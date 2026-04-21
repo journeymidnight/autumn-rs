@@ -72,7 +72,7 @@ async fn setup_ec_stream(
     n3_addr: SocketAddr,
     ec_data_shard: u32,
     ec_parity_shard: u32,
-) -> (u64, StreamClient) {
+) -> (u64, Rc<StreamClient>) {
     let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
 
     for (addr, disk) in [
