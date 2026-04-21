@@ -75,12 +75,34 @@ pub fn start_extent_node(addr: SocketAddr, dir: std::path::PathBuf, disk_id: u64
 }
 
 /// Start a partition server on its own thread.
+///
+/// F099-K note: `PartitionServer::connect()` implicitly calls
+/// `sync_regions_once()` during `finish_connect`. That sync opens any
+/// partitions already assigned to this PS via `open_partition`, which
+/// binds a dedicated per-partition listener on `base_port + ord`.
+/// Pre-fix, `base_port` was only set inside `serve()`; tests that
+/// `upsert_partition` BEFORE `connect` would therefore have
+/// `finish_connect`'s implicit sync try to bind port `0 + ord`, failing
+/// with EACCES / EADDRINUSE. We now use `connect_with_advertise_and_port`
+/// which seeds `base_port` + `advertise_host` BEFORE `finish_connect`
+/// runs its implicit sync; the subsequent explicit `sync_regions_once`
+/// is a no-op for already-open partitions and `serve()` reinstates the
+/// same base_port (idempotent). See
+/// `crates/partition-server/src/lib.rs::bind_listen_addr`.
 pub fn start_partition_server(ps_id: u64, mgr_addr: SocketAddr, ps_addr: SocketAddr) {
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let ps = PartitionServer::connect(ps_id, &mgr_addr.to_string())
-                .await
-                .expect("connect partition server");
+            // Match production (`autumn-ps`): pass the advertise addr so
+            // `bind_listen_addr` can derive the advertise host from it.
+            let advertise = ps_addr.to_string();
+            let ps = PartitionServer::connect_with_advertise_and_port(
+                ps_id,
+                &mgr_addr.to_string(),
+                Some(advertise),
+                ps_addr,
+            )
+            .await
+            .expect("connect partition server");
             ps.sync_regions_once().await.expect("sync regions");
             let _ = ps.serve(ps_addr).await;
         });
@@ -265,6 +287,96 @@ pub async fn ps_gc(ps: &RpcClient, part_id: u64) {
         .expect("gc");
     let _: partition_rpc::MaintenanceResp =
         partition_rpc::rkyv_decode(&resp).expect("decode MaintenanceResp");
+}
+
+// ── F099-K per-partition router ───────────────────────────────────────
+//
+// After F099-K, each partition binds its own TCP listener at
+// `base_port + ord`; cross-partition frames sent to the wrong port are
+// rejected with `NotFound` ("partition X not served by this P-log
+// (owner=Y)"). Tests that touch multiple partitions on one PS (e.g.
+// after a split) therefore need to dial the per-partition address from
+// `GetRegions.part_addrs`, not the first partition's port.
+//
+// `PsRouter` hides this routing: given a manager address and (on
+// construction) the initial partition's RpcClient, it resolves
+// subsequent `part_id`s by querying the manager and caching the
+// resulting RpcClients. Existing helpers (`ps_put`, `ps_get`, ...) are
+// still available for single-partition tests; split tests should use
+// the `psr_*` variants below.
+
+/// Cache of `RpcClient`s keyed by partition id. Resolves unknown
+/// partitions by querying the manager for `part_addrs`.
+pub struct PsRouter {
+    mgr_addr: SocketAddr,
+    /// Fallback address used when `part_addrs` does not yet list the
+    /// requested partition — typically the owning PS's first partition
+    /// port (pre-split it owns everything).
+    fallback_addr: SocketAddr,
+}
+
+impl PsRouter {
+    pub fn new(mgr_addr: SocketAddr, fallback_addr: SocketAddr) -> Self {
+        Self { mgr_addr, fallback_addr }
+    }
+
+    /// Resolve `part_id` to a fresh RpcClient every call. We do NOT
+    /// cache connections because a PS-side task drop (e.g. a partition
+    /// being evicted and re-opened) would leave the cached client
+    /// pointing at a dead FD. Test-scale cost of a reconnect per call
+    /// is negligible.
+    pub async fn client_for(&self, part_id: u64) -> Rc<autumn_rpc::client::RpcClient> {
+        // Fetch latest part_addrs from manager.
+        let mgr = RpcClient::connect(self.mgr_addr).await.expect("connect mgr");
+        let regions = get_regions(&mgr).await;
+        let mut addr: Option<SocketAddr> = None;
+        for (pid, part_addr) in regions.part_addrs {
+            if pid == part_id {
+                if let Ok(sa) = part_addr.parse::<SocketAddr>() {
+                    addr = Some(sa);
+                }
+                break;
+            }
+        }
+        let target = addr.unwrap_or(self.fallback_addr);
+        RpcClient::connect(target).await.expect("connect partition")
+    }
+}
+
+/// Routed `ps_put` — F099-K aware: dials the partition's own listener.
+pub async fn psr_put(
+    router: &PsRouter,
+    part_id: u64,
+    key: &[u8],
+    value: &[u8],
+    must_sync: bool,
+) {
+    let c = router.client_for(part_id).await;
+    ps_put(&c, part_id, key, value, must_sync).await;
+}
+
+/// Routed `ps_get` — F099-K aware.
+pub async fn psr_get(router: &PsRouter, part_id: u64, key: &[u8]) -> partition_rpc::GetResp {
+    let c = router.client_for(part_id).await;
+    ps_get(&c, part_id, key).await
+}
+
+/// Routed `ps_flush` — F099-K aware.
+pub async fn psr_flush(router: &PsRouter, part_id: u64) {
+    let c = router.client_for(part_id).await;
+    ps_flush(&c, part_id).await;
+}
+
+/// Routed `ps_compact` — F099-K aware.
+pub async fn psr_compact(router: &PsRouter, part_id: u64) {
+    let c = router.client_for(part_id).await;
+    ps_compact(&c, part_id).await;
+}
+
+/// Routed `ps_gc` — F099-K aware.
+pub async fn psr_gc(router: &PsRouter, part_id: u64) {
+    let c = router.client_for(part_id).await;
+    ps_gc(&c, part_id).await;
 }
 
 // ── Common setup patterns ─────────────────────────────────────────────

@@ -646,7 +646,44 @@ impl PartitionServer {
         self.current_mgr.set(next);
     }
 
+    /// F099-K test-harness affordance: same as `connect_with_advertise`
+    /// except the caller additionally supplies the first-partition listen
+    /// address so `base_port` + `advertise_host` are populated BEFORE
+    /// `finish_connect()` runs its implicit `sync_regions_once()`.
+    ///
+    /// The production binary (`autumn-ps`) does NOT need this path
+    /// because no partitions are registered at connect time — by the
+    /// time `serve()` is called, `base_port` is set and
+    /// `region_sync_loop` opens partitions with a valid listener port.
+    /// Tests, however, `upsert_partition` with the manager BEFORE
+    /// connecting the PS, so the implicit sync fires `open_partition`
+    /// immediately and needs `base_port` pre-set.
+    pub async fn connect_with_advertise_and_port(
+        ps_id: u64,
+        manager_endpoint: &str,
+        advertise_addr: Option<String>,
+        listen_addr: SocketAddr,
+    ) -> Result<Self> {
+        let server = Self::connect_raw(ps_id, manager_endpoint, advertise_addr).await?;
+        server.bind_listen_addr(listen_addr)?;
+        server.finish_connect().await
+    }
+
     pub async fn connect_with_advertise(
+        ps_id: u64,
+        manager_endpoint: &str,
+        advertise_addr: Option<String>,
+    ) -> Result<Self> {
+        let server = Self::connect_raw(ps_id, manager_endpoint, advertise_addr).await?;
+        server.finish_connect().await
+    }
+
+    /// F099-K helper: build `Self` (acquire owner lock + fill
+    /// `manager_addrs`) but DO NOT call `finish_connect()`. Callers
+    /// that need to set `base_port` before the implicit
+    /// `sync_regions_once()` runs use this + `bind_listen_addr` +
+    /// `finish_connect`.
+    async fn connect_raw(
         ps_id: u64,
         manager_endpoint: &str,
         advertise_addr: Option<String>,
@@ -663,14 +700,13 @@ impl PartitionServer {
             owner_key: owner_key.clone(),
         });
         let mut last_err = None;
-        let mut connected_idx = 0usize;
         for (idx, addr) in mgr_addrs.iter().enumerate() {
             match pool.call(addr, manager_rpc::MSG_ACQUIRE_OWNER_LOCK, req.clone()).await {
                 Ok(resp_data) => {
                     let resp: manager_rpc::AcquireOwnerLockResp =
                         manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
                     if resp.code == manager_rpc::CODE_OK {
-                        connected_idx = idx;
+                        let connected_idx = idx;
                         let server = Self {
                             ps_id,
                             advertise_addr,
@@ -680,16 +716,16 @@ impl PartitionServer {
                             pool,
                             server_owner_key: owner_key,
                             server_revision: Rc::new(Cell::new(resp.revision)),
-                            // F099-K — placeholders; populated by `serve()`
-                            // once the base port + advertise host are known.
+                            // F099-K — placeholders; populated by
+                            // `bind_listen_addr` (called from
+                            // `serve()` or `connect_with_advertise_and_port`).
                             base_port: Cell::new(0),
                             next_port_ord: Rc::new(Cell::new(0)),
                             advertise_host: Rc::new(std::cell::RefCell::new(
                                 String::from("127.0.0.1"),
                             )),
                         };
-                        // Jump to register_ps below
-                        return server.finish_connect().await;
+                        return Ok(server);
                     } else if resp.code == manager_rpc::CODE_NOT_LEADER {
                         last_err = Some(anyhow!("NotLeader from {}", addr));
                         continue;
@@ -982,7 +1018,14 @@ impl PartitionServer {
     //     OS threads at N partitions: `1 + 2N` (pre-F099-K it was `2 + 2N`
     //     because of the separate accept thread).
 
-    pub async fn serve(&self, addr: SocketAddr) -> Result<()> {
+    /// F099-K: initialise `base_port` + `advertise_host` from the
+    /// supplied first-partition listen address. Safe to call multiple
+    /// times with the same `addr` (idempotent set via `Cell` /
+    /// `RefCell`). Called by `serve()` and by
+    /// `connect_with_advertise_and_port` so callers that drive
+    /// `sync_regions_once()` BEFORE entering `serve()`'s forever-loop
+    /// still see a valid `base_port` in `open_partition`.
+    pub fn bind_listen_addr(&self, addr: SocketAddr) -> Result<()> {
         // F099-K: the `addr` arg is repurposed as the FIRST PARTITION's
         // listener address. Partition N (1-indexed by open order) binds
         // `addr.port() + (N-1)`. `base_port` is therefore `addr.port() - 1`
@@ -1006,6 +1049,17 @@ impl PartitionServer {
             .and_then(|a| a.rsplit_once(':').map(|(h, _)| h.to_string()))
             .unwrap_or_else(|| "127.0.0.1".to_string());
         *self.advertise_host.borrow_mut() = host;
+        Ok(())
+    }
+
+    pub async fn serve(&self, addr: SocketAddr) -> Result<()> {
+        // F099-K: set `base_port` + `advertise_host` BEFORE any
+        // background loop spawns `open_partition`. Idempotent if a
+        // caller already invoked `bind_listen_addr` (e.g. test
+        // harness via `connect_with_advertise_and_port`).
+        self.bind_listen_addr(addr)?;
+        let base_port = self.base_port.get();
+        let first_port = addr.port();
 
         tracing::info!(
             base_port = base_port,

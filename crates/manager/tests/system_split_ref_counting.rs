@@ -35,6 +35,9 @@ fn split_ref_counting_shared_extents_freed_after_both_gc() {
         let ps_addr = pick_addr();
         start_partition_server(71, mgr_addr, ps_addr);
         let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
+        // F099-K: after split, the right child binds a different port.
+        // Route per-partition via manager's `part_addrs`.
+        let router = PsRouter::new(mgr_addr, ps_addr);
 
         // Write data across the range and flush
         for i in 0u8..10 {
@@ -105,7 +108,7 @@ fn split_ref_counting_shared_extents_freed_after_both_gc() {
 
         // Compact both children (this creates new SSTables with only in-range keys)
         ps_compact(&ps, 901).await;
-        ps_compact(&ps, right_id).await;
+        psr_compact(&router, right_id).await;
         compio::time::sleep(Duration::from_millis(3000)).await;
 
         // After compaction, flush again to ensure new SSTables are on new extents
@@ -118,12 +121,12 @@ fn split_ref_counting_shared_extents_freed_after_both_gc() {
 
         ps_put(&ps, 901, left_key.as_bytes(), b"v", false).await;
         ps_flush(&ps, 901).await;
-        ps_put(&ps, right_id, right_key.as_bytes(), b"v", false).await;
-        ps_flush(&ps, right_id).await;
+        psr_put(&router, right_id, right_key.as_bytes(), b"v", false).await;
+        psr_flush(&router, right_id).await;
 
         // Trigger GC on both children to reclaim old shared extents
         ps_gc(&ps, 901).await;
-        ps_gc(&ps, right_id).await;
+        psr_gc(&router, right_id).await;
         compio::time::sleep(Duration::from_millis(2000)).await;
 
         // After both children GC, the shared extent should have refs decremented.
@@ -157,7 +160,7 @@ fn split_ref_counting_shared_extents_freed_after_both_gc() {
         // Regardless of GC result, both children should still serve reads
         let resp = ps_get(&ps, 901, left_key.as_bytes()).await;
         assert_eq!(resp.value, b"v", "left child should still serve reads");
-        let resp = ps_get(&ps, right_id, right_key.as_bytes()).await;
+        let resp = psr_get(&router, right_id, right_key.as_bytes()).await;
         assert_eq!(resp.value, b"v", "right child should still serve reads");
     });
 }

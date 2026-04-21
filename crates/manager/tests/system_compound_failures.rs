@@ -73,6 +73,8 @@ fn split_then_ps_crash_data_survives() {
         let ps2_addr = pick_addr();
         start_partition_server(81, mgr_addr, ps2_addr);
         let ps2 = RpcClient::connect(ps2_addr).await.expect("connect ps2");
+        // F099-K: after split, left and right live on different partition ports.
+        let router2 = PsRouter::new(mgr_addr, ps2_addr);
 
         // Wait for PS2 to sync regions and open both partitions
         compio::time::sleep(Duration::from_millis(6000)).await;
@@ -84,7 +86,7 @@ fn split_then_ps_crash_data_survives() {
             let key = format!("{}-data", c as char);
             let kb = key.as_bytes();
             let part_id = if kb < mid_key.as_slice() { 901 } else { right_rg.part_id };
-            let resp = ps_get(&ps2, part_id, kb).await;
+            let resp = psr_get(&router2, part_id, kb).await;
             assert_eq!(
                 resp.value.as_slice(), kb,
                 "key {key} (part_id={part_id}) must survive split+crash"
@@ -103,12 +105,12 @@ fn split_then_ps_crash_data_survives() {
         let left_new_key = format!("{}new", String::from_utf8_lossy(left_start));
         let right_new_key = format!("{}new", String::from_utf8_lossy(right_start));
 
-        ps_put(&ps2, 901, left_new_key.as_bytes(), b"ok-left", true).await;
-        ps_put(&ps2, right_rg.part_id, right_new_key.as_bytes(), b"ok-right", true).await;
+        psr_put(&router2, 901, left_new_key.as_bytes(), b"ok-left", true).await;
+        psr_put(&router2, right_rg.part_id, right_new_key.as_bytes(), b"ok-right", true).await;
 
-        let resp = ps_get(&ps2, 901, left_new_key.as_bytes()).await;
+        let resp = psr_get(&router2, 901, left_new_key.as_bytes()).await;
         assert_eq!(resp.value, b"ok-left");
-        let resp = ps_get(&ps2, right_rg.part_id, right_new_key.as_bytes()).await;
+        let resp = psr_get(&router2, right_rg.part_id, right_new_key.as_bytes()).await;
         assert_eq!(resp.value, b"ok-right");
     });
 }

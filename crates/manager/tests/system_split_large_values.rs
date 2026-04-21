@@ -35,6 +35,8 @@ fn split_with_large_values_preserves_vp_resolution() {
         let ps_addr = pick_addr();
         start_partition_server(71, mgr_addr, ps_addr);
         let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
+        // F099-K: post-split right partition binds a different port.
+        let router = PsRouter::new(mgr_addr, ps_addr);
 
         // Write keys with large values (>4KB triggers ValuePointer storage)
         let large_value = vec![0x42u8; 8192]; // 8KB value
@@ -107,7 +109,7 @@ fn split_with_large_values_preserves_vp_resolution() {
             } else {
                 right_rg.part_id
             };
-            let resp = ps_get(&ps, part_id, kb).await;
+            let resp = psr_get(&router, part_id, kb).await;
             assert_eq!(
                 resp.value.len(),
                 8192,
