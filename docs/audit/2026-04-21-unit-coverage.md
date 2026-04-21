@@ -1,9 +1,26 @@
 # autumn-rs unit-test coverage — 2026-04-21
 
 **Tool:** cargo-llvm-cov 0.8.5 (lib + bin units only, no tests/ integration)
-**Command:** `cargo llvm-cov --workspace --lib --exclude autumn-fuse --exclude autumn-manager --no-fail-fast`
+
+**Commands (run from `autumn-rs/`):**
+
+```
+# Step 1 — JSON summary (produces the raw table below)
+cargo llvm-cov --workspace --lib \
+  --exclude autumn-fuse --exclude autumn-manager \
+  --no-fail-fast \
+  --json --output-path /tmp/autumn-rs-unit-cov.json
+
+# Step 2 — HTML report
+cargo llvm-cov --workspace --lib \
+  --exclude autumn-fuse --exclude autumn-manager \
+  --no-fail-fast \
+  --html --output-dir /tmp/autumn-rs-unit-cov-html
+```
+
 **Snapshot JSON:** `/tmp/autumn-rs-unit-cov.json`
 **HTML report:** `/tmp/autumn-rs-unit-cov-html/html/index.html`
+(cargo-llvm-cov places HTML files in an `html/` subdirectory inside `--output-dir`)
 
 **Exclusions and workarounds:**
 - `autumn-fuse` excluded: libfuse3/libfuse not installed on this system (pkg-config cannot find `fuse3.pc` or `fuse.pc`).
@@ -30,9 +47,11 @@
 | autumn-partition-server | 55.4% (3075/5548) | 58.0% (276/476) | `rpc_handlers.rs` (0%), `background.rs` (20%) |
 | autumn-common | 59.4% (38/64) | 55.6% (5/9) | `metrics.rs` (0%) |
 | autumn-rpc | 67.7% (555/820) | 68.4% (78/114) | `pool.rs` (0%), `error.rs` (19%), `partition_rpc.rs` (33%) |
+| | | | |
+| **— excluded / unmeasured —** | | | |
 | autumn-manager | N/A (excluded) | N/A | test-visibility compile error — private handler methods called from tests |
-| autumn-server (bins only) | N/A (no lib target) | N/A | bin-only crate; no lib to measure |
 | autumn-fuse | N/A (excluded) | N/A | libfuse3 not installed on this host |
+| autumn-server | N/A (no lib target) | N/A | bin-only crate; no lib to measure |
 
 ## Top-10 largest uncovered files
 
