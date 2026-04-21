@@ -171,6 +171,7 @@ async fn create_stream(mgr: &RpcClient, replicates: u32) -> u64 {
     created.stream.expect("stream").stream_id
 }
 
+#[ignore = "requires go binary for embedded etcd; see docs/audit/2026-04-21-integration-inventory.md"]
 #[test]
 fn stream_manager_with_real_etcd() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
@@ -248,6 +249,7 @@ fn stream_manager_with_real_etcd() {
     });
 }
 
+#[ignore = "requires go binary for embedded etcd; see docs/audit/2026-04-21-integration-inventory.md"]
 #[test]
 fn etcd_replay_owner_lock_allows_check_commit_length_without_reacquire() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
@@ -329,6 +331,7 @@ fn etcd_replay_owner_lock_allows_check_commit_length_without_reacquire() {
     });
 }
 
+#[ignore = "requires go binary for embedded etcd; see docs/audit/2026-04-21-integration-inventory.md"]
 #[test]
 fn etcd_replicated_append_and_recovery_flow() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
@@ -437,6 +440,7 @@ fn etcd_replicated_append_and_recovery_flow() {
     });
 }
 
+#[ignore = "requires go binary for embedded etcd; see docs/audit/2026-04-21-integration-inventory.md"]
 #[test]
 fn etcd_election_and_replay_on_second_manager() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
