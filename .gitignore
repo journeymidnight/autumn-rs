@@ -1,2 +1,25 @@
+# Build output
+/target
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local test artefacts (cluster.sh, perf_check.sh)
+/tmp/
+/dev/shm/
+
+# Python bindings build output
+python/target
+python/*.so
+
+# Do NOT ignore perf_baseline*.json — these are checked-in regression gates
 # Override root *.json exclusion for tracked config files
 !perf_baseline.json
+!perf_baseline_shm.json
