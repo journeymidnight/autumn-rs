@@ -1,0 +1,21 @@
+Date: 2026-04-21
+TaskStatus: not_completed
+Task scope: Pre-extraction audit (unit/integration/perf) and preparation
+            for moving autumn-rs to a standalone git repository.
+
+Current summary: Phase A audit docs published under docs/audit/ (unit cov,
+                 integration inventory, perf_check, summary verdict).
+                 3 pre-existing blockers fixed (manager lib visibility,
+                 ec_integration type, F099-K port-init).
+                 Full workspace suite green: 213/0/9 (ignored: 2 preexisting,
+                 3 F099-K-followup latent bugs, 4 go-missing env tests).
+                 Phase B in progress: LICENSE / .gitignore / CI seeded;
+                 crosscut inventory done; doc migration under way.
+
+Main gaps: 3 F099-K-followup latent bugs (f037 overlap range-filter; two
+           HANGs in system_split_ref_counting + system_compound_failures).
+           FCI-01 pre-existing fmt/clippy debt (628 fmt hunks, 1 clippy
+           error, ~13 warnings) — CI initially non-gating on lints.
+
+Next steps: T9 (git filter-repo dry run) → T10 (push to new remote — user
+            must provide URL) → T11 (retire from parent) → T12 (smoke test).
