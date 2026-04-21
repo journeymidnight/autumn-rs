@@ -129,7 +129,7 @@ impl AutumnManager {
         }
     }
 
-    async fn handle_register_node(&self, payload: Bytes) -> HandlerResult {
+    pub(crate) async fn handle_register_node(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&RegisterNodeResp {
                 code: Self::err_to_code(&err),
@@ -1026,7 +1026,7 @@ impl AutumnManager {
 
     // ── PartitionManagerService handlers ───────────────────────────────
 
-    async fn handle_register_ps(&self, payload: Bytes) -> HandlerResult {
+    pub(crate) async fn handle_register_ps(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&CodeResp {
                 code: Self::err_to_code(&err),
@@ -1057,7 +1057,7 @@ impl AutumnManager {
         }))
     }
 
-    async fn handle_upsert_partition(&self, payload: Bytes) -> HandlerResult {
+    pub(crate) async fn handle_upsert_partition(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&UpsertPartitionResp {
                 code: Self::err_to_code(&err),
@@ -1097,7 +1097,7 @@ impl AutumnManager {
         }))
     }
 
-    async fn handle_get_regions(&self) -> HandlerResult {
+    pub(crate) async fn handle_get_regions(&self) -> HandlerResult {
         let s = self.store.inner.borrow();
         let regions = s
             .regions
@@ -1137,7 +1137,7 @@ impl AutumnManager {
         }))
     }
 
-    async fn handle_heartbeat_ps(&self, payload: Bytes) -> HandlerResult {
+    pub(crate) async fn handle_heartbeat_ps(&self, payload: Bytes) -> HandlerResult {
         let req: HeartbeatPsReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         let known = {
