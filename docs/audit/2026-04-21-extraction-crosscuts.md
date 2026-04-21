@@ -179,3 +179,21 @@ minor trimming in the parent post-extraction rather than migration. No inbound
 references block the `filter-repo` run itself; all parent-side cleanup
 (`CLAUDE.md` trim, `.gitignore` line removal, README banner) can happen in
 Task 11 after the new repo is live.
+
+## filter-repo dry run — 2026-04-21
+
+**Source:** `/data/dongmao_dev/autumn/.claude/worktrees/autumn-rs-extraction` @ `a0387ba extract: migrate Rust-era feature list, docs, and long-task rules under autumn-rs/`
+**Output:** `/tmp/autumn-rs-split`
+**Commits before filter-repo:** 456 (full branch history on `autumn-rs-extraction`)
+**Commits after filter-repo:** 210 (commits touching `autumn-rs/`)
+**First commit preserved:** `ae335bc rust: add stream append benchmark and client connection reuse`
+**Parent-only files leaked:** none (`test ! -e go.mod && test ! -e autumn_clientv1 && test ! -e manager && test ! -e node && test ! -e partition_server` → `CLEAN`)
+**Build:** pass (`Finished dev profile` in 12.79s on warm cache)
+**Unit tests:** 144 passed / 0 failed / 0 ignored (across 7 crates: 0+2+3+5+84+10+40)
+**Integration tests:** 213 passed / 0 failed / 8 ignored (across all workspace crates, --test-threads=1)
+**perf_check --shm vs baseline (`perf_baseline_shm.json`):**
+  - write ops/s: 38,021 (baseline 41,389, Δ−8.1%) — within 80% gate
+  - read ops/s: 53,043 (baseline 51,014, Δ+4.0%) — above baseline
+  - verdict: `perf-check OK` — within tolerance (gate is 80% of baseline)
+
+**Verdict:** filter-repo split is clean; ready for Task 10 (push to new remote).
