@@ -36,6 +36,9 @@ fn split_preserves_all_data() {
         let ps_addr = pick_addr();
         start_partition_server(71, mgr_addr, ps_addr);
         let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
+        // F099-K: after the split below, the new partition binds its OWN
+        // port; route per-partition via the manager's `part_addrs`.
+        let router = PsRouter::new(mgr_addr, ps_addr);
 
         // Write keys spread across the alphabet and flush
         let keys: Vec<String> = (b'b'..=b'x')
@@ -111,8 +114,8 @@ fn split_preserves_all_data() {
                 );
                 left_count += 1;
             } else {
-                // Should be in right partition
-                let resp = ps_get(&ps, right_rg.part_id, kb).await;
+                // Should be in right partition (F099-K: different port)
+                let resp = psr_get(&router, right_rg.part_id, kb).await;
                 assert_eq!(
                     resp.value.as_slice(),
                     kb,

@@ -219,12 +219,24 @@ async fn upsert_partition(
 }
 
 /// Start a partition server on its own thread.
+///
+/// F099-K: use `connect_with_advertise_and_port` so `base_port` is
+/// populated BEFORE the implicit `sync_regions_once()` inside
+/// `finish_connect()` fires. See
+/// `crates/manager/tests/support/mod.rs::start_partition_server` for
+/// the full explanation.
 fn start_partition_server(ps_id: u64, mgr_addr: SocketAddr, ps_addr: SocketAddr) {
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let ps = PartitionServer::connect(ps_id, &mgr_addr.to_string())
-                .await
-                .expect("connect partition server");
+            let advertise = ps_addr.to_string();
+            let ps = PartitionServer::connect_with_advertise_and_port(
+                ps_id,
+                &mgr_addr.to_string(),
+                Some(advertise),
+                ps_addr,
+            )
+            .await
+            .expect("connect partition server");
             ps.sync_regions_once().await.expect("sync regions");
             let _ = ps.serve(ps_addr).await;
         });
