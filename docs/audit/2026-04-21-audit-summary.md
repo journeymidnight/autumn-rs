@@ -64,6 +64,8 @@
 - **autumn-etcd: 12.6% coverage (470 lines, transport.rs 0%):** The etcd transport layer has no unit tests. Failures here would be silent until an integration test caught them. (⚠️ coverage)
 - **8 distributed-scenario gaps:** Network partition, slow replica, quorum loss (2-of-3 down), ENOSPC, rolling-upgrade compatibility, and range-scan correctness are unexercised. Highest production risk: quorum loss and rolling-upgrade (unversioned binary RPC frame format). These should be added as labelled issues in the extraction repo's issue tracker immediately post-move.
 
+- **CI lint debt (FCI-01 in feature_list):** 628 fmt hunks + 1 clippy error + ~13 clippy warnings are pre-existing on compio HEAD. CI workflow is initially shipped with `continue-on-error: true` on the fmt and clippy steps so build + test remain gating. Cleanup is tracked as post-extraction FCI-01; promote steps to gating once cleared.
+
 ## Verdict
 
 **CONDITIONAL-GO** — Extract now to the new repo on a `pre-release` branch; gate the new repo's CI on `cargo test` green by fixing the 4 concrete compile/port bugs (estimated 1–3 days total) before tagging v0.1.0. The 22 failing tests and 2 compile errors are all well-understood, well-scoped regressions that already exist on `compio` HEAD; extraction does not make them worse, and the new repo's CI feedback loop will force faster resolution than the monorepo environment.
