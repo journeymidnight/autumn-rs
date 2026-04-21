@@ -24,6 +24,7 @@ that spin up manager + extent-nodes + (optionally) PS via real RPC.
 | Multi-disk round-robin | `stream/tests/f021_multi_disk.rs` (3) — `f021_multi_disk_alloc`, `f021_multi_disk_load_extents`, `f021_df_reports_per_disk_stats` | covered |
 | Per-shard runtime sharding (F099-M) | `stream/tests/f099m_shards.rs` (4) — `f099m_shards_serve_disjoint_extents`, `f099m_register_node_reports_shard_ports`, `f099m_client_routes_by_extent_id_modulo`, `f099m_recovery_per_shard` | covered |
 | Extent-append pipeline (SQ/CQ) | `stream/tests/stream_sqcq.rs` (5) — `concurrent_append_preserves_order_within_stream`, `worker_handles_back_pressure`, `cq_advances_commit_on_out_of_order_completion`, `sq_continues_submitting_while_cq_drains`, `parallel_fanout_fires_3_replicas_concurrently`; `stream/tests/extent_pipeline.rs` (5) — `concurrent_appends_preserve_offset_order_per_extent`, `appends_to_different_extents_run_concurrently`, `seal_rejects_subsequent_appends`, `pwritev_batch_still_coalesced`, `cq_flushes_fast_ops_while_slow_op_runs`; `stream/tests/extent_append_semantics.rs` (2) — `append_rejects_stale_revision`, `append_with_mid_byte_commit_truncates_and_succeeds` | covered |
+| Stream-layer append / commit / punchhole / truncate + read round-trip | `manager/tests/integration.rs` (2) — `stream_append_commit_punchhole_truncate_flow`, `stream_append_and_read_blocks_flow` | covered |
 | **Partition-server** | | |
 | PS crash → reassign → resume | `manager/tests/system_ps_failover.rs` (2) — `ps_crash_partition_reassigned_to_new_ps`, `ps_heartbeat_timeout_triggers_reassignment` | covered |
 | PS restart replays metaStream+logStream | `manager/tests/system_ps_recovery.rs` (2) — `ps_crash_unflushed_data_recoverable`, `sequential_ps_crash_data_accumulates`; also `manager/tests/integration.rs` — `partition_server_recovery_replays_table_and_wal`, `f030_recovery_from_meta_and_row_streams`, `f031_recovery_replays_log_stream` | covered |
@@ -51,7 +52,7 @@ that spin up manager + extent-nodes + (optionally) PS via real RPC.
 | Disk-full ENOSPC on extent-node | — | gap |
 | Rolling-upgrade binary compatibility | — | gap |
 | Manager + PS simultaneous restart | — | gap |
-| Partition scan / range-query correctness | — | gap |
+| Partition scan / range-query correctness | — (no dedicated range-scan test fn; range traversal is only incidentally exercised inside split tests that perform single-key put/get before and after the split, never issuing a multi-key scan over a key range) | gap |
 | Heartbeat storm (many PS reconnect simultaneously) | — | gap |
 
 ---
