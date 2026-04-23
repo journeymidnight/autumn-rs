@@ -1,21 +1,28 @@
-Date: 2026-04-21
-TaskStatus: not_completed
-Task scope: Pre-extraction audit (unit/integration/perf) and preparation
-            for moving autumn-rs to a standalone git repository.
+Date: 2026-04-23
+TaskStatus: completed
+Task scope: F100-UCX brainstorm (UCP/UCX RDMA transport for path 1 + path 2).
+            Pre-extraction audit + repo extraction (T1–T12) is fully done.
 
-Current summary: Phase A audit docs published under docs/audit/ (unit cov,
-                 integration inventory, perf_check, summary verdict).
-                 3 pre-existing blockers fixed (manager lib visibility,
-                 ec_integration type, F099-K port-init).
-                 Full workspace suite green: 213/0/9 (ignored: 2 preexisting,
-                 3 F099-K-followup latent bugs, 4 go-missing env tests).
-                 Phase B in progress: LICENSE / .gitignore / CI seeded;
-                 crosscut inventory done; doc migration under way.
+Current summary: Brainstorm spec written + section-by-section reviewed.
+                 Q1/Q2/Q4 resolved (see §12 of design doc):
+                   Q1 — ucp_stream rndv on UCX 1.16 + RoCEv2 verified
+                        via ucx_perftest (13.4 GB/s @ 256 KB on
+                        rc_mlx5/mlx5_0:1; UCX_PROTO_INFO output captured
+                        in spec). Design premise holds.
+                   Q2 — Trait object dispatch (Box<dyn AutumnConn>) kept;
+                        vtable cost is sub-noise on RDMA RTT.
+                   Q4 — Repo extraction completed; F100 advances on main.
+                 Spec at:
+                   docs/superpowers/specs/2026-04-23-ucx-transport-design.md
+                 Feature registered: feature_list.md F100-UCX
+                                     (P5 — Network transport abstraction).
 
-Main gaps: 3 F099-K-followup latent bugs (f037 overlap range-filter; two
-           HANGs in system_split_ref_counting + system_compound_failures).
-           FCI-01 pre-existing fmt/clippy debt (628 fmt hunks, 1 clippy
-           error, ~13 warnings) — CI initially non-gating on lints.
+Main gaps: P0 task before P3 — `ucx-sys` Rust crate quality survey
+           (else fall back to in-tree bindgen sub-crate, +1–2 days).
+           Spec §10 still tracks 4 open risks (MR cache, cancel/buffer
+           ownership, ucx-sys quality, deployment RoCE-IP precondition).
 
-Next steps: T9 (git filter-repo dry run) → T10 (push to new remote — user
-            must provide URL) → T11 (retire from parent) → T12 (smoke test).
+Next steps: Pending user review of the committed spec → invoke
+            superpowers:writing-plans skill to break P1–P5 into
+            executable tasks. P0 ucx-sys research is the first plan
+            entry.
