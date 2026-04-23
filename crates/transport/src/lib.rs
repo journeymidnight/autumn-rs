@@ -25,9 +25,13 @@ use std::sync::OnceLock;
 
 mod probe;
 mod tcp;
+#[cfg(feature = "ucx")]
+mod ucx;
 
 pub use probe::{decide, Decision};
 pub use tcp::TcpTransport;
+#[cfg(feature = "ucx")]
+pub use ucx::UcxTransport;
 
 static GLOBAL: OnceLock<Box<dyn AutumnTransport>> = OnceLock::new();
 
@@ -78,22 +82,26 @@ pub trait AutumnTransport: Send + Sync + 'static {
 
 pub enum Conn {
     Tcp(compio::net::TcpStream),
-    // #[cfg(feature = "ucx")] Ucx(crate::ucx::UcxConn),  // Phase 3
+    #[cfg(feature = "ucx")]
+    Ucx(crate::ucx::endpoint::UcxConn),
 }
 
 pub enum Listener {
     Tcp(compio::net::TcpListener),
-    // #[cfg(feature = "ucx")] Ucx(crate::ucx::UcxListener),  // Phase 3
+    #[cfg(feature = "ucx")]
+    Ucx(crate::ucx::listener::UcxListener),
 }
 
 pub enum ReadHalf {
     Tcp(compio::net::OwnedReadHalf<compio::net::TcpStream>),
-    // #[cfg(feature = "ucx")] Ucx(crate::ucx::UcxReadHalf),  // Phase 3
+    #[cfg(feature = "ucx")]
+    Ucx(crate::ucx::endpoint::UcxReadHalf),
 }
 
 pub enum WriteHalf {
     Tcp(compio::net::OwnedWriteHalf<compio::net::TcpStream>),
-    // #[cfg(feature = "ucx")] Ucx(crate::ucx::UcxWriteHalf),  // Phase 3
+    #[cfg(feature = "ucx")]
+    Ucx(crate::ucx::endpoint::UcxWriteHalf),
 }
 
 // ---- Conn API ----
@@ -102,6 +110,8 @@ impl Conn {
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         match self {
             Conn::Tcp(s) => s.peer_addr(),
+            #[cfg(feature = "ucx")]
+            Conn::Ucx(c) => c.peer_addr(),
         }
     }
 
@@ -111,6 +121,11 @@ impl Conn {
                 let (r, w) = s.into_split();
                 (ReadHalf::Tcp(r), WriteHalf::Tcp(w))
             }
+            #[cfg(feature = "ucx")]
+            Conn::Ucx(c) => {
+                let (r, w) = c.into_split();
+                (ReadHalf::Ucx(r), WriteHalf::Ucx(w))
+            }
         }
     }
 
@@ -119,6 +134,8 @@ impl Conn {
     pub fn as_tcp(&self) -> Option<&compio::net::TcpStream> {
         match self {
             Conn::Tcp(s) => Some(s),
+            #[cfg(feature = "ucx")]
+            Conn::Ucx(_) => None,
         }
     }
 }
@@ -130,6 +147,8 @@ impl compio::io::AsyncRead for Conn {
     ) -> compio::BufResult<usize, B> {
         match self {
             Conn::Tcp(s) => s.read(buf).await,
+            #[cfg(feature = "ucx")]
+            Conn::Ucx(c) => c.read(buf).await,
         }
     }
 }
@@ -141,16 +160,22 @@ impl compio::io::AsyncWrite for Conn {
     ) -> compio::BufResult<usize, B> {
         match self {
             Conn::Tcp(s) => s.write(buf).await,
+            #[cfg(feature = "ucx")]
+            Conn::Ucx(c) => c.write(buf).await,
         }
     }
     async fn flush(&mut self) -> io::Result<()> {
         match self {
             Conn::Tcp(s) => s.flush().await,
+            #[cfg(feature = "ucx")]
+            Conn::Ucx(c) => c.flush().await,
         }
     }
     async fn shutdown(&mut self) -> io::Result<()> {
         match self {
             Conn::Tcp(s) => s.shutdown().await,
+            #[cfg(feature = "ucx")]
+            Conn::Ucx(c) => c.shutdown().await,
         }
     }
 }
@@ -164,12 +189,19 @@ impl Listener {
                 let (s, peer) = l.accept().await?;
                 Ok((Conn::Tcp(s), peer))
             }
+            #[cfg(feature = "ucx")]
+            Listener::Ucx(l) => {
+                let (c, peer) = l.accept().await?;
+                Ok((Conn::Ucx(c), peer))
+            }
         }
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         match self {
             Listener::Tcp(l) => l.local_addr(),
+            #[cfg(feature = "ucx")]
+            Listener::Ucx(l) => l.local_addr(),
         }
     }
 }
@@ -183,6 +215,8 @@ impl compio::io::AsyncRead for ReadHalf {
     ) -> compio::BufResult<usize, B> {
         match self {
             ReadHalf::Tcp(r) => r.read(buf).await,
+            #[cfg(feature = "ucx")]
+            ReadHalf::Ucx(r) => r.read(buf).await,
         }
     }
 }
@@ -194,16 +228,22 @@ impl compio::io::AsyncWrite for WriteHalf {
     ) -> compio::BufResult<usize, B> {
         match self {
             WriteHalf::Tcp(w) => w.write(buf).await,
+            #[cfg(feature = "ucx")]
+            WriteHalf::Ucx(w) => w.write(buf).await,
         }
     }
     async fn flush(&mut self) -> io::Result<()> {
         match self {
             WriteHalf::Tcp(w) => w.flush().await,
+            #[cfg(feature = "ucx")]
+            WriteHalf::Ucx(w) => w.flush().await,
         }
     }
     async fn shutdown(&mut self) -> io::Result<()> {
         match self {
             WriteHalf::Tcp(w) => w.shutdown().await,
+            #[cfg(feature = "ucx")]
+            WriteHalf::Ucx(w) => w.shutdown().await,
         }
     }
 }
