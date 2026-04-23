@@ -42,10 +42,25 @@ pub fn init() -> &'static dyn AutumnTransport {
 }
 
 /// Read the process-global transport. Panics if `init()` was never called.
+///
+/// Use this from binaries that call `init()` explicitly at startup so a
+/// missing initialisation surfaces as a panic rather than silent fallback.
 pub fn current() -> &'static dyn AutumnTransport {
     &**GLOBAL
         .get()
         .expect("autumn_transport::init() must be called once at startup")
+}
+
+/// Read the process-global transport, lazily initialising it if needed.
+///
+/// Use this from library code (`autumn-rpc`, `autumn-stream`, …) so that
+/// callers (tests, third-party users) don't have to remember to call
+/// `init()` first.
+pub fn current_or_init() -> &'static dyn AutumnTransport {
+    if let Some(t) = GLOBAL.get() {
+        return &**t;
+    }
+    init()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

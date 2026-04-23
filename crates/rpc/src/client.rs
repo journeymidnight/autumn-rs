@@ -27,7 +27,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWriteExt};
-use compio::net::TcpStream;
 use compio::runtime::spawn;
 use futures::channel::{mpsc, oneshot};
 use futures::{SinkExt, StreamExt};
@@ -35,8 +34,8 @@ use futures::{SinkExt, StreamExt};
 use crate::error::RpcError;
 use crate::frame::{Frame, FrameDecoder};
 
-type WriteHalf = compio::net::OwnedWriteHalf<TcpStream>;
-type ReadHalf = compio::net::OwnedReadHalf<TcpStream>;
+type WriteHalf = autumn_transport::WriteHalf;
+type ReadHalf = autumn_transport::ReadHalf;
 
 /// Capacity of the submit mpsc channel between callers and the writer task.
 ///
@@ -89,24 +88,34 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
-    /// Connect to a remote address and start the background reader + writer.
+    /// Connect to a remote address through the process-global transport
+    /// (`autumn_transport::current()`), then start the background reader +
+    /// writer. Honours `AUTUMN_TRANSPORT={tcp,ucx,auto}` once Phase 4 wires
+    /// the env switch.
     pub async fn connect(addr: SocketAddr) -> Result<Rc<Self>, RpcError> {
-        let stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
-        Self::from_stream(stream, addr)
+        let conn = autumn_transport::current_or_init().connect(addr).await?;
+        // TCP_NODELAY only applies to the TCP variant; UCX manages framing
+        // itself and exposes no equivalent knob.
+        if let Some(s) = conn.as_tcp() {
+            s.set_nodelay(true)?;
+        }
+        Self::from_conn(conn, addr)
     }
 
-    /// Build an RpcClient from an already-connected TcpStream.
+    /// Build an RpcClient from an already-connected `autumn_transport::Conn`.
     ///
     /// Spawns two background tasks on the current compio runtime:
-    /// - `writer_task`: owns `WriteHalf`, drains submit_rx, writes frames.
-    /// - `read_loop`: owns `ReadHalf`, decodes frames, dispatches via pending.
+    /// - `writer_task`: owns the write half, drains submit_rx, writes frames.
+    /// - `read_loop`: owns the read half, decodes frames, dispatches via pending.
     ///
     /// Both tasks terminate on socket close / write error. When either exits,
     /// `pending` is cleared so callers' receivers see `RecvError` and surface
     /// `RpcError::ConnectionClosed`.
-    pub fn from_stream(stream: TcpStream, peer_addr: SocketAddr) -> Result<Rc<Self>, RpcError> {
-        let (reader, writer) = stream.into_split();
+    pub fn from_conn(
+        conn: autumn_transport::Conn,
+        peer_addr: SocketAddr,
+    ) -> Result<Rc<Self>, RpcError> {
+        let (reader, writer) = conn.into_split();
         let pending: Rc<RefCell<HashMap<u32, oneshot::Sender<Frame>>>> =
             Rc::new(RefCell::new(HashMap::new()));
 
@@ -435,6 +444,9 @@ mod tests {
     use std::time::Duration;
 
     fn rt() -> compio::runtime::Runtime {
+        // Tests use the process-global transport set up by autumn-transport;
+        // init() is idempotent so multiple calls across tests are safe.
+        let _ = autumn_transport::init();
         compio::runtime::Runtime::new().unwrap()
     }
 
@@ -581,9 +593,10 @@ mod tests {
         rt().block_on(async move {
             // Manually construct a client with a tiny submit channel (cap=4)
             // so 10 callers see back-pressure.
-            let stream = TcpStream::connect(addr).await.unwrap();
+            let stream = compio::net::TcpStream::connect(addr).await.unwrap();
             stream.set_nodelay(true).unwrap();
-            let (reader, writer) = stream.into_split();
+            let conn = autumn_transport::Conn::Tcp(stream);
+            let (reader, writer) = conn.into_split();
 
             let pending: Rc<RefCell<HashMap<u32, oneshot::Sender<Frame>>>> =
                 Rc::new(RefCell::new(HashMap::new()));
