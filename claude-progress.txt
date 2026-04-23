@@ -1,32 +1,44 @@
 Date: 2026-04-23
 TaskStatus: completed
-Task scope: F100-UCX Phase 1 — autumn-transport crate scaffold + TCP impl
-            + generic loopback suite (on f100-ucx feature branch).
+Task scope: F100-UCX Phase 2 — migrate autumn-rpc / autumn-stream /
+            autumn-manager call sites to AutumnTransport (still TCP
+            underneath); wire init() into all 4 binaries.
 
-Current summary: New crate at crates/transport/ with enum-dispatch surface
-                 (Conn / Listener / ReadHalf / WriteHalf, with Tcp variant
-                 today and Ucx variant gated to Phase 3 under feature="ucx").
-                 AutumnTransport stays a dyn-safe trait so init() returns
-                 &'static dyn AutumnTransport for runtime selection.
-                 TcpTransport passes 4-test loopback suite (ping-pong, 2MB
-                 large-payload, half-close, 1k concurrent connections) +
-                 connect/bind round-trip + 5 probe::decide() env tests.
-                 Full workspace test (excl manager+fuse): 187/0/0 — no
-                 regressions vs baseline.
+Current summary: Client-side TCP connect paths migrated to use
+                 autumn_transport::current_or_init().connect — covers
+                 RpcClient::connect (autumn-rpc), rpc_oneshot in
+                 extent_node, manager's internal RpcConn::connect.
+                 RpcClient::from_stream renamed to from_conn taking a
+                 Conn enum. TCP_NODELAY conditional on Conn::as_tcp().
+                 All 4 binaries call autumn_transport::init() at
+                 startup; tracing log "autumn-transport: init kind=Tcp"
+                 confirms wiring.
 
-                 DESIGN PIVOT during P1.2: spec §3 originally had
-                 Box<dyn AutumnConn> trait object; compio 0.18's
-                 AsyncRead::read<B: IoBufMut> / AsyncWrite::write<T: IoBuf>
-                 are generic methods, making the trait NOT dyn-compatible
-                 (E0038). Switched to enum dispatch — strictly cheaper than
-                 vtable, fully inlinable, runtime selection still works via
-                 the dyn-safe AutumnTransport trait. Spec §3 + §12 Q2-rev
-                 updated; plan top has DESIGN PIVOT NOTE.
+                 SCOPE NOTE: server-side accept paths intentionally
+                 NOT migrated — rpc/server.rs uses std::net::TcpListener
+                 on a dedicated OS thread (compio's TcpListener is
+                 !Send), and stream/extent_node.rs + manager/rpc_handlers
+                 use compio TcpListener directly. UCX accept needs a
+                 fundamentally different per-worker ucp_listener
+                 pattern; that work belongs in Phase 3+ when UCX impl
+                 lands. Today's TCP server-side path remains identical
+                 to pre-F100 behavior.
 
-Main gaps: P2 — migrate autumn-rpc / autumn-stream / autumn-manager call
-           sites onto the enum surface (still TCP underneath); ~5 tasks.
+                 Test results (workspace, serial, includes live etcd):
+                 224 passed / 0 failed / 9 ignored
+                 = Phase A baseline (213) + 11 new transport tests.
+                 No regressions.
 
-Next steps: Phase 2. After P2 closeout, Phase 3 implements UcxTransport
-            using in-tree bindgen sub-crate (per spec §13).
+Main gaps: P3 — UcxTransport implementation under feature = "ucx".
+           Includes: in-tree ucx-sys-mini bindgen sub-crate, per-thread
+           UcxThreadCtx + progress task on compio::fs::AsyncFd,
+           UcxConn read/write via ucp_stream_*_nbx, UcxListener via
+           ucp_listener_create + on_conn handler, UCX loopback test
+           suite mirroring loopback_tcp.rs.
 
-Branch: f100-ucx (off main; commits 14506a5..1198bfd).
+Next steps: Phase 3 (Tasks 13–19 in plan). First sub-task: scaffold
+            crates/transport/ucx-sys-mini with bindgen build.rs over
+            <ucp/api/ucp.h> producing the symbol whitelist from
+            spec §13.
+
+Branch: f100-ucx (commits 14506a5..1283c4a).
