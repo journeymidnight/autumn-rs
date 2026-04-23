@@ -15,6 +15,9 @@
 //! enums) so `&'static dyn AutumnTransport` from `init()` still gives runtime
 //! transport selection. Hot-path I/O dispatches via enum match — strictly
 //! cheaper than the vtable hop §12 Q2 originally analysed.
+//!
+//! TCP variants carry `compio::net` types directly; UCX variants (Phase 3)
+//! will carry the custom `UcxConn` / `UcxListener` types from `crate::ucx`.
 
 use std::io;
 use std::net::SocketAddr;
@@ -38,25 +41,23 @@ pub trait AutumnTransport: Send + Sync + 'static {
     fn kind(&self) -> TransportKind;
 }
 
-/// Concrete connection enum — variants added per backend (`Tcp` always present,
-/// `Ucx` under `feature = "ucx"`).
 pub enum Conn {
-    Tcp(tcp::TcpConn),
+    Tcp(compio::net::TcpStream),
     // #[cfg(feature = "ucx")] Ucx(crate::ucx::UcxConn),  // Phase 3
 }
 
 pub enum Listener {
-    Tcp(tcp::TcpListener),
+    Tcp(compio::net::TcpListener),
     // #[cfg(feature = "ucx")] Ucx(crate::ucx::UcxListener),  // Phase 3
 }
 
 pub enum ReadHalf {
-    Tcp(tcp::TcpReadHalf),
+    Tcp(compio::net::OwnedReadHalf<compio::net::TcpStream>),
     // #[cfg(feature = "ucx")] Ucx(crate::ucx::UcxReadHalf),  // Phase 3
 }
 
 pub enum WriteHalf {
-    Tcp(tcp::TcpWriteHalf),
+    Tcp(compio::net::OwnedWriteHalf<compio::net::TcpStream>),
     // #[cfg(feature = "ucx")] Ucx(crate::ucx::UcxWriteHalf),  // Phase 3
 }
 
@@ -65,25 +66,24 @@ pub enum WriteHalf {
 impl Conn {
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         match self {
-            Conn::Tcp(c) => c.peer_addr(),
+            Conn::Tcp(s) => s.peer_addr(),
         }
     }
 
     pub fn into_split(self) -> (ReadHalf, WriteHalf) {
         match self {
-            Conn::Tcp(c) => {
-                let (r, w) = c.into_split();
+            Conn::Tcp(s) => {
+                let (r, w) = s.into_split();
                 (ReadHalf::Tcp(r), WriteHalf::Tcp(w))
             }
         }
     }
 
-    /// If this connection is backed by a TCP socket, return it for socket-level
-    /// tuning (`SO_RCVBUF`, `SO_SNDBUF`, `TCP_NODELAY`). Returns `None` for
-    /// non-TCP transports.
+    /// `Some(_)` only for the `Tcp` variant — call sites that need TCP-only
+    /// socket tuning (`SO_RCVBUF`, `TCP_NODELAY`) gate on this.
     pub fn as_tcp(&self) -> Option<&compio::net::TcpStream> {
         match self {
-            Conn::Tcp(c) => Some(c.as_inner()),
+            Conn::Tcp(s) => Some(s),
         }
     }
 }
@@ -94,7 +94,7 @@ impl compio::io::AsyncRead for Conn {
         buf: B,
     ) -> compio::BufResult<usize, B> {
         match self {
-            Conn::Tcp(c) => c.read(buf).await,
+            Conn::Tcp(s) => s.read(buf).await,
         }
     }
 }
@@ -105,17 +105,17 @@ impl compio::io::AsyncWrite for Conn {
         buf: B,
     ) -> compio::BufResult<usize, B> {
         match self {
-            Conn::Tcp(c) => c.write(buf).await,
+            Conn::Tcp(s) => s.write(buf).await,
         }
     }
     async fn flush(&mut self) -> io::Result<()> {
         match self {
-            Conn::Tcp(c) => c.flush().await,
+            Conn::Tcp(s) => s.flush().await,
         }
     }
     async fn shutdown(&mut self) -> io::Result<()> {
         match self {
-            Conn::Tcp(c) => c.shutdown().await,
+            Conn::Tcp(s) => s.shutdown().await,
         }
     }
 }
@@ -126,8 +126,8 @@ impl Listener {
     pub async fn accept(&mut self) -> io::Result<(Conn, SocketAddr)> {
         match self {
             Listener::Tcp(l) => {
-                let (c, peer) = l.accept().await?;
-                Ok((Conn::Tcp(c), peer))
+                let (s, peer) = l.accept().await?;
+                Ok((Conn::Tcp(s), peer))
             }
         }
     }
