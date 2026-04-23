@@ -343,9 +343,11 @@ impl Clone for ExtentNode {
 
 /// Helper: one-shot RPC call (connect → send → recv → close).
 async fn rpc_oneshot(addr: std::net::SocketAddr, msg_type: u8, payload: Bytes) -> Result<Bytes> {
-    let stream = compio::net::TcpStream::connect(addr).await?;
-    stream.set_nodelay(true)?;
-    let (mut reader, mut writer) = stream.into_split();
+    let conn = autumn_transport::current_or_init().connect(addr).await?;
+    if let Some(s) = conn.as_tcp() {
+        s.set_nodelay(true)?;
+    }
+    let (mut reader, mut writer) = conn.into_split();
 
     let req_id = 1u32;
     let frame = Frame::request(req_id, msg_type, payload);
