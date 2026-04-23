@@ -91,6 +91,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let _ = autumn_transport::init();
+
     // ---- pprof-rs profiling hook (R2 diagnosis) ----
     #[cfg(feature = "profiling")]
     {

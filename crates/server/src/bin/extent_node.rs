@@ -108,6 +108,8 @@ fn main() -> Result<()> {
         )
         .init();
 
+    let _ = autumn_transport::init();
+
     let args = parse_args();
 
     // F099-M: each shard i listens on port + i * shard_stride.

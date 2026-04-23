@@ -933,6 +933,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let _ = autumn_transport::init();
+
     let args = parse_args();
     let mut client = ClusterClient::connect(&args.manager).await?;
 
