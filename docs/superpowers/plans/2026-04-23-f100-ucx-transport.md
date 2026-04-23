@@ -12,6 +12,28 @@
 
 **Preflight:** `scripts/check_roce.sh` (committed `cafd4c0`) — exit 0 means build host has ≥1 usable RoCEv2 GID; required for Phase 3+ tests.
 
+> **DESIGN PIVOT NOTE (2026-04-23, during P1 Task 2 execution):** Spec §3
+> originally drafted `Box<dyn AutumnConn>` (trait object). compio 0.18's
+> `AsyncRead::read<B: IoBufMut>` / `AsyncWrite::write<T: IoBuf>` are generic
+> methods → trait is NOT dyn-compatible → `Box<dyn ...>` does not compile.
+>
+> **Corrected design:** `enum Conn { Tcp(TcpConn), #[cfg(feature="ucx")]
+> Ucx(UcxConn) }`, plus the same shape for `Listener` / `ReadHalf` /
+> `WriteHalf`. Match-arm dispatch on hot path (cheaper and more inlinable
+> than vtable). The `AutumnTransport` trait stays dyn-safe — its methods
+> have no generic params. See spec §3 (rewritten) and §12 Q2-rev for the
+> full rationale.
+>
+> **Plan delta:** every reference below to `Box<dyn AutumnConn>` /
+> `Box<dyn AutumnReadHalf>` / `Box<dyn AutumnWriteHalf>` /
+> `Box<dyn AutumnListener>` should read as `Conn` / `ReadHalf` /
+> `WriteHalf` / `Listener` (the concrete enum types from
+> `autumn_transport`). The Phase 1 Task 2 code block below is fully
+> rewritten to match. Phase 2/3 code snippets retain the old wording for
+> reference; the implementer should treat them as pseudocode showing
+> *which call site changes*, and use the corrected types from the
+> as-shipped `autumn-transport` crate.
+
 ---
 
 ## File-Structure Map

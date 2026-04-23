@@ -62,32 +62,49 @@ autumn-rs/crates/transport/               [新 crate, feature = "ucx"]
 - Manager 注册协议 / etcd 服务发现数据模型（`host:port` 格式不变，UCX 只换 port 语义）。
 - path 3（PS 内 P-log pipeline）、path 4（Manager RPC）。
 
-## 3. Transport trait 契约
+## 3. Transport trait + 类型 surface（已修正：enum dispatch — 见 §12 Q2-rev）
 
 ```rust
+#[async_trait::async_trait(?Send)]
 pub trait AutumnTransport: Send + Sync + 'static {
-    async fn connect(&self, addr: SocketAddr) -> io::Result<Box<dyn AutumnConn>>;
-    async fn bind(&self, addr: SocketAddr) -> io::Result<Box<dyn AutumnListener>>;
-    fn kind(&self) -> TransportKind;  // Tcp | Ucx，给日志/bench 用
+    async fn connect(&self, addr: SocketAddr) -> io::Result<Conn>;
+    async fn bind(&self, addr: SocketAddr) -> io::Result<Listener>;
+    fn kind(&self) -> TransportKind;  // Tcp | Ucx
 }
 
-pub trait AutumnListener: Send + 'static {
-    async fn accept(&mut self) -> io::Result<(Box<dyn AutumnConn>, SocketAddr)>;
-    fn local_addr(&self) -> io::Result<SocketAddr>;
+pub enum Conn {
+    Tcp(TcpConn),
+    #[cfg(feature = "ucx")] Ucx(UcxConn),
 }
 
-pub trait AutumnConn:
-    compio::io::AsyncRead + compio::io::AsyncWriteExt + 'static
-{
-    fn peer_addr(&self) -> io::Result<SocketAddr>;
-    fn into_split(self: Box<Self>)
-        -> (Box<dyn AutumnReadHalf>, Box<dyn AutumnWriteHalf>);
+pub enum Listener {
+    Tcp(TcpListener),
+    #[cfg(feature = "ucx")] Ucx(UcxListener),
 }
+
+pub enum ReadHalf  { Tcp(TcpReadHalf),  #[cfg(feature = "ucx")] Ucx(UcxReadHalf)  }
+pub enum WriteHalf { Tcp(TcpWriteHalf), #[cfg(feature = "ucx")] Ucx(UcxWriteHalf) }
+
+impl Conn {
+    pub fn peer_addr(&self) -> io::Result<SocketAddr>;
+    pub fn into_split(self) -> (ReadHalf, WriteHalf);
+    /// `Some(_)` only for the Tcp variant — call sites that need TCP-only
+    /// socket tuning (SO_RCVBUF, TCP_NODELAY) gate on this.
+    pub fn as_tcp(&self) -> Option<&compio::net::TcpStream>;
+}
+
+impl compio::io::AsyncRead  for Conn      { /* enum-match dispatch */ }
+impl compio::io::AsyncWrite for Conn      { /* same */ }
+impl compio::io::AsyncRead  for ReadHalf  { /* same */ }
+impl compio::io::AsyncWrite for WriteHalf { /* same */ }
+impl Listener { pub async fn accept(&mut self) -> io::Result<(Conn, SocketAddr)>; }
 ```
 
+- `AutumnTransport` 仍是 dyn-safe trait（方法都不带泛型参数；返回 concrete enum）。`init()` 仍返回 `&'static dyn AutumnTransport`，runtime 选择不变。
+- `Conn` / `Listener` / `ReadHalf` / `WriteHalf` 都是 concrete enum，直接 impl compio I/O trait —— 内部用 match 派发到对应 variant。
 - 使用 compio 自带 I/O trait（owned buffer / `BufResult`），避免再套一层包装。
 - `into_split` 两端半独立，沿用现有 `compio::net::OwnedReadHalf / OwnedWriteHalf` 语义。
-- `Box<dyn ...>` 的动态分发放在连接建立期；热路径 I/O 经 vtable 一次，相对一个 `read()` 系统调用成本可以忽略。想完全避开 vtable 可以后续引入泛型版本（`enum TransportImpl { Tcp(...), Ucx(...) }`），v1 先走 trait object 简化调用方。
+- 派发开销：每个 read/write 一次 enum tag 比较 + 跳转，比原计划的 vtable 跳转更便宜，且支持内联（branch predictor 在 hot loop 上稳态命中）。
 
 ## 4. 探测 & 选择流程
 
@@ -373,19 +390,36 @@ UCX 选出的协议表（`UCX_PROTO_INFO=y` 输出）：
 - path 2 小 RPC（64–512 B 用户请求 + 10 B frame header）跨在阈值两侧；UCX 自动按 size 选 eager copy-in 或 zcopy，无需上层手动切换。
 - 13.4 GB/s 是 200 Gb/s ConnectX RoCEv2 的合理水线（理论 25 GB/s，proto + 单 QP loopback overhead 后这个数字符合预期）。
 
-### Q2 · `Box<dyn AutumnConn>` vs. enum dispatch
+### Q2 · `Box<dyn AutumnConn>` vs. enum dispatch — **修正 (2026-04-23 P1.2 实施时发现)**
 
-**结论：维持 §3 的 trait object 设计。**
+**最终结论：enum dispatch（被强制；trait object 在 compio 0.18 上根本编不过）。**
 
-理由（量化）：
+实施 P1 Task 2 时发现：compio 0.18 的 `compio::io::AsyncRead::read` 与
+`AsyncWrite::write` 都是 generic over buffer 类型（`B: IoBufMut` / `T: IoBuf`）。
+trait 含 generic method 即不是 dyn-compatible，`Box<dyn AutumnConn>` 编译失败：
 
-| Path | per-op cost | vtable hop | 占比 |
-|---|---|---|---|
-| Path 2 RDMA 小 RPC | ~3 μs | ~1 ns | 0.03 % |
-| Path 1 RDMA 1 MB append | ~50 μs | ~1 ns | 0.002 % |
-| Path 2 kernel TCP 小 RPC | ~15 μs | ~1 ns | 0.007 % |
+```
+error[E0038]: the trait `AutumnConn` is not dyn compatible
+   = note: ...because method `read` has generic type parameters
+   = note: ...because method `write` has generic type parameters
+```
 
-vtable 跳转在工作负载层面完全消失在噪声里。enum 唯一可能的胜场是 hot decode loop 的可内联性，但 RPC frame decode 是先读到 buffer 再原地解析，内层循环不再回到 conn → 这部分增益不存在。trait object 的优点：贴近 compio 自身 `AsyncRead/AsyncWriteExt` 的形状、加入第三种 transport（如 SHM）零调用方改动、接口清晰。如果未来 flame graph 出现 `vtable_dispatch` 热点（高度不确定），可以局部把最热的 1–2 个方法改成 enum 单态化，无需推翻整个 API。
+原 Q2 答案的 vtable-cost 分析变得无意义 —— vtable 路径根本不存在。
+三种修补：
+
+| Option | 影响 |
+|---|---|
+| **A. Vec<u8> 类型擦除** | 每次 I/O 都进 Vec 分配 + memcpy；杀掉 path-1 zero-copy 收益 |
+| **B. enum dispatch**（采纳） | match-on-tag 派发；分支预测器命中后 ≈ vtable，且可内联；样板量可控 |
+| **C. 编译时单态化** | 失去 `AUTUMN_TRANSPORT=auto` 运行时探测（Q1 明确要求） |
+
+**enum 形状见 §3 已更新版本。** 可见 surface 的样板量：4 个 enum × 各 3–4 个 method
+match arm。新增 transport（如 SHM）需要在每个 enum 加 variant + match arm —— 机械、
+编译器会在缺 arm 时立刻报错，可控。
+
+**Performance 重评估：** match-on-tag 是 1 个对齐 load + 1 个 compare + 1 个 branch
+（~1 cycle on hot path with branch predictor warm）。等价或优于 vtable。原 Q2 结论
+"vtable 在工作负载层面消失在噪声里" 对 enum 同样成立 → 设计目标无回归。
 
 ### Q4 · Branch / 与 repo extraction 的时序
 
