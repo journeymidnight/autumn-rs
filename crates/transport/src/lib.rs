@@ -21,12 +21,32 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 
 mod probe;
 mod tcp;
 
 pub use probe::{decide, Decision};
 pub use tcp::TcpTransport;
+
+static GLOBAL: OnceLock<Box<dyn AutumnTransport>> = OnceLock::new();
+
+/// Initialise the process-global transport. Idempotent; first call wins.
+/// Phase 2 returns `TcpTransport` unconditionally; Phase 4 will honour
+/// `AUTUMN_TRANSPORT` via `decide()`.
+pub fn init() -> &'static dyn AutumnTransport {
+    let _ = GLOBAL.set(Box::new(TcpTransport));
+    let t = &**GLOBAL.get().expect("init");
+    tracing::info!("autumn-transport: init kind={:?}", t.kind());
+    t
+}
+
+/// Read the process-global transport. Panics if `init()` was never called.
+pub fn current() -> &'static dyn AutumnTransport {
+    &**GLOBAL
+        .get()
+        .expect("autumn_transport::init() must be called once at startup")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {
