@@ -9,6 +9,7 @@ members = [
   "crates/server",
   "crates/client",
   "crates/transport",
+  "crates/transport/ucx-sys-mini",
   "crates/fuse",
 ]
 exclude = ["python"]
