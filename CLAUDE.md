@@ -3,12 +3,10 @@
 ## 长任务执行规则 (inherited from monorepo 2026-04-21)
 
 ### 项目目标
-1. 把当前项目 `autumn` 从 Go 改写成 Rust。
-2. 新代码在 `autumn-rs`。
-3. 底层是 `stream layer`，负责分布式文件存储与恢复。
-4. 上层是 `partition layer`，负责 table 管理与有序 KV 存储。
-5. IMPORTANT: 在改写过程中，始终考虑性能因素, 来理解原始的go代码，新的rust代码也要充分考虑性能因素
-6. autumn-rs项目都增加了CLAUDE.md作为总结和编码思路， 如果有修改，需要同步更新CLAUDE.md
+1. 底层是 `stream layer`，负责分布式文件存储与恢复。
+2. 上层是 `partition layer`，负责 table 管理与有序 KV 存储。
+3. IMPORTANT: 任何代码改动都要充分考虑性能因素。
+4. 各 crate 都维护 CLAUDE.md 作为架构总结与编码思路；改动相关代码时需同步更新对应 CLAUDE.md。
 
 ### 长任务执行规则（参考 effective harness 思路）
 1. 每次开始任务前，必须先读取仓库根目录 `claude-progress.txt` 与 `feature_list.md`。
