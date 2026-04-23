@@ -1,28 +1,32 @@
 Date: 2026-04-23
 TaskStatus: completed
-Task scope: F100-UCX brainstorm (UCP/UCX RDMA transport for path 1 + path 2).
-            Pre-extraction audit + repo extraction (T1–T12) is fully done.
+Task scope: F100-UCX Phase 1 — autumn-transport crate scaffold + TCP impl
+            + generic loopback suite (on f100-ucx feature branch).
 
-Current summary: Brainstorm spec written + section-by-section reviewed.
-                 Q1/Q2/Q4 resolved (see §12 of design doc):
-                   Q1 — ucp_stream rndv on UCX 1.16 + RoCEv2 verified
-                        via ucx_perftest (13.4 GB/s @ 256 KB on
-                        rc_mlx5/mlx5_0:1; UCX_PROTO_INFO output captured
-                        in spec). Design premise holds.
-                   Q2 — Trait object dispatch (Box<dyn AutumnConn>) kept;
-                        vtable cost is sub-noise on RDMA RTT.
-                   Q4 — Repo extraction completed; F100 advances on main.
-                 Spec at:
-                   docs/superpowers/specs/2026-04-23-ucx-transport-design.md
-                 Feature registered: feature_list.md F100-UCX
-                                     (P5 — Network transport abstraction).
+Current summary: New crate at crates/transport/ with enum-dispatch surface
+                 (Conn / Listener / ReadHalf / WriteHalf, with Tcp variant
+                 today and Ucx variant gated to Phase 3 under feature="ucx").
+                 AutumnTransport stays a dyn-safe trait so init() returns
+                 &'static dyn AutumnTransport for runtime selection.
+                 TcpTransport passes 4-test loopback suite (ping-pong, 2MB
+                 large-payload, half-close, 1k concurrent connections) +
+                 connect/bind round-trip + 5 probe::decide() env tests.
+                 Full workspace test (excl manager+fuse): 187/0/0 — no
+                 regressions vs baseline.
 
-Main gaps: P0 task before P3 — `ucx-sys` Rust crate quality survey
-           (else fall back to in-tree bindgen sub-crate, +1–2 days).
-           Spec §10 still tracks 4 open risks (MR cache, cancel/buffer
-           ownership, ucx-sys quality, deployment RoCE-IP precondition).
+                 DESIGN PIVOT during P1.2: spec §3 originally had
+                 Box<dyn AutumnConn> trait object; compio 0.18's
+                 AsyncRead::read<B: IoBufMut> / AsyncWrite::write<T: IoBuf>
+                 are generic methods, making the trait NOT dyn-compatible
+                 (E0038). Switched to enum dispatch — strictly cheaper than
+                 vtable, fully inlinable, runtime selection still works via
+                 the dyn-safe AutumnTransport trait. Spec §3 + §12 Q2-rev
+                 updated; plan top has DESIGN PIVOT NOTE.
 
-Next steps: Pending user review of the committed spec → invoke
-            superpowers:writing-plans skill to break P1–P5 into
-            executable tasks. P0 ucx-sys research is the first plan
-            entry.
+Main gaps: P2 — migrate autumn-rpc / autumn-stream / autumn-manager call
+           sites onto the enum surface (still TCP underneath); ~5 tasks.
+
+Next steps: Phase 2. After P2 closeout, Phase 3 implements UcxTransport
+            using in-tree bindgen sub-crate (per spec §13).
+
+Branch: f100-ucx (off main; commits 14506a5..1198bfd).
