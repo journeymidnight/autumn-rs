@@ -43,6 +43,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let _ = autumn_transport::init();
+
     let args = parse_args();
     let addr: SocketAddr = format!("0.0.0.0:{}", args.port)
         .parse()

@@ -1,0 +1,8 @@
+{
+  "kind": "transport_micro_bench",
+  "host": "dc62-p3-t302-n014",
+  "date": "2026-04-24T01:54:21Z",
+  "scenarios": [
+    "      TCP (loopback): ping_pong 64B =    6.88 μs/op  |  throughput 1048576B =   2839.9 MB/s (    352 μs/op)",    "       UCX (rc_mlx5): ping_pong 64B =   24.17 μs/op  |  throughput 1048576B =   1133.3 MB/s (    882 μs/op)"
+  ]
+}

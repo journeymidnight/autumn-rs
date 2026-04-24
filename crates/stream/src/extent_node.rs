@@ -343,9 +343,11 @@ impl Clone for ExtentNode {
 
 /// Helper: one-shot RPC call (connect → send → recv → close).
 async fn rpc_oneshot(addr: std::net::SocketAddr, msg_type: u8, payload: Bytes) -> Result<Bytes> {
-    let stream = compio::net::TcpStream::connect(addr).await?;
-    stream.set_nodelay(true)?;
-    let (mut reader, mut writer) = stream.into_split();
+    let conn = autumn_transport::current_or_init().connect(addr).await?;
+    if let Some(s) = conn.as_tcp() {
+        s.set_nodelay(true)?;
+    }
+    let (mut reader, mut writer) = conn.into_split();
 
     let req_id = 1u32;
     let frame = Frame::request(req_id, msg_type, payload);
@@ -427,12 +429,12 @@ enum ReadBurst {
     Data {
         buf: Vec<u8>,
         n: usize,
-        reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
+        reader: autumn_transport::ReadHalf,
     },
     /// read() returned 0 (peer closed).
     Eof {
         #[allow(dead_code)]
-        reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
+        reader: autumn_transport::ReadHalf,
         #[allow(dead_code)]
         buf: Vec<u8>,
     },
@@ -440,7 +442,7 @@ enum ReadBurst {
     Err {
         e: std::io::Error,
         #[allow(dead_code)]
-        reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
+        reader: autumn_transport::ReadHalf,
         #[allow(dead_code)]
         buf: Vec<u8>,
     },
@@ -449,7 +451,7 @@ enum ReadBurst {
 /// Build a `'static`-lifetime `LocalBoxFuture<ReadBurst>` that reads once
 /// into `buf` and returns ownership of both `reader` and `buf`.
 fn spawn_read(
-    mut reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
+    mut reader: autumn_transport::ReadHalf,
     buf: Vec<u8>,
 ) -> futures::future::LocalBoxFuture<'static, ReadBurst> {
     use compio::io::AsyncRead;
@@ -1231,20 +1233,25 @@ impl ExtentNode {
     }
 
     /// Start the RPC server on a single-threaded compio runtime.
-    /// Accepts TCP connections and handles them cooperatively.
+    /// Accepts connections (TCP or UCX, per `autumn_transport::current()`)
+    /// and handles them cooperatively. TCP-only socket tuning gated on
+    /// `Conn::as_tcp()` so UCX paths skip the TCP setsockopt calls.
     pub async fn serve(&self, addr: SocketAddr) -> Result<()> {
-        let listener = TcpListener::bind(addr).await?;
-        tracing::info!(addr = %addr, "extent node listening");
+        let transport = autumn_transport::current_or_init();
+        let mut listener = transport.bind(addr).await?;
+        tracing::info!(addr = %addr, kind = ?transport.kind(), "extent node listening");
         loop {
-            let (stream, peer) = listener.accept().await?;
-            if let Err(e) = stream.set_nodelay(true) {
-                tracing::warn!(peer = %peer, error = %e, "set_nodelay failed");
+            let (conn, peer) = listener.accept().await?;
+            if let Some(s) = conn.as_tcp() {
+                if let Err(e) = s.set_nodelay(true) {
+                    tracing::warn!(peer = %peer, error = %e, "set_nodelay failed");
+                }
+                set_tcp_buffer_sizes(s, 512 * 1024);
             }
-            set_tcp_buffer_sizes(&stream, 512 * 1024);
             let node = self.clone();
             compio::runtime::spawn(async move {
                 tracing::debug!(peer = %peer, "new rpc connection");
-                if let Err(e) = Self::handle_connection(stream, node).await {
+                if let Err(e) = Self::handle_connection(conn, node).await {
                     tracing::debug!(peer = %peer, error = %e, "rpc connection ended");
                 }
             })
@@ -1303,7 +1310,7 @@ impl ExtentNode {
     /// `ReadBurst`. No per-iteration allocation — the same 512 KiB Vec is
     /// recycled.
     pub async fn handle_connection(
-        stream: compio::net::TcpStream,
+        conn: autumn_transport::Conn,
         node: ExtentNode,
     ) -> Result<()> {
         use futures::future::{select, Either, LocalBoxFuture};
@@ -1312,7 +1319,7 @@ impl ExtentNode {
 
         const READ_BUF_SIZE: usize = 512 * 1024;
 
-        let (reader, mut writer) = stream.into_split();
+        let (reader, mut writer) = conn.into_split();
         let mut decoder = FrameDecoder::new();
 
         let cap = extent_inflight_cap();

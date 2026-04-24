@@ -84,8 +84,8 @@ impl EtcdMirror {
 /// Minimal connection pool for manager → extent node calls.
 /// Duplicates the pattern from stream::conn_pool to avoid manager→stream dep.
 struct RpcConn {
-    reader: compio::net::OwnedReadHalf<TcpStream>,
-    writer: compio::net::OwnedWriteHalf<TcpStream>,
+    reader: autumn_transport::ReadHalf,
+    writer: autumn_transport::WriteHalf,
     decoder: FrameDecoder,
     next_id: u32,
     read_buf: Vec<u8>,
@@ -93,9 +93,11 @@ struct RpcConn {
 
 impl RpcConn {
     async fn connect(addr: SocketAddr) -> Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
-        let (reader, writer) = stream.into_split();
+        let conn = autumn_transport::current_or_init().connect(addr).await?;
+        if let Some(s) = conn.as_tcp() {
+            s.set_nodelay(true)?;
+        }
+        let (reader, writer) = conn.into_split();
         Ok(Self {
             reader,
             writer,

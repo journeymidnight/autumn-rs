@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+autumn-transport = { path = "../transport" }
 bytes.workspace = true
 compio = { version = "0.18", features = ["net", "time", "macros", "dispatcher"] }
 rkyv = { version = "0.8.15", features = ["alloc"] }

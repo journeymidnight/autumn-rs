@@ -12,6 +12,7 @@ tracing.workspace = true
 autumn-common = { path = "../common" }
 autumn-rpc = { path = "../rpc" }
 autumn-stream = { path = "../stream" }
+autumn-transport = { path = "../transport" }
 compio = { version = "0.18", features = ["net", "time", "macros", "dispatcher"] }
 crc32c.workspace = true
 xxhash-rust.workspace = true

@@ -1130,18 +1130,18 @@ enum PsReadBurst {
     Data {
         buf: Vec<u8>,
         n: usize,
-        reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
+        reader: autumn_transport::ReadHalf,
     },
     Eof {
         #[allow(dead_code)]
-        reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
+        reader: autumn_transport::ReadHalf,
         #[allow(dead_code)]
         buf: Vec<u8>,
     },
     Err {
         e: std::io::Error,
         #[allow(dead_code)]
-        reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
+        reader: autumn_transport::ReadHalf,
         #[allow(dead_code)]
         buf: Vec<u8>,
     },
@@ -1150,7 +1150,7 @@ enum PsReadBurst {
 /// Build a `'static`-lifetime `LocalBoxFuture<PsReadBurst>` that reads once
 /// into `buf` and returns ownership of both reader and buf.
 fn spawn_ps_read(
-    mut reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
+    mut reader: autumn_transport::ReadHalf,
     buf: Vec<u8>,
 ) -> futures::future::LocalBoxFuture<'static, PsReadBurst> {
     use compio::io::AsyncRead;
@@ -1378,7 +1378,7 @@ async fn d1_fast_path_round_trip(
 ///                     for other partitions synthesise a `NotFound` error
 ///                     frame (TODO(F099-K) forwarding).
 async fn handle_ps_connection(
-    stream: TcpStream,
+    conn: autumn_transport::Conn,
     req_tx: mpsc::Sender<PartitionRequest>,
     owner_part: u64,
 ) -> Result<()> {
@@ -1386,7 +1386,7 @@ async fn handle_ps_connection(
 
     const READ_BUF_SIZE: usize = 64 * 1024;
 
-    let (reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = conn.into_split();
     let mut decoder = FrameDecoder::new();
 
     let cap = ps_conn_inflight_cap();
@@ -1735,7 +1735,7 @@ async fn partition_thread_main(
     // back to the caller via `ready_tx`. If EITHER step fails, we report
     // the error and exit the partition thread so the main loop can
     // reclaim the partition slot and, on the next sync cycle, retry.
-    let listener = match compio::net::TcpListener::bind(listen_addr).await {
+    let mut listener = match autumn_transport::current_or_init().bind(listen_addr).await {
         Ok(l) => l,
         Err(e) => {
             let _ = ready_tx.send(Err(anyhow!("bind {}: {}", listen_addr, e)));
@@ -1829,12 +1829,14 @@ async fn partition_thread_main(
                     }
                 };
                 match res {
-                    Ok((stream, peer)) => {
-                        let _ = stream.set_nodelay(true);
+                    Ok((conn, peer)) => {
+                        if let Some(s) = conn.as_tcp() {
+                            let _ = s.set_nodelay(true);
+                        }
                         let req_tx_conn = req_tx_for_accept.clone();
                         compio::runtime::spawn(async move {
                             if let Err(e) =
-                                handle_ps_connection(stream, req_tx_conn, part_id).await
+                                handle_ps_connection(conn, req_tx_conn, part_id).await
                             {
                                 tracing::debug!(part_id, peer = %peer, error = %e, "ps connection ended");
                             }

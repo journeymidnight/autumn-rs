@@ -1,28 +1,45 @@
-Date: 2026-04-23
+Date: 2026-04-24
 TaskStatus: completed
-Task scope: F100-UCX brainstorm (UCP/UCX RDMA transport for path 1 + path 2).
-            Pre-extraction audit + repo extraction (T1–T12) is fully done.
+Task scope: F100-UCX — full feature complete (P0–P5) on f100-ucx branch.
 
-Current summary: Brainstorm spec written + section-by-section reviewed.
-                 Q1/Q2/Q4 resolved (see §12 of design doc):
-                   Q1 — ucp_stream rndv on UCX 1.16 + RoCEv2 verified
-                        via ucx_perftest (13.4 GB/s @ 256 KB on
-                        rc_mlx5/mlx5_0:1; UCX_PROTO_INFO output captured
-                        in spec). Design premise holds.
-                   Q2 — Trait object dispatch (Box<dyn AutumnConn>) kept;
-                        vtable cost is sub-noise on RDMA RTT.
-                   Q4 — Repo extraction completed; F100 advances on main.
-                 Spec at:
-                   docs/superpowers/specs/2026-04-23-ucx-transport-design.md
-                 Feature registered: feature_list.md F100-UCX
-                                     (P5 — Network transport abstraction).
+Current summary:
+  ✓ P0 ucx-sys decision (in-tree bindgen)         commit 14506a5
+  ✓ P1 crate scaffold + TCP impl + loopback        commits e79efe6..adfe94f
+       DESIGN PIVOT: enum dispatch (compio I/O    commit 70a0903
+       traits not dyn-compatible)
+  ✓ P1.6 simplify (drop redundant wrappers)       commit 36291a2
+  ✓ P2 call-site migration (rpc/stream/manager)   commits e213490..273fa3a
+  ✓ P3 UcxTransport implementation                 commits c2b4adb..8ced10d
+  ✓ P3-review: cancel safety + FORCE close        commit fdfe9b0
+  ✓ P3-fix: eventfd-driven progress               commit 72b7d30
+  ✓ P4 probe + env switch + validator + serve_ucx commits af6537a..b8e7923
+  ✓ P5 perf infra + numbers + README + feature   commit 61ca166
 
-Main gaps: P0 task before P3 — `ucx-sys` Rust crate quality survey
-           (else fall back to in-tree bindgen sub-crate, +1–2 days).
-           Spec §10 still tracks 4 open risks (MR cache, cancel/buffer
-           ownership, ucx-sys quality, deployment RoCE-IP precondition).
+Acceptance gates (per feature_list.md F100-UCX):
+  (a) ✓ TCP workspace test green: 192/0/0 (188 baseline + 4 validator)
+  (b) ✓ UCX loopback green: 4 active tests on rc_mlx5/mlx5_0 RoCEv2
+       7/7 rpc round_trip integration tests pass individually under
+       AUTUMN_TRANSPORT=ucx
+  (c) ⚠ Cross-host RDMA A/B not measured this session — single-host
+       loopback shows UCX slower than TCP (24μs vs 6.9μs ping-pong)
+       because TCP loopback bypasses the NIC; UCX rc_mlx5 hits the
+       HCA even for self-traffic. Needs 2-host deploy for the
+       targeted 30-50% RTT improvement validation.
+  (d) ✓ UCX_PROTO_INFO confirms zero-copy proto on rc_mlx5 ≥331 B
+       (close to spec §12 Q1's 478 B prediction)
 
-Next steps: Pending user review of the committed spec → invoke
-            superpowers:writing-plans skill to break P1–P5 into
-            executable tasks. P0 ucx-sys research is the first plan
-            entry.
+Branch: f100-ucx, base main, commits 14506a5..61ca166 (~25 commits).
+Default workspace: 192 passed / 0 failed / 0 ignored. No regressions.
+With ucx feature: +5 transport tests (4 loopback_ucx + 1 cancel-safety
+regression), 1 ignored half_close (ucp_stream has no FIN concept).
+
+Main gaps (carried into post-merge follow-ups):
+  - Cross-host perf A/B (the spec's actual perf targets need two hosts)
+  - Multi-core UCX server (current serve_ucx is single-thread; per-worker
+    listener + manager-side discovery needed for production scaling)
+  - Cross-test UCX state isolation in test harness (individual tests
+    work; full-suite under AUTUMN_TRANSPORT=ucx hangs on worker reuse)
+  - ucp_request_cancel for pending recv: 100k-iter spin cap as DiD
+    (works in practice; no observed leak)
+
+Next steps: superpowers:finishing-a-development-branch to merge / PR.

@@ -8,6 +8,8 @@ members = [
   "crates/partition-server",
   "crates/server",
   "crates/client",
+  "crates/transport",
+  "crates/transport/ucx-sys-mini",
   "crates/fuse",
   "examples/gallery",
 ]

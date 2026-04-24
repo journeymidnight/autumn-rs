@@ -14,6 +14,7 @@ futures = "0.3"
 tracing.workspace = true
 autumn-common = { path = "../common" }
 autumn-rpc = { path = "../rpc" }
+autumn-transport = { path = "../transport" }
 compio = { version = "0.18", features = ["net", "time", "macros", "dispatcher", "fs"] }
 libc = "0.2"
 rkyv = { version = "0.8.15", features = ["alloc"] }

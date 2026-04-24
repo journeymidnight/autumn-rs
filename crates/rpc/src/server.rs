@@ -66,10 +66,51 @@ impl RpcServer {
 
     /// Start serving on the given address. Runs until the process exits.
     ///
-    /// A dedicated OS thread runs the accept loop (blocking). Accepted
-    /// `std::net::TcpStream` (Send) is dispatched to compio worker threads
-    /// where it's converted to `compio::net::TcpStream` (!Send, thread-local).
+    /// Branches on the process-global transport (set by
+    /// `autumn_transport::init`):
+    ///
+    /// - **TCP**: dedicated OS thread runs `std::net::TcpListener::accept`,
+    ///   accepted streams are dispatched across compio worker threads via
+    ///   `Dispatcher` (multi-core scaling, the original autumn-rpc design).
+    ///
+    /// - **UCX**: accept loop runs on the calling compio runtime (UCX EPs
+    ///   are thread-bound to their worker; they cannot be Send-shipped to
+    ///   another runtime). Each connection is `compio::runtime::spawn`'d
+    ///   on the same runtime as a separate task. Single-thread server —
+    ///   sufficient for path 2 functional correctness; multi-core UCX
+    ///   server scaling needs per-worker listeners + manager-side
+    ///   discovery, which is a separate ticket.
     pub async fn serve(self, addr: SocketAddr) -> Result<(), RpcError> {
+        let transport = autumn_transport::current_or_init();
+        match transport.kind() {
+            autumn_transport::TransportKind::Tcp => self.serve_tcp(addr).await,
+            autumn_transport::TransportKind::Ucx => self.serve_ucx(addr).await,
+        }
+    }
+
+    /// UCX-mode serve: accept on the calling compio runtime, spawn each
+    /// conn handler as a task on the same runtime. No Dispatcher.
+    async fn serve_ucx(self, addr: SocketAddr) -> Result<(), RpcError> {
+        let transport = autumn_transport::current_or_init();
+        let mut listener = transport.bind(addr).await?;
+        let local_addr = listener.local_addr()?;
+        tracing::info!(addr = %local_addr, "rpc server (UCX) listening");
+
+        let handler = self.handler;
+        loop {
+            let (conn, peer_addr) = listener.accept().await?;
+            let handler = handler.clone();
+            spawn(async move {
+                tracing::debug!(peer = %peer_addr, "new ucx rpc connection");
+                if let Err(e) = handle_conn_generic(conn, handler).await {
+                    tracing::debug!(peer = %peer_addr, error = %e, "ucx rpc connection ended");
+                }
+            })
+            .detach();
+        }
+    }
+
+    async fn serve_tcp(self, addr: SocketAddr) -> Result<(), RpcError> {
         let std_listener = std::net::TcpListener::bind(addr)?;
         let local_addr = std_listener.local_addr()?;
         tracing::info!(addr = %local_addr, "rpc server listening");
@@ -146,6 +187,59 @@ impl RpcServer {
                 return Err(RpcError::Io(std::io::Error::other(
                     "all rpc worker threads panicked",
                 )));
+            }
+        }
+    }
+}
+
+/// Handle a single connection over an `autumn_transport::Conn`. Identical
+/// frame loop to the TCP-specific `handle_connection`; we just take the
+/// trait-enum so it works for both Tcp and Ucx variants.
+async fn handle_conn_generic(
+    conn: autumn_transport::Conn,
+    handler: BoxHandler,
+) -> Result<(), RpcError> {
+    let (mut reader, writer) = conn.into_split();
+    let writer = Rc::new(futures::lock::Mutex::new(writer));
+    let mut decoder = FrameDecoder::new();
+    let mut buf = vec![0u8; 64 * 1024];
+
+    loop {
+        let BufResult(result, buf_back) = reader.read(buf).await;
+        buf = buf_back;
+        let n = result?;
+        if n == 0 {
+            return Ok(());
+        }
+        decoder.feed(&buf[..n]);
+        loop {
+            match decoder.try_decode()? {
+                Some(frame) => {
+                    if frame.req_id == 0 {
+                        continue;
+                    }
+                    let handler = handler.clone();
+                    let writer = writer.clone();
+                    let req_id = frame.req_id;
+                    let msg_type = frame.msg_type;
+                    spawn(async move {
+                        let resp_frame = match handler(msg_type, frame.payload).await {
+                            Ok(payload) => Frame::response(req_id, msg_type, payload),
+                            Err((code, message)) => {
+                                let payload = RpcError::encode_status(code, &message);
+                                Frame::error(req_id, msg_type, payload)
+                            }
+                        };
+                        let data = resp_frame.encode();
+                        let mut w = writer.lock().await;
+                        let BufResult(result, _) = w.write_all(data).await;
+                        if let Err(e) = result {
+                            tracing::debug!(req_id, error = %e, "failed to write response");
+                        }
+                    })
+                    .detach();
+                }
+                None => break,
             }
         }
     }

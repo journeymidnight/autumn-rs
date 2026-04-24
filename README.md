@@ -391,6 +391,94 @@ cargo test --workspace
 
 ---
 
+## UCX / RDMA Mode (F100-UCX)
+
+autumn-rs can carry hot RPC paths over RDMA via UCP/UCX. Default is TCP;
+UCX is opt-in at compile time and runtime.
+
+### Build host preconditions
+- `libucx-dev` ≥ 1.16 (`pkg-config --modversion ucx`)
+- At least one mlx5 (or other RDMA) HCA with a RoCE v2 GID on a routable
+  IP (IPv4 or IPv6 GUA/ULA — link-local fe80::/10 doesn't work)
+- Verify with `scripts/check_roce.sh` (exit 0 = ready;
+  `--listen-candidates` lists valid bind IPs)
+
+### Build with the UCX feature
+    cargo build --workspace --features autumn-transport/ucx
+
+The default build has zero UCX dependencies.
+
+### Runtime selection
+    AUTUMN_TRANSPORT=auto   # default; pick UCX if RDMA available, else TCP
+    AUTUMN_TRANSPORT=tcp    # force TCP
+    AUTUMN_TRANSPORT=ucx    # force UCX (panics if no RDMA on this host)
+
+`auto` mode probes `ucp_context_print_info` for any of `rc_mlx5` /
+`rc_verbs` / `dc_mlx5` / `ud_mlx5` / `ud_verbs`. Pure-TCP UCX (no RDMA
+HCA) is treated as "unavailable" — there's no benefit layering UCX on
+top of native TCP.
+
+### Listen-address rule under UCX
+The address passed to PartitionServer / ExtentNode / Manager (via the
+binaries' `--port` flag, which becomes `0.0.0.0:<port>` or
+`[::]:<port>`) must resolve to a netdev with a RoCE GID. Wildcards
+(`0.0.0.0`, `[::]`) are fine — UCX will bind all routable interfaces.
+For an explicit IP, use `scripts/check_roce.sh --listen-candidates`
+to see what's valid.
+
+The opt-in helper `autumn_transport::check_listen_addr(addr, kind)`
+returns an `Err` with the candidate list if a binary is misconfigured —
+binaries can call it after `init()` for a hard failure on bad addresses.
+
+### Manual smoke (single-host loopback over UCX TCP fallback)
+
+Loopback `127.0.0.1` has no RDMA route; UCX falls back to its own TCP
+transport. Useful for proving the env switch + serve_ucx + connect path
+end-to-end, but **not** representative of real perf.
+
+    # All three in separate shells; each must export the env so init()
+    # picks UCX. Use the autumn-server binary names (autumn-extent-node,
+    # autumn-manager-server, autumn-ps).
+    AUTUMN_TRANSPORT=ucx cargo run --features autumn-transport/ucx \
+        -p autumn-server --bin autumn-extent-node \
+        -- --data /tmp/ext0 --port 9101 --manager 127.0.0.1:9001
+
+    AUTUMN_TRANSPORT=ucx cargo run --features autumn-transport/ucx \
+        -p autumn-server --bin autumn-manager-server -- --port 9001
+
+    AUTUMN_TRANSPORT=ucx cargo run --features autumn-transport/ucx \
+        -p autumn-server --bin autumn-ps \
+        -- --psid 1 --port 9201 --manager 127.0.0.1:9001 --data /tmp/ps1
+
+Each binary's startup log must contain
+`autumn-transport: init kind=Ucx`. If any prints `Tcp` the env was not
+honored; check that the feature flag is on and re-run.
+
+### Perf measurement
+
+Transport-level micro-bench (no cluster needed):
+
+    ./scripts/perf_ucx_baseline.sh transport
+
+Cluster-level A/B (requires `cluster.sh start N` first; honest perf
+needs a 2-host setup since loopback bypasses the NIC):
+
+    ./scripts/perf_ucx_baseline.sh cluster
+
+Single-host loopback numbers from this build host (`dc62-p3-t302-n014`,
+10× mlx5 HCAs):
+
+    TCP (loopback): ping_pong 64B = 6.88 μs/op | 2839 MB/s @ 1MB
+    UCX (rc_mlx5):  ping_pong 64B = 24.17 μs/op | 1133 MB/s @ 1MB
+
+UCX is *slower* in single-host loopback because TCP loopback bypasses
+the NIC entirely (kernel memcpy) while UCX rc_mlx5 hits the real HCA
+even for loopback (PCIe DMA + transmit + DMA back). The expected perf
+win materialises only when network latency dominates — i.e. across
+hosts. Cross-host A/B is a separate deploy session.
+
+---
+
 ## Notes
 
 - `IoMode::IoUring` is not yet implemented; extent nodes use `IoMode::Standard`.
