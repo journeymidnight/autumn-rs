@@ -110,7 +110,7 @@ run_perf() {
     else
         echo "[perf-check] --skip-cluster: assuming cluster is already running in $mode mode"
     fi
-    AUTUMN_TRANSPORT="$mode" "$AC" --manager 127.0.0.1:9001 \
+    AUTUMN_TRANSPORT="$mode" "$AC" --manager "${AUTUMN_BIND_HOST:-127.0.0.1}:9001" \
         perf-check \
         --nosync \
         --threads 256 \

@@ -16,7 +16,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$SCRIPT_DIR/target/release"
 LOG_DIR="/tmp/autumn-rs-logs"
 DATA_ROOT="${AUTUMN_DATA_ROOT:-/tmp/autumn-rs}"
-MANAGER_ADDR="127.0.0.1:9001"
+# F100-UCX: AUTUMN_BIND_HOST overrides the bind/advertise host. Default is
+# IPv4 loopback. For UCX cluster perf, set to a RoCE-attached IP (must be
+# in scripts/check_roce.sh --listen-candidates), e.g.:
+#   AUTUMN_BIND_HOST="[fdbb:dc62:3:3::16]" bash perf_check.sh --shm --ucx
+BIND_HOST="${AUTUMN_BIND_HOST:-127.0.0.1}"
+MANAGER_ADDR="${BIND_HOST}:9001"
 ETCD_DIR="$DATA_ROOT/etcd"
 
 MANAGER="$BIN/autumn-manager-server"
@@ -79,9 +84,12 @@ kill_proc() {
 
 wait_port() {
     local port="$1" name="$2" retries="${3:-20}"
-    echo -n "[cluster] waiting for $name on :$port ..."
+    # 4th arg overrides the host (default = BIND_HOST). etcd binds on
+    # 127.0.0.1 only — pass that explicitly when waiting for it.
+    local host="${4:-${BIND_HOST//[\[\]]/}}"
+    echo -n "[cluster] waiting for $name on :$port (host=$host)..."
     for _ in $(seq 1 $retries); do
-        if nc -z 127.0.0.1 "$port" 2>/dev/null; then echo " ok"; return 0; fi
+        if nc -z "$host" "$port" 2>/dev/null; then echo " ok"; return 0; fi
         sleep 0.5
     done
     echo " TIMEOUT"
@@ -139,7 +147,7 @@ do_start() {
         --data-dir "$ETCD_DIR" \
         --listen-client-urls http://127.0.0.1:2379 \
         --advertise-client-urls http://127.0.0.1:2379
-    wait_port 2379 etcd
+    wait_port 2379 etcd 20 127.0.0.1
 
     # Clean etcd data on fresh start (no bootstrap marker = fresh cluster)
     local bootstrap_marker="$DATA_ROOT/bootstrapped"
@@ -172,7 +180,7 @@ do_start() {
         # shellcheck disable=SC2086  # intentional word splitting for positional args
         "$AC" --manager "$MANAGER_ADDR" format \
             --listen ":9101" \
-            --advertise "127.0.0.1:9101" \
+            --advertise "${BIND_HOST}:9101" \
             $(echo "$disk_arg" | tr ',' ' ')
     fi
 
@@ -237,10 +245,10 @@ do_start() {
                     fi
                 done
                 "$AC" --manager "$MANAGER_ADDR" register-node \
-                    --addr "127.0.0.1:$port" --disk "disk-$i" \
+                    --addr "${BIND_HOST}:$port" --disk "disk-$i" \
                     --shard-ports "$shard_ports_csv"
             else
-                "$AC" --manager "$MANAGER_ADDR" register-node --addr "127.0.0.1:$port" --disk "disk-$i"
+                "$AC" --manager "$MANAGER_ADDR" register-node --addr "${BIND_HOST}:$port" --disk "disk-$i"
             fi
         done
         echo "[cluster] extent node(s) registered"
@@ -257,7 +265,7 @@ do_start() {
         "$PS" \
         --psid 1 --port 9201 \
         --manager "$MANAGER_ADDR" \
-        --advertise 127.0.0.1:9201
+        --advertise "${BIND_HOST}:9201"
     # F099-K: no central PS listener — partitions bind their own ports
     # AFTER they are opened. Don't wait for port 9201 here; bootstrap
     # below creates partitions, and the per-partition listener (9201,
@@ -309,7 +317,7 @@ do_start() {
     echo ""
     echo "[cluster] ✓ cluster ready (replicas=$replicas)"
     echo "[cluster]   manager  : $MANAGER_ADDR"
-    echo "[cluster]   partition: 127.0.0.1:9201"
+    echo "[cluster]   partition: ${BIND_HOST}:9201"
     echo "[cluster]   logs     : $LOG_DIR"
     echo ""
     echo "  AC=(\"$AC\" --manager \"$MANAGER_ADDR\")"
