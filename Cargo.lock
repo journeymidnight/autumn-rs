@@ -231,6 +231,7 @@ dependencies = [
  "autumn-common",
  "autumn-rpc",
  "autumn-stream",
+ "autumn-transport",
  "bytes",
  "compio",
  "crc32c",
@@ -311,8 +312,11 @@ dependencies = [
  "bytes",
  "compio",
  "futures",
+ "libc",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tracing",
+ "ucx-sys-mini",
 ]
 
 [[package]]
@@ -557,7 +561,7 @@ dependencies = [
  "polling",
  "slab",
  "smallvec",
- "socket2",
+ "socket2 0.6.2",
  "synchrony",
  "thin-cell",
  "windows-sys 0.61.2",
@@ -629,7 +633,7 @@ dependencies = [
  "either",
  "libc",
  "once_cell",
- "socket2",
+ "socket2 0.6.2",
  "widestring",
  "windows-sys 0.61.2",
 ]
@@ -676,7 +680,7 @@ dependencies = [
  "pin-project-lite",
  "scoped-tls",
  "slab",
- "socket2",
+ "socket2 0.6.2",
  "windows-sys 0.61.2",
 ]
 
@@ -1172,7 +1176,7 @@ dependencies = [
  "hyper",
  "libc",
  "pin-project-lite",
- "socket2",
+ "socket2 0.6.2",
  "tokio",
  "tower-service",
  "tracing",
@@ -2176,6 +2180,16 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "socket2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "socket2"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "86f4aa3ad99f2088c990dfa82d367e19cb29268ed67c574d10d0a4bfe71f07e0"
@@ -2363,7 +2377,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
- "socket2",
+ "socket2 0.6.2",
  "windows-sys 0.61.2",
 ]
 
