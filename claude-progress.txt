@@ -1,57 +1,71 @@
 Date: 2026-04-24
 TaskStatus: completed
-Task scope: F101 — RpcServer dead-code deletion + perf_check 2×2×2 matrix.
-(Originally drafted cross-thread UCX `ConnReqHandoff` primitives; user
- identified they'd violate thread-per-core for PS/extent-node; reverted
- in-session. Only the dead-code + perf_check work survives.)
+Task scope: F101-b root-cause the client-side UCX hang; fix under
+thread-per-core; verify the full 2×2×2 matrix now produces end-to-end
+numbers for both TCP and UCX.
 
 Current summary:
-  ✓ Deleted crates/rpc/src/server.rs, tests/round_trip.rs, and the
-    RpcServer-based test module at the tail of client.rs. Removed
-    `pub mod server` + the `[features] ucx` block in autumn-rpc
-    Cargo.toml + the compio `dispatcher` feature (only used by the
-    deleted Dispatcher-based serve_tcp).
-    Rationale: RpcServer is not referenced by any production hot path
-    (ExtentNode::serve, partition_thread_main, manager each run their
-    own transport.bind + handle_*_connection loop).
-  ✓ perf_check.sh default → 2×2×2 = 8 runs
-    (transport{tcp,ucx} × partitions{1,8} × pipeline-depth{1,8}).
-    Cluster restarted per (mode, parts); depth inner loop reuses
-    cluster (depth is client-side only — saves 4 × ~25 s).
-    Per-combo baselines perf_baseline_${tr}_p${p}_d${d}${_shm?}.json;
-    .gitignore whitelist expanded to !perf_baseline*.json.
-  ✓ UCX RDMA numbers measured (partitions=8, 4 KB, 3-replica, --nosync,
-    rc_mlx5/mlx5_0 RoCEv2, disk):
-      - 8t/d1  : 57 k w / 213 k r
-      - 32t/d1 : 85 k w / 331 k r
-      - 32t/d8 : 144 k w / 702 k r / 2.74 GB/s read  ← sweet spot
-      - 64t/d8 : 52 k  / 194 k    (falls off the cliff)
-    Best TCP comparison (256t/d1/p=8): 141 k w / 581 k r.
-    UCX matches write, +21 % read, 2.5–9× lower p50/p99 at 1/8 threads.
+  Used systematic-debugging skill with fail-stop experiment gates — no
+  blind trials. Results:
 
-Acceptance gates:
-  (a) ✓ Workspace builds clean with and without
-      `--features autumn-transport/ucx`.
-  (b) ✓ TCP workspace test suite green post-deletion (35+ binaries,
-       0 failed).
-  (c) ✓ Existing UCX loopback suite (4 active + 1 ignored +
-       cancel-safety regression) still green.
-  (d) ✓ RpcServer deletion: grep confirmed no production references.
+  Exp 1 (p=32 × 256t × d=1) → 0 ops. Kills H1 (per-listener EP
+    saturation) as primary cause — even at 8 EP/listener, 256 client
+    threads hang.
+  Exp 2 (fix p=32, sweep threads) → 64t=18 k, 128t=58 ops
+    (collapse), 256t=0. Phase transition at 128 clients. Confirms
+    problem is client-side scale, NOT per-listener.
+  Exp 3 (UCX log + HCA caps):
+    • uct_cm.c:97 DIAG "resolve callback failed with error:
+      Destination is unreachable" — RDMA CM layer fail at connect.
+    • PS log silent during hang — failure before server-side accept.
+    • ibv_devinfo mlx5_0: max_qp=131 072, max_cq=16 M — HCA fine.
+    • ulimit -l = 8 MB — present but doesn't change the diagnosis.
+  H5 (connect storm) partial-confirm: connect-stagger 5 ms/tid on
+    128t → 551 ops/s (10× over no-stagger), 256t → still 0. Stagger
+    code reverted (dead code vs. the real fix).
+  Decisive fix test: keep in-flight ≈ 256 but via 16 threads ×
+    depth=16 instead of 256 threads × depth=1:
+    • UCX p=32 × 16t × d=16 → 95 k write / 1.71 M read ops/s.
+    • TCP p=32 × 16t × d=16 → 166 k write / 1.81 M read ops/s.
+    Historical "1 M TCP reads" memory ratified.
 
-Main gaps (not fixed this session; separate concerns):
-  - perf_check.sh hardcodes --threads 256; UCX runs in the default
-    matrix all hang at 0 ops because one partition's single ucp_worker
-    can't drain 32 EP CQs fast enough. Under this codebase's
-    thread-per-core model the fix is to run more partitions (so each
-    worker sees ≤ 8 EPs), not to multi-thread one partition's
-    listener. Document in run instructions; don't change code.
-  - TCP p=8 read regression user flagged (historical 1 M → 581 k ops/s)
-    not investigated — separate concern.
+  Root cause: perf_check.sh's hardcoded --threads 256 itself
+  violates thread-per-core on the client side (192 logical CPUs
+  available, but 256 OS threads each pinning a ucp_worker is
+  *strictly worse* than fewer threads × deeper pipeline, and at
+  100+ concurrent rdma_cm connects UCX saturates).
+
+Fix (no server-side code change — thread-per-core preserved):
+  ✓ perf_check.sh default: --threads 16 (overridable via --threads N).
+  ✓ Matrix default still 2×2×2 (transport × partitions{1,8} ×
+    pipeline-depth{1,8}); now all 8 combos produce non-zero
+    end-to-end numbers.
+  ✓ await_ports_clear deadline bumped 90 s → 180 s so TCP→UCX
+    cluster transition doesn't die on TIME_WAIT from the prior
+    TCP client run.
+  ✓ Stagger code reverted.
+  ✓ Eight fresh per-combo baselines written
+    (perf_baseline_${transport}_p${parts}_d${depth}.json).
+
+Default matrix measured this session (threads=16, disk, 4 KB):
+  TCP p=1 × d=1 :  42 k w /  60 k r
+  TCP p=1 × d=8 :  68 k w /  91 k r
+  TCP p=8 × d=1 :  69 k w / 467 k r
+  TCP p=8 × d=8 : 142 k w / 1.11 M r  ← TCP best
+  UCX p=1 × d=1 :  33 k w /  70 k r
+  UCX p=1 × d=8 :  49 k w / 104 k r
+  UCX p=8 × d=1 :  61 k w / 277 k r
+  UCX p=8 × d=8 : 129 k w / 764 k r   ← UCX best
+
+Acceptance:
+  (a) ✓ Default perf_check.sh completes all 8 combos non-zero.
+  (b) ✓ TCP best read ≥ 1 M ops/s.
+  (c) ✓ UCX best read ≥ 500 k ops/s (764 k actual).
+  (d) ✓ No server-side code change (thread-per-core preserved).
 
 Next steps:
-  - If UCX 256-thread end-to-end perf still matters, diagnose why
-    partitions=8 × 32 EPs/partition still hangs (connect-storm? HCA QP
-    cap? stream credit deadlock?) by running partitions=32/64 ×
-    256-thread; if per-partition EP count dropping below ~8 unblocks
-    it, the fix is config/tuning, not a new architecture.
-  - Investigate TCP N=8 read regression vs historical 1 M ops/s.
+  - None in this area. UCX + TCP both converge on the same
+    scaling rule: total in-flight = threads × pipeline-depth; keep
+    threads ≤ ~32 for cache-locality + avoid rdma_cm saturation.
+  - Separate concern (not touched this session): cross-host UCX A/B
+    (F100-UCX gate c) still requires a 2-host deploy.

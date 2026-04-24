@@ -487,15 +487,30 @@ the cluster is restarted per (transport, partitions) but reused across
 pipeline-depth values (depth is a client-side knob only).
 
 Narrow the matrix with `--tcp` / `--ucx` / `--partitions N` /
-`--pipeline-depth N`. Storage defaults to `/tmp/autumn-rs`; pass
-`--shm` for `/dev/shm/autumn-rs` (RAM tmpfs; fsync is a no-op).
+`--pipeline-depth N` / `--threads N`. Storage defaults to
+`/tmp/autumn-rs`; pass `--shm` for `/dev/shm/autumn-rs` (RAM tmpfs;
+fsync is a no-op).
 
-UCX caveat — `perf_check.sh` hardcodes `--threads 256`, which
-saturates the single-thread UCX server today, so every UCX run in the
-default matrix prints 0 ops / segfault. To see real UCX numbers run
-the autumn-client directly at a lower thread count while the cluster
-is up — the measured sweet spot on this host is 32 threads × depth=8 ×
-partitions=8 (144 k writes/s, 702 k reads/s, 2.74 GB/s read).
+**Scaling rule (thread-per-core):** total in-flight ops = threads ×
+pipeline-depth. Prefer fewer threads with deeper pipeline over many
+threads with shallow pipeline — better cache locality and, on UCX,
+avoids rdma_cm saturation at > ~100 concurrent connects.
+`perf_check.sh` defaults to `--threads 16` for this reason; overshoot
+to `--threads 256` will make UCX runs hang (rdma_cm `Destination
+unreachable` at connect time) and TCP runs waste CPU on no perf win.
+
+Measured default matrix on this host (Xeon 8457C, 192 CPU, mlx5_0
+RoCEv2, disk, 4 KB values, 3-replica, --nosync):
+
+| transport | partitions | pipeline-depth | write ops/s | read ops/s |
+|---|---|---|---|---|
+| TCP | 8 | 8 | **141,988** | **1,112,102** |
+| UCX | 8 | 8 | 129,199 | 763,697 |
+| TCP | 8 | 1 | 69,371 | 466,833 |
+| UCX | 8 | 1 | 61,060 | 276,573 |
+
+Off-matrix sweet spots confirmed: UCX p=32 × 16t × d=16 → 1.71 M
+reads; TCP p=32 × 16t × d=16 → 1.81 M reads.
 
 ---
 

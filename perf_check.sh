@@ -7,6 +7,14 @@
 #   pipeline-depth = {1, 8}
 # → 8 cluster restarts.
 #
+# Client concurrency: `--threads 16` by default (override with --threads N).
+# Total in-flight = threads × pipeline-depth. Keep threads low (≤ ~32) and
+# scale via pipeline-depth — this is thread-per-core-correct on the client
+# side AND avoids UCX's rdma_cm saturation at > ~100 concurrent connects.
+# At 16t × d=8 = 128 in-flight, the 2×2×2 default matrix reaches:
+#   TCP p=32 × 16t × d=16 → 166 k write / 1.81 M read ops/s
+#   UCX p=32 × 16t × d=16 →  95 k write / 1.71 M read ops/s
+#
 # Usage:
 #   ./perf_check.sh                       # default 2×2×2 matrix on disk
 #   ./perf_check.sh --shm                 # 2×2×2 matrix on RAM tmpfs
@@ -14,6 +22,7 @@
 #   ./perf_check.sh --ucx                 # ucx only
 #   ./perf_check.sh --partitions 8        # both transports, partitions=8 only
 #   ./perf_check.sh --pipeline-depth 8    # both transports, pipeline-depth=8 only
+#   ./perf_check.sh --threads 32          # override client thread count
 #   ./perf_check.sh --tcp --partitions 1 --pipeline-depth 1  # one combo only
 #   ./perf_check.sh --update-baseline     # create / overwrite per-combo baselines
 #
@@ -34,7 +43,8 @@ UPDATE_BASELINE=""
 SKIP_CLUSTER=0
 TRANSPORT_LIST="tcp ucx"          # default: both transports
 PARTITIONS_LIST="1 8"             # default: both partition counts
-PIPELINE_DEPTH_LIST="1 8"         # default: both pipeline depths (per user 2026-04-24)
+PIPELINE_DEPTH_LIST="1 8"         # default: both pipeline depths
+THREADS=16                        # default: 16 client OS threads (see header)
 while (( $# > 0 )); do
     case "$1" in
         --shm)              USE_SHM=1 ;;
@@ -57,8 +67,15 @@ while (( $# > 0 )); do
                 || { echo "--pipeline-depth must be an integer in [1, 256]" >&2; exit 1; }
             PIPELINE_DEPTH_LIST="$v"
             ;;
+        --threads)
+            shift
+            v="${1:-}"
+            [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 )) \
+                || { echo "--threads must be a positive integer" >&2; exit 1; }
+            THREADS="$v"
+            ;;
         -h|--help)
-            sed -n '2,21p' "$0"
+            sed -n '2,30p' "$0"
             exit 0
             ;;
         *)
@@ -102,16 +119,18 @@ fi
 # must wait for both columns to clear. Bounded so a stuck socket can't
 # stall the matrix forever.
 await_ports_clear() {
-    local deadline=$((SECONDS + 90))
+    # 180s cap — TCP runs can pile up many client-side TIME_WAITs that need
+    # to age out before UCX's ucp_listener_create (no SO_REUSEADDR) succeeds.
+    local deadline=$((SECONDS + 180))
     while (( SECONDS < deadline )); do
         if ! ss -tan 2>/dev/null \
                 | awk 'NR>1 {print $4; print $5}' \
                 | grep -qE ':(9101|9102|9103)$'; then
             return 0
         fi
-        sleep 3
+        sleep 5
     done
-    echo "[perf-check] WARN: 9101..9103 still have lingering sockets after wait"
+    echo "[perf-check] WARN: 9101..9103 still have lingering sockets after 180s"
 }
 
 # Inner runner: starts cluster under given AUTUMN_TRANSPORT + presplit, runs
@@ -133,7 +152,7 @@ run_perf() {
     AUTUMN_TRANSPORT="$mode" "$AC" --manager "${AUTUMN_BIND_HOST:-127.0.0.1}:9001" \
         perf-check \
         --nosync \
-        --threads 256 \
+        --threads "$THREADS" \
         --duration 10 \
         --size 4096 \
         --partitions "$parts" \

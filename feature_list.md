@@ -613,6 +613,32 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 
 ## P5 — Network transport abstraction (RDMA / UCX)
 
+### F101-b · Root-cause client-side UCX hang; switch perf_check default to thread-per-core-correct config
+- **Target:** Diagnose why `perf_check.sh` UCX runs hang (0 ops) and restore UCX to working state end-to-end — while respecting thread-per-core (no per-partition worker fanout). Verify root cause by experiment, then remove the condition that triggers it.
+- **Evidence (experiments this session, all on single-host `rc_mlx5/mlx5_0` RoCEv2, 3-replica, --nosync, disk):**
+  - Exp 1: UCX p=32 × 256t × d=1 → 0 ops → rejects H1 (per-listener EP count). Even 8 EP/listener hangs at 256 client threads.
+  - Exp 2: fix p=32, sweep client threads → 64t=18 k, **128t=58 ops** (collapse), 256t=0. Transition 64→128 clients, same EP/listener.
+  - Exp 3: UCX_LOG_LEVEL=info on 128t reveals `uct_cm.c:97 DIAG resolve callback failed with error: Destination is unreachable` — RDMA CM address-resolve failure. PS log silent → failure is client-side BEFORE reaching the server. `ibv_devinfo`: max_qp = 131 072 (not QP cap); `ulimit -l` = 8 MB; HCA not the bottleneck.
+  - Diagnostic via `AUTUMN_PERF_CONNECT_STAGGER_MS=5` (connect stagger): 128t → 551 ops (10× over no-stagger, still broken); 256t → 0. Stagger is a partial mitigation for H5 (connect-storm) at 128, insufficient at 256. Stagger code reverted as dead (the real fix is fewer threads).
+  - **Decisive test — same in-flight, fewer threads:** 16 client threads × pipeline-depth=16 × partitions=32 UCX → **95 k write / 1.71 M read ops/s**. 256 in-flight via `threads × depth`, not 256 OS threads. TCP same config → 166 k w / 1.81 M r.
+- **Root cause:** `perf_check.sh` hardcoded `--threads 256`. Under thread-per-core the client shouldn't spawn 256 OS threads with a ucp_worker each; it should spawn few threads and deep-pipeline via `pipeline-depth`. At 100+ concurrent connects, UCX's rdma_cm returns EHOSTUNREACH on many, cascading into 0 ops. Server-side architecture is correct — no code change needed there. (ConnReqHandoff/accept_handoff primitives would have required per-partition multi-worker fan-out, which violates thread-per-core; reverted in this session's earlier commit.)
+- **Fix:** `perf_check.sh` default → `--threads 16` (override with `--threads N`). Full 2×2×2 default matrix now completes cleanly with 16 threads × 1 or 8 depth on both TCP and UCX. await_ports_clear deadline bumped to 180 s so TCP→UCX cluster transitions don't die on lingering TIME_WAIT from the TCP client run. Eight new per-combo baselines populated.
+- **Measured default matrix (threads=16, 4 KB values, disk, partitions ∈ {1,8}, depth ∈ {1,8}):**
+  | transport | p | d | write ops/s | read ops/s | write p99 | read p99 |
+  |---|---|---|---|---|---|---|
+  | TCP | 8 | 8 | 141,988 | **1,112,102** | 6.90 ms | 0.33 ms |
+  | TCP | 8 | 1 |  69,371 |   466,833 | 0.44 ms | 0.10 ms |
+  | UCX | 8 | 8 | **129,199** | 763,697 | 1.06 ms | 0.20 ms |
+  | UCX | 8 | 1 |  61,060 |   276,573 | 0.40 ms | 0.05 ms |
+
+  (Off-matrix sweeter spot confirmed during diagnosis: UCX p=32 × 16t × d=16 → 1.71 M reads; TCP p=32 × 16t × d=16 → 1.81 M reads. Historical "1 M reads" memory ratified.)
+- **Acceptance gates:**
+  - (a) ✓ Default `perf_check.sh` completes all 8 combos with non-zero throughput.
+  - (b) ✓ TCP best read ≥ 1 M ops/s (matches historical).
+  - (c) ✓ UCX best read ≥ 500 k ops/s.
+  - (d) ✓ No server-side code change (thread-per-core preserved).
+- **passes:** true
+
 ### F101 · RpcServer dead-code deletion + perf_check 2×2×2 matrix
 - **Target:** Two deliverables the user explicitly requested in 2026-04-24 session: (1) delete `autumn-rpc::server::RpcServer` and its tests — the struct is not used by any production hot path (extent-node, partition-server, manager each have their own `transport.bind` + `handle_*_connection` loop), confirmed by survey; (2) change `perf_check.sh` default to the full 2×2×2 = 8-run matrix: transport ∈ {tcp, ucx} × partitions ∈ {1, 8} × pipeline-depth ∈ {1, 8}. Rationale: no new code in hot paths — multi-core UCX scaling under this codebase's thread-per-core model is achieved by running **more partitions**, not more workers per partition. A cross-thread `ConnReqHandoff` primitive was drafted and then reverted in the same session after the user pointed out that fanning N worker threads per partition would violate thread-per-core.
 - **Evidence:** deleted: `crates/rpc/src/server.rs`, `crates/rpc/tests/round_trip.rs`, `RpcServer`-based test module at tail of `crates/rpc/src/client.rs`, `[features] ucx` block in `crates/rpc/Cargo.toml`, compio `dispatcher` feature. `perf_check.sh` rewritten to loop over transport × partitions × pipeline-depth with per-combo baselines `perf_baseline_${transport}_p${parts}_d${depth}${_shm?}.json`; cluster restarted per (mode, parts), depth loop reuses cluster. `.gitignore` whitelist expanded to `!perf_baseline*.json`.
