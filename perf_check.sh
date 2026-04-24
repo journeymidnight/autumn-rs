@@ -1,29 +1,34 @@
 #!/usr/bin/env bash
 # perf_check.sh — build release, start fresh 3-replica cluster, run perf-check
 #
-# Default: runs the full 2×2×2 = 8-run matrix
+# Default: runs the full 2×2×2×2 = 16-run matrix
 #   transports     = {tcp, ucx}
 #   partitions     = {1, 8}
 #   pipeline-depth = {1, 8}
-# → 8 cluster restarts.
+#   value size     = {4K, 8M}
+# → 4 cluster restarts (size + depth are client-side only; both inner-loop).
 #
 # Client concurrency: `--threads 16` by default (override with --threads N).
 # Total in-flight = threads × pipeline-depth. Keep threads low (≤ ~32) and
 # scale via pipeline-depth — this is thread-per-core-correct on the client
 # side AND avoids UCX's rdma_cm saturation at > ~100 concurrent connects.
-# At 16t × d=8 = 128 in-flight, the 2×2×2 default matrix reaches:
-#   TCP p=32 × 16t × d=16 → 166 k write / 1.81 M read ops/s
-#   UCX p=32 × 16t × d=16 →  95 k write / 1.71 M read ops/s
+# At 16t × d=8 = 128 in-flight the 2×2×2×2 matrix reaches:
+#   TCP p=8 × 16t × d=8 × 4 KB → 142 k write / 1.11 M read
+#   UCX p=8 × 16t × d=8 × 4 KB → 129 k write / 764 k read
+# 8 MB payload is where UCX rc_mlx5 zero-copy starts beating TCP loopback
+# memcpy — the rndv-get-zcopy handshake gets amortized over a much larger
+# DMA; at 4 KB it's pure overhead (see F100-UCX §12).
 #
 # Usage:
-#   ./perf_check.sh                       # default 2×2×2 matrix on disk
-#   ./perf_check.sh --shm                 # 2×2×2 matrix on RAM tmpfs
-#   ./perf_check.sh --tcp                 # tcp only (still both partition + pipeline-depth)
+#   ./perf_check.sh                       # default 2×2×2×2 matrix on disk
+#   ./perf_check.sh --shm                 # matrix on RAM tmpfs
+#   ./perf_check.sh --tcp                 # tcp only (still all inner axes)
 #   ./perf_check.sh --ucx                 # ucx only
 #   ./perf_check.sh --partitions 8        # both transports, partitions=8 only
-#   ./perf_check.sh --pipeline-depth 8    # both transports, pipeline-depth=8 only
+#   ./perf_check.sh --pipeline-depth 8    # pipeline-depth=8 only
+#   ./perf_check.sh --size 8m             # 8 MB only (or e.g. --size 4k, --size 1048576)
 #   ./perf_check.sh --threads 32          # override client thread count
-#   ./perf_check.sh --tcp --partitions 1 --pipeline-depth 1  # one combo only
+#   ./perf_check.sh --tcp --partitions 1 --pipeline-depth 1 --size 4k  # one combo
 #   ./perf_check.sh --update-baseline     # create / overwrite per-combo baselines
 #
 # --shm is useful for isolating the RPC / partition / stream layers from the
@@ -35,6 +40,20 @@ set -uo pipefail   # NOTE: no -e — we want the matrix to keep going past a fai
 # macOS default is 256 open files — far too few for 256-thread benchmarks
 ulimit -n 65536 2>/dev/null || true
 
+# RDMA pins memory via ibv_reg_mr. Default RLIMIT_MEMLOCK (often 8 MB) is
+# too small for the 8 MB payload matrix (16 threads × 8 MB = 128 MB
+# concurrent pinned). Child processes (cluster.sh → manager/node/ps
+# daemons) inherit this limit, so set it here to cover everything.
+ulimit -l unlimited 2>/dev/null || true
+
+# UCX workaround: this environment's IPC namespace rejects `shmat` (seen
+# in the PS log as `mm_sysv.c:59 UCX ERROR shmat(shmid=...) failed:
+# Invalid argument`), so UCX's sysv transport hangs on loopback transfers
+# larger than its small-msg threshold (≈ 4 KB works, 8 MB wedges). Default
+# UCX_TLS is `all`; exclude sysv. Respects caller-provided UCX_TLS.
+: "${UCX_TLS:=^sysv}"
+export UCX_TLS
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AC="$SCRIPT_DIR/target/release/autumn-client"
 
@@ -44,7 +63,31 @@ SKIP_CLUSTER=0
 TRANSPORT_LIST="tcp ucx"          # default: both transports
 PARTITIONS_LIST="1 8"             # default: both partition counts
 PIPELINE_DEPTH_LIST="1 8"         # default: both pipeline depths
+SIZES_LIST="4096 8388608"         # default: 4 KB (small-msg) + 8 MB (rndv-zcopy)
 THREADS=16                        # default: 16 client OS threads (see header)
+
+# Map a byte size to a short label used in baseline filenames:
+# 4096 → "4k", 8388608 → "8m", other → "<N>b" / "<N>k" / "<N>m".
+fmt_size_label() {
+    local n="$1"
+    if (( n >= 1048576 )) && (( n % 1048576 == 0 )); then
+        echo "$(( n / 1048576 ))m"
+    elif (( n >= 1024 )) && (( n % 1024 == 0 )); then
+        echo "$(( n / 1024 ))k"
+    else
+        echo "${n}b"
+    fi
+}
+# Parse a user-facing size arg: accepts "4096", "4k", "8m", etc.
+parse_size() {
+    local s="$1"
+    case "$s" in
+        *[mM])    echo $(( ${s%[mM]} * 1048576 )) ;;
+        *[kK])    echo $(( ${s%[kK]} * 1024 )) ;;
+        *[0-9])   echo "$s" ;;
+        *) echo "__ERR__" ;;
+    esac
+}
 while (( $# > 0 )); do
     case "$1" in
         --shm)              USE_SHM=1 ;;
@@ -66,6 +109,13 @@ while (( $# > 0 )); do
             [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 256 )) \
                 || { echo "--pipeline-depth must be an integer in [1, 256]" >&2; exit 1; }
             PIPELINE_DEPTH_LIST="$v"
+            ;;
+        --size)
+            shift
+            bytes="$(parse_size "${1:-}")"
+            [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes >= 1 )) \
+                || { echo "--size must be bytes, or Nk / Nm (e.g. 4096, 4k, 8m)" >&2; exit 1; }
+            SIZES_LIST="$bytes"
             ;;
         --threads)
             shift
@@ -134,19 +184,22 @@ await_ports_clear() {
 }
 
 # Inner runner: starts cluster under given AUTUMN_TRANSPORT + presplit, runs
-# perf-check at the requested pipeline-depth. The cluster is restarted per
-# (mode, parts) but reused across pipeline-depth values for that pair, since
-# pipeline-depth is purely a client-side knob — keeping the same cluster
-# avoids two extra cluster restarts per pipeline-depth swap (~25 s each).
+# perf-check at the requested pipeline-depth and value size. The cluster is
+# restarted per (mode, parts) but reused across pipeline-depth and size
+# values for that pair — both are purely client-side knobs. Saves many
+# cluster restarts (~25 s each) when the full matrix runs.
 run_perf() {
     local mode="$1"
     local parts="$2"
     local depth="$3"
-    local baseline="$SCRIPT_DIR/perf_baseline_${mode}_p${parts}_d${depth}${STORAGE_SUFFIX}.json"
+    local size="$4"
+    local size_label
+    size_label="$(fmt_size_label "$size")"
+    local baseline="$SCRIPT_DIR/perf_baseline_${mode}_p${parts}_d${depth}_s${size_label}${STORAGE_SUFFIX}.json"
 
     echo
     echo "============================================================"
-    echo "[perf-check] mode=$mode partitions=$parts pipeline-depth=$depth storage=$STORAGE_LABEL"
+    echo "[perf-check] mode=$mode partitions=$parts pipeline-depth=$depth size=$size_label ($size B) storage=$STORAGE_LABEL"
     echo "[perf-check] baseline=$(basename "$baseline")"
     echo "============================================================"
     AUTUMN_TRANSPORT="$mode" "$AC" --manager "${AUTUMN_BIND_HOST:-127.0.0.1}:9001" \
@@ -154,12 +207,12 @@ run_perf() {
         --nosync \
         --threads "$THREADS" \
         --duration 10 \
-        --size 4096 \
+        --size "$size" \
         --partitions "$parts" \
         --pipeline-depth "$depth" \
         --baseline "$baseline" \
         $UPDATE_BASELINE \
-        || echo "[perf-check] perf-check exited non-zero (mode=$mode parts=$parts depth=$depth)"
+        || echo "[perf-check] perf-check exited non-zero (mode=$mode parts=$parts depth=$depth size=$size_label)"
 }
 
 start_cluster_for() {
@@ -188,7 +241,9 @@ for mode in $TRANSPORT_LIST; do
             continue
         fi
         for depth in $PIPELINE_DEPTH_LIST; do
-            run_perf "$mode" "$parts" "$depth" || OVERALL_RC=1
+            for size in $SIZES_LIST; do
+                run_perf "$mode" "$parts" "$depth" "$size" || OVERALL_RC=1
+            done
         done
     done
 done

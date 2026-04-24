@@ -477,19 +477,36 @@ even for loopback (PCIe DMA + transmit + DMA back). The expected perf
 win materialises only when network latency dominates — i.e. across
 hosts. Cross-host A/B is a separate deploy session.
 
-### Cluster-level perf_check — 2×2×2 matrix
+### Cluster-level perf_check — 2×2×2×2 matrix
 
-`./perf_check.sh` (no flags) runs the full **2×2×2 = 8-run matrix**:
-transport ∈ {tcp, ucx} × partitions ∈ {1, 8} × pipeline-depth ∈ {1, 8}.
-Baselines are per-combo
-(`perf_baseline_${transport}_p${parts}_d${depth}${_shm?}.json`), and
-the cluster is restarted per (transport, partitions) but reused across
-pipeline-depth values (depth is a client-side knob only).
+`./perf_check.sh` (no flags) runs the full **2×2×2×2 = 16-run matrix**:
+transport ∈ {tcp, ucx} × partitions ∈ {1, 8} × pipeline-depth ∈ {1, 8}
+× value size ∈ {4K, 8M}. Baselines are per-combo
+(`perf_baseline_${transport}_p${parts}_d${depth}_s${size}${_shm?}.json`).
+The cluster is restarted per (transport, partitions) but reused across
+pipeline-depth and size (both are client-side knobs only).
 
 Narrow the matrix with `--tcp` / `--ucx` / `--partitions N` /
-`--pipeline-depth N` / `--threads N`. Storage defaults to
-`/tmp/autumn-rs`; pass `--shm` for `/dev/shm/autumn-rs` (RAM tmpfs;
-fsync is a no-op).
+`--pipeline-depth N` / `--size {4k|8m|N}` / `--threads N`. Storage
+defaults to `/tmp/autumn-rs`; pass `--shm` for `/dev/shm/autumn-rs`
+(RAM tmpfs; fsync is a no-op).
+
+The script sets two environment defaults (overridable by the caller)
+to keep UCX healthy at non-trivial message sizes:
+- `ulimit -l unlimited` — RDMA pins memory via `ibv_reg_mr`;
+  the common distro default (8 MB) is exhausted by 8 MB payload runs.
+- `UCX_TLS=^sysv` — this host's IPC namespace rejects `shmat`, which
+  hangs UCX's sysv transport on large loopback transfers (seen as
+  `mm_sysv.c:59 UCX ERROR shmat(...) failed: Invalid argument` in the
+  PS log). Excluding sysv falls back to other transports.
+
+**UCX 8 M loopback caveat**: with 127.0.0.1 / ::1 the cluster isn't on
+a RoCE-attached NIC, so UCX falls back to its own TCP transport
+(`uct_tcp`). UCX-over-TCP rendezvous handles 4 KB fine but is flaky on
+sustained 8 MB on a single EP (some runs complete, others wedge after
+3 ops). This is a loopback edge case — cross-host RDMA on
+RoCE-attached IPs is the target environment. TCP 8 MB runs cleanly in
+both loopback and cross-host.
 
 **Scaling rule (thread-per-core):** total in-flight ops = threads ×
 pipeline-depth. Prefer fewer threads with deeper pipeline over many
@@ -500,7 +517,9 @@ to `--threads 256` will make UCX runs hang (rdma_cm `Destination
 unreachable` at connect time) and TCP runs waste CPU on no perf win.
 
 Measured default matrix on this host (Xeon 8457C, 192 CPU, mlx5_0
-RoCEv2, disk, 4 KB values, 3-replica, --nosync):
+RoCEv2, disk, 3-replica, --nosync, threads=16):
+
+4 KB values — small-op ceiling:
 
 | transport | partitions | pipeline-depth | write ops/s | read ops/s |
 |---|---|---|---|---|
@@ -509,8 +528,24 @@ RoCEv2, disk, 4 KB values, 3-replica, --nosync):
 | TCP | 8 | 1 | 69,371 | 466,833 |
 | UCX | 8 | 1 | 61,060 | 276,573 |
 
-Off-matrix sweet spots confirmed: UCX p=32 × 16t × d=16 → 1.71 M
-reads; TCP p=32 × 16t × d=16 → 1.81 M reads.
+8 MB values — bandwidth ceiling (reads are VP-resolved via
+`read_bytes_from_extent`, so they hit the log_stream path too):
+
+| transport | partitions | depth | write ops/s | write MB/s | read ops/s | read MB/s |
+|---|---|---|---|---|---|---|
+| TCP | 8 | 8 | 199.5 | **1,596** | 91.3 | 730 |
+| TCP | 8 | 1 | 164.6 | 1,317 | 90.4 | 723 |
+| UCX | 8 | 8 | 35.0 | 280 | 34.3 | 275 |
+| TCP | 1 | 8 | 70.0 | 560 | 63.2 | 506 |
+| TCP | 1 | 1 | 71.6 | 573 | 59.2 | 474 |
+
+(TCP loopback wins decisively at 8 MB on this host — kernel memcpy
+runs at PCIe bandwidth while UCX-over-TCP has to traverse multiple
+userspace/kernel hops. On a real cross-host deploy, UCX RDMA would
+decouple from the CPU and typically match or beat this ceiling.)
+
+Off-matrix sweet spots confirmed at 4 KB: UCX p=32 × 16t × d=16 →
+1.71 M reads; TCP p=32 × 16t × d=16 → 1.81 M reads.
 
 ---
 

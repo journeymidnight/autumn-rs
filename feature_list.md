@@ -613,6 +613,15 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 
 ## P5 — Network transport abstraction (RDMA / UCX)
 
+### F101-c · Add size={4K, 8M} axis to perf_check; env defaults for UCX large-payload loopback
+- **Target:** perf_check.sh default matrix gains a **size** axis — now 2×2×2×2 = 16 runs (transport × partitions × pipeline-depth × size). 8 MB exercises the value-pointer path (values > VALUE_THROTTLE=4K are stored as VP in memtable, raw bytes go to log_stream), so the full flush pipeline is tested. Ship env workarounds needed to keep UCX healthy at large payloads on this host: `ulimit -l unlimited` (the 8 MB RLIMIT_MEMLOCK default is exhausted by 16 concurrent 8 MB pinned MRs) and `UCX_TLS=^sysv` (this IPC namespace rejects `shmat`, which hangs UCX's sysv transport on large loopback transfers — visible as `mm_sysv.c:59 UCX ERROR shmat(shmid=...) failed: Invalid argument` in the PS log).
+- **Evidence (this session):** `perf_check.sh` + eight baselines for TCP all sizes/combos; four UCX 4 K baselines; one UCX 8 M baseline (p=8 × d=8). Three UCX 8 M combos wedge — UCX on loopback falls back to `uct_tcp` (127.0.0.1 isn't on a RoCE-attached NIC), and UCX-over-TCP rendezvous is flaky on sustained single-EP 8 MB sends on this host. TCP 8 M runs cleanly across all 4 partition/depth combos (best: p=8 × d=8 → 199 ops/s / 1 596 MB/s write, 91 ops/s / 730 MB/s read).
+- **Notes:**
+  - `ulimit -l unlimited` is set in perf_check.sh so child cluster.sh → daemons inherit; verified via `/proc/<autumn-ps>/limits`.
+  - `UCX_TLS=^sysv` respects caller-provided `UCX_TLS` via `: "${UCX_TLS:=^sysv}"`; deployments that need a different transport whitelist can override.
+  - Single-op UCX 8 M put/get works fine. Failure mode is sustained 8 MB on a warm EP — likely UCX-over-TCP rendezvous credit/buffer interaction that only cross-host RoCE will bypass. Documented as a known loopback limitation; cross-host gate is F100-UCX (c).
+- **passes:** done_with_concerns (UCX 8 M loopback partial — scripts + docs ship; 3 of 4 UCX 8 M combos wedge and are flagged)
+
 ### F101-b · Root-cause client-side UCX hang; switch perf_check default to thread-per-core-correct config
 - **Target:** Diagnose why `perf_check.sh` UCX runs hang (0 ops) and restore UCX to working state end-to-end — while respecting thread-per-core (no per-partition worker fanout). Verify root cause by experiment, then remove the condition that triggers it.
 - **Evidence (experiments this session, all on single-host `rc_mlx5/mlx5_0` RoCEv2, 3-replica, --nosync, disk):**
