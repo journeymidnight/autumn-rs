@@ -1,17 +1,27 @@
 #!/usr/bin/env bash
 # perf_check.sh — build release, start fresh 3-replica cluster, run perf-check
 #
+# Default: runs the full 2×2×2 = 8-run matrix
+#   transports     = {tcp, ucx}
+#   partitions     = {1, 8}
+#   pipeline-depth = {1, 8}
+# → 8 cluster restarts.
+#
 # Usage:
-#   ./perf_check.sh                       # default disk (/tmp/autumn-rs on overlay)
-#   ./perf_check.sh --shm                 # RAM tmpfs (/dev/shm/autumn-rs)
-#   ./perf_check.sh --update-baseline     # create / overwrite baseline
-#   ./perf_check.sh --shm --update-baseline
+#   ./perf_check.sh                       # default 2×2×2 matrix on disk
+#   ./perf_check.sh --shm                 # 2×2×2 matrix on RAM tmpfs
+#   ./perf_check.sh --tcp                 # tcp only (still both partition + pipeline-depth)
+#   ./perf_check.sh --ucx                 # ucx only
+#   ./perf_check.sh --partitions 8        # both transports, partitions=8 only
+#   ./perf_check.sh --pipeline-depth 8    # both transports, pipeline-depth=8 only
+#   ./perf_check.sh --tcp --partitions 1 --pipeline-depth 1  # one combo only
+#   ./perf_check.sh --update-baseline     # create / overwrite per-combo baselines
 #
 # --shm is useful for isolating the RPC / partition / stream layers from the
 # underlying filesystem (extent storage lives in RAM, fsync is a no-op).
-# Separate baseline file is used so disk vs RAM numbers don't collide.
+# Separate baseline files per (transport, partitions, storage) combination.
 
-set -euo pipefail
+set -uo pipefail   # NOTE: no -e — we want the matrix to keep going past a failure
 
 # macOS default is 256 open files — far too few for 256-thread benchmarks
 ulimit -n 65536 2>/dev/null || true
@@ -21,33 +31,34 @@ AC="$SCRIPT_DIR/target/release/autumn-client"
 
 USE_SHM=0
 UPDATE_BASELINE=""
-PARTITIONS=1
-PIPELINE_DEPTH=1
 SKIP_CLUSTER=0
-TRANSPORT="tcp"           # F100-UCX: --ucx forces UCX, --transport-both runs both
-RUN_BOTH=0
+TRANSPORT_LIST="tcp ucx"          # default: both transports
+PARTITIONS_LIST="1 8"             # default: both partition counts
+PIPELINE_DEPTH_LIST="1 8"         # default: both pipeline depths (per user 2026-04-24)
 while (( $# > 0 )); do
     case "$1" in
         --shm)              USE_SHM=1 ;;
         --update-baseline)  UPDATE_BASELINE="--update-baseline" ;;
         --skip-cluster)     SKIP_CLUSTER=1 ;;
-        --ucx)              TRANSPORT="ucx" ;;
-        --tcp)              TRANSPORT="tcp" ;;
-        --transport-both)   RUN_BOTH=1 ;;
+        --ucx)              TRANSPORT_LIST="ucx" ;;
+        --tcp)              TRANSPORT_LIST="tcp" ;;
+        --transport-both)   TRANSPORT_LIST="tcp ucx" ;;   # back-compat no-op (already default)
         --partitions)
             shift
-            PARTITIONS="${1:-}"
-            [[ "$PARTITIONS" =~ ^[0-9]+$ ]] && (( PARTITIONS >= 1 )) \
+            v="${1:-}"
+            [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 )) \
                 || { echo "--partitions must be a positive integer" >&2; exit 1; }
+            PARTITIONS_LIST="$v"
             ;;
         --pipeline-depth)
             shift
-            PIPELINE_DEPTH="${1:-}"
-            [[ "$PIPELINE_DEPTH" =~ ^[0-9]+$ ]] && (( PIPELINE_DEPTH >= 1 && PIPELINE_DEPTH <= 256 )) \
+            v="${1:-}"
+            [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 256 )) \
                 || { echo "--pipeline-depth must be an integer in [1, 256]" >&2; exit 1; }
+            PIPELINE_DEPTH_LIST="$v"
             ;;
         -h|--help)
-            sed -n '2,11p' "$0"
+            sed -n '2,21p' "$0"
             exit 0
             ;;
         *)
@@ -58,32 +69,21 @@ while (( $# > 0 )); do
     shift
 done
 
-# Emit AUTUMN_BOOTSTRAP_PRESPLIT=N:hexstring when N > 1.
-# The bootstrap handler expands "hexstring" into N uniform 8-char hex midpoints
-# via hex_split_ranges(); no need to compute midpoints explicitly here.
-if (( PARTITIONS > 1 )); then
-    export AUTUMN_BOOTSTRAP_PRESPLIT="${PARTITIONS}:hexstring"
-    echo "[perf-check] presplit: $AUTUMN_BOOTSTRAP_PRESPLIT"
-fi
-
 if (( USE_SHM )); then
     export AUTUMN_DATA_ROOT="/dev/shm/autumn-rs"
     STORAGE_LABEL="RAM tmpfs (/dev/shm)"
-    BASELINE_TCP="$SCRIPT_DIR/perf_baseline_shm.json"
-    BASELINE_UCX="$SCRIPT_DIR/perf_baseline_shm_ucx.json"
+    STORAGE_SUFFIX="_shm"
 else
     export AUTUMN_DATA_ROOT="/tmp/autumn-rs"
     STORAGE_LABEL="disk ($AUTUMN_DATA_ROOT)"
-    BASELINE_TCP="$SCRIPT_DIR/perf_baseline.json"
-    BASELINE_UCX="$SCRIPT_DIR/perf_baseline_ucx_cluster.json"
+    STORAGE_SUFFIX=""
 fi
 
 # F100-UCX: build with the ucx feature when any UCX run is requested.
-# Without it, AUTUMN_TRANSPORT=ucx in the cluster would panic at init().
 NEED_UCX_FEATURE=0
-if [[ "$TRANSPORT" == "ucx" || $RUN_BOTH -eq 1 ]]; then
-    NEED_UCX_FEATURE=1
-fi
+for t in $TRANSPORT_LIST; do
+    [[ "$t" == "ucx" ]] && NEED_UCX_FEATURE=1
+done
 echo "[perf-check] building release binaries$([ $NEED_UCX_FEATURE -eq 1 ] && echo " (with --features autumn-transport/ucx)")..."
 cd "$SCRIPT_DIR"
 if (( NEED_UCX_FEATURE )); then
@@ -95,40 +95,86 @@ else
         | grep -E "^(Compiling|Finished|error)" || true
 fi
 
-# Inner runner: starts cluster under given AUTUMN_TRANSPORT, runs perf-check
-# against its baseline, leaves cluster running for caller to clean up.
+# Wait until extent-node ports (9101..9103) have no lingering sockets in
+# either direction (server-side LISTEN/TIME_WAIT *or* client-side TIME_WAIT
+# with peer=:910x). UCX's ucp_listener_create empirically refuses to bind
+# while client-side TIME_WAITs targeting the same port still exist, so we
+# must wait for both columns to clear. Bounded so a stuck socket can't
+# stall the matrix forever.
+await_ports_clear() {
+    local deadline=$((SECONDS + 90))
+    while (( SECONDS < deadline )); do
+        if ! ss -tan 2>/dev/null \
+                | awk 'NR>1 {print $4; print $5}' \
+                | grep -qE ':(9101|9102|9103)$'; then
+            return 0
+        fi
+        sleep 3
+    done
+    echo "[perf-check] WARN: 9101..9103 still have lingering sockets after wait"
+}
+
+# Inner runner: starts cluster under given AUTUMN_TRANSPORT + presplit, runs
+# perf-check at the requested pipeline-depth. The cluster is restarted per
+# (mode, parts) but reused across pipeline-depth values for that pair, since
+# pipeline-depth is purely a client-side knob — keeping the same cluster
+# avoids two extra cluster restarts per pipeline-depth swap (~25 s each).
 run_perf() {
     local mode="$1"
-    local baseline="$2"
+    local parts="$2"
+    local depth="$3"
+    local baseline="$SCRIPT_DIR/perf_baseline_${mode}_p${parts}_d${depth}${STORAGE_SUFFIX}.json"
+
     echo
     echo "============================================================"
-    echo "[perf-check] mode=$mode storage=$STORAGE_LABEL baseline=$baseline"
+    echo "[perf-check] mode=$mode partitions=$parts pipeline-depth=$depth storage=$STORAGE_LABEL"
+    echo "[perf-check] baseline=$(basename "$baseline")"
     echo "============================================================"
-    if (( SKIP_CLUSTER == 0 )); then
-        bash "$SCRIPT_DIR/cluster.sh" clean
-        AUTUMN_TRANSPORT="$mode" bash "$SCRIPT_DIR/cluster.sh" start 3
-    else
-        echo "[perf-check] --skip-cluster: assuming cluster is already running in $mode mode"
-    fi
     AUTUMN_TRANSPORT="$mode" "$AC" --manager "${AUTUMN_BIND_HOST:-127.0.0.1}:9001" \
         perf-check \
         --nosync \
         --threads 256 \
         --duration 10 \
         --size 4096 \
-        --partitions "$PARTITIONS" \
-        --pipeline-depth "$PIPELINE_DEPTH" \
+        --partitions "$parts" \
+        --pipeline-depth "$depth" \
         --baseline "$baseline" \
-        $UPDATE_BASELINE
+        $UPDATE_BASELINE \
+        || echo "[perf-check] perf-check exited non-zero (mode=$mode parts=$parts depth=$depth)"
 }
 
-if (( RUN_BOTH )); then
-    run_perf tcp "$BASELINE_TCP"
-    run_perf ucx "$BASELINE_UCX"
-else
-    if [[ "$TRANSPORT" == "ucx" ]]; then
-        run_perf ucx "$BASELINE_UCX"
+start_cluster_for() {
+    local mode="$1"
+    local parts="$2"
+    if (( parts > 1 )); then
+        export AUTUMN_BOOTSTRAP_PRESPLIT="${parts}:hexstring"
     else
-        run_perf tcp "$BASELINE_TCP"
+        unset AUTUMN_BOOTSTRAP_PRESPLIT
     fi
-fi
+    if (( SKIP_CLUSTER == 0 )); then
+        bash "$SCRIPT_DIR/cluster.sh" clean
+        await_ports_clear
+        AUTUMN_TRANSPORT="$mode" bash "$SCRIPT_DIR/cluster.sh" start 3 \
+            || { echo "[perf-check] FAILED to start cluster (mode=$mode parts=$parts)"; return 1; }
+    else
+        echo "[perf-check] --skip-cluster: assuming cluster is already running in $mode mode"
+    fi
+}
+
+OVERALL_RC=0
+for mode in $TRANSPORT_LIST; do
+    for parts in $PARTITIONS_LIST; do
+        if ! start_cluster_for "$mode" "$parts"; then
+            OVERALL_RC=1
+            continue
+        fi
+        for depth in $PIPELINE_DEPTH_LIST; do
+            run_perf "$mode" "$parts" "$depth" || OVERALL_RC=1
+        done
+    done
+done
+
+# Final cluster cleanup so the matrix leaves no dangling processes.
+bash "$SCRIPT_DIR/cluster.sh" clean >/dev/null 2>&1 || true
+
+exit $OVERALL_RC

@@ -477,6 +477,26 @@ even for loopback (PCIe DMA + transmit + DMA back). The expected perf
 win materialises only when network latency dominates — i.e. across
 hosts. Cross-host A/B is a separate deploy session.
 
+### Cluster-level perf_check — 2×2×2 matrix
+
+`./perf_check.sh` (no flags) runs the full **2×2×2 = 8-run matrix**:
+transport ∈ {tcp, ucx} × partitions ∈ {1, 8} × pipeline-depth ∈ {1, 8}.
+Baselines are per-combo
+(`perf_baseline_${transport}_p${parts}_d${depth}${_shm?}.json`), and
+the cluster is restarted per (transport, partitions) but reused across
+pipeline-depth values (depth is a client-side knob only).
+
+Narrow the matrix with `--tcp` / `--ucx` / `--partitions N` /
+`--pipeline-depth N`. Storage defaults to `/tmp/autumn-rs`; pass
+`--shm` for `/dev/shm/autumn-rs` (RAM tmpfs; fsync is a no-op).
+
+UCX caveat — `perf_check.sh` hardcodes `--threads 256`, which
+saturates the single-thread UCX server today, so every UCX run in the
+default matrix prints 0 ops / segfault. To see real UCX numbers run
+the autumn-client directly at a lower thread count while the cluster
+is up — the measured sweet spot on this host is 32 threads × depth=8 ×
+partitions=8 (144 k writes/s, 702 k reads/s, 2.74 GB/s read).
+
 ---
 
 ## Notes

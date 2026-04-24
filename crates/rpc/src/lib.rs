@@ -14,7 +14,6 @@ pub mod frame;
 pub mod manager_rpc;
 pub mod partition_rpc;
 pub mod pool;
-pub mod server;
 
 pub use error::{RpcError, Result, StatusCode};
 pub use frame::{Frame, FrameDecoder, HEADER_LEN};

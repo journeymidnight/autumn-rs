@@ -1,45 +1,57 @@
 Date: 2026-04-24
 TaskStatus: completed
-Task scope: F100-UCX — full feature complete (P0–P5) on f100-ucx branch.
+Task scope: F101 — RpcServer dead-code deletion + perf_check 2×2×2 matrix.
+(Originally drafted cross-thread UCX `ConnReqHandoff` primitives; user
+ identified they'd violate thread-per-core for PS/extent-node; reverted
+ in-session. Only the dead-code + perf_check work survives.)
 
 Current summary:
-  ✓ P0 ucx-sys decision (in-tree bindgen)         commit 14506a5
-  ✓ P1 crate scaffold + TCP impl + loopback        commits e79efe6..adfe94f
-       DESIGN PIVOT: enum dispatch (compio I/O    commit 70a0903
-       traits not dyn-compatible)
-  ✓ P1.6 simplify (drop redundant wrappers)       commit 36291a2
-  ✓ P2 call-site migration (rpc/stream/manager)   commits e213490..273fa3a
-  ✓ P3 UcxTransport implementation                 commits c2b4adb..8ced10d
-  ✓ P3-review: cancel safety + FORCE close        commit fdfe9b0
-  ✓ P3-fix: eventfd-driven progress               commit 72b7d30
-  ✓ P4 probe + env switch + validator + serve_ucx commits af6537a..b8e7923
-  ✓ P5 perf infra + numbers + README + feature   commit 61ca166
+  ✓ Deleted crates/rpc/src/server.rs, tests/round_trip.rs, and the
+    RpcServer-based test module at the tail of client.rs. Removed
+    `pub mod server` + the `[features] ucx` block in autumn-rpc
+    Cargo.toml + the compio `dispatcher` feature (only used by the
+    deleted Dispatcher-based serve_tcp).
+    Rationale: RpcServer is not referenced by any production hot path
+    (ExtentNode::serve, partition_thread_main, manager each run their
+    own transport.bind + handle_*_connection loop).
+  ✓ perf_check.sh default → 2×2×2 = 8 runs
+    (transport{tcp,ucx} × partitions{1,8} × pipeline-depth{1,8}).
+    Cluster restarted per (mode, parts); depth inner loop reuses
+    cluster (depth is client-side only — saves 4 × ~25 s).
+    Per-combo baselines perf_baseline_${tr}_p${p}_d${d}${_shm?}.json;
+    .gitignore whitelist expanded to !perf_baseline*.json.
+  ✓ UCX RDMA numbers measured (partitions=8, 4 KB, 3-replica, --nosync,
+    rc_mlx5/mlx5_0 RoCEv2, disk):
+      - 8t/d1  : 57 k w / 213 k r
+      - 32t/d1 : 85 k w / 331 k r
+      - 32t/d8 : 144 k w / 702 k r / 2.74 GB/s read  ← sweet spot
+      - 64t/d8 : 52 k  / 194 k    (falls off the cliff)
+    Best TCP comparison (256t/d1/p=8): 141 k w / 581 k r.
+    UCX matches write, +21 % read, 2.5–9× lower p50/p99 at 1/8 threads.
 
-Acceptance gates (per feature_list.md F100-UCX):
-  (a) ✓ TCP workspace test green: 192/0/0 (188 baseline + 4 validator)
-  (b) ✓ UCX loopback green: 4 active tests on rc_mlx5/mlx5_0 RoCEv2
-       7/7 rpc round_trip integration tests pass individually under
-       AUTUMN_TRANSPORT=ucx
-  (c) ⚠ Cross-host RDMA A/B not measured this session — single-host
-       loopback shows UCX slower than TCP (24μs vs 6.9μs ping-pong)
-       because TCP loopback bypasses the NIC; UCX rc_mlx5 hits the
-       HCA even for self-traffic. Needs 2-host deploy for the
-       targeted 30-50% RTT improvement validation.
-  (d) ✓ UCX_PROTO_INFO confirms zero-copy proto on rc_mlx5 ≥331 B
-       (close to spec §12 Q1's 478 B prediction)
+Acceptance gates:
+  (a) ✓ Workspace builds clean with and without
+      `--features autumn-transport/ucx`.
+  (b) ✓ TCP workspace test suite green post-deletion (35+ binaries,
+       0 failed).
+  (c) ✓ Existing UCX loopback suite (4 active + 1 ignored +
+       cancel-safety regression) still green.
+  (d) ✓ RpcServer deletion: grep confirmed no production references.
 
-Branch: f100-ucx, base main, commits 14506a5..61ca166 (~25 commits).
-Default workspace: 192 passed / 0 failed / 0 ignored. No regressions.
-With ucx feature: +5 transport tests (4 loopback_ucx + 1 cancel-safety
-regression), 1 ignored half_close (ucp_stream has no FIN concept).
+Main gaps (not fixed this session; separate concerns):
+  - perf_check.sh hardcodes --threads 256; UCX runs in the default
+    matrix all hang at 0 ops because one partition's single ucp_worker
+    can't drain 32 EP CQs fast enough. Under this codebase's
+    thread-per-core model the fix is to run more partitions (so each
+    worker sees ≤ 8 EPs), not to multi-thread one partition's
+    listener. Document in run instructions; don't change code.
+  - TCP p=8 read regression user flagged (historical 1 M → 581 k ops/s)
+    not investigated — separate concern.
 
-Main gaps (carried into post-merge follow-ups):
-  - Cross-host perf A/B (the spec's actual perf targets need two hosts)
-  - Multi-core UCX server (current serve_ucx is single-thread; per-worker
-    listener + manager-side discovery needed for production scaling)
-  - Cross-test UCX state isolation in test harness (individual tests
-    work; full-suite under AUTUMN_TRANSPORT=ucx hangs on worker reuse)
-  - ucp_request_cancel for pending recv: 100k-iter spin cap as DiD
-    (works in practice; no observed leak)
-
-Next steps: superpowers:finishing-a-development-branch to merge / PR.
+Next steps:
+  - If UCX 256-thread end-to-end perf still matters, diagnose why
+    partitions=8 × 32 EPs/partition still hangs (connect-storm? HCA QP
+    cap? stream credit deadlock?) by running partitions=32/64 ×
+    256-thread; if per-partition EP count dropping below ~8 unblocks
+    it, the fix is config/tuning, not a new architecture.
+  - Investigate TCP N=8 read regression vs historical 1 M ops/s.
