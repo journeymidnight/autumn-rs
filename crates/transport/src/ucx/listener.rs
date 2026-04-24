@@ -9,8 +9,7 @@
 use crate::ucx::endpoint::UcxConn;
 use crate::ucx::ffi::*;
 use crate::ucx::sockaddr;
-use crate::ucx::endpoint::YieldNow;
-use crate::ucx::worker::{progress_once, ucs_err, with_thread_ctx};
+use crate::ucx::worker::{ucs_err, with_thread_ctx};
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use std::io;
@@ -100,8 +99,10 @@ impl UcxListener {
     }
 
     pub(crate) async fn accept(&mut self) -> io::Result<(UcxConn, SocketAddr)> {
-        // Interleave progress so UCX wireup makes the conn_handler fire.
-        progress_once();
+        // The spawned per-runtime progress task in worker.rs drives
+        // `ucp_worker_progress` continuously, so the on_conn callback for
+        // a peer's connect lands on `self.rx` without any extra polling
+        // here.
         let req = self
             .rx
             .next()

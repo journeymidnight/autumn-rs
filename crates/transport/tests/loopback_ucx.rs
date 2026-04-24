@@ -54,3 +54,44 @@ async fn half_close() {
 async fn many_concurrent_4() {
     common::many_concurrent_at(UcxTransport, bind_addr(), 4).await;
 }
+
+/// Cancel-safety: drop a `read` future mid-await. With `InflightGuard`
+/// in place this must not free the buffer while UCX still holds the
+/// pointer (use-after-free). Pre-fix this would either UAF or segfault;
+/// post-fix the cancel + sync progress drains the request before we
+/// return, and the test completes cleanly.
+#[compio::test]
+async fn drop_read_mid_await_is_safe() {
+    use autumn_transport::AutumnTransport;
+    use compio::io::{AsyncRead as _, AsyncReadExt as _, AsyncWriteExt as _};
+    use std::time::Duration;
+
+    let t = UcxTransport;
+    let mut listener = t.bind(bind_addr()).await.unwrap();
+    let bound = listener.local_addr().unwrap();
+
+    let server = compio::runtime::spawn(async move {
+        let (c, _) = listener.accept().await.unwrap();
+        // Sleep before sending so the client's read sits "pending" long
+        // enough for us to drop it via timeout.
+        compio::time::sleep(Duration::from_millis(200)).await;
+        let (_r, mut w) = c.into_split();
+        let _ = w.write_all(vec![0xa5u8; 64]).await;
+    });
+
+    let c = t.connect(bound).await.unwrap();
+    let (mut r, _w) = c.into_split();
+
+    // Race a 1ms timeout against a 64-byte read. The timeout wins; the
+    // read future is dropped mid-await. Without InflightGuard this would
+    // be UAF.
+    let buf = vec![0u8; 64];
+    let race = async {
+        let _ = r.read(buf).await;
+    };
+    let _ = compio::time::timeout(Duration::from_millis(1), race).await;
+
+    // Wait for the server to finish so we don't tear it down early.
+    let _ = server.await;
+}
+
