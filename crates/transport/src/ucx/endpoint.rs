@@ -1,42 +1,153 @@
-//! UCX endpoint = one `ucp_ep` to a peer. Skeleton; Task 16 fills in
-//! `connect`, `read`, `write`, `into_split`.
+//! UCX endpoint = one `ucp_ep` to a peer. Implements `compio::io::AsyncRead`
+//! and `AsyncWrite` over `ucp_stream_send_nbx` / `ucp_stream_recv_nbx`.
+//!
+//! Buffer ownership: compio's owned-buffer Future model keeps the buffer
+//! alive in the future; we await the per-op oneshot before returning, so
+//! the buffer outlives the UCX request. **Cancel safety not yet handled** —
+//! if the future is dropped pre-completion the buffer goes away while UCX
+//! still holds the pointer; tracked in spec §10 as a P3+ follow-up.
 
+use crate::ucx::ffi::*;
+use crate::ucx::sockaddr;
+use crate::ucx::worker::{cache_ep, cached_ep, forget_ep, ucs_err, with_thread_ctx};
+use compio::buf::{IoBuf, IoBufMut, SetLen};
+use compio::BufResult;
+use futures::channel::oneshot;
+use std::cell::Cell;
 use std::io;
 use std::net::SocketAddr;
+use std::os::raw::c_void;
+use std::ptr;
+use std::rc::Rc;
+
+// ---- Pointer-status decoder ----
+
+/// UCS uses a fat-pointer convention: NULL = immediate OK, a real heap
+/// pointer = request in progress, or a `(void*)(intptr_t)UCS_ERR_*` =
+/// immediate error. This mirrors the `UCS_PTR_IS_ERR` / `UCS_PTR_IS_PTR`
+/// macros from `ucs/type/status.h`.
+fn classify_ptr(ptr: *mut c_void) -> PtrStatus {
+    if ptr.is_null() {
+        PtrStatus::Done
+    } else {
+        let s = ptr as isize;
+        // Error codes are in roughly -1..-100 range; any negative isize
+        // pointer cast is an error code, any positive is a real handle.
+        if (-100..0).contains(&s) {
+            PtrStatus::Err(s as ucs_status_t::Type)
+        } else {
+            PtrStatus::Pending(ptr)
+        }
+    }
+}
+
+enum PtrStatus {
+    Done,
+    Err(ucs_status_t::Type),
+    Pending(*mut c_void),
+}
+
+// ---- Send / recv callbacks ----
+
+unsafe extern "C" fn cb_send(
+    request: *mut c_void,
+    status: ucs_status_t::Type,
+    user: *mut c_void,
+) {
+    let tx = Box::from_raw(user as *mut oneshot::Sender<ucs_status_t::Type>);
+    let _ = tx.send(status);
+    // Free the request handle; UCX recycles it back into its pool.
+    ucp_request_free(request);
+}
+
+unsafe extern "C" fn cb_recv(
+    request: *mut c_void,
+    status: ucs_status_t::Type,
+    length: usize,
+    user: *mut c_void,
+) {
+    let tx = Box::from_raw(user as *mut oneshot::Sender<(ucs_status_t::Type, usize)>);
+    let _ = tx.send((status, length));
+    ucp_request_free(request);
+}
+
+// ---- Connection ----
 
 pub struct UcxConn {
-    _peer: SocketAddr,
+    ep: *mut ucp_ep,
+    peer: SocketAddr,
 }
 
 impl UcxConn {
-    pub(crate) async fn connect(_addr: SocketAddr) -> io::Result<Self> {
-        unimplemented!("Phase 3 Task 16: ucp_ep_create over rc_mlx5")
+    pub(crate) async fn connect(addr: SocketAddr) -> io::Result<Self> {
+        if let Some(ep) = cached_ep(&addr) {
+            return Ok(Self { ep, peer: addr });
+        }
+
+        let ep = with_thread_ctx(|ctx| -> io::Result<*mut ucp_ep> {
+            let (mut sa, sa_len) = sockaddr::to_storage(&addr);
+            let mut params: ucp_ep_params_t = unsafe { std::mem::zeroed() };
+            params.field_mask = (ucp_ep_params_field::UCP_EP_PARAM_FIELD_FLAGS
+                               | ucp_ep_params_field::UCP_EP_PARAM_FIELD_SOCK_ADDR)
+                as u64;
+            params.flags = ucp_ep_params_flags_field::UCP_EP_PARAMS_FLAGS_CLIENT_SERVER as u32;
+            params.sockaddr.addr = &sa as *const _ as *const _;
+            params.sockaddr.addrlen = sa_len;
+            let mut ep: *mut ucp_ep = ptr::null_mut();
+            let st = unsafe { ucp_ep_create(ctx.worker, &params, &mut ep) };
+            if st != ucs_status_t::UCS_OK {
+                return Err(ucs_err(st, "ucp_ep_create"));
+            }
+            // Touch sa to prevent the optimizer thinking it's dead before the
+            // C call uses it. (UCX copies internally before returning.)
+            std::hint::black_box(&mut sa);
+            Ok(ep)
+        })?;
+
+        cache_ep(addr, ep);
+        Ok(Self { ep, peer: addr })
+    }
+
+    /// Internal constructor used by `UcxListener::accept` after `ucp_ep_create`
+    /// has already been driven from a `ucp_conn_request_h`.
+    pub(crate) fn from_raw_ep(ep: *mut ucp_ep, peer: SocketAddr) -> Self {
+        Self { ep, peer }
     }
 
     pub(crate) fn peer_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self._peer)
+        Ok(self.peer)
     }
 
     pub(crate) fn into_split(self) -> (UcxReadHalf, UcxWriteHalf) {
-        unimplemented!("Phase 3 Task 16")
+        let shared = Rc::new(Cell::new(self.ep));
+        (
+            UcxReadHalf {
+                ep: shared.clone(),
+                peer: self.peer,
+            },
+            UcxWriteHalf {
+                ep: shared,
+                peer: self.peer,
+            },
+        )
+    }
+
+    fn ep(&self) -> *mut ucp_ep {
+        self.ep
     }
 }
 
+// ---- AsyncRead / AsyncWrite on the joined UcxConn ----
+
 impl compio::io::AsyncRead for UcxConn {
-    async fn read<B: compio::buf::IoBufMut>(
-        &mut self,
-        _buf: B,
-    ) -> compio::BufResult<usize, B> {
-        unimplemented!("Phase 3 Task 16: ucp_stream_recv_nbx")
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+        ucx_recv(self.ep, buf, &self.peer).await
     }
 }
 
 impl compio::io::AsyncWrite for UcxConn {
-    async fn write<B: compio::buf::IoBuf>(
-        &mut self,
-        _buf: B,
-    ) -> compio::BufResult<usize, B> {
-        unimplemented!("Phase 3 Task 16: ucp_stream_send_nbx")
+    async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+        ucx_send(self.ep, buf, &self.peer).await
     }
     async fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -46,33 +157,139 @@ impl compio::io::AsyncWrite for UcxConn {
     }
 }
 
+// ---- Half types ----
+
 pub struct UcxReadHalf {
-    _peer: SocketAddr,
+    ep: Rc<Cell<*mut ucp_ep>>,
+    peer: SocketAddr,
 }
+
 pub struct UcxWriteHalf {
-    _peer: SocketAddr,
+    ep: Rc<Cell<*mut ucp_ep>>,
+    peer: SocketAddr,
 }
 
 impl compio::io::AsyncRead for UcxReadHalf {
-    async fn read<B: compio::buf::IoBufMut>(
-        &mut self,
-        _buf: B,
-    ) -> compio::BufResult<usize, B> {
-        unimplemented!("Phase 3 Task 16")
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+        ucx_recv(self.ep.get(), buf, &self.peer).await
     }
 }
 
 impl compio::io::AsyncWrite for UcxWriteHalf {
-    async fn write<B: compio::buf::IoBuf>(
-        &mut self,
-        _buf: B,
-    ) -> compio::BufResult<usize, B> {
-        unimplemented!("Phase 3 Task 16")
+    async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+        ucx_send(self.ep.get(), buf, &self.peer).await
     }
     async fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
     async fn shutdown(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+// ---- Internals ----
+
+async fn ucx_send<B: IoBuf>(
+    ep: *mut ucp_ep,
+    buf: B,
+    peer: &SocketAddr,
+) -> BufResult<usize, B> {
+    let len = buf.buf_len();
+    if len == 0 {
+        return BufResult(Ok(0), buf);
+    }
+    let ptr = buf.buf_ptr();
+
+    let (tx, rx) = oneshot::channel::<ucs_status_t::Type>();
+    let user = Box::into_raw(Box::new(tx)) as *mut c_void;
+
+    let mut params: ucp_request_param_t = unsafe { std::mem::zeroed() };
+    params.op_attr_mask = (ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK
+                         | ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA) as u32;
+    params.cb.send = Some(cb_send);
+    params.user_data = user;
+
+    let r = unsafe { ucp_stream_send_nbx(ep, ptr as *const c_void, len, &params) };
+    match classify_ptr(r) {
+        PtrStatus::Done => {
+            // Immediate completion; reclaim and discard the user_data box.
+            unsafe { drop(Box::from_raw(user as *mut oneshot::Sender<ucs_status_t::Type>)) };
+            BufResult(Ok(len), buf)
+        }
+        PtrStatus::Err(st) => {
+            unsafe { drop(Box::from_raw(user as *mut oneshot::Sender<ucs_status_t::Type>)) };
+            forget_ep(peer);
+            BufResult(Err(ucs_err(st, "ucp_stream_send_nbx")), buf)
+        }
+        PtrStatus::Pending(_) => match rx.await {
+            Ok(st) if st == ucs_status_t::UCS_OK => BufResult(Ok(len), buf),
+            Ok(st) => {
+                forget_ep(peer);
+                BufResult(Err(ucs_err(st, "ucp_stream_send cb")), buf)
+            }
+            Err(_) => BufResult(
+                Err(io::Error::other("ucx send callback dropped")),
+                buf,
+            ),
+        },
+    }
+}
+
+async fn ucx_recv<B: IoBufMut>(
+    ep: *mut ucp_ep,
+    mut buf: B,
+    peer: &SocketAddr,
+) -> BufResult<usize, B> {
+    let cap = buf.buf_capacity();
+    if cap == 0 {
+        return BufResult(Ok(0), buf);
+    }
+    let ptr = buf.as_uninit().as_mut_ptr() as *mut c_void;
+
+    let (tx, rx) = oneshot::channel::<(ucs_status_t::Type, usize)>();
+    let user = Box::into_raw(Box::new(tx)) as *mut c_void;
+
+    let mut params: ucp_request_param_t = unsafe { std::mem::zeroed() };
+    params.op_attr_mask = (ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK
+                         | ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA
+                         | ucp_op_attr_t::UCP_OP_ATTR_FLAG_NO_IMM_CMPL) as u32;
+    params.cb.recv_stream = Some(cb_recv);
+    params.user_data = user;
+
+    let mut got: usize = 0;
+    let r = unsafe { ucp_stream_recv_nbx(ep, ptr, cap, &mut got, &params) };
+    match classify_ptr(r) {
+        PtrStatus::Done => {
+            unsafe {
+                drop(Box::from_raw(
+                    user as *mut oneshot::Sender<(ucs_status_t::Type, usize)>,
+                ))
+            };
+            unsafe { buf.set_len(got) };
+            BufResult(Ok(got), buf)
+        }
+        PtrStatus::Err(st) => {
+            unsafe {
+                drop(Box::from_raw(
+                    user as *mut oneshot::Sender<(ucs_status_t::Type, usize)>,
+                ))
+            };
+            forget_ep(peer);
+            BufResult(Err(ucs_err(st, "ucp_stream_recv_nbx")), buf)
+        }
+        PtrStatus::Pending(_) => match rx.await {
+            Ok((st, n)) if st == ucs_status_t::UCS_OK => {
+                unsafe { buf.set_len(n) };
+                BufResult(Ok(n), buf)
+            }
+            Ok((st, _)) => {
+                forget_ep(peer);
+                BufResult(Err(ucs_err(st, "ucp_stream_recv cb")), buf)
+            }
+            Err(_) => BufResult(
+                Err(io::Error::other("ucx recv callback dropped")),
+                buf,
+            ),
+        },
     }
 }
