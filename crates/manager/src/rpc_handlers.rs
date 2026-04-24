@@ -20,17 +20,19 @@ impl AutumnManager {
 
     pub async fn serve(&self, addr: SocketAddr) -> Result<()> {
         self.start_runtime_tasks();
-        let listener = compio::net::TcpListener::bind(addr).await?;
+        let mut listener = autumn_transport::current_or_init().bind(addr).await?;
         tracing::info!(addr = %addr, "manager listening");
         loop {
-            let (stream, peer) = listener.accept().await?;
-            if let Err(e) = stream.set_nodelay(true) {
-                tracing::warn!(peer = %peer, error = %e, "set_nodelay failed");
+            let (conn, peer) = listener.accept().await?;
+            if let Some(s) = conn.as_tcp() {
+                if let Err(e) = s.set_nodelay(true) {
+                    tracing::warn!(peer = %peer, error = %e, "set_nodelay failed");
+                }
             }
             let mgr = self.clone();
             compio::runtime::spawn(async move {
                 tracing::debug!(peer = %peer, "new manager rpc connection");
-                if let Err(e) = Self::handle_connection(stream, mgr).await {
+                if let Err(e) = Self::handle_connection(conn, mgr).await {
                     tracing::debug!(peer = %peer, error = %e, "manager rpc connection ended");
                 }
             })
@@ -38,8 +40,8 @@ impl AutumnManager {
         }
     }
 
-    async fn handle_connection(stream: TcpStream, mgr: AutumnManager) -> Result<()> {
-        let (mut reader, mut writer) = stream.into_split();
+    async fn handle_connection(conn: autumn_transport::Conn, mgr: AutumnManager) -> Result<()> {
+        let (mut reader, mut writer) = conn.into_split();
         let mut decoder = FrameDecoder::new();
         let mut buf = vec![0u8; 64 * 1024];
 

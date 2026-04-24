@@ -24,11 +24,16 @@ UPDATE_BASELINE=""
 PARTITIONS=1
 PIPELINE_DEPTH=1
 SKIP_CLUSTER=0
+TRANSPORT="tcp"           # F100-UCX: --ucx forces UCX, --transport-both runs both
+RUN_BOTH=0
 while (( $# > 0 )); do
     case "$1" in
         --shm)              USE_SHM=1 ;;
         --update-baseline)  UPDATE_BASELINE="--update-baseline" ;;
         --skip-cluster)     SKIP_CLUSTER=1 ;;
+        --ucx)              TRANSPORT="ucx" ;;
+        --tcp)              TRANSPORT="tcp" ;;
+        --transport-both)   RUN_BOTH=1 ;;
         --partitions)
             shift
             PARTITIONS="${1:-}"
@@ -63,38 +68,67 @@ fi
 
 if (( USE_SHM )); then
     export AUTUMN_DATA_ROOT="/dev/shm/autumn-rs"
-    BASELINE="$SCRIPT_DIR/perf_baseline_shm.json"
     STORAGE_LABEL="RAM tmpfs (/dev/shm)"
+    BASELINE_TCP="$SCRIPT_DIR/perf_baseline_shm.json"
+    BASELINE_UCX="$SCRIPT_DIR/perf_baseline_shm_ucx.json"
 else
     export AUTUMN_DATA_ROOT="/tmp/autumn-rs"
-    BASELINE="$SCRIPT_DIR/perf_baseline.json"
     STORAGE_LABEL="disk ($AUTUMN_DATA_ROOT)"
+    BASELINE_TCP="$SCRIPT_DIR/perf_baseline.json"
+    BASELINE_UCX="$SCRIPT_DIR/perf_baseline_ucx_cluster.json"
 fi
 
-# Build release binaries
-echo "[perf-check] building release binaries..."
+# F100-UCX: build with the ucx feature when any UCX run is requested.
+# Without it, AUTUMN_TRANSPORT=ucx in the cluster would panic at init().
+NEED_UCX_FEATURE=0
+if [[ "$TRANSPORT" == "ucx" || $RUN_BOTH -eq 1 ]]; then
+    NEED_UCX_FEATURE=1
+fi
+echo "[perf-check] building release binaries$([ $NEED_UCX_FEATURE -eq 1 ] && echo " (with --features autumn-transport/ucx)")..."
 cd "$SCRIPT_DIR"
-cargo build --workspace --release --exclude autumn-fuse 2>&1 | grep -E "^(Compiling|Finished|error)" || true
-
-# Fresh 3-replica cluster (data root => $AUTUMN_DATA_ROOT, picked up by cluster.sh)
-if (( SKIP_CLUSTER == 0 )); then
-    echo "[perf-check] clean + start 3-replica cluster on $STORAGE_LABEL..."
-    bash "$SCRIPT_DIR/cluster.sh" clean
-    bash "$SCRIPT_DIR/cluster.sh" start 3
+if (( NEED_UCX_FEATURE )); then
+    cargo build --workspace --release --exclude autumn-fuse \
+        --features autumn-transport/ucx 2>&1 \
+        | grep -E "^(Compiling|Finished|error)" || true
 else
-    echo "[perf-check] --skip-cluster: assuming cluster is already running"
+    cargo build --workspace --release --exclude autumn-fuse 2>&1 \
+        | grep -E "^(Compiling|Finished|error)" || true
 fi
 
-# Run perf-check (baseline file lives next to this script)
-# Parameters match production-style load: 256 threads, 4KB values, nosync (group-commit path)
-echo "[perf-check] running perf-check on $STORAGE_LABEL (baseline: $BASELINE)..."
-"$AC" --manager 127.0.0.1:9001 \
-    perf-check \
-    --nosync \
-    --threads 256 \
-    --duration 10 \
-    --size 4096 \
-    --partitions "$PARTITIONS" \
-    --pipeline-depth "$PIPELINE_DEPTH" \
-    --baseline "$BASELINE" \
-    $UPDATE_BASELINE
+# Inner runner: starts cluster under given AUTUMN_TRANSPORT, runs perf-check
+# against its baseline, leaves cluster running for caller to clean up.
+run_perf() {
+    local mode="$1"
+    local baseline="$2"
+    echo
+    echo "============================================================"
+    echo "[perf-check] mode=$mode storage=$STORAGE_LABEL baseline=$baseline"
+    echo "============================================================"
+    if (( SKIP_CLUSTER == 0 )); then
+        bash "$SCRIPT_DIR/cluster.sh" clean
+        AUTUMN_TRANSPORT="$mode" bash "$SCRIPT_DIR/cluster.sh" start 3
+    else
+        echo "[perf-check] --skip-cluster: assuming cluster is already running in $mode mode"
+    fi
+    AUTUMN_TRANSPORT="$mode" "$AC" --manager 127.0.0.1:9001 \
+        perf-check \
+        --nosync \
+        --threads 256 \
+        --duration 10 \
+        --size 4096 \
+        --partitions "$PARTITIONS" \
+        --pipeline-depth "$PIPELINE_DEPTH" \
+        --baseline "$baseline" \
+        $UPDATE_BASELINE
+}
+
+if (( RUN_BOTH )); then
+    run_perf tcp "$BASELINE_TCP"
+    run_perf ucx "$BASELINE_UCX"
+else
+    if [[ "$TRANSPORT" == "ucx" ]]; then
+        run_perf ucx "$BASELINE_UCX"
+    else
+        run_perf tcp "$BASELINE_TCP"
+    fi
+fi
