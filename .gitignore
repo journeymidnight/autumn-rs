@@ -19,11 +19,12 @@ Thumbs.db
 python/target
 python/*.so
 
-# Do NOT ignore perf_baseline*.json — these are checked-in regression gates
-# Override root *.json exclusion for tracked config files. The naming
-# perf_baseline_${transport}_p${parts}_d${depth}${_shm?}.json comes from
-# the 2×2×2 matrix in perf_check.sh.
-!perf_baseline*.json
+# Ignore all perf_baseline*.json — users regenerate these locally via
+# `perf_check.sh --update-baseline`. ONE representative baseline is
+# committed (perf_baseline_tcp_p8_d8_s4k.json, the headline TCP 4 K
+# peak) as a reference; everything else is local scratch.
+perf_baseline*.json
+!perf_baseline_tcp_p8_d8_s4k.json
 
 # Claude Code local session state (not part of the project)
 .claude/
