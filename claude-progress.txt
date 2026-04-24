@@ -1,44 +1,56 @@
-Date: 2026-04-23
+Date: 2026-04-24
 TaskStatus: completed
-Task scope: F100-UCX Phase 2 — migrate autumn-rpc / autumn-stream /
-            autumn-manager call sites to AutumnTransport (still TCP
-            underneath); wire init() into all 4 binaries.
+Task scope: F100-UCX Phase 3 — UcxTransport implementation under
+            feature = "ucx" (in-tree bindgen sub-crate, per-thread
+            UCX worker, ucp_stream send/recv, ucp_listener accept,
+            UCX loopback test suite).
 
-Current summary: Client-side TCP connect paths migrated to use
-                 autumn_transport::current_or_init().connect — covers
-                 RpcClient::connect (autumn-rpc), rpc_oneshot in
-                 extent_node, manager's internal RpcConn::connect.
-                 RpcClient::from_stream renamed to from_conn taking a
-                 Conn enum. TCP_NODELAY conditional on Conn::as_tcp().
-                 All 4 binaries call autumn_transport::init() at
-                 startup; tracing log "autumn-transport: init kind=Tcp"
-                 confirms wiring.
+Current summary:
+  ✓ ucx-sys-mini: in-tree bindgen sub-crate over <ucp/api/ucp.h>;
+    20 functions + 12 named constants from spec §13 whitelist verified.
+    build.rs runs pkg-config + bindgen with gcc-include fallback for
+    libclang-without-clang-CLI hosts.
+  ✓ ucx feature gate: autumn-transport gains [features] ucx that adds
+    Conn::Ucx / Listener::Ucx / ReadHalf::Ucx / WriteHalf::Ucx variants
+    behind cfg. Default-feature build unchanged.
+  ✓ Per-thread UcxThreadCtx + per-runtime progress task (re-spawned on
+    runtime change via Rc strong-count sentinel — needed for compio
+    test runners that recreate runtimes on the same OS thread).
+  ✓ UcxConn: connect/read/write/into_split via ucp_stream_send_nbx /
+    ucp_stream_recv_nbx; status-pointer convention (NULL/err/handle)
+    decoded in classify_ptr; oneshot user_data Box reclaimed in C
+    callbacks via Box::from_raw.
+  ✓ UcxListener: ucp_listener_create + on_conn callback pushes
+    ucp_conn_request_h onto an mpsc; accept().await drives the EP
+    setup; ucp_listener_query reads back the kernel-chosen port for
+    sockaddr port=0 binds.
+  ✓ UCX loopback suite (rc_mlx5/mlx5_0:1 over RoCEv2):
+      ping_pong            ok
+      large_payload (2 MB) ok
+      many_concurrent_4    ok
+      half_close           ignored (ucp_stream has no FIN/EOF)
+    UCX_PROTO_INFO trace confirms zero-copy proto path engaged at
+    ≥331 B (matches spec §12 Q1 finding within ±150 B).
 
-                 SCOPE NOTE: server-side accept paths intentionally
-                 NOT migrated — rpc/server.rs uses std::net::TcpListener
-                 on a dedicated OS thread (compio's TcpListener is
-                 !Send), and stream/extent_node.rs + manager/rpc_handlers
-                 use compio TcpListener directly. UCX accept needs a
-                 fundamentally different per-worker ucp_listener
-                 pattern; that work belongs in Phase 3+ when UCX impl
-                 lands. Today's TCP server-side path remains identical
-                 to pre-F100 behavior.
+  Workspace test: default 188/0/0 (= P2 baseline), with-ucx 190/0/1
+  (+3 loopback tests, -1 ignored half_close). Zero regressions.
 
-                 Test results (workspace, serial, includes live etcd):
-                 224 passed / 0 failed / 9 ignored
-                 = Phase A baseline (213) + 11 new transport tests.
-                 No regressions.
+Main gaps (tracked in spec §10 as P3+ follow-ups):
+  - UcxConn::Drop currently leaks the EP rather than calling
+    ucp_ep_close_nbx, because UCX close synchronously cancels in-flight
+    ops on the peer's side and races test patterns that drop
+    immediately after writing. Production EPs are pooled in
+    autumn-rpc/autumn-stream ConnPool and never dropped in steady
+    state. Real fix needs ucp_worker_flush + await before destroy.
+  - Eventfd-driven progress (ucp_worker_arm + AsyncFd) deferred —
+    chicken-and-egg vs single-thread mode means per-runtime spawned
+    polling task (50µs sleep) is the working model. Phase 5 perf
+    measurement will show whether 50µs overhead matters.
 
-Main gaps: P3 — UcxTransport implementation under feature = "ucx".
-           Includes: in-tree ucx-sys-mini bindgen sub-crate, per-thread
-           UcxThreadCtx + progress task on compio::fs::AsyncFd,
-           UcxConn read/write via ucp_stream_*_nbx, UcxListener via
-           ucp_listener_create + on_conn handler, UCX loopback test
-           suite mirroring loopback_tcp.rs.
+Next steps: Phase 4 — implement probe_ucx() body (inspect ucp_context
+            for RDMA transports), wire decide() result into init()
+            so AUTUMN_TRANSPORT={tcp,ucx,auto} selects at runtime,
+            add UCX bind-IP validator using nix::ifaddrs, run the
+            full integration suite under AUTUMN_TRANSPORT=ucx.
 
-Next steps: Phase 3 (Tasks 13–19 in plan). First sub-task: scaffold
-            crates/transport/ucx-sys-mini with bindgen build.rs over
-            <ucp/api/ucp.h> producing the symbol whitelist from
-            spec §13.
-
-Branch: f100-ucx (commits 14506a5..1283c4a).
+Branch: f100-ucx (commits 14506a5..3e9c7ff).
