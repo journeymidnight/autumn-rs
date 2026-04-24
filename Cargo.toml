@@ -9,6 +9,18 @@ members = [
   "crates/server",
   "crates/client",
   "crates/fuse",
+  "examples/gallery",
+]
+default-members = [
+  "crates/common",
+  "crates/rpc",
+  "crates/etcd",
+  "crates/stream",
+  "crates/manager",
+  "crates/partition-server",
+  "crates/server",
+  "crates/client",
+  "crates/fuse",
 ]
 exclude = ["python"]
 resolver = "2"
