@@ -2501,13 +2501,8 @@ pub(crate) fn rotate_active(part: &mut PartitionData) {
     if part.active.is_empty() {
         return;
     }
-    let frozen = Memtable::new();
-    part.active.for_each(|k, v| {
-        let size = k.len() as u64 + v.value.len() as u64 + 32;
-        frozen.insert(k.to_vec(), v.clone(), size);
-    });
+    let frozen = std::mem::replace(&mut part.active, Memtable::new());
     part.imm.push_back(Arc::new(frozen));
-    part.active = Memtable::new();
     let _ = part.flush_tx.unbounded_send(());
 }
 

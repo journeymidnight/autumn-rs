@@ -71,8 +71,8 @@
 ### F011 · Go range_partition advanced storage behaviors (umbrella)
 - **Target:** Compaction/GC/value-log/maintenance lifecycle equivalent to Go range_partition.
 - **Evidence:** `range_partition/*.go` · `autumn-rs/crates/partition-server/src/lib.rs`
-- **Notes:** Umbrella for F028-F033+F036+F037. Tracks overall completion of the partition layer rewrite.
-- **passes:** false
+- **Notes:** Umbrella for F028-F033+F036+F037. All component features are `passes: true`; umbrella updated accordingly.
+- **passes:** true
 
 ---
 
