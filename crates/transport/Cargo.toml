@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 default = []
-ucx = ["dep:ucx-sys-mini", "dep:libc", "dep:socket2"]
+ucx = ["dep:ucx-sys-mini", "dep:socket2"]
 
 [dependencies]
 compio = { version = "0.18", features = ["net", "io", "macros", "fs", "time"] }
@@ -15,8 +15,8 @@ futures = "0.3"
 tracing = "0.1"
 bytes.workspace = true
 thiserror.workspace = true
+libc = "0.2"
 ucx-sys-mini = { path = "ucx-sys-mini", optional = true }
-libc = { version = "0.2", optional = true }
 socket2 = { version = "0.5", optional = true, features = ["all"] }
 
 [dev-dependencies]

@@ -78,6 +78,155 @@ pub fn current_or_init() -> &'static dyn AutumnTransport {
     init()
 }
 
+/// Deployment preflight: verify a listen address is on a RoCE-attached
+/// netdev when `kind == Ucx`. Pure function — takes the transport kind
+/// as a parameter so callers can pass `current().kind()` OR a specific
+/// kind (useful in tests where the global might be pinned).
+///
+/// Returns `Ok(())` unconditionally under TCP; under UCX returns `Err`
+/// with the list of valid candidates if the address would fall back to
+/// UCX-over-TCP instead of rc_mlx5.
+///
+/// Binaries SHOULD call this after `init()` (passing `current().kind()`)
+/// if they want a hard failure on misconfigured deployment addresses.
+/// Tests typically bind `127.0.0.1:0` which falls back to UCX-over-TCP
+/// — useful for correctness testing — so the check is opt-in, not
+/// wired into `init()`.
+pub fn check_listen_addr(addr: SocketAddr, kind: TransportKind) -> io::Result<()> {
+    if kind != TransportKind::Ucx {
+        return Ok(());
+    }
+    let ip = addr.ip();
+    // Wildcards (0.0.0.0, [::]) are acceptable — UCX will bind all
+    // interfaces including any RoCE-attached ones.
+    if ip.is_unspecified() {
+        return Ok(());
+    }
+    let dev = find_netdev_owning_ip(&ip)?;
+    let gid_dir = format!("/sys/class/net/{dev}/device/infiniband");
+    if std::path::Path::new(&gid_dir).exists() {
+        tracing::info!(
+            "autumn-transport: UCX listen on {ip} via {dev} (RoCE-attached)"
+        );
+        Ok(())
+    } else {
+        let candidates = roce_candidates();
+        Err(io::Error::other(format!(
+            "AUTUMN_TRANSPORT=ucx but listen ip {ip} (on netdev {dev}) has no \
+             RoCE GID table. Valid RoCE-attached bind candidates: {candidates:?}. \
+             Run scripts/check_roce.sh --listen-candidates to verify."
+        )))
+    }
+}
+
+fn find_netdev_owning_ip(ip: &std::net::IpAddr) -> io::Result<String> {
+    // /sys/class/net/<dev> doesn't carry IP info; walk via iproute's
+    // documented pattern of reading each netdev's IPs via getifaddrs.
+    // We can avoid the nix dep by parsing /proc/net/{fib_trie,if_inet6}
+    // but getifaddrs via libc is simpler and we already pull libc.
+    unsafe {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut cur = head;
+        let result = loop {
+            if cur.is_null() {
+                break None;
+            }
+            let ifa = &*cur;
+            if !ifa.ifa_addr.is_null() {
+                let family = (*ifa.ifa_addr).sa_family as i32;
+                let matched = match (ip, family) {
+                    (std::net::IpAddr::V4(v4), libc::AF_INET) => {
+                        let sa = ifa.ifa_addr as *const libc::sockaddr_in;
+                        let raw = u32::from_be((*sa).sin_addr.s_addr);
+                        raw == u32::from(*v4)
+                    }
+                    (std::net::IpAddr::V6(v6), libc::AF_INET6) => {
+                        let sa = ifa.ifa_addr as *const libc::sockaddr_in6;
+                        (*sa).sin6_addr.s6_addr == v6.octets()
+                    }
+                    _ => false,
+                };
+                if matched {
+                    let name = std::ffi::CStr::from_ptr(ifa.ifa_name)
+                        .to_string_lossy()
+                        .into_owned();
+                    break Some(name);
+                }
+            }
+            cur = ifa.ifa_next;
+        };
+        libc::freeifaddrs(head);
+        result.ok_or_else(|| {
+            io::Error::other(format!("ip {ip} not found on any local netdev"))
+        })
+    }
+}
+
+fn roce_candidates() -> Vec<(String, std::net::IpAddr)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else { continue };
+        let ib = format!("/sys/class/net/{name}/device/infiniband");
+        if !std::path::Path::new(&ib).exists() {
+            continue;
+        }
+        // Collect non-link-local IPs on this netdev via getifaddrs.
+        let ips = netdev_ips(&name);
+        for ip in ips {
+            if !ip.is_loopback() && !is_link_local(&ip) {
+                out.push((name.clone(), ip));
+            }
+        }
+    }
+    out
+}
+
+fn netdev_ips(target_dev: &str) -> Vec<std::net::IpAddr> {
+    let mut out = Vec::new();
+    unsafe {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) != 0 {
+            return out;
+        }
+        let mut cur = head;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_addr.is_null() {
+                let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy();
+                if name == target_dev {
+                    let family = (*ifa.ifa_addr).sa_family as i32;
+                    if family == libc::AF_INET {
+                        let sa = ifa.ifa_addr as *const libc::sockaddr_in;
+                        let raw = u32::from_be((*sa).sin_addr.s_addr);
+                        out.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(raw)));
+                    } else if family == libc::AF_INET6 {
+                        let sa = ifa.ifa_addr as *const libc::sockaddr_in6;
+                        out.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                            (*sa).sin6_addr.s6_addr,
+                        )));
+                    }
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    out
+}
+
+fn is_link_local(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => (v6.octets()[0] == 0xfe) && (v6.octets()[1] & 0xc0 == 0x80),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {
     Tcp,
