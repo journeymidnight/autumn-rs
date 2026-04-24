@@ -3692,7 +3692,7 @@ mod f099j_tests {
 
             // Spawn the ps-conn task with the direct req_tx (no router).
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(server_stream, req_tx, /*owner_part=*/ 7).await
+                handle_ps_connection(autumn_transport::Conn::Tcp(server_stream), req_tx, /*owner_part=*/ 7).await
             });
 
             // Spawn a simulated merged_loop that answers the single Put.
@@ -3779,7 +3779,7 @@ mod f099j_tests {
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(128);
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(server, req_tx, 1).await
+                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, 1).await
             });
 
             // Simulated merged_loop: echo every Put.
@@ -3954,7 +3954,9 @@ mod f099k_tests {
                                         let tx = req_tx_accept.clone();
                                         compio::runtime::spawn(async move {
                                             let _ = handle_ps_connection(
-                                                stream, tx, owner_part,
+                                                autumn_transport::Conn::Tcp(stream),
+                                                tx,
+                                                owner_part,
                                             )
                                             .await;
                                         })
@@ -4197,7 +4199,7 @@ mod f099i_tests {
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(server, req_tx, /*owner_part=*/ 7).await
+                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, /*owner_part=*/ 7).await
             });
 
             let loop_handle = compio::runtime::spawn(async move {
@@ -4283,7 +4285,7 @@ mod f099i_tests {
             let cur = Rc::new(Cell::new(0usize));
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(server, req_tx, 9).await
+                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, 9).await
             });
 
             let peak_c = peak.clone();
@@ -4446,7 +4448,7 @@ mod f099i_tests {
                         mpsc::channel::<PartitionRequest>(4096);
 
                     let conn_handle = compio::runtime::spawn(async move {
-                        handle_ps_connection(server, req_tx, 5).await
+                        handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, 5).await
                     });
 
                     let peak_c = peak.clone();
@@ -4624,7 +4626,7 @@ mod f099i_tests {
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(8);
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(server, req_tx, /*owner_part=*/ 11).await
+                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, /*owner_part=*/ 11).await
             });
 
             // Responder: answer each request immediately so the fast-path
@@ -4719,7 +4721,7 @@ mod f099i_tests {
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(server, req_tx, 13).await
+                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, 13).await
             });
 
             let loop_handle = compio::runtime::spawn(async move {
