@@ -35,6 +35,7 @@ fn main() {
         .allowlist_function("ucp_ep_close_nbx")
         .allowlist_function("ucp_listener_create")
         .allowlist_function("ucp_listener_destroy")
+        .allowlist_function("ucp_listener_query")
         .allowlist_function("ucp_conn_request_query")
         .allowlist_function("ucp_stream_send_nbx")
         .allowlist_function("ucp_stream_recv_nbx")

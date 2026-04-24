@@ -9,7 +9,7 @@ default = []
 ucx = ["dep:ucx-sys-mini", "dep:libc", "dep:socket2"]
 
 [dependencies]
-compio = { version = "0.18", features = ["net", "io", "macros", "fs"] }
+compio = { version = "0.18", features = ["net", "io", "macros", "fs", "time"] }
 async-trait = "0.1"
 futures = "0.3"
 tracing = "0.1"

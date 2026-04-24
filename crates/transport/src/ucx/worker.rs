@@ -32,7 +32,10 @@ pub(crate) fn process_context() -> *mut ucp_context {
     CTX.get_or_init(|| {
         let mut params: ucp_params_t = unsafe { std::mem::zeroed() };
         params.field_mask = ucp_params_field::UCP_PARAM_FIELD_FEATURES as u64;
-        params.features = ucp_feature::UCP_FEATURE_STREAM as u64;
+        // STREAM = ucp_stream_*_nbx; WAKEUP = enables ucp_worker_get_efd so
+        // we can integrate progress with compio's io_uring poll loop.
+        params.features = (ucp_feature::UCP_FEATURE_STREAM
+                         | ucp_feature::UCP_FEATURE_WAKEUP) as u64;
 
         let mut cfg: *mut ucp_config_t = ptr::null_mut();
         let st = unsafe { ucp_config_read(ptr::null(), ptr::null(), &mut cfg) };
@@ -69,7 +72,14 @@ pub(crate) struct UcxThreadCtx {
 }
 
 /// Run `f` against the calling thread's UcxThreadCtx, lazily initialising
-/// the worker + spawning its progress task on first use.
+/// the worker AND spawning a per-runtime progress task on first use within
+/// each compio runtime. The progress task drives `ucp_worker_progress`
+/// every 50µs and dies cleanly when its runtime drops.
+///
+/// For test runners that spin up multiple compio runtimes on the same OS
+/// thread, the spawned task from runtime N dies when runtime N drops; we
+/// detect that on the next call (during runtime N+1) via an Rc strong-count
+/// sentinel and re-spawn.
 pub(crate) fn with_thread_ctx<R>(f: impl FnOnce(&mut UcxThreadCtx) -> R) -> R {
     UCX_THREAD.with(|cell| {
         {
@@ -77,7 +87,6 @@ pub(crate) fn with_thread_ctx<R>(f: impl FnOnce(&mut UcxThreadCtx) -> R) -> R {
             if borrow.is_none() {
                 let ctx = process_context();
                 let (worker, efd) = unsafe { create_worker(ctx) };
-                spawn_progress_task(worker, efd);
                 *borrow = Some(UcxThreadCtx {
                     worker,
                     _efd: efd,
@@ -88,9 +97,54 @@ pub(crate) fn with_thread_ctx<R>(f: impl FnOnce(&mut UcxThreadCtx) -> R) -> R {
                                 "autumn-transport ucx: worker created");
             }
         }
+        ensure_progress_task();
         let mut borrow = cell.borrow_mut();
         f(borrow.as_mut().expect("just initialised"))
     })
+}
+
+thread_local! {
+    static PROGRESS_GUARD: RefCell<Option<std::rc::Rc<()>>> =
+        const { RefCell::new(None) };
+}
+
+fn ensure_progress_task() {
+    PROGRESS_GUARD.with(|g| {
+        let need_spawn = match g.borrow().as_ref() {
+            Some(rc) => std::rc::Rc::strong_count(rc) == 1,
+            None => true,
+        };
+        if need_spawn {
+            let rc = std::rc::Rc::new(());
+            *g.borrow_mut() = Some(rc.clone());
+            spawn_progress_task(rc);
+        }
+    });
+}
+
+fn spawn_progress_task(rc: std::rc::Rc<()>) {
+    let worker = UCX_THREAD.with(|c| c.borrow().as_ref().map(|x| WorkerPtr(x.worker)));
+    let Some(w) = worker else { return };
+    compio::runtime::spawn(async move {
+        let _keepalive = rc;
+        loop {
+            unsafe { while ucp_worker_progress(w.0) > 0 {} }
+            compio::time::sleep(std::time::Duration::from_micros(50)).await;
+        }
+    })
+    .detach();
+}
+
+/// Drive `ucp_worker_progress` once on the calling thread's worker.
+/// Cheap: it's a thread-local lookup + a fast UCX call.
+pub(crate) fn progress_once() {
+    UCX_THREAD.with(|cell| {
+        if let Some(c) = cell.borrow().as_ref() {
+            unsafe {
+                while ucp_worker_progress(c.worker) > 0 {}
+            }
+        }
+    });
 }
 
 unsafe fn create_worker(ctx: *mut ucp_context) -> (*mut ucp_worker, RawFd) {
@@ -127,51 +181,6 @@ impl AsFd for UcxEventFd {
 struct WorkerPtr(*mut ucp_worker);
 unsafe impl Send for WorkerPtr {}
 
-fn spawn_progress_task(worker: *mut ucp_worker, efd: RawFd) {
-    let w = WorkerPtr(worker);
-    compio::runtime::spawn(async move {
-        let async_fd = match compio::fs::AsyncFd::new(UcxEventFd(efd)) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::error!(error = %e, "AsyncFd::new(eventfd) failed");
-                return;
-            }
-        };
-
-        loop {
-            // Phase A: drain everything currently ready.
-            // SAFETY: WorkerPtr is single-thread-tied; we run on the same
-            // compio thread that created the worker.
-            unsafe {
-                while ucp_worker_progress(w.0) > 0 {}
-            }
-
-            // Phase B: arm. If UCX still has events queued (BUSY) skip the
-            // wait and progress again. Otherwise wait for the kernel to
-            // signal the eventfd, then read it to consume the wakeup.
-            let arm = unsafe { ucp_worker_arm(w.0) };
-            if arm == ucs_status_t::UCS_ERR_BUSY {
-                continue;
-            }
-            if arm != ucs_status_t::UCS_OK {
-                tracing::error!(status = arm, "ucp_worker_arm failed; progress task exiting");
-                return;
-            }
-
-            // Read 8 bytes from the eventfd; this both blocks until UCX
-            // signals AND clears the counter so the next arm/wait cycle
-            // is meaningful.
-            use compio::io::AsyncRead;
-            let buf = vec![0u8; 8];
-            let compio::BufResult(res, _) = (&async_fd).read(buf).await;
-            if let Err(e) = res {
-                tracing::error!(error = %e, "eventfd read failed; progress task exiting");
-                return;
-            }
-        }
-    })
-    .detach();
-}
 
 // ---- Helpers used by endpoint.rs / listener.rs ----
 

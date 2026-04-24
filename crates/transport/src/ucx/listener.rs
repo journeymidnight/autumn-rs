@@ -9,7 +9,8 @@
 use crate::ucx::endpoint::UcxConn;
 use crate::ucx::ffi::*;
 use crate::ucx::sockaddr;
-use crate::ucx::worker::{ucs_err, with_thread_ctx};
+use crate::ucx::endpoint::YieldNow;
+use crate::ucx::worker::{progress_once, ucs_err, with_thread_ctx};
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use std::io;
@@ -59,12 +60,30 @@ impl UcxListener {
             }
             std::hint::black_box(&mut sa);
 
-            // ucp_listener_create may have allocated a different concrete
-            // sockaddr (for port=0 binds); use the supplied address as
-            // local_addr — it's already concrete (callers who passed
-            // [::]:0 will get a kernel-chosen port, so accept that).
-            // For the test harness we pass an explicit port, so this is fine.
-            Ok((l, addr))
+            // For port=0 binds, query the actual bound sockaddr (UCX picks
+            // an ephemeral port). For explicit ports the query agrees with
+            // what we passed, so this is always safe.
+            let local = unsafe {
+                let mut q: ucp_listener_attr_t = std::mem::zeroed();
+                q.field_mask =
+                    ucp_listener_attr_field::UCP_LISTENER_ATTR_FIELD_SOCKADDR as u64;
+                let st = ucp_listener_query(l, &mut q);
+                if st != ucs_status_t::UCS_OK {
+                    return Err(ucs_err(st, "ucp_listener_query"));
+                }
+                let bytes = std::slice::from_raw_parts(
+                    &q.sockaddr as *const _ as *const u8,
+                    std::mem::size_of::<libc::sockaddr_storage>(),
+                );
+                let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    &mut storage as *mut _ as *mut u8,
+                    bytes.len(),
+                );
+                sockaddr::from_storage(&storage)
+            };
+            Ok((l, local))
         })
         .map_err(|e| {
             // On failure, drop the sender we leaked.
@@ -81,6 +100,8 @@ impl UcxListener {
     }
 
     pub(crate) async fn accept(&mut self) -> io::Result<(UcxConn, SocketAddr)> {
+        // Interleave progress so UCX wireup makes the conn_handler fire.
+        progress_once();
         let req = self
             .rx
             .next()
