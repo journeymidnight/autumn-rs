@@ -35,11 +35,22 @@ pub use ucx::UcxTransport;
 
 static GLOBAL: OnceLock<Box<dyn AutumnTransport>> = OnceLock::new();
 
-/// Initialise the process-global transport. Idempotent; first call wins.
-/// Phase 2 returns `TcpTransport` unconditionally; Phase 4 will honour
-/// `AUTUMN_TRANSPORT` via `decide()`.
+/// Initialise the process-global transport based on `AUTUMN_TRANSPORT`
+/// (`auto` / `tcp` / `ucx`; default `auto`). Idempotent — first call wins.
+/// Subsequent calls are no-ops; `current()` returns whatever the first
+/// `init()` chose.
+///
+/// Panics if `AUTUMN_TRANSPORT=ucx` is requested but UCX/RDMA isn't
+/// available (explicit config error should fail loud, not silently
+/// fall back).
 pub fn init() -> &'static dyn AutumnTransport {
-    let _ = GLOBAL.set(Box::new(TcpTransport));
+    let _ = GLOBAL.set(match decide() {
+        Decision::Tcp => Box::new(TcpTransport) as Box<dyn AutumnTransport>,
+        #[cfg(feature = "ucx")]
+        Decision::Ucx => Box::new(UcxTransport) as Box<dyn AutumnTransport>,
+        #[cfg(not(feature = "ucx"))]
+        Decision::Ucx => unreachable!("decide() can't return Ucx without the ucx feature"),
+    });
     let t = &**GLOBAL.get().expect("init");
     tracing::info!("autumn-transport: init kind={:?}", t.kind());
     t
