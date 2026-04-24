@@ -324,6 +324,20 @@ impl compio::io::AsyncWrite for Conn {
             Conn::Ucx(c) => c.write(buf).await,
         }
     }
+    /// Forward to the inner type's `write_vectored` so the TcpStream's
+    /// native sendmsg-with-N-iovecs path is reachable. The default trait
+    /// impl loops calling `write` per buffer (= N syscalls), which costs
+    /// ~2× write throughput on the rpc client's 2-iov header+payload path.
+    async fn write_vectored<T: compio::buf::IoVectoredBuf>(
+        &mut self,
+        buf: T,
+    ) -> compio::BufResult<usize, T> {
+        match self {
+            Conn::Tcp(s) => s.write_vectored(buf).await,
+            #[cfg(feature = "ucx")]
+            Conn::Ucx(c) => c.write_vectored(buf).await,
+        }
+    }
     async fn flush(&mut self) -> io::Result<()> {
         match self {
             Conn::Tcp(s) => s.flush().await,
@@ -390,6 +404,18 @@ impl compio::io::AsyncWrite for WriteHalf {
             WriteHalf::Tcp(w) => w.write(buf).await,
             #[cfg(feature = "ucx")]
             WriteHalf::Ucx(w) => w.write(buf).await,
+        }
+    }
+    /// Same as `Conn::write_vectored` — forward to inner; default trait impl
+    /// loops + ~2× syscalls.
+    async fn write_vectored<T: compio::buf::IoVectoredBuf>(
+        &mut self,
+        buf: T,
+    ) -> compio::BufResult<usize, T> {
+        match self {
+            WriteHalf::Tcp(w) => w.write_vectored(buf).await,
+            #[cfg(feature = "ucx")]
+            WriteHalf::Ucx(w) => w.write_vectored(buf).await,
         }
     }
     async fn flush(&mut self) -> io::Result<()> {
