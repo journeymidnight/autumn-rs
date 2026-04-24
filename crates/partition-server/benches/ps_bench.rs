@@ -42,6 +42,7 @@ struct Config {
     manager: String,
     duration_secs: u64,
     value_size: usize,
+    transport: String,
 }
 
 impl Config {
@@ -50,6 +51,7 @@ impl Config {
             manager: "127.0.0.1:9001".to_string(),
             duration_secs: 10,
             value_size: 4096,
+            transport: std::env::var("AUTUMN_TRANSPORT").unwrap_or_else(|_| "auto".into()),
         };
         // skip arg 0 (executable name) and any `--bench` cargo injects
         let mut it = std::env::args().skip(1);
@@ -74,10 +76,17 @@ impl Config {
                         }
                     }
                 }
+                "--transport" => {
+                    if let Some(v) = it.next() {
+                        c.transport = v;
+                    }
+                }
                 // Ignore unknown flags (cargo bench passes --bench, etc.)
                 _ => {}
             }
         }
+        // Apply transport choice via env so autumn_transport::init picks it up.
+        std::env::set_var("AUTUMN_TRANSPORT", &c.transport);
         c
     }
 }

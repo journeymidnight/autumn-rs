@@ -615,9 +615,19 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 
 ### F100-UCX · AutumnTransport trait + UCP-stream RDMA impl（path 1 + path 2）
 - **Target:** Introduce a new `autumn-transport` crate that abstracts `connect` / `bind` / `accept` / `AsyncRead+AsyncWriteExt` behind an `AutumnTransport` / `AutumnListener` / `AutumnConn` trait surface, with a TCP implementation (parity with today) and a UCX implementation gated on `cargo feature = "ucx"`. Migrate call sites in `autumn-rpc` (Client ↔ PartitionServer — path 2) and `autumn-stream` (PartitionServer ↔ ExtentNode three-replica append — path 1). Out of scope: PS-internal pipeline (path 3), Manager RPC (path 4), tag-matching / Active-Messages rewrite, per-peer transport fallback, heterogeneous clusters. Runtime selection via `AUTUMN_TRANSPORT=auto|tcp|ucx`, compile default `off`. Phased rollout P1–P5 (see spec §9). Acceptance gates: (a) `cargo test --workspace` green on TCP; (b) `AUTUMN_TRANSPORT=ucx cargo test --features ucx` green on UCX loopback; (c) path 2 small-RPC RTT −30–50% and path 1 64 KB–1 MB append throughput ≥ 2× vs TCP baseline on the 10×mlx5 host; (d) `UCX_PROTO_INFO=y` trace confirms `rndv/get/zcopy` for > 64 KB payloads (design premise).
-- **Evidence:** `docs/superpowers/specs/2026-04-23-ucx-transport-design.md` (11 sections, ~340 lines, brainstorm-done).
-- **Notes:** Brainstorm complete. Next: finalize answers on Q1 (pre-commit `ucp_stream` rndv probe on UCX 1.16) and Q2 (`Box<dyn AutumnConn>` vs. enum dispatch), then hand off to superpowers:writing-plans for the P1–P5 task breakdown. Build host needs `libucx-dev` (currently only `libucx0=1.16.0` present) before P3. `ucx-sys` crate quality is a P0 research task inside the plan (may fall back to an in-tree `bindgen` crate).
-- **passes:** false
+- **Evidence:** spec `docs/superpowers/specs/2026-04-23-ucx-transport-design.md` (13 sections incl §13 ucx-sys decision); plan `docs/superpowers/plans/2026-04-23-f100-ucx-transport.md` (P0–P5, 27 tasks); commits `14506a5..b8e7923` on `f100-ucx`. Crate `crates/transport/` (~700 LoC), in-tree `crates/transport/ucx-sys-mini/` bindgen sub-crate. `scripts/check_roce.sh` deployment preflight, `scripts/perf_ucx_baseline.sh` A/B runner, `perf_baseline_ucx.json` first-pass numbers.
+- **Notes:**
+  - **Acceptance status — partial pass.** Gates (a), (b), (d) met; (c) requires cross-host benchmarking that's a separate deploy session, not a single-session deliverable.
+  - (a) ✓ workspace test green on TCP: 192/0/0 (188 P3 baseline + 4 listen_validator).
+  - (b) ✓ UCX loopback suite green on real rc_mlx5/mlx5_0 RoCEv2 (3 active + 1 ignored half_close + cancel-safety regression). 7/7 rpc round_trip integration tests pass individually under `AUTUMN_TRANSPORT=ucx`.
+  - (c) ⚠️ **Cross-host RDMA A/B not measured this session** — single-host loopback shows UCX *slower* than TCP (24μs vs 6.9μs ping-pong, 1.1 GB/s vs 2.8 GB/s) because TCP loopback bypasses the NIC entirely and UCX rc_mlx5 hits the real HCA even for self-traffic. This is expected and honest — RDMA wins only when network latency dominates. Need a 2-host run for the spec's targeted 30–50% RTT improvement and 2× large-payload throughput.
+  - (d) ✓ `UCX_PROTO_INFO` trace shows rc_mlx5 `multi-frag stream zero-copy copy-out` (= rndv get-zcopy) at ≥331 B (spec §12 Q1's 478 B prediction was close — different config defaults).
+  - **Major design pivots vs. spec §3:**
+    1. Trait object → enum dispatch (compio `AsyncRead::read<B>` is generic → trait not dyn-compatible). Spec §12 Q2-rev documents.
+    2. Polling progress → eventfd POLL_ADD via `compio::driver::op::PollOnce` (P3-fix commit `72b7d30`). Wakeup latency went from ~25μs avg (50μs polling) to <1μs (one io_uring round-trip).
+    3. Server-side serve split into `serve_tcp` (unchanged, std-listener+OS-thread+Dispatcher) vs `serve_ucx` (compio-runtime accept, single-thread). Multi-core UCX server scaling deferred.
+  - **Carried forward to future tickets:** cross-host perf A/B; multi-core UCX server (per-worker listeners + manager-side discovery); cross-test UCX state isolation in test harness; eventfd integration is in but `ucp_request_cancel` for pending recv has a 100k-iter spin cap as defense-in-depth.
+- **passes:** done_with_concerns
 
 
 ## P3 — Post-extraction CI cleanup (not blocking)

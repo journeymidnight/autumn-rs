@@ -21,3 +21,7 @@ socket2 = { version = "0.5", optional = true, features = ["all"] }
 
 [dev-dependencies]
 compio = { version = "0.18", features = ["net", "io", "macros", "time"] }
+
+[[bench]]
+name = "transport_bench"
+harness = false
