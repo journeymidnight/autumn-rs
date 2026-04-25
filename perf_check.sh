@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # perf_check.sh — build release, start fresh 3-replica cluster, run perf-check
 #
-# Default: runs the full 2×2×2×2 = 16-run matrix
+# Default: runs the 2×2×1×2 = 8-run matrix
 #   transports     = {tcp, ucx}
 #   partitions     = {1, 8}
-#   pipeline-depth = {1, 8}
+#   pipeline-depth = {8}          (client-side only; d=8 is the throughput point)
 #   value size     = {4K, 8M}
-# → 4 cluster restarts (size + depth are client-side only; both inner-loop).
+# → 4 cluster restarts (size is client-side only; inner-loop).
 #
 # Client concurrency: `--threads 16` by default (override with --threads N).
 # Total in-flight = threads × pipeline-depth. Keep threads low (≤ ~32) and
@@ -68,7 +68,7 @@ UPDATE_BASELINE=""
 SKIP_CLUSTER=0
 TRANSPORT_LIST="tcp ucx"          # default: both transports
 PARTITIONS_LIST="1 8"             # default: both partition counts
-PIPELINE_DEPTH_LIST="1 8"         # default: both pipeline depths
+PIPELINE_DEPTH_LIST="8"           # depth is client-side only; d=8 is the representative throughput point
 SIZES_LIST="4096 8388608"         # default: 4 KB (small-msg) + 8 MB (rndv-zcopy)
 THREADS=16                        # default: 16 client OS threads (see header)
 
