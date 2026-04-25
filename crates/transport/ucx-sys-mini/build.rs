@@ -5,13 +5,28 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    // Link libucp + transitive deps via pkg-config.
-    let lib = pkg_config::probe_library("ucx").expect(
-        "ucx pkg-config — install libucx-dev (see spec §13 build host preconditions)",
-    );
-
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("bindings.rs");
+
+    // Probe libucx via pkg-config. If absent, emit an empty bindings.rs so the
+    // crate compiles to an effectively-empty stub. Downstream that opts into
+    // `autumn-transport/ucx` will fail loudly (unresolved symbols) — which is
+    // the correct signal: install libucx-dev. Downstream that does NOT enable
+    // the feature won't reference any symbol, so a stub is fine and keeps
+    // `cargo build --workspace` working on hosts without UCX.
+    let lib = match pkg_config::probe_library("ucx") {
+        Ok(lib) => lib,
+        Err(e) => {
+            println!(
+                "cargo:warning=libucx not found via pkg-config ({e}); ucx-sys-mini built as empty stub. Install libucx-dev to enable --features ucx."
+            );
+            std::fs::write(&out_path, b"").expect("write empty bindings.rs stub");
+            return;
+        }
+    };
 
     let mut builder = bindgen::Builder::default()
         .header("wrapper.h")
@@ -79,7 +94,6 @@ fn main() {
         .generate()
         .expect("bindgen failed against <ucp/api/ucp.h>");
 
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("bindings.rs");
     bindings
         .write_to_file(&out_path)
         .expect("write bindings.rs");

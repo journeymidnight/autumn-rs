@@ -613,6 +613,21 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 
 ## P5 — Network transport abstraction (RDMA / UCX)
 
+### F101-e · Make `ucx-sys-mini` build cleanly on hosts without libucx
+- **Target:** Allow `cargo build --workspace` (and `cargo test --workspace`) on machines that don't have `libucx-dev` installed. Previously `ucx-sys-mini/build.rs` panicked at `pkg_config::probe_library("ucx").expect(...)` whenever libucx was absent, even though `autumn-transport`'s `ucx` feature is off by default and nobody references the symbols. The crate is in `[workspace.members]` (it has its own published name with `links = "ucp"`), so `--workspace` always tries to compile it.
+- **Fix:** `crates/transport/ucx-sys-mini/build.rs` now matches on `pkg_config::probe_library("ucx")`. On `Err` it writes an empty `bindings.rs` to `OUT_DIR` and emits `cargo:warning=libucx not found via pkg-config ... ucx-sys-mini built as empty stub`. The crate compiles to a near-empty lib (just `pub use libc;`). Downstream `autumn-transport` only references the bindings under `#[cfg(feature = "ucx")]`, so default builds touch nothing; opting into `--features ucx` without libucx fails at link time with unresolved `ucp_*` symbols — the correct signal.
+- **Verification (this session):**
+  - Host has libucx 1.16.0. Normal `cargo build -p ucx-sys-mini`: succeeds, full bindings generated.
+  - Simulated no-UCX via `PKG_CONFIG_LIBDIR=/tmp/empty cargo build -p ucx-sys-mini`: succeeds, warning emitted, empty stub bindings.
+  - Simulated no-UCX `cargo build --workspace --exclude autumn-fuse`: succeeds (autumn-fuse excluded because this host also lacks libfuse-dev — a separate, parallel pkg-config issue not in scope of F101-e).
+- **Acceptance:**
+  - (a) ✓ `cargo build -p ucx-sys-mini` works on hosts with and without libucx.
+  - (b) ✓ Default workspace build path (no `--features ucx`) requires no UCX install.
+  - (c) ✓ Explicit `--features ucx` on a host without libucx still fails (correct), pointing the developer at the missing dependency.
+  - (d) ✓ `links = "ucp"` left untouched — that field is cargo metadata for dedup, not a hard link directive; no `cargo:rustc-link-lib=ucp` is emitted on the stub path.
+- **passes:** true
+- **Carried forward:** `autumn-fuse` has `default = ["fuse"]` and pulls `fuser`, which also probes pkg-config (`fuse.pc`/`fuse3.pc`). On hosts without libfuse-dev, `cargo build --workspace` still fails at the `fuser` build script. Same pattern, separate fix — flag for a follow-up (F101-f or similar) to either flip the default off or apply the same graceful-stub treatment.
+
 ### F101-d · Root-cause UCX 8 M loopback wedge: also exclude `posix` transport
 - **Target:** F101-c shipped with `UCX_TLS=^sysv` and 3 of 4 UCX 8 M combos still wedged. Trace the actual failure on a fresh broken case, identify the real culprit, fix it under thread-per-core (env default only — no source change).
 - **Investigation (this session):**

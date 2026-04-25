@@ -1,66 +1,63 @@
 Date: 2026-04-25
 TaskStatus: completed
-Task scope: F101-d — root-cause the residual UCX 8 M loopback wedge that
-F101-c's `^sysv` exclusion didn't fix; ship the dual `^sysv,^posix`
-exclusion as the new default.
+Task scope: F101-e — make `ucx-sys-mini` build cleanly on hosts without
+libucx-dev installed, so that `cargo build --workspace` no longer panics
+on bare developer machines. Default-feature build path of
+`autumn-transport` already gates UCX usage; only the bindgen probe in
+ucx-sys-mini/build.rs was unconditionally fatal.
 
-Investigation:
-  ✓ Re-read crates/transport/src/ucx/endpoint.rs send/recv path. Each
-    call takes an OWNED `B: IoBuf` per send (no buffer reuse); UCX
-    handles MR caching internally via UCX_MEMTYPE_CACHE (default `try`).
-    Hypotheses #1 (buffer reuse) and #3 (MR re-registration) from
-    F101-c were misdirected — neither is in our codepath.
-  ✓ Triggered the wedge with --threads 1 --size 8M on a UCX cluster
-    that had only `^sysv`. Single op took 11.5 s. PS log captured:
-        mm_posix.c:233 UCX ERROR open(file_name=/proc/382025/fd/393
-                                       flags=0x0) failed: No such file
-                                       or directory
-  ✓ Same family of failure as sysv: UCX `posix` transport reads peer
-    process memory via /proc/<peer_pid>/fd/<N>. This environment
-    blocks /proc fd visibility across processes. UCX picks posix for
-    > eager rendezvous, open() fails, send wedges.
+Change:
+  - crates/transport/ucx-sys-mini/build.rs:
+      pkg_config::probe_library("ucx").expect(...)
+        → match { Ok(lib) => bindgen as before,
+                  Err(e)  => emit empty bindings.rs stub + cargo:warning }
+  - lib.rs untouched (the existing `include!(bindings.rs)` of an empty
+    file is a valid Rust no-op; only `pub use libc;` remains).
+  - Downstream autumn-transport `ucx` feature already gates all UCX
+    call sites with `#[cfg(feature = "ucx")]`, so no consumer-side
+    changes needed.
 
-Fix:
-  ✓ perf_check.sh: UCX_TLS default flipped from `^sysv` to
-    `^sysv,^posix` (caller still overridable via `: "${UCX_TLS:=...}"`).
-    UCX now falls back to `cma` (Cross-Memory-Attach, syscall-based,
-    immune to IPC-namespace and /proc restrictions; ~17 GB/s in
-    ucx_perftest) for intra-host bulk + `tcp` for control.
+Verification:
+  ✓ Host has libucx 1.16.0; `cargo build -p ucx-sys-mini` succeeds with
+    full bindings.
+  ✓ Simulated absence with `PKG_CONFIG_LIBDIR=/tmp/empty cargo build
+    -p ucx-sys-mini` → succeeds, warning emitted, empty stub written.
+  ✓ Simulated absence at workspace level (`--workspace --exclude
+    autumn-fuse`) → succeeds. autumn-fuse excluded because libfuse-dev
+    is also missing on this host — that is a parallel pkg-config
+    fragility (fuser crate's build.rs panics the same way), separate
+    from F101-e and worth a follow-up.
 
-Verification (after fix, p=8, threads=16, depth=8, size=8M):
-  Before: wedge or ~35 ops/s with multi-second p99 tails
-  After:  56 write ops/s @ 449 MB/s, 79 read ops/s @ 633 MB/s
-          run completes cleanly in 30 s, no posix/sysv errors
-          in PS log.
+Behavior matrix:
+  | Host env             | Command                                   | Result   |
+  |----------------------|-------------------------------------------|----------|
+  | no libucx, no flag   | cargo build -p ucx-sys-mini               | ✓ stub   |
+  | no libucx, no flag   | cargo build (default-members only)        | ✓        |
+  | no libucx, no flag   | cargo build --workspace                   | ✓ (mod.  |
+  |                      |                                           | autumn-  |
+  |                      |                                           | fuse)    |
+  | no libucx, --features ucx                                          | ✗ link   |
+  | with libucx, --features ucx                                        | ✓ full   |
 
 Acceptance:
-  (a) ✓ UCX 8 M perf-check completes end-to-end.
-  (b) ✓ No `mm_posix.c:233` or `mm_sysv.c:59` errors during runs.
-  (c) ✓ No source-code change in transport/rpc/partition-server
-       — env-default only, thread-per-core preserved.
-  (d) ⚠ Single-thread × d=1 × 8 M is ~5 s/op (RTT-bound on cma at
-       single-op serial). Parallelism (16t × d=8) hits 449/633 MB/s.
+  (a) ✓ Default workspace builds need no libucx install
+  (b) ✓ Explicit --features ucx without libucx still fails loudly
+       (correct signal: install libucx-dev)
+  (c) ✓ links = "ucp" Cargo manifest field untouched — only the build
+       script's link-lib emission changes, which is automatically tied
+       to the pkg_config probe path
+  (d) ✓ No source-code change in transport / rpc / partition-server /
+       stream — pure build-script refactor
 
-Same-host UCX upper bound (verified this session):
-  - HCA driver does NOT bridge two mlx5 cards on the same host.
-    Tried UCX_TLS=rc_mlx5,self with two different mlx5 NICs +
-    worker-address API via ucx_perftest → 'no connect to iface'.
-  - Linux kernel routes all local IPs to dev lo, so even if HCAs
-    could bridge, sockaddr-based ucp_listener can't see them as
-    remote peers.
-  - Conclusion: 真 RDMA 必须双机. NIXL 本地例子用的也是 cma,
-    不是真 RDMA.
+Follow-up (separate task, F101-f candidate):
+  - autumn-fuse has `default = ["fuse"]` and pulls `fuser` which
+    panics in its build.rs when libfuse-dev is absent. Same fragility
+    as ucx-sys-mini pre-F101-e but in a 3rd-party crate, so the fix
+    has to be a feature-gate flip (default = []) or workspace-level
+    exclusion, not a build.rs rewrite.
 
-Updated baseline data NOT regenerated — that's a separate run when
-user resumes (perf_check.sh --update-baseline runs the full 16-combo
-matrix; only the kept reference baseline perf_baseline_tcp_p8_d8_s4k.json
-is committed, others are local).
-
-Next steps (when user resumes):
-  - Run full `perf_check.sh --update-baseline` to capture all 16
-    combos with the new ^sysv,^posix default; verify all 4 UCX 8 M
-    combos now produce non-wedge data.
-  - Optionally tighten `UCX_TLS` further if `cma` shows transient
-    issues at high concurrency.
-  - Cross-host RDMA A/B (F100-UCX gate c) remains separate deploy
-    work, not addressable on this single-host setup.
+Next steps when user resumes:
+  - Optionally apply the parallel fix to autumn-fuse so
+    `cargo build --workspace` works on a fully bare host.
+  - F100-UCX gate (c) cross-host A/B remains the only path to actual
+    RDMA throughput numbers.

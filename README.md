@@ -397,7 +397,10 @@ autumn-rs can carry hot RPC paths over RDMA via UCP/UCX. Default is TCP;
 UCX is opt-in at compile time and runtime.
 
 ### Build host preconditions
-- `libucx-dev` ≥ 1.16 (`pkg-config --modversion ucx`)
+- `libucx-dev` ≥ 1.16 (`pkg-config --modversion ucx`) — only needed if
+  you opt into `--features ucx`. Default builds work without it; the
+  `ucx-sys-mini` build script gracefully degrades to an empty stub
+  (one `cargo:warning`) when pkg-config can't find ucx.
 - At least one mlx5 (or other RDMA) HCA with a RoCE v2 GID on a routable
   IP (IPv4 or IPv6 GUA/ULA — link-local fe80::/10 doesn't work)
 - Verify with `scripts/check_roce.sh` (exit 0 = ready;
@@ -406,7 +409,11 @@ UCX is opt-in at compile time and runtime.
 ### Build with the UCX feature
     cargo build --workspace --features autumn-transport/ucx
 
-The default build has zero UCX dependencies.
+The default build has zero UCX dependencies — `cargo build --workspace`
+on a host without libucx will compile `ucx-sys-mini` as an empty stub
+(prints a `cargo:warning`) and skip linking `libucp`. Opting into
+`--features ucx` without libucx fails at link time with unresolved
+`ucp_*` symbols — that's the signal to `apt install libucx-dev`.
 
 ### Runtime selection
     AUTUMN_TRANSPORT=auto   # default; pick UCX if RDMA available, else TCP
