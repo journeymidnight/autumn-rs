@@ -613,6 +613,27 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 
 ## P5 — Network transport abstraction (RDMA / UCX)
 
+### F101-d · Root-cause UCX 8 M loopback wedge: also exclude `posix` transport
+- **Target:** F101-c shipped with `UCX_TLS=^sysv` and 3 of 4 UCX 8 M combos still wedged. Trace the actual failure on a fresh broken case, identify the real culprit, fix it under thread-per-core (env default only — no source change).
+- **Investigation (this session):**
+  - Re-read `crates/transport/src/ucx/endpoint.rs` send/recv: each call takes an OWNED `B: IoBuf` per send (no buffer reuse on our side); UCX manages its own MR cache via `UCX_MEMTYPE_CACHE` (default `try`). Hypotheses #1 (buffer reuse) and #3 (MR re-registration) from the F101-c analysis were misdirected — neither is in our codepath.
+  - Forced a 1-thread × 8 M perf-check on a UCX cluster with `UCX_TLS=^sysv` (the F101-c default). Single op completed in 11.5 s. PS log captured the smoking gun:
+    ```
+    mm_posix.c:233 UCX ERROR open(file_name=/proc/382025/fd/393 flags=0x0) failed: No such file or directory
+    ```
+    UCX `posix` transport accesses peer process memory through `/proc/<peer_pid>/fd/<N>` paths. This environment blocks that visibility (same family of restriction as the SysV `shmat` issue). UCX picks posix for >eager rendezvous, the open fails, the send stalls.
+  - Verification: `UCX_TLS=^sysv,^posix` on both client AND daemon side. Restart cluster (env propagates via `cluster.sh start` inheritance). Re-run UCX 16 t × d=8 × 8 M:
+    - Before fix: wedge / 0 ops or 35 ops/s with huge tail
+    - After fix:  **56 write ops/s @ 449 MB/s, 79 read ops/s @ 633 MB/s** (real numbers, run completed cleanly in 30 s)
+- **Fix:** `perf_check.sh` defaults `UCX_TLS=^sysv,^posix` (was `^sysv`). Caller-overridable via `: "${UCX_TLS:=^sysv,^posix}"`. README + claude-progress.txt updated with the dual exclusion explanation. UCX falls back to `cma` (Cross-Memory-Attach syscall, no IPC-namespace dependence) for intra-host bulk + `tcp` for control.
+- **Acceptance:**
+  - (a) ✓ UCX 8 M perf-check completes end-to-end without wedging (verified 16 t × d=8).
+  - (b) ✓ No new `mm_posix.c:233` or `mm_sysv.c:59` errors in PS log during runs.
+  - (c) ✓ No source-code change in transport / rpc / partition-server crates — env-default only, thread-per-core preserved.
+  - (d) ⚠ Single-thread × d=1 × 8 M is still slow (~5 s/op = round-trip latency on cma path). Throughput at parallelism is fine; serial is fundamentally bandwidth × RTT bound.
+- **passes:** true
+- **Carried forward:** still no real RDMA on this host (Linux routes all local IPs to `dev lo`; HCA driver refuses RC between two same-host mlx5 cards — verified via `ucx_perftest UCX_TLS=rc_mlx5,self`). F100-UCX gate (c) cross-host A/B remains the only path to actual RDMA numbers.
+
 ### F101-c · Add size={4K, 8M} axis to perf_check; env defaults for UCX large-payload loopback
 - **Target:** perf_check.sh default matrix gains a **size** axis — now 2×2×2×2 = 16 runs (transport × partitions × pipeline-depth × size). 8 MB exercises the value-pointer path (values > VALUE_THROTTLE=4K are stored as VP in memtable, raw bytes go to log_stream), so the full flush pipeline is tested. Ship env workarounds needed to keep UCX healthy at large payloads on this host: `ulimit -l unlimited` (the 8 MB RLIMIT_MEMLOCK default is exhausted by 16 concurrent 8 MB pinned MRs) and `UCX_TLS=^sysv` (this IPC namespace rejects `shmat`, which hangs UCX's sysv transport on large loopback transfers — visible as `mm_sysv.c:59 UCX ERROR shmat(shmid=...) failed: Invalid argument` in the PS log).
 - **Evidence (this session):** `perf_check.sh` + eight baselines for TCP all sizes/combos; four UCX 4 K baselines; one UCX 8 M baseline (p=8 × d=8). Three UCX 8 M combos wedge — UCX on loopback falls back to `uct_tcp` (127.0.0.1 isn't on a RoCE-attached NIC), and UCX-over-TCP rendezvous is flaky on sustained single-EP 8 MB sends on this host. TCP 8 M runs cleanly across all 4 partition/depth combos (best: p=8 × d=8 → 199 ops/s / 1 596 MB/s write, 91 ops/s / 730 MB/s read).

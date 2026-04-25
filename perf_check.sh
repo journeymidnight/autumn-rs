@@ -46,12 +46,18 @@ ulimit -n 65536 2>/dev/null || true
 # daemons) inherit this limit, so set it here to cover everything.
 ulimit -l unlimited 2>/dev/null || true
 
-# UCX workaround: this environment's IPC namespace rejects `shmat` (seen
-# in the PS log as `mm_sysv.c:59 UCX ERROR shmat(shmid=...) failed:
-# Invalid argument`), so UCX's sysv transport hangs on loopback transfers
-# larger than its small-msg threshold (≈ 4 KB works, 8 MB wedges). Default
-# UCX_TLS is `all`; exclude sysv. Respects caller-provided UCX_TLS.
-: "${UCX_TLS:=^sysv}"
+# UCX workaround: this environment blocks BOTH the SysV and POSIX
+# shared-memory transports on the > eager-threshold path:
+#   sysv:  `mm_sysv.c:59  shmat(shmid=...) failed: Invalid argument`
+#          (IPC namespace denies shmat)
+#   posix: `mm_posix.c:233 open(file_name=/proc/<peer_pid>/fd/<N>) failed:
+#           No such file or directory`
+#          (peer-fd visibility through /proc restricted)
+# Either one being chosen by UCX for an 8 MB rendezvous causes the send
+# to wedge for tens of seconds. Excluding both lets UCX fall back to
+# `cma` (zero-copy syscall, 17+ GB/s in ucx_perftest) for intra-host
+# bulk + `tcp` for control. Respects caller-provided UCX_TLS.
+: "${UCX_TLS:=^sysv,^posix}"
 export UCX_TLS
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

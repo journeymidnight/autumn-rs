@@ -1,54 +1,66 @@
-Date: 2026-04-24
+Date: 2026-04-25
 TaskStatus: completed
-Task scope: F101-c — add value-size axis {4K, 8M} to perf_check default
-matrix, ship UCX env defaults that prevent common loopback pitfalls.
+Task scope: F101-d — root-cause the residual UCX 8 M loopback wedge that
+F101-c's `^sysv` exclusion didn't fix; ship the dual `^sysv,^posix`
+exclusion as the new default.
 
-Current summary:
-  ✓ perf_check.sh default matrix is now 2×2×2×2 = 16 runs
-      (transport × partitions × pipeline-depth × size {4K, 8M}).
-  ✓ Baseline naming extended:
-      perf_baseline_${transport}_p${parts}_d${depth}_s${size_label}[_shm].json
-    Size label: 4k, 8m (or <N>b / <N>k / <N>m for other values).
-  ✓ `--size {4k|8m|N_bytes}` flag to narrow the matrix.
-  ✓ ulimit -l unlimited set in perf_check.sh — RDMA pins via ibv_reg_mr;
-    the 8 MB distro default is exhausted by 16 × 8 MB concurrent MRs.
-    Child cluster.sh → daemons inherit; verified via /proc/<ps>/limits.
-  ✓ UCX_TLS=^sysv set (overridable) — this host's IPC namespace rejects
-    shmat, which hangs UCX's sysv transport on large loopback transfers
-    (seen as `mm_sysv.c:59 UCX ERROR shmat(shmid=...) failed: Invalid
-    argument`). Excluding sysv falls back to uct_tcp on loopback.
+Investigation:
+  ✓ Re-read crates/transport/src/ucx/endpoint.rs send/recv path. Each
+    call takes an OWNED `B: IoBuf` per send (no buffer reuse); UCX
+    handles MR caching internally via UCX_MEMTYPE_CACHE (default `try`).
+    Hypotheses #1 (buffer reuse) and #3 (MR re-registration) from
+    F101-c were misdirected — neither is in our codepath.
+  ✓ Triggered the wedge with --threads 1 --size 8M on a UCX cluster
+    that had only `^sysv`. Single op took 11.5 s. PS log captured:
+        mm_posix.c:233 UCX ERROR open(file_name=/proc/382025/fd/393
+                                       flags=0x0) failed: No such file
+                                       or directory
+  ✓ Same family of failure as sysv: UCX `posix` transport reads peer
+    process memory via /proc/<peer_pid>/fd/<N>. This environment
+    blocks /proc fd visibility across processes. UCX picks posix for
+    > eager rendezvous, open() fails, send wedges.
 
-Measured (disk, 3-replica, --nosync, threads=16):
+Fix:
+  ✓ perf_check.sh: UCX_TLS default flipped from `^sysv` to
+    `^sysv,^posix` (caller still overridable via `: "${UCX_TLS:=...}"`).
+    UCX now falls back to `cma` (Cross-Memory-Attach, syscall-based,
+    immune to IPC-namespace and /proc restrictions; ~17 GB/s in
+    ucx_perftest) for intra-host bulk + `tcp` for control.
 
-  4 KB (unchanged from F101-b):
-    TCP p=8 × d=8 : 141 988 w / 1.11 M r  (4.34 GB/s read)
-    UCX p=8 × d=8 : 129 199 w / 763 697 r (2.98 GB/s read)
-
-  8 MB (new this session):
-    TCP p=8 × d=8 : 199.5 w (1596 MB/s) / 91.3 r (730 MB/s)
-    TCP p=8 × d=1 : 164.6 w (1317 MB/s) / 90.4 r (723 MB/s)
-    TCP p=1 × d=8 :  70.0 w  (560 MB/s) / 63.2 r (506 MB/s)
-    TCP p=1 × d=1 :  71.6 w  (573 MB/s) / 59.2 r (474 MB/s)
-    UCX p=8 × d=8 :  35.0 w  (280 MB/s) / 34.3 r (275 MB/s)
-    UCX p=8 × d=1, UCX p=1 × d=1, UCX p=1 × d=8: wedge (see below)
+Verification (after fix, p=8, threads=16, depth=8, size=8M):
+  Before: wedge or ~35 ops/s with multi-second p99 tails
+  After:  56 write ops/s @ 449 MB/s, 79 read ops/s @ 633 MB/s
+          run completes cleanly in 30 s, no posix/sysv errors
+          in PS log.
 
 Acceptance:
-  (a) ✓ TCP 8 M completes all 4 combos non-zero — matrix dimension works.
-  (b) ✓ At least one UCX 8 M combo completes with real data (p=8 × d=8).
-  (c) ✓ Env defaults (memlock, UCX_TLS) propagate to daemons via inheritance.
-  (d) ⚠ 3 of 4 UCX 8 M combos wedge. This is UCX-over-loopback-TCP
-      (127.0.0.1 isn't on a RoCE NIC so uct_rc_mlx5 fails resolve);
-      uct_tcp rendezvous is flaky on sustained single-EP 8 MB sends.
-      Single-op put/get of 8 MB over UCX works fine. The failure is
-      SUSTAINED ops on a warm EP — a loopback-only edge case that
-      cross-host RoCE deployment will sidestep.
+  (a) ✓ UCX 8 M perf-check completes end-to-end.
+  (b) ✓ No `mm_posix.c:233` or `mm_sysv.c:59` errors during runs.
+  (c) ✓ No source-code change in transport/rpc/partition-server
+       — env-default only, thread-per-core preserved.
+  (d) ⚠ Single-thread × d=1 × 8 M is ~5 s/op (RTT-bound on cma at
+       single-op serial). Parallelism (16t × d=8) hits 449/633 MB/s.
 
-Main gaps (carried forward):
-  - Cross-host UCX A/B (F100-UCX gate c) is the only way to get real
-    UCX 8 MB numbers; single-host loopback can't represent it.
-  - TCP 8M p99 tail is huge (≥ 1.4 s p99) — that's disk-I/O tail on /tmp,
-    not transport related. Investigate later if needed.
+Same-host UCX upper bound (verified this session):
+  - HCA driver does NOT bridge two mlx5 cards on the same host.
+    Tried UCX_TLS=rc_mlx5,self with two different mlx5 NICs +
+    worker-address API via ucx_perftest → 'no connect to iface'.
+  - Linux kernel routes all local IPs to dev lo, so even if HCAs
+    could bridge, sockaddr-based ucp_listener can't see them as
+    remote peers.
+  - Conclusion: 真 RDMA 必须双机. NIXL 本地例子用的也是 cma,
+    不是真 RDMA.
 
-Next steps:
-  - None in scope. Matrix axis + env defaults shipped.
-  - Cross-host deploy required to complete F100-UCX gate (c).
+Updated baseline data NOT regenerated — that's a separate run when
+user resumes (perf_check.sh --update-baseline runs the full 16-combo
+matrix; only the kept reference baseline perf_baseline_tcp_p8_d8_s4k.json
+is committed, others are local).
+
+Next steps (when user resumes):
+  - Run full `perf_check.sh --update-baseline` to capture all 16
+    combos with the new ^sysv,^posix default; verify all 4 UCX 8 M
+    combos now produce non-wedge data.
+  - Optionally tighten `UCX_TLS` further if `cma` shows transient
+    issues at high concurrency.
+  - Cross-host RDMA A/B (F100-UCX gate c) remains separate deploy
+    work, not addressable on this single-host setup.

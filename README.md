@@ -495,18 +495,25 @@ The script sets two environment defaults (overridable by the caller)
 to keep UCX healthy at non-trivial message sizes:
 - `ulimit -l unlimited` — RDMA pins memory via `ibv_reg_mr`;
   the common distro default (8 MB) is exhausted by 8 MB payload runs.
-- `UCX_TLS=^sysv` — this host's IPC namespace rejects `shmat`, which
-  hangs UCX's sysv transport on large loopback transfers (seen as
-  `mm_sysv.c:59 UCX ERROR shmat(...) failed: Invalid argument` in the
-  PS log). Excluding sysv falls back to other transports.
+- `UCX_TLS=^sysv,^posix` — this environment blocks both shared-memory
+  transports for >eager messages:
+    - sysv: `mm_sysv.c:59 shmat(...) failed: Invalid argument`
+            (IPC namespace denies shmat)
+    - posix: `mm_posix.c:233 open(/proc/<peer_pid>/fd/<N>) failed: No
+             such file or directory` (peer-fd visibility restricted)
+  Either one being chosen by UCX for an 8 MB rendezvous wedges the
+  send for tens of seconds. Excluding both lets UCX fall back to
+  `cma` (Cross-Memory-Attach, ~17 GB/s in ucx_perftest) for intra-host
+  bulk and `tcp` for control.
 
-**UCX 8 M loopback caveat**: with 127.0.0.1 / ::1 the cluster isn't on
-a RoCE-attached NIC, so UCX falls back to its own TCP transport
-(`uct_tcp`). UCX-over-TCP rendezvous handles 4 KB fine but is flaky on
-sustained 8 MB on a single EP (some runs complete, others wedge after
-3 ops). This is a loopback edge case — cross-host RDMA on
-RoCE-attached IPs is the target environment. TCP 8 MB runs cleanly in
-both loopback and cross-host.
+**Same-host UCX caveat**: 127.0.0.1 / ::1 isn't on a RoCE-attached
+NIC, so UCX cannot use rc_mlx5 for our cluster — verified by
+`ucx_perftest` directly: even with two physical mlx5 HCAs and strict
+`UCX_TLS=rc_mlx5,self`, the local rc_mlx5 interfaces report `no
+connect to iface` (HCA driver doesn't bridge two cards on the same
+host). With `UCX_TLS=^sysv,^posix` UCX falls back to cma — fast but
+not actual RDMA. Real RDMA numbers require cross-host deployment
+(F100-UCX gate c).
 
 **Scaling rule (thread-per-core):** total in-flight ops = threads ×
 pipeline-depth. Prefer fewer threads with deeper pipeline over many
