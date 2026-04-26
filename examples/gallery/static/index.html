@@ -427,7 +427,7 @@ header .tag {
 .lightbox {
   position: fixed;
   inset: 0;
-  background: rgba(5, 5, 6, 0.6);
+  background: var(--lb-dominant, rgba(5, 5, 6, 0.6));
   display: none;
   align-items: center;
   justify-content: center;
@@ -436,6 +436,7 @@ header .tag {
   padding: 1.5rem;
   animation: lightbox-in 0.18s ease forwards;
   overflow: hidden;
+  transition: background-color 320ms ease;
 }
 
 .lightbox.active { display: flex; }
@@ -450,6 +451,7 @@ header .tag {
   transform: scale(1.1);
   z-index: 0;
   pointer-events: none;
+  opacity: 0.85;
 }
 
 .lightbox .lb-backdrop::after {
@@ -1184,6 +1186,43 @@ header .tag {
     lbBackdrop.style.backgroundImage = url ? 'url("' + url.replace(/"/g, '\\"') + '")' : '';
   }
 
+  // Sample the image into a tiny offscreen canvas and average the RGB,
+  // ignoring near-black and near-white pixels (so a black corner doesn't
+  // dominate the result for a sunset photo).
+  const dominantCanvas = document.createElement('canvas');
+  dominantCanvas.width = 16;
+  dominantCanvas.height = 16;
+  const dominantCtx = dominantCanvas.getContext('2d', { willReadFrequently: true });
+
+  function extractDominantColor(img) {
+    if (!img || !img.naturalWidth) return null;
+    try {
+      dominantCtx.clearRect(0, 0, 16, 16);
+      dominantCtx.drawImage(img, 0, 0, 16, 16);
+      const data = dominantCtx.getImageData(0, 0, 16, 16).data;
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let i = 0; i < data.length; i += 4) {
+        const pr = data[i], pg = data[i + 1], pb = data[i + 2];
+        const sum = pr + pg + pb;
+        if (sum < 40 || sum > 720) continue;
+        r += pr; g += pg; b += pb; n++;
+      }
+      if (n === 0) return null;
+      return 'rgb(' + Math.round(r / n) + ',' + Math.round(g / n) + ',' + Math.round(b / n) + ')';
+    } catch (e) {
+      return null;
+    }
+  }
+
+  const DEFAULT_LB_BG = 'rgba(5, 5, 6, 0.7)';
+  function setDominantFromImage(img) {
+    const c = extractDominantColor(img);
+    lightbox.style.setProperty('--lb-dominant', c || DEFAULT_LB_BG);
+  }
+  function resetDominant() {
+    lightbox.style.setProperty('--lb-dominant', DEFAULT_LB_BG);
+  }
+
   // Cache of <img> objects for neighbor prefetch — keeping references alive
   // ensures the browser keeps the decoded bitmap warm.
   const lbPrefetch = new Map();
@@ -1298,6 +1337,7 @@ header .tag {
       lbVideo.src = url;
       lbVideo.classList.remove('hidden');
       setBackdrop('');
+      resetDominant();
       // autoplay; ignore the promise (browsers may reject without user gesture, that's fine)
       lbVideo.play().catch(() => {});
       return;
@@ -1324,16 +1364,27 @@ header .tag {
     const freshOpen = lbImage.classList.contains('hidden') || !lbImage.src;
     if (freshOpen) {
       swap();
+      // Extract dominant once the visible image actually loads.
+      lbImage.addEventListener(
+        'load',
+        () => { if (token === lbLoadToken) setDominantFromImage(lbImage); },
+        { once: true }
+      );
       return;
     }
 
     const pre = prefetchImage(url);
-    if (pre.complete && pre.naturalWidth > 0) {
+    const finish = () => {
+      if (token !== lbLoadToken) return;
+      setDominantFromImage(pre);
       swap();
+    };
+    if (pre.complete && pre.naturalWidth > 0) {
+      finish();
     } else if (typeof pre.decode === 'function') {
-      pre.decode().then(swap, swap);
+      pre.decode().then(finish, swap);
     } else {
-      pre.onload = swap;
+      pre.onload = finish;
       pre.onerror = swap;
     }
   }
@@ -1345,6 +1396,7 @@ header .tag {
     lbVideo.pause();
     lbVideo.src = '';
     setBackdrop('');
+    resetDominant();
   }
 
   lightbox.addEventListener('click', e => {
