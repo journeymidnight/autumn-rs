@@ -10,7 +10,6 @@ use axum::extract::{DefaultBodyLimit, Multipart, Path};
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::routing::{delete, get, post};
 use axum::Router;
-use bytes::Bytes;
 use image::codecs::jpeg::JpegEncoder;
 use image::ImageReader;
 use send_wrapper::SendWrapper;
@@ -79,15 +78,6 @@ async fn index_handler() -> Response<Body> {
     Response::builder()
         .header("content-type", "text/html; charset=utf-8")
         .body(Body::from(include_str!("../static/index.html")))
-        .unwrap()
-}
-
-async fn loading_gif_handler() -> Response<Body> {
-    Response::builder()
-        .header("content-type", "image/gif")
-        .body(Body::from(Bytes::from_static(include_bytes!(
-            "../static/loading.gif"
-        ))))
         .unwrap()
 }
 
@@ -358,7 +348,6 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(index_handler))
-        .route("/loading.gif", get(loading_gif_handler))
         .route("/put/", put_route)
         .route("/get/{name}", get_route)
         .route("/thumb/{name}", thumb_route)

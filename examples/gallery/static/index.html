@@ -28,6 +28,31 @@
   --radius: 6px;
   --mono: 'DM Mono', 'SF Mono', monospace;
   --serif: 'Instrument Serif', Georgia, serif;
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --dur-fast: 150ms;
+  --dur-slow: 320ms;
+  --num-feat: 'tnum' 1, 'cv11' 1;
+}
+
+/* Tabular numerals on UI elements that show counts, sizes, percentages */
+.file-ext, .dl-pct, .progress-label, #fileCount,
+.hud, .hud * { font-feature-settings: var(--num-feat); }
+
+/* Visible focus ring for keyboard users */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+button:focus:not(:focus-visible) { outline: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 html { font-size: 15px; }
@@ -702,7 +727,7 @@ header .tag {
   gap: 0.75rem;
   opacity: 0;
   pointer-events: none;
-  transition: opacity 0.2s;
+  transition: opacity var(--dur-fast) var(--ease);
 }
 
 .preview-loader.active {
@@ -710,7 +735,17 @@ header .tag {
   pointer-events: auto;
 }
 
-.preview-loader img { width: 28px; opacity: 0.5; }
+.spinner {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: conic-gradient(from 0deg, transparent 0%, var(--accent) 100%);
+  -webkit-mask: radial-gradient(circle, transparent 50%, black 52%);
+          mask: radial-gradient(circle, transparent 50%, black 52%);
+  animation: spin 900ms linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
 
 .preview-loader .dl-pct {
   font-size: 0.65rem;
@@ -824,7 +859,7 @@ header .tag {
       <div class="card-body">
         <div class="preview-area" id="previewArea">
           <div class="preview-loader" id="previewLoader">
-            <img src="/loading.gif" alt="" />
+            <div class="spinner" aria-hidden="true"></div>
             <span class="dl-pct" id="dlPct">0%</span>
           </div>
           <div class="empty-state" id="emptyState">
