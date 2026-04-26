@@ -1453,7 +1453,7 @@ impl StreamClient {
         };
         let resp_bytes = self
             .pool
-            .call_timeout(addr, MSG_READ_BYTES, req.encode(), Duration::from_secs(10))
+            .call_timeout(addr, MSG_READ_BYTES, req.encode(), Duration::from_secs(3))
             .await?;
         let resp = ReadBytesResp::decode(resp_bytes)
             .map_err(|e| anyhow!("decode ReadBytesResp from {addr}: {e}"))?;
