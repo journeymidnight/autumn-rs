@@ -1,101 +1,83 @@
-Date: 2026-04-25
+Date: 2026-04-26
 TaskStatus: completed
-Task scope: F102 — cluster.sh per-process start/stop for recovery testing.
-Add `start-node N` / `stop-node N` / `restart-node N` / `start-ps` /
-`stop-ps` / `restart-ps` subcommands so the user can drive
-manager-side recovery dispatch and PS failover without bouncing the
-whole cluster, without re-typing flags / env vars on every cycle.
+Task scope: F103 — fix "$AC split N 一直block" bug. After a partition has
+been split once, a second `autumn-client split <PARTID>` would hang ~25s
+and return an opaque "rpc status FailedPrecondition: multi_modify_split
+failed: precondition failed: mid_key is not in partition range" error.
 
-Design choice (after user picked option (a)):
-  Snapshot REPLICAS + CLUSTER_MODE + every AUTUMN_* env var to
-  $DATA_ROOT/cluster_config at the end of `do_start`. Per-process
-  subcommands `source` it back, so `stop-node 2 && start-node 2`
-  reproduces the original launch line — including --3disk paths,
-  --shards / --shard-stride, AUTUMN_BIND_HOST, etc.
+Root cause (verified by inspection + live repro):
+  PartitionServer::sync_regions_once skips the rg refresh for an already-
+  open partition (lib.rs:884 `if self.partitions.borrow().contains_key
+  (&part_id) { continue; }`). After the 1st split the manager has the new
+  narrowed range, but the PS-local PartitionData.rg is the pre-split wide
+  range. Consequences cascade:
+    1. open_partition's overlap detection ran against the wide rg, so
+       has_overlap stayed 0 → F037's "cannot split: has overlapping keys"
+       gate (handle_split_part:304) is silently bypassed.
+    2. unique_user_keys() iterates CoW-shared SSTables that still span
+       the original wider range, so the returned key list crosses the
+       manager-authoritative mid_key boundary.
+    3. handle_split_part picks mid = sorted[len/2] against this
+       unfiltered set; it frequently lands above the manager's narrowed
+       end_key.
+    4. multi_modify_split rejects ("mid_key is not in partition range").
+    5. The in-handler retry loop backs off 100→200→400→800→1600→2000×
+       2000×2000 ms = 9.1s × 2 ClusterClient.call_ps_for_part retries
+       ≈ 25 s wallclock for a deterministic precondition failure.
 
-Change set (cluster.sh only — no Rust source touched this session):
-  - 6 new helpers introduced above do_start: compute_shard_config /
-    launch_extent_node / register_extent_node / launch_ps /
-    save_cluster_config / load_cluster_config.
-  - do_start refactored to call those helpers (behavior-preserving;
-    dropped the inline shards/loop + register-loop + PS launch block).
-  - 4 new subcommand functions: do_start_node / do_stop_node /
-    do_start_ps / do_stop_ps with guard rails (already-running
-    detection, REPLICAS bounds check, missing-N usage error).
-  - Main dispatcher: 6 new cases (start-node / stop-node / restart-node
-    / start-ps / stop-ps / restart-ps). The integer positional parser
-    grew an `ARG_INT_PROVIDED` flag so per-process subcommands can
-    require an explicit N instead of silently defaulting to 1.
-  - Mode validation (--3disk vs replicas==3, --multidisk-1node vs
-    replicas==1) is now only enforced for start/restart/reset; the
-    per-process subcommands inherit MODE from the snapshot.
-  - Help text rewritten with two sections (Cluster / Per-process).
+Fix (crates/partition-server/src/rpc_handlers.rs::handle_split_part):
+  (a) Fetch authoritative rg from the manager via MSG_GET_REGIONS before
+      picking mid_key. Use the partition's per-PS pool + manager_addr
+      (previously _-prefixed unused params).
+  (b) Filter unique_user_keys() to keys in the authoritative rg. If
+      <2 in-range keys, return FailedPrecondition with "run major
+      compaction first" instead of letting the manager reject mid_key.
+  (c) On successful multi_modify_split, narrow PS-local part.rg to
+      `[auth_rg.start, mid)` AND re-evaluate has_overlap against the
+      current sst_readers (smallest_key/biggest_key vs the new range).
+      Without (c) the same bug recurs on the 3rd split.
 
-README.md: added a "Per-process control (recovery testing)" subsection
-under `## Dev Cluster Script (cluster.sh)` documenting the new commands
-and the snapshot prerequisite.
+Verification (live, fresh 4-replica cluster, post-fix release binary):
+  ✓ put 20 small keys → split 15 → succeeds (partitions 15 + 19)
+  ✓ immediate `split 15` again → returns INSTANTLY with
+    `cannot split: partition has overlapping keys` (was ~25 s pre-fix)
+  ✓ `compact 15 → split 15` → succeeds, partition 15 narrows further,
+    new partition 25 = [key-006..key-011)
+  ✓ 4MB × 8-thread concurrent puts + `compact → split` + `kill -9` PS
+    + `start-ps` → all 6 partitions reopen cleanly, no SST parse errors
+  ✓ 12MB streamput × 6-thread + split + `kill -9` + restart → all 8
+    partitions reopen cleanly
+  ✓ `cargo build --release -p autumn-server` clean
 
-feature_list.md: added F102 entry under P3 (Developer Experience &
-Operations) with target / evidence / verification log / acceptance
-gates / passes status.
+Outstanding / deferred:
+  - Architecturally cleaner fix would be to make sync_regions_once
+    propagate rg changes to existing partitions and re-evaluate
+    has_overlap on rg change. That requires cross-thread (main →
+    P-log) state propagation because PartitionData is Rc<RefCell> /
+    !Send. Deferred — current scoped fix is self-contained on the
+    partition thread that already owns PartitionData.
+  - User additionally reported "在写数据的时候split，然后重启失败"
+    accompanied by a `partition thread failed: open SST extent=21
+    offset=0 read_len=24417 preview=[00, 00, 3f, 00, 50, 61, 74, ...]`
+    error from the pre-fix cluster's stored data. The 32-byte preview
+    is a valid SSTable entry header (overlap=0, diff_len=63, key=
+    "Patreon--leeesovely-Apr-2023..."), so the parse failure is in the
+    SSTable's meta-block trailer (last 4 bytes = meta_len, then the
+    MetaBlock with magic AU7B). We could not reproduce on the post-fix
+    binary across several aggressive concurrent-write + split +
+    kill -9 + restart cycles. The original on-disk extent file was
+    wiped by `cluster.sh clean` before we could inspect it. If this
+    recurs, capture `/tmp/autumn-rs/d{1..4}/<hash>/extent-21.dat`
+    BEFORE running cluster.sh clean so we can decode the bytes and the
+    meta_stream checkpoint that referenced them.
+  - Pre-existing flaky tests `f099i_d1_fast_path_no_fu_allocation` and
+    `f099i_fast_path_inactive_under_batch` fail on this run. Unrelated
+    to this fix (they exercise the F099-I d=1 fast-path counter).
 
-Verification (this session, on 1-replica cluster):
-  ✓ `clean → start 1` — fresh cluster ready, partition 0 listener up
-    on :9201.
-  ✓ `cat /tmp/autumn-rs/cluster_config` shows REPLICAS=1 +
-    CLUSTER_MODE=default (no AUTUMN_* envs were active so the AUTUMN_
-    section is empty — correct).
-  ✓ `stop-node 1` kills node1; `status` shows node1 absent, rest
-    RUNNING.
-  ✓ `start-node 1` relaunches node1; manager returns
-    `node_id=1, addr=127.0.0.1:9101` (re-registration path in
-    handle_register_node hits, node_id reused).
-  ✓ `stop-ps` kills PS; `status` shows ps NOT STARTED.
-  ✓ Guards: `start-node 1` while running →
-    `ERROR: node1 already running (pid …)`, exit 1.
-  ✓ Guards: `start-node 5` with REPLICAS=1 in snapshot →
-    `ERROR: node5 exceeds REPLICAS=1 …`, exit 1.
-  ✓ Guards: `stop-node` (no arg) →
-    `ERROR: usage: cluster.sh stop-node <N>`, exit 1.
-  ✓ `bash -n cluster.sh` clean; `cluster.sh help` text correct.
-
-Acceptance:
-  (a) ✓ Existing full-cluster commands (start [N] / stop / restart [N]
-       / clean / reset [N] / status / logs) behave identically — they
-       call the same helpers do_start always called inline.
-  (b) ✓ `stop-node N` / `start-node N` / `restart-node N` work for
-       individual extent-nodes; relies on the (already shipped)
-       handle_register_node re-registration path so manager doesn't
-       reject the duplicate addr.
-  (c) ✓ `stop-ps` works for partition server.
-  (d) ⚠ `start-ps` against an already-bootstrapped cluster reproduces
-       the F099-K port-1 bug (see below). Not tested as a positive
-       case this session for that reason; left as F102-followup.
-
-Known follow-up — F102-followup / F099-K-fix:
-  `partition_server.rs` binary calls
-  `PartitionServer::connect_with_advertise(...)` then `ps.serve(addr)`.
-  `connect_with_advertise` → `finish_connect` → `sync_regions_once`
-  runs BEFORE `serve()` calls `bind_listen_addr`, so on a restart
-  (where manager etcd already knows about partitions), open_partition
-  fires with `base_port == 0` and binds the per-partition listener to
-  `0.0.0.0:1` instead of `:9201`. The fix is a one-liner —
-  the `connect_with_advertise_and_port` variant already exists for
-  exactly this case (lib.rs:661-670, calls bind_listen_addr BEFORE
-  finish_connect):
-
-    let ps = PartitionServer::connect_with_advertise_and_port(
-        args.psid, &args.manager, Some(advertise), addr,
-    ).await?;
-
-  This bug also makes `cluster.sh restart` fail at the
-  "wait_port 9201 partition 0 listener" step, not just `start-ps`.
-  Diagnosed earlier this session via `lsof -p <ps>` showing
-  `TCP *:1 (LISTEN)`.
-
-Next steps when user resumes:
-  - Apply the F099-K one-liner to `crates/server/src/bin/partition_server.rs`,
-    rebuild, then re-verify `cluster.sh restart` AND `cluster.sh start-ps`
-    on an already-bootstrapped cluster as the missing F102 acceptance gate.
-  - Optional: extend per-process control to cover etcd / manager
-    if the user needs to inject control-plane failures too.
+Next steps when the user resumes:
+  - If they hit the SST parse error again, capture the on-disk extent
+    files BEFORE wiping the cluster, then we can pinpoint whether the
+    flush-during-split path is writing a truncated SST or whether the
+    meta_stream is recording an over-long len.
+  - Optionally tackle the architectural rg-propagation fix in
+    sync_regions_once as its own feature.

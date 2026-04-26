@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use autumn_common::metrics::ns_to_ms;
+use autumn_rpc::manager_rpc;
 use autumn_rpc::partition_rpc::{self, *};
 use autumn_rpc::{HandlerResult, StatusCode};
 use autumn_stream::{ConnPool, StreamClient};
@@ -294,8 +295,8 @@ pub(crate) async fn handle_split_part(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
     part_sc: &Rc<StreamClient>,
-    _pool: &Rc<ConnPool>,
-    _manager_addr: &str,
+    pool: &Rc<ConnPool>,
+    manager_addr: &str,
     _owner_key: &str,
     _revision: i64,
 ) -> HandlerResult {
@@ -305,9 +306,35 @@ pub(crate) async fn handle_split_part(
         return Err((StatusCode::FailedPrecondition, "cannot split: partition has overlapping keys".to_string()));
     }
 
-    let user_keys = unique_user_keys(&part.borrow());
+    // Fetch authoritative range from the manager. PartitionData.rg is set
+    // at open_partition and is NOT refreshed by sync_regions_once for an
+    // already-open partition, so after a previous split the local rg
+    // still spans the old wide range. Picking mid_key against the stale
+    // rg can yield a key outside the manager's narrowed range, which
+    // multi_modify_split then rejects.
+    let auth_rg: Range = {
+        let resp_bytes = pool
+            .call(manager_addr, manager_rpc::MSG_GET_REGIONS, Bytes::new())
+            .await
+            .map_err(|e| (StatusCode::Internal, format!("get_regions: {e}")))?;
+        let resp: manager_rpc::GetRegionsResp = manager_rpc::rkyv_decode(&resp_bytes)
+            .map_err(|e| (StatusCode::Internal, e))?;
+        if resp.code != manager_rpc::CODE_OK {
+            return Err((StatusCode::Internal, format!("get_regions: {}", resp.message)));
+        }
+        resp.regions.into_iter()
+            .find(|(pid, _)| *pid == req.part_id)
+            .and_then(|(_, info)| info.rg)
+            .ok_or_else(|| (StatusCode::NotFound, format!("partition {} not in manager regions", req.part_id)))?
+    };
+
+    let user_keys = unique_user_keys(&part.borrow())
+        .into_iter()
+        .filter(|k| in_range(&auth_rg, k))
+        .collect::<Vec<_>>();
     if user_keys.len() < 2 {
-        return Err((StatusCode::FailedPrecondition, "part has less than 2 keys".to_string()));
+        return Err((StatusCode::FailedPrecondition,
+            format!("part has fewer than 2 in-range keys (have {}; run major compaction first)", user_keys.len())));
     }
 
     flush_memtable_locked(part).await.map_err(|e| (StatusCode::Internal, e.to_string()))?;
@@ -345,6 +372,28 @@ pub(crate) async fn handle_split_part(
 
     if !split_ok {
         return Err((StatusCode::FailedPrecondition, split_err));
+    }
+
+    // Narrow PS-local rg to match the manager's new left range and
+    // re-evaluate has_overlap against the SSTables. Without this,
+    // sync_regions_once would leave the partition with a stale wide rg
+    // and a stale has_overlap=0, perpetuating the bug above.
+    {
+        let mut p = part.borrow_mut();
+        let new_rg = Range { start_key: auth_rg.start_key.clone(), end_key: mid.clone() };
+        let mut overlap = false;
+        for reader in &p.sst_readers {
+            let sk = parse_key(reader.smallest_key());
+            let bk = parse_key(reader.biggest_key());
+            if !in_range(&new_rg, sk) || !in_range(&new_rg, bk) {
+                overlap = true;
+                break;
+            }
+        }
+        p.rg = new_rg;
+        if overlap {
+            p.has_overlap.set(1);
+        }
     }
 
     Ok(partition_rpc::rkyv_encode(&SplitPartResp { code: CODE_OK, message: String::new() }))

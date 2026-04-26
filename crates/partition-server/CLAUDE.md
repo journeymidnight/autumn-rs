@@ -425,21 +425,44 @@ Auto-selects sealed extents with discard ratio > 40% (`GC_DISCARD_RATIO`), up to
 
 ## Partition Split
 
+`handle_split_part` runs inline on `merged_partition_loop` (the P-log
+task) via `dispatch_partition_rpc`, so all partition-state mutations are
+single-writer on the partition thread.
+
 ```
-split_part(part_id):
-  1. Remove partition from DashMap (blocks concurrent RPCs)
-  2. Acquire write lock
-  3. Check has_overlap == 0 (reject if set — run major compaction first)
-  4. unique_user_keys_async: collect all live user keys (dedup, filter tombstones/expired)
-  5. flush_memtable_locked: flush all imm + rotate active
-  6. Compute mid_key = unique_keys[len/2]
-  7. Get commit lengths for all 3 streams (log, row, meta)
-  8. acquire_owner_lock("split/{part_id}") on stream_client
-  9. Call multi_modify_split on manager (up to 8 retries, exponential backoff)
-  10. sync_regions: reload partition assignments from manager
+handle_split_part(req):
+  1. Reject if part.has_overlap == 1 (run major compaction first)
+  2. F103: fetch authoritative range from manager via MSG_GET_REGIONS
+       — PS-local part.rg is set at open_partition and is NOT refreshed
+         by sync_regions_once for already-open partitions, so after a
+         previous split it still spans the pre-split wide range. Picking
+         mid_key against the stale rg yields keys outside the manager's
+         narrowed range and multi_modify_split rejects them.
+  3. user_keys = unique_user_keys(part).filter(in_range(auth_rg))
+       (returns sorted, dedup, tombstone-/expired-filtered keys; F103
+        adds the auth-rg filter so CoW-shared SSTable keys spanning the
+        old wide range are dropped before mid_key selection)
+  4. If user_keys.len() < 2 → FailedPrecondition (run major compaction)
+  5. flush_memtable_locked(part): rotate active + flush all imm via
+       P-bulk
+  6. mid_key = user_keys[user_keys.len() / 2]
+  7. commit_length on each of {log, row, meta} stream
+  8. multi_modify_split(mid_key, part_id, sealed_lengths) on manager
+       (up to 8 retries, exponential backoff 100ms → 2s)
+  9. F103: narrow PS-local part.rg to [auth_rg.start, mid_key) AND
+       re-evaluate has_overlap by checking each sst_reader's smallest/
+       biggest key against the new rg. Without this the same staleness
+       bug recurs on the 3rd split.
 ```
 
-After split, both child partitions will detect `has_overlap = true` on next open (SSTables span the old full range). Split is rejected when `has_overlap` is set — the CoW extents must be cleaned up first.
+After split, both child partitions' on-disk SSTables still span the
+pre-split wider range (via CoW-shared extents). Per F103 step 9 the
+left (split source) partition immediately observes `has_overlap = 1`
+and refuses subsequent splits until major compaction drops the out-of-
+range keys and clears the flag. The right (newly created) partition
+gets opened by `sync_regions_once`, where `open_partition` evaluates
+overlap against its (correct) authoritative range and likewise sets
+`has_overlap = 1`.
 
 ## Crash Recovery (`open_partition`)
 
