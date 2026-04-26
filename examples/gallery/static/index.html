@@ -451,8 +451,11 @@ header .tag {
   transform: scale(1.1);
   z-index: 0;
   pointer-events: none;
-  opacity: 0.85;
+  opacity: 0;
+  transition: opacity 320ms ease;
 }
+
+.lightbox .lb-backdrop.active { opacity: 0.85; }
 
 .lightbox .lb-backdrop::after {
   content: '';
@@ -461,7 +464,31 @@ header .tag {
   background: rgba(5, 5, 6, 0.35);
 }
 
-.lightbox img,
+.lightbox .lb-img-layer {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  max-width: calc(100% - 3rem);
+  max-height: calc(100% - 8rem);
+  object-fit: contain;
+  user-select: none;
+  -webkit-user-drag: none;
+  z-index: 1;
+  opacity: 0;
+  transform: translate(-50%, -50%);
+  transition: opacity 220ms ease, transform 220ms ease;
+  pointer-events: none;
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+}
+
+.lightbox .lb-img-layer.active {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.lightbox .lb-img-layer.from-left  { transform: translate(calc(-50% - 60px), -50%); }
+.lightbox .lb-img-layer.from-right { transform: translate(calc(-50% + 60px), -50%); }
+
 .lightbox video {
   position: relative;
   z-index: 1;
@@ -471,11 +498,17 @@ header .tag {
   user-select: none;
   -webkit-user-drag: none;
   box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+  background: #000;
+  outline: none;
 }
-
-.lightbox video { background: #000; outline: none; }
-.lightbox img.hidden,
 .lightbox video.hidden { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .lightbox .lb-img-layer { transition: opacity 200ms ease; }
+  .lightbox .lb-img-layer.from-left,
+  .lightbox .lb-img-layer.from-right { transform: translate(-50%, -50%); }
+  .lightbox .lb-backdrop { transition: opacity 200ms ease; }
+}
 
 .lightbox .lb-close {
   position: absolute;
@@ -805,9 +838,11 @@ header .tag {
 </div>
 
 <div class="lightbox" id="lightbox" role="dialog" aria-label="Media preview" aria-hidden="true">
-  <div class="lb-backdrop" id="lbBackdrop"></div>
+  <div class="lb-backdrop" id="lbBackdropA"></div>
+  <div class="lb-backdrop" id="lbBackdropB"></div>
   <button class="lb-close" id="lbClose" type="button" aria-label="Close">×</button>
-  <img id="lbImage" alt="" class="hidden" />
+  <img id="lbImageA" alt="" class="lb-img-layer" />
+  <img id="lbImageB" alt="" class="lb-img-layer" />
   <video id="lbVideo" controls preload="metadata" class="hidden" playsinline></video>
   <div class="lb-strip" id="lbStrip" role="tablist" aria-label="Gallery thumbnails"></div>
   <div class="lb-caption" id="lbCaption"></div>
@@ -831,14 +866,25 @@ header .tag {
   const emptyState = $('#emptyState');
   const toastRack = $('#toastRack');
   const lightbox = $('#lightbox');
-  const lbBackdrop = $('#lbBackdrop');
-  const lbImage = $('#lbImage');
+  const lbImageA = $('#lbImageA');
+  const lbImageB = $('#lbImageB');
+  const lbBackdropA = $('#lbBackdropA');
+  const lbBackdropB = $('#lbBackdropB');
   const lbVideo = $('#lbVideo');
   const lbCaption = $('#lbCaption');
   const lbClose = $('#lbClose');
   const lbStrip = $('#lbStrip');
   const viewListBtn = $('#viewList');
   const viewGridBtn = $('#viewGrid');
+
+  // Two-layer crossfade state. The "active" layer is the one currently shown;
+  // navigation animates the inactive layer in (slide+fade) and the active one
+  // out, then swaps the pointer.
+  let activeLayer = 'A';
+  function activeImg()    { return activeLayer === 'A' ? lbImageA    : lbImageB; }
+  function inactiveImg()  { return activeLayer === 'A' ? lbImageB    : lbImageA; }
+  function activeBg()     { return activeLayer === 'A' ? lbBackdropA : lbBackdropB; }
+  function inactiveBg()   { return activeLayer === 'A' ? lbBackdropB : lbBackdropA; }
 
   let activeFile = null;
   let files = [];
@@ -1182,8 +1228,8 @@ header .tag {
   }
 
   // ── Lightbox ──
-  function setBackdrop(url) {
-    lbBackdrop.style.backgroundImage = url ? 'url("' + url.replace(/"/g, '\\"') + '")' : '';
+  function setLayerBackdrop(el, url) {
+    el.style.backgroundImage = url ? 'url("' + url.replace(/"/g, '\\"') + '")' : '';
   }
 
   // Sample the image into a tiny offscreen canvas and average the RGB,
@@ -1323,86 +1369,147 @@ header .tag {
   // Strip clicks should never close the lightbox.
   lbStrip.addEventListener('click', e => e.stopPropagation());
 
+  // Direction: -1 = previous (slide in from left), +1 = next (slide in from
+  // right), 0 = no animation (fresh open or jump via strip click). Track the
+  // last-shown name so navigations can derive direction automatically.
+  let lastShownName = null;
+
+  function directionBetween(a, b) {
+    if (!a || !b) return 0;
+    const media = files.filter(isMedia);
+    const ai = media.indexOf(a), bi = media.indexOf(b);
+    if (ai < 0 || bi < 0) return 0;
+    if (bi > ai) return 1;
+    if (bi < ai) return -1;
+    return 0;
+  }
+
+  function showImageOnLayer(url, name, direction) {
+    const inImg = inactiveImg();
+    const inBg = inactiveBg();
+    const outImg = activeImg();
+    const outBg = activeBg();
+
+    inImg.src = url;
+    inImg.alt = name;
+    setLayerBackdrop(inBg, url);
+
+    if (direction === 0) {
+      // No animation: just snap to the active state.
+      inImg.classList.remove('from-left', 'from-right');
+      inImg.classList.add('active');
+      inBg.classList.add('active');
+      outImg.classList.remove('active');
+      outBg.classList.remove('active');
+    } else {
+      // Position the inactive layer offscreen, force reflow, then animate in.
+      inImg.classList.remove('active');
+      inImg.classList.add(direction > 0 ? 'from-right' : 'from-left');
+      void inImg.offsetWidth; // force a reflow so the next change animates
+      inImg.classList.remove('from-left', 'from-right');
+      inImg.classList.add('active');
+      inBg.classList.add('active');
+      outImg.classList.remove('active');
+      outBg.classList.remove('active');
+    }
+
+    activeLayer = activeLayer === 'A' ? 'B' : 'A';
+  }
+
   function openLightbox(name) {
     if (!isMedia(name)) return;
     const url = '/get/' + encodeURIComponent(name);
     lbCaption.textContent = name;
+    const wasActive = lightbox.classList.contains('active');
     lightbox.classList.add('active');
     lightbox.setAttribute('aria-hidden', 'false');
     syncStrip();
 
     if (isVideo(name)) {
-      lbImage.src = '';
-      lbImage.classList.add('hidden');
+      // Fade both image layers out; show video.
+      lbImageA.classList.remove('active', 'from-left', 'from-right');
+      lbImageB.classList.remove('active', 'from-left', 'from-right');
+      lbBackdropA.classList.remove('active');
+      lbBackdropB.classList.remove('active');
+      lbImageA.src = '';
+      lbImageB.src = '';
       lbVideo.src = url;
       lbVideo.classList.remove('hidden');
-      setBackdrop('');
       resetDominant();
+      lastShownName = name;
       // autoplay; ignore the promise (browsers may reject without user gesture, that's fine)
       lbVideo.play().catch(() => {});
       return;
     }
 
+    // Image path.
     lbVideo.pause();
     lbVideo.src = '';
     lbVideo.classList.add('hidden');
 
+    const direction = wasActive ? directionBetween(lastShownName, name) : 0;
     const token = ++lbLoadToken;
-    const swap = () => {
+
+    const finish = (sourceImg) => {
       if (token !== lbLoadToken) return;
-      lbImage.src = url;
-      lbImage.alt = name;
-      lbImage.classList.remove('hidden');
-      setBackdrop(url);
+      if (sourceImg) setDominantFromImage(sourceImg);
+      showImageOnLayer(url, name, direction);
+      lastShownName = name;
       preloadNeighbors(name);
     };
 
-    // Fresh open (no previous image to preserve): show immediately so the user
-    // sees the lightbox responding even while the first image is still loading.
-    // Subsequent navigations preload first so the old image stays visible
-    // until the new one is ready — no flash to the dark backdrop.
-    const freshOpen = lbImage.classList.contains('hidden') || !lbImage.src;
-    if (freshOpen) {
-      swap();
-      // Extract dominant once the visible image actually loads.
-      lbImage.addEventListener(
+    if (!wasActive) {
+      // Fresh open: snap immediately, extract dominant once loaded.
+      showImageOnLayer(url, name, 0);
+      lastShownName = name;
+      const visible = activeImg(); // already swapped inside showImageOnLayer
+      visible.addEventListener(
         'load',
-        () => { if (token === lbLoadToken) setDominantFromImage(lbImage); },
+        () => { if (token === lbLoadToken) setDominantFromImage(visible); },
         { once: true }
       );
+      preloadNeighbors(name);
       return;
     }
 
+    // Subsequent nav: preload + decode, extract dominant from the preloaded
+    // image, then trigger the directional crossfade.
     const pre = prefetchImage(url);
-    const finish = () => {
-      if (token !== lbLoadToken) return;
-      setDominantFromImage(pre);
-      swap();
-    };
     if (pre.complete && pre.naturalWidth > 0) {
-      finish();
+      finish(pre);
     } else if (typeof pre.decode === 'function') {
-      pre.decode().then(finish, swap);
+      pre.decode().then(() => finish(pre), () => finish(null));
     } else {
-      pre.onload = finish;
-      pre.onerror = swap;
+      pre.onload = () => finish(pre);
+      pre.onerror = () => finish(null);
     }
   }
 
   function closeLightbox() {
     lightbox.classList.remove('active');
     lightbox.setAttribute('aria-hidden', 'true');
-    lbImage.src = '';
+    [lbImageA, lbImageB].forEach(el => {
+      el.classList.remove('active', 'from-left', 'from-right');
+      el.src = '';
+    });
+    [lbBackdropA, lbBackdropB].forEach(el => {
+      el.classList.remove('active');
+      el.style.backgroundImage = '';
+    });
     lbVideo.pause();
     lbVideo.src = '';
-    setBackdrop('');
     resetDominant();
+    lastShownName = null;
   }
 
   lightbox.addEventListener('click', e => {
     // close on backdrop click, image click, or close button.
     // video is excluded so its native controls remain usable.
-    if (e.target === lbImage || e.target === lightbox || e.target === lbClose) closeLightbox();
+    if (
+      e.target === lightbox ||
+      e.target === lbClose ||
+      e.target.classList.contains('lb-img-layer')
+    ) closeLightbox();
   });
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape' && lightbox.classList.contains('active')) closeLightbox();
