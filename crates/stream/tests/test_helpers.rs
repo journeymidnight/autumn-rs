@@ -147,4 +147,14 @@ impl TestConn {
             .expect("df RPC");
         rkyv_decode::<DfResp>(&resp).expect("decode DfResp")
     }
+
+    pub async fn delete_extent(&self, extent_id: u64) -> CodeResp {
+        let payload = rkyv_encode(&DeleteExtentReq { extent_id });
+        let resp = self
+            .pool
+            .call(&self.addr, MSG_DELETE_EXTENT, payload)
+            .await
+            .expect("delete_extent RPC");
+        rkyv_decode::<CodeResp>(&resp).expect("decode CodeResp")
+    }
 }

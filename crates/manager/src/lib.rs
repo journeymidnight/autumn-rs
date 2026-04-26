@@ -1,8 +1,11 @@
+mod extent_delete;
 mod recovery;
 mod rpc_handlers;
 
+pub(crate) use extent_delete::PendingDelete;
+
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::str;
@@ -200,6 +203,12 @@ pub struct AutumnManager {
     runtime_started: Rc<Cell<bool>>,
     ps_last_heartbeat: Rc<RefCell<HashMap<u64, Instant>>>,
     conn_pool: Rc<ConnPool>,
+    /// F109: extents whose refcount dropped to 0 and whose physical
+    /// `.dat`/`.meta` files still need to be unlinked on every replica.
+    /// Drained by `extent_delete_loop`. In-memory only — manager
+    /// restart loses pending entries; orphans then reaped by node
+    /// startup reconcile.
+    pub(crate) pending_extent_deletes: Rc<RefCell<VecDeque<PendingDelete>>>,
 }
 
 impl Default for AutumnManager {
@@ -220,6 +229,7 @@ impl AutumnManager {
             runtime_started: Rc::new(Cell::new(false)),
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),
             conn_pool: Rc::new(ConnPool::new()),
+            pending_extent_deletes: Rc::new(RefCell::new(VecDeque::new())),
         }
     }
 
@@ -289,6 +299,13 @@ impl AutumnManager {
         let mgr = self.clone();
         compio::runtime::spawn(async move {
             mgr.ps_liveness_check_loop().await;
+        })
+        .detach();
+
+        // F109: physical extent file deletion fanout.
+        let mgr = self.clone();
+        compio::runtime::spawn(async move {
+            mgr.extent_delete_loop().await;
         })
         .detach();
     }

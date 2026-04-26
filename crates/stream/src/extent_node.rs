@@ -145,6 +145,28 @@ impl DiskFS {
             .join(format!("extent-{extent_id}.meta"))
     }
 
+    /// F109: unlink the `.dat` and `.meta` files for an extent. Idempotent
+    /// — `NotFound` errors on either file are downgraded to `Ok(())` so
+    /// retries from the manager are safe. Returns Err only on a real I/O
+    /// failure (permission denied, etc.) so the caller can keep the entry
+    /// in the pending-delete queue and retry.
+    async fn remove_extent_files(&self, extent_id: u64) -> Result<()> {
+        for path in [self.extent_path(extent_id), self.meta_path(extent_id)] {
+            match compio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "remove {} (disk_id={}): {e}",
+                        path.display(),
+                        self.disk_id,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Return (total_bytes, free_bytes) for this disk via statvfs.
     fn disk_stats(&self) -> (u64, u64) {
         #[cfg(unix)]
@@ -993,6 +1015,16 @@ impl ExtentNode {
         // Load existing extents from all disks.
         node.load_extents().await?;
 
+        // F109: reconcile loaded extents against the manager. Any
+        // `extent_id` the manager no longer knows about (refs went to
+        // 0 while this node was offline, or the manager's in-memory
+        // pending-delete queue was lost across a restart) is unlinked.
+        // Best-effort: a network failure here just defers cleanup; the
+        // file remains on disk and we'll retry on next boot.
+        if let Err(e) = node.reconcile_orphans_with_manager().await {
+            tracing::warn!(error = %e, "F109 startup reconcile failed; will retry on next boot");
+        }
+
         // Replay WAL records into extent files. Only this shard's WAL is
         // replayed; cross-shard records live in sibling WAL dirs which
         // the corresponding shard will replay on its own init.
@@ -1003,6 +1035,78 @@ impl ExtentNode {
         }
 
         Ok(node)
+    }
+
+    /// F109: best-effort startup orphan reconcile.
+    /// If `manager_endpoint` is configured, ship every loaded
+    /// `extent_id` to the manager; receive back the subset that's no
+    /// longer registered and unlink the corresponding `.dat`/`.meta`.
+    /// Skips silently when there's no manager (test setups). Per-disk
+    /// errors are logged but don't propagate — partial cleanup is fine,
+    /// next boot will retry the rest.
+    async fn reconcile_orphans_with_manager(&self) -> Result<()> {
+        let mgr = match &self.manager_endpoint {
+            Some(ep) => crate::conn_pool::normalize_endpoint(ep),
+            None => return Ok(()),
+        };
+        let extent_ids: Vec<u64> = self
+            .extents
+            .iter()
+            .map(|e| *e.key())
+            .filter(|id| self.owns_extent(*id))
+            .collect();
+        if extent_ids.is_empty() {
+            return Ok(());
+        }
+        let req = manager_rpc::rkyv_encode(&manager_rpc::ReconcileExtentsReq {
+            // node_id 0 — the extent-node doesn't track its own node_id
+            // (assigned by manager at register-time, not threaded down).
+            // Manager uses this only for logging.
+            node_id: 0,
+            extent_ids: extent_ids.clone(),
+        });
+        let resp_data = self
+            .manager_pool
+            .call(&mgr, manager_rpc::MSG_RECONCILE_EXTENTS, req)
+            .await
+            .map_err(|e| anyhow::anyhow!("reconcile_extents rpc: {e}"))?;
+        let resp: manager_rpc::ReconcileExtentsResp =
+            manager_rpc::rkyv_decode(&resp_data)
+                .map_err(|e| anyhow::anyhow!("decode reconcile resp: {e}"))?;
+        if resp.code != manager_rpc::CODE_OK {
+            return Err(anyhow::anyhow!(
+                "reconcile_extents non-OK: {}",
+                resp.message,
+            ));
+        }
+        if resp.garbage.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            local = extent_ids.len(),
+            garbage = resp.garbage.len(),
+            "F109 startup reconcile: unlinking orphans",
+        );
+        for eid in &resp.garbage {
+            // Drop in-memory entry and unlink files. Look up the disk
+            // via the entry; if the entry is gone (concurrent delete),
+            // fall back to scanning every disk.
+            let entry = self.extents.remove(eid).map(|(_, v)| v);
+            if let Some(entry) = entry {
+                if let Some(disk) = self.disks.get(&entry.disk_id) {
+                    if let Err(e) = disk.remove_extent_files(*eid).await {
+                        tracing::warn!(extent_id = eid, error = %e, "reconcile unlink failed");
+                    }
+                    continue;
+                }
+            }
+            for disk in self.disks.values() {
+                if let Err(e) = disk.remove_extent_files(*eid).await {
+                    tracing::warn!(extent_id = eid, error = %e, "reconcile unlink failed");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// F099-M: does this shard own `extent_id`?
@@ -1461,6 +1565,7 @@ impl ExtentNode {
             MSG_COPY_EXTENT => self.handle_copy_extent(payload).await,
             MSG_CONVERT_TO_EC => self.handle_convert_to_ec(payload).await,
             MSG_WRITE_SHARD => self.handle_write_shard(payload).await,
+            MSG_DELETE_EXTENT => self.handle_delete_extent(payload).await,
             _ => Err((StatusCode::InvalidArgument, format!("unknown msg_type {msg_type}"))),
         }
     }
@@ -2281,6 +2386,75 @@ impl ExtentNode {
             code: CODE_OK,
             message: String::new(),
         }))
+    }
+
+    /// F109: unlink the physical extent files after the manager has
+    /// confirmed `refs == 0`. Idempotent: deleting an already-missing
+    /// extent returns `CODE_OK` so the manager's retry loop is safe.
+    ///
+    /// Sequencing: remove the in-memory `ExtentEntry` *first* so any
+    /// subsequent append fails fast with NotFound. Any pwritev that has
+    /// already taken the file handle is allowed to complete to disk
+    /// (the kernel preserves the open inode after `unlink`); the
+    /// inode is reaped when the last fd closes. The data is meaningless
+    /// at this point because the extent's manager-side refs are 0.
+    async fn handle_delete_extent(&self, payload: Bytes) -> HandlerResult {
+        let req: DeleteExtentReq = rkyv_decode(&payload)
+            .map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // F099-M: forward to owner shard so each shard only ever
+        // touches the extents whose ids hash to it.
+        if !self.owns_extent(req.extent_id) {
+            if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
+                return self
+                    .forward_rpc_to_sibling(sibling, MSG_DELETE_EXTENT, payload)
+                    .await;
+            }
+        }
+
+        // Pull the entry out of the map so any later append on this id
+        // fails with NotFound rather than racing the unlink.
+        let entry = self.extents.remove(&req.extent_id).map(|(_, v)| v);
+
+        // Locate the file. Prefer the in-memory entry's disk_id (exact
+        // match for the file that was actually created); fall back to
+        // every disk for the orphan-reconcile case where the entry is
+        // already gone (e.g. files left over from a prior boot).
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut targeted = false;
+        if let Some(entry) = entry {
+            if let Some(disk) = self.disks.get(&entry.disk_id) {
+                targeted = true;
+                if let Err(e) = disk.remove_extent_files(req.extent_id).await {
+                    last_err = Some(e);
+                }
+            }
+        }
+        if !targeted {
+            for disk in self.disks.values() {
+                if let Err(e) = disk.remove_extent_files(req.extent_id).await {
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        match last_err {
+            None => {
+                tracing::info!(
+                    extent_id = req.extent_id,
+                    shard_idx = self.shard_idx,
+                    "delete_extent: unlinked .dat + .meta",
+                );
+                Ok(rkyv_encode(&CodeResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                }))
+            }
+            Some(e) => Ok(rkyv_encode(&CodeResp {
+                code: CODE_ERROR,
+                message: e.to_string(),
+            })),
+        }
     }
 
     async fn handle_re_avali(&self, payload: Bytes) -> HandlerResult {

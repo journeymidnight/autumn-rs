@@ -21,6 +21,7 @@ pub const MSG_RE_AVALI: u8 = 7;
 pub const MSG_COPY_EXTENT: u8 = 8;
 pub const MSG_CONVERT_TO_EC: u8 = 9;
 pub const MSG_WRITE_SHARD: u8 = 10;
+pub const MSG_DELETE_EXTENT: u8 = 11;
 // MSG_TYPE_PING = 0xFF is reserved by autumn-rpc for heartbeat
 
 // ── Append (hot path) ────────────────────────────────────────────────────────
@@ -399,6 +400,15 @@ pub struct ReAvaliReq {
     pub eversion: u64,
 }
 
+/// DeleteExtent request: unlink the physical extent file (`.dat` + `.meta`).
+/// Sent by the manager after an extent's refcount drops to 0
+/// (`punch_holes` / `truncate` paths). Idempotent: a missing extent on the
+/// receiving node returns `CODE_OK`, so manager retries are safe.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct DeleteExtentReq {
+    pub extent_id: u64,
+}
+
 /// ConvertToEc request: EC-encode a sealed extent and distribute shards.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct ConvertToEcReq {
@@ -525,5 +535,27 @@ impl WriteShardResp {
             return Err("write_shard response too short");
         }
         Ok(Self { code: data[0] })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_extent_req_round_trip() {
+        let req = DeleteExtentReq { extent_id: 0xdead_beef_cafe_0042 };
+        let bytes = rkyv_encode(&req);
+        let decoded: DeleteExtentReq = rkyv_decode(&bytes).expect("decode");
+        assert_eq!(decoded.extent_id, req.extent_id);
+    }
+
+    #[test]
+    fn delete_extent_resp_uses_generic_code_resp() {
+        let resp = CodeResp { code: CODE_OK, message: String::new() };
+        let bytes = rkyv_encode(&resp);
+        let decoded: CodeResp = rkyv_decode(&bytes).expect("decode");
+        assert_eq!(decoded.code, CODE_OK);
+        assert!(decoded.message.is_empty());
     }
 }

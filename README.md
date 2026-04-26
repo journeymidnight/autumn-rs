@@ -334,6 +334,35 @@ $AC gc <PARTID>
 $AC forcegc <PARTID> <EXTID1> <EXTID2>
 ```
 
+#### F109: verifying extent files are physically reclaimed after GC
+
+When `gc` succeeds, the manager removes the extent's metadata and
+fans out a `MSG_DELETE_EXTENT` to every replica. The physical
+`{disk}/{hash:02x}/extent-{id}.dat` + `.meta` files should be
+unlinked within ~2 s (one sweep of `extent_delete_loop`).
+
+```bash
+# Pre-GC: capture the extent dir size on each extent-node
+du -sh /tmp/autumn-rs/d1/  /tmp/autumn-rs/d2/  /tmp/autumn-rs/d3/
+
+# Trigger GC for the partition you want to reclaim from
+$AC gc <PARTID>
+
+# Wait ~5s for the manager's extent_delete_loop sweep + per-replica unlink
+sleep 5
+
+# Post-GC: dir size should drop by the size of the punched extents
+du -sh /tmp/autumn-rs/d1/  /tmp/autumn-rs/d2/  /tmp/autumn-rs/d3/
+```
+
+If a node was offline during the delete fanout, the orphan files
+remain until the next `autumn-extent-node` startup, where
+`reconcile_orphans_with_manager` queries the manager for unknown
+extents and unlinks the corresponding files. To exercise the
+reconcile path manually: stop a node before running `gc`, run the
+GC, then restart that node and observe its data dir shrink as the
+reconcile completes during boot.
+
 ### Benchmarks
 
 ```bash

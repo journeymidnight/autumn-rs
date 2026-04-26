@@ -1,6 +1,6 @@
 //! RPC serve, dispatch, and handler methods for AutumnManager.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -13,7 +13,7 @@ use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::TcpStream;
 use compio::BufResult;
 
-use crate::AutumnManager;
+use crate::{AutumnManager, PendingDelete};
 
 impl AutumnManager {
     // ── Serve ──────────────────────────────────────────────────────────
@@ -98,6 +98,7 @@ impl AutumnManager {
             MSG_GET_REGIONS => self.handle_get_regions().await,
             MSG_HEARTBEAT_PS => self.handle_heartbeat_ps(payload).await,
             MSG_REGISTER_PARTITION_ADDR => self.handle_register_partition_addr(payload).await,
+            MSG_RECONCILE_EXTENTS => self.handle_reconcile_extents(payload).await,
             _ => Err((
                 StatusCode::InvalidArgument,
                 format!("unknown msg_type {msg_type}"),
@@ -791,9 +792,18 @@ impl AutumnManager {
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
         let out = {
-            let mut s = self.store.inner.borrow_mut();
-            (|| -> Result<(MgrStreamInfo, Vec<MgrExtentInfo>, Vec<u64>), AppError> {
-                Self::ensure_owner_revision(&req.owner_key, req.revision, &s)?;
+            let mut guard = self.store.inner.borrow_mut();
+            let s: &mut autumn_common::MetadataState = &mut guard;
+            (|| -> Result<
+                (
+                    MgrStreamInfo,
+                    Vec<MgrExtentInfo>,
+                    Vec<u64>,
+                    Vec<PendingDelete>,
+                ),
+                AppError,
+            > {
+                Self::ensure_owner_revision(&req.owner_key, req.revision, s)?;
                 let removed: HashSet<u64> = req.extent_ids.into_iter().collect();
                 let stream = s
                     .streams
@@ -809,6 +819,28 @@ impl AutumnManager {
                 let updated = stream.clone();
                 let mut extent_puts = Vec::new();
                 let mut extent_deletes = Vec::new();
+                let mut pending_deletes = Vec::new();
+
+                // F109: snapshot replica addrs requires reading `s.nodes`
+                // while we mutably touch `s.extents`. Capture the relevant
+                // node entries first so the borrow checker sees disjoint
+                // fields (split-borrow only works on a bare &mut struct,
+                // and even then nested calls confuse it).
+                let needed_addrs: HashMap<u64, MgrExtentInfo> = s
+                    .extents
+                    .iter()
+                    .filter(|(eid, e)| removed.contains(eid) && e.refs <= 1)
+                    .map(|(eid, e)| (*eid, e.clone()))
+                    .collect();
+                for (eid, extent) in &needed_addrs {
+                    let pending_addrs =
+                        Self::snapshot_replica_addrs(&s.nodes, *eid, extent);
+                    pending_deletes.push(PendingDelete {
+                        extent_id: *eid,
+                        pending_addrs,
+                        attempts: 0,
+                    });
+                }
 
                 for extent_id in removed {
                     if let Some(extent) = s.extents.get_mut(&extent_id) {
@@ -822,12 +854,12 @@ impl AutumnManager {
                         }
                     }
                 }
-                Ok((updated, extent_puts, extent_deletes))
+                Ok((updated, extent_puts, extent_deletes, pending_deletes))
             })()
         };
 
         match out {
-            Ok((stream, extent_puts, extent_deletes)) => {
+            Ok((stream, extent_puts, extent_deletes, pending_deletes)) => {
                 if let Err(err) = self
                     .mirror_stream_extent_mutation(&stream, &extent_puts, &extent_deletes)
                     .await
@@ -838,6 +870,9 @@ impl AutumnManager {
                         stream: None,
                     }));
                 }
+                // Enqueue physical-delete fanout only after etcd ack so a
+                // failed mirror never schedules stale unlinks.
+                self.enqueue_pending_deletes(pending_deletes);
                 Ok(rkyv_encode(&PunchHolesResp {
                     code: CODE_OK,
                     message: String::new(),
@@ -865,9 +900,18 @@ impl AutumnManager {
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
         let out = {
-            let mut s = self.store.inner.borrow_mut();
-            (|| -> Result<(MgrStreamInfo, Vec<MgrExtentInfo>, Vec<u64>), AppError> {
-                Self::ensure_owner_revision(&req.owner_key, req.revision, &s)?;
+            let mut guard = self.store.inner.borrow_mut();
+            let s: &mut autumn_common::MetadataState = &mut guard;
+            (|| -> Result<
+                (
+                    MgrStreamInfo,
+                    Vec<MgrExtentInfo>,
+                    Vec<u64>,
+                    Vec<PendingDelete>,
+                ),
+                AppError,
+            > {
+                Self::ensure_owner_revision(&req.owner_key, req.revision, s)?;
                 let stream = s
                     .streams
                     .get(&req.stream_id)
@@ -897,6 +941,26 @@ impl AutumnManager {
                 let updated = st.clone();
                 let mut extent_puts = Vec::new();
                 let mut extent_deletes = Vec::new();
+                let mut pending_deletes = Vec::new();
+
+                // F109: snapshot replica addrs for refs→0 extents BEFORE
+                // we mutably remove them from `s.extents`. See
+                // `handle_stream_punch_holes` for the same pattern.
+                let needed_addrs: HashMap<u64, MgrExtentInfo> = s
+                    .extents
+                    .iter()
+                    .filter(|(eid, e)| removed.contains(eid) && e.refs <= 1)
+                    .map(|(eid, e)| (*eid, e.clone()))
+                    .collect();
+                for (eid, extent) in &needed_addrs {
+                    let pending_addrs =
+                        Self::snapshot_replica_addrs(&s.nodes, *eid, extent);
+                    pending_deletes.push(PendingDelete {
+                        extent_id: *eid,
+                        pending_addrs,
+                        attempts: 0,
+                    });
+                }
 
                 for extent_id in removed {
                     if let Some(extent) = s.extents.get_mut(&extent_id) {
@@ -910,12 +974,12 @@ impl AutumnManager {
                         }
                     }
                 }
-                Ok((updated, extent_puts, extent_deletes))
+                Ok((updated, extent_puts, extent_deletes, pending_deletes))
             })()
         };
 
         match out {
-            Ok((stream, extent_puts, extent_deletes)) => {
+            Ok((stream, extent_puts, extent_deletes, pending_deletes)) => {
                 if let Err(err) = self
                     .mirror_stream_extent_mutation(&stream, &extent_puts, &extent_deletes)
                     .await
@@ -926,6 +990,7 @@ impl AutumnManager {
                         updated_stream_info: None,
                     }));
                 }
+                self.enqueue_pending_deletes(pending_deletes);
                 Ok(rkyv_encode(&TruncateResp {
                     code: CODE_OK,
                     message: String::new(),
@@ -1191,6 +1256,44 @@ impl AutumnManager {
         Ok(rkyv_encode(&CodeResp {
             code: CODE_OK,
             message: String::new(),
+        }))
+    }
+
+    /// F109: extent-node startup orphan reconcile. Node sends every
+    /// `extent_id` it found on disk; we return those that are no longer
+    /// in `s.extents`. The node then unlinks the corresponding files.
+    /// Best-effort: failure is logged on the node side but doesn't block
+    /// startup. Read-only with respect to manager state.
+    async fn handle_reconcile_extents(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&ReconcileExtentsResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                garbage: Vec::new(),
+            }));
+        }
+        let req: ReconcileExtentsReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let garbage: Vec<u64> = {
+            let s = self.store.inner.borrow();
+            req.extent_ids
+                .iter()
+                .copied()
+                .filter(|eid| !s.extents.contains_key(eid))
+                .collect()
+        };
+        if !garbage.is_empty() {
+            tracing::info!(
+                node_id = req.node_id,
+                local_extents = req.extent_ids.len(),
+                garbage = garbage.len(),
+                "F109 reconcile_extents: returning orphan list to node",
+            );
+        }
+        Ok(rkyv_encode(&ReconcileExtentsResp {
+            code: CODE_OK,
+            message: String::new(),
+            garbage,
         }))
     }
 

@@ -221,6 +221,45 @@ Used to bring a **sealed** extent's lagging replica up to date (e.g., after a no
 - `heartbeat`: streams a "beat" payload every second (keep-alive for the manager).
 - `df`: returns disk space info (currently hardcoded placeholder) + drains `recovery_done` to report completed recovery tasks. This is the mechanism by which the manager learns recovery finished.
 
+### F109: Delete Extent (`MSG_DELETE_EXTENT = 11`)
+
+Idempotent unlink for the physical `extent-{id}.dat` + `.meta` files
+after the manager has confirmed `refs == 0`. Sent fire-and-forget by
+the manager's `extent_delete_loop` once per replica.
+
+```
+handle_delete_extent(extent_id):
+  1. F099-M shard ownership: if !owns_extent → forward to sibling shard.
+  2. extents.remove(&id) — pull the in-memory ExtentEntry out so any
+     subsequent append fails fast with NotFound. Any pwritev that
+     already took the file handle keeps its inode (POSIX preserves
+     open fds across unlink); the data is meaningless because manager
+     refs are 0.
+  3. DiskFS::remove_extent_files(id):
+       a. compio::fs::remove_file({base}/{hash:02x}/extent-{id}.dat)
+       b. compio::fs::remove_file({base}/{hash:02x}/extent-{id}.meta)
+       Both NotFound errors are downgraded to Ok(()) — the contract is
+       idempotent so manager retries are safe.
+  4. Returns CodeResp { code: CODE_OK | CODE_ERROR }.
+```
+
+### F109: Startup Orphan Reconcile
+
+`ExtentNode::new` calls `reconcile_orphans_with_manager()` after
+`load_extents()`. The node ships every locally loaded `extent_id`
+(filtered through `owns_extent` in the F099-M shard mode) to the
+manager via `MSG_RECONCILE_EXTENTS = 0x31`; the manager returns the
+subset that is no longer in `s.extents`. The node unlinks the
+corresponding `.dat`/`.meta` files via the same `remove_extent_files`
+helper used by `handle_delete_extent`.
+
+This is the second-line cleanup for the case where the manager's
+in-memory `pending_extent_deletes` queue lost an entry — either
+because the manager restarted while the entry was still in flight,
+or because the receiving node was offline for the entire 60-sweep
+retry window. Best-effort: a network failure during reconcile is
+logged at WARN and doesn't block startup; the next boot retries.
+
 ---
 
 ## StreamClient — Client Side

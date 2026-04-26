@@ -72,6 +72,39 @@ create_stream(data_shard, parity_shard):
 - `truncate`: removes all extents before the specified `extent_id` (inclusive exclusive), same ref-counting logic.
 - Extents can be shared across partitions (CoW split), so ref counting is critical — never delete an extent with refs > 0.
 
+### F109: Physical extent file deletion (refs → 0)
+When the refs→0 path fires inside `handle_stream_punch_holes` /
+`handle_truncate`, the manager additionally:
+1. **Snapshots** the replica address list (`replicates ++ parity` →
+   shard-routed addresses via `Self::shard_addr_for_extent`) **before**
+   removing the extent from `s.extents` — done inside the same
+   `borrow_mut` block via the explicit `let s: &mut MetadataState =
+   &mut guard;` pattern (RefMut auto-deref doesn't preserve disjoint-
+   field borrow info, hence the manual deref).
+2. After `mirror_stream_extent_mutation` succeeds, hands the snapshot
+   to `enqueue_pending_deletes` (extent_delete.rs) which appends to
+   `pending_extent_deletes: Rc<RefCell<VecDeque<PendingDelete>>>`.
+3. The background `extent_delete_loop` (sweep every 2 s) drains the
+   queue and fans out `EXT_MSG_DELETE_EXTENT` over the shared
+   `ConnPool` to each replica. Replica addresses ack-by-ack are
+   removed from the entry's `pending_addrs`. After 60 failed sweeps
+   (≈ 2 min) the entry is dropped and a WARN is logged — orphan
+   `.dat`/`.meta` files are reaped on the affected node's next
+   startup via `MSG_RECONCILE_EXTENTS`.
+
+Etcd-first ordering is preserved: the queue push happens **after**
+`mirror_stream_extent_mutation` returns OK, so a failed mirror never
+schedules a stale unlink.
+
+The pending queue is in-memory only. Manager restart loses pending
+entries; orphans are then reaped by node-startup reconcile (the
+extent-node sends every locally-loaded `extent_id` to the manager
+via `MSG_RECONCILE_EXTENTS`; the manager returns the subset that's
+no longer in `s.extents`; the node unlinks the corresponding files).
+This trade-off is intentional: persisting the queue to etcd would
+double the manager's etcd traffic on the GC hot path for limited
+benefit, since the reconcile backstop converges on next boot.
+
 ## Partition Split: `multi_modify_split`
 
 The most complex operation. Atomically splits one partition into left + right:

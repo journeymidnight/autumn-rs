@@ -1,111 +1,224 @@
 Date: 2026-04-26
 TaskStatus: completed
-Task scope: F108 — manager `EtcdClient` panics with `RefCell already
-borrowed` under concurrent RPCs (hit live by the user as the 4-partition
-GC race against shared extent 10).
+Task scope: F109 — physical extent file deletion when refs → 0
+(`punch_holes` / `truncate` did not unlink replica `.dat`/`.meta`
+files; deferred from the F108 session as "Issue 2").
 
-Root cause (verified by code-reading + Go reference + reproduced in test):
+Root cause (verified by code-reading + Go reference + reproduced in
+new integration test):
 
-  `crates/etcd/src/lib.rs::EtcdClient::unary_call` line 200 / line 216,
-  and `LeaseKeeper::keep_alive` line 273 / line 283, all wrote
-  `self.channel.borrow_mut().call(path, body).await`. The
-  `RefMut<GrpcChannel>` guard from `borrow_mut()` was held across the
-  `.await`. On the manager's single-threaded compio runtime, when a
-  second task entered `unary_call` (or any of `put` / `get` / `txn` /
-  `delete` / `lease_grant` / `lease_revoke` — all funnel through
-  `unary_call`) while the first was still awaiting the response,
-  `borrow_mut()` panicked.
+  When `handle_stream_punch_holes` or `handle_truncate` decremented
+  an extent's `refs` to 0, the manager removed the
+  `MgrExtentInfo` from the in-memory store and deleted the
+  `extents/{id}` etcd key via `mirror_stream_extent_mutation`. It
+  did NOT notify any extent-node to unlink the physical
+  `extent-{id}.dat` + `.meta` files.  Result: every replica's data
+  dir kept the bytes forever after `autumn-client gc`. The user hit
+  this concretely after the F105/F106/F107/F108 session — manager
+  freed metadata, `du -sh /tmp/autumn-rs/d*/` stayed flat.
 
-  User-reported scenario: triggering `autumn-client gc` for 4 partitions
-  in quick succession (parts 26 / 32 / 20 / 15 — all sharing extent 10
-  from the F105/F106/F107 session) caused 4 concurrent
-  `handle_stream_punch_holes` invocations on the manager. Each handler
-  awaits `mirror_stream_extent_mutation → EtcdClient::txn`, and the
-  second one panicked with `already borrowed: BorrowMutError`. User
-  workaround was "GC one partition at a time"; F108 removes that.
+  Go reference (`/Users/zhangdongmao/upstream/autumn`) solves this
+  via etcd-watch on every node:
+  `node/smclient/extent_info_manager.go:140-158` watches `extents/`,
+  on DELETE event calls `node.go:138 RemoveExtent → diskfs.go:108
+  os.Remove(extentName)`. No fanout RPC; each replica converges
+  independently from etcd state.
 
-  This was already a known clippy warning (FCI-01: "RefCell reference
-  held across await point (4 in autumn-etcd)") — F108 is the runtime
-  manifestation.
+  The Rust port has diverged: extent-nodes have NO etcd client at
+  all; every manager↔node command (`require_recovery`, `re_avali`,
+  `copy_extent`, `df`, …) flows over autumn-rpc. Adding etcd watch
+  to extent-node would require extending `autumn-etcd` from
+  single-key to prefix watch and shipping a new client surface —
+  much larger blast radius. Per user decision (recorded after the
+  brainstorming round), F109 takes the manager-push path —
+  matching the existing Rust pattern — and keeps extent-node
+  etcd-free.
 
 Fix (single commit):
 
-  • `crates/etcd/src/transport.rs`:
-    - `GrpcChannel::call(&mut self, ...)` removed.
-    - New `GrpcChannel::sender(&self) -> http2::SendRequest<Full<Bytes>>`
-      returns a cheap clone of the underlying hyper sender (mpsc handle
-      + Arc — hyper's canonical idiom for HTTP/2 request multiplexing).
-    - New free function `call_with_sender(sender, path, body)` does the
-      actual gRPC POST + response-decode work. Free function (not
-      method) so callers can clone-then-drop-borrow before await.
+  1. Wire codec — `crates/stream/src/extent_rpc.rs`:
+     - New const `MSG_DELETE_EXTENT: u8 = 11`.
+     - New rkyv `DeleteExtentReq { extent_id: u64 }`. Response
+       reuses the existing `CodeResp`.
+     - Round-trip unit tests (`tests` mod, two cases).
 
-  • `crates/etcd/src/lib.rs`:
-    - `EtcdClient::unary_call`: `let mut sender = self.channel.borrow().sender();`
-      (RefCell guard dropped at `;`), then
-      `call_with_sender(&mut sender, path, body).await`. Both first
-      attempt and post-reconnect retry.
-    - `LeaseKeeper::keep_alive`: same pattern.
-    - `reconnect_shared` is unchanged — its `*channel.borrow_mut() =
-      new_channel` is synchronous (the await is on the prior
-      `GrpcChannel::connect` call), so no borrow-across-await there.
+  2. Manager-side wire types — `crates/rpc/src/manager_rpc.rs`:
+     - New const `MSG_RECONCILE_EXTENTS: u8 = 0x31` (StreamManager
+       service slot, next free in 0x30 range).
+     - New const `EXT_MSG_DELETE_EXTENT: u8 = 11` (manager → node
+       call).
+     - New rkyv types `ReconcileExtentsReq`,
+       `ReconcileExtentsResp`, `ExtDeleteExtentReq`.
 
-  • `crates/etcd/CLAUDE.md`:
-    - "Threading Model" section adds the F108 invariant: clone the
-      sender out of the RefCell before await, never hold `RefMut`
-      across `.await`. Includes the rule for future RPC additions.
+  3. Extent-node delete handler —
+     `crates/stream/src/extent_node.rs`:
+     - `MSG_DELETE_EXTENT` route in `dispatch`.
+     - New `handle_delete_extent`: F099-M owner-shard forward, then
+       `extents.remove(&id)` (so subsequent appends fast-fail with
+       NotFound), then `DiskFS::remove_extent_files` to unlink
+       `.dat` + `.meta`. Idempotent — `NotFound` errors on either
+       file are downgraded to `Ok`. Returns `CodeResp { CODE_OK |
+       CODE_ERROR }`.
+     - New `DiskFS::remove_extent_files` helper (uses existing
+       `extent_path` / `meta_path`).
 
-  • `crates/etcd/tests/concurrent_calls.rs` (new):
-    - `concurrent_puts_no_borrow_panic` — 8 concurrent `put` tasks on
-      one shared `Rc<EtcdClient>`; pre-F108 panics with
-      `RefCell already borrowed` at lib.rs:200, post-F108 all green.
-    - `concurrent_mixed_no_borrow_panic` — 4 puts + 4 gets concurrently.
-    - `concurrent_stress_no_borrow_panic` — 16 tasks, 1ms warmup sleep
-      to maximise interleaving.
-    - All tests skip cleanly if etcd is not at 127.0.0.1:2379.
+  4. Extent-node startup reconcile —
+     `crates/stream/src/extent_node.rs`:
+     - `ExtentNode::new` calls
+       `reconcile_orphans_with_manager()` after `load_extents()`.
+       Sends every locally loaded `extent_id` (filtered by
+       `owns_extent` for F099-M) via `MSG_RECONCILE_EXTENTS` to the
+       manager; receives back the subset that's no longer in
+       `s.extents`; unlinks the corresponding files. Best-effort:
+       a network failure logs at WARN and doesn't block startup.
 
-  • `feature_list.md`:
-    - F108 entry added with target / evidence / verification /
-      acceptance / notes; `passes: true` after the empirical
-      bug-reproduction round-trip below.
+  5. Manager pending queue + dispatch loop —
+     `crates/manager/src/extent_delete.rs` (new module):
+     - `PendingDelete { extent_id, pending_addrs: Vec<String>,
+       attempts: u32 }`.
+     - `pending_extent_deletes: Rc<RefCell<VecDeque<PendingDelete>>>`
+       field added to `AutumnManager`; init in `new()`.
+     - `extent_delete_loop`: sweep every 2 s, drain pending,
+       fan out `EXT_MSG_DELETE_EXTENT` via `ConnPool` per replica.
+       Drop confirmed addrs from each entry. After 60 failed
+       sweeps (≈ 2 min) drop the entry and log WARN — orphans
+       reaped on next node-startup reconcile.
+     - `Self::snapshot_replica_addrs(&nodes, eid, extent)` helper
+       resolves `replicates ++ parity` node-ids to shard-routed
+       addresses via the existing `Self::shard_addr_for_extent`.
+     - Spawn from `start_runtime_tasks`.
+
+  6. Snapshot wiring in handlers —
+     `crates/manager/src/rpc_handlers.rs`:
+     - `handle_stream_punch_holes` (lines ≈793-887) and
+       `handle_truncate` (lines ≈901-1002): replaced
+       `let mut s = self.store.inner.borrow_mut();` with
+       `let mut guard = ...; let s: &mut MetadataState =
+       &mut guard;` so partial-borrows on disjoint fields work
+       (`RefMut` deref alone confuses NLL).
+     - For each `extent_id` with `extent.refs <= 1`: snapshot the
+       replica addresses via `snapshot_replica_addrs` BEFORE the
+       in-memory `s.extents.remove(&extent_id)`. Implementation
+       uses an intermediate `HashMap<u64, MgrExtentInfo>` snapshot
+       to dodge the nested-borrow issue cleanly.
+     - After `mirror_stream_extent_mutation` returns OK, call
+       `self.enqueue_pending_deletes(pending_deletes)` —
+       etcd-first ordering preserved.
+     - New `handle_reconcile_extents`: `ensure_leader`, decode
+       `ReconcileExtentsReq`, return the subset of `req.extent_ids`
+       not in `s.extents`. Read-only.
+     - `MSG_RECONCILE_EXTENTS` route added to `dispatch`.
+
+  7. Test infrastructure — `crates/stream/tests/test_helpers.rs`:
+     - Added `TestConn::delete_extent` for `f109_extent_delete`.
+
+  8. New integration tests:
+     - `crates/stream/tests/f109_extent_delete.rs` (3 tests):
+       existing extent unlinks .dat+.meta; missing extent is
+       idempotent; delete-then-realloc starts fresh.
+     - `crates/manager/tests/f109_physical_deletion.rs`: end-to-end
+       — drives `StreamClient::punch_holes` with `max_extent_size =
+       1024` to roll 8 extents, punches 6 of them, polls until
+       both replicas have unlinked the punched extents within 8 s,
+       asserts the surviving extents remain on at least one replica.
+     - `crates/manager/tests/f109_offline_reconcile.rs`: writes a
+       synthetic orphan `extent-{id}.dat`+`.meta` into the correct
+       hash subdir of a tempdir BEFORE `ExtentNode::new`, then
+       starts the node pointing at that dir with the manager
+       endpoint configured. Verifies the startup reconcile path
+       unlinks the orphan within 4 s.
+
+  9. Docs:
+     - `crates/manager/CLAUDE.md`: new "F109: Physical extent file
+       deletion (refs → 0)" subsection under "GC: Punch Holes &
+       Truncate".
+     - `crates/stream/CLAUDE.md`: new "F109: Delete Extent" + "F109:
+       Startup Orphan Reconcile" sections.
+     - `README.md`: new "F109: verifying extent files are
+       physically reclaimed after GC" sub-section under
+       Operations / Partition operations, with the manual
+       `du -sh` check the operator should run.
+     - `feature_list.md`: F109 entry (target / evidence / fix /
+       verification / acceptance / notes / passes:true).
+     - `crates/manager/Cargo.toml`: added `crc32c = "0.6"` to
+       dev-dependencies (used by the offline-reconcile test to
+       compute the correct hash subdir for the synthetic orphan
+       file).
 
 Verification:
-  ✓ cargo build --workspace: clean (only pre-existing warnings remain)
-  ✓ cargo test -p autumn-etcd: 6 passed across 3 suites (lib + integ +
-    doc)
-  ✓ Bug-reproduction round-trip:
-      1. `git stash` both etcd source files (revert F108).
-      2. cargo test -p autumn-etcd --test concurrent_calls →
-         0 passed; 3 failed; panics at `crates/etcd/src/lib.rs:200:28:
-         RefCell already borrowed` — exactly matches user report.
-      3. `git stash pop` (restore F108).
-      4. cargo test -p autumn-etcd --test concurrent_calls →
-         3 passed.
+  ✓ cargo build --workspace: clean (only pre-existing warnings)
+  ✓ cargo test -p autumn-stream: 70/70 across 11 suites (incl.
+    new f109_extent_delete with 3 cases)
+  ✓ cargo test -p autumn-rpc: 7/7 (wire codec round-trips)
+  ✓ cargo test -p autumn-manager --test f109_physical_deletion:
+    1/1 (~2 s)
+  ✓ cargo test -p autumn-manager --test f109_offline_reconcile:
+    1/1 (~0.6 s)
+  ✓ cargo test -p autumn-manager --test integration
+    f033_gc_reclaims_log_stream_extents: 1/1 (no regression on
+    the existing GC end-to-end)
+  ✓ cargo test -p autumn-manager --test system_gc_chunked_read:
+    1/1 (no regression on F105 chunked-read path)
+  ⚠ cargo test -p autumn-partition-server --lib: 2 pre-existing
+    flaky failures in `f099i_tests::*` (Mutex poisoning when run
+    together; pass in isolation). Not caused by F109 — `git
+    status` confirms no PS code changed.
   ⚠ cargo test -p autumn-manager --lib: 1 pre-existing failure
-    (`register_node_duplicate_addr_rejected` expects code=3, gets code=0
-    — manager allowing duplicate addr to register). Confirmed
-    unrelated by re-running with F108 changes stashed: same failure.
-    Tracked separately, not in F108 scope.
-
-Issue 2 from the same session ("physical extent-N.dat files at
-/tmp/autumn-rs/dN/1e/ not deleted after refs→0") is **out of scope for
-F108**. It's an extent-node side cleanup concern, not manager etcd. Will
-be planned as F109 with reference to the Go `../autumn` extent-node
-implementation.
+    (`register_node_duplicate_addr_rejected`, documented in F108
+    progress entry). Not caused by F109.
+  ⚠ Live verification on the user's 4-partition cluster: deferred
+    to operator. After restarting manager + extent-nodes with this
+    binary, run `autumn-client gc 26 / 32 / 20 / 15` and confirm
+    `du -sh /tmp/autumn-rs/d*/1e/` drops by ≈ 3 GiB.
 
 Files modified:
-  • crates/etcd/src/transport.rs — sender() clone + call_with_sender
-    free function
-  • crates/etcd/src/lib.rs — clone-before-await pattern in 4 sites
-  • crates/etcd/CLAUDE.md — Threading Model section adds F108 invariant
-  • crates/etcd/tests/concurrent_calls.rs — new (3 regression tests)
-  • feature_list.md — F108 entry added (passes: true)
-  • claude-progress.txt — this file
+  • crates/stream/src/extent_rpc.rs           — MSG_DELETE_EXTENT,
+                                                 DeleteExtentReq, tests
+  • crates/stream/src/extent_node.rs          — handle_delete_extent,
+                                                 reconcile, DiskFS
+                                                 remove_extent_files
+  • crates/stream/tests/test_helpers.rs       — TestConn::delete_extent
+  • crates/stream/tests/f109_extent_delete.rs — new (3 tests)
+  • crates/rpc/src/manager_rpc.rs             — MSG_RECONCILE_EXTENTS,
+                                                 EXT_MSG_DELETE_EXTENT,
+                                                 ReconcileExtents{Req,Resp},
+                                                 ExtDeleteExtentReq
+  • crates/manager/src/lib.rs                 — pending_extent_deletes,
+                                                 extent_delete module wire,
+                                                 spawn extent_delete_loop
+  • crates/manager/src/extent_delete.rs       — new (PendingDelete,
+                                                 enqueue_pending_deletes,
+                                                 extent_delete_loop,
+                                                 try_delete_one,
+                                                 snapshot_replica_addrs)
+  • crates/manager/src/rpc_handlers.rs        — snapshot wiring in
+                                                 punch_holes + truncate;
+                                                 handle_reconcile_extents;
+                                                 dispatch route
+  • crates/manager/Cargo.toml                 — crc32c dev-dep
+  • crates/manager/tests/f109_physical_deletion.rs — new
+  • crates/manager/tests/f109_offline_reconcile.rs — new
+  • crates/manager/CLAUDE.md                  — F109 section
+  • crates/stream/CLAUDE.md                   — F109 sections
+  • README.md                                 — F109 manual verify
+  • feature_list.md                           — F109 entry (passes:true)
+  • claude-progress.txt                       — this file
+
+Out of scope (deferred):
+  • Persisting `pending_extent_deletes` to etcd (in-memory +
+    reconcile is sufficient per the user's fire-and-forget
+    decision).
+  • Etcd-watch on extent-node (Go-parity option, explicitly
+    declined by user — see Notes in feature_list F109 entry).
+  • DashMap → RefCell<HashMap> cleanup in `extent_node.rs`
+    (`extents` field at line 306, `recovery_inflight` at line
+    313). Tracked separately as F110 per user decision — kept out
+    of F109 to keep blast radius small and the cleanup
+    independently revertable.
 
 Next steps when the user resumes:
-  • Plan F109: physical extent .dat deletion when refs→0. Reference
-    Go `../autumn` extent-node cleanup logic. Surface plan to user
-    before touching code.
-  • Optional: run F108 fix on the live cluster — restart manager
-    binary, then trigger `autumn-client gc 26 / 32 / 20 / 15` in
-    parallel and confirm no panic. (User's previous workaround of
-    sequential GC should no longer be needed.)
+  • Run F109 fix on the live cluster — restart manager +
+    extent-nodes, then trigger `autumn-client gc 26 / 32 / 20 /
+    15` (sequentially or in parallel since F108) and confirm
+    `du -sh /tmp/autumn-rs/d*/1e/` drops by ≈ 3 GiB.
+  • Tackle F110 (DashMap → RefCell<HashMap>) when ready.

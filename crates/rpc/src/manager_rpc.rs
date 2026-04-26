@@ -37,6 +37,11 @@ pub const MSG_HEARTBEAT_PS: u8 = 0x2F;
 // can target the owning partition's CPU shard directly).
 pub const MSG_REGISTER_PARTITION_ADDR: u8 = 0x30;
 
+// F109: extent-node startup orphan reconcile. The node sends every
+// `extent_id` it loaded from disk; the manager replies with the subset
+// no longer present in `s.extents` so the node can unlink them.
+pub const MSG_RECONCILE_EXTENTS: u8 = 0x31;
+
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
 /// Serialize a value to Bytes using rkyv.
@@ -413,6 +418,28 @@ pub struct RegisterPartitionAddrReq {
 }
 // Response: CodeResp
 
+// --- ReconcileExtents (F109) ---
+// Extent node calls this on startup (after `load_extents`) with every
+// `extent_id` it found on disk. Manager checks each id against
+// `s.extents` and returns the subset that no longer exists — those are
+// orphans that the node should unlink (their refcount went to 0 while
+// the node was offline or while the manager's in-memory pending-delete
+// queue was lost to a manager restart).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ReconcileExtentsReq {
+    pub node_id: u64,
+    pub extent_ids: Vec<u64>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ReconcileExtentsResp {
+    pub code: u8,
+    pub message: String,
+    /// Subset of `req.extent_ids` that the manager no longer knows about.
+    /// Node should unlink the corresponding `.dat` + `.meta` files.
+    pub garbage: Vec<u64>,
+}
+
 // ── Extent node RPC types needed by the manager ────────────────────────────
 // The manager calls extent nodes for alloc/commit_length/re_avali/df/recovery/ec.
 // These duplicate the minimal subset from extent_rpc.rs to avoid manager→stream dep.
@@ -473,6 +500,12 @@ pub struct ExtDfResp {
     pub disk_status: Vec<(u64, ExtDiskStatus)>,
 }
 
+/// DeleteExtent request (manager → extent node, F109).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ExtDeleteExtentReq {
+    pub extent_id: u64,
+}
+
 /// ConvertToEc request (manager → extent node coordinator).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct ExtConvertToEcReq {
@@ -525,3 +558,4 @@ pub const EXT_MSG_DF: u8 = 5;
 pub const EXT_MSG_REQUIRE_RECOVERY: u8 = 6;
 pub const EXT_MSG_RE_AVALI: u8 = 7;
 pub const EXT_MSG_CONVERT_TO_EC: u8 = 9;
+pub const EXT_MSG_DELETE_EXTENT: u8 = 11;
