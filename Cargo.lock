@@ -1077,6 +1077,7 @@ dependencies = [
  "bytes",
  "compio",
  "cyper-axum",
+ "futures",
  "mime_guess",
  "send_wrapper",
  "tracing",

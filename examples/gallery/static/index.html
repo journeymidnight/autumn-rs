@@ -455,9 +455,10 @@ header .tag {
         <div class="card-head"><span class="dot"></span> Upload</div>
         <div class="card-body">
           <div class="drop-zone" id="dropZone">
-            <input type="file" id="fileInput" />
+            <input type="file" id="fileInput" multiple />
             <div class="icon">+</div>
-            <p>Drop file here or <strong>browse</strong></p>
+            <p>Drop files here or <strong>browse</strong><br>
+            <span style="font-size:0.65rem;color:var(--text-muted)">Multiple files supported</span></p>
           </div>
           <div class="progress-wrap" id="progressWrap">
             <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
@@ -468,7 +469,7 @@ header .tag {
 
       <!-- Files card -->
       <div class="card fade-up">
-        <div class="card-head"><span class="dot"></span> Files <span id="fileCount" style="margin-left:auto;color:var(--text-muted)"></span></div>
+        <div class="card-head"><span class="dot"></span> Files <span id="fileCount" style="margin-left:auto;color:var(--text-muted)"></span><span style="color:var(--text-muted);font-size:0.6rem;letter-spacing:0.05em;margin-left:0.5rem">↑↓</span></div>
         <div class="file-list" id="fileList">
           <div class="file-empty">No files yet</div>
         </div>
@@ -513,6 +514,7 @@ header .tag {
   const toastRack = $('#toastRack');
 
   let activeFile = null;
+  let files = [];
 
   // ── Toast ──
   function toast(msg, type) {
@@ -528,49 +530,77 @@ header .tag {
   ['dragleave','drop'].forEach(e => dropZone.addEventListener(e, ev => { ev.preventDefault(); dropZone.classList.remove('dragover'); }));
 
   dropZone.addEventListener('drop', ev => {
-    const file = ev.dataTransfer.files[0];
-    if (file) uploadFile(file);
+    if (ev.dataTransfer.files.length) uploadBatch(ev.dataTransfer.files);
   });
 
   fileInput.addEventListener('change', () => {
-    if (fileInput.files[0]) uploadFile(fileInput.files[0]);
+    if (fileInput.files.length) { uploadBatch(fileInput.files); fileInput.value = ''; }
   });
 
-  function uploadFile(file) {
+  function uploadOne(file, onSuccess, onError, onProgress) {
     const form = new FormData();
     form.append('file', file);
-
     const xhr = new XMLHttpRequest();
-    progressWrap.classList.add('active');
-    progressFill.style.width = '0%';
-    progressLabel.textContent = '0%';
-
-    xhr.upload.onprogress = e => {
-      if (e.lengthComputable) {
-        const pct = Math.round(e.loaded / e.total * 100);
-        progressFill.style.width = pct + '%';
-        progressLabel.textContent = pct + '%';
-      }
-    };
-
+    if (onProgress) {
+      xhr.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded, e.total); };
+    }
     xhr.onload = () => {
-      fileInput.value = '';
-      setTimeout(() => progressWrap.classList.remove('active'), 600);
-      if (xhr.status === 200) {
-        toast('Uploaded ' + xhr.responseText, 'success');
-        refreshList(() => selectFile(xhr.responseText));
-      } else {
-        toast('Upload failed: ' + xhr.responseText, 'error');
-      }
+      if (xhr.status === 200) onSuccess(xhr.responseText);
+      else onError(xhr.responseText || xhr.statusText);
     };
-
-    xhr.onerror = () => {
-      progressWrap.classList.remove('active');
-      toast('Upload failed (network error)', 'error');
-    };
-
+    xhr.onerror = () => onError('network error');
     xhr.open('POST', '/put/', true);
     xhr.send(form);
+  }
+
+  function uploadBatch(fileList) {
+    const arr = Array.from(fileList);
+    if (!arr.length) return;
+
+    const total = arr.length;
+    let idx = 0, completed = 0, failed = 0, firstSuccess = null;
+
+    progressWrap.classList.add('active');
+    progressFill.style.width = '0%';
+    progressLabel.textContent = total === 1 ? '0%' : '0 / ' + total;
+
+    function onFileDone() {
+      const done = completed + failed;
+      progressFill.style.width = Math.round(done / total * 100) + '%';
+      progressLabel.textContent = done + ' / ' + total;
+      if (done < total) return;
+      setTimeout(() => progressWrap.classList.remove('active'), 800);
+      const msg = failed
+        ? completed + ' uploaded, ' + failed + ' failed'
+        : completed + ' file' + (completed !== 1 ? 's' : '') + ' uploaded';
+      toast(msg, failed && !completed ? 'error' : 'success');
+      refreshList(() => { if (firstSuccess) selectFile(firstSuccess); });
+    }
+
+    function worker() {
+      if (idx >= total) return;
+      const file = arr[idx++];
+      // Single file: show byte-level XHR progress; batch: count-based only.
+      const onProgress = total === 1 ? (loaded, fileTotal) => {
+        const pct = Math.round(loaded / fileTotal * 100);
+        progressFill.style.width = pct + '%';
+        progressLabel.textContent = pct + '%';
+      } : null;
+      uploadOne(file, name => {
+        if (!firstSuccess) firstSuccess = name;
+        completed++;
+        onFileDone();
+        worker();
+      }, err => {
+        toast('Failed: ' + file.name + (err ? ' — ' + err : ''), 'error');
+        failed++;
+        onFileDone();
+        worker();
+      }, onProgress);
+    }
+
+    const concurrency = Math.min(16, total);
+    for (let i = 0; i < concurrency; i++) worker();
   }
 
   // ── File list ──
@@ -580,6 +610,7 @@ header .tag {
     xhr.onload = () => {
       if (xhr.status !== 200) return;
       const names = xhr.responseText.trim().split('\n').filter(Boolean);
+      files = names;
       fileCount.textContent = names.length || '';
       if (!names.length) {
         fileList.innerHTML = '<div class="file-empty">No files yet</div>';
@@ -614,6 +645,23 @@ header .tag {
     });
     previewFile(name);
   }
+
+  // ── Keyboard navigation ──
+  document.addEventListener('keydown', e => {
+    const tag = e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+    if (!files.length) return;
+    e.preventDefault();
+    const cur = activeFile ? files.indexOf(activeFile) : -1;
+    const next = e.key === 'ArrowUp'
+      ? (cur <= 0 ? 0 : cur - 1)
+      : (cur < 0 ? 0 : Math.min(files.length - 1, cur + 1));
+    if (next === cur) return;
+    selectFile(files[next]);
+    const items = fileList.querySelectorAll('.file-item');
+    if (items[next]) items[next].scrollIntoView({ block: 'nearest' });
+  });
 
   // ── Delete ──
   function deleteFile(name) {
@@ -655,21 +703,10 @@ header .tag {
     previewArea.appendChild(label);
 
     if (['jpg','jpeg','png','gif','bmp','webp','svg'].includes(ext)) {
-      showLoader();
-      const xhr = new XMLHttpRequest();
-      xhr.open('GET', url, true);
-      xhr.responseType = 'blob';
-      xhr.onprogress = e => { if (e.lengthComputable) updateDl(e.loaded, e.total); };
-      xhr.onload = () => {
-        hideLoader();
-        if (xhr.status === 200) {
-          const img = document.createElement('img');
-          img.src = URL.createObjectURL(xhr.response);
-          previewArea.appendChild(img);
-        }
-      };
-      xhr.onerror = () => { hideLoader(); toast('Failed to load image', 'error'); };
-      xhr.send();
+      const img = document.createElement('img');
+      img.src = url;
+      img.onerror = () => toast('Failed to load image', 'error');
+      previewArea.appendChild(img);
 
     } else if (['mp4','webm','ogg'].includes(ext)) {
       const v = document.createElement('video');

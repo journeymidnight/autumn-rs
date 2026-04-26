@@ -1,5 +1,6 @@
-use std::cell::RefCell;
 use std::rc::Rc;
+
+use futures::lock::Mutex;
 
 use anyhow::Result;
 use autumn_client::{AutumnError, ClusterClient};
@@ -11,7 +12,7 @@ use axum::Router;
 use bytes::Bytes;
 use send_wrapper::SendWrapper;
 
-type Client = Rc<RefCell<ClusterClient>>;
+type Client = Rc<Mutex<ClusterClient>>;
 
 // ---------------------------------------------------------------------------
 // HTTP response helpers
@@ -58,7 +59,7 @@ async fn put_handler_inner(client: &Client, mut multipart: Multipart) -> Respons
             Ok(b) => b.to_vec(),
             Err(e) => return error_response(StatusCode::BAD_REQUEST, format!("read field: {e}")),
         };
-        if let Err(e) = client.borrow_mut().put(filename.as_bytes(), &data, true).await {
+        if let Err(e) = client.lock().await.put(filename.as_bytes(), &data, true).await {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("put: {e}"));
         }
         return ok_response(filename);
@@ -77,36 +78,41 @@ async fn get_handler_inner(
 
     // Check for HTTP Range header — use sub-range read to avoid loading entire value.
     if let Some(range_header) = headers.get("range") {
-        let total = match client.borrow_mut().head(name.as_bytes()).await {
-            Ok(meta) if meta.found => meta.value_length as usize,
-            Ok(_) => return error_response(StatusCode::NOT_FOUND, "not found".into()),
-            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("head: {e}")),
-        };
         if let Ok(range_str) = range_header.to_str() {
             if let Some(bytes_range) = range_str.strip_prefix("bytes=") {
                 let parts: Vec<&str> = bytes_range.splitn(2, '-').collect();
                 if parts.len() == 2 {
                     let start: usize = parts[0].parse().unwrap_or(0);
-                    let end: usize = if parts[1].is_empty() {
-                        total.saturating_sub(1)
-                    } else {
-                        parts[1].parse().unwrap_or(total.saturating_sub(1))
+                    let end_str = parts[1];
+
+                    // Always call head() to get total size — Safari requires the exact total
+                    // in every Content-Range response (bytes X-Y/*  is rejected by Safari).
+                    let total_size: usize = match client.lock().await.head(name.as_bytes()).await {
+                        Ok(meta) if meta.found => meta.value_length as usize,
+                        Ok(_) => return error_response(StatusCode::NOT_FOUND, "not found".into()),
+                        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("head: {e}")),
                     };
-                    let end = end.min(total.saturating_sub(1));
-                    if start <= end && start < total {
+
+                    let end: usize = if end_str.is_empty() {
+                        total_size.saturating_sub(1)
+                    } else {
+                        end_str.parse().unwrap_or(usize::MAX).min(total_size.saturating_sub(1))
+                    };
+
+                    if start <= end {
                         let length = end - start + 1;
-                        // Use low-level get with offset/length for sub-range read
                         let slice = match get_with_range(&client, name.as_bytes(), start as u32, length as u32).await {
                             Ok(Some(v)) => v,
                             Ok(None) => return error_response(StatusCode::NOT_FOUND, "not found".into()),
                             Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("get: {e}")),
                         };
+                        let actual_end = start + slice.len() - 1;
                         return Response::builder()
                             .status(StatusCode::PARTIAL_CONTENT)
                             .header("content-type", &mime)
                             .header("accept-ranges", "bytes")
                             .header("content-length", slice.len())
-                            .header("content-range", format!("bytes {start}-{end}/{total}"))
+                            .header("content-range", format!("bytes {start}-{actual_end}/{total_size}"))
                             .body(Body::from(slice))
                             .unwrap();
                     }
@@ -116,7 +122,7 @@ async fn get_handler_inner(
     }
 
     // No Range header — full read via SDK.
-    match client.borrow_mut().get(name.as_bytes()).await {
+    match client.lock().await.get(name.as_bytes()).await {
         Ok(Some(v)) => Response::builder()
             .header("content-type", &mime)
             .header("accept-ranges", "bytes")
@@ -138,8 +144,14 @@ async fn get_with_range(
     use autumn_rpc::partition_rpc::*;
     use autumn_client::decode_err;
 
-    let (part_id, ps_addr) = client.borrow_mut().resolve_key(key).await?;
-    let ps = client.borrow().get_ps_client(&ps_addr).await?;
+    // Release the lock before the actual data transfer so concurrent Range
+    // requests (e.g. multiple browser seeks) are not serialized.
+    let (part_id, ps) = {
+        let mut guard = client.lock().await;
+        let (part_id, ps_addr) = guard.resolve_key(key).await?;
+        let ps = guard.get_ps_client(&ps_addr).await?;
+        (part_id, ps)
+    };
     let resp_bytes = ps
         .call(
             MSG_GET,
@@ -162,7 +174,7 @@ async fn get_with_range(
 }
 
 async fn delete_handler_inner(client: &Client, name: String) -> Response<Body> {
-    match client.borrow_mut().delete(name.as_bytes()).await {
+    match client.lock().await.delete(name.as_bytes()).await {
         Ok(()) => ok_response("OK"),
         Err(AutumnError::NotFound) => error_response(StatusCode::NOT_FOUND, "File not found".into()),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("delete: {e}")),
@@ -170,7 +182,7 @@ async fn delete_handler_inner(client: &Client, name: String) -> Response<Body> {
 }
 
 async fn list_handler_inner(client: &Client) -> Response<Body> {
-    match client.borrow_mut().range(b"", b"", u32::MAX).await {
+    match client.lock().await.range(b"", b"", u32::MAX).await {
         Ok(result) => {
             let keys: Vec<String> = result
                 .entries
@@ -203,7 +215,7 @@ async fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:9001".to_string());
 
-    let client: Client = Rc::new(RefCell::new(
+    let client: Client = Rc::new(Mutex::new(
         ClusterClient::connect(&manager).await?,
     ));
 
