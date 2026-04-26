@@ -65,6 +65,29 @@ cargo build --workspace          # build binaries first
 ./cluster.sh logs                # tail all log files (Ctrl-C to exit)
 ```
 
+### Per-process control (recovery testing)
+
+After at least one `cluster.sh start` (which snapshots the launch params to
+`$DATA_ROOT/cluster_config`), individual extent-nodes and the partition
+server can be killed and restarted without touching the rest of the cluster
+— useful for exercising manager recovery dispatch loops, PS region
+failover, etc.
+
+```bash
+./cluster.sh stop-node 2         # kill extent-node #2 (replicas are 1-indexed)
+./cluster.sh status              # node2 will show NOT STARTED; rest still running
+./cluster.sh start-node 2        # relaunch — re-registers with manager (idempotent on same addr)
+./cluster.sh restart-node 2      # = stop-node 2 + start-node 2
+
+./cluster.sh stop-ps             # kill the partition server
+./cluster.sh start-ps            # relaunch the partition server
+./cluster.sh restart-ps          # = stop-ps + start-ps
+```
+
+`start-node N` refuses to launch if node N is already running, and refuses
+indices outside the snapshot's `REPLICAS`. To extend the cluster size,
+re-run `cluster.sh start <new-N>`.
+
 After `start`, the script prints ready-to-use CLI examples:
 
 ```

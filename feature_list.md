@@ -449,6 +449,26 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 - **Notes:** 实现完成。SSTable MetaBlock 新增 `min_expires_at` 字段（向后兼容，旧 SST 默认为 0）。SstBuilder 在 add() 时自动跟踪最小非零 expires_at。background_compact_loop 在周期性 timeout 分支中检查所有 SST 的 min_expires_at，如有过期 key 则触发 major compaction（复用现有 do_compact major=true 逻辑，自动清理过期和删除条目）。读路径过滤（get/range/head）和写路径（put_with_ttl）之前已完成。3 个新单元测试通过。
 - **passes:** true
 
+### F102 · cluster.sh per-process start/stop for recovery testing
+- **Target:** 在 `cluster.sh` 增加 `start-node N` / `stop-node N` / `restart-node N` / `start-ps` / `stop-ps` / `restart-ps` 子命令，方便用户在不重启整个集群的前提下杀掉 / 拉起单个 extent-node 或 partition server，跑 manager recovery dispatch loop、PS region failover 等故障注入测试。要求：(1) 单进程拉起时不需要重新输入 `--3disk` / `AUTUMN_EXTENT_SHARDS` 等启动参数 — 全集群第一次 `start` 时把 `REPLICAS` / `CLUSTER_MODE` / 所有 `AUTUMN_*` 环境变量快照到 `$DATA_ROOT/cluster_config`，子命令通过 `source` 还原。(2) `start-node N` 已经在跑时报错而不是悄悄起第二个进程。(3) `start-node N` 自动调用 `register-node`（manager 的 `handle_register_node` 已经在 F-mgr-dup-fix 之后对相同 addr 幂等，会复用 `node_id`）。(4) 三套全集群命令（`start` / `restart` / `reset`）行为不变，只是改成调用同一组 `launch_extent_node` / `register_extent_node` / `launch_ps` 私有 helper，让 do_start 和 per-process 子命令走完全相同代码路径。
+- **Evidence:** `cluster.sh` (helpers `compute_shard_config` / `launch_extent_node` / `register_extent_node` / `launch_ps` / `save_cluster_config` / `load_cluster_config` 在 `do_start` 之上；新子命令 `do_start_node` / `do_stop_node` / `do_start_ps` / `do_stop_ps`；dispatcher case 新增 `start-node` / `stop-node` / `restart-node` / `start-ps` / `stop-ps` / `restart-ps`) · `README.md` Recovery testing 小节
+- **Verification (this session):**
+  - `clean → start 1 → status` 仍然是 etcd / manager / node1 / ps 全绿
+  - `cat /tmp/autumn-rs/cluster_config` 输出 `REPLICAS=1` + `CLUSTER_MODE=default`（本次没有 AUTUMN_* env，所以列表为空，正确）
+  - `stop-node 1` 杀掉 node1 → `status` 显示 etcd / manager / ps RUNNING、node1 不在列表
+  - `start-node 1` 重新拉起 → manager 返回 `node_id=1, addr=127.0.0.1:9101`（复用 node_id=1，证明 manager 的 re-registration 路径生效）
+  - `stop-ps` 杀掉 ps → `status` 显示 ps NOT STARTED
+  - `start-node 1` 在 node1 已运行时报错 `node1 already running (pid …)`，exit 1
+  - `start-node 5` 在 REPLICAS=1 的快照下报错 `node5 exceeds REPLICAS=1 …`，exit 1
+  - `stop-node`（缺少 N 参数）报错 `usage: cluster.sh stop-node <N>`，exit 1
+- **Acceptance:**
+  - (a) ✓ 全集群命令 `start [N]` / `stop` / `restart [N]` / `clean` / `reset [N]` / `status` / `logs` 行为不变（同样的 helper 直接被 do_start 调用）。
+  - (b) ✓ `stop-node N` 干净杀掉指定 extent-node，其它进程不动。
+  - (c) ✓ `start-node N` 复用快照里的 `--shards` / `--data` / `--3disk` 等启动参数，并且自动 `register-node`（依赖 `handle_register_node` 的 dup-addr 幂等）。
+  - (d) ✓ `stop-ps` 干净杀掉 PS。
+  - (e) ⚠ `start-ps` 当 manager etcd 已经持久化了 partition assignment 时会触发**已知 F099-K bug**（`partition_server.rs` 的 `connect_with_advertise` 在 `bind_listen_addr` 之前就跑 `sync_regions_once`，导致 `base_port == 0`，partition 0 bind 到 `0.0.0.0:1` 而不是 `:9201`）。此 bug 在 fresh `start` 的路径上不出现（PS 连接 manager 时还没有 partitions），所以本 feature 默认走「fresh start → 单独 stop/start node」recovery 场景仍然可用；`start-ps` 一旦集群已经 bootstrap 过就不可用。一行修复方案已经写在 `claude-progress.txt`：把 `connect_with_advertise` 换成 `connect_with_advertise_and_port(args.psid, &args.manager, Some(advertise), addr)`，让 `bind_listen_addr` 跑在 `finish_connect` 前。该修复是单独的 F102-followup，不在本次 commit 范围内。
+- **passes:** done_with_concerns
+
 ---
 
 ## P4 — PS Thread Isolation (log vs flush on separate OS threads)

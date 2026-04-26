@@ -123,6 +123,127 @@ disk_args_for_node() {
 }
 
 # ---------------------------------------------------------------------------
+# F102: per-process helpers + saved config
+# ---------------------------------------------------------------------------
+#
+# Used by:
+#   - do_start (full bring-up): writes the config snapshot once everything
+#     is staged, then re-uses launch_extent_node / register_extent_node /
+#     launch_ps so the per-process subcommands take exactly the same code
+#     path as the bulk start.
+#   - do_start_node / do_stop_node / do_start_ps / do_stop_ps: load the
+#     snapshot so a recovery test can `stop-node 2 && start-node 2`
+#     without re-typing flags or remembering env vars.
+
+CONFIG_FILE="$DATA_ROOT/cluster_config"
+
+# Populate $SHARDS / $SHARD_STRIDE from the env. Both helpers (do_start
+# and the post-load subcommands) call this BEFORE launching any node.
+compute_shard_config() {
+    SHARDS="${AUTUMN_EXTENT_SHARDS:-1}"
+    [[ "$SHARDS" =~ ^[0-9]+$ ]] && (( SHARDS >= 1 )) || SHARDS=1
+    SHARD_STRIDE="${AUTUMN_EXTENT_SHARD_STRIDE:-10}"
+    [[ "$SHARD_STRIDE" =~ ^[0-9]+$ ]] && (( SHARD_STRIDE >= 1 )) || SHARD_STRIDE=10
+}
+
+# Launch one extent-node ($1 = 1-indexed). Picks --shards/--data based on
+# the current CLUSTER_MODE + AUTUMN_EXTENT_SHARDS env (compute_shard_config
+# must have run first). Creates data dirs if missing. Waits for the primary
+# port before returning.
+launch_extent_node() {
+    local i="$1"
+    local port=$(( 9100 + i ))
+    local disk_arg
+    disk_arg=$(disk_args_for_node "$i")
+    # shellcheck disable=SC2046  # intentional word splitting on commas
+    mkdir -p $(echo "$disk_arg" | tr ',' ' ')
+    if [[ "$disk_arg" == *,* ]]; then
+        if (( SHARDS > 1 )); then
+            start_proc "node$i" \
+                "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
+                --shards "$SHARDS" --shard-stride "$SHARD_STRIDE"
+        else
+            start_proc "node$i" \
+                "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR"
+        fi
+    else
+        if (( SHARDS > 1 )); then
+            start_proc "node$i" \
+                "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR" \
+                --shards "$SHARDS" --shard-stride "$SHARD_STRIDE"
+        else
+            start_proc "node$i" \
+                "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR"
+        fi
+    fi
+    wait_port "$port" "node$i"
+}
+
+# Register one extent-node ($1 = 1-indexed) with the manager. No-op for
+# multidisk-1node — the `format` step already registered.
+register_extent_node() {
+    local i="$1"
+    local port=$(( 9100 + i ))
+    if (( SHARDS > 1 )); then
+        local shard_ports_csv=""
+        for (( s=0; s<SHARDS; s++ )); do
+            local sp=$(( port + s * SHARD_STRIDE ))
+            if [[ -z "$shard_ports_csv" ]]; then
+                shard_ports_csv="$sp"
+            else
+                shard_ports_csv="${shard_ports_csv},${sp}"
+            fi
+        done
+        "$AC" --manager "$MANAGER_ADDR" register-node \
+            --addr "${BIND_HOST}:$port" --disk "disk-$i" \
+            --shard-ports "$shard_ports_csv"
+    else
+        "$AC" --manager "$MANAGER_ADDR" register-node --addr "${BIND_HOST}:$port" --disk "disk-$i"
+    fi
+}
+
+# Launch the partition server. F099-K: the per-partition listeners (9201,
+# 9202, ...) come up only after partitions open, so we don't wait_port
+# here — bootstrap or region-sync handles readiness.
+launch_ps() {
+    start_proc ps \
+        "$PS" \
+        --psid 1 --port 9201 \
+        --manager "$MANAGER_ADDR" \
+        --advertise "${BIND_HOST}:9201"
+    echo "[cluster] PS launched (F099-K: per-partition listeners bind on partition open)"
+}
+
+# Snapshot the launch parameters so `start-node` / `start-ps` (run later)
+# can reproduce the exact env. Captures REPLICAS + CLUSTER_MODE explicitly,
+# then dumps every AUTUMN_* env var (quoted via %q so values with spaces
+# or special chars survive a `source`). Called once at the end of do_start
+# after all envs that matter have been read.
+save_cluster_config() {
+    mkdir -p "$DATA_ROOT"
+    {
+        printf 'REPLICAS=%s\n' "$REPLICAS"
+        printf 'CLUSTER_MODE=%s\n' "$MODE"
+        env | grep -E '^AUTUMN_' | sort | while IFS='=' read -r k v; do
+            printf 'export %s=%q\n' "$k" "$v"
+        done
+    } > "$CONFIG_FILE"
+}
+
+# Replay the snapshot. Errors with a clear hint if the cluster was never
+# started in this $DATA_ROOT.
+load_cluster_config() {
+    [[ -f "$CONFIG_FILE" ]] || die "no cluster config at $CONFIG_FILE — run '$0 start [N]' first"
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    MODE="${CLUSTER_MODE:-default}"
+    export CLUSTER_MODE="$MODE"
+    BIND_HOST="${AUTUMN_BIND_HOST:-127.0.0.1}"
+    MANAGER_ADDR="${BIND_HOST}:9001"
+    compute_shard_config
+}
+
+# ---------------------------------------------------------------------------
 # start
 # ---------------------------------------------------------------------------
 
@@ -185,71 +306,21 @@ do_start() {
     fi
 
     # F099-M: when AUTUMN_EXTENT_SHARDS is set, launch each extent-node
-    # with K shards. Each shard listens on port + shard_idx * shard_stride
-    # (stride 10 by default). cluster.sh passes --shards so the binary
-    # spawns K compio runtimes in one process; cluster.sh must also tell
-    # the manager about the shard_ports via `register-node --shard-ports`
-    # so the manager/PS can route each extent to the owning shard.
-    local shards="${AUTUMN_EXTENT_SHARDS:-1}"
-    [[ "$shards" =~ ^[0-9]+$ ]] && (( shards >= 1 )) || shards=1
-    local shard_stride="${AUTUMN_EXTENT_SHARD_STRIDE:-10}"
-    [[ "$shard_stride" =~ ^[0-9]+$ ]] && (( shard_stride >= 1 )) || shard_stride=10
-    if (( shards > 1 )); then
-        echo "[cluster] F099-M: extent-node shards=$shards stride=$shard_stride"
+    # with K shards (see compute_shard_config + launch_extent_node above).
+    compute_shard_config
+    if (( SHARDS > 1 )); then
+        echo "[cluster] F099-M: extent-node shards=$SHARDS stride=$SHARD_STRIDE"
     fi
 
     # Launch extent-node processes.
     for (( i=1; i<=replicas; i++ )); do
-        local port=$(( 9100 + i ))
-        local disk_arg
-        disk_arg=$(disk_args_for_node "$i")
-        # multidisk-1node sends multiple paths through --data and OMITS --disk-id
-        # (extent-node switches to multi-disk mode when --data has commas AND --disk-id is absent).
-        if [[ "$disk_arg" == *,* ]]; then
-            if (( shards > 1 )); then
-                start_proc "node$i" \
-                    "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
-                    --shards "$shards" --shard-stride "$shard_stride"
-            else
-                start_proc "node$i" \
-                    "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR"
-            fi
-        else
-            if (( shards > 1 )); then
-                start_proc "node$i" \
-                    "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR" \
-                    --shards "$shards" --shard-stride "$shard_stride"
-            else
-                start_proc "node$i" \
-                    "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR"
-            fi
-        fi
-        # Wait for the primary (shard 0) port. Sibling shard ports come up
-        # around the same time from the same process.
-        wait_port "$port" "node$i"
+        launch_extent_node "$i"
     done
 
     # register extent node(s) — skip for multidisk-1node (format already registered).
     if [[ "${CLUSTER_MODE:-default}" != "multidisk-1node" ]]; then
         for (( i=1; i<=replicas; i++ )); do
-            local port=$(( 9100 + i ))
-            if (( shards > 1 )); then
-                # Build comma-separated shard_ports: port, port+stride, port+2*stride, ...
-                local shard_ports_csv=""
-                for (( s=0; s<shards; s++ )); do
-                    local sp=$(( port + s * shard_stride ))
-                    if [[ -z "$shard_ports_csv" ]]; then
-                        shard_ports_csv="$sp"
-                    else
-                        shard_ports_csv="${shard_ports_csv},${sp}"
-                    fi
-                done
-                "$AC" --manager "$MANAGER_ADDR" register-node \
-                    --addr "${BIND_HOST}:$port" --disk "disk-$i" \
-                    --shard-ports "$shard_ports_csv"
-            else
-                "$AC" --manager "$MANAGER_ADDR" register-node --addr "${BIND_HOST}:$port" --disk "disk-$i"
-            fi
+            register_extent_node "$i"
         done
         echo "[cluster] extent node(s) registered"
     else
@@ -260,17 +331,7 @@ do_start() {
         echo "[cluster] AUTUMN_GROUP_COMMIT_CAP=$AUTUMN_GROUP_COMMIT_CAP (forwarding to PS)"
     fi
 
-    # partition server
-    start_proc ps \
-        "$PS" \
-        --psid 1 --port 9201 \
-        --manager "$MANAGER_ADDR" \
-        --advertise "${BIND_HOST}:9201"
-    # F099-K: no central PS listener — partitions bind their own ports
-    # AFTER they are opened. Don't wait for port 9201 here; bootstrap
-    # below creates partitions, and the per-partition listener (9201,
-    # 9202, ...) will come up as the PS opens each partition.
-    echo "[cluster] PS launched (F099-K: per-partition listeners bind on partition open)"
+    launch_ps
 
     # bootstrap (create streams + partitions) — only on a fresh data dir
     if [[ -f "$bootstrap_marker" ]]; then
@@ -314,6 +375,10 @@ do_start() {
         wait_port 9201 "partition 0 listener" 60
     fi
 
+    # F102: snapshot launch params so per-process subcommands can replay
+    # them later without the user re-typing flags or env vars.
+    save_cluster_config
+
     echo ""
     echo "[cluster] ✓ cluster ready (replicas=$replicas)"
     echo "[cluster]   manager  : $MANAGER_ADDR"
@@ -325,6 +390,55 @@ do_start() {
     echo "  echo hello | \"\${AC[@]}\" put mykey /dev/stdin"
     echo "  \"\${AC[@]}\" get mykey"
     echo "  \"\${AC[@]}\" ls"
+}
+
+# ---------------------------------------------------------------------------
+# F102: per-process subcommands (recovery testing)
+# ---------------------------------------------------------------------------
+
+do_start_node() {
+    local i="$1"
+    [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 )) || die "usage: $0 start-node <N>  (positive integer)"
+    load_cluster_config
+    (( i <= REPLICAS )) || die "node$i exceeds REPLICAS=$REPLICAS in saved config; re-run '$0 start $i' to extend"
+    need_bin "$NODE"
+    need_bin "$AC"
+    local pf; pf="$(pid_file "node$i")"
+    if [[ -f "$pf" ]] && kill -0 "$(cat "$pf")" 2>/dev/null; then
+        die "node$i already running (pid $(cat "$pf"))"
+    fi
+    launch_extent_node "$i"
+    if [[ "$MODE" != "multidisk-1node" ]]; then
+        # register-node is now idempotent on duplicate addr (manager
+        # rpc_handlers.rs handle_register_node) — safe to call on every
+        # restart so a manager that lost state re-learns the node.
+        register_extent_node "$i"
+        echo "[cluster] node$i registered"
+    fi
+}
+
+do_stop_node() {
+    local i="$1"
+    [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 )) || die "usage: $0 stop-node <N>  (positive integer)"
+    kill_proc "node$i"
+}
+
+do_start_ps() {
+    load_cluster_config
+    need_bin "$PS"
+    local pf; pf="$(pid_file "ps")"
+    if [[ -f "$pf" ]] && kill -0 "$(cat "$pf")" 2>/dev/null; then
+        die "ps already running (pid $(cat "$pf"))"
+    fi
+    launch_ps
+    # Per-partition listener on :9201 only comes up after partition 0
+    # opens (F099-K). Wait for it so a recovery test can `start-ps` and
+    # immediately drive traffic.
+    wait_port 9201 ps 60
+}
+
+do_stop_ps() {
+    kill_proc ps
 }
 
 # ---------------------------------------------------------------------------
@@ -415,8 +529,10 @@ shift || true
 
 REPLICAS=1
 MODE="default"  # default | 3disk | multidisk-1node
+ARG_INT_PROVIDED=0  # F102: distinguishes "explicit N" from "default 1" so per-process subcommands can require an explicit index.
 if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
     REPLICAS="$1"
+    ARG_INT_PROVIDED=1
     shift
 fi
 while (( $# > 0 )); do
@@ -428,25 +544,65 @@ while (( $# > 0 )); do
     shift
 done
 
-# Mode validation
-if [[ "$MODE" == "3disk" ]]; then
-    (( REPLICAS == 3 )) || die "--3disk requires replicas=3 (got $REPLICAS)"
-elif [[ "$MODE" == "multidisk-1node" ]]; then
-    (( REPLICAS == 1 )) || die "--multidisk-1node requires replicas=1 (got $REPLICAS)"
+# Mode validation (only enforced for full-cluster commands; per-process
+# subcommands inherit MODE from the saved config via load_cluster_config).
+if [[ "$CMD" == "start" || "$CMD" == "restart" || "$CMD" == "reset" ]]; then
+    if [[ "$MODE" == "3disk" ]]; then
+        (( REPLICAS == 3 )) || die "--3disk requires replicas=3 (got $REPLICAS)"
+    elif [[ "$MODE" == "multidisk-1node" ]]; then
+        (( REPLICAS == 1 )) || die "--multidisk-1node requires replicas=1 (got $REPLICAS)"
+    fi
 fi
 export CLUSTER_MODE="$MODE"
 
 case "$CMD" in
-    start)   do_start "$REPLICAS" ;;
-    stop)    do_stop ;;
-    restart) do_stop; do_start "$REPLICAS" ;;
-    clean)   do_clean ;;
-    reset)   do_clean; do_start "$REPLICAS" ;;
-    status)  do_status ;;
-    logs)    do_logs ;;
+    start)        do_start "$REPLICAS" ;;
+    stop)         do_stop ;;
+    restart)      do_stop; do_start "$REPLICAS" ;;
+    clean)        do_clean ;;
+    reset)        do_clean; do_start "$REPLICAS" ;;
+    status)       do_status ;;
+    logs)         do_logs ;;
+    # F102: per-process control for recovery testing. Args inherit the
+    # ARG_INT_PROVIDED gate above so a typo doesn't silently default N=1.
+    start-node)
+        (( ARG_INT_PROVIDED )) || die "usage: $0 start-node <N>"
+        do_start_node "$REPLICAS"
+        ;;
+    stop-node)
+        (( ARG_INT_PROVIDED )) || die "usage: $0 stop-node <N>"
+        do_stop_node "$REPLICAS"
+        ;;
+    restart-node)
+        (( ARG_INT_PROVIDED )) || die "usage: $0 restart-node <N>"
+        do_stop_node "$REPLICAS"; do_start_node "$REPLICAS"
+        ;;
+    start-ps)     do_start_ps ;;
+    stop-ps)      do_stop_ps ;;
+    restart-ps)   do_stop_ps; do_start_ps ;;
     *)
-        echo "Usage: $0 {start [N] | stop | restart [N] | clean | reset [N] | status | logs}"
-        echo "  Optional mode flag: --3disk (replicas=3, nodes on /data03,/data05,/data08) | --multidisk-1node (replicas=1, one node spans all three NVMes)"
+        echo "Usage: $0 <command> [args]"
+        echo ""
+        echo "  Cluster:"
+        echo "    start [N]          start full cluster (etcd + manager + N extent-nodes + ps)"
+        echo "    stop               kill all cluster processes"
+        echo "    restart [N]        stop + start (data preserved)"
+        echo "    clean              stop + wipe data dirs"
+        echo "    reset [N]          clean + start (fresh cluster)"
+        echo "    status             show running processes"
+        echo "    logs               tail all log files (Ctrl-C to exit)"
+        echo ""
+        echo "  Per-process (recovery testing — requires a prior 'start' to snapshot launch params):"
+        echo "    start-node <N>     start extent-node N (1-indexed)"
+        echo "    stop-node <N>      stop extent-node N"
+        echo "    restart-node <N>   stop-node + start-node"
+        echo "    start-ps           start partition server"
+        echo "    stop-ps            stop partition server"
+        echo "    restart-ps         stop-ps + start-ps"
+        echo ""
+        echo "  Mode flag (only with start/restart/reset):"
+        echo "    --3disk            replicas=3, nodes on /data03,/data05,/data08"
+        echo "    --multidisk-1node  replicas=1, one node spans all three NVMes"
         exit 1
         ;;
 esac

@@ -1,63 +1,101 @@
 Date: 2026-04-25
 TaskStatus: completed
-Task scope: F101-e — make `ucx-sys-mini` build cleanly on hosts without
-libucx-dev installed, so that `cargo build --workspace` no longer panics
-on bare developer machines. Default-feature build path of
-`autumn-transport` already gates UCX usage; only the bindgen probe in
-ucx-sys-mini/build.rs was unconditionally fatal.
+Task scope: F102 — cluster.sh per-process start/stop for recovery testing.
+Add `start-node N` / `stop-node N` / `restart-node N` / `start-ps` /
+`stop-ps` / `restart-ps` subcommands so the user can drive
+manager-side recovery dispatch and PS failover without bouncing the
+whole cluster, without re-typing flags / env vars on every cycle.
 
-Change:
-  - crates/transport/ucx-sys-mini/build.rs:
-      pkg_config::probe_library("ucx").expect(...)
-        → match { Ok(lib) => bindgen as before,
-                  Err(e)  => emit empty bindings.rs stub + cargo:warning }
-  - lib.rs untouched (the existing `include!(bindings.rs)` of an empty
-    file is a valid Rust no-op; only `pub use libc;` remains).
-  - Downstream autumn-transport `ucx` feature already gates all UCX
-    call sites with `#[cfg(feature = "ucx")]`, so no consumer-side
-    changes needed.
+Design choice (after user picked option (a)):
+  Snapshot REPLICAS + CLUSTER_MODE + every AUTUMN_* env var to
+  $DATA_ROOT/cluster_config at the end of `do_start`. Per-process
+  subcommands `source` it back, so `stop-node 2 && start-node 2`
+  reproduces the original launch line — including --3disk paths,
+  --shards / --shard-stride, AUTUMN_BIND_HOST, etc.
 
-Verification:
-  ✓ Host has libucx 1.16.0; `cargo build -p ucx-sys-mini` succeeds with
-    full bindings.
-  ✓ Simulated absence with `PKG_CONFIG_LIBDIR=/tmp/empty cargo build
-    -p ucx-sys-mini` → succeeds, warning emitted, empty stub written.
-  ✓ Simulated absence at workspace level (`--workspace --exclude
-    autumn-fuse`) → succeeds. autumn-fuse excluded because libfuse-dev
-    is also missing on this host — that is a parallel pkg-config
-    fragility (fuser crate's build.rs panics the same way), separate
-    from F101-e and worth a follow-up.
+Change set (cluster.sh only — no Rust source touched this session):
+  - 6 new helpers introduced above do_start: compute_shard_config /
+    launch_extent_node / register_extent_node / launch_ps /
+    save_cluster_config / load_cluster_config.
+  - do_start refactored to call those helpers (behavior-preserving;
+    dropped the inline shards/loop + register-loop + PS launch block).
+  - 4 new subcommand functions: do_start_node / do_stop_node /
+    do_start_ps / do_stop_ps with guard rails (already-running
+    detection, REPLICAS bounds check, missing-N usage error).
+  - Main dispatcher: 6 new cases (start-node / stop-node / restart-node
+    / start-ps / stop-ps / restart-ps). The integer positional parser
+    grew an `ARG_INT_PROVIDED` flag so per-process subcommands can
+    require an explicit N instead of silently defaulting to 1.
+  - Mode validation (--3disk vs replicas==3, --multidisk-1node vs
+    replicas==1) is now only enforced for start/restart/reset; the
+    per-process subcommands inherit MODE from the snapshot.
+  - Help text rewritten with two sections (Cluster / Per-process).
 
-Behavior matrix:
-  | Host env             | Command                                   | Result   |
-  |----------------------|-------------------------------------------|----------|
-  | no libucx, no flag   | cargo build -p ucx-sys-mini               | ✓ stub   |
-  | no libucx, no flag   | cargo build (default-members only)        | ✓        |
-  | no libucx, no flag   | cargo build --workspace                   | ✓ (mod.  |
-  |                      |                                           | autumn-  |
-  |                      |                                           | fuse)    |
-  | no libucx, --features ucx                                          | ✗ link   |
-  | with libucx, --features ucx                                        | ✓ full   |
+README.md: added a "Per-process control (recovery testing)" subsection
+under `## Dev Cluster Script (cluster.sh)` documenting the new commands
+and the snapshot prerequisite.
+
+feature_list.md: added F102 entry under P3 (Developer Experience &
+Operations) with target / evidence / verification log / acceptance
+gates / passes status.
+
+Verification (this session, on 1-replica cluster):
+  ✓ `clean → start 1` — fresh cluster ready, partition 0 listener up
+    on :9201.
+  ✓ `cat /tmp/autumn-rs/cluster_config` shows REPLICAS=1 +
+    CLUSTER_MODE=default (no AUTUMN_* envs were active so the AUTUMN_
+    section is empty — correct).
+  ✓ `stop-node 1` kills node1; `status` shows node1 absent, rest
+    RUNNING.
+  ✓ `start-node 1` relaunches node1; manager returns
+    `node_id=1, addr=127.0.0.1:9101` (re-registration path in
+    handle_register_node hits, node_id reused).
+  ✓ `stop-ps` kills PS; `status` shows ps NOT STARTED.
+  ✓ Guards: `start-node 1` while running →
+    `ERROR: node1 already running (pid …)`, exit 1.
+  ✓ Guards: `start-node 5` with REPLICAS=1 in snapshot →
+    `ERROR: node5 exceeds REPLICAS=1 …`, exit 1.
+  ✓ Guards: `stop-node` (no arg) →
+    `ERROR: usage: cluster.sh stop-node <N>`, exit 1.
+  ✓ `bash -n cluster.sh` clean; `cluster.sh help` text correct.
 
 Acceptance:
-  (a) ✓ Default workspace builds need no libucx install
-  (b) ✓ Explicit --features ucx without libucx still fails loudly
-       (correct signal: install libucx-dev)
-  (c) ✓ links = "ucp" Cargo manifest field untouched — only the build
-       script's link-lib emission changes, which is automatically tied
-       to the pkg_config probe path
-  (d) ✓ No source-code change in transport / rpc / partition-server /
-       stream — pure build-script refactor
+  (a) ✓ Existing full-cluster commands (start [N] / stop / restart [N]
+       / clean / reset [N] / status / logs) behave identically — they
+       call the same helpers do_start always called inline.
+  (b) ✓ `stop-node N` / `start-node N` / `restart-node N` work for
+       individual extent-nodes; relies on the (already shipped)
+       handle_register_node re-registration path so manager doesn't
+       reject the duplicate addr.
+  (c) ✓ `stop-ps` works for partition server.
+  (d) ⚠ `start-ps` against an already-bootstrapped cluster reproduces
+       the F099-K port-1 bug (see below). Not tested as a positive
+       case this session for that reason; left as F102-followup.
 
-Follow-up (separate task, F101-f candidate):
-  - autumn-fuse has `default = ["fuse"]` and pulls `fuser` which
-    panics in its build.rs when libfuse-dev is absent. Same fragility
-    as ucx-sys-mini pre-F101-e but in a 3rd-party crate, so the fix
-    has to be a feature-gate flip (default = []) or workspace-level
-    exclusion, not a build.rs rewrite.
+Known follow-up — F102-followup / F099-K-fix:
+  `partition_server.rs` binary calls
+  `PartitionServer::connect_with_advertise(...)` then `ps.serve(addr)`.
+  `connect_with_advertise` → `finish_connect` → `sync_regions_once`
+  runs BEFORE `serve()` calls `bind_listen_addr`, so on a restart
+  (where manager etcd already knows about partitions), open_partition
+  fires with `base_port == 0` and binds the per-partition listener to
+  `0.0.0.0:1` instead of `:9201`. The fix is a one-liner —
+  the `connect_with_advertise_and_port` variant already exists for
+  exactly this case (lib.rs:661-670, calls bind_listen_addr BEFORE
+  finish_connect):
+
+    let ps = PartitionServer::connect_with_advertise_and_port(
+        args.psid, &args.manager, Some(advertise), addr,
+    ).await?;
+
+  This bug also makes `cluster.sh restart` fail at the
+  "wait_port 9201 partition 0 listener" step, not just `start-ps`.
+  Diagnosed earlier this session via `lsof -p <ps>` showing
+  `TCP *:1 (LISTEN)`.
 
 Next steps when user resumes:
-  - Optionally apply the parallel fix to autumn-fuse so
-    `cargo build --workspace` works on a fully bare host.
-  - F100-UCX gate (c) cross-host A/B remains the only path to actual
-    RDMA throughput numbers.
+  - Apply the F099-K one-liner to `crates/server/src/bin/partition_server.rs`,
+    rebuild, then re-verify `cluster.sh restart` AND `cluster.sh start-ps`
+    on an already-bootstrapped cluster as the missing F102 acceptance gate.
+  - Optional: extend per-process control to cover etcd / manager
+    if the user needs to inject control-plane failures too.
