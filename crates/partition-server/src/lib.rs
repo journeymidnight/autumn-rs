@@ -646,18 +646,18 @@ impl PartitionServer {
         self.current_mgr.set(next);
     }
 
-    /// F099-K test-harness affordance: same as `connect_with_advertise`
-    /// except the caller additionally supplies the first-partition listen
-    /// address so `base_port` + `advertise_host` are populated BEFORE
+    /// F099-K: caller supplies the first-partition listen address up front
+    /// so `base_port` + `advertise_host` are populated BEFORE
     /// `finish_connect()` runs its implicit `sync_regions_once()`.
     ///
-    /// The production binary (`autumn-ps`) does NOT need this path
-    /// because no partitions are registered at connect time — by the
-    /// time `serve()` is called, `base_port` is set and
-    /// `region_sync_loop` opens partitions with a valid listener port.
-    /// Tests, however, `upsert_partition` with the manager BEFORE
-    /// connecting the PS, so the implicit sync fires `open_partition`
-    /// immediately and needs `base_port` pre-set.
+    /// **Required for any caller that may see existing partitions on connect**,
+    /// including the production binary (`autumn-ps`) on restart: when
+    /// partitions are already registered with the manager, `sync_regions_once`
+    /// fires `open_partition` immediately, and `open_partition` needs a valid
+    /// `base_port`. Earlier comments here claimed the production binary could
+    /// use `connect_with_advertise` because no partitions exist at connect
+    /// time — that's only true on fresh bootstrap. On restart the first
+    /// partition would otherwise bind to port `0 + 1 = 1`.
     pub async fn connect_with_advertise_and_port(
         ps_id: u64,
         manager_endpoint: &str,

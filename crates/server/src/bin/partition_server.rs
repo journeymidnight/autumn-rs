@@ -166,9 +166,18 @@ async fn main() -> Result<()> {
         args.port,
     );
 
-    let ps = PartitionServer::connect_with_advertise(args.psid, &args.manager, Some(advertise))
-        .await
-        .context("connect partition server")?;
+    // F099-K fix: use `_and_port` so `base_port` is set BEFORE `finish_connect`'s
+    // implicit `sync_regions_once()` runs `open_partition`. On restart, partitions
+    // already exist in the manager — without this, `open_partition` reads
+    // `base_port = 0` and binds the first partition to port `0 + 1 = 1`.
+    let ps = PartitionServer::connect_with_advertise_and_port(
+        args.psid,
+        &args.manager,
+        Some(advertise),
+        addr,
+    )
+    .await
+    .context("connect partition server")?;
 
     tracing::info!("autumn-ps ready (F099-K: per-partition listeners; first partition on {addr})");
 
