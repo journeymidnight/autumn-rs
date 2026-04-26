@@ -1,135 +1,111 @@
 Date: 2026-04-26
 TaskStatus: completed
-Task scope: F105 + F106 + F107 — three-fix bundle to unblock GC on the
-user's running 4-partition cluster (extent 10 = 3.0 GiB CoW-shared
-log_stream extent that auto-GC has been failing to reclaim every 30s
-for hours with `Invalid argument (os error 22)`).
+Task scope: F108 — manager `EtcdClient` panics with `RefCell already
+borrowed` under concurrent RPCs (hit live by the user as the 4-partition
+GC race against shared extent 10).
 
-Root cause (verified by code-reading + Go reference + live PS log):
+Root cause (verified by code-reading + Go reference + reproduced in test):
 
-  F105 — `StreamClient::read_bytes_from_extent` issues one `pread(file,
-    offset, length)` syscall per RPC. macOS caps `pread` at INT_MAX
-    (~2 GiB); Linux at 0x7ffff000. The user's GC tries to read 3.0 GiB
-    in one shot → server-side EINVAL. Same code path is used by
-    `recover_partition` (lib.rs:2381) — recovery would fail to open
-    any partition with a >2 GiB sealed extent on the next PS restart.
-    "Ticking time bomb": currently extent 42 is open at 2.9 GiB; once
-    it seals it'll join extent 10 in the unrecoverable bucket.
+  `crates/etcd/src/lib.rs::EtcdClient::unary_call` line 200 / line 216,
+  and `LeaseKeeper::keep_alive` line 273 / line 283, all wrote
+  `self.channel.borrow_mut().call(path, body).await`. The
+  `RefMut<GrpcChannel>` guard from `borrow_mut()` was held across the
+  `.await`. On the manager's single-threaded compio runtime, when a
+  second task entered `unary_call` (or any of `put` / `get` / `txn` /
+  `delete` / `lease_grant` / `lease_revoke` — all funnel through
+  `unary_call`) while the first was still awaiting the response,
+  `borrow_mut()` panicked.
 
-  F106 — `run_gc` calls `read_bytes_from_extent(eid, 0, sealed_length)`
-    and decodes the entire returned Vec into records in memory. Peak
-    RAM ≈ sealed_length per partition. Also held `RefMut<PartitionData>`
-    across `part_sc.append.await` per record — would panic if any
-    other P-log task tried to borrow `part` during the in-flight RPC.
+  User-reported scenario: triggering `autumn-client gc` for 4 partitions
+  in quick succession (parts 26 / 32 / 20 / 15 — all sharing extent 10
+  from the F105/F106/F107 session) caused 4 concurrent
+  `handle_stream_punch_holes` invocations on the manager. Each handler
+  awaits `mirror_stream_extent_mutation → EtcdClient::txn`, and the
+  second one panicked with `already borrowed: BorrowMutError`. User
+  workaround was "GC one partition at a time"; F108 removes that.
 
-  F107 — compact loop's early-return `if tbls.len() < 2 &&
-    has_overlap == 0 { continue; }` is correct logic (matches Go
-    `range_partition/compaction.go:171-174`) but silent, and
-    `open_partition` never logged final state. Result: a user-issued
-    `compact <PARTID>` that is gated by this branch returns "compact
-    triggered" but does nothing visible. Cost in this session: ~30
-    minutes of wrong-direction debugging trying to figure out why
-    compaction wasn't running.
+  This was already a known clippy warning (FCI-01: "RefCell reference
+  held across await point (4 in autumn-etcd)") — F108 is the runtime
+  manifestation.
 
-Fix (single bundled commit):
+Fix (single commit):
 
-  F105 — `crates/stream/src/client.rs::read_bytes_from_extent`:
-    • Resolve effective length first: sealed → `ExtentInfo.sealed_length`;
-      open → new helper `commit_length_for_extent` (min over replicas).
-    • If resolved > `read_chunk_bytes()` (env
-      `AUTUMN_STREAM_READ_CHUNK_BYTES`, default 256 MiB), loop with
-      `read_replicated_with_failover` per chunk and concat.
-    • EC path (`ec_subrange_read`) untouched — per-shard reads are
-      already bounded by `sealed_length / data_shards`.
+  • `crates/etcd/src/transport.rs`:
+    - `GrpcChannel::call(&mut self, ...)` removed.
+    - New `GrpcChannel::sender(&self) -> http2::SendRequest<Full<Bytes>>`
+      returns a cheap clone of the underlying hyper sender (mpsc handle
+      + Arc — hyper's canonical idiom for HTTP/2 request multiplexing).
+    - New free function `call_with_sender(sender, path, body)` does the
+      actual gRPC POST + response-decode work. Free function (not
+      method) so callers can clone-then-drop-borrow before await.
 
-  F106 — `crates/partition-server/src/background.rs::run_gc`:
-    • Rewritten as streaming chunked carry-forward. Chunk size from
-      env `AUTUMN_PS_GC_READ_CHUNK_BYTES` (default 64 MiB; matches
-      Go's ~1000-block replayLog window).
-    • Extracted `process_gc_chunk` helper that decodes complete
-      records, returns consumed-byte count; caller carries the partial
-      tail into the next chunk.
-    • Per record: stage new log entry under a tightly-scoped
-      `borrow_mut` (seq + encode), DROP the guard, await
-      `part_sc.append`, then re-acquire `borrow_mut` to update vp head
-      and memtable. No more borrow-across-await.
-    • Final guard: non-empty carry at end-of-loop refuses to punch
-      (sealed-extent records should be byte-aligned).
+  • `crates/etcd/src/lib.rs`:
+    - `EtcdClient::unary_call`: `let mut sender = self.channel.borrow().sender();`
+      (RefCell guard dropped at `;`), then
+      `call_with_sender(&mut sender, path, body).await`. Both first
+      attempt and post-reconnect retry.
+    - `LeaseKeeper::keep_alive`: same pattern.
+    - `reconnect_shared` is unchanged — its `*channel.borrow_mut() =
+      new_channel` is synchronous (the await is on the prior
+      `GrpcChannel::connect` call), so no borrow-across-await there.
 
-  F107 — observability:
-    • `background_compact_loop` early-return now emits
-      `tracing::info!("compact part {}: skipped — tables=N, has_overlap=0
-      (...)")`.
-    • `open_partition` now emits `tracing::info!("open_partition:
-      ready", part_id, tables, sst_readers, has_overlap, max_seq,
-      vp_extent_id, vp_offset)` just before constructing PartitionData.
+  • `crates/etcd/CLAUDE.md`:
+    - "Threading Model" section adds the F108 invariant: clone the
+      sender out of the RefCell before await, never hold `RefMut`
+      across `.await`. Includes the rule for future RPC additions.
 
-Files modified:
-  • crates/stream/src/client.rs — chunked read + helpers + env knob
-  • crates/partition-server/src/background.rs — streaming run_gc +
-    process_gc_chunk + gc_streaming_tests module + compact-loop log
-  • crates/partition-server/src/lib.rs — open_partition state log
-  • crates/stream/CLAUDE.md — read_bytes_from_extent table row +
-    Programming Note 12 (F105)
-  • crates/partition-server/CLAUDE.md — run_gc section rewritten for
-    F106 streaming pattern; Crash Recovery section adds F107 + F105
-    cross-references
-  • feature_list.md — F105 / F106 / F107 entries added (passes: true)
-  • crates/manager/tests/system_gc_chunked_read.rs — new integration
-    test that forces small-chunk + small-GC-chunk via env to exercise
-    F105 + F106 paths end-to-end
+  • `crates/etcd/tests/concurrent_calls.rs` (new):
+    - `concurrent_puts_no_borrow_panic` — 8 concurrent `put` tasks on
+      one shared `Rc<EtcdClient>`; pre-F108 panics with
+      `RefCell already borrowed` at lib.rs:200, post-F108 all green.
+    - `concurrent_mixed_no_borrow_panic` — 4 puts + 4 gets concurrently.
+    - `concurrent_stress_no_borrow_panic` — 16 tasks, 1ms warmup sleep
+      to maximise interleaving.
+    - All tests skip cleanly if etcd is not at 127.0.0.1:2379.
+
+  • `feature_list.md`:
+    - F108 entry added with target / evidence / verification /
+      acceptance / notes; `passes: true` after the empirical
+      bug-reproduction round-trip below.
 
 Verification:
-  ✓ cargo build --workspace: clean (warnings pre-existing)
-  ✓ cargo test -p autumn-stream: 65/65 (10 binaries)
-  ✓ cargo test -p autumn-manager --test integration f033: pass
-  ✓ cargo test -p autumn-manager --test system_gc_chunked_read: pass
-  ✓ cargo test -p autumn-partition-server --lib gc_streaming_tests:
-    4/4 (full decode, partial tail, partial header, every-byte-split
-    round-trip)
-  ✓ cargo test -p autumn-partition-server --lib: 87 pass, 1 fails —
-    same pre-existing flaky test documented in the F104 progress
-    entry (f099i_d1_fast_path_no_fu_allocation; unrelated)
-  ⚠ Live verification on user's running cluster deferred to operator:
-    PS at PID 16053 must be restarted to pick up the new binary;
-    after restart, `autumn-client gc 26 / 32 / 20` should successfully
-    punch extent 10 (refs=4 → 0) and free 3.0 GiB physical.
+  ✓ cargo build --workspace: clean (only pre-existing warnings remain)
+  ✓ cargo test -p autumn-etcd: 6 passed across 3 suites (lib + integ +
+    doc)
+  ✓ Bug-reproduction round-trip:
+      1. `git stash` both etcd source files (revert F108).
+      2. cargo test -p autumn-etcd --test concurrent_calls →
+         0 passed; 3 failed; panics at `crates/etcd/src/lib.rs:200:28:
+         RefCell already borrowed` — exactly matches user report.
+      3. `git stash pop` (restore F108).
+      4. cargo test -p autumn-etcd --test concurrent_calls →
+         3 passed.
+  ⚠ cargo test -p autumn-manager --lib: 1 pre-existing failure
+    (`register_node_duplicate_addr_rejected` expects code=3, gets code=0
+    — manager allowing duplicate addr to register). Confirmed
+    unrelated by re-running with F108 changes stashed: same failure.
+    Tracked separately, not in F108 scope.
 
-Live cluster context (from this session's diagnosis):
-  • 4 partitions on PS 1: 15, 20, 26, 32
-  • extent 10 (3.0 GiB, refs=4) shared by all 4 log_streams
-  • extent 16 (864 MiB, refs=3) shared by parts 20, 26, 32
-  • extent 33 (623 MiB, refs=1) part 20 log_stream sealed
-  • extent 42 (2.9 GiB, OPEN, refs=1) part 15 log_stream active head
-  • PS log shows 76× `Invalid argument (os error 22)` on extent 10
-    over 14 minutes (2026-04-26T08:11:31 → 08:25:52)
+Issue 2 from the same session ("physical extent-N.dat files at
+/tmp/autumn-rs/dN/1e/ not deleted after refs→0") is **out of scope for
+F108**. It's an extent-node side cleanup concern, not manager etcd. Will
+be planned as F109 with reference to the Go `../autumn` extent-node
+implementation.
 
-Notes for future operators / ops:
-  • The Bug #2 I initially flagged ("major compact silently skipped on
-    split children") turned out NOT to be a bug — Go has the same
-    early-return. The actual situation is: at startup all 4 partitions
-    had `tables.len() < 2 && has_overlap == 0` (likely because
-    metaStream's TableLocations checkpoint only includes in-range SSTs
-    by the time the cluster reaches steady state). The space waste
-    sits entirely in logStream sealed extents and is reclaimable by
-    GC alone — no compaction needed. F107's logging makes this case
-    diagnosable.
-  • If a future user reports recovery failures with the same EINVAL
-    message, F105 is in the relevant code path. Look for "rpc status
-    Internal: Invalid argument (os error 22)" in PS logs and check
-    extent sizes via `autumn-client info` — anything sealed > 2 GiB
-    pre-F105 is suspect.
-
-Outstanding / deferred:
-  • PS restart on user's cluster + live A/B (operator-led)
-  • Architecturally cleaner fix: make `sync_regions_once` propagate
-    range changes + re-evaluate has_overlap on rg change, rather than
-    relying on F103 per-handler patching (mentioned as Notes in F103;
-    not in F105/F106/F107 scope)
+Files modified:
+  • crates/etcd/src/transport.rs — sender() clone + call_with_sender
+    free function
+  • crates/etcd/src/lib.rs — clone-before-await pattern in 4 sites
+  • crates/etcd/CLAUDE.md — Threading Model section adds F108 invariant
+  • crates/etcd/tests/concurrent_calls.rs — new (3 regression tests)
+  • feature_list.md — F108 entry added (passes: true)
+  • claude-progress.txt — this file
 
 Next steps when the user resumes:
-  • Decide whether to restart the running PS now to deploy F105/F106/F107
-  • Build release binary: `cargo build --release -p autumn-server`
-  • Restart PS; then `autumn-client gc 26 / 32 / 20 / 15`; verify
-    `info` shows extent 10 refs decrementing to 0 and being physically
-    removed from the extent list
+  • Plan F109: physical extent .dat deletion when refs→0. Reference
+    Go `../autumn` extent-node cleanup logic. Surface plan to user
+    before touching code.
+  • Optional: run F108 fix on the live cluster — restart manager
+    binary, then trigger `autumn-client gc 26 / 32 / 20 / 15` in
+    parallel and confirm no panic. (User's previous workaround of
+    sequential GC should no longer be needed.)

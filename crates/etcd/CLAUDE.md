@@ -62,6 +62,10 @@ Hand-defined in `proto.rs` using `prost::Message` derive. Only the ~15 message t
 
 Single-threaded compio (`Rc<RefCell<GrpcChannel>>`). Not Send/Sync — matches the rest of autumn-rs's compio design. Each connection is used from one thread.
 
+**Concurrent in-flight RPCs are safe (F108).** The `RefCell<GrpcChannel>` exists only so `reconnect_shared` can swap the whole channel synchronously after a fresh `connect`. Every call path **clones the underlying `http2::SendRequest`** out of the cell first (cheap — internal mpsc handle + Arc), drops the borrow, then awaits via the free function `transport::call_with_sender`. Holding `RefMut<GrpcChannel>` across `.await` would panic the next concurrent task on the same runtime with `RefCell already borrowed` — that was the F108 bug, hit by the manager when 4 partitions raced on `handle_stream_punch_holes` for a shared GC extent. Cloning the sender also preserves HTTP/2 request multiplexing, so multiple in-flight etcd RPCs pipeline over one TCP connection rather than serializing.
+
+When adding a new RPC method here, **never** write `self.channel.borrow_mut().<anything>().await`. Use `let mut sender = self.channel.borrow().sender();` (drop the borrow at the semicolon) and then `call_with_sender(&mut sender, path, body).await`.
+
 ## Dependencies
 
 - `compio` (net, time, io-compat) — async runtime + TCP

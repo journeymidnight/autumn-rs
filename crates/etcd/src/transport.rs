@@ -20,6 +20,16 @@ use hyper::client::conn::http2;
 use prost::Message;
 
 /// A single HTTP/2 connection to etcd for gRPC unary calls.
+///
+/// Holds an `http2::SendRequest` handle. The handle is `Clone` (cheaply —
+/// internally just an mpsc sender + Arc), which is hyper's canonical idiom
+/// for multiplexing concurrent requests over one HTTP/2 connection.
+///
+/// Callers should obtain a clone via [`GrpcChannel::sender`] and invoke
+/// [`call_with_sender`] **without** holding a borrow of the channel across
+/// `.await`. This is essential for `EtcdClient`, which is wrapped in
+/// `Rc<RefCell<GrpcChannel>>` for swap-on-reconnect: holding `RefMut` across
+/// an awaited gRPC call would panic the second concurrent caller (F108).
 pub struct GrpcChannel {
     sender: http2::SendRequest<Full<Bytes>>,
 }
@@ -56,56 +66,72 @@ impl GrpcChannel {
         Ok(Self { sender })
     }
 
-    /// Send a unary gRPC call and return the response body bytes.
-    pub async fn call(&mut self, path: &str, body: Bytes) -> Result<Bytes> {
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("http://etcd{path}"))
-            .version(Version::HTTP_2)
-            .header("content-type", "application/grpc")
-            .header("te", "trailers")
-            .body(Full::new(body))
-            .map_err(|e| anyhow::anyhow!("build request: {e}"))?;
-
-        let resp = self
-            .sender
-            .send_request(req)
-            .await
-            .map_err(|e| anyhow::anyhow!("send request to {path}: {e}"))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            bail!("etcd gRPC {path}: HTTP {status}");
-        }
-
-        // Check gRPC status from trailers if available
-        let (parts, body) = resp.into_parts();
-        let body_bytes = body
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("read response body for {path}: {e}"))?
-            .to_bytes();
-
-        // Check for gRPC error status in headers or trailers
-        if let Some(grpc_status) = parts.headers.get("grpc-status") {
-            let code = grpc_status.to_str().unwrap_or("?");
-            if code != "0" {
-                let msg = parts
-                    .headers
-                    .get("grpc-message")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("unknown");
-                bail!("etcd gRPC {path}: status={code} message={msg}");
-            }
-        }
-
-        Ok(body_bytes)
+    /// Cheap clone of the underlying HTTP/2 sender handle.
+    ///
+    /// Use this to drop the [`GrpcChannel`] borrow before `.await`-ing a call,
+    /// so concurrent in-flight RPCs on the same client don't panic on
+    /// `RefCell::borrow_mut`.
+    pub fn sender(&self) -> http2::SendRequest<Full<Bytes>> {
+        self.sender.clone()
     }
 
     /// Check if the HTTP/2 connection is still usable.
     pub fn is_ready(&self) -> bool {
         !self.sender.is_closed()
     }
+}
+
+/// Send a unary gRPC call on the given sender clone and return the response body bytes.
+///
+/// Free function (not a method on `GrpcChannel`) so callers can clone the
+/// sender out of a `RefCell`, drop the borrow, then await — the canonical
+/// fix for borrow-across-await on a shared `Rc<RefCell<GrpcChannel>>`.
+pub async fn call_with_sender(
+    sender: &mut http2::SendRequest<Full<Bytes>>,
+    path: &str,
+    body: Bytes,
+) -> Result<Bytes> {
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://etcd{path}"))
+        .version(Version::HTTP_2)
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(body))
+        .map_err(|e| anyhow::anyhow!("build request: {e}"))?;
+
+    let resp = sender
+        .send_request(req)
+        .await
+        .map_err(|e| anyhow::anyhow!("send request to {path}: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("etcd gRPC {path}: HTTP {status}");
+    }
+
+    // Check gRPC status from trailers if available
+    let (parts, body) = resp.into_parts();
+    let body_bytes = body
+        .collect()
+        .await
+        .map_err(|e| anyhow::anyhow!("read response body for {path}: {e}"))?
+        .to_bytes();
+
+    // Check for gRPC error status in headers or trailers
+    if let Some(grpc_status) = parts.headers.get("grpc-status") {
+        let code = grpc_status.to_str().unwrap_or("?");
+        if code != "0" {
+            let msg = parts
+                .headers
+                .get("grpc-message")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown");
+            bail!("etcd gRPC {path}: status={code} message={msg}");
+        }
+    }
+
+    Ok(body_bytes)
 }
 
 // ── Streaming support ──────────────────────────────────────────────────────

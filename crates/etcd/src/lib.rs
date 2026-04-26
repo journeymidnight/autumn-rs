@@ -16,7 +16,7 @@ use anyhow::{Result, bail};
 use prost::Message;
 
 use proto::*;
-use transport::GrpcChannel;
+use transport::{GrpcChannel, call_with_sender};
 
 /// Minimal etcd v3 client for compio runtime (single-threaded, Rc-based).
 ///
@@ -196,8 +196,12 @@ impl EtcdClient {
     ) -> Result<Resp> {
         let body = grpc_encode(req);
 
-        // First attempt on current connection.
-        match self.channel.borrow_mut().call(path, body.clone()).await {
+        // F108: clone the SendRequest out of the RefCell, then drop the borrow
+        // before awaiting. Holding `RefMut<GrpcChannel>` across `.await` would
+        // panic the next concurrent caller on the same single-threaded runtime
+        // (e.g. 4 partitions racing on `handle_stream_punch_holes`).
+        let mut sender = self.channel.borrow().sender();
+        match call_with_sender(&mut sender, path, body.clone()).await {
             Ok(resp_bytes) => return grpc_decode::<Resp>(&resp_bytes),
             Err(e) => {
                 // Connection might be dead. Try reconnecting to another endpoint.
@@ -212,8 +216,9 @@ impl EtcdClient {
         // Reconnect: try each endpoint once (round-robin from the next one).
         self.reconnect().await?;
 
-        // Retry on the new connection.
-        let resp_bytes = self.channel.borrow_mut().call(path, body).await?;
+        // Retry on the new connection (re-clone after the channel was swapped).
+        let mut sender = self.channel.borrow().sender();
+        let resp_bytes = call_with_sender(&mut sender, path, body).await?;
         grpc_decode::<Resp>(&resp_bytes)
     }
 
@@ -269,8 +274,11 @@ impl LeaseKeeper {
         let body = grpc_encode(&req);
         let path = "/etcdserverpb.Lease/LeaseKeepAlive";
 
-        // Try on current connection.
-        match self.channel.borrow_mut().call(path, body.clone()).await {
+        // F108: same fix as `EtcdClient::unary_call` — clone the sender out
+        // of the RefCell before await, so concurrent keepalives (or any
+        // future shared use of LeaseKeeper) don't panic on borrow_mut.
+        let mut sender = self.channel.borrow().sender();
+        match call_with_sender(&mut sender, path, body.clone()).await {
             Ok(resp_bytes) => return grpc_decode::<LeaseKeepAliveResponse>(&resp_bytes),
             Err(e) => {
                 tracing::warn!(error = %e, "lease keepalive failed, reconnecting");
@@ -280,7 +288,8 @@ impl LeaseKeeper {
         // Reconnect round-robin.
         reconnect_shared(&self.channel, &self.endpoints, &self.current_ep).await?;
 
-        let resp_bytes = self.channel.borrow_mut().call(path, body).await?;
+        let mut sender = self.channel.borrow().sender();
+        let resp_bytes = call_with_sender(&mut sender, path, body).await?;
         grpc_decode::<LeaseKeepAliveResponse>(&resp_bytes)
     }
 
