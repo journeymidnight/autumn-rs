@@ -101,7 +101,12 @@ async fn get_handler_inner(
 
                     if start <= end {
                         let length = end - start + 1;
-                        let slice = match get_with_range(&client, name.as_bytes(), start as u32, length as u32).await {
+                        let slice = match client
+                            .lock()
+                            .await
+                            .get_range(name.as_bytes(), start as u32, length as u32)
+                            .await
+                        {
                             Ok(Some(v)) => v,
                             Ok(None) => return error_response(StatusCode::NOT_FOUND, "not found".into()),
                             Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("get: {e}")),
@@ -132,45 +137,6 @@ async fn get_handler_inner(
         Ok(None) => error_response(StatusCode::NOT_FOUND, "not found".into()),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("get: {e}")),
     }
-}
-
-/// Sub-range get using low-level RPC (SDK get() doesn't support offset/length).
-async fn get_with_range(
-    client: &Client,
-    key: &[u8],
-    offset: u32,
-    length: u32,
-) -> Result<Option<Vec<u8>>> {
-    use autumn_rpc::partition_rpc::*;
-    use autumn_client::decode_err;
-
-    // Release the lock before the actual data transfer so concurrent Range
-    // requests (e.g. multiple browser seeks) are not serialized.
-    let (part_id, ps) = {
-        let mut guard = client.lock().await;
-        let (part_id, ps_addr) = guard.resolve_key(key).await?;
-        let ps = guard.get_ps_client(&ps_addr).await?;
-        (part_id, ps)
-    };
-    let resp_bytes = ps
-        .call(
-            MSG_GET,
-            rkyv_encode(&GetReq {
-                part_id,
-                key: key.to_vec(),
-                offset,
-                length,
-            }),
-        )
-        .await?;
-    let resp: GetResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-    if resp.code == CODE_NOT_FOUND {
-        return Ok(None);
-    }
-    if resp.code != CODE_OK {
-        anyhow::bail!("get failed: {}", resp.message);
-    }
-    Ok(Some(resp.value))
 }
 
 async fn delete_handler_inner(client: &Client, name: String) -> Response<Body> {

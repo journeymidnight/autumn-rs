@@ -493,9 +493,25 @@ impl ClusterClient {
 
     /// Get a value by key. Returns None if not found.
     pub async fn get(&mut self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
+        self.get_range(key, 0, 0).await
+    }
+
+    /// Get a sub-range of a value: bytes `[offset, offset+length)`.
+    /// `length == 0` means "from offset to the end of the value" (matches the
+    /// underlying `GetReq` semantics). Returns None if the key is not found.
+    ///
+    /// Routes through `call_ps_for_key` so the cached PS connection is dropped
+    /// on RPC error and routing is refreshed on the second attempt — same
+    /// resilience as `get`/`put`/`head` after a cluster restart.
+    pub async fn get_range(
+        &mut self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+    ) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
         let key = key.to_vec();
         let resp_bytes = self.call_ps_for_key(&key, MSG_GET, |part_id| {
-            rkyv_encode(&GetReq { part_id, key: key.clone(), offset: 0, length: 0 })
+            rkyv_encode(&GetReq { part_id, key: key.clone(), offset, length })
         }).await?;
         let resp: GetResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code == partition_rpc::CODE_NOT_FOUND {
