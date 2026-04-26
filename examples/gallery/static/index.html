@@ -308,6 +308,79 @@ header .tag {
   max-height: 500px;
   border-radius: var(--radius);
   object-fit: contain;
+  cursor: zoom-in;
+  transition: opacity 0.15s;
+}
+
+.preview-area img:hover { opacity: 0.92; }
+
+/* ── Lightbox ── */
+.lightbox {
+  position: fixed;
+  inset: 0;
+  background: rgba(5, 5, 6, 0.94);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 10001;
+  cursor: zoom-out;
+  padding: 1.5rem;
+  animation: lightbox-in 0.18s ease forwards;
+}
+
+.lightbox.active { display: flex; }
+
+.lightbox img,
+.lightbox video {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.lightbox video { background: #000; outline: none; }
+.lightbox img.hidden,
+.lightbox video.hidden { display: none; }
+
+.lightbox .lb-close {
+  position: absolute;
+  top: 1rem;
+  right: 1.25rem;
+  font-family: var(--mono);
+  font-size: 1.4rem;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0.25rem 0.6rem;
+  border-radius: 3px;
+  transition: color 0.15s, background 0.15s;
+}
+
+.lightbox .lb-close:hover { color: var(--text); background: var(--surface-raised); }
+
+.lightbox .lb-caption {
+  position: absolute;
+  bottom: 1rem;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  letter-spacing: 0.05em;
+  background: var(--surface);
+  padding: 0.3rem 0.7rem;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  max-width: 80%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes lightbox-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 .preview-area video {
@@ -353,6 +426,37 @@ header .tag {
   border-radius: 3px;
   border: 1px solid var(--border);
   z-index: 2;
+}
+
+.preview-expand {
+  position: absolute;
+  top: 0.65rem;
+  right: 0.65rem;
+  width: 28px;
+  height: 28px;
+  font-size: 1rem;
+  line-height: 1;
+  font-family: var(--mono);
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+  z-index: 2;
+  opacity: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.15s, background 0.15s, border-color 0.15s;
+}
+
+.preview-area:hover .preview-expand,
+.preview-expand:focus { opacity: 1; }
+
+.preview-expand:hover {
+  background: var(--surface-raised);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .preview-loader {
@@ -495,6 +599,13 @@ header .tag {
   </div>
 </div>
 
+<div class="lightbox" id="lightbox" role="dialog" aria-label="Media preview" aria-hidden="true">
+  <button class="lb-close" id="lbClose" type="button" aria-label="Close">×</button>
+  <img id="lbImage" alt="" class="hidden" />
+  <video id="lbVideo" controls preload="metadata" class="hidden" playsinline></video>
+  <div class="lb-caption" id="lbCaption"></div>
+</div>
+
 <div class="toast-rack" id="toastRack"></div>
 
 <script>
@@ -512,9 +623,21 @@ header .tag {
   const dlPct = $('#dlPct');
   const emptyState = $('#emptyState');
   const toastRack = $('#toastRack');
+  const lightbox = $('#lightbox');
+  const lbImage = $('#lbImage');
+  const lbVideo = $('#lbVideo');
+  const lbCaption = $('#lbCaption');
+  const lbClose = $('#lbClose');
 
   let activeFile = null;
   let files = [];
+
+  const IMAGE_EXTS = ['jpg','jpeg','png','gif','bmp','webp','svg'];
+  const VIDEO_EXTS = ['mp4','webm','ogg','mov','m4v'];
+  function extOf(name) { return name.includes('.') ? name.split('.').pop().toLowerCase() : ''; }
+  function isImage(name) { return IMAGE_EXTS.includes(extOf(name)); }
+  function isVideo(name) { return VIDEO_EXTS.includes(extOf(name)); }
+  function isMedia(name) { return isImage(name) || isVideo(name); }
 
   // ── Toast ──
   function toast(msg, type) {
@@ -647,20 +770,36 @@ header .tag {
   }
 
   // ── Keyboard navigation ──
+  // ArrowUp/ArrowDown: move through files. When the lightbox is open, only
+  // image files are visited (the lightbox shows images only) and the lightbox
+  // is updated to match the newly-selected file.
   document.addEventListener('keydown', e => {
     const tag = e.target.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA') return;
     if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
     if (!files.length) return;
     e.preventDefault();
-    const cur = activeFile ? files.indexOf(activeFile) : -1;
-    const next = e.key === 'ArrowUp'
-      ? (cur <= 0 ? 0 : cur - 1)
-      : (cur < 0 ? 0 : Math.min(files.length - 1, cur + 1));
-    if (next === cur) return;
-    selectFile(files[next]);
+
+    const lightboxOpen = lightbox.classList.contains('active');
+    const indices = lightboxOpen
+      ? files.map((n, i) => isMedia(n) ? i : -1).filter(i => i >= 0)
+      : files.map((_, i) => i);
+    if (!indices.length) return;
+
+    const curAbs = activeFile ? files.indexOf(activeFile) : -1;
+    let posInList = indices.indexOf(curAbs);
+    if (posInList < 0) posInList = e.key === 'ArrowUp' ? indices.length : -1;
+    const nextPos = e.key === 'ArrowUp'
+      ? Math.max(0, posInList - 1)
+      : Math.min(indices.length - 1, posInList + 1);
+    const nextAbs = indices[nextPos];
+    if (nextAbs === curAbs) return;
+
+    selectFile(files[nextAbs]);
     const items = fileList.querySelectorAll('.file-item');
-    if (items[next]) items[next].scrollIntoView({ block: 'nearest' });
+    if (items[nextAbs]) items[nextAbs].scrollIntoView({ block: 'nearest' });
+
+    if (lightboxOpen) openLightbox(files[nextAbs]);
   });
 
   // ── Delete ──
@@ -702,17 +841,23 @@ header .tag {
     label.textContent = name;
     previewArea.appendChild(label);
 
-    if (['jpg','jpeg','png','gif','bmp','webp','svg'].includes(ext)) {
+    if (IMAGE_EXTS.includes(ext)) {
       const img = document.createElement('img');
       img.src = url;
+      img.alt = name;
+      img.title = 'Click to enlarge';
       img.onerror = () => toast('Failed to load image', 'error');
+      img.addEventListener('click', () => openLightbox(name));
       previewArea.appendChild(img);
+      addExpandButton(name);
 
-    } else if (['mp4','webm','ogg'].includes(ext)) {
+    } else if (VIDEO_EXTS.includes(ext)) {
       const v = document.createElement('video');
       v.src = url;
       v.controls = true;
+      v.playsInline = true;
       previewArea.appendChild(v);
+      addExpandButton(name);
 
     } else if (ext === 'pdf') {
       const f = document.createElement('iframe');
@@ -741,6 +886,58 @@ header .tag {
   function showLoader() { previewLoader.classList.add('active'); dlPct.textContent = '0%'; }
   function hideLoader() { previewLoader.classList.remove('active'); }
   function updateDl(loaded, total) { dlPct.textContent = Math.round(loaded / total * 100) + '%'; }
+
+  function addExpandButton(name) {
+    const btn = document.createElement('button');
+    btn.className = 'preview-expand';
+    btn.type = 'button';
+    btn.title = 'Open in lightbox';
+    btn.setAttribute('aria-label', 'Open in lightbox');
+    btn.textContent = '⛶';
+    btn.addEventListener('click', e => { e.stopPropagation(); openLightbox(name); });
+    previewArea.appendChild(btn);
+  }
+
+  // ── Lightbox ──
+  function openLightbox(name) {
+    if (!isMedia(name)) return;
+    const url = '/get/' + encodeURIComponent(name);
+    if (isVideo(name)) {
+      lbImage.src = '';
+      lbImage.classList.add('hidden');
+      lbVideo.src = url;
+      lbVideo.classList.remove('hidden');
+      // autoplay; ignore the promise (browsers may reject without user gesture, that's fine)
+      lbVideo.play().catch(() => {});
+    } else {
+      lbVideo.pause();
+      lbVideo.src = '';
+      lbVideo.classList.add('hidden');
+      lbImage.src = url;
+      lbImage.alt = name;
+      lbImage.classList.remove('hidden');
+    }
+    lbCaption.textContent = name;
+    lightbox.classList.add('active');
+    lightbox.setAttribute('aria-hidden', 'false');
+  }
+
+  function closeLightbox() {
+    lightbox.classList.remove('active');
+    lightbox.setAttribute('aria-hidden', 'true');
+    lbImage.src = '';
+    lbVideo.pause();
+    lbVideo.src = '';
+  }
+
+  lightbox.addEventListener('click', e => {
+    // close on backdrop click, image click, or close button.
+    // video is excluded so its native controls remain usable.
+    if (e.target === lbImage || e.target === lightbox || e.target === lbClose) closeLightbox();
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && lightbox.classList.contains('active')) closeLightbox();
+  });
 
   function escHtml(s) {
     const d = document.createElement('div');
