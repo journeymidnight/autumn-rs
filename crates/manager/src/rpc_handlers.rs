@@ -144,17 +144,54 @@ impl AutumnManager {
         let req: RegisterNodeReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
+        // Re-registration: if the address is already known, reuse the existing
+        // node_id and disk_ids rather than rejecting. This allows extent nodes
+        // to recover from a restart without requiring a full cluster wipe.
+        let existing = {
+            let s = self.store.inner.borrow();
+            s.nodes
+                .values()
+                .find(|n| n.address == req.addr)
+                .map(|n| (n.clone(), n.disks.iter().filter_map(|did| s.disks.get(did).cloned()).collect::<Vec<_>>()))
+        };
+
+        if let Some((mut existing_node, existing_disks)) = existing {
+            let node_id = existing_node.node_id;
+            let uuid_map: Vec<(String, u64)> = req
+                .disk_uuids
+                .iter()
+                .filter_map(|uuid| {
+                    existing_disks
+                        .iter()
+                        .find(|d| &d.uuid == uuid)
+                        .map(|d| (uuid.clone(), d.disk_id))
+                })
+                .collect();
+
+            // Update shard_ports if the node restarted with a different config.
+            if existing_node.shard_ports != req.shard_ports {
+                existing_node.shard_ports = req.shard_ports;
+                self.store.inner.borrow_mut().nodes.insert(node_id, existing_node.clone());
+                if let Err(err) = self.mirror_register_node(&existing_node, &[]).await {
+                    return Ok(rkyv_encode(&RegisterNodeResp {
+                        code: Self::err_to_code(&err),
+                        message: err.to_string(),
+                        node_id: 0,
+                        disk_uuids: vec![],
+                    }));
+                }
+            }
+
+            return Ok(rkyv_encode(&RegisterNodeResp {
+                code: CODE_OK,
+                message: String::new(),
+                node_id,
+                disk_uuids: uuid_map,
+            }));
+        }
+
         let (node, disk_infos, uuid_map, node_id) = {
             let mut s = self.store.inner.borrow_mut();
-            if s.nodes.values().any(|n| n.address == req.addr) {
-                let err = AppError::Precondition(format!("duplicated addr {}", req.addr));
-                return Ok(rkyv_encode(&RegisterNodeResp {
-                    code: Self::err_to_code(&err),
-                    message: err.to_string(),
-                    node_id: 0,
-                    disk_uuids: vec![],
-                }));
-            }
 
             let (start, _) = s.alloc_ids((req.disk_uuids.len() + 1) as u64);
             let node_id = start;
