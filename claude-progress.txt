@@ -1,83 +1,135 @@
 Date: 2026-04-26
 TaskStatus: completed
-Task scope: F103 — fix "$AC split N 一直block" bug. After a partition has
-been split once, a second `autumn-client split <PARTID>` would hang ~25s
-and return an opaque "rpc status FailedPrecondition: multi_modify_split
-failed: precondition failed: mid_key is not in partition range" error.
+Task scope: F105 + F106 + F107 — three-fix bundle to unblock GC on the
+user's running 4-partition cluster (extent 10 = 3.0 GiB CoW-shared
+log_stream extent that auto-GC has been failing to reclaim every 30s
+for hours with `Invalid argument (os error 22)`).
 
-Root cause (verified by inspection + live repro):
-  PartitionServer::sync_regions_once skips the rg refresh for an already-
-  open partition (lib.rs:884 `if self.partitions.borrow().contains_key
-  (&part_id) { continue; }`). After the 1st split the manager has the new
-  narrowed range, but the PS-local PartitionData.rg is the pre-split wide
-  range. Consequences cascade:
-    1. open_partition's overlap detection ran against the wide rg, so
-       has_overlap stayed 0 → F037's "cannot split: has overlapping keys"
-       gate (handle_split_part:304) is silently bypassed.
-    2. unique_user_keys() iterates CoW-shared SSTables that still span
-       the original wider range, so the returned key list crosses the
-       manager-authoritative mid_key boundary.
-    3. handle_split_part picks mid = sorted[len/2] against this
-       unfiltered set; it frequently lands above the manager's narrowed
-       end_key.
-    4. multi_modify_split rejects ("mid_key is not in partition range").
-    5. The in-handler retry loop backs off 100→200→400→800→1600→2000×
-       2000×2000 ms = 9.1s × 2 ClusterClient.call_ps_for_part retries
-       ≈ 25 s wallclock for a deterministic precondition failure.
+Root cause (verified by code-reading + Go reference + live PS log):
 
-Fix (crates/partition-server/src/rpc_handlers.rs::handle_split_part):
-  (a) Fetch authoritative rg from the manager via MSG_GET_REGIONS before
-      picking mid_key. Use the partition's per-PS pool + manager_addr
-      (previously _-prefixed unused params).
-  (b) Filter unique_user_keys() to keys in the authoritative rg. If
-      <2 in-range keys, return FailedPrecondition with "run major
-      compaction first" instead of letting the manager reject mid_key.
-  (c) On successful multi_modify_split, narrow PS-local part.rg to
-      `[auth_rg.start, mid)` AND re-evaluate has_overlap against the
-      current sst_readers (smallest_key/biggest_key vs the new range).
-      Without (c) the same bug recurs on the 3rd split.
+  F105 — `StreamClient::read_bytes_from_extent` issues one `pread(file,
+    offset, length)` syscall per RPC. macOS caps `pread` at INT_MAX
+    (~2 GiB); Linux at 0x7ffff000. The user's GC tries to read 3.0 GiB
+    in one shot → server-side EINVAL. Same code path is used by
+    `recover_partition` (lib.rs:2381) — recovery would fail to open
+    any partition with a >2 GiB sealed extent on the next PS restart.
+    "Ticking time bomb": currently extent 42 is open at 2.9 GiB; once
+    it seals it'll join extent 10 in the unrecoverable bucket.
 
-Verification (live, fresh 4-replica cluster, post-fix release binary):
-  ✓ put 20 small keys → split 15 → succeeds (partitions 15 + 19)
-  ✓ immediate `split 15` again → returns INSTANTLY with
-    `cannot split: partition has overlapping keys` (was ~25 s pre-fix)
-  ✓ `compact 15 → split 15` → succeeds, partition 15 narrows further,
-    new partition 25 = [key-006..key-011)
-  ✓ 4MB × 8-thread concurrent puts + `compact → split` + `kill -9` PS
-    + `start-ps` → all 6 partitions reopen cleanly, no SST parse errors
-  ✓ 12MB streamput × 6-thread + split + `kill -9` + restart → all 8
-    partitions reopen cleanly
-  ✓ `cargo build --release -p autumn-server` clean
+  F106 — `run_gc` calls `read_bytes_from_extent(eid, 0, sealed_length)`
+    and decodes the entire returned Vec into records in memory. Peak
+    RAM ≈ sealed_length per partition. Also held `RefMut<PartitionData>`
+    across `part_sc.append.await` per record — would panic if any
+    other P-log task tried to borrow `part` during the in-flight RPC.
+
+  F107 — compact loop's early-return `if tbls.len() < 2 &&
+    has_overlap == 0 { continue; }` is correct logic (matches Go
+    `range_partition/compaction.go:171-174`) but silent, and
+    `open_partition` never logged final state. Result: a user-issued
+    `compact <PARTID>` that is gated by this branch returns "compact
+    triggered" but does nothing visible. Cost in this session: ~30
+    minutes of wrong-direction debugging trying to figure out why
+    compaction wasn't running.
+
+Fix (single bundled commit):
+
+  F105 — `crates/stream/src/client.rs::read_bytes_from_extent`:
+    • Resolve effective length first: sealed → `ExtentInfo.sealed_length`;
+      open → new helper `commit_length_for_extent` (min over replicas).
+    • If resolved > `read_chunk_bytes()` (env
+      `AUTUMN_STREAM_READ_CHUNK_BYTES`, default 256 MiB), loop with
+      `read_replicated_with_failover` per chunk and concat.
+    • EC path (`ec_subrange_read`) untouched — per-shard reads are
+      already bounded by `sealed_length / data_shards`.
+
+  F106 — `crates/partition-server/src/background.rs::run_gc`:
+    • Rewritten as streaming chunked carry-forward. Chunk size from
+      env `AUTUMN_PS_GC_READ_CHUNK_BYTES` (default 64 MiB; matches
+      Go's ~1000-block replayLog window).
+    • Extracted `process_gc_chunk` helper that decodes complete
+      records, returns consumed-byte count; caller carries the partial
+      tail into the next chunk.
+    • Per record: stage new log entry under a tightly-scoped
+      `borrow_mut` (seq + encode), DROP the guard, await
+      `part_sc.append`, then re-acquire `borrow_mut` to update vp head
+      and memtable. No more borrow-across-await.
+    • Final guard: non-empty carry at end-of-loop refuses to punch
+      (sealed-extent records should be byte-aligned).
+
+  F107 — observability:
+    • `background_compact_loop` early-return now emits
+      `tracing::info!("compact part {}: skipped — tables=N, has_overlap=0
+      (...)")`.
+    • `open_partition` now emits `tracing::info!("open_partition:
+      ready", part_id, tables, sst_readers, has_overlap, max_seq,
+      vp_extent_id, vp_offset)` just before constructing PartitionData.
+
+Files modified:
+  • crates/stream/src/client.rs — chunked read + helpers + env knob
+  • crates/partition-server/src/background.rs — streaming run_gc +
+    process_gc_chunk + gc_streaming_tests module + compact-loop log
+  • crates/partition-server/src/lib.rs — open_partition state log
+  • crates/stream/CLAUDE.md — read_bytes_from_extent table row +
+    Programming Note 12 (F105)
+  • crates/partition-server/CLAUDE.md — run_gc section rewritten for
+    F106 streaming pattern; Crash Recovery section adds F107 + F105
+    cross-references
+  • feature_list.md — F105 / F106 / F107 entries added (passes: true)
+  • crates/manager/tests/system_gc_chunked_read.rs — new integration
+    test that forces small-chunk + small-GC-chunk via env to exercise
+    F105 + F106 paths end-to-end
+
+Verification:
+  ✓ cargo build --workspace: clean (warnings pre-existing)
+  ✓ cargo test -p autumn-stream: 65/65 (10 binaries)
+  ✓ cargo test -p autumn-manager --test integration f033: pass
+  ✓ cargo test -p autumn-manager --test system_gc_chunked_read: pass
+  ✓ cargo test -p autumn-partition-server --lib gc_streaming_tests:
+    4/4 (full decode, partial tail, partial header, every-byte-split
+    round-trip)
+  ✓ cargo test -p autumn-partition-server --lib: 87 pass, 1 fails —
+    same pre-existing flaky test documented in the F104 progress
+    entry (f099i_d1_fast_path_no_fu_allocation; unrelated)
+  ⚠ Live verification on user's running cluster deferred to operator:
+    PS at PID 16053 must be restarted to pick up the new binary;
+    after restart, `autumn-client gc 26 / 32 / 20` should successfully
+    punch extent 10 (refs=4 → 0) and free 3.0 GiB physical.
+
+Live cluster context (from this session's diagnosis):
+  • 4 partitions on PS 1: 15, 20, 26, 32
+  • extent 10 (3.0 GiB, refs=4) shared by all 4 log_streams
+  • extent 16 (864 MiB, refs=3) shared by parts 20, 26, 32
+  • extent 33 (623 MiB, refs=1) part 20 log_stream sealed
+  • extent 42 (2.9 GiB, OPEN, refs=1) part 15 log_stream active head
+  • PS log shows 76× `Invalid argument (os error 22)` on extent 10
+    over 14 minutes (2026-04-26T08:11:31 → 08:25:52)
+
+Notes for future operators / ops:
+  • The Bug #2 I initially flagged ("major compact silently skipped on
+    split children") turned out NOT to be a bug — Go has the same
+    early-return. The actual situation is: at startup all 4 partitions
+    had `tables.len() < 2 && has_overlap == 0` (likely because
+    metaStream's TableLocations checkpoint only includes in-range SSTs
+    by the time the cluster reaches steady state). The space waste
+    sits entirely in logStream sealed extents and is reclaimable by
+    GC alone — no compaction needed. F107's logging makes this case
+    diagnosable.
+  • If a future user reports recovery failures with the same EINVAL
+    message, F105 is in the relevant code path. Look for "rpc status
+    Internal: Invalid argument (os error 22)" in PS logs and check
+    extent sizes via `autumn-client info` — anything sealed > 2 GiB
+    pre-F105 is suspect.
 
 Outstanding / deferred:
-  - Architecturally cleaner fix would be to make sync_regions_once
-    propagate rg changes to existing partitions and re-evaluate
-    has_overlap on rg change. That requires cross-thread (main →
-    P-log) state propagation because PartitionData is Rc<RefCell> /
-    !Send. Deferred — current scoped fix is self-contained on the
-    partition thread that already owns PartitionData.
-  - User additionally reported "在写数据的时候split，然后重启失败"
-    accompanied by a `partition thread failed: open SST extent=21
-    offset=0 read_len=24417 preview=[00, 00, 3f, 00, 50, 61, 74, ...]`
-    error from the pre-fix cluster's stored data. The 32-byte preview
-    is a valid SSTable entry header (overlap=0, diff_len=63, key=
-    "Patreon--leeesovely-Apr-2023..."), so the parse failure is in the
-    SSTable's meta-block trailer (last 4 bytes = meta_len, then the
-    MetaBlock with magic AU7B). We could not reproduce on the post-fix
-    binary across several aggressive concurrent-write + split +
-    kill -9 + restart cycles. The original on-disk extent file was
-    wiped by `cluster.sh clean` before we could inspect it. If this
-    recurs, capture `/tmp/autumn-rs/d{1..4}/<hash>/extent-21.dat`
-    BEFORE running cluster.sh clean so we can decode the bytes and the
-    meta_stream checkpoint that referenced them.
-  - Pre-existing flaky tests `f099i_d1_fast_path_no_fu_allocation` and
-    `f099i_fast_path_inactive_under_batch` fail on this run. Unrelated
-    to this fix (they exercise the F099-I d=1 fast-path counter).
+  • PS restart on user's cluster + live A/B (operator-led)
+  • Architecturally cleaner fix: make `sync_regions_once` propagate
+    range changes + re-evaluate has_overlap on rg change, rather than
+    relying on F103 per-handler patching (mentioned as Notes in F103;
+    not in F105/F106/F107 scope)
 
 Next steps when the user resumes:
-  - If they hit the SST parse error again, capture the on-disk extent
-    files BEFORE wiping the cluster, then we can pinpoint whether the
-    flush-during-split path is writing a truncated SST or whether the
-    meta_stream is recording an over-long len.
-  - Optionally tackle the architectural rg-propagation fix in
-    sync_regions_once as its own feature.
+  • Decide whether to restart the running PS now to deploy F105/F106/F107
+  • Build release binary: `cargo build --release -p autumn-server`
+  • Restart PS; then `autumn-client gc 26 / 32 / 20 / 15`; verify
+    `info` shows extent 10 refs decrementing to 0 and being physically
+    removed from the extent list

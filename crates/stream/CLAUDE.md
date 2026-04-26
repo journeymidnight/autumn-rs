@@ -369,7 +369,7 @@ sufficient (and cheaper than DashMap).
 |--------|---------|
 | `append_batch(stream_id, blocks[], must_sync)` | Concatenate multiple blocks, single append |
 | `append_batch_repeated(stream_id, block, count, must_sync)` | Repeat one block N times |
-| `read_bytes_from_extent(extent_id, offset, length)` | Read from extent; replication: try replicas in order; EC: parallel shard reads with decode |
+| `read_bytes_from_extent(extent_id, offset, length)` | Read from extent; replication: try replicas in order, **chunked at `AUTUMN_STREAM_READ_CHUNK_BYTES` (default 256 MiB)** so reads >2 GiB don't trip the per-syscall pread ceiling on macOS (INT_MAX) / Linux (0x7ffff000); EC: parallel shard reads with decode (per-shard size already bounded). `length=0` resolves to-end via `sealed_length` (sealed extents) or `commit_length_for_extent` (open extents) before chunking. |
 | `read_last_extent_data(stream_id)` | Read last non-empty extent of a stream |
 | `punch_holes(stream_id, extent_ids[])` | GC: remove extents from stream |
 | `truncate(stream_id, extent_id)` | Remove all extents before extent_id |
@@ -402,6 +402,8 @@ sufficient (and cheaper than DashMap).
 10. **Extent allocation is capped per append** — `append_payload` allows at most 3 new extent allocations per single append call (`MAX_ALLOC_PER_APPEND`). This prevents runaway empty extent creation if appends persistently fail.
 
 11. **ConnPool is single-kind (post-F093)** — `ConnPool` keys by `SocketAddr` alone; each address owns one sequential `RpcConn` on a `Rc<RefCell<Option<RpcConn>>>` (take/put pattern; if taken, a fresh connection is opened on the fly). Historical note: F087-bulk-mux introduced a `PoolKind::{Hot, Bulk}` distinction so 128 MB SSTable uploads wouldn't head-of-line-block small WAL frames on the same socket. F088 moved flush to a dedicated P-bulk OS thread with its own ConnPool + StreamClient, so the P-log SC now only carries WAL (+ rare compact writes) and the shared-socket HoL scenario no longer exists. F093 removed `PoolKind`, `set_stream_kind`, and `kind_for` as dead code.
+
+12. **Chunked reads for >2 GiB extents (F105)** — `read_bytes_from_extent` splits requests larger than `AUTUMN_STREAM_READ_CHUNK_BYTES` (default 256 MiB) into multiple per-replica RPCs and concatenates the results. Without chunking, a single `pread` of 3 GiB on the extent_node returns `EINVAL` (errno 22) — macOS caps at `INT_MAX` (~2 GiB) and Linux at `0x7ffff000`. The pre-F105 GC + recovery path slurped sealed extents in one shot via `read_bytes_from_extent(eid, 0, sealed_length)`; once a sealed log_stream extent grew past 2 GiB, GC got stuck retrying every 30 s ("rpc status Internal: Invalid argument (os error 22)") and recovery would refuse to open the partition on the next restart. `length=0` ("to end") resolves the byte count via `ExtentInfo.sealed_length` for sealed extents or `commit_length_for_extent` (min-replica) for open extents, then chunks. EC reads stay on the per-shard path (`ec_subrange_read`) — each shard is at most `sealed_length / data_shards` so the per-syscall ceiling is rarely hit there. Test override: integration tests set `AUTUMN_STREAM_READ_CHUNK_BYTES` to small values (e.g. 1024) to exercise the chunked path without writing multi-GiB extents.
 
 ---
 

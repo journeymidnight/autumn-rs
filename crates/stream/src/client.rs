@@ -214,6 +214,20 @@ fn stream_inflight_cap() -> usize {
         .unwrap_or(32)
 }
 
+/// Reads `AUTUMN_STREAM_READ_CHUNK_BYTES` (default 256 MiB). Maximum
+/// per-RPC byte count for replicated `read_bytes_from_extent` reads.
+/// Required because macOS pread tops out at INT_MAX (~2 GiB) and Linux
+/// pread tops out at 0x7ffff000 — single-shot reads above that EINVAL.
+/// Tests override via env to exercise the chunked path with small
+/// extents.
+fn read_chunk_bytes() -> u32 {
+    std::env::var("AUTUMN_STREAM_READ_CHUNK_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(256 * 1024 * 1024)
+}
+
 /// Message from public API to per-stream worker.
 enum StreamSubmitMsg {
     /// Append payload segments; worker leases offsets, fans out to 3
@@ -1410,6 +1424,15 @@ impl StreamClient {
 
     /// Read bytes from a specific extent.
     /// Pass `length=0` to read from offset to the end of the extent.
+    ///
+    /// For replicated extents, reads larger than `read_chunk_bytes()`
+    /// (default 256 MiB, env `AUTUMN_STREAM_READ_CHUNK_BYTES`) are split
+    /// transparently into multiple chunks. This is required on macOS
+    /// (pread INT_MAX) and matches Linux's per-syscall ceiling
+    /// (`0x7ffff000`); without chunking, GC and recovery fail with
+    /// EINVAL on extents > 2 GiB. EC reads keep their existing per-shard
+    /// path — shards are at most `sealed_length / data_shards` and have
+    /// their own size logic.
     pub async fn read_bytes_from_extent(
         &self,
         extent_id: u64,
@@ -1422,19 +1445,108 @@ impl StreamClient {
             return self.ec_subrange_read(extent_id, offset, length, &ex).await;
         }
 
-        let addrs = self.replica_addrs_for_extent(&ex).await?;
+        // Resolve effective length so we know when to stop chunking.
+        // length=0 ("to end") needs an explicit size: sealed_length for
+        // sealed extents, commit_length min-replica for open extents.
+        let resolved = if length == 0 {
+            let total_end = if ex.sealed_length > 0 {
+                ex.sealed_length as u32
+            } else {
+                self.commit_length_for_extent(&ex).await?
+            };
+            total_end.saturating_sub(offset)
+        } else {
+            length
+        };
 
-        let mut last_err = anyhow!("no replicas for extent {}", extent_id);
+        let chunk = read_chunk_bytes();
+        if resolved <= chunk {
+            return self.read_replicated_with_failover(&ex, offset, length).await;
+        }
+
+        let mut data: Vec<u8> = Vec::with_capacity(resolved as usize);
+        let stop = offset
+            .checked_add(resolved)
+            .ok_or_else(|| anyhow!("read_bytes_from_extent: offset+length overflows u32"))?;
+        let mut cur = offset;
+        let mut last_end: u32 = 0;
+        while cur < stop {
+            let want = (stop - cur).min(chunk);
+            let (piece, end) = self
+                .read_replicated_with_failover(&ex, cur, want)
+                .await?;
+            if piece.is_empty() {
+                break;
+            }
+            let piece_len = piece.len() as u32;
+            data.extend_from_slice(&piece);
+            cur = cur.saturating_add(piece_len);
+            last_end = end;
+            if piece_len < want {
+                // server-side has less data than requested (open extent
+                // grew slower than expected); stop early
+                break;
+            }
+        }
+        Ok((data, last_end))
+    }
+
+    /// Replicated-mode read with per-replica failover. Used both for the
+    /// single-shot small path and as the per-chunk worker for the chunked
+    /// large-extent path.
+    async fn read_replicated_with_failover(
+        &self,
+        ex: &ExtentInfo,
+        offset: u32,
+        length: u32,
+    ) -> Result<(Vec<u8>, u32)> {
+        let addrs = self.replica_addrs_for_extent(ex).await?;
+        let mut last_err = anyhow!("no replicas for extent {}", ex.extent_id);
         for addr in &addrs {
-            match self.read_shard_from_addr(addr, extent_id, offset, length).await {
+            match self
+                .read_shard_from_addr(addr, ex.extent_id, offset, length)
+                .await
+            {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     last_err = e;
-                    self.extent_info_cache.remove(&extent_id);
+                    self.extent_info_cache.remove(&ex.extent_id);
                 }
             }
         }
         Err(last_err)
+    }
+
+    /// Query commit_length on each replica, return the minimum (the
+    /// safe contiguous-prefix end). For open extents only — sealed
+    /// extents should read `ExtentInfo.sealed_length` directly.
+    async fn commit_length_for_extent(&self, ex: &ExtentInfo) -> Result<u32> {
+        let addrs = self.replica_addrs_for_extent(ex).await?;
+        let revision = self.revision;
+        let mut min_len: Option<u32> = None;
+        for addr in &addrs {
+            let req = CommitLengthReq {
+                extent_id: ex.extent_id,
+                revision,
+            };
+            let Ok(resp_bytes) = self.pool.call(addr, MSG_COMMIT_LENGTH, req.encode()).await
+            else {
+                continue;
+            };
+            let Ok(resp) = CommitLengthResp::decode(resp_bytes) else {
+                continue;
+            };
+            if resp.code != CODE_OK {
+                continue;
+            }
+            min_len = Some(min_len.map_or(resp.length, |cur| cur.min(resp.length)));
+        }
+        min_len.ok_or_else(|| {
+            anyhow!(
+                "no replica responded to commit_length for extent {}",
+                ex.extent_id
+            )
+        })
     }
 
     /// Read raw shard bytes from a single replica address via autumn-rpc.

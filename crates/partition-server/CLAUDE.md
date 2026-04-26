@@ -383,21 +383,45 @@ After minor compaction, `do_compact` is called with `major=false`.
 - Drops out-of-range keys (overlap cleanup)
 - Clears `has_overlap` flag on success
 
-### `do_compact` Logic (the core)
+### `do_compact` Logic (the core, F104 streaming)
 ```
   1. Read lock: collect SstReaders for selected tables, sort newest-first by last_seq
   2. Create MergeIterator over TableIterators
-  3. Iterate merged entries:
-       - Dedup: skip if same user_key already seen (newest wins due to merge order)
-       - Range filter: skip keys outside partition range if overlap cleanup
-       - Discard tracking: when dropping VP entries, accumulate {extent_id → bytes} in discard map
-       - Major filter: skip tombstones and expired entries
-       - Accumulate output entries, chunk into ≤128MB output SSTables
-  4. Attach discard map to the last output SSTable's MetaBlock
-  5. Write lock: atomically swap old readers/metas for new ones
-  6. Save updated TableLocations to meta_stream
-  7. If truncate_id returned: truncate row_stream up to that extent
+  3. Streaming merge loop (F104):
+       - Maintain ONE in-progress SstBuilder + Vec<(TableMeta, Arc<SstReader>)> new_readers
+       - Per item from merge.next():
+         - Dedup: skip if same user_key already seen (newest wins)
+         - Range filter: skip keys outside partition range
+         - Discard tracking: when dropping VP entries, accumulate {extent_id → bytes}
+         - Major filter: skip tombstones and expired entries
+         - If current SstBuilder size > 2 × MAX_SKIP_LIST: finalize, append
+           to row_stream, push (TableMeta, SstReader) into new_readers,
+           start a fresh builder
+         - Otherwise: SstBuilder.add(key, op, value, expires_at)
+       - After loop: attach aggregated discards to the final SstBuilder,
+         finalize, append, push to new_readers
+       - NO `chunks: Vec<(Vec<IterItem>, u64)>` accumulator — pre-F104 this
+         materialized every kept entry as a cloned IterItem (~150 B each
+         for VP-path workloads), reaching ~6 GB per partition for a 5 GB
+         SST set; with 4 partitions concurrent that compounded to ~24 GB
+         on top of input + output bytes. See F104 in feature_list.md.
+  4. Atomic swap: write lock → remove old SstReaders + tables → push
+     new_readers entries → save_table_locs_raw to meta_stream
+       (single linearization point; if we crash before this commit, new
+        SSTs in row_stream are orphan bytes and recovery loads from the
+        previous meta checkpoint — same crash semantics as pre-F104)
+  5. If truncate_id returned: truncate row_stream up to that extent
 ```
+
+### F104 — Cross-partition compaction concurrency cap
+`PartitionServer` holds an `Arc<CompactionGate>` (lib.rs); each partition's
+`background_compact_loop` calls `gate.acquire().await` BEFORE invoking
+`do_compact` and drops the permit on RAII when the call returns. Default
+parallelism = 1 (fully serialized across all partitions on this PS),
+overridable via `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM` env var, range [1, 64].
+Without this cap, `autumn-client compact ALL` against an N-partition PS
+would launch N concurrent `do_compact` calls each holding ~2× SST bytes
+in memory, multiplying per-partition peak by N.
 
 ## GC (Garbage Collection)
 
@@ -411,17 +435,42 @@ Auto-selects sealed extents with discard ratio > 40% (`GC_DISCARD_RATIO`), up to
 
 **Discard map**: Each SSTable's MetaBlock contains `HashMap<extent_id, reclaimable_bytes>`. During compaction, when a VP entry is dropped (dedup, range filter, tombstone/expiry), its extent_id and value length are added to the discard map. The GC loop aggregates across all SSTable readers.
 
-**`run_gc` for one extent**:
+**`run_gc` for one extent (F106 streaming)**:
 ```
-  1. Read full sealed extent data from log_stream
-  2. Decode WAL records (same format as local WAL)
-  3. For each record:
-       - Lookup current live version in LSM (active → imm → SSTables)
-       - If live version has a VP pointing to THIS extent at THIS offset:
-           → re-write value to new log_stream append (new extent_id, offset)
-           → insert new memtable entry with updated VP
-  4. punch_holes([old_extent_id]) on log_stream
+  1. Loop until cur >= sealed_length:
+       a. read_bytes_from_extent(eid, cur, AUTUMN_PS_GC_READ_CHUNK_BYTES)
+       b. concatenate carry + chunk → buf
+       c. process_gc_chunk(buf):
+          - decode complete records left-to-right
+          - on partial record at tail, stop; caller saves buf[consumed..]
+            as carry for the next chunk
+          - per record (if VP and in_range):
+            * lookup current live version (active → imm → SSTables)
+            * if live VP still points to (eid, offset): re-write value
+              via stream_client.append, drop borrow_mut BEFORE awaiting
+              the network RPC, then re-acquire borrow_mut to insert
+              the updated VP into the memtable
+       d. cur += chunk.len()
+  2. carry must be empty at end (sealed extent records are byte-aligned);
+     non-empty carry → refuse to punch and return error
+  3. punch_holes([eid]) on log_stream → manager decrements refs;
+     extent is physically freed when refs → 0 across all CoW-shared streams
 ```
+
+Pre-F106 (~commit before this) `run_gc` slurped the entire sealed
+extent into one Vec via `read_bytes_from_extent(eid, 0, sealed_length)`
+and held `borrow_mut()` across the per-record `part_sc.append` await.
+Two latent bugs: (i) for sealed log_stream extents > 2 GiB, the
+extent_node `pread` failed with EINVAL (macOS INT_MAX limit), repeating
+forever every 30s GC tick — also addressed by F105 chunked reads at the
+StreamClient layer. (ii) the cross-await `RefMut` would panic if any
+other task on the P-log runtime tried to borrow `part` during the
+in-flight RPC. F106 fixes both: chunked carry-streaming (peak GC RAM
+≈ one chunk + one record) and tighter borrow scopes around the await.
+
+**Tunable**: `AUTUMN_PS_GC_READ_CHUNK_BYTES` (default 64 MiB) — chunk
+size for the streaming read inside `run_gc`. Matches Go's
+~1000-block (≈ 64 MiB) `replayLog` window in `valuelog.go::runGC`.
 
 ## Partition Split
 
@@ -480,10 +529,24 @@ overlap against its (correct) authoritative range and likewise sets
        - Large values (>4KB): VP points to record in logStream
        - Records with ts ≤ max_seq (already in SSTables) are skipped
   5. PartitionData.active = recovered memtable (preserves unflushed entries)
-  6. Spawn P-bulk OS thread (flush_worker_loop on own compio runtime)
-  7. Spawn P-log background tasks on this thread: flush_loop (dispatcher),
+  6. F107: log final state (`open_partition: ready` with tables=N,
+     sst_readers=N, has_overlap, max_seq, vp_extent_id, vp_offset) so
+     operators can correlate a user-issued `compact <PARTID>` against
+     the actual partition state — the major-compact path skips when
+     `tables.len() < 2 && has_overlap == 0` (matches Go reference;
+     correct when there's nothing to merge), but pre-F107 the silent
+     skip and missing open-time state hid this from users.
+  7. Spawn P-bulk OS thread (flush_worker_loop on own compio runtime)
+  8. Spawn P-log background tasks on this thread: flush_loop (dispatcher),
      compact_loop, gc_loop, write_loop, dispatch_rpc
 ```
+
+**F105 chunked reads also apply here**: the logStream replay step reads
+each extent via `read_bytes_from_extent(eid, start_off, 0)`. Pre-F105
+this would EINVAL on a >2 GiB sealed extent and prevent the partition
+from opening at all — the GC failure was the visible symptom, but the
+recovery failure was a ticking time bomb. F105's chunking inside
+`StreamClient::read_bytes_from_extent` covers both paths transparently.
 
 ## Fault Recovery: LockedByOther Self-Eviction
 

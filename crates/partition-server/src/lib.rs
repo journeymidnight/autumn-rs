@@ -95,6 +95,77 @@ const COMPACT_RATIO: f64 = 0.5;
 const HEAD_RATIO: f64 = 0.3;
 const COMPACT_N: usize = 5;
 
+/// F104 — global cross-partition gate on concurrent compactions.
+///
+/// `do_compact` (background.rs) holds, at peak, both the input SSTs'
+/// `Bytes` (already in `PartitionData.sst_readers`) and the output SSTs'
+/// `Bytes` (in the `new_readers` Vec built up during the streaming loop)
+/// — roughly 2× the on-disk SST size of one partition. With N partitions
+/// running compactions concurrently on the same process this multiplies
+/// linearly. On a single PS hosting 4 partitions of ~5 GB SST each, the
+/// observed peak was ~44 GB RSS during `autumn-client compact ALL`.
+///
+/// This gate caps cross-partition compaction concurrency. Default = 1
+/// (fully serialized across partitions, matching the safe-fix lower
+/// bound). Operators with plenty of RAM can raise it via
+/// `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM` to trade memory for throughput.
+/// Range clamped to [1, 64].
+pub(crate) fn ps_major_compact_parallelism() -> usize {
+    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("AUTUMN_PS_MAJOR_COMPACT_PARALLELISM")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.clamp(1, 64))
+            .unwrap_or(1)
+    })
+}
+
+pub struct CompactionGate {
+    inflight: std::sync::atomic::AtomicUsize,
+    max_parallel: usize,
+}
+
+impl CompactionGate {
+    pub fn new(max_parallel: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inflight: std::sync::atomic::AtomicUsize::new(0),
+            max_parallel: max_parallel.max(1),
+        })
+    }
+
+    pub async fn acquire(self: &std::sync::Arc<Self>) -> CompactionPermit {
+        use std::sync::atomic::Ordering;
+        loop {
+            let cur = self.inflight.load(Ordering::Acquire);
+            if cur < self.max_parallel
+                && self
+                    .inflight
+                    .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                return CompactionPermit { gate: std::sync::Arc::clone(self) };
+            }
+            // Either at-cap or CAS lost the race; back off briefly and
+            // retry. 50 ms is short relative to compaction wallclock
+            // (seconds–minutes) and avoids hot-spinning the CPU.
+            compio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+pub struct CompactionPermit {
+    gate: std::sync::Arc<CompactionGate>,
+}
+
+impl Drop for CompactionPermit {
+    fn drop(&mut self) {
+        self.gate
+            .inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MVCC internal-key helpers
 // ---------------------------------------------------------------------------
@@ -628,6 +699,9 @@ pub struct PartitionServer {
     /// address. Defaults to `127.0.0.1` if `--advertise` is omitted or
     /// is not parseable as `host:port`.
     advertise_host: Rc<std::cell::RefCell<String>>,
+    /// F104 — global cap on simultaneous compactions across partitions
+    /// hosted by this PS process. See `CompactionGate` docs above.
+    compact_gate: std::sync::Arc<CompactionGate>,
 }
 
 impl PartitionServer {
@@ -724,6 +798,7 @@ impl PartitionServer {
                             advertise_host: Rc::new(std::cell::RefCell::new(
                                 String::from("127.0.0.1"),
                             )),
+                            compact_gate: CompactionGate::new(ps_major_compact_parallelism()),
                         };
                         return Ok(server);
                     } else if resp.code == manager_rpc::CODE_NOT_LEADER {
@@ -952,6 +1027,7 @@ impl PartitionServer {
         let manager_addr_for_thread = manager_addr.clone();
         let owner_key_for_thread = owner_key.clone();
         let advertise_addr_for_thread = advertise_addr.clone();
+        let compact_gate_for_thread = self.compact_gate.clone();
         let join = std::thread::Builder::new()
             .name(format!("part-{part_id}"))
             .spawn(move || {
@@ -971,6 +1047,7 @@ impl PartitionServer {
                         advertise_addr_for_thread,
                         ready_tx,
                         shutdown_rx,
+                        compact_gate_for_thread,
                     )
                     .await
                     {
@@ -1596,6 +1673,7 @@ async fn partition_thread_main(
     advertise_addr: String,
     ready_tx: oneshot::Sender<Result<()>>,
     shutdown_rx: oneshot::Receiver<()>,
+    compact_gate: std::sync::Arc<CompactionGate>,
 ) -> Result<()> {
     // F099-J: create the same-thread ps-conn ↔ merged_partition_loop
     // channel. Both endpoints live on THIS compio runtime, so sends and
@@ -1672,6 +1750,19 @@ async fn partition_thread_main(
         }
     };
 
+    // F107 observability: surface initial state so operators can tell
+    // whether a user-triggered `compact <PARTID>` will actually run.
+    tracing::info!(
+        part_id,
+        tables = tables.len(),
+        sst_readers = sst_readers.len(),
+        has_overlap = detected_overlap as u32,
+        max_seq,
+        vp_extent_id = vp_eid,
+        vp_offset = vp_off,
+        "open_partition: ready"
+    );
+
     let part = Rc::new(RefCell::new(PartitionData {
         rg,
         active: recovered_active,
@@ -1716,8 +1807,9 @@ async fn partition_thread_main(
     }
     {
         let p = part.clone();
+        let gate = compact_gate.clone();
         compio::runtime::spawn(async move {
-            background_compact_loop(part_id, p, compact_rx).await;
+            background_compact_loop(part_id, p, compact_rx, gate).await;
         })
         .detach();
     }

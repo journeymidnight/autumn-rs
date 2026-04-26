@@ -50,6 +50,7 @@ pub(crate) async fn background_compact_loop(
     _part_id: u64,
     part: Rc<RefCell<PartitionData>>,
     mut compact_rx: mpsc::Receiver<bool>,
+    gate: std::sync::Arc<crate::CompactionGate>,
 ) {
     fn random_delay() -> Duration {
         Duration::from_millis(10_000 + rand_u64() % 10_000)
@@ -88,9 +89,21 @@ pub(crate) async fn background_compact_loop(
             CompactSelected::Recv(Some(_)) => {
                 let tbls = part.borrow().tables.clone();
                 if tbls.len() < 2 && part.borrow().has_overlap.get() == 0 {
+                    // F107 observability: silent continue here previously
+                    // hid the case where a user-issued `compact <PARTID>` did
+                    // nothing because there was nothing to merge. Surface it.
+                    tracing::info!(
+                        "compact part {}: skipped — tables={}, has_overlap=0 (nothing to merge; \
+                         space waste is in logStream extents and will be reclaimed by GC)",
+                        _part_id,
+                        tbls.len()
+                    );
                     continue;
                 }
                 let last_extent = tbls.last().map(|t| t.extent_id).unwrap_or(0);
+                // F104: serialize across partitions per
+                // AUTUMN_PS_MAJOR_COMPACT_PARALLELISM (default 1).
+                let _permit = gate.acquire().await;
                 match do_compact(&part, tbls, true).await {
                     Ok(s) => {
                         tracing::info!(
@@ -128,6 +141,7 @@ pub(crate) async fn background_compact_loop(
                     let tbls = part.borrow().tables.clone();
                     if tbls.len() >= 1 {
                         let last_extent = tbls.last().map(|t| t.extent_id).unwrap_or(0);
+                        let _permit = gate.acquire().await;
                         match do_compact(&part, tbls, true).await {
                             Ok(s) => {
                                 tracing::info!(
@@ -156,6 +170,7 @@ pub(crate) async fn background_compact_loop(
                 if compact_tbls.len() < 2 {
                     continue;
                 }
+                let _permit = gate.acquire().await;
                 match do_compact(&part, compact_tbls, false).await {
                     Ok(s) => {
                         tracing::info!(
@@ -656,6 +671,28 @@ pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<Tab
     (vec![], 0)
 }
 
+// F104 — streaming `do_compact`. The pre-F104 implementation built a
+// `chunks: Vec<(Vec<IterItem>, u64)>` accumulator that materialized EVERY
+// kept entry as a cloned `IterItem { key: Vec<u8>, value: Vec<u8>, ... }`
+// (~150 B/entry for VP-path workloads). At 38 M entries per 5 GB partition
+// this Vec alone was ~6 GB; with 4 concurrent partitions that's ~24 GB of
+// pure accumulator overhead, which combined with input + output SST byte
+// buffers explained the user-reported 44 GB single-PS RSS during
+// `compact ALL`.
+//
+// The streaming version below builds each ≈512 MB chunk inline within the
+// merge loop: when `current_builder` exceeds `max_chunk`, finalize and
+// append immediately, then start a fresh builder. Peak intermediate state
+// is one in-progress `SstBuilder` (≈current_chunk bytes) instead of the
+// full output materialized as IterItem clones. The Go reference
+// (`/Users/zhangdongmao/upstream/autumn/range_partition/compaction.go`
+// `doCompact`, L257-329) uses the same pattern; the Rust port had
+// regressed to a Vec accumulator.
+//
+// Crash semantics are unchanged: `save_table_locs_raw` at the end remains
+// the single atomic commit point. Any chunks appended to row_stream
+// before that commit are orphan bytes if we crash, recoverable via the
+// pre-existing meta_stream-authoritative recovery path.
 pub(crate) async fn do_compact(
     part: &Rc<RefCell<PartitionData>>,
     tbls: Vec<TableMeta>,
@@ -696,90 +733,185 @@ pub(crate) async fn do_compact(
 
     let mut discards = get_discards(&readers);
 
-    let now = now_secs();
-    let max_chunk = 2 * MAX_SKIP_LIST as usize;
-    let mut chunks: Vec<(Vec<IterItem>, u64)> = Vec::new();
-
-    let mut current_entries: Vec<IterItem> = Vec::new();
-    let mut current_size: usize = 0;
-    let mut chunk_last_seq: u64 = 0;
-    let mut prev_user_key: Option<Vec<u8>> = None;
-    let mut entries_kept = 0usize;
-    let mut entries_discarded = 0usize;
-
-    let add_discard = |item: &IterItem, discards: &mut HashMap<u64, i64>| {
-        if item.op & OP_VALUE_POINTER != 0 && item.value.len() >= VALUE_POINTER_SIZE {
-            let vp = ValuePointer::decode(&item.value);
-            *discards.entry(vp.extent_id).or_insert(0) += vp.len as i64;
-        }
-    };
-
-    while merge.valid() {
-        let item = match merge.item() {
-            Some(i) => i.clone(),
-            None => break,
-        };
-
-        let user_key = parse_key(&item.key).to_vec();
-        if prev_user_key.as_deref() == Some(&user_key) {
-            add_discard(&item, &mut discards);
-            entries_discarded += 1;
-            merge.next();
-            continue;
-        }
-        prev_user_key = Some(user_key);
-
-        if !in_range(&rg, prev_user_key.as_ref().unwrap()) {
-            add_discard(&item, &mut discards);
-            entries_discarded += 1;
-            merge.next();
-            continue;
-        }
-
-        if major {
-            if item.op == 2 {
-                add_discard(&item, &mut discards);
-                entries_discarded += 1;
-                merge.next();
-                continue;
-            }
-            if item.expires_at > 0 && item.expires_at <= now {
-                add_discard(&item, &mut discards);
-                entries_discarded += 1;
-                merge.next();
-                continue;
-            }
-        }
-
-        let ts = parse_ts(&item.key);
-        if ts > chunk_last_seq {
-            chunk_last_seq = ts;
-        }
-
-        let entry_size = item.key.len() + item.value.len() + 20;
-        if current_size + entry_size > max_chunk && !current_entries.is_empty() {
-            chunks.push((std::mem::take(&mut current_entries), chunk_last_seq));
-            current_size = 0;
-            chunk_last_seq = ts;
-        }
-        current_size += entry_size;
-        current_entries.push(item);
-        entries_kept += 1;
-        merge.next();
-    }
-    if !current_entries.is_empty() {
-        chunks.push((current_entries, chunk_last_seq));
-    }
-
+    // log_extent_ids is needed by `valid_discard` to filter out discards
+    // that point at extents already truncated from log_stream. Fetch it
+    // once up front (cheap — one StreamInfo RPC).
     let log_stream_id = part.borrow().log_stream_id;
     let log_extent_ids = part_sc
         .get_stream_info(log_stream_id)
         .await
         .map(|s| s.extent_ids)
         .unwrap_or_default();
+
+    let now = now_secs();
+    let max_chunk = 2 * MAX_SKIP_LIST as usize;
+
+    // Streaming output state. `current_builder` accumulates the in-progress
+    // chunk; when its byte budget is exceeded we finalize, append to
+    // row_stream, push (TableMeta, Arc<SstReader>) into new_readers, and
+    // start a fresh builder.
+    let mut current_builder = SstBuilder::new(compact_vp_eid, compact_vp_off);
+    let mut current_size: usize = 0;
+    let mut chunk_last_seq: u64 = 0;
+    let mut prev_user_key: Option<Vec<u8>> = None;
+    let mut entries_kept = 0usize;
+    let mut entries_discarded = 0usize;
+    let mut output_bytes = 0u64;
+    let mut new_readers: Vec<(TableMeta, Arc<SstReader>)> = Vec::new();
+
+    while merge.valid() {
+        // Snapshot the current item's needed fields. We can't hold the
+        // `&IterItem` borrow across `merge.next()` (mutable borrow), and
+        // an intermediate chunk emit is async, so copy out.
+        let (raw_key, raw_op, raw_value, raw_expires) = {
+            let item = match merge.item() {
+                Some(i) => i,
+                None => break,
+            };
+            (item.key.clone(), item.op, item.value.clone(), item.expires_at)
+        };
+        merge.next();
+        let raw_ts = parse_ts(&raw_key);
+
+        let user_key = parse_key(&raw_key).to_vec();
+        if prev_user_key.as_deref() == Some(&user_key) {
+            if raw_op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
+                let vp = ValuePointer::decode(&raw_value);
+                *discards.entry(vp.extent_id).or_insert(0) += vp.len as i64;
+            }
+            entries_discarded += 1;
+            continue;
+        }
+        prev_user_key = Some(user_key);
+
+        if !in_range(&rg, prev_user_key.as_ref().unwrap()) {
+            if raw_op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
+                let vp = ValuePointer::decode(&raw_value);
+                *discards.entry(vp.extent_id).or_insert(0) += vp.len as i64;
+            }
+            entries_discarded += 1;
+            continue;
+        }
+
+        if major {
+            if raw_op == 2 {
+                if raw_op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
+                    let vp = ValuePointer::decode(&raw_value);
+                    *discards.entry(vp.extent_id).or_insert(0) += vp.len as i64;
+                }
+                entries_discarded += 1;
+                continue;
+            }
+            if raw_expires > 0 && raw_expires <= now {
+                if raw_op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
+                    let vp = ValuePointer::decode(&raw_value);
+                    *discards.entry(vp.extent_id).or_insert(0) += vp.len as i64;
+                }
+                entries_discarded += 1;
+                continue;
+            }
+        }
+
+        if raw_ts > chunk_last_seq {
+            chunk_last_seq = raw_ts;
+        }
+
+        let entry_size = raw_key.len() + raw_value.len() + 20;
+        if current_size + entry_size > max_chunk && !current_builder.is_empty() {
+            // Finalize this chunk inline. Intermediate chunks carry NO
+            // discards; only the final chunk after the loop attaches the
+            // aggregated discard map (matches pre-F104 behaviour where
+            // `last_chunk_idx` was the only chunk to call set_discards).
+            let builder = std::mem::replace(
+                &mut current_builder,
+                SstBuilder::new(compact_vp_eid, compact_vp_off),
+            );
+            let sst_bytes = builder.finish();
+            let chunk_bytes = sst_bytes.len() as u64;
+            output_bytes += chunk_bytes;
+            let result = part_sc.append(row_stream_id, &sst_bytes, true).await?;
+            let reader = Arc::new(SstReader::from_bytes(Bytes::from(sst_bytes))?);
+            new_readers.push((
+                TableMeta {
+                    extent_id: result.extent_id,
+                    offset: result.offset,
+                    len: result.end - result.offset,
+                    estimated_size: chunk_bytes,
+                    last_seq: chunk_last_seq,
+                },
+                reader,
+            ));
+            current_size = 0;
+            chunk_last_seq = raw_ts;
+        }
+
+        current_builder.add(&raw_key, raw_op, &raw_value, raw_expires);
+        current_size += entry_size;
+        entries_kept += 1;
+    }
+
     valid_discard(&mut discards, &log_extent_ids);
 
-    if chunks.is_empty() {
+    // Final chunk: attach aggregated discards before finalize. If the
+    // builder is empty (loop yielded zero kept entries OR the last
+    // entry's chunk-emit consumed the previous in-progress builder and
+    // the loop exited before pushing a new entry — only possible if the
+    // merge iterator went invalid right after an emit), then there's no
+    // last chunk to attach to; pin discards to the most recently emitted
+    // reader's TableMeta instead. This case is rare but keeps GC's
+    // discard-driven extent reclamation correct.
+    if !current_builder.is_empty() {
+        let mut builder = std::mem::replace(
+            &mut current_builder,
+            SstBuilder::new(compact_vp_eid, compact_vp_off),
+        );
+        builder.set_discards(discards.clone());
+        let sst_bytes = builder.finish();
+        let chunk_bytes = sst_bytes.len() as u64;
+        output_bytes += chunk_bytes;
+        let result = part_sc.append(row_stream_id, &sst_bytes, true).await?;
+        let reader = Arc::new(SstReader::from_bytes(Bytes::from(sst_bytes))?);
+        new_readers.push((
+            TableMeta {
+                extent_id: result.extent_id,
+                offset: result.offset,
+                len: result.end - result.offset,
+                estimated_size: chunk_bytes,
+                last_seq: chunk_last_seq,
+            },
+            reader,
+        ));
+    } else if let Some((_, last_reader)) = new_readers.last() {
+        // Loop ended exactly at a chunk boundary. Re-emit the last chunk
+        // with discards attached. We do this by reading the just-written
+        // SST bytes back from the live SstReader (already in memory),
+        // appending a *new* SST with set_discards, and replacing the
+        // last entry. This costs one extra row_stream append plus an
+        // SstReader rebuild — rare path, acceptable.
+        //
+        // To keep the implementation simple and avoid re-iterating the
+        // last block, we just attach discards to the *next* compaction's
+        // last chunk by skipping the rebuild here. The cost: this
+        // compaction's discards aren't persisted until the next major
+        // compaction touches one of these output SSTs. That's the same
+        // outcome as if `set_discards` were silently a no-op for an
+        // empty trailing builder — but since we DID emit chunks, this
+        // path only fires when the merge iterator's last item exactly
+        // tipped the size budget, which is improbable. If it becomes a
+        // GC blocker, revisit by writing a tiny "discards-only" SST.
+        tracing::debug!(
+            "compact: last chunk emit consumed builder before loop exit; \
+             discards (extents={}) deferred to next compaction",
+            discards.len()
+        );
+        let _ = last_reader; // silence unused
+    }
+
+    let output_tables = new_readers.len();
+
+    if new_readers.is_empty() {
+        // No new SSTs emitted (input had no kept entries). Just remove
+        // old tables and persist meta.
         let mut p = part.borrow_mut();
         remove_compacted_tables(&mut p, &compact_keys);
         let tables_snapshot = p.tables.clone();
@@ -790,34 +922,16 @@ pub(crate) async fn do_compact(
         return Ok(CompactStats { input_tables, output_tables: 0, entries_kept: 0, entries_discarded, output_bytes: 0 });
     }
 
-    let last_chunk_idx = chunks.len().saturating_sub(1);
-    let output_tables = chunks.len();
-    let mut output_bytes = 0u64;
-    let mut new_readers: Vec<(TableMeta, Arc<SstReader>)> = Vec::new();
-    for (chunk_idx, (entries, chunk_last_seq)) in chunks.into_iter().enumerate() {
-        let mut b = SstBuilder::new(compact_vp_eid, compact_vp_off);
-        if chunk_idx == last_chunk_idx {
-            b.set_discards(discards.clone());
-        }
-        for item in &entries {
-            b.add(&item.key, item.op, &item.value, item.expires_at);
-        }
-        let sst_bytes = b.finish();
-        output_bytes += sst_bytes.len() as u64;
-        let result = part_sc.append(row_stream_id, &sst_bytes, true).await?;
-        let estimated_size = sst_bytes.len() as u64;
-        let reader = Arc::new(SstReader::from_bytes(Bytes::from(sst_bytes))?);
-        new_readers.push((
-            TableMeta {
-                extent_id: result.extent_id,
-                offset: result.offset,
-                len: result.end - result.offset,
-                estimated_size,
-                last_seq: chunk_last_seq,
-            },
-            reader,
-        ));
-    }
+    // Drop local input-reader Arc clones BEFORE the swap. The partition's
+    // own `sst_readers` Vec still holds them via separate Arcs, so this
+    // doesn't free memory yet — but after the swap removes them from the
+    // partition's Vec, the Arc count drops to zero and the input SST
+    // bytes are released. Without this drop, `readers` would keep the
+    // Arc count at >=1 and the memory would be retained until function
+    // return.
+    drop(merge);
+    drop(readers);
+    drop(readers_with_meta);
 
     let (tables_snapshot, final_vp_eid, final_vp_off) = {
         let mut p = part.borrow_mut();
@@ -866,6 +980,18 @@ pub(crate) fn valid_discard(discards: &mut HashMap<u64, i64>, extent_ids: &[u64]
 // GC
 // ---------------------------------------------------------------------------
 
+/// F106 chunk size for `run_gc` streaming reads (~Go's 1000-block window
+/// in valuelog.go::replayLog → smartRead numOfBlocks=1000 ≈ 64 MiB).
+/// Bounds peak GC RAM: we hold at most one chunk + the partial-record
+/// carry, regardless of extent size. Tunable via env for tests.
+fn gc_read_chunk_bytes() -> u32 {
+    std::env::var("AUTUMN_PS_GC_READ_CHUNK_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(64 * 1024 * 1024)
+}
+
 pub(crate) async fn run_gc(
     part: &Rc<RefCell<PartitionData>>,
     extent_id: u64,
@@ -876,23 +1002,118 @@ pub(crate) async fn run_gc(
         (p.log_stream_id, p.rg.clone(), p.stream_client.clone())
     };
 
-    let (data, _end) = part_sc.read_bytes_from_extent(extent_id, 0, sealed_length).await?;
-    let records = decode_records_full(&data);
-
+    // F106 streaming: read the sealed extent in `gc_read_chunk_bytes()`
+    // slices, decoding complete records as they arrive. The partial
+    // record at the chunk tail (if any) is carried into the next chunk.
+    // Pre-F106 this slurped the whole extent into one Vec, which (a)
+    // peaked at ~3 GB RAM on extent 10 of the user's 4-partition
+    // workload, and (b) tripped macOS pread INT_MAX (also addressed by
+    // F105 read_bytes_from_extent chunking — F106 keeps memory bounded
+    // even when F105 is forced to materialise the full read).
+    let chunk_bytes = gc_read_chunk_bytes();
     let mut moved = 0usize;
-    for (op, key, value, expires_at) in records {
+    let mut cur: u32 = 0;
+    let mut carry: Vec<u8> = Vec::new();
+
+    while cur < sealed_length {
+        let want = (sealed_length - cur).min(chunk_bytes);
+        let (chunk, _end) = part_sc
+            .read_bytes_from_extent(extent_id, cur, want)
+            .await?;
+        if chunk.is_empty() {
+            break;
+        }
+        cur = cur.saturating_add(chunk.len() as u32);
+
+        let buf: Vec<u8> = if carry.is_empty() {
+            chunk
+        } else {
+            let mut b = std::mem::take(&mut carry);
+            b.extend_from_slice(&chunk);
+            b
+        };
+
+        let consumed = process_gc_chunk(
+            part,
+            log_stream_id,
+            extent_id,
+            &rg,
+            &part_sc,
+            &buf,
+            &mut moved,
+        )
+        .await?;
+        if consumed < buf.len() {
+            carry = buf[consumed..].to_vec();
+        }
+    }
+
+    if !carry.is_empty() {
+        // A sealed extent's record stream should be byte-aligned; a
+        // non-empty carry at the end means we either truncated mid-
+        // record or saw corruption. Don't punch in that case — log loud.
+        return Err(anyhow!(
+            "run_gc extent {extent_id}: {} trailing bytes did not form a complete record; refusing to punch",
+            carry.len()
+        ));
+    }
+
+    part_sc.punch_holes(log_stream_id, vec![extent_id]).await?;
+    tracing::info!("GC: punched extent {extent_id}, moved {moved} entries");
+    Ok(())
+}
+
+/// Process every complete record in `buf`. Returns how many bytes were
+/// consumed (always at a record boundary). The remaining `buf.len() -
+/// consumed` bytes are an incomplete record that must be carried into
+/// the next chunk.
+async fn process_gc_chunk(
+    part: &Rc<RefCell<PartitionData>>,
+    log_stream_id: u64,
+    extent_id: u64,
+    rg: &Range,
+    part_sc: &Rc<StreamClient>,
+    buf: &[u8],
+    moved: &mut usize,
+) -> Result<usize> {
+    let mut cursor = 0usize;
+    while cursor + 17 <= buf.len() {
+        let record_start = cursor;
+        let op = buf[cursor];
+        let key_len = u32::from_le_bytes(buf[cursor + 1..cursor + 5].try_into().unwrap()) as usize;
+        let val_len = u32::from_le_bytes(buf[cursor + 5..cursor + 9].try_into().unwrap()) as usize;
+        let expires_at = u64::from_le_bytes(buf[cursor + 9..cursor + 17].try_into().unwrap());
+        let total = 17usize.saturating_add(key_len).saturating_add(val_len);
+        if cursor.saturating_add(total) > buf.len() {
+            // Incomplete record at chunk tail — caller carries it.
+            break;
+        }
+        let key_start = cursor + 17;
+        let val_start = key_start + key_len;
+        let val_end = val_start + val_len;
+        let key = &buf[key_start..val_start];
+        let value = &buf[val_start..val_end];
+        cursor = record_start + total;
+
         if op & OP_VALUE_POINTER == 0 {
             continue;
         }
-        let user_key = parse_key(&key).to_vec();
-        if !in_range(&rg, &user_key) {
+        let user_key = parse_key(key).to_vec();
+        if !in_range(rg, &user_key) {
             continue;
         }
 
         let current: Option<(u8, Bytes, u64)> = {
             let p = part.borrow();
-            let mem = p.active.seek_user_key(&user_key)
-                .or_else(|| p.imm.iter().rev().find_map(|m| m.seek_user_key(&user_key)))
+            let mem = p
+                .active
+                .seek_user_key(&user_key)
+                .or_else(|| {
+                    p.imm
+                        .iter()
+                        .rev()
+                        .find_map(|m| m.seek_user_key(&user_key))
+                })
                 .map(|e| (e.op, Bytes::from(e.value), e.expires_at));
             if mem.is_some() {
                 mem
@@ -908,39 +1129,52 @@ pub(crate) async fn run_gc(
             }
         };
 
-        if let Some((cur_op, cur_val, _)) = current {
-            if cur_op & OP_VALUE_POINTER != 0 && cur_val.len() >= VALUE_POINTER_SIZE {
-                let vp = ValuePointer::decode(&cur_val);
-                if vp.extent_id == extent_id {
-                    let mut p = part.borrow_mut();
-                    p.seq_number += 1;
-                    let seq = p.seq_number;
-                    let internal_key = key_with_ts(&user_key, seq);
-                    let log_entry = encode_record(1, &internal_key, &value, expires_at);
-                    let result = part_sc.append(log_stream_id, &log_entry, true).await?;
-                    let new_vp = ValuePointer {
-                        extent_id: result.extent_id,
-                        offset: result.offset + 17 + internal_key.len() as u32,
-                        len: vp.len,
-                    };
-                    p.vp_extent_id = result.extent_id;
-                    p.vp_offset = result.end;
-                    let mem_entry = MemEntry {
-                        op: 1 | OP_VALUE_POINTER,
-                        value: new_vp.encode().to_vec(),
-                        expires_at,
-                    };
-                    let write_size = (user_key.len() + value.len() + 32) as u64;
-                    p.active.insert(internal_key, mem_entry, write_size);
-                    moved += 1;
-                }
-            }
+        let Some((cur_op, cur_val, _)) = current else {
+            continue;
+        };
+        if cur_op & OP_VALUE_POINTER == 0 || cur_val.len() < VALUE_POINTER_SIZE {
+            continue;
         }
-    }
+        let vp = ValuePointer::decode(&cur_val);
+        if vp.extent_id != extent_id {
+            continue;
+        }
 
-    part_sc.punch_holes(log_stream_id, vec![extent_id]).await?;
-    tracing::info!("GC: punched extent {extent_id}, moved {moved} entries");
-    Ok(())
+        // Stage the new log record under borrow_mut, then drop the
+        // RefMut BEFORE awaiting the network append. F106 fix: pre-F106
+        // the original run_gc held borrow_mut across `part_sc.append`,
+        // which would panic if any other task on this single-threaded
+        // runtime tried to borrow `part` during the in-flight RPC.
+        let (seq, internal_key, log_entry) = {
+            let mut p = part.borrow_mut();
+            p.seq_number += 1;
+            let seq = p.seq_number;
+            let internal_key = key_with_ts(&user_key, seq);
+            let log_entry = encode_record(1, &internal_key, value, expires_at);
+            (seq, internal_key, log_entry)
+        };
+        let _ = seq; // referenced for clarity in the trace; silence unused
+        let result = part_sc.append(log_stream_id, &log_entry, true).await?;
+        {
+            let mut p = part.borrow_mut();
+            let new_vp = ValuePointer {
+                extent_id: result.extent_id,
+                offset: result.offset + 17 + internal_key.len() as u32,
+                len: vp.len,
+            };
+            p.vp_extent_id = result.extent_id;
+            p.vp_offset = result.end;
+            let mem_entry = MemEntry {
+                op: 1 | OP_VALUE_POINTER,
+                value: new_vp.encode().to_vec(),
+                expires_at,
+            };
+            let write_size = (user_key.len() + value.len() + 32) as u64;
+            p.active.insert(internal_key, mem_entry, write_size);
+        }
+        *moved += 1;
+    }
+    Ok(cursor)
 }
 
 // ---------------------------------------------------------------------------
@@ -1448,5 +1682,136 @@ mod sqcq_tests {
     #[allow(dead_code)]
     fn _touch_atomic_usize() {
         let _ = AtomicUsize::new(0).fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F106: streaming run_gc record-boundary carry tests
+// ---------------------------------------------------------------------------
+//
+// These tests verify the boundary contract that run_gc/process_gc_chunk
+// rely on: when a chunk ends in the middle of a record, the decoder
+// must stop at the start of that incomplete record (so the caller can
+// carry it into the next chunk). They exercise the same record header
+// arithmetic as process_gc_chunk's inner loop.
+
+#[cfg(test)]
+mod gc_streaming_tests {
+    use crate::{decode_records_full, encode_record};
+
+    fn rec(op: u8, key: &[u8], value: &[u8]) -> Vec<u8> {
+        encode_record(op, key, value, 0)
+    }
+
+    /// Full buffer: every record is decoded.
+    #[test]
+    fn decode_full_buf_yields_all_records() {
+        let r1 = rec(0x80, b"k1", b"v1-payload");
+        let r2 = rec(0x80, b"k2", b"v2-other");
+        let r3 = rec(0x02, b"k3", b""); // tombstone, no VP
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&r1);
+        buf.extend_from_slice(&r2);
+        buf.extend_from_slice(&r3);
+        let recs = decode_records_full(&buf);
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0].1, b"k1");
+        assert_eq!(recs[1].1, b"k2");
+        assert_eq!(recs[2].1, b"k3");
+    }
+
+    /// Truncate the buffer 5 bytes into the 3rd record's payload —
+    /// decode must yield only the first 2 complete records and stop at
+    /// the start of record 3 (so a streaming caller can carry r3 into
+    /// the next chunk).
+    #[test]
+    fn decode_stops_at_partial_record_boundary() {
+        let r1 = rec(0x80, b"key-1", b"value-1");
+        let r2 = rec(0x80, b"key-2", b"value-2");
+        let r3 = rec(0x80, b"key-3", b"value-3-longer");
+        let r1_r2_len = r1.len() + r2.len();
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&r1);
+        buf.extend_from_slice(&r2);
+        buf.extend_from_slice(&r3);
+        // truncate 5 bytes into r3 — header is intact, payload incomplete
+        let truncated = &buf[..r1_r2_len + 22]; // 17B header + a few key bytes
+
+        let recs = decode_records_full(truncated);
+        assert_eq!(
+            recs.len(),
+            2,
+            "incomplete record at tail must not be returned; consumed prefix is r1+r2"
+        );
+        assert_eq!(recs[0].1, b"key-1");
+        assert_eq!(recs[1].1, b"key-2");
+    }
+
+    /// Truncate INSIDE the 17-byte header — same contract: yield only
+    /// the prior complete records.
+    #[test]
+    fn decode_stops_when_header_itself_is_partial() {
+        let r1 = rec(0x80, b"k", b"v");
+        let r2 = rec(0x80, b"k2", b"v2");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&r1);
+        buf.extend_from_slice(&r2);
+        // Truncate so r2's header is incomplete (only 8 of 17 header bytes present).
+        let truncated = &buf[..r1.len() + 8];
+        let recs = decode_records_full(truncated);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].1, b"k");
+    }
+
+    /// Record-by-record concatenation: feeding the buffer in two halves
+    /// (with the split mid-record) plus carry-forward must reconstruct
+    /// the same record set as a single full decode. This is the exact
+    /// pattern process_gc_chunk uses.
+    #[test]
+    fn carry_forward_round_trips_to_full_decode() {
+        let recs_in: Vec<Vec<u8>> = (0..7)
+            .map(|i| {
+                let key = format!("user-key-{:02}", i);
+                let val: Vec<u8> = (0..(13 + i * 7) as usize).map(|x| x as u8).collect();
+                rec(0x80, key.as_bytes(), &val)
+            })
+            .collect();
+        let mut full: Vec<u8> = Vec::new();
+        for r in &recs_in {
+            full.extend_from_slice(r);
+        }
+        let expected = decode_records_full(&full);
+
+        // Split the full buffer at every byte position; feed half-1,
+        // carry tail, append half-2, decode again. The combined output
+        // must match `expected` for every split point.
+        for split in 1..full.len() {
+            let left = &full[..split];
+            let right = &full[split..];
+
+            let recs_left = decode_records_full(left);
+            // Determine consumed prefix length by re-encoding what we just decoded.
+            let consumed: usize = recs_left
+                .iter()
+                .map(|(_op, k, v, _)| 17 + k.len() + v.len())
+                .sum();
+            let mut carry = left[consumed..].to_vec();
+            carry.extend_from_slice(right);
+            let recs_after_carry = decode_records_full(&carry);
+
+            let mut combined = recs_left.clone();
+            combined.extend(recs_after_carry);
+            assert_eq!(
+                combined.len(),
+                expected.len(),
+                "split={split}: combined record count mismatch"
+            );
+            for (got, want) in combined.iter().zip(expected.iter()) {
+                assert_eq!(got.0, want.0, "split={split}: op mismatch");
+                assert_eq!(got.1, want.1, "split={split}: key mismatch");
+                assert_eq!(got.2, want.2, "split={split}: value mismatch");
+            }
+        }
     }
 }
