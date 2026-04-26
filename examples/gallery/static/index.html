@@ -508,6 +508,69 @@ header .tag {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  z-index: 2;
+}
+
+.lightbox .lb-strip {
+  position: absolute;
+  bottom: 3rem;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100% - 3rem);
+  display: flex;
+  gap: 0.4rem;
+  padding: 0.45rem;
+  background: rgba(0, 0, 0, 0.42);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+  z-index: 2;
+  scroll-behavior: smooth;
+  cursor: default;
+}
+
+.lightbox .lb-strip:empty,
+.lightbox .lb-strip.hidden { display: none; }
+
+.lightbox .lb-strip::-webkit-scrollbar { height: 4px; }
+.lightbox .lb-strip::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 2px; }
+.lightbox .lb-strip::-webkit-scrollbar-track { background: transparent; }
+
+.lb-strip-thumb {
+  flex: 0 0 auto;
+  width: 64px;
+  height: 64px;
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.05);
+  border: 2px solid transparent;
+  transition: border-color 0.15s, transform 0.15s;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.lb-strip-thumb:hover { transform: translateY(-1px); }
+
+.lb-strip-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.lb-strip-thumb.active {
+  border-color: var(--accent);
+}
+
+.lb-strip-thumb .play-glyph {
+  font-size: 1.2rem;
+  color: rgba(255, 255, 255, 0.75);
 }
 
 @keyframes lightbox-in {
@@ -744,6 +807,7 @@ header .tag {
   <button class="lb-close" id="lbClose" type="button" aria-label="Close">×</button>
   <img id="lbImage" alt="" class="hidden" />
   <video id="lbVideo" controls preload="metadata" class="hidden" playsinline></video>
+  <div class="lb-strip" id="lbStrip" role="tablist" aria-label="Gallery thumbnails"></div>
   <div class="lb-caption" id="lbCaption"></div>
 </div>
 
@@ -770,6 +834,7 @@ header .tag {
   const lbVideo = $('#lbVideo');
   const lbCaption = $('#lbCaption');
   const lbClose = $('#lbClose');
+  const lbStrip = $('#lbStrip');
   const viewListBtn = $('#viewList');
   const viewGridBtn = $('#viewGrid');
 
@@ -895,6 +960,7 @@ header .tag {
       }
       fileList.innerHTML = '';
       names.forEach(name => fileList.appendChild(renderFileItem(name)));
+      if (lightbox.classList.contains('active')) syncStrip();
       if (cb) cb();
     };
     xhr.send();
@@ -982,17 +1048,20 @@ header .tag {
   }
 
   // ── Keyboard navigation ──
-  // ArrowUp/ArrowDown: move through files. When the lightbox is open, only
-  // image files are visited (the lightbox shows images only) and the lightbox
-  // is updated to match the newly-selected file.
+  // ↑/↓ navigate the file list; when the lightbox is open, only media files
+  // are visited and the lightbox follows the selection. ←/→ are aliases for
+  // ↑/↓ but only when the lightbox is open (left/right is intuitive in a
+  // gallery, surprising in a vertical file list).
   document.addEventListener('keydown', e => {
     const tag = e.target.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-    if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+    const lightboxOpen = lightbox.classList.contains('active');
+    const isPrev = e.key === 'ArrowUp' || (lightboxOpen && e.key === 'ArrowLeft');
+    const isNext = e.key === 'ArrowDown' || (lightboxOpen && e.key === 'ArrowRight');
+    if (!isPrev && !isNext) return;
     if (!files.length) return;
     e.preventDefault();
 
-    const lightboxOpen = lightbox.classList.contains('active');
     const indices = lightboxOpen
       ? files.map((n, i) => isMedia(n) ? i : -1).filter(i => i >= 0)
       : files.map((_, i) => i);
@@ -1000,8 +1069,8 @@ header .tag {
 
     const curAbs = activeFile ? files.indexOf(activeFile) : -1;
     let posInList = indices.indexOf(curAbs);
-    if (posInList < 0) posInList = e.key === 'ArrowUp' ? indices.length : -1;
-    const nextPos = e.key === 'ArrowUp'
+    if (posInList < 0) posInList = isPrev ? indices.length : -1;
+    const nextPos = isPrev
       ? Math.max(0, posInList - 1)
       : Math.min(indices.length - 1, posInList + 1);
     const nextAbs = indices[nextPos];
@@ -1147,12 +1216,81 @@ header .tag {
     });
   }
 
+  // ── Lightbox thumbnail strip ──
+  // We re-render the strip only when the underlying media set changes (avoids
+  // re-fetching all thumbs on every navigation). Otherwise we just toggle the
+  // .active class and scroll into view.
+  let lbStripFiles = [];
+
+  function syncStrip() {
+    const media = files.filter(isMedia);
+    const changed =
+      lbStripFiles.length !== media.length ||
+      lbStripFiles.some((f, i) => f !== media[i]);
+    if (changed) {
+      lbStripFiles = media;
+      renderStrip();
+    } else {
+      updateStripActive();
+    }
+  }
+
+  function renderStrip() {
+    lbStrip.innerHTML = '';
+    if (lbStripFiles.length <= 1) {
+      lbStrip.classList.add('hidden');
+      return;
+    }
+    lbStrip.classList.remove('hidden');
+    lbStripFiles.forEach(name => {
+      const t = document.createElement('button');
+      t.type = 'button';
+      t.className = 'lb-strip-thumb' + (name === activeFile ? ' active' : '');
+      t.dataset.name = name;
+      t.title = name;
+      t.setAttribute('aria-label', name);
+      if (isImage(name)) {
+        const img = document.createElement('img');
+        img.loading = 'lazy';
+        img.alt = '';
+        img.src = thumbUrl(name);
+        img.onerror = () => { t.innerHTML = '<span class="play-glyph">?</span>'; };
+        t.appendChild(img);
+      } else {
+        t.innerHTML = '<span class="play-glyph">▶</span>';
+      }
+      t.addEventListener('click', e => {
+        e.stopPropagation();
+        selectFile(name);
+        openLightbox(name);
+      });
+      lbStrip.appendChild(t);
+    });
+    scrollActiveStripIntoView();
+  }
+
+  function updateStripActive() {
+    lbStrip.querySelectorAll('.lb-strip-thumb').forEach(t => {
+      t.classList.toggle('active', t.dataset.name === activeFile);
+    });
+    scrollActiveStripIntoView();
+  }
+
+  function scrollActiveStripIntoView() {
+    const a = lbStrip.querySelector('.lb-strip-thumb.active');
+    if (a) a.scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'smooth' });
+  }
+
+  // Strip clicks should never close the lightbox.
+  lbStrip.addEventListener('click', e => e.stopPropagation());
+
   function openLightbox(name) {
     if (!isMedia(name)) return;
     const url = '/get/' + encodeURIComponent(name);
     lbCaption.textContent = name;
     lightbox.classList.add('active');
     lightbox.setAttribute('aria-hidden', 'false');
+    syncStrip();
 
     if (isVideo(name)) {
       lbImage.src = '';
