@@ -527,12 +527,18 @@ pub struct ExtDeleteExtentReq {
 }
 
 /// ConvertToEc request (manager → extent node coordinator).
+///
+/// `eversion` is the new manager-decided eversion that every target
+/// node (data + parity) must adopt locally during the conversion.
+/// Pairs with `apply_ec_conversion_done` on the manager so that
+/// subsequent stale-cache reads see a mismatch and refresh.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct ExtConvertToEcReq {
     pub extent_id: u64,
     pub data_shards: u32,
     pub parity_shards: u32,
     pub target_addrs: Vec<String>,
+    pub eversion: u64,
 }
 
 // ── CommitLength binary codec (hot path, duplicated from extent_rpc) ───────

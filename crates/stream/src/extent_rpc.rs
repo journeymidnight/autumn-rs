@@ -279,6 +279,11 @@ pub const CODE_PRECONDITION: u8 = 3;
 pub const CODE_ERROR: u8 = 4;
 /// Returned when `header.revision < last_revision` — a newer owner has taken the lock.
 pub const CODE_LOCKED_BY_OTHER: u8 = 5;
+/// Returned by ReadBytes when the client's `eversion` is older than the
+/// server's local view (e.g. the extent has been EC-converted under a
+/// stale `StreamClient.extent_info_cache` entry). The client must
+/// invalidate its cached `ExtentInfo` and refetch from the manager.
+pub const CODE_EVERSION_MISMATCH: u8 = 6;
 
 /// Convert a u8 code from binary wire format to autumn_rpc::StatusCode.
 pub fn code_to_status(code: u8) -> StatusCode {
@@ -286,6 +291,7 @@ pub fn code_to_status(code: u8) -> StatusCode {
         CODE_OK => StatusCode::Ok,
         CODE_NOT_FOUND => StatusCode::NotFound,
         CODE_PRECONDITION => StatusCode::FailedPrecondition,
+        CODE_EVERSION_MISMATCH => StatusCode::FailedPrecondition,
         _ => StatusCode::Internal,
     }
 }
@@ -296,6 +302,7 @@ pub fn code_description(code: u8) -> &'static str {
         CODE_OK => "ok",
         CODE_NOT_FOUND => "not found",
         CODE_PRECONDITION => "precondition failed",
+        CODE_EVERSION_MISMATCH => "eversion mismatch (stale client cache)",
         _ => "error",
     }
 }
@@ -410,6 +417,12 @@ pub struct DeleteExtentReq {
 }
 
 /// ConvertToEc request: EC-encode a sealed extent and distribute shards.
+///
+/// `eversion` is the post-EC eversion the manager has decided on (one
+/// greater than the pre-EC value). The coordinator and every target
+/// node must adopt this value locally as part of installing their
+/// shard, so that subsequent `MSG_READ_BYTES` requests carrying a
+/// stale (pre-EC) eversion are rejected with `CODE_EVERSION_MISMATCH`.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct ConvertToEcReq {
     pub extent_id: u64,
@@ -417,6 +430,7 @@ pub struct ConvertToEcReq {
     pub parity_shards: u32,
     /// k+m target node addresses (data shard nodes first, then parity).
     pub target_addrs: Vec<String>,
+    pub eversion: u64,
 }
 
 // ── CopyExtent (binary — large payload) ─────────────────────────────────────
@@ -488,13 +502,19 @@ impl CopyExtentResp {
 
 // ── WriteShard (binary — large payload) ─────────────────────────────────────
 
-/// WriteShardRequest: [extent_id: u64 LE][shard_index: u32 LE][sealed_length: u64 LE][payload...]
-pub const WRITE_SHARD_HEADER_LEN: usize = 20;
+/// WriteShardRequest: [extent_id: u64 LE][shard_index: u32 LE][sealed_length: u64 LE][eversion: u64 LE][payload...]
+///
+/// `eversion` is the post-EC eversion the manager has decided on. The
+/// receiving extent node bumps `entry.eversion` to this value when it
+/// installs the shard, so subsequent ReadBytes requests with a stale
+/// (pre-EC) eversion are rejected with `CODE_EVERSION_MISMATCH`.
+pub const WRITE_SHARD_HEADER_LEN: usize = 28;
 
 pub struct WriteShardReq {
     pub extent_id: u64,
     pub shard_index: u32,
     pub sealed_length: u64,
+    pub eversion: u64,
     pub payload: Bytes,
 }
 
@@ -504,6 +524,7 @@ impl WriteShardReq {
         buf.put_u64_le(self.extent_id);
         buf.put_u32_le(self.shard_index);
         buf.put_u64_le(self.sealed_length);
+        buf.put_u64_le(self.eversion);
         buf.extend_from_slice(&self.payload);
         buf.freeze()
     }
@@ -515,8 +536,9 @@ impl WriteShardReq {
         let extent_id = data.get_u64_le();
         let shard_index = data.get_u32_le();
         let sealed_length = data.get_u64_le();
+        let eversion = data.get_u64_le();
         let payload = data;
-        Ok(Self { extent_id, shard_index, sealed_length, payload })
+        Ok(Self { extent_id, shard_index, sealed_length, eversion, payload })
     }
 }
 

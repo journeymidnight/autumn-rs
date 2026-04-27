@@ -483,6 +483,29 @@ sufficient (and cheaper than DashMap).
     - `file_pwrite_chunked` (splits via `Bytes::split_to`, O(1) no-copy) — used by `run_recovery_task`, `handle_re_avali`, `write_shard_local`
     Both fast-path the common case: single syscall when payload ≤ 256 MiB; only loop when larger. Any new full-extent local-file read or write **must** use these helpers — never call `file_pread`/`file_pwrite` directly with a `sealed_length`-sized buffer.
 
+14. **Read-side eversion freshness after EC conversion (F116)** — The
+    manager flips a sealed extent to EC by (a) sending `EXT_MSG_CONVERT_TO_EC`
+    with the new `eversion` field, then (b) `apply_ec_conversion_done`
+    rewriting `replicates` / `parity` and assigning the same eversion to
+    etcd. Every target node bumps its own `entry.eversion` from inside
+    `write_shard_local`, so the manager and all shard hosts agree on the
+    post-EC eversion the moment the coordinator returns OK.
+    `StreamClient` passes its **cached** `ex.eversion` in every
+    `ReadBytesReq` (formerly hard-coded to 0). When a stale-cache client
+    reads an EC-converted extent, the server returns
+    `CODE_EVERSION_MISMATCH` (instead of letting the read silently scrape
+    bytes from a shrunken shard file). The client side surfaces this as a
+    private `EversionStale` `anyhow` sentinel; the top-level
+    `read_bytes_from_extent` runs a 2-attempt loop that calls
+    `invalidate_extent_cache(extent_id)` and refetches `ExtentInfo` from
+    the manager once. This closes the only known stale-`extent_info_cache`
+    window and replaces a multi-second per-replica failover-timeout
+    burndown with one extra manager round-trip on the first read after
+    conversion. `read_replicated_with_failover` and `ec_subrange_read`
+    both fail-fast on `EversionStale` rather than walking the remaining
+    stale replicas — every replica reports the same mismatch by
+    construction.
+
 ---
 
 ## RPC Wire Protocol (extent_rpc.rs)

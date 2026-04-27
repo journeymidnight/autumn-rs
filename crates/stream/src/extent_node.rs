@@ -2034,11 +2034,23 @@ impl ExtentNode {
 
     /// Write a single EC shard to local storage, replacing any existing data.
     /// Called both by the coordinator (writing its own shard) and by write_shard RPC.
+    ///
+    /// `new_eversion` is the post-EC eversion the manager has decided
+    /// on (sent in-band via `ExtConvertToEcReq` / `WriteShardReq`).
+    /// Storing it here guarantees that subsequent `MSG_READ_BYTES`
+    /// requests carrying a stale (pre-EC) eversion are rejected with
+    /// `CODE_EVERSION_MISMATCH`, prompting the client to invalidate
+    /// its `extent_info_cache` and refetch the EC layout. Without this
+    /// bump the local check at the top of `handle_read_bytes` is a
+    /// no-op for stale clients (server's eversion still matches the
+    /// pre-EC value) and the read happily returns shrunken-shard
+    /// bytes that the client misinterprets as full-replica data.
     async fn write_shard_local(
         &self,
         extent_id: u64,
         shard_index: usize,
         _sealed_length: u64,
+        new_eversion: u64,
         shard_data: &[u8],
     ) -> Result<(), (StatusCode, String)> {
         let entry = self.ensure_extent(extent_id).await
@@ -2058,6 +2070,9 @@ impl ExtentNode {
         entry.len.store(shard_len, Ordering::SeqCst);
         entry.sealed_length.store(shard_len, Ordering::SeqCst);
         entry.avali.store(1, Ordering::SeqCst);
+        if new_eversion > 0 {
+            entry.eversion.store(new_eversion, Ordering::SeqCst);
+        }
 
         self.save_meta(extent_id, &entry).await
             .map_err(|e| (StatusCode::Internal, e))?;
@@ -2215,15 +2230,20 @@ impl ExtentNode {
         let extent = self.get_extent(req.extent_id).await?;
 
         // Use local extent state for eversion checks (no manager RPC needed on reads).
+        // Returning a typed CODE_EVERSION_MISMATCH (rather than an Err
+        // status) lets the StreamClient distinguish "stale cache —
+        // refetch ExtentInfo and retry" from generic transport errors.
+        // Critical post-EC-conversion: a stale-cache client would
+        // otherwise drive 3-replica failover-with-timeout against
+        // shrunken shard files (see plan: ec-http-...-smooth-tome.md).
         let ev = extent.eversion.load(Ordering::SeqCst);
         if req.eversion > 0 && req.eversion < ev {
-            return Err((
-                StatusCode::FailedPrecondition,
-                format!(
-                    "extent {} eversion too low: got {}, expect >= {}",
-                    req.extent_id, req.eversion, ev
-                ),
-            ));
+            return Ok(ReadBytesResp {
+                code: CODE_EVERSION_MISMATCH,
+                end: 0,
+                payload: Bytes::new(),
+            }
+            .encode());
         }
 
         let total_len = extent.len.load(Ordering::SeqCst);
@@ -2831,12 +2851,14 @@ impl ExtentNode {
 
         // Distribute shards to target nodes via WriteShard RPC.
         // If connection fails, assume this is our own address and write locally.
+        let new_eversion = req.eversion;
         for (i, target_addr) in req.target_addrs.iter().enumerate() {
             let shard = &shards[i];
             let ws_req = WriteShardReq {
                 extent_id,
                 shard_index: i as u32,
                 sealed_length,
+                eversion: new_eversion,
                 payload: Bytes::copy_from_slice(shard),
             };
 
@@ -2858,7 +2880,7 @@ impl ExtentNode {
                 }
                 Err(_) => {
                     // Connection failed — assume this is our own address; write locally.
-                    self.write_shard_local(extent_id, i, sealed_length, shard).await?;
+                    self.write_shard_local(extent_id, i, sealed_length, new_eversion, shard).await?;
                 }
             }
         }
@@ -2886,6 +2908,7 @@ impl ExtentNode {
             req.extent_id,
             req.shard_index as usize,
             req.sealed_length,
+            req.eversion,
             &req.payload,
         )
         .await?;

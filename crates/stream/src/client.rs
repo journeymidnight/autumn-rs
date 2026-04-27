@@ -10,9 +10,29 @@ use autumn_rpc::manager_rpc::{self, *};
 use crate::ConnPool;
 use crate::extent_rpc::{
     AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, ReadBytesReq,
-    ReadBytesResp, StreamInfo, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK,
-    MSG_APPEND, MSG_COMMIT_LENGTH, MSG_READ_BYTES,
+    ReadBytesResp, StreamInfo, CODE_EVERSION_MISMATCH, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND,
+    CODE_OK, MSG_APPEND, MSG_COMMIT_LENGTH, MSG_READ_BYTES,
 };
+
+/// Sentinel error attached to `anyhow::Error` when a `MSG_READ_BYTES`
+/// reply carries `CODE_EVERSION_MISMATCH`. Top-level
+/// `read_bytes_from_extent` downcasts to this type to drive the
+/// cache-invalidate-and-retry path. Carries no fields — the only
+/// remediation is to refetch `ExtentInfo` from the manager.
+#[derive(Debug)]
+struct EversionStale;
+
+impl std::fmt::Display for EversionStale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("eversion mismatch (stale extent_info_cache)")
+    }
+}
+
+impl std::error::Error for EversionStale {}
+
+fn is_eversion_stale(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<EversionStale>())
+}
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::channel::{mpsc, oneshot};
@@ -1433,16 +1453,48 @@ impl StreamClient {
     /// EINVAL on extents > 2 GiB. EC reads keep their existing per-shard
     /// path — shards are at most `sealed_length / data_shards` and have
     /// their own size logic.
+    ///
+    /// Wrapped in a 2-attempt loop so that a stale `extent_info_cache`
+    /// (e.g. after the manager flips an extent from replica to EC via
+    /// `ec_conversion_dispatch_loop`) self-heals on the first miss:
+    /// the inner read returns `EversionStale`, we evict the cache, and
+    /// the second attempt fetches the fresh `ExtentInfo` and routes
+    /// down the correct (EC) path. Without this, the first GET pays
+    /// up to `3 × call_timeout` (~9 s) per stale replica before any
+    /// future call sees the new layout.
     pub async fn read_bytes_from_extent(
         &self,
         extent_id: u64,
         offset: u32,
         length: u32,
     ) -> Result<(Vec<u8>, u32)> {
-        let ex = self.fetch_extent_info(extent_id).await?;
+        for attempt in 0..2 {
+            let ex = self.fetch_extent_info(extent_id).await?;
+            match self.read_with_layout(extent_id, offset, length, &ex).await {
+                Ok(r) => return Ok(r),
+                Err(e) if attempt == 0 && is_eversion_stale(&e) => {
+                    self.invalidate_extent_cache(extent_id);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("read_bytes_from_extent: 2-attempt loop must terminate")
+    }
 
+    /// Branch on the (cached) extent layout: EC sub-range read for
+    /// EC extents, replicated read with chunked failover for replica
+    /// extents. The `read_bytes_from_extent` retry loop handles
+    /// stale-cache (`EversionStale`) propagation.
+    async fn read_with_layout(
+        &self,
+        extent_id: u64,
+        offset: u32,
+        length: u32,
+        ex: &ExtentInfo,
+    ) -> Result<(Vec<u8>, u32)> {
         if !ex.parity.is_empty() {
-            return self.ec_subrange_read(extent_id, offset, length, &ex).await;
+            return self.ec_subrange_read(extent_id, offset, length, ex).await;
         }
 
         // Resolve effective length so we know when to stop chunking.
@@ -1452,7 +1504,7 @@ impl StreamClient {
             let total_end = if ex.sealed_length > 0 {
                 ex.sealed_length as u32
             } else {
-                self.commit_length_for_extent(&ex).await?
+                self.commit_length_for_extent(ex).await?
             };
             total_end.saturating_sub(offset)
         } else {
@@ -1461,7 +1513,7 @@ impl StreamClient {
 
         let chunk = read_chunk_bytes();
         if resolved <= chunk {
-            return self.read_replicated_with_failover(&ex, offset, length).await;
+            return self.read_replicated_with_failover(ex, offset, length).await;
         }
 
         let mut data: Vec<u8> = Vec::with_capacity(resolved as usize);
@@ -1473,7 +1525,7 @@ impl StreamClient {
         while cur < stop {
             let want = (stop - cur).min(chunk);
             let (piece, end) = self
-                .read_replicated_with_failover(&ex, cur, want)
+                .read_replicated_with_failover(ex, cur, want)
                 .await?;
             if piece.is_empty() {
                 break;
@@ -1494,6 +1546,12 @@ impl StreamClient {
     /// Replicated-mode read with per-replica failover. Used both for the
     /// single-shot small path and as the per-chunk worker for the chunked
     /// large-extent path.
+    ///
+    /// On `EversionStale` we **fail fast** — every replica in `ex` is
+    /// guaranteed to report the same mismatch (manager bumps eversion
+    /// once for the whole extent during EC conversion), so iterating
+    /// the remaining addresses just burns 3s timeouts each. Top-level
+    /// `read_bytes_from_extent` catches this and refetches.
     async fn read_replicated_with_failover(
         &self,
         ex: &ExtentInfo,
@@ -1504,11 +1562,14 @@ impl StreamClient {
         let mut last_err = anyhow!("no replicas for extent {}", ex.extent_id);
         for addr in &addrs {
             match self
-                .read_shard_from_addr(addr, ex.extent_id, offset, length)
+                .read_shard_from_addr(addr, ex.extent_id, ex.eversion, offset, length)
                 .await
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
+                    if is_eversion_stale(&e) {
+                        return Err(e);
+                    }
                     last_err = e;
                     self.extent_info_cache.remove(&ex.extent_id);
                 }
@@ -1550,16 +1611,27 @@ impl StreamClient {
     }
 
     /// Read raw shard bytes from a single replica address via autumn-rpc.
+    ///
+    /// `eversion` is the caller's view of the extent's eversion (from
+    /// the cached `ExtentInfo`). Server-side `handle_read_bytes`
+    /// rejects stale (lower) eversions with `CODE_EVERSION_MISMATCH`,
+    /// surfaced here as `EversionStale` so the top-level
+    /// `read_bytes_from_extent` can refetch and retry. Pass 0 to skip
+    /// the check (used by paths that don't have a cached eversion at
+    /// hand, e.g. the EC parallel-shard scatter; the trade-off is
+    /// silent stale reads if the cache is wrong, so prefer the real
+    /// eversion when available).
     async fn read_shard_from_addr(
         &self,
         addr: &str,
         extent_id: u64,
+        eversion: u64,
         offset: u32,
         length: u32,
     ) -> Result<(Vec<u8>, u32)> {
         let req = ReadBytesReq {
             extent_id,
-            eversion: 0,
+            eversion,
             offset,
             length,
         };
@@ -1569,6 +1641,10 @@ impl StreamClient {
             .await?;
         let resp = ReadBytesResp::decode(resp_bytes)
             .map_err(|e| anyhow!("decode ReadBytesResp from {addr}: {e}"))?;
+        if resp.code == CODE_EVERSION_MISMATCH {
+            return Err(anyhow::Error::new(EversionStale)
+                .context(format!("read_bytes from {addr} extent={extent_id}")));
+        }
         if resp.code != CODE_OK {
             return Err(anyhow!(
                 "read_bytes error from {addr}: code={}",
@@ -1607,9 +1683,15 @@ impl StreamClient {
             let shard_offset = (start % shard_size) as u32;
             let shard_len = read_len as u32;
             let addr = &addrs[start_shard];
-            match self.read_shard_from_addr(addr, extent_id, shard_offset, shard_len).await {
+            match self
+                .read_shard_from_addr(addr, extent_id, ex.eversion, shard_offset, shard_len)
+                .await
+            {
                 Ok(result) => return Ok(result),
-                Err(_) => {
+                Err(e) => {
+                    if is_eversion_stale(&e) {
+                        return Err(e);
+                    }
                     return self.ec_read_full_and_slice(extent_id, offset, length, ex).await;
                 }
             }
@@ -1624,10 +1706,20 @@ impl StreamClient {
             let addr1 = addrs[end_shard].clone();
 
             let (r0, r1) = futures::join!(
-                self.read_shard_from_addr(&addr0, extent_id, offset_in_first, first_len),
-                self.read_shard_from_addr(&addr1, extent_id, 0, second_len),
+                self.read_shard_from_addr(&addr0, extent_id, ex.eversion, offset_in_first, first_len),
+                self.read_shard_from_addr(&addr1, extent_id, ex.eversion, 0, second_len),
             );
 
+            if let Err(e) = &r0 {
+                if is_eversion_stale(e) {
+                    return Err(anyhow::Error::new(EversionStale));
+                }
+            }
+            if let Err(e) = &r1 {
+                if is_eversion_stale(e) {
+                    return Err(anyhow::Error::new(EversionStale));
+                }
+            }
             match (r0, r1) {
                 (Ok((mut d0, end_val)), Ok((d1, _))) => {
                     d0.extend_from_slice(&d1);
@@ -1679,6 +1771,7 @@ impl StreamClient {
 
         let (tx, mut rx) = futures::channel::mpsc::channel::<(usize, Result<(Vec<u8>, u32)>)>(n);
 
+        let cached_eversion = ex.eversion;
         for (i, addr) in addrs.into_iter().enumerate() {
             let mut tx = tx.clone();
             let pool = self.pool.clone();
@@ -1693,13 +1786,17 @@ impl StreamClient {
                 }
                 let req = ReadBytesReq {
                     extent_id,
-                    eversion: 0,
+                    eversion: cached_eversion,
                     offset: 0,
                     length: 0,
                 };
-                let result = match pool.call(&addr, MSG_READ_BYTES, req.encode()).await {
+                let result: Result<(Vec<u8>, u32)> = match pool.call(&addr, MSG_READ_BYTES, req.encode()).await {
                     Ok(resp_bytes) => match ReadBytesResp::decode(resp_bytes) {
                         Ok(resp) if resp.code == CODE_OK => Ok((resp.payload.to_vec(), resp.end)),
+                        Ok(resp) if resp.code == CODE_EVERSION_MISMATCH => {
+                            Err(anyhow::Error::new(EversionStale)
+                                .context(format!("ec_read_full shard {i} from {addr}")))
+                        }
                         Ok(resp) => Err(anyhow!(
                             "read_bytes from {}: code={}",
                             addr,
@@ -1731,6 +1828,12 @@ impl StreamClient {
                     }
                 }
                 Err(e) => {
+                    // Any single shard reporting stale eversion means
+                    // the cached EC layout is wrong; bail out so the
+                    // top-level retry can refetch ExtentInfo.
+                    if is_eversion_stale(&e) {
+                        return Err(e);
+                    }
                     last_err = e;
                 }
             }

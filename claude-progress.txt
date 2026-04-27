@@ -1,49 +1,96 @@
-Date: 2026-04-27
+Date: 2026-04-26
 TaskStatus: completed
-Task scope: F115 — fix EINVAL on >2 GiB extents in local-file I/O paths + surface EC status in `autumn-client info`
+Task scope: F116 — fix slow gallery /get/ + high autumn-extent CPU after EC conversion (stale extent_info_cache → eversion-based invalidation on the read path)
 
 Current summary:
-  Two related fixes:
+  Symptom: after `ec_conversion_dispatch_loop` flips a sealed extent
+  from 3-replica to EC, the next gallery GET (port 5001) is very slow
+  (multiple seconds, sometimes 9+ s) but eventually succeeds, and
+  `autumn-extent` shows elevated CPU during the transition window.
 
-  Part A — `autumn-client info` EC visibility:
-    `InfoExtentView` gains `parity: Vec<u64>` field. Text rendering prints
-    `EC(K+M), data=[...], parity=[...]` when parity is non-empty; otherwise
-    `replicas=[...]`. JSON projection exposes the same field. Rule:
-    `!parity.is_empty()` ⇔ extent is currently EC-encoded.
+  Root cause: `StreamClient.extent_info_cache` is never invalidated
+  when the manager bumps the extent's `eversion` and rewrites
+  `replicates`/`parity`. The PS reads the extent via the cached
+  pre-EC layout, hits 3 stale-replica addresses (whose `.dat` has
+  been truncated to a shard), and burns up to 3 s per replica
+  on `pool.call_timeout` before falling out. The client previously
+  passed `eversion: 0` in `ReadBytesReq`, which **disabled** the
+  server's own eversion guard. And `write_shard_local` never bumped
+  the local `entry.eversion`, so even if the client passed a real
+  eversion the server's view would still match the pre-EC value.
 
-  Part B — F115: chunked local-file I/O on ExtentNode:
-    F105 (commit d80a2b8) chunked `StreamClient::read_bytes_from_extent` at
-    the RPC path. Six extent_node.rs call sites still issued single oversize
-    syscalls that returned EINVAL on macOS (INT_MAX ≈ 2 GiB) and Linux
-    (0x7ffff000) for extents > 2 GiB. Symptoms: ec_conversion_dispatch_loop
-    (every 5 s) spamming "Invalid argument (os error 22)" for extents 33, 42,
-    46 (each ~3 GiB).
+  Fix (3 layers, all in-band, no manager push):
 
-    Added `file_pread_chunked` and `file_pwrite_chunked` helpers
-    (FILE_IO_CHUNK_BYTES = 256 MiB) to extent_node.rs (~line 443-492).
-    Both fast-path the common case (single syscall when <= 256 MiB).
-    `file_pwrite_chunked` uses `Bytes::split_to` (O(1), no copy).
+    1. ExtConvertToEcReq + ConvertToEcReq + WriteShardReq each gain
+       a `eversion: u64` field. The manager picks `new_eversion =
+       ex.eversion + 1` and sends it to the coordinator; the
+       coordinator forwards it in every WriteShardReq it dispatches
+       to data + parity targets.
+       - WriteShardReq header: 20 → 28 bytes.
 
-    Six call sites updated:
-      handle_convert_to_ec  -> file_pread_chunked
-      handle_read_bytes     -> file_pread_chunked
-      handle_copy_extent    -> file_pread_chunked
-      run_recovery_task     -> file_pwrite_chunked
-      handle_re_avali       -> file_pwrite_chunked
-      write_shard_local     -> file_pwrite_chunked
+    2. `write_shard_local` writes `entry.eversion = new_eversion`
+       (alongside `len`, `sealed_length`, `avali`) and persists via
+       `save_meta`. The manager's `apply_ec_conversion_done` now
+       *assigns* the same `new_eversion` to etcd (was `+= 1`) so all
+       parties agree.
 
-  Verification (live cluster):
-    After releasing the fixed binary (cluster.sh restart-node 1-4):
-    - extent 33 (3.0 GB): EC(3+1), data=[1, 3, 5], parity=[7], eversion=3 [OK]
-    - extent 42 (3.0 GB): EC(3+1), data=[1, 3, 7], parity=[5], eversion=3 [OK]
-    - extent 46 (3.1 GB): EC(3+1), data=[1, 3, 5], parity=[7], eversion=3 [OK]
-    - No more EINVAL errors in manager log after restart
-    - Physical files on all 4 nodes: ~1 GiB each (shard-sized, down from ~3 GiB)
+    3. Client passes `ex.eversion` in every ReadBytesReq.
+       `handle_read_bytes` returns the new `CODE_EVERSION_MISMATCH = 6`
+       (instead of an Err `FailedPrecondition`) when the client's
+       eversion is older than local. Client surfaces this as a private
+       `EversionStale` anyhow sentinel. Top-level
+       `read_bytes_from_extent` wraps the body in a 2-attempt loop
+       that calls `invalidate_extent_cache` and refetches `ExtentInfo`
+       once on `EversionStale`.
+       `read_replicated_with_failover` and `ec_subrange_read` /
+       `ec_read_full` fail-fast on `EversionStale` (every replica
+       reports the same mismatch by construction).
 
 Files changed:
-  - crates/server/src/bin/autumn_client.rs (Part A)
-  - crates/stream/src/extent_node.rs (Part B)
-  - crates/stream/CLAUDE.md (Programming Note 13 added)
+  - crates/stream/src/extent_rpc.rs  (CODE_EVERSION_MISMATCH=6;
+    WriteShardReq.eversion; ConvertToEcReq.eversion)
+  - crates/rpc/src/manager_rpc.rs    (ExtConvertToEcReq.eversion)
+  - crates/manager/src/recovery.rs   (compute new_eversion, send via
+    ExtConvertToEcReq, assign in apply_ec_conversion_done)
+  - crates/stream/src/extent_node.rs (handle_convert_to_ec /
+    handle_write_shard / write_shard_local plumb eversion;
+    handle_read_bytes returns CODE_EVERSION_MISMATCH)
+  - crates/stream/src/client.rs      (EversionStale sentinel;
+    read_shard_from_addr takes eversion + decodes mismatch;
+    read_bytes_from_extent retry loop; EC paths propagate)
+  - crates/stream/CLAUDE.md          (Programming Note 14)
+
+Verification:
+  - cargo build --workspace: clean (only pre-existing dead-code warnings).
+  - cargo test -p autumn-stream --tests --test-threads=1: 70 passed
+    (single flaky timing test cq_flushes_fast_ops_while_slow_op_runs
+    needs serial execution — pre-existing).
+  - cargo test -p autumn-manager --lib: 1 pre-existing failure
+    (register_node_duplicate_addr_rejected — failed pre-changes,
+    confirmed via git stash).
+  - autumn-manager full integration tests: deferred (live etcd +
+    manager-server already running on 127.0.0.1:2379 / :9001).
+
+  Live cluster verification (deferred to operator):
+    - Pick an EC-converted extent (`autumn-client info` shows EC(K+M)).
+    - `time curl -o /dev/null http://0.0.0.0:5001/get/<KEY>` for a key
+      whose VP is in that extent. Pre-fix: > 3 s on first GET, fast
+      on second. Post-fix: fast on the first GET (one extra manager
+      `extent_info` RTT, then steady-state cached EC reads).
+    - `top -pid $(pgrep autumn-extent | head -1)` over a small loop
+      of GETs: CPU stays flat (no per-request 3-replica fanout).
+      The residual encode CPU during active conversion is expected.
+
+Performance note (user-asked):
+  - Server-side ReadBytes adds one u64 comparison after the existing
+    `extent.eversion` atomic load. ~1 ns.
+  - Client-side adds one branch on resp.code before the existing
+    OK check. ~1 ns.
+  - WriteShardReq header grew 8 bytes; payload itself is shard-sized
+    (~GB), overhead is 8e-9.
+  - Retry loop runs once in the happy path (cache fresh) — same as
+    before. Only the post-EC stale-cache path retries, and that
+    saves multi-second timeouts.
 
 Next steps:
-  None -- both fixes verified and committed.
+  None — implemented + tested + documented.

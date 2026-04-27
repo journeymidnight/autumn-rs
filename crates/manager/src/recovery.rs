@@ -482,12 +482,21 @@ impl AutumnManager {
                 let target_nodes_clone = target_nodes.clone();
                 let extra_disk_ids_clone = extra_disk_ids.clone();
                 let orig_replica_count = ex.replicates.len() as u32;
+                // The post-conversion eversion. Sent in-band so every
+                // target node bumps `entry.eversion` to match what
+                // `apply_ec_conversion_done` will persist to etcd. This
+                // closes the read-side stale-cache window: once the
+                // coordinator returns OK, any client read with a stale
+                // (pre-EC) eversion is rejected with
+                // CODE_EVERSION_MISMATCH and the client refetches.
+                let new_eversion = ex.eversion + 1;
 
                 let payload = rkyv_encode(&ExtConvertToEcReq {
                     extent_id,
                     data_shards: data_shards as u32,
                     parity_shards: parity_shards as u32,
                     target_addrs: ec_target_addrs,
+                    eversion: new_eversion,
                 });
 
                 let result = self
@@ -522,6 +531,7 @@ impl AutumnManager {
                         target_nodes_clone,
                         extra_disk_ids_clone,
                         data_shards,
+                        new_eversion,
                     )
                     .await;
             }
@@ -535,6 +545,7 @@ impl AutumnManager {
         target_nodes: Vec<u64>,
         extra_disk_ids: Vec<u64>,
         data_shards: usize,
+        new_eversion: u64,
     ) -> Result<(), AppError> {
         let updated = {
             let mut s = self.store.inner.borrow_mut();
@@ -552,7 +563,10 @@ impl AutumnManager {
             ex.parity = target_nodes[data_shards..].to_vec();
             ex.replicate_disks = all_disks[..data_shards].to_vec();
             ex.parity_disks = all_disks[data_shards..].to_vec();
-            ex.eversion += 1;
+            // Use the eversion sent in-band to the extent nodes via
+            // ExtConvertToEcReq. Manager + every shard host now agree on
+            // the same post-EC eversion.
+            ex.eversion = new_eversion;
             ex.clone()
         };
 
