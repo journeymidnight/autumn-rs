@@ -249,7 +249,7 @@ fn run_hls_ffmpeg(url: &str, playlist: &std::path::Path, segments: &std::path::P
     let status = cmd
         .args([
             "-hls_time",
-            "30",
+            "20",
             "-hls_list_size",
             "0",
             "-hls_segment_type",
