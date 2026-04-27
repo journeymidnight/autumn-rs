@@ -435,6 +435,62 @@ async fn file_pread(file: &std::cell::UnsafeCell<CompioFile>, offset: u64, len: 
     Ok(buf)
 }
 
+/// Per-call chunk size for local-disk pread/pwrite. macOS caps a single
+/// pread/pwrite at INT_MAX (~2 GiB) and Linux at 0x7ffff000 — without
+/// chunking, sealed extents > 2 GiB EINVAL on the very first syscall.
+/// Mirrors `read_chunk_bytes` in `client.rs` (F105) for the StreamClient
+/// RPC path; this constant covers the local-file path on the extent node.
+const FILE_IO_CHUNK_BYTES: usize = 256 * 1024 * 1024;
+
+/// Chunked pread for full-extent reads (recovery / EC convert / etc.).
+/// Single-shot reads <= FILE_IO_CHUNK_BYTES bypass the loop.
+async fn file_pread_chunked(
+    file: &std::cell::UnsafeCell<CompioFile>,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>> {
+    if len <= FILE_IO_CHUNK_BYTES {
+        return file_pread(file, offset, len).await;
+    }
+    let mut buf = Vec::with_capacity(len);
+    let mut cur = offset;
+    let stop = offset + len as u64;
+    while cur < stop {
+        let want = ((stop - cur) as usize).min(FILE_IO_CHUNK_BYTES);
+        let part = file_pread(file, cur, want).await?;
+        let got = part.len() as u64;
+        buf.extend_from_slice(&part);
+        if got == 0 {
+            break;
+        }
+        cur += got;
+    }
+    Ok(buf)
+}
+
+/// Chunked pwrite for full-extent writes (recovery payload restore, etc.).
+/// `data` is consumed; chunks are split off without re-allocating the
+/// whole buffer.
+async fn file_pwrite_chunked(
+    file: &std::cell::UnsafeCell<CompioFile>,
+    offset: u64,
+    data: Vec<u8>,
+) -> Result<()> {
+    if data.len() <= FILE_IO_CHUNK_BYTES {
+        return file_pwrite(file, offset, data).await;
+    }
+    let mut bytes = Bytes::from(data);
+    let mut cur = offset;
+    while !bytes.is_empty() {
+        let take = FILE_IO_CHUNK_BYTES.min(bytes.len());
+        let chunk = bytes.split_to(take);
+        let chunk_len = chunk.len() as u64;
+        file_pwrite(file, cur, chunk.to_vec()).await?;
+        cur += chunk_len;
+    }
+    Ok(())
+}
+
 // ───── R4 step 4.2 — inline SQ/CQ pipeline helpers ──────────────────────────
 
 /// Outcome of the persistent read future used by `handle_connection`.
@@ -1874,7 +1930,7 @@ impl ExtentNode {
             .await
             .map_err(|e| e.to_string())?;
         let payload_len = payload.len() as u64;
-        file_pwrite(&extent.file, 0, payload).await
+        file_pwrite_chunked(&extent.file, 0, payload).await
             .map_err(|e| e.to_string())?;
         file_ref(&extent.file).sync_all().await
             .map_err(|e| e.to_string())?;
@@ -1993,7 +2049,7 @@ impl ExtentNode {
             .set_len(0)
             .await
             .map_err(|e| (StatusCode::Internal, format!("truncate shard {extent_id}: {e}")))?;
-        file_pwrite(&entry.file, 0, shard_data.to_vec()).await
+        file_pwrite_chunked(&entry.file, 0, shard_data.to_vec()).await
             .map_err(|e| (StatusCode::Internal, format!("write shard {extent_id}/{shard_index}: {e}")))?;
         file_ref(&entry.file).sync_all().await
             .map_err(|e| (StatusCode::Internal, format!("sync shard {extent_id}: {e}")))?;
@@ -2179,8 +2235,11 @@ impl ExtentNode {
             (req.length as u64).min(total_len.saturating_sub(read_offset))
         };
 
-        // Read the entire data in one shot (no streaming).
-        let data = file_pread(&extent.file, read_offset, read_size as usize).await
+        // Chunk pread to dodge the per-syscall INT_MAX cap on macOS /
+        // 0x7ffff000 on Linux. Recovery (`copy_bytes_from_source`) sends
+        // length=0 to slurp full sealed extents in one RPC, so the
+        // per-syscall size on the server side can exceed 2 GiB.
+        let data = file_pread_chunked(&extent.file, read_offset, read_size as usize).await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
 
         Ok(ReadBytesResp {
@@ -2608,7 +2667,7 @@ impl ExtentNode {
             .await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
         let payload_len = write_payload.len() as u64;
-        file_pwrite(&extent.file, 0, write_payload.to_vec()).await
+        file_pwrite_chunked(&extent.file, 0, write_payload.to_vec()).await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
         file_ref(&extent.file).sync_all().await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
@@ -2691,8 +2750,7 @@ impl ExtentNode {
             req.size.min(logical_len.saturating_sub(offset))
         };
 
-        // Read the entire data in one shot (no streaming).
-        let data = file_pread(&extent.file, offset, size as usize).await
+        let data = file_pread_chunked(&extent.file, offset, size as usize).await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
 
         Ok(CopyExtentResp {
@@ -2764,7 +2822,7 @@ impl ExtentNode {
             ));
         }
 
-        let data = file_pread(&entry.file, 0, sealed_length as usize).await
+        let data = file_pread_chunked(&entry.file, 0, sealed_length as usize).await
             .map_err(|e| (StatusCode::Internal, format!("read extent {extent_id}: {e}")))?;
 
         // EC-encode the full extent data into k+m shards.

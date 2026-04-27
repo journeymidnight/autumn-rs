@@ -478,6 +478,11 @@ sufficient (and cheaper than DashMap).
 
 12. **Chunked reads for >2 GiB extents (F105)** — `read_bytes_from_extent` splits requests larger than `AUTUMN_STREAM_READ_CHUNK_BYTES` (default 256 MiB) into multiple per-replica RPCs and concatenates the results. Without chunking, a single `pread` of 3 GiB on the extent_node returns `EINVAL` (errno 22) — macOS caps at `INT_MAX` (~2 GiB) and Linux at `0x7ffff000`. The pre-F105 GC + recovery path slurped sealed extents in one shot via `read_bytes_from_extent(eid, 0, sealed_length)`; once a sealed log_stream extent grew past 2 GiB, GC got stuck retrying every 30 s ("rpc status Internal: Invalid argument (os error 22)") and recovery would refuse to open the partition on the next restart. `length=0` ("to end") resolves the byte count via `ExtentInfo.sealed_length` for sealed extents or `commit_length_for_extent` (min-replica) for open extents, then chunks. EC reads stay on the per-shard path (`ec_subrange_read`) — each shard is at most `sealed_length / data_shards` so the per-syscall ceiling is rarely hit there. Test override: integration tests set `AUTUMN_STREAM_READ_CHUNK_BYTES` to small values (e.g. 1024) to exercise the chunked path without writing multi-GiB extents.
 
+13. **Chunked local-file I/O for >2 GiB extents (F115)** — The F105 fix (note 12) only covered the `StreamClient` RPC path. The `ExtentNode` server-side local-file operations had the same EINVAL exposure on all full-extent I/O paths. Fixed by two helpers in `extent_node.rs` (`FILE_IO_CHUNK_BYTES = 256 MiB`):
+    - `file_pread_chunked` — used by `handle_convert_to_ec`, `handle_read_bytes`, `handle_copy_extent`
+    - `file_pwrite_chunked` (splits via `Bytes::split_to`, O(1) no-copy) — used by `run_recovery_task`, `handle_re_avali`, `write_shard_local`
+    Both fast-path the common case: single syscall when payload ≤ 256 MiB; only loop when larger. Any new full-extent local-file read or write **must** use these helpers — never call `file_pread`/`file_pwrite` directly with a `sealed_length`-sized buffer.
+
 ---
 
 ## RPC Wire Protocol (extent_rpc.rs)

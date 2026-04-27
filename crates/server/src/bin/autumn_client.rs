@@ -843,6 +843,7 @@ struct InfoExtentView {
     size: u64,
     open: bool,
     replicas: Vec<u64>,
+    parity: Vec<u64>,
     refs: u64,
     eversion: u64,
 }
@@ -2298,6 +2299,7 @@ async fn main() -> Result<()> {
                             size: e.sealed_length,
                             open: open_extents.contains(eid),
                             replicas: e.replicates.clone(),
+                            parity: e.parity.clone(),
                             refs: e.refs,
                             eversion: e.eversion,
                         })
@@ -2405,8 +2407,14 @@ async fn main() -> Result<()> {
                     extents.sort_by_key(|(id, _)| **id);
                     for (eid, e) in &extents {
                         let tag = if open_extents.contains(eid) { " (open)" } else { "" };
-                        println!("  extent {}: size={}{}, replicas={:?}, refs={}, eversion={}",
-                            eid, human_size(e.sealed_length), tag, e.replicates, e.refs, e.eversion);
+                        let layout = if !e.parity.is_empty() {
+                            format!("EC({}+{}), data={:?}, parity={:?}",
+                                e.replicates.len(), e.parity.len(), e.replicates, e.parity)
+                        } else {
+                            format!("replicas={:?}", e.replicates)
+                        };
+                        println!("  extent {}: size={}{}, {}, refs={}, eversion={}",
+                            eid, human_size(e.sealed_length), tag, layout, e.refs, e.eversion);
                     }
 
                     println!("\n=== Streams ===");
