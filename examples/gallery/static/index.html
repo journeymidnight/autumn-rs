@@ -1830,6 +1830,10 @@ header .tag {
     lbVideo.src = '';
     resetDominant();
     lastShownName = null;
+    if (activeFile) {
+      const el = fileList.querySelector('.file-item[data-name="' + CSS.escape(activeFile) + '"]');
+      if (el) el.scrollIntoView({ block: 'nearest' });
+    }
   }
 
   lightbox.addEventListener('click', e => {
