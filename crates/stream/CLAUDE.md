@@ -506,6 +506,34 @@ sufficient (and cheaper than DashMap).
     stale replicas — every replica reports the same mismatch by
     construction.
 
+15. **CPU-bound work MUST run on the blocking pool, not the compio
+    event loop (F117)** — Reed-Solomon `ec_encode` / `ec_decode` /
+    `ec_reconstruct_shard` each take 100–300 ms on a 128 MiB extent.
+    All three callers wrap the call in
+    `compio::runtime::spawn_blocking(move || …)` so the GF(256)
+    polynomial math runs on a dedicated OS thread:
+    - `extent_node.rs::handle_convert_to_ec` (encode of a sealed
+      extent into k+m shards before WriteShard fanout).
+    - `extent_node.rs::run_ec_recovery_payload` (reconstruct the
+      single shard a recovering node should hold).
+    - `client.rs::ec_read_full` (decode the original payload from
+      k+m shards on the EC fallback / full-extent read path).
+    Without this offload the extent-node compio runtime stalls on
+    encode while the user's append/read RPCs queue up, and the
+    PS-side P-log/P-bulk threads stall on decode while a row_stream
+    fallback read is in flight. Pattern matches
+    `partition-server::flush_one_imm_async` which has wrapped
+    `build_sst_bytes` in `spawn_blocking` since F088. **Any new
+    CPU-bound work in this crate (RS math, large CRC, large
+    compression, big sort) MUST be wrapped in `spawn_blocking` —
+    never call directly from a compio task.** The error plumbing
+    pattern is double `.map_err`+`?` to handle (i) the join-time
+    panic-Box from `JoinHandle<T> = Task<Result<T, Box<dyn Any +
+    Send>>>` and (ii) the inner `Result` returned by the erasure
+    function itself. Out of scope: WAL CRC32C
+    (`wal.rs:172`/`:271`) on must_sync small writes — bounded at
+    ≤ 2 MiB per call, amortised by `write_batch`.
+
 ---
 
 ## RPC Wire Protocol (extent_rpc.rs)

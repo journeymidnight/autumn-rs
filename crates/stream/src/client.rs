@@ -1844,7 +1844,15 @@ impl StreamClient {
                 .context(format!("only {success}/{data_shards} shards available for EC decode")));
         }
 
-        let decoded = crate::erasure::ec_decode(shard_data, data_shards, parity_shards)?;
+        // F117: RS decode of a full extent (up to 128 MiB) is CPU-bound;
+        // run it on the blocking pool so the caller's compio thread (P-log
+        // / P-bulk / extent-node read fanout) stays responsive while the
+        // GF(256) math runs.
+        let decoded = compio::runtime::spawn_blocking(move || {
+            crate::erasure::ec_decode(shard_data, data_shards, parity_shards)
+        })
+        .await
+        .map_err(|_| anyhow!("ec_decode task panicked"))??;
         Ok((decoded, end_val.unwrap()))
     }
 

@@ -2028,8 +2028,20 @@ impl ExtentNode {
             ));
         }
 
-        crate::erasure::ec_reconstruct_shard(shards, data_shards, parity_shards, replacing_index)
-            .map_err(|e| format!("EC reconstruct failed: {e}"))
+        // F117: offload RS reconstruct (CPU-bound, GF(256) polynomial math
+        // over up-to-data_shards × per-shard MiB) to the blocking pool so
+        // recovery doesn't stall the extent-node compio runtime.
+        compio::runtime::spawn_blocking(move || {
+            crate::erasure::ec_reconstruct_shard(
+                shards,
+                data_shards,
+                parity_shards,
+                replacing_index,
+            )
+        })
+        .await
+        .map_err(|_| "EC reconstruct task panicked".to_string())?
+        .map_err(|e| format!("EC reconstruct failed: {e}"))
     }
 
     /// Write a single EC shard to local storage, replacing any existing data.
@@ -2846,8 +2858,15 @@ impl ExtentNode {
             .map_err(|e| (StatusCode::Internal, format!("read extent {extent_id}: {e}")))?;
 
         // EC-encode the full extent data into k+m shards.
-        let shards = crate::erasure::ec_encode(&data, data_shards, parity_shards)
-            .map_err(|e| (StatusCode::Internal, format!("ec_encode failed: {e}")))?;
+        // F117: offload Reed-Solomon encode (CPU-bound, ~100–300 ms on 128 MiB)
+        // to a dedicated blocking thread so the compio event loop keeps
+        // serving append/read RPCs while a sealed extent converts.
+        let shards = compio::runtime::spawn_blocking(move || {
+            crate::erasure::ec_encode(&data, data_shards, parity_shards)
+        })
+        .await
+        .map_err(|_| (StatusCode::Internal, "ec_encode task panicked".to_string()))?
+        .map_err(|e| (StatusCode::Internal, format!("ec_encode failed: {e}")))?;
 
         // Distribute shards to target nodes via WriteShard RPC.
         // If connection fails, assume this is our own address and write locally.
