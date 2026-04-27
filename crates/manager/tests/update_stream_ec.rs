@@ -268,7 +268,7 @@ fn update_stream_ec_triggers_conversion() {
         for _ in 0..15 {
             compio::time::sleep(Duration::from_secs(2)).await;
             let ext = get_extent_info(&mgr, first_extent_id).await;
-            if !ext.parity.is_empty() {
+            if ext.ec_converted {
                 converted = true;
                 break;
             }

@@ -1129,6 +1129,7 @@ dependencies = [
  "mime_guess",
  "percent-encoding",
  "send_wrapper",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

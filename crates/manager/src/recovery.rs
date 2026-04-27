@@ -374,7 +374,7 @@ impl AutumnManager {
                     }
                     for &eid in &stream.extent_ids {
                         if let Some(ex) = s.extents.get(&eid) {
-                            if ex.sealed_length == 0 || ex.original_replicates != 0 {
+                            if ex.sealed_length == 0 || ex.ec_converted {
                                 continue;
                             }
                             out.push((ex.clone(), stream.clone()));
@@ -481,7 +481,6 @@ impl AutumnManager {
                     .collect();
                 let target_nodes_clone = target_nodes.clone();
                 let extra_disk_ids_clone = extra_disk_ids.clone();
-                let orig_replica_count = ex.replicates.len() as u32;
                 // The post-conversion eversion. Sent in-band so every
                 // target node bumps `entry.eversion` to match what
                 // `apply_ec_conversion_done` will persist to etcd. This
@@ -527,7 +526,6 @@ impl AutumnManager {
                 let _ = self
                     .apply_ec_conversion_done(
                         extent_id,
-                        orig_replica_count,
                         target_nodes_clone,
                         extra_disk_ids_clone,
                         data_shards,
@@ -541,7 +539,6 @@ impl AutumnManager {
     async fn apply_ec_conversion_done(
         &self,
         extent_id: u64,
-        original_replicates: u32,
         target_nodes: Vec<u64>,
         extra_disk_ids: Vec<u64>,
         data_shards: usize,
@@ -558,7 +555,7 @@ impl AutumnManager {
             all_disks.extend_from_slice(&extra_disk_ids);
             all_disks.truncate(target_nodes.len());
 
-            ex.original_replicates = original_replicates;
+            ex.ec_converted = true;
             ex.replicates = target_nodes[..data_shards].to_vec();
             ex.parity = target_nodes[data_shards..].to_vec();
             ex.replicate_disks = all_disks[..data_shards].to_vec();

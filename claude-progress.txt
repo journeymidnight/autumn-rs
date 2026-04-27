@@ -1,94 +1,106 @@
-Date: 2026-04-26
+Date: 2026-04-27
 TaskStatus: completed
-Task scope: F117 — move all Reed-Solomon EC work (encode/decode/reconstruct) off the compio event loop onto compio::runtime::spawn_blocking, so extent_node + StreamClient stay responsive while EC math runs.
+Task scope: F118 — open extents on EC streams misrouted as EC. PS panicked
+post-split with `range start index 93582868 out of range for slice of length
+8388569` on `client.rs::read_with_layout → ec_subrange_read`, and `autumn-
+client info` labelled open extents as `EC(3+1)` even though they were still
+4-way replicated.
 
 Current summary:
-  Symptom: during `ec_conversion_dispatch_loop`-driven EC conversion,
-  `autumn-extent` becomes sluggish on append/read RPCs even though no
-  I/O is contended. Root cause: three CPU-bound Reed-Solomon call
-  sites ran synchronously on a compio task, monopolising the event
-  loop for 100–300 ms per 128 MiB sealed extent.
+  Symptom: live cluster after split. PS `part-20` (the new partition) panics on
+  read; info command shows open extents 21/23/24 as `EC(3+1), data=[1,3,5],
+  parity=[7]` despite `(open)` tag.
 
-  Hazard sites scanned + fixed:
+  Root cause: the manager's `stream_alloc_extent` (rpc_handlers.rs:792-803)
+  pre-fills `parity` with the M target nodes the moment an EC-stream extent
+  is allocated. The data plane writes the full payload to every K+M replica
+  until the `ec_conversion_dispatch_loop` runs `apply_ec_conversion_done` on
+  a *sealed* extent. Anything that branches on `parity.is_empty()` to
+  distinguish replication-vs-EC misroutes pre-conversion / open extents:
+    1. `client.rs::read_with_layout` → `ec_subrange_read`: panics on
+       `shard_size = shard_size(sealed_length=0, K) = 0`.
+    2. `extent_node.rs::run_recovery_task` → `run_ec_recovery_payload`:
+       would corrupt EC recovery (data is replicated, not EC-shaped).
+    3. `autumn_client.rs::Info`: misleading display.
 
-    1. crates/stream/src/extent_node.rs::handle_convert_to_ec @ 2849
-       — `crate::erasure::ec_encode(&data, …)` was running on the
-       extent-node compio runtime that also serves heartbeats +
-       append + read RPCs. This is the user-reported "extent_node
-       响应慢" hazard.
+  The manager's own EC conversion dispatch already used the correct marker
+  (`ex.original_replicates != 0` at recovery.rs:377), but `original_replicates:
+  u32` was confusingly named — only the zero / non-zero distinction was ever
+  consumed. Renamed to `ec_converted: bool` for clarity.
 
-    2. crates/stream/src/extent_node.rs::run_ec_recovery_payload @ 2031
-       — `crate::erasure::ec_reconstruct_shard(…)` rebuilds a single
-       missing shard during recovery. The surrounding task is
-       launched via `compio::runtime::spawn` (line 2493) which keeps
-       it on the same compio runtime — *not* a blocking pool.
-
-    3. crates/stream/src/client.rs::ec_read_full @ 1847 —
-       `crate::erasure::ec_decode(shard_data, …)` runs on whichever
-       caller's compio thread awaited the EC fallback path
-       (typically PS P-log / P-bulk for row_stream / meta_stream
-       full reads).
-
-  Fix (one pattern, three sites):
-    Wrap each call in `compio::runtime::spawn_blocking(move || { … })`,
-    matching the partition-server SSTable-build pattern at
-    crates/partition-server/src/lib.rs:2704. Each closure moves the
-    input buffer (Vec<u8> payload for encode; Vec<Option<Vec<u8>>>
-    shard set for decode/reconstruct) and Copy-typed shard counts.
-    Error plumbing uses double `.map_err`+`?` to handle (i) the
-    join-time panic-Box from compio's `JoinHandle<T> = Task<Result<T,
-    Box<dyn Any + Send>>>` and (ii) the inner anyhow / (StatusCode,
-    String) error from the erasure function.
-
-  Hazards explicitly considered and ruled out of this fix:
-    - WAL CRC32C in wal.rs:172/271 — bounded at ≤ 2 MiB per call
-      (≈ 1 ms on hardware CRC), amortised by `write_batch`. Revisit
-      only if profiling shows it on the hot path.
-    - SSTable build (`build_sst_bytes`) — already on `spawn_blocking`
-      since F088 (partition-server lib.rs:2704, :2955).
-    - Bloom filter probe in handle_get — single key, O(µs); fine on
-      the event loop.
-    - WAL replay at startup — runs in `ExtentNode::new` before the
-      event loop; not an issue.
+Fix:
+  1. Renamed `original_replicates: u32` → `ec_converted: bool` in
+     `MgrExtentInfo` (rpc/src/manager_rpc.rs) + `ExtentInfo`
+     (stream/src/extent_rpc.rs). Wire-format / etcd-schema change.
+  2. Init sites in `manager/src/rpc_handlers.rs` (2 locations): set
+     `ec_converted: false`.
+  3. `apply_ec_conversion_done` (manager/src/recovery.rs): drop the
+     `original_replicates: u32` parameter (and the caller's
+     `orig_replica_count`); set `ex.ec_converted = true`.
+  4. EC conversion dispatch filter (recovery.rs:377): `ex.ec_converted`.
+  5. Read-path dispatch (`client.rs::read_with_layout`): `if
+     ex.ec_converted` — the panic site.
+  6. Recovery dispatch (`extent_node.rs::run_recovery_task`): `if
+     !extent_info.ec_converted` for the replication path.
+  7. Info display (`autumn_client.rs::Info`): render `EC(K+M)` only when
+     `ec_converted`; otherwise render `replicas=[…replicates ++
+     parity…]` so all K+M nodes that physically hold the replicated
+     payload show up.
+  8. mgr↔local conversion helpers: copy through.
+  9. Tests (`ec_failover.rs`, `update_stream_ec.rs`): assertion switched
+     from `!ext.parity.is_empty()` to `ext.ec_converted`.
+  10. `crates/stream/CLAUDE.md` Programming Note 16: codify the rule.
 
 Files changed:
-  - crates/stream/src/extent_node.rs (handle_convert_to_ec encode +
-    run_ec_recovery_payload reconstruct wrapped in spawn_blocking)
-  - crates/stream/src/client.rs       (ec_read_full decode wrapped in
-    spawn_blocking)
-  - crates/stream/CLAUDE.md           (Programming Note 15 — CPU-
-    bound work must run on the blocking pool)
-  - feature_list.md                    (F117 entry: target / evidence
-    / fix / verification / acceptance / notes)
+  - crates/rpc/src/manager_rpc.rs        (MgrExtentInfo schema)
+  - crates/stream/src/extent_rpc.rs      (ExtentInfo schema)
+  - crates/manager/src/rpc_handlers.rs   (2 init sites)
+  - crates/manager/src/recovery.rs       (signature + set + filter)
+  - crates/stream/src/client.rs          (read_with_layout dispatch +
+                                          mgr_to_extent_info)
+  - crates/stream/src/extent_node.rs     (run_recovery_task dispatch +
+                                          mgr_to_local_extent)
+  - crates/server/src/bin/autumn_client.rs (info display)
+  - crates/manager/tests/ec_failover.rs   (test assertion + print)
+  - crates/manager/tests/update_stream_ec.rs (test assertion)
+  - crates/stream/CLAUDE.md               (Programming Note 16)
+  - feature_list.md                        (F118 entry)
 
 Verification:
-  - cargo build --workspace: clean (only pre-existing dead-code
+  - cargo build --workspace --tests: clean (only pre-existing dead-code
     warnings).
-  - cargo test -p autumn-stream --tests -- --test-threads=1: 70/70
-    pass (same baseline as F116 — one timing-sensitive test only
-    stable serially is pre-existing).
-  - cargo test -p autumn-partition-server --lib: 86 pass / 2 fail.
-    The two failures are the known pre-existing F099-I flaky pair
-    (`f099i_d1_fast_path_no_fu_allocation`,
-    `f099i_fast_path_inactive_under_batch`) documented in F104.
-    Re-running with `-- --test-threads=1` they pass 5/5 — confirmed
-    timing flake, unrelated to F117.
+  - cargo test -p autumn-stream --tests -- --test-threads=1: 70/70 pass.
+  - cargo test -p autumn-manager --test ec_failover --test update_stream_ec:
+    5/5 pass.
+  - cargo test -p autumn-partition-server --lib: 86 pass / 2 fail
+    (pre-existing F099-I flakes documented in F104 — pass 5/5 with
+    --test-threads=1).
+  - cargo test -p autumn-manager --lib: 4 pass / 1 fail
+    (`register_node_duplicate_addr_rejected` — pre-existing, documented in
+    F116's verification notes).
+  - grep -r original_replicates → no matches anywhere in crates/.
 
   Live cluster verification (deferred to operator):
-    - During an active EC conversion sweep on a multi-extent cluster,
-      `top -pid $(pgrep autumn-extent | head -1)` should still show
-      high RS-encode CPU (expected) — but on a different blocking
-      thread, not the event-loop thread.
-    - `time autumn-client put …` against a different extent on the
-      same node should remain at steady-state latency (~1–5 ms
-      loopback), not stall hundreds of ms while a 128 MiB encode runs.
+    - Etcd schema is incompatible — wipe etcd dir before restart (the
+      old `original_replicates: u32` rkyv records will not deserialize
+      against the new `ec_converted: bool` field).
+    - Reproduce the panic scenario: write enough data to trigger a
+      partition split, then read from the new (right) partition before
+      its log_stream tail extent has been sealed + EC-converted.
+      Pre-fix: PS panic on `client.rs::read_with_layout →
+      ec_subrange_read`. Post-fix: read succeeds via
+      `read_replicated_with_failover` against all 4 nodes.
+    - `autumn-client info` should render open extents as
+      `replicas=[1,3,5,7]` (all K+M nodes) instead of
+      `EC(3+1) parity=[7]`. Once conversion lands, sealed extents
+      should show `EC(3+1), data=[1,3,5], parity=[7]`.
 
-Performance note:
-  - spawn_blocking has a one-time cost of dispatching to a worker
-    thread (~5–20 µs). Trivial vs the 100–300 ms RS encode/decode
-    on a 128 MiB extent (~10⁴× cheaper). For the recovery path the
-    surrounding compio::spawn task is also amortised over the 10s
-    backoff retry loop so the dispatch cost is invisible.
+Out of scope:
+  - Manager's `min_size` check in `handle_check_commit_length` /
+    `handle_stream_alloc_extent` (rpc_handlers.rs:576/:717) still uses
+    `ex.parity.is_empty()` to require K alive replicas instead of 1 for
+    pre-conversion extents — overly strict but not a correctness bug;
+    revisit if a partial-failure scenario actually trips it.
 
 Next steps:
   None — implemented + tested + documented.

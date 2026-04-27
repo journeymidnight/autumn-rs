@@ -115,7 +115,14 @@ pub struct MgrExtentInfo {
     pub avali: u32,
     pub replicate_disks: Vec<u64>,
     pub parity_disks: Vec<u64>,
-    pub original_replicates: u32,
+    /// True iff `apply_ec_conversion_done` has rewritten this extent's
+    /// shards into RS-encoded form. False for (a) freshly allocated
+    /// open extents — even on EC streams where `parity` is pre-filled
+    /// at allocation time — and (b) sealed extents still waiting for
+    /// the manager's `ec_conversion_dispatch_loop` to fire. Read paths
+    /// branch on this, NOT on `parity.is_empty()` — see programming
+    /// note in `crates/stream/CLAUDE.md`.
+    pub ec_converted: bool,
 }
 
 /// Stream metadata — mirrors proto StreamInfo.

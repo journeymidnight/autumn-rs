@@ -506,6 +506,30 @@ sufficient (and cheaper than DashMap).
     stale replicas — every replica reports the same mismatch by
     construction.
 
+16. **EC dispatch keys on `ExtentInfo.ec_converted`, NEVER on
+    `parity.is_empty()` (F118)** — The manager pre-fills `parity` for
+    every extent allocated via `stream_alloc_extent` on an EC stream
+    (`crates/manager/src/rpc_handlers.rs`), so an open / pre-conversion
+    extent has `parity != []` even though it still holds full
+    replicated data on every K+M node. Only after the
+    `ec_conversion_dispatch_loop` fires `apply_ec_conversion_done` on
+    a *sealed* extent does the data physically split into K data + M
+    parity shards; that's also when `ec_converted` flips to `true`.
+    Routing a pre-conversion extent through `ec_subrange_read` would
+    compute `shard_size` from `sealed_length=0` and panic on the
+    per-shard slice with `range start index … out of range for slice
+    of length …` — and the underlying data isn't EC-shaped yet
+    anyway. Read-side dispatch (`client.rs::read_with_layout`) and
+    recovery-side dispatch (`extent_node.rs::run_recovery_task`) both
+    branch on `ec_converted`. The display path
+    (`autumn_client::Info`) uses the same flag, so open extents
+    correctly render as `replicas=[…all K+M nodes…]` instead of
+    `EC(K+M)`. **Invariant:** `ec_converted == true` implies
+    `sealed_length > 0` (the conversion loop refuses to act on open
+    extents at `recovery.rs:377`). Any future code that tags an
+    extent as EC must preserve this — never set `ec_converted` on an
+    open extent.
+
 15. **CPU-bound work MUST run on the blocking pool, not the compio
     event loop (F117)** — Reed-Solomon `ec_encode` / `ec_decode` /
     `ec_reconstruct_shard` each take 100–300 ms on a 128 MiB extent.

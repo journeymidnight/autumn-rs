@@ -19,7 +19,7 @@ fn mgr_to_local_extent(e: &MgrExtentInfo) -> ExtentInfo {
         avali: e.avali,
         replicate_disks: e.replicate_disks.clone(),
         parity_disks: e.parity_disks.clone(),
-        original_replicates: e.original_replicates,
+        ec_converted: e.ec_converted,
     }
 }
 use crate::wal::{replay_wal_files, should_use_wal, Wal, WalRecord};
@@ -1907,7 +1907,14 @@ impl ExtentNode {
     ) -> Result<RecoveryTaskDone, String> {
         let extent_info = self.resolve_recovery_extent(&task).await?;
 
-        let payload = if extent_info.parity.is_empty() {
+        // EC vs replication dispatch keys on `ec_converted` (set by the
+        // manager's `apply_ec_conversion_done` after a sealed extent has
+        // actually been RS-encoded). Pre-EC extents — including the open
+        // extents the manager pre-allocates with parity slots in
+        // `stream_alloc_extent` — are still full-replicated on every K+M
+        // node, so they must take the replication path even though
+        // `extent_info.parity` is non-empty.
+        let payload = if !extent_info.ec_converted {
             // Replication recovery: copy full extent from any healthy peer.
             let raw = self
                 .fetch_full_extent_from_sources(&extent_info, &[task.node_id, task.replace_id])

@@ -1486,6 +1486,21 @@ impl StreamClient {
     /// EC extents, replicated read with chunked failover for replica
     /// extents. The `read_bytes_from_extent` retry loop handles
     /// stale-cache (`EversionStale`) propagation.
+    ///
+    /// EC dispatch keys on `ec_converted` (set only by the manager's
+    /// `apply_ec_conversion_done` after RS-encoding a sealed extent),
+    /// NOT on `parity.is_empty()`. The manager pre-fills `parity` for
+    /// every extent allocated via `stream_alloc_extent` on an EC
+    /// stream, but those extents stay full-replicated on every K+M
+    /// node until EC conversion runs (only triggered after seal).
+    /// Routing an open / pre-conversion extent through `ec_subrange_read`
+    /// would compute `shard_size` from `sealed_length=0` and panic with
+    /// `range start index … out of range for slice of length …` on the
+    /// per-shard slice — and the underlying data isn't EC-shaped yet
+    /// anyway. `read_replicated_with_failover` already iterates the
+    /// full `replicates ++ parity` address list via
+    /// `replica_addrs_for_extent`, so it correctly hits all K+M nodes
+    /// holding the replicated payload.
     async fn read_with_layout(
         &self,
         extent_id: u64,
@@ -1493,7 +1508,7 @@ impl StreamClient {
         length: u32,
         ex: &ExtentInfo,
     ) -> Result<(Vec<u8>, u32)> {
-        if !ex.parity.is_empty() {
+        if ex.ec_converted {
             return self.ec_subrange_read(extent_id, offset, length, ex).await;
         }
 
@@ -1918,7 +1933,7 @@ impl StreamClient {
             avali: e.avali,
             replicate_disks: e.replicate_disks.clone(),
             parity_disks: e.parity_disks.clone(),
-            original_replicates: e.original_replicates,
+            ec_converted: e.ec_converted,
         }
     }
 }

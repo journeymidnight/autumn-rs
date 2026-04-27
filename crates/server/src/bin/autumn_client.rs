@@ -2407,11 +2407,21 @@ async fn main() -> Result<()> {
                     extents.sort_by_key(|(id, _)| **id);
                     for (eid, e) in &extents {
                         let tag = if open_extents.contains(eid) { " (open)" } else { "" };
-                        let layout = if !e.parity.is_empty() {
+                        // `ec_converted` is the authoritative EC marker — set
+                        // only by `apply_ec_conversion_done` after a sealed
+                        // extent is actually RS-encoded. Open / pre-conversion
+                        // extents on EC streams still hold full replicated
+                        // data on every K+M node despite having `parity != []`
+                        // pre-filled by `stream_alloc_extent`.
+                        let layout = if e.ec_converted {
                             format!("EC({}+{}), data={:?}, parity={:?}",
                                 e.replicates.len(), e.parity.len(), e.replicates, e.parity)
-                        } else {
+                        } else if e.parity.is_empty() {
                             format!("replicas={:?}", e.replicates)
+                        } else {
+                            let mut all = e.replicates.clone();
+                            all.extend(e.parity.iter().copied());
+                            format!("replicas={:?}", all)
                         };
                         println!("  extent {}: size={}{}, {}, refs={}, eversion={}",
                             eid, human_size(e.sealed_length), tag, layout, e.refs, e.eversion);

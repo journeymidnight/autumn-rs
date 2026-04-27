@@ -338,7 +338,7 @@ impl AutumnManager {
             avali: 0,
             replicate_disks: disk_ids,
             parity_disks: vec![],
-            original_replicates: 0,
+            ec_converted: false,
         };
 
         {
@@ -799,7 +799,7 @@ impl AutumnManager {
             avali: 0,
             replicate_disks: disk_ids[..data].to_vec(),
             parity_disks: disk_ids[data..].to_vec(),
-            original_replicates: 0,
+            ec_converted: false,
         };
 
         let stream_after = {

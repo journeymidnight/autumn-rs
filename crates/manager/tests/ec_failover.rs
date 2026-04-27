@@ -190,14 +190,14 @@ fn ec_2_1_failover_and_recovery() {
             compio::time::sleep(Duration::from_secs(2)).await;
             let ex = get_extent_info(&mgr, first_extent_id).await;
             eprintln!(
-                "extent {} sealed={} replicates={:?} parity={:?} original_replicates={}",
+                "extent {} sealed={} replicates={:?} parity={:?} ec_converted={}",
                 first_extent_id,
                 ex.sealed_length,
                 ex.replicates,
                 ex.parity,
-                ex.original_replicates
+                ex.ec_converted
             );
-            if !ex.parity.is_empty() {
+            if ex.ec_converted {
                 ec_converted = true;
                 eprintln!("EC conversion done!");
                 break;

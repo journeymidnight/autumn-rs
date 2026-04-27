@@ -322,7 +322,14 @@ pub struct ExtentInfo {
     pub avali: u32,
     pub replicate_disks: Vec<u64>,
     pub parity_disks: Vec<u64>,
-    pub original_replicates: u32,
+    /// True iff this extent has actually been EC-converted (sealed +
+    /// RS-encoded by `apply_ec_conversion_done`). The read path uses
+    /// this — NOT `parity.is_empty()` — to decide between
+    /// `ec_subrange_read` and `read_replicated_with_failover`. The
+    /// manager pre-fills `parity` at allocation time on EC streams,
+    /// so an open / pre-conversion extent has `parity != []` but
+    /// still holds full replicated data on every K+M node.
+    pub ec_converted: bool,
 }
 
 /// StreamInfo — stream ID and its ordered list of extent IDs.
