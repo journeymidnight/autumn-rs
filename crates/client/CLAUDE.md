@@ -57,6 +57,31 @@ Main entry point. Connect via `ClusterClient::connect("addr1,addr2")`.
 - PS connections: cached per-address, dropped on error, recreated on next call
 - Routing: `GetRegions` cached at connect, refresh on routing miss (binary search)
 
+### F099-K per-partition routing (SDK side)
+
+After F099-K, each partition binds its own TCP listener at `base_port + ord`.
+The PS-level address from `register_ps` (cached in `ps_details[ps_id].address`)
+only owns the FIRST partition opened on that PS — sending a RangeReq /
+PutReq / GetReq for any other partition to that address gets back
+`CODE_NOT_FOUND` from the receiving merged_partition_loop's mis-routed-frame
+fast path.
+
+Every cross-partition / per-partition call site MUST resolve via
+`part_addrs[part_id]` first, falling back to `ps_details[ps_id].address`
+only when the partition is not yet registered (transient post-split
+state):
+
+| Call site | Resolver |
+|-----------|----------|
+| `lookup_key` (get/put/del/head/stream_put) | `part_addrs.get(part_id).or_else(ps_details[ps_id])` |
+| `resolve_part_id` (split/compact/gc/flush) | same |
+| `all_partitions` (CLI listing) | same |
+| `range` (cross-partition scan) | same — F112 fixed this; was using ps_details only |
+
+`range` additionally surfaces per-partition errors instead of `continue`:
+silently dropping one partition's response would return a half-empty
+`Ok(RangeResult)`, which is indistinguishable from a true empty result.
+
 ## Dependencies
 
 - `autumn-rpc`: RPC client + wire codec (partition_rpc, manager_rpc)

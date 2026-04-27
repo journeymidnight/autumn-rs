@@ -589,11 +589,26 @@ impl ClusterClient {
                 }
             }
 
-            let ps_addr = match self.ps_details.get(&region.ps_id) {
-                Some(d) => d.address.clone(),
-                None => continue,
-            };
             let part_id = region.part_id;
+            // F112: prefer per-partition listener (F099-K). The PS-level
+            // address from `register_ps` is only the FIRST partition's
+            // listener post-F099-K; using it for every partition's range
+            // RPC mis-routes the other partitions, the PS replies with
+            // NotFound for `part_id != owner_part`, and we drop their
+            // entries. Mirror the lookup pattern in `lookup_key`,
+            // `resolve_part_id`, and `all_partitions`.
+            let ps_addr = match self.part_addrs.get(&part_id) {
+                Some(a) => a.clone(),
+                None => match self.ps_details.get(&region.ps_id) {
+                    Some(d) => d.address.clone(),
+                    None => {
+                        return Err(AutumnError::RoutingError(format!(
+                            "no address for partition {part_id} (ps_id {})",
+                            region.ps_id
+                        )));
+                    }
+                },
+            };
 
             let resp_bytes = match self
                 .ps_call(
@@ -609,15 +624,20 @@ impl ClusterClient {
                 .await
             {
                 Ok(b) => b,
-                Err(_) => {
+                Err(e) => {
+                    // F112: refresh regions then surface — silently
+                    // skipping a partition truncates the result without
+                    // the caller knowing.
                     let _ = self.refresh_regions().await;
-                    continue;
+                    return Err(AutumnError::ConnectionError(format!(
+                        "range on partition {part_id}: {e}"
+                    )));
                 }
             };
             let resp: RangeResp = rkyv_decode(&resp_bytes)
                 .map_err(|e| AutumnError::ServerError(e))?;
             if resp.code != partition_rpc::CODE_OK {
-                continue;
+                return Err(code_to_error(resp.code, resp.message));
             }
 
             let count = resp.entries.len() as u32;
