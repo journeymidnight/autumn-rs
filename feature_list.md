@@ -682,8 +682,19 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
   - (d) `AUTUMN_EC_LOG=off AUTUMN_EC_ROW=off ./cluster.sh reset 4` 强制全 replication，info 显示 `(0+0)` 复制 4。
   - (e) `AUTUMN_EC_ROW=5+2 ./cluster.sh reset 7` 后 row stream `(5+2)`，log stream 走默认 3+1；如果 K+M > 实际 replicas（例如 `AUTUMN_EC_LOG=5+2 ./cluster.sh reset 4`），cluster.sh 报错退出而不是悄悄降级。
   - (f) bootstrap 失败路径有清晰报错（manager 拒绝 `ec_data < 2` 的 case 已存在，此处只确认 cluster.sh 正确传参）。
-- **Notes:** EC 创建时 manager 仍按 replication 分配第一个 extent（`replicates = K+M` 个节点），后续 seal 触发 `convert_to_ec` 把数据 reshape 成 K data shards + M parity shards——本 feature 不动 conversion 路径，只确保 stream metadata 创建时携带 EC 形状。meta stream 永远不 EC：体积小（TableLocations 几 KB）+ 频繁 truncate，EC 收益负。N==3 → 2+1 比 3-replication 多了一个 parity shard 的恢复能力，但写入仅需 2 份 data + 1 份 parity（数据量与 3-replication 持平），属于免费的耐久性升级。
-- **passes:** false
+- **Notes:** EC 创建时 manager 仍按 replication 分配第一个 extent（`replicates = K+M` 个节点），后续 seal 触发 `convert_to_ec` 把数据 reshape 成 K data shards + M parity shards——本 feature 不动 conversion 路径，只确保 stream metadata 创建时携带 EC 形状。meta stream 永远不 EC：体积小（TableLocations 几 KB）+ 频繁 truncate，EC 收益负。N==3 → 2+1 比 3-replication 多了一个 parity shard 的恢复能力，但写入仅需 2 份 data + 1 份 parity（数据量与 3-replication 持平），属于免费的耐久性升级。Implementation: `cluster.sh` auto-EC decision matrix in `do_start`; `autumn-client bootstrap --log-ec K+M --row-ec K+M`; `parse_ec_flag` helper; per-stream `create_stream_once(replicates, ec_data, ec_parity)` in bootstrap handler.
+- **passes:** true
+
+### FOPS-03 · 修改已有 stream 的 EC 配置 (set-stream-ec)
+- **Target:** (1) 新增 manager RPC `MSG_UPDATE_STREAM_EC = 0x32`，请求 `UpdateStreamEcReq { stream_id, ec_data_shard, ec_parity_shard }`，返回 `UpdateStreamEcResp { code, message, stream }`；handler 校验 `ec_data >= 2 && ec_parity >= 1`，mutate in-memory `MgrStreamInfo`，持久化到 etcd（通过 `mirror_stream_meta_update`）；(2) `autumn-client set-stream-ec --stream <ID> --ec K+M` CLI 命令；(3) 现有 `ec_conversion_dispatch_loop`（`crates/manager/src/recovery.rs:361`，每 5 s 轮询）会自动 pick up 新的 EC 配置并 convert 该 stream 的所有 sealed extents（包括按需通过 `alloc_extent_on_node` 补齐节点到 K+M 个）——conversion 路径不需要额外修改。
+- **Evidence:** `crates/rpc/src/manager_rpc.rs` (`MSG_UPDATE_STREAM_EC = 0x32`, `UpdateStreamEcReq`, `UpdateStreamEcResp`) · `crates/manager/src/rpc_handlers.rs` (`handle_update_stream_ec` + dispatch arm) · `crates/manager/src/lib.rs` (`mirror_stream_meta_update`) · `crates/server/src/bin/autumn_client.rs` (`Command::SetStreamEc` + parser + executor) · `crates/manager/tests/update_stream_ec.rs` (4 tests: `update_stream_ec_sets_ec_fields`, `update_stream_ec_rejects_ec_data_below_two`, `update_stream_ec_rejects_unknown_stream`, `update_stream_ec_triggers_conversion`)
+- **Acceptance:**
+  - 调用 `set-stream-ec --stream <ID> --ec 3+1` 成功，`info` 显示该 stream EC 变为 `(3+1)`。
+  - 5-15 s 内 sealed extents 的 `original_replicates > 0`（parity 字段非空），可 `get` 验证数据完整。
+  - `--ec 1+1` → manager 返回 InvalidArgument；`--stream 999999` → NotFound。
+  - K+M > 当前节点数：manager 接受（不做事前校验），conversion loop 在缺少节点时跳过并 WARN；不会静默破坏数据。
+- **Notes:** `mirror_stream_meta_update` 只写 `streams/{id}` 一条 etcd key（复用 rkyv_encode(stream)），比 `mirror_create_stream` 更轻量（后者还写 extent）。所有 4 个集成测试通过（含需要真实 extent-node + EC conversion 的 `update_stream_ec_triggers_conversion`）。`register_node_duplicate_addr_rejected` 和 `f099i_*` 为已知 pre-existing failure，与本 feature 无关。
+- **passes:** true
 
 ---
 

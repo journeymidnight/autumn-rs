@@ -2,9 +2,11 @@
 
 ## Purpose
 
-The central control-plane service. Serves 16 RPCs via autumn-rpc (custom binary protocol on compio):
-- StreamManager (12 RPCs): status, acquire_owner_lock, register_node, create_stream, stream_info, extent_info, nodes_info, check_commit_length, stream_alloc_extent, stream_punch_holes, truncate, multi_modify_split
+The central control-plane service. Serves 18 RPCs via autumn-rpc (custom binary protocol on compio):
+- StreamManager (14 RPCs): status, acquire_owner_lock, register_node, create_stream, update_stream_ec, stream_info, extent_info, nodes_info, check_commit_length, stream_alloc_extent, stream_punch_holes, truncate, multi_modify_split, reconcile_extents
 - PartitionManager (4 RPCs): register_ps, upsert_partition, get_regions, heartbeat_ps
+
+`update_stream_ec` (MSG_UPDATE_STREAM_EC = 0x32, FOPS-03): mutates `MgrStreamInfo.ec_data_shard / ec_parity_shard` on an existing stream. After the call, the `ec_conversion_dispatch_loop` (fires every 5 s) picks up any sealed extents in the stream and converts them to the new EC shape, allocating extra extent-node slots if K+M > current replica count.
 
 Uses etcd (optional, via autumn-etcd compio-native client) for persistent metadata and leader election. Single-threaded compio runtime (Rc/RefCell, !Send).
 

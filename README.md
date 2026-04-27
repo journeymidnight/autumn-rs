@@ -54,7 +54,8 @@ cd autumn-rs
 cargo build --workspace          # build binaries first
 
 ./cluster.sh start               # 1-replica cluster (default)
-./cluster.sh start 3             # 3-replica cluster
+./cluster.sh start 3             # 3-replica cluster (EC 2+1 for log/row, meta 3+0)
+./cluster.sh start 4             # 4-replica cluster (EC 3+1 for log/row, meta 3+0)
 
 ./cluster.sh stop                # kill all processes
 ./cluster.sh clean               # stop + wipe /tmp/autumn-rs data dirs
@@ -63,6 +64,20 @@ cargo build --workspace          # build binaries first
 
 ./cluster.sh status              # show which processes are running
 ./cluster.sh logs                # tail all log files (Ctrl-C to exit)
+```
+
+**Auto-EC bootstrap** (FOPS-02): when `replicas ≥ 3`, `cluster.sh` automatically sets EC on log/row streams:
+
+| replicas | log/row streams | meta stream |
+|----------|----------------|-------------|
+| 1, 2 | `N+0` pure replication | `N+0` |
+| 3 | EC `2+1` (replicates=3) | `3+0` |
+| ≥4 | EC `3+1` (replicates=4) | `3+0` |
+
+Override with env vars (before `cluster.sh start N`):
+```bash
+AUTUMN_EC_LOG=off AUTUMN_EC_ROW=off ./cluster.sh start 4   # force all-replication
+AUTUMN_EC_ROW=5+2 ./cluster.sh start 7                     # custom row EC (needs K+M ≤ N)
 ```
 
 ### Per-process control (recovery testing)

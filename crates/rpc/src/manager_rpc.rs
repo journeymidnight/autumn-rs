@@ -42,6 +42,11 @@ pub const MSG_REGISTER_PARTITION_ADDR: u8 = 0x30;
 // no longer present in `s.extents` so the node can unlink them.
 pub const MSG_RECONCILE_EXTENTS: u8 = 0x31;
 
+// FOPS-03: mutate an existing stream's EC configuration.
+// After this call the manager's ec_conversion_dispatch_loop will pick up
+// any sealed extents in that stream and convert them on the next tick (~5s).
+pub const MSG_UPDATE_STREAM_EC: u8 = 0x32;
+
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
 /// Serialize a value to Bytes using rkyv.
@@ -498,6 +503,21 @@ pub struct ExtDiskStatus {
 pub struct ExtDfResp {
     pub done_tasks: Vec<MgrRecoveryTaskDone>,
     pub disk_status: Vec<(u64, ExtDiskStatus)>,
+}
+
+// --- UpdateStreamEc (FOPS-03) ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct UpdateStreamEcReq {
+    pub stream_id: u64,
+    pub ec_data_shard: u32,
+    pub ec_parity_shard: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct UpdateStreamEcResp {
+    pub code: u8,
+    pub message: String,
+    pub stream: Option<MgrStreamInfo>,
 }
 
 /// DeleteExtent request (manager → extent node, F109).

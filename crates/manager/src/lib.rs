@@ -1006,6 +1006,19 @@ impl AutumnManager {
         Ok(())
     }
 
+    async fn mirror_stream_meta_update(&self, stream: &MgrStreamInfo) -> Result<(), AppError> {
+        if let Some(etcd) = &self.etcd {
+            let kvs = vec![(
+                format!("streams/{}", stream.stream_id),
+                rkyv_encode(stream).to_vec(),
+            )];
+            etcd.put_msgs_txn(kvs)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     async fn mirror_create_stream(
         &self,
         stream: &MgrStreamInfo,

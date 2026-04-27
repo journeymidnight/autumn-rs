@@ -89,6 +89,15 @@ enum Command {
     Bootstrap {
         replication: String,
         presplit: String,
+        /// parsed `--log-ec K+M`; None = use same replicates as meta_stream, no EC
+        log_ec: Option<(u32, u32)>,
+        /// parsed `--row-ec K+M`; None = use same replicates as meta_stream, no EC
+        row_ec: Option<(u32, u32)>,
+    },
+    SetStreamEc {
+        stream_id: u64,
+        ec_data: u32,
+        ec_parity: u32,
     },
     Put {
         key: String,
@@ -234,6 +243,8 @@ fn parse_args() -> Args {
         "bootstrap" => {
             let mut replication = String::from("3+0");
             let mut presplit = String::from("1:normal");
+            let mut log_ec: Option<(u32, u32)> = None;
+            let mut row_ec: Option<(u32, u32)> = None;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--replication" => {
@@ -244,6 +255,20 @@ fn parse_args() -> Args {
                         i += 1;
                         presplit = raw[i].clone();
                     }
+                    "--log-ec" => {
+                        i += 1;
+                        log_ec = Some(parse_ec_flag(&raw[i]).unwrap_or_else(|e| {
+                            eprintln!("--log-ec: {e}");
+                            std::process::exit(1);
+                        }));
+                    }
+                    "--row-ec" => {
+                        i += 1;
+                        row_ec = Some(parse_ec_flag(&raw[i]).unwrap_or_else(|e| {
+                            eprintln!("--row-ec: {e}");
+                            std::process::exit(1);
+                        }));
+                    }
                     _ => break,
                 }
                 i += 1;
@@ -251,7 +276,42 @@ fn parse_args() -> Args {
             Command::Bootstrap {
                 replication,
                 presplit,
+                log_ec,
+                row_ec,
             }
+        }
+        "set-stream-ec" => {
+            let mut stream_id: Option<u64> = None;
+            let mut ec: Option<(u32, u32)> = None;
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--stream" => {
+                        i += 1;
+                        stream_id = Some(raw[i].parse().unwrap_or_else(|_| {
+                            eprintln!("--stream requires a numeric stream ID");
+                            std::process::exit(1);
+                        }));
+                    }
+                    "--ec" => {
+                        i += 1;
+                        ec = Some(parse_ec_flag(&raw[i]).unwrap_or_else(|e| {
+                            eprintln!("--ec: {e}");
+                            std::process::exit(1);
+                        }));
+                    }
+                    _ => break,
+                }
+                i += 1;
+            }
+            let stream_id = stream_id.unwrap_or_else(|| {
+                eprintln!("set-stream-ec requires --stream <ID>");
+                std::process::exit(1);
+            });
+            let (ec_data, ec_parity) = ec.unwrap_or_else(|| {
+                eprintln!("set-stream-ec requires --ec K+M");
+                std::process::exit(1);
+            });
+            Command::SetStreamEc { stream_id, ec_data, ec_parity }
         }
         "put" => {
             let mut nosync = false;
@@ -665,6 +725,20 @@ fn parse_replication(s: &str) -> Result<u32> {
     Ok(n)
 }
 
+/// Parse `K+M` EC shape string into `(data_shards, parity_shards)`.
+fn parse_ec_flag(s: &str) -> Result<(u32, u32)> {
+    let parts: Vec<&str> = s.splitn(2, '+').collect();
+    if parts.len() != 2 {
+        bail!("EC shape must be K+M (e.g. '3+1'), got '{s}'");
+    }
+    let k: u32 = parts[0].parse().with_context(|| format!("parse K in EC '{s}'"))?;
+    let m: u32 = parts[1].parse().with_context(|| format!("parse M in EC '{s}'"))?;
+    if k == 0 || m == 0 {
+        bail!("EC K and M must both be >= 1, got '{s}'");
+    }
+    Ok((k, m))
+}
+
 fn parse_bool_flag(value: &str, flag: &str) -> Result<bool> {
     match value {
         "true" | "1" | "yes" => Ok(true),
@@ -1043,8 +1117,21 @@ async fn main() -> Result<()> {
         Command::Bootstrap {
             replication,
             presplit,
+            log_ec,
+            row_ec,
         } => {
-            let replicates = parse_replication(&replication)?;
+            let meta_replicates = parse_replication(&replication)?;
+
+            // Per-stream (replicates, ec_data, ec_parity):
+            // - EC streams use K+M as replicates and carry the shard counts.
+            // - Non-EC streams use meta_replicates with ec=0+0.
+            let log_params = log_ec
+                .map(|(k, m)| (k + m, k, m))
+                .unwrap_or((meta_replicates, 0, 0));
+            let row_params = row_ec
+                .map(|(k, m)| (k + m, k, m))
+                .unwrap_or((meta_replicates, 0, 0));
+            let meta_params = (meta_replicates, 0u32, 0u32);
 
             let ranges: Vec<(Vec<u8>, Vec<u8>)> = {
                 let parts: Vec<&str> = presplit.splitn(2, ':').collect();
@@ -1056,13 +1143,13 @@ async fn main() -> Result<()> {
                 }
             };
 
-            let create_stream_once = |label: &'static str| {
+            let create_stream_once = |label: &'static str, replicates: u32, ec_data: u32, ec_parity: u32| {
                 let client = &client;
                 async move {
                     let req_bytes = rkyv_encode(&CreateStreamReq {
                         replicates,
-                        ec_data_shard: 0,
-                        ec_parity_shard: 0,
+                        ec_data_shard: ec_data,
+                        ec_parity_shard: ec_parity,
                     });
                     let mut attempt = 0u32;
                     loop {
@@ -1088,9 +1175,12 @@ async fn main() -> Result<()> {
             };
 
             for (idx, (start_key, end_key)) in ranges.iter().enumerate() {
-                let log_stream_id = create_stream_once("log").await?;
-                let row_stream_id = create_stream_once("row").await?;
-                let meta_stream_id = create_stream_once("meta").await?;
+                let (log_repl, log_k, log_m) = log_params;
+                let (row_repl, row_k, row_m) = row_params;
+                let (meta_repl, meta_k, meta_m) = meta_params;
+                let log_stream_id = create_stream_once("log", log_repl, log_k, log_m).await?;
+                let row_stream_id = create_stream_once("row", row_repl, row_k, row_m).await?;
+                let meta_stream_id = create_stream_once("meta", meta_repl, meta_k, meta_m).await?;
 
                 let meta = MgrPartitionMeta {
                     log_stream: log_stream_id,
@@ -1133,12 +1223,47 @@ async fn main() -> Result<()> {
                 } else {
                     String::from_utf8_lossy(end_key).to_string()
                 };
+                let (_, log_k, log_m) = log_params;
+                let (_, row_k, row_m) = row_params;
                 println!(
-                    "partition {} created: id={} log={} row={} meta={} range=[{}..{})",
-                    idx, resp.part_id, log_stream_id, row_stream_id, meta_stream_id, start_s, end_s
+                    "partition {} created: id={} log={} ({}+{}) row={} ({}+{}) meta={} (0+0) range=[{}..{})",
+                    idx, resp.part_id,
+                    log_stream_id, log_k, log_m,
+                    row_stream_id, row_k, row_m,
+                    meta_stream_id,
+                    start_s, end_s
                 );
             }
             println!("bootstrap succeeded: {} partition(s)", ranges.len());
+        }
+
+        Command::SetStreamEc { stream_id, ec_data, ec_parity } => {
+            let req_bytes = rkyv_encode(&UpdateStreamEcReq {
+                stream_id,
+                ec_data_shard: ec_data,
+                ec_parity_shard: ec_parity,
+            });
+            let mut attempt = 0u32;
+            loop {
+                let resp_bytes = client.mgr()?
+                    .call(MSG_UPDATE_STREAM_EC, req_bytes.clone())
+                    .await
+                    .context("update stream EC")?;
+                let resp: UpdateStreamEcResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+                if resp.code == CODE_OK {
+                    println!(
+                        "stream {} EC updated to {}+{}; conversion will run on next manager tick (~5s)",
+                        stream_id, ec_data, ec_parity
+                    );
+                    break;
+                }
+                if resp.code == CODE_NOT_LEADER && attempt < 60 {
+                    attempt += 1;
+                    compio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                bail!("set-stream-ec failed: code={} {}", resp.code, resp.message);
+            }
         }
 
         Command::Put { key, file, nosync } => {

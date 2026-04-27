@@ -339,9 +339,45 @@ do_start() {
         # Give PS a moment to sync regions and re-bind listeners on restart.
         wait_port 9201 ps 60
     else
-        # Use 3+0 replication when >= 3 nodes, otherwise match node count
-        local repl
-        if (( replicas >= 3 )); then repl="3+0"; else repl="${replicas}+0"; fi
+        # Auto-select EC shape based on replica count (FOPS-02).
+        # N>=4 → log/row EC 3+1 (replicates=4), meta 3+0.
+        # N==3 → log/row EC 2+1 (replicates=3), meta 3+0.
+        # N<3  → all streams pure replication N+0, no EC.
+        # Env overrides: AUTUMN_EC_LOG / AUTUMN_EC_ROW
+        #   "off"  → disable EC for that stream (pure replication)
+        #   "K+M"  → use that explicit shape
+        local log_ec_default row_ec_default meta_repl
+        if   (( replicas >= 4 )); then log_ec_default="3+1"; row_ec_default="3+1"; meta_repl=3
+        elif (( replicas == 3 )); then log_ec_default="2+1"; row_ec_default="2+1"; meta_repl=3
+        else                           log_ec_default="";    row_ec_default="";    meta_repl=$replicas
+        fi
+
+        local log_ec row_ec
+        case "${AUTUMN_EC_LOG:-}" in
+            off) log_ec="" ;;
+            ?*)  log_ec="$AUTUMN_EC_LOG" ;;
+            *)   log_ec="$log_ec_default" ;;
+        esac
+        case "${AUTUMN_EC_ROW:-}" in
+            off) row_ec="" ;;
+            ?*)  row_ec="$AUTUMN_EC_ROW" ;;
+            *)   row_ec="$row_ec_default" ;;
+        esac
+
+        # Validate K+M <= replicas to catch misconfiguration early.
+        for ec in "$log_ec" "$row_ec"; do
+            if [[ -n "$ec" ]]; then
+                [[ "$ec" =~ ^([0-9]+)\+([0-9]+)$ ]] || die "invalid EC shape '$ec' (expected K+M e.g. 3+1)"
+                local ec_k="${BASH_REMATCH[1]}" ec_m="${BASH_REMATCH[2]}"
+                (( ec_k >= 2 && ec_m >= 1 )) || die "EC shape '$ec' invalid: need K>=2 and M>=1"
+                (( ec_k + ec_m <= replicas )) || die "EC shape '$ec' needs K+M=$((ec_k+ec_m)) nodes, only have $replicas"
+            fi
+        done
+
+        local bootstrap_args=( --replication "${meta_repl}+0" )
+        [[ -n "$log_ec" ]] && bootstrap_args+=( --log-ec "$log_ec" )
+        [[ -n "$row_ec" ]] && bootstrap_args+=( --row-ec "$row_ec" )
+
         sleep 2  # give PS a moment to register with manager
         # AUTUMN_BOOTSTRAP_PRESPLIT: e.g. "4:3fffffff,7ffffffe,bffffffd"
         # The literal split points in the env var are documentation only;
@@ -351,10 +387,9 @@ do_start() {
         if [[ -n "${AUTUMN_BOOTSTRAP_PRESPLIT:-}" ]]; then
             local n_parts_arg="${AUTUMN_BOOTSTRAP_PRESPLIT%%:*}"
             [[ "$n_parts_arg" =~ ^[0-9]+$ ]] || n_parts_arg=1
-            "$AC" --manager "$MANAGER_ADDR" bootstrap --replication "$repl" --presplit "${n_parts_arg}:hexstring"
-        else
-            "$AC" --manager "$MANAGER_ADDR" bootstrap --replication "$repl"
+            bootstrap_args+=( --presplit "${n_parts_arg}:hexstring" )
         fi
+        "$AC" --manager "$MANAGER_ADDR" bootstrap "${bootstrap_args[@]}"
         touch "$bootstrap_marker"
         # Wait for PS to pick up the new partition(s) and finish opening them.
         # Each partition's open() runs stream commit_length calls serially against

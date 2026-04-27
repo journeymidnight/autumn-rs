@@ -216,7 +216,7 @@ Split is **Copy-on-Write** at the stream level:
 | `autumn-manager-server` | 9001 | Control plane: stream + partition management |
 | `autumn-extent-node` | 9101 | Data plane: raw extent storage on local disk |
 | `autumn-ps` | 9201 | Partition server: KV API |
-| `autumn-client` | — | Admin CLI (bootstrap, put, get, del, head, ls, split, info) |
+| `autumn-client` | — | Admin CLI (bootstrap, put, get, del, head, ls, split, set-stream-ec, info) |
 | `autumn-stream-cli` | — | Low-level stream layer CLI (create-stream, append, read) |
 
 ## Build & Test

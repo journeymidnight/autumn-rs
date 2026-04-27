@@ -1,7 +1,7 @@
 Date: 2026-04-26
 TaskStatus: completed
-Task scope: FOPS-01 — autumn-client `info` enhancements (shipped)
-  + FOPS-02 queued (not started)
+Task scope: FOPS-02 — cluster.sh auto-EC + bootstrap --log-ec/--row-ec (shipped)
+          + FOPS-03 — set-stream-ec RPC + CLI (shipped)
 
 FOPS-01 details:
   GC discard signal + --json / --top N / --part PID flags added to
@@ -76,25 +76,23 @@ Out of scope (not attempted):
 
 ---
 
-Queued (not started yet, recorded in feature_list.md P3):
+FOPS-02 summary:
+  cluster.sh do_start now auto-computes EC shape from replica count.
+  autumn-client bootstrap gained --log-ec K+M / --row-ec K+M flags.
+  parse_ec_flag() helper added. Per-stream create_stream_once takes
+  (replicates, ec_data, ec_parity). Both meta_stream always 0+0.
 
-  FOPS-02 — cluster.sh auto EC (replicas≥3)
-  ────────────────────────────────────────────────────────────────────────
-    Decision matrix:
-      N >= 4  →  log/row stream EC 3+1, meta stream replication 3+0
-      N == 3  →  log/row stream EC 2+1, meta stream replication 3+0
-      N <  3  →  all replication N+0 (same as now)
-    Env overrides:
-      AUTUMN_EC_LOG=off|K+M
-      AUTUMN_EC_ROW=off|K+M
-    Touch points:
-      cluster.sh do_start (line 343-357 current --replication decision)
-      crates/server/src/bin/autumn_client.rs Bootstrap branch
-        (add --log-ec / --row-ec flags, pass to CreateStreamReq)
-      manager handle_create_stream already supports EC fields — no change
+FOPS-03 summary:
+  MSG_UPDATE_STREAM_EC (0x32) manager RPC mutates stream EC fields.
+  mirror_stream_meta_update persists to etcd. ec_conversion_dispatch_loop
+  picks up the change automatically. autumn-client set-stream-ec CLI added.
+  4 integration tests in crates/manager/tests/update_stream_ec.rs.
 
-Next steps when resuming:
-  • FOPS-02: add --log-ec / --row-ec to `autumn-client bootstrap`,
-    update cluster.sh auto-EC decision
-  • Per CLAUDE.md long-task rules: print 已实现/未实现 list → code →
-    test → README → commit
+Pre-existing failures (unrelated):
+  • autumn-manager: register_node_duplicate_addr_rejected
+  • autumn-partition-server: f099i_d1_fast_path_no_fu_allocation,
+    f099i_fast_path_inactive_under_batch
+
+Next steps:
+  • Manual cluster verification (acceptance tests a-f from feature_list.md)
+    require a running cluster.

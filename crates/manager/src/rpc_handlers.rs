@@ -99,6 +99,7 @@ impl AutumnManager {
             MSG_HEARTBEAT_PS => self.handle_heartbeat_ps(payload).await,
             MSG_REGISTER_PARTITION_ADDR => self.handle_register_partition_addr(payload).await,
             MSG_RECONCILE_EXTENTS => self.handle_reconcile_extents(payload).await,
+            MSG_UPDATE_STREAM_EC => self.handle_update_stream_ec(payload).await,
             _ => Err((
                 StatusCode::InvalidArgument,
                 format!("unknown msg_type {msg_type}"),
@@ -355,6 +356,63 @@ impl AutumnManager {
             message: String::new(),
             stream: Some(stream.clone()),
             extent: Some(extent.clone()),
+        }))
+    }
+
+    async fn handle_update_stream_ec(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&UpdateStreamEcResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                stream: None,
+            }));
+        }
+
+        let req: UpdateStreamEcReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        if req.ec_data_shard < 2 || req.ec_parity_shard == 0 {
+            let err = AppError::InvalidArgument(
+                "ec_data_shard >= 2 and ec_parity_shard >= 1 required".to_string(),
+            );
+            return Ok(rkyv_encode(&UpdateStreamEcResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                stream: None,
+            }));
+        }
+
+        let stream = {
+            let mut s = self.store.inner.borrow_mut();
+            match s.streams.get_mut(&req.stream_id) {
+                Some(st) => {
+                    st.ec_data_shard = req.ec_data_shard;
+                    st.ec_parity_shard = req.ec_parity_shard;
+                    st.clone()
+                }
+                None => {
+                    let err = AppError::NotFound(format!("stream {} not found", req.stream_id));
+                    return Ok(rkyv_encode(&UpdateStreamEcResp {
+                        code: Self::err_to_code(&err),
+                        message: err.to_string(),
+                        stream: None,
+                    }));
+                }
+            }
+        };
+
+        if let Err(err) = self.mirror_stream_meta_update(&stream).await {
+            return Ok(rkyv_encode(&UpdateStreamEcResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                stream: None,
+            }));
+        }
+
+        Ok(rkyv_encode(&UpdateStreamEcResp {
+            code: CODE_OK,
+            message: String::new(),
+            stream: Some(stream),
         }))
     }
 

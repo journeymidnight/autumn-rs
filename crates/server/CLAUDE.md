@@ -60,7 +60,8 @@ autumn-client --manager 127.0.0.1:9001 <COMMAND>
 
 | Command | Description |
 |---------|-------------|
-| `bootstrap [--replication 3+0] [--presplit 1:normal\|N:hexstring]` | Create streams + partition(s); `--presplit N:hexstring` creates N pre-split partitions |
+| `bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal\|N:hexstring]` | Create streams + partition(s). `--log-ec`/`--row-ec` set EC shape for log/row streams (replicates=K+M); meta always plain replication. `cluster.sh` auto-sets EC based on replica count. |
+| `set-stream-ec --stream <ID> --ec K+M` | Change an existing stream's EC policy (FOPS-03). The background ec_conversion_dispatch_loop converts sealed extents within ~5 s. |
 | `put <KEY> <FILE>` | Write key with value from file |
 | `streamput <KEY> <FILE>` | Stream-put large file in 512KB chunks via `StreamPut` RPC |
 | `get <KEY>` | Read value, write to stdout |
