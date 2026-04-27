@@ -92,6 +92,7 @@ pub(crate) async fn dispatch_partition_rpc(
         MSG_GET => handle_get(payload, part, part_sc).await,
         MSG_HEAD => handle_head(payload, part).await,
         MSG_RANGE => handle_range(payload, part).await,
+        MSG_GET_DISCARDS => handle_get_discards(payload, part, part_sc).await,
         MSG_SPLIT_PART => handle_split_part(payload, part, part_sc, pool, manager_addr, owner_key, revision).await,
         MSG_MAINTENANCE => handle_maintenance(payload, part).await,
         MSG_PUT | MSG_DELETE | MSG_STREAM_PUT => Err((
@@ -417,6 +418,35 @@ pub(crate) async fn handle_maintenance(payload: Bytes, part: &Rc<RefCell<Partiti
         Ok(()) => Ok(partition_rpc::rkyv_encode(&MaintenanceResp { code: CODE_OK, message: String::new() })),
         Err(e) => Ok(partition_rpc::rkyv_encode(&MaintenanceResp { code: CODE_ERROR, message: e.to_string() })),
     }
+}
+
+pub(crate) async fn handle_get_discards(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+    part_sc: &Rc<StreamClient>,
+) -> HandlerResult {
+    let _req: GetDiscardsReq = partition_rpc::rkyv_decode(&payload)
+        .map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+    let (log_stream_id, readers) = {
+        let p = part.borrow();
+        (p.log_stream_id, p.sst_readers.clone())
+    };
+
+    let mut discards = crate::background::get_discards(&readers);
+
+    let log_extent_ids = part_sc
+        .get_stream_info(log_stream_id)
+        .await
+        .map(|s| s.extent_ids)
+        .unwrap_or_default();
+    crate::background::valid_discard(&mut discards, &log_extent_ids);
+
+    Ok(partition_rpc::rkyv_encode(&GetDiscardsResp {
+        code: CODE_OK,
+        message: String::new(),
+        discards: discards.into_iter().collect(),
+    }))
 }
 
 // ---------------------------------------------------------------------------

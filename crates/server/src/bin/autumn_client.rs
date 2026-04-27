@@ -12,7 +12,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use autumn_client::{ClusterClient, parse_addr, decode_err};
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
-use autumn_rpc::partition_rpc::{PutReq, GetReq, MSG_PUT, MSG_GET};
+use autumn_rpc::partition_rpc::{
+    PutReq, GetReq, MSG_PUT, MSG_GET,
+    GetDiscardsReq, GetDiscardsResp, MSG_GET_DISCARDS,
+};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -163,7 +166,11 @@ enum Command {
         partitions: usize,
         pipeline_depth: usize,
     },
-    Info,
+    Info {
+        json: bool,
+        top: Option<usize>,
+        part: Option<u64>,
+    },
 }
 
 struct Args {
@@ -195,7 +202,7 @@ fn usage() -> ! {
     eprintln!("                                    Read benchmark");
     eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--nosync] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K]");
     eprintln!("                                    Quick write+read bench; warns if >threshold regression vs baseline");
-    eprintln!("  info                              Show cluster info");
+    eprintln!("  info [--json] [--top N | --part PID]  Show cluster info");
     std::process::exit(1);
 }
 
@@ -610,7 +617,36 @@ fn parse_args() -> Args {
                 pipeline_depth,
             }
         }
-        "info" => Command::Info,
+        "info" => {
+            let mut json = false;
+            let mut top: Option<usize> = None;
+            let mut part: Option<u64> = None;
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--json" => { json = true; }
+                    "--top" => {
+                        i += 1;
+                        if i >= raw.len() { eprintln!("--top requires a number"); usage(); }
+                        top = Some(raw[i].parse().unwrap_or_else(|_| { eprintln!("--top requires a number"); usage() }));
+                    }
+                    "--part" => {
+                        i += 1;
+                        if i >= raw.len() { eprintln!("--part requires a number"); usage(); }
+                        part = Some(raw[i].parse().unwrap_or_else(|_| { eprintln!("--part requires a number"); usage() }));
+                    }
+                    other => {
+                        eprintln!("unknown info flag: {other}");
+                        usage();
+                    }
+                }
+                i += 1;
+            }
+            if top.is_some() && part.is_some() {
+                eprintln!("--top and --part are mutually exclusive");
+                usage();
+            }
+            Command::Info { json, top, part }
+        }
         other => {
             eprintln!("unknown command: {other}");
             usage();
@@ -707,6 +743,71 @@ struct PerfBaseline {
     read: BenchSummaryRecord,
     config: BenchConfig,
     recorded_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// `info` JSON output types
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct InfoDiskView {
+    disk_id: u64,
+    uuid: String,
+    online: bool,
+}
+
+#[derive(Serialize)]
+struct InfoNodeView {
+    node_id: u64,
+    address: String,
+    disks: Vec<InfoDiskView>,
+}
+
+#[derive(Serialize)]
+struct InfoExtentView {
+    extent_id: u64,
+    size: u64,
+    open: bool,
+    replicas: Vec<u64>,
+    refs: u64,
+    eversion: u64,
+}
+
+#[derive(Serialize)]
+struct InfoStreamView {
+    stream_id: u64,
+    ec_data: u32,
+    ec_parity: u32,
+    extent_ids: Vec<u64>,
+    total_size: u64,
+}
+
+#[derive(Serialize)]
+struct InfoDiscardEntry {
+    extent_id: u64,
+    bytes: i64,
+}
+
+#[derive(Serialize)]
+struct InfoPartitionView {
+    part_id: u64,
+    ps_addr: String,
+    range_start: String,
+    range_end: String,
+    live_size: u64,
+    total_extents: usize,
+    log_stream_id: u64,
+    row_stream_id: u64,
+    meta_stream_id: u64,
+    discards: Vec<InfoDiscardEntry>,
+}
+
+#[derive(Serialize)]
+struct InfoSnapshot {
+    nodes: Vec<InfoNodeView>,
+    extents: Vec<InfoExtentView>,
+    streams: Vec<InfoStreamView>,
+    partitions: Vec<InfoPartitionView>,
 }
 
 struct LatencyHist {
@@ -1933,64 +2034,71 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Info => {
+        Command::Info { json, top, part } => {
+            // === Fetch manager data ===
             let stream_resp_bytes = client
                 .mgr()?
-                .call(
-                    MSG_STREAM_INFO,
-                    rkyv_encode(&StreamInfoReq {
-                        stream_ids: Vec::new(),
-                    }),
-                )
+                .call(MSG_STREAM_INFO, rkyv_encode(&StreamInfoReq { stream_ids: Vec::new() }))
                 .await
                 .context("stream info")?;
-            let stream_resp: StreamInfoResp =
-                rkyv_decode(&stream_resp_bytes).map_err(decode_err)?;
+            let stream_resp: StreamInfoResp = rkyv_decode(&stream_resp_bytes).map_err(decode_err)?;
 
             let nodes_resp_bytes = client
                 .mgr()?
                 .call(MSG_NODES_INFO, Bytes::new())
                 .await
                 .context("nodes info")?;
-            let nodes_resp: NodesInfoResp =
-                rkyv_decode(&nodes_resp_bytes).map_err(decode_err)?;
+            let nodes_resp: NodesInfoResp = rkyv_decode(&nodes_resp_bytes).map_err(decode_err)?;
 
             let regions_resp_bytes = client
                 .mgr()?
                 .call(MSG_GET_REGIONS, Bytes::new())
                 .await
                 .context("get regions")?;
-            let regions_resp: GetRegionsResp =
-                rkyv_decode(&regions_resp_bytes).map_err(decode_err)?;
+            let regions_resp: GetRegionsResp = rkyv_decode(&regions_resp_bytes).map_err(decode_err)?;
 
-            // Build lookup maps
-            let mut extent_map: HashMap<u64, MgrExtentInfo> =
-                stream_resp.extents.into_iter().collect();
-            let stream_map: HashMap<u64, MgrStreamInfo> =
-                stream_resp.streams.iter().cloned().collect();
-            let disk_map: HashMap<u64, MgrDiskInfo> =
-                nodes_resp.disks_info.into_iter().collect();
-            let node_map: HashMap<u64, String> = nodes_resp
-                .nodes
-                .iter()
-                .map(|(id, n)| (*id, n.address.clone()))
-                .collect();
+            // === Build lookup maps ===
+            let mut extent_map: HashMap<u64, MgrExtentInfo> = stream_resp.extents.into_iter().collect();
+            let disk_map: HashMap<u64, MgrDiskInfo> = nodes_resp.disks_info.into_iter().collect();
 
-            // Query actual size for open (unsealed) extents via commit_length
+            let mut nodes_sorted: Vec<(u64, MgrNodeInfo)> = nodes_resp.nodes.into_iter().collect();
+            nodes_sorted.sort_by_key(|(id, _)| *id);
+            let node_map: HashMap<u64, String> = nodes_sorted.iter().map(|(id, n)| (*id, n.address.clone())).collect();
+
+            let mut streams_sorted: Vec<(u64, MgrStreamInfo)> = stream_resp.streams.into_iter().collect();
+            streams_sorted.sort_by_key(|(id, _)| *id);
+            let stream_map: HashMap<u64, MgrStreamInfo> = streams_sorted.iter().cloned().collect();
+
+            let regions: HashMap<u64, MgrRegionInfo> = regions_resp.regions.into_iter().collect();
+            let ps_details: HashMap<u64, MgrPsDetail> = regions_resp.ps_details.into_iter().collect();
+            let part_addr_map: HashMap<u64, String> = regions_resp.part_addrs.into_iter().collect();
+
+            let mut part_ids: Vec<u64> = regions.keys().copied().collect();
+            part_ids.sort();
+
+            // === Query commit_length for open extents ===
+            // When --part is given, only probe that partition's extents.
+            let probe_set: HashSet<u64> = if let Some(pid) = part {
+                regions.get(&pid).into_iter()
+                    .flat_map(|r| [r.log_stream, r.row_stream, r.meta_stream])
+                    .flat_map(|sid| stream_map.get(&sid).into_iter().flat_map(|s| s.extent_ids.iter().copied()))
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+
             let mut open_extents: HashSet<u64> = HashSet::new();
             for (eid, ext) in extent_map.iter_mut() {
                 if ext.sealed_length == 0 {
                     open_extents.insert(*eid);
+                    if part.is_some() && !probe_set.contains(eid) {
+                        continue;
+                    }
                     if let Some(node_id) = ext.replicates.first() {
                         if let Some(addr) = node_map.get(node_id) {
                             if let Ok(en_client) = client.get_ps_client(addr).await {
-                                let req = ExtCommitLengthReq {
-                                    extent_id: *eid,
-                                    revision: 0,
-                                };
-                                if let Ok(resp_bytes) =
-                                    en_client.call(EXT_MSG_COMMIT_LENGTH, req.encode()).await
-                                {
+                                let req = ExtCommitLengthReq { extent_id: *eid, revision: 0 };
+                                if let Ok(resp_bytes) = en_client.call(EXT_MSG_COMMIT_LENGTH, req.encode()).await {
                                     if let Ok(resp) = ExtCommitLengthResp::decode(resp_bytes) {
                                         ext.sealed_length = resp.length as u64;
                                     }
@@ -1998,6 +2106,32 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
+                }
+            }
+
+            // === Fetch pending discard snapshots from each PS ===
+            let pids_to_query: Vec<u64> = if let Some(pid) = part { vec![pid] } else { part_ids.clone() };
+            let mut part_discards: HashMap<u64, Vec<(u64, i64)>> = HashMap::new();
+            for pid in &pids_to_query {
+                let r = match regions.get(pid) { Some(r) => r, None => continue };
+                let ps_addr = part_addr_map.get(pid)
+                    .or_else(|| ps_details.get(&r.ps_id).map(|d| &d.address))
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                if ps_addr.is_empty() { continue; }
+                let req_bytes = rkyv_encode(&GetDiscardsReq { part_id: *pid });
+                match client.get_ps_client(ps_addr).await {
+                    Ok(ps_client) => match ps_client.call(MSG_GET_DISCARDS, req_bytes).await {
+                        Ok(resp_bytes) => match rkyv_decode::<GetDiscardsResp>(&resp_bytes) {
+                            Ok(resp) if resp.code == autumn_rpc::partition_rpc::CODE_OK => {
+                                part_discards.insert(*pid, resp.discards);
+                            }
+                            Ok(resp) => eprintln!("[warning] discard fetch part {pid}: {}", resp.message),
+                            Err(e) => eprintln!("[warning] discard decode part {pid}: {e}"),
+                        },
+                        Err(e) => eprintln!("[warning] discard fetch failed for part {pid}: {e}"),
+                    },
+                    Err(e) => eprintln!("[warning] connect PS for part {pid}: {e}"),
                 }
             }
 
@@ -2014,95 +2148,196 @@ async fn main() -> Result<()> {
             }
 
             fn stream_total(s: &MgrStreamInfo, extent_map: &HashMap<u64, MgrExtentInfo>) -> u64 {
-                s.extent_ids
-                    .iter()
-                    .filter_map(|eid| extent_map.get(eid))
-                    .map(|e| e.sealed_length)
-                    .sum()
+                s.extent_ids.iter().filter_map(|eid| extent_map.get(eid)).map(|e| e.sealed_length).sum()
             }
 
-            // === Nodes ===
-            println!("=== Nodes ===");
-            let mut nodes: Vec<(u64, MgrNodeInfo)> = nodes_resp.nodes.into_iter().collect();
-            nodes.sort_by_key(|(id, _)| *id);
-            for (nid, n) in &nodes {
-                println!("  node {}: addr={}", nid, n.address);
-                for did in &n.disks {
-                    if let Some(d) = disk_map.get(did) {
-                        println!(
-                            "    disk {}: uuid={}, online={}",
-                            did, d.uuid, d.online
-                        );
-                    } else {
-                        println!("    disk {}: (no info)", did);
-                    }
+            if json {
+                // === JSON output ===
+                let nodes_view: Vec<InfoNodeView> = nodes_sorted.iter()
+                    .map(|(nid, n)| InfoNodeView {
+                        node_id: *nid,
+                        address: n.address.clone(),
+                        disks: n.disks.iter().map(|did| InfoDiskView {
+                            disk_id: *did,
+                            uuid: disk_map.get(did).map(|d| d.uuid.clone()).unwrap_or_default(),
+                            online: disk_map.get(did).map(|d| d.online).unwrap_or(false),
+                        }).collect(),
+                    })
+                    .collect();
+
+                let extents_view: Vec<InfoExtentView> = {
+                    let mut v: Vec<_> = extent_map.iter()
+                        .map(|(eid, e)| InfoExtentView {
+                            extent_id: *eid,
+                            size: e.sealed_length,
+                            open: open_extents.contains(eid),
+                            replicas: e.replicates.clone(),
+                            refs: e.refs,
+                            eversion: e.eversion,
+                        })
+                        .collect();
+                    v.sort_by_key(|e| e.extent_id);
+                    v
+                };
+
+                let streams_view: Vec<InfoStreamView> = streams_sorted.iter()
+                    .map(|(sid, s)| InfoStreamView {
+                        stream_id: *sid,
+                        ec_data: s.ec_data_shard,
+                        ec_parity: s.ec_parity_shard,
+                        extent_ids: s.extent_ids.clone(),
+                        total_size: stream_total(s, &extent_map),
+                    })
+                    .collect();
+
+                let mut partitions_view: Vec<InfoPartitionView> = part_ids.iter()
+                    .filter_map(|pid| {
+                        let r = regions.get(pid)?;
+                        let rg = r.rg.as_ref()?;
+                        let ps_addr = part_addr_map.get(pid)
+                            .or_else(|| ps_details.get(&r.ps_id).map(|d| &d.address))
+                            .cloned()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let mut live_size = 0u64;
+                        let mut total_extents = 0usize;
+                        for sid in [r.log_stream, r.row_stream, r.meta_stream] {
+                            if let Some(s) = stream_map.get(&sid) {
+                                live_size += stream_total(s, &extent_map);
+                                total_extents += s.extent_ids.len();
+                            }
+                        }
+                        let discards = part_discards.get(pid)
+                            .map(|v| v.iter().map(|&(eid, bytes)| InfoDiscardEntry { extent_id: eid, bytes }).collect())
+                            .unwrap_or_default();
+                        Some(InfoPartitionView {
+                            part_id: *pid,
+                            ps_addr,
+                            range_start: String::from_utf8_lossy(&rg.start_key).into_owned(),
+                            range_end: if rg.end_key.is_empty() { String::new() } else { String::from_utf8_lossy(&rg.end_key).into_owned() },
+                            live_size,
+                            total_extents,
+                            log_stream_id: r.log_stream,
+                            row_stream_id: r.row_stream,
+                            meta_stream_id: r.meta_stream,
+                            discards,
+                        })
+                    })
+                    .collect();
+
+                partitions_view.sort_by(|a, b| b.live_size.cmp(&a.live_size));
+                if let Some(n) = top {
+                    partitions_view.truncate(n);
                 }
-            }
 
-            // === Extents ===
-            println!("\n=== Extents ===");
-            let mut extents: Vec<(&u64, &MgrExtentInfo)> = extent_map.iter().collect();
-            extents.sort_by_key(|(id, _)| **id);
-            for (eid, e) in &extents {
-                let tag = if open_extents.contains(eid) { " (open)" } else { "" };
-                println!(
-                    "  extent {}: size={}{}, replicas={:?}, refs={}, eversion={}",
-                    eid, human_size(e.sealed_length), tag, e.replicates, e.refs, e.eversion
-                );
-            }
-
-            // === Streams ===
-            println!("\n=== Streams ===");
-            let mut streams: Vec<(u64, MgrStreamInfo)> =
-                stream_resp.streams.into_iter().collect();
-            streams.sort_by_key(|(id, _)| *id);
-            for (sid, s) in &streams {
-                let total = stream_total(s, &extent_map);
-                println!(
-                    "  stream {} ({}+{}): extents={:?}, total={}",
-                    sid, s.ec_data_shard, s.ec_parity_shard, s.extent_ids,
-                    human_size(total)
-                );
-            }
-
-            // === Partitions ===
-            println!("\n=== Partitions ===");
-            let regions: HashMap<u64, MgrRegionInfo> =
-                regions_resp.regions.into_iter().collect();
-            let ps_details: HashMap<u64, MgrPsDetail> =
-                regions_resp.ps_details.into_iter().collect();
-            let mut part_ids: Vec<u64> = regions.keys().copied().collect();
-            part_ids.sort();
-            for pid in part_ids {
-                let r = &regions[&pid];
-                let rg = r.rg.as_ref().unwrap();
-                let ps_addr = ps_details
-                    .get(&r.ps_id)
-                    .map(|d| d.address.as_str())
-                    .unwrap_or("unknown");
-                println!(
-                    "  part {}: ps={}, range=[{}..{})",
-                    pid,
-                    ps_addr,
-                    String::from_utf8_lossy(&rg.start_key),
-                    if rg.end_key.is_empty() {
-                        "\u{221e}".to_string()
-                    } else {
-                        String::from_utf8_lossy(&rg.end_key).to_string()
+                if let Some(pid) = part {
+                    match partitions_view.into_iter().find(|p| p.part_id == pid) {
+                        Some(pv) => println!("{}", serde_json::to_string_pretty(&pv)?),
+                        None => eprintln!("partition {pid} not found"),
                     }
-                );
-                // Show stream details for this partition
-                let mut part_total = 0u64;
-                let mut part_extents = 0usize;
-                for (label, sid) in [("log", r.log_stream), ("row", r.row_stream), ("meta", r.meta_stream)] {
-                    if let Some(s) = stream_map.get(&sid) {
+                } else if top.is_some() {
+                    println!("{}", serde_json::to_string_pretty(&partitions_view)?);
+                } else {
+                    let snapshot = InfoSnapshot { nodes: nodes_view, extents: extents_view, streams: streams_view, partitions: partitions_view };
+                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                }
+            } else {
+                // === Text output ===
+                // Determine which partitions to show and in what order
+                let show_pids: Vec<u64> = if let Some(pid) = part {
+                    vec![pid]
+                } else {
+                    let mut v = part_ids.clone();
+                    if top.is_some() {
+                        v.sort_by(|a, b| {
+                            let sa: u64 = regions.get(a).map(|r| [r.log_stream, r.row_stream, r.meta_stream].iter()
+                                .filter_map(|sid| stream_map.get(sid)).map(|s| stream_total(s, &extent_map)).sum()).unwrap_or(0);
+                            let sb: u64 = regions.get(b).map(|r| [r.log_stream, r.row_stream, r.meta_stream].iter()
+                                .filter_map(|sid| stream_map.get(sid)).map(|s| stream_total(s, &extent_map)).sum()).unwrap_or(0);
+                            sb.cmp(&sa)
+                        });
+                        if let Some(n) = top { v.truncate(n); }
+                    }
+                    v
+                };
+
+                // Nodes / Extents / Streams sections only in full mode
+                if part.is_none() && top.is_none() {
+                    println!("=== Nodes ===");
+                    for (nid, n) in &nodes_sorted {
+                        println!("  node {}: addr={}", nid, n.address);
+                        for did in &n.disks {
+                            if let Some(d) = disk_map.get(did) {
+                                println!("    disk {}: uuid={}, online={}", did, d.uuid, d.online);
+                            } else {
+                                println!("    disk {}: (no info)", did);
+                            }
+                        }
+                    }
+
+                    println!("\n=== Extents ===");
+                    let mut extents: Vec<(&u64, &MgrExtentInfo)> = extent_map.iter().collect();
+                    extents.sort_by_key(|(id, _)| **id);
+                    for (eid, e) in &extents {
+                        let tag = if open_extents.contains(eid) { " (open)" } else { "" };
+                        println!("  extent {}: size={}{}, replicas={:?}, refs={}, eversion={}",
+                            eid, human_size(e.sealed_length), tag, e.replicates, e.refs, e.eversion);
+                    }
+
+                    println!("\n=== Streams ===");
+                    for (sid, s) in &streams_sorted {
                         let total = stream_total(s, &extent_map);
-                        part_total += total;
-                        part_extents += s.extent_ids.len();
-                        println!("    {}: stream {}, extents={:?}, size={}", label, sid, s.extent_ids, human_size(total));
+                        println!("  stream {} ({}+{}): extents={:?}, total={}",
+                            sid, s.ec_data_shard, s.ec_parity_shard, s.extent_ids, human_size(total));
                     }
                 }
-                println!("    total: {} extents, {}", part_extents, human_size(part_total));
+
+                // === Partitions section ===
+                let section_header = if let Some(n) = top {
+                    format!("\n=== Partitions (top {n}) ===")
+                } else if let Some(pid) = part {
+                    format!("\n=== Partition {pid} ===")
+                } else {
+                    "\n=== Partitions ===".to_string()
+                };
+                println!("{section_header}");
+
+                for pid in &show_pids {
+                    let r = match regions.get(pid) {
+                        Some(r) => r,
+                        None => { println!("  part {pid}: not found"); continue; }
+                    };
+                    let rg = match r.rg.as_ref() { Some(r) => r, None => continue };
+                    let ps_addr = part_addr_map.get(pid)
+                        .or_else(|| ps_details.get(&r.ps_id).map(|d| &d.address))
+                        .map(|s| s.as_str())
+                        .unwrap_or("unknown");
+                    println!("  part {}: ps={}, range=[{}..{})",
+                        pid, ps_addr,
+                        String::from_utf8_lossy(&rg.start_key),
+                        if rg.end_key.is_empty() { "\u{221e}".to_string() } else { String::from_utf8_lossy(&rg.end_key).to_string() }
+                    );
+                    let discards = part_discards.get(pid);
+                    let mut part_total = 0u64;
+                    let mut part_extents = 0usize;
+                    for (label, sid) in [("log", r.log_stream), ("row", r.row_stream), ("meta", r.meta_stream)] {
+                        if let Some(s) = stream_map.get(&sid) {
+                            let total = stream_total(s, &extent_map);
+                            part_total += total;
+                            part_extents += s.extent_ids.len();
+                            let mut line = format!("    {}: stream {}, extents={:?}, size={}", label, sid, s.extent_ids, human_size(total));
+                            if label == "log" {
+                                if let Some(d) = discards {
+                                    if !d.is_empty() {
+                                        let total_discard: i64 = d.iter().map(|(_, b)| b).sum();
+                                        line.push_str(&format!(", discard: {} ext / {} pending", d.len(), human_size(total_discard as u64)));
+                                    }
+                                }
+                            }
+                            println!("{line}");
+                        }
+                    }
+                    println!("    total: {} extents, {}", part_extents, human_size(part_total));
+                }
             }
         }
     }

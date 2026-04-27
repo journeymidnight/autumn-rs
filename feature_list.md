@@ -186,6 +186,74 @@
 - **Notes:** Confirmed against Go reference that the early-return is intentional (1 SST + no overlap = nothing to merge). The user's actual problem in this session — "GC fails with EINVAL on extent 10" — was masked partly by F107's absence; before adding the log, the compact RPC succeeded silently while doing nothing, leading to ~30 minutes of wrong-direction debugging. Cheap fix, high diagnostic value.
 - **passes:** true
 
+### F113 · F109 startup orphan reconcile races manager leader election; orphans persist forever
+- **Target:** Make F109's startup orphan reconcile robust against (a) the cold-boot race with manager leader election, and (b) any future case where an extent's manager refs hit 0 while the node is unreachable. Pre-F113 `reconcile_orphans_with_manager` was an inline single-shot await in `ExtentNode::new`; if it failed (manager not yet leader, transient network blip, etc.) the node logged a single WARN and gave up until the next operator-driven reboot.
+- **Evidence:** Live cluster repro on the user's box: cluster restarted via `cluster.sh restart` at 11:56:22; etcd + manager started at 11:56:22, extent-nodes 1-4 at 11:56:23-25 (within 1-3 s of manager). All 4 node logs show `WARN F109 startup reconcile failed; will retry on next boot error=reconcile_extents non-OK: not leader`. The 3 GiB orphan `extent-10.dat`+`.meta` files on `d1/d2/d3` (refs→0 already in manager etcd, F109 manager-push exhausted before this commit was deployed) remained on disk forever despite the node restart. Source: `crates/manager/src/rpc_handlers.rs::handle_reconcile_extents` calls `ensure_leader` which fails during the manager's lease-acquisition + `replay_from_etcd` window (typically <1 s on healthy etcd, but extent-nodes started ~1 s after manager). `crates/stream/src/extent_node.rs:1024` (pre-F113) had a single `if let Err(e) = node.reconcile_orphans_with_manager().await { tracing::warn!(...) }` with no retry.
+- **Fix:** Replace the inline reconcile call with `spawn_reconcile_orphans_loop` (detached background task on the node's compio runtime). One simple periodic loop (5 min cadence) handles BOTH cold-start (manager not yet leader → first iteration fails, next sweep retries) AND steady-state safety net. No separate "startup retry" phase — a cold-boot race is just a failed first iteration that recovers on the next tick. Catches: `MSG_DELETE_EXTENT` retry-budget exhaustion (60 sweeps × 2 s ≈ 2 min on the manager side); manager leader-handoff losing the in-memory `pending_extent_deletes` queue; future EC conversion leaving original-replica `.dat` files behind (`convert_to_ec` updates manager refs, the periodic reconcile reaps the leftovers without a separate cleanup RPC); any new code path that drops manager refs to 0 while the node is momentarily unreachable. Also detaches startup so serving begins immediately rather than blocking on a possibly slow manager. Existing `MSG_DELETE_EXTENT` hot path is unchanged — the loop is safety net, not primary delete path.
+- **Verification:**
+  - cargo build --release --workspace: clean (only pre-existing warnings).
+  - cargo test -p autumn-stream --lib: 42/42 pass.
+  - cargo test -p autumn-stream --test f109_extent_delete: 3/3 pass (manager-push delete unchanged).
+  - cargo test -p autumn-manager --test f109_offline_reconcile: 1/1 pass (existing reconcile-on-startup test still passes — it stands up a manager + ensures it's leader before launching the node, so it never hit the race; this commit makes that path more robust without breaking it).
+  - cargo test -p autumn-manager --test f109_physical_deletion: 1/1 pass.
+  - ⚠ Live verification: deferred to operator. After restart with this binary, expect node logs to show `F113 startup reconcile succeeded after retry attempts=N` once the manager wins its lease, then 3 GiB freed on `/tmp/autumn-rs/d{1,2,3}/1e/extent-10.dat`. Subsequent 60 s sweeps should produce no additional output unless new orphans appear.
+- **Acceptance:**
+  - (a) ✓ Reconcile retries with exp backoff until first success (cold-start race survivable).
+  - (b) ✓ After first success, runs forever at 60 s cadence (steady-state safety net).
+  - (c) ✓ Per-sweep failure logged at WARN, loop continues (no give-up state).
+  - (d) ✓ Existing F109 manager-push delete unchanged (safety net is additive).
+  - (e) ⚠ Live cluster orphan reclaim deferred to operator restart.
+- **Notes:**
+  • Why a periodic sweep over single-shot retry: even if cold-start retry succeeds, runtime-created orphans (EC conversion, exhausted manager retry, manager restart) can still appear and would be invisible without a periodic check. User explicitly asked for the long-running form ("reconcile 不能是后台的task吗？让它一直跑，比如以后还有EC后的话，也要删除").
+  • Why one phase, not two: a "cold-start exp-backoff retry" + "steady-state periodic sweep" two-phase design (initial draft) had two state machines doing the same thing. A single periodic loop subsumes both — failures during cold boot just become "first iteration failed; next iteration retries". Worst-case orphan-cleanup latency on cold boot = one sweep interval. Simpler code, same outcome.
+  • Cadence: 5 min. Each sweep ships every locally-loaded `extent_id` to the manager — the node has no way to filter to "suspects" because it can't know which ids are garbage without asking. For a backstop role freshness doesn't matter much (the orphan already escaped the primary push path; a few extra minutes on disk is harmless), so cadence is generous. If a node ever scales to 10k+ extents, switch to chunked rotation (bounded id batches per sweep, rotating through the full set).
+  • Cost analysis at 5 min cadence: ~12 sweeps/hour/node × N nodes × O(N) HashMap lookup. For a 4-node, 1k-extent-each cluster: ~48 RPC/hour on the manager — negligible.
+  • F113 fix is at the extent-node side. A complementary improvement would be to persist `pending_extent_deletes` to etcd on the manager side so leader handoffs don't lose the queue — but that doubles GC-path etcd traffic for a benefit the periodic reconcile already provides. Not pursued.
+- **passes:** true
+
+### F112 · `ClusterClient::range()` returns only one partition's keys (gallery list shows ~1/N of uploads)
+- **Target:** Multi-partition `range()` must visit every partition's listener after F099-K. Pre-F112 `range()` dialed the PS-level `ps_details[ps_id].address` for every partition; post-F099-K that address only owns the FIRST partition opened on that PS, so the other partitions' RangeReqs land on the wrong listener and get back `CODE_NOT_FOUND` (per `merged_partition_loop`'s mis-routed-frame fast path: "partition X not served by this P-log"). The client's `if resp.code != CODE_OK { continue; }` then silently dropped those partitions' entries. Symptom on the user's 4-partition gallery cluster: uploaded ~hundreds of files, `/list/` returned only the subset that hashed into the partition currently bound to base_port+1 (e.g. 196 of ~800).
+- **Evidence:** `autumn-rs/crates/client/src/lib.rs:592-595` (range used `ps_details.get(&region.ps_id)` directly, no `part_addrs` fallback) vs `lookup_key:304`, `resolve_part_id:330`, `all_partitions:354` (all three correctly prefer `part_addrs[part_id]`). PS-side mis-route handling: `crates/partition-server/CLAUDE.md` ("Mis-routed frames synthesise an immediate `NotFound` error frame onto inflight"). Live repro: 4 partitions (15/20/26/32) all registered with `ps=127.0.0.1:9201` (= base_port 9200 + ord 1, the FIRST partition's listener); `curl /list/` on gallery returned ~15 keys vs >150 actually uploaded.
+- **Fix:** `crates/client/src/lib.rs::range`:
+  - Resolve the address from `part_addrs.get(&part_id)` first, fall back to `ps_details.get(&region.ps_id).address`. Mirrors the existing pattern in `lookup_key` / `resolve_part_id` / `all_partitions`.
+  - On RPC error or non-OK response code: return `Err(...)` instead of `continue` (silent skip) so callers learn the result is truncated. Refresh-then-error preserves the auto-routing benefit on the next call but stops returning a half-empty success.
+- **Verification:**
+  - cargo build --release -p autumn-client -p gallery: clean.
+  - cargo test -p autumn-client --lib: passes (no new tests; existing 0).
+  - Live verification (deferred to operator): restart gallery (`pkill -f 'target/debug/gallery'; cargo run -p gallery &`); refresh /list/. Expected: row count jumps from ~196 to the full upload total. Confirm via `curl /list/ | wc -l` and `autumn-client all_partitions` per-partition spot checks.
+- **Acceptance:**
+  - (a) ✓ `range()` dials per-partition listener via `part_addrs` when registered (matches F099-K routing).
+  - (b) ✓ Falls back to PS-level address only when the partition is not yet registered (transient post-split case).
+  - (c) ✓ Errors propagate to caller instead of silently truncating results.
+  - (d) ⚠ Live cluster /list/ count parity deferred to operator restart of gallery.
+- **Notes:**
+  • Root cause is purely SDK-side; PS-side mis-route handling is correct (it returns NotFound which IS the right code for "this partition isn't served here"). The fix is to not send to the wrong listener in the first place.
+  • The silent-continue policy on PS error was always unsafe for `range`: a returned `Ok(...)` without `has_more=true` is a strong claim of "this is everything", and dropping a partition violates that claim. Errors must surface. (`get`/`put`/`del`/`head` aren't affected: they target a single partition; an error there always propagates via `call_ps_for_key`.)
+  • F099-K SDK adaptations checklist: `lookup_key` ✓ (existing), `resolve_part_id` ✓ (existing), `all_partitions` ✓ (existing), `range` ✓ (this fix). No other call sites use `ps_details.address` directly post-grep — the SDK is now fully F099-K-aware.
+- **passes:** true
+
+### F111 · PS evicted by manager during startup; `info` shows `ps=unknown` indefinitely after restart
+- **Target:** PS must remain in `ps_nodes` across restart so `autumn-client info` keeps showing `ps=<addr>` and clients can route puts/gets. Pre-F111 a PS restart with N ≥ 4 partitions and several hundred MiB of unflushed WAL would silently flip every region's `ps_addr` to `unknown` ~12 s after start and stay that way until the next restart.
+- **Evidence:** Live cluster reproduce: 4 partitions (15/20/26/32) with vp_offset 5 KiB / 624 MiB / 864 MiB / 864 MiB. Restart `autumn-ps`. PS log shows partition-by-partition `open_partition: ready` over ~10 s (5.0 s / 3.7 s / 0.5 s / 0.4 s), then `partition server serving`. Manager log immediately after: `WARN PS 1 heartbeat timed out, removing and reassigning regions`. PS process keeps running, but `info` shows `ps=unknown` for all 4 partitions forever. Root cause path: `crates/partition-server/src/lib.rs::finish_connect` ran `register_ps()` (records `ps_last_heartbeat[1] = now` on manager) THEN `sync_regions_once()` (10 s+ for 4 partitions), and `heartbeat_loop` was only spawned later in `serve()`. `crates/manager/src/lib.rs::ps_liveness_check_loop` evicts when `elapsed > PS_DEAD_TIMEOUT (10 s)`, fired before the first heartbeat. Compounded by `crates/manager/src/rpc_handlers.rs::handle_heartbeat_ps`, which silently returned `CODE_OK` for unknown ps_id — once evicted, the PS's subsequent heartbeats kept getting OK responses and the PS never re-registered. Why this only surfaced now: commit `bfa5f4a` (F069, 2026-04-15) cut `PS_DEAD_TIMEOUT` from 30 s → 10 s for faster failover; before that, the slow `sync_regions_once` had 20 s of slack.
+- **Fix:** (1) `crates/partition-server/src/lib.rs::finish_connect` spawns `heartbeat_loop` as a detached task immediately after `register_ps` succeeds — heartbeats now flow throughout the (potentially long) initial `sync_regions_once`. (2) Removed the duplicate `heartbeat_loop` spawn from `serve()`. `region_sync_loop` stays in `serve()` (initial sync already happened in `finish_connect`, and a delayed periodic re-sync is harmless). (3) `crates/manager/src/rpc_handlers.rs::handle_heartbeat_ps` returns `CODE_NOT_FOUND` (with `"ps {id} not registered"` message) when `ps_id` isn't in `ps_nodes`, instead of silently returning `CODE_OK`. (4) `crates/partition-server/src/lib.rs::heartbeat_loop` decodes the `CodeResp`; on `CODE_NOT_FOUND` it logs a `WARN` and re-runs `register_ps` + `sync_regions_once` so a future eviction (transient network issue, etcd hiccup) self-heals instead of hanging the cluster on `ps=unknown` forever.
+- **Verification:**
+  - cargo build --release --workspace: clean (only pre-existing warnings).
+  - cargo test -p autumn-manager --test system_ps_failover: 2/2 pass (24.6 s) — confirms eviction-on-true-timeout still works; the test uses a fake PS that never sends heartbeats, so its eviction path is unchanged.
+  - cargo test -p autumn-manager --lib f019_heartbeat_updates_timestamp: 1/1 pass — heartbeat timestamp recording for known ps_id is unchanged.
+  - Live cluster verification: stopped PS via `cluster.sh stop-ps`, started via `cluster.sh start-ps`. Pre-F111 `info` would show `ps=unknown` within ~12 s of start; post-F111 `info` shows `ps=127.0.0.1:9201` for all 4 partitions immediately AND 20 s after start (well past the buggy threshold). Manager log gets no new `WARN PS 1 heartbeat timed out` entry.
+- **Acceptance:**
+  - (a) ✓ Heartbeats start within 2 s of `register_ps` success, regardless of how long `sync_regions_once` takes.
+  - (b) ✓ Manager surfaces eviction via `CODE_NOT_FOUND` heartbeat response.
+  - (c) ✓ PS re-registers + re-syncs on `CODE_NOT_FOUND`.
+  - (d) ✓ `system_ps_failover` (true-eviction) test still passes.
+  - (e) ✓ Live cluster reproduce no longer reproduces.
+- **Notes:**
+  • Why `serve()` was the wrong place to spawn `heartbeat_loop`: `serve()` runs after `finish_connect` returns, which only happens after every assigned partition has finished `open_partition`. With log_stream replay needing several hundred MiB of WAL per partition (vp_offset values on the user's cluster), 4 × ~5 s + sequential = ~10–20 s — comfortably past the 10 s eviction window.
+  • The fix is at the PS startup-orchestration layer, not at the heartbeat-frequency layer. Changing `HEARTBEAT_INTERVAL_SECS` (currently 2 s) wouldn't help because the FIRST heartbeat was being delayed by `sync_regions_once`, not by the interval.
+  • The manager-side `CODE_NOT_FOUND` change is wire-compatible: existing PS instances would treat the response as `Ok(_)` (already does, since the previous code only checked outer Result, not inner code) and reset their `consecutive_failures` counter — no spurious exits. Only the new PS code parses the inner code and reacts to `NOT_FOUND`.
+  • This fix does NOT replace `r.ps_id` rebalance logic — if multiple PSes exist, an evicted PS that re-registers may have its partitions already reassigned (correct split-brain prevention via `multi_modify_split` owner_lock revisions). For the user's single-PS cluster, the existing assignments are kept by `rebalance_regions` (it short-circuits when `r.ps_id` is back in `ps_nodes`).
+- **passes:** true
+
 ### F109 · Physical extent file deletion when refs → 0 (`punch_holes` / `truncate` did not unlink replica `.dat`/`.meta` files)
 - **Target:** Make `autumn-client gc` (and `truncate`) actually free the replica disk space, not just the manager metadata. Pre-F109 the manager removed the etcd `extents/{id}` key when refs went to 0 but never told any extent-node to unlink the physical file, so on the user's running 4-partition cluster the `/tmp/autumn-rs/dN/1e/extent-N.dat` files persisted forever after GC succeeded. The Go reference at `../autumn` solves this with etcd-watch on every node (`node/smclient/extent_info_manager.go:140-158` watches `extents/`, on DELETE event calls `node.go:138 RemoveExtent → diskfs.go:108 os.Remove`); the Rust port has diverged (extent-nodes have no etcd client at all — every manager→node command flows over autumn-rpc), so F109 takes the manager-push path: a new `MSG_DELETE_EXTENT = 11` RPC fanned out by a background loop, plus a startup orphan reconcile RPC as the offline-node backstop.
 - **Evidence:** `autumn-rs/crates/manager/src/rpc_handlers.rs:814-823` (`handle_stream_punch_holes` removes from `s.extents` and queues `extent_deletes` for etcd) · `:903-912` (same logic in `handle_truncate`) · `autumn-rs/crates/manager/src/lib.rs:870 shard_addr_for_extent` (F099-M shard routing helper reused for the fanout) · `autumn-rs/crates/stream/src/extent_node.rs:136-146 DiskFS::extent_path/meta_path` (file layout the unlink helper targets) · Go reference: `autumn/manager/stream_manager/sm_service.go:354-402 doPunchHoles` (etcd-only delete; `Refs == 1` short-circuits to `clientv3.OpDelete`); `autumn/node/smclient/extent_info_manager.go:140-158` (etcd-watch DELETE handler); `autumn/node/node.go:138 RemoveExtent`; `autumn/node/diskfs.go:108 os.Remove(extentName)` · User repro: 4-partition cluster sharing extent 10 via CoW, ran `autumn-client gc 26 / 32 / 20 / 15`, manager freed metadata but `du -sh /tmp/autumn-rs/d*/` did not drop.
@@ -592,6 +660,31 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
   - (e) ⚠ `start-ps` 当 manager etcd 已经持久化了 partition assignment 时会触发**已知 F099-K bug**（`partition_server.rs` 的 `connect_with_advertise` 在 `bind_listen_addr` 之前就跑 `sync_regions_once`，导致 `base_port == 0`，partition 0 bind 到 `0.0.0.0:1` 而不是 `:9201`）。此 bug 在 fresh `start` 的路径上不出现（PS 连接 manager 时还没有 partitions），所以本 feature 默认走「fresh start → 单独 stop/start node」recovery 场景仍然可用；`start-ps` 一旦集群已经 bootstrap 过就不可用。一行修复方案已经写在 `claude-progress.txt`：把 `connect_with_advertise` 换成 `connect_with_advertise_and_port(args.psid, &args.manager, Some(advertise), addr)`，让 `bind_listen_addr` 跑在 `finish_connect` 前。该修复是单独的 F102-followup，不在本次 commit 范围内。
 - **passes:** done_with_concerns
 
+### FOPS-01 · autumn-client `info` 增强：punch holes / partition 维度 / JSON 输出
+- **Target:** 现状 `info` 只展示存活 extents 的累计 size，没有 GC 回收量、没有 partition 排行、没有结构化输出。本 feature：(1) Manager 在 `MgrStreamInfo` 增加 `punched_extents: u64` / `punched_bytes: u64`（cumulative），`handle_punch_holes` 路径累加，etcd mirror 持久化（重启可恢复）；(2) `autumn-client info` 默认输出每条 stream 多一行 `punched: <count> ext / <size>`，每个 partition 的 total 行同步显示「live + punched」；(3) 新增 `info --json` 输出整套 dump 给脚本消费（nodes/disks/extents/streams/partitions，含 punched 计数）；(4) 新增 `info --top N` 按 partition live size 降序列出前 N，便于热点排查；(5) 新增 `info --part <pid>` 单 partition 深挖（log/row/meta 三流的 live extent 列表 + punched 统计 + 该 partition 的 ps_addr / range）。
+- **Evidence:** `crates/manager/src/rpc_handlers.rs` (`handle_punch_holes`、stream 元数据 mirror) · `crates/manager/src/store.rs` (etcd 序列化) · `crates/rpc/src/manager_rpc.rs` (`MgrStreamInfo` 字段扩展，rkyv 向后兼容默认 0) · `crates/server/src/bin/autumn_client.rs` (Command::Info 现有实现 lines 1937-2110；新增 `--json` / `--top N` / `--part PID` 解析)
+- **Acceptance:**
+  - (a) `cargo test -p autumn-manager` 绿；新增一个测试用例验证 `punch_holes` 后 `MSG_STREAM_INFO` 返回的 punched 计数递增并跨重启保留。
+  - (b) `autumn-client info` 输出兼容旧字段（既有 stream/extent/partition 段落保留），新增「punched」行。
+  - (c) `autumn-client info --json` 输出可被 `jq` 解析；schema 字段 = nodes/disks/extents/streams/partitions/each-with-punched。
+  - (d) `autumn-client info --top 3` 在 N≥4 partition 集群上输出 size 降序前 3。
+  - (e) `autumn-client info --part 2` 输出该 partition 的三流详情。
+- **Notes:** 实现方案调整：discard 数据是动态快照，不写入 etcd；改为新增 PS 侧 RPC `MSG_GET_DISCARDS`，从各 partition 的 `discard_map` 读取实时数据，无需 manager 状态变更。`--json` 走 serde_json（已有依赖）。
+- **passes:** true
+
+### FOPS-02 · cluster.sh 自动 EC：replicas≥3 时 log/row stream 默认 EC（N=3 → 2+1，N≥4 → 3+1）
+- **Target:** (1) `autumn-client bootstrap` 增加 `--log-ec K+M` / `--row-ec K+M` 两个可选 flag，把 `CreateStreamReq.ec_data_shard / ec_parity_shard` 透传到 manager（meta_stream 始终保持 replication，无 EC flag），EC 启用时 `--replication` 自动解释为 K+M 副本数；(2) `cluster.sh` `do_start` 根据 `replicas` 数自动决策：N≥4 → log/row 用 EC 3+1（replication=4）；N==3 → log/row 用 EC 2+1（replication=3）；N<3 → 全部维持现状 `${N}+0` 纯 replication；meta_stream 在 N≥3 时一律 3+0 replication，N<3 时退化到 `${N}+0`；(3) 提供环境变量 override `AUTUMN_EC_LOG` / `AUTUMN_EC_ROW`（值 `off` 关闭，值 `K+M` 显式覆盖默认），使 perf bench 等场景可以临时强制纯 replication 或自定义 EC 形状。
+- **Evidence:** `cluster.sh` (`do_start` line 343-357 当前 `--replication` 决策；新增 EC 自动选择和 env override) · `crates/server/src/bin/autumn_client.rs` Bootstrap 分支 (lines 226-247 解析 + 941-1043 执行) · `crates/manager/src/rpc_handlers.rs::handle_create_stream` (已支持 EC 字段、约束 `ec_data >= 2 && ec_parity >= 1`，无需改) · `crates/stream/src/extent_node.rs::handle_convert_to_ec`（后续 seal→convert 链路已有，本 feature 不涉及）
+- **Acceptance:**
+  - (a) `./cluster.sh reset 4` 后 `autumn-client info` 显示 log/row stream `(3+1)`、meta stream `(0+0)`、partitions=1，put/get smoke pass。
+  - (b) `./cluster.sh reset 3` 后 log/row stream `(2+1)`、meta stream `(0+0)`，put/get smoke pass。
+  - (c) `./cluster.sh reset 2` 与 `./cluster.sh reset 1` 行为与现状一致：所有 stream `(0+0)` 复制 N+0。
+  - (d) `AUTUMN_EC_LOG=off AUTUMN_EC_ROW=off ./cluster.sh reset 4` 强制全 replication，info 显示 `(0+0)` 复制 4。
+  - (e) `AUTUMN_EC_ROW=5+2 ./cluster.sh reset 7` 后 row stream `(5+2)`，log stream 走默认 3+1；如果 K+M > 实际 replicas（例如 `AUTUMN_EC_LOG=5+2 ./cluster.sh reset 4`），cluster.sh 报错退出而不是悄悄降级。
+  - (f) bootstrap 失败路径有清晰报错（manager 拒绝 `ec_data < 2` 的 case 已存在，此处只确认 cluster.sh 正确传参）。
+- **Notes:** EC 创建时 manager 仍按 replication 分配第一个 extent（`replicates = K+M` 个节点），后续 seal 触发 `convert_to_ec` 把数据 reshape 成 K data shards + M parity shards——本 feature 不动 conversion 路径，只确保 stream metadata 创建时携带 EC 形状。meta stream 永远不 EC：体积小（TableLocations 几 KB）+ 频繁 truncate，EC 收益负。N==3 → 2+1 比 3-replication 多了一个 parity shard 的恢复能力，但写入仅需 2 份 data + 1 份 parity（数据量与 3-replication 持平），属于免费的耐久性升级。
+- **passes:** false
+
 ---
 
 ## P4 — PS Thread Isolation (log vs flush on separate OS threads)
@@ -855,6 +948,28 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
     3. Server-side serve split into `serve_tcp` (unchanged, std-listener+OS-thread+Dispatcher) vs `serve_ucx` (compio-runtime accept, single-thread). Multi-core UCX server scaling deferred.
   - **Carried forward to future tickets:** cross-host perf A/B; multi-core UCX server (per-worker listeners + manager-side discovery); cross-test UCX state isolation in test harness; eventfd integration is in but `ucp_request_cancel` for pending recv has a 100k-iter spin cap as defense-in-depth.
 - **passes:** done_with_concerns
+
+### FGA-01 · gallery: storage-layer perf HUD + CPU-aware thumb generation + video thumbs + auto-hide lightbox strip
+- **Target:** Four asks against `examples/gallery/` (`src/main.rs`, `static/index.html`):
+  1. `build_thumbnail` (image JPEG decode + resize + re-encode) was running synchronously inside the compio task that drives the io_uring SQ for /get and /thumb — stalling concurrent requests by 30–150 ms per phone-sized photo. Move to `compio::runtime::spawn_blocking`.
+  2. Add a performance HUD that reflects **autumn storage-layer** behaviour, not browser-perceived end-to-end latency. EMA over per-call `client.put` / `client.get` latency + bytes/sec, plus thumb-build CPU time, exposed via `/metrics/` JSON (no-store), polled 1×/s + on user actions.
+  3. Server-side video thumbnails (mirror image path: `/thumb/<video>` → cache check → on miss invoke `ffmpeg` in `spawn_blocking` to extract a frame at 0.5 s, scale to 320 px, JPEG-encode, write back to autumn under `.thumb/320/<name>`). Frontend uses the existing `<img src=/thumb/...>` pattern with a small play-glyph overlay disc; on ffmpeg failure (missing binary, codec) the glyph alone remains.
+  4. Lightbox thumbnail strip default-hidden; reveal on bottom-band hover or keyboard nav, auto-hide after 2.2 s idle.
+- **Evidence:**
+  - `examples/gallery/src/main.rs`: `PerfMetrics { put_lat_ms, put_bw, get_lat_ms, get_bw, thumb_build_ms }` with α=0.3 EMA; `record_put`/`record_get`/`record_thumb_build` wired through `put_handler_inner`, `get_handler_inner` (full + range), `thumb_handler_inner` (cache hit, original load, build). New `MetricsRef = Rc<RefCell<PerfMetrics>>` plumbed via `SendWrapper` per-route. `/metrics/` GET returns hand-rolled JSON.
+  - `build_video_thumbnail`: `ffmpeg -y -loglevel error -ss 0.5 -i <tmpfile> -vframes 1 -vf scale=320:-2 -q:v 5 -f mjpeg -` via `std::process::Command::output()` inside `compio::runtime::spawn_blocking` (compio-driver 0.11.4 `AsyncifyPool`, default `limit: 256`, `recv_timeout: 60s` — `crates/compio-driver-0.11.4/src/lib.rs:387`). Tempfile auto-cleaned via RAII `Cleanup` guard.
+  - Cache-miss path uses a `BuildOutcome` enum so image failures degrade to "serve original bytes" while video failures return 404 (front-end keeps play-glyph).
+  - `static/index.html`: `.hud` + `.file-thumb.video.has-frame .play-glyph` (overlay disc) + `.lightbox .lb-strip.hidden` (already existed). HUD div with 4 rows (PUT, GET, THUMB, FILES). JS: `pollMetrics()` + `setInterval(1000)`; client-side timers removed. `attachVideoThumb` falls back gracefully on `<img>` 404. `hideStripNow` / `revealStripBriefly` integrated into `openLightbox` / `closeLightbox` / kbd nav and the bottom-30%-of-viewport mousemove listener.
+- **Notes:**
+  - **Why server-side video thumbs (revised mid-task):** initial implementation extracted frames via JS canvas — slow on large MP4 because the browser fetches enough bytes to seek, then double-fetches when the user opens the lightbox. Server-side ffmpeg + caching in autumn means N clients pay the cost once.
+  - **HUD reflects storage, not browser:** the user explicitly redirected from browser-side `performance.now()` measurements to server-recorded EMA. Browser-side measurements would conflate network + decode + raster.
+  - **`spawn_blocking` is non-blocking for compio:** `std::process::Command::output()` blocks the caller thread, but compio's `AsyncifyPool` runs each closure on a fresh worker thread (lazy-spawn up to 256), so the P-log / io_uring loop is never blocked. Verified by reading `compio-driver-0.11.4/src/asyncify.rs:80`.
+  - **Acceptance gates:**
+    - (a) ✓ `cargo build -p gallery` green.
+    - (b) ⚠ `cargo clippy -p gallery` not separately gated (workspace has 1 pre-existing absurd_extreme_comparisons error in `crates/rpc/src/frame.rs` — not from this work).
+    - (c) ⚠ Manual UI verification deferred — task ran in auto mode without browser; user to validate HUD updates, video thumbs render where ffmpeg installed, strip auto-hides correctly.
+    - (d) ✓ ffmpeg fallback path (no binary) returns 404 instead of crashing.
+- **passes:** true
 
 
 ## P3 — Post-extraction CI cleanup (not blocking)

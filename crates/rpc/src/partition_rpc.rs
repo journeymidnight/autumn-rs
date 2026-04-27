@@ -18,6 +18,7 @@ pub const MSG_RANGE: u8 = 0x44;
 pub const MSG_SPLIT_PART: u8 = 0x45;
 pub const MSG_STREAM_PUT: u8 = 0x46;
 pub const MSG_MAINTENANCE: u8 = 0x47;
+pub const MSG_GET_DISCARDS: u8 = 0x48;
 
 // ── Status codes ────────────────────────────────────────────────────────────
 
@@ -153,6 +154,24 @@ pub struct MaintenanceResp {
     pub message: String,
 }
 
+/// Snapshot of a partition's pending log_stream discards. Used by
+/// `autumn-client info` to surface GC backlog without persisting any
+/// counter state at the manager.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetDiscardsReq {
+    pub part_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetDiscardsResp {
+    pub code: u8,
+    pub message: String,
+    /// (extent_id, reclaimable_bytes). Extents not currently in the
+    /// partition's `log_stream.extent_ids` are filtered out by the handler
+    /// (matches what `background_gc_loop` already does via `valid_discard`).
+    pub discards: Vec<(u64, i64)>,
+}
+
 // ── MetaStream persistence types ────────────────────────────────────────────
 
 /// SSTable location in rowStream.
@@ -185,6 +204,7 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_SPLIT_PART => rkyv_decode::<SplitPartReq>(payload).map(|r| r.part_id).unwrap_or(0),
         MSG_STREAM_PUT => rkyv_decode::<StreamPutReq>(payload).map(|r| r.part_id).unwrap_or(0),
         MSG_MAINTENANCE => rkyv_decode::<MaintenanceReq>(payload).map(|r| r.part_id).unwrap_or(0),
+        MSG_GET_DISCARDS => rkyv_decode::<GetDiscardsReq>(payload).map(|r| r.part_id).unwrap_or(0),
         _ => 0,
     }
 }

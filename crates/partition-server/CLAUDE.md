@@ -433,6 +433,16 @@ Targets the **logStream** where large values (ValuePointers) are stored.
 
 Auto-selects sealed extents with discard ratio > 40% (`GC_DISCARD_RATIO`), up to 3 per run (`MAX_GC_ONCE`).
 
+**Discard snapshot RPC** (`MSG_GET_DISCARDS = 0x48`, FOPS-01): `handle_get_discards` in `rpc_handlers.rs`
+reads a live snapshot of the partition's discard map without any manager state. It:
+1. Snapshots `sst_readers` from `part.borrow()` (no await while borrowed).
+2. Calls `background::get_discards(&readers)` — same aggregation the GC loop uses.
+3. Fetches `log_stream extent_ids` via `part_sc.get_stream_info(log_stream_id)`.
+4. Filters via `background::valid_discard(&mut discards, &log_extent_ids)` to drop
+   extents already punched by a prior GC run.
+5. Returns `(extent_id, reclaimable_bytes)` pairs to the caller.
+Used by `autumn-client info` to display `discard: N ext / X pending` per log stream.
+
 **Discard map**: Each SSTable's MetaBlock contains `HashMap<extent_id, reclaimable_bytes>`. During compaction, when a VP entry is dropped (dedup, range filter, tombstone/expiry), its extent_id and value length are added to the discard map. The GC loop aggregates across all SSTable readers.
 
 **`run_gc` for one extent (F106 streaming)**:
@@ -554,6 +564,24 @@ If the `merged_partition_loop` receives a `CODE_LOCKED_BY_OTHER` error from the 
 (meaning a newer partition owner has taken the lock), it sets a `locked_by_other` flag.
 The main partition loop checks this flag on each request and exits if set.
 This prevents split-brain where two PS nodes serve the same partition.
+
+## F111: Heartbeat must outlive `sync_regions_once`
+
+`finish_connect` spawns `heartbeat_loop` immediately after `register_ps`
+succeeds, BEFORE the (potentially long) `sync_regions_once`. With
+several hundred MiB of unflushed WAL across N partitions,
+`sync_regions_once` can take 10+ s — past the manager's
+`PS_DEAD_TIMEOUT` (10 s, F069). Pre-F111 the spawn lived in `serve()`
+which only runs after `finish_connect` returns, so the first heartbeat
+landed AFTER the manager had already evicted the PS, leaving every
+region's `ps_addr` permanently `unknown`.
+
+The `heartbeat_loop` also decodes the `CodeResp` from the manager. On
+`CODE_NOT_FOUND` (manager doesn't know this `ps_id`) it logs a WARN
+and re-runs `register_ps` + `sync_regions_once` so a transient
+eviction (network blip, etcd lease hiccup) self-heals. Pre-F111 the
+manager silently returned `CODE_OK` for unknown ps_id, so the running
+PS never noticed it had been evicted.
 
 ## SSTable Format
 

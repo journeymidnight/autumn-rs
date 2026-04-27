@@ -247,7 +247,7 @@ Default manager address: `127.0.0.1:9001`
 | `format --listen <ADDR> --advertise <ADDR> <DIR>...` | Format disk dirs and register a new extent node |
 | `wbench [--threads 4] [--duration 10] [--size 8192] [--nosync] [--report-interval 1] [--part-id ID] [--reuse-value true|false] [--channels-per-ps 1]` | Write benchmark; `--nosync` skips fsync; `--channels-per-ps` opens multiple independent gRPC channels to the same PS; outputs `write_result.json` with config/summary/ops samples/results |
 | `rbench [--threads 40] [--duration 10] <RESULT_FILE>` | Read benchmark using keys from `write_result.json` |
-| `info` | Show cluster state (nodes / streams / partitions) |
+| `info [--json] [--top N \| --part PID]` | Show cluster state (nodes / streams / partitions). `--json` emits a machine-readable dump; `--top N` lists the N largest partitions by live size; `--part PID` shows detail for one partition including pending GC discards. |
 
 ### autumn-stream-cli
 
@@ -333,6 +333,37 @@ $AC gc <PARTID>
 # Force GC on specific extents
 $AC forcegc <PARTID> <EXTID1> <EXTID2>
 ```
+
+### Cluster info
+
+```bash
+# Full text report (nodes / extents / streams / partitions)
+$AC info
+
+# Machine-readable JSON dump (pipeable to jq)
+$AC info --json | jq '.partitions | length'
+
+# Top 3 partitions by live size, JSON
+$AC info --json --top 3
+
+# Detail for partition 0 (3 streams + pending GC discards)
+$AC info --part 0
+
+# Same but JSON
+$AC info --json --part 0
+```
+
+Each partition's `log` stream line shows pending GC discard when non-zero:
+
+```
+  part 0: ps=127.0.0.1:9201, range=[..∞)
+    log: stream 1, extents=[1, 2], size=128.0 MB, discard: 2 ext / 54.3 MB pending
+    row: stream 2, extents=[3], size=64.0 MB
+    meta: stream 3, extents=[4], size=4.0 KB
+    total: 4 extents, 192.0 MB
+```
+
+`--top` and `--part` are mutually exclusive. `--json --top N` returns an array of the top-N partition objects. `--json --part PID` returns a single partition object.
 
 #### F109: verifying extent files are physically reclaimed after GC
 
