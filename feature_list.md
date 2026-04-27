@@ -696,6 +696,18 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 - **Notes:** `mirror_stream_meta_update` 只写 `streams/{id}` 一条 etcd key（复用 rkyv_encode(stream)），比 `mirror_create_stream` 更轻量（后者还写 extent）。所有 4 个集成测试通过（含需要真实 extent-node + EC conversion 的 `update_stream_ec_triggers_conversion`）。`register_node_duplicate_addr_rejected` 和 `f099i_*` 为已知 pre-existing failure，与本 feature 无关。
 - **passes:** true
 
+### FOPS-04 · replica stream 编码由 (0,0) 改为 (N,0)
+- **Target:** replica stream 的 `(ec_data_shard, ec_parity_shard)` 从隐式 sentinel `(0,0)` 改为 `(N, 0)`，其中 N = replica count。新约定：`(N, 0)` N≥1 表示 N 副本；`(K, M)` K≥2 M≥1 表示 EC；`(0, *)` 为非法。EC 判断谓词从 `ec_data_shard != 0` 改为 `ec_parity_shard != 0`。
+- **Evidence:** `crates/manager/src/rpc_handlers.rs` (create_stream 验证放宽) · `crates/manager/src/recovery.rs` (ec_conversion gate 改用 ec_parity_shard==0) · `crates/server/src/bin/autumn_client.rs` (bootstrap params + summary line) · 所有测试 fixture 更新
+- **Acceptance:**
+  - `autumn-client info` 中 3-replica meta stream 显示 `(3+0)` 而非 `(0+0)`
+  - bootstrap summary 行 meta={stream_id} (3+0) 而非 (0+0)
+  - EC stream 仍显示 `(3+1)` 等（无变化）
+  - `cargo test -p autumn-manager --test update_stream_ec` 全部通过（4/4）
+  - `cargo test -p autumn-stream` 全部通过（70/70）
+- **Notes:** 读/写路径分支全部依赖 `extent.parity.is_empty()`，不受 stream 级 shard count 影响，故无 I/O 行为变化。`set-stream-ec` 验证保持严格（ec_data≥2 ∧ ec_parity≥1），不允许 EC→replica downgrade。不对 etcd 已有 (0,0) 数据做 migration（fresh cluster 约定）。
+- **passes:** true
+
 ---
 
 ## P4 — PS Thread Isolation (log vs flush on separate OS threads)

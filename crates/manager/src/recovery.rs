@@ -369,7 +369,7 @@ impl AutumnManager {
                 let s = self.store.inner.borrow();
                 let mut out = Vec::new();
                 for stream in s.streams.values() {
-                    if stream.ec_data_shard == 0 {
+                    if stream.ec_parity_shard == 0 {
                         continue;
                     }
                     for &eid in &stream.extent_ids {

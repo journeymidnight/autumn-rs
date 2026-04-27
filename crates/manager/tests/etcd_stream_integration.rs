@@ -160,7 +160,7 @@ async fn create_stream(mgr: &RpcClient, replicates: u32) -> u64 {
             MSG_CREATE_STREAM,
             rkyv_encode(&CreateStreamReq {
                 replicates,
-                ec_data_shard: 0,
+                ec_data_shard: replicates,
                 ec_parity_shard: 0,
             }),
         )
@@ -364,7 +364,7 @@ fn etcd_replicated_append_and_recovery_flow() {
                 MSG_CREATE_STREAM,
                 rkyv_encode(&CreateStreamReq {
                     replicates: 2,
-                    ec_data_shard: 0,
+                    ec_data_shard: 2,
                     ec_parity_shard: 0,
                 }),
             )

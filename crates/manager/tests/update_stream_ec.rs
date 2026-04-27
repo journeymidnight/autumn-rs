@@ -58,7 +58,7 @@ async fn create_stream_repl(mgr: &RpcClient, replicates: u32) -> (u64, u64) {
             MSG_CREATE_STREAM,
             rkyv_encode(&CreateStreamReq {
                 replicates,
-                ec_data_shard: 0,
+                ec_data_shard: replicates,
                 ec_parity_shard: 0,
             }),
         )
@@ -140,9 +140,9 @@ fn update_stream_ec_sets_ec_fields() {
 
         let (stream_id, _extent_id) = create_stream_repl(&mgr, 3).await;
 
-        // Confirm starting shape is 0+0.
+        // Confirm starting shape is 3+0 (3-replica stream).
         let info = get_stream_info(&mgr, stream_id).await;
-        assert_eq!(info.ec_data_shard, 0);
+        assert_eq!(info.ec_data_shard, 3);
         assert_eq!(info.ec_parity_shard, 0);
 
         // Update to 2+1.

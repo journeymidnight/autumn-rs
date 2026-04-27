@@ -123,7 +123,7 @@ async fn setup_stream_3rep(mgr_addr: SocketAddr, n_addrs: [SocketAddr; 3]) -> u6
             MSG_CREATE_STREAM,
             rkyv_encode(&CreateStreamReq {
                 replicates: 3,
-                ec_data_shard: 0,
+                ec_data_shard: 3,
                 ec_parity_shard: 0,
             }),
         )
@@ -154,7 +154,7 @@ async fn setup_stream(mgr_addr: SocketAddr, n_addr: SocketAddr) -> u64 {
             MSG_CREATE_STREAM,
             rkyv_encode(&CreateStreamReq {
                 replicates: 1,
-                ec_data_shard: 0,
+                ec_data_shard: 1,
                 ec_parity_shard: 0,
             }),
         )

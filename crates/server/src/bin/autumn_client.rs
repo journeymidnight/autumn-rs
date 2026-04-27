@@ -1123,15 +1123,15 @@ async fn main() -> Result<()> {
             let meta_replicates = parse_replication(&replication)?;
 
             // Per-stream (replicates, ec_data, ec_parity):
-            // - EC streams use K+M as replicates and carry the shard counts.
-            // - Non-EC streams use meta_replicates with ec=0+0.
+            // - EC streams: replicates=K+M, ec_data=K, ec_parity=M.
+            // - Replica streams: replicates=N, ec_data=N, ec_parity=0.
             let log_params = log_ec
                 .map(|(k, m)| (k + m, k, m))
-                .unwrap_or((meta_replicates, 0, 0));
+                .unwrap_or((meta_replicates, meta_replicates, 0));
             let row_params = row_ec
                 .map(|(k, m)| (k + m, k, m))
-                .unwrap_or((meta_replicates, 0, 0));
-            let meta_params = (meta_replicates, 0u32, 0u32);
+                .unwrap_or((meta_replicates, meta_replicates, 0));
+            let meta_params = (meta_replicates, meta_replicates, 0u32);
 
             let ranges: Vec<(Vec<u8>, Vec<u8>)> = {
                 let parts: Vec<&str> = presplit.splitn(2, ':').collect();
@@ -1225,13 +1225,14 @@ async fn main() -> Result<()> {
                 };
                 let (_, log_k, log_m) = log_params;
                 let (_, row_k, row_m) = row_params;
+                let (_, meta_k, meta_m) = meta_params;
                 println!(
-                    "partition {} created: id={} log={} ({}+{}) row={} ({}+{}) meta={} (0+0) range=[{}..{})",
+                    "partition {} created: id={} log={} ({}+{}) row={} ({}+{}) meta={} ({}+{}) range=[{}..{})",
                     idx, resp.part_id,
                     log_stream_id, log_k, log_m,
                     row_stream_id, row_k, row_m,
-                    meta_stream_id,
-                    start_s, end_s
+                    meta_stream_id, meta_k, meta_m,
+                    start_s, end_s,
                 );
             }
             println!("bootstrap succeeded: {} partition(s)", ranges.len());

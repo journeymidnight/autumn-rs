@@ -116,7 +116,7 @@ fn benchmark_append_stream_throughput() {
                 MSG_CREATE_STREAM,
                 rkyv_encode(&CreateStreamReq {
                     replicates: 1,
-                    ec_data_shard: 0,
+                    ec_data_shard: 1,
                     ec_parity_shard: 0,
                 }),
             )

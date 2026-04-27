@@ -158,7 +158,7 @@ fn manager_failover_preserves_streams_and_partitions() {
 
         // M2 is a follower, so writes should be rejected
         let resp = mgr2
-            .call(MSG_CREATE_STREAM, rkyv_encode(&CreateStreamReq { replicates: 2, ec_data_shard: 0, ec_parity_shard: 0 }))
+            .call(MSG_CREATE_STREAM, rkyv_encode(&CreateStreamReq { replicates: 2, ec_data_shard: 2, ec_parity_shard: 0 }))
             .await
             .expect("create on follower");
         let cr: CreateStreamResp = rkyv_decode(&resp).expect("decode");

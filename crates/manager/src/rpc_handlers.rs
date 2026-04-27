@@ -256,24 +256,29 @@ impl AutumnManager {
         let ec_data = req.ec_data_shard;
         let ec_parity = req.ec_parity_shard;
 
-        if ec_data > 0 || ec_parity > 0 {
-            if ec_data < 2 || ec_parity == 0 {
-                let err = AppError::InvalidArgument(
-                    "ec_data_shard >= 2 and ec_parity_shard >= 1 required for EC conversion"
-                        .to_string(),
-                );
-                return Ok(rkyv_encode(&CreateStreamResp {
-                    code: Self::err_to_code(&err),
-                    message: err.to_string(),
-                    stream: None,
-                    extent: None,
-                }));
-            }
-        }
-
+        // Validate encoding: (N, 0) = replica; (K>=2, M>=1) = EC; (0, *) = invalid.
         let total_replicas = req.replicates as usize;
-        if total_replicas == 0 {
-            let err = AppError::InvalidArgument("replicates cannot be zero".to_string());
+        let err_msg: Option<&str> = if ec_data == 0 {
+            Some("ec_data_shard must be >= 1 (use ec_data=N, ec_parity=0 for replica streams)")
+        } else if ec_parity == 0 {
+            // Replica path: ec_data must equal replicates exactly.
+            if ec_data as usize != total_replicas {
+                Some("ec_data_shard must equal replicates for a replica stream")
+            } else {
+                None
+            }
+        } else {
+            // EC path: K >= 2, M >= 1, K+M == replicates.
+            if ec_data < 2 {
+                Some("ec_data_shard >= 2 required for EC streams")
+            } else if (ec_data + ec_parity) as usize != total_replicas {
+                Some("ec_data_shard + ec_parity_shard must equal replicates for EC streams")
+            } else {
+                None
+            }
+        };
+        if let Some(msg) = err_msg {
+            let err = AppError::InvalidArgument(msg.to_string());
             return Ok(rkyv_encode(&CreateStreamResp {
                 code: Self::err_to_code(&err),
                 message: err.to_string(),
