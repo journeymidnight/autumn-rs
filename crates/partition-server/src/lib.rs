@@ -835,6 +835,15 @@ impl PartitionServer {
                 Err(e) => return Err(e),
             }
         }
+
+        // Start heartbeats BEFORE the (potentially long) sync_regions_once. The
+        // manager evicts a PS after PS_DEAD_TIMEOUT (10s) without a heartbeat;
+        // opening N partitions can take >10s (each open_partition awaits
+        // commit_length on 3 streams + replays the WAL), which used to push
+        // the first heartbeat past the deadline and silently evict the PS.
+        let s = server.clone();
+        compio::runtime::spawn(async move { s.heartbeat_loop().await }).detach();
+
         server.sync_regions_once().await?;
 
         Ok(server)
@@ -872,8 +881,29 @@ impl PartitionServer {
             ticker.tick().await;
             let req = manager_rpc::rkyv_encode(&manager_rpc::HeartbeatPsReq { ps_id: self.ps_id });
             match self.pool.call(self.manager_addr(), manager_rpc::MSG_HEARTBEAT_PS, req).await {
-                Ok(_) => {
+                Ok(resp_data) => {
                     consecutive_failures = 0;
+                    let code = manager_rpc::rkyv_decode::<manager_rpc::CodeResp>(&resp_data)
+                        .map(|r| r.code)
+                        .unwrap_or(manager_rpc::CODE_OK);
+                    // Manager surfaces CODE_NOT_FOUND when ps_id is not in
+                    // ps_nodes (e.g. evicted after a transient hiccup). Re-
+                    // register and re-sync so the PS rejoins the cluster
+                    // instead of staying invisible to clients (`ps=unknown`).
+                    if code == manager_rpc::CODE_NOT_FOUND {
+                        tracing::warn!(
+                            "PS {} not in manager ps_nodes; re-registering",
+                            self.ps_id,
+                        );
+                        if let Err(e) = self.register_ps().await {
+                            tracing::warn!("PS {} re-register failed: {e}", self.ps_id);
+                        } else if let Err(e) = self.sync_regions_once().await {
+                            tracing::warn!(
+                                "PS {} re-sync after re-register failed: {e}",
+                                self.ps_id,
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     consecutive_failures += 1;
@@ -1145,8 +1175,9 @@ impl PartitionServer {
         );
 
         // Control-plane loops run on main compio thread and never exit.
-        let s = self.clone();
-        compio::runtime::spawn(async move { s.heartbeat_loop().await }).detach();
+        // heartbeat_loop is spawned by `finish_connect` right after
+        // register_ps succeeds, so it stays alive across the (potentially
+        // long) initial sync_regions_once.
         let s = self.clone();
         compio::runtime::spawn(async move { s.region_sync_loop().await }).detach();
 

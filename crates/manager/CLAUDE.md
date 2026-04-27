@@ -167,10 +167,14 @@ The `rg` refresh on keep is critical: after a split, `multi_modify_split` update
 `AutumnManager` tracks `ps_last_heartbeat: Arc<Mutex<HashMap<u64, Instant>>>` (ephemeral, not persisted to etcd).
 
 - **`register_ps`** records an initial timestamp so the PS isn't immediately evicted.
-- **`heartbeat_ps` RPC** (new): PS calls this every 5s to update its timestamp.
-- **`ps_liveness_check_loop`** (background, 10s interval): if a PS hasn't heartbeated in 30s, it is removed from `ps_nodes`, `rebalance_regions` is called, and the updated state is mirrored to etcd.
+- **`heartbeat_ps` RPC**: PS calls this every 2s to update its timestamp (F069 cadence).
+- **`ps_liveness_check_loop`** (background, 2s interval, F069): if a PS hasn't heartbeated in 10s, it is removed from `ps_nodes`, `rebalance_regions` is called, and the updated state is mirrored to etcd.
 
-The partition server side sends heartbeats from a `heartbeat_loop` spawned in `connect_with_advertise`, and polls `GetRegions` every 5s via `region_sync_loop` to pick up reassignments.
+The partition server side sends heartbeats from a `heartbeat_loop` spawned in `finish_connect` (F111: previously spawned in `serve()`, but `serve()` only runs after the initial `sync_regions_once` finishes opening every assigned partition; with hundreds of MiB of WAL replay per partition that exceeds the 10s eviction window). It also polls `GetRegions` every 2s via `region_sync_loop` to pick up reassignments.
+
+### F111: surface eviction via `CODE_NOT_FOUND`
+
+`handle_heartbeat_ps` returns `CODE_NOT_FOUND` (with `"ps {id} not registered"`) when the heartbeat's `ps_id` isn't in `ps_nodes`. Pre-F111 the handler silently returned `CODE_OK`, so a PS evicted by a transient hiccup never knew to re-register and stayed invisible to clients (`ps=unknown` in `info` output) until the next process restart. The PS-side `heartbeat_loop` reacts to `NOT_FOUND` by re-running `register_ps` + `sync_regions_once`, which restores the assignment via `rebalance_regions` (existing `r.ps_id` is preserved when the PS comes back into `ps_nodes`).
 
 ## Etcd Mirroring
 

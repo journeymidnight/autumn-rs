@@ -1252,11 +1252,18 @@ impl AutumnManager {
             self.ps_last_heartbeat
                 .borrow_mut()
                 .insert(req.ps_id, Instant::now());
+            Ok(rkyv_encode(&CodeResp {
+                code: CODE_OK,
+                message: String::new(),
+            }))
+        } else {
+            // Surface eviction so the PS can re-register instead of staying
+            // invisible to clients (`ps=unknown` in `info` output).
+            Ok(rkyv_encode(&CodeResp {
+                code: CODE_NOT_FOUND,
+                message: format!("ps {} not registered", req.ps_id),
+            }))
         }
-        Ok(rkyv_encode(&CodeResp {
-            code: CODE_OK,
-            message: String::new(),
-        }))
     }
 
     /// F109: extent-node startup orphan reconcile. Node sends every
