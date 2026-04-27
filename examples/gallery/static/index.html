@@ -315,6 +315,24 @@ header .tag {
   text-shadow: 0 1px 6px rgba(0, 0, 0, 0.5);
 }
 
+/* When the video thumb has an extracted frame behind it, the play glyph
+   becomes a small overlay disc rather than the cell's primary content. */
+.file-thumb.video.has-frame .play-glyph {
+  position: absolute;
+  width: 2.4rem;
+  height: 2.4rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(10, 10, 11, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  font-size: 0.9rem;
+  text-shadow: none;
+  pointer-events: none;
+}
+
 .file-thumb .ext-label {
   font-family: var(--mono);
   font-size: 0.7rem;
@@ -452,7 +470,7 @@ header .tag {
 .lightbox {
   position: fixed;
   inset: 0;
-  background: var(--lb-dominant, rgba(5, 5, 6, 0.6));
+  background: var(--lb-dominant, rgb(5, 5, 6));
   display: none;
   align-items: center;
   justify-content: center;
@@ -515,10 +533,19 @@ header .tag {
 .lightbox .lb-img-layer.from-right { transform: translate(calc(-50% + 60px), -50%); }
 
 .lightbox video {
-  position: relative;
+  /* Absolute-center mirrors the image layer pattern. We don't rely on the
+     flex centering for video because the element's intrinsic size after
+     metadata (videoWidth × videoHeight, e.g. 1080×1920 for portrait clips)
+     can interact with flex sizing in surprising ways and shift the box. */
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
   z-index: 1;
-  max-width: 100%;
-  max-height: 100%;
+  max-width: calc(100% - 3rem);
+  max-height: calc(100% - 8rem);
+  min-width: 0;
+  min-height: 0;
   object-fit: contain;
   user-select: none;
   -webkit-user-drag: none;
@@ -632,6 +659,57 @@ header .tag {
   font-size: 1.2rem;
   color: rgba(255, 255, 255, 0.75);
 }
+
+/* Video strip cells: server-extracted frame behind a small overlay disc. */
+.lb-strip-thumb.video { position: relative; }
+.lb-strip-thumb.video .play-glyph {
+  position: absolute;
+  width: 1.6rem;
+  height: 1.6rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  font-size: 0.7rem;
+  pointer-events: none;
+}
+
+/* Strip toggle button */
+.lightbox .lb-strip-toggle {
+  position: absolute;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  width: 2.4rem;
+  height: 2.4rem;
+  border-radius: 50%;
+  background: rgba(10, 10, 11, 0.55);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 0.95rem;
+  line-height: 1;
+  cursor: pointer;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.75;
+  transition: opacity var(--dur-fast) var(--ease),
+              background var(--dur-fast) var(--ease),
+              border-color var(--dur-fast) var(--ease),
+              color var(--dur-fast) var(--ease);
+}
+.lightbox .lb-strip-toggle:hover { opacity: 1; background: rgba(10, 10, 11, 0.7); }
+.lightbox .lb-strip-toggle.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  opacity: 1;
+}
+.lightbox .lb-strip-toggle.hidden { display: none; }
 
 @keyframes lightbox-in {
   from { opacity: 0; }
@@ -806,6 +884,45 @@ header .tag {
 .fade-up:nth-child(1) { animation-delay: 0.05s; }
 .fade-up:nth-child(2) { animation-delay: 0.12s; }
 .fade-up:nth-child(3) { animation-delay: 0.19s; }
+
+/* ── Performance HUD ── */
+.hud {
+  position: fixed;
+  bottom: 1.5rem;
+  left: 1.5rem;
+  z-index: 9998;
+  display: grid;
+  grid-template-columns: auto auto;
+  column-gap: 0.9rem;
+  row-gap: 0.2rem;
+  align-items: baseline;
+  padding: 0.65rem 0.9rem;
+  background: rgba(19, 19, 21, 0.72);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  backdrop-filter: blur(10px) saturate(1.2);
+  -webkit-backdrop-filter: blur(10px) saturate(1.2);
+  font-size: 0.6rem;
+  font-family: var(--mono);
+  letter-spacing: 0.06em;
+  pointer-events: none;
+  user-select: none;
+  opacity: 0.78;
+  transition: opacity var(--dur-fast) var(--ease);
+}
+.hud:hover { opacity: 1; }
+.hud .hud-label {
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+.hud .hud-value {
+  color: var(--text);
+  text-align: right;
+  min-width: 5.5rem;
+  transition: color 0.45s var(--ease);
+}
+.hud .hud-value.flash { color: var(--accent); }
+@media (max-width: 720px) { .hud { display: none; } }
 </style>
 </head>
 <body>
@@ -880,10 +997,25 @@ header .tag {
   <img id="lbImageB" alt="" class="lb-img-layer" />
   <video id="lbVideo" controls preload="metadata" class="hidden" playsinline></video>
   <div class="lb-strip" id="lbStrip" role="tablist" aria-label="Gallery thumbnails"></div>
+  <button
+    class="lb-strip-toggle hidden"
+    id="lbStripToggle"
+    type="button"
+    aria-label="Toggle thumbnails (T)"
+    aria-pressed="false"
+    title="Toggle thumbnails (T)"
+  ><span aria-hidden="true">▦</span></button>
   <div class="lb-caption" id="lbCaption"></div>
 </div>
 
 <div class="toast-rack" id="toastRack"></div>
+
+<div class="hud" id="hud" aria-hidden="true">
+  <span class="hud-label">↑ up</span>      <span class="hud-value" id="hudUp">—</span>
+  <span class="hud-label">↓ load</span>    <span class="hud-value" id="hudPreview">—</span>
+  <span class="hud-label">thumb</span>     <span class="hud-value" id="hudThumb">—</span>
+  <span class="hud-label">files</span>     <span class="hud-value" id="hudFiles">0</span>
+</div>
 
 <script>
 (function() {
@@ -911,6 +1043,80 @@ header .tag {
   const lbStrip = $('#lbStrip');
   const viewListBtn = $('#viewList');
   const viewGridBtn = $('#viewGrid');
+  const hudUp = $('#hudUp');
+  const hudPreview = $('#hudPreview');
+  const hudThumb = $('#hudThumb');
+  const hudFiles = $('#hudFiles');
+
+  // ── Perf HUD ──
+  // The HUD reflects the underlying autumn storage layer, NOT browser-perceived
+  // latency. The server tracks EMA latency + throughput for every put/get and
+  // for the JPEG thumbnail build (run on a compio blocking thread); this loop
+  // polls /metrics/ once per second and on demand after user actions.
+  function fmtRate(bps) {
+    if (!isFinite(bps) || bps <= 0) return '—';
+    if (bps >= 1024 * 1024) return (bps / (1024 * 1024)).toFixed(1) + ' MB/s';
+    if (bps >= 1024) return (bps / 1024).toFixed(1) + ' KB/s';
+    return Math.round(bps) + ' B/s';
+  }
+  function fmtMs(ms) {
+    if (!isFinite(ms) || ms <= 0) return '—';
+    if (ms >= 1000) return (ms / 1000).toFixed(2) + ' s';
+    return ms.toFixed(1) + ' ms';
+  }
+  function fmtLatBw(ms, bps) {
+    const lat = fmtMs(ms);
+    const rate = fmtRate(bps);
+    if (lat === '—' && rate === '—') return '—';
+    if (rate === '—') return lat;
+    return lat + ' · ' + rate;
+  }
+
+  let lastHud = { put: '', get: '', thumb: '' };
+  function flashIfChanged(el, key, next) {
+    el.textContent = next;
+    if (lastHud[key] === next) return;
+    lastHud[key] = next;
+    el.classList.remove('flash');
+    void el.offsetWidth;          // restart the color transition
+    el.classList.add('flash');
+    setTimeout(() => el.classList.remove('flash'), 450);
+  }
+  function setHudFiles(n) { hudFiles.textContent = n; }
+
+  // Server-side video thumbnail (ffmpeg in spawn_blocking, cached in autumn
+  // under the same .thumb/ prefix as images). The cell shows the extracted
+  // frame plus a small overlay play glyph.
+  function attachVideoThumb(thumb, name) {
+    thumb.classList.add('video');
+    const glyph = document.createElement('span');
+    glyph.className = 'play-glyph';
+    glyph.textContent = '▶';
+    const img = document.createElement('img');
+    img.alt = name;
+    img.loading = 'lazy';
+    img.src = thumbUrl(name);
+    img.onload = () => thumb.classList.add('has-frame');
+    img.onerror = () => {
+      // ffmpeg missing or codec unsupported — leave just the play glyph.
+      img.remove();
+    };
+    thumb.appendChild(img);
+    thumb.appendChild(glyph);
+  }
+
+  function pollMetrics() {
+    fetch('/metrics/', { cache: 'no-store' })
+      .then(r => r.ok ? r.json() : null)
+      .then(j => {
+        if (!j) return;
+        flashIfChanged(hudUp,      'put',   fmtLatBw(j.put_ms, j.put_bps));
+        flashIfChanged(hudPreview, 'get',   fmtLatBw(j.get_ms, j.get_bps));
+        flashIfChanged(hudThumb,   'thumb', fmtMs(j.thumb_build_ms));
+      })
+      .catch(() => {});
+  }
+  setInterval(pollMetrics, 1000);
 
   // Two-layer crossfade state. The "active" layer is the one currently shown;
   // navigation animates the inactive layer in (slide+fade) and the active one
@@ -998,6 +1204,8 @@ header .tag {
         ? completed + ' uploaded, ' + failed + ' failed'
         : completed + ' file' + (completed !== 1 ? 's' : '') + ' uploaded';
       toast(msg, failed && !completed ? 'error' : 'success');
+      // Server records per-put EMA latency/throughput; pull a fresh sample.
+      pollMetrics();
       refreshList(() => { if (firstSuccess) selectFile(firstSuccess); });
     }
 
@@ -1036,6 +1244,7 @@ header .tag {
       const names = xhr.responseText.trim().split('\n').filter(Boolean);
       files = names;
       fileCount.textContent = names.length || '';
+      setHudFiles(names.length);
       if (!names.length) {
         fileList.innerHTML = '<div class="file-empty">No files yet</div>';
         if (cb) cb();
@@ -1069,7 +1278,7 @@ header .tag {
         };
         thumb.appendChild(img);
       } else if (isVideo(name)) {
-        thumb.innerHTML = '<span class="play-glyph">▶</span>';
+        attachVideoThumb(thumb, name);
       } else {
         thumb.innerHTML = '<span class="ext-label">' + escHtml(ext) + '</span>';
       }
@@ -1166,6 +1375,18 @@ header .tag {
     if (lightboxOpen) openLightbox(files[nextAbs]);
   });
 
+  // Keyboard 'T' toggles the strip while the lightbox is open.
+  document.addEventListener('keydown', e => {
+    if (e.key !== 't' && e.key !== 'T') return;
+    if (!lightbox.classList.contains('active')) return;
+    const tag = e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    if (!shouldOfferStrip()) return;
+    e.preventDefault();
+    stripVisible = !stripVisible;
+    applyStripVisibility();
+  });
+
   // ── Delete ──
   function deleteFile(name) {
     const xhr = new XMLHttpRequest();
@@ -1183,10 +1404,24 @@ header .tag {
   }
 
   // ── Preview ──
-  function showEmpty() {
-    previewArea.innerHTML = '';
-    previewArea.appendChild(previewLoader);
+  // The preview loader (spinner overlay) is only relevant for the text/XHR
+  // branch — it shows download progress for arbitrary files. For images,
+  // videos, PDFs, the browser's native loading UI is enough, and stacking
+  // our spinner on top of `<video controls>` makes a confusing two-control
+  // pile-up. So `previewLoader` is added to the DOM ONLY by the text path.
+  let activePreviewXhr = null;
+  function resetPreviewLoaderState() {
     previewLoader.classList.remove('active');
+    if (previewLoader.parentNode) previewLoader.parentNode.removeChild(previewLoader);
+    if (activePreviewXhr) {
+      try { activePreviewXhr.abort(); } catch (e) {}
+      activePreviewXhr = null;
+    }
+  }
+
+  function showEmpty() {
+    resetPreviewLoaderState();
+    previewArea.innerHTML = '';
     const es = document.createElement('div');
     es.className = 'empty-state';
     es.innerHTML = '<span class="glyph">&#9671;</span>Select a file to preview';
@@ -1197,8 +1432,8 @@ header .tag {
     const ext = name.includes('.') ? name.split('.').pop().toLowerCase() : '';
     const url = '/get/' + encodeURIComponent(name);
 
+    resetPreviewLoaderState();
     previewArea.innerHTML = '';
-    previewArea.appendChild(previewLoader);
 
     const label = document.createElement('div');
     label.className = 'preview-filename';
@@ -1210,6 +1445,7 @@ header .tag {
       img.src = url;
       img.alt = name;
       img.title = 'Click to enlarge';
+      img.addEventListener('load', pollMetrics, { once: true });
       img.onerror = () => toast('Failed to load image', 'error');
       img.addEventListener('click', () => openLightbox(name));
       previewArea.appendChild(img);
@@ -1220,29 +1456,40 @@ header .tag {
       v.src = url;
       v.controls = true;
       v.playsInline = true;
+      v.addEventListener('loadeddata', pollMetrics, { once: true });
       previewArea.appendChild(v);
       addExpandButton(name);
 
     } else if (ext === 'pdf') {
       const f = document.createElement('iframe');
+      f.addEventListener('load', pollMetrics, { once: true });
       f.src = url;
       previewArea.appendChild(f);
 
     } else {
+      previewArea.appendChild(previewLoader);
       showLoader();
       const xhr = new XMLHttpRequest();
+      activePreviewXhr = xhr;
       xhr.open('GET', url, true);
       xhr.responseType = 'text';
       xhr.onprogress = e => { if (e.lengthComputable) updateDl(e.loaded, e.total); };
       xhr.onload = () => {
+        if (activePreviewXhr === xhr) activePreviewXhr = null;
         hideLoader();
         if (xhr.status === 200) {
+          pollMetrics();
           const pre = document.createElement('pre');
           pre.textContent = xhr.responseText;
           previewArea.appendChild(pre);
         }
       };
-      xhr.onerror = () => { hideLoader(); toast('Failed to load file', 'error'); };
+      xhr.onerror = () => {
+        if (activePreviewXhr === xhr) activePreviewXhr = null;
+        hideLoader();
+        toast('Failed to load file', 'error');
+      };
+      xhr.onabort = () => { hideLoader(); };
       xhr.send();
     }
   }
@@ -1295,7 +1542,9 @@ header .tag {
     }
   }
 
-  const DEFAULT_LB_BG = 'rgba(5, 5, 6, 0.7)';
+  // Fully opaque so videos (which don't get the dominant-color backdrop)
+  // never let the underlying preview-area player bleed through.
+  const DEFAULT_LB_BG = 'rgb(5, 5, 6)';
   function setDominantFromImage(img) {
     const c = extractDominantColor(img);
     lightbox.style.setProperty('--lb-dominant', c || DEFAULT_LB_BG);
@@ -1358,10 +1607,11 @@ header .tag {
   function renderStrip() {
     lbStrip.innerHTML = '';
     if (lbStripFiles.length <= 1) {
+      // applyStripVisibility() will keep the strip hidden anyway, but
+      // setting it here too avoids a one-frame flash if the toggle is on.
       lbStrip.classList.add('hidden');
       return;
     }
-    lbStrip.classList.remove('hidden');
     lbStripFiles.forEach(name => {
       const t = document.createElement('button');
       t.type = 'button';
@@ -1369,13 +1619,25 @@ header .tag {
       t.dataset.name = name;
       t.title = name;
       t.setAttribute('aria-label', name);
-      if (isImage(name)) {
+      const video = isVideo(name);
+      if (isImage(name) || video) {
         const img = document.createElement('img');
         img.loading = 'lazy';
         img.alt = '';
         img.src = thumbUrl(name);
-        img.onerror = () => { t.innerHTML = '<span class="play-glyph">?</span>'; };
+        img.onerror = () => {
+          // Preserve the video class so the overlay disc rule still
+          // matches; otherwise drop back to a generic glyph.
+          t.innerHTML = '<span class="play-glyph">' + (video ? '▶' : '?') + '</span>';
+        };
         t.appendChild(img);
+        if (video) {
+          t.classList.add('video');
+          const glyph = document.createElement('span');
+          glyph.className = 'play-glyph';
+          glyph.textContent = '▶';
+          t.appendChild(glyph);
+        }
       } else {
         t.innerHTML = '<span class="play-glyph">▶</span>';
       }
@@ -1386,6 +1648,7 @@ header .tag {
       });
       lbStrip.appendChild(t);
     });
+    // Don't toggle .hidden here — applyStripVisibility() owns that.
     scrollActiveStripIntoView();
   }
 
@@ -1403,6 +1666,28 @@ header .tag {
 
   // Strip clicks should never close the lightbox.
   lbStrip.addEventListener('click', e => e.stopPropagation());
+
+  // ── Strip toggle ──
+  // The thumbnail strip is hidden by default whenever the lightbox opens.
+  // A small disc button at bottom-right toggles it on; pressing 'T' is an
+  // alias. The button itself hides if there's nothing to show (≤1 media).
+  const lbStripToggle = $('#lbStripToggle');
+  let stripVisible = false;
+  function shouldOfferStrip() { return lbStripFiles.length > 1; }
+  function applyStripVisibility() {
+    const offer = shouldOfferStrip();
+    lbStripToggle.classList.toggle('hidden', !offer);
+    const show = offer && stripVisible;
+    lbStrip.classList.toggle('hidden', !show);
+    lbStripToggle.classList.toggle('active', show);
+    lbStripToggle.setAttribute('aria-pressed', show ? 'true' : 'false');
+    if (show) scrollActiveStripIntoView();
+  }
+  lbStripToggle.addEventListener('click', e => {
+    e.stopPropagation();
+    stripVisible = !stripVisible;
+    applyStripVisibility();
+  });
 
   // Direction: -1 = previous (slide in from left), +1 = next (slide in from
   // right), 0 = no animation (fresh open or jump via strip click). Track the
@@ -1458,7 +1743,17 @@ header .tag {
     const wasActive = lightbox.classList.contains('active');
     lightbox.classList.add('active');
     lightbox.setAttribute('aria-hidden', 'false');
+    // Pause anything playing in the right-pane preview so its audio and
+    // last frame don't sit behind the lightbox.
+    previewArea.querySelectorAll('video, audio').forEach(el => {
+      try { el.pause(); } catch (_) {}
+    });
+    // Reset the toggle on every fresh open so users always start with a
+    // clean view; if you re-navigate within an open session the existing
+    // stripVisible state is preserved.
+    if (!wasActive) stripVisible = false;
     syncStrip();
+    applyStripVisibility();
 
     if (isVideo(name)) {
       // Fade both image layers out; show video.
