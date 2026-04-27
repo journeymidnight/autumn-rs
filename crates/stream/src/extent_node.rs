@@ -1015,15 +1015,21 @@ impl ExtentNode {
         // Load existing extents from all disks.
         node.load_extents().await?;
 
-        // F109: reconcile loaded extents against the manager. Any
+        // F109+F113: reconcile loaded extents against the manager. Any
         // `extent_id` the manager no longer knows about (refs went to
         // 0 while this node was offline, or the manager's in-memory
-        // pending-delete queue was lost across a restart) is unlinked.
-        // Best-effort: a network failure here just defers cleanup; the
-        // file remains on disk and we'll retry on next boot.
-        if let Err(e) = node.reconcile_orphans_with_manager().await {
-            tracing::warn!(error = %e, "F109 startup reconcile failed; will retry on next boot");
-        }
+        // pending-delete queue was lost across a restart, or an EC
+        // conversion left a replica behind) is unlinked.
+        //
+        // F113: spawn as a long-lived background task. After an initial
+        // exp-backoff retry that races past manager leader election,
+        // it enters a steady-state periodic sweep so the node self-
+        // heals on any extent that becomes garbage at runtime —
+        // covering MSG_DELETE_EXTENT retry budget exhaustion, EC
+        // conversion leftovers, and any other future case where an
+        // extent's manager refs hit 0 while the node was momentarily
+        // unreachable.
+        node.spawn_reconcile_orphans_loop();
 
         // Replay WAL records into extent files. Only this shard's WAL is
         // replayed; cross-shard records live in sibling WAL dirs which
@@ -1037,13 +1043,70 @@ impl ExtentNode {
         Ok(node)
     }
 
+    /// F113: long-lived periodic orphan reconcile.
+    ///
+    /// Runs immediately on spawn, then every `SWEEP_INTERVAL`. Errors
+    /// (manager not leader during cold boot, transient network blip,
+    /// etcd hiccup) are logged at WARN and the loop continues — the
+    /// next sweep retries. No separate "startup retry" phase: a cold-
+    /// boot race is just a failed first iteration, recovered on the
+    /// next tick. Worst-case orphan-cleanup latency on cold boot is
+    /// one sweep interval.
+    ///
+    /// This is the safety net for any case where the manager-push
+    /// `MSG_DELETE_EXTENT` path doesn't unlink the local file:
+    ///   • `MSG_DELETE_EXTENT` retry budget (60 sweeps × 2 s ≈ 2 min
+    ///     on the manager side) exhausted while the node was
+    ///     unreachable.
+    ///   • Manager restart losing its in-memory
+    ///     `pending_extent_deletes` queue between leader hand-offs.
+    ///   • Future EC conversion: a replica-shaped extent that gets
+    ///     converted to EC leaves the original `.dat` files behind on
+    ///     the data nodes; `convert_to_ec` updates manager metadata
+    ///     and the periodic reconcile reaps the leftovers without a
+    ///     separate cleanup RPC.
+    ///   • Any other future code path that drops an extent's refs to
+    ///     0 in the manager but doesn't successfully unlink locally.
+    ///
+    /// Each sweep ships every locally-loaded `extent_id` to the
+    /// manager. There's no cheaper "send only suspects" filter the
+    /// node can apply — it can't know which ids are garbage without
+    /// asking. That's why the cadence is generous (5 min, not 1 min):
+    /// for a backstop role, freshness doesn't matter much; an orphan
+    /// already escaped the primary push path, a few extra minutes on
+    /// disk is harmless. If a node ever scales to 10k+ extents and
+    /// the per-sweep payload becomes a concern, switch to chunked
+    /// rotation (bounded id batches per sweep, rotating through the
+    /// full set over multiple sweeps) — the helper signature is
+    /// already shaped for that.
+    fn spawn_reconcile_orphans_loop(&self) {
+        if self.manager_endpoint.is_none() {
+            // Test setups without a manager: nothing to reconcile.
+            return;
+        }
+        let node = self.clone();
+        compio::runtime::spawn(async move {
+            const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+            loop {
+                if let Err(e) = node.reconcile_orphans_with_manager().await {
+                    tracing::warn!(
+                        error = %e,
+                        "F113 reconcile failed (will retry next sweep)",
+                    );
+                }
+                compio::time::sleep(SWEEP_INTERVAL).await;
+            }
+        })
+        .detach();
+    }
+
     /// F109: best-effort startup orphan reconcile.
     /// If `manager_endpoint` is configured, ship every loaded
     /// `extent_id` to the manager; receive back the subset that's no
     /// longer registered and unlink the corresponding `.dat`/`.meta`.
     /// Skips silently when there's no manager (test setups). Per-disk
     /// errors are logged but don't propagate — partial cleanup is fine,
-    /// next boot will retry the rest.
+    /// the F113 retry loop will catch the next iteration.
     async fn reconcile_orphans_with_manager(&self) -> Result<()> {
         let mgr = match &self.manager_endpoint {
             Some(ep) => crate::conn_pool::normalize_endpoint(ep),

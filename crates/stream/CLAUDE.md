@@ -243,22 +243,56 @@ handle_delete_extent(extent_id):
   4. Returns CodeResp { code: CODE_OK | CODE_ERROR }.
 ```
 
-### F109: Startup Orphan Reconcile
+### F109+F113: Startup + Periodic Orphan Reconcile
 
-`ExtentNode::new` calls `reconcile_orphans_with_manager()` after
-`load_extents()`. The node ships every locally loaded `extent_id`
-(filtered through `owns_extent` in the F099-M shard mode) to the
-manager via `MSG_RECONCILE_EXTENTS = 0x31`; the manager returns the
-subset that is no longer in `s.extents`. The node unlinks the
-corresponding `.dat`/`.meta` files via the same `remove_extent_files`
-helper used by `handle_delete_extent`.
+`ExtentNode::new` calls `spawn_reconcile_orphans_loop()` after
+`load_extents()`. This detaches a background task on the node's
+compio runtime that runs in two phases:
 
-This is the second-line cleanup for the case where the manager's
-in-memory `pending_extent_deletes` queue lost an entry — either
-because the manager restarted while the entry was still in flight,
-or because the receiving node was offline for the entire 60-sweep
-retry window. Best-effort: a network failure during reconcile is
-logged at WARN and doesn't block startup; the next boot retries.
+Runs immediately on spawn, then every 5 minutes. Each iteration
+ships every locally loaded `extent_id` (filtered through
+`owns_extent` in F099-M shard mode) to the manager via
+`MSG_RECONCILE_EXTENTS = 0x31`; the manager returns the subset that
+is no longer in `s.extents`. The node unlinks the corresponding
+`.dat`/`.meta` files via the same `remove_extent_files` helper used
+by `handle_delete_extent`.
+
+A single iteration handles BOTH cold-start (cluster boot, manager
+not yet leader → first attempt fails, next sweep retries) and
+steady-state (catch orphans missed by the manager-push path). No
+separate "startup retry" phase needed: a cold-boot race is just a
+failed first iteration that recovers on the next tick. Worst-case
+orphan-cleanup latency on cold boot is one sweep interval.
+
+Pre-F113 this was an inline single-shot await with WARN-and-give-up
+in `ExtentNode::new`: if the extent-node hit the manager before
+its etcd lease was won (`ensure_leader` returns "not leader"), the
+orphan files persisted until the next operator-driven reboot.
+
+The periodic sweep is a safety net for any case where an extent's
+manager refs hit 0 while the node was momentarily unreachable:
+- `MSG_DELETE_EXTENT` retry budget exhausted (60 sweeps × 2 s ≈
+  2 min on the manager side).
+- Manager restart loses its in-memory `pending_extent_deletes` queue
+  between leader hand-offs.
+- Future EC conversion: a replica-shaped extent that gets converted
+  to EC leaves original-replica `.dat` files behind on data nodes;
+  `convert_to_ec` updates manager metadata and the periodic
+  reconcile reaps the leftovers without a separate cleanup RPC.
+- Any future code path that drops manager refs to 0 unilaterally.
+
+Per-sweep failures are logged at WARN; the loop continues. No
+give-up state.
+
+**Per-sweep cost**: each iteration sends every locally-loaded
+`extent_id` to the manager. The node has no way to filter to
+"suspects" — it can't know which ids are garbage without asking.
+The cadence is therefore generous (5 min) — for a backstop role,
+freshness doesn't matter much; an orphan already escaped the
+primary push path, a few extra minutes on disk is harmless. If a
+node ever scales to 10k+ extents, switch to chunked rotation
+(bounded id batches per sweep, rotating through the full set over
+multiple sweeps).
 
 ---
 
