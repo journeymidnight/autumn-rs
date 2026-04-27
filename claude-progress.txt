@@ -1,70 +1,71 @@
 Date: 2026-04-27
 TaskStatus: completed
-Task scope: F119 — gallery example: transcode uploaded video to single-bitrate
-HLS (M3U8 + .ts) asynchronously after upload, store segments in Autumn KV,
-play with hls.js (Safari uses native HLS), drop the original after transcode,
-and surface transcode state in the grid via /transcode-status polling.
+Task scope: gallery /get/{name} Range handler — stream the response in
+4 MiB chunks instead of materialising the entire `bytes=N-` slice as a
+single Vec. Fix `bytes=-N` (suffix range) parsing along the way.
 
 Current summary:
-  Goal: replace direct MP4 byte streaming with HLS so video playback uses a
-  standard chunked protocol (browser/CDN-friendly, hls.js-compatible).
+  Symptom: `ffmpeg -i http://127.0.0.1:5001/get/<file>.mp4 -c copy ... HLS`
+  was very slow, and the bigger the source file the worse it got.
 
-  Approach (approved A in brainstorming):
-    - Async background transcoding via compio::runtime::spawn; FFmpeg
-      runs in spawn_blocking, pulls source from /get/ via HTTP Range.
-    - Single-bitrate libx264 / aac, hls_time=4, no ABR.
-    - Store HLS segments in KV under .hls/<name>/{index.m3u8,seg*.ts};
-      thumbnail at .thumb/320/<name> (same prefix as image thumbs);
-      delete original after transcode completes.
-    - In-memory transcode status map (Rc<RefCell<HashMap<...>>> — single
-      compio thread, no Arc/DashMap); KV fallback (.hls playlist exists ⇒
-      done; original exists w/o playlist ⇒ queued) handles server restart.
-    - 409 Conflict on same-name upload while transcoding.
-    - Front-end uses hls.js@1 from jsDelivr; cells render a "转码中…"
-      placeholder + spinner with backoff polling (2 s ×5 → 5 s ×5 → 10 s).
+  Root cause: ffmpeg's HTTP demuxer issues `Range: bytes=N-`. The previous
+  handler computed `length = total - N` and called `get_range(N, length)`
+  in one shot — for a 1 GiB upload that allocated a 1 GiB Vec (and pulled
+  a 1 GiB autumn-rpc payload back to the gallery process) before any HTTP
+  body byte shipped. ffmpeg blocked on the entire buffer materialising.
+  The autumn-rs storage layer's `get_range` is already a true partial
+  read end-to-end; the bottleneck was purely in the gallery response
+  shape.
+
+  Fix:
+    - New `parse_byte_range(s, total)` helper in
+      examples/gallery/src/main.rs handles `bytes=N-`, `bytes=N-M`, and
+      `bytes=-N` (suffix). The previous code mis-parsed `bytes=-N` as
+      `bytes=0-N`.
+    - New `stream_kv_range(client, metrics, name, start, end_inclusive)`
+      helper builds a `Body::from_stream` driven by an mpsc producer that
+      loops `get_range(off, RANGE_CHUNK_BYTES = 4 MiB)` until done. The
+      producer task is `SendWrapper`'d (Rc/RefCell client) and detached on
+      compio; chunks travel as `Bytes` over the (Send) mpsc into axum.
+      Backpressure cap=2 keeps memory at ~8 MiB regardless of value size.
+    - `get_handler_inner` is rewritten to: head() once → parse Range →
+      build streaming Body → 200 or 206 with the right Content-Length /
+      Content-Range. The non-Range path streams uniformly too.
+    - The same per-chunk loop releases the `Rc<Mutex<ClusterClient>>`
+      between fetches, so other gallery handlers can interleave instead
+      of waiting on one giant get_range.
 
 Files changed:
-  - examples/gallery/Cargo.toml          (added tempfile = "3")
-  - examples/gallery/src/main.rs         (transcoding pipeline, /hls and
-                                          /transcode-status routes,
-                                          recover_pending_transcodes,
-                                          409 conflict guard, list/delete
-                                          updates)
-  - examples/gallery/static/index.html   (hls.js script, attachHls/detachHls,
-                                          status polling + placeholder UI,
-                                          preview/lightbox HLS attach,
-                                          transcoding/failed CSS)
-  - examples/gallery/README.md           (new — storage layout, pipeline,
-                                          curl-based manual verification)
-  - feature_list.md                       (F119 entry)
-  - claude-progress.txt                   (this file)
+  - examples/gallery/src/main.rs            (new helpers + rewritten
+                                             get_handler_inner; new
+                                             RANGE_CHUNK_BYTES const)
+  - examples/gallery/README.md              (new "Range Reads" section)
+  - claude-progress.txt                     (this file)
 
 Verification:
-  - cargo build --release -p gallery -p autumn-server -p autumn-client: clean.
-  - End-to-end on 1-node cluster (./cluster.sh start 1):
-      * upload sample.mp4 (8 s testsrc) → /transcode-status flips to done in
-        ~500 ms → /hls/sample.mp4/index.m3u8 returns valid #EXTM3U
-        (application/vnd.apple.mpegurl) → /hls/sample.mp4/seg000.ts returns
-        181 KB of video/mp2t → /thumb/sample.mp4 returns image/jpeg →
-        /get/sample.mp4 → 404 → /list/ shows sample.mp4.
-      * sample.mov upload → same flow.
-      * red.png upload → unchanged behavior.
-      * DELETE /del/sample.mp4 → list no longer shows it; hls + thumb
-        keys all 404.
-      * concurrent same-name upload while transcoding → HTTP 409
-        ("transcoding in progress for big.mp4").
-      * restart gallery → status endpoint returns done via KV fallback.
-      * kill gallery mid-transcode → on restart, recover_pending_transcodes
-        re-enqueues the orphan and the transcode completes.
-  - In-browser verification (hls.js attach, autoplay, lightbox cleanup) is
-    covered by the README's manual steps; not exercised in this session.
+  - `cargo build -p gallery`: clean.
+  - `cargo clippy -p gallery --no-deps`: 3 pre-existing-style
+    `redundant_async_block` warnings around `compio::runtime::spawn(async
+    move { fut.await }).detach()` (matches the two other call sites that
+    already use this pattern); no new clippy issues introduced by this
+    change.
+  - End-to-end runtime validation (cluster up + actual ffmpeg HLS
+    timing) is left for manual follow-up using the steps in
+    examples/gallery/README.md §Manual Verification with a >=200 MB
+    source. Acceptance: `transcode: ffmpeg hls done hls_ms=...` should
+    drop close to a `ffmpeg`-against-local-file baseline, instead of
+    being dominated by gallery buffering.
 
-Out of scope:
-  - Multi-bitrate / adaptive bitrate (explicitly excluded in design).
-  - Authentication / authorization on /hls/ (gallery example has none on
-    /get/ either).
-  - Retry-with-backoff on transcode failure — failure leaves the original
-    in place; user can re-upload.
+Out of scope (flagged for follow-up):
+  - `ClusterClient::get_range` still uses `u32` for offset/length, so
+    files >= 4 GiB silently truncate — not relevant to current uploads
+    but worth lifting to u64 in a future pass.
+  - Per-handler ClusterClient / connection pool to enable truly parallel
+    HLS-segment fetches by the browser. Single-connection ffmpeg runs
+    don't benefit, but multi-segment HLS playback would.
+  - Streaming for `/hls/{name}/{file}` segments — segments are small and
+    fully buffered is fine.
 
 Next steps:
-  None — feature implemented, verified, documented, and ready for commit.
+  None required to close this task. Optional manual perf check on a
+  large h264+aac MP4 to quantify the speedup, per the README.

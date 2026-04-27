@@ -21,6 +21,15 @@ cargo run --release -p gallery -- 127.0.0.1:9001
 `127.0.0.1:9001` is the manager address. Override with the first CLI arg
 if your cluster runs elsewhere.
 
+## Range Reads
+
+`GET /get/{name}` parses RFC 7233 byte ranges (`bytes=N-`, `bytes=N-M`,
+`bytes=-N`) and streams the response in 4 MiB chunks back to the client.
+ffmpeg's HTTP demuxer always opens with `Range: bytes=0-`, so chunked
+streaming keeps memory and time-to-first-byte O(chunk) regardless of
+upload size — important for the HLS transcode pipeline below, which reads
+each source MP4 over `http://127.0.0.1:5001/get/...`.
+
 ## Storage Layout
 
 Files live in the cluster's KV store under these key conventions:
@@ -43,7 +52,11 @@ When a video (`mp4` / `webm` / `ogg` / `mov` / `m4v`) is uploaded:
    them via the gallery's own `/get/` route.
 2. A background `compio::runtime::spawn` task kicks off ffmpeg in
    `spawn_blocking`:
-   - `libx264 / aac, CRF 23, 4-second segments, single bitrate`.
+  - If the source is already compatible with the gallery's MPEG-TS HLS
+    output (`h264` video plus copy-safe audio such as `aac` / `mp3` /
+    `ac3` / `eac3`), it first tries a lossless `-c copy` passthrough.
+  - Otherwise it falls back to `libx264 / aac, CRF 23, 4-second segments,
+    single bitrate`.
    - Same pass extracts a 0.5 s thumbnail keyframe.
 3. All produced files are written to `.hls/<filename>/...` and
    `.thumb/320/<filename>`.

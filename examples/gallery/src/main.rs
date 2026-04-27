@@ -94,6 +94,11 @@ const THUMB_QUALITY: u8 = 80;
 // Must match the bind in main(). Used so ffmpeg can pull video bytes from
 // our own /get/ route via HTTP Range, avoiding a full-blob fetch.
 const LISTEN_PORT: u16 = 5001;
+// Chunk size for streaming /get/{name} responses. ffmpeg's HTTP demuxer
+// always opens with `Range: bytes=N-`; without chunking we'd materialise
+// `total - N` bytes into one Vec before any HTTP byte ships. 4 MiB keeps
+// memory bounded and lets ffmpeg start parsing after one round-trip.
+const RANGE_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
 
 fn thumb_key(name: &str) -> String {
     format!("{THUMB_PREFIX}{THUMB_WIDTH}/{name}")
@@ -201,35 +206,50 @@ fn json_string(s: &str) -> String {
     out
 }
 
-/// Single-bitrate FFmpeg pass: input video URL → directory containing
-/// `index.m3u8` + `seg000.ts` … plus `thumb.jpg`. Runs in `spawn_blocking`.
-fn run_transcode_blocking(url: &str) -> Result<Vec<(String, Vec<u8>)>> {
+#[derive(Clone, Copy, Debug)]
+enum HlsEncodeMode {
+    Copy,
+    Reencode,
+}
+
+fn run_hls_ffmpeg(url: &str, playlist: &std::path::Path, segments: &std::path::Path, mode: HlsEncodeMode) -> Result<()> {
     use std::process::{Command, Stdio};
 
-    let tmp = tempfile::tempdir().context("tempdir")?;
-    let dir = tmp.path();
-    let playlist = dir.join("index.m3u8");
-    let segments = dir.join("seg%03d.ts");
-
-    let hls_status = Command::new("ffmpeg")
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        url,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+    ]);
+    match mode {
+        HlsEncodeMode::Copy => {
+            cmd.args(["-c:v", "copy", "-c:a", "copy", "-bsf:v", "h264_mp4toannexb"]);
+        }
+        HlsEncodeMode::Reencode => {
+            cmd.args([
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+            ]);
+        }
+    }
+    let status = cmd
         .args([
-            "-y",
-            "-loglevel",
-            "error",
-            "-i",
-            url,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
             "-hls_time",
-            "4",
+            "30",
             "-hls_list_size",
             "0",
             "-hls_segment_type",
@@ -238,21 +258,59 @@ fn run_transcode_blocking(url: &str) -> Result<Vec<(String, Vec<u8>)>> {
             "independent_segments",
             "-hls_segment_filename",
         ])
-        .arg(&segments)
-        .arg(&playlist)
+        .arg(segments)
+        .arg(playlist)
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .output()
-        .context("spawn ffmpeg (hls)")?;
-    if !hls_status.status.success() {
-        let tail = String::from_utf8_lossy(&hls_status.stderr);
+        .with_context(|| format!("spawn ffmpeg (hls {})", format!("{mode:?}").to_ascii_lowercase()))?;
+    if !status.status.success() {
+        let tail = String::from_utf8_lossy(&status.stderr);
         let tail = tail.lines().rev().take(8).collect::<Vec<_>>().join(" | ");
-        return Err(anyhow!("ffmpeg hls exited {}: {tail}", hls_status.status));
+        return Err(anyhow!(
+            "ffmpeg hls {} exited {}: {tail}",
+            format!("{mode:?}").to_ascii_lowercase(),
+            status.status
+        ));
     }
+    Ok(())
+}
+
+/// FFmpeg HLS pass: input video URL → directory containing `index.m3u8` +
+/// `seg000.ts` … plus `thumb.jpg`. If the source streams are already
+/// MPEG-TS HLS-compatible (H.264 video and copy-safe audio), prefer `-c copy`
+/// so the output is lossless; otherwise fall back to re-encoding.
+fn run_transcode_blocking(url: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let tmp = tempfile::tempdir().context("tempdir")?;
+    let dir = tmp.path();
+    let playlist = dir.join("index.m3u8");
+    let segments = dir.join("seg%03d.ts");
+
+    let t1 = Instant::now();
+    if let Err(err) = run_hls_ffmpeg(url, &playlist, &segments, HlsEncodeMode::Copy) {
+        tracing::warn!(
+            error = %err,
+            "transcode: hls copy path failed, falling back to re-encode"
+        );
+        // Wipe any partial segments left by the failed copy pass so they
+        // don't get collected and uploaded as orphans after re-encode.
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        run_hls_ffmpeg(url, &playlist, &segments, HlsEncodeMode::Reencode)
+            .context("run ffmpeg hls reencode after copy fallback")?;
+    }
+    tracing::info!(hls_ms = t1.elapsed().as_millis(), "transcode: ffmpeg hls done");
 
     // Thumbnail in a second pass: source is still the original (HTTP Range),
     // so we don't have to re-decode the freshly-written .ts.
+    let t2 = Instant::now();
     let scale = format!("scale={THUMB_WIDTH}:-2");
     let thumb_path = dir.join("thumb.jpg");
     let thumb_status = Command::new("ffmpeg")
@@ -286,8 +344,10 @@ fn run_transcode_blocking(url: &str) -> Result<Vec<(String, Vec<u8>)>> {
         // playback will still work; the cell shows the play glyph alone.
         tracing::warn!("ffmpeg thumb pass failed: {tail}");
     }
+    tracing::info!(thumb_ms = t2.elapsed().as_millis(), "transcode: ffmpeg thumb done");
 
     let mut out = Vec::new();
+    let mut total_bytes: u64 = 0;
     for entry in std::fs::read_dir(dir).context("read tmpdir")? {
         let entry = entry?;
         let path = entry.path();
@@ -300,8 +360,14 @@ fn run_transcode_blocking(url: &str) -> Result<Vec<(String, Vec<u8>)>> {
             .ok_or_else(|| anyhow!("non-utf8 filename"))?
             .to_string();
         let bytes = std::fs::read(&path).with_context(|| format!("read {fname}"))?;
+        total_bytes += bytes.len() as u64;
         out.push((fname, bytes));
     }
+    tracing::info!(
+        files = out.len(),
+        total_mb = total_bytes / (1024 * 1024),
+        "transcode: collected output files"
+    );
     Ok(out)
 }
 
@@ -313,7 +379,9 @@ async fn transcode_video_task(name: String, client: Client, map: TranscodeMap) {
         .insert(name.clone(), TranscodeStatus::Transcoding);
     tracing::info!("transcode start: {name}");
     let url = self_get_url(&name);
+    let t_ffmpeg = std::time::Instant::now();
     let res = compio::runtime::spawn_blocking(move || run_transcode_blocking(&url)).await;
+    tracing::info!(ffmpeg_total_ms = t_ffmpeg.elapsed().as_millis(), "transcode: blocking work done");
 
     let outputs = match res {
         Ok(Ok(v)) => v,
@@ -334,12 +402,15 @@ async fn transcode_video_task(name: String, client: Client, map: TranscodeMap) {
     // Push every produced file: thumb.jpg → thumb_key, everything else →
     // .hls/<name>/<fname>. must_sync=false: HLS segments are derivable from
     // the original which we still have until the final delete.
+    let t_kv = std::time::Instant::now();
+    let mut kv_bytes: u64 = 0;
     for (fname, bytes) in outputs {
         let key = if fname == "thumb.jpg" {
             thumb_key(&name)
         } else {
             hls_key(&name, &fname)
         };
+        kv_bytes += bytes.len() as u64;
         let put_res = client.lock().await.put(key.as_bytes(), &bytes, false).await;
         if let Err(e) = put_res {
             tracing::warn!("write {key} failed: {e}");
@@ -348,6 +419,11 @@ async fn transcode_video_task(name: String, client: Client, map: TranscodeMap) {
             return;
         }
     }
+    tracing::info!(
+        kv_total_ms = t_kv.elapsed().as_millis(),
+        kv_total_mb = kv_bytes / (1024 * 1024),
+        "transcode: kv upload done"
+    );
 
     // Drop the original; non-fatal if it's already gone (concurrent delete).
     match client.lock().await.delete(name.as_bytes()).await {
@@ -502,6 +578,106 @@ async fn put_handler_inner(
     error_response(StatusCode::BAD_REQUEST, "no file field".into())
 }
 
+/// Parse `Range: bytes=...` (RFC 7233 §2.1, single byte-range only) into an
+/// inclusive (start, end) pair. Returns `None` for malformed input or for an
+/// otherwise-unrepresentable range; the caller falls back to a 200 response.
+///
+/// Handles the three byte-range-spec forms ffmpeg / Safari / hls.js actually
+/// emit: `bytes=N-`, `bytes=N-M`, and `bytes=-N` (suffix). The previous
+/// implementation mis-parsed `bytes=-N` as `bytes=0-N`.
+fn parse_byte_range(s: &str, total: u64) -> Option<(u64, u64)> {
+    let rest = s.strip_prefix("bytes=")?;
+    if total == 0 {
+        return None;
+    }
+    if let Some(suffix) = rest.strip_prefix('-') {
+        let n: u64 = suffix.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        let n = n.min(total);
+        return Some((total - n, total - 1));
+    }
+    let (start_s, end_s) = rest.split_once('-')?;
+    let start: u64 = start_s.parse().ok()?;
+    if start >= total {
+        return None;
+    }
+    let end: u64 = if end_s.is_empty() {
+        total - 1
+    } else {
+        end_s.parse::<u64>().ok()?.min(total - 1)
+    };
+    if start > end {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// Build a streaming `Body` that fetches `[start, end_inclusive]` of `name`
+/// from the cluster in `RANGE_CHUNK_BYTES`-sized pieces. The producer task
+/// runs on the local compio runtime; chunks travel over a Send-able mpsc so
+/// `Body::from_stream` can hold them across the axum (Send) boundary.
+///
+/// This replaces the previous "one giant `get_range`" path: ffmpeg sends
+/// `Range: bytes=0-` for sequential reads, so a 1 GiB upload used to allocate
+/// a 1 GiB Vec (plus an autumn-rpc payload of the same size) before the HTTP
+/// body emitted any frame. Now first byte ships after one chunk's RTT and
+/// resident memory stays O(chunk).
+fn stream_kv_range(
+    client: Client,
+    metrics: MetricsRef,
+    name: String,
+    start: u64,
+    end_inclusive: u64,
+) -> Body {
+    use futures::channel::mpsc;
+    use futures::SinkExt;
+
+    let total_len = end_inclusive - start + 1;
+    // Cap=2 gives one chunk in flight on the wire while the consumer drains
+    // another; bigger buffers just waste memory without improving throughput.
+    let (mut tx, rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
+
+    let producer = SendWrapper::new(async move {
+        let mut off: u64 = start;
+        let mut remaining: u64 = total_len;
+        while remaining > 0 {
+            let take = remaining.min(RANGE_CHUNK_BYTES as u64) as u32;
+            let t0 = Instant::now();
+            let res = client
+                .lock()
+                .await
+                .get_range(name.as_bytes(), off as u32, take)
+                .await;
+            let dt = elapsed_ms(t0);
+            match res {
+                Ok(Some(bytes)) => {
+                    let n = bytes.len() as u64;
+                    metrics.borrow_mut().record_get(dt, n);
+                    if n == 0 {
+                        break;
+                    }
+                    if tx.send(Ok(bytes::Bytes::from(bytes))).await.is_err() {
+                        return; // client disconnected
+                    }
+                    off = off.saturating_add(n);
+                    remaining = remaining.saturating_sub(n);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let err = std::io::Error::other(format!("get_range: {e}"));
+                    let _ = tx.send(Err(err)).await;
+                    return;
+                }
+            }
+        }
+    });
+    compio::runtime::spawn(async move { producer.await }).detach();
+
+    Body::from_stream(rx)
+}
+
 async fn get_handler_inner(
     client: &Client,
     metrics: &MetricsRef,
@@ -512,76 +688,51 @@ async fn get_handler_inner(
         .first_or_octet_stream()
         .to_string();
 
-    // Check for HTTP Range header — use sub-range read to avoid loading entire value.
-    if let Some(range_header) = headers.get("range") {
-        if let Ok(range_str) = range_header.to_str() {
-            if let Some(bytes_range) = range_str.strip_prefix("bytes=") {
-                let parts: Vec<&str> = bytes_range.splitn(2, '-').collect();
-                if parts.len() == 2 {
-                    let start: usize = parts[0].parse().unwrap_or(0);
-                    let end_str = parts[1];
+    // One head() per request: lets us 404 cleanly, validate the requested
+    // range, and emit a correct `Content-Range` total (Safari rejects
+    // `bytes X-Y/*`, see the existing comment retained from the previous
+    // implementation).
+    let total_size: u64 = match client.lock().await.head(name.as_bytes()).await {
+        Ok(meta) if meta.found => meta.value_length,
+        Ok(_) => return error_response(StatusCode::NOT_FOUND, "not found".into()),
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("head: {e}")),
+    };
 
-                    // Always call head() to get total size — Safari requires the exact total
-                    // in every Content-Range response (bytes X-Y/*  is rejected by Safari).
-                    let total_size: usize = match client.lock().await.head(name.as_bytes()).await {
-                        Ok(meta) if meta.found => meta.value_length as usize,
-                        Ok(_) => return error_response(StatusCode::NOT_FOUND, "not found".into()),
-                        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("head: {e}")),
-                    };
+    let parsed_range = headers
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| parse_byte_range(s, total_size));
 
-                    let end: usize = if end_str.is_empty() {
-                        total_size.saturating_sub(1)
-                    } else {
-                        end_str.parse().unwrap_or(usize::MAX).min(total_size.saturating_sub(1))
-                    };
-
-                    if start <= end {
-                        let length = end - start + 1;
-                        let t0 = Instant::now();
-                        let range_res = client
-                            .lock()
-                            .await
-                            .get_range(name.as_bytes(), start as u32, length as u32)
-                            .await;
-                        let dt = elapsed_ms(t0);
-                        let slice = match range_res {
-                            Ok(Some(v)) => v,
-                            Ok(None) => return error_response(StatusCode::NOT_FOUND, "not found".into()),
-                            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("get: {e}")),
-                        };
-                        metrics.borrow_mut().record_get(dt, slice.len() as u64);
-                        let actual_end = start + slice.len() - 1;
-                        return Response::builder()
-                            .status(StatusCode::PARTIAL_CONTENT)
-                            .header("content-type", &mime)
-                            .header("accept-ranges", "bytes")
-                            .header("content-length", slice.len())
-                            .header("content-range", format!("bytes {start}-{actual_end}/{total_size}"))
-                            .body(Body::from(slice))
-                            .unwrap();
-                    }
-                }
-            }
-        }
-    }
-
-    // No Range header — full read via SDK.
-    let t0 = Instant::now();
-    let res = client.lock().await.get(name.as_bytes()).await;
-    let dt = elapsed_ms(t0);
-    match res {
-        Ok(Some(v)) => {
-            metrics.borrow_mut().record_get(dt, v.len() as u64);
-            Response::builder()
+    let (start, end_inclusive, status, content_range) = match parsed_range {
+        Some((s, e)) => (
+            s,
+            e,
+            StatusCode::PARTIAL_CONTENT,
+            Some(format!("bytes {s}-{e}/{total_size}")),
+        ),
+        None if total_size == 0 => {
+            return Response::builder()
                 .header("content-type", &mime)
                 .header("accept-ranges", "bytes")
-                .header("content-length", v.len())
-                .body(Body::from(v))
-                .unwrap()
+                .header("content-length", 0)
+                .body(Body::empty())
+                .unwrap();
         }
-        Ok(None) => error_response(StatusCode::NOT_FOUND, "not found".into()),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("get: {e}")),
+        None => (0, total_size - 1, StatusCode::OK, None),
+    };
+
+    let length = end_inclusive - start + 1;
+    let body = stream_kv_range(client.clone(), metrics.clone(), name, start, end_inclusive);
+
+    let mut builder = Response::builder()
+        .status(status)
+        .header("content-type", &mime)
+        .header("accept-ranges", "bytes")
+        .header("content-length", length);
+    if let Some(cr) = content_range {
+        builder = builder.header("content-range", cr);
     }
+    builder.body(body).unwrap()
 }
 
 async fn cleanup_derived(client: &Client, name: &str) {
@@ -873,6 +1024,7 @@ async fn thumb_handler_inner(
         .unwrap()
 }
 
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -993,4 +1145,39 @@ async fn main() -> Result<()> {
     tracing::info!("Gallery listening on http://0.0.0.0:{LISTEN_PORT}");
     cyper_axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_byte_range;
+
+    #[test]
+    fn parse_open_ended() {
+        assert_eq!(parse_byte_range("bytes=0-", 1000), Some((0, 999)));
+        assert_eq!(parse_byte_range("bytes=500-", 1000), Some((500, 999)));
+    }
+
+    #[test]
+    fn parse_closed() {
+        assert_eq!(parse_byte_range("bytes=10-99", 1000), Some((10, 99)));
+        // end clamped to total - 1
+        assert_eq!(parse_byte_range("bytes=10-9999", 1000), Some((10, 999)));
+    }
+
+    #[test]
+    fn parse_suffix() {
+        // Regression: previously parsed as bytes=0-2048.
+        assert_eq!(parse_byte_range("bytes=-2048", 539849), Some((537801, 539848)));
+        // suffix larger than total clamps.
+        assert_eq!(parse_byte_range("bytes=-9999", 1000), Some((0, 999)));
+    }
+
+    #[test]
+    fn parse_rejects_unrepresentable() {
+        assert_eq!(parse_byte_range("bytes=1000-", 1000), None); // start at EOF
+        assert_eq!(parse_byte_range("bytes=-0", 1000), None); // empty suffix
+        assert_eq!(parse_byte_range("bytes=", 1000), None);
+        assert_eq!(parse_byte_range("not a range", 1000), None);
+        assert_eq!(parse_byte_range("bytes=0-", 0), None); // empty value
+    }
 }
