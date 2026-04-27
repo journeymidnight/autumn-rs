@@ -1,106 +1,70 @@
 Date: 2026-04-27
 TaskStatus: completed
-Task scope: F118 — open extents on EC streams misrouted as EC. PS panicked
-post-split with `range start index 93582868 out of range for slice of length
-8388569` on `client.rs::read_with_layout → ec_subrange_read`, and `autumn-
-client info` labelled open extents as `EC(3+1)` even though they were still
-4-way replicated.
+Task scope: F119 — gallery example: transcode uploaded video to single-bitrate
+HLS (M3U8 + .ts) asynchronously after upload, store segments in Autumn KV,
+play with hls.js (Safari uses native HLS), drop the original after transcode,
+and surface transcode state in the grid via /transcode-status polling.
 
 Current summary:
-  Symptom: live cluster after split. PS `part-20` (the new partition) panics on
-  read; info command shows open extents 21/23/24 as `EC(3+1), data=[1,3,5],
-  parity=[7]` despite `(open)` tag.
+  Goal: replace direct MP4 byte streaming with HLS so video playback uses a
+  standard chunked protocol (browser/CDN-friendly, hls.js-compatible).
 
-  Root cause: the manager's `stream_alloc_extent` (rpc_handlers.rs:792-803)
-  pre-fills `parity` with the M target nodes the moment an EC-stream extent
-  is allocated. The data plane writes the full payload to every K+M replica
-  until the `ec_conversion_dispatch_loop` runs `apply_ec_conversion_done` on
-  a *sealed* extent. Anything that branches on `parity.is_empty()` to
-  distinguish replication-vs-EC misroutes pre-conversion / open extents:
-    1. `client.rs::read_with_layout` → `ec_subrange_read`: panics on
-       `shard_size = shard_size(sealed_length=0, K) = 0`.
-    2. `extent_node.rs::run_recovery_task` → `run_ec_recovery_payload`:
-       would corrupt EC recovery (data is replicated, not EC-shaped).
-    3. `autumn_client.rs::Info`: misleading display.
-
-  The manager's own EC conversion dispatch already used the correct marker
-  (`ex.original_replicates != 0` at recovery.rs:377), but `original_replicates:
-  u32` was confusingly named — only the zero / non-zero distinction was ever
-  consumed. Renamed to `ec_converted: bool` for clarity.
-
-Fix:
-  1. Renamed `original_replicates: u32` → `ec_converted: bool` in
-     `MgrExtentInfo` (rpc/src/manager_rpc.rs) + `ExtentInfo`
-     (stream/src/extent_rpc.rs). Wire-format / etcd-schema change.
-  2. Init sites in `manager/src/rpc_handlers.rs` (2 locations): set
-     `ec_converted: false`.
-  3. `apply_ec_conversion_done` (manager/src/recovery.rs): drop the
-     `original_replicates: u32` parameter (and the caller's
-     `orig_replica_count`); set `ex.ec_converted = true`.
-  4. EC conversion dispatch filter (recovery.rs:377): `ex.ec_converted`.
-  5. Read-path dispatch (`client.rs::read_with_layout`): `if
-     ex.ec_converted` — the panic site.
-  6. Recovery dispatch (`extent_node.rs::run_recovery_task`): `if
-     !extent_info.ec_converted` for the replication path.
-  7. Info display (`autumn_client.rs::Info`): render `EC(K+M)` only when
-     `ec_converted`; otherwise render `replicas=[…replicates ++
-     parity…]` so all K+M nodes that physically hold the replicated
-     payload show up.
-  8. mgr↔local conversion helpers: copy through.
-  9. Tests (`ec_failover.rs`, `update_stream_ec.rs`): assertion switched
-     from `!ext.parity.is_empty()` to `ext.ec_converted`.
-  10. `crates/stream/CLAUDE.md` Programming Note 16: codify the rule.
+  Approach (approved A in brainstorming):
+    - Async background transcoding via compio::runtime::spawn; FFmpeg
+      runs in spawn_blocking, pulls source from /get/ via HTTP Range.
+    - Single-bitrate libx264 / aac, hls_time=4, no ABR.
+    - Store HLS segments in KV under .hls/<name>/{index.m3u8,seg*.ts};
+      thumbnail at .thumb/320/<name> (same prefix as image thumbs);
+      delete original after transcode completes.
+    - In-memory transcode status map (Rc<RefCell<HashMap<...>>> — single
+      compio thread, no Arc/DashMap); KV fallback (.hls playlist exists ⇒
+      done; original exists w/o playlist ⇒ queued) handles server restart.
+    - 409 Conflict on same-name upload while transcoding.
+    - Front-end uses hls.js@1 from jsDelivr; cells render a "转码中…"
+      placeholder + spinner with backoff polling (2 s ×5 → 5 s ×5 → 10 s).
 
 Files changed:
-  - crates/rpc/src/manager_rpc.rs        (MgrExtentInfo schema)
-  - crates/stream/src/extent_rpc.rs      (ExtentInfo schema)
-  - crates/manager/src/rpc_handlers.rs   (2 init sites)
-  - crates/manager/src/recovery.rs       (signature + set + filter)
-  - crates/stream/src/client.rs          (read_with_layout dispatch +
-                                          mgr_to_extent_info)
-  - crates/stream/src/extent_node.rs     (run_recovery_task dispatch +
-                                          mgr_to_local_extent)
-  - crates/server/src/bin/autumn_client.rs (info display)
-  - crates/manager/tests/ec_failover.rs   (test assertion + print)
-  - crates/manager/tests/update_stream_ec.rs (test assertion)
-  - crates/stream/CLAUDE.md               (Programming Note 16)
-  - feature_list.md                        (F118 entry)
+  - examples/gallery/Cargo.toml          (added tempfile = "3")
+  - examples/gallery/src/main.rs         (transcoding pipeline, /hls and
+                                          /transcode-status routes,
+                                          recover_pending_transcodes,
+                                          409 conflict guard, list/delete
+                                          updates)
+  - examples/gallery/static/index.html   (hls.js script, attachHls/detachHls,
+                                          status polling + placeholder UI,
+                                          preview/lightbox HLS attach,
+                                          transcoding/failed CSS)
+  - examples/gallery/README.md           (new — storage layout, pipeline,
+                                          curl-based manual verification)
+  - feature_list.md                       (F119 entry)
+  - claude-progress.txt                   (this file)
 
 Verification:
-  - cargo build --workspace --tests: clean (only pre-existing dead-code
-    warnings).
-  - cargo test -p autumn-stream --tests -- --test-threads=1: 70/70 pass.
-  - cargo test -p autumn-manager --test ec_failover --test update_stream_ec:
-    5/5 pass.
-  - cargo test -p autumn-partition-server --lib: 86 pass / 2 fail
-    (pre-existing F099-I flakes documented in F104 — pass 5/5 with
-    --test-threads=1).
-  - cargo test -p autumn-manager --lib: 4 pass / 1 fail
-    (`register_node_duplicate_addr_rejected` — pre-existing, documented in
-    F116's verification notes).
-  - grep -r original_replicates → no matches anywhere in crates/.
-
-  Live cluster verification (deferred to operator):
-    - Etcd schema is incompatible — wipe etcd dir before restart (the
-      old `original_replicates: u32` rkyv records will not deserialize
-      against the new `ec_converted: bool` field).
-    - Reproduce the panic scenario: write enough data to trigger a
-      partition split, then read from the new (right) partition before
-      its log_stream tail extent has been sealed + EC-converted.
-      Pre-fix: PS panic on `client.rs::read_with_layout →
-      ec_subrange_read`. Post-fix: read succeeds via
-      `read_replicated_with_failover` against all 4 nodes.
-    - `autumn-client info` should render open extents as
-      `replicas=[1,3,5,7]` (all K+M nodes) instead of
-      `EC(3+1) parity=[7]`. Once conversion lands, sealed extents
-      should show `EC(3+1), data=[1,3,5], parity=[7]`.
+  - cargo build --release -p gallery -p autumn-server -p autumn-client: clean.
+  - End-to-end on 1-node cluster (./cluster.sh start 1):
+      * upload sample.mp4 (8 s testsrc) → /transcode-status flips to done in
+        ~500 ms → /hls/sample.mp4/index.m3u8 returns valid #EXTM3U
+        (application/vnd.apple.mpegurl) → /hls/sample.mp4/seg000.ts returns
+        181 KB of video/mp2t → /thumb/sample.mp4 returns image/jpeg →
+        /get/sample.mp4 → 404 → /list/ shows sample.mp4.
+      * sample.mov upload → same flow.
+      * red.png upload → unchanged behavior.
+      * DELETE /del/sample.mp4 → list no longer shows it; hls + thumb
+        keys all 404.
+      * concurrent same-name upload while transcoding → HTTP 409
+        ("transcoding in progress for big.mp4").
+      * restart gallery → status endpoint returns done via KV fallback.
+      * kill gallery mid-transcode → on restart, recover_pending_transcodes
+        re-enqueues the orphan and the transcode completes.
+  - In-browser verification (hls.js attach, autoplay, lightbox cleanup) is
+    covered by the README's manual steps; not exercised in this session.
 
 Out of scope:
-  - Manager's `min_size` check in `handle_check_commit_length` /
-    `handle_stream_alloc_extent` (rpc_handlers.rs:576/:717) still uses
-    `ex.parity.is_empty()` to require K alive replicas instead of 1 for
-    pre-conversion extents — overly strict but not a correctness bug;
-    revisit if a partial-failure scenario actually trips it.
+  - Multi-bitrate / adaptive bitrate (explicitly excluded in design).
+  - Authentication / authorization on /hls/ (gallery example has none on
+    /get/ either).
+  - Retry-with-backoff on transcode failure — failure leaves the original
+    in place; user can re-upload.
 
 Next steps:
-  None — implemented + tested + documented.
+  None — feature implemented, verified, documented, and ready for commit.

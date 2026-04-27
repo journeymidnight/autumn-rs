@@ -923,7 +923,33 @@ header .tag {
 }
 .hud .hud-value.flash { color: var(--accent); }
 @media (max-width: 720px) { .hud { display: none; } }
+
+/* Transcoding placeholder for video grid cells */
+.file-thumb.video.transcoding {
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(255,255,255,0.04);
+}
+.file-thumb.video.transcoding .transcode-spinner {
+  width: 36px; height: 36px;
+  border: 3px solid rgba(255,255,255,0.15);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+  position: relative; z-index: 2;
+}
+.file-thumb.video.transcoding .transcode-label {
+  position: absolute; bottom: 6px; left: 0; right: 0; text-align: center;
+  font-size: 0.62rem; color: var(--text-muted); letter-spacing: 0.04em;
+  z-index: 2;
+}
+.file-thumb.video.failed {
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(180,40,40,0.08);
+  color: #ff8a8a; font-size: 1.4rem;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
 </head>
 <body>
 
@@ -1084,10 +1110,57 @@ header .tag {
   }
   function setHudFiles(n) { hudFiles.textContent = n; }
 
-  // Server-side video thumbnail (ffmpeg in spawn_blocking, cached in autumn
-  // under the same .thumb/ prefix as images). The cell shows the extracted
-  // frame plus a small overlay play glyph.
-  function attachVideoThumb(thumb, name) {
+  // Video assets are stored as HLS (M3U8 + .ts segments) under .hls/<name>/.
+  // The thumbnail is generated as part of the transcoding pipeline and lives
+  // at the same .thumb/ prefix as image thumbnails.
+  function hlsUrl(name) { return '/hls/' + encodeURIComponent(name) + '/index.m3u8'; }
+  function transcodeStatusUrl(name) { return '/transcode-status/' + encodeURIComponent(name); }
+
+  // Track active hls.js instances and per-cell pollers so we can clean up.
+  const transcodePollers = new Map();   // name → timeout id
+  function clearPoller(name) {
+    const id = transcodePollers.get(name);
+    if (id !== undefined) { clearTimeout(id); transcodePollers.delete(name); }
+  }
+
+  function attachHls(videoEl, name) {
+    detachHls(videoEl);
+    const url = hlsUrl(name);
+    if (videoEl.canPlayType('application/vnd.apple.mpegurl')) {
+      videoEl.src = url;                 // Safari native HLS
+      return;
+    }
+    if (window.Hls && Hls.isSupported()) {
+      const hls = new Hls({ enableWorker: true });
+      hls.on(Hls.Events.ERROR, (_e, data) => {
+        if (data && data.fatal) {
+          console.warn('hls.js fatal', data);
+          try { hls.destroy(); } catch (_) {}
+        }
+      });
+      hls.loadSource(url);
+      hls.attachMedia(videoEl);
+      videoEl.__hls = hls;
+    } else {
+      videoEl.src = url;                 // last-ditch fallback
+    }
+  }
+
+  function detachHls(videoEl) {
+    try { videoEl.pause(); } catch (_) {}
+    if (videoEl.__hls) {
+      try { videoEl.__hls.destroy(); } catch (_) {}
+      videoEl.__hls = null;
+    }
+    videoEl.removeAttribute('src');
+    try { videoEl.load(); } catch (_) {}
+  }
+
+  // Render the play-glyph + thumbnail layout on a cell once we know the
+  // backing video is ready. Always called after we've cleared transcoding UI.
+  function renderVideoCell(thumb, name) {
+    thumb.classList.remove('transcoding', 'failed');
+    thumb.innerHTML = '';
     thumb.classList.add('video');
     const glyph = document.createElement('span');
     glyph.className = 'play-glyph';
@@ -1095,14 +1168,72 @@ header .tag {
     const img = document.createElement('img');
     img.alt = name;
     img.loading = 'lazy';
-    img.src = thumbUrl(name);
+    img.src = thumbUrl(name) + '?t=' + Date.now();   // bypass stale 404 cache
     img.onload = () => thumb.classList.add('has-frame');
-    img.onerror = () => {
-      // ffmpeg missing or codec unsupported — leave just the play glyph.
-      img.remove();
-    };
+    img.onerror = () => { img.remove(); };
     thumb.appendChild(img);
     thumb.appendChild(glyph);
+  }
+
+  function renderTranscodingCell(thumb, name) {
+    thumb.classList.add('video', 'transcoding');
+    thumb.classList.remove('failed', 'has-frame');
+    thumb.innerHTML =
+      '<span class="transcode-spinner"></span>' +
+      '<span class="transcode-label">转码中…</span>';
+  }
+
+  function renderFailedCell(thumb, _name, err) {
+    thumb.classList.add('video', 'failed');
+    thumb.classList.remove('transcoding', 'has-frame');
+    thumb.innerHTML = '<span title="' + escHtml(err || 'transcode failed') + '">⚠</span>';
+  }
+
+  // Polls /transcode-status/<name> with backoff. Stops once the cell leaves
+  // the DOM (viewMode swap / list refresh) or status is terminal.
+  function pollTranscodeStatus(thumb, name, attempt) {
+    if (!thumb.isConnected) { clearPoller(name); return; }
+    fetch(transcodeStatusUrl(name), { cache: 'no-store' })
+      .then(r => r.ok ? r.json() : { status: 'failed', error: 'http ' + r.status })
+      .catch(() => ({ status: 'failed', error: 'network' }))
+      .then(j => {
+        if (!thumb.isConnected) { clearPoller(name); return; }
+        if (j.status === 'done') {
+          clearPoller(name);
+          renderVideoCell(thumb, name);
+          return;
+        }
+        if (j.status === 'failed') {
+          clearPoller(name);
+          renderFailedCell(thumb, name, j.error);
+          return;
+        }
+        // queued / transcoding — backoff: 2s × first 5, then 5s × next 5,
+        // then 10s indefinitely.
+        const next = attempt < 5 ? 2000 : attempt < 10 ? 5000 : 10000;
+        const id = setTimeout(() => pollTranscodeStatus(thumb, name, attempt + 1), next);
+        transcodePollers.set(name, id);
+      });
+  }
+
+  function attachVideoThumb(thumb, name) {
+    thumb.classList.add('video');
+    // Probe status once before deciding whether to render the play cell or
+    // a transcoding placeholder.
+    fetch(transcodeStatusUrl(name), { cache: 'no-store' })
+      .then(r => r.ok ? r.json() : { status: 'failed', error: 'http ' + r.status })
+      .catch(() => ({ status: 'failed', error: 'network' }))
+      .then(j => {
+        if (!thumb.isConnected) return;
+        if (j.status === 'done') {
+          renderVideoCell(thumb, name);
+        } else if (j.status === 'failed') {
+          renderFailedCell(thumb, name, j.error);
+        } else {
+          renderTranscodingCell(thumb, name);
+          pollTranscodeStatus(thumb, name, 0);
+        }
+      });
   }
 
   function pollMetrics() {
@@ -1417,6 +1548,8 @@ header .tag {
       try { activePreviewXhr.abort(); } catch (e) {}
       activePreviewXhr = null;
     }
+    // Tear down any hls.js attached to the preview pane's <video>.
+    previewArea.querySelectorAll('video').forEach(detachHls);
   }
 
   function showEmpty() {
@@ -1453,12 +1586,32 @@ header .tag {
 
     } else if (VIDEO_EXTS.includes(ext)) {
       const v = document.createElement('video');
-      v.src = url;
       v.controls = true;
       v.playsInline = true;
       v.addEventListener('loadeddata', pollMetrics, { once: true });
       previewArea.appendChild(v);
       addExpandButton(name);
+      // Probe status; only attach hls.js once transcoding has completed.
+      fetch(transcodeStatusUrl(name), { cache: 'no-store' })
+        .then(r => r.ok ? r.json() : { status: 'failed', error: 'http ' + r.status })
+        .catch(() => ({ status: 'failed', error: 'network' }))
+        .then(j => {
+          if (!v.isConnected) return;
+          if (j.status === 'done') {
+            attachHls(v, name);
+          } else if (j.status === 'failed') {
+            const note = document.createElement('div');
+            note.className = 'preview-filename';
+            note.style.color = '#ff8a8a';
+            note.textContent = '转码失败：' + (j.error || 'unknown');
+            previewArea.appendChild(note);
+          } else {
+            const note = document.createElement('div');
+            note.className = 'preview-filename';
+            note.textContent = '正在转码 — 完成后可播放';
+            previewArea.appendChild(note);
+          }
+        });
 
     } else if (ext === 'pdf') {
       const f = document.createElement('iframe');
@@ -1763,18 +1916,32 @@ header .tag {
       lbBackdropB.classList.remove('active');
       lbImageA.src = '';
       lbImageB.src = '';
-      lbVideo.src = url;
+      detachHls(lbVideo);
       lbVideo.classList.remove('hidden');
       resetDominant();
       lastShownName = name;
-      // autoplay; ignore the promise (browsers may reject without user gesture, that's fine)
-      lbVideo.play().catch(() => {});
+      // Probe status; if not done yet, keep the video element visible but
+      // empty (browser shows its blank state) and let the user dismiss.
+      fetch(transcodeStatusUrl(name), { cache: 'no-store' })
+        .then(r => r.ok ? r.json() : { status: 'failed', error: 'http ' + r.status })
+        .catch(() => ({ status: 'failed', error: 'network' }))
+        .then(j => {
+          if (lastShownName !== name) return;
+          if (j.status === 'done') {
+            attachHls(lbVideo, name);
+            // autoplay; ignore the promise (browsers may reject without gesture)
+            lbVideo.play().catch(() => {});
+          } else if (j.status === 'failed') {
+            toast('转码失败：' + (j.error || 'unknown'), 'error');
+          } else {
+            toast('正在转码，稍后再试', '');
+          }
+        });
       return;
     }
 
     // Image path.
-    lbVideo.pause();
-    lbVideo.src = '';
+    detachHls(lbVideo);
     lbVideo.classList.add('hidden');
 
     const direction = wasActive ? directionBetween(lastShownName, name) : 0;
@@ -1826,8 +1993,7 @@ header .tag {
       el.classList.remove('active');
       el.style.backgroundImage = '';
     });
-    lbVideo.pause();
-    lbVideo.src = '';
+    detachHls(lbVideo);
     resetDominant();
     lastShownName = null;
     if (activeFile) {

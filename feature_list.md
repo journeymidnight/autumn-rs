@@ -219,6 +219,44 @@
 - **Notes:** Wire-format change to two rkyv-serialised structs — old etcd state with `original_replicates: u32` will not deserialize against `ec_converted: bool`. Acceptable for this single-tenant rewrite project; documented in the verification step. Programming Note 16 added to `crates/stream/CLAUDE.md` codifying the rule "EC dispatch keys on `ec_converted`, NEVER on `parity.is_empty()`" with the underlying invariant `ec_converted == true ⇒ sealed_length > 0` (the conversion loop refuses to act on open extents). Out of scope: the manager's `min_size` check in `handle_check_commit_length` / `handle_stream_alloc_extent` (`rpc_handlers.rs:576`/`:717`) still uses `ex.parity.is_empty()` to require K alive replicas instead of 1 for pre-conversion extents — overly strict but not a correctness bug; revisit if a partial-failure scenario actually trips it.
 - **passes:** true
 
+### F119 · gallery video uploads transcoded to single-bitrate HLS (M3U8 + .ts) and played via hls.js
+- **Target:** When a video (`mp4` / `webm` / `ogg` / `mov` / `m4v`) is uploaded to the gallery example, run an asynchronous FFmpeg pass that produces a single-bitrate HLS playlist + 4-second `.ts` segments and a 320 px keyframe thumbnail, store all artifacts in Autumn KV under `.hls/<name>/...` and `.thumb/320/<name>`, then drop the original. Front-end uses [hls.js](https://github.com/video-dev/hls.js/) for non-Safari browsers (Safari uses its native HLS demuxer). Transcoding state is exposed via `GET /transcode-status/<name>` and surfaces in the grid as a "转码中…" placeholder that auto-refreshes when the worker finishes.
+- **Evidence:**
+  - Gallery currently serves video originals via `GET /get/<name>` + HTTP Range, with native `<video>` playback (`examples/gallery/src/main.rs:240-320`, `examples/gallery/static/index.html:1454-1461`). For long videos this scales poorly, can't be cached at segment granularity, and forces the cluster to range-read the full original on every viewer.
+  - Video thumbnails ran ffmpeg lazily on every cache miss (`examples/gallery/src/main.rs:140-179` + `:425-440`), which keeps the original around forever and burns CPU on every cold cache hit.
+- **Fix:**
+  1. New constant `HLS_PREFIX = ".hls/"` and helpers `hls_key`, `hls_dir_prefix`, `hls_playlist_key` in `examples/gallery/src/main.rs`.
+  2. `enum TranscodeStatus { Queued, Transcoding, Done, Failed(String) }` + `type TranscodeMap = Rc<RefCell<HashMap<String, TranscodeStatus>>>`. Compio is single-threaded so `Rc<RefCell<…>>` is sufficient (no `Arc<DashMap>`).
+  3. `run_transcode_blocking(url) -> Vec<(String, Vec<u8>)>` runs two FFmpeg passes inside `compio::runtime::spawn_blocking`: HLS (`libx264 / aac, CRF 23, hls_time 4, hls_list_size 0`) into a `tempfile::tempdir()` and a thumbnail keyframe at `-ss 0.5`. Both pull the source from `http://127.0.0.1:5001/get/<name>` so ffmpeg can issue Range requests and avoid full-blob fetches.
+  4. `transcode_video_task` writes every produced file (`index.m3u8`, `seg*.ts`, `thumb.jpg` → `.thumb/320/<name>`) to KV, then deletes the original. Failure leaves the original in place and records `TranscodeStatus::Failed`.
+  5. `put_handler_inner` rejects same-name uploads with `409 Conflict` while a transcode is `Queued|Transcoding`, otherwise spawns the worker and returns `{"name":…,"transcoding":true}` immediately.
+  6. New routes in `main()`:
+     - `GET /hls/{name}/{file}` → reads `.hls/<name>/<file>` from KV, sets `application/vnd.apple.mpegurl` for `.m3u8` and `video/mp2t` for `.ts`. Path-traversal guard rejects `..` / `/` in the segment field.
+     - `GET /transcode-status/{name}` → JSON. Falls back to KV when in-memory map is empty (server restart): `.hls/<name>/index.m3u8` present ⇒ `done`; original present ⇒ `queued`; otherwise 404.
+  7. `delete_handler_inner` cascades: original + `.thumb/320/<name>` + every `.hls/<name>/*` (prefix scan + per-key delete).
+  8. `list_handler_inner` filters out internal prefixes and adds the logical names extracted from `.hls/<name>/index.m3u8` so a video remains visible after its original is reaped.
+  9. `thumb_handler_inner` for videos: serve cached only (no ffmpeg in the request path); 404 if not yet generated.
+  10. `recover_pending_transcodes` runs once at boot: scans KV, re-enqueues any video whose original key still exists but lacks `.hls/<name>/index.m3u8`.
+  11. Front-end (`examples/gallery/static/index.html`):
+      - `<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>` in `<head>`.
+      - `attachHls(videoEl, name)` / `detachHls(videoEl)` helpers; Safari uses `videoEl.src = hlsUrl(name)` directly, others attach `Hls`. Tear-down in `resetPreviewLoaderState` and `closeLightbox`.
+      - `attachVideoThumb` first probes `/transcode-status/<name>`; renders a spinner + label while transcoding, with backoff polling (2 s × 5, 5 s × 5, then 10 s); flips to the thumbnail + play glyph on `done`; renders an error icon on `failed`.
+      - `previewFile` and `openLightbox` gate hls.js attach on `done` status.
+  12. New CSS rules for `.file-thumb.video.transcoding` (spinner + label) and `.file-thumb.video.failed` (error glyph).
+  13. New `examples/gallery/README.md` documents the storage layout, video pipeline, status endpoint, and curl-driven manual verification.
+- **Evidence:** `examples/gallery/src/main.rs`, `examples/gallery/static/index.html`, `examples/gallery/Cargo.toml` (added `tempfile = "3"`), `examples/gallery/README.md`.
+- **Verification:**
+  - `cargo build --release -p gallery -p autumn-server -p autumn-client` clean.
+  - End-to-end on a 1-node cluster (`./cluster.sh start 1`):
+    - Upload `sample.mp4` (8 s test pattern) → `transcoding:true` → status flips to `done` within ~500 ms → `/hls/sample.mp4/index.m3u8` returns a valid `#EXTM3U` playlist (`application/vnd.apple.mpegurl`), `/hls/sample.mp4/seg000.ts` returns 181 KB of `video/mp2t`, `/thumb/sample.mp4` returns `image/jpeg`, `/get/sample.mp4` returns 404 (original reaped), `/list/` shows `sample.mp4`.
+    - Upload `sample2.mov` → same flow.
+    - Upload `red.png` (image) → unchanged behavior.
+    - `DELETE /del/sample.mp4` → `/list/` no longer contains it; `/hls/sample.mp4/index.m3u8`, `/hls/sample.mp4/seg000.ts`, `/thumb/sample.mp4` all 404.
+    - Concurrent same-name upload while transcoding → `HTTP 409` with `transcoding in progress for big.mp4`.
+    - Restart gallery → status endpoint still returns `done` for previously-completed videos via the KV fallback.
+    - Kill gallery mid-transcode → on restart, `recover_pending_transcodes` re-enqueues the orphan and the transcode completes.
+- **passes:** true
+
 ### F116 · gallery `/get/` slow + autumn-extent CPU after EC conversion (stale `extent_info_cache`, no eversion check on read)
 - **Target:** After `ec_conversion_dispatch_loop` flips a sealed extent from 3-replica to EC (e.g. 3+1), `StreamClient.extent_info_cache` (`crates/stream/src/client.rs:619`) still holds the pre-EC `ExtentInfo` (`replicates`, `parity=[]`, old `eversion`). The PS reads against three stale-replica addresses whose `.dat` has been truncated to one shard's worth (`write_shard_local`, `extent_node.rs:2037-2065`), burning up to `3 × 3 s` (`pool.call_timeout`, `client.rs:1568`) on `read_replicated_with_failover` (`client.rs:1497-1518`) before the cache is finally evicted on error. Compounded by two server-side gaps: client passes `eversion: 0` (`client.rs:1562`) which disables the existing eversion guard at `extent_node.rs:2219`, and `write_shard_local` never bumps `entry.eversion` so the local view would still match pre-EC even if the client did pass a real value. User-visible symptom: `curl http://0.0.0.0:5001/get/<KEY>` takes multiple seconds on the first attempt after conversion and `autumn-extent` shows elevated CPU (mostly EC-encode for in-progress extents + read amplification). Make the read path self-heal on stale-cache without manager push.
 - **Evidence:** `crates/manager/src/recovery.rs:531-568` (`apply_ec_conversion_done` writes new layout + `eversion += 1` to the manager's etcd / in-memory store with no client notification). `crates/stream/src/client.rs:1397-1417` (`fetch_extent_info` is cache-only on hit; never proactively refreshed; `invalidate_extent_cache` at `:1421-1423` only called by tests). `crates/stream/src/extent_node.rs:2219-2227` (server eversion guard returns `FailedPrecondition` Err when `req.eversion > 0 && req.eversion < ev` — but client passes 0, so the check is dead code on the read path). `crates/stream/src/extent_node.rs:2037-2065` (`write_shard_local` updates `len`/`sealed_length`/`avali` but not `eversion`). The user observed the slow GET on a live cluster where `autumn-client info` correctly shows EC layout because `info` bypasses the cache and fetches directly from the manager (`autumn_client.rs:2164-2237`).
