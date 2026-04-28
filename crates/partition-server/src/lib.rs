@@ -125,7 +125,7 @@ pub(crate) fn max_imm_depth() -> usize {
 pub(crate) fn max_wal_gap() -> u64 {
     static CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *CELL.get_or_init(|| {
-        const DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
+        const DEFAULT: u64 = 1 * 1024 * 1024 * 1024;
         const MIN: u64 = 128 * 1024 * 1024;
         const MAX: u64 = 64 * 1024 * 1024 * 1024;
         std::env::var("AUTUMN_PS_MAX_WAL_GAP")
