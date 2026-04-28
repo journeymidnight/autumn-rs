@@ -1,71 +1,118 @@
-Date: 2026-04-27
+Date: 2026-04-28
 TaskStatus: completed
-Task scope: gallery /get/{name} Range handler — stream the response in
-4 MiB chunks instead of materialising the entire `bytes=N-` slice as a
-single Vec. Fix `bytes=-N` (suffix range) parsing along the way.
+Task scope: F120 — bound recovery replay window after killed-mid-write
+restarts. Add three independent guard rails inspired by RocksDB:
+F120-A imm depth cap + back-pressure, F120-B WAL-gap forced rotate,
+F120-C graceful shutdown via SIGTERM.
 
-Current summary:
-  Symptom: `ffmpeg -i http://127.0.0.1:5001/get/<file>.mp4 -c copy ... HLS`
-  was very slow, and the bigger the source file the worse it got.
+Symptom (user-reported, 2026-04-27 23:00):
+  After driving the 4-disk EC cluster through wbench + split tests,
+  `cluster.sh stop && start` showed `top -pid <ps>` reporting 16 GB
+  memory footprint (RSS 2 MB, compressor 8.6 GB, 17.6 M swapouts).
+  Investigating /tmp/autumn-rs-logs/ps.log:
+    - part 15: logStream end=2.46 GB, vp_offset=499 MB → 1.96 GB to
+      replay on open
+    - part 36: logStream end=1.09 GB, vp_offset=639 MB → 448 MB
+    - parts 19/28/44: vp_offset == end (already drained)
+  GC for extent 22 (sealed=2.77 GB) ran 4 m 16 s; VP resolves spiked
+  to 4.4 s due to swap pressure. The replay window itself is the root
+  cause — `imm: VecDeque<Arc<Memtable>>` was unbounded.
 
-  Root cause: ffmpeg's HTTP demuxer issues `Range: bytes=N-`. The previous
-  handler computed `length = total - N` and called `get_range(N, length)`
-  in one shot — for a 1 GiB upload that allocated a 1 GiB Vec (and pulled
-  a 1 GiB autumn-rpc payload back to the gallery process) before any HTTP
-  body byte shipped. ffmpeg blocked on the entire buffer materialising.
-  The autumn-rs storage layer's `get_range` is already a true partial
-  read end-to-end; the bottleneck was purely in the gallery response
-  shape.
+Diagnosis:
+  Three independent gaps in the partition server:
+    1. `rotate_active` (lib.rs:2625) does an unconditional
+       `imm.push_back` against an unbounded VecDeque. P-bulk falling
+       behind on `row_stream.append` (especially with EC encoding)
+       lets imm grow without limit. RocksDB caps this at
+       `max_write_buffer_number=2` and stalls writes when full.
+    2. `maybe_rotate` only fires on `active.mem_bytes >=
+       FLUSH_MEM_BYTES = 256 MB`. Workloads of small writes that
+       never fill the memtable can still grow log_stream without
+       bound — VPs cost ~16 B in memtable but the full payload sits
+       in log_stream. RocksDB's `max_total_wal_size` (default
+       `write_buffer_size × max_write_buffer_number × 4 ≈ 2 GB`)
+       handles this exact case.
+    3. `cluster.sh stop` sends SIGTERM, waits 5 s, then SIGKILL.
+       `autumn-ps` had no signal handler. `merged_partition_loop`'s
+       tail-drain only flushed `pending` + `inflight` — it did NOT
+       rotate `active` or drain `imm`, so any data ack'd to the
+       client between the last flush and SIGKILL was left for replay.
 
-  Fix:
-    - New `parse_byte_range(s, total)` helper in
-      examples/gallery/src/main.rs handles `bytes=N-`, `bytes=N-M`, and
-      `bytes=-N` (suffix). The previous code mis-parsed `bytes=-N` as
-      `bytes=0-N`.
-    - New `stream_kv_range(client, metrics, name, start, end_inclusive)`
-      helper builds a `Body::from_stream` driven by an mpsc producer that
-      loops `get_range(off, RANGE_CHUNK_BYTES = 4 MiB)` until done. The
-      producer task is `SendWrapper`'d (Rc/RefCell client) and detached on
-      compio; chunks travel as `Bytes` over the (Send) mpsc into axum.
-      Backpressure cap=2 keeps memory at ~8 MiB regardless of value size.
-    - `get_handler_inner` is rewritten to: head() once → parse Range →
-      build streaming Body → 200 or 206 with the right Content-Length /
-      Content-Range. The non-Range path streams uniformly too.
-    - The same per-chunk loop releases the `Rc<Mutex<ClusterClient>>`
-      between fetches, so other gallery handlers can interleave instead
-      of waiting on one giant get_range.
+Fix (this session):
+  Files changed:
+    - crates/partition-server/src/lib.rs (~250 lines): F120 env knobs
+      (max_imm_depth, max_wal_gap, shutdown_timeout_ms);
+      `imm_drained_tx` field on PartitionData + imm-pop signalling in
+      flush_one_imm + flush_one_imm_local; new `drain_tx`/`drain_rx`
+      channel wired through PartitionHandle / partition_thread_main /
+      merged_partition_loop; merged_partition_loop now gates on
+      imm_full (skips req_rx + batch launch) and on drain_ack
+      (initiates rotate-and-flush-imm shutdown sequence after the
+      existing tail drain); WAL-gap force-rotate hook after each
+      iteration; new PartitionServer::shutdown() + serve_until_shutdown.
+    - crates/server/src/bin/partition_server.rs: install
+      SIGTERM/SIGINT handler that sets an AtomicBool; main awaits
+      serve_until_shutdown with a future polling the flag every 100 ms.
+    - cluster.sh: extend `kill_proc` SIGTERM-to-SIGKILL deadline from
+      5 s to 60 s (with operator-visible logging on timeout).
+    - crates/partition-server/CLAUDE.md: new "F120 — bounded recovery
+      replay" section + Key Constants table additions.
+    - feature_list.md: F120 entry inserted between F119 and F116.
+    - README.md: new "F120 — graceful shutdown + write back-pressure"
+      subsection with tunables and operator manual-verification steps.
+    - crates/manager/tests/f120_graceful_shutdown.rs: end-to-end
+      integration test (write + flag-set → thread-joined < 10 s →
+      second PS opens partition → all 64 keys still readable).
+    - crates/partition-server/src/lib.rs `f120_knob_tests`: 12 unit
+      tests covering env-knob defaults + clamps + live in-range checks.
 
-Files changed:
-  - examples/gallery/src/main.rs            (new helpers + rewritten
-                                             get_handler_inner; new
-                                             RANGE_CHUNK_BYTES const)
-  - examples/gallery/README.md              (new "Range Reads" section)
-  - claude-progress.txt                     (this file)
+Key invariants preserved by the F120 changes:
+  - Phase 1 / Phase 2 / Phase 3 split is unchanged. F120-A only changes
+    when (B) launches and when (D) polls req_rx; the SQ/CQ pattern is
+    intact.
+  - `imm_drained_tx` is a same-thread mpsc::UnboundedSender; never
+    crosses thread boundaries.
+  - `drain_tx`: held by `PartitionServer::shutdown()` on the main
+    compio thread, sender side; receiver side polled by
+    merged_partition_loop on the partition thread. The
+    `oneshot::Sender<()>` payload is Send by construction.
+  - F120-C tail drain re-uses existing `flush_one_imm` (P-bulk hand-off)
+    + its `flush_one_imm_local` fallback, so degraded-mode partitions
+    still drain correctly.
+  - `imm: VecDeque<Arc<Memtable>>` stays Arc — FlushReq sends the
+    Memtable cross-thread to P-bulk; user explicitly considered Rc
+    and confirmed Arc is required.
 
 Verification:
-  - `cargo build -p gallery`: clean.
-  - `cargo clippy -p gallery --no-deps`: 3 pre-existing-style
-    `redundant_async_block` warnings around `compio::runtime::spawn(async
-    move { fut.await }).detach()` (matches the two other call sites that
-    already use this pattern); no new clippy issues introduced by this
-    change.
-  - End-to-end runtime validation (cluster up + actual ffmpeg HLS
-    timing) is left for manual follow-up using the steps in
-    examples/gallery/README.md §Manual Verification with a >=200 MB
-    source. Acceptance: `transcode: ffmpeg hls done hls_ms=...` should
-    drop close to a `ffmpeg`-against-local-file baseline, instead of
-    being dominated by gallery buffering.
+  - cargo build --workspace: clean (only pre-existing dead-code warnings).
+  - cargo test -p autumn-partition-server --lib --test-threads=1:
+      101 passed (88 prior + 13 new F120 env-knob tests).
+  - cargo test -p autumn-stream --tests --test-threads=1: 77 passed.
+  - cargo test -p autumn-manager --test f120_graceful_shutdown:
+      1 pass / 14.36 s wallclock (11 s of which is the deliberate
+      ps_dead_timeout wait for the second-PS rebalance hop).
+  - Pre-existing test failures unchanged:
+      * autumn-partition-server lib --test-threads=8 (parallel):
+        f099i_d1_fast_path_no_fu_allocation +
+        f099i_fast_path_inactive_under_batch — documented as F099-I
+        timing-sensitive flakes in F104/F118.
+      * autumn-manager: register_node_duplicate_addr_rejected —
+        documented in F116.
 
-Out of scope (flagged for follow-up):
-  - `ClusterClient::get_range` still uses `u32` for offset/length, so
-    files >= 4 GiB silently truncate — not relevant to current uploads
-    but worth lifting to u64 in a future pass.
-  - Per-handler ClusterClient / connection pool to enable truly parallel
-    HLS-segment fetches by the browser. Single-connection ffmpeg runs
-    don't benefit, but multi-segment HLS playback would.
-  - Streaming for `/hls/{name}/{file}` segments — segments are small and
-    fully buffered is fine.
+Out of scope (intentionally not in this commit):
+  - Live cluster validation of the imm-cap back-pressure path: the
+    integration test exercises F120-C only; F120-A (back-pressure under
+    slow P-bulk) needs operator load with EC enabled to actually fill
+    imm. Documented as the F120 acceptance "Live verification" item.
+  - Tighter assertion that "graceful shutdown drained imm to row_stream"
+    (vs. logStream replay on restart). The integration test verifies
+    end-to-end data survives, but distinguishing the two paths from
+    outside the PS requires extra RPC plumbing (extent_node-side
+    commit_length query). Defer to live verification.
 
-Next steps:
-  None required to close this task. Optional manual perf check on a
-  large h264+aac MP4 to quantify the speedup, per the README.
+Next steps (none required for this scope):
+  - If operator finds 60 s graceful timeout too tight under heavy EC
+    load, raise via `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS`.
+  - If imm back-pressure regresses write throughput under bursty load,
+    raise `AUTUMN_PS_MAX_IMM_DEPTH` (memory cost: each step adds 256 MB
+    worst-case per partition).

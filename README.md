@@ -103,6 +103,53 @@ failover, etc.
 indices outside the snapshot's `REPLICAS`. To extend the cluster size,
 re-run `cluster.sh start <new-N>`.
 
+### F120 — graceful shutdown + write back-pressure (2026-04-27)
+
+`cluster.sh stop` now sends SIGTERM and waits up to **60 s** for autumn-ps
+to drain its in-memory state to row_stream before falling back to SIGKILL.
+On a clean shutdown the partition server:
+
+1. Stops accepting new client requests on every per-partition listener.
+2. Drains all in-flight Phase-2 batches.
+3. Rotates `active` memtable → imm.
+4. Calls `flush_one_imm` repeatedly until imm is empty (each flush ships
+   an SST to row_stream + writes a `TableLocations` checkpoint to
+   meta_stream).
+5. Replies on the per-partition oneshot, threads exit, process returns 0.
+
+**Result:** on the next `cluster.sh start`, `open_partition` finds an
+up-to-date `vp_offset` checkpoint and the logStream replay window is
+empty (or close to it). Pre-F120, `cluster.sh stop` killed the process
+after 5 s and any imm queued behind a slow P-bulk got replayed —
+witnessed at 1.96 GB on partition 15 of a 4-disk EC cluster.
+
+Tunables:
+
+| env var | default | range | role |
+|---------|---------|-------|------|
+| `AUTUMN_PS_MAX_IMM_DEPTH` | `4` | `[1, 64]` | imm queue cap; merged_partition_loop stalls req intake when reached (RocksDB analogue: `max_write_buffer_number`) |
+| `AUTUMN_PS_MAX_WAL_GAP` | `2 GiB` | `[128 MiB, 64 GiB]` | force-rotate active when `active.bytes + Σ imm.bytes` exceeds this (RocksDB analogue: `max_total_wal_size`) |
+| `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS` | `60_000` | `[1_000, 600_000]` | per-partition drain deadline; SIGKILL fallback after this |
+
+Manual verification (live cluster):
+
+```bash
+# 4-replica EC cluster.
+bash cluster.sh reset 4
+
+# Drive ~30 s of writes (any wbench / app load).
+target/release/autumn-client --manager 127.0.0.1:9001 wbench --threads 8 --duration 30
+
+# Graceful stop. SIGTERM is sent first; cluster.sh waits up to 60 s.
+time bash cluster.sh stop      # should return in well under 60 s
+
+# Restart and inspect /tmp/autumn-rs-logs/ps.log "open_partition: ready"
+# lines: `vp_offset` should be ≈ logStream `commit_length end=` for each
+# partition (no tail to replay).
+bash cluster.sh start 4
+grep -E 'logStream commit_length OK|open_partition: ready' /tmp/autumn-rs-logs/ps.log
+```
+
 After `start`, the script prints ready-to-use CLI examples:
 
 ```

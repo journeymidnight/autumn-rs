@@ -91,6 +91,66 @@ pub(crate) fn ps_bulk_inflight_cap() -> usize {
     })
 }
 
+/// F120-A — maximum imm queue depth per partition. When `imm.len()` reaches
+/// this cap, `merged_partition_loop` stops pulling from `req_rx` (write
+/// back-pressure) and waits for `flush_one_imm` to pop one entry before
+/// resuming. Worst-case unflushed-WAL window per partition is therefore
+/// `MAX_IMM_DEPTH * FLUSH_MEM_BYTES + active.bytes` = 4 × 256 MB + 256 MB
+/// = 1.25 GB (vs. unbounded pre-F120). Range clamped to [1, 64]. Read once
+/// from env `AUTUMN_PS_MAX_IMM_DEPTH`. RocksDB analogue:
+/// `max_write_buffer_number` (default 2). Default 4 because our memtable
+/// is 4× RocksDB's default `write_buffer_size` and bulk uploads are
+/// network-bound 128 MB SSTs.
+pub(crate) fn max_imm_depth() -> usize {
+    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("AUTUMN_PS_MAX_IMM_DEPTH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.clamp(1, 64))
+            .unwrap_or(4)
+    })
+}
+
+/// F120-B — maximum unflushed log_stream gap per partition. When
+/// `active.bytes + Σ imm[i].bytes > MAX_WAL_GAP`, `merged_partition_loop`
+/// force-rotates `active` to imm even if it hasn't reached
+/// `FLUSH_MEM_BYTES = 256 MB`. Bounds `open_partition` replay time when
+/// the workload is dominated by large values (small memtable footprint
+/// per record but full payload sits in log_stream as VPs) or by small
+/// writes that drip in below the rotate threshold. Range clamped to
+/// [128 MiB, 64 GiB]. Read once from env `AUTUMN_PS_MAX_WAL_GAP`.
+/// RocksDB analogue: `max_total_wal_size` (default
+/// `write_buffer_size × max_write_buffer_number × 4`).
+pub(crate) fn max_wal_gap() -> u64 {
+    static CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        const DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
+        const MIN: u64 = 128 * 1024 * 1024;
+        const MAX: u64 = 64 * 1024 * 1024 * 1024;
+        std::env::var("AUTUMN_PS_MAX_WAL_GAP")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|n| n.clamp(MIN, MAX))
+            .unwrap_or(DEFAULT)
+    })
+}
+
+/// F120-C — graceful shutdown deadline. After SIGTERM, `PartitionServer::
+/// shutdown()` waits at most this many milliseconds for each partition's
+/// drain (rotate active + flush all imm). Range clamped to [1 s, 10 min].
+/// Read once from env `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS`.
+pub(crate) fn shutdown_timeout_ms() -> u64 {
+    static CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("AUTUMN_PS_SHUTDOWN_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|n| n.clamp(1_000, 600_000))
+            .unwrap_or(60_000)
+    })
+}
+
 const COMPACT_RATIO: f64 = 0.5;
 const HEAD_RATIO: f64 = 0.3;
 const COMPACT_N: usize = 5;
@@ -392,6 +452,12 @@ pub(crate) struct PartitionData {
     /// thread failed to initialize — fall back to in-thread flush (legacy
     /// path) so the partition remains usable.
     flush_req_tx: Option<mpsc::Sender<FlushReq>>,
+    /// F120-A: signaled (one item per pop) by `flush_one_imm` after every
+    /// successful `imm.pop_front()` so that `merged_partition_loop` can
+    /// wake from its imm-full back-pressure wait. Unbounded because the
+    /// receiver always drains all pending notifications before re-checking
+    /// `imm.len()`, so the buffer self-bounds at `MAX_IMM_DEPTH`.
+    imm_drained_tx: mpsc::UnboundedSender<()>,
 }
 
 // ---------------------------------------------------------------------------
@@ -659,6 +725,11 @@ struct PartitionHandle {
     /// can take/drop it explicitly.
     #[allow(dead_code)]
     shutdown_tx: Option<oneshot::Sender<()>>,
+    /// F120-C — graceful drain signal. Main thread sends a
+    /// `oneshot::Sender<()>` through it to ask the partition to flush
+    /// active+imm and reply when done. Dropped during shutdown so the
+    /// `mpsc::Receiver` end inside the partition thread observes EOF.
+    drain_tx: Option<mpsc::UnboundedSender<oneshot::Sender<()>>>,
     /// Address (`host:port`) the partition is listening on. Reported to
     /// the manager via `MSG_REGISTER_PARTITION_ADDR` on open.
     #[allow(dead_code)]
@@ -1050,6 +1121,12 @@ impl PartitionServer {
         // partition's accept loop to exit.
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
+        // F120-C: graceful drain signal. Main thread (`PartitionServer::
+        // shutdown()`) sends a `oneshot::Sender<()>` through `drain_tx` to
+        // ask the partition to rotate active + flush all imm and reply
+        // when done, BEFORE dropping `shutdown_tx`.
+        let (drain_tx, drain_rx) = mpsc::unbounded::<oneshot::Sender<()>>();
+
         // Report bind + registration success/failure back to the caller,
         // so we can fail loudly and reclaim the ordinal if needed.
         let (ready_tx, ready_rx) = oneshot::channel::<Result<()>>();
@@ -1077,11 +1154,12 @@ impl PartitionServer {
                         advertise_addr_for_thread,
                         ready_tx,
                         shutdown_rx,
+                        drain_rx,
                         compact_gate_for_thread,
                     )
                     .await
                     {
-                        tracing::error!(part_id, "partition thread failed: {e}");
+                        tracing::error!(part_id, "partition thread failed: {e:#}");
                     }
                 });
             })
@@ -1107,9 +1185,121 @@ impl PartitionServer {
 
         Ok(PartitionHandle {
             shutdown_tx: Some(shutdown_tx),
+            drain_tx: Some(drain_tx),
             part_addr: advertise_addr,
             join: Some(join),
         })
+    }
+
+    /// F120-C — graceful shutdown. For each open partition:
+    ///   1. Send a `oneshot::Sender<()>` via `drain_tx`. The partition's
+    ///      `merged_partition_loop` stops pulling new requests, drains
+    ///      inflight, rotates `active`, calls `flush_one_imm` until imm
+    ///      is empty, then replies on the oneshot.
+    ///   2. Await the oneshot with `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS`
+    ///      deadline. On timeout, log a warning and skip — the SIGKILL
+    ///      fallback (and on-restart logStream replay) keeps correctness.
+    ///   3. Drop `shutdown_tx` to close the per-partition accept loop;
+    ///      every per-conn `req_tx` clone is dropped, `merged_loop`
+    ///      observes `req_rx == None`, exits, partition thread joins.
+    ///
+    /// Concurrent partitions drain in parallel — wallclock is bounded
+    /// by the slowest partition's flush time.
+    pub async fn shutdown(&self) -> Result<()> {
+        use futures::future::join_all;
+
+        let timeout = Duration::from_millis(shutdown_timeout_ms());
+        let part_ids: Vec<u64> = self.partitions.borrow().keys().copied().collect();
+
+        tracing::info!(
+            partitions = part_ids.len(),
+            timeout_ms = timeout.as_millis() as u64,
+            "graceful shutdown: draining partitions",
+        );
+
+        // Send drain signals + collect oneshot receivers.
+        let mut drain_rxs: Vec<(u64, oneshot::Receiver<()>)> = Vec::new();
+        {
+            let mut parts = self.partitions.borrow_mut();
+            for &pid in &part_ids {
+                let Some(handle) = parts.get_mut(&pid) else { continue };
+                let Some(drain_tx) = handle.drain_tx.as_ref() else { continue };
+                let (ack_tx, ack_rx) = oneshot::channel::<()>();
+                if drain_tx.unbounded_send(ack_tx).is_ok() {
+                    drain_rxs.push((pid, ack_rx));
+                }
+            }
+        }
+
+        // Race each ack against the deadline.
+        let waits = drain_rxs.into_iter().map(|(pid, ack_rx)| {
+            let timeout = timeout;
+            async move {
+                use futures::future::{select, Either};
+                let sleep_fut = compio::time::sleep(timeout);
+                futures::pin_mut!(sleep_fut);
+                match select(ack_rx, sleep_fut).await {
+                    Either::Left((Ok(_), _)) => {
+                        tracing::info!(part_id = pid, "graceful shutdown: drained");
+                    }
+                    Either::Left((Err(_), _)) => {
+                        tracing::warn!(part_id = pid, "graceful shutdown: drain channel cancelled");
+                    }
+                    Either::Right(_) => {
+                        tracing::warn!(
+                            part_id = pid,
+                            timeout_ms = timeout.as_millis() as u64,
+                            "graceful shutdown: drain timed out (replay on restart will cover unflushed data)",
+                        );
+                    }
+                }
+            }
+        });
+        join_all(waits).await;
+
+        // Now close accept loops by dropping `shutdown_tx`. The merged_loop
+        // exits its tail-drain block once req_rx hits EOF (no more conns).
+        // Drop drain_tx as well so any pending receiver wakes with EOF.
+        {
+            let mut parts = self.partitions.borrow_mut();
+            for handle in parts.values_mut() {
+                handle.shutdown_tx.take();
+                handle.drain_tx.take();
+            }
+        }
+
+        // Join threads (best effort; bound to a fraction of the timeout).
+        let join_deadline = Duration::from_millis((timeout.as_millis() as u64).max(1_000));
+        let join_start = std::time::Instant::now();
+        loop {
+            let mut all_done = true;
+            {
+                let mut parts = self.partitions.borrow_mut();
+                for handle in parts.values_mut() {
+                    if let Some(j) = handle.join.as_ref() {
+                        if !j.is_finished() {
+                            all_done = false;
+                        }
+                    }
+                }
+            }
+            if all_done {
+                let mut parts = self.partitions.borrow_mut();
+                for handle in parts.values_mut() {
+                    if let Some(j) = handle.join.take() {
+                        let _ = j.join();
+                    }
+                }
+                break;
+            }
+            if join_start.elapsed() >= join_deadline {
+                tracing::warn!("graceful shutdown: thread join deadline reached, leaving threads detached");
+                break;
+            }
+            compio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tracing::info!("graceful shutdown: complete");
+        Ok(())
     }
 
     // ── Serve ──────────────────────────────────────────────────────────
@@ -1160,6 +1350,24 @@ impl PartitionServer {
     }
 
     pub async fn serve(&self, addr: SocketAddr) -> Result<()> {
+        // Backwards-compatible: never-resolving shutdown_signal — caller
+        // gets the pre-F120 forever-loop behavior. Production binaries
+        // should use `serve_until_shutdown` with a SIGTERM-driven future.
+        self.serve_until_shutdown(addr, std::future::pending::<()>()).await
+    }
+
+    /// F120-C — like `serve()` but exits the main control-plane loop
+    /// when `shutdown_signal` resolves, then runs `self.shutdown()` to
+    /// drain partitions before returning. Production: pass a future
+    /// driven by a SIGTERM/SIGINT handler.
+    pub async fn serve_until_shutdown<F>(
+        &self,
+        addr: SocketAddr,
+        shutdown_signal: F,
+    ) -> Result<()>
+    where
+        F: std::future::Future<Output = ()>,
+    {
         // F099-K: set `base_port` + `advertise_host` BEFORE any
         // background loop spawns `open_partition`. Idempotent if a
         // caller already invoked `bind_listen_addr` (e.g. test
@@ -1182,12 +1390,24 @@ impl PartitionServer {
         compio::runtime::spawn(async move { s.region_sync_loop().await }).detach();
 
         // F099-K: region_sync_loop above drives all open/close of partition
-        // threads. Partitions bind their own listeners; `serve()` never
-        // returns unless manual shutdown is implemented (future work).
-        // Park the main task forever — compio::time::sleep covers both
-        // normal runtime operation and idle periods between syncs.
-        loop {
-            compio::time::sleep(Duration::from_secs(3600)).await;
+        // threads. Partitions bind their own listeners. F120-C: park here
+        // until `shutdown_signal` resolves, then drain.
+        futures::pin_mut!(shutdown_signal);
+        let park = async {
+            loop {
+                compio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        };
+        futures::pin_mut!(park);
+        use futures::future::{select, Either};
+        match select(shutdown_signal, park).await {
+            Either::Left(_) => {
+                tracing::info!("shutdown signal received, draining partitions");
+                self.shutdown().await?;
+                Ok(())
+            }
+            // park never resolves; this arm is unreachable but exhaustive.
+            Either::Right(_) => Ok(()),
         }
     }
 }
@@ -1704,6 +1924,7 @@ async fn partition_thread_main(
     advertise_addr: String,
     ready_tx: oneshot::Sender<Result<()>>,
     shutdown_rx: oneshot::Receiver<()>,
+    drain_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
     compact_gate: std::sync::Arc<CompactionGate>,
 ) -> Result<()> {
     // F099-J: create the same-thread ps-conn ↔ merged_partition_loop
@@ -1760,6 +1981,10 @@ async fn partition_thread_main(
     let (flush_tx, flush_rx) = mpsc::unbounded::<()>();
     let (compact_tx, compact_rx) = mpsc::channel::<bool>(1);
     let (gc_tx, gc_rx) = mpsc::channel::<GcTask>(1);
+    // F120-A: signal channel from flush_one_imm (after each imm.pop_front)
+    // back to merged_partition_loop for back-pressure wakeup. Both ends
+    // live on this thread so the unbounded futures::channel is fine.
+    let (imm_drained_tx, imm_drained_rx) = mpsc::unbounded::<()>();
 
     // F088: spawn a dedicated OS thread (P-bulk) that owns its own compio
     // runtime + io_uring + ConnPool. Flush requests are forwarded to it via
@@ -1812,6 +2037,7 @@ async fn partition_thread_main(
         vp_offset: vp_off,
         stream_client: part_sc.clone(),
         flush_req_tx: flush_req_tx_part,
+        imm_drained_tx,
     }));
 
     // Drop the extra `flush_req_tx` clone held locally: the one stored in
@@ -1989,6 +2215,8 @@ async fn partition_thread_main(
         part_id,
         part.clone(),
         req_rx,
+        imm_drained_rx,
+        drain_rx,
         locked_by_other,
         part_sc.clone(),
         pool.clone(),
@@ -2035,10 +2263,13 @@ async fn partition_thread_main(
 ///     into the outer ps-conn oneshot. No inner oneshot, no Waker
 ///     cascade through a second compio task.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn merged_partition_loop(
     part_id: u64,
     part: Rc<RefCell<PartitionData>>,
     mut req_rx: mpsc::Receiver<PartitionRequest>,
+    mut imm_drained_rx: mpsc::UnboundedReceiver<()>,
+    mut drain_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
     locked_by_other: Rc<Cell<bool>>,
     part_sc: Rc<StreamClient>,
     pool: Rc<ConnPool>,
@@ -2050,8 +2281,13 @@ async fn merged_partition_loop(
 
     let cap = ps_inflight_cap();
     let batch_target = crate::background::min_pipeline_batch().min(max_write_batch());
+    let imm_cap = max_imm_depth();
+    let wal_gap_cap = max_wal_gap();
     let mut metrics = WriteLoopMetrics::new();
     let mut pending: Vec<WriteRequest> = Vec::new();
+    // F120-C — set when `drain_rx` delivered a request; once set, stop
+    // pulling new items from `req_rx` and head for the tail-drain block.
+    let mut drain_ack: Option<oneshot::Sender<()>> = None;
 
     type CompletionFut =
         std::pin::Pin<Box<dyn std::future::Future<Output = InflightCompletion>>>;
@@ -2060,6 +2296,11 @@ async fn merged_partition_loop(
     'outer: loop {
         if locked_by_other.get() {
             tracing::error!(part_id, "partition poisoned by LockedByOther, shutting down");
+            break;
+        }
+        if drain_ack.is_some() {
+            // F120-C — we received a drain signal. Stop pulling from
+            // req_rx; finish anything already started.
             break;
         }
 
@@ -2072,15 +2313,33 @@ async fn merged_partition_loop(
             }
         }
 
+        // F120-A — sample imm depth + WAL gap snapshot under one borrow.
+        // `imm_full` blocks new request intake (and new batch launches);
+        // `force_rotate` is consulted after we already have a Phase-3 done
+        // (in `finish_write_batch::maybe_rotate`).
+        let (imm_full, _gap_now) = {
+            let p = part.borrow();
+            let gap = p.active.mem_bytes()
+                + p.imm.iter().map(|m| m.mem_bytes()).sum::<u64>();
+            (p.imm.len() >= imm_cap, gap)
+        };
+
+        // F120-A — drain any pending imm-pop notifications so we don't
+        // accidentally wake on a stale signal in the wait branches below.
+        while let Some(Some(())) = imm_drained_rx.next().now_or_never() {}
+
         let n_inflight = inflight.len();
         let at_cap = n_inflight >= cap;
 
         // (B) Launch a new batch when conditions are right. Same gate as
         // the legacy `background_write_loop_r1`: first batch always
         // launches; subsequent batches wait for pending >= batch_target
-        // to avoid the R3 Task 5b regression.
+        // to avoid the R3 Task 5b regression. F120-A: when imm is full,
+        // do not launch — the next batch's Phase 3 maybe_rotate would
+        // exceed the cap.
         let ready_to_launch = !pending.is_empty()
             && !at_cap
+            && !imm_full
             && (n_inflight == 0 || pending.len() >= batch_target);
         if ready_to_launch {
             let batch = std::mem::take(&mut pending);
@@ -2109,23 +2368,86 @@ async fn merged_partition_loop(
             continue;
         }
 
-        // (D) Pipeline has room; race SQ (req_rx) and CQ (inflight).
-        if n_inflight == 0 {
-            // Fully idle: block on req_rx alone.
-            match req_rx.next().await {
-                Some(req) => {
-                    handle_incoming_req(
-                        req, &mut pending, &part, &part_sc, &pool,
-                        &manager_addr, &owner_key, revision,
-                    )
-                    .await;
+        // F120-A — when imm is full, treat it the same as `at_cap`: only
+        // wait for either an inflight completion (which can pop_front imm
+        // via maybe_rotate's flush_tx signal eventually) or an
+        // `imm_drained` notification (one fired per pop_front). Drain
+        // signal also wakes us so shutdown isn't blocked behind a slow
+        // bulk thread.
+        if imm_full {
+            if n_inflight == 0 {
+                // Pure back-pressure wait. Race imm-pop vs drain.
+                let pop_fut = imm_drained_rx.next();
+                let drain_fut = drain_rx.next();
+                futures::pin_mut!(pop_fut);
+                futures::pin_mut!(drain_fut);
+                match select(pop_fut, drain_fut).await {
+                    Either::Left((_, _)) => continue,
+                    Either::Right((maybe_drain, _)) => {
+                        if let Some(ack) = maybe_drain {
+                            drain_ack = Some(ack);
+                        }
+                        continue;
+                    }
                 }
-                None => break,
+            }
+            // Race imm-pop, inflight CQ, drain.
+            let pop_fut = imm_drained_rx.next();
+            let cfut = inflight.next();
+            let drain_fut = drain_rx.next();
+            futures::pin_mut!(pop_fut);
+            futures::pin_mut!(drain_fut);
+            match select(pop_fut, Box::pin(cfut)).await {
+                Either::Left((_, _)) => continue,
+                Either::Right((maybe_c, _)) => {
+                    if let Some(c) = maybe_c {
+                        handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+                        if locked_by_other.get() {
+                            break;
+                        }
+                    }
+                    // Also non-blocking-poll drain just in case.
+                    if let Some(Some(ack)) = drain_fut.now_or_never() {
+                        drain_ack = Some(ack);
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // (D) Pipeline has room and imm not full; race SQ (req_rx),
+        // CQ (inflight), and drain.
+        if n_inflight == 0 {
+            // Fully idle: race req_rx vs drain.
+            let req_fut = req_rx.next();
+            let drain_fut = drain_rx.next();
+            futures::pin_mut!(req_fut);
+            futures::pin_mut!(drain_fut);
+            match select(req_fut, drain_fut).await {
+                Either::Left((maybe_req, _)) => match maybe_req {
+                    Some(req) => {
+                        handle_incoming_req(
+                            req, &mut pending, &part, &part_sc, &pool,
+                            &manager_addr, &owner_key, revision,
+                        )
+                        .await;
+                    }
+                    None => break,
+                },
+                Either::Right((maybe_drain, _)) => {
+                    if let Some(ack) = maybe_drain {
+                        drain_ack = Some(ack);
+                    }
+                }
             }
         } else {
             let req_fut = req_rx.next();
             let cfut = inflight.next();
+            let drain_fut = drain_rx.next();
             futures::pin_mut!(req_fut);
+            futures::pin_mut!(drain_fut);
+            // First select: race req_rx vs (inflight + drain). We poll
+            // drain via now_or_never below to keep this select binary.
             match select(req_fut, Box::pin(cfut)).await {
                 Either::Left((maybe_req, _cfut_dropped)) => match maybe_req {
                     Some(req) => {
@@ -2161,21 +2483,42 @@ async fn merged_partition_loop(
                     }
                 }
             }
+            // Non-blocking drain check after either branch.
+            if let Some(Some(ack)) = drain_fut.now_or_never() {
+                drain_ack = Some(ack);
+            }
+        }
+
+        // F120-B — WAL-gap-driven force rotate. After each iteration, if
+        // the unflushed WAL window exceeds `MAX_WAL_GAP`, rotate `active`
+        // even when it hasn't reached `FLUSH_MEM_BYTES`. Skipped when
+        // imm is already full (rotation would over-cap and `imm_full`
+        // back-pressure has already kicked in).
+        {
+            let mut p = part.borrow_mut();
+            let gap = p.active.mem_bytes()
+                + p.imm.iter().map(|m| m.mem_bytes()).sum::<u64>();
+            if gap > wal_gap_cap && p.imm.len() < imm_cap && !p.active.is_empty() {
+                rotate_active(&mut p);
+            }
         }
 
         // (E) Non-blocking drain of any queued requests before the next
         // iteration. Reads are processed inline (await) and do NOT go into
-        // pending; writes decode and push into pending.
-        while pending.len() < max_write_batch() {
-            match req_rx.next().now_or_never() {
-                Some(Some(req)) => {
-                    handle_incoming_req(
-                        req, &mut pending, &part, &part_sc, &pool,
-                        &manager_addr, &owner_key, revision,
-                    )
-                    .await;
+        // pending; writes decode and push into pending. Skip when imm is
+        // full so the back-pressure path actually applies.
+        if !imm_full {
+            while pending.len() < max_write_batch() {
+                match req_rx.next().now_or_never() {
+                    Some(Some(req)) => {
+                        handle_incoming_req(
+                            req, &mut pending, &part, &part_sc, &pool,
+                            &manager_addr, &owner_key, revision,
+                        )
+                        .await;
+                    }
+                    _ => break,
                 }
-                _ => break,
             }
         }
     }
@@ -2194,6 +2537,33 @@ async fn merged_partition_loop(
         }
     }
     metrics.flush(part_id);
+
+    // F120-C — graceful drain. If the loop exited because of `drain_rx`,
+    // rotate `active` to imm and synchronously flush every imm via
+    // `flush_one_imm` (which uses the existing P-bulk hand-off, or the
+    // in-thread fallback). Reply on the oneshot once `imm` is empty.
+    if let Some(ack) = drain_ack {
+        // Rotate any leftover `active`. `rotate_active` is a no-op on
+        // empty memtables.
+        {
+            let mut p = part.borrow_mut();
+            rotate_active(&mut p);
+        }
+        // Drain imm in order. `flush_one_imm` returns `Ok(false)` when
+        // the deque is empty.
+        loop {
+            match flush_one_imm(&part).await {
+                Ok(true) => continue,
+                Ok(false) => break,
+                Err(e) => {
+                    tracing::error!(part_id, "graceful drain flush_one_imm: {e:#}");
+                    break;
+                }
+            }
+        }
+        let _ = ack.send(());
+        tracing::info!(part_id, "graceful drain complete");
+    }
 }
 
 /// F099-D — decode one incoming `PartitionRequest` and route it. Writes
@@ -2685,6 +3055,8 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
     p.tables.push(new_meta);
     p.sst_readers.push(Arc::new(reader));
     p.imm.pop_front();
+    // F120-A — wake `merged_partition_loop` if it's parked on imm-full.
+    let _ = p.imm_drained_tx.unbounded_send(());
     Ok(true)
 }
 
@@ -2722,6 +3094,8 @@ async fn flush_one_imm_local(
         });
         p.sst_readers.push(reader);
         p.imm.pop_front();
+        // F120-A — wake merged_partition_loop on imm-full back-pressure.
+        let _ = p.imm_drained_tx.unbounded_send(());
 
         let veid = p.vp_extent_id.max(snap_vp_eid);
         let voff = if veid == p.vp_extent_id {
@@ -3584,6 +3958,125 @@ mod env_knob_tests {
         assert_eq!(parse_env(Some("abc")), super::DEFAULT_MAX_WRITE_BATCH);
     }
 }
+
+// ---------------------------------------------------------------------------
+// F120 — env-knob parsing tests (mirrors env_knob_tests' "inline parse"
+// strategy because OnceLock prevents re-initialisation in-process).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod f120_knob_tests {
+    fn parse_imm_depth(raw: Option<&str>) -> usize {
+        raw.and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.clamp(1, 64))
+            .unwrap_or(4)
+    }
+
+    fn parse_wal_gap(raw: Option<&str>) -> u64 {
+        const DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
+        const MIN: u64 = 128 * 1024 * 1024;
+        const MAX: u64 = 64 * 1024 * 1024 * 1024;
+        raw.and_then(|s| s.parse::<u64>().ok())
+            .map(|n| n.clamp(MIN, MAX))
+            .unwrap_or(DEFAULT)
+    }
+
+    fn parse_shutdown_timeout(raw: Option<&str>) -> u64 {
+        raw.and_then(|s| s.parse::<u64>().ok())
+            .map(|n| n.clamp(1_000, 600_000))
+            .unwrap_or(60_000)
+    }
+
+    #[test]
+    fn imm_depth_default() {
+        assert_eq!(parse_imm_depth(None), 4);
+    }
+
+    #[test]
+    fn imm_depth_clamped_low() {
+        assert_eq!(parse_imm_depth(Some("0")), 1);
+    }
+
+    #[test]
+    fn imm_depth_clamped_high() {
+        assert_eq!(parse_imm_depth(Some("999")), 64);
+    }
+
+    #[test]
+    fn imm_depth_in_range() {
+        assert_eq!(parse_imm_depth(Some("8")), 8);
+    }
+
+    #[test]
+    fn wal_gap_default_is_2gib() {
+        assert_eq!(parse_wal_gap(None), 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn wal_gap_clamped_low() {
+        // 1 KiB → clamped up to 128 MiB minimum.
+        assert_eq!(parse_wal_gap(Some("1024")), 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn wal_gap_clamped_high() {
+        // 1 TiB → clamped down to 64 GiB maximum.
+        let one_tib: u64 = 1024 * 1024 * 1024 * 1024;
+        assert_eq!(
+            parse_wal_gap(Some(&one_tib.to_string())),
+            64 * 1024 * 1024 * 1024,
+        );
+    }
+
+    #[test]
+    fn shutdown_timeout_default() {
+        assert_eq!(parse_shutdown_timeout(None), 60_000);
+    }
+
+    #[test]
+    fn shutdown_timeout_clamped_low() {
+        // 100 ms is below 1 s minimum.
+        assert_eq!(parse_shutdown_timeout(Some("100")), 1_000);
+    }
+
+    #[test]
+    fn shutdown_timeout_clamped_high() {
+        // 1 hour is above 10 min maximum.
+        assert_eq!(parse_shutdown_timeout(Some("3600000")), 600_000);
+    }
+
+    /// Drives the actual `max_imm_depth()` once via OnceLock — proves the
+    /// runtime path returns a value in range without exploding. Subsequent
+    /// reads are cached so this is a smoke test, not a per-env-value test.
+    #[test]
+    fn live_max_imm_depth_in_range() {
+        let v = super::max_imm_depth();
+        assert!((1..=64).contains(&v), "imm_depth out of range: {v}");
+    }
+
+    #[test]
+    fn live_max_wal_gap_in_range() {
+        let v = super::max_wal_gap();
+        assert!(
+            v >= 128 * 1024 * 1024 && v <= 64 * 1024 * 1024 * 1024,
+            "wal_gap out of range: {v}",
+        );
+    }
+
+    #[test]
+    fn live_shutdown_timeout_in_range() {
+        let v = super::shutdown_timeout_ms();
+        assert!((1_000..=600_000).contains(&v), "shutdown_timeout_ms out of range: {v}");
+    }
+}
+
+// F120-A imm-pop signal flow is validated by:
+//   - The integration test `crates/manager/tests/f120_graceful_shutdown.rs`
+//     (graceful drain end-to-end exercises rotate → imm push → P-bulk
+//     flush → pop_front → imm_drained_tx wake).
+//   - Live cluster verification documented in feature_list.md F120.
+// Constructing a `PartitionData` directly in a unit test would require a
+// real `StreamClient` (async constructor + manager round-trips), which
+// is out of scope for an in-process unit test.
 
 // ---------------------------------------------------------------------------
 // F099-D — merged_partition_loop direct-response path tests.

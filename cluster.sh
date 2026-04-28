@@ -64,15 +64,20 @@ kill_proc() {
         local pid; pid="$(cat "$pf")"
         if kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
-            # Wait up to 5s for process to exit; SIGKILL if stuck.
+            # F120-C: wait up to 60s for process to exit gracefully — autumn-ps
+            # now drains active+imm to row_stream on SIGTERM (PartitionServer::
+            # shutdown), which can take seconds per partition with EC bulk
+            # uploads. SIGKILL if still stuck after the deadline (replay on
+            # restart covers any unflushed data).
             # NOTE: use pre-increment `((++i))` — `((i++))` returns the OLD value,
             # which is 0 on the first iteration and trips `set -e`.
             local i=0
-            while kill -0 "$pid" 2>/dev/null && (( i < 50 )); do
+            while kill -0 "$pid" 2>/dev/null && (( i < 600 )); do
                 sleep 0.1
                 (( ++i ))
             done
             if kill -0 "$pid" 2>/dev/null; then
+                echo "[cluster] $name (pid $pid) did not exit within 60s; SIGKILL"
                 kill -9 "$pid" 2>/dev/null || true
                 sleep 0.2
             fi

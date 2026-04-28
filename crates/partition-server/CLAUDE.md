@@ -646,6 +646,45 @@ Operates on **user keys only** (8-byte MVCC suffix stripped before hashing). 1% 
 | `BLOCK_SIZE_TARGET` | 64 KB | Target SSTable block size |
 | `GC_DISCARD_RATIO` | 0.4 (40%) | Min discard ratio to trigger GC |
 | `OP_VALUE_POINTER` | 0x80 | Op flag bit for ValuePointer entries |
+| `MAX_IMM_DEPTH` (F120-A) | 4 | imm queue cap; merged_loop stalls req intake when reached. RocksDB's `max_write_buffer_number`. Env: `AUTUMN_PS_MAX_IMM_DEPTH` ([1, 64]). |
+| `MAX_WAL_GAP` (F120-B) | 2 GiB | force-rotate active when `active.bytes + Σ imm.bytes` exceeds this. RocksDB's `max_total_wal_size`. Env: `AUTUMN_PS_MAX_WAL_GAP` ([128 MiB, 64 GiB]). |
+| `SHUTDOWN_TIMEOUT_MS` (F120-C) | 60_000 | per-partition graceful drain deadline before SIGKILL fallback. Env: `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS` ([1_000, 600_000]). |
+
+## F120 — bounded recovery replay
+
+**The problem (2026-04-27):** A killed-mid-write PS that had pushed many imm
+tables behind a slow P-bulk left the entire `(vp_offset, log_stream commit)`
+window for restart-time replay. Witnessed at **1.96 GB on partition 15** with
+several hundred MiB across siblings, surfacing as a 16 GB process footprint
+post-restart.
+
+**The three fixes:**
+
+1. **F120-A — imm depth cap + back-pressure.** `merged_partition_loop` reads
+   `imm_full = part.imm.len() >= MAX_IMM_DEPTH` at top of loop. When full it
+   skips both batch launches (B) and `req_rx.next()` (D), only polling
+   `inflight.next()` and a new `imm_drained_rx` channel. `flush_one_imm`
+   (and the legacy `flush_one_imm_local` fallback) signal `imm_drained_tx`
+   after each successful `imm.pop_front()` so the loop wakes and resumes
+   request intake. Worst-case unflushed-WAL window per partition is now
+   `MAX_IMM_DEPTH * FLUSH_MEM_BYTES + active.bytes` = 1.25 GB.
+
+2. **F120-B — WAL-gap forced rotate.** After each iteration of
+   `merged_partition_loop`, compute `gap = active.bytes + Σ imm[i].bytes`.
+   If `gap > MAX_WAL_GAP` AND `imm.len() < MAX_IMM_DEPTH`, call
+   `rotate_active`. Bounds replay window for workloads that don't fill
+   `FLUSH_MEM_BYTES` before triggering rotate (e.g. mostly-large-value
+   writes where memtable is light but log_stream grows fast via VPs).
+
+3. **F120-C — graceful shutdown.** New `PartitionServer::shutdown()` sends
+   a `oneshot::Sender<()>` per partition through `drain_tx`. The
+   `merged_partition_loop` picks it up via select, sets `drain_ack`, exits
+   the main loop, runs the existing tail-drain block (in-flight + pending),
+   THEN rotates `active` and loops `flush_one_imm` until imm empties,
+   replies on the oneshot, exits. `serve_until_shutdown(addr,
+   shutdown_signal)` wraps `serve()` with a future the binary drives from a
+   SIGTERM/SIGINT handler. `cluster.sh stop` waits up to 60 s instead of
+   the previous 5 s before SIGKILL fallback.
 
 ## Programming Notes
 

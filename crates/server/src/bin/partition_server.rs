@@ -181,6 +181,49 @@ async fn main() -> Result<()> {
 
     tracing::info!("autumn-ps ready (F099-K: per-partition listeners; first partition on {addr})");
 
-    ps.serve(addr).await?;
+    // F120-C — install a SIGTERM/SIGINT handler. The handler sets an
+    // atomic flag (only async-signal-safe ops allowed); a sidecar future
+    // polls the flag every 100 ms and resolves once tripped, asking
+    // `serve_until_shutdown` to drain partitions and exit gracefully.
+    #[cfg(unix)]
+    install_term_handler();
+
+    let shutdown_fut = async {
+        #[cfg(unix)]
+        {
+            use std::sync::atomic::Ordering;
+            use std::time::Duration;
+            loop {
+                if SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+                    return;
+                }
+                compio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            std::future::pending::<()>().await
+        }
+    };
+
+    ps.serve_until_shutdown(addr, shutdown_fut).await?;
+    tracing::info!("autumn-ps exited cleanly");
     Ok(())
+}
+
+#[cfg(unix)]
+static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn handle_term_signal(_sig: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(unix)]
+fn install_term_handler() {
+    unsafe {
+        libc::signal(libc::SIGTERM, handle_term_signal as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handle_term_signal as libc::sighandler_t);
+    }
 }
