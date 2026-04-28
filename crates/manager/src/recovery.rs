@@ -296,21 +296,23 @@ impl AutumnManager {
                 });
                 let resp = match self.conn_pool.call(&addr, EXT_MSG_DF, payload).await {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(_) => {
+                        // F121: peer is unreachable — mark all of its
+                        // disks offline so allocation/recovery skip it.
+                        // `ConnPool::call` already evicts the broken
+                        // conn so the next poll reconnects.
+                        Self::mark_node_disks_offline(&self.store, node);
+                        continue;
+                    }
                 };
                 let df: ExtDfResp = match rkyv_decode(&resp) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                // Update disk online status from df response
-                if !df.disk_status.is_empty() {
-                    let mut s = self.store.inner.borrow_mut();
-                    for (disk_id, status) in &df.disk_status {
-                        if let Some(disk) = s.disks.get_mut(disk_id) {
-                            disk.online = status.online;
-                        }
-                    }
-                }
+                // F121: see disk_status_update_loop — promote on the
+                // call-level signal, not per-payload disk_id, because
+                // the wire status uses the extent-node's local disk_id.
+                Self::mark_node_disks_online(&self.store, node);
                 for done in df.done_tasks {
                     let _ = self.apply_recovery_done(done).await;
                 }
@@ -338,21 +340,89 @@ impl AutumnManager {
                     tasks: Vec::new(),
                     disk_ids: Vec::new(),
                 });
+                // F121: bound df at 5 s; on failure mark this node's
+                // disks offline (the pre-F121 `Err(_) => continue` left
+                // a stale `online=true` and `info` would lie about a
+                // dead node indefinitely).
                 let resp = match self.conn_pool.call(&addr, EXT_MSG_DF, payload).await {
                     Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let df: ExtDfResp = match rkyv_decode(&resp) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                if !df.disk_status.is_empty() {
-                    let mut s = self.store.inner.borrow_mut();
-                    for (disk_id, status) in &df.disk_status {
-                        if let Some(disk) = s.disks.get_mut(disk_id) {
-                            disk.online = status.online;
-                        }
+                    Err(_) => {
+                        // F121: see recovery_collect_loop comment.
+                        Self::mark_node_disks_offline(&self.store, node);
+                        continue;
                     }
+                };
+                if rkyv_decode::<ExtDfResp>(&resp).is_err() {
+                    continue;
+                }
+                // F121: a successful df proves the node is reachable, so
+                // promote each of its `MgrNodeInfo.disks` back to
+                // `online=true`. The per-disk-id status carried in the
+                // response keys on the *extent-node's* local disk_id
+                // (e.g. `--disk-id 4`), which is unrelated to the
+                // manager's allocated disk_id (e.g. 8). Treating the
+                // call result as the liveness signal sidesteps that
+                // mismatch entirely; recovery-side per-disk failure is
+                // still surfaced via `mark_disk_offline_for_extent` on
+                // the extent-node and propagated through dedicated
+                // recovery RPCs.
+                Self::mark_node_disks_online(&self.store, node);
+            }
+        }
+    }
+
+    /// F121 helper: flip `online=false` for every disk owned by `node`
+    /// when its `df` RPC fails. In-memory only — the manager reseeds
+    /// disk state from etcd on leader promotion via `replay_from_etcd`,
+    /// and a recovered node will overwrite `online=true` on the next
+    /// successful `df` poll.
+    fn mark_node_disks_offline(
+        store: &autumn_common::MetadataStore,
+        node: &autumn_rpc::manager_rpc::MgrNodeInfo,
+    ) {
+        if node.disks.is_empty() {
+            return;
+        }
+        let mut s = store.inner.borrow_mut();
+        let mut changed = false;
+        for disk_id in &node.disks {
+            if let Some(disk) = s.disks.get_mut(disk_id) {
+                if disk.online {
+                    disk.online = false;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            tracing::warn!(
+                node_id = node.node_id,
+                addr = %node.address,
+                "df RPC failed; marked node disks offline"
+            );
+        }
+    }
+
+    /// F121 helper: counterpart to `mark_node_disks_offline`. Flip
+    /// `online=true` on a successful df. Keys on `MgrNodeInfo.disks`
+    /// (manager-allocated disk_ids) instead of the response payload's
+    /// extent-node-local disk_ids, which historically failed to map.
+    fn mark_node_disks_online(
+        store: &autumn_common::MetadataStore,
+        node: &autumn_rpc::manager_rpc::MgrNodeInfo,
+    ) {
+        if node.disks.is_empty() {
+            return;
+        }
+        let mut s = store.inner.borrow_mut();
+        for disk_id in &node.disks {
+            if let Some(disk) = s.disks.get_mut(disk_id) {
+                if !disk.online {
+                    disk.online = true;
+                    tracing::info!(
+                        node_id = node.node_id,
+                        disk_id,
+                        "df RPC succeeded; disk back online"
+                    );
                 }
             }
         }

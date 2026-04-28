@@ -34,12 +34,24 @@ impl ConnPool {
     }
 
     /// Get or open an RpcClient for `addr`. Uses the existing pool entry
-    /// if present; otherwise connects and stashes. Connection is shared
-    /// across concurrent callers.
+    /// if present and not closed; otherwise connects and stashes.
+    /// Connection is shared across concurrent callers.
+    ///
+    /// F121: a cached entry whose `read_loop`/`writer_task` has exited
+    /// (i.e. the peer died) is poisoned — `client.is_closed()` returns
+    /// true. Returning it would cause new submits to fail fast (good)
+    /// but lock us out of any reconnect attempt. Evict and reconnect
+    /// instead so peer recovery surfaces as a fresh successful client
+    /// and a still-dead peer surfaces as `ECONNREFUSED` immediately.
     async fn get_client(&self, addr: SocketAddr) -> Result<Rc<RpcClient>> {
         if let Some(client) = self.clients.borrow().get(&addr).cloned() {
-            return Ok(client);
+            if !client.is_closed() {
+                return Ok(client);
+            }
         }
+        // Evict any closed entry under a fresh borrow so the upcoming
+        // `connect.await` doesn't hold the RefCell across a yield.
+        self.clients.borrow_mut().remove(&addr);
         let client = RpcClient::connect(addr)
             .await
             .map_err(|e| anyhow!("connect {}: {}", addr, e))?;
@@ -115,10 +127,20 @@ impl ConnPool {
     ) -> Result<futures::channel::oneshot::Receiver<autumn_rpc::Frame>> {
         let sock = parse_addr(addr)?;
         let client = self.get_client(sock).await?;
-        client
-            .send_vectored(msg_type, payload_parts)
-            .await
-            .map_err(|e| anyhow!("{}", e))
+        match client.send_vectored(msg_type, payload_parts).await {
+            Ok(rx) => Ok(rx),
+            Err(e) => {
+                // F121: matches `call`/`call_timeout` semantics — evict
+                // on submit-time error so the next call retries with a
+                // fresh client. `client.is_closed()` is `true` whenever
+                // the reader/writer task has exited, regardless of which
+                // path triggered the error.
+                if client.is_closed() {
+                    self.evict(sock);
+                }
+                Err(anyhow!("{}", e))
+            }
+        }
     }
 
     pub fn is_healthy(&self, addr: &str) -> bool {

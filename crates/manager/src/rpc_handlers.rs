@@ -315,7 +315,7 @@ impl AutumnManager {
 
         let (stream_id, extent_id, selected) = {
             let mut s = self.store.inner.borrow_mut();
-            let selected = match Self::select_nodes(&s.nodes, total_replicas) {
+            let selected = match Self::select_nodes(&s.nodes, &s.disks, total_replicas) {
                 Ok(v) => v,
                 Err(err) => {
                     return Ok(rkyv_encode(&CreateStreamResp {
@@ -711,7 +711,7 @@ impl AutumnManager {
             } else {
                 tail.replicates.len()
             };
-            let selected = match Self::select_nodes(&s.nodes, data) {
+            let selected = match Self::select_nodes(&s.nodes, &s.disks, data) {
                 Ok(v) => v,
                 Err(err) => {
                     return Ok(rkyv_encode(&StreamAllocExtentResp {

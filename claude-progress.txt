@@ -1,118 +1,140 @@
 Date: 2026-04-28
 TaskStatus: completed
-Task scope: F120 — bound recovery replay window after killed-mid-write
-restarts. Add three independent guard rails inspired by RocksDB:
-F120-A imm depth cap + back-pressure, F120-B WAL-gap forced rotate,
-F120-C graceful shutdown via SIGTERM.
+Task scope: F121 — node-failure write recovery. Two reported symptoms after
+`cluster.sh stop-node 1` against a 4-node cluster whose tail extents were
+on replicas [1, 3, 5]:
+  (a) `autumn-client put k2` blocks forever (>120 s observed).
+  (b) `autumn-client info` keeps reporting the dead node's disk
+      `online=true` indefinitely.
 
-Symptom (user-reported, 2026-04-27 23:00):
-  After driving the 4-disk EC cluster through wbench + split tests,
-  `cluster.sh stop && start` showed `top -pid <ps>` reporting 16 GB
-  memory footprint (RSS 2 MB, compressor 8.6 GB, 17.6 M swapouts).
-  Investigating /tmp/autumn-rs-logs/ps.log:
-    - part 15: logStream end=2.46 GB, vp_offset=499 MB → 1.96 GB to
-      replay on open
-    - part 36: logStream end=1.09 GB, vp_offset=639 MB → 448 MB
-    - parts 19/28/44: vp_offset == end (already drained)
-  GC for extent 22 (sealed=2.77 GB) ran 4 m 16 s; VP resolves spiked
-  to 4.4 s due to swap pressure. The replay window itself is the root
-  cause — `imm: VecDeque<Arc<Memtable>>` was unbounded.
+Root cause:
+  After SIGTERM kills extent-node 1, the kernel sends FIN to the PS-side
+  TCP socket. autumn-rpc's `read_loop` sees EOF, returns `Ok(())`, and
+  clears `pending`. But the `Rc<RpcClient>` is *still in
+  crates/stream/src/conn_pool.rs's `ConnPool`* — the pool only ever evicts
+  on `call*`-error, and `pool.send_vectored` did not evict on error at
+  all. The next `pool.send_vectored("127.0.0.1:9101", …)` returns the
+  same dead client. `client.send_vectored` happily inserts a fresh
+  `(req_id → oneshot::Sender)` into `pending` (no read_loop alive to
+  dispatch it), succeeds at submitting (writer_task still drains the
+  channel; macOS loopback writes to half-closed sockets succeed for
+  small payloads), and the caller's `rx.await` hangs forever. There was
+  no transport-layer timeout on the append fanout (Go autumn has 5 s
+  via `context.WithTimeout` — `streamclient.go:770`). The manager's
+  `select_nodes` did not consult disk liveness, so even after the
+  retry path fired the manager picked node 1 first. And
+  `disk_status_update_loop` only did *positive* updates — `Err(_) =>
+  continue` left a stale `online=true`. A fourth pre-existing bug
+  finally surfaced: the per-disk-id status update path keyed on the
+  extent-node's local `disk_id` (e.g. `--disk-id 4`) which never
+  matches the manager-allocated `disk_id` (e.g. 8), so even a
+  successful df was a silent no-op against `s.disks`.
 
-Diagnosis:
-  Three independent gaps in the partition server:
-    1. `rotate_active` (lib.rs:2625) does an unconditional
-       `imm.push_back` against an unbounded VecDeque. P-bulk falling
-       behind on `row_stream.append` (especially with EC encoding)
-       lets imm grow without limit. RocksDB caps this at
-       `max_write_buffer_number=2` and stalls writes when full.
-    2. `maybe_rotate` only fires on `active.mem_bytes >=
-       FLUSH_MEM_BYTES = 256 MB`. Workloads of small writes that
-       never fill the memtable can still grow log_stream without
-       bound — VPs cost ~16 B in memtable but the full payload sits
-       in log_stream. RocksDB's `max_total_wal_size` (default
-       `write_buffer_size × max_write_buffer_number × 4 ≈ 2 GB`)
-       handles this exact case.
-    3. `cluster.sh stop` sends SIGTERM, waits 5 s, then SIGKILL.
-       `autumn-ps` had no signal handler. `merged_partition_loop`'s
-       tail-drain only flushed `pending` + `inflight` — it did NOT
-       rotate `active` or drain `imm`, so any data ack'd to the
-       client between the last flush and SIGKILL was left for replay.
-
-Fix (this session):
+Fix (this session — five layered changes, all small):
   Files changed:
-    - crates/partition-server/src/lib.rs (~250 lines): F120 env knobs
-      (max_imm_depth, max_wal_gap, shutdown_timeout_ms);
-      `imm_drained_tx` field on PartitionData + imm-pop signalling in
-      flush_one_imm + flush_one_imm_local; new `drain_tx`/`drain_rx`
-      channel wired through PartitionHandle / partition_thread_main /
-      merged_partition_loop; merged_partition_loop now gates on
-      imm_full (skips req_rx + batch launch) and on drain_ack
-      (initiates rotate-and-flush-imm shutdown sequence after the
-      existing tail drain); WAL-gap force-rotate hook after each
-      iteration; new PartitionServer::shutdown() + serve_until_shutdown.
-    - crates/server/src/bin/partition_server.rs: install
-      SIGTERM/SIGINT handler that sets an AtomicBool; main awaits
-      serve_until_shutdown with a future polling the flag every 100 ms.
-    - cluster.sh: extend `kill_proc` SIGTERM-to-SIGKILL deadline from
-      5 s to 60 s (with operator-visible logging on timeout).
-    - crates/partition-server/CLAUDE.md: new "F120 — bounded recovery
-      replay" section + Key Constants table additions.
-    - feature_list.md: F120 entry inserted between F119 and F116.
-    - README.md: new "F120 — graceful shutdown + write back-pressure"
-      subsection with tunables and operator manual-verification steps.
-    - crates/manager/tests/f120_graceful_shutdown.rs: end-to-end
-      integration test (write + flag-set → thread-joined < 10 s →
-      second PS opens partition → all 64 keys still readable).
-    - crates/partition-server/src/lib.rs `f120_knob_tests`: 12 unit
-      tests covering env-knob defaults + clamps + live in-range checks.
+    - crates/rpc/src/client.rs — add `closed: Rc<Cell<bool>>` to
+      RpcClient; set true on read_loop / writer_task exit; short-
+      circuit `send_frame` / `send_vectored` / `send_oneshot` with
+      `RpcError::ConnectionClosed`. New `is_closed()` accessor. New
+      unit test `closed_flag_set_after_peer_disconnect`.
+    - crates/stream/src/conn_pool.rs — `get_client` evicts cached
+      entries with `is_closed() == true`; `send_vectored` evicts on
+      submit error when `client.is_closed()` matches the existing
+      `call*` semantics.
+    - crates/stream/src/client.rs — new `append_fanout_timeout`
+      (env `AUTUMN_STREAM_APPEND_TIMEOUT_MS`, default 5 s, clamped to
+      [200 ms, 60 s]). `launch_append` wraps each replica's response
+      receiver in `compio::time::sleep + futures::future::select`;
+      `Elapsed` becomes a soft error that the existing
+      `append_payload_segments` retry loop escalates to
+      `alloc_new_extent`.
+    - crates/manager/src/recovery.rs — `disk_status_update_loop` and
+      `recovery_collect_loop`'s df poll now call
+      `mark_node_disks_offline(store, node)` on RPC error and
+      `mark_node_disks_online(store, node)` on success; both key on
+      `MgrNodeInfo.disks` (manager-allocated disk_ids), sidestepping
+      the long-standing local-vs-allocated disk_id mismatch in the
+      df response payload.
+    - crates/manager/src/lib.rs — `select_nodes` now takes
+      `&HashMap<u64, MgrDiskInfo>`; pre-filters nodes whose
+      `node.disks` has any `s.disks[id].online == true`. Falls back
+      to the full node set when too few healthy candidates appear
+      (preserves the existing fall-back path in
+      `handle_stream_alloc_extent`).
+    - crates/manager/src/rpc_handlers.rs — pass `&s.disks` to the
+      two `Self::select_nodes` callers (`handle_create_stream`,
+      `handle_stream_alloc_extent`).
+    - feature_list.md — F121 entry inserted between F120 and F116.
 
-Key invariants preserved by the F120 changes:
-  - Phase 1 / Phase 2 / Phase 3 split is unchanged. F120-A only changes
-    when (B) launches and when (D) polls req_rx; the SQ/CQ pattern is
-    intact.
-  - `imm_drained_tx` is a same-thread mpsc::UnboundedSender; never
-    crosses thread boundaries.
-  - `drain_tx`: held by `PartitionServer::shutdown()` on the main
-    compio thread, sender side; receiver side polled by
-    merged_partition_loop on the partition thread. The
-    `oneshot::Sender<()>` payload is Send by construction.
-  - F120-C tail drain re-uses existing `flush_one_imm` (P-bulk hand-off)
-    + its `flush_one_imm_local` fallback, so degraded-mode partitions
-    still drain correctly.
-  - `imm: VecDeque<Arc<Memtable>>` stays Arc — FlushReq sends the
-    Memtable cross-thread to P-bulk; user explicitly considered Rc
-    and confirmed Arc is required.
+Reference patterns leaned on:
+  - Go autumn streamclient/streamclient.go:770 (5 s
+    `context.WithTimeout` on append fanout) → Layer 3.
+  - Go autumn streamclient/streamclient.go:917-941 (any error → 2×
+    local retry → `MustAllocNewExtent`) → autumn-rs already had this
+    in `append_payload_segments`; F121 just unblocks the trigger.
+  - Go autumn manager/stream_manager/policy.go:16-46
+    (`AllocExtent` filters by `getAllNodeStatus(true)`) → Layer 5.
+  - F119 typed-signal pattern (server returns
+    `CODE_EVERSION_MISMATCH` → client invalidates cache + retries)
+    → Layer 1 reuses the same shape one layer down: the closed flag
+    is the typed signal, the conn-pool evict is the
+    cache-invalidate.
+
+Key invariants preserved:
+  - autumn-rpc single-threaded compio: `closed.get()` and
+    `pending.borrow_mut().insert(...)` happen in the same sync block
+    (no awaits between them), so the close-vs-send race is bounded
+    to "cleared after we inserted" → caller's `rx.await` returns
+    `Err` immediately via the existing `pending.clear()` path.
+  - `MgrNodeInfo.disks: Vec<u64>` already carries the manager's
+    allocated disk_ids; F121's `mark_node_disks_*` just consume that
+    list, no schema change.
+  - `select_nodes` falls through to the full sorted set when too few
+    online disks are visible (cold leader before the first df sweep
+    has run) — `handle_stream_alloc_extent`'s per-RPC fall-back is
+    still the load-bearing layer here, F121 just narrows the
+    candidate set in the common case.
 
 Verification:
-  - cargo build --workspace: clean (only pre-existing dead-code warnings).
+  - cargo build --workspace --release: clean (only pre-existing
+    dead-code warnings).
+  - cargo test -p autumn-rpc --lib: 8 passed (7 pre-existing + new
+    `closed_flag_set_after_peer_disconnect` covering Layer 1).
+  - cargo test -p autumn-stream --lib: 47 passed.
   - cargo test -p autumn-partition-server --lib --test-threads=1:
-      101 passed (88 prior + 13 new F120 env-knob tests).
-  - cargo test -p autumn-stream --tests --test-threads=1: 77 passed.
+    101 passed.
+  - cargo test -p autumn-manager --lib: 4 passed, 1 fail
+    (`register_node_duplicate_addr_rejected`, pre-existing F116
+    documented flake — unrelated).
   - cargo test -p autumn-manager --test f120_graceful_shutdown:
-      1 pass / 14.36 s wallclock (11 s of which is the deliberate
-      ps_dead_timeout wait for the second-PS rebalance hop).
-  - Pre-existing test failures unchanged:
-      * autumn-partition-server lib --test-threads=8 (parallel):
-        f099i_d1_fast_path_no_fu_allocation +
-        f099i_fast_path_inactive_under_batch — documented as F099-I
-        timing-sensitive flakes in F104/F118.
-      * autumn-manager: register_node_duplicate_addr_rejected —
-        documented in F116.
+    1 pass / ~14 s (regression check on F120 untouched).
+  - Live verification end-to-end (mirrors user's exact repro):
+      cluster.sh reset 4
+      put k1 /tmp/v.txt              → ok in ~0.01 s
+      cluster.sh stop-node 1
+      put k2 /tmp/v.txt              → ok in **0.22 s** (was >120 s)
+      info → extent 16 (log_stream tail) on replicas=[7, 3, 5]
+              (excludes node 1); within ~10 s
+              node 1 disk online=false, node 7 disk online=true.
 
 Out of scope (intentionally not in this commit):
-  - Live cluster validation of the imm-cap back-pressure path: the
-    integration test exercises F120-C only; F120-A (back-pressure under
-    slow P-bulk) needs operator load with EC enabled to actually fill
-    imm. Documented as the F120 acceptance "Live verification" item.
-  - Tighter assertion that "graceful shutdown drained imm to row_stream"
-    (vs. logStream replay on restart). The integration test verifies
-    end-to-end data survives, but distinguishing the two paths from
-    outside the PS requires extra RPC plumbing (extent_node-side
-    commit_length query). Defer to live verification.
+  - Continuous active health-checking heartbeat in
+    `crates/stream/src/conn_pool.rs` (Go's `MonitorHealth`). Layer
+    1+2+3 are sufficient for the user's symptom; a heartbeat is a
+    follow-up.
+  - Manager-side node-liveness via a heartbeat stream (Go's
+    `LastEcho` ordering). Disk-online (df-driven) is the proxy used
+    by Layer 5.
+  - Replica-recovery dispatch on the extents that still list node 1
+    in `replicates` — that path already works via the F036 recovery
+    loop once the disk is correctly marked offline (Layer 4).
+  - Pre-existing F116 manager unit-test flake
+    (`register_node_duplicate_addr_rejected`).
+  - Pre-existing F099-I timing-sensitive
+    `cq_flushes_fast_ops_while_slow_op_runs` flake (passes on
+    single-test rerun).
 
 Next steps (none required for this scope):
-  - If operator finds 60 s graceful timeout too tight under heavy EC
-    load, raise via `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS`.
-  - If imm back-pressure regresses write throughput under bursty load,
-    raise `AUTUMN_PS_MAX_IMM_DEPTH` (memory cost: each step adds 256 MB
-    worst-case per partition).
+  - If operator reports a peer that consistently passes writes but
+    never replies (half-open TCP hang the OS doesn't surface), bump
+    `AUTUMN_STREAM_APPEND_TIMEOUT_MS` lower to recover sooner.

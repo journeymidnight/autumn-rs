@@ -212,3 +212,34 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
 5. **`alloc_ids` is the only ID source** — never generate IDs any other way. The `next_id` is derived from `max(all_entity_ids) + 1` during `replay_from_etcd`, so wasted IDs from failed mutations are safe.
 
 6. **Rebalance is called eagerly** — `rebalance_regions` after every PS registration or partition upsert. This is safe because it's idempotent (keeps existing assignments, only changes unassigned ones).
+
+7. **F121 disk-online tracking is call-result-driven, NOT
+   payload-driven.** `disk_status_update_loop` and the `df` poll
+   inside `recovery_collect_loop` use the helpers
+   `mark_node_disks_offline(store, node)` on RPC error and
+   `mark_node_disks_online(store, node)` on success. Both key on
+   `MgrNodeInfo.disks` (manager-allocated `disk_id`s). The
+   per-disk-id status carried in `DfResp.disk_status` is **the
+   extent-node's local `disk_id`** (set via `--disk-id N` at
+   process launch) which is unrelated to the manager's allocated
+   `disk_id` — pre-F121 the success path tried `s.disks.get_mut(&local_id)`
+   and silently no-op'd, so once a disk was marked offline (by my
+   F121 mark-on-failure addition), the success path could never
+   flip it back. The simple fix: trust the call-level liveness
+   signal, ignore the response payload's per-disk online field.
+   Per-disk failure inside an extent-node is still surfaced by
+   `mark_disk_offline_for_extent` (`crates/stream/src/extent_node.rs:1293`)
+   and propagates via the dedicated recovery RPCs.
+
+8. **F121 `select_nodes` prefers nodes with at least one online
+   disk**, falling back to the full sorted set when too few healthy
+   candidates remain. The fall-back exists because a cold leader
+   that hasn't yet run its first `df` sweep would otherwise refuse
+   to allocate. The per-RPC fall-back inside
+   `handle_stream_alloc_extent` (which retries on a fresh node when
+   `alloc_extent_on_node` fails) remains the load-bearing layer —
+   F121's `select_nodes` change just narrows the candidate set in
+   the common case so the user's expected behaviour
+   (`stop-node 1` → new extent on `[3, 5, 7]`) is observable on the
+   very first allocation attempt instead of only after a fall-back
+   hop.

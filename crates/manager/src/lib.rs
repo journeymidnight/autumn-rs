@@ -171,6 +171,7 @@ impl ConnPool {
         result
     }
 
+
     async fn get_or_connect(&self, addr: SocketAddr) -> Result<Rc<RefCell<RpcConn>>> {
         if let Some(conn) = self.conns.borrow().get(&addr) {
             return Ok(conn.clone());
@@ -572,8 +573,19 @@ impl AutumnManager {
         }
     }
 
+    /// F121: pick `count` candidate nodes for a fresh extent allocation.
+    ///
+    /// Prefers nodes that have **at least one online disk** so the very
+    /// first AllocExtent fan-out doesn't include a peer the manager has
+    /// already detected as dead (see `mark_node_disks_offline` in
+    /// `recovery.rs`). Falls back to the full node set when too few
+    /// nodes appear online — this keeps the existing
+    /// fall-back-to-fresh-node path in `handle_stream_alloc_extent`
+    /// available even in degraded states (e.g. cold leader before the
+    /// first `df` poll has run).
     fn select_nodes(
         nodes: &HashMap<u64, MgrNodeInfo>,
+        disks: &HashMap<u64, MgrDiskInfo>,
         count: usize,
     ) -> Result<Vec<MgrNodeInfo>, AppError> {
         let mut all: Vec<_> = nodes.values().cloned().collect();
@@ -584,6 +596,24 @@ impl AutumnManager {
                 all.len()
             )));
         }
+        let mut healthy: Vec<MgrNodeInfo> = all
+            .iter()
+            .filter(|n| {
+                n.disks
+                    .iter()
+                    .any(|d| disks.get(d).map(|di| di.online).unwrap_or(false))
+            })
+            .cloned()
+            .collect();
+        if healthy.len() >= count {
+            healthy.sort_by_key(|n| n.node_id);
+            return Ok(healthy.into_iter().take(count).collect());
+        }
+        // Degraded fallback: not enough online disks observed; preserve
+        // the pre-F121 behaviour of using the full node set so the
+        // post-RPC fall-back path in `handle_stream_alloc_extent` can
+        // still recover (it pings the candidate per-RPC and walks
+        // alternates on failure).
         Ok(all.into_iter().take(count).collect())
     }
 

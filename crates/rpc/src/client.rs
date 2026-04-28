@@ -85,6 +85,12 @@ pub struct RpcClient {
     /// Value 0 is reserved for fire-and-forget (no response expected).
     next_id: Cell<u32>,
     peer_addr: SocketAddr,
+    /// Set true when either `read_loop` or `writer_task` exits. After
+    /// that point new submits MUST short-circuit with `ConnectionClosed`
+    /// — otherwise the caller's pending entry would never be dispatched
+    /// (no read_loop alive to deliver the response). Without this flag,
+    /// a stale pooled client whose peer has died blocks callers forever.
+    closed: Rc<Cell<bool>>,
 }
 
 impl RpcClient {
@@ -120,37 +126,55 @@ impl RpcClient {
             Rc::new(RefCell::new(HashMap::new()));
 
         let (submit_tx, submit_rx) = mpsc::channel::<SubmitMsg>(SUBMIT_CHANNEL_CAP);
+        let closed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
         let client = Rc::new(Self {
             submit_tx: RefCell::new(submit_tx),
             pending: pending.clone(),
             next_id: Cell::new(1),
             peer_addr,
+            closed: closed.clone(),
         });
 
         // SQ: writer_task drains submit_rx and writes to the socket.
-        // On write error, it removes the offending req_id from `pending`
-        // (caller's receiver will then see RecvError) and exits. Remaining
-        // in-flight requests will be cleaned up when read_loop sees EOF
-        // (socket close) and clears `pending`.
+        // On exit (write error or channel-close) we set `closed` BEFORE
+        // clearing `pending` so any caller racing a fresh `send_*` checks
+        // the flag and short-circuits with `ConnectionClosed`. Without
+        // `closed`, a stale `Rc<RpcClient>` left in a pool would let new
+        // submits insert pending entries that nobody dispatches — the
+        // caller's `rx.await` then hangs forever (F121 root cause).
         let pending_for_writer = pending.clone();
+        let closed_for_writer = closed.clone();
         spawn(async move {
-            writer_task(writer, submit_rx, pending_for_writer, peer_addr).await;
+            writer_task(writer, submit_rx, pending_for_writer.clone(), peer_addr).await;
+            closed_for_writer.set(true);
+            pending_for_writer.borrow_mut().clear();
         })
         .detach();
 
         // CQ: read_loop decodes response frames and dispatches via pending.
         let pending_for_reader = pending;
+        let closed_for_reader = closed;
         spawn(async move {
             if let Err(e) = read_loop(reader, pending_for_reader.clone(), peer_addr).await {
                 tracing::warn!(addr = %peer_addr, error = %e, "rpc client reader exited");
             }
-            // On disconnect, drop all pending senders so callers get RecvError.
+            // F121: set closed BEFORE clearing pending so subsequent
+            // `send_*` short-circuits and never inserts a fresh pending
+            // entry that has no read_loop alive to dispatch it.
+            closed_for_reader.set(true);
             pending_for_reader.borrow_mut().clear();
         })
         .detach();
 
         Ok(client)
+    }
+
+    /// True when either `read_loop` or `writer_task` has exited.
+    /// Pools should evict the entry; new `send_*` calls return
+    /// `ConnectionClosed` without inserting into `pending`.
+    pub fn is_closed(&self) -> bool {
+        self.closed.get()
     }
 
     /// Send a request and wait for the response.
@@ -176,6 +200,14 @@ impl RpcClient {
         &self,
         frame: Frame,
     ) -> Result<oneshot::Receiver<Frame>, RpcError> {
+        // F121: short-circuit if the reader/writer task has already
+        // exited. The check + pending.insert below run in one sync block
+        // (single-threaded compio, no awaits), so a concurrent close that
+        // races us either flips `closed` first → we return here, or runs
+        // after we insert → its `pending.clear()` cancels our `tx`.
+        if self.closed.get() {
+            return Err(RpcError::ConnectionClosed);
+        }
         let req_id = frame.req_id;
         let (tx, rx) = oneshot::channel();
 
@@ -241,6 +273,10 @@ impl RpcClient {
         msg_type: u8,
         payload_parts: Vec<Bytes>,
     ) -> Result<oneshot::Receiver<Frame>, RpcError> {
+        // F121: see send_frame for the rationale.
+        if self.closed.get() {
+            return Err(RpcError::ConnectionClosed);
+        }
         let req_id = self.next_req_id();
         let payload_len: usize = payload_parts.iter().map(|p| p.len()).sum();
         let hdr = Frame::encode_request_header(req_id, msg_type, payload_len as u32);
@@ -286,6 +322,11 @@ impl RpcClient {
     /// Returns Ok once the frame has been queued for the writer_task
     /// (under back-pressure from the bounded submit channel).
     pub async fn send_oneshot(&self, msg_type: u8, payload: Bytes) -> Result<(), RpcError> {
+        // F121: short-circuit on a dead client; the submit channel may
+        // still drain into a writer_task that has nowhere to read replies.
+        if self.closed.get() {
+            return Err(RpcError::ConnectionClosed);
+        }
         let req_id = 0; // req_id 0 = no response expected
         let frame = Frame::request(req_id, msg_type, payload);
         let bytes = frame.encode();
@@ -431,5 +472,66 @@ async fn read_loop(
                 None => break,
             }
         }
+    }
+}
+
+// ── F121 tests ─────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::time::Duration;
+
+    /// F121 — when the peer closes its socket without responding, the
+    /// client's `read_loop` exits, `closed` flips to true, and the very
+    /// next `send_frame`/`send_vectored`/`send_oneshot`/`call` returns
+    /// `ConnectionClosed` immediately instead of inserting a fresh
+    /// pending entry that nobody will ever dispatch (the bug that caused
+    /// the >120 s hang in the original repro).
+    #[compio::test]
+    async fn closed_flag_set_after_peer_disconnect() {
+        let _ = autumn_transport::init();
+
+        // Bind a server-side listener; accept one connection then drop
+        // both halves so the client sees EOF.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+        let accept_thread = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().expect("accept");
+            // Hold for ~50 ms so the client finishes connecting, then
+            // drop — the FIN reaches the client and read_loop exits.
+            std::thread::sleep(Duration::from_millis(50));
+            drop(sock);
+        });
+
+        let client = RpcClient::connect(server_addr).await.expect("connect");
+        accept_thread.join().expect("accept thread");
+
+        // Wait up to 1 s for read_loop to observe EOF and flip closed.
+        let mut waited = Duration::ZERO;
+        while !client.is_closed() && waited < Duration::from_secs(1) {
+            compio::time::sleep(Duration::from_millis(10)).await;
+            waited += Duration::from_millis(10);
+        }
+        assert!(
+            client.is_closed(),
+            "RpcClient.closed should flip true within 1 s of peer FIN"
+        );
+
+        // Each public submit path must short-circuit, NOT hang.
+        let r = client
+            .send_frame(Frame::request(1, 1, Bytes::new()))
+            .await;
+        assert!(matches!(r, Err(RpcError::ConnectionClosed)));
+
+        let r = client.send_vectored(2, vec![Bytes::from_static(b"x")]).await;
+        assert!(matches!(r, Err(RpcError::ConnectionClosed)));
+
+        let r = client.send_oneshot(3, Bytes::new()).await;
+        assert!(matches!(r, Err(RpcError::ConnectionClosed)));
+
+        // `call` returns the same error.
+        let r = client.call(4, Bytes::new()).await;
+        assert!(matches!(r, Err(RpcError::ConnectionClosed)));
     }
 }

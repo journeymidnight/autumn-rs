@@ -150,6 +150,42 @@ bash cluster.sh start 4
 grep -E 'logStream commit_length OK|open_partition: ready' /tmp/autumn-rs-logs/ps.log
 ```
 
+### F121 — node-failure write recovery (2026-04-28)
+
+When you `cluster.sh stop-node N` while a partition's open extents
+include node `N`, the next write seals the current extent and
+allocates a new 3-replica extent on the surviving nodes — within
+~one append-fanout-timeout window (default **5 s**). Pre-F121 the
+write blocked indefinitely because the PS-side stream `ConnPool` kept
+returning a dead `Rc<RpcClient>` whose `read_loop` had exited; new
+submits inserted into `pending` with no reader to dispatch them.
+
+```bash
+bash cluster.sh reset 4
+echo hello > /tmp/v.txt
+target/release/autumn-client --manager 127.0.0.1:9001 put k1 /tmp/v.txt   # ok
+bash cluster.sh stop-node 1
+target/release/autumn-client --manager 127.0.0.1:9001 put k2 /tmp/v.txt   # ok in <6 s
+target/release/autumn-client --manager 127.0.0.1:9001 info                # node 1 disk online=false; new log_stream extent on the live nodes
+```
+
+Tunables:
+
+| env var | default | range | role |
+|---------|---------|-------|------|
+| `AUTUMN_STREAM_APPEND_TIMEOUT_MS` | `5000` | `[200, 60_000]` | per-replica deadline inside `launch_append`'s 3-replica fanout. `Elapsed` becomes a soft error so the existing retry loop in `append_payload_segments` escalates to `alloc_new_extent`. |
+
+Operator notes:
+- The manager's `disk_status_update_loop` runs every 10 s — `info` may
+  briefly show `online=true` for a node you just stopped; the next
+  sweep flips it. A recovered node flips back automatically on the
+  following sweep.
+- `select_nodes` prefers nodes with at least one online disk; when too
+  few healthy candidates appear (e.g. a cold leader before the first
+  df sweep), it falls back to the full sorted set and the per-RPC
+  fall-back inside `handle_stream_alloc_extent` walks alternates on
+  failure.
+
 After `start`, the script prints ready-to-use CLI examples:
 
 ```

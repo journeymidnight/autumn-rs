@@ -626,6 +626,42 @@ sufficient (and cheaper than DashMap).
     (`wal.rs:172`/`:271`) on must_sync small writes — bounded at
     ≤ 2 MiB per call, amortised by `write_batch`.
 
+17. **F121 dead-replica recovery: closed-aware pool + append fanout
+    timeout.** When an extent-node dies (SIGTERM/SIGKILL) the kernel
+    sends FIN to the PS-side TCP socket. autumn-rpc's `read_loop`
+    sees EOF and clears `pending`, but the `Rc<RpcClient>` stays in
+    `ConnPool` until somebody asks for it again. Pre-F121 the next
+    `pool.send_vectored("dead.addr", …)` returned that dead client;
+    `client.send_vectored` happily inserted a fresh
+    `(req_id → tx)` into `pending`, but with no read_loop alive to
+    dispatch responses, the caller's `rx.await` hung forever.
+    Three layered fixes:
+    - autumn-rpc `RpcClient` exposes `is_closed()` (set true on
+      `read_loop`/`writer_task` exit, before `pending.clear()`);
+      every `send_*` early-returns `ConnectionClosed` when set.
+    - `ConnPool::get_client` skips and reconnects when the cached
+      entry's `is_closed()` is true; `send_vectored` evicts on
+      submit error (matches existing `call*` semantics).
+    - `launch_append` wraps each per-replica response receiver in
+      `compio::time::sleep + futures::future::select` with
+      `append_fanout_timeout()` (env
+      `AUTUMN_STREAM_APPEND_TIMEOUT_MS`, default 5 s, clamped to
+      [200 ms, 60 s]). Mirrors Go autumn's
+      `streamclient.go:770` `context.WithTimeout(ctx, 5*time.Second)`.
+      `Elapsed` translates to a soft error that
+      `apply_completion` already classifies, so the existing
+      `append_payload_segments` retry loop escalates to
+      `alloc_new_extent` exactly the same way it does for any
+      other replica error. Backstop for the corner case where the
+      kernel hasn't surfaced the FIN yet but writes still appear
+      to succeed (half-open TCP).
+
+    Invariant: any future caller of `pool.send_vectored` /
+    `pool.call_vectored` against a peer that may go down between
+    `get_client` and `rx.await` MUST allow the surrounding logic
+    to handle `Err` — never assume a returned receiver will
+    resolve.
+
 ---
 
 ## RPC Wire Protocol (extent_rpc.rs)

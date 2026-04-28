@@ -70,6 +70,19 @@ Error responses encode status as: `[status_code: u8][message bytes]`.
   one syscall. Stress-tested at 2048 concurrent futures sharing one
   writer_task in `writer_task_handles_2048_concurrent_vectored` — no
   EINVAL, no EAGAIN, all requests complete.
+- **F121 closed-state flag (`closed: Rc<Cell<bool>>`)**: set true
+  whenever `read_loop` or `writer_task` exits — the read EOF / write
+  error / channel-closed paths all set it BEFORE clearing `pending`.
+  `send_frame`, `send_vectored`, `send_oneshot` short-circuit with
+  `RpcError::ConnectionClosed` when `closed.get()` is true; without
+  this, a stale `Rc<RpcClient>` left in any pool would let new
+  submits insert pending entries that nobody dispatches (no
+  read_loop alive). Single-threaded compio guarantees the check +
+  `pending.insert` run in one sync block (no awaits between them),
+  so a concurrent close race resolves to either "we early-return"
+  or "our entry gets cleared by `pending.clear()`". Pools should
+  treat `is_closed()` as a hard "evict and reconnect" signal —
+  `crates/stream/src/conn_pool.rs::get_client` does this.
 
 ### `server.rs`
 - `RpcServer::new(handler)`: create server with async handler `Fn(u8, Bytes) -> Result<Bytes, (StatusCode, String)>`

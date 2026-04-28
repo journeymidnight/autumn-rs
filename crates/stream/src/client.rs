@@ -234,6 +234,21 @@ fn stream_inflight_cap() -> usize {
         .unwrap_or(32)
 }
 
+/// F121: per-replica append fanout deadline. Mirrors Go autumn's
+/// 5 s `context.WithTimeout` on `appendBlocks`. A dead replica whose
+/// TCP socket is half-open or stuck in send-buffer flushing will
+/// otherwise hang the join_all forever even when `RpcClient.closed`
+/// hasn't yet flipped. Default 5 s, env-tunable, clamped to
+/// [200 ms, 60 s].
+fn append_fanout_timeout() -> Duration {
+    let ms = std::env::var("AUTUMN_STREAM_APPEND_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5_000)
+        .clamp(200, 60_000);
+    Duration::from_millis(ms)
+}
+
 /// Reads `AUTUMN_STREAM_READ_CHUNK_BYTES` (default 256 MiB). Maximum
 /// per-RPC byte count for replicated `read_bytes_from_extent` reads.
 /// Required because macOS pread tops out at INT_MAX (~2 GiB) and Linux
@@ -614,14 +629,34 @@ async fn launch_append(
     let receivers: Vec<(String, Result<oneshot::Receiver<autumn_rpc::Frame>>)> =
         join_all(send_futs).await;
 
+    // F121: bound each replica's recv at `append_fanout_timeout`. A
+    // half-open socket whose SubmitMsg landed in the writer_task before
+    // RpcClient.closed flipped will otherwise hang join_all forever
+    // (the response can never arrive — peer is dead). Translating
+    // Elapsed into a regular `replica N rpc error: ... timeout` makes
+    // `apply_completion` classify it as a soft error, which the
+    // public-API retry loop already escalates to alloc_new_extent.
+    let timeout = append_fanout_timeout();
     let fut = async move {
         let wait_futs = receivers.into_iter().map(|(addr, rx_res)| async move {
             match rx_res {
                 Err(e) => Err(anyhow!("{} submit error: {}", addr, e)),
-                Ok(rx) => match rx.await {
-                    Err(_) => Err(anyhow!("{} connection closed", addr)),
-                    Ok(frame) => Ok(frame),
-                },
+                Ok(rx) => {
+                    let recv_fut = rx;
+                    let timer = compio::time::sleep(timeout);
+                    futures::pin_mut!(recv_fut, timer);
+                    match futures::future::select(recv_fut, timer).await {
+                        futures::future::Either::Left((Ok(frame), _)) => Ok(frame),
+                        futures::future::Either::Left((Err(_), _)) => {
+                            Err(anyhow!("{} connection closed", addr))
+                        }
+                        futures::future::Either::Right(_) => Err(anyhow!(
+                            "{} append timeout after {:?}",
+                            addr,
+                            timeout
+                        )),
+                    }
+                }
             }
         });
         let frames = join_all(wait_futs).await;
