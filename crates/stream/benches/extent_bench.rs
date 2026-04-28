@@ -280,7 +280,7 @@ async fn bench_read(
             for k in 0..prefill {
                 let block = (t as u64 * ops_per_task + k) % num_blocks;
                 let req = ReadBytesReq {
-                    extent_id, eversion: 0, offset: (block * 4096) as u32, length: 4096,
+                    extent_id, eversion: 1, offset: (block * 4096) as u32, length: 4096,
                 };
                 conn.send(MSG_READ_BYTES, req.encode()).await;
                 sent += 1;
@@ -297,7 +297,7 @@ async fn bench_read(
                 if sent < ops_per_task {
                     let block = (t as u64 * ops_per_task + sent) % num_blocks;
                     let req = ReadBytesReq {
-                        extent_id, eversion: 0, offset: (block * 4096) as u32, length: 4096,
+                        extent_id, eversion: 1, offset: (block * 4096) as u32, length: 4096,
                     };
                     conn.send(MSG_READ_BYTES, req.encode()).await;
                     sent += 1;
@@ -408,7 +408,7 @@ async fn bench_mixed(
             for k in 0..prefill {
                 let block = (t as u64 * read_ops_per_reader + k) % num_blocks;
                 let req = ReadBytesReq {
-                    extent_id, eversion: 0, offset: (block * 4096) as u32, length: 4096,
+                    extent_id, eversion: 1, offset: (block * 4096) as u32, length: 4096,
                 };
                 conn.send(MSG_READ_BYTES, req.encode()).await;
                 sent += 1;
@@ -424,7 +424,7 @@ async fn bench_mixed(
                 if sent < read_ops_per_reader {
                     let block = (t as u64 * read_ops_per_reader + sent) % num_blocks;
                     let req = ReadBytesReq {
-                        extent_id, eversion: 0, offset: (block * 4096) as u32, length: 4096,
+                        extent_id, eversion: 1, offset: (block * 4096) as u32, length: 4096,
                     };
                     conn.send(MSG_READ_BYTES, req.encode()).await;
                     sent += 1;

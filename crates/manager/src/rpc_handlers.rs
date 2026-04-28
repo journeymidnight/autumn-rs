@@ -256,29 +256,55 @@ impl AutumnManager {
         let ec_data = req.ec_data_shard;
         let ec_parity = req.ec_parity_shard;
 
-        // Validate encoding: (N, 0) = replica; (K>=2, M>=1) = EC; (0, *) = invalid.
+        // Validate encoding:
+        //   - Replication stream (ec_parity == 0): replicates == ec_data
+        //     (K data nodes, no parity).
+        //   - EC stream (ec_parity >= 1): K >= 2, M >= 1. `replicates`
+        //     and `ec_data` are INDEPENDENT here. `replicates` is the
+        //     open-extent replica count (typically 3), `ec_data` is the
+        //     post-seal data-shard count (e.g. 4, 7), and `ec_parity`
+        //     is the parity-shard count. The ec_conversion_dispatch_loop
+        //     reads the sealed payload from any one of the open
+        //     replicas, encodes into K+M shards, and allocates the
+        //     extra `(K + M − replicates)` host slots needed.
+        //
+        //     Concretely: a 3-replica stream can be converted to 4+1
+        //     EC (K=4 ≠ replicates=3) — `ec_conversion_dispatch_loop`
+        //     allocates 5 − 3 = 2 extra host slots and writes 5 shards
+        //     in total. This decouples the open-write topology from
+        //     the storage-encoded topology.
+        //
+        //     Pre-fix EC streams required `replicates == K+M`, which
+        //     pushed the open-extent allocation onto K+M nodes (each
+        //     holding a full replica). The M extra replicas got
+        //     overwritten with parity bytes on EC conversion anyway,
+        //     so the up-front fanout was pure waste — and any
+        //     seal/EC race had a wider blast radius across K+M nodes
+        //     instead of just the K_open replicas.
         let total_replicas = req.replicates as usize;
-        let err_msg: Option<&str> = if ec_data == 0 {
-            Some("ec_data_shard must be >= 1 (use ec_data=N, ec_parity=0 for replica streams)")
+        let err_msg: Option<String> = if total_replicas == 0 {
+            Some("replicates must be >= 1".to_string())
+        } else if ec_data == 0 {
+            Some("ec_data_shard must be >= 1 (use ec_data=N, ec_parity=0 for replica streams)".to_string())
         } else if ec_parity == 0 {
             // Replica path: ec_data must equal replicates exactly.
             if ec_data as usize != total_replicas {
-                Some("ec_data_shard must equal replicates for a replica stream")
+                Some("ec_data_shard must equal replicates for a replica stream".to_string())
             } else {
                 None
             }
         } else {
-            // EC path: K >= 2, M >= 1, K+M == replicates.
+            // EC path: K >= 2, M >= 1. replicates and ec_data are
+            // independent — open extents go on `replicates` nodes;
+            // EC conversion expands to K+M total shards.
             if ec_data < 2 {
-                Some("ec_data_shard >= 2 required for EC streams")
-            } else if (ec_data + ec_parity) as usize != total_replicas {
-                Some("ec_data_shard + ec_parity_shard must equal replicates for EC streams")
+                Some("ec_data_shard >= 2 required for EC streams".to_string())
             } else {
                 None
             }
         };
         if let Some(msg) = err_msg {
-            let err = AppError::InvalidArgument(msg.to_string());
+            let err = AppError::InvalidArgument(msg);
             return Ok(rkyv_encode(&CreateStreamResp {
                 code: Self::err_to_code(&err),
                 message: err.to_string(),
@@ -327,6 +353,7 @@ impl AutumnManager {
             extent_ids: vec![extent_id],
             ec_data_shard: ec_data,
             ec_parity_shard: ec_parity,
+            replicates: req.replicates,
         };
         let extent = MgrExtentInfo {
             extent_id,
@@ -674,9 +701,17 @@ impl AutumnManager {
                 }
             };
 
-            let data = tail.replicates.len();
-            let parity = tail.parity.len();
-            let selected = match Self::select_nodes(&s.nodes, data + parity) {
+            // The new extent is allocated as an OPEN, REPLICATED extent
+            // on `stream.replicates` nodes. For legacy streams persisted
+            // before `replicates` was added to MgrStreamInfo (default
+            // 0), fall back to `tail.replicates.len()`, which on a
+            // pre-EC-converted tail equals the open replica count.
+            let data = if stream.replicates > 0 {
+                stream.replicates as usize
+            } else {
+                tail.replicates.len()
+            };
+            let selected = match Self::select_nodes(&s.nodes, data) {
                 Ok(v) => v,
                 Err(err) => {
                     return Ok(rkyv_encode(&StreamAllocExtentResp {
@@ -691,10 +726,43 @@ impl AutumnManager {
             (tail, selected, extent_id, data, s.nodes.clone())
         };
 
-        // Seal old extent
+        // Seal old extent.
+        //
+        // **Idempotency / EC-corruption guard**: if the tail is already
+        // sealed (some prior caller set `sealed_length > 0`), DO NOT
+        // re-query commit_length and DO NOT overwrite sealed_length.
+        //
+        // Why: after EC conversion of a sealed extent, each replica's
+        // local `entry.len` is rewritten to `shard_size` (the per-shard
+        // payload size, ~ original_sealed_length / data_shards) by
+        // `write_shard_local`. A naive re-seal would query
+        // commit_length, get `shard_size` back from every replica,
+        // take the min (= shard_size), and clobber the manager's
+        // `tail.sealed_length` from `original_payload_len` down to
+        // `shard_size`. Any VP at offset in `[shard_size,
+        // original_payload_len)` would then suddenly be "past
+        // sealed_length" — out-of-bounds on the read path even though
+        // the underlying EC shards still encode the full original
+        // payload. That triggered the production
+        // `range start index N out of range for slice of length L`
+        // panic in the partition server.
+        //
+        // A re-seal request typically arrives via the writer's
+        // soft-error retry path: it observes that the cached tail was
+        // sealed by another owner / split / EC dispatch and calls
+        // `alloc_new_extent(stream_id, 0)` to obtain a fresh tail. We
+        // honor the "allocate a new tail" intent while preserving the
+        // existing seal point.
+        let already_sealed = tail.sealed_length > 0;
+
         let mut min_len: Option<u32> = None;
         let mut avali: u32 = 0;
-        if req.end > 0 {
+        if already_sealed {
+            // Preserve the existing seal — do not touch sealed_length,
+            // eversion, or avali. The new-tail allocation below proceeds.
+            min_len = Some(tail.sealed_length as u32);
+            avali = tail.avali;
+        } else if req.end > 0 {
             min_len = Some(req.end);
             avali = Self::all_bits(tail.replicates.len() + tail.parity.len());
         } else {
@@ -748,9 +816,13 @@ impl AutumnManager {
                 }));
             }
         };
-        tail.sealed_length = sealed_len as u64;
-        tail.eversion += 1;
-        tail.avali = avali;
+        if !already_sealed {
+            tail.sealed_length = sealed_len as u64;
+            tail.eversion += 1;
+            tail.avali = avali;
+        }
+        // Suppress unused warning when `already_sealed` skips the real seal.
+        let _ = sealed_len;
 
         // Allocate new extent on nodes with fallback
         let mut node_ids = Vec::with_capacity(selected.len());

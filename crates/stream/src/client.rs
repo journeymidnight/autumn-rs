@@ -248,6 +248,33 @@ fn read_chunk_bytes() -> u32 {
         .unwrap_or(256 * 1024 * 1024)
 }
 
+/// Pure slicing logic shared by `ec_read_full_and_slice`. Returns the
+/// `[offset, offset+length)` sub-slice of an EC-decoded payload (where
+/// `length == 0` means "to end"), or an `Err` describing the
+/// out-of-bounds condition. Lifted out of the async method so it can
+/// be unit-tested without standing up a manager + extent-node fixture.
+fn ec_slice_decoded(full_payload: &[u8], offset: u32, length: u32) -> Result<Vec<u8>> {
+    if offset == 0 && length == 0 {
+        return Ok(full_payload.to_vec());
+    }
+    let start = offset as usize;
+    if start > full_payload.len() {
+        return Err(anyhow!(
+            "offset {} past decoded payload len {} (requested length={})",
+            start,
+            full_payload.len(),
+            length,
+        ));
+    }
+    let read_len = if length == 0 {
+        full_payload.len() - start
+    } else {
+        length as usize
+    };
+    let slice_end = (start + read_len).min(full_payload.len());
+    Ok(full_payload[start..slice_end].to_vec())
+}
+
 /// Message from public API to per-stream worker.
 enum StreamSubmitMsg {
     /// Append payload segments; worker leases offsets, fans out to 3
@@ -1628,14 +1655,18 @@ impl StreamClient {
     /// Read raw shard bytes from a single replica address via autumn-rpc.
     ///
     /// `eversion` is the caller's view of the extent's eversion (from
-    /// the cached `ExtentInfo`). Server-side `handle_read_bytes`
-    /// rejects stale (lower) eversions with `CODE_EVERSION_MISMATCH`,
-    /// surfaced here as `EversionStale` so the top-level
-    /// `read_bytes_from_extent` can refetch and retry. Pass 0 to skip
-    /// the check (used by paths that don't have a cached eversion at
-    /// hand, e.g. the EC parallel-shard scatter; the trade-off is
-    /// silent stale reads if the cache is wrong, so prefer the real
-    /// eversion when available).
+    /// the cached `ExtentInfo`). Server-side `handle_read_bytes` /
+    /// `build_read_future` reject stale (lower) eversions with
+    /// `CODE_EVERSION_MISMATCH`, surfaced here as `EversionStale` so
+    /// the top-level `read_bytes_from_extent` can refetch and retry.
+    ///
+    /// F119-C: there is no longer a "pass 0 to skip" sentinel — the
+    /// extent_node defaults `entry.eversion` to 1 on alloc (matches
+    /// the manager's `MgrExtentInfo { eversion: 1 }` default), so any
+    /// `eversion=0` is by definition stale (or never-cached). Always
+    /// pass the cached `ex.eversion`; the only legitimate `0` is from
+    /// raw bench/test code talking to a hand-rolled `entry.eversion=0`
+    /// fixture.
     async fn read_shard_from_addr(
         &self,
         addr: &str,
@@ -1669,7 +1700,36 @@ impl StreamClient {
         Ok((resp.payload.to_vec(), resp.end))
     }
 
-    /// EC sub-range read with data-shard fast path.
+    /// EC sub-range read.
+    ///
+    /// Generalised N-shard parallel scatter: for a `[offset, offset+length)`
+    /// sub-range that spans `start_shard..=end_shard` of the data shards,
+    /// fire one parallel `read_shard_from_addr` per touched shard and
+    /// concatenate the results in shard order. Each shard's slice is:
+    ///
+    /// - **first shard** (`start_shard`): `[start % shard_size, shard_size)`
+    /// - **last shard** (`end_shard`): `[0, end - end_shard*shard_size)`
+    /// - **middle shards** (when `end_shard - start_shard >= 2`):
+    ///   the entire shard `[0, shard_size)`
+    /// - **single-shard read** (`start_shard == end_shard`): just
+    ///   `[start % shard_size, start % shard_size + length)`
+    ///
+    /// On any per-shard error (non-eversion), short read, or a request
+    /// that lands past the data shards (e.g. a stale VP whose offset
+    /// straddles into the parity region), we fall back to
+    /// `ec_read_full_and_slice` — slow (full extent decode + RS) but
+    /// always correct.
+    ///
+    /// **Bug history**: pre-fix the two-shard branch only checked
+    /// `end_shard < data_shards` and entered for any 3+ shard span
+    /// (e.g. K=3 EC extent + 64 MiB GC chunk). It read shard 0 +
+    /// shard 2 only — silently skipping shard 1's bytes. The server
+    /// returned a SHORT-OK for shard 2 (length exceeded that shard's
+    /// actual file size), the join produced a contiguous buffer of
+    /// the right total length but with the middle ~15 MiB replaced
+    /// by shard 2's prefix, and the GC log-record decoder panicked
+    /// with `trailing bytes did not form a complete record`. The
+    /// generalised scatter below handles spans of any width safely.
     async fn ec_subrange_read(
         &self,
         extent_id: u64,
@@ -1684,71 +1744,114 @@ impl StreamClient {
 
         let sealed_length = ex.sealed_length;
         let shard_size = crate::erasure::shard_size(sealed_length as usize, data_shards) as u64;
-        let read_len = if length == 0 { sealed_length - offset as u64 } else { length as u64 };
+        // Saturating sub guards against a stale / corrupt VP whose
+        // offset has drifted past sealed_length: instead of unsigned-
+        // wrapping `read_len`, we fall through to ec_read_full_and_slice
+        // which returns an explicit Err.
+        let read_len = if length == 0 {
+            sealed_length.saturating_sub(offset as u64)
+        } else {
+            length as u64
+        };
+
+        if read_len == 0 {
+            return Ok((Vec::new(), 0));
+        }
 
         let start = offset as u64;
         let end = start + read_len;
 
         let start_shard = (start / shard_size) as usize;
-        let end_shard = ((end.saturating_sub(1)) / shard_size) as usize;
+        let end_shard = ((end - 1) / shard_size) as usize;
+
+        // If the read lands past the data-shard region (start_shard or
+        // end_shard >= data_shards) we cannot service it from data
+        // shards alone — surface via the bounds-checked full-decode
+        // path which returns Err with extent_id + sealed_length context.
+        if start_shard >= data_shards || end_shard >= data_shards {
+            return self.ec_read_full_and_slice(extent_id, offset, length, ex).await;
+        }
 
         let addrs = self.replica_addrs_for_extent(ex).await?;
 
-        if start_shard == end_shard && start_shard < data_shards {
-            let shard_offset = (start % shard_size) as u32;
-            let shard_len = read_len as u32;
-            let addr = &addrs[start_shard];
-            match self
-                .read_shard_from_addr(addr, extent_id, ex.eversion, shard_offset, shard_len)
-                .await
-            {
-                Ok(result) => return Ok(result),
+        // Build the per-shard (offset, length) plan.
+        let span = end_shard - start_shard + 1;
+        let mut shard_plan: Vec<(usize, u32, u32)> = Vec::with_capacity(span);
+        for shard_idx in start_shard..=end_shard {
+            let (sh_off, sh_len) = if start_shard == end_shard {
+                ((start % shard_size) as u32, read_len as u32)
+            } else if shard_idx == start_shard {
+                let off = (start % shard_size) as u32;
+                let len = (shard_size - start % shard_size) as u32;
+                (off, len)
+            } else if shard_idx == end_shard {
+                let len = (end - shard_idx as u64 * shard_size) as u32;
+                (0, len)
+            } else {
+                (0, shard_size as u32)
+            };
+            shard_plan.push((shard_idx, sh_off, sh_len));
+        }
+
+        // Parallel scatter. `read_shard_from_addr` borrows `&self`,
+        // which is fine because all futures share the same self
+        // borrow that outlives this `await`.
+        let read_futs: Vec<_> = shard_plan
+            .iter()
+            .map(|&(shard_idx, sh_off, sh_len)| {
+                let addr = &addrs[shard_idx];
+                self.read_shard_from_addr(addr, extent_id, ex.eversion, sh_off, sh_len)
+            })
+            .collect();
+        let results = futures::future::join_all(read_futs).await;
+
+        // Single pass: stitch results, watch for eversion-stale (fail
+        // fast — every replica reports the same mismatch by
+        // construction) and short reads (fall back to full decode).
+        let mut data: Vec<u8> = Vec::with_capacity(read_len as usize);
+        let mut last_end: u32 = 0;
+        let mut fall_back = false;
+        for (i, r) in results.into_iter().enumerate() {
+            match r {
+                Ok((bytes, end_val)) => {
+                    if bytes.len() as u32 != shard_plan[i].2 {
+                        fall_back = true;
+                        break;
+                    }
+                    data.extend_from_slice(&bytes);
+                    last_end = end_val;
+                }
                 Err(e) => {
                     if is_eversion_stale(&e) {
-                        return Err(e);
+                        return Err(anyhow::Error::new(EversionStale));
                     }
-                    return self.ec_read_full_and_slice(extent_id, offset, length, ex).await;
+                    fall_back = true;
+                    break;
                 }
             }
         }
 
-        if end_shard < data_shards {
-            let offset_in_first = (start % shard_size) as u32;
-            let first_len = (shard_size - start % shard_size) as u32;
-            let second_len = (read_len - first_len as u64) as u32;
-
-            let addr0 = addrs[start_shard].clone();
-            let addr1 = addrs[end_shard].clone();
-
-            let (r0, r1) = futures::join!(
-                self.read_shard_from_addr(&addr0, extent_id, ex.eversion, offset_in_first, first_len),
-                self.read_shard_from_addr(&addr1, extent_id, ex.eversion, 0, second_len),
-            );
-
-            if let Err(e) = &r0 {
-                if is_eversion_stale(e) {
-                    return Err(anyhow::Error::new(EversionStale));
-                }
-            }
-            if let Err(e) = &r1 {
-                if is_eversion_stale(e) {
-                    return Err(anyhow::Error::new(EversionStale));
-                }
-            }
-            match (r0, r1) {
-                (Ok((mut d0, end_val)), Ok((d1, _))) => {
-                    d0.extend_from_slice(&d1);
-                    return Ok((d0, end_val));
-                }
-                _ => {
-                    return self.ec_read_full_and_slice(extent_id, offset, length, ex).await;
-                }
-            }
+        if !fall_back {
+            return Ok((data, last_end));
         }
-
         self.ec_read_full_and_slice(extent_id, offset, length, ex).await
     }
 
+    /// Decode the entire EC extent and slice `[offset, offset+length)`.
+    ///
+    /// Returns `Err` (instead of panicking) when `offset` is past the
+    /// decoded payload length. The caller is responsible for surfacing
+    /// the resulting short/missing read upstream.
+    ///
+    /// **Bug history**: pre-fix this used `full_payload[start..slice_end]`
+    /// directly, which panics with `range start index N out of range
+    /// for slice of length L` when `start > L`. That happened in
+    /// production when log_stream extents were (incorrectly) EC-converted
+    /// and a VP referenced an offset past the manager's recorded
+    /// `sealed_length` — the panic took down the entire PS process.
+    /// The error is now structured so `read_value_from_log` reports a
+    /// "logStream value short" / out-of-bounds error to the caller and
+    /// the partition keeps serving other requests.
     async fn ec_read_full_and_slice(
         &self,
         extent_id: u64,
@@ -1757,19 +1860,15 @@ impl StreamClient {
         ex: &ExtentInfo,
     ) -> Result<(Vec<u8>, u32)> {
         let (full_payload, end) = self.ec_read_full(extent_id, ex).await?;
-
-        if offset == 0 && length == 0 {
-            return Ok((full_payload, end));
-        }
-
-        let start = offset as usize;
-        let read_len = if length == 0 {
-            full_payload.len().saturating_sub(start)
-        } else {
-            length as usize
-        };
-        let slice_end = (start + read_len).min(full_payload.len());
-        Ok((full_payload[start..slice_end].to_vec(), end))
+        let bytes = ec_slice_decoded(&full_payload, offset, length).map_err(|e| {
+            anyhow!(
+                "ec_read_full_and_slice: {} for extent {} (manager sealed_length={})",
+                e,
+                extent_id,
+                ex.sealed_length,
+            )
+        })?;
+        Ok((bytes, end))
     }
 
     async fn ec_read_full(
@@ -2011,5 +2110,67 @@ mod pipeline_tests {
         assert!(state.poisoned);
         assert_eq!(state.lease_cursor, 300);
         assert_eq!(state.in_flight, 1);
+    }
+}
+
+#[cfg(test)]
+mod ec_slice_tests {
+    //! Regression tests for the slice-bounds bug that crashed the
+    //! partition server when a VP referenced an offset past the
+    //! EC-decoded payload length. Pre-fix the slicing was
+    //! `full_payload[start..slice_end]` with `start > full_payload.len()`,
+    //! which panics with `range start index N out of range for slice of
+    //! length L` and unwound the entire partition thread.
+    use super::ec_slice_decoded;
+
+    #[test]
+    fn slice_in_range_returns_subslice() {
+        let payload: Vec<u8> = (0u8..=199).collect();
+        let out = ec_slice_decoded(&payload, 50, 30).expect("in-range slice");
+        assert_eq!(out.len(), 30);
+        assert_eq!(out, payload[50..80]);
+    }
+
+    #[test]
+    fn slice_zero_length_means_to_end() {
+        let payload: Vec<u8> = (0u8..=199).collect();
+        let out = ec_slice_decoded(&payload, 50, 0).expect("to-end slice");
+        assert_eq!(out, payload[50..]);
+    }
+
+    #[test]
+    fn slice_offset_past_end_returns_err_not_panic() {
+        // Reproduces the production crash: VP offset 49541652 on a
+        // payload of length 45479123. Pre-fix this slicing path
+        // panicked; post-fix it must surface a clean Err so the
+        // caller can convert it into a "value short" RPC response and
+        // the partition keeps serving other requests.
+        let payload = vec![0u8; 45_479_123];
+        let err = ec_slice_decoded(&payload, 49_541_652, 14_456_954)
+            .expect_err("offset past end must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("past decoded payload len"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn slice_offset_at_end_returns_empty() {
+        // offset == len is the boundary: no bytes to read, but not an
+        // error. Required for callers that pass `offset = sealed_length`
+        // and `length = 0` to mean "nothing left".
+        let payload = vec![0u8; 100];
+        let out = ec_slice_decoded(&payload, 100, 0).expect("offset==len is OK");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn slice_length_overshoots_clamps_to_end() {
+        let payload: Vec<u8> = (0u8..=99).collect();
+        // Asking for 999 bytes from offset 80 should return 20.
+        let out = ec_slice_decoded(&payload, 80, 999).expect("clamped slice");
+        assert_eq!(out.len(), 20);
+        assert_eq!(out, payload[80..]);
     }
 }

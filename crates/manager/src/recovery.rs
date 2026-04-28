@@ -365,14 +365,39 @@ impl AutumnManager {
                 continue;
             }
 
+            // F119-D: dedupe candidates by extent_id. After a partition
+            // split, a CoW-shared extent (refs >= 2) appears in BOTH
+            // child streams' extent_ids. Without dedup, the inner for
+            // loop processes the same extent twice — the first pass
+            // encodes the original payload into K data + M parity
+            // shards, and the second pass reads the (now-shard) local
+            // file and RE-ENCODES it as if it were the original
+            // payload, producing sub-shards of size
+            // shard_size(shard_size(original)) = original / K^2. The
+            // manager state (ec_converted=true, sealed_length=original)
+            // looks correct, but on-disk shards only encode original/K
+            // bytes — every read past offset shard_size returns short
+            // data and surfaces upstream as `logStream value short` or
+            // `ec_read_full_and_slice: offset N past decoded payload
+            // len M`.
+            //
+            // Use a HashSet on extent_id to keep the first stream's
+            // entry and skip the duplicate. Stream-specific fields
+            // (ec_data_shard, ec_parity_shard) are identical across
+            // CoW-shared streams by construction (compute_duplicate_stream
+            // copies them), so picking either stream is equivalent.
             let candidates: Vec<(MgrExtentInfo, MgrStreamInfo)> = {
                 let s = self.store.inner.borrow();
                 let mut out = Vec::new();
+                let mut seen: HashSet<u64> = HashSet::new();
                 for stream in s.streams.values() {
                     if stream.ec_parity_shard == 0 {
                         continue;
                     }
                     for &eid in &stream.extent_ids {
+                        if !seen.insert(eid) {
+                            continue;
+                        }
                         if let Some(ex) = s.extents.get(&eid) {
                             if ex.sealed_length == 0 || ex.ec_converted {
                                 continue;

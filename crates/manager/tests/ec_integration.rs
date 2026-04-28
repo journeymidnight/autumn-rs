@@ -94,6 +94,8 @@ async fn setup_ec_stream(
         let _: RegisterNodeResp = rkyv_decode(&resp).expect("decode");
     }
 
+    // Open-extent replica count is independent of EC (K, M) — here
+    // 3-replica open extents with whatever K+M the test selected.
     let resp = mgr
         .call(
             MSG_CREATE_STREAM,

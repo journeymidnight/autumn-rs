@@ -796,6 +796,7 @@ impl AutumnManager {
             extent_ids: vec![],
             ec_data_shard: src.ec_data_shard,
             ec_parity_shard: src.ec_parity_shard,
+            replicates: src.replicates,
         };
 
         let mut modified_extents = Vec::new();

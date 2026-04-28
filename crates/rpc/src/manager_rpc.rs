@@ -126,12 +126,31 @@ pub struct MgrExtentInfo {
 }
 
 /// Stream metadata — mirrors proto StreamInfo.
+///
+/// The triple `(replicates, ec_data_shard, ec_parity_shard)` fully
+/// describes the stream's data layout:
+///
+/// - `replicates`: open-extent replica count. While an extent is open
+///   (not yet sealed), the data is fully replicated across this many
+///   nodes (typically 3). Independent of `ec_data_shard` — a 3-replica
+///   open stream can be encoded to 4+1, 7+1, etc. on seal.
+/// - `ec_data_shard` (K): data-shard count of the post-seal EC encoding.
+///   For a replication-only stream, equals `replicates` and `ec_parity_shard`
+///   is 0.
+/// - `ec_parity_shard` (M): parity-shard count of the post-seal EC encoding.
+///   `0` means pure replication (no EC conversion will fire).
+///
+/// Legacy values (pre-2026-04-27 schema): streams persisted before this
+/// field was introduced deserialise with `replicates = 0`. Callers must
+/// treat `replicates == 0` as "unknown — derive from one of the stream's
+/// open extents' `replicates.len()`".
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MgrStreamInfo {
     pub stream_id: u64,
     pub extent_ids: Vec<u64>,
     pub ec_data_shard: u32,
     pub ec_parity_shard: u32,
+    pub replicates: u32,
 }
 
 /// Partition metadata.

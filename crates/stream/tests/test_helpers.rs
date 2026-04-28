@@ -157,4 +157,27 @@ impl TestConn {
             .expect("delete_extent RPC");
         rkyv_decode::<CodeResp>(&resp).expect("decode CodeResp")
     }
+
+    pub async fn write_shard(
+        &self,
+        extent_id: u64,
+        shard_index: u32,
+        sealed_length: u64,
+        eversion: u64,
+        payload: Vec<u8>,
+    ) -> WriteShardResp {
+        let req = WriteShardReq {
+            extent_id,
+            shard_index,
+            sealed_length,
+            eversion,
+            payload: Bytes::from(payload),
+        };
+        let resp = self
+            .pool
+            .call(&self.addr, MSG_WRITE_SHARD, req.encode())
+            .await
+            .expect("write_shard RPC");
+        WriteShardResp::decode(resp).expect("decode WriteShardResp")
+    }
 }

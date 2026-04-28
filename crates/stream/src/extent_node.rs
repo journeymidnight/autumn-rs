@@ -972,16 +972,32 @@ fn build_read_future(
         for slot in slots {
             let req = slot.req;
             let ev = extent.eversion.load(Ordering::SeqCst);
-            if req.eversion > 0 && req.eversion < ev {
-                out.push(err_bytes(
-                    slot.req_id,
-                    MSG_READ_BYTES,
-                    StatusCode::FailedPrecondition,
-                    &format!(
-                        "extent {} eversion too low: got {}, expect >= {}",
-                        req.extent_id, req.eversion, ev
-                    ),
-                ));
+            // F119-C: see handle_read_bytes — drop the `req.eversion > 0`
+            // skip so a stale-cached eversion=0 (populated when the extent
+            // was open) gets rejected as CODE_EVERSION_MISMATCH after
+            // split / EC bump it past 0. Also: return a CODE_EVERSION_MISMATCH
+            // RESPONSE (not a frame-level error) so the client's
+            // `read_shard_from_addr` recognises it via `resp.code ==
+            // CODE_EVERSION_MISMATCH` and the top-level
+            // `read_bytes_from_extent` retry loop self-heals via
+            // `invalidate_extent_cache` + refetch + EC re-route. Pre-fix
+            // this batched path emitted a `FailedPrecondition` frame
+            // error, which surfaced as a generic transport error and
+            // never triggered the cache refresh.
+            if req.eversion < ev {
+                out.push(
+                    Frame::response(
+                        slot.req_id,
+                        MSG_READ_BYTES,
+                        ReadBytesResp {
+                            code: CODE_EVERSION_MISMATCH,
+                            end: 0,
+                            payload: Bytes::new(),
+                        }
+                        .encode(),
+                    )
+                    .encode(),
+                );
                 continue;
             }
 
@@ -2068,7 +2084,7 @@ impl ExtentNode {
         &self,
         extent_id: u64,
         shard_index: usize,
-        _sealed_length: u64,
+        sealed_length: u64,
         new_eversion: u64,
         shard_data: &[u8],
     ) -> Result<(), (StatusCode, String)> {
@@ -2085,9 +2101,21 @@ impl ExtentNode {
         file_ref(&entry.file).sync_all().await
             .map_err(|e| (StatusCode::Internal, format!("sync shard {extent_id}: {e}")))?;
 
+        // F119-E: store the ORIGINAL payload length (passed from the EC
+        // coordinator), not the per-shard size. `entry.sealed_length`
+        // is the logical seal point — it must match the manager's
+        // `MgrExtentInfo.sealed_length` so that commit_length probes,
+        // F119-D's idempotency guard, and any future read-side check
+        // see consistent values. Pre-fix this stored `shard_len`,
+        // which made the EC'd extent appear to be sealed at the
+        // shard size on the local node — `handle_commit_length`
+        // returned shard_len, polluting `current_commit` →
+        // `SeedCursor`, and any code that compared
+        // `entry.sealed_length` against the manager's value would
+        // disagree.
         let shard_len = shard_data.len() as u64;
         entry.len.store(shard_len, Ordering::SeqCst);
-        entry.sealed_length.store(shard_len, Ordering::SeqCst);
+        entry.sealed_length.store(sealed_length.max(shard_len), Ordering::SeqCst);
         entry.avali.store(1, Ordering::SeqCst);
         if new_eversion > 0 {
             entry.eversion.store(new_eversion, Ordering::SeqCst);
@@ -2189,6 +2217,36 @@ impl ExtentNode {
             .encode());
         }
         if start > req.commit as u64 {
+            // F119-E: confirm with the manager that this extent is NOT
+            // sealed before truncating. Otherwise a stale-PS append with
+            // a low `header.commit` would silently shrink an extent the
+            // manager has already sealed (the seal isn't pushed to
+            // extent_nodes — there's no etcd watch — so a stale client's
+            // eversion check passes and we'd fall through to truncate).
+            // The lost bytes between `req.commit` and the prior file
+            // length are unrecoverable: the on-disk shards from the
+            // subsequent EC pass would encode `req.commit` bytes while
+            // the manager still believes `sealed_length` was the larger
+            // value, miscomputing every cross-shard read boundary
+            // afterwards (surfaced as F119-E `invalid meta_len=...` /
+            // `logStream value short`). The manager round-trip on this
+            // path is acceptable because commit-reconciliation
+            // truncation is rare in normal operation (only fires when
+            // this replica got ahead of the consensus min).
+            if let Ok(Some(mgr_info)) = self.extent_info_from_manager(req.extent_id).await {
+                if mgr_info.sealed_length > 0 {
+                    let sealed_changed = Self::apply_extent_meta(&extent, &mgr_info);
+                    if sealed_changed {
+                        let _ = self.save_meta(req.extent_id, &extent).await;
+                    }
+                    return Ok(AppendResp {
+                        code: CODE_PRECONDITION,
+                        offset: 0,
+                        end: 0,
+                    }
+                    .encode());
+                }
+            }
             Self::truncate_to_commit(&extent, req.commit)
                 .await
                 .map_err(|e| (StatusCode::Internal, e))?;
@@ -2255,8 +2313,19 @@ impl ExtentNode {
         // Critical post-EC-conversion: a stale-cache client would
         // otherwise drive 3-replica failover-with-timeout against
         // shrunken shard files (see plan: ec-http-...-smooth-tome.md).
+        //
+        // F119-C: enforce req.eversion < ev unconditionally — the prior
+        // `req.eversion > 0` skip silently let through a stale-cached
+        // eversion=0 (populated when the extent was open via
+        // load_stream_tail / alloc_new_extent_once). After split bumped
+        // ev to 1 and EC conversion bumped ev to 2 + shrunk the on-disk
+        // file to shard_size, a cross-shard sub-range read (e.g. a 14 MB
+        // VP straddling shards 0/1) silently truncated to the bytes
+        // remaining in shard 0. The client now correctly sees
+        // EVERSION_MISMATCH on attempt 0, invalidates the cache, and the
+        // retry routes through ec_subrange_read.
         let ev = extent.eversion.load(Ordering::SeqCst);
-        if req.eversion > 0 && req.eversion < ev {
+        if req.eversion < ev {
             return Ok(ReadBytesResp {
                 code: CODE_EVERSION_MISMATCH,
                 end: 0,
@@ -2336,10 +2405,29 @@ impl ExtentNode {
                 let _ = self.save_meta(req.extent_id, &entry).await;
             }
         }
-        let len = entry.len.load(Ordering::SeqCst);
+        // F119-E: for sealed extents, return the LOGICAL sealed length
+        // (the original payload length, agreed with the manager). For
+        // open extents, return the current file length (commit point).
+        //
+        // Pre-fix this always returned `entry.len`, which after EC
+        // conversion is the per-shard size (`shard_size(payload, K)`),
+        // not the original payload length. That polluted
+        // `StreamClient::current_commit` → `SeedCursor`, leading the
+        // worker to seed `state.commit` with the shard size instead of
+        // the logical end. Cosmetic for sealed extents (writes get
+        // rejected by the sealed check anyway), but `current_commit` is
+        // also called when initialising new stream-client workers for a
+        // CoW-shared sealed-EC tail post-split, where the seeded commit
+        // surfaces upstream as a misleading commit_length value.
+        let sealed = entry.sealed_length.load(Ordering::SeqCst);
+        let length = if sealed > 0 {
+            sealed
+        } else {
+            entry.len.load(Ordering::SeqCst)
+        };
         Ok(CommitLengthResp {
             code: CODE_OK,
-            length: len as u32,
+            length: length as u32,
         }
         .encode())
     }
@@ -2837,20 +2925,64 @@ impl ExtentNode {
         let entry = self.get_extent(extent_id).await?;
         let mut sealed_length = entry.sealed_length.load(Ordering::SeqCst);
 
-        // If not sealed locally, check with manager — the seal event may
-        // not have propagated yet (no etcd watch in Rust implementation).
-        if sealed_length == 0 {
-            if let Ok(Some(mgr_info)) = self.extent_info_from_manager(extent_id).await {
-                if mgr_info.sealed_length > 0 {
-                    let local_len = entry.len.load(Ordering::SeqCst);
-                    let target = mgr_info.sealed_length.min(local_len);
-                    entry.sealed_length.store(target, Ordering::SeqCst);
-                    entry.eversion.store(mgr_info.eversion, Ordering::SeqCst);
-                    entry.avali.store(mgr_info.avali, Ordering::SeqCst);
-                    let _ = self.save_meta(extent_id, &entry).await;
-                    sealed_length = target;
-                    tracing::info!(extent_id, sealed_length, "applied seal from manager for EC convert");
-                }
+        // F119-D: idempotency guard. After a successful EC conversion,
+        // `write_shard_local` has set `entry.eversion = req.eversion`
+        // and shrunk the local file to `shard_size`. If the manager
+        // re-dispatches convert_to_ec for the same `eversion` (e.g.
+        // because the dispatch loop's candidates list contained the
+        // same extent twice — once per CoW-shared stream — and the
+        // first iteration already completed), we MUST NOT re-encode
+        // the now-shard local file as if it were the original
+        // payload. Doing so would produce sub-shards of size
+        // shard_size(shard_size(original)) ≈ original/K^2 and corrupt
+        // every read past offset shard_size with `logStream value
+        // short` / `ec_read_full_and_slice: offset N past decoded
+        // payload len M`.
+        //
+        // Detect post-EC state: local eversion >= the requested
+        // eversion. (write_shard_local persists `req.eversion` →
+        // `entry.eversion` only on a successful EC install, so this
+        // check is reliable.) Return CODE_OK so the manager's
+        // apply_ec_conversion_done block runs and the state machine
+        // converges — the state is already what the manager wants.
+        let local_eversion = entry.eversion.load(Ordering::SeqCst);
+        if local_eversion >= req.eversion && sealed_length > 0 && entry.avali.load(Ordering::SeqCst) > 0 {
+            tracing::info!(
+                extent_id,
+                local_eversion,
+                req_eversion = req.eversion,
+                sealed_length,
+                "convert_to_ec idempotent skip: extent already EC-converted"
+            );
+            return Ok(rkyv_encode(&CodeResp {
+                code: CODE_OK,
+                message: String::new(),
+            }));
+        }
+
+        // F119-E: manager is the authoritative source for sealed_length /
+        // eversion. If the local view is behind, pull from the manager
+        // (always — even if `sealed_length` looks set locally, the manager
+        // may have advanced eversion via split). After syncing the seal
+        // metadata, if the local file itself is shorter than
+        // mgr.sealed_length (legitimate cause: this replica missed some
+        // appends, manager sealed at the consensus min, and we happen to
+        // be behind), peer-copy from other replicas to bring the file up
+        // to the manager's sealed_length BEFORE encoding. Without the
+        // peer-copy, `file_pread_chunked` would short-read and EC would
+        // encode the truncated payload, leaving manager.sealed_length and
+        // on-disk shard sizes permanently disagreeing — surfaced as
+        // `invalid meta_len` on partition open / `logStream value short`
+        // on VP reads.
+        let mgr_info_opt = self.extent_info_from_manager(extent_id).await.ok().flatten();
+        if let Some(mgr_info) = mgr_info_opt.as_ref() {
+            if mgr_info.sealed_length > 0 {
+                entry.sealed_length.store(mgr_info.sealed_length, Ordering::SeqCst);
+                entry.eversion.store(mgr_info.eversion, Ordering::SeqCst);
+                entry.avali.store(mgr_info.avali, Ordering::SeqCst);
+                let _ = self.save_meta(extent_id, &entry).await;
+                sealed_length = mgr_info.sealed_length;
+                tracing::info!(extent_id, sealed_length, "applied seal from manager for EC convert");
             }
         }
 
@@ -2859,6 +2991,66 @@ impl ExtentNode {
                 StatusCode::FailedPrecondition,
                 format!("extent {extent_id} is not sealed — cannot EC convert"),
             ));
+        }
+
+        // Peer-copy gap if local file is short. Manager is the source of
+        // truth for sealed_length, so we trust its value and reach out
+        // to peers (which by construction must hold ≥ sealed_length bytes
+        // — that's how the manager arrived at the seal point in the
+        // first place). Self-heal here so the EC encode reflects the
+        // manager's logical seal.
+        let local_len = entry.len.load(Ordering::SeqCst);
+        if local_len < sealed_length {
+            let mgr_info = mgr_info_opt.ok_or_else(|| {
+                (
+                    StatusCode::Unavailable,
+                    format!(
+                        "extent {extent_id} local_len={local_len} < sealed_length={sealed_length} \
+                         and manager unreachable — cannot peer-copy"
+                    ),
+                )
+            })?;
+            let payload = self
+                .fetch_full_extent_from_sources(&mgr_info, &[])
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::Unavailable,
+                        format!(
+                            "peer-copy for extent {extent_id} (need {sealed_length}, local has \
+                             {local_len}): {e}"
+                        ),
+                    )
+                })?;
+            if (payload.len() as u64) < sealed_length {
+                return Err((
+                    StatusCode::FailedPrecondition,
+                    format!(
+                        "peer-copy returned {} bytes < sealed_length={sealed_length} for extent \
+                         {extent_id} — data is unrecoverable; operator intervention required",
+                        payload.len()
+                    ),
+                ));
+            }
+            let truncated = payload[..sealed_length as usize].to_vec();
+            file_ref(&entry.file)
+                .set_len(0)
+                .await
+                .map_err(|e| (StatusCode::Internal, format!("truncate {extent_id}: {e}")))?;
+            file_pwrite_chunked(&entry.file, 0, truncated)
+                .await
+                .map_err(|e| (StatusCode::Internal, format!("write {extent_id}: {e}")))?;
+            file_ref(&entry.file)
+                .sync_all()
+                .await
+                .map_err(|e| (StatusCode::Internal, format!("sync {extent_id}: {e}")))?;
+            entry.len.store(sealed_length, Ordering::SeqCst);
+            tracing::info!(
+                extent_id,
+                local_len,
+                sealed_length,
+                "peer-copied missing tail before EC convert"
+            );
         }
 
         let data = file_pread_chunked(&entry.file, 0, sealed_length as usize).await

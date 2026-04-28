@@ -344,18 +344,44 @@ do_start() {
         # Give PS a moment to sync regions and re-bind listeners on restart.
         wait_port 9201 ps 60
     else
-        # Auto-select EC shape based on replica count (FOPS-02).
-        # N>=4 → log/row EC 3+1 (replicates=4), meta 3+0.
-        # N==3 → log/row EC 2+1 (replicates=3), meta 3+0.
-        # N<3  → all streams pure replication N+0, no EC.
+        # Auto-select EC shape (FOPS-02).
+        #
+        # `replicas` here is the number of EXTENT NODES in the cluster,
+        # NOT the replication factor. Streams are described by the
+        # triple `(replicates, ec_data, ec_parity)` (see MgrStreamInfo):
+        #   - replicates: open-extent replica count, fixed at 3 (or N
+        #     when N<3 for tiny dev clusters). All open extents land
+        #     on this many nodes regardless of EC config.
+        #   - ec_data (K): post-seal data-shard count. Independent of
+        #     replicates — a 3-replica stream can be EC-encoded into
+        #     4+1 or 7+1 on seal.
+        #   - ec_parity (M): post-seal parity-shard count.
+        #
+        # EC default (applied to both log_stream and row_stream):
+        #   N<=3 → no EC (no parity headroom)
+        #   N=4 → 3+1   (K=3, M=1)
+        #   N>=5 → 4+1  (K=4, M=1; K capped at 4 to bound RS decode cost)
+        #
+        # log_stream EC is supported via ec_subrange_read's generalised
+        # N-shard parallel sub-range read (handles VP reads of any width
+        # safely; replaced the buggy two-adjacent-shard-only fast path).
+        # See crates/stream/CLAUDE.md note 6 + the bug-history block.
+        #
         # Env overrides: AUTUMN_EC_LOG / AUTUMN_EC_ROW
         #   "off"  → disable EC for that stream (pure replication)
-        #   "K+M"  → use that explicit shape
+        #   "K+M"  → use that explicit EC shape (open replicates is
+        #            still the meta replication factor; only the
+        #            post-seal EC encoding shape changes)
         local log_ec_default row_ec_default meta_repl
-        if   (( replicas >= 4 )); then log_ec_default="3+1"; row_ec_default="3+1"; meta_repl=3
-        elif (( replicas == 3 )); then log_ec_default="2+1"; row_ec_default="2+1"; meta_repl=3
-        else                           log_ec_default="";    row_ec_default="";    meta_repl=$replicas
+        if (( replicas >= 3 )); then meta_repl=3; else meta_repl=$replicas; fi
+        local _ec_default=""
+        if (( replicas == 4 )); then
+            _ec_default="3+1"
+        elif (( replicas >= 5 )); then
+            _ec_default="4+1"
         fi
+        log_ec_default="$_ec_default"
+        row_ec_default="$_ec_default"
 
         local log_ec row_ec
         case "${AUTUMN_EC_LOG:-}" in

@@ -851,6 +851,7 @@ struct InfoExtentView {
 #[derive(Serialize)]
 struct InfoStreamView {
     stream_id: u64,
+    replicates: u32,
     ec_data: u32,
     ec_parity: u32,
     extent_ids: Vec<u64>,
@@ -1124,13 +1125,27 @@ async fn main() -> Result<()> {
             let meta_replicates = parse_replication(&replication)?;
 
             // Per-stream (replicates, ec_data, ec_parity):
-            // - EC streams: replicates=K+M, ec_data=K, ec_parity=M.
             // - Replica streams: replicates=N, ec_data=N, ec_parity=0.
+            // - EC streams: replicates is the OPEN-EXTENT replica count
+            //   (= meta_replicates, typically 3), and (ec_data,
+            //   ec_parity) describes the POST-SEAL EC encoding (e.g.
+            //   4+1, 7+1). The two are independent — the
+            //   `ec_conversion_dispatch_loop` reads the sealed payload
+            //   from one of the open replicas and re-encodes it into
+            //   K+M shards, allocating any extra host slots beyond
+            //   `replicates` on the fly. So a 3-replica stream can be
+            //   converted to 4+1, 7+1, etc.
+            //
+            //   Pre-fix we sent `replicates=K+M`, forcing open extents
+            //   onto K+M nodes (each holding a full replica). The M
+            //   extra replicas got overwritten with parity bytes on
+            //   conversion anyway — pure waste — and the seal/EC race
+            //   blast radius was wider than necessary.
             let log_params = log_ec
-                .map(|(k, m)| (k + m, k, m))
+                .map(|(k, m)| (meta_replicates, k, m))
                 .unwrap_or((meta_replicates, meta_replicates, 0));
             let row_params = row_ec
-                .map(|(k, m)| (k + m, k, m))
+                .map(|(k, m)| (meta_replicates, k, m))
                 .unwrap_or((meta_replicates, meta_replicates, 0));
             let meta_params = (meta_replicates, meta_replicates, 0u32);
 
@@ -2309,12 +2324,24 @@ async fn main() -> Result<()> {
                 };
 
                 let streams_view: Vec<InfoStreamView> = streams_sorted.iter()
-                    .map(|(sid, s)| InfoStreamView {
-                        stream_id: *sid,
-                        ec_data: s.ec_data_shard,
-                        ec_parity: s.ec_parity_shard,
-                        extent_ids: s.extent_ids.clone(),
-                        total_size: stream_total(s, &extent_map),
+                    .map(|(sid, s)| {
+                        let r = if s.replicates > 0 {
+                            s.replicates
+                        } else {
+                            s.extent_ids.iter()
+                                .find_map(|eid| extent_map.get(eid)
+                                    .filter(|e| !e.ec_converted)
+                                    .map(|e| e.replicates.len() as u32))
+                                .unwrap_or(0)
+                        };
+                        InfoStreamView {
+                            stream_id: *sid,
+                            replicates: r,
+                            ec_data: s.ec_data_shard,
+                            ec_parity: s.ec_parity_shard,
+                            extent_ids: s.extent_ids.clone(),
+                            total_size: stream_total(s, &extent_map),
+                        }
                     })
                     .collect();
 
@@ -2430,8 +2457,25 @@ async fn main() -> Result<()> {
                     println!("\n=== Streams ===");
                     for (sid, s) in &streams_sorted {
                         let total = stream_total(s, &extent_map);
-                        println!("  stream {} ({}+{}): extents={:?}, total={}",
-                            sid, s.ec_data_shard, s.ec_parity_shard, s.extent_ids, human_size(total));
+                        // (replicates, ec_data, ec_parity) triple. For
+                        // legacy streams without `replicates` (default 0),
+                        // derive from a non-EC-converted extent.
+                        let r = if s.replicates > 0 {
+                            s.replicates
+                        } else {
+                            s.extent_ids.iter()
+                                .find_map(|eid| extent_map.get(eid)
+                                    .filter(|e| !e.ec_converted)
+                                    .map(|e| e.replicates.len() as u32))
+                                .unwrap_or(0)
+                        };
+                        let layout = if s.ec_parity_shard == 0 {
+                            format!("repl={}", r)
+                        } else {
+                            format!("repl={}, EC={}+{}", r, s.ec_data_shard, s.ec_parity_shard)
+                        };
+                        println!("  stream {} ({}): extents={:?}, total={}",
+                            sid, layout, s.extent_ids, human_size(total));
                     }
                 }
 

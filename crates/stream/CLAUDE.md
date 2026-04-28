@@ -464,7 +464,15 @@ sufficient (and cheaper than DashMap).
 
 5. **StreamClient is always held as `Rc<StreamClient>`** — constructors return `Rc<Self>` (via `Rc::new_cyclic`) so per-stream workers can hold `Weak<StreamClient>` for the removal-guard. Callers clone the `Rc` to share. Public API methods take `&self`, so `sc.append(...)` works transparently.
 
-6. **EC vs replication compatibility** — EC is a per-stream property. `log_stream` (value log with VP sub-range reads) must use replication (`parity_shard=0`). `row_stream` and `meta_stream` are suitable for EC since each SSTable/checkpoint is one append read back in full.
+6. **EC for all three streams (post-fix)** — EC is a per-stream property. All three streams (`log_stream`, `row_stream`, `meta_stream`) can be EC-converted on seal. Replication factor is fixed at **3** while open; EC default keeps `M=1` parity and grows `K = N - 1` capped at 4 (so N=4 → 3+1, N=5 → 4+1, N≥6 → 4+1; cap bounds RS decode cost). `log_stream`'s arbitrary VP `(extent, offset, length)` sub-range reads are handled by `ec_subrange_read`'s generalised N-shard parallel scatter — one `read_shard_from_addr` per touched data shard, stitched in order; single- and two-shard cases fall out as plan-of-1 / plan-of-2 special cases. **Bug history (2026-04-27 production crash)**: with log_stream EC'd by default, three independent bugs combined to crash PS:
+    - `cluster.sh` defaulted log_stream EC to a fixed 3+1 / 2+1 shape regardless of N — fine semantically, but exposed the next two bugs.
+    - `ec_subrange_read`'s "two-shard fast path" only checked `end_shard < data_shards`. On K=3, a 64 MiB GC chunk read (start_shard=0, end_shard=2) entered this branch and joined shard 0 + shard 2's prefix while silently skipping shard 1. The server's CODE_OK-with-short-payload behaviour produced a buffer of the right total length but with the middle ~15 MiB replaced by shard 2's prefix → GC's record-stream parser surfaced `trailing bytes did not form a complete record`.
+    - `handle_stream_alloc_extent` had no idempotency guard: when a writer's soft-error retry called `alloc_new_extent(stream_id, 0)` on an *already-sealed* tail (post-EC), the manager re-ran the seal block — re-queried commit_length on each replica (which after `write_shard_local` returned only `shard_size`), took the min, and CLOBBERED `tail.sealed_length` from the original payload size down to `shard_size`. Existing VPs in `[shard_size, original_payload_len)` were now past sealed_length, and `ec_read_full_and_slice` panicked the partition thread with `range start index N out of range for slice of length L`.
+
+    Fixes:
+    - cluster.sh: log + row default to `3+1` (N=4) / `4+1` (N≥5), with `M=1` parity, `K` capped at 4.
+    - `ec_subrange_read` rewritten as generalised N-shard parallel scatter; out-of-range offset (`start_shard >= data_shards`) routes to `ec_read_full_and_slice` whose extracted `ec_slice_decoded` helper returns `Err` (not panic) on `offset > full_payload.len()`. Saturating-sub on `read_len` prevents unsigned wrap. Regression tests in `mod ec_slice_tests` (`client.rs`).
+    - `handle_stream_alloc_extent` (manager): if `tail.sealed_length > 0`, skip the entire seal block (no commit_length re-query, no overwrite of `sealed_length / eversion / avali`). New-tail allocation still proceeds. This is the load-bearing fix: it preserves the manager's seal-time `sealed_length` against post-EC re-seal corruption.
 
 7. **EC offset semantics** — In EC mode, `AppendResult.offset/end` are shard-level byte offsets. Each shard has `shard_size(payload_len, data_shards)` bytes. Upper layers treat these as opaque — they pass them unchanged to `read_bytes_from_extent`. The EC read path handles the decode transparently.
 
@@ -483,28 +491,88 @@ sufficient (and cheaper than DashMap).
     - `file_pwrite_chunked` (splits via `Bytes::split_to`, O(1) no-copy) — used by `run_recovery_task`, `handle_re_avali`, `write_shard_local`
     Both fast-path the common case: single syscall when payload ≤ 256 MiB; only loop when larger. Any new full-extent local-file read or write **must** use these helpers — never call `file_pread`/`file_pwrite` directly with a `sealed_length`-sized buffer.
 
-14. **Read-side eversion freshness after EC conversion (F116)** — The
-    manager flips a sealed extent to EC by (a) sending `EXT_MSG_CONVERT_TO_EC`
-    with the new `eversion` field, then (b) `apply_ec_conversion_done`
-    rewriting `replicates` / `parity` and assigning the same eversion to
-    etcd. Every target node bumps its own `entry.eversion` from inside
-    `write_shard_local`, so the manager and all shard hosts agree on the
-    post-EC eversion the moment the coordinator returns OK.
-    `StreamClient` passes its **cached** `ex.eversion` in every
-    `ReadBytesReq` (formerly hard-coded to 0). When a stale-cache client
-    reads an EC-converted extent, the server returns
-    `CODE_EVERSION_MISMATCH` (instead of letting the read silently scrape
-    bytes from a shrunken shard file). The client side surfaces this as a
-    private `EversionStale` `anyhow` sentinel; the top-level
-    `read_bytes_from_extent` runs a 2-attempt loop that calls
-    `invalidate_extent_cache(extent_id)` and refetches `ExtentInfo` from
-    the manager once. This closes the only known stale-`extent_info_cache`
-    window and replaces a multi-second per-replica failover-timeout
-    burndown with one extra manager round-trip on the first read after
-    conversion. `read_replicated_with_failover` and `ec_subrange_read`
-    both fail-fast on `EversionStale` rather than walking the remaining
+14. **Read-side eversion freshness after EC conversion (F116 + F119-C)**
+    — The manager flips a sealed extent to EC by (a) sending
+    `EXT_MSG_CONVERT_TO_EC` with the new `eversion` field, then (b)
+    `apply_ec_conversion_done` rewriting `replicates` / `parity` and
+    assigning the same eversion to etcd. Every target node bumps its
+    own `entry.eversion` from inside `write_shard_local`, so the
+    manager and all shard hosts agree on the post-EC eversion the
+    moment the coordinator returns OK. `StreamClient` passes its
+    **cached** `ex.eversion` in every `ReadBytesReq` (formerly
+    hard-coded to 0). When a stale-cache client reads an EC-converted
+    extent, the server returns `CODE_EVERSION_MISMATCH` (instead of
+    letting the read silently scrape bytes from a shrunken shard
+    file). The client side surfaces this as a private `EversionStale`
+    `anyhow` sentinel; the top-level `read_bytes_from_extent` runs a
+    2-attempt loop that calls `invalidate_extent_cache(extent_id)` and
+    refetches `ExtentInfo` from the manager once.
+    `read_replicated_with_failover` and `ec_subrange_read` both
+    fail-fast on `EversionStale` rather than walking the remaining
     stale replicas — every replica reports the same mismatch by
     construction.
+
+    **F119-C tightening — closes the eversion=0 silent-skip loophole.**
+    Pre-F119-C the server-side check was
+    `if req.eversion > 0 && req.eversion < ev`. The `> 0` clause was
+    documented as a "pass 0 to skip" sentinel, but it silently let
+    through a stale-cached `eversion=0` populated by
+    `load_stream_tail` / `alloc_new_extent_once` while the extent was
+    still open (eversion=0 in the cache, even after manager+server
+    bump it past 0 via split + EC conversion). Concrete bug: a 14 MiB
+    log_stream value at offset 398 MiB inside an extent EC-converted
+    to 3+1 (shard_size ≈ 402 MiB) returned `min(14 MiB, 402 MiB - 398
+    MiB) = 3.9 MiB` from data shard 0; the client's
+    `read_replicated_with_failover` treated it as success and
+    surfaced it as `logStream value short: need 14456954 bytes, got
+    3909555`. The fix is enforced in **both** `handle_read_bytes`
+    (the dispatch fallback) and `build_read_future` (the production
+    batched path): drop the `> 0` clause; reject any `req.eversion <
+    ev` with a CODE_EVERSION_MISMATCH **response** (not a frame-level
+    error — the batched path previously emitted
+    `FailedPrecondition`, which never reached the client's
+    `is_eversion_stale` retry detection). The client-side 2-attempt
+    retry loop then evicts the cache, refetches fresh `ExtentInfo`,
+    and the second attempt routes through `ec_subrange_read`.
+
+    **Invariant:** `entry.eversion` defaults to 1 on alloc
+    (matches `MgrExtentInfo { eversion: 1, .. }`), so any
+    `req.eversion = 0` is by construction stale. The only callers
+    that pass 0 in production are bench/test fixtures that hand-roll
+    fresh ExtentEntry state with `entry.eversion = 0`.
+
+    **F119-D: convert_to_ec must be idempotent on the coordinator.**
+    A separate corruption path (root cause: dispatch-loop candidates
+    list contained one extent_id twice when the extent was CoW-shared
+    across two streams post-split) caused
+    `EXT_MSG_CONVERT_TO_EC` to fire twice on the same extent. The
+    first call correctly encoded the original payload into K shards
+    of `shard_size(original, K)` bytes. `write_shard_local` then
+    shrunk every replica's local file to that shard size. The second
+    call on the coordinator re-entered `handle_convert_to_ec`, found
+    `entry.sealed_length > 0` (from the first call), skipped the
+    "applied seal from manager" branch, read `entry.sealed_length`
+    bytes (= the K=1 shard) from local, and re-encoded **that** as if
+    it were the original payload — producing sub-shards of
+    `shard_size(shard_size(original, K), K) ≈ original / K²` bytes.
+    Manager state (sealed_length, ec_converted, eversion) didn't
+    change — `apply_ec_conversion_done` is idempotent for those
+    fields — so reads silently scraped sub-shard bytes. Surfaced as
+    `logStream value short: need 11979455 bytes, got 1423859` on a
+    cross-shard VP read, and as `ec_read_full_and_slice: offset 3951
+    past decoded payload len 2636 (manager sealed_length=7902)` on
+    SST replay during partition open after restart.
+
+    Fix layered at two points:
+    - Manager (`crates/manager/src/recovery.rs`
+      `ec_conversion_dispatch_loop`): dedup candidates by
+      `extent_id` via `HashSet`. The primary fix.
+    - Coordinator (`handle_convert_to_ec`): defense-in-depth — if
+      `entry.eversion >= req.eversion && sealed_length > 0 &&
+      entry.avali > 0`, the extent is already EC-converted at this
+      eversion. Return `CODE_OK` without re-encoding. Any future
+      bug that re-dispatches a converted extent then becomes a
+      no-op instead of a corruption.
 
 16. **EC dispatch keys on `ExtentInfo.ec_converted`, NEVER on
     `parity.is_empty()` (F118)** — The manager pre-fills `parity` for

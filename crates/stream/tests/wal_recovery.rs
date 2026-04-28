@@ -160,8 +160,10 @@ async fn wal_replay_multiple_appends() {
     assert_eq!(cl.code, CODE_OK);
     assert_eq!(cl.length, total_len, "all chunks should be replayed");
 
-    // Read back and verify content
-    let read = conn2.read_bytes(extent_id, 0, 0, total_len).await;
+    // Read back and verify content. Local extent default eversion is 1
+    // (extent_node.rs ExtentEntry initialiser), matching manager defaults
+    // — passing 0 here would now be rejected as stale (F119-C tightening).
+    let read = conn2.read_bytes(extent_id, 1, 0, total_len).await;
     assert_eq!(read.code, CODE_OK);
     let expected: Vec<u8> = chunks.into_iter().flatten().collect();
     assert_eq!(read.payload.as_ref(), expected.as_slice(), "read back should match original data");

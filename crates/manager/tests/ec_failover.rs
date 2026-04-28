@@ -119,12 +119,15 @@ fn ec_2_1_failover_and_recovery() {
         register_node(&mgr, &n3_addr.to_string(), "disk-3").await;
         register_node(&mgr, &n4_addr.to_string(), "disk-4").await;
 
-        // Create a 3-replica stream with EC policy 2+1.
+        // Create a 2-replica EC 2+1 stream. `replicates` is the
+        // open-extent replica count = K = ec_data; the M=1 parity
+        // host is allocated by the EC conversion dispatch loop after
+        // seal (4 nodes total in this test, so plenty of headroom).
         let resp = mgr
             .call(
                 MSG_CREATE_STREAM,
                 rkyv_encode(&CreateStreamReq {
-                    replicates: 3,
+                    replicates: 2,
                     ec_data_shard: 2,
                     ec_parity_shard: 1,
                 }),
