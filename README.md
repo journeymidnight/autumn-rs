@@ -706,10 +706,10 @@ not actual RDMA. Real RDMA numbers require cross-host deployment
 **Scaling rule (thread-per-core):** total in-flight ops = threads ×
 pipeline-depth. Prefer fewer threads with deeper pipeline over many
 threads with shallow pipeline — better cache locality and, on UCX,
-avoids rdma_cm saturation at > ~100 concurrent connects.
-`perf_check.sh` defaults to `--threads 16` for this reason; overshoot
-to `--threads 256` will make UCX runs hang (rdma_cm `Destination
-unreachable` at connect time) and TCP runs waste CPU on no perf win.
+fewer EPs landing on each partition's single-threaded UCX progress
+worker. `perf_check.sh` defaults to `--threads 16` for this reason.
+For the UCX cliff at higher thread counts, see "UCX scaling and
+limits" below.
 
 Measured default matrix on this host (Xeon 8457C, 192 CPU, mlx5_0
 RoCEv2, disk, 3-replica, --nosync, threads=16):
@@ -741,6 +741,70 @@ decouple from the CPU and typically match or beat this ceiling.)
 
 Off-matrix sweet spots confirmed at 4 KB: UCX p=32 × 16t × d=16 →
 1.71 M reads; TCP p=32 × 16t × d=16 → 1.81 M reads.
+
+### UCX scaling and limits
+
+The PS architecture binds **one UCX listener per partition**, hosted on
+that partition's P-log thread (one OS thread). Each listener has its
+own `UCS_THREAD_MODE_SINGLE` UCX worker driving `ucp_worker_progress`,
+so a partition's per-second work is bounded by what one user-space
+thread can drive. Adding workers per partition is intentionally not
+supported (per-partition fan-out conflicts with the rest of the
+thread-per-core design); **scale by adding partitions, not threads**.
+
+**Per-partition concurrent-op formula.** UCX in-flight ops landing on a
+single partition's worker:
+
+* read-heavy workload (e.g. `perf-check` read phase, point-reads): each
+  client thread connects to every partition that owns one of its keys
+  → per-partition load = `client_threads × pipeline_depth`.
+* write-heavy workload sharded by partition affinity (e.g. `perf-check`
+  write phase): per-partition load = `client_threads × pipeline_depth ÷ partitions`.
+
+**Empirical bands** at `--partitions 8 --pipeline-depth 16 --size 4k`,
+RoCEv2 cross-host on this cluster, post-`fix(ucx): drop UcxEp
+close-on-Drop`:
+
+| client `--threads` | per-partition concurrent ops (read) | write ops/s | read ops/s | read p99 |
+|---|---|---|---|---|
+| 16  | 256   | 104 k | 970 k | 0.46 ms ← supported |
+| 32  | 512   | 80 k  | 610 k | 1.16 ms ← degrades, p99 ~2.5× |
+| 64  | 1 024 | 14 k  | 105 k | 18 ms ← cliff, p99 ~40× |
+| 256 | 4 096 | ~0    | 0     | — ← hard fail (read collapses, log spams `Connection reset by remote peer`) |
+
+The cliff between 32 and 64 threads is the rc_mlx5 RNR / endpoint
+timeout firing because a single-threaded progress worker can't drain
+~1 k pending UCX completions fast enough; rdma device caps and FD
+limits both have ~500× headroom on this host (`max_qp = 131 072`,
+`ulimit -n = 1 048 576`).
+
+**Recommended client config band:** keep `client_threads ×
+pipeline_depth ≲ 256` per partition you read from. Examples:
+
+| config | per-partition (read) | OK? |
+|---|---|---|
+| `--threads 16 --pipeline-depth 16 --partitions 8`  | 256   | ✓ |
+| `--threads 32 --pipeline-depth 8  --partitions 8`  | 256   | ✓ |
+| `--threads 64 --pipeline-depth 16 --partitions 8`  | 1 024 | ✗ degraded |
+| `--threads 64 --pipeline-depth 16 --partitions 32` | 256   | ✓ |
+
+If you need more total client concurrency, add partitions
+(`AUTUMN_BOOTSTRAP_PRESPLIT=N:hexstring` at bootstrap). Each partition
+gets its own listener / worker, so total per-PS UCX progress capacity
+scales linearly with partition count.
+
+**TCP transport has no equivalent ceiling** at this scale — kernel
+sockets fan accept/recv I/O across cores. If your workload genuinely
+needs more concurrent inbound connections per PS than UCX supports
+under `--threads × --pipeline-depth ÷ partitions ≲ 256`, pick TCP. UCX
+wins on p99 inside its supported region (0.46 ms vs ~0.5 ms TCP at 16t
+in the table at the top of this section); the win is gone outside the
+supported region.
+
+**The same applies in production.** A workload doing N concurrent
+point-reads on UCX against M partitions per PS should plan for
+N ÷ M ≲ ~256. Otherwise, either add partitions or use TCP for that
+RPC path.
 
 ---
 

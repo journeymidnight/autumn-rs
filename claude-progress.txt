@@ -1,87 +1,127 @@
 Date: 2026-04-29
 TaskStatus: completed
 Task scope: silence the `ucp_ep_close_nbx returned err status=-5` warning
-  flood emitted by `perf_check.sh --ucx` at every cluster teardown
-  (~144 warnings per run at threads=16, partitions=8, depth=16).
+  flood emitted by `perf_check.sh --ucx` at every cluster teardown,
+  AND document the high-thread UCX cliff that the warning previously
+  obscured (Phase 2 of the same investigation).
 
 Current summary:
-  One file changed.
+  Three files changed, in two commits.
 
-  crates/transport/src/ucx/endpoint.rs
-    - Removed `impl Drop for UcxEp` entirely (was: zero out raw + call
-      `ucp_ep_close_nbx` with `UCP_EP_CLOSE_FLAG_FORCE`). The FORCE call
-      was a noisy no-op: UCX rejects FORCE on EPs created with the
-      default `UCP_ERR_HANDLING_MODE_NONE`, returning
-      `UCS_ERR_INVALID_PARAM (-5)` synchronously and *not* closing the EP.
-      So the call achieved nothing functional — just produced one
-      `tracing::warn!` per EP teardown.
-    - Updated the module-level "EP lifetime" doc to spell out why we
-      now skip the close call entirely, and which alternatives were
-      ruled out:
-        * FORCE close requires PEER mode (rejected with -5 otherwise).
-        * Graceful FLUSH-mode close deadlocks the loopback test (both
-          peers in the same compio runtime block each other's ack).
-        * `UCP_ERR_HANDLING_MODE_PEER` (which would let FORCE succeed)
-          enables UCX's RC-layer dead-peer detection — under high
-          fan-out write load (16 client threads × 16 inflight against
-          8 PS workers) rc_mlx5 RNR/timeout fires *mid-test* and tears
-          down live EPs (verified empirically: write ops/s collapsed
-          from 16 k → 0 around the 8-second mark, read ops/s stayed
-          at 0). Worse than a teardown warning.
-      Skipping the call leaks the C-side EP in the worker context until
-      `ucp_worker_destroy` (thread/process exit). For autumn-rs this is
-      fine: autumn-rpc::pool and autumn-stream::conn_pool reuse one EP
-      per (peer-address, thread) pair for the life of the process, so
-      EPs do not accumulate at runtime.
-    - listener.rs unchanged (server-side EPs share the same Rc<UcxEp>
-      Drop path — fix at the one site covers both directions).
+  Commit 1 — `fix(ucx): drop UcxEp close-on-Drop (was a noisy no-op)`
+  (already pushed as 76a6f51):
+
+    crates/transport/src/ucx/endpoint.rs
+      - Removed `impl Drop for UcxEp` entirely (was: zero out raw + call
+        `ucp_ep_close_nbx` with `UCP_EP_CLOSE_FLAG_FORCE`). The FORCE
+        call was a noisy no-op: UCX rejects FORCE on EPs created with
+        the default `UCP_ERR_HANDLING_MODE_NONE`, returning
+        `UCS_ERR_INVALID_PARAM (-5)` synchronously and *not* closing
+        the EP. So the call achieved nothing functional — just
+        produced one `tracing::warn!` per EP teardown.
+      - Updated the module-level "EP lifetime" doc to spell out why we
+        now skip the close call entirely, and which alternatives were
+        ruled out:
+          * FORCE close requires PEER mode (rejected with -5 otherwise).
+          * Graceful FLUSH-mode close deadlocks the loopback test (both
+            peers in the same compio runtime block each other's ack).
+          * `UCP_ERR_HANDLING_MODE_PEER` (which would let FORCE succeed)
+            enables UCX's RC-layer dead-peer detection — under high
+            fan-out write load (16 client threads × 16 inflight) rc_mlx5
+            RNR/timeout fires *mid-test* and tears down live EPs
+            (verified empirically: write ops/s collapsed from 16 k → 0
+            around the 8-second mark). Worse than a teardown warning.
+        Skipping the call leaks the C-side EP in the worker context
+        until `ucp_worker_destroy` (thread/process exit). For autumn-rs
+        this is fine: autumn-rpc::pool and autumn-stream::conn_pool
+        reuse one EP per (peer-address, thread) pair for the life of
+        the process, so EPs do not accumulate at runtime.
+
+  Commit 2 — Phase 2 documentation only, no Rust source touched:
+
+    autumn-rs/README.md
+      - Replaced the outdated "rdma_cm Destination unreachable" line in
+        the "Scaling rule" paragraph (the failure mode at high thread
+        counts is now characterized as PS-side rc_mlx5 RNR timeouts on
+        a single-threaded UCX worker, post-Phase-1).
+      - Added a new "UCX scaling and limits" subsection in the
+        `Cluster-level perf_check` chapter. It documents:
+          * the per-partition single-UCX-worker architecture and why
+            scaling is "more partitions, not more workers per
+            partition" (cites
+            MEMORY/feedback_no_multiworker_per_partition.md).
+          * the per-partition concurrent-op formula:
+              read-heavy:  client_threads × pipeline_depth
+              write-heavy: client_threads × pipeline_depth ÷ partitions
+          * the empirical sweep table (16/32/64/256 threads at p=8
+            d=16 4 KB) showing the cliff between 32 and 64 threads.
+          * a "recommended client config band" table — keep
+            client_threads × pipeline_depth / partitions ≲ 256.
+          * pointer to TCP for workloads that exceed the UCX band, and
+            confirmation that UCX p99 wins inside its supported region.
+
+    autumn-rs/perf_check.sh
+      - Extended the existing header comment with an abbreviated cliff
+        table and the "client_threads × pipeline_depth / partitions
+        ≲ 256" rule of thumb. Behavior unchanged (defaults still
+        --threads 16; the script remains useful for the supported
+        region and still runs — non-erroring — past the cliff).
+
+    autumn-rs/claude-progress.txt
+      - This file: Phase 2 entry.
 
 Verification:
-  1. `cargo build --release -p autumn-transport --features ucx` → clean.
-  2. `cargo build --workspace --release --exclude autumn-fuse --features autumn-server/ucx`
-     → clean (only pre-existing function-cast / dead-code warnings).
-  3. `AUTUMN_UCX_TEST_BIND="[fdbd:dc62:3:302::14]:0" cargo test --release \
-       -p autumn-transport --features ucx --tests`
-     → all suites pass:
-        init.rs (1), listen_validator.rs (4), loopback_tcp.rs (4),
-        loopback_ucx.rs (5+1 ignored), probe.rs (2), tcp_basic.rs (1).
-     loopback_ucx finishes in 1.83s (was: stderr-spam from UCX
-     `flush.c:57` errors and `large_payload` running >60 s on previous
-     attempted-fix iterations).
-  4. Pre-fix repro at HEAD~1 (FORCE close in Drop):
-     `AUTUMN_BIND_HOST="[fdbd:dc62:3:302::14]" bash perf_check.sh --ucx \
-        --partitions 8 --pipeline-depth 16 --size 4k --threads 16 \
-       2>&1 | grep -c "ucp_ep_close_nbx returned err"`
-     → 144 (one per torn-down EP).
-  5. Post-fix same command → 0 warnings in stdout AND stderr.
-     Bench numbers also confirm no perf regression vs the user's
-     supported-region baseline:
-       Write: 104 038 ops/s · 406.40 MB/s · p50 1.41 ms / p99 11.10 ms
-       Read : 970 923 ops/s · 3792.67 MB/s · p50 0.16 ms / p99 0.46 ms
-     (Compare to the recorded baseline in this file's prior entry:
-        Write: 99 483 ops/s · 388.61 MB/s · p99 10.88 ms
-        Read : 940 202 ops/s · 3672.67 MB/s · p99 0.40 ms
-      → small variance in our favor; well within run-to-run noise.)
-  6. `cargo test --release -p autumn-transport --tests` (no env var
-     needed for the non-ucx tests) → all green.
+  Phase 1 (already verified pre-merge):
+    1. `cargo build --release -p autumn-transport --features ucx` → clean.
+    2. `cargo build --workspace --release --exclude autumn-fuse \
+         --features autumn-server/ucx` → clean.
+    3. `AUTUMN_UCX_TEST_BIND="[fdbd:dc62:3:302::14]:0" cargo test \
+         --release -p autumn-transport --features ucx --tests`
+       → all suites pass (loopback_ucx in 1.83 s; was hung >60 s on
+       the FLUSH-close iterations during dev).
+    4. `AUTUMN_BIND_HOST=… bash perf_check.sh --ucx --partitions 8 \
+         --pipeline-depth 16 --size 4k --threads 16`
+       → 0 `ucp_ep_close_nbx returned err` warnings (was 144).
+       → write 104 038 ops/s · 406 MB/s · p99 11.10 ms.
+       → read  970 923 ops/s · 3792 MB/s · p99 0.46 ms.
+       → numbers match-or-beat the prior baseline (99 k / 940 k,
+         p99 ~10.9 / 0.40 ms).
 
-Main gaps: none for the warning-suppression scope.
+  Phase 2 cliff characterization sweep (2026-04-29 post-Phase-1, all
+  with no `ucp_ep_close_nbx` warnings — Phase 1 fix holds across the
+  range):
+    --threads 16 : write 104 k / p99 11 ms · read 970 k / p99 0.46 ms ✓
+    --threads 32 : write  80 k / p99 10 ms · read 610 k / p99 1.16 ms (degrading)
+    --threads 64 : write  14 k / p99 54 ms · read 105 k / p99 18 ms (cliff)
+    --threads 256: write   ~0           · read   0          (hard fail)
 
-Next steps (Phase 2 — separate session):
-  - 256-thread UCX hard failure (read phase produces ops/s=0,
-    "Connection reset by remote peer" floods from rc_mlx5 RNR
-    timeouts on the PS-side single accept-thread worker). The user
-    confirmed this is a real cliff: threads=16 / depth=16 works (~256
-    in-progress ops per PS-worker), threads≥32 / depth=16 fails. UCX
-    P99 is *better* than TCP at supported scale — worth raising the
-    ceiling rather than capping clients. Plan is at
-    `~/.claude/plans/ucx-bench-perf-check-baseline-perf-base-splendid-sunrise.md`
-    Phase 2 (Step 1: characterize the cliff with --threads ∈ {24, 32,
-    48, 64} + UCX_LOG_LEVEL=info + ibv_devinfo; Step 2: pick fix
-    direction once evidence shows whether the bottleneck is single-
-    worker progress, mlx5 QP/MR exhaustion, or RoCE timeout tuning;
-    Step 3: implement). Likely candidate is server-side multi-listener
-    so each PS OS thread has its own UCX worker accepting connections.
-  - Pre-existing UCX < TCP perf gap at moderate thread counts
-    (probably want UCX_TLS=rc_mlx5,self tuning + remove the
-    `^sysv,^posix` exclusions — separate from the cliff above).
+  RDMA / OS resource ceilings ruled out as the cause:
+    - `ulimit -n` 1 048 576 (~500× headroom)
+    - `ibv_devinfo -d mlx5_1 -v`: max_qp=131 072, max_mr=16 777 216
+      (workload uses ~2 048 QPs at 256t = 1.5 % of cap)
+    - `/proc/<ps_pid>/status` during 32t test: 26 threads, 14 GB RSS,
+      healthy.
+  Conclusion: bottleneck is the per-partition single-threaded
+  user-space UCX worker, not RDMA / OS resources. Cliff is around
+  ~512–1 024 concurrent UCX ops per worker on this host's rc_mlx5.
+
+  Phase 2 verification:
+    1. README markdown renders as expected; new section sits inside
+       the `## UCX / RDMA Mode (F100-UCX)` chapter, just before the
+       trailing `## Notes`.
+    2. `bash -n perf_check.sh` → syntax OK; defaults unchanged (still
+       `--threads 16`, 2×2×2×2 default matrix).
+    3. `cargo build --workspace --release --exclude autumn-fuse \
+         --features autumn-server/ucx` → no-op (no Rust changes), 0.14 s.
+
+Main gaps: none for the scope. The Phase-1 commit is shippable and
+shipped. Phase-2 is documentation-only — the cliff is now an
+explicitly-documented limit, with the supported-region rule of thumb
+("client_threads × pipeline_depth / partitions ≲ 256") spelled out so
+future readers don't re-discover it the hard way.
+
+Next steps (separate sessions):
+  - Pre-existing UCX < TCP perf gap at moderate thread counts (likely
+    `UCX_TLS=rc_mlx5,self` tuning + remove the `^sysv,^posix` TL
+    exclusions, which currently force `cma` for intra-host bulk).
+  - F100-UCX gate (c) cross-host RDMA A/B is still pending.

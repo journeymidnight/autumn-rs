@@ -11,13 +11,29 @@
 # Client concurrency: `--threads 16` by default (override with --threads N).
 # Total in-flight = threads × pipeline-depth. Keep threads low (≤ ~32) and
 # scale via pipeline-depth — this is thread-per-core-correct on the client
-# side AND avoids UCX's rdma_cm saturation at > ~100 concurrent connects.
+# side AND keeps each partition's single-threaded UCX worker on the PS
+# in its supported region (see "UCX cliff" note below).
 # At 16t × d=8 = 128 in-flight the 2×2×2×2 matrix reaches:
 #   TCP p=8 × 16t × d=8 × 4 KB → 142 k write / 1.11 M read
 #   UCX p=8 × 16t × d=8 × 4 KB → 129 k write / 764 k read
 # 8 MB payload is where UCX rc_mlx5 zero-copy starts beating TCP loopback
 # memcpy — the rndv-get-zcopy handshake gets amortized over a much larger
 # DMA; at 4 KB it's pure overhead (see F100-UCX §12).
+#
+# UCX cliff (post fix(ucx): drop UcxEp close-on-Drop, 2026-04-29). Each PS
+# partition has a single-threaded UCX worker; per-partition concurrent
+# in-flight ops = client-threads × pipeline-depth ÷ partitions for write,
+# = client-threads × pipeline-depth for read (point-reads fan out to
+# every partition). Empirical at p=8 d=16 4 KB:
+#   --threads 16  → 256 ops/p → write 104 k · read 970 k · read p99 0.46 ms ✓
+#   --threads 32  → 512 ops/p → write  80 k · read 610 k · read p99 1.16 ms (degrading)
+#   --threads 64  → 1 024 ops/p → write 14 k · read 105 k · read p99 18 ms ✗ cliff
+#   --threads 256 → 4 096 ops/p → write   ~0 · read     0 · ✗ hard fail
+# Rule of thumb: keep client-threads × pipeline-depth / partitions ≲ 256.
+# Need more total concurrency? Add partitions, not threads — see README
+# "UCX scaling and limits" for the full discussion. Numbers above
+# `--threads 32` at `--pipeline-depth 16 --partitions 8` are outside the
+# UCX supported region and should not be used as performance signal.
 #
 # Usage:
 #   ./perf_check.sh                       # default 2×2×2×2 matrix on disk
