@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use autumn_common::cpu_pin::{affinity_set, pick_cpu_for_ord};
 use autumn_common::metrics::{duration_to_ns, ns_to_ms};
 use autumn_rpc::manager_rpc::{self, MgrRange as Range, rkyv_encode, rkyv_decode};
 use autumn_rpc::partition_rpc::{self, *, TableLocations, SstLocation};
@@ -150,6 +151,12 @@ pub(crate) fn shutdown_timeout_ms() -> u64 {
             .unwrap_or(60_000)
     })
 }
+
+// CPU affinity policy lives in `autumn_common::cpu_pin`. Both OS threads
+// owned by a partition (P-log `part-{id}` and P-bulk `part-{id}-bulk`)
+// pin to the SAME core — P-bulk is mostly idle during P-log's busy
+// windows (its work is syscall + 3-replica network wait on a 128 MB SST
+// upload), so sharing a core is fine and keeps "one partition = one core".
 
 const COMPACT_RATIO: f64 = 0.5;
 const HEAD_RATIO: f64 = 0.3;
@@ -1110,6 +1117,9 @@ impl PartitionServer {
             anyhow!("exhausted partition port ordinal space (u16 overflow)")
         })?;
         self.next_port_ord.set(ord);
+        // ord is 1-based; cpu pool indexing is 0-based. Both P-log (`part-N`)
+        // and P-bulk (`part-N-bulk`) of this partition will pin to `cpu`.
+        let cpu = pick_cpu_for_ord((ord as usize).saturating_sub(1));
         let base_port = self.base_port.get();
         let listen_port = base_port.checked_add(ord).ok_or_else(|| {
             anyhow!(
@@ -1150,7 +1160,11 @@ impl PartitionServer {
         let join = std::thread::Builder::new()
             .name(format!("part-{part_id}"))
             .spawn(move || {
-                let rt = compio::runtime::Runtime::new().expect("create compio runtime");
+                let rt = compio::runtime::RuntimeBuilder::new()
+                    .thread_affinity(affinity_set(cpu))
+                    .build()
+                    .expect("create compio runtime");
+                tracing::info!(part_id, ?cpu, "P-log thread runtime ready");
                 rt.block_on(async move {
                     if let Err(e) = partition_thread_main(
                         part_id,
@@ -1168,6 +1182,7 @@ impl PartitionServer {
                         shutdown_rx,
                         drain_rx,
                         compact_gate_for_thread,
+                        cpu,
                     )
                     .await
                     {
@@ -1939,6 +1954,7 @@ async fn partition_thread_main(
     shutdown_rx: oneshot::Receiver<()>,
     drain_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
     compact_gate: std::sync::Arc<CompactionGate>,
+    cpu: Option<usize>,
 ) -> Result<()> {
     // F099-J: create the same-thread ps-conn ↔ merged_partition_loop
     // channel. Both endpoints live on THIS compio runtime, so sends and
@@ -2010,6 +2026,7 @@ async fn partition_thread_main(
         owner_key.clone(),
         revision,
         flush_req_rx,
+        cpu,
     );
     let flush_req_tx_part = match &bulk_thread_spawn {
         Ok(_) => Some(flush_req_tx.clone()),
@@ -3181,17 +3198,22 @@ fn spawn_bulk_thread(
     owner_key: String,
     revision: i64,
     flush_req_rx: mpsc::Receiver<FlushReq>,
+    cpu: Option<usize>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name(format!("part-{part_id}-bulk"))
         .spawn(move || {
-            let rt = match compio::runtime::Runtime::new() {
+            let rt = match compio::runtime::RuntimeBuilder::new()
+                .thread_affinity(affinity_set(cpu))
+                .build()
+            {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(part_id, error = %e, "bulk thread runtime init failed");
                     return;
                 }
             };
+            tracing::info!(part_id, ?cpu, "P-bulk thread runtime ready");
             rt.block_on(async move {
                 let pool = Rc::new(ConnPool::new());
                 let bulk_sc = match StreamClient::new_with_revision(

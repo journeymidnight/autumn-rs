@@ -25,6 +25,7 @@ anyhow.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+autumn-common = { path = "../common" }
 autumn-manager = { path = "../manager" }
 autumn-stream = { path = "../stream" }
 autumn-partition-server = { path = "../partition-server" }

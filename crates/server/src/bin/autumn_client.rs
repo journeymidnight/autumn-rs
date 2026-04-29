@@ -1542,7 +1542,12 @@ async fn main() -> Result<()> {
                 let value_template = (0..value_size).map(|i| (i % 256) as u8).collect::<Vec<u8>>();
 
                 let handle = std::thread::spawn(move || {
-                    compio::runtime::Runtime::new().unwrap().block_on(async {
+                    let cpu = autumn_common::pick_cpu_for_ord(tid);
+                    compio::runtime::RuntimeBuilder::new()
+                        .thread_affinity(autumn_common::affinity_set(cpu))
+                        .build()
+                        .unwrap()
+                        .block_on(async {
                         let ps = match RpcClient::connect(ps_addr).await {
                             Ok(c) => c,
                             Err(e) => {
@@ -1707,7 +1712,12 @@ async fn main() -> Result<()> {
                 let total_errors = Arc::clone(&total_errors);
 
                 let handle = std::thread::spawn(move || {
-                    compio::runtime::Runtime::new().unwrap().block_on(async {
+                    let cpu = autumn_common::pick_cpu_for_ord(tid);
+                    compio::runtime::RuntimeBuilder::new()
+                        .thread_affinity(autumn_common::affinity_set(cpu))
+                        .build()
+                        .unwrap()
+                        .block_on(async {
                         let mut cc = match ClusterClient::connect(&manager_addr).await {
                             Ok(c) => c,
                             Err(e) => {
@@ -1878,7 +1888,12 @@ async fn main() -> Result<()> {
 
                 let max_depth = pipeline_depth;
                 let handle = std::thread::spawn(move || {
-                    compio::runtime::Runtime::new().unwrap().block_on(async {
+                    let cpu = autumn_common::pick_cpu_for_ord(tid);
+                    compio::runtime::RuntimeBuilder::new()
+                        .thread_affinity(autumn_common::affinity_set(cpu))
+                        .build()
+                        .unwrap()
+                        .block_on(async {
                         use futures::stream::{FuturesUnordered, StreamExt};
                         let ps = match RpcClient::connect(ps_addr).await {
                             Ok(c) => c,
@@ -2000,7 +2015,12 @@ async fn main() -> Result<()> {
 
                 let max_depth = pipeline_depth;
                 let handle = std::thread::spawn(move || {
-                    compio::runtime::Runtime::new().unwrap().block_on(async {
+                    let cpu = autumn_common::pick_cpu_for_ord(tid);
+                    compio::runtime::RuntimeBuilder::new()
+                        .thread_affinity(autumn_common::affinity_set(cpu))
+                        .build()
+                        .unwrap()
+                        .block_on(async {
                         use futures::stream::{FuturesUnordered, StreamExt};
                         // Per-thread RpcClient connection cache keyed by ps_addr.
                         let mut conns: std::collections::HashMap<SocketAddr, Rc<RpcClient>> =

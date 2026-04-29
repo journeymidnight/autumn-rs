@@ -1,144 +1,113 @@
 Date: 2026-04-29
 TaskStatus: completed
-Task scope: silence the `ucp_ep_close_nbx returned err status=-5` warning
-  flood emitted by `perf_check.sh --ucx` at every cluster teardown,
-  AND document the high-thread UCX cliff that the warning previously
-  obscured (Phase 2 of the same investigation).
+Task scope: F122 — auto-pin one CPU core per partition / per extent-node
+  shard / per autumn-client bench worker. Default-on, no CLI flag, cpuset
+  honored via `taskset -c <set>` outside the binary. Surplus work-units
+  log a WARN and float; modulo-wrap was rejected (would force two
+  work-units to fight one core).
 
 Current summary:
-  Three files changed, in two commits.
+  Five files changed; one new file; build clean; 150+ unit tests pass.
 
-  Commit 1 — `fix(ucx): drop UcxEp close-on-Drop (was a noisy no-op)`
-  (already pushed as 76a6f51):
+  New file:
+    crates/common/src/cpu_pin.rs
+      - `available_cpu_cores() -> &'static [usize]` (cached in OnceLock,
+        sorted ascending) snapshots the process cpuset on first call.
+      - `pick_cpu_for_ord(zero_based_ord) -> Option<usize>` returns the
+        ord-th core or None (with one-time WARN) when ord exceeds the
+        cpuset.
+      - `affinity_set(cpu: Option<usize>) -> HashSet<usize>` builds the
+        argument for `compio::runtime::RuntimeBuilder::thread_affinity`.
 
-    crates/transport/src/ucx/endpoint.rs
-      - Removed `impl Drop for UcxEp` entirely (was: zero out raw + call
-        `ucp_ep_close_nbx` with `UCP_EP_CLOSE_FLAG_FORCE`). The FORCE
-        call was a noisy no-op: UCX rejects FORCE on EPs created with
-        the default `UCP_ERR_HANDLING_MODE_NONE`, returning
-        `UCS_ERR_INVALID_PARAM (-5)` synchronously and *not* closing
-        the EP. So the call achieved nothing functional — just
-        produced one `tracing::warn!` per EP teardown.
-      - Updated the module-level "EP lifetime" doc to spell out why we
-        now skip the close call entirely, and which alternatives were
-        ruled out:
-          * FORCE close requires PEER mode (rejected with -5 otherwise).
-          * Graceful FLUSH-mode close deadlocks the loopback test (both
-            peers in the same compio runtime block each other's ack).
-          * `UCP_ERR_HANDLING_MODE_PEER` (which would let FORCE succeed)
-            enables UCX's RC-layer dead-peer detection — under high
-            fan-out write load (16 client threads × 16 inflight) rc_mlx5
-            RNR/timeout fires *mid-test* and tears down live EPs
-            (verified empirically: write ops/s collapsed from 16 k → 0
-            around the 8-second mark). Worse than a teardown warning.
-        Skipping the call leaks the C-side EP in the worker context
-        until `ucp_worker_destroy` (thread/process exit). For autumn-rs
-        this is fine: autumn-rpc::pool and autumn-stream::conn_pool
-        reuse one EP per (peer-address, thread) pair for the life of
-        the process, so EPs do not accumulate at runtime.
+  Edits:
+    crates/common/Cargo.toml
+      - Added `core_affinity = "0.8"` (was a transitive dep via compio,
+        now a direct dep so binaries that don't depend on partition-server
+        can also use the helper) and `tracing.workspace = true`.
+    crates/common/src/lib.rs
+      - `pub mod cpu_pin;` + `pub use cpu_pin::{affinity_set, pick_cpu_for_ord};`
+    crates/partition-server/src/lib.rs
+      - `use autumn_common::cpu_pin::{affinity_set, pick_cpu_for_ord};`
+      - `open_partition`: after the `let ord = ...` block, compute
+        `let cpu = pick_cpu_for_ord((ord as usize).saturating_sub(1));`
+        (ord is 1-based; pool is 0-based).
+      - P-log spawn closure: `Runtime::new()` →
+        `RuntimeBuilder::new().thread_affinity(affinity_set(cpu)).build()`,
+        with a `tracing::info!(part_id, ?cpu, "P-log thread runtime ready")`.
+      - `partition_thread_main` signature: added `cpu: Option<usize>`.
+      - `spawn_bulk_thread` call site: passes `cpu`.
+      - `spawn_bulk_thread` signature: added `cpu: Option<usize>`.
+      - P-bulk closure: same builder pattern + INFO log.
+    crates/server/Cargo.toml
+      - Added `autumn-common = { path = "../common" }` (was only
+        transitive via partition-server; needed direct now that the
+        extent-node and autumn-client binaries call `autumn_common::*`).
+    crates/server/src/bin/extent_node.rs
+      - Multi-shard loop computes `let cpu =
+        autumn_common::pick_cpu_for_ord(shard_idx as usize);` per shard
+        and replaces the per-shard `Runtime::new()` with the
+        builder pattern + INFO log.
+    crates/server/src/bin/autumn_client.rs
+      - Four `std::thread::spawn(... Runtime::new() ...)` bench-worker
+        spots (wbench ~1545, rbench ~1710, perf-check write ~1881,
+        perf-check read ~2003) updated. Each adds
+        `let cpu = autumn_common::pick_cpu_for_ord(tid);` and uses the
+        builder pattern. Admin-mode commands (`put`/`get`/`info`/...)
+        and progress-printer threads are deliberately untouched —
+        either too short-lived or no io_uring.
 
-  Commit 2 — Phase 2 documentation only, no Rust source touched:
-
-    autumn-rs/README.md
-      - Replaced the outdated "rdma_cm Destination unreachable" line in
-        the "Scaling rule" paragraph (the failure mode at high thread
-        counts is now characterized as PS-side rc_mlx5 RNR timeouts on
-        a single-threaded UCX worker, post-Phase-1).
-      - Added a new "UCX scaling and limits" subsection in the
-        `Cluster-level perf_check` chapter. It documents:
-          * the per-partition single-UCX-worker architecture and why
-            scaling is "more partitions, not more workers per
-            partition" (cites
-            MEMORY/feedback_no_multiworker_per_partition.md).
-          * the per-partition concurrent-op formula:
-              read-heavy:  client_threads × pipeline_depth
-              write-heavy: client_threads × pipeline_depth ÷ partitions
-          * the empirical sweep table (16/32/64/256 threads at p=8
-            d=16 4 KB) showing the cliff between 32 and 64 threads.
-          * a "recommended client config band" table — keep
-            client_threads × pipeline_depth / partitions ≲ 256.
-          * pointer to TCP for workloads that exceed the UCX band, and
-            confirmation that UCX p99 wins inside its supported region.
-
-    autumn-rs/perf_check.sh
-      - Extended the existing header comment with an abbreviated cliff
-        table and the "client_threads × pipeline_depth / partitions
-        ≲ 256" rule of thumb. Behavior unchanged (defaults still
-        --threads 16; the script remains useful for the supported
-        region and still runs — non-erroring — past the cliff).
-
-    autumn-rs/claude-progress.txt
-      - This file: Phase 2 entry.
+  Threads still un-pinned (deliberately):
+    - autumn-ps main compio thread (`#[compio::main]` in
+      crates/server/src/bin/partition_server.rs:104)
+    - ps-accept blocking thread (crates/rpc/src/client.rs:499)
+    - autumn-manager-server (control plane, low CPU)
+    - autumn-client admin commands and progress-printer threads
 
 Verification:
-  Phase 1 (already verified pre-merge):
-    1. `cargo build --release -p autumn-transport --features ucx` → clean.
-    2. `cargo build --workspace --release --exclude autumn-fuse \
-         --features autumn-server/ucx` → clean.
-    3. `AUTUMN_UCX_TEST_BIND="[fdbd:dc62:3:302::14]:0" cargo test \
-         --release -p autumn-transport --features ucx --tests`
-       → all suites pass (loopback_ucx in 1.83 s; was hung >60 s on
-       the FLUSH-close iterations during dev).
-    4. `AUTUMN_BIND_HOST=… bash perf_check.sh --ucx --partitions 8 \
-         --pipeline-depth 16 --size 4k --threads 16`
-       → 0 `ucp_ep_close_nbx returned err` warnings (was 144).
-       → write 104 038 ops/s · 406 MB/s · p99 11.10 ms.
-       → read  970 923 ops/s · 3792 MB/s · p99 0.46 ms.
-       → numbers match-or-beat the prior baseline (99 k / 940 k,
-         p99 ~10.9 / 0.40 ms).
+  1. `cargo build --workspace --release --exclude autumn-fuse`
+     → clean: `Finished release profile [optimized + debuginfo] target(s)
+       in 40.74s`. No new warnings; only pre-existing ones (function-cast
+       warnings in partition_server.rs, dead_code on
+       parse_positive_usize_flag).
+  2. `cargo test --release -p autumn-partition-server`
+     → 101/0/0/0/0 — all tests green incl. f099j_n1_load_basic_sanity,
+       f099k_n1_single_partition_listener, f099k_n4_distinct_ports,
+       ps_sqcq_handles_concurrent_in_flight (which exercise the new
+       spawn path under load).
+  3. `cargo test --release -p autumn-common`
+     → 2/0 (store::alloc_ids_monotonic + owner_lock_revision_validation;
+       the new cpu_pin module has no tests yet — it's a 3-line wrapper
+       around `core_affinity` + `tracing` and is exercised end-to-end
+       via the partition-server tests).
+  4. `cargo test --release -p autumn-stream --lib`
+     → 47/0.
+  5. `--help` smoke for autumn-ps / autumn-extent-node / autumn-client
+     → parses cleanly; binaries start and report shard / partition
+       runtimes via the new INFO log.
 
-  Phase 2 cliff characterization sweep (2026-04-29 post-Phase-1, all
-  with no `ucp_ep_close_nbx` warnings — Phase 1 fix holds across the
-  range):
-    --threads 16 : write 104 k / p99 11 ms · read 970 k / p99 0.46 ms ✓
-    --threads 32 : write  80 k / p99 10 ms · read 610 k / p99 1.16 ms (degrading)
-    --threads 64 : write  14 k / p99 54 ms · read 105 k / p99 18 ms (cliff)
-    --threads 256: write   ~0           · read   0          (hard fail)
-
-  Cliff axis: **EPs per partition's UCX worker, not aggregate in-flight
-  ops**. The aggregate-in-flight axis is symmetric for read and write
-  (FuturesUnordered is capped per-thread at pipeline_depth, so per
-  partition both phases see ~`threads × pipeline_depth ÷ partitions`
-  concurrent ops). What differs is EP fan-out:
-    - perf-check write pins each thread to one partition →
-      EPs / partition = `threads ÷ partitions`. At 256t/p8 = 32.
-    - perf-check read holds per-thread HashMap<ps_addr, RpcClient> →
-      EPs / partition = `threads`. At 256t/p8 = 256 — 8× higher.
-  256 EPs on a single-threaded ucp_worker_progress task is what trips
-  rc_mlx5 RNR; 32 EPs is fine. Rule of thumb baked into the README
-  recommendation: `threads ÷ partitions ≲ 32`.
-
-  (Earlier draft had this as `threads × pipeline_depth / partitions`
-  which conflated EP count with in-flight count — corrected on
-  reread of `crates/server/src/bin/autumn_client.rs:2005-2046`.)
-
-  RDMA / OS resource ceilings ruled out as the cause:
-    - `ulimit -n` 1 048 576 (~500× headroom)
-    - `ibv_devinfo -d mlx5_1 -v`: max_qp=131 072, max_mr=16 777 216
-      (workload uses ~2 048 QPs at 256t = 1.5 % of cap)
-    - `/proc/<ps_pid>/status` during 32t test: 26 threads, 14 GB RSS,
-      healthy.
-  Conclusion: bottleneck is the per-partition single-threaded
-  user-space UCX worker, not RDMA / OS resources. Cliff is around
-  ~512–1 024 concurrent UCX ops per worker on this host's rc_mlx5.
-
-  Phase 2 verification:
-    1. README markdown renders as expected; new section sits inside
-       the `## UCX / RDMA Mode (F100-UCX)` chapter, just before the
-       trailing `## Notes`.
-    2. `bash -n perf_check.sh` → syntax OK; defaults unchanged (still
-       `--threads 16`, 2×2×2×2 default matrix).
-    3. `cargo build --workspace --release --exclude autumn-fuse \
-         --features autumn-server/ucx` → no-op (no Rust changes), 0.14 s.
-
-Main gaps: none for the scope. The Phase-1 commit is shippable and
-shipped. Phase-2 is documentation-only — the cliff is now an
-explicitly-documented limit, with the supported-region rule of thumb
-("client_threads × pipeline_depth / partitions ≲ 256") spelled out so
-future readers don't re-discover it the hard way.
+Main gaps:
+  - **Live affinity check deferred** — needs an operator on a real
+    multi-core machine to run e.g.
+      bash cluster.sh start --partitions 4
+      ps -L -o tid,psr,comm -p $(pgrep -x autumn-ps) | grep -E 'part-'
+    and confirm `part-1` + `part-1-bulk` both show `psr=0`,
+    `part-2` + `part-2-bulk` both `psr=1`, etc. No automated gate
+    for this — would require either a /proc parsing test or a custom
+    libc::sched_getaffinity wrapper, which feels like overkill for a
+    feature whose correctness is "we asked compio to bind, compio
+    asked the kernel" — both sides are already covered by their own
+    test suites.
+  - **Surplus-WARN check deferred** — same operator step:
+    `taskset -c 0,1 ./target/release/autumn-ps --psid 1 ...` with 4
+    partitions → expect 2 WARN lines `more work-units than cores in
+    cpuset`.
 
 Next steps (separate sessions):
-  - Pre-existing UCX < TCP perf gap at moderate thread counts (likely
-    `UCX_TLS=rc_mlx5,self` tuning + remove the `^sysv,^posix` TL
-    exclusions, which currently force `cma` for intra-host bulk).
-  - F100-UCX gate (c) cross-host RDMA A/B is still pending.
+  - Live cluster affinity verification on a real ≥8-core box; confirm
+    perf_check results aren't degraded by single-thread CPU pinning
+    (esp. the d=8 SQ/CQ paths that were just optimized).
+  - Optional: `--no-pin` opt-out flag if anyone hits a NUMA-pinning
+    issue we didn't anticipate. Default-on stays.
+  - Optional: thread-pool affinity for compio's `AsyncifyPool` workers
+    (currently un-pinned; used by `spawn_blocking` in gallery for
+    image/video transcoding). Different priority from io_uring threads.

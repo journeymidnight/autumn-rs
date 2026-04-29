@@ -159,7 +159,9 @@ fn main() -> Result<()> {
     }
 
     // Multi-shard: spawn one OS thread per shard, each with its own compio
-    // runtime + io_uring + TcpListener + ExtentNode instance.
+    // runtime + io_uring + TcpListener + ExtentNode instance. Each shard
+    // pins to one core via the shared `pick_cpu_for_ord` helper (cpuset
+    // honored via `taskset -c <set>`; surplus shards log a WARN and float).
     let mut joins = Vec::with_capacity(args.shards as usize);
     for shard_idx in 0..args.shards {
         let data_dirs = args.data_dirs.clone();
@@ -170,12 +172,16 @@ fn main() -> Result<()> {
         let shards = args.shards;
         let listen_port = shard_ports[shard_idx as usize];
         let bind_host = args.bind_host.clone();
+        let cpu = autumn_common::pick_cpu_for_ord(shard_idx as usize);
 
         let join = std::thread::Builder::new()
             .name(format!("extent-shard-{shard_idx}"))
             .spawn(move || -> Result<()> {
-                let rt = compio::runtime::Runtime::new()
+                let rt = compio::runtime::RuntimeBuilder::new()
+                    .thread_affinity(autumn_common::affinity_set(cpu))
+                    .build()
                     .context("create compio runtime")?;
+                tracing::info!(shard_idx, ?cpu, "extent-shard runtime ready");
                 rt.block_on(async move {
                     let addr = autumn_transport::format_listen_addr(&bind_host, listen_port)
                         .context("parse listen address")?;

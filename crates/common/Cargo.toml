@@ -7,5 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 autumn-rpc = { path = "../rpc" }
+core_affinity = "0.8"
 serde.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
