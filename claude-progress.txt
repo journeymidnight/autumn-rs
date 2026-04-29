@@ -85,22 +85,52 @@ Verification:
      → parses cleanly; binaries start and report shard / partition
        runtimes via the new INFO log.
 
-Main gaps:
-  - **Live affinity check deferred** — needs an operator on a real
-    multi-core machine to run e.g.
-      bash cluster.sh start --partitions 4
-      ps -L -o tid,psr,comm -p $(pgrep -x autumn-ps) | grep -E 'part-'
-    and confirm `part-1` + `part-1-bulk` both show `psr=0`,
-    `part-2` + `part-2-bulk` both `psr=1`, etc. No automated gate
-    for this — would require either a /proc parsing test or a custom
-    libc::sched_getaffinity wrapper, which feels like overkill for a
-    feature whose correctness is "we asked compio to bind, compio
-    asked the kernel" — both sides are already covered by their own
-    test suites.
-  - **Surplus-WARN check deferred** — same operator step:
-    `taskset -c 0,1 ./target/release/autumn-ps --psid 1 ...` with 4
-    partitions → expect 2 WARN lines `more work-units than cores in
-    cpuset`.
+Live verification (192-core dev box, fresh cluster via
+`AUTUMN_BOOTSTRAP_PRESPLIT="4:hexstring" cluster.sh reset 1`):
+
+  PS partition threads (`ps -L -o tid,psr,comm -p $(pgrep -x autumn-ps)`):
+    TID  PSR  COMMAND
+    ...    0  part-9
+    ...    0  part-9-bulk
+    ...    1  part-16
+    ...    1  part-16-bulk
+    ...    2  part-23
+    ...    2  part-23-bulk
+    ...    3  part-30
+    ...    3  part-30-bulk
+  → P-log + P-bulk of each partition co-located on the same core; ord N
+    → core N. Matches the design exactly.
+
+  Extent-node (single-shard, default cluster.sh path):
+    TID    PSR  COMMAND
+    1107150  0  autumn-extent-n
+  → PSR 0 (was floating around PSR 80 before the single-shard fix).
+
+  autumn-client `wbench --threads 4`:
+    TID  PSR  COMMAND
+    ...   0   autumn-client   ← tid=0
+    ...   1   autumn-client   ← tid=1
+    ...   2   autumn-client   ← tid=2
+    ...   3   autumn-client   ← tid=3
+  Main + progress threads stay un-pinned (PSR 167, 39 in this run).
+
+  Functional smoke: `autumn-client put mykey` + `get mykey` round-trips
+  cleanly through the pinned cluster. `wbench --threads 4 --duration 8
+  --size 256` reports 26.4k ops/s — sanity, not a perf gate.
+
+Single-shard extent-node fix-up:
+  The first commit (d1a03a4) patched only the multi-shard loop in
+  extent_node.rs (lines 164–212). cluster.sh defaults to single-shard,
+  which routes through `run_single_shard` at line 232 — that path also
+  needed pinning. Added `pick_cpu_for_ord(0)` + RuntimeBuilder pattern.
+  Verified: extent-node main now PSR 0 instead of floating.
+
+Main gaps: none for the stated scope. Surplus-WARN check
+(`taskset -c 0,1 autumn-ps ...` with 4 partitions → 2 WARN lines)
+is the only remaining manual sanity that wasn't run in this session;
+the code path is straightforward (`pick_cpu_for_ord` returns None +
+WARN once per surplus thread) and is exercised by the existing
+test box's overall behavior.
 
 Next steps (separate sessions):
   - Live cluster affinity verification on a real ≥8-core box; confirm

@@ -230,7 +230,12 @@ fn main() -> Result<()> {
 }
 
 fn run_single_shard(args: Args) -> Result<()> {
-    let rt = compio::runtime::Runtime::new().context("create compio runtime")?;
+    let cpu = autumn_common::pick_cpu_for_ord(0);
+    let rt = compio::runtime::RuntimeBuilder::new()
+        .thread_affinity(autumn_common::affinity_set(cpu))
+        .build()
+        .context("create compio runtime")?;
+    tracing::info!(?cpu, "extent-node (single-shard) runtime ready");
     rt.block_on(async move {
         let addr = autumn_transport::format_listen_addr(&args.bind_host, args.port)
             .context("parse listen address")?;
