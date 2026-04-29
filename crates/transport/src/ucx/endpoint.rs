@@ -23,10 +23,31 @@
 //!
 //! `*mut ucp_ep` lives inside `Rc<UcxEp>` so `UcxConn` and the two halves
 //! produced by `into_split` can share ownership. When the last `Rc` drops,
-//! `UcxEp::Drop` issues `ucp_ep_close_nbx` with `UCP_EP_CLOSE_FLAG_FORCE`
-//! (no flush — peer learns of disconnect via wire RST, equivalent to a
-//! TCP socket close after kernel SO_LINGER=0). The Drop drives progress
-//! synchronously until the close request completes.
+//! `UcxEp::Drop` simply releases the Rust-side handle. We deliberately
+//! do **not** call `ucp_ep_close_nbx`:
+//!
+//! * With the default `UCP_ERR_HANDLING_MODE_NONE` (set in `connect` /
+//!   `accept`), `ucp_ep_close_nbx(ep, FORCE)` is rejected with
+//!   `UCS_ERR_INVALID_PARAM (-5)` and the EP isn't actually closed — so
+//!   the call is a noisy no-op.
+//! * `ucp_ep_close_nbx(ep, /*FLUSH*/ NULL)` *is* accepted, but a
+//!   loopback close (both peers in the same compio runtime) deadlocks:
+//!   each side's blocking close waits for an ack the other side can't
+//!   deliver until *its* close runs. Bounded waits time out, but only
+//!   after 30 s+ of UCX-internal retries.
+//! * Switching to `UCP_ERR_HANDLING_MODE_PEER` (which would let FORCE
+//!   succeed) enables UCX's RC-layer dead-peer detection. Under high
+//!   fan-out write load (16 client threads × 16 inflight against 8 PS
+//!   workers) the rc_mlx5 RNR/timeout fires *mid-test* and tears down
+//!   live EPs, which is much worse than a teardown warning.
+//!
+//! Skipping the close call means each EP stays allocated in its UCX
+//! worker context until the worker is destroyed (`ucp_worker_destroy`,
+//! invoked when the OS thread exits or the process exits). For our
+//! deployment this is fine: connection pools (autumn-rpc::pool,
+//! autumn-stream::conn_pool) reuse one EP per (peer-address, thread)
+//! pair for the life of the process, so EPs do not accumulate. Long-
+//! running servers reclaim them on normal shutdown via worker destroy.
 
 use crate::ucx::ffi::*;
 use crate::ucx::sockaddr;
@@ -100,43 +121,6 @@ impl UcxEp {
     }
     fn ptr(&self) -> *mut ucp_ep {
         self.raw
-    }
-}
-
-impl Drop for UcxEp {
-    fn drop(&mut self) {
-        if self.raw.is_null() {
-            return;
-        }
-        // FORCE close: don't flush in-flight ops on our side, don't wait for
-        // peer-side drain. Sends a wire RST equivalent — peer's pending
-        // recvs see ENDPOINT_TIMEOUT/CONN_RESET, like TCP shutdown(LINGER=0).
-        // Suitable for application-level disconnect; for graceful close use
-        // an explicit flush-then-close API at the layer above.
-        let mut params: ucp_request_param_t = unsafe { std::mem::zeroed() };
-        params.op_attr_mask = ucp_op_attr_t::UCP_OP_ATTR_FIELD_FLAGS as u32;
-        params.flags = ucp_ep_close_flags_t::UCP_EP_CLOSE_FLAG_FORCE;
-        let r = unsafe { ucp_ep_close_nbx(self.raw, &params) };
-        match classify_ptr(r) {
-            PtrStatus::Done => {} // synchronous close, nothing to drain
-            PtrStatus::Err(st) => {
-                tracing::warn!(status = st, "ucp_ep_close_nbx returned err");
-            }
-            PtrStatus::Pending(_) => {
-                // Drive progress synchronously until the close completes.
-                // We're on the worker's owning OS thread (UCX_THREAD is
-                // thread-local), so the spawned async progress task can't
-                // run while we hold the thread — drive the loop ourselves.
-                let worker = with_thread_ctx(|c| c.worker);
-                unsafe {
-                    while ucp_request_check_status(r) == ucs_status_t::UCS_INPROGRESS {
-                        ucp_worker_progress(worker);
-                    }
-                    ucp_request_free(r);
-                }
-            }
-        }
-        self.raw = ptr::null_mut();
     }
 }
 

@@ -1,122 +1,87 @@
-Date: 2026-04-28
+Date: 2026-04-29
 TaskStatus: completed
-Task scope: Drop `decide()`/`AUTUMN_TRANSPORT` env probe; require explicit
-  `--transport tcp|ucx` CLI flag on every binary. Add `ucx` feature
-  forwarding on the autumn-server crate so binaries actually link UCX
-  when built with `--features autumn-server/ucx`.
+Task scope: silence the `ucp_ep_close_nbx returned err status=-5` warning
+  flood emitted by `perf_check.sh --ucx` at every cluster teardown
+  (~144 warnings per run at threads=16, partitions=8, depth=16).
 
 Current summary:
-  Twelve files changed in this session.
+  One file changed.
 
-  crates/transport/src/probe.rs
-    - Replaced. `decide()`, `Decision`, `probe_ucx()`, `RDMA_TRANSPORTS`,
-      and the `open_memstream` UCX context probe are all gone. The file
-      now exposes only `parse_transport_flag(&str) -> Result<TransportKind, &str>`,
-      a small CLI-string parser accepting "tcp" or "ucx".
-
-  crates/transport/src/lib.rs
-    - `pub use probe::{decide, Decision}` → `pub use probe::parse_transport_flag`.
-    - `init()` → `init_with(kind: TransportKind)`. The choice now comes from
-      the caller. Panics if `TransportKind::Ucx` is requested but the binary
-      was built without the `ucx` feature.
-    - `current_or_init()` lazy fallback defaults to TCP (was: read env via
-      `init()` → `decide()`).
-    - `check_listen_addr` doc comment updated from "after init()" to
-      "after init_with()".
-
-  crates/server/Cargo.toml
-    - Added `ucx = ["autumn-transport/ucx"]` feature so
-      `cargo build --features autumn-server/ucx` actually links UCX into
-      the four server binaries. Pre-fix, `--features autumn-transport/ucx`
-      at the workspace level didn't propagate into autumn-server, so
-      autumn-client and autumn-manager-server were silently TCP-only.
-
-  crates/server/src/bin/manager.rs
-  crates/server/src/bin/extent_node.rs
-  crates/server/src/bin/partition_server.rs
-  crates/server/src/bin/autumn_client.rs
-    - All four binaries: added `--transport tcp|ucx` CLI arg (default `tcp`),
-      moved `parse_args()` before transport init, replaced
-      `autumn_transport::init()` with `init_with(args.transport)`.
-    - partition_server.rs: also added `--transport <MODE>` to `--help` text.
-    - autumn_client.rs: `--transport` is a global arg (alongside `--manager`).
-
-  crates/partition-server/benches/ps_bench.rs
-    - Removed the `std::env::var("AUTUMN_TRANSPORT")` default and the
-      `std::env::set_var("AUTUMN_TRANSPORT", &c.transport)` write-back.
-      Now defaults to "tcp" and calls `autumn_transport::init_with(kind)`
-      explicitly at the end of `Config::from_args()`.
-
-  crates/transport/tests/probe.rs
-    - Replaced the `decide()` env-var test matrix with two simple tests
-      for `parse_transport_flag` accepting "tcp"/"ucx" and rejecting
-      everything else.
-
-  crates/transport/tests/init.rs
-    - Updated the single `init() → init_with(TransportKind::Tcp)` test to
-      reflect the new explicit-init API.
-
-  cluster.sh
-    - Added a TRANSPORT validation block at top: reads AUTUMN_TRANSPORT
-      (default "tcp"), accepts only tcp|ucx, then `unset AUTUMN_TRANSPORT`
-      so it doesn't leak to child binaries.
-    - `wait_port` switched from `${AUTUMN_TRANSPORT:-auto}` to `$TRANSPORT`.
-    - Added `--transport "$TRANSPORT"` to every binary launch:
-      manager, extent-node (4 disk × shard variants), PS, and the three
-      autumn-client invocations (register-node, format, bootstrap).
-
-  perf_check.sh
-    - Build command flag: `--features autumn-transport/ucx` →
-      `--features autumn-server/ucx` (Item F: feature now lives on the
-      autumn-server crate which actually owns the binary build).
-    - `AUTUMN_TRANSPORT="$mode" "$AC" perf-check ...` →
-      `"$AC" --transport "$mode" perf-check ...`. The cluster.sh invocation
-      keeps its `AUTUMN_TRANSPORT="$mode" bash cluster.sh start 3` form;
-      cluster.sh consumes the env var internally and translates it to
-      `--transport` flags.
+  crates/transport/src/ucx/endpoint.rs
+    - Removed `impl Drop for UcxEp` entirely (was: zero out raw + call
+      `ucp_ep_close_nbx` with `UCP_EP_CLOSE_FLAG_FORCE`). The FORCE call
+      was a noisy no-op: UCX rejects FORCE on EPs created with the
+      default `UCP_ERR_HANDLING_MODE_NONE`, returning
+      `UCS_ERR_INVALID_PARAM (-5)` synchronously and *not* closing the EP.
+      So the call achieved nothing functional — just produced one
+      `tracing::warn!` per EP teardown.
+    - Updated the module-level "EP lifetime" doc to spell out why we
+      now skip the close call entirely, and which alternatives were
+      ruled out:
+        * FORCE close requires PEER mode (rejected with -5 otherwise).
+        * Graceful FLUSH-mode close deadlocks the loopback test (both
+          peers in the same compio runtime block each other's ack).
+        * `UCP_ERR_HANDLING_MODE_PEER` (which would let FORCE succeed)
+          enables UCX's RC-layer dead-peer detection — under high
+          fan-out write load (16 client threads × 16 inflight against
+          8 PS workers) rc_mlx5 RNR/timeout fires *mid-test* and tears
+          down live EPs (verified empirically: write ops/s collapsed
+          from 16 k → 0 around the 8-second mark, read ops/s stayed
+          at 0). Worse than a teardown warning.
+      Skipping the call leaks the C-side EP in the worker context until
+      `ucp_worker_destroy` (thread/process exit). For autumn-rs this is
+      fine: autumn-rpc::pool and autumn-stream::conn_pool reuse one EP
+      per (peer-address, thread) pair for the life of the process, so
+      EPs do not accumulate at runtime.
+    - listener.rs unchanged (server-side EPs share the same Rc<UcxEp>
+      Drop path — fix at the one site covers both directions).
 
 Verification:
-  1. `cargo build --workspace --release --exclude autumn-fuse`
-     → clean build, default features, no UCX symbols (TCP-only).
+  1. `cargo build --release -p autumn-transport --features ucx` → clean.
   2. `cargo build --workspace --release --exclude autumn-fuse --features autumn-server/ucx`
-     → clean build with UCX. `nm target/release/autumn-{client,manager-server,ps,extent-node}`
-     all show `ucp_init` symbols (Item F verified — pre-fix only autumn-stream
-     binaries linked UCX; the autumn-server binaries were silently TCP-only).
-  3. `cargo test -p autumn-transport --tests` → all suites pass:
-     init.rs (1), listen_validator.rs (4), loopback_tcp.rs (4),
-     loopback_ucx.rs (0; gated), probe.rs (2 new), tcp_basic.rs (1).
-  4. TCP cluster smoke (`bash cluster.sh reset 3` + put/get) → ok.
-     manager/ps/node logs all contain `autumn-transport: init kind=Tcp`.
-  5. UCX cluster smoke at the user's RoCE GID
-     (`AUTUMN_BIND_HOST="[fdbd:dc62:3:302::14]" AUTUMN_TRANSPORT=ucx bash cluster.sh reset 3`)
-     → ok. All bins log `init kind=Ucx`. UCX itself prints its own
-     `transport '^posix' is not available` warning, which is downstream
-     of UCX's own `UCX_TLS` parsing — not ours.
-  6. Original failing perf test
-     (`AUTUMN_BIND_HOST="[fdbd:dc62:3:302::14]" bash perf_check.sh --ucx --partitions 8 --pipeline-depth 16 --size 4096 --threads 16`)
-     → no panic; full run completed.
-       Write: 99 483 ops/s · 388.61 MB/s · p50 1.56 ms / p99 10.88 ms
-       Read : 940 202 ops/s · 3672.67 MB/s · p50 0.17 ms / p99 0.40 ms
-     For comparison the same workload on TCP at the same GID:
-       Write: 146 689 ops/s · 573.00 MB/s · p50 1.09 ms / p99 8.87 ms
-       Read : 1 203 389 ops/s · 4700.74 MB/s · p50 0.19 ms / p99 0.51 ms
-     UCX < TCP on this host/workload, but separate perf-tuning concern
-     (likely RoCE peer-discovery cost at depth=16 and the `^sysv,^posix`
-     tl exclusions); this task's goal was selectability, not UCX speed.
-  7. CLI validation negative tests:
-       `autumn-manager-server --transport auto`
-         → exit 2, stderr `--transport must be \`tcp\` or \`ucx\`, got "auto"`
-       `AUTUMN_TRANSPORT=auto bash cluster.sh status`
-         → exit 2, stderr `AUTUMN_TRANSPORT must be 'tcp' or 'ucx', got 'auto'`
+     → clean (only pre-existing function-cast / dead-code warnings).
+  3. `AUTUMN_UCX_TEST_BIND="[fdbd:dc62:3:302::14]:0" cargo test --release \
+       -p autumn-transport --features ucx --tests`
+     → all suites pass:
+        init.rs (1), listen_validator.rs (4), loopback_tcp.rs (4),
+        loopback_ucx.rs (5+1 ignored), probe.rs (2), tcp_basic.rs (1).
+     loopback_ucx finishes in 1.83s (was: stderr-spam from UCX
+     `flush.c:57` errors and `large_payload` running >60 s on previous
+     attempted-fix iterations).
+  4. Pre-fix repro at HEAD~1 (FORCE close in Drop):
+     `AUTUMN_BIND_HOST="[fdbd:dc62:3:302::14]" bash perf_check.sh --ucx \
+        --partitions 8 --pipeline-depth 16 --size 4k --threads 16 \
+       2>&1 | grep -c "ucp_ep_close_nbx returned err"`
+     → 144 (one per torn-down EP).
+  5. Post-fix same command → 0 warnings in stdout AND stderr.
+     Bench numbers also confirm no perf regression vs the user's
+     supported-region baseline:
+       Write: 104 038 ops/s · 406.40 MB/s · p50 1.41 ms / p99 11.10 ms
+       Read : 970 923 ops/s · 3792.67 MB/s · p50 0.16 ms / p99 0.46 ms
+     (Compare to the recorded baseline in this file's prior entry:
+        Write: 99 483 ops/s · 388.61 MB/s · p99 10.88 ms
+        Read : 940 202 ops/s · 3672.67 MB/s · p99 0.40 ms
+      → small variance in our favor; well within run-to-run noise.)
+  6. `cargo test --release -p autumn-transport --tests` (no env var
+     needed for the non-ucx tests) → all green.
 
-Main gaps: none for this scope.
+Main gaps: none for the warning-suppression scope.
 
-Next steps:
-  - UCX < TCP perf gap is its own investigation (likely needs `UCX_TLS`
-    tuning to enable rc_mlx5 specifically rather than excluding shm,
-    or there's a real per-connection latency cost in the current
-    UcxConn endpoint plumbing). Not part of this cleanup task.
-  - If anyone ever wants `--transport auto` back, the path is to add a
-    new `parse_transport_flag` arm and re-introduce a probe — but the
-    current "operator says what they want" model is the user's
-    explicit preference.
+Next steps (Phase 2 — separate session):
+  - 256-thread UCX hard failure (read phase produces ops/s=0,
+    "Connection reset by remote peer" floods from rc_mlx5 RNR
+    timeouts on the PS-side single accept-thread worker). The user
+    confirmed this is a real cliff: threads=16 / depth=16 works (~256
+    in-progress ops per PS-worker), threads≥32 / depth=16 fails. UCX
+    P99 is *better* than TCP at supported scale — worth raising the
+    ceiling rather than capping clients. Plan is at
+    `~/.claude/plans/ucx-bench-perf-check-baseline-perf-base-splendid-sunrise.md`
+    Phase 2 (Step 1: characterize the cliff with --threads ∈ {24, 32,
+    48, 64} + UCX_LOG_LEVEL=info + ibv_devinfo; Step 2: pick fix
+    direction once evidence shows whether the bottleneck is single-
+    worker progress, mlx5 QP/MR exhaustion, or RoCE timeout tuning;
+    Step 3: implement). Likely candidate is server-side multi-listener
+    so each PS OS thread has its own UCX worker accepting connections.
+  - Pre-existing UCX < TCP perf gap at moderate thread counts
+    (probably want UCX_TLS=rc_mlx5,self tuning + remove the
+    `^sysv,^posix` exclusions — separate from the cliff above).
