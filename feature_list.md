@@ -757,7 +757,7 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 ### F073 · System test: split with large values — VP resolution across shared extents
 - **Target:** 写入 8KB value (VP)，flush，split。两个 child partition 都能 resolve 指向共享 logStream extent 的 VP。
 - **Evidence:** `crates/manager/tests/system_split_large_values.rs`
-- **Notes:** Fixed. Writes 10 keys with 8KB values, flush, split, verifies all VP resolutions work from both children.
+- **Notes:** Fixed. Writes 10 keys with 8KB values, flush, split, verifies all VP resolutions work from both children. 2026-04-29 hardening: added SST-level `vp_deps`, manager-side `vp_table_refs`, per-partition `partitionVpRefs/<part_id>` snapshots, split-time snapshot cloning, and delete gating on `refs == 0 && vp_table_refs == 0` so old log extents referenced by shared SSTs survive until the tables are rewritten.
 - **passes:** true
 
 ### F074 · System test: compound failure — split + PS crash

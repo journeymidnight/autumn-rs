@@ -141,6 +141,24 @@ multi_modify_split(part_id, mid_key, owner_key, revision, log_sealed_len, row_se
 
 After split, both left and right partitions initially share the same physical extents. Their `PartitionServer` will detect `has_overlap = true` on open (SSTables contain keys outside the narrowed range). Major compaction cleans up out-of-range keys and frees the shared extents via GC.
 
+### VP lifetime after split (`vp_table_refs`, 2026-04-29)
+
+Split can duplicate row-stream SST ownership without duplicating the old log extents referenced by the SSTs' embedded `ValuePointer`s. The direct stream-membership refcount `MgrExtentInfo.refs` is therefore insufficient to protect old log extents after split.
+
+Manager now tracks two independent lifetimes on every extent:
+
+- `refs`: direct membership in some stream's `extent_ids`
+- `vp_table_refs`: indirect retention by live SSTables whose `MetaBlock.vp_deps` still mention this extent
+
+The source of truth for indirect retention is `partitionVpRefs/<part_id>` in etcd and `MetadataState.partition_vp_refs` in memory. Each snapshot stores `extent_id -> table_count` for the partition's CURRENT live SST set. The manager updates global `vp_table_refs` by diffing the old snapshot and the new snapshot.
+
+Rules:
+
+1. `MSG_SYNC_PARTITION_VP_REFS` replaces the partition's full snapshot; manager diffs old/new and adjusts `vp_table_refs` on touched extents.
+2. `multi_modify_split` clones the parent snapshot to the right child immediately, because both children still reference the shared SST set until compaction rewrites them.
+3. Extent deletion is allowed only when `refs == 0 && vp_table_refs == 0`.
+4. `vp_table_refs` is manager-owned aggregate state. It must NEVER be written into SST format.
+
 ## EC Conversion Dispatch (`ec_conversion_dispatch_loop`)
 
 Background loop that fires every 5 s. Picks any sealed extent on an EC stream where `ec_converted == false`, sends `EXT_MSG_CONVERT_TO_EC` to the coordinator (first replica), and on success calls `apply_ec_conversion_done` to flip `ec_converted = true` + bump `eversion = pre_ec + 1` in the manager + etcd.
@@ -195,7 +213,7 @@ The partition server side sends heartbeats from a `heartbeat_loop` spawned in `f
 ## Etcd Mirroring
 
 All persistent state is mirrored to etcd under prefixes:
-- `nodes/`, `disks/`, `streams/`, `extents/`, `partitions/`, `regions/`, `ps_nodes/`, `next_id`
+- `nodes/`, `disks/`, `streams/`, `extents/`, `partitions/`, `partitionVpRefs/`, `regions/`, `ps_nodes/`, `next_id`
 
 On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory state. The etcd transaction in `multi_modify_split` groups all related writes/deletes atomically.
 
@@ -203,7 +221,7 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
 
 1. **Etcd-first mutation pattern** — all mutating RPC handlers follow: (1) compute mutations without modifying store, (2) persist to etcd, (3) apply to in-memory store. This ensures manager crash after step 1 but before step 2 leaves etcd and memory consistent. Exception: `register_ps`/`upsert_partition` apply to memory first because `mirror_partition_snapshot` reads from the store (these are idempotent on retry). The old function `duplicate_stream` (which modified state directly) has been replaced by `compute_duplicate_stream` (read-only) + `apply_split_mutations`.
 
-2. **`compute_duplicate_stream` increments extent `refs`** — this is the ref-counting mechanism for CoW. If you add new ways to share extents, increment refs. If you add new ways to remove extents, decrement refs and only delete when refs → 0.
+2. **`compute_duplicate_stream` increments extent `refs`** — this is only the direct stream-membership refcount for CoW. If shared SSTs can retain old log extents via `ValuePointer`, update `partition_vp_refs` / `vp_table_refs` too. Physical extent deletion requires BOTH counters to reach zero.
 
 3. **Owner revision must be validated before any stream mutation** — call `ensure_owner_revision` at the start of `stream_alloc_extent`, `stream_punch_holes`, `truncate`, `multi_modify_split`. Missing this allows split-brain.
 

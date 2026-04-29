@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use autumn_rpc::manager_rpc::{
-    MgrDiskInfo, MgrExtentInfo, MgrNodeInfo, MgrPartitionMeta, MgrRegionInfo, MgrStreamInfo,
+    MgrDiskInfo, MgrExtentInfo, MgrNodeInfo, MgrPartitionMeta, MgrPartitionVpRefs,
+    MgrRegionInfo, MgrStreamInfo,
 };
 
 use crate::{AppError, AppResult};
@@ -18,6 +19,8 @@ pub struct MetadataState {
     pub owner_revisions: HashMap<String, i64>,
     pub next_revision: i64,
     pub partitions: HashMap<u64, MgrPartitionMeta>,
+    /// Persistent partition-scoped snapshot of live SST VP dependencies.
+    pub partition_vp_refs: HashMap<u64, MgrPartitionVpRefs>,
     pub ps_nodes: HashMap<u64, String>,
     pub regions: BTreeMap<u64, MgrRegionInfo>,
     /// F099-K — per-partition listener addresses reported by PS via

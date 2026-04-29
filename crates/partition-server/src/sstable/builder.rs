@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use super::bloom::BloomFilterBuilder;
 use super::format::{
@@ -46,6 +46,8 @@ pub struct SstBuilder {
     total_raw_bytes: u64,
     /// Discard stats to embed in MetaBlock (set via set_discards before finish()).
     discards: HashMap<u64, i64>,
+    /// Distinct old log extents referenced by live ValuePointer entries.
+    vp_deps: BTreeSet<u64>,
     /// Earliest non-zero expires_at seen across all entries.
     min_expires_at: u64,
 }
@@ -68,6 +70,7 @@ impl SstBuilder {
             biggest_key: Vec::new(),
             total_raw_bytes: 0,
             discards: HashMap::new(),
+            vp_deps: BTreeSet::new(),
             min_expires_at: 0,
         }
     }
@@ -142,6 +145,11 @@ impl SstBuilder {
         self.current.extend_from_slice(&expires_at.to_le_bytes());
         self.current.extend_from_slice(value);
 
+        if op & crate::OP_VALUE_POINTER != 0 && value.len() >= crate::VALUE_POINTER_SIZE {
+            let extent_id = u64::from_le_bytes(value[0..8].try_into().unwrap());
+            self.vp_deps.insert(extent_id);
+        }
+
         self.total_raw_bytes += entry_size as u64;
     }
 
@@ -176,6 +184,7 @@ impl SstBuilder {
             seq_num: self.seq_num,
             vp_extent_id: self.vp_extent_id,
             vp_offset: self.vp_offset,
+            vp_deps: self.vp_deps.into_iter().collect(),
             discards: self.discards,
             min_expires_at: self.min_expires_at,
         };

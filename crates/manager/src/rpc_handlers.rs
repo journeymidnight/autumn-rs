@@ -98,6 +98,7 @@ impl AutumnManager {
             MSG_GET_REGIONS => self.handle_get_regions().await,
             MSG_HEARTBEAT_PS => self.handle_heartbeat_ps(payload).await,
             MSG_REGISTER_PARTITION_ADDR => self.handle_register_partition_addr(payload).await,
+            MSG_SYNC_PARTITION_VP_REFS => self.handle_sync_partition_vp_refs(payload).await,
             MSG_RECONCILE_EXTENTS => self.handle_reconcile_extents(payload).await,
             MSG_UPDATE_STREAM_EC => self.handle_update_stream_ec(payload).await,
             _ => Err((
@@ -361,6 +362,7 @@ impl AutumnManager {
             parity: vec![],
             eversion: 1,
             refs: 1,
+            vp_table_refs: 0,
             sealed_length: 0,
             avali: 0,
             replicate_disks: disk_ids,
@@ -867,6 +869,7 @@ impl AutumnManager {
             parity: node_ids[data..].to_vec(),
             eversion: 1,
             refs: 1,
+            vp_table_refs: 0,
             sealed_length: 0,
             avali: 0,
             replicate_disks: disk_ids[..data].to_vec(),
@@ -964,7 +967,7 @@ impl AutumnManager {
                 let needed_addrs: HashMap<u64, MgrExtentInfo> = s
                     .extents
                     .iter()
-                    .filter(|(eid, e)| removed.contains(eid) && e.refs <= 1)
+                    .filter(|(eid, e)| removed.contains(eid) && e.refs == 1 && e.vp_table_refs == 0)
                     .map(|(eid, e)| (*eid, e.clone()))
                     .collect();
                 for (eid, extent) in &needed_addrs {
@@ -980,8 +983,14 @@ impl AutumnManager {
                 for extent_id in removed {
                     if let Some(extent) = s.extents.get_mut(&extent_id) {
                         if extent.refs <= 1 {
-                            s.extents.remove(&extent_id);
-                            extent_deletes.push(extent_id);
+                            extent.refs = 0;
+                            if Self::extent_can_delete(extent) {
+                                s.extents.remove(&extent_id);
+                                extent_deletes.push(extent_id);
+                            } else {
+                                extent.eversion += 1;
+                                extent_puts.push(extent.clone());
+                            }
                         } else {
                             extent.refs -= 1;
                             extent.eversion += 1;
@@ -1084,7 +1093,7 @@ impl AutumnManager {
                 let needed_addrs: HashMap<u64, MgrExtentInfo> = s
                     .extents
                     .iter()
-                    .filter(|(eid, e)| removed.contains(eid) && e.refs <= 1)
+                    .filter(|(eid, e)| removed.contains(eid) && e.refs == 1 && e.vp_table_refs == 0)
                     .map(|(eid, e)| (*eid, e.clone()))
                     .collect();
                 for (eid, extent) in &needed_addrs {
@@ -1100,8 +1109,14 @@ impl AutumnManager {
                 for extent_id in removed {
                     if let Some(extent) = s.extents.get_mut(&extent_id) {
                         if extent.refs <= 1 {
-                            s.extents.remove(&extent_id);
-                            extent_deletes.push(extent_id);
+                            extent.refs = 0;
+                            if Self::extent_can_delete(extent) {
+                                s.extents.remove(&extent_id);
+                                extent_deletes.push(extent_id);
+                            } else {
+                                extent.eversion += 1;
+                                extent_puts.push(extent.clone());
+                            }
                         } else {
                             extent.refs -= 1;
                             extent.eversion += 1;
@@ -1155,7 +1170,13 @@ impl AutumnManager {
         // (only alloc_ids touches state.next_id, which is safe to waste on failure)
         let out = {
             let mut s = self.store.inner.borrow_mut();
-            (|| -> Result<(Vec<MgrStreamInfo>, Vec<MgrExtentInfo>, MgrPartitionMeta, MgrPartitionMeta), AppError> {
+            (|| -> Result<(
+                Vec<MgrStreamInfo>,
+                Vec<MgrExtentInfo>,
+                MgrPartitionMeta,
+                MgrPartitionMeta,
+                MgrPartitionVpRefs,
+            ), AppError> {
                 Self::ensure_owner_revision(&req.owner_key, req.revision, &s)?;
 
                 let src_meta = s
@@ -1215,22 +1236,30 @@ impl AutumnManager {
                     end_key: rg.end_key,
                 });
 
-                Ok((new_streams, all_extents, left, right))
+                let right_snapshot = Self::split_partition_vp_snapshot(&s, req.part_id, new_part_id);
+                let vp_extent_puts = Self::preview_partition_vp_refs_apply(&s, &right_snapshot);
+                all_extents = Self::merge_extent_updates(all_extents, vp_extent_puts);
+
+                Ok((new_streams, all_extents, left, right, right_snapshot))
             })()
         };
 
         match out {
-            Ok((new_streams, modified_extents, left, right)) => {
+            Ok((new_streams, modified_extents, left, right, right_snapshot)) => {
                 // Phase 2: Persist streams and extents to etcd FIRST
                 if let Some(etcd) = &self.etcd {
                     let mut kvs =
-                        Vec::with_capacity(new_streams.len() + modified_extents.len());
+                        Vec::with_capacity(new_streams.len() + modified_extents.len() + 1);
                     for st in &new_streams {
                         kvs.push((format!("streams/{}", st.stream_id), rkyv_encode(st).to_vec()));
                     }
                     for ex in &modified_extents {
                         kvs.push((format!("extents/{}", ex.extent_id), rkyv_encode(ex).to_vec()));
                     }
+                    kvs.push((
+                        format!("partitionVpRefs/{}", right_snapshot.part_id),
+                        rkyv_encode(&right_snapshot).to_vec(),
+                    ));
                     etcd.put_msgs_txn(kvs)
                         .await
                         .map_err(|e| (StatusCode::Internal, e.to_string()))?;
@@ -1242,6 +1271,8 @@ impl AutumnManager {
                     Self::apply_split_mutations(
                         &mut s, &new_streams, &modified_extents, left, right,
                     );
+                    s.partition_vp_refs
+                        .insert(right_snapshot.part_id, right_snapshot);
                 }
 
                 // Phase 4: Mirror partition snapshot to etcd
@@ -1459,6 +1490,35 @@ impl AutumnManager {
         let _ = req.ps_id; // reserved for future validation
         s.part_addrs.insert(req.part_id, req.address);
         Ok(rkyv_encode(&CodeResp {
+            code: CODE_OK,
+            message: String::new(),
+        }))
+    }
+
+    async fn handle_sync_partition_vp_refs(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+            }));
+        }
+        let req: SyncPartitionVpRefsReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let snapshot = MgrPartitionVpRefs {
+            part_id: req.part_id,
+            refs: req.refs,
+        };
+        let extent_puts = {
+            let mut s = self.store.inner.borrow_mut();
+            Self::apply_partition_vp_refs(&mut s, snapshot.clone())
+        };
+        if let Err(err) = self.mirror_partition_vp_refs(&snapshot, &extent_puts).await {
+            return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+            }));
+        }
+        Ok(rkyv_encode(&SyncPartitionVpRefsResp {
             code: CODE_OK,
             message: String::new(),
         }))

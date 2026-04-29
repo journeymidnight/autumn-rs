@@ -171,6 +171,24 @@ The null byte (`0x00`) is a **separator** between the user key and the inverted 
 
 The **inverted** sequence ensures that for the same user key, newer writes (higher seq) sort **before** older writes in byte order. Lookup uses `seek_user_key` which seeks to `user_key ++ 0x00 ++ BE(0)` — the smallest possible internal key for this user key — then returns the first (newest) entry found.
 
+## SST VP dependency tracking (`vp_deps`, 2026-04-29)
+
+Each SST `MetaBlock` now persists `vp_deps: Vec<u64>`: the distinct log extent ids referenced by live `ValuePointer` entries in that SST.
+
+Rules:
+
+1. `vp_deps` is an SST-local fact derived while building the SST (`SstBuilder::add` sees `OP_VALUE_POINTER` entries and records their `extent_id`).
+2. `vp_deps` is persisted in rowStream as part of the SST MetaBlock and recovered through `SstReader.vp_deps`.
+3. `vp_deps` is NOT a refcount. The manager-owned aggregate is `MgrExtentInfo.vp_table_refs`, computed from full partition snapshots.
+
+`PartitionData` recomputes and syncs the full live-SST snapshot (`extent_id -> number of live SSTs mentioning it`) at three points:
+
+1. right after recovery/open succeeds
+2. after every successful flush checkpoint (`save_table_locs_raw`)
+3. after every successful compaction checkpoint
+
+This closes the split-lifetime bug where shared SSTs could still contain old `ValuePointer`s after the current log stream had already truncated the underlying extent.
+
 ## Write Path: Put / Delete (Group Commit, R4 4.4 SQ/CQ, F099-D merged, F099-I batched)
 
 ```

@@ -1,143 +1,39 @@
 Date: 2026-04-29
 TaskStatus: completed
-Task scope: F122 — auto-pin one CPU core per partition / per extent-node
-  shard / per autumn-client bench worker. Default-on, no CLI flag, cpuset
-  honored via `taskset -c <set>` outside the binary. Surplus work-units
-  log a WARN and float; modulo-wrap was rejected (would force two
-  work-units to fight one core).
+Task scope: Fix split regression `etcdserver: duplicate key given in txn request`
+  triggered by `split <part_id>` after the vp-table-refs change.
 
 Current summary:
-  Five files changed; one new file; build clean; 150+ unit tests pass.
+  Root cause: `handle_multi_modify_split` built one etcd txn containing
+  `extents/<id>` writes from two sources:
+  1. stream duplication (`compute_duplicate_stream`) updating `refs/eversion`
+  2. right-child VP snapshot preview updating `vp_table_refs`
 
-  New file:
-    crates/common/src/cpu_pin.rs
-      - `available_cpu_cores() -> &'static [usize]` (cached in OnceLock,
-        sorted ascending) snapshots the process cpuset on first call.
-      - `pick_cpu_for_ord(zero_based_ord) -> Option<usize>` returns the
-        ord-th core or None (with one-time WARN) when ord exceeds the
-        cpuset.
-      - `affinity_set(cpu: Option<usize>) -> HashSet<usize>` builds the
-        argument for `compio::runtime::RuntimeBuilder::thread_affinity`.
+  When an extent appeared in both sets, the txn contained duplicate puts for
+  the same etcd key, and etcd rejected it with `duplicate key given in txn request`.
+  The two payloads also differed, so naive dedupe would have lost either the
+  `refs` update or the `vp_table_refs` update.
 
-  Edits:
-    crates/common/Cargo.toml
-      - Added `core_affinity = "0.8"` (was a transitive dep via compio,
-        now a direct dep so binaries that don't depend on partition-server
-        can also use the helper) and `tracing.workspace = true`.
-    crates/common/src/lib.rs
-      - `pub mod cpu_pin;` + `pub use cpu_pin::{affinity_set, pick_cpu_for_ord};`
-    crates/partition-server/src/lib.rs
-      - `use autumn_common::cpu_pin::{affinity_set, pick_cpu_for_ord};`
-      - `open_partition`: after the `let ord = ...` block, compute
-        `let cpu = pick_cpu_for_ord((ord as usize).saturating_sub(1));`
-        (ord is 1-based; pool is 0-based).
-      - P-log spawn closure: `Runtime::new()` →
-        `RuntimeBuilder::new().thread_affinity(affinity_set(cpu)).build()`,
-        with a `tracing::info!(part_id, ?cpu, "P-log thread runtime ready")`.
-      - `partition_thread_main` signature: added `cpu: Option<usize>`.
-      - `spawn_bulk_thread` call site: passes `cpu`.
-      - `spawn_bulk_thread` signature: added `cpu: Option<usize>`.
-      - P-bulk closure: same builder pattern + INFO log.
-    crates/server/Cargo.toml
-      - Added `autumn-common = { path = "../common" }` (was only
-        transitive via partition-server; needed direct now that the
-        extent-node and autumn-client binaries call `autumn_common::*`).
-    crates/server/src/bin/extent_node.rs
-      - Multi-shard loop computes `let cpu =
-        autumn_common::pick_cpu_for_ord(shard_idx as usize);` per shard
-        and replaces the per-shard `Runtime::new()` with the
-        builder pattern + INFO log.
-    crates/server/src/bin/autumn_client.rs
-      - Four `std::thread::spawn(... Runtime::new() ...)` bench-worker
-        spots (wbench ~1545, rbench ~1710, perf-check write ~1881,
-        perf-check read ~2003) updated. Each adds
-        `let cpu = autumn_common::pick_cpu_for_ord(tid);` and uses the
-        builder pattern. Admin-mode commands (`put`/`get`/`info`/...)
-        and progress-printer threads are deliberately untouched —
-        either too short-lived or no io_uring.
-
-  Threads still un-pinned (deliberately):
-    - autumn-ps main compio thread (`#[compio::main]` in
-      crates/server/src/bin/partition_server.rs:104)
-    - ps-accept blocking thread (crates/rpc/src/client.rs:499)
-    - autumn-manager-server (control plane, low CPU)
-    - autumn-client admin commands and progress-printer threads
+  Fix implemented:
+  1. added `AutumnManager::merge_extent_updates(base, overlays)`
+  2. split path now merges overlapping extent updates by `extent_id`
+  3. on overlap, preserve the stream-duplication mutation (`refs/eversion/...`)
+     and overlay the new `vp_table_refs`
+  4. added regression test `merge_extent_updates_preserves_ref_and_vp_changes`
 
 Verification:
-  1. `cargo build --workspace --release --exclude autumn-fuse`
-     → clean: `Finished release profile [optimized + debuginfo] target(s)
-       in 40.74s`. No new warnings; only pre-existing ones (function-cast
-       warnings in partition_server.rs, dead_code on
-       parse_positive_usize_flag).
-  2. `cargo test --release -p autumn-partition-server`
-     → 101/0/0/0/0 — all tests green incl. f099j_n1_load_basic_sanity,
-       f099k_n1_single_partition_listener, f099k_n4_distinct_ports,
-       ps_sqcq_handles_concurrent_in_flight (which exercise the new
-       spawn path under load).
-  3. `cargo test --release -p autumn-common`
-     → 2/0 (store::alloc_ids_monotonic + owner_lock_revision_validation;
-       the new cpu_pin module has no tests yet — it's a 3-line wrapper
-       around `core_affinity` + `tracing` and is exercised end-to-end
-       via the partition-server tests).
-  4. `cargo test --release -p autumn-stream --lib`
-     → 47/0.
-  5. `--help` smoke for autumn-ps / autumn-extent-node / autumn-client
-     → parses cleanly; binaries start and report shard / partition
-       runtimes via the new INFO log.
+  1. `cargo build -p autumn-manager`
+     → clean.
+  2. `cargo test -p autumn-manager merge_extent_updates_preserves_ref_and_vp_changes`
+     → pass.
+  3. `cargo test -p autumn-manager split_partition_vp_snapshot_clones_parent_refs`
+     → pass.
+  4. `cargo test -p autumn-manager partition_vp_refs_diff_updates_extent_counters`
+     → pass.
 
-Live verification (192-core dev box, fresh cluster via
-`AUTUMN_BOOTSTRAP_PRESPLIT="4:hexstring" cluster.sh reset 1`):
+Main gaps:
+  Live cluster split retry has not yet been rerun in this session.
 
-  PS partition threads (`ps -L -o tid,psr,comm -p $(pgrep -x autumn-ps)`):
-    TID  PSR  COMMAND
-    ...    0  part-9
-    ...    0  part-9-bulk
-    ...    1  part-16
-    ...    1  part-16-bulk
-    ...    2  part-23
-    ...    2  part-23-bulk
-    ...    3  part-30
-    ...    3  part-30-bulk
-  → P-log + P-bulk of each partition co-located on the same core; ord N
-    → core N. Matches the design exactly.
-
-  Extent-node (single-shard, default cluster.sh path):
-    TID    PSR  COMMAND
-    1107150  0  autumn-extent-n
-  → PSR 0 (was floating around PSR 80 before the single-shard fix).
-
-  autumn-client `wbench --threads 4`:
-    TID  PSR  COMMAND
-    ...   0   autumn-client   ← tid=0
-    ...   1   autumn-client   ← tid=1
-    ...   2   autumn-client   ← tid=2
-    ...   3   autumn-client   ← tid=3
-  Main + progress threads stay un-pinned (PSR 167, 39 in this run).
-
-  Functional smoke: `autumn-client put mykey` + `get mykey` round-trips
-  cleanly through the pinned cluster. `wbench --threads 4 --duration 8
-  --size 256` reports 26.4k ops/s — sanity, not a perf gate.
-
-Single-shard extent-node fix-up:
-  The first commit (d1a03a4) patched only the multi-shard loop in
-  extent_node.rs (lines 164–212). cluster.sh defaults to single-shard,
-  which routes through `run_single_shard` at line 232 — that path also
-  needed pinning. Added `pick_cpu_for_ord(0)` + RuntimeBuilder pattern.
-  Verified: extent-node main now PSR 0 instead of floating.
-
-Main gaps: none for the stated scope. Surplus-WARN check
-(`taskset -c 0,1 autumn-ps ...` with 4 partitions → 2 WARN lines)
-is the only remaining manual sanity that wasn't run in this session;
-the code path is straightforward (`pick_cpu_for_ord` returns None +
-WARN once per surplus thread) and is exercised by the existing
-test box's overall behavior.
-
-Next steps (separate sessions):
-  - Live cluster affinity verification on a real ≥8-core box; confirm
-    perf_check results aren't degraded by single-thread CPU pinning
-    (esp. the d=8 SQ/CQ paths that were just optimized).
-  - Optional: `--no-pin` opt-out flag if anyone hits a NUMA-pinning
-    issue we didn't anticipate. Default-on stays.
-  - Optional: thread-pool affinity for compio's `AsyncifyPool` workers
-    (currently un-pinned; used by `spawn_blocking` in gallery for
-    image/video transcoding). Different priority from io_uring threads.
+Next steps:
+  1. retry `autumn-client split 15`
+  2. if it succeeds, commit/push this regression fix separately

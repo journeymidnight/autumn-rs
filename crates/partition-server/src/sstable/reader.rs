@@ -22,6 +22,7 @@ pub struct SstReader {
     seq_num: u64,
     pub vp_extent_id: u64,
     pub vp_offset: u32,
+    pub vp_deps: Vec<u64>,
     estimated_size: u64,
     pub discards: HashMap<u64, i64>,
     /// Earliest non-zero expires_at across all entries (0 = no expiring keys).
@@ -94,6 +95,7 @@ impl SstReader {
             seq_num: meta.seq_num,
             vp_extent_id: meta.vp_extent_id,
             vp_offset: meta.vp_offset,
+            vp_deps: meta.vp_deps,
             estimated_size: meta.estimated_size,
             discards: meta.discards,
             min_expires_at: meta.min_expires_at,

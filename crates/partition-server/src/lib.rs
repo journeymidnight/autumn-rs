@@ -439,6 +439,7 @@ impl TableMeta {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct PartitionData {
+    part_id: u64,
     rg: Range,
     active: Memtable,
     imm: VecDeque<Arc<Memtable>>,
@@ -455,6 +456,8 @@ pub(crate) struct PartitionData {
     vp_extent_id: u64,
     vp_offset: u32,
     stream_client: Rc<StreamClient>,
+    manager_addr: String,
+    pool: Rc<ConnPool>,
     /// F088: sender to the per-partition bulk thread. `None` if the bulk
     /// thread failed to initialize — fall back to in-thread flush (legacy
     /// path) so the partition remains usable.
@@ -2049,6 +2052,7 @@ async fn partition_thread_main(
     );
 
     let part = Rc::new(RefCell::new(PartitionData {
+        part_id,
         rg,
         active: recovered_active,
         imm: VecDeque::new(),
@@ -2065,9 +2069,15 @@ async fn partition_thread_main(
         vp_extent_id: vp_eid,
         vp_offset: vp_off,
         stream_client: part_sc.clone(),
+        manager_addr: manager_addr.clone(),
+        pool: pool.clone(),
         flush_req_tx: flush_req_tx_part,
         imm_drained_tx,
     }));
+
+    sync_partition_vp_refs(&part)
+        .await
+        .context("sync partition vp refs after recovery")?;
 
     // Drop the extra `flush_req_tx` clone held locally: the one stored in
     // PartitionData is the only reference. When PartitionData drops, the
@@ -2996,6 +3006,61 @@ pub(crate) async fn save_table_locs_raw(
     Ok(())
 }
 
+fn collect_partition_vp_refs(readers: &[Arc<SstReader>]) -> Vec<(u64, u32)> {
+    let mut counts = BTreeMap::<u64, u32>::new();
+    for reader in readers {
+        for &extent_id in &reader.vp_deps {
+            *counts.entry(extent_id).or_insert(0) += 1;
+        }
+    }
+    counts.into_iter().collect()
+}
+
+pub(crate) async fn sync_partition_vp_refs(part: &Rc<RefCell<PartitionData>>) -> Result<()> {
+    let (part_id, refs, manager_addr, pool) = {
+        let p = part.borrow();
+        (
+            p.part_id,
+            collect_partition_vp_refs(&p.sst_readers),
+            p.manager_addr.clone(),
+            p.pool.clone(),
+        )
+    };
+
+    let req = manager_rpc::rkyv_encode(&manager_rpc::SyncPartitionVpRefsReq { part_id, refs });
+    let mut last_err: Option<anyhow::Error> = None;
+    for mgr in manager_addr.split(',') {
+        let mgr = mgr.trim();
+        if mgr.is_empty() {
+            continue;
+        }
+        let mgr_norm = autumn_stream::conn_pool::normalize_endpoint(mgr);
+        match pool
+            .call(&mgr_norm, manager_rpc::MSG_SYNC_PARTITION_VP_REFS, req.clone())
+            .await
+        {
+            Ok(bytes) => match manager_rpc::rkyv_decode::<manager_rpc::SyncPartitionVpRefsResp>(&bytes) {
+                Ok(resp) if resp.code == manager_rpc::CODE_OK => return Ok(()),
+                Ok(resp) => {
+                    last_err = Some(anyhow!(
+                        "sync_partition_vp_refs rejected by {}: {}",
+                        mgr,
+                        resp.message
+                    ));
+                }
+                Err(e) => {
+                    last_err = Some(anyhow!("decode sync_partition_vp_refs resp: {}", e));
+                }
+            },
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("no manager addresses to sync vp refs with")))
+}
+
 // ---------------------------------------------------------------------------
 // SSTable building
 // ---------------------------------------------------------------------------
@@ -3096,6 +3161,7 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
     };
 
     save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, vp_eid, vp_off).await?;
+    sync_partition_vp_refs(part).await?;
     Ok(true)
 }
 
@@ -3146,6 +3212,7 @@ async fn flush_one_imm_local(
     };
 
     save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, vp_eid, vp_off).await?;
+    sync_partition_vp_refs(part).await?;
     Ok(true)
 }
 

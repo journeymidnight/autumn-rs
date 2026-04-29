@@ -71,6 +71,9 @@ pub struct MetaBlock {
     pub seq_num: u64,
     pub vp_extent_id: u64,
     pub vp_offset: u32,
+    /// Distinct old log extents still referenced by live ValuePointer
+    /// entries in this SST.
+    pub vp_deps: Vec<u64>,
     /// Per-logStream-extent discard stats: extentID -> reclaimable bytes.
     /// Persisted in rowStream as part of the SSTable MetaBlock.
     pub discards: HashMap<u64, i64>,
@@ -102,6 +105,10 @@ impl MetaBlock {
         buf.extend_from_slice(&self.seq_num.to_le_bytes());
         buf.extend_from_slice(&self.vp_extent_id.to_le_bytes());
         buf.extend_from_slice(&self.vp_offset.to_le_bytes());
+        buf.extend_from_slice(&(self.vp_deps.len() as u32).to_le_bytes());
+        for &eid in &self.vp_deps {
+            buf.extend_from_slice(&eid.to_le_bytes());
+        }
         buf.push(0u8); // compression_type = None
                        // Discard map: [count: u32 LE][extent_id: u64 LE][size: i64 LE] * count
         buf.extend_from_slice(&(self.discards.len() as u32).to_le_bytes());
@@ -165,6 +172,11 @@ impl MetaBlock {
         let seq_num = read_u64(payload, &mut c)?;
         let vp_extent_id = read_u64(payload, &mut c)?;
         let vp_offset = read_u32(payload, &mut c)?;
+        let vp_dep_count = read_u32(payload, &mut c)? as usize;
+        let mut vp_deps = Vec::with_capacity(vp_dep_count);
+        for _ in 0..vp_dep_count {
+            vp_deps.push(read_u64(payload, &mut c)?);
+        }
         // skip compression_type byte
         c += 1;
         // Discard map (optional — old SSTs without discards will have nothing left to read)
@@ -194,6 +206,7 @@ impl MetaBlock {
             seq_num,
             vp_extent_id,
             vp_offset,
+            vp_deps,
             discards,
             min_expires_at,
         })
@@ -382,4 +395,39 @@ fn read_bytes(data: &[u8], c: &mut usize, len: usize) -> Result<Vec<u8>> {
     let v = data[*c..*c + len].to_vec();
     *c += len;
     Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meta_block_round_trip_preserves_vp_deps() {
+        let mut discards = HashMap::new();
+        discards.insert(11, 123);
+        let meta = MetaBlock {
+            block_offsets: vec![BlockOffset {
+                key: b"k".to_vec(),
+                relative_offset: 7,
+                block_len: 9,
+            }],
+            bloom_data: vec![1, 2, 3],
+            smallest_key: b"a".to_vec(),
+            biggest_key: b"z".to_vec(),
+            estimated_size: 42,
+            seq_num: 99,
+            vp_extent_id: 52,
+            vp_offset: 4096,
+            vp_deps: vec![21, 48, 52],
+            discards,
+            min_expires_at: 1234,
+        };
+
+        let decoded = MetaBlock::decode(&meta.encode()).unwrap();
+        assert_eq!(decoded.vp_deps, vec![21, 48, 52]);
+        assert_eq!(decoded.vp_extent_id, 52);
+        assert_eq!(decoded.vp_offset, 4096);
+        assert_eq!(decoded.discards.get(&11), Some(&123));
+        assert_eq!(decoded.min_expires_at, 1234);
+    }
 }

@@ -919,6 +919,7 @@ pub(crate) async fn do_compact(
         let voff = if veid == p.vp_extent_id { p.vp_offset } else { compact_vp_off };
         drop(p);
         save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, veid, voff).await?;
+        sync_partition_vp_refs(part).await?;
         return Ok(CompactStats { input_tables, output_tables: 0, entries_kept: 0, entries_discarded, output_bytes: 0 });
     }
 
@@ -946,6 +947,7 @@ pub(crate) async fn do_compact(
     };
 
     save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, final_vp_eid, final_vp_off).await?;
+    sync_partition_vp_refs(part).await?;
     Ok(CompactStats { input_tables, output_tables, entries_kept, entries_discarded, output_bytes })
 }
 

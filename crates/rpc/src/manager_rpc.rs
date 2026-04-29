@@ -47,6 +47,9 @@ pub const MSG_RECONCILE_EXTENTS: u8 = 0x31;
 // any sealed extents in that stream and convert them on the next tick (~5s).
 pub const MSG_UPDATE_STREAM_EC: u8 = 0x32;
 
+// Partition→manager sync of live SST VP dependency snapshot.
+pub const MSG_SYNC_PARTITION_VP_REFS: u8 = 0x33;
+
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
 /// Serialize a value to Bytes using rkyv.
@@ -111,6 +114,10 @@ pub struct MgrExtentInfo {
     pub parity: Vec<u64>,
     pub eversion: u64,
     pub refs: u64,
+    /// Number of live SSTables across all partitions whose ValuePointers
+    /// still reference this extent. Distinct from `refs`, which counts
+    /// direct stream membership via `stream.extent_ids`.
+    pub vp_table_refs: u64,
     pub sealed_length: u64,
     pub avali: u32,
     pub replicate_disks: Vec<u64>,
@@ -161,6 +168,15 @@ pub struct MgrPartitionMeta {
     pub row_stream: u64,
     pub meta_stream: u64,
     pub rg: Option<MgrRange>,
+}
+
+/// Partition-scoped snapshot of live SST VP dependencies.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrPartitionVpRefs {
+    pub part_id: u64,
+    /// extent_id -> number of live SSTs in this partition whose VP deps
+    /// include that extent.
+    pub refs: Vec<(u64, u32)>,
 }
 
 /// Region (partition→PS assignment).
@@ -448,6 +464,19 @@ pub struct RegisterPartitionAddrReq {
     pub address: String,
 }
 // Response: CodeResp
+
+// --- SyncPartitionVpRefs ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SyncPartitionVpRefsReq {
+    pub part_id: u64,
+    pub refs: Vec<(u64, u32)>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SyncPartitionVpRefsResp {
+    pub code: u8,
+    pub message: String,
+}
 
 // --- ReconcileExtents (F109) ---
 // Extent node calls this on startup (after `load_extents`) with every

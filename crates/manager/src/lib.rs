@@ -446,6 +446,7 @@ impl AutumnManager {
         let tasks = c.get_prefix("recoveryTasks/").await?;
         let owner_locks = c.get_prefix("ownerLocks/").await?;
         let partitions = c.get_prefix("partitions/").await?;
+        let partition_vp_refs = c.get_prefix("partitionVpRefs/").await?;
         let ps_nodes = c.get_prefix("psNodes/").await?;
         let regions = c.get_prefix("regions/").await?;
         drop(c);
@@ -511,6 +512,15 @@ impl AutumnManager {
             decoded_partitions.insert(id, part);
         }
 
+        let mut decoded_partition_vp_refs = HashMap::new();
+        for kv in &partition_vp_refs.kvs {
+            let id = Self::parse_id_from_key("partitionVpRefs/", &kv.key)?;
+            let refs: MgrPartitionVpRefs =
+                rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
+            max_id = max_id.max(id);
+            decoded_partition_vp_refs.insert(id, refs);
+        }
+
         let mut decoded_ps_nodes = HashMap::new();
         for kv in &ps_nodes.kvs {
             let id = Self::parse_id_from_key("psNodes/", &kv.key)?;
@@ -534,6 +544,7 @@ impl AutumnManager {
             s.owner_revisions = decoded_owner_revs;
             s.next_revision = s.next_revision.max(max_revision);
             s.partitions = decoded_partitions;
+            s.partition_vp_refs = decoded_partition_vp_refs;
             s.ps_nodes = decoded_ps_nodes;
             s.regions = decoded_regions;
             s.next_id = s.next_id.max(max_id.saturating_add(1));
@@ -849,6 +860,103 @@ impl AutumnManager {
         Ok((dst, modified_extents))
     }
 
+    fn vp_refs_to_map(snapshot: &MgrPartitionVpRefs) -> HashMap<u64, u32> {
+        snapshot.refs.iter().copied().collect()
+    }
+
+    fn partition_vp_ref_deltas(
+        state: &autumn_common::MetadataState,
+        snapshot: &MgrPartitionVpRefs,
+    ) -> HashMap<u64, i64> {
+        let old = state
+            .partition_vp_refs
+            .get(&snapshot.part_id)
+            .cloned()
+            .unwrap_or_default();
+        let old_map = Self::vp_refs_to_map(&old);
+        let new_map = Self::vp_refs_to_map(snapshot);
+        let mut touched = HashSet::new();
+        touched.extend(old_map.keys().copied());
+        touched.extend(new_map.keys().copied());
+
+        let mut deltas = HashMap::new();
+        for extent_id in touched {
+            let old_count = old_map.get(&extent_id).copied().unwrap_or(0) as i64;
+            let new_count = new_map.get(&extent_id).copied().unwrap_or(0) as i64;
+            let delta = new_count - old_count;
+            if delta != 0 {
+                deltas.insert(extent_id, delta);
+            }
+        }
+        deltas
+    }
+
+    fn preview_partition_vp_refs_apply(
+        state: &autumn_common::MetadataState,
+        snapshot: &MgrPartitionVpRefs,
+    ) -> Vec<MgrExtentInfo> {
+        let mut updated = Vec::new();
+        for (extent_id, delta) in Self::partition_vp_ref_deltas(state, snapshot) {
+            if let Some(extent) = state.extents.get(&extent_id) {
+                let mut next = extent.clone();
+                next.vp_table_refs = (next.vp_table_refs as i64 + delta).max(0) as u64;
+                updated.push(next);
+            }
+        }
+        updated
+    }
+
+    fn merge_extent_updates(
+        base: Vec<MgrExtentInfo>,
+        overlays: Vec<MgrExtentInfo>,
+    ) -> Vec<MgrExtentInfo> {
+        let mut merged = HashMap::<u64, MgrExtentInfo>::new();
+        for ex in base {
+            merged.insert(ex.extent_id, ex);
+        }
+        for overlay in overlays {
+            match merged.get_mut(&overlay.extent_id) {
+                Some(existing) => {
+                    existing.vp_table_refs = overlay.vp_table_refs;
+                }
+                None => {
+                    merged.insert(overlay.extent_id, overlay);
+                }
+            }
+        }
+        merged.into_values().collect()
+    }
+
+    fn apply_partition_vp_refs(
+        state: &mut autumn_common::MetadataState,
+        snapshot: MgrPartitionVpRefs,
+    ) -> Vec<MgrExtentInfo> {
+        let updated = Self::preview_partition_vp_refs_apply(state, &snapshot);
+        for ex in &updated {
+            state.extents.insert(ex.extent_id, ex.clone());
+        }
+        state.partition_vp_refs.insert(snapshot.part_id, snapshot);
+        updated
+    }
+
+    fn split_partition_vp_snapshot(
+        state: &autumn_common::MetadataState,
+        src_part_id: u64,
+        dst_part_id: u64,
+    ) -> MgrPartitionVpRefs {
+        let mut snapshot = state
+            .partition_vp_refs
+            .get(&src_part_id)
+            .cloned()
+            .unwrap_or_default();
+        snapshot.part_id = dst_part_id;
+        snapshot
+    }
+
+    fn extent_can_delete(extent: &MgrExtentInfo) -> bool {
+        extent.refs == 0 && extent.vp_table_refs == 0
+    }
+
     /// Apply computed split mutations to the in-memory store.
     fn apply_split_mutations(
         state: &mut autumn_common::MetadataState,
@@ -1158,6 +1266,30 @@ impl AutumnManager {
         }
         Ok(())
     }
+
+    async fn mirror_partition_vp_refs(
+        &self,
+        snapshot: &MgrPartitionVpRefs,
+        extent_puts: &[MgrExtentInfo],
+    ) -> Result<(), AppError> {
+        if let Some(etcd) = &self.etcd {
+            let mut kvs = Vec::with_capacity(extent_puts.len() + 1);
+            kvs.push((
+                format!("partitionVpRefs/{}", snapshot.part_id),
+                rkyv_encode(snapshot).to_vec(),
+            ));
+            for ex in extent_puts {
+                kvs.push((
+                    format!("extents/{}", ex.extent_id),
+                    rkyv_encode(ex).to_vec(),
+                ));
+            }
+            etcd.put_msgs_txn(kvs)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -1165,6 +1297,22 @@ impl AutumnManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_extent(extent_id: u64, refs: u64, vp_table_refs: u64) -> MgrExtentInfo {
+        MgrExtentInfo {
+            extent_id,
+            replicates: vec![],
+            parity: vec![],
+            eversion: 1,
+            refs,
+            vp_table_refs,
+            sealed_length: 0,
+            avali: 0,
+            replicate_disks: vec![],
+            parity_disks: vec![],
+            ec_converted: false,
+        }
+    }
 
     fn run<F: std::future::Future<Output = T>, T>(f: F) -> T {
         compio::runtime::Runtime::new().unwrap().block_on(f)
@@ -1352,5 +1500,78 @@ mod tests {
             let recorded = hb.get(&55).expect("timestamp recorded");
             assert!(recorded.elapsed() < Duration::from_millis(500));
         })
+    }
+
+    #[test]
+    fn partition_vp_refs_diff_updates_extent_counters() {
+        let mut state = autumn_common::MetadataState::default();
+        state.extents.insert(21, test_extent(21, 0, 0));
+        state.extents.insert(48, test_extent(48, 0, 1));
+
+        let updated = AutumnManager::apply_partition_vp_refs(
+            &mut state,
+            MgrPartitionVpRefs {
+                part_id: 7,
+                refs: vec![(21, 2), (48, 1)],
+            },
+        );
+
+        assert_eq!(updated.len(), 2);
+        assert_eq!(state.extents.get(&21).unwrap().vp_table_refs, 2);
+        assert_eq!(state.extents.get(&48).unwrap().vp_table_refs, 2);
+
+        AutumnManager::apply_partition_vp_refs(
+            &mut state,
+            MgrPartitionVpRefs {
+                part_id: 7,
+                refs: vec![(48, 1)],
+            },
+        );
+
+        assert_eq!(state.extents.get(&21).unwrap().vp_table_refs, 0);
+        assert_eq!(state.extents.get(&48).unwrap().vp_table_refs, 2);
+    }
+
+    #[test]
+    fn split_partition_vp_snapshot_clones_parent_refs() {
+        let mut state = autumn_common::MetadataState::default();
+        state.extents.insert(21, test_extent(21, 1, 3));
+        state.partition_vp_refs.insert(
+            10,
+            MgrPartitionVpRefs {
+                part_id: 10,
+                refs: vec![(21, 2)],
+            },
+        );
+
+        let child = AutumnManager::split_partition_vp_snapshot(&state, 10, 11);
+        assert_eq!(child.part_id, 11);
+        assert_eq!(child.refs, vec![(21, 2)]);
+
+        let preview = AutumnManager::preview_partition_vp_refs_apply(&state, &child);
+        assert_eq!(preview.len(), 1);
+        assert_eq!(preview[0].extent_id, 21);
+        assert_eq!(preview[0].vp_table_refs, 5);
+    }
+
+    #[test]
+    fn merge_extent_updates_preserves_ref_and_vp_changes() {
+        let merged = AutumnManager::merge_extent_updates(
+            vec![MgrExtentInfo {
+                refs: 2,
+                eversion: 9,
+                ..test_extent(21, 1, 3)
+            }],
+            vec![MgrExtentInfo {
+                vp_table_refs: 5,
+                ..test_extent(21, 1, 3)
+            }],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].extent_id, 21);
+        assert_eq!(merged[0].refs, 2);
+        assert_eq!(merged[0].eversion, 9);
+        assert_eq!(merged[0].vp_table_refs, 5);
     }
 }
