@@ -752,41 +752,87 @@ thread can drive. Adding workers per partition is intentionally not
 supported (per-partition fan-out conflicts with the rest of the
 thread-per-core design); **scale by adding partitions, not threads**.
 
-**Per-partition concurrent-op formula.** UCX in-flight ops landing on a
-single partition's worker:
+**Per-partition load — two axes.** Two different things land on each
+partition's single UCX worker, and they grow with the client config in
+different ways.
 
-* read-heavy workload (e.g. `perf-check` read phase, point-reads): each
-  client thread connects to every partition that owns one of its keys
-  → per-partition load = `client_threads × pipeline_depth`.
-* write-heavy workload sharded by partition affinity (e.g. `perf-check`
-  write phase): per-partition load = `client_threads × pipeline_depth ÷ partitions`.
+*Concurrent in-flight UCX ops per partition:*
+
+```
+in_flight_per_partition = (client_threads × pipeline_depth) ÷ partitions
+```
+
+This is symmetric for read and write — both perf-check phases cap each
+client thread's `FuturesUnordered` at `pipeline_depth`, so the
+aggregate `client_threads × pipeline_depth` total in-flight is spread
+across all partitions roughly uniformly (perf-check write shards by
+partition affinity in `tid % partitions`; perf-check read sweeps the
+keys it just wrote, which were similarly sharded). At
+`--threads 256 --pipeline-depth 16 --partitions 8` that's
+`256×16÷8 = 512` concurrent ops per partition for *both* phases.
+
+*Open EPs (UCX endpoints) per partition:*
+
+```
+eps_per_partition_read  = client_threads
+eps_per_partition_write = client_threads ÷ partitions
+```
+
+`perf-check` read keeps a per-thread `HashMap<ps_addr, RpcClient>`
+pool, so every client thread eventually has one EP to *every*
+partition that owns one of its keys (`autumn_client.rs:2005-2034`).
+Write pins each thread to one partition (line 1863), so each thread
+opens one EP total. At `--threads 256 --partitions 8` the read phase
+holds **256 EPs per partition's worker** while the write phase holds
+**32**.
+
+**The cliff is the EP-count axis, not the in-flight axis.** Each EP
+has per-EP state in the `ucp_worker` (queue pair, internal buffers,
+progress callbacks); even when the aggregate in-flight count is the
+same, a worker that has to walk 256 EPs per `ucp_worker_progress`
+iteration finishes far less work per second than one walking 32. So
+`perf-check` read collapses well before write at the same thread
+count.
 
 **Empirical bands** at `--partitions 8 --pipeline-depth 16 --size 4k`,
 RoCEv2 cross-host on this cluster, post-`fix(ucx): drop UcxEp
 close-on-Drop`:
 
-| client `--threads` | per-partition concurrent ops (read) | write ops/s | read ops/s | read p99 |
-|---|---|---|---|---|
-| 16  | 256   | 104 k | 970 k | 0.46 ms ← supported |
-| 32  | 512   | 80 k  | 610 k | 1.16 ms ← degrades, p99 ~2.5× |
-| 64  | 1 024 | 14 k  | 105 k | 18 ms ← cliff, p99 ~40× |
-| 256 | 4 096 | ~0    | 0     | — ← hard fail (read collapses, log spams `Connection reset by remote peer`) |
+| `--threads` | EPs / partition (read) | in-flight / partition | write ops/s | read ops/s | read p99 |
+|---|---|---|---|---|---|
+| 16  | 16  | 32  | 104 k | 970 k | 0.46 ms ← supported |
+| 32  | 32  | 64  | 80 k  | 610 k | 1.16 ms ← degrades, p99 ~2.5× |
+| 64  | 64  | 128 | 14 k  | 105 k | 18 ms ← cliff, p99 ~40× |
+| 256 | 256 | 512 | ~0    | 0     | — ← hard fail (read collapses, log spams `Connection reset by remote peer`) |
 
-The cliff between 32 and 64 threads is the rc_mlx5 RNR / endpoint
-timeout firing because a single-threaded progress worker can't drain
-~1 k pending UCX completions fast enough; rdma device caps and FD
-limits both have ~500× headroom on this host (`max_qp = 131 072`,
-`ulimit -n = 1 048 576`).
+The cliff lands between 32 and 64 EPs per partition's worker — beyond
+that, rc_mlx5's RNR / endpoint-timeout fires because the single-threaded
+progress task can't keep up with all the EPs it's responsible for. RDMA
+device caps and FD limits both have ~500× headroom on this host
+(`max_qp = 131 072`, `ulimit -n = 1 048 576`), so this is purely a
+user-space single-thread CPU ceiling, not a resource exhaustion.
 
-**Recommended client config band:** keep `client_threads ×
-pipeline_depth ≲ 256` per partition you read from. Examples:
+**Recommended client config band.** Read fan-out is the binding
+constraint, since EP count for reads = `client_threads`. Keep:
 
-| config | per-partition (read) | OK? |
+```
+client_threads ÷ partitions ≲ 32          # read EPs per partition
+```
+
+Examples:
+
+| config | EPs/partition (read) | OK? |
 |---|---|---|
-| `--threads 16 --pipeline-depth 16 --partitions 8`  | 256   | ✓ |
-| `--threads 32 --pipeline-depth 8  --partitions 8`  | 256   | ✓ |
-| `--threads 64 --pipeline-depth 16 --partitions 8`  | 1 024 | ✗ degraded |
-| `--threads 64 --pipeline-depth 16 --partitions 32` | 256   | ✓ |
+| `--threads 16 --partitions 8`   | 2   | ✓ comfortable |
+| `--threads 32 --partitions 8`   | 4   | ✓ |
+| `--threads 64 --partitions 8`   | 8   | ✓ workable but not measured here |
+| `--threads 256 --partitions 8`  | 32  | borderline — sit at the cliff |
+| `--threads 256 --partitions 32` | 8   | ✓ — same total client load, more partitions |
+
+(The empirical sweep used the same 256-key-space-per-thread that
+write produced, so the read EP count grows linearly with client thread
+count regardless of partition count; the recommendation is to scale by
+partitions any time you need more client threads.)
 
 If you need more total client concurrency, add partitions
 (`AUTUMN_BOOTSTRAP_PRESPLIT=N:hexstring` at bootstrap). Each partition
@@ -795,15 +841,14 @@ scales linearly with partition count.
 
 **TCP transport has no equivalent ceiling** at this scale — kernel
 sockets fan accept/recv I/O across cores. If your workload genuinely
-needs more concurrent inbound connections per PS than UCX supports
-under `--threads × --pipeline-depth ÷ partitions ≲ 256`, pick TCP. UCX
-wins on p99 inside its supported region (0.46 ms vs ~0.5 ms TCP at 16t
-in the table at the top of this section); the win is gone outside the
-supported region.
+needs more concurrent inbound EPs per PS-side worker than UCX supports
+(`client_threads ÷ partitions ≳ 64`), pick TCP. UCX wins on p99 inside
+its supported region (0.46 ms vs ~0.5 ms TCP at 16t in the table at
+the top of this section); the win is gone outside that region.
 
 **The same applies in production.** A workload doing N concurrent
 point-reads on UCX against M partitions per PS should plan for
-N ÷ M ≲ ~256. Otherwise, either add partitions or use TCP for that
+N ÷ M ≲ ~32. Otherwise, either add partitions or use TCP for that
 RPC path.
 
 ---

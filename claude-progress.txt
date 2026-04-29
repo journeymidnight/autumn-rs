@@ -95,6 +95,23 @@ Verification:
     --threads 64 : write  14 k / p99 54 ms · read 105 k / p99 18 ms (cliff)
     --threads 256: write   ~0           · read   0          (hard fail)
 
+  Cliff axis: **EPs per partition's UCX worker, not aggregate in-flight
+  ops**. The aggregate-in-flight axis is symmetric for read and write
+  (FuturesUnordered is capped per-thread at pipeline_depth, so per
+  partition both phases see ~`threads × pipeline_depth ÷ partitions`
+  concurrent ops). What differs is EP fan-out:
+    - perf-check write pins each thread to one partition →
+      EPs / partition = `threads ÷ partitions`. At 256t/p8 = 32.
+    - perf-check read holds per-thread HashMap<ps_addr, RpcClient> →
+      EPs / partition = `threads`. At 256t/p8 = 256 — 8× higher.
+  256 EPs on a single-threaded ucp_worker_progress task is what trips
+  rc_mlx5 RNR; 32 EPs is fine. Rule of thumb baked into the README
+  recommendation: `threads ÷ partitions ≲ 32`.
+
+  (Earlier draft had this as `threads × pipeline_depth / partitions`
+  which conflated EP count with in-flight count — corrected on
+  reread of `crates/server/src/bin/autumn_client.rs:2005-2046`.)
+
   RDMA / OS resource ceilings ruled out as the cause:
     - `ulimit -n` 1 048 576 (~500× headroom)
     - `ibv_devinfo -d mlx5_1 -v`: max_qp=131 072, max_mr=16 777 216

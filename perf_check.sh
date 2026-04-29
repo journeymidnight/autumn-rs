@@ -20,20 +20,29 @@
 # memcpy — the rndv-get-zcopy handshake gets amortized over a much larger
 # DMA; at 4 KB it's pure overhead (see F100-UCX §12).
 #
-# UCX cliff (post fix(ucx): drop UcxEp close-on-Drop, 2026-04-29). Each PS
-# partition has a single-threaded UCX worker; per-partition concurrent
-# in-flight ops = client-threads × pipeline-depth ÷ partitions for write,
-# = client-threads × pipeline-depth for read (point-reads fan out to
-# every partition). Empirical at p=8 d=16 4 KB:
-#   --threads 16  → 256 ops/p → write 104 k · read 970 k · read p99 0.46 ms ✓
-#   --threads 32  → 512 ops/p → write  80 k · read 610 k · read p99 1.16 ms (degrading)
-#   --threads 64  → 1 024 ops/p → write 14 k · read 105 k · read p99 18 ms ✗ cliff
-#   --threads 256 → 4 096 ops/p → write   ~0 · read     0 · ✗ hard fail
-# Rule of thumb: keep client-threads × pipeline-depth / partitions ≲ 256.
-# Need more total concurrency? Add partitions, not threads — see README
-# "UCX scaling and limits" for the full discussion. Numbers above
-# `--threads 32` at `--pipeline-depth 16 --partitions 8` are outside the
-# UCX supported region and should not be used as performance signal.
+# UCX cliff (post fix(ucx): drop UcxEp close-on-Drop, 2026-04-29). Each
+# PS partition runs a single-threaded UCX worker. The cliff is set by
+# *EPs per partition's worker*, not by aggregate in-flight ops:
+#   - perf-check read keeps a per-thread HashMap<ps_addr, RpcClient> →
+#     each thread eventually opens one EP to every partition →
+#     EPs / partition = client_threads.
+#   - perf-check write pins each thread to one partition (tid % parts) →
+#     EPs / partition = client_threads ÷ partitions.
+# In-flight is symmetric (FuturesUnordered cap is per-thread =
+# pipeline_depth) and = client_threads × pipeline_depth ÷ partitions for
+# both phases. The reason read collapses before write at the same thread
+# count is the EP-count axis (8× more EPs/partition for read at p=8).
+# Empirical at p=8 d=16 4 KB:
+#   --threads 16  → 16 EPs/p → write 104 k · read 970 k · p99 0.46 ms ✓
+#   --threads 32  → 32 EPs/p → write  80 k · read 610 k · p99 1.16 ms (degrading)
+#   --threads 64  → 64 EPs/p → write 14 k  · read 105 k · p99 18 ms ✗ cliff
+#   --threads 256 → 256 EPs/p → write ~0   · read   0   · ✗ hard fail
+# Rule of thumb: keep client_threads ÷ partitions ≲ 32 (read EPs per
+# partition's worker). Need more total client concurrency? Add
+# partitions, not threads — see README "UCX scaling and limits" for
+# the full discussion. Numbers above `--threads 32` at
+# `--pipeline-depth 16 --partitions 8` are outside the UCX supported
+# region and should not be used as performance signal.
 #
 # Usage:
 #   ./perf_check.sh                       # default 2×2×2×2 matrix on disk
