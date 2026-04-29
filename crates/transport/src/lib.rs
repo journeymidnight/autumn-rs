@@ -28,30 +28,29 @@ mod tcp;
 #[cfg(feature = "ucx")]
 mod ucx;
 
-pub use probe::{decide, Decision};
+pub use probe::parse_transport_flag;
 pub use tcp::TcpTransport;
 #[cfg(feature = "ucx")]
 pub use ucx::UcxTransport;
 
 static GLOBAL: OnceLock<Box<dyn AutumnTransport>> = OnceLock::new();
 
-/// Initialise the process-global transport based on `AUTUMN_TRANSPORT`
-/// (`auto` / `tcp` / `ucx`; default `auto`). Idempotent — first call wins.
-/// Subsequent calls are no-ops; `current()` returns whatever the first
-/// `init()` chose.
+/// Initialise the process-global transport with an explicit `TransportKind`.
+/// Idempotent — the first call wins; subsequent calls are no-ops.
 ///
-/// Panics if `AUTUMN_TRANSPORT=ucx` is requested but UCX/RDMA isn't
-/// available (explicit config error should fail loud, not silently
-/// fall back).
-pub fn init() -> &'static dyn AutumnTransport {
-    let _ = GLOBAL.set(match decide() {
-        Decision::Tcp => Box::new(TcpTransport) as Box<dyn AutumnTransport>,
+/// Panics if `TransportKind::Ucx` is requested but the binary was built
+/// without the `ucx` feature.
+pub fn init_with(kind: TransportKind) -> &'static dyn AutumnTransport {
+    let _ = GLOBAL.set(match kind {
+        TransportKind::Tcp => Box::new(TcpTransport) as Box<dyn AutumnTransport>,
         #[cfg(feature = "ucx")]
-        Decision::Ucx => Box::new(UcxTransport) as Box<dyn AutumnTransport>,
+        TransportKind::Ucx => Box::new(UcxTransport) as Box<dyn AutumnTransport>,
         #[cfg(not(feature = "ucx"))]
-        Decision::Ucx => unreachable!("decide() can't return Ucx without the ucx feature"),
+        TransportKind::Ucx => panic!(
+            "binary requested --transport ucx but was built without the `ucx` feature"
+        ),
     });
-    let t = &**GLOBAL.get().expect("init");
+    let t = &**GLOBAL.get().expect("init_with");
     tracing::info!("autumn-transport: init kind={:?}", t.kind());
     t
 }
@@ -66,57 +65,72 @@ pub fn current() -> &'static dyn AutumnTransport {
         .expect("autumn_transport::init() must be called once at startup")
 }
 
-/// Read the process-global transport, lazily initialising it if needed.
-///
-/// Use this from library code (`autumn-rpc`, `autumn-stream`, …) so that
-/// callers (tests, third-party users) don't have to remember to call
-/// `init()` first.
+/// Read the process-global transport, lazily initialising it with TCP if
+/// `init_with()` was never called. Use this from library code
+/// (`autumn-rpc`, `autumn-stream`, …) so tests and library users don't
+/// have to call `init_with()` explicitly.
 pub fn current_or_init() -> &'static dyn AutumnTransport {
     if let Some(t) = GLOBAL.get() {
         return &**t;
     }
-    init()
+    init_with(TransportKind::Tcp)
 }
 
-/// Deployment preflight: verify a listen address is on a RoCE-attached
-/// netdev when `kind == Ucx`. Pure function — takes the transport kind
-/// as a parameter so callers can pass `current().kind()` OR a specific
-/// kind (useful in tests where the global might be pinned).
+/// Format `host` (an IPv4 or IPv6 literal, with or without brackets) and
+/// `port` into a parsed `SocketAddr`. Brackets are stripped and re-applied
+/// as needed, so `"::1"`, `"[::1]"`, and `"fdbd:dc62:3:302::14"` all work.
+pub fn format_listen_addr(host: &str, port: u16) -> io::Result<SocketAddr> {
+    let host = host.trim_matches(['[', ']']);
+    let s = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    s.parse()
+        .map_err(|e| io::Error::other(format!("parse listen addr {s:?}: {e}")))
+}
+
+/// Deployment preflight: log a warning when a non-wildcard listen address is
+/// on a netdev without a RoCE GID table and `kind == Ucx`. Always returns
+/// `Ok(())` — UCX may still fall back to TCP/shm at runtime; the caller
+/// decides whether to abort. No-op under TCP.
 ///
-/// Returns `Ok(())` unconditionally under TCP; under UCX returns `Err`
-/// with the list of valid candidates if the address would fall back to
-/// UCX-over-TCP instead of rc_mlx5.
-///
-/// Binaries SHOULD call this after `init()` (passing `current().kind()`)
-/// if they want a hard failure on misconfigured deployment addresses.
-/// Tests typically bind `127.0.0.1:0` which falls back to UCX-over-TCP
-/// — useful for correctness testing — so the check is opt-in, not
-/// wired into `init()`.
+/// Call this after `init_with()` (passing `current().kind()`) in server binaries
+/// so operators see a clear diagnostic when binding on a non-RDMA interface.
 pub fn check_listen_addr(addr: SocketAddr, kind: TransportKind) -> io::Result<()> {
     if kind != TransportKind::Ucx {
         return Ok(());
     }
     let ip = addr.ip();
-    // Wildcards (0.0.0.0, [::]) are acceptable — UCX will bind all
-    // interfaces including any RoCE-attached ones.
+    // Wildcards (0.0.0.0, [::]) are acceptable — UCX binds all interfaces.
     if ip.is_unspecified() {
         return Ok(());
     }
-    let dev = find_netdev_owning_ip(&ip)?;
+    let dev = match find_netdev_owning_ip(&ip) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(
+                "autumn-transport: UCX listen on {ip}: not found on any local netdev ({e}); \
+                 UCX may fall back to TCP/shm"
+            );
+            return Ok(());
+        }
+    };
     let gid_dir = format!("/sys/class/net/{dev}/device/infiniband");
     if std::path::Path::new(&gid_dir).exists() {
         tracing::info!(
             "autumn-transport: UCX listen on {ip} via {dev} (RoCE-attached)"
         );
-        Ok(())
     } else {
         let candidates = roce_candidates();
-        Err(io::Error::other(format!(
-            "AUTUMN_TRANSPORT=ucx but listen ip {ip} (on netdev {dev}) has no \
-             RoCE GID table. Valid RoCE-attached bind candidates: {candidates:?}. \
-             Run scripts/check_roce.sh --listen-candidates to verify."
-        )))
+        tracing::warn!(
+            ?candidates,
+            "autumn-transport: UCX listen on {ip} (netdev {dev}) has no RoCE GID table; \
+             UCX will likely fall back to TCP/shm. \
+             Run scripts/check_roce.sh --listen-candidates to see valid bind IPs."
+        );
     }
+    Ok(())
 }
 
 fn find_netdev_owning_ip(ip: &std::net::IpAddr) -> io::Result<String> {

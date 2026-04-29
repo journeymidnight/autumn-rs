@@ -16,12 +16,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$SCRIPT_DIR/target/release"
 LOG_DIR="/tmp/autumn-rs-logs"
 DATA_ROOT="${AUTUMN_DATA_ROOT:-/tmp/autumn-rs}"
-# F100-UCX: AUTUMN_BIND_HOST overrides the bind/advertise host. Default is
-# IPv4 loopback. For UCX cluster perf, set to a RoCE-attached IP (must be
-# in scripts/check_roce.sh --listen-candidates), e.g.:
-#   AUTUMN_BIND_HOST="[fdbb:dc62:3:3::16]" bash perf_check.sh --shm --ucx
+# AUTUMN_BIND_HOST overrides the bind/advertise host. Default is IPv4 loopback.
+# For UCX/RoCE perf, set to a RoCE-attached IP, e.g.:
+#   AUTUMN_BIND_HOST="[fdbd:dc62:3:302::14]" AUTUMN_TRANSPORT=ucx bash cluster.sh reset 4
 BIND_HOST="${AUTUMN_BIND_HOST:-127.0.0.1}"
 MANAGER_ADDR="${BIND_HOST}:9001"
+# AUTUMN_TRANSPORT selects tcp (default) or ucx. Consumed here and passed to
+# binaries as --transport; binaries never read AUTUMN_TRANSPORT themselves.
+TRANSPORT="${AUTUMN_TRANSPORT:-tcp}"
+case "$TRANSPORT" in
+    tcp|ucx) ;;
+    *) echo "AUTUMN_TRANSPORT must be 'tcp' or 'ucx', got '$TRANSPORT'" >&2; exit 2 ;;
+esac
+unset AUTUMN_TRANSPORT  # don't leak to child processes
 ETCD_DIR="$DATA_ROOT/etcd"
 
 MANAGER="$BIN/autumn-manager-server"
@@ -93,6 +100,24 @@ wait_port() {
     # 127.0.0.1 only — pass that explicitly when waiting for it.
     local host="${4:-${BIND_HOST//[\[\]]/}}"
     echo -n "[cluster] waiting for $name on :$port (host=$host)..."
+    if [[ "$TRANSPORT" == "ucx" ]]; then
+        local log=""
+        local pattern=""
+        case "$name" in
+            manager) log="$LOG_DIR/manager.log"; pattern="manager listening" ;;
+            node*) log="$LOG_DIR/${name}.log"; pattern="autumn-extent-node listening|extent-node shard listening" ;;
+            partition*) log="$LOG_DIR/ps.log"; pattern="partition listener bound" ;;
+            ps) log="$LOG_DIR/ps.log"; pattern="partition server serving" ;;
+        esac
+        if [[ -n "$log" ]]; then
+            for _ in $(seq 1 "$retries"); do
+                if [[ -f "$log" ]] && grep -Eq "$pattern" "$log"; then echo " ok"; return 0; fi
+                sleep 0.5
+            done
+            echo " TIMEOUT"
+            die "$name did not start in time (port $port)"
+        fi
+    fi
     for _ in $(seq 1 $retries); do
         if nc -z "$host" "$port" 2>/dev/null; then echo " ok"; return 0; fi
         sleep 0.5
@@ -166,19 +191,23 @@ launch_extent_node() {
         if (( SHARDS > 1 )); then
             start_proc "node$i" \
                 "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
+                --listen "$BIND_HOST" --transport "$TRANSPORT" \
                 --shards "$SHARDS" --shard-stride "$SHARD_STRIDE"
         else
             start_proc "node$i" \
-                "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR"
+                "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
+                --listen "$BIND_HOST" --transport "$TRANSPORT"
         fi
     else
         if (( SHARDS > 1 )); then
             start_proc "node$i" \
                 "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR" \
+                --listen "$BIND_HOST" --transport "$TRANSPORT" \
                 --shards "$SHARDS" --shard-stride "$SHARD_STRIDE"
         else
             start_proc "node$i" \
-                "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR"
+                "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR" \
+                --listen "$BIND_HOST" --transport "$TRANSPORT"
         fi
     fi
     wait_port "$port" "node$i"
@@ -199,11 +228,11 @@ register_extent_node() {
                 shard_ports_csv="${shard_ports_csv},${sp}"
             fi
         done
-        "$AC" --manager "$MANAGER_ADDR" register-node \
+        "$AC" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" register-node \
             --addr "${BIND_HOST}:$port" --disk "disk-$i" \
             --shard-ports "$shard_ports_csv"
     else
-        "$AC" --manager "$MANAGER_ADDR" register-node --addr "${BIND_HOST}:$port" --disk "disk-$i"
+        "$AC" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" register-node --addr "${BIND_HOST}:$port" --disk "disk-$i"
     fi
 }
 
@@ -215,7 +244,9 @@ launch_ps() {
         "$PS" \
         --psid 1 --port 9201 \
         --manager "$MANAGER_ADDR" \
-        --advertise "${BIND_HOST}:9201"
+        --listen "$BIND_HOST" \
+        --advertise "${BIND_HOST}:9201" \
+        --transport "$TRANSPORT"
     echo "[cluster] PS launched (F099-K: per-partition listeners bind on partition open)"
 }
 
@@ -284,7 +315,8 @@ do_start() {
 
     # manager
     start_proc manager \
-        "$MANAGER" --port 9001 --etcd 127.0.0.1:2379
+        "$MANAGER" --port 9001 --etcd 127.0.0.1:2379 --listen "$BIND_HOST" \
+        --transport "$TRANSPORT"
     wait_port 9001 manager
 
     # Extent node(s): node1=9101, node2=9102, ...
@@ -304,7 +336,7 @@ do_start() {
         local disk_arg
         disk_arg=$(disk_args_for_node 1)
         # shellcheck disable=SC2086  # intentional word splitting for positional args
-        "$AC" --manager "$MANAGER_ADDR" format \
+        "$AC" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" format \
             --listen ":9101" \
             --advertise "${BIND_HOST}:9101" \
             $(echo "$disk_arg" | tr ',' ' ')
@@ -420,7 +452,7 @@ do_start() {
             [[ "$n_parts_arg" =~ ^[0-9]+$ ]] || n_parts_arg=1
             bootstrap_args+=( --presplit "${n_parts_arg}:hexstring" )
         fi
-        "$AC" --manager "$MANAGER_ADDR" bootstrap "${bootstrap_args[@]}"
+        "$AC" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" bootstrap "${bootstrap_args[@]}"
         touch "$bootstrap_marker"
         # Wait for PS to pick up the new partition(s) and finish opening them.
         # Each partition's open() runs stream commit_length calls serially against

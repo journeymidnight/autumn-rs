@@ -21,6 +21,7 @@
 //! and is correct.
 
 use crate::ucx::ffi::*;
+use std::ffi::c_void;
 use std::cell::RefCell;
 use std::io;
 use std::ptr;
@@ -60,9 +61,33 @@ pub(crate) fn process_context() -> *mut ucp_context {
         assert_eq!(st, ucs_status_t::UCS_OK, "ucp_init_version");
 
         tracing::info!("autumn-transport ucx: ucp_context_h initialized");
+        tracing::info!(
+            info = %capture_context_info(ctx),
+            "autumn-transport ucx: context info"
+        );
         CtxPtr(ctx)
     })
     .0
+}
+
+fn capture_context_info(ctx: *mut ucp_context) -> String {
+    let mut buf: *mut libc::c_char = ptr::null_mut();
+    let mut size: libc::size_t = 0;
+    unsafe {
+        let f = libc::open_memstream(&mut buf, &mut size);
+        if f.is_null() {
+            return "<open_memstream failed>".to_string();
+        }
+        ucp_context_print_info(ctx, f as *mut FILE);
+        libc::fclose(f);
+        if buf.is_null() || size == 0 {
+            return String::new();
+        }
+        let slice = std::slice::from_raw_parts(buf as *const u8, size as usize);
+        let info = String::from_utf8_lossy(slice).into_owned();
+        libc::free(buf as *mut c_void);
+        info
+    }
 }
 
 // ---- Per-thread context ----

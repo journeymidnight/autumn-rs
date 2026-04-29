@@ -185,6 +185,7 @@ enum Command {
 struct Args {
     manager: String,
     command: Command,
+    transport: autumn_transport::TransportKind,
 }
 
 fn usage() -> ! {
@@ -218,6 +219,7 @@ fn usage() -> ! {
 fn parse_args() -> Args {
     let raw: Vec<String> = std::env::args().collect();
     let mut manager = String::from("127.0.0.1:9001");
+    let mut transport = autumn_transport::TransportKind::Tcp;
     let mut i = 1;
 
     while i < raw.len() {
@@ -225,6 +227,15 @@ fn parse_args() -> Args {
             "--manager" => {
                 i += 1;
                 manager = raw[i].clone();
+                i += 1;
+            }
+            "--transport" => {
+                i += 1;
+                transport = autumn_transport::parse_transport_flag(&raw[i])
+                    .unwrap_or_else(|bad| {
+                        eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
+                        std::process::exit(2);
+                    });
                 i += 1;
             }
             "--help" | "-h" => usage(),
@@ -713,7 +724,7 @@ fn parse_args() -> Args {
         }
     };
 
-    Args { manager, command }
+    Args { manager, command, transport }
 }
 
 fn parse_replication(s: &str) -> Result<u32> {
@@ -1110,9 +1121,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let _ = autumn_transport::init();
-
     let args = parse_args();
+    let _ = autumn_transport::init_with(args.transport);
     let mut client = ClusterClient::connect(&args.manager).await?;
 
     match args.command {

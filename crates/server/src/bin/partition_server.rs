@@ -1,15 +1,16 @@
-use std::net::SocketAddr;
-
 use anyhow::{Context, Result};
 #[cfg(unix)]
 extern crate libc;
 use autumn_partition_server::PartitionServer;
+use autumn_transport::TransportKind;
 
 struct Args {
     port: u16,
     psid: u64,
     manager: String,
     advertise: Option<String>,
+    bind_host: String,
+    transport: TransportKind,
 }
 
 fn parse_args() -> Args {
@@ -17,6 +18,8 @@ fn parse_args() -> Args {
     let mut psid: u64 = 0;
     let mut manager = String::from("127.0.0.1:9001");
     let mut advertise: Option<String> = None;
+    let mut bind_host = String::from("0.0.0.0");
+    let mut transport = TransportKind::Tcp;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -37,6 +40,18 @@ fn parse_args() -> Args {
             "--advertise" => {
                 i += 1;
                 advertise = Some(args[i].clone());
+            }
+            "--listen" => {
+                i += 1;
+                bind_host = args[i].clone();
+            }
+            "--transport" => {
+                i += 1;
+                transport = autumn_transport::parse_transport_flag(&args[i])
+                    .unwrap_or_else(|bad| {
+                        eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
+                        std::process::exit(2);
+                    });
             }
             // F099-J: `--conn-threads` is a no-op. Pre-F099-J it sized the
             // compio Dispatcher worker pool that ran ps-conn tasks; after
@@ -59,8 +74,10 @@ fn parse_args() -> Args {
                 eprintln!("  --port <PORT>        First partition's listener port [default: 9201]");
                 eprintln!("                       (F099-K: subsequent partitions bind PORT+1, PORT+2, ...)");
                 eprintln!("  --manager <ADDR>     Manager endpoint [default: 127.0.0.1:9001]");
+                eprintln!("  --listen <HOST>      Bind host (IPv4 or bare/bracketed IPv6) [default: 0.0.0.0]");
                 eprintln!("  --advertise <ADDR>   Advertise host for cluster discovery");
                 eprintln!("                       (F099-K: the `host:port` base — port comes from --port)");
+                eprintln!("  --transport <MODE>   Transport backend: tcp (default) or ucx");
                 eprintln!("  --conn-threads <N>   [DEPRECATED, F099-J] accepted but ignored");
                 std::process::exit(0);
             }
@@ -79,6 +96,8 @@ fn parse_args() -> Args {
         psid,
         manager,
         advertise,
+        bind_host,
+        transport,
     }
 }
 
@@ -90,8 +109,6 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-
-    let _ = autumn_transport::init();
 
     // ---- pprof-rs profiling hook (R2 diagnosis) ----
     #[cfg(feature = "profiling")]
@@ -137,6 +154,7 @@ async fn main() -> Result<()> {
     // ---- end pprof hook ----
 
     let args = parse_args();
+    let _ = autumn_transport::init_with(args.transport);
 
     #[cfg(unix)]
     unsafe {
@@ -146,13 +164,15 @@ async fn main() -> Result<()> {
             libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
         }
     }
-    let addr: SocketAddr = format!("0.0.0.0:{}", args.port)
-        .parse()
+    let addr = autumn_transport::format_listen_addr(&args.bind_host, args.port)
         .context("parse listen address")?;
+    autumn_transport::check_listen_addr(addr, autumn_transport::current().kind()).ok();
 
-    let advertise = args
-        .advertise
-        .unwrap_or_else(|| format!("127.0.0.1:{}", args.port));
+    let advertise = args.advertise.unwrap_or_else(|| {
+        autumn_transport::format_listen_addr(&args.bind_host, args.port)
+            .map(|sa| sa.to_string())
+            .unwrap_or_else(|_| format!("{}:{}", args.bind_host, args.port))
+    });
 
     tracing::info!(
         "autumn-ps starting: psid={}, first_part_port={}, manager={}, advertise={}",

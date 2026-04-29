@@ -51,7 +51,7 @@ impl Config {
             manager: "127.0.0.1:9001".to_string(),
             duration_secs: 10,
             value_size: 4096,
-            transport: std::env::var("AUTUMN_TRANSPORT").unwrap_or_else(|_| "auto".into()),
+            transport: "tcp".to_string(),
         };
         // skip arg 0 (executable name) and any `--bench` cargo injects
         let mut it = std::env::args().skip(1);
@@ -85,8 +85,12 @@ impl Config {
                 _ => {}
             }
         }
-        // Apply transport choice via env so autumn_transport::init picks it up.
-        std::env::set_var("AUTUMN_TRANSPORT", &c.transport);
+        let kind = autumn_transport::parse_transport_flag(&c.transport)
+            .unwrap_or_else(|bad| {
+                eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
+                std::process::exit(2);
+            });
+        let _ = autumn_transport::init_with(kind);
         c
     }
 }

@@ -1,8 +1,8 @@
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use autumn_stream::{ExtentNode, ExtentNodeConfig};
+use autumn_transport::TransportKind;
 
 struct Args {
     /// Primary (shard 0) listen port. Sibling shards use
@@ -21,6 +21,9 @@ struct Args {
     shards: u32,
     /// F099-M: port stride between sibling shards.
     shard_stride: u16,
+    /// Bind host for the listener (IPv4 or bare/bracketed IPv6). Default 0.0.0.0.
+    bind_host: String,
+    transport: TransportKind,
 }
 
 fn parse_args() -> Args {
@@ -40,6 +43,8 @@ fn parse_args() -> Args {
         .and_then(|s| s.parse::<u16>().ok())
         .filter(|v| *v >= 1)
         .unwrap_or(10);
+    let mut bind_host = String::from("0.0.0.0");
+    let mut transport = TransportKind::Tcp;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -80,6 +85,18 @@ fn parse_args() -> Args {
                 shard_stride = args[i].parse().expect("--shard-stride must be a number");
                 assert!(shard_stride >= 1, "--shard-stride must be >= 1");
             }
+            "--listen" => {
+                i += 1;
+                bind_host = args[i].clone();
+            }
+            "--transport" => {
+                i += 1;
+                transport = autumn_transport::parse_transport_flag(&args[i])
+                    .unwrap_or_else(|bad| {
+                        eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
+                        std::process::exit(2);
+                    });
+            }
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
@@ -97,6 +114,8 @@ fn parse_args() -> Args {
         wal_dir,
         shards,
         shard_stride,
+        bind_host,
+        transport,
     }
 }
 
@@ -108,21 +127,24 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let _ = autumn_transport::init();
-
     let args = parse_args();
+    let _ = autumn_transport::init_with(args.transport);
 
     // F099-M: each shard i listens on port + i * shard_stride.
     let shard_ports: Vec<u16> = (0..args.shards)
         .map(|i| args.port + (i as u16) * args.shard_stride)
         .collect();
 
-    // Sibling addresses on localhost loopback — used by each shard to
-    // forward control-plane RPCs to the owning sibling when a mismatched
-    // extent_id arrives.
+    // Sibling addresses — used by each shard to forward control-plane RPCs
+    // to the owning sibling when a mismatched extent_id arrives. Must use
+    // the same bind host so UCX/RoCE connections reach the right address.
     let sibling_addrs: Vec<String> = shard_ports
         .iter()
-        .map(|p| format!("127.0.0.1:{p}"))
+        .map(|p| {
+            autumn_transport::format_listen_addr(&args.bind_host, *p)
+                .map(|sa| sa.to_string())
+                .unwrap_or_else(|_| format!("{}:{}", args.bind_host, p))
+        })
         .collect();
 
     tracing::info!(
@@ -147,6 +169,7 @@ fn main() -> Result<()> {
         let siblings = sibling_addrs.clone();
         let shards = args.shards;
         let listen_port = shard_ports[shard_idx as usize];
+        let bind_host = args.bind_host.clone();
 
         let join = std::thread::Builder::new()
             .name(format!("extent-shard-{shard_idx}"))
@@ -154,9 +177,10 @@ fn main() -> Result<()> {
                 let rt = compio::runtime::Runtime::new()
                     .context("create compio runtime")?;
                 rt.block_on(async move {
-                    let addr: SocketAddr = format!("0.0.0.0:{listen_port}")
-                        .parse()
+                    let addr = autumn_transport::format_listen_addr(&bind_host, listen_port)
                         .context("parse listen address")?;
+                    autumn_transport::check_listen_addr(addr, autumn_transport::current().kind())
+                        .ok();
 
                     let mut cfg = if data_dirs.len() == 1 && disk_id.is_some() {
                         let data = data_dirs.into_iter().next().unwrap();
@@ -202,9 +226,9 @@ fn main() -> Result<()> {
 fn run_single_shard(args: Args) -> Result<()> {
     let rt = compio::runtime::Runtime::new().context("create compio runtime")?;
     rt.block_on(async move {
-        let addr: SocketAddr = format!("0.0.0.0:{}", args.port)
-            .parse()
+        let addr = autumn_transport::format_listen_addr(&args.bind_host, args.port)
             .context("parse listen address")?;
+        autumn_transport::check_listen_addr(addr, autumn_transport::current().kind()).ok();
 
         let config = if args.data_dirs.len() == 1 && args.disk_id.is_some() {
             let data = args.data_dirs.into_iter().next().unwrap();

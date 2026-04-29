@@ -157,11 +157,11 @@ NEED_UCX_FEATURE=0
 for t in $TRANSPORT_LIST; do
     [[ "$t" == "ucx" ]] && NEED_UCX_FEATURE=1
 done
-echo "[perf-check] building release binaries$([ $NEED_UCX_FEATURE -eq 1 ] && echo " (with --features autumn-transport/ucx)")..."
+echo "[perf-check] building release binaries$([ $NEED_UCX_FEATURE -eq 1 ] && echo " (with --features autumn-server/ucx)")..."
 cd "$SCRIPT_DIR"
 if (( NEED_UCX_FEATURE )); then
     cargo build --workspace --release --exclude autumn-fuse \
-        --features autumn-transport/ucx 2>&1 \
+        --features autumn-server/ucx 2>&1 \
         | grep -E "^(Compiling|Finished|error)" || true
 else
     cargo build --workspace --release --exclude autumn-fuse 2>&1 \
@@ -208,7 +208,7 @@ run_perf() {
     echo "[perf-check] mode=$mode partitions=$parts pipeline-depth=$depth size=$size_label ($size B) storage=$STORAGE_LABEL"
     echo "[perf-check] baseline=$(basename "$baseline")"
     echo "============================================================"
-    AUTUMN_TRANSPORT="$mode" "$AC" --manager "${AUTUMN_BIND_HOST:-127.0.0.1}:9001" \
+    "$AC" --manager "${AUTUMN_BIND_HOST:-127.0.0.1}:9001" --transport "$mode" \
         perf-check \
         --nosync \
         --threads "$THREADS" \

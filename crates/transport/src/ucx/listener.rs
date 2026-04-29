@@ -6,7 +6,7 @@
 //! `ucp_conn_request_h` onto a futures mpsc; `accept().await` pulls them
 //! off the receiver and finishes the handshake via `ucp_ep_create`.
 
-use crate::ucx::endpoint::UcxConn;
+use crate::ucx::endpoint::{ucx_flush, UcxConn};
 use crate::ucx::ffi::*;
 use crate::ucx::sockaddr;
 use crate::ucx::worker::{ucs_err, with_thread_ctx};
@@ -148,6 +148,7 @@ impl UcxListener {
             }
             Ok(ep)
         })?;
+        ucx_flush(ep).await?;
 
         Ok((UcxConn::from_raw_ep(ep, peer), peer))
     }

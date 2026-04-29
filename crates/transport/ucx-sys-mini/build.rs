@@ -47,6 +47,7 @@ fn main() {
         .allowlist_function("ucp_worker_arm")
         .allowlist_function("ucp_worker_progress")
         .allowlist_function("ucp_ep_create")
+        .allowlist_function("ucp_ep_flush_nbx")
         .allowlist_function("ucp_ep_close_nbx")
         .allowlist_function("ucp_listener_create")
         .allowlist_function("ucp_listener_destroy")

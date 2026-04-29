@@ -1,140 +1,122 @@
 Date: 2026-04-28
 TaskStatus: completed
-Task scope: F121 — node-failure write recovery. Two reported symptoms after
-`cluster.sh stop-node 1` against a 4-node cluster whose tail extents were
-on replicas [1, 3, 5]:
-  (a) `autumn-client put k2` blocks forever (>120 s observed).
-  (b) `autumn-client info` keeps reporting the dead node's disk
-      `online=true` indefinitely.
+Task scope: Drop `decide()`/`AUTUMN_TRANSPORT` env probe; require explicit
+  `--transport tcp|ucx` CLI flag on every binary. Add `ucx` feature
+  forwarding on the autumn-server crate so binaries actually link UCX
+  when built with `--features autumn-server/ucx`.
 
-Root cause:
-  After SIGTERM kills extent-node 1, the kernel sends FIN to the PS-side
-  TCP socket. autumn-rpc's `read_loop` sees EOF, returns `Ok(())`, and
-  clears `pending`. But the `Rc<RpcClient>` is *still in
-  crates/stream/src/conn_pool.rs's `ConnPool`* — the pool only ever evicts
-  on `call*`-error, and `pool.send_vectored` did not evict on error at
-  all. The next `pool.send_vectored("127.0.0.1:9101", …)` returns the
-  same dead client. `client.send_vectored` happily inserts a fresh
-  `(req_id → oneshot::Sender)` into `pending` (no read_loop alive to
-  dispatch it), succeeds at submitting (writer_task still drains the
-  channel; macOS loopback writes to half-closed sockets succeed for
-  small payloads), and the caller's `rx.await` hangs forever. There was
-  no transport-layer timeout on the append fanout (Go autumn has 5 s
-  via `context.WithTimeout` — `streamclient.go:770`). The manager's
-  `select_nodes` did not consult disk liveness, so even after the
-  retry path fired the manager picked node 1 first. And
-  `disk_status_update_loop` only did *positive* updates — `Err(_) =>
-  continue` left a stale `online=true`. A fourth pre-existing bug
-  finally surfaced: the per-disk-id status update path keyed on the
-  extent-node's local `disk_id` (e.g. `--disk-id 4`) which never
-  matches the manager-allocated `disk_id` (e.g. 8), so even a
-  successful df was a silent no-op against `s.disks`.
+Current summary:
+  Twelve files changed in this session.
 
-Fix (this session — five layered changes, all small):
-  Files changed:
-    - crates/rpc/src/client.rs — add `closed: Rc<Cell<bool>>` to
-      RpcClient; set true on read_loop / writer_task exit; short-
-      circuit `send_frame` / `send_vectored` / `send_oneshot` with
-      `RpcError::ConnectionClosed`. New `is_closed()` accessor. New
-      unit test `closed_flag_set_after_peer_disconnect`.
-    - crates/stream/src/conn_pool.rs — `get_client` evicts cached
-      entries with `is_closed() == true`; `send_vectored` evicts on
-      submit error when `client.is_closed()` matches the existing
-      `call*` semantics.
-    - crates/stream/src/client.rs — new `append_fanout_timeout`
-      (env `AUTUMN_STREAM_APPEND_TIMEOUT_MS`, default 5 s, clamped to
-      [200 ms, 60 s]). `launch_append` wraps each replica's response
-      receiver in `compio::time::sleep + futures::future::select`;
-      `Elapsed` becomes a soft error that the existing
-      `append_payload_segments` retry loop escalates to
-      `alloc_new_extent`.
-    - crates/manager/src/recovery.rs — `disk_status_update_loop` and
-      `recovery_collect_loop`'s df poll now call
-      `mark_node_disks_offline(store, node)` on RPC error and
-      `mark_node_disks_online(store, node)` on success; both key on
-      `MgrNodeInfo.disks` (manager-allocated disk_ids), sidestepping
-      the long-standing local-vs-allocated disk_id mismatch in the
-      df response payload.
-    - crates/manager/src/lib.rs — `select_nodes` now takes
-      `&HashMap<u64, MgrDiskInfo>`; pre-filters nodes whose
-      `node.disks` has any `s.disks[id].online == true`. Falls back
-      to the full node set when too few healthy candidates appear
-      (preserves the existing fall-back path in
-      `handle_stream_alloc_extent`).
-    - crates/manager/src/rpc_handlers.rs — pass `&s.disks` to the
-      two `Self::select_nodes` callers (`handle_create_stream`,
-      `handle_stream_alloc_extent`).
-    - feature_list.md — F121 entry inserted between F120 and F116.
+  crates/transport/src/probe.rs
+    - Replaced. `decide()`, `Decision`, `probe_ucx()`, `RDMA_TRANSPORTS`,
+      and the `open_memstream` UCX context probe are all gone. The file
+      now exposes only `parse_transport_flag(&str) -> Result<TransportKind, &str>`,
+      a small CLI-string parser accepting "tcp" or "ucx".
 
-Reference patterns leaned on:
-  - Go autumn streamclient/streamclient.go:770 (5 s
-    `context.WithTimeout` on append fanout) → Layer 3.
-  - Go autumn streamclient/streamclient.go:917-941 (any error → 2×
-    local retry → `MustAllocNewExtent`) → autumn-rs already had this
-    in `append_payload_segments`; F121 just unblocks the trigger.
-  - Go autumn manager/stream_manager/policy.go:16-46
-    (`AllocExtent` filters by `getAllNodeStatus(true)`) → Layer 5.
-  - F119 typed-signal pattern (server returns
-    `CODE_EVERSION_MISMATCH` → client invalidates cache + retries)
-    → Layer 1 reuses the same shape one layer down: the closed flag
-    is the typed signal, the conn-pool evict is the
-    cache-invalidate.
+  crates/transport/src/lib.rs
+    - `pub use probe::{decide, Decision}` → `pub use probe::parse_transport_flag`.
+    - `init()` → `init_with(kind: TransportKind)`. The choice now comes from
+      the caller. Panics if `TransportKind::Ucx` is requested but the binary
+      was built without the `ucx` feature.
+    - `current_or_init()` lazy fallback defaults to TCP (was: read env via
+      `init()` → `decide()`).
+    - `check_listen_addr` doc comment updated from "after init()" to
+      "after init_with()".
 
-Key invariants preserved:
-  - autumn-rpc single-threaded compio: `closed.get()` and
-    `pending.borrow_mut().insert(...)` happen in the same sync block
-    (no awaits between them), so the close-vs-send race is bounded
-    to "cleared after we inserted" → caller's `rx.await` returns
-    `Err` immediately via the existing `pending.clear()` path.
-  - `MgrNodeInfo.disks: Vec<u64>` already carries the manager's
-    allocated disk_ids; F121's `mark_node_disks_*` just consume that
-    list, no schema change.
-  - `select_nodes` falls through to the full sorted set when too few
-    online disks are visible (cold leader before the first df sweep
-    has run) — `handle_stream_alloc_extent`'s per-RPC fall-back is
-    still the load-bearing layer here, F121 just narrows the
-    candidate set in the common case.
+  crates/server/Cargo.toml
+    - Added `ucx = ["autumn-transport/ucx"]` feature so
+      `cargo build --features autumn-server/ucx` actually links UCX into
+      the four server binaries. Pre-fix, `--features autumn-transport/ucx`
+      at the workspace level didn't propagate into autumn-server, so
+      autumn-client and autumn-manager-server were silently TCP-only.
+
+  crates/server/src/bin/manager.rs
+  crates/server/src/bin/extent_node.rs
+  crates/server/src/bin/partition_server.rs
+  crates/server/src/bin/autumn_client.rs
+    - All four binaries: added `--transport tcp|ucx` CLI arg (default `tcp`),
+      moved `parse_args()` before transport init, replaced
+      `autumn_transport::init()` with `init_with(args.transport)`.
+    - partition_server.rs: also added `--transport <MODE>` to `--help` text.
+    - autumn_client.rs: `--transport` is a global arg (alongside `--manager`).
+
+  crates/partition-server/benches/ps_bench.rs
+    - Removed the `std::env::var("AUTUMN_TRANSPORT")` default and the
+      `std::env::set_var("AUTUMN_TRANSPORT", &c.transport)` write-back.
+      Now defaults to "tcp" and calls `autumn_transport::init_with(kind)`
+      explicitly at the end of `Config::from_args()`.
+
+  crates/transport/tests/probe.rs
+    - Replaced the `decide()` env-var test matrix with two simple tests
+      for `parse_transport_flag` accepting "tcp"/"ucx" and rejecting
+      everything else.
+
+  crates/transport/tests/init.rs
+    - Updated the single `init() → init_with(TransportKind::Tcp)` test to
+      reflect the new explicit-init API.
+
+  cluster.sh
+    - Added a TRANSPORT validation block at top: reads AUTUMN_TRANSPORT
+      (default "tcp"), accepts only tcp|ucx, then `unset AUTUMN_TRANSPORT`
+      so it doesn't leak to child binaries.
+    - `wait_port` switched from `${AUTUMN_TRANSPORT:-auto}` to `$TRANSPORT`.
+    - Added `--transport "$TRANSPORT"` to every binary launch:
+      manager, extent-node (4 disk × shard variants), PS, and the three
+      autumn-client invocations (register-node, format, bootstrap).
+
+  perf_check.sh
+    - Build command flag: `--features autumn-transport/ucx` →
+      `--features autumn-server/ucx` (Item F: feature now lives on the
+      autumn-server crate which actually owns the binary build).
+    - `AUTUMN_TRANSPORT="$mode" "$AC" perf-check ...` →
+      `"$AC" --transport "$mode" perf-check ...`. The cluster.sh invocation
+      keeps its `AUTUMN_TRANSPORT="$mode" bash cluster.sh start 3` form;
+      cluster.sh consumes the env var internally and translates it to
+      `--transport` flags.
 
 Verification:
-  - cargo build --workspace --release: clean (only pre-existing
-    dead-code warnings).
-  - cargo test -p autumn-rpc --lib: 8 passed (7 pre-existing + new
-    `closed_flag_set_after_peer_disconnect` covering Layer 1).
-  - cargo test -p autumn-stream --lib: 47 passed.
-  - cargo test -p autumn-partition-server --lib --test-threads=1:
-    101 passed.
-  - cargo test -p autumn-manager --lib: 4 passed, 1 fail
-    (`register_node_duplicate_addr_rejected`, pre-existing F116
-    documented flake — unrelated).
-  - cargo test -p autumn-manager --test f120_graceful_shutdown:
-    1 pass / ~14 s (regression check on F120 untouched).
-  - Live verification end-to-end (mirrors user's exact repro):
-      cluster.sh reset 4
-      put k1 /tmp/v.txt              → ok in ~0.01 s
-      cluster.sh stop-node 1
-      put k2 /tmp/v.txt              → ok in **0.22 s** (was >120 s)
-      info → extent 16 (log_stream tail) on replicas=[7, 3, 5]
-              (excludes node 1); within ~10 s
-              node 1 disk online=false, node 7 disk online=true.
+  1. `cargo build --workspace --release --exclude autumn-fuse`
+     → clean build, default features, no UCX symbols (TCP-only).
+  2. `cargo build --workspace --release --exclude autumn-fuse --features autumn-server/ucx`
+     → clean build with UCX. `nm target/release/autumn-{client,manager-server,ps,extent-node}`
+     all show `ucp_init` symbols (Item F verified — pre-fix only autumn-stream
+     binaries linked UCX; the autumn-server binaries were silently TCP-only).
+  3. `cargo test -p autumn-transport --tests` → all suites pass:
+     init.rs (1), listen_validator.rs (4), loopback_tcp.rs (4),
+     loopback_ucx.rs (0; gated), probe.rs (2 new), tcp_basic.rs (1).
+  4. TCP cluster smoke (`bash cluster.sh reset 3` + put/get) → ok.
+     manager/ps/node logs all contain `autumn-transport: init kind=Tcp`.
+  5. UCX cluster smoke at the user's RoCE GID
+     (`AUTUMN_BIND_HOST="[fdbd:dc62:3:302::14]" AUTUMN_TRANSPORT=ucx bash cluster.sh reset 3`)
+     → ok. All bins log `init kind=Ucx`. UCX itself prints its own
+     `transport '^posix' is not available` warning, which is downstream
+     of UCX's own `UCX_TLS` parsing — not ours.
+  6. Original failing perf test
+     (`AUTUMN_BIND_HOST="[fdbd:dc62:3:302::14]" bash perf_check.sh --ucx --partitions 8 --pipeline-depth 16 --size 4096 --threads 16`)
+     → no panic; full run completed.
+       Write: 99 483 ops/s · 388.61 MB/s · p50 1.56 ms / p99 10.88 ms
+       Read : 940 202 ops/s · 3672.67 MB/s · p50 0.17 ms / p99 0.40 ms
+     For comparison the same workload on TCP at the same GID:
+       Write: 146 689 ops/s · 573.00 MB/s · p50 1.09 ms / p99 8.87 ms
+       Read : 1 203 389 ops/s · 4700.74 MB/s · p50 0.19 ms / p99 0.51 ms
+     UCX < TCP on this host/workload, but separate perf-tuning concern
+     (likely RoCE peer-discovery cost at depth=16 and the `^sysv,^posix`
+     tl exclusions); this task's goal was selectability, not UCX speed.
+  7. CLI validation negative tests:
+       `autumn-manager-server --transport auto`
+         → exit 2, stderr `--transport must be \`tcp\` or \`ucx\`, got "auto"`
+       `AUTUMN_TRANSPORT=auto bash cluster.sh status`
+         → exit 2, stderr `AUTUMN_TRANSPORT must be 'tcp' or 'ucx', got 'auto'`
 
-Out of scope (intentionally not in this commit):
-  - Continuous active health-checking heartbeat in
-    `crates/stream/src/conn_pool.rs` (Go's `MonitorHealth`). Layer
-    1+2+3 are sufficient for the user's symptom; a heartbeat is a
-    follow-up.
-  - Manager-side node-liveness via a heartbeat stream (Go's
-    `LastEcho` ordering). Disk-online (df-driven) is the proxy used
-    by Layer 5.
-  - Replica-recovery dispatch on the extents that still list node 1
-    in `replicates` — that path already works via the F036 recovery
-    loop once the disk is correctly marked offline (Layer 4).
-  - Pre-existing F116 manager unit-test flake
-    (`register_node_duplicate_addr_rejected`).
-  - Pre-existing F099-I timing-sensitive
-    `cq_flushes_fast_ops_while_slow_op_runs` flake (passes on
-    single-test rerun).
+Main gaps: none for this scope.
 
-Next steps (none required for this scope):
-  - If operator reports a peer that consistently passes writes but
-    never replies (half-open TCP hang the OS doesn't surface), bump
-    `AUTUMN_STREAM_APPEND_TIMEOUT_MS` lower to recover sooner.
+Next steps:
+  - UCX < TCP perf gap is its own investigation (likely needs `UCX_TLS`
+    tuning to enable rc_mlx5 specifically rather than excluding shm,
+    or there's a real per-connection latency cost in the current
+    UcxConn endpoint plumbing). Not part of this cleanup task.
+  - If anyone ever wants `--transport auto` back, the path is to add a
+    new `parse_transport_flag` arm and re-introduce a probe — but the
+    current "operator says what they want" model is the user's
+    explicit preference.

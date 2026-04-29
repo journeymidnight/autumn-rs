@@ -770,6 +770,9 @@ pub struct PartitionServer {
     /// address. Defaults to `127.0.0.1` if `--advertise` is omitted or
     /// is not parseable as `host:port`.
     advertise_host: Rc<std::cell::RefCell<String>>,
+    /// F099-K/F100-UCX — host component for the per-partition listener bind.
+    /// For UCX/RoCE this must be the routable HCA IP, not `0.0.0.0`.
+    listen_host: Rc<std::cell::RefCell<String>>,
     /// F104 — global cap on simultaneous compactions across partitions
     /// hosted by this PS process. See `CompactionGate` docs above.
     compact_gate: std::sync::Arc<CompactionGate>,
@@ -868,6 +871,9 @@ impl PartitionServer {
                             next_port_ord: Rc::new(Cell::new(0)),
                             advertise_host: Rc::new(std::cell::RefCell::new(
                                 String::from("127.0.0.1"),
+                            )),
+                            listen_host: Rc::new(std::cell::RefCell::new(
+                                String::from("0.0.0.0"),
                             )),
                             compact_gate: CompactionGate::new(ps_major_compact_parallelism()),
                         };
@@ -1111,7 +1117,13 @@ impl PartitionServer {
                 base_port, ord,
             )
         })?;
-        let listen_addr: SocketAddr = format!("0.0.0.0:{}", listen_port)
+        let listen_host = self.listen_host.borrow().clone();
+        let listen_addr_s = if listen_host.contains(':') {
+            format!("[{}]:{}", listen_host.trim_matches(['[', ']']), listen_port)
+        } else {
+            format!("{}:{}", listen_host, listen_port)
+        };
+        let listen_addr: SocketAddr = listen_addr_s
             .parse()
             .context("parse per-partition listen addr")?;
         let advertise_host = self.advertise_host.borrow().clone();
@@ -1336,6 +1348,7 @@ impl PartitionServer {
         }
         let base_port = first_port - 1;
         self.base_port.set(base_port);
+        *self.listen_host.borrow_mut() = addr.ip().to_string();
 
         // Parse advertise host from `advertise_addr` (falls back to
         // `127.0.0.1`). The per-partition advertise becomes
