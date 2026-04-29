@@ -29,7 +29,10 @@ use std::net::SocketAddr;
 
 fn bind_addr() -> SocketAddr {
     std::env::var("AUTUMN_UCX_TEST_BIND")
-        .unwrap_or_else(|_| "[fdbb:dc62:3:3::16]:0".to_string())
+        .expect(
+            "set AUTUMN_UCX_TEST_BIND=\"[<roce-ip>]:0\" to a RoCE-attached address \
+             (e.g. from scripts/check_roce.sh --listen-candidates)",
+        )
         .parse()
         .expect("parse AUTUMN_UCX_TEST_BIND")
 }
@@ -55,6 +58,48 @@ async fn many_concurrent_4() {
     common::many_concurrent_at(UcxTransport, bind_addr(), 4).await;
 }
 
+/// Repro for transport_bench hang: many sequential ping-pongs over a single
+/// connection should work, just like TCP. If this hangs, the wrapper has a
+/// progress-starvation bug that doesn't surface in the single-roundtrip
+/// `ping_pong` test.
+#[compio::test]
+async fn many_iter_pingpong() {
+    use autumn_transport::AutumnTransport;
+    use compio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use compio::BufResult;
+
+    let t = UcxTransport;
+    let mut listener = t.bind(bind_addr()).await.unwrap();
+    let bound = listener.local_addr().unwrap();
+    const SIZE: usize = 1024;
+    const ITERS: usize = 50;
+
+    let server = compio::runtime::spawn(async move {
+        let (c, _) = listener.accept().await.unwrap();
+        let (mut r, mut w) = c.into_split();
+        for _ in 0..ITERS {
+            let buf = vec![0u8; SIZE];
+            let BufResult(res, b) = r.read_exact(buf).await;
+            res.unwrap();
+            let BufResult(res, _) = w.write_all(b).await;
+            res.unwrap();
+        }
+    });
+
+    let c = t.connect(bound).await.unwrap();
+    let (mut r, mut w) = c.into_split();
+    for i in 0..ITERS {
+        let payload = vec![(i & 0xff) as u8; SIZE];
+        w.write_all(payload).await.0.unwrap();
+        let BufResult(res, b) = r.read_exact(vec![0u8; SIZE]).await;
+        res.unwrap();
+        assert!(b.iter().all(|&v| v == (i & 0xff) as u8));
+    }
+    drop(w);
+    drop(r);
+    let _ = server.await;
+}
+
 /// Cancel-safety: drop a `read` future mid-await. With `InflightGuard`
 /// in place this must not free the buffer while UCX still holds the
 /// pointer (use-after-free). Pre-fix this would either UAF or segfault;
@@ -63,7 +108,7 @@ async fn many_concurrent_4() {
 #[compio::test]
 async fn drop_read_mid_await_is_safe() {
     use autumn_transport::AutumnTransport;
-    use compio::io::{AsyncRead as _, AsyncReadExt as _, AsyncWriteExt as _};
+    use compio::io::{AsyncRead as _, AsyncWriteExt as _};
     use std::time::Duration;
 
     let t = UcxTransport;
@@ -94,4 +139,3 @@ async fn drop_read_mid_await_is_safe() {
     // Wait for the server to finish so we don't tear it down early.
     let _ = server.await;
 }
-

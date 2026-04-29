@@ -20,7 +20,8 @@ ucx-sys-mini = { path = "ucx-sys-mini", optional = true }
 socket2 = { version = "0.5", optional = true, features = ["all"] }
 
 [dev-dependencies]
-compio = { version = "0.18", features = ["net", "io", "macros", "time"] }
+compio = { version = "0.18", features = ["net", "io", "macros", "time", "bytes"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [[bench]]
 name = "transport_bench"
