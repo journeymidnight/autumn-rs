@@ -481,11 +481,12 @@ pub(crate) enum GcTask {
 // ---------------------------------------------------------------------------
 //
 // F088: background_flush_loop on the P-log thread no longer runs
-// build_sst_bytes + row_stream.append + save_table_locs_raw itself. Instead it
-// ships a FlushReq over to a dedicated P-bulk OS thread (its own compio
-// runtime + io_uring + ConnPool), which does the heavy lifting and replies
-// with the new TableMeta + SstReader. P-log then atomically pushes the new
-// table/reader and pops imm — single-threaded semantics are preserved.
+// build_sst_bytes + row_stream.append itself. Instead it ships a FlushReq
+// over to a dedicated P-bulk OS thread (its own compio runtime + io_uring +
+// ConnPool), which does the heavy lifting and replies with the new TableMeta
+// + SstReader. P-log then atomically pushes the new table/reader, pops imm,
+// and publishes the authoritative metaStream checkpoint from its single-
+// threaded `p.tables` state.
 //
 // imm: Arc<Memtable> — parking_lot::RwLock<BTreeMap<_,_>> + AtomicU64,
 // Send+Sync. Safe to cross threads (F099-C).
@@ -497,8 +498,6 @@ pub(crate) struct FlushReq {
     pub(crate) vp_eid: u64,
     pub(crate) vp_off: u32,
     pub(crate) row_stream_id: u64,
-    pub(crate) meta_stream_id: u64,
-    pub(crate) tables_before: Vec<TableMeta>,
     pub(crate) resp_tx: oneshot::Sender<Result<(TableMeta, SstReader)>>,
 }
 
@@ -3039,7 +3038,7 @@ pub(crate) fn maybe_rotate(part: &mut PartitionData) {
 
 pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
     // Snapshot of what P-bulk needs + whether a bulk worker is wired up.
-    let (imm_mem, row_stream_id, meta_stream_id, snap_vp_eid, snap_vp_off, tables_before, req_tx) = {
+    let (imm_mem, row_stream_id, meta_stream_id, snap_vp_eid, snap_vp_off, req_tx, part_sc) = {
         let p = part.borrow();
         let Some(imm_mem) = p.imm.front().cloned() else {
             return Ok(false);
@@ -3050,8 +3049,8 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
             p.meta_stream_id,
             p.vp_extent_id,
             p.vp_offset,
-            p.tables.clone(),
             p.flush_req_tx.clone(),
+            p.stream_client.clone(),
         )
     };
 
@@ -3067,8 +3066,6 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
         vp_eid: snap_vp_eid,
         vp_off: snap_vp_off,
         row_stream_id,
-        meta_stream_id,
-        tables_before,
         resp_tx,
     };
     if req_tx.send(req).await.is_err() {
@@ -3080,13 +3077,25 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
         Err(_) => return Err(anyhow!("bulk thread dropped flush response")),
     };
 
-    // Atomic swap on P-log: push new table/reader, pop drained imm.
-    let mut p = part.borrow_mut();
-    p.tables.push(new_meta);
-    p.sst_readers.push(Arc::new(reader));
-    p.imm.pop_front();
-    // F120-A — wake `merged_partition_loop` if it's parked on imm-full.
-    let _ = p.imm_drained_tx.unbounded_send(());
+    let (tables_snapshot, vp_eid, vp_off) = {
+        // Atomic swap on P-log: push new table/reader, pop drained imm.
+        let mut p = part.borrow_mut();
+        p.tables.push(new_meta);
+        p.sst_readers.push(Arc::new(reader));
+        p.imm.pop_front();
+        // F120-A — wake `merged_partition_loop` if it's parked on imm-full.
+        let _ = p.imm_drained_tx.unbounded_send(());
+
+        let veid = p.vp_extent_id.max(snap_vp_eid);
+        let voff = if veid == p.vp_extent_id {
+            p.vp_offset
+        } else {
+            snap_vp_off
+        };
+        (p.tables.clone(), veid, voff)
+    };
+
+    save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, vp_eid, vp_off).await?;
     Ok(true)
 }
 
@@ -3280,8 +3289,6 @@ async fn flush_worker_loop(
             vp_eid,
             vp_off,
             row_stream_id,
-            meta_stream_id,
-            tables_before,
             resp_tx,
         } = req;
         let bulk_sc = bulk_sc.clone();
@@ -3292,8 +3299,6 @@ async fn flush_worker_loop(
                 vp_eid,
                 vp_off,
                 row_stream_id,
-                meta_stream_id,
-                tables_before,
             )
             .await;
             FlushCompletion { resp_tx, result }
@@ -3357,8 +3362,6 @@ async fn do_flush_on_bulk(
     vp_eid: u64,
     vp_off: u32,
     row_stream_id: u64,
-    meta_stream_id: u64,
-    tables_before: Vec<TableMeta>,
 ) -> Result<(TableMeta, SstReader)> {
     let imm_clone = imm.clone();
     let (sst_bytes, last_seq) = compio::runtime::spawn_blocking(move || {
@@ -3377,14 +3380,6 @@ async fn do_flush_on_bulk(
         estimated_size,
         last_seq,
     };
-
-    // Persist the updated tables list + vp snapshot on meta_stream. Using the
-    // snapshot vp (captured at FlushReq time on P-log) instead of the possibly
-    // advanced current vp means logStream may retain slightly more data until
-    // the next flush — harmless, and avoids a second P-log ↔ P-bulk round trip.
-    let mut tables_after = tables_before;
-    tables_after.push(new_meta.clone());
-    save_table_locs_raw(bulk_sc, meta_stream_id, &tables_after, vp_eid, vp_off).await?;
     Ok((new_meta, reader))
 }
 

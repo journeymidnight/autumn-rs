@@ -336,14 +336,13 @@ P-bulk: flush_worker_loop
   2. build_sst_bytes(imm, vp_eid, vp_off)         ← spawn_blocking (CPU)
   3. bulk_sc.append(row_stream_id, sst_bytes)     ← 128 MB network upload
   4. SstReader::from_bytes(Bytes::from(sst_bytes))
-  5. tables_after = tables_before + new_meta
-  6. save_table_locs_raw(bulk_sc, meta_stream_id, tables_after, vp_eid, vp_off)
-  7. resp_tx.send(Ok((new_meta, reader)))
+  5. resp_tx.send(Ok((new_meta, reader)))
 
 P-log: continuation
-  8. part.tables.push(new_meta)
-  9. part.sst_readers.push(Rc::new(reader))
-  10. part.imm.pop_front()
+  6. part.tables.push(new_meta)
+  7. part.sst_readers.push(Rc::new(reader))
+  8. part.imm.pop_front()
+  9. save_table_locs_raw(part_sc, meta_stream_id, part.tables.clone(), vp)
 ```
 
 The in-thread legacy path (`flush_one_imm_local`) is retained as a fallback for
@@ -351,6 +350,18 @@ when bulk-thread spawn fails.
 
 After flush, `save_table_locs_raw` writes `TableLocations` to `meta_stream` and
 **truncates meta_stream to 1 extent** — only the latest checkpoint is kept.
+
+**Checkpoint publication invariant (post-2026-04-29 fix):** only P-log may
+publish `metaStream` checkpoints. P-bulk may upload the SST and build the
+`SstReader`, but it must not write `TableLocations` from the `FlushReq`
+snapshot. With `AUTUMN_PS_BULK_INFLIGHT_CAP > 1`, two in-flight flushes can
+complete out of order; publishing from stale `tables_before` snapshots can drop
+older SSTs or emit duplicate `(extent_id, offset)` entries in the checkpoint
+(`part 19` restart corruption: extent 48 locs `[len=13754, len=8387]`, extent
+24 missing). The authoritative checkpoint must be emitted only after P-log has
+merged `new_meta` into `part.tables`. Already-corrupted historical checkpoints
+must be repaired out of band; do not add silent normalization to the normal
+reopen path.
 
 **vp snapshot semantics**: the meta_stream checkpoint records the vp
 (`vp_extent_id/vp_offset`) captured at FlushReq send time on P-log — NOT the
@@ -557,6 +568,12 @@ this would EINVAL on a >2 GiB sealed extent and prevent the partition
 from opening at all — the GC failure was the visible symptom, but the
 recovery failure was a ticking time bomb. F105's chunking inside
 `StreamClient::read_bytes_from_extent` covers both paths transparently.
+
+**Historical checkpoint repair (2026-04-29):** the bad `part 19` checkpoint was
+repaired with a one-off server binary, `repair_metastream`, which appends a new
+`TableLocations` record to the target meta stream and leaves normal recovery
+strict. Use this path for preserved broken data; keep `recover_partition`
+simple and authoritative.
 
 ## Fault Recovery: LockedByOther Self-Eviction
 

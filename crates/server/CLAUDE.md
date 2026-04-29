@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Binary-only crate. Contains the 5 executable entry points that wire together the library crates. No library code lives here — all logic is in the other crates.
+Binary-only crate. Contains the executable entry points that wire together the library crates, including one-off repair tooling. No library code lives here — all logic is in the other crates.
 
 ## Binaries
 
@@ -96,6 +96,22 @@ autumn-stream-cli --manager 127.0.0.1:9001 <COMMAND>
 | `read --stream-id <ID> [--length N]` | Read from stream |
 | `alloc-extent --node <ADDR> --extent-id N` | Pre-create an extent on an extent node |
 | `commit-length --node <ADDR> --extent-id N [--revision N]` | Query current write position of an extent |
+
+### `repair-metastream` (`src/bin/repair_metastream.rs`)
+
+One-off repair CLI for historical partition checkpoint corruption.
+
+```
+repair-metastream --manager 127.0.0.1:9001 --meta-stream <ID> \
+  --vp-extent <ID> --vp-offset <OFF> --sst <extent:offset:len> [--sst ...]
+```
+
+- Connects as a normal `StreamClient` owner, reads and prints the current last
+  `TableLocations` record from the target `meta_stream`, prints the requested
+  replacement, then appends the new checkpoint.
+- `--dry-run` prints current + target state without writing.
+- Intended for offline/preserved-data repair only; normal PS recovery should
+  not rely on it.
 
 ## Startup Ordering
 
