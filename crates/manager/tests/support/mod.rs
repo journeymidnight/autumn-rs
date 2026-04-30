@@ -268,8 +268,9 @@ pub async fn ps_compact(ps: &RpcClient, part_id: u64) {
         )
         .await
         .expect("compact");
-    let _: partition_rpc::MaintenanceResp =
+    let r: partition_rpc::MaintenanceResp =
         partition_rpc::rkyv_decode(&resp).expect("decode MaintenanceResp");
+    assert_eq!(r.code, partition_rpc::CODE_OK, "compact failed: {}", r.message);
 }
 
 /// Trigger GC.
@@ -285,8 +286,9 @@ pub async fn ps_gc(ps: &RpcClient, part_id: u64) {
         )
         .await
         .expect("gc");
-    let _: partition_rpc::MaintenanceResp =
+    let r: partition_rpc::MaintenanceResp =
         partition_rpc::rkyv_decode(&resp).expect("decode MaintenanceResp");
+    assert_eq!(r.code, partition_rpc::CODE_OK, "gc failed: {}", r.message);
 }
 
 // ── F099-K per-partition router ───────────────────────────────────────

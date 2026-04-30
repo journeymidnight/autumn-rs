@@ -1285,7 +1285,20 @@ impl StreamClient {
             return Ok(());
         }
         let tail = self.load_stream_tail(stream_id).await?;
-        let commit_val = self.current_commit(&tail).await.unwrap_or(0);
+        let (tail, commit_val) = if tail.extent.sealed_length > 0 {
+            let (_, new_ext) = self.alloc_new_extent(stream_id, 0).await?;
+            let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
+            (
+                StreamTail {
+                    extent: new_ext,
+                    replica_addrs,
+                },
+                0,
+            )
+        } else {
+            let commit_val = self.current_commit(&tail).await.unwrap_or(0);
+            (tail, commit_val)
+        };
         let mut tx_clone = tx.clone();
         tx_clone
             .send(StreamSubmitMsg::ResetTail { tail })

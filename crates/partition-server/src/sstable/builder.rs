@@ -250,6 +250,7 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sstable::iterator::TableIterator;
     use crate::sstable::reader::SstReader;
 
     fn ikey(user_key: &[u8], seq: u64) -> Vec<u8> {
@@ -359,5 +360,74 @@ mod tests {
         let data = b.finish();
         let reader = SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader");
         assert_eq!(reader.min_expires_at, 42);
+    }
+
+    #[test]
+    fn mixed_gallery_like_keys_round_trip() {
+        let mut b = SstBuilder::new(0, 0);
+        let keys = [
+            b".thumb/320/Patreon--leeesovely-October-2024-MissKON.com-241.jpg".as_ref(),
+            b".thumb/320/Patreon--leeesovely-October-2024-MissKON.com-299.jpg".as_ref(),
+            b"Patreon--leeesovely-October-2024-MissKON.com-003.jpg".as_ref(),
+            b"Patreon--leeesovely-October-2024-MissKON.com-300.jpg".as_ref(),
+            b"Patreon--leeesovely-October-2024-MissKON.com-301.jpg".as_ref(),
+        ];
+        for (seq, key) in keys.iter().enumerate() {
+            b.add(&ikey(key, seq as u64 + 1), 1, b"value", 0);
+        }
+
+        let data = b.finish();
+        let reader = std::sync::Arc::new(
+            SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader"),
+        );
+        let mut it = TableIterator::new(reader);
+        it.rewind();
+
+        let mut seen = Vec::new();
+        while let Some(item) = it.item() {
+            seen.push(parse_user_key(&item.key).to_vec());
+            it.next();
+        }
+
+        assert_eq!(seen, keys.iter().map(|k| k.to_vec()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn gallery_like_rightmost_slice_round_trip() {
+        let mut b = SstBuilder::new(0, 0);
+        let mut keys: Vec<Vec<u8>> = (241..=301)
+            .map(|i| {
+                format!(
+                    ".thumb/320/Patreon--leeesovely-October-2024-MissKON.com-{i:03}.jpg"
+                )
+                .into_bytes()
+            })
+            .collect();
+        keys.push(b"Patreon--leeesovely-October-2024-MissKON.com-003.jpg".to_vec());
+        keys.extend((276..=301).map(|i| {
+            format!(
+                "Patreon--leeesovely-October-2024-MissKON.com-{i:03}.jpg"
+            )
+            .into_bytes()
+        }));
+
+        for (seq, key) in keys.iter().enumerate() {
+            b.add(&ikey(key, seq as u64 + 1), 1, b"value", 0);
+        }
+
+        let data = b.finish();
+        let reader = std::sync::Arc::new(
+            SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader"),
+        );
+        let mut it = TableIterator::new(reader);
+        it.rewind();
+
+        let mut seen = Vec::new();
+        while let Some(item) = it.item() {
+            seen.push(parse_user_key(&item.key).to_vec());
+            it.next();
+        }
+
+        assert_eq!(seen, keys);
     }
 }

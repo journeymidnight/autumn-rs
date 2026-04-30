@@ -425,6 +425,12 @@ $AC split <PARTID>
 # Trigger major compaction (clears overlap after split, reclaims space)
 $AC compact <PARTID>
 
+# Repeated rightmost split + compact should preserve existing keys while
+# clearing overlap on each descendant.
+$AC split <PARTID>
+$AC compact <RIGHT_CHILD_PARTID>
+$AC split <RIGHT_CHILD_PARTID>
+
 # Trigger auto GC (reclaims logStream extents with >40% discard)
 $AC gc <PARTID>
 

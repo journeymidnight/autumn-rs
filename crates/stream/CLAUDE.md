@@ -329,6 +329,12 @@ append*(stream_id, payload, must_sync):
      init mutex, loads tail from manager + queries commit_length on replicas,
      then sends ResetTail + SeedCursor to the worker. Subsequent callers find
      initialized=true and skip.
+    - If the manager-reported tail is already sealed (`sealed_length > 0`),
+     `ensure_tail_initialised` allocates a fresh extent immediately instead
+     of seeding the worker with the sealed tail. This is load-bearing after
+     partition split / stream duplication: the child stream may inherit a
+     sealed tail, and waiting for append-time failure leaves descendant
+     compaction stuck behind `LockedByOther` / overlap-clearing failures.
   3. Retry loop (MAX_ALLOC_PER_APPEND=3):
      a. Send Append msg — parks on bounded channel under overload.
      b. Await ack_rx.
@@ -490,6 +496,15 @@ sufficient (and cheaper than DashMap).
     - `file_pread_chunked` — used by `handle_convert_to_ec`, `handle_read_bytes`, `handle_copy_extent`
     - `file_pwrite_chunked` (splits via `Bytes::split_to`, O(1) no-copy) — used by `run_recovery_task`, `handle_re_avali`, `write_shard_local`
     Both fast-path the common case: single syscall when payload ≤ 256 MiB; only loop when larger. Any new full-extent local-file read or write **must** use these helpers — never call `file_pread`/`file_pwrite` directly with a `sealed_length`-sized buffer.
+
+14. **Sealed duplicated tails must allocate on init** — after `multi_modify_split`,
+    the new child stream can inherit a tail extent that the manager has already
+    sealed at the split point. `StreamClient::ensure_tail_initialised()` must
+    treat this as "allocate fresh tail now", not "seed the worker and discover
+    the seal later on append". The latter path can wedge descendant compaction:
+    the first row_stream append hits the old duplicated tail, extent-node
+    fencing surfaces `LockedByOther`, major compaction never clears
+    `has_overlap`, and the next split stays blocked forever.
 
 14. **Read-side eversion freshness after EC conversion (F116 + F119-C)**
     — The manager flips a sealed extent to EC by (a) sending
