@@ -171,6 +171,18 @@ impl AutumnManager {
                 })
                 .collect();
 
+            if uuid_map.is_empty() {
+                return Ok(rkyv_encode(&RegisterNodeResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "address {} already registered by node {} with different disks",
+                        existing_node.address, node_id
+                    ),
+                    node_id: 0,
+                    disk_uuids: vec![],
+                }));
+            }
+
             // Update shard_ports if the node restarted with a different config.
             if existing_node.shard_ports != req.shard_ports {
                 existing_node.shard_ports = req.shard_ports;
