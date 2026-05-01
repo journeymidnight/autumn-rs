@@ -145,6 +145,12 @@ impl DiskFS {
             .join(format!("extent-{extent_id}.meta"))
     }
 
+    fn ec_staging_path(&self, extent_id: u64) -> PathBuf {
+        self.base_dir
+            .join(format!("{:02x}", Self::hash_byte(extent_id)))
+            .join(format!("extent-{extent_id}.ec.dat"))
+    }
+
     /// F109: unlink the `.dat` and `.meta` files for an extent. Idempotent
     /// — `NotFound` errors on either file are downgraded to `Ok(())` so
     /// retries from the manager are safe. Returns Err only on a real I/O
@@ -220,6 +226,7 @@ impl DiskFS {
             None
         }
     }
+
 }
 
 // ─── ExtentNodeConfig ─────────────────────────────────────────────────────────
@@ -1701,6 +1708,7 @@ impl ExtentNode {
             MSG_CONVERT_TO_EC => self.handle_convert_to_ec(payload).await,
             MSG_WRITE_SHARD => self.handle_write_shard(payload).await,
             MSG_DELETE_EXTENT => self.handle_delete_extent(payload).await,
+            MSG_COMMIT_EC_SHARD => self.handle_commit_ec_shard(payload).await,
             _ => Err((StatusCode::InvalidArgument, format!("unknown msg_type {msg_type}"))),
         }
     }
@@ -2067,54 +2075,138 @@ impl ExtentNode {
         .map_err(|e| format!("EC reconstruct failed: {e}"))
     }
 
-    /// Write a single EC shard to local storage, replacing any existing data.
-    /// Called both by the coordinator (writing its own shard) and by write_shard RPC.
+    /// 2PC Phase 1 (prepare): write a single EC shard to a staging file
+    /// (`extent-{id}.ec.dat`), preserving the original `.dat` intact.
+    /// Called by both the coordinator (for its own shard) and the
+    /// WriteShard RPC handler (for remote shards).
     ///
-    /// `new_eversion` is the post-EC eversion the manager has decided
-    /// on (sent in-band via `ExtConvertToEcReq` / `WriteShardReq`).
-    /// Storing it here guarantees that subsequent `MSG_READ_BYTES`
-    /// requests carrying a stale (pre-EC) eversion are rejected with
-    /// `CODE_EVERSION_MISMATCH`, prompting the client to invalidate
-    /// its `extent_info_cache` and refetch the EC layout. Without this
-    /// bump the local check at the top of `handle_read_bytes` is a
-    /// no-op for stale clients (server's eversion still matches the
-    /// pre-EC value) and the read happily returns shrunken-shard
-    /// bytes that the client misinterprets as full-replica data.
+    /// The original data file is untouched — reads continue to serve
+    /// the full replica until Phase 2 (`commit_shard_local`) renames
+    /// the staging file over it. If the process crashes after prepare
+    /// but before commit, the staging file is cleaned up on startup
+    /// and the original data remains intact for a retry.
     async fn write_shard_local(
         &self,
         extent_id: u64,
         shard_index: usize,
         sealed_length: u64,
-        new_eversion: u64,
+        _new_eversion: u64,
         shard_data: &[u8],
     ) -> Result<(), (StatusCode, String)> {
         let entry = self.ensure_extent(extent_id).await
             .map_err(|e| (StatusCode::Internal, e))?;
 
+        let disk = self.disk_for(entry.disk_id)
+            .map_err(|e| (StatusCode::Internal, e))?;
+        let staging_path = disk.ec_staging_path(extent_id);
 
-        file_ref(&entry.file)
-            .set_len(0)
+        // Idempotent: if a prior prepare already wrote .ec.dat with
+        // the correct shard size, skip the redundant I/O.
+        if let Ok(meta) = compio::fs::metadata(&staging_path).await {
+            if meta.len() == shard_data.len() as u64 {
+                tracing::info!(
+                    extent_id,
+                    shard_index,
+                    shard_len = shard_data.len(),
+                    "EC prepare: staging file already exists with correct size, skipping"
+                );
+                return Ok(());
+            }
+        }
+
+        if let Some(parent) = staging_path.parent() {
+            compio::fs::create_dir_all(parent).await
+                .map_err(|e| (StatusCode::Internal, format!("mkdir for staging {extent_id}: {e}")))?;
+        }
+
+        let staging_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&staging_path)
             .await
-            .map_err(|e| (StatusCode::Internal, format!("truncate shard {extent_id}: {e}")))?;
-        file_pwrite_chunked(&entry.file, 0, shard_data.to_vec()).await
-            .map_err(|e| (StatusCode::Internal, format!("write shard {extent_id}/{shard_index}: {e}")))?;
-        file_ref(&entry.file).sync_all().await
-            .map_err(|e| (StatusCode::Internal, format!("sync shard {extent_id}: {e}")))?;
+            .map_err(|e| (StatusCode::Internal, format!("create staging {extent_id}: {e}")))?;
 
-        // F119-E: store the ORIGINAL payload length (passed from the EC
-        // coordinator), not the per-shard size. `entry.sealed_length`
-        // is the logical seal point — it must match the manager's
-        // `MgrExtentInfo.sealed_length` so that commit_length probes,
-        // F119-D's idempotency guard, and any future read-side check
-        // see consistent values. Pre-fix this stored `shard_len`,
-        // which made the EC'd extent appear to be sealed at the
-        // shard size on the local node — `handle_commit_length`
-        // returned shard_len, polluting `current_commit` →
-        // `SeedCursor`, and any code that compared
-        // `entry.sealed_length` against the manager's value would
-        // disagree.
-        let shard_len = shard_data.len() as u64;
+        let staging_cell = std::cell::UnsafeCell::new(staging_file);
+        file_pwrite_chunked(&staging_cell, 0, shard_data.to_vec()).await
+            .map_err(|e| (StatusCode::Internal, format!("write staging {extent_id}/{shard_index}: {e}")))?;
+        file_ref(&staging_cell).sync_all().await
+            .map_err(|e| (StatusCode::Internal, format!("sync staging {extent_id}: {e}")))?;
+
+        tracing::info!(
+            extent_id,
+            shard_index,
+            shard_len = shard_data.len(),
+            sealed_length,
+            "EC prepare: shard written to staging file"
+        );
+        Ok(())
+    }
+
+    /// 2PC Phase 2 (commit): atomically rename the staging file
+    /// (`extent-{id}.ec.dat`) over the original data file (`.dat`),
+    /// reopen the file handle, bump eversion, and persist metadata.
+    ///
+    /// After this call, the node serves shard data on reads. POSIX
+    /// guarantees the rename is atomic — either the old or new file
+    /// is visible, never a partial state. If the process crashes
+    /// before rename, `.ec.dat` persists as a durable prepare record
+    /// and the original `.dat` is intact; the manager's retry will
+    /// re-send CommitEcShard to complete the conversion.
+    async fn commit_shard_local(
+        &self,
+        extent_id: u64,
+        sealed_length: u64,
+        new_eversion: u64,
+    ) -> Result<(), (StatusCode, String)> {
+        let entry = self.ensure_extent(extent_id).await
+            .map_err(|e| (StatusCode::Internal, e))?;
+
+        let disk = self.disk_for(entry.disk_id)
+            .map_err(|e| (StatusCode::Internal, e))?;
+        let staging_path = disk.ec_staging_path(extent_id);
+        let dat_path = disk.extent_path(extent_id);
+
+        let staging_exists = compio::fs::metadata(&staging_path).await.is_ok();
+        if !staging_exists {
+            // Idempotent: staging file already renamed (prior commit
+            // succeeded but response was lost). Check eversion to
+            // confirm this is a replay, not a missing prepare.
+            let local_ev = entry.eversion.load(Ordering::SeqCst);
+            if local_ev >= new_eversion {
+                return Ok(());
+            }
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "commit_shard extent {extent_id}: staging file missing and \
+                     eversion {local_ev} < {new_eversion} — prepare was not run"
+                ),
+            ));
+        }
+
+        compio::fs::rename(&staging_path, &dat_path).await
+            .map_err(|e| (StatusCode::Internal, format!("rename staging {extent_id}: {e}")))?;
+
+        // Reopen the file at the .dat path so entry.file points to the
+        // new (shard) data instead of the old (unlinked) inode.
+        let new_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&dat_path)
+            .await
+            .map_err(|e| (StatusCode::Internal, format!("reopen {extent_id}: {e}")))?;
+        let shard_len = new_file.metadata().await
+            .map(|m| m.len())
+            .map_err(|e| (StatusCode::Internal, format!("metadata {extent_id}: {e}")))?;
+
+        // Replace the file handle. Safe: single-threaded compio, no
+        // concurrent I/O on this extent during EC commit.
+        unsafe { *entry.file.get() = new_file; }
+
         entry.len.store(shard_len, Ordering::SeqCst);
+        // F119-E: sealed_length = original payload length (from manager),
+        // not shard size.
         entry.sealed_length.store(sealed_length.max(shard_len), Ordering::SeqCst);
         entry.avali.store(1, Ordering::SeqCst);
         if new_eversion > 0 {
@@ -2123,6 +2215,14 @@ impl ExtentNode {
 
         self.save_meta(extent_id, &entry).await
             .map_err(|e| (StatusCode::Internal, e))?;
+
+        tracing::info!(
+            extent_id,
+            shard_len,
+            sealed_length,
+            new_eversion,
+            "EC commit: staging renamed to .dat, eversion bumped"
+        );
         Ok(())
     }
 
@@ -2903,6 +3003,7 @@ impl ExtentNode {
         let extent_id = req.extent_id;
         let data_shards = req.data_shards as usize;
         let parity_shards = req.parity_shards as usize;
+        let new_eversion = req.eversion;
 
         if data_shards == 0 || parity_shards == 0 {
             return Err((
@@ -2921,30 +3022,14 @@ impl ExtentNode {
             ));
         }
 
-        // Read the full sealed extent from local storage.
         let entry = self.get_extent(extent_id).await?;
         let mut sealed_length = entry.sealed_length.load(Ordering::SeqCst);
 
-        // F119-D: idempotency guard. After a successful EC conversion,
-        // `write_shard_local` has set `entry.eversion = req.eversion`
-        // and shrunk the local file to `shard_size`. If the manager
-        // re-dispatches convert_to_ec for the same `eversion` (e.g.
-        // because the dispatch loop's candidates list contained the
-        // same extent twice — once per CoW-shared stream — and the
-        // first iteration already completed), we MUST NOT re-encode
-        // the now-shard local file as if it were the original
-        // payload. Doing so would produce sub-shards of size
-        // shard_size(shard_size(original)) ≈ original/K^2 and corrupt
-        // every read past offset shard_size with `logStream value
-        // short` / `ec_read_full_and_slice: offset N past decoded
-        // payload len M`.
-        //
-        // Detect post-EC state: local eversion >= the requested
-        // eversion. (write_shard_local persists `req.eversion` →
-        // `entry.eversion` only on a successful EC install, so this
-        // check is reliable.) Return CODE_OK so the manager's
-        // apply_ec_conversion_done block runs and the state machine
-        // converges — the state is already what the manager wants.
+        // Idempotency guard: if the coordinator's eversion is already
+        // at the post-EC value, a prior 2PC completed successfully
+        // (commit_shard_local is the last step, so eversion bump means
+        // all phases finished). Return OK so the manager's
+        // apply_ec_conversion_done converges.
         let local_eversion = entry.eversion.load(Ordering::SeqCst);
         if local_eversion >= req.eversion && sealed_length > 0 && entry.avali.load(Ordering::SeqCst) > 0 {
             tracing::info!(
@@ -2960,148 +3045,205 @@ impl ExtentNode {
             }));
         }
 
-        // F119-E: manager is the authoritative source for sealed_length /
-        // eversion. If the local view is behind, pull from the manager
-        // (always — even if `sealed_length` looks set locally, the manager
-        // may have advanced eversion via split). After syncing the seal
-        // metadata, if the local file itself is shorter than
-        // mgr.sealed_length (legitimate cause: this replica missed some
-        // appends, manager sealed at the consensus min, and we happen to
-        // be behind), peer-copy from other replicas to bring the file up
-        // to the manager's sealed_length BEFORE encoding. Without the
-        // peer-copy, `file_pread_chunked` would short-read and EC would
-        // encode the truncated payload, leaving manager.sealed_length and
-        // on-disk shard sizes permanently disagreeing — surfaced as
-        // `invalid meta_len` on partition open / `logStream value short`
-        // on VP reads.
-        let mgr_info_opt = self.extent_info_from_manager(extent_id).await.ok().flatten();
-        if let Some(mgr_info) = mgr_info_opt.as_ref() {
-            if mgr_info.sealed_length > 0 {
-                entry.sealed_length.store(mgr_info.sealed_length, Ordering::SeqCst);
-                entry.eversion.store(mgr_info.eversion, Ordering::SeqCst);
-                entry.avali.store(mgr_info.avali, Ordering::SeqCst);
-                let _ = self.save_meta(extent_id, &entry).await;
-                sealed_length = mgr_info.sealed_length;
-                tracing::info!(extent_id, sealed_length, "applied seal from manager for EC convert");
+        // ── Check if coordinator's .ec.dat exists (prior prepare completed) ──
+        //
+        // If the coordinator's own staging file exists with the expected
+        // shard size, a prior prepare phase completed for ALL nodes
+        // (coordinator prepares itself last). Skip RS-encode and jump
+        // straight to Phase 2 (commit).
+        let coordinator_prepared = {
+            let disk = self.disk_for(entry.disk_id)
+                .map_err(|e| (StatusCode::Internal, e))?;
+            let staging = disk.ec_staging_path(extent_id);
+            if let Ok(meta) = compio::fs::metadata(&staging).await {
+                // Validate shard size matches expectation. If sealed_length
+                // is not yet known locally, we can't validate — fall through
+                // to the full path which syncs from manager first.
+                if sealed_length > 0 {
+                    let expected_shard_size = crate::erasure::shard_size(sealed_length as usize, data_shards);
+                    meta.len() == expected_shard_size as u64
+                } else {
+                    false
+                }
+            } else {
+                false
             }
-        }
+        };
 
-        if sealed_length == 0 {
-            return Err((
-                StatusCode::FailedPrecondition,
-                format!("extent {extent_id} is not sealed — cannot EC convert"),
-            ));
-        }
+        if coordinator_prepared {
+            tracing::info!(
+                extent_id,
+                "EC 2PC: coordinator staging file found, skipping to commit phase"
+            );
+        } else {
+            // ── Full prepare path: read, encode, distribute ──
 
-        // Peer-copy gap if local file is short. Manager is the source of
-        // truth for sealed_length, so we trust its value and reach out
-        // to peers (which by construction must hold ≥ sealed_length bytes
-        // — that's how the manager arrived at the seal point in the
-        // first place). Self-heal here so the EC encode reflects the
-        // manager's logical seal.
-        let local_len = entry.len.load(Ordering::SeqCst);
-        if local_len < sealed_length {
-            let mgr_info = mgr_info_opt.ok_or_else(|| {
-                (
-                    StatusCode::Unavailable,
-                    format!(
-                        "extent {extent_id} local_len={local_len} < sealed_length={sealed_length} \
-                         and manager unreachable — cannot peer-copy"
-                    ),
-                )
-            })?;
-            let payload = self
-                .fetch_full_extent_from_sources(&mgr_info, &[])
-                .await
-                .map_err(|e| {
+            // F119-E: sync sealed_length / eversion from manager.
+            let mgr_info_opt = self.extent_info_from_manager(extent_id).await.ok().flatten();
+            if let Some(mgr_info) = mgr_info_opt.as_ref() {
+                if mgr_info.sealed_length > 0 {
+                    entry.sealed_length.store(mgr_info.sealed_length, Ordering::SeqCst);
+                    entry.eversion.store(mgr_info.eversion, Ordering::SeqCst);
+                    entry.avali.store(mgr_info.avali, Ordering::SeqCst);
+                    let _ = self.save_meta(extent_id, &entry).await;
+                    sealed_length = mgr_info.sealed_length;
+                    tracing::info!(extent_id, sealed_length, "applied seal from manager for EC convert");
+                }
+            }
+
+            if sealed_length == 0 {
+                return Err((
+                    StatusCode::FailedPrecondition,
+                    format!("extent {extent_id} is not sealed — cannot EC convert"),
+                ));
+            }
+
+            // Peer-copy gap if local file is short.
+            let local_len = entry.len.load(Ordering::SeqCst);
+            if local_len < sealed_length {
+                let mgr_info = mgr_info_opt.ok_or_else(|| {
                     (
                         StatusCode::Unavailable,
                         format!(
-                            "peer-copy for extent {extent_id} (need {sealed_length}, local has \
-                             {local_len}): {e}"
+                            "extent {extent_id} local_len={local_len} < sealed_length={sealed_length} \
+                             and manager unreachable — cannot peer-copy"
                         ),
                     )
                 })?;
-            if (payload.len() as u64) < sealed_length {
-                return Err((
-                    StatusCode::FailedPrecondition,
-                    format!(
-                        "peer-copy returned {} bytes < sealed_length={sealed_length} for extent \
-                         {extent_id} — data is unrecoverable; operator intervention required",
-                        payload.len()
-                    ),
-                ));
+                let fetched = self
+                    .fetch_full_extent_from_sources(&mgr_info, &[])
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::Unavailable,
+                            format!(
+                                "peer-copy for extent {extent_id} (need {sealed_length}, local has \
+                                 {local_len}): {e}"
+                            ),
+                        )
+                    })?;
+                if (fetched.len() as u64) < sealed_length {
+                    return Err((
+                        StatusCode::FailedPrecondition,
+                        format!(
+                            "peer-copy returned {} bytes < sealed_length={sealed_length} for extent \
+                             {extent_id} — data is unrecoverable; operator intervention required",
+                            fetched.len()
+                        ),
+                    ));
+                }
+                let truncated = fetched[..sealed_length as usize].to_vec();
+                file_ref(&entry.file)
+                    .set_len(0)
+                    .await
+                    .map_err(|e| (StatusCode::Internal, format!("truncate {extent_id}: {e}")))?;
+                file_pwrite_chunked(&entry.file, 0, truncated)
+                    .await
+                    .map_err(|e| (StatusCode::Internal, format!("write {extent_id}: {e}")))?;
+                file_ref(&entry.file)
+                    .sync_all()
+                    .await
+                    .map_err(|e| (StatusCode::Internal, format!("sync {extent_id}: {e}")))?;
+                entry.len.store(sealed_length, Ordering::SeqCst);
+                tracing::info!(extent_id, local_len, sealed_length, "peer-copied missing tail before EC convert");
             }
-            let truncated = payload[..sealed_length as usize].to_vec();
-            file_ref(&entry.file)
-                .set_len(0)
-                .await
-                .map_err(|e| (StatusCode::Internal, format!("truncate {extent_id}: {e}")))?;
-            file_pwrite_chunked(&entry.file, 0, truncated)
-                .await
-                .map_err(|e| (StatusCode::Internal, format!("write {extent_id}: {e}")))?;
-            file_ref(&entry.file)
-                .sync_all()
-                .await
-                .map_err(|e| (StatusCode::Internal, format!("sync {extent_id}: {e}")))?;
-            entry.len.store(sealed_length, Ordering::SeqCst);
-            tracing::info!(
-                extent_id,
-                local_len,
-                sealed_length,
-                "peer-copied missing tail before EC convert"
-            );
+
+            let data = file_pread_chunked(&entry.file, 0, sealed_length as usize).await
+                .map_err(|e| (StatusCode::Internal, format!("read extent {extent_id}: {e}")))?;
+
+            // F117: offload RS encode to blocking thread.
+            let shards = compio::runtime::spawn_blocking(move || {
+                crate::erasure::ec_encode(&data, data_shards, parity_shards)
+            })
+            .await
+            .map_err(|_| (StatusCode::Internal, "ec_encode task panicked".to_string()))?
+            .map_err(|e| (StatusCode::Internal, format!("ec_encode failed: {e}")))?;
+
+            // ── Phase 1 (prepare): write .ec.dat on all nodes ──
+            // Remote nodes first, coordinator (index 0) last.
+            for (i, target_addr) in req.target_addrs.iter().enumerate() {
+                if i == 0 { continue; }
+                let shard = &shards[i];
+                let ws_req = WriteShardReq {
+                    extent_id,
+                    shard_index: i as u32,
+                    sealed_length,
+                    eversion: new_eversion,
+                    payload: Bytes::copy_from_slice(shard),
+                };
+                let sock = parse_addr(target_addr)
+                    .map_err(|e| (StatusCode::Internal, format!("parse addr {target_addr}: {e}")))?;
+                match rpc_oneshot(sock, MSG_WRITE_SHARD, ws_req.encode()).await {
+                    Ok(resp_bytes) => {
+                        let resp = WriteShardResp::decode(resp_bytes)
+                            .map_err(|e| (StatusCode::Internal, format!("decode write_shard resp: {e}")))?;
+                        if resp.code != CODE_OK {
+                            return Err((
+                                StatusCode::Internal,
+                                format!(
+                                    "WriteShard to {target_addr} shard {i}: code={}",
+                                    code_description(resp.code)
+                                ),
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        return Err((
+                            StatusCode::Internal,
+                            format!("WriteShard to {target_addr} shard {i}: {e}"),
+                        ));
+                    }
+                }
+            }
+
+            // Coordinator writes its own shard LAST. If we crash here,
+            // no .ec.dat on coordinator → next retry re-reads full
+            // data and re-distributes (remote nodes' prepare is
+            // idempotent).
+            self.write_shard_local(extent_id, 0, sealed_length, new_eversion, &shards[0]).await?;
+
+            tracing::info!(extent_id, "EC 2PC phase 1 (prepare) complete on all nodes");
         }
 
-        let data = file_pread_chunked(&entry.file, 0, sealed_length as usize).await
-            .map_err(|e| (StatusCode::Internal, format!("read extent {extent_id}: {e}")))?;
-
-        // EC-encode the full extent data into k+m shards.
-        // F117: offload Reed-Solomon encode (CPU-bound, ~100–300 ms on 128 MiB)
-        // to a dedicated blocking thread so the compio event loop keeps
-        // serving append/read RPCs while a sealed extent converts.
-        let shards = compio::runtime::spawn_blocking(move || {
-            crate::erasure::ec_encode(&data, data_shards, parity_shards)
-        })
-        .await
-        .map_err(|_| (StatusCode::Internal, "ec_encode task panicked".to_string()))?
-        .map_err(|e| (StatusCode::Internal, format!("ec_encode failed: {e}")))?;
-
-        // Distribute shards to target nodes via WriteShard RPC.
-        // If connection fails, assume this is our own address and write locally.
-        let new_eversion = req.eversion;
+        // ── Phase 2 (commit): rename .ec.dat → .dat on all nodes ──
+        // Remote nodes first, coordinator last.
         for (i, target_addr) in req.target_addrs.iter().enumerate() {
-            let shard = &shards[i];
-            let ws_req = WriteShardReq {
+            if i == 0 { continue; }
+            let commit_req = CommitEcShardReq {
                 extent_id,
-                shard_index: i as u32,
                 sealed_length,
                 eversion: new_eversion,
-                payload: Bytes::copy_from_slice(shard),
             };
-
             let sock = parse_addr(target_addr)
                 .map_err(|e| (StatusCode::Internal, format!("parse addr {target_addr}: {e}")))?;
-            match rpc_oneshot(sock, MSG_WRITE_SHARD, ws_req.encode()).await {
+            match rpc_oneshot(sock, MSG_COMMIT_EC_SHARD, commit_req.encode()).await {
                 Ok(resp_bytes) => {
-                    let resp = WriteShardResp::decode(resp_bytes)
-                        .map_err(|e| (StatusCode::Internal, format!("decode write_shard resp: {e}")))?;
+                    let resp = CommitEcShardResp::decode(resp_bytes)
+                        .map_err(|e| (StatusCode::Internal, format!("decode commit_ec resp: {e}")))?;
                     if resp.code != CODE_OK {
                         return Err((
                             StatusCode::Internal,
                             format!(
-                                "WriteShard to {target_addr} shard {i}: code={}",
+                                "CommitEcShard to {target_addr} shard {i}: code={}",
                                 code_description(resp.code)
                             ),
                         ));
                     }
                 }
-                Err(_) => {
-                    // Connection failed — assume this is our own address; write locally.
-                    self.write_shard_local(extent_id, i, sealed_length, new_eversion, shard).await?;
+                Err(e) => {
+                    return Err((
+                        StatusCode::Internal,
+                        format!("CommitEcShard to {target_addr} shard {i}: {e}"),
+                    ));
                 }
             }
         }
+
+        // Coordinator commits itself LAST. After this, the idempotency
+        // guard (eversion bump) ensures future retries are a no-op.
+        self.commit_shard_local(extent_id, sealed_length, new_eversion).await?;
+
+        tracing::info!(extent_id, new_eversion, "EC 2PC phase 2 (commit) complete");
 
         Ok(rkyv_encode(&CodeResp {
             code: CODE_OK,
@@ -3132,5 +3274,23 @@ impl ExtentNode {
         .await?;
 
         Ok(WriteShardResp { code: CODE_OK }.encode())
+    }
+
+    async fn handle_commit_ec_shard(&self, payload: Bytes) -> HandlerResult {
+        let req = CommitEcShardReq::decode(payload.clone())
+            .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
+
+        if !self.owns_extent(req.extent_id) {
+            if let Some(sibling) = self.sibling_for_extent(req.extent_id) {
+                return self
+                    .forward_rpc_to_sibling(sibling, MSG_COMMIT_EC_SHARD, payload)
+                    .await;
+            }
+        }
+
+        self.commit_shard_local(req.extent_id, req.sealed_length, req.eversion)
+            .await?;
+
+        Ok(CommitEcShardResp { code: CODE_OK }.encode())
     }
 }

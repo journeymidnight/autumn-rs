@@ -22,6 +22,7 @@ pub const MSG_COPY_EXTENT: u8 = 8;
 pub const MSG_CONVERT_TO_EC: u8 = 9;
 pub const MSG_WRITE_SHARD: u8 = 10;
 pub const MSG_DELETE_EXTENT: u8 = 11;
+pub const MSG_COMMIT_EC_SHARD: u8 = 12;
 // MSG_TYPE_PING = 0xFF is reserved by autumn-rpc for heartbeat
 
 // ── Append (hot path) ────────────────────────────────────────────────────────
@@ -562,6 +563,55 @@ impl WriteShardResp {
     pub fn decode(data: Bytes) -> Result<Self, &'static str> {
         if data.is_empty() {
             return Err("write_shard response too short");
+        }
+        Ok(Self { code: data[0] })
+    }
+}
+
+// ── CommitEcShard (binary — phase-2 of 2PC EC conversion) ────────────────────
+
+/// CommitEcShardRequest: [extent_id: u64 LE][sealed_length: u64 LE][eversion: u64 LE]
+pub const COMMIT_EC_SHARD_HEADER_LEN: usize = 24;
+
+pub struct CommitEcShardReq {
+    pub extent_id: u64,
+    pub sealed_length: u64,
+    pub eversion: u64,
+}
+
+impl CommitEcShardReq {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(COMMIT_EC_SHARD_HEADER_LEN);
+        buf.put_u64_le(self.extent_id);
+        buf.put_u64_le(self.sealed_length);
+        buf.put_u64_le(self.eversion);
+        buf.freeze()
+    }
+
+    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
+        if data.len() < COMMIT_EC_SHARD_HEADER_LEN {
+            return Err("commit_ec_shard request too short");
+        }
+        let extent_id = data.get_u64_le();
+        let sealed_length = data.get_u64_le();
+        let eversion = data.get_u64_le();
+        Ok(Self { extent_id, sealed_length, eversion })
+    }
+}
+
+/// CommitEcShardResponse: [code: u8]
+pub struct CommitEcShardResp {
+    pub code: u8,
+}
+
+impl CommitEcShardResp {
+    pub fn encode(&self) -> Bytes {
+        Bytes::copy_from_slice(&[self.code])
+    }
+
+    pub fn decode(data: Bytes) -> Result<Self, &'static str> {
+        if data.is_empty() {
+            return Err("commit_ec_shard response too short");
         }
         Ok(Self { code: data[0] })
     }

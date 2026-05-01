@@ -640,3 +640,4 @@ pub const EXT_MSG_REQUIRE_RECOVERY: u8 = 6;
 pub const EXT_MSG_RE_AVALI: u8 = 7;
 pub const EXT_MSG_CONVERT_TO_EC: u8 = 9;
 pub const EXT_MSG_DELETE_EXTENT: u8 = 11;
+pub const EXT_MSG_COMMIT_EC_SHARD: u8 = 12;

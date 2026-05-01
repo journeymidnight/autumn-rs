@@ -38,8 +38,9 @@ async fn read_bytes_rejects_eversion_zero_after_post_seal_bump() {
     let alloc = conn.alloc_extent(extent_id).await;
     assert_eq!(alloc.code, CODE_OK);
 
-    // Pretend we're the EC coordinator's WriteShard arrival: this also
-    // bumps `entry.eversion` from 0 to 5 and shrinks the on-disk file
+    // Pretend we're the EC coordinator's 2PC: WriteShard (prepare) writes
+    // the shard to .ec.dat, then CommitEcShard (commit) renames it to
+    // .dat and bumps eversion from 0 to 5, shrinking the on-disk file
     // to the shard payload (mimicking post-EC state where a value at
     // offset > shard_len no longer fits).
     let shard_payload = vec![0xABu8; 1024];
@@ -47,6 +48,8 @@ async fn read_bytes_rejects_eversion_zero_after_post_seal_bump() {
         .write_shard(extent_id, 0, 1024, 5, shard_payload)
         .await;
     assert_eq!(ws.code, CODE_OK, "write_shard should succeed");
+    let cs = conn.commit_ec_shard(extent_id, 1024, 5).await;
+    assert_eq!(cs.code, CODE_OK, "commit_ec_shard should succeed");
 
     // A client with stale ExtentInfo (eversion=0 cached when the extent
     // was open) attempts to read past the shard boundary. Pre-fix the
@@ -83,11 +86,13 @@ async fn batched_read_returns_eversion_mismatch_response() {
     let extent_id: u64 = 7778;
     assert_eq!(conn.alloc_extent(extent_id).await.code, CODE_OK);
 
-    // Bump entry.eversion to 7 + shrink to 1 KiB, simulating post-EC.
+    // 2PC: prepare (write .ec.dat) + commit (rename + bump eversion to 7).
     let ws = conn
         .write_shard(extent_id, 0, 1024, 7, vec![0xCDu8; 1024])
         .await;
     assert_eq!(ws.code, CODE_OK);
+    let cs = conn.commit_ec_shard(extent_id, 1024, 7).await;
+    assert_eq!(cs.code, CODE_OK);
 
     // Stale non-zero eversion — pre-fix this hit the batched path's
     // FailedPrecondition error frame, bypassing the client's

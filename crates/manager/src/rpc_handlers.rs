@@ -930,6 +930,7 @@ impl AutumnManager {
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
         let out = {
+            let ec_inflight = self.ec_conversion_inflight.borrow();
             let mut guard = self.store.inner.borrow_mut();
             let s: &mut autumn_common::MetadataState = &mut guard;
             (|| -> Result<
@@ -964,10 +965,17 @@ impl AutumnManager {
                 // node entries first so the borrow checker sees disjoint
                 // fields (split-borrow only works on a bare &mut struct,
                 // and even then nested calls confuse it).
+                // Skip extents undergoing EC conversion — their physical
+                // files must not be deleted until conversion completes.
                 let needed_addrs: HashMap<u64, MgrExtentInfo> = s
                     .extents
                     .iter()
-                    .filter(|(eid, e)| removed.contains(eid) && e.refs == 1 && e.vp_table_refs == 0)
+                    .filter(|(eid, e)| {
+                        removed.contains(eid)
+                            && e.refs == 1
+                            && e.vp_table_refs == 0
+                            && !ec_inflight.contains(eid)
+                    })
                     .map(|(eid, e)| (*eid, e.clone()))
                     .collect();
                 for (eid, extent) in &needed_addrs {
@@ -984,7 +992,9 @@ impl AutumnManager {
                     if let Some(extent) = s.extents.get_mut(&extent_id) {
                         if extent.refs <= 1 {
                             extent.refs = 0;
-                            if Self::extent_can_delete(extent) {
+                            if Self::extent_can_delete(extent)
+                                && !ec_inflight.contains(&extent_id)
+                            {
                                 s.extents.remove(&extent_id);
                                 extent_deletes.push(extent_id);
                             } else {
@@ -1044,6 +1054,7 @@ impl AutumnManager {
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
         let out = {
+            let ec_inflight = self.ec_conversion_inflight.borrow();
             let mut guard = self.store.inner.borrow_mut();
             let s: &mut autumn_common::MetadataState = &mut guard;
             (|| -> Result<
@@ -1090,10 +1101,16 @@ impl AutumnManager {
                 // F109: snapshot replica addrs for refs→0 extents BEFORE
                 // we mutably remove them from `s.extents`. See
                 // `handle_stream_punch_holes` for the same pattern.
+                // Skip extents undergoing EC conversion.
                 let needed_addrs: HashMap<u64, MgrExtentInfo> = s
                     .extents
                     .iter()
-                    .filter(|(eid, e)| removed.contains(eid) && e.refs == 1 && e.vp_table_refs == 0)
+                    .filter(|(eid, e)| {
+                        removed.contains(eid)
+                            && e.refs == 1
+                            && e.vp_table_refs == 0
+                            && !ec_inflight.contains(eid)
+                    })
                     .map(|(eid, e)| (*eid, e.clone()))
                     .collect();
                 for (eid, extent) in &needed_addrs {
@@ -1110,7 +1127,9 @@ impl AutumnManager {
                     if let Some(extent) = s.extents.get_mut(&extent_id) {
                         if extent.refs <= 1 {
                             extent.refs = 0;
-                            if Self::extent_can_delete(extent) {
+                            if Self::extent_can_delete(extent)
+                                && !ec_inflight.contains(&extent_id)
+                            {
                                 s.extents.remove(&extent_id);
                                 extent_deletes.push(extent_id);
                             } else {

@@ -180,4 +180,23 @@ impl TestConn {
             .expect("write_shard RPC");
         WriteShardResp::decode(resp).expect("decode WriteShardResp")
     }
+
+    pub async fn commit_ec_shard(
+        &self,
+        extent_id: u64,
+        sealed_length: u64,
+        eversion: u64,
+    ) -> CommitEcShardResp {
+        let req = CommitEcShardReq {
+            extent_id,
+            sealed_length,
+            eversion,
+        };
+        let resp = self
+            .pool
+            .call(&self.addr, MSG_COMMIT_EC_SHARD, req.encode())
+            .await
+            .expect("commit_ec_shard RPC");
+        CommitEcShardResp::decode(resp).expect("decode CommitEcShardResp")
+    }
 }
