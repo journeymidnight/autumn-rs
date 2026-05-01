@@ -375,6 +375,19 @@ pub(crate) async fn handle_split_part(
         return Err((StatusCode::FailedPrecondition, split_err));
     }
 
+    // The manager sealed all 3 stream tails as part of the split. The
+    // P-log stream workers still cache the old (now-sealed) tails and
+    // would keep appending beyond sealed_length. On recovery,
+    // read_last_extent_data only reads up to sealed_length, so any
+    // post-split checkpoint/SST appended beyond that point is invisible
+    // — causing "invalid meta_len" or missing SSTs.
+    part_sc.invalidate_stream(log_stream_id);
+    part_sc.invalidate_stream(row_stream_id);
+    part_sc.invalidate_stream(meta_stream_id);
+    // P-bulk owns a separate StreamClient on another OS thread; signal
+    // it to invalidate its row_stream worker on the next FlushReq.
+    part.borrow().need_invalidate_row_stream.set(true);
+
     // Narrow PS-local rg to match the manager's new left range and
     // re-evaluate has_overlap against the SSTables. Without this,
     // sync_regions_once would leave the partition with a stale wide rg

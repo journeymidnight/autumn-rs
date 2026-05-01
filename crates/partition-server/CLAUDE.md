@@ -537,6 +537,11 @@ handle_split_part(req):
   7. commit_length on each of {log, row, meta} stream
   8. multi_modify_split(mid_key, part_id, sealed_lengths) on manager
        (up to 8 retries, exponential backoff 100ms → 2s)
+  8b. Invalidate stream workers: call part_sc.invalidate_stream()
+       on all 3 stream IDs (log, row, meta) and set
+       need_invalidate_row_stream for P-bulk. The manager sealed
+       the old tails; without invalidation the stale workers keep
+       appending beyond sealed_length and recovery misses that data.
   9. F103: narrow PS-local part.rg to [auth_rg.start, mid_key) AND
        re-evaluate has_overlap by checking each sst_reader's smallest/
        biggest key against the new rg. Without this the same staleness

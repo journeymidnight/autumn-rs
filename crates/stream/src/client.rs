@@ -954,6 +954,17 @@ impl StreamClient {
         tx
     }
 
+    /// Discard the cached worker and init-lock for `stream_id` so the next
+    /// append spawns a fresh worker that re-loads the tail from the manager.
+    /// Used after partition split: the manager sealed the old tail, but the
+    /// existing worker still targets it.  Without invalidation the worker
+    /// keeps appending beyond `sealed_length`, and recovery (which reads up
+    /// to `sealed_length`) silently loses that data.
+    pub fn invalidate_stream(&self, stream_id: u64) {
+        self.stream_workers.borrow_mut().remove(&stream_id);
+        self.stream_init_locks.borrow_mut().remove(&stream_id);
+    }
+
     async fn load_stream_tail(&self, stream_id: u64) -> Result<StreamTail> {
         let req = manager_rpc::rkyv_encode(&StreamInfoReq {
             stream_ids: vec![stream_id],

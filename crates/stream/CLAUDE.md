@@ -455,6 +455,7 @@ sufficient (and cheaper than DashMap).
 | `get_stream_info(stream_id)` | Query StreamInfo from manager |
 | `get_extent_info(extent_id)` | Query ExtentInfo from manager |
 | `multi_modify_split(req)` | Forward partition split to manager |
+| `invalidate_stream(stream_id)` | Discard cached worker + init-lock for a stream; next append re-loads the tail from manager and spawns a fresh worker. Used after split to prevent appending beyond the sealed tail. |
 
 ---
 

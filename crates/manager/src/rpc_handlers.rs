@@ -1509,14 +1509,18 @@ impl AutumnManager {
             refs: req.refs,
         };
         let extent_puts = {
-            let mut s = self.store.inner.borrow_mut();
-            Self::apply_partition_vp_refs(&mut s, snapshot.clone())
+            let s = self.store.inner.borrow();
+            Self::preview_partition_vp_refs_apply(&s, &snapshot)
         };
         if let Err(err) = self.mirror_partition_vp_refs(&snapshot, &extent_puts).await {
             return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
                 code: Self::err_to_code(&err),
                 message: err.to_string(),
             }));
+        }
+        {
+            let mut s = self.store.inner.borrow_mut();
+            Self::apply_partition_vp_refs(&mut s, snapshot);
         }
         Ok(rkyv_encode(&SyncPartitionVpRefsResp {
             code: CODE_OK,

@@ -453,6 +453,7 @@ pub(crate) struct PartitionData {
     tables: Vec<TableMeta>,
     sst_readers: Vec<Arc<SstReader>>,
     has_overlap: Cell<u32>,
+    need_invalidate_row_stream: Cell<bool>,
     vp_extent_id: u64,
     vp_offset: u32,
     stream_client: Rc<StreamClient>,
@@ -501,6 +502,7 @@ pub(crate) struct FlushReq {
     pub(crate) vp_eid: u64,
     pub(crate) vp_off: u32,
     pub(crate) row_stream_id: u64,
+    pub(crate) invalidate_row_stream: bool,
     pub(crate) resp_tx: oneshot::Sender<Result<(TableMeta, SstReader)>>,
 }
 
@@ -2066,6 +2068,7 @@ async fn partition_thread_main(
         tables,
         sst_readers,
         has_overlap: Cell::new(if detected_overlap { 1 } else { 0 }),
+        need_invalidate_row_stream: Cell::new(false),
         vp_extent_id: vp_eid,
         vp_offset: vp_off,
         stream_client: part_sc.clone(),
@@ -3103,11 +3106,12 @@ pub(crate) fn maybe_rotate(part: &mut PartitionData) {
 
 pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
     // Snapshot of what P-bulk needs + whether a bulk worker is wired up.
-    let (imm_mem, row_stream_id, meta_stream_id, snap_vp_eid, snap_vp_off, req_tx, part_sc) = {
+    let (imm_mem, row_stream_id, meta_stream_id, snap_vp_eid, snap_vp_off, req_tx, part_sc, invalidate_row) = {
         let p = part.borrow();
         let Some(imm_mem) = p.imm.front().cloned() else {
             return Ok(false);
         };
+        let inv = p.need_invalidate_row_stream.replace(false);
         (
             imm_mem,
             p.row_stream_id,
@@ -3116,12 +3120,15 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
             p.vp_offset,
             p.flush_req_tx.clone(),
             p.stream_client.clone(),
+            inv,
         )
     };
 
     let Some(mut req_tx) = req_tx else {
         // P-bulk thread failed to spawn — fall back to in-thread flush so
         // the partition keeps working (degraded performance, legacy path).
+        // Legacy path uses part_sc for row_stream; invalidation already
+        // happened on part_sc in handle_split_part.
         return flush_one_imm_local(part, imm_mem, row_stream_id, meta_stream_id, snap_vp_eid, snap_vp_off).await;
     };
 
@@ -3131,6 +3138,7 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
         vp_eid: snap_vp_eid,
         vp_off: snap_vp_off,
         row_stream_id,
+        invalidate_row_stream: invalidate_row,
         resp_tx,
     };
     if req_tx.send(req).await.is_err() {
@@ -3151,13 +3159,7 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
         // F120-A — wake `merged_partition_loop` if it's parked on imm-full.
         let _ = p.imm_drained_tx.unbounded_send(());
 
-        let veid = p.vp_extent_id.max(snap_vp_eid);
-        let voff = if veid == p.vp_extent_id {
-            p.vp_offset
-        } else {
-            snap_vp_off
-        };
-        (p.tables.clone(), veid, voff)
+        (p.tables.clone(), snap_vp_eid, snap_vp_off)
     };
 
     save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, vp_eid, vp_off).await?;
@@ -3188,7 +3190,7 @@ async fn flush_one_imm_local(
     let estimated_size = sst_bytes.len() as u64;
     let reader = Arc::new(SstReader::from_bytes(Bytes::from(sst_bytes))?);
 
-    let (tables_snapshot, vp_eid, vp_off) = {
+    let tables_snapshot = {
         let mut p = part.borrow_mut();
         p.tables.push(TableMeta {
             extent_id: result.extent_id,
@@ -3202,16 +3204,10 @@ async fn flush_one_imm_local(
         // F120-A — wake merged_partition_loop on imm-full back-pressure.
         let _ = p.imm_drained_tx.unbounded_send(());
 
-        let veid = p.vp_extent_id.max(snap_vp_eid);
-        let voff = if veid == p.vp_extent_id {
-            p.vp_offset
-        } else {
-            snap_vp_off
-        };
-        (p.tables.clone(), veid, voff)
+        p.tables.clone()
     };
 
-    save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, vp_eid, vp_off).await?;
+    save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, snap_vp_eid, snap_vp_off).await?;
     sync_partition_vp_refs(part).await?;
     Ok(true)
 }
@@ -3356,10 +3352,14 @@ async fn flush_worker_loop(
             vp_eid,
             vp_off,
             row_stream_id,
+            invalidate_row_stream,
             resp_tx,
         } = req;
         let bulk_sc = bulk_sc.clone();
         Box::pin(async move {
+            if invalidate_row_stream {
+                bulk_sc.invalidate_stream(row_stream_id);
+            }
             let result = do_flush_on_bulk(
                 &bulk_sc,
                 imm,

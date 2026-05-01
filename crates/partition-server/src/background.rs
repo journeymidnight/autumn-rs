@@ -915,10 +915,8 @@ pub(crate) async fn do_compact(
         let mut p = part.borrow_mut();
         remove_compacted_tables(&mut p, &compact_keys);
         let tables_snapshot = p.tables.clone();
-        let veid = p.vp_extent_id.max(compact_vp_eid);
-        let voff = if veid == p.vp_extent_id { p.vp_offset } else { compact_vp_off };
         drop(p);
-        save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, veid, voff).await?;
+        save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, compact_vp_eid, compact_vp_off).await?;
         sync_partition_vp_refs(part).await?;
         return Ok(CompactStats { input_tables, output_tables: 0, entries_kept: 0, entries_discarded, output_bytes: 0 });
     }
@@ -934,19 +932,17 @@ pub(crate) async fn do_compact(
     drop(readers);
     drop(readers_with_meta);
 
-    let (tables_snapshot, final_vp_eid, final_vp_off) = {
+    let tables_snapshot = {
         let mut p = part.borrow_mut();
         remove_compacted_tables(&mut p, &compact_keys);
         for (tbl_meta, reader) in new_readers {
             p.sst_readers.push(reader);
             p.tables.push(tbl_meta);
         }
-        let veid = p.vp_extent_id.max(compact_vp_eid);
-        let voff = if veid == p.vp_extent_id { p.vp_offset } else { compact_vp_off };
-        (p.tables.clone(), veid, voff)
+        p.tables.clone()
     };
 
-    save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, final_vp_eid, final_vp_off).await?;
+    save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, compact_vp_eid, compact_vp_off).await?;
     sync_partition_vp_refs(part).await?;
     Ok(CompactStats { input_tables, output_tables, entries_kept, entries_discarded, output_bytes })
 }
