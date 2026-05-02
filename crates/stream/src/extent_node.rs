@@ -849,6 +849,24 @@ async fn build_append_future(
         return Box::pin(async move { out });
     }
     if file_start > first.commit as u64 {
+        // F119-E / F123: before truncating, confirm with manager that this
+        // extent is NOT sealed. A stale writer's low `header.commit` would
+        // otherwise silently shrink a sealed extent.
+        let extent_id = slots[0].req.extent_id;
+        if let Ok(Some(mgr_info)) = node.extent_info_from_manager(extent_id).await {
+            if mgr_info.sealed_length > 0 {
+                let sealed_changed = ExtentNode::apply_extent_meta_ref(&extent, &mgr_info);
+                if sealed_changed {
+                    let _ = node.save_meta(extent_id, &extent).await;
+                }
+                let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
+                let out: Vec<Bytes> = slots
+                    .into_iter()
+                    .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
+                    .collect();
+                return Box::pin(async move { out });
+            }
+        }
         if let Err(e) = node.truncate_to_commit_ref(&extent, first.commit).await {
             let out: Vec<Bytes> = slots
                 .into_iter()
@@ -3100,7 +3118,26 @@ impl ExtentNode {
 
             // Peer-copy gap if local file is short.
             let local_len = entry.len.load(Ordering::SeqCst);
-            if local_len < sealed_length {
+            // F128: detect crash between rename(.ec.dat → .dat) and
+            // save_meta in commit_shard_local. .dat is the shard file
+            // (len = shard_size), .meta has old eversion, no staging
+            // file exists. Fix meta and skip to Phase 2.
+            let expected_shard = crate::erasure::shard_size(sealed_length as usize, data_shards) as u64;
+            let f128_recovered = local_len < sealed_length
+                && local_len == expected_shard
+                && !coordinator_prepared;
+            if f128_recovered {
+                tracing::info!(
+                    extent_id, local_len, sealed_length, new_eversion,
+                    "F128: detected post-rename/pre-save_meta crash, recovering meta"
+                );
+                entry.sealed_length.store(sealed_length.max(local_len), Ordering::SeqCst);
+                entry.avali.store(1, Ordering::SeqCst);
+                if new_eversion > 0 {
+                    entry.eversion.store(new_eversion, Ordering::SeqCst);
+                }
+                let _ = self.save_meta(extent_id, &entry).await;
+            } else if local_len < sealed_length {
                 let mgr_info = mgr_info_opt.ok_or_else(|| {
                     (
                         StatusCode::Unavailable,
@@ -3148,6 +3185,7 @@ impl ExtentNode {
                 tracing::info!(extent_id, local_len, sealed_length, "peer-copied missing tail before EC convert");
             }
 
+            if !f128_recovered {
             let data = file_pread_chunked(&entry.file, 0, sealed_length as usize).await
                 .map_err(|e| (StatusCode::Internal, format!("read extent {extent_id}: {e}")))?;
 
@@ -3203,6 +3241,7 @@ impl ExtentNode {
             self.write_shard_local(extent_id, 0, sealed_length, new_eversion, &shards[0]).await?;
 
             tracing::info!(extent_id, "EC 2PC phase 1 (prepare) complete on all nodes");
+            } // !f128_recovered
         }
 
         // ── Phase 2 (commit): rename .ec.dat → .dat on all nodes ──

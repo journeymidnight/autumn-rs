@@ -117,7 +117,7 @@ impl AutumnManager {
         }))
     }
 
-    async fn handle_acquire_owner_lock(&self, payload: Bytes) -> HandlerResult {
+    pub(crate) async fn handle_acquire_owner_lock(&self, payload: Bytes) -> HandlerResult {
         let req: AcquireOwnerLockReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         match self.acquire_owner_revision(&req.owner_key).await {
@@ -657,7 +657,7 @@ impl AutumnManager {
         }))
     }
 
-    async fn handle_stream_alloc_extent(&self, payload: Bytes) -> HandlerResult {
+    pub(crate) async fn handle_stream_alloc_extent(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&StreamAllocExtentResp {
                 code: Self::err_to_code(&err),
@@ -889,9 +889,11 @@ impl AutumnManager {
             ec_converted: false,
         };
 
+        // F125: compute stream_after without modifying store, mirror to
+        // etcd FIRST, then apply to in-memory state on success.
         let stream_after = {
-            let mut s = self.store.inner.borrow_mut();
-            let st = match s.streams.get_mut(&req.stream_id) {
+            let s = self.store.inner.borrow();
+            let st = match s.streams.get(&req.stream_id) {
                 Some(v) => v,
                 None => {
                     return Ok(rkyv_encode(&StreamAllocExtentResp {
@@ -902,10 +904,8 @@ impl AutumnManager {
                     }))
                 }
             };
-            st.extent_ids.push(extent_id);
-            let stream_after = st.clone();
-            s.extents.insert(tail.extent_id, tail.clone());
-            s.extents.insert(extent_id, new_extent.clone());
+            let mut stream_after = st.clone();
+            stream_after.extent_ids.push(extent_id);
             stream_after
         };
 
@@ -921,6 +921,15 @@ impl AutumnManager {
             }));
         }
 
+        {
+            let mut s = self.store.inner.borrow_mut();
+            if let Some(st) = s.streams.get_mut(&req.stream_id) {
+                *st = stream_after.clone();
+            }
+            s.extents.insert(tail.extent_id, tail.clone());
+            s.extents.insert(extent_id, new_extent.clone());
+        }
+
         Ok(rkyv_encode(&StreamAllocExtentResp {
             code: CODE_OK,
             message: String::new(),
@@ -929,7 +938,7 @@ impl AutumnManager {
         }))
     }
 
-    async fn handle_stream_punch_holes(&self, payload: Bytes) -> HandlerResult {
+    pub(crate) async fn handle_stream_punch_holes(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&PunchHolesResp {
                 code: Self::err_to_code(&err),
@@ -955,11 +964,20 @@ impl AutumnManager {
                 AppError,
             > {
                 Self::ensure_owner_revision(&req.owner_key, req.revision, s)?;
-                let removed: HashSet<u64> = req.extent_ids.into_iter().collect();
+                let requested: HashSet<u64> = req.extent_ids.into_iter().collect();
                 let stream = s
                     .streams
                     .get_mut(&req.stream_id)
                     .ok_or_else(|| AppError::NotFound(format!("stream {}", req.stream_id)))?;
+
+                // F126: only operate on extents that actually belong to this
+                // stream. Without this, a malformed request could decrement
+                // refs on unrelated streams' extents.
+                let members: HashSet<u64> = stream.extent_ids.iter().copied().collect();
+                let removed: HashSet<u64> = requested
+                    .into_iter()
+                    .filter(|id| members.contains(id))
+                    .collect();
 
                 stream.extent_ids.retain(|id| !removed.contains(id));
                 if stream.extent_ids.is_empty() {
@@ -1277,10 +1295,12 @@ impl AutumnManager {
 
         match out {
             Ok((new_streams, modified_extents, left, right, right_snapshot)) => {
-                // Phase 2: Persist streams and extents to etcd FIRST
+                // Phase 2: Persist ALL mutations to etcd in ONE atomic txn
+                // (F124: partitions + regions are included here, not in a
+                // separate txn, to prevent orphan streams on crash.)
                 if let Some(etcd) = &self.etcd {
                     let mut kvs =
-                        Vec::with_capacity(new_streams.len() + modified_extents.len() + 1);
+                        Vec::with_capacity(new_streams.len() + modified_extents.len() + 5);
                     for st in &new_streams {
                         kvs.push((format!("streams/{}", st.stream_id), rkyv_encode(st).to_vec()));
                     }
@@ -1291,6 +1311,29 @@ impl AutumnManager {
                         format!("partitionVpRefs/{}", right_snapshot.part_id),
                         rkyv_encode(&right_snapshot).to_vec(),
                     ));
+                    kvs.push((
+                        format!("partitions/{}", left.part_id),
+                        rkyv_encode(&left).to_vec(),
+                    ));
+                    kvs.push((
+                        format!("partitions/{}", right.part_id),
+                        rkyv_encode(&right).to_vec(),
+                    ));
+                    // Pre-compute region entries for left and right partitions
+                    // so they are included in the same atomic txn.
+                    {
+                        let s = self.store.inner.borrow();
+                        let left_region = Self::compute_region_for_partition(&s, &left);
+                        let right_region = Self::compute_region_for_partition(&s, &right);
+                        kvs.push((
+                            format!("regions/{}", left.part_id),
+                            rkyv_encode(&left_region).to_vec(),
+                        ));
+                        kvs.push((
+                            format!("regions/{}", right.part_id),
+                            rkyv_encode(&right_region).to_vec(),
+                        ));
+                    }
                     etcd.put_msgs_txn(kvs)
                         .await
                         .map_err(|e| (StatusCode::Internal, e.to_string()))?;
@@ -1306,13 +1349,6 @@ impl AutumnManager {
                         .insert(right_snapshot.part_id, right_snapshot);
                 }
 
-                // Phase 4: Mirror partition snapshot to etcd
-                if let Err(err) = self.mirror_partition_snapshot().await {
-                    return Ok(rkyv_encode(&CodeResp {
-                        code: Self::err_to_code(&err),
-                        message: err.to_string(),
-                    }));
-                }
                 Ok(rkyv_encode(&CodeResp {
                     code: CODE_OK,
                     message: String::new(),

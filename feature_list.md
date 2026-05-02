@@ -1187,6 +1187,38 @@ Motivation: tonic gRPC (HTTP/2 + protobuf) 在 `append_payload_segments` fanout 
 - **passes:** true
 
 
+## P0 — Code Review Fixes (2026-05-01 distributed systems audit)
+
+### F123 · build_append_future missing F119-E sealed-extent truncation guard
+- **Target:** `build_append_future` (batch append hot path) truncates extent file to `header.commit` without checking if the extent is sealed. Legacy `handle_append` has the F119-E manager round-trip check. Add the same check to the batch path: before `truncate_to_commit_ref`, query manager to confirm extent is NOT sealed; if sealed, return PRECONDITION error.
+- **Evidence:** `crates/stream/src/extent_node.rs:841-860` (no sealed check) vs `crates/stream/src/extent_node.rs:2319-2353` (has F119-E check)
+- **passes:** true
+
+### F124 · multi_modify_split non-atomic etcd writes — partition snapshot in separate txn
+- **Target:** `handle_multi_modify_split` writes streams/extents/VP refs to etcd in Phase 2, then partition snapshot in a separate Phase 4 txn. Manager crash between the two leaves orphan streams and over-counted extent refs. Fix: include partition snapshot mutations in the same etcd txn as streams/extents.
+- **Evidence:** `crates/manager/src/rpc_handlers.rs:1278-1316`
+- **passes:** true
+
+### F125 · handle_stream_alloc_extent applies state before etcd mirror
+- **Target:** `handle_stream_alloc_extent` mutates in-memory store (push extent_id, set sealed_length) at line 893 before mirroring to etcd at line 912. Violates etcd-first pattern. Fix: mirror to etcd first, then apply to in-memory store on success.
+- **Evidence:** `crates/manager/src/rpc_handlers.rs:892-922`
+- **passes:** true
+
+### F126 · punch_holes missing extent-stream membership validation
+- **Target:** `punch_holes` decrements refs on any extent_id in the request without verifying it belongs to the target stream. A malformed request can decrement refs on unrelated extents. Fix: validate each extent_id is in `stream.extent_ids` before decrementing refs.
+- **Evidence:** `crates/manager/src/rpc_handlers.rs:958-1022`
+- **passes:** true
+
+### F127 · recover_partition silently skips failed extent reads
+- **Target:** logStream replay in `recover_partition` silently `continue`s on `read_bytes_from_extent` failure. If a node is temporarily unreachable, un-checkpointed records are permanently lost. Fix: retry with backoff, or fail partition open entirely on read failure.
+- **Evidence:** `crates/partition-server/src/lib.rs:2837-2839`
+- **passes:** true
+
+### F128 · EC 2PC coordinator crash between rename and save_meta — stuck conversion
+- **Target:** In EC Phase 2, if coordinator crashes after rename(`.ec.dat` → `.dat`) but before `save_meta`, recovery sees old eversion in `.meta`, retry triggers peer-copy which fails because peers are shard-sized. Fix: detect this state (file exists + eversion mismatch) and skip re-encoding.
+- **Evidence:** `crates/stream/src/extent_node.rs:3208-3244`
+- **passes:** true
+
 ## P3 — Post-extraction CI cleanup (not blocking)
 
 ### FCI-01 · Mass fmt + clippy cleanup before tightening CI

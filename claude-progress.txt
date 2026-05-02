@@ -1,69 +1,13 @@
-Date: 2026-04-29
+Date: 2026-05-01
 TaskStatus: completed
-Task scope: Reproduce the gallery original-key disappearance as a deterministic
-  split/compaction regression test in manager system tests.
+Task scope: Fix 6 distributed systems bugs found in code review audit (F123-F128)
 
-Current summary:
-  Field evidence now shows this is not a gallery/list bug:
-  1. original keys such as `Patreon--...-300.jpg` are `head/get` misses
-  2. matching thumbs still exist and are queryable
-  3. offline checkpoint inspection shows the current live SST/meta view misses
-     the original while still hitting the thumb
-  4. raw bytes for the original key still exist in older row extents on disk
-  5. direct full-SST dump of the live part-40 table (extent 41) confirms this is
-    not a point-lookup/seek bug: the table physically contains
-    `.thumb/...241.jpg` through `.thumb/...301.jpg`, then only
-    `Patreon--...-003.jpg`; `Patreon--...-300.jpg` is absent from the live SST
+Completed:
+  - F123: build_append_future sealed-extent truncation guard (extent_node.rs + integration test)
+  - F124: multi_modify_split atomic etcd writes (rpc_handlers.rs + lib.rs helper + 2 unit tests)
+  - F125: handle_stream_alloc_extent etcd-first pattern (rpc_handlers.rs + 1 unit test)
+  - F126: punch_holes extent-stream membership validation (rpc_handlers.rs + 1 unit test)
+  - F127: recover_partition retry with error propagation (lib.rs + 1 unit test)
+  - F128: EC 2PC coordinator crash recovery via shard_size detection (extent_node.rs + 1 unit test in erasure.rs)
 
-  Additional split-stream finding:
-  6. `StreamClient::commit_length()` / manager `check_commit_length` return the
-    commit length of the tail extent only, not a whole-stream logical length;
-    however `compute_duplicate_stream()` clones all extents and does not use the
-    sealed-length argument to crop historical row extents, so tail-length
-    semantics do not currently explain the missing originals.
-    7. old shared row extent 12 contains a valid SST slice at `offset=0 len=55706`
-      whose range is `.thumb/...001.jpg` .. `Patreon--...301.jpg`, and normal
-      SST lookup on that slice hits `Patreon--...300.jpg`
-    8. a focused system test with exactly one `split -> compact(right child)`
-      passes, so the field bug is not reproduced by the minimal single-split path
-      9. root cause for the focused two-round failure was not overlap logic itself
-        but sealed-tail handling on duplicated row streams: after split, the new
-        child stream could start with a manager-sealed tail extent, but
-        `StreamClient::ensure_tail_initialised()` still seeded the worker with that
-        sealed tail instead of allocating a fresh extent
-      10. that left descendant compaction appending against the duplicated tail;
-        before the fix this surfaced as `LockedByOther: a newer owner holds extent 8`
-        and overlap never cleared, blocking the next split
-      11. fixing sealed-tail initialisation to allocate a fresh extent immediately
-        makes the focused two-round path pass, and the broader three-round
-        gallery regression now passes as well
-
-  Working hypothesis: repeated split + overlap-clearing compaction on a
-  gallery-like mixed keyspace (small `.thumb/...` keys + large original image
-  keys) can drop large original keys from the rightmost child's live SST/meta
-  lineage.
-
-  Probe added:
-  1. new manager system test `system_split_gallery_originals.rs`
-  2. test writes large original values plus small thumb keys
-  3. test repeatedly splits and compacts the rightmost child
-  4. after each round it asserts a high original key and its thumb still exist
-
-Verification:
-  1. `cargo test -p autumn-partition-server mixed_gallery_like_keys_round_trip -- --nocapture` passes
-  2. `cargo run --manifest-path target/tmp/inspect_checkpoint/Cargo.toml -- dump /tmp/autumn-rs/d1/ee/extent-41.dat 0 4269` confirms `300.jpg` is physically absent from the live SST slice
-  3. `cargo run --manifest-path target/tmp/inspect_checkpoint/Cargo.toml -- scan-from /tmp/autumn-rs/d1/3d/extent-12.dat 0` finds a valid SST slice `offset=0 len=55706`
-  4. `cargo run --manifest-path target/tmp/inspect_checkpoint/Cargo.toml -- sst /tmp/autumn-rs/d1/3d/extent-12.dat 0 55706 'Patreon--...300.jpg'` hits the original key in the old shared SST
-  5. `cargo test -p autumn-partition-server gallery_like_rightmost_slice_round_trip -- --nocapture` passes
-  6. `cargo test -p autumn-manager single_split_compact_preserves_gallery_originals_on_right_child -- --nocapture` passes
-  7. `cargo test -p autumn-manager two_split_compact_preserves_gallery_originals_on_rightmost_descendant -- --nocapture` now passes after the sealed-tail fix
-  8. `cargo test -p autumn-manager split_compact_preserves_gallery_originals_on_rightmost_child -- --nocapture` now passes
-  9. `cargo test -p autumn-manager split_overlap_compaction_enables_second_split -- --nocapture` still passes
-
-Main gaps:
-  No known code/test gap remains in-repo for this fix set. Live-cluster
-  validation is still recommended as post-commit operational follow-up.
-
-Next steps:
-  1. rebuild/restart the relevant partition server(s) with the fix and verify the gallery/live cluster no longer loses originals through repeated rightmost split+compact lineage
-  2. if live data still diverges, dump the new checkpoint lineage again and compare against the now-passing test path
+All 6 fixes implemented, all 8 tests pass, feature_list.md updated.

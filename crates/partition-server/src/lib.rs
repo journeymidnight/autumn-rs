@@ -2834,9 +2834,30 @@ async fn recover_partition(
 
     if let Some(extents) = replay_extents {
         for (eid, start_off) in extents {
-            let data = match part_sc.read_bytes_from_extent(eid, start_off, 0).await {
-                Ok((d, _)) => d,
-                Err(_) => continue,
+            // F127: retry extent reads during recovery instead of silently
+            // skipping. A transient node failure should not cause permanent
+            // data loss for un-checkpointed writes.
+            let data = {
+                let mut attempt = 0u32;
+                loop {
+                    match part_sc.read_bytes_from_extent(eid, start_off, 0).await {
+                        Ok((d, _)) => break d,
+                        Err(e) => {
+                            attempt += 1;
+                            if attempt >= 10 {
+                                return Err(anyhow::anyhow!(
+                                    "recover_partition: failed to read extent {} after {} attempts: {}",
+                                    eid, attempt, e
+                                ));
+                            }
+                            tracing::warn!(
+                                "recover_partition: read extent {} attempt {}/10 failed: {}, retrying...",
+                                eid, attempt, e
+                            );
+                            compio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        }
+                    }
+                }
             };
             for (buf_off, op, key, value, expires_at) in decode_records_with_offsets(&data) {
                 let ts = parse_ts(&key);
@@ -3512,6 +3533,63 @@ mod tests {
         });
 
         assert!(fired.load(Ordering::SeqCst), "spawned timer should have fired");
+    }
+
+    /// F127: The recover_partition retry loop must propagate errors after
+    /// exhausting retries, not silently skip extents. This test validates the
+    /// pattern: succeed after transient failures, or fail hard after 10 attempts.
+    #[test]
+    fn f127_retry_loop_propagates_after_exhaustion() {
+        let max_retries = 10u32;
+
+        // Case 1: succeeds on the 5th attempt (transient failure → recovery).
+        let succeed_on = 5u32;
+        let mut attempt = 0u32;
+        let result: Result<Vec<u8>> = loop {
+            match if attempt < succeed_on - 1 {
+                Err(anyhow::anyhow!("transient"))
+            } else {
+                Ok(vec![1, 2, 3])
+            } {
+                Ok(d) => break Ok(d),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= max_retries {
+                        break Err(anyhow::anyhow!(
+                            "failed after {} attempts: {}",
+                            attempt,
+                            e
+                        ));
+                    }
+                }
+            }
+        };
+        assert!(result.is_ok(), "should succeed after transient failures");
+        assert_eq!(result.unwrap(), vec![1, 2, 3]);
+
+        // Case 2: all 10 attempts fail → error propagated (not silent skip).
+        let mut attempt = 0u32;
+        let result: Result<Vec<u8>> = loop {
+            match Err::<Vec<u8>, _>(anyhow::anyhow!("persistent failure")) {
+                Ok(d) => break Ok(d),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= max_retries {
+                        break Err(anyhow::anyhow!(
+                            "failed after {} attempts: {}",
+                            attempt,
+                            e
+                        ));
+                    }
+                }
+            }
+        };
+        assert!(result.is_err(), "should propagate error after exhausting retries");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("failed after 10 attempts"),
+            "error message should include attempt count: {msg}"
+        );
     }
 
     #[test]

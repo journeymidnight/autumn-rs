@@ -818,6 +818,36 @@ impl AutumnManager {
         }
     }
 
+    fn compute_region_for_partition(
+        state: &autumn_common::MetadataState,
+        part: &MgrPartitionMeta,
+    ) -> MgrRegionInfo {
+        let ps_id = state
+            .regions
+            .get(&part.part_id)
+            .filter(|r| state.ps_nodes.contains_key(&r.ps_id))
+            .map(|r| r.ps_id)
+            .or_else(|| {
+                let mut load: HashMap<u64, usize> =
+                    state.ps_nodes.keys().map(|&id| (id, 0)).collect();
+                for region in state.regions.values() {
+                    if let Some(cnt) = load.get_mut(&region.ps_id) {
+                        *cnt += 1;
+                    }
+                }
+                load.into_iter().min_by_key(|&(_, cnt)| cnt).map(|(id, _)| id)
+            })
+            .unwrap_or(0);
+        MgrRegionInfo {
+            rg: part.rg.clone(),
+            part_id: part.part_id,
+            ps_id,
+            log_stream: part.log_stream,
+            row_stream: part.row_stream,
+            meta_stream: part.meta_stream,
+        }
+    }
+
     /// Compute the mutations for duplicating a stream (CoW for split).
     /// Returns (new_stream, modified_extents) WITHOUT modifying state.
     fn compute_duplicate_stream(
@@ -1555,6 +1585,89 @@ mod tests {
     }
 
     #[test]
+    fn f124_compute_region_keeps_existing_ps_for_left_partition() {
+        let mut state = autumn_common::MetadataState::default();
+        state.ps_nodes.insert(10, "ps10:9001".to_string());
+        state.ps_nodes.insert(20, "ps20:9002".to_string());
+
+        // Pre-existing region: part 101 is on ps 10
+        state.regions.insert(
+            101,
+            MgrRegionInfo {
+                rg: Some(MgrRange {
+                    start_key: b"a".to_vec(),
+                    end_key: b"z".to_vec(),
+                }),
+                part_id: 101,
+                ps_id: 10,
+                log_stream: 1,
+                row_stream: 2,
+                meta_stream: 3,
+            },
+        );
+
+        let left = MgrPartitionMeta {
+            part_id: 101,
+            log_stream: 1,
+            row_stream: 2,
+            meta_stream: 3,
+            rg: Some(MgrRange {
+                start_key: b"a".to_vec(),
+                end_key: b"m".to_vec(),
+            }),
+        };
+
+        let region = AutumnManager::compute_region_for_partition(&state, &left);
+        assert_eq!(region.ps_id, 10, "left partition should keep its existing PS");
+        assert_eq!(region.part_id, 101);
+        assert_eq!(region.rg.as_ref().unwrap().end_key, b"m".to_vec());
+    }
+
+    #[test]
+    fn f124_compute_region_assigns_least_loaded_for_new_partition() {
+        let mut state = autumn_common::MetadataState::default();
+        state.ps_nodes.insert(10, "ps10:9001".to_string());
+        state.ps_nodes.insert(20, "ps20:9002".to_string());
+
+        // ps 10 already has 2 regions, ps 20 has 0
+        for part_id in [101, 102] {
+            state.regions.insert(
+                part_id,
+                MgrRegionInfo {
+                    rg: Some(MgrRange {
+                        start_key: vec![],
+                        end_key: vec![],
+                    }),
+                    part_id,
+                    ps_id: 10,
+                    log_stream: part_id,
+                    row_stream: part_id + 100,
+                    meta_stream: part_id + 200,
+                },
+            );
+        }
+
+        // New partition (right child from split)
+        let right = MgrPartitionMeta {
+            part_id: 999,
+            log_stream: 50,
+            row_stream: 51,
+            meta_stream: 52,
+            rg: Some(MgrRange {
+                start_key: b"m".to_vec(),
+                end_key: b"z".to_vec(),
+            }),
+        };
+
+        let region = AutumnManager::compute_region_for_partition(&state, &right);
+        assert_eq!(
+            region.ps_id, 20,
+            "new partition should go to least-loaded PS (ps 20 has 0 regions)"
+        );
+        assert_eq!(region.part_id, 999);
+    }
+
+    #[test]
     fn merge_extent_updates_preserves_ref_and_vp_changes() {
         let merged = AutumnManager::merge_extent_updates(
             vec![MgrExtentInfo {
@@ -1573,5 +1686,203 @@ mod tests {
         assert_eq!(merged[0].refs, 2);
         assert_eq!(merged[0].eversion, 9);
         assert_eq!(merged[0].vp_table_refs, 5);
+    }
+
+    /// F125: handle_stream_alloc_extent must not modify the in-memory store
+    /// when the handler fails partway through. When alloc_extent_on_node
+    /// fails (no running extent nodes), the store must remain unchanged.
+    /// Pre-F125, the handler mutated the store before the etcd mirror, so
+    /// any early return left stale mutations behind.
+    #[test]
+    fn f125_alloc_extent_no_store_mutation_on_failure() {
+        run(async {
+            let m = AutumnManager::new();
+
+            // Register nodes (unreachable — no actual servers).
+            for (nid, addr) in [(1, "127.0.0.1:4001"), (2, "127.0.0.1:4002"), (3, "127.0.0.1:4003")] {
+                let req = rkyv_encode(&RegisterNodeReq {
+                    addr: addr.to_string(),
+                    disk_uuids: vec![format!("disk-{nid}")],
+                    shard_ports: vec![],
+                });
+                let resp = m.handle_register_node(req).await.unwrap();
+                let r: RegisterNodeResp = rkyv_decode(&resp).unwrap();
+                assert_eq!(r.code, CODE_OK, "register node {nid}");
+            }
+
+            let owner_key = "test-owner-f125".to_string();
+            let rev = {
+                let req = rkyv_encode(&AcquireOwnerLockReq {
+                    owner_key: owner_key.clone(),
+                });
+                let resp = m.handle_acquire_owner_lock(req).await.unwrap();
+                let r: AcquireOwnerLockResp = rkyv_decode(&resp).unwrap();
+                assert_eq!(r.code, CODE_OK);
+                r.revision
+            };
+
+            // Seed stream + tail in store (nodes not actually running).
+            let stream_id;
+            let tail_id;
+            {
+                let mut s = m.store.inner.borrow_mut();
+                let (sid, _) = s.alloc_ids(1);
+                stream_id = sid;
+                let (eid, _) = s.alloc_ids(1);
+                tail_id = eid;
+                s.streams.insert(stream_id, MgrStreamInfo {
+                    stream_id,
+                    extent_ids: vec![tail_id],
+                    ec_data_shard: 0,
+                    ec_parity_shard: 0,
+                    replicates: 3,
+                });
+                s.extents.insert(tail_id, MgrExtentInfo {
+                    extent_id: tail_id,
+                    replicates: vec![1, 2, 3],
+                    parity: vec![],
+                    eversion: 1,
+                    refs: 1,
+                    vp_table_refs: 0,
+                    sealed_length: 0,
+                    avali: 0,
+                    replicate_disks: vec![1, 2, 3],
+                    parity_disks: vec![],
+                    ec_converted: false,
+                });
+            }
+
+            // Snapshot before.
+            let tail_before = m.store.inner.borrow().extents.get(&tail_id).cloned().unwrap();
+            let stream_before = m.store.inner.borrow().streams.get(&stream_id).cloned().unwrap();
+
+            // Call alloc_extent with end=100 — nodes unreachable, so the
+            // handler returns a precondition error after failing to allocate.
+            let req = rkyv_encode(&StreamAllocExtentReq {
+                stream_id,
+                owner_key,
+                revision: rev,
+                end: 100,
+            });
+            let resp = m.handle_stream_alloc_extent(req).await.unwrap();
+            let r: StreamAllocExtentResp = rkyv_decode(&resp).unwrap();
+            assert_ne!(r.code, CODE_OK, "should fail: no running extent nodes");
+
+            // F125 invariant: store must be unchanged after failed alloc.
+            let tail_after = m.store.inner.borrow().extents.get(&tail_id).cloned().unwrap();
+            let stream_after = m.store.inner.borrow().streams.get(&stream_id).cloned().unwrap();
+
+            assert_eq!(
+                tail_after.sealed_length, tail_before.sealed_length,
+                "tail sealed_length must not change on failed alloc"
+            );
+            assert_eq!(
+                tail_after.eversion, tail_before.eversion,
+                "tail eversion must not change on failed alloc"
+            );
+            assert_eq!(
+                stream_after.extent_ids.len(), stream_before.extent_ids.len(),
+                "stream extent_ids must not change on failed alloc"
+            );
+        })
+    }
+
+    /// F126: handle_stream_punch_holes only removes extents that are
+    /// members of the target stream. Non-member extent IDs in the
+    /// request are silently ignored — their ref counts must NOT change.
+    #[test]
+    fn f126_punch_holes_ignores_non_member_extents() {
+        run(async {
+            let m = AutumnManager::new();
+
+            let owner_key = "test-owner-f126".to_string();
+            let rev = {
+                let req = rkyv_encode(&AcquireOwnerLockReq {
+                    owner_key: owner_key.clone(),
+                });
+                let resp = m.handle_acquire_owner_lock(req).await.unwrap();
+                let r: AcquireOwnerLockResp = rkyv_decode(&resp).unwrap();
+                r.revision
+            };
+
+            // Seed two streams: stream A owns extents [10, 11, 12],
+            // stream B owns extent [20].
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.next_id = 100;
+                s.streams.insert(1, MgrStreamInfo {
+                    stream_id: 1,
+                    extent_ids: vec![10, 11, 12],
+                    ec_data_shard: 0,
+                    ec_parity_shard: 0,
+                    replicates: 3,
+                });
+                for eid in [10, 11, 12] {
+                    s.extents.insert(eid, MgrExtentInfo {
+                        extent_id: eid,
+                        replicates: vec![],
+                        parity: vec![],
+                        eversion: 1,
+                        refs: 1,
+                        vp_table_refs: 0,
+                        sealed_length: 100,
+                        avali: 1,
+                        replicate_disks: vec![],
+                        parity_disks: vec![],
+                        ec_converted: false,
+                    });
+                }
+
+                s.streams.insert(2, MgrStreamInfo {
+                    stream_id: 2,
+                    extent_ids: vec![20],
+                    ec_data_shard: 0,
+                    ec_parity_shard: 0,
+                    replicates: 3,
+                });
+                s.extents.insert(20, MgrExtentInfo {
+                    extent_id: 20,
+                    replicates: vec![],
+                    parity: vec![],
+                    eversion: 1,
+                    refs: 1,
+                    vp_table_refs: 0,
+                    sealed_length: 200,
+                    avali: 1,
+                    replicate_disks: vec![],
+                    parity_disks: vec![],
+                    ec_converted: false,
+                });
+            }
+
+            // Punch stream 1 with extent_ids [10, 20, 999].
+            //   10 is a member  → should be removed
+            //   20 is NOT a member of stream 1 → must be ignored
+            //   999 doesn't exist → must be ignored
+            let req = rkyv_encode(&PunchHolesReq {
+                stream_id: 1,
+                owner_key,
+                revision: rev,
+                extent_ids: vec![10, 20, 999],
+            });
+            let resp = m.handle_stream_punch_holes(req).await.unwrap();
+            let r: PunchHolesResp = rkyv_decode(&resp).unwrap();
+            assert_eq!(r.code, CODE_OK, "punch_holes should succeed: {}", r.message);
+
+            let s = m.store.inner.borrow();
+
+            // Stream 1 should only have [11, 12] left.
+            let stream_a = s.streams.get(&1).unwrap();
+            assert_eq!(stream_a.extent_ids, vec![11, 12]);
+
+            // Extent 20 (stream B) must be untouched: refs still 1.
+            let ext20 = s.extents.get(&20).unwrap();
+            assert_eq!(ext20.refs, 1, "non-member extent 20 refs must not change");
+
+            // Extent 10 was the only member punched.
+            // With refs=1 and no vp_table_refs, it should have been deleted
+            // from the extents map.
+            assert!(s.extents.get(&10).is_none(), "extent 10 should be removed (refs was 1)");
+        })
     }
 }

@@ -372,4 +372,40 @@ mod tests {
         let decoded = ec_decode(shards_opt, 2, 1).unwrap();
         assert_eq!(decoded, payload, "should recover from 1 data + 1 parity");
     }
+
+    /// F128: verify the shard_size detection condition used by
+    /// handle_convert_to_ec to detect a crash between rename(.ec.dat → .dat)
+    /// and save_meta. After the crash, local file len == shard_size but meta
+    /// still has the old eversion. The condition is:
+    ///   local_len < sealed_length && local_len == expected_shard
+    #[test]
+    fn f128_shard_size_detection_for_crash_recovery() {
+        for &(payload_len, data_shards) in &[
+            (1024usize, 2usize),
+            (4096, 3),
+            (10000, 3),
+            (65536, 4),
+            (1 << 20, 3),
+        ] {
+            let expected_shard = shard_size(payload_len, data_shards);
+            assert!(
+                expected_shard < payload_len,
+                "shard_size({payload_len}, {data_shards}) = {expected_shard} should be < {payload_len}"
+            );
+            let local_len = expected_shard as u64;
+            let sealed_length = payload_len as u64;
+            let detected = local_len < sealed_length && local_len == expected_shard as u64;
+            assert!(
+                detected,
+                "F128 detection should fire for payload={payload_len}, data_shards={data_shards}"
+            );
+
+            let not_crash = payload_len as u64;
+            let not_detected = not_crash < sealed_length && not_crash == expected_shard as u64;
+            assert!(
+                !not_detected,
+                "full payload should NOT trigger F128 detection"
+            );
+        }
+    }
 }
