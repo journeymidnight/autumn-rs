@@ -291,6 +291,63 @@ pub async fn ps_gc(ps: &RpcClient, part_id: u64) {
     assert_eq!(r.code, partition_rpc::CODE_OK, "gc failed: {}", r.message);
 }
 
+/// Delete a key.
+pub async fn ps_delete(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rpc::DeleteResp {
+    let resp = ps
+        .call(
+            partition_rpc::MSG_DELETE,
+            partition_rpc::rkyv_encode(&partition_rpc::DeleteReq {
+                part_id,
+                key: key.to_vec(),
+            }),
+        )
+        .await
+        .expect("delete");
+    let r: partition_rpc::DeleteResp = partition_rpc::rkyv_decode(&resp).expect("decode DeleteResp");
+    assert_eq!(r.code, partition_rpc::CODE_OK, "delete failed: {}", r.message);
+    r
+}
+
+/// Check if a key exists without fetching the value.
+pub async fn ps_head(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rpc::HeadResp {
+    let resp = ps
+        .call(
+            partition_rpc::MSG_HEAD,
+            partition_rpc::rkyv_encode(&partition_rpc::HeadReq {
+                part_id,
+                key: key.to_vec(),
+            }),
+        )
+        .await
+        .expect("head");
+    partition_rpc::rkyv_decode(&resp).expect("decode HeadResp")
+}
+
+/// Range scan with prefix, start key, and limit.
+pub async fn ps_range(
+    ps: &RpcClient,
+    part_id: u64,
+    prefix: &[u8],
+    start: &[u8],
+    limit: u32,
+) -> partition_rpc::RangeResp {
+    let resp = ps
+        .call(
+            partition_rpc::MSG_RANGE,
+            partition_rpc::rkyv_encode(&partition_rpc::RangeReq {
+                part_id,
+                prefix: prefix.to_vec(),
+                start: start.to_vec(),
+                limit,
+            }),
+        )
+        .await
+        .expect("range");
+    let r: partition_rpc::RangeResp = partition_rpc::rkyv_decode(&resp).expect("decode RangeResp");
+    assert_eq!(r.code, partition_rpc::CODE_OK, "range failed: {}", r.message);
+    r
+}
+
 // ── F099-K per-partition router ───────────────────────────────────────
 //
 // After F099-K, each partition binds its own TCP listener at
@@ -379,6 +436,85 @@ pub async fn psr_compact(router: &PsRouter, part_id: u64) {
 pub async fn psr_gc(router: &PsRouter, part_id: u64) {
     let c = router.client_for(part_id).await;
     ps_gc(&c, part_id).await;
+}
+
+/// Routed `ps_delete` — F099-K aware.
+pub async fn psr_delete(router: &PsRouter, part_id: u64, key: &[u8]) -> partition_rpc::DeleteResp {
+    let c = router.client_for(part_id).await;
+    ps_delete(&c, part_id, key).await
+}
+
+/// Routed `ps_head` — F099-K aware.
+pub async fn psr_head(router: &PsRouter, part_id: u64, key: &[u8]) -> partition_rpc::HeadResp {
+    let c = router.client_for(part_id).await;
+    ps_head(&c, part_id, key).await
+}
+
+/// Routed `ps_range` — F099-K aware.
+pub async fn psr_range(
+    router: &PsRouter,
+    part_id: u64,
+    prefix: &[u8],
+    start: &[u8],
+    limit: u32,
+) -> partition_rpc::RangeResp {
+    let c = router.client_for(part_id).await;
+    ps_range(&c, part_id, prefix, start, limit).await
+}
+
+// ── Bulk test utilities ──────────────────────────────────────────────
+
+/// Write `count` keys as `{prefix}-{i:03}` with values `val-{prefix}-{i:03}`.
+pub async fn write_sequential_keys(
+    ps: &RpcClient,
+    part_id: u64,
+    prefix: &str,
+    count: u32,
+) -> Vec<String> {
+    let mut keys = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let key = format!("{prefix}-{i:03}");
+        let val = format!("val-{prefix}-{i:03}");
+        ps_put(ps, part_id, key.as_bytes(), val.as_bytes(), true).await;
+        keys.push(key);
+    }
+    keys
+}
+
+/// Verify all keys exist with their deterministic values via `ps_get`.
+pub async fn verify_sequential_keys(
+    ps: &RpcClient,
+    part_id: u64,
+    keys: &[String],
+) -> usize {
+    for key in keys {
+        let expected_val = format!("val-{key}");
+        let resp = ps_get(ps, part_id, key.as_bytes()).await;
+        assert_eq!(
+            resp.value,
+            expected_val.as_bytes(),
+            "key {key} has wrong value"
+        );
+    }
+    keys.len()
+}
+
+/// Verify all keys via routed `psr_get` (for post-split partitions).
+pub async fn verify_sequential_keys_routed(
+    router: &PsRouter,
+    part_id: u64,
+    keys: &[String],
+) -> usize {
+    for key in keys {
+        let expected_val = format!("val-{key}");
+        let resp = psr_get(router, part_id, key.as_bytes()).await;
+        assert_eq!(
+            resp.value,
+            expected_val.as_bytes(),
+            "key {key} has wrong value (routed)"
+        );
+    }
+    keys.len()
 }
 
 // ── Common setup patterns ─────────────────────────────────────────────
