@@ -13,7 +13,6 @@ use autumn_stream::{ConnPool, StreamClient};
 
 use support::*;
 
-#[ignore = "FIXME(F099-K-followup): cross-partition psr_put HANGS on right partition after compact+flush; merged_partition_loop wake bug; see docs/audit/2026-04-21-integration-inventory.md"]
 #[test]
 fn split_ref_counting_shared_extents_freed_after_both_gc() {
     let mgr_addr = pick_addr();

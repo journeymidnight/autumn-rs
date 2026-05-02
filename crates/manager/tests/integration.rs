@@ -1023,7 +1023,6 @@ fn f033_gc_reclaims_log_stream_extents() {
 // F037: Partition split with overlap detection and major compaction
 // ---------------------------------------------------------------------------
 
-#[ignore = "FIXME(F099-K-followup): post-split range-filter lets mid-key through on exclusive-end side; see docs/audit/2026-04-21-integration-inventory.md"]
 #[test]
 fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(119);

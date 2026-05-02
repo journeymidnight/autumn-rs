@@ -14,7 +14,6 @@ use autumn_rpc::partition_rpc;
 
 use support::*;
 
-#[ignore = "FIXME(F099-K-followup): cross-partition write HANGS post-recovery on PS2; same root cause as system_split_ref_counting; see docs/audit/2026-04-21-integration-inventory.md"]
 #[test]
 fn split_then_ps_crash_data_survives() {
     let mgr_addr = pick_addr();

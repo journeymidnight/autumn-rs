@@ -1,13 +1,19 @@
-Date: 2026-05-01
+Date: 2026-05-02
 TaskStatus: completed
-Task scope: Fix 6 distributed systems bugs found in code review audit (F123-F128)
+Task scope: Un-ignore F099-K-followup tests — bug already fixed by prior commits
 
 Completed:
-  - F123: build_append_future sealed-extent truncation guard (extent_node.rs + integration test)
-  - F124: multi_modify_split atomic etcd writes (rpc_handlers.rs + lib.rs helper + 2 unit tests)
-  - F125: handle_stream_alloc_extent etcd-first pattern (rpc_handlers.rs + 1 unit test)
-  - F126: punch_holes extent-stream membership validation (rpc_handlers.rs + 1 unit test)
-  - F127: recover_partition retry with error propagation (lib.rs + 1 unit test)
-  - F128: EC 2PC coordinator crash recovery via shard_size detection (extent_node.rs + 1 unit test in erasure.rs)
+  - Verified that all 3 tests previously ignored due to F099-K-followup bug now pass:
+    1. system_split_ref_counting::split_ref_counting_shared_extents_freed_after_both_gc (12.97s)
+    2. system_compound_failures::split_then_ps_crash_data_survives (8.28s)
+    3. integration::f037_overlap_detected_after_split_and_cleared_by_compaction (4.12s)
+  - Removed #[ignore] from all 3 tests
+  - The bug (writes to RIGHT child partition hang after split) was fixed by
+    earlier commits, most likely `4f2e656 Fix sealed split tail initialization`
+    which ensured ensure_tail_initialised() properly handles sealed tails
+    from split by allocating a fresh extent immediately.
 
-All 6 fixes implemented, all 8 tests pass, feature_list.md updated.
+Pre-existing failures (not related):
+  - ec_integration::replication_stream_works — panics at line 111
+  - integration::f030_flush_writes_sst_to_row_stream — pre-existing
+  - integration::f029_compaction_merges_small_tables — pre-existing
