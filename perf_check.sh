@@ -88,6 +88,21 @@ export UCX_TLS
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AC="$SCRIPT_DIR/target/release/autumn-client"
 
+# AC_PREFIX is a hook for ad-hoc client wrapping (numactl, taskset, perf
+# stat, strace ...). Empty by default — the benchmark should reflect the
+# production network path where client runs on a separate host and the
+# NIC's NUMA locality (not the client thread's) is what matters. Pinning
+# the local bench client via `numactl --cpunodebind=0 --membind=0` does
+# improve loopback read throughput ~20% by removing cross-NUMA sk_buff
+# memcpy, but that win does not exist over real NICs and would inflate
+# the baseline above any production system can reach. Keep the hook so
+# experiments that explicitly want to isolate the bench harness can
+# still set `AC_PREFIX="numactl ..." ./perf_check.sh ...`.
+: "${AC_PREFIX:=}"
+if [[ -n "$AC_PREFIX" ]]; then
+    echo "[perf-check] AC_PREFIX (override): $AC_PREFIX"
+fi
+
 USE_SHM=0
 UPDATE_BASELINE=""
 SKIP_CLUSTER=0
@@ -233,7 +248,7 @@ run_perf() {
     echo "[perf-check] mode=$mode partitions=$parts pipeline-depth=$depth size=$size_label ($size B) storage=$STORAGE_LABEL"
     echo "[perf-check] baseline=$(basename "$baseline")"
     echo "============================================================"
-    "$AC" --manager "${AUTUMN_BIND_HOST:-127.0.0.1}:9001" --transport "$mode" \
+    ${AC_PREFIX:-} "$AC" --manager "${AUTUMN_BIND_HOST:-127.0.0.1}:9001" --transport "$mode" \
         perf-check \
         --nosync \
         --threads "$THREADS" \
