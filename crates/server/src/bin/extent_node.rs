@@ -24,6 +24,9 @@ struct Args {
     /// Bind host for the listener (IPv4 or bare/bracketed IPv6). Default 0.0.0.0.
     bind_host: String,
     transport: TransportKind,
+    /// First core to pin shard threads to. Multi-process clusters on one host
+    /// need disjoint values across processes so they don't share cores.
+    cpu_start: usize,
 }
 
 fn parse_args() -> Args {
@@ -45,6 +48,7 @@ fn parse_args() -> Args {
         .unwrap_or(10);
     let mut bind_host = String::from("0.0.0.0");
     let mut transport = TransportKind::Tcp;
+    let mut cpu_start: usize = 0;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -97,6 +101,10 @@ fn parse_args() -> Args {
                         std::process::exit(2);
                     });
             }
+            "--cpu-start" => {
+                i += 1;
+                cpu_start = args[i].parse().expect("--cpu-start must be a number");
+            }
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
@@ -116,6 +124,7 @@ fn parse_args() -> Args {
         shard_stride,
         bind_host,
         transport,
+        cpu_start,
     }
 }
 
@@ -129,6 +138,7 @@ fn main() -> Result<()> {
 
     let args = parse_args();
     let _ = autumn_transport::init_with(args.transport);
+    autumn_common::set_cpu_offset(args.cpu_start);
 
     // F099-M: each shard i listens on port + i * shard_stride.
     let shard_ports: Vec<u16> = (0..args.shards)

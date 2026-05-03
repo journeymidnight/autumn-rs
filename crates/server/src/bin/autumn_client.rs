@@ -1542,9 +1542,7 @@ async fn main() -> Result<()> {
                 let value_template = (0..value_size).map(|i| (i % 256) as u8).collect::<Vec<u8>>();
 
                 let handle = std::thread::spawn(move || {
-                    let cpu = autumn_common::pick_cpu_for_ord(tid);
                     compio::runtime::RuntimeBuilder::new()
-                        .thread_affinity(autumn_common::affinity_set(cpu))
                         .build()
                         .unwrap()
                         .block_on(async {
@@ -1712,9 +1710,7 @@ async fn main() -> Result<()> {
                 let total_errors = Arc::clone(&total_errors);
 
                 let handle = std::thread::spawn(move || {
-                    let cpu = autumn_common::pick_cpu_for_ord(tid);
                     compio::runtime::RuntimeBuilder::new()
-                        .thread_affinity(autumn_common::affinity_set(cpu))
                         .build()
                         .unwrap()
                         .block_on(async {
@@ -1888,9 +1884,7 @@ async fn main() -> Result<()> {
 
                 let max_depth = pipeline_depth;
                 let handle = std::thread::spawn(move || {
-                    let cpu = autumn_common::pick_cpu_for_ord(tid);
                     compio::runtime::RuntimeBuilder::new()
-                        .thread_affinity(autumn_common::affinity_set(cpu))
                         .build()
                         .unwrap()
                         .block_on(async {
@@ -2015,9 +2009,7 @@ async fn main() -> Result<()> {
 
                 let max_depth = pipeline_depth;
                 let handle = std::thread::spawn(move || {
-                    let cpu = autumn_common::pick_cpu_for_ord(tid);
                     compio::runtime::RuntimeBuilder::new()
-                        .thread_affinity(autumn_common::affinity_set(cpu))
                         .build()
                         .unwrap()
                         .block_on(async {

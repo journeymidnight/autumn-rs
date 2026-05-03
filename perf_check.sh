@@ -257,6 +257,14 @@ start_cluster_for() {
     if (( SKIP_CLUSTER == 0 )); then
         bash "$SCRIPT_DIR/cluster.sh" clean
         await_ports_clear
+        # F122-fix: default to AUTUMN_EXTENT_SHARDS=4 so each EN process has 4
+        # cores serving extent traffic (single-shard mode put all 3-replica
+        # writes through 3 cores total — EN became the wall at >100k ops/s).
+        # Caller can override via env. With our current cpu-start formula
+        # (EN_i: (i-1)*SHARDS, PS: REPLICAS*SHARDS) 4 shards × 3 replicas = 12
+        # EN cores then PS partitions take 2N cores after — fits any
+        # reasonably-sized host's cpuset.
+        AUTUMN_EXTENT_SHARDS="${AUTUMN_EXTENT_SHARDS:-4}" \
         AUTUMN_TRANSPORT="$mode" bash "$SCRIPT_DIR/cluster.sh" start 3 \
             || { echo "[perf-check] FAILED to start cluster (mode=$mode parts=$parts)"; return 1; }
     else

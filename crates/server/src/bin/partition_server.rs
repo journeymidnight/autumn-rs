@@ -11,6 +11,7 @@ struct Args {
     advertise: Option<String>,
     bind_host: String,
     transport: TransportKind,
+    cpu_start: usize,
 }
 
 fn parse_args() -> Args {
@@ -20,6 +21,7 @@ fn parse_args() -> Args {
     let mut advertise: Option<String> = None;
     let mut bind_host = String::from("0.0.0.0");
     let mut transport = TransportKind::Tcp;
+    let mut cpu_start: usize = 0;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -53,6 +55,10 @@ fn parse_args() -> Args {
                         std::process::exit(2);
                     });
             }
+            "--cpu-start" => {
+                i += 1;
+                cpu_start = args[i].parse().expect("--cpu-start must be a number");
+            }
             // F099-J: `--conn-threads` is a no-op. Pre-F099-J it sized the
             // compio Dispatcher worker pool that ran ps-conn tasks; after
             // F099-J every ps-conn task runs on the owning partition's
@@ -78,6 +84,9 @@ fn parse_args() -> Args {
                 eprintln!("  --advertise <ADDR>   Advertise host for cluster discovery");
                 eprintln!("                       (F099-K: the `host:port` base — port comes from --port)");
                 eprintln!("  --transport <MODE>   Transport backend: tcp (default) or ucx");
+                eprintln!("  --cpu-start <N>      First core to pin partition threads to [default: 0]");
+                eprintln!("                       Multi-process clusters on one host need disjoint values");
+                eprintln!("                       so PS partitions don't share cores with extent-nodes.");
                 eprintln!("  --conn-threads <N>   [DEPRECATED, F099-J] accepted but ignored");
                 std::process::exit(0);
             }
@@ -98,6 +107,7 @@ fn parse_args() -> Args {
         advertise,
         bind_host,
         transport,
+        cpu_start,
     }
 }
 
@@ -155,6 +165,7 @@ async fn main() -> Result<()> {
 
     let args = parse_args();
     let _ = autumn_transport::init_with(args.transport);
+    autumn_common::set_cpu_offset(args.cpu_start);
 
     #[cfg(unix)]
     unsafe {

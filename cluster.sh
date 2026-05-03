@@ -185,6 +185,9 @@ launch_extent_node() {
     local port=$(( 9100 + i ))
     local disk_arg
     disk_arg=$(disk_args_for_node "$i")
+    # F122-fix: each node owns SHARDS cores starting at (i-1)*SHARDS.
+    # PS gets cores starting after all extent-node ranges (see launch_ps).
+    local cpu_start=$(( (i - 1) * SHARDS ))
     # shellcheck disable=SC2046  # intentional word splitting on commas
     mkdir -p $(echo "$disk_arg" | tr ',' ' ')
     if [[ "$disk_arg" == *,* ]]; then
@@ -192,22 +195,26 @@ launch_extent_node() {
             start_proc "node$i" \
                 "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
                 --listen "$BIND_HOST" --transport "$TRANSPORT" \
-                --shards "$SHARDS" --shard-stride "$SHARD_STRIDE"
+                --shards "$SHARDS" --shard-stride "$SHARD_STRIDE" \
+                --cpu-start "$cpu_start"
         else
             start_proc "node$i" \
                 "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
-                --listen "$BIND_HOST" --transport "$TRANSPORT"
+                --listen "$BIND_HOST" --transport "$TRANSPORT" \
+                --cpu-start "$cpu_start"
         fi
     else
         if (( SHARDS > 1 )); then
             start_proc "node$i" \
                 "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR" \
                 --listen "$BIND_HOST" --transport "$TRANSPORT" \
-                --shards "$SHARDS" --shard-stride "$SHARD_STRIDE"
+                --shards "$SHARDS" --shard-stride "$SHARD_STRIDE" \
+                --cpu-start "$cpu_start"
         else
             start_proc "node$i" \
                 "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR" \
-                --listen "$BIND_HOST" --transport "$TRANSPORT"
+                --listen "$BIND_HOST" --transport "$TRANSPORT" \
+                --cpu-start "$cpu_start"
         fi
     fi
     wait_port "$port" "node$i"
@@ -240,14 +247,19 @@ register_extent_node() {
 # 9202, ...) come up only after partitions open, so we don't wait_port
 # here — bootstrap or region-sync handles readiness.
 launch_ps() {
+    # F122-fix: PS partitions pin starting AFTER all extent-node core ranges
+    # (each EN owns SHARDS cores, REPLICAS nodes total → PS starts at
+    # REPLICAS*SHARDS). Disjoint ranges prevent ord=0 collision on core 0.
+    local ps_cpu_start=$(( REPLICAS * SHARDS ))
     start_proc ps \
         "$PS" \
         --psid 1 --port 9201 \
         --manager "$MANAGER_ADDR" \
         --listen "$BIND_HOST" \
         --advertise "${BIND_HOST}:9201" \
-        --transport "$TRANSPORT"
-    echo "[cluster] PS launched (F099-K: per-partition listeners bind on partition open)"
+        --transport "$TRANSPORT" \
+        --cpu-start "$ps_cpu_start"
+    echo "[cluster] PS launched (F099-K: per-partition listeners bind on partition open; cpu-start=$ps_cpu_start)"
 }
 
 # Snapshot the launch parameters so `start-node` / `start-ps` (run later)

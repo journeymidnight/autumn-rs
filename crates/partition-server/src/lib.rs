@@ -1121,9 +1121,14 @@ impl PartitionServer {
             anyhow!("exhausted partition port ordinal space (u16 overflow)")
         })?;
         self.next_port_ord.set(ord);
-        // ord is 1-based; cpu pool indexing is 0-based. Both P-log (`part-N`)
-        // and P-bulk (`part-N-bulk`) of this partition will pin to `cpu`.
-        let cpu = pick_cpu_for_ord((ord as usize).saturating_sub(1));
+        // ord is 1-based; cpu pool indexing is 0-based. F122-fix: P-log and
+        // P-bulk now pin to different cores — at sustained 4 KB write loads
+        // P-bulk's `build_sst_bytes` is CPU-heavy enough to fight P-log for
+        // cycles when they share. Layout: partition i takes cores
+        // [cpu_offset + 2i, cpu_offset + 2i+1] (P-log, P-bulk).
+        let ord_zero = (ord as usize).saturating_sub(1);
+        let cpu_log = pick_cpu_for_ord(2 * ord_zero);
+        let cpu_bulk = pick_cpu_for_ord(2 * ord_zero + 1);
         let base_port = self.base_port.get();
         let listen_port = base_port.checked_add(ord).ok_or_else(|| {
             anyhow!(
@@ -1165,10 +1170,10 @@ impl PartitionServer {
             .name(format!("part-{part_id}"))
             .spawn(move || {
                 let rt = compio::runtime::RuntimeBuilder::new()
-                    .thread_affinity(affinity_set(cpu))
+                    .thread_affinity(affinity_set(cpu_log))
                     .build()
                     .expect("create compio runtime");
-                tracing::info!(part_id, ?cpu, "P-log thread runtime ready");
+                tracing::info!(part_id, cpu_log = ?cpu_log, cpu_bulk = ?cpu_bulk, "P-log thread runtime ready");
                 rt.block_on(async move {
                     if let Err(e) = partition_thread_main(
                         part_id,
@@ -1186,7 +1191,7 @@ impl PartitionServer {
                         shutdown_rx,
                         drain_rx,
                         compact_gate_for_thread,
-                        cpu,
+                        cpu_bulk,
                     )
                     .await
                     {
@@ -1958,7 +1963,7 @@ async fn partition_thread_main(
     shutdown_rx: oneshot::Receiver<()>,
     drain_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
     compact_gate: std::sync::Arc<CompactionGate>,
-    cpu: Option<usize>,
+    cpu_bulk: Option<usize>,
 ) -> Result<()> {
     // F099-J: create the same-thread ps-conn ↔ merged_partition_loop
     // channel. Both endpoints live on THIS compio runtime, so sends and
@@ -2030,7 +2035,7 @@ async fn partition_thread_main(
         owner_key.clone(),
         revision,
         flush_req_rx,
-        cpu,
+        cpu_bulk,
     );
     let flush_req_tx_part = match &bulk_thread_spawn {
         Ok(_) => Some(flush_req_tx.clone()),
