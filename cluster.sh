@@ -176,6 +176,47 @@ compute_shard_config() {
     [[ "$SHARD_STRIDE" =~ ^[0-9]+$ ]] && (( SHARD_STRIDE >= 1 )) || SHARD_STRIDE=10
 }
 
+# Detect the available CPU count in a portable way (Linux + macOS).
+# Returns 0 if no probe succeeded — caller should treat 0 as "unknown,
+# don't bother with affinity".
+detect_cpu_count() {
+    local n
+    n="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+    if [[ -z "$n" ]]; then n="$(nproc 2>/dev/null || true)"; fi
+    if [[ -z "$n" ]]; then n="$(sysctl -n hw.ncpu 2>/dev/null || true)"; fi
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    echo "$n"
+}
+
+# Decide whether to pass --cpu-start to extent-nodes / PS. Sets the global
+# AFFINITY_ENABLED=1|0 and (when enabled) leaves the calculated cpu_start
+# values to the launchers. Compatible across macOS and Linux:
+#   - macOS: core_affinity in our Rust code is best-effort; passing
+#     --cpu-start is harmless. We still gate by detected core count.
+#   - Linux with taskset: nproc honors the cpuset, so the gate triggers
+#     correctly under restricted cgroups.
+# Heuristic: need REPLICAS*SHARDS cores for EN side + 2*PS_PARTS_HINT for
+# PS (P-log + P-bulk per partition). PS_PARTS_HINT defaults to 8 (matches
+# perf_check.sh default partition count); override via
+# AUTUMN_PS_PARTS_HINT for clusters with more partitions.
+compute_affinity_decision() {
+    local detected required ps_hint
+    detected="$(detect_cpu_count)"
+    ps_hint="${AUTUMN_PS_PARTS_HINT:-8}"
+    [[ "$ps_hint" =~ ^[0-9]+$ ]] && (( ps_hint >= 1 )) || ps_hint=8
+    required=$(( REPLICAS * SHARDS + 2 * ps_hint ))
+    if (( detected == 0 )); then
+        AFFINITY_ENABLED=0
+        echo "[cluster] affinity: disabled (could not detect CPU count)"
+    elif (( detected < required )); then
+        AFFINITY_ENABLED=0
+        echo "[cluster] affinity: disabled (detected $detected cores < required $required = ${REPLICAS}*${SHARDS} EN + 2*${ps_hint} PS)"
+    else
+        AFFINITY_ENABLED=1
+        echo "[cluster] affinity: enabled (detected $detected cores >= required $required)"
+    fi
+}
+
 # Launch one extent-node ($1 = 1-indexed). Picks --shards/--data based on
 # the current CLUSTER_MODE + AUTUMN_EXTENT_SHARDS env (compute_shard_config
 # must have run first). Creates data dirs if missing. Waits for the primary
@@ -187,7 +228,11 @@ launch_extent_node() {
     disk_arg=$(disk_args_for_node "$i")
     # F122-fix: each node owns SHARDS cores starting at (i-1)*SHARDS.
     # PS gets cores starting after all extent-node ranges (see launch_ps).
+    # Skip --cpu-start when affinity is disabled (low core count / unknown
+    # platform) — the binary then leaves all threads unpinned.
     local cpu_start=$(( (i - 1) * SHARDS ))
+    local -a cpu_args=()
+    (( ${AFFINITY_ENABLED:-0} == 1 )) && cpu_args=(--cpu-start "$cpu_start")
     # shellcheck disable=SC2046  # intentional word splitting on commas
     mkdir -p $(echo "$disk_arg" | tr ',' ' ')
     if [[ "$disk_arg" == *,* ]]; then
@@ -196,12 +241,12 @@ launch_extent_node() {
                 "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
                 --listen "$BIND_HOST" --transport "$TRANSPORT" \
                 --shards "$SHARDS" --shard-stride "$SHARD_STRIDE" \
-                --cpu-start "$cpu_start"
+                "${cpu_args[@]}"
         else
             start_proc "node$i" \
                 "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
                 --listen "$BIND_HOST" --transport "$TRANSPORT" \
-                --cpu-start "$cpu_start"
+                "${cpu_args[@]}"
         fi
     else
         if (( SHARDS > 1 )); then
@@ -209,12 +254,12 @@ launch_extent_node() {
                 "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR" \
                 --listen "$BIND_HOST" --transport "$TRANSPORT" \
                 --shards "$SHARDS" --shard-stride "$SHARD_STRIDE" \
-                --cpu-start "$cpu_start"
+                "${cpu_args[@]}"
         else
             start_proc "node$i" \
                 "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR" \
                 --listen "$BIND_HOST" --transport "$TRANSPORT" \
-                --cpu-start "$cpu_start"
+                "${cpu_args[@]}"
         fi
     fi
     wait_port "$port" "node$i"
@@ -250,7 +295,14 @@ launch_ps() {
     # F122-fix: PS partitions pin starting AFTER all extent-node core ranges
     # (each EN owns SHARDS cores, REPLICAS nodes total → PS starts at
     # REPLICAS*SHARDS). Disjoint ranges prevent ord=0 collision on core 0.
+    # Skip --cpu-start when AFFINITY_ENABLED=0 (low core count).
     local ps_cpu_start=$(( REPLICAS * SHARDS ))
+    local -a cpu_args=()
+    local affinity_msg="affinity=off"
+    if (( ${AFFINITY_ENABLED:-0} == 1 )); then
+        cpu_args=(--cpu-start "$ps_cpu_start")
+        affinity_msg="cpu-start=$ps_cpu_start"
+    fi
     start_proc ps \
         "$PS" \
         --psid 1 --port 9201 \
@@ -258,8 +310,8 @@ launch_ps() {
         --listen "$BIND_HOST" \
         --advertise "${BIND_HOST}:9201" \
         --transport "$TRANSPORT" \
-        --cpu-start "$ps_cpu_start"
-    echo "[cluster] PS launched (F099-K: per-partition listeners bind on partition open; cpu-start=$ps_cpu_start)"
+        "${cpu_args[@]}"
+    echo "[cluster] PS launched (F099-K: per-partition listeners bind on partition open; $affinity_msg)"
 }
 
 # Snapshot the launch parameters so `start-node` / `start-ps` (run later)
@@ -289,6 +341,7 @@ load_cluster_config() {
     BIND_HOST="${AUTUMN_BIND_HOST:-127.0.0.1}"
     MANAGER_ADDR="${BIND_HOST}:9001"
     compute_shard_config
+    compute_affinity_decision
 }
 
 # ---------------------------------------------------------------------------
@@ -357,6 +410,7 @@ do_start() {
     # F099-M: when AUTUMN_EXTENT_SHARDS is set, launch each extent-node
     # with K shards (see compute_shard_config + launch_extent_node above).
     compute_shard_config
+    compute_affinity_decision
     if (( SHARDS > 1 )); then
         echo "[cluster] F099-M: extent-node shards=$SHARDS stride=$SHARD_STRIDE"
     fi
