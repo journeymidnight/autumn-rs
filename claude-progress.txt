@@ -25,8 +25,9 @@ Completed:
   - Cross-crate audit via 3 Explore agents (manager / partition-server / stream). Findings written to
     /Users/zhangdongmao/.claude/plans/abstract-singing-music.md as suspects S1–S5; only F136 needed an
     immediate fix. S2 (extent-node fd/inode race between recovery and EC commit_shard_local) is closed
-    transitively by F136. S1 (manager eversion lost-update across await), S3 (extent-node delete vs
-    in-flight recovery), and S4/S5 are tracked as low-priority follow-ups.
+    transitively by F136. S1 (manager eversion lost-update across await) and S3 (extent-node delete vs
+    in-flight recovery) are now formally tracked in feature_list.md as F138 / F139 (passes:false, with
+    Trigger: conditions for when to escalate). S4/S5 remain no-action per the plan.
   - Updated feature_list.md with F136 entry (passes:true).
   - Updated CLAUDE.md? — no changes (the F136 fix is in recovery.rs and the manager CLAUDE.md already
     described the loop structure; the bug was a missing mutual-exclusion check, not a structural change).
@@ -39,7 +40,8 @@ Files modified:
     internal numbering; the feature index for this fix is F136)
   - crates/partition-server/src/background.rs: F135 compact_row_append helper + 2 do_compact call sites
     routed through P-bulk's row_append_tx
-  - feature_list.md: F136 entry added
+  - feature_list.md: F136 entry added; F138 (eversion lost-update) and F139 (delete vs recovery)
+    appended as deferred entries with passes:false and Trigger: clauses
   - claude-progress.txt: this file
 
 Out of scope:
