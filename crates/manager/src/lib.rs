@@ -1885,4 +1885,118 @@ mod tests {
             assert!(s.extents.get(&10).is_none(), "extent 10 should be removed (refs was 1)");
         })
     }
+
+    // ── F126: recovery + EC conversion mutual exclusion ─────────────────
+
+    #[test]
+    fn f126_apply_recovery_done_rejects_duplicate_target() {
+        run(async {
+            let m = AutumnManager::new();
+
+            // Simulate: extent 20 was correctly EC-converted to (data=[1,3,5],
+            // parity=[7]). Then a recovery task that was dispatched BEFORE EC
+            // conversion (when parity was still []) completes — the task says
+            // "replace node 1 with node 7". Applying this would produce
+            // replicates=[7,3,5], parity=[7] (duplicate node 7).
+            let extent_id = 20u64;
+            let ex = MgrExtentInfo {
+                extent_id,
+                replicates: vec![1, 3, 5],
+                parity: vec![7],
+                eversion: 3,
+                refs: 1,
+                vp_table_refs: 0,
+                sealed_length: 100_000,
+                avali: 0xF, // all 4 slots available before
+                replicate_disks: vec![10, 11, 12],
+                parity_disks: vec![13],
+                ec_converted: true,
+            };
+            m.store.inner.borrow_mut().extents.insert(extent_id, ex.clone());
+
+            let task = MgrRecoveryTask {
+                extent_id,
+                replace_id: 1,
+                node_id: 7, // already in parity[]
+                start_time: 0,
+            };
+            m.recovery_tasks
+                .borrow_mut()
+                .insert(extent_id, task.clone());
+
+            let done = MgrRecoveryTaskDone {
+                task,
+                ready_disk_id: 99,
+            };
+            let result = m.apply_recovery_done(done).await;
+
+            assert!(
+                result.is_err(),
+                "apply_recovery_done must reject duplicate-node state"
+            );
+            // Recovery_tasks entry should be cleaned up so future dispatches
+            // can re-attempt (e.g., once the original failed node is back
+            // online, re_avali can repair without going through dispatch).
+            assert!(
+                !m.recovery_tasks.borrow().contains_key(&extent_id),
+                "stale recovery task must be removed on duplicate-node rejection"
+            );
+            // Extent layout must be unchanged.
+            let s = m.store.inner.borrow();
+            let ex_after = s.extents.get(&extent_id).unwrap();
+            assert_eq!(ex_after.replicates, vec![1, 3, 5]);
+            assert_eq!(ex_after.parity, vec![7]);
+            assert_eq!(ex_after.eversion, 3, "eversion must not be bumped on rejection");
+        })
+    }
+
+    #[test]
+    fn f126_apply_recovery_done_succeeds_when_target_is_unique() {
+        // Sanity check: the duplicate-target check must not interfere with
+        // normal recovery applies. With a 5-node cluster, recovery from
+        // node 1 → node 9 (not in extent_nodes) should succeed cleanly.
+        run(async {
+            let m = AutumnManager::new();
+
+            let extent_id = 30u64;
+            let ex = MgrExtentInfo {
+                extent_id,
+                replicates: vec![1, 3, 5],
+                parity: vec![7],
+                eversion: 3,
+                refs: 1,
+                vp_table_refs: 0,
+                sealed_length: 100_000,
+                avali: 0xE, // slot 0 marked unavailable
+                replicate_disks: vec![10, 11, 12],
+                parity_disks: vec![13],
+                ec_converted: true,
+            };
+            m.store.inner.borrow_mut().extents.insert(extent_id, ex);
+
+            let task = MgrRecoveryTask {
+                extent_id,
+                replace_id: 1,
+                node_id: 9, // fresh node, NOT in extent_nodes
+                start_time: 0,
+            };
+            m.recovery_tasks
+                .borrow_mut()
+                .insert(extent_id, task.clone());
+
+            let done = MgrRecoveryTaskDone {
+                task,
+                ready_disk_id: 88,
+            };
+            let result = m.apply_recovery_done(done).await;
+
+            assert!(result.is_ok(), "normal recovery apply must succeed: {result:?}");
+            let s = m.store.inner.borrow();
+            let ex_after = s.extents.get(&extent_id).unwrap();
+            assert_eq!(ex_after.replicates, vec![9, 3, 5], "slot 0 should be replaced");
+            assert_eq!(ex_after.parity, vec![7]);
+            assert_eq!(ex_after.eversion, 4, "eversion must be bumped on apply");
+            assert_eq!(ex_after.avali, 0xF, "slot 0 avali bit should be set");
+        })
+    }
 }

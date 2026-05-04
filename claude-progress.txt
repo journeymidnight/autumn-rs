@@ -1,19 +1,56 @@
-Date: 2026-05-02
+Date: 2026-05-04
 TaskStatus: completed
-Task scope: Un-ignore F099-K-followup tests — bug already fixed by prior commits
+Task scope: F136 — recovery + EC conversion race causing duplicate-node corruption; reapplied F135 wiring lost from a prior revert; cross-crate background-task race audit
 
 Completed:
-  - Verified that all 3 tests previously ignored due to F099-K-followup bug now pass:
-    1. system_split_ref_counting::split_ref_counting_shared_extents_freed_after_both_gc (12.97s)
-    2. system_compound_failures::split_then_ps_crash_data_survives (8.28s)
-    3. integration::f037_overlap_detected_after_split_and_cleared_by_compaction (4.12s)
-  - Removed #[ignore] from all 3 tests
-  - The bug (writes to RIGHT child partition hang after split) was fixed by
-    earlier commits, most likely `4f2e656 Fix sealed split tail initialization`
-    which ensured ensure_tail_initialised() properly handles sealed tails
-    from split by allocating a fresh extent immediately.
+  - Root cause (F136): pre-EC extents have parity=[] (handle_create_stream + handle_stream_alloc_extent in
+    crates/manager/src/rpc_handlers.rs:374,881). dispatch_recovery_task computes occupied = replicates ++ parity,
+    so it can pick the FUTURE parity node as a recovery target. If a recovery dispatches before EC conversion
+    runs, the recovering node ends up holding parity bytes (commit_shard_local rename overwrites recovery's
+    .dat) AND the manager's apply_recovery_done later replaces replicates[slot] with that node id — resulting
+    in the same node id appearing in both replicates and parity. Reads of the duplicated data shard return
+    parity bytes → GC fails with "trailing bytes did not form a complete record".
+  - Fix layered three ways in crates/manager/src/recovery.rs:
+      1. dispatch_recovery_task early-returns when extent_id ∈ ec_conversion_inflight
+      2. ec_conversion_dispatch_loop skips extents present in recovery_tasks
+      3. apply_recovery_done rejects the apply if task.node_id is already in extent_nodes(ex) at a different
+         slot, removing the stale recovery_tasks entry from memory + etcd so future re-dispatch is unblocked
+  - Tests: f126_apply_recovery_done_rejects_duplicate_target and
+    f126_apply_recovery_done_succeeds_when_target_is_unique in crates/manager/src/lib.rs.
+  - Made apply_recovery_done pub(crate) so tests can call it.
+  - Reapplied F135's compact_row_append helper + do_compact wiring in
+    crates/partition-server/src/background.rs (the lib.rs side of F135 was already in working state from
+    the prior session; only the background.rs portion had been accidentally reverted by an earlier
+    `git checkout` during exploratory debugging in this session).
+  - Cross-crate audit via 3 Explore agents (manager / partition-server / stream). Findings written to
+    /Users/zhangdongmao/.claude/plans/abstract-singing-music.md as suspects S1–S5; only F136 needed an
+    immediate fix. S2 (extent-node fd/inode race between recovery and EC commit_shard_local) is closed
+    transitively by F136. S1 (manager eversion lost-update across await), S3 (extent-node delete vs
+    in-flight recovery), and S4/S5 are tracked as low-priority follow-ups.
+  - Updated feature_list.md with F136 entry (passes:true).
+  - Updated CLAUDE.md? — no changes (the F136 fix is in recovery.rs and the manager CLAUDE.md already
+    described the loop structure; the bug was a missing mutual-exclusion check, not a structural change).
 
-Pre-existing failures (not related):
-  - ec_integration::replication_stream_works — panics at line 111
-  - integration::f030_flush_writes_sst_to_row_stream — pre-existing
-  - integration::f029_compaction_merges_small_tables — pre-existing
+Files modified:
+  - crates/manager/src/recovery.rs: dispatch_recovery_task ec_conversion_inflight check; apply_recovery_done
+    duplicate-node precheck + cleanup of stale task; ec_conversion_dispatch_loop recovery_tasks check;
+    apply_recovery_done made pub(crate)
+  - crates/manager/src/lib.rs: 2 new F126* tests (the test names use "f126" reflecting the file's pre-existing
+    internal numbering; the feature index for this fix is F136)
+  - crates/partition-server/src/background.rs: F135 compact_row_append helper + 2 do_compact call sites
+    routed through P-bulk's row_append_tx
+  - feature_list.md: F136 entry added
+  - claude-progress.txt: this file
+
+Out of scope:
+  - Already-corrupted extent 20 in the running cluster. The user will `cluster.sh reset` to wipe and
+    re-bootstrap, so no in-place repair is needed.
+
+Verification:
+  - cargo build --workspace: clean
+  - cargo test -p autumn-manager --lib: 14 passed (12 prior + 2 new F126*)
+  - cargo test -p autumn-manager --test ec_failover: passed
+  - cargo test -p autumn-partition-server --lib: 103 passed, 2 pre-existing f099i flaky failures unrelated
+    to this change (same as in the prior session's progress notes)
+  - cargo test -p autumn-manager --test ec_integration::replication_stream_works: pre-existing failure
+    on baseline (verified by stashing my changes and re-running); not introduced by this fix

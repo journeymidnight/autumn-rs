@@ -241,12 +241,12 @@ launch_extent_node() {
                 "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
                 --listen "$BIND_HOST" --transport "$TRANSPORT" \
                 --shards "$SHARDS" --shard-stride "$SHARD_STRIDE" \
-                "${cpu_args[@]}"
+                ${cpu_args[@]:+"${cpu_args[@]}"}
         else
             start_proc "node$i" \
                 "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
                 --listen "$BIND_HOST" --transport "$TRANSPORT" \
-                "${cpu_args[@]}"
+                ${cpu_args[@]:+"${cpu_args[@]}"}
         fi
     else
         if (( SHARDS > 1 )); then
@@ -254,12 +254,12 @@ launch_extent_node() {
                 "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR" \
                 --listen "$BIND_HOST" --transport "$TRANSPORT" \
                 --shards "$SHARDS" --shard-stride "$SHARD_STRIDE" \
-                "${cpu_args[@]}"
+                ${cpu_args[@]:+"${cpu_args[@]}"}
         else
             start_proc "node$i" \
                 "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR" \
                 --listen "$BIND_HOST" --transport "$TRANSPORT" \
-                "${cpu_args[@]}"
+                ${cpu_args[@]:+"${cpu_args[@]}"}
         fi
     fi
     wait_port "$port" "node$i"
@@ -310,7 +310,7 @@ launch_ps() {
         --listen "$BIND_HOST" \
         --advertise "${BIND_HOST}:9201" \
         --transport "$TRANSPORT" \
-        "${cpu_args[@]}"
+        ${cpu_args[@]:+"${cpu_args[@]}"}
     echo "[cluster] PS launched (F099-K: per-partition listeners bind on partition open; $affinity_msg)"
 }
 

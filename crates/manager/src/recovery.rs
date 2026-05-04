@@ -19,6 +19,18 @@ impl AutumnManager {
             return Ok(());
         }
 
+        // F126: do not dispatch recovery while EC conversion is in flight on
+        // this extent. Recovery would write a full replica copy to the node's
+        // `.dat` file; EC conversion's `commit_shard_local` then renames
+        // `.ec.dat` over the same path, silently clobbering recovery's data
+        // and leaving the recovery target node holding parity bytes while
+        // `apply_recovery_done` still rewrites `replicates[slot]` to point
+        // there — producing a duplicate-node corrupt state where the same
+        // node id appears in both `replicates` and `parity`.
+        if self.ec_conversion_inflight.borrow().contains(&extent_id) {
+            return Ok(());
+        }
+
         let (extent, candidates) = {
             let s = self.store.inner.borrow();
             let extent = s
@@ -109,11 +121,56 @@ impl AutumnManager {
         ))
     }
 
-    async fn apply_recovery_done(
+    pub(crate) async fn apply_recovery_done(
         &self,
         done_task: MgrRecoveryTaskDone,
     ) -> Result<(), AppError> {
         let task = &done_task.task;
+
+        // F126: precheck — if `task.node_id` is already present in this
+        // extent at a slot OTHER than the failed `replace_id`, the layout
+        // has changed since dispatch (typically EC conversion completed
+        // during recovery and assigned this node as parity). Applying the
+        // recovery would produce a duplicate-node state where one node
+        // holds two shards; reads of the duplicated slot would return
+        // whatever shard EC conversion last wrote there (parity bytes in
+        // the documented production case), corrupting the read path.
+        // Discard the stale task (memory + etcd) so the dedup check in
+        // `dispatch_recovery_task` doesn't permanently block future
+        // attempts to repair this slot.
+        let layout_changed = {
+            let s = self.store.inner.borrow();
+            match s.extents.get(&task.extent_id) {
+                Some(ex) => match Self::extent_slot(ex, task.replace_id) {
+                    Some(slot) => Some(
+                        Self::extent_nodes(ex)
+                            .iter()
+                            .enumerate()
+                            .any(|(i, &id)| i != slot && id == task.node_id),
+                    ),
+                    None => None,
+                },
+                None => Some(false),
+            }
+        };
+        if matches!(layout_changed, Some(true)) {
+            self.recovery_tasks
+                .borrow_mut()
+                .remove(&task.extent_id);
+            if let Some(etcd) = &self.etcd {
+                let _ = etcd
+                    .put_and_delete_txn(
+                        Vec::new(),
+                        vec![format!("recoveryTasks/{}", task.extent_id)],
+                    )
+                    .await;
+            }
+            return Err(AppError::Precondition(format!(
+                "recovery target {} for extent {} already in extent node list at a different slot; \
+                 likely EC conversion completed during recovery — discarding stale apply",
+                task.node_id, task.extent_id
+            )));
+        }
 
         let updated_extent = {
             let mut s = self.store.inner.borrow_mut();
@@ -456,6 +513,21 @@ impl AutumnManager {
             // (ec_data_shard, ec_parity_shard) are identical across
             // CoW-shared streams by construction (compute_duplicate_stream
             // copies them), so picking either stream is equivalent.
+            // F126: snapshot recovery_tasks so we skip extents that have an
+            // in-flight recovery. Without this, an EC conversion can dispatch
+            // shards (write_shard_local + commit_shard_local rename) to the
+            // SAME node that recovery is concurrently writing a full-replica
+            // copy to — the rename clobbers recovery's data, leaving the
+            // recovering node holding parity bytes while the manager later
+            // updates `replicates[slot]` to point at it (duplicate-node
+            // corrupt state).
+            let recovery_inflight_extents: HashSet<u64> = self
+                .recovery_tasks
+                .borrow()
+                .keys()
+                .copied()
+                .collect();
+
             let candidates: Vec<(MgrExtentInfo, MgrStreamInfo)> = {
                 let s = self.store.inner.borrow();
                 let mut out = Vec::new();
@@ -466,6 +538,9 @@ impl AutumnManager {
                     }
                     for &eid in &stream.extent_ids {
                         if !seen.insert(eid) {
+                            continue;
+                        }
+                        if recovery_inflight_extents.contains(&eid) {
                             continue;
                         }
                         if let Some(ex) = s.extents.get(&eid) {

@@ -318,6 +318,26 @@ small. The benefit is that while one SST is uploading via
 `spawn_blocking` — overlapping CPU (build) with network (upload) without
 ballooning peak memory.
 
+**Single-writer invariant for row_stream (post-2026-05-03 fix):** ALL
+appends to `row_stream` MUST go through P-bulk's `StreamClient`. The
+`flush_worker_loop` accepts two channel types:
+- `FlushReq` (from flush_loop): build SST + row_stream.append
+- `RowAppendReq` (from compaction on P-log): row_stream.append only
+
+Both share P-bulk's single `StreamClient`, so the per-stream worker's
+commit/lease state stays coherent. **Never use P-log's `part_sc` for
+row_stream appends.** Pre-fix, compaction (`do_compact`) used P-log's
+`part_sc.append(row_stream_id, ...)` while flush used P-bulk's
+`bulk_sc.append(row_stream_id, ...)`. The two independent StreamClients
+tracked commit position locally and independently. When one writer's
+stale commit was sent in an append header, ExtentNode truncated data
+written by the other, destroying SST data and causing `invalid meta_len`
+corruption on PS restart.
+
+Legacy fallback: if P-bulk failed to spawn, `row_append_tx` is `None`
+and compaction falls back to `part_sc` — acceptable because in that case
+flush also uses `part_sc` (single writer).
+
 **Record format**: `[op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key][value]` (17-byte header)
 
 **No local WAL file**: logStream is the sole write-ahead log. Recovery replays logStream from the VP head recorded in the last metaStream checkpoint.

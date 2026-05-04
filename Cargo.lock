@@ -1131,7 +1131,6 @@ dependencies = [
  "futures",
  "image",
  "mime_guess",
- "percent-encoding",
  "send_wrapper",
  "tempfile",
  "tracing",

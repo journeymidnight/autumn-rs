@@ -91,13 +91,9 @@ const THUMB_PREFIX: &str = ".thumb/";
 const HLS_PREFIX: &str = ".hls/";
 const THUMB_WIDTH: u32 = 320;
 const THUMB_QUALITY: u8 = 80;
-// Must match the bind in main(). Used so ffmpeg can pull video bytes from
-// our own /get/ route via HTTP Range, avoiding a full-blob fetch.
 const LISTEN_PORT: u16 = 5001;
-// Chunk size for streaming /get/{name} responses. ffmpeg's HTTP demuxer
-// always opens with `Range: bytes=N-`; without chunking we'd materialise
-// `total - N` bytes into one Vec before any HTTP byte ships. 4 MiB keeps
-// memory bounded and lets ffmpeg start parsing after one round-trip.
+// Chunk size for streaming /get/{name} responses and for downloading
+// source video to a temp file before transcoding.
 const RANGE_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
 
 fn thumb_key(name: &str) -> String {
@@ -130,14 +126,6 @@ fn is_video_ext(ext: &str) -> bool {
 
 fn is_svg_ext(ext: &str) -> bool {
     ext == "svg"
-}
-
-fn url_encode(s: &str) -> String {
-    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
-}
-
-fn self_get_url(name: &str) -> String {
-    format!("http://127.0.0.1:{LISTEN_PORT}/get/{}", url_encode(name))
 }
 
 /// Decode the original image bytes, downscale to THUMB_WIDTH preserving aspect,
@@ -212,7 +200,7 @@ enum HlsEncodeMode {
     Reencode,
 }
 
-fn run_hls_ffmpeg(url: &str, playlist: &std::path::Path, segments: &std::path::Path, mode: HlsEncodeMode) -> Result<()> {
+fn run_hls_ffmpeg(input: &str, playlist: &std::path::Path, segments: &std::path::Path, mode: HlsEncodeMode) -> Result<()> {
     use std::process::{Command, Stdio};
 
     let mut cmd = Command::new("ffmpeg");
@@ -221,7 +209,7 @@ fn run_hls_ffmpeg(url: &str, playlist: &std::path::Path, segments: &std::path::P
         "-loglevel",
         "error",
         "-i",
-        url,
+        input,
         "-map",
         "0:v:0",
         "-map",
@@ -277,39 +265,41 @@ fn run_hls_ffmpeg(url: &str, playlist: &std::path::Path, segments: &std::path::P
     Ok(())
 }
 
-/// FFmpeg HLS pass: input video URL → directory containing `index.m3u8` +
+/// FFmpeg HLS pass: input video file → directory containing `index.m3u8` +
 /// `seg000.ts` … plus `thumb.jpg`. If the source streams are already
 /// MPEG-TS HLS-compatible (H.264 video and copy-safe audio), prefer `-c copy`
 /// so the output is lossless; otherwise fall back to re-encoding.
-fn run_transcode_blocking(url: &str) -> Result<Vec<(String, Vec<u8>)>> {
+///
+/// `input_path` is a local file (pre-downloaded from KV by the caller).
+/// The caller owns the tempdir that contains this file.
+fn run_transcode_blocking(input_path: &std::path::Path) -> Result<Vec<(String, Vec<u8>)>> {
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
-    let tmp = tempfile::tempdir().context("tempdir")?;
-    let dir = tmp.path();
+    let dir = input_path.parent().context("input_path has no parent")?;
+    let input_str = input_path.to_str().context("non-utf8 input path")?;
     let playlist = dir.join("index.m3u8");
     let segments = dir.join("seg%03d.ts");
 
     let t1 = Instant::now();
-    if let Err(err) = run_hls_ffmpeg(url, &playlist, &segments, HlsEncodeMode::Copy) {
+    if let Err(err) = run_hls_ffmpeg(input_str, &playlist, &segments, HlsEncodeMode::Copy) {
         tracing::warn!(
             error = %err,
             "transcode: hls copy path failed, falling back to re-encode"
         );
-        // Wipe any partial segments left by the failed copy pass so they
-        // don't get collected and uploaded as orphans after re-encode.
         if let Ok(entries) = std::fs::read_dir(dir) {
             for e in entries.flatten() {
-                let _ = std::fs::remove_file(e.path());
+                let p = e.path();
+                if p != input_path {
+                    let _ = std::fs::remove_file(p);
+                }
             }
         }
-        run_hls_ffmpeg(url, &playlist, &segments, HlsEncodeMode::Reencode)
+        run_hls_ffmpeg(input_str, &playlist, &segments, HlsEncodeMode::Reencode)
             .context("run ffmpeg hls reencode after copy fallback")?;
     }
     tracing::info!(hls_ms = t1.elapsed().as_millis(), "transcode: ffmpeg hls done");
 
-    // Thumbnail in a second pass: source is still the original (HTTP Range),
-    // so we don't have to re-decode the freshly-written .ts.
     let t2 = Instant::now();
     let scale = format!("scale={THUMB_WIDTH}:-2");
     let thumb_path = dir.join("thumb.jpg");
@@ -321,7 +311,7 @@ fn run_transcode_blocking(url: &str) -> Result<Vec<(String, Vec<u8>)>> {
             "-ss",
             "0.5",
             "-i",
-            url,
+            input_str,
             "-vframes",
             "1",
             "-vf",
@@ -340,11 +330,12 @@ fn run_transcode_blocking(url: &str) -> Result<Vec<(String, Vec<u8>)>> {
     if !thumb_status.status.success() {
         let tail = String::from_utf8_lossy(&thumb_status.stderr);
         let tail = tail.lines().rev().take(4).collect::<Vec<_>>().join(" | ");
-        // Don't hard-fail the whole transcode if only the thumb pass failed —
-        // playback will still work; the cell shows the play glyph alone.
         tracing::warn!("ffmpeg thumb pass failed: {tail}");
     }
     tracing::info!(thumb_ms = t2.elapsed().as_millis(), "transcode: ffmpeg thumb done");
+
+    // Remove the source file before collecting so it doesn't get re-uploaded.
+    let _ = std::fs::remove_file(input_path);
 
     let mut out = Vec::new();
     let mut total_bytes: u64 = 0;
@@ -371,16 +362,85 @@ fn run_transcode_blocking(url: &str) -> Result<Vec<(String, Vec<u8>)>> {
     Ok(out)
 }
 
-/// Drives one transcoding job end-to-end: marks status, runs ffmpeg in a
-/// blocking thread, writes HLS segments + thumbnail to KV, then deletes the
-/// original. On failure leaves the original in place so the user can retry.
+/// Download a blob from KV to a local file, chunk by chunk.
+async fn download_to_file(
+    client: &Client,
+    key: &str,
+    dest: &std::path::Path,
+) -> Result<u64> {
+    use std::io::Write;
+
+    let meta = client.lock().await.head(key.as_bytes()).await
+        .context("head for download")?;
+    if !meta.found {
+        return Err(anyhow!("key not found: {key}"));
+    }
+    let total = meta.value_length;
+    let mut file = std::fs::File::create(dest)
+        .with_context(|| format!("create {}", dest.display()))?;
+    let chunk_size = RANGE_CHUNK_BYTES;
+    let mut offset: u64 = 0;
+    while offset < total {
+        let take = ((total - offset).min(chunk_size as u64)) as u32;
+        let data = client
+            .lock()
+            .await
+            .get_range(key.as_bytes(), offset as u32, take)
+            .await
+            .with_context(|| format!("get_range at offset {offset}"))?
+            .ok_or_else(|| anyhow!("unexpected None at offset {offset}"))?;
+        let n = data.len();
+        if n == 0 {
+            break;
+        }
+        file.write_all(&data)
+            .with_context(|| format!("write at offset {offset}"))?;
+        offset += n as u64;
+    }
+    file.flush().context("flush download file")?;
+    Ok(offset)
+}
+
+/// Drives one transcoding job end-to-end: marks status, downloads source to a
+/// temp file, runs ffmpeg in a blocking thread, writes HLS segments + thumbnail
+/// to KV, then deletes the original.
+/// On failure leaves the original in place so the user can retry.
 async fn transcode_video_task(name: String, client: Client, map: TranscodeMap) {
     map.borrow_mut()
         .insert(name.clone(), TranscodeStatus::Transcoding);
     tracing::info!("transcode start: {name}");
-    let url = self_get_url(&name);
+
+    let tmp = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("transcode: tempdir failed for {name}: {e}");
+            map.borrow_mut()
+                .insert(name, TranscodeStatus::Failed(format!("tempdir: {e}")));
+            return;
+        }
+    };
+    let source_path = tmp.path().join("source.mp4");
+
+    let t_dl = std::time::Instant::now();
+    match download_to_file(&client, &name, &source_path).await {
+        Ok(bytes) => {
+            tracing::info!(
+                dl_ms = t_dl.elapsed().as_millis(),
+                dl_mb = bytes / (1024 * 1024),
+                "transcode: source downloaded"
+            );
+        }
+        Err(e) => {
+            tracing::warn!("transcode: download failed for {name}: {e:#}");
+            map.borrow_mut()
+                .insert(name, TranscodeStatus::Failed(format!("download: {e:#}")));
+            return;
+        }
+    }
+
+    let input_path = source_path.clone();
     let t_ffmpeg = std::time::Instant::now();
-    let res = compio::runtime::spawn_blocking(move || run_transcode_blocking(&url)).await;
+    let res = compio::runtime::spawn_blocking(move || run_transcode_blocking(&input_path)).await;
     tracing::info!(ffmpeg_total_ms = t_ffmpeg.elapsed().as_millis(), "transcode: blocking work done");
 
     let outputs = match res {

@@ -693,6 +693,53 @@ pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<Tab
 // the single atomic commit point. Any chunks appended to row_stream
 // before that commit are orphan bytes if we crash, recoverable via the
 // pre-existing meta_stream-authoritative recovery path.
+/// F135 — route a single row_stream append through P-bulk's StreamClient if
+/// available, falling back to P-log's `part_sc` only when the bulk thread
+/// failed to spawn (legacy single-writer scenario).
+///
+/// **Why this matters:** flush is owned by P-bulk, which holds its own
+/// `StreamClient` with its own per-stream commit-tracking state. If
+/// compaction independently appends to row_stream via P-log's `part_sc`,
+/// the two clients each carry their own commit watermark. When one client's
+/// stale `commit` field hits the ExtentNode replicas, the server truncates
+/// data written by the other client (commit-protocol step 5). Result: SST
+/// bytes from one writer are silently destroyed mid-flight, surfacing later
+/// as `invalid meta_len` on PS restart.
+///
+/// The fix is to funnel ALL row_stream appends through P-bulk's single
+/// StreamClient. Flush already does so via `FlushReq`; compaction now does
+/// so via `RowAppendReq`. P-log → P-bulk hand-off is a oneshot per request,
+/// so callers see the same `AppendResult` shape as a direct append.
+async fn compact_row_append(
+    row_append_tx: &Option<futures::channel::mpsc::Sender<crate::RowAppendReq>>,
+    part_sc: &Rc<StreamClient>,
+    row_stream_id: u64,
+    sst_bytes: Bytes,
+) -> Result<autumn_stream::AppendResult> {
+    if let Some(tx) = row_append_tx {
+        let (resp_tx, resp_rx) = futures::channel::oneshot::channel();
+        let req = crate::RowAppendReq {
+            sst_bytes,
+            row_stream_id,
+            resp_tx,
+        };
+        tx.clone()
+            .send(req)
+            .await
+            .map_err(|_| anyhow::anyhow!("P-bulk row_append channel closed"))?;
+        resp_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("P-bulk row_append response dropped"))?
+    } else {
+        // Fallback: P-bulk failed to spawn → flush also runs on P-log,
+        // so single-writer invariant is preserved by accident.
+        part_sc
+            .append_bytes(row_stream_id, sst_bytes, true)
+            .await
+            .map_err(Into::into)
+    }
+}
+
 pub(crate) async fn do_compact(
     part: &Rc<RefCell<PartitionData>>,
     tbls: Vec<TableMeta>,
@@ -705,7 +752,7 @@ pub(crate) async fn do_compact(
     let input_tables = tbls.len();
     let compact_keys: HashSet<(u64, u32)> = tbls.iter().map(|t| t.loc()).collect();
 
-    let (readers, row_stream_id, meta_stream_id, compact_vp_eid, compact_vp_off, rg, part_sc) = {
+    let (readers, row_stream_id, meta_stream_id, compact_vp_eid, compact_vp_off, rg, part_sc, row_append_tx) = {
         let p = part.borrow();
         let mut rds: Vec<Arc<SstReader>> = Vec::new();
         for t in &tbls {
@@ -713,7 +760,7 @@ pub(crate) async fn do_compact(
                 rds.push(p.sst_readers[idx].clone());
             }
         }
-        (rds, p.row_stream_id, p.meta_stream_id, p.vp_extent_id, p.vp_offset, p.rg.clone(), p.stream_client.clone())
+        (rds, p.row_stream_id, p.meta_stream_id, p.vp_extent_id, p.vp_offset, p.rg.clone(), p.stream_client.clone(), p.row_append_tx.clone())
     };
 
     if readers.is_empty() {
@@ -826,11 +873,13 @@ pub(crate) async fn do_compact(
                 &mut current_builder,
                 SstBuilder::new(compact_vp_eid, compact_vp_off),
             );
-            let sst_bytes = builder.finish();
+            let sst_bytes = Bytes::from(builder.finish());
             let chunk_bytes = sst_bytes.len() as u64;
             output_bytes += chunk_bytes;
-            let result = part_sc.append(row_stream_id, &sst_bytes, true).await?;
-            let reader = Arc::new(SstReader::from_bytes(Bytes::from(sst_bytes))?);
+            // F135: route through P-bulk's StreamClient to preserve the
+            // single-writer invariant on row_stream.
+            let result = compact_row_append(&row_append_tx, &part_sc, row_stream_id, sst_bytes.clone()).await?;
+            let reader = Arc::new(SstReader::from_bytes(sst_bytes)?);
             new_readers.push((
                 TableMeta {
                     extent_id: result.extent_id,
@@ -866,11 +915,13 @@ pub(crate) async fn do_compact(
             SstBuilder::new(compact_vp_eid, compact_vp_off),
         );
         builder.set_discards(discards.clone());
-        let sst_bytes = builder.finish();
+        let sst_bytes = Bytes::from(builder.finish());
         let chunk_bytes = sst_bytes.len() as u64;
         output_bytes += chunk_bytes;
-        let result = part_sc.append(row_stream_id, &sst_bytes, true).await?;
-        let reader = Arc::new(SstReader::from_bytes(Bytes::from(sst_bytes))?);
+        // F135: route through P-bulk's StreamClient to preserve the
+        // single-writer invariant on row_stream.
+        let result = compact_row_append(&row_append_tx, &part_sc, row_stream_id, sst_bytes.clone()).await?;
+        let reader = Arc::new(SstReader::from_bytes(sst_bytes)?);
         new_readers.push((
             TableMeta {
                 extent_id: result.extent_id,

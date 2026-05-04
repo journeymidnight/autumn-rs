@@ -463,6 +463,10 @@ pub(crate) struct PartitionData {
     /// thread failed to initialize — fall back to in-thread flush (legacy
     /// path) so the partition remains usable.
     flush_req_tx: Option<mpsc::Sender<FlushReq>>,
+    /// Channel for compaction to route row_stream appends through P-bulk's
+    /// StreamClient, preventing dual-writer truncation corruption.
+    /// `None` when P-bulk failed to spawn (legacy fallback uses part_sc).
+    row_append_tx: Option<mpsc::Sender<RowAppendReq>>,
     /// F120-A: signaled (one item per pop) by `flush_one_imm` after every
     /// successful `imm.pop_front()` so that `merged_partition_loop` can
     /// wake from its imm-full back-pressure wait. Unbounded because the
@@ -504,6 +508,12 @@ pub(crate) struct FlushReq {
     pub(crate) row_stream_id: u64,
     pub(crate) invalidate_row_stream: bool,
     pub(crate) resp_tx: oneshot::Sender<Result<(TableMeta, SstReader)>>,
+}
+
+pub(crate) struct RowAppendReq {
+    pub(crate) sst_bytes: Bytes,
+    pub(crate) row_stream_id: u64,
+    pub(crate) resp_tx: oneshot::Sender<Result<autumn_stream::AppendResult>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2029,19 +2039,21 @@ async fn partition_thread_main(
     // `flush_req_tx`. capacity=1 keeps flushes sequential (matches the old
     // in-thread semantics) and provides back-pressure on the P-log flush_loop.
     let (flush_req_tx, flush_req_rx) = mpsc::channel::<FlushReq>(1);
+    let (row_append_tx, row_append_rx) = mpsc::channel::<RowAppendReq>(1);
     let bulk_thread_spawn = spawn_bulk_thread(
         part_id,
         manager_addr.clone(),
         owner_key.clone(),
         revision,
         flush_req_rx,
+        row_append_rx,
         cpu_bulk,
     );
-    let flush_req_tx_part = match &bulk_thread_spawn {
-        Ok(_) => Some(flush_req_tx.clone()),
+    let (flush_req_tx_part, row_append_tx_part) = match &bulk_thread_spawn {
+        Ok(_) => (Some(flush_req_tx.clone()), Some(row_append_tx.clone())),
         Err(e) => {
             tracing::error!(part_id, error = %e, "bulk thread spawn failed; flush will fall back to P-log");
-            None
+            (None, None)
         }
     };
 
@@ -2080,6 +2092,7 @@ async fn partition_thread_main(
         manager_addr: manager_addr.clone(),
         pool: pool.clone(),
         flush_req_tx: flush_req_tx_part,
+        row_append_tx: row_append_tx_part,
         imm_drained_tx,
     }));
 
@@ -2087,11 +2100,11 @@ async fn partition_thread_main(
         .await
         .context("sync partition vp refs after recovery")?;
 
-    // Drop the extra `flush_req_tx` clone held locally: the one stored in
-    // PartitionData is the only reference. When PartitionData drops, the
-    // channel closes, the bulk thread sees flush_req_rx.next() = None,
-    // and exits cleanly.
+    // Drop the extra clones held locally: the ones stored in PartitionData
+    // are the only references. When PartitionData drops, the channels close,
+    // the bulk thread sees rx.next() = None, and exits cleanly.
     drop(flush_req_tx);
+    drop(row_append_tx);
 
     // Spawn background loops on this thread's compio runtime.
     //
@@ -3296,6 +3309,7 @@ fn spawn_bulk_thread(
     owner_key: String,
     revision: i64,
     flush_req_rx: mpsc::Receiver<FlushReq>,
+    row_append_rx: mpsc::Receiver<RowAppendReq>,
     cpu: Option<usize>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
@@ -3330,78 +3344,93 @@ fn spawn_bulk_thread(
                     }
                 };
                 tracing::info!(part_id, "bulk thread ready");
-                flush_worker_loop(bulk_sc, flush_req_rx).await;
+                flush_worker_loop(bulk_sc, flush_req_rx, row_append_rx).await;
                 tracing::info!(part_id, "bulk thread exiting");
             });
         })
 }
 
-/// R4 4.4 — P-bulk flush worker with N-deep SQ/CQ pipeline.
+/// R4 4.4 — P-bulk worker with N-deep SQ/CQ pipeline.
 ///
-/// Earlier this loop was strictly sequential: recv FlushReq → build SST
-/// bytes → upload → reply → recv next. On a rapidly-rotating partition
-/// (many 256 MB memtables per second), the next `build_sst_bytes`
-/// `spawn_blocking` would not start until the previous 128 MB
-/// `row_stream.append` returned.
+/// Handles two kinds of work, both using P-bulk's single StreamClient so
+/// that row_stream commit tracking stays coherent:
+///   - `FlushReq`: build SST bytes + row_stream.append (from flush_loop)
+///   - `RowAppendReq`: row_stream.append only (from compaction on P-log)
 ///
 /// The cap is deliberately small (default 2, env
-/// `AUTUMN_PS_BULK_INFLIGHT_CAP`) because each in-flight flush holds a
-/// full 128 MB SSTable buffer in RAM. `build_sst_bytes` dominates CPU,
-/// while `row_stream.append` dominates network — with cap=2 they overlap
-/// (one is CPU-bound, one is I/O-bound) without ballooning peak memory.
-///
-/// FlushReqs arrive one per memtable rotation, so in most workloads the
-/// pipeline is effectively single-depth. The benefit kicks in during
-/// burst flushes (recovery, or back-to-back memtable-full triggers).
+/// `AUTUMN_PS_BULK_INFLIGHT_CAP`) because each in-flight item holds a
+/// full SSTable buffer in RAM.
 async fn flush_worker_loop(
     bulk_sc: Rc<StreamClient>,
-    mut flush_req_rx: mpsc::Receiver<FlushReq>,
+    flush_req_rx: mpsc::Receiver<FlushReq>,
+    row_append_rx: mpsc::Receiver<RowAppendReq>,
 ) {
     use futures::future::{select, Either};
 
     let cap = crate::ps_bulk_inflight_cap();
 
-    /// Carrier for a single in-flight flush: owns the response channel and
-    /// the Result produced by `do_flush_on_bulk`. Kept here so the
-    /// FuturesUnordered element type is a concrete future.
-    struct FlushCompletion {
-        resp_tx: oneshot::Sender<Result<(TableMeta, SstReader)>>,
-        result: Result<(TableMeta, SstReader)>,
+    enum BulkCompletion {
+        Flush {
+            resp_tx: oneshot::Sender<Result<(TableMeta, SstReader)>>,
+            result: Result<(TableMeta, SstReader)>,
+        },
+        RowAppend {
+            resp_tx: oneshot::Sender<Result<autumn_stream::AppendResult>>,
+            result: Result<autumn_stream::AppendResult>,
+        },
     }
 
-    type FlushFut = std::pin::Pin<Box<dyn std::future::Future<Output = FlushCompletion>>>;
-    let mut inflight: FuturesUnordered<FlushFut> = FuturesUnordered::new();
-
-    let launch = |req: FlushReq, bulk_sc: &Rc<StreamClient>| -> FlushFut {
-        let FlushReq {
-            imm,
-            vp_eid,
-            vp_off,
-            row_stream_id,
-            invalidate_row_stream,
-            resp_tx,
-        } = req;
-        let bulk_sc = bulk_sc.clone();
-        Box::pin(async move {
-            if invalidate_row_stream {
-                bulk_sc.invalidate_stream(row_stream_id);
+    impl BulkCompletion {
+        fn send(self) {
+            match self {
+                BulkCompletion::Flush { resp_tx, result } => { let _ = resp_tx.send(result); }
+                BulkCompletion::RowAppend { resp_tx, result } => { let _ = resp_tx.send(result); }
             }
-            let result = do_flush_on_bulk(
-                &bulk_sc,
-                imm,
-                vp_eid,
-                vp_off,
-                row_stream_id,
-            )
-            .await;
-            FlushCompletion { resp_tx, result }
-        })
+        }
+    }
+
+    type BulkFut = std::pin::Pin<Box<dyn std::future::Future<Output = BulkCompletion>>>;
+    let mut inflight: FuturesUnordered<BulkFut> = FuturesUnordered::new();
+
+    enum SqMsg {
+        Flush(FlushReq),
+        RowAppend(RowAppendReq),
+    }
+
+    let mut sq_rx = futures::stream::select(
+        flush_req_rx.map(SqMsg::Flush),
+        row_append_rx.map(SqMsg::RowAppend),
+    );
+
+    let launch = |msg: SqMsg, bulk_sc: &Rc<StreamClient>| -> BulkFut {
+        match msg {
+            SqMsg::Flush(req) => {
+                let FlushReq { imm, vp_eid, vp_off, row_stream_id, invalidate_row_stream, resp_tx } = req;
+                let bulk_sc = bulk_sc.clone();
+                Box::pin(async move {
+                    if invalidate_row_stream {
+                        bulk_sc.invalidate_stream(row_stream_id);
+                    }
+                    let result = do_flush_on_bulk(&bulk_sc, imm, vp_eid, vp_off, row_stream_id).await;
+                    BulkCompletion::Flush { resp_tx, result }
+                })
+            }
+            SqMsg::RowAppend(req) => {
+                let RowAppendReq { sst_bytes, row_stream_id, resp_tx } = req;
+                let bulk_sc = bulk_sc.clone();
+                Box::pin(async move {
+                    let result = bulk_sc.append_bytes(row_stream_id, sst_bytes, true).await
+                        .map_err(Into::into);
+                    BulkCompletion::RowAppend { resp_tx, result }
+                })
+            }
+        }
     };
 
     loop {
         // (A) Opportunistic CQ drain.
         while let Some(Some(done)) = inflight.next().now_or_never() {
-            let _ = done.resp_tx.send(done.result);
+            done.send();
         }
 
         let n_inflight = inflight.len();
@@ -3409,8 +3438,8 @@ async fn flush_worker_loop(
 
         if n_inflight == 0 {
             // Idle: only SQ can progress.
-            match flush_req_rx.next().await {
-                Some(req) => inflight.push(launch(req, &bulk_sc)),
+            match sq_rx.next().await {
+                Some(msg) => inflight.push(launch(msg, &bulk_sc)),
                 None => break,
             }
             continue;
@@ -3419,30 +3448,28 @@ async fn flush_worker_loop(
         if at_cap {
             // Back-pressure: only CQ can progress.
             if let Some(done) = inflight.next().await {
-                let _ = done.resp_tx.send(done.result);
+                done.send();
             }
             continue;
         }
 
         // 0 < n_inflight < cap → race SQ vs CQ.
-        let sq_fut = flush_req_rx.next();
+        let sq_fut = sq_rx.next();
         let cq_fut = inflight.next();
         futures::pin_mut!(sq_fut);
         match select(sq_fut, Box::pin(cq_fut)).await {
-            Either::Left((maybe_req, _cq_dropped)) => match maybe_req {
-                Some(req) => inflight.push(launch(req, &bulk_sc)),
+            Either::Left((maybe_msg, _cq_dropped)) => match maybe_msg {
+                Some(msg) => inflight.push(launch(msg, &bulk_sc)),
                 None => {
-                    // Channel closed: drain remaining inflight so callers
-                    // receive their final response, then exit.
                     while let Some(done) = inflight.next().await {
-                        let _ = done.resp_tx.send(done.result);
+                        done.send();
                     }
                     break;
                 }
             },
             Either::Right((maybe_done, _sq_dropped)) => {
                 if let Some(done) = maybe_done {
-                    let _ = done.resp_tx.send(done.result);
+                    done.send();
                 }
             }
         }
