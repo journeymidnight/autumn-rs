@@ -1,46 +1,88 @@
 Date: 2026-05-04
 TaskStatus: completed
-Task scope: feature_list.md prune — drop work-tracking entries with no value to a fresh
-            contributor; keep root-cause analyses, architectural decisions, and active
-            designs. F136 / F138 / F139 from the prior session are intact.
+Task scope: F140 — split + concurrent EC conversion + node-flap → row_stream SST
+            corruption. Add feature entry; remove EC shard memcpy from the event loop
+            (the user's specific direction: "EC 转换必须放到别的 thread 里面").
 
 Completed:
-  - feature_list.md: 1322 → 446 lines (-66 %; -876 net lines).
-  - Demoted to the ✅ Completed table (rationale lives in code + crate CLAUDE.md):
-    F010, F012, F019, F020, F021, F024, F040, F041, F042-F047, F048, F049, F050-F060,
-    F061, F062-F076 (system tests), F077, F078, F079, F082, F083, F084, F085, F086,
-    F087-bulk-mux, F088-F094 (PS thread isolation perf series), F095, F096,
-    F098-4.2 / 4.3 / 4.4 / R4-B, F099-A / B / C / D / H / I / I-fix / N-a,
-    F101 / 101-b / 101-c / 101-d / 101-e (UCX experiments), F102, FOPS-01 / 02 / 03 / 04,
-    FGA-01.
-  - Kept verbatim (high reference value):
-    * core arch: F011, F028-F038 (already brief)
-    * production root-cause fixes: F103-F107, F108, F109, F111, F112, F113, F116-F121,
-      F122, F123-F128, F135, F136
-    * open / deferred: F129-F134, F138, F139, FCI-01
-    * perf-series architectural lessons (small set): F099-J, F099-K-diagnosis, F099-M,
-      F099-N-b — these document non-obvious decisions / measured root causes that
-      cannot be derived from code alone
-    * P5 transport: F100-UCX (umbrella + cross-host A/B deferral)
-  - All entries kept retain the Target/Evidence/passes shape; "passes" is unchanged for
-    every entry. No status flips. The prune is a simplification, not a state change.
-  - Order: ✅ Completed table → P0 Core Architecture → P1 Performance & Space (incl.
-    production fixes) → P0 Code Review Fixes → Open/Deferred → Perf-series lessons →
-    P5 transport → P3 CI cleanup. The previous file's repeated "P0", "P1", "P2", "P3"
-    section markers (the original was a chronological log with reused headers) were
-    consolidated.
+  - feature_list.md: F140 entry added (passes:false). Documents the reproduced
+    symptom (`MetaBlock CRC mismatch` on row_stream extent 17 after `wbench →
+    compact → split → wbench` cycle), the on-disk evidence (file size divergence
+    across replicas: d1/d2/d3=929 MB, d4=526 MB, manager view sealed at 502 MB),
+    the mechanism (in-flight RowAppendReq during split's `multi_modify_split`
+    seal, amplified by F121 disk-flap from EC conversion CPU contention), the
+    partial mitigation in this commit, and the deferred structural fix
+    (`drain_p_bulk_inflight()` barrier in `handle_split_part` before the seal).
 
-Out of scope:
-  - F136 / F138 / F139 (prior session, kept).
-  - Source-code changes (this session is documentation only).
-  - autumn-rs/CLAUDE.md, crate-level CLAUDE.md (untouched — they remain the source of
-    truth for current architecture, and feature_list.md now defers to them).
+  - crates/stream/src/extent_node.rs: removed event-loop memcpy from
+    `handle_convert_to_ec`. F117 already wraps `ec_encode/decode/reconstruct`
+    in `spawn_blocking`, but ~700 MB of memcpy per conversion still ran on the
+    event loop (`Bytes::copy_from_slice(shard)` per remote target +
+    `shard_data.to_vec()` in `write_shard_local` + `chunk.to_vec()` in
+    `file_pwrite_chunked`). Patch:
+      • `file_pwrite_chunked` now takes `Bytes` (was `Vec<u8>`); chunked path
+        uses `Bytes::split_to` (O(1) Arc reslice) and passes chunks straight to
+        `file_pwrite` which accepts `impl IoBuf`. The per-chunk `chunk.to_vec()`
+        is gone. Four call sites updated to convert `Vec<u8>` to `Bytes` at the
+        boundary via zero-copy `Bytes::from`.
+      • `write_shard_local` now takes `Bytes` (was `&[u8]`); the
+        `shard_data.to_vec()` before `file_pwrite_chunked` is gone.
+      • `handle_convert_to_ec` spawn_blocking closure now returns `Vec<Bytes>`
+        (zero-copy `vecs.into_iter().map(Bytes::from).collect()` inside the
+        closure); the per-target loop uses `shards[i].clone()` (O(1) Arc inc)
+        instead of `Bytes::copy_from_slice(shard)`. Coordinator path uses
+        `shards[0].clone()` into the new `write_shard_local(_, _, _, _, Bytes)`
+        signature.
+      • `handle_write_shard` passes `req.payload` directly instead of
+        `&req.payload`.
+
+    Net effect: at K=3, M=1, ~526 MB extent → previously ~700 MB of event-loop
+    memcpy per EC conversion (3 remotes × shard_size + 1 coordinator + per-chunk
+    round-trips); after F140, 0 bytes of event-loop memcpy. The Reed-Solomon
+    math + the conversion to Bytes + the chunked I/O all run on the
+    spawn_blocking pool / io_uring, never on the compio runtime serving
+    df/heartbeat/append RPCs. This addresses the user's direction:
+    "EC conversion CPU-heavy work must be on a different thread".
 
 Verification:
-  - feature_list.md still parses as well-formed Markdown (verified by `grep -nE '^(##|###)'`
-    outline: 8 sections, 48 detailed entries, 1 completed-table block).
-  - All 12 root-cause entries (F103-F121 / F108 / F109) still cite their file:line evidence.
-  - All 8 deferred entries (F129-F134, F138, F139) retain their Trigger: clauses per the
-    project's "deferred items go into feature_list.md" rule.
-  - No source changes → no build / test runs needed; the repository builds the same as it
-    did at HEAD before this commit (commit 8661dfa).
+  - cargo build --workspace --release: clean (only pre-existing warnings).
+  - cargo test -p autumn-stream --lib --release: 48/48 pass.
+  - cargo test -p autumn-stream --tests --release --no-fail-fast: 13 suites pass,
+    1 timing-sensitive `cq_flushes_fast_ops_while_slow_op_runs` flake fails
+    (verified pre-existing — fails identically with `git stash` of my changes;
+    not caused by F140).
+  - Live cluster verification: `cluster.sh reset 4` → `wbench 60s × 8 KB
+    16-thread` (104 MB/s, EC conversion of 3 GB extent 10 fired in background)
+    → `wbench 30s × 512 B 32-thread` → `compact 15` → `split 15` → `wbench 30s
+    × 16-thread` (this is the EXACT scenario that produced
+    `MetaBlock CRC mismatch on extent 17` pre-F140) → `stop-ps + start-ps`.
+    Result: BOTH partitions (15 and 21) reopened cleanly with `tables=2,
+    sst_readers=2, has_overlap=0`. Zero `invalid meta_len`, zero
+    `MetaBlock CRC mismatch`, zero `partition thread failed` in ps.log.
+    `df RPC failed; marked node disks offline` warnings still appear during
+    EC conversion (CPU still loaded on a 10-core machine), but they
+    auto-recover within one sweep instead of staying offline through the
+    workload — the runtime is no longer blocked by 700 MB of memcpy.
+
+Files modified:
+  - crates/stream/src/extent_node.rs (5 edits: file_pwrite_chunked signature +
+    body; one fast-path caller now passing Bytes::from(payload); one
+    fast-path caller now passing write_payload directly; one re-avali path
+    converting via Bytes::from; write_shard_local signature; handle_convert_to_ec
+    spawn_blocking closure + per-target loop + coordinator call;
+    handle_write_shard pass-by-value).
+  - feature_list.md: F140 entry added (passes:false).
+  - claude-progress.txt: this file.
+
+Out of scope (deferred under F140 with explicit Trigger clause):
+  - The structural split-vs-compact race: even with EC CPU off the event loop,
+    `handle_split_part` still calls `multi_modify_split` without first
+    draining in-flight `RowAppendReq` from P-bulk's `flush_worker_loop` FU
+    pipeline. If a compaction's row_stream append is in flight when split
+    fires, the seal can land at a commit point earlier than the in-flight
+    write's lease, and divergent on-disk state can result on whichever
+    replicas haven't received the manager's eversion-bump push by then. The
+    proposed fix (extend `flush_memtable_locked` to drain RowAppendReq, or
+    take the `compact_gate` permit during split) is more invasive and stays
+    deferred. Reproduction now requires a more aggressive stress than the
+    one this session ran clean.

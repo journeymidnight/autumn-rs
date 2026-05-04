@@ -475,24 +475,28 @@ async fn file_pread_chunked(
     Ok(buf)
 }
 
-/// Chunked pwrite for full-extent writes (recovery payload restore, etc.).
-/// `data` is consumed; chunks are split off without re-allocating the
-/// whole buffer.
+/// Chunked pwrite for full-extent writes (recovery payload restore, EC shard
+/// staging, etc.). Takes `Bytes` so callers that already hold a `Bytes` (e.g.,
+/// EC shard from `Vec<u8>` via zero-copy `Bytes::from`) avoid an event-loop
+/// memcpy. Chunks are split via `Bytes::split_to` (O(1) Arc reslice) and
+/// passed straight to `file_pwrite` which accepts `impl IoBuf`; F140 removed
+/// the per-chunk `chunk.to_vec()` round-trip that previously forced
+/// `O(extent)` event-loop memcpy on every full-extent write.
 async fn file_pwrite_chunked(
     file: &std::cell::UnsafeCell<CompioFile>,
     offset: u64,
-    data: Vec<u8>,
+    data: Bytes,
 ) -> Result<()> {
     if data.len() <= FILE_IO_CHUNK_BYTES {
         return file_pwrite(file, offset, data).await;
     }
-    let mut bytes = Bytes::from(data);
+    let mut bytes = data;
     let mut cur = offset;
     while !bytes.is_empty() {
         let take = FILE_IO_CHUNK_BYTES.min(bytes.len());
         let chunk = bytes.split_to(take);
         let chunk_len = chunk.len() as u64;
-        file_pwrite(file, cur, chunk.to_vec()).await?;
+        file_pwrite(file, cur, chunk).await?;
         cur += chunk_len;
     }
     Ok(())
@@ -1979,7 +1983,7 @@ impl ExtentNode {
             .await
             .map_err(|e| e.to_string())?;
         let payload_len = payload.len() as u64;
-        file_pwrite_chunked(&extent.file, 0, payload).await
+        file_pwrite_chunked(&extent.file, 0, Bytes::from(payload)).await
             .map_err(|e| e.to_string())?;
         file_ref(&extent.file).sync_all().await
             .map_err(|e| e.to_string())?;
@@ -2109,7 +2113,7 @@ impl ExtentNode {
         shard_index: usize,
         sealed_length: u64,
         _new_eversion: u64,
-        shard_data: &[u8],
+        shard_data: Bytes,
     ) -> Result<(), (StatusCode, String)> {
         let entry = self.ensure_extent(extent_id).await
             .map_err(|e| (StatusCode::Internal, e))?;
@@ -2117,15 +2121,16 @@ impl ExtentNode {
         let disk = self.disk_for(entry.disk_id)
             .map_err(|e| (StatusCode::Internal, e))?;
         let staging_path = disk.ec_staging_path(extent_id);
+        let shard_len = shard_data.len();
 
         // Idempotent: if a prior prepare already wrote .ec.dat with
         // the correct shard size, skip the redundant I/O.
         if let Ok(meta) = compio::fs::metadata(&staging_path).await {
-            if meta.len() == shard_data.len() as u64 {
+            if meta.len() == shard_len as u64 {
                 tracing::info!(
                     extent_id,
                     shard_index,
-                    shard_len = shard_data.len(),
+                    shard_len,
                     "EC prepare: staging file already exists with correct size, skipping"
                 );
                 return Ok(());
@@ -2146,7 +2151,7 @@ impl ExtentNode {
             .map_err(|e| (StatusCode::Internal, format!("create staging {extent_id}: {e}")))?;
 
         let staging_cell = std::cell::UnsafeCell::new(staging_file);
-        file_pwrite_chunked(&staging_cell, 0, shard_data.to_vec()).await
+        file_pwrite_chunked(&staging_cell, 0, shard_data).await
             .map_err(|e| (StatusCode::Internal, format!("write staging {extent_id}/{shard_index}: {e}")))?;
         file_ref(&staging_cell).sync_all().await
             .map_err(|e| (StatusCode::Internal, format!("sync staging {extent_id}: {e}")))?;
@@ -2154,7 +2159,7 @@ impl ExtentNode {
         tracing::info!(
             extent_id,
             shard_index,
-            shard_len = shard_data.len(),
+            shard_len,
             sealed_length,
             "EC prepare: shard written to staging file"
         );
@@ -2912,7 +2917,7 @@ impl ExtentNode {
             .await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
         let payload_len = write_payload.len() as u64;
-        file_pwrite_chunked(&extent.file, 0, write_payload.to_vec()).await
+        file_pwrite_chunked(&extent.file, 0, write_payload).await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
         file_ref(&extent.file).sync_all().await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
@@ -3169,7 +3174,7 @@ impl ExtentNode {
                         ),
                     ));
                 }
-                let truncated = fetched[..sealed_length as usize].to_vec();
+                let truncated = Bytes::from(fetched[..sealed_length as usize].to_vec());
                 file_ref(&entry.file)
                     .set_len(0)
                     .await
@@ -3190,8 +3195,15 @@ impl ExtentNode {
                 .map_err(|e| (StatusCode::Internal, format!("read extent {extent_id}: {e}")))?;
 
             // F117: offload RS encode to blocking thread.
-            let shards = compio::runtime::spawn_blocking(move || {
+            // F140: also do the `Vec<u8> -> Bytes` conversion inside the
+            // blocking closure (zero-copy via `Bytes::from`) so the per-shard
+            // ~shard_size memcpy that previously ran on the event loop as
+            // `Bytes::copy_from_slice(shard)` per remote target moves off
+            // the runtime. After this, the loop below uses
+            // `shards[i].clone()` which is an O(1) Arc inc.
+            let shards: Vec<Bytes> = compio::runtime::spawn_blocking(move || {
                 crate::erasure::ec_encode(&data, data_shards, parity_shards)
+                    .map(|vecs| vecs.into_iter().map(Bytes::from).collect())
             })
             .await
             .map_err(|_| (StatusCode::Internal, "ec_encode task panicked".to_string()))?
@@ -3201,13 +3213,12 @@ impl ExtentNode {
             // Remote nodes first, coordinator (index 0) last.
             for (i, target_addr) in req.target_addrs.iter().enumerate() {
                 if i == 0 { continue; }
-                let shard = &shards[i];
                 let ws_req = WriteShardReq {
                     extent_id,
                     shard_index: i as u32,
                     sealed_length,
                     eversion: new_eversion,
-                    payload: Bytes::copy_from_slice(shard),
+                    payload: shards[i].clone(),
                 };
                 let sock = parse_addr(target_addr)
                     .map_err(|e| (StatusCode::Internal, format!("parse addr {target_addr}: {e}")))?;
@@ -3238,7 +3249,7 @@ impl ExtentNode {
             // no .ec.dat on coordinator → next retry re-reads full
             // data and re-distributes (remote nodes' prepare is
             // idempotent).
-            self.write_shard_local(extent_id, 0, sealed_length, new_eversion, &shards[0]).await?;
+            self.write_shard_local(extent_id, 0, sealed_length, new_eversion, shards[0].clone()).await?;
 
             tracing::info!(extent_id, "EC 2PC phase 1 (prepare) complete on all nodes");
             } // !f128_recovered
@@ -3308,7 +3319,7 @@ impl ExtentNode {
             req.shard_index as usize,
             req.sealed_length,
             req.eversion,
-            &req.payload,
+            req.payload,
         )
         .await?;
 
