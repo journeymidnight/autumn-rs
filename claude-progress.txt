@@ -1,58 +1,46 @@
 Date: 2026-05-04
 TaskStatus: completed
-Task scope: F136 — recovery + EC conversion race causing duplicate-node corruption; reapplied F135 wiring lost from a prior revert; cross-crate background-task race audit
+Task scope: feature_list.md prune — drop work-tracking entries with no value to a fresh
+            contributor; keep root-cause analyses, architectural decisions, and active
+            designs. F136 / F138 / F139 from the prior session are intact.
 
 Completed:
-  - Root cause (F136): pre-EC extents have parity=[] (handle_create_stream + handle_stream_alloc_extent in
-    crates/manager/src/rpc_handlers.rs:374,881). dispatch_recovery_task computes occupied = replicates ++ parity,
-    so it can pick the FUTURE parity node as a recovery target. If a recovery dispatches before EC conversion
-    runs, the recovering node ends up holding parity bytes (commit_shard_local rename overwrites recovery's
-    .dat) AND the manager's apply_recovery_done later replaces replicates[slot] with that node id — resulting
-    in the same node id appearing in both replicates and parity. Reads of the duplicated data shard return
-    parity bytes → GC fails with "trailing bytes did not form a complete record".
-  - Fix layered three ways in crates/manager/src/recovery.rs:
-      1. dispatch_recovery_task early-returns when extent_id ∈ ec_conversion_inflight
-      2. ec_conversion_dispatch_loop skips extents present in recovery_tasks
-      3. apply_recovery_done rejects the apply if task.node_id is already in extent_nodes(ex) at a different
-         slot, removing the stale recovery_tasks entry from memory + etcd so future re-dispatch is unblocked
-  - Tests: f126_apply_recovery_done_rejects_duplicate_target and
-    f126_apply_recovery_done_succeeds_when_target_is_unique in crates/manager/src/lib.rs.
-  - Made apply_recovery_done pub(crate) so tests can call it.
-  - Reapplied F135's compact_row_append helper + do_compact wiring in
-    crates/partition-server/src/background.rs (the lib.rs side of F135 was already in working state from
-    the prior session; only the background.rs portion had been accidentally reverted by an earlier
-    `git checkout` during exploratory debugging in this session).
-  - Cross-crate audit via 3 Explore agents (manager / partition-server / stream). Findings written to
-    /Users/zhangdongmao/.claude/plans/abstract-singing-music.md as suspects S1–S5; only F136 needed an
-    immediate fix. S2 (extent-node fd/inode race between recovery and EC commit_shard_local) is closed
-    transitively by F136. S1 (manager eversion lost-update across await) and S3 (extent-node delete vs
-    in-flight recovery) are now formally tracked in feature_list.md as F138 / F139 (passes:false, with
-    Trigger: conditions for when to escalate). S4/S5 remain no-action per the plan.
-  - Updated feature_list.md with F136 entry (passes:true).
-  - Updated CLAUDE.md? — no changes (the F136 fix is in recovery.rs and the manager CLAUDE.md already
-    described the loop structure; the bug was a missing mutual-exclusion check, not a structural change).
-
-Files modified:
-  - crates/manager/src/recovery.rs: dispatch_recovery_task ec_conversion_inflight check; apply_recovery_done
-    duplicate-node precheck + cleanup of stale task; ec_conversion_dispatch_loop recovery_tasks check;
-    apply_recovery_done made pub(crate)
-  - crates/manager/src/lib.rs: 2 new F126* tests (the test names use "f126" reflecting the file's pre-existing
-    internal numbering; the feature index for this fix is F136)
-  - crates/partition-server/src/background.rs: F135 compact_row_append helper + 2 do_compact call sites
-    routed through P-bulk's row_append_tx
-  - feature_list.md: F136 entry added; F138 (eversion lost-update) and F139 (delete vs recovery)
-    appended as deferred entries with passes:false and Trigger: clauses
-  - claude-progress.txt: this file
+  - feature_list.md: 1322 → 446 lines (-66 %; -876 net lines).
+  - Demoted to the ✅ Completed table (rationale lives in code + crate CLAUDE.md):
+    F010, F012, F019, F020, F021, F024, F040, F041, F042-F047, F048, F049, F050-F060,
+    F061, F062-F076 (system tests), F077, F078, F079, F082, F083, F084, F085, F086,
+    F087-bulk-mux, F088-F094 (PS thread isolation perf series), F095, F096,
+    F098-4.2 / 4.3 / 4.4 / R4-B, F099-A / B / C / D / H / I / I-fix / N-a,
+    F101 / 101-b / 101-c / 101-d / 101-e (UCX experiments), F102, FOPS-01 / 02 / 03 / 04,
+    FGA-01.
+  - Kept verbatim (high reference value):
+    * core arch: F011, F028-F038 (already brief)
+    * production root-cause fixes: F103-F107, F108, F109, F111, F112, F113, F116-F121,
+      F122, F123-F128, F135, F136
+    * open / deferred: F129-F134, F138, F139, FCI-01
+    * perf-series architectural lessons (small set): F099-J, F099-K-diagnosis, F099-M,
+      F099-N-b — these document non-obvious decisions / measured root causes that
+      cannot be derived from code alone
+    * P5 transport: F100-UCX (umbrella + cross-host A/B deferral)
+  - All entries kept retain the Target/Evidence/passes shape; "passes" is unchanged for
+    every entry. No status flips. The prune is a simplification, not a state change.
+  - Order: ✅ Completed table → P0 Core Architecture → P1 Performance & Space (incl.
+    production fixes) → P0 Code Review Fixes → Open/Deferred → Perf-series lessons →
+    P5 transport → P3 CI cleanup. The previous file's repeated "P0", "P1", "P2", "P3"
+    section markers (the original was a chronological log with reused headers) were
+    consolidated.
 
 Out of scope:
-  - Already-corrupted extent 20 in the running cluster. The user will `cluster.sh reset` to wipe and
-    re-bootstrap, so no in-place repair is needed.
+  - F136 / F138 / F139 (prior session, kept).
+  - Source-code changes (this session is documentation only).
+  - autumn-rs/CLAUDE.md, crate-level CLAUDE.md (untouched — they remain the source of
+    truth for current architecture, and feature_list.md now defers to them).
 
 Verification:
-  - cargo build --workspace: clean
-  - cargo test -p autumn-manager --lib: 14 passed (12 prior + 2 new F126*)
-  - cargo test -p autumn-manager --test ec_failover: passed
-  - cargo test -p autumn-partition-server --lib: 103 passed, 2 pre-existing f099i flaky failures unrelated
-    to this change (same as in the prior session's progress notes)
-  - cargo test -p autumn-manager --test ec_integration::replication_stream_works: pre-existing failure
-    on baseline (verified by stashing my changes and re-running); not introduced by this fix
+  - feature_list.md still parses as well-formed Markdown (verified by `grep -nE '^(##|###)'`
+    outline: 8 sections, 48 detailed entries, 1 completed-table block).
+  - All 12 root-cause entries (F103-F121 / F108 / F109) still cite their file:line evidence.
+  - All 8 deferred entries (F129-F134, F138, F139) retain their Trigger: clauses per the
+    project's "deferred items go into feature_list.md" rule.
+  - No source changes → no build / test runs needed; the repository builds the same as it
+    did at HEAD before this commit (commit 8661dfa).
