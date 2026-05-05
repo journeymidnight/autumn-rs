@@ -209,6 +209,46 @@ The same shuffle covers EC-parity allocation (parity slots no longer
 land exclusively on whichever node `HashMap` iteration visits last) and
 the per-RPC fall-back path inside `handle_stream_alloc_extent`.
 
+### F140 — split vs concurrent compact/GC race (2026-05-05)
+
+`handle_split_part` read `commit_length(row_stream_id)` and sealed via
+`multi_modify_split` while two background tasks could have appends in flight:
+(A) compaction's `RowAppendReq` on P-bulk writing to row_stream; (B) GC's
+`run_gc` writing live VP records to log_stream. Whichever replicas had not
+yet received the manager's eversion-bump push would accept the in-flight
+append past the sealed point → replica file-size divergence → `MetaBlock CRC
+mismatch` on restart.
+
+Fix: dual-gate acquisition. `handle_split_part` acquires `compact_gate`
+(PS-wide, same gate held by `background_compact_loop` for the duration of
+`do_compact`) followed by `gc_gate` (per-partition, new in F140, acquired by
+`background_gc_loop` around the `for eid in holes` block). Both gates are
+held through `multi_modify_split` so commit_length is read with P-bulk idle
+and GC idle.
+
+Manual repro (verifying the gates prevent divergence):
+
+```bash
+bash cluster.sh reset 4
+AC="./target/debug/autumn-client --manager 127.0.0.1:9001"
+# fill data so compaction and GC have work to do
+bash cluster.sh wbench 2G
+PARTID=$($AC ls | awk 'NR==1{print $1}')
+# kick off concurrent compact + GC, then split
+$AC compact "$PARTID" &
+$AC gc "$PARTID" &
+$AC split "$PARTID"
+bash cluster.sh restart-ps
+# Post-restart: no MetaBlock CRC mismatch in the ps log
+grep -i "crc mismatch\|meta_len" /tmp/autumn-rs-logs/ps.log
+# Verify replica sizes converge for the row_stream tail extent
+SID=$($AC info --json "$PARTID" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['row_stream_id'])")
+for d in /tmp/autumn-rs/d{1..4}/$SID; do stat -c '%s %n' "$d"/extent-*.dat 2>/dev/null; done
+# All four replicas should report the same size for the sealed tail extent
+```
+
+---
+
 ### F139 — extent-node delete vs in-flight recovery (2026-05-05)
 
 `handle_delete_extent` would race with `run_recovery_task` on the same

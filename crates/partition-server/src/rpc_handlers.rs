@@ -307,6 +307,19 @@ pub(crate) async fn handle_split_part(
         return Err((StatusCode::FailedPrecondition, "cannot split: partition has overlapping keys".to_string()));
     }
 
+    // F140: Acquire compact_gate then gc_gate before reading commit_length.
+    // compact_gate ensures no RowAppendReq is in-flight on P-bulk (do_compact
+    // holds the gate for its full duration and awaits every compact_row_append
+    // oneshot before releasing). gc_gate ensures run_gc has no log_stream
+    // append in-flight. Both are held through multi_modify_split and released
+    // on function exit via RAII.
+    let (compact_gate, gc_gate) = {
+        let p = part.borrow();
+        (p.compact_gate.clone(), p.gc_gate.clone())
+    };
+    let _compact_permit = compact_gate.acquire().await;
+    let _gc_permit = gc_gate.acquire().await;
+
     // Fetch authoritative range from the manager. PartitionData.rg is set
     // at open_partition and is NOT refreshed by sync_regions_once for an
     // already-open partition, so after a previous split the local rg

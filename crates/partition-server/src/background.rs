@@ -199,6 +199,7 @@ pub(crate) async fn background_compact_loop(
 pub(crate) async fn background_gc_loop(
     part: Rc<RefCell<PartitionData>>,
     mut gc_rx: mpsc::Receiver<GcTask>,
+    gc_gate: std::sync::Arc<crate::CompactionGate>,
 ) {
     const MAX_GC_ONCE: usize = 3;
     const GC_DISCARD_RATIO: f64 = 0.4;
@@ -300,6 +301,11 @@ pub(crate) async fn background_gc_loop(
             continue;
         }
 
+        // F140: acquire gc_gate around the actual run_gc calls so that
+        // handle_split_part can wait for no log_stream appends in-flight.
+        // Gate is held only for the holes-processing loop, not for the
+        // preceding read-only get_stream_info / get_extent_info RPCs.
+        let _gc_permit = gc_gate.acquire().await;
         tracing::info!("GC: starting, extents={:?}", holes);
         for eid in holes {
             let sealed_length = match part_sc.get_extent_info(eid).await {
@@ -313,6 +319,7 @@ pub(crate) async fn background_gc_loop(
                 tracing::error!("GC run_gc extent {eid}: {e}");
             }
         }
+        drop(_gc_permit);
     }
 }
 

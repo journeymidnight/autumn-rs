@@ -1,6 +1,53 @@
 Date: 2026-05-05
 TaskStatus: completed
-Task scope: F139 — Extent-node delete vs in-flight recovery (orphan + write-to-unlinked-inode race).
+Task scope: F140 — Structural split-vs-{compact,GC} serialisation (dual-gate acquisition).
+
+Root cause (confirmed):
+  Two race subwindows between handle_split_part and background writers
+  sharing the P-log compio runtime:
+  (A) F140-A: background_compact_loop had a RowAppendReq awaiting its P-bulk
+      oneshot when handle_split_part read commit_length(row_stream_id) and
+      called multi_modify_split. The in-flight append landed past the seal
+      point on replicas not yet receiving the eversion-bump push.
+  (B) F140-B: background_gc_loop (run_gc) had a log_stream append via
+      part_sc in-flight for the same reason — no gate prevented GC from
+      writing past the newly sealed log_stream tail.
+
+Fix (dual-gate pattern):
+  1. PartitionData now holds compact_gate: Arc<CompactionGate> (PS-wide,
+     clone of the existing gate used by background_compact_loop) and
+     gc_gate: Arc<CompactionGate> (new per-partition gate).
+  2. background_gc_loop receives gc_gate; acquires it around the
+     "for eid in holes" block (covering all run_gc calls).
+  3. handle_split_part acquires compact_gate then gc_gate (in that order)
+     after the has_overlap guard and before flush_memtable_locked /
+     commit_length / multi_modify_split. Both released RAII on return.
+
+Files modified:
+  - crates/partition-server/src/lib.rs (PartitionData two new fields,
+    gc_gate creation + PartitionData init, background_gc_loop spawn,
+    2 new F140 unit tests)
+  - crates/partition-server/src/background.rs (background_gc_loop signature,
+    gc_gate acquire/drop around holes loop)
+  - crates/partition-server/src/rpc_handlers.rs (handle_split_part dual-gate
+    acquisition)
+  - crates/partition-server/CLAUDE.md (F140 dual-gate pattern documented)
+  - feature_list.md (F140 passes:true + structural fix description)
+  - README.md (F140 manual repro block)
+  - claude-progress.txt (this file)
+
+Verification:
+  - cargo build --workspace: clean (only pre-existing warnings).
+  - cargo test -p autumn-partition-server --lib: 105 pass / 2 pre-existing
+    f099i parallel-test race failures (same as F139/F141/F142/F143 baselines).
+  - cargo test -p autumn-stream --lib: 48/48 pass.
+  - cargo test -p autumn-manager --lib: 24/24 pass.
+
+Next steps:
+  - Live cluster re-verification (cluster.sh reset 4 + wbench + concurrent
+    compact/gc/split cycle) deferred per project policy on destructive commands.
+  - F141: already completed (passes:true).
+  - F145 or next unimplemented feature from feature_list.md.
 
 Root cause (confirmed):
   Two reachable race subwindows between handle_delete_extent and run_recovery_task

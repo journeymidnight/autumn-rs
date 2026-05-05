@@ -577,6 +577,22 @@ gets opened by `sync_regions_once`, where `open_partition` evaluates
 overlap against its (correct) authoritative range and likewise sets
 `has_overlap = 1`.
 
+**F140 split serialisation (dual-gate pattern):** `handle_split_part`
+acquires two gates before calling `flush_memtable_locked` / `commit_length`:
+
+1. `compact_gate` (PS-wide, same `Arc` held by `background_compact_loop`) —
+   ensures no `RowAppendReq` is in-flight on P-bulk when row_stream's tail is
+   sealed (`do_compact` holds this gate for its full duration and awaits every
+   `compact_row_append` oneshot before releasing).
+2. `gc_gate` (per-partition, new in F140) — ensures `run_gc` has no
+   `log_stream` append in-flight. `background_gc_loop` acquires `gc_gate`
+   around the `for eid in holes` block (not the preceding read-only RPC calls).
+
+Both are held through `multi_modify_split` and released RAII on return.
+Acquisition order is always compact→gc. `PartitionData` stores both `Arc`s so
+`handle_split_part` (which only receives `part: &Rc<RefCell<PartitionData>>`)
+can clone and acquire them without extra parameters.
+
 ## Crash Recovery (`open_partition`)
 
 ```

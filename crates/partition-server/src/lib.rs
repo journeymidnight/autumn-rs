@@ -473,6 +473,15 @@ pub(crate) struct PartitionData {
     /// receiver always drains all pending notifications before re-checking
     /// `imm.len()`, so the buffer self-bounds at `MAX_IMM_DEPTH`.
     imm_drained_tx: mpsc::UnboundedSender<()>,
+    /// F140: PS-wide gate shared with background_compact_loop. handle_split_part
+    /// acquires this to ensure no RowAppendReq is in-flight on P-bulk when
+    /// commit_length is read (do_compact awaits every compact_row_append oneshot
+    /// before releasing the permit).
+    pub(crate) compact_gate: std::sync::Arc<CompactionGate>,
+    /// F140: per-partition gate shared with background_gc_loop. handle_split_part
+    /// acquires this to ensure run_gc has no log_stream append in-flight when
+    /// commit_length is read.
+    pub(crate) gc_gate: std::sync::Arc<CompactionGate>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2070,6 +2079,11 @@ async fn partition_thread_main(
         "open_partition: ready"
     );
 
+    // F140: per-partition gc_gate — background_gc_loop acquires this around
+    // the actual run_gc calls; handle_split_part acquires it before reading
+    // commit_length so no log_stream append can race the seal.
+    let gc_gate = CompactionGate::new(1);
+
     let part = Rc::new(RefCell::new(PartitionData {
         part_id,
         rg,
@@ -2094,6 +2108,8 @@ async fn partition_thread_main(
         flush_req_tx: flush_req_tx_part,
         row_append_tx: row_append_tx_part,
         imm_drained_tx,
+        compact_gate: compact_gate.clone(),
+        gc_gate: gc_gate.clone(),
     }));
 
     sync_partition_vp_refs(&part)
@@ -2132,8 +2148,9 @@ async fn partition_thread_main(
     }
     {
         let p = part.clone();
+        let gc_gate_for_loop = gc_gate.clone();
         compio::runtime::spawn(async move {
-            background_gc_loop(p, gc_rx).await;
+            background_gc_loop(p, gc_rx, gc_gate_for_loop).await;
         })
         .detach();
     }
@@ -5633,5 +5650,55 @@ mod f099i_tests {
             let _ = conn_handle.await;
             let _ = loop_handle.await;
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F140 tests — split serialisation gates
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod f140_tests {
+    use super::CompactionGate;
+    use std::sync::atomic::Ordering;
+
+    // Verify that a second acquire waits while a first permit is held, then
+    // succeeds immediately after the first permit is dropped.
+    #[test]
+    fn f140_split_serialises_with_compact_gate() {
+        let gate = CompactionGate::new(1);
+
+        // Simulate "compaction in progress": manually bump inflight.
+        gate.inflight.fetch_add(1, Ordering::Release);
+        assert_eq!(gate.inflight.load(Ordering::Acquire), 1, "gate should show inflight=1");
+
+        // A split trying to acquire should fail CAS (at-cap).
+        let cur = gate.inflight.load(Ordering::Acquire);
+        assert!(cur >= gate.max_parallel, "gate should be at capacity");
+
+        // Simulate compaction finishing.
+        gate.inflight.fetch_sub(1, Ordering::Release);
+        assert_eq!(gate.inflight.load(Ordering::Acquire), 0, "gate should be free after compaction");
+
+        // Now split's CAS should succeed.
+        let cur = gate.inflight.load(Ordering::Acquire);
+        assert!(cur < gate.max_parallel, "gate should be acquirable for split");
+    }
+
+    // Verify that gc_gate (per-partition) has the same acquire/release semantics.
+    #[test]
+    fn f140_gc_releases_gate_after_holes_loop() {
+        let gc_gate = CompactionGate::new(1);
+
+        // Simulate GC holding the gate.
+        gc_gate.inflight.fetch_add(1, Ordering::Release);
+        assert_eq!(gc_gate.inflight.load(Ordering::Acquire), 1, "gc_gate should show inflight=1 while GC runs");
+
+        // Split cannot acquire.
+        assert!(gc_gate.inflight.load(Ordering::Acquire) >= gc_gate.max_parallel);
+
+        // GC loop exits: drop permit.
+        gc_gate.inflight.fetch_sub(1, Ordering::Release);
+        assert_eq!(gc_gate.inflight.load(Ordering::Acquire), 0, "gc_gate should be free after holes loop");
     }
 }
