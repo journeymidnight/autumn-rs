@@ -794,10 +794,10 @@ async fn build_append_future(
         let extent_id = slots[0].req.extent_id;
         match node.extent_info_from_manager(extent_id).await {
             Ok(Some(ex)) => {
-                let sealed_changed = ExtentNode::apply_extent_meta_ref(&extent, &ex);
-                if sealed_changed {
-                    let _ = node.save_meta(extent_id, &extent).await;
-                }
+                // F143: durable seal — fsync the data file when the
+                // refresh promotes 0 → sealed_length so the on-disk
+                // prefix matches the manager's view.
+                let _ = node.apply_extent_meta_durable(extent_id, &extent, &ex).await;
             }
             Ok(None) | Err(_) => {
                 let msg = format!(
@@ -859,10 +859,11 @@ async fn build_append_future(
         let extent_id = slots[0].req.extent_id;
         if let Ok(Some(mgr_info)) = node.extent_info_from_manager(extent_id).await {
             if mgr_info.sealed_length > 0 {
-                let sealed_changed = ExtentNode::apply_extent_meta_ref(&extent, &mgr_info);
-                if sealed_changed {
-                    let _ = node.save_meta(extent_id, &extent).await;
-                }
+                // F143: durable seal — fsync the data file as part
+                // of accepting the manager's seal point.
+                let _ = node
+                    .apply_extent_meta_durable(extent_id, &extent, &mgr_info)
+                    .await;
                 let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
                 let out: Vec<Bytes> = slots
                     .into_iter()
@@ -1824,10 +1825,49 @@ impl ExtentNode {
         old_sealed == 0 && ex.sealed_length > 0
     }
 
-    /// Crate-visible wrapper for `apply_extent_meta` used from extent_worker.rs.
-    pub(crate) fn apply_extent_meta_ref(extent: &ExtentEntry, ex: &ExtentInfo) -> bool {
-        Self::apply_extent_meta(extent, ex)
+    /// F143: apply extent metadata from manager AND make the seal
+    /// durable on disk. When `apply_extent_meta` reports a 0→nonzero
+    /// `sealed_length` transition we (1) persist the meta sidecar so a
+    /// restart doesn't forget the seal, and (2) `file.sync_all()` the
+    /// data file so any page-cache-only bytes up to `sealed_length`
+    /// hit disk before the manager (or anyone else) can rely on the
+    /// sealed prefix being durable.
+    ///
+    /// Without (2), an extent that was open + receiving `must_sync=
+    /// false` writes can have `extent.len` advanced in memory past
+    /// what's actually on disk; the seal then captures the in-memory
+    /// length but the disk holds less. A subsequent extent-node
+    /// restart, OOM-driven page eviction, or host reboot drops the
+    /// unsynced bytes — the file shrinks below `sealed_length` and
+    /// any VP referencing the lost region surfaces as
+    /// `ec_read_full_and_slice: offset N past decoded payload len M`
+    /// after EC conversion.
+    ///
+    /// Idempotent: repeat calls with no transition are cheap (one
+    /// atomic load, no I/O). Returns the same `sealed_changed` flag
+    /// as the underlying `apply_extent_meta` for callers that branch
+    /// on it.
+    async fn apply_extent_meta_durable(
+        &self,
+        extent_id: u64,
+        extent: &Rc<ExtentEntry>,
+        ex: &ExtentInfo,
+    ) -> bool {
+        let sealed_changed = Self::apply_extent_meta(extent, ex);
+        if sealed_changed {
+            let _ = self.save_meta(extent_id, extent).await;
+            if let Err(e) = file_ref(&extent.file).sync_all().await {
+                tracing::warn!(
+                    extent_id,
+                    sealed_length = ex.sealed_length,
+                    error = %e,
+                    "F143: fsync failed on seal apply — sealed prefix may not be durable",
+                );
+            }
+        }
+        sealed_changed
     }
+
 
     async fn truncate_to_commit(extent: &Rc<ExtentEntry>, commit: u32) -> Result<(), String> {
         file_ref(&extent.file)
@@ -2265,10 +2305,12 @@ impl ExtentNode {
             // TODO(F044): manager RPC for eversion refresh not yet implemented
             match self.extent_info_from_manager(req.extent_id).await {
                 Ok(Some(ex)) => {
-                    let sealed_changed = Self::apply_extent_meta(&extent, &ex);
-                    if sealed_changed {
-                        let _ = self.save_meta(req.extent_id, &extent).await;
-                    }
+                    // F143: fsync on 0→sealed transition so the
+                    // sealed prefix is durable on this node before we
+                    // surface the seal upstream.
+                    let _ = self
+                        .apply_extent_meta_durable(req.extent_id, &extent, &ex)
+                        .await;
                 }
                 Ok(None) => {
                     // Manager unreachable but we know local state is stale -- reject.
@@ -2359,10 +2401,11 @@ impl ExtentNode {
             // this replica got ahead of the consensus min).
             if let Ok(Some(mgr_info)) = self.extent_info_from_manager(req.extent_id).await {
                 if mgr_info.sealed_length > 0 {
-                    let sealed_changed = Self::apply_extent_meta(&extent, &mgr_info);
-                    if sealed_changed {
-                        let _ = self.save_meta(req.extent_id, &extent).await;
-                    }
+                    // F143: fsync as part of accepting the seal —
+                    // see apply_extent_meta_durable for why.
+                    let _ = self
+                        .apply_extent_meta_durable(req.extent_id, &extent, &mgr_info)
+                        .await;
                     return Ok(AppendResp {
                         code: CODE_PRECONDITION,
                         offset: 0,
@@ -2927,10 +2970,10 @@ impl ExtentNode {
                 }));
             }
         };
-        let sealed_changed = Self::apply_extent_meta(&extent, &extent_info);
-        if sealed_changed {
-            let _ = self.save_meta(req.extent_id, &extent).await;
-        }
+        // F143: fsync on 0→sealed transition.
+        let _ = self
+            .apply_extent_meta_durable(req.extent_id, &extent, &extent_info)
+            .await;
 
         if req.eversion < extent_info.eversion {
             return Ok(rkyv_encode(&CodeResp {
@@ -3009,10 +3052,10 @@ impl ExtentNode {
         // TODO(F044): manager RPC for extent_info not yet implemented
         match self.extent_info_from_manager(req.extent_id).await {
             Ok(Some(ex)) => {
-                let sealed_changed = Self::apply_extent_meta(&extent, &ex);
-                if sealed_changed {
-                    let _ = self.save_meta(req.extent_id, &extent).await;
-                }
+                // F143: fsync on 0→sealed transition.
+                let _ = self
+                    .apply_extent_meta_durable(req.extent_id, &extent, &ex)
+                    .await;
                 if req.eversion < ex.eversion {
                     return Err((
                         StatusCode::FailedPrecondition,

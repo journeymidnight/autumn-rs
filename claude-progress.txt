@@ -104,19 +104,30 @@ Files modified:
   - feature_list.md (F142 entry, passes:true)
   - claude-progress.txt (this file)
 
-Out of scope (explicitly deferred):
+Follow-up landed in same session (F143):
 
-  - Sealed-extent durability: a flush whose imm references a
-    PREVIOUSLY-SEALED log_stream extent (vp head crossed an extent
-    rotation during the imm's lifetime) is still vulnerable, because
-    seal currently does NOT fsync. The fix shape is to call
-    `file.sync_all()` in extent-node's "applied seal from manager"
-    path. File as F143 if it surfaces under stress.
+  - F143 closes the "imm crossed an extent rotation" hole. New
+    `ExtentNode::apply_extent_meta_durable(&self, extent_id, &extent,
+    &ex)` async helper replaces the 8 sites that previously did
+    `apply_extent_meta` + `if sealed_changed { save_meta }`. On a
+    0→sealed_length transition it now also calls
+    `file_ref(&extent.file).sync_all().await`, so the on-disk
+    sealed prefix matches the manager's recorded `sealed_length`
+    before any subsequent EC encode / read can rely on it.
+    Pre-existing `handle_convert_to_ec` direct-stores of
+    sealed_length are unchanged — EC's own `write_shard_local`
+    fsyncs its shard outputs.
 
-  - Existing-data recovery: the user's bad VP for the 100 MB MP4 is
-    unrecoverable — those 100 MB of bytes never reached disk. F142
-    prevents the next one; the existing entry can be deleted, or
-    left as a tombstone after major compaction drops it.
+  - F144 (VP scrub admin) — user explicitly declined. The few bad
+    VPs from yesterday's --nosync-then-page-cache-loss event are
+    user-deletable via `autumn-client del`; no tool needed.
+
+Existing-data recovery: the user's bad VP for the 100 MB MP4 (and
+the jpg, and any other VPs in extent 31 at offset >=
+sealed_length=308491269) is unrecoverable — those bytes never
+reached disk. F142 prevents new corruption on the open tail; F143
+extends the same guarantee to seal application; existing bad
+entries are user-deletable.
 
 User context (preserved for future sessions):
   - User confirmed: only `restart-ps`, never `kill -9`, never
