@@ -10,8 +10,9 @@ use autumn_rpc::manager_rpc::{self, *};
 use crate::ConnPool;
 use crate::extent_rpc::{
     AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, ReadBytesReq,
-    ReadBytesResp, StreamInfo, CODE_EVERSION_MISMATCH, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND,
-    CODE_OK, MSG_APPEND, MSG_COMMIT_LENGTH, MSG_READ_BYTES,
+    ReadBytesResp, StreamInfo, SyncExtentReq, SyncExtentResp, CODE_EVERSION_MISMATCH,
+    CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK, MSG_APPEND, MSG_COMMIT_LENGTH, MSG_READ_BYTES,
+    MSG_SYNC_EXTENT,
 };
 
 /// Sentinel error attached to `anyhow::Error` when a `MSG_READ_BYTES`
@@ -1431,6 +1432,86 @@ impl StreamClient {
     pub async fn commit_length(&self, stream_id: u64) -> Result<u32> {
         let (_stream, _extent, end) = self.check_commit(stream_id).await?;
         Ok(end)
+    }
+
+    /// F142: fsync the current tail extent of a stream on every replica
+    /// (data + parity for EC streams). Intended as a barrier for the
+    /// partition server's flush path: before committing an SST whose
+    /// VPs reference log_stream regions written with `must_sync=false`,
+    /// call this to make those regions durable on disk.
+    ///
+    /// Tolerates `extent_node` failures: requires a quorum equal to
+    /// `replicates.len()` (matching `current_commit` semantics) so a
+    /// single-replica hiccup doesn't block flush, but a true minority
+    /// failure surfaces as an error and the caller can decide whether
+    /// to retry.
+    ///
+    /// Sealed tails are skipped — the manager-pushed seal already
+    /// fixed the durable size, and writes can no longer extend the
+    /// page cache past the on-disk len. Open tails fan the sync RPC
+    /// out in parallel via `join_all`.
+    pub async fn sync_stream_tail(&self, stream_id: u64) -> Result<()> {
+        let stream = self.get_stream_info(stream_id).await?;
+        let Some(tail_id) = stream.extent_ids.last().copied() else {
+            return Ok(());
+        };
+        let extent = self.get_extent_info(tail_id).await?;
+        if extent.sealed_length > 0 {
+            return Ok(());
+        }
+        let addrs = self.replica_addrs_for_extent(&extent).await?;
+        let req = SyncExtentReq {
+            extent_id: tail_id,
+            revision: self.revision,
+        }
+        .encode();
+
+        let pool = self.pool.clone();
+        let futs = addrs.iter().map(|addr| {
+            let addr = addr.clone();
+            let req = req.clone();
+            let pool = pool.clone();
+            async move {
+                let resp = pool.call(&addr, MSG_SYNC_EXTENT, req).await;
+                (addr, resp)
+            }
+        });
+        let results: Vec<(String, Result<Bytes>)> = futures::future::join_all(futs).await;
+
+        let mut ok = 0usize;
+        let mut last_err: Option<String> = None;
+        for (addr, resp) in results {
+            match resp {
+                Ok(bytes) => match SyncExtentResp::decode(bytes) {
+                    Ok(r) if r.code == CODE_OK => ok += 1,
+                    Ok(r) => {
+                        last_err = Some(format!("{addr} sync_extent code={}", r.code));
+                    }
+                    Err(e) => last_err = Some(format!("{addr} decode: {e}")),
+                },
+                Err(e) => last_err = Some(format!("{addr} rpc: {e}")),
+            }
+        }
+        let need = if extent.parity.is_empty() {
+            extent.replicates.len()
+        } else {
+            // EC streams: a quorum of K data shards is required. Be
+            // strict here — if even one data-shard sync fails we don't
+            // know which K bytes are durable, so failing the barrier
+            // and letting the caller retry is the safer choice.
+            extent.replicates.len()
+        };
+        if ok < need {
+            return Err(anyhow!(
+                "sync_stream_tail stream={} extent={} ok={}/{}: {}",
+                stream_id,
+                tail_id,
+                ok,
+                need,
+                last_err.unwrap_or_else(|| "no replicas".to_string())
+            ));
+        }
+        Ok(())
     }
 
     pub async fn punch_holes(&self, stream_id: u64, extent_ids: Vec<u64>) -> Result<StreamInfo> {

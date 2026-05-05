@@ -1,125 +1,129 @@
 Date: 2026-05-05
 TaskStatus: completed
-Task scope: F141 — GC log_stream rewrite storm + read-side head-of-line
-            blocking. Lands the user's four requested mitigations
-            ("我认为 1,2,3,4 都需要") plus a follow-up after live ps.log
-            verification surfaced the residual read-side bottleneck.
+Task scope: F142 — `must_sync=false` foreground writes break WAL→SST
+            durability ordering. User repro: `$AC put XXX.mp4` (with
+            `--nosync` per the workload's default) succeeded yesterday;
+            after `restart-ps` today, `$AC head` returns the size but
+            `$AC get` fails with `ec_read_full_and_slice: offset
+            459976209 past decoded payload len 308491269`. Forensic
+            evidence shows the bad VP was flushed to a row_stream SST
+            yesterday at 23:20 — well before today's F141 work — so
+            F141 is not implicated. User chose option A from the
+            diagnosis ("pre-flush WAL fsync barrier").
 
-Original symptom (from /tmp/autumn-rs-logs/ps.log, 2026-05-05 05:06:43Z):
-  • 05:06:43 GC: starting, extents=[16, 17] on partition 21 / log_stream=18
-  • 05:06:46–55 stream append summary `ops` jumps from idle (1, 752) to a
-    sustained 6 000–7 000 ops/sec. owner_key="ps-1", stream_id=18.
-  • 05:07:19 first `append timeout after 5s` against replica 0 (127.0.0.1:9101)
-  • 05:07:29 second timeout against replica 1 (9102) — fanout p50 collapses
-  • 05:08:14 single op shows fanout_ms=3377, total_ms=14587 — 14 s queueing
-  • Foreground put traffic stalled for the duration of the GC run.
+Diagnosis (full chain, captured in feature_list.md F142):
+  • `--nosync` foreground put → `start_write_batch` calls
+    `append_segments(log_stream, ..., must_sync=false)`
+  • Extent-node `handle_append` Direct path writes to page cache and
+    SKIPS `file.sync_all()`. `extent.len` advances in memory; the
+    StreamClient sees `result.end` advance and the partition memtable
+    stores a `ValuePointer` referencing page-cache-only bytes.
+  • Memtable rotation → P-bulk flushes the SST via
+    `row_stream.append(must_sync=true)`; partition writes
+    `meta_stream` checkpoint with `must_sync=true`. SST + checkpoint
+    are durable. Their VP targets are NOT durable.
+  • Page-cache loss event (Mac reboot, OOM eviction, or even some
+    extent-node restart paths) drops the unsynced bytes. SST
+    persists; VP now points past the actual durable extent length.
+  • Manager seals the extent at the post-eviction commit_length,
+    EC-converts the shorter payload, and reads of the bad VP surface
+    the "offset N past decoded payload len M" error.
 
-Root cause (in code, pre-F141):
-  crates/partition-server/src/background.rs::process_gc_chunk re-appended
-  every still-live VP record one at a time:
-      part_sc.append(log_stream_id, &log_entry, /*must_sync=*/true).await
-  At 4 KiB-typical VPs over a 1–2 GiB sealed extent that's 64 k–256 k
-  individual fsyncs × 3-replica fanout. The StreamClient per-stream worker
-  mpsc and the extent-node WAL fsync rate ceiling pinned together at the
-  same time, so foreground put traffic could not progress.
+Fix (F142 implements option A — single fsync barrier per imm):
 
-Completed (the four mitigations the user asked for; lands as a single feature):
-  - feature_list.md: F141 entry added (passes:true) under the F140 section,
-    with full mechanism, fix breakdown, env tunables, and verification.
+  - crates/stream/src/extent_rpc.rs: new wire codec
+      MSG_SYNC_EXTENT = 13
+      SyncExtentReq  { extent_id: u64, revision: i64 }    (16 bytes)
+      SyncExtentResp { code: u8 }                          (1 byte)
 
-  - crates/partition-server/src/background.rs:
-      • New `GcWriteBatch { segments, pending, bytes, record_cap, byte_cap }`
-        accumulates rewrites across `process_gc_chunk` calls (carries across
-        chunks; flushes mid-chunk when full).
-      • New `GcRateLimiter` (1-second sliding window) caps GC's
-        log_stream throughput at AUTUMN_PS_GC_RATE_BYTES_PER_SEC bytes/s
-        (default 64 MiB/s, 0 = unlimited).
-      • New `gc_yield_now()` (one-shot Pending+wake) yields the compio
-        scheduler to merged_partition_loop / ps-conn between batches.
-      • New `flush_gc_batch(part, log_stream_id, part_sc, batch, must_sync,
-        rate_limiter, moved)`:
-          - Calls `part_sc.append_segments(log_stream_id, segments, must_sync)`
-            ONCE per batch (was N times per record).
-          - Walks the returned tail offset to compute per-record VP offsets,
-            then `p.active.insert_batch(items)` — single RwLock acquire for
-            up to record_cap inserts.
-          - Updates `vp_extent_id`/`vp_offset` to the batch's `result.end`.
-          - `gc_yield_now().await` then optional sleep on the rate budget.
-      • Rewrote `run_gc`: holds `batch` + `rate_limiter` across the chunk
-        loop, calls `flush_gc_batch(..., must_sync=false, ...)` mid-loop on
-        cap, and ONE final `flush_gc_batch(..., must_sync=true, ...)` after
-        the carry check before `punch_holes`. POSIX fsync semantics flush
-        every prior must_sync=false byte on the same fd, so durability
-        before the source extent is reaped is preserved with a single
-        fsync per GC'd extent (was 64 k–256 k).
-      • Rewrote `process_gc_chunk`: takes `&mut GcWriteBatch` and `&mut
-        GcRateLimiter`; under a brief borrow_mut bumps `seq_number` +
-        encodes the internal_key, builds (header_segment, value_segment)
-        Bytes pairs into the batch, then `if batch.is_full()` calls
-        `flush_gc_batch(..., must_sync=false, ...)`. WAL header op preserves
-        original GC behaviour (`op = 1`, no VP flag — recovery's
-        `value.len() > VALUE_THROTTLE` fallback at lib.rs:2891 still
-        recognises the entry as a VP on replay because GC only ever
-        rewrites entries that were tagged VP in the source extent).
-      • New env knobs (all clamped, with sane defaults):
-          AUTUMN_PS_GC_BATCH_RECORDS  ([1, 4096], default 256)
-          AUTUMN_PS_GC_BATCH_BYTES    ([64 KiB, 256 MiB], default 4 MiB)
-          AUTUMN_PS_GC_RATE_BYTES_PER_SEC (default 64 MiB/s, 0 = unlimited)
-          AUTUMN_PS_GC_READ_CHUNK_BYTES   (default 8 MiB, was 64 MiB pre-F141)
+  - crates/stream/src/extent_node.rs:
+      • dispatch arm for MSG_SYNC_EXTENT in `dispatch()`
+      • `handle_sync_extent` — shard-routing check (matches
+        commit_length), revision fencing (returns
+        CODE_LOCKED_BY_OTHER on stale revision; bumps + persists the
+        meta sidecar on a higher revision, matching the existing
+        commit_length contract), then `file_ref(&entry.file)
+        .sync_all().await`. No payload, no extent.len change.
+        Idempotent — repeat calls just trigger another fsync, which
+        is a no-op if the file is clean.
 
-  - Read-side follow-up (after live ps.log verification 06:08–06:11Z):
-    The first-pass batching/sync fix collapsed GC writes to one batch
-    per extent (`moved 23 entries` / `moved 91 entries`), but the user
-    still observed `replica 0 rpc error: 127.0.0.1:9101 append timeout
-    after 5s` on stream_id=26 / stream_id=33 (foreground log_streams
-    of partitions 29 / 36). The PS-side trace showed a 17–21 s gap on
-    extent-node 1's append-summary log line during a GC run on extent
-    20 (sealed_length=1.09 GiB, EC-converted at eversion=3) — a single
-    64 MiB EC subrange read was head-of-line-blocking the extent-node
-    runtime long enough that foreground appends timed out at the
-    StreamClient's 5 s ceiling. Two extra changes folded into F141:
-      • `gc_read_chunk_bytes()` default lowered 64 MiB → 8 MiB.
-      • After every `read_bytes_from_extent` in `run_gc`, call
-        `gc_yield_now().await` and bill the chunk's bytes against the
-        SAME rate limiter the writes use, so the 64 MiB/s budget
-        bounds GC's TOTAL log-layer footprint (reads + writes).
+  - crates/stream/src/client.rs:
+      • New imports: SyncExtentReq, SyncExtentResp, MSG_SYNC_EXTENT.
+      • New public method:
+          pub async fn sync_stream_tail(&self, stream_id: u64)
+              -> Result<()>
+        Loads the stream via get_stream_info, picks the tail
+        extent. If sealed (sealed_length > 0) returns Ok early —
+        sealed tails can't extend; their page cache state is
+        whatever the seal captured. Otherwise looks up replica
+        addrs (replicates + parity), fans out MSG_SYNC_EXTENT in
+        parallel via futures::future::join_all, and requires
+        replicates.len() (K) successful syncs to declare the
+        barrier complete. M parity-target failures are tolerated,
+        matching the post-EC fault model.
+
+  - crates/partition-server/src/lib.rs::flush_one_imm:
+      Inserted the barrier BEFORE the FlushReq to P-bulk:
+        if let Err(e) = part_sc.sync_stream_tail(log_stream_id).await {
+            return Err(anyhow!("flush_one_imm: WAL barrier sync failed: {e}"));
+        }
+      Coverage matrix:
+        • normal flush (memtable rotation under load): yes
+        • flush_one_imm_local (P-bulk failed to spawn): yes (it's
+          dispatched AFTER the barrier inside flush_one_imm)
+        • flush_memtable_locked (split, drain): yes — calls
+          flush_one_imm in a loop
+        • background_flush_loop: yes — same dispatch
+        • shutdown drain: yes — calls flush_one_imm in the drain
+          loop
 
 Verification:
+  - cargo build -p autumn-stream: clean.
   - cargo build -p autumn-partition-server: clean.
   - cargo build --workspace --release: clean.
-  - cargo test -p autumn-partition-server --lib gc_streaming_tests: 4/4 pass
-    (the F106 record-boundary carry contract is unchanged).
-  - cargo test -p autumn-partition-server --lib (whole suite, default
-    parallelism): 103 passed / 2 failed BEFORE and AFTER the patch.
-    The 2 failing tests (`f099i_tests::f099i_d1_fast_path_no_fu_allocation`
-    and `f099i_tests::f099i_fast_path_inactive_under_batch`) are a
-    pre-existing parallel-test race on the process-wide
-    `PS_FAST_PATH_HITS` counter — both pass when run serially with
-    `--test-threads=1` on both branches. Confirmed via `git stash` toggle.
-  - Live cluster verification: NOT executed in this session — the user
-    did not authorise `cluster.sh reset 4` here. Repro plan documented:
+  - cargo test -p autumn-stream --lib: 48/48 pass.
+  - cargo test -p autumn-partition-server --lib: 104 pass / 1 fail
+    identically before and after (pre-existing
+    f099i_d1_fast_path_no_fu_allocation parallel-test race on the
+    process-wide PS_FAST_PATH_HITS counter, passes serially with
+    --test-threads=1).
+  - Live cluster re-verification of the user's `head→get` repro
+    deferred per the established user policy on destructive
+    cluster commands. Repro plan:
       • cluster.sh reset 4
-      • wbench long enough to fill log_stream with VPs (≥ 1 GiB)
-      • trigger GC via `autumn-client gc <PARTID>` or wait for auto-GC
-      • observe ps.log: per-batch `stream append summary` should show
-        `ops≈256` (not 1), `retries=0`, no `append timeout after 5s`,
-        and foreground put traffic should stay flat through the GC run.
+      • $AC put big.mp4 --nosync
+      • cluster.sh restart-ps
+      • $AC get big.mp4 → expected: returns the file (no
+        offset-past-payload error).
 
 Files modified:
-  - crates/partition-server/src/background.rs (run_gc + process_gc_chunk
-    rewrite; new GcWriteBatch / GcRateLimiter / flush_gc_batch /
-    gc_yield_now helpers; new env knobs).
-  - feature_list.md (F141 entry, Last updated → 2026-05-05).
-  - claude-progress.txt (this file).
+  - crates/stream/src/extent_rpc.rs
+  - crates/stream/src/extent_node.rs
+  - crates/stream/src/client.rs
+  - crates/partition-server/src/lib.rs
+  - feature_list.md (F142 entry, passes:true)
+  - claude-progress.txt (this file)
 
-Out of scope (kept simple per project style):
-  - `read_bytes_from_extent` for the GC source extent still issues one
-    network round-trip per 64 MiB chunk; pipelining the read window in
-    front of the rewrite batch is a separate optimisation, not motivated
-    by this incident.
-  - `MAX_GC_ONCE = 3` extents per tick unchanged (the storm root was
-    per-record, not per-extent).
-  - autumn-partition-server CLAUDE.md "GC" section is still accurate at
-    the high level (single-fragment VP rewrite path, punch_holes after
-    full carry); a tighter F141 callout can be added in a future doc
-    sweep if needed.
+Out of scope (explicitly deferred):
+
+  - Sealed-extent durability: a flush whose imm references a
+    PREVIOUSLY-SEALED log_stream extent (vp head crossed an extent
+    rotation during the imm's lifetime) is still vulnerable, because
+    seal currently does NOT fsync. The fix shape is to call
+    `file.sync_all()` in extent-node's "applied seal from manager"
+    path. File as F143 if it surfaces under stress.
+
+  - Existing-data recovery: the user's bad VP for the 100 MB MP4 is
+    unrecoverable — those 100 MB of bytes never reached disk. F142
+    prevents the next one; the existing entry can be deleted, or
+    left as a tombstone after major compaction drops it.
+
+User context (preserved for future sessions):
+  - User confirmed: only `restart-ps`, never `kill -9`, never
+    `cluster.sh reset` mid-workload between yesterday's puts and
+    today's `get`.
+  - User noted occasional false-offline detection of extent-nodes by
+    the manager (df RPC timeouts under load). The F142 sync barrier
+    will surface as flush failures if a node is genuinely
+    unreachable, but is unaffected by the manager's `online` flag —
+    it does direct extent-node TCP RPCs.

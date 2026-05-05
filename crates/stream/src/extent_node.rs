@@ -1731,6 +1731,7 @@ impl ExtentNode {
             MSG_WRITE_SHARD => self.handle_write_shard(payload).await,
             MSG_DELETE_EXTENT => self.handle_delete_extent(payload).await,
             MSG_COMMIT_EC_SHARD => self.handle_commit_ec_shard(payload).await,
+            MSG_SYNC_EXTENT => self.handle_sync_extent(payload).await,
             _ => Err((StatusCode::InvalidArgument, format!("unknown msg_type {msg_type}"))),
         }
     }
@@ -2553,6 +2554,64 @@ impl ExtentNode {
             length: length as u32,
         }
         .encode())
+    }
+
+    /// F142: fsync a single extent's data file in place. No payload,
+    /// no `extent.len` change. Used by the partition server before
+    /// committing an SST whose VPs reference log_stream regions
+    /// written with `must_sync=false`. Idempotent and cheap when the
+    /// file is already clean.
+    async fn handle_sync_extent(&self, payload: Bytes) -> HandlerResult {
+        let req = SyncExtentReq::decode(payload)
+            .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
+
+        if !self.owns_extent(req.extent_id) {
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "extent {} belongs to shard {} not shard {} (shard_count={})",
+                    req.extent_id,
+                    req.extent_id % self.shard_count as u64,
+                    self.shard_idx,
+                    self.shard_count,
+                ),
+            ));
+        }
+
+        let entry = self.extents.get(&req.extent_id).ok_or_else(|| {
+            (
+                StatusCode::NotFound,
+                format!("extent {} not found", req.extent_id),
+            )
+        })?;
+
+        // Revision fencing matches commit_length / append: a stale
+        // owner must not be able to force a sync against a fenced
+        // extent. A higher revision bumps last_revision (and persists
+        // the meta sidecar), matching the existing commit_length
+        // behaviour so the sync RPC participates in the same fencing
+        // contract.
+        if req.revision > 0 {
+            let last = entry.last_revision.load(Ordering::SeqCst);
+            if req.revision < last {
+                return Ok(SyncExtentResp {
+                    code: CODE_LOCKED_BY_OTHER,
+                }
+                .encode());
+            }
+            if req.revision > last {
+                entry.last_revision.store(req.revision, Ordering::SeqCst);
+                let _ = self.save_meta(req.extent_id, &entry).await;
+            }
+        }
+
+        if let Err(e) = file_ref(&entry.file).sync_all().await {
+            return Err((
+                StatusCode::Internal,
+                format!("sync_extent {}: {}", req.extent_id, e),
+            ));
+        }
+        Ok(SyncExtentResp { code: CODE_OK }.encode())
     }
 
     async fn handle_alloc_extent(&self, payload: Bytes) -> HandlerResult {

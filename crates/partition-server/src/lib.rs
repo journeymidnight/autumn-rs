@@ -3145,7 +3145,7 @@ pub(crate) fn maybe_rotate(part: &mut PartitionData) {
 
 pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
     // Snapshot of what P-bulk needs + whether a bulk worker is wired up.
-    let (imm_mem, row_stream_id, meta_stream_id, snap_vp_eid, snap_vp_off, req_tx, part_sc, invalidate_row) = {
+    let (imm_mem, row_stream_id, meta_stream_id, log_stream_id, snap_vp_eid, snap_vp_off, req_tx, part_sc, invalidate_row) = {
         let p = part.borrow();
         let Some(imm_mem) = p.imm.front().cloned() else {
             return Ok(false);
@@ -3155,6 +3155,7 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
             imm_mem,
             p.row_stream_id,
             p.meta_stream_id,
+            p.log_stream_id,
             p.vp_extent_id,
             p.vp_offset,
             p.flush_req_tx.clone(),
@@ -3162,6 +3163,21 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
             inv,
         )
     };
+
+    // F142 WAL barrier: fsync the log_stream tail BEFORE we let
+    // P-bulk commit the SST. The imm we're about to flush contains
+    // ValuePointer entries that reference log_stream regions which
+    // may have been written with `must_sync=false` (e.g. clients using
+    // `--nosync`). If we let the SST + meta_stream checkpoint become
+    // durable while those WAL bytes are still page-cache-only, an
+    // extent-node restart that loses page cache leaves the SST
+    // pointing into now-truncated regions — `head` succeeds, `get`
+    // surfaces `offset N past decoded payload len M`. Single fsync per
+    // imm is amortised across hundreds of MB of writes and runs on the
+    // background flush task, so it doesn't slow foreground puts.
+    if let Err(e) = part_sc.sync_stream_tail(log_stream_id).await {
+        return Err(anyhow!("flush_one_imm: WAL barrier sync failed: {e}"));
+    }
 
     let Some(mut req_tx) = req_tx else {
         // P-bulk thread failed to spawn — fall back to in-thread flush so
