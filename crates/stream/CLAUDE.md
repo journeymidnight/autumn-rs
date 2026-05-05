@@ -230,18 +230,42 @@ the manager's `extent_delete_loop` once per replica.
 ```
 handle_delete_extent(extent_id):
   1. F099-M shard ownership: if !owns_extent → forward to sibling shard.
-  2. extents.remove(&id) — pull the in-memory ExtentEntry out so any
+  2. F139: if recovery_inflight.contains_key(&extent_id) → return
+     CODE_PRECONDITION. Manager's extent_delete_loop retries (60 × 2 s
+     budget); once recovery_inflight clears, next retry succeeds.
+  3. extents.remove(&id) — pull the in-memory ExtentEntry out so any
      subsequent append fails fast with NotFound. Any pwritev that
      already took the file handle keeps its inode (POSIX preserves
      open fds across unlink); the data is meaningless because manager
      refs are 0.
-  3. DiskFS::remove_extent_files(id):
+  4. DiskFS::remove_extent_files(id):
        a. compio::fs::remove_file({base}/{hash:02x}/extent-{id}.dat)
        b. compio::fs::remove_file({base}/{hash:02x}/extent-{id}.meta)
        Both NotFound errors are downgraded to Ok(()) — the contract is
        idempotent so manager retries are safe.
-  4. Returns CodeResp { code: CODE_OK | CODE_ERROR }.
+  5. Returns CodeResp { code: CODE_OK | CODE_PRECONDITION | CODE_ERROR }.
 ```
+
+**F139 recovery-vs-delete mutual exclusion (belt-and-braces):**
+`handle_require_recovery` inserts into `recovery_inflight` before
+detaching the background `run_recovery_task`. `handle_delete_extent`
+(step 2 above) checks `recovery_inflight` and refuses with
+`CODE_PRECONDITION` if set. This prevents two data-loss paths:
+
+(a) **Resurrection**: `ensure_extent` in `run_recovery_task` opens with
+`create:true`; if delete already unlinked the file, it silently creates
+a fresh one, writes the peer-fetched payload, and saves a sidecar — an
+orphan with no manager record until the 5-min reconcile sweep.
+
+(b) **Write-to-unlinked-inode**: if `ensure_extent` ran before delete
+(entry is still in `self.extents`), recovery holds an `Rc<ExtentEntry>`
+whose open fd survives the unlink. All subsequent writes succeed against
+the unlinked inode but the data evaporates on fd drop.
+
+The manager-side guards (F139 in `recovery.rs` and `rpc_handlers.rs`)
+are the primary prevention. The extent-node check is belt-and-braces for
+the leader-failover scenario where `pending_extent_deletes` is lost
+in-memory but `recovery_inflight` survives on the extent-node process.
 
 ### F109+F113: Startup + Periodic Orphan Reconcile
 

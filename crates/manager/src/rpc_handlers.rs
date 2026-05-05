@@ -958,6 +958,7 @@ impl AutumnManager {
 
         let out = {
             let ec_inflight = self.ec_conversion_inflight.borrow();
+            let recovery_inflight = self.recovery_tasks.borrow();
             let mut guard = self.store.inner.borrow_mut();
             let s: &mut autumn_common::MetadataState = &mut guard;
             (|| -> Result<
@@ -984,6 +985,26 @@ impl AutumnManager {
                     .into_iter()
                     .filter(|id| members.contains(id))
                     .collect();
+
+                // F139: if any extent that would drop to refs=0 is currently
+                // being recovered, refuse the entire call. Recovery's
+                // ensure_extent auto-creates on NotFound, risking either a
+                // write-to-unlinked-inode (data evaporates) or an extent
+                // resurrection (orphan with no manager record). Returns
+                // Precondition so PS GC retry loop backs off until recovery
+                // completes. Symmetric to the ec_inflight guard above (F138).
+                for eid in &removed {
+                    if recovery_inflight.contains_key(eid) {
+                        if let Some(ex) = s.extents.get(eid) {
+                            if ex.refs == 1 && ex.vp_table_refs == 0 {
+                                return Err(AppError::Precondition(format!(
+                                    "extent {eid} has in-flight recovery; \
+                                     defer punch_holes until recovery completes"
+                                )));
+                            }
+                        }
+                    }
+                }
 
                 stream.extent_ids.retain(|id| !removed.contains(id));
                 if stream.extent_ids.is_empty() {
@@ -1077,7 +1098,7 @@ impl AutumnManager {
         }
     }
 
-    async fn handle_truncate(&self, payload: Bytes) -> HandlerResult {
+    pub(crate) async fn handle_truncate(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&TruncateResp {
                 code: Self::err_to_code(&err),
@@ -1091,6 +1112,7 @@ impl AutumnManager {
 
         let out = {
             let ec_inflight = self.ec_conversion_inflight.borrow();
+            let recovery_inflight = self.recovery_tasks.borrow();
             let mut guard = self.store.inner.borrow_mut();
             let s: &mut autumn_common::MetadataState = &mut guard;
             (|| -> Result<
@@ -1124,6 +1146,22 @@ impl AutumnManager {
                 }
 
                 let removed: HashSet<u64> = stream.extent_ids[..pos].iter().copied().collect();
+
+                // F139: symmetric guard to punch_holes — refuse if any extent
+                // that would drop to refs=0 is currently being recovered.
+                for eid in &removed {
+                    if recovery_inflight.contains_key(eid) {
+                        if let Some(ex) = s.extents.get(eid) {
+                            if ex.refs == 1 && ex.vp_table_refs == 0 {
+                                return Err(AppError::Precondition(format!(
+                                    "extent {eid} has in-flight recovery; \
+                                     defer truncate until recovery completes"
+                                )));
+                            }
+                        }
+                    }
+                }
+
                 let st = s
                     .streams
                     .get_mut(&req.stream_id)

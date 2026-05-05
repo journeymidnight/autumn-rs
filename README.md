@@ -209,6 +209,43 @@ The same shuffle covers EC-parity allocation (parity slots no longer
 land exclusively on whichever node `HashMap` iteration visits last) and
 the per-RPC fall-back path inside `handle_stream_alloc_extent`.
 
+### F139 — extent-node delete vs in-flight recovery (2026-05-05)
+
+`handle_delete_extent` would race with `run_recovery_task` on the same
+extent_id. Two failure modes: (a) recovery's `ensure_extent` auto-creates
+a file after delete unlinked it → silent orphan with no manager record;
+(b) recovery writes to an open fd whose path is already unlinked → data
+evaporates on fd drop.
+
+Fix: five symmetric guards using the same in-flight-set pattern as F138.
+Manager: `dispatch_recovery_task` skips when the extent is in
+`pending_extent_deletes`; `punch_holes` / `truncate` return Precondition
+when a refs→0 extent is in `recovery_tasks`; `apply_recovery_done`'s
+None-branch enqueues a targeted `PendingDelete` for immediate cleanup.
+Extent-node: `handle_delete_extent` returns `CODE_PRECONDITION` when
+`recovery_inflight.contains_key(&extent_id)`; `extent_delete_loop`
+retries up to 60 × 2 s.
+
+Manual repro (verifying the guard fires under concurrent GC + recovery):
+
+```bash
+bash cluster.sh reset 4          # 4-node cluster, EC enabled
+AC="./target/debug/autumn-client --manager 127.0.0.1:9001"
+# Sustained writes to fill at least one extent rotation
+for i in $(seq 1 200); do dd if=/dev/urandom bs=4k count=1 2>/dev/null | $AC put k$i /dev/stdin; done
+bash cluster.sh stop-node 2      # triggers recovery dispatch on ext-node-2 slots
+# Concurrently issue GC on a partition whose log_stream tail extent is recovering
+PARTID=$($AC ls | awk 'NR==1{print $1}')
+$AC gc "$PARTID" &
+sleep 30
+# Verify: no orphan .dat files and no "recovery_done apply" for a concurrently-deleted extent
+grep -i "extent.*recovery.*precondition\|pending.*delete.*queued" /tmp/autumn-rs-logs/manager.log
+# Expected: at most a few CODE_PRECONDITION retries, then clean convergence
+$AC info --json | python3 -c "import sys,json; d=json.load(sys.stdin); print('orphans:', [e for e in d.get('extents',[]) if not e.get('in_stream',True)])"
+```
+
+---
+
 ### F138 — eversion-bump lock during EC conversion (2026-05-05)
 
 `ec_conversion_dispatch_loop` captures `new_eversion = ex.eversion + 1`

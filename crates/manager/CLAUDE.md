@@ -298,3 +298,35 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     return `Err(Precondition(...))` if set — retried on the next 2 s
     dispatch tick or client retry. Symmetric to F136's pre-existing
     guard (EC checks `recovery_tasks` before dispatch).
+
+11. **F139 delete vs in-flight recovery symmetric exclusion.**
+    Two race subwindows close here with the same in-flight-set pattern
+    used by F138:
+    - **Resurrection race**: `ensure_extent` (called by `run_recovery_task`)
+      auto-creates with `OpenOptions::create(true)` on miss; if delete
+      has already unlinked the file, it silently resurrects an orphan
+      on disk with no manager record.
+    - **Write-to-unlinked-inode race**: recovery holds `Rc<ExtentEntry>`;
+      delete unlinks the path; recovery writes to the open (unlinked)
+      fd; data evaporates on fd close.
+    Four changes close both subwindows:
+    (a) `dispatch_recovery_task` (`recovery.rs`) skips dispatch when the
+      extent appears in `pending_extent_deletes` — the 2 s retry tick
+      will naturally find the extent gone from `s.extents` once the
+      queue drains.
+    (b) `handle_stream_punch_holes` (`rpc_handlers.rs`) returns
+      `Err(Precondition)` when any to-be-removed extent (refs→0) is
+      present in `recovery_tasks` — PS GC retry backs off until recovery
+      completes.
+    (c) `handle_truncate` (`rpc_handlers.rs`) symmetric guard to (b).
+    (d) `apply_recovery_done` (`recovery.rs`) None-branch (extent no
+      longer in manager store) enqueues a targeted `PendingDelete` for
+      the recovering node so any resurrected on-disk files are reaped
+      immediately, not waiting for the 5-min orphan-reconcile sweep.
+    Belt-and-braces: extent-node's `handle_delete_extent`
+    (`extent_node.rs`) returns `CODE_PRECONDITION` when
+    `recovery_inflight.contains_key(&extent_id)`; `extent_delete_loop`
+    retries up to 60 × 2 s = 2 min, which exceeds typical recovery
+    duration. This covers manager leader-failover where
+    `pending_extent_deletes` is lost in-memory but `recovery_inflight`
+    survives on the extent-node process.

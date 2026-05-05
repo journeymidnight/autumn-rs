@@ -7,10 +7,10 @@ use autumn_common::AppError;
 use autumn_rpc::manager_rpc::*;
 use bytes::Bytes;
 
-use crate::AutumnManager;
+use crate::{AutumnManager, PendingDelete};
 
 impl AutumnManager {
-    async fn dispatch_recovery_task(
+    pub(crate) async fn dispatch_recovery_task(
         &self,
         extent_id: u64,
         replace_id: u64,
@@ -28,6 +28,20 @@ impl AutumnManager {
         // there — producing a duplicate-node corrupt state where the same
         // node id appears in both `replicates` and `parity`.
         if self.ec_conversion_inflight.borrow().contains(&extent_id) {
+            return Ok(());
+        }
+
+        // F139: skip recovery dispatch if the extent is already queued for
+        // physical deletion. Once the queue drains, s.extents will no longer
+        // contain this extent and dispatch_recovery_task returns NotFound on
+        // the next tick — recovery is automatically moot. Symmetric to the
+        // F126 ec_conversion_inflight guard above.
+        if self
+            .pending_extent_deletes
+            .borrow()
+            .iter()
+            .any(|p| p.extent_id == extent_id)
+        {
             return Ok(());
         }
 
@@ -226,6 +240,24 @@ impl AutumnManager {
         };
 
         let Some(updated_extent) = updated_extent else {
+            // The extent was removed from manager state before recovery
+            // completed. F139: enqueue a targeted delete for the recovering
+            // node so the resurrected on-disk files are reaped promptly
+            // instead of waiting for the 5-minute orphan-reconcile sweep.
+            let maybe_addr: Option<String> = {
+                let s = self.store.inner.borrow();
+                s.nodes.get(&task.node_id).map(|n| {
+                    let base = Self::normalize_endpoint(&n.address);
+                    Self::shard_addr_for_extent(&base, &n.shard_ports, task.extent_id)
+                })
+            };
+            if let Some(addr) = maybe_addr {
+                self.enqueue_pending_deletes(vec![PendingDelete {
+                    extent_id: task.extent_id,
+                    pending_addrs: vec![addr],
+                    attempts: 0,
+                }]);
+            }
             self.recovery_tasks.borrow_mut().remove(&task.extent_id);
             return Ok(());
         };

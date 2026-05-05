@@ -2391,4 +2391,281 @@ mod tests {
             "degraded fallback should pick at least 3 distinct nodes across 200 tries; got {first_node_seen:?}"
         );
     }
+
+    // ── F139: extent-node delete vs in-flight recovery ──────────────────────
+
+    /// dispatch_recovery_task must return Ok without populating recovery_tasks
+    /// when the extent is already queued for physical deletion.
+    #[test]
+    fn f139_dispatch_recovery_skips_when_pending_delete_queued() {
+        run(async {
+            let m = AutumnManager::new();
+            let extent_id = 300u64;
+            m.store
+                .inner
+                .borrow_mut()
+                .extents
+                .insert(extent_id, make_ec_extent(extent_id, 1));
+
+            // Simulate GC having queued a delete for this extent.
+            m.pending_extent_deletes
+                .borrow_mut()
+                .push_back(PendingDelete {
+                    extent_id,
+                    pending_addrs: vec!["127.0.0.1:9101".to_string()],
+                    attempts: 0,
+                });
+
+            // dispatch_recovery_task must skip — delete is already queued.
+            let result = m.dispatch_recovery_task(extent_id, /*replace_id=*/ 1).await;
+            assert!(
+                result.is_ok(),
+                "F139: dispatch_recovery_task must return Ok when delete queued: {result:?}"
+            );
+            assert!(
+                !m.recovery_tasks.borrow().contains_key(&extent_id),
+                "F139: recovery_tasks must NOT be populated when delete is queued"
+            );
+        })
+    }
+
+    /// handle_stream_punch_holes must return Precondition (not remove the
+    /// extent) when the to-be-deleted extent is currently being recovered.
+    #[test]
+    fn f139_punch_holes_aborts_when_extent_is_in_recovery() {
+        run(async {
+            let m = AutumnManager::new();
+
+            let owner_key = "owner-f139-ph".to_string();
+            let revision = {
+                let mut s = m.store.inner.borrow_mut();
+                s.acquire_owner_lock(&owner_key)
+            };
+
+            let stream_id = 50u64;
+            let extent_id = 301u64;
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.streams.insert(
+                    stream_id,
+                    MgrStreamInfo {
+                        stream_id,
+                        extent_ids: vec![extent_id, 399],
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                        replicates: 3,
+                    },
+                );
+                // Keep a second extent so the stream isn't left empty after punching 301.
+                s.extents.insert(399, make_ec_extent(399, 1));
+                let mut ex = make_ec_extent(extent_id, 1);
+                ex.refs = 1;
+                ex.vp_table_refs = 0;
+                s.extents.insert(extent_id, ex);
+            }
+
+            // Mark this extent as in-flight for recovery.
+            m.recovery_tasks.borrow_mut().insert(
+                extent_id,
+                MgrRecoveryTask {
+                    extent_id,
+                    replace_id: 1,
+                    node_id: 9,
+                    start_time: 0,
+                },
+            );
+
+            let req = rkyv_encode(&PunchHolesReq {
+                stream_id,
+                owner_key: owner_key.clone(),
+                revision,
+                extent_ids: vec![extent_id],
+            });
+            let resp = m.handle_stream_punch_holes(req).await.unwrap();
+            let r: PunchHolesResp = rkyv_decode(&resp).unwrap();
+
+            assert_ne!(
+                r.code, CODE_OK,
+                "F139: punch_holes must be rejected when target extent is in recovery"
+            );
+            assert!(
+                r.message.contains("in-flight recovery"),
+                "error must mention in-flight recovery: {}",
+                r.message
+            );
+            // Extent must still be in s.extents — not removed.
+            let s = m.store.inner.borrow();
+            assert!(
+                s.extents.contains_key(&extent_id),
+                "F139: extent must not be removed from store on rejection"
+            );
+            drop(s);
+            // No pending delete must have been enqueued.
+            assert!(
+                m.pending_extent_deletes.borrow().is_empty(),
+                "F139: pending_extent_deletes must be empty on rejection"
+            );
+        })
+    }
+
+    /// handle_truncate must return Precondition when any to-be-truncated
+    /// extent that would drop to refs=0 is currently being recovered.
+    #[test]
+    fn f139_truncate_aborts_when_any_extent_is_in_recovery() {
+        run(async {
+            let m = AutumnManager::new();
+
+            let owner_key = "owner-f139-tr".to_string();
+            let revision = {
+                let mut s = m.store.inner.borrow_mut();
+                s.acquire_owner_lock(&owner_key)
+            };
+
+            let stream_id = 51u64;
+            let extent_a = 302u64; // will be truncated (pos < truncate target)
+            let extent_b = 303u64; // truncate target (kept)
+            let extent_c = 304u64; // kept
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.streams.insert(
+                    stream_id,
+                    MgrStreamInfo {
+                        stream_id,
+                        extent_ids: vec![extent_a, extent_b, extent_c],
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                        replicates: 3,
+                    },
+                );
+                for &eid in &[extent_a, extent_b, extent_c] {
+                    let mut ex = make_ec_extent(eid, 1);
+                    ex.refs = 1;
+                    ex.vp_table_refs = 0;
+                    s.extents.insert(eid, ex);
+                }
+            }
+
+            // extent_a is being recovered — truncate should be refused.
+            m.recovery_tasks.borrow_mut().insert(
+                extent_a,
+                MgrRecoveryTask {
+                    extent_id: extent_a,
+                    replace_id: 1,
+                    node_id: 9,
+                    start_time: 0,
+                },
+            );
+
+            let req = rkyv_encode(&TruncateReq {
+                stream_id,
+                owner_key: owner_key.clone(),
+                revision,
+                extent_id: extent_b, // truncate everything before extent_b
+            });
+            let resp = m.handle_truncate(req).await.unwrap();
+            let r: TruncateResp = rkyv_decode(&resp).unwrap();
+
+            assert_ne!(
+                r.code, CODE_OK,
+                "F139: truncate must be rejected when a to-be-removed extent is in recovery"
+            );
+            assert!(
+                r.message.contains("in-flight recovery"),
+                "error must mention in-flight recovery: {}",
+                r.message
+            );
+            // Stream must still contain extent_a.
+            let s = m.store.inner.borrow();
+            let stream = s.streams.get(&stream_id).unwrap();
+            assert!(
+                stream.extent_ids.contains(&extent_a),
+                "F139: extent_a must not be removed from stream on rejection"
+            );
+        })
+    }
+
+    /// Full-race cycle: punch_holes is rejected while recovery is in flight,
+    /// then recovery completes, then punch_holes succeeds and extent is
+    /// enqueued for physical deletion.
+    #[test]
+    fn f139_full_race_recovery_after_punch_holes_attempt() {
+        run(async {
+            let m = AutumnManager::new();
+
+            let owner_key = "owner-f139-full".to_string();
+            let revision = {
+                let mut s = m.store.inner.borrow_mut();
+                s.acquire_owner_lock(&owner_key)
+            };
+
+            let stream_id = 52u64;
+            let extent_id = 305u64;
+            let keep_id = 306u64;
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.streams.insert(
+                    stream_id,
+                    MgrStreamInfo {
+                        stream_id,
+                        extent_ids: vec![extent_id, keep_id],
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                        replicates: 3,
+                    },
+                );
+                let mut ex = make_ec_extent(extent_id, 1);
+                ex.refs = 1;
+                ex.vp_table_refs = 0;
+                s.extents.insert(extent_id, ex);
+                s.extents.insert(keep_id, make_ec_extent(keep_id, 1));
+            }
+
+            // Recovery is in flight.
+            m.recovery_tasks.borrow_mut().insert(
+                extent_id,
+                MgrRecoveryTask {
+                    extent_id,
+                    replace_id: 1,
+                    node_id: 9,
+                    start_time: 0,
+                },
+            );
+
+            // Phase 1: punch_holes must be rejected.
+            let req_bytes = rkyv_encode(&PunchHolesReq {
+                stream_id,
+                owner_key: owner_key.clone(),
+                revision,
+                extent_ids: vec![extent_id],
+            });
+            let resp = m.handle_stream_punch_holes(req_bytes.clone()).await.unwrap();
+            let r: PunchHolesResp = rkyv_decode(&resp).unwrap();
+            assert_ne!(r.code, CODE_OK, "Phase 1: punch_holes must be rejected");
+
+            // Phase 2: recovery completes — clear recovery_tasks.
+            m.recovery_tasks.borrow_mut().remove(&extent_id);
+
+            // Phase 3: punch_holes must now succeed.
+            let resp2 = m.handle_stream_punch_holes(req_bytes).await.unwrap();
+            let r2: PunchHolesResp = rkyv_decode(&resp2).unwrap();
+            assert_eq!(r2.code, CODE_OK, "Phase 3: punch_holes must succeed after recovery clears: {}", r2.message);
+
+            // Extent must be removed from the stream.
+            let s = m.store.inner.borrow();
+            let stream = s.streams.get(&stream_id).unwrap();
+            assert!(
+                !stream.extent_ids.contains(&extent_id),
+                "F139: extent must be removed from stream after successful punch_holes"
+            );
+            drop(s);
+            // Extent must be queued for physical deletion.
+            assert!(
+                m.pending_extent_deletes
+                    .borrow()
+                    .iter()
+                    .any(|p| p.extent_id == extent_id),
+                "F139: extent must be enqueued for physical deletion after refs→0"
+            );
+        })
+    }
 }

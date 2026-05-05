@@ -1,60 +1,55 @@
 Date: 2026-05-05
 TaskStatus: completed
-Task scope: F138 — eversion lost-update across EC conversion await.
-            Manager's ec_conversion_dispatch_loop captured new_eversion
-            before the EXT_MSG_CONVERT_TO_EC await; apply_ec_conversion_done
-            then wrote it back unconditionally, overwriting concurrent bumps
-            from apply_recovery_done / mark_extent_available / split.
-            Also: apply_ec_conversion_done's ex.replicates overwrite silently
-            reverted recovery slot replacements.
+Task scope: F139 — Extent-node delete vs in-flight recovery (orphan + write-to-unlinked-inode race).
 
-Root cause (confirmed via unit tests):
-  • apply_ec_conversion_done wrote `ex.eversion = new_eversion` (captured
-    before the await) instead of incrementing, losing any concurrent bumps.
-  • apply_ec_conversion_done wrote `ex.replicates = target_nodes[..K]`
-    (also captured at dispatch time), reverting recovery's node replacement.
-  • The lock (ec_conversion_inflight.remove) fired BEFORE the apply, leaving
-    a window between remove and apply_ec_conversion_done where the race
-    remained reachable.
+Root cause (confirmed):
+  Two reachable race subwindows between handle_delete_extent and run_recovery_task
+  on the same extent_id:
+  (a) Resurrection: ensure_extent auto-creates with create:true after delete
+      unlinks the file → orphan on disk, no manager record.
+  (b) Write-to-unlinked-inode: recovery holds Rc<ExtentEntry>; delete unlinks
+      the path; recovery's pwrite succeeds on unlinked inode; data evaporates
+      on fd drop. apply_recovery_done's None-branch silently Ok(())'d the stale
+      task, masking the corruption.
 
-Fix (option b — eversion-bump lock, symmetric to F136):
-  1. ec_conversion_dispatch_loop: move ec_conversion_inflight.remove to AFTER
-     apply_ec_conversion_done completes (or fails). Lock now covers full
-     dispatch → RPC await → in-memory+etcd apply window.
-  2. apply_recovery_done (recovery.rs): check ec_conversion_inflight at
-     entry; return Err::Precondition if set; keep recovery_tasks entry for
-     next 2 s retry tick.
-  3. recovery_dispatch_loop (recovery.rs): skip per-slot processing entirely
-     when ec_conversion_inflight contains the extent, preventing re_avali
-     from triggering mark_extent_available during EC.
-  4. mark_extent_available (lib.rs): same check + Err early-return.
-  5. handle_multi_modify_split (rpc_handlers.rs): check all source-stream
-     extents; return Err::Precondition if any is locked.
+Fix (symmetric in-flight-set pattern from F138):
+  1. recovery.rs dispatch_recovery_task: skip dispatch when extent is in
+     pending_extent_deletes — next 2 s tick naturally finds extent gone.
+  2. rpc_handlers.rs handle_stream_punch_holes: return Err(Precondition) if
+     any refs→0 extent is in recovery_tasks. PS GC retry backs off.
+  3. rpc_handlers.rs handle_truncate: symmetric guard to (2).
+  4. recovery.rs apply_recovery_done None-branch: enqueue PendingDelete for
+     recovering node — immediate reap instead of 5-min orphan-reconcile wait.
+  5. extent_node.rs handle_delete_extent: return CODE_PRECONDITION when
+     recovery_inflight.contains_key(&extent_id). extent_delete_loop retries
+     up to 60 × 2 s = 2 min budget.
+
+Belt-and-braces: both manager and extent-node sides independently refuse,
+covering leader failover where pending_extent_deletes is lost in-memory
+but recovery_inflight survives on the extent-node process.
 
 Files modified:
-  - crates/manager/src/recovery.rs (apply_recovery_done early-return,
-    recovery_dispatch_loop per-extent skip, ec_conversion_dispatch_loop
-    lock order fix, apply_ec_conversion_done visibility pub(crate))
-  - crates/manager/src/lib.rs (mark_extent_available early-return,
-    4 new F138 unit tests)
-  - crates/manager/src/rpc_handlers.rs (handle_multi_modify_split check,
-    visibility pub(crate))
-  - crates/manager/CLAUDE.md (note 10 documenting F138 lock semantics)
-  - feature_list.md (F138 passes:true + fix description)
-  - README.md (F138 manual repro block)
+  - crates/manager/src/recovery.rs (dispatch pending-delete skip, apply None cleanup)
+  - crates/manager/src/rpc_handlers.rs (punch_holes and truncate recovery guards)
+  - crates/stream/src/extent_node.rs (handle_delete_extent precondition check,
+    clone_recovery_inflight test helper)
+  - crates/manager/src/lib.rs (4 new F139 unit tests)
+  - crates/stream/tests/f139_delete_recovery_race.rs (new integration test)
+  - crates/manager/CLAUDE.md (note 11 documenting F139 lock semantics)
+  - crates/stream/CLAUDE.md (F109 section updated with F139 guard documentation)
+  - feature_list.md (F139 passes:true + fix description)
+  - README.md (F139 manual repro block to be added)
   - claude-progress.txt (this file)
 
 Verification:
-  - cargo build --workspace: clean (only pre-existing unused-import
-    warnings, identical to pre-change state).
-  - cargo test -p autumn-manager --lib: 20/20 pass — 16 pre-existing
-    + 4 new F138 tests.
+  - cargo build --workspace: clean (only pre-existing warnings).
+  - cargo test -p autumn-manager --lib: 24/24 pass — 20 pre-existing + 4 new F139.
   - cargo test -p autumn-stream --lib: 48/48 pass.
-  - cargo test -p autumn-partition-server --lib: 103/105 pass — same
-    2 pre-existing f099i parallel-test race failures as before.
-  - Live cluster re-verification deferred per project policy on
-    destructive cluster commands.
+  - cargo test -p autumn-stream --test f139_delete_recovery_race: 1/1 pass.
+  - cargo test -p autumn-partition-server --lib: 103/105 pass — same 2
+    pre-existing f099i parallel-test race failures as before.
 
 Next steps:
-  - F139: Extent-node delete vs in-flight recovery (orphan .dat risk).
-  - F140: Structural split-vs-compact serialisation (P-bulk drain).
+  - README.md F139 manual repro block (concurrent recovery + GC scenario).
+  - F140: Structural split-vs-compact serialisation (P-bulk drain barrier).
+  - F141: GC log_stream rewrite storm — batch + must_sync=false + yield + rate-limit.

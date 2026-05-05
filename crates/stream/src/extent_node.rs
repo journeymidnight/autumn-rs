@@ -2886,6 +2886,23 @@ impl ExtentNode {
             }
         }
 
+        // F139: if recovery is in flight for this extent, refuse the delete.
+        // run_recovery_task's ensure_extent auto-creates on NotFound; if we
+        // unlink now, recovery either writes to the unlinked inode (data
+        // evaporates when fd closes) or resurrects the extent on-disk as an
+        // orphan with no manager record. The manager's extent_delete_loop
+        // retries up to 60× (~2 min); orphan-reconcile (F113) is the backstop
+        // if that budget exhausts before recovery completes.
+        if self.recovery_inflight.contains_key(&req.extent_id) {
+            return Ok(rkyv_encode(&CodeResp {
+                code: CODE_PRECONDITION,
+                message: format!(
+                    "extent {} recovery in flight; delete deferred",
+                    req.extent_id
+                ),
+            }));
+        }
+
         // Pull the entry out of the map so any later append on this id
         // fails with NotFound rather than racing the unlink.
         let entry = self.extents.remove(&req.extent_id).map(|(_, v)| v);
@@ -3444,5 +3461,15 @@ impl ExtentNode {
             .await?;
 
         Ok(CommitEcShardResp { code: CODE_OK }.encode())
+    }
+
+    /// Expose the recovery_inflight map for integration tests. The Rc clone
+    /// shares the same underlying DashMap, so inserts made after `serve` is
+    /// spawned are visible to the running connection handler on the same
+    /// compio thread. Only intended for test use.
+    pub fn clone_recovery_inflight(
+        &self,
+    ) -> std::rc::Rc<dashmap::DashMap<u64, crate::extent_rpc::RecoveryTask>> {
+        self.recovery_inflight.clone()
     }
 }
