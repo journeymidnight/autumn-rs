@@ -1,88 +1,107 @@
-Date: 2026-05-04
+Date: 2026-05-05
 TaskStatus: completed
-Task scope: F140 — split + concurrent EC conversion + node-flap → row_stream SST
-            corruption. Add feature entry; remove EC shard memcpy from the event loop
-            (the user's specific direction: "EC 转换必须放到别的 thread 里面").
+Task scope: F141 — GC log_stream rewrite storm (per-record fsync) → batch +
+            must_sync=false + cooperative yield + rate-limit (the user's
+            specific direction: "我认为 1,2,3,4 都需要", referring to the four
+            mitigations laid out in the diagnosis of /tmp/autumn-rs-logs/ps.log).
 
-Completed:
-  - feature_list.md: F140 entry added (passes:false). Documents the reproduced
-    symptom (`MetaBlock CRC mismatch` on row_stream extent 17 after `wbench →
-    compact → split → wbench` cycle), the on-disk evidence (file size divergence
-    across replicas: d1/d2/d3=929 MB, d4=526 MB, manager view sealed at 502 MB),
-    the mechanism (in-flight RowAppendReq during split's `multi_modify_split`
-    seal, amplified by F121 disk-flap from EC conversion CPU contention), the
-    partial mitigation in this commit, and the deferred structural fix
-    (`drain_p_bulk_inflight()` barrier in `handle_split_part` before the seal).
+Original symptom (from /tmp/autumn-rs-logs/ps.log, 2026-05-05 05:06:43Z):
+  • 05:06:43 GC: starting, extents=[16, 17] on partition 21 / log_stream=18
+  • 05:06:46–55 stream append summary `ops` jumps from idle (1, 752) to a
+    sustained 6 000–7 000 ops/sec. owner_key="ps-1", stream_id=18.
+  • 05:07:19 first `append timeout after 5s` against replica 0 (127.0.0.1:9101)
+  • 05:07:29 second timeout against replica 1 (9102) — fanout p50 collapses
+  • 05:08:14 single op shows fanout_ms=3377, total_ms=14587 — 14 s queueing
+  • Foreground put traffic stalled for the duration of the GC run.
 
-  - crates/stream/src/extent_node.rs: removed event-loop memcpy from
-    `handle_convert_to_ec`. F117 already wraps `ec_encode/decode/reconstruct`
-    in `spawn_blocking`, but ~700 MB of memcpy per conversion still ran on the
-    event loop (`Bytes::copy_from_slice(shard)` per remote target +
-    `shard_data.to_vec()` in `write_shard_local` + `chunk.to_vec()` in
-    `file_pwrite_chunked`). Patch:
-      • `file_pwrite_chunked` now takes `Bytes` (was `Vec<u8>`); chunked path
-        uses `Bytes::split_to` (O(1) Arc reslice) and passes chunks straight to
-        `file_pwrite` which accepts `impl IoBuf`. The per-chunk `chunk.to_vec()`
-        is gone. Four call sites updated to convert `Vec<u8>` to `Bytes` at the
-        boundary via zero-copy `Bytes::from`.
-      • `write_shard_local` now takes `Bytes` (was `&[u8]`); the
-        `shard_data.to_vec()` before `file_pwrite_chunked` is gone.
-      • `handle_convert_to_ec` spawn_blocking closure now returns `Vec<Bytes>`
-        (zero-copy `vecs.into_iter().map(Bytes::from).collect()` inside the
-        closure); the per-target loop uses `shards[i].clone()` (O(1) Arc inc)
-        instead of `Bytes::copy_from_slice(shard)`. Coordinator path uses
-        `shards[0].clone()` into the new `write_shard_local(_, _, _, _, Bytes)`
-        signature.
-      • `handle_write_shard` passes `req.payload` directly instead of
-        `&req.payload`.
+Root cause (in code, pre-F141):
+  crates/partition-server/src/background.rs::process_gc_chunk re-appended
+  every still-live VP record one at a time:
+      part_sc.append(log_stream_id, &log_entry, /*must_sync=*/true).await
+  At 4 KiB-typical VPs over a 1–2 GiB sealed extent that's 64 k–256 k
+  individual fsyncs × 3-replica fanout. The StreamClient per-stream worker
+  mpsc and the extent-node WAL fsync rate ceiling pinned together at the
+  same time, so foreground put traffic could not progress.
 
-    Net effect: at K=3, M=1, ~526 MB extent → previously ~700 MB of event-loop
-    memcpy per EC conversion (3 remotes × shard_size + 1 coordinator + per-chunk
-    round-trips); after F140, 0 bytes of event-loop memcpy. The Reed-Solomon
-    math + the conversion to Bytes + the chunked I/O all run on the
-    spawn_blocking pool / io_uring, never on the compio runtime serving
-    df/heartbeat/append RPCs. This addresses the user's direction:
-    "EC conversion CPU-heavy work must be on a different thread".
+Completed (the four mitigations the user asked for; lands as a single feature):
+  - feature_list.md: F141 entry added (passes:true) under the F140 section,
+    with full mechanism, fix breakdown, env tunables, and verification.
+
+  - crates/partition-server/src/background.rs:
+      • New `GcWriteBatch { segments, pending, bytes, record_cap, byte_cap }`
+        accumulates rewrites across `process_gc_chunk` calls (carries across
+        chunks; flushes mid-chunk when full).
+      • New `GcRateLimiter` (1-second sliding window) caps GC's
+        log_stream throughput at AUTUMN_PS_GC_RATE_BYTES_PER_SEC bytes/s
+        (default 64 MiB/s, 0 = unlimited).
+      • New `gc_yield_now()` (one-shot Pending+wake) yields the compio
+        scheduler to merged_partition_loop / ps-conn between batches.
+      • New `flush_gc_batch(part, log_stream_id, part_sc, batch, must_sync,
+        rate_limiter, moved)`:
+          - Calls `part_sc.append_segments(log_stream_id, segments, must_sync)`
+            ONCE per batch (was N times per record).
+          - Walks the returned tail offset to compute per-record VP offsets,
+            then `p.active.insert_batch(items)` — single RwLock acquire for
+            up to record_cap inserts.
+          - Updates `vp_extent_id`/`vp_offset` to the batch's `result.end`.
+          - `gc_yield_now().await` then optional sleep on the rate budget.
+      • Rewrote `run_gc`: holds `batch` + `rate_limiter` across the chunk
+        loop, calls `flush_gc_batch(..., must_sync=false, ...)` mid-loop on
+        cap, and ONE final `flush_gc_batch(..., must_sync=true, ...)` after
+        the carry check before `punch_holes`. POSIX fsync semantics flush
+        every prior must_sync=false byte on the same fd, so durability
+        before the source extent is reaped is preserved with a single
+        fsync per GC'd extent (was 64 k–256 k).
+      • Rewrote `process_gc_chunk`: takes `&mut GcWriteBatch` and `&mut
+        GcRateLimiter`; under a brief borrow_mut bumps `seq_number` +
+        encodes the internal_key, builds (header_segment, value_segment)
+        Bytes pairs into the batch, then `if batch.is_full()` calls
+        `flush_gc_batch(..., must_sync=false, ...)`. WAL header op preserves
+        original GC behaviour (`op = 1`, no VP flag — recovery's
+        `value.len() > VALUE_THROTTLE` fallback at lib.rs:2891 still
+        recognises the entry as a VP on replay because GC only ever
+        rewrites entries that were tagged VP in the source extent).
+      • New env knobs (all clamped, with sane defaults):
+          AUTUMN_PS_GC_BATCH_RECORDS  ([1, 4096], default 256)
+          AUTUMN_PS_GC_BATCH_BYTES    ([64 KiB, 256 MiB], default 4 MiB)
+          AUTUMN_PS_GC_RATE_BYTES_PER_SEC (default 64 MiB/s, 0 = unlimited)
 
 Verification:
-  - cargo build --workspace --release: clean (only pre-existing warnings).
-  - cargo test -p autumn-stream --lib --release: 48/48 pass.
-  - cargo test -p autumn-stream --tests --release --no-fail-fast: 13 suites pass,
-    1 timing-sensitive `cq_flushes_fast_ops_while_slow_op_runs` flake fails
-    (verified pre-existing — fails identically with `git stash` of my changes;
-    not caused by F140).
-  - Live cluster verification: `cluster.sh reset 4` → `wbench 60s × 8 KB
-    16-thread` (104 MB/s, EC conversion of 3 GB extent 10 fired in background)
-    → `wbench 30s × 512 B 32-thread` → `compact 15` → `split 15` → `wbench 30s
-    × 16-thread` (this is the EXACT scenario that produced
-    `MetaBlock CRC mismatch on extent 17` pre-F140) → `stop-ps + start-ps`.
-    Result: BOTH partitions (15 and 21) reopened cleanly with `tables=2,
-    sst_readers=2, has_overlap=0`. Zero `invalid meta_len`, zero
-    `MetaBlock CRC mismatch`, zero `partition thread failed` in ps.log.
-    `df RPC failed; marked node disks offline` warnings still appear during
-    EC conversion (CPU still loaded on a 10-core machine), but they
-    auto-recover within one sweep instead of staying offline through the
-    workload — the runtime is no longer blocked by 700 MB of memcpy.
+  - cargo build -p autumn-partition-server: clean.
+  - cargo build --workspace --release: clean.
+  - cargo test -p autumn-partition-server --lib gc_streaming_tests: 4/4 pass
+    (the F106 record-boundary carry contract is unchanged).
+  - cargo test -p autumn-partition-server --lib (whole suite, default
+    parallelism): 103 passed / 2 failed BEFORE and AFTER the patch.
+    The 2 failing tests (`f099i_tests::f099i_d1_fast_path_no_fu_allocation`
+    and `f099i_tests::f099i_fast_path_inactive_under_batch`) are a
+    pre-existing parallel-test race on the process-wide
+    `PS_FAST_PATH_HITS` counter — both pass when run serially with
+    `--test-threads=1` on both branches. Confirmed via `git stash` toggle.
+  - Live cluster verification: NOT executed in this session — the user
+    did not authorise `cluster.sh reset 4` here. Repro plan documented:
+      • cluster.sh reset 4
+      • wbench long enough to fill log_stream with VPs (≥ 1 GiB)
+      • trigger GC via `autumn-client gc <PARTID>` or wait for auto-GC
+      • observe ps.log: per-batch `stream append summary` should show
+        `ops≈256` (not 1), `retries=0`, no `append timeout after 5s`,
+        and foreground put traffic should stay flat through the GC run.
 
 Files modified:
-  - crates/stream/src/extent_node.rs (5 edits: file_pwrite_chunked signature +
-    body; one fast-path caller now passing Bytes::from(payload); one
-    fast-path caller now passing write_payload directly; one re-avali path
-    converting via Bytes::from; write_shard_local signature; handle_convert_to_ec
-    spawn_blocking closure + per-target loop + coordinator call;
-    handle_write_shard pass-by-value).
-  - feature_list.md: F140 entry added (passes:false).
-  - claude-progress.txt: this file.
+  - crates/partition-server/src/background.rs (run_gc + process_gc_chunk
+    rewrite; new GcWriteBatch / GcRateLimiter / flush_gc_batch /
+    gc_yield_now helpers; new env knobs).
+  - feature_list.md (F141 entry, Last updated → 2026-05-05).
+  - claude-progress.txt (this file).
 
-Out of scope (deferred under F140 with explicit Trigger clause):
-  - The structural split-vs-compact race: even with EC CPU off the event loop,
-    `handle_split_part` still calls `multi_modify_split` without first
-    draining in-flight `RowAppendReq` from P-bulk's `flush_worker_loop` FU
-    pipeline. If a compaction's row_stream append is in flight when split
-    fires, the seal can land at a commit point earlier than the in-flight
-    write's lease, and divergent on-disk state can result on whichever
-    replicas haven't received the manager's eversion-bump push by then. The
-    proposed fix (extend `flush_memtable_locked` to drain RowAppendReq, or
-    take the `compact_gate` permit during split) is more invasive and stays
-    deferred. Reproduction now requires a more aggressive stress than the
-    one this session ran clean.
+Out of scope (kept simple per project style):
+  - `read_bytes_from_extent` for the GC source extent still issues one
+    network round-trip per 64 MiB chunk; pipelining the read window in
+    front of the rewrite batch is a separate optimisation, not motivated
+    by this incident.
+  - `MAX_GC_ONCE = 3` extents per tick unchanged (the storm root was
+    per-record, not per-extent).
+  - autumn-partition-server CLAUDE.md "GC" section is still accurate at
+    the high level (single-fragment VP rewrite path, punch_holes after
+    full carry); a tighter F141 callout can be added in a future doc
+    sweep if needed.

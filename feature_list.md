@@ -1,6 +1,6 @@
 # autumn go→rust feature list
 
-**Last updated:** 2026-05-04
+**Last updated:** 2026-05-05
 
 **Rules:**
 - `passes` and `notes` are the only mutable fields after a feature is created.
@@ -399,6 +399,22 @@
 - **Trigger for the deeper fix (still `passes:false`):** the underlying race — split sealing the tail while a P-bulk RowAppendReq is in flight — is only mitigated, not closed, by reducing CPU contention. Open and prioritise the structural fix if `MetaBlock CRC mismatch` recurs in stress with the EC-CPU patch in place. Likely shape: extend `flush_memtable_locked` (or add a `drain_p_bulk_inflight()` barrier) so `handle_split_part` awaits all queued/in-flight `RowAppendReq` on P-bulk's `flush_worker_loop` before calling `multi_modify_split`. Alternatively, take the `compact_gate` permit during split so no new compactions can dispatch a `RowAppendReq` while split is sealing.
 - **Evidence:** `crates/stream/src/extent_node.rs::handle_convert_to_ec` (L3193 + L3210 + L3241), `write_shard_local` (L2106), `file_pwrite_chunked` (L481); `crates/partition-server/src/rpc_handlers.rs::handle_split_part` step-5 `flush_memtable_locked` (L341) doesn't cover RowAppendReq; F117 + F121 + F135 history; `/tmp/autumn-rs/d{1..4}/19/extent-17.dat` size divergence captured 2026-05-04.
 - **passes:** false (memcpy mitigation in flight; structural split-vs-compact serialisation deferred)
+
+### F141 · GC log_stream rewrite storm — batch + must_sync=false + yield + rate-limit
+
+- **Target:** Reproduced 2026-05-05: after `cluster.sh reset 4` + a write workload that filled log_stream with VPs, GC kicking in (`GC: starting, extents=[16, 17]`) instantly drove `stream append summary ops` from idle (1 ops/s, 752 ops/s) to a sustained 6 000–7 000 ops/s storm on stream_id=18 for ~10 s, then the extent-nodes started returning `append timeout after 5s` on replicas 0 and 1, foreground put traffic stalled, and a shutdown-time append measured `total_ms=14587, fanout=3377` — extent-node was saturated, foreground workload was starved. Root cause: `process_gc_chunk` re-appended every still-live VP record one-at-a-time via `part_sc.append(log_stream_id, &log_entry, /*must_sync=*/true)`. Per-record fsync × 3-replica fanout × N records / second swamped the extent-node fanout, the StreamClient's per-stream worker, and the log_stream's tail extent.
+- **Mechanism:** sealed log_stream extents reach hundreds of MiB to a few GiB before they qualify for GC (40 % discard threshold). At 4 KiB-typical VP records that's 64 k–256 k records to rewrite, each as one independent `append` call, each fsync-ed, each fanned out to 3 replicas. The StreamClient's per-stream worker mpsc serialises GC's appends with foreground put `append_batch` calls, so foreground latency lifts proportionally; on the extent-node side the WAL fsync rate ceiling becomes the system rate.
+- **Fix (4-pronged, F141 lands all four together — single-knob fixes don't compose):**
+  1. **Batch GC appends**: `process_gc_chunk` now stages records into a `GcWriteBatch` (segments + per-record metadata) and flushes via `append_segments(log_stream_id, segments, must_sync)`. Defaults: ≤ 256 records *or* ≤ 4 MiB per batch, whichever hits first. Env tunables: `AUTUMN_PS_GC_BATCH_RECORDS` ([1, 4096], default 256) / `AUTUMN_PS_GC_BATCH_BYTES` ([64 KiB, 256 MiB], default 4 MiB). One `append_segments` replaces N `append` calls — at N=256 this is a 256× drop in StreamClient worker mpsc traffic and a 256× drop in extent-node `handle_append_batch` traversals.
+  2. **`must_sync=false` for intermediate batches**: only the *final* `flush_gc_batch` of `run_gc` runs with `must_sync=true`, and that single fsync — by POSIX semantics — flushes every prior must_sync=false byte on the same fd. This collapses 6 000+ fsync/s into 1 fsync per GC'd extent. `punch_holes` only runs after the final must_sync=true commit, so durability before the source extent is reaped is preserved.
+  3. **Cooperative yield**: `gc_yield_now()` (one-shot Pending+wake) at the end of every batch flush forces the compio scheduler to poll `merged_partition_loop` / ps-conn before GC's next batch, even when the rate limiter has no debt. Otherwise back-to-back batches under a 64 MiB/s limit can keep GC's task running for the full sleep window.
+  4. **Throughput rate limit**: `GcRateLimiter` (1-second sliding window) caps GC's `log_stream` rewrite at 64 MiB/s by default. Env: `AUTUMN_PS_GC_RATE_BYTES_PER_SEC` (0 = unlimited). Bounds the worst case where GC runs against a full extent of all-live VPs without producing meaningful free space — the prior unthrottled loop generated more `log_stream` traffic than a typical workload.
+- **Files:** `crates/partition-server/src/background.rs` (`run_gc` + `process_gc_chunk` rewrite, new helpers `GcWriteBatch` / `GcRateLimiter` / `flush_gc_batch` / `gc_yield_now`).
+- **Verification:** `cargo build --workspace --release` clean. `cargo test -p autumn-partition-server --lib gc_streaming_tests` 4/4 pass (the carry-forward decode contract is unchanged). Whole-suite `cargo test -p autumn-partition-server --lib` reports 103 passed / 2 failed identically before and after the patch (the two `f099i_tests` failures are a pre-existing parallel-test race on the process-wide `PS_FAST_PATH_HITS` counter — passes serially with `--test-threads=1` on both branches). Cluster smoke run not executed in this session (the user did not authorise `cluster.sh reset` here); the original-symptom repro plan is documented for follow-up.
+- **Out of scope:**
+  - `read_bytes_from_extent` for the GC source extent still issues one network round-trip per 64 MiB chunk; pipelining the read window in front of the rewrite batch is a separate optimisation, not motivated by this incident.
+  - `MAX_GC_ONCE = 3` extents per GC tick is unchanged — the storm root was per-record, not per-extent.
+- **passes:** true (build clean, gc_streaming_tests pass, no new regressions vs main; live cluster verification deferred to next session per user policy on destructive cluster commands).
 
 ---
 

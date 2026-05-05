@@ -1041,6 +1041,206 @@ fn gc_read_chunk_bytes() -> u32 {
         .unwrap_or(64 * 1024 * 1024)
 }
 
+/// F141: max records per GC append batch. Defaults to 256 to match
+/// `MAX_WRITE_BATCH` on the foreground put path.
+fn gc_batch_records() -> usize {
+    std::env::var("AUTUMN_PS_GC_BATCH_RECORDS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1 && n <= 4096)
+        .unwrap_or(256)
+}
+
+/// F141: max bytes per GC append batch. Defaults to 4 MiB so a single
+/// `append_segments` payload is bounded regardless of how large the
+/// individual VP values are. Hit the records cap first on small VPs;
+/// hit the bytes cap first on large VPs.
+fn gc_batch_bytes() -> usize {
+    std::env::var("AUTUMN_PS_GC_BATCH_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 64 * 1024 && n <= 256 * 1024 * 1024)
+        .unwrap_or(4 * 1024 * 1024)
+}
+
+/// F141: GC log_stream rewrite throttle in bytes/sec. 0 = unlimited.
+/// Default 64 MiB/s — bounded headroom relative to typical foreground
+/// put traffic so GC doesn't starve client writes on the shared
+/// log_stream worker / extent-node fanout.
+fn gc_rate_bytes_per_sec() -> u64 {
+    std::env::var("AUTUMN_PS_GC_RATE_BYTES_PER_SEC")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(64 * 1024 * 1024)
+}
+
+/// Per-record metadata kept alongside the encoded segments for memtable
+/// post-processing once `append_segments` returns the batch's offset.
+struct GcRecord {
+    user_key: Vec<u8>,
+    internal_key: Vec<u8>,
+    value_len: u32,
+    expires_at: u64,
+    /// Total bytes the record occupies in log_stream: 17 + key_len + value_len.
+    record_size: u32,
+}
+
+/// F141: accumulates a batch of GC rewrites. Records are encoded into
+/// `segments` (alternating header+key / value Bytes per record). The
+/// per-record metadata in `pending` is consumed when the batch flushes
+/// into the memtable, walking the tail offset returned by
+/// `append_segments`.
+struct GcWriteBatch {
+    segments: Vec<Bytes>,
+    pending: Vec<GcRecord>,
+    bytes: u64,
+    record_cap: usize,
+    byte_cap: u64,
+}
+
+impl GcWriteBatch {
+    fn new() -> Self {
+        Self {
+            segments: Vec::new(),
+            pending: Vec::new(),
+            bytes: 0,
+            record_cap: gc_batch_records(),
+            byte_cap: gc_batch_bytes() as u64,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn is_full(&self) -> bool {
+        self.pending.len() >= self.record_cap || self.bytes >= self.byte_cap
+    }
+}
+
+/// F141: simple wall-clock rate limiter. After each batch flush we add
+/// the batch's bytes to a 1-second sliding window; if cumulative bytes
+/// exceed what the budget allows for the elapsed time, sleep enough to
+/// catch up. Window resets every second to bound drift.
+struct GcRateLimiter {
+    bytes_per_sec: u64,
+    window_start: Instant,
+    bytes_in_window: u64,
+}
+
+impl GcRateLimiter {
+    fn new() -> Self {
+        Self {
+            bytes_per_sec: gc_rate_bytes_per_sec(),
+            window_start: Instant::now(),
+            bytes_in_window: 0,
+        }
+    }
+
+    fn account(&mut self, bytes: u64) -> Option<Duration> {
+        if self.bytes_per_sec == 0 {
+            return None;
+        }
+        self.bytes_in_window = self.bytes_in_window.saturating_add(bytes);
+        let elapsed = self.window_start.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            // Reset window — we earned a full second's worth of budget.
+            self.window_start = Instant::now();
+            self.bytes_in_window = 0;
+            return None;
+        }
+        let target_secs = self.bytes_in_window as f64 / self.bytes_per_sec as f64;
+        let target = Duration::from_secs_f64(target_secs);
+        if target > elapsed {
+            Some(target - elapsed)
+        } else {
+            None
+        }
+    }
+}
+
+/// F141: cooperative single-step yield. Lets other tasks on this
+/// compio runtime (merged_partition_loop, ps-conn) make forward
+/// progress between back-to-back GC batches even when we'd otherwise
+/// stay runnable through the rate-limiter.
+async fn gc_yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
+/// Flush a non-empty `GcWriteBatch`: send all queued records as ONE
+/// `append_segments`, then walk the returned tail offset to insert the
+/// new VPs into the memtable in a single `insert_batch`. The flush is
+/// the only place GC awaits the network, so it's also the place where
+/// the rate limiter and yield run.
+async fn flush_gc_batch(
+    part: &Rc<RefCell<PartitionData>>,
+    log_stream_id: u64,
+    part_sc: &Rc<StreamClient>,
+    batch: &mut GcWriteBatch,
+    must_sync: bool,
+    rate_limiter: &mut GcRateLimiter,
+    moved: &mut usize,
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let segments = std::mem::take(&mut batch.segments);
+    let pending = std::mem::take(&mut batch.pending);
+    let batch_bytes = std::mem::replace(&mut batch.bytes, 0);
+    let n = pending.len();
+
+    let result = part_sc
+        .append_segments(log_stream_id, segments, must_sync)
+        .await?;
+
+    let mut cur_offset = result.offset;
+    let mut insert_items: Vec<(Vec<u8>, MemEntry, u64)> = Vec::with_capacity(n);
+    for r in pending {
+        let new_vp = ValuePointer {
+            extent_id: result.extent_id,
+            offset: cur_offset + 17 + r.internal_key.len() as u32,
+            len: r.value_len,
+        };
+        let mem_entry = MemEntry {
+            op: 1 | OP_VALUE_POINTER,
+            value: new_vp.encode().to_vec(),
+            expires_at: r.expires_at,
+        };
+        let write_size = (r.user_key.len() + r.value_len as usize + 32) as u64;
+        insert_items.push((r.internal_key, mem_entry, write_size));
+        cur_offset = cur_offset.saturating_add(r.record_size);
+    }
+
+    {
+        let mut p = part.borrow_mut();
+        p.vp_extent_id = result.extent_id;
+        p.vp_offset = result.end;
+        p.active.insert_batch(insert_items);
+    }
+    *moved += n;
+
+    // Cooperative yield: even if the rate limiter has no budget to
+    // burn, give merged_partition_loop / ps-conn a turn before the
+    // next batch.
+    gc_yield_now().await;
+
+    if let Some(sleep_dur) = rate_limiter.account(batch_bytes) {
+        compio::time::sleep(sleep_dur).await;
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn run_gc(
     part: &Rc<RefCell<PartitionData>>,
     extent_id: u64,
@@ -1059,10 +1259,21 @@ pub(crate) async fn run_gc(
     // workload, and (b) tripped macOS pread INT_MAX (also addressed by
     // F105 read_bytes_from_extent chunking — F106 keeps memory bounded
     // even when F105 is forced to materialise the full read).
+    //
+    // F141 batching: rewrites accumulate into `batch` and flush via
+    // `append_segments` (must_sync=false) when the batch hits its
+    // record/byte caps. The final flush at end-of-extent uses
+    // must_sync=true so durability is established before `punch_holes`
+    // removes the source extent. Pre-F141 each VP record was a separate
+    // `part_sc.append(..., must_sync=true)` — a 6-7 k ops/s, 6-7 k
+    // fsync/s storm that saturated the extent-node fanout and starved
+    // foreground put traffic for tens of seconds.
     let chunk_bytes = gc_read_chunk_bytes();
     let mut moved = 0usize;
     let mut cur: u32 = 0;
     let mut carry: Vec<u8> = Vec::new();
+    let mut batch = GcWriteBatch::new();
+    let mut rate_limiter = GcRateLimiter::new();
 
     while cur < sealed_length {
         let want = (sealed_length - cur).min(chunk_bytes);
@@ -1090,6 +1301,8 @@ pub(crate) async fn run_gc(
             &part_sc,
             &buf,
             &mut moved,
+            &mut batch,
+            &mut rate_limiter,
         )
         .await?;
         if consumed < buf.len() {
@@ -1107,15 +1320,32 @@ pub(crate) async fn run_gc(
         ));
     }
 
+    // Final flush: must_sync=true so that punch_holes only fires after
+    // the moved values are durably committed on a quorum of replicas.
+    // POSIX fsync semantics flush all pending bytes for the fd, so this
+    // single sync covers every prior must_sync=false batch on the same
+    // log_stream tail extent.
+    flush_gc_batch(
+        part,
+        log_stream_id,
+        &part_sc,
+        &mut batch,
+        true,
+        &mut rate_limiter,
+        &mut moved,
+    )
+    .await?;
+
     part_sc.punch_holes(log_stream_id, vec![extent_id]).await?;
     tracing::info!("GC: punched extent {extent_id}, moved {moved} entries");
     Ok(())
 }
 
-/// Process every complete record in `buf`. Returns how many bytes were
-/// consumed (always at a record boundary). The remaining `buf.len() -
-/// consumed` bytes are an incomplete record that must be carried into
-/// the next chunk.
+/// Process every complete record in `buf`, staging VP rewrites into
+/// `batch` and flushing mid-chunk when the batch fills. Returns how
+/// many bytes were consumed (always at a record boundary). The
+/// remaining `buf.len() - consumed` bytes are an incomplete record
+/// that must be carried into the next chunk.
 async fn process_gc_chunk(
     part: &Rc<RefCell<PartitionData>>,
     log_stream_id: u64,
@@ -1124,6 +1354,8 @@ async fn process_gc_chunk(
     part_sc: &Rc<StreamClient>,
     buf: &[u8],
     moved: &mut usize,
+    batch: &mut GcWriteBatch,
+    rate_limiter: &mut GcRateLimiter,
 ) -> Result<usize> {
     let mut cursor = 0usize;
     while cursor + 17 <= buf.len() {
@@ -1189,39 +1421,61 @@ async fn process_gc_chunk(
             continue;
         }
 
-        // Stage the new log record under borrow_mut, then drop the
-        // RefMut BEFORE awaiting the network append. F106 fix: pre-F106
-        // the original run_gc held borrow_mut across `part_sc.append`,
-        // which would panic if any other task on this single-threaded
-        // runtime tried to borrow `part` during the in-flight RPC.
-        let (seq, internal_key, log_entry) = {
+        // Stage the WAL record into the batch under a brief borrow_mut
+        // (seq assignment + internal_key encode). No await happens
+        // inside the borrow.
+        let internal_key = {
             let mut p = part.borrow_mut();
             p.seq_number += 1;
             let seq = p.seq_number;
-            let internal_key = key_with_ts(&user_key, seq);
-            let log_entry = encode_record(1, &internal_key, value, expires_at);
-            (seq, internal_key, log_entry)
+            key_with_ts(&user_key, seq)
         };
-        let _ = seq; // referenced for clarity in the trace; silence unused
-        let result = part_sc.append(log_stream_id, &log_entry, true).await?;
-        {
-            let mut p = part.borrow_mut();
-            let new_vp = ValuePointer {
-                extent_id: result.extent_id,
-                offset: result.offset + 17 + internal_key.len() as u32,
-                len: vp.len,
-            };
-            p.vp_extent_id = result.extent_id;
-            p.vp_offset = result.end;
-            let mem_entry = MemEntry {
-                op: 1 | OP_VALUE_POINTER,
-                value: new_vp.encode().to_vec(),
-                expires_at,
-            };
-            let write_size = (user_key.len() + value.len() + 32) as u64;
-            p.active.insert(internal_key, mem_entry, write_size);
+
+        let header_size = 17 + internal_key.len();
+        let mut hdr_buf = BytesMut::with_capacity(header_size);
+        // Match the original GC behaviour: write op=1 (no VP flag in
+        // the WAL header). Recovery's `value.len() > VALUE_THROTTLE`
+        // fallback at lib.rs:2891 still detects this as a VP entry on
+        // replay, since GC only ever rewrites entries that were tagged
+        // VP in the source extent (and therefore have value bytes
+        // larger than VALUE_THROTTLE).
+        hdr_buf.put_u8(1u8);
+        hdr_buf.put_u32_le(internal_key.len() as u32);
+        hdr_buf.put_u32_le(val_len as u32);
+        hdr_buf.put_u64_le(expires_at);
+        hdr_buf.extend_from_slice(&internal_key);
+
+        let header_bytes = hdr_buf.freeze();
+        let value_bytes = Bytes::copy_from_slice(value);
+        let record_size = (header_size + val_len) as u32;
+
+        batch.segments.push(header_bytes);
+        if !value_bytes.is_empty() {
+            batch.segments.push(value_bytes);
         }
-        *moved += 1;
+        batch.bytes = batch.bytes.saturating_add(record_size as u64);
+        batch.pending.push(GcRecord {
+            user_key,
+            internal_key,
+            value_len: val_len as u32,
+            expires_at,
+            record_size,
+        });
+
+        let _ = vp; // length already captured via val_len; vp.len would also work.
+
+        if batch.is_full() {
+            flush_gc_batch(
+                part,
+                log_stream_id,
+                part_sc,
+                batch,
+                false,
+                rate_limiter,
+                moved,
+            )
+            .await?;
+        }
     }
     Ok(cursor)
 }
