@@ -250,7 +250,7 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
    and propagates via the dedicated recovery RPCs.
 
 8. **F121 `select_nodes` prefers nodes with at least one online
-   disk**, falling back to the full sorted set when too few healthy
+   disk**, falling back to the full set when too few healthy
    candidates remain. The fall-back exists because a cold leader
    that hasn't yet run its first `df` sweep would otherwise refuse
    to allocate. The per-RPC fall-back inside
@@ -261,3 +261,20 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
    (`stop-node 1` → new extent on `[3, 5, 7]`) is observable on the
    very first allocation attempt instead of only after a fall-back
    hop.
+
+9. **F144 `select_nodes` shuffles the candidate set instead of
+   sorting by `node_id`.** Pre-F144 a 4-node cluster `{1,3,5,7}`
+   placed every 3-replica extent on `[1, 3, 5]` because the function
+   sorted ascending and returned `take(count)`. The same bias also
+   lived in two adjacent paths: `recovery.rs`'s EC-conversion
+   extra-parity selection (`HashMap.values().take(extra)` —
+   deterministic per process), and `rpc_handlers.rs`'s
+   `handle_stream_alloc_extent` fall-back iterator (sorted by
+   `node_id` before walking). All three sites now `shuffle` then
+   `take`. The "online disk" filter from F121 is preserved, so
+   degraded clusters still avoid known-dead peers in the common
+   case. Capacity-aware selection (least-allocated) is intentionally
+   deferred — it requires a per-node extent counter persisted in
+   etcd; the random pick is the minimum change that fixes the
+   observed concentration on `{1,3,5}` and is sufficient for
+   uniform load over the long run.

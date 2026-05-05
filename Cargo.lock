@@ -225,6 +225,7 @@ dependencies = [
  "bytes",
  "compio",
  "crc32c",
+ "rand 0.8.5",
  "rkyv",
  "tempfile",
  "tracing",

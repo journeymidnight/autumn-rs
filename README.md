@@ -182,9 +182,32 @@ Operator notes:
   following sweep.
 - `select_nodes` prefers nodes with at least one online disk; when too
   few healthy candidates appear (e.g. a cold leader before the first
-  df sweep), it falls back to the full sorted set and the per-RPC
-  fall-back inside `handle_stream_alloc_extent` walks alternates on
-  failure.
+  df sweep), it falls back to the full set and the per-RPC fall-back
+  inside `handle_stream_alloc_extent` walks alternates on failure.
+  Since F144 both the primary pick and the fall-back walk are
+  shuffled — see below.
+
+### F144 — uniform allocator across all extent-nodes (2026-05-05)
+
+Pre-F144 the manager picked the lowest-`node_id` `count` nodes for every
+new extent. On a 4-node cluster (`node_ids 1, 3, 5, 7`) every extent
+landed on `[1, 3, 5]`; node 7 only ever appeared when one of the first
+three failed the F121 online-disk check. Post-F144 the pick is a uniform
+random `count`-subset, so all four nodes share replica + EC-parity load.
+
+```bash
+bash cluster.sh reset 4
+AC="./target/debug/autumn-client --manager 127.0.0.1:9001"
+for i in $(seq 1 20); do echo data$i | $AC put key$i /dev/stdin; done
+$AC info | grep -E 'extent .*replicas=|extent .*data='
+# Expected: across ~20 extents node 7 should appear in roughly 75% of
+# the replica/data sets (same as nodes 1, 3, 5). Pre-F144 node 7 would
+# show up in 0 of them.
+```
+
+The same shuffle covers EC-parity allocation (parity slots no longer
+land exclusively on whichever node `HashMap` iteration visits last) and
+the per-RPC fall-back path inside `handle_stream_alloc_extent`.
 
 After `start`, the script prints ready-to-use CLI examples:
 

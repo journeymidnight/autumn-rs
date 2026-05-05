@@ -12,6 +12,7 @@ autumn-rpc = { path = "../rpc" }
 autumn-transport = { path = "../transport" }
 bytes.workspace = true
 compio = { version = "0.18", features = ["net", "time", "macros"] }
+rand = "0.8"
 rkyv = { version = "0.8.15", features = ["alloc"] }
 tracing.workspace = true
 uuid.workspace = true

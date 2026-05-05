@@ -590,15 +590,24 @@ impl AutumnManager {
 
                 if total_shards > target_nodes.len() {
                     let extra_needed = total_shards - target_nodes.len();
+                    // F144: shuffle candidates so EC parity slots don't
+                    // always land on the same low-`node_id` peers.
+                    // Pre-F144 used HashMap iteration order + take(N),
+                    // which is deterministic per program run and biased
+                    // toward whichever node_id happened to be visited
+                    // first.
                     let extra_candidates: Vec<_> = {
+                        use rand::seq::SliceRandom;
                         let s = self.store.inner.borrow();
                         let existing: HashSet<u64> = target_nodes.iter().copied().collect();
-                        s.nodes
+                        let mut pool: Vec<_> = s
+                            .nodes
                             .values()
                             .filter(|n| !existing.contains(&n.node_id))
-                            .take(extra_needed)
                             .cloned()
-                            .collect()
+                            .collect();
+                        pool.shuffle(&mut rand::thread_rng());
+                        pool.into_iter().take(extra_needed).collect()
                     };
                     if extra_candidates.len() < extra_needed {
                         continue;

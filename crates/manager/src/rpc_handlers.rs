@@ -847,7 +847,13 @@ impl AutumnManager {
             .filter(|n| !selected_ids.contains(&n.node_id))
             .cloned()
             .collect();
-        fallback_nodes.sort_by_key(|n| n.node_id);
+        // F144: walk fallbacks in random order — ID-sorted order
+        // re-introduces the same low-ID bias that `select_nodes` was
+        // changed to avoid.
+        {
+            use rand::seq::SliceRandom;
+            fallback_nodes.shuffle(&mut rand::thread_rng());
+        }
         let mut fallback_iter = fallback_nodes.into_iter();
 
         for n in &selected {

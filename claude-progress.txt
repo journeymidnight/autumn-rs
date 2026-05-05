@@ -1,140 +1,120 @@
 Date: 2026-05-05
 TaskStatus: completed
-Task scope: F142 — `must_sync=false` foreground writes break WAL→SST
-            durability ordering. User repro: `$AC put XXX.mp4` (with
-            `--nosync` per the workload's default) succeeded yesterday;
-            after `restart-ps` today, `$AC head` returns the size but
-            `$AC get` fails with `ec_read_full_and_slice: offset
-            459976209 past decoded payload len 308491269`. Forensic
-            evidence shows the bad VP was flushed to a row_stream SST
-            yesterday at 23:20 — well before today's F141 work — so
-            F141 is not implicated. User chose option A from the
-            diagnosis ("pre-flush WAL fsync barrier").
+Task scope: F144 — Allocator node-selection bias. User observed that
+            on a 4-extent-node cluster (node_ids 1, 3, 5, 7) every
+            new stream / extent landed on [1, 3, 5]; out of 14 live
+            extents only 2 ever included node 7. All replica reads,
+            writes, and EC parity work concentrated on three of the
+            four nodes. User confirmed root cause is allocator bias
+            (not read load balancing) and chose option 2 from the
+            design discussion: random shuffle replacing the existing
+            "sort by node_id then take(count)" selection.
 
-Diagnosis (full chain, captured in feature_list.md F142):
-  • `--nosync` foreground put → `start_write_batch` calls
-    `append_segments(log_stream, ..., must_sync=false)`
-  • Extent-node `handle_append` Direct path writes to page cache and
-    SKIPS `file.sync_all()`. `extent.len` advances in memory; the
-    StreamClient sees `result.end` advance and the partition memtable
-    stores a `ValuePointer` referencing page-cache-only bytes.
-  • Memtable rotation → P-bulk flushes the SST via
-    `row_stream.append(must_sync=true)`; partition writes
-    `meta_stream` checkpoint with `must_sync=true`. SST + checkpoint
-    are durable. Their VP targets are NOT durable.
-  • Page-cache loss event (Mac reboot, OOM eviction, or even some
-    extent-node restart paths) drops the unsynced bytes. SST
-    persists; VP now points past the actual durable extent length.
-  • Manager seals the extent at the post-eviction commit_length,
-    EC-converts the shorter payload, and reads of the bad VP surface
-    the "offset N past decoded payload len M" error.
+Diagnosis (full chain, captured in feature_list.md F144):
+  • `AutumnManager::select_nodes` (crates/manager/src/lib.rs:597)
+    collected nodes into a Vec, sorted ascending by `node_id`, and
+    returned `take(count)`. With a sorted candidate list the lowest
+    `count` IDs always win; node 7 was only ever selected when one
+    of {1,3,5} was filtered out by the F121 online-disk check.
+  • Two adjacent paths reproduced the same bug shape:
+    - `recovery.rs:591-622` (EC-conversion extra-parity selection):
+      walked `HashMap.values().take(extra_needed)`. HashMap order is
+      formally undefined but deterministic per process, biased
+      toward whichever node_id happened to be visited first.
+    - `rpc_handlers.rs:845-851` (`handle_stream_alloc_extent`
+      fall-back): sorted leftover candidates by `node_id` before
+      walking, so a failed primary always retried on the
+      next-lowest ID.
+  • Compounding effect: an extent allocated as [1,3,5] then needing
+    EC conversion to 3+1 picked node 7 as the only remaining
+    candidate, so node 7 became the *parity* node almost
+    exclusively — additionally lopsided since parity work is
+    asymmetric (less reads, all encode CPU).
 
-Fix (F142 implements option A — single fsync barrier per imm):
+Fix (F144 implements option 2 — random shuffle + online filter):
 
-  - crates/stream/src/extent_rpc.rs: new wire codec
-      MSG_SYNC_EXTENT = 13
-      SyncExtentReq  { extent_id: u64, revision: i64 }    (16 bytes)
-      SyncExtentResp { code: u8 }                          (1 byte)
+  - crates/manager/Cargo.toml: new `rand = "0.8"` dependency
+    (matches the version already used by autumn-server's CLI).
 
-  - crates/stream/src/extent_node.rs:
-      • dispatch arm for MSG_SYNC_EXTENT in `dispatch()`
-      • `handle_sync_extent` — shard-routing check (matches
-        commit_length), revision fencing (returns
-        CODE_LOCKED_BY_OTHER on stale revision; bumps + persists the
-        meta sidecar on a higher revision, matching the existing
-        commit_length contract), then `file_ref(&entry.file)
-        .sync_all().await`. No payload, no extent.len change.
-        Idempotent — repeat calls just trigger another fsync, which
-        is a no-op if the file is clean.
+  - crates/manager/src/lib.rs::select_nodes:
+      Replaces both `sort_by_key` calls with
+      `pool.shuffle(&mut rand::thread_rng())` then
+      `into_iter().take(count)`. The F121 "at least one online
+      disk" filter is unchanged; the degraded fallback (no online
+      disks observed) is also shuffled instead of returning the
+      sorted full set.
 
-  - crates/stream/src/client.rs:
-      • New imports: SyncExtentReq, SyncExtentResp, MSG_SYNC_EXTENT.
-      • New public method:
-          pub async fn sync_stream_tail(&self, stream_id: u64)
-              -> Result<()>
-        Loads the stream via get_stream_info, picks the tail
-        extent. If sealed (sealed_length > 0) returns Ok early —
-        sealed tails can't extend; their page cache state is
-        whatever the seal captured. Otherwise looks up replica
-        addrs (replicates + parity), fans out MSG_SYNC_EXTENT in
-        parallel via futures::future::join_all, and requires
-        replicates.len() (K) successful syncs to declare the
-        barrier complete. M parity-target failures are tolerated,
-        matching the post-EC fault model.
+  - crates/manager/src/recovery.rs::ec_conversion_dispatch_loop:
+      Replaces `HashMap.values().filter().take(extra_needed)` with
+      `let mut pool: Vec<_> = ... .filter().cloned().collect();
+       pool.shuffle(&mut rand::thread_rng());
+       pool.into_iter().take(extra_needed).collect()`.
+      Comment explicitly notes the F144 reason so future readers
+      don't "optimise" it back to a take-from-iterator.
 
-  - crates/partition-server/src/lib.rs::flush_one_imm:
-      Inserted the barrier BEFORE the FlushReq to P-bulk:
-        if let Err(e) = part_sc.sync_stream_tail(log_stream_id).await {
-            return Err(anyhow!("flush_one_imm: WAL barrier sync failed: {e}"));
-        }
-      Coverage matrix:
-        • normal flush (memtable rotation under load): yes
-        • flush_one_imm_local (P-bulk failed to spawn): yes (it's
-          dispatched AFTER the barrier inside flush_one_imm)
-        • flush_memtable_locked (split, drain): yes — calls
-          flush_one_imm in a loop
-        • background_flush_loop: yes — same dispatch
-        • shutdown drain: yes — calls flush_one_imm in the drain
-          loop
+  - crates/manager/src/rpc_handlers.rs::handle_stream_alloc_extent:
+      Replaces `fallback_nodes.sort_by_key(|n| n.node_id)` with
+      `fallback_nodes.shuffle(&mut rand::thread_rng())` so per-RPC
+      retries don't re-introduce the low-ID bias.
+
+  - crates/manager/src/lib.rs::tests:
+      Two new unit tests:
+        f144_select_nodes_distribution — runs select_nodes 1000
+          times against a 4-node cluster requesting count=3,
+          asserts each of the 4 nodes appears in [600, 900] of the
+          selections (theoretical mean = 750, std-dev ≈ 14, so
+          the bound passes with probability ≈ 1 even without a
+          fixed RNG seed).
+        f144_select_nodes_degraded_fallback_shuffles — exercises
+          the degraded-fallback path (empty disk map) and asserts
+          at least 3 distinct first-pick node_ids across 200
+          tries.
 
 Verification:
-  - cargo build -p autumn-stream: clean.
-  - cargo build -p autumn-partition-server: clean.
-  - cargo build --workspace --release: clean.
-  - cargo test -p autumn-stream --lib: 48/48 pass.
-  - cargo test -p autumn-partition-server --lib: 104 pass / 1 fail
-    identically before and after (pre-existing
-    f099i_d1_fast_path_no_fu_allocation parallel-test race on the
-    process-wide PS_FAST_PATH_HITS counter, passes serially with
-    --test-threads=1).
-  - Live cluster re-verification of the user's `head→get` repro
-    deferred per the established user policy on destructive
-    cluster commands. Repro plan:
+  - cargo build -p autumn-manager: clean (only pre-existing unused-
+    import + dead-code warnings, identical to pre-change state).
+  - cargo build --workspace: clean.
+  - cargo test -p autumn-manager --lib: 16/16 pass — includes the
+    14 pre-existing tests plus the 2 new F144 tests.
+  - Live cluster re-verification deferred per the established user
+    policy on destructive cluster commands. Repro plan:
       • cluster.sh reset 4
-      • $AC put big.mp4 --nosync
-      • cluster.sh restart-ps
-      • $AC get big.mp4 → expected: returns the file (no
-        offset-past-payload error).
+      • for i in $(seq 1 20); do echo data$i | $AC put k$i /dev/stdin; done
+      • $AC info | grep -E 'extent .*replicas=|extent .*data='
+      • Expected: across ~20 extents node 7 appears in roughly 75%
+        of replica/data sets (binomial mean 15/20 with σ≈1.9), and
+        EC parity slots are distributed roughly uniformly across
+        all 4 nodes instead of monotonically landing on node 7.
 
 Files modified:
-  - crates/stream/src/extent_rpc.rs
-  - crates/stream/src/extent_node.rs
-  - crates/stream/src/client.rs
-  - crates/partition-server/src/lib.rs
-  - feature_list.md (F142 entry, passes:true)
+  - crates/manager/Cargo.toml
+  - crates/manager/src/lib.rs
+  - crates/manager/src/recovery.rs
+  - crates/manager/src/rpc_handlers.rs
+  - crates/manager/CLAUDE.md (new note 9 documenting F144 rationale)
+  - feature_list.md (new F144 entry, passes:true)
+  - README.md (new manual-verification block + cross-link from the
+    F121 explanation)
   - claude-progress.txt (this file)
 
-Follow-up landed in same session (F143):
-
-  - F143 closes the "imm crossed an extent rotation" hole. New
-    `ExtentNode::apply_extent_meta_durable(&self, extent_id, &extent,
-    &ex)` async helper replaces the 8 sites that previously did
-    `apply_extent_meta` + `if sealed_changed { save_meta }`. On a
-    0→sealed_length transition it now also calls
-    `file_ref(&extent.file).sync_all().await`, so the on-disk
-    sealed prefix matches the manager's recorded `sealed_length`
-    before any subsequent EC encode / read can rely on it.
-    Pre-existing `handle_convert_to_ec` direct-stores of
-    sealed_length are unchanged — EC's own `write_shard_local`
-    fsyncs its shard outputs.
-
-  - F144 (VP scrub admin) — user explicitly declined. The few bad
-    VPs from yesterday's --nosync-then-page-cache-loss event are
-    user-deletable via `autumn-client del`; no tool needed.
-
-Existing-data recovery: the user's bad VP for the 100 MB MP4 (and
-the jpg, and any other VPs in extent 31 at offset >=
-sealed_length=308491269) is unrecoverable — those bytes never
-reached disk. F142 prevents new corruption on the open tail; F143
-extends the same guarantee to seal application; existing bad
-entries are user-deletable.
+Out of scope (deferred):
+  - Capacity-aware least-allocated selection. Requires a per-node
+    `extent_count` (or `used_bytes`) counter persisted in etcd,
+    incremented on alloc / decremented on F109 physical delete.
+    This is the natural follow-up but is a larger schema change;
+    F144 is the minimum-change bias fix.
+  - Read-side load balancing (always-replica[0] in failover order).
+    Once allocation spreads, the existing read path naturally
+    distributes traffic across {1,3,5,7} since different extents
+    now live on different replica sets. Read LB is a second-order
+    optimisation that should wait for an observed hot-extent
+    pattern; raised earlier in the same session and deferred.
 
 User context (preserved for future sessions):
-  - User confirmed: only `restart-ps`, never `kill -9`, never
-    `cluster.sh reset` mid-workload between yesterday's puts and
-    today's `get`.
-  - User noted occasional false-offline detection of extent-nodes by
-    the manager (df RPC timeouts under load). The F142 sync barrier
-    will surface as flush failures if a node is genuinely
-    unreachable, but is unaffected by the manager's `online` flag —
-    it does direct extent-node TCP RPCs.
+  - User's diagnosis from the live cluster: 12 of 14 extents on
+    {1,3,5}, only extents 30 and 38 ever included node 7. Confirmed
+    root cause is allocator, not read path.
+  - User chose option 2 (random + online filter) explicitly over
+    option 3 (least-allocated). The deferred-feature note in
+    feature_list.md F144 captures this so the follow-up doesn't
+    get lost.

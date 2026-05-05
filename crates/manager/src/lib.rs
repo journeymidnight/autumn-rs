@@ -594,20 +594,26 @@ impl AutumnManager {
     /// fall-back-to-fresh-node path in `handle_stream_alloc_extent`
     /// available even in degraded states (e.g. cold leader before the
     /// first `df` poll has run).
+    ///
+    /// F144: pick is **shuffled** (uniform random `count`-subset) instead
+    /// of "lowest `node_id` first". The pre-F144 deterministic order
+    /// concentrated load on the first `count` nodes by ID — e.g. a 4-node
+    /// cluster {1,3,5,7} with 3-replica streams placed every extent on
+    /// {1,3,5}, leaving node 7 idle until one of the first three failed.
     fn select_nodes(
         nodes: &HashMap<u64, MgrNodeInfo>,
         disks: &HashMap<u64, MgrDiskInfo>,
         count: usize,
     ) -> Result<Vec<MgrNodeInfo>, AppError> {
-        let mut all: Vec<_> = nodes.values().cloned().collect();
-        all.sort_by_key(|n| n.node_id);
+        use rand::seq::SliceRandom;
+        let all: Vec<MgrNodeInfo> = nodes.values().cloned().collect();
         if all.len() < count {
             return Err(AppError::Precondition(format!(
                 "not enough nodes: need {count}, got {}",
                 all.len()
             )));
         }
-        let mut healthy: Vec<MgrNodeInfo> = all
+        let healthy: Vec<MgrNodeInfo> = all
             .iter()
             .filter(|n| {
                 n.disks
@@ -616,16 +622,20 @@ impl AutumnManager {
             })
             .cloned()
             .collect();
+        let mut rng = rand::thread_rng();
         if healthy.len() >= count {
-            healthy.sort_by_key(|n| n.node_id);
-            return Ok(healthy.into_iter().take(count).collect());
+            let mut pool = healthy;
+            pool.shuffle(&mut rng);
+            return Ok(pool.into_iter().take(count).collect());
         }
         // Degraded fallback: not enough online disks observed; preserve
         // the pre-F121 behaviour of using the full node set so the
         // post-RPC fall-back path in `handle_stream_alloc_extent` can
         // still recover (it pings the candidate per-RPC and walks
         // alternates on failure).
-        Ok(all.into_iter().take(count).collect())
+        let mut pool = all;
+        pool.shuffle(&mut rng);
+        Ok(pool.into_iter().take(count).collect())
     }
 
     fn all_bits(size: usize) -> u32 {
@@ -1998,5 +2008,88 @@ mod tests {
             assert_eq!(ex_after.eversion, 4, "eversion must be bumped on apply");
             assert_eq!(ex_after.avali, 0xF, "slot 0 avali bit should be set");
         })
+    }
+
+    /// F144: with 4 nodes and count=3, every node must appear in a
+    /// non-trivial fraction of selections — pre-F144 the lowest-id 3
+    /// always won and node 7 never showed up.
+    #[test]
+    fn f144_select_nodes_distribution() {
+        let mut nodes: HashMap<u64, MgrNodeInfo> = HashMap::new();
+        let mut disks: HashMap<u64, MgrDiskInfo> = HashMap::new();
+        for (idx, &nid) in [1u64, 3, 5, 7].iter().enumerate() {
+            let did = 100 + idx as u64;
+            nodes.insert(
+                nid,
+                MgrNodeInfo {
+                    node_id: nid,
+                    address: format!("127.0.0.1:{}", 9000 + nid),
+                    disks: vec![did],
+                    shard_ports: vec![],
+                },
+            );
+            disks.insert(
+                did,
+                MgrDiskInfo {
+                    disk_id: did,
+                    online: true,
+                    uuid: format!("uuid-{nid}"),
+                },
+            );
+        }
+
+        const ITERS: usize = 1000;
+        let mut counts: HashMap<u64, usize> = HashMap::new();
+        for _ in 0..ITERS {
+            let picked = AutumnManager::select_nodes(&nodes, &disks, 3).unwrap();
+            assert_eq!(picked.len(), 3);
+            let mut ids: Vec<u64> = picked.iter().map(|n| n.node_id).collect();
+            ids.sort();
+            ids.dedup();
+            assert_eq!(ids.len(), 3, "selection must be 3 distinct nodes");
+            for id in ids {
+                *counts.entry(id).or_insert(0) += 1;
+            }
+        }
+        // Each of the 4 nodes should appear in ~750/1000 selections
+        // (3/4 = 75%). Allow a generous [60%, 90%] window so the test
+        // is statistically robust without a fixed RNG seed.
+        for &nid in &[1u64, 3, 5, 7] {
+            let c = *counts.get(&nid).unwrap_or(&0);
+            assert!(
+                c >= 600 && c <= 900,
+                "node {nid} appeared in {c}/{ITERS} selections; expected 600..=900"
+            );
+        }
+    }
+
+    /// Degraded fallback (no online disks) must also shuffle so that
+    /// repeated retries from a cold leader spread across the cluster
+    /// instead of always pinging the lowest-id node first.
+    #[test]
+    fn f144_select_nodes_degraded_fallback_shuffles() {
+        let mut nodes: HashMap<u64, MgrNodeInfo> = HashMap::new();
+        let disks: HashMap<u64, MgrDiskInfo> = HashMap::new(); // empty = nothing online
+        for &nid in &[1u64, 3, 5, 7] {
+            nodes.insert(
+                nid,
+                MgrNodeInfo {
+                    node_id: nid,
+                    address: format!("127.0.0.1:{}", 9000 + nid),
+                    disks: vec![100 + nid],
+                    shard_ports: vec![],
+                },
+            );
+        }
+
+        let mut first_node_seen: HashSet<u64> = HashSet::new();
+        for _ in 0..200 {
+            let picked = AutumnManager::select_nodes(&nodes, &disks, 1).unwrap();
+            first_node_seen.insert(picked[0].node_id);
+        }
+        assert!(
+            first_node_seen.len() >= 3,
+            "degraded fallback should pick at least 3 distinct nodes across 200 tries; got {first_node_seen:?}"
+        );
     }
 }

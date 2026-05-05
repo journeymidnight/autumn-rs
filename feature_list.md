@@ -442,6 +442,24 @@
 - **Performance:** seal application is rare (one fsync per extent rotation, manager-pushed seal, or split). The fsync cost is bounded by the dirty-page count for that extent at seal time, which is typically small. Even on a 1 GiB extent freshly receiving must_sync=false writes, the fsync is one bounded I/O on the background flush task — not on the foreground put hot path.
 - **passes:** true.
 
+### F144 · Allocator node-selection bias (random shuffle replaces sort+take)
+
+- **Trigger:** User observed that on a 4-node cluster (node_ids `1, 3, 5, 7`) every freshly created stream / extent landed on `[1, 3, 5]`. Out of 14 extents inspected on a live cluster, only 2 ever included node 7 — the rest were `[1, 3, 5]` for both the open replica set and the post-EC-conversion (3+1) layout. Concrete impact: 100% of write fan-out, 100% of foreground read traffic, and ~75% of EC parity work concentrated on three of the four extent-nodes.
+- **Root cause:** `AutumnManager::select_nodes` (`crates/manager/src/lib.rs:597`) collected every registered node into a Vec, sorted ascending by `node_id`, and returned `take(count)`. With a sorted candidate list, the lowest `count` IDs always win — node 7 is only ever picked when one of `{1,3,5}` is filtered out by the F121 online-disk check. Two adjacent paths reproduced the same bug shape: (a) `recovery.rs:591-622`'s EC-conversion extra-parity allocation walked `HashMap.values().take(extra_needed)`, which is deterministic-per-process and biased toward whichever node_id happened to be visited first; (b) `rpc_handlers.rs:845-851`'s `stream_alloc_extent` fall-back iterator sorted the leftover candidates by `node_id` before walking them, so a failed primary always retried on the next-lowest ID.
+- **Fix (option 2 from design discussion):** keep the F121 "at least one online disk" filter; replace the deterministic order with a uniform random `count`-subset. Implementation uses `rand::seq::SliceRandom::shuffle(&mut rand::thread_rng())` followed by `take(count)`. All three call sites switched in lock-step:
+  1. `select_nodes` (healthy path + degraded fallback)
+  2. `ec_conversion_dispatch_loop` extra-parity selection
+  3. `handle_stream_alloc_extent` fall-back iterator
+  Capacity-aware least-allocated selection (option 3) is deferred to a future feature — it requires a per-node extent counter persisted in etcd and is orthogonal to this fix.
+- **Files:** `crates/manager/Cargo.toml` (new `rand = "0.8"` dep, matching the version already used by `autumn-server`), `crates/manager/src/lib.rs` (`select_nodes` body + new F144 doc-comment block + 2 new unit tests `f144_select_nodes_distribution` and `f144_select_nodes_degraded_fallback_shuffles`), `crates/manager/src/recovery.rs` (EC extra-parity shuffle), `crates/manager/src/rpc_handlers.rs` (fall-back shuffle).
+- **Verification:**
+  - `cargo build -p autumn-manager` clean (only pre-existing unused-import warnings).
+  - `cargo build --workspace` clean.
+  - `cargo test -p autumn-manager --lib` 16/16 pass — includes the 2 new F144 tests. The new distribution test runs `select_nodes` 1000 times against a 4-node cluster requesting count=3 and asserts each node lands in `[600, 900]` of the selections (theoretical mean 750, std-dev ~14, so the bound passes essentially with probability 1).
+  - Live-cluster re-verification deferred per project policy on destructive commands. Manual repro plan: `cluster.sh reset 4 && for i in $(seq 1 16); do $AC create-stream …; done && manager dump-extents | sort | uniq -c` — node 7 should appear in roughly 12 of 16 (75%) of replica sets, instead of 0–2 of 16 pre-F144.
+- **Out of scope:** capacity / used-bytes-aware allocation (deferred); read-side load balancing (deferred — once allocation spreads, the existing `replica[0]`-first read path naturally distributes across all nodes since extents now live on different sets).
+- **passes:** true (build + lib tests clean; live re-verification deferred).
+
 ---
 
 ## Architectural lessons from the perf series (kept for context, the rest of F098/F099 lives in the Completed table)
