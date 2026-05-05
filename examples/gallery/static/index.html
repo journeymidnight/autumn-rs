@@ -1269,6 +1269,8 @@ header .tag {
 
   const IMAGE_EXTS = ['jpg','jpeg','png','gif','bmp','webp','svg'];
   const VIDEO_EXTS = ['mp4','webm','ogg','mov','m4v'];
+  const BINARY_EXTS = ['epub','zip','gz','tar','rar','7z','docx','xlsx','pptx','odt','ods','odp','dmg','pkg','exe','deb','rpm','wasm','bin','iso'];
+  const TEXT_PREVIEW_MAX = 5 * 1024 * 1024; // 5 MB cap for unknown text files
   function extOf(name) { return name.includes('.') ? name.split('.').pop().toLowerCase() : ''; }
   function isImage(name) { return IMAGE_EXTS.includes(extOf(name)); }
   function isVideo(name) { return VIDEO_EXTS.includes(extOf(name)); }
@@ -1619,6 +1621,22 @@ header .tag {
       f.src = url;
       previewArea.appendChild(f);
 
+    } else if (BINARY_EXTS.includes(ext)) {
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'display:flex;flex-direction:column;align-items:center;gap:1rem;padding:2rem;color:var(--text-muted);font-size:0.8rem;';
+      wrap.innerHTML =
+        '<span style="font-size:2rem;opacity:0.3">&#128196;</span>' +
+        '<span>' + escHtml(ext.toUpperCase()) + ' — no preview available</span>';
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      a.textContent = 'Download ' + name;
+      a.style.cssText = 'color:var(--accent);text-decoration:none;border:1px solid var(--accent-dim);padding:0.4rem 1rem;border-radius:var(--radius);font-size:0.75rem;transition:background 0.15s;';
+      a.onmouseover = () => { a.style.background = 'rgba(197,160,94,0.1)'; };
+      a.onmouseout  = () => { a.style.background = ''; };
+      wrap.appendChild(a);
+      previewArea.appendChild(wrap);
+
     } else {
       previewArea.appendChild(previewLoader);
       showLoader();
@@ -1626,7 +1644,26 @@ header .tag {
       activePreviewXhr = xhr;
       xhr.open('GET', url, true);
       xhr.responseType = 'text';
-      xhr.onprogress = e => { if (e.lengthComputable) updateDl(e.loaded, e.total); };
+      let abortedForSize = false;
+      xhr.onprogress = e => {
+        if (e.lengthComputable) {
+          if (e.total > TEXT_PREVIEW_MAX) {
+            abortedForSize = true;
+            xhr.abort();
+            hideLoader();
+            const wrap = document.createElement('div');
+            wrap.style.cssText = 'display:flex;flex-direction:column;align-items:center;gap:1rem;padding:2rem;color:var(--text-muted);font-size:0.8rem;';
+            wrap.innerHTML = '<span>File too large to preview (' + (e.total / (1024*1024)).toFixed(1) + ' MB)</span>';
+            const a = document.createElement('a');
+            a.href = url; a.download = name; a.textContent = 'Download ' + name;
+            a.style.cssText = 'color:var(--accent);text-decoration:none;border:1px solid var(--accent-dim);padding:0.4rem 1rem;border-radius:var(--radius);font-size:0.75rem;';
+            wrap.appendChild(a);
+            previewArea.appendChild(wrap);
+            return;
+          }
+          updateDl(e.loaded, e.total);
+        }
+      };
       xhr.onload = () => {
         if (activePreviewXhr === xhr) activePreviewXhr = null;
         hideLoader();
@@ -1642,7 +1679,7 @@ header .tag {
         hideLoader();
         toast('Failed to load file', 'error');
       };
-      xhr.onabort = () => { hideLoader(); };
+      xhr.onabort = () => { if (!abortedForSize) hideLoader(); };
       xhr.send();
     }
   }
