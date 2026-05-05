@@ -127,6 +127,22 @@ impl AutumnManager {
     ) -> Result<(), AppError> {
         let task = &done_task.task;
 
+        // F138: if EC conversion is in flight for this extent, defer the
+        // recovery apply. apply_ec_conversion_done would overwrite both
+        // ex.replicates (reverting the slot replacement) and ex.eversion
+        // (losing the recovery's eversion bump). The recovery_collect_loop
+        // retries on the next 2 s tick after EC clears.
+        if self
+            .ec_conversion_inflight
+            .borrow()
+            .contains(&task.extent_id)
+        {
+            return Err(AppError::Precondition(format!(
+                "ec conversion in flight on extent {}; deferring recovery apply",
+                task.extent_id
+            )));
+        }
+
         // F126: precheck — if `task.node_id` is already present in this
         // extent at a slot OTHER than the failed `replace_id`, the layout
         // has changed since dispatch (typically EC conversion completed
@@ -248,6 +264,17 @@ impl AutumnManager {
 
             for ex in extents {
                 if ex.sealed_length == 0 {
+                    continue;
+                }
+                // F138: skip extents whose EC conversion is in flight. Sending
+                // re_avali or dispatching recovery while EC is pending would
+                // trigger a concurrent eversion bump that apply_ec_conversion_done
+                // would silently overwrite.
+                if self
+                    .ec_conversion_inflight
+                    .borrow()
+                    .contains(&ex.extent_id)
+                {
                     continue;
                 }
                 let copies = Self::extent_nodes(&ex);
@@ -682,40 +709,48 @@ impl AutumnManager {
                     .call(&coordinator_addr, EXT_MSG_CONVERT_TO_EC, payload)
                     .await;
 
-                self.ec_conversion_inflight.borrow_mut().remove(&extent_id);
-
-                match result {
-                    Ok(resp_data) => {
-                        if let Ok(r) = rkyv_decode::<ExtCodeResp>(&resp_data) {
-                            if r.code != CODE_OK {
-                                tracing::warn!(
-                                    "EC conversion failed for extent {extent_id}: {}",
-                                    r.message
-                                );
-                                continue;
-                            }
+                // F138: keep the extent in ec_conversion_inflight until AFTER
+                // apply_ec_conversion_done. The lock must cover the full
+                // dispatch → RPC await → apply window so that apply_recovery_done,
+                // mark_extent_available, and handle_multi_modify_split see the lock
+                // and defer rather than racing the in-memory + etcd write.
+                let rpc_ok = match result {
+                    Ok(resp_data) => match rkyv_decode::<ExtCodeResp>(&resp_data) {
+                        Ok(r) if r.code == CODE_OK => true,
+                        Ok(r) => {
+                            tracing::warn!(
+                                "EC conversion failed for extent {extent_id}: {}",
+                                r.message
+                            );
+                            false
                         }
-                    }
+                        Err(_) => false,
+                    },
                     Err(e) => {
                         tracing::warn!("EC conversion failed for extent {extent_id}: {e}");
-                        continue;
+                        false
                     }
+                };
+
+                if rpc_ok {
+                    let _ = self
+                        .apply_ec_conversion_done(
+                            extent_id,
+                            target_nodes_clone,
+                            extra_disk_ids_clone,
+                            data_shards,
+                            new_eversion,
+                        )
+                        .await;
                 }
 
-                let _ = self
-                    .apply_ec_conversion_done(
-                        extent_id,
-                        target_nodes_clone,
-                        extra_disk_ids_clone,
-                        data_shards,
-                        new_eversion,
-                    )
-                    .await;
+                // Release the lock only after apply completes (or after RPC failure).
+                self.ec_conversion_inflight.borrow_mut().remove(&extent_id);
             }
         }
     }
 
-    async fn apply_ec_conversion_done(
+    pub(crate) async fn apply_ec_conversion_done(
         &self,
         extent_id: u64,
         target_nodes: Vec<u64>,

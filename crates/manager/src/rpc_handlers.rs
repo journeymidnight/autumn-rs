@@ -1210,7 +1210,7 @@ impl AutumnManager {
         }
     }
 
-    async fn handle_multi_modify_split(&self, payload: Bytes) -> HandlerResult {
+    pub(crate) async fn handle_multi_modify_split(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&CodeResp {
                 code: Self::err_to_code(&err),
@@ -1251,6 +1251,26 @@ impl AutumnManager {
                     return Err(AppError::Precondition(
                         "mid_key is not in partition range".to_string(),
                     ));
+                }
+
+                // F138: reject split if any source-stream extent is undergoing EC
+                // conversion. compute_duplicate_stream bumps eversion on the
+                // source extents; if apply_ec_conversion_done runs concurrently it
+                // would overwrite those bumps. Fail fast — client retries with
+                // backoff.
+                {
+                    let ec_inflight = self.ec_conversion_inflight.borrow();
+                    for &sid in &[src_meta.log_stream, src_meta.row_stream, src_meta.meta_stream] {
+                        if let Some(stream) = s.streams.get(&sid) {
+                            for &eid in &stream.extent_ids {
+                                if ec_inflight.contains(&eid) {
+                                    return Err(AppError::Precondition(format!(
+                                        "ec conversion in flight on extent {eid}; retry split"
+                                    )));
+                                }
+                            }
+                        }
+                    }
                 }
 
                 let (start, end) = s.alloc_ids(4);

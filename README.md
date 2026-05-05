@@ -209,6 +209,35 @@ The same shuffle covers EC-parity allocation (parity slots no longer
 land exclusively on whichever node `HashMap` iteration visits last) and
 the per-RPC fall-back path inside `handle_stream_alloc_extent`.
 
+### F138 — eversion-bump lock during EC conversion (2026-05-05)
+
+`ec_conversion_dispatch_loop` captures `new_eversion = ex.eversion + 1`
+before its long await, and `apply_ec_conversion_done` wrote that value
+back unconditionally. A recovery completion or `mark_extent_available`
+firing during the await would have its eversion bump silently overwritten.
+Worse: `apply_ec_conversion_done`'s `ex.replicates = target_nodes[..]`
+would revert the recovery's slot replacement.
+
+Fix: `ec_conversion_inflight` now covers the full dispatch-to-apply
+window. `apply_recovery_done`, `mark_extent_available`, and
+`handle_multi_modify_split` check the lock and defer; they retry on the
+next 2 s tick or client-side backoff. Symmetric to the existing F136
+guard (EC checks `recovery_tasks` before dispatch).
+
+Manual repro (verifying the deferral path is reachable):
+
+```bash
+bash cluster.sh reset 4
+# enable EC on the first stream; write some data
+AC="./target/debug/autumn-client --manager 127.0.0.1:9001"
+bash cluster.sh stop-node 1          # kill node 1 mid-cluster
+for i in $(seq 1 20); do echo data$i | $AC put k$i /dev/stdin; done
+# node 1 outage triggers recovery AND EC conversion on the same extents.
+# Manager log shows: "ec conversion in flight on extent N; deferring recovery apply"
+# After EC clears, recovery completes and eversion is bumped twice (EC + recovery).
+$AC info | grep 'extent .* eversion'
+```
+
 After `start`, the script prints ready-to-use CLI examples:
 
 ```

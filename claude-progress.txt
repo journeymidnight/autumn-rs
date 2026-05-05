@@ -1,120 +1,60 @@
 Date: 2026-05-05
 TaskStatus: completed
-Task scope: F144 — Allocator node-selection bias. User observed that
-            on a 4-extent-node cluster (node_ids 1, 3, 5, 7) every
-            new stream / extent landed on [1, 3, 5]; out of 14 live
-            extents only 2 ever included node 7. All replica reads,
-            writes, and EC parity work concentrated on three of the
-            four nodes. User confirmed root cause is allocator bias
-            (not read load balancing) and chose option 2 from the
-            design discussion: random shuffle replacing the existing
-            "sort by node_id then take(count)" selection.
+Task scope: F138 — eversion lost-update across EC conversion await.
+            Manager's ec_conversion_dispatch_loop captured new_eversion
+            before the EXT_MSG_CONVERT_TO_EC await; apply_ec_conversion_done
+            then wrote it back unconditionally, overwriting concurrent bumps
+            from apply_recovery_done / mark_extent_available / split.
+            Also: apply_ec_conversion_done's ex.replicates overwrite silently
+            reverted recovery slot replacements.
 
-Diagnosis (full chain, captured in feature_list.md F144):
-  • `AutumnManager::select_nodes` (crates/manager/src/lib.rs:597)
-    collected nodes into a Vec, sorted ascending by `node_id`, and
-    returned `take(count)`. With a sorted candidate list the lowest
-    `count` IDs always win; node 7 was only ever selected when one
-    of {1,3,5} was filtered out by the F121 online-disk check.
-  • Two adjacent paths reproduced the same bug shape:
-    - `recovery.rs:591-622` (EC-conversion extra-parity selection):
-      walked `HashMap.values().take(extra_needed)`. HashMap order is
-      formally undefined but deterministic per process, biased
-      toward whichever node_id happened to be visited first.
-    - `rpc_handlers.rs:845-851` (`handle_stream_alloc_extent`
-      fall-back): sorted leftover candidates by `node_id` before
-      walking, so a failed primary always retried on the
-      next-lowest ID.
-  • Compounding effect: an extent allocated as [1,3,5] then needing
-    EC conversion to 3+1 picked node 7 as the only remaining
-    candidate, so node 7 became the *parity* node almost
-    exclusively — additionally lopsided since parity work is
-    asymmetric (less reads, all encode CPU).
+Root cause (confirmed via unit tests):
+  • apply_ec_conversion_done wrote `ex.eversion = new_eversion` (captured
+    before the await) instead of incrementing, losing any concurrent bumps.
+  • apply_ec_conversion_done wrote `ex.replicates = target_nodes[..K]`
+    (also captured at dispatch time), reverting recovery's node replacement.
+  • The lock (ec_conversion_inflight.remove) fired BEFORE the apply, leaving
+    a window between remove and apply_ec_conversion_done where the race
+    remained reachable.
 
-Fix (F144 implements option 2 — random shuffle + online filter):
-
-  - crates/manager/Cargo.toml: new `rand = "0.8"` dependency
-    (matches the version already used by autumn-server's CLI).
-
-  - crates/manager/src/lib.rs::select_nodes:
-      Replaces both `sort_by_key` calls with
-      `pool.shuffle(&mut rand::thread_rng())` then
-      `into_iter().take(count)`. The F121 "at least one online
-      disk" filter is unchanged; the degraded fallback (no online
-      disks observed) is also shuffled instead of returning the
-      sorted full set.
-
-  - crates/manager/src/recovery.rs::ec_conversion_dispatch_loop:
-      Replaces `HashMap.values().filter().take(extra_needed)` with
-      `let mut pool: Vec<_> = ... .filter().cloned().collect();
-       pool.shuffle(&mut rand::thread_rng());
-       pool.into_iter().take(extra_needed).collect()`.
-      Comment explicitly notes the F144 reason so future readers
-      don't "optimise" it back to a take-from-iterator.
-
-  - crates/manager/src/rpc_handlers.rs::handle_stream_alloc_extent:
-      Replaces `fallback_nodes.sort_by_key(|n| n.node_id)` with
-      `fallback_nodes.shuffle(&mut rand::thread_rng())` so per-RPC
-      retries don't re-introduce the low-ID bias.
-
-  - crates/manager/src/lib.rs::tests:
-      Two new unit tests:
-        f144_select_nodes_distribution — runs select_nodes 1000
-          times against a 4-node cluster requesting count=3,
-          asserts each of the 4 nodes appears in [600, 900] of the
-          selections (theoretical mean = 750, std-dev ≈ 14, so
-          the bound passes with probability ≈ 1 even without a
-          fixed RNG seed).
-        f144_select_nodes_degraded_fallback_shuffles — exercises
-          the degraded-fallback path (empty disk map) and asserts
-          at least 3 distinct first-pick node_ids across 200
-          tries.
-
-Verification:
-  - cargo build -p autumn-manager: clean (only pre-existing unused-
-    import + dead-code warnings, identical to pre-change state).
-  - cargo build --workspace: clean.
-  - cargo test -p autumn-manager --lib: 16/16 pass — includes the
-    14 pre-existing tests plus the 2 new F144 tests.
-  - Live cluster re-verification deferred per the established user
-    policy on destructive cluster commands. Repro plan:
-      • cluster.sh reset 4
-      • for i in $(seq 1 20); do echo data$i | $AC put k$i /dev/stdin; done
-      • $AC info | grep -E 'extent .*replicas=|extent .*data='
-      • Expected: across ~20 extents node 7 appears in roughly 75%
-        of replica/data sets (binomial mean 15/20 with σ≈1.9), and
-        EC parity slots are distributed roughly uniformly across
-        all 4 nodes instead of monotonically landing on node 7.
+Fix (option b — eversion-bump lock, symmetric to F136):
+  1. ec_conversion_dispatch_loop: move ec_conversion_inflight.remove to AFTER
+     apply_ec_conversion_done completes (or fails). Lock now covers full
+     dispatch → RPC await → in-memory+etcd apply window.
+  2. apply_recovery_done (recovery.rs): check ec_conversion_inflight at
+     entry; return Err::Precondition if set; keep recovery_tasks entry for
+     next 2 s retry tick.
+  3. recovery_dispatch_loop (recovery.rs): skip per-slot processing entirely
+     when ec_conversion_inflight contains the extent, preventing re_avali
+     from triggering mark_extent_available during EC.
+  4. mark_extent_available (lib.rs): same check + Err early-return.
+  5. handle_multi_modify_split (rpc_handlers.rs): check all source-stream
+     extents; return Err::Precondition if any is locked.
 
 Files modified:
-  - crates/manager/Cargo.toml
-  - crates/manager/src/lib.rs
-  - crates/manager/src/recovery.rs
-  - crates/manager/src/rpc_handlers.rs
-  - crates/manager/CLAUDE.md (new note 9 documenting F144 rationale)
-  - feature_list.md (new F144 entry, passes:true)
-  - README.md (new manual-verification block + cross-link from the
-    F121 explanation)
+  - crates/manager/src/recovery.rs (apply_recovery_done early-return,
+    recovery_dispatch_loop per-extent skip, ec_conversion_dispatch_loop
+    lock order fix, apply_ec_conversion_done visibility pub(crate))
+  - crates/manager/src/lib.rs (mark_extent_available early-return,
+    4 new F138 unit tests)
+  - crates/manager/src/rpc_handlers.rs (handle_multi_modify_split check,
+    visibility pub(crate))
+  - crates/manager/CLAUDE.md (note 10 documenting F138 lock semantics)
+  - feature_list.md (F138 passes:true + fix description)
+  - README.md (F138 manual repro block)
   - claude-progress.txt (this file)
 
-Out of scope (deferred):
-  - Capacity-aware least-allocated selection. Requires a per-node
-    `extent_count` (or `used_bytes`) counter persisted in etcd,
-    incremented on alloc / decremented on F109 physical delete.
-    This is the natural follow-up but is a larger schema change;
-    F144 is the minimum-change bias fix.
-  - Read-side load balancing (always-replica[0] in failover order).
-    Once allocation spreads, the existing read path naturally
-    distributes traffic across {1,3,5,7} since different extents
-    now live on different replica sets. Read LB is a second-order
-    optimisation that should wait for an observed hot-extent
-    pattern; raised earlier in the same session and deferred.
+Verification:
+  - cargo build --workspace: clean (only pre-existing unused-import
+    warnings, identical to pre-change state).
+  - cargo test -p autumn-manager --lib: 20/20 pass — 16 pre-existing
+    + 4 new F138 tests.
+  - cargo test -p autumn-stream --lib: 48/48 pass.
+  - cargo test -p autumn-partition-server --lib: 103/105 pass — same
+    2 pre-existing f099i parallel-test race failures as before.
+  - Live cluster re-verification deferred per project policy on
+    destructive cluster commands.
 
-User context (preserved for future sessions):
-  - User's diagnosis from the live cluster: 12 of 14 extents on
-    {1,3,5}, only extents 30 and 38 ever included node 7. Confirmed
-    root cause is allocator, not read path.
-  - User chose option 2 (random + online filter) explicitly over
-    option 3 (least-allocated). The deferred-feature note in
-    feature_list.md F144 captures this so the follow-up doesn't
-    get lost.
+Next steps:
+  - F139: Extent-node delete vs in-flight recovery (orphan .dat risk).
+  - F140: Structural split-vs-compact serialisation (P-bulk drain).

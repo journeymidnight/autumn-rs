@@ -1135,6 +1135,19 @@ impl AutumnManager {
     }
 
     async fn mark_extent_available(&self, extent_id: u64, slot: usize) -> Result<(), AppError> {
+        // F138: defer while EC conversion is in flight on this extent.
+        // re_avali was sent to the extent-node (eversion bump there), but the
+        // manager-side eversion bump must not race apply_ec_conversion_done's
+        // overwrite. The recovery_dispatch_loop retries on the next tick.
+        if self
+            .ec_conversion_inflight
+            .borrow()
+            .contains(&extent_id)
+        {
+            return Err(AppError::Precondition(format!(
+                "ec conversion in flight on extent {extent_id}; deferring mark_extent_available"
+            )));
+        }
         let updated = {
             let mut s = self.store.inner.borrow_mut();
             let ex = s
@@ -2007,6 +2020,292 @@ mod tests {
             assert_eq!(ex_after.parity, vec![7]);
             assert_eq!(ex_after.eversion, 4, "eversion must be bumped on apply");
             assert_eq!(ex_after.avali, 0xF, "slot 0 avali bit should be set");
+        })
+    }
+
+    // ── F138: eversion lost-update during EC conversion await ──────────────
+
+    fn make_ec_extent(extent_id: u64, eversion: u64) -> MgrExtentInfo {
+        MgrExtentInfo {
+            extent_id,
+            replicates: vec![1, 3, 5],
+            parity: vec![],
+            eversion,
+            refs: 1,
+            vp_table_refs: 0,
+            sealed_length: 100_000,
+            avali: 0x7,
+            replicate_disks: vec![10, 30, 50],
+            parity_disks: vec![],
+            ec_converted: false,
+        }
+    }
+
+    /// apply_recovery_done must defer (return Err, preserve recovery_tasks
+    /// entry) when ec_conversion_inflight contains the extent.
+    #[test]
+    fn f138_apply_recovery_done_during_ec_inflight_defers() {
+        run(async {
+            let m = AutumnManager::new();
+            let extent_id = 200u64;
+            m.store
+                .inner
+                .borrow_mut()
+                .extents
+                .insert(extent_id, make_ec_extent(extent_id, 5));
+
+            // Simulate EC dispatch: acquire the inflight lock.
+            m.ec_conversion_inflight.borrow_mut().insert(extent_id);
+
+            // Recovery task was already dispatched.
+            let task = MgrRecoveryTask {
+                extent_id,
+                replace_id: 1,
+                node_id: 9,
+                start_time: 0,
+            };
+            m.recovery_tasks.borrow_mut().insert(extent_id, task.clone());
+
+            // Recovery completes while EC is in flight — must be deferred.
+            let done = MgrRecoveryTaskDone {
+                task: task.clone(),
+                ready_disk_id: 99,
+            };
+            let result = m.apply_recovery_done(done.clone()).await;
+            assert!(
+                result.is_err(),
+                "F138: apply_recovery_done must return Err while ec_conversion_inflight"
+            );
+            assert!(
+                m.recovery_tasks.borrow().contains_key(&extent_id),
+                "F138: recovery_tasks entry must be preserved for retry"
+            );
+            let s = m.store.inner.borrow();
+            let ex = s.extents.get(&extent_id).unwrap();
+            assert_eq!(ex.replicates, vec![1, 3, 5], "replicates unchanged during deferral");
+            assert_eq!(ex.eversion, 5, "eversion unchanged during deferral");
+            drop(s);
+
+            // EC clears — retry now succeeds.
+            m.ec_conversion_inflight.borrow_mut().remove(&extent_id);
+            let result = m.apply_recovery_done(done).await;
+            assert!(result.is_ok(), "F138: recovery apply must succeed after EC clears");
+            let s = m.store.inner.borrow();
+            let ex = s.extents.get(&extent_id).unwrap();
+            assert_eq!(ex.replicates, vec![9, 3, 5], "slot 0 replaced after retry");
+            assert_eq!(ex.eversion, 6, "eversion bumped after retry");
+        })
+    }
+
+    /// mark_extent_available must defer when ec_conversion_inflight contains
+    /// the extent.
+    #[test]
+    fn f138_mark_extent_available_during_ec_inflight_defers() {
+        run(async {
+            let m = AutumnManager::new();
+            let extent_id = 201u64;
+            let mut ex = make_ec_extent(extent_id, 7);
+            ex.avali = 0x6; // slot 0 unavailable
+            m.store.inner.borrow_mut().extents.insert(extent_id, ex);
+
+            m.ec_conversion_inflight.borrow_mut().insert(extent_id);
+
+            let result = m.mark_extent_available(extent_id, 0).await;
+            assert!(
+                result.is_err(),
+                "F138: mark_extent_available must return Err while ec_conversion_inflight"
+            );
+            let s = m.store.inner.borrow();
+            let ex = s.extents.get(&extent_id).unwrap();
+            assert_eq!(ex.eversion, 7, "eversion unchanged during deferral");
+            assert_eq!(ex.avali, 0x6, "avali unchanged during deferral");
+            drop(s);
+
+            // After EC clears, retry succeeds.
+            m.ec_conversion_inflight.borrow_mut().remove(&extent_id);
+            let result = m.mark_extent_available(extent_id, 0).await;
+            assert!(result.is_ok(), "F138: mark_extent_available must succeed after EC clears");
+            let s = m.store.inner.borrow();
+            let ex = s.extents.get(&extent_id).unwrap();
+            assert_eq!(ex.eversion, 8, "eversion bumped after retry");
+            assert_eq!(ex.avali, 0x7, "avali bit set after retry");
+        })
+    }
+
+    /// End-to-end interleave: EC dispatch → recovery defers → EC apply →
+    /// EC lock released → recovery retries. Final state reflects BOTH bumps
+    /// and recovery's slot replacement is preserved.
+    #[test]
+    fn f138_full_race_recovery_after_ec_apply() {
+        run(async {
+            let m = AutumnManager::new();
+            let extent_id = 202u64;
+            m.store
+                .inner
+                .borrow_mut()
+                .extents
+                .insert(extent_id, make_ec_extent(extent_id, 5));
+
+            // Step 1: EC dispatch — acquire lock, capture eversion.
+            m.ec_conversion_inflight.borrow_mut().insert(extent_id);
+            let captured_eversion = {
+                let s = m.store.inner.borrow();
+                s.extents.get(&extent_id).unwrap().eversion
+            };
+            let new_eversion_for_ec = captured_eversion + 1; // = 6
+
+            // Step 2: recovery completes during EC, gets deferred.
+            let task = MgrRecoveryTask {
+                extent_id,
+                replace_id: 1,
+                node_id: 9,
+                start_time: 0,
+            };
+            m.recovery_tasks.borrow_mut().insert(extent_id, task.clone());
+            let done = MgrRecoveryTaskDone {
+                task,
+                ready_disk_id: 99,
+            };
+            let r = m.apply_recovery_done(done.clone()).await;
+            assert!(r.is_err(), "recovery must defer while EC in flight");
+
+            // Step 3: EC RPC returns OK; apply runs.
+            m.apply_ec_conversion_done(
+                extent_id,
+                vec![1, 3, 5, 7], // target_nodes captured at dispatch time
+                vec![70],         // extra_disk_ids (parity disk)
+                3,                // data_shards
+                new_eversion_for_ec,
+            )
+            .await
+            .unwrap();
+            // Step 3b: lock released (mirrors the moved remove in ec_conversion_dispatch_loop).
+            m.ec_conversion_inflight.borrow_mut().remove(&extent_id);
+
+            // Step 4: deferred recovery retries — must succeed now.
+            let r = m.apply_recovery_done(done).await;
+            assert!(r.is_ok(), "recovery apply must succeed after EC clears: {r:?}");
+
+            // Final state: both eversion bumps preserved; slot replacement survived.
+            let s = m.store.inner.borrow();
+            let ex = s.extents.get(&extent_id).unwrap();
+            assert_eq!(
+                ex.replicates, vec![9, 3, 5],
+                "F138: recovery's slot replacement (node 1→9) must survive EC apply"
+            );
+            assert_eq!(ex.parity, vec![7], "parity node added by EC");
+            assert_eq!(
+                ex.eversion, 7,
+                "F138: eversion must reflect EC bump (5→6) + recovery bump (6→7)"
+            );
+            assert!(ex.ec_converted);
+        })
+    }
+
+    /// handle_multi_modify_split must return Precondition when any source-
+    /// stream extent is in ec_conversion_inflight.
+    #[test]
+    fn f138_split_aborts_when_source_extent_is_ec_inflight() {
+        run(async {
+            let m = AutumnManager::new();
+
+            // Minimal cluster state: one owner revision, one partition with
+            // three streams (log=10, row=11, meta=12), each having one extent.
+            let owner_key = "owner-test".to_string();
+            let revision = {
+                let mut s = m.store.inner.borrow_mut();
+                s.acquire_owner_lock(&owner_key)
+            };
+
+            let log_stream_id = 10u64;
+            let row_stream_id = 11u64;
+            let meta_stream_id = 12u64;
+            let part_id = 1u64;
+            let log_extent = 100u64;
+            let row_extent = 101u64;
+            let meta_extent = 102u64;
+
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.next_id = 200;
+
+                for (sid, eid) in [
+                    (log_stream_id, log_extent),
+                    (row_stream_id, row_extent),
+                    (meta_stream_id, meta_extent),
+                ] {
+                    s.streams.insert(
+                        sid,
+                        MgrStreamInfo {
+                            stream_id: sid,
+                            extent_ids: vec![eid],
+                            ec_data_shard: 0,
+                            ec_parity_shard: 0,
+                            replicates: 3,
+                        },
+                    );
+                    s.extents.insert(eid, MgrExtentInfo {
+                        extent_id: eid,
+                        replicates: vec![1, 3, 5],
+                        parity: vec![],
+                        eversion: 1,
+                        refs: 1,
+                        vp_table_refs: 0,
+                        sealed_length: 1000,
+                        avali: 0x7,
+                        replicate_disks: vec![10, 30, 50],
+                        parity_disks: vec![],
+                        ec_converted: false,
+                    });
+                }
+
+                s.partitions.insert(
+                    part_id,
+                    MgrPartitionMeta {
+                        part_id,
+                        log_stream: log_stream_id,
+                        row_stream: row_stream_id,
+                        meta_stream: meta_stream_id,
+                        rg: Some(MgrRange {
+                            start_key: b"a".to_vec(),
+                            end_key: b"z".to_vec(),
+                        }),
+                    },
+                );
+            }
+
+            // Lock the row_stream's extent — simulates EC conversion in flight.
+            m.ec_conversion_inflight.borrow_mut().insert(row_extent);
+
+            let req = rkyv_encode(&MultiModifySplitReq {
+                part_id,
+                owner_key: owner_key.clone(),
+                revision,
+                mid_key: b"m".to_vec(),
+                log_stream_sealed_length: 500,
+                row_stream_sealed_length: 500,
+                meta_stream_sealed_length: 500,
+            });
+            let resp = m.handle_multi_modify_split(req).await.unwrap();
+            let r: CodeResp = rkyv_decode(&resp).unwrap();
+
+            assert_ne!(
+                r.code, CODE_OK,
+                "F138: split must be rejected when source extent is ec_inflight"
+            );
+            assert!(
+                r.message.contains("ec conversion in flight"),
+                "error message must identify the cause: {}",
+                r.message
+            );
+
+            // Partitions and streams must be unchanged.
+            let s = m.store.inner.borrow();
+            assert_eq!(
+                s.partitions.len(),
+                1,
+                "no new partition must be created on rejection"
+            );
         })
     }
 

@@ -278,3 +278,23 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
    etcd; the random pick is the minimum change that fixes the
    observed concentration on `{1,3,5}` and is sufficient for
    uniform load over the long run.
+
+10. **F138 `ec_conversion_inflight` extends to an eversion-bump lock.**
+    Before F138, `ec_conversion_inflight` only (i) prevented double EC
+    dispatch and (ii) inhibited physical extent deletion. F138 extends
+    the lock's meaning: while extent X ∈ `ec_conversion_inflight`, no
+    other task may bump `ex.eversion` or rewrite `ex.replicates` on X.
+    The race: `ec_conversion_dispatch_loop` captures `new_eversion =
+    ex.eversion + 1` before the `EXT_MSG_CONVERT_TO_EC` await; if
+    `apply_recovery_done`, `mark_extent_available`, or
+    `handle_multi_modify_split` bump eversion during the await,
+    `apply_ec_conversion_done`'s unconditional `ex.eversion =
+    new_eversion` overwrites the intermediate bump, and its
+    `ex.replicates = target_nodes[..data_shards]` silently reverts a
+    recovery's slot replacement. Fix: (a) the `ec_conversion_inflight`
+    `.remove` is now deferred until AFTER `apply_ec_conversion_done`
+    completes; (b) `apply_recovery_done`, `mark_extent_available`, and
+    `handle_multi_modify_split` check `ec_conversion_inflight` and
+    return `Err(Precondition(...))` if set — retried on the next 2 s
+    dispatch tick or client retry. Symmetric to F136's pre-existing
+    guard (EC checks `recovery_tasks` before dispatch).
