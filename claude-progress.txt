@@ -1,9 +1,9 @@
 Date: 2026-05-05
 TaskStatus: completed
-Task scope: F141 — GC log_stream rewrite storm (per-record fsync) → batch +
-            must_sync=false + cooperative yield + rate-limit (the user's
-            specific direction: "我认为 1,2,3,4 都需要", referring to the four
-            mitigations laid out in the diagnosis of /tmp/autumn-rs-logs/ps.log).
+Task scope: F141 — GC log_stream rewrite storm + read-side head-of-line
+            blocking. Lands the user's four requested mitigations
+            ("我认为 1,2,3,4 都需要") plus a follow-up after live ps.log
+            verification surfaced the residual read-side bottleneck.
 
 Original symptom (from /tmp/autumn-rs-logs/ps.log, 2026-05-05 05:06:43Z):
   • 05:06:43 GC: starting, extents=[16, 17] on partition 21 / log_stream=18
@@ -65,6 +65,24 @@ Completed (the four mitigations the user asked for; lands as a single feature):
           AUTUMN_PS_GC_BATCH_RECORDS  ([1, 4096], default 256)
           AUTUMN_PS_GC_BATCH_BYTES    ([64 KiB, 256 MiB], default 4 MiB)
           AUTUMN_PS_GC_RATE_BYTES_PER_SEC (default 64 MiB/s, 0 = unlimited)
+          AUTUMN_PS_GC_READ_CHUNK_BYTES   (default 8 MiB, was 64 MiB pre-F141)
+
+  - Read-side follow-up (after live ps.log verification 06:08–06:11Z):
+    The first-pass batching/sync fix collapsed GC writes to one batch
+    per extent (`moved 23 entries` / `moved 91 entries`), but the user
+    still observed `replica 0 rpc error: 127.0.0.1:9101 append timeout
+    after 5s` on stream_id=26 / stream_id=33 (foreground log_streams
+    of partitions 29 / 36). The PS-side trace showed a 17–21 s gap on
+    extent-node 1's append-summary log line during a GC run on extent
+    20 (sealed_length=1.09 GiB, EC-converted at eversion=3) — a single
+    64 MiB EC subrange read was head-of-line-blocking the extent-node
+    runtime long enough that foreground appends timed out at the
+    StreamClient's 5 s ceiling. Two extra changes folded into F141:
+      • `gc_read_chunk_bytes()` default lowered 64 MiB → 8 MiB.
+      • After every `read_bytes_from_extent` in `run_gc`, call
+        `gc_yield_now().await` and bill the chunk's bytes against the
+        SAME rate limiter the writes use, so the 64 MiB/s budget
+        bounds GC's TOTAL log-layer footprint (reads + writes).
 
 Verification:
   - cargo build -p autumn-partition-server: clean.

@@ -1029,16 +1029,22 @@ pub(crate) fn valid_discard(discards: &mut HashMap<u64, i64>, extent_ids: &[u64]
 // GC
 // ---------------------------------------------------------------------------
 
-/// F106 chunk size for `run_gc` streaming reads (~Go's 1000-block window
-/// in valuelog.go::replayLog → smartRead numOfBlocks=1000 ≈ 64 MiB).
-/// Bounds peak GC RAM: we hold at most one chunk + the partial-record
-/// carry, regardless of extent size. Tunable via env for tests.
+/// F106 chunk size for `run_gc` streaming reads. Bounds peak GC RAM
+/// (one chunk + partial-record carry).
+///
+/// F141 lowered the default from 64 MiB → 8 MiB after observing that a
+/// single 64 MiB EC-subrange-read against a 1 GiB sealed log_stream
+/// extent could stall extent-node 1's compio runtime for ~15 s,
+/// causing foreground put fanout against partitions sharing that node
+/// to time out at the StreamClient's 5 s ceiling. Smaller chunks keep
+/// the extent-node's read I/O slot returning often enough that
+/// foreground appends don't hit the timeout. Tunable via env.
 fn gc_read_chunk_bytes() -> u32 {
     std::env::var("AUTUMN_PS_GC_READ_CHUNK_BYTES")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(64 * 1024 * 1024)
+        .unwrap_or(8 * 1024 * 1024)
 }
 
 /// F141: max records per GC append batch. Defaults to 256 to match
@@ -1283,6 +1289,7 @@ pub(crate) async fn run_gc(
         if chunk.is_empty() {
             break;
         }
+        let chunk_len = chunk.len() as u64;
         cur = cur.saturating_add(chunk.len() as u32);
 
         let buf: Vec<u8> = if carry.is_empty() {
@@ -1307,6 +1314,18 @@ pub(crate) async fn run_gc(
         .await?;
         if consumed < buf.len() {
             carry = buf[consumed..].to_vec();
+        }
+
+        // F141 read-side throttle: a 64 MiB chunk read against an
+        // EC-converted, replicated source extent (e.g. extent 20 with
+        // sealed_length ≈ 1 GiB) is not free — it competes with
+        // foreground put fanout on the same extent-nodes. After each
+        // chunk yield + bill the bytes against the same rate limiter
+        // we use for writes, so GC's total log-layer footprint stays
+        // bounded regardless of which side dominates.
+        gc_yield_now().await;
+        if let Some(sleep_dur) = rate_limiter.account(chunk_len) {
+            compio::time::sleep(sleep_dur).await;
         }
     }
 
