@@ -2434,6 +2434,19 @@ impl ExtentNode {
             Self::truncate_to_commit(&extent, req.commit)
                 .await
                 .map_err(|e| (StatusCode::Internal, e))?;
+            // F147-B: re-check seal state after the truncate await (symmetric
+            // to F146 in build_append_future). A concurrent
+            // apply_extent_meta_durable (from handle_re_avali or another
+            // handle_append's pre-truncate seal-confirm branch) may have landed
+            // a fresh seal DURING the truncate I/O. Without this re-check the
+            // subsequent file_pwrite would write bytes past sealed_length —
+            // corrupting subsequent reads as "logStream value short" or
+            // out-of-bounds slice panics on EC reads.
+            if extent.sealed_length.load(Ordering::SeqCst) > 0
+                || extent.avali.load(Ordering::SeqCst) > 0
+            {
+                return Ok(AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode());
+            }
             start = extent.len.load(Ordering::SeqCst);
         }
 
@@ -3488,5 +3501,87 @@ impl ExtentNode {
         &self,
     ) -> std::rc::Rc<dashmap::DashMap<u64, crate::extent_rpc::RecoveryTask>> {
         self.recovery_inflight.clone()
+    }
+}
+
+// ─── Unit tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod f147b_tests {
+    use super::*;
+
+    /// F147-B: handle_append returns CODE_PRECONDITION when sealed_length > 0.
+    ///
+    /// The F147-B fix inserts a post-truncate seal recheck in handle_append
+    /// after `Self::truncate_to_commit` completes. That recheck fires in the
+    /// async window between the truncate await and the subsequent file_pwrite —
+    /// a concurrent `apply_extent_meta_durable` may have landed a fresh seal
+    /// during the truncate I/O. In a single-threaded compio test we cannot
+    /// inject that concurrency, so this test exercises the nearest-equivalent
+    /// path: the _early_ seal check at step 3 of handle_append, which guards
+    /// the same CODE_PRECONDITION response. It confirms:
+    ///
+    ///   (a) handle_append correctly returns CODE_PRECONDITION when
+    ///       sealed_length > 0 (whatever the code path that fires it),
+    ///   (b) the call does NOT panic or produce CODE_OK.
+    ///
+    /// The post-truncate recheck (new F147-B code at line ~2434) is validated
+    /// by code inspection: it is structurally identical to the F146 recheck in
+    /// build_append_future (lines 882-898) and fires on the same atomics.
+    #[compio::test]
+    async fn handle_append_rejects_sealed_extent_with_low_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
+        let node = ExtentNode::new(config).await.expect("ExtentNode::new");
+
+        // Allocate extent 9001 via the handler.
+        let alloc_payload = rkyv_encode(&AllocExtentReq { extent_id: 9001 });
+        let alloc_result = node.handle_alloc_extent(alloc_payload).await;
+        assert!(alloc_result.is_ok(), "alloc_extent should succeed");
+
+        // Write 100 bytes at eversion=1, revision=0, commit=0 (no truncation).
+        let write_req = AppendReq {
+            extent_id: 9001,
+            eversion: 1,
+            commit: 0,
+            revision: 0,
+            must_sync: false,
+            payload: Bytes::from(vec![0u8; 100]),
+        };
+        let write_result = node.handle_append(write_req.encode()).await;
+        assert!(write_result.is_ok(), "first append should succeed");
+        let write_resp = AppendResp::decode(write_result.unwrap()).expect("decode AppendResp");
+        assert_eq!(write_resp.code, CODE_OK, "first append code == CODE_OK");
+        assert_eq!(write_resp.end, 100, "extent len == 100 after first append");
+
+        // Simulate a concurrent seal arriving: set sealed_length = 100, avali = 1.
+        // In production this is done by apply_extent_meta_durable triggered from
+        // handle_re_avali or another handle_append's pre-truncate manager check.
+        {
+            let entry = node.extents.get(&9001).expect("extent 9001 in map");
+            entry.sealed_length.store(100, Ordering::SeqCst);
+            entry.avali.store(1, Ordering::SeqCst);
+        }
+
+        // Now attempt an append with commit=50 (< current len=100): truncation
+        // branch is entered. The early sealed check (step 3 of handle_append)
+        // fires before truncation starts and returns CODE_PRECONDITION, which is
+        // the same CODE_PRECONDITION the post-truncate F147-B recheck would
+        // return if the seal had arrived DURING the truncate await instead.
+        let stale_req = AppendReq {
+            extent_id: 9001,
+            eversion: 1,
+            commit: 50,
+            revision: 0,
+            must_sync: false,
+            payload: Bytes::from(b"x".to_vec()),
+        };
+        let stale_result = node.handle_append(stale_req.encode()).await;
+        assert!(stale_result.is_ok(), "handle_append should not error on sealed extent");
+        let stale_resp = AppendResp::decode(stale_result.unwrap()).expect("decode AppendResp");
+        assert_eq!(
+            stale_resp.code, CODE_PRECONDITION,
+            "handle_append on sealed extent must return CODE_PRECONDITION"
+        );
     }
 }
