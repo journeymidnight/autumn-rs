@@ -974,6 +974,15 @@ pub(crate) async fn do_compact(
         remove_compacted_tables(&mut p, &compact_keys);
         let tables_snapshot = p.tables.clone();
         drop(p);
+        // F148-A invariant — DO NOT introduce an `.await` between the
+        // borrow_mut drop above and the mpsc send inside
+        // `save_table_locs_raw` below. See the matching comment in
+        // `flush_one_imm` (lib.rs). The invariant guarantees that
+        // concurrent flush + compact publishers (running as separate
+        // tasks on the single-threaded P-log compio runtime) cannot
+        // produce a stale-snapshot meta_stream checkpoint: borrow_mut
+        // order = mpsc-send order = meta_stream record order, so the
+        // latest record always reflects the latest in-memory state.
         save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, compact_vp_eid, compact_vp_off).await?;
         sync_partition_vp_refs(part).await?;
         return Ok(CompactStats { input_tables, output_tables: 0, entries_kept: 0, entries_discarded, output_bytes: 0 });
@@ -1000,6 +1009,9 @@ pub(crate) async fn do_compact(
         p.tables.clone()
     };
 
+    // F148-A invariant — see flush_one_imm in lib.rs for the full
+    // statement. No `.await` may be introduced between the borrow_mut
+    // drop and the mpsc send inside `save_table_locs_raw`.
     save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, compact_vp_eid, compact_vp_off).await?;
     sync_partition_vp_refs(part).await?;
     Ok(CompactStats { input_tables, output_tables, entries_kept, entries_discarded, output_bytes })

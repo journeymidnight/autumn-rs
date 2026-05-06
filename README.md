@@ -352,6 +352,64 @@ manager-reported `sealed_length`.
 
 ---
 
+### F148 — Race-hunt audit after F147 (2026-05-06)
+
+Continuation of the race-hunt that produced F146/F147. Three parallel layer-scoped
+audits (manager / extent-node / partition-server) flagged 12 candidates;
+verification against the actual code + crate CLAUDE.md context **confirmed zero
+new HIGH-severity unfixed races** — every candidate is either already covered
+by F119–F147, closed by F140's dual-gate, theoretical and not exercised by the
+production call-graph, or precluded by single-threaded compio + the synchronous
+path between `borrow_mut` drop and mpsc-send. F148 ships only:
+
+**F148-A** — Inline-comment + regression test for the metadata-publish ordering
+invariant. The conclusion that PS-side `flush_one_imm` and `do_compact`
+concurrent metadata publishes cannot produce a stale meta_stream checkpoint
+rests on three load-bearing properties: (P1) compio P-log runtime is
+single-threaded, (P2) `borrow_mut` blocks contain no `.await`, (P3) the path
+`borrow_mut` drop → `rkyv_encode` → `stream_client.append` → mpsc-send is
+purely synchronous (first await is `ack_rx`, after FIFO mpsc). Together
+(P1)–(P3) guarantee `borrow_mut` order = mpsc-send order = meta_stream record
+order; the LATEST persisted record's `tables_snapshot` therefore necessarily
+reflects all prior `borrow_mut` mutations. A future refactor that introduces
+an `.await` between the `borrow_mut` drop and the mpsc send would silently
+re-open a stale-snapshot race that could persist tables compaction has
+already removed. Inline `// F148-A invariant` comments at all four call sites
+(`flush_one_imm`, `flush_one_imm_local` in lib.rs; both branches of
+`do_compact` in background.rs) state the rule next to the code.
+
+**F148-B** — Defensive guard in `handle_copy_extent`. After the manager-fetch
++ `apply_extent_meta_durable` step, refuse with `CODE_PRECONDITION` when
+`entry.sealed_length == 0`. Production callers (`run_recovery_task`,
+`handle_re_avali`) only target sealed extents by design — the manager
+dispatches both only after seal. Without the guard, a stray caller hitting
+an unsealed extent could race a concurrent in-flight `handle_append`'s
+`truncate_to_commit` await window and observe a mix of pre- and
+post-truncate bytes via `file_pread_chunked`. On a sealed extent the append
+protocol step 3 rejects concurrent appends, so the race only exists for
+unsealed extents. Belt-and-braces.
+
+```
+# F148-A regression test: simulates two concurrent publishers (flush + compact)
+# on a single compio runtime and asserts the LATER snapshot extends the EARLIER
+# one — locks in the borrow_mut-order = mpsc-send-order invariant.
+cargo test -p autumn-partition-server \
+  f148_concurrent_publisher_ordering_invariant -- --nocapture
+
+# F148-B guard tests: copy_extent must refuse with FailedPrecondition on
+# unsealed extents, must succeed on sealed extents.
+cargo test -p autumn-stream \
+  copy_extent_unsealed_refused_with_precondition -- --nocapture
+cargo test -p autumn-stream copy_extent_sealed_succeeds -- --nocapture
+```
+
+The full audit and per-candidate verdicts are in `claude-progress.txt` and
+`feature_list.md`. Deferred: MED-2 (`handle_get → resolve_value` vs background
+GC `punch_holes` on log_stream extent — needs a per-extent reader-pin
+protocol, separate structural feature).
+
+---
+
 ### F145 — punch_holes/truncate vs in-flight EC conversion (2026-05-06)
 
 F138 made `ec_conversion_inflight` an eversion-bump lock: while an extent is

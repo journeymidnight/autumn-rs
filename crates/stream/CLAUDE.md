@@ -190,6 +190,22 @@ Append(AppendReq via autumn-rpc binary frame):
              manager-reported `sealed_length`; a mismatch means a concurrent seal
              landed during recovery and the task retries rather than persisting
              stale metadata.
+           * F148-B: `handle_copy_extent` (extent_node.rs:3114-…) refuses with
+             CODE_PRECONDITION when the local `entry.sealed_length` is 0
+             after the manager-fetch + apply_extent_meta_durable step.
+             Production callers (`run_recovery_task`,
+             `handle_re_avali`) only target sealed extents by design — the
+             manager dispatches both only after seal. Without this guard, a
+             stray caller hitting an unsealed extent would race a concurrent
+             in-flight `handle_append`'s `truncate_to_commit` await window
+             and observe a mix of pre- and post-truncate bytes via
+             `file_pread_chunked`. On a sealed extent the append protocol
+             step 3 rejects concurrent appends, so the race only exists for
+             unsealed extents. The guard converts the theoretical race into
+             a clean CODE_PRECONDITION error and documents the invariant in
+             code. Sibling note in `partition-server/CLAUDE.md` Programming
+             Note 12 describes the matching publishing-order invariant for
+             flush + compact metadata publishes.
   6. Write payload:
        - WAL path (must_sync=true AND payload ≤ 2MB AND WAL enabled):
            futures::join!(wal.write(record), file.write_at(start, payload))

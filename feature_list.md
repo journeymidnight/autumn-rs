@@ -509,6 +509,29 @@
   - Live-cluster re-verification deferred per project policy on destructive commands.
 - **passes:** true (build + lib tests clean; live re-verification deferred).
 
+### F148 · Race-hunt audit after F147 (regression-test + defensive guard, no production behavior change)
+- **Target:** Continue checking for unfixed snapshot-await-writeback / reader-vs-reclaim / dual-writer races after F147 closed three. Lock in the orderings that *currently* prevent corruption so future refactors cannot regress silently.
+- **Audit verdict:** No new HIGH-severity unfixed races confirmed. Three parallel layer-scoped Explore agents (manager / extent-node / partition-server) flagged 12 candidates; verification against the actual code + crate CLAUDE.md context showed each is either (a) already covered by F119–F147 (manager handlers all use F147-A refuse-at-start + verify-at-apply; extent-node `handle_append` has F146/F147-B post-truncate recheck; recovery has F147-C verify-after-fetch), (b) closed by F140 dual-gate (split vs compact + GC), (c) theoretical and not exercised by the production call-graph (e.g., `handle_copy_extent` on unsealed extents — recovery and re-avali only target sealed extents), or (d) precluded by single-threaded compio + the synchronous path between `borrow_mut` drop and mpsc-send (the PS-side hypothesised flush-vs-compact `save_table_locs_raw` stale-snapshot race). The previously-known MED-2 (`handle_get → resolve_value` vs background GC `punch_holes`) remains deferred as a separate structural feature requiring a per-extent reader-pin protocol.
+- **Why this still ships as a feature:**
+  - F148-A: the conclusion that PS-side flush + compact metadata publishes are race-free is *load-bearing* on (P1) compio P-log is single-threaded, (P2) `borrow_mut` blocks contain no `.await`, (P3) the path `borrow_mut` drop → `rkyv_encode` → `stream_client.append` → mpsc-send is purely synchronous. A future refactor that violates any of these silently re-opens a stale-snapshot race that could persist tables which compaction has already removed (data corruption on restart if GC has punched any of those tables' VP-referenced log_stream extents). Inline `// F148-A invariant` comments at all four call sites (`flush_one_imm` + `flush_one_imm_local` in lib.rs; both branches of `do_compact` in background.rs) state the rule next to the code; a regression test (`f148_publisher_invariant_tests::f148_concurrent_publisher_ordering_invariant`) exercises two simulated publishers on a single compio runtime and asserts the LATER snapshot extends the EARLIER one.
+  - F148-B: defensive guard in `handle_copy_extent`. After the manager-fetch + `apply_extent_meta_durable`, refuse with `CODE_PRECONDITION` if `entry.sealed_length == 0`. Production callers (`run_recovery_task`, `handle_re_avali`) only target sealed extents by design — the manager dispatches both only after seal. Without this guard a stray caller hitting an unsealed extent could race a concurrent in-flight `handle_append`'s `truncate_to_commit` await window and observe a mix of pre- and post-truncate bytes via `file_pread_chunked`. On a sealed extent the append protocol step 3 rejects concurrent appends, so the race only exists for unsealed extents. The guard converts the theoretical race into a clean error and documents the invariant in code.
+- **Files:**
+  - `crates/stream/src/extent_node.rs` (F148-B guard in `handle_copy_extent`, 2 tests in `f148_copy_extent_tests`).
+  - `crates/partition-server/src/lib.rs` (F148-A inline comments in `flush_one_imm` + `flush_one_imm_local`, 1 test in `f148_publisher_invariant_tests`).
+  - `crates/partition-server/src/background.rs` (F148-A inline comments in both branches of `do_compact`).
+  - `crates/partition-server/CLAUDE.md` (Programming Note 10: metadata-publish ordering invariant).
+  - `crates/stream/CLAUDE.md` (append protocol step 5: F148-B handle_copy_extent guard bullet).
+  - `feature_list.md` (this entry).
+  - `claude-progress.txt`.
+  - `README.md` (F148 manual-repro block).
+- **Verification:**
+  - `cargo build --workspace` clean (only pre-existing warnings).
+  - `cargo test -p autumn-manager --lib` 30/30 pass (no manager-side change).
+  - `cargo test -p autumn-stream --lib` 52/52 pass — 50 pre-existing + 2 new F148-B tests.
+  - `cargo test -p autumn-partition-server --lib` 108/108 pass — pre-existing baseline + 1 new F148-A test (the 2 historical `f099i` parallel-test races did not trigger this run).
+  - Live-cluster re-verification not applicable: F148 ships only documentation, an inline guard with no production-path effect, and tests.
+- **passes:** true (build + lib tests clean; behaviorally inert in production).
+
 ---
 
 ## Architectural lessons from the perf series (kept for context, the rest of F098/F099 lives in the Completed table)

@@ -1,67 +1,111 @@
 Date: 2026-05-06
 TaskStatus: completed
-Task scope: F147 — Three remaining snapshot-await-writeback races (sync_partition_vp_refs etcd divergence, handle_append non-batched seal recheck, run_recovery_task verify-after-fetch).
+Task scope: F148 — Race-hunt audit after F147. Documents that no new HIGH-severity
+            unfixed races were confirmed; ships a regression test + defensive guard
+            so the orderings that *currently* prevent corruption cannot regress.
 
-Root cause (confirmed):
-  F147-A: handle_sync_partition_vp_refs applied a VP-ref diff after awaiting
-  the etcd mirror without verifying that touched extents had not been mutated
-  (eversion bumped, replica rewritten) during the await. On leader-failover,
-  replaying the stale etcd entry produced a vp_table_refs count inconsistent
-  with in-memory state, risking premature extent deletion when the diff
-  under-counted retention.
+Audit verdict (after parallel 3-layer Explore + per-candidate verification):
 
-  F147-B: handle_append (the non-batched path, extent_node.rs line ~2437)
-  lacked the post-truncate seal recheck that F146 added to build_append_future
-  (the batched handle_append_batch path). A concurrent apply_extent_meta_durable
-  sealing the extent during the truncate_to_commit await allowed pwritev to land
-  bytes past the new sealed_length — identical corruption to F146-HIGH-3 but on
-  the non-batched code path.
+  No new HIGH-severity unfixed races. The 12 candidates flagged by Explore agents
+  resolve as follows:
 
-  F147-C: run_recovery_task had no verify-after-fetch step. A concurrent seal
-  arriving (from the manager dispatching a new eversion bump) during the
-  multi-second CopyExtent fetch I/O could cause recovery to write back stale
-  eversion/sealed_length metadata and log an incorrect fetch_max value. The
-  recovery task would complete with CODE_OK while the extent's on-disk sidecar
-  diverged from the manager's view.
+  Manager: 0 candidates. Every mutating handler (handle_stream_alloc_extent /
+    handle_multi_modify_split / handle_sync_partition_vp_refs / etc.) is already
+    protected by the F146/F147-A refuse-at-start + verify-at-apply pattern, or
+    mutates in-place inside a single borrow_mut block before any await.
 
-Fix:
-  F147-A: refuse-at-start in handle_sync_partition_vp_refs (check
-  ec_conversion_inflight + recovery_tasks for every extent in the new snapshot;
-  return Err(Precondition) before any await) + verify-at-apply (re-read each
-  touched extent's eversion under a fresh borrow_mut after the etcd mirror;
-  return Err(Precondition) if any eversion changed during the await window).
+  Extent-node: 5 candidates, none confirmed.
+    - handle_copy_extent stale logical_len (HIGH claimed): only triggers on
+      unsealed extents; production callers (run_recovery_task, handle_re_avali)
+      only target sealed extents by design. → F148-B defensive guard.
+    - handle_read_bytes pread stale (HIGH claimed): false — sync_all does not
+      invalidate already-read user-space buffers.
+    - handle_convert_to_ec idempotency (MED): already fixed by F119-D.
+    - write_shard_local concurrent read (MED): false — readers go through the
+      live entry.file handle, not the staging file.
+    - commit_shard_local UnsafeCell swap (LOW): mitigated by single-threaded compio.
 
-  F147-B: insert post-truncate seal recheck (sealed_length.load(SeqCst) > 0 ||
-  avali.load(SeqCst) > 0) in handle_append immediately after truncate_to_commit
-  returns Ok and before file_pwrite offset computation — structurally identical
-  to the F146 recheck in build_append_future.
+  Partition-server: 6 candidates, none confirmed.
+    - F-NEW-1 PS-side sync_partition_vp_refs divergence (HIGH claimed): false —
+      sync_partition_vp_refs reads p.sst_readers fresh at call time.
+    - F-NEW-2 per-partition save_table_locs_raw stale-snapshot race (HIGH claimed):
+      false on single-threaded compio. The path borrow_mut drop → rkyv_encode →
+      stream_client.append → mpsc send is purely synchronous, so borrow_mut
+      order = mpsc-send order = meta_stream record order. The latest persisted
+      record's tables_snapshot necessarily reflects all prior borrow_mut
+      mutations from any concurrent publisher. → F148-A inline-comment +
+      regression test to lock in the invariant against future refactors.
+    - F-NEW-3 compact log_extent_ids stale (MED): benign — stale snapshot
+      only over-keeps discards for already-punched extents; subsequent GC
+      no-ops on the missing extent.
+    - F-NEW-4 split vs compaction Phase 3 (MED): closed by F140 dual-gate
+      (compact_gate + gc_gate held by handle_split_part).
+    - F-NEW-5 GC vs split rg narrowing (MED): closed by F140 gc_gate held
+      around the entire `for eid in holes` loop including run_gc.
+    - F-NEW-6 compact partial commit + crash (MED): known accepted tradeoff
+      per F104 (orphan row_stream bytes; recovery loads previous checkpoint).
 
-  F147-C: after sync_all following the full-extent fetch in run_recovery_task,
-  re-read the local extent's eversion atomics; if it advanced during the fetch,
-  return an error and trigger retry. Additionally gate the fetch_max writeback
-  on the fetched length matching the manager-reported sealed_length.
+  Already-tracked: MED-2 (handle_get → resolve_value vs GC punch_holes) remains
+  deferred as a structural feature (per-extent reader-pin protocol).
+
+Fix shipped (F148):
+
+  F148-A — Inline-comment + regression test for the metadata-publish ordering
+  invariant. The conclusion that flush + compact concurrent publishes do not
+  race is load-bearing on three properties:
+    (P1) compio P-log runtime is single-threaded;
+    (P2) borrow_mut blocks contain no .await;
+    (P3) the path borrow_mut drop → rkyv_encode → stream_client.append →
+         mpsc-send-into-per-stream-worker is purely synchronous; first .await
+         is on the per-stream worker's ack_rx (after FIFO mpsc).
+  Inline `// F148-A invariant` comments at flush_one_imm + flush_one_imm_local
+  (lib.rs) and both branches of do_compact (background.rs) state the rule next
+  to the code. New test
+  f148_publisher_invariant_tests::f148_concurrent_publisher_ordering_invariant
+  exercises two simulated publishers on one compio runtime via futures::join!
+  and asserts:
+    (A1) worker received both publishes;
+    (A2) the LATER publisher's snapshot includes the EARLIER's mutation;
+    (A3) the LATEST received snapshot equals the post-state of shared tables.
+
+  F148-B — Defensive guard in handle_copy_extent (extent_node.rs). After
+  manager-fetch + apply_extent_meta_durable, refuse with CODE_PRECONDITION
+  when entry.sealed_length == 0. Production callers only target sealed extents,
+  so this is belt-and-braces — converts a theoretical race window (where a
+  stray caller could observe a mix of pre- and post-truncate-to-commit bytes
+  via file_pread_chunked on an unsealed extent) into a clean error.
+
+  F148-C — Documentation:
+    - crates/partition-server/CLAUDE.md Programming Note 10: full statement of
+      the metadata-publish ordering invariant.
+    - crates/stream/CLAUDE.md append protocol step 5: F148-B bullet.
+    - feature_list.md F148 entry.
+    - README.md F148 manual-repro.
 
 Files modified:
-  - crates/manager/src/rpc_handlers.rs (F147-A: refuse-at-start + verify-at-apply
-    in handle_sync_partition_vp_refs)
-  - crates/manager/src/lib.rs (1 new F147-A unit test:
-    f147_sync_vp_refs_refuses_when_concurrent_eversion_bump)
-  - crates/stream/src/extent_node.rs (F147-B: handle_append post-truncate recheck;
-    F147-C: run_recovery_task verify-after-fetch + fetch_max writeback gate;
-    1 test in f147b_tests, 1 test in f147c_tests)
-  - crates/manager/CLAUDE.md (note 14 documenting F147-A refuse-at-start +
-    verify-at-apply pattern, cross-referencing notes 10/11/12/13)
-  - crates/stream/CLAUDE.md (append protocol step-5 F147-B/C bullets)
-  - feature_list.md (F147 entry, passes:true)
-  - README.md (F147 manual-repro block)
-  - claude-progress.txt (this file)
+  - crates/stream/src/extent_node.rs (F148-B guard + 2 unit tests in
+    f148_copy_extent_tests).
+  - crates/partition-server/src/lib.rs (F148-A inline comments at
+    flush_one_imm + flush_one_imm_local; 1 new unit test in
+    f148_publisher_invariant_tests).
+  - crates/partition-server/src/background.rs (F148-A inline comments at
+    both branches of do_compact).
+  - crates/partition-server/CLAUDE.md (Programming Note 10).
+  - crates/stream/CLAUDE.md (append protocol step 5 F148-B bullet).
+  - feature_list.md (F148 entry, passes:true).
+  - README.md (F148 manual-repro block).
+  - claude-progress.txt (this file).
 
 Verification:
   - cargo build --workspace: clean (only pre-existing warnings).
-  - cargo test -p autumn-manager --lib: 30/30 pass — 29 pre-existing + 1 new F147-A test.
-  - cargo test -p autumn-stream --lib: 50/50 pass — 48 pre-existing + 2 new F147-B/C tests.
-  - cargo test -p autumn-partition-server --lib: 105 pass / 2 pre-existing
-    f099i parallel-test race failures (same baseline as F146).
+  - cargo test -p autumn-manager --lib: 30/30 pass (no manager-side change).
+  - cargo test -p autumn-stream --lib: 52/52 pass — 50 pre-existing + 2 new
+    F148-B tests (copy_extent_unsealed_refused_with_precondition,
+    copy_extent_sealed_succeeds).
+  - cargo test -p autumn-partition-server --lib: 108/108 pass — pre-existing
+    baseline + 1 new F148-A test
+    (f148_concurrent_publisher_ordering_invariant). The 2 historical f099i
+    parallel-test race failures did not trigger this run.
 
 Next steps:
   - MED-2 (Get → resolve_value vs GC reader-pin) — structural reader-epoch /

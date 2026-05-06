@@ -3173,6 +3173,25 @@ impl ExtentNode {
             }
         }
 
+        // F148-B: refuse copy on unsealed extents. Production callers
+        // (run_recovery_task, handle_re_avali) only target sealed extents
+        // by design — the manager dispatches recovery/re-avali after seal.
+        // Without this guard, a stray caller hitting an unsealed extent
+        // could race a concurrent in-flight handle_append's
+        // truncate_to_commit await window and observe a mix of pre- and
+        // post-truncate bytes via file_pread_chunked below. On a sealed
+        // extent the append protocol step 3 rejects concurrent appends, so
+        // the race only exists for unsealed extents. Belt-and-braces.
+        if extent.sealed_length.load(Ordering::SeqCst) == 0 {
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "copy_extent on unsealed extent {} refused (sealed_length=0)",
+                    req.extent_id
+                ),
+            ));
+        }
+
         let offset = req.offset.min(logical_len);
         let size = if req.size == 0 {
             logical_len.saturating_sub(offset)
@@ -3714,5 +3733,142 @@ mod f147c_tests {
                 "avali must not roll back from 1 to 0"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod f148_copy_extent_tests {
+    use super::*;
+
+    /// F148-B: handle_copy_extent refuses with CODE_PRECONDITION on
+    /// unsealed extents.
+    ///
+    /// Production callers (run_recovery_task, handle_re_avali) only target
+    /// sealed extents per design — the manager dispatches both only after
+    /// seal. Without this guard, a stray caller hitting an unsealed extent
+    /// could race a concurrent in-flight handle_append's truncate_to_commit
+    /// await window and observe a mix of pre- and post-truncate bytes via
+    /// file_pread_chunked. On a sealed extent the append protocol step 3
+    /// rejects concurrent appends, so the race only exists for unsealed
+    /// extents. The guard converts that theoretical race into a clean
+    /// CODE_PRECONDITION error.
+    ///
+    /// `extent_info_from_manager` returns `Ok(None)` in unit tests (no
+    /// manager configured) so the manager-fetch branch falls into `Ok(None)`,
+    /// no apply_extent_meta_durable runs, and `entry.sealed_length` stays
+    /// at its alloc-time value of 0. The F148-B post-fetch check fires.
+    #[compio::test]
+    async fn copy_extent_unsealed_refused_with_precondition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
+        let node = ExtentNode::new(config).await.expect("ExtentNode::new");
+
+        // Allocate extent 8001 — sealed_length=0, avali=0 (unsealed).
+        let alloc_payload = rkyv_encode(&AllocExtentReq { extent_id: 8001 });
+        let alloc_result = node.handle_alloc_extent(alloc_payload).await;
+        assert!(alloc_result.is_ok(), "alloc_extent should succeed");
+
+        // Write some bytes so extent.len > 0 but extent stays unsealed.
+        let write_req = AppendReq {
+            extent_id: 8001,
+            eversion: 1,
+            commit: 0,
+            revision: 0,
+            must_sync: false,
+            payload: Bytes::from(vec![0u8; 256]),
+        };
+        let write_result = node.handle_append(write_req.encode()).await;
+        assert!(write_result.is_ok(), "first append should succeed");
+        let write_resp = AppendResp::decode(write_result.unwrap()).expect("decode");
+        assert_eq!(write_resp.code, CODE_OK, "append on unsealed extent OK");
+
+        // Confirm sealed_length is still 0.
+        {
+            let entry = node.extents.get(&8001).expect("extent 8001 in map");
+            assert_eq!(
+                entry.sealed_length.load(Ordering::SeqCst),
+                0,
+                "extent must remain unsealed for this test"
+            );
+        }
+
+        // copy_extent on unsealed extent must refuse.
+        let copy_req = CopyExtentReq {
+            extent_id: 8001,
+            offset: 0,
+            size: 0,
+            eversion: 1,
+        };
+        let copy_result = node.handle_copy_extent(copy_req.encode()).await;
+        assert!(
+            copy_result.is_err(),
+            "copy_extent on unsealed extent must Err"
+        );
+        let (code, msg) = copy_result.unwrap_err();
+        assert_eq!(
+            code,
+            StatusCode::FailedPrecondition,
+            "expected FailedPrecondition, got {:?}: {}",
+            code,
+            msg
+        );
+        assert!(
+            msg.contains("unsealed") || msg.contains("sealed_length"),
+            "error message should reference unsealed/sealed_length: {}",
+            msg
+        );
+    }
+
+    /// F148-B: handle_copy_extent succeeds on a sealed extent.
+    ///
+    /// Sanity check that the guard does not regress the production path.
+    /// Seal the extent locally (sealed_length > 0) and assert copy_extent
+    /// returns CODE_OK with the expected payload bytes.
+    #[compio::test]
+    async fn copy_extent_sealed_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
+        let node = ExtentNode::new(config).await.expect("ExtentNode::new");
+
+        let alloc_payload = rkyv_encode(&AllocExtentReq { extent_id: 8002 });
+        node.handle_alloc_extent(alloc_payload).await.unwrap();
+
+        let payload_bytes = vec![0xAB_u8; 128];
+        let write_req = AppendReq {
+            extent_id: 8002,
+            eversion: 1,
+            commit: 0,
+            revision: 0,
+            must_sync: false,
+            payload: Bytes::from(payload_bytes.clone()),
+        };
+        let write_result = node.handle_append(write_req.encode()).await;
+        assert!(write_result.is_ok());
+        let write_resp = AppendResp::decode(write_result.unwrap()).unwrap();
+        assert_eq!(write_resp.code, CODE_OK);
+
+        // Simulate a seal landing locally.
+        {
+            let entry = node.extents.get(&8002).expect("extent 8002 in map");
+            entry.sealed_length.store(128, Ordering::SeqCst);
+            entry.avali.store(1, Ordering::SeqCst);
+        }
+
+        let copy_req = CopyExtentReq {
+            extent_id: 8002,
+            offset: 0,
+            size: 128,
+            eversion: 1,
+        };
+        let copy_result = node.handle_copy_extent(copy_req.encode()).await;
+        assert!(
+            copy_result.is_ok(),
+            "copy_extent on sealed extent must succeed: {:?}",
+            copy_result.as_ref().err()
+        );
+        let resp = CopyExtentResp::decode(copy_result.unwrap()).expect("decode");
+        assert_eq!(resp.code, CODE_OK);
+        assert_eq!(resp.payload.len(), 128);
+        assert_eq!(&resp.payload[..], &payload_bytes[..]);
     }
 }
