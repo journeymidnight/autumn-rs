@@ -1,119 +1,128 @@
 Date: 2026-05-06
 TaskStatus: completed
-Task scope: F148 — Race-hunt audit after F147. Documents that no new HIGH-severity
-            unfixed races were confirmed; ships a regression test + defensive guard
-            so the orderings that *currently* prevent corruption cannot regress.
+Task scope: F149 — Leader-fence on every manager etcd write txn. Closes the
+            failover-gap split-brain window where a deposed leader's in-process
+            `self.leader.get() == true` flag could lag etcd ground truth and
+            allow last-writer-wins overwrites of the new leader's mirror_*
+            state.
 
-Audit verdict (after parallel 3-layer Explore + per-candidate verification):
+Why F149 was needed:
 
-  No new HIGH-severity unfixed races. The 12 candidates flagged by Explore agents
-  resolve as follows:
+  F005's lease-based leader election (10 s lease + 2 s keepalive + create_revision
+  CAS) is sufficient to guarantee that at most one manager **holds** the leader-key
+  at any time. It is NOT sufficient to prevent a deposed leader from issuing etcd
+  writes that overwrite the new leader's state. The window between (a) the etcd
+  lease expiring + a new leader winning the CAS, and (b) the old leader's
+  keepalive task observing failure and flipping `set_leader(false)` is bounded
+  by lease TTL + keepalive jitter on a healthy host (~10 s), but unbounded under
+  compio runtime starvation, GC pauses, or syscall hangs. During that window
+  the deposed leader's mirror_* paths (which use plain etcd puts, not version-
+  conditional CAS) can revert recovery slot replacements, EC conversion eversion
+  bumps, partition splits, etc.
 
-  Manager: 0 candidates. Every mutating handler (handle_stream_alloc_extent /
-    handle_multi_modify_split / handle_sync_partition_vp_refs / etc.) is already
-    protected by the F146/F147-A refuse-at-start + verify-at-apply pattern, or
-    mutates in-place inside a single borrow_mut block before any await.
+Fix shipped (F149):
 
-  Extent-node: 5 candidates, none confirmed.
-    - handle_copy_extent stale logical_len (HIGH claimed): only triggers on
-      unsealed extents; production callers (run_recovery_task, handle_re_avali)
-      only target sealed extents by design. → F148-B defensive guard.
-    - handle_read_bytes pread stale (HIGH claimed): false — sync_all does not
-      invalidate already-read user-space buffers.
-    - handle_convert_to_ec idempotency (MED): already fixed by F119-D.
-    - write_shard_local concurrent read (MED): false — readers go through the
-      live entry.file handle, not the staging file.
-    - commit_shard_local UnsafeCell swap (LOW): mitigated by single-threaded compio.
+  Added Cmp::value() helper to autumn-etcd (target=3 VALUE, result=0 EQUAL).
 
-  Partition-server: 6 candidates, none confirmed.
-    - F-NEW-1 PS-side sync_partition_vp_refs divergence (HIGH claimed): false —
-      sync_partition_vp_refs reads p.sst_readers fresh at call time.
-    - F-NEW-2 per-partition save_table_locs_raw stale-snapshot race (HIGH claimed):
-      false on single-threaded compio. The path borrow_mut drop → rkyv_encode →
-      stream_client.append → mpsc send is purely synchronous, so borrow_mut
-      order = mpsc-send order = meta_stream record order. The latest persisted
-      record's tables_snapshot necessarily reflects all prior borrow_mut
-      mutations from any concurrent publisher. → F148-A inline-comment +
-      regression test to lock in the invariant against future refactors.
-    - F-NEW-3 compact log_extent_ids stale (MED): benign — stale snapshot
-      only over-keeps discards for already-punched extents; subsequent GC
-      no-ops on the missing extent.
-    - F-NEW-4 split vs compaction Phase 3 (MED): closed by F140 dual-gate
-      (compact_gate + gc_gate held by handle_split_part).
-    - F-NEW-5 GC vs split rg narrowing (MED): closed by F140 gc_gate held
-      around the entire `for eid in holes` loop including run_gc.
-    - F-NEW-6 compact partial commit + crash (MED): known accepted tradeoff
-      per F104 (orphan row_stream bytes; recovery loads previous checkpoint).
+  Made `EtcdMirror` carry `instance_id: Rc<String>` + `leader: Rc<Cell<bool>>`
+  (shared with AutumnManager).
 
-  Already-tracked: MED-2 (handle_get → resolve_value vs GC punch_holes) remains
-  deferred as a structural feature (per-extent reader-pin protocol).
+  Added a private `EtcdMirror::txn_fenced(extra_cmp, success, failure)` that
+  always prepends `Cmp::value(LEADER_KEY) == instance_id` to extra_cmp. On
+  txn rejection it does a follow-up GET on the leader-key to distinguish
+  fence-fail (flip `leader` Cell to false, return AppError::NotLeader) from
+  extra_cmp-fail (return Ok(false), preserving the create_revision==0
+  semantics for owner-lock + recoveryTasks acquisition).
 
-Fix shipped (F148):
+  Rerouted `put_msgs_txn` and `put_and_delete_txn` through `txn_fenced(vec![],
+  …)`. Return type changed from `anyhow::Result<()>` to `Result<(), AppError>`
+  so the NotLeader distinction propagates without translation.
 
-  F148-A — Inline-comment + regression test for the metadata-publish ordering
-  invariant. The conclusion that flush + compact concurrent publishes do not
-  race is load-bearing on three properties:
-    (P1) compio P-log runtime is single-threaded;
-    (P2) borrow_mut blocks contain no .await;
-    (P3) the path borrow_mut drop → rkyv_encode → stream_client.append →
-         mpsc-send-into-per-stream-worker is purely synchronous; first .await
-         is on the per-stream worker's ack_rx (after FIFO mpsc).
-  Inline `// F148-A invariant` comments at flush_one_imm + flush_one_imm_local
-  (lib.rs) and both branches of do_compact (background.rs) state the rule next
-  to the code. New test
-  f148_publisher_invariant_tests::f148_concurrent_publisher_ordering_invariant
-  exercises two simulated publishers on one compio runtime via futures::join!
-  and asserts:
-    (A1) worker received both publishes;
-    (A2) the LATER publisher's snapshot includes the EARLIER's mutation;
-    (A3) the LATEST received snapshot equals the post-state of shared tables.
+  Five callsite groups now go through the fence:
+    1. All 9 `mirror_*` helpers (lib.rs ~1218–1431) — `.map_err(...)` shims
+       stripped now that the helpers return AppError directly.
+    2. `persist_extent` (lib.rs ~1217).
+    3. `acquire_owner_revision` (lib.rs ~665) — extra_cmp = create_revision==0
+       on `ownerLocks/$owner_key`. The follow-up GET reads the existing
+       revision when the CAS fails.
+    4. `dispatch_recovery_task` (recovery.rs ~107) — extra_cmp =
+       create_revision==0 on `recoveryTasks/$extent_id`. Returns Ok(()) on
+       Ok(false) (already in-flight), bubbles NotLeader on Err.
+    5. `handle_multi_modify_split` Phase-2 consolidated txn (rpc_handlers.rs
+       ~1533) — error mapper updated to `Self::err_to_status` so NotLeader
+       maps to StatusCode::Unavailable instead of being flattened to Internal.
 
-  F148-B — Defensive guard in handle_copy_extent (extent_node.rs). After
-  manager-fetch + apply_extent_meta_durable, refuse with CODE_PRECONDITION
-  when entry.sealed_length == 0. Production callers only target sealed extents,
-  so this is belt-and-braces — converts a theoretical race window (where a
-  stray caller could observe a mix of pre- and post-truncate-to-commit bytes
-  via file_pread_chunked on an unsealed extent) into a clean error.
-
-  F148-C — Documentation:
-    - crates/partition-server/CLAUDE.md Programming Note 10: full statement of
-      the metadata-publish ordering invariant.
-    - crates/stream/CLAUDE.md append protocol step 5: F148-B bullet.
-    - feature_list.md F148 entry.
-    - README.md F148 manual-repro.
+  Intentionally NOT routed through txn_fenced:
+    - `try_become_leader` — the txn IS the operation establishing ownership of
+      the leader-key; cannot fence on a key we are about to acquire.
+    - `replay_from_etcd` — read-only, no fence semantics.
+    - `leader_keepalive_loop` — pure lease keep-alive, no k/v write.
 
 Files modified:
-  - crates/stream/src/extent_node.rs (F148-B guard + 2 unit tests in
-    f148_copy_extent_tests).
-  - crates/partition-server/src/lib.rs (F148-A inline comments at
-    flush_one_imm + flush_one_imm_local; 1 new unit test in
-    f148_publisher_invariant_tests).
-  - crates/partition-server/src/background.rs (F148-A inline comments at
-    both branches of do_compact).
-  - crates/partition-server/CLAUDE.md (Programming Note 10).
-  - crates/stream/CLAUDE.md (append protocol step 5 F148-B bullet).
-  - feature_list.md (F148 entry, passes:true).
-  - README.md (F148 manual-repro block).
+  - crates/etcd/src/lib.rs (Cmp::value).
+  - crates/manager/src/lib.rs (EtcdMirror struct + connect signature, LEADER_KEY
+    hoisted to module-level constant, txn_fenced, put_msgs_txn/put_and_delete_txn
+    rerouted, mirror_* shims stripped, acquire_owner_revision rerouted,
+    instance_id changed to Rc<String>, leader_election_loop + try_become_leader
+    use the module-level constant).
+  - crates/manager/src/recovery.rs (dispatch_recovery_task rerouted, two
+    .map_err shims stripped from apply_recovery_done + apply_ec_conversion_done).
+  - crates/manager/src/rpc_handlers.rs (handle_multi_modify_split error mapper
+    updated to Self::err_to_status).
+  - crates/manager/tests/f149_leader_fence.rs (new — gated #[ignore] integration
+    test verifying deposition produces CODE_NOT_LEADER and only pre-deposition
+    state survives).
+  - crates/manager/CLAUDE.md (note 15 — full F149 statement).
+  - feature_list.md (F149 entry, passes:true).
+  - README.md (F149 manual-repro block + live-cluster repro).
   - claude-progress.txt (this file).
 
 Verification:
   - cargo build --workspace: clean (only pre-existing warnings).
-  - cargo test -p autumn-manager --lib: 30/30 pass (no manager-side change).
-  - cargo test -p autumn-stream --lib: 52/52 pass — 50 pre-existing + 2 new
-    F148-B tests (copy_extent_unsealed_refused_with_precondition,
-    copy_extent_sealed_succeeds).
-  - cargo test -p autumn-partition-server --lib: 108/108 pass — pre-existing
-    baseline + 1 new F148-A test
-    (f148_concurrent_publisher_ordering_invariant). The 2 historical f099i
-    parallel-test race failures did not trigger this run.
+  - cargo test -p autumn-etcd --lib: 3/3 pass.
+  - cargo test -p autumn-manager --lib: 30/30 pass — no unit test regression
+    (in-memory mode bypasses etcd entirely; fence is a no-op).
+  - cargo test -p autumn-stream --lib: 52/52 pass.
+  - cargo test -p autumn-partition-server --lib: 108/108 pass.
+  - cargo build -p autumn-manager --tests: clean compile of all integration
+    tests including the new f149_leader_fence.
+  - The integration test `f149_deposed_leader_etcd_writes_are_fenced` is
+    `#[ignore]`-gated per repo convention (requires Go toolchain to build the
+    embedded etcd helper). It reproduces the deposition window by externally
+    overwriting the leader-key value mid-flight and asserts (a) baseline writes
+    succeed, (b) the next mirror_register_node returns CODE_NOT_LEADER,
+    (c) subsequent writes remain sticky CODE_NOT_LEADER (proving the in-process
+    `leader` Cell flipped on the first fence break without re-hitting etcd),
+    and (d) only the pre-deposition node entry survived in etcd.
+  - Live-cluster verification: see README.md F149 block (SIGSTOP M1 + 12 s wait
+    + SIGCONT to surface the deposition window).
+
+Distributed-systems audit:
+
+  1. Identity — instance_id is generated by `uuid::Uuid::new_v4()` once at
+     `AutumnManager::new()`. It survives the entire process lifetime and is the
+     same value written into LEADER_KEY by `try_become_leader` AND used by
+     `txn_fenced` as the fence operand. The same instance can re-acquire
+     leadership after a transient failure (its previous lease expired, the
+     LEADER_KEY auto-deleted, the next election round wrote the same
+     instance_id back) — fence still works because we are comparing against
+     ourselves.
+
+  2. The follow-up GET in txn_fenced on rejection: there is a brief race where
+     between the failed txn and the GET, the new leader could itself be
+     deposed and a third leader could win — but in that scenario the GET sees
+     the third leader's instance_id, which still doesn't match ours, so we
+     correctly return NotLeader. The only way the GET returns "still leader"
+     after a txn fail is if the extra_cmp itself failed — which is the
+     intended Ok(false) path.
+
+  3. The leader Cell flip is monotonic-during-deposition: once flipped to
+     false, only `try_become_leader` can flip it back to true, and only
+     after a successful CAS that re-establishes ownership. So the
+     "false-flip-then-instantly-true" race is impossible.
 
 Next steps:
   - MED-2 (Get → resolve_value vs GC reader-pin) — structural reader-epoch /
-    extent-pin fix needed. A partition's resolve_value calls
-    read_bytes_from_extent on a log_stream extent while background GC may
-    concurrently call stream_punch_holes/truncate on the same extent. The
-    manager-side delete guard (F139) only covers recovery_tasks; a live Get
-    resolving a VP while GC removes the extent has no pin protocol. Requires
-    a per-extent reader-epoch counter or a PS-level extent-pin set integrated
-    with the GC submission path. Separate feature — deeper structural change
-    than the refuse-at-start pattern.
+    extent-pin fix needed, deferred per F148 next-steps.
+  - Live-cluster verification of F149 against a real 3-node etcd cluster
+    (manual repro is documented; needs to run against an etcd-having env).

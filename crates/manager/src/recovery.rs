@@ -105,21 +105,18 @@ impl AutumnManager {
             }
 
             if let Some(etcd) = &self.etcd {
+                // F149: route through the leader-fenced txn helper. The
+                // create_revision==0 CAS guarantees we don't double-record an
+                // in-flight recovery task; if a task already exists we return
+                // Ok(()) (caller retries on next dispatch tick). If the
+                // leader fence itself fails, NotLeader bubbles up so the
+                // background loop short-circuits and the new leader takes
+                // over.
                 let key = format!("recoveryTasks/{extent_id}");
                 let payload = rkyv_encode(&task).to_vec();
-                let cmp =
-                    autumn_etcd::Cmp::create_revision(key.as_bytes(), 0);
-                let txn = autumn_etcd::proto::TxnRequest {
-                    compare: vec![cmp],
-                    success: vec![autumn_etcd::Op::put(key.as_bytes(), &payload)],
-                    failure: vec![],
-                };
-                let c = etcd.client.borrow_mut();
-                let resp = c
-                    .txn(txn)
-                    .await
-                    .map_err(|e| AppError::Internal(e.to_string()))?;
-                if !resp.succeeded {
+                let extra_cmp = vec![autumn_etcd::Cmp::create_revision(key.as_bytes(), 0)];
+                let put_op = autumn_etcd::Op::put(key.as_bytes(), &payload);
+                if !etcd.txn_fenced(extra_cmp, vec![put_op], vec![]).await? {
                     return Ok(());
                 }
             }
@@ -268,8 +265,7 @@ impl AutumnManager {
                 vec![(format!("extents/{}", updated_extent.extent_id), ex_payload)],
                 vec![format!("recoveryTasks/{}", updated_extent.extent_id)],
             )
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+            .await?;
         }
 
         self.recovery_tasks
@@ -816,9 +812,7 @@ impl AutumnManager {
         if let Some(etcd) = &self.etcd {
             let key = format!("extents/{}", extent_id);
             let val = rkyv_encode(&updated).to_vec();
-            etcd.put_msgs_txn(vec![(key, val)])
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            etcd.put_msgs_txn(vec![(key, val)]).await?;
         }
 
         Ok(())

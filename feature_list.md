@@ -532,6 +532,29 @@
   - Live-cluster re-verification not applicable: F148 ships only documentation, an inline guard with no production-path effect, and tests.
 - **passes:** true (build + lib tests clean; behaviorally inert in production).
 
+### F149 · Leader-fence on every manager etcd write txn (master-standby split-brain closure)
+- **Target:** Close the failover-gap split-brain window. F005's lease-based leader election guarantees that at most one manager **holds** the leader-key at any time, but the deposed leader's in-process `self.leader.get() == true` flag can lag the etcd ground truth indefinitely under runtime starvation, GC pauses, or syscall hangs. During that lag the deposed leader's mirror_* writes overwrite the new leader's state with last-writer-wins — reverting freshly-applied recovery slot replacements, EC conversion eversion bumps, split snapshots, etc. F149 makes every manager → etcd write txn fenced on the value of the leader-key.
+- **Root cause:** Pre-F149, mirror_* helpers issued plain etcd puts without any conditional CAS on identity. F005's `Cmp::create_revision == 0` only protects the leader-key acquisition itself; it does not protect subsequent metadata mutations. The window between (a) the etcd lease expiring + a new leader winning the CAS, and (b) the old leader's keepalive task observing failure and flipping `set_leader(false)`, is the exposure: bounded by lease TTL + keepalive jitter on a healthy host (~10 s), unbounded under host pathology.
+- **Fix:**
+  - Added `autumn_etcd::Cmp::value(key, value)` helper (target=3 VALUE, result=0 EQUAL).
+  - `EtcdMirror` now carries `instance_id: Rc<String>` + `leader: Rc<Cell<bool>>` (shared with `AutumnManager`).
+  - New private `EtcdMirror::txn_fenced(extra_cmp, success, failure) -> Result<bool, AppError>` always prepends `Cmp::value(LEADER_KEY) == instance_id` to `extra_cmp`. On `succeeded == false` it does a follow-up GET on the leader-key to distinguish (a) fence-fail (someone else's `instance_id` or empty) → flip `leader` Cell to false + return `AppError::NotLeader`; (b) fence-held but extra_cmp-fail → return `Ok(false)` (preserves the existing CAS-fail semantics for owner-lock + recoveryTasks acquisition paths).
+  - `EtcdMirror::put_msgs_txn` and `put_and_delete_txn` rerouted through `txn_fenced(vec![], …)`. Return type changed from `anyhow::Result<()>` to `Result<(), AppError>` so the `NotLeader` distinction propagates.
+  - All 9 mirror_* helpers + `persist_extent` now `?` directly into `AppError` (the redundant `.map_err(|e| AppError::Internal(e.to_string()))` shims were stripped).
+  - `acquire_owner_revision` (lib.rs) and `dispatch_recovery_task` (recovery.rs) — the two manual `c.txn(...)` callsites — now use `txn_fenced` with `extra_cmp = vec![Cmp::create_revision(key, 0)]`. Their `Ok(false)` semantics (key already exists) are preserved.
+  - `handle_multi_modify_split`'s Phase-2 consolidated etcd txn already routed through `etcd.put_msgs_txn`; only the `.map_err` shim was updated to `Self::err_to_status`.
+  - `try_become_leader` and `replay_from_etcd` are intentionally NOT routed through `txn_fenced` (the former IS the operation establishing leader-key ownership; the latter is read-only).
+- **Files:** `crates/etcd/src/lib.rs` (Cmp::value), `crates/manager/src/lib.rs` (EtcdMirror struct + connect signature, txn_fenced, put_msgs_txn / put_and_delete_txn rerouted, mirror_* shims stripped, acquire_owner_revision rerouted, LEADER_KEY hoisted to module-level constant, instance_id changed to `Rc<String>`), `crates/manager/src/recovery.rs` (dispatch_recovery_task rerouted, two `.map_err` shims stripped), `crates/manager/src/rpc_handlers.rs` (handle_multi_modify_split error mapper updated to Self::err_to_status), `crates/manager/tests/f149_leader_fence.rs` (new integration test gated on embedded etcd), `crates/manager/CLAUDE.md` (note 15), `feature_list.md` (this entry), `README.md` (F149 manual-repro block), `claude-progress.txt`.
+- **Verification:**
+  - `cargo build --workspace`: clean (pre-existing warnings only).
+  - `cargo test -p autumn-etcd --lib`: 3/3 pass.
+  - `cargo test -p autumn-manager --lib`: 30/30 pass (no behavior regression in single-manager mode — the fence compare passes when the manager owns the leader-key, which is always true in unit tests since they use in-memory `AutumnManager::new()` with `etcd: None`).
+  - `cargo test -p autumn-stream --lib`: 52/52 pass.
+  - `cargo test -p autumn-partition-server --lib`: 108/108 pass.
+  - `cargo build -p autumn-manager --tests`: clean compile of all integration tests including the new `f149_leader_fence`.
+  - The integration test `f149_deposed_leader_etcd_writes_are_fenced` is `#[ignore]`-gated per repo convention (requires Go toolchain to build the embedded etcd helper); reproduces the deposition window by externally overwriting the leader-key value mid-flight and asserts (a) baseline writes succeed, (b) the next write returns `CODE_NOT_LEADER`, (c) subsequent writes remain `CODE_NOT_LEADER` (proving the in-process `leader` Cell flipped without re-hitting etcd), and (d) only the pre-deposition state survived in etcd. Live-cluster verification is the same procedure run against a 3-node etcd cluster — manual repro listed in README.md.
+- **passes:** true (build + 4 lib test suites pass; integration test compiles cleanly, marked `#[ignore]` per repo convention).
+
 ---
 
 ## Architectural lessons from the perf series (kept for context, the rest of F098/F099 lives in the Completed table)

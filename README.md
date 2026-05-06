@@ -410,6 +410,58 @@ protocol, separate structural feature).
 
 ---
 
+### F149 — Leader-fence on every manager etcd write (2026-05-06)
+
+F005's lease-based leader election guarantees at most one manager **holds** the
+leader-key at any time, but the deposed leader's in-process `self.leader` flag
+can lag the etcd ground truth indefinitely under runtime starvation, GC pauses,
+or syscall hangs. During that lag the deposed leader's mirror_* writes overwrite
+the new leader's state with last-writer-wins, reverting freshly-applied recovery
+slot replacements / EC conversion bumps / split snapshots. F149 closes the
+window by making **every** manager → etcd write txn fenced on the value of the
+leader-key:
+
+```
+compare prepended:
+  Cmp::value("autumn-rs/stream-manager/leader") == self.instance_id
+```
+
+If the fence holds, the txn applies as before. If the fence fails (someone
+else's `instance_id` is now in the leader-key), the helper flips the in-process
+`leader` Cell to `false` and returns `AppError::NotLeader`, which bubbles up to
+the client as `CODE_NOT_LEADER` so the client retries against whoever etcd
+currently lists as leader. Routes covered: all 9 mirror_* helpers,
+`persist_extent`, `acquire_owner_revision`, `dispatch_recovery_task`, and
+`handle_multi_modify_split`'s consolidated Phase-2 txn. The only paths
+intentionally NOT fenced are `try_become_leader` (the operation that
+establishes ownership) and `replay_from_etcd` (read-only).
+
+```
+# Unit-level smoke (in-memory mode — fence is no-op since etcd is None).
+cargo test -p autumn-manager --lib
+
+# Integration test — requires Go toolchain for the embedded etcd helper.
+# Spins up etcd, starts a manager, registers a node baseline, then externally
+# overwrites the leader-key value to simulate a clean failover. Asserts the
+# next mirror_register_node returns CODE_NOT_LEADER, that subsequent writes
+# stay sticky NotLeader (proving the in-process leader Cell flipped without
+# re-hitting etcd), and that only the pre-deposition state survived in etcd.
+cargo test -p autumn-manager --test f149_leader_fence -- --ignored --nocapture
+```
+
+Live-cluster repro: run two `autumn-manager-server` instances against a 3-node
+etcd cluster. Confirm M1 wins leadership (`etcdctl get
+autumn-rs/stream-manager/leader` returns M1's instance_id). Pause M1 with
+`SIGSTOP`, wait 12 s for M1's lease to expire, observe M2 winning election
+(value becomes M2's instance_id). `SIGCONT` M1 — its `leader_keepalive_loop`
+will eventually detect deposition, but ANY mirror_* call M1 issues in the gap
+must immediately bubble up `CODE_NOT_LEADER` rather than overwriting M2's
+state. Pre-F149: M1 would silently overwrite. Post-F149: M1's first attempted
+write fence-fails, flips `leader=false`, surfaces NotLeader; client retries
+hit M2.
+
+---
+
 ### F145 — punch_holes/truncate vs in-flight EC conversion (2026-05-06)
 
 F138 made `ec_conversion_inflight` an eversion-bump lock: while an extent is

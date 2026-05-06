@@ -22,20 +22,108 @@ use compio::BufResult;
 
 // ── EtcdMirror ─────────────────────────────────────────────────────────────
 
+/// Etcd path for the manager leader-key. F149: also used as the fence target
+/// for every manager etcd write txn.
+pub(crate) const LEADER_KEY: &str = "autumn-rs/stream-manager/leader";
+
 #[derive(Clone)]
 pub(crate) struct EtcdMirror {
     client: Rc<RefCell<autumn_etcd::EtcdClient>>,
+    /// F149: identity used in the leader-fence compare. Set at connect time
+    /// from `AutumnManager::instance_id`.
+    instance_id: Rc<String>,
+    /// F149: shared with `AutumnManager.leader`. Flipped to `false` when the
+    /// fence compare detects a deposition, so the in-process state agrees with
+    /// the etcd ground truth before the next operation runs.
+    leader: Rc<Cell<bool>>,
 }
 
 impl EtcdMirror {
-    async fn connect(endpoints: Vec<String>) -> Result<Self> {
+    async fn connect(
+        endpoints: Vec<String>,
+        instance_id: Rc<String>,
+        leader: Rc<Cell<bool>>,
+    ) -> Result<Self> {
         let client = autumn_etcd::EtcdClient::connect_many(&endpoints).await?;
         Ok(Self {
             client: Rc::new(RefCell::new(client)),
+            instance_id,
+            leader,
         })
     }
 
-    async fn put_msgs_txn(&self, kvs: Vec<(String, Vec<u8>)>) -> Result<()> {
+    /// F149: run a fenced txn. Always prepends a
+    /// `Cmp::value(LEADER_KEY) == instance_id` compare to `extra_cmp`.
+    ///
+    /// Returns:
+    ///   - `Ok(true)` — the txn (fence + extra) succeeded; success ops applied.
+    ///   - `Ok(false)` — the fence held but `extra_cmp` failed (e.g., a
+    ///     create_revision==0 CAS rejected because the key already exists).
+    ///     Caller-visible "soft-failure"; semantics identical to a vanilla
+    ///     `succeeded=false` from etcd.
+    ///   - `Err(AppError::NotLeader)` — the fence itself failed. The shared
+    ///     `leader` Cell is flipped to `false` so subsequent in-process
+    ///     `ensure_leader()` calls reject. Callers should bubble this up so
+    ///     the client receives `CODE_NOT_LEADER` and retries against whoever
+    ///     etcd currently lists as leader.
+    async fn txn_fenced(
+        &self,
+        extra_cmp: Vec<autumn_etcd::proto::Compare>,
+        success: Vec<autumn_etcd::proto::RequestOp>,
+        failure: Vec<autumn_etcd::proto::RequestOp>,
+    ) -> Result<bool, AppError> {
+        let mut compare = Vec::with_capacity(1 + extra_cmp.len());
+        compare.push(autumn_etcd::Cmp::value(
+            LEADER_KEY.as_bytes(),
+            self.instance_id.as_bytes(),
+        ));
+        compare.extend(extra_cmp);
+
+        let txn = autumn_etcd::proto::TxnRequest {
+            compare,
+            success,
+            failure,
+        };
+
+        let resp = {
+            let c = self.client.as_ptr();
+            unsafe { &mut *c }
+                .txn(txn)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?
+        };
+
+        if resp.succeeded {
+            return Ok(true);
+        }
+
+        // Distinguish fence-failure from extra_cmp-failure by reading the
+        // current leader-key value. If it still matches our instance_id, the
+        // fence held and only a business CAS failed (e.g., create_revision==0
+        // refused because the key already exists). If it differs (or is
+        // gone), we have been deposed.
+        let got = {
+            let c = self.client.as_ptr();
+            unsafe { &mut *c }
+                .get(LEADER_KEY.as_bytes())
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?
+        };
+        let still_leader = got
+            .kvs
+            .first()
+            .map(|kv| kv.value.as_slice() == self.instance_id.as_bytes())
+            .unwrap_or(false);
+
+        if !still_leader {
+            self.leader.set(false);
+            return Err(AppError::NotLeader);
+        }
+
+        Ok(false)
+    }
+
+    async fn put_msgs_txn(&self, kvs: Vec<(String, Vec<u8>)>) -> Result<(), AppError> {
         if kvs.is_empty() {
             return Ok(());
         }
@@ -43,21 +131,22 @@ impl EtcdMirror {
             .into_iter()
             .map(|(k, v)| autumn_etcd::Op::put(k.as_bytes(), &v))
             .collect::<Vec<_>>();
-        let txn = autumn_etcd::proto::TxnRequest {
-            compare: vec![],
-            success: ops,
-            failure: vec![],
-        };
-        let c = self.client.as_ptr();
-        let _ = unsafe { &mut *c }.txn(txn).await?;
-        Ok(())
+        match self.txn_fenced(vec![], ops, vec![]).await? {
+            true => Ok(()),
+            // No extra_cmp was supplied, so a `false` here would mean etcd
+            // returned `succeeded=false` despite an empty compare list — that
+            // can only happen on a server-side bug. Surface as Internal.
+            false => Err(AppError::Internal(
+                "etcd txn rejected with empty extra_cmp".to_string(),
+            )),
+        }
     }
 
     async fn put_and_delete_txn(
         &self,
         puts: Vec<(String, Vec<u8>)>,
         deletes: Vec<String>,
-    ) -> Result<()> {
+    ) -> Result<(), AppError> {
         if puts.is_empty() && deletes.is_empty() {
             return Ok(());
         }
@@ -71,14 +160,12 @@ impl EtcdMirror {
                 .into_iter()
                 .map(|k| autumn_etcd::Op::delete(k.as_bytes())),
         );
-        let txn = autumn_etcd::proto::TxnRequest {
-            compare: vec![],
-            success: ops,
-            failure: vec![],
-        };
-        let c = self.client.as_ptr();
-        let _ = unsafe { &mut *c }.txn(txn).await?;
-        Ok(())
+        match self.txn_fenced(vec![], ops, vec![]).await? {
+            true => Ok(()),
+            false => Err(AppError::Internal(
+                "etcd txn rejected with empty extra_cmp".to_string(),
+            )),
+        }
     }
 }
 
@@ -198,7 +285,10 @@ pub struct AutumnManager {
     pub store: MetadataStore,
     leader: Rc<Cell<bool>>,
     etcd: Option<EtcdMirror>,
-    instance_id: String,
+    /// Owned via `Rc` so `EtcdMirror` (cloned from this) can use the same
+    /// identity in its leader-fence compare without shipping a string per
+    /// txn (F149).
+    instance_id: Rc<String>,
     recovery_tasks: Rc<RefCell<HashMap<u64, MgrRecoveryTask>>>,
     ec_conversion_inflight: Rc<RefCell<HashSet<u64>>>,
     runtime_started: Rc<Cell<bool>>,
@@ -224,7 +314,7 @@ impl AutumnManager {
             store: MetadataStore::new(),
             leader: Rc::new(Cell::new(true)),
             etcd: None,
-            instance_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: Rc::new(uuid::Uuid::new_v4().to_string()),
             recovery_tasks: Rc::new(RefCell::new(HashMap::new())),
             ec_conversion_inflight: Rc::new(RefCell::new(HashSet::new())),
             runtime_started: Rc::new(Cell::new(false)),
@@ -237,7 +327,9 @@ impl AutumnManager {
     pub async fn new_with_etcd(endpoints: Vec<String>) -> Result<Self> {
         let mut s = Self::new();
         s.leader.set(false);
-        s.etcd = Some(EtcdMirror::connect(endpoints).await?);
+        s.etcd = Some(
+            EtcdMirror::connect(endpoints, s.instance_id.clone(), s.leader.clone()).await?,
+        );
         s.replay_from_etcd().await?;
         let _ = s.try_become_leader().await;
         s.start_runtime_tasks();
@@ -314,7 +406,6 @@ impl AutumnManager {
     // ── Leader election ────────────────────────────────────────────────
 
     async fn leader_election_loop(self) {
-        const LEADER_KEY: &str = "autumn-rs/stream-manager/leader";
         const RETRY: Duration = Duration::from_secs(2);
         loop {
             if self.leader.get() {
@@ -354,7 +445,6 @@ impl AutumnManager {
     }
 
     async fn try_become_leader(&self) -> Result<bool> {
-        const LEADER_KEY: &str = "autumn-rs/stream-manager/leader";
         const LEASE_TTL_SECS: i64 = 10;
         let etcd = match &self.etcd {
             Some(v) => v,
@@ -664,34 +754,27 @@ impl AutumnManager {
 
         if let Some(etcd) = &self.etcd {
             let key = format!("ownerLocks/{owner_key}");
-            let cmp =
-                autumn_etcd::Cmp::create_revision(key.as_bytes(), 0);
-            let put = autumn_etcd::Op::put(
-                key.as_bytes(),
-                self.instance_id.as_bytes(),
-            );
-            let txn = autumn_etcd::proto::TxnRequest {
-                compare: vec![cmp],
-                success: vec![put],
-                failure: vec![],
+            // F149: route through the leader-fenced txn helper. The
+            // create_revision==0 CAS becomes `extra_cmp`; if the owner-key
+            // already exists the txn returns `Ok(false)` (we still proceed
+            // to the GET to read the existing revision). If the leader
+            // fence itself fails, `Err(AppError::NotLeader)` propagates.
+            let extra_cmp = vec![autumn_etcd::Cmp::create_revision(key.as_bytes(), 0)];
+            let put_op = autumn_etcd::Op::put(key.as_bytes(), self.instance_id.as_bytes());
+            let _ = etcd.txn_fenced(extra_cmp, vec![put_op], vec![]).await?;
+
+            let got = {
+                let c = etcd.client.as_ptr();
+                unsafe { &mut *c }
+                    .get(key.as_bytes())
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?
             };
-
-            let c = etcd.client.borrow_mut();
-            let _ = c
-                .txn(txn)
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-
-            let got = c
-                .get(key.as_bytes())
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?;
             let kv = got
                 .kvs
                 .first()
                 .ok_or_else(|| AppError::Internal("owner lock key missing".to_string()))?;
             let rev = kv.create_revision;
-            drop(c);
 
             let mut s = self.store.inner.borrow_mut();
             s.owner_revisions.insert(owner_key.to_string(), rev);
@@ -1128,8 +1211,7 @@ impl AutumnManager {
         if let Some(etcd) = &self.etcd {
             let value = rkyv_encode(extent).to_vec();
             etcd.put_msgs_txn(vec![(format!("extents/{}", extent.extent_id), value)])
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+                .await?;
         }
         Ok(())
     }
@@ -1191,9 +1273,7 @@ impl AutumnManager {
                     rkyv_encode(disk).to_vec(),
                 ));
             }
-            etcd.put_msgs_txn(kvs)
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            etcd.put_msgs_txn(kvs).await?;
         }
         Ok(())
     }
@@ -1204,9 +1284,7 @@ impl AutumnManager {
                 format!("streams/{}", stream.stream_id),
                 rkyv_encode(stream).to_vec(),
             )];
-            etcd.put_msgs_txn(kvs)
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            etcd.put_msgs_txn(kvs).await?;
         }
         Ok(())
     }
@@ -1227,9 +1305,7 @@ impl AutumnManager {
                     rkyv_encode(extent).to_vec(),
                 ),
             ];
-            etcd.put_msgs_txn(kvs)
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            etcd.put_msgs_txn(kvs).await?;
         }
         Ok(())
     }
@@ -1255,9 +1331,7 @@ impl AutumnManager {
                     rkyv_encode(new_extent).to_vec(),
                 ),
             ];
-            etcd.put_msgs_txn(kvs)
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            etcd.put_msgs_txn(kvs).await?;
         }
         Ok(())
     }
@@ -1284,9 +1358,7 @@ impl AutumnManager {
                 .iter()
                 .map(|id| format!("extents/{id}"))
                 .collect::<Vec<_>>();
-            etcd.put_and_delete_txn(puts, deletes)
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            etcd.put_and_delete_txn(puts, deletes).await?;
         }
         Ok(())
     }
@@ -1313,9 +1385,7 @@ impl AutumnManager {
                     rkyv_encode(&region).to_vec(),
                 ));
             }
-            etcd.put_msgs_txn(kvs)
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            etcd.put_msgs_txn(kvs).await?;
         }
         Ok(())
     }
@@ -1337,9 +1407,7 @@ impl AutumnManager {
                     rkyv_encode(ex).to_vec(),
                 ));
             }
-            etcd.put_msgs_txn(kvs)
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?;
+            etcd.put_msgs_txn(kvs).await?;
         }
         Ok(())
     }

@@ -1532,7 +1532,7 @@ impl AutumnManager {
                     }
                     etcd.put_msgs_txn(kvs)
                         .await
-                        .map_err(|e| (StatusCode::Internal, e.to_string()))?;
+                        .map_err(|e| Self::err_to_status(&e))?;
                 }
 
                 // Phase 3: Apply to in-memory store AFTER etcd success

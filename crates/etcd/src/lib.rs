@@ -366,6 +366,20 @@ impl Cmp {
             ..Default::default()
         }
     }
+
+    /// Compare value of a key equals the given byte slice. Used by autumn-rs
+    /// for the F149 leader-fence: every manager etcd write txn prepends a
+    /// `Cmp::value(LEADER_KEY) == instance_id` so a deposed leader cannot
+    /// stomp on the new leader's writes during the failover window.
+    pub fn value(key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Compare {
+        Compare {
+            result: 0, // EQUAL
+            target: 3, // VALUE
+            key: key.as_ref().to_vec(),
+            target_union: Some(TargetUnion::Value(value.as_ref().to_vec())),
+            ..Default::default()
+        }
+    }
 }
 
 /// Helper for building RequestOp operations.

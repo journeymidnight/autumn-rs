@@ -408,3 +408,72 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       write is benign (failover replay sees the latest revision per key,
       and the PS retry produces a fresh correct snapshot).
     Cross-reference: notes 10 (F138), 11 (F139), 12 (F145), 13 (F146).
+
+15. **F149 leader-fence on every manager etcd write txn.**
+    F005 already runs lease-based leader election + a 2 s keepalive on a
+    10 s lease. The window between (a) the etcd lease expiring and (b)
+    the deposed leader's keepalive task observing failure can stretch
+    arbitrarily long under compio runtime starvation, GC pauses, or
+    syscall hangs. During that window the deposed leader still believes
+    `self.leader.get() == true` and happily issues etcd writes against
+    keys (`streams/`, `extents/`, `partitions/`, `partitionVpRefs/`,
+    `regions/`, `nodes/`, `disks/`, `psNodes/`, `recoveryTasks/`,
+    `ownerLocks/`) that the new leader has already begun overwriting.
+    Etcd CAS by itself does not protect us — these mirror_* paths use
+    plain puts, not version-conditional CAS, so the deposed write is a
+    bare last-writer-wins overwrite that can revert a freshly-applied
+    recovery slot replacement, an EC conversion eversion bump, a split
+    snapshot, etc.
+
+    F149 closes this by making **every** manager → etcd write txn fenced
+    on the value of the leader-key:
+
+      compare prepended:
+        Cmp::value("autumn-rs/stream-manager/leader") == self.instance_id
+
+    If the fence holds, the txn applies as before. If the fence fails
+    (someone else's `instance_id` is now in the leader-key, or the
+    leader-key has been deleted entirely), the helper:
+    - flips the in-process `leader: Rc<Cell<bool>>` to `false` so
+      `ensure_leader()` short-circuits subsequent mutating RPCs without
+      another etcd round-trip;
+    - returns `AppError::NotLeader`, which the RPC handler translates
+      into `CODE_NOT_LEADER` so the client retries against whoever etcd
+      currently lists as leader.
+
+    Implementation sits on `EtcdMirror`:
+
+      - `EtcdMirror` carries `instance_id: Rc<String>` and
+        `leader: Rc<Cell<bool>>` — both shared with `AutumnManager`.
+      - `txn_fenced(extra_cmp, success, failure)` always prepends the
+        fence compare, then runs the etcd txn. On `succeeded == false`
+        it issues a follow-up GET on the leader-key to distinguish:
+        * fence held but `extra_cmp` failed — return `Ok(false)` (this
+          is the normal CAS-fail path used by the create_revision
+          guards on `ownerLocks/` and `recoveryTasks/`);
+        * fence broke — set leader=false + return `NotLeader`.
+      - `put_msgs_txn` and `put_and_delete_txn` are thin wrappers around
+        `txn_fenced(vec![], …)` and bubble `NotLeader` up.
+
+    Five call paths route through this:
+      1. all 9 `mirror_*` helpers (lib.rs ~1218–1431);
+      2. `persist_extent` (lib.rs ~1217);
+      3. `acquire_owner_revision` (lib.rs ~665) — extra_cmp is
+         create_revision==0 for the owner-lock CAS;
+      4. `dispatch_recovery_task` (recovery.rs ~107) — extra_cmp is
+         create_revision==0 for the recoveryTasks/$id CAS;
+      5. `handle_multi_modify_split`'s consolidated Phase-2 txn
+         (rpc_handlers.rs ~1533).
+
+    NOT fenced (intentionally):
+      - `try_become_leader` — this txn IS the operation that establishes
+        ownership of the leader-key; cannot fence on owning what we are
+        about to acquire.
+      - `replay_from_etcd` — read-only; fence has no semantics for GETs.
+      - `leader_keepalive_loop` — pure lease keep-alive RPC; no k/v
+        write.
+
+    Cross-reference: F005 (lease-based leader election); F079
+    (multi-manager failover for StreamClient + PS); test
+    `crates/manager/tests/f149_leader_fence.rs` (gated on embedded
+    etcd, marked `#[ignore]` per repo convention).
