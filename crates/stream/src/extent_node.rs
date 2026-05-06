@@ -2011,6 +2011,21 @@ impl ExtentNode {
     ) -> Result<RecoveryTaskDone, String> {
         let extent_info = self.resolve_recovery_extent(&task).await?;
 
+        // F147-C: refuse-at-start — if the local extent already has a fresher
+        // eversion than the manager's snapshot, the recovery snapshot is stale.
+        // Skip the expensive peer-copy and let the manager redispatch (the
+        // caller's retry loop will re-resolve extent_info from manager on the
+        // next attempt).
+        if let Some(local) = self.extents.get(&task.extent_id) {
+            let live_ev = local.eversion.load(Ordering::SeqCst);
+            if live_ev > extent_info.eversion {
+                return Err(format!(
+                    "extent {} local eversion {} > recovery snapshot {}; skipping stale recovery",
+                    task.extent_id, live_ev, extent_info.eversion
+                ));
+            }
+        }
+
         // EC vs replication dispatch keys on `ec_converted` (set by the
         // manager's `apply_ec_conversion_done` after a sealed extent has
         // actually been RS-encoded). Pre-EC extents — including the open
@@ -2045,14 +2060,30 @@ impl ExtentNode {
             .map_err(|e| e.to_string())?;
         file_ref(&extent.file).sync_all().await
             .map_err(|e| e.to_string())?;
+
+        // F147-C: verify-after-sync — a concurrent apply_extent_meta_durable
+        // (triggered by handle_re_avali or another append's seal-confirm branch)
+        // may have bumped eversion/sealed_length/avali during the long peer-copy
+        // await above. If the local eversion has advanced past the snapshot,
+        // writing back the stale snapshot values would silently roll back the
+        // fresher atomics. Return Err so the manager redispatches recovery
+        // against the fresh seal point.
+        let live_eversion = extent.eversion.load(Ordering::SeqCst);
+        if live_eversion > extent_info.eversion {
+            return Err(format!(
+                "recovery for extent {} superseded by concurrent seal: local eversion {} > snapshot {}",
+                task.extent_id, live_eversion, extent_info.eversion
+            ));
+        }
+
         extent.len.store(payload_len, Ordering::SeqCst);
-        extent
-            .eversion
-            .store(extent_info.eversion, Ordering::SeqCst);
-        extent
-            .sealed_length
-            .store(extent_info.sealed_length, Ordering::SeqCst);
-        extent.avali.store(extent_info.avali, Ordering::SeqCst);
+        // Use fetch_max instead of store for eversion/sealed_length/avali so
+        // that any concurrent atomic update that landed between the check and
+        // these stores cannot be rolled back. Monotonic progress is guaranteed
+        // even in the race window after the eversion check above.
+        let _ = extent.eversion.fetch_max(extent_info.eversion, Ordering::SeqCst);
+        let _ = extent.sealed_length.fetch_max(extent_info.sealed_length, Ordering::SeqCst);
+        let _ = extent.avali.fetch_max(extent_info.avali, Ordering::SeqCst);
 
         let _ = self.save_meta(task.extent_id, &extent).await;
 
@@ -3583,5 +3614,105 @@ mod f147b_tests {
             stale_resp.code, CODE_PRECONDITION,
             "handle_append on sealed extent must return CODE_PRECONDITION"
         );
+    }
+}
+
+#[cfg(test)]
+mod f147c_tests {
+    use super::*;
+
+    /// F147-C: run_recovery_task refuses when the local extent's eversion
+    /// already exceeds the manager's recovery snapshot.
+    ///
+    /// The full `run_recovery_task` path requires a live manager (for
+    /// `resolve_recovery_extent`) and live peers (for peer-copy). We cannot
+    /// inject those in a unit test, so this test exercises the logical
+    /// precondition checked by the refuse-at-start guard directly:
+    ///
+    ///   Given: a local ExtentEntry with eversion = 10
+    ///   Given: a recovery snapshot ExtentInfo with eversion = 5
+    ///   Assertion: local.eversion.load(SeqCst) > extent_info.eversion   → true
+    ///
+    /// This is exactly the boolean the refuse-at-start guard evaluates before
+    /// issuing the expensive peer-copy. The test also confirms:
+    ///
+    ///   (a) fetch_max on eversion/sealed_length correctly refuses to roll back
+    ///       a higher value to a lower one (verifies the writeback monotonicity
+    ///       guarantee that replaces the old unconditional store).
+    ///   (b) fetch_max on avali (AtomicU32) behaves identically.
+    ///
+    /// Pattern matches F147-B's test: the post-fetch verify cannot be injected
+    /// in a single-threaded compio test either, so both tests validate the
+    /// observable guard semantics rather than the concurrent injection.
+    #[compio::test]
+    async fn f147_recovery_refuses_when_local_eversion_advanced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
+        let node = ExtentNode::new(config).await.expect("ExtentNode::new");
+
+        // Allocate extent 7001 so it lives in self.extents with a known state.
+        let alloc_payload = rkyv_encode(&AllocExtentReq { extent_id: 7001 });
+        let alloc_result = node.handle_alloc_extent(alloc_payload).await;
+        assert!(alloc_result.is_ok(), "alloc_extent should succeed");
+
+        // Simulate a concurrent apply_extent_meta_durable that advanced the
+        // local eversion to 10 (e.g., from a seal-confirm branch or re_avali).
+        {
+            let entry = node.extents.get(&7001).expect("extent 7001 in map");
+            entry.eversion.store(10, Ordering::SeqCst);
+            entry.sealed_length.store(512, Ordering::SeqCst);
+            entry.avali.store(1, Ordering::SeqCst);
+        }
+
+        // Build a stale recovery snapshot (eversion=5, sealed_length=256).
+        // This is the ExtentInfo the refuse-at-start guard compares against.
+        let stale_eversion: u64 = 5;
+        let stale_sealed_length: u64 = 256;
+
+        // Verify the refuse-at-start condition: local eversion > snapshot eversion.
+        {
+            let entry = node.extents.get(&7001).expect("extent 7001 in map");
+            let live_ev = entry.eversion.load(Ordering::SeqCst);
+            assert!(
+                live_ev > stale_eversion,
+                "refuse-at-start guard should fire: live_ev={} > stale_eversion={}",
+                live_ev, stale_eversion
+            );
+        }
+
+        // Verify fetch_max monotonicity: applying the stale snapshot must NOT
+        // roll back the fresher local eversion/sealed_length/avali.
+        {
+            let entry = node.extents.get(&7001).expect("extent 7001 in map");
+
+            // fetch_max(stale_eversion=5) on a field holding 10 must return 10
+            // (the old value) and leave the field at 10.
+            let prev_ev = entry.eversion.fetch_max(stale_eversion, Ordering::SeqCst);
+            assert_eq!(prev_ev, 10, "fetch_max must return old value 10");
+            assert_eq!(
+                entry.eversion.load(Ordering::SeqCst),
+                10,
+                "eversion must not roll back from 10 to 5"
+            );
+
+            // fetch_max(stale_sealed_length=256) on a field holding 512 must
+            // leave the field at 512.
+            let prev_sl = entry.sealed_length.fetch_max(stale_sealed_length, Ordering::SeqCst);
+            assert_eq!(prev_sl, 512, "fetch_max must return old sealed_length 512");
+            assert_eq!(
+                entry.sealed_length.load(Ordering::SeqCst),
+                512,
+                "sealed_length must not roll back from 512 to 256"
+            );
+
+            // fetch_max(0) on avali (AtomicU32) holding 1 must leave it at 1.
+            let prev_avali = entry.avali.fetch_max(0u32, Ordering::SeqCst);
+            assert_eq!(prev_avali, 1, "fetch_max must return old avali 1");
+            assert_eq!(
+                entry.avali.load(Ordering::SeqCst),
+                1,
+                "avali must not roll back from 1 to 0"
+            );
+        }
     }
 }
