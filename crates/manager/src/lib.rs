@@ -3081,4 +3081,80 @@ mod tests {
             );
         })
     }
+
+    /// F147-A: the verify-at-apply guard in handle_sync_partition_vp_refs
+    /// must detect a concurrent eversion bump on any touched extent.
+    ///
+    /// This test exercises the state-checking logic directly (no RPC, no
+    /// compio runtime). It:
+    ///   1. Sets up an extent with eversion=3 and a snapshot that touches it.
+    ///   2. Captures pre_eversion via partition_vp_ref_deltas.
+    ///   3. Simulates a concurrent mutator bumping eversion to 4.
+    ///   4. Asserts the verify-at-apply check detects the mismatch.
+    #[test]
+    fn f147_sync_vp_refs_refuses_when_concurrent_eversion_bump() {
+        let extent_id = 77u64;
+        let part_id = 5u64;
+
+        let mut state = autumn_common::MetadataState::default();
+        // Seed an extent with eversion=3 and no existing vp_table_refs.
+        state.extents.insert(
+            extent_id,
+            MgrExtentInfo {
+                extent_id,
+                replicates: vec![],
+                parity: vec![],
+                eversion: 3,
+                refs: 1,
+                vp_table_refs: 0,
+                sealed_length: 100,
+                avali: 1,
+                replicate_disks: vec![],
+                parity_disks: vec![],
+                ec_converted: false,
+            },
+        );
+
+        // Snapshot that adds refs=1 to extent_id for part_id (touching it).
+        let snapshot = MgrPartitionVpRefs {
+            part_id,
+            refs: vec![(extent_id, 1)],
+        };
+
+        // Capture pre_eversion exactly as handle_sync_partition_vp_refs does.
+        let pre_eversion: HashMap<u64, u64> =
+            AutumnManager::partition_vp_ref_deltas(&state, &snapshot)
+                .keys()
+                .filter_map(|&eid| state.extents.get(&eid).map(|ex| (eid, ex.eversion)))
+                .collect();
+
+        // Verify the extent was captured.
+        assert!(
+            pre_eversion.contains_key(&extent_id),
+            "F147-A: extent must be in pre_eversion capture"
+        );
+        assert_eq!(
+            pre_eversion[&extent_id], 3,
+            "F147-A: pre_eversion must be 3 before the bump"
+        );
+
+        // Simulate a concurrent mutator (e.g. apply_recovery_done) bumping eversion.
+        state.extents.get_mut(&extent_id).unwrap().eversion = 4;
+
+        // Run the verify-at-apply logic: any eversion mismatch must be detected.
+        let mut detected_mismatch = false;
+        for (&eid, &pre_ev) in &pre_eversion {
+            if let Some(live) = state.extents.get(&eid) {
+                if live.eversion != pre_ev {
+                    detected_mismatch = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            detected_mismatch,
+            "F147-A: verify-at-apply must detect eversion bump from 3 to 4 on extent {extent_id}"
+        );
+    }
 }

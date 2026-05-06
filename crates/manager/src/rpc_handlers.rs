@@ -1789,9 +1789,43 @@ impl AutumnManager {
             part_id: req.part_id,
             refs: req.refs,
         };
-        let extent_puts = {
+        // F147-A: refuse-at-start if any touched extent is in-flight for
+        // another eversion-bumping operation. Concurrent mutators (recovery,
+        // EC conversion) may bump eversion during the etcd await below; our
+        // pre-await blobs in extent_puts would then overwrite fresher data in
+        // etcd (last-writer-wins). PS must retry after the in-flight op clears.
+        {
             let s = self.store.inner.borrow();
-            Self::preview_partition_vp_refs_apply(&s, &snapshot)
+            let deltas = Self::partition_vp_ref_deltas(&s, &snapshot);
+            for extent_id in deltas.keys().copied() {
+                if self.ec_conversion_inflight.borrow().contains(&extent_id) {
+                    return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
+                        code: CODE_PRECONDITION,
+                        message: format!(
+                            "extent {extent_id} has in-flight EC conversion; \
+                             defer sync_partition_vp_refs until conversion completes"
+                        ),
+                    }));
+                }
+                if self.recovery_tasks.borrow().contains_key(&extent_id) {
+                    return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
+                        code: CODE_PRECONDITION,
+                        message: format!(
+                            "extent {extent_id} has in-flight recovery; \
+                             defer sync_partition_vp_refs until recovery completes"
+                        ),
+                    }));
+                }
+            }
+        }
+        let (extent_puts, pre_eversion) = {
+            let s = self.store.inner.borrow();
+            let puts = Self::preview_partition_vp_refs_apply(&s, &snapshot);
+            let evs: HashMap<u64, u64> = Self::partition_vp_ref_deltas(&s, &snapshot)
+                .keys()
+                .filter_map(|&eid| s.extents.get(&eid).map(|ex| (eid, ex.eversion)))
+                .collect();
+            (puts, evs)
         };
         if let Err(err) = self.mirror_partition_vp_refs(&snapshot, &extent_puts).await {
             return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
@@ -1801,6 +1835,25 @@ impl AutumnManager {
         }
         {
             let mut s = self.store.inner.borrow_mut();
+            // F147-A: verify-at-apply — if any touched extent's eversion drifted
+            // during the etcd await, another mutator ran concurrently and our
+            // pre-await blobs would overwrite its fresher data in etcd. Refuse
+            // and let the PS retry; the stale etcd entry from mirror_partition_vp_refs
+            // is benign (failover replay will see the retry's fresher write).
+            for (&extent_id, &pre_ev) in &pre_eversion {
+                if let Some(live) = s.extents.get(&extent_id) {
+                    if live.eversion != pre_ev {
+                        return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
+                            code: CODE_PRECONDITION,
+                            message: format!(
+                                "extent {extent_id} eversion changed ({pre_ev} → {}) \
+                                 during vp_refs mirror; PS must retry",
+                                live.eversion
+                            ),
+                        }));
+                    }
+                }
+            }
             Self::apply_partition_vp_refs(&mut s, snapshot);
         }
         Ok(rkyv_encode(&SyncPartitionVpRefsResp {
