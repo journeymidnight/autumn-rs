@@ -346,3 +346,41 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     its `ex.replicates = target_nodes` reverted a punch_holes-driven
     state update. PS GC retry (same `Precondition` path as F139) backs
     off until EC completes (typically seconds).
+
+13. **F146 adds refuse-at-start + verify-at-apply to the two remaining
+    snapshot-capture-then-await handlers.**
+
+    **`handle_stream_alloc_extent`** (HIGH-1): The handler snapshots the
+    tail extent under `borrow_mut`, then awaits `commit_length_on_node`,
+    `alloc_extent_on_node`, and `mirror_stream_alloc_extent` before
+    writing back via `s.extents.insert(tail_id, tail.clone())`. During
+    any of those awaits, a concurrent mutator (recovery_done,
+    ec_conversion_done, punch_holes, truncate, split) could bump
+    `tail.eversion` and rewrite `tail.replicates` — the writeback would
+    then silently overwrite those changes. F146 adds two defenses:
+    (a) **Refuse-at-start**: if tail is in `ec_conversion_inflight` or
+      `recovery_tasks`, return `Err(Precondition)` immediately, before
+      any await.
+    (b) **Verify-at-apply**: after the etcd mirror returns, re-read
+      `s.extents[tail_id].eversion` under a fresh `borrow_mut` and
+      compare against the pre-await snapshot. If they differ, another
+      mutator ran during the await — refuse with `Precondition` rather
+      than stomping live state. The orphan stale etcd revision is benign:
+      failover replay reads the latest revision per key, which the
+      client's retry will produce.
+
+    **`handle_multi_modify_split`** (HIGH-2): The F138 guard at Phase-1
+    already refuses when any source-stream extent is in
+    `ec_conversion_inflight`. F146 adds the symmetric `recovery_tasks`
+    check (same loop, same Precondition return). Additionally, Phase-3
+    now captures `pre_bump_eversion: HashMap<u64, u64>` in Phase-1 and
+    verifies each source-stream extent's live eversion matches before
+    calling `apply_split_mutations` — same verify-at-apply pattern as
+    alloc_extent above.
+
+    **Deferred**: a heavier `alloc_extent_inflight` / `split_inflight`
+    set scheme would provide a mutual-exclusion lock across the entire
+    await window for the narrower dispatch-during-our-await sub-race. The
+    verify-at-apply approach closes the window for the cases where the
+    other mutator actually changes eversion (all current mutators do).
+    Cross-reference: notes 10 (F138), 11 (F139), 12 (F145).

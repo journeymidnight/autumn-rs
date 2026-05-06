@@ -249,6 +249,52 @@ for d in /tmp/autumn-rs/d{1..4}/$SID; do stat -c '%s %n' "$d"/extent-*.dat 2>/de
 
 ---
 
+### F146 — Three manager-side data-corruption races (2026-05-06)
+
+Three lost-update races closed in one pass:
+
+**HIGH-1**: `handle_stream_alloc_extent` snapshotted the tail extent then
+awaited `commit_length_on_node` / `alloc_extent_on_node` / etcd mirror
+before writing back. Concurrent `recovery_done` or `ec_conversion_done`
+running during those awaits had their eversion bump and replica rewrite
+silently overwritten. Fix: refuse-at-start (check `ec_conversion_inflight`
+and `recovery_tasks` before first await) + verify-at-apply (re-check
+`s.extents[tail].eversion` before the writeback; refuse if it changed).
+
+**HIGH-2**: `handle_multi_modify_split` Phase-1 had an F138 EC guard but
+no `recovery_tasks` check. `apply_recovery_done` running during Phase-2's
+etcd await would have its replica slot replacement overwritten by Phase-3's
+`apply_split_mutations`. Fix: symmetric `recovery_tasks` refuse-at-start +
+verify-at-apply checking `pre_bump_eversion` snapshot.
+
+**HIGH-3**: `build_append_future` in `extent_node.rs` did not re-check
+seal state after the `truncate_to_commit_ref` await. A concurrent
+`apply_extent_meta_durable` (from `handle_re_avali` or another append's
+pre-truncate confirm path) could seal the extent during the truncate I/O;
+the pwritev then landed bytes past the new `sealed_length`. Fix: re-check
+`sealed_length / avali` atomics before computing offsets.
+
+```bash
+bash cluster.sh reset 4
+AC="./target/debug/autumn-client --manager 127.0.0.1:9001"
+bash cluster.sh wbench 4G
+# Trigger concurrent alloc_extent + EC conversion + recovery to exercise HIGH-1/2.
+LOG_STREAM=$($AC info --json | python3 -c "import sys,json; p=json.load(sys.stdin)['partitions'][0]; print(p['log_stream_id'])")
+$AC update-stream-ec "$LOG_STREAM" 2 1 &
+bash cluster.sh stop-node 2   # triggers recovery on replicas hosted by node 2
+bash cluster.sh start-node 2  # recovery starts; manager.log will show
+                               # "defer alloc_extent until recovery completes"
+                               # or "eversion changed during alloc_extent" retries.
+# For HIGH-3: concurrent re_avali + in-flight append (needs two connections
+# racing on the same extent):
+bash cluster.sh stop-node 3 && bash cluster.sh start-node 3
+# Post-F146: all three paths retry safely with Precondition/CODE_PRECONDITION
+# until the competing operation completes.
+$AC info | grep -E 'extent.*eversion|extent.*replicates'
+```
+
+---
+
 ### F145 — punch_holes/truncate vs in-flight EC conversion (2026-05-06)
 
 F138 made `ec_conversion_inflight` an eversion-bump lock: while an extent is

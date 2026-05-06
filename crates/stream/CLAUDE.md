@@ -164,7 +164,18 @@ Append(AppendReq via autumn-rpc binary frame):
        - If header.revision > last_revision: update last_revision, persist meta
   5. Commit reconciliation:
        - If local file len < header.commit: reject (data loss on our side)
-       - If local file len > header.commit: TRUNCATE file to header.commit
+       - If local file len > header.commit:
+           * F119-E / F123: first confirm with manager that extent is not sealed
+             (if manager says sealed, apply meta + reject with CODE_PRECONDITION)
+           * TRUNCATE file to header.commit (await truncate_to_commit_ref)
+           * F146: re-check sealed_length / avali after the truncate await — a
+             concurrent apply_extent_meta_durable (from handle_re_avali or
+             another append's pre-truncate seal-confirm branch) may have landed
+             a fresh seal DURING the truncate I/O. Without this re-check, pwritev
+             would write bytes past the new sealed_length, corrupting subsequent
+             reads as "logStream value short" or out-of-bounds slice panics on EC
+             reads. The re-check fires CODE_PRECONDITION; client retries via the
+             standard apply_completion soft-error path (same as F119/F123/F143).
   6. Write payload:
        - WAL path (must_sync=true AND payload ≤ 2MB AND WAL enabled):
            futures::join!(wal.write(record), file.write_at(start, payload))

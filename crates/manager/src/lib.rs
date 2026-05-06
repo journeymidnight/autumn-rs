@@ -2833,4 +2833,252 @@ mod tests {
             );
         })
     }
+
+    // ── F146: alloc_extent / split lost-update races ─────────────────────────
+
+    /// handle_stream_alloc_extent must return Precondition (not proceed to
+    /// network calls) when the current tail extent is in ec_conversion_inflight.
+    #[test]
+    fn f146_alloc_extent_refuses_when_ec_inflight() {
+        run(async {
+            let m = AutumnManager::new();
+
+            let owner_key = "owner-f146-ae-ec".to_string();
+            let revision = {
+                let mut s = m.store.inner.borrow_mut();
+                s.acquire_owner_lock(&owner_key)
+            };
+
+            let stream_id = 80u64;
+            let tail_id = 500u64;
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.streams.insert(
+                    stream_id,
+                    MgrStreamInfo {
+                        stream_id,
+                        extent_ids: vec![tail_id],
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                        replicates: 0,
+                    },
+                );
+                s.extents.insert(tail_id, MgrExtentInfo {
+                    extent_id: tail_id,
+                    replicates: vec![],
+                    parity: vec![],
+                    eversion: 5,
+                    refs: 1,
+                    vp_table_refs: 0,
+                    sealed_length: 0,
+                    avali: 0,
+                    replicate_disks: vec![],
+                    parity_disks: vec![],
+                    ec_converted: false,
+                });
+            }
+
+            // Tail is mid-EC: alloc_extent must refuse immediately.
+            m.ec_conversion_inflight.borrow_mut().insert(tail_id);
+            let eversion_before = m.store.inner.borrow().extents[&tail_id].eversion;
+
+            let req = rkyv_encode(&StreamAllocExtentReq {
+                stream_id,
+                owner_key: owner_key.clone(),
+                revision,
+                end: 100,
+            });
+            let resp = m.handle_stream_alloc_extent(req).await.unwrap();
+            let r: StreamAllocExtentResp = rkyv_decode(&resp).unwrap();
+
+            assert_ne!(r.code, CODE_OK, "F146: alloc_extent must be rejected when tail is mid-EC");
+            assert!(
+                r.message.contains("in-flight EC conversion"),
+                "error must mention in-flight EC conversion: {}",
+                r.message
+            );
+            let ev_after = m.store.inner.borrow().extents[&tail_id].eversion;
+            assert_eq!(
+                ev_after, eversion_before,
+                "F146: eversion must not be bumped when alloc_extent is rejected mid-EC"
+            );
+        })
+    }
+
+    /// handle_stream_alloc_extent must return Precondition when the tail
+    /// extent has an in-flight recovery task (symmetric to EC guard above).
+    #[test]
+    fn f146_alloc_extent_refuses_when_recovery_inflight() {
+        run(async {
+            let m = AutumnManager::new();
+
+            let owner_key = "owner-f146-ae-rec".to_string();
+            let revision = {
+                let mut s = m.store.inner.borrow_mut();
+                s.acquire_owner_lock(&owner_key)
+            };
+
+            let stream_id = 81u64;
+            let tail_id = 501u64;
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.streams.insert(
+                    stream_id,
+                    MgrStreamInfo {
+                        stream_id,
+                        extent_ids: vec![tail_id],
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                        replicates: 0,
+                    },
+                );
+                s.extents.insert(tail_id, MgrExtentInfo {
+                    extent_id: tail_id,
+                    replicates: vec![],
+                    parity: vec![],
+                    eversion: 7,
+                    refs: 1,
+                    vp_table_refs: 0,
+                    sealed_length: 0,
+                    avali: 0,
+                    replicate_disks: vec![],
+                    parity_disks: vec![],
+                    ec_converted: false,
+                });
+            }
+
+            // Tail is under active recovery: alloc_extent must refuse.
+            m.recovery_tasks.borrow_mut().insert(tail_id, MgrRecoveryTask {
+                extent_id: tail_id,
+                replace_id: 0,
+                node_id: 1,
+                start_time: 0,
+            });
+            let eversion_before = m.store.inner.borrow().extents[&tail_id].eversion;
+
+            let req = rkyv_encode(&StreamAllocExtentReq {
+                stream_id,
+                owner_key: owner_key.clone(),
+                revision,
+                end: 100,
+            });
+            let resp = m.handle_stream_alloc_extent(req).await.unwrap();
+            let r: StreamAllocExtentResp = rkyv_decode(&resp).unwrap();
+
+            assert_ne!(r.code, CODE_OK, "F146: alloc_extent must be rejected when tail is mid-recovery");
+            assert!(
+                r.message.contains("in-flight recovery"),
+                "error must mention in-flight recovery: {}",
+                r.message
+            );
+            let ev_after = m.store.inner.borrow().extents[&tail_id].eversion;
+            assert_eq!(
+                ev_after, eversion_before,
+                "F146: eversion must not be bumped when alloc_extent is rejected mid-recovery"
+            );
+        })
+    }
+
+    /// handle_multi_modify_split must return Precondition when any source-
+    /// stream extent is currently undergoing recovery (symmetric to F138's
+    /// ec_conversion_inflight guard).
+    #[test]
+    fn f146_split_refuses_when_recovery_inflight() {
+        run(async {
+            let m = AutumnManager::new();
+
+            let owner_key = "owner-f146-split".to_string();
+            let revision = {
+                let mut s = m.store.inner.borrow_mut();
+                s.acquire_owner_lock(&owner_key)
+            };
+
+            let log_stream_id = 20u64;
+            let row_stream_id = 21u64;
+            let meta_stream_id = 22u64;
+            let part_id = 5u64;
+            let log_extent = 200u64;
+            let row_extent = 201u64;
+            let meta_extent = 202u64;
+
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.next_id = 300;
+                for (sid, eid) in [
+                    (log_stream_id, log_extent),
+                    (row_stream_id, row_extent),
+                    (meta_stream_id, meta_extent),
+                ] {
+                    s.streams.insert(sid, MgrStreamInfo {
+                        stream_id: sid,
+                        extent_ids: vec![eid],
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                        replicates: 3,
+                    });
+                    s.extents.insert(eid, MgrExtentInfo {
+                        extent_id: eid,
+                        replicates: vec![1, 3, 5],
+                        parity: vec![],
+                        eversion: 1,
+                        refs: 1,
+                        vp_table_refs: 0,
+                        sealed_length: 1000,
+                        avali: 0x7,
+                        replicate_disks: vec![10, 30, 50],
+                        parity_disks: vec![],
+                        ec_converted: false,
+                    });
+                }
+                s.partitions.insert(part_id, MgrPartitionMeta {
+                    part_id,
+                    log_stream: log_stream_id,
+                    row_stream: row_stream_id,
+                    meta_stream: meta_stream_id,
+                    rg: Some(MgrRange {
+                        start_key: b"a".to_vec(),
+                        end_key: b"z".to_vec(),
+                    }),
+                });
+            }
+
+            // Simulate recovery in flight on the log_stream's extent.
+            m.recovery_tasks.borrow_mut().insert(log_extent, MgrRecoveryTask {
+                extent_id: log_extent,
+                replace_id: 0,
+                node_id: 2,
+                start_time: 0,
+            });
+            let eversion_before = m.store.inner.borrow().extents[&log_extent].eversion;
+
+            let req = rkyv_encode(&MultiModifySplitReq {
+                part_id,
+                owner_key: owner_key.clone(),
+                revision,
+                mid_key: b"m".to_vec(),
+                log_stream_sealed_length: 500,
+                row_stream_sealed_length: 500,
+                meta_stream_sealed_length: 500,
+            });
+            let resp = m.handle_multi_modify_split(req).await.unwrap();
+            let r: CodeResp = rkyv_decode(&resp).unwrap();
+
+            assert_ne!(r.code, CODE_OK, "F146: split must be rejected when source extent is mid-recovery");
+            assert!(
+                r.message.contains("recovery in flight"),
+                "error must mention recovery in flight: {}",
+                r.message
+            );
+            // Source streams and partitions must be unchanged.
+            let s = m.store.inner.borrow();
+            assert_eq!(
+                s.extents[&log_extent].eversion, eversion_before,
+                "F146: eversion must not be bumped when split is rejected"
+            );
+            assert!(
+                s.partitions.contains_key(&part_id),
+                "F146: original partition must still exist on split rejection"
+            );
+        })
+    }
 }

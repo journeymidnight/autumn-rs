@@ -879,6 +879,23 @@ async fn build_append_future(
                 .collect();
             return Box::pin(async move { out });
         }
+        // F146: re-check seal state after the truncate await.
+        // apply_extent_meta_durable from a concurrent handle_re_avali or
+        // handle_convert_to_ec may have landed a fresh seal during the
+        // truncate's I/O. Without this re-check our pwritev would write
+        // bytes past the new sealed_length — a data-corruption path
+        // surfacing as "logStream value short" or out-of-bounds slice
+        // panics on EC reads after the sealed extent is re-read.
+        if extent.sealed_length.load(Ordering::SeqCst) > 0
+            || extent.avali.load(Ordering::SeqCst) > 0
+        {
+            let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
+            let out: Vec<Bytes> = slots
+                .into_iter()
+                .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
+                .collect();
+            return Box::pin(async move { out });
+        }
         file_start = extent.len.load(Ordering::SeqCst);
     }
 

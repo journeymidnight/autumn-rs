@@ -715,6 +715,37 @@ impl AutumnManager {
                 }
             };
 
+            // F146: refuse-at-start. Symmetric to F138 (apply_recovery_done,
+            // mark_extent_available, handle_multi_modify_split) and F145
+            // (handle_stream_punch_holes, handle_truncate). Without these
+            // guards, a concurrent EC conversion or recovery on the tail
+            // extent would have its eversion+replicates writeback silently
+            // overwritten by our verify-at-apply block below.
+            if self.ec_conversion_inflight.borrow().contains(&tail_id) {
+                let msg = format!(
+                    "extent {tail_id} has in-flight EC conversion; \
+                     defer alloc_extent until conversion completes"
+                );
+                return Ok(rkyv_encode(&StreamAllocExtentResp {
+                    code: CODE_PRECONDITION,
+                    message: msg,
+                    stream_info: None,
+                    last_ex_info: None,
+                }));
+            }
+            if self.recovery_tasks.borrow().contains_key(&tail_id) {
+                let msg = format!(
+                    "extent {tail_id} has in-flight recovery; \
+                     defer alloc_extent until recovery completes"
+                );
+                return Ok(rkyv_encode(&StreamAllocExtentResp {
+                    code: CODE_PRECONDITION,
+                    message: msg,
+                    stream_info: None,
+                    last_ex_info: None,
+                }));
+            }
+
             // The new extent is allocated as an OPEN, REPLICATED extent
             // on `stream.replicates` nodes. For legacy streams persisted
             // before `replicates` was added to MgrStreamInfo (default
@@ -739,6 +770,10 @@ impl AutumnManager {
             let (extent_id, _) = s.alloc_ids(1);
             (tail, selected, extent_id, data, s.nodes.clone())
         };
+
+        // F146: capture the tail's eversion BEFORE any mutation so the
+        // verify-at-apply block below can detect concurrent bumps.
+        let expected_eversion = tail.eversion;
 
         // Seal old extent.
         //
@@ -929,6 +964,43 @@ impl AutumnManager {
 
         {
             let mut s = self.store.inner.borrow_mut();
+            // F146: verify the captured tail's eversion is still current.
+            // If a concurrent mutator (recovery_done, ec_conversion_done,
+            // punch_holes, truncate, or split) bumped it during the
+            // commit_length / alloc_extent_on_node / etcd-mirror await
+            // window above, the etcd write we just made is stale relative
+            // to live memory. Refuse to stomp live state; client retries
+            // with a fresh snapshot. The orphan stale etcd revision is
+            // benign — failover replay reads the latest revision per key,
+            // which the successful retry will produce.
+            let live_eversion = match s.extents.get(&tail.extent_id) {
+                Some(ex) => ex.eversion,
+                None => {
+                    let msg = format!(
+                        "extent {} was deleted during alloc_extent",
+                        tail.extent_id
+                    );
+                    return Ok(rkyv_encode(&StreamAllocExtentResp {
+                        code: CODE_PRECONDITION,
+                        message: msg,
+                        stream_info: None,
+                        last_ex_info: None,
+                    }));
+                }
+            };
+            if live_eversion != expected_eversion {
+                let msg = format!(
+                    "extent {} eversion changed during alloc_extent \
+                     ({} -> {}); retry with fresh snapshot",
+                    tail.extent_id, expected_eversion, live_eversion
+                );
+                return Ok(rkyv_encode(&StreamAllocExtentResp {
+                    code: CODE_PRECONDITION,
+                    message: msg,
+                    stream_info: None,
+                    last_ex_info: None,
+                }));
+            }
             if let Some(st) = s.streams.get_mut(&req.stream_id) {
                 *st = stream_after.clone();
             }
@@ -1294,6 +1366,7 @@ impl AutumnManager {
                 MgrPartitionMeta,
                 MgrPartitionMeta,
                 MgrPartitionVpRefs,
+                HashMap<u64, u64>,
             ), AppError> {
                 Self::ensure_owner_revision(&req.owner_key, req.revision, &s)?;
 
@@ -1335,6 +1408,40 @@ impl AutumnManager {
                         }
                     }
                 }
+                // F146: symmetric guard against in-flight recovery on any
+                // source-stream extent. apply_recovery_done bumps eversion and
+                // rewrites replicates; Phase-3's apply_split_mutations would
+                // overwrite both with the Phase-1 captured snapshot.
+                {
+                    let recovery_inflight = self.recovery_tasks.borrow();
+                    for &sid in &[src_meta.log_stream, src_meta.row_stream, src_meta.meta_stream] {
+                        if let Some(stream) = s.streams.get(&sid) {
+                            for &eid in &stream.extent_ids {
+                                if recovery_inflight.contains_key(&eid) {
+                                    return Err(AppError::Precondition(format!(
+                                        "recovery in flight on extent {eid}; retry split"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // F146: snapshot pre-mutation eversions so Phase-3 can verify
+                // no concurrent mutator ran during Phase-2's etcd await.
+                let pre_bump_eversion: HashMap<u64, u64> = {
+                    let mut m = HashMap::new();
+                    for &sid in &[src_meta.log_stream, src_meta.row_stream, src_meta.meta_stream] {
+                        if let Some(stream) = s.streams.get(&sid) {
+                            for &eid in &stream.extent_ids {
+                                if let Some(ex) = s.extents.get(&eid) {
+                                    m.insert(eid, ex.eversion);
+                                }
+                            }
+                        }
+                    }
+                    m
+                };
 
                 let (start, end) = s.alloc_ids(4);
                 let new_log_stream = start;
@@ -1378,12 +1485,12 @@ impl AutumnManager {
                 let vp_extent_puts = Self::preview_partition_vp_refs_apply(&s, &right_snapshot);
                 all_extents = Self::merge_extent_updates(all_extents, vp_extent_puts);
 
-                Ok((new_streams, all_extents, left, right, right_snapshot))
+                Ok((new_streams, all_extents, left, right, right_snapshot, pre_bump_eversion))
             })()
         };
 
         match out {
-            Ok((new_streams, modified_extents, left, right, right_snapshot)) => {
+            Ok((new_streams, modified_extents, left, right, right_snapshot, pre_bump_eversion)) => {
                 // Phase 2: Persist ALL mutations to etcd in ONE atomic txn
                 // (F124: partitions + regions are included here, not in a
                 // separate txn, to prevent orphan streams on crash.)
@@ -1431,6 +1538,24 @@ impl AutumnManager {
                 // Phase 3: Apply to in-memory store AFTER etcd success
                 {
                     let mut s = self.store.inner.borrow_mut();
+                    // F146: verify no source-stream extent's eversion drifted
+                    // during Phase-2's etcd await. apply_split_mutations would
+                    // overwrite the live state with the Phase-1 captured
+                    // snapshot otherwise — losing a concurrent recovery_done's
+                    // slot replacement or EC conversion's replicates rewrite.
+                    for (eid, expected) in &pre_bump_eversion {
+                        if let Some(live) = s.extents.get(eid).map(|ex| ex.eversion) {
+                            if live != *expected {
+                                return Ok(rkyv_encode(&CodeResp {
+                                    code: CODE_PRECONDITION,
+                                    message: format!(
+                                        "extent {eid} eversion drift during split \
+                                         ({expected} -> {live}); retry split"
+                                    ),
+                                }));
+                            }
+                        }
+                    }
                     Self::apply_split_mutations(
                         &mut s, &new_streams, &modified_extents, left, right,
                     );

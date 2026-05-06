@@ -477,6 +477,22 @@
   - Live-cluster re-verification deferred per project policy on destructive commands.
 - **passes:** true (build + lib tests clean; live re-verification deferred).
 
+### F146 · Three manager-side data-corruption races (alloc_extent, split, append-past-seal)
+- **Target:** Three remaining lost-update races with the same snapshot-capture-then-await-then-writeback shape: (HIGH-1) `handle_stream_alloc_extent` unconditionally overwrote `s.extents[tail]` at apply time, losing concurrent recovery_done/ec_conversion_done/punch_holes/truncate/split mutations; (HIGH-2) `handle_multi_modify_split` Phase-1 already had an F138 `ec_conversion_inflight` check but no `recovery_tasks` check, and Phase-3 `apply_split_mutations` overwrote live state without verifying no concurrent mutator ran during Phase-2's etcd await; (HIGH-3) `build_append_future` in `extent_node.rs` did not re-check `sealed_length / avali` after the `truncate_to_commit_ref` await, allowing a concurrent `apply_extent_meta_durable` (from `handle_re_avali` or another append's pre-truncate seal-confirm path) to land a fresh seal during the truncate I/O — the pwritev would then land bytes past the new sealed_length.
+- **Root cause:** F138/F139/F145 covered the explicit eversion-bump-lock pattern but did not audit snapshot-capture-then-writeback handlers for the "dispatch-during-our-await" sub-race.
+- **Fix:**
+  - HIGH-1: refuse-at-start in `handle_stream_alloc_extent` (check `ec_conversion_inflight` + `recovery_tasks` for the tail before any await), plus verify-at-apply (re-read `s.extents[tail].eversion` under a fresh `borrow_mut` after the etcd mirror; refuse with `Precondition` if eversion changed during the await window).
+  - HIGH-2: extend the F138 Phase-1 block in `handle_multi_modify_split` to also check `recovery_tasks` for every source-stream extent; add verify-at-apply in Phase-3 comparing `pre_bump_eversion` snapshot against live eversions before calling `apply_split_mutations`.
+  - HIGH-3: after `truncate_to_commit_ref` returns Ok and before the `file_start` reload, re-check `extent.sealed_length.load(SeqCst) > 0 || extent.avali.load(SeqCst) > 0`; if true, return `CODE_PRECONDITION` (mirrors step-3 guard at line 818). Client-side `apply_completion` already classifies `CODE_PRECONDITION` as a soft error → retry with fresh tail.
+- **Files:** `crates/manager/src/rpc_handlers.rs` (HIGH-1 refuse-at-start + verify-at-apply in `handle_stream_alloc_extent`; HIGH-2 recovery_tasks check + verify-at-apply in `handle_multi_modify_split`), `crates/manager/src/lib.rs` (3 new F146 unit tests), `crates/stream/src/extent_node.rs` (HIGH-3 post-truncate seal recheck), `crates/manager/CLAUDE.md` (note 13), `crates/stream/CLAUDE.md` (append protocol step-5 annotation), `README.md` (F146 repro block), `feature_list.md` (this entry), `claude-progress.txt`.
+- **Verification:**
+  - `cargo build --workspace` clean (only pre-existing warnings).
+  - `cargo test -p autumn-manager --lib` 29/29 pass — 26 pre-existing + 3 new F146 tests.
+  - `cargo test -p autumn-stream --lib` 48/48 pass.
+  - `cargo test -p autumn-partition-server --lib` 105 pass / 2 pre-existing `f099i` parallel-test race failures (same baseline as F145).
+  - Live-cluster re-verification deferred per project policy on destructive commands.
+- **passes:** true (build + lib tests clean; live re-verification deferred).
+
 ---
 
 ## Architectural lessons from the perf series (kept for context, the rest of F098/F099 lives in the Completed table)
