@@ -464,6 +464,19 @@
 - **Out of scope:** capacity / used-bytes-aware allocation (deferred); read-side load balancing (deferred — once allocation spreads, the existing `replica[0]`-first read path naturally distributes across all nodes since extents now live on different sets).
 - **passes:** true (build + lib tests clean; live re-verification deferred).
 
+### F145 · punch_holes/truncate vs in-flight EC conversion (eversion-bump lock gap)
+- **Target:** F138 elevated `ec_conversion_inflight` to an eversion-bump lock but missed two mutators. `handle_stream_punch_holes` and `handle_truncate` in `crates/manager/src/rpc_handlers.rs` both fell into the `extent.eversion += 1` else-branch for any ec-inflight extent (refs<=1 path) or the unconditional `eversion += 1` path (refs>1 path), violating F138's invariant that no task may bump eversion while EC conversion is in flight. This caused `apply_ec_conversion_done`'s `ex.eversion = new_eversion` to overwrite the intermediate bump (lost-update), and the subsequent `ex.replicates = target_nodes[..K]` to silently rewrite replica assignments on a stale extent record. On leader-failover the replayed etcd state was internally inconsistent.
+- **Root cause (race timeline):** (1) `ec_conversion_dispatch_loop` captures `new_eversion = eversion + 1`, inserts X into `ec_conversion_inflight`, awaits `EXT_MSG_CONVERT_TO_EC` (multi-second). (2) concurrent `handle_stream_punch_holes` sets refs=0, falls into else branch, runs `extent.eversion += 1` (= new_eversion), mirrors to etcd, removes X from stream. (3) EC completes; `apply_ec_conversion_done` writes `ex.eversion = new_eversion`, `ex.replicates = target_nodes`, overwriting the now-stale record — replica state and manager state diverge.
+- **Fix:** Two symmetric `Err(Precondition)` guards in `handle_stream_punch_holes` and `handle_truncate`, immediately after the F139 recovery guards, refusing the entire RPC if any to-be-removed extent is in `ec_conversion_inflight`. The PS GC retry loop already handles `Precondition` from F139; the same retry covers EC. No new locks or state needed.
+- **Files:** `crates/manager/src/rpc_handlers.rs` (2 guards, one per handler), `crates/manager/src/lib.rs` (2 new F145 unit tests: `f145_punch_holes_refuses_when_ec_inflight`, `f145_truncate_refuses_when_ec_inflight`), `crates/manager/CLAUDE.md` (note 12 completing the F138 mutator list), `README.md` (F145 manual-repro block), `feature_list.md` (this entry), `claude-progress.txt`.
+- **Verification:**
+  - `cargo build --workspace` clean (only pre-existing warnings).
+  - `cargo test -p autumn-manager --lib` 26/26 pass — 24 pre-existing + 2 new F145 tests.
+  - `cargo test -p autumn-stream --lib` 48/48 pass.
+  - `cargo test -p autumn-partition-server --lib` 105 pass / 2 pre-existing `f099i` parallel-test race failures (same baseline as F144).
+  - Live-cluster re-verification deferred per project policy on destructive commands.
+- **passes:** true (build + lib tests clean; live re-verification deferred).
+
 ---
 
 ## Architectural lessons from the perf series (kept for context, the rest of F098/F099 lives in the Completed table)

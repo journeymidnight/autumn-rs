@@ -330,3 +330,19 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     duration. This covers manager leader-failover where
     `pending_extent_deletes` is lost in-memory but `recovery_inflight`
     survives on the extent-node process.
+
+12. **F145 completes the F138 eversion-bump lock across all five mutators.**
+    F138 (note 10) declared: "while extent X ∈ `ec_conversion_inflight`,
+    no other task may bump `ex.eversion`." F138 covered
+    `apply_recovery_done`, `mark_extent_available`, and
+    `handle_multi_modify_split`. **F145 covers the two missing mutators:**
+    `handle_stream_punch_holes` and `handle_truncate`. Both handlers now
+    return `Err(Precondition)` (mirroring the F139 pattern from note 11)
+    if any to-be-removed extent is in `ec_conversion_inflight`. The
+    violation was that both handlers' mutation loops unconditionally ran
+    `extent.eversion += 1` for ec-inflight extents (refs<=1 else-branch
+    and refs>1 branch), so `apply_ec_conversion_done`'s overwrite of
+    `ex.eversion = new_eversion` silently lost the intermediate bump and
+    its `ex.replicates = target_nodes` reverted a punch_holes-driven
+    state update. PS GC retry (same `Precondition` path as F139) backs
+    off until EC completes (typically seconds).

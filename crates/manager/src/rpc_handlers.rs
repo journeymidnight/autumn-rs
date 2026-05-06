@@ -1005,6 +1005,20 @@ impl AutumnManager {
                         }
                     }
                 }
+                // F145: symmetric to the F139 recovery guard above. Refuse the
+                // whole RPC if any to-be-removed extent is mid-EC. punch_holes
+                // would otherwise bump eversion via the else branch (refs<=1 +
+                // ec_inflight) or the refs>1 branch — both violate F138's
+                // invariant that ec_conversion_inflight is an eversion-bump lock.
+                // PS GC retry naturally covers the brief inflight window.
+                for eid in &removed {
+                    if ec_inflight.contains(eid) {
+                        return Err(AppError::Precondition(format!(
+                            "extent {eid} has in-flight EC conversion; \
+                             defer punch_holes until conversion completes"
+                        )));
+                    }
+                }
 
                 stream.extent_ids.retain(|id| !removed.contains(id));
                 if stream.extent_ids.is_empty() {
@@ -1159,6 +1173,17 @@ impl AutumnManager {
                                 )));
                             }
                         }
+                    }
+                }
+                // F145: symmetric to the F139 recovery guard above. Refuse if
+                // any to-be-truncated extent is mid-EC conversion, to preserve
+                // F138's eversion-bump lock invariant. Caller retries.
+                for eid in &removed {
+                    if ec_inflight.contains(eid) {
+                        return Err(AppError::Precondition(format!(
+                            "extent {eid} has in-flight EC conversion; \
+                             defer truncate until conversion completes"
+                        )));
                     }
                 }
 

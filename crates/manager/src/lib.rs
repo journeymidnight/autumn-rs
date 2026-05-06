@@ -2668,4 +2668,169 @@ mod tests {
             );
         })
     }
+
+    // ── F145: punch_holes/truncate vs in-flight EC conversion ────────────────
+
+    /// handle_stream_punch_holes must return Precondition (not bump eversion)
+    /// when any to-be-removed extent is currently undergoing EC conversion.
+    #[test]
+    fn f145_punch_holes_refuses_when_ec_inflight() {
+        run(async {
+            let m = AutumnManager::new();
+
+            let owner_key = "owner-f145-ph".to_string();
+            let revision = {
+                let mut s = m.store.inner.borrow_mut();
+                s.acquire_owner_lock(&owner_key)
+            };
+
+            let stream_id = 60u64;
+            let extent_id = 401u64;
+            let extent_keep = 402u64;
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.streams.insert(
+                    stream_id,
+                    MgrStreamInfo {
+                        stream_id,
+                        extent_ids: vec![extent_id, extent_keep],
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                        replicates: 3,
+                    },
+                );
+                s.extents.insert(extent_keep, make_ec_extent(extent_keep, 1));
+                let mut ex = make_ec_extent(extent_id, 1);
+                ex.refs = 1;
+                ex.vp_table_refs = 0;
+                s.extents.insert(extent_id, ex);
+            }
+
+            // Simulate EC dispatch: extent is mid-conversion.
+            m.ec_conversion_inflight.borrow_mut().insert(extent_id);
+            let eversion_before = m.store.inner.borrow().extents[&extent_id].eversion;
+
+            let req = rkyv_encode(&PunchHolesReq {
+                stream_id,
+                owner_key: owner_key.clone(),
+                revision,
+                extent_ids: vec![extent_id],
+            });
+            let resp = m.handle_stream_punch_holes(req).await.unwrap();
+            let r: PunchHolesResp = rkyv_decode(&resp).unwrap();
+
+            assert_ne!(
+                r.code, CODE_OK,
+                "F145: punch_holes must be rejected when target extent is mid-EC"
+            );
+            assert!(
+                r.message.contains("in-flight EC conversion"),
+                "error must mention in-flight EC conversion: {}",
+                r.message
+            );
+            // Eversion must not have been bumped.
+            let s = m.store.inner.borrow();
+            let ex = s.extents.get(&extent_id).expect("F145: extent must not be removed");
+            assert_eq!(
+                ex.eversion, eversion_before,
+                "F145: eversion must not be bumped during mid-EC punch_holes"
+            );
+            drop(s);
+            assert!(
+                m.pending_extent_deletes.borrow().is_empty(),
+                "F145: no pending delete must be enqueued on rejection"
+            );
+
+            // After EC completes (remove from inflight), punch_holes must succeed.
+            m.ec_conversion_inflight.borrow_mut().remove(&extent_id);
+            let req2 = rkyv_encode(&PunchHolesReq {
+                stream_id,
+                owner_key: owner_key.clone(),
+                revision,
+                extent_ids: vec![extent_id],
+            });
+            let resp2 = m.handle_stream_punch_holes(req2).await.unwrap();
+            let r2: PunchHolesResp = rkyv_decode(&resp2).unwrap();
+            assert_eq!(r2.code, CODE_OK, "F145: punch_holes must succeed after EC completes: {}", r2.message);
+            let s2 = m.store.inner.borrow();
+            assert!(
+                !s2.streams[&stream_id].extent_ids.contains(&extent_id),
+                "F145: extent must be removed from stream after successful punch_holes"
+            );
+        })
+    }
+
+    /// handle_truncate must return Precondition (not bump eversion) when any
+    /// to-be-truncated extent is currently undergoing EC conversion.
+    #[test]
+    fn f145_truncate_refuses_when_ec_inflight() {
+        run(async {
+            let m = AutumnManager::new();
+
+            let owner_key = "owner-f145-tr".to_string();
+            let revision = {
+                let mut s = m.store.inner.borrow_mut();
+                s.acquire_owner_lock(&owner_key)
+            };
+
+            let stream_id = 61u64;
+            let extent_a = 403u64; // to be truncated
+            let extent_b = 404u64; // truncate target (kept)
+            let extent_c = 405u64; // kept
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.streams.insert(
+                    stream_id,
+                    MgrStreamInfo {
+                        stream_id,
+                        extent_ids: vec![extent_a, extent_b, extent_c],
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                        replicates: 3,
+                    },
+                );
+                for &eid in &[extent_a, extent_b, extent_c] {
+                    let mut ex = make_ec_extent(eid, 1);
+                    ex.refs = 1;
+                    ex.vp_table_refs = 0;
+                    s.extents.insert(eid, ex);
+                }
+            }
+
+            // extent_a is mid-EC conversion — truncate should be refused.
+            m.ec_conversion_inflight.borrow_mut().insert(extent_a);
+            let eversion_before = m.store.inner.borrow().extents[&extent_a].eversion;
+
+            let req = rkyv_encode(&TruncateReq {
+                stream_id,
+                owner_key: owner_key.clone(),
+                revision,
+                extent_id: extent_b, // truncate everything before extent_b
+            });
+            let resp = m.handle_truncate(req).await.unwrap();
+            let r: TruncateResp = rkyv_decode(&resp).unwrap();
+
+            assert_ne!(
+                r.code, CODE_OK,
+                "F145: truncate must be rejected when a to-be-removed extent is mid-EC"
+            );
+            assert!(
+                r.message.contains("in-flight EC conversion"),
+                "error must mention in-flight EC conversion: {}",
+                r.message
+            );
+            // Stream must still contain extent_a; eversion must be unchanged.
+            let s = m.store.inner.borrow();
+            let stream = s.streams.get(&stream_id).unwrap();
+            assert!(
+                stream.extent_ids.contains(&extent_a),
+                "F145: extent_a must not be removed from stream on rejection"
+            );
+            let ex = s.extents.get(&extent_a).expect("F145: extent_a must still be in store");
+            assert_eq!(
+                ex.eversion, eversion_before,
+                "F145: eversion must not be bumped during mid-EC truncate"
+            );
+        })
+    }
 }

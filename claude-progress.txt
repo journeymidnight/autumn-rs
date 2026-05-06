@@ -1,3 +1,46 @@
+Date: 2026-05-06
+TaskStatus: completed
+Task scope: F145 — punch_holes/truncate vs in-flight EC conversion (eversion-bump lock gap).
+
+Root cause (confirmed):
+  F138 made ec_conversion_inflight an eversion-bump lock but missed two
+  mutators. Both handle_stream_punch_holes and handle_truncate fell into
+  the extent.eversion += 1 else-branch for ec-inflight extents (refs<=1
+  path) and the unconditional eversion += 1 path (refs>1 path). This let
+  apply_ec_conversion_done's "ex.eversion = new_eversion" overwrite the
+  intermediate bump (lost-update), and ex.replicates = target_nodes then
+  silently rewrote replica assignments on a stale record. On leader-
+  failover the replayed etcd state was internally inconsistent.
+
+Fix:
+  Two symmetric Err(Precondition) guards in rpc_handlers.rs, immediately
+  after the F139 recovery guards in each handler. The guards scan
+  `removed` and refuse the entire RPC if any extent is in
+  ec_conversion_inflight. PS GC retry (already handles Precondition from
+  F139 path) naturally backs off until EC completes.
+
+Files modified:
+  - crates/manager/src/rpc_handlers.rs (F145 guard in handle_stream_punch_holes,
+    F145 guard in handle_truncate)
+  - crates/manager/src/lib.rs (2 new F145 unit tests)
+  - crates/manager/CLAUDE.md (note 12 completing the F138 mutator list)
+  - feature_list.md (F145 entry, passes:true)
+  - README.md (F145 manual-repro block)
+  - claude-progress.txt (this file)
+
+Verification:
+  - cargo build --workspace: clean (only pre-existing warnings).
+  - cargo test -p autumn-manager --lib: 26/26 pass (24 pre-existing + 2 new F145).
+  - cargo test -p autumn-stream --lib: 48/48 pass.
+  - cargo test -p autumn-partition-server --lib: 105 pass / 2 pre-existing
+    f099i parallel-test race failures (same baseline as F144).
+
+Next steps:
+  - Continue auditing for additional parallel-conflict races.
+  - Live cluster re-verification deferred per project policy.
+
+---
+
 Date: 2026-05-05
 TaskStatus: completed
 Task scope: F140 — Structural split-vs-{compact,GC} serialisation (dual-gate acquisition).

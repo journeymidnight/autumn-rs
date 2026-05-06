@@ -249,6 +249,40 @@ for d in /tmp/autumn-rs/d{1..4}/$SID; do stat -c '%s %n' "$d"/extent-*.dat 2>/de
 
 ---
 
+### F145 — punch_holes/truncate vs in-flight EC conversion (2026-05-06)
+
+F138 made `ec_conversion_inflight` an eversion-bump lock: while an extent is
+mid-EC, no other mutator may bump its `eversion`. F138 covered
+`apply_recovery_done`, `mark_extent_available`, and `handle_multi_modify_split`.
+`handle_stream_punch_holes` and `handle_truncate` were missed: both would fall
+into the "keep alive with eversion+1" else-branch for any ec-inflight extent,
+producing a lost-update when `apply_ec_conversion_done` later overwrote
+eversion with the pre-captured `new_eversion`.
+
+Fix: two symmetric `Err(Precondition)` guards in `rpc_handlers.rs`, immediately
+after the F139 recovery guards, refusing the entire RPC if any to-be-removed
+extent is in `ec_conversion_inflight`. The PS GC retry loop already handles
+`Precondition` from the F139 recovery path; the same retry covers this.
+
+```bash
+bash cluster.sh reset 4
+AC="./target/debug/autumn-client --manager 127.0.0.1:9001"
+bash cluster.sh wbench 4G
+# Trigger EC conversion on the log_stream while GC is running
+LOG_STREAM=$($AC info --json | python3 -c "import sys,json; p=json.load(sys.stdin)['partitions'][0]; print(p['log_stream_id'])")
+$AC update-stream-ec "$LOG_STREAM" 2 1 &
+PARTID=$($AC ls | awk 'NR==1{print $1}')
+$AC gc "$PARTID"
+# Post-F145: gc retries with "in-flight EC conversion" until EC completes,
+# then succeeds. Pre-F145: manager etcd had refs=0 records with eversion
+# equal to the EC new_eversion; on leader-failover the replayed state was
+# internally inconsistent (replicates referred to nodes that no longer
+# owned the extent).
+$AC info | grep -E 'extent.*refs=0|extent.*ec_converted'
+```
+
+---
+
 ### F139 — extent-node delete vs in-flight recovery (2026-05-05)
 
 `handle_delete_extent` would race with `run_recovery_task` on the same
