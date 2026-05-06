@@ -176,6 +176,20 @@ Append(AppendReq via autumn-rpc binary frame):
              reads as "logStream value short" or out-of-bounds slice panics on EC
              reads. The re-check fires CODE_PRECONDITION; client retries via the
              standard apply_completion soft-error path (same as F119/F123/F143).
+           * F147-B: the same post-truncate seal recheck is also inserted in the
+             non-batched `handle_append` path (line ~2437), which previously had
+             the F146 guard only in `build_append_future` (the batched path in
+             `handle_append_batch`). Without F147-B, a concurrent seal landing
+             during the truncate await on a non-batched append wrote past the
+             new sealed_length identically to the F146 race.
+           * F147-C: `run_recovery_task` now performs a verify-after-fetch step
+             after `sync_all` and before writing the recovered bytes back: it
+             re-reads the local extent's `eversion` and refuses with an error
+             (triggering retry) if it advanced during the fetch I/O. Additionally,
+             `fetch_max writeback` is gated on the fetched length matching the
+             manager-reported `sealed_length`; a mismatch means a concurrent seal
+             landed during recovery and the task retries rather than persisting
+             stale metadata.
   6. Write payload:
        - WAL path (must_sync=true AND payload ≤ 2MB AND WAL enabled):
            futures::join!(wal.write(record), file.write_at(start, payload))

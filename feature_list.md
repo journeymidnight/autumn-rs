@@ -493,6 +493,22 @@
   - Live-cluster re-verification deferred per project policy on destructive commands.
 - **passes:** true (build + lib tests clean; live re-verification deferred).
 
+### F147 · Three snapshot-await-writeback races (sync_partition_vp_refs etcd divergence, handle_append non-batched seal recheck, run_recovery_task verify-after-fetch)
+- **Target:** Three remaining data-corruption races sharing the snapshot-capture-then-await-then-apply shape not covered by F146.
+- **Root cause:** F146 added refuse-at-start + verify-at-apply to `handle_stream_alloc_extent` and `handle_multi_modify_split`, and added a post-truncate seal recheck to `build_append_future` (the batched append path). Three analogous paths were missed: (F147-A) `handle_sync_partition_vp_refs` in the manager applied a VP-ref diff after an etcd await without verifying the touched extents had not been mutated during the await, causing etcd-vs-memory divergence on leader-failover replay; (F147-B) `handle_append` (the non-batched path, line ~2437) lacked the F146 post-truncate seal recheck that `build_append_future` received, so a concurrent `apply_extent_meta_durable` sealing the extent during the truncate await would allow pwritev to land bytes past the new `sealed_length`; (F147-C) `run_recovery_task` had no verify-after-fetch step, so a concurrent seal arriving during the extent fetch could cause recovery to write stale metadata back and log incorrect `fetch_max` values.
+- **Fix:**
+  - F147-A: refuse-at-start in `handle_sync_partition_vp_refs` (check `ec_conversion_inflight` + `recovery_tasks` for each extent in the new snapshot; return `Err(Precondition)` before any await if any is in-flight) + verify-at-apply (re-read each touched extent's `eversion` under a fresh `borrow_mut` after the etcd mirror; return `Err(Precondition)` if any eversion changed during the await window).
+  - F147-B: insert the same post-truncate seal recheck (`sealed_length.load(SeqCst) > 0 || avali.load(SeqCst) > 0`) in `handle_append` immediately after `truncate_to_commit` returns Ok and before the `file_pwrite` offset computation — structurally identical to the F146 recheck in `build_append_future`.
+  - F147-C: after the `sync_all` following the full-extent fetch in `run_recovery_task`, re-read the local extent's `eversion` atomics; if it advanced during the fetch, retry the recovery task. Additionally gate the `fetch_max` writeback on the fetched length matching the manager-reported `sealed_length`.
+- **Files:** `crates/manager/src/rpc_handlers.rs` + `crates/manager/src/lib.rs` (F147-A: refuse-at-start + verify-at-apply, 1 new unit test: `f147_sync_vp_refs_refuses_when_concurrent_eversion_bump`), `crates/stream/src/extent_node.rs` (F147-B: `handle_append` post-truncate recheck, 1 test in `f147b_tests`; F147-C: `run_recovery_task` verify-after-fetch + fetch_max writeback gate, 1 test in `f147c_tests`), `crates/manager/CLAUDE.md` (note 14), `crates/stream/CLAUDE.md` (append protocol step-5 F147-B/C bullets), `README.md` (F147 manual-repro block), `feature_list.md` (this entry), `claude-progress.txt`.
+- **Verification:**
+  - `cargo build --workspace` clean (only pre-existing warnings).
+  - `cargo test -p autumn-manager --lib` 30/30 pass — 29 pre-existing + 1 new F147-A test.
+  - `cargo test -p autumn-stream --lib` 50/50 pass — 48 pre-existing + 2 new F147-B/C tests.
+  - `cargo test -p autumn-partition-server --lib` 105 pass / 2 pre-existing `f099i` parallel-test race failures (same baseline as F146).
+  - Live-cluster re-verification deferred per project policy on destructive commands.
+- **passes:** true (build + lib tests clean; live re-verification deferred).
+
 ---
 
 ## Architectural lessons from the perf series (kept for context, the rest of F098/F099 lives in the Completed table)

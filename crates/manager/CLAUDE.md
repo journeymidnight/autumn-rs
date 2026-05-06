@@ -384,3 +384,27 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     verify-at-apply approach closes the window for the cases where the
     other mutator actually changes eversion (all current mutators do).
     Cross-reference: notes 10 (F138), 11 (F139), 12 (F145).
+
+14. **F147-A `handle_sync_partition_vp_refs` refuse-at-start + verify-at-apply.**
+    `MSG_SYNC_PARTITION_VP_REFS` replaces a partition's full VP-ref snapshot and
+    diffs the old/new snapshots to adjust `vp_table_refs` on each touched extent.
+    The handler snapshots the old entry under `borrow_mut`, then may await etcd
+    persistence (`mirror_partition_vp_refs`) before applying the new diff.
+    During that await, a concurrent `apply_recovery_done` or
+    `apply_ec_conversion_done` could bump `ex.eversion` or rewrite
+    `ex.replicates` on a touched extent; the handler's subsequent
+    `vp_table_refs` adjustment would still complete, but the diff-apply
+    diverges between the etcd-persisted state and in-memory state if the
+    manager crashes mid-handler and replays with a stale etcd entry.
+    F147-A adds the same two-stage pattern used by notes 12/13 (F145/F146):
+    (a) **Refuse-at-start**: if any extent mentioned in the new snapshot
+      is currently in `ec_conversion_inflight` or `recovery_tasks`, return
+      `Err(Precondition)` before any await — the PS retries on the next
+      flush cycle.
+    (b) **Verify-at-apply**: after the etcd mirror returns, re-read each
+      touched extent's `eversion` under a fresh `borrow_mut` and compare
+      against the pre-await snapshot. If any eversion changed, return
+      `Err(Precondition)` rather than applying a stale diff; the etcd
+      write is benign (failover replay sees the latest revision per key,
+      and the PS retry produces a fresh correct snapshot).
+    Cross-reference: notes 10 (F138), 11 (F139), 12 (F145), 13 (F146).

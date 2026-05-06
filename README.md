@@ -295,6 +295,63 @@ $AC info | grep -E 'extent.*eversion|extent.*replicates'
 
 ---
 
+### F147 — Three snapshot-await-writeback races (2026-05-06)
+
+Three data-corruption races with the same snapshot-capture-then-await-then-apply
+shape, missed by F146:
+
+**F147-A**: `handle_sync_partition_vp_refs` applied a VP-ref diff after
+awaiting the etcd mirror, without verifying that the touched extents had not
+been mutated (eversion bumped, replica rewritten) during the await. On
+leader-failover, replaying the etcd entry would produce a `vp_table_refs`
+count inconsistent with in-memory state. Fix: refuse-at-start (check
+`ec_conversion_inflight` + `recovery_tasks` for all extents in the new
+snapshot; return `Precondition` before any await) + verify-at-apply (re-read
+each touched extent's `eversion` under a fresh `borrow_mut` after the etcd
+write; return `Precondition` if any eversion changed).
+
+**F147-B**: `handle_append` (the non-batched code path, line ~2437) lacked
+the post-truncate seal recheck that F146 added to `build_append_future` (the
+batched path). A concurrent `apply_extent_meta_durable` sealing the extent
+during the `truncate_to_commit` await would allow the subsequent `pwritev` to
+land bytes past the new `sealed_length`, producing "logStream value short" or
+out-of-bounds slice panics on EC reads. Fix: identical post-truncate recheck
+in `handle_append` (check `sealed_length / avali` atomics before computing
+pwritev offsets; return `CODE_PRECONDITION` if sealed).
+
+**F147-C**: `run_recovery_task` performed no verification after fetching the
+full extent from a peer and calling `sync_all`. A concurrent seal (from the
+manager marking the extent sealed while recovery was in progress) could arrive
+during the multi-second fetch I/O; without a check, recovery would write back
+stale eversion/sealed_length metadata and log an incorrect `fetch_max` value.
+Fix: after `sync_all`, re-read the local extent's `eversion` atomics; retry if
+it advanced. Gate the `fetch_max` writeback on the fetched length matching the
+manager-reported `sealed_length`.
+
+```
+# Scenario F147-A: concurrent flush + leader-failover with etcd-regressed eversion.
+# Run wbench to accumulate VP deps, trigger a leader failover (kill + restart manager)
+# exactly while a PS is calling sync_partition_vp_refs, and simultaneously trigger
+# recovery on an affected extent. Pre-F147-A: the replayed vp_table_refs count on
+# the new leader diverged from the PS's in-memory snapshot, risking premature
+# extent deletion. Post-F147-A: the handler returns Precondition; PS retries on the
+# next flush cycle with a fresh snapshot.
+
+# Scenario F147-B: concurrent seal during truncate on the non-batched append path.
+# Restart an extent-node mid-write so its replica is lagging. The next append
+# triggers truncate_to_commit on the non-batched path (payload below the batch
+# threshold). Simultaneously send re_avali to seal the extent. Pre-F147-B: pwritev
+# landed bytes past sealed_length. Post-F147-B: CODE_PRECONDITION, client retries.
+
+# Scenario F147-C: long recovery + concurrent seal.
+# Stop a node hosting a large (>128 MB) sealed extent. Manager dispatches recovery.
+# While the CopyExtent fetch is in-flight (seconds on loopback), the manager seals
+# a second extent on the same node (eversion bump). Pre-F147-C: recovery wrote back
+# stale metadata. Post-F147-C: recovery detects eversion advance and retries.
+```
+
+---
+
 ### F145 — punch_holes/truncate vs in-flight EC conversion (2026-05-06)
 
 F138 made `ec_conversion_inflight` an eversion-bump lock: while an extent is
