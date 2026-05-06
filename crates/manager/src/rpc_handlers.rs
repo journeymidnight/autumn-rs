@@ -1776,7 +1776,7 @@ impl AutumnManager {
         }))
     }
 
-    async fn handle_sync_partition_vp_refs(&self, payload: Bytes) -> HandlerResult {
+    pub(crate) async fn handle_sync_partition_vp_refs(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
                 code: Self::err_to_code(&err),
@@ -1789,14 +1789,19 @@ impl AutumnManager {
             part_id: req.part_id,
             refs: req.refs,
         };
-        // F147-A: refuse-at-start if any touched extent is in-flight for
-        // another eversion-bumping operation. Concurrent mutators (recovery,
-        // EC conversion) may bump eversion during the etcd await below; our
-        // pre-await blobs in extent_puts would then overwrite fresher data in
-        // etcd (last-writer-wins). PS must retry after the in-flight op clears.
-        {
+        // F147-A: single borrow block — compute deltas once, then (1) check
+        // in-flight guards, (2) build extent_puts, and (3) snapshot pre_eversion.
+        // Pre-F147-A this was two separate borrow blocks each calling
+        // partition_vp_ref_deltas, allocating the HashMap twice.
+        let (extent_puts, pre_eversion) = {
             let s = self.store.inner.borrow();
             let deltas = Self::partition_vp_ref_deltas(&s, &snapshot);
+            // Refuse-at-start: if any touched extent is in-flight for another
+            // eversion-bumping operation, concurrent mutators (recovery,
+            // EC conversion) may bump eversion during the etcd await below;
+            // our pre-await blobs in extent_puts would then overwrite fresher
+            // data in etcd (last-writer-wins). PS must retry after the
+            // in-flight op clears.
             for extent_id in deltas.keys().copied() {
                 if self.ec_conversion_inflight.borrow().contains(&extent_id) {
                     return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
@@ -1817,11 +1822,8 @@ impl AutumnManager {
                     }));
                 }
             }
-        }
-        let (extent_puts, pre_eversion) = {
-            let s = self.store.inner.borrow();
             let puts = Self::preview_partition_vp_refs_apply(&s, &snapshot);
-            let evs: HashMap<u64, u64> = Self::partition_vp_ref_deltas(&s, &snapshot)
+            let evs: HashMap<u64, u64> = deltas
                 .keys()
                 .filter_map(|&eid| s.extents.get(&eid).map(|ex| (eid, ex.eversion)))
                 .collect();
