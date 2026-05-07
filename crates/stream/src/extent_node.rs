@@ -22,8 +22,6 @@ fn mgr_to_local_extent(e: &MgrExtentInfo) -> ExtentInfo {
         ec_converted: e.ec_converted,
     }
 }
-use crate::wal::{replay_wal_files, should_use_wal, Wal, WalRecord};
-
 use anyhow::Result;
 use bytes::Bytes;
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
@@ -245,7 +243,6 @@ pub struct ExtentNodeConfig {
     /// (dir, disk_id): None disk_id → read from `disk_id` file in dir.
     disks: Vec<(PathBuf, Option<u64>)>,
     pub manager_endpoint: Option<String>,
-    pub wal_dir: Option<PathBuf>,
     /// F099-M: this shard's index (0..shard_count). Only extents where
     /// `extent_id % shard_count == shard_idx` are owned by this instance.
     pub shard_idx: u32,
@@ -266,7 +263,6 @@ impl ExtentNodeConfig {
         Self {
             disks: vec![(data_dir, Some(disk_id))],
             manager_endpoint: None,
-            wal_dir: None,
             shard_idx: 0,
             shard_count: 1,
             sibling_addrs: Vec::new(),
@@ -279,7 +275,6 @@ impl ExtentNodeConfig {
         Self {
             disks: data_dirs.into_iter().map(|d| (d, None)).collect(),
             manager_endpoint: None,
-            wal_dir: None,
             shard_idx: 0,
             shard_count: 1,
             sibling_addrs: Vec::new(),
@@ -288,11 +283,6 @@ impl ExtentNodeConfig {
 
     pub fn with_manager_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.manager_endpoint = Some(endpoint.into());
-        self
-    }
-
-    pub fn with_wal_dir(mut self, wal_dir: PathBuf) -> Self {
-        self.wal_dir = Some(wal_dir);
         self
     }
 
@@ -342,7 +332,6 @@ pub struct ExtentNode {
     recovery_inflight: Rc<DashMap<u64, crate::extent_rpc::RecoveryTask>>,
     /// WAL for small must_sync writes. None if WAL is disabled.
     /// Wrapped in Rc<RefCell<>> for interior mutability on single-threaded compio.
-    pub(crate) wal: Option<Rc<RefCell<Wal>>>,
     /// F099-M: shard_idx / shard_count for per-shard extent ownership.
     /// Default is (0, 1) = legacy single-thread mode.
     shard_idx: u32,
@@ -362,7 +351,6 @@ impl Clone for ExtentNode {
             manager_pool: self.manager_pool.clone(),
             recovery_done: self.recovery_done.clone(),
             recovery_inflight: self.recovery_inflight.clone(),
-            wal: self.wal.clone(),
             shard_idx: self.shard_idx,
             shard_count: self.shard_count,
             sibling_addrs: self.sibling_addrs.clone(),
@@ -918,36 +906,6 @@ async fn build_append_future(
     let total_end = cursor;
     let extent_id = slots[0].req.extent_id;
 
-    // 6. WAL batch.
-    let use_wal = must_sync && node.wal.is_some()
-        && crate::wal::should_use_wal(true, total_payload);
-    if use_wal {
-        let wal_records: Vec<crate::wal::WalRecord> = slots
-            .iter()
-            .enumerate()
-            .map(|(k, s)| crate::wal::WalRecord {
-                extent_id,
-                start: offsets[k],
-                revision: s.req.revision,
-                payload: s.req.payload.to_vec(),
-            })
-            .collect();
-        if let Err(e) = node
-            .wal
-            .as_ref()
-            .unwrap()
-            .borrow_mut()
-            .write_batch(&wal_records)
-        {
-            let msg = e.to_string();
-            let out: Vec<Bytes> = req_ids
-                .into_iter()
-                .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
-                .collect();
-            return Box::pin(async move { out });
-        }
-    }
-
     // 7. Reserve `extent.len` BEFORE returning the I/O future so overlapping
     //    same-extent futures compute non-overlapping file_starts.
     extent.len.store(total_end, Ordering::SeqCst);
@@ -971,9 +929,9 @@ async fn build_append_future(
                 .collect();
         }
 
-        if must_sync && !use_wal {
+        if must_sync {
             let f_ref: &CompioFile = unsafe { &*extent_for_io.file.get() };
-            if let Err(e) = f_ref.sync_all().await {
+            if let Err(e) = f_ref.sync_data().await {
                 node.mark_disk_offline_for_extent(extent_id);
                 let msg = e.to_string();
                 return req_ids
@@ -1103,29 +1061,13 @@ impl ExtentNode {
             disk_map.insert(disk_id, Rc::new(disk));
         }
 
-        // F099-M: per-shard WAL subdir so fsync on one shard does not
-        // serialise with fsync on another (they live on separate compio
-        // runtimes and would otherwise block each other through a shared
-        // Wal record writer).
-        let wal_result = if let Some(wal_dir) = config.wal_dir {
-            let resolved = if config.shard_count > 1 {
-                wal_dir.join(format!("shard_{}", config.shard_idx))
-            } else {
-                wal_dir
-            };
-            Some(Wal::open(resolved)?)
-        } else {
-            None
-        };
-
-        let mut node = Self {
+        let node = Self {
             extents: Rc::new(DashMap::new()),
             disks: Rc::new(disk_map),
             manager_endpoint: config.manager_endpoint,
             manager_pool: Rc::new(crate::ConnPool::new()),
             recovery_done: Rc::new(std::cell::RefCell::new(Vec::new())),
             recovery_inflight: Rc::new(DashMap::new()),
-            wal: None, // set after replay
             shard_idx: config.shard_idx,
             shard_count: config.shard_count,
             sibling_addrs: Rc::new(config.sibling_addrs),
@@ -1149,15 +1091,6 @@ impl ExtentNode {
         // extent's manager refs hit 0 while the node was momentarily
         // unreachable.
         node.spawn_reconcile_orphans_loop();
-
-        // Replay WAL records into extent files. Only this shard's WAL is
-        // replayed; cross-shard records live in sibling WAL dirs which
-        // the corresponding shard will replay on its own init.
-        if let Some((mut wal, replay_files)) = wal_result {
-            node.replay_wal(&replay_files).await;
-            wal.cleanup_old_wals();
-            node.wal = Some(Rc::new(RefCell::new(wal)));
-        }
 
         Ok(node)
     }
@@ -1344,66 +1277,6 @@ impl ExtentNode {
                 if disk.online() {
                     tracing::error!(extent_id, disk_id, "marking disk offline due to I/O error");
                     disk.set_offline();
-                }
-            }
-        }
-    }
-
-    /// Replay WAL records into extent files. Called on startup after load_extents().
-    async fn replay_wal(&self, replay_files: &[std::path::PathBuf]) {
-        let mut records = Vec::new();
-        replay_wal_files(replay_files, |rec| records.push(rec));
-
-        let mut replayed_extents: std::collections::HashSet<u64> =
-            std::collections::HashSet::new();
-
-        for rec in records {
-            let extent = match self.ensure_extent(rec.extent_id).await {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(
-                        "WAL replay: cannot get extent {}: {}",
-                        rec.extent_id,
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            let start = rec.start as u64;
-            let payload_len = rec.payload.len() as u64;
-            let end = start + payload_len;
-
-            // Write is idempotent: if extent file already has this data, we just overwrite.
-            if let Err(e) = file_pwrite(&extent.file, start, rec.payload).await {
-                tracing::warn!("WAL replay: write_at failed for extent {}: {e}", rec.extent_id);
-                continue;
-            }
-
-            // Advance len if needed.
-            let _ = extent.len.fetch_max(end, Ordering::SeqCst);
-
-            // Restore last_revision: take max so stale clients are still rejected after restart.
-            let _ = extent.last_revision.fetch_max(rec.revision, Ordering::SeqCst);
-
-            replayed_extents.insert(rec.extent_id);
-
-            tracing::debug!(
-                "WAL replay: extent {} start={} len={}",
-                rec.extent_id,
-                start,
-                payload_len
-            );
-        }
-
-        // Persist updated metadata (including last_revision) for every replayed extent so that
-        // the on-disk .meta file reflects the recovered revision before we start serving traffic.
-        for extent_id in replayed_extents {
-            if let Some(entry) = self.extents.get(&extent_id) {
-                if let Err(e) = self.save_meta(extent_id, &entry).await {
-                    tracing::warn!(
-                        "WAL replay: save_meta failed for extent {extent_id}: {e:?}"
-                    );
                 }
             }
         }
@@ -1749,7 +1622,6 @@ impl ExtentNode {
             MSG_WRITE_SHARD => self.handle_write_shard(payload).await,
             MSG_DELETE_EXTENT => self.handle_delete_extent(payload).await,
             MSG_COMMIT_EC_SHARD => self.handle_commit_ec_shard(payload).await,
-            MSG_SYNC_EXTENT => self.handle_sync_extent(payload).await,
             _ => Err((StatusCode::InvalidArgument, format!("unknown msg_type {msg_type}"))),
         }
     }
@@ -1873,7 +1745,7 @@ impl ExtentNode {
         let sealed_changed = Self::apply_extent_meta(extent, ex);
         if sealed_changed {
             let _ = self.save_meta(extent_id, extent).await;
-            if let Err(e) = file_ref(&extent.file).sync_all().await {
+            if let Err(e) = file_ref(&extent.file).sync_data().await {
                 tracing::warn!(
                     extent_id,
                     sealed_length = ex.sealed_length,
@@ -2058,7 +1930,7 @@ impl ExtentNode {
         let payload_len = payload.len() as u64;
         file_pwrite_chunked(&extent.file, 0, Bytes::from(payload)).await
             .map_err(|e| e.to_string())?;
-        file_ref(&extent.file).sync_all().await
+        file_ref(&extent.file).sync_data().await
             .map_err(|e| e.to_string())?;
 
         // F147-C: verify-after-sync — a concurrent apply_extent_meta_durable
@@ -2242,7 +2114,7 @@ impl ExtentNode {
         let staging_cell = std::cell::UnsafeCell::new(staging_file);
         file_pwrite_chunked(&staging_cell, 0, shard_data).await
             .map_err(|e| (StatusCode::Internal, format!("write staging {extent_id}/{shard_index}: {e}")))?;
-        file_ref(&staging_cell).sync_all().await
+        file_ref(&staging_cell).sync_data().await
             .map_err(|e| (StatusCode::Internal, format!("sync staging {extent_id}: {e}")))?;
 
         tracing::info!(
@@ -2483,31 +2355,14 @@ impl ExtentNode {
 
         let data_payload = req.payload;
 
-        let use_wal = self.wal.is_some() && should_use_wal(req.must_sync, data_payload.len());
-        if use_wal {
-            let record = WalRecord {
-                extent_id: req.extent_id,
-                start: start as u32,
-                revision: req.revision,
-                payload: data_payload.to_vec(),
-            };
-            self.wal.as_ref().unwrap().borrow_mut().write(&record)
-                .map_err(|e| (StatusCode::Internal, e.to_string()))?;
-            // Extent write — no sync needed, WAL provides durability.
-            if let Err(e) = file_pwrite(&extent.file, start, data_payload.clone()).await {
+        if let Err(e) = file_pwrite(&extent.file, start, data_payload.clone()).await {
+            self.mark_disk_offline_for_extent(req.extent_id);
+            return Err((StatusCode::Internal, e.to_string()));
+        }
+        if req.must_sync {
+            if let Err(e) = file_ref(&extent.file).sync_data().await {
                 self.mark_disk_offline_for_extent(req.extent_id);
                 return Err((StatusCode::Internal, e.to_string()));
-            }
-        } else {
-            if let Err(e) = file_pwrite(&extent.file, start, data_payload.clone()).await {
-                self.mark_disk_offline_for_extent(req.extent_id);
-                return Err((StatusCode::Internal, e.to_string()));
-            }
-            if req.must_sync {
-                if let Err(e) = file_ref(&extent.file).sync_all().await {
-                    self.mark_disk_offline_for_extent(req.extent_id);
-                    return Err((StatusCode::Internal, e.to_string()));
-                }
             }
         }
 
@@ -2658,64 +2513,6 @@ impl ExtentNode {
             length: length as u32,
         }
         .encode())
-    }
-
-    /// F142: fsync a single extent's data file in place. No payload,
-    /// no `extent.len` change. Used by the partition server before
-    /// committing an SST whose VPs reference log_stream regions
-    /// written with `must_sync=false`. Idempotent and cheap when the
-    /// file is already clean.
-    async fn handle_sync_extent(&self, payload: Bytes) -> HandlerResult {
-        let req = SyncExtentReq::decode(payload)
-            .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
-
-        if !self.owns_extent(req.extent_id) {
-            return Err((
-                StatusCode::FailedPrecondition,
-                format!(
-                    "extent {} belongs to shard {} not shard {} (shard_count={})",
-                    req.extent_id,
-                    req.extent_id % self.shard_count as u64,
-                    self.shard_idx,
-                    self.shard_count,
-                ),
-            ));
-        }
-
-        let entry = self.extents.get(&req.extent_id).ok_or_else(|| {
-            (
-                StatusCode::NotFound,
-                format!("extent {} not found", req.extent_id),
-            )
-        })?;
-
-        // Revision fencing matches commit_length / append: a stale
-        // owner must not be able to force a sync against a fenced
-        // extent. A higher revision bumps last_revision (and persists
-        // the meta sidecar), matching the existing commit_length
-        // behaviour so the sync RPC participates in the same fencing
-        // contract.
-        if req.revision > 0 {
-            let last = entry.last_revision.load(Ordering::SeqCst);
-            if req.revision < last {
-                return Ok(SyncExtentResp {
-                    code: CODE_LOCKED_BY_OTHER,
-                }
-                .encode());
-            }
-            if req.revision > last {
-                entry.last_revision.store(req.revision, Ordering::SeqCst);
-                let _ = self.save_meta(req.extent_id, &entry).await;
-            }
-        }
-
-        if let Err(e) = file_ref(&entry.file).sync_all().await {
-            return Err((
-                StatusCode::Internal,
-                format!("sync_extent {}: {}", req.extent_id, e),
-            ));
-        }
-        Ok(SyncExtentResp { code: CODE_OK }.encode())
     }
 
     async fn handle_alloc_extent(&self, payload: Bytes) -> HandlerResult {
@@ -3099,7 +2896,7 @@ impl ExtentNode {
         let payload_len = write_payload.len() as u64;
         file_pwrite_chunked(&extent.file, 0, write_payload).await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
-        file_ref(&extent.file).sync_all().await
+        file_ref(&extent.file).sync_data().await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
         extent.len.store(payload_len, Ordering::SeqCst);
 
@@ -3382,7 +3179,7 @@ impl ExtentNode {
                     .await
                     .map_err(|e| (StatusCode::Internal, format!("write {extent_id}: {e}")))?;
                 file_ref(&entry.file)
-                    .sync_all()
+                    .sync_data()
                     .await
                     .map_err(|e| (StatusCode::Internal, format!("sync {extent_id}: {e}")))?;
                 entry.len.store(sealed_length, Ordering::SeqCst);

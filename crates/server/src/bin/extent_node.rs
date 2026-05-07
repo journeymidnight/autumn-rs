@@ -13,8 +13,6 @@ struct Args {
     /// Optional explicit disk_id for single-disk backward-compat mode.
     disk_id: Option<u64>,
     manager: Option<String>,
-    /// WAL directory. Independent of data dirs. If not set, WAL is disabled.
-    wal_dir: Option<PathBuf>,
     /// F099-M: number of compio runtimes (shards) to spawn in this process.
     /// Each shard owns extents where `extent_id % shards == shard_idx` and
     /// listens on `port + shard_idx * shard_stride`. Default 1 (legacy).
@@ -34,7 +32,6 @@ fn parse_args() -> Args {
     let mut data_dirs: Vec<PathBuf> = Vec::new();
     let mut disk_id: Option<u64> = None;
     let mut manager: Option<String> = None;
-    let mut wal_dir: Option<PathBuf> = None;
     // Default shard count from AUTUMN_EXTENT_SHARDS env, else 1.
     let mut shards: u32 = std::env::var("AUTUMN_EXTENT_SHARDS")
         .ok()
@@ -74,10 +71,6 @@ fn parse_args() -> Args {
             "--manager" => {
                 i += 1;
                 manager = Some(args[i].clone());
-            }
-            "--wal-dir" => {
-                i += 1;
-                wal_dir = Some(PathBuf::from(&args[i]));
             }
             "--shards" => {
                 i += 1;
@@ -119,7 +112,6 @@ fn parse_args() -> Args {
         data_dirs,
         disk_id,
         manager,
-        wal_dir,
         shards,
         shard_stride,
         bind_host,
@@ -177,7 +169,6 @@ fn main() -> Result<()> {
         let data_dirs = args.data_dirs.clone();
         let disk_id = args.disk_id;
         let manager = args.manager.clone();
-        let wal_dir = args.wal_dir.clone();
         let siblings = sibling_addrs.clone();
         let shards = args.shards;
         let listen_port = shard_ports[shard_idx as usize];
@@ -204,9 +195,6 @@ fn main() -> Result<()> {
                     } else {
                         ExtentNodeConfig::new_multi(data_dirs)
                     };
-                    if let Some(wal) = wal_dir {
-                        cfg = cfg.with_wal_dir(wal);
-                    }
                     if let Some(mgr) = manager {
                         cfg = cfg.with_manager_endpoint(mgr);
                     }
@@ -254,18 +242,12 @@ fn run_single_shard(args: Args) -> Result<()> {
         let config = if args.data_dirs.len() == 1 && args.disk_id.is_some() {
             let data = args.data_dirs.into_iter().next().unwrap();
             let mut c = ExtentNodeConfig::new(data, args.disk_id.unwrap());
-            if let Some(wal) = args.wal_dir {
-                c = c.with_wal_dir(wal);
-            }
             if let Some(mgr) = args.manager {
                 c = c.with_manager_endpoint(mgr);
             }
             c
         } else {
             let mut c = ExtentNodeConfig::new_multi(args.data_dirs);
-            if let Some(wal) = args.wal_dir {
-                c = c.with_wal_dir(wal);
-            }
             if let Some(mgr) = args.manager {
                 c = c.with_manager_endpoint(mgr);
             }

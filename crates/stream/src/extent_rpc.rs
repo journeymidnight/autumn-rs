@@ -23,12 +23,9 @@ pub const MSG_CONVERT_TO_EC: u8 = 9;
 pub const MSG_WRITE_SHARD: u8 = 10;
 pub const MSG_DELETE_EXTENT: u8 = 11;
 pub const MSG_COMMIT_EC_SHARD: u8 = 12;
-/// F142: fsync barrier RPC. Server calls `file.sync_all()` on the named
-/// extent's data file. Used by the partition server to flush log_stream
-/// page cache before committing an SST whose VPs reference that
-/// log_stream extent — preserves the WAL→SST durability ordering when
-/// foreground puts run with `must_sync=false`.
-pub const MSG_SYNC_EXTENT: u8 = 13;
+// 13 = MSG_SYNC_EXTENT — retired in F150 Phase B; the F142 fsync barrier is
+//      now folded into the rotation-trigger `must_sync=true` batch promotion
+//      in autumn-partition-server's `start_write_batch`.
 // MSG_TYPE_PING = 0xFF is reserved by autumn-rpc for heartbeat
 
 // ── Append (hot path) ────────────────────────────────────────────────────────
@@ -247,62 +244,9 @@ impl CommitLengthResp {
     }
 }
 
-// ── SyncExtent (F142 fsync barrier) ─────────────────────────────────────────
-
-/// SyncExtentRequest: 16 bytes.
-/// `[extent_id: u64 LE][revision: i64 LE]`
-///
-/// Causes the extent-node to call `file.sync_all()` on the named
-/// extent's data file. No payload is written and `extent.len` is not
-/// modified. Used by the partition server's flush path to make
-/// `must_sync=false` log_stream writes durable before committing an
-/// SST that references them via `ValuePointer`.
-pub struct SyncExtentReq {
-    pub extent_id: u64,
-    pub revision: i64,
-}
-
-impl SyncExtentReq {
-    pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(16);
-        buf.put_u64_le(self.extent_id);
-        buf.put_i64_le(self.revision);
-        buf.freeze()
-    }
-
-    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
-        if data.len() < 16 {
-            return Err("sync_extent request too short");
-        }
-        Ok(Self {
-            extent_id: data.get_u64_le(),
-            revision: data.get_i64_le(),
-        })
-    }
-}
-
-/// SyncExtentResponse: 1 byte.
-/// `[code: u8]`
-pub struct SyncExtentResp {
-    pub code: u8,
-}
-
-impl SyncExtentResp {
-    pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(1);
-        buf.put_u8(self.code);
-        buf.freeze()
-    }
-
-    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
-        if data.is_empty() {
-            return Err("sync_extent response too short");
-        }
-        Ok(Self {
-            code: data.get_u8(),
-        })
-    }
-}
+// (F150 Phase B removed SyncExtentReq/Resp + MSG_SYNC_EXTENT — the F142
+// fsync barrier is now folded into `start_write_batch`'s rotation-trigger
+// `must_sync=true` promotion in autumn-partition-server.)
 
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 

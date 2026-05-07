@@ -38,7 +38,7 @@ use sstable::{IterItem, MemtableIterator, MergeIterator, SstBuilder, SstReader, 
 // Constants
 // ---------------------------------------------------------------------------
 
-const FLUSH_MEM_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const FLUSH_MEM_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SKIP_LIST: u64 = 256 * 1024 * 1024;
 const WRITE_CHANNEL_CAP: usize = 1024;
 const DEFAULT_MAX_WRITE_BATCH: usize = WRITE_CHANNEL_CAP * 3;
@@ -3181,20 +3181,16 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
         )
     };
 
-    // F142 WAL barrier: fsync the log_stream tail BEFORE we let
-    // P-bulk commit the SST. The imm we're about to flush contains
-    // ValuePointer entries that reference log_stream regions which
-    // may have been written with `must_sync=false` (e.g. clients using
-    // `--nosync`). If we let the SST + meta_stream checkpoint become
-    // durable while those WAL bytes are still page-cache-only, an
-    // extent-node restart that loses page cache leaves the SST
-    // pointing into now-truncated regions — `head` succeeds, `get`
-    // surfaces `offset N past decoded payload len M`. Single fsync per
-    // imm is amortised across hundreds of MB of writes and runs on the
-    // background flush task, so it doesn't slow foreground puts.
-    if let Err(e) = part_sc.sync_stream_tail(log_stream_id).await {
-        return Err(anyhow!("flush_one_imm: WAL barrier sync failed: {e}"));
-    }
+    // F150 Phase B replaces the F142 WAL barrier here. The rotation-
+    // trigger batch in `start_write_batch` (background.rs) already promoted
+    // its `must_sync` to `true`, so the extent-node ran `file.sync_data()`
+    // on the log_stream tail covering ALL prior must_sync=false bytes
+    // before this imm was rotated. No separate `sync_stream_tail` RPC
+    // needed at flush time. Cross-reference: F150 Phase A- removed the
+    // extent-node WAL fast path so the must_sync=true append always takes
+    // the Direct path (write_at + sync_data), which is what makes the
+    // rotation-trigger barrier load-bearing.
+    let _ = log_stream_id; // kept in scope for future Phase C wiring
 
     let Some(mut req_tx) = req_tx else {
         // P-bulk thread failed to spawn — fall back to in-thread flush so

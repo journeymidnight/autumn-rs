@@ -1,6 +1,6 @@
 //! Shared test infrastructure for autumn-stream integration tests.
 //!
-//! Provides `TestConn` (typed RPC client over autumn-rpc) and `start_node`/`start_node_with_wal`
+//! Provides `TestConn` (typed RPC client over autumn-rpc) and `start_node`
 //! helpers that spawn an ExtentNode on the compio runtime.
 
 use std::net::SocketAddr;
@@ -20,22 +20,10 @@ pub fn pick_addr() -> SocketAddr {
     addr
 }
 
-/// Start an ExtentNode on the given address (single-disk, no WAL).
+/// Start an ExtentNode on the given address (single-disk).
 /// Returns after the server is listening.
 pub async fn start_node(data_dir: &std::path::Path, addr: SocketAddr) {
     let config = ExtentNodeConfig::new(data_dir.to_path_buf(), 1);
-    let node = ExtentNode::new(config).await.expect("create ExtentNode");
-    compio::runtime::spawn(async move {
-        let _ = node.serve(addr).await;
-    })
-    .detach();
-    compio::time::sleep(Duration::from_millis(120)).await;
-}
-
-/// Start an ExtentNode with WAL enabled.
-pub async fn start_node_with_wal(data_dir: &std::path::Path, addr: SocketAddr) {
-    let wal_dir = data_dir.join("wal");
-    let config = ExtentNodeConfig::new(data_dir.to_path_buf(), 1).with_wal_dir(wal_dir);
     let node = ExtentNode::new(config).await.expect("create ExtentNode");
     compio::runtime::spawn(async move {
         let _ = node.serve(addr).await;

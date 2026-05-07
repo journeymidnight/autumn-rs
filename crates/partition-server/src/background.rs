@@ -462,7 +462,27 @@ pub(crate) fn start_write_batch(
             record_sizes.push((hdr_size + e.value.len()) as u32);
         }
 
-        let batch_must_sync = valid.iter().any(|e| e.must_sync);
+        // F150 Phase B: rotation-trigger barrier.
+        //
+        // If this batch will push `active.mem_bytes()` past the rotation
+        // threshold, force `must_sync=true` on the entire batch. Post-F150
+        // Phase A- the must_sync path is `file.write_at` + `file.sync_data()`
+        // (Direct path; the WAL fast-path was deleted), and `sync_data`
+        // fsyncs ALL dirty pages of the extent file — including any prior
+        // must_sync=false bytes that landed via page cache only. So the
+        // rotation-trigger batch's append acts as a WAL barrier covering
+        // every byte the imm-about-to-be-rotated will reference via
+        // ValuePointer.
+        //
+        // This replaces the F142 `sync_stream_tail` separate-RPC barrier
+        // that flush_one_imm used to issue: same fsync, one fewer RPC
+        // round-trip, no extra wire message type.
+        let estimated_batch_bytes: u64 =
+            record_sizes.iter().map(|s| *s as u64).sum();
+        let triggers_rotation =
+            p.active.mem_bytes() + estimated_batch_bytes >= crate::FLUSH_MEM_BYTES;
+        let batch_must_sync = triggers_rotation
+            || valid.iter().any(|e| e.must_sync);
         let log_stream_id = p.log_stream_id;
         let part_sc = p.stream_client.clone();
 

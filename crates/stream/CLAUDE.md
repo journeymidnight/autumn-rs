@@ -7,7 +7,7 @@ Five components in one crate:
 2. **`extent_rpc`** (`extent_rpc.rs`) — wire codec for all 10 ExtentService RPCs. Hot-path uses binary encoding; control-plane uses rkyv zero-copy serialization.
 3. **`StreamClient`** (`client.rs`) — the client library used by `PartitionServer` to read/write streams. Manager calls are stubbed (F044 scope).
 4. **`erasure`** (`erasure.rs`) — Reed-Solomon EC codec (`ec_encode`, `ec_decode`, `ec_reconstruct_shard`), wrapping `reed-solomon-erasure` crate.
-5. **`wal`** (`wal.rs`) — Extent node WAL for small-write durability (F035).
+5. _(removed in F150 Phase A-: extent-node WAL deleted; SSD-only deployments make sequential WAL fsync no longer beat extent-file fsync)_.
 
 All are exported from `src/lib.rs`.
 
@@ -41,7 +41,7 @@ Each extent file pair:
 autumn-client --manager ... format --listen :9101 --advertise host:9101 /disk1 /disk2
 
 # Start node with multiple disks (comma-separated or repeated)
-autumn-extent-node --data /disk1,/disk2 --manager ... [--wal-dir /nvme/wal]
+autumn-extent-node --data /disk1,/disk2 --manager ...
 ```
 
 **Single-disk usage** (tests / backward compat):
@@ -206,12 +206,12 @@ Append(AppendReq via autumn-rpc binary frame):
              code. Sibling note in `partition-server/CLAUDE.md` Programming
              Note 12 describes the matching publishing-order invariant for
              flush + compact metadata publishes.
-  6. Write payload:
-       - WAL path (must_sync=true AND payload ≤ 2MB AND WAL enabled):
-           futures::join!(wal.write(record), file.write_at(start, payload))
-       - Direct path:
-           file.write_at(start, payload)
-           if must_sync: file.sync_all()
+  6. Write payload (Direct path — F150 Phase A- removed the WAL fast path):
+       - file.write_at(start, payload)
+       - if must_sync: file.sync_all() — fsyncs the entire extent file's
+         dirty pages, including any prior must_sync=false bytes still in
+         page cache. This is what F150 Phase B's rotation-trigger barrier
+         relies on.
   7. Advance extent.len
   8. Return (offset=start, end=start+payload_len)
 ```
@@ -220,22 +220,9 @@ No `write_lock` — appends are serialized by sequential processing within `hand
 
 Step 5 (commit-based truncation) is the key to consistency: it effectively replaces a traditional WAL by using the data files themselves as journals.
 
-### WAL (wal.rs)
-
-Small must_sync writes (≤ 2MB) use the WAL for lower-latency durability:
-
-- **Format**: Pebble/LevelDB-style 128KB block framing. Each chunk has a 9-byte header: `[CRC32C: 4B][len: 4B][type: 1B]`. Chunk types: FULL=1, FIRST=2, MIDDLE=3, LAST=4.
-- **Record**: `[uvarint extent_id][uvarint start][i64 revision][uvarint payload_len][payload]`
-- **Synchronous writes**: `Wal` directly owns the `RecordWriter` (std::fs::File). No background task, no channels. `write()` and `write_batch()` are blocking sync calls — acceptable because WAL writes are sequential and fast (single rotating file, single fsync). Called from the compio event loop thread.
-- **Batch support**: `write_batch(&mut self, records: &[WalRecord])` writes all records then syncs once, amortizing fsync cost. Used by `handle_append_batch` for pipelined writes.
-- **Rotation**: at 250MB; old WAL files are kept for replay then deleted.
-- **Startup replay**: `replay_wal_files()` called in `ExtentNode::new()` after `load_extents()`. Each record is written back to the extent file at `record.start`; idempotent if extent already has the data.
-- **Config**: `ExtentNodeConfig::with_wal_dir(PathBuf)`. Binary defaults to `data_dir/wal/`.
-- **Ownership**: Stored as `Option<Rc<RefCell<Wal>>>` in `ExtentNode`. Single-threaded compio, no Arc/Mutex needed.
-
 ### Commit Protocol Explained
 
-The `StreamClient` computes `commit = min(commit_length on all replicas)` before each append. Any replica that got ahead (e.g., partially acknowledged data before a crash) is truncated back to the consensus point on the next append. The WAL provides per-node durability on top of this protocol.
+The `StreamClient` computes `commit = min(commit_length on all replicas)` before each append. Any replica that got ahead (e.g., partially acknowledged data before a crash) is truncated back to the consensus point on the next append. Per-node durability comes from `file.sync_all()` on must_sync=true appends (after F150 Phase A- there is no separate WAL file).
 
 ### Recovery (`require_recovery` RPC)
 
@@ -532,7 +519,7 @@ sufficient (and cheaper than DashMap).
 
 3. **Parallel 3-replica fanout (F099-B)** — `launch_append` fires the 3 per-replica `pool.send_vectored` futures concurrently via `futures::future::join_all`. Each per-replica future awaits its own RpcClient submit channel independently, so one slow/back-pressured replica doesn't serialise the others. Per-replica TCP byte order is still preserved because each RpcClient runs a single-writer `writer_task` (R4 step 4.1) — the fanout order across replicas is irrelevant because every replica is independent. The `AppendResp.offset/end` consistency check in `apply_completion` still enforces that all replicas agree on the file-level offset.
 
-4. **`must_sync` cost** — for small payloads (≤ 2MB) with WAL enabled, triggers parallel WAL sync + async extent write; the WAL sequential write is faster than random `sync_all()` on the extent file. For large payloads or WAL-disabled nodes, falls back to `sync_all()` on the extent file. Only set for records requiring guaranteed durability (e.g., partition WAL entries). SSTable data doesn't need `must_sync` since replication provides durability.
+4. **`must_sync` cost** — F150 Phase A- removed the extent-node WAL. `must_sync=true` always takes the Direct path: `file.write_at` + `file.sync_all()`. The extent fsync covers ALL dirty pages of the file including prior must_sync=false bytes that landed via page cache only — this is the load-bearing property F150 Phase B (rotation-trigger barrier in PS) depends on. SSTable data doesn't need `must_sync` since replication provides durability.
 
 5. **StreamClient is always held as `Rc<StreamClient>`** — constructors return `Rc<Self>` (via `Rc::new_cyclic`) so per-stream workers can hold `Weak<StreamClient>` for the removal-guard. Callers clone the `Rc` to share. Public API methods take `&self`, so `sc.append(...)` works transparently.
 

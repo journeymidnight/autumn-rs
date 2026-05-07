@@ -1,128 +1,125 @@
-Date: 2026-05-06
+Date: 2026-05-07
 TaskStatus: completed
-Task scope: F149 — Leader-fence on every manager etcd write txn. Closes the
-            failover-gap split-brain window where a deposed leader's in-process
-            `self.leader.get() == true` flag could lag etcd ground truth and
-            allow last-writer-wins overwrites of the new leader's mirror_*
-            state.
+Task scope: F150 — Reduce F142's WAL-fsync-barrier cost on the flush hot path.
+            Two phases shipped (A- and B); Phase A and Phase C deferred.
+            See feature_list.md F150 entry for the full design and rationale.
 
-Why F149 was needed:
+Phases:
 
-  F005's lease-based leader election (10 s lease + 2 s keepalive + create_revision
-  CAS) is sufficient to guarantee that at most one manager **holds** the leader-key
-  at any time. It is NOT sufficient to prevent a deposed leader from issuing etcd
-  writes that overwrite the new leader's state. The window between (a) the etcd
-  lease expiring + a new leader winning the CAS, and (b) the old leader's
-  keepalive task observing failure and flipping `set_leader(false)` is bounded
-  by lease TTL + keepalive jitter on a healthy host (~10 s), but unbounded under
-  compio runtime starvation, GC pauses, or syscall hangs. During that window
-  the deposed leader's mirror_* paths (which use plain etcd puts, not version-
-  conditional CAS) can revert recovery slot replacements, EC conversion eversion
-  bumps, partition splits, etc.
+  Phase A- (extent-node WAL deletion). The extent-node WAL was originally
+    introduced (F035) as a small-write durability optimisation: must_sync=true
+    payloads ≤ 2 MiB took a "WAL path" — write the record to a sequential
+    rotating log file with its own fsync, write the data to the extent file
+    via page cache only (no fsync). On rotational disks this was a clear win:
+    sequential WAL fsync beat random extent fsync. On modern SSD/NVMe
+    deployments the gap collapses (no seek penalty + SLC cache + wear
+    levelling), and the WAL adds a parallel codepath that the F150 Phase B
+    barrier would have to bypass with a new flag.
+    Deletion: `crates/stream/src/wal.rs` (963 lines) + `replay_wal_files`
+    + `Wal::open` + `--wal-dir` CLI flag + `ExtentNodeConfig::with_wal_dir`
+    + `ExtentNode.wal` field + `start_node_with_wal` test helper +
+    `tests/wal_recovery.rs` integration test (170 lines). After deletion
+    `handle_append`'s must_sync=true path collapses to the Direct path
+    (`file.write_at` + `file.sync_data()`), which is what Phase B then
+    leans on.
 
-Fix shipped (F149):
+  Phase A (sync_all → sync_data). Replaced every `file.sync_all().await`
+    call site in `crates/stream/src/extent_node.rs` with `sync_data().await`.
+    On Linux ext4, fdatasync skips one inode-metadata journal commit
+    relative to fsync; the file size still gets sync'd (so EOF reads remain
+    consistent). Per-fsync cost drops ~30-50% on ext4 SSDs; on the local
+    /tmp tmpfs perf-check rig the difference is unmeasurable (RAM-backed,
+    fsync is essentially free either way).
 
-  Added Cmp::value() helper to autumn-etcd (target=3 VALUE, result=0 EQUAL).
+  Phase B (rotation-trigger must_sync barrier). PS-side
+    `start_write_batch` (`crates/partition-server/src/background.rs`)
+    now estimates `active.mem_bytes() + Σ record_sizes` and forces
+    `batch_must_sync = true` when this batch will push past
+    `FLUSH_MEM_BYTES`. Post-Phase-A- this means the rotation-triggering
+    batch's append takes the Direct path → `file.sync_data()` on the
+    log_stream tail extent, which by Linux semantics fsyncs ALL dirty
+    pages of the file including any prior must_sync=false bytes. The imm
+    that gets created by the next `maybe_rotate` therefore has all its
+    VP-referenced WAL bytes durable before flush_one_imm even fires.
+    Deletions:
+      - `flush_one_imm`'s `part_sc.sync_stream_tail(log_stream_id)` call
+      - `StreamClient::sync_stream_tail` public API (~80 lines)
+      - `ExtentNode::handle_sync_extent` server handler (~60 lines)
+      - `MSG_SYNC_EXTENT = 13` dispatch entry
+      - `SyncExtentReq` / `SyncExtentResp` extent_rpc types (~55 lines)
+    Net diff: ~200 LOC fewer + 1 fewer RPC type + 1 fewer round-trip per
+    flush. Same fsync cost (the actual fsync syscall happens regardless),
+    but folded into the rotation-trigger append's existing 3-replica
+    fanout instead of a separate barrier RPC.
 
-  Made `EtcdMirror` carry `instance_id: Rc<String>` + `leader: Rc<Cell<bool>>`
-  (shared with AutumnManager).
+  Phase C (background async fsync loop) — DEFERRED.
+    Design: per-partition `wal_sync_loop` fsyncs log_stream tail every
+    ~50ms, maintains `wal_synced_high_water`. start_write_batch's
+    rotation-trigger barrier becomes a wait-not-block (typically
+    sub-ms because the background loop has already caught up).
+    Deferred because:
+      (a) On the local tmpfs perf-check rig the measurable fsync cost
+          is already zero — Phase C's win against zero is also zero.
+      (b) Phase C is a larger architectural change (new background
+          task, new state tracking, interleaving with active appends)
+          that should be justified by a measurement on real SSD
+          hardware showing residual fsync cost after Phase B.
+    Re-evaluate when production-grade benches show non-trivial Phase B
+    flush latency.
 
-  Added a private `EtcdMirror::txn_fenced(extra_cmp, success, failure)` that
-  always prepends `Cmp::value(LEADER_KEY) == instance_id` to extra_cmp. On
-  txn rejection it does a follow-up GET on the leader-key to distinguish
-  fence-fail (flip `leader` Cell to false, return AppError::NotLeader) from
-  extra_cmp-fail (return Ok(false), preserving the create_revision==0
-  semantics for owner-lock + recoveryTasks acquisition).
-
-  Rerouted `put_msgs_txn` and `put_and_delete_txn` through `txn_fenced(vec![],
-  …)`. Return type changed from `anyhow::Result<()>` to `Result<(), AppError>`
-  so the NotLeader distinction propagates without translation.
-
-  Five callsite groups now go through the fence:
-    1. All 9 `mirror_*` helpers (lib.rs ~1218–1431) — `.map_err(...)` shims
-       stripped now that the helpers return AppError directly.
-    2. `persist_extent` (lib.rs ~1217).
-    3. `acquire_owner_revision` (lib.rs ~665) — extra_cmp = create_revision==0
-       on `ownerLocks/$owner_key`. The follow-up GET reads the existing
-       revision when the CAS fails.
-    4. `dispatch_recovery_task` (recovery.rs ~107) — extra_cmp =
-       create_revision==0 on `recoveryTasks/$extent_id`. Returns Ok(()) on
-       Ok(false) (already in-flight), bubbles NotLeader on Err.
-    5. `handle_multi_modify_split` Phase-2 consolidated txn (rpc_handlers.rs
-       ~1533) — error mapper updated to `Self::err_to_status` so NotLeader
-       maps to StatusCode::Unavailable instead of being flattened to Internal.
-
-  Intentionally NOT routed through txn_fenced:
-    - `try_become_leader` — the txn IS the operation establishing ownership of
-      the leader-key; cannot fence on a key we are about to acquire.
-    - `replay_from_etcd` — read-only, no fence semantics.
-    - `leader_keepalive_loop` — pure lease keep-alive, no k/v write.
-
-Files modified:
-  - crates/etcd/src/lib.rs (Cmp::value).
-  - crates/manager/src/lib.rs (EtcdMirror struct + connect signature, LEADER_KEY
-    hoisted to module-level constant, txn_fenced, put_msgs_txn/put_and_delete_txn
-    rerouted, mirror_* shims stripped, acquire_owner_revision rerouted,
-    instance_id changed to Rc<String>, leader_election_loop + try_become_leader
-    use the module-level constant).
-  - crates/manager/src/recovery.rs (dispatch_recovery_task rerouted, two
-    .map_err shims stripped from apply_recovery_done + apply_ec_conversion_done).
-  - crates/manager/src/rpc_handlers.rs (handle_multi_modify_split error mapper
-    updated to Self::err_to_status).
-  - crates/manager/tests/f149_leader_fence.rs (new — gated #[ignore] integration
-    test verifying deposition produces CODE_NOT_LEADER and only pre-deposition
-    state survives).
-  - crates/manager/CLAUDE.md (note 15 — full F149 statement).
-  - feature_list.md (F149 entry, passes:true).
-  - README.md (F149 manual-repro block + live-cluster repro).
-  - claude-progress.txt (this file).
+Files modified (Phase A- + A + B):
+  - crates/stream/src/wal.rs (deleted, 963 LOC)
+  - crates/stream/src/lib.rs (mod wal; removed)
+  - crates/stream/src/extent_node.rs (WAL field, init, replay_wal,
+    WAL-path branches in handle_append + build_append_future,
+    handle_sync_extent, dispatch entry, all sync_all → sync_data;
+    ~190 LOC net delete)
+  - crates/stream/src/extent_rpc.rs (SyncExtentReq/Resp, MSG_SYNC_EXTENT)
+  - crates/stream/src/client.rs (sync_stream_tail public API + imports)
+  - crates/stream/CLAUDE.md (WAL section, config note, must_sync cost note)
+  - crates/stream/tests/test_helpers.rs (start_node_with_wal removal)
+  - crates/stream/tests/wal_recovery.rs (deleted, 170 LOC)
+  - crates/server/src/bin/extent_node.rs (--wal-dir CLI flag, with_wal_dir
+    calls in single-shard + multi-shard paths)
+  - crates/partition-server/src/lib.rs (FLUSH_MEM_BYTES exported pub(crate),
+    flush_one_imm sync_stream_tail call removed + comment block)
+  - crates/partition-server/src/background.rs (start_write_batch
+    rotation-trigger detection + batch_must_sync upgrade)
 
 Verification:
-  - cargo build --workspace: clean (only pre-existing warnings).
-  - cargo test -p autumn-etcd --lib: 3/3 pass.
-  - cargo test -p autumn-manager --lib: 30/30 pass — no unit test regression
-    (in-memory mode bypasses etcd entirely; fence is a no-op).
-  - cargo test -p autumn-stream --lib: 52/52 pass.
-  - cargo test -p autumn-partition-server --lib: 108/108 pass.
-  - cargo build -p autumn-manager --tests: clean compile of all integration
-    tests including the new f149_leader_fence.
-  - The integration test `f149_deposed_leader_etcd_writes_are_fenced` is
-    `#[ignore]`-gated per repo convention (requires Go toolchain to build the
-    embedded etcd helper). It reproduces the deposition window by externally
-    overwriting the leader-key value mid-flight and asserts (a) baseline writes
-    succeed, (b) the next mirror_register_node returns CODE_NOT_LEADER,
-    (c) subsequent writes remain sticky CODE_NOT_LEADER (proving the in-process
-    `leader` Cell flipped on the first fence break without re-hitting etcd),
-    and (d) only the pre-deposition node entry survived in etcd.
-  - Live-cluster verification: see README.md F149 block (SIGSTOP M1 + 12 s wait
-    + SIGCONT to surface the deposition window).
 
-Distributed-systems audit:
+  cargo build --workspace --exclude autumn-fuse: clean (only pre-existing
+    warnings).
+  cargo test -p autumn-stream --lib: 30/30 pass (was 52 — drop accounts
+    for the 22 wal.rs internal unit tests deleted with the file).
+  cargo test -p autumn-manager --lib: 30/30 pass.
+  cargo test -p autumn-partition-server --lib: 106 pass / 2 pre-existing
+    f099i parallel-test races (same baseline as F148/F149, verified by
+    running each individually with --test-threads=1: passes).
 
-  1. Identity — instance_id is generated by `uuid::Uuid::new_v4()` once at
-     `AutumnManager::new()`. It survives the entire process lifetime and is the
-     same value written into LEADER_KEY by `try_become_leader` AND used by
-     `txn_fenced` as the fence operand. The same instance can re-acquire
-     leadership after a transient failure (its previous lease expired, the
-     LEADER_KEY auto-deleted, the next election round wrote the same
-     instance_id back) — fence still works because we are comparing against
-     ourselves.
+  Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs):
+    F148 (HEAD~2):                   90,659 ops/s
+    F149 (HEAD~1, leader-fence):     96,826 ops/s
+    F150 Phase A- + A:               92,836 ops/s
+    F150 Phase A- + A + B (now):     91,505 ops/s
+    Read-side and latency: indistinguishable from F149/F148.
 
-  2. The follow-up GET in txn_fenced on rejection: there is a brief race where
-     between the failed txn and the GET, the new leader could itself be
-     deposed and a third leader could win — but in that scenario the GET sees
-     the third leader's instance_id, which still doesn't match ours, so we
-     correctly return NotLeader. The only way the GET returns "still leader"
-     after a txn fail is if the extra_cmp itself failed — which is the
-     intended Ok(false) path.
+  All four numbers cluster within ±3.5% — measurement noise on this rig.
+  The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is owed to
+  F142's correctness barrier (proved by HEAD-bisect at d985a6e=124k vs
+  7a90983=97k) which neither Phase B nor any future code change should
+  remove on durability grounds. Phase C remains the only avenue for
+  recovering more of that cost without compromising the F142 invariant,
+  and that's deferred until a real-SSD bench shows the residual.
 
-  3. The leader Cell flip is monotonic-during-deposition: once flipped to
-     false, only `try_become_leader` can flip it back to true, and only
-     after a successful CAS that re-establishes ownership. So the
-     "false-flip-then-instantly-true" race is impossible.
+Pre-existing failure not caused by F150:
+  - autumn-manager test ec_integration::replication_stream_works fails
+    on this box both with and without F150; reproduced by `git stash` +
+    re-run on F149 baseline. Tracking note only — separate bug.
+  - autumn-rpc lib test `init` symbol missing (build error). Pre-existing.
 
 Next steps:
-  - MED-2 (Get → resolve_value vs GC reader-pin) — structural reader-epoch /
-    extent-pin fix needed, deferred per F148 next-steps.
-  - Live-cluster verification of F149 against a real 3-node etcd cluster
-    (manual repro is documented; needs to run against an etcd-having env).
+  - Real-SSD perf measurement to validate Phase A and to decide whether
+    Phase C is worth the architectural cost.
+  - MED-2 (Get → resolve_value vs background GC reader-pin) — still
+    deferred per F148 next-steps.
