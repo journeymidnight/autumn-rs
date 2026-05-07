@@ -1,125 +1,94 @@
 Date: 2026-05-07
 TaskStatus: completed
-Task scope: F150 — Reduce F142's WAL-fsync-barrier cost on the flush hot path.
-            Two phases shipped (A- and B); Phase A and Phase C deferred.
-            See feature_list.md F150 entry for the full design and rationale.
+Task scope: F151 — Python bindings: asyncio-native refactor.
+            Replace the blocking surface in `python/src/lib.rs` with
+            awaitable methods that bridge the existing compio worker
+            thread to the running asyncio loop via
+            `loop.call_soon_threadsafe(fut.set_result|set_exception, …)`.
 
-Phases:
+Why:
+  The pre-F151 surface ran a compio runtime on a worker thread but
+  the Python-facing methods (`put`, `get`, `delete`, `range`,
+  `batch_delete`, `close`) were blocking — each one allocated a sync
+  `mpsc::channel`, sent the op, and `recv()`-blocked the calling Python
+  thread until the worker completed. Under asyncio that pattern stalls
+  the event loop for the duration of every RPC, so the binding could
+  not be used inside an async server. The user asked for an asyncio-
+  native API: compio still drives the IO, asyncio still drives the
+  application, the bridge between them is `call_soon_threadsafe` on
+  the asyncio.Future the binding hands back.
 
-  Phase A- (extent-node WAL deletion). The extent-node WAL was originally
-    introduced (F035) as a small-write durability optimisation: must_sync=true
-    payloads ≤ 2 MiB took a "WAL path" — write the record to a sequential
-    rotating log file with its own fsync, write the data to the extent file
-    via page cache only (no fsync). On rotational disks this was a clear win:
-    sequential WAL fsync beat random extent fsync. On modern SSD/NVMe
-    deployments the gap collapses (no seek penalty + SLC cache + wear
-    levelling), and the WAL adds a parallel codepath that the F150 Phase B
-    barrier would have to bypass with a new flag.
-    Deletion: `crates/stream/src/wal.rs` (963 lines) + `replay_wal_files`
-    + `Wal::open` + `--wal-dir` CLI flag + `ExtentNodeConfig::with_wal_dir`
-    + `ExtentNode.wal` field + `start_node_with_wal` test helper +
-    `tests/wal_recovery.rs` integration test (170 lines). After deletion
-    `handle_append`'s must_sync=true path collapses to the Direct path
-    (`file.write_at` + `file.sync_data()`), which is what Phase B then
-    leans on.
+Architecture:
+  - One detached OS thread runs the compio runtime + the
+    `ClusterClient`. Unchanged from before.
+  - Channel between Python and worker is now
+    `futures::channel::mpsc::unbounded` (was `std::sync::mpsc`). The
+    worker `await`s the next op via `StreamExt::next` instead of
+    busy-polling with `try_recv` + 1 ms sleep — strictly better
+    backpressure + zero idle wakes.
+  - Each Op variant carries a `PyHandle { loop: Py<PyAny>, fut:
+    Py<PyAny> }`. Python-side every method (a) acquires the running
+    asyncio loop via `asyncio.get_running_loop()`, (b) creates a
+    fresh `loop.create_future()`, (c) sends the op, (d) returns the
+    future. The compio worker, on op completion, re-acquires the
+    GIL and calls `loop.call_soon_threadsafe(fut.set_result | …
+    set_exception, value)` — `call_soon_threadsafe` is the only
+    asyncio-blessed cross-thread wake primitive.
+  - `Client.connect(addr)` is itself an async classmethod. It
+    spawns the worker thread; the worker performs
+    `ClusterClient::connect(...).await`, then re-acquires the GIL
+    to construct the Python `Client` object (which owns the `tx`
+    Sender) on the worker side and resolves the future with it.
+    Failure path: `set_exception(RuntimeError("connect failed: …"))`
+    and the worker exits.
+  - `close()` sends `Op::Close { handle }`; the worker resolves
+    the handle, breaks out of the event loop, and the runtime
+    drops. The thread is detached (no JoinHandle held) — `Drop`
+    on the Python `Client` just drops the Sender, the worker
+    observes channel disconnect and tears down. No Python-side
+    lifetime hazards because the worker thread holds the GIL only
+    for the brief notify call.
 
-  Phase A (sync_all → sync_data). Replaced every `file.sync_all().await`
-    call site in `crates/stream/src/extent_node.rs` with `sync_data().await`.
-    On Linux ext4, fdatasync skips one inode-metadata journal commit
-    relative to fsync; the file size still gets sync'd (so EOF reads remain
-    consistent). Per-fsync cost drops ~30-50% on ext4 SSDs; on the local
-    /tmp tmpfs perf-check rig the difference is unmeasurable (RAM-backed,
-    fsync is essentially free either way).
-
-  Phase B (rotation-trigger must_sync barrier). PS-side
-    `start_write_batch` (`crates/partition-server/src/background.rs`)
-    now estimates `active.mem_bytes() + Σ record_sizes` and forces
-    `batch_must_sync = true` when this batch will push past
-    `FLUSH_MEM_BYTES`. Post-Phase-A- this means the rotation-triggering
-    batch's append takes the Direct path → `file.sync_data()` on the
-    log_stream tail extent, which by Linux semantics fsyncs ALL dirty
-    pages of the file including any prior must_sync=false bytes. The imm
-    that gets created by the next `maybe_rotate` therefore has all its
-    VP-referenced WAL bytes durable before flush_one_imm even fires.
-    Deletions:
-      - `flush_one_imm`'s `part_sc.sync_stream_tail(log_stream_id)` call
-      - `StreamClient::sync_stream_tail` public API (~80 lines)
-      - `ExtentNode::handle_sync_extent` server handler (~60 lines)
-      - `MSG_SYNC_EXTENT = 13` dispatch entry
-      - `SyncExtentReq` / `SyncExtentResp` extent_rpc types (~55 lines)
-    Net diff: ~200 LOC fewer + 1 fewer RPC type + 1 fewer round-trip per
-    flush. Same fsync cost (the actual fsync syscall happens regardless),
-    but folded into the rotation-trigger append's existing 3-replica
-    fanout instead of a separate barrier RPC.
-
-  Phase C (background async fsync loop) — DEFERRED.
-    Design: per-partition `wal_sync_loop` fsyncs log_stream tail every
-    ~50ms, maintains `wal_synced_high_water`. start_write_batch's
-    rotation-trigger barrier becomes a wait-not-block (typically
-    sub-ms because the background loop has already caught up).
-    Deferred because:
-      (a) On the local tmpfs perf-check rig the measurable fsync cost
-          is already zero — Phase C's win against zero is also zero.
-      (b) Phase C is a larger architectural change (new background
-          task, new state tracking, interleaving with active appends)
-          that should be justified by a measurement on real SSD
-          hardware showing residual fsync cost after Phase B.
-    Re-evaluate when production-grade benches show non-trivial Phase B
-    flush latency.
-
-Files modified (Phase A- + A + B):
-  - crates/stream/src/wal.rs (deleted, 963 LOC)
-  - crates/stream/src/lib.rs (mod wal; removed)
-  - crates/stream/src/extent_node.rs (WAL field, init, replay_wal,
-    WAL-path branches in handle_append + build_append_future,
-    handle_sync_extent, dispatch entry, all sync_all → sync_data;
-    ~190 LOC net delete)
-  - crates/stream/src/extent_rpc.rs (SyncExtentReq/Resp, MSG_SYNC_EXTENT)
-  - crates/stream/src/client.rs (sync_stream_tail public API + imports)
-  - crates/stream/CLAUDE.md (WAL section, config note, must_sync cost note)
-  - crates/stream/tests/test_helpers.rs (start_node_with_wal removal)
-  - crates/stream/tests/wal_recovery.rs (deleted, 170 LOC)
-  - crates/server/src/bin/extent_node.rs (--wal-dir CLI flag, with_wal_dir
-    calls in single-shard + multi-shard paths)
-  - crates/partition-server/src/lib.rs (FLUSH_MEM_BYTES exported pub(crate),
-    flush_one_imm sync_stream_tail call removed + comment block)
-  - crates/partition-server/src/background.rs (start_write_batch
-    rotation-trigger detection + batch_must_sync upgrade)
+Files modified:
+  - python/Cargo.toml                       (+1 dep: futures = "0.3")
+  - python/src/lib.rs                       (full rewrite, ~290 LOC)
+  - README.md                               (new "Python bindings (asyncio)" section)
+  - feature_list.md                         (F151 entry)
+  - claude-progress.txt                     (this file)
 
 Verification:
+  - `cargo check` inside `python/`: clean (no warnings, no errors).
+  - `maturin develop --release` in a virtualenv: builds wheel for
+    CPython 3.12 against the local crates.
+  - Async smoke test (/tmp/autumn_async_test.py) against a fresh
+    `cluster.sh reset 1` cluster: ALL OK
+      * `await Client.connect(addr)` returns connected client.
+      * `put / get / delete` round-trip; missing-key get returns None.
+      * `range(prefix, start, limit)` returns key-only entries
+        (matches partition-server's intentional contract — values
+        are an empty Vec; callers that need values fan-in with `get`).
+      * `asyncio.gather(*[client.put(...) for _ in range(50)])` —
+        50 concurrent in-flight puts on the single worker thread,
+        all complete; range scan confirms 50 keys landed.
+      * `batch_delete(prefix)` returns count + clears the range.
+      * `await client.close()` resolves cleanly; `Drop` is idempotent.
 
-  cargo build --workspace --exclude autumn-fuse: clean (only pre-existing
-    warnings).
-  cargo test -p autumn-stream --lib: 30/30 pass (was 52 — drop accounts
-    for the 22 wal.rs internal unit tests deleted with the file).
-  cargo test -p autumn-manager --lib: 30/30 pass.
-  cargo test -p autumn-partition-server --lib: 106 pass / 2 pre-existing
-    f099i parallel-test races (same baseline as F148/F149, verified by
-    running each individually with --test-threads=1: passes).
-
-  Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs):
-    F148 (HEAD~2):                   90,659 ops/s
-    F149 (HEAD~1, leader-fence):     96,826 ops/s
-    F150 Phase A- + A:               92,836 ops/s
-    F150 Phase A- + A + B (now):     91,505 ops/s
-    Read-side and latency: indistinguishable from F149/F148.
-
-  All four numbers cluster within ±3.5% — measurement noise on this rig.
-  The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is owed to
-  F142's correctness barrier (proved by HEAD-bisect at d985a6e=124k vs
-  7a90983=97k) which neither Phase B nor any future code change should
-  remove on durability grounds. Phase C remains the only avenue for
-  recovering more of that cost without compromising the F142 invariant,
-  and that's deferred until a real-SSD bench shows the residual.
-
-Pre-existing failure not caused by F150:
-  - autumn-manager test ec_integration::replication_stream_works fails
-    on this box both with and without F150; reproduced by `git stash` +
-    re-run on F149 baseline. Tracking note only — separate bug.
-  - autumn-rpc lib test `init` symbol missing (build error). Pre-existing.
+Out of scope (not started):
+  - `head` / `put_with_ttl` / `stream_put` / `split` / `compact` /
+    `gc` / `flush` are still unbound on the Python side (same as
+    pre-F151). Easy follow-up because the PyHandle infrastructure
+    is in place — each method is now ~10 LOC of new code.
+  - No Python-side type stubs (.pyi) generated. Acceptable for
+    internal use; revisit when packaging for PyPI.
+  - No Python-side tests in-tree; the smoke test lives in /tmp
+    because the project doesn't currently host a Python test suite.
+    If the binding becomes load-bearing this should move under
+    `python/tests/` with a maturin-based CI step.
 
 Next steps:
-  - Real-SSD perf measurement to validate Phase A and to decide whether
-    Phase C is worth the architectural cost.
+  - Bind the remaining ClusterClient methods listed above when a
+    user surfaces a need.
+  - Real-SSD perf measurement to validate F150 Phase A + decide on
+    Phase C (carried over from prior session).
   - MED-2 (Get → resolve_value vs background GC reader-pin) — still
     deferred per F148 next-steps.

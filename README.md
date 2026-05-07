@@ -935,6 +935,43 @@ $NODE --port 9104 \
 
 ---
 
+## Python bindings (asyncio)
+
+The `python/` crate exposes an asyncio-native client. All RPCs run on a
+dedicated compio worker thread; each Python method returns an
+`asyncio.Future` that the worker resolves via `loop.call_soon_threadsafe`.
+
+Build into a virtualenv:
+
+```bash
+python3 -m venv /tmp/autumn-py-venv
+/tmp/autumn-py-venv/bin/pip install maturin
+cd python && VIRTUAL_ENV=/tmp/autumn-py-venv /tmp/autumn-py-venv/bin/maturin develop --release
+```
+
+Use:
+
+```python
+import asyncio, autumn
+
+async def main():
+    client = await autumn.Client.connect("127.0.0.1:9001")
+    await client.put(b"k", b"v")
+    print(await client.get(b"k"))                        # b"v"
+    rows = await client.range(b"k", b"", 100)            # keys only; values empty
+    await asyncio.gather(*[client.put(f"x/{i}".encode(), b"v") for i in range(50)])
+    n = await client.batch_delete(b"x/")
+    await client.close()
+
+asyncio.run(main())
+```
+
+API: `Client.connect(addr)`, `put(k, v)`, `get(k)`, `delete(k)`,
+`range(prefix, start=b"", limit=100)`, `batch_delete(prefix)`, `close()`.
+All methods are awaitable. `range` returns a list of `(key, value)`
+tuples — the partition server fills only the key slot, so call `get` for
+values you actually need.
+
 ## Tests
 
 ```bash

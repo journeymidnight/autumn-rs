@@ -570,6 +570,22 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F151 · Python bindings: asyncio-native (replaces blocking surface)
+- **Target:** Refactor `python/` so every public method is `await`-able from Python's asyncio. The pre-F151 surface ran the compio runtime on a worker thread but the Python-facing API was synchronous (blocking the calling thread on a per-call mpsc roundtrip). Under asyncio that pattern stalls the event loop for the duration of every RPC, which is unacceptable for a server-side embedding.
+- **Architecture:** One detached OS thread hosts the compio runtime + `ClusterClient` (unchanged). Channel between Python and worker is `futures::channel::mpsc::unbounded` so the worker can `await` the next op cleanly instead of busy-polling with `try_recv` + 1 ms sleep. Each op carries a `PyHandle { loop: Py<PyAny>, fut: Py<PyAny> }`. On the Python side every method (a) acquires the running asyncio loop via `asyncio.get_running_loop()`, (b) creates `loop.create_future()`, (c) sends the op + handle, (d) returns the future. On op completion the worker re-acquires the GIL and schedules `loop.call_soon_threadsafe(fut.set_result | fut.set_exception, value)` — `call_soon_threadsafe` is the asyncio-blessed cross-thread wake primitive, so the awaiting coroutine resumes on the asyncio thread without locking. `Client.connect(addr)` is itself an async classmethod: the spawned worker performs `ClusterClient::connect` inside the runtime, then constructs the Python `Client` object (which owns the `tx` Sender) on the worker thread under the GIL and resolves the future with it. `close()` awaits an Op::Close ack from the worker; Drop drops the Sender, the worker observes channel disconnect and tears down the runtime.
+- **Files:** `python/Cargo.toml` (added `futures = "0.3"`), `python/src/lib.rs` (full rewrite, ~290 LOC; PyHandle + Op + event_loop + Client async methods), `README.md` (new “Python bindings (asyncio)” section with build + usage example), `feature_list.md` (this entry), `claude-progress.txt`.
+- **Verification:**
+  - `cargo check` inside `python/` clean (no warnings, no errors).
+  - `maturin develop --release` produces wheel for CPython 3.12.
+  - Async smoke test against a fresh `cluster.sh reset 1` cluster:
+    - `await Client.connect(...)` — connects + returns Client object.
+    - `put / get / delete` round-trips ok.
+    - `range` returns key-only entries (matches partition-server contract); `get` per key returns values.
+    - `batch_delete(prefix)` returns count and clears the range.
+    - `asyncio.gather(*[client.put(...) for _ in range(50)])` — 50 concurrent in-flight puts complete via the single worker thread; range scan confirms all 50 keys landed.
+    - `await client.close()` returns cleanly; subsequent calls raise `RuntimeError("client is closed")`.
+- **passes:** true
+
 ---
 
 ## Architectural lessons from the perf series (kept for context, the rest of F098/F099 lives in the Completed table)
