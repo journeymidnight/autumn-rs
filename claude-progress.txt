@@ -1,106 +1,102 @@
 Date: 2026-05-08
 TaskStatus: completed
-Task scope: F159 — save_meta durability + apply_extent_meta_durable ordering fix.
-            Closes 2 verified data-corruption surfaces from the atomic-ops
-            audit (atomic file/cross-file ordering windows).
-
-Audit context (this iteration):
-  Two parallel Explore agents — read-path corruption + atomic file/cross-file
-  ordering. Read-path audit verdict: codebase mostly clean post-F155-F158.
-  Only 1 HIGH hypothesis (cross-replica byte divergence in
-  read_replicated_with_failover, requires two correlated bit-rot events,
-  deferred). Atomic-ops audit verdict: 2 verified ordering bugs in extent_node.rs
-  + 1 missing fsync in save_meta. F159 ships fixes for both.
+Task scope: F160 — F119-C tightening on handle_copy_extent (close eversion=0
+            silent-skip loophole) + clear Audit 2 #2 (vp_refs concurrent
+            deletion race in handle_stream_punch_holes / handle_truncate)
+            after re-verification.
 
 Why:
-  Bug 1 — save_meta not fsync'd (extent_node.rs:1332).
-    Pre-F159 used `compio::fs::write(path, buf)` which writes via the page
-    cache without fsync. The 44-byte V1 .meta could remain page-cached for
-    unbounded time; a host crash before OS background flush would lose the
-    write. On restart, parse_meta returns whatever state .meta had at the
-    previous successful flush — silently rolling back metadata even though
-    F157's CRC trailer is intact (CRC validates against OLD durable bytes,
-    can't detect "stale but valid").
+  F119-C closed the `eversion=0 silent-skip` loophole in `handle_read_bytes`
+  and `build_read_future` by dropping the `req.eversion > 0 &&` clause
+  from the eversion comparison. The same loophole still existed in
+  `handle_copy_extent`'s Ok(None) branch (line 3074) and Err(_) branch
+  (line 3086), both used by `run_recovery_task` and `handle_re_avali`.
 
-  Bug 2 — apply_extent_meta_durable writes .meta BEFORE fsync'ing .dat
-    (extent_node.rs:1820-1830).
-    Pre-F159 order: (a) update in-memory atomics, (b) save_meta writes .meta,
-    (c) sync_data on .dat. Crash in b→c window: OS may have flushed .meta
-    (44 bytes, well under one sector) while .dat's must_sync=false bytes
-    were still in page cache and lost. On restart parse_meta returned NEW
-    sealed_length while .dat file size was SHORTER — reads past durable
-    extent.len returned EOF or zero-padded bytes, masquerading as
-    successful seal. F143's sync_data was load-bearing but the wrong order
-    made it ineffective.
+  Production callers fetch ExtentInfo from the manager before dispatch
+  so eversion is normally fresh. But defense-in-depth matters: removing
+  the `> 0 &&` clause closes a future-bug class where uninitialised
+  eversion would bypass the EC-shape mismatch detection and copy shard
+  bytes as if they were full payload (the F119-D corruption shape).
 
 How:
-  Fix 1 (save_meta): replace `compio::fs::write` with
-    OpenOptions::new().create.truncate.write.open + write_all_at + sync_data.
-    The .meta is always durable on return.
+  Drop `req.eversion > 0 &&` from both Ok(None) and Err(_) branches of
+  handle_copy_extent. The check now reads simply `if req.eversion < ev`,
+  matching the F119-C invariant.
 
-  Fix 2 (apply_extent_meta_durable): reorder — fsync .dat FIRST (data
-    durable up to new sealed_length), THEN save_meta (which now also
-    fsyncs .meta). Even if a crash strikes between, the worst observable
-    state is "old .meta + new .dat" which restart treats as still-unsealed;
-    manager re-applies seal on next contact. No silent corruption.
+Audit 2 #2 cleared:
+  Re-verified the snapshot-and-mutate sequence in
+  crates/manager/src/rpc_handlers.rs:1100-1203 (handle_stream_punch_holes).
+  The whole block runs inside a synchronous closure under one
+  borrow_mut. `needed_addrs` (line 1162-1172) and the in-memory
+  `s.extents.remove` (line 1190) happen in the SAME synchronous scope
+  without any `.await`.
 
-Cost:
-  Each save_meta call now does one extra fsync (the .meta). save_meta runs
-  on owner-revision changes, eversion bumps, seal applies, recovery — all
-  rare events. Negligible perf cost.
+  After the closure returns, borrow_mut drops; the etcd-mirror await
+  follows. During that await, a concurrent handle_sync_partition_vp_refs
+  cannot increment vp_table_refs on an extent that's already been
+  removed from s.extents (since vp_table_refs is a field on
+  MgrExtentInfo stored in the map; if the extent is gone, the increment
+  silently no-ops, not a corruption).
+
+  The agent's claimed race in Audit 2 #2 is not reachable today. NOT a
+  bug. Documented as cleared in feature_list.md.
 
 Files modified:
   - crates/stream/src/extent_node.rs:
-      * save_meta: open + write_all_at + sync_data (was compio::fs::write,
-        no fsync)
-      * apply_extent_meta_durable: reorder — sync .dat before save_meta
-  - feature_list.md: F159 entry
+      * handle_copy_extent: drop `> 0 &&` from 2 eversion-check branches
+      * mod f160_copy_extent_eversion_tests: 1 new unit test
+  - feature_list.md: F160 entry + Audit 2 #2 cleared note
   - claude-progress.txt: this file
 
 Verification:
   - cargo build --workspace --exclude autumn-fuse: clean.
-  - cargo test -p autumn-stream --lib: 38/38 pass.
+  - cargo test -p autumn-stream --lib: 39/39 pass (was 38; +1 new F160
+    test that constructs an extent with eversion=7 and asserts a
+    copy_extent request with eversion=0 returns FailedPrecondition).
   - cargo test -p autumn-manager --lib: 30/30 pass.
   - cargo test -p autumn-partition-server --lib -- --test-threads=1:
     118/118 pass.
-  - End-to-end: cluster.sh reset 1 → 3 puts → cluster.sh restart 1 →
-    3 gets return correct values. Validates the new save_meta path +
-    reordered apply_extent_meta_durable on the seal/recovery code path
-    that runs at PS startup.
-
-Cleared by audit (NOT bugs, kept for reference):
-  - EC stale eversion failover exit (F119-C handles)
-  - SST block CRC verified at read time (cleared)
-  - VP-after-GC bounds (ec_slice_decoded returns Err not panic)
-  - MergeIterator deterministic tie-break (lower iterator index wins)
-  - vp snapshot atomicity at flush_one_imm (single borrow captures both)
-  - vp_head intentional staleness in checkpoint (CLAUDE.md note 5)
-  - F147-B race coverage on apply_extent_meta + handle_append
 
 Out of scope (deferred to future features):
-  - Cross-replica byte-divergence detection (read-path Audit #1, HIGH but
-    narrow window) — would require either end-to-end value CRC at API
-    boundary or cross-replica byte comparison at every read; structural.
-  - vp_refs sync timing window between compaction publish and manager sync
-    — brief, asymptotic, GC catches up next tick.
-  - F154 candidate (manager-side ecConversionInFlight etcd persistence) —
-    perf hygiene only after F153 closed corruption.
-  - EC reconstruction integrity (Audit 1 #5) — would need shard-level CRC.
-  - sealed_length cross-source consistency (manager vs sidecar vs cache) —
-    periodic reconciliation, structural.
+  - F154 candidate (manager-side ecConversionInFlight etcd persistence)
+    — perf hygiene only after F153 closed corruption.
+  - Cross-replica byte-divergence detection — would require either
+    end-to-end value CRC at API boundary or cross-replica byte
+    comparison at every read; structural.
+  - EC reconstruction integrity — would need shard-level CRC.
+  - sealed_length cross-source consistency — periodic reconciliation.
   - F157-MED-2 reader-pin protocol — longest deferred structural item.
+    Re-evaluation: MED-2's failure mode is "spurious NotFound" on
+    in-flight Get vs concurrent GC delete (POSIX preserves bytes on
+    open fds; physical delete only on refs+vp_table_refs both 0;
+    extent-node's get_extent returns NotFound after extents.remove —
+    clean error). Severity is availability (occasional read failures
+    during normal GC) more than correctness. Reader-pin would reduce
+    user-visible errors but isn't closing a silent-corruption surface.
 
-Pre-existing (NOT caused by F159):
+Pre-existing (NOT caused by F160):
   - autumn-rpc lib test `init` symbol missing — pre-existing build error.
-  - autumn-manager test ec_integration::replication_stream_works fails on
-    this box both with and without F159.
+  - autumn-manager test ec_integration::replication_stream_works fails
+    on this box both with and without F160.
+
+Session-level summary (F151-F160 across this loop session):
+  F151: Python bindings asyncio-native
+  F152: 3 etcd-first manager handlers + truncate sync_data
+  F153: per-extent EC conversion lock (post-failover double-dispatch)
+  F154: RETRACTED (was: flush_one_imm_local F148-A invariant violation
+        — re-inspection showed agent over-claim, not a bug)
+  F155: rkyv checked decode (replaces from_bytes_unchecked)
+  F156: min-replica commit_length majority quorum
+  F157: extent .meta CRC32C + decode_last_table_locations skip-on-corruption
+  F158: WAL record per-record CRC32C (V1 envelope)
+  F159: save_meta durability + apply_extent_meta_durable ordering fix
+  F160: handle_copy_extent F119-C tightening + Audit 2 #2 cleared
+
+  Net: 9 verified bugs closed; 5 audit findings cleared; 1 agent
+  over-claim retracted.
 
 Next steps:
-  - The on-disk silent-corruption surfaces are now closed: extent .meta
-    CRC + durability (F157 + F159), TableLocations skip-on-corruption
-    (F157), WAL record CRC (F158), apply_extent_meta_durable order fix
-    (F159), SST block + MetaBlock CRC (pre-existing), VP offset (covered
-    by SST block CRC). The remaining audit candidates require structural
-    change or hit narrow windows already mitigated by other layers.
-  - Next high-value targets: F157-MED-2 reader-pin (structural), or
-    operationally-driven items based on production telemetry.
+  - Remaining audit candidates require structural change (MED-2 reader
+    pin, cross-replica detection, EC shard CRC, periodic reconciliation)
+    or are perf hygiene (F154 EC CAS). Priority should be
+    operationally-driven from production telemetry.

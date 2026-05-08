@@ -3071,7 +3071,20 @@ impl ExtentNode {
             }
             Ok(None) => {
                 let ev = extent.eversion.load(Ordering::SeqCst);
-                if req.eversion > 0 && req.eversion < ev {
+                // F160: drop the `req.eversion > 0` clause to match
+                // F119-C's invariant. Pre-F160 the check skipped on
+                // `req.eversion == 0`, which the F119-C closure for
+                // `handle_read_bytes` had already identified as a
+                // silent-skip loophole — `entry.eversion` defaults to 1
+                // on alloc, so any `req.eversion == 0` is by construction
+                // stale (or never-cached). `handle_copy_extent` is used
+                // by `run_recovery_task` + `handle_re_avali`; both fetch
+                // ExtentInfo from the manager before dispatching so eversion
+                // is normally fresh, but a defense-in-depth check here
+                // closes a future-bug class where uninitialised eversion
+                // bypasses the EC-shape mismatch detection and copies
+                // shard bytes as if they were full payload.
+                if req.eversion < ev {
                     return Err((
                         StatusCode::FailedPrecondition,
                         format!(
@@ -3083,7 +3096,8 @@ impl ExtentNode {
             }
             Err(_) => {
                 let ev = extent.eversion.load(Ordering::SeqCst);
-                if req.eversion > 0 && req.eversion < ev {
+                // F160: same tightening as the Ok(None) branch above.
+                if req.eversion < ev {
                     return Err((
                         StatusCode::FailedPrecondition,
                         format!(
@@ -3987,6 +4001,73 @@ mod f157_meta_crc_tests {
         let mut buf = [0u8; ExtentNode::META_SIZE_V1];
         buf[0..8].copy_from_slice(b"NOT_META");
         assert!(ExtentNode::parse_meta(&buf, 1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod f160_copy_extent_eversion_tests {
+    use super::*;
+
+    /// F160: handle_copy_extent (the Ok(None) branch — no manager configured)
+    /// must reject `req.eversion = 0` when local eversion has advanced past 0.
+    /// Pre-F160 the check skipped on req.eversion == 0 due to the legacy
+    /// `req.eversion > 0 &&` clause that F119-C had removed in
+    /// handle_read_bytes / build_read_future but missed here.
+    ///
+    /// Production callers (run_recovery_task, handle_re_avali) fetch
+    /// ExtentInfo from the manager before dispatching, so eversion is
+    /// normally fresh. This test exercises the defense-in-depth check that
+    /// catches a future-bug class where uninitialised eversion bypasses
+    /// the EC-shape mismatch detection.
+    #[compio::test]
+    async fn copy_extent_rejects_zero_eversion_on_advanced_extent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
+        let node = ExtentNode::new(config).await.expect("ExtentNode::new");
+
+        // Allocate extent 9001 then seal it (so handle_copy_extent's
+        // F148-B unsealed-refusal doesn't fire first — we want to reach
+        // the F160 eversion check).
+        let alloc_payload = rkyv_encode(&AllocExtentReq { extent_id: 9001 });
+        node.handle_alloc_extent(alloc_payload).await.expect("alloc");
+        // Append some bytes so the extent has content.
+        let payload = vec![0xa5u8; 64];
+        let write_req = AppendReq {
+            extent_id: 9001,
+            eversion: 1,
+            commit: 0,
+            revision: 0,
+            must_sync: false,
+            payload: Bytes::from(payload),
+        };
+        node.handle_append(write_req.encode()).await.expect("append");
+        // Manually seal in-memory (no manager configured in this test).
+        {
+            let entry = node.extents.get(&9001).expect("exists");
+            entry.sealed_length.store(64, Ordering::SeqCst);
+            entry.avali.store(1, Ordering::SeqCst);
+            entry.eversion.store(7, Ordering::SeqCst); // bumped to 7
+        }
+
+        // Copy with eversion=0 (the previously-silently-accepted value).
+        let copy_req = CopyExtentReq {
+            extent_id: 9001,
+            offset: 0,
+            size: 0,
+            eversion: 0,
+        };
+        let r = node.handle_copy_extent(copy_req.encode()).await;
+        assert!(
+            r.is_err(),
+            "F160: copy_extent with eversion=0 must Err when local eversion=7"
+        );
+        let (code, msg) = r.unwrap_err();
+        assert_eq!(code, StatusCode::FailedPrecondition);
+        assert!(
+            msg.contains("eversion too low"),
+            "expected eversion-too-low error, got: {}",
+            msg
+        );
     }
 }
 
