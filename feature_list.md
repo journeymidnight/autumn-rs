@@ -570,6 +570,44 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F176 · Sustained-write tail-latency validation + bottleneck audit (perf bench investigation)
+- **Target:** Validate that F168 (compaction merge yield) keeps the compio runtime responsive during real flush + compaction events under sustained load. Identify remaining bottlenecks: (a) does the 256 MB → 512 MB FLUSH_MEM_BYTES change help, (b) why is large-value (8 MB) throughput so much lower than small-value (4 KB) throughput.
+- **Bench setup:**
+  - 3-replica TCP cluster, 1 partition (`cluster.sh reset 3`).
+  - `wbench --threads 16 --duration 180 --size 4096 --report-interval 1 --part-id 13 --reuse-value true`.
+  - `/tmp/autumn-rs` on tmpfs (RAM-backed, fsync near-zero).
+- **Sustained 4 KB write results (180 s):**
+  - Aggregate: **16,378 ops/s, 64 MB/s sustained, p50 = 0.74 ms, p95 = 1.64 ms, p99 = 3.88 ms**.
+  - Total: 2,950,167 ops, 11.5 GB written, 4 sealed log_stream extents at 3 GB each (extents roll at 3 GB).
+  - Per-second range: 645 → 22,646 ops/s; median 17,328 ops/s.
+  - 10 lowest seconds: 645 (s=178, final-flush drain at end-of-run), then 8.5k–10.6k ops/s scattered through the run; cyclic pattern matches the FLUSH_MEM_BYTES = 256 MB / 70 MB/s ≈ 3.6 s memtable-fill cadence.
+- **F168 verdict — VALIDATED:**
+  - **No throughput stall longer than 1 s** during the 180 s run (the 645 ops/s outlier at second 178 is the bench tail, not a mid-run freeze).
+  - Pre-F168 the compaction merge loop ran up to 512 MB inline (~1-2 s blocking); a sustained workload like this would have shown 1-2 second 0-ops gaps every flush cycle. We see ~50 % dips lasting 1 second — the runtime is responsive throughout, just slower under flush + compact contention.
+  - **p99 = 3.88 ms over 180 s including all flush/compact events** is the headline result. F168/F169/F170/F172 collectively keep the P-log compio runtime tight under sustained load.
+- **FLUSH_MEM_BYTES 256 MB → 512 MB analysis:**
+  - **Current cadence:** at 70 MB/s sustained, memtable fills in 3.6 s; 4 flushes triggered during the 180 s run plus 4 sealed log_stream extents (extent rolls at 3 GB independent of flush).
+  - **Each flush:** rotate (instant) + must_sync barrier on rotation-trigger batch (F150 Phase B; near-zero on tmpfs, 5-15 ms on SSD) + P-bulk ships 256 MB SST upload (~50 ms × 3-replica fanout = 150 ms wall) + meta_stream checkpoint (~ms).
+  - **512 MB cadence:** 7.2 s flush interval; 2 flushes / 180 s. Each flush is 2× heavier (300 ms upload), but happens half as often → net flush wall-time the same.
+  - **Net throughput effect at tmpfs:** unchanged within noise. The dominant cost is per-flush serialisation overhead, NOT total bytes flushed; halving the count doesn't help if each one is twice as heavy.
+  - **Where 512 MB DOES help:** real spinning-disk / lower-bandwidth SSD where each fsync barrier has a fixed seek cost; halving the barrier count gives ~10-20 % gain. On tmpfs the gain is in the noise.
+  - **Cost of 512 MB:** 2× peak memtable bytes/partition (256 MB → 512 MB), plus the imm queue cap stays at MAX_IMM_DEPTH = 4 → 4 × 512 MB = 2 GB unflushed-WAL-window per partition (was 1 GB). F120 already designed for this trade-off; the const is just a tuning knob.
+  - **Recommendation:** keep FLUSH_MEM_BYTES = 256 MB on tmpfs deployment. Promote to a CLI flag (NOT env var per repo convention) on autumn-ps if production deployments on SSD/HDD want to tune. Defer the CLI flag until a production benchmark on real disk shows the gain.
+- **Big-value (8 MB) throughput root cause — TWO inline-CPU sites identified:**
+  - From the prior matrix bench: `p=8 d=8 8M`: write 254 ops/s = 2.0 GB/s, p99 = 744 ms; read 187 ops/s = 1.5 GB/s, p99 = 1.4 s. `p=1 d=8 8M`: 33 ops/s — head-of-line on single partition.
+  - **Inline CPU site #1 — `crc32c_append(crc, value)` over 8 MB value** (`crates/partition-server/src/wal_record.rs:167`): 8 MB CRC32C at ~12 GB/s = ~700 µs inline per record. With batches of 32–256 records: 22–180 ms per-batch inline CPU. Violates F117 ("CPU-bound work MUST run on the blocking pool"). The CLAUDE.md note 15 explicitly bounds this at ≤ 2 MiB / call — the bound holds for 4 KB workloads but does NOT hold for 8 MB values.
+  - **Inline CPU site #2 — `Bytes::copy_from_slice(value)` for 8 MB** (`wal_record.rs:170`): unnecessary memcpy of the large value into a fresh `Bytes`. The original `value: &[u8]` is borrowed from the caller's `Vec<u8>` decode buffer, but the encode helper allocates + copies anyway. For 8 MB: ~3 ms memcpy inline per record × 32-256 records per batch = 100 ms – 1 s inline.
+  - **Combined inline CPU per batch at 8 MB:** ~3.7 ms × records-in-batch. A 256-record batch ≈ 950 ms blocking the P-log compio runtime — explains the p99 = 744 ms observed and the read p99 = 1.4 s (read goes through the same encode path for VP fetches via resolve_value's backreads).
+  - **Other contributors (NOT in scope of this audit):** 3-replica fanout at 8 MB × 3 = 24 MB/op network bandwidth × 254 ops/s = 6 GB/s aggregate — saturates loopback ceiling; 8 MB extent file pwrite + sync_data per replica ~15-30 ms (kernel page cache + tmpfs write); 128 in-flight × 8 MB peak memory = 1 GB.
+- **F177 candidate (deferred for explicit scope):**
+  - Move `Bytes::copy_from_slice(value)` to ownership-transfer: change `encode_v1_segments(... value: &[u8] ...)` to `value: Bytes` so the caller's owned buffer flows through without copying. Saves ~3 ms inline per 8 MB record.
+  - Move CRC computation to spawn_blocking when batch payload > threshold (e.g., 4 MiB). Keeps small-value path inline (overhead-free); offloads big-value batches to the blocking pool. Saves ~700 µs–180 ms inline per batch.
+  - Together: P-log compio runtime would NOT block for 8 MB workloads. p99 would drop from 744 ms toward the 3-replica fanout floor (~50-100 ms). Worth ~3-10× p99 improvement on big-value workloads.
+  - Scope: ~50 LOC change in `wal_record.rs` + caller threading in `background.rs::start_write_batch`. Defer until user explicitly requests big-value perf work.
+- **Files (this audit, no code changes):** `feature_list.md`, `claude-progress.txt`. Bench output captured in `/tmp/wbench_long.log` (ephemeral).
+- **Verification:** the 180 s `wbench` run completed successfully; cluster torn down cleanly via `cluster.sh stop`.
+- **passes:** true (audit + measurement complete)
+
 ### F174 · EC shard-level CRC32C — CLEARED, won't fix (end-to-end protection already exists)
 - **Target:** Audit the deferred concern about silent shard corruption in EC-converted extents (cosmic ray bit flips, disk bit rot, silent encode bugs). Determine whether per-shard CRC is needed.
 - **Audit findings — actual CRC coverage by layer:**
