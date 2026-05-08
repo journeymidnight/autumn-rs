@@ -570,6 +570,43 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F177 · WAL encode (CRC32C + memcpy) → spawn_blocking on big batches; zero-copy value segment
+- **Target:** Close the two F176-identified inline CPU sites in `wal_record::encode_v1_segments` so the P-log compio runtime never blocks for hundreds of ms during big-value Put bursts. Same principle as F168/F169/F170 (thread-per-core: never run payload-sized CPU on the runtime).
+- **Two fixes:**
+  1. **Zero-copy value segment** (`wal_record.rs:170`): change `encode_v1_segments(value: &[u8])` → `encode_v1_segments(value: Bytes)`. The caller's owned `Bytes` (from PutReq decode → WriteOp::Put) flows into the returned value segment with **zero memcpy**. Pre-F177 `Bytes::copy_from_slice(value)` was an unconditional ~3 ms / 8 MiB allocation+memcpy on the P-log runtime — pure waste because the original `Bytes` was already owned.
+  2. **Conditional spawn_blocking offload** (`background.rs::start_write_batch`): split Phase 1 into 1a (validate + assign seq under `borrow_mut`) and 1b (CRC32C + segment build, after `borrow_mut` release). When total batch payload `>= PHASE1_OFFLOAD_THRESHOLD = 4 MiB`, the entire encode loop runs in `compio::runtime::spawn_blocking`. Below the threshold, encode runs inline (spawn_blocking's ~10-20 µs join overhead would dominate sub-4 MiB batches; a 4 KiB / 256-record batch ≈ 1 MiB total stays inline at ~80 µs total CRC).
+- **Why 4 MiB threshold:**
+  - CRC32C hardware throughput ~12 GB/s → 4 MiB CRC ≈ 350 µs, 17× the spawn_blocking join overhead (~20 µs). Crossover.
+  - Below 4 MiB: small-value workload (typical 4 KiB Put × 256 records = 1 MiB / batch). Inline encode is correct.
+  - Above 4 MiB: big-value workload (8 MiB × 32+ records, or many small records that aggregate). Offload protects the runtime.
+- **Function-signature break and migration:**
+  - `encode_v1_segments` signature changed; one production call site (`background.rs::start_write_batch`) and one cold-path call site (`background.rs::process_gc_chunk`, GC re-write) updated. The GC site uses `Bytes::copy_from_slice(value)` because `value` is a `&[u8]` slice into the GC chunk read buffer — copy unavoidable, but GC is bounded by `gc_batch_bytes() = 4 MiB` per batch and yields cooperatively (F168 pattern).
+  - `encode_v1` (single-buffer convenience used by tests) keeps `&[u8]` signature; internally does `Bytes::copy_from_slice` then calls the new `encode_v1_segments`. No test changes.
+- **`start_write_batch` becomes async:** the function now `.await`s only on the big-batch path (spawn_blocking join). Both call sites (`merged_partition_loop`'s ready-to-launch branch and the shutdown drain) already run inside async contexts — added `.await`.
+- **Observable behaviour preserved:** Phase 3 (memtable insert + responder dispatch) is unchanged; ValidatedEntry's `value: Bytes` is cloned (Arc::clone, ~free) into the encode pipeline so the original stays for memtable insert (small values inline). LogStream record format on the wire/disk is byte-identical to F158 V1.
+- **Files:**
+  - `crates/partition-server/src/wal_record.rs`: `encode_v1_segments` signature + body; `encode_v1` keeps backward-compat shim.
+  - `crates/partition-server/src/background.rs`: `start_write_batch` async + Phase 1 split + spawn_blocking branch; `process_gc_chunk` adds `Bytes::copy_from_slice` for the &[u8]-source case + comment.
+  - `crates/partition-server/src/lib.rs`: 2 caller sites add `.await`.
+- **Verification:**
+  - `cargo build -p autumn-partition-server`: clean (only pre-existing warnings; `encode_v1` now flagged unused — test-only convenience kept for future use).
+  - `cargo build --release --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 122/122 pass.
+  - `cargo test -p autumn-stream --lib`: 40/40 pass.
+  - `cargo test -p autumn-manager --lib`: 30/30 pass.
+- **Smoke perf (`partitions=1 threads=16 depth=8 size=8M duration=10s`, /tmp tmpfs):**
+  - F176 baseline (pre-F177): 33 ops/s, p99 = 4.32 s (write); 37 ops/s, p99 = 3.77 s (read).
+  - F177: 34.71 ops/s, p99 = 3.97 s (write); 34.19 ops/s, p99 = 3.99 s (read).
+  - Throughput change: ~4 %. p99 change: ~8 %. **F177's microbench delta is small** — at p=1 / 16 threads × 8 in-flight × 8 MiB the dominant bottleneck is 3-replica TCP fanout (24 MiB/op network) and per-replica fsync, NOT CPU. The P-log compio runtime has spare capacity even pre-F177 (F099-D's merged loop is single-task; the 950 ms inline CPU spike I theorized for full 256-record batches doesn't fully materialise because batches stay smaller — 32-64 records — under 8 MiB-value back-pressure).
+- **Where F177's value DOES land (architectural, not microbench):**
+  - **Co-tenancy:** when a partition mixes small-value foreground writes with occasional big-value writes (typical real workload), big-value batches no longer freeze the runtime for hundreds of ms. Heartbeat / ps-conn / other partition tasks stay responsive throughout. Microbench doesn't capture this.
+  - **Worst-case latency tail:** under a burst of big-value writes filling the merged_loop's 256-record cap, post-F177 the spawn_blocking offload keeps p99 bounded by 3-replica fanout (~50-100 ms architectural floor) instead of inline encode CPU + 3-replica fanout. Pre-F177's pessimistic worst-case (all 256 × 8 MiB inline) was a 950 ms-class hazard the microbench rarely hit but production bursts might.
+  - **Memory:** zero-copy value segment saves a ~24 MiB / 256-record × 8-MiB-value transient allocation per batch (Bytes::copy_from_slice). Negligible at low concurrency, real at high.
+- **Out of scope (deferred):**
+  - Per-record CRC threshold (spawn_blocking PER record, not per batch): adds spawn overhead without proportional benefit; batch-level offload is the right granularity.
+  - Eliminating the GC re-write `Bytes::copy_from_slice`: would require restructuring GC's chunk read into Bytes-owned slicing. Cold path; not worth the structural cost.
+- **passes:** true
+
 ### F176 · Sustained-write tail-latency validation + bottleneck audit (perf bench investigation)
 - **Target:** Validate that F168 (compaction merge yield) keeps the compio runtime responsive during real flush + compaction events under sustained load. Identify remaining bottlenecks: (a) does the 256 MB → 512 MB FLUSH_MEM_BYTES change help, (b) why is large-value (8 MB) throughput so much lower than small-value (4 KB) throughput.
 - **Bench setup:**

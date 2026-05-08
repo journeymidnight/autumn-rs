@@ -2587,7 +2587,13 @@ async fn merged_partition_loop(
             && (n_inflight == 0 || pending.len() >= batch_target);
         if ready_to_launch {
             let batch = std::mem::take(&mut pending);
-            match start_write_batch(&part, batch) {
+            // F177: start_write_batch is now async — small batches stay
+            // inline in the future (no spawn_blocking), big batches
+            // (>= PHASE1_OFFLOAD_THRESHOLD) await spawn_blocking. The
+            // .await yields to the runtime only on the big-batch path,
+            // letting other tasks (ps-conn, flush_loop, etc.) progress
+            // while the encoder runs on the blocking pool.
+            match start_write_batch(&part, batch).await {
                 Ok(Some(mut flight)) => {
                     let data = flight.data;
                     inflight.push(Box::pin(async move {
@@ -2775,7 +2781,7 @@ async fn merged_partition_loop(
     }
     if !pending.is_empty() {
         let batch = std::mem::take(&mut pending);
-        if let Ok(Some(mut flight)) = start_write_batch(&part, batch) {
+        if let Ok(Some(mut flight)) = start_write_batch(&part, batch).await {
             let r = (&mut flight.phase2_fut).await;
             let _ = finish_write_batch(&part, flight.data, r).await;
         }

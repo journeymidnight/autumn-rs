@@ -142,11 +142,18 @@ pub(crate) fn decode_one(bytes: &[u8]) -> DecodeOne<'_> {
 
 /// Encode one WAL record as a V1 envelope. Returns
 /// `(header_bytes, value_bytes, crc_bytes)` — three segments suitable for
-/// vectored I/O without copying `value`. The caller appends them in order.
+/// vectored I/O without copying `value`.
+///
+/// F177: takes `value: Bytes` by value so the caller's owned buffer
+/// flows into the returned value segment **without a memcpy**. The
+/// original `Bytes::copy_from_slice(value)` was a wasted ~3 ms inline
+/// memcpy on 8 MiB values (caller already owned a `Bytes` from the
+/// PutReq decode path). Borrow `&value` for the CRC compute; move
+/// the `Bytes` into the returned segment after.
 pub(crate) fn encode_v1_segments(
     op: u8,
     key: &[u8],
-    value: &[u8],
+    value: Bytes,
     expires_at: u64,
 ) -> (Bytes, Bytes, Bytes) {
     let payload_len = PAYLOAD_HEADER + key.len() + value.len();
@@ -164,19 +171,20 @@ pub(crate) fn encode_v1_segments(
     //   payload_bytes = header[5..] || value
     let mut crc = crc32c::crc32c(&header[1..5]);
     crc = crc32c::crc32c_append(crc, &header[5..]);
-    crc = crc32c::crc32c_append(crc, value);
+    crc = crc32c::crc32c_append(crc, &value);
 
     let crc_bytes = crc.to_le_bytes().to_vec();
-    (Bytes::from(header), Bytes::copy_from_slice(value), Bytes::from(crc_bytes))
+    (Bytes::from(header), value, Bytes::from(crc_bytes))
 }
 
 /// Encode one WAL record as a single contiguous V1 envelope buffer. Used by
 /// callers that don't need vectored I/O (mostly tests + GC-rewrite path).
 pub(crate) fn encode_v1(op: u8, key: &[u8], value: &[u8], expires_at: u64) -> Vec<u8> {
-    let (h, _v, c) = encode_v1_segments(op, key, value, expires_at);
-    let mut out = Vec::with_capacity(h.len() + value.len() + c.len());
+    let value_bytes = Bytes::copy_from_slice(value);
+    let (h, v, c) = encode_v1_segments(op, key, value_bytes, expires_at);
+    let mut out = Vec::with_capacity(h.len() + v.len() + c.len());
     out.extend_from_slice(&h);
-    out.extend_from_slice(value);
+    out.extend_from_slice(&v);
     out.extend_from_slice(&c);
     out
 }

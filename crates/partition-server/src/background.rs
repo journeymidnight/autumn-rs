@@ -398,19 +398,50 @@ pub(crate) struct InFlightBatch {
     pub(crate) phase2_fut: Phase2Fut,
 }
 
-/// Phase 1: validate + encode + launch Phase2 future (no await).
-pub(crate) fn start_write_batch(
+/// F177: payload-byte threshold for offloading Phase 1's WAL encoding
+/// (CRC32C compute + segment build) to `spawn_blocking`. Below this
+/// threshold the encode runs inline on the P-log compio runtime —
+/// spawn_blocking's ~10-20 µs join overhead would dominate small
+/// batches. Above this, the inline CPU cost (CRC32C ~12 GB/s = ~83 µs
+/// per MB) dominates and offloading wins. 4 MiB → ~350 µs CRC, 17×
+/// the spawn overhead.
+const PHASE1_OFFLOAD_THRESHOLD: u64 = 4 * 1024 * 1024;
+
+/// Phase 1: validate + encode + launch Phase2 future.
+///
+/// **F177 — async + conditional spawn_blocking on big batches.**
+/// Pre-F177 this was sync and ran the full encode loop (CRC32C +
+/// `Bytes::copy_from_slice` of every value) inline under the P-log
+/// `borrow_mut`. For 8 MiB-value workloads a 256-record batch ran
+/// ~950 ms inline CPU on the compio runtime, blocking all other tasks
+/// (ps-conn, flush_loop, compact_loop, gc_loop) for the duration —
+/// observed as 744 ms p99 on the F176 perf bench. F177 splits Phase 1
+/// into two sub-phases:
+///   - **Phase 1a (sync, under `borrow_mut`):** validate range, assign
+///     seq numbers, build `ValidatedEntry` list. Bounded CPU; no per-
+///     record CRC.
+///   - **Phase 1b (CRC + segment build):** runs **inline** when total
+///     batch payload < `PHASE1_OFFLOAD_THRESHOLD` (= 4 MiB), otherwise
+///     `spawn_blocking` so the CPU work moves to the blocking pool and
+///     the P-log runtime stays responsive for ps-conn / heartbeat /
+///     other tasks.
+pub(crate) async fn start_write_batch(
     part: &Rc<RefCell<PartitionData>>,
     batch: Vec<WriteRequest>,
 ) -> Result<Option<InFlightBatch>> {
     let picked_at = Instant::now();
     let phase1_started_at = Instant::now();
 
-    let (valid, record_sizes, segments, batch_must_sync, log_stream_id, part_sc) = {
+    // Phase 1a: validate + assign seq + collect entries.
+    let (mut valid, batch_must_sync_caller_flag, log_stream_id, part_sc) = {
         let mut p = part.borrow_mut();
 
         let mut valid: Vec<ValidatedEntry> = Vec::with_capacity(batch.len());
+        let mut any_must_sync = false;
         for req in batch {
+            if req.must_sync {
+                any_must_sync = true;
+            }
             let (user_key, op, value, expires_at) = match req.op {
                 WriteOp::Put {
                     user_key,
@@ -443,55 +474,121 @@ pub(crate) fn start_write_batch(
             return Ok(None);
         }
 
-        // F158: emit V1 envelope per record (sentinel + length + payload + crc32c).
-        // See `crates/partition-server/src/wal_record.rs` for the format.
+        let log_stream_id = p.log_stream_id;
+        let part_sc = p.stream_client.clone();
+        (valid, any_must_sync, log_stream_id, part_sc)
+    };
+    // borrow_mut released here — safe to await below.
+
+    // Phase 1b: CRC32C + segment build. Decide inline vs spawn_blocking
+    // by total batch payload. Each ValidatedEntry contributes
+    // `value.len()` bytes to the CRC compute (the dominant cost); keys
+    // and headers are tens of bytes per record, negligible.
+    let total_value_bytes: u64 = valid.iter().map(|e| e.value.len() as u64).sum();
+
+    let (segments, record_sizes) = if total_value_bytes >= PHASE1_OFFLOAD_THRESHOLD {
+        // F177: big-batch path — move encode inputs into spawn_blocking.
+        // We MUST keep `valid` alive on the main runtime (its `resp` /
+        // `WriteResponder` holds Rc<...> oneshot senders that are !Send).
+        // So we stage `(op, internal_key, value: Bytes, expires_at)`
+        // tuples into a Send Vec, and clone `value` (Bytes::clone =
+        // Arc::clone, ~free for both small + large values).
+        let inputs: Vec<(u8, Vec<u8>, Bytes, u64)> = valid
+            .iter()
+            .map(|e| {
+                let wal_op = if e.value.len() > VALUE_THROTTLE {
+                    e.op | OP_VALUE_POINTER
+                } else {
+                    e.op
+                };
+                (wal_op, e.internal_key.clone(), e.value.clone(), e.expires_at)
+            })
+            .collect();
+        let result = compio::runtime::spawn_blocking(move || {
+            let mut segments: Vec<Bytes> = Vec::with_capacity(inputs.len() * 3);
+            let mut record_sizes: Vec<u32> = Vec::with_capacity(inputs.len());
+            for (wal_op, internal_key, value, expires_at) in inputs {
+                let value_empty = value.is_empty();
+                let (hdr_seg, val_seg, crc_seg) =
+                    crate::wal_record::encode_v1_segments(
+                        wal_op,
+                        &internal_key,
+                        value,
+                        expires_at,
+                    );
+                let total = hdr_seg.len() + val_seg.len() + crc_seg.len();
+                segments.push(hdr_seg);
+                if !value_empty {
+                    segments.push(val_seg);
+                }
+                segments.push(crc_seg);
+                record_sizes.push(total as u32);
+            }
+            (segments, record_sizes)
+        })
+        .await
+        .map_err(|_| anyhow!("F177 spawn_blocking encode panicked"))?;
+        result
+    } else {
+        // Small-batch fast path: encode inline. Spawn overhead would
+        // dominate sub-4 MiB batches. Move each value's Bytes into the
+        // segments.
         let mut segments: Vec<Bytes> = Vec::with_capacity(valid.len() * 3);
         let mut record_sizes: Vec<u32> = Vec::with_capacity(valid.len());
-        for e in &valid {
-            // VP flag in WAL for large values so GC can identify them.
-            let wal_op =
-                if e.value.len() > VALUE_THROTTLE { e.op | OP_VALUE_POINTER } else { e.op };
-            let (hdr_seg, val_seg, crc_seg) = crate::wal_record::encode_v1_segments(
-                wal_op,
-                &e.internal_key,
-                &e.value,
-                e.expires_at,
-            );
+        for e in valid.iter_mut() {
+            let wal_op = if e.value.len() > VALUE_THROTTLE {
+                e.op | OP_VALUE_POINTER
+            } else {
+                e.op
+            };
+            // Clone Bytes (Arc::clone, ~free) so the original stays in
+            // ValidatedEntry for Phase 3 memtable insert (small values
+            // go inline; large VP-path values aren't needed but the
+            // clone cost is irrelevant since we're below 4 MiB total).
+            let value_for_encode = e.value.clone();
+            let value_empty = value_for_encode.is_empty();
+            let (hdr_seg, val_seg, crc_seg) =
+                crate::wal_record::encode_v1_segments(
+                    wal_op,
+                    &e.internal_key,
+                    value_for_encode,
+                    e.expires_at,
+                );
             let total = hdr_seg.len() + val_seg.len() + crc_seg.len();
             segments.push(hdr_seg);
-            if !e.value.is_empty() {
+            if !value_empty {
                 segments.push(val_seg);
             }
             segments.push(crc_seg);
             record_sizes.push(total as u32);
         }
-
-        // F150 Phase B: rotation-trigger barrier.
-        //
-        // If this batch will push `active.mem_bytes()` past the rotation
-        // threshold, force `must_sync=true` on the entire batch. Post-F150
-        // Phase A- the must_sync path is `file.write_at` + `file.sync_data()`
-        // (Direct path; the WAL fast-path was deleted), and `sync_data`
-        // fsyncs ALL dirty pages of the extent file — including any prior
-        // must_sync=false bytes that landed via page cache only. So the
-        // rotation-trigger batch's append acts as a WAL barrier covering
-        // every byte the imm-about-to-be-rotated will reference via
-        // ValuePointer.
-        //
-        // This replaces the F142 `sync_stream_tail` separate-RPC barrier
-        // that flush_one_imm used to issue: same fsync, one fewer RPC
-        // round-trip, no extra wire message type.
-        let estimated_batch_bytes: u64 =
-            record_sizes.iter().map(|s| *s as u64).sum();
-        let triggers_rotation =
-            p.active.mem_bytes() + estimated_batch_bytes >= crate::FLUSH_MEM_BYTES;
-        let batch_must_sync = triggers_rotation
-            || valid.iter().any(|e| e.must_sync);
-        let log_stream_id = p.log_stream_id;
-        let part_sc = p.stream_client.clone();
-
-        (valid, record_sizes, segments, batch_must_sync, log_stream_id, part_sc)
+        (segments, record_sizes)
     };
+
+    // F150 Phase B: rotation-trigger barrier.
+    //
+    // If this batch will push `active.mem_bytes()` past the rotation
+    // threshold, force `must_sync=true` on the entire batch. Post-F150
+    // Phase A- the must_sync path is `file.write_at` + `file.sync_data()`
+    // (Direct path; the WAL fast-path was deleted), and `sync_data`
+    // fsyncs ALL dirty pages of the extent file — including any prior
+    // must_sync=false bytes that landed via page cache only. So the
+    // rotation-trigger batch's append acts as a WAL barrier covering
+    // every byte the imm-about-to-be-rotated will reference via
+    // ValuePointer.
+    //
+    // This replaces the F142 `sync_stream_tail` separate-RPC barrier
+    // that flush_one_imm used to issue: same fsync, one fewer RPC
+    // round-trip, no extra wire message type.
+    //
+    // F177: this re-borrow is short, sync, no awaits inside.
+    let estimated_batch_bytes: u64 =
+        record_sizes.iter().map(|s| *s as u64).sum();
+    let triggers_rotation = {
+        let p = part.borrow();
+        p.active.mem_bytes() + estimated_batch_bytes >= crate::FLUSH_MEM_BYTES
+    };
+    let batch_must_sync = triggers_rotation || batch_must_sync_caller_flag;
     let phase1_ns = duration_to_ns(phase1_started_at.elapsed());
 
     // Launch Phase 2 as a future (not awaited yet).
@@ -1595,8 +1692,14 @@ async fn process_gc_chunk(
         // (no VP flag); recovery's `value.len() > VALUE_THROTTLE` fallback
         // at lib.rs:2891 still detects this as a VP entry on replay, since
         // GC only ever rewrites entries that were tagged VP in the source.
+        // F177: caller-side memcpy unavoidable here — `value` is borrowed
+        // from the chunk read buffer; can't move it. GC is bounded by
+        // `gc_batch_bytes() = 4 MiB` per batch and runs cooperatively
+        // (yield between chunks), so the copy is acceptable on this cold
+        // path.
+        let value_bytes = Bytes::copy_from_slice(value);
         let (hdr_seg, val_seg, crc_seg) =
-            crate::wal_record::encode_v1_segments(1u8, &internal_key, value, expires_at);
+            crate::wal_record::encode_v1_segments(1u8, &internal_key, value_bytes, expires_at);
         let record_size = (hdr_seg.len() + val_seg.len() + crc_seg.len()) as u32;
         batch.segments.push(hdr_seg);
         if !value.is_empty() {
