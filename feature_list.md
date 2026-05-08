@@ -570,6 +570,40 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F174 · EC shard-level CRC32C — CLEARED, won't fix (end-to-end protection already exists)
+- **Target:** Audit the deferred concern about silent shard corruption in EC-converted extents (cosmic ray bit flips, disk bit rot, silent encode bugs). Determine whether per-shard CRC is needed.
+- **Audit findings — actual CRC coverage by layer:**
+
+  | Layer | Replicated | EC | Mechanism |
+  |---|---|---|---|
+  | Wire frame | ✅ | ✅ | F165 V1 frame CRC32C trailer |
+  | `.meta` sidecar | ✅ | ✅ | F157 CRC32C trailer |
+  | `extent-{id}.dat` raw bytes | ❌ | ❌ | (none) |
+  | log_stream WAL record | ✅ | ✅ | F158 V1 envelope per-record CRC32C |
+  | row_stream SST block | ✅ | ✅ | Pre-existing 4-byte CRC32C trailer per block |
+  | meta_stream TableLocations | ✅ checked | ✅ checked | F155 rkyv checked decode |
+
+- **Key observation:** neither replicated NOR EC extent-data files (`extent-{id}.dat`) carry application-level CRC at the byte level. **Both rely on the upper-layer record-level CRCs** (F158 for log_stream, SST block CRC for row_stream, F155 rkyv-checked decode for meta_stream).
+- **End-to-end protection comparison:**
+  - **Replicated path:** disk bytes ARE the application records (Put records, SST blocks, TableLocations). Read-time corruption is caught by the record's own CRC32C envelope.
+  - **EC path:** disk bytes are RS-encoded mathematical shards. On read, `ec_decode` reverses the encoding to produce the original byte stream. If a shard is silently corrupted, `ec_decode` produces WRONG bytes, but those wrong bytes still flow through the same application-record CRC verification — the corruption surfaces as an F158 record CRC mismatch ("skip + log") or an SST block CRC mismatch ("refuse").
+  - **Net:** end-to-end safety is identical between replicated and EC paths. The only practical difference is diagnostic precision: replicated can pinpoint "replica N byte X is wrong"; EC only says "this 64 KB decoded with CRC mismatch."
+- **CRC32C cost analysis (the perf concern that drove the user's question):**
+  - SSE4.2 hardware `crc32` instruction throughput: ~10-15 GB/s single-core.
+  - Whole-shard inline CRC on a 1 GiB shard: ~70-100 ms inline. Unacceptable on the compio runtime (would violate F168/F170 thread-per-core principle).
+  - Per-stripe CRC (e.g., 16 MB stripe + 4-byte CRC): partial reads only verify ~1-2 stripes ≈ 1-2 ms — bounded, but still ~150 LOC of new code + a wire-format flag for backward compat (old shards have no CRC).
+- **Decision: don't add F174.**
+  - The application-record CRC layer already catches silent corruption end-to-end.
+  - Per-shard CRC at the on-disk-byte level is additional precision (better diagnostics on which shard rotted) but NOT additional correctness — wrong bytes never reach a client either way.
+  - The enterprise-SSD silent-corruption rate is ~1e-15 per byte read; spending 70-400 ms inline CPU per full-shard read OR 150 LOC of stripe-CRC plumbing for "more precise diagnostics on a 1e-15 event" is not the right trade-off in this iteration.
+  - If a real production silent-corruption incident is observed, F174 stripe-CRC becomes worth it for the diagnostic precision. Until then, the existing F158 + SST block CRC + F157 .meta CRC + F165 frame CRC stack is sufficient.
+- **What we explicitly considered and rejected:**
+  - **Whole-shard CRC trailer:** O(shard_size) inline CPU per verify — would block the compio runtime for hundreds of ms per partial read. Violates F168/F170.
+  - **Per-stripe CRC index (16 MB stripes):** correct trade-off if added, but requires (a) wire format change with `ec_shard_has_crc: bool` flag for migration, (b) per-stripe CRC computation interleaved into `file_pwrite_chunked`, (c) per-read stripe-bounds CRC verification. ~150 LOC. Deferred to a future iteration when a real failure justifies it.
+  - **End-to-end RS self-check (decode K shards, then re-decode with K-1+different-parity, compare):** doubles read CPU cost (~100-300 ms per check); not viable on the hot path.
+- **Files:** `feature_list.md`, `claude-progress.txt`. (No code changes.)
+- **passes:** true (audit-cleared, decision documented)
+
 ### F175 · `sealed_length` cross-source consistency audit — CLEARED, no fix needed
 - **Target:** Audit the deferred concern about `sealed_length` divergence between manager state and per-replica extent-node state. Determine whether existing mechanisms cover the consistency invariant or whether a new reconciliation path is required.
 - **Audit findings:**

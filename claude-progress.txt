@@ -1,10 +1,27 @@
 Date: 2026-05-08
 TaskStatus: completed
 Task scope: F173 (etcd-persist ec_conversion_inflight) + F175
-            (sealed_length consistency audit, cleared no-fix). First
-            two of the deferred items requested by the user this
-            iteration. F174 (EC shard-level CRC) and F176 (perf
-            bench) deferred to the next /loop iteration.
+            (sealed_length consistency, cleared no-fix) + F174 (EC
+            shard CRC, cleared won't-fix per user decision after
+            cost/benefit analysis). F176 (perf bench) deferred —
+            requires explicit user authorization for cluster.sh.
+
+F174 — EC shard-level CRC: CLEARED, won't fix.
+  Decision rationale (after user discussion):
+    - End-to-end protection already exists: application-record
+      CRC layer (F158 log_stream + SST block CRC + F155 rkyv
+      checked decode) catches silent corruption regardless of
+      whether the data is replicated or EC-decoded.
+    - Per-shard whole-file CRC = 70-400 ms inline CPU per verify
+      on a 1-4 GB shard. Violates F168/F170 thread-per-core.
+    - Per-stripe CRC (16 MB stripes): correct trade-off but ~150
+      LOC + wire-format migration flag. Cost vs ~1e-15 silent
+      corruption rate on enterprise SSDs not justified now.
+    - Replicated and EC paths have IDENTICAL end-to-end safety;
+      only diagnostic precision differs (replicated pinpoints
+      "replica N byte X", EC says "this 64 KB decoded mismatch").
+    - Deferred until a real production silent-corruption incident
+      justifies stripe-CRC for diagnostic precision.
 
 F175 — sealed_length cross-source consistency:
   Audit-cleared, no fix. Defenses already in place:
