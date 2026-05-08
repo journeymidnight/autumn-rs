@@ -206,11 +206,11 @@ fn usage() -> ! {
     eprintln!("  forcegc <PARTID> <EXTID>...       Force GC specific extents");
     eprintln!("  format --listen <ADDR> --advertise <ADDR> <DIR>...");
     eprintln!("                                    Format disks and register node");
-    eprintln!("  wbench [--threads 4] [--duration 10] [--size 8192] [--nosync] [--report-interval 1] [--part-id ID] [--reuse-value true|false]");
-    eprintln!("                                    Write benchmark (--nosync skips fsync)");
+    eprintln!("  wbench [--threads 4] [--duration 10] [--size 8192] [--report-interval 1] [--part-id ID] [--reuse-value true|false]");
+    eprintln!("                                    Write benchmark (always durable; F178 removed --nosync)");
     eprintln!("  rbench [--threads 40] [--duration 10] <RESULT_FILE>");
     eprintln!("                                    Read benchmark");
-    eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--nosync] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K]");
+    eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K]");
     eprintln!("                                    Quick write+read bench; warns if >threshold regression vs baseline");
     eprintln!("  info [--json] [--top N | --part PID]  Show cluster info");
     std::process::exit(1);
@@ -325,10 +325,10 @@ fn parse_args() -> Args {
             Command::SetStreamEc { stream_id, ec_data, ec_parity }
         }
         "put" => {
-            let mut nosync = false;
+            let nosync = false; // F178: always durable; --nosync ignored
             while i < raw.len() && raw[i].starts_with('-') {
                 if raw[i] == "--nosync" {
-                    nosync = true;
+                    warn_nosync_deprecated_once();
                 }
                 i += 1;
             }
@@ -341,10 +341,10 @@ fn parse_args() -> Args {
             Command::Put { key, file, nosync }
         }
         "streamput" => {
-            let mut nosync = false;
+            let nosync = false; // F178: always durable
             while i < raw.len() && raw[i].starts_with('-') {
                 if raw[i] == "--nosync" {
-                    nosync = true;
+                    warn_nosync_deprecated_once();
                 }
                 i += 1;
             }
@@ -366,10 +366,10 @@ fn parse_args() -> Args {
             }
         }
         "del" => {
-            let mut nosync = false;
+            let nosync = false; // F178: always durable
             while i < raw.len() && raw[i].starts_with('-') {
                 if raw[i] == "--nosync" {
-                    nosync = true;
+                    warn_nosync_deprecated_once();
                 }
                 i += 1;
             }
@@ -534,7 +534,7 @@ fn parse_args() -> Args {
             let mut threads: usize = 4;
             let mut duration_secs: u64 = 10;
             let mut value_size: usize = 8192;
-            let mut nosync = false;
+            let nosync = false; // F178: always durable
             let mut report_interval_secs: u64 = 1;
             let mut part_id: Option<u64> = None;
             let mut reuse_value = true;
@@ -569,7 +569,7 @@ fn parse_args() -> Args {
                             .expect("--reuse-value must be true or false");
                     }
                     "--nosync" => {
-                        nosync = true;
+                        warn_nosync_deprecated_once();
                     }
                     _ => {}
                 }
@@ -617,7 +617,7 @@ fn parse_args() -> Args {
             let mut threads = 256usize;
             let mut duration_secs = 10u64;
             let mut value_size = 4096usize;
-            let mut nosync = false;
+            let nosync = false; // F178: always durable
             let mut baseline_file = "perf_baseline.json".to_string();
             let mut threshold = 0.8f64;
             let mut update_baseline = false;
@@ -638,7 +638,7 @@ fn parse_args() -> Args {
                         value_size = raw[i].parse().expect("--size must be a number");
                     }
                     "--nosync" => {
-                        nosync = true;
+                        warn_nosync_deprecated_once();
                     }
                     "--baseline" => {
                         i += 1;
@@ -725,6 +725,23 @@ fn parse_args() -> Args {
     };
 
     Args { manager, command, transport }
+}
+
+/// F178 Phase 3: `--nosync` was removed because writes are now ALWAYS
+/// durable via the per-extent fsync coalescer (Phase 1) + flush-time
+/// quorum durability wait (Phase 2). The flag is kept as a parser
+/// no-op so existing scripts (perf_check.sh, ad-hoc invocations) don't
+/// hard-fail; callers always get the durable path. Logged once per
+/// invocation so deprecation is visible.
+fn warn_nosync_deprecated_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[autumn-client] note: --nosync was removed in F178 (LevelDB-style \
+             coalescing makes writes always durable). Flag ignored, behaviour \
+             unchanged from --sync."
+        );
+    });
 }
 
 fn parse_replication(s: &str) -> Result<u32> {

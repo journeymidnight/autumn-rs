@@ -1,111 +1,175 @@
 Date: 2026-05-08
 TaskStatus: completed
-Task scope: F173 (etcd-persist ec_conversion_inflight) + F175
-            (sealed_length consistency, cleared no-fix) + F174 (EC
-            shard CRC, cleared won't-fix per user decision after
-            cost/benefit analysis). F176 (perf bench) deferred —
-            requires explicit user authorization for cluster.sh.
+Task scope: F178 — LevelDB-style sync coalescing.
+            Phase 1: per-extent fsync coalescer in extent_node.
+            Phase 2: drop rotation-trigger barrier; add MSG_SYNCED_LENGTH
+                     + StreamClient::await_log_synced_to; flush waits at
+                     flush time, not write time.
+            Phase 3: --nosync removed from autumn-client put/streamput/
+                     wbench/perf-check + perf_check.sh; flag retained as
+                     no-op with deprecation warning. PutReq/AppendReq
+                     must_sync field kept on wire.
+            Phase 4: tests + CLAUDE.md updates + commit (this entry).
+            Real-cluster perf bench deferred (requires user authorization
+            for cluster.sh). Microbench results to be captured in a
+            follow-up explicit-scope cycle when authorized.
 
-F174 — EC shard-level CRC: CLEARED, won't fix.
-  Decision rationale (after user discussion):
-    - End-to-end protection already exists: application-record
-      CRC layer (F158 log_stream + SST block CRC + F155 rkyv
-      checked decode) catches silent corruption regardless of
-      whether the data is replicated or EC-decoded.
-    - Per-shard whole-file CRC = 70-400 ms inline CPU per verify
-      on a 1-4 GB shard. Violates F168/F170 thread-per-core.
-    - Per-stripe CRC (16 MB stripes): correct trade-off but ~150
-      LOC + wire-format migration flag. Cost vs ~1e-15 silent
-      corruption rate on enterprise SSDs not justified now.
-    - Replicated and EC paths have IDENTICAL end-to-end safety;
-      only diagnostic precision differs (replicated pinpoints
-      "replica N byte X", EC says "this 64 KB decoded mismatch").
-    - Deferred until a real production silent-corruption incident
-      justifies stripe-CRC for diagnostic precision.
-
-F175 — sealed_length cross-source consistency:
-  Audit-cleared, no fix. Defenses already in place:
-    - Manager is single authoritative source (etcd-first ordering)
-    - F147-D `already_sealed` guard prevents re-seal clobber
-    - F119-C eversion read-reject covers stale-replica reads
-    - recovery_dispatch_loop catches up laggards via re_avali
-    - F157 .meta CRC32C protects on-disk sealed_length
-
-F173 — Persist ec_conversion_inflight to etcd:
+F178 — LevelDB-style sync coalescing — what + why:
   Why:
-    F138's eversion-bump-lock semantics ("while X ∈
-    ec_conversion_inflight, no other mutator bumps eversion") only
-    hold within a single leader's lifetime — the HashSet was purely
-    in-memory. On leader failover the new leader's set was empty,
-    and recovery_dispatch_loop could fire re_avali /
-    require_recovery on extents the deposed leader was actively
-    converting. F119-D + F153 + F119-C made the race non-corrupting
-    in practice, but each fires post-hoc — F173 closes the window
-    at the source.
+    F150 Phase B's rotation-trigger barrier put a 5-15 ms (real SSD)
+    fsync syscall on the unlucky writer that happened to push past
+    FLUSH_MEM_BYTES — typically 1/s under sustained 70 MB/s. p99 spike
+    visible in F176 audit (744 ms at 8 MiB; 4 KiB workload less but
+    still landed entirely on one writer's path). The writer-side
+    barrier was conceptually "wait for log_stream tail durable before
+    flush starts"; the right place for that wait is the flush task
+    itself (background), not the writer.
 
-  What:
-    persist_ec_conversion_inflight(extent_id):
-      etcd PUT ecConversionInflight/{id} (empty value, existence
-      is the signal). Called BEFORE EXT_MSG_CONVERT_TO_EC dispatch
-      in ec_conversion_dispatch_loop. On etcd failure, skip this
-      extent and retry next tick.
+  What — Phase 1 (extent_node coalescer):
+    - Coalescer struct on each ExtentEntry:
+      * last_synced: AtomicU64
+      * pending_fsync: AtomicU64
+      * inner: RefCell<{ waiters: Vec<(u64, oneshot::Sender)>, task_running: bool }>
+    - register_sync_waiter(extent, end_offset) → oneshot::Receiver:
+      * push (end, tx) into waiters
+      * if !task_running, set true and spawn coalescer_loop
+    - coalescer_loop:
+      * compio::time::sleep(AUTUMN_EXTENT_FSYNC_COALESCE_MS, default 2)
+      * if pending > synced: file.sync_data(); store last_synced=pending;
+        wake waiters with end ≤ pending
+      * exit if waiters empty AND pending == synced (under inner.borrow_mut
+        to close the registration-vs-exit race)
+    - handle_append (non-batched) and build_append_future (batched):
+      * always advance pending_fsync after pwrite (LevelDB "always
+        durable" — the coalescer covers must_sync=false batches too)
+      * if must_sync: register_sync_waiter + await receiver
+      * On fsync error: all pending waiters fail together (sync_data
+        is whole-file)
 
-    unpersist_ec_conversion_inflight(extent_id):
-      etcd DELETE. Called AFTER apply_ec_conversion_done or RPC
-      failure. Lingering markers are harmless (one extra
-      recovery_dispatch_loop skip + idempotent reconvert).
+  What — Phase 2 (drop rotation barrier; flush-time wait):
+    - background.rs::start_write_batch: dropped the triggers_rotation
+      block. batch_must_sync = batch_must_sync_caller_flag only.
+    - extent_rpc.rs: new MSG_SYNCED_LENGTH = 13 (slot recycled from
+      retired MSG_SYNC_EXTENT). SyncedLengthReq: 8B [extent_id u64].
+      SyncedLengthResp: 9B [code u8][length u64].
+    - extent_node.rs::handle_synced_length: returns
+      max(coalescer.last_synced, sealed_length). The sealed-length
+      bump is load-bearing for old extents the imm spans into —
+      apply_extent_meta_durable fsync'd at seal time, so the wait is
+      trivially satisfied even before the coalescer has run.
+    - client.rs::await_extent_synced_to(extent_id, min_offset):
+      * fetch ExtentInfo, resolve replica addrs
+      * poll MSG_SYNCED_LENGTH on each replica every
+        AUTUMN_STREAM_SYNCED_POLL_MS (default 2 ms)
+      * return Ok when ≥ ⌊N/2⌋+1 replicas have synced ≥ min_offset
+      * timeout after AUTUMN_STREAM_SYNCED_TIMEOUT_MS (default 30 s)
+    - Public alias: await_log_synced_to(extent_id, offset) — same
+      semantics, named for the call site.
+    - lib.rs::flush_one_imm + flush_one_imm_local: call
+      part_sc.await_log_synced_to(snap_vp_eid, snap_vp_off as u64)
+      BEFORE row_stream.append. Skip when snap_vp_off == 0 (no
+      VPs in the imm yet).
+    - F148-A invariant survives: the await sits BEFORE the
+      borrow_mut block + save_table_locs_raw mpsc send.
 
-    replay_from_etcd:
-      scan `ecConversionInflight/` prefix, repopulate
-      ec_conversion_inflight: HashSet<u64> BEFORE the leader-key
-      flip completes. New leader's first recovery_dispatch_loop
-      tick observes markers and skips those extents.
+  What — Phase 3 (remove --nosync from clients + perf_check.sh):
+    - autumn_client.rs:
+      * usage() drops --nosync from wbench / perf-check help
+      * each --nosync parse site: warn_nosync_deprecated_once (stderr,
+        once per invocation), set nosync = false (always durable)
+      * Command::* enum fields kept for back-compat (zero refactor)
+    - perf_check.sh:253: dropped the --nosync line; comment retained
+      explaining F178 makes writes always durable.
+    - PutReq/AppendReq must_sync field kept on the wire; PS still
+      sends it from the (always-true) caller flag.
 
-  Why both F173 (etcd persist) and F153 (extent-node lock):
-    - F153 catches CONCURRENT dispatch race: deposed leader's
-      encode mid-flight when new leader re-fires. Per-extent
-      futures::lock::Mutex serialises; second dispatch waits,
-      F119-D makes it a no-op.
-    - F173 catches BROADER recovery race: deposed leader's EC
-      dispatch may have completed on coordinator (shards on disk,
-      eversion bumped) but apply_ec_conversion_done never ran in
-      etcd. recovery_dispatch_loop would dispatch require_recovery
-      on the eversion mismatch; F173's marker tells new leader to
-      skip until the next ec_conversion_dispatch_loop re-enters
-      and converges state.
+  What — Phase 4 (tests + docs):
+    - cargo test passes (no behaviour-change for tests):
+      * autumn-stream --lib: 40/40 pass
+      * autumn-partition-server --lib --test-threads=1: 122/122 pass
+      * autumn-manager --lib: 30/30 pass
+    - cargo build --workspace --exclude autumn-fuse: clean
+    - crates/stream/CLAUDE.md: append protocol step 6 rewritten;
+      Programming Note 4 (must_sync cost) rewritten; Commit Protocol
+      section gains F178 Phase 2 paragraph.
+    - crates/partition-server/CLAUDE.md: Programming Note 6 (group
+      commit batching) rewritten with two-layer durability story.
+    - autumn-rs/README.md: no manual-test step changes (the perf
+      bench is identical from a user perspective; --nosync just
+      prints a warning).
+    - feature_list.md F178 passes: false → true.
 
 Files modified:
-  - crates/manager/src/lib.rs:
-      * persist_ec_conversion_inflight + unpersist (new helpers)
-      * replay_from_etcd: get_prefix + decode + populate
-  - crates/manager/src/recovery.rs:
-      * ec_conversion_dispatch_loop: persist BEFORE dispatch,
-        unpersist AFTER apply
-  - feature_list.md: F173 + F175 entries
+  - crates/stream/src/extent_node.rs:
+      * +Coalescer + register_sync_waiter + coalescer_loop +
+        extent_fsync_coalesce_ms (~+170 LOC near ExtentEntry)
+      * +coalescer field on ExtentEntry; 3 construction sites
+      * build_append_future: replace inline sync_data with
+        pending_fsync.store + register_sync_waiter await
+      * handle_append (non-batched): same replacement
+      * handle_synced_length: new dispatch handler
+      * dispatch table: +MSG_SYNCED_LENGTH branch
+  - crates/stream/src/extent_rpc.rs:
+      * +MSG_SYNCED_LENGTH const (slot 13, recycled)
+      * +SyncedLengthReq / SyncedLengthResp codecs
+  - crates/stream/src/client.rs:
+      * +use SyncedLengthReq / Resp / MSG_SYNCED_LENGTH
+      * +synced_length_on_replica (private helper)
+      * +await_extent_synced_to (public)
+      * +await_log_synced_to (public alias for the flush call site)
+  - crates/partition-server/src/background.rs:
+      * start_write_batch: dropped the triggers_rotation block;
+        batch_must_sync = caller flag only
+  - crates/partition-server/src/lib.rs:
+      * flush_one_imm: await_log_synced_to(snap_vp_eid, snap_vp_off)
+        before req_tx.send(FlushReq) (P-bulk path)
+      * flush_one_imm_local: same await before row_stream.append
+        (legacy in-thread fallback path)
+  - crates/server/src/bin/autumn_client.rs:
+      * +warn_nosync_deprecated_once helper
+      * usage() text edits (drop --nosync from wbench/perf-check)
+      * 5 --nosync parse arms: replaced flag-set with deprecation
+        warning, fixed nosync to false at parse time
+  - perf_check.sh:
+      * line 253: dropped --nosync; +F178 explanatory comment
+  - crates/stream/CLAUDE.md, crates/partition-server/CLAUDE.md:
+      * doc updates for Phase 1 coalescer + Phase 2 flush barrier +
+        Phase 3 nosync removal
+  - feature_list.md: F178 passes: true; Phase 4 closure
   - claude-progress.txt: this file
 
 Verification:
-  - cargo build -p autumn-manager: clean.
-  - cargo build --release --workspace --exclude autumn-fuse: clean.
-  - cargo test -p autumn-manager --lib: 30/30 pass.
+  - cargo build --workspace --exclude autumn-fuse: clean (only
+    pre-existing warnings).
+  - autumn-stream lib tests: 40/40 pass.
+  - autumn-partition-server lib tests: 122/122 pass.
+  - autumn-manager lib tests: 30/30 pass.
+  - Manual real-cluster perf bench DEFERRED — requires explicit user
+    authorization for cluster.sh. Will be picked up in a follow-up
+    iteration with target 4K p=8 NVMe ≥ 100k ops/s (recover toward
+    pre-F142 130k).
+
+Pre-existing (NOT caused by F178):
+  - autumn-manager test ec_integration::replication_stream_works
+    fails on this box with or without F178 (also documented in F173
+    progress entry).
+
+Out of scope (deferred):
+  - Multi-extent fsync grouping at the kernel level (sync_file_range
+    or io_uring linked SQEs). Per-extent coalescer is sufficient
+    given the 3 GB extent size at 70 MB/s ≈ 40 s/extent.
+  - Quorum-2 fast-path replacing 3-replica "wait for slowest" on the
+    write path (independent optimization).
+  - wbench / perf-check switching to LevelDB multi-writer-share-batch
+    model (server-side merged_partition_loop already implements this
+    via F099-D).
 
 Pending in /loop continuation (next iteration):
-  - F174 — EC shard-level CRC32C (per-shard integrity check).
-    Real correctness gap: silent shard corruption (cosmic ray,
-    bit rot) currently produces wrong-bytes from ec_decode without
-    detection.
-  - F176 — perf_check.sh bench cycle to measure F168/F169/F170/F172
-    impact (compaction yield, EC slice zero-copy, manager dispatch
-    pre-filter, etc.).
+  - F179: real-cluster perf bench validation of F178 (requires user
+    authorization to run cluster.sh). Target: 4K p=8 NVMe ≥ 100k
+    ops/s; 8M p=8 NVMe ≥ 1.5 GB/s preserved.
 
-Out of scope (still deferred):
-  - Cross-replica byte-divergence detection (structural).
-
-Pre-existing (NOT caused by F173):
-  - autumn-manager test ec_integration::replication_stream_works
-    fails on this box both with and without F173.
-
-Session-level summary (F151-F173):
+Session-level summary (F151-F178):
   F151: Python bindings asyncio-native
   F152: 3× etcd-first manager handlers + truncate sync_data
   F153: per-extent EC conversion lock
@@ -130,3 +194,9 @@ Session-level summary (F151-F173):
   F172: manager dispatch-loop pre-filter + hoist redundant clones
   F173: ec_conversion_inflight persist to etcd
   F175: sealed_length consistency cleared no-fix
+  F174: EC shard CRC cleared, won't fix
+  F176: sustained-write tail-latency validation + bottleneck audit
+  F177: WAL encode (CRC + memcpy) → spawn_blocking on big batches;
+        zero-copy value segment
+  F178: LevelDB-style sync coalescing — coalescer + flush-time
+        durability + always durable (no --nosync). passes: true.

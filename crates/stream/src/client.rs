@@ -10,8 +10,9 @@ use autumn_rpc::manager_rpc::{self, *};
 use crate::ConnPool;
 use crate::extent_rpc::{
     AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, ReadBytesReq,
-    ReadBytesResp, StreamInfo, CODE_EVERSION_MISMATCH,
+    ReadBytesResp, StreamInfo, SyncedLengthReq, SyncedLengthResp, CODE_EVERSION_MISMATCH,
     CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK, MSG_APPEND, MSG_COMMIT_LENGTH, MSG_READ_BYTES,
+    MSG_SYNCED_LENGTH,
 };
 
 /// Sentinel error attached to `anyhow::Error` when a `MSG_READ_BYTES`
@@ -1462,6 +1463,107 @@ impl StreamClient {
     pub async fn commit_length(&self, stream_id: u64) -> Result<u32> {
         let (_stream, _extent, end) = self.check_commit(stream_id).await?;
         Ok(end)
+    }
+
+    /// F178 Phase 2: query a single replica for `MSG_SYNCED_LENGTH(extent_id)`.
+    /// Returns `Ok(Some(synced))` on a success response, `Ok(None)` if the
+    /// extent is unknown to that node (CODE_NOT_FOUND or any other non-OK
+    /// code), and `Err` only on transport / decode failure.
+    async fn synced_length_on_replica(
+        &self,
+        addr: &str,
+        extent_id: u64,
+    ) -> Result<Option<u64>> {
+        let req = SyncedLengthReq { extent_id };
+        let resp_bytes = self.pool.call(addr, MSG_SYNCED_LENGTH, req.encode()).await?;
+        let resp = SyncedLengthResp::decode(resp_bytes)
+            .map_err(|e| anyhow!("synced_length decode: {e}"))?;
+        if resp.code == CODE_OK {
+            Ok(Some(resp.length))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// F178 Phase 2: wait until the per-extent fsync coalescer on **quorum**
+    /// of `extent_id`'s replicas has flushed bytes covering `min_offset`.
+    ///
+    /// Mirrors the F156 `current_commit` quorum pattern: the result is the
+    /// minimum of the responding replicas' `last_synced` values; we treat
+    /// the wait as satisfied when at least `⌊N/2⌋ + 1` replicas have
+    /// `synced >= min_offset`. Sealed extents on the server side already
+    /// report `max(last_synced, sealed_length)`, so this trivially
+    /// succeeds against sealed sources.
+    ///
+    /// Polls every `AUTUMN_STREAM_SYNCED_POLL_MS` (default 2 ms — matches
+    /// the coalescer cadence), bounded by
+    /// `AUTUMN_STREAM_SYNCED_TIMEOUT_MS` (default 30 s). Returns
+    /// `Err` if the wait times out (expected only on a stuck disk / dead
+    /// majority).
+    ///
+    /// `min_offset == 0` is a no-op fast path; the caller can pass
+    /// `imm.max_vp_offset` and we trivially return Ok if the imm carried
+    /// no large values.
+    pub async fn await_extent_synced_to(
+        &self,
+        extent_id: u64,
+        min_offset: u64,
+    ) -> Result<()> {
+        if min_offset == 0 {
+            return Ok(());
+        }
+        let poll_ms: u64 = std::env::var("AUTUMN_STREAM_SYNCED_POLL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v: &u64| (1..=50).contains(v))
+            .unwrap_or(2);
+        let timeout_ms: u64 = std::env::var("AUTUMN_STREAM_SYNCED_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v: &u64| *v >= 100)
+            .unwrap_or(30_000);
+
+        let ex = self.fetch_extent_info(extent_id).await?;
+        let addrs = self.replica_addrs_for_extent(&ex).await?;
+        let total = addrs.len();
+        if total == 0 {
+            return Err(anyhow!(
+                "await_extent_synced_to: no replica addrs for extent {extent_id}"
+            ));
+        }
+        let quorum = total / 2 + 1;
+
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            let mut covered: usize = 0;
+            for addr in &addrs {
+                match self.synced_length_on_replica(addr, extent_id).await {
+                    Ok(Some(synced)) if synced >= min_offset => covered += 1,
+                    _ => {}
+                }
+                if covered >= quorum {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "await_extent_synced_to: timeout waiting for extent {extent_id} to sync \
+                     past offset {min_offset} (quorum {covered}/{quorum} of {total})"
+                ));
+            }
+            compio::time::sleep(Duration::from_millis(poll_ms)).await;
+        }
+    }
+
+    /// F178 Phase 2: helper for flush durability — convenience wrapper
+    /// that delegates to `await_extent_synced_to` for a single extent.
+    /// Renamed from the original plan's `await_log_synced_to(stream_id, _)`
+    /// because `(extent_id, offset)` is the unit the partition layer
+    /// already tracks: each `flush_one_imm` snapshot carries
+    /// `(vp_extent_id, vp_offset)` for the latest log_stream extent the
+    /// imm wrote to. The stream id is implicit in the extent id.
+    pub async fn await_log_synced_to(&self, extent_id: u64, offset: u64) -> Result<()> {
+        self.await_extent_synced_to(extent_id, offset).await
     }
 
     // F150 Phase B retired the public `sync_stream_tail` API. The F142 fsync

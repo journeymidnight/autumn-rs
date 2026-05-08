@@ -565,30 +565,39 @@ pub(crate) async fn start_write_batch(
         (segments, record_sizes)
     };
 
-    // F150 Phase B: rotation-trigger barrier.
+    // F178 Phase 2 retires the F150 Phase B rotation-trigger barrier.
     //
-    // If this batch will push `active.mem_bytes()` past the rotation
-    // threshold, force `must_sync=true` on the entire batch. Post-F150
-    // Phase A- the must_sync path is `file.write_at` + `file.sync_data()`
-    // (Direct path; the WAL fast-path was deleted), and `sync_data`
-    // fsyncs ALL dirty pages of the extent file — including any prior
-    // must_sync=false bytes that landed via page cache only. So the
-    // rotation-trigger batch's append acts as a WAL barrier covering
-    // every byte the imm-about-to-be-rotated will reference via
-    // ValuePointer.
+    // F150 Phase B used to promote `must_sync=true` on the rotation-
+    // triggering batch so its `file.sync_data()` covered every prior
+    // `must_sync=false` byte still in page cache before the imm rotated.
+    // That made write p99 unfairly punitive for the unlucky writer that
+    // happened to push past `FLUSH_MEM_BYTES` (a fixed-cost per-rotation
+    // fsync — typically 1/s under sustained 70 MB/s — landed entirely on
+    // ONE writer's path even though the durability work is pure
+    // background overhead).
     //
-    // This replaces the F142 `sync_stream_tail` separate-RPC barrier
-    // that flush_one_imm used to issue: same fsync, one fewer RPC
-    // round-trip, no extra wire message type.
+    // After F178:
+    //   1. Phase 1 (extent_node coalescer) runs `sync_data` every
+    //      `AUTUMN_EXTENT_FSYNC_COALESCE_MS` (default 2 ms) covering ALL
+    //      pending appends since the last sync — both must_sync=true and
+    //      must_sync=false bytes (sync_data fsyncs the whole file).
+    //   2. Phase 2 (this change) drops the rotation barrier here, AND
+    //      adds an `await_log_synced_to(vp_extent_id, vp_offset)` in
+    //      `flush_one_imm` BEFORE the SST upload. That moves the
+    //      durability wait from the WRITE path (single unlucky writer
+    //      pays the rotation barrier) to the FLUSH path (background
+    //      task, latency-invisible to clients).
     //
-    // F177: this re-borrow is short, sync, no awaits inside.
-    let estimated_batch_bytes: u64 =
-        record_sizes.iter().map(|s| *s as u64).sum();
-    let triggers_rotation = {
-        let p = part.borrow();
-        p.active.mem_bytes() + estimated_batch_bytes >= crate::FLUSH_MEM_BYTES
-    };
-    let batch_must_sync = triggers_rotation || batch_must_sync_caller_flag;
+    // Net: every Put pays exactly 1 coalesce window (1-5 ms) regardless
+    // of whether it triggers rotation. Flush adds ≈ 0 ms on the
+    // happy path (coalescer fires every 2 ms; flush builds SST in
+    // parallel) and at most one coalesce window on the worst case.
+    //
+    // The caller's explicit `must_sync` (e.g. wbench `--sync`) still
+    // promotes to `batch_must_sync=true` and waits via the per-extent
+    // coalescer's waiter list. After Phase 3 removes the wire flag, this
+    // collapses to "always sync" client-side too.
+    let batch_must_sync = batch_must_sync_caller_flag;
     let phase1_ns = duration_to_ns(phase1_started_at.elapsed());
 
     // Launch Phase 2 as a future (not awaited yet).

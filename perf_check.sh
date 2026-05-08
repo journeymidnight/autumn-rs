@@ -248,9 +248,10 @@ run_perf() {
     echo "[perf-check] mode=$mode partitions=$parts pipeline-depth=$depth size=$size_label ($size B) storage=$STORAGE_LABEL"
     echo "[perf-check] baseline=$(basename "$baseline")"
     echo "============================================================"
+    # F178: --nosync removed — writes are now always durable (LevelDB-style
+    # coalescer fires every 1-5 ms; all batches go through quorum fsync).
     ${AC_PREFIX:-} "$AC" --manager "${AUTUMN_BIND_HOST:-127.0.0.1}:9001" --transport "$mode" \
         perf-check \
-        --nosync \
         --threads "$THREADS" \
         --duration 10 \
         --size "$size" \

@@ -237,12 +237,33 @@ Append(AppendReq via autumn-rpc binary frame):
              code. Sibling note in `partition-server/CLAUDE.md` Programming
              Note 12 describes the matching publishing-order invariant for
              flush + compact metadata publishes.
-  6. Write payload (Direct path — F150 Phase A- removed the WAL fast path):
+  6. Write payload (Direct path — F150 Phase A- removed the WAL fast path,
+                    F178 Phase 1 routes durability through the coalescer):
        - file.write_at(start, payload)
-       - if must_sync: file.sync_all() — fsyncs the entire extent file's
-         dirty pages, including any prior must_sync=false bytes still in
-         page cache. This is what F150 Phase B's rotation-trigger barrier
-         relies on.
+       - F178: advance `entry.coalescer.pending_fsync` to end. ALWAYS,
+         regardless of must_sync. Pre-F178 must_sync=false meant "leave
+         dirty pages in cache, no syscall"; post-F178 false means "no
+         WAITER registered, but the coalescer task picks them up on its
+         next 1-5 ms tick anyway". Gives LevelDB-style "always durable"
+         semantics without paying syscall cost per write.
+       - F178: if must_sync, register_sync_waiter(extent, end) → await
+         oneshot. The lazily-spawned coalescer task issues ONE
+         file.sync_data() per AUTUMN_EXTENT_FSYNC_COALESCE_MS window
+         (default 2 ms) covering ALL pending bytes; every waiter whose
+         end_offset is now ≤ last_synced wakes together. fsync rate is
+         decoupled from pwrite throughput — 200-1000 fsyncs/sec is enough
+         to drain any reasonable batch volume; pwrites pipeline freely
+         between fsyncs.
+       - Coalescer task lifecycle: spawn on first register_sync_waiter,
+         exit when waiters.is_empty() AND pending == last_synced. The
+         exit decision sits under the same RefCell borrow_mut new
+         waiters take, so the registration-vs-exit race is closed.
+       - Pre-F178: `if must_sync: file.sync_all()` ran inline on the
+         compio runtime — every must_sync=true append paid one fsync;
+         under sustained 4K writes that capped at the syscall rate
+         (~1000-2000/s on tmpfs, ~200/s on real SSD). F178's coalescer
+         removes that ceiling: 1 fsync covers a coalesce window's
+         worth of appends regardless of count.
   7. Advance extent.len
   8. Return (offset=start, end=start+payload_len)
 ```
@@ -253,7 +274,9 @@ Step 5 (commit-based truncation) is the key to consistency: it effectively repla
 
 ### Commit Protocol Explained
 
-The `StreamClient` computes `commit = min(commit_length on all replicas)` before each append. Any replica that got ahead (e.g., partially acknowledged data before a crash) is truncated back to the consensus point on the next append. Per-node durability comes from `file.sync_all()` on must_sync=true appends (after F150 Phase A- there is no separate WAL file).
+The `StreamClient` computes `commit = min(commit_length on all replicas)` before each append. Any replica that got ahead (e.g., partially acknowledged data before a crash) is truncated back to the consensus point on the next append. Per-node durability comes from the F178 Phase 1 fsync coalescer — every append's bytes are guaranteed durable within `AUTUMN_EXTENT_FSYNC_COALESCE_MS` (default 2 ms) whether or not `must_sync` was set on the request. After F150 Phase A- there is no separate WAL file.
+
+**F178 Phase 2 — flush-time durability barrier (replaces F150 Phase B's rotation barrier).** Pre-F178 the partition layer's `start_write_batch` promoted `must_sync=true` on the rotation-triggering batch, putting the entire memtable's worth of fsync cost on one unlucky writer. Post-F178 every Put pays exactly one coalesce window (1-5 ms) regardless of rotation; the durability wait moves to `flush_one_imm` via `MSG_SYNCED_LENGTH`. The flush calls `await_log_synced_to(vp_extent_id, vp_offset)` BEFORE uploading the SST — quorum-min of replicas must report `last_synced >= vp_offset`. On the happy path this waits ≈ 0 because the coalescer fires every 2 ms and flush builds the SST in parallel; on the worst case it waits one coalesce window. Flush is background, so this is invisible to clients.
 
 **F156: majority quorum required.** `commit_length_for_extent` and `current_commit` (`crates/stream/src/client.rs`) require `success >= ⌊N/2⌋ + 1` replica responses before treating their min as authoritative. Pre-F156 they accepted any subset — even a single response — which could commit at a position only the lone responder held. If that responder then died before re-replicating to the unreachable peers, the data was permanently lost. With quorum: writes halt under majority failure rather than silently risking data loss; degraded operation (≥1 dead but quorum reachable) continues normally.
 
@@ -552,7 +575,26 @@ sufficient (and cheaper than DashMap).
 
 3. **Parallel 3-replica fanout (F099-B)** — `launch_append` fires the 3 per-replica `pool.send_vectored` futures concurrently via `futures::future::join_all`. Each per-replica future awaits its own RpcClient submit channel independently, so one slow/back-pressured replica doesn't serialise the others. Per-replica TCP byte order is still preserved because each RpcClient runs a single-writer `writer_task` (R4 step 4.1) — the fanout order across replicas is irrelevant because every replica is independent. The `AppendResp.offset/end` consistency check in `apply_completion` still enforces that all replicas agree on the file-level offset.
 
-4. **`must_sync` cost** — F150 Phase A- removed the extent-node WAL. `must_sync=true` always takes the Direct path: `file.write_at` + `file.sync_all()`. The extent fsync covers ALL dirty pages of the file including prior must_sync=false bytes that landed via page cache only — this is the load-bearing property F150 Phase B (rotation-trigger barrier in PS) depends on. SSTable data doesn't need `must_sync` since replication provides durability.
+4. **`must_sync` cost (post-F178)** — every append's bytes become durable
+   within `AUTUMN_EXTENT_FSYNC_COALESCE_MS` (default 2 ms) regardless of
+   the request's `must_sync` flag. The flag now controls only whether the
+   caller WAITS for durability:
+   - `must_sync=true`: register a `(end_offset, oneshot)` waiter on the
+     coalescer; await the receiver. Resolves Ok when the next coalesced
+     `sync_data` covers `end_offset`. Typical wait 1-5 ms.
+   - `must_sync=false`: advance `pending_fsync` and return immediately.
+     The coalescer still picks up these bytes on its next tick and they
+     become durable; the caller just doesn't wait.
+   Pre-F178 `must_sync=true` was `file.write_at` + inline `file.sync_data()`
+   per request; under heavy load this capped throughput at the kernel's
+   fsync rate (~200/s on real SSD, ~2000/s on tmpfs). The coalescer
+   removes that ceiling — 1 syscall per coalesce window covers ALL
+   pending appends. F150 Phase B's load-bearing property (sync_data
+   covers prior must_sync=false bytes) is preserved structurally because
+   sync_data is whole-file. F178 Phase 3 removed `--nosync` from
+   clients, so PS->extent_node always passes `must_sync=true`; the flag
+   is kept on the wire for back-compat. SSTable data doesn't need an
+   extra wait beyond append's coalescer wake.
 
 5. **StreamClient is always held as `Rc<StreamClient>`** — constructors return `Rc<Self>` (via `Rc::new_cyclic`) so per-stream workers can hold `Weak<StreamClient>` for the removal-guard. Callers clone the `Rc` to share. Public API methods take `&self`, so `sc.append(...)` works transparently.
 

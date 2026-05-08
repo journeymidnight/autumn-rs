@@ -308,6 +308,161 @@ impl ExtentNodeConfig {
 
 // ─── ExtentEntry ─────────────────────────────────────────────────────────────
 
+/// F178 Phase 1: per-extent fsync coalescer state.
+///
+/// Decouples pwrite throughput from fsync rate. Hot-path append handlers
+/// store-then-register: advance `pending_fsync` to their write end_offset,
+/// register a `(end, oneshot)` waiter via `register_sync_waiter`, await the
+/// receiver. A lazily-spawned coalescer task wakes every
+/// `AUTUMN_EXTENT_FSYNC_COALESCE_MS` (default 2 ms, range [1, 50]); if
+/// `pending > last_synced` it issues ONE `sync_data` syscall covering
+/// everything written so far, advances `last_synced`, and wakes every
+/// waiter whose `end ≤ last_synced`. Higher `end`s stay in the waiter list
+/// until a later sync covers them.
+///
+/// Why per-extent: an extent file's `sync_data` covers ALL of THAT file's
+/// dirty pages in one syscall — no benefit to grouping across extents at
+/// userspace; the kernel already does the I/O scheduling.
+///
+/// Lifecycle: the task spawns lazily on the first `register_sync_waiter`
+/// (transitions `task_running` false→true under the inner borrow_mut), and
+/// exits when `waiters.is_empty()` AND `pending == last_synced`. The exit
+/// check sits under the same `inner` borrow_mut that new waiters use, so a
+/// new waiter arriving during the check window either blocks until the
+/// task sets `task_running = false` and exits (in which case the new
+/// waiter spawns a fresh task), or sneaks in first (in which case the
+/// task sees the waiter and continues looping).
+pub(crate) struct Coalescer {
+    pub(crate) last_synced: AtomicU64,
+    pub(crate) pending_fsync: AtomicU64,
+    inner: RefCell<CoalescerInner>,
+}
+
+struct CoalescerInner {
+    waiters: Vec<(u64, futures::channel::oneshot::Sender<Result<(), String>>)>,
+    task_running: bool,
+}
+
+impl Coalescer {
+    fn new(initial_len: u64) -> Self {
+        Self {
+            last_synced: AtomicU64::new(initial_len),
+            pending_fsync: AtomicU64::new(initial_len),
+            inner: RefCell::new(CoalescerInner {
+                waiters: Vec::new(),
+                task_running: false,
+            }),
+        }
+    }
+}
+
+/// Coalescing window. Fsync rate ceiling = 1000 / ms. Default 2 ms keeps
+/// pipeline saturated on typical NVMe (sync_data ~1 ms) with a p99 floor
+/// of ~5 ms (worst-case two windows back-to-back).
+fn extent_fsync_coalesce_ms() -> u64 {
+    std::env::var("AUTUMN_EXTENT_FSYNC_COALESCE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|v| (1..=50).contains(v))
+        .unwrap_or(2)
+}
+
+/// Register a sync waiter on `extent` for bytes up to `end_offset`. Returns
+/// a `oneshot::Receiver<Result<(), String>>` that resolves Ok when the
+/// next coalesced `sync_data` has covered `end_offset`, or Err with the
+/// fsync error message if the syscall failed (in which case ALL pending
+/// waiters fail together — sync_data covers the whole file, no per-waiter
+/// ordering).
+///
+/// Side effect: if no coalescer task is currently running for this extent,
+/// spawns one before returning.
+pub(crate) fn register_sync_waiter(
+    extent: &Rc<ExtentEntry>,
+    end_offset: u64,
+) -> futures::channel::oneshot::Receiver<Result<(), String>> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let needs_spawn = {
+        let mut inner = extent.coalescer.inner.borrow_mut();
+        inner.waiters.push((end_offset, tx));
+        if !inner.task_running {
+            inner.task_running = true;
+            true
+        } else {
+            false
+        }
+    };
+    if needs_spawn {
+        let extent_clone = Rc::clone(extent);
+        compio::runtime::spawn(coalescer_loop(extent_clone)).detach();
+    }
+    rx
+}
+
+async fn coalescer_loop(extent: Rc<ExtentEntry>) {
+    use std::time::Duration;
+    let coalesce_ms = extent_fsync_coalesce_ms();
+    loop {
+        compio::time::sleep(Duration::from_millis(coalesce_ms)).await;
+        let pending = extent.coalescer.pending_fsync.load(Ordering::SeqCst);
+        let synced = extent.coalescer.last_synced.load(Ordering::SeqCst);
+        if pending > synced {
+            let file_rc = extent.file_rc();
+            let f: &CompioFile = &*file_rc;
+            match f.sync_data().await {
+                Ok(_) => {
+                    // Update last_synced FIRST so any new register_sync_waiter
+                    // observing pending == synced after our load can correctly
+                    // attribute coverage.
+                    extent
+                        .coalescer
+                        .last_synced
+                        .store(pending, Ordering::SeqCst);
+                    let waiters = {
+                        let mut inner = extent.coalescer.inner.borrow_mut();
+                        std::mem::take(&mut inner.waiters)
+                    };
+                    let mut still: Vec<(u64, futures::channel::oneshot::Sender<Result<(), String>>)> =
+                        Vec::new();
+                    for (end, tx) in waiters {
+                        if end <= pending {
+                            let _ = tx.send(Ok(()));
+                        } else {
+                            still.push((end, tx));
+                        }
+                    }
+                    if !still.is_empty() {
+                        extent.coalescer.inner.borrow_mut().waiters.extend(still);
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let waiters = {
+                        let mut inner = extent.coalescer.inner.borrow_mut();
+                        std::mem::take(&mut inner.waiters)
+                    };
+                    for (_, tx) in waiters {
+                        let _ = tx.send(Err(msg.clone()));
+                    }
+                    // Don't advance last_synced; next iteration will retry.
+                }
+            }
+        }
+        // Exit decision: under the same `inner` borrow_mut that new waiters
+        // take in `register_sync_waiter`, so the registration-vs-exit race
+        // is closed: if a new waiter snuck in just before this check, we see
+        // it and continue; if a new waiter snuck in just after we set
+        // task_running=false and returned, register_sync_waiter sees
+        // task_running=false and spawns a fresh task.
+        let mut inner = extent.coalescer.inner.borrow_mut();
+        let pending = extent.coalescer.pending_fsync.load(Ordering::SeqCst);
+        let synced = extent.coalescer.last_synced.load(Ordering::SeqCst);
+        if inner.waiters.is_empty() && pending == synced {
+            inner.task_running = false;
+            return;
+        }
+    }
+}
+
 pub(crate) struct ExtentEntry {
     /// F171: structural close of the type-level UB at the file-replacement
     /// path. Pre-F171 this was `UnsafeCell<CompioFile>` and the replace
@@ -331,6 +486,8 @@ pub(crate) struct ExtentEntry {
     pub(crate) last_revision: AtomicI64,
     /// Which disk this extent lives on. Used to resolve file paths.
     pub(crate) disk_id: u64,
+    /// F178 Phase 1: per-extent fsync coalescer state.
+    pub(crate) coalescer: Coalescer,
 }
 
 impl ExtentEntry {
@@ -1000,15 +1157,41 @@ async fn build_append_future(
                 .collect();
         }
 
+        // F178 Phase 1: register a sync waiter on the coalescer instead of
+        // calling sync_data inline. The coalescer task batches all in-flight
+        // pending fsyncs across this extent into ONE sync_data per
+        // AUTUMN_EXTENT_FSYNC_COALESCE_MS window (default 2 ms), waking
+        // every waiter whose end_offset is now durable.
+        //
+        // Always advance pending_fsync (LevelDB-style "eventually durable"
+        // even for must_sync=false batches). The coalescer's next iteration
+        // will cover these bytes; without a waiter we don't await, so the
+        // call site is non-blocking.
+        extent_for_io
+            .coalescer
+            .pending_fsync
+            .store(total_end, Ordering::SeqCst);
         if must_sync {
-            let f_ref: &CompioFile = &*file_rc;
-            if let Err(e) = f_ref.sync_data().await {
-                node.mark_disk_offline_for_extent(extent_id);
-                let msg = e.to_string();
-                return req_ids
-                    .into_iter()
-                    .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
-                    .collect();
+            let rx = register_sync_waiter(&extent_for_io, total_end);
+            match rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(msg)) => {
+                    node.mark_disk_offline_for_extent(extent_id);
+                    return req_ids
+                        .into_iter()
+                        .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
+                        .collect();
+                }
+                Err(_canceled) => {
+                    // Coalescer dropped tx without sending — should not happen
+                    // unless the runtime is shutting down. Treat as Internal.
+                    node.mark_disk_offline_for_extent(extent_id);
+                    let msg = "fsync coalescer canceled".to_string();
+                    return req_ids
+                        .into_iter()
+                        .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
+                        .collect();
+                }
             }
         }
 
@@ -1537,6 +1720,7 @@ impl ExtentNode {
                         avali: AtomicU32::new(if sealed_length > 0 { 1 } else { 0 }),
                         last_revision: AtomicI64::new(last_revision),
                         disk_id: disk.disk_id,
+                        coalescer: Coalescer::new(len),
                     }),
                 );
                 tracing::info!(
@@ -1779,6 +1963,7 @@ impl ExtentNode {
             MSG_WRITE_SHARD => self.handle_write_shard(payload).await,
             MSG_DELETE_EXTENT => self.handle_delete_extent(payload).await,
             MSG_COMMIT_EC_SHARD => self.handle_commit_ec_shard(payload).await,
+            MSG_SYNCED_LENGTH => self.handle_synced_length(payload).await,
             _ => Err((StatusCode::InvalidArgument, format!("unknown msg_type {msg_type}"))),
         }
     }
@@ -1852,6 +2037,7 @@ impl ExtentNode {
                 avali: AtomicU32::new(0),
                 last_revision: AtomicI64::new(0),
                 disk_id,
+                coalescer: Coalescer::new(len),
             }),
         );
         self.extents
@@ -2554,15 +2740,29 @@ impl ExtentNode {
             self.mark_disk_offline_for_extent(req.extent_id);
             return Err((StatusCode::Internal, e.to_string()));
         }
+        let start_offset = start as u32;
+        let end = start + data_payload.len() as u64;
+        // F178 Phase 1: route durability through the per-extent coalescer.
+        // See `register_sync_waiter` doc-comment in this file for design.
+        extent.coalescer.pending_fsync.store(end, Ordering::SeqCst);
         if req.must_sync {
-            if let Err(e) = extent.file_rc().sync_data().await {
-                self.mark_disk_offline_for_extent(req.extent_id);
-                return Err((StatusCode::Internal, e.to_string()));
+            let rx = register_sync_waiter(&extent, end);
+            match rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(msg)) => {
+                    self.mark_disk_offline_for_extent(req.extent_id);
+                    return Err((StatusCode::Internal, msg));
+                }
+                Err(_canceled) => {
+                    self.mark_disk_offline_for_extent(req.extent_id);
+                    return Err((
+                        StatusCode::Internal,
+                        "fsync coalescer canceled".to_string(),
+                    ));
+                }
             }
         }
 
-        let start_offset = start as u32;
-        let end = start + data_payload.len() as u64;
         extent.len.store(end, Ordering::SeqCst);
 
         if revision_changed {
@@ -2710,6 +2910,56 @@ impl ExtentNode {
         .encode())
     }
 
+    /// F178 Phase 2: report the per-extent fsync coalescer's
+    /// `last_synced_offset`. Used by `flush_one_imm` (via
+    /// `StreamClient::await_log_synced_to`) to ensure all log_stream bytes
+    /// referenced by a to-be-flushed memtable's ValuePointers are durable
+    /// on this replica before the SST upload.
+    ///
+    /// Notes:
+    /// - This is a node-local view; the client takes the quorum-min across
+    ///   3 replicas (mirror of F156 commit_length quorum).
+    /// - For sealed extents, all bytes up to `sealed_length` were forced
+    ///   durable by `apply_extent_meta_durable` at seal time, so we
+    ///   bound-up to `max(last_synced, sealed_length)` here. Otherwise a
+    ///   reader of a sealed extent could observe `last_synced=0` purely
+    ///   because no append-driven sync has run since this node loaded the
+    ///   extent — even though the bytes are demonstrably on disk.
+    async fn handle_synced_length(&self, payload: Bytes) -> HandlerResult {
+        let req = SyncedLengthReq::decode(payload)
+            .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
+
+        // F099-M: hot-path RPC; reject wrong-shard.
+        if !self.owns_extent(req.extent_id) {
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "extent {} belongs to shard {} not shard {} (shard_count={})",
+                    req.extent_id,
+                    req.extent_id % self.shard_count as u64,
+                    self.shard_idx,
+                    self.shard_count,
+                ),
+            ));
+        }
+
+        let entry = self.extents.get(&req.extent_id).ok_or_else(|| {
+            (
+                StatusCode::NotFound,
+                format!("extent {} not found", req.extent_id),
+            )
+        })?;
+
+        let synced = entry.coalescer.last_synced.load(Ordering::SeqCst);
+        let sealed = entry.sealed_length.load(Ordering::SeqCst);
+        let length = synced.max(sealed);
+        Ok(SyncedLengthResp {
+            code: CODE_OK,
+            length,
+        }
+        .encode())
+    }
+
     async fn handle_alloc_extent(&self, payload: Bytes) -> HandlerResult {
         let req: AllocExtentReq = rkyv_decode(&payload)
             .map_err(|e| (StatusCode::InvalidArgument, e))?;
@@ -2754,6 +3004,7 @@ impl ExtentNode {
                 avali: AtomicU32::new(0),
                 last_revision: AtomicI64::new(0),
                 disk_id,
+                coalescer: Coalescer::new(len),
             }),
         );
 

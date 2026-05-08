@@ -23,9 +23,16 @@ pub const MSG_CONVERT_TO_EC: u8 = 9;
 pub const MSG_WRITE_SHARD: u8 = 10;
 pub const MSG_DELETE_EXTENT: u8 = 11;
 pub const MSG_COMMIT_EC_SHARD: u8 = 12;
-// 13 = MSG_SYNC_EXTENT — retired in F150 Phase B; the F142 fsync barrier is
-//      now folded into the rotation-trigger `must_sync=true` batch promotion
-//      in autumn-partition-server's `start_write_batch`.
+// 13 = MSG_SYNC_EXTENT — retired in F150 Phase B (the F142 fsync barrier was
+//      folded into `start_write_batch`'s rotation-trigger `must_sync=true`
+//      batch promotion). F178 Phase 2 retires the rotation barrier in turn,
+//      replacing both with the per-extent fsync coalescer + `MSG_SYNCED_LENGTH`
+//      durability query so flush waits at flush-time, not at write-time.
+/// F178 Phase 2: query the extent-node's coalesced fsync high-water mark.
+/// Returned `length` = `Coalescer::last_synced` for `extent_id`. Used by
+/// `flush_one_imm` to await durability of all log_stream bytes referenced
+/// by the to-be-flushed memtable's ValuePointers BEFORE uploading the SST.
+pub const MSG_SYNCED_LENGTH: u8 = 13;
 // MSG_TYPE_PING = 0xFF is reserved by autumn-rpc for heartbeat
 
 // ── Append (hot path) ────────────────────────────────────────────────────────
@@ -246,7 +253,65 @@ impl CommitLengthResp {
 
 // (F150 Phase B removed SyncExtentReq/Resp + MSG_SYNC_EXTENT — the F142
 // fsync barrier is now folded into `start_write_batch`'s rotation-trigger
-// `must_sync=true` promotion in autumn-partition-server.)
+// `must_sync=true` promotion in autumn-partition-server. F178 Phase 2
+// then drops the rotation barrier altogether and adds MSG_SYNCED_LENGTH
+// (below) for flush-time durability waits via the per-extent coalescer.)
+
+// ── SyncedLength (F178 Phase 2) ──────────────────────────────────────────────
+
+/// SyncedLengthRequest: 8 bytes.
+/// `[extent_id: u64 LE]`
+pub struct SyncedLengthReq {
+    pub extent_id: u64,
+}
+
+impl SyncedLengthReq {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(8);
+        buf.put_u64_le(self.extent_id);
+        buf.freeze()
+    }
+
+    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
+        if data.len() < 8 {
+            return Err("synced_length request too short");
+        }
+        Ok(Self {
+            extent_id: data.get_u64_le(),
+        })
+    }
+}
+
+/// SyncedLengthResponse: 9 bytes.
+/// `[code: u8][length: u64 LE]`
+///
+/// `length` is `Coalescer::last_synced` — the highest byte offset known to
+/// be durable on this replica. Quorum is enforced by the client side
+/// (see `StreamClient::await_log_synced_to`); the server reports its own
+/// view only.
+pub struct SyncedLengthResp {
+    pub code: u8,
+    pub length: u64,
+}
+
+impl SyncedLengthResp {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(9);
+        buf.put_u8(self.code);
+        buf.put_u64_le(self.length);
+        buf.freeze()
+    }
+
+    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
+        if data.len() < 9 {
+            return Err("synced_length response too short");
+        }
+        Ok(Self {
+            code: data.get_u8(),
+            length: data.get_u64_le(),
+        })
+    }
+}
 
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 

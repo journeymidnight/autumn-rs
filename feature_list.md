@@ -620,7 +620,32 @@
 - **Verification plan:**
   - Per-phase: `cargo build --workspace --exclude autumn-fuse`, `cargo test -p {stream,partition-server,manager} --lib`, end-to-end smoke via cluster.sh.
   - Final: NVMe perf bench p=8 d=8 4K + 8M, both transports — primary metric is 4K write ops/s and p99.
-- **passes:** false (planning entry; flips to true on Phase 4 completion)
+- **Phase 1 implementation (extent_node coalescer):**
+  - `Coalescer` struct on every `ExtentEntry`: `last_synced: AtomicU64`, `pending_fsync: AtomicU64`, `RefCell<{ waiters: Vec<(u64, oneshot::Sender)>, task_running: bool }>`. Initial values match the loaded file length so the seal-time fsync's coverage isn't lost across restart.
+  - `register_sync_waiter(extent, end_offset)`: pushes `(end, tx)` into the inner waiter list, lazily spawns `coalescer_loop` when transitioning `task_running` false→true under the same `borrow_mut` that the loop's exit-decision takes — closes the registration-vs-exit race structurally.
+  - `coalescer_loop`: `compio::time::sleep(AUTUMN_EXTENT_FSYNC_COALESCE_MS, default 2 ms, range [1, 50])` → if `pending > synced` issue ONE `file.sync_data()` covering ALL pending bytes, advance `last_synced`, drain waiters with `end ≤ pending`. fsync error: fail every pending waiter together (sync_data is whole-file).
+  - `build_append_future` (batched) and `handle_append` (non-batched): always `pending_fsync.store(end)` after pwrite (LevelDB-style "always durable"); if `must_sync` register a waiter and await.
+  - 3 `ExtentEntry` construction sites (`load_extents`, `ensure_extent`, `handle_alloc_extent`) initialise the coalescer.
+- **Phase 2 implementation (flush-time durability + drop write-time barrier):**
+  - `extent_rpc.rs`: `MSG_SYNCED_LENGTH = 13` (slot recycled from retired `MSG_SYNC_EXTENT`); `SyncedLengthReq{extent_id: u64}` (8B) + `SyncedLengthResp{code: u8, length: u64}` (9B).
+  - `extent_node.rs::handle_synced_length`: returns `max(coalescer.last_synced, sealed_length)`. The sealed-length floor is load-bearing for old log_stream extents the imm spans into — `apply_extent_meta_durable` already fsync'd at seal time, so even before the coalescer has run on a freshly-loaded sealed extent the wait is trivially satisfied.
+  - `client.rs::await_extent_synced_to(extent_id, min_offset)`: fetches `ExtentInfo`, resolves replica addrs, polls `MSG_SYNCED_LENGTH` on each replica every `AUTUMN_STREAM_SYNCED_POLL_MS` (default 2 ms) until ≥ ⌊N/2⌋+1 replicas report `synced ≥ min_offset`. Timeout `AUTUMN_STREAM_SYNCED_TIMEOUT_MS` (default 30 s).
+  - `client.rs::await_log_synced_to(extent_id, offset)`: thin wrapper, named for the call site.
+  - `background.rs::start_write_batch`: dropped the `triggers_rotation` block. `batch_must_sync = batch_must_sync_caller_flag` only.
+  - `lib.rs::flush_one_imm` (P-bulk hand-off path) and `lib.rs::flush_one_imm_local` (legacy in-thread fallback): call `part_sc.await_log_synced_to(snap_vp_eid, snap_vp_off as u64)` BEFORE the row_stream upload (skip when `snap_vp_off == 0`). F148-A invariant survives — the await sits BEFORE the borrow_mut block + `save_table_locs_raw` mpsc send.
+- **Phase 3 implementation (--nosync removal):**
+  - `autumn_client.rs`: 5 `--nosync` parse sites (`put`, `streamput`, `del`, `wbench`, `perf-check`) replaced with `warn_nosync_deprecated_once()` (Once-guarded stderr); `nosync` always set to `false` at parse time. `usage()` drops `--nosync` from `wbench`/`perf-check` help. `Command::*` enum fields kept for back-compat (zero refactor downstream).
+  - `perf_check.sh:253`: dropped `--nosync` line; explanatory comment retained.
+  - `PutReq`/`AppendReq` `must_sync` wire field kept for back-compat. Always `true` in practice from the PS side because the client always sends `must_sync=true` post-Phase-3.
+- **Phase 4 (tests + docs):**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-stream --lib`: 40/40 pass.
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 122/122 pass.
+  - `cargo test -p autumn-manager --lib`: 30/30 pass.
+  - `crates/stream/CLAUDE.md`: append protocol step 6 rewritten; Programming Note 4 (must_sync cost) rewritten; Commit Protocol section gains Phase 2 paragraph.
+  - `crates/partition-server/CLAUDE.md`: Programming Note 6 (group commit batching) rewritten with the two-layer durability story.
+  - Real-cluster perf bench DEFERRED — requires explicit user authorization for `cluster.sh`. Target NVMe 4K p=8 ≥ 100k ops/s; 8M p=8 ≥ 1.5 GB/s preserved.
+- **passes:** true
 
 ### F177 · WAL encode (CRC32C + memcpy) → spawn_blocking on big batches; zero-copy value segment
 - **Target:** Close the two F176-identified inline CPU sites in `wal_record::encode_v1_segments` so the P-log compio runtime never blocks for hundreds of ms during big-value Put bursts. Same principle as F168/F169/F170 (thread-per-core: never run payload-sized CPU on the runtime).

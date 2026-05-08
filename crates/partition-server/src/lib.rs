@@ -3399,16 +3399,38 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
         )
     };
 
-    // F150 Phase B replaces the F142 WAL barrier here. The rotation-
-    // trigger batch in `start_write_batch` (background.rs) already promoted
-    // its `must_sync` to `true`, so the extent-node ran `file.sync_data()`
-    // on the log_stream tail covering ALL prior must_sync=false bytes
-    // before this imm was rotated. No separate `sync_stream_tail` RPC
-    // needed at flush time. Cross-reference: F150 Phase A- removed the
-    // extent-node WAL fast path so the must_sync=true append always takes
-    // the Direct path (write_at + sync_data), which is what makes the
-    // rotation-trigger barrier load-bearing.
-    let _ = log_stream_id; // kept in scope for future Phase C wiring
+    // F178 Phase 2: durability barrier moves from WRITE to FLUSH.
+    //
+    // F150 Phase B used to enforce durability via the rotation-trigger
+    // `must_sync=true` promotion in `start_write_batch` (background.rs);
+    // F178 Phase 2 dropped that promotion. The replacement: at FLUSH
+    // time we wait for quorum of log_stream replicas to have their
+    // per-extent fsync coalescer (Phase 1) advanced past the imm's
+    // VP head — which is exactly `(snap_vp_eid, snap_vp_off)`.
+    //
+    // Why this is sufficient (covers both new and pre-existing extents):
+    //   - For the LATEST log_stream extent the imm wrote to: the
+    //     coalescer fires every AUTUMN_EXTENT_FSYNC_COALESCE_MS (2 ms)
+    //     so this typically waits ≤ 5 ms.
+    //   - For OLDER log_stream extents the imm may also reference (rare
+    //     — only if rotation happened mid-imm): they are sealed by the
+    //     manager and `apply_extent_meta_durable` fsync'd them on the
+    //     0→sealed_length transition. The extent-node's
+    //     `handle_synced_length` returns `max(last_synced, sealed_length)`
+    //     so the older extent's wait is trivially satisfied.
+    //
+    // F148-A invariant survives: NO `.await` is introduced between the
+    // `borrow_mut` drop above and the `stream_client.append` mpsc send
+    // inside `save_table_locs_raw` BELOW (this `await_log_synced_to`
+    // sits BEFORE the `req_tx.send` and BEFORE
+    // `save_table_locs_raw`, neither of which is inside a `borrow_mut`
+    // block).
+    if snap_vp_off > 0 && snap_vp_eid != 0 {
+        part_sc
+            .await_log_synced_to(snap_vp_eid, snap_vp_off as u64)
+            .await?;
+    }
+    let _ = log_stream_id; // kept for future per-extent multi-VP barrier
 
     let Some(mut req_tx) = req_tx else {
         // P-bulk thread failed to spawn — fall back to in-thread flush so
@@ -3481,6 +3503,13 @@ async fn flush_one_imm_local(
     snap_vp_off: u32,
 ) -> Result<bool> {
     let part_sc = part.borrow().stream_client.clone();
+    // F178 Phase 2: same flush-time durability wait as the P-bulk path
+    // in `flush_one_imm`. See that comment for rationale.
+    if snap_vp_off > 0 && snap_vp_eid != 0 {
+        part_sc
+            .await_log_synced_to(snap_vp_eid, snap_vp_off as u64)
+            .await?;
+    }
     let imm_clone = imm_mem.clone();
     let (sst_bytes, last_seq) = compio::runtime::spawn_blocking(move || {
         build_sst_bytes(&imm_clone, snap_vp_eid, snap_vp_off)
