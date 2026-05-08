@@ -483,6 +483,171 @@ pub(crate) struct PartitionData {
     /// acquires this to ensure run_gc has no log_stream append in-flight when
     /// commit_length is read.
     pub(crate) gc_gate: std::sync::Arc<CompactionGate>,
+    /// F162 (MED-2): per-extent reader-pin map. `handle_get → resolve_value`
+    /// reads a ValuePointer from an SST, drops the partition borrow, and
+    /// awaits `read_bytes_from_extent` on log_stream. Without coordination,
+    /// `run_gc` could decrement vp_table_refs to 0 (after compaction
+    /// rewrote the SSTs that referenced the extent) and call `punch_holes`,
+    /// causing the manager to enqueue a physical delete. The in-flight
+    /// resolve_value's read RPC arrives at the extent-node which (a) may
+    /// have already received MSG_DELETE_EXTENT and respond NotFound — a
+    /// spurious user-visible read failure on data that was perfectly valid
+    /// at the moment the SST was looked up; or (b) the file fd is already
+    /// unlinked but still open from a prior reader, returning the original
+    /// bytes — correct but timing-dependent.
+    ///
+    /// F162 closes the spurious-NotFound class via a per-extent pin counter:
+    ///   value >= 0: number of active readers; readers can acquire
+    ///   value == -1: GC in progress (writer holds exclusively)
+    ///
+    /// Reader path (`resolve_value`): CAS-acquire (increment from a
+    /// non-negative value); CAS-release (`fetch_sub(1)`).
+    /// GC path (`run_gc` before `punch_holes`): try-CAS 0 → -1. On success,
+    /// proceed with the RPC; release with `store(0)`. On failure (readers
+    /// active), defer this extent's GC to the next 30-60 s tick. The reader
+    /// completes within milliseconds typically; the deferred GC catches up
+    /// on the next iteration.
+    ///
+    /// Memory footprint: HashMap grows monotonically with extents ever
+    /// referenced by VP resolution. ~32 bytes per entry; bounded by
+    /// log_stream extent count per partition (typically a few thousand
+    /// at most). Not worth GC'ing the map; deleted extents leave benign
+    /// stale entries with count=0.
+    pub(crate) extent_pins: std::cell::RefCell<std::collections::HashMap<u64, std::rc::Rc<std::sync::atomic::AtomicI64>>>,
+}
+
+impl PartitionData {
+    /// F162 (MED-2): get-or-insert the per-extent pin counter for `eid`.
+    /// Cheap — just a HashMap lookup with lazy creation.
+    pub(crate) fn pin_for(&self, eid: u64) -> std::rc::Rc<std::sync::atomic::AtomicI64> {
+        self.extent_pins
+            .borrow_mut()
+            .entry(eid)
+            .or_insert_with(|| std::rc::Rc::new(std::sync::atomic::AtomicI64::new(0)))
+            .clone()
+    }
+}
+
+/// F162 (MED-2): RAII reader pin guard. Decrements the counter on drop.
+/// Created via `acquire_reader_pin`; returns None if a writer (GC) currently
+/// holds the pin (counter == -1). Caller treats None as "extent is being
+/// reclaimed; treat as not-found".
+pub(crate) struct ReaderPin(std::rc::Rc<std::sync::atomic::AtomicI64>);
+
+impl Drop for ReaderPin {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// F162: try to acquire a reader pin on `eid`. CAS-loop increments the
+/// counter only when current value >= 0. Returns None when a GC writer
+/// holds the pin (counter == -1).
+pub(crate) fn acquire_reader_pin(
+    pin: std::rc::Rc<std::sync::atomic::AtomicI64>,
+) -> Option<ReaderPin> {
+    use std::sync::atomic::Ordering::SeqCst;
+    loop {
+        let cur = pin.load(SeqCst);
+        if cur < 0 {
+            return None;
+        }
+        if pin
+            .compare_exchange(cur, cur + 1, SeqCst, SeqCst)
+            .is_ok()
+        {
+            return Some(ReaderPin(pin));
+        }
+        // CAS lost a race with another reader/writer; re-try.
+    }
+}
+
+/// F162: try to acquire a writer (GC) pin on `eid`. Single CAS 0 → -1.
+/// Returns true on success (proceed with punch_holes); false on failure
+/// (readers active — defer this extent's GC to the next tick).
+pub(crate) fn try_acquire_writer_pin(
+    pin: &std::rc::Rc<std::sync::atomic::AtomicI64>,
+) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    pin.compare_exchange(0, -1, SeqCst, SeqCst).is_ok()
+}
+
+/// F162: release a writer pin (counter back to 0). Called after GC's
+/// `punch_holes` returns (or errors).
+pub(crate) fn release_writer_pin(pin: &std::rc::Rc<std::sync::atomic::AtomicI64>) {
+    pin.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod f162_reader_pin_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    /// F162: acquire_reader_pin succeeds when no writer is holding,
+    /// increments counter, drops decrement.
+    #[test]
+    fn reader_pin_acquire_release() {
+        let pin = std::rc::Rc::new(AtomicI64::new(0));
+        {
+            let _g = acquire_reader_pin(pin.clone()).expect("acquire");
+            assert_eq!(pin.load(Ordering::SeqCst), 1);
+            // Acquiring a second reader pin works too.
+            let _g2 = acquire_reader_pin(pin.clone()).expect("acquire 2");
+            assert_eq!(pin.load(Ordering::SeqCst), 2);
+        }
+        // Both guards dropped → back to 0.
+        assert_eq!(pin.load(Ordering::SeqCst), 0);
+    }
+
+    /// F162: acquire_reader_pin returns None when writer holds the pin.
+    #[test]
+    fn reader_pin_blocked_by_writer() {
+        let pin = std::rc::Rc::new(AtomicI64::new(0));
+        assert!(try_acquire_writer_pin(&pin), "writer should acquire");
+        assert_eq!(pin.load(Ordering::SeqCst), -1);
+
+        // Reader cannot acquire while writer holds.
+        assert!(
+            acquire_reader_pin(pin.clone()).is_none(),
+            "reader should be blocked by writer"
+        );
+
+        release_writer_pin(&pin);
+        assert_eq!(pin.load(Ordering::SeqCst), 0);
+
+        // After writer releases, reader can acquire.
+        let _g = acquire_reader_pin(pin.clone()).expect("acquire after writer release");
+        assert_eq!(pin.load(Ordering::SeqCst), 1);
+    }
+
+    /// F162: try_acquire_writer_pin fails when readers are holding.
+    #[test]
+    fn writer_pin_blocked_by_readers() {
+        let pin = std::rc::Rc::new(AtomicI64::new(0));
+        let _g = acquire_reader_pin(pin.clone()).expect("acquire reader");
+        assert_eq!(pin.load(Ordering::SeqCst), 1);
+
+        // Writer cannot acquire while reader holds.
+        assert!(
+            !try_acquire_writer_pin(&pin),
+            "writer should be blocked by reader"
+        );
+        // Reader pin still 1 (writer's failed CAS didn't perturb it).
+        assert_eq!(pin.load(Ordering::SeqCst), 1);
+        drop(_g);
+        // After reader releases, writer can acquire.
+        assert!(try_acquire_writer_pin(&pin), "writer after reader release");
+    }
+
+    /// F162: writer pin already held — second writer also blocked.
+    /// (Should not happen in production since GC serialises per-extent
+    /// via the gc_gate, but the protocol is correct either way.)
+    #[test]
+    fn writer_pin_exclusive() {
+        let pin = std::rc::Rc::new(AtomicI64::new(0));
+        assert!(try_acquire_writer_pin(&pin));
+        assert!(!try_acquire_writer_pin(&pin), "second writer must fail");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2111,6 +2276,7 @@ async fn partition_thread_main(
         imm_drained_tx,
         compact_gate: compact_gate.clone(),
         gc_gate: gc_gate.clone(),
+        extent_pins: std::cell::RefCell::new(std::collections::HashMap::new()),
     }));
 
     sync_partition_vp_refs(&part)

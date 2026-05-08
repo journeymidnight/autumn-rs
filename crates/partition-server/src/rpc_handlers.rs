@@ -152,11 +152,43 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
 
     let sc = p.stream_client.clone();
     let is_vp = (op & crate::OP_VALUE_POINTER) != 0;
+
+    // F162 (MED-2): acquire a per-extent reader pin BEFORE dropping the
+    // partition borrow, so a concurrent run_gc can't decide-and-punch the
+    // log_stream extent during our await on read_bytes_from_extent.
+    // The pin is taken only when the value is a VP (small inline values
+    // never read from log_stream). If the writer (GC) currently holds the
+    // pin, treat as not-found rather than racing the deletion.
+    let _vp_pin = if is_vp && raw_value.len() >= crate::VALUE_POINTER_SIZE {
+        let vp = crate::ValuePointer::decode(&raw_value[..crate::VALUE_POINTER_SIZE]);
+        let pin = p.pin_for(vp.extent_id);
+        match crate::acquire_reader_pin(pin) {
+            Some(g) => Some(g),
+            None => {
+                // GC has acquired the writer pin on this extent — the bytes
+                // are about to be deleted. Surface as NotFound rather than
+                // racing the punch_holes RPC.
+                READ_METRICS.with(|m| {
+                    let mut m = m.borrow_mut();
+                    m.ops += 1; m.lookup_ns += lookup_ns; m.not_found += 1;
+                    m.maybe_report();
+                });
+                return Ok(partition_rpc::rkyv_encode(&GetResp {
+                    code: CODE_NOT_FOUND,
+                    message: "extent reclaimed by GC".to_string(),
+                    value: vec![],
+                }));
+            }
+        }
+    } else {
+        None
+    };
     drop(p);
 
     let vp_t0 = Instant::now();
     let value = resolve_value(op, raw_value, &sc, req.offset, req.length).await.map_err(|e| (StatusCode::Internal, e.to_string()))?;
     let vp_resolve_ns = if is_vp { vp_t0.elapsed().as_nanos() as u64 } else { 0 };
+    // _vp_pin guard drops here, releasing the pin.
 
     let encode_t0 = Instant::now();
     let resp = partition_rpc::rkyv_encode(&GetResp { code: CODE_OK, message: String::new(), value });

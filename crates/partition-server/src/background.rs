@@ -1398,7 +1398,23 @@ pub(crate) async fn run_gc(
     )
     .await?;
 
-    part_sc.punch_holes(log_stream_id, vec![extent_id]).await?;
+    // F162 (MED-2): try-acquire writer pin on this extent BEFORE punch_holes.
+    // If a `handle_get → resolve_value` reader is currently in-flight on this
+    // extent (rare race window — they typically complete in milliseconds),
+    // defer this extent's GC to the next 30-60 s tick rather than letting
+    // the reader return spurious NotFound bytes when the manager processes
+    // the punch_holes RPC and enqueues a physical delete.
+    let pin = part.borrow().pin_for(extent_id);
+    if !crate::try_acquire_writer_pin(&pin) {
+        tracing::info!(
+            extent_id,
+            "F162: GC deferred — reader pin held; will retry on next gc tick"
+        );
+        return Ok(());
+    }
+    let punch_result = part_sc.punch_holes(log_stream_id, vec![extent_id]).await;
+    crate::release_writer_pin(&pin);
+    punch_result?;
     tracing::info!("GC: punched extent {extent_id}, moved {moved} entries");
     Ok(())
 }
