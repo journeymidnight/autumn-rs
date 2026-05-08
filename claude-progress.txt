@@ -1,97 +1,104 @@
 Date: 2026-05-08
 TaskStatus: completed
-Task scope: F166 — Eliminate `&mut` aliasing UB on `UnsafeCell<CompioFile>`
-            in extent_node.rs (memory-safety audit finding). Two sites
-            converted to use compio's safe `&File` AsyncWriteAt impl
-            (uses SharedFd internally). One file-replacement site
-            (line 2314) deferred to a future Rc<File> refactor.
+Task scope: F170 — Close the last big inline-CPU offender on the EC
+            read path. `ec_slice_decoded` was called inline on the
+            compio runtime AFTER `spawn_blocking(ec_decode)` returns
+            and unconditionally `.to_vec()`'d the full decoded
+            payload — 50-100 ms of memcpy on a 256 MiB extent.
+            Changed to take Vec<u8> by value; full-read branch now
+            returns the input Vec via ownership transfer (zero copy).
 
 Why:
-  A focused memory-safety audit (this iteration, distinct from the
-  prior 8 wire/disk/race audits) flagged two sites in extent_node.rs:
-    - file_pwrite (line 435): `let f = unsafe { &mut *file.get() };`
-    - build_append_future (line 937): same pattern
+  Continued thread-per-core audit prompted by user concern about
+  GC pressure → compio block → heartbeat loss. Per F117 + the
+  partition-server CLAUDE.md note 17 ("CPU-bound work MUST run on
+  the blocking pool, not the compio event loop") any payload-sized
+  memcpy on the compio runtime is a violation.
 
-  Both held `&mut CompioFile` across `.await`. The historical SAFETY
-  comment claimed "compio is single-threaded so &mut aliasing is
-  serialised per-future" — but Rust's `&mut` exclusivity rule is at
-  the LIFETIME level, not the temporal level. Two compio futures on
-  the same runtime each holding a `&mut` across awaits have
-  overlapping lifetimes the compiler is allowed to reason against,
-  even when only one polls at a time. UB the compiler may exploit.
+  F168 + F169 closed compaction's merge-loop and chunk-emit. F170
+  catches the structurally-separate EC read sibling on the same
+  principle:
+    - `ec_decode` (RS GF(256), 100-300 ms): already in spawn_blocking
+      via F117 (`crates/stream/src/client.rs:2069`).
+    - `ec_slice_decoded` full-read (50-100 ms memcpy): inline on the
+      compio runtime — fixed in F170 by zero-copy ownership transfer.
+    - `ec_slice_decoded` sub-range (~ms): kept inline; spawn_blocking
+      join overhead would dominate the actual work.
 
 How:
-  compio provides `impl AsyncWriteAt for &File` (compio_fs/file.rs:250)
-  which uses `SharedFd` interior mutability internally — write_at on
-  `&File` is just as efficient as on `&mut File` (in fact the
-  `&mut File` impl just calls the `&File` impl). Switching to a
-  SHARED reference via `&*file.get()` makes the pattern legal:
+  Pre-F170 signature:
+    fn ec_slice_decoded(full_payload: &[u8], offset: u32, length: u32)
+        -> Result<Vec<u8>>
 
-    Pre-F166: let f = unsafe { &mut *file.get() }; f.write_*at(...)
-    Post-F166: let mut f: &CompioFile = unsafe { &*file.get() };
-               f.write_*at(...)
+  Post-F170 signature:
+    fn ec_slice_decoded(full_payload: Vec<u8>, offset: u32, length: u32)
+        -> Result<Vec<u8>>
 
-  The `let mut f` makes the BINDING mutable. Autoref builds
-  `&mut &CompioFile` which is the receiver type for
-  `AsyncWriteAtExt::write_all_at` on the `&File` impl. Shared refs
-  to UnsafeCell content can alias freely (that's exactly what
-  UnsafeCell is for); concurrent writes are serialised by the
-  kernel/io_uring at the syscall level (not by Rust's borrow
-  checker, which doesn't need to know).
+  Full-read fast path: `if offset == 0 && length == 0 { return Ok(full_payload); }`
+  — strictly zero allocation. The caller at `client.rs:1967`
+  already owned the Vec returned from `ec_read_full`, so the move
+  semantics drop in cleanly.
 
-Cleared (related, NOT bugs):
-  - file_ref (line 428): already returns `&CompioFile` (shared).
-  - file_pread (line 442): already uses `unsafe { &*file.get() }`.
-  - file_pwrite_chunked / file_pread_chunked: just delegate to
-    file_pwrite / file_pread, so fixed transitively.
+  New test `slice_full_read_is_zero_copy` asserts
+  `out.as_ptr() == in_ptr && out.capacity() == in_cap`. Future
+  refactors that reintroduce a memcpy will fail the invariant.
 
-Deferred (real but bigger scope):
-  - The file-replacement at line 2314 (`*entry.file.get() = new_file`
-    during EC commit) is structurally different (REPLACES the file,
-    not just borrows). F153's per-extent EC conversion lock
-    serialises this with concurrent reads, but type-level UB still
-    exists. Closing it would require migrating UnsafeCell<CompioFile>
-    to RefCell<Rc<CompioFile>> (~50-100 LOC refactor across all
-    file_* helpers and call sites).
-  - getifaddrs memory leak in transport/src/lib.rs:141-175 (audit's
-    surface 5) — LOW impact, separate issue.
+Audit cleared (no fix needed) for thread-per-core compliance:
+  - recover_partition logStream replay loop: runs at startup with no
+    concurrent tasks on the partition's compio runtime; heartbeat is
+    on PS-main (different runtime). Single-threaded by structure;
+    not a thread-per-core violation.
+  - process_gc_chunk inner SST/memtable lookup nesting: bounded by
+    GC batch cap (256 records / 4 MiB) with flush_gc_batch.await
+    between batches and gc_yield_now between 64 MiB chunks. Per-
+    batch inline CPU ~1-50 ms in pathological many-SST cases —
+    borderline but already cooperatively scheduled.
+  - All 3 RS encode/decode production sites already wrapped in
+    spawn_blocking (extent_node.rs:2235, extent_node.rs:3427,
+    client.rs:2069).
+  - MergeIterator::next at iterator.rs:268: O(N) over iterators
+    but ~50ns per call; bounded by F168's per-1000-entry yield.
 
 Files modified:
-  - crates/stream/src/extent_node.rs:
-      * file_pwrite (line 434): `&mut *get()` → `&*get()` + mut binding
-      * build_append_future (line 932): same shape
-      * Both inline SAFETY comments rewritten to explain the
-        lifetime-vs-temporal distinction
-  - feature_list.md: F166 entry
-  - claude-progress.txt: this file
+  - crates/stream/src/client.rs:
+      * ec_slice_decoded: take Vec<u8> by value; full-read returns
+        the Vec without copy. Full safety/perf rationale in the
+        rewritten doc-comment.
+      * Caller in ec_read_full_and_slice (line 1967): drop the &
+        borrow operator (pass owned full_payload).
+      * 5 existing tests updated to call by-value (clone for
+        comparison via prepared `expected` Vec).
+      * Added `slice_full_read_is_zero_copy` invariant test.
+  - feature_list.md: F170 entry above F169.
+  - claude-progress.txt: this file.
 
 Verification:
-  - cargo build --workspace --exclude autumn-fuse: clean.
-  - cargo build --release --workspace --exclude autumn-fuse: clean.
-  - cargo test -p autumn-stream --lib: 39/39 pass.
-  - cargo test -p autumn-manager --lib: 30/30 pass.
+  - cargo build -p autumn-stream: clean (only pre-existing warnings).
+  - cargo build --release -p autumn-stream: clean.
+  - cargo test -p autumn-stream --lib: 40/40 pass (was 39 pre-F170;
+    +1 new zero-copy invariant test).
   - cargo test -p autumn-partition-server --lib -- --test-threads=1:
-    122/122 pass.
-  - End-to-end (V1 frame default ON post-F165): cluster.sh reset 1 +
-    3-key put/get round-trip ok. The append path
-    (build_append_future) and direct file_pwrite path are both
-    exercised by the put-then-get cycle (Put → log_stream WAL append
-    via file_pwrite + Get → log_stream read via file_pread, plus the
-    flush path → row_stream SST upload via build_append_future).
+    122/122 pass (parallel runs hit known f099i shared-static races
+    unrelated to F170).
 
 Out of scope (still deferred):
-  - F167 candidate — UnsafeCell<CompioFile> → RefCell<Rc<CompioFile>>
-    migration to close the file-replacement UB at line 2314. Larger
-    refactor.
+  - F168 candidate (still): UnsafeCell<CompioFile> → RefCell<Rc<CompioFile>>
+    migration to close the file-replacement type-level UB at
+    extent_node.rs:2314. F167 documented the invariant; structural
+    refactor still pending.
   - F154 — manager-side ecConversionInFlight etcd persist (perf hygiene).
   - sealed_length cross-source consistency (structural).
-  - EC reconstruction integrity / cross-replica byte detection (structural).
+  - EC reconstruction integrity / cross-replica byte-divergence
+    detection (structural).
 
-Pre-existing (NOT caused by F166):
+Pre-existing (NOT caused by F170):
   - autumn-manager test ec_integration::replication_stream_works
-    fails on this box both with and without F166.
+    fails on this box both with and without F170.
+  - PS lib parallel test failures (f099i_d1_fast_path_no_fu_allocation,
+    f099i_fast_path_inactive_under_batch) due to a shared static
+    counter; serialized run with --test-threads=1 passes.
 
-Session-level summary (F151-F166):
+Session-level summary (F151-F170):
   F151: Python bindings asyncio-native
   F152: 3× etcd-first manager handlers + truncate sync_data
   F153: per-extent EC conversion lock
@@ -108,8 +115,21 @@ Session-level summary (F151-F166):
   F164: F163 unblocked + startup env-dump diagnostic
   F165: V1 default flipped ON — 7 corruption surfaces closed
   F166: UnsafeCell `&mut` aliasing UB closed in 2 sites
-        (file_pwrite + build_append_future)
+  F167: file-replace unsafe encapsulation + safety contract
+  F168: cooperative yield in do_compact merge loop
+  F169: do_compact chunk-emit moves to spawn_blocking
+  F170: ec_slice_decoded zero-copy full-read
 
-  Net: 13 verified bugs closed (F166 closes 2 UB sites) + 1 ops
-  diagnostic + 5 audit findings cleared + 2 over-claims retracted +
-  1 drive-by baseline fix.
+  Net thread-per-core audit closed: F168 (compaction merge),
+  F169 (compaction chunk-emit), F170 (EC read slice). Compio
+  runtimes no longer block on payload-sized CPU work in any of:
+  - compaction (merge + emit + spawn_blocking)
+  - GC (batched, cooperatively scheduled, gc_yield)
+  - EC reads (decode in spawn_blocking, slice zero-copy)
+  - Flush (build_sst_bytes in spawn_blocking, F117/F088)
+
+  User concern (heartbeat loss under GC pressure) confirmed
+  not-a-bug across F168-F170: heartbeat runs on PS-main runtime;
+  per-partition GC/compaction runs on a different OS thread; the
+  thread-per-core principle is now structurally enforced for the
+  audited code paths.

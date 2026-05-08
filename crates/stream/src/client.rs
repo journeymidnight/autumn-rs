@@ -268,9 +268,18 @@ fn read_chunk_bytes() -> u32 {
 /// `length == 0` means "to end"), or an `Err` describing the
 /// out-of-bounds condition. Lifted out of the async method so it can
 /// be unit-tested without standing up a manager + extent-node fixture.
-fn ec_slice_decoded(full_payload: &[u8], offset: u32, length: u32) -> Result<Vec<u8>> {
+/// F170: takes `full_payload` by value so the full-read path
+/// (offset=0, length=0) can return the decoded Vec directly with
+/// zero copy. Pre-F170 this took `&[u8]` and unconditionally
+/// `.to_vec()`'d, which on a 256 MiB EC-decoded payload spent
+/// 50-100 ms memcpy'ing INLINE on the caller's compio runtime —
+/// a thread-per-core violation. Sub-range reads still allocate
+/// `read_len` bytes (typically small), but the full-extent EC
+/// read path (the dominant case during recovery / VP fetches)
+/// is now zero-copy after `spawn_blocking(ec_decode)` returns.
+fn ec_slice_decoded(full_payload: Vec<u8>, offset: u32, length: u32) -> Result<Vec<u8>> {
     if offset == 0 && length == 0 {
-        return Ok(full_payload.to_vec());
+        return Ok(full_payload);
     }
     let start = offset as usize;
     if start > full_payload.len() {
@@ -1964,7 +1973,7 @@ impl StreamClient {
         ex: &ExtentInfo,
     ) -> Result<(Vec<u8>, u32)> {
         let (full_payload, end) = self.ec_read_full(extent_id, ex).await?;
-        let bytes = ec_slice_decoded(&full_payload, offset, length).map_err(|e| {
+        let bytes = ec_slice_decoded(full_payload, offset, length).map_err(|e| {
             anyhow!(
                 "ec_read_full_and_slice: {} for extent {} (manager sealed_length={})",
                 e,
@@ -2230,16 +2239,18 @@ mod ec_slice_tests {
     #[test]
     fn slice_in_range_returns_subslice() {
         let payload: Vec<u8> = (0u8..=199).collect();
-        let out = ec_slice_decoded(&payload, 50, 30).expect("in-range slice");
+        let expected = payload[50..80].to_vec();
+        let out = ec_slice_decoded(payload, 50, 30).expect("in-range slice");
         assert_eq!(out.len(), 30);
-        assert_eq!(out, payload[50..80]);
+        assert_eq!(out, expected);
     }
 
     #[test]
     fn slice_zero_length_means_to_end() {
         let payload: Vec<u8> = (0u8..=199).collect();
-        let out = ec_slice_decoded(&payload, 50, 0).expect("to-end slice");
-        assert_eq!(out, payload[50..]);
+        let expected = payload[50..].to_vec();
+        let out = ec_slice_decoded(payload, 50, 0).expect("to-end slice");
+        assert_eq!(out, expected);
     }
 
     #[test]
@@ -2250,7 +2261,7 @@ mod ec_slice_tests {
         // caller can convert it into a "value short" RPC response and
         // the partition keeps serving other requests.
         let payload = vec![0u8; 45_479_123];
-        let err = ec_slice_decoded(&payload, 49_541_652, 14_456_954)
+        let err = ec_slice_decoded(payload, 49_541_652, 14_456_954)
             .expect_err("offset past end must be rejected");
         let msg = err.to_string();
         assert!(
@@ -2265,16 +2276,32 @@ mod ec_slice_tests {
         // error. Required for callers that pass `offset = sealed_length`
         // and `length = 0` to mean "nothing left".
         let payload = vec![0u8; 100];
-        let out = ec_slice_decoded(&payload, 100, 0).expect("offset==len is OK");
+        let out = ec_slice_decoded(payload, 100, 0).expect("offset==len is OK");
         assert!(out.is_empty());
     }
 
     #[test]
     fn slice_length_overshoots_clamps_to_end() {
         let payload: Vec<u8> = (0u8..=99).collect();
+        let expected = payload[80..].to_vec();
         // Asking for 999 bytes from offset 80 should return 20.
-        let out = ec_slice_decoded(&payload, 80, 999).expect("clamped slice");
+        let out = ec_slice_decoded(payload, 80, 999).expect("clamped slice");
         assert_eq!(out.len(), 20);
-        assert_eq!(out, payload[80..]);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn slice_full_read_is_zero_copy() {
+        // F170 invariant: offset=0,length=0 returns the input Vec
+        // by ownership transfer (no allocation). This test verifies
+        // that the returned Vec's capacity matches the input — if a
+        // memcpy slipped in, the new Vec would have shrunken capacity.
+        let mut payload = Vec::with_capacity(1024);
+        payload.extend_from_slice(&(0u8..=199).collect::<Vec<u8>>());
+        let in_ptr = payload.as_ptr();
+        let in_cap = payload.capacity();
+        let out = ec_slice_decoded(payload, 0, 0).expect("full read");
+        assert_eq!(out.as_ptr(), in_ptr, "full-read must NOT memcpy");
+        assert_eq!(out.capacity(), in_cap, "capacity preserved → no realloc");
     }
 }
