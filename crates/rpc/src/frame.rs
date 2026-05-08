@@ -87,9 +87,26 @@ impl Frame {
     }
 
     /// Encode this frame into bytes (header + payload).
-    /// F161 deferred — currently emits V0 (no CRC). Decoder supports both
-    /// V0 (which this produces) and V1 (FLAG_CRC set) for forward compat.
+    ///
+    /// F163: dispatches to V0 (legacy, no CRC) or V1 (per-frame CRC32C
+    /// trailer, FLAG_CRC set) based on the `AUTUMN_RPC_FRAME_V1` env var.
+    /// Default is V0 — the V1 encoder rollout is gated to opt-in until
+    /// the F161 first-attempt cluster break is root-caused. Decoder
+    /// always supports both formats so a V1-enabled binary still talks
+    /// to V0 peers and vice versa (within the constraint that
+    /// V0-binary-on-V1-data fails inner-protocol decode; restart-all-
+    /// together is the deployment model).
     pub fn encode(&self) -> Bytes {
+        if v1_encoder_enabled() {
+            self.encode_v1()
+        } else {
+            self.encode_v0()
+        }
+    }
+
+    /// V0 encoder: legacy `[req_id 4][msg_type 1][flags 1][payload_len 4][payload N]`.
+    /// Exposed for direct test access independent of env-var state.
+    pub fn encode_v0(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(HEADER_LEN + self.payload.len());
         buf.put_u32_le(self.req_id);
         buf.put_u8(self.msg_type);
@@ -99,25 +116,74 @@ impl Frame {
         buf.freeze()
     }
 
+    /// V1 encoder: `[req_id 4][msg_type 1][flags|FLAG_CRC 1][payload_len=N+4 4][payload N][crc32c 4]`.
+    /// `payload_len` includes the 4-byte CRC trailer; CRC32C covers
+    /// `inner_payload` bytes only (header is already protected by TCP
+    /// CRC + the FLAG_CRC sentinel; corruption of the header would
+    /// either fail bounds-check at decode or land at a wrong stream
+    /// position which the next frame's flag-bit check will catch).
+    pub fn encode_v1(&self) -> Bytes {
+        let crc = crc32c::crc32c(&self.payload);
+        let on_wire_len = self.payload.len() + 4;
+        let mut buf = BytesMut::with_capacity(HEADER_LEN + on_wire_len);
+        buf.put_u32_le(self.req_id);
+        buf.put_u8(self.msg_type);
+        buf.put_u8(self.flags | FLAG_CRC);
+        buf.put_u32_le(on_wire_len as u32);
+        buf.extend_from_slice(&self.payload);
+        buf.put_u32_le(crc);
+        buf.freeze()
+    }
+
     /// Encode only the header into a fixed-size array (for vectored writes).
+    /// F163: dispatches V0/V1 based on `AUTUMN_RPC_FRAME_V1` env var. When
+    /// V1, caller must follow the header bytes with the payload AND a
+    /// 4-byte CRC trailer (use `compute_payload_crc`). The `payload_len`
+    /// in the header already accounts for the 4-byte trailer in V1.
     pub fn encode_header(&self) -> [u8; HEADER_LEN] {
+        let v1 = v1_encoder_enabled();
         let mut hdr = [0u8; HEADER_LEN];
         hdr[0..4].copy_from_slice(&self.req_id.to_le_bytes());
         hdr[4] = self.msg_type;
-        hdr[5] = self.flags;
-        hdr[6..10].copy_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        hdr[5] = if v1 { self.flags | FLAG_CRC } else { self.flags };
+        let len = if v1 { (self.payload.len() + 4) as u32 } else { self.payload.len() as u32 };
+        hdr[6..10].copy_from_slice(&len.to_le_bytes());
         hdr
     }
 
     /// Build a request frame header without the payload (for vectored writes).
-    pub fn encode_request_header(req_id: u32, msg_type: u8, payload_len: u32) -> [u8; HEADER_LEN] {
+    /// F163: dispatches V0/V1 based on env var. `inner_payload_len` is the
+    /// caller's payload bytes only; under V1 the wire `payload_len` field
+    /// is `inner_payload_len + 4` and the caller MUST append a 4-byte CRC
+    /// trailer (see `compute_payload_crc`).
+    pub fn encode_request_header(
+        req_id: u32,
+        msg_type: u8,
+        inner_payload_len: u32,
+    ) -> [u8; HEADER_LEN] {
+        let v1 = v1_encoder_enabled();
         let mut hdr = [0u8; HEADER_LEN];
         hdr[0..4].copy_from_slice(&req_id.to_le_bytes());
         hdr[4] = msg_type;
-        hdr[5] = 0; // flags: request
-        hdr[6..10].copy_from_slice(&payload_len.to_le_bytes());
+        hdr[5] = if v1 { FLAG_CRC } else { 0 };
+        let len = if v1 { inner_payload_len + 4 } else { inner_payload_len };
+        hdr[6..10].copy_from_slice(&len.to_le_bytes());
         hdr
     }
+}
+
+/// F163: cached `AUTUMN_RPC_FRAME_V1` env-var lookup. Reads once on first
+/// access and memoises (so toggling the env mid-process has no effect —
+/// matches how the encoder choice must be process-stable to avoid
+/// mid-stream wire-format changes that the decoder couldn't follow).
+fn v1_encoder_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("AUTUMN_RPC_FRAME_V1")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    })
 }
 
 /// F161 (DEFERRED): compute CRC32C over a multi-segment payload by rolling
@@ -277,6 +343,46 @@ mod tests {
 
         decoder.feed(&encoded[HEADER_LEN + 50..]); // rest of payload + CRC
         let decoded = decoder.try_decode().unwrap().unwrap();
+        assert_eq!(decoded.payload, payload);
+    }
+
+    /// F163: encode_v1 + decoder round-trip. Verifies the explicit V1
+    /// encoder produces bytes the decoder accepts and CRC-validates.
+    #[test]
+    fn f163_encode_v1_decode_round_trip() {
+        let payload = Bytes::from(b"hello-v1".to_vec());
+        let frame = Frame::request(42, 7, payload.clone());
+        let encoded = frame.encode_v1();
+        // V1 frame size = HEADER_LEN + payload + 4-byte CRC trailer.
+        assert_eq!(encoded.len(), HEADER_LEN + payload.len() + 4);
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.try_decode().unwrap().unwrap();
+
+        assert_eq!(decoded.req_id, 42);
+        assert_eq!(decoded.msg_type, 7);
+        assert_eq!(decoded.flags & FLAG_CRC, FLAG_CRC);
+        assert_eq!(decoded.payload, payload);
+    }
+
+    /// F163: encode_v0 + decoder round-trip. Verifies the explicit V0
+    /// encoder still works (the legacy path remains the production
+    /// default until the V1 rollout is verified safe).
+    #[test]
+    fn f163_encode_v0_decode_round_trip() {
+        let payload = Bytes::from(b"hello-v0".to_vec());
+        let frame = Frame::request(99, 3, payload.clone());
+        let encoded = frame.encode_v0();
+        // V0 frame size = HEADER_LEN + payload (no CRC).
+        assert_eq!(encoded.len(), HEADER_LEN + payload.len());
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.try_decode().unwrap().unwrap();
+
+        assert_eq!(decoded.req_id, 99);
+        assert_eq!(decoded.flags & FLAG_CRC, 0); // V0 → no CRC bit
         assert_eq!(decoded.payload, payload);
     }
 

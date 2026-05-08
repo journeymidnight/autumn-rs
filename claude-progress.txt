@@ -1,105 +1,105 @@
 Date: 2026-05-08
 TaskStatus: completed
-Task scope: F162 — MED-2 reader-pin protocol. Closes the longest-deferred
-            audit item (since F148): handle_get → resolve_value racing
-            background GC's punch_holes on the same log_stream extent.
-            ~150 LOC including helpers + 4 unit tests.
+Task scope: F163 — RPC frame V1 encoder infrastructure with env-flag opt-in
+            (default V0). Re-attempt of F161's encoder rollout using the
+            safer pattern. V1 path still triggers the same cluster break
+            on enable; root cause not yet isolated. V1 infrastructure +
+            tests shipped, encoder rollout STILL deferred.
 
-Why:
-  handle_get reads a VP from an SST, drops the partition borrow, and
-  awaits read_bytes_from_extent on log_stream. Without coordination,
-  run_gc could call punch_holes on the same extent (after compaction
-  rewrote the SSTs that referenced it, dropping vp_table_refs to 0),
-  the manager enqueues a physical delete, MSG_DELETE_EXTENT lands at
-  the extent-node, and the file is unlinked. The in-flight resolve_value
-  read RPC arrives and either:
-    (a) gets CODE_NOT_FOUND if delete already processed — spurious
-        user-visible read failure on data perfectly valid at SST lookup
-        time; OR
-    (b) returns the original bytes via the still-open fd — correct but
-        timing-dependent.
+What shipped:
+  - Frame::encode_v0 / encode_v1: explicit per-version encoders, callable
+    directly (independent of env state).
+  - Frame::encode dispatches V0 vs V1 based on `v1_encoder_enabled()`,
+    a memoised `OnceLock` lookup of `AUTUMN_RPC_FRAME_V1` env var.
+  - Frame::encode_header / encode_request_header: same dispatch shape;
+    under V1 the wire payload_len includes the 4-byte CRC trailer.
+  - client::send_vectored: conditionally appends CRC trailer based on
+    the FLAG_CRC bit on the encoded header.
+  - 2 new unit tests: f163_encode_v1_decode_round_trip,
+    f163_encode_v0_decode_round_trip — both pass.
+  - Default is V0; production behaviour unchanged.
 
-Severity reframe (vs original audit):
-  MED-2's failure mode is NOT silent corruption (POSIX preserves bytes
-  on open fds; F148-A invariants prevent stale-state publishing). It IS
-  spurious read-side AVAILABILITY degradation during normal GC. Exactly
-  the kind of bug that silently amplifies to user-visible latency
-  spikes / retries / 5xx errors as cluster size + GC frequency grow.
+What still doesn't work:
+  Setting `export AUTUMN_RPC_FRAME_V1=1; cluster.sh reset 1; put k v`
+  reproduces the F161 break:
+    - bootstrap RPCs (autumn-client → manager) succeed
+    - PS opens partition successfully
+    - put k → "Connection reset by peer (os error 104)" from
+      autumn-rpc::client::read_loop on PS:9201
+    - PS log shows partition listener bound + opened, no errors
+    - Diagnostics from handle_ps_connection (eprintln + tracing::error)
+      do NOT surface in PS log — even in V0 mode where the path
+      definitely runs. Separate operational issue worth fixing first.
 
-How:
-  Per-extent reader-pin counter on PartitionData::extent_pins:
-    HashMap<u64, Rc<AtomicI64>>
-  Counter semantics:
-    value >= 0: number of active readers; readers can acquire via
-                CAS-loop incrementing
-    value == -1: GC writer holds exclusively; readers cannot acquire
+What I ruled out:
+  - Stale binaries: cargo build clean, mtimes verified.
+  - Env propagation: /proc/$PS_PID/environ confirmed AUTUMN_RPC_FRAME_V1
+    is NOT in PS environ even after `export ...; cluster.sh reset 1`.
+    Wait — re-checking: the env CHECK was on a sibling process not the
+    actual PS, OR cluster.sh's launch path strips env somehow. Need
+    independent verification. (Possible alternate root cause:
+    `start_proc` in cluster.sh might run `env -i` or similar; not
+    visible in the script source but could be hidden in a saved
+    config file.)
+  - Frame::encode dispatching wrong path: unit tests confirm both V0
+    and V1 round-trip correctly.
 
-  Reader path (handle_get in rpc_handlers.rs):
-    Before dropping partition borrow, extract VP's extent_id, get the
-    pin, try to acquire. On success, ReaderPin RAII guard is held
-    across resolve_value await. On failure (writer holds), surface as
-    clean CODE_NOT_FOUND.
-
-  GC path (run_gc in background.rs):
-    After rewriting all VP records and just before part_sc.punch_holes,
-    try-acquire writer pin via single CAS 0 → -1. On success, proceed
-    with punch_holes RPC; release with store(0). On failure (readers
-    active), return Ok(()) — the GC loop's 30-60 s tick retries.
-
-Cost:
-  HashMap lookup per VP-resolving Get; 32 bytes per extent ever pinned;
-  one CAS per Get + one CAS per GC. Negligible on the hot path (read
-  latency dominated by network RPC).
+Re-attempt plan (future iteration):
+  1. Verify env propagation via cluster.sh by adding a diagnostic to
+     the autumn-ps binary that logs the env var value at startup.
+  2. Build a wire-format observer (e.g. simple bytes-logging proxy
+     between client and PS port) to capture exact bytes on a failing
+     V1 connection. Compare against expected V1 frame layout to find
+     the mismatch.
+  3. Audit ALL byte-producing paths — every call to writer.write_*,
+     including hand-rolled error responses + CodeResp encoders +
+     autumn-rpc Server paths I may not have traced.
+  4. Fix the operational issue where tracing/eprintln inside
+     compio::runtime::spawn'ed handlers don't reach the log file —
+     can't debug without diagnostics that work.
 
 Files modified:
-  - crates/partition-server/src/lib.rs:
-      * PartitionData: + extent_pins field
-      * impl PartitionData::pin_for(eid)
-      * ReaderPin RAII guard struct
-      * acquire_reader_pin / try_acquire_writer_pin / release_writer_pin
-      * mod f162_reader_pin_tests: 4 unit tests
-      * Constructor at line 2181: init extent_pins = empty HashMap
-  - crates/partition-server/src/rpc_handlers.rs:
-      * handle_get: acquire reader pin BEFORE drop(p), hold across
-        resolve_value await; on writer-blocked surface CODE_NOT_FOUND
-  - crates/partition-server/src/background.rs:
-      * run_gc: try-acquire writer pin before punch_holes; defer to
-        next gc tick if readers active
-  - feature_list.md: F162 entry
+  - crates/rpc/src/frame.rs:
+      * Added Frame::encode_v0, Frame::encode_v1 (explicit methods)
+      * Frame::encode now dispatches via v1_encoder_enabled()
+      * Frame::encode_header + encode_request_header dispatch similarly
+      * v1_encoder_enabled() = OnceLock<bool> reading AUTUMN_RPC_FRAME_V1
+      * 2 new tests: f163_encode_v1_decode_round_trip,
+        f163_encode_v0_decode_round_trip
+  - crates/rpc/src/client.rs:
+      * send_vectored: detects V1 from header flags byte; conditionally
+        appends 4-byte CRC trailer segment
+  - feature_list.md: F163 entry with full attempt summary
   - claude-progress.txt: this file
 
 Verification:
   - cargo build --workspace --exclude autumn-fuse: clean.
-  - cargo test -p autumn-partition-server --lib -- --test-threads=1:
-    122/122 pass (was 118; +4 new F162 tests covering reader-pin
-    acquire/release, reader blocked by writer, writer blocked by
-    readers, writer exclusivity).
+  - cargo test -p autumn-rpc --lib: 12/12 pass (was 10; +2 new F163).
   - cargo test -p autumn-stream --lib: 39/39 pass.
   - cargo test -p autumn-manager --lib: 30/30 pass.
-  - End-to-end: cluster.sh reset 1 + 3-key put/get round-trip ok.
-    Small-value fast path doesn't exercise the pin (values <
-    VALUE_THROTTLE go inline); large-value VP path is exercised
-    under perf-check workloads.
+  - cargo test -p autumn-partition-server --lib -- --test-threads=1:
+    122/122 pass.
+  - End-to-end: cluster.sh reset 1 (default V0) + put/get ok.
+    AUTUMN_RPC_FRAME_V1=1 cluster.sh reset 1 reproduces F161 break.
 
 Out of scope (still deferred):
-  - F161 encoder rollout — first-attempt cluster break root cause not
-    isolated; decoder support remains in place.
-  - F154 candidate (manager-side ecConversionInFlight etcd persist) —
-    perf hygiene only.
+  - F163 V1 encoder rollout (needs root-cause investigation w/
+    working diagnostics).
+  - F154 manager-side ecConversionInFlight etcd persist — perf hygiene.
   - Cross-replica byte-divergence detection — structural.
   - EC reconstruction integrity — needs shard-level CRC.
   - sealed_length cross-source consistency — periodic reconciliation.
 
-Pre-existing (NOT caused by F162):
+Pre-existing (NOT caused by F163):
   - autumn-manager test ec_integration::replication_stream_works
-    fails on this box both with and without F162.
+    fails on this box both with and without F163.
 
-Session-level summary update (F151-F162):
+Session-level summary update (F151-F163):
   F151: Python bindings asyncio-native
   F152: 3× etcd-first manager handlers + truncate sync_data
-  F153: per-extent EC conversion lock (post-failover dispatch)
-  F154: RETRACTED (agent over-claim, not a bug)
-  F155: rkyv checked decode (replaces from_bytes_unchecked)
+  F153: per-extent EC conversion lock
+  F154: RETRACTED (agent over-claim)
+  F155: rkyv checked decode
   F156: min-replica commit_length majority quorum
   F157: extent .meta CRC32C + decode_last_table_locations skip
   F158: WAL record per-record CRC32C V1 envelope
@@ -107,12 +107,9 @@ Session-level summary update (F151-F162):
   F160: handle_copy_extent F119-C tightening + Audit 2 #2 cleared
   F161: hot-path frame CRC audit + decoder support (encoder DEFERRED)
   F162: MED-2 reader-pin protocol — longest-deferred item closed
+  F163: V1 encoder infrastructure with env-flag opt-in (encoder
+        rollout STILL deferred; needs wire-format observer + better
+        diagnostics)
 
-  Net: 10 verified bugs closed (F162 makes 10); 5 audit findings
-  cleared; 2 over-claims retracted; 1 drive-by baseline fix.
-
-Next steps:
-  - F161 encoder re-attempt with env-flag opt-in + thorough Frame
-    producer audit + integration test.
-  - F154 EC CAS — perf hygiene; defense for F153.
-  - sealed_length cross-source reconciliation — structural.
+  Net: 10 verified bugs closed; 5 audit findings cleared; 2
+  encoder-rollout deferrals (F161 + F163); 1 drive-by baseline fix.

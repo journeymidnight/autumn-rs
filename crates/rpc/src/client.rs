@@ -278,16 +278,29 @@ impl RpcClient {
             return Err(RpcError::ConnectionClosed);
         }
         let req_id = self.next_req_id();
-        let payload_len: usize = payload_parts.iter().map(|p| p.len()).sum();
-        let hdr = Frame::encode_request_header(req_id, msg_type, payload_len as u32);
+        let inner_payload_len: usize = payload_parts.iter().map(|p| p.len()).sum();
+        // F163: encode_request_header dispatches V0/V1 internally; under V1 it
+        // bumps the wire `payload_len` field by 4 to account for the trailer
+        // we append below.
+        let hdr = Frame::encode_request_header(req_id, msg_type, inner_payload_len as u32);
 
         let (tx, rx) = oneshot::channel();
         // Insert BEFORE submit — see comment in send_frame.
         self.pending.borrow_mut().insert(req_id, tx);
 
-        let mut bufs: Vec<Bytes> = Vec::with_capacity(1 + payload_parts.len());
+        let v1 = (hdr[5] & crate::frame::FLAG_CRC) != 0;
+        let extra = if v1 { 1 } else { 0 };
+        let mut bufs: Vec<Bytes> = Vec::with_capacity(1 + payload_parts.len() + extra);
         bufs.push(Bytes::copy_from_slice(&hdr));
-        bufs.extend(payload_parts);
+        if v1 {
+            // F163: compute CRC32C over the multi-segment payload BEFORE
+            // moving the parts into bufs (compute_payload_crc takes &[Bytes]).
+            let crc = crate::frame::compute_payload_crc(&payload_parts);
+            bufs.extend(payload_parts);
+            bufs.push(Bytes::copy_from_slice(&crc));
+        } else {
+            bufs.extend(payload_parts);
+        }
 
         if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id }).await {
             self.pending.borrow_mut().remove(&req_id);

@@ -570,6 +570,30 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F163 · RPC frame V1 encoder infrastructure (env-flag opt-in, default V0)
+- **Target:** Re-attempt F161's per-frame CRC32C V1 encoder rollout, this time with the env-flag opt-in pattern that the F161 retraction notes prescribed. F161 verified 7 corruption surfaces in hot-path binary RPC frames; the decoder support shipped, but the encoder rollout broke the cluster on first try and the root cause was not isolated.
+- **F163 changes:** Frame's `encode` / `encode_header` / `encode_request_header` now dispatch V0 vs V1 based on `AUTUMN_RPC_FRAME_V1` env var (memoised via `OnceLock` on first access). Default is V0 — production behaviour unchanged. Explicit `encode_v0` / `encode_v1` methods are exposed for direct test access independent of env-var state. `send_vectored` checks the FLAG_CRC bit on the encoded header and conditionally appends the CRC trailer segment.
+- **V1 encoder rollout STILL DEFERRED:** Setting `AUTUMN_RPC_FRAME_V1=1` and re-running the cluster reproduces the same break as F161's first attempt — `Connection reset by peer` from PS, `handle_ps_connection`'s tracing diagnostics never surface (despite tracing being initialized), and root-cause investigation with eprintln + tracing both fail to identify the offending wire-format mismatch within the iteration's budget. The V1 path passes unit tests (encoder→decoder direct round-trip via `encode_v1`); something in the cluster pipeline (likely a Frame producer not going through `Frame::encode()` that I haven't found yet) breaks under V1.
+- **What ships:**
+  - `Frame::encode_v0` (explicit legacy) + `Frame::encode_v1` (explicit with CRC) public methods
+  - `Frame::encode` dispatches via `v1_encoder_enabled()` (memoised env-var lookup)
+  - `Frame::encode_header` / `encode_request_header` similarly dispatch
+  - `client::send_vectored` conditionally appends CRC trailer based on the encoded header's flags byte
+  - 2 new tests: `f163_encode_v1_decode_round_trip`, `f163_encode_v0_decode_round_trip`
+- **Files:** `crates/rpc/src/frame.rs` (V0/V1 dispatcher + memoised env lookup + 2 new tests), `crates/rpc/src/client.rs` (send_vectored conditional CRC trailer), `feature_list.md`, `claude-progress.txt`.
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-rpc --lib`: 12/12 pass (was 10; +2 new F163 tests for V0 + V1 encode→decode round-trips).
+  - `cargo test -p autumn-stream --lib`: 39/39 pass.
+  - `cargo test -p autumn-manager --lib`: 30/30 pass.
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 122/122 pass.
+  - End-to-end: `cluster.sh reset 1` (default V0) + put/get round-trip ok. `AUTUMN_RPC_FRAME_V1=1 cluster.sh reset 1` reproduces the F161 break — root cause still pending investigation.
+- **Re-attempt plan (future iteration):**
+  - Build a wire-format observer (e.g., a simple proxy that logs every byte) to capture the exact byte sequence on a failing V1 connection. Compare against expected V1 frame layout to find the mismatch.
+  - Audit ALL byte-producing paths systematically — every place that calls `writer.write_*` directly, not just those that obviously use `Frame::encode()`. Possible culprits: a CodeResp encoder, a hand-built error response, an autumn-rpc Server somewhere I haven't traced.
+  - Verify `tracing::error!` from inside `compio::runtime::spawn`-ed handlers actually reaches the log file (this iteration found that diagnostics from inside `handle_ps_connection` don't surface — separate operational issue worth fixing first).
+- **passes:** false (V1 encoder rollout still pending — V0 default unchanged, V1 infrastructure shipped + tested in unit tests)
+
 ### F162 · MED-2 reader-pin protocol (closes spurious-NotFound on `handle_get` vs concurrent GC)
 - **Target:** Close the longest-deferred audit item — MED-2 — `handle_get → resolve_value` racing background GC's `punch_holes` on the same `log_stream` extent. The race window: `handle_get` reads a `ValuePointer` from an SST, drops the partition borrow, and awaits `read_bytes_from_extent` on log_stream. Without coordination, `run_gc` could call `punch_holes` on the same extent (after compaction has rewritten the SSTs that referenced it, decrementing `vp_table_refs` to 0), the manager enqueues a physical delete, MSG_DELETE_EXTENT lands at the extent-node, and the extent file is unlinked. The in-flight resolve_value's read RPC arrives at the extent-node and either (a) gets `CODE_NOT_FOUND` if the delete already processed — a spurious user-visible read failure on data that was perfectly valid at the moment the SST was looked up, OR (b) returns the original bytes via the still-open fd if the delete is in-flight — correct but timing-dependent.
 - **Severity reframe (vs original audit):** MED-2's failure mode is NOT silent corruption (POSIX preserves bytes on open fds, so reads from a yet-to-be-closed unlinked file return the original bytes; F148-A invariants prevent stale-state publishing). It IS spurious read-side **availability degradation** during normal GC operation — exactly the kind of bug that silently amplifies to user-visible latency spikes / retries / 5xx errors as cluster size + GC frequency grow.
