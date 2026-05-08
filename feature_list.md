@@ -570,6 +570,28 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F166 · Eliminate `&mut` aliasing UB on `UnsafeCell<CompioFile>` (memory-safety audit finding)
+- **Target:** Close the verified `&mut`-aliasing UB in `extent_node.rs::file_pwrite` (line 435) and `build_append_future` (line 937). A focused memory-safety audit (this iteration's lens, distinct from the prior 8 audits) flagged both sites. The pattern was `let f = unsafe { &mut *file.get() };` followed by `f.write_*at(...).await` where the `&mut CompioFile` lifetime spans across the await. The historical SAFETY comment claimed "compio is single-threaded so &mut aliasing is serialised per-future" — but Rust's `&mut` exclusivity rule is at the LIFETIME level, not the temporal level. Two compio futures on the same runtime, each holding a `&mut` across awaits, have overlapping lifetimes the compiler is allowed to reason against, even when only one polls at a time.
+- **The right fix:** compio provides `impl AsyncWriteAt for &File` (`compio_fs/file.rs:250`) which uses `SharedFd` interior mutability — write_at on `&File` is just as efficient as on `&mut File` (in fact the `&mut File` impl just calls the `&File` impl: `(&*self).write_at(buf, pos).await`). Switching to a SHARED reference via `&*file.get()` makes the pattern legal: shared refs to `UnsafeCell` content can alias freely (that's exactly what `UnsafeCell` is for), and concurrent writes are serialised by the kernel/io_uring at the syscall level (not by Rust's borrow checker, which doesn't need to know).
+- **Change:**
+  - `file_pwrite` (line 434): `let mut f: &CompioFile = unsafe { &*file.get() }; f.write_all_at(...)`. The `let mut` makes the binding mutable; autoref builds `&mut &CompioFile` which is the receiver type for `AsyncWriteAtExt::write_all_at` on the `&File` impl.
+  - `build_append_future` (line 932): same pattern with `write_vectored_at`.
+  - Both inline SAFETY comments rewritten to explain the lifetime-vs-temporal distinction so future contributors don't reintroduce the unsafe pattern.
+- **Cleared (related, NOT bugs):**
+  - `file_ref` (line 428) already returns `&CompioFile` (shared) — safe.
+  - `file_pread` (line 442) already uses `unsafe { &*file.get() }` (shared) — safe.
+  - The remaining `&mut` site at line 2314 (`*entry.file.get() = new_file` during EC commit) is structurally different (it REPLACES the file, not just borrows). F153's per-extent EC conversion lock serialises this with concurrent reads, but the type-level UB still exists; closing it would require migrating `UnsafeCell<CompioFile>` to `RefCell<Rc<CompioFile>>` (~50-100 LOC refactor) — deferred to a future iteration.
+  - `getifaddrs` memory leak in `transport/src/lib.rs:141-175` (the agent's surface 5) — LOW impact, separate issue, deferred.
+- **Files:** `crates/stream/src/extent_node.rs` (file_pwrite + build_append_future + comments), `feature_list.md`, `claude-progress.txt`.
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo build --release --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-stream --lib`: 39/39 pass.
+  - `cargo test -p autumn-manager --lib`: 30/30 pass.
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 122/122 pass.
+  - End-to-end (V1 frame default ON post-F165): `cluster.sh reset 1` + 3-key put/get round-trip ok. Append path (`build_append_future`) and direct file_pwrite path both exercised.
+- **passes:** true
+
 ### F165 · Flip RPC frame V1 default ON — closes 7 verified hot-path corruption surfaces in production
 - **Target:** Make F163's V1 encoder the default. F161 audit verified 7 hot-path RPC frame corruption surfaces (header field corruption silently passed to handle_append, payload bytes corrupted in transit, length-field poisoning, eversion bypass, etc.). F163 shipped the V1 encoder + decoder infrastructure. F164 verified V1 works end-to-end. With V1 opt-in, the corruption protection is unused unless the operator explicitly sets `AUTUMN_RPC_FRAME_V1=1`. F165 flips the default so production deployments get the protection automatically.
 - **Change:** One-line semantic flip in `crates/rpc/src/frame.rs::v1_encoder_enabled`:

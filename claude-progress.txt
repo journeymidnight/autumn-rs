@@ -1,79 +1,97 @@
 Date: 2026-05-08
 TaskStatus: completed
-Task scope: F165 — Flip RPC frame V1 default ON. F161 audit verified 7
-            hot-path corruption surfaces; F163 shipped V1 infrastructure;
-            F164 verified V1 works end-to-end. F165 flips the default
-            so production deployments get the protection by default.
+Task scope: F166 — Eliminate `&mut` aliasing UB on `UnsafeCell<CompioFile>`
+            in extent_node.rs (memory-safety audit finding). Two sites
+            converted to use compio's safe `&File` AsyncWriteAt impl
+            (uses SharedFd internally). One file-replacement site
+            (line 2314) deferred to a future Rc<File> refactor.
 
 Why:
-  F161 audit verified 7 corruption surfaces in hot-path binary RPC
-  frames (Append/ReadBytes/CommitLength). All HIGH severity. With V1
-  opt-in, the protection sits dormant unless operator explicitly
-  enables — most users won't. Flipping default-on means the
-  corruption surfaces are closed in production by default.
+  A focused memory-safety audit (this iteration, distinct from the
+  prior 8 wire/disk/race audits) flagged two sites in extent_node.rs:
+    - file_pwrite (line 435): `let f = unsafe { &mut *file.get() };`
+    - build_append_future (line 937): same pattern
+
+  Both held `&mut CompioFile` across `.await`. The historical SAFETY
+  comment claimed "compio is single-threaded so &mut aliasing is
+  serialised per-future" — but Rust's `&mut` exclusivity rule is at
+  the LIFETIME level, not the temporal level. Two compio futures on
+  the same runtime each holding a `&mut` across awaits have
+  overlapping lifetimes the compiler is allowed to reason against,
+  even when only one polls at a time. UB the compiler may exploit.
 
 How:
-  One-line semantic flip in crates/rpc/src/frame.rs::v1_encoder_enabled:
-    Pre-F165: unwrap_or(false) + matches!(v, "1"|"true"|"yes"|"on")
-              — V1 opt-in.
-    Post-F165: unwrap_or(true) + !matches!(v, "0"|"false"|"no"|"off")
-              — V1 default-on, opt-out via AUTUMN_RPC_FRAME_V1=0.
+  compio provides `impl AsyncWriteAt for &File` (compio_fs/file.rs:250)
+  which uses `SharedFd` interior mutability internally — write_at on
+  `&File` is just as efficient as on `&mut File` (in fact the
+  `&mut File` impl just calls the `&File` impl). Switching to a
+  SHARED reference via `&*file.get()` makes the pattern legal:
 
-  Existing frame::tests::encode_decode_round_trip + empty_payload
-  updated to assert V1 sizes (HEADER_LEN + payload + 4-byte CRC).
+    Pre-F166: let f = unsafe { &mut *file.get() }; f.write_*at(...)
+    Post-F166: let mut f: &CompioFile = unsafe { &*file.get() };
+               f.write_*at(...)
 
-Trade-off:
-  ~10% throughput cost on read hot path (HW CRC32C compute at
-  ~1 µs per 4 KB payload at SSE4.2). V0 read ~124k ops/s vs
-  V1 read ~110k ops/s on tmpfs. Acceptable for corruption protection;
-  most production storage systems ship checksums on by default.
+  The `let mut f` makes the BINDING mutable. Autoref builds
+  `&mut &CompioFile` which is the receiver type for
+  `AsyncWriteAtExt::write_all_at` on the `&File` impl. Shared refs
+  to UnsafeCell content can alias freely (that's exactly what
+  UnsafeCell is for); concurrent writes are serialised by the
+  kernel/io_uring at the syscall level (not by Rust's borrow
+  checker, which doesn't need to know).
 
-Operational notes:
-  - Whole cluster must agree on wire version. Per-process flips
-    create decode mismatches.
-  - cluster.sh runs target/release. Always cargo build --release
-    after a wire-format-affecting change. (F164 process lesson.)
-  - F164's startup env-dump in autumn-ps continues to log AUTUMN_*
-    env vars so operators can confirm cluster is on intended version.
+Cleared (related, NOT bugs):
+  - file_ref (line 428): already returns `&CompioFile` (shared).
+  - file_pread (line 442): already uses `unsafe { &*file.get() }`.
+  - file_pwrite_chunked / file_pread_chunked: just delegate to
+    file_pwrite / file_pread, so fixed transitively.
+
+Deferred (real but bigger scope):
+  - The file-replacement at line 2314 (`*entry.file.get() = new_file`
+    during EC commit) is structurally different (REPLACES the file,
+    not just borrows). F153's per-extent EC conversion lock
+    serialises this with concurrent reads, but type-level UB still
+    exists. Closing it would require migrating UnsafeCell<CompioFile>
+    to RefCell<Rc<CompioFile>> (~50-100 LOC refactor across all
+    file_* helpers and call sites).
+  - getifaddrs memory leak in transport/src/lib.rs:141-175 (audit's
+    surface 5) — LOW impact, separate issue.
+
+Files modified:
+  - crates/stream/src/extent_node.rs:
+      * file_pwrite (line 434): `&mut *get()` → `&*get()` + mut binding
+      * build_append_future (line 932): same shape
+      * Both inline SAFETY comments rewritten to explain the
+        lifetime-vs-temporal distinction
+  - feature_list.md: F166 entry
+  - claude-progress.txt: this file
 
 Verification:
+  - cargo build --workspace --exclude autumn-fuse: clean.
   - cargo build --release --workspace --exclude autumn-fuse: clean.
-  - cargo test -p autumn-rpc --lib: 12/12 pass (frame tests updated).
   - cargo test -p autumn-stream --lib: 39/39 pass.
   - cargo test -p autumn-manager --lib: 30/30 pass.
   - cargo test -p autumn-partition-server --lib -- --test-threads=1:
     122/122 pass.
-  - E2E V1 default: cluster.sh reset 1 (no env var) + 3-key put/get
-    round-trip ok. F164 dump: "no AUTUMN_* env vars at startup".
-  - E2E V0 opt-out: AUTUMN_RPC_FRAME_V1=0 cluster.sh reset 1 + put/get
-    ok. F164 dump: AUTUMN_RPC_FRAME_V1=0 propagated. Legacy V0 used.
-
-Closed corruption surfaces (now ON by default):
-  1. AppendReq header bit-flip → wrong extent/fence-bypass/data loss
-  2. AppendReq payload bytes corrupted in transit
-  3. ReadBytesResp payload bytes corrupted in transit
-  4. CommitLengthResp.length poisoning consensus min
-  5. Frame payload_len corruption causing hang/OOM (still bound by
-     MAX_PAYLOAD_LEN check; CRC catches header+payload corruption
-     after that bound is met)
-  6. AppendReq eversion check race with corrupted req.eversion
-  7. CommitLengthResp.code with corrupted length
+  - End-to-end (V1 frame default ON post-F165): cluster.sh reset 1 +
+    3-key put/get round-trip ok. The append path
+    (build_append_future) and direct file_pwrite path are both
+    exercised by the put-then-get cycle (Put → log_stream WAL append
+    via file_pwrite + Get → log_stream read via file_pread, plus the
+    flush path → row_stream SST upload via build_append_future).
 
 Out of scope (still deferred):
-  - F154 candidate (manager-side ecConversionInFlight etcd persist)
-    — perf hygiene only after F153 closed corruption.
-  - sealed_length cross-source consistency (manager etcd vs sidecar
-    vs StreamClient cache) — periodic reconciliation, structural.
-  - EC reconstruction integrity — would need shard-level CRC.
-  - Cross-replica byte-divergence detection — would need
-    end-to-end value CRC at API boundary or cross-replica byte
-    comparison at every read.
+  - F167 candidate — UnsafeCell<CompioFile> → RefCell<Rc<CompioFile>>
+    migration to close the file-replacement UB at line 2314. Larger
+    refactor.
+  - F154 — manager-side ecConversionInFlight etcd persist (perf hygiene).
+  - sealed_length cross-source consistency (structural).
+  - EC reconstruction integrity / cross-replica byte detection (structural).
 
-Pre-existing (NOT caused by F165):
+Pre-existing (NOT caused by F166):
   - autumn-manager test ec_integration::replication_stream_works
-    fails on this box both with and without F165.
+    fails on this box both with and without F166.
 
-Session-level summary update (F151-F165):
+Session-level summary (F151-F166):
   F151: Python bindings asyncio-native
   F152: 3× etcd-first manager handlers + truncate sync_data
   F153: per-extent EC conversion lock
@@ -86,12 +104,12 @@ Session-level summary update (F151-F165):
   F160: handle_copy_extent F119-C tightening + Audit 2 #2 cleared
   F161: hot-path frame CRC audit + decoder support
   F162: MED-2 reader-pin protocol
-  F163: V1 encoder infrastructure with env-flag opt-in
+  F163: V1 encoder infrastructure
   F164: F163 unblocked + startup env-dump diagnostic
-  F165: V1 default flipped ON — 7 corruption surfaces closed in
-        production by default
+  F165: V1 default flipped ON — 7 corruption surfaces closed
+  F166: UnsafeCell `&mut` aliasing UB closed in 2 sites
+        (file_pwrite + build_append_future)
 
-  Net: 12 verified bugs closed (7 wire-corruption surfaces now
-  default-protected via F165 + 5 individual closures from F151-F162)
-  + 1 ops diagnostic + 5 audit findings cleared + 2 over-claims
-  retracted + 1 drive-by baseline fix.
+  Net: 13 verified bugs closed (F166 closes 2 UB sites) + 1 ops
+  diagnostic + 5 audit findings cleared + 2 over-claims retracted +
+  1 drive-by baseline fix.

@@ -431,8 +431,24 @@ fn file_ref(file: &std::cell::UnsafeCell<CompioFile>) -> &CompioFile {
 
 /// Positional write (pwrite) at reserved offset — safe for concurrent
 /// non-overlapping offsets (each caller uses fetch_add to reserve).
-async fn file_pwrite(file: &std::cell::UnsafeCell<CompioFile>, offset: u64, data: impl compio::buf::IoBuf) -> Result<()> {
-    let f = unsafe { &mut *file.get() };
+///
+/// F166: takes a SHARED reference via `&*file.get()` (not `&mut`).
+/// compio's `impl AsyncWriteAt for &File` (compio_fs/file.rs:250) uses
+/// `SharedFd` interior mutability internally, so `&CompioFile` suffices
+/// — and shared refs to `UnsafeCell` content can legally alias, which
+/// the previous `&mut *file.get()` did NOT (Rust's `&mut` exclusivity
+/// rule is at the lifetime level, not the temporal level; two compio
+/// futures on the same runtime each holding a `&mut` across awaits
+/// have overlapping lifetimes regardless of single-threaded execution).
+/// The `let mut f` pattern below is just to satisfy the
+/// `AsyncWriteAtExt::write_all_at` signature (`&mut self where Self =
+/// &File`) — the underlying `&File` value is shared.
+async fn file_pwrite(
+    file: &std::cell::UnsafeCell<CompioFile>,
+    offset: u64,
+    data: impl compio::buf::IoBuf,
+) -> Result<()> {
+    let mut f: &CompioFile = unsafe { &*file.get() };
     let BufResult(result, _) = f.write_all_at(data, offset).await;
     result.map_err(|e| anyhow::anyhow!(e))
 }
@@ -931,10 +947,18 @@ async fn build_append_future(
     let extent_for_io = extent;
     Box::pin(async move {
         let write_t0 = Instant::now();
-        // SAFETY: overlapping same-extent futures have non-overlapping
-        // file_starts (reserved in step 7); compio is single-threaded so
-        // &mut aliasing inside this closure is serialised per-future.
-        let f = unsafe { &mut *extent_for_io.file.get() };
+        // F166: use compio's `&File` AsyncWriteAt impl (SharedFd interior
+        // mutability) instead of `&mut *file.get()`. Pre-F166 the comment
+        // here claimed "compio is single-threaded so &mut aliasing is
+        // serialised per-future" — but Rust's `&mut` aliasing rule is at
+        // the LIFETIME level, not the temporal level: two compio futures
+        // each holding `&mut` across awaits have overlapping lifetimes
+        // regardless of single-thread execution, which is UB the compiler
+        // is allowed to reason against. Shared `&CompioFile` refs alias
+        // freely under UnsafeCell semantics; concurrent writes are
+        // serialised by the kernel/io_uring at the syscall level (not by
+        // Rust's borrow checker).
+        let mut f: &CompioFile = unsafe { &*extent_for_io.file.get() };
         let BufResult(wr, _) = f.write_vectored_at(bufs, file_start).await;
         if let Err(e) = wr {
             node.mark_disk_offline_for_extent(extent_id);
