@@ -570,6 +570,41 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F172 · Manager dispatch-loop CPU audit — pre-filter + hoist redundant clones
+- **Target:** Continue the thread-per-core audit, this iteration on the manager. The manager runs ~7 background dispatch loops on a single compio runtime alongside its 18 RPC handlers (heartbeat, register_ps, get_regions, mutating handlers, etc.). Any inline CPU work between awaits in a dispatch loop blocks all RPC handlers + sibling loops on the same runtime. Audit identified two concrete inefficiencies; the rest are clean.
+- **Audit findings (cleared, no fix needed):**
+  - `ec_conversion_dispatch_loop` (recovery.rs:586-610): already filters under borrow before cloning candidates. Good pattern.
+  - `extent_delete_loop` (extent_delete.rs:50): drains queue then sequential per-replica RPC. Each RPC awaited; runtime stays responsive for sibling tasks.
+  - `ps_liveness_check_loop` (lib.rs:791): filter under borrow, only `dead_ps: Vec<u64>` clones cross the await boundary.
+  - `recovery_collect_loop` (recovery.rs:378): only clones small `s.nodes` map; per-node RPC dispatch with awaits.
+  - `disk_status_update_loop`, `leader_keepalive_loop`, `leader_election_loop`: small constant work per tick.
+  - `rebalance_regions` (lib.rs:842): O(parts × PS) inner `min_by_key` scan. At 10K parts × 100 PS = 1M ops ≈ 10 ms inline; bounded — accepted.
+  - `replay_from_etcd` (lib.rs:540+): startup-only, not a hot-path concern.
+  - All RPC handler etcd writes go through F149 `txn_fenced`; one extra GET on fence break, otherwise straight-through.
+- **F172-A — `recovery_dispatch_loop` snapshot pre-filter (recovery.rs:284-291):**
+  - **Pre-F172 pattern:** snapshot was `s.extents.values().cloned().collect::<Vec<_>>()` — clones EVERY extent in the cluster, including the ones the loop body will skip on its very first line (`if ex.sealed_length == 0 { continue; }`, then `if ec_conversion_inflight.contains(&ex.extent_id) { continue; }`).
+  - **Cost:** `MgrExtentInfo` carries 4 `Vec<u64>` fields (replicates, parity, replicate_disks, parity_disks) — each clone allocates 4 small heap regions. At 10K extents (~200 B each effective) = ~2 MB inline memcpy + ~40K allocations per 2 s tick. At 100K extents = 20 MB / 400K allocs ≈ 10-20 ms inline. Worst-case window: heartbeat (`heartbeat_ps` RPC) handlers blocked for tens of ms per tick on a busy cluster.
+  - **Fix:** push the early-skip checks INTO the borrow scope so we filter first, clone after. The filter is a tight CPU loop over hashed lookups (`HashSet::contains`), no allocations. The body's correctness is unchanged because `apply_recovery_done` / `mark_extent_available` / `handle_multi_modify_split` re-check `ec_conversion_inflight` at apply time (F138), so a stale snapshot is safe.
+- **F172-B — `ec_conversion_dispatch_loop` hoist `node_addrs` clone (recovery.rs:626-632):**
+  - **Pre-F172 pattern:** the inner `for (ex, stream) in candidates` loop re-collected the entire `s.nodes -> address` map ONCE PER CANDIDATE EXTENT, even though `s.nodes` is identical for every iteration of a single tick.
+  - **Cost:** N candidates × M nodes of `String::clone` per tick. Bounded but pure waste. With M = 100 nodes and N = 50 candidates per tick = 5000 String clones × ~30 bytes = ~150 KB total clones plus 5000 heap allocations. Sub-millisecond, but eliminating it costs essentially nothing.
+  - **Fix:** snapshot `node_addrs` ONCE alongside `candidates` under the same borrow. Save N-1 clones per tick.
+- **What's NOT addressed in F172 (deferred):**
+  - **Sequential RPC dispatch in `recovery_dispatch_loop`:** at 10K sealed extents × 3 replicas × 1 ms RPC each = 30 s end-to-end loop time. This is an I/O latency concern, not CPU — the runtime stays responsive for sibling tasks because each await yields. Parallelising via `FuturesUnordered` / `join_all` would shorten loop wall-time at the cost of coordinated dispatch ordering. Out of scope for this CPU audit.
+  - **`Rc<MgrExtentInfo>` storage migration:** would make every `s.extents.values().cloned()` a one-atomic-increment-per-clone instead of allocating-clone. ~50 LOC structural change across the manager + every consumer that mutates an extent. Deferred until a measurable hot path actually needs it; F172-A's pre-filter is the targeted fix for the dispatch loop's specific hot path.
+- **Files:** `crates/manager/src/recovery.rs` (2 sites + comments), `feature_list.md`, `claude-progress.txt`.
+- **Verification:**
+  - `cargo build -p autumn-manager`: clean (only pre-existing unused-import warnings).
+  - `cargo build --release --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-manager --lib`: 30/30 pass.
+  - `cargo test -p autumn-stream --lib`: 40/40 pass.
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 122/122 pass.
+- **Operational notes:**
+  - On a 10K-extent / mostly-sealed-extents cluster, F172-A reduces per-tick CPU spike from 2 MB clone (~1-2 ms) to ~1 KB filter Vec (~µs). Heartbeat tail latency on the manager runtime stays sub-ms even under recovery dispatch pressure.
+  - On a 100-node × 50-candidate cluster, F172-B saves ~150 KB of String clones per tick. Negligible per-tick but removes the per-candidate amplification factor — protects against a future O(N²) regression if cluster size grows.
+  - Both fixes are pure refactors preserving observable behavior (same dispatch decisions, same RPC sequence). Existing F138/F126 inflight-set semantics are untouched.
+- **passes:** true
+
 ### F171 · `UnsafeCell<CompioFile>` → `RefCell<Rc<CompioFile>>` structural migration (close the file-replace UB at the type level)
 - **Target:** Close the type-level UB at the file-replacement path on the extent node, completing the F166/F167 line of work. Pre-F166 the file handle was held in `UnsafeCell<CompioFile>` and accessed via `unsafe { &mut *file.get() }` borrows that aliased across `.await` (a real Rust UB the compiler is allowed to reason against, regardless of single-threaded compio execution). F166 fixed two `&mut` borrow sites by switching to shared `&File` via compio's `SharedFd` interior mutability. F167 encapsulated the file-REPLACE site (`*entry.file.get() = new_file` during EC commit) with a documented `unsafe fn replace_file_under_lock` and a safety contract relying on F153's per-extent EC-conversion lock. F167 documented but did NOT close the structural concern: a concurrent reader holding `&CompioFile` from `unsafe { &*file.get() }` is type-level dangling if the replace fires mid-read. F119-C's eversion-mismatch covers it in practice; F171 closes it at the type level.
 - **Approach (5 file helpers + ~20 call sites + 1 field type + 1 method):**

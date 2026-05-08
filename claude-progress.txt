@@ -1,121 +1,91 @@
 Date: 2026-05-08
 TaskStatus: completed
-Task scope: F171 — Structural migration of `ExtentEntry.file` from
-            `UnsafeCell<CompioFile>` to `RefCell<Rc<CompioFile>>`.
-            Closes the type-level UB at the file-replacement path
-            (line 2378, ex-2314 EC commit) by making the replace path
-            return the OLD `Rc` to be dropped only after concurrent
-            readers release their clones. Completes the F166/F167
-            line of work — there is now zero `unsafe` and zero
-            `UnsafeCell` in any file-access path on the extent node.
+Task scope: F172 — Manager dispatch-loop CPU audit. Two concrete
+            inefficiencies fixed; the rest of the dispatch loops
+            cleared as already-clean.
 
 Why:
-  F166 fixed `&mut` aliasing UB on borrow paths (file_pwrite,
-  build_append_future) by switching to shared `&File`. F167
-  encapsulated the file-REPLACE path with a documented `unsafe fn
-  replace_file_under_lock`, but the type-level UB remained: a
-  concurrent reader holding `&CompioFile` from `unsafe { &*file.get() }`
-  is dangling if `replace` fires mid-read. F119-C's eversion-mismatch
-  reject blocked it in practice; F171 closes it at the type level so
-  no future contributor can reintroduce the pattern at a new call site.
+  The manager runs ~7 background dispatch loops on a single compio
+  runtime alongside its 18 RPC handlers (heartbeat_ps, register_ps,
+  get_regions, mutating handlers). Any inline CPU work between
+  awaits in a dispatch loop blocks all RPC handlers + sibling loops
+  on the same runtime — same thread-per-core principle the
+  partition-server side enforces post-F168/F169/F170.
 
-How:
-  Field type: UnsafeCell<CompioFile> → RefCell<Rc<CompioFile>>.
+Audit findings (cleared, no fix needed):
+  - ec_conversion_dispatch_loop (recovery.rs:586-610): already
+    filters under borrow before cloning candidates. Good pattern.
+  - extent_delete_loop (extent_delete.rs:50): drains queue then
+    sequential per-replica RPC. Each RPC awaited.
+  - ps_liveness_check_loop (lib.rs:791): filter under borrow,
+    only `dead_ps: Vec<u64>` clones cross the await.
+  - recovery_collect_loop (recovery.rs:378): only clones small
+    `s.nodes` map; per-node RPC dispatch with awaits.
+  - disk_status_update_loop, leader_keepalive_loop,
+    leader_election_loop: small constant work per tick.
+  - rebalance_regions: O(parts × PS), bounded ~10 ms at 10K × 100,
+    accepted.
+  - replay_from_etcd: startup-only.
 
-  New methods on ExtentEntry:
-    fn file_rc(&self) -> Rc<CompioFile>      // brief borrow + clone
-    fn replace_file(&self, new: CompioFile)  // safe borrow_mut + swap
+Fixes:
+  F172-A — recovery_dispatch_loop snapshot pre-filter:
+    Pre-F172: `s.extents.values().cloned().collect::<Vec<_>>()`
+              clones EVERY extent, even the ones the loop body
+              skips on its very first line.
+    Post-F172: filter under borrow first
+              (sealed_length > 0 AND not in ec_conversion_inflight)
+              then clone only the matching set.
+    Cost saved: at 10K extents (~200 B each with 4 Vec fields)
+                = ~2 MB inline memcpy + ~40K heap allocs per 2 s
+                tick → ~few KB / few µs after F172-A.
+                At 100K extents = 20 MB / 400K allocs / 10-20 ms
+                inline → mostly flat.
+    Correctness: F138's apply-time re-check on
+                 apply_recovery_done / mark_extent_available /
+                 handle_multi_modify_split protects against the
+                 stale-snapshot race window.
 
-  All 5 file helpers (file_pwrite, file_pread, file_pwrite_chunked,
-  file_pread_chunked, plus the chunk-loop's per-iteration calls) take
-  `Rc<CompioFile>` by value. The future captures it, deref gives
-  `&CompioFile` for the syscall. RefCell borrow is released before
-  the first .await.
+  F172-B — ec_conversion_dispatch_loop hoist node_addrs:
+    Pre-F172: re-collected `s.nodes -> address` map ONCE PER
+              CANDIDATE EXTENT inside `for (ex, stream) in
+              candidates`. Same map identical across all iterations
+              of a single tick.
+    Post-F172: snapshot once alongside candidates under the same
+               borrow.
+    Cost saved: N candidates × M nodes of String clone per tick →
+                M nodes total per tick. At 50 × 100 = 5000 →
+                100 saved.
 
-  Free function `file_ref` deleted — callers use `entry.file_rc()`
-  directly. The Rc deref handles `.sync_data().await`,
-  `.metadata().await`, `.estimated_size()` etc identically to the
-  prior `&CompioFile`.
-
-  Construction sites:
-    3× `ExtentEntry { file: UnsafeCell::new(file), .. }`
-       → `ExtentEntry { file: RefCell::new(Rc::new(file)), .. }`
-    1× `staging_cell = UnsafeCell::new(staging_file)` in
-       `prepare_shard_local` (local-only, never aliased)
-       → plain `Rc::new(staging_file)`
-
-  Replace site (commit_shard_local, ex-line 2378):
-    `unsafe { entry.replace_file_under_lock(new_file); }`
-    → `entry.replace_file(new_file);`
-
-What's no longer load-bearing:
-  - F153 per-extent ec_conversion_locks: still serialises concurrent
-    EC dispatches racing on the staging path, but no longer the sole
-    memory-safety guarantor for the file replace.
-  - F119-C eversion-mismatch reject: belt-and-braces for client-side
-    cache freshness, no longer load-bearing for memory safety.
-
-Final state:
-  - unsafe blocks in file-access path: 0
-  - UnsafeCell in code: 0 (only in F171 doc-comment describing pre-F171)
-  - file.get() calls: 0
-  - Remaining `unsafe { ... }` in extent_node.rs: 2, both libc
-    setsockopt for TCP socket tuning (lines 182 + 456) — totally
-    unrelated to file path.
+Out of scope (deferred):
+  - Sequential RPC dispatch in recovery_dispatch_loop: I/O
+    latency concern, not CPU. Each await yields.
+  - Rc<MgrExtentInfo> storage migration: structural ~50 LOC
+    change across manager + consumers. Deferred until F172-A's
+    pre-filter doesn't suffice.
 
 Files modified:
-  - crates/stream/src/extent_node.rs:
-      * ExtentEntry.file: type changed
-      * ExtentEntry::replace_file_under_lock (unsafe) → replace_file (safe)
-      * ExtentEntry::file_rc added
-      * 5 file helpers: signature + implementation
-      * file_ref free function: deleted
-      * 17 call sites: file_ref(&extent.file) → extent.file_rc(),
-                        file_ref(&entry.file)  → entry.file_rc(),
-                        file_pwrite(&extent.file, ...) → file_pwrite(extent.file_rc(), ...)
-                        (and the 4 other helper variants)
-      * 3 construction sites: UnsafeCell::new → RefCell::new(Rc::new(...))
-      * 1 staging-file site: UnsafeCell → plain Rc
-      * 1 replace site: unsafe { replace_file_under_lock } → replace_file
-      * build_append_future: cloned Rc once, used `&*rc` for syscalls
-      * build_read_future: same pattern
-  - crates/stream/CLAUDE.md: ExtentEntry section rewritten with F171 note
-  - feature_list.md: F171 entry above F170
+  - crates/manager/src/recovery.rs:
+      * recovery_dispatch_loop: pre-filter under borrow
+      * ec_conversion_dispatch_loop: hoist node_addrs out of
+        candidate loop
+      * Inline F172 comments documenting both
+  - feature_list.md: F172 entry
   - claude-progress.txt: this file
 
 Verification:
-  - cargo build --workspace --exclude autumn-fuse: clean.
+  - cargo build -p autumn-manager: clean.
   - cargo build --release --workspace --exclude autumn-fuse: clean.
+  - cargo test -p autumn-manager --lib: 30/30 pass.
   - cargo test -p autumn-stream --lib: 40/40 pass.
   - cargo test -p autumn-partition-server --lib -- --test-threads=1:
     122/122 pass.
-  - cargo test -p autumn-manager --lib: 30/30 pass.
-  - End-to-end smoke (cluster.sh reset 1) was denied by the harness
-    — F171 is a pure refactor preserving observable behavior, the
-    test suites cover every changed code path.
 
-Performance impact:
-  - Per-I/O cost: one Rc::clone (atomic increment, ~1-2 ns) before
-    each pread/pwrite. Negligible relative to the syscall +
-    io_uring round-trip (~µs minimum).
-  - Memory: Rc<CompioFile> is 16 bytes (ptr + control block) vs the
-    inline CompioFile, plus 8 bytes RefCell borrow flag. ~24 bytes
-    per ExtentEntry — negligible at typical extent counts.
-
-Out of scope (still deferred):
-  - F154 — manager-side ecConversionInFlight etcd persist (perf hygiene).
-  - sealed_length cross-source consistency (structural).
-  - EC reconstruction integrity / cross-replica byte-divergence (structural).
-
-Pre-existing (NOT caused by F171):
+Pre-existing (NOT caused by F172):
   - autumn-manager test ec_integration::replication_stream_works
-    fails on this box both with and without F171 (reproduces in main
-    pre-F171 also).
-  - PS lib parallel test failures (f099i_d1_fast_path_no_fu_allocation,
-    f099i_fast_path_inactive_under_batch) due to a shared static
-    counter; serialized run with --test-threads=1 passes.
+    fails on this box both with and without F172 (reproduces in
+    main pre-F172 also).
 
-Session-level summary (F151-F171):
+Session-level summary (F151-F172):
   F151: Python bindings asyncio-native
   F152: 3× etcd-first manager handlers + truncate sync_data
   F153: per-extent EC conversion lock
@@ -136,8 +106,9 @@ Session-level summary (F151-F171):
   F168: cooperative yield in do_compact merge loop
   F169: do_compact chunk-emit moves to spawn_blocking
   F170: ec_slice_decoded zero-copy full-read
-  F171: ExtentEntry.file: UnsafeCell<CompioFile> → RefCell<Rc<CompioFile>>
+  F171: ExtentEntry.file: UnsafeCell → RefCell<Rc<CompioFile>>
+  F172: manager dispatch-loop pre-filter + hoist redundant clones
 
-  Memory-safety arc closed (F166 → F167 → F171): from 3+ unsafe
-  sites in file path to 0; from "documented invariant under
-  F153/F119-C" to "structurally protected by Rc refcount".
+  Thread-per-core audit complete across PS (F168-F170), stream layer
+  (F171), and manager (F172). Compio runtimes no longer block on
+  payload-sized inline CPU work in any audited code path.

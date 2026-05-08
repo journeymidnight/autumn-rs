@@ -281,30 +281,33 @@ impl AutumnManager {
                 continue;
             }
 
+            // F172-A: pre-filter under the store borrow so we DON'T clone
+            // extents that the loop body will skip on the next line. The
+            // loop body's first checks are `if ex.sealed_length == 0
+            // { continue; }` and `if ec_conversion_inflight.contains(...)
+            // { continue; }`. Pre-F172 we cloned every single extent in
+            // `s.extents` (~200 B each for the 4 Vec fields) only to drop
+            // most on the floor — a 10K-extent cluster cloned 2 MB inline
+            // per 2 s tick on the manager's compio runtime, blocking
+            // heartbeat / register_ps / get_regions handlers for a few ms
+            // each tick. F138's ec_conversion_inflight gating is unchanged
+            // — `apply_recovery_done` / `mark_extent_available` /
+            // `handle_multi_modify_split` still re-check the set at apply
+            // time, so a stale snapshot here is safe (drops at most one
+            // tick's worth of dispatch latency on the racing extent).
             let (extents, nodes, disks) = {
                 let s = self.store.inner.borrow();
-                (
-                    s.extents.values().cloned().collect::<Vec<_>>(),
-                    s.nodes.clone(),
-                    s.disks.clone(),
-                )
+                let ec_inflight = self.ec_conversion_inflight.borrow();
+                let extents: Vec<MgrExtentInfo> = s
+                    .extents
+                    .values()
+                    .filter(|ex| ex.sealed_length > 0 && !ec_inflight.contains(&ex.extent_id))
+                    .cloned()
+                    .collect();
+                (extents, s.nodes.clone(), s.disks.clone())
             };
 
             for ex in extents {
-                if ex.sealed_length == 0 {
-                    continue;
-                }
-                // F138: skip extents whose EC conversion is in flight. Sending
-                // re_avali or dispatching recovery while EC is pending would
-                // trigger a concurrent eversion bump that apply_ec_conversion_done
-                // would silently overwrite.
-                if self
-                    .ec_conversion_inflight
-                    .borrow()
-                    .contains(&ex.extent_id)
-                {
-                    continue;
-                }
                 let copies = Self::extent_nodes(&ex);
                 for (slot, node_id) in copies.iter().copied().enumerate() {
                     let bit = 1u32 << slot;
@@ -583,8 +586,25 @@ impl AutumnManager {
                 .copied()
                 .collect();
 
-            let candidates: Vec<(MgrExtentInfo, MgrStreamInfo)> = {
+            // F172-B: snapshot node_addrs ONCE per loop tick. Pre-F172 we
+            // re-collected the full `s.nodes -> address` map inside the
+            // `for (ex, stream) in candidates` loop (one clone per
+            // candidate extent), even though `s.nodes` is identical for
+            // every iteration of a single tick — N candidates × M nodes
+            // of String clones × 5 s cadence. Hoisting saves
+            // `O((candidates - 1) * nodes)` String allocations per tick
+            // while preserving the existing same-tick consistency
+            // semantics (race vs concurrent register_node lasts at most
+            // 5 s, recovered on next tick).
+            let candidates: Vec<(MgrExtentInfo, MgrStreamInfo)>;
+            let node_addrs: HashMap<u64, String>;
+            {
                 let s = self.store.inner.borrow();
+                node_addrs = s
+                    .nodes
+                    .iter()
+                    .map(|(id, n)| (*id, n.address.clone()))
+                    .collect();
                 let mut out = Vec::new();
                 let mut seen: HashSet<u64> = HashSet::new();
                 for stream in s.streams.values() {
@@ -606,8 +626,8 @@ impl AutumnManager {
                         }
                     }
                 }
-                out
-            };
+                candidates = out;
+            }
 
             for (ex, stream) in candidates {
                 let extent_id = ex.extent_id;
@@ -622,14 +642,6 @@ impl AutumnManager {
                 let mut target_nodes: Vec<u64> = ex.replicates.clone();
                 let mut target_addrs: Vec<String> = Vec::new();
                 let mut extra_disk_ids: Vec<u64> = Vec::new();
-
-                let node_addrs: HashMap<u64, String> = {
-                    let s = self.store.inner.borrow();
-                    s.nodes
-                        .iter()
-                        .map(|(id, n)| (*id, n.address.clone()))
-                        .collect()
-                };
 
                 for &nid in &target_nodes {
                     if let Some(addr) = node_addrs.get(&nid) {
