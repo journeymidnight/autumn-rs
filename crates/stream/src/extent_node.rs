@@ -1759,10 +1759,21 @@ impl ExtentNode {
 
 
     async fn truncate_to_commit(extent: &Rc<ExtentEntry>, commit: u32) -> Result<(), String> {
-        file_ref(&extent.file)
-            .set_len(commit as u64)
-            .await
-            .map_err(|e| e.to_string())?;
+        let f = file_ref(&extent.file);
+        f.set_len(commit as u64).await.map_err(|e| e.to_string())?;
+        // F152: fsync the truncate. Without this, the kernel may report the
+        // smaller size in stat() before the inode metadata is durable; if the
+        // node crashes after `set_len` but before any subsequent must_sync
+        // append flushes the file's metadata, post-restart the file size
+        // could be observed at the pre-truncate length. The min-replica
+        // commit protocol depends on per-replica `extent.len` matching what
+        // the file actually holds — a stale longer length lets the next
+        // commit_length probe report wrong consensus, after which an append
+        // truncates the OTHER replicas back to that wrong value, diverging
+        // them at the same offset. fdatasync (sync_data) is sufficient: the
+        // file size IS the data we need durable, and subsequent appends
+        // will sync content separately.
+        f.sync_data().await.map_err(|e| e.to_string())?;
         extent.len.store(commit as u64, Ordering::SeqCst);
         Ok(())
     }

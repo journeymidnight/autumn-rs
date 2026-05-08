@@ -1,94 +1,134 @@
-Date: 2026-05-07
+Date: 2026-05-08
 TaskStatus: completed
-Task scope: F151 — Python bindings: asyncio-native refactor.
-            Replace the blocking surface in `python/src/lib.rs` with
-            awaitable methods that bridge the existing compio worker
-            thread to the running asyncio loop via
-            `loop.call_soon_threadsafe(fut.set_result|set_exception, …)`.
+Task scope: F152 — Close 4 verified consistency bugs from a multi-round audit.
+            Lowest-risk subset of the audit's findings (3 etcd-first ordering
+            violations on the manager + 1 missing fsync on stream truncate).
+            ~50 LOC core change + invariant comments. No new RPCs, no new
+            architectural state.
 
-Why:
-  The pre-F151 surface ran a compio runtime on a worker thread but
-  the Python-facing methods (`put`, `get`, `delete`, `range`,
-  `batch_delete`, `close`) were blocking — each one allocated a sync
-  `mpsc::channel`, sent the op, and `recv()`-blocked the calling Python
-  thread until the worker completed. Under asyncio that pattern stalls
-  the event loop for the duration of every RPC, so the binding could
-  not be used inside an async server. The user asked for an asyncio-
-  native API: compio still drives the IO, asyncio still drives the
-  application, the bridge between them is `call_soon_threadsafe` on
-  the asyncio.Future the binding hands back.
+Audit context:
+  Six Explore agents over two iterations of /loop ("作为一个强一致的分布式系统，
+  还有哪些要修复的？") audited manager / stream / partition-server for
+  consistency-breaking bugs not yet closed by F140-F150. Round 1 produced a
+  Tier 1 list of 3 verified HIGH manager bugs + 1 verified HIGH stream bug;
+  round 2 verified the 3 hypotheses round 1 left open and explored failover-
+  completeness + decoder/cross-replica invariants. Net findings:
+    - 9 verified bugs (4 closed by F152, 5 deferred — see Out-of-scope below)
+    - 5 cleared after investigation (NOT bugs; documented in feature_list.md)
+    - 4 hypotheses still pending verification
 
-Architecture:
-  - One detached OS thread runs the compio runtime + the
-    `ClusterClient`. Unchanged from before.
-  - Channel between Python and worker is now
-    `futures::channel::mpsc::unbounded` (was `std::sync::mpsc`). The
-    worker `await`s the next op via `StreamExt::next` instead of
-    busy-polling with `try_recv` + 1 ms sleep — strictly better
-    backpressure + zero idle wakes.
-  - Each Op variant carries a `PyHandle { loop: Py<PyAny>, fut:
-    Py<PyAny> }`. Python-side every method (a) acquires the running
-    asyncio loop via `asyncio.get_running_loop()`, (b) creates a
-    fresh `loop.create_future()`, (c) sends the op, (d) returns the
-    future. The compio worker, on op completion, re-acquires the
-    GIL and calls `loop.call_soon_threadsafe(fut.set_result | …
-    set_exception, value)` — `call_soon_threadsafe` is the only
-    asyncio-blessed cross-thread wake primitive.
-  - `Client.connect(addr)` is itself an async classmethod. It
-    spawns the worker thread; the worker performs
-    `ClusterClient::connect(...).await`, then re-acquires the GIL
-    to construct the Python `Client` object (which owns the `tx`
-    Sender) on the worker side and resolves the future with it.
-    Failure path: `set_exception(RuntimeError("connect failed: …"))`
-    and the worker exits.
-  - `close()` sends `Op::Close { handle }`; the worker resolves
-    the handle, breaks out of the event loop, and the runtime
-    drops. The thread is detached (no JoinHandle held) — `Drop`
-    on the Python `Client` just drops the Sender, the worker
-    observes channel disconnect and tears down. No Python-side
-    lifetime hazards because the worker thread holds the GIL only
-    for the brief notify call.
+Bugs closed by F152:
+
+  Bug 1 — handle_create_stream etcd-first violation
+    File: crates/manager/src/rpc_handlers.rs:385-398
+    Root cause: pre-F152 `s.streams.insert + s.extents.insert` ran BEFORE
+      `mirror_create_stream(...).await`. Manager crash in await window leaves
+      new leader (post-replay_from_etcd) without the stream record while
+      extent files exist on remote nodes as orphans (eventually cleaned by
+      F109/F113 reconcile sweep, but the stream record is lost).
+    Fix: swap order — etcd mirror first, in-memory insert second. Symmetric
+      to F125's fix on `handle_stream_alloc_extent`.
+
+  Bug 2 — handle_update_stream_ec etcd-first violation
+    File: crates/manager/src/rpc_handlers.rs:431-462
+    Root cause: same anti-pattern. Higher impact than #1 because EC params
+      drive `ec_conversion_dispatch_loop` — a crash mid-mirror leaves the new
+      leader dispatching the OLD EC shape while the deposed leader's memory
+      had the new one. Could materialise as `logStream value short` or
+      `ec_read_full_and_slice: offset N past decoded payload` on subsequent
+      reads (the F119-D corruption class).
+    Fix: clone-then-mutate-then-mirror under read borrow, then apply to
+      memory in a fresh `borrow_mut`.
+
+  Bug 3 — handle_register_node etcd-first violation (both branches)
+    File: crates/manager/src/rpc_handlers.rs:186-254
+    Re-reg branch: `existing_node.shard_ports = ...; nodes.insert(...)` ran
+      before `mirror_register_node(&existing_node, &[]).await`.
+    New-node branch: `s.disks.insert + s.nodes.insert` ran inside the same
+      `borrow_mut` that allocated IDs, before `mirror_register_node(&node,
+      &disk_infos).await`.
+    Root cause: shard_ports drives F099-K per-partition routing — a crash
+      mid-mirror routes RPCs to the OLD shard layout until the next
+      heartbeat re-corrects.
+    Fix: both branches reserve IDs upfront, mirror to etcd, then apply to
+      memory in a fresh `borrow_mut`. Wasted IDs from a failed mirror are
+      safe per CLAUDE.md note 5 (`alloc_ids` derives `next_id =
+      max(all_entity_ids) + 1` on replay).
+
+  Bug 4 — truncate_to_commit no fsync after set_len
+    File: crates/stream/src/extent_node.rs:1761-1782
+    Root cause: pre-F152 the function called `file.set_len(commit).await`
+      then `extent.len.store(commit, SeqCst)` with no `sync_data()`. The
+      min-replica commit protocol depends on per-replica `extent.len`
+      matching what the file actually holds on disk — if the node crashes
+      after `set_len` but before any subsequent must_sync append flushes
+      the file's metadata, post-restart the file size could be observed
+      at the pre-truncate length (kernel hasn't durably persisted the
+      inode shrink). Then the next `commit_length` probe reports a wrong
+      consensus, and an append truncates the OTHER replicas back to that
+      wrong value, diverging them at the same offset.
+    Fix: `f.sync_data().await` between `set_len` and the atomic store.
+      fdatasync is sufficient — the file size IS the data we need durable;
+      subsequent appends sync content separately. truncate fires only on
+      commit-reconciliation (rare), so the extra fsync cost is negligible
+      on the hot path.
 
 Files modified:
-  - python/Cargo.toml                       (+1 dep: futures = "0.3")
-  - python/src/lib.rs                       (full rewrite, ~290 LOC)
-  - README.md                               (new "Python bindings (asyncio)" section)
-  - feature_list.md                         (F151 entry)
-  - claude-progress.txt                     (this file)
+  - crates/manager/src/rpc_handlers.rs  (handle_create_stream + handle_update_stream_ec
+                                          + handle_register_node both branches; ~80 LOC
+                                          incl invariant comments)
+  - crates/stream/src/extent_node.rs    (truncate_to_commit: + sync_data().await + comment)
+  - feature_list.md                      (F152 entry with cleared / deferred lists)
+  - claude-progress.txt                  (this file)
 
 Verification:
-  - `cargo check` inside `python/`: clean (no warnings, no errors).
-  - `maturin develop --release` in a virtualenv: builds wheel for
-    CPython 3.12 against the local crates.
-  - Async smoke test (/tmp/autumn_async_test.py) against a fresh
-    `cluster.sh reset 1` cluster: ALL OK
-      * `await Client.connect(addr)` returns connected client.
-      * `put / get / delete` round-trip; missing-key get returns None.
-      * `range(prefix, start, limit)` returns key-only entries
-        (matches partition-server's intentional contract — values
-        are an empty Vec; callers that need values fan-in with `get`).
-      * `asyncio.gather(*[client.put(...) for _ in range(50)])` —
-        50 concurrent in-flight puts on the single worker thread,
-        all complete; range scan confirms 50 keys landed.
-      * `batch_delete(prefix)` returns count + clears the range.
-      * `await client.close()` resolves cleanly; `Drop` is idempotent.
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-stream --lib`: 30/30 pass.
+  - `cargo test -p autumn-manager --lib`: 30/30 pass.
+  - `cargo test -p autumn-partition-server --lib`: 106 pass parallel / 108 pass serial
+    (--test-threads=1). Same 2 pre-existing F099I parallel-test races as F148/F149/F150
+    baseline; not introduced by F152.
+  - End-to-end smoke: `cluster.sh reset 1` succeeds (exercises handle_register_node
+    re-reg AND new-node branches + handle_create_stream 3× for log/row/meta).
+    `autumn-client put k1 /tmp/v.bin` + `get k1` round-trip ok.
+  - Perf sanity: `perf-check --duration 5 --partitions 1 --pipeline-depth 8 --size 4096`
+    reports 107k ops/s read sustained — within F148-F150 range (90-97k); the extra
+    `sync_data()` on `truncate_to_commit` is rare-fire and does not show up.
 
-Out of scope (not started):
-  - `head` / `put_with_ttl` / `stream_put` / `split` / `compact` /
-    `gc` / `flush` are still unbound on the Python side (same as
-    pre-F151). Easy follow-up because the PyHandle infrastructure
-    is in place — each method is now ~10 LOC of new code.
-  - No Python-side type stubs (.pyi) generated. Acceptable for
-    internal use; revisit when packaging for PyPI.
-  - No Python-side tests in-tree; the smoke test lives in /tmp
-    because the project doesn't currently host a Python test suite.
-    If the binding becomes load-bearing this should move under
-    `python/tests/` with a maturin-based CI step.
+Cleared by audit (NOT bugs, kept for future reference):
+  - Unsealed-extent read vs concurrent truncate: F148-B + single-task-per-conn + SeqCst close it.
+  - Stale `revision` reuse after manager failover: per-extent `last_revision` total-orders
+    writers across manager instances; F149 is belt-and-braces.
+  - `recovery_tasks` etcd-write-vs-memory-insert gap: F149 atomic txn closes it.
+  - `partition_vp_refs` RMW post-failover: F149 atomic txn closes it.
+  - Owner-lock revision persistence on extent-node restart: properly loaded from meta sidecar.
+
+Out of scope (deferred to future features):
+  - F153 candidate: `ec_conversion_inflight` not etcd-persisted → post-failover double
+    EC dispatch. F119-D guard fires post-hoc only; the deposed leader's mid-`spawn_blocking`
+    `ec_encode` window is exposed to a duplicate dispatch from the new leader. Fix sketch:
+    new `ecConversionInFlight/$extent_id` etcd key with create_revision==0 CAS, mirroring
+    the F149 `recoveryTasks/$id` pattern.
+  - F154 candidate: `flush_one_imm_local` fallback violates F148-A invariant P3 (verified):
+    `await spawn_blocking + part_sc.append().await` between borrow drop and next
+    `borrow_mut`. Rare path (P-bulk spawn fail). Refactor: capture snapshot tuple
+    synchronously before the await; ~30 LOC.
+  - F155 candidate: rkyv `from_bytes_unchecked` on every wire deserialize + no schema
+    versioning. UB on malformed input. HIGH for rolling upgrades + cosmic-ray-flipped
+    bytes that pass TCP CRC; LOW for restart-all-together with trusted network.
+  - F156 candidate: min-replica `commit_length_for_extent` continues on RPC error →
+    uses `min` of REACHABLE replicas. Could commit at speculative position with only
+    1/N respondents. Needs quorum enforcement + adversarial test first.
+  - F157 candidate: MED-2 `handle_get → resolve_value` vs GC `punch_holes` (deferred
+    since F148): per-extent reader-pin protocol; structural change.
+
+Pre-existing (NOT caused by F152):
+  - autumn-manager test ec_integration::replication_stream_works fails on this box both
+    with and without F152; reproduced by `git stash` + re-run on F151 baseline.
+  - autumn-rpc lib test `init` symbol missing (build error). Pre-existing.
 
 Next steps:
-  - Bind the remaining ClusterClient methods listed above when a
-    user surfaces a need.
-  - Real-SSD perf measurement to validate F150 Phase A + decide on
-    Phase C (carried over from prior session).
-  - MED-2 (Get → resolve_value vs background GC reader-pin) — still
-    deferred per F148 next-steps.
+  - Pick one of the F153-F157 candidates above based on operating model priorities.
+    F153 (ec_conversion_inflight persist) is the highest-value next move because it
+    closes a HIGH-class corruption hazard with the lowest architectural cost (single
+    new etcd key + 2 CAS sites).

@@ -184,9 +184,13 @@ impl AutumnManager {
             }
 
             // Update shard_ports if the node restarted with a different config.
+            // F152: etcd-first ordering (CLAUDE.md note 1) — mirror to etcd
+            // BEFORE updating in-memory store. The shard_ports change drives
+            // route resolution; a crash mid-mirror leaves the new leader
+            // routing to the OLD shard layout while the deposed leader's
+            // memory had the new one.
             if existing_node.shard_ports != req.shard_ports {
                 existing_node.shard_ports = req.shard_ports;
-                self.store.inner.borrow_mut().nodes.insert(node_id, existing_node.clone());
                 if let Err(err) = self.mirror_register_node(&existing_node, &[]).await {
                     return Ok(rkyv_encode(&RegisterNodeResp {
                         code: Self::err_to_code(&err),
@@ -195,6 +199,11 @@ impl AutumnManager {
                         disk_uuids: vec![],
                     }));
                 }
+                self.store
+                    .inner
+                    .borrow_mut()
+                    .nodes
+                    .insert(node_id, existing_node.clone());
             }
 
             return Ok(rkyv_encode(&RegisterNodeResp {
@@ -205,9 +214,15 @@ impl AutumnManager {
             }));
         }
 
+        // F152: etcd-first ordering (CLAUDE.md note 1). Compute node +
+        // disk_infos (and reserve their IDs via alloc_ids) under a single
+        // borrow_mut, mirror to etcd, then apply to memory in a fresh
+        // borrow_mut. alloc_ids is reserved upfront because IDs must be
+        // monotonic across the whole cluster — wasted IDs from a failed
+        // mirror are safe per note 5 (alloc_ids regeneration on replay
+        // takes max(all_entity_ids)+1, so the gap is harmless).
         let (node, disk_infos, uuid_map, node_id) = {
             let mut s = self.store.inner.borrow_mut();
-
             let (start, _) = s.alloc_ids((req.disk_uuids.len() + 1) as u64);
             let node_id = start;
 
@@ -222,7 +237,6 @@ impl AutumnManager {
                     online: true,
                     uuid: uuid.clone(),
                 };
-                s.disks.insert(disk_id, disk.clone());
                 disk_infos.push(disk);
                 uuid_map.push((uuid.clone(), disk_id));
             }
@@ -233,7 +247,6 @@ impl AutumnManager {
                 disks: disk_ids,
                 shard_ports: req.shard_ports,
             };
-            s.nodes.insert(node_id, node.clone());
             (node, disk_infos, uuid_map, node_id)
         };
 
@@ -244,6 +257,14 @@ impl AutumnManager {
                 node_id: 0,
                 disk_uuids: vec![],
             }));
+        }
+
+        {
+            let mut s = self.store.inner.borrow_mut();
+            for disk in &disk_infos {
+                s.disks.insert(disk.disk_id, disk.clone());
+            }
+            s.nodes.insert(node_id, node.clone());
         }
 
         Ok(rkyv_encode(&RegisterNodeResp {
@@ -382,12 +403,13 @@ impl AutumnManager {
             ec_converted: false,
         };
 
-        {
-            let mut s = self.store.inner.borrow_mut();
-            s.streams.insert(stream_id, stream.clone());
-            s.extents.insert(extent_id, extent.clone());
-        }
-
+        // F152: etcd-first ordering (CLAUDE.md note 1). Mirror to etcd
+        // BEFORE applying to in-memory store. Pre-F152 the inserts at
+        // s.streams / s.extents happened first; a manager crash between
+        // memory-insert and etcd-write left the new leader (post-replay)
+        // without the stream record while the extent files existed on
+        // remote nodes as orphans. F125 fixed the same anti-pattern in
+        // handle_stream_alloc_extent; this handler was missed.
         if let Err(err) = self.mirror_create_stream(&stream, &extent).await {
             return Ok(rkyv_encode(&CreateStreamResp {
                 code: Self::err_to_code(&err),
@@ -395,6 +417,12 @@ impl AutumnManager {
                 stream: None,
                 extent: None,
             }));
+        }
+
+        {
+            let mut s = self.store.inner.borrow_mut();
+            s.streams.insert(stream_id, stream.clone());
+            s.extents.insert(extent_id, extent.clone());
         }
 
         Ok(rkyv_encode(&CreateStreamResp {
@@ -428,13 +456,21 @@ impl AutumnManager {
             }));
         }
 
+        // F152: etcd-first ordering (CLAUDE.md note 1). Compute the new
+        // stream snapshot under a read-only borrow, mirror to etcd, then
+        // apply to memory. Pre-F152 the handler mutated the in-memory
+        // ec_data_shard / ec_parity_shard before the etcd mirror, so a
+        // crash between memory-mutate and etcd-write left the new leader
+        // dispatching the OLD EC shape via ec_conversion_dispatch_loop
+        // while the deposed leader thought it was already updated.
         let stream = {
-            let mut s = self.store.inner.borrow_mut();
-            match s.streams.get_mut(&req.stream_id) {
+            let s = self.store.inner.borrow();
+            match s.streams.get(&req.stream_id) {
                 Some(st) => {
-                    st.ec_data_shard = req.ec_data_shard;
-                    st.ec_parity_shard = req.ec_parity_shard;
-                    st.clone()
+                    let mut updated = st.clone();
+                    updated.ec_data_shard = req.ec_data_shard;
+                    updated.ec_parity_shard = req.ec_parity_shard;
+                    updated
                 }
                 None => {
                     let err = AppError::NotFound(format!("stream {} not found", req.stream_id));
@@ -453,6 +489,19 @@ impl AutumnManager {
                 message: err.to_string(),
                 stream: None,
             }));
+        }
+
+        {
+            let mut s = self.store.inner.borrow_mut();
+            // Apply to memory only after etcd persistence succeeds. If the
+            // stream was concurrently removed (e.g. by a future delete RPC)
+            // the get_mut returns None and we silently skip — the etcd
+            // mirror already wrote the update; replay would resurrect it.
+            // Today no delete-stream path exists so this is unreachable.
+            if let Some(st) = s.streams.get_mut(&req.stream_id) {
+                st.ec_data_shard = stream.ec_data_shard;
+                st.ec_parity_shard = stream.ec_parity_shard;
+            }
         }
 
         Ok(rkyv_encode(&UpdateStreamEcResp {

@@ -167,7 +167,13 @@ Append(AppendReq via autumn-rpc binary frame):
        - If local file len > header.commit:
            * F119-E / F123: first confirm with manager that extent is not sealed
              (if manager says sealed, apply meta + reject with CODE_PRECONDITION)
-           * TRUNCATE file to header.commit (await truncate_to_commit_ref)
+           * TRUNCATE file to header.commit (await truncate_to_commit_ref).
+             F152: `truncate_to_commit` calls `set_len` then `sync_data`
+             before updating `extent.len` — without the fsync, post-crash
+             the file size could be observed at the pre-truncate length
+             (kernel hasn't durably persisted the inode shrink), letting
+             the next `commit_length` probe report a wrong consensus and
+             diverging replicas at the same offset.
            * F146: re-check sealed_length / avali after the truncate await — a
              concurrent apply_extent_meta_durable (from handle_re_avali or
              another append's pre-truncate seal-confirm branch) may have landed
