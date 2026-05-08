@@ -570,6 +570,29 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F168 · Cooperative yield in `do_compact` merge loop (thread-per-core principle enforcement)
+- **Target:** Investigate user-flagged concern — does GC pressure cause heartbeat loss? Audit confirms a real violation of the thread-per-core principle ("compio runtime should never block due to CPU busy") in `do_compact`'s merge loop, even though heartbeat itself is NOT lost.
+- **Audit findings:**
+  - **Heartbeat is NOT lost** during GC/compaction. PS heartbeat_loop is spawned on the PS main thread's compio runtime (`crates/partition-server/src/lib.rs:1118`). GC + compaction run on per-partition P-log runtimes (separate threads). CPU pressure on P-log doesn't block heartbeat on PS-main; the kernel's TCP machinery is independent.
+  - **GC's inline CPU is bounded.** `process_gc_chunk` processes up to `GC_BATCH_RECORDS = 256` records OR `GC_BATCH_BYTES = 4 MiB` per batch (~1 ms inline CPU typical), then awaits `flush_gc_batch`. After each chunk, `gc_yield_now` + rate-limiter sleep. Already cooperatively-scheduled.
+  - **Compaction's inline CPU was NOT bounded.** `do_compact`'s merge loop (`background.rs:840-934`) ran up to `max_chunk = 2 * MAX_SKIP_LIST = 512 MiB` of entries inline (~16M entries at 32 bytes/entry, ~1-2 SECONDS of CPU) before the first chunk-emit `await` released the event loop. This stalled merged_partition_loop, ps-conn, and other tasks on the SAME P-log runtime — client puts/gets to that partition stalled for the full duration. Heartbeat (PS-main, different runtime) was unaffected, but the thread-per-core principle was violated.
+- **Fix:** Add `yield_to_runtime` (renamed from `gc_yield_now`, kept as backwards-compat alias) and call it every `COMPACT_YIELD_EVERY = 1000` entries inside the merge loop. Cost: one poll round-trip per yield, <1 µs amortised against ~100 ns of per-entry encode work — < 1% overhead. Benefit: P-log compio runtime stays responsive throughout compaction; client puts/gets to the same partition no longer stall for 1-2s during major compaction.
+- **What ships:**
+  - `yield_to_runtime` async helper (existing `gc_yield_now` renamed, alias kept for source compatibility)
+  - `COMPACT_YIELD_EVERY` constant (1000 entries) + `entries_since_yield` counter in `do_compact`
+  - Yield call at the bottom of the merge loop body
+- **Files:** `crates/partition-server/src/background.rs` (renamed helper + 2 yield additions), `feature_list.md`, `claude-progress.txt`.
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo build --release --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 122/122 pass.
+  - End-to-end: `cluster.sh reset 1` + 2-key put/get round-trip ok (V1 frame default ON post-F165).
+- **Operational notes:**
+  - The user's hypothesis ("GC pressure causes heartbeat loss") was INCORRECT for autumn-rs's current thread model. Heartbeat is on PS-main, GC/compact on P-log, separate runtimes. Heartbeat won't be lost due to partition-thread CPU pressure.
+  - The user's PRINCIPLE ("compio should never block due to CPU busy") was correct and surfaces a real bug. F168 enforces the principle by yielding every 1000 entries during compaction.
+  - Client put/get latency to a partition undergoing major compaction should now be much steadier — instead of multi-second stalls during merge, latency stays in normal range with brief micro-pauses every 1000 entries (<1 µs each).
+- **passes:** true
+
 ### F167 · Encapsulate the file-replace unsafe with a documented invariant (line 2314)
 - **Target:** Make the line-2314 unsafe (`*entry.file.get() = new_file` during EC commit) — flagged by F166's audit as the third UnsafeCell aliasing concern — explicit and discoverable. The previous inline pattern had no encapsulation; any contributor could write the same pattern at a NEW call site without realising the F153 EC-conversion-lock invariant the existing call site relies on. F167 centralises the unsafe into a clearly-named method on `ExtentEntry` with a full safety contract in the doc-comment.
 - **Why this and not the full Rc<File> migration:** Closing the type-level UB requires migrating `UnsafeCell<CompioFile>` to `RefCell<Rc<CompioFile>>` so the replacement returns the old `Rc` to be dropped only when concurrent readers release their clones. That's ~50-100 LOC across all `file_*` helpers and ~20 call sites — invasive enough to risk regressions in this iteration's budget. The encapsulation+documentation alternative (this F167) makes the invariant explicit and discoverable, so future contributors don't unwittingly reintroduce the pattern at new call sites — without changing the type-level structure. The Rc<File> migration is documented as a future feature (F168 candidate) for when a real failure or bigger consolidation justifies the structural cost.

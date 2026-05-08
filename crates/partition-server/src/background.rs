@@ -824,6 +824,19 @@ pub(crate) async fn do_compact(
     let now = now_secs();
     let max_chunk = 2 * MAX_SKIP_LIST as usize;
 
+    // F168: yield to other tasks on this compio runtime every
+    // COMPACT_YIELD_EVERY entries. Pre-F168 the merge loop ran up to
+    // `max_chunk = 512 MiB` of entries inline (~16M entries, ~1-2s of
+    // CPU) before the chunk-emit `await` released the event loop —
+    // long enough to stall client puts/gets to the same partition
+    // for the entire duration. Heartbeat lives on PS-main (different
+    // runtime) so it wasn't lost, but the thread-per-core principle
+    // was violated. The yield cost is negligible (one poll
+    // round-trip per 1000 entries, which is <1 µs amortised against
+    // ~100ns of per-entry encode work).
+    const COMPACT_YIELD_EVERY: usize = 1000;
+    let mut entries_since_yield: usize = 0;
+
     // Streaming output state. `current_builder` accumulates the in-progress
     // chunk; when its byte budget is exceeded we finalize, append to
     // row_stream, push (TableMeta, Arc<SstReader>) into new_readers, and
@@ -928,6 +941,14 @@ pub(crate) async fn do_compact(
         current_builder.add(&raw_key, raw_op, &raw_value, raw_expires);
         current_size += entry_size;
         entries_kept += 1;
+
+        // F168: cooperative yield to keep the compio runtime responsive
+        // for other tasks (merged_partition_loop, ps-conn, etc.).
+        entries_since_yield += 1;
+        if entries_since_yield >= COMPACT_YIELD_EVERY {
+            yield_to_runtime().await;
+            entries_since_yield = 0;
+        }
     }
 
     valid_discard(&mut discards, &log_extent_ids);
@@ -1208,11 +1229,29 @@ impl GcRateLimiter {
     }
 }
 
-/// F141: cooperative single-step yield. Lets other tasks on this
-/// compio runtime (merged_partition_loop, ps-conn) make forward
-/// progress between back-to-back GC batches even when we'd otherwise
-/// stay runnable through the rate-limiter.
-async fn gc_yield_now() {
+/// F141 / F168: cooperative single-step yield. Lets other tasks on
+/// this compio runtime (merged_partition_loop, ps-conn,
+/// background_flush_loop, etc.) make forward progress between
+/// long stretches of inline CPU work that would otherwise starve
+/// the event loop.
+///
+/// Pattern: `poll_fn` returns `Pending` once after waking itself, so
+/// the runtime polls all OTHER ready tasks before returning to this
+/// one. Lighter-weight than `compio::time::sleep(Duration::ZERO)`
+/// which routes through the timer wheel.
+///
+/// F168 promoted from `gc_yield_now` (was GC-only) to a crate-private
+/// helper and now also called from `do_compact`'s merge loop every
+/// `COMPACT_YIELD_EVERY` entries (1000) — pre-F168 the inline merge
+/// loop ran up to `2 * MAX_SKIP_LIST = 512 MiB` of entries with NO
+/// `.await`, blocking the P-log compio runtime for ~1-2 SECONDS on
+/// large compactions. Client puts/gets to the same partition stalled
+/// for that duration. Heartbeat (PS-main runtime) was unaffected —
+/// it lives on a different thread — but the thread-per-core
+/// principle ("compio runtime should NEVER block due to CPU busy")
+/// was violated. This periodic yield enforces the principle while
+/// keeping the per-yield cost tiny (one poll round-trip).
+async fn yield_to_runtime() {
     let mut yielded = false;
     std::future::poll_fn(|cx| {
         if yielded {
@@ -1224,6 +1263,11 @@ async fn gc_yield_now() {
         }
     })
     .await
+}
+
+/// Backwards-compat alias for the historical name.
+async fn gc_yield_now() {
+    yield_to_runtime().await
 }
 
 /// Flush a non-empty `GcWriteBatch`: send all queued records as ONE
