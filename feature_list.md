@@ -570,6 +570,52 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F178 · LevelDB-style sync coalescing — remove `--nosync`, always durable, fsync at 1-5 ms cadence
+- **Target:** Recover the F142-era throughput regression (pre-F142 130k ops/s → post-F142 89k-100k ops/s on 4K writes) without compromising the durability invariant F142 introduced. F142 added a rotation-trigger `must_sync=true` barrier so that all log_stream bytes referenced by VPs in the about-to-be-flushed memtable are durable BEFORE the flush starts; pre-F142's `sync_stream_tail` separate-RPC pattern had the same intent. The cost: every rotation-triggering batch (~1/s under sustained 70 MB/s write) does a sync_data on the log_stream tail extent. Combined with per-batch must_sync=true on the client-driven sync path, fsync overhead dominates the throughput ceiling on real disks.
+- **Approach (LevelDB-style):** sync at the wire is now a hint, not a guarantee — every append always becomes durable, but the actual `sync_data` syscall is coalesced. A background fsync task on each extent-node aggregates `pending_fsync_offset` across many concurrent appends, fires `sync_data` every 1-5 ms (configurable coalescing window), and wakes all waiters whose `end ≤ synced_high_water` together. This decouples pwrite throughput from fsync rate: 200-1000 fsyncs/sec is enough to drain any reasonable batch volume; pwrites pipeline freely between fsyncs.
+- **Phasing (committed plan, executes across multiple iterations):**
+  - **Phase 1 — extent-node coalescer (core architecture):**
+    - Per-`ExtentEntry`: `last_synced_offset: AtomicU64`, `pending_fsync_offset: AtomicU64`, sync waiter list (`Vec<(end_offset, oneshot::Sender)>`).
+    - `handle_append` / `build_append_future` (batched path): unconditionally `write_vectored_at` (no inline `sync_data`); register the new `(end_offset, oneshot)` into waiter list; nudge the coalescer.
+    - Per-extent coalescer task: `compio::time::sleep(coalesce_window)` → if `pending_fsync_offset > last_synced_offset`: `sync_data` → update `last_synced_offset` → drain waiter list, wake all `(end ≤ synced)` via their oneshots.
+    - Tunable: `AUTUMN_EXTENT_FSYNC_COALESCE_MS` default 2 (range [1, 50]).
+  - **Phase 2 — PS always-sync; flush relies on coalescer high-water:**
+    - `start_write_batch`: drop `triggers_rotation || any_must_sync` logic; `batch_must_sync = true` always.
+    - `flush_one_imm`: no separate fsync barrier needed — the coalesced fsync covers all bytes referenced by VPs in the imm by the time the flush extent_node calls return. The F150 Phase B invariant ("`sync_data` on the rotation batch covers ALL prior dirty pages") still holds because `sync_data` always fsyncs the whole file.
+  - **Phase 3 — wire / client API cleanup:**
+    - Remove `--nosync` flag from `autumn-client put`, `streamput`, `wbench`, `perf-check`.
+    - Remove `must_sync: bool` field from `PutReq`, `AppendReq` (or keep at wire level for back-compat but ignore semantically — TBD by smaller cost).
+    - Remove `--nosync` from `perf_check.sh` (line 253).
+    - Update `wbench` benchmark documentation.
+  - **Phase 4 — validation + cleanup:**
+    - Test sweep: PS lib (122 tests), stream lib (40 tests), manager lib (30 tests), all passing.
+    - Perf benches: 4K p=8 NVMe target ≥ 100k ops/s (recover toward pre-F142 130k); 8M p=8 NVMe target ≥ 1.5 GB/s (preserved or improved).
+    - Update CLAUDE.md (stream + partition-server crate guides + system root).
+- **Why "always durable, no nosync flag":**
+  - Half of the F142 cost was about the rotation-trigger barrier, which is independent of client `--nosync`. Removing client-side nosync doesn't add new fsync cost beyond what F142 already imposed; the coalescer pays it cheaper.
+  - Operational simplicity: one mode of operation, one performance envelope. Production deployments can no longer pick "fast but unsafe" by accident.
+  - LevelDB / RocksDB / etcd / Cassandra commitlog all default to durable; nosync has been a perf-test escape hatch that confused performance comparisons (see F176 audit).
+- **Why coalescing window 1-5 ms specifically:**
+  - 1 ms: fsync rate up to 1000/sec; latency floor 1 ms. Good for low-latency workloads.
+  - 5 ms: fsync rate up to 200/sec; latency floor 5 ms. Good for high-throughput sustained writes.
+  - 2 ms default: matches typical NVMe sync_data cost, keeps pipeline saturated, p99 floor ~5 ms (covers worst-case 2 windows back-to-back).
+- **Out of scope (deferred to future iterations):**
+  - Multi-extent fsync grouping at the kernel level (would need `sync_file_range` or `io_uring` linked SQEs). The per-extent coalescer is sufficient: extent rotates at 3 GB → at 70 MB/s, ~40s/extent → most fsyncs land on the same extent file.
+  - Replacing 3-replica fanout's "wait for slowest" with quorum-2 fast-path (independent optimization; affects p99 but not throughput).
+  - `wbench` / `perf-check` switching to LevelDB-style multi-writer-share-batch model (the merged_partition_loop already implements this server-side via F099-D).
+- **Files touched (planned):**
+  - `crates/stream/src/extent_node.rs`: coalescer state + task + waiter logic + handle_append / build_append_future.
+  - `crates/stream/src/extent_rpc.rs`: (Phase 3) AppendReq schema if removing must_sync.
+  - `crates/stream/src/client.rs`: (Phase 3) StreamClient::append* signature cleanup.
+  - `crates/partition-server/src/background.rs::start_write_batch`: drop rotation-trigger logic (Phase 2).
+  - `crates/server/src/bin/autumn_client.rs`: (Phase 3) drop --nosync flags from put/streamput/wbench/perf-check.
+  - `perf_check.sh`: (Phase 3) drop --nosync from line 253.
+  - `crates/stream/CLAUDE.md`, `crates/partition-server/CLAUDE.md`, `CLAUDE.md`: doc updates.
+- **Verification plan:**
+  - Per-phase: `cargo build --workspace --exclude autumn-fuse`, `cargo test -p {stream,partition-server,manager} --lib`, end-to-end smoke via cluster.sh.
+  - Final: NVMe perf bench p=8 d=8 4K + 8M, both transports — primary metric is 4K write ops/s and p99.
+- **passes:** false (planning entry; flips to true on Phase 4 completion)
+
 ### F177 · WAL encode (CRC32C + memcpy) → spawn_blocking on big batches; zero-copy value segment
 - **Target:** Close the two F176-identified inline CPU sites in `wal_record::encode_v1_segments` so the P-log compio runtime never blocks for hundreds of ms during big-value Put bursts. Same principle as F168/F169/F170 (thread-per-core: never run payload-sized CPU on the runtime).
 - **Two fixes:**
