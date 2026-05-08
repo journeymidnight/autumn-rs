@@ -21,6 +21,18 @@ pub const MAX_PAYLOAD_LEN: u32 = u32::MAX;
 pub const FLAG_RESPONSE: u8 = 0x01;
 pub const FLAG_ERROR: u8 = 0x02;
 pub const FLAG_STREAM_END: u8 = 0x04;
+/// F161 (DEFERRED — see feature_list.md): wire-format flag bit reserved for
+/// the V1 frame format with a per-frame CRC32C trailer. The decoder
+/// supports both V0 (no CRC) and V1 (with CRC verify), but the encoder
+/// currently emits V0 only. F161's audit identified the closure as
+/// valuable defense-in-depth against TCP CRC collisions / NIC offload
+/// bugs / cosmic-ray corruption in hot-path binary frames; enabling V1
+/// requires a careful migration that the F161 prototype attempt
+/// surfaced is non-trivial (the cluster broke when V1 was enabled
+/// unconditionally, root cause not yet isolated). Re-attempt should
+/// add a feature flag, ship the decoder support first, then flip the
+/// encoder under controlled rollout.
+pub const FLAG_CRC: u8 = 0x08;
 
 /// A single RPC frame on the wire.
 #[derive(Debug, Clone)]
@@ -75,6 +87,8 @@ impl Frame {
     }
 
     /// Encode this frame into bytes (header + payload).
+    /// F161 deferred — currently emits V0 (no CRC). Decoder supports both
+    /// V0 (which this produces) and V1 (FLAG_CRC set) for forward compat.
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(HEADER_LEN + self.payload.len());
         buf.put_u32_le(self.req_id);
@@ -106,6 +120,19 @@ impl Frame {
     }
 }
 
+/// F161 (DEFERRED): compute CRC32C over a multi-segment payload by rolling
+/// `crc32c_append`. Returns the 4-byte little-endian trailer to append to
+/// the vectored write. Kept exposed so a future V1-enabling encoder can
+/// use it; currently unused on production paths.
+#[allow(dead_code)]
+pub fn compute_payload_crc(parts: &[Bytes]) -> [u8; 4] {
+    let mut crc: u32 = 0;
+    for p in parts {
+        crc = crc32c::crc32c_append(crc, p);
+    }
+    crc.to_le_bytes()
+}
+
 /// Decode state machine for reading frames from a byte stream.
 pub struct FrameDecoder {
     buf: BytesMut,
@@ -125,6 +152,13 @@ impl FrameDecoder {
 
     /// Try to decode the next complete frame from the buffer.
     /// Returns `None` if not enough data is available yet.
+    ///
+    /// F161: if `flags & FLAG_CRC != 0`, the trailing 4 bytes of the
+    /// announced payload are a CRC32C over the inner payload bytes. The
+    /// CRC is verified before the payload is exposed; mismatch returns
+    /// `FrameError::CrcMismatch` and the corrupted bytes are dropped.
+    /// The exposed payload excludes the CRC trailer (so the inner
+    /// protocol decoders see exactly what the encoder sent).
     pub fn try_decode(&mut self) -> Result<Option<Frame>, FrameError> {
         if self.buf.len() < HEADER_LEN {
             return Ok(None);
@@ -149,7 +183,23 @@ impl FrameDecoder {
         let flags = self.buf[5];
 
         self.buf.advance(HEADER_LEN);
-        let payload = self.buf.split_to(payload_len as usize).freeze();
+        let mut payload = self.buf.split_to(payload_len as usize).freeze();
+
+        if flags & FLAG_CRC != 0 {
+            // F161 (DEFERRED): V1 frame with CRC trailer. Decoder support
+            // is in place for forward compat; encoders currently emit V0
+            // (FLAG_CRC unset) so this branch is dormant in production.
+            if payload.len() < 4 {
+                return Err(FrameError::CrcMissing);
+            }
+            let crc_pos = payload.len() - 4;
+            let stored = u32::from_le_bytes(payload[crc_pos..].try_into().unwrap());
+            let computed = crc32c::crc32c(&payload[..crc_pos]);
+            if stored != computed {
+                return Err(FrameError::CrcMismatch { stored, computed });
+            }
+            payload = payload.slice(..crc_pos);
+        }
 
         Ok(Some(Frame {
             req_id,
@@ -172,6 +222,12 @@ pub enum FrameError {
     PayloadTooLarge(u32),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// F161: V1 frame's announced payload is shorter than the 4-byte CRC trailer.
+    #[error("V1 frame payload too short for CRC trailer")]
+    CrcMissing,
+    /// F161: V1 frame CRC32C does not match the inner payload.
+    #[error("V1 frame CRC mismatch: stored={stored:#010x} computed={computed:#010x}")]
+    CrcMismatch { stored: u32, computed: u32 },
 }
 
 #[cfg(test)]
@@ -219,9 +275,70 @@ mod tests {
         decoder.feed(&encoded[..HEADER_LEN + 50]); // header + half payload
         assert!(decoder.try_decode().unwrap().is_none());
 
-        decoder.feed(&encoded[HEADER_LEN + 50..]); // rest of payload
+        decoder.feed(&encoded[HEADER_LEN + 50..]); // rest of payload + CRC
         let decoded = decoder.try_decode().unwrap().unwrap();
         assert_eq!(decoded.payload, payload);
+    }
+
+    /// F161 (DEFERRED): hand-construct a V1 frame and verify the decoder
+    /// CRC-validates it. Encoder currently emits V0; this test exercises
+    /// the decoder support path that's in place for forward-compat.
+    #[test]
+    fn f161_decoder_v1_round_trip_via_compute_payload_crc() {
+        let p1 = Bytes::from_static(b"hello");
+        let p2 = Bytes::from(vec![0xab; 64]);
+        let p3 = Bytes::from_static(b"world");
+        let parts = vec![p1.clone(), p2.clone(), p3.clone()];
+        let inner_len: usize = parts.iter().map(|p| p.len()).sum();
+
+        // Hand-construct a V1 frame: header (FLAG_CRC set, payload_len = inner+4),
+        // payload, CRC trailer.
+        let mut wire = BytesMut::new();
+        wire.put_u32_le(99); // req_id
+        wire.put_u8(3); // msg_type
+        wire.put_u8(FLAG_CRC); // V1 marker
+        wire.put_u32_le((inner_len + 4) as u32);
+        for p in &parts {
+            wire.extend_from_slice(p);
+        }
+        let crc_bytes = compute_payload_crc(&parts);
+        wire.extend_from_slice(&crc_bytes);
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&wire);
+        let decoded = decoder.try_decode().unwrap().unwrap();
+        assert_eq!(decoded.req_id, 99);
+        assert_eq!(decoded.flags & FLAG_CRC, FLAG_CRC);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&p1);
+        expected.extend_from_slice(&p2);
+        expected.extend_from_slice(&p3);
+        assert_eq!(&decoded.payload[..], &expected[..]);
+    }
+
+    /// F161 (DEFERRED): a V1 frame with a flipped payload byte trips CRC.
+    #[test]
+    fn f161_decoder_rejects_corrupted_v1_payload() {
+        let payload = vec![0u8; 256];
+        let crc = crc32c::crc32c(&payload);
+
+        let mut wire = BytesMut::new();
+        wire.put_u32_le(1); // req_id
+        wire.put_u8(1); // msg_type
+        wire.put_u8(FLAG_CRC);
+        wire.put_u32_le((payload.len() + 4) as u32);
+        wire.extend_from_slice(&payload);
+        wire.put_u32_le(crc);
+
+        // Flip a payload byte.
+        wire[HEADER_LEN + 50] ^= 0x01;
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&wire);
+        match decoder.try_decode() {
+            Err(FrameError::CrcMismatch { .. }) => {}
+            other => panic!("expected CrcMismatch, got {other:?}"),
+        }
     }
 
     #[test]

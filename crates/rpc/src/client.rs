@@ -490,7 +490,11 @@ mod tests {
     /// the >120 s hang in the original repro).
     #[compio::test]
     async fn closed_flag_set_after_peer_disconnect() {
-        let _ = autumn_transport::init();
+        // F161 drive-by: was `autumn_transport::init()` (function removed in
+        // a prior refactor; baseline build failure noted in claude-progress
+        // since F151). The transport is now initialised on first use via
+        // `current_or_init()`.
+        let _ = autumn_transport::current_or_init();
 
         // Bind a server-side listener; accept one connection then drop
         // both halves so the client sees EOF.

@@ -1,102 +1,120 @@
 Date: 2026-05-08
 TaskStatus: completed
-Task scope: F160 — F119-C tightening on handle_copy_extent (close eversion=0
-            silent-skip loophole) + clear Audit 2 #2 (vp_refs concurrent
-            deletion race in handle_stream_punch_holes / handle_truncate)
-            after re-verification.
+Task scope: F161 — Hot-path RPC frame CRC32C audit + decoder support
+            shipped, encoder rollout DEFERRED after a first-attempt
+            cluster break. Drive-by fix: replaced stale
+            `autumn_transport::init()` baseline error with
+            `current_or_init()`.
 
-Why:
-  F119-C closed the `eversion=0 silent-skip` loophole in `handle_read_bytes`
-  and `build_read_future` by dropping the `req.eversion > 0 &&` clause
-  from the eversion comparison. The same loophole still existed in
-  `handle_copy_extent`'s Ok(None) branch (line 3074) and Err(_) branch
-  (line 3086), both used by `run_recovery_task` and `handle_re_avali`.
+Audit (verified 7 surfaces):
+  Hot-path binary RPC frames (Append/ReadBytes/CommitLength) decode
+  by hand without rkyv bytecheck (F155 covered control plane only)
+  and have no application-level CRC. TCP CRC catches most network
+  corruption but leaks ~1 in 10⁸–10¹⁰ corrupt segments past
+  detection (Stone & Partridge 2000); TX/RX checksum offload bugs
+  in NIC drivers can present uncorrected bytes. A flipped bit in
+  AppendReq's `extent_id`/`eversion`/`commit`/`revision` would be
+  silently trusted by `handle_append`'s decoder.
 
-  Production callers fetch ExtentInfo from the manager before dispatch
-  so eversion is normally fresh. But defense-in-depth matters: removing
-  the `> 0 &&` clause closes a future-bug class where uninitialised
-  eversion would bypass the EC-shape mismatch detection and copy shard
-  bytes as if they were full payload (the F119-D corruption shape).
+  Verified surfaces (all in crates/stream/src/extent_rpc.rs +
+  crates/rpc/src/frame.rs):
+    1. AppendReq header (HIGH): wrong extent / fence bypass / data loss
+    2. AppendReq payload (HIGH): wrong bytes written + ack'd
+    3. ReadBytesResp payload (HIGH): wrong bytes returned to client
+    4. CommitLengthResp.length (MED): consensus min poisoned
+    5. Frame payload_len (MED): hang / OOM on bound-less reader
+    6. AppendReq eversion check race (MED): stale eversion accepted
+    7. CommitLengthResp.code (LOW): false success with poisoned length
 
-How:
-  Drop `req.eversion > 0 &&` from both Ok(None) and Err(_) branches of
-  handle_copy_extent. The check now reads simply `if req.eversion < ev`,
-  matching the F119-C invariant.
+Design (per-frame CRC32C V1 wire format):
+  V0 frame: [req_id 4][msg_type 1][flags 1][payload_len 4][payload N]
+  V1 frame: [req_id 4][msg_type 1][flags|FLAG_CRC 1][payload_len=N+4][payload N][crc32c 4]
+  FLAG_CRC = 0x08 (free in current flags byte). Decoder dispatches:
+  V1 → verify CRC + strip trailer; V0 → legacy. Backward-compatible.
 
-Audit 2 #2 cleared:
-  Re-verified the snapshot-and-mutate sequence in
-  crates/manager/src/rpc_handlers.rs:1100-1203 (handle_stream_punch_holes).
-  The whole block runs inside a synchronous closure under one
-  borrow_mut. `needed_addrs` (line 1162-1172) and the in-memory
-  `s.extents.remove` (line 1190) happen in the SAME synchronous scope
-  without any `.await`.
+Status — DEFERRED encoder rollout:
+  First-attempt encoder rollout (Frame::encode + send_vectored both
+  emitting V1) broke the cluster. Bootstrap RPCs (manager-side)
+  worked but PS-side puts failed with `Connection reset by peer`.
+  The autumn-client receiver decoded a `flags=0x01` (V0 RESPONSE)
+  frame from somewhere — meaning a path exists that emits V0
+  responses despite my Frame::encode() always setting FLAG_CRC.
+  Root cause not isolated within this iteration's budget. Reverted
+  the encoder changes; decoder support remains in place.
 
-  After the closure returns, borrow_mut drops; the etcd-mirror await
-  follows. During that await, a concurrent handle_sync_partition_vp_refs
-  cannot increment vp_table_refs on an extent that's already been
-  removed from s.extents (since vp_table_refs is a field on
-  MgrExtentInfo stored in the map; if the extent is gone, the increment
-  silently no-ops, not a corruption).
+  Re-attempt plan (next iteration):
+    - Add an RPC_FRAME_VERSION env var (`v0` default, `v1` opt-in)
+      to gate the encoder.
+    - Trace ALL Frame producers — especially in extent_node.rs and
+      manager rpc_handlers — to confirm every path goes through
+      Frame::encode() (no hand-rolled byte building).
+    - Add an integration test that exercises full client → server
+      → response round-trip with V1 enabled BEFORE flipping the
+      default.
 
-  The agent's claimed race in Audit 2 #2 is not reachable today. NOT a
-  bug. Documented as cleared in feature_list.md.
+What stayed (kept in place for future re-enable):
+  - FLAG_CRC = 0x08 wire flag bit reserved.
+  - Decoder support: try_decode dispatches on FLAG_CRC; CrcMissing
+    + CrcMismatch error variants added.
+  - compute_payload_crc helper for vectored encoders.
+  - 2 new unit tests for the decoder path:
+    * f161_decoder_v1_round_trip_via_compute_payload_crc
+    * f161_decoder_rejects_corrupted_v1_payload
+  - crc32c.workspace = true dep on autumn-rpc crate.
+
+Drive-by fix (kept):
+  crates/rpc/src/client.rs:498 `autumn_transport::init()` was a
+  stale call to a removed function (baseline build error noted in
+  claude-progress.txt since F151). Replaced with
+  `autumn_transport::current_or_init()` so `cargo test -p
+  autumn-rpc --lib` now compiles and passes (was failing pre-F161).
 
 Files modified:
-  - crates/stream/src/extent_node.rs:
-      * handle_copy_extent: drop `> 0 &&` from 2 eversion-check branches
-      * mod f160_copy_extent_eversion_tests: 1 new unit test
-  - feature_list.md: F160 entry + Audit 2 #2 cleared note
+  - crates/rpc/Cargo.toml: added crc32c dep (kept for re-enable)
+  - crates/rpc/src/frame.rs: FLAG_CRC constant + decoder support +
+    compute_payload_crc helper + 2 decoder tests
+  - crates/rpc/src/client.rs: drive-by current_or_init fix
+  - feature_list.md: F161 DEFERRED entry with full audit summary
   - claude-progress.txt: this file
 
 Verification:
   - cargo build --workspace --exclude autumn-fuse: clean.
-  - cargo test -p autumn-stream --lib: 39/39 pass (was 38; +1 new F160
-    test that constructs an extent with eversion=7 and asserts a
-    copy_extent request with eversion=0 returns FailedPrecondition).
+  - cargo test -p autumn-rpc --lib: 10/10 pass (was failing to
+    compile pre-F161 due to baseline init symbol; now passes
+    including 2 new F161 decoder tests).
+  - cargo test -p autumn-stream --lib: 39/39 pass.
   - cargo test -p autumn-manager --lib: 30/30 pass.
   - cargo test -p autumn-partition-server --lib -- --test-threads=1:
     118/118 pass.
+  - End-to-end: cluster.sh reset 1 + 3-key put/get round-trip ok
+    (cluster works on V0 wire format, unchanged from pre-F161).
 
 Out of scope (deferred to future features):
-  - F154 candidate (manager-side ecConversionInFlight etcd persistence)
-    — perf hygiene only after F153 closed corruption.
-  - Cross-replica byte-divergence detection — would require either
-    end-to-end value CRC at API boundary or cross-replica byte
-    comparison at every read; structural.
-  - EC reconstruction integrity — would need shard-level CRC.
+  - F161 encoder rollout (this entry, next iteration).
+  - F154 candidate (manager-side ecConversionInFlight etcd persist)
+    — perf hygiene only.
+  - Cross-replica byte-divergence detection — structural.
+  - EC reconstruction integrity — needs shard-level CRC.
   - sealed_length cross-source consistency — periodic reconciliation.
-  - F157-MED-2 reader-pin protocol — longest deferred structural item.
-    Re-evaluation: MED-2's failure mode is "spurious NotFound" on
-    in-flight Get vs concurrent GC delete (POSIX preserves bytes on
-    open fds; physical delete only on refs+vp_table_refs both 0;
-    extent-node's get_extent returns NotFound after extents.remove —
-    clean error). Severity is availability (occasional read failures
-    during normal GC) more than correctness. Reader-pin would reduce
-    user-visible errors but isn't closing a silent-corruption surface.
+  - F157-MED-2 reader-pin protocol — longest deferred structural.
 
-Pre-existing (NOT caused by F160):
-  - autumn-rpc lib test `init` symbol missing — pre-existing build error.
-  - autumn-manager test ec_integration::replication_stream_works fails
-    on this box both with and without F160.
+Pre-existing (NOT caused by F161):
+  - autumn-manager test ec_integration::replication_stream_works
+    fails on this box both with and without F161.
+  - autumn-rpc lib test `init` symbol — FIXED as drive-by in F161.
 
-Session-level summary (F151-F160 across this loop session):
+Session-level summary update (F151-F161):
   F151: Python bindings asyncio-native
-  F152: 3 etcd-first manager handlers + truncate sync_data
-  F153: per-extent EC conversion lock (post-failover double-dispatch)
-  F154: RETRACTED (was: flush_one_imm_local F148-A invariant violation
-        — re-inspection showed agent over-claim, not a bug)
+  F152: 3× etcd-first manager handlers + truncate sync_data
+  F153: per-extent EC conversion lock (post-failover dispatch)
+  F154: RETRACTED (agent over-claim, not a bug)
   F155: rkyv checked decode (replaces from_bytes_unchecked)
   F156: min-replica commit_length majority quorum
-  F157: extent .meta CRC32C + decode_last_table_locations skip-on-corruption
-  F158: WAL record per-record CRC32C (V1 envelope)
-  F159: save_meta durability + apply_extent_meta_durable ordering fix
+  F157: extent .meta CRC32C + decode_last_table_locations skip
+  F158: WAL record per-record CRC32C V1 envelope
+  F159: save_meta durability + apply_extent_meta_durable order
   F160: handle_copy_extent F119-C tightening + Audit 2 #2 cleared
+  F161: hot-path frame CRC audit + decoder support (encoder DEFERRED)
 
-  Net: 9 verified bugs closed; 5 audit findings cleared; 1 agent
-  over-claim retracted.
-
-Next steps:
-  - Remaining audit candidates require structural change (MED-2 reader
-    pin, cross-replica detection, EC shard CRC, periodic reconciliation)
-    or are perf hygiene (F154 EC CAS). Priority should be
-    operationally-driven from production telemetry.
+  Net: 9 verified bugs closed; 5 audit findings cleared; 2 over-
+  claims retracted (F154 + F161 encoder); 1 drive-by baseline fix.
