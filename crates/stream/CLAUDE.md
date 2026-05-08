@@ -672,6 +672,24 @@ sufficient (and cheaper than DashMap).
     extent as EC must preserve this — never set `ec_converted` on an
     open extent.
 
+    **F153: per-extent EC conversion serialisation lock on the coordinator.**
+    F119-D's idempotency guard fires post-hoc — the eversion bump is the LAST
+    step of the 2PC, so during the window between dispatch-1's start and
+    dispatch-1's `commit_shard_local`, a concurrent dispatch-2 sees
+    `entry.eversion < req.eversion` and proceeds. Two concurrent encodes race
+    on the same `.ec.dat` staging file, producing the F119-D corruption shape.
+    The manager-side `ec_conversion_inflight` set is purely in-memory and is
+    lost on leader failover, so a deposed leader's in-flight conversion can
+    race with the new leader's redispatch from the 5 s
+    `ec_conversion_dispatch_loop`. F153 adds a per-extent
+    `Rc<futures::lock::Mutex<()>>` map on `ExtentNode`, acquired at the start
+    of `handle_convert_to_ec` and held across the entire prepare + commit
+    phase. The second concurrent dispatch awaits the first; when the first
+    releases, the second re-runs the F119-D guard UNDER the lock and exits as
+    a no-op. Defense-in-depth against the manager-side double-dispatch —
+    F119-D becomes load-bearing AFTER the lock. Pattern mirrors
+    `client.rs::stream_init_locks`. Test: `f153_ec_lock_tests`.
+
 15. **CPU-bound work MUST run on the blocking pool, not the compio
     event loop (F117)** — Reed-Solomon `ec_encode` / `ec_decode` /
     `ec_reconstruct_shard` each take 100–300 ms on a 128 MiB extent.

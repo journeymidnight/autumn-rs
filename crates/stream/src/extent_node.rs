@@ -340,6 +340,21 @@ pub struct ExtentNode {
     /// forwarding. `sibling_addrs[i]` is the address of shard `i` on this
     /// host. Empty in single-thread mode.
     sibling_addrs: Rc<Vec<String>>,
+    /// F153: per-extent serialisation lock for `handle_convert_to_ec`. The
+    /// manager-side `ec_conversion_inflight` set is purely in-memory and is
+    /// lost on leader failover; a deposed leader's in-flight EC conversion
+    /// is invisible to the new leader, whose 5 s `ec_conversion_dispatch_loop`
+    /// can fire a SECOND `EXT_MSG_CONVERT_TO_EC` before the first completes.
+    /// F119-D's idempotency guard fires post-hoc (eversion bump is the last
+    /// step of the 2PC), so during the deposed leader's mid-`spawn_blocking`
+    /// `ec_encode` + `write_shard_local` window the guard does not yet
+    /// trigger and two encodes race on the same `.ec.dat` staging file —
+    /// producing corrupted shards or sub-shard-of-sub-shard payloads
+    /// (the F119-D corruption shape). This lock serialises both dispatches
+    /// on the coordinator: the second one waits, then re-runs the F119-D
+    /// guard under the lock and exits as a no-op once the first finishes.
+    /// Pattern mirrors `client.rs::stream_init_locks`.
+    ec_conversion_locks: Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>>,
 }
 
 impl Clone for ExtentNode {
@@ -354,6 +369,7 @@ impl Clone for ExtentNode {
             shard_idx: self.shard_idx,
             shard_count: self.shard_count,
             sibling_addrs: self.sibling_addrs.clone(),
+            ec_conversion_locks: self.ec_conversion_locks.clone(),
         }
     }
 }
@@ -1071,6 +1087,7 @@ impl ExtentNode {
             shard_idx: config.shard_idx,
             shard_count: config.shard_count,
             sibling_addrs: Rc::new(config.sibling_addrs),
+            ec_conversion_locks: Rc::new(RefCell::new(HashMap::new())),
         };
 
         // Load existing extents from all disks.
@@ -3052,6 +3069,24 @@ impl ExtentNode {
             ));
         }
 
+        // F153: serialise concurrent EC conversion dispatches on this
+        // extent. The manager-side `ec_conversion_inflight` set is purely
+        // in-memory and is lost on leader failover; without this lock,
+        // a deposed leader's mid-conversion + new leader's redispatch
+        // could both pass the F119-D guard (because eversion has not yet
+        // bumped) and race on `.ec.dat` writes. The lock entry is created
+        // lazily and lives for the lifetime of the node — bounded by the
+        // number of extents ever EC-converted on this shard, which is
+        // the same bound as the existing `extents` DashMap (~negligible).
+        let convert_lock = {
+            let mut locks = self.ec_conversion_locks.borrow_mut();
+            locks
+                .entry(extent_id)
+                .or_insert_with(|| Rc::new(futures::lock::Mutex::new(())))
+                .clone()
+        };
+        let _convert_guard = convert_lock.lock().await;
+
         let entry = self.get_extent(extent_id).await?;
         let mut sealed_length = entry.sealed_length.load(Ordering::SeqCst);
 
@@ -3059,7 +3094,9 @@ impl ExtentNode {
         // at the post-EC value, a prior 2PC completed successfully
         // (commit_shard_local is the last step, so eversion bump means
         // all phases finished). Return OK so the manager's
-        // apply_ec_conversion_done converges.
+        // apply_ec_conversion_done converges. F153: this re-check now
+        // runs UNDER the per-extent lock, so a serialized second
+        // dispatch reliably observes the post-bump state.
         let local_eversion = entry.eversion.load(Ordering::SeqCst);
         if local_eversion >= req.eversion && sealed_length > 0 && entry.avali.load(Ordering::SeqCst) > 0 {
             tracing::info!(
@@ -3678,5 +3715,71 @@ mod f148_copy_extent_tests {
         assert_eq!(resp.code, CODE_OK);
         assert_eq!(resp.payload.len(), 128);
         assert_eq!(&resp.payload[..], &payload_bytes[..]);
+    }
+}
+
+#[cfg(test)]
+mod f153_ec_lock_tests {
+    use super::*;
+
+    /// F153: per-extent EC conversion lock serialises concurrent dispatches.
+    ///
+    /// Validates the lock plumbing: requesting the same extent's lock twice
+    /// returns the SAME `Rc<Mutex>`, so the second await blocks until the
+    /// first guard drops. Different extent IDs get independent locks.
+    ///
+    /// Full end-to-end concurrent `handle_convert_to_ec` would require peer
+    /// extent nodes for the prepare-fanout phase; this targeted test covers
+    /// the lock semantics in isolation.
+    #[compio::test]
+    async fn ec_lock_serialises_same_extent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
+        let node = ExtentNode::new(config).await.expect("ExtentNode::new");
+
+        // Acquire the lock for extent 9001 the same way handle_convert_to_ec
+        // does — lazy-create + clone.
+        let lock_a = {
+            let mut locks = node.ec_conversion_locks.borrow_mut();
+            locks
+                .entry(9001)
+                .or_insert_with(|| Rc::new(futures::lock::Mutex::new(())))
+                .clone()
+        };
+        let lock_b = {
+            let mut locks = node.ec_conversion_locks.borrow_mut();
+            locks
+                .entry(9001)
+                .or_insert_with(|| Rc::new(futures::lock::Mutex::new(())))
+                .clone()
+        };
+        // Same extent → same Rc<Mutex>.
+        assert!(Rc::ptr_eq(&lock_a, &lock_b), "same extent must share lock");
+
+        // Hold the first guard; the second `try_lock` must fail.
+        let guard_a = lock_a.lock().await;
+        assert!(
+            lock_b.try_lock().is_none(),
+            "second try_lock must fail while first guard is held"
+        );
+        drop(guard_a);
+        // After drop, the second try_lock succeeds.
+        assert!(
+            lock_b.try_lock().is_some(),
+            "second try_lock must succeed after first guard drops"
+        );
+
+        // Different extent IDs get independent locks.
+        let lock_other = {
+            let mut locks = node.ec_conversion_locks.borrow_mut();
+            locks
+                .entry(9002)
+                .or_insert_with(|| Rc::new(futures::lock::Mutex::new(())))
+                .clone()
+        };
+        assert!(
+            !Rc::ptr_eq(&lock_a, &lock_other),
+            "different extents must not share lock"
+        );
     }
 }

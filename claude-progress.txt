@@ -1,134 +1,106 @@
 Date: 2026-05-08
 TaskStatus: completed
-Task scope: F152 — Close 4 verified consistency bugs from a multi-round audit.
-            Lowest-risk subset of the audit's findings (3 etcd-first ordering
-            violations on the manager + 1 missing fsync on stream truncate).
-            ~50 LOC core change + invariant comments. No new RPCs, no new
-            architectural state.
+Task scope: F153 — Close post-failover double EC dispatch race via per-extent
+            serialisation lock on the coordinator (defense-in-depth approach).
+            ~30 LOC core change + invariant comments + 1 unit test.
+            Ships the second item from F152's deferred candidate list.
 
-Audit context:
-  Six Explore agents over two iterations of /loop ("作为一个强一致的分布式系统，
-  还有哪些要修复的？") audited manager / stream / partition-server for
-  consistency-breaking bugs not yet closed by F140-F150. Round 1 produced a
-  Tier 1 list of 3 verified HIGH manager bugs + 1 verified HIGH stream bug;
-  round 2 verified the 3 hypotheses round 1 left open and explored failover-
-  completeness + decoder/cross-replica invariants. Net findings:
-    - 9 verified bugs (4 closed by F152, 5 deferred — see Out-of-scope below)
-    - 5 cleared after investigation (NOT bugs; documented in feature_list.md)
-    - 4 hypotheses still pending verification
+Why:
+  The F152-era multi-round audit verified that the manager's
+  `ec_conversion_inflight` set is purely in-memory and is lost on leader
+  failover. A deposed leader's mid-`spawn_blocking ec_encode` +
+  `write_shard_local` call (per CLAUDE.md note 15, 100-300 ms encode +
+  shard fanout RTTs — easily multi-second) is invisible to the new
+  leader. The new leader's 5 s `ec_conversion_dispatch_loop` re-fires a
+  duplicate `EXT_MSG_CONVERT_TO_EC` for the same extent.
 
-Bugs closed by F152:
+  F119-D's coordinator-side idempotency guard fires post-hoc — the
+  eversion bump is the LAST step of the 2PC (`commit_shard_local` ->
+  rename + save_meta + entry.eversion.store), so during the window
+  between dispatch-1's start and dispatch-1's commit, dispatch-2 sees
+  `entry.eversion < req.eversion` and proceeds. Two concurrent encodes
+  race on the same `.ec.dat` staging file, producing the F119-D
+  corruption shape: `logStream value short: need N got M` on cross-shard
+  VP reads, or `ec_read_full_and_slice: offset N past decoded payload`
+  on SST recovery during partition open.
 
-  Bug 1 — handle_create_stream etcd-first violation
-    File: crates/manager/src/rpc_handlers.rs:385-398
-    Root cause: pre-F152 `s.streams.insert + s.extents.insert` ran BEFORE
-      `mirror_create_stream(...).await`. Manager crash in await window leaves
-      new leader (post-replay_from_etcd) without the stream record while
-      extent files exist on remote nodes as orphans (eventually cleaned by
-      F109/F113 reconcile sweep, but the stream record is lost).
-    Fix: swap order — etcd mirror first, in-memory insert second. Symmetric
-      to F125's fix on `handle_stream_alloc_extent`.
+How (defense-in-depth, not root-cause):
+  Per-extent `Rc<futures::lock::Mutex<()>>` map on `ExtentNode`,
+  acquired at the very start of `handle_convert_to_ec` (before any
+  state inspection), held across the entire prepare + commit phase.
+  The second concurrent dispatch awaits the first; when the first
+  releases, the second re-runs the F119-D guard UNDER the lock — at
+  which point `entry.eversion` IS bumped (the first dispatch's
+  `commit_shard_local` ran while the second was waiting), so the
+  second exits as a no-op. Pattern mirrors `client.rs::stream_init_locks`.
 
-  Bug 2 — handle_update_stream_ec etcd-first violation
-    File: crates/manager/src/rpc_handlers.rs:431-462
-    Root cause: same anti-pattern. Higher impact than #1 because EC params
-      drive `ec_conversion_dispatch_loop` — a crash mid-mirror leaves the new
-      leader dispatching the OLD EC shape while the deposed leader's memory
-      had the new one. Could materialise as `logStream value short` or
-      `ec_read_full_and_slice: offset N past decoded payload` on subsequent
-      reads (the F119-D corruption class).
-    Fix: clone-then-mutate-then-mirror under read borrow, then apply to
-      memory in a fresh `borrow_mut`.
+Architectural choice — why defense alone, not root cause:
+  The full root-cause fix would persist `ecConversionInFlight/$extent_id`
+  to etcd with a create_revision==0 CAS, mirroring the F149
+  `recoveryTasks/$id` pattern. ~150 LOC: new etcd key prefix, dispatch
+  loop CAS, replay rebuild, lease attachment for orphan reaping.
+  Defense alone (this F153) is sufficient for CORRECTNESS: the F119-D
+  guard becomes load-bearing AFTER the lock, so the worst observable
+  behaviour is a wasted RPC round-trip (network + the second
+  dispatch's `entry_info_from_manager` fetch) instead of corrupted
+  shards. Root-cause fix becomes optional perf hygiene; left as F154
+  candidate.
 
-  Bug 3 — handle_register_node etcd-first violation (both branches)
-    File: crates/manager/src/rpc_handlers.rs:186-254
-    Re-reg branch: `existing_node.shard_ports = ...; nodes.insert(...)` ran
-      before `mirror_register_node(&existing_node, &[]).await`.
-    New-node branch: `s.disks.insert + s.nodes.insert` ran inside the same
-      `borrow_mut` that allocated IDs, before `mirror_register_node(&node,
-      &disk_infos).await`.
-    Root cause: shard_ports drives F099-K per-partition routing — a crash
-      mid-mirror routes RPCs to the OLD shard layout until the next
-      heartbeat re-corrects.
-    Fix: both branches reserve IDs upfront, mirror to etcd, then apply to
-      memory in a fresh `borrow_mut`. Wasted IDs from a failed mirror are
-      safe per CLAUDE.md note 5 (`alloc_ids` derives `next_id =
-      max(all_entity_ids) + 1` on replay).
-
-  Bug 4 — truncate_to_commit no fsync after set_len
-    File: crates/stream/src/extent_node.rs:1761-1782
-    Root cause: pre-F152 the function called `file.set_len(commit).await`
-      then `extent.len.store(commit, SeqCst)` with no `sync_data()`. The
-      min-replica commit protocol depends on per-replica `extent.len`
-      matching what the file actually holds on disk — if the node crashes
-      after `set_len` but before any subsequent must_sync append flushes
-      the file's metadata, post-restart the file size could be observed
-      at the pre-truncate length (kernel hasn't durably persisted the
-      inode shrink). Then the next `commit_length` probe reports a wrong
-      consensus, and an append truncates the OTHER replicas back to that
-      wrong value, diverging them at the same offset.
-    Fix: `f.sync_data().await` between `set_len` and the atomic store.
-      fdatasync is sufficient — the file size IS the data we need durable;
-      subsequent appends sync content separately. truncate fires only on
-      commit-reconciliation (rare), so the extra fsync cost is negligible
-      on the hot path.
+Memory footprint:
+  `HashMap<u64, Rc<Mutex>>` grows monotonically with extents ever
+  EC-converted on this shard. ~64 bytes per entry. 10 k extent
+  cluster → ~640 KB per node, same order as the existing `extents`
+  DashMap; not worth GC'ing.
 
 Files modified:
-  - crates/manager/src/rpc_handlers.rs  (handle_create_stream + handle_update_stream_ec
-                                          + handle_register_node both branches; ~80 LOC
-                                          incl invariant comments)
-  - crates/stream/src/extent_node.rs    (truncate_to_commit: + sync_data().await + comment)
-  - feature_list.md                      (F152 entry with cleared / deferred lists)
-  - claude-progress.txt                  (this file)
+  - crates/stream/src/extent_node.rs:
+      * ExtentNode struct: added `ec_conversion_locks` field
+      * Clone impl: clone the new field
+      * `ExtentNode::new`: init empty HashMap
+      * `handle_convert_to_ec`: acquire per-extent lock at start
+      * mod f153_ec_lock_tests: 1 new unit test
+  - feature_list.md: F153 entry with deferred candidates list
+  - claude-progress.txt: this file
 
 Verification:
   - `cargo build --workspace --exclude autumn-fuse`: clean.
-  - `cargo test -p autumn-stream --lib`: 30/30 pass.
+  - `cargo test -p autumn-stream --lib`: 31/31 pass (was 30 pre-F153;
+    +1 new test in `f153_ec_lock_tests::ec_lock_serialises_same_extent`
+    exercising lock semantics — same Rc on same extent, distinct Rc on
+    different extents, try_lock fails while held / succeeds after drop).
   - `cargo test -p autumn-manager --lib`: 30/30 pass.
-  - `cargo test -p autumn-partition-server --lib`: 106 pass parallel / 108 pass serial
-    (--test-threads=1). Same 2 pre-existing F099I parallel-test races as F148/F149/F150
-    baseline; not introduced by F152.
-  - End-to-end smoke: `cluster.sh reset 1` succeeds (exercises handle_register_node
-    re-reg AND new-node branches + handle_create_stream 3× for log/row/meta).
-    `autumn-client put k1 /tmp/v.bin` + `get k1` round-trip ok.
-  - Perf sanity: `perf-check --duration 5 --partitions 1 --pipeline-depth 8 --size 4096`
-    reports 107k ops/s read sustained — within F148-F150 range (90-97k); the extra
-    `sync_data()` on `truncate_to_commit` is rare-fire and does not show up.
-
-Cleared by audit (NOT bugs, kept for future reference):
-  - Unsealed-extent read vs concurrent truncate: F148-B + single-task-per-conn + SeqCst close it.
-  - Stale `revision` reuse after manager failover: per-extent `last_revision` total-orders
-    writers across manager instances; F149 is belt-and-braces.
-  - `recovery_tasks` etcd-write-vs-memory-insert gap: F149 atomic txn closes it.
-  - `partition_vp_refs` RMW post-failover: F149 atomic txn closes it.
-  - Owner-lock revision persistence on extent-node restart: properly loaded from meta sidecar.
+  - End-to-end smoke: `cluster.sh reset 4` (4 nodes, 3+1 EC stream
+    config) bootstrap + 5-key put/get round-trip ok. Bootstrap path
+    exercises non-EC extent allocation. Full EC conversion under load
+    deferred (would need >256 MB writes to seal an extent and trigger
+    the 5 s dispatch tick — outside this iteration's scope; lock
+    semantics already covered by unit test).
 
 Out of scope (deferred to future features):
-  - F153 candidate: `ec_conversion_inflight` not etcd-persisted → post-failover double
-    EC dispatch. F119-D guard fires post-hoc only; the deposed leader's mid-`spawn_blocking`
-    `ec_encode` window is exposed to a duplicate dispatch from the new leader. Fix sketch:
-    new `ecConversionInFlight/$extent_id` etcd key with create_revision==0 CAS, mirroring
-    the F149 `recoveryTasks/$id` pattern.
-  - F154 candidate: `flush_one_imm_local` fallback violates F148-A invariant P3 (verified):
-    `await spawn_blocking + part_sc.append().await` between borrow drop and next
-    `borrow_mut`. Rare path (P-bulk spawn fail). Refactor: capture snapshot tuple
-    synchronously before the await; ~30 LOC.
-  - F155 candidate: rkyv `from_bytes_unchecked` on every wire deserialize + no schema
-    versioning. UB on malformed input. HIGH for rolling upgrades + cosmic-ray-flipped
-    bytes that pass TCP CRC; LOW for restart-all-together with trusted network.
-  - F156 candidate: min-replica `commit_length_for_extent` continues on RPC error →
-    uses `min` of REACHABLE replicas. Could commit at speculative position with only
-    1/N respondents. Needs quorum enforcement + adversarial test first.
-  - F157 candidate: MED-2 `handle_get → resolve_value` vs GC `punch_holes` (deferred
-    since F148): per-extent reader-pin protocol; structural change.
+  - F154 candidate — manager-side `ecConversionInFlight/$extent_id`
+    etcd persistence with create_revision==0 CAS. Would prevent the
+    duplicate dispatch from ever reaching the coordinator; reduces to
+    a perf optimisation now that F153 closes the corruption path.
+  - F155 candidate — `flush_one_imm_local` fallback F148-A invariant
+    violation (verified, rare path: P-bulk spawn fail; ~30 LOC
+    snapshot-before-await refactor).
+  - F156 candidate — rkyv `from_bytes_unchecked` on every wire
+    deserialise + no schema versioning. UB on malformed input. HIGH
+    for rolling upgrades, LOW otherwise.
+  - F157 candidate — min-replica `commit_length_for_extent` continues
+    on RPC error → uses `min` of REACHABLE replicas. Could commit at
+    speculative position with only 1/N respondents. Needs quorum
+    enforcement + adversarial test first.
+  - F158 candidate — MED-2 `handle_get → resolve_value` vs GC
+    `punch_holes` reader-pin protocol; structural change.
 
-Pre-existing (NOT caused by F152):
-  - autumn-manager test ec_integration::replication_stream_works fails on this box both
-    with and without F152; reproduced by `git stash` + re-run on F151 baseline.
+Pre-existing (NOT caused by F153):
+  - autumn-manager test ec_integration::replication_stream_works fails
+    on this box both with and without F153 (same as F151/F152 baseline).
   - autumn-rpc lib test `init` symbol missing (build error). Pre-existing.
 
 Next steps:
-  - Pick one of the F153-F157 candidates above based on operating model priorities.
-    F153 (ec_conversion_inflight persist) is the highest-value next move because it
-    closes a HIGH-class corruption hazard with the lowest architectural cost (single
-    new etcd key + 2 CAS sites).
+  - F154 (etcd CAS for double-dispatch perf hygiene) is the natural
+    follow-up if the wasted-RPC noise becomes measurable in production
+    failover scenarios. Otherwise F155 (flush_one_imm_local refactor)
+    is the next correctness item — verified bug, rare path, ~30 LOC.

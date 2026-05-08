@@ -279,6 +279,20 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
    observed concentration on `{1,3,5}` and is sufficient for
    uniform load over the long run.
 
+    **F153 closes the failover-failure mode of this guard.** F138's
+    `ec_conversion_inflight` set is purely in-memory; on leader failover it is
+    lost. The new leader's `ec_conversion_dispatch_loop` (5 s tick) cannot see
+    that a deposed leader had a conversion in flight, and re-fires
+    `EXT_MSG_CONVERT_TO_EC` for the same extent. The coordinator-side F119-D
+    guard fires post-hoc (after the eversion bump in `commit_shard_local`), so
+    during the deposed leader's mid-`spawn_blocking ec_encode` window the new
+    leader's dispatch passes the guard and races on `.ec.dat`. F153 adds a
+    per-extent `Rc<futures::lock::Mutex<()>>` on the extent-node coordinator
+    (`crates/stream/src/extent_node.rs::handle_convert_to_ec`) so a duplicate
+    dispatch is serialised — the second one re-runs F119-D under the lock and
+    exits as a no-op. Defense-in-depth: F138's manager-side guard remains the
+    primary mechanism in steady-state; F153 closes the failover hole.
+
 10. **F138 `ec_conversion_inflight` extends to an eversion-bump lock.**
     Before F138, `ec_conversion_inflight` only (i) prevented double EC
     dispatch and (ii) inhibited physical extent deletion. F138 extends
