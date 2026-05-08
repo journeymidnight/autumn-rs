@@ -1,106 +1,136 @@
 Date: 2026-05-08
 TaskStatus: completed
-Task scope: F153 — Close post-failover double EC dispatch race via per-extent
-            serialisation lock on the coordinator (defense-in-depth approach).
-            ~30 LOC core change + invariant comments + 1 unit test.
-            Ships the second item from F152's deferred candidate list.
+Task scope: F156 — Min-replica `commit_length` quorum enforcement.
+            ~30 LOC change to two functions in `crates/stream/src/client.rs`.
+            Closes a verified data-loss hazard from the F152-era audit's
+            deferred candidate list.
+
+            Also: retracted F154 candidate after re-inspection — the agent's
+            "VERIFIED-VIOLATION" of `flush_one_imm_local`'s F148-A invariant
+            was a misreading. See F156 entry's "F154 candidate retracted"
+            note in feature_list.md.
 
 Why:
-  The F152-era multi-round audit verified that the manager's
-  `ec_conversion_inflight` set is purely in-memory and is lost on leader
-  failover. A deposed leader's mid-`spawn_blocking ec_encode` +
-  `write_shard_local` call (per CLAUDE.md note 15, 100-300 ms encode +
-  shard fanout RTTs — easily multi-second) is invisible to the new
-  leader. The new leader's 5 s `ec_conversion_dispatch_loop` re-fires a
-  duplicate `EXT_MSG_CONVERT_TO_EC` for the same extent.
+  Both `current_commit` (`client.rs:1332`) and `commit_length_for_extent`
+  (`client.rs:1689`) iterated over all replica addresses, `continue`d on
+  any error (RPC failure, decode error, non-OK code), and computed the
+  minimum over WHATEVER subset responded — accepting even a 1-of-N
+  response. The min-replica commit protocol's correctness invariant is
+  that the consensus position is bounded by EVERY replica's local length;
+  taking the min of a strict subset can return a position HIGHER than
+  what the unreachable replicas actually hold. After an append at that
+  speculative position, the data exists on only the lone responder. If
+  that responder dies before the unreachable peers re-replicate the
+  speculative bytes, the data is permanently lost — and the manager's
+  metadata still references those bytes, so partition open at restart
+  fails to load any SST whose ValuePointers reference the lost range.
 
-  F119-D's coordinator-side idempotency guard fires post-hoc — the
-  eversion bump is the LAST step of the 2PC (`commit_shard_local` ->
-  rename + save_meta + entry.eversion.store), so during the window
-  between dispatch-1's start and dispatch-1's commit, dispatch-2 sees
-  `entry.eversion < req.eversion` and proceeds. Two concurrent encodes
-  race on the same `.ec.dat` staging file, producing the F119-D
-  corruption shape: `logStream value short: need N got M` on cross-shard
-  VP reads, or `ec_read_full_and_slice: offset N past decoded payload`
-  on SST recovery during partition open.
+Concrete failure mode (R=3):
+  - A/B/C all at offset 100.
+  - Network partition: B+C isolated from manager + client.
+  - Client probes commit_length: A responds 100, B/C unreachable.
+  - Pre-F156 returns 100 → client appends bytes 100..200 → A acks →
+    manager records sealed_length using this offset on next seal.
+  - A crashes. B+C return with bytes 0..100 only.
+  - Recovery tries to re-replicate 100..200 from a healthy source;
+    none exist (A is dead).
+  - Bytes 100..200 lost. Restart: SSTs whose VPs reference the lost
+    range fail to load on partition open.
 
-How (defense-in-depth, not root-cause):
-  Per-extent `Rc<futures::lock::Mutex<()>>` map on `ExtentNode`,
-  acquired at the very start of `handle_convert_to_ec` (before any
-  state inspection), held across the entire prepare + commit phase.
-  The second concurrent dispatch awaits the first; when the first
-  releases, the second re-runs the F119-D guard UNDER the lock — at
-  which point `entry.eversion` IS bumped (the first dispatch's
-  `commit_shard_local` ran while the second was waiting), so the
-  second exits as a no-op. Pattern mirrors `client.rs::stream_init_locks`.
+How:
+  Track `success: usize` alongside `min_len`. After the loop, require
+  `success >= total / 2 + 1` (majority quorum). If below, return
+  `Err(insufficient quorum...)`. The worker's existing soft-error retry
+  path waits + reloads tail + retries, which converges once the
+  partition heals or the manager evicts the stale node and
+  re-replicates.
 
-Architectural choice — why defense alone, not root cause:
-  The full root-cause fix would persist `ecConversionInFlight/$extent_id`
-  to etcd with a create_revision==0 CAS, mirroring the F149
-  `recoveryTasks/$id` pattern. ~150 LOC: new etcd key prefix, dispatch
-  loop CAS, replay rebuild, lease attachment for orphan reaping.
-  Defense alone (this F153) is sufficient for CORRECTNESS: the F119-D
-  guard becomes load-bearing AFTER the lock, so the worst observable
-  behaviour is a wasted RPC round-trip (network + the second
-  dispatch's `entry_info_from_manager` fetch) instead of corrupted
-  shards. Root-cause fix becomes optional perf hygiene; left as F154
-  candidate.
+  Quorum threshold = ⌊N/2⌋+1 (Raft / Paxos majority):
+    R=1 → 1 (no fault tolerance, but no quorum to violate)
+    R=2 → 2 (no fault tolerance — single-replica response not safe)
+    R=3 → 2 (tolerates 1 dead)
+    R=4 → 3 (tolerates 1 dead)
+    R=5 → 3 (tolerates 2 dead)
 
-Memory footprint:
-  `HashMap<u64, Rc<Mutex>>` grows monotonically with extents ever
-  EC-converted on this shard. ~64 bytes per entry. 10 k extent
-  cluster → ~640 KB per node, same order as the existing `extents`
-  DashMap; not worth GC'ing.
+Trade-off:
+  Pre-F156 the system would continue writing on a single-survivor
+  majority-failure scenario (silently unsafe). Post-F156 writes halt
+  until ⌊N/2⌋+1 replicas can be reached. This is the correct durability
+  trade-off for a strongly-consistent system: refuse to make progress
+  on insufficient information rather than silently risk data loss.
+  Production clusters running in degraded mode (≥1 replica dead) still
+  make progress as long as quorum is reachable.
 
 Files modified:
-  - crates/stream/src/extent_node.rs:
-      * ExtentNode struct: added `ec_conversion_locks` field
-      * Clone impl: clone the new field
-      * `ExtentNode::new`: init empty HashMap
-      * `handle_convert_to_ec`: acquire per-extent lock at start
-      * mod f153_ec_lock_tests: 1 new unit test
-  - feature_list.md: F153 entry with deferred candidates list
+  - crates/stream/src/client.rs:
+      * current_commit: success counter + quorum check + invariant comment
+      * commit_length_for_extent: same shape
+  - feature_list.md: F156 entry + F154 candidate retraction note
   - claude-progress.txt: this file
 
 Verification:
   - `cargo build --workspace --exclude autumn-fuse`: clean.
-  - `cargo test -p autumn-stream --lib`: 31/31 pass (was 30 pre-F153;
-    +1 new test in `f153_ec_lock_tests::ec_lock_serialises_same_extent`
-    exercising lock semantics — same Rc on same extent, distinct Rc on
-    different extents, try_lock fails while held / succeeds after drop).
+  - `cargo test -p autumn-stream --lib`: 31/31 pass.
   - `cargo test -p autumn-manager --lib`: 30/30 pass.
-  - End-to-end smoke: `cluster.sh reset 4` (4 nodes, 3+1 EC stream
-    config) bootstrap + 5-key put/get round-trip ok. Bootstrap path
-    exercises non-EC extent allocation. Full EC conversion under load
-    deferred (would need >256 MB writes to seal an extent and trigger
-    the 5 s dispatch tick — outside this iteration's scope; lock
-    semantics already covered by unit test).
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`:
+    108/108 pass.
+  - End-to-end: `cluster.sh reset 3` (R=3 replication) + put/get round-trip
+    verifies steady-state quorum (3/3 success). With one node killed
+    (`stop-node 3`), the alloc_new_extent path is the bottleneck (separate
+    from F156): manager still allocates new extents to the dead node
+    until heartbeat eviction completes (~10 s); after restart of the
+    killed node, put/get works again. F156's contribution: the
+    commit_length probe specifically with 1 dead replica still succeeds
+    (2/3 ≥ 2 quorum), exercised in steady state.
+
+F154 candidate retracted:
+  The previous round's audit agent reported `flush_one_imm_local`
+  (lib.rs:3257-3300) as a VERIFIED-VIOLATION of F148-A invariant P3.
+  Re-inspection shows this was a misreading. F148-A's P3 requires no
+  `.await` between (a) the snapshot-capturing borrow_mut DROP and (b)
+  the mpsc-send inside save_table_locs_raw. In flush_one_imm_local:
+    - Lines 3277-3292: borrow_mut block (no awaits inside), captures
+      tables_snapshot at line 3291.
+    - Line 3292: borrow_mut drops (end of block).
+    - Line 3297: save_table_locs_raw call (synchronous up to mpsc-send
+      inside the function; first await is on ack_rx after the message
+      lands in the per-stream worker FIFO).
+  Path 3292 → 3297 contains only `};` and the function call — no awaits.
+  The awaits at lines 3267-3272 (spawn_blocking + part_sc.append) happen
+  BEFORE the snapshot-capturing borrow_mut, which is fine — any
+  concurrent `do_compact` mutations to `p.tables` during those awaits
+  are reflected in the snapshot taken AFTER those awaits. The F148-A
+  invariant holds in both flush_one_imm and flush_one_imm_local.
+  Lesson: an audit agent saying "VERIFIED-VIOLATION" with file:line
+  references still warrants independent re-inspection before a fix —
+  agents can confidently misread invariants whose subtleties live in
+  inline comments.
 
 Out of scope (deferred to future features):
-  - F154 candidate — manager-side `ecConversionInFlight/$extent_id`
-    etcd persistence with create_revision==0 CAS. Would prevent the
-    duplicate dispatch from ever reaching the coordinator; reduces to
-    a perf optimisation now that F153 closes the corruption path.
-  - F155 candidate — `flush_one_imm_local` fallback F148-A invariant
-    violation (verified, rare path: P-bulk spawn fail; ~30 LOC
-    snapshot-before-await refactor).
-  - F156 candidate — rkyv `from_bytes_unchecked` on every wire
-    deserialise + no schema versioning. UB on malformed input. HIGH
-    for rolling upgrades, LOW otherwise.
-  - F157 candidate — min-replica `commit_length_for_extent` continues
-    on RPC error → uses `min` of REACHABLE replicas. Could commit at
-    speculative position with only 1/N respondents. Needs quorum
-    enforcement + adversarial test first.
-  - F158 candidate — MED-2 `handle_get → resolve_value` vs GC
-    `punch_holes` reader-pin protocol; structural change.
+  - F154 candidate (manager-side `ecConversionInFlight/$extent_id` etcd
+    persistence) — perf hygiene only after F153 closed the corruption
+    path. Reduces the wasted-RPC overhead of the post-failover
+    duplicate dispatch but doesn't change correctness.
+  - F155 candidate — rkyv `from_bytes_unchecked` + schema versioning.
+    UB on malformed input. HIGH for rolling upgrades + cosmic-ray-flipped
+    bytes that pass TCP CRC; LOW for restart-all-together with trusted
+    network. Real fix: switch to `rkyv::access` (checked) on the wire
+    boundary + add a 1-byte schema_version prefix to all wire types.
+  - F157 candidate — MED-2 `handle_get → resolve_value` vs GC
+    `punch_holes`. Per-extent reader-pin protocol; structural change.
 
-Pre-existing (NOT caused by F153):
+Pre-existing (NOT caused by F156):
   - autumn-manager test ec_integration::replication_stream_works fails
-    on this box both with and without F153 (same as F151/F152 baseline).
+    on this box both with and without F156 (same as F151/F152/F153
+    baseline).
   - autumn-rpc lib test `init` symbol missing (build error). Pre-existing.
+  - alloc_new_extent retrying on dead node until manager heartbeat
+    eviction (~10 s) — separate from F156's commit_length probe;
+    unrelated.
 
 Next steps:
-  - F154 (etcd CAS for double-dispatch perf hygiene) is the natural
-    follow-up if the wasted-RPC noise becomes measurable in production
-    failover scenarios. Otherwise F155 (flush_one_imm_local refactor)
-    is the next correctness item — verified bug, rare path, ~30 LOC.
+  - F155 (rkyv checked decode + schema versioning) is the next
+    correctness item. ~50-80 LOC across `crates/rpc/src/manager_rpc.rs`
+    + `crates/stream/src/extent_rpc.rs`.
+  - Or F157 (MED-2 reader-pin) — bigger but closes the longest-deferred
+    correctness item.

@@ -1329,8 +1329,19 @@ impl StreamClient {
 
     /// Query commit length from all replicas (min). Called on first append
     /// to an existing extent (commit==0) to avoid truncating pre-existing data.
+    ///
+    /// F156: requires majority quorum to respond before returning the min.
+    /// Pre-F156 the function returned the min of WHATEVER subset responded
+    /// (down to a single replica), which could commit at a position higher
+    /// than what the unreachable replicas actually held — if the lone
+    /// responder then crashed before the unreachable replicas recovered
+    /// those bytes via re-replication, the data was permanently lost.
+    /// Required quorum = ⌊N/2⌋+1 (majority): R=1→1, R=2→2, R=3→2,
+    /// R=4→3, R=5→3. Mirrors Raft/Paxos majority semantics.
     async fn current_commit(&self, tail: &StreamTail) -> Result<u32> {
         let mut min_len: Option<u32> = None;
+        let mut success: usize = 0;
+        let total = tail.replica_addrs.len();
         let revision = self.revision;
         for addr in &tail.replica_addrs {
             let req = CommitLengthReq {
@@ -1347,7 +1358,18 @@ impl StreamClient {
             if resp.code != CODE_OK {
                 continue;
             }
+            success += 1;
             min_len = Some(min_len.map_or(resp.length, |cur| cur.min(resp.length)));
+        }
+        let quorum = total / 2 + 1;
+        if success < quorum {
+            return Err(anyhow!(
+                "insufficient quorum for commit_length on extent {}: got {} of {} (need {})",
+                tail.extent.extent_id,
+                success,
+                total,
+                quorum
+            ));
         }
         min_len.ok_or_else(|| anyhow!("no available replica for commit_length"))
     }
@@ -1686,10 +1708,18 @@ impl StreamClient {
     /// Query commit_length on each replica, return the minimum (the
     /// safe contiguous-prefix end). For open extents only — sealed
     /// extents should read `ExtentInfo.sealed_length` directly.
+    ///
+    /// F156: requires majority quorum to respond — see `current_commit`
+    /// for the rationale. Without a quorum check, the protocol could
+    /// commit at a position only the lone surviving responder held,
+    /// permanently losing data if that responder later died before
+    /// re-replicating to the unreachable peers.
     async fn commit_length_for_extent(&self, ex: &ExtentInfo) -> Result<u32> {
         let addrs = self.replica_addrs_for_extent(ex).await?;
         let revision = self.revision;
         let mut min_len: Option<u32> = None;
+        let mut success: usize = 0;
+        let total = addrs.len();
         for addr in &addrs {
             let req = CommitLengthReq {
                 extent_id: ex.extent_id,
@@ -1705,7 +1735,18 @@ impl StreamClient {
             if resp.code != CODE_OK {
                 continue;
             }
+            success += 1;
             min_len = Some(min_len.map_or(resp.length, |cur| cur.min(resp.length)));
+        }
+        let quorum = total / 2 + 1;
+        if success < quorum {
+            return Err(anyhow!(
+                "insufficient quorum for commit_length on extent {}: got {} of {} (need {})",
+                ex.extent_id,
+                success,
+                total,
+                quorum
+            ));
         }
         min_len.ok_or_else(|| {
             anyhow!(

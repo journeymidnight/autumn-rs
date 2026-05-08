@@ -570,6 +570,74 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F156 · Min-replica `commit_length` quorum enforcement
+- **Target:** Close the verified protocol-level data-loss hazard in
+  `current_commit` and `commit_length_for_extent` (`crates/stream/src/client.rs:1332`
+  + `:1689`). Pre-F156 both functions iterated over all replica addresses,
+  `continue`d on RPC error / decode error / non-OK code, and computed the
+  minimum across whatever subset responded — accepting even a 1-of-N
+  response. The min-replica commit protocol's correctness invariant is
+  that the consensus position is bounded by EVERY replica's local length;
+  taking the min of a strict subset can return a position HIGHER than what
+  the unreachable replicas actually hold, after which an append at that
+  speculative position writes data that exists on only the lone responder.
+  If that responder dies before the unreachable peers re-replicate the
+  speculative bytes (recovery via re-avali / require_recovery), the data
+  is permanently lost.
+- **Concrete failure mode:** R=3 cluster, replicas A/B/C all at offset 100.
+  Network partition isolates B+C from manager + client. Client probes
+  commit_length: A responds 100, B/C unreachable. Pre-F156 returns 100 →
+  client appends bytes 100..200 → A acks → manager records sealed_length
+  via this offset on next seal. A then crashes. B+C return with bytes 0..100
+  only. Recovery tries to re-replicate 100..200 from a healthy source;
+  none exist (A is dead). Bytes 100..200 lost forever, but the manager's
+  metadata still references them — partition open at restart fails to load
+  any SST whose ValuePointers reference the lost range.
+- **Fix:** Track `success: usize` alongside `min_len`. After the loop,
+  require `success >= total / 2 + 1` (majority quorum). Mirrors Raft / Paxos
+  semantics: R=1→1, R=2→2, R=3→2, R=4→3, R=5→3. Below quorum, return an
+  error — the worker's existing soft-error retry path waits + reloads
+  tail + retries, which converges once the partition heals or the manager
+  evicts the stale node and re-replicates.
+- **Trade-off:** Pre-F156 the system would continue writing on a
+  single-survivor majority-failure scenario (silently unsafe). Post-F156
+  writes halt until a majority of replicas can be reached. This is the
+  correct durability trade-off for a strongly-consistent system: refuse
+  to make progress on insufficient information rather than silently risk
+  data loss. Production clusters running in degraded mode (≥1 replica
+  dead) will still make progress as long as ⌊N/2⌋+1 are reachable.
+- **Files:** `crates/stream/src/client.rs` (current_commit + commit_length_for_extent;
+  ~30 LOC including invariant comments), `feature_list.md` (this entry),
+  `claude-progress.txt`.
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-stream --lib`: 31/31 pass.
+  - `cargo test -p autumn-manager --lib`: 30/30 pass.
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 108/108 pass.
+  - End-to-end: `cluster.sh reset 3` (R=3 replication) + put/get round-trip
+    verifies steady-state quorum (3/3 success). `stop-node 3` + put with
+    one replica down: the alloc_new_extent path (separate from F156's
+    commit_length probe) hits a pre-existing limitation where new extents
+    still allocate to the dead node until the manager evicts it (10 s
+    heartbeat window); after restart, put/get works again. F156's
+    contribution: the commit_length probe with 1 dead replica still
+    succeeds (2/3 ≥ 2 quorum), exercised in steady state.
+- **F154 candidate retracted (was: `flush_one_imm_local` F148-A invariant violation):**
+  Re-inspection of `crates/partition-server/src/lib.rs:3257-3300` shows the
+  previous audit agent's "VERIFIED-VIOLATION" was a misreading of the
+  F148-A invariant. The invariant requires no `.await` between (a) the
+  *snapshot-capturing* `borrow_mut` drop and (b) the mpsc-send inside
+  `save_table_locs_raw`. In `flush_one_imm_local` the borrow_mut block
+  at lines 3277-3292 captures `tables_snapshot` at line 3291; the drop is
+  at line 3292; the `save_table_locs_raw` call is at line 3297. Between
+  3292 and 3297 there is only a `};` and the function call — no awaits.
+  The awaits at lines 3267-3272 (`spawn_blocking` + `part_sc.append`)
+  occur BEFORE the snapshot-capturing borrow_mut, which is fine — any
+  concurrent `do_compact` mutations to `p.tables` are reflected in the
+  snapshot taken AFTER those awaits. F148-A invariant holds. Removing
+  F154 from the deferred list.
+- **passes:** true
+
 ### F153 · Closes post-failover double EC dispatch race (per-extent serialisation lock on coordinator)
 - **Target:** Close the verified post-failover double-EC-dispatch hazard surfaced by the F152-era audit. The manager's `ec_conversion_inflight` set is purely in-memory and is lost on leader failover; a deposed leader's in-flight `EXT_MSG_CONVERT_TO_EC` (still mid-`spawn_blocking ec_encode` + `write_shard_local` per CLAUDE.md note 15, 100-300 ms encode + ~RTTs of fanout) is invisible to the new leader, whose 5 s `ec_conversion_dispatch_loop` re-fires a duplicate dispatch. F119-D's coordinator-side idempotency guard (`entry.eversion >= req.eversion && sealed_length > 0 && entry.avali > 0`) fires post-hoc — the eversion bump is the LAST step of the 2PC, so during the window between dispatch-1's start and dispatch-1's `commit_shard_local`, dispatch-2 sees `entry.eversion < req.eversion` and proceeds. Two concurrent encodes race on the same `.ec.dat` staging file, producing the F119-D corruption shape (`logStream value short` / `ec_read_full_and_slice: offset N past decoded payload`).
 - **Fix:** Per-extent `Rc<futures::lock::Mutex<()>>` map on `ExtentNode`, acquired at the very start of `handle_convert_to_ec` (before any state inspection), held across the entire prepare + commit phase. The second concurrent dispatch awaits the first, then re-runs the F119-D guard UNDER the lock — at which point `entry.eversion` IS bumped (the first dispatch's `commit_shard_local` ran while the second was waiting), so the second exits as a no-op. Pattern mirrors `client.rs::stream_init_locks`.

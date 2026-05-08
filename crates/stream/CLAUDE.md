@@ -230,6 +230,8 @@ Step 5 (commit-based truncation) is the key to consistency: it effectively repla
 
 The `StreamClient` computes `commit = min(commit_length on all replicas)` before each append. Any replica that got ahead (e.g., partially acknowledged data before a crash) is truncated back to the consensus point on the next append. Per-node durability comes from `file.sync_all()` on must_sync=true appends (after F150 Phase A- there is no separate WAL file).
 
+**F156: majority quorum required.** `commit_length_for_extent` and `current_commit` (`crates/stream/src/client.rs`) require `success >= ⌊N/2⌋ + 1` replica responses before treating their min as authoritative. Pre-F156 they accepted any subset — even a single response — which could commit at a position only the lone responder held. If that responder then died before re-replicating to the unreachable peers, the data was permanently lost. With quorum: writes halt under majority failure rather than silently risking data loss; degraded operation (≥1 dead but quorum reachable) continues normally.
+
 ### Recovery (`require_recovery` RPC)
 
 Triggered by the manager when a replica node fails:
