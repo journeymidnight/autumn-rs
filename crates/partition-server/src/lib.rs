@@ -1,6 +1,7 @@
 mod background;
 mod rpc_handlers;
 mod sstable;
+mod wal_record;
 
 use background::*;
 use rpc_handlers::dispatch_partition_rpc;
@@ -2938,61 +2939,72 @@ async fn recover_partition(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn encode_record(op: u8, key: &[u8], value: &[u8], expires_at: u64) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(17 + key.len() + value.len());
-    buf.push(op);
-    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&expires_at.to_le_bytes());
-    buf.extend_from_slice(key);
-    buf.extend_from_slice(value);
-    buf
+    // F158: now writes V1 envelope. Used by GC tests (background.rs
+    // gc_streaming_tests) and lib.rs round-trip tests; both verify via the
+    // V1-aware decoders.
+    crate::wal_record::encode_v1(op, key, value, expires_at)
 }
 
 pub(crate) fn decode_records_full(bytes: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>, u64)> {
+    // F158: dispatches per-record on V0 vs V1 envelope; CRC failures on V1
+    // log a WARN and skip past the corrupted record (advance by its declared
+    // length) instead of silently returning truncated state.
     let mut out = Vec::new();
     let mut cursor = 0usize;
-    while cursor + 17 <= bytes.len() {
-        let op = bytes[cursor];
-        cursor += 1;
-        let key_len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-        cursor += 4;
-        let val_len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-        cursor += 4;
-        let expires_at = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-        cursor += 8;
-        if cursor + key_len + val_len > bytes.len() {
-            break;
+    let mut skipped: usize = 0;
+    while cursor < bytes.len() {
+        match crate::wal_record::decode_one(&bytes[cursor..]) {
+            crate::wal_record::DecodeOne::Ok(r) => {
+                out.push((r.op, r.key.to_vec(), r.value.to_vec(), r.expires_at));
+                cursor += r.total;
+            }
+            crate::wal_record::DecodeOne::Incomplete => break,
+            crate::wal_record::DecodeOne::Corrupt { skip_bytes, reason } => {
+                tracing::warn!(
+                    cursor,
+                    skip_bytes,
+                    reason,
+                    "F158: WAL record corrupted; skipping"
+                );
+                cursor += skip_bytes;
+                skipped += 1;
+            }
         }
-        let key = bytes[cursor..cursor + key_len].to_vec();
-        cursor += key_len;
-        let value = bytes[cursor..cursor + val_len].to_vec();
-        cursor += val_len;
-        out.push((op, key, value, expires_at));
+    }
+    if skipped > 0 {
+        tracing::warn!(skipped, "F158: skipped {skipped} corrupted WAL record(s)");
     }
     out
 }
 
 pub(crate) fn decode_records_with_offsets(bytes: &[u8]) -> Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)> {
+    // F158: same shape as decode_records_full but preserves the
+    // record-start offset so callers can compute the recovered VP head.
     let mut out = Vec::new();
     let mut cursor = 0usize;
-    while cursor + 17 <= bytes.len() {
+    let mut skipped: usize = 0;
+    while cursor < bytes.len() {
         let record_start = cursor;
-        let op = bytes[cursor];
-        cursor += 1;
-        let key_len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-        cursor += 4;
-        let val_len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-        cursor += 4;
-        let expires_at = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-        cursor += 8;
-        if cursor + key_len + val_len > bytes.len() {
-            break;
+        match crate::wal_record::decode_one(&bytes[cursor..]) {
+            crate::wal_record::DecodeOne::Ok(r) => {
+                out.push((record_start, r.op, r.key.to_vec(), r.value.to_vec(), r.expires_at));
+                cursor += r.total;
+            }
+            crate::wal_record::DecodeOne::Incomplete => break,
+            crate::wal_record::DecodeOne::Corrupt { skip_bytes, reason } => {
+                tracing::warn!(
+                    record_start,
+                    skip_bytes,
+                    reason,
+                    "F158: WAL record corrupted; skipping"
+                );
+                cursor += skip_bytes;
+                skipped += 1;
+            }
         }
-        let key = bytes[cursor..cursor + key_len].to_vec();
-        cursor += key_len;
-        let value = bytes[cursor..cursor + val_len].to_vec();
-        cursor += val_len;
-        out.push((record_start, op, key, value, expires_at));
+    }
+    if skipped > 0 {
+        tracing::warn!(skipped, "F158: skipped {skipped} corrupted WAL record(s)");
     }
     out
 }

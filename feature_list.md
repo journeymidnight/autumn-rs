@@ -570,6 +570,36 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F158 · WAL record per-record CRC32C (V1 envelope) — closes the last on-disk silent-corruption surface
+- **Target:** Close the WAL-record bit-rot silent-corruption surface (Audit 1 #3 from the data-corruption audit). Pre-F158 each `log_stream` record was `[op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key][value]` (17-byte header + variable payload, no CRC). A single bit flip in the header (especially `key_len` or `val_len`) silently changed how the decoder parsed that record: a corrupted `key_len` caused the decoder to read past the record into the next one's header and insert a garbage MVCC entry into the memtable; a corrupted `val_len` returned wrong value bytes to subsequent VP-resolution reads. The block-level CRC32C inside `crates/partition-server/src/sstable/builder.rs:217` covers SSTable bytes but not the WAL — `log_stream` had no integrity protection at the record granularity.
+- **VP-offset bit-rot question CLEARED.** Audit 1 #4 raised concern about VP offset corruption returning silent wrong bytes. Verified `crates/partition-server/src/sstable/builder.rs:217` — block CRC covers `[entries + offsets + num_entries]`, and VP entries (OP_VALUE_POINTER) are inside `entries`, so the block CRC catches bit rot in stored VP offsets at read time. No fix needed.
+- **Fix:** New `crates/partition-server/src/wal_record.rs` module defines a versioned record codec:
+  - V0 (legacy, pre-F158, 17 + key + value bytes): unchanged on-disk format. Existing log_stream records keep working.
+  - V1 (post-F158, 9 + 17 + key + value bytes): `[0xff sentinel][length:4 LE][V0 payload][crc32c:4 LE]`. The 0xff sentinel is unambiguous because no valid V0 op byte can be 0xff (ops are 1, 2, optionally OR'd with 0x80=OP_VALUE_POINTER, never 0xff). `crc32c` covers `length_bytes || payload_bytes` so a corrupted `length` is caught before its value is trusted.
+  - Decoder dispatches per-record on the first byte: 0xff → V1 with CRC verification; else → V0 legacy. CRC mismatch returns `DecodeOne::Corrupt { skip_bytes, reason }` so the caller logs a WARN and advances past the corrupted record (matches F157's TableLocations skip-on-corruption pattern).
+  - Five call sites updated: `start_write_batch` (background.rs) + the GC re-write encoder (background.rs) emit V1; `decode_records_full` + `decode_records_with_offsets` (lib.rs) + `process_gc_chunk`'s inline decoder (background.rs) all dispatch via the shared codec; `encode_record` (lib.rs, used by tests) now emits V1.
+- **Migration:** Forward-compatible. V1 binaries write V1; V1 decoders accept both V0 (legacy on-disk pre-F158) and V1 (new writes). V0 binaries on V1 data would interpret 0xff as op byte → bounds check probably fails → some records skipped silently. Acceptable for restart-all-together model.
+- **Files:**
+  - `crates/partition-server/src/wal_record.rs` (NEW, ~270 LOC including doc comment + 9 unit tests)
+  - `crates/partition-server/src/lib.rs` (mod registration; encode_record + decode_records_full + decode_records_with_offsets dispatched via codec)
+  - `crates/partition-server/src/background.rs` (start_write_batch encoder + process_gc_chunk decoder + GC re-write encoder; carry_forward_round_trips_to_full_decode test updated for V1 envelope size)
+  - `feature_list.md` (this entry)
+  - `claude-progress.txt`
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-stream --lib`: 38/38 pass.
+  - `cargo test -p autumn-manager --lib`: 30/30 pass.
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 118/118 pass (was 109; +9 new wal_record codec tests covering V1 round-trip, V1 large value, V0 legacy decode, V1 corrupted payload byte caught, V1 corrupted CRC byte caught, V1 corrupted length caught, V1 truncated tail = Incomplete, mixed V1+V0 decode, empty key/value).
+  - End-to-end: `cluster.sh reset 1` → 3 puts (write 3 V1 WAL records to log_stream) → `cluster.sh restart 1` → 3 gets all return correct values (recovery replayed V1 records via the V1-aware decoder).
+- **Out of scope (still deferred):**
+  - F154 candidate (manager-side `ecConversionInFlight` etcd persistence) — perf hygiene only after F153.
+  - EC reconstruction integrity (Audit 1 #5) — would need shard-level CRC; deferred until shard-level transport hardening.
+  - sealed_length cross-source consistency (Audit 1 #6) — periodic reconciliation pass.
+  - vp_refs concurrent deletion race in punch_holes/truncate (Audit 2 #2) — needs deeper code-walk verification.
+  - F119-C incomplete on read path (Audit 2 #4) — needs verification.
+  - MED-2 reader-pin protocol — longest deferred structural item.
+- **passes:** true
+
 ### F157 · Closes 2 silent data-corruption surfaces (extent .meta CRC + TableLocations skip-on-corruption)
 - **Target:** Close two verified silent-corruption surfaces from the data-corruption-focused audit. Both let undetected bit rot or torn writes silently change recovered state without any error logged.
 - **Bug 1 — Extent .meta sidecar has no checksum** (`crates/stream/src/extent_node.rs` save_meta + parse_meta + META_SIZE constants).

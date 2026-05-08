@@ -443,23 +443,27 @@ pub(crate) fn start_write_batch(
             return Ok(None);
         }
 
-        let mut segments: Vec<Bytes> = Vec::with_capacity(valid.len() * 2);
+        // F158: emit V1 envelope per record (sentinel + length + payload + crc32c).
+        // See `crates/partition-server/src/wal_record.rs` for the format.
+        let mut segments: Vec<Bytes> = Vec::with_capacity(valid.len() * 3);
         let mut record_sizes: Vec<u32> = Vec::with_capacity(valid.len());
         for e in &valid {
-            let hdr_size = 17 + e.internal_key.len();
-            let mut hdr_buf = BytesMut::with_capacity(hdr_size);
-            // Write VP flag into WAL for large values so GC can identify them.
-            let wal_op = if e.value.len() > VALUE_THROTTLE { e.op | OP_VALUE_POINTER } else { e.op };
-            hdr_buf.put_u8(wal_op);
-            hdr_buf.put_u32_le(e.internal_key.len() as u32);
-            hdr_buf.put_u32_le(e.value.len() as u32);
-            hdr_buf.put_u64_le(e.expires_at);
-            hdr_buf.extend_from_slice(&e.internal_key);
-            segments.push(hdr_buf.freeze());
+            // VP flag in WAL for large values so GC can identify them.
+            let wal_op =
+                if e.value.len() > VALUE_THROTTLE { e.op | OP_VALUE_POINTER } else { e.op };
+            let (hdr_seg, val_seg, crc_seg) = crate::wal_record::encode_v1_segments(
+                wal_op,
+                &e.internal_key,
+                &e.value,
+                e.expires_at,
+            );
+            let total = hdr_seg.len() + val_seg.len() + crc_seg.len();
+            segments.push(hdr_seg);
             if !e.value.is_empty() {
-                segments.push(e.value.clone());
+                segments.push(val_seg);
             }
-            record_sizes.push((hdr_size + e.value.len()) as u32);
+            segments.push(crc_seg);
+            record_sizes.push(total as u32);
         }
 
         // F150 Phase B: rotation-trigger barrier.
@@ -1415,24 +1419,40 @@ async fn process_gc_chunk(
     batch: &mut GcWriteBatch,
     rate_limiter: &mut GcRateLimiter,
 ) -> Result<usize> {
+    // F158: decode via shared codec — handles both V0 (legacy on-disk) and V1
+    // (post-F158 with CRC). On a V1 CRC failure we log + skip + continue,
+    // matching the recover_partition decoder semantics.
     let mut cursor = 0usize;
-    while cursor + 17 <= buf.len() {
+    while cursor < buf.len() {
         let record_start = cursor;
-        let op = buf[cursor];
-        let key_len = u32::from_le_bytes(buf[cursor + 1..cursor + 5].try_into().unwrap()) as usize;
-        let val_len = u32::from_le_bytes(buf[cursor + 5..cursor + 9].try_into().unwrap()) as usize;
-        let expires_at = u64::from_le_bytes(buf[cursor + 9..cursor + 17].try_into().unwrap());
-        let total = 17usize.saturating_add(key_len).saturating_add(val_len);
-        if cursor.saturating_add(total) > buf.len() {
-            // Incomplete record at chunk tail — caller carries it.
-            break;
-        }
-        let key_start = cursor + 17;
-        let val_start = key_start + key_len;
-        let val_end = val_start + val_len;
-        let key = &buf[key_start..val_start];
-        let value = &buf[val_start..val_end];
-        cursor = record_start + total;
+        let (op, key_owned, value_owned, expires_at) = match crate::wal_record::decode_one(&buf[cursor..]) {
+            crate::wal_record::DecodeOne::Ok(r) => {
+                let op = r.op;
+                let key = r.key.to_vec();
+                let value = r.value.to_vec();
+                let expires_at = r.expires_at;
+                cursor += r.total;
+                (op, key, value, expires_at)
+            }
+            crate::wal_record::DecodeOne::Incomplete => {
+                // Caller carries this partial record into the next chunk.
+                break;
+            }
+            crate::wal_record::DecodeOne::Corrupt { skip_bytes, reason } => {
+                tracing::warn!(
+                    record_start,
+                    skip_bytes,
+                    reason,
+                    "F158: GC encountered corrupted WAL record; skipping"
+                );
+                cursor += skip_bytes;
+                continue;
+            }
+        };
+        let key = key_owned.as_slice();
+        let value = value_owned.as_slice();
+        let val_len = value.len();
+        let _ = expires_at; // used downstream by GcRecord builder
 
         if op & OP_VALUE_POINTER == 0 {
             continue;
@@ -1489,28 +1509,19 @@ async fn process_gc_chunk(
             key_with_ts(&user_key, seq)
         };
 
-        let header_size = 17 + internal_key.len();
-        let mut hdr_buf = BytesMut::with_capacity(header_size);
-        // Match the original GC behaviour: write op=1 (no VP flag in
-        // the WAL header). Recovery's `value.len() > VALUE_THROTTLE`
-        // fallback at lib.rs:2891 still detects this as a VP entry on
-        // replay, since GC only ever rewrites entries that were tagged
-        // VP in the source extent (and therefore have value bytes
-        // larger than VALUE_THROTTLE).
-        hdr_buf.put_u8(1u8);
-        hdr_buf.put_u32_le(internal_key.len() as u32);
-        hdr_buf.put_u32_le(val_len as u32);
-        hdr_buf.put_u64_le(expires_at);
-        hdr_buf.extend_from_slice(&internal_key);
-
-        let header_bytes = hdr_buf.freeze();
-        let value_bytes = Bytes::copy_from_slice(value);
-        let record_size = (header_size + val_len) as u32;
-
-        batch.segments.push(header_bytes);
-        if !value_bytes.is_empty() {
-            batch.segments.push(value_bytes);
+        // F158: GC re-write also emits V1 envelope (sentinel + length +
+        // payload + crc). Match the original GC behaviour of writing op=1
+        // (no VP flag); recovery's `value.len() > VALUE_THROTTLE` fallback
+        // at lib.rs:2891 still detects this as a VP entry on replay, since
+        // GC only ever rewrites entries that were tagged VP in the source.
+        let (hdr_seg, val_seg, crc_seg) =
+            crate::wal_record::encode_v1_segments(1u8, &internal_key, value, expires_at);
+        let record_size = (hdr_seg.len() + val_seg.len() + crc_seg.len()) as u32;
+        batch.segments.push(hdr_seg);
+        if !value.is_empty() {
+            batch.segments.push(val_seg);
         }
+        batch.segments.push(crc_seg);
         batch.bytes = batch.bytes.saturating_add(record_size as u64);
         batch.pending.push(GcRecord {
             user_key,
@@ -2153,9 +2164,15 @@ mod gc_streaming_tests {
 
             let recs_left = decode_records_full(left);
             // Determine consumed prefix length by re-encoding what we just decoded.
+            // F158: post-V1 the envelope adds 9 bytes per record (sentinel + length + crc).
             let consumed: usize = recs_left
                 .iter()
-                .map(|(_op, k, v, _)| 17 + k.len() + v.len())
+                .map(|(_op, k, v, _)| {
+                    crate::wal_record::V1_ENVELOPE_OVERHEAD
+                        + crate::wal_record::PAYLOAD_HEADER
+                        + k.len()
+                        + v.len()
+                })
                 .sum();
             let mut carry = left[consumed..].to_vec();
             carry.extend_from_slice(right);
