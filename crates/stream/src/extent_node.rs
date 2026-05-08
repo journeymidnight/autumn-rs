@@ -319,6 +319,44 @@ pub(crate) struct ExtentEntry {
     pub(crate) disk_id: u64,
 }
 
+impl ExtentEntry {
+    /// F167: replace the file handle in-place. The previous
+    /// `unsafe { *entry.file.get() = new_file }` had no encapsulation;
+    /// any contributor could write the same pattern at a NEW call site
+    /// without realising the F153 EC-conversion-lock invariant the
+    /// existing call site relies on. This helper centralises the unsafe
+    /// + documents the invariant once.
+    ///
+    /// # Safety
+    /// Caller MUST guarantee NO concurrent access to `self.file` for the
+    /// full duration of this call. Specifically:
+    ///   - No other compio task on the same runtime may hold a `&CompioFile`
+    ///     borrow obtained via `unsafe { &*self.file.get() }` (file_pwrite,
+    ///     file_pread, file_ref, etc.).
+    ///   - No other compio task may have a future-pinned write on this file
+    ///     (build_append_future, file_pwrite, file_pwrite_chunked).
+    ///
+    /// In production the only call site is `handle_convert_to_ec`'s commit
+    /// phase, which is serialised against concurrent ec dispatches by
+    /// F153's `ec_conversion_locks` per-extent `futures::lock::Mutex<()>`.
+    /// Concurrent reads (handle_read_bytes / handle_copy_extent) on the
+    /// same extent during EC commit are theoretically possible but in
+    /// practice rejected by F119-C's eversion-mismatch check (the manager
+    /// has bumped eversion before dispatching EC convert; readers with
+    /// the pre-bump eversion get CODE_EVERSION_MISMATCH and refetch).
+    ///
+    /// A FULL fix that closes this type-level UB would migrate
+    /// `UnsafeCell<CompioFile>` to `RefCell<Rc<CompioFile>>` so the
+    /// replacement returns the old `Rc` to be dropped after concurrent
+    /// readers release their clones. ~50-100 LOC across all `file_*`
+    /// helpers and ~20 call sites; deferred to a future feature when
+    /// the structural cost is justified by a real failure (not yet
+    /// observed in production).
+    pub(crate) unsafe fn replace_file_under_lock(&self, new_file: CompioFile) {
+        unsafe { *self.file.get() = new_file }
+    }
+}
+
 // ─── ExtentNode ───────────────────────────────────────────────────────────────
 
 pub struct ExtentNode {
@@ -2333,9 +2371,14 @@ impl ExtentNode {
             .map(|m| m.len())
             .map_err(|e| (StatusCode::Internal, format!("metadata {extent_id}: {e}")))?;
 
-        // Replace the file handle. Safe: single-threaded compio, no
-        // concurrent I/O on this extent during EC commit.
-        unsafe { *entry.file.get() = new_file; }
+        // F167: encapsulated unsafe with documented invariant — see
+        // `ExtentEntry::replace_file_under_lock` for the full safety
+        // contract. The F153 per-extent `ec_conversion_locks`
+        // `futures::lock::Mutex<()>` (acquired at the start of
+        // `handle_convert_to_ec`) is the load-bearing serialisation
+        // mechanism; F119-C's eversion-mismatch reject covers
+        // concurrent reads from stale-cached clients.
+        unsafe { entry.replace_file_under_lock(new_file); }
 
         entry.len.store(shard_len, Ordering::SeqCst);
         // F119-E: sealed_length = original payload length (from manager),
