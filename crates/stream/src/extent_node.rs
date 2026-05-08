@@ -1344,9 +1344,32 @@ impl ExtentNode {
         let crc = crc32c::crc32c(&buf[0..Self::META_SIZE_V0]);
         buf[40..44].copy_from_slice(&crc.to_le_bytes());
 
+        // F159: open + write + fsync. Pre-F159 the helper used
+        // `compio::fs::write` which buffers via the page cache without
+        // calling fsync; the .meta could remain in cache for an
+        // unbounded time and be lost on a host crash. The most acute
+        // failure mode was `apply_extent_meta_durable` writing the new
+        // sealed_length to .meta before fsync'ing .dat — the .meta then
+        // landed on disk via OS background flush, but the must_sync=false
+        // bytes still in .dat's page cache were lost. On restart,
+        // parse_meta returned the new sealed_length while file size of
+        // .dat was shorter, so reads past the durable extent.len returned
+        // EOF or zero-padded bytes. F159 makes save_meta itself durable
+        // and reorders apply_extent_meta_durable to fsync .dat first.
         let disk = self.disk_for(entry.disk_id)?;
-        let BufResult(result, _) = compio::fs::write(disk.meta_path(extent_id), buf.to_vec()).await;
+        let path = disk.meta_path(extent_id);
+        let mut f = compio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .await
+            .map_err(|e| format!("open meta for extent {extent_id}: {e}"))?;
+        let BufResult(result, _) = f.write_all_at(buf.to_vec(), 0).await;
         result.map_err(|e| format!("save meta for extent {extent_id}: {e}"))?;
+        f.sync_data()
+            .await
+            .map_err(|e| format!("sync meta for extent {extent_id}: {e}"))?;
         Ok(())
     }
 
@@ -1819,15 +1842,31 @@ impl ExtentNode {
     ) -> bool {
         let sealed_changed = Self::apply_extent_meta(extent, ex);
         if sealed_changed {
-            let _ = self.save_meta(extent_id, extent).await;
+            // F159: fsync .dat FIRST (data durable), THEN write+fsync .meta
+            // (sealed_length / eversion durable). Pre-F159 the order was
+            // reversed: .meta written first then .dat fsync'd. If the
+            // process crashed in that window, the OS page cache could have
+            // already flushed .meta (44 bytes, well under one sector) while
+            // .dat's must_sync=false bytes were still in page cache and
+            // lost. On restart `parse_meta` returned the NEW sealed_length
+            // while the `.dat` file size was SHORTER; subsequent reads
+            // past the durable `extent.len` returned EOF or zero-padded
+            // bytes — silent corruption that masqueraded as a successful
+            // seal. The corrected order: even if the crash strikes
+            // between the two steps, the worst observable state is "old
+            // .meta + new .dat" which restart treats as still-unsealed
+            // (manager re-applies the seal on next contact). Save_meta
+            // itself was also made durable in F159 (open + write + fsync,
+            // not bare `compio::fs::write`).
             if let Err(e) = file_ref(&extent.file).sync_data().await {
                 tracing::warn!(
                     extent_id,
                     sealed_length = ex.sealed_length,
                     error = %e,
-                    "F143: fsync failed on seal apply — sealed prefix may not be durable",
+                    "F159/F143: fsync of .dat failed before meta save — sealed prefix may not be durable",
                 );
             }
+            let _ = self.save_meta(extent_id, extent).await;
         }
         sealed_changed
     }

@@ -1,81 +1,60 @@
 Date: 2026-05-08
 TaskStatus: completed
-Task scope: F158 — WAL record per-record CRC32C (V1 envelope). Closes the
-            last verified on-disk silent-corruption surface from the
-            data-corruption audit (Audit 1 #3). Also formally clears
-            Audit 1 #4 (VP offset bit-rot) after verifying SST block CRC
-            covers stored VP entries.
+Task scope: F159 — save_meta durability + apply_extent_meta_durable ordering fix.
+            Closes 2 verified data-corruption surfaces from the atomic-ops
+            audit (atomic file/cross-file ordering windows).
+
+Audit context (this iteration):
+  Two parallel Explore agents — read-path corruption + atomic file/cross-file
+  ordering. Read-path audit verdict: codebase mostly clean post-F155-F158.
+  Only 1 HIGH hypothesis (cross-replica byte divergence in
+  read_replicated_with_failover, requires two correlated bit-rot events,
+  deferred). Atomic-ops audit verdict: 2 verified ordering bugs in extent_node.rs
+  + 1 missing fsync in save_meta. F159 ships fixes for both.
 
 Why:
-  Pre-F158 each log_stream record was 17-byte header + variable payload
-  with no CRC. A bit flip in the header silently mis-parsed the record:
-    - Corrupted key_len: decoder reads past the record into the next
-      one's header, treating remainder as next record's data. Insert a
-      garbage MVCC entry into the memtable on recovery replay.
-    - Corrupted val_len: returns wrong value bytes to subsequent
-      VP-resolution reads.
-  The block-level CRC32C in sstable/builder.rs:217 covers SSTable
-  bytes but NOT the WAL — log_stream had no integrity protection at the
-  record granularity. Modern SSDs/NVMe have low (not zero) error rates;
-  ZFS/btrfs catch this at the filesystem layer; ext4 does not.
+  Bug 1 — save_meta not fsync'd (extent_node.rs:1332).
+    Pre-F159 used `compio::fs::write(path, buf)` which writes via the page
+    cache without fsync. The 44-byte V1 .meta could remain page-cached for
+    unbounded time; a host crash before OS background flush would lose the
+    write. On restart, parse_meta returns whatever state .meta had at the
+    previous successful flush — silently rolling back metadata even though
+    F157's CRC trailer is intact (CRC validates against OLD durable bytes,
+    can't detect "stale but valid").
 
-VP-offset CLEARED:
-  Audit 1 #4 raised concern about VP offset corruption returning silent
-  wrong bytes. Verified crates/partition-server/src/sstable/builder.rs:217
-  — block CRC32C covers `[entries + offsets + num_entries]`, and VP
-  entries (OP_VALUE_POINTER) live inside the block's entries section. So
-  a bit flip in a stored VP offset is caught at block read time. No fix
-  needed; documented as cleared in F158's feature_list entry.
+  Bug 2 — apply_extent_meta_durable writes .meta BEFORE fsync'ing .dat
+    (extent_node.rs:1820-1830).
+    Pre-F159 order: (a) update in-memory atomics, (b) save_meta writes .meta,
+    (c) sync_data on .dat. Crash in b→c window: OS may have flushed .meta
+    (44 bytes, well under one sector) while .dat's must_sync=false bytes
+    were still in page cache and lost. On restart parse_meta returned NEW
+    sealed_length while .dat file size was SHORTER — reads past durable
+    extent.len returned EOF or zero-padded bytes, masquerading as
+    successful seal. F143's sync_data was load-bearing but the wrong order
+    made it ineffective.
 
 How:
-  New module `crates/partition-server/src/wal_record.rs` (~270 LOC)
-  defines a versioned record codec:
+  Fix 1 (save_meta): replace `compio::fs::write` with
+    OpenOptions::new().create.truncate.write.open + write_all_at + sync_data.
+    The .meta is always durable on return.
 
-  - V0 (legacy): unchanged on-disk format. Existing log_stream records
-    keep working post-F158.
-  - V1 (post-F158): [0xff sentinel][length:4 LE][V0 payload][crc32c:4 LE]
-    The 0xff sentinel is unambiguous because no valid V0 op byte can
-    be 0xff (ops are 1, 2, optionally OR'd with 0x80=OP_VALUE_POINTER,
-    never 0xff). crc32c covers `length_bytes || payload_bytes` so a
-    corrupted length is caught before its value is trusted.
+  Fix 2 (apply_extent_meta_durable): reorder — fsync .dat FIRST (data
+    durable up to new sealed_length), THEN save_meta (which now also
+    fsyncs .meta). Even if a crash strikes between, the worst observable
+    state is "old .meta + new .dat" which restart treats as still-unsealed;
+    manager re-applies seal on next contact. No silent corruption.
 
-  Decoder dispatches per-record on the first byte:
-    - 0xff → V1 path with CRC verify; mismatch → DecodeOne::Corrupt
-      with skip_bytes (= envelope total) so caller can advance past.
-    - else → V0 legacy path.
-
-  Five call sites updated to use the shared codec:
-    1. start_write_batch (background.rs:447) — emits V1 envelope segments
-    2. GC re-write encoder (background.rs:1509) — emits V1
-    3. decode_records_full (lib.rs:2951) — dispatches via codec
-    4. decode_records_with_offsets (lib.rs:2975) — dispatches via codec
-    5. process_gc_chunk inline decoder (background.rs:1419) — dispatches
-       via codec
-    Plus: encode_record (lib.rs:2940, used by tests) now emits V1.
-
-Migration:
-  Forward-compatible. V1 binaries write V1; V1 decoders accept both
-  V0 (legacy on-disk pre-F158) and V1 (new writes). V0 binaries on V1
-  data would interpret 0xff as op byte → bounds check probably fails →
-  some records skipped silently. Acceptable for restart-all-together
-  model.
+Cost:
+  Each save_meta call now does one extra fsync (the .meta). save_meta runs
+  on owner-revision changes, eversion bumps, seal applies, recovery — all
+  rare events. Negligible perf cost.
 
 Files modified:
-  - crates/partition-server/src/wal_record.rs (NEW, ~270 LOC including
-    9 unit tests)
-  - crates/partition-server/src/lib.rs:
-      * mod wal_record; registration
-      * encode_record: now dispatches to wal_record::encode_v1
-      * decode_records_full: dispatches via wal_record::decode_one
-      * decode_records_with_offsets: same shape
-  - crates/partition-server/src/background.rs:
-      * start_write_batch: emits V1 envelope segments (3 segments per
-        record: header + value + crc)
-      * process_gc_chunk: decodes via shared codec, handles Corrupt
-      * GC re-write batch encoder: emits V1
-      * carry_forward_round_trips_to_full_decode test: updated to use
-        V1 envelope size (V1_ENVELOPE_OVERHEAD + PAYLOAD_HEADER + key + value)
-  - feature_list.md: F158 entry + VP-offset cleared note
+  - crates/stream/src/extent_node.rs:
+      * save_meta: open + write_all_at + sync_data (was compio::fs::write,
+        no fsync)
+      * apply_extent_meta_durable: reorder — sync .dat before save_meta
+  - feature_list.md: F159 entry
   - claude-progress.txt: this file
 
 Verification:
@@ -83,40 +62,45 @@ Verification:
   - cargo test -p autumn-stream --lib: 38/38 pass.
   - cargo test -p autumn-manager --lib: 30/30 pass.
   - cargo test -p autumn-partition-server --lib -- --test-threads=1:
-    118/118 pass (was 109; +9 new wal_record codec tests covering V1
-    round-trip, V1 large value, V0 legacy decode, V1 corrupted payload
-    byte caught, V1 corrupted CRC byte caught, V1 corrupted length
-    caught, V1 truncated tail = Incomplete, mixed V1+V0 decode, empty
-    key/value).
-  - End-to-end: cluster.sh reset 1 → 3 puts (writes 3 V1 WAL records to
-    log_stream) → cluster.sh restart 1 → 3 gets return correct values
-    (recovery replayed V1 records via the V1-aware decoder). Validates
-    full write→sync→crash→recover round-trip.
+    118/118 pass.
+  - End-to-end: cluster.sh reset 1 → 3 puts → cluster.sh restart 1 →
+    3 gets return correct values. Validates the new save_meta path +
+    reordered apply_extent_meta_durable on the seal/recovery code path
+    that runs at PS startup.
+
+Cleared by audit (NOT bugs, kept for reference):
+  - EC stale eversion failover exit (F119-C handles)
+  - SST block CRC verified at read time (cleared)
+  - VP-after-GC bounds (ec_slice_decoded returns Err not panic)
+  - MergeIterator deterministic tie-break (lower iterator index wins)
+  - vp snapshot atomicity at flush_one_imm (single borrow captures both)
+  - vp_head intentional staleness in checkpoint (CLAUDE.md note 5)
+  - F147-B race coverage on apply_extent_meta + handle_append
 
 Out of scope (deferred to future features):
-  - F154 candidate (manager-side ecConversionInFlight etcd persistence)
-    — perf hygiene only after F153 closed the corruption path.
-  - EC reconstruction integrity (Audit 1 #5) — would need shard-level
-    CRC or transport hardening.
-  - sealed_length cross-source consistency (Audit 1 #6) — periodic
-    reconciliation pass.
-  - vp_refs concurrent deletion race in punch_holes/truncate (Audit 2 #2)
-    — needs deeper code-walk verification.
-  - F119-C incomplete on read path (Audit 2 #4) — needs verification.
+  - Cross-replica byte-divergence detection (read-path Audit #1, HIGH but
+    narrow window) — would require either end-to-end value CRC at API
+    boundary or cross-replica byte comparison at every read; structural.
+  - vp_refs sync timing window between compaction publish and manager sync
+    — brief, asymptotic, GC catches up next tick.
+  - F154 candidate (manager-side ecConversionInFlight etcd persistence) —
+    perf hygiene only after F153 closed corruption.
+  - EC reconstruction integrity (Audit 1 #5) — would need shard-level CRC.
+  - sealed_length cross-source consistency (manager vs sidecar vs cache) —
+    periodic reconciliation, structural.
   - F157-MED-2 reader-pin protocol — longest deferred structural item.
 
-Pre-existing (NOT caused by F158):
+Pre-existing (NOT caused by F159):
   - autumn-rpc lib test `init` symbol missing — pre-existing build error.
-  - autumn-manager test ec_integration::replication_stream_works fails
-    on this box both with and without F158.
+  - autumn-manager test ec_integration::replication_stream_works fails on
+    this box both with and without F159.
 
 Next steps:
-  - With F158, the on-disk silent-corruption-surfaces from the data
-    corruption audit are now mostly closed: extent .meta sidecar CRC
-    (F157), TableLocations skip-on-corruption (F157), WAL record CRC
-    (F158), SST block CRC (pre-existing), VP offset (cleared by SST
-    block CRC).
-  - Remaining audit candidates require structural change (MED-2 reader
-    pin, EC shard CRC, periodic sealed_length reconciliation) or
-    verification (vp_refs race, F119-C read path). Pick based on
-    priority.
+  - The on-disk silent-corruption surfaces are now closed: extent .meta
+    CRC + durability (F157 + F159), TableLocations skip-on-corruption
+    (F157), WAL record CRC (F158), apply_extent_meta_durable order fix
+    (F159), SST block + MetaBlock CRC (pre-existing), VP offset (covered
+    by SST block CRC). The remaining audit candidates require structural
+    change or hit narrow windows already mitigated by other layers.
+  - Next high-value targets: F157-MED-2 reader-pin (structural), or
+    operationally-driven items based on production telemetry.
