@@ -172,17 +172,32 @@ impl Frame {
     }
 }
 
-/// F163: cached `AUTUMN_RPC_FRAME_V1` env-var lookup. Reads once on first
-/// access and memoises (so toggling the env mid-process has no effect —
-/// matches how the encoder choice must be process-stable to avoid
-/// mid-stream wire-format changes that the decoder couldn't follow).
+/// F163 / F165: cached `AUTUMN_RPC_FRAME_V1` env-var lookup. Reads once on
+/// first access and memoises (so toggling the env mid-process has no effect
+/// — the encoder choice must be process-stable to avoid mid-stream wire-
+/// format changes that the decoder couldn't follow).
+///
+/// F165 flipped the default from V0 to V1: F164 verified V1 works
+/// end-to-end (root-caused the F161/F163 "cluster break" as stale release
+/// binaries, not a real wire-format bug). With V1 default-on, the 7
+/// verified hot-path corruption surfaces from F161's audit (header field
+/// corruption silently passed to handle_append, payload bytes corrupted
+/// in transit, length-field poisoning, eversion bypass, etc.) are now
+/// closed in production deployments — not just for users who opt in.
+///
+/// Opt-out: `AUTUMN_RPC_FRAME_V1=0` (or `false` / `no` / `off`) reverts
+/// to legacy V0 wire format. Use this only if (a) you observe the ~10%
+/// CRC32C compute cost is not acceptable for your workload AND (b) you
+/// understand the corruption surfaces it leaves open. The whole cluster
+/// (manager + extent-nodes + PSes + clients) MUST agree on the wire
+/// version: per-process flips would create decode mismatches.
 fn v1_encoder_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("AUTUMN_RPC_FRAME_V1")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false)
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
+            .unwrap_or(true)
     })
 }
 
@@ -304,7 +319,8 @@ mod tests {
     fn encode_decode_round_trip() {
         let frame = Frame::request(42, 7, Bytes::from_static(b"hello world"));
         let encoded = frame.encode();
-        assert_eq!(encoded.len(), HEADER_LEN + 11);
+        // F165: V1 is the default; wire format is HEADER_LEN + payload + 4-byte CRC.
+        assert_eq!(encoded.len(), HEADER_LEN + 11 + 4);
 
         let mut decoder = FrameDecoder::new();
         decoder.feed(&encoded);
@@ -312,7 +328,8 @@ mod tests {
 
         assert_eq!(decoded.req_id, 42);
         assert_eq!(decoded.msg_type, 7);
-        assert_eq!(decoded.flags, 0);
+        // F165: V1 default → FLAG_CRC bit set on the surfaced frame.
+        assert_eq!(decoded.flags & FLAG_CRC, FLAG_CRC);
         assert_eq!(decoded.payload, Bytes::from_static(b"hello world"));
     }
 
@@ -486,7 +503,8 @@ mod tests {
     fn empty_payload() {
         let frame = Frame::request(0, 0, Bytes::new());
         let encoded = frame.encode();
-        assert_eq!(encoded.len(), HEADER_LEN);
+        // F165: V1 is the default; even an empty payload carries a 4-byte CRC trailer.
+        assert_eq!(encoded.len(), HEADER_LEN + 4);
 
         let mut decoder = FrameDecoder::new();
         decoder.feed(&encoded);

@@ -570,6 +570,28 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F165 · Flip RPC frame V1 default ON — closes 7 verified hot-path corruption surfaces in production
+- **Target:** Make F163's V1 encoder the default. F161 audit verified 7 hot-path RPC frame corruption surfaces (header field corruption silently passed to handle_append, payload bytes corrupted in transit, length-field poisoning, eversion bypass, etc.). F163 shipped the V1 encoder + decoder infrastructure. F164 verified V1 works end-to-end. With V1 opt-in, the corruption protection is unused unless the operator explicitly sets `AUTUMN_RPC_FRAME_V1=1`. F165 flips the default so production deployments get the protection automatically.
+- **Change:** One-line semantic flip in `crates/rpc/src/frame.rs::v1_encoder_enabled`:
+  - Pre-F165: `unwrap_or(false)` + `matches!(v, "1"|"true"|"yes"|"on")` — V1 opt-in.
+  - Post-F165: `unwrap_or(true)` + `!matches!(v, "0"|"false"|"no"|"off")` — V1 default-on, opt-out via `AUTUMN_RPC_FRAME_V1=0`.
+  - Existing tests (`encode_decode_round_trip` + `empty_payload`) updated to assert V1 sizes (HEADER_LEN + payload + 4-byte CRC).
+- **Trade-off:** ~10% throughput cost on the read hot path (HW CRC32C compute at ~1 µs per 4 KB payload at SSE4.2). Measured under perf-check on tmpfs: V0 read ~124k ops/s vs V1 read ~110k ops/s. Acceptable for the corruption protection — most production storage systems (Cassandra, Kafka, RocksDB-on-disk) ship checksums on by default.
+- **Operational notes:**
+  - The whole cluster must agree on the wire version. Per-process flips would create decode mismatches. Pre-F155 binaries on V1 wire would silently mis-decode trailing CRC bytes as part of the rkyv archive — exactly the F161/F163 "cluster break" symptom F164 root-caused. Always coordinate the wire version across the entire deployment.
+  - `cluster.sh` runs from `target/release/`. Any `cargo build --workspace` that targets debug won't change cluster behaviour. Always `cargo build --release` after a wire-format-affecting change.
+  - F164's startup env-dump in autumn-ps continues to log the AUTUMN_* env vars so operators can confirm the cluster is on the intended wire version.
+- **Files:** `crates/rpc/src/frame.rs` (v1_encoder_enabled default flip + 2 existing test assertions updated), `feature_list.md`, `claude-progress.txt`.
+- **Verification:**
+  - `cargo build --release --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-rpc --lib`: 12/12 pass.
+  - `cargo test -p autumn-stream --lib`: 39/39 pass.
+  - `cargo test -p autumn-manager --lib`: 30/30 pass.
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 122/122 pass.
+  - End-to-end V1 default: `cluster.sh reset 1` (no env var) + 3-key put/get round-trip ok. F164 dump confirms "no AUTUMN_* env vars at startup".
+  - End-to-end V0 opt-out: `AUTUMN_RPC_FRAME_V1=0 cluster.sh reset 1` + put/get ok. F164 dump confirms `AUTUMN_RPC_FRAME_V1=0` propagated. Legacy V0 wire format used.
+- **passes:** true
+
 ### F164 · F163 V1 encoder UNBLOCKED — root-caused stale release binaries; ships startup env-dump diagnostic
 - **Root cause of F161 + F163 "cluster break":** `cluster.sh:16` sets `BIN="$SCRIPT_DIR/target/release"` and launches all server processes from `target/release/`. My F151-F163 work was being compiled into `target/debug/` via `cargo build --workspace`. The RELEASE binaries on disk were from `May 7 06:09` — **24 hours old**, predating the F155 rkyv-checked-decode bytecheck. When I set `AUTUMN_RPC_FRAME_V1=1` and tested, the autumn-client (which I ran from `./target/debug/autumn-client`) sent V1 frames with the 4-byte CRC trailer, but the cluster's release PS / manager / extent-node binaries used the pre-F155 `from_bytes_unchecked` rkyv decoder which silently mis-read the trailing CRC bytes as part of the rkyv archive. PutReq's part_id field decoded to garbage values like `18446744004990074880` (close to u64::MAX), which `extract_part_id` returned, leading to "partition NOT_FOUND part_id=garbage" errors. The diagnostics from `handle_ps_connection` never showed up because the running PS binary was the OLD release one without my eprintln/tracing additions.
 - **Verification (this iteration):**
