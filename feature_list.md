@@ -570,6 +570,45 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F175 · `sealed_length` cross-source consistency audit — CLEARED, no fix needed
+- **Target:** Audit the deferred concern about `sealed_length` divergence between manager state and per-replica extent-node state. Determine whether existing mechanisms cover the consistency invariant or whether a new reconciliation path is required.
+- **Audit findings:**
+  - **Manager is the single authoritative source.** `tail.sealed_length` is set in `handle_stream_alloc_extent` (rpc_handlers.rs:918) and persisted to etcd before in-memory mutation per F125's etcd-first ordering. Replicas learn about a seal via manager-pushed `re_avali` / `apply_extent_meta_durable`, not by reaching consensus among themselves.
+  - **Re-seal protection (F147-D, rpc_handlers.rs:854 `already_sealed` guard):** if `tail.sealed_length > 0` already, `handle_stream_alloc_extent` skips the entire seal block (no commit_length re-query, no overwrite). This prevents the post-EC re-seal corruption shape where a re-issued alloc would clobber `sealed_length` from `original_payload_len` down to `shard_size`.
+  - **Stale-replica reads rejected (F119-C):** if an extent-node's local `eversion` is ahead of the client's request `eversion`, the read is rejected with `CODE_EVERSION_MISMATCH`; the client's 2-attempt retry loop in `read_bytes_from_extent` invalidates its cache and refetches `ExtentInfo`. Sealed bumps eversion, so any sealed_length divergence is also an eversion divergence — F119-C is the load-bearing protection.
+  - **Replica catch-up (recovery_dispatch_loop, recovery.rs:277):** every 2 s the manager probes each replica's `commit_length`. A laggard replica (e.g., one that missed the seal RPC) is brought up to `sealed_length` via `re_avali` (extent_node.rs `handle_re_avali`).
+  - **Persistent .meta integrity (F157):** post-F157, the .meta sidecar carries a CRC32C trailer; corrupted on-disk metadata is rejected on load instead of returning stale `sealed_length`. The recovery path falls back to fresh metadata from the manager.
+- **Conclusion:** the divergence cases are already handled by layered defenses (manager-authoritative, F147-D re-seal guard, F119-C eversion read reject, recovery_dispatch_loop catch-up, F157 .meta CRC). No additional reconciliation loop or invariant check is needed in this iteration.
+- **What we explicitly did NOT add (and why):**
+  - A periodic manager-side scan that compares `MgrExtentInfo.sealed_length` against each replica's `.meta` sidecar would be ~150 LOC of new RPC + dispatch loop. The above mechanisms already converge replicas back to the manager's truth on a 2 s tick. A scan would only catch the brief race window between a seal and the next recovery tick — already invisible to clients via F119-C.
+  - A read-side sealed_length consistency check (server-side reject if local sealed_length < requested offset) would duplicate F119-C semantics on a different axis. F119-C already covers it indirectly via the eversion bump.
+- **Files:** `feature_list.md`, `claude-progress.txt`. (No code changes.)
+- **passes:** true (audit-cleared)
+
+### F173 · Persist `ec_conversion_inflight` to etcd (defense-in-depth across leader failover)
+- **Target:** Close the remaining `ec_conversion_inflight` failover-window concern flagged in F154's deferred footnote. F138's eversion-bump-lock semantics ("while extent X ∈ `ec_conversion_inflight`, no other manager-side mutator may bump `ex.eversion`") only hold within a single leader's lifetime — the HashSet was purely in-memory. On leader failover the new leader's set was empty, so its `recovery_dispatch_loop` could fire `re_avali` / `require_recovery` on an extent the deposed leader was actively converting. Downstream defenses (F119-D coordinator idempotency, F153 extent-node per-extent EC lock, F119-C read-side eversion check) made the race non-corrupting in practice, but each fires post-hoc — F173 closes the window at the source.
+- **Approach:** persist a marker key per in-flight extent.
+  - `persist_ec_conversion_inflight(extent_id)`: `etcd PUT ecConversionInflight/{id}` with empty value (existence is the signal). Called BEFORE the `EXT_MSG_CONVERT_TO_EC` RPC dispatch in `ec_conversion_dispatch_loop`. On failure to persist, skip this extent and retry on the next tick.
+  - `unpersist_ec_conversion_inflight(extent_id)`: `etcd DELETE ecConversionInflight/{id}`. Called AFTER `apply_ec_conversion_done` (success path) or RPC failure. Lingering markers are harmless — `recovery_dispatch_loop` skips the extent for one extra tick, then `ec_conversion_dispatch_loop` re-fires the convert path which is idempotent (F119-D).
+  - `replay_from_etcd`: scan `ecConversionInflight/` prefix and repopulate `ec_conversion_inflight: HashSet<u64>` BEFORE the leader-key flip completes. The new leader's first `recovery_dispatch_loop` tick observes the markers and skips those extents.
+- **Why both etcd persistence (F173) and extent-node lock (F153) are needed:**
+  - F153 catches a CONCURRENT dispatch race: deposed leader's encode is mid-flight when new leader re-fires. The per-extent `futures::lock::Mutex` on the extent-node serialises so the second dispatch waits, then F119-D's eversion-check makes it a no-op.
+  - F173 catches the BROADER recovery race: deposed leader's EC dispatch may have completed on the coordinator (shards on disk, eversion bumped to X+1), but `apply_ec_conversion_done` never ran in etcd (manager state still has eversion X, not-converted). New leader's `recovery_dispatch_loop` would observe the eversion mismatch via `commit_length` probe and dispatch `require_recovery` — F173's marker tells the new leader to skip this extent until the next `ec_conversion_dispatch_loop` re-enters the convert path (which is idempotent and converges manager state).
+- **Cost:**
+  - 1 extra etcd PUT per EC dispatch (under the F149 `txn_fenced` leader-fence protocol).
+  - 1 extra etcd DELETE per completion.
+  - 1 extra `get_prefix("ecConversionInflight/")` per leader take-over (replay).
+  - At cluster steady-state with sparse EC traffic (~few extents converting per minute), this is sub-percent overhead on etcd.
+- **Files:** `crates/manager/src/lib.rs` (3 etcd helpers + replay hook + ec_conversion_inflight populate), `crates/manager/src/recovery.rs` (persist before dispatch + unpersist after apply), `feature_list.md`, `claude-progress.txt`.
+- **Verification:**
+  - `cargo build -p autumn-manager`: clean.
+  - `cargo build --release --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-manager --lib`: 30/30 pass.
+- **Operational notes:**
+  - Markers are NEVER long-lived in steady state — they live only for the duration of a single EC conversion (typically seconds). A node-startup race could theoretically observe stale markers from a hung/crashed prior leader, but the next `ec_conversion_dispatch_loop` tick re-enters the path and clears them via `unpersist_ec_conversion_inflight` after F119-D's idempotent return.
+  - The marker format is intentionally minimal (empty value). If future iterations need to record richer state (target_nodes, new_eversion, dispatch timestamp) for observability or smarter recovery, the schema can be extended without changing the existence-as-marker invariant — readers that don't understand the new fields just see the marker and skip the extent.
+- **passes:** true
+
 ### F172 · Manager dispatch-loop CPU audit — pre-filter + hoist redundant clones
 - **Target:** Continue the thread-per-core audit, this iteration on the manager. The manager runs ~7 background dispatch loops on a single compio runtime alongside its 18 RPC handlers (heartbeat, register_ps, get_regions, mutating handlers, etc.). Any inline CPU work between awaits in a dispatch loop blocks all RPC handlers + sibling loops on the same runtime. Audit identified two concrete inefficiencies; the rest are clean.
 - **Audit findings (cleared, no fix needed):**

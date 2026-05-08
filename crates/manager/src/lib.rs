@@ -539,6 +539,11 @@ impl AutumnManager {
         let partition_vp_refs = c.get_prefix("partitionVpRefs/").await?;
         let ps_nodes = c.get_prefix("psNodes/").await?;
         let regions = c.get_prefix("regions/").await?;
+        // F173: replay ec_conversion_inflight markers so the new leader
+        // sees the deposed leader's in-flight EC conversions and skips
+        // them in recovery_dispatch_loop until the next
+        // ec_conversion_dispatch_loop tick re-enters the convert path.
+        let ec_inflight = c.get_prefix("ecConversionInflight/").await?;
         drop(c);
 
         let mut max_id = 0u64;
@@ -625,6 +630,13 @@ impl AutumnManager {
             decoded_regions.insert(id, region);
         }
 
+        // F173: parse extent_ids from `ecConversionInflight/` keys.
+        let mut decoded_ec_inflight: HashSet<u64> = HashSet::new();
+        for kv in &ec_inflight.kvs {
+            let id = Self::parse_id_from_key("ecConversionInflight/", &kv.key)?;
+            decoded_ec_inflight.insert(id);
+        }
+
         {
             let mut s = self.store.inner.borrow_mut();
             s.nodes = decoded_nodes;
@@ -640,6 +652,12 @@ impl AutumnManager {
             s.next_id = s.next_id.max(max_id.saturating_add(1));
         }
         *self.recovery_tasks.borrow_mut() = decoded_tasks;
+        // F173: install the EC-inflight markers BEFORE the leader-key
+        // flip completes its caller (try_become_leader). Without this
+        // hook, the very first tick of the new leader's
+        // recovery_dispatch_loop could fire on extents the prior leader
+        // was converting.
+        *self.ec_conversion_inflight.borrow_mut() = decoded_ec_inflight;
 
         Ok(())
     }
@@ -1212,6 +1230,53 @@ impl AutumnManager {
             let value = rkyv_encode(extent).to_vec();
             etcd.put_msgs_txn(vec![(format!("extents/{}", extent.extent_id), value)])
                 .await?;
+        }
+        Ok(())
+    }
+
+    /// F173: persist a marker that extent X is currently mid-EC-conversion
+    /// from THIS leader's perspective. Called BEFORE the
+    /// `EXT_MSG_CONVERT_TO_EC` RPC is dispatched. If this leader dies
+    /// mid-flight, the new leader's `replay_from_etcd` repopulates
+    /// `ec_conversion_inflight` from the prefix, preserving the F138
+    /// eversion-bump-lock semantics across the failover boundary.
+    ///
+    /// Pre-F173 the `ec_conversion_inflight` HashSet was purely
+    /// in-memory; on leader failover the new leader's set was empty,
+    /// and `recovery_dispatch_loop` could fire `re_avali` /
+    /// `require_recovery` on extents the deposed leader was actively
+    /// converting. The downstream defenses (F119-D coordinator
+    /// idempotency, F153 extent-node per-extent EC lock, F119-C
+    /// read-side eversion check) made the race non-corrupting in
+    /// practice, but each defense fires post-hoc — F173 closes the
+    /// window at the source.
+    ///
+    /// The marker value is empty (existence is the signal).
+    async fn persist_ec_conversion_inflight(&self, extent_id: u64) -> Result<(), AppError> {
+        if let Some(etcd) = &self.etcd {
+            etcd.put_msgs_txn(vec![(
+                format!("ecConversionInflight/{}", extent_id),
+                Vec::new(),
+            )])
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// F173: clear the EC-inflight marker after `apply_ec_conversion_done`
+    /// completes (or after the dispatch RPC returns failure — in either
+    /// case the conversion is no longer in flight from this leader).
+    /// On failure to clear etcd (network blip), the marker is harmless
+    /// — it just causes an extra `recovery_dispatch_loop` skip on the
+    /// next tick, and the next `ec_conversion_dispatch_loop` re-fires
+    /// the convert path which is idempotent (F119-D).
+    async fn unpersist_ec_conversion_inflight(&self, extent_id: u64) -> Result<(), AppError> {
+        if let Some(etcd) = &self.etcd {
+            etcd.put_and_delete_txn(
+                Vec::new(),
+                vec![format!("ecConversionInflight/{}", extent_id)],
+            )
+            .await?;
         }
         Ok(())
     }

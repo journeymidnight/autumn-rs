@@ -700,6 +700,19 @@ impl AutumnManager {
                 target_nodes.truncate(total_shards);
                 target_addrs.truncate(total_shards);
 
+                // F173: persist the inflight marker to etcd BEFORE
+                // dispatching the EC RPC. If we fail to persist, skip
+                // this extent — the next tick will retry. The
+                // `ec_conversion_inflight` HashSet update happens only
+                // after etcd ack, so a deposed-leader crash mid-persist
+                // leaves no stale memory state on the dead instance and
+                // the new leader sees no marker.
+                if let Err(e) = self.persist_ec_conversion_inflight(extent_id).await {
+                    tracing::warn!(
+                        "F173: failed to persist ec_conversion_inflight for extent {extent_id}: {e}; will retry next tick"
+                    );
+                    continue;
+                }
                 self.ec_conversion_inflight
                     .borrow_mut()
                     .insert(extent_id);
@@ -786,6 +799,16 @@ impl AutumnManager {
 
                 // Release the lock only after apply completes (or after RPC failure).
                 self.ec_conversion_inflight.borrow_mut().remove(&extent_id);
+                // F173: clear the etcd marker AFTER apply (or RPC fail).
+                // A lingering marker is harmless — recovery_dispatch_loop
+                // skips the extent for one extra tick, then the next
+                // ec_conversion_dispatch_loop fires and F119-D
+                // idempotency on the coordinator handles the redispatch.
+                if let Err(e) = self.unpersist_ec_conversion_inflight(extent_id).await {
+                    tracing::warn!(
+                        "F173: failed to clear ec_conversion_inflight marker for extent {extent_id}: {e}; will be cleaned up on next conversion or restart"
+                    );
+                }
             }
         }
     }

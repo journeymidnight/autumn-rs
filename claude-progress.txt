@@ -1,91 +1,94 @@
 Date: 2026-05-08
 TaskStatus: completed
-Task scope: F172 — Manager dispatch-loop CPU audit. Two concrete
-            inefficiencies fixed; the rest of the dispatch loops
-            cleared as already-clean.
+Task scope: F173 (etcd-persist ec_conversion_inflight) + F175
+            (sealed_length consistency audit, cleared no-fix). First
+            two of the deferred items requested by the user this
+            iteration. F174 (EC shard-level CRC) and F176 (perf
+            bench) deferred to the next /loop iteration.
 
-Why:
-  The manager runs ~7 background dispatch loops on a single compio
-  runtime alongside its 18 RPC handlers (heartbeat_ps, register_ps,
-  get_regions, mutating handlers). Any inline CPU work between
-  awaits in a dispatch loop blocks all RPC handlers + sibling loops
-  on the same runtime — same thread-per-core principle the
-  partition-server side enforces post-F168/F169/F170.
+F175 — sealed_length cross-source consistency:
+  Audit-cleared, no fix. Defenses already in place:
+    - Manager is single authoritative source (etcd-first ordering)
+    - F147-D `already_sealed` guard prevents re-seal clobber
+    - F119-C eversion read-reject covers stale-replica reads
+    - recovery_dispatch_loop catches up laggards via re_avali
+    - F157 .meta CRC32C protects on-disk sealed_length
 
-Audit findings (cleared, no fix needed):
-  - ec_conversion_dispatch_loop (recovery.rs:586-610): already
-    filters under borrow before cloning candidates. Good pattern.
-  - extent_delete_loop (extent_delete.rs:50): drains queue then
-    sequential per-replica RPC. Each RPC awaited.
-  - ps_liveness_check_loop (lib.rs:791): filter under borrow,
-    only `dead_ps: Vec<u64>` clones cross the await.
-  - recovery_collect_loop (recovery.rs:378): only clones small
-    `s.nodes` map; per-node RPC dispatch with awaits.
-  - disk_status_update_loop, leader_keepalive_loop,
-    leader_election_loop: small constant work per tick.
-  - rebalance_regions: O(parts × PS), bounded ~10 ms at 10K × 100,
-    accepted.
-  - replay_from_etcd: startup-only.
+F173 — Persist ec_conversion_inflight to etcd:
+  Why:
+    F138's eversion-bump-lock semantics ("while X ∈
+    ec_conversion_inflight, no other mutator bumps eversion") only
+    hold within a single leader's lifetime — the HashSet was purely
+    in-memory. On leader failover the new leader's set was empty,
+    and recovery_dispatch_loop could fire re_avali /
+    require_recovery on extents the deposed leader was actively
+    converting. F119-D + F153 + F119-C made the race non-corrupting
+    in practice, but each fires post-hoc — F173 closes the window
+    at the source.
 
-Fixes:
-  F172-A — recovery_dispatch_loop snapshot pre-filter:
-    Pre-F172: `s.extents.values().cloned().collect::<Vec<_>>()`
-              clones EVERY extent, even the ones the loop body
-              skips on its very first line.
-    Post-F172: filter under borrow first
-              (sealed_length > 0 AND not in ec_conversion_inflight)
-              then clone only the matching set.
-    Cost saved: at 10K extents (~200 B each with 4 Vec fields)
-                = ~2 MB inline memcpy + ~40K heap allocs per 2 s
-                tick → ~few KB / few µs after F172-A.
-                At 100K extents = 20 MB / 400K allocs / 10-20 ms
-                inline → mostly flat.
-    Correctness: F138's apply-time re-check on
-                 apply_recovery_done / mark_extent_available /
-                 handle_multi_modify_split protects against the
-                 stale-snapshot race window.
+  What:
+    persist_ec_conversion_inflight(extent_id):
+      etcd PUT ecConversionInflight/{id} (empty value, existence
+      is the signal). Called BEFORE EXT_MSG_CONVERT_TO_EC dispatch
+      in ec_conversion_dispatch_loop. On etcd failure, skip this
+      extent and retry next tick.
 
-  F172-B — ec_conversion_dispatch_loop hoist node_addrs:
-    Pre-F172: re-collected `s.nodes -> address` map ONCE PER
-              CANDIDATE EXTENT inside `for (ex, stream) in
-              candidates`. Same map identical across all iterations
-              of a single tick.
-    Post-F172: snapshot once alongside candidates under the same
-               borrow.
-    Cost saved: N candidates × M nodes of String clone per tick →
-                M nodes total per tick. At 50 × 100 = 5000 →
-                100 saved.
+    unpersist_ec_conversion_inflight(extent_id):
+      etcd DELETE. Called AFTER apply_ec_conversion_done or RPC
+      failure. Lingering markers are harmless (one extra
+      recovery_dispatch_loop skip + idempotent reconvert).
 
-Out of scope (deferred):
-  - Sequential RPC dispatch in recovery_dispatch_loop: I/O
-    latency concern, not CPU. Each await yields.
-  - Rc<MgrExtentInfo> storage migration: structural ~50 LOC
-    change across manager + consumers. Deferred until F172-A's
-    pre-filter doesn't suffice.
+    replay_from_etcd:
+      scan `ecConversionInflight/` prefix, repopulate
+      ec_conversion_inflight: HashSet<u64> BEFORE the leader-key
+      flip completes. New leader's first recovery_dispatch_loop
+      tick observes markers and skips those extents.
+
+  Why both F173 (etcd persist) and F153 (extent-node lock):
+    - F153 catches CONCURRENT dispatch race: deposed leader's
+      encode mid-flight when new leader re-fires. Per-extent
+      futures::lock::Mutex serialises; second dispatch waits,
+      F119-D makes it a no-op.
+    - F173 catches BROADER recovery race: deposed leader's EC
+      dispatch may have completed on coordinator (shards on disk,
+      eversion bumped) but apply_ec_conversion_done never ran in
+      etcd. recovery_dispatch_loop would dispatch require_recovery
+      on the eversion mismatch; F173's marker tells new leader to
+      skip until the next ec_conversion_dispatch_loop re-enters
+      and converges state.
 
 Files modified:
+  - crates/manager/src/lib.rs:
+      * persist_ec_conversion_inflight + unpersist (new helpers)
+      * replay_from_etcd: get_prefix + decode + populate
   - crates/manager/src/recovery.rs:
-      * recovery_dispatch_loop: pre-filter under borrow
-      * ec_conversion_dispatch_loop: hoist node_addrs out of
-        candidate loop
-      * Inline F172 comments documenting both
-  - feature_list.md: F172 entry
+      * ec_conversion_dispatch_loop: persist BEFORE dispatch,
+        unpersist AFTER apply
+  - feature_list.md: F173 + F175 entries
   - claude-progress.txt: this file
 
 Verification:
   - cargo build -p autumn-manager: clean.
   - cargo build --release --workspace --exclude autumn-fuse: clean.
   - cargo test -p autumn-manager --lib: 30/30 pass.
-  - cargo test -p autumn-stream --lib: 40/40 pass.
-  - cargo test -p autumn-partition-server --lib -- --test-threads=1:
-    122/122 pass.
 
-Pre-existing (NOT caused by F172):
+Pending in /loop continuation (next iteration):
+  - F174 — EC shard-level CRC32C (per-shard integrity check).
+    Real correctness gap: silent shard corruption (cosmic ray,
+    bit rot) currently produces wrong-bytes from ec_decode without
+    detection.
+  - F176 — perf_check.sh bench cycle to measure F168/F169/F170/F172
+    impact (compaction yield, EC slice zero-copy, manager dispatch
+    pre-filter, etc.).
+
+Out of scope (still deferred):
+  - Cross-replica byte-divergence detection (structural).
+
+Pre-existing (NOT caused by F173):
   - autumn-manager test ec_integration::replication_stream_works
-    fails on this box both with and without F172 (reproduces in
-    main pre-F172 also).
+    fails on this box both with and without F173.
 
-Session-level summary (F151-F172):
+Session-level summary (F151-F173):
   F151: Python bindings asyncio-native
   F152: 3× etcd-first manager handlers + truncate sync_data
   F153: per-extent EC conversion lock
@@ -108,7 +111,5 @@ Session-level summary (F151-F172):
   F170: ec_slice_decoded zero-copy full-read
   F171: ExtentEntry.file: UnsafeCell → RefCell<Rc<CompioFile>>
   F172: manager dispatch-loop pre-filter + hoist redundant clones
-
-  Thread-per-core audit complete across PS (F168-F170), stream layer
-  (F171), and manager (F172). Compio runtimes no longer block on
-  payload-sized inline CPU work in any audited code path.
+  F173: ec_conversion_inflight persist to etcd
+  F175: sealed_length consistency cleared no-fix
