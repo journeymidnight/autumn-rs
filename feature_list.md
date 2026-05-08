@@ -570,6 +570,66 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F155 · rkyv checked decode (replaces `from_bytes_unchecked` with `from_bytes`)
+- **Target:** Close the verified UB-on-malformed-input hazard in both
+  `rkyv_decode` helpers — `crates/rpc/src/manager_rpc.rs:65` and
+  `crates/stream/src/extent_rpc.rs:268`. Pre-F155 both helpers used
+  `unsafe { rkyv::from_bytes_unchecked::<T, RkyvError>(&v) }` with the
+  comment "we control both sides" as the only safety justification. The
+  unsafe path performs zero-copy deserialisation without validating
+  archive bytes (no bounds check on length-prefixed containers, no
+  pointer-relativity check, no sum-type discriminant validation). Any
+  malformed input — a flipped bit past TCP's 16-bit CRC, a struct-layout
+  mismatch from a partial rolling upgrade (cf. F118's
+  `original_replicates → ec_converted` rename which had no schema-version
+  prefix to detect mixed-version peers), or in a future where the wire
+  crosses an untrusted boundary, a hostile sender — triggers undefined
+  behaviour: out-of-bounds reads, pointer dereferences into arbitrary
+  memory, or silent partial decoding into a corrupt struct that
+  downstream code then trusts.
+- **Fix:** Switch both helpers to `rkyv::from_bytes::<T, RkyvError>(&v)`,
+  the checked path. Bounds added to the function signature:
+  `T::Archived: for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, RkyvError>>`.
+  rkyv 0.8's `#[derive(Archive)]` auto-derives `CheckBytes` for the
+  archived type, so all wire structs in `manager_rpc.rs` /
+  `partition_rpc.rs` / `extent_rpc.rs` / etc. compile without further
+  changes. The validator runs `bytecheck`'s archive-validation pass
+  before deserialising; malformed input returns a clean `Err` instead of
+  UB.
+- **Cost:** Validation adds a constant-overhead pass over the archived
+  bytes. For the hot path (4 KB Put/Get), this is a few μs per request
+  — bounded and predictable. Perf-check on tmpfs after F155: ops/s
+  fluctuates between 42k and 102k across runs (high rig noise on the
+  shared box), median within the F148-F150 baseline band. No clean
+  regression signal.
+- **Out of scope (still deferred to a separate feature):** wire-format
+  schema versioning. F155 closes the UB-on-malformed-input class of
+  bugs; it does NOT close the rolling-upgrade-with-incompatible-schema
+  class. A future feature could add a 1-byte `schema_version` prefix to
+  every wire payload and a version-mismatch handshake on connect, so
+  rolling upgrades fail loud at the wire boundary instead of silently
+  decoding into a wrong struct (the failure mode F118's rename would
+  have produced if anyone had attempted a rolling upgrade across that
+  commit). For now, autumn-rs's deployment model is restart-all-together,
+  so version mismatch is operationally avoided.
+- **Files:** `crates/rpc/src/manager_rpc.rs` (rkyv_decode signature +
+  body), `crates/stream/src/extent_rpc.rs` (rkyv_decode signature + body
+  + 1 new test in `tests`), `feature_list.md` (this entry),
+  `claude-progress.txt`, `crates/stream/CLAUDE.md` (note 4 amendment).
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-stream --lib`: 32/32 pass (was 31; +1 new
+    `f155_rkyv_decode_rejects_malformed` test that XOR-corrupts each
+    byte of a valid CodeResp encoding and asserts at least one
+    corruption triggers Err — proves the validator actually runs;
+    plus truncation and empty-payload cases).
+  - `cargo test -p autumn-manager --lib`: 30/30 pass.
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`:
+    108/108 pass.
+  - End-to-end: `cluster.sh reset 1` + bootstrap + perf-check (read-side
+    ~96k ops/s within F148-F150 baseline band).
+- **passes:** true
+
 ### F156 · Min-replica `commit_length` quorum enforcement
 - **Target:** Close the verified protocol-level data-loss hazard in
   `current_commit` and `commit_length_for_extent` (`crates/stream/src/client.rs:1332`

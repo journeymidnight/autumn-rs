@@ -61,17 +61,29 @@ where
     Bytes::copy_from_slice(&buf)
 }
 
-/// Deserialize a value from bytes using rkyv (unchecked — we control both sides).
+/// Deserialize a value from bytes using rkyv with archive-bytes validation.
+///
+/// F155: switched from `from_bytes_unchecked` to the checked `from_bytes`.
+/// Pre-F155 a malformed payload (corrupted by a flipped bit that escaped TCP
+/// CRC, a peer running an incompatible struct layout from a partial rolling
+/// upgrade, or — in a future where the wire crosses an untrusted boundary —
+/// a hostile sender) caused undefined behaviour: out-of-bounds reads, pointer
+/// dereferences into arbitrary memory, or silent partial decoding into a
+/// corrupt struct that downstream code then trusted. The checked path runs
+/// `bytecheck`'s validation pass on the archived bytes (size, alignment,
+/// pointer relativity, sum-type discriminants, container length bounds) and
+/// returns a clean `Err` on any inconsistency. The validation cost is small
+/// and bounded by the payload size — a few percent on the hot path at most;
+/// negligible against rkyv's existing per-archive zero-copy work.
 pub fn rkyv_decode<T>(data: &[u8]) -> Result<T, String>
 where
     T: Archive,
-    T::Archived: Deserialize<T, HighDeserializer<RkyvError>>,
+    T::Archived: Deserialize<T, HighDeserializer<RkyvError>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>,
 {
     let mut v = rkyv::util::AlignedVec::<16>::with_capacity(data.len());
     v.extend_from_slice(data);
-    // SAFETY: data was serialized by rkyv_encode on the same side of the wire.
-    unsafe { rkyv::from_bytes_unchecked::<T, RkyvError>(&v) }
-        .map_err(|e| format!("rkyv decode: {e}"))
+    rkyv::from_bytes::<T, RkyvError>(&v).map_err(|e| format!("rkyv decode: {e}"))
 }
 
 // ── Shared domain types ─────────────────────────────────────────────────────

@@ -263,19 +263,22 @@ where
     Bytes::copy_from_slice(&buf)
 }
 
-/// Deserialize a value from bytes using rkyv (unchecked — we control both sides).
+/// Deserialize a value from bytes using rkyv with archive-bytes validation.
 /// Copies into an AlignedVec if the input is not properly aligned.
+///
+/// F155: switched from `from_bytes_unchecked` to the checked `from_bytes` —
+/// see the matching note in `crates/rpc/src/manager_rpc.rs` for rationale.
+/// Validates archived bytes via bytecheck before deserialising; returns
+/// `Err` on malformed input instead of UB.
 pub fn rkyv_decode<T>(data: &[u8]) -> Result<T, String>
 where
     T: Archive,
-    T::Archived: Deserialize<T, HighDeserializer<RkyvError>>,
+    T::Archived: Deserialize<T, HighDeserializer<RkyvError>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>,
 {
-    // Wire bytes may not be aligned; copy into AlignedVec to satisfy rkyv requirements.
     let mut v = rkyv::util::AlignedVec::<16>::with_capacity(data.len());
     v.extend_from_slice(data);
-    // SAFETY: data was serialized by rkyv_encode on the same side of the wire.
-    unsafe { rkyv::from_bytes_unchecked::<T, RkyvError>(&v) }
-        .map_err(|e| format!("rkyv decode: {e}"))
+    rkyv::from_bytes::<T, RkyvError>(&v).map_err(|e| format!("rkyv decode: {e}"))
 }
 
 // ── Status code constants ────────────────────────────────────────────────────
@@ -643,5 +646,54 @@ mod tests {
         let decoded: CodeResp = rkyv_decode(&bytes).expect("decode");
         assert_eq!(decoded.code, CODE_OK);
         assert!(decoded.message.is_empty());
+    }
+
+    /// F155: rkyv_decode rejects malformed input via bytecheck instead of UB.
+    /// Pre-F155 this used `from_bytes_unchecked` and a corrupted payload
+    /// (flipped bits past TCP CRC, mixed-version cluster, etc.) caused
+    /// out-of-bounds reads or pointer dereferences into arbitrary memory.
+    /// Post-F155 the checked decoder runs validation first and returns Err.
+    #[test]
+    fn f155_rkyv_decode_rejects_malformed() {
+        // Encode a valid CodeResp, then mangle each byte and confirm the
+        // decode path returns Err rather than panicking or reading garbage.
+        let valid = rkyv_encode(&CodeResp {
+            code: CODE_OK,
+            message: "hello".to_string(),
+        });
+
+        // Truncated payload — should fail validation, not UB.
+        let truncated = &valid[..valid.len() / 2];
+        let r: Result<CodeResp, _> = rkyv_decode(truncated);
+        assert!(
+            r.is_err(),
+            "truncated input must Err (got {:?})",
+            r.map(|v| v.code)
+        );
+
+        // Single-byte XOR corruption near the end of the payload — most
+        // likely to land in archive headers / pointer offsets and trigger
+        // the bytecheck validator. We don't assert ALL corruptions fail
+        // (some may land in the inline string body and decode to garbage
+        // text — still safe, just not-Err); we assert at least one of a
+        // sweep does, which proves the validator is running.
+        let mut any_err = false;
+        for offset in 0..valid.len() {
+            let mut corrupted = valid.to_vec();
+            corrupted[offset] ^= 0xff;
+            let r: Result<CodeResp, _> = rkyv_decode(&corrupted);
+            if r.is_err() {
+                any_err = true;
+                break;
+            }
+        }
+        assert!(
+            any_err,
+            "no XOR-corrupted byte triggered Err — bytecheck is probably not running"
+        );
+
+        // Empty payload — should fail (alignment / size validation).
+        let r: Result<CodeResp, _> = rkyv_decode(&[]);
+        assert!(r.is_err(), "empty input must Err");
     }
 }

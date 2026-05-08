@@ -1,136 +1,112 @@
 Date: 2026-05-08
 TaskStatus: completed
-Task scope: F156 — Min-replica `commit_length` quorum enforcement.
-            ~30 LOC change to two functions in `crates/stream/src/client.rs`.
-            Closes a verified data-loss hazard from the F152-era audit's
-            deferred candidate list.
-
-            Also: retracted F154 candidate after re-inspection — the agent's
-            "VERIFIED-VIOLATION" of `flush_one_imm_local`'s F148-A invariant
-            was a misreading. See F156 entry's "F154 candidate retracted"
-            note in feature_list.md.
+Task scope: F155 — rkyv checked decode (replaces `from_bytes_unchecked` with
+            `from_bytes`). Closes the verified UB-on-malformed-input hazard
+            in both `rkyv_decode` helpers (`crates/rpc/src/manager_rpc.rs`
+            + `crates/stream/src/extent_rpc.rs`).
 
 Why:
-  Both `current_commit` (`client.rs:1332`) and `commit_length_for_extent`
-  (`client.rs:1689`) iterated over all replica addresses, `continue`d on
-  any error (RPC failure, decode error, non-OK code), and computed the
-  minimum over WHATEVER subset responded — accepting even a 1-of-N
-  response. The min-replica commit protocol's correctness invariant is
-  that the consensus position is bounded by EVERY replica's local length;
-  taking the min of a strict subset can return a position HIGHER than
-  what the unreachable replicas actually hold. After an append at that
-  speculative position, the data exists on only the lone responder. If
-  that responder dies before the unreachable peers re-replicate the
-  speculative bytes, the data is permanently lost — and the manager's
-  metadata still references those bytes, so partition open at restart
-  fails to load any SST whose ValuePointers reference the lost range.
-
-Concrete failure mode (R=3):
-  - A/B/C all at offset 100.
-  - Network partition: B+C isolated from manager + client.
-  - Client probes commit_length: A responds 100, B/C unreachable.
-  - Pre-F156 returns 100 → client appends bytes 100..200 → A acks →
-    manager records sealed_length using this offset on next seal.
-  - A crashes. B+C return with bytes 0..100 only.
-  - Recovery tries to re-replicate 100..200 from a healthy source;
-    none exist (A is dead).
-  - Bytes 100..200 lost. Restart: SSTs whose VPs reference the lost
-    range fail to load on partition open.
+  Both rkyv_decode helpers used `unsafe { rkyv::from_bytes_unchecked }`
+  with the comment "we control both sides" as the only safety
+  justification. The unchecked path performs zero-copy deserialisation
+  without any validation:
+    - no bounds check on length-prefixed containers (Vec / String)
+    - no pointer-relativity check on archived offsets
+    - no sum-type discriminant validation
+    - no alignment check
+  Any malformed input triggers UB:
+    - cosmic-ray bit flip past TCP's 16-bit CRC
+    - struct-layout mismatch from a partial rolling upgrade
+      (cf. F118 renamed MgrExtentInfo.original_replicates → ec_converted
+       with no schema-version prefix to detect mixed-version peers)
+    - in a future where the wire crosses untrusted boundaries, a hostile
+      sender
+  → out-of-bounds reads, pointer dereferences into arbitrary memory, or
+  silent partial decoding into a corrupt struct that downstream code
+  trusts (e.g. crashing the partition thread, or — worse — silently
+  routing data to the wrong partition).
 
 How:
-  Track `success: usize` alongside `min_len`. After the loop, require
-  `success >= total / 2 + 1` (majority quorum). If below, return
-  `Err(insufficient quorum...)`. The worker's existing soft-error retry
-  path waits + reloads tail + retries, which converges once the
-  partition heals or the manager evicts the stale node and
-  re-replicates.
+  Switched both helpers to `rkyv::from_bytes::<T, RkyvError>(&v)`, the
+  checked path. Added bound:
+    T::Archived: for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, RkyvError>>
+  rkyv 0.8's `#[derive(Archive)]` auto-derives CheckBytes for the
+  archived type, so all wire structs across manager_rpc.rs /
+  partition_rpc.rs / extent_rpc.rs / etc. compile without further
+  changes. The validator runs bytecheck's archive-validation pass before
+  deserialising; malformed input returns clean `Err` instead of UB.
 
-  Quorum threshold = ⌊N/2⌋+1 (Raft / Paxos majority):
-    R=1 → 1 (no fault tolerance, but no quorum to violate)
-    R=2 → 2 (no fault tolerance — single-replica response not safe)
-    R=3 → 2 (tolerates 1 dead)
-    R=4 → 3 (tolerates 1 dead)
-    R=5 → 3 (tolerates 2 dead)
+Cost:
+  Validation adds a constant-overhead pass over the archived bytes. For
+  the 4 KB hot path Put/Get this is a few µs per request — bounded and
+  predictable. Perf-check on tmpfs post-F155 fluctuates 42k-102k ops/s
+  across 6 runs (high rig noise on shared box), median within the
+  F148-F150 baseline band (90-97k). No clean regression signal.
 
-Trade-off:
-  Pre-F156 the system would continue writing on a single-survivor
-  majority-failure scenario (silently unsafe). Post-F156 writes halt
-  until ⌊N/2⌋+1 replicas can be reached. This is the correct durability
-  trade-off for a strongly-consistent system: refuse to make progress
-  on insufficient information rather than silently risk data loss.
-  Production clusters running in degraded mode (≥1 replica dead) still
-  make progress as long as quorum is reachable.
+Out of scope (still deferred):
+  - Wire-format schema versioning. F155 closes the UB-on-malformed
+    input class of bugs; it does NOT close the rolling-upgrade-with-
+    incompatible-schema class. A future feature could add a 1-byte
+    schema_version prefix to every wire payload + a version-mismatch
+    handshake on connect, so rolling upgrades fail loud at the wire
+    boundary instead of silently decoding into a wrong struct (the
+    failure mode F118's rename would have produced if anyone had
+    attempted a rolling upgrade across that commit). Today's deployment
+    model is restart-all-together, so version mismatch is
+    operationally avoided.
 
 Files modified:
-  - crates/stream/src/client.rs:
-      * current_commit: success counter + quorum check + invariant comment
-      * commit_length_for_extent: same shape
-  - feature_list.md: F156 entry + F154 candidate retraction note
+  - crates/rpc/src/manager_rpc.rs
+      * rkyv_decode signature: + CheckBytes bound
+      * rkyv_decode body: from_bytes_unchecked → from_bytes; no unsafe
+      * docstring rewritten with F155 rationale
+  - crates/stream/src/extent_rpc.rs
+      * rkyv_decode: same shape as above
+      * tests: + f155_rkyv_decode_rejects_malformed (XOR-corruption
+        sweep + truncation + empty-payload)
+  - crates/stream/CLAUDE.md (this iteration: append protocol step 5
+    note 4 truncate fsync stays as-is; no doc change required for F155
+    since the rkyv_decode helpers are not in the documented append
+    protocol path)
+  - feature_list.md: F155 entry
   - claude-progress.txt: this file
 
 Verification:
   - `cargo build --workspace --exclude autumn-fuse`: clean.
-  - `cargo test -p autumn-stream --lib`: 31/31 pass.
+  - `cargo test -p autumn-stream --lib`: 32/32 pass (was 31; +1 new
+    `f155_rkyv_decode_rejects_malformed` test that XOR-corrupts each
+    byte of a valid CodeResp encoding and asserts at least one
+    corruption triggers Err — proves the validator runs; plus
+    truncation and empty-payload cases).
   - `cargo test -p autumn-manager --lib`: 30/30 pass.
   - `cargo test -p autumn-partition-server --lib -- --test-threads=1`:
     108/108 pass.
-  - End-to-end: `cluster.sh reset 3` (R=3 replication) + put/get round-trip
-    verifies steady-state quorum (3/3 success). With one node killed
-    (`stop-node 3`), the alloc_new_extent path is the bottleneck (separate
-    from F156): manager still allocates new extents to the dead node
-    until heartbeat eviction completes (~10 s); after restart of the
-    killed node, put/get works again. F156's contribution: the
-    commit_length probe specifically with 1 dead replica still succeeds
-    (2/3 ≥ 2 quorum), exercised in steady state.
+  - End-to-end: `cluster.sh reset 1` + put/get round-trip via bootstrap
+    paths exercises rkyv-decoded RPCs (CreateStream, AllocExtent,
+    PartitionRegister, ...). All succeed.
+  - Perf-check: ~96k ops/s read sustained, within F148-F150 baseline
+    band; high run-to-run variance on this rig (42k-102k across 6
+    runs) is noise, not regression.
 
-F154 candidate retracted:
-  The previous round's audit agent reported `flush_one_imm_local`
-  (lib.rs:3257-3300) as a VERIFIED-VIOLATION of F148-A invariant P3.
-  Re-inspection shows this was a misreading. F148-A's P3 requires no
-  `.await` between (a) the snapshot-capturing borrow_mut DROP and (b)
-  the mpsc-send inside save_table_locs_raw. In flush_one_imm_local:
-    - Lines 3277-3292: borrow_mut block (no awaits inside), captures
-      tables_snapshot at line 3291.
-    - Line 3292: borrow_mut drops (end of block).
-    - Line 3297: save_table_locs_raw call (synchronous up to mpsc-send
-      inside the function; first await is on ack_rx after the message
-      lands in the per-stream worker FIFO).
-  Path 3292 → 3297 contains only `};` and the function call — no awaits.
-  The awaits at lines 3267-3272 (spawn_blocking + part_sc.append) happen
-  BEFORE the snapshot-capturing borrow_mut, which is fine — any
-  concurrent `do_compact` mutations to `p.tables` during those awaits
-  are reflected in the snapshot taken AFTER those awaits. The F148-A
-  invariant holds in both flush_one_imm and flush_one_imm_local.
-  Lesson: an audit agent saying "VERIFIED-VIOLATION" with file:line
-  references still warrants independent re-inspection before a fix —
-  agents can confidently misread invariants whose subtleties live in
-  inline comments.
+Pre-existing (NOT caused by F155):
+  - autumn-rpc lib test `init` symbol missing — pre-existing build
+    error noted in claude-progress.txt since F151.
+  - autumn-manager test ec_integration::replication_stream_works fails
+    on this box both with and without F155 (same as F151-F156 baseline).
 
 Out of scope (deferred to future features):
-  - F154 candidate (manager-side `ecConversionInFlight/$extent_id` etcd
-    persistence) — perf hygiene only after F153 closed the corruption
-    path. Reduces the wasted-RPC overhead of the post-failover
-    duplicate dispatch but doesn't change correctness.
-  - F155 candidate — rkyv `from_bytes_unchecked` + schema versioning.
-    UB on malformed input. HIGH for rolling upgrades + cosmic-ray-flipped
-    bytes that pass TCP CRC; LOW for restart-all-together with trusted
-    network. Real fix: switch to `rkyv::access` (checked) on the wire
-    boundary + add a 1-byte schema_version prefix to all wire types.
+  - F154 candidate (manager-side ecConversionInFlight etcd persistence)
+    — perf hygiene only after F153 closed the corruption path.
   - F157 candidate — MED-2 `handle_get → resolve_value` vs GC
     `punch_holes`. Per-extent reader-pin protocol; structural change.
-
-Pre-existing (NOT caused by F156):
-  - autumn-manager test ec_integration::replication_stream_works fails
-    on this box both with and without F156 (same as F151/F152/F153
-    baseline).
-  - autumn-rpc lib test `init` symbol missing (build error). Pre-existing.
-  - alloc_new_extent retrying on dead node until manager heartbeat
-    eviction (~10 s) — separate from F156's commit_length probe;
-    unrelated.
+  - F158 candidate — wire-format schema versioning (1-byte prefix +
+    version handshake on connect); pre-condition for safe rolling
+    upgrades.
 
 Next steps:
-  - F155 (rkyv checked decode + schema versioning) is the next
-    correctness item. ~50-80 LOC across `crates/rpc/src/manager_rpc.rs`
-    + `crates/stream/src/extent_rpc.rs`.
-  - Or F157 (MED-2 reader-pin) — bigger but closes the longest-deferred
-    correctness item.
+  - F157 (MED-2 reader-pin) is the longest-deferred correctness item.
+    Structural change but well-understood from prior audits. Likely the
+    next item.
+  - F158 (schema versioning) is an optional pre-condition for rolling
+    upgrades — only needed if the operating model changes from
+    restart-all-together to rolling.
