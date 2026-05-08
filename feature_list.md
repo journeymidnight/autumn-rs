@@ -579,9 +579,15 @@
     - `handle_append` / `build_append_future` (batched path): unconditionally `write_vectored_at` (no inline `sync_data`); register the new `(end_offset, oneshot)` into waiter list; nudge the coalescer.
     - Per-extent coalescer task: `compio::time::sleep(coalesce_window)` → if `pending_fsync_offset > last_synced_offset`: `sync_data` → update `last_synced_offset` → drain waiter list, wake all `(end ≤ synced)` via their oneshots.
     - Tunable: `AUTUMN_EXTENT_FSYNC_COALESCE_MS` default 2 (range [1, 50]).
-  - **Phase 2 — PS always-sync; flush relies on coalescer high-water:**
-    - `start_write_batch`: drop `triggers_rotation || any_must_sync` logic; `batch_must_sync = true` always.
-    - `flush_one_imm`: no separate fsync barrier needed — the coalesced fsync covers all bytes referenced by VPs in the imm by the time the flush extent_node calls return. The F150 Phase B invariant ("`sync_data` on the rotation batch covers ALL prior dirty pages") still holds because `sync_data` always fsyncs the whole file.
+  - **Phase 2 — Move durability wait from WRITE to FLUSH (true LevelDB):**
+    - **Writers never pay rotation cost.** `start_write_batch`: drop the entire `triggers_rotation` block. Rotation happens lazily whenever active passes threshold, no barrier promotion. Every Put is bounded by exactly 1 coalesce window (1-5 ms), regardless of whether it triggers rotation.
+    - **Flush waits for log_stream to be synced past `imm.max_vp_offset`.** New API: `extent_node` exposes `synced_length(extent_id) -> u64` (= coalescer's `last_synced_offset`). `StreamClient` exposes `await_log_synced_to(stream_id, offset)` which queries all 3 replicas and waits for quorum-min to reach the offset (mirrors the F156 `commit_length` quorum pattern). `flush_one_imm` calls this BEFORE `row_stream.append` of the SST; usually wait ≈ 0 because coalescer fires every 1-5 ms and flush builds SST in parallel.
+    - **Why "wait at flush" beats "wait at write":**
+      1. Write p99 no longer has "I unluckily triggered rotation" tail latency — every Put pays the same 1-5 ms coalesce floor.
+      2. Flush is background; +5 ms to its start is invisible to clients.
+      3. F150 Phase B invariant preserved structurally: `sync_data` always fsyncs the whole file's dirty pages, so coalescer's fsync covers ALL prior bytes (no "must_sync=false dirty pages" gap because F178 removes the false branch entirely).
+      4. The 3-replica fanout cost stays unchanged — `synced_length` is one round-trip per replica, parallelized.
+    - `flush_one_imm` and `flush_one_imm_local` both updated. Same pattern in `do_compact` if compact ever spans logStream extents (currently only row_stream, so no change).
   - **Phase 3 — wire / client API cleanup:**
     - Remove `--nosync` flag from `autumn-client put`, `streamput`, `wbench`, `perf-check`.
     - Remove `must_sync: bool` field from `PutReq`, `AppendReq` (or keep at wire level for back-compat but ignore semantically — TBD by smaller cost).
