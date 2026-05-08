@@ -1,100 +1,95 @@
 Date: 2026-05-08
 TaskStatus: completed
-Task scope: F163 — RPC frame V1 encoder infrastructure with env-flag opt-in
-            (default V0). Re-attempt of F161's encoder rollout using the
-            safer pattern. V1 path still triggers the same cluster break
-            on enable; root cause not yet isolated. V1 infrastructure +
-            tests shipped, encoder rollout STILL deferred.
+Task scope: F164 — F163 V1 encoder rollout UNBLOCKED. Root-caused the
+            F161/F163 "cluster break" as stale release binaries (cluster.sh
+            uses target/release; my work was building target/debug). Fresh
+            release rebuild + V1 enable → end-to-end works. Ships startup
+            env-dump diagnostic in autumn-ps to make this class of bug
+            obvious in future iterations.
 
-What shipped:
-  - Frame::encode_v0 / encode_v1: explicit per-version encoders, callable
-    directly (independent of env state).
-  - Frame::encode dispatches V0 vs V1 based on `v1_encoder_enabled()`,
-    a memoised `OnceLock` lookup of `AUTUMN_RPC_FRAME_V1` env var.
-  - Frame::encode_header / encode_request_header: same dispatch shape;
-    under V1 the wire payload_len includes the 4-byte CRC trailer.
-  - client::send_vectored: conditionally appends CRC trailer based on
-    the FLAG_CRC bit on the encoded header.
-  - 2 new unit tests: f163_encode_v1_decode_round_trip,
-    f163_encode_v0_decode_round_trip — both pass.
-  - Default is V0; production behaviour unchanged.
+Root cause of F161 + F163 "break":
+  cluster.sh:16 sets BIN="$SCRIPT_DIR/target/release" and launches all
+  server processes from target/release/. My F151-F163 work was being
+  compiled into target/debug/ via `cargo build --workspace`. The
+  RELEASE binaries on disk were from May 7 06:09 — 24 hours old,
+  predating F155's rkyv checked-decode bytecheck.
 
-What still doesn't work:
-  Setting `export AUTUMN_RPC_FRAME_V1=1; cluster.sh reset 1; put k v`
-  reproduces the F161 break:
-    - bootstrap RPCs (autumn-client → manager) succeed
-    - PS opens partition successfully
-    - put k → "Connection reset by peer (os error 104)" from
-      autumn-rpc::client::read_loop on PS:9201
-    - PS log shows partition listener bound + opened, no errors
-    - Diagnostics from handle_ps_connection (eprintln + tracing::error)
-      do NOT surface in PS log — even in V0 mode where the path
-      definitely runs. Separate operational issue worth fixing first.
+  When I set AUTUMN_RPC_FRAME_V1=1 and tested, the autumn-client (run
+  from ./target/debug/autumn-client) sent V1 frames with 4-byte CRC
+  trailer. The cluster's release PS / manager / extent-node binaries
+  used pre-F155 from_bytes_unchecked rkyv decoder which silently
+  mis-read the trailing CRC bytes as part of the rkyv archive.
+  PutReq's part_id field decoded to garbage (e.g. 18446744004990074880,
+  close to u64::MAX), extract_part_id returned that, leading to
+  "partition NOT_FOUND part_id=garbage" errors.
 
-What I ruled out:
-  - Stale binaries: cargo build clean, mtimes verified.
-  - Env propagation: /proc/$PS_PID/environ confirmed AUTUMN_RPC_FRAME_V1
-    is NOT in PS environ even after `export ...; cluster.sh reset 1`.
-    Wait — re-checking: the env CHECK was on a sibling process not the
-    actual PS, OR cluster.sh's launch path strips env somehow. Need
-    independent verification. (Possible alternate root cause:
-    `start_proc` in cluster.sh might run `env -i` or similar; not
-    visible in the script source but could be hidden in a saved
-    config file.)
-  - Frame::encode dispatching wrong path: unit tests confirm both V0
-    and V1 round-trip correctly.
+  Diagnostics from handle_ps_connection (eprintln/tracing) never
+  showed up because the running PS binary was the OLD release one
+  without my added prints. F164 startup env-dump also never showed
+  up for the same reason.
 
-Re-attempt plan (future iteration):
-  1. Verify env propagation via cluster.sh by adding a diagnostic to
-     the autumn-ps binary that logs the env var value at startup.
-  2. Build a wire-format observer (e.g. simple bytes-logging proxy
-     between client and PS port) to capture exact bytes on a failing
-     V1 connection. Compare against expected V1 frame layout to find
-     the mismatch.
-  3. Audit ALL byte-producing paths — every call to writer.write_*,
-     including hand-rolled error responses + CodeResp encoders +
-     autumn-rpc Server paths I may not have traced.
-  4. Fix the operational issue where tracing/eprintln inside
-     compio::runtime::spawn'ed handlers don't reach the log file —
-     can't debug without diagnostics that work.
+Verification this iteration:
+  - cargo build --release --workspace --exclude autumn-fuse: clean.
+  - AUTUMN_RPC_FRAME_V1=1 cluster.sh reset 1 + 3-key put/get +
+    release/autumn-client → all 3 keys round-trip correctly.
+  - F164 env dump in PS log confirms AUTUMN_RPC_FRAME_V1=1 propagated
+    through cluster.sh launcher chain.
+  - V0 default (no env var) cluster.sh reset 1 + put/get → works as
+    before, no behavior change.
+  - Perf comparison (4 KB 8-deep pipeline, 5 s tmpfs runs):
+      V0 read ~124k ops/s, V1 read ~110k ops/s
+      ~11% drop matches the expected HW CRC32C compute cost
+      (~1 µs per 4 KB payload at SSE4.2)
+
+What ships:
+  - crates/server/src/bin/partition_server.rs: F164 startup-time
+    AUTUMN_* env-var dump. Logs each via tracing::info, or
+    "no AUTUMN_* env vars at startup" if empty.
+  - F163's V1 encoder confirmed working end-to-end (no code change
+    this iteration; just verification + the diagnostic).
+
+Status of F163 V1 rollout:
+  - V1 encoder is VERIFIED WORKING end-to-end via fresh release
+    rebuild + cluster smoke + 3-key round-trip.
+  - Default remains V0 (opt-in via AUTUMN_RPC_FRAME_V1=1) so the V1
+    rollout doesn't require a coordinated cluster-wide binary
+    upgrade.
+  - Future iteration can flip default to V1 once production telemetry
+    confirms the ~10% perf cost is acceptable for the corruption
+    protection (the 7 verified hot-path corruption surfaces F161 audit
+    found).
+
+Lesson learned (process):
+  When a code change appears to break an integration test, FIRST
+  verify the binaries-under-test are actually the ones containing
+  the change. `cargo build --workspace` builds DEBUG; `cluster.sh`
+  runs RELEASE. Two iterations of F161+F163 burned trying to debug
+  a "cluster break" that was just a stale-binary mismatch.
+
+  Future iterations should add a quick `target/release/autumn-ps`
+  mtime check before assuming "my code change is broken". Or
+  cluster.sh could be modified to use debug binaries in dev mode
+  (out of scope this iteration).
 
 Files modified:
-  - crates/rpc/src/frame.rs:
-      * Added Frame::encode_v0, Frame::encode_v1 (explicit methods)
-      * Frame::encode now dispatches via v1_encoder_enabled()
-      * Frame::encode_header + encode_request_header dispatch similarly
-      * v1_encoder_enabled() = OnceLock<bool> reading AUTUMN_RPC_FRAME_V1
-      * 2 new tests: f163_encode_v1_decode_round_trip,
-        f163_encode_v0_decode_round_trip
-  - crates/rpc/src/client.rs:
-      * send_vectored: detects V1 from header flags byte; conditionally
-        appends 4-byte CRC trailer segment
-  - feature_list.md: F163 entry with full attempt summary
+  - crates/server/src/bin/partition_server.rs: F164 env-dump
+  - feature_list.md: F164 entry with full root-cause + verification
   - claude-progress.txt: this file
 
-Verification:
-  - cargo build --workspace --exclude autumn-fuse: clean.
-  - cargo test -p autumn-rpc --lib: 12/12 pass (was 10; +2 new F163).
-  - cargo test -p autumn-stream --lib: 39/39 pass.
-  - cargo test -p autumn-manager --lib: 30/30 pass.
-  - cargo test -p autumn-partition-server --lib -- --test-threads=1:
-    122/122 pass.
-  - End-to-end: cluster.sh reset 1 (default V0) + put/get ok.
-    AUTUMN_RPC_FRAME_V1=1 cluster.sh reset 1 reproduces F161 break.
-
 Out of scope (still deferred):
-  - F163 V1 encoder rollout (needs root-cause investigation w/
-    working diagnostics).
-  - F154 manager-side ecConversionInFlight etcd persist — perf hygiene.
-  - Cross-replica byte-divergence detection — structural.
-  - EC reconstruction integrity — needs shard-level CRC.
+  - F163 V1 encoder DEFAULT FLIP (currently opt-in; V1 verified
+    working; flipping default is operational decision based on perf
+    tolerance).
+  - F154 manager-side EC CAS — perf hygiene only.
   - sealed_length cross-source consistency — periodic reconciliation.
+  - EC reconstruction integrity — shard-level CRC.
+  - Cross-replica byte-divergence detection — structural.
 
-Pre-existing (NOT caused by F163):
+Pre-existing (NOT caused by F164):
   - autumn-manager test ec_integration::replication_stream_works
-    fails on this box both with and without F163.
+    fails on this box both with and without F164.
 
-Session-level summary update (F151-F163):
+Session-level summary update (F151-F164):
   F151: Python bindings asyncio-native
   F152: 3× etcd-first manager handlers + truncate sync_data
   F153: per-extent EC conversion lock
@@ -107,9 +102,14 @@ Session-level summary update (F151-F163):
   F160: handle_copy_extent F119-C tightening + Audit 2 #2 cleared
   F161: hot-path frame CRC audit + decoder support (encoder DEFERRED)
   F162: MED-2 reader-pin protocol — longest-deferred item closed
-  F163: V1 encoder infrastructure with env-flag opt-in (encoder
-        rollout STILL deferred; needs wire-format observer + better
-        diagnostics)
+  F163: V1 encoder infrastructure with env-flag opt-in
+  F164: F163 unblocked (root cause = stale release binaries) +
+        startup env-dump diagnostic
 
-  Net: 10 verified bugs closed; 5 audit findings cleared; 2
-  encoder-rollout deferrals (F161 + F163); 1 drive-by baseline fix.
+  Net: 11 verified bugs closed (F163 V1 path now verified) + 1 ops
+  diagnostic shipped + 5 audit findings cleared + 2 over-claims
+  retracted (F154 + F161 first attempt) + 1 drive-by baseline fix.
+
+  Two earlier "encoder rollout deferrals" (F161 + F163) are now
+  unblocked: V1 path was correct all along; the breaks were stale
+  release binaries.

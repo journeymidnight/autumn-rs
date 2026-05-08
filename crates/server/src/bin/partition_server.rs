@@ -120,6 +120,22 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // F164: dump AUTUMN_* env vars at startup so env-flag-gated features
+    // (e.g. F163 V1 rollout) can confirm propagation through the launcher
+    // chain (cluster.sh → start_proc → bash → autumn-ps). Useful when
+    // debugging why a process doesn't appear to honour an env var that
+    // was exported in the parent shell.
+    let autumn_env: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("AUTUMN_"))
+        .collect();
+    if autumn_env.is_empty() {
+        tracing::info!("F164: no AUTUMN_* env vars at startup");
+    } else {
+        for (k, v) in &autumn_env {
+            tracing::info!(key = %k, value = %v, "F164: env var");
+        }
+    }
+
     // ---- pprof-rs profiling hook (R2 diagnosis) ----
     #[cfg(feature = "profiling")]
     {
