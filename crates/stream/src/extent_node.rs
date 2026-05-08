@@ -1060,8 +1060,38 @@ fn build_read_future(
 }
 
 impl ExtentNode {
-    const META_MAGIC: &'static [u8; 8] = b"EXTMETA\0";
-    const META_SIZE: usize = 40;
+    /// F157: extent .meta sidecar layout versioning.
+    ///
+    /// V0 (legacy, pre-F157): 40 bytes, no CRC.
+    ///   [magic[8]=b"EXTMETA\0"][extent_id[8]][sealed_length[8]][eversion[8]][last_revision[8]]
+    ///
+    /// V1 (post-F157): 44 bytes, CRC32C trailer over the first 40 bytes.
+    ///   [magic[8]=b"EXTMETA\x01"][extent_id[8]][sealed_length[8]][eversion[8]][last_revision[8]][crc32c[4]]
+    ///
+    /// Pre-F157 a flipped bit anywhere in the 40-byte payload (bit rot, undetected
+    /// disk error, partial overwrite during a torn write) silently changed the
+    /// extent's seal state at restart — recovery would load `sealed_length=0`
+    /// for an actually-sealed extent, accept new appends past the old seal
+    /// boundary, and corrupt every replica's view of the extent's tail bytes.
+    /// V1 wraps a CRC32C trailer; on read, mismatch returns None (treated as
+    /// "no meta file" → defaults applied + warning logged), so a corrupted
+    /// meta cannot silently drive the extent into an inconsistent state.
+    ///
+    /// **Migration:** save_meta always writes V1. parse_meta dispatches on
+    /// `magic[7]`:
+    ///   - 0x00 (V0): legacy 40-byte read, no CRC verification, WARN logged.
+    ///                Next save_meta upgrades to V1.
+    ///   - 0x01 (V1): 44-byte read with CRC verification.
+    ///   - other: None (treated as missing/corrupt meta).
+    /// V0-binary on V1-file: magic mismatch → None → broken on rollback.
+    /// Acceptable since rollback is operator-driven and rare.
+    const META_MAGIC_V0: &'static [u8; 8] = b"EXTMETA\0";
+    const META_MAGIC_V1: &'static [u8; 8] = b"EXTMETA\x01";
+    const META_SIZE_V0: usize = 40;
+    const META_SIZE_V1: usize = 44;
+    /// Backwards-compat alias for any external code reading the constant.
+    /// Equal to V1 size (the size save_meta writes).
+    const META_SIZE: usize = Self::META_SIZE_V1;
 
     pub async fn new(config: ExtentNodeConfig) -> Result<Self> {
         // Build DiskFS instances for all configured disks.
@@ -1304,12 +1334,15 @@ impl ExtentNode {
         let eversion = entry.eversion.load(Ordering::SeqCst);
         let last_revision = entry.last_revision.load(Ordering::SeqCst);
 
-        let mut buf = [0u8; Self::META_SIZE];
-        buf[0..8].copy_from_slice(Self::META_MAGIC);
+        // F157: always write V1 (44 bytes with CRC32C trailer).
+        let mut buf = [0u8; Self::META_SIZE_V1];
+        buf[0..8].copy_from_slice(Self::META_MAGIC_V1);
         buf[8..16].copy_from_slice(&extent_id.to_le_bytes());
         buf[16..24].copy_from_slice(&sealed_length.to_le_bytes());
         buf[24..32].copy_from_slice(&eversion.to_le_bytes());
         buf[32..40].copy_from_slice(&last_revision.to_le_bytes());
+        let crc = crc32c::crc32c(&buf[0..Self::META_SIZE_V0]);
+        buf[40..44].copy_from_slice(&crc.to_le_bytes());
 
         let disk = self.disk_for(entry.disk_id)?;
         let BufResult(result, _) = compio::fs::write(disk.meta_path(extent_id), buf.to_vec()).await;
@@ -1318,15 +1351,40 @@ impl ExtentNode {
     }
 
     fn parse_meta(buf: &[u8], extent_id: u64) -> Option<(u64, u64, i64)> {
-        if buf.len() < Self::META_SIZE {
+        if buf.len() < Self::META_SIZE_V0 {
             return None;
         }
-        if &buf[0..8] != Self::META_MAGIC {
+        // F157: dispatch on magic[7] for V0/V1 layout.
+        let v1 = &buf[0..8] == Self::META_MAGIC_V1;
+        let v0 = &buf[0..8] == Self::META_MAGIC_V0;
+        if !v0 && !v1 {
+            return None;
+        }
+        if v1 && buf.len() < Self::META_SIZE_V1 {
             return None;
         }
         let eid = u64::from_le_bytes(buf[8..16].try_into().ok()?);
         if eid != extent_id {
             return None;
+        }
+        if v1 {
+            let stored_crc = u32::from_le_bytes(buf[40..44].try_into().ok()?);
+            let computed_crc = crc32c::crc32c(&buf[0..Self::META_SIZE_V0]);
+            if stored_crc != computed_crc {
+                tracing::warn!(
+                    extent_id,
+                    stored_crc,
+                    computed_crc,
+                    "F157: meta sidecar CRC mismatch — bit rot or torn write; treating as missing"
+                );
+                return None;
+            }
+        } else {
+            // V0 legacy: no checksum. Warn once per load so operators see the upgrade signal.
+            tracing::warn!(
+                extent_id,
+                "F157: legacy V0 meta sidecar (no CRC) — will upgrade to V1 on next save_meta"
+            );
         }
         let sealed_length = u64::from_le_bytes(buf[16..24].try_into().ok()?);
         let eversion = u64::from_le_bytes(buf[24..32].try_into().ok()?);
@@ -3783,3 +3841,113 @@ mod f153_ec_lock_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod f157_meta_crc_tests {
+    use super::*;
+
+    /// F157: round-trip through V1 meta save/parse with CRC validation.
+    #[test]
+    fn v1_round_trip() {
+        // Build a valid V1 buffer manually to test parse_meta in isolation
+        // (save_meta requires a full ExtentNode + DiskFS setup).
+        let extent_id = 0xdead_beef_cafe_0042u64;
+        let mut buf = [0u8; ExtentNode::META_SIZE_V1];
+        buf[0..8].copy_from_slice(ExtentNode::META_MAGIC_V1);
+        buf[8..16].copy_from_slice(&extent_id.to_le_bytes());
+        buf[16..24].copy_from_slice(&12345u64.to_le_bytes()); // sealed_length
+        buf[24..32].copy_from_slice(&7u64.to_le_bytes()); // eversion
+        buf[32..40].copy_from_slice(&42i64.to_le_bytes()); // last_revision
+        let crc = crc32c::crc32c(&buf[0..ExtentNode::META_SIZE_V0]);
+        buf[40..44].copy_from_slice(&crc.to_le_bytes());
+
+        let parsed = ExtentNode::parse_meta(&buf, extent_id).expect("V1 parse");
+        assert_eq!(parsed, (12345, 7, 42));
+    }
+
+    /// F157: V0 legacy 40-byte buffer must parse (back-compat).
+    #[test]
+    fn v0_legacy_compat() {
+        let extent_id = 0x1234_5678u64;
+        let mut buf = [0u8; ExtentNode::META_SIZE_V0];
+        buf[0..8].copy_from_slice(ExtentNode::META_MAGIC_V0);
+        buf[8..16].copy_from_slice(&extent_id.to_le_bytes());
+        buf[16..24].copy_from_slice(&999u64.to_le_bytes());
+        buf[24..32].copy_from_slice(&3u64.to_le_bytes());
+        buf[32..40].copy_from_slice(&100i64.to_le_bytes());
+
+        let parsed = ExtentNode::parse_meta(&buf, extent_id).expect("V0 parse");
+        assert_eq!(parsed, (999, 3, 100));
+    }
+
+    /// F157: a V1 buffer with a flipped payload byte must be rejected (CRC mismatch).
+    #[test]
+    fn v1_bit_rot_in_payload_rejected() {
+        let extent_id = 100u64;
+        let mut buf = [0u8; ExtentNode::META_SIZE_V1];
+        buf[0..8].copy_from_slice(ExtentNode::META_MAGIC_V1);
+        buf[8..16].copy_from_slice(&extent_id.to_le_bytes());
+        buf[16..24].copy_from_slice(&500u64.to_le_bytes());
+        buf[24..32].copy_from_slice(&1u64.to_le_bytes());
+        buf[32..40].copy_from_slice(&0i64.to_le_bytes());
+        let crc = crc32c::crc32c(&buf[0..ExtentNode::META_SIZE_V0]);
+        buf[40..44].copy_from_slice(&crc.to_le_bytes());
+
+        // Flip a bit in sealed_length.
+        buf[16] ^= 0x01;
+
+        assert!(
+            ExtentNode::parse_meta(&buf, extent_id).is_none(),
+            "V1 bit rot in payload must trip CRC mismatch and return None"
+        );
+    }
+
+    /// F157: a V1 buffer with a flipped CRC trailer byte must be rejected.
+    #[test]
+    fn v1_bit_rot_in_crc_trailer_rejected() {
+        let extent_id = 200u64;
+        let mut buf = [0u8; ExtentNode::META_SIZE_V1];
+        buf[0..8].copy_from_slice(ExtentNode::META_MAGIC_V1);
+        buf[8..16].copy_from_slice(&extent_id.to_le_bytes());
+        buf[16..24].copy_from_slice(&777u64.to_le_bytes());
+        buf[24..32].copy_from_slice(&5u64.to_le_bytes());
+        buf[32..40].copy_from_slice(&99i64.to_le_bytes());
+        let crc = crc32c::crc32c(&buf[0..ExtentNode::META_SIZE_V0]);
+        buf[40..44].copy_from_slice(&crc.to_le_bytes());
+
+        // Flip a bit in the CRC.
+        buf[40] ^= 0xff;
+
+        assert!(
+            ExtentNode::parse_meta(&buf, extent_id).is_none(),
+            "V1 bit rot in CRC trailer must be rejected"
+        );
+    }
+
+    /// F157: extent_id mismatch on V1 meta returns None (existing behaviour preserved).
+    #[test]
+    fn v1_extent_id_mismatch_rejected() {
+        let mut buf = [0u8; ExtentNode::META_SIZE_V1];
+        buf[0..8].copy_from_slice(ExtentNode::META_MAGIC_V1);
+        buf[8..16].copy_from_slice(&500u64.to_le_bytes()); // file says 500
+        buf[16..24].copy_from_slice(&1u64.to_le_bytes());
+        buf[24..32].copy_from_slice(&1u64.to_le_bytes());
+        buf[32..40].copy_from_slice(&0i64.to_le_bytes());
+        let crc = crc32c::crc32c(&buf[0..ExtentNode::META_SIZE_V0]);
+        buf[40..44].copy_from_slice(&crc.to_le_bytes());
+
+        assert!(
+            ExtentNode::parse_meta(&buf, 999).is_none(),
+            "extent_id mismatch must return None"
+        );
+    }
+
+    /// F157: unknown magic byte (not V0 or V1) returns None.
+    #[test]
+    fn unknown_magic_rejected() {
+        let mut buf = [0u8; ExtentNode::META_SIZE_V1];
+        buf[0..8].copy_from_slice(b"NOT_META");
+        assert!(ExtentNode::parse_meta(&buf, 1).is_none());
+    }
+}
+

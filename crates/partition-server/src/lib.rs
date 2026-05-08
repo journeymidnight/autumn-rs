@@ -2998,23 +2998,57 @@ pub(crate) fn decode_records_with_offsets(bytes: &[u8]) -> Vec<(usize, u8, Vec<u
 }
 
 pub(crate) fn decode_last_table_locations(data: &[u8]) -> Result<TableLocations> {
-    // Format: sequence of [len: u32 LE][rkyv payload] records.
-    // We want the last successfully decoded record.
+    // Format: sequence of [len: u32 LE][rkyv payload] records. We want the last
+    // successfully decoded record.
+    //
+    // F157: pre-F157 a decode failure mid-stream caused `break`, returning the
+    // PRIOR record. After F155 made rkyv decoding strict (bytecheck), any bit
+    // rot in a record's payload trips this break-and-fall-back path, silently
+    // discarding all valid records that came AFTER the corrupted one — the
+    // partition restarts on stale state without a single error logged.
+    //
+    // F157 changes the decode-failure handling to: log a WARN with offset +
+    // error, advance past the corrupted record using its declared msg_len, and
+    // continue scanning. This preserves the legitimate partial-tail-write
+    // behaviour (the `total > buf.len()` check still breaks at the end) while
+    // surfacing mid-stream corruption loudly and refusing to silently drop
+    // newer valid records. If `msg_len` itself is corrupt to point into
+    // garbage, we still bound the damage: the next record's length-prefix will
+    // almost certainly fail decode too, and we'll skip it; eventually we either
+    // find a valid record or exit with `last` populated by the last good one.
     let mut last: Option<TableLocations> = None;
     let mut buf = data;
+    let mut offset = 0usize;
+    let mut skipped: usize = 0;
     while buf.len() >= 4 {
         let msg_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         let total = 4 + msg_len;
         if total > buf.len() {
+            // Legitimate partial-tail-write: stop here.
             break;
         }
         match rkyv_decode::<TableLocations>(&buf[4..4 + msg_len]) {
             Ok(locs) => {
                 last = Some(locs);
-                buf = &buf[total..];
             }
-            Err(_) => break,
+            Err(e) => {
+                tracing::warn!(
+                    offset,
+                    msg_len,
+                    error = %e,
+                    "F157: TableLocations record decode failed (likely bit rot); skipping and continuing"
+                );
+                skipped += 1;
+            }
         }
+        buf = &buf[total..];
+        offset += total;
+    }
+    if skipped > 0 {
+        tracing::warn!(
+            skipped,
+            "F157: skipped {skipped} corrupted TableLocations record(s); newer valid records preserved"
+        );
     }
     last.ok_or_else(|| anyhow!("decode TableLocations: no valid record"))
 }
@@ -4095,6 +4129,49 @@ mod tests {
     fn decode_table_locations_empty_fails() {
         assert!(decode_last_table_locations(&[]).is_err());
         assert!(decode_last_table_locations(&[0, 0, 0]).is_err());
+    }
+
+    /// F157: a corrupted record in the MIDDLE of the stream must not silently
+    /// drop subsequent valid records. Pre-F157 the loop broke on the first
+    /// decode failure and returned the prior record — losing the newer (valid)
+    /// records entirely. Post-F157 the loop logs + skips and continues.
+    #[test]
+    fn f157_decode_table_locations_skips_mid_stream_corruption() {
+        let locs1 = TableLocations {
+            locs: vec![SstLocation { extent_id: 1, offset: 0, len: 100 }],
+            vp_extent_id: 10,
+            vp_offset: 0,
+        };
+        let locs3 = TableLocations {
+            locs: vec![
+                SstLocation { extent_id: 1, offset: 0, len: 100 },
+                SstLocation { extent_id: 2, offset: 0, len: 200 },
+                SstLocation { extent_id: 3, offset: 0, len: 300 },
+            ],
+            vp_extent_id: 30,
+            vp_offset: 100,
+        };
+
+        let mut data = Vec::new();
+        // Record 1: valid.
+        let p1 = rkyv_encode(&locs1);
+        data.extend_from_slice(&(p1.len() as u32).to_le_bytes());
+        data.extend_from_slice(&p1);
+        // Record 2: malformed payload (random bytes prefixed with a valid length).
+        // Use a payload size that's plausible to keep the loop walking past it.
+        let bogus_len: u32 = 64;
+        data.extend_from_slice(&bogus_len.to_le_bytes());
+        data.extend_from_slice(&vec![0xABu8; bogus_len as usize]);
+        // Record 3: valid (the one pre-F157 would silently drop).
+        let p3 = rkyv_encode(&locs3);
+        data.extend_from_slice(&(p3.len() as u32).to_le_bytes());
+        data.extend_from_slice(&p3);
+
+        let decoded = decode_last_table_locations(&data).unwrap();
+        // Must return record 3, NOT record 1.
+        assert_eq!(decoded.locs.len(), 3, "should return record 3, not record 1");
+        assert_eq!(decoded.vp_extent_id, 30);
+        assert_eq!(decoded.vp_offset, 100);
     }
 
     // ── build_sst_bytes test ─────────────────────────────────────────────────

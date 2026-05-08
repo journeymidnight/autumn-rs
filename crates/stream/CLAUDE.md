@@ -27,11 +27,12 @@ Each extent file pair:
 
 | Bytes | Field |
 |-------|-------|
-| 0–7 | Magic: `EXTMETA\0` |
+| 0–7 | Magic: `EXTMETA\0` (V0, legacy) or `EXTMETA\x01` (V1, post-F157) |
 | 8–15 | `extent_id` (le u64) |
 | 16–23 | `sealed_length` (le u64) |
 | 24–31 | `eversion` (le u64) |
 | 32–39 | `last_revision` (le i64) |
+| 40–43 | **F157**: CRC32C of bytes 0–39 (V1 only; V0 lacks this trailer) |
 
 `ExtentEntry` stores `disk_id` for path resolution. `choose_disk()` returns the first online disk (matches Go's strategy). `df()` returns real `statvfs` stats per disk.
 

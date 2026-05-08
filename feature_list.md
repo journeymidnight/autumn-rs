@@ -570,6 +570,32 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F157 · Closes 2 silent data-corruption surfaces (extent .meta CRC + TableLocations skip-on-corruption)
+- **Target:** Close two verified silent-corruption surfaces from the data-corruption-focused audit. Both let undetected bit rot or torn writes silently change recovered state without any error logged.
+- **Bug 1 — Extent .meta sidecar has no checksum** (`crates/stream/src/extent_node.rs` save_meta + parse_meta + META_SIZE constants).
+  Pre-F157 the 40-byte sidecar (`magic[8] | extent_id[8] | sealed_length[8] | eversion[8] | last_revision[8]`) had no CRC. Bit rot in `sealed_length` silently changed an extent's seal state at restart — recovery would load `sealed_length=0` for an actually-sealed extent, accept new appends past the old seal boundary, and corrupt every replica's view of the extent's tail bytes. `parse_meta` validated only the magic and extent_id fields; the four numeric fields were trusted blindly.
+  Fix: bump on-disk format from V0 (40 bytes) to V1 (44 bytes with CRC32C trailer over the first 40). Magic byte `magic[7]` distinguishes versions: V0 = `b"EXTMETA\0"`, V1 = `b"EXTMETA\x01"`. `save_meta` always writes V1 with crc32c. `parse_meta` dispatches: V1 → verify CRC, return None on mismatch (treats as missing meta + WARN log); V0 → legacy parse with no checksum + WARN log; unknown magic → None. Migration is forward-compatible: V0 files keep working post-F157 and auto-upgrade to V1 on next save_meta. Rollback (V0 binary on V1 file) breaks because magic mismatches; acceptable for an operator-driven rare path.
+- **Bug 2 — `decode_last_table_locations` silently drops newer records on mid-stream corruption** (`crates/partition-server/src/lib.rs::decode_last_table_locations`).
+  meta_stream stores `[len:u32 LE][rkyv_payload]…` records. Pre-F157 the loop scanned forward and `break`d on any decode failure, returning the LAST successful decode. After F155 made rkyv decoding strict (bytecheck), any bit rot in a record's payload tripped this break-and-fall-back path, silently discarding all valid records that came AFTER the corrupted one — the partition would restart on stale state without a single error logged. Concrete failure: partition flushes 5 SSTs, bit flip corrupts checkpoint #4, recovery returns checkpoint #3 as authoritative, the 5th SST becomes orphan on disk, every VP from log_stream pointing into the 5th SST's extent is now unreachable.
+  Fix: change decode-failure handling to log a WARN with offset + error, advance past the corrupted record using its declared `msg_len`, and continue scanning. Legitimate partial-tail-write behaviour is preserved (the `total > buf.len()` check still breaks at the end). If `msg_len` itself is corrupt to point into garbage, damage is bounded: the next record's length-prefix will almost certainly fail decode too, and we'll skip it; eventually we either find a valid record or exit with `last` populated by the last good one. After the loop, a summary WARN logs the skip count.
+- **Files:**
+  - `crates/stream/src/extent_node.rs` — META_MAGIC_V0/V1 + META_SIZE_V0/V1 constants, save_meta rewrite, parse_meta dispatch, 6 new tests in `f157_meta_crc_tests`
+  - `crates/partition-server/src/lib.rs` — decode_last_table_locations skip-and-continue, 1 new test in `tests::f157_decode_table_locations_skips_mid_stream_corruption`
+  - `feature_list.md` (this entry)
+  - `claude-progress.txt`
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-stream --lib`: 38/38 pass (was 32; +6 new F157 tests covering V1 round-trip, V0 legacy compat, bit rot in payload, bit rot in CRC trailer, extent_id mismatch, unknown magic).
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 109/109 pass (was 108; +1 new F157 test covering mid-stream-corrupted-record + valid-record-after).
+  - `cargo test -p autumn-manager --lib`: 30/30 pass.
+  - End-to-end: `cluster.sh reset 1` → put → `cluster.sh restart 1` → get → returns the right value. Validates V1 meta survives a process restart (recovery loads V1 sidecar, CRC passes, sealed_length restored).
+- **Out of scope (still deferred):**
+  - F158 candidate — wire-format schema versioning (1-byte prefix + version handshake on connect); pre-condition for safe rolling upgrades.
+  - WAL record per-record CRC (audit found this as MEDIUM but format change requires more careful migration; deferred).
+  - VP offset bit-rot validation — needs verification that SSTable block-level CRC catches the upstream corruption first (pending investigation).
+  - F154 candidate (manager-side `ecConversionInFlight` etcd persistence) — perf hygiene only after F153.
+- **passes:** true
+
 ### F155 · rkyv checked decode (replaces `from_bytes_unchecked` with `from_bytes`)
 - **Target:** Close the verified UB-on-malformed-input hazard in both
   `rkyv_decode` helpers — `crates/rpc/src/manager_rpc.rs:65` and
