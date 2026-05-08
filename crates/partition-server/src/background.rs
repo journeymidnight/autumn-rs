@@ -917,13 +917,28 @@ pub(crate) async fn do_compact(
                 &mut current_builder,
                 SstBuilder::new(compact_vp_eid, compact_vp_off),
             );
-            let sst_bytes = Bytes::from(builder.finish());
+            // F169: build SST bytes off the compio runtime. `builder.finish()`
+            // concatenates all blocks (~256 MiB memcpy at max chunk size) +
+            // bloom-filter finalize + meta encode + CRC32C — typically
+            // 50-100 ms of CPU for a full chunk. flush_one_imm already
+            // wraps this work in spawn_blocking via build_sst_bytes
+            // (per F117 + partition-server/CLAUDE.md note 17); compact's
+            // chunk-emit was the only inline-CPU offender left in the
+            // post-F168 P-log task.
+            let sst_bytes = compio::runtime::spawn_blocking(move || Bytes::from(builder.finish()))
+                .await
+                .map_err(|_| anyhow!("compact builder finish join failed"))?;
             let chunk_bytes = sst_bytes.len() as u64;
             output_bytes += chunk_bytes;
             // F135: route through P-bulk's StreamClient to preserve the
             // single-writer invariant on row_stream.
             let result = compact_row_append(&row_append_tx, &part_sc, row_stream_id, sst_bytes.clone()).await?;
-            let reader = Arc::new(SstReader::from_bytes(sst_bytes)?);
+            // F169: SstReader::from_bytes parses the MetaBlock + bloom +
+            // verifies CRC; ~5-10 ms for a max-chunk SST. Off-loaded too.
+            let reader = compio::runtime::spawn_blocking(move || SstReader::from_bytes(sst_bytes))
+                .await
+                .map_err(|_| anyhow!("compact SstReader join failed"))??;
+            let reader = Arc::new(reader);
             new_readers.push((
                 TableMeta {
                     extent_id: result.extent_id,
@@ -967,13 +982,19 @@ pub(crate) async fn do_compact(
             SstBuilder::new(compact_vp_eid, compact_vp_off),
         );
         builder.set_discards(discards.clone());
-        let sst_bytes = Bytes::from(builder.finish());
+        // F169: same spawn_blocking pattern as the in-loop chunk-emit above.
+        let sst_bytes = compio::runtime::spawn_blocking(move || Bytes::from(builder.finish()))
+            .await
+            .map_err(|_| anyhow!("compact final builder finish join failed"))?;
         let chunk_bytes = sst_bytes.len() as u64;
         output_bytes += chunk_bytes;
         // F135: route through P-bulk's StreamClient to preserve the
         // single-writer invariant on row_stream.
         let result = compact_row_append(&row_append_tx, &part_sc, row_stream_id, sst_bytes.clone()).await?;
-        let reader = Arc::new(SstReader::from_bytes(sst_bytes)?);
+        let reader = compio::runtime::spawn_blocking(move || SstReader::from_bytes(sst_bytes))
+            .await
+            .map_err(|_| anyhow!("compact final SstReader join failed"))??;
+        let reader = Arc::new(reader);
         new_readers.push((
             TableMeta {
                 extent_id: result.extent_id,

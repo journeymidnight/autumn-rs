@@ -570,6 +570,35 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F169 · `do_compact` chunk-emit moves to spawn_blocking (the last big inline-CPU offender)
+- **Target:** Continue the thread-per-core audit from F168. After F168 added a per-1000-entry yield to the merge loop, the next biggest inline CPU work was the chunk-emit itself: `builder.finish()` does a 256 MiB memcpy (concatenates all blocks) + bloom-filter finalize + meta encode + CRC32C ≈ **50-100 ms inline**, then `SstReader::from_bytes` parses the just-built MetaBlock + verifies CRC ≈ **5-10 ms inline**. Both ran on the P-log compio runtime in `do_compact`'s emit path, blocking all other tasks (merged_partition_loop, ps-conn, background_*) for the duration.
+- **Why it slipped earlier:** `flush_one_imm` already wraps the equivalent work in `spawn_blocking` via `build_sst_bytes` (per F117 + partition-server/CLAUDE.md note 17 — "CPU-bound work MUST run on the blocking pool, not the compio event loop"). Compact's chunk-emit was the only inline-CPU site that violated this rule. Both `do_compact` chunk-emit sites (mid-loop at line 920, final at line 985) now match the flush pattern.
+- **Fix:**
+  ```rust
+  let sst_bytes = compio::runtime::spawn_blocking(move || Bytes::from(builder.finish()))
+      .await
+      .map_err(|_| anyhow!("compact builder finish join failed"))?;
+  // ... append to row_stream (already async) ...
+  let reader = compio::runtime::spawn_blocking(move || SstReader::from_bytes(sst_bytes))
+      .await
+      .map_err(|_| anyhow!("compact SstReader join failed"))??;
+  ```
+- **Combined with F168, the P-log compio runtime is now responsive throughout compaction:**
+  - Pre-F168: merge loop ran up to 512 MiB inline (~1-2s blocking).
+  - Post-F168: merge loop yields every 1000 entries (<1 µs micro-pause).
+  - Pre-F169: each chunk-emit blocked 50-110 ms inline (memcpy + parse).
+  - Post-F169: chunk-emit fully off-loaded to the blocking pool; the P-log task only awaits the join.
+- **Files:** `crates/partition-server/src/background.rs` (2 chunk-emit sites + comments), `feature_list.md`, `claude-progress.txt`.
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo build --release --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 122/122 pass.
+  - End-to-end: `cluster.sh reset 1` + 3-key put/get + `autumn-client compact 9` round-trip ok (V1 frame default ON post-F165).
+- **Operational notes:**
+  - The blocking pool is global (compio runtime-wide), shared with `flush_one_imm`'s `build_sst_bytes`. If both flush + compact emit chunks at the same time, they share the pool and serialize naturally on a single blocking thread (default pool size). Contention is bounded by the foreground put rate that drives flush + the explicit `compact` RPC dispatch — both are bursty, not sustained.
+  - Heartbeat (PS-main runtime) was already unaffected per F168's analysis. F169 closes the remaining client-put-stall window during compaction on the same partition.
+- **passes:** true
+
 ### F168 · Cooperative yield in `do_compact` merge loop (thread-per-core principle enforcement)
 - **Target:** Investigate user-flagged concern — does GC pressure cause heartbeat loss? Audit confirms a real violation of the thread-per-core principle ("compio runtime should never block due to CPU busy") in `do_compact`'s merge loop, even though heartbeat itself is NOT lost.
 - **Audit findings:**
