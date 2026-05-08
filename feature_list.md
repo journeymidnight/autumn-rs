@@ -570,6 +570,35 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F171 · `UnsafeCell<CompioFile>` → `RefCell<Rc<CompioFile>>` structural migration (close the file-replace UB at the type level)
+- **Target:** Close the type-level UB at the file-replacement path on the extent node, completing the F166/F167 line of work. Pre-F166 the file handle was held in `UnsafeCell<CompioFile>` and accessed via `unsafe { &mut *file.get() }` borrows that aliased across `.await` (a real Rust UB the compiler is allowed to reason against, regardless of single-threaded compio execution). F166 fixed two `&mut` borrow sites by switching to shared `&File` via compio's `SharedFd` interior mutability. F167 encapsulated the file-REPLACE site (`*entry.file.get() = new_file` during EC commit) with a documented `unsafe fn replace_file_under_lock` and a safety contract relying on F153's per-extent EC-conversion lock. F167 documented but did NOT close the structural concern: a concurrent reader holding `&CompioFile` from `unsafe { &*file.get() }` is type-level dangling if the replace fires mid-read. F119-C's eversion-mismatch covers it in practice; F171 closes it at the type level.
+- **Approach (5 file helpers + ~20 call sites + 1 field type + 1 method):**
+  - **Field type:** `UnsafeCell<CompioFile>` → `RefCell<Rc<CompioFile>>`. Brief `borrow()` to clone the `Rc` for I/O; `borrow_mut()` for replace. No `unsafe`.
+  - **`ExtentEntry::file_rc(&self) -> Rc<CompioFile>`:** the canonical accessor. Clones the inner `Rc` under a brief `borrow()`. The clone is captured by the I/O future across `.await`; the `RefCell` borrow itself is released by `.clone()` before the future awaits.
+  - **`ExtentEntry::replace_file(&self, new: CompioFile)`:** safe `borrow_mut()` + `Rc::replace` (well, `*self.file.borrow_mut() = Rc::new(new)`). The OLD `Rc` is dropped only when the LAST concurrent reader releases its clone — the fd cannot dangle.
+  - **Helper signatures:** `file_pwrite`, `file_pread`, `file_pwrite_chunked`, `file_pread_chunked` all take `Rc<CompioFile>` by value (the future captures it). The free function `file_ref` is deleted — callers use `entry.file_rc()` directly.
+  - **Construction sites:** 3 `ExtentEntry { file: UnsafeCell::new(file), .. }` → `RefCell::new(Rc::new(file))`. The `staging_cell` site in `prepare_shard_local` becomes a plain local `Rc<CompioFile>` (the staging file is never aliased — its path is unique per extent).
+- **Why this and not earlier:** F167's deferred footnote called this out: "A FULL fix that closes this type-level UB would migrate `UnsafeCell<CompioFile>` to `RefCell<Rc<CompioFile>>` ... ~50-100 LOC across all `file_*` helpers and ~20 call sites; deferred to a future feature when the structural cost is justified." F171 is exactly that work, sized in at ~140 LOC across helpers + 17 call sites + 1 field + 1 method.
+- **What's no longer load-bearing post-F171:**
+  - F153's per-extent `ec_conversion_locks` `futures::lock::Mutex<()>` remains for higher-level serialisation against concurrent EC dispatches racing on the staging path — but it is no longer the only thing between us and a dangling fd. The fd is now structurally protected by `Rc` refcount semantics.
+  - F119-C's eversion-mismatch reject is similarly belt-and-braces for client-side cache freshness, no longer the sole memory-safety guarantor.
+- **What is now zero in the file-access path:**
+  - `unsafe` blocks: 0 (the only remaining `unsafe` in `extent_node.rs` is libc setsockopt at lines 182 + 456 for TCP socket tuning).
+  - `UnsafeCell` mentions: 0 in code (only in F171 doc-comment describing the pre-F171 pattern).
+  - `file.get()` calls: 0 in code.
+- **Files:** `crates/stream/src/extent_node.rs` (field type + 5 helpers + 17 call sites + 3 construction sites + replace_file rewrite + build_append_future + build_read_future), `crates/stream/CLAUDE.md` (ExtentEntry section rewritten), `feature_list.md`, `claude-progress.txt`.
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo build --release --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-stream --lib`: 40/40 pass.
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 122/122 pass.
+  - `cargo test -p autumn-manager --lib`: 30/30 pass.
+- **Operational notes:**
+  - Per-I/O cost: one `Rc::clone` (atomic increment, ~1-2 ns) before each pread/pwrite. Negligible relative to the syscall + io_uring round-trip (~µs minimum). Throughput-neutral.
+  - Memory: `Rc<CompioFile>` is 16 bytes (pointer + control block) vs `CompioFile` inline. The `RefCell` adds 8 bytes for the borrow flag. Per-extent overhead ~24 bytes on top of the existing `ExtentEntry`. Negligible at typical extent counts.
+  - Refactor preserves semantics 1:1: the `Rc::clone` happens at the same logical site that previously did `unsafe { &*file.get() }`; the I/O paths are otherwise unchanged.
+- **passes:** true
+
 ### F170 · `ec_slice_decoded` zero-copy full-read (close the post-spawn_blocking memcpy on EC reads)
 - **Target:** Continue the thread-per-core audit from F168/F169. The remaining outlier in the EC read path: `ec_slice_decoded` was called INLINE on the compio runtime AFTER `spawn_blocking(ec_decode)` returns (`crates/stream/src/client.rs:1967` in `ec_read_full_and_slice`). Its full-read branch (offset=0, length=0 — the dominant case during recovery / large-VP fetches) unconditionally `.to_vec()`'d the entire decoded payload, which on a 256 MiB EC-decoded extent is **50-100 ms of inline memcpy** on the caller's compio runtime. F117 + partition-server/CLAUDE.md note 17 are explicit: CPU-bound work MUST run on the blocking pool. F170 closes this last hot-path violation in the EC read pipeline.
 - **Fix:** Change `ec_slice_decoded` to take `Vec<u8>` by value. The full-read branch returns the input Vec via ownership transfer (zero allocation, zero memcpy). Sub-range reads still allocate `read_len` bytes (typically 4 KiB – 1 MiB for VP-sized requests), but the dominant full-extent path is now strictly zero-copy. The single production call site at `client.rs:1967` already owns `full_payload: Vec<u8>` returned from `ec_read_full`, so the move semantics line up with no caller changes beyond dropping the `&` borrow operator.

@@ -309,7 +309,21 @@ impl ExtentNodeConfig {
 // ─── ExtentEntry ─────────────────────────────────────────────────────────────
 
 pub(crate) struct ExtentEntry {
-    pub(crate) file: std::cell::UnsafeCell<CompioFile>,
+    /// F171: structural close of the type-level UB at the file-replacement
+    /// path. Pre-F171 this was `UnsafeCell<CompioFile>` and the replace
+    /// path (`*entry.file.get() = new_file`) could dangle a concurrent
+    /// reader's `&CompioFile` borrow if F153's EC-conversion lock missed
+    /// any reader (theoretical UB even when in practice ruled out by
+    /// F119-C's eversion check).
+    ///
+    /// Post-F171: `RefCell<Rc<CompioFile>>`. Reads clone the `Rc` while
+    /// holding a brief `borrow()`; the I/O runs on the cloned `Rc` so
+    /// the borrow is released before any `.await`. The replace path
+    /// takes a `borrow_mut()` and `Rc::replace` — the OLD `Rc` is
+    /// returned and dropped only when the last concurrent reader
+    /// releases its clone, so the underlying file handle / fd cannot
+    /// dangle. No `unsafe` anywhere in the file-access path.
+    pub(crate) file: RefCell<Rc<CompioFile>>,
     pub(crate) len: AtomicU64,
     pub(crate) eversion: AtomicU64,
     pub(crate) sealed_length: AtomicU64,
@@ -320,40 +334,29 @@ pub(crate) struct ExtentEntry {
 }
 
 impl ExtentEntry {
-    /// F167: replace the file handle in-place. The previous
-    /// `unsafe { *entry.file.get() = new_file }` had no encapsulation;
-    /// any contributor could write the same pattern at a NEW call site
-    /// without realising the F153 EC-conversion-lock invariant the
-    /// existing call site relies on. This helper centralises the unsafe
-    /// + documents the invariant once.
+    /// F171: replace the file handle. Safe by construction —
+    /// `RefCell::borrow_mut` panics if any borrow is currently held,
+    /// and concurrent readers have already cloned an `Rc<CompioFile>`
+    /// off a brief `borrow()` so they hold no `RefCell` borrow during
+    /// their I/O. The OLD `Rc` is returned and dropped only when the
+    /// last concurrent reader releases its clone — the underlying fd
+    /// cannot dangle.
     ///
-    /// # Safety
-    /// Caller MUST guarantee NO concurrent access to `self.file` for the
-    /// full duration of this call. Specifically:
-    ///   - No other compio task on the same runtime may hold a `&CompioFile`
-    ///     borrow obtained via `unsafe { &*self.file.get() }` (file_pwrite,
-    ///     file_pread, file_ref, etc.).
-    ///   - No other compio task may have a future-pinned write on this file
-    ///     (build_append_future, file_pwrite, file_pwrite_chunked).
-    ///
-    /// In production the only call site is `handle_convert_to_ec`'s commit
-    /// phase, which is serialised against concurrent ec dispatches by
-    /// F153's `ec_conversion_locks` per-extent `futures::lock::Mutex<()>`.
-    /// Concurrent reads (handle_read_bytes / handle_copy_extent) on the
-    /// same extent during EC commit are theoretically possible but in
-    /// practice rejected by F119-C's eversion-mismatch check (the manager
-    /// has bumped eversion before dispatching EC convert; readers with
-    /// the pre-bump eversion get CODE_EVERSION_MISMATCH and refetch).
-    ///
-    /// A FULL fix that closes this type-level UB would migrate
-    /// `UnsafeCell<CompioFile>` to `RefCell<Rc<CompioFile>>` so the
-    /// replacement returns the old `Rc` to be dropped after concurrent
-    /// readers release their clones. ~50-100 LOC across all `file_*`
-    /// helpers and ~20 call sites; deferred to a future feature when
-    /// the structural cost is justified by a real failure (not yet
-    /// observed in production).
-    pub(crate) unsafe fn replace_file_under_lock(&self, new_file: CompioFile) {
-        unsafe { *self.file.get() = new_file }
+    /// F153's per-extent EC-conversion lock still serialises concurrent
+    /// `handle_convert_to_ec` dispatches at a higher level (so two
+    /// converts don't race on the staging file), but is no longer
+    /// load-bearing for memory safety of the replace itself.
+    pub(crate) fn replace_file(&self, new_file: CompioFile) {
+        *self.file.borrow_mut() = Rc::new(new_file);
+    }
+
+    /// F171: clone the current file Rc for I/O. Caller's `Rc` keeps
+    /// the underlying fd alive across `.await` boundaries, even if
+    /// another task calls `replace_file` mid-flight (the new file
+    /// handle goes into the RefCell; the old one stays alive in the
+    /// I/O caller's clone until they drop).
+    pub(crate) fn file_rc(&self) -> Rc<CompioFile> {
+        self.file.borrow().clone()
     }
 }
 
@@ -462,38 +465,33 @@ fn set_tcp_buffer_sizes(stream: &compio::net::TcpStream, size: usize) {
     }
 }
 
-/// Shared ref to file inside UnsafeCell (single-threaded compio).
-fn file_ref(file: &std::cell::UnsafeCell<CompioFile>) -> &CompioFile {
-    unsafe { &*file.get() }
-}
-
 /// Positional write (pwrite) at reserved offset — safe for concurrent
 /// non-overlapping offsets (each caller uses fetch_add to reserve).
 ///
-/// F166: takes a SHARED reference via `&*file.get()` (not `&mut`).
-/// compio's `impl AsyncWriteAt for &File` (compio_fs/file.rs:250) uses
-/// `SharedFd` interior mutability internally, so `&CompioFile` suffices
-/// — and shared refs to `UnsafeCell` content can legally alias, which
-/// the previous `&mut *file.get()` did NOT (Rust's `&mut` exclusivity
-/// rule is at the lifetime level, not the temporal level; two compio
-/// futures on the same runtime each holding a `&mut` across awaits
-/// have overlapping lifetimes regardless of single-threaded execution).
-/// The `let mut f` pattern below is just to satisfy the
-/// `AsyncWriteAtExt::write_all_at` signature (`&mut self where Self =
-/// &File`) — the underlying `&File` value is shared.
+/// F171: takes `Rc<CompioFile>` by value. The caller cloned the `Rc`
+/// off `entry.file_rc()` before invoking us, so the `RefCell` borrow
+/// is already released and the underlying fd is kept alive by THIS
+/// future's captured `Rc` for the duration of the `.await`. If
+/// another task calls `entry.replace_file(new_file)` while this
+/// pwrite is in flight, the old fd survives until our `Rc` drops.
+///
+/// compio's `impl AsyncWriteAt for &File` (compio_fs/file.rs:250)
+/// uses `SharedFd` interior mutability, so `&*rc` (giving
+/// `&CompioFile`) suffices for the `write_all_at` syscall.
 async fn file_pwrite(
-    file: &std::cell::UnsafeCell<CompioFile>,
+    file: Rc<CompioFile>,
     offset: u64,
     data: impl compio::buf::IoBuf,
 ) -> Result<()> {
-    let mut f: &CompioFile = unsafe { &*file.get() };
+    let mut f: &CompioFile = &*file;
     let BufResult(result, _) = f.write_all_at(data, offset).await;
     result.map_err(|e| anyhow::anyhow!(e))
 }
 
-/// Positional read (pread).
-async fn file_pread(file: &std::cell::UnsafeCell<CompioFile>, offset: u64, len: usize) -> Result<Vec<u8>> {
-    let f = unsafe { &*file.get() };
+/// Positional read (pread). F171: see `file_pwrite` for the
+/// `Rc<CompioFile>` rationale.
+async fn file_pread(file: Rc<CompioFile>, offset: u64, len: usize) -> Result<Vec<u8>> {
+    let f: &CompioFile = &*file;
     let buf = vec![0u8; len];
     let BufResult(result, buf) = f.read_exact_at(buf, offset).await;
     result.map_err(|e| anyhow::anyhow!(e))?;
@@ -510,7 +508,7 @@ const FILE_IO_CHUNK_BYTES: usize = 256 * 1024 * 1024;
 /// Chunked pread for full-extent reads (recovery / EC convert / etc.).
 /// Single-shot reads <= FILE_IO_CHUNK_BYTES bypass the loop.
 async fn file_pread_chunked(
-    file: &std::cell::UnsafeCell<CompioFile>,
+    file: Rc<CompioFile>,
     offset: u64,
     len: usize,
 ) -> Result<Vec<u8>> {
@@ -522,7 +520,7 @@ async fn file_pread_chunked(
     let stop = offset + len as u64;
     while cur < stop {
         let want = ((stop - cur) as usize).min(FILE_IO_CHUNK_BYTES);
-        let part = file_pread(file, cur, want).await?;
+        let part = file_pread(file.clone(), cur, want).await?;
         let got = part.len() as u64;
         buf.extend_from_slice(&part);
         if got == 0 {
@@ -541,7 +539,7 @@ async fn file_pread_chunked(
 /// the per-chunk `chunk.to_vec()` round-trip that previously forced
 /// `O(extent)` event-loop memcpy on every full-extent write.
 async fn file_pwrite_chunked(
-    file: &std::cell::UnsafeCell<CompioFile>,
+    file: Rc<CompioFile>,
     offset: u64,
     data: Bytes,
 ) -> Result<()> {
@@ -554,7 +552,7 @@ async fn file_pwrite_chunked(
         let take = FILE_IO_CHUNK_BYTES.min(bytes.len());
         let chunk = bytes.split_to(take);
         let chunk_len = chunk.len() as u64;
-        file_pwrite(file, cur, chunk).await?;
+        file_pwrite(file.clone(), cur, chunk).await?;
         cur += chunk_len;
     }
     Ok(())
@@ -985,18 +983,13 @@ async fn build_append_future(
     let extent_for_io = extent;
     Box::pin(async move {
         let write_t0 = Instant::now();
-        // F166: use compio's `&File` AsyncWriteAt impl (SharedFd interior
-        // mutability) instead of `&mut *file.get()`. Pre-F166 the comment
-        // here claimed "compio is single-threaded so &mut aliasing is
-        // serialised per-future" — but Rust's `&mut` aliasing rule is at
-        // the LIFETIME level, not the temporal level: two compio futures
-        // each holding `&mut` across awaits have overlapping lifetimes
-        // regardless of single-thread execution, which is UB the compiler
-        // is allowed to reason against. Shared `&CompioFile` refs alias
-        // freely under UnsafeCell semantics; concurrent writes are
-        // serialised by the kernel/io_uring at the syscall level (not by
-        // Rust's borrow checker).
-        let mut f: &CompioFile = unsafe { &*extent_for_io.file.get() };
+        // F171: clone the `Rc<CompioFile>` off the RefCell once. The
+        // future captures this `Rc` so the underlying fd survives any
+        // concurrent `entry.replace_file()` (e.g. EC commit) until our
+        // I/O completes — the old fd lives until the LAST clone drops.
+        // The `RefCell` borrow is released immediately by `.clone()`.
+        let file_rc = extent_for_io.file_rc();
+        let mut f: &CompioFile = &*file_rc;
         let BufResult(wr, _) = f.write_vectored_at(bufs, file_start).await;
         if let Err(e) = wr {
             node.mark_disk_offline_for_extent(extent_id);
@@ -1008,7 +1001,7 @@ async fn build_append_future(
         }
 
         if must_sync {
-            let f_ref: &CompioFile = unsafe { &*extent_for_io.file.get() };
+            let f_ref: &CompioFile = &*file_rc;
             if let Err(e) = f_ref.sync_data().await {
                 node.mark_disk_offline_for_extent(extent_id);
                 let msg = e.to_string();
@@ -1093,7 +1086,11 @@ fn build_read_future(
                 (req.length as u64).min(total_len.saturating_sub(read_offset))
             };
 
-            let f: &CompioFile = unsafe { &*extent.file.get() };
+            // F171: clone the file Rc once per slot; same rationale as
+            // build_append_future. The RefCell borrow is released by
+            // `.clone()` before any `.await`.
+            let file_rc = extent.file_rc();
+            let f: &CompioFile = &*file_rc;
             let buf = vec![0u8; read_size as usize];
             let BufResult(result, buf) = f.read_exact_at(buf, read_offset).await;
             let bytes = match result {
@@ -1533,7 +1530,7 @@ impl ExtentNode {
                 extents.insert(
                     extent_id,
                     Rc::new(ExtentEntry {
-                        file: std::cell::UnsafeCell::new(file),
+                        file: RefCell::new(Rc::new(file)),
                         len: AtomicU64::new(len),
                                 eversion: AtomicU64::new(eversion),
                         sealed_length: AtomicU64::new(sealed_length),
@@ -1848,7 +1845,7 @@ impl ExtentNode {
         self.extents.insert(
             extent_id,
             Rc::new(ExtentEntry {
-                        file: std::cell::UnsafeCell::new(file),
+                        file: RefCell::new(Rc::new(file)),
                 len: AtomicU64::new(len),
                 eversion: AtomicU64::new(1),
                 sealed_length: AtomicU64::new(0),
@@ -1920,7 +1917,7 @@ impl ExtentNode {
             // (manager re-applies the seal on next contact). Save_meta
             // itself was also made durable in F159 (open + write + fsync,
             // not bare `compio::fs::write`).
-            if let Err(e) = file_ref(&extent.file).sync_data().await {
+            if let Err(e) = extent.file_rc().sync_data().await {
                 tracing::warn!(
                     extent_id,
                     sealed_length = ex.sealed_length,
@@ -1935,7 +1932,7 @@ impl ExtentNode {
 
 
     async fn truncate_to_commit(extent: &Rc<ExtentEntry>, commit: u32) -> Result<(), String> {
-        let f = file_ref(&extent.file);
+        let f = extent.file_rc();
         f.set_len(commit as u64).await.map_err(|e| e.to_string())?;
         // F152: fsync the truncate. Without this, the kernel may report the
         // smaller size in stat() before the inode metadata is durable; if the
@@ -2110,14 +2107,14 @@ impl ExtentNode {
 
         let extent = self.ensure_extent(task.extent_id).await?;
 
-        file_ref(&extent.file)
+        extent.file_rc()
             .set_len(0)
             .await
             .map_err(|e| e.to_string())?;
         let payload_len = payload.len() as u64;
-        file_pwrite_chunked(&extent.file, 0, Bytes::from(payload)).await
+        file_pwrite_chunked(extent.file_rc(), 0, Bytes::from(payload)).await
             .map_err(|e| e.to_string())?;
-        file_ref(&extent.file).sync_data().await
+        extent.file_rc().sync_data().await
             .map_err(|e| e.to_string())?;
 
         // F147-C: verify-after-sync — a concurrent apply_extent_meta_durable
@@ -2298,10 +2295,14 @@ impl ExtentNode {
             .await
             .map_err(|e| (StatusCode::Internal, format!("create staging {extent_id}: {e}")))?;
 
-        let staging_cell = std::cell::UnsafeCell::new(staging_file);
-        file_pwrite_chunked(&staging_cell, 0, shard_data).await
+        // F171: staging file is local to this function — never aliased
+        // by other tasks (the path is unique per `extent_id`), so a
+        // freshly-created `Rc` suffices. We share via clone for the
+        // sync_data call below.
+        let staging_rc = Rc::new(staging_file);
+        file_pwrite_chunked(staging_rc.clone(), 0, shard_data).await
             .map_err(|e| (StatusCode::Internal, format!("write staging {extent_id}/{shard_index}: {e}")))?;
-        file_ref(&staging_cell).sync_data().await
+        staging_rc.sync_data().await
             .map_err(|e| (StatusCode::Internal, format!("sync staging {extent_id}: {e}")))?;
 
         tracing::info!(
@@ -2371,14 +2372,16 @@ impl ExtentNode {
             .map(|m| m.len())
             .map_err(|e| (StatusCode::Internal, format!("metadata {extent_id}: {e}")))?;
 
-        // F167: encapsulated unsafe with documented invariant — see
-        // `ExtentEntry::replace_file_under_lock` for the full safety
-        // contract. The F153 per-extent `ec_conversion_locks`
-        // `futures::lock::Mutex<()>` (acquired at the start of
-        // `handle_convert_to_ec`) is the load-bearing serialisation
-        // mechanism; F119-C's eversion-mismatch reject covers
-        // concurrent reads from stale-cached clients.
-        unsafe { entry.replace_file_under_lock(new_file); }
+        // F171: safe replace via `RefCell::borrow_mut` + `Rc` swap.
+        // Concurrent readers have already cloned an `Rc<CompioFile>`
+        // off `entry.file_rc()` for their I/O, so they keep the OLD
+        // file alive in their captured `Rc` until they drop. F153's
+        // per-extent `ec_conversion_locks` still serialises concurrent
+        // EC dispatches at the handler level (so two converts don't
+        // race on the staging path), and F119-C's eversion-mismatch
+        // reject covers concurrent reads from stale-cached clients —
+        // but they are no longer load-bearing for memory safety here.
+        entry.replace_file(new_file);
 
         entry.len.store(shard_len, Ordering::SeqCst);
         // F119-E: sealed_length = original payload length (from manager),
@@ -2547,12 +2550,12 @@ impl ExtentNode {
 
         let data_payload = req.payload;
 
-        if let Err(e) = file_pwrite(&extent.file, start, data_payload.clone()).await {
+        if let Err(e) = file_pwrite(extent.file_rc(), start, data_payload.clone()).await {
             self.mark_disk_offline_for_extent(req.extent_id);
             return Err((StatusCode::Internal, e.to_string()));
         }
         if req.must_sync {
-            if let Err(e) = file_ref(&extent.file).sync_data().await {
+            if let Err(e) = extent.file_rc().sync_data().await {
                 self.mark_disk_offline_for_extent(req.extent_id);
                 return Err((StatusCode::Internal, e.to_string()));
             }
@@ -2622,7 +2625,7 @@ impl ExtentNode {
         // 0x7ffff000 on Linux. Recovery (`copy_bytes_from_source`) sends
         // length=0 to slurp full sealed extents in one RPC, so the
         // per-syscall size on the server side can exceed 2 GiB.
-        let data = file_pread_chunked(&extent.file, read_offset, read_size as usize).await
+        let data = file_pread_chunked(extent.file_rc(), read_offset, read_size as usize).await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
 
         Ok(ReadBytesResp {
@@ -2744,7 +2747,7 @@ impl ExtentNode {
         self.extents.insert(
             req.extent_id,
             Rc::new(ExtentEntry {
-                        file: std::cell::UnsafeCell::new(file),
+                        file: RefCell::new(Rc::new(file)),
                 len: AtomicU64::new(len),
                 eversion: AtomicU64::new(1),
                 sealed_length: AtomicU64::new(0),
@@ -3081,14 +3084,14 @@ impl ExtentNode {
         let write_payload = Bytes::from(raw_payload[..want].to_vec());
 
 
-        file_ref(&extent.file)
+        extent.file_rc()
             .set_len(0)
             .await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
         let payload_len = write_payload.len() as u64;
-        file_pwrite_chunked(&extent.file, 0, write_payload).await
+        file_pwrite_chunked(extent.file_rc(), 0, write_payload).await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
-        file_ref(&extent.file).sync_data().await
+        extent.file_rc().sync_data().await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
         extent.len.store(payload_len, Ordering::SeqCst);
 
@@ -3202,7 +3205,7 @@ impl ExtentNode {
             req.size.min(logical_len.saturating_sub(offset))
         };
 
-        let data = file_pread_chunked(&extent.file, offset, size as usize).await
+        let data = file_pread_chunked(extent.file_rc(), offset, size as usize).await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
 
         Ok(CopyExtentResp {
@@ -3397,14 +3400,14 @@ impl ExtentNode {
                     ));
                 }
                 let truncated = Bytes::from(fetched[..sealed_length as usize].to_vec());
-                file_ref(&entry.file)
+                entry.file_rc()
                     .set_len(0)
                     .await
                     .map_err(|e| (StatusCode::Internal, format!("truncate {extent_id}: {e}")))?;
-                file_pwrite_chunked(&entry.file, 0, truncated)
+                file_pwrite_chunked(entry.file_rc(), 0, truncated)
                     .await
                     .map_err(|e| (StatusCode::Internal, format!("write {extent_id}: {e}")))?;
-                file_ref(&entry.file)
+                entry.file_rc()
                     .sync_data()
                     .await
                     .map_err(|e| (StatusCode::Internal, format!("sync {extent_id}: {e}")))?;
@@ -3413,7 +3416,7 @@ impl ExtentNode {
             }
 
             if !f128_recovered {
-            let data = file_pread_chunked(&entry.file, 0, sealed_length as usize).await
+            let data = file_pread_chunked(entry.file_rc(), 0, sealed_length as usize).await
                 .map_err(|e| (StatusCode::Internal, format!("read extent {extent_id}: {e}")))?;
 
             // F117: offload RS encode to blocking thread.

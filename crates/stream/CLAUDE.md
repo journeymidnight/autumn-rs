@@ -54,17 +54,41 @@ In memory, `ExtentNode` holds a `Rc<DashMap<u64, Rc<ExtentEntry>>>` (single-thre
 
 ```rust
 struct ExtentEntry {
-    file: UnsafeCell<CompioFile>, // compio::fs::File, UnsafeCell for async I/O
-    len: AtomicU64,               // current byte length
-    eversion: AtomicU64,          // bumped on seal or eversion change
-    sealed_length: AtomicU64,     // 0 = active; >0 = sealed at this length
-    avali: AtomicU32,             // availability flag (non-zero = sealed)
-    last_revision: AtomicI64,     // most recent owner revision seen
-    disk_id: u64,                 // immutable after creation
+    file: RefCell<Rc<CompioFile>>, // F171: structural close of file-replace UB
+    len: AtomicU64,                // current byte length
+    eversion: AtomicU64,           // bumped on seal or eversion change
+    sealed_length: AtomicU64,      // 0 = active; >0 = sealed at this length
+    avali: AtomicU32,              // availability flag (non-zero = sealed)
+    last_revision: AtomicI64,      // most recent owner revision seen
+    disk_id: u64,                  // immutable after creation
 }
 ```
 
 No `write_lock` — appends are serialized by the single-threaded compio runtime (sequential processing in `handle_connection`).
+
+**F171 — file handle is `RefCell<Rc<CompioFile>>` (no `unsafe` in the file path).**
+Pre-F171 the field was `UnsafeCell<CompioFile>` and access used
+`unsafe { &*file.get() }` for borrows, `unsafe { *file.get() = new_file }` for
+the EC-commit replace. F166 removed the `&mut` aliasing UB on the borrow paths
+by switching to shared refs through compio's `impl AsyncWriteAt for &File`
+(`SharedFd` interior mutability). F167 encapsulated the replace path with a
+documented invariant. F171 closes the remaining type-level UB structurally:
+- All borrows go through `entry.file_rc()` which clones the inner `Rc<CompioFile>`
+  under a brief `RefCell::borrow()`; the clone is held by the I/O future across
+  `.await`. The `RefCell` borrow itself is released before the first `.await`.
+- The file-replace path (`commit_shard_local`) calls `entry.replace_file(new)`
+  which is a safe `RefCell::borrow_mut()` + `Rc::replace`. The OLD `Rc` is
+  dropped only when the LAST concurrent reader releases its clone, so the
+  underlying fd cannot dangle.
+- F153's per-extent `ec_conversion_locks` is no longer load-bearing for memory
+  safety; it remains as a higher-level serialisation against concurrent EC
+  dispatches racing on the staging path.
+
+Helper signatures (`file_pwrite`, `file_pread`, `file_pwrite_chunked`,
+`file_pread_chunked`) all take `Rc<CompioFile>` by value; the I/O future
+captures it. The free function `file_ref` was removed — callers use
+`entry.file_rc()` directly. There is no `unsafe` in any file-access path
+on the extent node post-F171.
 
 ### Connection Handling & Batch Optimization (R4 step 4.2 v3 — true SQ/CQ)
 
