@@ -1138,6 +1138,11 @@ struct PartitionHandle {
     /// read by the main thread's `report_load_loop`. Arc is Send so this
     /// is safe to clone across threads.
     metrics: std::sync::Arc<PartitionMetrics>,
+    /// F184: snapshot of (rg, log/row/meta stream ids) at open time.
+    /// `sync_regions_once` compares this against the latest manager
+    /// regions snapshot to detect a wider rg (post-merge) or new
+    /// stream IDs and force a reopen.
+    opened_with: (Range, u64, u64, u64),
     /// JoinHandle retained for RAII.
     #[allow(dead_code)]
     join: Option<std::thread::JoinHandle<()>>,
@@ -1516,9 +1521,28 @@ impl PartitionServer {
         // and exits, which in turn closes every ps-conn task's `req_tx`
         // clone — merged_partition_loop observes `req_rx.next() == None` and
         // drains. The partition thread then joins on its own.
+        //
+        // F184: also detect partitions whose (rg, stream_ids) changed since
+        // open (e.g., post-merge widening; post-split stream rotation that
+        // wasn't caught by F103). Drop the handle so the open-new-partitions
+        // pass reopens with fresh state.
         let current: Vec<u64> = self.partitions.borrow().keys().copied().collect();
         for part_id in current {
-            if !wanted.contains_key(&part_id) {
+            let drop_for_reload = match wanted.get(&part_id) {
+                None => true,
+                Some(latest) => {
+                    let opened = self.partitions.borrow().get(&part_id).map(|h| h.opened_with.clone());
+                    match opened {
+                        Some(prev) => prev != *latest,
+                        None => false,
+                    }
+                }
+            };
+            if drop_for_reload {
+                tracing::info!(
+                    "PS {} F184 reloading partition {part_id} due to region change",
+                    self.ps_id
+                );
                 self.partitions.borrow_mut().remove(&part_id);
             }
         }
@@ -1564,6 +1588,10 @@ impl PartitionServer {
         let owner_key = self.server_owner_key.clone();
         let revision = self.server_revision.get();
         let ps_id = self.ps_id;
+        // F184: snapshot the open-time params for sync_regions_once
+        // change-detection (post-merge widening, post-split narrowing,
+        // stream-ID rotation).
+        let opened_with = (rg.clone(), log_stream_id, row_stream_id, meta_stream_id);
 
         // F099-K port allocation: reserve the next ordinal eagerly so a
         // later `open_partition` never collides with this one even if the
@@ -1681,6 +1709,7 @@ impl PartitionServer {
             drain_tx: Some(drain_tx),
             part_addr: advertise_addr,
             metrics: metrics_for_handle,
+            opened_with,
             join: Some(join),
         })
     }

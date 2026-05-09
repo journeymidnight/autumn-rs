@@ -181,7 +181,7 @@ pub async fn upsert_partition(
         )
         .await
         .expect("upsert partition");
-    let r: CodeResp = rkyv_decode(&resp).expect("decode CodeResp");
+    let r: UpsertPartitionResp = rkyv_decode(&resp).expect("decode UpsertPartitionResp");
     assert_eq!(r.code, CODE_OK, "upsert_partition failed: {}", r.message);
 }
 

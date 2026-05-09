@@ -96,7 +96,7 @@ where
 // ── Shared domain types ─────────────────────────────────────────────────────
 
 /// Range of keys [start_key, end_key). Empty end_key means unbounded.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct MgrRange {
     pub start_key: Vec<u8>,
     pub end_key: Vec<u8>,
