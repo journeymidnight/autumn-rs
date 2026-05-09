@@ -7,8 +7,30 @@ license.workspace = true
 [lib]
 name = "autumn_ioring"
 
+[[bin]]
+name = "autumn-ioring-daemon"
+path = "src/bin/daemon.rs"
+required-features = ["daemon"]
+
+[features]
+default = []
+# `daemon` pulls in the autumn-client + compio runtime dependencies
+# needed to actually service SQEs against an autumn-rs cluster. The
+# core protocol crate (`lib`) builds without these deps so it can be
+# linked into a Python pyo3 binding (F180-D) without the heavy
+# transitive compio chain.
+daemon = ["dep:autumn-client", "dep:compio", "dep:futures", "dep:anyhow", "dep:tracing-subscriber", "dep:clap"]
+
 [dependencies]
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 libc = "0.2"
+
+# Optional — only pulled in when the `daemon` feature is on.
+autumn-client = { path = "../client", optional = true }
+compio = { version = "0.18", features = ["net", "io", "macros", "time", "fs"], optional = true }
+futures = { version = "0.3", optional = true }
+anyhow = { workspace = true, optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
