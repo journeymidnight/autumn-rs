@@ -1,90 +1,107 @@
 Date: 2026-05-09
-TaskStatus: not_completed
-Task scope: F129 — PutStream / GetStream multipart upload.
-            Phase A: wire types + multi-frag VP encoding (committed e49e120).
-            Phase B: PS server side (committed da5c8fd).
-            Phase D: client API + autumn-client subcommands. THIS COMMIT.
-            Phase E (deferred): GC awareness of OP_CHUNK_BLOB / multi-
-                                 frag VP refs (= F130 active rewrite).
-            Phase F (deferred): autumn-fuse perf evaluation.
+TaskStatus: completed
+Task scope: F183 — Partition merge primitive + advisory policy engine.
+            Stage 1: manual merge via CLI orchestration + advisory engine (no
+            auto-trigger, no PS-side handle_merge_part). Stage 2 (auto-split
+            behind feature flag) and Stage 3 (auto-merge + PS-side splice
+            handler) are deferred follow-ups.
 
-F129 Phase D — what landed in this commit:
+What landed in this commit family (F183-A through F183-J):
 
-  AutumnError extensions (crates/client/src/lib.rs):
-    - 2 new variants: ValueTooLarge { size, cap } and UploadNotFound.
-    - Display format omits cap when cap == 0 (server-side reject —
-      we don't parse the message; client has no authoritative cap
-      number to show).
-    - code_to_error maps CODE_VALUE_TOO_LARGE / CODE_UPLOAD_NOT_FOUND
-      to the new variants.
-    - CLIENT_PUT_HARD_CAP = 256 MiB (matches PS's
-      AUTUMN_PS_MAX_INLINE_BYTES_HARD).
+  Wire types (autumn-rpc):
+    - MSG_MULTI_MODIFY_MERGE 0x34, MultiModifyMergeReq/Resp
+    - MSG_GET_POLICY_CANDIDATES 0x35, GetPolicyCandidatesReq/Resp,
+      PolicyCandidate (POLICY_KIND_SPLIT=0, POLICY_KIND_MERGE=1)
+    - MSG_REPORT_PARTITION_LOAD 0x36, ReportPartitionLoadReq, PartitionLoad
+    - MSG_MERGE_PART 0x4D + MergePartReq/Resp (reserved; no handler in Stage 1)
 
-  ClusterClient API (crates/client/src/lib.rs):
-    - put_stream_begin(key, expires_at) -> PutStreamHandle. Resolves
-      part_id + caches Rc<RpcClient> on the handle so subsequent
-      send() calls don't re-resolve.
-    - get_stream(key, chunk_size) -> Option<GetStream>. Uses head() to
-      learn total_bytes upfront; subsequent next_chunk() calls walk
-      the value via offset/length GetReqs.
-    - Client-side cap pre-check on put_opts: rejects > 256 MiB without
-      a wire round-trip; lets PS authoritatively reject 64-256 MiB
-      range (default cap is 64 MiB but env-configurable).
+  Manager pure-fns (lib.rs):
+    - compute_merge_streams (log_stream splice with [L]+[V]+[E_new])
+    - splice_streams_without_new_tail (row + meta splice)
+    - merged_partition_vp_refs (per-extent sum)
+    - apply_merge_mutations (in-memory applier; mirror of apply_split_mutations)
 
-  PutStreamHandle (handle struct):
-    - send(chunk) -> bytes_committed; advances next_chunk_index.
-    - commit(self) -> (); finalises the upload. Self-checks bytes_sent
-      against the PS via expected_total_bytes.
-    - abort(self) -> (); idempotent; best-effort RPC (no failure
-      reported because PS-side TTL is the safety net).
-    - Drop without commit/abort logs WARN (PS-side TTL reclaims).
+  Manager state additions:
+    - last_op_at: Rc<RefCell<HashMap<u64, i64>>>  (cooldown gate)
+    - policy: Rc<RefCell<PolicyEngine>>            (advisory engine)
+    - partitionLastOp/<part_id> etcd sidecar; loaded by replay_from_etcd
 
-  GetStream (handle struct):
-    - next_chunk() -> Option<Vec<u8>>; yields chunk_size-byte chunks
-      until exhausted.
-    - position(), remaining(), total_bytes() accessors.
+  Manager handlers (rpc_handlers.rs):
+    - handle_multi_modify_merge (4 phases, F124 single-txn + F138/F145/F146
+      inflight checks + F146-style verify-at-apply on pre_bump_eversion +
+      F149 fence applied via put_and_delete_txn)
+    - handle_get_policy_candidates  (returns advisory_cache)
+    - handle_report_partition_load  (appends PartitionLoad to per-part window)
+    - handle_multi_modify_split extended to write partitionLastOp/<l,r>
 
-  autumn-client subcommands (crates/server/src/bin/autumn_client.rs):
-    - `put-stream [--chunk-size N] <KEY> <FILE-or-->`: reads file (or
-      stdin if file = "-") in chunk_size-byte chunks via PutStream API.
-    - `get-stream [--chunk-size N] [--out FILE] <KEY>`: streaming read,
-      writes to stdout or out file.
-    - Default chunk_size is 4 MiB on both.
+  Policy engine (policy.rs, NEW):
+    - PartitionMetricsWindow: 30-min sliding window of 1-min buckets
+    - PolicyEngine.compute_candidates: SPLIT pass + MERGE adjacency pass
+    - Thresholds: SPLIT_SIZE_HARD=50 GiB, SPLIT_QPS_HIGH=50K,
+      SPLIT_IMMFULL_HIGH=10, SPLIT_COOLDOWN=1h, MERGE_SIZE_LOW=1 GiB,
+      MERGE_QPS_LOW=5K, MERGE_COOLDOWN=6h
+    - 10× hysteresis between split and merge prevents oscillation
+    - policy_tick_loop spawned in start_runtime_tasks (60 s cadence,
+      leader-only)
 
-  Cargo.toml: added `tracing` to autumn-client's deps (used by Drop
-  impl on PutStreamHandle).
+  Partition-server (lib.rs):
+    - PartitionMetrics struct (req_count + imm_full_count + size_bytes,
+      AtomicU64); Arc<PartitionMetrics> threaded across main↔partition
+      thread boundary; PartitionHandle.metrics holds the main-thread clone
+    - merged_partition_loop bumps req_count on every handle_incoming_req,
+      imm_full_count on every iteration with imm_full = true
+    - report_load_loop spawned in finish_connect (5 s cadence); ships
+      ReportPartitionLoadReq with all live partitions' metrics
 
-Smoke test (3-replica TCP cluster, AUTUMN_PS_PARTS_HINT=8):
-  - 8 MiB payload via put-stream (8×1 MiB chunks): SHA256 round-trip
-    matches via both `get-stream` and regular `get`.
-  - 65 MiB regular `put`: rejected with CODE_VALUE_TOO_LARGE,
-    surfaced as "value 68157440 bytes exceeds the partition server's
-    inline cap — use put_stream".
-  - 100 MiB payload via put-stream (25×4 MiB chunks): SHA256 round-
-    trip matches via `get-stream`.
-  - Multiple concurrent uploads (8 MiB + 100 MiB + 100 MiB) on the
-    same partition: log_stream grows to 208 MB, all reads succeed.
-  - `del` on a multi-frag VP creates a tombstone; subsequent
-    `head` / `get` return NotFound.
+  Client + CLI:
+    - ClusterClient.merge_partitions(survivor, victim) — flushes both,
+      acquires admin owner-lock, captures sealed lengths, calls manager
+    - ClusterClient.policy_candidates() — thin wrapper
+    - autumn-client merge <SURVIVOR> <VICTIM>
+    - autumn-client policy-candidates  (also accepts policy_candidates / policy)
+
+  Tests:
+    - 4 merge unit tests in manager (compute_merge_streams,
+      splice_without_new_tail, merged_partition_vp_refs, apply_merge_mutations)
+    - 3 merge handler refusal-path tests (non-adjacent, self-merge, ec_inflight)
+    - 11 policy unit tests in policy_tests.rs (5 split + 6 merge)
+    - All pre-existing tests still pass: 48/48 manager-lib, 130/130 PS-lib
+
+  Docs:
+    - README.md F183 manual merge section + advisory thresholds
+    - crates/manager/CLAUDE.md note 16 (merge handler + last_op_at sidecar +
+      policy engine)
+    - crates/partition-server/CLAUDE.md notes 11 (metrics) + 12 (manual merge)
+    - feature_list.md F183 detailed entry
+    - Spec: docs/superpowers/specs/2026-05-09-partition-merge-and-split-merge-policy-design.md
+    - Plan: docs/superpowers/plans/2026-05-09-partition-merge-and-split-merge-policy.md
+
+Out of scope (deferred follow-ups):
+  - Stage 2: AUTUMN_MGR_AUTO_SPLIT auto-trigger loop on the manager
+  - Stage 3: AUTUMN_MGR_AUTO_MERGE auto-trigger loop + PS-side
+    handle_merge_part with dual-gate + freeze-drain (in-place splice
+    instead of region_sync reopen)
+  - Cross-PS merge (requires partition migration primitive; advisory
+    currently marks cross-PS pairs same_ps=false / feas=no)
+  - p99 latency reading on PS (PartitionLoad.p99_us = 0 always; reserved
+    field for tie-breaking)
+  - End-to-end integration tests in tests/system_merge.rs (would require
+    extending support/mod.rs with merge helpers and live extent-node
+    services for alloc_extent_on_node calls during Phase 1.5)
+  - Per-cluster threshold tuning via CLI flags (Stage 1 hard-codes constants)
+
+Why split-auto before merge-auto in Stage 2/3:
+  Thread-per-core means merge concentrates two partitions' SSTs + future
+  load onto one P-log core. A wrongly-merged hot pair degrades immediately
+  at the worst place (single-core ceiling). Split is the relief valve;
+  its failure mode is mild (redundant partition, extra metadata). HBase
+  / CRDB / TiDB all enabled auto-split years before auto-merge for the
+  same structural reason. Recorded in
+  feedback_auto_split_before_merge.md (auto-memory).
 
 Workspace verification:
-  - cargo check --workspace --exclude autumn-fuse: clean.
-  - cargo test -p autumn-rpc f129_wire: 5/5.
-  - cargo test -p autumn-partition-server --lib (-- --test-threads=1):
-    130/130.
-  - cargo test -p autumn-client --lib: 0 lib tests (existing pattern;
-    integration via smoke).
-
-Out of scope this commit (deferred phases):
-  - Phase E — F130 GC awareness of multi-frag VP refs. Today: chunk
-    fragments leak in log_stream until host extent ages out below
-    GC_DISCARD_RATIO via other live data churn. No correctness bug;
-    only storage overhead.
-  - Phase F — autumn-fuse perf evaluation. Sketch: replace the
-    FUSE-write buffered-Put path with PutStream so a 100 MiB write
-    doesn't peak-buffer 100 MiB on the daemon. Reads are already
-    chunk-parallel via F179; GetStream gain expected to be small.
-  - F131 — concurrent fragment pread in resolve_multi_frag (still
-    sequential).
-  - F132 — PutStream resume across PS restart / partition split.
-  - F134 — frame-level Put cap reject (perf hardening).
+  cargo check --workspace --exclude autumn-fuse: clean
+  cargo build --workspace --exclude autumn-fuse: clean
+  cargo test -p autumn-rpc: clean
+  cargo test -p autumn-manager --lib: 48 passed; 0 failed
+  cargo test -p autumn-partition-server --lib -- --test-threads=1: 130 passed; 0 failed

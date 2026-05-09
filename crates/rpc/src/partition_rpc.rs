@@ -30,7 +30,7 @@ pub const MSG_PUT_CHUNK: u8 = 0x4A;
 pub const MSG_PUT_COMMIT: u8 = 0x4B;
 pub const MSG_PUT_ABORT: u8 = 0x4C;
 
-// F181: partition merge — sent to the SURVIVOR's PS.
+// F183: partition merge — sent to the SURVIVOR's PS.
 pub const MSG_MERGE_PART: u8 = 0x4D;
 
 // ── Status codes ────────────────────────────────────────────────────────────
@@ -145,7 +145,7 @@ pub struct SplitPartResp {
     pub message: String,
 }
 
-// F181 — partition merge. Sent to the SURVIVOR's PS; both partitions
+// F183 — partition merge. Sent to the SURVIVOR's PS; both partitions
 // must currently be served by that PS (cross-PS merge unsupported).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct MergePartReq {

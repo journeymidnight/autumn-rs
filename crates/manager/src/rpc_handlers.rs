@@ -1582,7 +1582,7 @@ impl AutumnManager {
                             rkyv_encode(&right_region).to_vec(),
                         ));
                     }
-                    // F181: stamp last_op_at on both children so the
+                    // F183: stamp last_op_at on both children so the
                     // policy engine's cooldown gate is correct.
                     let now = Self::epoch_seconds();
                     kvs.push((
@@ -1627,7 +1627,7 @@ impl AutumnManager {
                     s.partition_vp_refs
                         .insert(right_snapshot.part_id, right_snapshot);
                     drop(s);
-                    // F181: in-memory last_op_at update (mirror of etcd write above)
+                    // F183: in-memory last_op_at update (mirror of etcd write above)
                     let now = Self::epoch_seconds();
                     self.last_op_at.borrow_mut().insert(left_id, now);
                     self.last_op_at.borrow_mut().insert(right_id, now);
@@ -1647,7 +1647,7 @@ impl AutumnManager {
 
     // ── PartitionManagerService handlers ───────────────────────────────
 
-    // ── F181: handle_multi_modify_merge ─────────────────────────────────────
+    // ── F183: handle_multi_modify_merge ─────────────────────────────────────
     // Inverse of handle_multi_modify_split. Atomically:
     //   - Splices victim's three streams' extent_ids into survivor's
     //   - Allocates a fresh log_stream tail extent (E_new) on K replicas
@@ -2027,7 +2027,7 @@ impl AutumnManager {
         }))
     }
 
-    // ── F181: handle_get_policy_candidates / handle_report_partition_load ──
+    // ── F183: handle_get_policy_candidates / handle_report_partition_load ──
 
     pub(crate) async fn handle_get_policy_candidates(
         &self,

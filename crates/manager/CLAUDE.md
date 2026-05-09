@@ -491,3 +491,39 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     (multi-manager failover for StreamClient + PS); test
     `crates/manager/tests/f149_leader_fence.rs` (gated on embedded
     etcd, marked `#[ignore]` per repo convention).
+
+
+16. **F183 partition merge handler.** `handle_multi_modify_merge` is
+    the inverse of `handle_multi_modify_split`. Pattern matches the
+    F124 single-txn + F138/F145/F146 inflight checks + F149 fence.
+
+    **Pure-fn helpers (lib.rs):**
+    - `compute_merge_streams` — log_stream splice with `[L]+[V]+[E_new]`
+      ordering. **Order invariant** is load-bearing for vp_head replay
+      correctness; tested by `f181_compute_merge_streams_extent_ids_order_and_refs`.
+    - `splice_streams_without_new_tail` — row + meta splice (no fresh tail).
+    - `merged_partition_vp_refs` — per-extent sum of two partitions' VP refs.
+    - `apply_merge_mutations` — in-memory applier; mirror of `apply_split_mutations`.
+
+    **Phases (rpc_handlers.rs):**
+    - Phase 1 (no awaits): F138/F145/F146 inflight checks, adjacency check,
+      alloc_ids(1) + select_nodes for `E_new`, splice + VP-refs computation,
+      eversion snapshot.
+    - Phase 1.5 (await): `alloc_extent_on_node` per replica with F144-style
+      shuffled fallback walk.
+    - Phase 2 (etcd): single fenced `put_and_delete_txn` containing all
+      puts + victim deletes (F124 atomicity).
+    - Phase 3 (no awaits): F146 verify-at-apply on `pre_bump_eversion`,
+      `apply_merge_mutations`, in-memory `last_op_at` update.
+
+    **`partitionLastOp/<part_id>` sidecar etcd prefix** stores the last
+    split or merge timestamp per partition (i64 unix-epoch LE). Loaded
+    by `replay_from_etcd` into `AutumnManager.last_op_at`. Both split
+    (F183-C2) and merge handlers write entries in their atomic txn.
+
+    **Policy engine (policy.rs).** `policy_tick_loop` ticks every 60 s on
+    the leader, reads per-partition load metrics from
+    `MSG_REPORT_PARTITION_LOAD` aggregations, computes split/merge
+    candidates over a 30-min sliding window with the thresholds in
+    `policy.rs`, exposes via `MSG_GET_POLICY_CANDIDATES`. Stage 1 is
+    advisory only.

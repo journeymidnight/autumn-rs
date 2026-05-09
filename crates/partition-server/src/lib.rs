@@ -704,7 +704,7 @@ pub(crate) struct PartitionData {
     /// at most). Not worth GC'ing the map; deleted extents leave benign
     /// stale entries with count=0.
     pub(crate) extent_pins: std::cell::RefCell<std::collections::HashMap<u64, std::rc::Rc<std::sync::atomic::AtomicI64>>>,
-    /// F181: per-partition load metrics for the manager's policy engine.
+    /// F183: per-partition load metrics for the manager's policy engine.
     /// Counters are bumped by `merged_partition_loop` (req on each
     /// dispatch, imm_full each time the imm cap stalls intake). The
     /// PS-level `report_load_loop` snapshots and resets these every 5 s
@@ -1134,7 +1134,7 @@ struct PartitionHandle {
     /// the manager via `MSG_REGISTER_PARTITION_ADDR` on open.
     #[allow(dead_code)]
     part_addr: String,
-    /// F181: cross-thread metrics handle. Bumped by the partition thread,
+    /// F183: cross-thread metrics handle. Bumped by the partition thread,
     /// read by the main thread's `report_load_loop`. Arc is Send so this
     /// is safe to clone across threads.
     metrics: std::sync::Arc<PartitionMetrics>,
@@ -1325,7 +1325,7 @@ impl PartitionServer {
         let s = server.clone();
         compio::runtime::spawn(async move { s.heartbeat_loop().await }).detach();
 
-        // F181: per-partition load metrics report (5 s cadence).
+        // F183: per-partition load metrics report (5 s cadence).
         let s = server.clone();
         compio::runtime::spawn(async move { s.report_load_loop().await }).detach();
 
@@ -1411,7 +1411,7 @@ impl PartitionServer {
         }
     }
 
-    /// F181: every 5 s, snapshot per-partition metrics from each
+    /// F183: every 5 s, snapshot per-partition metrics from each
     /// PartitionHandle's Arc<PartitionMetrics> and ship to the manager
     /// via MSG_REPORT_PARTITION_LOAD. Cheap — one RPC per cycle, payload
     /// scales with partition count.
@@ -1460,7 +1460,7 @@ impl PartitionServer {
                 .call(self.manager_addr(), manager_rpc::MSG_REPORT_PARTITION_LOAD, req)
                 .await
             {
-                tracing::debug!("F181 report_load failed: {e}");
+                tracing::debug!("F183 report_load failed: {e}");
             }
         }
     }
@@ -1617,7 +1617,7 @@ impl PartitionServer {
         let owner_key_for_thread = owner_key.clone();
         let advertise_addr_for_thread = advertise_addr.clone();
         let compact_gate_for_thread = self.compact_gate.clone();
-        // F181: build the metrics Arc on the main thread so we can keep
+        // F183: build the metrics Arc on the main thread so we can keep
         // a clone in PartitionHandle for the report loop. The other clone
         // is moved into the partition thread and threaded into PartitionData.
         let metrics_for_thread = std::sync::Arc::new(PartitionMetrics::default());
@@ -2844,7 +2844,7 @@ async fn merged_partition_loop(
                 + p.imm.iter().map(|m| m.mem_bytes()).sum::<u64>();
             (p.imm.len() >= imm_cap, gap)
         };
-        // F181: track imm_full back-pressure events (per-iteration; coarse
+        // F183: track imm_full back-pressure events (per-iteration; coarse
         // but matches the spec's "events/sec" semantics — per-tick rate).
         if imm_full {
             part.borrow()
@@ -3117,7 +3117,7 @@ async fn handle_incoming_req(
     owner_key: &str,
     revision: i64,
 ) {
-    // F181: bump per-partition request counter for the policy engine.
+    // F183: bump per-partition request counter for the policy engine.
     part.borrow()
         .metrics
         .req_count

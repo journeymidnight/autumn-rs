@@ -1272,6 +1272,85 @@ RPC path.
 
 ---
 
+## F183 — Partition merge + advisory policy (Stage 1)
+
+### Manual partition merge
+
+Merges two adjacent partitions on the same PS. The survivor keeps its `part_id`;
+the victim is deleted from the manager. The merged partition's range becomes
+`[SURVIVOR.start, VICTIM.end)`.
+
+```bash
+# Stop writes to both partitions first.
+autumn-client --manager 127.0.0.1:9001 merge <SURVIVOR_PART_ID> <VICTIM_PART_ID>
+```
+
+Stage 1 contract: the CLI orchestrates the merge.
+
+1. `FLUSH` on both partitions (drains imm into durable SSTs)
+2. Acquire admin owner-lock; manager allocates a fresh revision
+3. Resolve the six stream IDs via `GetRegions`
+4. `CheckCommitLength` on each stream
+5. `MultiModifyMerge` — single atomic etcd txn (F124-style):
+   - splices victim's stream extents into survivor's (refs++ CoW; same as
+     split's `compute_duplicate_stream` but inverted)
+   - allocates a fresh log_stream tail extent (`E_new`) on K replicas
+   - merges victim's `partition_vp_refs` snapshot into survivor's
+   - widens survivor's `rg.end_key` to victim's `rg.end_key`
+   - deletes victim's `partitions/`, three `streams/`, `regions/`,
+     `partitionVpRefs/`, `partitionLastOp/` etcd keys
+6. Survivor's PS picks up the wider `rg` + spliced `extent_ids` on the
+   next `region_sync_loop` tick (~2 s).
+
+Preconditions enforced by the manager:
+- `survivor.end_key == victim.start_key` (adjacent in keyspace)
+- Neither side's source extents in `ec_conversion_inflight` /
+  `recovery_tasks` / `pending_extent_deletes`
+- F146-style verify-at-apply on `pre_bump_eversion` snapshot
+- F149 leader-fence on the etcd txn
+
+Stage 1 trade-off: no PS-side `handle_merge_part` with dual-gate +
+freeze-drain. Operator must stop writes during the merge window. Stage 2/3
+(deferred) adds the in-place splice and proper drain.
+
+### Policy candidates
+
+```bash
+autumn-client --manager 127.0.0.1:9001 policy-candidates
+```
+
+Shows the manager's advisory engine output (recomputed every 60 s from
+the last 30 min of per-partition `(size_bytes, req_per_sec, imm_full_per_sec)`
+samples reported by each PS via `MSG_REPORT_PARTITION_LOAD` every 5 s).
+
+Thresholds (hard-coded in Stage 1):
+
+| Trigger | Threshold |
+|---|---|
+| SPLIT — size_hard | > 50 GiB |
+| SPLIT — qps + size | qps > 50 K AND size > 1 GiB |
+| SPLIT — imm_full saturation | imm_full_per_sec > 10 |
+| SPLIT — cooldown | 1 h since last op on this partition |
+| MERGE — both small | each side < 1 GiB |
+| MERGE — both cold | sum req_per_sec < 5 K, both imm_full == 0 |
+| MERGE — cooldown | 6 h since last op on either side |
+| MERGE — feasibility | both on same PS (cross-PS marked `same_ps=false`) |
+
+The 10× hysteresis between split (50 K qps) and merge (5 K qps) prevents
+oscillation. Stage 1 emits cross-PS candidates with `feas=no` so operators
+can plan co-location manually before merging.
+
+### Auto-trigger (Stage 2/3, deferred)
+
+Per `feedback_auto_split_before_merge.md` (auto-memory): autumn-rs is
+thread-per-core; **merge concentrates load onto a single P-log core**, so
+the staging order is `auto-split first` (Stage 2), `auto-merge second`
+(Stage 3). Both gated behind feature flags on the manager. See
+`docs/superpowers/specs/2026-05-09-partition-merge-and-split-merge-policy-design.md`
+§6 for burn-in criteria.
+
+---
+
 ## Notes
 
 - `IoMode::IoUring` is not yet implemented; extent nodes use `IoMode::Standard`.

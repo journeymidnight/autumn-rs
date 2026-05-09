@@ -850,7 +850,7 @@ impl ClusterClient {
         self.maintenance(part_id, MAINTENANCE_FLUSH, vec![]).await
     }
 
-    /// F181: merge two adjacent partitions. Survivor keeps its part_id;
+    /// F183: merge two adjacent partitions. Survivor keeps its part_id;
     /// victim is deleted from the manager.
     ///
     /// Stage 1 implementation orchestrates the merge from the client:
@@ -981,7 +981,7 @@ impl ClusterClient {
         Ok(())
     }
 
-    /// F181: query the manager's policy-engine advisory cache.
+    /// F183: query the manager's policy-engine advisory cache.
     pub async fn policy_candidates(
         &self,
     ) -> std::result::Result<Vec<PolicyCandidate>, AutumnError> {

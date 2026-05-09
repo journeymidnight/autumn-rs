@@ -50,11 +50,11 @@ pub const MSG_UPDATE_STREAM_EC: u8 = 0x32;
 // Partition→manager sync of live SST VP dependency snapshot.
 pub const MSG_SYNC_PARTITION_VP_REFS: u8 = 0x33;
 
-// F181: partition merge primitive (inverse of MSG_MULTI_MODIFY_SPLIT).
+// F183: partition merge primitive (inverse of MSG_MULTI_MODIFY_SPLIT).
 pub const MSG_MULTI_MODIFY_MERGE: u8 = 0x34;
-// F181: advisory engine — query split/merge candidates.
+// F183: advisory engine — query split/merge candidates.
 pub const MSG_GET_POLICY_CANDIDATES: u8 = 0x35;
-// F181: per-partition load metrics report (PS → manager, 5 s cadence).
+// F183: per-partition load metrics report (PS → manager, 5 s cadence).
 pub const MSG_REPORT_PARTITION_LOAD: u8 = 0x36;
 
 // ── rkyv helpers ────────────────────────────────────────────────────────────
@@ -650,7 +650,7 @@ impl ExtCommitLengthResp {
     }
 }
 
-// ── F181: partition merge + policy advisory ────────────────────────────────
+// ── F183: partition merge + policy advisory ────────────────────────────────
 
 // --- MultiModifyMerge ---
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]

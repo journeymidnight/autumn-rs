@@ -800,3 +800,28 @@ post-restart.
     Together (P1)–(P3) imply: `borrow_mut` order = mpsc-send order = meta_stream record order. The latest record's `tables_snapshot` therefore necessarily reflects all prior `borrow_mut` mutations, including those of any concurrent publisher. A refactor that introduces an `.await` between the `borrow_mut` drop and the `stream_client.append` (e.g., moving `rkyv_encode` behind an async helper, adding async metric flushes, holding a `futures::lock::Mutex` around the publish) re-opens a stale-snapshot race against the concurrent publisher: a flush whose snapshot was captured earlier could be ack'd later than a compact's, persisting tables that compact has already removed. On restart, recovery would load the stale checkpoint and resurrect compacted-away SSTs whose VPs may now point at GC-punched log_stream extents.
 
     Inline `// F148-A invariant` comments at both call sites (`flush_one_imm`, `flush_one_imm_local`, both branches of `do_compact`) state the rule next to the code. Test: `f148_publisher_invariant_tests::f148_concurrent_publisher_ordering_invariant` (lib.rs) exercises the pattern with two concurrent simulated publishers and asserts the LATER snapshot extends the EARLIER one.
+
+11. **F183 metrics export.** Each `PartitionData` carries an
+    `Arc<PartitionMetrics>` whose AtomicU64 counters are bumped by
+    `merged_partition_loop` (req_count on each `handle_incoming_req`,
+    imm_full_count when the imm cap stalls intake). The same Arc is
+    cloned into the `PartitionHandle` on the main thread; the main
+    thread's `report_load_loop` (5 s cadence) snapshots all live
+    handles' metrics, computes /sec rates, and ships
+    `ReportPartitionLoadReq` to the manager. Manager's policy engine
+    consumes the per-partition windowed history (30 min, 1-min buckets)
+    to emit advisory split/merge candidates.
+
+12. **F183 manual partition merge.** Stage 1 ships the merge primitive
+    as a manager-side atomic etcd txn (see `crates/manager/CLAUDE.md`
+    note 16), driven by the CLI:
+    `autumn-client merge <SURVIVOR> <VICTIM>`. The CLI flushes both
+    partitions, acquires an admin owner-lock, captures sealed lengths,
+    calls `MSG_MULTI_MODIFY_MERGE`. After the manager txn commits, the
+    survivor's PS picks up the wider rg + spliced extent_ids on the
+    next `region_sync_loop` tick (~2 s). **No PS-side
+    `handle_merge_part` in Stage 1** — operator must stop writes during
+    the merge window. Stage 2/3 (deferred per
+    `feedback_auto_split_before_merge.md`) adds a proper PS-side
+    handler with dual-gate + freeze-drain and auto-trigger from the
+    policy engine.

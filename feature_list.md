@@ -95,6 +95,7 @@
 | FOPS-03 | `set-stream-ec` RPC + CLI (modify EC config on existing stream; conversion loop picks up) | manager |
 | FOPS-04 | replica stream encoding `(0,0)` → `(N,0)`; EC predicate now `ec_parity_shard != 0` | stream |
 | FGA-01 | gallery: storage HUD + spawn_blocking thumbs + video thumbs + auto-hide lightbox strip | examples |
+| F183 | Partition merge primitive + size+load advisory policy engine (Stage 1) | partition/manager |
 
 ---
 
@@ -571,6 +572,33 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F183 · Partition merge primitive + size+load advisory policy engine (Stage 1)
+
+- **Target:** Add the inverse of partition split as a CoW stream-extent splice (no value rewrite, single-stream-per-partition invariant preserved); add a manager-side advisory policy engine that emits split/merge candidates from per-partition `(size_bytes, req_per_sec, imm_full_per_sec)` over a 30-min sliding window. Stage 1 is manual triggers + advisory only; auto-trigger gated behind feature flags in Stage 2/3 (deferred).
+- **Mechanism (manager):** `handle_multi_modify_merge` is a single fenced atomic etcd txn (F124 pattern) with F138/F145/F146 inflight checks and F146-style verify-at-apply on `pre_bump_eversion`. Allocates a fresh log_stream tail extent (E_new) inside the txn; survivor's log_stream extent_ids becomes `[L]+[V]+[E_new]`, row + meta become `[L]+[V]`. Extent refs++ on every victim extent (CoW). Victim's partition + three streams + region + partitionVpRefs + partitionLastOp keys deleted in the same txn. Survivor's `rg.end_key` widens to `victim.end_key`. Order invariant in spliced extent_ids is load-bearing for vp_head replay; tested by `f183_compute_merge_streams_extent_ids_order_and_refs`.
+- **Mechanism (CLI orchestration, Stage 1):** `autumn-client merge <SURVIVOR> <VICTIM>` flushes both partitions, acquires admin owner-lock, captures sealed lengths via `MSG_CHECK_COMMIT_LENGTH`, calls `MSG_MULTI_MODIFY_MERGE`. Survivor's PS picks up the wider rg + spliced extent_ids on the next `region_sync_loop` tick (~2 s). **Operator must stop writes during the merge window** (Stage 2/3 will add a PS-side dual-gate + freeze-drain handler).
+- **Mechanism (advisory):** PSes carry `Arc<PartitionMetrics>` per partition (counters bumped by `merged_partition_loop`); main-thread `report_load_loop` (5 s cadence) ships `MSG_REPORT_PARTITION_LOAD` to manager. Manager's `policy_tick_loop` (60 s cadence) computes candidates from a 30-min sliding window with thresholds (`SPLIT_SIZE_HARD=50 GiB`, `SPLIT_QPS_HIGH=50K`, `SPLIT_IMMFULL_HIGH=10`, `SPLIT_COOLDOWN=1h`, `MERGE_SIZE_LOW=1 GiB`, `MERGE_QPS_LOW=5K`, `MERGE_COOLDOWN=6h`). 10× hysteresis between split (50K qps) and merge (5K qps) prevents oscillation. Cross-PS merge candidates emitted with `same_ps=false` so operators can plan co-location.
+- **Wire types added:** `MSG_MULTI_MODIFY_MERGE 0x34`, `MSG_GET_POLICY_CANDIDATES 0x35`, `MSG_REPORT_PARTITION_LOAD 0x36` (manager); `MSG_MERGE_PART 0x4D` (PS — reserved, no handler in Stage 1). `MultiModifyMergeReq/Resp`, `PartitionLoad`, `ReportPartitionLoadReq`, `PolicyCandidate`, `GetPolicyCandidatesReq/Resp`. New etcd prefix `partitionLastOp/<part_id>` (i64-LE) for cooldown gating; both split and merge handlers write entries in their atomic txn; loaded by `replay_from_etcd`.
+- **Stage 1 sub-features (this commit family, all `passes:true`):**
+  - F183-A: wire types (manager + PS)
+  - F183-B: pure-fn helpers `compute_merge_streams`, `splice_streams_without_new_tail`, `merged_partition_vp_refs`, `apply_merge_mutations` + 4 unit tests
+  - F183-C: `last_op_at` sidecar field + etcd replay + split-handler write
+  - F183-D: `handle_multi_modify_merge` 4-phase impl + 3 refusal-path smoke tests
+  - F183-E: `policy.rs` engine (skeleton + split + merge passes) + 11 unit tests
+  - F183-F: `policy_tick_loop` spawn + handle_get_policy_candidates + handle_report_partition_load
+  - F183-G: PS metrics export (Arc<PartitionMetrics>, counter bumps, report_load_loop)
+  - F183-I: CLI `merge` + `policy-candidates` subcommands + ClusterClient API
+- **Stage 2/3 (deferred):** `AUTUMN_MGR_AUTO_SPLIT` / `AUTUMN_MGR_AUTO_MERGE` feature flags; PS-side `handle_merge_part` with dual-gate + freeze-drain (no in-place splice in Stage 1 — survivor PS reopens via `region_sync_loop` after manager commit). Cross-PS merge requires partition migration primitive; advisory marks them infeasible for now.
+- **Why split-auto before merge-auto in Stage 2/3:** thread-per-core means merge concentrates two partitions' SSTs + future load onto one P-log core. A wrongly-merged hot pair degrades immediately at the worst place (single-core ceiling). Split is the *relief valve* — its failure mode is mild (redundant partition, extra metadata). Recorded in `feedback_auto_split_before_merge.md` (auto-memory).
+- **Files:** `crates/rpc/src/manager_rpc.rs` (3 new MSG_*, 4 new structs, 2 new POLICY_KIND consts); `crates/rpc/src/partition_rpc.rs` (`MSG_MERGE_PART` + `MergePartReq/Resp`); `crates/manager/src/policy.rs` (NEW); `crates/manager/src/policy_tests.rs` (NEW); `crates/manager/src/lib.rs` (4 pure-fns + `last_op_at`/`policy` fields + `policy_tick_loop` + replay); `crates/manager/src/rpc_handlers.rs` (3 new handlers + split-handler last_op_at write); `crates/common/src/store.rs` (MetadataState derives Clone for snapshot); `crates/partition-server/src/lib.rs` (PartitionMetrics + PartitionHandle.metrics + report_load_loop + counter bumps); `crates/client/src/lib.rs` (ClusterClient.merge_partitions + policy_candidates); `crates/server/src/bin/autumn_client.rs` (CLI subcommands); `README.md` + `crates/manager/CLAUDE.md` (note 16) + `crates/partition-server/CLAUDE.md` (notes 11+12).
+- **Spec/plan:** `docs/superpowers/specs/2026-05-09-partition-merge-and-split-merge-policy-design.md`, `docs/superpowers/plans/2026-05-09-partition-merge-and-split-merge-policy.md`.
+- **Tests passing:**
+  - `cargo test -p autumn-rpc`: clean
+  - `cargo test -p autumn-manager --lib`: 48/48 (4 merge unit + 11 policy unit + 33 pre-existing)
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 130/130
+  - `cargo build --workspace --exclude autumn-fuse`: clean
+- **passes:** true
+
 ### F179 · autumn-fuse: async-reply read + parallel chunk fetch + ClusterClient `&self` refactor
 
 - **Target**: lift the FUSE read throughput from `~13 k ops/s` aggregate (4K random) and `~470 MB/s` (8M random) — observed pre-fix with arbitrary client thread count, indicating a single-dispatcher serialisation bottleneck in the fuse path.
@@ -662,7 +690,7 @@
 - **Target**: replace TCP-loopback memcpy with RDMA zero-copy on the chunk-data path. autumn-rs already has UCX support (F100-UCX); the fuse client doesn't use it.
 - **Approach**:
   - autumn-fuse opens its `ClusterClient` with the UCX transport when available.
-  - For the chunk data plane specifically: pin RDMA-registered read buffers in the daemon. Server-side `MSG_GET` (or `MSG_BATCH_GET` post-F181) uses UCX rndv-zcopy for ≥ 1 MiB results.
+  - For the chunk data plane specifically: pin RDMA-registered read buffers in the daemon. Server-side `MSG_GET` (or `MSG_BATCH_GET` post-F183) uses UCX rndv-zcopy for ≥ 1 MiB results.
   - End-to-end zero copy requires F180 — without bypassing kernel FUSE, data still round-trips through `/dev/fuse` and the RDMA win is daemon ↔ cluster only.
 - **Expected gain**: 8 M read 600 MB/s → 2-3 GB/s on RDMA-capable hardware; ~no gain on TCP loopback.
 - **Prereq**: RDMA NIC (RoCE / IB); F180 for end-to-end zero copy.

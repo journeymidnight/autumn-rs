@@ -142,13 +142,13 @@ enum Command {
     Split {
         part_id: u64,
     },
-    /// F181: merge two adjacent partitions on the same PS.
+    /// F183: merge two adjacent partitions on the same PS.
     /// Survivor keeps its part_id; victim is deleted.
     Merge {
         survivor_part_id: u64,
         victim_part_id: u64,
     },
-    /// F181: show advisory split/merge candidates from the manager's
+    /// F183: show advisory split/merge candidates from the manager's
     /// policy engine.
     PolicyCandidates,
     Compact {
@@ -1516,7 +1516,7 @@ async fn main() -> Result<()> {
 
         Command::Merge { survivor_part_id, victim_part_id } => {
             eprintln!(
-                "F181: stop writes to partitions {survivor_part_id} and {victim_part_id} \
+                "F183: stop writes to partitions {survivor_part_id} and {victim_part_id} \
                  before continuing. The CLI will FLUSH both, then issue the manager merge. \
                  The survivor's PS picks up the wider range on the next region_sync (~2 s)."
             );

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship F181 Stage 1 — manual partition merge primitive (CoW stream-extent splice, no value rewrite) + size+load-driven advisory policy engine in the manager. Auto-trigger of split/merge stays OFF.
+**Goal:** Ship F183 Stage 1 — manual partition merge primitive (CoW stream-extent splice, no value rewrite) + size+load-driven advisory policy engine in the manager. Auto-trigger of split/merge stays OFF.
 
 **Architecture:** Inverse-of-split via stream-extent splice. Manager allocates a fresh log_stream tail extent inside the merge etcd txn; survivor's log_stream extent_ids becomes `[L.sealed]+[V.sealed]+[E_new]`, row_stream is `[L.sealed]+[V.sealed]`. Merged TableLocations checkpoint is written to survivor's meta_stream. Victim partition deleted. F124 single-txn commit + F138/F145/F146 inflight checks + F149 fence preserved. Policy engine collects per-partition `size_bytes / req_per_sec / imm_full_per_sec` over a 30-min sliding window via a new `MSG_REPORT_PARTITION_LOAD` RPC, computes split/merge candidates every 60 s, exposes via `MSG_GET_POLICY_CANDIDATES`.
 
@@ -29,7 +29,7 @@
 | `crates/manager/src/policy_tests.rs` | Create | Unit tests for policy engine |
 | `crates/manager/tests/system_merge.rs` | Create | Integration tests for merge primitive |
 | `crates/manager/tests/system_policy.rs` | Create | Integration tests for advisory policy |
-| `feature_list.md` | Modify | F181 entry |
+| `feature_list.md` | Modify | F183 entry |
 | `claude-progress.txt` | Modify | Status update |
 | `README.md` | Modify | Manual merge + policy candidates sections |
 | `crates/manager/CLAUDE.md` | Modify | Note 16: merge handler + last_op_at sidecar |
@@ -41,7 +41,7 @@
 
 Before starting, output the two CLAUDE.md task lists:
 
-- [ ] **Pre-step: Output implemented vs not-implemented lists for F181**
+- [ ] **Pre-step: Output implemented vs not-implemented lists for F183**
 
 Reference the spec §0. Verify these match what the spec calls out:
 
@@ -56,7 +56,7 @@ Reference the spec §0. Verify these match what the spec calls out:
   Heartbeat 2s + region_sync_loop 2s
   pending_extent_deletes + extent_delete_loop (F109/F139)
 
-未实现 (本次范围 = F181 Stage 1):
+未实现 (本次范围 = F183 Stage 1):
   Partition merge primitive (no MSG_MULTI_MODIFY_MERGE / MSG_MERGE_PART)
   Per-partition size+req/sec+imm_full metrics export
   Manager policy engine + advisory candidate emission
@@ -94,7 +94,7 @@ pub const MSG_REPORT_PARTITION_LOAD: u8 = 0x36;
 Append (use the existing rkyv derive pattern from `MultiModifySplitReq`):
 
 ```rust
-// --- MultiModifyMerge (F181) ---
+// --- MultiModifyMerge (F183) ---
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct MultiModifyMergeReq {
     pub survivor_part_id: u64,
@@ -123,7 +123,7 @@ pub struct MultiModifyMergeResp {
 Append:
 
 ```rust
-// --- ReportPartitionLoad (F181 — policy metrics) ---
+// --- ReportPartitionLoad (F183 — policy metrics) ---
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct PartitionLoad {
     pub part_id: u64,
@@ -145,7 +145,7 @@ pub struct ReportPartitionLoadReq {
 Append:
 
 ```rust
-// --- GetPolicyCandidates (F181 — advisory) ---
+// --- GetPolicyCandidates (F183 — advisory) ---
 pub const POLICY_KIND_SPLIT: u8 = 0;
 pub const POLICY_KIND_MERGE: u8 = 1;
 
@@ -182,7 +182,7 @@ Expected: clean.
 
 ```bash
 git add crates/rpc/src/manager_rpc.rs
-git commit -m "F181-A1: wire types — manager-side merge + policy RPCs"
+git commit -m "F183-A1: wire types — manager-side merge + policy RPCs"
 ```
 
 ---
@@ -205,7 +205,7 @@ pub const MSG_MERGE_PART: u8 = 0x4D;
 Append at end of file (mirror SplitPartReq/Resp pattern at lines 135-145):
 
 ```rust
-// --- MergePart (F181) ---
+// --- MergePart (F183) ---
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct MergePartReq {
     pub survivor_part_id: u64,
@@ -240,7 +240,7 @@ Expected: clean.
 
 ```bash
 git add crates/rpc/src/partition_rpc.rs
-git commit -m "F181-A2: wire types — PS-side MSG_MERGE_PART"
+git commit -m "F183-A2: wire types — PS-side MSG_MERGE_PART"
 ```
 
 ---
@@ -261,7 +261,7 @@ Find around line 964. Note the signature pattern: takes `&MetadataState`, return
 Insert after the closing `}` of `compute_duplicate_stream`:
 
 ```rust
-    /// F181: Compute the mutations for splicing `victim_stream`'s
+    /// F183: Compute the mutations for splicing `victim_stream`'s
     /// extents onto the END of `survivor_stream`'s extent_ids list, then
     /// appending one fresh tail extent (`new_tail`).
     ///
@@ -273,7 +273,7 @@ Insert after the closing `}` of `compute_duplicate_stream`:
     ///   - new_tail extent itself (caller must have already built its
     ///     MgrExtentInfo via select_nodes + alloc_extent_on_node)
     ///
-    /// Order invariant (load-bearing — F181):
+    /// Order invariant (load-bearing — F183):
     ///   updated.extent_ids = [survivor's existing] + [victim's existing] + [new_tail]
     ///
     /// Caller (handle_multi_modify_merge) is responsible for the F138/
@@ -435,7 +435,7 @@ Expected: PASS once the function is in the right scope.
 
 ```bash
 git add crates/manager/src/lib.rs
-git commit -m "F181-B1: compute_merge_streams pure-fn + unit test"
+git commit -m "F183-B1: compute_merge_streams pure-fn + unit test"
 ```
 
 ---
@@ -450,7 +450,7 @@ git commit -m "F181-B1: compute_merge_streams pure-fn + unit test"
 Insert just below `split_partition_vp_snapshot` (around line 1083):
 
 ```rust
-    /// F181: per-extent sum of two partitions' VP refs into a snapshot
+    /// F183: per-extent sum of two partitions' VP refs into a snapshot
     /// owned by `survivor_id`. Caller deletes `partition_vp_refs[victim_id]`
     /// in Phase 3.
     fn merged_partition_vp_refs(
@@ -511,7 +511,7 @@ Expected: PASS.
 
 ```bash
 git add crates/manager/src/lib.rs
-git commit -m "F181-B2: merged_partition_vp_refs pure-fn + unit test"
+git commit -m "F183-B2: merged_partition_vp_refs pure-fn + unit test"
 ```
 
 ---
@@ -526,7 +526,7 @@ git commit -m "F181-B2: merged_partition_vp_refs pure-fn + unit test"
 Insert below `apply_split_mutations` (around line 1102-1118):
 
 ```rust
-    /// F181: apply computed merge mutations to in-memory store.
+    /// F183: apply computed merge mutations to in-memory store.
     /// Mirror of `apply_split_mutations`. Caller has already verified
     /// (Phase 3) that no concurrent mutator drifted eversion during the
     /// etcd await.
@@ -626,7 +626,7 @@ Expected: PASS.
 
 ```bash
 git add crates/manager/src/lib.rs
-git commit -m "F181-B3: apply_merge_mutations pure-fn + unit test"
+git commit -m "F183-B3: apply_merge_mutations pure-fn + unit test"
 ```
 
 ---
@@ -647,7 +647,7 @@ Search for `pub struct AutumnManager` near top of the file. Note its existing fi
 Add to the struct:
 
 ```rust
-    /// F181: per-partition unix-epoch timestamp of the last split or
+    /// F183: per-partition unix-epoch timestamp of the last split or
     /// merge involving this partition. Sourced from etcd prefix
     /// `partitionLastOp/<part_id>` (i64 little-endian). Default 0
     /// for partitions never split/merged.
@@ -665,7 +665,7 @@ last_op_at: Rc::new(RefCell::new(HashMap::new())),
 Locate `replay_from_etcd`. After the existing partition/stream/extent prefixes are loaded, add:
 
 ```rust
-        // F181: load partitionLastOp/ sidecar
+        // F183: load partitionLastOp/ sidecar
         let resp = etcd.get_with_prefix("partitionLastOp/").await?;
         let mut last_op_map = HashMap::new();
         for kv in resp {
@@ -702,7 +702,7 @@ Expected: clean.
 
 ```bash
 git add crates/manager/src/lib.rs
-git commit -m "F181-C1: last_op_at sidecar field + etcd replay"
+git commit -m "F183-C1: last_op_at sidecar field + etcd replay"
 ```
 
 ---
@@ -751,7 +751,7 @@ Expected: existing split tests still PASS.
 
 ```bash
 git add crates/manager/src/rpc_handlers.rs
-git commit -m "F181-C2: split handler writes partitionLastOp sidecar"
+git commit -m "F183-C2: split handler writes partitionLastOp sidecar"
 ```
 
 ---
@@ -788,7 +788,7 @@ Append (replace the body in subsequent steps):
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
         // Implementation continues — see following steps.
-        Err((StatusCode::Internal, "F181 handler not yet implemented".to_string()))
+        Err((StatusCode::Internal, "F183 handler not yet implemented".to_string()))
     }
 ```
 
@@ -996,7 +996,7 @@ Replace the stub body with:
 In `lib.rs`:
 
 ```rust
-    /// F181: same as compute_merge_streams but without appending a fresh tail.
+    /// F183: same as compute_merge_streams but without appending a fresh tail.
     /// Used for row_stream + meta_stream where the "current tail" is the
     /// last existing extent (sealed by the caller's commit_length).
     fn splice_streams_without_new_tail(
@@ -1058,7 +1058,7 @@ Fix any unresolved imports (likely need `HashSet` and `MultiModifyMergeReq/Resp`
 
 ```bash
 git add crates/manager/src/lib.rs crates/manager/src/rpc_handlers.rs
-git commit -m "F181-D1: handle_multi_modify_merge Phase 1 + 1.5"
+git commit -m "F183-D1: handle_multi_modify_merge Phase 1 + 1.5"
 ```
 
 ---
@@ -1176,7 +1176,7 @@ Expected: all existing tests pass; merge handler compiles.
 
 ```bash
 git add crates/manager/src/rpc_handlers.rs
-git commit -m "F181-D2: handle_multi_modify_merge Phase 2 (etcd) + Phase 3 (apply)"
+git commit -m "F183-D2: handle_multi_modify_merge Phase 2 (etcd) + Phase 3 (apply)"
 ```
 
 ---
@@ -1218,7 +1218,7 @@ Expected: PASS.
 
 ```bash
 git add crates/manager/src/lib.rs
-git commit -m "F181-D3: in-memory merge handler smoke test"
+git commit -m "F183-D3: in-memory merge handler smoke test"
 ```
 
 ---
@@ -1233,7 +1233,7 @@ git commit -m "F181-D3: in-memory merge handler smoke test"
 - [ ] **Step 1: Create the file with thresholds + types**
 
 ```rust
-//! F181 policy engine: per-partition metrics window + split/merge candidate
+//! F183 policy engine: per-partition metrics window + split/merge candidate
 //! computation. Stage 1 is advisory only; auto-trigger gated behind feature
 //! flags in Stage 2/3.
 
@@ -1304,7 +1304,7 @@ Expected: clean.
 
 ```bash
 git add crates/manager/src/policy.rs crates/manager/src/lib.rs
-git commit -m "F181-E1: policy.rs skeleton — thresholds + window struct"
+git commit -m "F183-E1: policy.rs skeleton — thresholds + window struct"
 ```
 
 ---
@@ -1386,7 +1386,7 @@ impl PolicyEngine {
 - [ ] **Step 2: Create `crates/manager/src/policy_tests.rs`**
 
 ```rust
-//! F181 policy engine unit tests.
+//! F183 policy engine unit tests.
 
 use std::collections::HashMap;
 use autumn_common::MetadataState;
@@ -1501,7 +1501,7 @@ Expected: 4/4 PASS.
 
 ```bash
 git add crates/manager/src/policy.rs crates/manager/src/policy_tests.rs crates/manager/src/lib.rs
-git commit -m "F181-E2: policy split logic + 4 unit tests"
+git commit -m "F183-E2: policy split logic + 4 unit tests"
 ```
 
 ---
@@ -1688,7 +1688,7 @@ Expected: 7/7 PASS.
 
 ```bash
 git add crates/manager/src/policy.rs crates/manager/src/policy_tests.rs
-git commit -m "F181-E3: policy merge logic + 3 unit tests"
+git commit -m "F183-E3: policy merge logic + 3 unit tests"
 ```
 
 ---
@@ -1774,7 +1774,7 @@ In `AutumnManager::serve` (or wherever other background loops are spawned — he
                     now,
                 });
                 if !cands.is_empty() {
-                    tracing::info!("F181 policy: {} candidates", cands.len());
+                    tracing::info!("F183 policy: {} candidates", cands.len());
                     for c in &cands {
                         tracing::info!("  {:?}: {} -> {} ({})",
                             if c.kind == POLICY_KIND_SPLIT { "SPLIT" } else { "MERGE" },
@@ -1794,7 +1794,7 @@ Expected: clean compile; existing tests + policy unit tests pass.
 
 ```bash
 git add crates/manager/src/lib.rs crates/manager/src/rpc_handlers.rs
-git commit -m "F181-F: policy_tick_loop + handle_get_policy_candidates + handle_report_partition_load"
+git commit -m "F183-F: policy_tick_loop + handle_get_policy_candidates + handle_report_partition_load"
 ```
 
 ---
@@ -1832,7 +1832,7 @@ metrics: Rc::new(PartitionMetrics::default()),
 
 ```bash
 git add crates/partition-server/src/lib.rs
-git commit -m "F181-G1: PartitionMetrics struct on PartitionData"
+git commit -m "F183-G1: PartitionMetrics struct on PartitionData"
 ```
 
 ---
@@ -1867,7 +1867,7 @@ Expected: all green.
 
 ```bash
 git add crates/partition-server/src/background.rs
-git commit -m "F181-G2: bump req_count + imm_full_count in merged_partition_loop"
+git commit -m "F183-G2: bump req_count + imm_full_count in merged_partition_loop"
 ```
 
 ---
@@ -1921,7 +1921,7 @@ Find where `heartbeat_loop` is spawned (per F111, in `finish_connect`). Add a si
                     .call(&server_clone.manager_addr, MSG_REPORT_PARTITION_LOAD, payload)
                     .await
                 {
-                    tracing::debug!("F181 report_load failed: {e}");
+                    tracing::debug!("F183 report_load failed: {e}");
                 }
             }
         }).detach();
@@ -1936,7 +1936,7 @@ Expected: clean.
 
 ```bash
 git add crates/partition-server/src/lib.rs
-git commit -m "F181-G3: PS report_load_loop (5 s cadence)"
+git commit -m "F183-G3: PS report_load_loop (5 s cadence)"
 ```
 
 ---
@@ -1986,7 +1986,7 @@ Find the `Drain` arm of the select! macro (F120-C). Add sibling arms:
                     rotate_active(&part);
                     while !part.borrow().imm.is_empty() {
                         flush_one_imm(&part, &p_bulk, &part_sc).await
-                            .map_err(|e| tracing::warn!("F181 freeze flush failed: {e}"))?;
+                            .map_err(|e| tracing::warn!("F183 freeze flush failed: {e}"))?;
                     }
                     let _ = ack.send(());
                     // Continue loop, but the request-intake arm now short-circuits
@@ -2018,7 +2018,7 @@ Expected: clean (some renaming of helpers may be needed; adapt to existing names
 
 ```bash
 git add crates/partition-server/src/lib.rs crates/partition-server/src/background.rs
-git commit -m "F181-H1: MergeFreeze/MergeRelease control messages"
+git commit -m "F183-H1: MergeFreeze/MergeRelease control messages"
 ```
 
 ---
@@ -2182,7 +2182,7 @@ Expected: clean.
 
 ```bash
 git add crates/partition-server/src/rpc_handlers.rs
-git commit -m "F181-H2: handle_merge_part — 12-step flow"
+git commit -m "F183-H2: handle_merge_part — 12-step flow"
 ```
 
 ---
@@ -2286,7 +2286,7 @@ Expected: clean.
 
 ```bash
 git add crates/client/src/lib.rs crates/server/src/bin/autumn_client.rs
-git commit -m "F181-I: CLI — merge + policy candidates subcommands"
+git commit -m "F183-I: CLI — merge + policy candidates subcommands"
 ```
 
 ---
@@ -2372,7 +2372,7 @@ Expected: 3/3 PASS.
 
 ```bash
 git add crates/manager/tests/system_merge.rs
-git commit -m "F181-J1: integration tests — basic merge + 2 refusal cases"
+git commit -m "F183-J1: integration tests — basic merge + 2 refusal cases"
 ```
 
 ---
@@ -2434,7 +2434,7 @@ Expected: PASS (long-running).
 
 ```bash
 git add crates/manager/tests/system_policy.rs
-git commit -m "F181-J2: integration test — policy advisory end-to-end"
+git commit -m "F183-J2: integration test — policy advisory end-to-end"
 ```
 
 ---
@@ -2454,7 +2454,7 @@ git commit -m "F181-J2: integration test — policy advisory end-to-end"
 Append a new section:
 
 ```markdown
-## F181 — Partition merge + policy advisory
+## F183 — Partition merge + policy advisory
 
 ### Manual partition merge
 
@@ -2487,7 +2487,7 @@ runs `split` / `merge` manually based on output.
 - [ ] **Step 2: Add to `crates/manager/CLAUDE.md` — note 16**
 
 ```markdown
-16. **F181 partition merge handler.** `handle_multi_modify_merge` is
+16. **F183 partition merge handler.** `handle_multi_modify_merge` is
     the inverse of `handle_multi_modify_split`. Pattern matches the
     F124 single-txn + F138/F145/F146 inflight checks + F149 fence. Phase 1
     (no awaits) computes spliced streams via `compute_merge_streams`
@@ -2511,7 +2511,7 @@ runs `split` / `merge` manually based on output.
 - [ ] **Step 3: Add to `crates/partition-server/CLAUDE.md` — Programming Note 11**
 
 ```markdown
-11. **F181 partition merge.** `handle_merge_part` runs on the
+11. **F183 partition merge.** `handle_merge_part` runs on the
     survivor's PS (same-PS-only constraint; cross-PS rejected at
     Precondition). Acquisition order for the four gates is strict:
     `(victim, compact_gate) → (victim, gc_gate) → (survivor,
@@ -2532,10 +2532,10 @@ runs `split` / `merge` manually based on output.
 Find the message-type table; add:
 
 ```
-| `0x34`  | `MSG_MULTI_MODIFY_MERGE`     | manager: F181 partition merge    |
-| `0x35`  | `MSG_GET_POLICY_CANDIDATES`  | manager: F181 advisory engine    |
-| `0x36`  | `MSG_REPORT_PARTITION_LOAD`  | PS → manager: F181 metrics       |
-| `0x4D`  | `MSG_MERGE_PART`             | PS: F181 merge entry-point       |
+| `0x34`  | `MSG_MULTI_MODIFY_MERGE`     | manager: F183 partition merge    |
+| `0x35`  | `MSG_GET_POLICY_CANDIDATES`  | manager: F183 advisory engine    |
+| `0x36`  | `MSG_REPORT_PARTITION_LOAD`  | PS → manager: F183 metrics       |
+| `0x4D`  | `MSG_MERGE_PART`             | PS: F183 merge entry-point       |
 ```
 
 - [ ] **Step 5: cargo doc + commit**
@@ -2545,7 +2545,7 @@ Run: `cd /data/dongmao_dev/autumn-rs && cargo doc --workspace --no-deps --exclud
 
 ```bash
 git add README.md crates/manager/CLAUDE.md crates/partition-server/CLAUDE.md crates/rpc/CLAUDE.md
-git commit -m "F181-K1: docs — README manual repro + CLAUDE.md notes"
+git commit -m "F183-K1: docs — README manual repro + CLAUDE.md notes"
 ```
 
 ---
@@ -2556,18 +2556,18 @@ git commit -m "F181-K1: docs — README manual repro + CLAUDE.md notes"
 - Modify: `feature_list.md`
 - Modify: `claude-progress.txt`
 
-- [ ] **Step 1: Add F181 entry to `feature_list.md`**
+- [ ] **Step 1: Add F183 entry to `feature_list.md`**
 
-Find the table at the top (~line 16), add the F181 row:
+Find the table at the top (~line 16), add the F183 row:
 
 ```
-| F181 | Partition merge + size+load advisory policy | partition/manager |
+| F183 | Partition merge + size+load advisory policy | partition/manager |
 ```
 
 Then add a detailed entry in the body of the file (mirror the F129 entry's structure):
 
 ```markdown
-### F181 · Partition merge + split/merge advisory policy
+### F183 · Partition merge + split/merge advisory policy
 - **Target:** Inverse-of-split partition merge primitive (CoW stream-extent
   splice, no value rewrite, single-stream-per-partition invariant
   preserved); manager-side advisory engine emitting split/merge candidates
@@ -2607,7 +2607,7 @@ Replace contents with:
 ```
 Date: 2026-05-09
 TaskStatus: completed
-Task scope: F181 — Partition merge primitive + advisory policy engine.
+Task scope: F183 — Partition merge primitive + advisory policy engine.
             Stage 1: manual triggers + advisory only.
             Spec: docs/superpowers/specs/2026-05-09-partition-merge-...
 
@@ -2643,7 +2643,7 @@ What landed in this commit family:
     - 1 system_policy.rs end-to-end advisory test
 
   Docs:
-    - README.md F181 manual repro section
+    - README.md F183 manual repro section
     - manager CLAUDE.md note 16
     - partition-server CLAUDE.md Programming Note 11
     - rpc CLAUDE.md message-type table updated
@@ -2672,7 +2672,7 @@ Run them in order. Each should be green before proceeding.
 
 ```bash
 git add feature_list.md claude-progress.txt
-git commit -m "F181: feature_list + claude-progress closeout"
+git commit -m "F183: feature_list + claude-progress closeout"
 ```
 
 - [ ] **Step 5: Push to main (per memory: solo-flow repo)**

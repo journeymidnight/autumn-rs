@@ -303,13 +303,13 @@ pub struct AutumnManager {
     /// restart loses pending entries; orphans then reaped by node
     /// startup reconcile.
     pub(crate) pending_extent_deletes: Rc<RefCell<VecDeque<PendingDelete>>>,
-    /// F181: per-partition unix-epoch timestamp of the last split or merge
+    /// F183: per-partition unix-epoch timestamp of the last split or merge
     /// involving this partition. Sourced from etcd prefix
     /// `partitionLastOp/<part_id>` (i64 little-endian). Default 0 for
     /// partitions never split/merged. Used by the policy engine for
     /// cooldown.
     pub(crate) last_op_at: Rc<RefCell<HashMap<u64, i64>>>,
-    /// F181: policy engine — split/merge candidate computation over a
+    /// F183: policy engine — split/merge candidate computation over a
     /// 30-min sliding window of per-partition load metrics.
     pub(crate) policy: Rc<RefCell<crate::policy::PolicyEngine>>,
 }
@@ -338,7 +338,7 @@ impl AutumnManager {
         }
     }
 
-    /// F181: read the last_op_at timestamp for a partition (0 if never op'd).
+    /// F183: read the last_op_at timestamp for a partition (0 if never op'd).
     pub(crate) fn last_op_at_for(&self, part_id: u64) -> i64 {
         self.last_op_at.borrow().get(&part_id).copied().unwrap_or(0)
     }
@@ -421,7 +421,7 @@ impl AutumnManager {
         })
         .detach();
 
-        // F181: policy advisory tick.
+        // F183: policy advisory tick.
         let mgr = self.clone();
         compio::runtime::spawn(async move {
             mgr.policy_tick_loop().await;
@@ -429,7 +429,7 @@ impl AutumnManager {
         .detach();
     }
 
-    /// F181: every POLICY_TICK_INTERVAL_SEC, leader recomputes split/merge
+    /// F183: every POLICY_TICK_INTERVAL_SEC, leader recomputes split/merge
     /// candidates from the per-partition load windows + last_op_at +
     /// region owners. Logs new candidates at INFO; exposes the cache
     /// via MSG_GET_POLICY_CANDIDATES.
@@ -455,7 +455,7 @@ impl AutumnManager {
                 now,
             });
             if !cands.is_empty() {
-                tracing::info!("F181 policy: {} candidate(s)", cands.len());
+                tracing::info!("F183 policy: {} candidate(s)", cands.len());
                 for c in &cands {
                     let kind = if c.kind == POLICY_KIND_SPLIT { "SPLIT" } else { "MERGE" };
                     tracing::info!(
@@ -615,7 +615,7 @@ impl AutumnManager {
         // them in recovery_dispatch_loop until the next
         // ec_conversion_dispatch_loop tick re-enters the convert path.
         let ec_inflight = c.get_prefix("ecConversionInflight/").await?;
-        // F181: per-partition last_op_at sidecar
+        // F183: per-partition last_op_at sidecar
         let last_op = c.get_prefix("partitionLastOp/").await?;
         drop(c);
 
@@ -710,7 +710,7 @@ impl AutumnManager {
             decoded_ec_inflight.insert(id);
         }
 
-        // F181: parse partitionLastOp/ sidecar (i64 little-endian)
+        // F183: parse partitionLastOp/ sidecar (i64 little-endian)
         let mut decoded_last_op: HashMap<u64, i64> = HashMap::new();
         for kv in &last_op.kvs {
             let id = Self::parse_id_from_key("partitionLastOp/", &kv.key)?;
@@ -741,7 +741,7 @@ impl AutumnManager {
         // recovery_dispatch_loop could fire on extents the prior leader
         // was converting.
         *self.ec_conversion_inflight.borrow_mut() = decoded_ec_inflight;
-        // F181: install last_op_at sidecar so policy engine cooldown
+        // F183: install last_op_at sidecar so policy engine cooldown
         // gating is correct on cold-start as well.
         *self.last_op_at.borrow_mut() = decoded_last_op;
 
@@ -1087,7 +1087,7 @@ impl AutumnManager {
         Ok((dst, modified_extents))
     }
 
-    /// F181: splice victim's extents onto the END of survivor's
+    /// F183: splice victim's extents onto the END of survivor's
     /// extent_ids list, then append `new_tail` as the new active tail.
     ///
     /// Order invariant (load-bearing):
@@ -1173,7 +1173,7 @@ impl AutumnManager {
         Ok((updated, modified_extents))
     }
 
-    /// F181: same as compute_merge_streams but without appending a new
+    /// F183: same as compute_merge_streams but without appending a new
     /// tail. Used for row_stream + meta_stream where the post-merge
     /// stream's tail is just victim's last existing extent (sealed by
     /// the caller's commit_length capture).
@@ -1330,7 +1330,7 @@ impl AutumnManager {
         snapshot
     }
 
-    /// F181: per-extent sum of two partitions' VP refs, owned by
+    /// F183: per-extent sum of two partitions' VP refs, owned by
     /// `survivor_id`. Caller deletes `partition_vp_refs[victim_id]`
     /// in Phase 3.
     fn merged_partition_vp_refs(
@@ -1381,7 +1381,7 @@ impl AutumnManager {
         Self::rebalance_regions(state);
     }
 
-    /// F181: apply computed merge mutations. Mirror of `apply_split_mutations`.
+    /// F183: apply computed merge mutations. Mirror of `apply_split_mutations`.
     /// Caller (handle_multi_modify_merge Phase 3) verifies eversion drift
     /// before invoking. Drops victim partition + its three stream metas
     /// + its partition_vp_refs entry; rebalances regions to remove the
@@ -2982,7 +2982,7 @@ mod tests {
         })
     }
 
-    /// F181: merge handler rejects non-adjacent partitions.
+    /// F183: merge handler rejects non-adjacent partitions.
     #[test]
     fn f181_merge_refuses_non_adjacent() {
         run(async {
@@ -3044,7 +3044,7 @@ mod tests {
         })
     }
 
-    /// F181: merge handler rejects when survivor == victim.
+    /// F183: merge handler rejects when survivor == victim.
     #[test]
     fn f181_merge_refuses_self_merge() {
         run(async {
@@ -3074,7 +3074,7 @@ mod tests {
         })
     }
 
-    /// F181: merge handler rejects when any source extent is in
+    /// F183: merge handler rejects when any source extent is in
     /// ec_conversion_inflight (mirrors F138).
     #[test]
     fn f181_merge_refuses_when_ec_inflight() {

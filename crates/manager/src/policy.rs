@@ -1,4 +1,4 @@
-//! F181 policy engine: per-partition load metrics window + split/merge
+//! F183 policy engine: per-partition load metrics window + split/merge
 //! candidate computation. Stage 1 ships advisory only; auto-trigger is
 //! gated behind feature flags in Stage 2/3.
 //!

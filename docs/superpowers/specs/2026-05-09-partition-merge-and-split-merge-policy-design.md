@@ -515,7 +515,7 @@ Existing `info` output gains a per-partition `last_op_at` line (from `MgrPartiti
 ## 6. Staging & Rollout
 
 ```
-Stage 1 (this commit family — F181):
+Stage 1 (this commit family — F183):
   ├─ MSG_MULTI_MODIFY_MERGE / MSG_MERGE_PART implemented
   ├─ Policy engine running, advisory only (no auto-trigger)
   ├─ CLI `autumn-client merge` + `autumn-client policy candidates`
@@ -650,7 +650,7 @@ Tests live in `crates/manager/tests/` (integration) and `crates/manager/src/lib.
 
 ### 9.7 Docs (4 files)
 - `README.md`: add "Manual partition merge" section + "Policy candidates" section.
-- `feature_list.md`: add F181 entry (umbrella) + F181-A (merge primitive), F181-B (policy advisory).
+- `feature_list.md`: add F183 entry (umbrella) + F183-A (merge primitive), F183-B (policy advisory).
 - `claude-progress.txt`: status update on commit.
 - `crates/rpc/CLAUDE.md`: list new message types `0x33` / `0x34` / `0x35` / `0x46`.
 
@@ -669,7 +669,7 @@ Tests live in `crates/manager/tests/` (integration) and `crates/manager/src/lib.
 
 | Risk | Mitigation |
 |---|---|
-| `extent_ids` ordering invariant violated by future refactor | Inline `// F181 invariant` comments at splice site; unit test `compute_merge_streams_extent_ids_order` |
+| `extent_ids` ordering invariant violated by future refactor | Inline `// F183 invariant` comments at splice site; unit test `compute_merge_streams_extent_ids_order` |
 | Survivor `sst_readers` doubles → bloom-FP rate doubles → read latency bump | Same shape as post-split has_overlap state; major compaction unifies. Document in PS CLAUDE.md. |
 | Long `extent_ids` lists → `MSG_STREAM_INFO` wire bloat | At 100 GB partition, ~37 KB worst case; acceptable. Policy can refuse merging two huge partitions back-to-back via the `MERGE_SIZE_LOW=1 GB` threshold (already ensures both sides are small). |
 | Merge-then-immediate-split oscillation | `SPLIT_COOLDOWN=1h`, `MERGE_COOLDOWN=6h`, plus 10× hysteresis between `SPLIT_QPS_HIGH=50K` and `MERGE_QPS_LOW=5K`. |
