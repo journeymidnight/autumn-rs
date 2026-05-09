@@ -59,6 +59,7 @@ pub mod cqe;
 pub mod header;
 pub mod buffer_pool;
 pub mod ring;
+pub mod handshake;
 
 pub use opcode::Opcode;
 pub use sqe::{Sqe, SqeDecodeError};
@@ -71,6 +72,11 @@ pub use header::{
 pub use buffer_pool::{BufferPoolLayout, BufferPoolError};
 pub use ring::{
     SqProducer, SqConsumer, CqProducer, CqConsumer, allocate_test_region,
+};
+pub use handshake::{
+    HelloRequest, HelloResponse, HelloStatus, MsgType, DaemonLimits,
+    HandshakeDecodeError, negotiate, HANDSHAKE_MAGIC, HELLO_REQUEST_SIZE,
+    HELLO_RESPONSE_SIZE,
 };
 
 /// All decode errors produced by this crate share this surface so a
@@ -85,4 +91,6 @@ pub enum IoRingError {
     HeaderDecode(#[from] RingHeaderDecodeError),
     #[error("buffer pool error: {0}")]
     BufferPool(#[from] BufferPoolError),
+    #[error("malformed handshake: {0}")]
+    Handshake(#[from] HandshakeDecodeError),
 }
