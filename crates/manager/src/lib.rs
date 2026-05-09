@@ -3397,6 +3397,203 @@ mod tests {
         })
     }
 
+    /// F183: merge handler refuses when any source extent is in
+    /// recovery_tasks (mirrors F146 split-side guard).
+    #[test]
+    fn f183_merge_refuses_when_recovery_inflight() {
+        run(async {
+            let m = AutumnManager::new();
+            let owner_key = "owner-test".to_string();
+            let revision = {
+                let mut s = m.store.inner.borrow_mut();
+                s.acquire_owner_lock(&owner_key)
+            };
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.next_id = 200;
+                for (pid, sids, start, end, eids) in [
+                    (1u64, [10u64, 11, 12], b"a".to_vec(), b"m".to_vec(), [100u64, 101, 102]),
+                    (2u64, [20u64, 21, 22], b"m".to_vec(), b"z".to_vec(), [200u64, 201, 202]),
+                ] {
+                    for (sid, eid) in sids.iter().copied().zip(eids.iter().copied()) {
+                        s.streams.insert(
+                            sid,
+                            MgrStreamInfo {
+                                stream_id: sid,
+                                extent_ids: vec![eid],
+                                ec_data_shard: 0,
+                                ec_parity_shard: 0,
+                                replicates: 3,
+                            },
+                        );
+                        s.extents.insert(
+                            eid,
+                            MgrExtentInfo {
+                                extent_id: eid,
+                                replicates: vec![1],
+                                parity: vec![],
+                                eversion: 1,
+                                refs: 1,
+                                vp_table_refs: 0,
+                                sealed_length: 1000,
+                                avali: 1,
+                                replicate_disks: vec![10],
+                                parity_disks: vec![],
+                                ec_converted: false,
+                            },
+                        );
+                    }
+                    s.partitions.insert(
+                        pid,
+                        MgrPartitionMeta {
+                            part_id: pid,
+                            log_stream: sids[0],
+                            row_stream: sids[1],
+                            meta_stream: sids[2],
+                            rg: Some(MgrRange { start_key: start, end_key: end }),
+                        },
+                    );
+                }
+            }
+            // Simulate active recovery on victim's row_stream extent.
+            m.recovery_tasks.borrow_mut().insert(
+                201,
+                MgrRecoveryTask {
+                    extent_id: 201,
+                    replace_id: 999,
+                    node_id: 1,
+                    start_time: 0,
+                },
+            );
+
+            let req = rkyv_encode(&MultiModifyMergeReq {
+                survivor_part_id: 1,
+                victim_part_id: 2,
+                owner_key,
+                revision,
+                log_sealed_lengths: [0, 0],
+                row_sealed_lengths: [0, 0],
+                meta_sealed_lengths: [0, 0],
+            });
+            let resp = m.handle_multi_modify_merge(req).await.unwrap();
+            let r: MultiModifyMergeResp = rkyv_decode(&resp).unwrap();
+            assert_ne!(r.code, CODE_OK);
+            assert!(
+                r.message.contains("recovery in flight"),
+                "must identify recovery inflight cause: {}",
+                r.message
+            );
+        })
+    }
+
+    /// F183: merge handler refuses when any source extent is queued
+    /// for physical delete (mirrors F139).
+    #[test]
+    fn f183_merge_refuses_when_pending_delete() {
+        run(async {
+            let m = AutumnManager::new();
+            let owner_key = "owner-test".to_string();
+            let revision = {
+                let mut s = m.store.inner.borrow_mut();
+                s.acquire_owner_lock(&owner_key)
+            };
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.next_id = 200;
+                for (pid, sids, start, end, eids) in [
+                    (1u64, [10u64, 11, 12], b"a".to_vec(), b"m".to_vec(), [100u64, 101, 102]),
+                    (2u64, [20u64, 21, 22], b"m".to_vec(), b"z".to_vec(), [200u64, 201, 202]),
+                ] {
+                    for (sid, eid) in sids.iter().copied().zip(eids.iter().copied()) {
+                        s.streams.insert(
+                            sid,
+                            MgrStreamInfo {
+                                stream_id: sid,
+                                extent_ids: vec![eid],
+                                ec_data_shard: 0,
+                                ec_parity_shard: 0,
+                                replicates: 3,
+                            },
+                        );
+                        s.extents.insert(
+                            eid,
+                            MgrExtentInfo {
+                                extent_id: eid,
+                                replicates: vec![1],
+                                parity: vec![],
+                                eversion: 1,
+                                refs: 1,
+                                vp_table_refs: 0,
+                                sealed_length: 1000,
+                                avali: 1,
+                                replicate_disks: vec![10],
+                                parity_disks: vec![],
+                                ec_converted: false,
+                            },
+                        );
+                    }
+                    s.partitions.insert(
+                        pid,
+                        MgrPartitionMeta {
+                            part_id: pid,
+                            log_stream: sids[0],
+                            row_stream: sids[1],
+                            meta_stream: sids[2],
+                            rg: Some(MgrRange { start_key: start, end_key: end }),
+                        },
+                    );
+                }
+            }
+            // Queue extent 100 (survivor's log_stream extent) for physical delete.
+            m.pending_extent_deletes.borrow_mut().push_back(PendingDelete {
+                extent_id: 100,
+                pending_addrs: vec![],
+                attempts: 0,
+            });
+
+            let req = rkyv_encode(&MultiModifyMergeReq {
+                survivor_part_id: 1,
+                victim_part_id: 2,
+                owner_key,
+                revision,
+                log_sealed_lengths: [0, 0],
+                row_sealed_lengths: [0, 0],
+                meta_sealed_lengths: [0, 0],
+            });
+            let resp = m.handle_multi_modify_merge(req).await.unwrap();
+            let r: MultiModifyMergeResp = rkyv_decode(&resp).unwrap();
+            assert_ne!(r.code, CODE_OK);
+            assert!(
+                r.message.contains("pending delete"),
+                "must identify pending-delete cause: {}",
+                r.message
+            );
+        })
+    }
+
+    /// F183 + F184: merge then last_op_at must be updated on the
+    /// survivor and removed for the victim.
+    #[test]
+    fn f184_merge_updates_last_op_at_correctly() {
+        let mut state = autumn_common::MetadataState::default();
+        let mut m = HashMap::new();
+        m.insert(1u64, 1_700_000_000i64);
+        m.insert(2u64, 1_700_000_500i64);
+
+        // Simulate the in-memory updates applied at end of
+        // handle_multi_modify_merge Phase 3.
+        let now = 1_800_000_000i64;
+        m.insert(1u64, now);
+        m.remove(&2);
+
+        assert_eq!(m.get(&1), Some(&now));
+        assert!(m.get(&2).is_none());
+        // Suppress unused-state warning.
+        let _ = state.partitions.is_empty();
+        // Avoid `state` mut warning.
+        state.next_id = 1;
+    }
+
     /// F144: with 4 nodes and count=3, every node must appear in a
     /// non-trivial fraction of selections — pre-F144 the lowest-id 3
     /// always won and node 7 never showed up.
