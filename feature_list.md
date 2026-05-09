@@ -570,6 +570,78 @@
   - Perf (TCP p=8 d=8 4K, /tmp tmpfs, same machine, back-to-back runs): F148 90,659 ops/s; F149 96,826 ops/s; F150 Phase A-+A 92,836 ops/s; F150 Phase A-+A+B 91,505 ops/s. All four cluster within ±3.5% — measurement noise on a tmpfs rig where fsync is already free. Read side and latency indistinguishable from F148/F149. The 26-31% gap vs the 2026-04-29 baseline (131,246 ops/s) is the F142 correctness cost (proved by HEAD-bisect: d985a6e parent=124,176 vs 7a90983 F142=96,905). Phase B preserves the F142 invariant; Phase C remains the only avenue for recovering more without compromising it.
 - **passes:** true (correctness preserved, lib tests pass, architectural cleanup substantial; perf-on-tmpfs shows no degradation but cannot demonstrate a recovery either, validation deferred to production SSD bench).
 
+### F179 · autumn-fuse: async-reply read + parallel chunk fetch + ClusterClient `&self` refactor
+
+- **Target**: lift the FUSE read throughput from `~13 k ops/s` aggregate (4K random) and `~470 MB/s` (8M random) — observed pre-fix with arbitrary client thread count, indicating a single-dispatcher serialisation bottleneck in the fuse path.
+- **Three coordinated fixes (committed `b7811a9`)**:
+  1. **Async-reply Read**: `FsRequest::Read` now carries `fuser::ReplyData` directly across the bridge instead of returning through a std::mpsc reply. `ops.rs::read` ships the request and returns immediately, freeing fuser's single-threaded `/dev/fuse` reader to advance to the next request. `dispatch.rs::Read` spawns the parallel chunk fetch and replies via the carried `ReplyData` when the fanout lands.
+  2. **Two-phase read with parallel chunk fanout**: `read::prepare(&mut state, ...)` does cheap synchronous chunk planning (resolve_key + get_ps_client per chunk) under brief borrow; `read::execute(plan)` does `join_all` over chunk MSG_GET RPCs with no state reference. RpcClient is multiplexed so N concurrent calls share one socket.
+  3. **ClusterClient `&self` refactor**: `regions`/`ps_details`/`part_addrs` wrapped in `RefCell`; all hot-path methods (`resolve_key`, `put`, `get`, `range`, etc.) take `&self`. Concurrent compio tasks holding `Rc<ClusterClient>` can do brief routing lookups without blocking each other. Borrows are scoped — never held across `.await`.
+- **Mount-side tuning (also committed)**:
+  - `FOPEN_DIRECT_IO` on Open reply so each user `read()` reaches the daemon (bypass kernel page cache).
+  - `MountOption::CUSTOM("max_read=8388608")` to encourage larger FUSE read units (kernel still caps at `FUSE_MAX_PAGES_PER_REQ`, but harmless).
+- **Bench results (TCP, 3-disk, threads=N)**:
+  - 4K random read aggregate: `13.8 k → 31.5 k ops/s` (+128%)
+  - 8M random read aggregate: `471 → 600 MB/s` (+27%)
+- **Remaining gap to perf_check direct (`1.81 M ops/s` on 4K)**: ~60×. Two structural limits remaining: fuser-0.15's single-threaded `/dev/fuse` reader, and kernel `FUSE_MAX_PAGES_PER_REQ` ~128 KiB cap. Both need either a different FUSE library (multi-fd dispatch / `-o clone_fd`) OR a parallel data path that bypasses kernel FUSE entirely. F180 takes the latter approach.
+- **passes:** true
+
+### F180 · autumn-fuse: shared-memory io_uring side-channel (3FS-style)
+
+- **Target**: structurally remove the two FUSE bottlenecks F179 hit but couldn't break — fuser's single-threaded `/dev/fuse` reader and the kernel `FUSE_MAX_PAGES_PER_REQ` ~128 KiB cap. Inspired by 3FS's `IoRing` (`3FS/src/fuse/IoRing.h`, `IoRing.cc`): applications and daemon share a memory-mapped ring with atomic SQE/CQE protocol; batched submit, no kernel context switch per I/O. Targeting AI/HPC workloads — PyTorch DataLoader, inference batch read — where one process issues thousands of in-flight reads against known data sets.
+- **Critical scope clarification**: this is a **parallel side-channel**, NOT a replacement of the kernel FUSE mount. The mount stays so `ls`, `cp`, `cat`, monitoring agents continue to work. AI applications opt-in to the io_uring path via a Rust SDK / Python binding; standard POSIX tools keep using kernel FUSE.
+- **Phasing**:
+  - **F180-A — protocol + ring layout** (this entry's first commit):
+    - New crate `crates/ioring/` with the wire protocol, layout constants, and pure-data SQE/CQE codecs. **No daemon or client integration yet** — just the shared types both sides will agree on.
+    - SHM file path: `/dev/shm/autumn-fuse/<session_id>.ring`. Layout: header (producer/consumer indices, ring size, capability flags), SQ ring (atomic indices), CQ ring, pinned buffer pool region.
+    - SQE struct: `{ opcode: u8, ring_fd: u32, offset: u64, length: u32, buf_offset: u64, user_data: u64 }`. Opcodes: `OPEN` (path → ring_fd), `READ`, `WRITE`, `CLOSE`. Reads/writes reference a slot in the buffer pool (no copy through SHM body).
+    - CQE struct: `{ user_data: u64, result: i64 }`. Negative result = errno.
+    - Sync primitives: `AtomicU64` head/tail indices for SQ and CQ; `eventfd` or `futex` for blocked-waiter wake-ups.
+    - Tests: round-trip SQE/CQE encode/decode; head/tail wraparound; capacity invariants.
+  - **F180-B — daemon-side ring poller**:
+    - autumn-fuse daemon listens on a Unix socket for session-open RPC. On accept, allocates an SHM ring, sends the fd back via `SCM_RIGHTS`.
+    - Compio task on the existing fuse runtime polls the SQ; pulls SQE batches of up to 32; dispatches `READ`/`WRITE`/`OPEN`/`CLOSE` to the existing `read::prepare/execute`/`write::write` path.
+    - Maintains `ring_fd → inode` mapping per session. `OPEN` allocates a new ring_fd, `CLOSE` releases it. Ring_fds are NOT kernel fds — they're indices into the daemon's per-session table.
+    - On completion: write CQE to ring head, atomic-increment, eventfd-wake the waiter if registered.
+  - **F180-C — Rust client API + benchmark**:
+    - `crates/ioring/` exposes `IoRing::connect(daemon_socket) → IoRing`, `submit_open(path)`, `submit_read(ring_fd, off, len, buf_idx)`, `wait_completion() → CQE`, `poll_completion() → Option<CQE>`.
+    - New benchmark binary `crates/ioring/examples/bench_read.rs` doing N-thread parallel reads via the ring.
+    - **Validation gate**: F180-C bench must show ≥ 200 k ops/s on 4 K random reads (vs F179's 31 k via FUSE) before committing to F180-D/E. If not, the design is wrong and we re-architect.
+  - **F180-D — Python binding** (deferred until C validates):
+    - Extend `python/autumn-python` with a new `IoRing` pyo3 class. Async API: `await ring.read(ring_fd, off, len) -> bytes`. Same compio worker-thread pattern as the existing `Client` binding.
+  - **F180-E — PyTorch integration** (deferred until D validates):
+    - `python/examples/autumn_torch_dataset.py` showing `AutumnIODataset` that wraps `IoRing` for DataLoader prefetching.
+- **Expected gain**: 4 K reads from 31 k → 500 k+ ops/s; 8 M reads from 600 MB/s → 5+ GB/s (approaches perf_check direct path because FUSE-kernel layer is gone).
+- **Out of scope**:
+  - Replacing FUSE mount entirely — F180 is parallel, not a replacement.
+  - Kernel-side multi-fd dispatch (`-o clone_fd`).
+  - Multi-mount load balancing.
+  - LD_PRELOAD transparency shim — apps explicitly link `autumn-ioring`.
+- **Why not just expose ClusterClient to Python directly?** That works for read-only workloads with no write coherence needs, and `python/autumn-python` already does it. F180 is for workloads that need the daemon's shared inode cache + write coherence + POSIX integration — multi-process inference, write-heavy mixed loads. For pure-read PyTorch training, the existing async ClusterClient binding is enough; F180 adds value when daemon-mediated coherence matters.
+- **passes:** false (in-flight: F180-A starts with this entry)
+
+### F181 · autumn-fuse: batched chunk RPC (`MSG_BATCH_GET`) — deferred follow-up
+
+- **Target**: cut RPC framing overhead on chunk reads. Each MSG_GET pays 10-byte rpc frame header + rkyv encode/decode of GetReq/GetResp + per-call PS-side route lookup. After F179 we issue N parallel MSG_GETs per FUSE read; after F180 the daemon will issue N parallel MSG_GETs per ring submit. Both paths benefit from a single batched RPC.
+- **Approach**:
+  - New PS RPC: `MSG_BATCH_GET = 0x4A`. Request: `BatchGetReq { part_id, items: Vec<{key, offset, length}> }`. Response: `BatchGetResp { code, results: Vec<GetResultItem { code, offset, value }> }`.
+  - PS handler: looks up each key in active memtable / imm / SSTable (single-threaded P-log task; per-key processing serialised but RPC framing amortised).
+  - autumn-fuse `read::execute` groups chunks **by `part_id`** and issues one `MSG_BATCH_GET` per group.
+- **Expected gain**: 30-50% on 8 M reads (RPC framing currently ~30% of per-chunk overhead at 256 KiB).
+- **Out of scope**: `MSG_BATCH_PUT`, `MSG_BATCH_HEAD`. Separate entries once the read win lands.
+- **passes:** false (deferred)
+
+### F182 · autumn-fuse: RDMA chunk transfer — deferred follow-up
+
+- **Target**: replace TCP-loopback memcpy with RDMA zero-copy on the chunk-data path. autumn-rs already has UCX support (F100-UCX); the fuse client doesn't use it.
+- **Approach**:
+  - autumn-fuse opens its `ClusterClient` with the UCX transport when available.
+  - For the chunk data plane specifically: pin RDMA-registered read buffers in the daemon. Server-side `MSG_GET` (or `MSG_BATCH_GET` post-F181) uses UCX rndv-zcopy for ≥ 1 MiB results.
+  - End-to-end zero copy requires F180 — without bypassing kernel FUSE, data still round-trips through `/dev/fuse` and the RDMA win is daemon ↔ cluster only.
+- **Expected gain**: 8 M read 600 MB/s → 2-3 GB/s on RDMA-capable hardware; ~no gain on TCP loopback.
+- **Prereq**: RDMA NIC (RoCE / IB); F180 for end-to-end zero copy.
+- **passes:** false (deferred; needs hardware + F180)
+
 ### F178 · LevelDB-style sync coalescing — remove `--nosync`, always durable, fsync at 1-5 ms cadence
 - **Target:** Recover the F142-era throughput regression (pre-F142 130k ops/s → post-F142 89k-100k ops/s on 4K writes) without compromising the durability invariant F142 introduced. F142 added a rotation-trigger `must_sync=true` barrier so that all log_stream bytes referenced by VPs in the about-to-be-flushed memtable are durable BEFORE the flush starts; pre-F142's `sync_stream_tail` separate-RPC pattern had the same intent. The cost: every rotation-triggering batch (~1/s under sustained 70 MB/s write) does a sync_data on the log_stream tail extent. Combined with per-batch must_sync=true on the client-driven sync path, fsync overhead dominates the throughput ceiling on real disks.
 - **Approach (LevelDB-style):** sync at the wire is now a hint, not a guarantee — every append always becomes durable, but the actual `sync_data` syscall is coalesced. A background fsync task on each extent-node aggregates `pending_fsync_offset` across many concurrent appends, fires `sync_data` every 1-5 ms (configurable coalescing window), and wakes all waiters whose `end ≤ synced_high_water` together. This decouples pwrite throughput from fsync rate: 200-1000 fsyncs/sec is enough to drain any reasonable batch volume; pwrites pipeline freely between fsyncs.
