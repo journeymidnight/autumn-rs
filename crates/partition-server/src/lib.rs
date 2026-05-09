@@ -288,15 +288,16 @@ const OP_VALUE_POINTER: u8 = 0x80;
 //     fragment of an in-progress multipart upload. Recovery and GC
 //     skip these records (no memtable insert, no rewrite). They're
 //     reclaimed when their host extent is punched.
-const OP_VALUE_POINTER_MULTI: u8 = 0x40;
-const OP_CHUNK_BLOB: u8 = 0x10;
+pub(crate) const OP_VALUE_POINTER_MULTI: u8 = 0x40;
+pub(crate) const OP_CHUNK_BLOB: u8 = 0x10;
 
 // F129 multipart upload caps. Symmetric on read + write. Configurable
 // via env at PS startup (see `parse_env_caps`).
-const AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT: u32 = 64 * 1024 * 1024;
-const AUTUMN_PS_MAX_INLINE_BYTES_HARD: u32 = 256 * 1024 * 1024;
-const AUTUMN_PS_MAX_UPLOAD_SESSIONS_DEFAULT: usize = 1024;
-const AUTUMN_PS_UPLOAD_TTL_SECS_DEFAULT: u64 = 30 * 60;
+pub(crate) const AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT: u32 = 64 * 1024 * 1024;
+#[allow(dead_code)]
+pub(crate) const AUTUMN_PS_MAX_INLINE_BYTES_HARD: u32 = 256 * 1024 * 1024;
+pub(crate) const AUTUMN_PS_MAX_UPLOAD_SESSIONS_DEFAULT: usize = 1024;
+pub(crate) const AUTUMN_PS_UPLOAD_TTL_SECS_DEFAULT: u64 = 30 * 60;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ValuePointer {
@@ -600,6 +601,30 @@ impl TableMeta {
 // PartitionData — lives on a dedicated partition thread (Rc, no locks)
 // ---------------------------------------------------------------------------
 
+/// F129 in-progress multipart upload state. One entry per active
+/// `upload_id`. Lives in-memory only; a PS restart drops all sessions
+/// (clients must re-Begin). Resume across restart is F132 (deferred).
+///
+/// The fragments list grows monotonically: each successful PutChunk
+/// appends one entry. PutCommit walks `fragments` to build the final
+/// `MultiFragVp` blob. PutAbort drops the session; the chunk bytes
+/// stay in log_stream as `OP_CHUNK_BLOB` records — GC + recovery
+/// skip them, so they're reclaimed when their host extent is punched
+/// (no F130 active rewrite yet, so they only go away when their host
+/// extent ages out below GC_DISCARD_RATIO).
+#[derive(Debug, Clone)]
+pub(crate) struct UploadSession {
+    pub user_key: Vec<u8>,
+    pub expires_at: u64,
+    pub started_at_secs: u64,
+    pub last_seen_secs: u64,
+    pub bytes_committed: u64,
+    /// Index of the next chunk the client may submit. PutChunk rejects
+    /// chunks whose `chunk_index` doesn't match.
+    pub next_chunk_index: u32,
+    pub fragments: Vec<ValuePointer>,
+}
+
 pub(crate) struct PartitionData {
     part_id: u64,
     rg: Range,
@@ -609,6 +634,10 @@ pub(crate) struct PartitionData {
     compact_tx: mpsc::Sender<bool>,
     gc_tx: mpsc::Sender<GcTask>,
     seq_number: u64,
+    /// F129: in-memory upload session map. Bounded by
+    /// `AUTUMN_PS_MAX_UPLOAD_SESSIONS_DEFAULT`; expired entries are
+    /// evicted lazily at PutBegin time.
+    pub(crate) upload_sessions: std::collections::HashMap<u128, UploadSession>,
     log_stream_id: u64,
     row_stream_id: u64,
     meta_stream_id: u64,
@@ -2437,6 +2466,7 @@ async fn partition_thread_main(
         compact_gate: compact_gate.clone(),
         gc_gate: gc_gate.clone(),
         extent_pins: std::cell::RefCell::new(std::collections::HashMap::new()),
+        upload_sessions: std::collections::HashMap::new(),
     }));
 
     sync_partition_vp_refs(&part)
@@ -3018,6 +3048,22 @@ async fn handle_incoming_req(
 fn enqueue_put(req: PartitionRequest, pending: &mut Vec<WriteRequest>) {
     match partition_rpc::rkyv_decode::<PutReq>(&req.payload) {
         Ok(put_req) => {
+            // F129: regular `Put` rejects values exceeding the inline
+            // cap. Caller should retry via PutBegin/Chunk/Commit.
+            if put_req.value.len() > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize {
+                let key_vec = put_req.key.clone();
+                let resp = PutResp {
+                    code: CODE_VALUE_TOO_LARGE,
+                    message: format!(
+                        "value {} bytes exceeds inline cap {} — use PutStream",
+                        put_req.value.len(),
+                        AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT
+                    ),
+                    key: key_vec,
+                };
+                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                return;
+            }
             let key_vec = put_req.key.clone();
             pending.push(WriteRequest {
                 op: WriteOp::Put {
@@ -3225,6 +3271,15 @@ async fn recover_partition(
                 }
             };
             for (buf_off, op, key, value, expires_at) in decode_records_with_offsets(&data) {
+                // F129: chunk blobs are payload-only WAL records that
+                // exist solely so the multi-frag VP can point at their
+                // bytes. They aren't memtable entries; their key is
+                // empty; replay must skip them. They're reclaimed
+                // when their host extent is punched by GC.
+                if op & OP_CHUNK_BLOB != 0 {
+                    continue;
+                }
+
                 let ts = parse_ts(&key);
                 if ts > max_seq {
                     max_seq = ts;
@@ -3234,8 +3289,19 @@ async fn recover_partition(
                 }
 
                 let record_extent_off = start_off + buf_off as u32;
-                // VP detection: new WAL has VP flag in op; old WAL uses value size as fallback
-                let mem_entry = if op & OP_VALUE_POINTER != 0 || value.len() > VALUE_THROTTLE {
+                let mem_entry = if op & OP_VALUE_POINTER_MULTI != 0 {
+                    // F129: multi-frag VP commit record. The `value`
+                    // here IS the encoded MultiFragVp blob (fragment
+                    // list + total_len). Insert as-is; resolve_value
+                    // decodes the blob at Get time and reads each
+                    // fragment from log_stream.
+                    MemEntry {
+                        op: (op & 0x7f) | OP_VALUE_POINTER_MULTI,
+                        value,
+                        expires_at,
+                    }
+                } else if op & OP_VALUE_POINTER != 0 || value.len() > VALUE_THROTTLE {
+                    // VP detection: new WAL has VP flag in op; old WAL uses value size as fallback
                     let vp = ValuePointer {
                         extent_id: eid,
                         offset: record_extent_off + 17 + key.len() as u32,
@@ -4888,6 +4954,43 @@ mod merged_loop_tests {
         let decoded: PutResp = partition_rpc::rkyv_decode(&bytes).unwrap();
         assert_eq!(decoded.code, CODE_OK);
         assert_eq!(decoded.key.as_slice(), b"hello");
+    }
+
+    /// F129 — regular Put rejects values > AUTUMN_PS_MAX_INLINE_BYTES
+    /// without enqueueing into the write batch. The outer oneshot
+    /// receives a PutResp with code=CODE_VALUE_TOO_LARGE so the
+    /// client can fall back to PutBegin/Chunk/Commit.
+    #[test]
+    fn enqueue_put_rejects_oversized_value() {
+        let big_value = vec![0u8; AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize + 1];
+        let (req, resp_rx) =
+            build_put_partition_request(b"big-key", &big_value, 0);
+        let mut pending: Vec<WriteRequest> = Vec::new();
+        enqueue_put(req, &mut pending);
+
+        // No WriteRequest queued — the cap fires before pipeline insert.
+        assert_eq!(pending.len(), 0, "oversized Put must not enter pipeline");
+
+        // The outer oneshot got a CODE_VALUE_TOO_LARGE PutResp frame.
+        let frame = compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { resp_rx.await });
+        let bytes = frame.expect("outer oneshot dropped").expect("encoded PutResp");
+        let decoded: PutResp = partition_rpc::rkyv_decode(&bytes).unwrap();
+        assert_eq!(decoded.code, CODE_VALUE_TOO_LARGE);
+        assert_eq!(decoded.key.as_slice(), b"big-key");
+    }
+
+    /// F129 — regular Put at exactly the inline cap goes through normally.
+    /// Cap is `> AUTUMN_PS_MAX_INLINE_BYTES`, so equality is allowed.
+    #[test]
+    fn enqueue_put_accepts_value_at_inline_cap() {
+        let exact_cap_value = vec![0u8; AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize];
+        let (req, _resp_rx) =
+            build_put_partition_request(b"k", &exact_cap_value, 0);
+        let mut pending: Vec<WriteRequest> = Vec::new();
+        enqueue_put(req, &mut pending);
+        assert_eq!(pending.len(), 1, "value at exact cap must enqueue normally");
     }
 
     /// F099-D test 2 — mixed sequence: enqueue 2 puts and 1 delete in

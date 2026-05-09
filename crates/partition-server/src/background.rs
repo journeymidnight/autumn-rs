@@ -1804,6 +1804,15 @@ pub(crate) async fn resolve_value(
     offset: u32,
     length: u32,
 ) -> Result<Vec<u8>> {
+    if op & crate::OP_VALUE_POINTER_MULTI != 0 {
+        // F129: multi-fragment VP. raw_value IS the encoded blob —
+        // decode it, walk fragments, and read the requested
+        // [offset, offset+length) window. Fragment reads are
+        // sequential in this Phase C v1; concurrent fan-out is F131.
+        let mfvp = crate::MultiFragVp::decode(&raw_value)
+            .map_err(|e| anyhow!("multi-frag VP decode: {e}"))?;
+        return resolve_multi_frag(&mfvp, stream_client, offset, length).await;
+    }
     if op & OP_VALUE_POINTER != 0 {
         if raw_value.len() < VALUE_POINTER_SIZE {
             return Err(anyhow!("ValuePointer too short"));
@@ -1820,6 +1829,69 @@ pub(crate) async fn resolve_value(
             Ok(v[start..end].to_vec())
         }
     }
+}
+
+/// F129 sequential multi-fragment resolver. `offset`/`length` semantics
+/// match `read_value_from_log`: 0/0 reads the whole value, otherwise
+/// the bytes are a sub-range over the assembled value (NOT per
+/// fragment). Walks fragments in order, reads each one's relevant
+/// slice from log_stream, concatenates.
+///
+/// Concurrent reads (F131) would replace the for-loop with a
+/// `FuturesUnordered` capped at AUTUMN_PS_RESOLVE_CONCURRENCY.
+/// Out of scope for the F129 Phase C v1.
+async fn resolve_multi_frag(
+    mfvp: &crate::MultiFragVp,
+    stream_client: &Rc<StreamClient>,
+    offset: u32,
+    length: u32,
+) -> Result<Vec<u8>> {
+    let total = mfvp.total_len;
+    let read_off = (offset as u64).min(total);
+    let read_len = if length == 0 {
+        total - read_off
+    } else {
+        (length as u64).min(total - read_off)
+    };
+    if read_len == 0 {
+        return Ok(Vec::new());
+    }
+    let read_end = read_off + read_len;
+
+    let mut out = Vec::with_capacity(read_len as usize);
+    let mut cur: u64 = 0;
+    for f in &mfvp.frags {
+        let frag_end = cur + f.len as u64;
+        if frag_end <= read_off {
+            cur = frag_end;
+            continue;
+        }
+        if cur >= read_end {
+            break;
+        }
+        // Local offset/length within this fragment.
+        let lo = read_off.saturating_sub(cur) as u32;
+        let hi = (read_end - cur).min(f.len as u64) as u32;
+        let slice_len = hi - lo;
+        let (data, _) = stream_client
+            .read_bytes_from_extent(f.extent_id, f.offset + lo, slice_len)
+            .await
+            .with_context(|| {
+                format!(
+                    "multi-frag read: extent={} off={} len={}",
+                    f.extent_id, f.offset + lo, slice_len
+                )
+            })?;
+        if (data.len() as u32) < slice_len {
+            return Err(anyhow!(
+                "multi-frag fragment short read: extent={} off={} need={} got={}",
+                f.extent_id, f.offset + lo, slice_len, data.len()
+            ));
+        }
+        out.extend_from_slice(&data);
+        cur = frag_end;
+    }
+    Ok(out)
 }
 
 /// Read value bytes from logStream. VP.offset points to value start.

@@ -95,6 +95,17 @@ pub(crate) async fn dispatch_partition_rpc(
         MSG_GET_DISCARDS => handle_get_discards(payload, part, part_sc).await,
         MSG_SPLIT_PART => handle_split_part(payload, part, part_sc, pool, manager_addr, owner_key, revision).await,
         MSG_MAINTENANCE => handle_maintenance(payload, part).await,
+        // F129 multipart upload — handled inline (not via merged_partition_loop's
+        // batch pipeline). Begin/Chunk/Abort touch only the in-memory session
+        // map; Chunk additionally appends a single OP_CHUNK_BLOB record to
+        // log_stream; Commit allocates one seq + appends one V1 WAL record
+        // (op = OP_VALUE_POINTER_MULTI | 1) + inserts one memtable entry.
+        // The per-stream worker serialises log_stream appends so they don't
+        // race with concurrent merged_partition_loop batches.
+        MSG_PUT_BEGIN => handle_put_begin(payload, part).await,
+        MSG_PUT_CHUNK => handle_put_chunk(payload, part, part_sc).await,
+        MSG_PUT_COMMIT => handle_put_commit(payload, part, part_sc).await,
+        MSG_PUT_ABORT => handle_put_abort(payload, part).await,
         MSG_PUT | MSG_DELETE | MSG_STREAM_PUT => Err((
             StatusCode::Internal,
             format!("write msg_type {msg_type} must be routed via merged_partition_loop"),
@@ -235,7 +246,14 @@ pub(crate) async fn handle_head(payload: Bytes, part: &Rc<RefCell<PartitionData>
         return Ok(partition_rpc::rkyv_encode(&HeadResp { code: CODE_NOT_FOUND, message: "key not found".to_string(), found: false, value_length: 0 }));
     }
 
-    let value_len = if op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
+    let value_len = if op & crate::OP_VALUE_POINTER_MULTI != 0 {
+        // F129: multi-frag VP. raw_value is a MultiFragVp blob; total
+        // value size = mfvp.total_len. Decode failures degrade to 0
+        // (treat as not-found-shaped rather than panicking).
+        crate::MultiFragVp::decode(&raw_value)
+            .map(|m| m.total_len)
+            .unwrap_or(0)
+    } else if op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
         ValuePointer::decode(&raw_value[..VALUE_POINTER_SIZE]).len as u64
     } else {
         raw_value.len() as u64
@@ -508,3 +526,311 @@ pub(crate) async fn handle_get_discards(
 }
 
 // ---------------------------------------------------------------------------
+// F129 PutStream multipart upload handlers
+// ---------------------------------------------------------------------------
+
+/// Generate a 128-bit upload_id from /dev/urandom (falls back to time-
+/// based bits on read failure). Caller is responsible for collision
+/// avoidance — at 2^128 keyspace this is safe even with millions of
+/// concurrent uploads.
+fn rand_upload_id() -> u128 {
+    let mut buf = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if std::io::Read::read_exact(&mut f, &mut buf).is_ok() {
+            return u128::from_le_bytes(buf);
+        }
+    }
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0xdeadbeef);
+    t as u128
+}
+
+pub(crate) async fn handle_put_begin(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> HandlerResult {
+    let req: PutBeginReq = partition_rpc::rkyv_decode(&payload)
+        .map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+    {
+        let p = part.borrow();
+        if !crate::in_range(&p.rg, &req.key) {
+            return Err((StatusCode::InvalidArgument, "key is out of range".into()));
+        }
+    }
+
+    let now = crate::now_secs();
+    let ttl = AUTUMN_PS_UPLOAD_TTL_SECS_DEFAULT;
+    let cap = AUTUMN_PS_MAX_UPLOAD_SESSIONS_DEFAULT;
+
+    let upload_id = {
+        let mut p = part.borrow_mut();
+
+        // Lazy TTL eviction: drop sessions whose last_seen has aged
+        // out. Cheap (single linear scan over a HashMap that's bounded
+        // at `cap` entries).
+        p.upload_sessions
+            .retain(|_, s| s.last_seen_secs.saturating_add(ttl) > now);
+
+        if p.upload_sessions.len() >= cap {
+            return Ok(partition_rpc::rkyv_encode(&PutBeginResp {
+                code: CODE_ERROR,
+                message: format!("too many in-flight uploads (cap = {cap})"),
+                upload_id: 0,
+            }));
+        }
+
+        // Loop until we draw an unused id. Vanishingly unlikely to
+        // collide; bounded for safety.
+        let mut id = rand_upload_id();
+        for _ in 0..16 {
+            if !p.upload_sessions.contains_key(&id) {
+                break;
+            }
+            id = rand_upload_id();
+        }
+        if p.upload_sessions.contains_key(&id) {
+            return Err((StatusCode::Internal, "upload_id collision".into()));
+        }
+
+        p.upload_sessions.insert(
+            id,
+            crate::UploadSession {
+                user_key: req.key.clone(),
+                expires_at: req.expires_at,
+                started_at_secs: now,
+                last_seen_secs: now,
+                bytes_committed: 0,
+                next_chunk_index: 0,
+                fragments: Vec::new(),
+            },
+        );
+        id
+    };
+
+    Ok(partition_rpc::rkyv_encode(&PutBeginResp {
+        code: CODE_OK,
+        message: String::new(),
+        upload_id,
+    }))
+}
+
+pub(crate) async fn handle_put_chunk(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+    part_sc: &Rc<StreamClient>,
+) -> HandlerResult {
+    let req: PutChunkReq = partition_rpc::rkyv_decode(&payload)
+        .map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+    // Validate session + chunk_index ordering under brief borrow.
+    let log_stream_id = {
+        let p = part.borrow();
+        let s = match p.upload_sessions.get(&req.upload_id) {
+            Some(s) => s,
+            None => {
+                return Ok(partition_rpc::rkyv_encode(&PutChunkResp {
+                    code: CODE_UPLOAD_NOT_FOUND,
+                    message: "unknown upload_id (timed out, aborted, or never opened)".into(),
+                    bytes_committed: 0,
+                }));
+            }
+        };
+        if s.next_chunk_index != req.chunk_index {
+            return Ok(partition_rpc::rkyv_encode(&PutChunkResp {
+                code: CODE_INVALID_ARGUMENT,
+                message: format!(
+                    "chunk_index {} out of order; expected {}",
+                    req.chunk_index, s.next_chunk_index
+                ),
+                bytes_committed: s.bytes_committed,
+            }));
+        }
+        p.log_stream_id
+    };
+
+    // Encode V1 WAL record: op = OP_CHUNK_BLOB, key = empty, value =
+    // chunk data. Replay + GC skip records with this op flag.
+    let chunk_len = req.data.len() as u32;
+    let wal = crate::encode_record(crate::OP_CHUNK_BLOB, &[], &req.data, 0);
+    let result = part_sc
+        .append(log_stream_id, &wal)
+        .await
+        .map_err(|e| (StatusCode::Internal, format!("log_stream append: {e}")))?;
+
+    // Within a V1 record the value bytes start at offset
+    // `1 (sentinel) + 4 (length) + 17 (V0 inner header) + key.len()`.
+    // For chunks key.len() == 0, so the value lives at offset 22
+    // within the record. The record itself was appended at
+    // `result.offset` in the extent.
+    let value_offset_in_record: u32 = 1 + 4 + crate::wal_record::PAYLOAD_HEADER as u32;
+    let frag = crate::ValuePointer {
+        extent_id: result.extent_id,
+        offset: result.offset + value_offset_in_record,
+        len: chunk_len,
+    };
+
+    // Re-validate session under borrow_mut + commit fragment. The
+    // session COULD have been aborted concurrently (TTL eviction or
+    // explicit Abort); in that case the chunk bytes are already
+    // durable in log_stream and become OP_CHUNK_BLOB garbage,
+    // collected by GC when the host extent is punched.
+    let bytes = {
+        let mut p = part.borrow_mut();
+        let s = match p.upload_sessions.get_mut(&req.upload_id) {
+            Some(s) => s,
+            None => {
+                return Ok(partition_rpc::rkyv_encode(&PutChunkResp {
+                    code: CODE_UPLOAD_NOT_FOUND,
+                    message: "session disappeared mid-append".into(),
+                    bytes_committed: 0,
+                }));
+            }
+        };
+        if s.next_chunk_index != req.chunk_index {
+            // Concurrent retransmit landed first; this chunk is now
+            // a duplicate. Don't double-commit fragment.
+            return Ok(partition_rpc::rkyv_encode(&PutChunkResp {
+                code: CODE_INVALID_ARGUMENT,
+                message: "chunk superseded by concurrent retransmit".into(),
+                bytes_committed: s.bytes_committed,
+            }));
+        }
+        s.fragments.push(frag);
+        s.bytes_committed = s.bytes_committed.saturating_add(chunk_len as u64);
+        s.next_chunk_index = s.next_chunk_index.saturating_add(1);
+        s.last_seen_secs = crate::now_secs();
+        s.bytes_committed
+    };
+
+    Ok(partition_rpc::rkyv_encode(&PutChunkResp {
+        code: CODE_OK,
+        message: String::new(),
+        bytes_committed: bytes,
+    }))
+}
+
+pub(crate) async fn handle_put_commit(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+    part_sc: &Rc<StreamClient>,
+) -> HandlerResult {
+    let req: PutCommitReq = partition_rpc::rkyv_decode(&payload)
+        .map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+    // Take + validate session in a single borrow_mut (so a concurrent
+    // TTL evict / Abort can't race us).
+    let session = {
+        let mut p = part.borrow_mut();
+        match p.upload_sessions.remove(&req.upload_id) {
+            Some(s) => s,
+            None => {
+                return Ok(partition_rpc::rkyv_encode(&PutResp {
+                    code: CODE_UPLOAD_NOT_FOUND,
+                    message: "unknown upload_id".into(),
+                    key: vec![],
+                }));
+            }
+        }
+    };
+
+    // Bytes-total sanity check. On mismatch, re-insert the session so
+    // the client can either re-submit the missing chunks (if any) or
+    // call Abort.
+    if req.expected_total_bytes != 0
+        && req.expected_total_bytes != session.bytes_committed
+    {
+        let key = session.user_key.clone();
+        part.borrow_mut().upload_sessions.insert(req.upload_id, session);
+        return Ok(partition_rpc::rkyv_encode(&PutResp {
+            code: CODE_INVALID_ARGUMENT,
+            message: format!(
+                "expected_total_bytes {} != session.bytes_committed",
+                req.expected_total_bytes
+            ),
+            key,
+        }));
+    }
+
+    // Range check.
+    let in_range = {
+        let p = part.borrow();
+        crate::in_range(&p.rg, &session.user_key)
+    };
+    if !in_range {
+        return Err((StatusCode::InvalidArgument, "key is out of range".into()));
+    }
+
+    // Build the multi-frag VP blob. This is what lands in the
+    // memtable as the entry's value; resolve_value will decode it
+    // and fan out per-fragment reads at Get time (Phase C).
+    let mfvp = crate::MultiFragVp {
+        total_len: session.bytes_committed,
+        frags: session.fragments.clone(),
+    };
+    let blob = mfvp.encode();
+    let key = session.user_key.clone();
+    let expires_at = session.expires_at;
+    let wal_op: u8 = crate::OP_VALUE_POINTER_MULTI | 1; // 1 = put
+
+    // Allocate seq + build internal_key. Seq is monotonic on the
+    // single-threaded P-log runtime; safe to bump from inline
+    // dispatch_partition_rpc.
+    let (seq, log_stream_id) = {
+        let mut p = part.borrow_mut();
+        p.seq_number += 1;
+        (p.seq_number, p.log_stream_id)
+    };
+    let internal_key = crate::key_with_ts(&key, seq);
+    let wal = crate::encode_record(wal_op, &internal_key, &blob, expires_at);
+
+    // Append the commit WAL record to log_stream. The per-stream
+    // worker serialises these against concurrent merged_loop batches
+    // so the bytes order well in the extent.
+    let result = part_sc
+        .append(log_stream_id, &wal)
+        .await
+        .map_err(|e| (StatusCode::Internal, format!("commit append: {e}")))?;
+
+    // Insert the memtable entry. Value is the multi-frag VP blob
+    // (NOT the user value bytes, which live across the chunk
+    // fragments in log_stream). vp_extent_id / vp_offset get
+    // advanced too so subsequent flush includes this commit's tail.
+    {
+        let mut p = part.borrow_mut();
+        let mem_entry = crate::MemEntry {
+            op: wal_op,
+            value: blob,
+            expires_at,
+        };
+        let size = (internal_key.len() + mem_entry.value.len() + 32) as u64;
+        p.active.insert(internal_key, mem_entry, size);
+        p.vp_extent_id = result.extent_id;
+        p.vp_offset = result.end;
+        crate::maybe_rotate(&mut p);
+    }
+
+    Ok(partition_rpc::rkyv_encode(&PutResp {
+        code: CODE_OK,
+        message: String::new(),
+        key,
+    }))
+}
+
+pub(crate) async fn handle_put_abort(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> HandlerResult {
+    let req: PutAbortReq = partition_rpc::rkyv_decode(&payload)
+        .map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+    // Idempotent: missing upload_id is treated as success.
+    let _ = part.borrow_mut().upload_sessions.remove(&req.upload_id);
+
+    Ok(partition_rpc::rkyv_encode(&PutAbortResp {
+        code: CODE_OK,
+        message: String::new(),
+    }))
+}
