@@ -1244,6 +1244,34 @@ impl AutumnManager {
         snapshot
     }
 
+    /// F181: per-extent sum of two partitions' VP refs, owned by
+    /// `survivor_id`. Caller deletes `partition_vp_refs[victim_id]`
+    /// in Phase 3.
+    fn merged_partition_vp_refs(
+        state: &autumn_common::MetadataState,
+        survivor_id: u64,
+        victim_id: u64,
+    ) -> MgrPartitionVpRefs {
+        let survivor = state
+            .partition_vp_refs
+            .get(&survivor_id)
+            .cloned()
+            .unwrap_or_default();
+        let victim = state
+            .partition_vp_refs
+            .get(&victim_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut sum: HashMap<u64, u32> = survivor.refs.iter().copied().collect();
+        for (eid, n) in victim.refs.iter().copied() {
+            *sum.entry(eid).or_insert(0) += n;
+        }
+        MgrPartitionVpRefs {
+            part_id: survivor_id,
+            refs: sum.into_iter().collect(),
+        }
+    }
+
     fn extent_can_delete(extent: &MgrExtentInfo) -> bool {
         extent.refs == 0 && extent.vp_table_refs == 0
     }
@@ -1981,6 +2009,31 @@ mod tests {
         let e40 = modified.iter().find(|e| e.extent_id == 40).unwrap();
         assert_eq!(e40.refs, 2);
         assert_eq!(e40.sealed_length, 200);
+    }
+
+    #[test]
+    fn f181_merged_partition_vp_refs_sums_per_extent() {
+        let mut state = autumn_common::MetadataState::default();
+        state.partition_vp_refs.insert(
+            1,
+            MgrPartitionVpRefs {
+                part_id: 1,
+                refs: vec![(10, 2), (20, 5)],
+            },
+        );
+        state.partition_vp_refs.insert(
+            2,
+            MgrPartitionVpRefs {
+                part_id: 2,
+                refs: vec![(20, 3), (30, 7)],
+            },
+        );
+        let merged = AutumnManager::merged_partition_vp_refs(&state, 1, 2);
+        assert_eq!(merged.part_id, 1);
+        let map: HashMap<u64, u32> = merged.refs.iter().copied().collect();
+        assert_eq!(map.get(&10), Some(&2));
+        assert_eq!(map.get(&20), Some(&8));
+        assert_eq!(map.get(&30), Some(&7));
     }
 
     #[test]
