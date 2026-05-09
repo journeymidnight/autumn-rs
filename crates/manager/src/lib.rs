@@ -1001,6 +1001,156 @@ impl AutumnManager {
         Ok((dst, modified_extents))
     }
 
+    /// F181: splice victim's extents onto the END of survivor's
+    /// extent_ids list, then append `new_tail` as the new active tail.
+    ///
+    /// Order invariant (load-bearing):
+    ///   updated.extent_ids = [survivor.existing] + [victim.existing] + [new_tail]
+    ///
+    /// Refs++ on every victim extent (CoW transfer). Sealing rules:
+    ///   - survivor's old tail (last existing extent) sealed at `survivor_sealed`
+    ///     if it was open
+    ///   - victim's old tail (last victim extent) sealed at `victim_sealed`
+    ///     if it was open
+    ///   - new_tail is appended as-is (caller has already built its
+    ///     MgrExtentInfo via select_nodes + alloc_extent_on_node)
+    ///
+    /// Caller (handle_multi_modify_merge) is responsible for the F138/
+    /// F145/F146 inflight checks before calling this.
+    fn compute_merge_streams(
+        state: &autumn_common::MetadataState,
+        survivor_stream_id: u64,
+        victim_stream_id: u64,
+        survivor_sealed: u32,
+        victim_sealed: u32,
+        new_tail: MgrExtentInfo,
+    ) -> Result<(MgrStreamInfo, Vec<MgrExtentInfo>), AppError> {
+        let survivor = state
+            .streams
+            .get(&survivor_stream_id)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("stream {survivor_stream_id}")))?;
+        let victim = state
+            .streams
+            .get(&victim_stream_id)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("stream {victim_stream_id}")))?;
+
+        let mut modified_extents = Vec::new();
+
+        // Seal survivor's existing tail at survivor_sealed (if open).
+        if let Some(&tail_id) = survivor.extent_ids.last() {
+            let extent = state
+                .extents
+                .get(&tail_id)
+                .ok_or_else(|| AppError::NotFound(format!("extent {tail_id}")))?;
+            let mut ex = extent.clone();
+            if ex.sealed_length == 0 && survivor_sealed > 0 {
+                ex.sealed_length = survivor_sealed as u64;
+                ex.eversion += 1;
+                ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
+                modified_extents.push(ex);
+            }
+        }
+
+        // Refs++ on every victim extent + seal victim's tail at victim_sealed.
+        for (idx, &eid) in victim.extent_ids.iter().enumerate() {
+            let extent = state
+                .extents
+                .get(&eid)
+                .ok_or_else(|| AppError::NotFound(format!("extent {eid}")))?;
+            let mut ex = extent.clone();
+            ex.refs += 1;
+            ex.eversion += 1;
+            if idx == victim.extent_ids.len() - 1 && ex.sealed_length == 0 && victim_sealed > 0 {
+                ex.sealed_length = victim_sealed as u64;
+                ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
+            }
+            modified_extents.push(ex);
+        }
+
+        // Splice extent_ids: [survivor.existing] + [victim.existing] + [new_tail].
+        let mut new_extent_ids = survivor.extent_ids.clone();
+        new_extent_ids.extend(victim.extent_ids.iter().copied());
+        new_extent_ids.push(new_tail.extent_id);
+
+        let updated = MgrStreamInfo {
+            stream_id: survivor.stream_id,
+            extent_ids: new_extent_ids,
+            ec_data_shard: survivor.ec_data_shard,
+            ec_parity_shard: survivor.ec_parity_shard,
+            replicates: survivor.replicates,
+        };
+
+        modified_extents.push(new_tail);
+
+        Ok((updated, modified_extents))
+    }
+
+    /// F181: same as compute_merge_streams but without appending a new
+    /// tail. Used for row_stream + meta_stream where the post-merge
+    /// stream's tail is just victim's last existing extent (sealed by
+    /// the caller's commit_length capture).
+    fn splice_streams_without_new_tail(
+        state: &autumn_common::MetadataState,
+        survivor_stream_id: u64,
+        victim_stream_id: u64,
+        survivor_sealed: u32,
+        victim_sealed: u32,
+    ) -> Result<(MgrStreamInfo, Vec<MgrExtentInfo>), AppError> {
+        let survivor = state
+            .streams
+            .get(&survivor_stream_id)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("stream {survivor_stream_id}")))?;
+        let victim = state
+            .streams
+            .get(&victim_stream_id)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("stream {victim_stream_id}")))?;
+
+        let mut modified_extents = Vec::new();
+        if let Some(&tail_id) = survivor.extent_ids.last() {
+            let extent = state
+                .extents
+                .get(&tail_id)
+                .ok_or_else(|| AppError::NotFound(format!("extent {tail_id}")))?;
+            let mut ex = extent.clone();
+            if ex.sealed_length == 0 && survivor_sealed > 0 {
+                ex.sealed_length = survivor_sealed as u64;
+                ex.eversion += 1;
+                ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
+                modified_extents.push(ex);
+            }
+        }
+        for (idx, &eid) in victim.extent_ids.iter().enumerate() {
+            let extent = state
+                .extents
+                .get(&eid)
+                .ok_or_else(|| AppError::NotFound(format!("extent {eid}")))?;
+            let mut ex = extent.clone();
+            ex.refs += 1;
+            ex.eversion += 1;
+            if idx == victim.extent_ids.len() - 1 && ex.sealed_length == 0 && victim_sealed > 0 {
+                ex.sealed_length = victim_sealed as u64;
+                ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
+            }
+            modified_extents.push(ex);
+        }
+        let mut new_extent_ids = survivor.extent_ids.clone();
+        new_extent_ids.extend(victim.extent_ids.iter().copied());
+        Ok((
+            MgrStreamInfo {
+                stream_id: survivor.stream_id,
+                extent_ids: new_extent_ids,
+                ec_data_shard: survivor.ec_data_shard,
+                ec_parity_shard: survivor.ec_parity_shard,
+                replicates: survivor.replicates,
+            },
+            modified_extents,
+        ))
+    }
+
     fn vp_refs_to_map(snapshot: &MgrPartitionVpRefs) -> HashMap<u64, u32> {
         snapshot.refs.iter().copied().collect()
     }
@@ -1716,6 +1866,121 @@ mod tests {
 
         assert_eq!(state.extents.get(&21).unwrap().vp_table_refs, 0);
         assert_eq!(state.extents.get(&48).unwrap().vp_table_refs, 2);
+    }
+
+    #[test]
+    fn f181_compute_merge_streams_extent_ids_order_and_refs() {
+        let mut state = autumn_common::MetadataState::default();
+        let mk = |id: u64, refs: u64, sealed: u64| MgrExtentInfo {
+            extent_id: id,
+            replicates: vec![1],
+            parity: vec![],
+            replicate_disks: vec![1],
+            parity_disks: vec![],
+            sealed_length: sealed,
+            avali: 1,
+            eversion: 0,
+            refs,
+            vp_table_refs: 0,
+            ec_converted: false,
+        };
+        state.extents.insert(10, mk(10, 1, 1024));
+        state.extents.insert(11, mk(11, 1, 0));
+        state.streams.insert(
+            100,
+            MgrStreamInfo {
+                stream_id: 100,
+                extent_ids: vec![10, 11],
+                ec_data_shard: 1,
+                ec_parity_shard: 0,
+                replicates: 3,
+            },
+        );
+        state.extents.insert(20, mk(20, 1, 2048));
+        state.extents.insert(21, mk(21, 1, 0));
+        state.streams.insert(
+            200,
+            MgrStreamInfo {
+                stream_id: 200,
+                extent_ids: vec![20, 21],
+                ec_data_shard: 1,
+                ec_parity_shard: 0,
+                replicates: 3,
+            },
+        );
+        let new_tail = mk(99, 1, 0);
+
+        let (updated, modified) =
+            AutumnManager::compute_merge_streams(&state, 100, 200, 4096, 8192, new_tail.clone())
+                .unwrap();
+
+        assert_eq!(updated.extent_ids, vec![10, 11, 20, 21, 99]);
+        assert_eq!(updated.stream_id, 100);
+
+        let e11 = modified.iter().find(|e| e.extent_id == 11).unwrap();
+        assert_eq!(e11.sealed_length, 4096);
+        assert_eq!(e11.refs, 1);
+
+        let e10 = modified.iter().find(|e| e.extent_id == 10);
+        assert!(e10.is_none(), "non-tail survivor extent unchanged → not in modified");
+
+        let e20 = modified.iter().find(|e| e.extent_id == 20).unwrap();
+        assert_eq!(e20.refs, 2);
+        assert_eq!(e20.sealed_length, 2048);
+
+        let e21 = modified.iter().find(|e| e.extent_id == 21).unwrap();
+        assert_eq!(e21.refs, 2);
+        assert_eq!(e21.sealed_length, 8192);
+
+        let e99 = modified.iter().find(|e| e.extent_id == 99).unwrap();
+        assert_eq!(e99.sealed_length, 0);
+        assert_eq!(e99.refs, 1);
+    }
+
+    #[test]
+    fn f181_splice_streams_without_new_tail_no_e_new() {
+        let mut state = autumn_common::MetadataState::default();
+        let mk = |id: u64, refs: u64| MgrExtentInfo {
+            extent_id: id,
+            replicates: vec![1],
+            parity: vec![],
+            replicate_disks: vec![1],
+            parity_disks: vec![],
+            sealed_length: 0,
+            avali: 1,
+            eversion: 0,
+            refs,
+            vp_table_refs: 0,
+            ec_converted: false,
+        };
+        state.extents.insert(30, mk(30, 1));
+        state.extents.insert(40, mk(40, 1));
+        state.streams.insert(
+            300,
+            MgrStreamInfo {
+                stream_id: 300,
+                extent_ids: vec![30],
+                ec_data_shard: 1,
+                ec_parity_shard: 0,
+                replicates: 3,
+            },
+        );
+        state.streams.insert(
+            400,
+            MgrStreamInfo {
+                stream_id: 400,
+                extent_ids: vec![40],
+                ec_data_shard: 1,
+                ec_parity_shard: 0,
+                replicates: 3,
+            },
+        );
+        let (updated, modified) =
+            AutumnManager::splice_streams_without_new_tail(&state, 300, 400, 100, 200).unwrap();
+        assert_eq!(updated.extent_ids, vec![30, 40]);
+        let e40 = modified.iter().find(|e| e.extent_id == 40).unwrap();
+        assert_eq!(e40.refs, 2);
+        assert_eq!(e40.sealed_length, 200);
     }
 
     #[test]
