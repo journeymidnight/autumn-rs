@@ -55,6 +55,11 @@
 #   ./perf_check.sh --threads 32          # override client thread count
 #   ./perf_check.sh --tcp --partitions 1 --pipeline-depth 1 --size 4k  # one combo
 #   ./perf_check.sh --update-baseline     # create / overwrite per-combo baselines
+#   ./perf_check.sh --3disk               # spread 3 replicas across /data03,
+#                                         #   /data05, /data08 (3 independent
+#                                         #   NVMes) — fsync parallelises across
+#                                         #   hardware instead of all 3 replicas
+#                                         #   queueing on a single disk
 #
 # --shm is useful for isolating the RPC / partition / stream layers from the
 # underlying filesystem (extent storage lives in RAM, fsync is a no-op).
@@ -104,6 +109,7 @@ if [[ -n "$AC_PREFIX" ]]; then
 fi
 
 USE_SHM=0
+USE_3DISK=0
 UPDATE_BASELINE=""
 SKIP_CLUSTER=0
 TRANSPORT_LIST="tcp ucx"          # default: both transports
@@ -137,6 +143,7 @@ parse_size() {
 while (( $# > 0 )); do
     case "$1" in
         --shm)              USE_SHM=1 ;;
+        --3disk)            USE_3DISK=1 ;;
         --update-baseline)  UPDATE_BASELINE="--update-baseline" ;;
         --skip-cluster)     SKIP_CLUSTER=1 ;;
         --ucx)              TRANSPORT_LIST="ucx" ;;
@@ -282,8 +289,17 @@ start_cluster_for() {
         # (EN_i: (i-1)*SHARDS, PS: REPLICAS*SHARDS) 4 shards × 3 replicas = 12
         # EN cores then PS partitions take 2N cores after — fits any
         # reasonably-sized host's cpuset.
+        # --3disk: spread the 3 replicas across /data03, /data05, /data08
+        # (three independent NVMes) instead of one disk → fsync work
+        # parallelises across hardware. Without this flag, all 3 replicas
+        # land on whatever single disk AUTUMN_DATA_ROOT points at.
+        local cluster_3disk=()
+        if (( USE_3DISK )); then
+            cluster_3disk=(--3disk)
+        fi
         AUTUMN_EXTENT_SHARDS="${AUTUMN_EXTENT_SHARDS:-4}" \
         AUTUMN_TRANSPORT="$mode" bash "$SCRIPT_DIR/cluster.sh" start 3 \
+            "${cluster_3disk[@]}" \
             || { echo "[perf-check] FAILED to start cluster (mode=$mode parts=$parts)"; return 1; }
     else
         echo "[perf-check] --skip-cluster: assuming cluster is already running in $mode mode"
