@@ -79,7 +79,7 @@ No SST bytes move. No VP-target log_stream extents move. Only manager metadata +
 `crates/rpc/src/manager_rpc.rs`:
 
 ```rust
-pub const MSG_MULTI_MODIFY_MERGE: u8 = 0x33;
+pub const MSG_MULTI_MODIFY_MERGE: u8 = 0x34;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct MultiModifyMergeReq {
@@ -112,7 +112,7 @@ Response carries `new_log_tail_extent_id` because the manager allocates it atomi
 `crates/rpc/src/partition_rpc.rs`:
 
 ```rust
-pub const MSG_MERGE_PART: u8 = 0x46;
+pub const MSG_MERGE_PART: u8 = 0x4D;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct MergePartReq {
@@ -146,7 +146,7 @@ enum PartitionControl {
 `crates/rpc/src/manager_rpc.rs`:
 
 ```rust
-pub const MSG_GET_POLICY_CANDIDATES: u8 = 0x34;
+pub const MSG_GET_POLICY_CANDIDATES: u8 = 0x35;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct GetPolicyCandidatesReq {}
@@ -179,7 +179,7 @@ Used by `autumn-client policy candidates` (§5) and by Stage 2/3 auto-trigger lo
 Heartbeat schema is left UNCHANGED (rkyv struct evolution is fragile; an additive field on `HeartbeatPsReq` would break old-PS / new-manager mixed deployments). Metrics ride a dedicated periodic RPC instead:
 
 ```rust
-pub const MSG_REPORT_PARTITION_LOAD: u8 = 0x35;
+pub const MSG_REPORT_PARTITION_LOAD: u8 = 0x36;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct PartitionLoad {
@@ -218,10 +218,10 @@ Trade-off: one extra etcd put per split/merge event (negligible) vs zero risk to
 
 | Const | Value | Notes |
 |---|---|---|
-| `MSG_MULTI_MODIFY_MERGE` | `0x33` | next free in 0x20-0x3F manager range |
-| `MSG_GET_POLICY_CANDIDATES` | `0x34` | |
-| `MSG_REPORT_PARTITION_LOAD` | `0x35` | PS → manager, 5 s cadence |
-| `MSG_MERGE_PART` | `0x46` | next free in 0x40-0x4F PS range |
+| `MSG_MULTI_MODIFY_MERGE` | `0x34` | (0x33 already taken by MSG_SYNC_PARTITION_VP_REFS) |
+| `MSG_GET_POLICY_CANDIDATES` | `0x35` | |
+| `MSG_REPORT_PARTITION_LOAD` | `0x36` | PS → manager, 5 s cadence |
+| `MSG_MERGE_PART` | `0x4D` | (0x46 already taken by MSG_STREAM_PUT; 0x49-0x4C used by F129 PutStream) |
 | `CODE_PRECONDITION` (existing) | reused for cross-PS / has_overlap / inflight refusals |
 
 ---
