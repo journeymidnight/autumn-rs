@@ -30,6 +30,9 @@ pub const MSG_PUT_CHUNK: u8 = 0x4A;
 pub const MSG_PUT_COMMIT: u8 = 0x4B;
 pub const MSG_PUT_ABORT: u8 = 0x4C;
 
+// F181: partition merge — sent to the SURVIVOR's PS.
+pub const MSG_MERGE_PART: u8 = 0x4D;
+
 // ── Status codes ────────────────────────────────────────────────────────────
 
 pub const CODE_OK: u8 = 0;
@@ -138,6 +141,20 @@ pub struct SplitPartReq {
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct SplitPartResp {
+    pub code: u8,
+    pub message: String,
+}
+
+// F181 — partition merge. Sent to the SURVIVOR's PS; both partitions
+// must currently be served by that PS (cross-PS merge unsupported).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MergePartReq {
+    pub survivor_part_id: u64,
+    pub victim_part_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MergePartResp {
     pub code: u8,
     pub message: String,
 }
@@ -313,6 +330,7 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_PUT_CHUNK => rkyv_decode::<PutChunkReq>(payload).map(|r| r.part_id).unwrap_or(0),
         MSG_PUT_COMMIT => rkyv_decode::<PutCommitReq>(payload).map(|r| r.part_id).unwrap_or(0),
         MSG_PUT_ABORT => rkyv_decode::<PutAbortReq>(payload).map(|r| r.part_id).unwrap_or(0),
+        MSG_MERGE_PART => rkyv_decode::<MergePartReq>(payload).map(|r| r.survivor_part_id).unwrap_or(0),
         _ => 0,
     }
 }
