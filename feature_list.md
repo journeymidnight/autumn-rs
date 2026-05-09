@@ -592,9 +592,18 @@
 - **Why split-auto before merge-auto in Stage 2/3:** thread-per-core means merge concentrates two partitions' SSTs + future load onto one P-log core. A wrongly-merged hot pair degrades immediately at the worst place (single-core ceiling). Split is the *relief valve* — its failure mode is mild (redundant partition, extra metadata). Recorded in `feedback_auto_split_before_merge.md` (auto-memory).
 - **Files:** `crates/rpc/src/manager_rpc.rs` (3 new MSG_*, 4 new structs, 2 new POLICY_KIND consts); `crates/rpc/src/partition_rpc.rs` (`MSG_MERGE_PART` + `MergePartReq/Resp`); `crates/manager/src/policy.rs` (NEW); `crates/manager/src/policy_tests.rs` (NEW); `crates/manager/src/lib.rs` (4 pure-fns + `last_op_at`/`policy` fields + `policy_tick_loop` + replay); `crates/manager/src/rpc_handlers.rs` (3 new handlers + split-handler last_op_at write); `crates/common/src/store.rs` (MetadataState derives Clone for snapshot); `crates/partition-server/src/lib.rs` (PartitionMetrics + PartitionHandle.metrics + report_load_loop + counter bumps); `crates/client/src/lib.rs` (ClusterClient.merge_partitions + policy_candidates); `crates/server/src/bin/autumn_client.rs` (CLI subcommands); `README.md` + `crates/manager/CLAUDE.md` (note 16) + `crates/partition-server/CLAUDE.md` (notes 11+12).
 - **Spec/plan:** `docs/superpowers/specs/2026-05-09-partition-merge-and-split-merge-policy-design.md`, `docs/superpowers/plans/2026-05-09-partition-merge-and-split-merge-policy.md`.
-- **Tests passing:**
+- **F184 follow-on (auto-trigger + reload + integration tests):**
+  - F184-A: `--auto-split` / `--auto-merge` flags on autumn-manager-server; `policy_tick_loop` rate-limited 1/tick auto-dispatch when enabled.
+  - F184-B: `PartitionHandle.opened_with` snapshot; `sync_regions_once` reloads partitions whose `(rg, stream_ids)` changed (catches post-merge widening).
+  - F184-C: `read_all_table_locations` walks every meta_stream extent and unions LAST records — fixes survivor's recovery picking up victim's tables post-merge.
+  - F184-D: integration tests `merge_split_round_trip_keys_intact`, `merge_then_split_again_round_trip` (multi-step lifecycle).
+  - F184-E: 3 more merge handler unit tests (recovery_inflight, pending_delete, last_op_at).
+  - F184-F: public `manager.force_auto_split(part_id)` / `force_auto_merge(survivor, victim)` test helpers + `auto_dispatch_merge_orchestrates_full_flow` integration test.
+  - F184-G: `auto_dispatch_split_dispatches_msg_split_part` integration test.
+- **Tests passing (post-F184):**
   - `cargo test -p autumn-rpc`: clean
-  - `cargo test -p autumn-manager --lib`: 48/48 (4 merge unit + 11 policy unit + 33 pre-existing)
+  - `cargo test -p autumn-manager --lib`: 51/51 (10 merge unit + 11 policy unit + 30 pre-existing)
+  - `cargo test -p autumn-manager --test system_merge -- --ignored`: 6/6 (~45 s)
   - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 130/130
   - `cargo build --workspace --exclude autumn-fuse`: clean
 - **passes:** true
