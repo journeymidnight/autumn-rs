@@ -99,7 +99,6 @@ async fn ps_put(
     part_id: u64,
     key: &[u8],
     value: &[u8],
-    must_sync: bool,
 ) {
     let resp = ps
         .call(
@@ -108,7 +107,6 @@ async fn ps_put(
                 part_id,
                 key: key.to_vec(),
                 value: value.to_vec(),
-                must_sync,
                 expires_at: 0,
             }),
         )
@@ -345,7 +343,7 @@ fn partition_server_put_get_and_split_flow() {
         let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
 
         for k in ["a1", "a2", "a3", "a4"] {
-            ps_put(&ps, 501, k.as_bytes(), format!("val-{k}").as_bytes(), false).await;
+            ps_put(&ps, 501, k.as_bytes(), format!("val-{k}").as_bytes()).await;
         }
 
         let get = ps_get(&ps, 501, b"a3").await;
@@ -428,10 +426,10 @@ fn partition_server_recovery_replays_table_and_wal() {
 
         let ps1 = RpcClient::connect(ps1_addr).await.expect("connect ps1");
 
-        ps_put(&ps1, 511, b"a-flush", b"flushed-value", false).await;
+        ps_put(&ps1, 511, b"a-flush", b"flushed-value").await;
         ps_flush(&ps1, 511).await;
-        ps_put(&ps1, 511, b"a-wal-1", b"v1", false).await;
-        ps_put(&ps1, 511, b"a-wal-2", b"v2", false).await;
+        ps_put(&ps1, 511, b"a-wal-1", b"v1").await;
+        ps_put(&ps1, 511, b"a-wal-2", b"v2").await;
 
         // Drop ps1 connection (server thread keeps running but we don't care)
         drop(ps1);
@@ -486,11 +484,11 @@ fn stream_append_commit_punchhole_truncate_flow() {
 
         let first_batch = [b"hello".as_slice(), b"world!!!".as_slice()];
         let b1 = client
-            .append_batch(stream_id, &first_batch, true)
+            .append_batch(stream_id, &first_batch)
             .await
             .expect("batch append 1");
         assert_eq!(b1.offset, 0);
-        let _a3 = client.append(stream_id, b"z", true).await.expect("append 3");
+        let _a3 = client.append(stream_id, b"z").await.expect("append 3");
 
         let committed = client.commit_length(stream_id).await.expect("commit length");
         assert!(committed > 0);
@@ -557,11 +555,11 @@ fn stream_append_and_read_blocks_flow() {
 
         let batch = [b"hello".as_slice(), b"world".as_slice()];
         let wr = client
-            .append_batch(stream_id, &batch, true)
+            .append_batch(stream_id, &batch)
             .await
             .expect("append batch");
         assert_eq!(wr.offset, 0);
-        let wr2 = client.append(stream_id, b"!", true).await.expect("append third");
+        let wr2 = client.append(stream_id, b"!").await.expect("append third");
         assert_eq!(wr2.offset, 10);
 
         // Read all bytes via StreamClient
@@ -656,7 +654,7 @@ fn f030_flush_writes_sst_to_row_stream() {
 
         let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
 
-        ps_put(&ps, 601, b"a-big", &vec![b'X'; 4 * 1024], false).await;
+        ps_put(&ps, 601, b"a-big", &vec![b'X'; 4 * 1024]).await;
         ps_flush(&ps, 601).await;
 
         let pool = Rc::new(ConnPool::new());
@@ -713,9 +711,9 @@ fn f030_recovery_from_meta_and_row_streams() {
         start_partition_server(42, mgr_addr, ps1_addr);
 
         let ps1 = RpcClient::connect(ps1_addr).await.expect("connect ps1");
-        ps_put(&ps1, 611, b"a-streamed", &vec![b'S'; 4 * 1024], false).await;
+        ps_put(&ps1, 611, b"a-streamed", &vec![b'S'; 4 * 1024]).await;
         ps_flush(&ps1, 611).await;
-        ps_put(&ps1, 611, b"a-wal-only", b"small", false).await;
+        ps_put(&ps1, 611, b"a-wal-only", b"small").await;
 
         drop(ps1);
         std::thread::sleep(Duration::from_millis(200));
@@ -757,8 +755,7 @@ fn f029_compaction_merges_small_tables() {
                 &ps,
                 621,
                 format!("key-{:02}", i).as_bytes(),
-                &vec![b'A' + i; 4 * 1024],
-                false,
+                &vec![b'A' + i; 4 * 1024]
             )
             .await;
             ps_flush(&ps, 621).await;
@@ -846,11 +843,11 @@ fn f031_large_value_stored_in_log_stream() {
 
         // Large value: 8 KB > VALUE_THROTTLE (4 KB) — stored in logStream.
         let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
-        ps_put(&ps, 701, b"large-key", &large_val, false).await;
+        ps_put(&ps, 701, b"large-key", &large_val).await;
 
         // Small value: 2 KB <= VALUE_THROTTLE — stays inline.
         let small_val = vec![b'S'; 2 * 1024];
-        ps_put(&ps, 701, b"small-key", &small_val, false).await;
+        ps_put(&ps, 701, b"small-key", &small_val).await;
 
         let got_large = ps_get(&ps, 701, b"large-key").await;
         assert_eq!(got_large.value, large_val, "large value must roundtrip via logStream");
@@ -879,9 +876,9 @@ fn f031_recovery_replays_log_stream() {
         let ps1 = RpcClient::connect(ps1_addr).await.expect("connect ps1");
 
         let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
-        ps_put(&ps1, 711, b"b-large", &large_val, false).await;
+        ps_put(&ps1, 711, b"b-large", &large_val).await;
         ps_flush(&ps1, 711).await;
-        ps_put(&ps1, 711, b"b-wal-small", b"small-wal", false).await;
+        ps_put(&ps1, 711, b"b-wal-small", b"small-wal").await;
 
         drop(ps1);
         std::thread::sleep(Duration::from_millis(200));
@@ -931,8 +928,7 @@ fn f031_compaction_preserves_value_pointers() {
                 &ps,
                 721,
                 format!("c-large-{}", i).as_bytes(),
-                &large_val,
-                false,
+                &large_val
             )
             .await;
             ps_flush(&ps, 721).await;
@@ -978,8 +974,7 @@ fn f033_gc_reclaims_log_stream_extents() {
                 &ps,
                 801,
                 format!("gc-key-{}", i).as_bytes(),
-                &val_v1,
-                false,
+                &val_v1
             )
             .await;
             ps_flush(&ps, 801).await;
@@ -992,8 +987,7 @@ fn f033_gc_reclaims_log_stream_extents() {
                 &ps,
                 801,
                 format!("gc-key-{}", i).as_bytes(),
-                &val_v2,
-                false,
+                &val_v2
             )
             .await;
             ps_flush(&ps, 801).await;
@@ -1046,8 +1040,7 @@ fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
                 &ps,
                 901,
                 format!("a-key-{:02}", i).as_bytes(),
-                format!("val-a-{}", i).as_bytes(),
-                false,
+                format!("val-a-{}", i).as_bytes()
             )
             .await;
         }
@@ -1059,8 +1052,7 @@ fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
                 &ps,
                 901,
                 format!("y-key-{:02}", i).as_bytes(),
-                format!("val-y-{}", i).as_bytes(),
-                false,
+                format!("val-y-{}", i).as_bytes()
             )
             .await;
         }

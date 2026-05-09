@@ -130,7 +130,7 @@ fn manager_failover_preserves_streams_and_partitions() {
         let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
 
         for i in 0..10 {
-            ps_put(&ps, 801, format!("k-{i:02}").as_bytes(), format!("v-{i}").as_bytes(), true).await;
+            ps_put(&ps, 801, format!("k-{i:02}").as_bytes(), format!("v-{i}").as_bytes()).await;
         }
 
         // Start M2 (as follower while M1 is alive)
@@ -197,7 +197,7 @@ fn manager_crash_during_split_state_consistent() {
         let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
 
         for i in 0..10 {
-            ps_put(&ps, 901, format!("d-{i:02}").as_bytes(), format!("v-{i}").as_bytes(), true).await;
+            ps_put(&ps, 901, format!("d-{i:02}").as_bytes(), format!("v-{i}").as_bytes()).await;
         }
         ps_flush(&ps, 901).await;
 

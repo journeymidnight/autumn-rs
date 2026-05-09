@@ -38,7 +38,7 @@ fn ps_crash_partition_reassigned_to_new_ps() {
         let ps1 = RpcClient::connect(ps1_addr).await.expect("connect ps1");
 
         for i in 0..10 {
-            ps_put(&ps1, 901, format!("k-{i:02}").as_bytes(), format!("v-{i}").as_bytes(), true).await;
+            ps_put(&ps1, 901, format!("k-{i:02}").as_bytes(), format!("v-{i}").as_bytes()).await;
         }
 
         // Verify PS1 is serving
@@ -91,7 +91,7 @@ fn ps_crash_partition_reassigned_to_new_ps() {
         }
 
         // PS2 should serve new writes
-        ps_put(&ps2, 901, b"new-key", b"new-val", true).await;
+        ps_put(&ps2, 901, b"new-key", b"new-val").await;
         let resp = ps_get(&ps2, 901, b"new-key").await;
         assert_eq!(resp.value, b"new-val", "new write on PS2 must succeed");
     });

@@ -45,8 +45,7 @@ fn split_ref_counting_shared_extents_freed_after_both_gc() {
                 &ps,
                 901,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes(),
-                false,
+                format!("val-{i}").as_bytes()
             )
             .await;
         }
@@ -119,9 +118,9 @@ fn split_ref_counting_shared_extents_freed_after_both_gc() {
         let left_key = format!("{}new", String::from_utf8_lossy(&left_rg.rg.as_ref().unwrap().start_key));
         let right_key = format!("{}new", String::from_utf8_lossy(&right_rg.rg.as_ref().unwrap().start_key));
 
-        ps_put(&ps, 901, left_key.as_bytes(), b"v", false).await;
+        ps_put(&ps, 901, left_key.as_bytes(), b"v").await;
         ps_flush(&ps, 901).await;
-        psr_put(&router, right_id, right_key.as_bytes(), b"v", false).await;
+        psr_put(&router, right_id, right_key.as_bytes(), b"v").await;
         psr_flush(&router, right_id).await;
 
         // Trigger GC on both children to reclaim old shared extents

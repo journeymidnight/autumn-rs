@@ -49,8 +49,7 @@ fn vp_resolvable_after_split_and_one_child_gc() {
             ps_put(
                 &ps, 901,
                 format!("key-{i:02}").as_bytes(),
-                &large_value(i),
-                true,
+                &large_value(i)
             ).await;
         }
         ps_flush(&ps, 901).await;
@@ -137,8 +136,7 @@ fn vp_freed_after_both_children_compact_and_gc() {
             ps_put(
                 &ps, 902,
                 format!("key-{i:02}").as_bytes(),
-                &large_value(i),
-                true,
+                &large_value(i)
             ).await;
         }
         ps_flush(&ps, 902).await;
@@ -183,9 +181,9 @@ fn vp_freed_after_both_children_compact_and_gc() {
         // Write a small key to each child and flush
         let left_key = format!("{}small", String::from_utf8_lossy(&left_rg.rg.as_ref().unwrap().start_key));
         let right_key = format!("{}small", String::from_utf8_lossy(&right_rg.rg.as_ref().unwrap().start_key));
-        ps_put(&ps, 902, left_key.as_bytes(), b"v", true).await;
+        ps_put(&ps, 902, left_key.as_bytes(), b"v").await;
         ps_flush(&ps, 902).await;
-        psr_put(&router, right_id, right_key.as_bytes(), b"v", true).await;
+        psr_put(&router, right_id, right_key.as_bytes(), b"v").await;
         psr_flush(&router, right_id).await;
 
         // GC both children

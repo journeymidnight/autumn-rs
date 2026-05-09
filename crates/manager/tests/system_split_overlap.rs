@@ -42,8 +42,7 @@ fn split_overlap_compaction_enables_second_split() {
                 &ps,
                 901,
                 format!("key-{:02}", i).as_bytes(),
-                format!("val-{}", i).as_bytes(),
-                false,
+                format!("val-{}", i).as_bytes()
             )
             .await;
         }
@@ -100,8 +99,7 @@ fn split_overlap_compaction_enables_second_split() {
                 &ps,
                 901,
                 format!("ab-{:02}", i).as_bytes(),
-                b"after-compact",
-                false,
+                b"after-compact"
             )
             .await;
         }

@@ -46,7 +46,7 @@ fn seal_during_active_writes_client_retries() {
         // Write some data to establish the stream tail
         for i in 0..5 {
             let payload = format!("pre-seal-{i:04}").into_bytes();
-            sc.append(stream_id, &payload, false)
+            sc.append(stream_id, &payload)
                 .await
                 .expect("pre-seal append");
         }
@@ -100,7 +100,7 @@ fn seal_during_active_writes_client_retries() {
 
         // sc2 will load the stream tail fresh from manager → gets the new extent
         let result = sc2
-            .append(stream_id, b"after-seal-data", false)
+            .append(stream_id, b"after-seal-data")
             .await
             .expect("append on fresh client");
 

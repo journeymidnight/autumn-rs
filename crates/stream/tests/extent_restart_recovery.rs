@@ -20,7 +20,7 @@ async fn restart_preserves_commit_length() {
         assert_eq!(alloc.code, CODE_OK);
 
         let resp = conn
-            .append(2001, 1, 0, 10, true, b"helloworld".to_vec())
+            .append(2001, 1, 0, 10, b"helloworld".to_vec())
             .await;
         assert_eq!(resp.code, CODE_OK);
         assert_eq!(resp.end, 10);
@@ -53,7 +53,7 @@ async fn restart_preserves_meta_fields() {
 
         // Establish revision 42
         let resp = conn
-            .append(2002, 1, 0, 42, true, b"data".to_vec())
+            .append(2002, 1, 0, 42, b"data".to_vec())
             .await;
         assert_eq!(resp.code, CODE_OK);
     }
@@ -64,7 +64,7 @@ async fn restart_preserves_meta_fields() {
     let conn2 = TestConn::new(addr2);
 
     let stale = conn2
-        .append(2002, 1, 4, 10, true, b"x".to_vec())
+        .append(2002, 1, 4, 10, b"x".to_vec())
         .await;
     assert_eq!(
         stale.code, CODE_LOCKED_BY_OTHER,
@@ -85,7 +85,7 @@ async fn restart_extent_remains_writable() {
         conn.alloc_extent(2003).await;
 
         let resp = conn
-            .append(2003, 1, 0, 5, true, b"abc".to_vec())
+            .append(2003, 1, 0, 5, b"abc".to_vec())
             .await;
         assert_eq!(resp.code, CODE_OK);
         assert_eq!(resp.end, 3);
@@ -102,7 +102,7 @@ async fn restart_extent_remains_writable() {
 
     // Can append more data starting from the correct commit point
     let resp2 = conn2
-        .append(2003, 1, 3, 5, true, b"def".to_vec())
+        .append(2003, 1, 3, 5, b"def".to_vec())
         .await;
     assert_eq!(
         resp2.code, CODE_OK,

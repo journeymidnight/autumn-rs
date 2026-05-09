@@ -37,8 +37,7 @@ fn crash_during_flush_unflushed_data_recoverable() {
             ps_put(
                 &ps1, 901,
                 format!("key-{i:03}").as_bytes(),
-                format!("val-{i}").as_bytes(),
-                true,
+                format!("val-{i}").as_bytes()
             ).await;
         }
 
@@ -93,8 +92,7 @@ fn crash_mid_flush_no_orphan_corruption() {
             ps_put(
                 &ps1, 902,
                 format!("batch1-{i:03}").as_bytes(),
-                format!("val1-{i}").as_bytes(),
-                true,
+                format!("val1-{i}").as_bytes()
             ).await;
         }
         ps_flush(&ps1, 902).await;
@@ -104,8 +102,7 @@ fn crash_mid_flush_no_orphan_corruption() {
             ps_put(
                 &ps1, 902,
                 format!("batch2-{i:03}").as_bytes(),
-                format!("val2-{i}").as_bytes(),
-                true,
+                format!("val2-{i}").as_bytes()
             ).await;
         }
         // Trigger flush and race with crash

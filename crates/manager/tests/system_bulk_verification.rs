@@ -37,14 +37,14 @@ fn bulk_write_crash_restart_all_data_intact() {
         for i in 0u32..100 {
             let key = format!("small-{i:03}");
             let val = format!("sv-{i:03}");
-            ps_put(&ps1, 901, key.as_bytes(), val.as_bytes(), true).await;
+            ps_put(&ps1, 901, key.as_bytes(), val.as_bytes()).await;
         }
         // Write 100 large keys (>4KB, VP path)
         for i in 0u32..100 {
             let key = format!("large-{i:03}");
             let mut val = format!("lv-{i:03}-").into_bytes();
             val.resize(5000, b'y');
-            ps_put(&ps1, 901, key.as_bytes(), &val, true).await;
+            ps_put(&ps1, 901, key.as_bytes(), &val).await;
         }
 
         ps_flush(&ps1, 901).await;
@@ -113,7 +113,7 @@ fn bulk_mixed_ops_split_restart_verify() {
                 v.resize(5000, b'y');
                 v
             };
-            ps_put(&ps, 902, key.as_bytes(), &val, true).await;
+            ps_put(&ps, 902, key.as_bytes(), &val).await;
         }
         ps_flush(&ps, 902).await;
 
@@ -125,7 +125,7 @@ fn bulk_mixed_ops_split_restart_verify() {
         for i in 0u32..30 {
             let key = format!("post-{i:03}");
             let val = format!("pv-{i:03}");
-            ps_put(&ps, 902, key.as_bytes(), val.as_bytes(), true).await;
+            ps_put(&ps, 902, key.as_bytes(), val.as_bytes()).await;
         }
         ps_flush(&ps, 902).await;
 
@@ -159,8 +159,8 @@ fn bulk_mixed_ops_split_restart_verify() {
         for i in 0u32..20 {
             let lk = format!("{left_start}child-{i:02}");
             let rk = format!("{right_start}child-{i:02}");
-            ps_put(&ps, 902, lk.as_bytes(), lk.as_bytes(), true).await;
-            psr_put(&router, right_id, rk.as_bytes(), rk.as_bytes(), true).await;
+            ps_put(&ps, 902, lk.as_bytes(), lk.as_bytes()).await;
+            psr_put(&router, right_id, rk.as_bytes(), rk.as_bytes()).await;
         }
         ps_flush(&ps, 902).await;
         psr_flush(&router, right_id).await;

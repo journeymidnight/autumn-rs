@@ -308,30 +308,56 @@ impl ExtentNodeConfig {
 
 // ─── ExtentEntry ─────────────────────────────────────────────────────────────
 
-/// F178 Phase 1: per-extent fsync coalescer state.
+/// F178 Phase 1: per-extent fsync coalescer state (event-driven, RocksDB-style).
 ///
 /// Decouples pwrite throughput from fsync rate. Hot-path append handlers
 /// store-then-register: advance `pending_fsync` to their write end_offset,
 /// register a `(end, oneshot)` waiter via `register_sync_waiter`, await the
-/// receiver. A lazily-spawned coalescer task wakes every
-/// `AUTUMN_EXTENT_FSYNC_COALESCE_MS` (default 2 ms, range [1, 50]); if
-/// `pending > last_synced` it issues ONE `sync_data` syscall covering
-/// everything written so far, advances `last_synced`, and wakes every
-/// waiter whose `end ≤ last_synced`. Higher `end`s stay in the waiter list
-/// until a later sync covers them.
+/// receiver. A lazily-spawned coalescer task issues ONE `sync_data` syscall
+/// per wake-cycle covering ALL pending bytes, then drains every waiter
+/// whose `end ≤ last_synced`.
+///
+/// **Event-driven, not timer-driven.** The first `register_sync_waiter`
+/// spawns the coalescer task with a `mpsc::Unbounded<()>` wake channel. Each
+/// subsequent waiter pushes itself into the list AND sends a `()` on the
+/// wake channel. The coalescer loop:
+///
+/// 1. Snapshot `pending`/`synced`. If there's work AND any waiter, run
+///    `sync_data` immediately (no sleep).
+/// 2. After fsync, drain every waiter covered by the snapshot.
+/// 3. If no work AND no waiters, set `wake_tx = None` and return —
+///    a future `register_sync_waiter` will see `wake_tx.is_none()` and
+///    spawn a fresh task.
+/// 4. Otherwise park on `wake_rx.next().await` until the next waiter wakes
+///    us. No timer involved.
+///
+/// Latency profile vs the prior timer-driven design (kept for reference):
+///   - timer (sleep 2 ms): every fsync paid up to 2 ms of "wait for more
+///     friends" even when the queue was empty after the first arrival.
+///   - event-driven (this version): first waiter triggers fsync immediately;
+///     friends that arrive during the fsync's I/O await ride along on the
+///     same syscall (whole-file fsync covers ALL dirty pages including
+///     those written after the syscall was issued? — no: `sync_data`
+///     captures the file's dirty page state at issue time, plus any new
+///     pages whose write was started before the syscall returns. In
+///     practice, "all friends whose pwrite completed before sync_data
+///     returns" are durable, which is exactly the LevelDB/RocksDB group-
+///     commit semantics.). Subsequent batches that arrived too late get a
+///     fresh wake → fresh fsync. No per-fsync 2 ms floor.
 ///
 /// Why per-extent: an extent file's `sync_data` covers ALL of THAT file's
 /// dirty pages in one syscall — no benefit to grouping across extents at
 /// userspace; the kernel already does the I/O scheduling.
 ///
-/// Lifecycle: the task spawns lazily on the first `register_sync_waiter`
-/// (transitions `task_running` false→true under the inner borrow_mut), and
-/// exits when `waiters.is_empty()` AND `pending == last_synced`. The exit
-/// check sits under the same `inner` borrow_mut that new waiters use, so a
-/// new waiter arriving during the check window either blocks until the
-/// task sets `task_running = false` and exits (in which case the new
-/// waiter spawns a fresh task), or sneaks in first (in which case the
-/// task sees the waiter and continues looping).
+/// Lifecycle race-freedom (single-threaded compio):
+///   - Spawn: first register sees `wake_tx.is_none()`, sets it Some, spawns.
+///     Subsequent registers see Some, send `()` on the channel.
+///   - Exit: task takes `inner.borrow_mut()`, re-checks `waiters.is_empty()`
+///     AND `pending == synced`, sets `wake_tx = None`, releases borrow,
+///     returns. Compio is single-threaded, so a concurrent register
+///     interleaves only at `.await` points; the borrow_mut block has no
+///     await inside, so the swap from Some→None and a fresh register
+///     observing None happen in disjoint scheduling slots — no lost wake.
 pub(crate) struct Coalescer {
     pub(crate) last_synced: AtomicU64,
     pub(crate) pending_fsync: AtomicU64,
@@ -340,7 +366,11 @@ pub(crate) struct Coalescer {
 
 struct CoalescerInner {
     waiters: Vec<(u64, futures::channel::oneshot::Sender<Result<(), String>>)>,
-    task_running: bool,
+    /// Wake channel sender. `Some` iff a coalescer task is running.
+    /// `None` means no task; the next `register_sync_waiter` must spawn one.
+    /// Replaces the prior `task_running: bool` so we can both signal AND
+    /// wake-from-park with a single primitive.
+    wake_tx: Option<futures::channel::mpsc::UnboundedSender<()>>,
 }
 
 impl Coalescer {
@@ -350,21 +380,10 @@ impl Coalescer {
             pending_fsync: AtomicU64::new(initial_len),
             inner: RefCell::new(CoalescerInner {
                 waiters: Vec::new(),
-                task_running: false,
+                wake_tx: None,
             }),
         }
     }
-}
-
-/// Coalescing window. Fsync rate ceiling = 1000 / ms. Default 2 ms keeps
-/// pipeline saturated on typical NVMe (sync_data ~1 ms) with a p99 floor
-/// of ~5 ms (worst-case two windows back-to-back).
-fn extent_fsync_coalesce_ms() -> u64 {
-    std::env::var("AUTUMN_EXTENT_FSYNC_COALESCE_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|v| (1..=50).contains(v))
-        .unwrap_or(2)
 }
 
 /// Register a sync waiter on `extent` for bytes up to `end_offset`. Returns
@@ -375,56 +394,82 @@ fn extent_fsync_coalesce_ms() -> u64 {
 /// ordering).
 ///
 /// Side effect: if no coalescer task is currently running for this extent,
-/// spawns one before returning.
+/// spawns one. Otherwise pushes a `()` onto the existing task's wake
+/// channel so it processes us on its next iteration.
 pub(crate) fn register_sync_waiter(
     extent: &Rc<ExtentEntry>,
     end_offset: u64,
 ) -> futures::channel::oneshot::Receiver<Result<(), String>> {
     let (tx, rx) = futures::channel::oneshot::channel();
-    let needs_spawn = {
+    let new_wake_rx = {
         let mut inner = extent.coalescer.inner.borrow_mut();
         inner.waiters.push((end_offset, tx));
-        if !inner.task_running {
-            inner.task_running = true;
-            true
+        if inner.wake_tx.is_none() {
+            // No task running — create wake channel, take ownership of rx
+            // so we can hand it to the new task.
+            let (wtx, wrx) = futures::channel::mpsc::unbounded::<()>();
+            inner.wake_tx = Some(wtx);
+            Some(wrx)
         } else {
-            false
+            // Task is running. Send a wake; ignore Err (would only happen
+            // if the receiver was dropped, which shouldn't be possible
+            // while wake_tx is Some).
+            let _ = inner.wake_tx.as_ref().unwrap().unbounded_send(());
+            None
         }
     };
-    if needs_spawn {
+    if let Some(wrx) = new_wake_rx {
         let extent_clone = Rc::clone(extent);
-        compio::runtime::spawn(coalescer_loop(extent_clone)).detach();
+        compio::runtime::spawn(coalescer_loop(extent_clone, wrx)).detach();
     }
     rx
 }
 
-async fn coalescer_loop(extent: Rc<ExtentEntry>) {
-    use std::time::Duration;
-    let coalesce_ms = extent_fsync_coalesce_ms();
+async fn coalescer_loop(
+    extent: Rc<ExtentEntry>,
+    mut wake_rx: futures::channel::mpsc::UnboundedReceiver<()>,
+) {
+    use futures::StreamExt as _;
     loop {
-        compio::time::sleep(Duration::from_millis(coalesce_ms)).await;
+        // ── Try to do work ─────────────────────────────────────────────
         let pending = extent.coalescer.pending_fsync.load(Ordering::SeqCst);
         let synced = extent.coalescer.last_synced.load(Ordering::SeqCst);
-        if pending > synced {
+        let have_waiters = !extent.coalescer.inner.borrow().waiters.is_empty();
+
+        if pending > synced && have_waiters {
+            // POSIX-correct group commit: snapshot `pending` BEFORE
+            // issuing `sync_data`. Per POSIX, `fdatasync` only
+            // guarantees durability for writes that completed BEFORE
+            // the syscall entered the kernel; writes that completed
+            // DURING the syscall (i.e. between the syscall entry and
+            // its return) MAY or MAY NOT be flushed (Linux often does
+            // include them, but it's not contractual). RocksDB's
+            // group-commit leader does this same snapshot — only the
+            // batches the leader merged BEFORE issuing fsync are
+            // claimed durable; late arrivals create a fresh group.
+            //
+            // We capture `snapshot = pending_fsync.load()` here, then
+            // after fsync only credit `last_synced = snapshot`. Late
+            // arrivals (whose `pending_fsync.store` happens DURING our
+            // await) advance `pending_fsync` past `snapshot` and queue
+            // a wake event on `wake_rx`; the next loop iteration sees
+            // `pending > synced` and issues a fresh fsync.
+            let snapshot = pending; // already loaded at top of iteration
             let file_rc = extent.file_rc();
             let f: &CompioFile = &*file_rc;
             match f.sync_data().await {
                 Ok(_) => {
-                    // Update last_synced FIRST so any new register_sync_waiter
-                    // observing pending == synced after our load can correctly
-                    // attribute coverage.
-                    extent
-                        .coalescer
-                        .last_synced
-                        .store(pending, Ordering::SeqCst);
+                    extent.coalescer.last_synced.store(snapshot, Ordering::SeqCst);
                     let waiters = {
                         let mut inner = extent.coalescer.inner.borrow_mut();
                         std::mem::take(&mut inner.waiters)
                     };
-                    let mut still: Vec<(u64, futures::channel::oneshot::Sender<Result<(), String>>)> =
-                        Vec::new();
+                    let mut still: Vec<(
+                        u64,
+                        futures::channel::oneshot::Sender<Result<(), String>>,
+                    )> = Vec::new();
                     for (end, tx) in waiters {
-                        if end <= pending {
+                        if end <= snapshot {
                             let _ = tx.send(Ok(()));
                         } else {
                             still.push((end, tx));
@@ -443,21 +488,40 @@ async fn coalescer_loop(extent: Rc<ExtentEntry>) {
                     for (_, tx) in waiters {
                         let _ = tx.send(Err(msg.clone()));
                     }
-                    // Don't advance last_synced; next iteration will retry.
+                    // Don't advance last_synced; the next register will
+                    // retry via a fresh wake.
                 }
             }
+            // Loop back — there may already be queued wakes / late waiters.
+            continue;
         }
-        // Exit decision: under the same `inner` borrow_mut that new waiters
-        // take in `register_sync_waiter`, so the registration-vs-exit race
-        // is closed: if a new waiter snuck in just before this check, we see
-        // it and continue; if a new waiter snuck in just after we set
-        // task_running=false and returned, register_sync_waiter sees
-        // task_running=false and spawns a fresh task.
-        let mut inner = extent.coalescer.inner.borrow_mut();
-        let pending = extent.coalescer.pending_fsync.load(Ordering::SeqCst);
-        let synced = extent.coalescer.last_synced.load(Ordering::SeqCst);
-        if inner.waiters.is_empty() && pending == synced {
-            inner.task_running = false;
+
+        // ── No work. Park on wake_rx, OR exit if truly idle. ───────────
+        let park_or_exit = {
+            let mut inner = extent.coalescer.inner.borrow_mut();
+            let p = extent.coalescer.pending_fsync.load(Ordering::SeqCst);
+            let s = extent.coalescer.last_synced.load(Ordering::SeqCst);
+            if inner.waiters.is_empty() && p == s {
+                // No outstanding work AND nobody's waiting — exit cleanly.
+                // Drop wake_tx so any concurrent registers see None and
+                // spawn a fresh task.
+                inner.wake_tx = None;
+                None
+            } else {
+                Some(())
+            }
+        };
+        if park_or_exit.is_none() {
+            return;
+        }
+        // Park on the wake channel. Compio single-thread guarantees that
+        // any register that took the inner borrow_mut after our exit-check
+        // finished AND saw wake_tx=Some has already pushed its `()` onto
+        // the channel, so `next().await` either returns Some(()) immediately
+        // (event already queued) or blocks until the next register does so.
+        if wake_rx.next().await.is_none() {
+            // wake_tx dropped (shouldn't happen in normal operation —
+            // we control its drop only on our own exit path). Bail.
             return;
         }
     }
@@ -1118,7 +1182,6 @@ async fn build_append_future(
     let mut bufs: Vec<Bytes> = Vec::with_capacity(n);
     let mut req_ids: Vec<u32> = Vec::with_capacity(n);
     let mut cursor = file_start;
-    let mut must_sync = false;
     let mut total_payload: usize = 0;
     for slot in &slots {
         offsets.push(cursor as u32);
@@ -1126,7 +1189,6 @@ async fn build_append_future(
         total_payload += slot.req.payload.len();
         bufs.push(slot.req.payload.clone());
         req_ids.push(slot.req_id);
-        must_sync |= slot.req.must_sync;
     }
     let total_end = cursor;
     let extent_id = slots[0].req.extent_id;
@@ -1157,41 +1219,37 @@ async fn build_append_future(
                 .collect();
         }
 
-        // F178 Phase 1: register a sync waiter on the coalescer instead of
-        // calling sync_data inline. The coalescer task batches all in-flight
-        // pending fsyncs across this extent into ONE sync_data per
-        // AUTUMN_EXTENT_FSYNC_COALESCE_MS window (default 2 ms), waking
-        // every waiter whose end_offset is now durable.
-        //
-        // Always advance pending_fsync (LevelDB-style "eventually durable"
-        // even for must_sync=false batches). The coalescer's next iteration
-        // will cover these bytes; without a waiter we don't await, so the
-        // call site is non-blocking.
+        // F178: every append is durable. Advance pending_fsync to the new
+        // high-water, register a sync waiter on the per-extent coalescer,
+        // and await. The coalescer task issues ONE sync_data per
+        // wake-cycle covering ALL pending bytes (event-driven, RocksDB
+        // group-commit style); every waiter whose end_offset is now
+        // covered wakes together. Pre-F178 must_sync was a per-batch
+        // flag and false batches skipped this wait; post-F178 the wire
+        // field is gone and every batch waits.
         extent_for_io
             .coalescer
             .pending_fsync
             .store(total_end, Ordering::SeqCst);
-        if must_sync {
-            let rx = register_sync_waiter(&extent_for_io, total_end);
-            match rx.await {
-                Ok(Ok(())) => {}
-                Ok(Err(msg)) => {
-                    node.mark_disk_offline_for_extent(extent_id);
-                    return req_ids
-                        .into_iter()
-                        .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
-                        .collect();
-                }
-                Err(_canceled) => {
-                    // Coalescer dropped tx without sending — should not happen
-                    // unless the runtime is shutting down. Treat as Internal.
-                    node.mark_disk_offline_for_extent(extent_id);
-                    let msg = "fsync coalescer canceled".to_string();
-                    return req_ids
-                        .into_iter()
-                        .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
-                        .collect();
-                }
+        let rx = register_sync_waiter(&extent_for_io, total_end);
+        match rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(msg)) => {
+                node.mark_disk_offline_for_extent(extent_id);
+                return req_ids
+                    .into_iter()
+                    .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
+                    .collect();
+            }
+            Err(_canceled) => {
+                // Coalescer dropped tx without sending — should not happen
+                // unless the runtime is shutting down. Treat as Internal.
+                node.mark_disk_offline_for_extent(extent_id);
+                let msg = "fsync coalescer canceled".to_string();
+                return req_ids
+                    .into_iter()
+                    .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
+                    .collect();
             }
         }
 
@@ -2742,24 +2800,23 @@ impl ExtentNode {
         }
         let start_offset = start as u32;
         let end = start + data_payload.len() as u64;
-        // F178 Phase 1: route durability through the per-extent coalescer.
-        // See `register_sync_waiter` doc-comment in this file for design.
+        // F178: every append is durable via the per-extent coalescer. See
+        // `register_sync_waiter` and the matching block in
+        // `build_append_future` for the full design.
         extent.coalescer.pending_fsync.store(end, Ordering::SeqCst);
-        if req.must_sync {
-            let rx = register_sync_waiter(&extent, end);
-            match rx.await {
-                Ok(Ok(())) => {}
-                Ok(Err(msg)) => {
-                    self.mark_disk_offline_for_extent(req.extent_id);
-                    return Err((StatusCode::Internal, msg));
-                }
-                Err(_canceled) => {
-                    self.mark_disk_offline_for_extent(req.extent_id);
-                    return Err((
-                        StatusCode::Internal,
-                        "fsync coalescer canceled".to_string(),
-                    ));
-                }
+        let rx = register_sync_waiter(&extent, end);
+        match rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(msg)) => {
+                self.mark_disk_offline_for_extent(req.extent_id);
+                return Err((StatusCode::Internal, msg));
+            }
+            Err(_canceled) => {
+                self.mark_disk_offline_for_extent(req.extent_id);
+                return Err((
+                    StatusCode::Internal,
+                    "fsync coalescer canceled".to_string(),
+                ));
             }
         }
 
@@ -3872,7 +3929,6 @@ mod f147b_tests {
             eversion: 1,
             commit: 0,
             revision: 0,
-            must_sync: false,
             payload: Bytes::from(vec![0u8; 100]),
         };
         let write_result = node.handle_append(write_req.encode()).await;
@@ -3900,7 +3956,6 @@ mod f147b_tests {
             eversion: 1,
             commit: 50,
             revision: 0,
-            must_sync: false,
             payload: Bytes::from(b"x".to_vec()),
         };
         let stale_result = node.handle_append(stale_req.encode()).await;
@@ -4051,7 +4106,6 @@ mod f148_copy_extent_tests {
             eversion: 1,
             commit: 0,
             revision: 0,
-            must_sync: false,
             payload: Bytes::from(vec![0u8; 256]),
         };
         let write_result = node.handle_append(write_req.encode()).await;
@@ -4116,7 +4170,6 @@ mod f148_copy_extent_tests {
             eversion: 1,
             commit: 0,
             revision: 0,
-            must_sync: false,
             payload: Bytes::from(payload_bytes.clone()),
         };
         let write_result = node.handle_append(write_req.encode()).await;
@@ -4358,7 +4411,6 @@ mod f160_copy_extent_eversion_tests {
             eversion: 1,
             commit: 0,
             revision: 0,
-            must_sync: false,
             payload: Bytes::from(payload),
         };
         node.handle_append(write_req.encode()).await.expect("append");

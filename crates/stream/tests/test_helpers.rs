@@ -73,7 +73,6 @@ impl TestConn {
         eversion: u64,
         commit: u32,
         revision: i64,
-        must_sync: bool,
         payload: Vec<u8>,
     ) -> AppendResp {
         let req = AppendReq {
@@ -81,7 +80,6 @@ impl TestConn {
             eversion,
             commit,
             revision,
-            must_sync,
             payload: Bytes::from(payload),
         };
         let resp = self

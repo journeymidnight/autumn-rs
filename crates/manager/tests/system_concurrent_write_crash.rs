@@ -42,7 +42,7 @@ fn concurrent_writers_crash_no_data_loss() {
                 for i in 0u32..20 {
                     let key = format!("w{w}-key-{i:02}");
                     let val = format!("w{w}-val-{i:02}");
-                    ps_put(&ps_clone, 901, key.as_bytes(), val.as_bytes(), true).await;
+                    ps_put(&ps_clone, 901, key.as_bytes(), val.as_bytes()).await;
                     keys.push(key);
                 }
                 keys
@@ -109,8 +109,7 @@ fn concurrent_writers_during_split() {
             ps_put(
                 &ps, 902,
                 format!("pre-{i:02}").as_bytes(),
-                format!("pv-{i:02}").as_bytes(),
-                true,
+                format!("pv-{i:02}").as_bytes()
             ).await;
         }
         ps_flush(&ps, 902).await;
@@ -141,7 +140,7 @@ fn concurrent_writers_during_split() {
                             part_id: 902,
                             key: key.as_bytes().to_vec(),
                             value: val.as_bytes().to_vec(),
-                            must_sync: true,
+
                             expires_at: 0,
                         }),
                     )

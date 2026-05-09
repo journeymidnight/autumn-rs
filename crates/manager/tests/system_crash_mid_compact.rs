@@ -37,8 +37,7 @@ fn crash_during_compaction_no_data_loss() {
             ps_put(
                 &ps1, 901,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes(),
-                true,
+                format!("val-{i}").as_bytes()
             ).await;
         }
         ps_flush(&ps1, 901).await;
@@ -48,8 +47,7 @@ fn crash_during_compaction_no_data_loss() {
             ps_put(
                 &ps1, 901,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes(),
-                true,
+                format!("val-{i}").as_bytes()
             ).await;
         }
         ps_flush(&ps1, 901).await;
@@ -107,8 +105,7 @@ fn crash_during_compaction_then_successful_compact() {
             ps_put(
                 &ps1, 902,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes(),
-                true,
+                format!("val-{i}").as_bytes()
             ).await;
         }
         ps_flush(&ps1, 902).await;
@@ -124,8 +121,7 @@ fn crash_during_compaction_then_successful_compact() {
             ps_put(
                 &ps1, 902,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes(),
-                true,
+                format!("val-{i}").as_bytes()
             ).await;
         }
         ps_flush(&ps1, 902).await;

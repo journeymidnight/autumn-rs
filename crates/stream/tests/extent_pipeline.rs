@@ -35,7 +35,7 @@ async fn concurrent_appends_preserve_offset_order_per_extent() {
     let mut expected_offset: u32 = 0;
     for _ in 0..N {
         let resp = conn
-            .append(2003, 1, expected_offset, 10, false, payload.clone())
+            .append(2003, 1, expected_offset, 10, payload.clone())
             .await;
         assert_eq!(resp.code, CODE_OK);
         assert_eq!(resp.offset, expected_offset, "offsets must be contiguous");
@@ -66,12 +66,12 @@ async fn appends_to_different_extents_run_concurrently() {
     assert_eq!(alloc_b.code, CODE_OK);
 
     // Warm-up: do a must_sync once on each extent to exclude first-sync cost.
-    let _ = conn.append(2010, 1, 0, 10, true, vec![0u8; 4096]).await;
-    let _ = conn.append(2011, 1, 0, 10, true, vec![0u8; 4096]).await;
+    let _ = conn.append(2010, 1, 0, 10, vec![0u8; 4096]).await;
+    let _ = conn.append(2011, 1, 0, 10, vec![0u8; 4096]).await;
 
     // Measure single-extent baseline.
     let t = Instant::now();
-    let _ = conn.append(2010, 1, 4096, 10, true, vec![0u8; 4096]).await;
+    let _ = conn.append(2010, 1, 4096, 10, vec![0u8; 4096]).await;
     let single = t.elapsed();
 
     // Two concurrent must_sync appends on different extents, each on its
@@ -81,11 +81,11 @@ async fn appends_to_different_extents_run_concurrently() {
 
     let t2 = Instant::now();
     let fa = async {
-        let r = conn_a.append(2010, 1, 8192, 10, true, vec![0u8; 4096]).await;
+        let r = conn_a.append(2010, 1, 8192, 10, vec![0u8; 4096]).await;
         assert_eq!(r.code, CODE_OK);
     };
     let fb = async {
-        let r = conn_b.append(2011, 1, 4096, 10, true, vec![0u8; 4096]).await;
+        let r = conn_b.append(2011, 1, 4096, 10, vec![0u8; 4096]).await;
         assert_eq!(r.code, CODE_OK);
     };
     futures::future::join(fa, fb).await;
@@ -118,12 +118,12 @@ async fn seal_rejects_subsequent_appends() {
 
     // High-revision write: sets last_revision=100.
     let r1 = conn
-        .append(2020, 1, 0, 100, false, b"first".to_vec())
+        .append(2020, 1, 0, 100, b"first".to_vec())
         .await;
     assert_eq!(r1.code, CODE_OK);
 
     // Late-arriving low-revision: must be rejected with LOCKED_BY_OTHER.
-    let r2 = conn.append(2020, 1, 5, 50, false, b"late".to_vec()).await;
+    let r2 = conn.append(2020, 1, 5, 50, b"late".to_vec()).await;
     assert_eq!(
         r2.code,
         autumn_stream::extent_rpc::CODE_LOCKED_BY_OTHER,
@@ -132,7 +132,7 @@ async fn seal_rejects_subsequent_appends() {
 
     // Subsequent high-revision still works, proving the connection is live.
     let r3 = conn
-        .append(2020, 1, 5, 150, false, b"ok".to_vec())
+        .append(2020, 1, 5, 150, b"ok".to_vec())
         .await;
     assert_eq!(r3.code, CODE_OK);
     assert_eq!(r3.offset, 5);
@@ -163,7 +163,7 @@ async fn pwritev_batch_still_coalesced() {
 
     for i in 0..10 {
         let resp = conn
-            .append(2030, 1, i * payload_len, 10, false, payload.clone())
+            .append(2030, 1, i * payload_len, 10, payload.clone())
             .await;
         assert_eq!(resp.code, CODE_OK, "append {i} failed");
         assert_eq!(resp.offset, i * payload_len);
@@ -210,7 +210,7 @@ async fn cq_flushes_fast_ops_while_slow_op_runs() {
         let r = setup.alloc_extent(READ_EXTENT_BASE + i).await;
         assert_eq!(r.code, CODE_OK);
         let seed = setup
-            .append(READ_EXTENT_BASE + i, 1, 0, 10, false, vec![0x42u8; 64])
+            .append(READ_EXTENT_BASE + i, 1, 0, 10, vec![0x42u8; 64])
             .await;
         assert_eq!(seed.code, CODE_OK);
     }
@@ -218,7 +218,7 @@ async fn cq_flushes_fast_ops_while_slow_op_runs() {
     // Warm-up: must_sync on extent A once so the first-sync cost doesn't
     // contaminate the measurement.
     let warm = setup
-        .append(APPEND_EXTENT, 1, 0, 10, true, vec![0u8; 64 * 1024])
+        .append(APPEND_EXTENT, 1, 0, 10, vec![0u8; 64 * 1024])
         .await;
     assert_eq!(warm.code, CODE_OK);
 
@@ -236,7 +236,6 @@ async fn cq_flushes_fast_ops_while_slow_op_runs() {
                 1,
                 append_offset,
                 10,
-                true,
                 vec![0u8; BIG_PAYLOAD],
             )
             .await;

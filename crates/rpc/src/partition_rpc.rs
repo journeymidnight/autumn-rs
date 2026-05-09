@@ -35,7 +35,9 @@ pub struct PutReq {
     pub part_id: u64,
     pub key: Vec<u8>,
     pub value: Vec<u8>,
-    pub must_sync: bool,
+    /// F178 follow-up: the `must_sync` field was removed. Every Put is
+    /// now durable via the extent-node fsync coalescer (RocksDB-style
+    /// group commit). The PS no longer threads any sync flag through.
     pub expires_at: u64,
 }
 
@@ -129,7 +131,7 @@ pub struct StreamPutReq {
     pub part_id: u64,
     pub key: Vec<u8>,
     pub value: Vec<u8>,
-    pub must_sync: bool,
+    /// F178 follow-up: see `PutReq.must_sync` comment for context.
     pub expires_at: u64,
 }
 // Response: PutResp

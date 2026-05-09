@@ -38,8 +38,7 @@ fn delete_survives_crash_and_recovery() {
             ps_put(
                 &ps1, 901,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes(),
-                true,
+                format!("val-{i}").as_bytes()
             ).await;
         }
         ps_flush(&ps1, 901).await;
@@ -99,8 +98,7 @@ fn delete_compaction_removes_tombstones() {
             ps_put(
                 &ps1, 902,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes(),
-                true,
+                format!("val-{i}").as_bytes()
             ).await;
         }
         ps_flush(&ps1, 902).await;
@@ -168,8 +166,7 @@ fn delete_before_split_correct_in_both_children() {
             ps_put(
                 &ps, 903,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes(),
-                true,
+                format!("val-{i}").as_bytes()
             ).await;
         }
         ps_flush(&ps, 903).await;

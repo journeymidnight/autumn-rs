@@ -1310,17 +1310,17 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Put { key, file, nosync } => {
+        Command::Put { key, file, nosync: _ } => {
             let value = std::fs::read(&file).with_context(|| format!("read file {file}"))?;
-            client.put(key.as_bytes(), &value, !nosync).await
+            client.put(key.as_bytes(), &value).await
                 .map_err(|e| anyhow!("put: {e}"))?;
             println!("ok");
         }
 
-        Command::StreamPut { key, file, nosync } => {
+        Command::StreamPut { key, file, nosync: _ } => {
             let value = std::fs::read(&file).with_context(|| format!("read file {file}"))?;
             let file_size = value.len();
-            client.stream_put(key.as_bytes(), &value, !nosync).await
+            client.stream_put(key.as_bytes(), &value).await
                 .map_err(|e| anyhow!("stream put: {e}"))?;
             println!("ok ({file_size} bytes)");
         }
@@ -1596,7 +1596,6 @@ async fn main() -> Result<()> {
                                         part_id,
                                         key: key.as_bytes().to_vec(),
                                         value,
-                                        must_sync: !nosync,
                                         expires_at: 0,
                                     }),
                                 )
@@ -1931,7 +1930,6 @@ async fn main() -> Result<()> {
                                     part_id,
                                     key: key.as_bytes().to_vec(),
                                     value: value_bytes.clone(),
-                                    must_sync: !nosync,
                                     expires_at: 0,
                                 });
                                 let ps_clone = ps.clone();

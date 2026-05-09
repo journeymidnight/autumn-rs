@@ -152,7 +152,7 @@ fn ec_2_1_failover_and_recovery() {
         // Write a recognizable payload.
         let payload: Vec<u8> = (0..8192u16).map(|i| (i % 251) as u8).collect();
         let result = client
-            .append(stream_id, &payload, false)
+            .append(stream_id, &payload)
             .await
             .expect("append");
         assert_eq!(result.extent_id, first_extent_id);
@@ -255,7 +255,7 @@ fn ec_2_1_failover_and_recovery() {
         // ── Step 7: New writes go to the new (non-sealed) extent ──
         let payload2 = b"new write after EC conversion";
         let r2 = client
-            .append(stream_id, payload2, false)
+            .append(stream_id, payload2)
             .await
             .expect("write after EC conversion");
         assert_ne!(

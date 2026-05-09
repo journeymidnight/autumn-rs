@@ -39,8 +39,7 @@ fn range_scan_returns_correct_results_after_split() {
             ps_put(
                 &ps, 901,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes(),
-                true,
+                format!("val-{i}").as_bytes()
             ).await;
         }
         ps_flush(&ps, 901).await;
@@ -116,8 +115,7 @@ fn range_scan_with_limit_and_pagination_after_split() {
             ps_put(
                 &ps, 902,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes(),
-                true,
+                format!("val-{i}").as_bytes()
             ).await;
         }
         ps_flush(&ps, 902).await;
@@ -194,8 +192,7 @@ fn range_scan_consistent_after_split_compact_split() {
             ps_put(
                 &ps, 903,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes(),
-                true,
+                format!("val-{i}").as_bytes()
             ).await;
         }
         ps_flush(&ps, 903).await;

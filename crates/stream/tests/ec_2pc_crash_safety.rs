@@ -28,7 +28,7 @@ async fn prepare_preserves_original_data() {
     assert_eq!(conn.alloc_extent(extent_id).await.code, CODE_OK);
 
     let original = vec![0x42u8; 2048];
-    let append = conn.append(extent_id, 1, 0, 0, false, original.clone()).await;
+    let append = conn.append(extent_id, 1, 0, 0, original.clone()).await;
     assert_eq!(append.code, CODE_OK);
 
     // Phase 1: write shard to staging. eversion=5 is the post-EC target.
@@ -58,7 +58,7 @@ async fn commit_switches_to_shard_data() {
     assert_eq!(conn.alloc_extent(extent_id).await.code, CODE_OK);
 
     let original = vec![0x42u8; 2048];
-    conn.append(extent_id, 1, 0, 0, false, original).await;
+    conn.append(extent_id, 1, 0, 0, original).await;
 
     let shard_payload = vec![0xCDu8; 1024];
     let ws = conn
@@ -143,7 +143,7 @@ async fn crash_between_prepare_and_commit_preserves_data() {
     assert_eq!(conn.alloc_extent(extent_id).await.code, CODE_OK);
 
     let original = vec![0x11u8; 4096];
-    let append = conn.append(extent_id, 1, 0, 0, false, original.clone()).await;
+    let append = conn.append(extent_id, 1, 0, 0, original.clone()).await;
     assert_eq!(append.code, CODE_OK);
 
     // Prepare: shard goes to .ec.dat

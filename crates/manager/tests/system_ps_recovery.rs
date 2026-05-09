@@ -46,7 +46,6 @@ fn ps_crash_unflushed_data_recoverable() {
                 801,
                 format!("key-{i:04}").as_bytes(),
                 format!("value-{i}").as_bytes(),
-                true, // must_sync to ensure data is in logStream
             )
             .await;
         }
@@ -111,8 +110,7 @@ fn sequential_ps_crash_data_accumulates() {
                 &ps1,
                 802,
                 format!("batch1-{i:02}").as_bytes(),
-                format!("val1-{i}").as_bytes(),
-                true,
+                format!("val1-{i}").as_bytes()
             )
             .await;
         }
@@ -133,8 +131,7 @@ fn sequential_ps_crash_data_accumulates() {
                 &ps2,
                 802,
                 format!("batch2-{i:02}").as_bytes(),
-                format!("val2-{i}").as_bytes(),
-                true,
+                format!("val2-{i}").as_bytes()
             )
             .await;
         }

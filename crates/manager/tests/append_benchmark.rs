@@ -45,7 +45,9 @@ fn benchmark_append_stream_throughput() {
     let ops = env_usize("APPEND_BENCH_OPS", 20_000);
     let payload_size = env_usize("APPEND_BENCH_PAYLOAD", 4096);
     let warmup_ops = env_usize("APPEND_BENCH_WARMUP", 1000);
-    let must_sync = env_bool("APPEND_BENCH_SYNC", false);
+    // F178: writes are always durable; the APPEND_BENCH_SYNC env var no
+    // longer controls sync behaviour (the per-extent fsync coalescer
+    // does it unconditionally).
 
     let mgr_addr = pick_addr();
     std::thread::spawn(move || {
@@ -143,8 +145,7 @@ fn benchmark_append_stream_throughput() {
         for i in 0..warmup_reqs {
             let n = batch_count(i, warmup_ops, BATCH_SIZE, warmup_reqs);
             let _ = client
-                .append_batch_repeated(stream_id, payload.as_slice(), n, must_sync)
-                .await
+                .append_batch_repeated(stream_id, payload.as_slice(), n).await
                 .expect("warmup append");
         }
 
@@ -154,8 +155,7 @@ fn benchmark_append_stream_throughput() {
         for i in 0..bench_reqs {
             let n = batch_count(i, ops, BATCH_SIZE, bench_reqs);
             client
-                .append_batch_repeated(stream_id, payload.as_slice(), n, must_sync)
-                .await
+                .append_batch_repeated(stream_id, payload.as_slice(), n).await
                 .expect("bench append");
         }
         let elapsed = start.elapsed();
@@ -166,8 +166,8 @@ fn benchmark_append_stream_throughput() {
         let ops_per_sec = (ops as f64) / secs;
 
         println!(
-            "BENCH_RESULT ops={} payload={}B batch=16 sync={} elapsed={:.3}s throughput={:.2}MiB/s ops_per_sec={:.2}",
-            ops, payload_size, must_sync, secs, mbps, ops_per_sec
+            "BENCH_RESULT ops={} payload={}B batch=16 sync=true elapsed={:.3}s throughput={:.2}MiB/s ops_per_sec={:.2}",
+            ops, payload_size, secs, mbps, ops_per_sec
         );
 
         assert!(mbps > 0.0);

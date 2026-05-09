@@ -187,7 +187,11 @@ if (( USE_SHM )); then
     STORAGE_LABEL="RAM tmpfs (/dev/shm)"
     STORAGE_SUFFIX="_shm"
 else
-    export AUTUMN_DATA_ROOT="/tmp/autumn-rs"
+    # Honor a pre-set AUTUMN_DATA_ROOT so callers can target a specific
+    # disk (e.g. AUTUMN_DATA_ROOT=/data03/autumn-rs to escape overlayfs
+    # in containerized environments where /tmp may not be a real ext4
+    # mount). Default stays /tmp/autumn-rs to match historical baselines.
+    export AUTUMN_DATA_ROOT="${AUTUMN_DATA_ROOT:-/tmp/autumn-rs}"
     STORAGE_LABEL="disk ($AUTUMN_DATA_ROOT)"
     STORAGE_SUFFIX=""
 fi
@@ -248,8 +252,6 @@ run_perf() {
     echo "[perf-check] mode=$mode partitions=$parts pipeline-depth=$depth size=$size_label ($size B) storage=$STORAGE_LABEL"
     echo "[perf-check] baseline=$(basename "$baseline")"
     echo "============================================================"
-    # F178: --nosync removed — writes are now always durable (LevelDB-style
-    # coalescer fires every 1-5 ms; all batches go through quorum fsync).
     ${AC_PREFIX:-} "$AC" --manager "${AUTUMN_BIND_HOST:-127.0.0.1}:9001" --transport "$mode" \
         perf-check \
         --threads "$THREADS" \

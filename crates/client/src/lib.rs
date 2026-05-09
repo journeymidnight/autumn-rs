@@ -448,8 +448,13 @@ impl ClusterClient {
     // ── High-level SDK API ──────────────────────────────────────────────────
 
     /// Put a key-value pair. Retries once on routing miss.
-    pub async fn put(&mut self, key: &[u8], value: &[u8], must_sync: bool) -> std::result::Result<(), AutumnError> {
-        self.put_opts(key, value, must_sync, 0).await
+    ///
+    /// F178: every Put is durable. Pre-F178 the API took a `must_sync: bool`
+    /// flag; after F178 the field was removed from the wire and every
+    /// append goes through the extent-node fsync coalescer (RocksDB-style
+    /// group commit). Callers no longer have a "fast but unsafe" mode.
+    pub async fn put(&mut self, key: &[u8], value: &[u8]) -> std::result::Result<(), AutumnError> {
+        self.put_opts(key, value, 0).await
     }
 
     /// Put a key-value pair with TTL (seconds from now). 0 = no expiry.
@@ -457,7 +462,6 @@ impl ClusterClient {
         &mut self,
         key: &[u8],
         value: &[u8],
-        must_sync: bool,
         ttl_secs: u64,
     ) -> std::result::Result<(), AutumnError> {
         let expires_at = if ttl_secs > 0 {
@@ -469,20 +473,19 @@ impl ClusterClient {
         } else {
             0
         };
-        self.put_opts(key, value, must_sync, expires_at).await
+        self.put_opts(key, value, expires_at).await
     }
 
     async fn put_opts(
         &mut self,
         key: &[u8],
         value: &[u8],
-        must_sync: bool,
         expires_at: u64,
     ) -> std::result::Result<(), AutumnError> {
         let key = key.to_vec();
         let value = value.to_vec();
         let resp_bytes = self.call_ps_for_key(&key, MSG_PUT, |part_id| {
-            rkyv_encode(&PutReq { part_id, key: key.clone(), value: value.clone(), must_sync, expires_at })
+            rkyv_encode(&PutReq { part_id, key: key.clone(), value: value.clone(), expires_at })
         }).await?;
         let resp: PutResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code != partition_rpc::CODE_OK {
@@ -663,16 +666,17 @@ impl ClusterClient {
     }
 
     /// Stream put (for large values, single RPC).
+    ///
+    /// F178: see `put` doc — every write is durable, no `must_sync` flag.
     pub async fn stream_put(
         &mut self,
         key: &[u8],
         value: &[u8],
-        must_sync: bool,
     ) -> std::result::Result<(), AutumnError> {
         let key = key.to_vec();
         let value = value.to_vec();
         let resp_bytes = self.call_ps_for_key(&key, MSG_STREAM_PUT, |part_id| {
-            rkyv_encode(&StreamPutReq { part_id, key: key.clone(), value: value.clone(), must_sync, expires_at: 0 })
+            rkyv_encode(&StreamPutReq { part_id, key: key.clone(), value: value.clone(), expires_at: 0 })
         }).await?;
         let resp: PutResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code != partition_rpc::CODE_OK {

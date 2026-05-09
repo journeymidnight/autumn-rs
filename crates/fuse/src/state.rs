@@ -68,6 +68,14 @@ impl FsState {
     }
 
     /// Put a key-value pair into the KV store.
+    ///
+    /// F178: every Put is durable (no `must_sync` flag). Pre-F178 there
+    /// was a `kv_put` (must_sync=false) and `kv_put_sync` (must_sync=
+    /// true) split; post-F178 they collapse to one method because the
+    /// extent-node fsync coalescer makes every append durable
+    /// regardless. The `kv_put_sync` alias is retained as a no-op
+    /// pass-through for callers that explicitly want to read as
+    /// "durable Put".
     pub async fn kv_put(&mut self, k: &[u8], v: &[u8]) -> Result<()> {
         let (part_id, addr) = self.client.resolve_key(k).await?;
         let ps = self.client.get_ps_client(&addr).await?;
@@ -75,7 +83,6 @@ impl FsState {
             part_id,
             key: k.to_vec(),
             value: v.to_vec(),
-            must_sync: false,
             expires_at: 0,
         };
         let payload = rkyv_encode(&req);
@@ -89,26 +96,10 @@ impl FsState {
         Ok(())
     }
 
-    /// Put with must_sync flag.
+    /// F178: alias for `kv_put`. See `kv_put` doc — no semantic difference
+    /// post-F178 since every write is durable.
     pub async fn kv_put_sync(&mut self, k: &[u8], v: &[u8]) -> Result<()> {
-        let (part_id, addr) = self.client.resolve_key(k).await?;
-        let ps = self.client.get_ps_client(&addr).await?;
-        let req = PutReq {
-            part_id,
-            key: k.to_vec(),
-            value: v.to_vec(),
-            must_sync: true,
-            expires_at: 0,
-        };
-        let payload = rkyv_encode(&req);
-        let resp_bytes = ps.call(MSG_PUT, Bytes::from(payload)).await
-            .context("KV put sync RPC")?;
-        let resp: PutResp = rkyv_decode(&resp_bytes)
-            .map_err(|e| anyhow!("decode PutResp: {}", e))?;
-        if resp.code != CODE_OK {
-            return Err(anyhow!("KV put sync error: {} {}", resp.code, resp.message));
-        }
-        Ok(())
+        self.kv_put(k, v).await
     }
 
     /// Delete a key from the KV store.

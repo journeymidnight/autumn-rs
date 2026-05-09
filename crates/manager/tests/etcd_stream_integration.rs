@@ -384,7 +384,7 @@ fn etcd_replicated_append_and_recovery_flow() {
         .await
         .expect("connect stream client");
         let appended = client
-            .append(stream_id, b"abcdef", true)
+            .append(stream_id, b"abcdef")
             .await
             .expect("append stream");
         assert_eq!(appended.offset, 0);

@@ -45,7 +45,7 @@ fn split_preserves_all_data() {
             .map(|c| format!("{}-key", c as char))
             .collect();
         for key in &keys {
-            ps_put(&ps, 901, key.as_bytes(), key.as_bytes(), false).await;
+            ps_put(&ps, 901, key.as_bytes(), key.as_bytes()).await;
         }
         ps_flush(&ps, 901).await;
 

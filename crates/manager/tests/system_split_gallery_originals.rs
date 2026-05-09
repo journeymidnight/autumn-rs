@@ -68,9 +68,9 @@ fn split_compact_preserves_gallery_originals_on_rightmost_child() {
                 "Patreon--leeesovely-October-2024-MissKON.com-{i:03}.jpg"
             );
             let thumb = format!(".thumb/320/{original}");
-            ps_put(&ps, 901, thumb.as_bytes(), &thumb_value, false).await;
+            ps_put(&ps, 901, thumb.as_bytes(), &thumb_value).await;
             if i >= 300 {
-                ps_put(&ps, 901, original.as_bytes(), &large_value, false).await;
+                ps_put(&ps, 901, original.as_bytes(), &large_value).await;
             }
         }
         ps_flush(&ps, 901).await;
@@ -170,9 +170,9 @@ fn single_split_compact_preserves_gallery_originals_on_right_child() {
                 "Patreon--leeesovely-October-2024-MissKON.com-{i:03}.jpg"
             );
             let thumb = format!(".thumb/320/{original}");
-            ps_put(&ps, 902, thumb.as_bytes(), &thumb_value, false).await;
+            ps_put(&ps, 902, thumb.as_bytes(), &thumb_value).await;
             if i == 3 || i >= 276 {
-                ps_put(&ps, 902, original.as_bytes(), &large_value, false).await;
+                ps_put(&ps, 902, original.as_bytes(), &large_value).await;
             }
         }
         ps_flush(&ps, 902).await;
@@ -251,9 +251,9 @@ fn two_split_compact_preserves_gallery_originals_on_rightmost_descendant() {
                 "Patreon--leeesovely-October-2024-MissKON.com-{i:03}.jpg"
             );
             let thumb = format!(".thumb/320/{original}");
-            ps_put(&ps, 903, thumb.as_bytes(), &thumb_value, false).await;
+            ps_put(&ps, 903, thumb.as_bytes(), &thumb_value).await;
             if i == 3 || i >= 276 {
-                ps_put(&ps, 903, original.as_bytes(), &large_value, false).await;
+                ps_put(&ps, 903, original.as_bytes(), &large_value).await;
             }
         }
         ps_flush(&ps, 903).await;

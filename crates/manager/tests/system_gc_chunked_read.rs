@@ -64,8 +64,7 @@ fn f105_gc_works_on_large_extent_via_chunked_reads() {
                 &ps,
                 part_id,
                 format!("key-{}", i).as_bytes(),
-                &val_v1,
-                false,
+                &val_v1
             )
             .await;
             ps_flush(&ps, part_id).await;
@@ -79,8 +78,7 @@ fn f105_gc_works_on_large_extent_via_chunked_reads() {
                 &ps,
                 part_id,
                 format!("key-{}", i).as_bytes(),
-                &val_v2,
-                false,
+                &val_v2
             )
             .await;
             ps_flush(&ps, part_id).await;

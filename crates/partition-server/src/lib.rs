@@ -765,7 +765,6 @@ impl WriteResponder {
 
 pub(crate) struct WriteRequest {
     op: WriteOp,
-    must_sync: bool,
     resp: WriteResponder,
 }
 
@@ -780,7 +779,7 @@ impl WriteRequest {
     }
 
     #[cfg(test)]
-    pub(crate) fn new_for_test(op: WriteOp, must_sync: bool) -> Self {
+    pub(crate) fn new_for_test(op: WriteOp) -> Self {
         // Build a dangling responder (outer _rx dropped immediately). Tests
         // that exercise the responder should construct it explicitly.
         let (outer, _rx) = oneshot::channel();
@@ -792,7 +791,7 @@ impl WriteRequest {
             WriteOp::Put { .. } => WriteResponder::Put { outer, key },
             WriteOp::Delete { .. } => WriteResponder::Delete { outer, key },
         };
-        Self { op, must_sync, resp }
+        Self { op, resp }
     }
 }
 
@@ -2865,7 +2864,6 @@ fn enqueue_put(req: PartitionRequest, pending: &mut Vec<WriteRequest>) {
                     value: Bytes::from(put_req.value),
                     expires_at: put_req.expires_at,
                 },
-                must_sync: put_req.must_sync,
                 resp: WriteResponder::Put {
                     outer: req.resp_tx,
                     key: key_vec,
@@ -2884,7 +2882,6 @@ fn enqueue_delete(req: PartitionRequest, pending: &mut Vec<WriteRequest>) {
             let key_vec = del_req.key.clone();
             pending.push(WriteRequest {
                 op: WriteOp::Delete { user_key: del_req.key },
-                must_sync: false,
                 resp: WriteResponder::Delete {
                     outer: req.resp_tx,
                     key: key_vec,
@@ -2907,7 +2904,6 @@ fn enqueue_stream_put(req: PartitionRequest, pending: &mut Vec<WriteRequest>) {
                     value: Bytes::from(sp_req.value),
                     expires_at: sp_req.expires_at,
                 },
-                must_sync: sp_req.must_sync,
                 resp: WriteResponder::Put {
                     outer: req.resp_tx,
                     key: key_vec,
@@ -3274,7 +3270,7 @@ pub(crate) async fn save_table_locs_raw(
     let mut data = Vec::with_capacity(4 + payload.len());
     data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     data.extend_from_slice(&payload);
-    stream_client.append(meta_stream_id, &data, true).await?;
+    stream_client.append(meta_stream_id, &data).await?;
     let info = stream_client.get_stream_info(meta_stream_id).await?;
     if info.extent_ids.len() > 1 {
         let last = *info.extent_ids.last().unwrap();
@@ -3410,8 +3406,9 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
     //
     // Why this is sufficient (covers both new and pre-existing extents):
     //   - For the LATEST log_stream extent the imm wrote to: the
-    //     coalescer fires every AUTUMN_EXTENT_FSYNC_COALESCE_MS (2 ms)
-    //     so this typically waits ≤ 5 ms.
+    //     coalescer is event-driven (no timer); the first waiter triggers
+    //     `sync_data` immediately and any append in flight rides along.
+    //     Typical wait ≈ one fsync syscall (~1 ms tmpfs / 5-15 ms NVMe).
     //   - For OLDER log_stream extents the imm may also reference (rare
     //     — only if rotation happened mid-imm): they are sealed by the
     //     manager and `apply_extent_meta_durable` fsync'd them on the
@@ -3516,7 +3513,7 @@ async fn flush_one_imm_local(
     })
     .await
     .map_err(|_| anyhow::anyhow!("SSTable build task failed"))?;
-    let result = part_sc.append(row_stream_id, &sst_bytes, true).await?;
+    let result = part_sc.append(row_stream_id, &sst_bytes).await?;
 
     let estimated_size = sst_bytes.len() as u64;
     let reader = Arc::new(SstReader::from_bytes(Bytes::from(sst_bytes))?);
@@ -3714,7 +3711,7 @@ async fn flush_worker_loop(
                 let RowAppendReq { sst_bytes, row_stream_id, resp_tx } = req;
                 let bulk_sc = bulk_sc.clone();
                 Box::pin(async move {
-                    let result = bulk_sc.append_bytes(row_stream_id, sst_bytes, true).await
+                    let result = bulk_sc.append_bytes(row_stream_id, sst_bytes).await
                         .map_err(Into::into);
                     BulkCompletion::RowAppend { resp_tx, result }
                 })
@@ -3785,7 +3782,7 @@ async fn do_flush_on_bulk(
     .await
     .map_err(|_| anyhow::anyhow!("SSTable build task failed"))?;
 
-    let append_result = bulk_sc.append(row_stream_id, &sst_bytes, true).await?;
+    let append_result = bulk_sc.append(row_stream_id, &sst_bytes).await?;
     let estimated_size = sst_bytes.len() as u64;
     let reader = SstReader::from_bytes(Bytes::from(sst_bytes))?;
     let new_meta = TableMeta {
@@ -4658,14 +4655,12 @@ mod merged_loop_tests {
     fn build_put_partition_request(
         key: &[u8],
         value: &[u8],
-        must_sync: bool,
         expires_at: u64,
     ) -> (PartitionRequest, oneshot::Receiver<HandlerResult>) {
         let req = PutReq {
             part_id: 0,
             key: key.to_vec(),
             value: value.to_vec(),
-            must_sync,
             expires_at,
         };
         let payload = partition_rpc::rkyv_encode(&req);
@@ -4705,7 +4700,7 @@ mod merged_loop_tests {
     /// spawn, no inner oneshot.
     #[test]
     fn merged_loop_put_direct_response() {
-        let (req, resp_rx) = build_put_partition_request(b"hello", b"world", false, 0);
+        let (req, resp_rx) = build_put_partition_request(b"hello", b"world", 0);
         let mut pending: Vec<WriteRequest> = Vec::new();
         enqueue_put(req, &mut pending);
 
@@ -4740,8 +4735,8 @@ mod merged_loop_tests {
     /// variants encode correctly.
     #[test]
     fn merged_loop_mixed_read_write() {
-        let (p1, rx1) = build_put_partition_request(b"k1", b"v1", false, 0);
-        let (p2, rx2) = build_put_partition_request(b"k2", b"v2", true, 0);
+        let (p1, rx1) = build_put_partition_request(b"k1", b"v1", 0);
+        let (p2, rx2) = build_put_partition_request(b"k2", b"v2", 0);
         let (d1, rx3) = build_delete_partition_request(b"k3");
 
         let mut pending: Vec<WriteRequest> = Vec::new();
@@ -4879,7 +4874,6 @@ mod f099j_tests {
                 part_id: 7,
                 key: b"hello".to_vec(),
                 value: b"world".to_vec(),
-                must_sync: false,
                 expires_at: 0,
             };
             let payload = partition_rpc::rkyv_encode(&put);
@@ -4971,7 +4965,6 @@ mod f099j_tests {
                     part_id: 1,
                     key: key.clone(),
                     value,
-                    must_sync: false,
                     expires_at: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
@@ -5170,7 +5163,6 @@ mod f099k_tests {
                     part_id: owner_part,
                     key: b"k_n1".to_vec(),
                     value: b"v_n1".to_vec(),
-                    must_sync: false,
                     expires_at: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
@@ -5249,7 +5241,6 @@ mod f099k_tests {
                         part_id: o,
                         key: format!("k-{o}").into_bytes(),
                         value: format!("v-{o}").into_bytes(),
-                        must_sync: false,
                         expires_at: 0,
                     };
                     let payload = partition_rpc::rkyv_encode(&put);
@@ -5283,7 +5274,6 @@ mod f099k_tests {
                         part_id: o + 1000, // definitely not this listener's owner
                         key: b"bogus".to_vec(),
                         value: b"bogus".to_vec(),
-                        must_sync: false,
                         expires_at: 0,
                     };
                     let payload = partition_rpc::rkyv_encode(&wrong);
@@ -5383,7 +5373,6 @@ mod f099i_tests {
                 part_id: 7,
                 key: b"one-frame".to_vec(),
                 value: b"v".to_vec(),
-                must_sync: false,
                 expires_at: 0,
             };
             let payload = partition_rpc::rkyv_encode(&put);
@@ -5501,7 +5490,6 @@ mod f099i_tests {
                     part_id: 9,
                     key: format!("batch-{i}").into_bytes(),
                     value: b"v".to_vec(),
-                    must_sync: false,
                     expires_at: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
@@ -5679,7 +5667,6 @@ mod f099i_tests {
                             part_id: 5,
                             key: format!("bp-{i:03}").into_bytes(),
                             value: b"v".to_vec(),
-                            must_sync: false,
                             expires_at: 0,
                         };
                         let payload = partition_rpc::rkyv_encode(&put);
@@ -5815,7 +5802,6 @@ mod f099i_tests {
                     part_id: 11,
                     key: format!("fast-{i:02}").into_bytes(),
                     value: b"v".to_vec(),
-                    must_sync: false,
                     expires_at: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
@@ -5907,7 +5893,6 @@ mod f099i_tests {
                     part_id: 13,
                     key: format!("batch-{i}").into_bytes(),
                     value: b"v".to_vec(),
-                    must_sync: false,
                     expires_at: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);

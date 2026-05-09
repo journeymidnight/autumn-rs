@@ -57,7 +57,7 @@ fn extent_recovery_replaces_dead_node() {
 
         // Write data
         let payload = b"recovery-test-data-1234567890";
-        let result = sc.append(stream_id, payload, true).await.expect("append");
+        let result = sc.append(stream_id, payload).await.expect("append");
         let extent_id = result.extent_id;
 
         // Seal the extent
@@ -121,7 +121,7 @@ fn extent_recovery_replaces_dead_node() {
         // data readable, sealed correctly.
 
         // Write more data — should succeed (StreamClient handles sealed extent)
-        sc.append(stream_id, b"post-seal-data", false).await.expect("post-seal append");
+        sc.append(stream_id, b"post-seal-data").await.expect("post-seal append");
     });
 }
 
@@ -156,7 +156,7 @@ fn recovery_dispatch_skips_healthy_sealed_extents() {
         .await
         .expect("connect sc");
 
-        let r = sc.append(stream_id, b"data", true).await.expect("append");
+        let r = sc.append(stream_id, b"data").await.expect("append");
         let extent_id = r.extent_id;
 
         // Seal

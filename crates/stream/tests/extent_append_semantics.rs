@@ -16,12 +16,12 @@ async fn append_rejects_stale_revision() {
     assert_eq!(alloc.code, CODE_OK);
 
     let first = conn
-        .append(1001, 1, 0, 20, true, b"abc".to_vec())
+        .append(1001, 1, 0, 20, b"abc".to_vec())
         .await;
     assert_eq!(first.code, CODE_OK);
 
     let stale = conn
-        .append(1001, 1, 3, 10, true, b"x".to_vec())
+        .append(1001, 1, 3, 10, b"x".to_vec())
         .await;
     assert_eq!(stale.code, CODE_LOCKED_BY_OTHER, "stale revision should be rejected");
 }
@@ -39,14 +39,14 @@ async fn append_with_mid_byte_commit_truncates_and_succeeds() {
     assert_eq!(alloc.code, CODE_OK);
 
     let first = conn
-        .append(1002, 1, 0, 30, true, b"helloworld".to_vec())
+        .append(1002, 1, 0, 30, b"helloworld".to_vec())
         .await;
     assert_eq!(first.code, CODE_OK);
     assert_eq!(first.end, 10);
 
     // commit=6 truncates to 6 bytes (byte-granular), then appends "!" → end=7
     let partial = conn
-        .append(1002, 1, 6, 30, true, b"!".to_vec())
+        .append(1002, 1, 6, 30, b"!".to_vec())
         .await;
     assert_eq!(
         partial.code, CODE_OK,
@@ -79,7 +79,7 @@ async fn f123_batch_append_rejects_sealed_extent_with_low_commit() {
     assert_eq!(alloc.code, CODE_OK);
 
     // Write 10 bytes so extent.len = 10.
-    let w1 = conn.append(eid, 1, 0, 30, true, b"0123456789".to_vec()).await;
+    let w1 = conn.append(eid, 1, 0, 30, b"0123456789".to_vec()).await;
     assert_eq!(w1.code, CODE_OK);
     assert_eq!(w1.end, 10);
 
@@ -94,7 +94,7 @@ async fn f123_batch_append_rejects_sealed_extent_with_low_commit() {
 
     // Attempt an append with commit=5 (lower than file_start).
     // The batch path's sealed check (step 2) should reject immediately.
-    let stale = conn.append(eid, 2, 5, 30, true, b"x".to_vec()).await;
+    let stale = conn.append(eid, 2, 5, 30, b"x".to_vec()).await;
     assert_eq!(
         stale.code, CODE_PRECONDITION,
         "batch append on a sealed extent must return PRECONDITION"

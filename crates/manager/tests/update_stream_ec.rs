@@ -237,7 +237,7 @@ fn update_stream_ec_triggers_conversion() {
         .expect("stream client");
 
         let payload: Vec<u8> = vec![0xABu8; 4096];
-        let result = sc.append(stream_id, &payload, false).await.expect("append");
+        let result = sc.append(stream_id, &payload).await.expect("append");
 
         // Seal by calling MSG_STREAM_ALLOC_EXTENT (mirrors ec_failover.rs pattern).
         let seal_resp = mgr

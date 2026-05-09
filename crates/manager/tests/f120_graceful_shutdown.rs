@@ -82,7 +82,7 @@ fn f120_graceful_shutdown_drains_active_to_sst() {
         for i in 0..n_keys {
             let key = format!("k{:04}", i);
             let value = vec![b'v'; 256];
-            ps_put(&ps, part_id, key.as_bytes(), &value, true).await;
+            ps_put(&ps, part_id, key.as_bytes(), &value).await;
         }
     });
 

@@ -37,19 +37,25 @@ pub const MSG_SYNCED_LENGTH: u8 = 13;
 
 // ── Append (hot path) ────────────────────────────────────────────────────────
 
-/// Fixed binary header for AppendRequest: 29 bytes + raw payload.
+/// Fixed binary header for AppendRequest: 28 bytes + raw payload.
 /// ```text
-/// [extent_id: u64 LE][eversion: u64 LE][commit: u32 LE][revision: i64 LE][must_sync: u8]
+/// [extent_id: u64 LE][eversion: u64 LE][commit: u32 LE][revision: i64 LE]
 /// [payload bytes...]
 /// ```
-pub const APPEND_HEADER_LEN: usize = 29;
+///
+/// F178 Phase 3 follow-up: `must_sync` byte removed. Every append is
+/// always durable via the per-extent fsync coalescer (see
+/// `extent_node.rs::Coalescer`); the handler unconditionally registers a
+/// sync waiter and awaits coalesced `sync_data`. Pre-F178 this byte
+/// distinguished sync vs. nosync writes; post-F178 there is no nosync
+/// path. Wire format shrinks by 1 byte.
+pub const APPEND_HEADER_LEN: usize = 28;
 
 pub struct AppendReq {
     pub extent_id: u64,
     pub eversion: u64,
     pub commit: u32,
     pub revision: i64,
-    pub must_sync: bool,
     pub payload: Bytes,
 }
 
@@ -60,25 +66,22 @@ impl AppendReq {
         buf.put_u64_le(self.eversion);
         buf.put_u32_le(self.commit);
         buf.put_i64_le(self.revision);
-        buf.put_u8(if self.must_sync { 1 } else { 0 });
         buf.extend_from_slice(&self.payload);
         buf.freeze()
     }
 
-    /// Encode only the 29-byte header (for vectored writes — payload sent separately).
+    /// Encode only the 28-byte header (for vectored writes — payload sent separately).
     pub fn encode_header(
         extent_id: u64,
         eversion: u64,
         commit: u32,
         revision: i64,
-        must_sync: bool,
     ) -> Bytes {
         let mut buf = BytesMut::with_capacity(APPEND_HEADER_LEN);
         buf.put_u64_le(extent_id);
         buf.put_u64_le(eversion);
         buf.put_u32_le(commit);
         buf.put_i64_le(revision);
-        buf.put_u8(if must_sync { 1 } else { 0 });
         buf.freeze()
     }
 
@@ -90,14 +93,12 @@ impl AppendReq {
         let eversion = data.get_u64_le();
         let commit = data.get_u32_le();
         let revision = data.get_i64_le();
-        let must_sync = data.get_u8() != 0;
         let payload = data;
         Ok(Self {
             extent_id,
             eversion,
             commit,
             revision,
-            must_sync,
             payload,
         })
     }

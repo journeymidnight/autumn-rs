@@ -139,8 +139,7 @@ fn ec_policy_stream_write_read_roundtrip() {
 
         let payload = b"hello seal-after-write EC! this is a test payload.";
         let result = client
-            .append(stream_id, payload.as_slice(), false)
-            .await
+            .append(stream_id, payload.as_slice()).await
             .expect("append to EC-policy stream");
 
         let (read_back, _end) = client
@@ -176,8 +175,7 @@ fn ec_policy_stream_multiple_appends() {
         let mut results = Vec::new();
         for p in &payloads {
             let r = client
-                .append(stream_id, p.as_slice(), false)
-                .await
+                .append(stream_id, p.as_slice()).await
                 .expect("append");
             results.push(r);
         }
@@ -209,7 +207,7 @@ fn ec_policy_stream_large_payload() {
         let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
 
         let result = client
-            .append(stream_id, &payload, false)
+            .append(stream_id, &payload)
             .await
             .expect("append large");
 
@@ -238,8 +236,7 @@ fn replication_stream_works() {
 
         let payload = b"replicated data payload";
         let r = client
-            .append(stream_id, payload.as_slice(), false)
-            .await
+            .append(stream_id, payload.as_slice()).await
             .unwrap();
         let (read_back, _) = client
             .read_bytes_from_extent(r.extent_id, r.offset, r.end - r.offset)

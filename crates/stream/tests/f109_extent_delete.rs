@@ -29,7 +29,7 @@ async fn delete_existing_extent_unlinks_files() {
     // Write a payload so the .dat file has bytes; meta is created at
     // alloc time. After delete both files must be gone.
     let payload = vec![0xab; 4096];
-    let resp = conn.append(extent_id, 1, 0, 10, false, payload).await;
+    let resp = conn.append(extent_id, 1, 0, 10, payload).await;
     assert_eq!(resp.code, CODE_OK, "append failed");
 
     // Sanity: files exist before delete.
@@ -82,7 +82,7 @@ async fn delete_then_realloc_starts_fresh() {
     let extent_id: u64 = 7;
     let alloc = conn.alloc_extent(extent_id).await;
     assert_eq!(alloc.code, CODE_OK);
-    let resp = conn.append(extent_id, 1, 0, 10, false, vec![0x11; 1024]).await;
+    let resp = conn.append(extent_id, 1, 0, 10, vec![0x11; 1024]).await;
     assert_eq!(resp.code, CODE_OK);
 
     let resp = conn.delete_extent(extent_id).await;
@@ -97,7 +97,7 @@ async fn delete_then_realloc_starts_fresh() {
     // Fresh append at offset 0 — we use `revision=20 >= 10` to satisfy
     // the fencing check (the .meta sidecar was unlinked, so
     // last_revision is reset to 0; any positive revision is fine).
-    let resp = conn.append(extent_id, 1, 0, 20, false, vec![0x22; 512]).await;
+    let resp = conn.append(extent_id, 1, 0, 20, vec![0x22; 512]).await;
     assert_eq!(resp.code, CODE_OK, "append after re-alloc failed");
     assert_eq!(resp.offset, 0, "fresh extent must start at offset 0");
     assert_eq!(resp.end, 512);

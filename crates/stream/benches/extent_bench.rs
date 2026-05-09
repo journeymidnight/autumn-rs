@@ -147,7 +147,7 @@ async fn run_bench() {
         for _ in 0..read_blocks {
             let req = AppendReq {
                 extent_id: read_extent_id, eversion: 1, commit, revision: 1,
-                must_sync: false, payload: payload.clone(),
+ payload: payload.clone(),
             };
             let resp = AppendResp::decode(conn.call(MSG_APPEND, req.encode()).await).unwrap();
             commit = resp.end;
@@ -176,7 +176,7 @@ async fn run_bench() {
         for _ in 0..mixed_prefill {
             let req = AppendReq {
                 extent_id: mixed_extent_id, eversion: 1, commit, revision: 1,
-                must_sync: false, payload: payload.clone(),
+ payload: payload.clone(),
             };
             let resp = AppendResp::decode(conn.call(MSG_APPEND, req.encode()).await).unwrap();
             commit = resp.end;
@@ -216,7 +216,7 @@ async fn bench_append(addr: SocketAddr, extent_id: u64, depth: usize, total_ops:
     for _ in 0..prefill {
         let req = AppendReq {
             extent_id, eversion: 1, commit, revision: 1,
-            must_sync: false, payload: payload.clone(),
+ payload: payload.clone(),
         };
         conn.send(MSG_APPEND, req.encode()).await;
         sent += 1;
@@ -232,7 +232,7 @@ async fn bench_append(addr: SocketAddr, extent_id: u64, depth: usize, total_ops:
         if sent < total_ops {
             let req = AppendReq {
                 extent_id, eversion: 1, commit: resp.end, revision: 1,
-                must_sync: false, payload: payload.clone(),
+ payload: payload.clone(),
             };
             conn.send(MSG_APPEND, req.encode()).await;
             sent += 1;
@@ -368,7 +368,7 @@ async fn bench_mixed(
             for _ in 0..prefill {
                 let req = AppendReq {
                     extent_id, eversion: 1, commit, revision: 1,
-                    must_sync: false, payload: payload.clone(),
+ payload: payload.clone(),
                 };
                 conn.send(MSG_APPEND, req.encode()).await;
                 sent += 1;
@@ -383,7 +383,7 @@ async fn bench_mixed(
                 if sent < write_ops {
                     let req = AppendReq {
                         extent_id, eversion: 1, commit: resp.end, revision: 1,
-                        must_sync: false, payload: payload.clone(),
+ payload: payload.clone(),
                     };
                     conn.send(MSG_APPEND, req.encode()).await;
                     sent += 1;

@@ -261,7 +261,7 @@ fn run_scenario(
                                     part_id: target_part,
                                     key: key.as_bytes().to_vec(),
                                     value: value.clone(),
-                                    must_sync: false,
+
                                     expires_at: 0,
                                 };
                                 (MSG_PUT, rkyv_encode(&req))
@@ -378,7 +378,7 @@ fn warmup(cfg: &Config, target_part: u64, ps_addr: SocketAddr) {
                 part_id: target_part,
                 key: format!("psb_warmup_{i}").into_bytes(),
                 value: value.clone(),
-                must_sync: false,
+
                 expires_at: 0,
             };
             let _ = ps.call(MSG_PUT, rkyv_encode(&req)).await;
@@ -408,7 +408,7 @@ fn seed_read_keys(cfg: &Config, target_part: u64, ps_addr: SocketAddr, count: u6
                     part_id: target_part,
                     key: format!("psb_read_{sent}").into_bytes(),
                     value: value.clone(),
-                    must_sync: false,
+
                     expires_at: 0,
                 };
                 let bytes = rkyv_encode(&req);

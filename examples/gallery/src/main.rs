@@ -471,7 +471,7 @@ async fn transcode_video_task(name: String, client: Client, map: TranscodeMap) {
             hls_key(&name, &fname)
         };
         kv_bytes += bytes.len() as u64;
-        let put_res = client.lock().await.put(key.as_bytes(), &bytes, false).await;
+        let put_res = client.lock().await.put(key.as_bytes(), &bytes).await;
         if let Err(e) = put_res {
             tracing::warn!("write {key} failed: {e}");
             map.borrow_mut()
@@ -609,7 +609,7 @@ async fn put_handler_inner(
         };
         let bytes = data.len() as u64;
         let t0 = Instant::now();
-        let put_res = client.lock().await.put(filename.as_bytes(), &data, true).await;
+        let put_res = client.lock().await.put(filename.as_bytes(), &data).await;
         let dt = elapsed_ms(t0);
         if let Err(e) = put_res {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("put: {e}"));
@@ -1067,8 +1067,7 @@ async fn thumb_handler_inner(
             if let Err(e) = client
                 .lock()
                 .await
-                .put(key.as_bytes(), &thumb, false)
-                .await
+                .put(key.as_bytes(), &thumb).await
             {
                 tracing::warn!("cache thumbnail put failed for {name}: {e}");
             }

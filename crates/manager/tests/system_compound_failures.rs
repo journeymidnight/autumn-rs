@@ -40,7 +40,7 @@ fn split_then_ps_crash_data_survives() {
 
         for c in b'b'..=b'x' {
             let key = format!("{}-data", c as char);
-            ps_put(&ps1, 901, key.as_bytes(), key.as_bytes(), true).await;
+            ps_put(&ps1, 901, key.as_bytes(), key.as_bytes()).await;
         }
         ps_flush(&ps1, 901).await;
 
@@ -105,8 +105,8 @@ fn split_then_ps_crash_data_survives() {
         let left_new_key = format!("{}new", String::from_utf8_lossy(left_start));
         let right_new_key = format!("{}new", String::from_utf8_lossy(right_start));
 
-        psr_put(&router2, 901, left_new_key.as_bytes(), b"ok-left", true).await;
-        psr_put(&router2, right_rg.part_id, right_new_key.as_bytes(), b"ok-right", true).await;
+        psr_put(&router2, 901, left_new_key.as_bytes(), b"ok-left").await;
+        psr_put(&router2, right_rg.part_id, right_new_key.as_bytes(), b"ok-right").await;
 
         let resp = psr_get(&router2, 901, left_new_key.as_bytes()).await;
         assert_eq!(resp.value, b"ok-left");

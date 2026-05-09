@@ -373,7 +373,6 @@ pub(crate) struct ValidatedEntry {
     op: u8,
     value: Bytes,
     expires_at: u64,
-    must_sync: bool,
     /// F099-D: direct responder. On Phase 3 success we call `send_ok` which
     /// encodes the `PutResp` / `DeleteResp` frame bytes and forwards to the
     /// outer ps-conn oneshot — no inner oneshot hop.
@@ -433,15 +432,11 @@ pub(crate) async fn start_write_batch(
     let phase1_started_at = Instant::now();
 
     // Phase 1a: validate + assign seq + collect entries.
-    let (mut valid, batch_must_sync_caller_flag, log_stream_id, part_sc) = {
+    let (mut valid, log_stream_id, part_sc) = {
         let mut p = part.borrow_mut();
 
         let mut valid: Vec<ValidatedEntry> = Vec::with_capacity(batch.len());
-        let mut any_must_sync = false;
         for req in batch {
-            if req.must_sync {
-                any_must_sync = true;
-            }
             let (user_key, op, value, expires_at) = match req.op {
                 WriteOp::Put {
                     user_key,
@@ -465,7 +460,6 @@ pub(crate) async fn start_write_batch(
                 op,
                 value,
                 expires_at,
-                must_sync: req.must_sync,
                 resp: req.resp,
             });
         }
@@ -476,7 +470,7 @@ pub(crate) async fn start_write_batch(
 
         let log_stream_id = p.log_stream_id;
         let part_sc = p.stream_client.clone();
-        (valid, any_must_sync, log_stream_id, part_sc)
+        (valid, log_stream_id, part_sc)
     };
     // borrow_mut released here — safe to await below.
 
@@ -565,45 +559,28 @@ pub(crate) async fn start_write_batch(
         (segments, record_sizes)
     };
 
-    // F178 Phase 2 retires the F150 Phase B rotation-trigger barrier.
+    // F178: every append is durable. The F150 Phase B rotation-trigger
+    // barrier is gone (Phase 2), and the AppendReq.must_sync wire field
+    // is gone (Phase 3 follow-up). Durability is enforced at TWO points:
+    //   1. extent-node coalescer (Phase 1, event-driven group commit) —
+    //      every pwrite's bytes become durable in one fsync coalesced
+    //      with concurrent friends; the handler always awaits the
+    //      coalescer's wake.
+    //   2. flush-time `await_log_synced_to` in `flush_one_imm` — quorum
+    //      of replicas must have synced past `vp_offset` BEFORE the SST
+    //      upload, so every byte the imm's ValuePointers reference is
+    //      durable on a quorum before the SST that names them is
+    //      checkpointed.
     //
-    // F150 Phase B used to promote `must_sync=true` on the rotation-
-    // triggering batch so its `file.sync_data()` covered every prior
-    // `must_sync=false` byte still in page cache before the imm rotated.
-    // That made write p99 unfairly punitive for the unlucky writer that
-    // happened to push past `FLUSH_MEM_BYTES` (a fixed-cost per-rotation
-    // fsync — typically 1/s under sustained 70 MB/s — landed entirely on
-    // ONE writer's path even though the durability work is pure
-    // background overhead).
-    //
-    // After F178:
-    //   1. Phase 1 (extent_node coalescer) runs `sync_data` every
-    //      `AUTUMN_EXTENT_FSYNC_COALESCE_MS` (default 2 ms) covering ALL
-    //      pending appends since the last sync — both must_sync=true and
-    //      must_sync=false bytes (sync_data fsyncs the whole file).
-    //   2. Phase 2 (this change) drops the rotation barrier here, AND
-    //      adds an `await_log_synced_to(vp_extent_id, vp_offset)` in
-    //      `flush_one_imm` BEFORE the SST upload. That moves the
-    //      durability wait from the WRITE path (single unlucky writer
-    //      pays the rotation barrier) to the FLUSH path (background
-    //      task, latency-invisible to clients).
-    //
-    // Net: every Put pays exactly 1 coalesce window (1-5 ms) regardless
-    // of whether it triggers rotation. Flush adds ≈ 0 ms on the
-    // happy path (coalescer fires every 2 ms; flush builds SST in
-    // parallel) and at most one coalesce window on the worst case.
-    //
-    // The caller's explicit `must_sync` (e.g. wbench `--sync`) still
-    // promotes to `batch_must_sync=true` and waits via the per-extent
-    // coalescer's waiter list. After Phase 3 removes the wire flag, this
-    // collapses to "always sync" client-side too.
-    let batch_must_sync = batch_must_sync_caller_flag;
+    // Net: every Put pays exactly one fsync syscall (~1 ms tmpfs / 5-15
+    // ms NVMe). Flush adds ≈ 0 ms on the happy path (coalescer fires
+    // when first waiter arrives; flush builds SST in parallel).
     let phase1_ns = duration_to_ns(phase1_started_at.elapsed());
 
     // Launch Phase 2 as a future (not awaited yet).
     let phase2_started_at = Instant::now();
     let phase2_fut = Box::pin(async move {
-        part_sc.append_segments(log_stream_id, segments, batch_must_sync).await
+        part_sc.append_segments(log_stream_id, segments).await
     });
 
     Ok(Some(InFlightBatch {
@@ -871,7 +848,7 @@ async fn compact_row_append(
         // Fallback: P-bulk failed to spawn → flush also runs on P-log,
         // so single-writer invariant is preserved by accident.
         part_sc
-            .append_bytes(row_stream_id, sst_bytes, true)
+            .append_bytes(row_stream_id, sst_bytes)
             .await
             .map_err(Into::into)
     }
@@ -1407,7 +1384,6 @@ async fn flush_gc_batch(
     log_stream_id: u64,
     part_sc: &Rc<StreamClient>,
     batch: &mut GcWriteBatch,
-    must_sync: bool,
     rate_limiter: &mut GcRateLimiter,
     moved: &mut usize,
 ) -> Result<()> {
@@ -1420,7 +1396,7 @@ async fn flush_gc_batch(
     let n = pending.len();
 
     let result = part_sc
-        .append_segments(log_stream_id, segments, must_sync)
+        .append_segments(log_stream_id, segments)
         .await?;
 
     let mut cur_offset = result.offset;
@@ -1481,13 +1457,11 @@ pub(crate) async fn run_gc(
     // even when F105 is forced to materialise the full read).
     //
     // F141 batching: rewrites accumulate into `batch` and flush via
-    // `append_segments` (must_sync=false) when the batch hits its
-    // record/byte caps. The final flush at end-of-extent uses
-    // must_sync=true so durability is established before `punch_holes`
-    // removes the source extent. Pre-F141 each VP record was a separate
-    // `part_sc.append(..., must_sync=true)` — a 6-7 k ops/s, 6-7 k
-    // fsync/s storm that saturated the extent-node fanout and starved
-    // foreground put traffic for tens of seconds.
+    // `append_segments` when the batch hits its record/byte caps.
+    // F178 made every append durable via the per-extent coalescer
+    // (group commit), so the per-record fsync storm of pre-F141 is
+    // structurally impossible — multiple in-flight batch appends share
+    // one coalesced fsync per wake-cycle.
     let chunk_bytes = gc_read_chunk_bytes();
     let mut moved = 0usize;
     let mut cur: u32 = 0;
@@ -1553,17 +1527,15 @@ pub(crate) async fn run_gc(
         ));
     }
 
-    // Final flush: must_sync=true so that punch_holes only fires after
-    // the moved values are durably committed on a quorum of replicas.
-    // POSIX fsync semantics flush all pending bytes for the fd, so this
-    // single sync covers every prior must_sync=false batch on the same
-    // log_stream tail extent.
+    // Final flush: F178 makes every append durable via the per-extent
+    // coalescer, so by the time `flush_gc_batch` returns, the moved
+    // values are durable on a quorum of replicas. punch_holes is safe
+    // to fire after this.
     flush_gc_batch(
         part,
         log_stream_id,
         &part_sc,
         &mut batch,
-        true,
         &mut rate_limiter,
         &mut moved,
     )
@@ -1732,7 +1704,6 @@ async fn process_gc_chunk(
                 log_stream_id,
                 part_sc,
                 batch,
-                false,
                 rate_limiter,
                 moved,
             )

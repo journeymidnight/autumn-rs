@@ -247,17 +247,20 @@ Append(AppendReq via autumn-rpc binary frame):
          next 1-5 ms tick anyway". Gives LevelDB-style "always durable"
          semantics without paying syscall cost per write.
        - F178: if must_sync, register_sync_waiter(extent, end) → await
-         oneshot. The lazily-spawned coalescer task issues ONE
-         file.sync_data() per AUTUMN_EXTENT_FSYNC_COALESCE_MS window
-         (default 2 ms) covering ALL pending bytes; every waiter whose
-         end_offset is now ≤ last_synced wakes together. fsync rate is
-         decoupled from pwrite throughput — 200-1000 fsyncs/sec is enough
-         to drain any reasonable batch volume; pwrites pipeline freely
-         between fsyncs.
-       - Coalescer task lifecycle: spawn on first register_sync_waiter,
-         exit when waiters.is_empty() AND pending == last_synced. The
-         exit decision sits under the same RefCell borrow_mut new
-         waiters take, so the registration-vs-exit race is closed.
+         oneshot. The coalescer task is event-driven (RocksDB group-
+         commit style): the first waiter at an idle extent triggers
+         `file.sync_data()` immediately; any pwrite that completes
+         before the syscall returns rides along. Subsequent waiters
+         that miss this group get a fresh wake → fresh fsync. No
+         timer involved.
+       - Lazy spawn / clean exit: the first register_sync_waiter
+         creates an `mpsc::Unbounded<()>` wake channel and spawns the
+         loop; subsequent registers push `()` onto the channel.
+         The loop parks on `wake_rx.next()` between fsyncs; on
+         "no work AND no waiters" it sets `wake_tx = None` and
+         returns. A future register sees None and spawns a fresh
+         task. Compio's single-threaded scheduling makes this race-
+         free without locks.
        - Pre-F178: `if must_sync: file.sync_all()` ran inline on the
          compio runtime — every must_sync=true append paid one fsync;
          under sustained 4K writes that capped at the syscall rate
@@ -274,7 +277,7 @@ Step 5 (commit-based truncation) is the key to consistency: it effectively repla
 
 ### Commit Protocol Explained
 
-The `StreamClient` computes `commit = min(commit_length on all replicas)` before each append. Any replica that got ahead (e.g., partially acknowledged data before a crash) is truncated back to the consensus point on the next append. Per-node durability comes from the F178 Phase 1 fsync coalescer — every append's bytes are guaranteed durable within `AUTUMN_EXTENT_FSYNC_COALESCE_MS` (default 2 ms) whether or not `must_sync` was set on the request. After F150 Phase A- there is no separate WAL file.
+The `StreamClient` computes `commit = min(commit_length on all replicas)` before each append. Any replica that got ahead (e.g., partially acknowledged data before a crash) is truncated back to the consensus point on the next append. Per-node durability comes from the F178 Phase 1 fsync coalescer — the first must_sync waiter at an idle extent triggers `sync_data` immediately (event-driven, RocksDB group-commit style); subsequent appends that complete before the syscall returns are durable on the same syscall. After F150 Phase A- there is no separate WAL file.
 
 **F178 Phase 2 — flush-time durability barrier (replaces F150 Phase B's rotation barrier).** Pre-F178 the partition layer's `start_write_batch` promoted `must_sync=true` on the rotation-triggering batch, putting the entire memtable's worth of fsync cost on one unlucky writer. Post-F178 every Put pays exactly one coalesce window (1-5 ms) regardless of rotation; the durability wait moves to `flush_one_imm` via `MSG_SYNCED_LENGTH`. The flush calls `await_log_synced_to(vp_extent_id, vp_offset)` BEFORE uploading the SST — quorum-min of replicas must report `last_synced >= vp_offset`. On the happy path this waits ≈ 0 because the coalescer fires every 2 ms and flush builds the SST in parallel; on the worst case it waits one coalesce window. Flush is background, so this is invisible to clients.
 
@@ -575,13 +578,14 @@ sufficient (and cheaper than DashMap).
 
 3. **Parallel 3-replica fanout (F099-B)** — `launch_append` fires the 3 per-replica `pool.send_vectored` futures concurrently via `futures::future::join_all`. Each per-replica future awaits its own RpcClient submit channel independently, so one slow/back-pressured replica doesn't serialise the others. Per-replica TCP byte order is still preserved because each RpcClient runs a single-writer `writer_task` (R4 step 4.1) — the fanout order across replicas is irrelevant because every replica is independent. The `AppendResp.offset/end` consistency check in `apply_completion` still enforces that all replicas agree on the file-level offset.
 
-4. **`must_sync` cost (post-F178)** — every append's bytes become durable
-   within `AUTUMN_EXTENT_FSYNC_COALESCE_MS` (default 2 ms) regardless of
-   the request's `must_sync` flag. The flag now controls only whether the
-   caller WAITS for durability:
+4. **`must_sync` cost (post-F178)** — the per-extent fsync coalescer is
+   event-driven (RocksDB group-commit style). The flag controls whether
+   the caller WAITS for durability:
    - `must_sync=true`: register a `(end_offset, oneshot)` waiter on the
      coalescer; await the receiver. Resolves Ok when the next coalesced
-     `sync_data` covers `end_offset`. Typical wait 1-5 ms.
+     `sync_data` covers `end_offset`. The first waiter at an idle extent
+     triggers `sync_data` immediately (no timer floor). Typical wait =
+     one fsync syscall (~1 ms tmpfs / 5-15 ms NVMe).
    - `must_sync=false`: advance `pending_fsync` and return immediately.
      The coalescer still picks up these bytes on its next tick and they
      become durable; the caller just doesn't wait.

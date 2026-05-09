@@ -200,7 +200,7 @@ fn concurrent_append_preserves_order_within_stream() {
                 let payload = vec![b'a' + (i as u8 % 26); PAYLOAD];
                 compio::runtime::spawn(async move {
                     client
-                        .append(stream_id, &payload, false)
+                        .append(stream_id, &payload)
                         .await
                         .expect("append")
                 })
@@ -283,7 +283,7 @@ fn worker_handles_back_pressure() {
                 let payload = vec![b'z'; PAYLOAD];
                 compio::runtime::spawn(async move {
                     client
-                        .append(stream_id, &payload, false)
+                        .append(stream_id, &payload)
                         .await
                         .expect("append")
                 })
@@ -346,7 +346,7 @@ fn cq_advances_commit_on_out_of_order_completion() {
             .map(|_| {
                 let client = client.clone();
                 let payload = vec![b'q'; PAYLOAD];
-                async move { client.append(stream_id, &payload, false).await }
+                async move { client.append(stream_id, &payload).await }
             })
             .collect();
         let results = join_all(futs).await;
@@ -393,14 +393,14 @@ fn sq_continues_submitting_while_cq_drains() {
         // Warm-up: ensure tail is initialised and connections are open
         // before we start the timer.
         for _ in 0..16 {
-            client.append(stream_id, &payload, false).await.expect("warmup");
+            client.append(stream_id, &payload).await.expect("warmup");
         }
 
         // Sequential baseline: await each append fully before starting the
         // next one.
         let t_seq = Instant::now();
         for _ in 0..N {
-            client.append(stream_id, &payload, false).await.expect("seq");
+            client.append(stream_id, &payload).await.expect("seq");
         }
         let seq_elapsed = t_seq.elapsed();
 
@@ -411,7 +411,7 @@ fn sq_continues_submitting_while_cq_drains() {
                 let client = client.clone();
                 let p = payload.clone();
                 compio::runtime::spawn(async move {
-                    client.append(stream_id, &p, false).await.expect("par")
+                    client.append(stream_id, &p).await.expect("par")
                 })
             })
             .collect();
@@ -489,7 +489,7 @@ fn parallel_fanout_fires_3_replicas_concurrently() {
                 let payload = vec![b'a' + (i as u8 % 26); PAYLOAD];
                 compio::runtime::spawn(async move {
                     client
-                        .append(stream_id, &payload, false)
+                        .append(stream_id, &payload)
                         .await
                         .expect("append")
                 })
@@ -539,7 +539,7 @@ fn parallel_fanout_fires_3_replicas_concurrently() {
         let t = Instant::now();
         for _ in 0..64 {
             client
-                .append(stream_id, &vec![b'p'; PAYLOAD], false)
+                .append(stream_id, &vec![b'p'; PAYLOAD])
                 .await
                 .expect("post append");
         }

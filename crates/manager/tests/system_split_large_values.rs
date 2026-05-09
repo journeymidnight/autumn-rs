@@ -44,7 +44,7 @@ fn split_with_large_values_preserves_vp_resolution() {
         let keys_right: Vec<String> = (0..5).map(|i| format!("r-big-{i:02}")).collect();
 
         for key in keys_left.iter().chain(keys_right.iter()) {
-            ps_put(&ps, 901, key.as_bytes(), &large_value, false).await;
+            ps_put(&ps, 901, key.as_bytes(), &large_value).await;
         }
 
         // Flush to persist SSTables with ValuePointers

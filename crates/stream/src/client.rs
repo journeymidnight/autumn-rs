@@ -304,9 +304,14 @@ fn ec_slice_decoded(full_payload: Vec<u8>, offset: u32, length: u32) -> Result<V
 enum StreamSubmitMsg {
     /// Append payload segments; worker leases offsets, fans out to 3
     /// replicas, and acks on completion.
+    ///
+    /// F178: no `must_sync` field. Every append is durable via the
+    /// extent-node's per-extent fsync coalescer. Pre-F178 this carried
+    /// a `must_sync: bool` that the extent-node honoured to skip the
+    /// fsync wait; that wire field was removed when --nosync was
+    /// dropped.
     Append {
         payload_parts: Vec<Bytes>,
-        must_sync: bool,
         revision: i64,
         ack_tx: oneshot::Sender<Result<AppendResult>>,
     },
@@ -392,7 +397,6 @@ async fn stream_worker_loop(
                 }
                 Some(StreamSubmitMsg::Append {
                     payload_parts,
-                    must_sync,
                     revision,
                     ack_tx,
                 }) => {
@@ -401,7 +405,6 @@ async fn stream_worker_loop(
                         &pool,
                         &mut inflight,
                         payload_parts,
-                        must_sync,
                         revision,
                         ack_tx,
                     )
@@ -448,7 +451,6 @@ async fn stream_worker_loop(
                 }
                 Some(StreamSubmitMsg::Append {
                     payload_parts,
-                    must_sync,
                     revision,
                     ack_tx,
                 }) => {
@@ -457,7 +459,6 @@ async fn stream_worker_loop(
                         &pool,
                         &mut inflight,
                         payload_parts,
-                        must_sync,
                         revision,
                         ack_tx,
                     )
@@ -574,7 +575,6 @@ async fn launch_append(
     pool: &Rc<ConnPool>,
     inflight: &mut FuturesUnordered<InflightFut>,
     payload_parts: Vec<Bytes>,
-    must_sync: bool,
     revision: i64,
     ack_tx: oneshot::Sender<Result<AppendResult>>,
 ) {
@@ -605,7 +605,6 @@ async fn launch_append(
         tail.extent.eversion,
         header_commit,
         revision,
-        must_sync,
     );
 
     // Fire send_vectored to each replica IN PARALLEL (F099-B). Each
@@ -1084,10 +1083,8 @@ impl StreamClient {
         &self,
         stream_id: u64,
         payload: Bytes,
-        must_sync: bool,
     ) -> Result<AppendResult> {
-        self.append_payload_segments(stream_id, vec![payload], must_sync)
-            .await
+        self.append_payload_segments(stream_id, vec![payload]).await
     }
 
     /// R4 4.3 public-API retry loop.  The worker is a stateful single-op
@@ -1111,7 +1108,6 @@ impl StreamClient {
         &self,
         stream_id: u64,
         segments: Vec<Bytes>,
-        must_sync: bool,
     ) -> Result<AppendResult> {
         let payload_len_u32: u32 = segments.iter().map(|s| s.len() as u32).sum();
         let payload_len: usize = payload_len_u32 as usize;
@@ -1133,7 +1129,6 @@ impl StreamClient {
             let (ack_tx, ack_rx) = oneshot::channel();
             let msg = StreamSubmitMsg::Append {
                 payload_parts: segments.clone(),
-                must_sync,
                 revision: self.revision,
                 ack_tx,
             };
@@ -1391,7 +1386,6 @@ impl StreamClient {
         stream_id: u64,
         block: &[u8],
         count: usize,
-        must_sync: bool,
     ) -> Result<AppendResult> {
         if count == 0 {
             return Err(anyhow!("append_batch_repeated requires count > 0"));
@@ -1404,15 +1398,13 @@ impl StreamClient {
         for _ in 0..count {
             payload.extend_from_slice(block);
         }
-        self.append_payload(stream_id, payload.freeze(), must_sync)
-            .await
+        self.append_payload(stream_id, payload.freeze()).await
     }
 
     pub async fn append_batch(
         &self,
         stream_id: u64,
         blocks: &[&[u8]],
-        must_sync: bool,
     ) -> Result<AppendResult> {
         if blocks.is_empty() {
             return Err(anyhow!("append_batch requires at least one block"));
@@ -1425,8 +1417,7 @@ impl StreamClient {
         for b in blocks {
             payload.extend_from_slice(b);
         }
-        self.append_payload(stream_id, payload.freeze(), must_sync)
-            .await
+        self.append_payload(stream_id, payload.freeze()).await
     }
 
     /// Append a pre-built Bytes payload directly (avoids an extra copy).
@@ -1434,9 +1425,8 @@ impl StreamClient {
         &self,
         stream_id: u64,
         payload: Bytes,
-        must_sync: bool,
     ) -> Result<AppendResult> {
-        self.append_payload(stream_id, payload, must_sync).await
+        self.append_payload(stream_id, payload).await
     }
 
     /// Append multiple Bytes segments without copying them into a single buffer.
@@ -1444,19 +1434,16 @@ impl StreamClient {
         &self,
         stream_id: u64,
         segments: Vec<Bytes>,
-        must_sync: bool,
     ) -> Result<AppendResult> {
-        self.append_payload_segments(stream_id, segments, must_sync)
-            .await
+        self.append_payload_segments(stream_id, segments).await
     }
 
     pub async fn append(
         &self,
         stream_id: u64,
         payload: &[u8],
-        must_sync: bool,
     ) -> Result<AppendResult> {
-        self.append_payload(stream_id, Bytes::copy_from_slice(payload), must_sync)
+        self.append_payload(stream_id, Bytes::copy_from_slice(payload))
             .await
     }
 

@@ -39,8 +39,7 @@ fn split_compact_split_preserves_all_data() {
             ps_put(
                 &ps, 901,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes(),
-                true,
+                format!("val-{i}").as_bytes()
             ).await;
         }
         ps_flush(&ps, 901).await;
@@ -159,8 +158,8 @@ fn split_chain_with_writes_between_splits() {
         for i in 0u32..10 {
             let lk = format!("{left_start}new-{i:02}");
             let rk = format!("{right_start}new-{i:02}");
-            ps_put(&ps, 902, lk.as_bytes(), lk.as_bytes(), true).await;
-            psr_put(&router, right1_id, rk.as_bytes(), rk.as_bytes(), true).await;
+            ps_put(&ps, 902, lk.as_bytes(), lk.as_bytes()).await;
+            psr_put(&router, right1_id, rk.as_bytes(), rk.as_bytes()).await;
         }
         ps_flush(&ps, 902).await;
         psr_flush(&router, right1_id).await;

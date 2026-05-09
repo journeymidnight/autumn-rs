@@ -202,7 +202,6 @@ pub async fn ps_put(
     part_id: u64,
     key: &[u8],
     value: &[u8],
-    must_sync: bool,
 ) {
     let resp = ps
         .call(
@@ -211,7 +210,6 @@ pub async fn ps_put(
                 part_id,
                 key: key.to_vec(),
                 value: value.to_vec(),
-                must_sync,
                 expires_at: 0,
             }),
         )
@@ -408,10 +406,9 @@ pub async fn psr_put(
     part_id: u64,
     key: &[u8],
     value: &[u8],
-    must_sync: bool,
 ) {
     let c = router.client_for(part_id).await;
-    ps_put(&c, part_id, key, value, must_sync).await;
+    ps_put(&c, part_id, key, value).await;
 }
 
 /// Routed `ps_get` — F099-K aware.
@@ -475,7 +472,7 @@ pub async fn write_sequential_keys(
     for i in 0..count {
         let key = format!("{prefix}-{i:03}");
         let val = format!("val-{prefix}-{i:03}");
-        ps_put(ps, part_id, key.as_bytes(), val.as_bytes(), true).await;
+        ps_put(ps, part_id, key.as_bytes(), val.as_bytes()).await;
         keys.push(key);
     }
     keys

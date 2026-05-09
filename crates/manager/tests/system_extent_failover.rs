@@ -56,7 +56,7 @@ fn extent_node_unreachable_stream_client_retries_on_new_extent() {
         // Write some data successfully
         for i in 0..3 {
             let payload = format!("before-crash-{i}").into_bytes();
-            sc.append(stream_id, &payload, false)
+            sc.append(stream_id, &payload)
                 .await
                 .expect("pre-crash append should succeed");
         }
@@ -91,7 +91,7 @@ fn extent_node_unreachable_stream_client_retries_on_new_extent() {
         // because StreamClient retries with backoff and potentially allocates new extent.
         for i in 0..5 {
             let payload = format!("after-test-{i}").into_bytes();
-            sc.append(stream_id, &payload, false)
+            sc.append(stream_id, &payload)
                 .await
                 .expect("continued appends should succeed");
         }
@@ -147,7 +147,7 @@ fn alloc_extent_falls_back_on_dead_node() {
         // Appends should work
         for i in 0..5 {
             let payload = format!("data-{i}").into_bytes();
-            sc.append(stream_id, &payload, false)
+            sc.append(stream_id, &payload)
                 .await
                 .expect("append should succeed with fallback nodes");
         }

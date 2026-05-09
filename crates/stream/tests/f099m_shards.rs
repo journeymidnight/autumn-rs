@@ -325,7 +325,6 @@ fn f099m_client_routes_by_extent_id_modulo() {
             eversion: 1,
             commit: 0,
             revision: 1,
-            must_sync: false,
             payload: Bytes::from_static(b"hello-f099m-even"),
         };
         let r = pool
@@ -360,7 +359,6 @@ fn f099m_client_routes_by_extent_id_modulo() {
             eversion: 1,
             commit: 0,
             revision: 1,
-            must_sync: false,
             payload: Bytes::from_static(b"odd-f099m-world"),
         };
         let r = pool
@@ -420,7 +418,6 @@ fn f099m_recovery_per_shard() {
                 eversion: 1,
                 commit: 0,
                 revision: 1,
-                must_sync: false,
                 payload: Bytes::from(payload),
             };
             let r = pool

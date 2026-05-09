@@ -85,7 +85,7 @@ fn f109_punched_extents_are_physically_unlinked() {
         // extent = 8 extents in the stream.
         let payload: Vec<u8> = vec![0xab; 1500];
         for _ in 0..7 {
-            sc.append(stream_id, &payload, false).await.expect("append");
+            sc.append(stream_id, &payload).await.expect("append");
         }
 
         // Read the stream layout from manager. Capture the extent_ids
