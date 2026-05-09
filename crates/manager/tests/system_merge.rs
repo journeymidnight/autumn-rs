@@ -520,6 +520,98 @@ fn merge_then_split_again_round_trip() {
     });
 }
 
+/// F184 auto-trigger smoke: register an in-process AutumnManager so the
+/// test can call `force_auto_merge` directly. Verifies that
+/// `auto_dispatch_merge` orchestrates FLUSH+lock+commit_length+merge
+/// end-to-end via the manager's own internal RPC handlers.
+///
+/// Note: this differs from `merge_split_round_trip_keys_intact` because
+/// it goes through the auto-trigger code path (`force_auto_merge`)
+/// rather than the test's hand-rolled `merge_partitions` helper. They
+/// both ultimately call `MSG_MULTI_MODIFY_MERGE` but the auto path
+/// also exercises the FLUSH-via-conn_pool + admin-owner-lock-acquire +
+/// per-stream commit_length capture inside `auto_dispatch_merge`.
+#[test]
+#[ignore]
+fn auto_dispatch_merge_orchestrates_full_flow() {
+    use autumn_manager::AutumnManager;
+
+    let mgr_addr = pick_addr();
+    // AutumnManager is Rc-based (!Send), so the manager handle must live
+    // entirely on one thread. We spawn `serve` on the test's compio
+    // runtime and keep a clone of the manager handle in the test's task.
+
+    let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
+    let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let manager = AutumnManager::new();
+        // Clone for the spawned serve task (Rc-clone, shares state).
+        let mgr_for_serve = manager.clone();
+        compio::runtime::spawn(async move {
+            let _ = mgr_for_serve.serve(mgr_addr).await;
+        }).detach();
+        compio::time::sleep(Duration::from_millis(200)).await;
+        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 95).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 6001, log, row, meta, b"a", b"z").await;
+
+        let ps_addr = pick_addr();
+        start_partition_server(95, mgr_addr, ps_addr);
+        // Give the PS a moment to register + open partition.
+        compio::time::sleep(Duration::from_millis(2000)).await;
+        let _ps = RpcClient::connect(ps_addr).await.expect("connect ps");
+        let router = PsRouter::new(mgr_addr, ps_addr);
+
+        for i in 0u8..6 {
+            psr_put(&router, 6001, format!("k-{:02}", i).as_bytes(), b"v").await;
+        }
+        psr_flush(&router, 6001).await;
+        psr_compact(&router, 6001).await;
+        compio::time::sleep(Duration::from_millis(2000)).await;
+
+        // Split into two children.
+        router.client_for(6001).await
+            .call(
+                partition_rpc::MSG_SPLIT_PART,
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 6001 }),
+            )
+            .await.expect("split");
+        let _ = poll_until_async(
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+            || async {
+                let r = get_regions(&mgr).await;
+                r.regions.len() == 2 && r.part_addrs.len() == 2
+            },
+        ).await;
+
+        let regions = get_regions(&mgr).await;
+        let mut s = 0u64; let mut v = 0u64;
+        for (pid, r) in &regions.regions {
+            if let Some(rg) = &r.rg {
+                if rg.start_key == b"a".to_vec() { s = *pid; } else { v = *pid; }
+            }
+        }
+        psr_compact(&router, s).await;
+        psr_compact(&router, v).await;
+        compio::time::sleep(Duration::from_millis(3000)).await;
+
+        // ── KEY DIFFERENCE: drive the merge via force_auto_merge ──
+        // This exercises auto_dispatch_merge's full flow.
+        manager.force_auto_merge(s, v).await
+            .expect("force_auto_merge must succeed");
+
+        compio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(get_regions(&mgr).await.regions.len(), 1, "merge must complete");
+    });
+}
+
 #[allow(dead_code)]
 fn _suppress_unused() {
     let _ = Bytes::new();

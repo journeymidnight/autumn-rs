@@ -365,6 +365,42 @@ impl AutumnManager {
         self.auto_merge_enabled.set(enabled);
     }
 
+    /// F184 test helper: dispatch a SPLIT against `part_id` as if the
+    /// policy engine had picked it. Snapshots state internally.
+    pub async fn force_auto_split(&self, part_id: u64) -> Result<()> {
+        let state = (*self.store.inner.borrow()).clone();
+        let cand = autumn_rpc::manager_rpc::PolicyCandidate {
+            kind: autumn_rpc::manager_rpc::POLICY_KIND_SPLIT,
+            primary_part_id: part_id,
+            secondary_part_id: 0,
+            reason: "test forced split".to_string(),
+            size_bytes: 0,
+            req_per_sec: 0,
+            imm_full_per_sec: 0,
+            same_ps: true,
+            last_op_at: 0,
+        };
+        self.auto_dispatch_split(&cand, &state).await
+    }
+
+    /// F184 test helper: orchestrate a MERGE for (survivor, victim) as
+    /// if the policy engine had picked it. Snapshots state internally.
+    pub async fn force_auto_merge(&self, survivor: u64, victim: u64) -> Result<()> {
+        let state = (*self.store.inner.borrow()).clone();
+        let cand = autumn_rpc::manager_rpc::PolicyCandidate {
+            kind: autumn_rpc::manager_rpc::POLICY_KIND_MERGE,
+            primary_part_id: survivor,
+            secondary_part_id: victim,
+            reason: "test forced merge".to_string(),
+            size_bytes: 0,
+            req_per_sec: 0,
+            imm_full_per_sec: 0,
+            same_ps: true,
+            last_op_at: 0,
+        };
+        self.auto_dispatch_merge(&cand, &state).await
+    }
+
     pub async fn new_with_etcd(endpoints: Vec<String>) -> Result<Self> {
         let mut s = Self::new();
         s.leader.set(false);
@@ -535,7 +571,7 @@ impl AutumnManager {
     /// F184: auto-dispatch SPLIT to the owning PS for a SPLIT candidate.
     /// The PS handler (`handle_split_part`) already implements the full
     /// F140 dual-gate + F103 auth-rg flow; we just send the RPC.
-    async fn auto_dispatch_split(
+    pub async fn auto_dispatch_split(
         &self,
         cand: &PolicyCandidate,
         state: &autumn_common::MetadataState,
@@ -579,7 +615,7 @@ impl AutumnManager {
     /// Mirrors the CLI orchestration (FLUSH both → admin owner-lock →
     /// commit_lengths → multi_modify_merge). PS-side state catches up
     /// via region_sync_loop within ~2 s.
-    async fn auto_dispatch_merge(
+    pub async fn auto_dispatch_merge(
         &self,
         cand: &PolicyCandidate,
         state: &autumn_common::MetadataState,
