@@ -48,13 +48,17 @@
 //! The atomic-index ring traversal logic will land in F180-B/C alongside
 //! the daemon poller and client submit primitives.
 
-#![forbid(unsafe_code)]
+// `ring.rs` uses `unsafe` to materialise `&AtomicU64` views over a
+// shared byte slice (mmap-backed in production). All other modules
+// remain pure-data; the unsafe surface is small and centralised.
+#![allow(unsafe_code)]
 
 pub mod opcode;
 pub mod sqe;
 pub mod cqe;
 pub mod header;
 pub mod buffer_pool;
+pub mod ring;
 
 pub use opcode::Opcode;
 pub use sqe::{Sqe, SqeDecodeError};
@@ -65,6 +69,9 @@ pub use header::{
     DEFAULT_BUF_SLOT_SIZE,
 };
 pub use buffer_pool::{BufferPoolLayout, BufferPoolError};
+pub use ring::{
+    SqProducer, SqConsumer, CqProducer, CqConsumer, allocate_test_region,
+};
 
 /// All decode errors produced by this crate share this surface so a
 /// daemon poll loop can match on a single error type.
