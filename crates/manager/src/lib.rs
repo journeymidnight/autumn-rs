@@ -1,5 +1,7 @@
 mod extent_delete;
 pub(crate) mod policy;
+#[cfg(test)]
+mod policy_tests;
 mod recovery;
 mod rpc_handlers;
 
