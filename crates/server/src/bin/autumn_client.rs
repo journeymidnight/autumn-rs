@@ -142,6 +142,15 @@ enum Command {
     Split {
         part_id: u64,
     },
+    /// F181: merge two adjacent partitions on the same PS.
+    /// Survivor keeps its part_id; victim is deleted.
+    Merge {
+        survivor_part_id: u64,
+        victim_part_id: u64,
+    },
+    /// F181: show advisory split/merge candidates from the manager's
+    /// policy engine.
+    PolicyCandidates,
     Compact {
         part_id: u64,
     },
@@ -489,6 +498,17 @@ fn parse_args() -> Args {
                 part_id: raw[i].parse().expect("PARTID must be a number"),
             }
         }
+        "merge" => {
+            if i + 1 >= raw.len() {
+                eprintln!("merge requires <SURVIVOR_PART_ID> <VICTIM_PART_ID>");
+                std::process::exit(1);
+            }
+            Command::Merge {
+                survivor_part_id: raw[i].parse().expect("SURVIVOR_PART_ID must be a number"),
+                victim_part_id: raw[i + 1].parse().expect("VICTIM_PART_ID must be a number"),
+            }
+        }
+        "policy-candidates" | "policy_candidates" | "policy" => Command::PolicyCandidates,
         "compact" => {
             if i >= raw.len() {
                 eprintln!("compact requires <PARTID>");
@@ -1492,6 +1512,54 @@ async fn main() -> Result<()> {
             client.split(part_id).await
                 .map_err(|e| anyhow!("split: {e}"))?;
             println!("split ok");
+        }
+
+        Command::Merge { survivor_part_id, victim_part_id } => {
+            eprintln!(
+                "F181: stop writes to partitions {survivor_part_id} and {victim_part_id} \
+                 before continuing. The CLI will FLUSH both, then issue the manager merge. \
+                 The survivor's PS picks up the wider range on the next region_sync (~2 s)."
+            );
+            client.merge_partitions(survivor_part_id, victim_part_id).await
+                .map_err(|e| anyhow!("merge: {e}"))?;
+            println!("merge ok: partition {victim_part_id} merged into {survivor_part_id}");
+        }
+
+        Command::PolicyCandidates => {
+            let cands = client.policy_candidates().await
+                .map_err(|e| anyhow!("policy_candidates: {e}"))?;
+            if cands.is_empty() {
+                println!("(no candidates)");
+            } else {
+                println!(
+                    "{:<6} {:<10} {:<10} {:<46} {:<10} {:<8} {:<6} {:<5}",
+                    "KIND", "PRIMARY", "SECONDARY", "REASON", "SIZE", "QPS", "IMM/s", "FEAS"
+                );
+                for c in cands {
+                    let kind = if c.kind == autumn_rpc::manager_rpc::POLICY_KIND_SPLIT {
+                        "split"
+                    } else {
+                        "merge"
+                    };
+                    let feas = if c.same_ps { "yes" } else { "no" };
+                    let secondary = if c.secondary_part_id == 0 {
+                        "-".to_string()
+                    } else {
+                        c.secondary_part_id.to_string()
+                    };
+                    println!(
+                        "{:<6} {:<10} {:<10} {:<46} {:<10} {:<8} {:<6} {:<5}",
+                        kind,
+                        c.primary_part_id,
+                        secondary,
+                        c.reason,
+                        format!("{} MB", c.size_bytes / (1024 * 1024)),
+                        c.req_per_sec,
+                        c.imm_full_per_sec,
+                        feas,
+                    );
+                }
+            }
         }
 
         Command::Compact { part_id } => {
