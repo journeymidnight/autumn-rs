@@ -1,73 +1,69 @@
 Date: 2026-05-09
-TaskStatus: completed
-Task scope: F180-B6 — multi-runtime autumn-ioring daemon + cached PS RpcClient
-            at OPEN. Pushes single-key 4 K read aggregate from B5's 137 k
-            (single compio runtime CPU bound) past the 200 k gate.
-            Phase: B6 (follow-on to B5 within the F180 series).
+TaskStatus: not_completed
+Task scope: F129 — PutStream / GetStream multipart upload.
+            Phase A: wire types + multi-frag VP encoding (this commit).
+            Phase B: PS server side (handlers + UploadSession state).
+            Phase C: read side (resolve_value handles multi-frag VP).
+            Phase D: client API (put_stream, get_stream) + Put size check.
+            Phase E: recovery + GC awareness of OP_CHUNK_BLOB.
+            Phase F: autumn-fuse perf evaluation under PutStream.
 
-F180-B6 — what + why:
+Design clarification from user (2026-05-09):
+  - No `put_auto` / `get_auto` auto-routing. Caller explicitly picks
+    `Put` (with size check; rejects > AUTUMN_PS_MAX_INLINE_BYTES with
+    CODE_VALUE_TOO_LARGE) or `PutStream` (Begin/Chunk/Commit/Abort).
+  - Server holds the fragment list (not client) — simpler API, < 4 KB
+    per session, supports F132 resume cleanly when that's eventually
+    built.
+  - F134 (frame-level early reject) is deferred — separate perf
+    hardening item, not part of this F129 series.
 
-  Why:
-    F180-B5 (commit 55d254f) lifted per-session ceiling from 44 k → 150 k
-    by spawning a compio task per SQE. But aggregate plateaued at ~137 k
-    on 16-thread × d=8 because the daemon's single compio runtime
-    saturates one core handling all SQE/CQE traffic + all RPC dispatch.
-    Pushing past the 200 k validation gate required either multi-core
-    daemon or substantial per-call overhead reduction.
+F129 Phase A — what landed in this commit:
 
-  What — multi-runtime daemon:
-    `autumn-ioring-daemon --runtimes N` spawns N OS threads, each with
-    its own compio runtime, own ClusterClient, and own UnixListener at
-    `{socket}.{idx}` (`.0`, `.1`, …). Sessions are pinned to whichever
-    runtime accepted them — no cross-thread state. Backward-compat:
-    N=1 keeps the legacy single-socket behaviour (same path as before).
-    Bench gains a matching `--runtimes N` flag; worker tid picks
-    `socket.{tid % N}`.
+  Wire (crates/rpc/src/partition_rpc.rs):
+    - 4 new msg_type constants: MSG_PUT_BEGIN=0x49, MSG_PUT_CHUNK=0x4A,
+      MSG_PUT_COMMIT=0x4B, MSG_PUT_ABORT=0x4C.
+    - 2 new status codes: CODE_VALUE_TOO_LARGE=5,
+      CODE_UPLOAD_NOT_FOUND=6.
+    - 4 new request types + 3 new response types: PutBeginReq/Resp,
+      PutChunkReq/Resp, PutCommitReq (response = PutResp),
+      PutAbortReq/Resp. upload_id = u128 (16 bytes, rkyv-friendly).
+    - extract_part_id() routes the new msg_types.
 
-  What — cached PS client at OPEN:
-    Per ring_fd state is now `OpenedFile { key, part_id, ps:
-    Rc<RpcClient> }`. At OPEN we do `cluster.head` (existence) +
-    `cluster.resolve_key` + `cluster.get_ps_client` once and cache the
-    Rc. At READ we skip `ClusterClient::get_range` entirely — build
-    `GetReq{ part_id, key, offset:0, length:0 }` inline and call the
-    cached PS directly. Saves several RefCell borrows + 2 hashmap
-    lookups + the `call_ps_for_key` retry-closure shell per READ.
+  Multi-frag VP (crates/partition-server/src/lib.rs):
+    - 2 new op flags: OP_VALUE_POINTER_MULTI=0x40, OP_CHUNK_BLOB=0x10.
+      Bit-distinct from OP_VALUE_POINTER=0x80 and from user op bits
+      (1=put, 2=delete).
+    - 4 new constants: AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT (64 MiB),
+      _HARD (256 MiB), AUTUMN_PS_MAX_UPLOAD_SESSIONS_DEFAULT (1024),
+      AUTUMN_PS_UPLOAD_TTL_SECS_DEFAULT (1800s).
+    - MultiFragVp struct + encode/decode (LE binary):
+      `[n_frags:u32][total_len:u64][(extent_id:u64,offset:u32,len:u32) × N]`.
 
-  Subtle issue (caught + fixed mid-iteration):
-    Initial B6 sent `GetReq.length: sqe.length` (= 4096 for the bench),
-    expecting PS to return only the requested slice. PS's
-    `resolve_value` then took the `offset!=0 || length!=0` branch which
-    does `to_vec()` TWICE (raw_value.to_vec() + v[start..end].to_vec()).
-    At 100 k+ ops/s the extra 4 K memcpy on the PS path cost ~25 %
-    throughput. Fix: send `length: 0` ("whole value", PS hits the
-    one-copy fast path), slice in the daemon. PS-side handler is
-    unchanged.
+  Tests:
+    - 5 new rkyv round-trip tests in partition_rpc::f129_wire_tests
+      (PutBegin, PutChunk, PutCommit/Abort, extract_part_id routing,
+      msg_type collision check). All pass.
+    - 6 new MultiFragVp tests in f129_multifrag_tests (zero-frag,
+      three-frag roundtrip, short-header reject, short-payload reject,
+      total_len mismatch reject, op-flag distinctness). All pass.
 
-  Results (3-replica TCP cluster, 1 partition, hot single key, 16
-           bench threads × depth 8 × 4 KB):
-    | config     | ops/s   | notes                                    |
-    | B5 r=1     | ~104 k  | re-measured baseline (was 137 k pre-F178/cluster state shifts) |
-    | B6 r=1     |  113 k  | +9 % from cached PS client + skip ClusterClient.get shell |
-    | B6 r=4     |  208 k  | **passes 200 k gate**                    |
-    | B6 r=8     |  203 k  | PS process CPU at 100 % — single-partition saturated |
+  Workspace:
+    - cargo check --workspace --exclude autumn-fuse: clean.
+    - cargo test -p autumn-rpc f129_wire: 5/5.
+    - cargo test -p autumn-partition-server --lib f129_multifrag: 6/6.
+    - cargo test -p autumn-partition-server --lib (parallel): 126/128
+      pass; same 2 pre-existing f099i parallel-test races as F138/
+      F140/F148/F149/F150/F152 baseline. With --test-threads=1: 128/128.
 
-  Above ~200 k the bottleneck is the single-partition handle_get
-  CPU on the PS process. Multi-partition workloads will scale
-  further (this bench cluster boots with 1 partition by default).
+Also in this commit:
+  - feature_list.md F011 marked CLEARED, won't fix (umbrella —
+    redundant; all 8 sub-features F028/F029/F030/F031/F032/F033/F036/
+    F037 pass independently). User confirmed.
 
-Files touched:
-  - crates/ioring/Cargo.toml (autumn-rpc dep on `daemon` feature)
-  - crates/ioring/src/bin/daemon.rs (rewrite — multi-runtime, OpenedFile cache)
-  - crates/ioring/src/bin/bench.rs (--runtimes flag, %tid% key templating)
-  - feature_list.md (F180-B6 entry + bench results table)
-  - claude-progress.txt (this entry)
-
-Tests: `cargo test -p autumn-ioring --features daemon --bin
-       autumn-ioring-daemon` — 2/2 unit tests for runtime_socket_path
-       (n=1 unchanged, n>1 appends `.idx`).
-
-Out of scope (deferred per user direction):
-  - F180-D — Python pyo3 IoRing class binding
-  - F180-E — PyTorch DataLoader integration via IoRing
-  - F181  — BatchGet RPC (separate follow-up feature)
-  - F182  — RDMA chunk transfer (separate follow-up feature)
+Out of scope this iteration (next phases):
+  - PS server-side handlers + UploadSession state (Phase B)
+  - Read side multi-frag VP support in resolve_value (Phase C)
+  - ClusterClient.put_stream / get_stream (Phase D)
+  - Replay + GC awareness of OP_CHUNK_BLOB (Phase E)
+  - autumn-fuse perf evaluation (Phase F)

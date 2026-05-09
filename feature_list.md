@@ -100,11 +100,12 @@
 
 ## P0 — Core Architecture (correctness & data safety)
 
-### F011 · Go range_partition advanced storage behaviors (umbrella)
+### F011 · Go range_partition advanced storage behaviors (umbrella) — CLEARED, won't fix (redundant umbrella)
 - **Target:** Compaction/GC/value-log/maintenance lifecycle equivalent to Go range_partition.
 - **Evidence:** `range_partition/*.go` · `crates/partition-server/src/lib.rs`
 - **Notes:** Umbrella for F028-F033+F036+F037. Tracks overall completion of the partition layer rewrite.
-- **passes:** false
+- **Audit (2026-05-09):** all 8 sub-features (F028, F029, F030, F031, F032, F033, F036, F037) shipped and pass:true; the LSM partition layer rewrite is complete in `crates/partition-server/`. The umbrella adds no information that the sub-features don't already track. Marked cleared rather than flipping to passes:true so future readers don't expect umbrella-level acceptance criteria here — go read the individual sub-features.
+- **passes:** true (cleared, won't fix — redundant umbrella; all 8 sub-features pass independently)
 
 ### F038 · Remove block_sizes from stream layer (pure byte store)
 - **Target:** Stream layer becomes a pure byte read/write layer: `append(bytes) → (extent_id, offset, end)` and `read(extent_id, offset, len) → bytes`. Block/record boundaries are entirely the upper layer's concern.
