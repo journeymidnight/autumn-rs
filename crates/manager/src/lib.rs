@@ -2982,6 +2982,179 @@ mod tests {
         })
     }
 
+    /// F181: merge handler rejects non-adjacent partitions.
+    #[test]
+    fn f181_merge_refuses_non_adjacent() {
+        run(async {
+            let m = AutumnManager::new();
+            let owner_key = "owner-test".to_string();
+            let revision = {
+                let mut s = m.store.inner.borrow_mut();
+                s.acquire_owner_lock(&owner_key)
+            };
+            // Two partitions with a GAP in keyspace.
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.next_id = 200;
+                for (pid, sids, start, end) in [
+                    (1u64, [10u64, 11, 12], b"a".to_vec(), b"f".to_vec()),
+                    (2u64, [20u64, 21, 22], b"m".to_vec(), b"z".to_vec()),
+                ] {
+                    for sid in sids {
+                        s.streams.insert(
+                            sid,
+                            MgrStreamInfo {
+                                stream_id: sid,
+                                extent_ids: vec![],
+                                ec_data_shard: 0,
+                                ec_parity_shard: 0,
+                                replicates: 3,
+                            },
+                        );
+                    }
+                    s.partitions.insert(
+                        pid,
+                        MgrPartitionMeta {
+                            part_id: pid,
+                            log_stream: sids[0],
+                            row_stream: sids[1],
+                            meta_stream: sids[2],
+                            rg: Some(MgrRange { start_key: start, end_key: end }),
+                        },
+                    );
+                }
+            }
+            let req = rkyv_encode(&MultiModifyMergeReq {
+                survivor_part_id: 1,
+                victim_part_id: 2,
+                owner_key,
+                revision,
+                log_sealed_lengths: [0, 0],
+                row_sealed_lengths: [0, 0],
+                meta_sealed_lengths: [0, 0],
+            });
+            let resp = m.handle_multi_modify_merge(req).await.unwrap();
+            let r: MultiModifyMergeResp = rkyv_decode(&resp).unwrap();
+            assert_ne!(r.code, CODE_OK);
+            assert!(
+                r.message.contains("not adjacent"),
+                "error must identify non-adjacency: {}",
+                r.message
+            );
+        })
+    }
+
+    /// F181: merge handler rejects when survivor == victim.
+    #[test]
+    fn f181_merge_refuses_self_merge() {
+        run(async {
+            let m = AutumnManager::new();
+            let owner_key = "owner-test".to_string();
+            let revision = {
+                let mut s = m.store.inner.borrow_mut();
+                s.acquire_owner_lock(&owner_key)
+            };
+            let req = rkyv_encode(&MultiModifyMergeReq {
+                survivor_part_id: 5,
+                victim_part_id: 5,
+                owner_key,
+                revision,
+                log_sealed_lengths: [0, 0],
+                row_sealed_lengths: [0, 0],
+                meta_sealed_lengths: [0, 0],
+            });
+            let resp = m.handle_multi_modify_merge(req).await.unwrap();
+            let r: MultiModifyMergeResp = rkyv_decode(&resp).unwrap();
+            assert_ne!(r.code, CODE_OK);
+            assert!(
+                r.message.contains("same partition"),
+                "error must identify self-merge: {}",
+                r.message
+            );
+        })
+    }
+
+    /// F181: merge handler rejects when any source extent is in
+    /// ec_conversion_inflight (mirrors F138).
+    #[test]
+    fn f181_merge_refuses_when_ec_inflight() {
+        run(async {
+            let m = AutumnManager::new();
+            let owner_key = "owner-test".to_string();
+            let revision = {
+                let mut s = m.store.inner.borrow_mut();
+                s.acquire_owner_lock(&owner_key)
+            };
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.next_id = 200;
+                for (pid, sids, start, end, eids) in [
+                    (1u64, [10u64, 11, 12], b"a".to_vec(), b"m".to_vec(), [100u64, 101, 102]),
+                    (2u64, [20u64, 21, 22], b"m".to_vec(), b"z".to_vec(), [200u64, 201, 202]),
+                ] {
+                    for (sid, eid) in sids.iter().copied().zip(eids.iter().copied()) {
+                        s.streams.insert(
+                            sid,
+                            MgrStreamInfo {
+                                stream_id: sid,
+                                extent_ids: vec![eid],
+                                ec_data_shard: 0,
+                                ec_parity_shard: 0,
+                                replicates: 3,
+                            },
+                        );
+                        s.extents.insert(
+                            eid,
+                            MgrExtentInfo {
+                                extent_id: eid,
+                                replicates: vec![1],
+                                parity: vec![],
+                                eversion: 1,
+                                refs: 1,
+                                vp_table_refs: 0,
+                                sealed_length: 1000,
+                                avali: 1,
+                                replicate_disks: vec![10],
+                                parity_disks: vec![],
+                                ec_converted: false,
+                            },
+                        );
+                    }
+                    s.partitions.insert(
+                        pid,
+                        MgrPartitionMeta {
+                            part_id: pid,
+                            log_stream: sids[0],
+                            row_stream: sids[1],
+                            meta_stream: sids[2],
+                            rg: Some(MgrRange { start_key: start, end_key: end }),
+                        },
+                    );
+                }
+            }
+            // Mark victim's row_stream extent as EC-inflight.
+            m.ec_conversion_inflight.borrow_mut().insert(201);
+
+            let req = rkyv_encode(&MultiModifyMergeReq {
+                survivor_part_id: 1,
+                victim_part_id: 2,
+                owner_key,
+                revision,
+                log_sealed_lengths: [0, 0],
+                row_sealed_lengths: [0, 0],
+                meta_sealed_lengths: [0, 0],
+            });
+            let resp = m.handle_multi_modify_merge(req).await.unwrap();
+            let r: MultiModifyMergeResp = rkyv_decode(&resp).unwrap();
+            assert_ne!(r.code, CODE_OK);
+            assert!(
+                r.message.contains("ec conversion in flight"),
+                "error must identify EC inflight: {}",
+                r.message
+            );
+        })
+    }
+
     /// F144: with 4 nodes and count=3, every node must appear in a
     /// non-trivial fraction of selections — pre-F144 the lowest-id 3
     /// always won and node 7 never showed up.
