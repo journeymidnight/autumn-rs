@@ -7,6 +7,12 @@ struct Args {
     etcd: Vec<String>,
     bind_host: String,
     transport: TransportKind,
+    /// F184: Stage 2 — auto-dispatch SPLIT to owning PS based on
+    /// policy-engine candidates. Default off.
+    auto_split: bool,
+    /// F184: Stage 3 — auto-orchestrate MERGE for same-PS adjacent
+    /// candidates. Default off.
+    auto_merge: bool,
 }
 
 fn parse_args() -> Args {
@@ -14,6 +20,8 @@ fn parse_args() -> Args {
     let mut etcd: Vec<String> = Vec::new();
     let mut bind_host = String::from("0.0.0.0");
     let mut transport = TransportKind::Tcp;
+    let mut auto_split = false;
+    let mut auto_merge = false;
 
     let raw: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -41,12 +49,14 @@ fn parse_args() -> Args {
                         std::process::exit(2);
                     });
             }
+            "--auto-split" => auto_split = true,
+            "--auto-merge" => auto_merge = true,
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
     }
 
-    Args { port, etcd, bind_host, transport }
+    Args { port, etcd, bind_host, transport, auto_split, auto_merge }
 }
 
 #[compio::main]
@@ -76,6 +86,15 @@ async fn main() -> Result<()> {
             .await
             .context("connect to etcd")?
     };
+
+    if args.auto_split {
+        tracing::warn!("F184: --auto-split enabled; manager will dispatch SPLIT for hot partitions");
+        manager.set_auto_split(true);
+    }
+    if args.auto_merge {
+        tracing::warn!("F184: --auto-merge enabled; manager will orchestrate MERGE for cold same-PS pairs");
+        manager.set_auto_merge(true);
+    }
 
     tracing::info!("autumn-manager-server listening on {addr}");
     manager.serve(addr).await?;

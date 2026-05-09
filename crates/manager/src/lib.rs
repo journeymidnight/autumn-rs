@@ -312,6 +312,13 @@ pub struct AutumnManager {
     /// F183: policy engine — split/merge candidate computation over a
     /// 30-min sliding window of per-partition load metrics.
     pub(crate) policy: Rc<RefCell<crate::policy::PolicyEngine>>,
+    /// F184: feature flag — enable auto-trigger of SPLIT for hot
+    /// partitions. When true, `policy_tick_loop` dispatches MSG_SPLIT_PART
+    /// to the owning PS for each SPLIT candidate. Default off (advisory).
+    pub(crate) auto_split_enabled: Rc<Cell<bool>>,
+    /// F184: feature flag — enable auto-orchestrated MERGE for same-PS
+    /// adjacent cold pairs. Default off.
+    pub(crate) auto_merge_enabled: Rc<Cell<bool>>,
 }
 
 impl Default for AutumnManager {
@@ -335,12 +342,27 @@ impl AutumnManager {
             pending_extent_deletes: Rc::new(RefCell::new(VecDeque::new())),
             last_op_at: Rc::new(RefCell::new(HashMap::new())),
             policy: Rc::new(RefCell::new(crate::policy::PolicyEngine::default())),
+            auto_split_enabled: Rc::new(Cell::new(false)),
+            auto_merge_enabled: Rc::new(Cell::new(false)),
         }
     }
 
     /// F183: read the last_op_at timestamp for a partition (0 if never op'd).
     pub(crate) fn last_op_at_for(&self, part_id: u64) -> i64 {
         self.last_op_at.borrow().get(&part_id).copied().unwrap_or(0)
+    }
+
+    /// F184: enable auto-dispatch of SPLIT for SPLIT candidates from the
+    /// policy engine. Default off; toggle via the manager binary CLI flag
+    /// `--auto-split` or programmatically.
+    pub fn set_auto_split(&self, enabled: bool) {
+        self.auto_split_enabled.set(enabled);
+    }
+
+    /// F184: enable auto-orchestration of MERGE for same-PS adjacent
+    /// cold pairs. Default off.
+    pub fn set_auto_merge(&self, enabled: bool) {
+        self.auto_merge_enabled.set(enabled);
     }
 
     pub async fn new_with_etcd(endpoints: Vec<String>) -> Result<Self> {
@@ -446,14 +468,17 @@ impl AutumnManager {
                 s.regions.iter().map(|(id, r)| (*id, r.ps_id)).collect()
             };
             let last_op = self.last_op_at.borrow().clone();
-            let state_snapshot: autumn_common::MetadataState = (*self.store.inner.borrow()).clone();
-            let mut p = self.policy.borrow_mut();
-            let cands = p.compute_candidates(crate::policy::ComputeArgs {
-                state: &state_snapshot,
-                last_op_at: &last_op,
-                region_owners: &owners,
-                now,
-            });
+            let state_snapshot: autumn_common::MetadataState =
+                (*self.store.inner.borrow()).clone();
+            let cands: Vec<PolicyCandidate> = {
+                let mut p = self.policy.borrow_mut();
+                p.compute_candidates(crate::policy::ComputeArgs {
+                    state: &state_snapshot,
+                    last_op_at: &last_op,
+                    region_owners: &owners,
+                    now,
+                })
+            };
             if !cands.is_empty() {
                 tracing::info!("F183 policy: {} candidate(s)", cands.len());
                 for c in &cands {
@@ -471,7 +496,224 @@ impl AutumnManager {
                     );
                 }
             }
+
+            // F184 Stage 2/3: auto-dispatch when feature flag is on.
+            // Per-tick rate-limit: at most 1 split + 1 merge per tick to
+            // bound blast radius if the policy mis-fires.
+            if self.auto_split_enabled.get() {
+                if let Some(c) = cands
+                    .iter()
+                    .find(|c| c.kind == POLICY_KIND_SPLIT)
+                {
+                    if let Err(e) = self.auto_dispatch_split(c, &state_snapshot).await {
+                        tracing::warn!(
+                            "F184 auto-split part={} failed: {e}",
+                            c.primary_part_id
+                        );
+                    }
+                }
+            }
+            if self.auto_merge_enabled.get() {
+                if let Some(c) = cands
+                    .iter()
+                    .find(|c| c.kind == POLICY_KIND_MERGE && c.same_ps)
+                {
+                    if let Err(e) = self
+                        .auto_dispatch_merge(c, &state_snapshot)
+                        .await
+                    {
+                        tracing::warn!(
+                            "F184 auto-merge survivor={} victim={} failed: {e}",
+                            c.primary_part_id, c.secondary_part_id
+                        );
+                    }
+                }
+            }
         }
+    }
+
+    /// F184: auto-dispatch SPLIT to the owning PS for a SPLIT candidate.
+    /// The PS handler (`handle_split_part`) already implements the full
+    /// F140 dual-gate + F103 auth-rg flow; we just send the RPC.
+    async fn auto_dispatch_split(
+        &self,
+        cand: &PolicyCandidate,
+        state: &autumn_common::MetadataState,
+    ) -> Result<()> {
+        // Look up the owning PS via regions + ps_nodes.
+        let region = state
+            .regions
+            .get(&cand.primary_part_id)
+            .ok_or_else(|| anyhow::anyhow!("no region for part {}", cand.primary_part_id))?;
+        // Prefer per-partition address (F099-K) when present; fall back to PS-level.
+        let ps_addr = state
+            .part_addrs
+            .get(&cand.primary_part_id)
+            .cloned()
+            .or_else(|| state.ps_nodes.get(&region.ps_id).cloned())
+            .ok_or_else(|| anyhow::anyhow!("no address for part {}", cand.primary_part_id))?;
+        let payload = autumn_rpc::partition_rpc::rkyv_encode(
+            &autumn_rpc::partition_rpc::SplitPartReq {
+                part_id: cand.primary_part_id,
+            },
+        );
+        let resp_bytes = self
+            .conn_pool
+            .call(&ps_addr, autumn_rpc::partition_rpc::MSG_SPLIT_PART, payload)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let resp: autumn_rpc::partition_rpc::SplitPartResp =
+            autumn_rpc::partition_rpc::rkyv_decode(&resp_bytes)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if resp.code != autumn_rpc::partition_rpc::CODE_OK {
+            anyhow::bail!("split returned code {}: {}", resp.code, resp.message);
+        }
+        tracing::info!(
+            "F184 auto-split part={} dispatched OK",
+            cand.primary_part_id
+        );
+        Ok(())
+    }
+
+    /// F184: auto-orchestrate MERGE for a same-PS adjacent cold pair.
+    /// Mirrors the CLI orchestration (FLUSH both → admin owner-lock →
+    /// commit_lengths → multi_modify_merge). PS-side state catches up
+    /// via region_sync_loop within ~2 s.
+    async fn auto_dispatch_merge(
+        &self,
+        cand: &PolicyCandidate,
+        state: &autumn_common::MetadataState,
+    ) -> Result<()> {
+        let survivor_id = cand.primary_part_id;
+        let victim_id = cand.secondary_part_id;
+        // Resolve PS addresses (per-partition first).
+        let resolve = |pid: u64| -> Option<String> {
+            state
+                .part_addrs
+                .get(&pid)
+                .cloned()
+                .or_else(|| {
+                    state
+                        .regions
+                        .get(&pid)
+                        .and_then(|r| state.ps_nodes.get(&r.ps_id).cloned())
+                })
+        };
+        let s_addr = resolve(survivor_id)
+            .ok_or_else(|| anyhow::anyhow!("no address for survivor {survivor_id}"))?;
+        let v_addr = resolve(victim_id)
+            .ok_or_else(|| anyhow::anyhow!("no address for victim {victim_id}"))?;
+
+        // FLUSH both partitions.
+        let flush = |addr: String, pid: u64| {
+            let pool = self.conn_pool.clone();
+            async move {
+                let payload = autumn_rpc::partition_rpc::rkyv_encode(
+                    &autumn_rpc::partition_rpc::MaintenanceReq {
+                        part_id: pid,
+                        op: autumn_rpc::partition_rpc::MAINTENANCE_FLUSH,
+                        extent_ids: vec![],
+                    },
+                );
+                pool.call(&addr, autumn_rpc::partition_rpc::MSG_MAINTENANCE, payload)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok::<(), anyhow::Error>(())
+            }
+        };
+        flush(s_addr.clone(), survivor_id).await?;
+        flush(v_addr.clone(), victim_id).await?;
+
+        // Acquire an admin owner-lock. The manager is `self` so we call
+        // through `acquire_owner_revision` directly — same revision the
+        // CLI obtains via MSG_ACQUIRE_OWNER_LOCK.
+        let owner_key = format!("auto-merge:{survivor_id}:{victim_id}");
+        let revision = self.acquire_owner_revision(&owner_key).await?;
+
+        // commit_length per stream type for both partitions.
+        let s_region = state
+            .regions
+            .get(&survivor_id)
+            .ok_or_else(|| anyhow::anyhow!("no region for survivor {survivor_id}"))?;
+        let v_region = state
+            .regions
+            .get(&victim_id)
+            .ok_or_else(|| anyhow::anyhow!("no region for victim {victim_id}"))?;
+        let log_lens = [
+            self.commit_length_for_stream(s_region.log_stream, &owner_key, revision)
+                .await?
+                .max(1),
+            self.commit_length_for_stream(v_region.log_stream, &owner_key, revision)
+                .await?
+                .max(1),
+        ];
+        let row_lens = [
+            self.commit_length_for_stream(s_region.row_stream, &owner_key, revision)
+                .await?
+                .max(1),
+            self.commit_length_for_stream(v_region.row_stream, &owner_key, revision)
+                .await?
+                .max(1),
+        ];
+        let meta_lens = [
+            self.commit_length_for_stream(s_region.meta_stream, &owner_key, revision)
+                .await?
+                .max(1),
+            self.commit_length_for_stream(v_region.meta_stream, &owner_key, revision)
+                .await?
+                .max(1),
+        ];
+
+        // Issue the merge directly through the local handler — manager is `self`.
+        let req = MultiModifyMergeReq {
+            survivor_part_id: survivor_id,
+            victim_part_id: victim_id,
+            owner_key,
+            revision,
+            log_sealed_lengths: log_lens,
+            row_sealed_lengths: row_lens,
+            meta_sealed_lengths: meta_lens,
+        };
+        let resp_bytes = self
+            .handle_multi_modify_merge(rkyv_encode(&req))
+            .await
+            .map_err(|(_, msg)| anyhow::anyhow!("{msg}"))?;
+        let resp: MultiModifyMergeResp =
+            rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if resp.code != CODE_OK {
+            anyhow::bail!("merge returned code {}: {}", resp.code, resp.message);
+        }
+        tracing::info!(
+            "F184 auto-merge survivor={survivor_id} victim={victim_id} OK \
+             (E_new={})",
+            resp.new_log_tail_extent_id
+        );
+        Ok(())
+    }
+
+    /// F184 helper: query commit_length for one stream by hitting the
+    /// stream's tail extent's replicas via ConnPool.
+    async fn commit_length_for_stream(
+        &self,
+        stream_id: u64,
+        owner_key: &str,
+        revision: i64,
+    ) -> Result<u64> {
+        let req = rkyv_encode(&CheckCommitLengthReq {
+            stream_id,
+            owner_key: owner_key.to_string(),
+            revision,
+        });
+        let resp_bytes = self
+            .handle_check_commit_length(req)
+            .await
+            .map_err(|(_, msg)| anyhow::anyhow!("{msg}"))?;
+        let resp: CheckCommitLengthResp =
+            rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if resp.code != CODE_OK {
+            anyhow::bail!("commit_length code {}: {}", resp.code, resp.message);
+        }
+        Ok(resp.end as u64)
     }
 
     // ── Leader election ────────────────────────────────────────────────

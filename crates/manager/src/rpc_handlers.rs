@@ -585,7 +585,7 @@ impl AutumnManager {
         }))
     }
 
-    async fn handle_check_commit_length(&self, payload: Bytes) -> HandlerResult {
+    pub(crate) async fn handle_check_commit_length(&self, payload: Bytes) -> HandlerResult {
         let req: CheckCommitLengthReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
