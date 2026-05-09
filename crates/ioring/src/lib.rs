@@ -61,6 +61,9 @@ pub mod buffer_pool;
 pub mod ring;
 pub mod handshake;
 
+#[cfg(target_os = "linux")]
+pub mod socket;
+
 pub use opcode::Opcode;
 pub use sqe::{Sqe, SqeDecodeError};
 pub use cqe::{Cqe, CqeDecodeError};

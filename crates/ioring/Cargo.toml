@@ -11,3 +11,4 @@ name = "autumn_ioring"
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+libc = "0.2"
