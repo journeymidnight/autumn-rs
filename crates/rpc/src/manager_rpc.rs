@@ -50,6 +50,13 @@ pub const MSG_UPDATE_STREAM_EC: u8 = 0x32;
 // Partition→manager sync of live SST VP dependency snapshot.
 pub const MSG_SYNC_PARTITION_VP_REFS: u8 = 0x33;
 
+// F181: partition merge primitive (inverse of MSG_MULTI_MODIFY_SPLIT).
+pub const MSG_MULTI_MODIFY_MERGE: u8 = 0x34;
+// F181: advisory engine — query split/merge candidates.
+pub const MSG_GET_POLICY_CANDIDATES: u8 = 0x35;
+// F181: per-partition load metrics report (PS → manager, 5 s cadence).
+pub const MSG_REPORT_PARTITION_LOAD: u8 = 0x36;
+
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
 /// Serialize a value to Bytes using rkyv.
@@ -641,6 +648,74 @@ impl ExtCommitLengthResp {
             length: data.get_u32_le(),
         })
     }
+}
+
+// ── F181: partition merge + policy advisory ────────────────────────────────
+
+// --- MultiModifyMerge ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MultiModifyMergeReq {
+    pub survivor_part_id: u64,
+    pub victim_part_id: u64,
+    pub owner_key: String,
+    pub revision: i64,
+    /// commit_length per stream type, indexed [0]=survivor, [1]=victim
+    pub log_sealed_lengths: [u64; 2],
+    pub row_sealed_lengths: [u64; 2],
+    pub meta_sealed_lengths: [u64; 2],
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MultiModifyMergeResp {
+    pub code: u8,
+    pub message: String,
+    /// extent_id of the freshly allocated empty tail for survivor's
+    /// log_stream; used as vp_head when writing the merged
+    /// TableLocations checkpoint on the PS.
+    pub new_log_tail_extent_id: u64,
+}
+
+// --- ReportPartitionLoad (PS → manager periodic metrics) ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct PartitionLoad {
+    pub part_id: u64,
+    pub size_bytes: u64,
+    pub req_per_sec: u32,
+    pub imm_full_per_sec: u32,
+    pub p99_us: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ReportPartitionLoadReq {
+    pub ps_id: u64,
+    pub partitions: Vec<PartitionLoad>,
+}
+
+// --- GetPolicyCandidates (advisory) ---
+pub const POLICY_KIND_SPLIT: u8 = 0;
+pub const POLICY_KIND_MERGE: u8 = 1;
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct PolicyCandidate {
+    pub kind: u8,                    // POLICY_KIND_SPLIT or POLICY_KIND_MERGE
+    pub primary_part_id: u64,        // split: target; merge: survivor
+    pub secondary_part_id: u64,      // split: 0; merge: victim
+    pub reason: String,
+    pub size_bytes: u64,
+    pub req_per_sec: u32,
+    pub imm_full_per_sec: u32,
+    pub same_ps: bool,
+    pub last_op_at: i64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct GetPolicyCandidatesReq {}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetPolicyCandidatesResp {
+    pub code: u8,
+    pub message: String,
+    pub candidates: Vec<PolicyCandidate>,
 }
 
 // ── Extent msg_type constants (needed by manager for node calls) ──────────
