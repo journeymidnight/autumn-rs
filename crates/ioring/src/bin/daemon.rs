@@ -32,6 +32,7 @@
 //! - SQE polling is a sleep-loop with a small backoff. F180-C may add
 //!   futex-based wake-up to drop idle CPU usage.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::os::unix::io::AsRawFd;
@@ -210,133 +211,146 @@ async fn handle_session(
 }
 
 async fn poller_loop(
-    mut region: MmapRegion,
+    region: MmapRegion,
     header: RingHeader,
     cluster: Rc<ClusterClient>,
     idle_us: u64,
     _stream: compio::net::UnixStream,
     _memfd: std::os::unix::io::OwnedFd,
 ) -> Result<()> {
-    // Per-session ring_fd table. Linear ring_fds are simpler than a
-    // free list for v1; collisions on close+reopen are not a concern
-    // in F180-B4 (test workloads use a small fixed set).
-    let mut ring_fds: HashMap<u32, Vec<u8>> = HashMap::new();
-    let mut next_fd: u32 = 1;
+    // F180-B5 refactor: per-session state is now Rc<RefCell<>> so the
+    // poller can spawn a per-SQE task that holds NO state borrow
+    // across `cluster.get(...).await`. Per-session ceiling rises
+    // from ~44 k ops/s (serial pop → await get → push) to ideally
+    // 200-400 k (depth-1 latency × in-flight count).
+    let region: Rc<RefCell<MmapRegion>> = Rc::new(RefCell::new(region));
+    let ring_fds: Rc<RefCell<HashMap<u32, Vec<u8>>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    let next_fd: Rc<Cell<u32>> = Rc::new(Cell::new(1));
     let backoff = Duration::from_micros(idle_us);
 
     loop {
-        // Snapshot a single SQE under an immutable borrow, drop, then
-        // process. Single-task compio runtime → no concurrent
-        // mutation on `region` between borrow-drop and re-borrow.
-        let sqe_opt = {
-            let cons = SqConsumer::new(region.as_slice(), header);
-            cons.try_pop()
-        };
-        let Some(sqe) = sqe_opt else {
+        // Pull a batch of SQEs under a brief immutable borrow.
+        let mut sqes: Vec<Sqe> = Vec::new();
+        {
+            let r = region.borrow();
+            let cons = SqConsumer::new(r.as_slice(), header);
+            cons.try_pop_batch(&mut sqes, 32);
+        }
+        if sqes.is_empty() {
             compio::time::sleep(backoff).await;
             continue;
-        };
+        }
 
-        let cqe = dispatch_sqe(
-            sqe,
-            &mut region,
-            &header,
-            &cluster,
-            &mut ring_fds,
-            &mut next_fd,
-        )
-        .await;
-
-        // Push CQE. If CQ is full we drop the completion (a real
-        // production daemon should back-pressure SQ pulls; F180-B4
-        // skips this for simplicity — clients sized for bench
-        // workloads will keep up).
-        let mut prod = CqProducer::new(region.as_mut_slice(), header);
-        if prod.try_push(cqe).is_err() {
-            tracing::warn!("CQ full; dropping completion");
+        for sqe in sqes {
+            let region_c = region.clone();
+            let cluster_c = cluster.clone();
+            let ring_fds_c = ring_fds.clone();
+            let next_fd_c = next_fd.clone();
+            compio::runtime::spawn(async move {
+                let cqe = service_sqe(
+                    sqe,
+                    &region_c,
+                    &header,
+                    &cluster_c,
+                    &ring_fds_c,
+                    &next_fd_c,
+                )
+                .await;
+                // Brief borrow_mut to push CQE — no .await held
+                // across the borrow. CqProducer::try_push is purely
+                // atomic loads/stores; safe for cooperative
+                // multi-task scheduling on single-threaded compio.
+                let mut r = region_c.borrow_mut();
+                let mut prod = CqProducer::new(r.as_mut_slice(), header);
+                if prod.try_push(cqe).is_err() {
+                    tracing::warn!("CQ full; dropping completion");
+                }
+            })
+            .detach();
         }
     }
 }
 
-/// Service one SQE. Returns the CQE to push back. Always succeeds at
-/// the type level — errors become `Cqe::err`.
-async fn dispatch_sqe(
+/// Service one SQE; never holds any state borrow across `.await`.
+/// Returns the CQE to push back. Caller pushes it in its own brief
+/// borrow_mut after this returns.
+async fn service_sqe(
     sqe: Sqe,
-    region: &mut MmapRegion,
+    region: &Rc<RefCell<MmapRegion>>,
     header: &RingHeader,
     cluster: &ClusterClient,
-    ring_fds: &mut HashMap<u32, Vec<u8>>,
-    next_fd: &mut u32,
+    ring_fds: &Rc<RefCell<HashMap<u32, Vec<u8>>>>,
+    next_fd: &Rc<Cell<u32>>,
 ) -> Cqe {
     match sqe.opcode {
         Opcode::Nop => Cqe::ok(sqe.user_data, 0),
 
         Opcode::Open => {
-            // Path bytes live at `buf_offset` in the buffer pool, of
-            // length `length` bytes.
             let layout = autumn_ioring::buffer_pool::BufferPoolLayout::from_header(header);
-            if let Err(_) = layout.validate_slice(sqe.buf_offset, sqe.length) {
+            if layout.validate_slice(sqe.buf_offset, sqe.length).is_err() {
                 return Cqe::err(sqe.user_data, libc::EINVAL);
             }
-            let path = region.as_slice()
-                [sqe.buf_offset as usize..sqe.buf_offset as usize + sqe.length as usize]
-                .to_vec();
-            // Existence check: HEAD the key. If absent, return ENOENT.
-            // (Avoids handing back a ring_fd that points at nothing.)
-            // This costs one round-trip per OPEN — acceptable, OPEN
-            // is rare in batch workloads.
+            // Read path bytes under a brief immutable borrow; drop
+            // before awaiting on the manager.
+            let path = {
+                let r = region.borrow();
+                r.as_slice()
+                    [sqe.buf_offset as usize..sqe.buf_offset as usize + sqe.length as usize]
+                    .to_vec()
+            };
             match cluster.head(&path).await {
                 Ok(meta) if meta.found => {}
                 Ok(_) => return Cqe::err(sqe.user_data, libc::ENOENT),
                 Err(AutumnError::NotFound) => return Cqe::err(sqe.user_data, libc::ENOENT),
                 Err(_) => return Cqe::err(sqe.user_data, libc::EIO),
             }
-            let fd = *next_fd;
-            *next_fd = next_fd.checked_add(1).unwrap_or(1);
-            ring_fds.insert(fd, path);
+            // Allocate a ring_fd. Cell on a single-threaded runtime
+            // races only with other spawned tasks at await points;
+            // the get/set pair below is sync, no yield in between.
+            let fd = next_fd.get();
+            next_fd.set(fd.checked_add(1).unwrap_or(1));
+            ring_fds.borrow_mut().insert(fd, path);
             Cqe::ok(sqe.user_data, fd as u64)
         }
 
         Opcode::Read => {
-            let key = match ring_fds.get(&sqe.ring_fd) {
-                Some(k) => k.clone(),
-                None => return Cqe::err(sqe.user_data, libc::EBADF),
+            let key = {
+                let fds = ring_fds.borrow();
+                match fds.get(&sqe.ring_fd) {
+                    Some(k) => k.clone(),
+                    None => return Cqe::err(sqe.user_data, libc::EBADF),
+                }
             };
             let layout = autumn_ioring::buffer_pool::BufferPoolLayout::from_header(header);
-            if let Err(_) = layout.validate_slice(sqe.buf_offset, sqe.length) {
+            if layout.validate_slice(sqe.buf_offset, sqe.length).is_err() {
                 return Cqe::err(sqe.user_data, libc::EINVAL);
             }
-            // Use sub-range get if cluster client supports it. We use
-            // `get` for whole-value semantics here and apply offset
-            // client-side. F181 (BatchGet) and a future get_range
-            // pass-through could trim the wire.
             let data = match cluster.get(&key).await {
                 Ok(Some(v)) => v,
                 Ok(None) => return Cqe::err(sqe.user_data, libc::ENOENT),
                 Err(_) => return Cqe::err(sqe.user_data, libc::EIO),
             };
-            // Apply offset / length window.
             let start = sqe.offset as usize;
             if start >= data.len() {
-                return Cqe::ok(sqe.user_data, 0); // EOF
+                return Cqe::ok(sqe.user_data, 0);
             }
             let end = (start + sqe.length as usize).min(data.len());
             let n = end - start;
-            // Copy into the buffer pool slot.
-            let dst = &mut region.as_mut_slice()
-                [sqe.buf_offset as usize..sqe.buf_offset as usize + n];
-            dst.copy_from_slice(&data[start..end]);
+            // Brief borrow_mut to copy into buf slot. No await held.
+            {
+                let mut r = region.borrow_mut();
+                let dst = &mut r.as_mut_slice()
+                    [sqe.buf_offset as usize..sqe.buf_offset as usize + n];
+                dst.copy_from_slice(&data[start..end]);
+            }
             Cqe::ok(sqe.user_data, n as u64)
         }
 
-        Opcode::Write => {
-            // F180-B4 scope: writes deferred. Return ENOSYS so client
-            // can detect and skip.
-            Cqe::err(sqe.user_data, libc::ENOSYS)
-        }
+        Opcode::Write => Cqe::err(sqe.user_data, libc::ENOSYS),
 
         Opcode::Close => {
-            if ring_fds.remove(&sqe.ring_fd).is_some() {
+            if ring_fds.borrow_mut().remove(&sqe.ring_fd).is_some() {
                 Cqe::ok(sqe.user_data, 0)
             } else {
                 Cqe::err(sqe.user_data, libc::EBADF)
