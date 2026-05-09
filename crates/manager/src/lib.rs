@@ -1295,6 +1295,45 @@ impl AutumnManager {
         Self::rebalance_regions(state);
     }
 
+    /// F181: apply computed merge mutations. Mirror of `apply_split_mutations`.
+    /// Caller (handle_multi_modify_merge Phase 3) verifies eversion drift
+    /// before invoking. Drops victim partition + its three stream metas
+    /// + its partition_vp_refs entry; rebalances regions to remove the
+    /// victim's region.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_merge_mutations(
+        state: &mut autumn_common::MetadataState,
+        survivor_streams: &[MgrStreamInfo],
+        modified_extents: &[MgrExtentInfo],
+        survivor_meta: MgrPartitionMeta,
+        merged_vp_refs: MgrPartitionVpRefs,
+        victim_part_id: u64,
+        victim_log_stream: u64,
+        victim_row_stream: u64,
+        victim_meta_stream: u64,
+    ) {
+        for ex in modified_extents {
+            state.extents.insert(ex.extent_id, ex.clone());
+        }
+        for st in survivor_streams {
+            state.streams.insert(st.stream_id, st.clone());
+        }
+        state.partitions.insert(survivor_meta.part_id, survivor_meta);
+        state
+            .partition_vp_refs
+            .insert(merged_vp_refs.part_id, merged_vp_refs);
+
+        // Drop victim entries.
+        state.partitions.remove(&victim_part_id);
+        state.streams.remove(&victim_log_stream);
+        state.streams.remove(&victim_row_stream);
+        state.streams.remove(&victim_meta_stream);
+        state.partition_vp_refs.remove(&victim_part_id);
+        state.regions.remove(&victim_part_id);
+
+        Self::rebalance_regions(state);
+    }
+
     fn extent_nodes(extent: &MgrExtentInfo) -> Vec<u64> {
         extent
             .replicates
@@ -2009,6 +2048,103 @@ mod tests {
         let e40 = modified.iter().find(|e| e.extent_id == 40).unwrap();
         assert_eq!(e40.refs, 2);
         assert_eq!(e40.sealed_length, 200);
+    }
+
+    #[test]
+    fn f181_apply_merge_mutations_drops_victim_entries() {
+        let mut state = autumn_common::MetadataState::default();
+        // Survivor partition 1 with streams 100/101/102
+        state.partitions.insert(
+            1,
+            MgrPartitionMeta {
+                part_id: 1,
+                log_stream: 100,
+                row_stream: 101,
+                meta_stream: 102,
+                rg: Some(MgrRange {
+                    start_key: b"a".to_vec(),
+                    end_key: b"m".to_vec(),
+                }),
+            },
+        );
+        // Victim partition 2 with streams 200/201/202
+        state.partitions.insert(
+            2,
+            MgrPartitionMeta {
+                part_id: 2,
+                log_stream: 200,
+                row_stream: 201,
+                meta_stream: 202,
+                rg: Some(MgrRange {
+                    start_key: b"m".to_vec(),
+                    end_key: b"z".to_vec(),
+                }),
+            },
+        );
+        for sid in [100, 101, 102, 200, 201, 202] {
+            state.streams.insert(
+                sid,
+                MgrStreamInfo {
+                    stream_id: sid,
+                    extent_ids: vec![],
+                    ec_data_shard: 1,
+                    ec_parity_shard: 0,
+                    replicates: 3,
+                },
+            );
+        }
+        state.partition_vp_refs.insert(
+            1,
+            MgrPartitionVpRefs {
+                part_id: 1,
+                refs: vec![],
+            },
+        );
+        state.partition_vp_refs.insert(
+            2,
+            MgrPartitionVpRefs {
+                part_id: 2,
+                refs: vec![],
+            },
+        );
+
+        let new_survivor_meta = MgrPartitionMeta {
+            part_id: 1,
+            log_stream: 100,
+            row_stream: 101,
+            meta_stream: 102,
+            rg: Some(MgrRange {
+                start_key: b"a".to_vec(),
+                end_key: b"z".to_vec(),
+            }),
+        };
+
+        AutumnManager::apply_merge_mutations(
+            &mut state,
+            &[],
+            &[],
+            new_survivor_meta,
+            MgrPartitionVpRefs {
+                part_id: 1,
+                refs: vec![],
+            },
+            2,
+            200,
+            201,
+            202,
+        );
+
+        assert!(state.partitions.contains_key(&1));
+        assert!(!state.partitions.contains_key(&2));
+        assert!(state.streams.contains_key(&100));
+        assert!(!state.streams.contains_key(&200));
+        assert!(!state.streams.contains_key(&201));
+        assert!(!state.streams.contains_key(&202));
+        assert!(!state.partition_vp_refs.contains_key(&2));
+        assert_eq!(
+            state.partitions.get(&1).unwrap().rg.as_ref().unwrap().end_key,
+            b"z".to_vec()
+        );
     }
 
     #[test]
