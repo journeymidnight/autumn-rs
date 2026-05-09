@@ -93,6 +93,9 @@ impl AutumnManager {
             MSG_STREAM_PUNCH_HOLES => self.handle_stream_punch_holes(payload).await,
             MSG_TRUNCATE => self.handle_truncate(payload).await,
             MSG_MULTI_MODIFY_SPLIT => self.handle_multi_modify_split(payload).await,
+            MSG_MULTI_MODIFY_MERGE => self.handle_multi_modify_merge(payload).await,
+            MSG_GET_POLICY_CANDIDATES => self.handle_get_policy_candidates(payload).await,
+            MSG_REPORT_PARTITION_LOAD => self.handle_report_partition_load(payload).await,
             MSG_REGISTER_PS => self.handle_register_ps(payload).await,
             MSG_UPSERT_PARTITION => self.handle_upsert_partition(payload).await,
             MSG_GET_REGIONS => self.handle_get_regions().await,
@@ -1643,6 +1646,419 @@ impl AutumnManager {
     }
 
     // ── PartitionManagerService handlers ───────────────────────────────
+
+    // ── F181: handle_multi_modify_merge ─────────────────────────────────────
+    // Inverse of handle_multi_modify_split. Atomically:
+    //   - Splices victim's three streams' extent_ids into survivor's
+    //   - Allocates a fresh log_stream tail extent (E_new) on K replicas
+    //   - Merges victim's partition_vp_refs snapshot into survivor's
+    //   - Widens survivor.rg.end_key to victim.rg.end_key
+    //   - Deletes victim's partitions/streams/regions/partitionVpRefs/
+    //     partitionLastOp keys
+    //
+    // Single-txn etcd commit (F124-style) — crash mid-merge means no state
+    // change. F138/F145/F146 inflight checks. F146-style verify-at-apply on
+    // pre_bump_eversion. F149 fence already applied via put_and_delete_txn.
+    pub(crate) async fn handle_multi_modify_merge(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&MultiModifyMergeResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                new_log_tail_extent_id: 0,
+            }));
+        }
+        let req: MultiModifyMergeReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // Phase 1: compute under borrow_mut, NO awaits inside.
+        // Returns alloc-IDs reserved + selected nodes for Phase 1.5.
+        struct Phase1Result {
+            new_streams: Vec<MgrStreamInfo>,
+            modified_extents: Vec<MgrExtentInfo>,
+            survivor_meta: MgrPartitionMeta,
+            merged_vp: MgrPartitionVpRefs,
+            victim_part_id: u64,
+            victim_log: u64,
+            victim_row: u64,
+            victim_meta: u64,
+            new_tail_id: u64,
+            selected_nodes: Vec<MgrNodeInfo>,
+            new_tail_replicas: u32,
+            pre_bump_eversion: HashMap<u64, u64>,
+        }
+
+        let phase1: Result<Phase1Result, AppError> = {
+            let mut s = self.store.inner.borrow_mut();
+            (|| -> Result<Phase1Result, AppError> {
+                Self::ensure_owner_revision(&req.owner_key, req.revision, &s)?;
+
+                if req.survivor_part_id == req.victim_part_id {
+                    return Err(AppError::Precondition(
+                        "survivor and victim are the same partition".to_string(),
+                    ));
+                }
+                let survivor_meta = s
+                    .partitions
+                    .get(&req.survivor_part_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        AppError::NotFound(format!("partition {}", req.survivor_part_id))
+                    })?;
+                let victim_meta = s
+                    .partitions
+                    .get(&req.victim_part_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        AppError::NotFound(format!("partition {}", req.victim_part_id))
+                    })?;
+                let s_rg = survivor_meta
+                    .rg
+                    .clone()
+                    .ok_or_else(|| AppError::Internal("survivor range missing".into()))?;
+                let v_rg = victim_meta
+                    .rg
+                    .clone()
+                    .ok_or_else(|| AppError::Internal("victim range missing".into()))?;
+                if s_rg.end_key != v_rg.start_key {
+                    return Err(AppError::Precondition(format!(
+                        "partitions are not adjacent (survivor.end={:?}, victim.start={:?})",
+                        s_rg.end_key, v_rg.start_key
+                    )));
+                }
+
+                let all_streams = [
+                    survivor_meta.log_stream,
+                    survivor_meta.row_stream,
+                    survivor_meta.meta_stream,
+                    victim_meta.log_stream,
+                    victim_meta.row_stream,
+                    victim_meta.meta_stream,
+                ];
+                {
+                    let ec_inflight = self.ec_conversion_inflight.borrow();
+                    let recovery_inflight = self.recovery_tasks.borrow();
+                    let pending_deletes = self.pending_extent_deletes.borrow();
+                    let pending_eids: HashSet<u64> =
+                        pending_deletes.iter().map(|p| p.extent_id).collect();
+                    for &sid in &all_streams {
+                        if let Some(stream) = s.streams.get(&sid) {
+                            for &eid in &stream.extent_ids {
+                                if ec_inflight.contains(&eid) {
+                                    return Err(AppError::Precondition(format!(
+                                        "ec conversion in flight on extent {eid}; retry merge"
+                                    )));
+                                }
+                                if recovery_inflight.contains_key(&eid) {
+                                    return Err(AppError::Precondition(format!(
+                                        "recovery in flight on extent {eid}; retry merge"
+                                    )));
+                                }
+                                if pending_eids.contains(&eid) {
+                                    return Err(AppError::Precondition(format!(
+                                        "extent {eid} pending delete; retry merge"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let pre_bump_eversion: HashMap<u64, u64> = {
+                    let mut m = HashMap::new();
+                    for &sid in &all_streams {
+                        if let Some(stream) = s.streams.get(&sid) {
+                            for &eid in &stream.extent_ids {
+                                if let Some(ex) = s.extents.get(&eid) {
+                                    m.insert(eid, ex.eversion);
+                                }
+                            }
+                        }
+                    }
+                    m
+                };
+
+                let (new_tail_id, _) = s.alloc_ids(1);
+                // Pick K replica nodes for E_new (replication factor matches
+                // survivor's log_stream).
+                let log_stream_meta = s
+                    .streams
+                    .get(&survivor_meta.log_stream)
+                    .ok_or_else(|| {
+                        AppError::Internal(format!("stream {}", survivor_meta.log_stream))
+                    })?;
+                let target_replicas = if log_stream_meta.replicates > 0 {
+                    log_stream_meta.replicates as usize
+                } else {
+                    3
+                };
+                let selected = Self::select_nodes(&s.nodes, &s.disks, target_replicas)?;
+                let new_tail = MgrExtentInfo {
+                    extent_id: new_tail_id,
+                    replicates: selected.iter().map(|n| n.node_id).collect(),
+                    parity: vec![],
+                    replicate_disks: vec![0u64; selected.len()],
+                    parity_disks: vec![],
+                    sealed_length: 0,
+                    avali: 0,
+                    eversion: 1,
+                    refs: 1,
+                    vp_table_refs: 0,
+                    ec_converted: false,
+                };
+
+                let (log_dup, log_exts) = Self::compute_merge_streams(
+                    &s,
+                    survivor_meta.log_stream,
+                    victim_meta.log_stream,
+                    req.log_sealed_lengths[0] as u32,
+                    req.log_sealed_lengths[1] as u32,
+                    new_tail.clone(),
+                )?;
+                let (row_dup, row_exts) = Self::splice_streams_without_new_tail(
+                    &s,
+                    survivor_meta.row_stream,
+                    victim_meta.row_stream,
+                    req.row_sealed_lengths[0] as u32,
+                    req.row_sealed_lengths[1] as u32,
+                )?;
+                let (meta_dup, meta_exts) = Self::splice_streams_without_new_tail(
+                    &s,
+                    survivor_meta.meta_stream,
+                    victim_meta.meta_stream,
+                    req.meta_sealed_lengths[0] as u32,
+                    req.meta_sealed_lengths[1] as u32,
+                )?;
+
+                let new_streams = vec![log_dup, row_dup, meta_dup];
+                let mut all_extents = Vec::new();
+                all_extents.extend(log_exts);
+                all_extents.extend(row_exts);
+                all_extents.extend(meta_exts);
+
+                let merged_vp = Self::merged_partition_vp_refs(
+                    &s,
+                    req.survivor_part_id,
+                    req.victim_part_id,
+                );
+                let vp_extent_puts =
+                    Self::preview_partition_vp_refs_apply(&s, &merged_vp);
+                let all_extents = Self::merge_extent_updates(all_extents, vp_extent_puts);
+
+                let mut new_survivor_meta = survivor_meta.clone();
+                new_survivor_meta.rg = Some(MgrRange {
+                    start_key: s_rg.start_key,
+                    end_key: v_rg.end_key,
+                });
+
+                Ok(Phase1Result {
+                    new_streams,
+                    modified_extents: all_extents,
+                    survivor_meta: new_survivor_meta,
+                    merged_vp,
+                    victim_part_id: req.victim_part_id,
+                    victim_log: victim_meta.log_stream,
+                    victim_row: victim_meta.row_stream,
+                    victim_meta: victim_meta.meta_stream,
+                    new_tail_id,
+                    selected_nodes: selected,
+                    new_tail_replicas: target_replicas as u32,
+                    pre_bump_eversion,
+                })
+            })()
+        };
+
+        let p1 = match phase1 {
+            Ok(t) => t,
+            Err(e) => {
+                return Ok(rkyv_encode(&MultiModifyMergeResp {
+                    code: Self::err_to_code(&e),
+                    message: e.to_string(),
+                    new_log_tail_extent_id: 0,
+                }))
+            }
+        };
+
+        // Phase 1.5: alloc_extent_on_node for E_new on each replica.
+        // On per-node failure, fall back to other healthy nodes (mirrors
+        // handle_stream_alloc_extent's fallback walk).
+        let p1_selected_ids: HashSet<u64> =
+            p1.selected_nodes.iter().map(|n| n.node_id).collect();
+        let mut fallback_nodes: Vec<MgrNodeInfo> = {
+            let s = self.store.inner.borrow();
+            s.nodes
+                .values()
+                .filter(|n| !p1_selected_ids.contains(&n.node_id))
+                .cloned()
+                .collect()
+        };
+        {
+            use rand::seq::SliceRandom;
+            fallback_nodes.shuffle(&mut rand::thread_rng());
+        }
+        let mut fallback_iter = fallback_nodes.into_iter();
+        let mut final_node_ids: Vec<u64> = Vec::with_capacity(p1.selected_nodes.len());
+        let mut final_disk_ids: Vec<u64> = Vec::with_capacity(p1.selected_nodes.len());
+        for n in &p1.selected_nodes {
+            let mut candidate = n.clone();
+            let (node_id, disk_id) = loop {
+                match self
+                    .alloc_extent_on_node(&candidate.address, p1.new_tail_id)
+                    .await
+                {
+                    Ok(disk) => break (candidate.node_id, disk),
+                    Err(_) => match fallback_iter.next() {
+                        Some(alt) => candidate = alt,
+                        None => {
+                            return Ok(rkyv_encode(&MultiModifyMergeResp {
+                                code: CODE_PRECONDITION,
+                                message: format!(
+                                    "no healthy node available to allocate E_new {}",
+                                    p1.new_tail_id
+                                ),
+                                new_log_tail_extent_id: 0,
+                            }));
+                        }
+                    },
+                }
+            };
+            final_node_ids.push(node_id);
+            final_disk_ids.push(disk_id);
+        }
+
+        // Patch E_new with the actual node/disk ids (Phase 1's selected_nodes
+        // may have been replaced via fallback walk).
+        let mut modified_extents = p1.modified_extents;
+        let _ = p1.new_tail_replicas; // reserved for diagnostics
+        if let Some(e_new) = modified_extents
+            .iter_mut()
+            .find(|e| e.extent_id == p1.new_tail_id)
+        {
+            e_new.replicates = final_node_ids;
+            e_new.replicate_disks = final_disk_ids;
+        }
+
+        // Phase 2: single fenced etcd txn.
+        if let Some(etcd) = &self.etcd {
+            let now = Self::epoch_seconds();
+            let mut kvs = Vec::with_capacity(p1.new_streams.len() + modified_extents.len() + 6);
+            for st in &p1.new_streams {
+                kvs.push((format!("streams/{}", st.stream_id), rkyv_encode(st).to_vec()));
+            }
+            for ex in &modified_extents {
+                kvs.push((
+                    format!("extents/{}", ex.extent_id),
+                    rkyv_encode(ex).to_vec(),
+                ));
+            }
+            kvs.push((
+                format!("partitionVpRefs/{}", p1.merged_vp.part_id),
+                rkyv_encode(&p1.merged_vp).to_vec(),
+            ));
+            kvs.push((
+                format!("partitions/{}", p1.survivor_meta.part_id),
+                rkyv_encode(&p1.survivor_meta).to_vec(),
+            ));
+            {
+                let s = self.store.inner.borrow();
+                let region = Self::compute_region_for_partition(&s, &p1.survivor_meta);
+                kvs.push((
+                    format!("regions/{}", p1.survivor_meta.part_id),
+                    rkyv_encode(&region).to_vec(),
+                ));
+            }
+            kvs.push((
+                format!("partitionLastOp/{}", p1.survivor_meta.part_id),
+                now.to_le_bytes().to_vec(),
+            ));
+
+            let deletes = vec![
+                format!("partitions/{}", p1.victim_part_id),
+                format!("streams/{}", p1.victim_log),
+                format!("streams/{}", p1.victim_row),
+                format!("streams/{}", p1.victim_meta),
+                format!("partitionVpRefs/{}", p1.victim_part_id),
+                format!("regions/{}", p1.victim_part_id),
+                format!("partitionLastOp/{}", p1.victim_part_id),
+            ];
+            etcd.put_and_delete_txn(kvs, deletes)
+                .await
+                .map_err(|e| Self::err_to_status(&e))?;
+        }
+
+        // Phase 3: in-memory apply with verify-at-apply.
+        {
+            let mut s = self.store.inner.borrow_mut();
+            for (eid, expected) in &p1.pre_bump_eversion {
+                if let Some(live) = s.extents.get(eid).map(|ex| ex.eversion) {
+                    if live != *expected {
+                        return Ok(rkyv_encode(&MultiModifyMergeResp {
+                            code: CODE_PRECONDITION,
+                            message: format!(
+                                "extent {eid} eversion drift during merge \
+                                 ({expected} -> {live}); retry merge"
+                            ),
+                            new_log_tail_extent_id: 0,
+                        }));
+                    }
+                }
+            }
+            Self::apply_merge_mutations(
+                &mut s,
+                &p1.new_streams,
+                &modified_extents,
+                p1.survivor_meta.clone(),
+                p1.merged_vp,
+                p1.victim_part_id,
+                p1.victim_log,
+                p1.victim_row,
+                p1.victim_meta,
+            );
+        }
+        let now = Self::epoch_seconds();
+        self.last_op_at
+            .borrow_mut()
+            .insert(p1.survivor_meta.part_id, now);
+        self.last_op_at.borrow_mut().remove(&p1.victim_part_id);
+
+        Ok(rkyv_encode(&MultiModifyMergeResp {
+            code: CODE_OK,
+            message: String::new(),
+            new_log_tail_extent_id: p1.new_tail_id,
+        }))
+    }
+
+    // ── F181: handle_get_policy_candidates / handle_report_partition_load ──
+
+    pub(crate) async fn handle_get_policy_candidates(
+        &self,
+        _payload: Bytes,
+    ) -> HandlerResult {
+        let p = self.policy.borrow();
+        let candidates = p.advisory_cache.clone();
+        Ok(rkyv_encode(&GetPolicyCandidatesResp {
+            code: CODE_OK,
+            message: String::new(),
+            candidates,
+        }))
+    }
+
+    pub(crate) async fn handle_report_partition_load(
+        &self,
+        payload: Bytes,
+    ) -> HandlerResult {
+        let req: ReportPartitionLoadReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let now = Self::epoch_seconds();
+        let mut p = self.policy.borrow_mut();
+        for load in req.partitions {
+            p.metrics.entry(load.part_id).or_default().push(now, load);
+        }
+        drop(p);
+        Ok(rkyv_encode(&CodeResp {
+            code: CODE_OK,
+            message: String::new(),
+        }))
+    }
 
     pub(crate) async fn handle_register_ps(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
