@@ -612,6 +612,65 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
     });
 }
 
+/// F184 auto-split smoke: invoke `force_auto_split` and verify the
+/// manager dispatches MSG_SPLIT_PART to the owning PS via conn_pool.
+#[test]
+#[ignore]
+fn auto_dispatch_split_dispatches_msg_split_part() {
+    use autumn_manager::AutumnManager;
+
+    let mgr_addr = pick_addr();
+
+    let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
+    let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let manager = AutumnManager::new();
+        let mgr_for_serve = manager.clone();
+        compio::runtime::spawn(async move {
+            let _ = mgr_for_serve.serve(mgr_addr).await;
+        }).detach();
+        compio::time::sleep(Duration::from_millis(200)).await;
+
+        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 96).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 7001, log, row, meta, b"a", b"z").await;
+
+        let ps_addr = pick_addr();
+        start_partition_server(96, mgr_addr, ps_addr);
+        compio::time::sleep(Duration::from_millis(2000)).await;
+        let _ps = RpcClient::connect(ps_addr).await.expect("connect ps");
+        let router = PsRouter::new(mgr_addr, ps_addr);
+
+        // Populate enough keys for unique_user_keys to find a clean mid.
+        for i in 0u8..10 {
+            psr_put(&router, 7001, format!("key-{:02}", i).as_bytes(), b"v").await;
+        }
+        psr_flush(&router, 7001).await;
+        psr_compact(&router, 7001).await;
+        compio::time::sleep(Duration::from_millis(2000)).await;
+
+        // Auto-dispatch the split via force_auto_split. Manager looks up
+        // owning PS from regions/part_addrs, sends MSG_SPLIT_PART via
+        // its conn_pool, returns Ok on PS handler success.
+        manager.force_auto_split(7001).await.expect("force_auto_split must succeed");
+
+        // Wait for region propagation.
+        let _ = poll_until_async(
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+            || async { get_regions(&mgr).await.regions.len() == 2 },
+        ).await;
+        let regions = get_regions(&mgr).await;
+        assert_eq!(regions.regions.len(), 2, "auto-split must produce 2 regions");
+    });
+}
+
 #[allow(dead_code)]
 fn _suppress_unused() {
     let _ = Bytes::new();
