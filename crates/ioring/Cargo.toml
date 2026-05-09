@@ -12,6 +12,11 @@ name = "autumn-ioring-daemon"
 path = "src/bin/daemon.rs"
 required-features = ["daemon"]
 
+[[bin]]
+name = "autumn-ioring-bench"
+path = "src/bin/bench.rs"
+required-features = ["bench"]
+
 [features]
 default = []
 # `daemon` pulls in the autumn-client + compio runtime dependencies
@@ -20,6 +25,9 @@ default = []
 # linked into a Python pyo3 binding (F180-D) without the heavy
 # transitive compio chain.
 daemon = ["dep:autumn-client", "dep:compio", "dep:futures", "dep:anyhow", "dep:tracing-subscriber", "dep:clap"]
+# `bench` is the read-throughput harness. Lighter dep set (no compio,
+# no autumn-client) — uses std threads + the IoRingClient API.
+bench = ["dep:clap", "dep:anyhow", "dep:tracing-subscriber"]
 
 [dependencies]
 bytes = { workspace = true }

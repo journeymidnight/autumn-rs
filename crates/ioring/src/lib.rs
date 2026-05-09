@@ -65,6 +65,8 @@ pub mod handshake;
 pub mod socket;
 #[cfg(target_os = "linux")]
 pub mod mmap;
+#[cfg(target_os = "linux")]
+pub mod client;
 
 pub use opcode::Opcode;
 pub use sqe::{Sqe, SqeDecodeError};
