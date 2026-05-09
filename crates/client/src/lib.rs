@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -81,21 +81,31 @@ pub struct KeyMeta {
 ///
 /// Supports multiple manager addresses with round-robin failover on
 /// NotLeader or connection errors. PS connections auto-reconnect on failure.
+///
+/// **All hot-path methods take `&self`** so an `Rc<ClusterClient>` can be
+/// shared across concurrent compio tasks (e.g., FUSE dispatcher spawning
+/// per-request tasks). Internal mutability is provided via `RefCell` for
+/// the routing caches and `Cell` for the manager round-robin index.
+/// Borrows are deliberately scoped: every `borrow()` / `borrow_mut()` is
+/// released before any `.await`.
 pub struct ClusterClient {
     /// Manager addresses (comma-separated on construction).
     manager_addrs: Vec<String>,
     /// Current manager index (round-robin).
     current_mgr: Cell<usize>,
     /// Cached manager RPC connection. Recreated on error.
-    mgr_conn: Rc<std::cell::RefCell<Option<Rc<RpcClient>>>>,
+    mgr_conn: Rc<RefCell<Option<Rc<RpcClient>>>>,
     /// Cached PS RPC connections. Dropped on error, recreated on next use.
-    ps_conns: std::cell::RefCell<HashMap<String, Rc<RpcClient>>>,
-    regions: Vec<(u64, MgrRegionInfo)>,
-    ps_details: HashMap<u64, MgrPsDetail>,
+    ps_conns: RefCell<HashMap<String, Rc<RpcClient>>>,
+    /// Routing cache. Populated on `connect`, refreshed on `refresh_regions`.
+    /// `RefCell` so concurrent tasks holding `Rc<ClusterClient>` can do
+    /// brief lookup-and-clone borrows without blocking each other.
+    regions: RefCell<Vec<(u64, MgrRegionInfo)>>,
+    ps_details: RefCell<HashMap<u64, MgrPsDetail>>,
     /// F099-K — per-partition listener addresses, indexed by `part_id`.
     /// When an entry is present, it supersedes `ps_details[ps_id].address`
     /// for routing decisions (thread-per-partition shard target).
-    part_addrs: HashMap<u64, String>,
+    part_addrs: RefCell<HashMap<u64, String>>,
 }
 
 impl ClusterClient {
@@ -176,14 +186,14 @@ impl ClusterClient {
             .map(|s| s.trim().to_string())
             .collect();
 
-        let mut client = Self {
+        let client = Self {
             manager_addrs,
             current_mgr: Cell::new(0),
-            mgr_conn: Rc::new(std::cell::RefCell::new(None)),
-            ps_conns: std::cell::RefCell::new(HashMap::new()),
-            regions: Vec::new(),
-            ps_details: HashMap::new(),
-            part_addrs: HashMap::new(),
+            mgr_conn: Rc::new(RefCell::new(None)),
+            ps_conns: RefCell::new(HashMap::new()),
+            regions: RefCell::new(Vec::new()),
+            ps_details: RefCell::new(HashMap::new()),
+            part_addrs: RefCell::new(HashMap::new()),
         };
 
         // Try connecting to each manager until one responds
@@ -206,7 +216,7 @@ impl ClusterClient {
         Ok(client)
     }
 
-    pub async fn refresh_regions(&mut self) -> Result<()> {
+    pub async fn refresh_regions(&self) -> Result<()> {
         let resp_bytes = self
             .mgr_call_retry(MSG_GET_REGIONS, Bytes::new(), 3)
             .await
@@ -246,9 +256,10 @@ impl ClusterClient {
                 );
             }
         }
-        self.regions = sorted;
-        self.ps_details = resp.ps_details.into_iter().collect();
-        self.part_addrs = resp.part_addrs.into_iter().collect();
+        // Brief swap — no .await held under any borrow.
+        *self.regions.borrow_mut() = sorted;
+        *self.ps_details.borrow_mut() = resp.ps_details.into_iter().collect();
+        *self.part_addrs.borrow_mut() = resp.part_addrs.into_iter().collect();
         Ok(())
     }
 
@@ -289,26 +300,29 @@ impl ClusterClient {
     }
 
     pub fn lookup_key(&self, key: &[u8]) -> Option<(u64, String)> {
-        if self.regions.is_empty() {
+        let regions = self.regions.borrow();
+        if regions.is_empty() {
             return None;
         }
-        let idx = self.regions.partition_point(|(_, region)| match region.rg.as_ref() {
+        let idx = regions.partition_point(|(_, region)| match region.rg.as_ref() {
             Some(rg) if !rg.end_key.is_empty() => rg.end_key.as_slice() <= key,
             _ => false,
         });
-        if idx >= self.regions.len() {
+        if idx >= regions.len() {
             return None;
         }
-        let (_, region) = &self.regions[idx];
+        let (_, region) = &regions[idx];
         // F099-K: prefer per-partition listener if registered.
-        let addr = match self.part_addrs.get(&region.part_id) {
+        let part_addrs = self.part_addrs.borrow();
+        let ps_details = self.ps_details.borrow();
+        let addr = match part_addrs.get(&region.part_id) {
             Some(a) => a.clone(),
-            None => self.ps_details.get(&region.ps_id)?.address.clone(),
+            None => ps_details.get(&region.ps_id)?.address.clone(),
         };
         Some((region.part_id, addr))
     }
 
-    pub async fn resolve_key(&mut self, key: &[u8]) -> Result<(u64, String)> {
+    pub async fn resolve_key(&self, key: &[u8]) -> Result<(u64, String)> {
         if let Some(result) = self.lookup_key(key) {
             return Ok(result);
         }
@@ -317,48 +331,42 @@ impl ClusterClient {
             .ok_or_else(|| anyhow!("key is out of range"))
     }
 
-    pub async fn resolve_part_id(&mut self, part_id: u64) -> Result<String> {
+    pub async fn resolve_part_id(&self, part_id: u64) -> Result<String> {
         // F099-K: prefer the per-partition listener address when
         // registered; fall back to the PS-level base address otherwise.
-        let lookup = |regions: &Vec<(u64, MgrRegionInfo)>,
-                      ps_details: &HashMap<u64, MgrPsDetail>,
-                      part_addrs: &HashMap<u64, String>| {
-            regions
-                .iter()
-                .find(|(_, r)| r.part_id == part_id)
-                .and_then(|(_, region)| {
-                    if let Some(a) = part_addrs.get(&region.part_id) {
-                        return Some(a.clone());
-                    }
-                    ps_details.get(&region.ps_id).map(|d| d.address.clone())
-                })
+        // Borrows are scoped — released before any `.await`.
+        let lookup = |this: &Self| -> Option<String> {
+            let regions = this.regions.borrow();
+            let region = regions.iter().find(|(_, r)| r.part_id == part_id)?;
+            let part_addrs = this.part_addrs.borrow();
+            if let Some(a) = part_addrs.get(&region.1.part_id) {
+                return Some(a.clone());
+            }
+            let ps_details = this.ps_details.borrow();
+            ps_details.get(&region.1.ps_id).map(|d| d.address.clone())
         };
-        if let Some(addr) = lookup(&self.regions, &self.ps_details, &self.part_addrs) {
+        if let Some(addr) = lookup(self) {
             return Ok(addr);
         }
         self.refresh_regions().await?;
-        lookup(&self.regions, &self.ps_details, &self.part_addrs)
-            .ok_or_else(|| anyhow!("partition {} not found", part_id))
+        lookup(self).ok_or_else(|| anyhow!("partition {} not found", part_id))
     }
 
-    pub async fn all_partitions(&mut self) -> Result<Vec<(u64, String)>> {
-        if self.regions.is_empty() {
+    pub async fn all_partitions(&self) -> Result<Vec<(u64, String)>> {
+        if self.regions.borrow().is_empty() {
             self.refresh_regions().await?;
         }
-        let mut result: Vec<(u64, String)> = self
-            .regions
+        let regions = self.regions.borrow();
+        let part_addrs = self.part_addrs.borrow();
+        let ps_details = self.ps_details.borrow();
+        let mut result: Vec<(u64, String)> = regions
             .iter()
             .map(|(_, region)| {
                 // F099-K: prefer per-partition listener address when present.
-                let addr = self
-                    .part_addrs
+                let addr = part_addrs
                     .get(&region.part_id)
                     .cloned()
-                    .or_else(|| {
-                        self.ps_details
-                            .get(&region.ps_id)
-                            .map(|d| d.address.clone())
-                    })
+                    .or_else(|| ps_details.get(&region.ps_id).map(|d| d.address.clone()))
                     .unwrap_or_default();
                 (region.part_id, addr)
             })
@@ -374,24 +382,21 @@ impl ClusterClient {
     /// always fell in ONE partition, making N>1 perf tests measure a single
     /// partition with (N-1) rejecting load.
     pub async fn all_partitions_with_range(
-        &mut self,
+        &self,
     ) -> Result<Vec<(u64, String, Vec<u8>, Vec<u8>)>> {
-        if self.regions.is_empty() {
+        if self.regions.borrow().is_empty() {
             self.refresh_regions().await?;
         }
-        let mut result: Vec<(u64, String, Vec<u8>, Vec<u8>)> = self
-            .regions
+        let regions = self.regions.borrow();
+        let part_addrs = self.part_addrs.borrow();
+        let ps_details = self.ps_details.borrow();
+        let mut result: Vec<(u64, String, Vec<u8>, Vec<u8>)> = regions
             .iter()
             .map(|(_, region)| {
-                let addr = self
-                    .part_addrs
+                let addr = part_addrs
                     .get(&region.part_id)
                     .cloned()
-                    .or_else(|| {
-                        self.ps_details
-                            .get(&region.ps_id)
-                            .map(|d| d.address.clone())
-                    })
+                    .or_else(|| ps_details.get(&region.ps_id).map(|d| d.address.clone()))
                     .unwrap_or_default();
                 let (start_key, end_key) = region
                     .rg
@@ -409,7 +414,7 @@ impl ClusterClient {
 
     /// Resolve key to (part_id, ps_addr), call PS, retry once on failure with refresh.
     async fn call_ps_for_key(
-        &mut self,
+        &self,
         key: &[u8],
         msg_type: u8,
         build_payload: impl Fn(u64) -> Bytes,
@@ -428,7 +433,7 @@ impl ClusterClient {
 
     /// Resolve part_id to ps_addr, call PS, retry once on failure with refresh.
     async fn call_ps_for_part(
-        &mut self,
+        &self,
         part_id: u64,
         msg_type: u8,
         payload: Bytes,
@@ -453,13 +458,13 @@ impl ClusterClient {
     /// flag; after F178 the field was removed from the wire and every
     /// append goes through the extent-node fsync coalescer (RocksDB-style
     /// group commit). Callers no longer have a "fast but unsafe" mode.
-    pub async fn put(&mut self, key: &[u8], value: &[u8]) -> std::result::Result<(), AutumnError> {
+    pub async fn put(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), AutumnError> {
         self.put_opts(key, value, 0).await
     }
 
     /// Put a key-value pair with TTL (seconds from now). 0 = no expiry.
     pub async fn put_with_ttl(
-        &mut self,
+        &self,
         key: &[u8],
         value: &[u8],
         ttl_secs: u64,
@@ -477,7 +482,7 @@ impl ClusterClient {
     }
 
     async fn put_opts(
-        &mut self,
+        &self,
         key: &[u8],
         value: &[u8],
         expires_at: u64,
@@ -495,7 +500,7 @@ impl ClusterClient {
     }
 
     /// Get a value by key. Returns None if not found.
-    pub async fn get(&mut self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
+    pub async fn get(&self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
         self.get_range(key, 0, 0).await
     }
 
@@ -507,7 +512,7 @@ impl ClusterClient {
     /// on RPC error and routing is refreshed on the second attempt — same
     /// resilience as `get`/`put`/`head` after a cluster restart.
     pub async fn get_range(
-        &mut self,
+        &self,
         key: &[u8],
         offset: u32,
         length: u32,
@@ -527,7 +532,7 @@ impl ClusterClient {
     }
 
     /// Delete a key. Returns Ok(()) even if key didn't exist.
-    pub async fn delete(&mut self, key: &[u8]) -> std::result::Result<(), AutumnError> {
+    pub async fn delete(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
         let key = key.to_vec();
         let resp_bytes = self.call_ps_for_key(&key, MSG_DELETE, |part_id| {
             rkyv_encode(&DeleteReq { part_id, key: key.clone() })
@@ -540,7 +545,7 @@ impl ClusterClient {
     }
 
     /// Get key metadata (existence and value length).
-    pub async fn head(&mut self, key: &[u8]) -> std::result::Result<KeyMeta, AutumnError> {
+    pub async fn head(&self, key: &[u8]) -> std::result::Result<KeyMeta, AutumnError> {
         let key = key.to_vec();
         let resp_bytes = self.call_ps_for_key(&key, MSG_HEAD, |part_id| {
             rkyv_encode(&HeadReq { part_id, key: key.clone() })
@@ -551,67 +556,71 @@ impl ClusterClient {
 
     /// Range scan with prefix filter. Scans across partitions like Go's Range().
     pub async fn range(
-        &mut self,
+        &self,
         prefix: &[u8],
         start: &[u8],
         limit: u32,
     ) -> std::result::Result<RangeResult, AutumnError> {
         // Ensure regions are loaded
-        if self.regions.is_empty() {
+        if self.regions.borrow().is_empty() {
             self.refresh_regions().await
                 .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
         }
 
         let search_key = if start.is_empty() { prefix } else { start };
 
-        // Find starting partition index (same binary search as lookup_key)
-        let start_idx = self.regions.partition_point(|(_, region)| match region.rg.as_ref() {
-            Some(rg) if !rg.end_key.is_empty() => rg.end_key.as_slice() <= search_key,
-            _ => false,
-        });
+        // Snapshot the routing info into Vec<(part_id, ps_addr, start_key)>
+        // upfront so we can drop the borrow before any await. F112: prefer
+        // per-partition listener (F099-K) — same lookup pattern as
+        // `lookup_key` / `resolve_part_id` / `all_partitions`.
+        let snapshot: Vec<(u64, String, Vec<u8>)> = {
+            let regions = self.regions.borrow();
+            let part_addrs = self.part_addrs.borrow();
+            let ps_details = self.ps_details.borrow();
+            let start_idx = regions.partition_point(|(_, region)| match region.rg.as_ref() {
+                Some(rg) if !rg.end_key.is_empty() => rg.end_key.as_slice() <= search_key,
+                _ => false,
+            });
+            let mut out = Vec::new();
+            for (_, region) in regions.iter().skip(start_idx) {
+                let ps_addr = match part_addrs.get(&region.part_id) {
+                    Some(a) => a.clone(),
+                    None => match ps_details.get(&region.ps_id) {
+                        Some(d) => d.address.clone(),
+                        None => {
+                            return Err(AutumnError::RoutingError(format!(
+                                "no address for partition {} (ps_id {})",
+                                region.part_id, region.ps_id
+                            )));
+                        }
+                    },
+                };
+                let region_start_key = region
+                    .rg
+                    .as_ref()
+                    .map(|r| r.start_key.clone())
+                    .unwrap_or_default();
+                out.push((region.part_id, ps_addr, region_start_key));
+            }
+            out
+        };
 
         let mut remaining = limit;
         let mut all_entries = Vec::new();
         let mut has_more = false;
 
-        // Iterate from starting partition through subsequent ones
-        for i in start_idx..self.regions.len() {
+        for (idx, (part_id, ps_addr, region_start_key)) in snapshot.iter().enumerate() {
             if remaining == 0 {
                 has_more = true;
                 break;
             }
-
-            let (_, region) = &self.regions[i];
-
             // For partitions after the first, check if start_key still has the prefix
-            if i != start_idx && !prefix.is_empty() {
-                if let Some(rg) = &region.rg {
-                    if !rg.start_key.starts_with(prefix) {
-                        break;
-                    }
+            if idx != 0 && !prefix.is_empty() {
+                if !region_start_key.is_empty() && !region_start_key.starts_with(prefix) {
+                    break;
                 }
             }
-
-            let part_id = region.part_id;
-            // F112: prefer per-partition listener (F099-K). The PS-level
-            // address from `register_ps` is only the FIRST partition's
-            // listener post-F099-K; using it for every partition's range
-            // RPC mis-routes the other partitions, the PS replies with
-            // NotFound for `part_id != owner_part`, and we drop their
-            // entries. Mirror the lookup pattern in `lookup_key`,
-            // `resolve_part_id`, and `all_partitions`.
-            let ps_addr = match self.part_addrs.get(&part_id) {
-                Some(a) => a.clone(),
-                None => match self.ps_details.get(&region.ps_id) {
-                    Some(d) => d.address.clone(),
-                    None => {
-                        return Err(AutumnError::RoutingError(format!(
-                            "no address for partition {part_id} (ps_id {})",
-                            region.ps_id
-                        )));
-                    }
-                },
-            };
+            let part_id = *part_id;
 
             let resp_bytes = match self
                 .ps_call(
@@ -669,7 +678,7 @@ impl ClusterClient {
     ///
     /// F178: see `put` doc — every write is durable, no `must_sync` flag.
     pub async fn stream_put(
-        &mut self,
+        &self,
         key: &[u8],
         value: &[u8],
     ) -> std::result::Result<(), AutumnError> {
@@ -686,32 +695,32 @@ impl ClusterClient {
     }
 
     /// Trigger partition split.
-    pub async fn split(&mut self, part_id: u64) -> std::result::Result<(), AutumnError> {
+    pub async fn split(&self, part_id: u64) -> std::result::Result<(), AutumnError> {
         self.call_ps_for_part(part_id, MSG_SPLIT_PART, rkyv_encode(&SplitPartReq { part_id })).await?;
         Ok(())
     }
 
     /// Trigger compaction on a partition.
-    pub async fn compact(&mut self, part_id: u64) -> std::result::Result<(), AutumnError> {
+    pub async fn compact(&self, part_id: u64) -> std::result::Result<(), AutumnError> {
         self.maintenance(part_id, MAINTENANCE_COMPACT, vec![]).await
     }
 
     /// Trigger automatic GC on a partition.
-    pub async fn gc(&mut self, part_id: u64) -> std::result::Result<(), AutumnError> {
+    pub async fn gc(&self, part_id: u64) -> std::result::Result<(), AutumnError> {
         self.maintenance(part_id, MAINTENANCE_AUTO_GC, vec![]).await
     }
 
     /// Force GC of specific extents on a partition.
-    pub async fn force_gc(&mut self, part_id: u64, extent_ids: Vec<u64>) -> std::result::Result<(), AutumnError> {
+    pub async fn force_gc(&self, part_id: u64, extent_ids: Vec<u64>) -> std::result::Result<(), AutumnError> {
         self.maintenance(part_id, MAINTENANCE_FORCE_GC, extent_ids).await
     }
 
     /// Trigger flush on a partition.
-    pub async fn flush(&mut self, part_id: u64) -> std::result::Result<(), AutumnError> {
+    pub async fn flush(&self, part_id: u64) -> std::result::Result<(), AutumnError> {
         self.maintenance(part_id, MAINTENANCE_FLUSH, vec![]).await
     }
 
-    async fn maintenance(&mut self, part_id: u64, op: u8, extent_ids: Vec<u64>) -> std::result::Result<(), AutumnError> {
+    async fn maintenance(&self, part_id: u64, op: u8, extent_ids: Vec<u64>) -> std::result::Result<(), AutumnError> {
         let resp_bytes = self.call_ps_for_part(
             part_id, MSG_MAINTENANCE,
             rkyv_encode(&MaintenanceReq { part_id, op, extent_ids }),

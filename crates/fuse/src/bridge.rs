@@ -93,11 +93,19 @@ pub enum FsRequest {
         flags: i32,
         reply: Reply<u64>, // fh
     },
+    /// **Async-reply Read** — does NOT use the std::mpsc reply channel.
+    /// Instead, the fuser-side `ReplyData` is shipped across the bridge
+    /// to the compio thread, which calls `reply.data(...)` directly when
+    /// the parallel chunk fetch completes. This unblocks fuser's
+    /// single-threaded dispatch loop (see fuser-0.15 `Session::run` doc:
+    /// "read-dispatch-loop is non-concurrent"). Without this, every
+    /// FUSE read serialized at the kernel-channel layer regardless of
+    /// our compio-side concurrency.
     Read {
         ino: u64,
         offset: i64,
         size: u32,
-        reply: Reply<Vec<u8>>,
+        fuse_reply: fuser::ReplyData,
     },
     Write {
         ino: u64,

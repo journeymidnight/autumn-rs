@@ -242,9 +242,38 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             }.await;
             let _ = reply.send(result);
         }
-        FsRequest::Read { ino, offset, size, reply } => {
-            let result = read::read(state, ino, offset, size).await;
-            let _ = reply.send(result);
+        FsRequest::Read { ino, offset, size, fuse_reply } => {
+            // Async-reply two-phase read (autumn-fuse perf fix #1):
+            // - prepare under dispatcher's `&mut state` (cheap routing
+            //   lookups + inode cache hit, no real I/O);
+            // - spawn `execute` to do the parallel chunk fanout;
+            // - the spawned task replies to fuser DIRECTLY via the
+            //   shipped `ReplyData`, bypassing the std::mpsc reply hop.
+            // The fuser kernel-channel reader thread is then free to
+            // read the next /dev/fuse request immediately, so concurrent
+            // FUSE reads can actually overlap.
+            match read::prepare(state, ino, offset, size).await {
+                Ok(plan) => {
+                    compio::runtime::spawn(async move {
+                        match read::execute(plan).await {
+                            Ok(data) => fuse_reply.data(&data),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "fuse read execute failed");
+                                fuse_reply.error(libc::EIO);
+                            }
+                        }
+                    })
+                    .detach();
+                }
+                Err(e) => {
+                    let errno = if e.to_string().contains("not found") {
+                        libc::ENOENT
+                    } else {
+                        libc::EIO
+                    };
+                    fuse_reply.error(errno);
+                }
+            }
         }
         FsRequest::Write { ino, offset, data, reply } => {
             let result = write::write(state, ino, offset, &data).await;

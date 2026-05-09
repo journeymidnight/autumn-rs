@@ -38,8 +38,18 @@ impl Filesystem for AutumnFs {
     fn init(
         &mut self,
         _req: &Request<'_>,
-        _config: &mut fuser::KernelConfig,
+        config: &mut fuser::KernelConfig,
     ) -> Result<(), libc::c_int> {
+        // Bump max_read so a userspace `pread(8 MiB)` arrives as ONE
+        // FUSE read() call instead of 64 × 128 KiB. With the parallel
+        // chunk fetch in `read::execute` (autumn-fuse perf fix #2),
+        // a single 8 MiB FUSE read fans out 32 concurrent chunk RPCs;
+        // the kernel default 128 KiB cap forced single-chunk reads
+        // and hid the parallelism win on 8 M workloads. 1 MiB is the
+        // sweet spot — matches the 1 MiB write buffer (3FS reference)
+        // and keeps fuser's per-request buffer reasonable.
+        let _ = config.set_max_readahead(16 * 1024 * 1024);
+        let _ = config.set_max_write(1024 * 1024);
         match self.send(|reply| FsRequest::Init { reply }) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -203,7 +213,20 @@ impl Filesystem for AutumnFs {
             flags,
             reply: r,
         }) {
-            Ok(fh) => reply.opened(fh, 0),
+            // FOPEN_DIRECT_IO (= 1) — bypass kernel page cache so every
+            // user-space `read()` reaches our dispatcher. Without this,
+            // pages are cached after the first access and ~99% of reads
+            // never round-trip to autumn-fuse, masking any improvement
+            // from concurrent dispatch / parallel chunk fetch.
+            //
+            // Trade-off: removes the kernel page cache as a free
+            // accelerator for repeat reads. For workloads that benefit
+            // from page caching (e.g. hot key reread loops), this hurts.
+            // The right long-term tuning is to expose this as a mount
+            // option (`--direct-io`) so users can pick. For now we
+            // default to direct_io because measurement-without-it gives
+            // misleading "free" throughput numbers.
+            Ok(fh) => reply.opened(fh, 1),
             Err(e) => reply.error(err_to_errno(&e)),
         }
     }
@@ -219,14 +242,29 @@ impl Filesystem for AutumnFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        match self.send(|r| FsRequest::Read {
-            ino,
-            offset,
-            size,
-            reply: r,
-        }) {
-            Ok(data) => reply.data(&data),
-            Err(e) => reply.error(err_to_errno(&e)),
+        // Async-reply read (autumn-fuse perf fix #1): hand `reply`
+        // straight to compio thread and return immediately. The fuser
+        // single-threaded dispatch loop is then free to read the next
+        // /dev/fuse request while this read's parallel chunks are in
+        // flight on compio. Without this fix, fuser blocked here on the
+        // call_sync std::mpsc reply, capping aggregate FUSE read
+        // throughput at ~13 k ops/s regardless of client/dispatcher
+        // concurrency.
+        if self
+            .tx
+            .unbounded_send(FsRequest::Read {
+                ino,
+                offset,
+                size,
+                fuse_reply: reply,
+            })
+            .is_err()
+        {
+            // Channel closed — bridge gone. The unbounded_send swallowed
+            // ownership of `reply` so we can't reply with an error here;
+            // returning lets fuser time out. Should never happen in
+            // production unless the compio thread crashed.
+            tracing::error!("fuse Read: bridge channel closed");
         }
     }
 
