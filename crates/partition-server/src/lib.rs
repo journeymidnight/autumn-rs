@@ -704,6 +704,21 @@ pub(crate) struct PartitionData {
     /// at most). Not worth GC'ing the map; deleted extents leave benign
     /// stale entries with count=0.
     pub(crate) extent_pins: std::cell::RefCell<std::collections::HashMap<u64, std::rc::Rc<std::sync::atomic::AtomicI64>>>,
+    /// F181: per-partition load metrics for the manager's policy engine.
+    /// Counters are bumped by `merged_partition_loop` (req on each
+    /// dispatch, imm_full each time the imm cap stalls intake). The
+    /// PS-level `report_load_loop` snapshots and resets these every 5 s
+    /// and ships them via MSG_REPORT_PARTITION_LOAD.
+    pub(crate) metrics: std::sync::Arc<PartitionMetrics>,
+}
+
+#[derive(Default)]
+pub struct PartitionMetrics {
+    pub req_count: std::sync::atomic::AtomicU64,
+    pub imm_full_count: std::sync::atomic::AtomicU64,
+    /// Bytes resident: SST total + active.bytes + Σ imm.bytes. Updated
+    /// after each flush + memtable rotate (cheap; under borrow_mut).
+    pub size_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl PartitionData {
@@ -1119,6 +1134,10 @@ struct PartitionHandle {
     /// the manager via `MSG_REGISTER_PARTITION_ADDR` on open.
     #[allow(dead_code)]
     part_addr: String,
+    /// F181: cross-thread metrics handle. Bumped by the partition thread,
+    /// read by the main thread's `report_load_loop`. Arc is Send so this
+    /// is safe to clone across threads.
+    metrics: std::sync::Arc<PartitionMetrics>,
     /// JoinHandle retained for RAII.
     #[allow(dead_code)]
     join: Option<std::thread::JoinHandle<()>>,
@@ -1306,6 +1325,10 @@ impl PartitionServer {
         let s = server.clone();
         compio::runtime::spawn(async move { s.heartbeat_loop().await }).detach();
 
+        // F181: per-partition load metrics report (5 s cadence).
+        let s = server.clone();
+        compio::runtime::spawn(async move { s.report_load_loop().await }).detach();
+
         server.sync_regions_once().await?;
 
         Ok(server)
@@ -1384,6 +1407,60 @@ impl PartitionServer {
                         std::process::exit(1);
                     }
                 }
+            }
+        }
+    }
+
+    /// F181: every 5 s, snapshot per-partition metrics from each
+    /// PartitionHandle's Arc<PartitionMetrics> and ship to the manager
+    /// via MSG_REPORT_PARTITION_LOAD. Cheap — one RPC per cycle, payload
+    /// scales with partition count.
+    async fn report_load_loop(&self) {
+        const REPORT_INTERVAL_SECS: u64 = 5;
+        let mut ticker = compio::time::interval(Duration::from_secs(REPORT_INTERVAL_SECS));
+        ticker.tick().await; // first tick is immediate
+        loop {
+            ticker.tick().await;
+            let snapshots: Vec<manager_rpc::PartitionLoad> = {
+                let parts = self.partitions.borrow();
+                parts
+                    .iter()
+                    .map(|(part_id, handle)| {
+                        let req = handle
+                            .metrics
+                            .req_count
+                            .swap(0, std::sync::atomic::Ordering::Relaxed);
+                        let imm_full = handle
+                            .metrics
+                            .imm_full_count
+                            .swap(0, std::sync::atomic::Ordering::Relaxed);
+                        let size_bytes = handle
+                            .metrics
+                            .size_bytes
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        manager_rpc::PartitionLoad {
+                            part_id: *part_id,
+                            size_bytes,
+                            req_per_sec: (req / REPORT_INTERVAL_SECS) as u32,
+                            imm_full_per_sec: (imm_full / REPORT_INTERVAL_SECS) as u32,
+                            p99_us: 0,
+                        }
+                    })
+                    .collect()
+            };
+            if snapshots.is_empty() {
+                continue;
+            }
+            let req = manager_rpc::rkyv_encode(&manager_rpc::ReportPartitionLoadReq {
+                ps_id: self.ps_id,
+                partitions: snapshots,
+            });
+            if let Err(e) = self
+                .pool
+                .call(self.manager_addr(), manager_rpc::MSG_REPORT_PARTITION_LOAD, req)
+                .await
+            {
+                tracing::debug!("F181 report_load failed: {e}");
             }
         }
     }
@@ -1540,6 +1617,11 @@ impl PartitionServer {
         let owner_key_for_thread = owner_key.clone();
         let advertise_addr_for_thread = advertise_addr.clone();
         let compact_gate_for_thread = self.compact_gate.clone();
+        // F181: build the metrics Arc on the main thread so we can keep
+        // a clone in PartitionHandle for the report loop. The other clone
+        // is moved into the partition thread and threaded into PartitionData.
+        let metrics_for_thread = std::sync::Arc::new(PartitionMetrics::default());
+        let metrics_for_handle = metrics_for_thread.clone();
         let join = std::thread::Builder::new()
             .name(format!("part-{part_id}"))
             .spawn(move || {
@@ -1566,6 +1648,7 @@ impl PartitionServer {
                         drain_rx,
                         compact_gate_for_thread,
                         cpu_bulk,
+                        metrics_for_thread,
                     )
                     .await
                     {
@@ -1597,6 +1680,7 @@ impl PartitionServer {
             shutdown_tx: Some(shutdown_tx),
             drain_tx: Some(drain_tx),
             part_addr: advertise_addr,
+            metrics: metrics_for_handle,
             join: Some(join),
         })
     }
@@ -2321,6 +2405,7 @@ async fn handle_ps_connection(
 // Partition thread main — runs on a dedicated OS thread with its own compio
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn partition_thread_main(
     part_id: u64,
     rg: Range,
@@ -2338,6 +2423,7 @@ async fn partition_thread_main(
     drain_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
     compact_gate: std::sync::Arc<CompactionGate>,
     cpu_bulk: Option<usize>,
+    metrics_arc: std::sync::Arc<PartitionMetrics>,
 ) -> Result<()> {
     // F099-J: create the same-thread ps-conn ↔ merged_partition_loop
     // channel. Both endpoints live on THIS compio runtime, so sends and
@@ -2467,6 +2553,7 @@ async fn partition_thread_main(
         gc_gate: gc_gate.clone(),
         extent_pins: std::cell::RefCell::new(std::collections::HashMap::new()),
         upload_sessions: std::collections::HashMap::new(),
+        metrics: metrics_arc.clone(),
     }));
 
     sync_partition_vp_refs(&part)
@@ -2757,6 +2844,14 @@ async fn merged_partition_loop(
                 + p.imm.iter().map(|m| m.mem_bytes()).sum::<u64>();
             (p.imm.len() >= imm_cap, gap)
         };
+        // F181: track imm_full back-pressure events (per-iteration; coarse
+        // but matches the spec's "events/sec" semantics — per-tick rate).
+        if imm_full {
+            part.borrow()
+                .metrics
+                .imm_full_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // F120-A — drain any pending imm-pop notifications so we don't
         // accidentally wake on a stale signal in the wait branches below.
@@ -3022,6 +3117,11 @@ async fn handle_incoming_req(
     owner_key: &str,
     revision: i64,
 ) {
+    // F181: bump per-partition request counter for the policy engine.
+    part.borrow()
+        .metrics
+        .req_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     match req.msg_type {
         MSG_PUT => enqueue_put(req, pending),
         MSG_DELETE => enqueue_delete(req, pending),
