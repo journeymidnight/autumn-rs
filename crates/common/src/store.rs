@@ -9,7 +9,7 @@ use autumn_rpc::manager_rpc::{
 
 use crate::{AppError, AppResult};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MetadataState {
     pub next_id: u64,
     pub streams: HashMap<u64, MgrStreamInfo>,

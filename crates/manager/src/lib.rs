@@ -420,6 +420,58 @@ impl AutumnManager {
             mgr.extent_delete_loop().await;
         })
         .detach();
+
+        // F181: policy advisory tick.
+        let mgr = self.clone();
+        compio::runtime::spawn(async move {
+            mgr.policy_tick_loop().await;
+        })
+        .detach();
+    }
+
+    /// F181: every POLICY_TICK_INTERVAL_SEC, leader recomputes split/merge
+    /// candidates from the per-partition load windows + last_op_at +
+    /// region owners. Logs new candidates at INFO; exposes the cache
+    /// via MSG_GET_POLICY_CANDIDATES.
+    async fn policy_tick_loop(self) {
+        let interval = Duration::from_secs(crate::policy::POLICY_TICK_INTERVAL_SEC as u64);
+        loop {
+            compio::time::sleep(interval).await;
+            if !self.leader.get() {
+                continue;
+            }
+            let now = Self::epoch_seconds();
+            let owners: HashMap<u64, u64> = {
+                let s = self.store.inner.borrow();
+                s.regions.iter().map(|(id, r)| (*id, r.ps_id)).collect()
+            };
+            let last_op = self.last_op_at.borrow().clone();
+            let state_snapshot: autumn_common::MetadataState = (*self.store.inner.borrow()).clone();
+            let mut p = self.policy.borrow_mut();
+            let cands = p.compute_candidates(crate::policy::ComputeArgs {
+                state: &state_snapshot,
+                last_op_at: &last_op,
+                region_owners: &owners,
+                now,
+            });
+            if !cands.is_empty() {
+                tracing::info!("F181 policy: {} candidate(s)", cands.len());
+                for c in &cands {
+                    let kind = if c.kind == POLICY_KIND_SPLIT { "SPLIT" } else { "MERGE" };
+                    tracing::info!(
+                        "  {} primary={} secondary={} reason='{}' size={}MB qps={} imm/s={} same_ps={}",
+                        kind,
+                        c.primary_part_id,
+                        c.secondary_part_id,
+                        c.reason,
+                        c.size_bytes / (1024 * 1024),
+                        c.req_per_sec,
+                        c.imm_full_per_sec,
+                        c.same_ps,
+                    );
+                }
+            }
+        }
     }
 
     // ── Leader election ────────────────────────────────────────────────
