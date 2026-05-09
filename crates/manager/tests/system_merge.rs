@@ -698,6 +698,91 @@ fn auto_merge_fires_via_policy_tick_loop_fast_mode() {
     });
 }
 
+/// F184 fast-mode policy_tick_loop e2e for auto-SPLIT: enable auto-split
+/// with a 1-bucket / 1-second config + low SPLIT_SIZE_HARD threshold,
+/// send synthetic high-load metrics for one partition, verify
+/// policy_tick_loop fires SPLIT automatically.
+#[test]
+#[ignore]
+fn auto_split_fires_via_policy_tick_loop_fast_mode() {
+    use autumn_manager::AutumnManager;
+    use autumn_manager::policy::PolicyConfig;
+
+    let mgr_addr = pick_addr();
+
+    let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
+    let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let manager = AutumnManager::new();
+
+        // Fast-mode: 1 bucket / 1 s tick, no cooldown, low SPLIT_SIZE_HARD
+        // (10 MiB) so a synthetic metric with size=20 MiB fires immediately.
+        let mut cfg = PolicyConfig::default();
+        cfg.required_buckets = 1;
+        cfg.tick_interval_sec = 1;
+        cfg.split_cooldown_sec = 0;
+        cfg.merge_cooldown_sec = 0;
+        cfg.split_size_hard = 10 * 1024 * 1024;
+        manager.set_policy_config(cfg);
+        manager.set_auto_split(true);
+
+        let mgr_for_serve = manager.clone();
+        compio::runtime::spawn(async move {
+            let _ = mgr_for_serve.serve(mgr_addr).await;
+        }).detach();
+        compio::time::sleep(Duration::from_millis(200)).await;
+
+        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 98).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 9001, log, row, meta, b"a", b"z").await;
+
+        let ps_addr = pick_addr();
+        start_partition_server(98, mgr_addr, ps_addr);
+        compio::time::sleep(Duration::from_millis(2000)).await;
+        let _ps = RpcClient::connect(ps_addr).await.expect("connect ps");
+        let router = PsRouter::new(mgr_addr, ps_addr);
+
+        // Populate enough keys for split to find a clean mid_key.
+        for i in 0u8..10 {
+            psr_put(&router, 9001, format!("key-{:02}", i).as_bytes(), b"v").await;
+        }
+        psr_flush(&router, 9001).await;
+        psr_compact(&router, 9001).await;
+        compio::time::sleep(Duration::from_millis(2000)).await;
+
+        // Send synthetic HIGH-size load to trigger the size_hard split rule.
+        let load = PartitionLoad {
+            part_id: 9001,
+            size_bytes: 20 * 1024 * 1024, // > split_size_hard=10 MiB
+            req_per_sec: 0,
+            imm_full_per_sec: 0,
+            p99_us: 0,
+        };
+        let report_req = rkyv_encode(&ReportPartitionLoadReq {
+            ps_id: 98,
+            partitions: vec![load],
+        });
+        mgr.call(MSG_REPORT_PARTITION_LOAD, report_req)
+            .await
+            .expect("report_partition_load");
+
+        // Wait for policy_tick_loop to fire SPLIT.
+        let split = poll_until_async(
+            Duration::from_secs(30),
+            Duration::from_millis(500),
+            || async { get_regions(&mgr).await.regions.len() == 2 },
+        )
+        .await;
+        assert!(split, "auto-split via policy_tick_loop must produce 2 regions");
+    });
+}
+
 /// F184 auto-split smoke: invoke `force_auto_split` and verify the
 /// manager dispatches MSG_SPLIT_PART to the owning PS via conn_pool.
 #[test]
