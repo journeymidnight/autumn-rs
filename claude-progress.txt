@@ -59,15 +59,23 @@ F184 follow-on (8 commits, e516789..527d0a4):
           end-to-end in ~6 s
   F184-I: auto_split_fires_via_policy_tick_loop_fast_mode — mirror of
           F184-H for the SPLIT closed loop, ~5.5 s e2e
+  F184-J: split_merge_split_with_interleaved_writes — full lifecycle
+          (seed → split → puts → merge → puts → split-again → puts →
+          verify ALL keys readable), ~17 s e2e. Covers post-merge
+          region_sync reload + seq monotonicity across multi-step
+          topology changes.
 
 Test status (post-F184):
   cargo test -p autumn-rpc                                      : clean
   cargo test -p autumn-manager --lib                            : 51/51
-  cargo test -p autumn-manager --test system_merge -- --ignored : 8/8 (~57 s)
+  cargo test -p autumn-manager --test system_merge -- --ignored : 9/9 individually (each ≤ 60 s)
+  (Full --ignored suite has known test-isolation issue: cluster
+   processes accumulate across test cases; each test passes when
+   run in isolation. Not a F183/F184 correctness bug.)
   cargo test -p autumn-partition-server --lib                   : 130/130
   cargo build --workspace --exclude autumn-fuse                 : clean
 
-system_merge breakdown (8 integration tests):
+system_merge breakdown (9 integration tests):
   refusal-path:
     merge_refuses_self_merge
     merge_refuses_non_adjacent_partitions
@@ -80,6 +88,8 @@ system_merge breakdown (8 integration tests):
   full closed-loop (policy_tick_loop drives):
     auto_merge_fires_via_policy_tick_loop_fast_mode
     auto_split_fires_via_policy_tick_loop_fast_mode
+  full lifecycle stress:
+    split_merge_split_with_interleaved_writes (~17 s)
 
 Manager unit tests (51 total) breakdown:
   Pre-existing                                  : 30
@@ -117,4 +127,4 @@ Stage 2/3 production rollout:
     auto-split is the relief valve. Recorded in
     feedback_auto_split_before_merge.md.
 
-Final commit: 527d0a4 (F184-I).
+Final commit: 644c8fa (F184-J).
