@@ -1,4 +1,5 @@
 mod extent_delete;
+pub(crate) mod policy;
 mod recovery;
 mod rpc_handlers;
 
@@ -300,6 +301,15 @@ pub struct AutumnManager {
     /// restart loses pending entries; orphans then reaped by node
     /// startup reconcile.
     pub(crate) pending_extent_deletes: Rc<RefCell<VecDeque<PendingDelete>>>,
+    /// F181: per-partition unix-epoch timestamp of the last split or merge
+    /// involving this partition. Sourced from etcd prefix
+    /// `partitionLastOp/<part_id>` (i64 little-endian). Default 0 for
+    /// partitions never split/merged. Used by the policy engine for
+    /// cooldown.
+    pub(crate) last_op_at: Rc<RefCell<HashMap<u64, i64>>>,
+    /// F181: policy engine — split/merge candidate computation over a
+    /// 30-min sliding window of per-partition load metrics.
+    pub(crate) policy: Rc<RefCell<crate::policy::PolicyEngine>>,
 }
 
 impl Default for AutumnManager {
@@ -321,7 +331,14 @@ impl AutumnManager {
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),
             conn_pool: Rc::new(ConnPool::new()),
             pending_extent_deletes: Rc::new(RefCell::new(VecDeque::new())),
+            last_op_at: Rc::new(RefCell::new(HashMap::new())),
+            policy: Rc::new(RefCell::new(crate::policy::PolicyEngine::default())),
         }
+    }
+
+    /// F181: read the last_op_at timestamp for a partition (0 if never op'd).
+    pub(crate) fn last_op_at_for(&self, part_id: u64) -> i64 {
+        self.last_op_at.borrow().get(&part_id).copied().unwrap_or(0)
     }
 
     pub async fn new_with_etcd(endpoints: Vec<String>) -> Result<Self> {
@@ -544,6 +561,8 @@ impl AutumnManager {
         // them in recovery_dispatch_loop until the next
         // ec_conversion_dispatch_loop tick re-enters the convert path.
         let ec_inflight = c.get_prefix("ecConversionInflight/").await?;
+        // F181: per-partition last_op_at sidecar
+        let last_op = c.get_prefix("partitionLastOp/").await?;
         drop(c);
 
         let mut max_id = 0u64;
@@ -637,6 +656,16 @@ impl AutumnManager {
             decoded_ec_inflight.insert(id);
         }
 
+        // F181: parse partitionLastOp/ sidecar (i64 little-endian)
+        let mut decoded_last_op: HashMap<u64, i64> = HashMap::new();
+        for kv in &last_op.kvs {
+            let id = Self::parse_id_from_key("partitionLastOp/", &kv.key)?;
+            if kv.value.len() >= 8 {
+                let ts = i64::from_le_bytes(kv.value[..8].try_into().unwrap());
+                decoded_last_op.insert(id, ts);
+            }
+        }
+
         {
             let mut s = self.store.inner.borrow_mut();
             s.nodes = decoded_nodes;
@@ -658,6 +687,9 @@ impl AutumnManager {
         // recovery_dispatch_loop could fire on extents the prior leader
         // was converting.
         *self.ec_conversion_inflight.borrow_mut() = decoded_ec_inflight;
+        // F181: install last_op_at sidecar so policy engine cooldown
+        // gating is correct on cold-start as well.
+        *self.last_op_at.borrow_mut() = decoded_last_op;
 
         Ok(())
     }
