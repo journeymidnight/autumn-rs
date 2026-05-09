@@ -109,6 +109,21 @@ enum Command {
         file: String,
         nosync: bool,
     },
+    /// F129: multipart upload of a large value via PutBegin/Chunk/Commit.
+    /// Reads `file` (or stdin if file = "-"), splits into `chunk_size`
+    /// byte chunks, and commits.
+    PutStream {
+        key: String,
+        file: String,
+        chunk_size: usize,
+    },
+    /// F129: streaming read. Walks the value via offset/length GetReqs
+    /// and writes chunks to stdout (or `out` if provided).
+    GetStream {
+        key: String,
+        chunk_size: u32,
+        out: Option<String>,
+    },
     Get {
         key: String,
     },
@@ -355,6 +370,48 @@ fn parse_args() -> Args {
             let key = raw[i].clone();
             let file = raw[i + 1].clone();
             Command::StreamPut { key, file, nosync }
+        }
+        "put-stream" | "putstream" => {
+            // put-stream [--chunk-size N] <KEY> <FILE-or-->
+            let mut chunk_size: usize = 4 * 1024 * 1024; // 4 MiB default
+            while i < raw.len() && raw[i].starts_with('-') {
+                if raw[i] == "--chunk-size" && i + 1 < raw.len() {
+                    chunk_size = raw[i + 1].parse().unwrap_or(chunk_size);
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            if i + 1 >= raw.len() {
+                eprintln!("put-stream requires <KEY> <FILE-or-->");
+                std::process::exit(1);
+            }
+            let key = raw[i].clone();
+            let file = raw[i + 1].clone();
+            Command::PutStream { key, file, chunk_size }
+        }
+        "get-stream" | "getstream" => {
+            // get-stream [--chunk-size N] [--out FILE] <KEY>
+            let mut chunk_size: u32 = 4 * 1024 * 1024;
+            let mut out: Option<String> = None;
+            while i < raw.len() && raw[i].starts_with('-') {
+                if raw[i] == "--chunk-size" && i + 1 < raw.len() {
+                    chunk_size = raw[i + 1].parse().unwrap_or(chunk_size);
+                    i += 2;
+                    continue;
+                }
+                if raw[i] == "--out" && i + 1 < raw.len() {
+                    out = Some(raw[i + 1].clone());
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            if i >= raw.len() {
+                eprintln!("get-stream requires <KEY>");
+                std::process::exit(1);
+            }
+            Command::GetStream { key: raw[i].clone(), chunk_size, out }
         }
         "get" => {
             if i >= raw.len() {
@@ -1323,6 +1380,67 @@ async fn main() -> Result<()> {
             client.stream_put(key.as_bytes(), &value).await
                 .map_err(|e| anyhow!("stream put: {e}"))?;
             println!("ok ({file_size} bytes)");
+        }
+
+        Command::PutStream { key, file, chunk_size } => {
+            // F129: read full payload (stdin if file = "-"), drive
+            // PutBegin → N×Chunk → Commit. The handle owns the cached
+            // RpcClient so all chunks land on the same PS connection.
+            use std::io::Read;
+            let payload: Vec<u8> = if file == "-" {
+                let mut buf = Vec::new();
+                std::io::stdin().read_to_end(&mut buf)
+                    .with_context(|| "read stdin")?;
+                buf
+            } else {
+                std::fs::read(&file).with_context(|| format!("read file {file}"))?
+            };
+            let mut handle = client
+                .put_stream_begin(key.as_bytes(), 0)
+                .await
+                .map_err(|e| anyhow!("put-stream begin: {e}"))?;
+            let mut sent = 0u64;
+            let mut idx: usize = 0;
+            while idx < payload.len() {
+                let end = (idx + chunk_size).min(payload.len());
+                let n = handle
+                    .send(&payload[idx..end])
+                    .await
+                    .map_err(|e| anyhow!("put-stream chunk #{}: {e}", handle.chunks_sent()))?;
+                sent = n;
+                idx = end;
+            }
+            handle.commit().await.map_err(|e| anyhow!("put-stream commit: {e}"))?;
+            println!("ok ({sent} bytes, {} chunks)", payload.len().div_ceil(chunk_size));
+        }
+
+        Command::GetStream { key, chunk_size, out } => {
+            use std::io::Write;
+            let mut stream = match client
+                .get_stream(key.as_bytes(), chunk_size)
+                .await
+                .map_err(|e| anyhow!("get-stream: {e}"))?
+            {
+                Some(s) => s,
+                None => {
+                    eprintln!("not found");
+                    std::process::exit(1);
+                }
+            };
+            let total = stream.total_bytes();
+            let mut writer: Box<dyn Write> = match out {
+                Some(p) => Box::new(std::fs::File::create(&p)
+                    .with_context(|| format!("create output {p}"))?),
+                None => Box::new(std::io::stdout().lock()),
+            };
+            while let Some(chunk) = stream
+                .next_chunk()
+                .await
+                .map_err(|e| anyhow!("get-stream chunk: {e}"))?
+            {
+                writer.write_all(&chunk)?;
+            }
+            eprintln!("ok ({total} bytes)");
         }
 
         Command::Get { key } => {

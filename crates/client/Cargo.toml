@@ -9,3 +9,4 @@ autumn-rpc = { path = "../rpc" }
 anyhow.workspace = true
 bytes.workspace = true
 compio = { version = "0.18", features = ["time"] }
+tracing.workspace = true

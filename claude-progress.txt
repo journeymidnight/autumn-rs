@@ -2,89 +2,89 @@ Date: 2026-05-09
 TaskStatus: not_completed
 Task scope: F129 — PutStream / GetStream multipart upload.
             Phase A: wire types + multi-frag VP encoding (committed e49e120).
-            Phase B: PS server side — UploadSession state + 4 handlers
-                     (PutBegin / PutChunk / PutCommit / PutAbort) +
-                     regular Put size-cap reject + recovery skip for
-                     OP_CHUNK_BLOB + multi-frag handling in resolve_value
-                     (Phase C scope folded in since coupled). THIS COMMIT.
-            Phase D: client API (put_stream, get_stream).
-            Phase E: GC awareness of OP_CHUNK_BLOB (= F130 active rewrite,
-                     deferred — chunk fragments leak until host extent ages
-                     out below GC_DISCARD_RATIO; correctness OK, only
-                     storage overhead).
-            Phase F: autumn-fuse perf evaluation under PutStream.
+            Phase B: PS server side (committed da5c8fd).
+            Phase D: client API + autumn-client subcommands. THIS COMMIT.
+            Phase E (deferred): GC awareness of OP_CHUNK_BLOB / multi-
+                                 frag VP refs (= F130 active rewrite).
+            Phase F (deferred): autumn-fuse perf evaluation.
 
-F129 Phase B — what landed in this commit:
+F129 Phase D — what landed in this commit:
 
-  PartitionData state (crates/partition-server/src/lib.rs):
-    - New `UploadSession` struct: { user_key, expires_at, started_at_secs,
-      last_seen_secs, bytes_committed, next_chunk_index, fragments }.
-    - PartitionData gains `upload_sessions: HashMap<u128, UploadSession>`.
-    - 4 caps lifted to pub(crate) so handlers can reference them:
-      AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT, _HARD,
-      AUTUMN_PS_MAX_UPLOAD_SESSIONS_DEFAULT,
-      AUTUMN_PS_UPLOAD_TTL_SECS_DEFAULT.
-    - 2 op flags lifted to pub(crate): OP_VALUE_POINTER_MULTI,
-      OP_CHUNK_BLOB.
+  AutumnError extensions (crates/client/src/lib.rs):
+    - 2 new variants: ValueTooLarge { size, cap } and UploadNotFound.
+    - Display format omits cap when cap == 0 (server-side reject —
+      we don't parse the message; client has no authoritative cap
+      number to show).
+    - code_to_error maps CODE_VALUE_TOO_LARGE / CODE_UPLOAD_NOT_FOUND
+      to the new variants.
+    - CLIENT_PUT_HARD_CAP = 256 MiB (matches PS's
+      AUTUMN_PS_MAX_INLINE_BYTES_HARD).
 
-  RPC handlers (crates/partition-server/src/rpc_handlers.rs):
-    - handle_put_begin: TTL-evict expired sessions, check session cap,
-      generate u128 upload_id from /dev/urandom, insert empty session.
-    - handle_put_chunk: validate chunk_index ordering, encode V1 WAL
-      record with op=OP_CHUNK_BLOB + empty key, append to log_stream,
-      record (extent_id, offset+22 [V1 envelope+inner header], len)
-      as a fragment on the session.
-    - handle_put_commit: take session under borrow_mut, optional
-      bytes-total sanity check, build MultiFragVp blob, allocate seq,
-      append V1 WAL record (op=OP_VALUE_POINTER_MULTI|1, value=blob)
-      to log_stream, insert MemEntry into active memtable, advance
-      vp_extent_id/vp_offset, maybe_rotate.
-    - handle_put_abort: idempotent session removal.
-    - dispatch_partition_rpc routes the 4 new MSG_PUT_BEGIN/CHUNK/
-      COMMIT/ABORT msg_types inline (NOT through merged_partition_loop;
-      the per-stream worker still serialises log_stream appends).
-    - handle_head fixed to report total_len for multi-frag VPs (was
-      reporting blob byte-length).
+  ClusterClient API (crates/client/src/lib.rs):
+    - put_stream_begin(key, expires_at) -> PutStreamHandle. Resolves
+      part_id + caches Rc<RpcClient> on the handle so subsequent
+      send() calls don't re-resolve.
+    - get_stream(key, chunk_size) -> Option<GetStream>. Uses head() to
+      learn total_bytes upfront; subsequent next_chunk() calls walk
+      the value via offset/length GetReqs.
+    - Client-side cap pre-check on put_opts: rejects > 256 MiB without
+      a wire round-trip; lets PS authoritatively reject 64-256 MiB
+      range (default cap is 64 MiB but env-configurable).
 
-  Regular Put cap reject (crates/partition-server/src/lib.rs::enqueue_put):
-    - Values > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT (64 MiB) get a
-      CODE_VALUE_TOO_LARGE PutResp without entering the write batch.
-      Caller should retry via PutStream.
+  PutStreamHandle (handle struct):
+    - send(chunk) -> bytes_committed; advances next_chunk_index.
+    - commit(self) -> (); finalises the upload. Self-checks bytes_sent
+      against the PS via expected_total_bytes.
+    - abort(self) -> (); idempotent; best-effort RPC (no failure
+      reported because PS-side TTL is the safety net).
+    - Drop without commit/abort logs WARN (PS-side TTL reclaims).
 
-  Read side — multi-frag resolution (crates/partition-server/src/background.rs):
-    - resolve_value detects OP_VALUE_POINTER_MULTI flag, decodes the
-      MultiFragVp blob, calls resolve_multi_frag.
-    - resolve_multi_frag walks fragments in order and reads each
-      relevant slice via stream_client.read_bytes_from_extent. Reads
-      are SEQUENTIAL in this v1; concurrent fan-out is F131 (deferred).
+  GetStream (handle struct):
+    - next_chunk() -> Option<Vec<u8>>; yields chunk_size-byte chunks
+      until exhausted.
+    - position(), remaining(), total_bytes() accessors.
 
-  Recovery awareness (crates/partition-server/src/lib.rs::recover_partition):
-    - Skips OP_CHUNK_BLOB records (don't insert into memtable).
-    - For OP_VALUE_POINTER_MULTI records, stores the blob as the
-      memtable entry's value (no single-frag VP downgrade).
+  autumn-client subcommands (crates/server/src/bin/autumn_client.rs):
+    - `put-stream [--chunk-size N] <KEY> <FILE-or-->`: reads file (or
+      stdin if file = "-") in chunk_size-byte chunks via PutStream API.
+    - `get-stream [--chunk-size N] [--out FILE] <KEY>`: streaming read,
+      writes to stdout or out file.
+    - Default chunk_size is 4 MiB on both.
 
-  Tests:
-    - `enqueue_put_rejects_oversized_value`: verifies CODE_VALUE_TOO_LARGE
-      reply + zero pipeline entries.
-    - `enqueue_put_accepts_value_at_inline_cap`: at exactly the cap
-      (NOT strictly greater) the put goes through.
-    - All previous f129_multifrag_tests remain green.
-    - 130/130 partition-server lib tests pass at --test-threads=1
-      (was 128/128 in Phase A; +2 new).
+  Cargo.toml: added `tracing` to autumn-client's deps (used by Drop
+  impl on PutStreamHandle).
 
-Out of scope for this commit (Phase D / E / F):
-  - ClusterClient::put_stream / get_stream API.
-  - Regular ClusterClient::put client-side size pre-check (currently
-    only server-side reject).
-  - GC awareness of OP_CHUNK_BLOB (F130). Today's behaviour: chunk
-    fragments leak in log_stream until their host extent ages out
-    below GC_DISCARD_RATIO via OTHER live data churning. No
-    correctness bug; only storage overhead.
-  - F131 concurrent fragment pread (resolve_multi_frag is sequential).
-  - autumn-fuse PutStream-aware write path.
+Smoke test (3-replica TCP cluster, AUTUMN_PS_PARTS_HINT=8):
+  - 8 MiB payload via put-stream (8×1 MiB chunks): SHA256 round-trip
+    matches via both `get-stream` and regular `get`.
+  - 65 MiB regular `put`: rejected with CODE_VALUE_TOO_LARGE,
+    surfaced as "value 68157440 bytes exceeds the partition server's
+    inline cap — use put_stream".
+  - 100 MiB payload via put-stream (25×4 MiB chunks): SHA256 round-
+    trip matches via `get-stream`.
+  - Multiple concurrent uploads (8 MiB + 100 MiB + 100 MiB) on the
+    same partition: log_stream grows to 208 MB, all reads succeed.
+  - `del` on a multi-frag VP creates a tombstone; subsequent
+    `head` / `get` return NotFound.
 
 Workspace verification:
   - cargo check --workspace --exclude autumn-fuse: clean.
+  - cargo test -p autumn-rpc f129_wire: 5/5.
   - cargo test -p autumn-partition-server --lib (-- --test-threads=1):
-    130/130 pass.
-  - cargo test -p autumn-rpc f129_wire: 5/5 pass.
+    130/130.
+  - cargo test -p autumn-client --lib: 0 lib tests (existing pattern;
+    integration via smoke).
+
+Out of scope this commit (deferred phases):
+  - Phase E — F130 GC awareness of multi-frag VP refs. Today: chunk
+    fragments leak in log_stream until host extent ages out below
+    GC_DISCARD_RATIO via other live data churn. No correctness bug;
+    only storage overhead.
+  - Phase F — autumn-fuse perf evaluation. Sketch: replace the
+    FUSE-write buffered-Put path with PutStream so a 100 MiB write
+    doesn't peak-buffer 100 MiB on the daemon. Reads are already
+    chunk-parallel via F179; GetStream gain expected to be small.
+  - F131 — concurrent fragment pread in resolve_multi_frag (still
+    sequential).
+  - F132 — PutStream resume across PS restart / partition split.
+  - F134 — frame-level Put cap reject (perf hardening).

@@ -35,6 +35,13 @@ pub enum AutumnError {
     ServerError(String),
     RoutingError(String),
     ConnectionError(String),
+    /// F129: value exceeds the inline `Put` cap. Caller should retry
+    /// via `put_stream_begin` / `PutStreamHandle::send` / `commit`.
+    ValueTooLarge { size: u64, cap: u64 },
+    /// F129: the upload_id is unknown to the PS — TTL-evicted, never
+    /// opened, already committed/aborted, or the PS restarted (resume
+    /// across restart is F132, not yet implemented).
+    UploadNotFound,
 }
 
 impl std::fmt::Display for AutumnError {
@@ -46,6 +53,14 @@ impl std::fmt::Display for AutumnError {
             AutumnError::ServerError(msg) => write!(f, "server error: {msg}"),
             AutumnError::RoutingError(msg) => write!(f, "routing error: {msg}"),
             AutumnError::ConnectionError(msg) => write!(f, "connection error: {msg}"),
+            AutumnError::ValueTooLarge { size, cap } => {
+                if *cap > 0 {
+                    write!(f, "value {size} bytes exceeds inline cap {cap} — use put_stream")
+                } else {
+                    write!(f, "value {size} bytes exceeds the partition server's inline cap — use put_stream")
+                }
+            }
+            AutumnError::UploadNotFound => write!(f, "upload_id not found on partition server"),
         }
     }
 }
@@ -57,9 +72,23 @@ fn code_to_error(code: u8, message: String) -> AutumnError {
         partition_rpc::CODE_NOT_FOUND => AutumnError::NotFound,
         partition_rpc::CODE_INVALID_ARGUMENT => AutumnError::InvalidArgument(message),
         partition_rpc::CODE_PRECONDITION => AutumnError::PreconditionFailed(message),
+        partition_rpc::CODE_VALUE_TOO_LARGE => {
+            // The cap is in the message; we don't try to parse it. Surface the
+            // raw size if the caller doesn't already know.
+            AutumnError::ValueTooLarge { size: 0, cap: 0 }
+        }
+        partition_rpc::CODE_UPLOAD_NOT_FOUND => AutumnError::UploadNotFound,
         _ => AutumnError::ServerError(message),
     }
 }
+
+/// F129 client-side hard cap. Matches the PS's `AUTUMN_PS_MAX_INLINE_BYTES_HARD`
+/// (256 MiB). Pre-checked in `put_opts` to avoid sending a 256 MB+ request
+/// over the wire only to get rejected. The PS may be configured with a
+/// stricter (lower) cap; in that case the server still rejects, mapped to
+/// `AutumnError::ValueTooLarge` with `cap = 0` (the size + cap parsed
+/// from the message would require parsing, which we skip).
+pub const CLIENT_PUT_HARD_CAP: u64 = 256 * 1024 * 1024;
 
 // ── Range scan result ───────────────────────────────────────────────────────
 
@@ -487,12 +516,32 @@ impl ClusterClient {
         value: &[u8],
         expires_at: u64,
     ) -> std::result::Result<(), AutumnError> {
+        // F129: client-side pre-check against the hard cap. Avoids sending
+        // a 256 MB+ payload over the wire only to be rejected post-decode.
+        // The PS still authoritatively rejects > its configured (default
+        // 64 MiB) cap; for anything in (64 MiB, 256 MiB] we let the server
+        // decide (its default rejects, but it could be raised via env).
+        if value.len() as u64 > CLIENT_PUT_HARD_CAP {
+            return Err(AutumnError::ValueTooLarge {
+                size: value.len() as u64,
+                cap: CLIENT_PUT_HARD_CAP,
+            });
+        }
         let key = key.to_vec();
         let value = value.to_vec();
         let resp_bytes = self.call_ps_for_key(&key, MSG_PUT, |part_id| {
             rkyv_encode(&PutReq { part_id, key: key.clone(), value: value.clone(), expires_at })
         }).await?;
         let resp: PutResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
+        if resp.code == partition_rpc::CODE_VALUE_TOO_LARGE {
+            // PS-reported cap (lower than CLIENT_PUT_HARD_CAP). Surface the
+            // value's size so the caller can size the next put_stream
+            // chunks appropriately.
+            return Err(AutumnError::ValueTooLarge {
+                size: value.len() as u64,
+                cap: 0, // unknown server-side cap (would need to parse `resp.message`)
+            });
+        }
         if resp.code != partition_rpc::CODE_OK {
             return Err(code_to_error(resp.code, resp.message));
         }
@@ -694,6 +743,87 @@ impl ClusterClient {
         Ok(())
     }
 
+    // ── F129 multipart upload ──────────────────────────────────────────────
+
+    /// Open a multipart upload session for `key`. Returns a handle that
+    /// holds the cached PS connection and the running fragment list;
+    /// repeated calls to `send` push chunks to log_stream, `commit`
+    /// finalises the value, `abort` discards. Drop without commit/abort
+    /// is logged at WARN — the PS-side TTL (default 30 min) will reclaim.
+    pub async fn put_stream_begin(
+        &self,
+        key: &[u8],
+        expires_at: u64,
+    ) -> std::result::Result<PutStreamHandle, AutumnError> {
+        let key_vec = key.to_vec();
+        let (part_id, ps_addr) = self
+            .resolve_key(&key_vec)
+            .await
+            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+        let ps = self
+            .get_ps_client(&ps_addr)
+            .await
+            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        let req = PutBeginReq {
+            part_id,
+            key: key_vec.clone(),
+            expires_at,
+            total_bytes_hint: 0,
+        };
+        let payload = rkyv_encode(&req);
+        let resp_bytes = ps
+            .call(MSG_PUT_BEGIN, payload)
+            .await
+            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        let resp: PutBeginResp =
+            rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
+        if resp.code != partition_rpc::CODE_OK {
+            return Err(code_to_error(resp.code, resp.message));
+        }
+        Ok(PutStreamHandle {
+            upload_id: resp.upload_id,
+            user_key: key_vec,
+            part_id,
+            ps,
+            next_chunk_index: 0,
+            bytes_sent: 0,
+            state: PutStreamState::Open,
+        })
+    }
+
+    /// Open a streaming reader over an existing key. The reader yields
+    /// `chunk_size`-byte chunks via `next_chunk()`, walking the value
+    /// without buffering the full payload in client memory. Useful for
+    /// large multi-fragment values written via `put_stream_*`. Returns
+    /// `Ok(None)` if the key doesn't exist.
+    pub async fn get_stream(
+        &self,
+        key: &[u8],
+        chunk_size: u32,
+    ) -> std::result::Result<Option<GetStream>, AutumnError> {
+        let key_vec = key.to_vec();
+        let meta = self.head(&key_vec).await?;
+        if !meta.found {
+            return Ok(None);
+        }
+        let (part_id, ps_addr) = self
+            .resolve_key(&key_vec)
+            .await
+            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+        let ps = self
+            .get_ps_client(&ps_addr)
+            .await
+            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        Ok(Some(GetStream {
+            user_key: key_vec,
+            part_id,
+            ps,
+            total_bytes: meta.value_length,
+            cursor: 0,
+            chunk_size: chunk_size.max(1),
+        }))
+    }
+
     /// Trigger partition split.
     pub async fn split(&self, part_id: u64) -> std::result::Result<(), AutumnError> {
         self.call_ps_for_part(part_id, MSG_SPLIT_PART, rkyv_encode(&SplitPartReq { part_id })).await?;
@@ -730,5 +860,226 @@ impl ClusterClient {
             return Err(code_to_error(resp.code, resp.message));
         }
         Ok(())
+    }
+}
+
+// ── F129 PutStream / GetStream handles ────────────────────────────────────
+
+/// Lifecycle state of a `PutStreamHandle`. Open → (Committed | Aborted)
+/// transitions are one-way; the `commit` / `abort` consumers move the
+/// handle. A drop in the `Open` state logs a WARN; the PS-side TTL will
+/// reclaim the session within `AUTUMN_PS_UPLOAD_TTL_SECS` (default 30 min).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PutStreamState {
+    Open,
+    Committed,
+    Aborted,
+}
+
+/// In-progress multipart upload handle. Owns the cached `Rc<RpcClient>`
+/// to the partition's PS so subsequent `send` calls don't re-resolve
+/// (saves several RefCell + hashmap lookups per chunk vs going through
+/// `call_ps_for_key`). The handle is `!Send` because it owns an `Rc`;
+/// don't move it across compio runtimes.
+pub struct PutStreamHandle {
+    upload_id: u128,
+    user_key: Vec<u8>,
+    part_id: u64,
+    ps: Rc<RpcClient>,
+    next_chunk_index: u32,
+    bytes_sent: u64,
+    state: PutStreamState,
+}
+
+impl PutStreamHandle {
+    /// Server-assigned u128 upload identifier. Useful for logs.
+    pub fn upload_id(&self) -> u128 {
+        self.upload_id
+    }
+
+    /// Total bytes successfully appended to log_stream so far.
+    /// Updated only on successful `send`.
+    pub fn bytes_sent(&self) -> u64 {
+        self.bytes_sent
+    }
+
+    /// Number of chunks successfully appended.
+    pub fn chunks_sent(&self) -> u32 {
+        self.next_chunk_index
+    }
+
+    /// Append one chunk. The PS appends `chunk` to log_stream as a
+    /// single `OP_CHUNK_BLOB` WAL record and adds a fragment to the
+    /// session. Returns the running total of bytes committed.
+    ///
+    /// Caller is responsible for choosing chunk sizes — typically
+    /// 1–4 MiB. Larger chunks reduce per-chunk RPC overhead but raise
+    /// peak memory on both client and PS; smaller chunks improve
+    /// recoverability across transient network blips (less re-send on
+    /// retry).
+    pub async fn send(&mut self, chunk: &[u8]) -> std::result::Result<u64, AutumnError> {
+        if self.state != PutStreamState::Open {
+            return Err(AutumnError::InvalidArgument(format!(
+                "PutStreamHandle is {:?}, not Open",
+                self.state
+            )));
+        }
+        let req = PutChunkReq {
+            part_id: self.part_id,
+            upload_id: self.upload_id,
+            chunk_index: self.next_chunk_index,
+            data: chunk.to_vec(),
+        };
+        let payload = rkyv_encode(&req);
+        let resp_bytes = self
+            .ps
+            .call(MSG_PUT_CHUNK, payload)
+            .await
+            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        let resp: PutChunkResp =
+            rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
+        if resp.code != partition_rpc::CODE_OK {
+            return Err(code_to_error(resp.code, resp.message));
+        }
+        self.next_chunk_index = self.next_chunk_index.saturating_add(1);
+        self.bytes_sent = resp.bytes_committed;
+        Ok(resp.bytes_committed)
+    }
+
+    /// Finalise the upload. The PS builds a multi-fragment ValuePointer
+    /// from the session's fragment list, allocates a memtable seq, and
+    /// writes one V1 WAL record (op = `OP_VALUE_POINTER_MULTI | 1`)
+    /// before inserting into the active memtable. After this returns,
+    /// the value is visible to subsequent `get` / `get_stream`.
+    pub async fn commit(mut self) -> std::result::Result<(), AutumnError> {
+        if self.state != PutStreamState::Open {
+            return Err(AutumnError::InvalidArgument(format!(
+                "PutStreamHandle is {:?}, cannot commit",
+                self.state
+            )));
+        }
+        let req = PutCommitReq {
+            part_id: self.part_id,
+            upload_id: self.upload_id,
+            expected_total_bytes: self.bytes_sent,
+        };
+        let payload = rkyv_encode(&req);
+        let resp_bytes = self
+            .ps
+            .call(MSG_PUT_COMMIT, payload)
+            .await
+            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        let resp: PutResp =
+            rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
+        if resp.code != partition_rpc::CODE_OK {
+            self.state = PutStreamState::Aborted; // suppress Drop warn
+            return Err(code_to_error(resp.code, resp.message));
+        }
+        self.state = PutStreamState::Committed;
+        Ok(())
+    }
+
+    /// Discard the in-progress upload. Idempotent — calling abort on a
+    /// handle whose session has already been TTL-reclaimed succeeds.
+    /// The chunk bytes already in log_stream become OP_CHUNK_BLOB
+    /// garbage; GC reclaims them when the host extent is punched.
+    pub async fn abort(mut self) -> std::result::Result<(), AutumnError> {
+        if self.state != PutStreamState::Open {
+            return Ok(());
+        }
+        let req = PutAbortReq {
+            part_id: self.part_id,
+            upload_id: self.upload_id,
+        };
+        let payload = rkyv_encode(&req);
+        // Best-effort: a transient connection error doesn't change the
+        // outcome (TTL still reclaims).
+        let _ = self.ps.call(MSG_PUT_ABORT, payload).await;
+        self.state = PutStreamState::Aborted;
+        Ok(())
+    }
+}
+
+impl Drop for PutStreamHandle {
+    fn drop(&mut self) {
+        if self.state == PutStreamState::Open {
+            tracing::warn!(
+                upload_id = ?self.upload_id,
+                key = ?String::from_utf8_lossy(&self.user_key),
+                bytes_sent = self.bytes_sent,
+                "PutStreamHandle dropped without commit/abort; \
+                 PS-side TTL will reclaim within AUTUMN_PS_UPLOAD_TTL_SECS (~30 min)"
+            );
+        }
+    }
+}
+
+/// Streaming reader over an existing value. Yields `chunk_size`-byte
+/// chunks via `next_chunk()` until the value is exhausted. Each chunk
+/// is one `MSG_GET` RPC under the hood, so multi-fragment values
+/// (`OP_VALUE_POINTER_MULTI`) are reassembled by the PS's
+/// `resolve_multi_frag` (sequential per-fragment reads); inline values
+/// just get sliced.
+pub struct GetStream {
+    user_key: Vec<u8>,
+    part_id: u64,
+    ps: Rc<RpcClient>,
+    total_bytes: u64,
+    cursor: u64,
+    chunk_size: u32,
+}
+
+impl GetStream {
+    /// Total value size in bytes (set by the initial `head` call).
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    /// Bytes yielded so far.
+    pub fn position(&self) -> u64 {
+        self.cursor
+    }
+
+    /// Bytes remaining to yield.
+    pub fn remaining(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.cursor)
+    }
+
+    /// Pull the next chunk. Returns `Ok(None)` when the value is
+    /// exhausted. The yielded chunk is at most `chunk_size` bytes; the
+    /// final chunk may be shorter.
+    pub async fn next_chunk(&mut self) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
+        if self.cursor >= self.total_bytes {
+            return Ok(None);
+        }
+        let want = (self.total_bytes - self.cursor).min(self.chunk_size as u64) as u32;
+        let req = GetReq {
+            part_id: self.part_id,
+            key: self.user_key.clone(),
+            offset: self.cursor as u32,
+            length: want,
+        };
+        let payload = rkyv_encode(&req);
+        let resp_bytes = self
+            .ps
+            .call(MSG_GET, payload)
+            .await
+            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
+        let resp: GetResp =
+            rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
+        if resp.code == partition_rpc::CODE_NOT_FOUND {
+            // Key was concurrently deleted mid-stream. Surface as Ok(None).
+            return Ok(None);
+        }
+        if resp.code != partition_rpc::CODE_OK {
+            return Err(code_to_error(resp.code, resp.message));
+        }
+        if resp.value.is_empty() {
+            // Defensive: PS reported OK but no bytes. Shouldn't happen
+            // with our resolve_value, but treat as EOF rather than spinning.
+            return Ok(None);
+        }
+        self.cursor += resp.value.len() as u64;
+        Ok(Some(resp.value))
     }
 }
