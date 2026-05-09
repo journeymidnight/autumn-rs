@@ -842,6 +842,222 @@ fn auto_dispatch_split_dispatches_msg_split_part() {
     });
 }
 
+/// F184 stress: split → put → merge → put → split with batches of writes
+/// interleaved between topology ops. Verifies all written keys remain
+/// readable across the full lifecycle.
+///
+/// (Concurrent-writer version was attempted but compio's single-threaded
+/// runtime + per-call PsRouter reconnects produced unbounded CPU usage
+/// without yielding the test thread back to the foreground topology
+/// driver. Sequential interleaved writes still cover the meaningful
+/// invariants: split/merge metadata mutations, log_stream extent
+/// splice, region_sync reload, multi-step seq_number monotonicity.)
+#[test]
+#[ignore]
+fn split_merge_split_with_interleaved_writes() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
+    let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 99).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 12001, log, row, meta, b"a", b"z").await;
+
+        let ps_addr = pick_addr();
+        start_partition_server(99, mgr_addr, ps_addr);
+        compio::time::sleep(Duration::from_millis(2000)).await;
+        let _ps = RpcClient::connect(ps_addr).await.unwrap();
+        let router = PsRouter::new(mgr_addr, ps_addr);
+
+        // ── Phase 0: pre-seed ─────────────────────────────────────────
+        let mut all_keys: Vec<Vec<u8>> = Vec::new();
+        for i in 0u8..20 {
+            let key = format!("k{:03}", i).into_bytes();
+            psr_put(&router, 12001, &key, b"v").await;
+            all_keys.push(key);
+        }
+        psr_flush(&router, 12001).await;
+        psr_compact(&router, 12001).await;
+        compio::time::sleep(Duration::from_millis(2500)).await;
+
+        // ── Phase 1: SPLIT #1 ─────────────────────────────────────────
+        let r = router.client_for(12001).await
+            .call(
+                partition_rpc::MSG_SPLIT_PART,
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 12001 }),
+            )
+            .await.expect("split #1");
+        let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&r).unwrap();
+        assert_eq!(sr.code, partition_rpc::CODE_OK, "split #1: {}", sr.message);
+
+        let _ = poll_until_async(
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+            || async {
+                let r = get_regions(&mgr).await;
+                r.regions.len() == 2 && r.part_addrs.len() == 2
+            },
+        ).await;
+        let regions = get_regions(&mgr).await;
+        let mut s1 = 0u64; let mut v1 = 0u64;
+        for (pid, r) in &regions.regions {
+            if let Some(rg) = &r.rg {
+                if rg.start_key == b"a".to_vec() { s1 = *pid; } else { v1 = *pid; }
+            }
+        }
+
+        // ── Phase 2: writes against 2-partition topology ──────────────
+        for i in 0u8..10 {
+            let lkey = format!("a-mid-{:02}", i).into_bytes();
+            let rkey = format!("n-mid-{:02}", i).into_bytes();
+            psr_put(&router, s1, &lkey, b"v").await;
+            psr_put(&router, v1, &rkey, b"v").await;
+            all_keys.push(lkey);
+            all_keys.push(rkey);
+        }
+        psr_flush(&router, s1).await;
+        psr_flush(&router, v1).await;
+        psr_compact(&router, s1).await;
+        psr_compact(&router, v1).await;
+        compio::time::sleep(Duration::from_millis(3000)).await;
+
+        // ── Phase 3: MERGE ────────────────────────────────────────────
+        let resp = merge_partitions(&mgr, &router, s1, v1).await;
+        assert_eq!(resp.code, CODE_OK, "merge: {}", resp.message);
+        compio::time::sleep(Duration::from_millis(3000)).await;
+        assert_eq!(get_regions(&mgr).await.regions.len(), 1, "after merge");
+
+        // ── Phase 4: writes against merged topology ───────────────────
+        for i in 0u8..10 {
+            let key = format!("post-merge-{:02}", i).into_bytes();
+            psr_put(&router, s1, &key, b"v").await;
+            all_keys.push(key);
+        }
+        psr_flush(&router, s1).await;
+        psr_compact(&router, s1).await;
+        compio::time::sleep(Duration::from_millis(3000)).await;
+
+        // ── Phase 5: SPLIT #2 on merged partition ─────────────────────
+        let r = router.client_for(s1).await
+            .call(
+                partition_rpc::MSG_SPLIT_PART,
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: s1 }),
+            )
+            .await.expect("split #2");
+        let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&r).unwrap();
+        assert_eq!(sr.code, partition_rpc::CODE_OK, "split #2: {}", sr.message);
+
+        let _ = poll_until_async(
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+            || async { get_regions(&mgr).await.regions.len() == 2 },
+        ).await;
+        compio::time::sleep(Duration::from_millis(800)).await;
+
+        // ── Phase 6: writes against post-split-#2 topology ────────────
+        for i in 0u8..6 {
+            let key = format!("post-split2-{:02}", i).into_bytes();
+            // Resolve to current part_id.
+            let mgr_c = RpcClient::connect(mgr_addr).await.unwrap();
+            let pid = resolve_part_id_for_key(&mgr_c, &key).await
+                .expect("post-split2 key must route to a partition");
+            psr_put(&router, pid, &key, b"v").await;
+            all_keys.push(key);
+        }
+
+        // ── Verify ALL keys readable from current topology ────────────
+        let mgr_v = RpcClient::connect(mgr_addr).await.unwrap();
+        let mut missing: Vec<Vec<u8>> = Vec::new();
+        for key in &all_keys {
+            let pid = match resolve_part_id_for_key(&mgr_v, key).await {
+                Some(p) => p,
+                None => { missing.push(key.clone()); continue; }
+            };
+            let r = psr_get(&router, pid, key).await;
+            let want = if key.starts_with(b"k") { b"v".to_vec() } else { b"v".to_vec() };
+            if r.code != partition_rpc::CODE_OK || r.value != want {
+                missing.push(key.clone());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{} keys missing/wrong after full lifecycle: {:?}",
+            missing.len(),
+            missing.iter().take(5).map(|k| String::from_utf8_lossy(k).to_string()).collect::<Vec<_>>()
+        );
+    });
+}
+
+/// Routes a key to its current partition via GetRegions. Returns None
+/// if no partition's range covers the key (transient during merge).
+async fn resolve_part_id_for_key(mgr: &RpcClient, key: &[u8]) -> Option<u64> {
+    let regions = get_regions(mgr).await;
+    for (pid, r) in regions.regions {
+        if let Some(rg) = r.rg {
+            let in_range = key >= rg.start_key.as_slice()
+                && (rg.end_key.is_empty() || key < rg.end_key.as_slice());
+            if in_range {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+/// Try a Put; map all error variants to Err(()) so the writer can
+/// distinguish "no progress, retry" from a permanent-fault assertion.
+async fn try_psr_put(
+    router: &PsRouter,
+    part_id: u64,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), ()> {
+    let c = router.client_for(part_id).await;
+    let resp = c.call(
+        partition_rpc::MSG_PUT,
+        partition_rpc::rkyv_encode(&partition_rpc::PutReq {
+            part_id,
+            key: key.to_vec(),
+            value: value.to_vec(),
+            expires_at: 0,
+        }),
+    ).await;
+    let resp_bytes = match resp { Ok(b) => b, Err(_) => return Err(()) };
+    let r: partition_rpc::PutResp = match partition_rpc::rkyv_decode(&resp_bytes) {
+        Ok(r) => r,
+        Err(_) => return Err(()),
+    };
+    if r.code != partition_rpc::CODE_OK { Err(()) } else { Ok(()) }
+}
+
+/// Drive a SPLIT through transient retries. The CLI's `split` is a
+/// single RPC; if the partition is mid-flush or compacting, the
+/// PartitionData mutex will serialise. Wrap with a short retry loop.
+async fn poll_split_succeeds(router: &std::rc::Rc<PsRouter>, part_id: u64) -> bool {
+    for _ in 0..15 {
+        let c = router.client_for(part_id).await;
+        let resp = c.call(
+            partition_rpc::MSG_SPLIT_PART,
+            partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id }),
+        ).await;
+        if let Ok(bytes) = resp {
+            if let Ok(r) = partition_rpc::rkyv_decode::<partition_rpc::SplitPartResp>(&bytes) {
+                if r.code == partition_rpc::CODE_OK { return true; }
+            }
+        }
+        compio::time::sleep(Duration::from_millis(500)).await;
+    }
+    false
+}
+
 #[allow(dead_code)]
 fn _suppress_unused() {
     let _ = Bytes::new();
