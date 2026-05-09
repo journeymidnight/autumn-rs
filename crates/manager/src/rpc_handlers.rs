@@ -1579,6 +1579,17 @@ impl AutumnManager {
                             rkyv_encode(&right_region).to_vec(),
                         ));
                     }
+                    // F181: stamp last_op_at on both children so the
+                    // policy engine's cooldown gate is correct.
+                    let now = Self::epoch_seconds();
+                    kvs.push((
+                        format!("partitionLastOp/{}", left.part_id),
+                        now.to_le_bytes().to_vec(),
+                    ));
+                    kvs.push((
+                        format!("partitionLastOp/{}", right.part_id),
+                        now.to_le_bytes().to_vec(),
+                    ));
                     etcd.put_msgs_txn(kvs)
                         .await
                         .map_err(|e| Self::err_to_status(&e))?;
@@ -1605,11 +1616,18 @@ impl AutumnManager {
                             }
                         }
                     }
+                    let left_id = left.part_id;
+                    let right_id = right.part_id;
                     Self::apply_split_mutations(
                         &mut s, &new_streams, &modified_extents, left, right,
                     );
                     s.partition_vp_refs
                         .insert(right_snapshot.part_id, right_snapshot);
+                    drop(s);
+                    // F181: in-memory last_op_at update (mirror of etcd write above)
+                    let now = Self::epoch_seconds();
+                    self.last_op_at.borrow_mut().insert(left_id, now);
+                    self.last_op_at.borrow_mut().insert(right_id, now);
                 }
 
                 Ok(rkyv_encode(&CodeResp {
