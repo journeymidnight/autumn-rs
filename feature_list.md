@@ -604,21 +604,34 @@
     - Maintains `ring_fd → inode` mapping per session. `OPEN` allocates a new ring_fd, `CLOSE` releases it. Ring_fds are NOT kernel fds — they're indices into the daemon's per-session table.
     - On completion: write CQE to ring head, atomic-increment, eventfd-wake the waiter if registered.
   - **F180-C — Rust client API + benchmark**:
-    - `crates/ioring/` exposes `IoRing::connect(daemon_socket) → IoRing`, `submit_open(path)`, `submit_read(ring_fd, off, len, buf_idx)`, `wait_completion() → CQE`, `poll_completion() → Option<CQE>`.
-    - New benchmark binary `crates/ioring/examples/bench_read.rs` doing N-thread parallel reads via the ring.
+    - `crates/ioring/src/client.rs` exposes `IoRingClient::connect(socket_path)`, `submit(sqe)`, `try_completion()`, `wait_completion(idle_us)`, `drain_completions(dst, max)`, plus a buffer-pool slot allocator.
+    - `src/bin/bench.rs` (binary `autumn-ioring-bench`) drives N reader threads (one IoRingClient per thread) → OPEN → prime depth reads → drain CQEs and re-issue.
     - **Validation gate**: F180-C bench must show ≥ 200 k ops/s on 4 K random reads (vs F179's 31 k via FUSE) before committing to F180-D/E. If not, the design is wrong and we re-architect.
-  - **F180-D — Python binding** (deferred until C validates):
+    - **F180-C smoke results (3-disk TCP cluster, single small key — value padding-zero behaviour)**:
+      | config                         | ops/s   | notes                                  |
+      |--------------------------------|---------|----------------------------------------|
+      | threads=1  depth=1             |   7,800 | path latency baseline ~128 µs          |
+      | threads=16 depth=8             | **139,000** | 4.5× FUSE (F179 31 k peak)        |
+      | threads=8  depth=32            |  44,000 | single-session ceiling                  |
+      | threads=64 depth=8             |  54,000 | runtime contention degrades            |
+      | threads=128 depth=8            |  27,000 | severely degraded                       |
+    - **Verdict**: 139 k peak below the 200 k gate but well above F179's 31 k. The design works; the bottleneck is the daemon-side per-session poller serialising SQE dispatch (`pop → await cluster.get → push`). Each session caps at ~44 k; aggregate scales linearly until compio runtime saturates around 16 sessions. Fix: F180-B5 (below).
+  - **F180-B5 — daemon spawn-per-SQE refactor** (next, prerequisite for hitting the gate):
+    - Wrap `MmapRegion` and `ring_fds` table in `Rc<RefCell<...>>` per session.
+    - Per-session poller pops SQE batches; for each SQE spawns a compio task that does `cluster.get(...).await` (no region borrow held), then briefly borrows region twice (write data into buf slot, push CQE). Borrows are scoped — never held across `.await`.
+    - Expected: per-session ceiling rises from 44 k → ~200-400 k; aggregate 16 sessions × 200 k → push past gate.
+  - **F180-D — Python binding** (deferred until B5 + bench validates):
     - Extend `python/autumn-python` with a new `IoRing` pyo3 class. Async API: `await ring.read(ring_fd, off, len) -> bytes`. Same compio worker-thread pattern as the existing `Client` binding.
   - **F180-E — PyTorch integration** (deferred until D validates):
     - `python/examples/autumn_torch_dataset.py` showing `AutumnIODataset` that wraps `IoRing` for DataLoader prefetching.
-- **Expected gain**: 4 K reads from 31 k → 500 k+ ops/s; 8 M reads from 600 MB/s → 5+ GB/s (approaches perf_check direct path because FUSE-kernel layer is gone).
+- **Expected gain (post-B5)**: 4 K reads from 31 k → 500 k+ ops/s; 8 M reads from 600 MB/s → 5+ GB/s (approaches perf_check direct path because FUSE-kernel layer is gone).
 - **Out of scope**:
   - Replacing FUSE mount entirely — F180 is parallel, not a replacement.
   - Kernel-side multi-fd dispatch (`-o clone_fd`).
   - Multi-mount load balancing.
   - LD_PRELOAD transparency shim — apps explicitly link `autumn-ioring`.
 - **Why not just expose ClusterClient to Python directly?** That works for read-only workloads with no write coherence needs, and `python/autumn-python` already does it. F180 is for workloads that need the daemon's shared inode cache + write coherence + POSIX integration — multi-process inference, write-heavy mixed loads. For pure-read PyTorch training, the existing async ClusterClient binding is enough; F180 adds value when daemon-mediated coherence matters.
-- **passes:** false (in-flight: F180-A starts with this entry)
+- **passes:** false (in-flight: F180-A through F180-C committed; F180-B5 + final validation pending)
 
 ### F181 · autumn-fuse: batched chunk RPC (`MSG_BATCH_GET`) — deferred follow-up
 
