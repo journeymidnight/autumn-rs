@@ -616,10 +616,22 @@
       | threads=64 depth=8             |  54,000 | runtime contention degrades            |
       | threads=128 depth=8            |  27,000 | severely degraded                       |
     - **Verdict**: 139 k peak below the 200 k gate but well above F179's 31 k. The design works; the bottleneck is the daemon-side per-session poller serialising SQE dispatch (`pop → await cluster.get → push`). Each session caps at ~44 k; aggregate scales linearly until compio runtime saturates around 16 sessions. Fix: F180-B5 (below).
-  - **F180-B5 — daemon spawn-per-SQE refactor** (next, prerequisite for hitting the gate):
+  - **F180-B5 — daemon spawn-per-SQE refactor** (committed `55d254f`, lifted per-session ceiling 44 k → 150 k but aggregate plateaued at ~137 k due to single-runtime daemon CPU saturation):
     - Wrap `MmapRegion` and `ring_fds` table in `Rc<RefCell<...>>` per session.
     - Per-session poller pops SQE batches; for each SQE spawns a compio task that does `cluster.get(...).await` (no region borrow held), then briefly borrows region twice (write data into buf slot, push CQE). Borrows are scoped — never held across `.await`.
-    - Expected: per-session ceiling rises from 44 k → ~200-400 k; aggregate 16 sessions × 200 k → push past gate.
+  - **F180-B6 — multi-runtime daemon + cached PS client at OPEN** (passes the 200 k gate):
+    - `autumn-ioring-daemon --runtimes N` spawns N OS threads, each runs its own compio runtime + own `ClusterClient` + own `UnixListener` bound at `{socket}.{idx}`. Sessions are pinned to whichever runtime accepted them — no cross-thread state. Clients distribute load by picking their runtime index (bench: `tid % N`).
+    - At `OPEN` the daemon now resolves `(part_id, ps_addr)` once and caches `Rc<RpcClient>` on the ring_fd. `READ` skips `ClusterClient::get_range` entirely — builds `GetReq{ part_id, key, offset:0, length:0 }` inline and calls the cached PS directly. Saves several `RefCell` borrows + 2 hashmap lookups + the `call_ps_for_key` retry-closure shell per READ.
+    - `length: 0` is load-bearing: PS `resolve_value` returns the raw `Bytes` directly when `offset==0 && length==0`; with `length: sqe.length` (e.g. 4096) it does an extra `to_vec()` slice on the PS path which costs ~25% throughput at single-runtime load. The daemon slices its own response.
+    - Bench: `--runtimes N` flag and `%tid%` token in `--key` for spreading load across keys/partitions.
+    - **Results** (single-PS cluster, hot single key, 16 threads × depth 8 × 4 KB):
+      | config       | ops/s     | notes                              |
+      |--------------|-----------|------------------------------------|
+      | B5 r=1       | ~104 k    | re-measured baseline this session  |
+      | B6 r=1       |   113 k   | +9 % from cached PS client         |
+      | B6 r=4       | **208 k** | **passes 200 k gate**              |
+      | B6 r=8       |   203 k   | PS process at 100 % CPU (cap)      |
+    - Above ~200 k the bottleneck moves to the single-PS-process / single-partition CPU. Real workloads with > 1 partition (or PS process) will scale further; this bench cluster has 1 partition by default.
   - **F180-D — Python binding** (deferred until B5 + bench validates):
     - Extend `python/autumn-python` with a new `IoRing` pyo3 class. Async API: `await ring.read(ring_fd, off, len) -> bytes`. Same compio worker-thread pattern as the existing `Client` binding.
   - **F180-E — PyTorch integration** (deferred until D validates):
@@ -631,7 +643,7 @@
   - Multi-mount load balancing.
   - LD_PRELOAD transparency shim — apps explicitly link `autumn-ioring`.
 - **Why not just expose ClusterClient to Python directly?** That works for read-only workloads with no write coherence needs, and `python/autumn-python` already does it. F180 is for workloads that need the daemon's shared inode cache + write coherence + POSIX integration — multi-process inference, write-heavy mixed loads. For pure-read PyTorch training, the existing async ClusterClient binding is enough; F180 adds value when daemon-mediated coherence matters.
-- **passes:** false (in-flight: F180-A through F180-C committed; F180-B5 + final validation pending)
+- **passes:** true (F180-A through F180-C, B5, B6 committed; 4 K read 200 k gate met at r=4 / 16-thread / depth-8). F180-D (Python pyo3 IoRing class) and F180-E (PyTorch DataLoader) remain deferred per user direction; F181 / F182 are separate feature entries.
 
 ### F181 · autumn-fuse: batched chunk RPC (`MSG_BATCH_GET`) — deferred follow-up
 

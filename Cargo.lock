@@ -212,6 +212,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "autumn-ioring"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "autumn-client",
+ "autumn-rpc",
+ "bytes",
+ "clap",
+ "compio",
+ "futures",
+ "libc",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "autumn-manager"
 version = "0.1.0"
 dependencies = [

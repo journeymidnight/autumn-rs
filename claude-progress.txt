@@ -1,202 +1,73 @@
-Date: 2026-05-08
+Date: 2026-05-09
 TaskStatus: completed
-Task scope: F178 — LevelDB-style sync coalescing.
-            Phase 1: per-extent fsync coalescer in extent_node.
-            Phase 2: drop rotation-trigger barrier; add MSG_SYNCED_LENGTH
-                     + StreamClient::await_log_synced_to; flush waits at
-                     flush time, not write time.
-            Phase 3: --nosync removed from autumn-client put/streamput/
-                     wbench/perf-check + perf_check.sh; flag retained as
-                     no-op with deprecation warning. PutReq/AppendReq
-                     must_sync field kept on wire.
-            Phase 4: tests + CLAUDE.md updates + commit (this entry).
-            Real-cluster perf bench deferred (requires user authorization
-            for cluster.sh). Microbench results to be captured in a
-            follow-up explicit-scope cycle when authorized.
+Task scope: F180-B6 — multi-runtime autumn-ioring daemon + cached PS RpcClient
+            at OPEN. Pushes single-key 4 K read aggregate from B5's 137 k
+            (single compio runtime CPU bound) past the 200 k gate.
+            Phase: B6 (follow-on to B5 within the F180 series).
 
-F178 — LevelDB-style sync coalescing — what + why:
+F180-B6 — what + why:
+
   Why:
-    F150 Phase B's rotation-trigger barrier put a 5-15 ms (real SSD)
-    fsync syscall on the unlucky writer that happened to push past
-    FLUSH_MEM_BYTES — typically 1/s under sustained 70 MB/s. p99 spike
-    visible in F176 audit (744 ms at 8 MiB; 4 KiB workload less but
-    still landed entirely on one writer's path). The writer-side
-    barrier was conceptually "wait for log_stream tail durable before
-    flush starts"; the right place for that wait is the flush task
-    itself (background), not the writer.
+    F180-B5 (commit 55d254f) lifted per-session ceiling from 44 k → 150 k
+    by spawning a compio task per SQE. But aggregate plateaued at ~137 k
+    on 16-thread × d=8 because the daemon's single compio runtime
+    saturates one core handling all SQE/CQE traffic + all RPC dispatch.
+    Pushing past the 200 k validation gate required either multi-core
+    daemon or substantial per-call overhead reduction.
 
-  What — Phase 1 (extent_node coalescer):
-    - Coalescer struct on each ExtentEntry:
-      * last_synced: AtomicU64
-      * pending_fsync: AtomicU64
-      * inner: RefCell<{ waiters: Vec<(u64, oneshot::Sender)>, task_running: bool }>
-    - register_sync_waiter(extent, end_offset) → oneshot::Receiver:
-      * push (end, tx) into waiters
-      * if !task_running, set true and spawn coalescer_loop
-    - coalescer_loop:
-      * compio::time::sleep(AUTUMN_EXTENT_FSYNC_COALESCE_MS, default 2)
-      * if pending > synced: file.sync_data(); store last_synced=pending;
-        wake waiters with end ≤ pending
-      * exit if waiters empty AND pending == synced (under inner.borrow_mut
-        to close the registration-vs-exit race)
-    - handle_append (non-batched) and build_append_future (batched):
-      * always advance pending_fsync after pwrite (LevelDB "always
-        durable" — the coalescer covers must_sync=false batches too)
-      * if must_sync: register_sync_waiter + await receiver
-      * On fsync error: all pending waiters fail together (sync_data
-        is whole-file)
+  What — multi-runtime daemon:
+    `autumn-ioring-daemon --runtimes N` spawns N OS threads, each with
+    its own compio runtime, own ClusterClient, and own UnixListener at
+    `{socket}.{idx}` (`.0`, `.1`, …). Sessions are pinned to whichever
+    runtime accepted them — no cross-thread state. Backward-compat:
+    N=1 keeps the legacy single-socket behaviour (same path as before).
+    Bench gains a matching `--runtimes N` flag; worker tid picks
+    `socket.{tid % N}`.
 
-  What — Phase 2 (drop rotation barrier; flush-time wait):
-    - background.rs::start_write_batch: dropped the triggers_rotation
-      block. batch_must_sync = batch_must_sync_caller_flag only.
-    - extent_rpc.rs: new MSG_SYNCED_LENGTH = 13 (slot recycled from
-      retired MSG_SYNC_EXTENT). SyncedLengthReq: 8B [extent_id u64].
-      SyncedLengthResp: 9B [code u8][length u64].
-    - extent_node.rs::handle_synced_length: returns
-      max(coalescer.last_synced, sealed_length). The sealed-length
-      bump is load-bearing for old extents the imm spans into —
-      apply_extent_meta_durable fsync'd at seal time, so the wait is
-      trivially satisfied even before the coalescer has run.
-    - client.rs::await_extent_synced_to(extent_id, min_offset):
-      * fetch ExtentInfo, resolve replica addrs
-      * poll MSG_SYNCED_LENGTH on each replica every
-        AUTUMN_STREAM_SYNCED_POLL_MS (default 2 ms)
-      * return Ok when ≥ ⌊N/2⌋+1 replicas have synced ≥ min_offset
-      * timeout after AUTUMN_STREAM_SYNCED_TIMEOUT_MS (default 30 s)
-    - Public alias: await_log_synced_to(extent_id, offset) — same
-      semantics, named for the call site.
-    - lib.rs::flush_one_imm + flush_one_imm_local: call
-      part_sc.await_log_synced_to(snap_vp_eid, snap_vp_off as u64)
-      BEFORE row_stream.append. Skip when snap_vp_off == 0 (no
-      VPs in the imm yet).
-    - F148-A invariant survives: the await sits BEFORE the
-      borrow_mut block + save_table_locs_raw mpsc send.
+  What — cached PS client at OPEN:
+    Per ring_fd state is now `OpenedFile { key, part_id, ps:
+    Rc<RpcClient> }`. At OPEN we do `cluster.head` (existence) +
+    `cluster.resolve_key` + `cluster.get_ps_client` once and cache the
+    Rc. At READ we skip `ClusterClient::get_range` entirely — build
+    `GetReq{ part_id, key, offset:0, length:0 }` inline and call the
+    cached PS directly. Saves several RefCell borrows + 2 hashmap
+    lookups + the `call_ps_for_key` retry-closure shell per READ.
 
-  What — Phase 3 (remove --nosync from clients + perf_check.sh):
-    - autumn_client.rs:
-      * usage() drops --nosync from wbench / perf-check help
-      * each --nosync parse site: warn_nosync_deprecated_once (stderr,
-        once per invocation), set nosync = false (always durable)
-      * Command::* enum fields kept for back-compat (zero refactor)
-    - perf_check.sh:253: dropped the --nosync line; comment retained
-      explaining F178 makes writes always durable.
-    - PutReq/AppendReq must_sync field kept on the wire; PS still
-      sends it from the (always-true) caller flag.
+  Subtle issue (caught + fixed mid-iteration):
+    Initial B6 sent `GetReq.length: sqe.length` (= 4096 for the bench),
+    expecting PS to return only the requested slice. PS's
+    `resolve_value` then took the `offset!=0 || length!=0` branch which
+    does `to_vec()` TWICE (raw_value.to_vec() + v[start..end].to_vec()).
+    At 100 k+ ops/s the extra 4 K memcpy on the PS path cost ~25 %
+    throughput. Fix: send `length: 0` ("whole value", PS hits the
+    one-copy fast path), slice in the daemon. PS-side handler is
+    unchanged.
 
-  What — Phase 4 (tests + docs):
-    - cargo test passes (no behaviour-change for tests):
-      * autumn-stream --lib: 40/40 pass
-      * autumn-partition-server --lib --test-threads=1: 122/122 pass
-      * autumn-manager --lib: 30/30 pass
-    - cargo build --workspace --exclude autumn-fuse: clean
-    - crates/stream/CLAUDE.md: append protocol step 6 rewritten;
-      Programming Note 4 (must_sync cost) rewritten; Commit Protocol
-      section gains F178 Phase 2 paragraph.
-    - crates/partition-server/CLAUDE.md: Programming Note 6 (group
-      commit batching) rewritten with two-layer durability story.
-    - autumn-rs/README.md: no manual-test step changes (the perf
-      bench is identical from a user perspective; --nosync just
-      prints a warning).
-    - feature_list.md F178 passes: false → true.
+  Results (3-replica TCP cluster, 1 partition, hot single key, 16
+           bench threads × depth 8 × 4 KB):
+    | config     | ops/s   | notes                                    |
+    | B5 r=1     | ~104 k  | re-measured baseline (was 137 k pre-F178/cluster state shifts) |
+    | B6 r=1     |  113 k  | +9 % from cached PS client + skip ClusterClient.get shell |
+    | B6 r=4     |  208 k  | **passes 200 k gate**                    |
+    | B6 r=8     |  203 k  | PS process CPU at 100 % — single-partition saturated |
 
-Files modified:
-  - crates/stream/src/extent_node.rs:
-      * +Coalescer + register_sync_waiter + coalescer_loop +
-        extent_fsync_coalesce_ms (~+170 LOC near ExtentEntry)
-      * +coalescer field on ExtentEntry; 3 construction sites
-      * build_append_future: replace inline sync_data with
-        pending_fsync.store + register_sync_waiter await
-      * handle_append (non-batched): same replacement
-      * handle_synced_length: new dispatch handler
-      * dispatch table: +MSG_SYNCED_LENGTH branch
-  - crates/stream/src/extent_rpc.rs:
-      * +MSG_SYNCED_LENGTH const (slot 13, recycled)
-      * +SyncedLengthReq / SyncedLengthResp codecs
-  - crates/stream/src/client.rs:
-      * +use SyncedLengthReq / Resp / MSG_SYNCED_LENGTH
-      * +synced_length_on_replica (private helper)
-      * +await_extent_synced_to (public)
-      * +await_log_synced_to (public alias for the flush call site)
-  - crates/partition-server/src/background.rs:
-      * start_write_batch: dropped the triggers_rotation block;
-        batch_must_sync = caller flag only
-  - crates/partition-server/src/lib.rs:
-      * flush_one_imm: await_log_synced_to(snap_vp_eid, snap_vp_off)
-        before req_tx.send(FlushReq) (P-bulk path)
-      * flush_one_imm_local: same await before row_stream.append
-        (legacy in-thread fallback path)
-  - crates/server/src/bin/autumn_client.rs:
-      * +warn_nosync_deprecated_once helper
-      * usage() text edits (drop --nosync from wbench/perf-check)
-      * 5 --nosync parse arms: replaced flag-set with deprecation
-        warning, fixed nosync to false at parse time
-  - perf_check.sh:
-      * line 253: dropped --nosync; +F178 explanatory comment
-  - crates/stream/CLAUDE.md, crates/partition-server/CLAUDE.md:
-      * doc updates for Phase 1 coalescer + Phase 2 flush barrier +
-        Phase 3 nosync removal
-  - feature_list.md: F178 passes: true; Phase 4 closure
-  - claude-progress.txt: this file
+  Above ~200 k the bottleneck is the single-partition handle_get
+  CPU on the PS process. Multi-partition workloads will scale
+  further (this bench cluster boots with 1 partition by default).
 
-Verification:
-  - cargo build --workspace --exclude autumn-fuse: clean (only
-    pre-existing warnings).
-  - autumn-stream lib tests: 40/40 pass.
-  - autumn-partition-server lib tests: 122/122 pass.
-  - autumn-manager lib tests: 30/30 pass.
-  - Manual real-cluster perf bench DEFERRED — requires explicit user
-    authorization for cluster.sh. Will be picked up in a follow-up
-    iteration with target 4K p=8 NVMe ≥ 100k ops/s (recover toward
-    pre-F142 130k).
+Files touched:
+  - crates/ioring/Cargo.toml (autumn-rpc dep on `daemon` feature)
+  - crates/ioring/src/bin/daemon.rs (rewrite — multi-runtime, OpenedFile cache)
+  - crates/ioring/src/bin/bench.rs (--runtimes flag, %tid% key templating)
+  - feature_list.md (F180-B6 entry + bench results table)
+  - claude-progress.txt (this entry)
 
-Pre-existing (NOT caused by F178):
-  - autumn-manager test ec_integration::replication_stream_works
-    fails on this box with or without F178 (also documented in F173
-    progress entry).
+Tests: `cargo test -p autumn-ioring --features daemon --bin
+       autumn-ioring-daemon` — 2/2 unit tests for runtime_socket_path
+       (n=1 unchanged, n>1 appends `.idx`).
 
-Out of scope (deferred):
-  - Multi-extent fsync grouping at the kernel level (sync_file_range
-    or io_uring linked SQEs). Per-extent coalescer is sufficient
-    given the 3 GB extent size at 70 MB/s ≈ 40 s/extent.
-  - Quorum-2 fast-path replacing 3-replica "wait for slowest" on the
-    write path (independent optimization).
-  - wbench / perf-check switching to LevelDB multi-writer-share-batch
-    model (server-side merged_partition_loop already implements this
-    via F099-D).
-
-Pending in /loop continuation (next iteration):
-  - F179: real-cluster perf bench validation of F178 (requires user
-    authorization to run cluster.sh). Target: 4K p=8 NVMe ≥ 100k
-    ops/s; 8M p=8 NVMe ≥ 1.5 GB/s preserved.
-
-Session-level summary (F151-F178):
-  F151: Python bindings asyncio-native
-  F152: 3× etcd-first manager handlers + truncate sync_data
-  F153: per-extent EC conversion lock
-  F154: RETRACTED (agent over-claim)
-  F155: rkyv checked decode
-  F156: min-replica commit_length majority quorum
-  F157: extent .meta CRC32C + decode_last_table_locations skip
-  F158: WAL record per-record CRC32C V1 envelope
-  F159: save_meta durability + apply_extent_meta_durable order
-  F160: handle_copy_extent F119-C tightening
-  F161: hot-path frame CRC audit + decoder support
-  F162: MED-2 reader-pin protocol
-  F163: V1 encoder infrastructure
-  F164: F163 unblocked + startup env-dump diagnostic
-  F165: V1 default flipped ON — 7 corruption surfaces closed
-  F166: UnsafeCell `&mut` aliasing UB closed in 2 sites
-  F167: file-replace unsafe encapsulation + safety contract
-  F168: cooperative yield in do_compact merge loop
-  F169: do_compact chunk-emit moves to spawn_blocking
-  F170: ec_slice_decoded zero-copy full-read
-  F171: ExtentEntry.file: UnsafeCell → RefCell<Rc<CompioFile>>
-  F172: manager dispatch-loop pre-filter + hoist redundant clones
-  F173: ec_conversion_inflight persist to etcd
-  F175: sealed_length consistency cleared no-fix
-  F174: EC shard CRC cleared, won't fix
-  F176: sustained-write tail-latency validation + bottleneck audit
-  F177: WAL encode (CRC + memcpy) → spawn_blocking on big batches;
-        zero-copy value segment
-  F178: LevelDB-style sync coalescing — coalescer + flush-time
-        durability + always durable (no --nosync). passes: true.
+Out of scope (deferred per user direction):
+  - F180-D — Python pyo3 IoRing class binding
+  - F180-E — PyTorch DataLoader integration via IoRing
+  - F181  — BatchGet RPC (separate follow-up feature)
+  - F182  — RDMA chunk transfer (separate follow-up feature)

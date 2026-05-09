@@ -39,11 +39,21 @@ use autumn_ioring::sqe::Sqe;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "autumn-ioring-bench", about = "F180 read perf bench")]
 struct Args {
-    /// Daemon Unix socket path.
+    /// Daemon Unix socket path. With `--runtimes > 1` the bench
+    /// connects to `{socket}.{tid % runtimes}` so worker threads
+    /// distribute themselves across daemon runtimes.
     #[arg(long, default_value = "/run/autumn-ioring/ring.sock")]
     socket: PathBuf,
 
-    /// Key to read (must already exist in the cluster).
+    /// Number of daemon runtimes. Workers tid % runtimes pick the
+    /// listener path. Default 1 = single-runtime daemon (legacy).
+    #[arg(long, default_value_t = 1)]
+    runtimes: usize,
+
+    /// Key to read (must already exist in the cluster). The token
+    /// `%tid%` (if present) is replaced with the worker thread id —
+    /// pass e.g. `--key 'f180/key_%tid%'` to spread load across many
+    /// keys / partitions instead of hammering a single hot key.
     #[arg(long)]
     key: String,
 
@@ -150,17 +160,26 @@ fn worker(
     total_ops: Arc<AtomicU64>,
     total_bytes: Arc<AtomicU64>,
 ) {
-    let mut client = match IoRingClient::connect(&args.socket) {
+    let socket_path = if args.runtimes > 1 {
+        let mut s = args.socket.as_os_str().to_owned();
+        s.push(format!(".{}", tid % args.runtimes));
+        PathBuf::from(s)
+    } else {
+        args.socket.clone()
+    };
+    let mut client = match IoRingClient::connect(&socket_path) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(tid, error = %e, "client connect failed");
+            tracing::error!(tid, socket = %socket_path.display(), error = %e, "client connect failed");
             return;
         }
     };
 
     // OPEN the key. Slot 0 holds the path bytes during this call;
-    // we'll re-use it for read buffers afterward.
-    let path_bytes = args.key.as_bytes();
+    // we'll re-use it for read buffers afterward. Substitute %tid%
+    // so multi-key workloads can spread across partitions.
+    let resolved_key = args.key.replace("%tid%", &format!("{:02}", tid));
+    let path_bytes = resolved_key.as_bytes();
     if path_bytes.len() > client.header().buf_slot_size as usize {
         tracing::error!(tid, "key path too long for buffer slot");
         return;
