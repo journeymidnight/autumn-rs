@@ -28,6 +28,44 @@ pub const POLICY_WINDOW_BUCKETS: usize = 30;
 pub const POLICY_REQUIRED_BUCKETS: usize = 5;
 pub const POLICY_TICK_INTERVAL_SEC: i64 = 60;
 
+/// F184: runtime-configurable policy thresholds. Production uses the
+/// `*_DEFAULT` constants above; tests can lower `required_buckets` and
+/// `tick_interval_sec` to exercise the full policy_tick_loop fast.
+#[derive(Clone, Debug)]
+pub struct PolicyConfig {
+    pub split_size_hard: u64,
+    pub split_size_min: u64,
+    pub split_qps_high: u32,
+    pub split_immfull_high: u32,
+    pub split_cooldown_sec: i64,
+    pub merge_size_low: u64,
+    pub merge_qps_low: u32,
+    pub merge_cooldown_sec: i64,
+    pub bucket_sec: i64,
+    pub window_buckets: usize,
+    pub required_buckets: usize,
+    pub tick_interval_sec: i64,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            split_size_hard: SPLIT_SIZE_HARD,
+            split_size_min: SPLIT_SIZE_MIN,
+            split_qps_high: SPLIT_QPS_HIGH,
+            split_immfull_high: SPLIT_IMMFULL_HIGH,
+            split_cooldown_sec: SPLIT_COOLDOWN_SEC,
+            merge_size_low: MERGE_SIZE_LOW,
+            merge_qps_low: MERGE_QPS_LOW,
+            merge_cooldown_sec: MERGE_COOLDOWN_SEC,
+            bucket_sec: POLICY_BUCKET_SEC,
+            window_buckets: POLICY_WINDOW_BUCKETS,
+            required_buckets: POLICY_REQUIRED_BUCKETS,
+            tick_interval_sec: POLICY_TICK_INTERVAL_SEC,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct PartitionMetricsWindow {
     pub buckets: VecDeque<(i64, PartitionLoad)>,
@@ -35,8 +73,11 @@ pub struct PartitionMetricsWindow {
 
 impl PartitionMetricsWindow {
     pub fn push(&mut self, ts: i64, load: PartitionLoad) {
+        self.push_with_cap(ts, load, POLICY_WINDOW_BUCKETS);
+    }
+    pub fn push_with_cap(&mut self, ts: i64, load: PartitionLoad, cap: usize) {
         self.buckets.push_back((ts, load));
-        while self.buckets.len() > POLICY_WINDOW_BUCKETS {
+        while self.buckets.len() > cap {
             self.buckets.pop_front();
         }
     }
@@ -50,6 +91,15 @@ pub struct PolicyEngine {
     pub last_advisory_at: HashMap<(u8, u64, u64), i64>,
     pub advisory_cache: Vec<PolicyCandidate>,
     pub advisory_cache_at: i64,
+    /// F184: runtime-configurable thresholds. Default production values;
+    /// tests can override via `set_config`.
+    pub config: PolicyConfig,
+}
+
+impl PolicyEngine {
+    pub fn set_config(&mut self, config: PolicyConfig) {
+        self.config = config;
+    }
 }
 
 pub struct ComputeArgs<'a> {
@@ -64,6 +114,7 @@ pub struct ComputeArgs<'a> {
 impl PolicyEngine {
     pub fn compute_candidates(&mut self, args: ComputeArgs<'_>) -> Vec<PolicyCandidate> {
         let mut out = Vec::new();
+        let cfg = self.config.clone();
 
         // ── SPLIT pass ──────────────────────────────────────────────────────
         for (&part_id, window) in self.metrics.iter() {
@@ -71,40 +122,40 @@ impl PolicyEngine {
                 .buckets
                 .iter()
                 .rev()
-                .take(POLICY_REQUIRED_BUCKETS)
+                .take(cfg.required_buckets)
                 .collect();
-            if bs.len() < POLICY_REQUIRED_BUCKETS {
+            if bs.len() < cfg.required_buckets {
                 continue;
             }
 
             let last_op = args.last_op_at.get(&part_id).copied().unwrap_or(0);
-            if args.now - last_op < SPLIT_COOLDOWN_SEC {
+            if args.now - last_op < cfg.split_cooldown_sec {
                 continue;
             }
 
-            // ALL of the last POLICY_REQUIRED_BUCKETS must show a trigger.
+            // ALL of the last required_buckets must show a trigger.
             let all_match = bs.iter().all(|(_, l)| {
-                l.size_bytes > SPLIT_SIZE_HARD
-                    || (l.req_per_sec > SPLIT_QPS_HIGH && l.size_bytes > SPLIT_SIZE_MIN)
-                    || l.imm_full_per_sec > SPLIT_IMMFULL_HIGH
+                l.size_bytes > cfg.split_size_hard
+                    || (l.req_per_sec > cfg.split_qps_high && l.size_bytes > cfg.split_size_min)
+                    || l.imm_full_per_sec > cfg.split_immfull_high
             });
             if !all_match {
                 continue;
             }
 
             let recent = &bs[0].1;
-            let reason = if recent.size_bytes > SPLIT_SIZE_HARD {
+            let reason = if recent.size_bytes > cfg.split_size_hard {
                 format!(
                     "size_bytes>{} ({} GiB)",
-                    SPLIT_SIZE_HARD,
+                    cfg.split_size_hard,
                     recent.size_bytes / GIB
                 )
-            } else if recent.imm_full_per_sec > SPLIT_IMMFULL_HIGH {
-                format!("imm_full_per_sec>{} sustained", SPLIT_IMMFULL_HIGH)
+            } else if recent.imm_full_per_sec > cfg.split_immfull_high {
+                format!("imm_full_per_sec>{} sustained", cfg.split_immfull_high)
             } else {
                 format!(
                     "req_per_sec>{} sustained AND size_bytes>{}",
-                    SPLIT_QPS_HIGH, SPLIT_SIZE_MIN
+                    cfg.split_qps_high, cfg.split_size_min
                 )
             };
             out.push(PolicyCandidate {
@@ -153,24 +204,24 @@ impl PolicyEngine {
                 None => continue,
             };
             let lbs: Vec<&(i64, PartitionLoad)> =
-                lw.buckets.iter().rev().take(POLICY_REQUIRED_BUCKETS).collect();
+                lw.buckets.iter().rev().take(cfg.required_buckets).collect();
             let rbs: Vec<&(i64, PartitionLoad)> =
-                rw.buckets.iter().rev().take(POLICY_REQUIRED_BUCKETS).collect();
-            if lbs.len() < POLICY_REQUIRED_BUCKETS || rbs.len() < POLICY_REQUIRED_BUCKETS {
+                rw.buckets.iter().rev().take(cfg.required_buckets).collect();
+            if lbs.len() < cfg.required_buckets || rbs.len() < cfg.required_buckets {
                 continue;
             }
 
             let last_op_l = args.last_op_at.get(&left_id).copied().unwrap_or(0);
             let last_op_r = args.last_op_at.get(&right_id).copied().unwrap_or(0);
             let max_last_op = last_op_l.max(last_op_r);
-            if args.now - max_last_op < MERGE_COOLDOWN_SEC {
+            if args.now - max_last_op < cfg.merge_cooldown_sec {
                 continue;
             }
 
             let all_qualify = lbs.iter().zip(rbs.iter()).all(|((_, lb), (_, rb))| {
-                lb.size_bytes < MERGE_SIZE_LOW
-                    && rb.size_bytes < MERGE_SIZE_LOW
-                    && (lb.req_per_sec + rb.req_per_sec) < MERGE_QPS_LOW
+                lb.size_bytes < cfg.merge_size_low
+                    && rb.size_bytes < cfg.merge_size_low
+                    && (lb.req_per_sec + rb.req_per_sec) < cfg.merge_qps_low
                     && lb.imm_full_per_sec == 0
                     && rb.imm_full_per_sec == 0
             });
@@ -193,8 +244,8 @@ impl PolicyEngine {
                 secondary_part_id: right_id,
                 reason: format!(
                     "size_sum<{} qps_sum<{} sustained{}",
-                    MERGE_SIZE_LOW,
-                    MERGE_QPS_LOW,
+                    cfg.merge_size_low,
+                    cfg.merge_qps_low,
                     if !same_ps {
                         " (cross-PS, infeasible)"
                     } else {

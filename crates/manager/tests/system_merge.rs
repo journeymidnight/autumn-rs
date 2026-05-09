@@ -612,6 +612,92 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
     });
 }
 
+/// F184 fast-mode policy_tick_loop e2e: enable auto-merge with a 1-bucket
+/// 1-second tick config, send synthetic low-load metrics for two adjacent
+/// partitions, verify the policy_tick_loop fires auto-merge automatically
+/// (no manual force_auto_merge call). Exercises the full closed loop:
+/// `MSG_REPORT_PARTITION_LOAD → metrics window → compute_candidates →
+/// auto_dispatch_merge → multi_modify_merge`.
+#[test]
+#[ignore]
+fn auto_merge_fires_via_policy_tick_loop_fast_mode() {
+    use autumn_manager::AutumnManager;
+    use autumn_manager::policy::PolicyConfig;
+
+    let mgr_addr = pick_addr();
+
+    let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
+    let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let manager = AutumnManager::new();
+
+        // Fast-mode policy config — required_buckets=1, tick_interval=1s,
+        // cooldown=0. Lets a single MSG_REPORT_PARTITION_LOAD trigger
+        // candidate detection on the next tick.
+        let mut cfg = PolicyConfig::default();
+        cfg.required_buckets = 1;
+        cfg.tick_interval_sec = 1;
+        cfg.split_cooldown_sec = 0;
+        cfg.merge_cooldown_sec = 0;
+        manager.set_policy_config(cfg);
+        manager.set_auto_merge(true);
+
+        let mgr_for_serve = manager.clone();
+        compio::runtime::spawn(async move {
+            let _ = mgr_for_serve.serve(mgr_addr).await;
+        }).detach();
+        compio::time::sleep(Duration::from_millis(200)).await;
+
+        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 97).await;
+
+        // Set up two adjacent partitions on one PS.
+        let ps_addr = pick_addr();
+        start_partition_server(97, mgr_addr, ps_addr);
+        compio::time::sleep(Duration::from_millis(2000)).await;
+
+        let (l1, r1, m1) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 8001, l1, r1, m1, b"a", b"m").await;
+        let (l2, r2, m2) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 8002, l2, r2, m2, b"m", b"z").await;
+        compio::time::sleep(Duration::from_millis(2500)).await;
+
+        // Send synthetic LOW load metrics for both partitions — qualify
+        // for merge candidate detection.
+        let load = PartitionLoad {
+            part_id: 0,
+            size_bytes: 100 * 1024 * 1024,
+            req_per_sec: 50,
+            imm_full_per_sec: 0,
+            p99_us: 0,
+        };
+        let mut p1 = load.clone(); p1.part_id = 8001;
+        let mut p2 = load; p2.part_id = 8002;
+        let report_req = rkyv_encode(&ReportPartitionLoadReq {
+            ps_id: 97,
+            partitions: vec![p1, p2],
+        });
+        mgr.call(MSG_REPORT_PARTITION_LOAD, report_req)
+            .await
+            .expect("report_partition_load");
+
+        // Wait for policy_tick_loop to fire (tick=1s). Up to 30s for the
+        // full loop including FLUSH+lock+commit_length+merge.
+        let merged = poll_until_async(
+            Duration::from_secs(30),
+            Duration::from_millis(500),
+            || async { get_regions(&mgr).await.regions.len() == 1 },
+        )
+        .await;
+        assert!(merged, "auto-merge via policy_tick_loop must reduce regions to 1");
+    });
+}
+
 /// F184 auto-split smoke: invoke `force_auto_split` and verify the
 /// manager dispatches MSG_SPLIT_PART to the owning PS via conn_pool.
 #[test]

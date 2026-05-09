@@ -1,5 +1,5 @@
 mod extent_delete;
-pub(crate) mod policy;
+pub mod policy;
 #[cfg(test)]
 mod policy_tests;
 mod recovery;
@@ -367,6 +367,13 @@ impl AutumnManager {
 
     /// F184 test helper: dispatch a SPLIT against `part_id` as if the
     /// policy engine had picked it. Snapshots state internally.
+    /// F184 test helper: override the policy engine's thresholds.
+    /// Tests can lower `required_buckets` and `tick_interval_sec` to
+    /// fast-mode the full policy_tick_loop.
+    pub fn set_policy_config(&self, config: crate::policy::PolicyConfig) {
+        self.policy.borrow_mut().set_config(config);
+    }
+
     pub async fn force_auto_split(&self, part_id: u64) -> Result<()> {
         let state = (*self.store.inner.borrow()).clone();
         let cand = autumn_rpc::manager_rpc::PolicyCandidate {
@@ -492,8 +499,12 @@ impl AutumnManager {
     /// region owners. Logs new candidates at INFO; exposes the cache
     /// via MSG_GET_POLICY_CANDIDATES.
     async fn policy_tick_loop(self) {
-        let interval = Duration::from_secs(crate::policy::POLICY_TICK_INTERVAL_SEC as u64);
         loop {
+            // Re-read tick interval each cycle so set_policy_config takes
+            // effect immediately (matters in tests; production stays at 60s).
+            let interval = Duration::from_secs(
+                self.policy.borrow().config.tick_interval_sec.max(1) as u64,
+            );
             compio::time::sleep(interval).await;
             if !self.leader.get() {
                 continue;
