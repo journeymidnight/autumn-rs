@@ -3271,16 +3271,42 @@ async fn recover_partition(
     let mut recovered_vp_off: u32 = 0;
     let mut detected_overlap = false;
 
-    let meta_bytes_opt = part_sc.read_last_extent_data(meta_stream_id).await?;
+    // F184: union the LAST TableLocations record from EACH meta_stream
+    // extent (instead of just the last extent's last record). Pre-merge
+    // partitions have a single non-empty meta_stream extent with one
+    // canonical record — single-extent path is unchanged. Post-merge,
+    // the splice puts both survivor's and victim's old meta_stream
+    // extents into the merged stream; reading just the last extent
+    // would lose half the table set.
+    let meta_records: Vec<TableLocations> = read_all_table_locations(meta_stream_id, part_sc)
+        .await
+        .context("union TableLocations from metaStream extents")?;
 
-    if let Some(meta_bytes) = meta_bytes_opt {
-        let locations = decode_last_table_locations(&meta_bytes)
-            .context("decode TableLocations from metaStream")?;
-
-        recovered_vp_eid = locations.vp_extent_id;
-        recovered_vp_off = locations.vp_offset;
-
-        for loc in locations.locs {
+    if !meta_records.is_empty() {
+        // Take the max vp_head across all source partitions (both were
+        // drained pre-merge so neither has stale records past its vp_head).
+        for r in &meta_records {
+            if r.vp_extent_id > recovered_vp_eid
+                || (r.vp_extent_id == recovered_vp_eid && r.vp_offset > recovered_vp_off)
+            {
+                recovered_vp_eid = r.vp_extent_id;
+                recovered_vp_off = r.vp_offset;
+            }
+        }
+        // Dedup SstLocation by (extent_id, offset, len) — CoW-shared SSTs
+        // post-split appear in both partitions' records pointing at the
+        // same physical bytes; we keep one entry.
+        let mut seen: HashSet<(u64, u32, u32)> = HashSet::new();
+        let mut all_locs: Vec<SstLocation> = Vec::new();
+        for r in meta_records {
+            for loc in r.locs {
+                let key = (loc.extent_id, loc.offset, loc.len);
+                if seen.insert(key) {
+                    all_locs.push(loc);
+                }
+            }
+        }
+        for loc in all_locs {
             let (sst_bytes, _end) = part_sc
                 .read_bytes_from_extent(loc.extent_id, loc.offset, loc.len)
                 .await
@@ -3531,6 +3557,43 @@ pub(crate) fn decode_records_with_offsets(bytes: &[u8]) -> Vec<(usize, u8, Vec<u
         tracing::warn!(skipped, "F158: skipped {skipped} corrupted WAL record(s)");
     }
     out
+}
+
+/// F184: Walk all extents in a meta_stream and collect the LAST
+/// `TableLocations` record from each non-empty extent. Used by
+/// recovery to gather both survivor's and victim's checkpoints
+/// after a partition merge spliced their meta_streams together.
+///
+/// Pre-merge partitions have one non-empty extent → single record →
+/// behaviour identical to the legacy `read_last_extent_data +
+/// decode_last_table_locations`. Post-merge they have N extents.
+pub(crate) async fn read_all_table_locations(
+    stream_id: u64,
+    sc: &Rc<StreamClient>,
+) -> Result<Vec<TableLocations>> {
+    let info = sc.get_stream_info(stream_id).await?;
+    let mut out: Vec<TableLocations> = Vec::new();
+    for &eid in &info.extent_ids {
+        let (payload, _end) = sc.read_bytes_from_extent(eid, 0, 0).await?;
+        if payload.is_empty() {
+            continue;
+        }
+        // decode_last_table_locations returns Err only when NO valid
+        // record exists in the buffer; bit-rot mid-stream is logged
+        // and skipped. Empty extents (carry no records) are common —
+        // skip them silently.
+        match decode_last_table_locations(&payload) {
+            Ok(locs) => out.push(locs),
+            Err(e) => {
+                tracing::warn!(
+                    extent_id = eid,
+                    error = %e,
+                    "F184: meta_stream extent has no valid TableLocations; skipping"
+                );
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn decode_last_table_locations(data: &[u8]) -> Result<TableLocations> {
