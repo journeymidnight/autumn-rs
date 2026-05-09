@@ -291,6 +291,236 @@ fn merge_refuses_self_merge() {
     });
 }
 
+/// Merge with large values that go through ValuePointer. After merge,
+/// the survivor's SSTs (including those imported from victim) must
+/// still resolve their VPs against the spliced log_stream's extents.
+///
+/// **Currently disabled**: this exercises the VP+compact code path,
+/// which has a pre-existing 5-byte offset bug ahead of merge — VPs
+/// written then re-encoded through major compaction return values
+/// prefixed with 5 bytes of the MVCC suffix tail (the inverted seq=1
+/// suffix `0xff 0xff 0xff 0xff 0xfe`). The bug reproduces WITHOUT a
+/// split or merge step (asserted by the PRE-SPLIT sanity check below
+/// failing). Tracked as a separate VP-encoding regression.
+#[test]
+#[ignore]
+#[allow(dead_code)]
+fn merge_preserves_value_pointer_resolution() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
+    let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 90).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 4001, log, row, meta, b"a", b"z").await;
+
+        let ps_addr = pick_addr();
+        start_partition_server(90, mgr_addr, ps_addr);
+        let _ps = RpcClient::connect(ps_addr).await.unwrap();
+        let router = PsRouter::new(mgr_addr, ps_addr);
+
+        // Write 6 large values (8 KiB each) → above the 4 KiB VP threshold,
+        // so each becomes a ValuePointer in the SST. 3 keys < 'm' (left
+        // half), 3 keys >= 'm' (right half).
+        let big_val = vec![0xab; 8 * 1024];
+        for i in 0u8..3 {
+            psr_put(&router, 4001, format!("a-{:02}", i).as_bytes(), &big_val).await;
+            psr_put(&router, 4001, format!("n-{:02}", i).as_bytes(), &big_val).await;
+        }
+        psr_flush(&router, 4001).await;
+        psr_compact(&router, 4001).await;
+        compio::time::sleep(Duration::from_millis(2000)).await;
+
+        // Sanity: read big_val pre-split — must succeed cleanly.
+        for i in 0u8..3 {
+            let r = psr_get(&router, 4001, format!("a-{:02}", i).as_bytes()).await;
+            assert_eq!(
+                r.value, big_val,
+                "PRE-SPLIT: big_val a-{:02} corrupted (len={}, expected {})",
+                i, r.value.len(), big_val.len()
+            );
+        }
+
+        // Split.
+        let split_resp_bytes = router
+            .client_for(4001)
+            .await
+            .call(
+                partition_rpc::MSG_SPLIT_PART,
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 4001 }),
+            )
+            .await
+            .expect("split");
+        let sr: partition_rpc::SplitPartResp =
+            partition_rpc::rkyv_decode(&split_resp_bytes).unwrap();
+        assert_eq!(sr.code, partition_rpc::CODE_OK, "split: {}", sr.message);
+
+        let _ = poll_until_async(
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+            || async {
+                let r = get_regions(&mgr).await;
+                r.regions.len() == 2 && r.part_addrs.len() == 2
+            },
+        )
+        .await;
+
+        let regions = get_regions(&mgr).await;
+        let mut survivor_id = 0u64;
+        let mut victim_id = 0u64;
+        for (pid, r) in &regions.regions {
+            if let Some(rg) = &r.rg {
+                if rg.start_key == b"a".to_vec() {
+                    survivor_id = *pid;
+                } else {
+                    victim_id = *pid;
+                }
+            }
+        }
+        assert!(survivor_id != 0 && victim_id != 0);
+
+        psr_compact(&router, survivor_id).await;
+        psr_compact(&router, victim_id).await;
+        compio::time::sleep(Duration::from_millis(3000)).await;
+
+        let resp = merge_partitions(&mgr, &router, survivor_id, victim_id).await;
+        assert_eq!(resp.code, CODE_OK, "merge: {}", resp.message);
+
+        compio::time::sleep(Duration::from_millis(2500)).await;
+
+        // Verify: every large value resolves correctly post-merge. The
+        // VPs in re-imported SSTs reference log_stream extents that were
+        // spliced into survivor's log_stream by the manager merge.
+        for i in 0u8..3 {
+            let r = psr_get(&router, survivor_id, format!("a-{:02}", i).as_bytes()).await;
+            assert_eq!(r.value.len(), big_val.len(), "left big-val a-{:02} len mismatch", i);
+            assert_eq!(r.value, big_val, "left big-val a-{:02} content mismatch", i);
+            let r = psr_get(&router, survivor_id, format!("n-{:02}", i).as_bytes()).await;
+            assert_eq!(r.value.len(), big_val.len(), "right big-val n-{:02} len mismatch", i);
+            assert_eq!(r.value, big_val, "right big-val n-{:02} content mismatch", i);
+        }
+    });
+}
+
+/// Merge then split-again chain: confirms cooldown and post-merge state
+/// supports a follow-up split. Cooldown thresholds are 1h split / 6h
+/// merge — but `last_op_at` is a hint to the policy engine, NOT a hard
+/// gate on manual triggers. Manual split should always work.
+#[test]
+#[ignore]
+fn merge_then_split_again_round_trip() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
+    let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 91).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 5001, log, row, meta, b"a", b"z").await;
+
+        let ps_addr = pick_addr();
+        start_partition_server(91, mgr_addr, ps_addr);
+        let _ps = RpcClient::connect(ps_addr).await.unwrap();
+        let router = PsRouter::new(mgr_addr, ps_addr);
+
+        // Pre-populate.
+        for i in 0u8..6 {
+            psr_put(&router, 5001, format!("k-{:02}", i).as_bytes(), b"v").await;
+            psr_put(&router, 5001, format!("p-{:02}", i).as_bytes(), b"v").await;
+        }
+        psr_flush(&router, 5001).await;
+        psr_compact(&router, 5001).await;
+        compio::time::sleep(Duration::from_millis(2000)).await;
+
+        // Split #1.
+        router
+            .client_for(5001)
+            .await
+            .call(
+                partition_rpc::MSG_SPLIT_PART,
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 5001 }),
+            )
+            .await
+            .expect("split #1");
+        let _ = poll_until_async(
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+            || async {
+                let r = get_regions(&mgr).await;
+                r.regions.len() == 2 && r.part_addrs.len() == 2
+            },
+        )
+        .await;
+
+        let regions = get_regions(&mgr).await;
+        let mut s1 = 0u64;
+        let mut v1 = 0u64;
+        for (pid, r) in &regions.regions {
+            if let Some(rg) = &r.rg {
+                if rg.start_key == b"a".to_vec() {
+                    s1 = *pid;
+                } else {
+                    v1 = *pid;
+                }
+            }
+        }
+
+        psr_compact(&router, s1).await;
+        psr_compact(&router, v1).await;
+        compio::time::sleep(Duration::from_millis(3000)).await;
+
+        // Merge.
+        let mr = merge_partitions(&mgr, &router, s1, v1).await;
+        assert_eq!(mr.code, CODE_OK, "merge: {}", mr.message);
+        compio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(get_regions(&mgr).await.regions.len(), 1);
+
+        // Compact survivor to clear has_overlap (post-merge SSTs span
+        // both old halves; compaction unifies into the wider range).
+        psr_compact(&router, s1).await;
+        compio::time::sleep(Duration::from_millis(3000)).await;
+
+        // Split #2 on the merged partition. This is the harder case
+        // because survivor's seq_number must be > max of both old
+        // partitions' seqs (asserted by the merge logic) AND
+        // unique_user_keys must reflect the unioned table set.
+        let r2 = router
+            .client_for(s1)
+            .await
+            .call(
+                partition_rpc::MSG_SPLIT_PART,
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: s1 }),
+            )
+            .await
+            .expect("split #2 call");
+        let sr2: partition_rpc::SplitPartResp =
+            partition_rpc::rkyv_decode(&r2).unwrap();
+        assert_eq!(
+            sr2.code,
+            partition_rpc::CODE_OK,
+            "split #2 must succeed after merge+compact: {}",
+            sr2.message
+        );
+        compio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(get_regions(&mgr).await.regions.len(), 2);
+    });
+}
+
 #[allow(dead_code)]
 fn _suppress_unused() {
     let _ = Bytes::new();
