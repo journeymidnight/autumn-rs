@@ -1,105 +1,139 @@
 Date: 2026-05-10
 TaskStatus: completed
-Task scope: F130 — GC active rewrite for multi-fragment ValuePointers.
-            Closes the F129 sustained-use disk-leak gap: without F130
-            the existing single-VP GC pass skipped OP_CHUNK_BLOB
-            records (correctly — those are bare byte blobs, not WAL
-            entries), and `punch_holes` would orphan live multi-frag
-            chunks on the reclaimed extent.
+Task scope: F186 — client-side striperados (Ceph pattern) replaces F129
+            server multipart + F130 GC active rewrite. Plus a
+            pre-existing latent VP-offset bug that F186 caught and
+            fixed.
 
-Approach:
-  - **Full-value rewrite** when GC targets an extent with any chunk
-    of any live multi-frag value: rewrite the ENTIRE multi-frag value
-    (every fragment, even those on extents other than the one being
-    reclaimed) to the active log_stream tail. Avoids the partial-
-    overlap discard accounting bug that selective rewrite would
-    introduce — when compaction later shadows the old mfvp, it can
-    blindly bump per-extent discards for every frag.
-  - **MVCC seq ordering** for race safety: rewrite allocates a fresh
-    seq under brief borrow_mut. A foreground Put on the same user_key
-    always gets a strictly newer seq and shadows the rewrite via the
-    inverted-seq byte ordering of internal_keys. Rewrite chunks
-    become orphan if foreground wins; next GC pass collects them.
-    Same pattern as the existing single-VP process_gc_chunk.
-  - **No procedure-WAL needed**: the design is per-extent and idempotent;
-    a PS crash mid-rewrite leaves orphan OP_CHUNK_BLOB records on the
-    new tail and the original mfvp still pointing at the old extent
-    — recovery just sees both, MVCC picks the right one.
+User feedback that drove this: F129 / F130 (just shipped) was
+overengineered. The "value too big for inline cap" problem can be
+solved with pure client-side striping over existing server primitives,
+matching how Ceph striperados / S3 multipart / etc all work in
+practice. This redesign:
+  - DELETED ~1500 server-side lines (F129 handlers, F130 GC rewrite,
+    multi-frag VP shape, OP_VALUE_POINTER_MULTI / OP_CHUNK_BLOB op
+    flags, UploadSession, recovery handling, compaction discard
+    branches)
+  - ADDED ~250 client-side lines (StripeMeta, make_chunk_key,
+    PutStreamHandle/GetStream now sync, delete_stream)
+  - Same caller-visible API surface (PutStreamHandle / GetStream
+    shape unchanged), same end-to-end functionality
 
-Implementation:
-  - `bump_discards_for_dropped_entry(discards, op, raw_value)` —
-    helper extracted from 4 sites in `do_compact`'s drop branches
-    (dedup, range filter, tombstone, expired). Now handles BOTH
-    single-VP (existing) and multi-frag VP (new): for multi-frag,
-    decodes MultiFragVp and bumps per-extent discards for EVERY
-    fragment.
-  - `collect_live_mfvps_touching(part, eid)` — walks active memtable
-    + imm queue, dedups by user_key (newest wins), returns mfvps with
-    at least one fragment on the to-be-reclaimed extent.
-  - `rewrite_multi_frag_for_extent(part, log_stream_id, eid, part_sc)`
-    — main rewrite loop. Per candidate:
-      1. Read every fragment via read_bytes_from_extent.
-      2. Append each as a fresh OP_CHUNK_BLOB record.
-      3. Build new MultiFragVp.
-      4. Allocate seq under borrow_mut.
-      5. Append OP_VALUE_POINTER_MULTI|1 commit record.
-      6. Insert memtable entry, update vp_extent_id / vp_offset.
-  - `run_gc` calls `rewrite_multi_frag_for_extent` as a pre-pass
-    BEFORE the existing single-VP `process_gc_chunk` loop. After the
-    pre-pass, the single-VP scan can punch_holes safely.
+Splits committed in two commits to keep diffs reviewable:
+  c744058 F186-A/B: build client-side + VP-offset fix
+  (this commit) F186-C/D: rip out server-side + docs
 
-Scope limitation (recorded in feature_list F130 + CLAUDE.md):
-  - Pre-pass walks active memtable + imm only, NOT SSTs. Live mfvps
-    whose newest copy is only in an SST and not yet shadowed are
-    handled by the compaction discard path: compaction shadows the
-    SST entry → bumps discards for every frag → host extents
-    eventually accumulate > 40% discard ratio → next GC tick picks
-    them.
-  - This trade-off avoids walking every entry of every SST on every
-    GC tick (O(SST bytes) per tick). If production sees stuck
-    extents that compaction takes too long to clear, add a targeted
-    scan via the existing SST `vp_deps` index.
+Saved feedback memory:
+  feedback_client_side_complexity_first.md — try client-side
+  complexity before server-side. Complements 2PC + orchestrator-
+  must-be-crash-safe memories.
 
-Test results:
-  cargo test -p autumn-partition-server --lib --test-threads=1: 130/130
-  cargo test -p autumn-manager --test system_putstream -- --ignored: 4/4
-    f129_putstream_roundtrip_12mib                — pre-existing
-    f129_putstream_single_chunk_1mib              — pre-existing
-    f129_putstream_abort_drops_session            — pre-existing
-    f130_multifrag_gc_rewrite_preserves_value     — NEW, validates F130
+Pre-existing VP-offset bug (latent since F165 V1 default-on):
+  finish_write_batch + flush_gc_batch + recover_partition all
+  computed VP.offset = record_offset + 17 + key.len() (V0 layout).
+  Post-F165 records on disk are V1 with a 5-byte envelope prefix
+  (sentinel + payload_len), so value bytes are at +22 not +17.
+  Every value > 4 KiB written via the regular Put path since F165
+  has had its VP pointing 5 bytes too early — reads return the
+  last 5 bytes of internal_key (inverted-seq, e.g. [ff,ff,ff,ff,fe])
+  followed by (value_len - 5) bytes of value. Latent because:
+    - production tests use small values (≤ 4 KiB → inline)
+    - F129 multipart used the correct V1 calc (1+4+17 = 22)
+    - no test verified content of large VP-path values post-V1
+  F186 caught it because client-side striperados puts every chunk
+  via plain Put with chunk_size = 4 MiB > VALUE_THROTTLE.
+  Fix: `+ 17 +` → `+ 22 +` at three sites.
+
+F186 client-side design:
+  - StripeMeta (29 bytes): 8B magic + 1B version + 8B total_bytes
+    + 4B chunk_count + 4B chunk_size + 4B CRC32C over first 25.
+    False-positive rate against random user values ≈ 2^-96.
+  - make_chunk_key: \xff\xfeacv1\xff + user_key_len(BE u32) +
+    user_key + chunk_index(BE u64). Sorts after all normal user
+    keys; length-prefix prevents user-key ambiguity.
+  - PutStreamHandle::send writes chunk to chunk_key via plain
+    cluster.put. PutStreamHandle::commit writes the meta blob to
+    the user key — its presence is the atomic linearisation point.
+    abort best-effort deletes already-written chunks.
+  - GetStream auto-detects via StripeMeta::try_decode: striped →
+    walks chunks; non-striped → yields blob whole.
+  - delete_stream cascades; plain delete only removes meta.
+  - 6 unit tests (StripeMeta encode/decode + chunk-key disambiguation
+    + sort order).
+
+Server-side rip-out:
+  Wire types: MSG_PUT_BEGIN/CHUNK/COMMIT/ABORT (0x49-0x4C reserved,
+    constants commented out for stale-binary safety),
+    PutBegin/Chunk/Commit/Abort{Req,Resp}, CODE_UPLOAD_NOT_FOUND.
+  Server handlers: handle_put_begin/chunk/commit/abort,
+    rand_upload_id, HEAD's multi-frag value_length branch.
+  Op flags + types: OP_VALUE_POINTER_MULTI, OP_CHUNK_BLOB,
+    MultiFragVp + 5 unit tests, op-flag-distinct test,
+    UploadSession, AUTUMN_PS_MAX_INLINE_BYTES_HARD,
+    AUTUMN_PS_MAX_UPLOAD_SESSIONS_DEFAULT,
+    AUTUMN_PS_UPLOAD_TTL_SECS_DEFAULT.
+  PartitionData: upload_sessions field.
+  Recovery: OP_CHUNK_BLOB skip + OP_VALUE_POINTER_MULTI re-insert.
+  GC + compaction: F130's collect_live_mfvps_touching,
+    rewrite_multi_frag_for_extent, run_gc pre-pass call,
+    multi-frag branch of bump_discards_for_dropped_entry,
+    resolve_multi_frag.
+
+Tests:
+  cargo test -p autumn-rpc                                     : 13/13
+                                              (was 17, dropped 4 F129)
+  cargo test -p autumn-partition-server --lib --test-threads=1 : 124/124
+                                  (was 130, dropped 5 multi-frag + 1
+                                   op-flag-distinct = 6)
+  cargo test -p autumn-manager --lib                           : 51/51
+  cargo test -p autumn-manager --test system_putstream -- --ignored:
+    f186_putstream_roundtrip_12mib              ✓ (4 × 3 MiB chunks,
+        full roundtrip, pre-commit get returns NotFound, post-commit
+        meta blob present, get_stream reassembles bytes,
+        delete_stream cascades)
+    f186_putstream_single_chunk_1mib            ✓ (n_chunks=1 edge)
+    f186_putstream_abort_drops_chunks           ✓ (meta absent → get
+        returns None even with orphan chunks)
+    f186_get_stream_inline_value_passthrough    ✓ (auto-detect non-
+        striped via meta magic mismatch)
   cargo check --workspace --exclude autumn-fuse: clean
 
-F130 test (f130_multifrag_gc_rewrite_preserves_value):
-  - Stream-puts a 12 MiB value (4 × 3 MiB chunks)
-  - Snapshots target log_stream extent (where chunks landed)
-  - Flushes → posts a second 2 MiB value to grow log_stream past
-    the target → compacts so SST holds the mfvp entry
-  - Force_GC the original target extent
-  - Assertions:
-    a) get(key) returns 12 MiB byte-for-byte → rewrite preserved value
-    b) get_stream(key) reassembles to identical bytes → multi-frag
-       resolution still works post-rewrite
-    c) unrelated key still readable → F130 didn't corrupt other entries
-
 Files changed:
-  crates/partition-server/src/background.rs  — bump_discards_for_dropped_entry
-                                                 helper, F130 pre-pass:
-                                                 collect_live_mfvps_touching
-                                                 + rewrite_multi_frag_for_extent;
-                                                 run_gc pre-pass call;
-                                                 4 compaction sites refactored
-                                                 to use the helper
-  crates/manager/tests/system_putstream.rs   — new f130 test
-  crates/partition-server/CLAUDE.md          — GC section now describes
-                                                 F130 pre-pass
-  feature_list.md                            — F130 → passes:true,
-                                                 completed-table row added
-  claude-progress.txt                        — this file
-
-Out-of-scope follow-ups (independent F-numbers, recorded):
-  F131 — concurrent fragment pread for resolve_multi_frag (perf)
-  F132 — PutStream resume across partition split / PS restart
-  F133 — autumn-rpc native multi-frame (FLAG_STREAM_END activation)
-  F134 — frame-level Put early reject (perf hardening)
+  crates/rpc/src/partition_rpc.rs                — F129 wire types out
+  crates/partition-server/src/lib.rs             — F129 op flags +
+                                                    MultiFragVp +
+                                                    UploadSession +
+                                                    upload_sessions
+                                                    field + recovery
+                                                    handling + VP
+                                                    offset fix
+  crates/partition-server/src/rpc_handlers.rs    — F129 handlers +
+                                                    HEAD multi-frag
+  crates/partition-server/src/background.rs      — F130 helpers +
+                                                    pre-pass +
+                                                    resolve_multi_frag
+                                                    + multi-frag
+                                                    discard branch +
+                                                    VP offset fix (× 2
+                                                    sites)
+  crates/client/Cargo.toml                       — added crc32c dep
+  crates/client/src/lib.rs                       — F186 client-side
+                                                    striperados (added
+                                                    in c744058) +
+                                                    UploadNotFound
+                                                    error variant
+                                                    removed
+  crates/server/src/bin/autumn_client.rs         — putstream is sync
+  crates/manager/tests/system_putstream.rs       — rewrote 4 tests
+                                                    for client-side
+                                                    semantics
+  feature_list.md                                — F186 entry,
+                                                    F129/F130 marked
+                                                    SUPERSEDED
+  README.md                                      — F186 docs
+  claude-progress.txt                            — this file
+  /root/.claude/projects/-data-dongmao-dev-autumn-rs/memory/MEMORY.md
+  /root/.claude/projects/-data-dongmao-dev-autumn-rs/memory/feedback_client_side_complexity_first.md
+                                                 — new feedback memory
 
 Final commit: pending (this commit).

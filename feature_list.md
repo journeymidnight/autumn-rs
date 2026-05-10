@@ -98,8 +98,9 @@
 | F183 | Partition merge primitive + size+load advisory policy engine (Stage 1) | partition/manager |
 | F184 | Auto-trigger flags + reload-on-region-change + concurrent-writer test + ClusterClient.rpc_timeout | manager/client |
 | F185 | Manager-orchestrated merge with PS freeze-drain (closes F184-K ~5% merge-window loss; 0 loss verified) | manager/partition |
-| F129 | PutStream / GetStream — multipart upload + multi-fragment ValuePointer (lifts 64 MiB inline cap) | partition-server/client |
-| F130 | GC active rewrite for multi-frag VPs — unblocks log_stream extent reclaim under sustained F129 use | partition-server |
+| F186 | Client-side striperados (Ceph pattern) replaces F129/F130 server multipart — pure ClusterClient impl | client |
+| ~~F129~~ | ~~PutStream / GetStream — multipart + multi-frag VP~~ — SUPERSEDED by F186 (server code ripped out) | — |
+| ~~F130~~ | ~~GC active rewrite for multi-frag VPs~~ — SUPERSEDED by F186 (no multi-frag any more) | — |
 
 ---
 
@@ -352,8 +353,57 @@
 
 ## Open / Deferred designs
 
-### F129 · PutStream / GetStream — PS multipart upload + multi-fragment ValuePointer
-- **Target:** Bound PS RAM and improve TTFB for large values by adding S3-style multipart upload (`PutBegin` / `PutChunk` / `PutCommit` / `PutAbort`) at the partition server, plus a client-side `GetStream` that loops the existing `GetReq.offset/length`. Memtable / SSTable gain a multi-fragment `ValuePointer` (op flag `OP_VALUE_POINTER_MULTI = 0x40`, encoded `[n_frags:u32][total_len:u64][(extent_id:u64, offset:u32, len:u32) × n_frags]`); chunks stored as WAL-shaped records with op `OP_CHUNK_BLOB = 0x10` so `decode_records_with_offsets` / `process_gc_chunk` skip them safely. Existing `Put`/`Get` preserved; both gain symmetric size cap `AUTUMN_PS_MAX_INLINE_BYTES` (default 64 MiB, hard ≤ 256 MiB) — over-cap returns `CODE_VALUE_TOO_LARGE`. Client adds `PutStreamHandle { send, commit, abort }` + `GetStream { next_chunk }`. PS holds upload sessions in memory only (`HashMap<u128, UploadSession>`); session metadata is O(1) in chunks (clients hold the fragment list); idle TTL 30 min (`AUTUMN_PS_UPLOAD_TTL_SECS`); per-partition cap 1024 (`AUTUMN_PS_MAX_UPLOAD_SESSIONS`). Routing requires `part_id` in `PutChunkReq`/`PutCommitReq`/`PutAbortReq`.
+### F186 · Client-side striperados — supersedes F129 + F130
+
+- **Target:** Stripe-write large values without ANY new server-side machinery. Replaces F129's server-side multipart upload + multi-fragment ValuePointer + F130's GC active-rewrite path with pure client-side striping (Ceph striperados pattern). Caller insight (preserved as `feedback_client_side_complexity_first.md` auto-memory): when an architecture problem can be solved with client logic over the existing primitives, that's almost always the right call — server complexity compounds across the whole cluster's memory + WAL + recovery + GC + compaction state, while client complexity costs only the SDK's footprint.
+- **Mechanism (no new server RPCs):**
+  - `ClusterClient::put_stream_begin(key, expires_at) → PutStreamHandle`. Each `send(chunk)` writes to `make_chunk_key(user_key, chunk_index)` via plain `MSG_PUT`. The chunk-key namespace is `b"\xff\xfeacv1\xff" + user_key.len() (BE u32) + user_key + chunk_index (BE u64)` — sorts after all normal user keys + length-prefix prevents user-key ambiguity.
+  - `commit` writes a 29-byte `StripeMeta` blob to the user key: 8-byte magic + 1-byte version + 8-byte total_bytes + 4-byte chunk_count + 4-byte chunk_size + 4-byte CRC32C over the first 25 bytes. The meta blob's presence at the user key is the atomic linearisation point: until commit returns, `get(key)` returns NotFound and orphan chunks are invisible.
+  - `abort` best-effort deletes already-written chunks. `delete_stream(key)` cascade-deletes all chunks then removes meta.
+  - `get_stream(key, chunk_size_hint)` auto-detects: if `cluster.get(key)` returns a 29-byte blob with the magic + valid CRC, walks chunks; otherwise treats the blob as inline and yields it whole.
+- **Crash safety:** chunks-before-meta ordering: a client crash leaves orphan chunks (no meta → invisible to readers, can be cleaned by application-layer sweep) — but never leaves dangling meta with missing chunks, which would surface as user-visible read failures. Same trade-off as Ceph striperados.
+- **Files changed:**
+  - `crates/client/src/lib.rs`: `StripeMeta`, `make_chunk_key`, `STRIPE_CHUNK_SIZE = 4 MiB`, `PutStreamHandle<'a>` (now sync `put_stream_begin`, no more `Rc<RpcClient>` caching), `GetStream<'a>`, new `delete_stream`, 6 unit tests.
+  - `crates/server/src/bin/autumn_client.rs`: `putstream`/`getstream` CLI now uses the new sync API.
+  - `crates/manager/tests/system_putstream.rs`: 4 integration tests (12 MiB roundtrip + pre-/post-commit visibility, single-chunk edge, abort drops chunks, inline-value passthrough).
+- **Server-side rip-out** (deleted in same release):
+  - `crates/rpc/src/partition_rpc.rs`: `MSG_PUT_BEGIN/CHUNK/COMMIT/ABORT` + Req/Resp shapes + `CODE_UPLOAD_NOT_FOUND` deleted; constants reserved (commented out) for stale-binary safety.
+  - `crates/partition-server/src/rpc_handlers.rs`: `handle_put_begin/chunk/commit/abort` + `rand_upload_id` deleted; HEAD's multi-frag value_length branch deleted.
+  - `crates/partition-server/src/lib.rs`: `OP_VALUE_POINTER_MULTI` (0x40), `OP_CHUNK_BLOB` (0x10), `MultiFragVp` struct + 5 tests, `UploadSession` struct, `upload_sessions` field on `PartitionData`, `AUTUMN_PS_MAX_INLINE_BYTES_HARD`, `AUTUMN_PS_MAX_UPLOAD_SESSIONS_DEFAULT`, `AUTUMN_PS_UPLOAD_TTL_SECS_DEFAULT`. Recovery's `OP_CHUNK_BLOB` skip + `OP_VALUE_POINTER_MULTI` re-insert deleted.
+  - `crates/partition-server/src/background.rs`: F130's `collect_live_mfvps_touching` + `rewrite_multi_frag_for_extent` + multi-frag branch of `bump_discards_for_dropped_entry` + `resolve_multi_frag` + `run_gc` pre-pass call deleted.
+- **Pre-existing bug fix** (also F186, same commits): `finish_write_batch` and `flush_gc_batch` were computing VP offset as `record_offset + 17 + key.len()` (V0 layout). Latent since F165 made V1 default-on (V1 envelope adds 5 bytes before the V0 inner header), so every value > 4 KiB written via the regular Put path since F165 had VP pointing 5 bytes too early — reads returned the last 5 bytes of internal_key (inverted-seq, e.g. `[ff,ff,ff,ff,fe]`) followed by `value_len - 5` bytes of value. Latent because:
+  - production tests use small values (≤ 4 KiB → inline path)
+  - F129 multipart used the correct V1 calc (1+4+17 = 22)
+  - no test verified content of large VP-path values post-V1
+  F186 caught it because client-side striperados puts every chunk via plain Put with chunk_size = 4 MiB > VALUE_THROTTLE. Fix: `+ 17 +` → `+ 22 +` at all three sites (`finish_write_batch`, `flush_gc_batch`, `recover_partition`).
+- **Verification:**
+  - `cargo test -p autumn-rpc`: 13/13 (was 17 — 4 F129 wire tests deleted)
+  - `cargo test -p autumn-partition-server --lib --test-threads=1`: 124/124 (was 130 — 6 F129 multi-frag tests deleted)
+  - `cargo test -p autumn-manager --lib`: 51/51
+  - `cargo test -p autumn-manager --test system_putstream -- --ignored`: 4/4
+  - `cargo check --workspace --exclude autumn-fuse`: clean
+- **Comparison with the F129 server-side multipart it replaced:**
+  | | F129 server-side | F186 client-side |
+  |---|---|---|
+  | New wire RPCs | 4 (`MSG_PUT_BEGIN/CHUNK/COMMIT/ABORT`) | 0 |
+  | New op flags | 2 (`OP_VALUE_POINTER_MULTI`, `OP_CHUNK_BLOB`) | 0 |
+  | New memtable shape | multi-frag VP value | none |
+  | New WAL records | OP_CHUNK_BLOB | none |
+  | PS in-memory state | `upload_sessions: HashMap<u128, UploadSession>` + 30 min TTL | none |
+  | New GC machinery | F130 active rewrite (~300 lines) | none |
+  | Recovery handling | OP_CHUNK_BLOB skip + OP_VALUE_POINTER_MULTI insert | none |
+  | Compaction discard | per-frag accounting | none (chunks are normal Puts) |
+  | Caller-visible API | same `PutStreamHandle` / `GetStream` shape | same |
+  | Test coverage | 5 multi-frag unit + 3 integration | 6 stripe-meta unit + 4 integration |
+- **Trade-offs:**
+  - Client crashes mid-upload leave orphan chunks (F129 had server-side TTL eviction). Applications that care must sweep the chunk-key namespace periodically.
+  - Replacing a striped value with a non-striped value (or vice versa) at the same key requires explicit `delete_stream` first; otherwise old chunks linger.
+  - Get of a striped value is N+1 RPCs (1 meta + N chunks) where F129 was 1 RPC server-resolved. For full-value reads on a single client, latency scales with N (LAN: ~10ms × N). Mitigation: client SDK could parallel-fetch chunks (deferred — only matters on WAN).
+- **passes:** true
+
+### F129 · PutStream / GetStream — server-side multipart (SUPERSEDED by F186)
+- **Status:** REMOVED in F186. The server-side multipart upload was an over-engineered solution to the "value > 64 MiB inline cap" problem; client-side striperados covers the same use case with zero server changes. F129 entry preserved as historical context.
+- **Original target (kept for posterity):** Bound PS RAM and improve TTFB for large values by adding S3-style multipart upload (`PutBegin` / `PutChunk` / `PutCommit` / `PutAbort`) at the partition server, plus a client-side `GetStream` that loops the existing `GetReq.offset/length`. Memtable / SSTable gain a multi-fragment `ValuePointer` (op flag `OP_VALUE_POINTER_MULTI = 0x40`, encoded `[n_frags:u32][total_len:u64][(extent_id:u64, offset:u32, len:u32) × n_frags]`); chunks stored as WAL-shaped records with op `OP_CHUNK_BLOB = 0x10` so `decode_records_with_offsets` / `process_gc_chunk` skip them safely. Existing `Put`/`Get` preserved; both gain symmetric size cap `AUTUMN_PS_MAX_INLINE_BYTES` (default 64 MiB, hard ≤ 256 MiB) — over-cap returns `CODE_VALUE_TOO_LARGE`. Client adds `PutStreamHandle { send, commit, abort }` + `GetStream { next_chunk }`. PS holds upload sessions in memory only (`HashMap<u128, UploadSession>`); session metadata is O(1) in chunks (clients hold the fragment list); idle TTL 30 min (`AUTUMN_PS_UPLOAD_TTL_SECS`); per-partition cap 1024 (`AUTUMN_PS_MAX_UPLOAD_SESSIONS`). Routing requires `part_id` in `PutChunkReq`/`PutCommitReq`/`PutAbortReq`.
 - **Notes:** Picked S3 multipart over autumn-rpc native multi-frame (F133) because it has zero framework impact, matches Azure Blob / GCS / HDFS / GridFS / Ceph practice. Multi-fragment VP (ζ) over per-upload `blob_stream` (ε): all the surveyed systems store large values as fragment lists; single-segment continuity gives a measurable advantage only on "client reads whole 1 GiB at once", which is rare in this codebase. Symmetric Put/Get cap is critical: asymmetric creates "writable-but-not-readable" footgun.
 - **`put_auto` / `get_auto` deliberately NOT added.** The early plan called for them but they're a footgun: `put_auto` would silently route a 200 MiB `Vec<u8>` through streaming, which doesn't change the caller's memory profile (already buffered) but hides the "you're crossing a code-path boundary" signal. `get_auto` is worse — buffering N×4 MiB streamed chunks back into one `Vec<u8>` defeats streaming's whole point. Callers either know their value size class (use `put`/`get`) or are streaming source/sink (use `put_stream_begin`/`get_stream` directly). The clean error from `put` on > 64 MiB is the right interface.
 - **Implementation:**
@@ -371,7 +421,10 @@
 - **Out of scope (separate feature entries):** F130 (GC active rewrite — needed for sealed log_stream reclaim under sustained F129 use), F131 (concurrent fragment pread — perf), F132 (resume across split / restart), F134 (frame-level early reject — perf hardening).
 - **passes:** true
 
-### F130 · GC active rewrite for multi-fragment VPs (unblocks log_stream extent reclaim under F129)
+### F130 · GC active rewrite for multi-fragment VPs — SUPERSEDED by F186
+- **Status:** REMOVED in F186. With server-side multi-frag VPs deleted, there's nothing for this rewrite path to act on; chunks are now normal Puts that the existing single-VP GC handles. Entry preserved as historical context.
+
+### F130 (original — historical) · GC active rewrite for multi-fragment VPs (unblocks log_stream extent reclaim under F129)
 - **Target:** Atomic VP rewrite so log_stream extents holding live multi-frag fragments can be reclaimed. Without F130, sustained F129 use accumulates `OP_CHUNK_BLOB` records in sealed log_stream extents that the existing single-VP GC scan skips (line 1616 of background.rs masks `op & OP_VALUE_POINTER` which is 0 for chunk records), so `punch_holes` would silently orphan the chunks if the holding extent was reclaimed.
 - **Approach (chosen):** **Full-value rewrite** — when GC targets an extent with chunks for any live multi-frag value, rewrite the ENTIRE multi-frag value (every fragment, including ones not on the to-be-reclaimed extent) to the active log_stream tail. After rewrite, every fragment of the shadowed mfvp is truly dead and compaction can blindly bump per-extent discard counters when it later shadows the old entry. Cost: a 200 MiB value with one chunk on the target extent rewrites all 200 MiB. Acceptable because multipart upload's typical pattern is contiguous chunks landing in the same log_stream tail extent.
 - **Linearisation (the "hard problem" referenced in the deferred note):** Reuses the same MVCC seq-number ordering that the existing single-VP `process_gc_chunk` uses. The rewrite allocates a fresh seq under `borrow_mut` (no `.await` between read-current-mfvp and seq allocation); a foreground Put on the same user_key always gets a strictly newer seq and shadows the rewrite via the inverted-seq byte ordering of internal_keys. F148-A invariant covers `borrow_mut → mpsc-send → ack` ordering for log_stream record durability. The rewrite's chunks become orphan if the foreground Put wins; the next GC pass collects them.

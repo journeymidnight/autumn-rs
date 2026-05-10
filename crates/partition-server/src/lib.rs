@@ -286,30 +286,18 @@ const OP_VALUE_POINTER: u8 = 0x80;
 /// design would imply.
 const FREEZE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
-// F129 op flags. Single-bit flags on the WAL/memtable op byte. The
-// existing `OP_VALUE_POINTER = 0x80` continues to mark single-fragment
-// VPs. New entries:
-//
-//   OP_VALUE_POINTER_MULTI = 0x40  → memtable / SSTable entry whose
-//     `value` is a `MultiFragVp::encode()` blob (list of fragments).
-//     Mutually exclusive with OP_VALUE_POINTER. The low bits still
-//     carry the user op (1 = put, 2 = delete) so logic that masks
-//     `op & 0x7f` continues to work.
-//
-//   OP_CHUNK_BLOB         = 0x10  → log_stream WAL record for one
-//     fragment of an in-progress multipart upload. Recovery and GC
-//     skip these records (no memtable insert, no rewrite). They're
-//     reclaimed when their host extent is punched.
-pub(crate) const OP_VALUE_POINTER_MULTI: u8 = 0x40;
-pub(crate) const OP_CHUNK_BLOB: u8 = 0x10;
+// F129/F186 — `OP_VALUE_POINTER_MULTI` (0x40) and `OP_CHUNK_BLOB` (0x10)
+// were the F129 server-side multipart op flags. Removed in F186 with the
+// rest of the server-side multipart machinery. Stripe-write is now pure
+// client-side via `ClusterClient::put_stream_begin` (Ceph striperados
+// pattern). Op-flag values 0x40 and 0x10 remain RESERVED to avoid
+// conflicting with on-disk records that may still exist from pre-F186
+// runs.
 
-// F129 multipart upload caps. Symmetric on read + write. Configurable
-// via env at PS startup (see `parse_env_caps`).
+// Inline-Put cap. The PS rejects `MSG_PUT` with `value.len()` greater
+// than this with `CODE_VALUE_TOO_LARGE`; client SDK retries via
+// `put_stream_begin` (client-side striping).
 pub(crate) const AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT: u32 = 64 * 1024 * 1024;
-#[allow(dead_code)]
-pub(crate) const AUTUMN_PS_MAX_INLINE_BYTES_HARD: u32 = 256 * 1024 * 1024;
-pub(crate) const AUTUMN_PS_MAX_UPLOAD_SESSIONS_DEFAULT: usize = 1024;
-pub(crate) const AUTUMN_PS_UPLOAD_TTL_SECS_DEFAULT: u64 = 30 * 60;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ValuePointer {
@@ -335,142 +323,6 @@ impl ValuePointer {
     }
 }
 
-/// F129 multi-fragment ValuePointer. Stored as the `value` of a
-/// memtable/SSTable entry whose op has `OP_VALUE_POINTER_MULTI` set.
-/// Encoding is little-endian:
-///
-/// ```text
-///   [n_frags: u32 LE][total_len: u64 LE]
-///   [(extent_id: u64, offset: u32, len: u32) × n_frags]
-/// ```
-///
-/// `total_len` is the sum of `frag.len` and is stored explicitly so
-/// `Head` (`HeadResp.value_length`) doesn't need to walk the list.
-#[derive(Debug, Clone)]
-pub(crate) struct MultiFragVp {
-    pub total_len: u64,
-    pub frags: Vec<ValuePointer>,
-}
-
-impl MultiFragVp {
-    /// Bytes needed for `n` fragments. n_frags(4) + total_len(8) + n × 16.
-    pub fn encoded_len_for(n_frags: usize) -> usize {
-        12 + n_frags * VALUE_POINTER_SIZE
-    }
-
-    pub fn encoded_len(&self) -> usize {
-        Self::encoded_len_for(self.frags.len())
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        assert!(self.frags.len() <= u32::MAX as usize, "too many fragments");
-        let mut out = Vec::with_capacity(self.encoded_len());
-        out.extend_from_slice(&(self.frags.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.total_len.to_le_bytes());
-        for f in &self.frags {
-            out.extend_from_slice(&f.extent_id.to_le_bytes());
-            out.extend_from_slice(&f.offset.to_le_bytes());
-            out.extend_from_slice(&f.len.to_le_bytes());
-        }
-        out
-    }
-
-    pub fn decode(b: &[u8]) -> Result<Self, &'static str> {
-        if b.len() < 12 {
-            return Err("MultiFragVp: header underrun");
-        }
-        let n = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
-        let total_len = u64::from_le_bytes(b[4..12].try_into().unwrap());
-        let need = 12 + n * VALUE_POINTER_SIZE;
-        if b.len() < need {
-            return Err("MultiFragVp: payload underrun");
-        }
-        let mut frags = Vec::with_capacity(n);
-        let mut p = 12;
-        let mut sum: u64 = 0;
-        for _ in 0..n {
-            let f = ValuePointer::decode(&b[p..p + VALUE_POINTER_SIZE]);
-            sum = sum.saturating_add(f.len as u64);
-            frags.push(f);
-            p += VALUE_POINTER_SIZE;
-        }
-        if sum != total_len {
-            return Err("MultiFragVp: total_len mismatch with fragment sum");
-        }
-        Ok(Self { total_len, frags })
-    }
-}
-
-#[cfg(test)]
-mod f129_multifrag_tests {
-    use super::*;
-
-    #[test]
-    fn encode_decode_roundtrip_zero_frags() {
-        let m = MultiFragVp { total_len: 0, frags: vec![] };
-        let buf = m.encode();
-        assert_eq!(buf.len(), 12);
-        let dec = MultiFragVp::decode(&buf).unwrap();
-        assert_eq!(dec.total_len, 0);
-        assert_eq!(dec.frags.len(), 0);
-    }
-
-    #[test]
-    fn encode_decode_roundtrip_three_frags() {
-        let m = MultiFragVp {
-            total_len: 100 + 200 + 50,
-            frags: vec![
-                ValuePointer { extent_id: 7, offset: 0, len: 100 },
-                ValuePointer { extent_id: 7, offset: 100, len: 200 },
-                ValuePointer { extent_id: 9, offset: 0, len: 50 },
-            ],
-        };
-        let buf = m.encode();
-        assert_eq!(buf.len(), 12 + 3 * VALUE_POINTER_SIZE);
-        let dec = MultiFragVp::decode(&buf).unwrap();
-        assert_eq!(dec.total_len, 350);
-        assert_eq!(dec.frags.len(), 3);
-        assert_eq!(dec.frags[0].extent_id, 7);
-        assert_eq!(dec.frags[1].offset, 100);
-        assert_eq!(dec.frags[2].extent_id, 9);
-    }
-
-    #[test]
-    fn decode_rejects_short_header() {
-        assert!(MultiFragVp::decode(&[0u8; 5]).is_err());
-    }
-
-    #[test]
-    fn decode_rejects_short_payload() {
-        // n_frags=2, total_len=0, but only 1 fragment of bytes
-        let mut buf = vec![];
-        buf.extend_from_slice(&2u32.to_le_bytes());
-        buf.extend_from_slice(&0u64.to_le_bytes());
-        buf.extend_from_slice(&[0u8; VALUE_POINTER_SIZE]);
-        assert!(MultiFragVp::decode(&buf).is_err());
-    }
-
-    #[test]
-    fn decode_rejects_total_len_mismatch() {
-        let m = MultiFragVp {
-            total_len: 999, // wrong on purpose
-            frags: vec![ValuePointer { extent_id: 1, offset: 0, len: 100 }],
-        };
-        let buf = m.encode();
-        assert!(MultiFragVp::decode(&buf).is_err());
-    }
-
-    #[test]
-    fn op_flags_are_distinct() {
-        assert_eq!(OP_VALUE_POINTER & OP_VALUE_POINTER_MULTI, 0);
-        assert_eq!(OP_VALUE_POINTER & OP_CHUNK_BLOB, 0);
-        assert_eq!(OP_VALUE_POINTER_MULTI & OP_CHUNK_BLOB, 0);
-        // user op bits (1 = put, 2 = delete) don't collide with any flag
-        assert_eq!(1u8 & OP_VALUE_POINTER, 0);
-        assert_eq!(1u8 & OP_VALUE_POINTER_MULTI, 0);
-        assert_eq!(1u8 & OP_CHUNK_BLOB, 0);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Memtable entry
@@ -613,29 +465,10 @@ impl TableMeta {
 // PartitionData — lives on a dedicated partition thread (Rc, no locks)
 // ---------------------------------------------------------------------------
 
-/// F129 in-progress multipart upload state. One entry per active
-/// `upload_id`. Lives in-memory only; a PS restart drops all sessions
-/// (clients must re-Begin). Resume across restart is F132 (deferred).
-///
-/// The fragments list grows monotonically: each successful PutChunk
-/// appends one entry. PutCommit walks `fragments` to build the final
-/// `MultiFragVp` blob. PutAbort drops the session; the chunk bytes
-/// stay in log_stream as `OP_CHUNK_BLOB` records — GC + recovery
-/// skip them, so they're reclaimed when their host extent is punched
-/// (no F130 active rewrite yet, so they only go away when their host
-/// extent ages out below GC_DISCARD_RATIO).
-#[derive(Debug, Clone)]
-pub(crate) struct UploadSession {
-    pub user_key: Vec<u8>,
-    pub expires_at: u64,
-    pub started_at_secs: u64,
-    pub last_seen_secs: u64,
-    pub bytes_committed: u64,
-    /// Index of the next chunk the client may submit. PutChunk rejects
-    /// chunks whose `chunk_index` doesn't match.
-    pub next_chunk_index: u32,
-    pub fragments: Vec<ValuePointer>,
-}
+// F129/F186 — `UploadSession` and `upload_sessions` field on PartitionData
+// were the in-memory state for the F129 server-side multipart upload.
+// Removed in F186; stripe-write is now pure client-side (Ceph
+// striperados). The PS no longer holds any per-upload state.
 
 pub(crate) struct PartitionData {
     part_id: u64,
@@ -646,10 +479,6 @@ pub(crate) struct PartitionData {
     compact_tx: mpsc::Sender<bool>,
     gc_tx: mpsc::Sender<GcTask>,
     seq_number: u64,
-    /// F129: in-memory upload session map. Bounded by
-    /// `AUTUMN_PS_MAX_UPLOAD_SESSIONS_DEFAULT`; expired entries are
-    /// evicted lazily at PutBegin time.
-    pub(crate) upload_sessions: std::collections::HashMap<u128, UploadSession>,
     log_stream_id: u64,
     row_stream_id: u64,
     meta_stream_id: u64,
@@ -2618,7 +2447,6 @@ async fn partition_thread_main(
         extent_pins: std::cell::RefCell::new(std::collections::HashMap::new()),
         frozen_for_merge: Cell::new(None),
         freeze_drain_ack: std::cell::RefCell::new(None),
-        upload_sessions: std::collections::HashMap::new(),
         metrics: metrics_arc.clone(),
     }));
 
@@ -3625,15 +3453,6 @@ async fn recover_partition(
                 }
             };
             for (buf_off, op, key, value, expires_at) in decode_records_with_offsets(&data) {
-                // F129: chunk blobs are payload-only WAL records that
-                // exist solely so the multi-frag VP can point at their
-                // bytes. They aren't memtable entries; their key is
-                // empty; replay must skip them. They're reclaimed
-                // when their host extent is punched by GC.
-                if op & OP_CHUNK_BLOB != 0 {
-                    continue;
-                }
-
                 let ts = parse_ts(&key);
                 if ts > max_seq {
                     max_seq = ts;
@@ -3643,22 +3462,14 @@ async fn recover_partition(
                 }
 
                 let record_extent_off = start_off + buf_off as u32;
-                let mem_entry = if op & OP_VALUE_POINTER_MULTI != 0 {
-                    // F129: multi-frag VP commit record. The `value`
-                    // here IS the encoded MultiFragVp blob (fragment
-                    // list + total_len). Insert as-is; resolve_value
-                    // decodes the blob at Get time and reads each
-                    // fragment from log_stream.
-                    MemEntry {
-                        op: (op & 0x7f) | OP_VALUE_POINTER_MULTI,
-                        value,
-                        expires_at,
-                    }
-                } else if op & OP_VALUE_POINTER != 0 || value.len() > VALUE_THROTTLE {
-                    // VP detection: new WAL has VP flag in op; old WAL uses value size as fallback
+                let mem_entry = if op & OP_VALUE_POINTER != 0 || value.len() > VALUE_THROTTLE {
+                    // VP detection: new WAL has VP flag in op; old WAL uses
+                    // value size as fallback. F186 fix: V1 envelope adds
+                    // 5 bytes (sentinel+length) before the V0 inner header,
+                    // so value bytes are at +22 not +17 from record start.
                     let vp = ValuePointer {
                         extent_id: eid,
-                        offset: record_extent_off + 17 + key.len() as u32,
+                        offset: record_extent_off + 22 + key.len() as u32,
                         len: value.len() as u32,
                     };
                     MemEntry {

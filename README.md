@@ -783,7 +783,7 @@ $AC ls --prefix my      # scan keys with prefix
 $AC del mykey
 ```
 
-### Large value (>4KB uses inline VP, >64MB uses F129 multipart)
+### Large value (>4KB inline VP, >64MB client-side striperados — F186)
 
 ```bash
 # 100 KiB — inline `Put` is fine; if value > 4 KiB the PS stores the
@@ -792,14 +792,17 @@ dd if=/dev/urandom of=/tmp/big.bin bs=1024 count=100
 $AC put bigkey /tmp/big.bin
 $AC head bigkey         # expects: length: 102400
 
-# 200 MiB — inline cap (`AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT` = 64 MiB)
-# is exceeded; use F129 multipart upload. The CLI splits the file into
-# 4 MiB chunks via MSG_PUT_BEGIN / MSG_PUT_CHUNK / MSG_PUT_COMMIT and
-# installs a multi-fragment ValuePointer that lets recovery + GC + read
-# all walk the fragment list correctly.
+# 200 MiB — inline cap (AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT = 64 MiB) is
+# exceeded. F186 (replaces F129/F130): pure client-side striping. The
+# SDK splits the file into 4 MiB chunks and writes each as a normal
+# `Put` to a reserved-namespace key (\xff\xfeacv1\xff...), then writes
+# a 29-byte StripeMeta blob to the user key as the atomic commit point.
+# No server-side multipart RPCs, no multi-fragment VP, no GC active
+# rewrite — just normal Puts under the hood.
 dd if=/dev/urandom of=/tmp/huge.bin bs=1M count=200
 $AC putstream hugekey /tmp/huge.bin
-$AC head hugekey                            # expects: length: 209715200
+# `head hugekey` returns 29 (the meta blob length), not 209715200.
+# Use getstream + diff to verify content.
 
 # Read back via streaming so the daemon doesn't buffer 200 MiB in RAM.
 $AC getstream hugekey --out /tmp/huge.copy

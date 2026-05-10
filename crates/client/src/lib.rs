@@ -35,13 +35,10 @@ pub enum AutumnError {
     ServerError(String),
     RoutingError(String),
     ConnectionError(String),
-    /// F129: value exceeds the inline `Put` cap. Caller should retry
-    /// via `put_stream_begin` / `PutStreamHandle::send` / `commit`.
+    /// F129/F186: value exceeds the inline `Put` cap. Caller should retry
+    /// via `put_stream_begin` / `PutStreamHandle::send` / `commit`
+    /// (client-side striped write, no server-side multipart RPC any more).
     ValueTooLarge { size: u64, cap: u64 },
-    /// F129: the upload_id is unknown to the PS — TTL-evicted, never
-    /// opened, already committed/aborted, or the PS restarted (resume
-    /// across restart is F132, not yet implemented).
-    UploadNotFound,
 }
 
 impl std::fmt::Display for AutumnError {
@@ -55,12 +52,11 @@ impl std::fmt::Display for AutumnError {
             AutumnError::ConnectionError(msg) => write!(f, "connection error: {msg}"),
             AutumnError::ValueTooLarge { size, cap } => {
                 if *cap > 0 {
-                    write!(f, "value {size} bytes exceeds inline cap {cap} — use put_stream")
+                    write!(f, "value {size} bytes exceeds inline cap {cap} — use put_stream_begin")
                 } else {
-                    write!(f, "value {size} bytes exceeds the partition server's inline cap — use put_stream")
+                    write!(f, "value {size} bytes exceeds the partition server's inline cap — use put_stream_begin")
                 }
             }
-            AutumnError::UploadNotFound => write!(f, "upload_id not found on partition server"),
         }
     }
 }
@@ -77,7 +73,6 @@ fn code_to_error(code: u8, message: String) -> AutumnError {
             // raw size if the caller doesn't already know.
             AutumnError::ValueTooLarge { size: 0, cap: 0 }
         }
-        partition_rpc::CODE_UPLOAD_NOT_FOUND => AutumnError::UploadNotFound,
         _ => AutumnError::ServerError(message),
     }
 }
