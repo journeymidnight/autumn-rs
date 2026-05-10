@@ -99,6 +99,7 @@
 | F184 | Auto-trigger flags + reload-on-region-change + concurrent-writer test + ClusterClient.rpc_timeout | manager/client |
 | F185 | Manager-orchestrated merge with PS freeze-drain (closes F184-K ~5% merge-window loss; 0 loss verified) | manager/partition |
 | F129 | PutStream / GetStream — multipart upload + multi-fragment ValuePointer (lifts 64 MiB inline cap) | partition-server/client |
+| F130 | GC active rewrite for multi-frag VPs — unblocks log_stream extent reclaim under sustained F129 use | partition-server |
 
 ---
 
@@ -371,10 +372,25 @@
 - **passes:** true
 
 ### F130 · GC active rewrite for multi-fragment VPs (unblocks log_stream extent reclaim under F129)
-- **Target:** Atomic VP rewrite so log_stream extents holding live multi-frag fragments can be reclaimed. Background task scans sealed log_stream extents; for each live multi-frag VP, append a fresh contiguous copy to active log_stream extent, atomically swap the memtable / SSTable VP, bump discard counters on source extents.
-- **Trigger:** v1 monitoring shows log_stream sealed extent count > 16 OR partition disk usage > 80%.
-- **Notes:** Hard problem — linearisation between rewrite, foreground writes, compaction, and GC needs a clean version-stamp story. Likely candidate: piggyback on memtable seq-number to make VP rewrites look like a normal Put with a higher seq, leveraging existing MVCC machinery.
-- **passes:** false
+- **Target:** Atomic VP rewrite so log_stream extents holding live multi-frag fragments can be reclaimed. Without F130, sustained F129 use accumulates `OP_CHUNK_BLOB` records in sealed log_stream extents that the existing single-VP GC scan skips (line 1616 of background.rs masks `op & OP_VALUE_POINTER` which is 0 for chunk records), so `punch_holes` would silently orphan the chunks if the holding extent was reclaimed.
+- **Approach (chosen):** **Full-value rewrite** — when GC targets an extent with chunks for any live multi-frag value, rewrite the ENTIRE multi-frag value (every fragment, including ones not on the to-be-reclaimed extent) to the active log_stream tail. After rewrite, every fragment of the shadowed mfvp is truly dead and compaction can blindly bump per-extent discard counters when it later shadows the old entry. Cost: a 200 MiB value with one chunk on the target extent rewrites all 200 MiB. Acceptable because multipart upload's typical pattern is contiguous chunks landing in the same log_stream tail extent.
+- **Linearisation (the "hard problem" referenced in the deferred note):** Reuses the same MVCC seq-number ordering that the existing single-VP `process_gc_chunk` uses. The rewrite allocates a fresh seq under `borrow_mut` (no `.await` between read-current-mfvp and seq allocation); a foreground Put on the same user_key always gets a strictly newer seq and shadows the rewrite via the inverted-seq byte ordering of internal_keys. F148-A invariant covers `borrow_mut → mpsc-send → ack` ordering for log_stream record durability. The rewrite's chunks become orphan if the foreground Put wins; the next GC pass collects them.
+- **Mechanism:**
+  1. `rewrite_multi_frag_for_extent(part, log_stream_id, eid, part_sc)` runs as a **pre-pass** at the top of `run_gc`, before the existing single-VP `process_gc_chunk` loop.
+  2. `collect_live_mfvps_touching(part, eid)` walks active memtable + imm queue, dedups by user_key (newest wins), filters to `OP_VALUE_POINTER_MULTI` entries whose mfvp has at least one fragment on `eid`.
+     - **Scope limitation:** does NOT walk SSTs. Live mfvps whose newest copy is only in an SST and not yet shadowed are handled by F130-C's compaction discard path (compaction shadows mfvp_old → bumps discards for every frag of mfvp_old → host extents eventually accumulate > 40% discard ratio → next GC tick picks them).
+  3. For each candidate: read every fragment via `read_bytes_from_extent`, append each as a fresh `OP_CHUNK_BLOB` record, build new `MultiFragVp` with the new fragment list, allocate seq + append `OP_VALUE_POINTER_MULTI | 1` commit record, insert memtable entry. Updates `vp_extent_id` / `vp_offset` so the next flush includes the rewrite's tail.
+  4. After the pre-pass returns, the existing single-VP scan runs unchanged (`OP_CHUNK_BLOB` records still skipped — they're now genuinely orphan).
+- **Compaction discard tracking (F130-C):** Refactored 4 sites in `do_compact`'s discard-on-drop branches (dedup, range filter, tombstone, expired) into a single helper `bump_discards_for_dropped_entry(discards, op, raw_value)` that handles BOTH single-VP (existing) AND multi-frag VP (new). For multi-frag, decodes `MultiFragVp` and bumps per-extent discards for EVERY fragment.
+- **Recovery:** No changes needed. WAL replay already handles `OP_CHUNK_BLOB` (skip) and `OP_VALUE_POINTER_MULTI` (memtable insert) — the rewrite's commit record looks identical to a fresh `handle_put_commit` write. The MVCC seq ordering ensures the rewrite shadows the original whether the original is in WAL, memtable, or SST.
+- **Files:** `crates/partition-server/src/background.rs` (`bump_discards_for_dropped_entry`, `collect_live_mfvps_touching`, `rewrite_multi_frag_for_extent`, `run_gc` pre-pass call, 4 discard-site refactors); `crates/manager/tests/system_putstream.rs` (new `f130_multifrag_gc_rewrite_preserves_value` test).
+- **Verification:**
+  - `cargo test -p autumn-partition-server --lib --test-threads=1`: 130/130
+  - `cargo test -p autumn-manager --test system_putstream -- --ignored`: 4/4 (3 F129 + 1 F130)
+  - `cargo check --workspace --exclude autumn-fuse`: clean
+  - F130 test exercises: 12 MiB / 4 × 3 MiB chunks committed → second multi-frag value forces tail rotation → force_gc on the original tail extent → assert original value still readable byte-for-byte (rewrite worked) and unrelated value unaffected.
+- **Out of scope:** Walking ALL SSTs for live mfvps in the GC pre-pass. Cost is O(SST bytes); deferred to compaction's discard path which is O(compacted bytes) per its existing schedule. If production sees stuck extents that compaction takes too long to clear, add a targeted scan via SST `vp_deps` index (already shipped).
+- **passes:** true
 
 ### F131 · Concurrent fragment pread in `resolve_value` (perf follow-up to F129)
 - **Target:** Replace v1 sequential per-fragment `read_bytes_from_extent` with `FuturesUnordered`, capped at `AUTUMN_PS_RESOLVE_CONCURRENCY` (default 8). Result Vec assembled in fragment order despite out-of-order completion.

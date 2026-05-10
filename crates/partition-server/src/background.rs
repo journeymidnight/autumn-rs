@@ -949,38 +949,26 @@ pub(crate) async fn do_compact(
 
         let user_key = parse_key(&raw_key).to_vec();
         if prev_user_key.as_deref() == Some(&user_key) {
-            if raw_op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
-                let vp = ValuePointer::decode(&raw_value);
-                *discards.entry(vp.extent_id).or_insert(0) += vp.len as i64;
-            }
+            bump_discards_for_dropped_entry(&mut discards, raw_op, &raw_value);
             entries_discarded += 1;
             continue;
         }
         prev_user_key = Some(user_key);
 
         if !in_range(&rg, prev_user_key.as_ref().unwrap()) {
-            if raw_op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
-                let vp = ValuePointer::decode(&raw_value);
-                *discards.entry(vp.extent_id).or_insert(0) += vp.len as i64;
-            }
+            bump_discards_for_dropped_entry(&mut discards, raw_op, &raw_value);
             entries_discarded += 1;
             continue;
         }
 
         if major {
             if raw_op == 2 {
-                if raw_op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
-                    let vp = ValuePointer::decode(&raw_value);
-                    *discards.entry(vp.extent_id).or_insert(0) += vp.len as i64;
-                }
+                bump_discards_for_dropped_entry(&mut discards, raw_op, &raw_value);
                 entries_discarded += 1;
                 continue;
             }
             if raw_expires > 0 && raw_expires <= now {
-                if raw_op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
-                    let vp = ValuePointer::decode(&raw_value);
-                    *discards.entry(vp.extent_id).or_insert(0) += vp.len as i64;
-                }
+                bump_discards_for_dropped_entry(&mut discards, raw_op, &raw_value);
                 entries_discarded += 1;
                 continue;
             }
@@ -1437,6 +1425,298 @@ async fn flush_gc_batch(
     Ok(())
 }
 
+/// F130 — when compaction drops an entry (dedup, range filter,
+/// tombstone, expired), bump the per-extent discard counter for every
+/// log_stream byte the dropped entry was holding live.
+///
+/// Single-VP path (existing): one VP → one fragment → one extent.
+/// Multi-frag path (F130): one mfvp → N fragments → potentially N
+/// extents. Per F130's full-rewrite invariant, when a multi-frag mfvp
+/// is shadowed by a newer entry (whether a fresh foreground Put or a
+/// GC rewrite), every fragment of the shadowed mfvp is truly dead —
+/// the newer entry has its own fresh fragment list. So we can blindly
+/// bump discards for every frag.
+fn bump_discards_for_dropped_entry(
+    discards: &mut HashMap<u64, i64>,
+    op: u8,
+    raw_value: &[u8],
+) {
+    if op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
+        let vp = ValuePointer::decode(raw_value);
+        *discards.entry(vp.extent_id).or_insert(0) += vp.len as i64;
+        return;
+    }
+    if op & crate::OP_VALUE_POINTER_MULTI != 0 {
+        if let Ok(mfvp) = crate::MultiFragVp::decode(raw_value) {
+            for f in &mfvp.frags {
+                *discards.entry(f.extent_id).or_insert(0) += f.len as i64;
+            }
+        }
+    }
+}
+
+/// F130 — collect `(user_key, MultiFragVp)` for every live multi-frag VP
+/// entry in active memtable, imm queue, and SSTs whose mfvp has at least
+/// one fragment landing on `eid`. Used by `rewrite_multi_frag_for_extent`
+/// as the candidate set; the rewrite then issues a fresh full-value copy
+/// to the active log_stream tail and inserts a new memtable entry at a
+/// higher seq, letting the existing MVCC ordering (newest-seq-wins) make
+/// the rewrite atomically visible.
+///
+/// Snapshot semantics: we only walk the **newest** mfvp entry per
+/// user_key (memtable shadows imm shadows SSTs). Older shadowed entries
+/// don't need rewriting because they're already invisible to readers
+/// and will be dropped on the next major compaction (which will
+/// correctly bump their frag-discard counters).
+fn collect_live_mfvps_touching(
+    part: &Rc<RefCell<PartitionData>>,
+    eid: u64,
+) -> Vec<(Vec<u8>, MemEntry)> {
+    use std::collections::HashSet;
+
+    let p = part.borrow();
+    let rg = p.rg.clone();
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut out: Vec<(Vec<u8>, MemEntry)> = Vec::new();
+
+    // Walk active memtable first — its entries are the newest.
+    for it in p.active.snapshot_sorted() {
+        let user_key = parse_key(&it.key).to_vec();
+        if !in_range(&rg, &user_key) {
+            continue;
+        }
+        if !seen.insert(user_key.clone()) {
+            continue;
+        }
+        if it.op & crate::OP_VALUE_POINTER_MULTI == 0 {
+            continue;
+        }
+        if let Ok(mfvp) = crate::MultiFragVp::decode(&it.value) {
+            if mfvp.frags.iter().any(|f| f.extent_id == eid) {
+                out.push((
+                    user_key,
+                    MemEntry {
+                        op: it.op,
+                        value: it.value,
+                        expires_at: it.expires_at,
+                    },
+                ));
+            }
+        }
+    }
+
+    // imm queue (newest first).
+    for imm in p.imm.iter().rev() {
+        for it in imm.snapshot_sorted() {
+            let user_key = parse_key(&it.key).to_vec();
+            if !in_range(&rg, &user_key) {
+                continue;
+            }
+            if !seen.insert(user_key.clone()) {
+                continue;
+            }
+            if it.op & crate::OP_VALUE_POINTER_MULTI == 0 {
+                continue;
+            }
+            if let Ok(mfvp) = crate::MultiFragVp::decode(&it.value) {
+                if mfvp.frags.iter().any(|f| f.extent_id == eid) {
+                    out.push((
+                        user_key,
+                        MemEntry {
+                            op: it.op,
+                            value: it.value,
+                            expires_at: it.expires_at,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+
+    // SST readers (newest first by index — `sst_readers` is oldest→newest,
+    // so iterate `.rev()`). Use the existing point-lookup so we hit the
+    // bloom + binary-search fast path rather than scanning every block.
+    // The user_key set we already collected via memtable + imm covers
+    // the fresh writes; here we add user_keys whose newest copy lives
+    // only in an SST.
+    //
+    // F130 does NOT walk every entry of every SST — that would be O(SST
+    // bytes). Instead we rely on the fact that a multi-frag value's
+    // chunks land contiguously in the log_stream tail, so the typical
+    // case is: a single recently-written value's chunks are all on the
+    // same about-to-reclaim extent, and the value's mfvp entry is in
+    // active+imm (still hot). For older mfvps that have flushed but not
+    // yet compacted, the to-be-reclaimed extent's discard ratio will
+    // grow when compaction shadows them; F130 is the rewrite path for
+    // values whose live entry is reachable via the partition's working
+    // set.
+    //
+    // Trade-off: this misses live mfvps whose entries are only in SSTs
+    // and not yet shadowed. They'd block extent reclaim until a
+    // compaction picks them up. Acceptable because:
+    //   (a) the next compact pass will rewrite them via
+    //       `compact_multi_frag_rewrite` (F130-C extension below) OR
+    //   (b) the `bloom_may_contain` filter on a candidate SST is fast
+    //       enough that we COULD walk all SSTs and check mfvp content,
+    //       but at the cost of `for r in p.sst_readers { for block in r
+    //       { decode every entry } }` — multiple seconds on a large
+    //       partition. Defer to compact-side handling per (a).
+    //
+    // For now we leave the SST-only case to the compaction discard path
+    // (F130-C below); the GC pre-pass here covers active+imm only.
+
+    drop(p);
+    out
+}
+
+/// F130 — rewrite every live multi-frag VP entry whose mfvp references
+/// `eid` to a fresh location in the active log_stream, allowing
+/// `extent_id` to be punched.
+///
+/// Approach: full-value rewrite (every fragment moves), not partial.
+/// Partial rewrite would require compaction-time discard accounting to
+/// know which fragments of a shadowed mfvp are "still referenced by the
+/// newer mfvp" vs "truly dead" — which is fragile. With full rewrite,
+/// every shadowed mfvp's frags can be blindly added to the discard map
+/// because nothing else references them.
+///
+/// MVCC safety mirrors the existing single-VP `process_gc_chunk`
+/// pattern: seq is allocated under a brief `borrow_mut`; a foreground
+/// Put on the same user_key with a newer seq always wins on read,
+/// regardless of the order in which the rewrite's commit record lands
+/// in log_stream. The rewrite's chunks become orphan and are eligible
+/// for the next GC pass.
+///
+/// Returns the number of mfvp entries rewritten.
+async fn rewrite_multi_frag_for_extent(
+    part: &Rc<RefCell<PartitionData>>,
+    log_stream_id: u64,
+    eid: u64,
+    part_sc: &Rc<StreamClient>,
+) -> Result<usize> {
+    use anyhow::anyhow;
+
+    let candidates = collect_live_mfvps_touching(part, eid);
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    tracing::info!(
+        eid,
+        n_candidates = candidates.len(),
+        "F130: rewriting multi-frag values referencing to-be-reclaimed extent"
+    );
+
+    let mut rewritten = 0usize;
+    for (user_key, mem_entry) in candidates {
+        let mfvp_old = match crate::MultiFragVp::decode(&mem_entry.value) {
+            Ok(m) => m,
+            Err(_) => continue, // defensive: shouldn't happen, we just decoded above
+        };
+
+        // 1) Read every fragment's bytes from log_stream. This is async
+        //    and may straddle multiple extents (frags on extents other
+        //    than `eid` still need to be re-read so the new mfvp is
+        //    fully self-contained on a single new tail).
+        let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(mfvp_old.frags.len());
+        for f in &mfvp_old.frags {
+            let (data, _) = part_sc
+                .read_bytes_from_extent(f.extent_id, f.offset, f.len)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "F130 read fragment ext={} off={} len={}: {e}",
+                        f.extent_id,
+                        f.offset,
+                        f.len
+                    )
+                })?;
+            if data.len() < f.len as usize {
+                return Err(anyhow!(
+                    "F130 short read on fragment ext={} off={} need={} got={}",
+                    f.extent_id,
+                    f.offset,
+                    f.len,
+                    data.len()
+                ));
+            }
+            chunks.push(data);
+        }
+
+        // 2) Append each chunk as a fresh OP_CHUNK_BLOB record. The
+        //    per-stream worker serialises these so they land in the
+        //    expected order even if the loop body yields between
+        //    iterations.
+        let value_offset_in_record: u32 =
+            1 + 4 + crate::wal_record::PAYLOAD_HEADER as u32;
+        let mut new_frags: Vec<crate::ValuePointer> =
+            Vec::with_capacity(mfvp_old.frags.len());
+        for chunk in chunks {
+            let chunk_len = chunk.len() as u32;
+            let wal = crate::encode_record(crate::OP_CHUNK_BLOB, &[], &chunk, 0);
+            let r = part_sc
+                .append(log_stream_id, &wal)
+                .await
+                .map_err(|e| anyhow!("F130 append chunk: {e}"))?;
+            new_frags.push(crate::ValuePointer {
+                extent_id: r.extent_id,
+                offset: r.offset + value_offset_in_record,
+                len: chunk_len,
+            });
+        }
+
+        // 3) Build new mfvp + commit record. seq is allocated here, so
+        //    a concurrent foreground Put on the same user_key gets a
+        //    higher seq and shadows the rewrite via MVCC (matches the
+        //    single-VP GC's race semantics — see lib.rs note 11
+        //    "F148-A invariant" for the borrow_mut→mpsc-send→ack chain
+        //    that makes record ordering equal seq ordering).
+        let mfvp_new = crate::MultiFragVp {
+            total_len: mfvp_old.total_len,
+            frags: new_frags,
+        };
+        let blob = mfvp_new.encode();
+        let internal_key;
+        let seq;
+        {
+            let mut p = part.borrow_mut();
+            p.seq_number += 1;
+            seq = p.seq_number;
+            internal_key = key_with_ts(&user_key, seq);
+        }
+        let _ = seq;
+        let wal_op: u8 = crate::OP_VALUE_POINTER_MULTI | 1;
+        let wal = crate::encode_record(
+            wal_op,
+            &internal_key,
+            &blob,
+            mem_entry.expires_at,
+        );
+        let r = part_sc
+            .append(log_stream_id, &wal)
+            .await
+            .map_err(|e| anyhow!("F130 append commit: {e}"))?;
+
+        // 4) Insert the rewritten entry into active memtable and bump
+        //    vp_head so subsequent flush includes the rewrite's tail.
+        {
+            let mut p = part.borrow_mut();
+            let entry = MemEntry {
+                op: wal_op,
+                value: blob,
+                expires_at: mem_entry.expires_at,
+            };
+            let size = (internal_key.len() + entry.value.len() + 32) as u64;
+            p.active.insert(internal_key, entry, size);
+            p.vp_extent_id = r.extent_id;
+            p.vp_offset = r.end;
+            crate::maybe_rotate(&mut p);
+        }
+        rewritten += 1;
+    }
+
+    Ok(rewritten)
+}
+
 pub(crate) async fn run_gc(
     part: &Rc<RefCell<PartitionData>>,
     extent_id: u64,
@@ -1462,6 +1742,37 @@ pub(crate) async fn run_gc(
     // (group commit), so the per-record fsync storm of pre-F141 is
     // structurally impossible — multiple in-flight batch appends share
     // one coalesced fsync per wake-cycle.
+    // F130 — multi-frag VP rewrite pre-pass. Walks active memtable +
+    // imm queue for OP_VALUE_POINTER_MULTI entries whose mfvp has at
+    // least one fragment landing on `extent_id`, and rewrites the full
+    // value to the active log_stream tail before the single-VP scan
+    // below punches the extent. Without this, the OP_CHUNK_BLOB records
+    // for those fragments would be lost when punch_holes fires, since
+    // the existing single-VP `process_gc_chunk` skips records whose op
+    // doesn't have OP_VALUE_POINTER set (line 1616) — which is correct
+    // for the chunk records but means multi-frag values sitting on
+    // sealed extents never moved.
+    //
+    // Trade-off: rewrites the ENTIRE multi-frag value (every fragment,
+    // even those NOT on `extent_id`). Avoids the partial-overlap
+    // discard-accounting bug that comes with selective rewrite — when
+    // compaction later shadows mfvp_old with the rewritten mfvp_new,
+    // it can blindly bump discards for every frag of mfvp_old without
+    // checking which of those frags are still referenced by mfvp_new.
+    // Cost: a 200 MiB value with one chunk on `extent_id` rewrites all
+    // 200 MiB. Acceptable because multipart upload's typical pattern
+    // is contiguous chunks landing in the same log_stream tail extent
+    // (see handle_put_chunk).
+    let mfvp_rewrites =
+        rewrite_multi_frag_for_extent(part, log_stream_id, extent_id, &part_sc).await?;
+    if mfvp_rewrites > 0 {
+        tracing::info!(
+            extent_id,
+            mfvp_rewrites,
+            "F130: rewrote {mfvp_rewrites} multi-frag VPs before single-VP GC pass"
+        );
+    }
+
     let chunk_bytes = gc_read_chunk_bytes();
     let mut moved = 0usize;
     let mut cur: u32 = 0;

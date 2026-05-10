@@ -494,21 +494,45 @@ Used by `autumn-client info` to display `discard: N ext / X pending` per log str
 
 **Discard map**: Each SSTable's MetaBlock contains `HashMap<extent_id, reclaimable_bytes>`. During compaction, when a VP entry is dropped (dedup, range filter, tombstone/expiry), its extent_id and value length are added to the discard map. The GC loop aggregates across all SSTable readers.
 
-**`run_gc` for one extent (F106 streaming)**:
+**`run_gc` for one extent (F106 streaming + F130 multi-frag pre-pass)**:
 ```
-  1. Loop until cur >= sealed_length:
+  0. F130 multi-frag rewrite pre-pass (NEW):
+     `rewrite_multi_frag_for_extent(part, log_stream_id, eid, part_sc)`
+       - Walk active memtable + imm queue for OP_VALUE_POINTER_MULTI
+         entries whose mfvp has any fragment on `eid`. Dedup by user_key
+         (newest seq wins). SST-only mfvps deferred to compaction's
+         discard path (see F130 entry in feature_list.md).
+       - For each candidate: read every fragment via
+         read_bytes_from_extent (full-value rewrite, not partial),
+         append each as a fresh OP_CHUNK_BLOB record, build new
+         MultiFragVp, allocate seq + append OP_VALUE_POINTER_MULTI|1
+         commit record, insert memtable entry.
+       - Race semantics: foreground Put on the same user_key allocates
+         a strictly newer seq under the same single-threaded P-log
+         runtime → wins on read via MVCC. Rewrite chunks become orphan
+         and are reclaimed by the next GC pass.
+     Without F130, OP_CHUNK_BLOB records of live multi-frag values would
+     be silently orphaned when punch_holes fired (the single-VP scan at
+     step 1 skips OP_CHUNK_BLOB records since `op & OP_VALUE_POINTER == 0`).
+  1. Single-VP loop (F106 streaming): until cur >= sealed_length:
        a. read_bytes_from_extent(eid, cur, AUTUMN_PS_GC_READ_CHUNK_BYTES)
        b. concatenate carry + chunk → buf
        c. process_gc_chunk(buf):
           - decode complete records left-to-right
           - on partial record at tail, stop; caller saves buf[consumed..]
             as carry for the next chunk
-          - per record (if VP and in_range):
+          - per record (if single-VP and in_range):
             * lookup current live version (active → imm → SSTables)
             * if live VP still points to (eid, offset): re-write value
               via stream_client.append, drop borrow_mut BEFORE awaiting
               the network RPC, then re-acquire borrow_mut to insert
               the updated VP into the memtable
+          - OP_CHUNK_BLOB records: skipped (handled by F130 pre-pass)
+          - OP_VALUE_POINTER_MULTI commit records: skipped (these are
+            tiny — ~16 + n_frags*16 bytes — and the rewrite pre-pass
+            covers their semantic content; the byte-trail of the old
+            commit record falls within the punched extent same as
+            chunks)
        d. cur += chunk.len()
   2. carry must be empty at end (sealed extent records are byte-aligned);
      non-empty carry → refuse to punch and return error
