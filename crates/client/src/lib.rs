@@ -135,6 +135,28 @@ pub struct ClusterClient {
     /// When an entry is present, it supersedes `ps_details[ps_id].address`
     /// for routing decisions (thread-per-partition shard target).
     part_addrs: RefCell<HashMap<u64, String>>,
+    /// F184: opt-in per-call timeout for PS-bound RPCs.
+    ///
+    /// `None` (default) preserves the original "wait forever" semantics —
+    /// no behavior change for existing callers.
+    ///
+    /// When set, every `ps_call` (i.e. every Put/Get/Delete/Head/Range/
+    /// StreamPut/PutChunk/PutCommit/PutAbort/MergePart) is raced against a
+    /// `compio::time::sleep(timeout)`. Expiry surfaces as
+    /// `AutumnError::ConnectionError("timeout …")` so the caller's
+    /// `call_ps_for_*` retry-on-failure path triggers a `refresh_regions`
+    /// + one retry, identical to any other transient connection error.
+    ///
+    /// Why this exists: the partition-server may drop a partition's
+    /// `req_rx` mid-call (e.g. region_sync_loop reload after merge,
+    /// graceful shutdown drain), closing the per-request response oneshot
+    /// without closing the underlying TCP connection. autumn-rpc's F121
+    /// `closed: Cell<bool>` flag fires on TCP close but not on req_rx
+    /// drop; without a per-call timeout the caller's `.await` never
+    /// resolves. Manager calls (`mgr_call`) are NOT timed out — they
+    /// already have round-robin failover via `rotate_manager` on
+    /// connection error.
+    rpc_timeout: Cell<Option<Duration>>,
 }
 
 impl ClusterClient {
@@ -223,6 +245,7 @@ impl ClusterClient {
             regions: RefCell::new(Vec::new()),
             ps_details: RefCell::new(HashMap::new()),
             part_addrs: RefCell::new(HashMap::new()),
+            rpc_timeout: Cell::new(None),
         };
 
         // Try connecting to each manager until one responds
@@ -318,7 +341,14 @@ impl ClusterClient {
         payload: Bytes,
     ) -> Result<Bytes> {
         let client = self.get_ps_client(ps_addr).await?;
-        match client.call(msg_type, payload).await {
+        // F184: optional per-call timeout. None preserves the original
+        // wait-forever semantics; Some(t) protects against the partition-
+        // dropped-but-TCP-still-alive hang documented on `rpc_timeout`.
+        let outcome = match self.rpc_timeout.get() {
+            None => client.call(msg_type, payload).await,
+            Some(t) => client.call_timeout(msg_type, payload, t).await,
+        };
+        match outcome {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 // Drop connection so next call reconnects
@@ -326,6 +356,27 @@ impl ClusterClient {
                 Err(anyhow!("{e}"))
             }
         }
+    }
+
+    /// F184: set the per-call timeout for PS-bound RPCs. Default is no
+    /// timeout (wait forever). Recommended in production: 2-5 s, balanced
+    /// against your slow-disk fsync coalescer worst case (1-5 ms baseline,
+    /// up to 100 ms under heavy contention) plus 3-replica fanout.
+    /// Tests that drive topology changes (split/merge) should set this so
+    /// puts that race a partition-handle drop don't hang the test.
+    pub fn set_rpc_timeout(&self, t: Duration) {
+        self.rpc_timeout.set(Some(t));
+    }
+
+    /// F184: clear the per-call timeout (wait forever). Equivalent to the
+    /// pre-F184 default.
+    pub fn clear_rpc_timeout(&self) {
+        self.rpc_timeout.set(None);
+    }
+
+    /// F184: read the current per-call timeout. Mostly for tests.
+    pub fn rpc_timeout(&self) -> Option<Duration> {
+        self.rpc_timeout.get()
     }
 
     pub fn lookup_key(&self, key: &[u8]) -> Option<(u64, String)> {

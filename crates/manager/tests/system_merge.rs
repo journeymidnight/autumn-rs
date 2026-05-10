@@ -902,11 +902,17 @@ fn split_merge_split_with_concurrent_writes() {
         // ── ClusterClient with cached connections + regions ──────────
         // Connect ONCE, share via Rc with the writer task. Internal
         // mgr_conn + ps_conns + regions caches handle all routing.
+        // F184: set rpc_timeout=2s so writes that race a partition-
+        // handle drop during merge reload return promptly with
+        // ConnectionError instead of waiting forever (handle drop
+        // closes req_rx but not the multiplexed TCP connection that
+        // other partitions on the same PS still use).
         let cluster = std::rc::Rc::new(
             ClusterClient::connect(&mgr_addr.to_string())
                 .await
                 .expect("ClusterClient::connect"),
         );
+        cluster.set_rpc_timeout(Duration::from_secs(2));
 
         // ── Spawn writer task ────────────────────────────────────────
         let stop = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -926,31 +932,17 @@ fn split_merge_split_with_concurrent_writes() {
                     // so writes hit both halves of any post-split topology.
                     let prefix = if counter % 2 == 0 { "b" } else { "n" };
                     let key = format!("{prefix}-{counter:06}").into_bytes();
-                    // Wrap each Put in a 2 s timeout. The merge handler
-                    // drops both PartitionHandles to force region_sync
-                    // reload — a Put that landed on the partition just
-                    // before the drop has its req_rx closed and waits
-                    // forever for a response. autumn-rpc has no default
-                    // per-call timeout; a bounded Future::race against a
-                    // 2 s sleep self-heals via the next refresh_regions.
-                    // Use a bool flag to avoid borrowing `key` across the
-                    // select, which would prevent the move into acked.
-                    let put_outcome: Option<bool> = {
-                        let put_fut = cluster.put(&key, b"v");
-                        let timeout_fut = compio::time::sleep(Duration::from_secs(2));
-                        futures::pin_mut!(put_fut);
-                        futures::pin_mut!(timeout_fut);
-                        match futures::future::select(put_fut, timeout_fut).await {
-                            futures::future::Either::Left((Ok(()), _)) => Some(true),
-                            _ => Some(false),
+                    // F184 SDK-level rpc_timeout (set on the cluster
+                    // above) bounds each put. Expiry surfaces as
+                    // AutumnError::ConnectionError; treat as transient
+                    // and refresh routing for the next iteration.
+                    match cluster.put(&key, b"v").await {
+                        Ok(()) => acked.borrow_mut().push(key),
+                        Err(_) => {
+                            transient_errors.set(transient_errors.get() + 1);
+                            let _ = cluster.refresh_regions().await;
+                            compio::time::sleep(Duration::from_millis(100)).await;
                         }
-                    };
-                    if put_outcome == Some(true) {
-                        acked.borrow_mut().push(key);
-                    } else {
-                        transient_errors.set(transient_errors.get() + 1);
-                        let _ = cluster.refresh_regions().await;
-                        compio::time::sleep(Duration::from_millis(100)).await;
                     }
                     compio::time::sleep(Duration::from_millis(20)).await;
                 }

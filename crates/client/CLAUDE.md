@@ -25,6 +25,36 @@ Main entry point. Connect via `ClusterClient::connect("addr1,addr2")`.
 - `gc(part_id)` — trigger automatic GC
 - `force_gc(part_id, extent_ids)` — force GC on specific extents
 - `flush(part_id)` — trigger memtable flush
+- `merge_partitions(survivor, victim)` — F183 partition merge (CLI orchestration)
+- `policy_candidates() → Vec<PolicyCandidate>` — F183 advisory engine output
+
+**Per-call timeout (F184):**
+- `set_rpc_timeout(Duration)` — set the per-call timeout for PS-bound RPCs
+- `clear_rpc_timeout()` — restore default (wait forever)
+- `rpc_timeout() → Option<Duration>` — read current setting
+
+Default is **None (wait forever)**, preserving pre-F184 behavior. When set,
+every `ps_call` (i.e. `put`/`get`/`delete`/`head`/`range`/`stream_put`/
+`merge_partitions`'s FLUSH and downstream PS calls / F129 PutChunk / etc.)
+is raced against `compio::time::sleep(timeout)`. Expiry surfaces as
+`AutumnError::ConnectionError` so the caller's existing
+retry-on-routing-miss path triggers a `refresh_regions` + one retry.
+
+**Why this exists:** the partition-server may drop a partition's `req_rx`
+mid-call — region_sync_loop reload after merge, F140 split's drain,
+graceful shutdown. The drop closes the per-request response oneshot
+**without** closing the underlying TCP connection (other partitions on
+the same PS still use it). autumn-rpc's F121 closed-state flag fires on
+TCP close, not on req_rx drop, so without a per-call timeout `cluster.put().await`
+hangs forever.
+
+**Recommended values:**
+- Production read-heavy loads: 2-5 s (slow-disk fsync coalescer worst case is ~100 ms; 3-replica fanout ~10 ms).
+- Tests that drive split/merge: 2 s (the merge-reload window is ~1-2 s).
+- Bulk uploads via `stream_put` of multi-GiB blobs: clear the timeout entirely or set 30+ s, since the call itself is long-running.
+
+**NOT timed out**: `mgr_call` and `mgr_call_retry`. Manager calls already have
+round-robin failover via `rotate_manager` on connection error.
 
 **Low-level (for CLI/benchmarks):**
 - `mgr_call(msg_type, payload)` — raw manager RPC
