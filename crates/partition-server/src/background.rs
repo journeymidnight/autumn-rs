@@ -1664,27 +1664,60 @@ async fn rewrite_multi_frag_for_extent(
             });
         }
 
-        // 3) Build new mfvp + commit record. seq is allocated here, so
-        //    a concurrent foreground Put on the same user_key gets a
-        //    higher seq and shadows the rewrite via MVCC (matches the
-        //    single-VP GC's race semantics — see lib.rs note 11
-        //    "F148-A invariant" for the borrow_mut→mpsc-send→ack chain
-        //    that makes record ordering equal seq ordering).
+        // 3) Build new mfvp + commit record.
+        //
+        //    Race-free seq allocation requires verify-at-apply: between
+        //    step 0's `collect_live_mfvps_touching` snapshot and now,
+        //    a foreground Put on the same user_key may have replaced
+        //    mfvp_old with a value mfvp_X containing DIFFERENT user
+        //    bytes (different chunks, different mfvp blob). Single-VP
+        //    GC doesn't need this check because the WAL record itself
+        //    carries the user value bytes — `vp.extent_id == E` is
+        //    sufficient. F130's rewrite carries OLD bytes (read from
+        //    mfvp_old's frags); inserting at a fresh seq would shadow
+        //    foreground's NEW bytes via MVCC and silently lose data.
+        //
+        //    Fix: under the same borrow_mut that allocates seq, look up
+        //    the current memtable value for user_key. If it still
+        //    matches our snapshot byte-for-byte, proceed; otherwise
+        //    abandon — the new chunks become orphan in the active
+        //    log_stream and the next GC pass collects them.
         let mfvp_new = crate::MultiFragVp {
             total_len: mfvp_old.total_len,
             frags: new_frags,
         };
         let blob = mfvp_new.encode();
-        let internal_key;
-        let seq;
-        {
-            let mut p = part.borrow_mut();
-            p.seq_number += 1;
-            seq = p.seq_number;
-            internal_key = key_with_ts(&user_key, seq);
-        }
-        let _ = seq;
         let wal_op: u8 = crate::OP_VALUE_POINTER_MULTI | 1;
+
+        let internal_key = {
+            let mut p = part.borrow_mut();
+
+            let current = lookup_in_memtable(&p.active, &user_key).or_else(|| {
+                p.imm
+                    .iter()
+                    .rev()
+                    .find_map(|m| lookup_in_memtable(m, &user_key))
+            });
+            let still_matches = match current {
+                Some((cur_op, cur_val, _)) => {
+                    cur_op == mem_entry.op
+                        && cur_val.as_ref() == mem_entry.value.as_slice()
+                }
+                None => false,
+            };
+            if !still_matches {
+                tracing::debug!(
+                    eid,
+                    "F130: foreground Put raced rewrite — abandoning, chunks orphan"
+                );
+                continue;
+            }
+
+            p.seq_number += 1;
+            let seq = p.seq_number;
+            key_with_ts(&user_key, seq)
+        };
+
         let wal = crate::encode_record(
             wal_op,
             &internal_key,
@@ -1698,6 +1731,12 @@ async fn rewrite_multi_frag_for_extent(
 
         // 4) Insert the rewritten entry into active memtable and bump
         //    vp_head so subsequent flush includes the rewrite's tail.
+        //    Even if a foreground Put landed BETWEEN the verify-at-
+        //    apply (step 3) and here, MVCC ordering protects: the
+        //    foreground's seq is strictly higher than ours (allocated
+        //    later on the same single-threaded P-log runtime), so
+        //    foreground's entry wins on read regardless of insertion
+        //    order.
         {
             let mut p = part.borrow_mut();
             let entry = MemEntry {
