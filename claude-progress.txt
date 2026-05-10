@@ -1,91 +1,94 @@
 Date: 2026-05-10
 TaskStatus: completed
-Task scope: F185 — Manager-orchestrated partition merge with PS freeze-drain.
-            Closes the F184-K ~5% merge-window data-loss gap at 0 loss.
+Task scope: F129 — PutStream / GetStream multipart upload + multi-fragment
+            ValuePointer. Closes the 64 MiB inline-Put cap; values up to
+            256 MiB-per-fragment with no fragment-count limit.
 
-Approach chosen (TiKV PrepareMerge model, NOT spec §4.1's PS-orchestrated
-4-gate cross-thread design):
-  - Leader-fenced control plane (manager) is the orchestrator
-  - CLI is a thin wrapper around one new RPC: MSG_MERGE_PARTITIONS
-  - PSes self-freeze in-place via MSG_MERGE_FREEZE — no cross-thread channels
-  - In-memory splice (spec §4.1) NOT done — survivor reopens via existing
-    region_sync_loop reload (F184-B) + read_all_table_locations union (F184-C)
-  - Trade-off: merge wallclock stays ~2-3 s (vs spec's <1 s); data loss → 0
-  - Crash safety via FREEZE_TTL = 30 s backstop on PS, no procedure-WAL
+Most of F129 was already implemented in earlier sessions (wire types,
+server handlers, op flags, client SDK, CLI). The gap to mark passes:true
+was the missing end-to-end integration test + final docs.
 
-Wire additions:
-  - partition_rpc: MSG_MERGE_FREEZE = 0x4E, MergeFreezeReq/Resp,
-                   CODE_UNAVAILABLE = 7
-  - manager_rpc:   MSG_MERGE_PARTITIONS = 0x37, MergePartitionsReq/Resp
+Work this iteration:
+  1. Reviewed all F129 sites — confirmed server handlers, recovery, GC
+     skip path for OP_CHUNK_BLOB, multi-frag VP read path, and client
+     SDK (PutStreamHandle / GetStream) were complete.
+  2. Considered + rejected put_auto / get_auto convenience helpers.
+     Rationale: put_auto would silently route a buffered Vec<u8>
+     through streaming with no memory-profile change but masks the
+     "you crossed a code-path boundary" signal. get_auto would buffer
+     N×4 MiB chunks back into one Vec<u8>, defeating streaming's
+     entire purpose. Callers know their value class — clean error
+     from `put` on > 64 MiB is the right interface.
+  3. New integration test: crates/manager/tests/system_putstream.rs
+     covering 12 MiB roundtrip (4×3 MiB chunks, exercises uneven
+     fragments + cross-fragment sub-range reads), single-chunk 1 MiB
+     edge case (n_frags=1 mfvp distinct from legacy single-VP), and
+     abort path (session dropped, get returns None).
+  4. README.md "Large value" section now distinguishes inline VP
+     (>4 KiB) from F129 multipart (>64 MiB), with a 200 MiB putstream
+     /getstream example.
+  5. feature_list.md F129: passes:false → true. Top-of-file Completed
+     table gains an F129 row.
 
-PartitionData state:
-  - frozen_for_merge: Cell<Option<Instant>>     — Some(set_at) while frozen
-  - freeze_drain_ack: RefCell<Option<oneshot>>  — parked freeze response
+Wire / handler / SDK summary (already shipped pre-this-iteration):
+  - Wire types: MSG_PUT_BEGIN=0x49, MSG_PUT_CHUNK=0x4A,
+    MSG_PUT_COMMIT=0x4B, MSG_PUT_ABORT=0x4C; PutBegin/Chunk/Commit/Abort
+    Req+Resp shapes. Inline cap = AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT
+    (64 MiB), hard ceiling 256 MiB. Op flag distinguishes single-VP
+    from multi-VP: OP_VALUE_POINTER=0x80, OP_VALUE_POINTER_MULTI=0x40,
+    OP_CHUNK_BLOB=0x10. CODE_VALUE_TOO_LARGE=5, CODE_UPLOAD_NOT_FOUND=6.
+  - Server: handle_put_begin/chunk/commit/abort. Sessions held in
+    PartitionData.upload_sessions: HashMap<u128, UploadSession> with
+    AUTUMN_PS_MAX_UPLOAD_SESSIONS_DEFAULT=1024 cap and
+    AUTUMN_PS_UPLOAD_TTL_SECS_DEFAULT=30min idle TTL.
+  - Read path: handle_get / handle_head decode OP_VALUE_POINTER_MULTI;
+    resolve_value dispatches to resolve_multi_frag (sequential per-
+    fragment reads, F131 will add concurrency).
+  - Recovery: WAL replay skips OP_CHUNK_BLOB; OP_VALUE_POINTER_MULTI
+    re-inserts the encoded mfvp blob into memtable (preserved across
+    restart).
+  - Client SDK: ClusterClient.put_stream_begin → PutStreamHandle
+    {send, commit, abort}; ClusterClient.get_stream → GetStream
+    {next_chunk, total_bytes, position, remaining}.
+  - CLI: autumn-client putstream <KEY> <FILE> [--chunk-size N];
+    autumn-client getstream <KEY> [--chunk-size N] [--out FILE].
 
-merged_partition_loop changes:
-  - top-of-loop freeze drain check: rotate active + flush_one_imm in a
-    loop; once pending+inflight both empty, send OK on parked ack
-  - top-of-loop FREEZE_TTL check: auto-unfreeze on 30 s expiry,
-    surface PRECONDITION error to any stale ack
-  - handle_incoming_req: Put/Delete/StreamPut return CODE_UNAVAILABLE
-    while frozen; reads/maintenance still flow
-  - handle_incoming_req intercepts MSG_MERGE_FREEZE inline:
-      freeze=true:  set frozen + park resp_tx in freeze_drain_ack
-      freeze=false: clear frozen, ack OK immediately
-  - idempotency: re-freezing already-drained partition replies OK;
-    second freeze while drain pending replies PRECONDITION
-
-handle_merge_partitions (manager, new):
-  1. ensure_leader + resolve part_addr / stream ids in one borrow
-  2. acquire admin owner-lock for the partition pair
-  3. MSG_MERGE_FREEZE → victim PS, await OK (drains+flushes)
-  4. MSG_MERGE_FREEZE → survivor PS, await OK
-  5. capture commit_length × 6 via handle_check_commit_length
-  6. handle_multi_modify_merge synchronously (existing F183 logic)
-  7a. on OK: leave PSes frozen (region_sync_loop drops them on next tick)
-  7b. on err: best-effort MSG_MERGE_FREEZE freeze=false rollback to all
-
-ClusterClient.merge_partitions:
-  - was 100+ lines of CLI orchestration with manual owner-lock,
-    GetRegions, 6× CheckCommitLength, MultiModifyMerge
-  - now ~20 lines: just call MSG_MERGE_PARTITIONS
-
-Tests:
-  - f185_orchestrated_merge_zero_loss_concurrent_writes (NEW): clone of
-    F184-K's setup that routes merge through MSG_MERGE_PARTITIONS;
-    asserts 0 loss + > 0 CODE_UNAVAILABLE retries
-  - F184-K test kept as regression baseline for the old path (helper
-    still hits MSG_MULTI_MODIFY_MERGE directly; ≤20% threshold)
-
-Test results (cargo test -p autumn-manager --test system_merge -- --ignored):
-  All 11/11 system_merge tests pass:
-    f185_orchestrated_merge_zero_loss_concurrent_writes:
-      360 acked, 360 read back, 0 lost (0.00%),
-      11 unavailable-retried (proves freeze fired)
-    split_merge_split_with_concurrent_writes (F184-K baseline):
-      542 acked, 516 read, 26 lost (4.8% — Stage-1 expected)
-  cargo test -p autumn-rpc:                clean (17/17)
-  cargo test -p autumn-manager --lib:      clean (51/51)
+Test results:
+  cargo test -p autumn-rpc:                                  17/17
   cargo test -p autumn-partition-server --lib --test-threads=1: 130/130
-  cargo check --workspace --exclude autumn-fuse: clean
+                                          (incl. 5 f129_multifrag_tests)
+  cargo test -p autumn-manager --lib:                        51/51
+  cargo test -p autumn-manager --test system_putstream -- --ignored: 3/3
+    f129_putstream_roundtrip_12mib       — 12 MiB / 4 chunks / full
+                                            roundtrip + cross-fragment
+                                            sub-range read
+    f129_putstream_single_chunk_1mib     — n_frags=1 edge case
+    f129_putstream_abort_drops_session   — session drop + get → None
+  cargo check --workspace --exclude autumn-fuse:             clean
 
-Files changed:
-  crates/rpc/src/partition_rpc.rs       — wire types
-  crates/rpc/src/manager_rpc.rs         — wire types
-  crates/partition-server/src/lib.rs    — PartitionData state, freeze drain
-                                          in merged_partition_loop,
-                                          handle_incoming_req short-circuit,
-                                          FREEZE_TTL constant
-  crates/manager/src/rpc_handlers.rs    — handle_merge_partitions
-  crates/client/src/lib.rs              — merge_partitions thin wrapper
-  crates/manager/tests/system_merge.rs  — F185 zero-loss test
+Files changed this iteration:
+  crates/manager/tests/system_putstream.rs  — NEW (3 integration tests)
+  feature_list.md                           — F129 → passes:true,
+                                              completed-table row added
+  README.md                                 — F129 putstream/getstream
+                                              docs, 200 MiB example
+  claude-progress.txt                       — this file
 
-Out of scope (record-only follow-ups):
-  - cross-PS merge (still requires partition migration primitive;
-    advisory marks them infeasible)
-  - HBase-ProcedureV2-style etcd sidecar marker for sub-30s crash recovery
-    (current TTL is sufficient for current scale)
-  - p99 latency reading (PartitionLoad.p99_us still always 0)
-  - Per-cluster threshold tuning via flags on autumn-manager-server
+Out-of-scope follow-ups (separate F-numbers, recorded in feature_list):
+  - F130: GC active rewrite for multi-fragment VPs (REQUIRED to reclaim
+    sealed log_stream extents holding live multi-frag fragments —
+    without F130 long-running clusters with sustained F129 use will
+    eventually run out of disk; advisory: monitor sealed log_stream
+    extent count + partition disk usage and prioritize F130 if those
+    cross 16 ext / 80 % util)
+  - F131: concurrent fragment pread (perf, sequential read latency
+    scales linearly with n_frags today)
+  - F132: PutStream resume across split / PS restart (UploadSession
+    is in-memory only)
+  - F133: autumn-rpc native multi-frame (FLAG_STREAM_END activation —
+    alternative to multipart for "many small results from one query"
+    workloads like big MSG_RANGE)
+  - F134: frame-level Put early reject (perf hardening — drop the
+    socket on payload_len > cap before reading body bytes)
 
 Final commit: pending (this commit).

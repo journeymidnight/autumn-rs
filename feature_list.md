@@ -98,6 +98,7 @@
 | F183 | Partition merge primitive + size+load advisory policy engine (Stage 1) | partition/manager |
 | F184 | Auto-trigger flags + reload-on-region-change + concurrent-writer test + ClusterClient.rpc_timeout | manager/client |
 | F185 | Manager-orchestrated merge with PS freeze-drain (closes F184-K ~5% merge-window loss; 0 loss verified) | manager/partition |
+| F129 | PutStream / GetStream — multipart upload + multi-fragment ValuePointer (lifts 64 MiB inline cap) | partition-server/client |
 
 ---
 
@@ -351,10 +352,23 @@
 ## Open / Deferred designs
 
 ### F129 · PutStream / GetStream — PS multipart upload + multi-fragment ValuePointer
-- **Target:** Bound PS RAM and improve TTFB for large values by adding S3-style multipart upload (`PutBegin` / `PutChunk` / `PutCommit` / `PutAbort`) at the partition server, plus a client-side `GetStream` that loops the existing `GetReq.offset/length`. Memtable / SSTable gain a multi-fragment `ValuePointer` (op flag `OP_VALUE_POINTER_MULTI = 0x40`, encoded `[n_frags:u32][total_len:u64][(extent_id:u64, offset:u32, len:u32) × n_frags]`); chunks stored as WAL-shaped records with op `OP_CHUNK_BLOB = 0x10` so `decode_records_with_offsets` / `process_gc_chunk` skip them safely. Existing `Put`/`Get` preserved; both gain symmetric size cap `AUTUMN_PS_MAX_INLINE_BYTES` (default 64 MiB, hard ≤ 256 MiB) — over-cap returns `CODE_VALUE_TOO_LARGE`. Client adds `PutStreamHandle { send, commit, abort }` + `put_stream(Stream<Bytes>)` / `get_stream() -> Stream<Bytes>` / `put_auto` / `get_auto`. PS holds upload sessions in memory only (`HashMap<[u8;16], UploadSession>`); session metadata is O(1) in chunks (clients hold the fragment list); idle TTL 30 min (`AUTUMN_PS_UPLOAD_TTL_SECS`); per-partition cap 1024 (`AUTUMN_PS_MAX_UPLOAD_SESSIONS`). Routing requires `part_id` in `PutChunkReq`/`PutCommitReq`/`PutAbortReq`.
-- **Acceptance:** see plan `/Users/zhangdongmao/.claude/plans/resilient-greeting-ember.md`.
+- **Target:** Bound PS RAM and improve TTFB for large values by adding S3-style multipart upload (`PutBegin` / `PutChunk` / `PutCommit` / `PutAbort`) at the partition server, plus a client-side `GetStream` that loops the existing `GetReq.offset/length`. Memtable / SSTable gain a multi-fragment `ValuePointer` (op flag `OP_VALUE_POINTER_MULTI = 0x40`, encoded `[n_frags:u32][total_len:u64][(extent_id:u64, offset:u32, len:u32) × n_frags]`); chunks stored as WAL-shaped records with op `OP_CHUNK_BLOB = 0x10` so `decode_records_with_offsets` / `process_gc_chunk` skip them safely. Existing `Put`/`Get` preserved; both gain symmetric size cap `AUTUMN_PS_MAX_INLINE_BYTES` (default 64 MiB, hard ≤ 256 MiB) — over-cap returns `CODE_VALUE_TOO_LARGE`. Client adds `PutStreamHandle { send, commit, abort }` + `GetStream { next_chunk }`. PS holds upload sessions in memory only (`HashMap<u128, UploadSession>`); session metadata is O(1) in chunks (clients hold the fragment list); idle TTL 30 min (`AUTUMN_PS_UPLOAD_TTL_SECS`); per-partition cap 1024 (`AUTUMN_PS_MAX_UPLOAD_SESSIONS`). Routing requires `part_id` in `PutChunkReq`/`PutCommitReq`/`PutAbortReq`.
 - **Notes:** Picked S3 multipart over autumn-rpc native multi-frame (F133) because it has zero framework impact, matches Azure Blob / GCS / HDFS / GridFS / Ceph practice. Multi-fragment VP (ζ) over per-upload `blob_stream` (ε): all the surveyed systems store large values as fragment lists; single-segment continuity gives a measurable advantage only on "client reads whole 1 GiB at once", which is rare in this codebase. Symmetric Put/Get cap is critical: asymmetric creates "writable-but-not-readable" footgun.
-- **passes:** false
+- **`put_auto` / `get_auto` deliberately NOT added.** The early plan called for them but they're a footgun: `put_auto` would silently route a 200 MiB `Vec<u8>` through streaming, which doesn't change the caller's memory profile (already buffered) but hides the "you're crossing a code-path boundary" signal. `get_auto` is worse — buffering N×4 MiB streamed chunks back into one `Vec<u8>` defeats streaming's whole point. Callers either know their value size class (use `put`/`get`) or are streaming source/sink (use `put_stream_begin`/`get_stream` directly). The clean error from `put` on > 64 MiB is the right interface.
+- **Implementation:**
+  - Wire types: `MSG_PUT_BEGIN = 0x49`, `MSG_PUT_CHUNK = 0x4A`, `MSG_PUT_COMMIT = 0x4B`, `MSG_PUT_ABORT = 0x4C` + Req/Resp shapes (`crates/rpc/src/partition_rpc.rs`).
+  - PS handlers: `handle_put_begin/chunk/commit/abort` (`crates/partition-server/src/rpc_handlers.rs`); upload session map on `PartitionData.upload_sessions`.
+  - Op flags + `MultiFragVp` encode/decode + 5 unit tests (`crates/partition-server/src/lib.rs`).
+  - Recovery: WAL replay skips `OP_CHUNK_BLOB`; `OP_VALUE_POINTER_MULTI` re-inserts the mfvp blob into memtable.
+  - Read path: `handle_get` / `handle_head` decode `OP_VALUE_POINTER_MULTI`; `resolve_value` dispatches to `resolve_multi_frag` which walks fragments sequentially honouring offset/length sub-range.
+  - Client SDK: `ClusterClient::put_stream_begin` → `PutStreamHandle::{send, commit, abort, upload_id, bytes_sent, chunks_sent}`; `ClusterClient::get_stream` → `GetStream::{next_chunk, total_bytes, position, remaining}` (`crates/client/src/lib.rs`).
+  - CLI: `autumn-client putstream <KEY> <FILE> [--chunk-size N]` and `autumn-client getstream <KEY> [--chunk-size N] [--out FILE]`.
+- **Verification:**
+  - `cargo test -p autumn-rpc`: 17/17.
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 130/130 (includes 5 `f129_multifrag_tests`).
+  - `cargo test -p autumn-manager --test system_putstream -- --ignored`: 3/3 (NEW; covers 12 MiB roundtrip with 4×3 MiB chunks, single-chunk edge case, abort path).
+- **Out of scope (separate feature entries):** F130 (GC active rewrite — needed for sealed log_stream reclaim under sustained F129 use), F131 (concurrent fragment pread — perf), F132 (resume across split / restart), F134 (frame-level early reject — perf hardening).
+- **passes:** true
 
 ### F130 · GC active rewrite for multi-fragment VPs (unblocks log_stream extent reclaim under F129)
 - **Target:** Atomic VP rewrite so log_stream extents holding live multi-frag fragments can be reclaimed. Background task scans sealed log_stream extents; for each live multi-frag VP, append a fresh contiguous copy to active log_stream extent, atomically swap the memtable / SSTable VP, bump discard counters on source extents.

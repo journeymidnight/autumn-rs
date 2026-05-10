@@ -708,8 +708,10 @@ Default manager address: `127.0.0.1:9001`
 | Command | Description |
 |---------|-------------|
 | `bootstrap [--replication 1+0] [--presplit 1:normal\|N:hexstring]` | Create streams and partition(s). `N:hexstring` splits the hex key space into N partitions. |
-| `put <KEY> <FILE>` | Write key with value from file |
-| `streamput <KEY> <FILE>` | Stream-put large file in 512KB chunks |
+| `put <KEY> <FILE>` | Write key with value from file (≤ 64 MiB inline) |
+| `streamput <KEY> <FILE>` | Single-frame StreamPut (legacy; prefer `putstream` for >64 MiB) |
+| `putstream <KEY> <FILE> [--chunk-size N]` | F129 multipart upload — splits FILE into chunks (default 4 MiB), each one `MSG_PUT_CHUNK` to log_stream; final commit installs a multi-fragment ValuePointer. The only path for values > 64 MiB. |
+| `getstream <KEY> [--chunk-size N] [--out FILE]` | F129 streaming read — pulls chunks via offset/length GetReqs; writes to FILE or stdout. Use for large values to avoid buffering the full payload in client memory. |
 | `get <KEY>` | Read value (writes raw bytes to stdout) |
 | `del <KEY>` | Delete key |
 | `head <KEY>` | Show key metadata (length only) |
@@ -781,12 +783,27 @@ $AC ls --prefix my      # scan keys with prefix
 $AC del mykey
 ```
 
-### Large value (>4KB uses StreamPut)
+### Large value (>4KB uses inline VP, >64MB uses F129 multipart)
 
 ```bash
+# 100 KiB — inline `Put` is fine; if value > 4 KiB the PS stores the
+# bytes in log_stream and the memtable holds a ValuePointer.
 dd if=/dev/urandom of=/tmp/big.bin bs=1024 count=100
-$AC streamput bigkey /tmp/big.bin
+$AC put bigkey /tmp/big.bin
 $AC head bigkey         # expects: length: 102400
+
+# 200 MiB — inline cap (`AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT` = 64 MiB)
+# is exceeded; use F129 multipart upload. The CLI splits the file into
+# 4 MiB chunks via MSG_PUT_BEGIN / MSG_PUT_CHUNK / MSG_PUT_COMMIT and
+# installs a multi-fragment ValuePointer that lets recovery + GC + read
+# all walk the fragment list correctly.
+dd if=/dev/urandom of=/tmp/huge.bin bs=1M count=200
+$AC putstream hugekey /tmp/huge.bin
+$AC head hugekey                            # expects: length: 209715200
+
+# Read back via streaming so the daemon doesn't buffer 200 MiB in RAM.
+$AC getstream hugekey --out /tmp/huge.copy
+diff /tmp/huge.bin /tmp/huge.copy
 ```
 
 ### Partition operations
