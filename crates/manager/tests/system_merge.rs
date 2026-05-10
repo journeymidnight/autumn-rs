@@ -842,6 +842,207 @@ fn auto_dispatch_split_dispatches_msg_split_part() {
     });
 }
 
+/// F184 stress: split → merge → split with a CONCURRENT writer task
+/// running through ClusterClient (caches mgr/PS connections + regions
+/// + auto-routes per Put). Replaces the earlier abandoned attempt that
+/// used PsRouter (per-call TCP reconnect → unbounded CPU on the manager
+/// accept loop, hung the cluster).
+///
+/// Verifies the full lifecycle:
+///  - background writer continuously Puts keys, retrying on transient
+///    NotFound / routing-miss errors that occur during the ~2 s
+///    region_sync reload window after merge
+///  - foreground does: split → wait → compact-children → merge → wait →
+///    compact-survivor → split-again
+///  - At end: stop writer, verify ALL acked keys are readable from the
+///    correct partition
+///
+/// Why this matters: handle_split_part runs inline on the partition's
+/// merged_partition_loop and serialises against writes via the F140
+/// dual-gate. Merge orchestration FLUSHes both partitions then drops
+/// their PartitionHandles to force region_sync reload — during which
+/// reads/writes against the merging partitions can fail with NotFound
+/// until the survivor reopens. ClusterClient's lazy region refresh on
+/// routing-miss handles this transparently.
+#[test]
+#[ignore]
+fn split_merge_split_with_concurrent_writes() {
+    use autumn_client::ClusterClient;
+
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
+    let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 100).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 13001, log, row, meta, b"a", b"z").await;
+
+        let ps_addr = pick_addr();
+        start_partition_server(100, mgr_addr, ps_addr);
+        compio::time::sleep(Duration::from_millis(2000)).await;
+        let _ps = RpcClient::connect(ps_addr).await.unwrap();
+        let router = PsRouter::new(mgr_addr, ps_addr);
+
+        // Pre-seed enough keys so split's unique_user_keys finds a clean mid_key.
+        for i in 0u8..20 {
+            psr_put(&router, 13001, format!("k{:03}", i).as_bytes(), b"seed").await;
+        }
+        psr_flush(&router, 13001).await;
+        psr_compact(&router, 13001).await;
+        compio::time::sleep(Duration::from_millis(2500)).await;
+
+        // ── ClusterClient with cached connections + regions ──────────
+        // Connect ONCE, share via Rc with the writer task. Internal
+        // mgr_conn + ps_conns + regions caches handle all routing.
+        let cluster = std::rc::Rc::new(
+            ClusterClient::connect(&mgr_addr.to_string())
+                .await
+                .expect("ClusterClient::connect"),
+        );
+
+        // ── Spawn writer task ────────────────────────────────────────
+        let stop = std::rc::Rc::new(std::cell::Cell::new(false));
+        let acked = std::rc::Rc::new(std::cell::RefCell::new(Vec::<Vec<u8>>::new()));
+        let transient_errors = std::rc::Rc::new(std::cell::Cell::new(0u64));
+
+        let writer = {
+            let stop = stop.clone();
+            let acked = acked.clone();
+            let cluster = cluster.clone();
+            let transient_errors = transient_errors.clone();
+            compio::runtime::spawn(async move {
+                let mut counter: u64 = 1000;
+                while !stop.get() {
+                    counter += 1;
+                    // Round-robin across the keyspace ('b-...' < 'm', 'n-...' >= 'm')
+                    // so writes hit both halves of any post-split topology.
+                    let prefix = if counter % 2 == 0 { "b" } else { "n" };
+                    let key = format!("{prefix}-{counter:06}").into_bytes();
+                    match cluster.put(&key, b"v").await {
+                        Ok(()) => acked.borrow_mut().push(key),
+                        Err(_) => {
+                            transient_errors.set(transient_errors.get() + 1);
+                            // Refresh routing on miss (region sync reload, etc.)
+                            let _ = cluster.refresh_regions().await;
+                            compio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                    compio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+        };
+
+        // ── Foreground topology operations ───────────────────────────
+        compio::time::sleep(Duration::from_secs(2)).await;
+
+        // SPLIT #1
+        let r = router.client_for(13001).await
+            .call(
+                partition_rpc::MSG_SPLIT_PART,
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 13001 }),
+            )
+            .await.expect("split #1");
+        let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&r).unwrap();
+        assert_eq!(sr.code, partition_rpc::CODE_OK, "split #1: {}", sr.message);
+
+        let _ = poll_until_async(
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+            || async {
+                let r = get_regions(&mgr).await;
+                r.regions.len() == 2 && r.part_addrs.len() == 2
+            },
+        ).await;
+        let regions = get_regions(&mgr).await;
+        let mut s1 = 0u64; let mut v1 = 0u64;
+        for (pid, r) in &regions.regions {
+            if let Some(rg) = &r.rg {
+                if rg.start_key == b"a".to_vec() { s1 = *pid; } else { v1 = *pid; }
+            }
+        }
+
+        // Let writer continue against the new 2-partition topology.
+        compio::time::sleep(Duration::from_secs(2)).await;
+
+        // Compact both children to clear post-split has_overlap.
+        psr_compact(&router, s1).await;
+        psr_compact(&router, v1).await;
+        compio::time::sleep(Duration::from_millis(3000)).await;
+
+        // MERGE
+        let resp = merge_partitions(&mgr, &router, s1, v1).await;
+        assert_eq!(resp.code, CODE_OK, "merge: {}", resp.message);
+        compio::time::sleep(Duration::from_millis(3000)).await;
+        assert_eq!(get_regions(&mgr).await.regions.len(), 1, "after merge");
+
+        // Let writer continue against the merged topology — writes during
+        // the region_sync reload window will hit transient NotFound and
+        // self-recover via cluster.refresh_regions() in the writer's
+        // error branch.
+        compio::time::sleep(Duration::from_secs(2)).await;
+
+        // Compact survivor to clear post-merge has_overlap.
+        psr_compact(&router, s1).await;
+        compio::time::sleep(Duration::from_millis(3000)).await;
+
+        // SPLIT #2 on the merged partition.
+        let r = router.client_for(s1).await
+            .call(
+                partition_rpc::MSG_SPLIT_PART,
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: s1 }),
+            )
+            .await.expect("split #2");
+        let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&r).unwrap();
+        assert_eq!(sr.code, partition_rpc::CODE_OK, "split #2: {}", sr.message);
+        let _ = poll_until_async(
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+            || async { get_regions(&mgr).await.regions.len() == 2 },
+        ).await;
+
+        compio::time::sleep(Duration::from_secs(1)).await;
+
+        // ── Stop writer, verify all acked keys readable ──────────────
+        stop.set(true);
+        writer.await;
+        let final_acked = acked.borrow().clone();
+        let n = final_acked.len();
+        assert!(n >= 20, "writer should have acked many keys, got {n}");
+
+        // Refresh regions for the verifier; ClusterClient.get auto-routes.
+        let _ = cluster.refresh_regions().await;
+
+        let mut missing: Vec<Vec<u8>> = Vec::new();
+        for key in &final_acked {
+            match cluster.get(key).await {
+                Ok(Some(v)) if v == b"v".to_vec() => {}
+                _ => missing.push(key.clone()),
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{} acked keys missing after full split-merge-split lifecycle (sample: {:?}); \
+             writer hit {} transient routing-miss errors during topology changes (expected non-zero)",
+            missing.len(),
+            missing.iter().take(5).map(|k| String::from_utf8_lossy(k).to_string()).collect::<Vec<_>>(),
+            transient_errors.get(),
+        );
+
+        eprintln!(
+            "F184 concurrent writer: {} acked, {} transient errors gracefully retried",
+            n, transient_errors.get()
+        );
+    });
+}
+
 /// F184 stress: split → put → merge → put → split with batches of writes
 /// interleaved between topology ops. Verifies all written keys remain
 /// readable across the full lifecycle.
