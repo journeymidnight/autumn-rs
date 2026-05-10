@@ -652,9 +652,26 @@ pub(crate) async fn finish_write_batch(
             idx += 1;
 
             let mem_entry = if entry.value.len() > VALUE_THROTTLE {
+                // V1 record layout (post-F165 default-on):
+                //   [V1_SENTINEL:1][payload_len:4][op:1][key_len:4]
+                //   [val_len:4][expires_at:8][key bytes][value bytes][crc:4]
+                //
+                // Value starts at record_offset + 1 + 4 + 17 + key.len()
+                //                                        ^^^^^^ V0 inner header
+                //                                  ^^ V1 envelope (sentinel+length)
+                //                                = 22 + key.len()
+                //
+                // Pre-fix this used `+ 17 +` which was the V0-layout calc;
+                // the V1 envelope's 5-byte sentinel+length prefix makes the
+                // VP offset point 5 bytes EARLIER than the value bytes,
+                // returning the last 5 bytes of internal_key (inverted-seq)
+                // followed by (val_len - 5) bytes of value. Latent since
+                // F165 flipped V1 default-on; surfaced by F186's putstream
+                // tests because they were the first to verify > VALUE_THROTTLE
+                // value content end-to-end with V1 records.
                 let vp = ValuePointer {
                     extent_id: extent_id_for_vp,
-                    offset: record_offset + 17 + entry.internal_key.len() as u32,
+                    offset: record_offset + 22 + entry.internal_key.len() as u32,
                     len: entry.value.len() as u32,
                 };
                 MemEntry {
@@ -1390,9 +1407,12 @@ async fn flush_gc_batch(
     let mut cur_offset = result.offset;
     let mut insert_items: Vec<(Vec<u8>, MemEntry, u64)> = Vec::with_capacity(n);
     for r in pending {
+        // F186 fix: V1 envelope adds 5 bytes (sentinel+length) before the
+        // V0 inner header, so value bytes start at +22 not +17. See
+        // `finish_write_batch` for the full layout discussion.
         let new_vp = ValuePointer {
             extent_id: result.extent_id,
-            offset: cur_offset + 17 + r.internal_key.len() as u32,
+            offset: cur_offset + 22 + r.internal_key.len() as u32,
             len: r.value_len,
         };
         let mem_entry = MemEntry {

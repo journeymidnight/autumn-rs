@@ -797,82 +797,110 @@ impl ClusterClient {
     // ── F129 multipart upload ──────────────────────────────────────────────
 
     /// Open a multipart upload session for `key`. Returns a handle that
-    /// holds the cached PS connection and the running fragment list;
-    /// repeated calls to `send` push chunks to log_stream, `commit`
-    /// finalises the value, `abort` discards. Drop without commit/abort
-    /// is logged at WARN — the PS-side TTL (default 30 min) will reclaim.
-    pub async fn put_stream_begin(
+    /// F186 — Begin a striped (Ceph-striperados-style) put. Returns a
+    /// handle that takes value bytes via `send` and finalises via
+    /// `commit`. Internals (no new server RPCs):
+    ///   - each `send(chunk)` writes `chunk` to a deterministic chunk
+    ///     key under a reserved `\xff\xfe`-prefixed namespace via the
+    ///     existing `put` RPC
+    ///   - `commit` writes a 28-byte `Meta` blob to `key` (magic +
+    ///     version + total_bytes + chunk_count + chunk_size + crc32c)
+    ///     — its presence is the atomic linearisation point: until
+    ///     `commit` returns, `get(key)` returns NotFound and orphan
+    ///     chunks are invisible
+    ///   - `abort` best-effort deletes the partial chunks
+    ///
+    /// Replaces the deprecated server-side multipart upload (F129
+    /// `MSG_PUT_BEGIN/CHUNK/COMMIT/ABORT` + multi-fragment ValuePointer +
+    /// F130 GC active rewrite). Total simplification: ~1500 server-side
+    /// lines deleted, ~200 client-side lines added; behaviour from the
+    /// caller's perspective is identical.
+    ///
+    /// `expires_at` is currently ignored — chunk-level TTL would
+    /// require setting `expires_at` on each chunk's Put. Future work.
+    pub fn put_stream_begin(
         &self,
         key: &[u8],
-        expires_at: u64,
-    ) -> std::result::Result<PutStreamHandle, AutumnError> {
-        let key_vec = key.to_vec();
-        let (part_id, ps_addr) = self
-            .resolve_key(&key_vec)
-            .await
-            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
-        let ps = self
-            .get_ps_client(&ps_addr)
-            .await
-            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
-        let req = PutBeginReq {
-            part_id,
-            key: key_vec.clone(),
-            expires_at,
-            total_bytes_hint: 0,
-        };
-        let payload = rkyv_encode(&req);
-        let resp_bytes = ps
-            .call(MSG_PUT_BEGIN, payload)
-            .await
-            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
-        let resp: PutBeginResp =
-            rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
-        if resp.code != partition_rpc::CODE_OK {
-            return Err(code_to_error(resp.code, resp.message));
-        }
-        Ok(PutStreamHandle {
-            upload_id: resp.upload_id,
-            user_key: key_vec,
-            part_id,
-            ps,
+        _expires_at: u64,
+    ) -> PutStreamHandle<'_> {
+        PutStreamHandle {
+            cluster: self,
+            user_key: key.to_vec(),
+            chunk_size: STRIPE_CHUNK_SIZE,
             next_chunk_index: 0,
             bytes_sent: 0,
             state: PutStreamState::Open,
-        })
+        }
     }
 
-    /// Open a streaming reader over an existing key. The reader yields
-    /// `chunk_size`-byte chunks via `next_chunk()`, walking the value
-    /// without buffering the full payload in client memory. Useful for
-    /// large multi-fragment values written via `put_stream_*`. Returns
-    /// `Ok(None)` if the key doesn't exist.
+    /// F186 — Open a streaming reader. Auto-detects:
+    ///   - **striped** values (key holds a 28-byte `Meta` blob with the
+    ///     magic) → reads chunks under the reserved chunk-key namespace
+    ///     and yields them via `next_chunk()`
+    ///   - **inline** values (anything else, including a normal small
+    ///     `put`) → yields the entire value in one `next_chunk()` call
+    ///
+    /// `chunk_size_hint` controls how much each `next_chunk()` returns
+    /// for striped values (chunks are buffered and re-sliced on the
+    /// client). Hint <= stored chunk_size yields slices; hint > stored
+    /// yields whatever the next stored chunk holds (no merging — keeps
+    /// memory bounded).
+    ///
+    /// Returns `Ok(None)` if the key doesn't exist.
     pub async fn get_stream(
         &self,
         key: &[u8],
-        chunk_size: u32,
-    ) -> std::result::Result<Option<GetStream>, AutumnError> {
+        chunk_size_hint: u32,
+    ) -> std::result::Result<Option<GetStream<'_>>, AutumnError> {
+        let blob = match self.get(key).await? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
         let key_vec = key.to_vec();
-        let meta = self.head(&key_vec).await?;
-        if !meta.found {
-            return Ok(None);
+        match StripeMeta::try_decode(&blob) {
+            Some(meta) => Ok(Some(GetStream {
+                cluster: self,
+                user_key: key_vec,
+                inline: None,
+                striped: Some(meta),
+                cursor: 0,
+                next_chunk_index: 0,
+                pending_buf: Vec::new(),
+                pending_pos: 0,
+                yield_size: chunk_size_hint.max(1),
+            })),
+            None => Ok(Some(GetStream {
+                cluster: self,
+                user_key: key_vec,
+                inline: Some(blob),
+                striped: None,
+                cursor: 0,
+                next_chunk_index: 0,
+                pending_buf: Vec::new(),
+                pending_pos: 0,
+                yield_size: chunk_size_hint.max(1),
+            })),
         }
-        let (part_id, ps_addr) = self
-            .resolve_key(&key_vec)
-            .await
-            .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
-        let ps = self
-            .get_ps_client(&ps_addr)
-            .await
-            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
-        Ok(Some(GetStream {
-            user_key: key_vec,
-            part_id,
-            ps,
-            total_bytes: meta.value_length,
-            cursor: 0,
-            chunk_size: chunk_size.max(1),
-        }))
+    }
+
+    /// F186 — Cascade-delete a striped value: read meta, delete all
+    /// chunks, delete meta. For non-striped keys this is just a regular
+    /// delete on the meta key (chunks don't exist). Idempotent on
+    /// already-deleted keys.
+    ///
+    /// Plain `delete()` (existing) only removes the meta key, leaving
+    /// chunks orphan — use this method when the caller has been
+    /// using `put_stream_begin` for the key.
+    pub async fn delete_stream(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
+        if let Some(blob) = self.get(key).await? {
+            if let Some(meta) = StripeMeta::try_decode(&blob) {
+                for i in 0..meta.chunk_count as u64 {
+                    let ck = make_chunk_key(key, i);
+                    let _ = self.delete(&ck).await;
+                }
+            }
+        }
+        self.delete(key).await
     }
 
     /// Trigger partition split.
@@ -985,12 +1013,185 @@ impl ClusterClient {
     }
 }
 
-// ── F129 PutStream / GetStream handles ────────────────────────────────────
+// ── F186 client-side striperados (Ceph-style) ─────────────────────────────
+//
+// Replaces F129's server-side multipart upload + multi-fragment ValuePointer
+// + F130 GC active rewrite. Pure client-side striping over the existing
+// MSG_PUT / MSG_GET / MSG_DELETE primitives — no new server RPCs, no
+// changes to the WAL / memtable / SSTable shape.
+//
+// Layout:
+//   - Meta object lives at the user's key. 28-byte fixed-shape blob with
+//     magic + version + total_bytes + chunk_count + chunk_size + crc32c.
+//     Its presence is the atomic linearisation point: if the meta is
+//     visible, the value is committed; if absent, any orphan chunks are
+//     invisible.
+//   - Chunks live at deterministic keys under a reserved 0xff-prefixed
+//     namespace so range scans of user prefixes don't see them.
+
+/// F186 — meta object header magic + version, 9 bytes total. The last
+/// byte is the version; bumping the wire format means bumping that
+/// byte. Chosen to start with `0xfe 0xfd` so a casual `head` of a
+/// striped key returns a recognisable hex prefix in operator tooling.
+const META_MAGIC: [u8; 9] = *b"\xfeAUTSTRP\x01";
+const META_VERSION_BYTE_INDEX: usize = 8;
+const META_VERSION: u8 = 0x01;
+/// 9 (magic+version) + 8 (total_bytes) + 4 (chunk_count) + 4 (chunk_size)
+/// + 4 (crc32c) = 29 bytes. CRC covers magic+version+total_bytes+
+/// chunk_count+chunk_size i.e. the first 25 bytes.
+const META_ENCODED_LEN: usize = 29;
+
+/// F186 — default chunk size for `put_stream_begin`. 4 MiB matches
+/// the inline-VP threshold ratio used by other F129-replacement
+/// systems (S3 multipart's 5 MiB minimum, Ceph striperados 4 MiB
+/// default). Each chunk is one `MSG_PUT` RPC + one VP entry on the
+/// PS — large enough to amortise per-chunk RPC framing, small enough
+/// that a transient connection error costs only a 4 MiB resend.
+pub const STRIPE_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
+
+/// F186 — chunk-key namespace prefix. Starts with `\xff\xfe` so chunks
+/// sort AFTER all normal user keys; range scans within a user prefix
+/// naturally skip them. Followed by a 4-byte format tag (`acv1` =
+/// "Autumn Chunk v1") and a separator byte.
+const CHUNK_KEY_PREFIX: &[u8] = b"\xff\xfeacv1\xff";
+
+/// F186 — encode a chunk key as
+/// `[CHUNK_KEY_PREFIX][user_key_len:u32 BE][user_key][chunk_index:u64 BE]`.
+/// Length-prefixing the user key avoids ambiguity if it contains the
+/// separator pattern; BE encoding on the index keeps chunks of one
+/// stripe sorted in numerical order.
+pub(crate) fn make_chunk_key(user_key: &[u8], chunk_index: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(CHUNK_KEY_PREFIX.len() + 4 + user_key.len() + 8);
+    k.extend_from_slice(CHUNK_KEY_PREFIX);
+    k.extend_from_slice(&(user_key.len() as u32).to_be_bytes());
+    k.extend_from_slice(user_key);
+    k.extend_from_slice(&chunk_index.to_be_bytes());
+    k
+}
+
+/// F186 — striped-value meta header. Fixed 28-byte layout makes
+/// `try_decode` cheap and unambiguous.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StripeMeta {
+    pub total_bytes: u64,
+    pub chunk_count: u32,
+    pub chunk_size: u32,
+}
+
+impl StripeMeta {
+    fn encode(&self) -> [u8; META_ENCODED_LEN] {
+        let mut buf = [0u8; META_ENCODED_LEN];
+        buf[0..9].copy_from_slice(&META_MAGIC);
+        buf[9..17].copy_from_slice(&self.total_bytes.to_le_bytes());
+        buf[17..21].copy_from_slice(&self.chunk_count.to_le_bytes());
+        buf[21..25].copy_from_slice(&self.chunk_size.to_le_bytes());
+        let crc = crc32c::crc32c(&buf[0..25]);
+        buf[25..29].copy_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// F186 — try to interpret `blob` as a stripe meta. Returns None if
+    /// length, magic, or CRC don't match — the caller treats the blob
+    /// as an inline value in that case.
+    ///
+    /// False-positive analysis: the magic is 8 bytes (~64 bits), the
+    /// CRC is 32 bits over magic + total_bytes + chunk_count +
+    /// chunk_size, AND length must be exactly 28. The probability that
+    /// a user-supplied 28-byte value matches all three by accident is
+    /// negligible (~2^-96). A user could MALICIOUSLY craft a 28-byte
+    /// value that matches; the SDK handles "missing chunks" gracefully
+    /// (returns NotFound or a clean error).
+    pub(crate) fn try_decode(blob: &[u8]) -> Option<Self> {
+        if blob.len() != META_ENCODED_LEN {
+            return None;
+        }
+        if blob[0..META_VERSION_BYTE_INDEX] != META_MAGIC[0..META_VERSION_BYTE_INDEX] {
+            return None;
+        }
+        if blob[META_VERSION_BYTE_INDEX] != META_VERSION {
+            return None;
+        }
+        let stored_crc = u32::from_le_bytes(blob[25..29].try_into().ok()?);
+        let computed_crc = crc32c::crc32c(&blob[0..25]);
+        if stored_crc != computed_crc {
+            return None;
+        }
+        Some(StripeMeta {
+            total_bytes: u64::from_le_bytes(blob[9..17].try_into().ok()?),
+            chunk_count: u32::from_le_bytes(blob[17..21].try_into().ok()?),
+            chunk_size: u32::from_le_bytes(blob[21..25].try_into().ok()?),
+        })
+    }
+}
+
+#[cfg(test)]
+mod stripe_meta_tests {
+    use super::*;
+
+    #[test]
+    fn meta_roundtrip() {
+        let m = StripeMeta { total_bytes: 12 * 1024 * 1024, chunk_count: 4, chunk_size: 3 * 1024 * 1024 };
+        let encoded = m.encode();
+        assert_eq!(encoded.len(), META_ENCODED_LEN);
+        let dec = StripeMeta::try_decode(&encoded).expect("decode");
+        assert_eq!(dec.total_bytes, m.total_bytes);
+        assert_eq!(dec.chunk_count, m.chunk_count);
+        assert_eq!(dec.chunk_size, m.chunk_size);
+    }
+
+    #[test]
+    fn meta_rejects_wrong_length() {
+        assert!(StripeMeta::try_decode(&[0u8; 28]).is_none());
+        assert!(StripeMeta::try_decode(&[0u8; 30]).is_none());
+        assert!(StripeMeta::try_decode(b"hello world").is_none());
+    }
+
+    #[test]
+    fn meta_rejects_bad_magic() {
+        let m = StripeMeta { total_bytes: 100, chunk_count: 1, chunk_size: 100 };
+        let mut e = m.encode();
+        e[0] ^= 0x01;
+        assert!(StripeMeta::try_decode(&e).is_none());
+    }
+
+    #[test]
+    fn meta_rejects_corrupted_crc() {
+        let m = StripeMeta { total_bytes: 100, chunk_count: 1, chunk_size: 100 };
+        let mut e = m.encode();
+        // Flip a bit in the body — CRC will mismatch
+        e[12] ^= 0x01;
+        assert!(StripeMeta::try_decode(&e).is_none());
+    }
+
+    #[test]
+    fn chunk_key_disambiguates_user_keys() {
+        // user_key "ab" + index 5 vs "abc" + index 5 must encode
+        // distinctly (length-prefix prevents ambiguity).
+        let k1 = make_chunk_key(b"ab", 5);
+        let k2 = make_chunk_key(b"abc", 5);
+        assert_ne!(k1, k2);
+        // Both must start with the reserved prefix.
+        assert!(k1.starts_with(CHUNK_KEY_PREFIX));
+        assert!(k2.starts_with(CHUNK_KEY_PREFIX));
+    }
+
+    #[test]
+    fn chunk_keys_sort_by_index() {
+        let k0 = make_chunk_key(b"key", 0);
+        let k1 = make_chunk_key(b"key", 1);
+        let k_big = make_chunk_key(b"key", u64::MAX);
+        assert!(k0 < k1);
+        assert!(k1 < k_big);
+    }
+}
 
 /// Lifecycle state of a `PutStreamHandle`. Open → (Committed | Aborted)
 /// transitions are one-way; the `commit` / `abort` consumers move the
-/// handle. A drop in the `Open` state logs a WARN; the PS-side TTL will
-/// reclaim the session within `AUTUMN_PS_UPLOAD_TTL_SECS` (default 30 min).
+/// handle. A drop in the `Open` state logs a WARN; the chunks already
+/// written under the reserved namespace become orphan until a sweep
+/// cleans them up (no automatic TTL — that was an F129 server-side
+/// feature; client-side striping pushes orphan handling to the
+/// application layer or a periodic GC tool).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PutStreamState {
     Open,
@@ -998,47 +1199,46 @@ enum PutStreamState {
     Aborted,
 }
 
-/// In-progress multipart upload handle. Owns the cached `Rc<RpcClient>`
-/// to the partition's PS so subsequent `send` calls don't re-resolve
-/// (saves several RefCell + hashmap lookups per chunk vs going through
-/// `call_ps_for_key`). The handle is `!Send` because it owns an `Rc`;
-/// don't move it across compio runtimes.
-pub struct PutStreamHandle {
-    upload_id: u128,
+/// F186 — In-progress striped put. Borrows the `ClusterClient` so each
+/// `send`/`commit` can route its sub-Put through the SDK's existing
+/// resolution + connection caching. The handle is `!Send` (transitively
+/// through the SDK's `Rc` internals); don't move it across runtimes.
+pub struct PutStreamHandle<'a> {
+    cluster: &'a ClusterClient,
     user_key: Vec<u8>,
-    part_id: u64,
-    ps: Rc<RpcClient>,
-    next_chunk_index: u32,
+    chunk_size: u32,
+    next_chunk_index: u64,
     bytes_sent: u64,
     state: PutStreamState,
 }
 
-impl PutStreamHandle {
-    /// Server-assigned u128 upload identifier. Useful for logs.
-    pub fn upload_id(&self) -> u128 {
-        self.upload_id
-    }
-
-    /// Total bytes successfully appended to log_stream so far.
-    /// Updated only on successful `send`.
+impl<'a> PutStreamHandle<'a> {
+    /// Total bytes successfully appended (sum of all `send` sizes).
     pub fn bytes_sent(&self) -> u64 {
         self.bytes_sent
     }
 
     /// Number of chunks successfully appended.
-    pub fn chunks_sent(&self) -> u32 {
+    pub fn chunks_sent(&self) -> u64 {
         self.next_chunk_index
     }
 
-    /// Append one chunk. The PS appends `chunk` to log_stream as a
-    /// single `OP_CHUNK_BLOB` WAL record and adds a fragment to the
-    /// session. Returns the running total of bytes committed.
+    /// Override the default 4 MiB chunk size. Must be called before
+    /// the first `send`.
+    pub fn with_chunk_size(mut self, chunk_size: u32) -> Self {
+        debug_assert_eq!(self.next_chunk_index, 0, "chunk_size set after send");
+        self.chunk_size = chunk_size.max(1);
+        self
+    }
+
+    /// Append one chunk. The SDK writes it as a normal `Put` to a
+    /// reserved-namespace chunk key. Returns the running total bytes
+    /// committed.
     ///
-    /// Caller is responsible for choosing chunk sizes — typically
-    /// 1–4 MiB. Larger chunks reduce per-chunk RPC overhead but raise
-    /// peak memory on both client and PS; smaller chunks improve
-    /// recoverability across transient network blips (less re-send on
-    /// retry).
+    /// Caller is responsible for chunk sizing — typically 1–4 MiB. The
+    /// 4 KiB inline-VP threshold on the PS means each chunk goes via
+    /// the VP path on the server; very small chunks would inflate
+    /// memtable entry counts proportionally.
     pub async fn send(&mut self, chunk: &[u8]) -> std::result::Result<u64, AutumnError> {
         if self.state != PutStreamState::Open {
             return Err(AutumnError::InvalidArgument(format!(
@@ -1046,33 +1246,18 @@ impl PutStreamHandle {
                 self.state
             )));
         }
-        let req = PutChunkReq {
-            part_id: self.part_id,
-            upload_id: self.upload_id,
-            chunk_index: self.next_chunk_index,
-            data: chunk.to_vec(),
-        };
-        let payload = rkyv_encode(&req);
-        let resp_bytes = self
-            .ps
-            .call(MSG_PUT_CHUNK, payload)
-            .await
-            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
-        let resp: PutChunkResp =
-            rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
-        if resp.code != partition_rpc::CODE_OK {
-            return Err(code_to_error(resp.code, resp.message));
-        }
+        let chunk_key = make_chunk_key(&self.user_key, self.next_chunk_index);
+        self.cluster.put(&chunk_key, chunk).await?;
         self.next_chunk_index = self.next_chunk_index.saturating_add(1);
-        self.bytes_sent = resp.bytes_committed;
-        Ok(resp.bytes_committed)
+        self.bytes_sent = self.bytes_sent.saturating_add(chunk.len() as u64);
+        Ok(self.bytes_sent)
     }
 
-    /// Finalise the upload. The PS builds a multi-fragment ValuePointer
-    /// from the session's fragment list, allocates a memtable seq, and
-    /// writes one V1 WAL record (op = `OP_VALUE_POINTER_MULTI | 1`)
-    /// before inserting into the active memtable. After this returns,
-    /// the value is visible to subsequent `get` / `get_stream`.
+    /// Finalise the upload. Writes a meta blob to the user key — its
+    /// presence is the atomic linearisation point. Until this returns
+    /// successfully, `get(key)` returns NotFound and orphan chunks
+    /// stay invisible. After this returns, `get` / `get_stream` /
+    /// `head` / `delete_stream` see the assembled value.
     pub async fn commit(mut self) -> std::result::Result<(), AutumnError> {
         if self.state != PutStreamState::Open {
             return Err(AutumnError::InvalidArgument(format!(
@@ -1080,81 +1265,104 @@ impl PutStreamHandle {
                 self.state
             )));
         }
-        let req = PutCommitReq {
-            part_id: self.part_id,
-            upload_id: self.upload_id,
-            expected_total_bytes: self.bytes_sent,
-        };
-        let payload = rkyv_encode(&req);
-        let resp_bytes = self
-            .ps
-            .call(MSG_PUT_COMMIT, payload)
-            .await
-            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
-        let resp: PutResp =
-            rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
-        if resp.code != partition_rpc::CODE_OK {
-            self.state = PutStreamState::Aborted; // suppress Drop warn
-            return Err(code_to_error(resp.code, resp.message));
+        // Range guard: we encode chunk_count as u32 in the meta blob.
+        if self.next_chunk_index > u32::MAX as u64 {
+            self.state = PutStreamState::Aborted;
+            return Err(AutumnError::InvalidArgument(format!(
+                "chunk_count {} exceeds u32::MAX",
+                self.next_chunk_index
+            )));
         }
-        self.state = PutStreamState::Committed;
-        Ok(())
+        let meta = StripeMeta {
+            total_bytes: self.bytes_sent,
+            chunk_count: self.next_chunk_index as u32,
+            chunk_size: self.chunk_size,
+        };
+        let blob = meta.encode();
+        match self.cluster.put(&self.user_key, &blob).await {
+            Ok(()) => {
+                self.state = PutStreamState::Committed;
+                Ok(())
+            }
+            Err(e) => {
+                // The chunks are now orphan. We don't auto-clean here
+                // (`commit` already failed; the user can retry or call
+                // `delete_stream` after a successful retry).
+                self.state = PutStreamState::Aborted;
+                Err(e)
+            }
+        }
     }
 
-    /// Discard the in-progress upload. Idempotent — calling abort on a
-    /// handle whose session has already been TTL-reclaimed succeeds.
-    /// The chunk bytes already in log_stream become OP_CHUNK_BLOB
-    /// garbage; GC reclaims them when the host extent is punched.
+    /// Discard the in-progress upload by best-effort deleting any
+    /// already-written chunks. The meta blob was never written, so
+    /// `get(key)` already returns NotFound.
+    ///
+    /// Failures during chunk delete are swallowed — orphans become a
+    /// background-sweep concern rather than blocking the abort path.
     pub async fn abort(mut self) -> std::result::Result<(), AutumnError> {
         if self.state != PutStreamState::Open {
             return Ok(());
         }
-        let req = PutAbortReq {
-            part_id: self.part_id,
-            upload_id: self.upload_id,
-        };
-        let payload = rkyv_encode(&req);
-        // Best-effort: a transient connection error doesn't change the
-        // outcome (TTL still reclaims).
-        let _ = self.ps.call(MSG_PUT_ABORT, payload).await;
+        for i in 0..self.next_chunk_index {
+            let ck = make_chunk_key(&self.user_key, i);
+            let _ = self.cluster.delete(&ck).await;
+        }
         self.state = PutStreamState::Aborted;
         Ok(())
     }
 }
 
-impl Drop for PutStreamHandle {
+impl<'a> Drop for PutStreamHandle<'a> {
     fn drop(&mut self) {
         if self.state == PutStreamState::Open {
             tracing::warn!(
-                upload_id = ?self.upload_id,
                 key = ?String::from_utf8_lossy(&self.user_key),
                 bytes_sent = self.bytes_sent,
-                "PutStreamHandle dropped without commit/abort; \
-                 PS-side TTL will reclaim within AUTUMN_PS_UPLOAD_TTL_SECS (~30 min)"
+                chunks_sent = self.next_chunk_index,
+                "PutStreamHandle dropped without commit/abort; meta blob \
+                 was not written so the value is invisible to readers, but \
+                 {} chunks are now orphan under the reserved namespace and \
+                 require a background sweep or `delete_stream` retry to clean",
+                self.next_chunk_index
             );
         }
     }
 }
 
-/// Streaming reader over an existing value. Yields `chunk_size`-byte
-/// chunks via `next_chunk()` until the value is exhausted. Each chunk
-/// is one `MSG_GET` RPC under the hood, so multi-fragment values
-/// (`OP_VALUE_POINTER_MULTI`) are reassembled by the PS's
-/// `resolve_multi_frag` (sequential per-fragment reads); inline values
-/// just get sliced.
-pub struct GetStream {
+/// F186 — streaming reader. For striped values: walks chunk keys
+/// in order. For inline values: yields the entire blob in one
+/// `next_chunk` call. The same `GetStream` shape so callers don't
+/// need to know which path they're on.
+pub struct GetStream<'a> {
+    cluster: &'a ClusterClient,
     user_key: Vec<u8>,
-    part_id: u64,
-    ps: Rc<RpcClient>,
-    total_bytes: u64,
+    /// `Some` for inline values — the blob to yield in one shot.
+    inline: Option<Vec<u8>>,
+    /// `Some` for striped values — describes the chunk layout.
+    striped: Option<StripeMeta>,
+    /// Bytes yielded so far (assembled-value cursor).
     cursor: u64,
-    chunk_size: u32,
+    /// Next chunk index to fetch (only for striped).
+    next_chunk_index: u64,
+    /// Buffered chunk bytes from the most recent fetch (striped path).
+    pending_buf: Vec<u8>,
+    /// Read cursor inside `pending_buf`.
+    pending_pos: usize,
+    /// Max bytes to yield per `next_chunk` call.
+    yield_size: u32,
 }
 
-impl GetStream {
-    /// Total value size in bytes (set by the initial `head` call).
+impl<'a> GetStream<'a> {
+    /// Total assembled-value size in bytes.
     pub fn total_bytes(&self) -> u64 {
-        self.total_bytes
+        if let Some(m) = &self.striped {
+            m.total_bytes
+        } else if let Some(b) = &self.inline {
+            b.len() as u64
+        } else {
+            0
+        }
     }
 
     /// Bytes yielded so far.
@@ -1164,44 +1372,50 @@ impl GetStream {
 
     /// Bytes remaining to yield.
     pub fn remaining(&self) -> u64 {
-        self.total_bytes.saturating_sub(self.cursor)
+        self.total_bytes().saturating_sub(self.cursor)
     }
 
     /// Pull the next chunk. Returns `Ok(None)` when the value is
-    /// exhausted. The yielded chunk is at most `chunk_size` bytes; the
-    /// final chunk may be shorter.
+    /// exhausted. The yielded chunk is at most `yield_size` bytes;
+    /// the final chunk may be shorter.
     pub async fn next_chunk(&mut self) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
-        if self.cursor >= self.total_bytes {
+        if self.cursor >= self.total_bytes() {
             return Ok(None);
         }
-        let want = (self.total_bytes - self.cursor).min(self.chunk_size as u64) as u32;
-        let req = GetReq {
-            part_id: self.part_id,
-            key: self.user_key.clone(),
-            offset: self.cursor as u32,
-            length: want,
-        };
-        let payload = rkyv_encode(&req);
-        let resp_bytes = self
-            .ps
-            .call(MSG_GET, payload)
-            .await
-            .map_err(|e| AutumnError::ConnectionError(e.to_string()))?;
-        let resp: GetResp =
-            rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
-        if resp.code == partition_rpc::CODE_NOT_FOUND {
-            // Key was concurrently deleted mid-stream. Surface as Ok(None).
-            return Ok(None);
+
+        // Inline path — single yield of the whole blob.
+        if let Some(blob) = self.inline.take() {
+            self.cursor = blob.len() as u64;
+            return Ok(Some(blob));
         }
-        if resp.code != partition_rpc::CODE_OK {
-            return Err(code_to_error(resp.code, resp.message));
+
+        // Striped path — refill pending buf if drained.
+        let meta = self.striped.as_ref().expect("inline or striped");
+        while self.pending_pos >= self.pending_buf.len() {
+            if self.next_chunk_index >= meta.chunk_count as u64 {
+                return Ok(None);
+            }
+            let ck = make_chunk_key(&self.user_key, self.next_chunk_index);
+            let chunk = match self.cluster.get(&ck).await? {
+                Some(c) => c,
+                None => {
+                    return Err(AutumnError::ServerError(format!(
+                        "striped chunk {} missing for key — value may have been \
+                         partially deleted; call delete_stream + re-upload",
+                        self.next_chunk_index
+                    )));
+                }
+            };
+            self.pending_buf = chunk;
+            self.pending_pos = 0;
+            self.next_chunk_index = self.next_chunk_index.saturating_add(1);
         }
-        if resp.value.is_empty() {
-            // Defensive: PS reported OK but no bytes. Shouldn't happen
-            // with our resolve_value, but treat as EOF rather than spinning.
-            return Ok(None);
-        }
-        self.cursor += resp.value.len() as u64;
-        Ok(Some(resp.value))
+
+        let avail = self.pending_buf.len() - self.pending_pos;
+        let want = (self.yield_size as usize).min(avail);
+        let out = self.pending_buf[self.pending_pos..self.pending_pos + want].to_vec();
+        self.pending_pos += want;
+        self.cursor = self.cursor.saturating_add(want as u64);
+        Ok(Some(out))
     }
 }

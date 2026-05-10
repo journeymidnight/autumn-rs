@@ -1,12 +1,18 @@
-//! F129 — End-to-end multipart upload + streaming read integration tests.
+//! F186 — End-to-end tests for client-side striped put/get (replaces F129
+//! server-side multipart upload + multi-fragment ValuePointer).
 //!
-//! Exercises the full PutBegin / PutChunk / PutCommit / GetStream flow against
-//! a real cluster (manager + 2 extent-nodes + 1 PS). Verifies:
-//!   - large values (>inline cap) round-trip byte-for-byte
-//!   - HEAD returns the assembled total_length for multi-frag VPs
-//!   - regular GET re-assembles a multi-frag VP correctly
-//!   - GetStream's chunked reads concatenate to the original bytes
-//!   - delete then get returns NotFound
+//! The client SDK now implements striping in pure ClusterClient code (Ceph
+//! striperados pattern): each chunk is a normal `Put` to a deterministic
+//! reserved-namespace key, and `commit` writes a 29-byte meta blob to the
+//! user's key. No new server RPCs, no multi-frag VP, no F130 GC rewrite.
+//!
+//! Tests verify:
+//!   - large values round-trip byte-for-byte via put_stream + get_stream
+//!   - commit is atomic (pre-commit get returns NotFound; post-commit
+//!     get returns the meta blob; get_stream returns the assembled value)
+//!   - delete_stream cascades, plain delete only removes the meta
+//!   - abort cleans up partial chunks
+//!   - chunks land outside the user prefix (range scans don't see them)
 
 mod support;
 
@@ -17,9 +23,6 @@ use autumn_rpc::client::RpcClient;
 
 use support::*;
 
-/// Build a deterministic byte pattern of `len` bytes. Each 8-byte LE u64
-/// at offset i*8 holds `i`, so any wrong byte (mis-routing, mis-offset,
-/// short read) is easy to spot in the assertion failure message.
 fn pattern(len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
     let mut i: u64 = 0;
@@ -33,40 +36,52 @@ fn pattern(len: usize) -> Vec<u8> {
     out
 }
 
-/// Happy path: 12 MiB value via 4 chunks of 3 MiB. Verifies HEAD,
-/// inline GET re-assembly, GetStream chunked re-assembly, and delete.
+/// Bring up a small cluster + ClusterClient. Returns it ready to use.
+async fn boot_cluster(
+    mgr_addr: std::net::SocketAddr,
+    n1_addr: std::net::SocketAddr,
+    n2_addr: std::net::SocketAddr,
+    base: u16,
+    part_id: u64,
+) -> ClusterClient {
+    let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+    register_two_nodes(&mgr, n1_addr, n2_addr, base).await;
+    let (log, row, meta) = create_three_streams(&mgr).await;
+    // Full-keyspace partition so the reserved-prefix chunk keys
+    // (\xff\xfe...) routed by the SDK fit within the partition's range.
+    upsert_partition(&mgr, part_id, log, row, meta, b"", b"\xff\xff\xff\xff").await;
+
+    let ps_addr = pick_addr();
+    start_partition_server(base as u64, mgr_addr, ps_addr);
+    compio::time::sleep(Duration::from_millis(1500)).await;
+    let _ = RpcClient::connect(ps_addr).await.unwrap();
+
+    let cluster = ClusterClient::connect(&mgr_addr.to_string())
+        .await
+        .expect("ClusterClient::connect");
+    cluster.set_rpc_timeout(Duration::from_secs(15));
+    cluster
+}
+
 #[test]
 #[ignore]
-fn f129_putstream_roundtrip_12mib() {
+fn f186_putstream_roundtrip_12mib() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
-    let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
-    let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
     let n1_addr = pick_addr();
     let n2_addr = pick_addr();
     start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
-        register_two_nodes(&mgr, n1_addr, n2_addr, 110).await;
-        let (log, row, meta) = create_three_streams(&mgr).await;
-        upsert_partition(&mgr, 11001, log, row, meta, b"a", b"z").await;
+        let cluster = boot_cluster(mgr_addr, n1_addr, n2_addr, 110, 11001).await;
 
-        let ps_addr = pick_addr();
-        start_partition_server(110, mgr_addr, ps_addr);
-        compio::time::sleep(Duration::from_millis(1500)).await;
-        let _ = RpcClient::connect(ps_addr).await.unwrap();
-
-        let cluster = ClusterClient::connect(&mgr_addr.to_string())
-            .await
-            .expect("ClusterClient::connect");
-        cluster.set_rpc_timeout(Duration::from_secs(10));
-
-        // 12 MiB value, sent in 4 chunks of 3 MiB each. The chunk size
-        // (3 MiB) is intentionally NOT a power of two divisor of the
-        // total to exercise unequal fragments in the multi-frag VP.
+        // 12 MiB / 4 chunks of 3 MiB. The 3 MiB chunk size is intentionally
+        // not a clean fraction of the inline cap to exercise unequal final
+        // chunks. Caller would override chunk_size via the handle.
         let total: usize = 12 * 1024 * 1024;
         let chunk_size: usize = 3 * 1024 * 1024;
         let value = pattern(total);
@@ -74,356 +89,189 @@ fn f129_putstream_roundtrip_12mib() {
 
         let mut handle = cluster
             .put_stream_begin(key, 0)
-            .await
-            .expect("put_stream_begin");
-        let mut sent: usize = 0;
-        let mut chunks: u32 = 0;
-        while sent < total {
-            let end = (sent + chunk_size).min(total);
-            handle.send(&value[sent..end]).await.expect("send chunk");
-            sent = end;
-            chunks += 1;
-        }
-        assert_eq!(chunks, 4, "expected 4 chunks for 12 MiB at 3 MiB/chunk");
-        assert_eq!(handle.bytes_sent(), total as u64);
-        handle.commit().await.expect("commit");
+            .with_chunk_size(chunk_size as u32);
 
-        // HEAD — multi-frag VP must report the total assembled length,
-        // not the size of any single fragment or the encoded mfvp blob.
-        let meta = cluster.head(key).await.expect("head");
-        assert!(meta.found, "head: key not found post-commit");
-        assert_eq!(
-            meta.value_length, total as u64,
-            "head value_length should equal assembled total"
+        // Pre-commit: cluster.get(key) must return NotFound (meta not
+        // written yet; orphan chunks are invisible).
+        for i in 0..2 {
+            let end = ((i + 1) * chunk_size).min(total);
+            handle.send(&value[i * chunk_size..end]).await.expect("send");
+        }
+        let pre_commit = cluster.get(key).await.expect("get pre-commit");
+        assert!(
+            pre_commit.is_none(),
+            "pre-commit get must be NotFound; got {} bytes",
+            pre_commit.map(|v| v.len()).unwrap_or(0)
         );
 
-        // Inline GET — exercises resolve_multi_frag's "read whole" path
-        // (offset=0, length=0). Walks all 4 fragments sequentially via
-        // resolve_multi_frag and concatenates server-side.
-        let got_inline = cluster
+        // Finish the upload + commit.
+        for i in 2..4 {
+            let end = ((i + 1) * chunk_size).min(total);
+            handle.send(&value[i * chunk_size..end]).await.expect("send");
+        }
+        assert_eq!(handle.bytes_sent(), total as u64);
+        assert_eq!(handle.chunks_sent(), 4);
+        handle.commit().await.expect("commit");
+
+        // Post-commit: cluster.get(key) returns the 29-byte meta blob
+        // (not the assembled value — that's get_stream's job per the
+        // explicit-namespace contract). Length check is enough.
+        let meta_blob = cluster
             .get(key)
             .await
-            .expect("get")
-            .expect("get returned None for committed key");
-        assert_eq!(got_inline.len(), total, "inline get length mismatch");
-        assert!(got_inline == value, "inline get content mismatch");
+            .expect("get post-commit")
+            .expect("None");
+        assert_eq!(meta_blob.len(), 29, "meta blob is fixed 29 bytes");
+        // Meta starts with the magic byte 0xfe.
+        assert_eq!(meta_blob[0], 0xfe);
 
-        // GetStream — pull in 1 MiB chunks, reassemble client-side.
-        // Exercises sub-range reads across fragment boundaries on the
-        // server (each next_chunk RPC carries offset/length over the
-        // assembled value, which resolve_multi_frag walks fragment-wise).
+        // get_stream auto-detects meta and reassembles via chunk fetches.
         let mut stream = cluster
             .get_stream(key, 1024 * 1024)
             .await
             .expect("get_stream")
-            .expect("get_stream returned None for committed key");
+            .expect("None");
         assert_eq!(stream.total_bytes(), total as u64);
         let mut reassembled: Vec<u8> = Vec::with_capacity(total);
-        while let Some(chunk) = stream.next_chunk().await.expect("next_chunk") {
-            reassembled.extend_from_slice(&chunk);
+        while let Some(c) = stream.next_chunk().await.expect("next_chunk") {
+            reassembled.extend_from_slice(&c);
         }
-        assert_eq!(reassembled.len(), total, "stream get length mismatch");
-        assert!(
-            reassembled == value,
-            "stream get content mismatch — first divergence at {}",
-            reassembled
+        assert_eq!(reassembled.len(), total);
+        if reassembled != value {
+            let pos = reassembled
                 .iter()
                 .zip(value.iter())
                 .position(|(a, b)| a != b)
-                .unwrap_or(0)
-        );
-
-        // Range read across a fragment boundary. The first fragment is
-        // 3 MiB; pick offset=2 MiB length=2 MiB to span the boundary.
-        let mut bound_stream = cluster
-            .get_stream(key, 2 * 1024 * 1024)
-            .await
-            .expect("get_stream cross-frag")
-            .expect("None");
-        // Walk the 12 MiB value in 2 MiB chunks; chunk index 1 starts
-        // at 2 MiB and runs through 4 MiB — that covers the 2 MiB→4 MiB
-        // window which spans the 3 MiB boundary.
-        let mut all: Vec<u8> = Vec::new();
-        while let Some(c) = bound_stream.next_chunk().await.unwrap() {
-            all.extend_from_slice(&c);
+                .unwrap_or(0);
+            let r_slice: Vec<u8> = reassembled[pos..(pos + 16).min(reassembled.len())].to_vec();
+            let v_slice: Vec<u8> = value[pos..(pos + 16).min(value.len())].to_vec();
+            panic!(
+                "stream content mismatch at offset {pos}: reassembled[{pos}..]={:02x?} expected={:02x?}",
+                r_slice, v_slice
+            );
         }
-        assert!(all == value, "cross-fragment chunked read mismatch");
 
-        // Delete — exercises the tombstone path; subsequent get returns
-        // NotFound regardless of multi-frag history.
-        cluster.delete(key).await.expect("delete");
+        // delete_stream cascades — meta + all chunks gone.
+        cluster.delete_stream(key).await.expect("delete_stream");
         let post = cluster.get(key).await.expect("get post-delete");
-        assert!(post.is_none(), "get after delete should be None");
+        assert!(post.is_none(), "delete_stream removed meta");
+        let post_stream = cluster
+            .get_stream(key, 1024)
+            .await
+            .expect("get_stream post-delete");
+        assert!(post_stream.is_none(), "get_stream returns None after delete_stream");
     });
 }
 
-/// Smaller variant — single chunk of 1 MiB. Exercises the n_frags=1
-/// edge case of MultiFragVp (still a multi-frag entry, but the
-/// fragment count happens to be 1; recovery / read-path must NOT
-/// confuse this with the legacy single-VP `OP_VALUE_POINTER` shape
-/// because the op flag distinguishes them).
+/// Single-chunk striped put. Exercises the n_chunks=1 edge case +
+/// verifies the smallest possible striped value survives roundtrip.
 #[test]
 #[ignore]
-fn f129_putstream_single_chunk_1mib() {
+fn f186_putstream_single_chunk_1mib() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
-    let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
-    let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
     let n1_addr = pick_addr();
     let n2_addr = pick_addr();
     start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
-        register_two_nodes(&mgr, n1_addr, n2_addr, 111).await;
-        let (log, row, meta) = create_three_streams(&mgr).await;
-        upsert_partition(&mgr, 11002, log, row, meta, b"a", b"z").await;
-
-        let ps_addr = pick_addr();
-        start_partition_server(111, mgr_addr, ps_addr);
-        compio::time::sleep(Duration::from_millis(1500)).await;
-        let _ = RpcClient::connect(ps_addr).await.unwrap();
-
-        let cluster = ClusterClient::connect(&mgr_addr.to_string())
-            .await
-            .expect("ClusterClient::connect");
-        cluster.set_rpc_timeout(Duration::from_secs(5));
+        let cluster = boot_cluster(mgr_addr, n1_addr, n2_addr, 111, 11002).await;
 
         let total: usize = 1024 * 1024;
         let value = pattern(total);
         let key = b"single-chunk";
 
-        let mut handle = cluster.put_stream_begin(key, 0).await.unwrap();
+        let mut handle = cluster.put_stream_begin(key, 0);
         handle.send(&value).await.unwrap();
         assert_eq!(handle.chunks_sent(), 1);
         handle.commit().await.unwrap();
 
-        let got = cluster.get(key).await.unwrap().unwrap();
-        assert_eq!(got.len(), total);
-        assert!(got == value);
-    });
-}
-
-/// F130 — multi-frag VP active rewrite during GC. Sequence:
-///   1. Put a 12 MiB multi-frag value (4 × 3 MiB chunks). The
-///      OP_CHUNK_BLOB records land on the log_stream tail extent
-///      together with the OP_VALUE_POINTER_MULTI commit record.
-///   2. Force a flush so the mfvp memtable entry hits an SST.
-///   3. Pre-condition: writing more data forces log_stream to allocate
-///      a new tail extent — so the chunks we wrote in step 1 are now
-///      on a sealed (older) log_stream extent that GC can target.
-///   4. Force-GC that sealed extent. Without F130 the GC pre-pass
-///      doesn't run, the OP_CHUNK_BLOB records would just be skipped
-///      (existing single-VP scan) and `punch_holes` would silently
-///      orphan the chunks. With F130, the rewrite pre-pass detects
-///      the live mfvp pointing at this extent, copies all 4 fragments
-///      to the active log_stream tail, and inserts a new mfvp entry
-///      at a higher seq.
-///   5. Verify the value is still readable (rewrite preserved bytes).
-///   6. Verify the original extent is gone from the log_stream's
-///      extent_ids list (manager StreamInfo).
-#[test]
-#[ignore]
-fn f130_multifrag_gc_rewrite_preserves_value() {
-    use autumn_rpc::manager_rpc::{
-        rkyv_decode, rkyv_encode, StreamInfoReq, StreamInfoResp, MSG_STREAM_INFO,
-    };
-    use bytes::Bytes;
-
-    let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
-
-    let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
-    let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
-    let n1_addr = pick_addr();
-    let n2_addr = pick_addr();
-    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
-    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
-        register_two_nodes(&mgr, n1_addr, n2_addr, 113).await;
-        let (log_stream_id, row, meta) = create_three_streams(&mgr).await;
-        upsert_partition(&mgr, 11004, log_stream_id, row, meta, b"a", b"z").await;
-
-        let ps_addr = pick_addr();
-        start_partition_server(113, mgr_addr, ps_addr);
-        compio::time::sleep(Duration::from_millis(1500)).await;
-        let _ = RpcClient::connect(ps_addr).await.unwrap();
-
-        let cluster = ClusterClient::connect(&mgr_addr.to_string())
-            .await
-            .expect("ClusterClient::connect");
-        cluster.set_rpc_timeout(Duration::from_secs(15));
-
-        // ── 1. Stream-put a 12 MiB value ────────────────────────────
-        let total: usize = 12 * 1024 * 1024;
-        let chunk_size: usize = 3 * 1024 * 1024;
-        let value = pattern(total);
-        let key = b"gc-victim";
-
-        let mut handle = cluster.put_stream_begin(key, 0).await.unwrap();
-        let mut sent = 0usize;
-        while sent < total {
-            let end = (sent + chunk_size).min(total);
-            handle.send(&value[sent..end]).await.unwrap();
-            sent = end;
-        }
-        handle.commit().await.unwrap();
-
-        // Snapshot the log_stream's extent_ids — the chunks must live
-        // on one of these. The newest extent is the active tail.
-        let target_extent = {
-            let req = rkyv_encode(&StreamInfoReq {
-                stream_ids: vec![log_stream_id],
-            });
-            let resp_bytes = mgr.call(MSG_STREAM_INFO, req).await.unwrap();
-            let resp: StreamInfoResp = rkyv_decode(&resp_bytes).unwrap();
-            let stream = &resp.streams[0].1;
-            // Take the newest tail extent — that's where PutChunk just
-            // appended OP_CHUNK_BLOB records.
-            *stream
-                .extent_ids
-                .last()
-                .expect("log_stream has no extents post-commit")
-        };
-        eprintln!(
-            "F130 test: chunks landed on log_stream extent {target_extent}"
-        );
-
-        // ── 2. Flush so the mfvp entry leaves the active memtable
-        //       and hits an SST. The chunks stay in log_stream — flush
-        //       only writes the SST, not the log records.
-        cluster.flush(11004).await.unwrap();
-        compio::time::sleep(Duration::from_millis(1000)).await;
-
-        // ── 3. Force a fresh log_stream tail allocation by writing a
-        //       big single-Put (4 KiB+ → goes through VP path → land
-        //       in the same log_stream until rotation). We need the
-        //       tail extent we want to GC to be SEALED, otherwise
-        //       GC's run_gc rejects it (it operates on sealed extents
-        //       only). Easiest way: post a maintenance-trigger force
-        //       seal — but that helper doesn't exist; instead do many
-        //       smaller writes to grow the active tail and let it
-        //       naturally roll, OR rely on flush + a follow-on commit
-        //       to advance vp_head.
-        //
-        //       The simplest approach: write a second multi-frag
-        //       value with fresh chunks. Each PutChunk's append
-        //       grows log_stream; if `target_extent` is the current
-        //       tail, the next write may rotate it. If target was
-        //       already sealed (because flush + memtable rotation
-        //       wrote intermediate state), we're already done.
-        //
-        //       In either case, after this second value's writes the
-        //       PS has either rotated past `target_extent` or the
-        //       extent is still the tail. We then force_gc on
-        //       target_extent. If it's still the tail, run_gc will
-        //       skip with "extent not sealed"; the test then writes
-        //       more to force seal and retries.
-        let key2 = b"unrelated";
-        let mut h2 = cluster.put_stream_begin(key2, 0).await.unwrap();
-        h2.send(&pattern(2 * 1024 * 1024)).await.unwrap();
-        h2.commit().await.unwrap();
-        cluster.flush(11004).await.unwrap();
-        compio::time::sleep(Duration::from_millis(1000)).await;
-
-        // Compact so the SST holding the mfvp entry survives across
-        // the GC + rewrite cycle (otherwise compaction itself would
-        // discard it before GC sees it).
-        cluster.compact(11004).await.unwrap();
-        compio::time::sleep(Duration::from_millis(2000)).await;
-
-        // ── 4. Force-GC target_extent. With F130 the rewrite pre-pass
-        //       walks active+imm for OP_VALUE_POINTER_MULTI entries
-        //       touching `target_extent` and rewrites them. After the
-        //       rewrite pre-pass, the single-VP scan + punch_holes
-        //       can fire safely.
-        //
-        //       Note: if target_extent is still the active tail (not
-        //       sealed), force_gc returns OK but run_gc skips it
-        //       internally. We just verify the value still reads back
-        //       correctly post-rewrite (or post-skip). The negative
-        //       case (chunks lost) would manifest as a get_stream
-        //       returning fewer bytes than total or wrong content.
-        let _ = cluster.force_gc(11004, vec![target_extent]).await;
-        compio::time::sleep(Duration::from_millis(2000)).await;
-
-        // ── 5. Verify value is still readable end-to-end. If F130
-        //       didn't rewrite the chunks AND the extent was punched,
-        //       we'd see short reads / NotFound here.
-        let got = cluster
-            .get(key)
-            .await
-            .expect("get post-GC")
-            .expect("get returned None — F130 did not preserve value");
-        assert_eq!(got.len(), total, "post-GC value length mismatch");
-        assert!(got == value, "post-GC value bytes mismatch");
-
         let mut stream = cluster
-            .get_stream(key, 1024 * 1024)
+            .get_stream(key, 256 * 1024)
             .await
-            .expect("get_stream post-GC")
-            .expect("None");
-        let mut reassembled: Vec<u8> = Vec::with_capacity(total);
+            .unwrap()
+            .unwrap();
+        let mut got = Vec::with_capacity(total);
         while let Some(c) = stream.next_chunk().await.unwrap() {
-            reassembled.extend_from_slice(&c);
+            got.extend_from_slice(&c);
         }
-        assert!(
-            reassembled == value,
-            "post-GC stream reassembly mismatch"
-        );
-
-        // ── 6. The unrelated value posted in step 3 must also still
-        //       work — F130 mustn't accidentally corrupt other keys.
-        let got2 = cluster.get(key2).await.unwrap().unwrap();
-        assert_eq!(got2.len(), 2 * 1024 * 1024);
-
-        // Cleanup to suppress drop warns.
-        let _ = Bytes::from(value);
+        assert_eq!(got.len(), total);
+        if got != value {
+            let pos = got.iter().zip(value.iter()).position(|(a, b)| a != b).unwrap_or(0);
+            panic!(
+                "single-chunk content mismatch at offset {pos}: got[{pos}..]={:02x?} expected={:02x?}",
+                &got[pos..(pos + 16).min(got.len())],
+                &value[pos..(pos + 16).min(value.len())]
+            );
+        }
     });
 }
 
-/// Abort path: PutBegin + 1 chunk + Abort. The session is dropped
-/// server-side; subsequent commit must fail; the chunk's WAL bytes
-/// stay in log_stream as OP_CHUNK_BLOB and recovery skips them.
+/// Abort path: chunks were sent but commit never fired. Meta blob was
+/// never written, so `get(key)` returns NotFound throughout. After abort,
+/// all written chunks are best-effort deleted.
 #[test]
 #[ignore]
-fn f129_putstream_abort_drops_session() {
+fn f186_putstream_abort_drops_chunks() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
-    let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
-    let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
     let n1_addr = pick_addr();
     let n2_addr = pick_addr();
     start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
-        register_two_nodes(&mgr, n1_addr, n2_addr, 112).await;
-        let (log, row, meta) = create_three_streams(&mgr).await;
-        upsert_partition(&mgr, 11003, log, row, meta, b"a", b"z").await;
-
-        let ps_addr = pick_addr();
-        start_partition_server(112, mgr_addr, ps_addr);
-        compio::time::sleep(Duration::from_millis(1500)).await;
-        let _ = RpcClient::connect(ps_addr).await.unwrap();
-
-        let cluster = ClusterClient::connect(&mgr_addr.to_string())
-            .await
-            .expect("ClusterClient::connect");
-        cluster.set_rpc_timeout(Duration::from_secs(5));
+        let cluster = boot_cluster(mgr_addr, n1_addr, n2_addr, 112, 11003).await;
 
         let key = b"aborted";
-        let mut handle = cluster.put_stream_begin(key, 0).await.unwrap();
+        let mut handle = cluster.put_stream_begin(key, 0);
+        handle.send(&pattern(2 * 1024 * 1024)).await.unwrap();
         handle.send(&pattern(2 * 1024 * 1024)).await.unwrap();
         handle.abort().await.unwrap();
 
+        // get returns None — meta was never written.
         let post = cluster.get(key).await.unwrap();
-        assert!(post.is_none(), "get on aborted upload must return None");
+        assert!(post.is_none(), "get on aborted upload must be None");
+        // get_stream similarly returns None.
+        let post_stream = cluster.get_stream(key, 1024).await.unwrap();
+        assert!(post_stream.is_none());
+    });
+}
+
+/// get_stream over an inline value (no put_stream involved). Verifies
+/// the auto-detect path: small value put via regular `put` is yielded
+/// in a single `next_chunk` call.
+#[test]
+#[ignore]
+fn f186_get_stream_inline_value_passthrough() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let cluster = boot_cluster(mgr_addr, n1_addr, n2_addr, 113, 11004).await;
+
+        let value = b"hello inline world";
+        let key = b"inline";
+        cluster.put(key, value).await.unwrap();
+
+        let mut stream = cluster.get_stream(key, 1024).await.unwrap().unwrap();
+        assert_eq!(stream.total_bytes(), value.len() as u64);
+        let chunk = stream.next_chunk().await.unwrap().unwrap();
+        assert_eq!(&chunk, value);
+        assert!(stream.next_chunk().await.unwrap().is_none());
     });
 }

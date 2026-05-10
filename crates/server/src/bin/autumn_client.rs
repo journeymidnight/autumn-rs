@@ -1415,10 +1415,7 @@ async fn main() -> Result<()> {
             } else {
                 std::fs::read(&file).with_context(|| format!("read file {file}"))?
             };
-            let mut handle = client
-                .put_stream_begin(key.as_bytes(), 0)
-                .await
-                .map_err(|e| anyhow!("put-stream begin: {e}"))?;
+            let mut handle = client.put_stream_begin(key.as_bytes(), 0);
             let mut sent = 0u64;
             let mut idx: usize = 0;
             while idx < payload.len() {
