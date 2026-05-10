@@ -96,6 +96,8 @@
 | FOPS-04 | replica stream encoding `(0,0)` → `(N,0)`; EC predicate now `ec_parity_shard != 0` | stream |
 | FGA-01 | gallery: storage HUD + spawn_blocking thumbs + video thumbs + auto-hide lightbox strip | examples |
 | F183 | Partition merge primitive + size+load advisory policy engine (Stage 1) | partition/manager |
+| F184 | Auto-trigger flags + reload-on-region-change + concurrent-writer test + ClusterClient.rpc_timeout | manager/client |
+| F185 | PS-side `handle_merge_part` with freeze-drain (deferred — closes Stage-1 ~5% merge-window loss) | partition |
 
 ---
 
@@ -606,6 +608,118 @@
   - `cargo test -p autumn-manager --test system_merge -- --ignored`: 6/6 (~45 s)
   - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 130/130
   - `cargo build --workspace --exclude autumn-fuse`: clean
+- **passes:** true
+
+### F185 · PS-side `handle_merge_part` with freeze-drain — deferred follow-on to F183/F184
+
+- **Target:** Close the Stage-1 merge-window data-loss gap measured by F184-K: writes that
+  arrive after the merge orchestrator's FLUSH but before the survivor's `region_sync_loop`
+  reload land in the old log_stream's tail extent (offset BEFORE the post-merge
+  `vp_head=(E_new, 0)`); survivor's recovery never replays them. F184-K observes ~5 %
+  loss across split-merge-split with a sustained 50 ops/sec writer.
+- **Mechanism (per spec §4.1):** new PS RPC `MSG_MERGE_PART` (wire id 0x4D, already
+  reserved in F183-A2). The handler runs on the **survivor's** PS and performs an
+  atomic write-halt + drain protocol:
+  1. Acquire 4 gates in strict deadlock-safe order:
+     `(victim.compact_gate, victim.gc_gate, survivor.compact_gate, survivor.gc_gate)`
+  2. Send `MergeFreeze` to victim's `merged_partition_loop` via a new Send-capable
+     control channel; victim drains pending + inflight, flushes all imm, sets
+     `frozen_for_merge: Cell<bool>` on its `PartitionData`, acks back.
+  3. Same freeze on survivor.
+  4. While both are frozen, capture `commit_length` on six streams, call
+     `MSG_MULTI_MODIFY_MERGE` (existing F183 manager handler — unchanged).
+  5. **In-place splice on survivor's `PartitionData`**: append victim's
+     `tables` + `sst_readers`, widen `rg.end_key`, bump `seq_number` to
+     `max(s.seq, v.seq) + 1`, write a unioned `TableLocations` to
+     survivor's meta_stream with `vp_head = (E_new, 0)`. NO region_sync
+     reload needed — survivor stays open with merged state.
+  6. Send `MergeRelease` to victim → victim closes; OS thread joins.
+  7. `survivor.frozen_for_merge.set(false)`; clients' Unavailable retries
+     succeed.
+- **Why deferred:** every partition runs on its own OS thread (F099-K). `handle_merge_part`
+  fires on survivor's thread but needs to operate on victim's `PartitionData`
+  (`Rc<RefCell<>>`, `!Send`). Requires:
+  - new `Send` mpsc channel from any partition thread to the main thread
+  - main-thread `merge_service_loop` that consumes `(survivor_id, victim_id, ack_tx)`
+    requests and performs the freeze coordination (main thread already holds
+    `Rc<RefCell<HashMap<part_id, PartitionHandle>>>` so it can reach both partitions'
+    cross-thread `drain_tx`-style channels)
+  Substantial cross-thread refactor — F184 deliberately deferred this and used CLI
+  orchestration + `region_sync_loop` reload-on-rg-change (F184-B) as a Stage-1
+  approximation.
+- **Observed Stage-1 limitation closed by this:**
+  - data loss: ~5 % → 0
+  - merge wallclock: ~3 s (incl. region_sync wait) → < 1 s
+  - client-visible errors: silent loss + NotFound → bounded `Unavailable`-retry
+    window only (clients' standard retry path handles it)
+- **Where it lives in the spec:** `docs/superpowers/specs/2026-05-09-partition-merge-and-split-merge-policy-design.md`
+  §4.1 (handler), §4.3 (`merged_partition_loop` MergeFreeze handling), §7.2/§7.3
+  (crash recovery), §9.3 (file changes).
+- **Trigger to start:** when production observes the Stage-1 ~5 % loss as
+  unacceptable. F184's `ClusterClient.set_rpc_timeout` (F184-L) already converts
+  the loss-window from "silent loss" to "bounded retry"; the actual loss only
+  matters for workloads where idempotent writes can't replay safely.
+- **Files (when implemented):** `crates/partition-server/src/lib.rs` (extend
+  `PartitionRequest` enum with `MergeFreeze`/`MergeRelease`; add
+  `frozen_for_merge: Cell<bool>` on `PartitionData`; new `merge_service_loop`
+  on main thread; cross-thread mpsc); `crates/partition-server/src/rpc_handlers.rs`
+  (add `handle_merge_part`); `crates/partition-server/src/background.rs`
+  (extend `merged_partition_loop` select with MergeFreeze/MergeRelease arms).
+  Wire types `MergePartReq`/`MergePartResp` already shipped in F183-A2.
+- **passes:** false (deferred; no existing implementation)
+
+### F184 · F183 follow-on — auto-trigger + reload-on-region-change + concurrent-writer test + SDK rpc_timeout
+
+- **Target:** finish the F183 Stage 1 advisory primitive into a usable Stage-1.5: enable
+  manager-side auto-dispatch behind feature flags, fix post-merge survivor recovery so
+  region_sync reload picks up victim's tables, and document/test the residual write-loss
+  window via concurrent-writer integration tests.
+- **F184-A:** `--auto-split` / `--auto-merge` flags on `autumn-manager-server` binary;
+  `set_auto_split` / `set_auto_merge` setters on `AutumnManager`; `policy_tick_loop`
+  consumes its own candidates and dispatches `MSG_SPLIT_PART` (split) or runs the CLI
+  orchestration flow (merge), rate-limited to 1 candidate/tick.
+- **F184-B:** `PartitionHandle.opened_with: (Range, log_id, row_id, meta_id)` snapshot;
+  `sync_regions_once` compares against the latest manager regions and removes the handle
+  (forcing the open-new-partitions pass to reopen with fresh state) when any field changed
+  — this is what makes the merge primitive usable WITHOUT a PS-side handler.
+- **F184-C:** new `read_all_table_locations` walks every meta_stream extent and unions
+  the LAST `TableLocations` from each non-empty extent; recovery dedups SST locs by
+  `(extent_id, offset, len)`. Pre-merge partitions (single non-empty extent) keep
+  identical behaviour; post-merge survivors get the union of victim's + survivor's
+  checkpoint tables.
+- **F184-D/J/K:** `system_merge.rs` integration tests: round-trip happy path,
+  multi-step `merge → split-again` lifecycle, `split → merge → split` with
+  interleaved-writes (F184-J) and **concurrent writer** (F184-K) using `ClusterClient`.
+  F184-K test exposes and asserts the ~5 % Stage-1 merge-window loss documented in F185.
+- **F184-E:** 3 more merge handler unit tests (recovery_inflight, pending_delete,
+  last_op_at).
+- **F184-F:** public `manager.force_auto_split` / `force_auto_merge` test helpers +
+  `auto_dispatch_merge_orchestrates_full_flow` integration test.
+- **F184-G:** `auto_dispatch_split_dispatches_msg_split_part` integration test.
+- **F184-H:** `PolicyConfig` runtime-configurable thresholds via
+  `manager.set_policy_config(cfg)`; `policy_tick_loop` re-reads `tick_interval_sec`
+  each cycle. Enables fast-mode `auto_merge_fires_via_policy_tick_loop_fast_mode`
+  e2e test (~6 s) — first test that exercises the FULL closed loop:
+  `MSG_REPORT_PARTITION_LOAD → metrics window → compute_candidates →
+  auto_dispatch_merge → multi_modify_merge` end-to-end without manual intervention.
+- **F184-I:** mirror of F184-H for SPLIT closed loop.
+- **F184-L:** opt-in `ClusterClient.set_rpc_timeout(Duration)` setter +
+  `clear_rpc_timeout` / `rpc_timeout` getters. When set, every `ps_call`
+  (put/get/delete/head/range/stream_put/merge_part/F129 PutChunk/Commit/Abort)
+  is raced via `RpcClient::call_timeout` against the deadline; expiry surfaces
+  as `AutumnError::ConnectionError` so the existing `call_ps_for_*`
+  retry-on-failure path triggers `refresh_regions` + one retry. Default `None`
+  preserves pre-F184 wait-forever semantics. Closes a footgun: PS dropping
+  `req_rx` mid-call (region_sync reload, graceful drain) without closing TCP
+  used to hang `cluster.put().await` forever — autumn-rpc F121's closed-state
+  flag fires only on TCP close, not on req_rx drop.
+- **Tests (post-F184):**
+  - `cargo test -p autumn-manager --lib`: 51/51
+  - `cargo test -p autumn-manager --test system_merge -- --ignored`: 9/9 individually
+    (each ≤ 60 s on a clean machine; suite mode has known test-isolation issue
+    where cluster processes accumulate across cases)
+  - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 130/130
+- **Spec/plan:** same as F183.
 - **passes:** true
 
 ### F179 · autumn-fuse: async-reply read + parallel chunk fetch + ClusterClient `&self` refactor
