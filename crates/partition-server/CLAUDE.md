@@ -886,10 +886,39 @@ post-restart.
     unlimited) would be exceeded. F141's per-partition GC limiter
     stays as a tighter inner cap.
 
-    Stage 3 (deferred) is true admission control: fg gets priority
-    tokens and bg gets elastic tokens that yield to fg under
-    contention (CockroachDB `kvadmission` pattern). Currently
-    foreground writes do NOT consult the bucket — they bypass entirely.
+    **F189 Stage 3 (shipped 2026-05-10)** replaces `IoTokenBucket` with
+    `AdmissionController` — a two-class admission controller (CockroachDB
+    `kvadmission` pattern, simplified). Same 1-second wall-clock window
+    + parking_lot::Mutex<state>, but state now tracks `fg_bytes` and
+    `bg_bytes` independently:
+
+    - `account_fg(bytes).await`: sleeps only when an explicit fg
+      ceiling (`AUTUMN_PS_FG_RATE_BYTES_PER_SEC`, default 0 =
+      unlimited) is set AND would be exceeded. Default returns
+      immediately after a single Mutex acquire — keeps the fg hot
+      path cheap.
+    - `account_bg(bytes).await`: sleeps until BOTH (1) bg's own
+      ceiling (`AUTUMN_PS_BG_RATE_BYTES_PER_SEC`, default 256 MiB/s)
+      AND (2) fg-aware yield — when fg observed rate >
+      `AUTUMN_PS_FG_SATURATED_THRESHOLD * fg_rate` (default 0.8), bg
+      waits till the next 1-second window. Fg-aware yield is
+      disabled when fg_rate=0 (no baseline to detect saturation).
+
+    Wire site for fg: `start_write_batch` in `background.rs` calls
+    `admission.account_fg(total_value_bytes).await` ONCE per batch
+    just before launching Phase 2. Per-batch (not per-op) keeps the
+    lock acquisition rate at ~1/256 of per-op overhead.
+
+    Wire sites for bg: `do_compact` (chunk-emit + final-emit),
+    `flush_gc_batch` (write side), `run_gc` (chunk-read side),
+    `process_gc_chunk` (passes through). All call `account_bg`
+    instead of the old `account`. F141's per-partition GC limiter is
+    kept as an inner cap.
+
+    Tests in `f189_admission_tests` (7, all passing):
+    fg_unlimited_no_sleep, bg_unlimited_no_sleep, bg_respects_own_rate,
+    bg_yields_when_fg_saturated, bg_does_not_yield_when_fg_idle,
+    bg_ignores_fg_when_fg_unlimited, window_resets_after_1s.
 
 12. **F183/F185 partition merge.** F183 shipped the merge primitive
     as a manager-side atomic etcd txn (see `crates/manager/CLAUDE.md`

@@ -518,7 +518,7 @@ pub(crate) struct PartitionData {
     /// partition on this PS; GC + compact append paths call
     /// `io_bucket.account(bytes).await` before each write so a single PS
     /// can't blow past the cluster's BG_RATE budget.
-    pub(crate) io_bucket: std::sync::Arc<crate::IoTokenBucket>,
+    pub(crate) io_bucket: std::sync::Arc<crate::AdmissionController>,
     /// F162 (MED-2): per-extent reader-pin map. `handle_get → resolve_value`
     /// reads a ValuePointer from an SST, drops the partition borrow, and
     /// awaits `read_bytes_from_extent` on log_stream. Without coordination,
@@ -1096,68 +1096,104 @@ pub struct PartitionServer {
     /// consult it (true admission control with elastic vs priority
     /// tokens is Stage 3 territory). Default rate: 256 MiB/s. Tunable
     /// via env `AUTUMN_PS_BG_RATE_BYTES_PER_SEC` (0 = unlimited).
-    pub(crate) io_bucket: std::sync::Arc<IoTokenBucket>,
+    pub(crate) io_bucket: std::sync::Arc<AdmissionController>,
 }
 
-/// F188: simple wall-clock token-bucket rate limiter for background IO
-/// (GC + compaction). Shared across all partitions on a PS. Replaces the
-/// per-partition `GcRateLimiter` (F141) for the network-write side of
-/// background work, ensuring N partitions × default 64 MiB/s GC + whatever
-/// compaction adds doesn't blow past a single tunable cluster ceiling.
+/// F189 — two-class admission controller (CockroachDB `kvadmission`
+/// pattern, simplified). Foreground (writes) gets priority tokens with
+/// at most a configurable hard ceiling; background (GC + compaction)
+/// gets elastic tokens that explicitly yield to foreground when fg
+/// pressure crosses a configurable share threshold.
 ///
-/// Foreground writes do NOT consult this bucket. Stage 3 will add a
-/// foreground/elastic split (CockroachDB admission-control style) where
-/// fg gets priority tokens and bg gets elastic tokens that yield to fg.
-pub struct IoTokenBucket {
-    rate_bytes_per_sec: u64,
-    state: parking_lot::Mutex<IoTokenState>,
+/// Replaces F188's per-class `IoTokenBucket` for the GC + compact append
+/// paths AND adds a new `account_fg` call site at the foreground write
+/// path.
+///
+/// Single 1-second wall-clock window; both classes share the same
+/// `Instant` reset boundary so fg's observed-rate estimate stays
+/// consistent with bg's accounting. parking_lot::Mutex is held only
+/// across the synchronous accounting calc — the sleep, when needed,
+/// happens outside the lock.
+///
+/// Configuration (env, applied via `from_env`):
+///   AUTUMN_PS_FG_RATE_BYTES_PER_SEC  — fg ceiling (0 = unlimited; default 0)
+///   AUTUMN_PS_BG_RATE_BYTES_PER_SEC  — bg ceiling (0 = unlimited; default 256 MiB/s)
+///   AUTUMN_PS_FG_SATURATED_THRESHOLD — fg observed-rate ratio above
+///       which bg yields entirely to the next window. Default 0.8;
+///       only meaningful when AUTUMN_PS_FG_RATE_BYTES_PER_SEC > 0.
+///       When fg rate is 0 (unlimited), bg uses ONLY its own ceiling
+///       — no fg-aware throttle (we don't know fg's "intended" rate).
+pub struct AdmissionController {
+    fg_rate_bytes_per_sec: u64,
+    bg_rate_bytes_per_sec: u64,
+    fg_saturated_ratio: f64,
+    state: parking_lot::Mutex<AdmissionState>,
 }
 
-struct IoTokenState {
+struct AdmissionState {
     window_start: Instant,
-    bytes_in_window: u64,
+    fg_bytes: u64,
+    bg_bytes: u64,
 }
 
-impl IoTokenBucket {
-    pub fn new(rate_bytes_per_sec: u64) -> Self {
+impl AdmissionController {
+    pub fn new(
+        fg_rate_bytes_per_sec: u64,
+        bg_rate_bytes_per_sec: u64,
+        fg_saturated_ratio: f64,
+    ) -> Self {
         Self {
-            rate_bytes_per_sec,
-            state: parking_lot::Mutex::new(IoTokenState {
+            fg_rate_bytes_per_sec,
+            bg_rate_bytes_per_sec,
+            fg_saturated_ratio: fg_saturated_ratio.clamp(0.1, 1.0),
+            state: parking_lot::Mutex::new(AdmissionState {
                 window_start: Instant::now(),
-                bytes_in_window: 0,
+                fg_bytes: 0,
+                bg_bytes: 0,
             }),
         }
     }
 
     pub fn from_env() -> Self {
-        let rate = std::env::var("AUTUMN_PS_BG_RATE_BYTES_PER_SEC")
+        let fg_rate = std::env::var("AUTUMN_PS_FG_RATE_BYTES_PER_SEC")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let bg_rate = std::env::var("AUTUMN_PS_BG_RATE_BYTES_PER_SEC")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(256 * 1024 * 1024);
-        Self::new(rate)
+        let saturated = std::env::var("AUTUMN_PS_FG_SATURATED_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.8);
+        Self::new(fg_rate, bg_rate, saturated)
     }
 
-    /// Account for `bytes` consumed; sleep until the budget would allow.
-    /// Returns immediately if rate=0 (unlimited).
-    ///
-    /// The mutex is held only across the synchronous accounting calc;
-    /// the sleep happens outside the lock so contending callers see the
-    /// updated `bytes_in_window` without blocking on wall-clock catch-up.
-    pub async fn account(&self, bytes: u64) {
-        if self.rate_bytes_per_sec == 0 {
-            return;
+    fn maybe_reset_window(state: &mut AdmissionState) {
+        if state.window_start.elapsed() >= Duration::from_secs(1) {
+            state.window_start = Instant::now();
+            state.fg_bytes = 0;
+            state.bg_bytes = 0;
         }
+    }
+
+    /// Foreground accounting. Sleeps only when an explicit fg ceiling
+    /// is set (`fg_rate_bytes_per_sec > 0`) AND the current window's
+    /// fg consumption would exceed it. Default (rate=0) returns
+    /// immediately after a single Mutex acquire — keep this CHEAP, it
+    /// runs on the request hot path.
+    pub async fn account_fg(&self, bytes: u64) {
         let sleep_for = {
             let mut s = self.state.lock();
-            let elapsed = s.window_start.elapsed();
-            if elapsed >= Duration::from_secs(1) {
-                s.window_start = Instant::now();
-                s.bytes_in_window = 0;
+            Self::maybe_reset_window(&mut s);
+            s.fg_bytes = s.fg_bytes.saturating_add(bytes);
+            if self.fg_rate_bytes_per_sec == 0 {
                 None
             } else {
-                s.bytes_in_window = s.bytes_in_window.saturating_add(bytes);
-                let target_secs = s.bytes_in_window as f64 / self.rate_bytes_per_sec as f64;
+                let target_secs = s.fg_bytes as f64 / self.fg_rate_bytes_per_sec as f64;
                 let target = Duration::from_secs_f64(target_secs);
+                let elapsed = s.window_start.elapsed();
                 if target > elapsed {
                     Some(target - elapsed)
                 } else {
@@ -1168,6 +1204,235 @@ impl IoTokenBucket {
         if let Some(d) = sleep_for {
             compio::time::sleep(d).await;
         }
+    }
+
+    /// Background accounting. Sleeps until BOTH constraints are met:
+    /// 1. bg's own rate ceiling (same logic as F188's IoTokenBucket);
+    /// 2. foreground-aware yield: when fg observed rate exceeds
+    ///    `fg_saturated_ratio * fg_rate`, bg waits till the next
+    ///    window. Disabled (no fg-aware sleep) when fg_rate = 0
+    ///    because we lack a baseline to detect "fg saturated".
+    pub async fn account_bg(&self, bytes: u64) {
+        let sleep_for = {
+            let mut s = self.state.lock();
+            Self::maybe_reset_window(&mut s);
+            s.bg_bytes = s.bg_bytes.saturating_add(bytes);
+            let elapsed = s.window_start.elapsed();
+            // (1) bg's own ceiling
+            let bg_rate_sleep: Option<Duration> = if self.bg_rate_bytes_per_sec == 0 {
+                None
+            } else {
+                let target = Duration::from_secs_f64(
+                    s.bg_bytes as f64 / self.bg_rate_bytes_per_sec as f64,
+                );
+                if target > elapsed {
+                    Some(target - elapsed)
+                } else {
+                    None
+                }
+            };
+            // (2) fg-aware yield. Only active when an fg ceiling is set
+            // (otherwise we'd treat any fg activity as "saturated").
+            let fg_aware_sleep: Option<Duration> = if self.fg_rate_bytes_per_sec > 0 {
+                let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+                let fg_observed_rate = s.fg_bytes as f64 / elapsed_secs;
+                let saturated_at =
+                    self.fg_rate_bytes_per_sec as f64 * self.fg_saturated_ratio;
+                if fg_observed_rate > saturated_at {
+                    let remaining =
+                        Duration::from_secs(1).saturating_sub(elapsed);
+                    if remaining > Duration::ZERO {
+                        Some(remaining)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            // Take the larger of the two sleeps so both constraints hold.
+            match (bg_rate_sleep, fg_aware_sleep) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            }
+        };
+        if let Some(d) = sleep_for {
+            compio::time::sleep(d).await;
+        }
+    }
+
+    /// Test-only snapshot of the current window's accounting state.
+    /// Locks briefly. Used by `f189_admission_tests`.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> (u64, u64, Duration) {
+        let s = self.state.lock();
+        (s.fg_bytes, s.bg_bytes, s.window_start.elapsed())
+    }
+}
+
+#[cfg(test)]
+mod f189_admission_tests {
+    use super::*;
+
+    /// fg_rate=0 (default unlimited): account_fg returns immediately
+    /// regardless of bytes consumed.
+    #[test]
+    fn fg_unlimited_no_sleep() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let ac = AdmissionController::new(0, 0, 0.8);
+            let t0 = Instant::now();
+            for _ in 0..100 {
+                ac.account_fg(1024 * 1024).await;
+            }
+            let elapsed = t0.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(50),
+                "fg with rate=0 must not sleep, elapsed={:?}",
+                elapsed
+            );
+            let (fg, bg, _) = ac.snapshot();
+            assert!(fg >= 100 * 1024 * 1024, "fg counter not bumped: {fg}");
+            assert_eq!(bg, 0);
+        });
+    }
+
+    /// bg_rate=0 (unlimited): account_bg returns immediately.
+    #[test]
+    fn bg_unlimited_no_sleep() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let ac = AdmissionController::new(0, 0, 0.8);
+            let t0 = Instant::now();
+            for _ in 0..100 {
+                ac.account_bg(1024 * 1024).await;
+            }
+            assert!(t0.elapsed() < Duration::from_millis(50));
+        });
+    }
+
+    /// bg_rate=10 MiB/s: 5 MiB writes should sleep ~500ms when done back-to-back.
+    #[test]
+    fn bg_respects_own_rate() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let ac = AdmissionController::new(0, 10 * 1024 * 1024, 0.8);
+            let t0 = Instant::now();
+            // 5 MiB consumed against 10 MiB/s budget = 500ms target
+            ac.account_bg(5 * 1024 * 1024).await;
+            // Next 5 MiB pushes us to the full second's budget
+            ac.account_bg(5 * 1024 * 1024).await;
+            let elapsed = t0.elapsed();
+            // Allow generous slop: should sleep close to 1s but
+            // window-reset boundary effects can cut it short on the
+            // second call.
+            assert!(
+                elapsed >= Duration::from_millis(800)
+                    && elapsed <= Duration::from_millis(1500),
+                "bg should sleep ~1s on 10 MiB at 10 MiB/s, got {:?}",
+                elapsed
+            );
+        });
+    }
+
+    /// fg saturated (fg observed rate > 0.8 * fg_rate): bg yields to next window.
+    #[test]
+    fn bg_yields_when_fg_saturated() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            // fg_rate = 100 MiB/s, fg_saturated_ratio = 0.5 → saturation
+            // threshold = 50 MiB/s observed.
+            let ac = AdmissionController::new(
+                100 * 1024 * 1024,
+                100 * 1024 * 1024, // generous bg budget
+                0.5,
+            );
+            // Push fg to saturate the window: 60 MiB consumed in <100ms
+            // gives observed rate >> 50 MiB/s threshold.
+            ac.account_fg(60 * 1024 * 1024).await;
+            // Now bg attempt — should yield to the *remaining* time in
+            // the current 1s window. fg's account_fg call took ~600ms
+            // already (60 MiB at 100 MiB/s), so the remaining gap is
+            // ~400ms. Use a generous lower bound (300ms) to absorb
+            // wall-clock jitter on busy CI hosts.
+            let t0 = Instant::now();
+            ac.account_bg(1024).await; // tiny payload
+            let elapsed = t0.elapsed();
+            assert!(
+                elapsed >= Duration::from_millis(300),
+                "bg should yield to next window when fg saturated, got {:?}",
+                elapsed
+            );
+        });
+    }
+
+    /// fg idle: bg uses its full ceiling without yielding.
+    #[test]
+    fn bg_does_not_yield_when_fg_idle() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let ac = AdmissionController::new(
+                100 * 1024 * 1024, // fg ceiling set
+                100 * 1024 * 1024,
+                0.5,
+            );
+            // No fg traffic at all.
+            let t0 = Instant::now();
+            ac.account_bg(1024).await; // small bg payload
+            let elapsed = t0.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(50),
+                "bg should not yield when fg idle, got {:?}",
+                elapsed
+            );
+        });
+    }
+
+    /// fg_rate=0 + fg active: bg ignores fg-aware throttle (we have
+    /// no rate baseline) and only respects its own ceiling.
+    #[test]
+    fn bg_ignores_fg_when_fg_unlimited() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let ac = AdmissionController::new(
+                0,                 // fg unlimited
+                100 * 1024 * 1024, // bg ceiling
+                0.5,
+            );
+            // Push lots of fg.
+            ac.account_fg(500 * 1024 * 1024).await;
+            // bg should still be free (well under bg ceiling).
+            let t0 = Instant::now();
+            ac.account_bg(1024).await;
+            assert!(
+                t0.elapsed() < Duration::from_millis(50),
+                "bg should not yield to fg when fg has no ceiling"
+            );
+        });
+    }
+
+    /// Window reset clears both counters after 1s. Regression guard:
+    /// the reset path must not panic on first call and must zero fg+bg.
+    #[test]
+    fn window_resets_after_1s() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let ac = AdmissionController::new(0, 0, 0.8);
+            ac.account_fg(123).await;
+            ac.account_bg(456).await;
+            let (fg, bg, _) = ac.snapshot();
+            assert_eq!(fg, 123);
+            assert_eq!(bg, 456);
+            compio::time::sleep(Duration::from_millis(1100)).await;
+            // Trigger a reset via a fresh call.
+            ac.account_fg(7).await;
+            let (fg, bg, _) = ac.snapshot();
+            assert_eq!(fg, 7, "fg should reset to fresh accounting after window");
+            assert_eq!(bg, 0, "bg should reset");
+        });
     }
 }
 
@@ -1269,7 +1534,7 @@ impl PartitionServer {
                                 String::from("0.0.0.0"),
                             )),
                             compact_gate: CompactionGate::new(ps_major_compact_parallelism()),
-                            io_bucket: std::sync::Arc::new(IoTokenBucket::from_env()),
+                            io_bucket: std::sync::Arc::new(AdmissionController::from_env()),
                         };
                         return Ok(server);
                     } else if resp.code == manager_rpc::CODE_NOT_LEADER {
@@ -2685,7 +2950,7 @@ async fn partition_thread_main(
     compact_rx: mpsc::Receiver<bool>,
     gc_tx: mpsc::Sender<GcTask>,
     gc_rx: mpsc::Receiver<GcTask>,
-    io_bucket: std::sync::Arc<crate::IoTokenBucket>,
+    io_bucket: std::sync::Arc<crate::AdmissionController>,
 ) -> Result<()> {
     // F099-J: create the same-thread ps-conn ↔ merged_partition_loop
     // channel. Both endpoints live on THIS compio runtime, so sends and

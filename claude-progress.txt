@@ -1,91 +1,77 @@
 Date: 2026-05-10
 TaskStatus: completed
-Task scope: F188 — GC + compact Stage 2 (PS-level priority maintenance
-            scheduler + foreground awareness + shared IO token bucket).
-            Builds on F187 Stage 1 advisory; replaces per-partition
-            random-jitter compact/gc timers with a foreground-aware,
-            priority-driven dispatcher and adds PS-wide BG rate ceiling.
+Task scope: F189 — GC + compact Stage 3 (two-class admission control:
+            fg priority + bg elastic, CockroachDB kvadmission pattern).
+            Replaces F188's single-class IoTokenBucket; FG writes
+            now also consult the controller (vs F188 where they
+            bypassed entirely).
 
-Stage 2 verified end-to-end on a real 4-node cluster + sustained
-~90s 1KB write load + manual major compact (which tagged the
-discards). Logged events:
-  compact part 15: major, input=7 tables, output=4 tables,
-                   kept=1738292, discarded=298314, output=1.7 GB
-  F188 dispatched gc part 15 urgency=4661.16 debt=4661MB
-  ...repeats every 5s while debt > threshold and outside cooldown...
+Live verification (4-node cluster, fg_rate=10 MiB/s, bg_rate=32 MiB/s,
+saturation threshold=0.5):
+  16-thread wbench at 8 KiB values: throttled to 9.98 MB/s (vs 10
+  MiB/s ceiling — 0.2% accuracy). Latency p50=12.5ms (vs ~1ms
+  unthrottled — expected queueing under admission cap).
 
-Stage 3 (deferred): true admission control with fg priority +
-bg elastic tokens (CockroachDB kvadmission pattern). Foreground
-writes currently bypass the bucket entirely.
+Unit tests (f189_admission_tests, 7/7 passing):
+  fg_unlimited_no_sleep
+  bg_unlimited_no_sleep
+  bg_respects_own_rate
+  bg_yields_when_fg_saturated
+  bg_does_not_yield_when_fg_idle
+  bg_ignores_fg_when_fg_unlimited
+  window_resets_after_1s
 
 Files changed:
   crates/partition-server/src/lib.rs
-    + IoTokenBucket type (PS-wide rate limiter, parking_lot::Mutex
-      around sliding-window)
-    + PartitionServer.io_bucket: Arc<IoTokenBucket>
-    + PartitionHandle.compact_trigger / gc_trigger (Send Senders;
-      same channel as the in-thread PartitionData clone, accessible
-      from main-thread scheduler)
-    + maintenance_scheduler_loop spawned alongside report_load_loop:
-      - 5s cadence
-      - foreground-aware skip (req_per_sec > AUTUMN_PS_FG_QPS_QUOTA,
-        default 50K)
-      - urgency = debt / threshold, sort desc, dispatch top-K
-      - cooldown gates from PS-reported last_gc_at / last_compact_at
-    * partition_thread_main params: compact_tx/rx + gc_tx/rx +
-      io_bucket now passed in (channels created on main thread)
-    * PartitionData: + io_bucket field
+    - IoTokenBucket renamed to AdmissionController; state now tracks
+      fg_bytes + bg_bytes independently (single 1s wall-clock window)
+    - account() split into:
+        account_fg(bytes).await — sleeps only when fg_rate > 0 AND
+                                  exceeded; default unlimited
+        account_bg(bytes).await — sleeps until BOTH bg ceiling AND
+                                  fg-aware yield (when fg observed
+                                  rate > saturation_ratio * fg_rate)
+    - new env vars: AUTUMN_PS_FG_RATE_BYTES_PER_SEC (default 0),
+                    AUTUMN_PS_FG_SATURATED_THRESHOLD (default 0.8)
+                    AUTUMN_PS_BG_RATE_BYTES_PER_SEC (default 256 MiB/s,
+                    same as F188)
+    - new test module f189_admission_tests (7 tests)
   crates/partition-server/src/background.rs
-    * background_compact_loop:
-      - random_delay 10-20s → 5-7s (metric-refresh-only)
-      - Timeout branch: only refreshes pending_compaction_bytes
-        + does expiry-major check (wall-clock event, scheduler
-        can't see). Minor-compact-on-timer REMOVED.
-      - Recv branch: bool payload now means is_major; minor goes
-        through pickup_tables path
-    * background_gc_loop: random_delay 30-60s → 5-7s; same Auto
-      handling on Recv
-    * do_compact: + io_bucket.account() before each compact_row_append
-    * flush_gc_batch + process_gc_chunk + run_gc: + io_bucket.account()
-      threaded through; F141's GcRateLimiter retained as inner cap
-  crates/partition-server/CLAUDE.md
-    note 11 extended with F188 Stage 2 + Stage 3 deferral
+    - start_write_batch calls admission.account_fg(total_value_bytes)
+      .await once per batch before Phase 2 launch (the FG hot path)
+    - all BG sites: io_bucket.account(...) → io_bucket.account_bg(...)
   feature_list.md
-    F188 row + Open/Deferred section
+    - F189 row + Open/Deferred entry (mechanism + verification + Stage 4
+      future deferrals)
+  crates/partition-server/CLAUDE.md
+    - note 11 extended with F189 admission controller details
   claude-progress.txt
-    this file
+    - this file
 
-Build + tests:
-  cargo check -p autumn-partition-server  : clean (3 pre-existing warns)
-  cargo test -p autumn-partition-server --lib -- --test-threads=1
-                                          : 124/124 (no regression vs F187)
-  cargo test -p autumn-manager --lib       : 58/58 (no regression vs F187)
-  cargo test -p autumn-rpc                 : 13/13
+Tests:
+  cargo check -p autumn-partition-server          : clean
+  cargo test -p autumn-partition-server --lib
+                                  -- --test-threads=1 : 131/131
+                                  (was 124, +7 F189)
+  cargo test -p autumn-rpc                        : 13/13
+  cargo test -p autumn-manager --lib              : 58/58
+  Live cluster: fg ceiling honored to 0.2%
 
-Live cluster load:
-  4-node, default partition (3+1 EC log/row, 3+0 meta).
-  AUTUMN_POLICY_FAST_MODE=1 (manager) +
-  AUTUMN_PS_GC_DEBT_HIGH_BYTES=1MiB
-  AUTUMN_PS_COMPACT_PENDING_HIGH_BYTES=4MiB
-  AUTUMN_PS_GC_COOLDOWN_SECS=30
-  AUTUMN_PS_COMPACT_COOLDOWN_SECS=30
-  AUTUMN_PS_BG_RATE_BYTES_PER_SEC=32MiB
-  Workload: wbench --threads 32 --duration 90 --size 1024 + manual
-            major compact (to tag discards).
-  Result: scheduler dispatched GC every 5s once debt crossed 1 MiB,
-          urgency = 4661 (debt 4.6 GB / threshold 1 MiB), respecting
-          cooldown.
+Cluster currently RUNNING with Stage 3 active. Default config in
+production should be:
+  AUTUMN_PS_FG_RATE_BYTES_PER_SEC=0           (unlimited; backwards-compat)
+  AUTUMN_PS_BG_RATE_BYTES_PER_SEC=268435456   (256 MiB/s)
+  AUTUMN_PS_FG_SATURATED_THRESHOLD=0.8
 
-Pre-existing observation (not F188-caused): under heavy
-overwrite-style wbench (16K values), foreground throughput
-occasionally drops to ~2 MB/s. Investigation deferred — likely
-related to memtable rotation cadence under VP-heavy load and
-unrelated to F188's bg path. F188's io_bucket.account() applies
-ONLY to GC + compact, not foreground writes, so it cannot cause
-foreground regressions by construction.
+Operators who want to enforce a fg ceiling for predictable bg
+behaviour can set AUTUMN_PS_FG_RATE_BYTES_PER_SEC > 0; the bg fg-aware
+yield activates at that point.
 
-Final commit: pending (user owns commit decision per
-feedback_push_to_main.md memory).
+Next steps:
+  - Distributed-system race review (in progress in the conversation
+    after this commit)
+  - Stage 4 (deferred): per-op priority hints, per-extent-node
+    bandwidth attribution, integrate with F183 advisory's req_per_sec
+    instead of local 1s window.
 
-Cluster currently RUNNING with Stage 2 active. Use
-`/data/dongmao_dev/autumn-rs/cluster.sh stop` to tear down when done.
+Final commit: pending.

@@ -519,7 +519,7 @@ pub(crate) async fn start_write_batch(
     let phase1_started_at = Instant::now();
 
     // Phase 1a: validate + assign seq + collect entries.
-    let (mut valid, log_stream_id, part_sc) = {
+    let (mut valid, log_stream_id, part_sc, admission) = {
         let mut p = part.borrow_mut();
 
         let mut valid: Vec<ValidatedEntry> = Vec::with_capacity(batch.len());
@@ -557,7 +557,8 @@ pub(crate) async fn start_write_batch(
 
         let log_stream_id = p.log_stream_id;
         let part_sc = p.stream_client.clone();
-        (valid, log_stream_id, part_sc)
+        let admission = p.io_bucket.clone();
+        (valid, log_stream_id, part_sc, admission)
     };
     // borrow_mut released here — safe to await below.
 
@@ -663,6 +664,13 @@ pub(crate) async fn start_write_batch(
     // ms NVMe). Flush adds ≈ 0 ms on the happy path (coalescer fires
     // when first waiter arrives; flush builds SST in parallel).
     let phase1_ns = duration_to_ns(phase1_started_at.elapsed());
+
+    // F189: foreground admission. Per-batch single Mutex acquire +
+    // bytes accounting. By default (AUTUMN_PS_FG_RATE_BYTES_PER_SEC=0)
+    // returns immediately after the lock — no sleep on the hot path.
+    // When set, this is the back-pressure point that lets bg writers
+    // see fg's actual rate and choose to yield via account_bg.
+    admission.account_fg(total_value_bytes).await;
 
     // Launch Phase 2 as a future (not awaited yet).
     let phase2_started_at = Instant::now();
@@ -1128,7 +1136,7 @@ pub(crate) async fn do_compact(
             // AUTUMN_PS_BG_RATE_BYTES_PER_SEC. Sleep happens BEFORE the
             // append so the bucket reflects "intent to write" rather
             // than counts after-the-fact, matching F141's pattern.
-            io_bucket.account(chunk_bytes).await;
+            io_bucket.account_bg(chunk_bytes).await;
             // F135: route through P-bulk's StreamClient to preserve the
             // single-writer invariant on row_stream.
             let result = compact_row_append(&row_append_tx, &part_sc, row_stream_id, sst_bytes.clone()).await?;
@@ -1188,7 +1196,7 @@ pub(crate) async fn do_compact(
         let chunk_bytes = sst_bytes.len() as u64;
         output_bytes += chunk_bytes;
         // F188: same PS-wide budget account as the per-chunk emit above.
-        io_bucket.account(chunk_bytes).await;
+        io_bucket.account_bg(chunk_bytes).await;
         // F135: route through P-bulk's StreamClient to preserve the
         // single-writer invariant on row_stream.
         let result = compact_row_append(&row_append_tx, &part_sc, row_stream_id, sst_bytes.clone()).await?;
@@ -1503,7 +1511,7 @@ async fn flush_gc_batch(
     part_sc: &Rc<StreamClient>,
     batch: &mut GcWriteBatch,
     rate_limiter: &mut GcRateLimiter,
-    io_bucket: &std::sync::Arc<crate::IoTokenBucket>,
+    io_bucket: &std::sync::Arc<crate::AdmissionController>,
     moved: &mut usize,
 ) -> Result<()> {
     if batch.is_empty() {
@@ -1556,7 +1564,7 @@ async fn flush_gc_batch(
         compio::time::sleep(sleep_dur).await;
     }
     // F188: PS-wide budget on the GC append side too.
-    io_bucket.account(batch_bytes).await;
+    io_bucket.account_bg(batch_bytes).await;
 
     Ok(())
 }
@@ -1676,7 +1684,7 @@ pub(crate) async fn run_gc(
         // partitions on this PS, in addition to F141's per-partition
         // limiter above. Prevents N partitions × per-partition rate
         // from blowing past the cluster ceiling.
-        io_bucket.account(chunk_len).await;
+        io_bucket.account_bg(chunk_len).await;
     }
 
     if !carry.is_empty() {
@@ -1740,7 +1748,7 @@ async fn process_gc_chunk(
     moved: &mut usize,
     batch: &mut GcWriteBatch,
     rate_limiter: &mut GcRateLimiter,
-    io_bucket: &std::sync::Arc<crate::IoTokenBucket>,
+    io_bucket: &std::sync::Arc<crate::AdmissionController>,
 ) -> Result<usize> {
     // F158: decode via shared codec — handles both V0 (legacy on-disk) and V1
     // (post-F158 with CRC). On a V1 CRC failure we log + skip + continue,

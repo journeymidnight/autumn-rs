@@ -101,6 +101,7 @@
 | F186 | Client-side striperados (Ceph pattern) replaces F129/F130 server multipart — pure ClusterClient impl | client |
 | F187 | GC + compaction maintenance advisory (Stage 1) — debt metrics + PolicyEngine emits POLICY_KIND_GC/COMPACT alongside SPLIT/MERGE | partition/manager/client |
 | F188 | GC + compaction Stage 2 — PS-level priority maintenance scheduler + foreground awareness + shared IO token bucket between GC + compact | partition |
+| F189 | GC + compaction Stage 3 — two-class admission controller (fg priority + bg elastic, CockroachDB kvadmission style) | partition |
 | ~~F129~~ | ~~PutStream / GetStream — multipart + multi-frag VP~~ — SUPERSEDED by F186 (server code ripped out) | — |
 | ~~F130~~ | ~~GC active rewrite for multi-frag VPs~~ — SUPERSEDED by F186 (no multi-frag any more) | — |
 
@@ -354,6 +355,20 @@
 ---
 
 ## Open / Deferred designs
+
+### F189 · GC + compaction Stage 3 — two-class admission controller (fg priority + bg elastic)
+
+- **Target:** F188 Stage 2 added a PS-wide IoTokenBucket but only on the BG (GC + compact) side; FG writes bypassed it entirely. Under sustained FG load BG would still grab tokens at full rate, contending with FG on the same network and extent-node pwrite path. F189 closes the loop by replacing IoTokenBucket with a two-class admission controller (CockroachDB kvadmission pattern, simplified): FG gets a configurable hard ceiling, BG explicitly yields to FG when FG observed rate crosses a saturation threshold.
+- **Mechanism (controller):** new `AdmissionController` (parking_lot::Mutex<{window_start, fg_bytes, bg_bytes}>, 1s wall-clock window). `account_fg(bytes).await` sleeps only when an explicit fg ceiling is set AND would be exceeded — default `AUTUMN_PS_FG_RATE_BYTES_PER_SEC=0` (unlimited) returns immediately after a single Mutex acquire to keep the request hot path cheap. `account_bg(bytes).await` sleeps until BOTH constraints hold: (1) bg's own ceiling `AUTUMN_PS_BG_RATE_BYTES_PER_SEC` (default 256 MiB/s), AND (2) fg-aware yield — when fg observed rate > `AUTUMN_PS_FG_SATURATED_THRESHOLD * fg_rate` (default 0.8), bg waits till the next window. Fg-aware yield is disabled when fg_rate=0 (no baseline to detect saturation).
+- **Mechanism (wire):** `start_write_batch` (the FG hot path) calls `admission.account_fg(total_value_bytes).await` once per batch, just before launching Phase 2. Per-batch (not per-op) keeps the lock acquisition rate at ~1/256 of per-op overhead. GC + compact append paths (`do_compact`, `flush_gc_batch`, `process_gc_chunk`, `run_gc`) call `account_bg` instead of F188's `IoTokenBucket::account`. F141's per-partition GC limiter retained as inner cap (defense in depth).
+- **Tests:** `f189_admission_tests` (7 tests, all passing): fg_unlimited_no_sleep, bg_unlimited_no_sleep, bg_respects_own_rate, bg_yields_when_fg_saturated, bg_does_not_yield_when_fg_idle, bg_ignores_fg_when_fg_unlimited, window_resets_after_1s.
+- **Live cluster verification (2026-05-10):** with `AUTUMN_PS_FG_RATE_BYTES_PER_SEC=10485760` (10 MiB/s), 16-thread wbench at 8 KiB values self-throttled to **9.98 MB/s** — admission ceiling honored to 0.2% — with p50 latency rising from ~1ms (unthrottled baseline) to 12.5ms (throttled queueing, expected).
+- **passes:** true (build clean, 131 PS lib + 58 manager lib + 13 RPC tests pass; live admission throttle verified).
+- **Files changed:**
+  - `crates/partition-server/src/lib.rs` — `IoTokenBucket` → `AdmissionController` with `account_fg` + `account_bg`. Field rename `io_bucket` → kept (semantic alias). New `f189_admission_tests` module (7 tests).
+  - `crates/partition-server/src/background.rs` — `start_write_batch` calls `admission.account_fg(total_value_bytes).await` once per batch before Phase 2. All BG `.account(...)` calls renamed to `.account_bg(...)`.
+  - `feature_list.md`, `claude-progress.txt`, `crates/partition-server/CLAUDE.md` — docs.
+- **Stage 4 / future (deferred):** explicit per-op priority hints (e.g. user-marked `IsPriority=true` writes from latency-sensitive paths bypass admission); per-extent-node bandwidth attribution so admission decisions reflect actual disk pressure rather than cluster-aggregate; integration with the F183 policy advisory (advisories already mark `req_per_sec` — could feed into admission's saturation calc instead of the local 1s window).
 
 ### F188 · GC + compaction Stage 2 — PS-level priority scheduler + shared IO bucket
 
