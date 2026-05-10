@@ -21,6 +21,7 @@ uuid.workspace = true
 autumn-stream = { path = "../stream" }
 autumn-partition-server = { path = "../partition-server" }
 autumn-client = { path = "../client" }
+futures = "0.3"
 autumn-rpc = { path = "../rpc" }
 autumn-etcd = { path = "../etcd" }
 compio = { version = "0.18", features = ["net", "time", "macros"] }
