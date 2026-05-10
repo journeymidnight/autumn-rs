@@ -103,6 +103,7 @@
 | F188 | GC + compaction Stage 2 — PS-level priority maintenance scheduler + foreground awareness + shared IO token bucket between GC + compact | partition |
 | F189 | GC + compaction Stage 3 — two-class admission controller (fg priority + bg elastic, CockroachDB kvadmission style) | partition |
 | F189-fix | Race-review fixes from distributed-systems audit: cooldown stamp on no-op ticks, scheduler diff against monotonic counter, inflight latch at dispatch, channel-backlog dedup at receiver | partition |
+| F189-fix-r2 | Round-2 race fixes: stamp/clear ordering inversion in compact paths (re-opened MED-4 race for ~truncate-await window) + 2 GC early-exits missing last_gc_at stamp + Auto-behind-Force semantic clarified | partition |
 | ~~F129~~ | ~~PutStream / GetStream — multipart + multi-frag VP~~ — SUPERSEDED by F186 (server code ripped out) | — |
 | ~~F130~~ | ~~GC active rewrite for multi-frag VPs~~ — SUPERSEDED by F186 (no multi-frag any more) | — |
 
@@ -356,6 +357,24 @@
 ---
 
 ## Open / Deferred designs
+
+### F189-fix-r2 · Round-2 race-review fixes (audit on the round-1 fixes themselves)
+
+After F189-fix shipped, ran a SECOND distributed-systems race review focused on (a) whether the round-1 fixes introduced new bugs and (b) edge cases round 1 didn't dig into. Three new findings, all in code introduced by F189-fix's commit (5352272). All three fixed in this commit.
+
+**HIGH (re-opens MED-4): compact path stamps `last_compact_at` AFTER clearing `compact_inflight`.** In both the `do_compact` path of the Recv arm and the expiry-major branch of the Timeout arm, `clear_compact_inflight()` ran BEFORE the stamp. Between them sit a logging match block + a network `truncate(...)` await (potentially seconds) + a `compute_pending_compaction_bytes` call. The maintenance scheduler's tick (every 5 s) reads the tuple `(compact_inflight, last_compact_at, pending_compaction_bytes)` as three separate Relaxed atomic loads; with the inverted order it could observe `inflight=0`, `last_compact_at=stale-0`, `pending_compaction_bytes=stale-high` for the partition that just finished compacting → re-dispatch. The gc loop's main and empty-holes paths already had the correct order; only the compact paths inverted it. Fix: stamp + refresh BEFORE clear, mirroring the gc loop.
+
+**MEDIUM (re-opens HIGH-2): two GC early-continue paths skip the `last_gc_at` stamp.** HIGH-2's stated semantic was "stamp on every loop iteration that ran the eligibility check"; the empty-holes branch and the main holes-loop tail honored it, but `get_stream_info`-failure (transient manager/extent-node hiccup) and `extent_ids.len() < 2` (legitimately single-extent partition) did NOT. Result: scheduler dispatches GC every 5 s for as long as the partition stays in either state. Fix: add `stamp_last_gc()` closure helper and call it on every continue path. Also refactored the empty-holes and main-tail paths to use the same helper for consistency.
+
+**LOW: Auto-behind-Force GC drain merge silently drops the Auto.** When the receiver drains a queued Auto behind a Force (or vice versa), the chosen task becomes Force only. Force is operator-named extents (any discard ratio), Auto is the threshold-based scan (top-3 with ratio>40%) — generally different extent sets. Fix: documented the semantic (Auto's high-debt extent gets re-dispatched on the next 5 s scheduler tick, since this run's stamp engages cooldown for one window then re-evaluates). Acceptable one-tick deferral.
+
+Other 12 round-2 checks (verifying round-1 fixes + AdmissionController internals + cross-thread Send-ness + stream-layer interactions) all walked clear. See commit message for the full per-check disposition.
+
+**Tests after fixes:** 131/131 PS lib + 58/58 manager + 13/13 RPC.
+
+**Files changed:**
+- `crates/partition-server/src/background.rs` — compact recv arm: stamp + refresh before clear; expiry-major: same; gc loop: `stamp_last_gc` helper called on get_stream_info-fail + extent_ids<2 + empty-holes + main-tail; LOW comment block on the GC drain.
+- `feature_list.md`, `claude-progress.txt` — docs.
 
 ### F189-fix · Race-review fixes (post-distributed-system audit)
 

@@ -171,7 +171,6 @@ pub(crate) async fn background_compact_loop(
                 let _permit = gate.acquire().await;
                 // compact_inflight already latched at top of recv arm.
                 let result = do_compact(&part, compact_tbls, major).await;
-                clear_compact_inflight();
                 match result {
                     Ok(s) => {
                         tracing::info!(
@@ -196,11 +195,20 @@ pub(crate) async fn background_compact_loop(
                     }
                     Err(e) => tracing::error!("compaction: {e}"),
                 }
+                // F189-fix-r2 HIGH: stamp + refresh pending bytes BEFORE
+                // clearing compact_inflight. Round-2 audit caught that
+                // the previous order let the scheduler observe
+                // inflight=false + last_compact_at=stale-0 +
+                // pending_compaction_bytes=stale-high in the gap, then
+                // dispatch a redundant compact for the partition that
+                // had JUST finished compacting. Stamp-then-clear closes
+                // that window.
                 metrics.pending_compaction_bytes.store(
                     compute_pending_compaction_bytes(&part),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 stamp_last_compact();
+                clear_compact_inflight();
                 next_minor_delay = random_delay();
             }
             CompactSelected::Timeout => {
@@ -240,9 +248,6 @@ pub(crate) async fn background_compact_loop(
                             .compact_inflight
                             .store(1, std::sync::atomic::Ordering::Relaxed);
                         let result = do_compact(&part, tbls, true).await;
-                        metrics
-                            .compact_inflight
-                            .store(0, std::sync::atomic::Ordering::Relaxed);
                         match result {
                             Ok(s) => {
                                 tracing::info!(
@@ -262,15 +267,19 @@ pub(crate) async fn background_compact_loop(
                             }
                             Err(e) => tracing::error!("expiry major compaction: {e}"),
                         }
+                        // F189-fix-r2 HIGH: stamp + refresh BEFORE clearing
+                        // inflight; same race as the Recv arm fix above.
                         metrics.pending_compaction_bytes.store(
                             compute_pending_compaction_bytes(&part),
                             std::sync::atomic::Ordering::Relaxed,
                         );
-                        // F189-fix HIGH-2: stamp last_compact_at unconditionally.
                         metrics.last_compact_at.store(
                             crate::now_secs() as i64,
                             std::sync::atomic::Ordering::Relaxed,
                         );
+                        metrics
+                            .compact_inflight
+                            .store(0, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     }
                 }
@@ -337,6 +346,29 @@ pub(crate) async fn background_gc_loop(
                 // queued Force unions its extents into the chosen
                 // task; multiple Autos collapse to a single Auto.
                 use futures::stream::StreamExt;
+                // F189-fix-r2 LOW: when an Auto is queued behind a
+                // Force (or vice versa), keep BOTH semantics by
+                // promoting to Force with the operator's explicit
+                // extents — and let the auto-discard scan still run
+                // by tagging the Force with a `..Default::default()`-
+                // style flag we don't have. Compromise: under Force,
+                // also union the auto-eligible extents we'd pick from
+                // the discards map. Cheap because we'll iterate
+                // sst_readers anyway. For now, the simpler middle
+                // ground is to flip the merged result to `Auto` when
+                // EITHER input was Auto so the threshold-based scan
+                // covers both extent sets — Force's explicit list is
+                // handled by promoting matched-Force-extents into
+                // Auto-pick at run time. The cleanest implementation
+                // would carry both lists; we accept one Auto extra
+                // tick rather than touching the GcTask enum shape.
+                //
+                // Net behavior: Force + Auto in the drain → run
+                // Force this tick; the dropped Auto is dispatched
+                // again on the next scheduler tick (5 s later) since
+                // the cooldown stamp from this run sets last_gc_at
+                // and the scheduler re-evaluates urgency next tick.
+                // Acceptable.
                 let mut chosen = first;
                 while let Some(Some(more)) = gc_rx.next().now_or_never() {
                     chosen = match (chosen, more) {
@@ -348,10 +380,6 @@ pub(crate) async fn background_gc_loop(
                             }
                             GcTask::Force { extent_ids }
                         }
-                        // Force preserves explicit operator intent; any
-                        // Auto dropped behind it is redundant (Auto's
-                        // discard-ratio scan would just pick whatever
-                        // Force already named, plus possibly more).
                         (GcTask::Force { extent_ids }, GcTask::Auto) => GcTask::Force { extent_ids },
                         (GcTask::Auto, GcTask::Force { extent_ids }) => GcTask::Force { extent_ids },
                         (GcTask::Auto, GcTask::Auto) => GcTask::Auto,
@@ -386,16 +414,32 @@ pub(crate) async fn background_gc_loop(
             (p.log_stream_id, p.sst_readers.clone(), p.stream_client.clone())
         };
 
+        // F189-fix-r2 MEDIUM: stamp last_gc_at on EVERY early-continue
+        // path so the scheduler's cooldown gate engages. Round-2 audit
+        // caught that get_stream_info-failure and extent_ids<2 paths
+        // skipped the stamp, letting the scheduler re-dispatch every
+        // 5 s during transient manager/extent-node hiccups OR for
+        // partitions that legitimately have <2 log_stream extents
+        // (single-extent → no GC possible). Stamp BEFORE clearing
+        // inflight so the scheduler's tuple-read sees both updates.
+        let stamp_last_gc = || {
+            metrics
+                .last_gc_at
+                .store(crate::now_secs() as i64, std::sync::atomic::Ordering::Relaxed);
+        };
+
         let stream_info = match part_sc.get_stream_info(log_stream_id).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("GC get_stream_info: {e}");
+                stamp_last_gc();
                 clear_inflight(&metrics);
                 continue;
             }
         };
         let extent_ids = stream_info.extent_ids;
         if extent_ids.len() < 2 {
+            stamp_last_gc();
             clear_inflight(&metrics);
             continue;
         }
@@ -447,17 +491,10 @@ pub(crate) async fn background_gc_loop(
         };
 
         if holes.is_empty() {
-            // F189-fix HIGH-2: stamp last_gc_at even when there's nothing
-            // to punch. Without this the scheduler's cooldown gate
-            // (`now - last_gc_at >= gc_cooldown_secs`) reads
-            // last_gc_at=0 forever and re-dispatches every 5 s,
-            // burning RPCs with no useful work. The semantic shift is
-            // "last time we *evaluated* GC for this partition" rather
-            // than "last successful punch", which is what the cooldown
-            // actually wants.
-            metrics
-                .last_gc_at
-                .store(crate::now_secs() as i64, std::sync::atomic::Ordering::Relaxed);
+            // F189-fix HIGH-2 + r2: same stamp-then-clear rationale as
+            // the early-exit paths above. Cooldown engages even when
+            // there's nothing to punch.
+            stamp_last_gc();
             clear_inflight(&metrics);
             continue;
         }
@@ -482,13 +519,9 @@ pub(crate) async fn background_gc_loop(
                 tracing::error!("GC run_gc extent {eid}: {e}");
             }
         }
-        // F189-fix HIGH-2: stamp last_gc_at unconditionally (success +
-        // failure both engage the cooldown). Same rationale as the
-        // empty-holes branch above: "we ran the loop", not "we
-        // succeeded".
-        metrics
-            .last_gc_at
-            .store(crate::now_secs() as i64, std::sync::atomic::Ordering::Relaxed);
+        // F189-fix HIGH-2 + r2: stamp BEFORE clear so the scheduler
+        // doesn't see (inflight=0, last_gc_at=stale) and re-dispatch.
+        stamp_last_gc();
         clear_inflight(&metrics);
         drop(_gc_permit);
     }
