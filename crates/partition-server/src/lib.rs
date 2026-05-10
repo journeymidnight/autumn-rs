@@ -514,6 +514,11 @@ pub(crate) struct PartitionData {
     /// acquires this to ensure run_gc has no log_stream append in-flight when
     /// commit_length is read.
     pub(crate) gc_gate: std::sync::Arc<CompactionGate>,
+    /// F188: PS-wide background-IO token bucket. Shared with every other
+    /// partition on this PS; GC + compact append paths call
+    /// `io_bucket.account(bytes).await` before each write so a single PS
+    /// can't blow past the cluster's BG_RATE budget.
+    pub(crate) io_bucket: std::sync::Arc<crate::IoTokenBucket>,
     /// F162 (MED-2): per-extent reader-pin map. `handle_get → resolve_value`
     /// reads a ValuePointer from an SST, drops the partition borrow, and
     /// awaits `read_bytes_from_extent` on log_stream. Without coordination,
@@ -583,6 +588,35 @@ pub struct PartitionMetrics {
     /// Bytes resident: SST total + active.bytes + Σ imm.bytes. Updated
     /// after each flush + memtable rotate (cheap; under borrow_mut).
     pub size_bytes: std::sync::atomic::AtomicU64,
+    /// F187: aggregated discard bytes on sealed log_stream extents that
+    /// the GC loop would target. Refreshed by the GC loop's read-only
+    /// prefix (no extra RPCs) and shipped via report_load_loop. Manager
+    /// emits a `POLICY_KIND_GC` advisory when this stays above
+    /// `gc_debt_high` for `policy.required_buckets` consecutive ticks
+    /// outside the gc cooldown.
+    pub gc_debt_bytes: std::sync::atomic::AtomicU64,
+    /// F187: bytes of SSTable data that compaction would consume on its
+    /// next pass — sum of (head-extent table sizes when head-ratio < 30 %)
+    /// + (overlap-tagged tables when has_overlap == 1). Refreshed by the
+    /// compact loop's periodic tick. Manager emits a `POLICY_KIND_COMPACT`
+    /// advisory when sustained above `compact_pending_high`.
+    pub pending_compaction_bytes: std::sync::atomic::AtomicU64,
+    /// F187: 1 while `background_gc_loop` is inside `run_gc`, else 0. Lets
+    /// operators see stuck-GC at a glance and lets the policy engine skip
+    /// duplicate advisories for an already-active GC.
+    pub gc_inflight: std::sync::atomic::AtomicU32,
+    /// F187: 1 while `background_compact_loop` is inside `do_compact`,
+    /// else 0.
+    pub compact_inflight: std::sync::atomic::AtomicU32,
+    /// F187: unix-epoch seconds of the last successful GC `punch_holes`
+    /// completion. 0 if never run since process start. Used by the policy
+    /// engine to enforce cooldown (no advisory while `now - last_gc_at <
+    /// gc_cooldown_sec`).
+    pub last_gc_at: std::sync::atomic::AtomicI64,
+    /// F187: unix-epoch seconds of the last successful `do_compact`
+    /// commit. 0 if never run since process start. Used for compact
+    /// cooldown.
+    pub last_compact_at: std::sync::atomic::AtomicI64,
 }
 
 impl PartitionData {
@@ -1002,6 +1036,14 @@ struct PartitionHandle {
     /// read by the main thread's `report_load_loop`. Arc is Send so this
     /// is safe to clone across threads.
     metrics: std::sync::Arc<PartitionMetrics>,
+    /// F188: clone of the partition's compact-trigger sender. Held on the
+    /// main thread so the maintenance scheduler loop can dispatch
+    /// compact runs without going through the loopback PS RPC. Same
+    /// channel as the in-thread `PartitionData.compact_tx`; the receiver
+    /// inside `background_compact_loop` is unchanged.
+    compact_trigger: mpsc::Sender<bool>,
+    /// F188: same shape for GC.
+    gc_trigger: mpsc::Sender<GcTask>,
     /// F184: snapshot of (rg, log/row/meta stream ids) at open time.
     /// `sync_regions_once` compares this against the latest manager
     /// regions snapshot to detect a wider rg (post-merge) or new
@@ -1049,6 +1091,84 @@ pub struct PartitionServer {
     /// F104 — global cap on simultaneous compactions across partitions
     /// hosted by this PS process. See `CompactionGate` docs above.
     compact_gate: std::sync::Arc<CompactionGate>,
+    /// F188 — PS-wide background-IO token bucket. Shared by every
+    /// partition's GC + compact append paths. Foreground writes do NOT
+    /// consult it (true admission control with elastic vs priority
+    /// tokens is Stage 3 territory). Default rate: 256 MiB/s. Tunable
+    /// via env `AUTUMN_PS_BG_RATE_BYTES_PER_SEC` (0 = unlimited).
+    pub(crate) io_bucket: std::sync::Arc<IoTokenBucket>,
+}
+
+/// F188: simple wall-clock token-bucket rate limiter for background IO
+/// (GC + compaction). Shared across all partitions on a PS. Replaces the
+/// per-partition `GcRateLimiter` (F141) for the network-write side of
+/// background work, ensuring N partitions × default 64 MiB/s GC + whatever
+/// compaction adds doesn't blow past a single tunable cluster ceiling.
+///
+/// Foreground writes do NOT consult this bucket. Stage 3 will add a
+/// foreground/elastic split (CockroachDB admission-control style) where
+/// fg gets priority tokens and bg gets elastic tokens that yield to fg.
+pub struct IoTokenBucket {
+    rate_bytes_per_sec: u64,
+    state: parking_lot::Mutex<IoTokenState>,
+}
+
+struct IoTokenState {
+    window_start: Instant,
+    bytes_in_window: u64,
+}
+
+impl IoTokenBucket {
+    pub fn new(rate_bytes_per_sec: u64) -> Self {
+        Self {
+            rate_bytes_per_sec,
+            state: parking_lot::Mutex::new(IoTokenState {
+                window_start: Instant::now(),
+                bytes_in_window: 0,
+            }),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        let rate = std::env::var("AUTUMN_PS_BG_RATE_BYTES_PER_SEC")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(256 * 1024 * 1024);
+        Self::new(rate)
+    }
+
+    /// Account for `bytes` consumed; sleep until the budget would allow.
+    /// Returns immediately if rate=0 (unlimited).
+    ///
+    /// The mutex is held only across the synchronous accounting calc;
+    /// the sleep happens outside the lock so contending callers see the
+    /// updated `bytes_in_window` without blocking on wall-clock catch-up.
+    pub async fn account(&self, bytes: u64) {
+        if self.rate_bytes_per_sec == 0 {
+            return;
+        }
+        let sleep_for = {
+            let mut s = self.state.lock();
+            let elapsed = s.window_start.elapsed();
+            if elapsed >= Duration::from_secs(1) {
+                s.window_start = Instant::now();
+                s.bytes_in_window = 0;
+                None
+            } else {
+                s.bytes_in_window = s.bytes_in_window.saturating_add(bytes);
+                let target_secs = s.bytes_in_window as f64 / self.rate_bytes_per_sec as f64;
+                let target = Duration::from_secs_f64(target_secs);
+                if target > elapsed {
+                    Some(target - elapsed)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(d) = sleep_for {
+            compio::time::sleep(d).await;
+        }
+    }
 }
 
 impl PartitionServer {
@@ -1149,6 +1269,7 @@ impl PartitionServer {
                                 String::from("0.0.0.0"),
                             )),
                             compact_gate: CompactionGate::new(ps_major_compact_parallelism()),
+                            io_bucket: std::sync::Arc::new(IoTokenBucket::from_env()),
                         };
                         return Ok(server);
                     } else if resp.code == manager_rpc::CODE_NOT_LEADER {
@@ -1197,6 +1318,14 @@ impl PartitionServer {
         // F183: per-partition load metrics report (5 s cadence).
         let s = server.clone();
         compio::runtime::spawn(async move { s.report_load_loop().await }).detach();
+
+        // F188: PS-level maintenance scheduler. Replaces the per-partition
+        // random-jitter compact/gc timers with a foreground-aware priority
+        // dispatcher that picks the partition with the highest debt-to-
+        // threshold ratio under per-PS concurrency caps + skips when
+        // sustained foreground req/sec exceeds AUTUMN_PS_FG_QPS_QUOTA.
+        let s = server.clone();
+        compio::runtime::spawn(async move { s.maintenance_scheduler_loop().await }).detach();
 
         server.sync_regions_once().await?;
 
@@ -1295,24 +1424,32 @@ impl PartitionServer {
                 parts
                     .iter()
                     .map(|(part_id, handle)| {
-                        let req = handle
-                            .metrics
-                            .req_count
-                            .swap(0, std::sync::atomic::Ordering::Relaxed);
-                        let imm_full = handle
-                            .metrics
-                            .imm_full_count
-                            .swap(0, std::sync::atomic::Ordering::Relaxed);
-                        let size_bytes = handle
-                            .metrics
-                            .size_bytes
-                            .load(std::sync::atomic::Ordering::Relaxed);
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let req = handle.metrics.req_count.swap(0, Relaxed);
+                        let imm_full = handle.metrics.imm_full_count.swap(0, Relaxed);
+                        let size_bytes = handle.metrics.size_bytes.load(Relaxed);
+                        // F187: maintenance debt + inflight + last-run timestamps.
+                        // gc_debt/pending_compaction are gauges (load, no swap);
+                        // *_inflight are 0/1 booleans.
+                        let gc_debt_bytes = handle.metrics.gc_debt_bytes.load(Relaxed);
+                        let pending_compaction_bytes =
+                            handle.metrics.pending_compaction_bytes.load(Relaxed);
+                        let gc_inflight = handle.metrics.gc_inflight.load(Relaxed);
+                        let compact_inflight = handle.metrics.compact_inflight.load(Relaxed);
+                        let last_gc_at = handle.metrics.last_gc_at.load(Relaxed);
+                        let last_compact_at = handle.metrics.last_compact_at.load(Relaxed);
                         manager_rpc::PartitionLoad {
                             part_id: *part_id,
                             size_bytes,
                             req_per_sec: (req / REPORT_INTERVAL_SECS) as u32,
                             imm_full_per_sec: (imm_full / REPORT_INTERVAL_SECS) as u32,
                             p99_us: 0,
+                            gc_debt_bytes,
+                            pending_compaction_bytes,
+                            gc_inflight,
+                            compact_inflight,
+                            last_gc_at,
+                            last_compact_at,
                         }
                     })
                     .collect()
@@ -1330,6 +1467,212 @@ impl PartitionServer {
                 .await
             {
                 tracing::debug!("F183 report_load failed: {e}");
+            }
+        }
+    }
+
+    /// F188 PS-level maintenance scheduler. Runs on the main thread; uses
+    /// the per-partition metrics already collected by `PartitionMetrics`
+    /// (Arc<>, Send-safe). Replaces the per-partition random-jitter
+    /// compact/gc timers with a foreground-aware priority dispatcher:
+    ///
+    /// 1. Every `SCHEDULE_INTERVAL_SECS` seconds, walk every PartitionHandle.
+    /// 2. Compute compact + GC priority per partition: `debt_bytes /
+    ///    threshold` (urgency); zero if below threshold or already
+    ///    inflight or last-run-too-recent.
+    /// 3. Skip a partition entirely when its sustained foreground req/sec
+    ///    over the last interval exceeds `AUTUMN_PS_FG_QPS_QUOTA`
+    ///    (default 50K) — matches the F183 advisory's spirit ("don't
+    ///    crush the system") at the dispatch layer.
+    /// 4. Sort by urgency desc; for the top-K (capped to keep this loop
+    ///    cheap), `try_send` the trigger via the partition's compact /
+    ///    gc Sender clone held in PartitionHandle. Already-busy partitions
+    ///    silently no-op via the channel's `Full` error since the in-thread
+    ///    receiver hasn't drained yet.
+    ///
+    /// This does NOT remove the in-thread compact/gc loops; they still
+    /// service these triggers. F188-B kills only the random-jitter timer
+    /// inside those loops, leaving the channel-driven path as the sole
+    /// trigger source besides the manual `client compact|gc` RPCs.
+    async fn maintenance_scheduler_loop(&self) {
+        const SCHEDULE_INTERVAL_SECS: u64 = 5;
+        // Match F183's required-buckets default (5) — 5 × 5 s = 25 s of
+        // metric history before we'll fire something off the timer.
+        let fg_qps_quota: u32 = std::env::var("AUTUMN_PS_FG_QPS_QUOTA")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n: &u32| n > 0)
+            .unwrap_or(50_000);
+        // Same defaults as the F187 PolicyConfig — the scheduler is the
+        // local executor of the same advisories, so keeping the trigger
+        // threshold == advisory threshold makes the two layers coherent.
+        let gc_debt_high: u64 = std::env::var("AUTUMN_PS_GC_DEBT_HIGH_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n: &u64| n > 0)
+            .unwrap_or(1024 * 1024 * 1024);
+        let compact_pending_high: u64 = std::env::var("AUTUMN_PS_COMPACT_PENDING_HIGH_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n: &u64| n > 0)
+            .unwrap_or(4 * 1024 * 1024 * 1024);
+        // Cooldown between scheduler-driven dispatches per partition+kind.
+        // Picks from PS-side `last_*_at` metrics so the gate respects
+        // actual completion, not just dispatch.
+        let gc_cooldown_secs: i64 = std::env::var("AUTUMN_PS_GC_COOLDOWN_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+        let compact_cooldown_secs: i64 = std::env::var("AUTUMN_PS_COMPACT_COOLDOWN_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+
+        // Per-partition rolling avg of req/sec across the last
+        // SCHEDULE_INTERVAL_SECS window. Computed by diffing the
+        // `req_count` Atomic across iterations.
+        let mut last_req_count: HashMap<u64, u64> = HashMap::new();
+
+        let mut ticker = compio::time::interval(Duration::from_secs(SCHEDULE_INTERVAL_SECS));
+        ticker.tick().await; // first tick immediate
+
+        tracing::info!(
+            "F188 maintenance scheduler armed: fg_qps_quota={}, gc_debt_high={}MB, compact_pending_high={}MB, gc_cooldown={}s, compact_cooldown={}s",
+            fg_qps_quota,
+            gc_debt_high / (1024 * 1024),
+            compact_pending_high / (1024 * 1024),
+            gc_cooldown_secs,
+            compact_cooldown_secs,
+        );
+
+        loop {
+            ticker.tick().await;
+            let now = now_secs() as i64;
+            // Snapshot all partitions' state under one borrow; release
+            // before any cross-thread `try_send`.
+            let snapshots: Vec<(u64, std::sync::Arc<PartitionMetrics>, mpsc::Sender<bool>, mpsc::Sender<GcTask>)> = {
+                let parts = self.partitions.borrow();
+                parts
+                    .iter()
+                    .map(|(pid, h)| {
+                        (
+                            *pid,
+                            h.metrics.clone(),
+                            h.compact_trigger.clone(),
+                            h.gc_trigger.clone(),
+                        )
+                    })
+                    .collect()
+            };
+
+            use std::sync::atomic::Ordering::Relaxed;
+
+            // Build candidate list per kind, with urgency = debt / threshold.
+            #[derive(Clone)]
+            struct Candidate {
+                part_id: u64,
+                kind: &'static str, // "compact" or "gc"
+                urgency: f64,
+                _debt: u64,
+            }
+            let mut cands: Vec<(Candidate, mpsc::Sender<bool>, mpsc::Sender<GcTask>)> =
+                Vec::new();
+
+            for (pid, m, ctx, gtx) in snapshots {
+                // Foreground-awareness: compute req/sec across the last
+                // interval. We do NOT swap req_count (that belongs to
+                // report_load_loop); we read it and diff against the
+                // previous reading. Race with report_load_loop's swap is
+                // benign — it just means our diff lands at zero for one
+                // interval.
+                let req_now = m.req_count.load(Relaxed);
+                let prev = last_req_count.insert(pid, req_now).unwrap_or(req_now);
+                let req_per_sec = req_now.saturating_sub(prev) / SCHEDULE_INTERVAL_SECS;
+                if (req_per_sec as u32) > fg_qps_quota {
+                    tracing::debug!(
+                        "F188 part {} skipped: req_per_sec={} > fg_qps_quota={}",
+                        pid,
+                        req_per_sec,
+                        fg_qps_quota
+                    );
+                    continue;
+                }
+
+                let gc_debt = m.gc_debt_bytes.load(Relaxed);
+                let gc_inflight = m.gc_inflight.load(Relaxed) > 0;
+                let last_gc_at = m.last_gc_at.load(Relaxed);
+                let gc_eligible = !gc_inflight
+                    && gc_debt > gc_debt_high
+                    && (last_gc_at == 0 || now - last_gc_at >= gc_cooldown_secs);
+                if gc_eligible {
+                    cands.push((
+                        Candidate {
+                            part_id: pid,
+                            kind: "gc",
+                            urgency: gc_debt as f64 / gc_debt_high as f64,
+                            _debt: gc_debt,
+                        },
+                        ctx.clone(),
+                        gtx.clone(),
+                    ));
+                }
+
+                let compact_pending = m.pending_compaction_bytes.load(Relaxed);
+                let compact_inflight = m.compact_inflight.load(Relaxed) > 0;
+                let last_compact_at = m.last_compact_at.load(Relaxed);
+                let compact_eligible = !compact_inflight
+                    && compact_pending > compact_pending_high
+                    && (last_compact_at == 0
+                        || now - last_compact_at >= compact_cooldown_secs);
+                if compact_eligible {
+                    cands.push((
+                        Candidate {
+                            part_id: pid,
+                            kind: "compact",
+                            urgency: compact_pending as f64 / compact_pending_high as f64,
+                            _debt: compact_pending,
+                        },
+                        ctx,
+                        gtx,
+                    ));
+                }
+            }
+
+            // Sort by urgency desc and dispatch top-K. `CompactionGate`
+            // already serialises actual work across partitions; the
+            // top-K cap here is just to avoid filling all the trigger
+            // channels in one tick (which would block try_send).
+            cands.sort_by(|a, b| b.0.urgency.partial_cmp(&a.0.urgency).unwrap_or(std::cmp::Ordering::Equal));
+            const DISPATCH_PER_TICK: usize = 4;
+            for (cand, mut ctx, mut gtx) in cands.into_iter().take(DISPATCH_PER_TICK) {
+                match cand.kind {
+                    "compact" => {
+                        // F188: scheduler dispatches MINOR compaction
+                        // (false). Manual `client compact` dispatches
+                        // major (true). Major still goes through this
+                        // same channel; the in-loop branch picks
+                        // tables based on the bool.
+                        if ctx.try_send(false).is_ok() {
+                            tracing::info!(
+                                "F188 dispatched compact (minor) part {} urgency={:.2} debt={}MB",
+                                cand.part_id,
+                                cand.urgency,
+                                cand._debt / (1024 * 1024)
+                            );
+                        }
+                    }
+                    "gc" => {
+                        if gtx.try_send(GcTask::Auto).is_ok() {
+                            tracing::info!(
+                                "F188 dispatched gc part {} urgency={:.2} debt={}MB",
+                                cand.part_id,
+                                cand.urgency,
+                                cand._debt / (1024 * 1024)
+                            );
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -1509,11 +1852,21 @@ impl PartitionServer {
         let owner_key_for_thread = owner_key.clone();
         let advertise_addr_for_thread = advertise_addr.clone();
         let compact_gate_for_thread = self.compact_gate.clone();
+        let io_bucket_for_thread = self.io_bucket.clone();
         // F183: build the metrics Arc on the main thread so we can keep
         // a clone in PartitionHandle for the report loop. The other clone
         // is moved into the partition thread and threaded into PartitionData.
         let metrics_for_thread = std::sync::Arc::new(PartitionMetrics::default());
         let metrics_for_handle = metrics_for_thread.clone();
+        // F188: build the compact + GC trigger channels on the main thread
+        // so `PartitionHandle` can hold a Send `mpsc::Sender` for the
+        // maintenance scheduler. The receivers go into `partition_thread_main`
+        // and on into `background_compact_loop` / `background_gc_loop`. The
+        // in-thread sender clones land in `PartitionData` via `partition_thread_main`.
+        let (compact_tx_main, compact_rx_main) = mpsc::channel::<bool>(1);
+        let (gc_tx_main, gc_rx_main) = mpsc::channel::<GcTask>(1);
+        let compact_tx_for_thread = compact_tx_main.clone();
+        let gc_tx_for_thread = gc_tx_main.clone();
         let join = std::thread::Builder::new()
             .name(format!("part-{part_id}"))
             .spawn(move || {
@@ -1541,6 +1894,11 @@ impl PartitionServer {
                         compact_gate_for_thread,
                         cpu_bulk,
                         metrics_for_thread,
+                        compact_tx_for_thread,
+                        compact_rx_main,
+                        gc_tx_for_thread,
+                        gc_rx_main,
+                        io_bucket_for_thread,
                     )
                     .await
                     {
@@ -1573,6 +1931,8 @@ impl PartitionServer {
             drain_tx: Some(drain_tx),
             part_addr: advertise_addr,
             metrics: metrics_for_handle,
+            compact_trigger: compact_tx_main,
+            gc_trigger: gc_tx_main,
             opened_with,
             join: Some(join),
         })
@@ -2317,6 +2677,15 @@ async fn partition_thread_main(
     compact_gate: std::sync::Arc<CompactionGate>,
     cpu_bulk: Option<usize>,
     metrics_arc: std::sync::Arc<PartitionMetrics>,
+    // F188: trigger channels created on the main thread; the senders
+    // are cloned into `PartitionData` (replacing the old in-thread
+    // channel) so loopback rpc handlers + the maintenance scheduler
+    // (main thread) drain into the same receiver.
+    compact_tx: mpsc::Sender<bool>,
+    compact_rx: mpsc::Receiver<bool>,
+    gc_tx: mpsc::Sender<GcTask>,
+    gc_rx: mpsc::Receiver<GcTask>,
+    io_bucket: std::sync::Arc<crate::IoTokenBucket>,
 ) -> Result<()> {
     // F099-J: create the same-thread ps-conn ↔ merged_partition_loop
     // channel. Both endpoints live on THIS compio runtime, so sends and
@@ -2370,8 +2739,9 @@ async fn partition_thread_main(
             .await?;
 
     let (flush_tx, flush_rx) = mpsc::unbounded::<()>();
-    let (compact_tx, compact_rx) = mpsc::channel::<bool>(1);
-    let (gc_tx, gc_rx) = mpsc::channel::<GcTask>(1);
+    // F188: compact_tx/rx + gc_tx/rx are created on the main thread by
+    // `open_partition` and passed in as parameters so PartitionHandle on
+    // main can hold a Send Sender for the maintenance scheduler.
     // F120-A: signal channel from flush_one_imm (after each imm.pop_front)
     // back to merged_partition_loop for back-pressure wakeup. Both ends
     // live on this thread so the unbounded futures::channel is fine.
@@ -2444,6 +2814,7 @@ async fn partition_thread_main(
         imm_drained_tx,
         compact_gate: compact_gate.clone(),
         gc_gate: gc_gate.clone(),
+        io_bucket: io_bucket.clone(),
         extent_pins: std::cell::RefCell::new(std::collections::HashMap::new()),
         frozen_for_merge: Cell::new(None),
         freeze_drain_ack: std::cell::RefCell::new(None),

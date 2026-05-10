@@ -675,6 +675,7 @@ fn auto_merge_fires_via_policy_tick_loop_fast_mode() {
             req_per_sec: 50,
             imm_full_per_sec: 0,
             p99_us: 0,
+            ..Default::default()
         };
         let mut p1 = load.clone(); p1.part_id = 8001;
         let mut p2 = load; p2.part_id = 8002;
@@ -763,6 +764,7 @@ fn auto_split_fires_via_policy_tick_loop_fast_mode() {
             req_per_sec: 0,
             imm_full_per_sec: 0,
             p99_us: 0,
+            ..Default::default()
         };
         let report_req = rkyv_encode(&ReportPartitionLoadReq {
             ps_id: 98,

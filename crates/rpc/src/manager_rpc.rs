@@ -706,13 +706,31 @@ pub struct MergePartitionsResp {
 }
 
 // --- ReportPartitionLoad (PS → manager periodic metrics) ---
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct PartitionLoad {
     pub part_id: u64,
     pub size_bytes: u64,
     pub req_per_sec: u32,
     pub imm_full_per_sec: u32,
     pub p99_us: u32,
+    /// F187: Σ reclaimable bytes on still-live sealed log_stream extents.
+    /// "GC debt" — rises with deletes/overwrites, drops on `punch_holes`.
+    pub gc_debt_bytes: u64,
+    /// F187: bytes that the next compact tick would feed into `do_compact`
+    /// (overlap-tagged tables when has_overlap == 1, else
+    /// pickup_tables(...)). "Compaction debt".
+    pub pending_compaction_bytes: u64,
+    /// F187: 1 while `background_gc_loop` is inside `run_gc`, else 0.
+    pub gc_inflight: u32,
+    /// F187: 1 while `background_compact_loop` is inside `do_compact`,
+    /// else 0.
+    pub compact_inflight: u32,
+    /// F187: unix-epoch seconds of the last successful GC `punch_holes`.
+    /// 0 = never since process start.
+    pub last_gc_at: i64,
+    /// F187: unix-epoch seconds of the last successful `do_compact`.
+    /// 0 = never since process start.
+    pub last_compact_at: i64,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
@@ -724,6 +742,16 @@ pub struct ReportPartitionLoadReq {
 // --- GetPolicyCandidates (advisory) ---
 pub const POLICY_KIND_SPLIT: u8 = 0;
 pub const POLICY_KIND_MERGE: u8 = 1;
+/// F187: GC debt advisory — partition's `gc_debt_bytes` exceeds the
+/// configured high-water threshold for `policy.required_buckets`
+/// consecutive sliding-window buckets and the partition is outside the
+/// gc cooldown window. Stage 1 is advisory-only — no auto-trigger.
+pub const POLICY_KIND_GC: u8 = 2;
+/// F187: compaction debt advisory — partition's
+/// `pending_compaction_bytes` exceeds the configured high-water
+/// threshold for `policy.required_buckets` consecutive buckets and
+/// outside the compact cooldown.
+pub const POLICY_KIND_COMPACT: u8 = 3;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct PolicyCandidate {

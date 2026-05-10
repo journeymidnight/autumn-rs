@@ -1529,23 +1529,34 @@ async fn main() -> Result<()> {
                 println!("(no candidates)");
             } else {
                 println!(
-                    "{:<6} {:<10} {:<10} {:<46} {:<10} {:<8} {:<6} {:<5}",
+                    "{:<7} {:<10} {:<10} {:<46} {:<10} {:<8} {:<6} {:<5}",
                     "KIND", "PRIMARY", "SECONDARY", "REASON", "SIZE", "QPS", "IMM/s", "FEAS"
                 );
                 for c in cands {
-                    let kind = if c.kind == autumn_rpc::manager_rpc::POLICY_KIND_SPLIT {
-                        "split"
-                    } else {
-                        "merge"
+                    let kind = match c.kind {
+                        autumn_rpc::manager_rpc::POLICY_KIND_SPLIT => "split",
+                        autumn_rpc::manager_rpc::POLICY_KIND_MERGE => "merge",
+                        autumn_rpc::manager_rpc::POLICY_KIND_GC => "gc",
+                        autumn_rpc::manager_rpc::POLICY_KIND_COMPACT => "compact",
+                        _ => "?",
                     };
-                    let feas = if c.same_ps { "yes" } else { "no" };
+                    // F187: GC/COMPACT advisories aren't bound by `same_ps`
+                    // — they're always per-partition and locally feasible.
+                    // Render `feas` as "n/a" for them so operators don't
+                    // misread the column.
+                    let feas = match c.kind {
+                        autumn_rpc::manager_rpc::POLICY_KIND_GC
+                        | autumn_rpc::manager_rpc::POLICY_KIND_COMPACT => "n/a",
+                        _ if c.same_ps => "yes",
+                        _ => "no",
+                    };
                     let secondary = if c.secondary_part_id == 0 {
                         "-".to_string()
                     } else {
                         c.secondary_part_id.to_string()
                     };
                     println!(
-                        "{:<6} {:<10} {:<10} {:<46} {:<10} {:<8} {:<6} {:<5}",
+                        "{:<7} {:<10} {:<10} {:<46} {:<10} {:<8} {:<6} {:<5}",
                         kind,
                         c.primary_part_id,
                         secondary,

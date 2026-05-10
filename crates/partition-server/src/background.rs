@@ -52,8 +52,17 @@ pub(crate) async fn background_compact_loop(
     mut compact_rx: mpsc::Receiver<bool>,
     gate: std::sync::Arc<crate::CompactionGate>,
 ) {
+    // F188: short timer kept to refresh `pending_compaction_bytes` for
+    // the maintenance scheduler — it polls metrics on the main thread,
+    // but the metric is recomputed only inside this loop (where we hold
+    // a `borrow()` on `PartitionData`). Without periodic refresh the
+    // scheduler would see a stale 0 and never dispatch.
+    //
+    // The timeout branch ONLY refreshes the metric; it no longer fires
+    // a compaction off the timer. Actual compactions are triggered via
+    // `compact_rx` (scheduler dispatches + manual `client compact`).
     fn random_delay() -> Duration {
-        Duration::from_millis(10_000 + rand_u64() % 10_000)
+        Duration::from_millis(5_000 + rand_u64() % 2_000)
     }
 
     let mut next_minor_delay = random_delay();
@@ -86,48 +95,99 @@ pub(crate) async fn background_compact_loop(
 
         match task {
             CompactSelected::Recv(None) => break,
-            CompactSelected::Recv(Some(_)) => {
+            CompactSelected::Recv(Some(major)) => {
+                // F188: bool payload distinguishes major (true, manual
+                // `client compact` + has_overlap recovery) from minor
+                // (false, scheduler-dispatched routine compaction).
                 let tbls = part.borrow().tables.clone();
+                let metrics = part.borrow().metrics.clone();
                 if tbls.len() < 2 && part.borrow().has_overlap.get() == 0 {
-                    // F107 observability: silent continue here previously
-                    // hid the case where a user-issued `compact <PARTID>` did
-                    // nothing because there was nothing to merge. Surface it.
                     tracing::info!(
-                        "compact part {}: skipped — tables={}, has_overlap=0 (nothing to merge; \
-                         space waste is in logStream extents and will be reclaimed by GC)",
-                        _part_id,
-                        tbls.len()
+                        "compact part {}: skipped (major={}) — tables={}, has_overlap=0",
+                        _part_id, major, tbls.len()
+                    );
+                    metrics.pending_compaction_bytes.store(
+                        compute_pending_compaction_bytes(&part),
+                        std::sync::atomic::Ordering::Relaxed,
                     );
                     continue;
                 }
-                let last_extent = tbls.last().map(|t| t.extent_id).unwrap_or(0);
+
+                let (compact_tbls, truncate_id) = if major {
+                    (tbls.clone(), tbls.last().map(|t| t.extent_id).unwrap_or(0))
+                } else {
+                    pickup_tables(&tbls, 2 * MAX_SKIP_LIST)
+                };
+                if compact_tbls.len() < 2 {
+                    metrics.pending_compaction_bytes.store(
+                        compute_pending_compaction_bytes(&part),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    continue;
+                }
+
                 // F104: serialize across partitions per
                 // AUTUMN_PS_MAJOR_COMPACT_PARALLELISM (default 1).
                 let _permit = gate.acquire().await;
-                match do_compact(&part, tbls, true).await {
+                metrics
+                    .compact_inflight
+                    .store(1, std::sync::atomic::Ordering::Relaxed);
+                let result = do_compact(&part, compact_tbls, major).await;
+                metrics
+                    .compact_inflight
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                match result {
                     Ok(s) => {
                         tracing::info!(
-                            "compact part {}: major, input={} tables, output={} tables, kept={}, discarded={}, output={}",
-                            _part_id, s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
+                            "compact part {}: {}, input={} tables, output={} tables, kept={}, discarded={}, output={}",
+                            _part_id,
+                            if major { "major" } else { "minor" },
+                            s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
                             crate::human_size(s.output_bytes)
                         );
-                        part.borrow().has_overlap.set(0);
-                        if last_extent != 0 {
+                        if major {
+                            part.borrow().has_overlap.set(0);
+                        }
+                        metrics
+                            .last_compact_at
+                            .store(crate::now_secs() as i64, std::sync::atomic::Ordering::Relaxed);
+                        if truncate_id != 0 {
                             let (row_stream_id, part_sc) = {
                                 let p = part.borrow();
                                 (p.row_stream_id, p.stream_client.clone())
                             };
-                            if let Err(e) = part_sc.truncate(row_stream_id, last_extent).await {
-                                tracing::warn!("major compaction truncate: {e}");
+                            if let Err(e) = part_sc.truncate(row_stream_id, truncate_id).await {
+                                tracing::warn!("compaction truncate: {e}");
                             }
                         }
                     }
-                    Err(e) => tracing::error!("major compaction: {e}"),
+                    Err(e) => tracing::error!("compaction: {e}"),
                 }
+                metrics.pending_compaction_bytes.store(
+                    compute_pending_compaction_bytes(&part),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 next_minor_delay = random_delay();
             }
             CompactSelected::Timeout => {
                 next_minor_delay = random_delay();
+
+                // F187: refresh pending_compaction_bytes every periodic
+                // tick — independent of whether we end up compacting.
+                let metrics = part.borrow().metrics.clone();
+                metrics.pending_compaction_bytes.store(
+                    compute_pending_compaction_bytes(&part),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+
+                // F188: timeout branch is now metric-refresh-only.
+                // Actual compactions only fire on `compact_rx` triggers
+                // (scheduler dispatches + manual `client compact`).
+                // Expiry-major compaction is the one exception — TTL
+                // keys ARE a wall-clock event the scheduler doesn't see,
+                // so the loop continues to pick it up via the periodic
+                // tick rather than waiting for an external trigger.
+                let _expiry_continue_below = ();
 
                 // Check if any SSTable has expired keys — trigger major compaction
                 let has_expired = {
@@ -142,12 +202,23 @@ pub(crate) async fn background_compact_loop(
                     if tbls.len() >= 1 {
                         let last_extent = tbls.last().map(|t| t.extent_id).unwrap_or(0);
                         let _permit = gate.acquire().await;
-                        match do_compact(&part, tbls, true).await {
+                        metrics
+                            .compact_inflight
+                            .store(1, std::sync::atomic::Ordering::Relaxed);
+                        let result = do_compact(&part, tbls, true).await;
+                        metrics
+                            .compact_inflight
+                            .store(0, std::sync::atomic::Ordering::Relaxed);
+                        match result {
                             Ok(s) => {
                                 tracing::info!(
                                     "compact part {}: expiry major, input={} tables, output={} tables, kept={}, discarded={}, output={}",
                                     _part_id, s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
                                     crate::human_size(s.output_bytes)
+                                );
+                                metrics.last_compact_at.store(
+                                    crate::now_secs() as i64,
+                                    std::sync::atomic::Ordering::Relaxed,
                                 );
                                 if last_extent != 0 {
                                     let (row_stream_id, part_sc) = {
@@ -161,35 +232,19 @@ pub(crate) async fn background_compact_loop(
                             }
                             Err(e) => tracing::error!("expiry major compaction: {e}"),
                         }
+                        metrics.pending_compaction_bytes.store(
+                            compute_pending_compaction_bytes(&part),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         continue;
                     }
                 }
 
-                let tbls = part.borrow().tables.clone();
-                let (compact_tbls, truncate_id) = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
-                if compact_tbls.len() < 2 {
-                    continue;
-                }
-                let _permit = gate.acquire().await;
-                match do_compact(&part, compact_tbls, false).await {
-                    Ok(s) => {
-                        tracing::info!(
-                            "compact part {}: minor, input={} tables, output={} tables, kept={}, discarded={}, output={}",
-                            _part_id, s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
-                            crate::human_size(s.output_bytes)
-                        );
-                        if truncate_id != 0 {
-                            let (row_stream_id, part_sc) = {
-                                let p = part.borrow();
-                                (p.row_stream_id, p.stream_client.clone())
-                            };
-                            if let Err(e) = part_sc.truncate(row_stream_id, truncate_id).await {
-                                tracing::warn!("minor compaction truncate: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => tracing::error!("minor compaction: {e}"),
-                }
+                // F188: minor-compact-on-timer removed. Scheduler now
+                // dispatches compactions via `compact_rx` based on
+                // `pending_compaction_bytes` (which we just refreshed
+                // above). The Recv branch handles BOTH manual triggers
+                // and scheduler dispatches via the same channel.
             }
         }
     }
@@ -203,8 +258,12 @@ pub(crate) async fn background_gc_loop(
 ) {
     const MAX_GC_ONCE: usize = 3;
     const GC_DISCARD_RATIO: f64 = 0.4;
+    // F188: short timer for `gc_debt_bytes` metric refresh. The Auto
+    // task that fires off the timer ALSO refreshes the metric, but
+    // since we're keeping the loop responsive for scheduler dispatches
+    // (which use the same channel), the timer can stay short.
     fn random_delay() -> Duration {
-        Duration::from_millis(30_000 + rand_u64() % 30_000)
+        Duration::from_millis(5_000 + rand_u64() % 2_000)
     }
 
     let mut next_auto_delay = random_delay();
@@ -263,14 +322,25 @@ pub(crate) async fn background_gc_loop(
 
         let sealed_extents = &extent_ids[..extent_ids.len() - 1];
 
+        // F187: refresh gc_debt_bytes from current discards, regardless of
+        // whether this tick will actually punch anything. The aggregate is
+        // sum(reclaimable bytes on still-live sealed log_stream extents) —
+        // exactly what an operator would call "GC debt".
+        let metrics = part.borrow().metrics.clone();
+        let mut tick_discards = get_discards(&readers_snapshot);
+        valid_discard(&mut tick_discards, sealed_extents);
+        let gc_debt: u64 = tick_discards.values().map(|v| (*v).max(0) as u64).sum();
+        metrics
+            .gc_debt_bytes
+            .store(gc_debt, std::sync::atomic::Ordering::Relaxed);
+
         let holes: Vec<u64> = match gc_task {
             GcTask::Force { ref extent_ids } => {
                 let idx: HashSet<u64> = sealed_extents.iter().copied().collect();
                 extent_ids.iter().copied().filter(|e| idx.contains(e)).take(MAX_GC_ONCE).collect()
             }
             GcTask::Auto => {
-                let mut discards = get_discards(&readers_snapshot);
-                valid_discard(&mut discards, sealed_extents);
+                let discards = tick_discards;
 
                 let mut candidates: Vec<u64> = discards.keys().copied().collect();
                 candidates.sort_by(|a, b| discards[b].cmp(&discards[a]));
@@ -307,6 +377,12 @@ pub(crate) async fn background_gc_loop(
         // preceding read-only get_stream_info / get_extent_info RPCs.
         let _gc_permit = gc_gate.acquire().await;
         tracing::info!("GC: starting, extents={:?}", holes);
+        // F187: gc_inflight visible to the policy engine + operator dashboards
+        // for the entire holes-processing window.
+        metrics
+            .gc_inflight
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let mut any_success = false;
         for eid in holes {
             let sealed_length = match part_sc.get_extent_info(eid).await {
                 Ok(info) => info.sealed_length as u32,
@@ -315,9 +391,20 @@ pub(crate) async fn background_gc_loop(
                     continue;
                 }
             };
-            if let Err(e) = run_gc(&part, eid, sealed_length).await {
-                tracing::error!("GC run_gc extent {eid}: {e}");
+            match run_gc(&part, eid, sealed_length).await {
+                Ok(_) => {
+                    any_success = true;
+                }
+                Err(e) => tracing::error!("GC run_gc extent {eid}: {e}"),
             }
+        }
+        metrics
+            .gc_inflight
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        if any_success {
+            metrics
+                .last_gc_at
+                .store(crate::now_secs() as i64, std::sync::atomic::Ordering::Relaxed);
         }
         drop(_gc_permit);
     }
@@ -721,6 +808,24 @@ pub(crate) async fn finish_write_batch(
 // Compaction
 // ---------------------------------------------------------------------------
 
+/// F187: snapshot how many SSTable bytes the next compact tick would
+/// consume. `has_overlap == 1` means major compaction is mandated and
+/// will rewrite every table — so the answer is total SST bytes.
+/// Otherwise it's whatever `pickup_tables` would pick, which is the same
+/// thing the periodic compact tick will actually do. Cheap (no I/O, no
+/// borrow_mut on Memtable).
+pub(crate) fn compute_pending_compaction_bytes(part: &Rc<RefCell<PartitionData>>) -> u64 {
+    let p = part.borrow();
+    let tbls = p.tables.clone();
+    let overlap = p.has_overlap.get();
+    drop(p);
+    if overlap == 1 {
+        return tbls.iter().map(|t| t.estimated_size).sum();
+    }
+    let (compact_tbls, _) = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
+    compact_tbls.iter().map(|t| t.estimated_size).sum()
+}
+
 pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<TableMeta>, u64) {
     if tables.len() < 2 {
         return (vec![], 0);
@@ -883,7 +988,7 @@ pub(crate) async fn do_compact(
     let input_tables = tbls.len();
     let compact_keys: HashSet<(u64, u32)> = tbls.iter().map(|t| t.loc()).collect();
 
-    let (readers, row_stream_id, meta_stream_id, compact_vp_eid, compact_vp_off, rg, part_sc, row_append_tx) = {
+    let (readers, row_stream_id, meta_stream_id, compact_vp_eid, compact_vp_off, rg, part_sc, row_append_tx, io_bucket) = {
         let p = part.borrow();
         let mut rds: Vec<Arc<SstReader>> = Vec::new();
         for t in &tbls {
@@ -891,7 +996,7 @@ pub(crate) async fn do_compact(
                 rds.push(p.sst_readers[idx].clone());
             }
         }
-        (rds, p.row_stream_id, p.meta_stream_id, p.vp_extent_id, p.vp_offset, p.rg.clone(), p.stream_client.clone(), p.row_append_tx.clone())
+        (rds, p.row_stream_id, p.meta_stream_id, p.vp_extent_id, p.vp_offset, p.rg.clone(), p.stream_client.clone(), p.row_append_tx.clone(), p.io_bucket.clone())
     };
 
     if readers.is_empty() {
@@ -1018,6 +1123,12 @@ pub(crate) async fn do_compact(
                 .map_err(|_| anyhow!("compact builder finish join failed"))?;
             let chunk_bytes = sst_bytes.len() as u64;
             output_bytes += chunk_bytes;
+            // F188: PS-wide background-IO budget — sleeps if compact +
+            // GC across all partitions on this PS would exceed
+            // AUTUMN_PS_BG_RATE_BYTES_PER_SEC. Sleep happens BEFORE the
+            // append so the bucket reflects "intent to write" rather
+            // than counts after-the-fact, matching F141's pattern.
+            io_bucket.account(chunk_bytes).await;
             // F135: route through P-bulk's StreamClient to preserve the
             // single-writer invariant on row_stream.
             let result = compact_row_append(&row_append_tx, &part_sc, row_stream_id, sst_bytes.clone()).await?;
@@ -1076,6 +1187,8 @@ pub(crate) async fn do_compact(
             .map_err(|_| anyhow!("compact final builder finish join failed"))?;
         let chunk_bytes = sst_bytes.len() as u64;
         output_bytes += chunk_bytes;
+        // F188: same PS-wide budget account as the per-chunk emit above.
+        io_bucket.account(chunk_bytes).await;
         // F135: route through P-bulk's StreamClient to preserve the
         // single-writer invariant on row_stream.
         let result = compact_row_append(&row_append_tx, &part_sc, row_stream_id, sst_bytes.clone()).await?;
@@ -1390,6 +1503,7 @@ async fn flush_gc_batch(
     part_sc: &Rc<StreamClient>,
     batch: &mut GcWriteBatch,
     rate_limiter: &mut GcRateLimiter,
+    io_bucket: &std::sync::Arc<crate::IoTokenBucket>,
     moved: &mut usize,
 ) -> Result<()> {
     if batch.is_empty() {
@@ -1441,6 +1555,8 @@ async fn flush_gc_batch(
     if let Some(sleep_dur) = rate_limiter.account(batch_bytes) {
         compio::time::sleep(sleep_dur).await;
     }
+    // F188: PS-wide budget on the GC append side too.
+    io_bucket.account(batch_bytes).await;
 
     Ok(())
 }
@@ -1476,9 +1592,9 @@ pub(crate) async fn run_gc(
     extent_id: u64,
     sealed_length: u32,
 ) -> Result<()> {
-    let (log_stream_id, rg, part_sc) = {
+    let (log_stream_id, rg, part_sc, io_bucket) = {
         let p = part.borrow();
-        (p.log_stream_id, p.rg.clone(), p.stream_client.clone())
+        (p.log_stream_id, p.rg.clone(), p.stream_client.clone(), p.io_bucket.clone())
     };
 
     // F106 streaming: read the sealed extent in `gc_read_chunk_bytes()`
@@ -1538,6 +1654,7 @@ pub(crate) async fn run_gc(
             &mut moved,
             &mut batch,
             &mut rate_limiter,
+            &io_bucket,
         )
         .await?;
         if consumed < buf.len() {
@@ -1555,6 +1672,11 @@ pub(crate) async fn run_gc(
         if let Some(sleep_dur) = rate_limiter.account(chunk_len) {
             compio::time::sleep(sleep_dur).await;
         }
+        // F188: PS-wide background-IO budget — gates GC across all
+        // partitions on this PS, in addition to F141's per-partition
+        // limiter above. Prevents N partitions × per-partition rate
+        // from blowing past the cluster ceiling.
+        io_bucket.account(chunk_len).await;
     }
 
     if !carry.is_empty() {
@@ -1577,6 +1699,7 @@ pub(crate) async fn run_gc(
         &part_sc,
         &mut batch,
         &mut rate_limiter,
+        &io_bucket,
         &mut moved,
     )
     .await?;
@@ -1617,6 +1740,7 @@ async fn process_gc_chunk(
     moved: &mut usize,
     batch: &mut GcWriteBatch,
     rate_limiter: &mut GcRateLimiter,
+    io_bucket: &std::sync::Arc<crate::IoTokenBucket>,
 ) -> Result<usize> {
     // F158: decode via shared codec — handles both V0 (legacy on-disk) and V1
     // (post-F158 with CRC). On a V1 CRC failure we log + skip + continue,
@@ -1745,6 +1869,7 @@ async fn process_gc_chunk(
                 part_sc,
                 batch,
                 rate_limiter,
+                io_bucket,
                 moved,
             )
             .await?;

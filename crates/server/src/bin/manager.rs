@@ -13,6 +13,12 @@ struct Args {
     /// F184: Stage 3 — auto-orchestrate MERGE for same-PS adjacent
     /// candidates. Default off.
     auto_merge: bool,
+    /// F187: enable fast-mode policy thresholds for load testing —
+    /// 1-bucket / 5 s tick / 1 MiB GC debt / 4 MiB compact pending /
+    /// 30 s cooldowns. Production should never use this; the default
+    /// is `false` (production thresholds = 1 GiB / 4 GiB / 5-bucket /
+    /// 60 s tick / 5-min cooldown).
+    policy_fast_mode: bool,
 }
 
 fn parse_args() -> Args {
@@ -22,6 +28,7 @@ fn parse_args() -> Args {
     let mut transport = TransportKind::Tcp;
     let mut auto_split = false;
     let mut auto_merge = false;
+    let mut policy_fast_mode = false;
 
     let raw: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -51,12 +58,21 @@ fn parse_args() -> Args {
             }
             "--auto-split" => auto_split = true,
             "--auto-merge" => auto_merge = true,
+            "--policy-fast-mode" => policy_fast_mode = true,
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
     }
 
-    Args { port, etcd, bind_host, transport, auto_split, auto_merge }
+    Args {
+        port,
+        etcd,
+        bind_host,
+        transport,
+        auto_split,
+        auto_merge,
+        policy_fast_mode,
+    }
 }
 
 #[compio::main]
@@ -94,6 +110,22 @@ async fn main() -> Result<()> {
     if args.auto_merge {
         tracing::warn!("F184: --auto-merge enabled; manager will orchestrate MERGE for cold same-PS pairs");
         manager.set_auto_merge(true);
+    }
+    if args.policy_fast_mode {
+        let mut cfg = autumn_manager::policy::PolicyConfig::default();
+        cfg.required_buckets = 1;
+        cfg.tick_interval_sec = 5;
+        cfg.bucket_sec = 5;
+        cfg.gc_debt_high = 1024 * 1024;
+        cfg.compact_pending_high = 4 * 1024 * 1024;
+        cfg.gc_cooldown_sec = 30;
+        cfg.compact_cooldown_sec = 30;
+        cfg.split_cooldown_sec = 30;
+        cfg.merge_cooldown_sec = 30;
+        manager.set_policy_config(cfg);
+        tracing::warn!(
+            "F187: --policy-fast-mode enabled; thresholds={{gc_debt=1MiB, compact=4MiB, bucket=5s, tick=5s, required=1, cooldown=30s}}. NOT FOR PRODUCTION."
+        );
     }
 
     tracing::info!("autumn-manager-server listening on {addr}");

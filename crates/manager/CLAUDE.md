@@ -570,3 +570,36 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     (continue) based on whether the partition deletion is already
     persisted. ~200 lines, ProcedureV2 in miniature. Recorded as
     deferred follow-up in `feature_list.md` F185.
+
+18. **F187 maintenance advisory — `PolicyEngine::compute_maintenance_advisory`.**
+    Symmetric to F183's `compute_candidates` for split/merge, but for the
+    GC + compact loops: surfaces per-partition `gc_debt_bytes` /
+    `pending_compaction_bytes` reported by the PS via the existing
+    `MSG_REPORT_PARTITION_LOAD` (F183 wire, +6 fields), runs the same
+    `required_buckets`-of-`bucket_sec` sliding-window check, gates by a
+    per-kind cooldown (`gc_cooldown_sec` / `compact_cooldown_sec`,
+    default 300 s), and skips a partition when its corresponding
+    `*_inflight` flag is 1.
+
+    Emits `POLICY_KIND_GC` (= 2) / `POLICY_KIND_COMPACT` (= 3)
+    candidates appended to the same `advisory_cache` returned by
+    `MSG_GET_POLICY_CANDIDATES`. `policy_tick_loop` (lib.rs ~520) calls
+    `compute_maintenance_advisory(now)` after `compute_candidates(...)`
+    each tick, then OVERWRITES `advisory_cache` with the union — so the
+    cache always carries the freshest 4-kind set. The handler at
+    `rpc_handlers.rs:2327` reads the cache untouched.
+
+    **Stage 1 only** — advisory is purely informational. `last_op_at`
+    and `auto_dispatch_*` paths are NOT touched (those would be Stage
+    2/3 territory: a PS-local priority maintenance scheduler + shared
+    fg/bg token bucket, mirroring how F184 added the `--auto-split`
+    flag on top of F183's advisory). Manager-driven maintenance
+    scheduling is deliberately NOT planned: GC/compact are local
+    concerns (per-partition state, per-PS resources), unlike split /
+    merge where range reassignment is inherently global. The advisory
+    layer is the only manager involvement we want.
+
+    `PolicyConfig` runtime-tunable via `set_policy_config` carries the
+    new thresholds + cooldowns (defaults: 1 GiB / 4 GiB / 300 s / 300 s).
+    Tests in `policy_tests.rs` (7 new + 11 existing = 18 passing) cover
+    the trigger / cooldown / inflight / partial-window cases.

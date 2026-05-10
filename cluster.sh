@@ -378,10 +378,17 @@ do_start() {
         etcdctl del "" --prefix >/dev/null 2>&1 || true
     fi
 
-    # manager
+    # manager — F187: AUTUMN_POLICY_FAST_MODE=1 enables fast-mode
+    # advisory thresholds (1 MiB GC / 4 MiB compact / 5s tick / 1
+    # bucket / 30s cooldown) so load tests surface advisories within
+    # seconds instead of the production 5-min sustained window.
+    local mgr_extra=""
+    if [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]]; then
+        mgr_extra="--policy-fast-mode"
+    fi
     start_proc manager \
         "$MANAGER" --port 9001 --etcd 127.0.0.1:2379 --listen "$BIND_HOST" \
-        --transport "$TRANSPORT"
+        --transport "$TRANSPORT" $mgr_extra
     wait_port 9001 manager
 
     # Extent node(s): node1=9101, node2=9102, ...

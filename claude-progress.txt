@@ -1,139 +1,91 @@
 Date: 2026-05-10
 TaskStatus: completed
-Task scope: F186 — client-side striperados (Ceph pattern) replaces F129
-            server multipart + F130 GC active rewrite. Plus a
-            pre-existing latent VP-offset bug that F186 caught and
-            fixed.
+Task scope: F188 — GC + compact Stage 2 (PS-level priority maintenance
+            scheduler + foreground awareness + shared IO token bucket).
+            Builds on F187 Stage 1 advisory; replaces per-partition
+            random-jitter compact/gc timers with a foreground-aware,
+            priority-driven dispatcher and adds PS-wide BG rate ceiling.
 
-User feedback that drove this: F129 / F130 (just shipped) was
-overengineered. The "value too big for inline cap" problem can be
-solved with pure client-side striping over existing server primitives,
-matching how Ceph striperados / S3 multipart / etc all work in
-practice. This redesign:
-  - DELETED ~1500 server-side lines (F129 handlers, F130 GC rewrite,
-    multi-frag VP shape, OP_VALUE_POINTER_MULTI / OP_CHUNK_BLOB op
-    flags, UploadSession, recovery handling, compaction discard
-    branches)
-  - ADDED ~250 client-side lines (StripeMeta, make_chunk_key,
-    PutStreamHandle/GetStream now sync, delete_stream)
-  - Same caller-visible API surface (PutStreamHandle / GetStream
-    shape unchanged), same end-to-end functionality
+Stage 2 verified end-to-end on a real 4-node cluster + sustained
+~90s 1KB write load + manual major compact (which tagged the
+discards). Logged events:
+  compact part 15: major, input=7 tables, output=4 tables,
+                   kept=1738292, discarded=298314, output=1.7 GB
+  F188 dispatched gc part 15 urgency=4661.16 debt=4661MB
+  ...repeats every 5s while debt > threshold and outside cooldown...
 
-Splits committed in two commits to keep diffs reviewable:
-  c744058 F186-A/B: build client-side + VP-offset fix
-  (this commit) F186-C/D: rip out server-side + docs
-
-Saved feedback memory:
-  feedback_client_side_complexity_first.md — try client-side
-  complexity before server-side. Complements 2PC + orchestrator-
-  must-be-crash-safe memories.
-
-Pre-existing VP-offset bug (latent since F165 V1 default-on):
-  finish_write_batch + flush_gc_batch + recover_partition all
-  computed VP.offset = record_offset + 17 + key.len() (V0 layout).
-  Post-F165 records on disk are V1 with a 5-byte envelope prefix
-  (sentinel + payload_len), so value bytes are at +22 not +17.
-  Every value > 4 KiB written via the regular Put path since F165
-  has had its VP pointing 5 bytes too early — reads return the
-  last 5 bytes of internal_key (inverted-seq, e.g. [ff,ff,ff,ff,fe])
-  followed by (value_len - 5) bytes of value. Latent because:
-    - production tests use small values (≤ 4 KiB → inline)
-    - F129 multipart used the correct V1 calc (1+4+17 = 22)
-    - no test verified content of large VP-path values post-V1
-  F186 caught it because client-side striperados puts every chunk
-  via plain Put with chunk_size = 4 MiB > VALUE_THROTTLE.
-  Fix: `+ 17 +` → `+ 22 +` at three sites.
-
-F186 client-side design:
-  - StripeMeta (29 bytes): 8B magic + 1B version + 8B total_bytes
-    + 4B chunk_count + 4B chunk_size + 4B CRC32C over first 25.
-    False-positive rate against random user values ≈ 2^-96.
-  - make_chunk_key: \xff\xfeacv1\xff + user_key_len(BE u32) +
-    user_key + chunk_index(BE u64). Sorts after all normal user
-    keys; length-prefix prevents user-key ambiguity.
-  - PutStreamHandle::send writes chunk to chunk_key via plain
-    cluster.put. PutStreamHandle::commit writes the meta blob to
-    the user key — its presence is the atomic linearisation point.
-    abort best-effort deletes already-written chunks.
-  - GetStream auto-detects via StripeMeta::try_decode: striped →
-    walks chunks; non-striped → yields blob whole.
-  - delete_stream cascades; plain delete only removes meta.
-  - 6 unit tests (StripeMeta encode/decode + chunk-key disambiguation
-    + sort order).
-
-Server-side rip-out:
-  Wire types: MSG_PUT_BEGIN/CHUNK/COMMIT/ABORT (0x49-0x4C reserved,
-    constants commented out for stale-binary safety),
-    PutBegin/Chunk/Commit/Abort{Req,Resp}, CODE_UPLOAD_NOT_FOUND.
-  Server handlers: handle_put_begin/chunk/commit/abort,
-    rand_upload_id, HEAD's multi-frag value_length branch.
-  Op flags + types: OP_VALUE_POINTER_MULTI, OP_CHUNK_BLOB,
-    MultiFragVp + 5 unit tests, op-flag-distinct test,
-    UploadSession, AUTUMN_PS_MAX_INLINE_BYTES_HARD,
-    AUTUMN_PS_MAX_UPLOAD_SESSIONS_DEFAULT,
-    AUTUMN_PS_UPLOAD_TTL_SECS_DEFAULT.
-  PartitionData: upload_sessions field.
-  Recovery: OP_CHUNK_BLOB skip + OP_VALUE_POINTER_MULTI re-insert.
-  GC + compaction: F130's collect_live_mfvps_touching,
-    rewrite_multi_frag_for_extent, run_gc pre-pass call,
-    multi-frag branch of bump_discards_for_dropped_entry,
-    resolve_multi_frag.
-
-Tests:
-  cargo test -p autumn-rpc                                     : 13/13
-                                              (was 17, dropped 4 F129)
-  cargo test -p autumn-partition-server --lib --test-threads=1 : 124/124
-                                  (was 130, dropped 5 multi-frag + 1
-                                   op-flag-distinct = 6)
-  cargo test -p autumn-manager --lib                           : 51/51
-  cargo test -p autumn-manager --test system_putstream -- --ignored:
-    f186_putstream_roundtrip_12mib              ✓ (4 × 3 MiB chunks,
-        full roundtrip, pre-commit get returns NotFound, post-commit
-        meta blob present, get_stream reassembles bytes,
-        delete_stream cascades)
-    f186_putstream_single_chunk_1mib            ✓ (n_chunks=1 edge)
-    f186_putstream_abort_drops_chunks           ✓ (meta absent → get
-        returns None even with orphan chunks)
-    f186_get_stream_inline_value_passthrough    ✓ (auto-detect non-
-        striped via meta magic mismatch)
-  cargo check --workspace --exclude autumn-fuse: clean
+Stage 3 (deferred): true admission control with fg priority +
+bg elastic tokens (CockroachDB kvadmission pattern). Foreground
+writes currently bypass the bucket entirely.
 
 Files changed:
-  crates/rpc/src/partition_rpc.rs                — F129 wire types out
-  crates/partition-server/src/lib.rs             — F129 op flags +
-                                                    MultiFragVp +
-                                                    UploadSession +
-                                                    upload_sessions
-                                                    field + recovery
-                                                    handling + VP
-                                                    offset fix
-  crates/partition-server/src/rpc_handlers.rs    — F129 handlers +
-                                                    HEAD multi-frag
-  crates/partition-server/src/background.rs      — F130 helpers +
-                                                    pre-pass +
-                                                    resolve_multi_frag
-                                                    + multi-frag
-                                                    discard branch +
-                                                    VP offset fix (× 2
-                                                    sites)
-  crates/client/Cargo.toml                       — added crc32c dep
-  crates/client/src/lib.rs                       — F186 client-side
-                                                    striperados (added
-                                                    in c744058) +
-                                                    UploadNotFound
-                                                    error variant
-                                                    removed
-  crates/server/src/bin/autumn_client.rs         — putstream is sync
-  crates/manager/tests/system_putstream.rs       — rewrote 4 tests
-                                                    for client-side
-                                                    semantics
-  feature_list.md                                — F186 entry,
-                                                    F129/F130 marked
-                                                    SUPERSEDED
-  README.md                                      — F186 docs
-  claude-progress.txt                            — this file
-  /root/.claude/projects/-data-dongmao-dev-autumn-rs/memory/MEMORY.md
-  /root/.claude/projects/-data-dongmao-dev-autumn-rs/memory/feedback_client_side_complexity_first.md
-                                                 — new feedback memory
+  crates/partition-server/src/lib.rs
+    + IoTokenBucket type (PS-wide rate limiter, parking_lot::Mutex
+      around sliding-window)
+    + PartitionServer.io_bucket: Arc<IoTokenBucket>
+    + PartitionHandle.compact_trigger / gc_trigger (Send Senders;
+      same channel as the in-thread PartitionData clone, accessible
+      from main-thread scheduler)
+    + maintenance_scheduler_loop spawned alongside report_load_loop:
+      - 5s cadence
+      - foreground-aware skip (req_per_sec > AUTUMN_PS_FG_QPS_QUOTA,
+        default 50K)
+      - urgency = debt / threshold, sort desc, dispatch top-K
+      - cooldown gates from PS-reported last_gc_at / last_compact_at
+    * partition_thread_main params: compact_tx/rx + gc_tx/rx +
+      io_bucket now passed in (channels created on main thread)
+    * PartitionData: + io_bucket field
+  crates/partition-server/src/background.rs
+    * background_compact_loop:
+      - random_delay 10-20s → 5-7s (metric-refresh-only)
+      - Timeout branch: only refreshes pending_compaction_bytes
+        + does expiry-major check (wall-clock event, scheduler
+        can't see). Minor-compact-on-timer REMOVED.
+      - Recv branch: bool payload now means is_major; minor goes
+        through pickup_tables path
+    * background_gc_loop: random_delay 30-60s → 5-7s; same Auto
+      handling on Recv
+    * do_compact: + io_bucket.account() before each compact_row_append
+    * flush_gc_batch + process_gc_chunk + run_gc: + io_bucket.account()
+      threaded through; F141's GcRateLimiter retained as inner cap
+  crates/partition-server/CLAUDE.md
+    note 11 extended with F188 Stage 2 + Stage 3 deferral
+  feature_list.md
+    F188 row + Open/Deferred section
+  claude-progress.txt
+    this file
 
-Final commit: pending (this commit).
+Build + tests:
+  cargo check -p autumn-partition-server  : clean (3 pre-existing warns)
+  cargo test -p autumn-partition-server --lib -- --test-threads=1
+                                          : 124/124 (no regression vs F187)
+  cargo test -p autumn-manager --lib       : 58/58 (no regression vs F187)
+  cargo test -p autumn-rpc                 : 13/13
+
+Live cluster load:
+  4-node, default partition (3+1 EC log/row, 3+0 meta).
+  AUTUMN_POLICY_FAST_MODE=1 (manager) +
+  AUTUMN_PS_GC_DEBT_HIGH_BYTES=1MiB
+  AUTUMN_PS_COMPACT_PENDING_HIGH_BYTES=4MiB
+  AUTUMN_PS_GC_COOLDOWN_SECS=30
+  AUTUMN_PS_COMPACT_COOLDOWN_SECS=30
+  AUTUMN_PS_BG_RATE_BYTES_PER_SEC=32MiB
+  Workload: wbench --threads 32 --duration 90 --size 1024 + manual
+            major compact (to tag discards).
+  Result: scheduler dispatched GC every 5s once debt crossed 1 MiB,
+          urgency = 4661 (debt 4.6 GB / threshold 1 MiB), respecting
+          cooldown.
+
+Pre-existing observation (not F188-caused): under heavy
+overwrite-style wbench (16K values), foreground throughput
+occasionally drops to ~2 MB/s. Investigation deferred — likely
+related to memtable rotation cadence under VP-heavy load and
+unrelated to F188's bg path. F188's io_bucket.account() applies
+ONLY to GC + compact, not foreground writes, so it cannot cause
+foreground regressions by construction.
+
+Final commit: pending (user owns commit decision per
+feedback_push_to_main.md memory).
+
+Cluster currently RUNNING with Stage 2 active. Use
+`/data/dongmao_dev/autumn-rs/cluster.sh stop` to tear down when done.

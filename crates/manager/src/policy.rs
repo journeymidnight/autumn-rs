@@ -8,7 +8,8 @@ use std::collections::{HashMap, VecDeque};
 
 use autumn_common::MetadataState;
 use autumn_rpc::manager_rpc::{
-    PartitionLoad, PolicyCandidate, POLICY_KIND_MERGE, POLICY_KIND_SPLIT,
+    PartitionLoad, PolicyCandidate, POLICY_KIND_COMPACT, POLICY_KIND_GC, POLICY_KIND_MERGE,
+    POLICY_KIND_SPLIT,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -22,6 +23,22 @@ pub const SPLIT_COOLDOWN_SEC: i64 = 3600;
 pub const MERGE_SIZE_LOW: u64 = GIB;
 pub const MERGE_QPS_LOW: u32 = 5_000;
 pub const MERGE_COOLDOWN_SEC: i64 = 6 * 3600;
+
+/// F187: GC debt advisory threshold. Default 1 GiB sustained — large
+/// enough to filter normal write churn, small enough that operators
+/// notice before disk pressure. Tunable via `PolicyConfig`.
+pub const GC_DEBT_HIGH: u64 = GIB;
+/// F187: compaction debt advisory threshold. Default 4 GiB — higher
+/// than GC because compact's pending bytes naturally accumulate to
+/// MAX_SKIP_LIST × N tables before the periodic loop fires.
+pub const COMPACT_PENDING_HIGH: u64 = 4 * GIB;
+/// F187: GC advisory cooldown. Once an advisory fires for a partition,
+/// suppress re-emission for 5 min so operators can react without
+/// duplicate-noise. Distinct from any auto-trigger cooldown (Stage 2/3
+/// territory).
+pub const GC_COOLDOWN_SEC: i64 = 300;
+/// F187: compaction advisory cooldown.
+pub const COMPACT_COOLDOWN_SEC: i64 = 300;
 
 pub const POLICY_BUCKET_SEC: i64 = 60;
 pub const POLICY_WINDOW_BUCKETS: usize = 30;
@@ -45,6 +62,16 @@ pub struct PolicyConfig {
     pub window_buckets: usize,
     pub required_buckets: usize,
     pub tick_interval_sec: i64,
+    /// F187: gc advisory threshold (bytes, sustained over
+    /// `required_buckets`).
+    pub gc_debt_high: u64,
+    /// F187: compaction advisory threshold (bytes, sustained over
+    /// `required_buckets`).
+    pub compact_pending_high: u64,
+    /// F187: gc advisory cooldown (seconds since `last_gc_at`).
+    pub gc_cooldown_sec: i64,
+    /// F187: compact advisory cooldown (seconds since `last_compact_at`).
+    pub compact_cooldown_sec: i64,
 }
 
 impl Default for PolicyConfig {
@@ -62,6 +89,10 @@ impl Default for PolicyConfig {
             window_buckets: POLICY_WINDOW_BUCKETS,
             required_buckets: POLICY_REQUIRED_BUCKETS,
             tick_interval_sec: POLICY_TICK_INTERVAL_SEC,
+            gc_debt_high: GC_DEBT_HIGH,
+            compact_pending_high: COMPACT_PENDING_HIGH,
+            gc_cooldown_sec: GC_COOLDOWN_SEC,
+            compact_cooldown_sec: COMPACT_COOLDOWN_SEC,
         }
     }
 }
@@ -262,6 +293,95 @@ impl PolicyEngine {
 
         self.advisory_cache = out.clone();
         self.advisory_cache_at = args.now;
+        out
+    }
+
+    /// F187: maintenance (GC + compact) advisory pass. Mirrors the F183
+    /// split/merge structure: require all of the most recent
+    /// `required_buckets` to exceed the threshold, gate by per-kind
+    /// cooldown driven from the partition's own `last_gc_at` /
+    /// `last_compact_at` (PS-reported, not manager-tracked — the PS is
+    /// the authority on when its loops actually ran). Skips partitions
+    /// where the corresponding loop is currently inflight (no point
+    /// telling an operator to GC a partition that's already GCing).
+    ///
+    /// The output uses `PolicyCandidate` with `kind = POLICY_KIND_GC`
+    /// or `POLICY_KIND_COMPACT`. `secondary_part_id = 0`,
+    /// `same_ps = true` (not meaningful for maintenance), `last_op_at`
+    /// carries the kind-specific last-run timestamp so the operator
+    /// dashboard can render "since X minutes ago".
+    pub fn compute_maintenance_advisory(
+        &mut self,
+        now: i64,
+    ) -> Vec<PolicyCandidate> {
+        let mut out = Vec::new();
+        let cfg = self.config.clone();
+
+        for (&part_id, window) in self.metrics.iter() {
+            let bs: Vec<&(i64, PartitionLoad)> = window
+                .buckets
+                .iter()
+                .rev()
+                .take(cfg.required_buckets)
+                .collect();
+            if bs.len() < cfg.required_buckets {
+                continue;
+            }
+            let recent = &bs[0].1;
+
+            // ── GC advisory ────────────────────────────────────────────
+            // Skip when an inflight GC is already chewing on this
+            // partition; let that complete before re-advising.
+            if recent.gc_inflight == 0
+                && (recent.last_gc_at == 0
+                    || now - recent.last_gc_at >= cfg.gc_cooldown_sec)
+                && bs.iter().all(|(_, l)| l.gc_debt_bytes > cfg.gc_debt_high)
+            {
+                out.push(PolicyCandidate {
+                    kind: POLICY_KIND_GC,
+                    primary_part_id: part_id,
+                    secondary_part_id: 0,
+                    reason: format!(
+                        "gc_debt_bytes>{} ({} MiB) sustained {}m",
+                        cfg.gc_debt_high,
+                        recent.gc_debt_bytes / (1024 * 1024),
+                        cfg.required_buckets * cfg.bucket_sec as usize / 60,
+                    ),
+                    size_bytes: recent.gc_debt_bytes,
+                    req_per_sec: recent.req_per_sec,
+                    imm_full_per_sec: recent.imm_full_per_sec,
+                    same_ps: true,
+                    last_op_at: recent.last_gc_at,
+                });
+            }
+
+            // ── Compact advisory ──────────────────────────────────────
+            if recent.compact_inflight == 0
+                && (recent.last_compact_at == 0
+                    || now - recent.last_compact_at >= cfg.compact_cooldown_sec)
+                && bs.iter().all(|(_, l)| {
+                    l.pending_compaction_bytes > cfg.compact_pending_high
+                })
+            {
+                out.push(PolicyCandidate {
+                    kind: POLICY_KIND_COMPACT,
+                    primary_part_id: part_id,
+                    secondary_part_id: 0,
+                    reason: format!(
+                        "pending_compaction_bytes>{} ({} MiB) sustained {}m",
+                        cfg.compact_pending_high,
+                        recent.pending_compaction_bytes / (1024 * 1024),
+                        cfg.required_buckets * cfg.bucket_sec as usize / 60,
+                    ),
+                    size_bytes: recent.pending_compaction_bytes,
+                    req_per_sec: recent.req_per_sec,
+                    imm_full_per_sec: recent.imm_full_per_sec,
+                    same_ps: true,
+                    last_op_at: recent.last_compact_at,
+                });
+            }
+        }
+
         out
     }
 }

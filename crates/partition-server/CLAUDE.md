@@ -836,6 +836,61 @@ post-restart.
     consumes the per-partition windowed history (30 min, 1-min buckets)
     to emit advisory split/merge candidates.
 
+    **F187 maintenance debt extension.** Same `PartitionMetrics` struct
+    grows six fields used by `compute_maintenance_advisory`:
+    `gc_debt_bytes` (gauge, refreshed every GC tick from
+    `Σ(get_discards filtered to live sealed log_stream extents)` —
+    reuses existing aggregation, no extra RPCs); `pending_compaction_bytes`
+    (gauge, refreshed every compact tick: when `has_overlap == 1` it's
+    total SST bytes, else it's `pickup_tables(...)`'s output);
+    `gc_inflight` / `compact_inflight` (0/1 booleans set around `run_gc`
+    and `do_compact` awaits, lets the policy engine skip already-active
+    partitions); `last_gc_at` / `last_compact_at` (unix-epoch i64 set
+    on successful completion, drives the per-kind cooldown). Helper
+    `compute_pending_compaction_bytes(part)` lives in `background.rs`
+    and is callable both from the compact loop and (future Stage 2)
+    from a PS-local maintenance scheduler.
+
+    Stage 1 keeps the existing random-jitter scheduling intact (10-20s
+    compact, 30-60s GC). Stage 2/3 (deferred): replace with a PS-local
+    priority scheduler driven by these gauges + a shared fg/bg token
+    bucket on top of F141's GC bytes/sec limiter and a new (currently
+    missing) compact bytes/sec limiter.
+
+    **F188 Stage 2 (shipped 2026-05-10).** PS-level
+    `maintenance_scheduler_loop` (5s cadence on main thread) replaces
+    the random-jitter timers as the primary trigger source. Reads the
+    F187 metrics, computes `urgency = debt / threshold`, sorts desc,
+    dispatches top-K minor compactions / GCs via Send-capable trigger
+    channels held in PartitionHandle. Skips partitions whose
+    `req_per_sec` (derived from `req_count` diff over the interval)
+    exceeds `AUTUMN_PS_FG_QPS_QUOTA` (default 50K) — foreground always
+    wins. Cooldowns drive from PS-side `last_*_at` so the gate respects
+    actual completion. The compact channel's `bool` payload now means
+    `is_major` (true: manual `client compact`, expiry; false: scheduler
+    routine — picks via `pickup_tables`).
+
+    Background loops (`background_compact_loop`, `background_gc_loop`)
+    keep their channel-receive paths but their timeout branches are
+    demoted to short 5-7s metric-refresh ticks — they NO LONGER fire
+    compact/GC off the timer (except expiry-major, which is a
+    wall-clock event the scheduler doesn't see). Helper
+    `compute_pending_compaction_bytes(part)` lives in `background.rs`.
+
+    PS-wide `IoTokenBucket` (parking_lot::Mutex<sliding-window>):
+    `Arc<IoTokenBucket>` on PartitionServer cloned into every
+    PartitionData. GC + compact append paths call
+    `io_bucket.account(bytes).await` BEFORE every network append,
+    sleeping if the cluster ceiling
+    (`AUTUMN_PS_BG_RATE_BYTES_PER_SEC`, default 256 MiB/s; 0 =
+    unlimited) would be exceeded. F141's per-partition GC limiter
+    stays as a tighter inner cap.
+
+    Stage 3 (deferred) is true admission control: fg gets priority
+    tokens and bg gets elastic tokens that yield to fg under
+    contention (CockroachDB `kvadmission` pattern). Currently
+    foreground writes do NOT consult the bucket — they bypass entirely.
+
 12. **F183/F185 partition merge.** F183 shipped the merge primitive
     as a manager-side atomic etcd txn (see `crates/manager/CLAUDE.md`
     note 16). F185 closes the F184-K ~5% merge-window data-loss gap by

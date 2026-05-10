@@ -517,7 +517,7 @@ impl AutumnManager {
             let last_op = self.last_op_at.borrow().clone();
             let state_snapshot: autumn_common::MetadataState =
                 (*self.store.inner.borrow()).clone();
-            let cands: Vec<PolicyCandidate> = {
+            let mut cands: Vec<PolicyCandidate> = {
                 let mut p = self.policy.borrow_mut();
                 p.compute_candidates(crate::policy::ComputeArgs {
                     state: &state_snapshot,
@@ -526,10 +526,33 @@ impl AutumnManager {
                     now,
                 })
             };
+            // F187: maintenance (GC + COMPACT) advisory pass uses only
+            // the per-partition windowed metrics (no need for state /
+            // owners / last_op_at — `last_gc_at` / `last_compact_at`
+            // come straight from the PS-reported buckets).
+            let mut maint = {
+                let mut p = self.policy.borrow_mut();
+                p.compute_maintenance_advisory(now)
+            };
+            cands.append(&mut maint);
+            // Persist the union into the advisory cache so
+            // `MSG_GET_POLICY_CANDIDATES` returns SPLIT / MERGE / GC /
+            // COMPACT in one call.
+            {
+                let mut p = self.policy.borrow_mut();
+                p.advisory_cache = cands.clone();
+                p.advisory_cache_at = now;
+            }
             if !cands.is_empty() {
-                tracing::info!("F183 policy: {} candidate(s)", cands.len());
+                tracing::info!("F183/F187 policy: {} candidate(s)", cands.len());
                 for c in &cands {
-                    let kind = if c.kind == POLICY_KIND_SPLIT { "SPLIT" } else { "MERGE" };
+                    let kind = match c.kind {
+                        POLICY_KIND_SPLIT => "SPLIT",
+                        POLICY_KIND_MERGE => "MERGE",
+                        autumn_rpc::manager_rpc::POLICY_KIND_GC => "GC",
+                        autumn_rpc::manager_rpc::POLICY_KIND_COMPACT => "COMPACT",
+                        _ => "UNKNOWN",
+                    };
                     tracing::info!(
                         "  {} primary={} secondary={} reason='{}' size={}MB qps={} imm/s={} same_ps={}",
                         kind,

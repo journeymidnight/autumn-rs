@@ -99,6 +99,8 @@
 | F184 | Auto-trigger flags + reload-on-region-change + concurrent-writer test + ClusterClient.rpc_timeout | manager/client |
 | F185 | Manager-orchestrated merge with PS freeze-drain (closes F184-K ~5% merge-window loss; 0 loss verified) | manager/partition |
 | F186 | Client-side striperados (Ceph pattern) replaces F129/F130 server multipart — pure ClusterClient impl | client |
+| F187 | GC + compaction maintenance advisory (Stage 1) — debt metrics + PolicyEngine emits POLICY_KIND_GC/COMPACT alongside SPLIT/MERGE | partition/manager/client |
+| F188 | GC + compaction Stage 2 — PS-level priority maintenance scheduler + foreground awareness + shared IO token bucket between GC + compact | partition |
 | ~~F129~~ | ~~PutStream / GetStream — multipart + multi-frag VP~~ — SUPERSEDED by F186 (server code ripped out) | — |
 | ~~F130~~ | ~~GC active rewrite for multi-frag VPs~~ — SUPERSEDED by F186 (no multi-frag any more) | — |
 
@@ -352,6 +354,49 @@
 ---
 
 ## Open / Deferred designs
+
+### F188 · GC + compaction Stage 2 — PS-level priority scheduler + shared IO bucket
+
+- **Target:** F187 Stage 1 surfaced GC/compact debt as advisory metrics but kept the per-partition random-jitter loops (10-20s compact, 30-60s GC) that fire compactions and GC arbitrarily without regard to per-PS capacity, foreground load, or cross-partition priority. F188 Stage 2 closes that asymmetry: a PS-level scheduler dispatches maintenance based on priority + foreground awareness + per-PS bytes/sec budget, replacing the random jitters as the primary trigger source.
+- **Mechanism (scheduler):** new `maintenance_scheduler_loop` on PartitionServer main thread (5s cadence). Snapshots per-partition metrics (`gc_debt_bytes`, `pending_compaction_bytes`, `gc_inflight`, `compact_inflight`, `last_gc_at`, `last_compact_at`) + diffs `req_count` to derive `req_per_sec` over the interval. Skips a partition when `req_per_sec > AUTUMN_PS_FG_QPS_QUOTA` (default 50K). For eligible partitions, computes `urgency = debt / threshold`, sorts desc, dispatches top-K (DISPATCH_PER_TICK=4) via `compact_trigger.try_send(false)` (minor) or `gc_trigger.try_send(GcTask::Auto)` Send-capable channels held in PartitionHandle. Already-busy partitions silently no-op via channel `Full`. Cooldowns (default 300s, env-tunable) gate re-dispatch from PS-side `last_*_at` timestamps so the gate respects actual completion not just dispatch.
+- **Mechanism (loops):** `background_compact_loop` and `background_gc_loop` keep their channel-receive paths (which now serve scheduler dispatches + manual `client compact`/`gc`). Their timeout branches demoted to short 5-7s metric-refresh ticks: refresh `pending_compaction_bytes` / `gc_debt_bytes` every iteration but DON'T fire compact/GC off the timer (except expiry-major, which is a wall-clock event the scheduler doesn't see). The compact channel payload `bool` distinguishes major (true, manual) from minor (false, scheduler routine).
+- **Mechanism (rate limiter):** new `IoTokenBucket` (parking_lot::Mutex<sliding-window>) at PS level. `Arc<IoTokenBucket>` cloned into every PartitionData. GC's `flush_gc_batch` + `run_gc` chunk-read path AND compact's `compact_row_append` (both major + minor) call `io_bucket.account(bytes).await` BEFORE the network append. Default `AUTUMN_PS_BG_RATE_BYTES_PER_SEC = 256 MiB/s`; 0 = unlimited. F141's per-partition GC rate limiter is kept as a tighter inner cap (defense in depth). Foreground writes do NOT consult the bucket — true admission control with elastic vs priority tokens (CockroachDB style) is Stage 3 territory.
+- **Verified on real cluster (2026-05-10):** with `AUTUMN_PS_GC_DEBT_HIGH_BYTES=1MiB AUTUMN_PS_COMPACT_PENDING_HIGH_BYTES=4MiB AUTUMN_PS_BG_RATE_BYTES_PER_SEC=32MiB AUTUMN_PS_GC_COOLDOWN_SECS=30 AUTUMN_PS_COMPACT_COOLDOWN_SECS=30`, drove ~90s of 1KB writes + manual major compact, then observed:
+  - `compact part 15: major, input=7 tables, output=4 tables, kept=1738292, discarded=298314, output=1.7 GB` ← compact tagged discards
+  - `F188 dispatched gc part 15 urgency=4661.16 debt=4661MB` ← scheduler picked up the 4.6 GB debt
+  - Subsequent 5s ticks kept dispatching while debt > threshold and outside cooldown
+- **passes:** true (build clean, 124 PS lib + 58 manager lib + 13 RPC tests pass; live cluster verification of scheduler-dispatch path successful).
+- **Files changed:**
+  - `crates/partition-server/src/lib.rs` — `IoTokenBucket` type + PS field; PartitionHandle gains `compact_trigger` + `gc_trigger` (Send Senders); `partition_thread_main` takes channel + bucket parameters; `PartitionData` gets `io_bucket`; new `maintenance_scheduler_loop` spawned alongside `report_load_loop`.
+  - `crates/partition-server/src/background.rs` — `background_compact_loop` Recv branch handles bool=major/minor; Timeout branch is metric-refresh-only; `background_gc_loop` short timer; `do_compact` + `flush_gc_batch` + `process_gc_chunk` + `run_gc` route through `io_bucket.account()`.
+  - `feature_list.md` — F188 row + Open/Deferred entry.
+  - `claude-progress.txt`, `crates/partition-server/CLAUDE.md` — docs.
+- **Stage 3 (deferred):** true admission-control split between fg priority tokens and bg elastic tokens (CockroachDB `kvadmission` pattern). Foreground writes would also consult an admission queue; bg yields to fg under contention. Manager-driven hint backstop for partitions where `gc_debt > 30%` of disk + sustained high QPS for N minutes (mostly defensive given auto-split already exists).
+
+### F187 · GC + compaction maintenance advisory (Stage 1)
+
+- **Target:** Asymmetry of treatment between auto-split/auto-merge (F183/F184/F185 — full advisory + windowed metrics + policy + cooldown + auto-trigger) and GC/compact (random jitter, hardcoded thresholds, zero manager visibility) leaves operators flying blind on maintenance debt and risks GC/compact starving foreground or being starved by it. Stage 1 mirrors F183's "advisory only — no behavior change" stage onto GC/compact: surface debt as metrics, let the manager emit `POLICY_KIND_GC` / `POLICY_KIND_COMPACT` candidates from the same sliding window. Zero scheduling-policy change in this stage; Stage 2/3 (PS-local priority scheduler + shared token bucket between fg/bg) deferred.
+- **Mechanism (PS-side metrics):** `PartitionMetrics` (partition-server/src/lib.rs) gains six fields:
+  - `gc_debt_bytes` (gauge): Σ `(reclaimable_bytes)` over still-live sealed log_stream extents, refreshed every GC tick from the existing `get_discards` + `valid_discard` aggregation — no extra RPCs.
+  - `pending_compaction_bytes` (gauge): bytes that the next compact tick would feed into `do_compact`. When `has_overlap == 1`, total SST bytes; otherwise `pickup_tables(...)`'s output. Refreshed every compact tick.
+  - `gc_inflight` / `compact_inflight` (0/1 booleans): set 1 around the actual `run_gc` / `do_compact` await; lets advisory engine skip already-active partitions.
+  - `last_gc_at` / `last_compact_at` (unix-epoch i64): set on successful completion; drives the per-kind cooldown.
+- **Mechanism (wire):** `PartitionLoad` (rpc/src/manager_rpc.rs) gets the same six fields. `report_load_loop` (5 s cadence) populates them from `PartitionMetrics`. `Default` derived so existing test sites compile with `..Default::default()`.
+- **Mechanism (manager):** `PolicyEngine::compute_maintenance_advisory(now)` mirrors `compute_candidates` structure: require all of the most recent `required_buckets` to exceed the threshold, gate by per-kind cooldown driven from PS-reported `last_gc_at` / `last_compact_at`, skip when the corresponding `*_inflight` is 1. New `PolicyConfig` fields: `gc_debt_high` (default 1 GiB), `compact_pending_high` (default 4 GiB), `gc_cooldown_sec` (default 300 s), `compact_cooldown_sec` (default 300 s). New constants in `rpc/manager_rpc.rs`: `POLICY_KIND_GC = 2`, `POLICY_KIND_COMPACT = 3`. `policy_tick_loop` (manager/src/lib.rs) appends maintenance advisories to the same `advisory_cache` returned by `MSG_GET_POLICY_CANDIDATES`.
+- **Mechanism (CLI):** `autumn-client policy-candidates` (server/src/bin/autumn_client.rs) now renders 4 kinds (`split` / `merge` / `gc` / `compact`); the `FEAS` column reads `n/a` for GC/COMPACT (always per-partition local feasibility).
+- **Tests:** `crates/manager/src/policy_tests.rs` adds 7 F187 tests (gc_advisory_fires_on_sustained_debt, gc_advisory_skipped_when_inflight, gc_advisory_respects_cooldown, gc_advisory_no_trigger_below_threshold, compact_advisory_fires_on_sustained_pending, compact_advisory_respects_cooldown_and_inflight, maintenance_advisory_partial_window_no_trigger). All 18 policy_tests pass. PS lib (124) + RPC (13) tests still clean.
+- **Stage 2/3 (deferred):** PS-local priority maintenance scheduler that kills the random-jitter loops (each `merged_partition_loop` posts `MaintenanceTicket{want, urgency, debt_bytes}` to a PS-level scheduler that picks under `CompactionGate` and skips when foreground QPS spikes); compact bytes/sec rate limiter to mirror F141's GC limiter; PS-level shared `IoTokenBucket` between foreground writes + GC + compact (CockroachDB admission-control style, GC/compact get elastic tokens). Manager-driven scheduling is deliberately out of scope: GC/compact are local concerns (per-partition state, per-PS resources), unlike split/merge which are inherently global (range reassignment).
+- **passes:** true (build clean, 18 policy_tests pass, 124 PS lib tests pass, 13 RPC tests pass; full live cluster verification deferred per user policy on destructive cluster commands).
+- **Files changed:**
+  - `crates/rpc/src/manager_rpc.rs` — `PartitionLoad` +6 fields + `Default`; `POLICY_KIND_GC` / `POLICY_KIND_COMPACT` constants.
+  - `crates/manager/src/policy.rs` — `GC_DEBT_HIGH` / `COMPACT_PENDING_HIGH` / `GC_COOLDOWN_SEC` / `COMPACT_COOLDOWN_SEC` constants; `PolicyConfig` +4 fields; `PolicyEngine::compute_maintenance_advisory`.
+  - `crates/manager/src/policy_tests.rs` — 7 new tests + `..Default::default()` for the 13 existing PartitionLoad sites.
+  - `crates/manager/src/lib.rs` — `policy_tick_loop` calls `compute_maintenance_advisory`, unions into `advisory_cache`, INFO-logs all 4 kinds.
+  - `crates/manager/tests/system_merge.rs` — `..Default::default()` for 2 PartitionLoad sites.
+  - `crates/partition-server/src/lib.rs` — `PartitionMetrics` +6 atomics; `report_load_loop` populates new wire fields.
+  - `crates/partition-server/src/background.rs` — `compute_pending_compaction_bytes` helper; metric updates in `background_compact_loop` (3 branches: signal, expiry-major, minor) + `background_gc_loop` (debt aggregation + inflight + last_gc_at).
+  - `crates/server/src/bin/autumn_client.rs` — `policy-candidates` renders 4 kinds + adjusted column width.
+  - `feature_list.md`, `claude-progress.txt`, `crates/manager/CLAUDE.md`, `crates/partition-server/CLAUDE.md` — docs.
 
 ### F186 · Client-side striperados — supersedes F129 + F130
 
