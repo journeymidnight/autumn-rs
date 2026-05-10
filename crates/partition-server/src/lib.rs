@@ -584,6 +584,14 @@ pub(crate) struct PartitionData {
 #[derive(Default)]
 pub struct PartitionMetrics {
     pub req_count: std::sync::atomic::AtomicU64,
+    /// F189-fix MED-3: monotonic request counter (NEVER swap-reset).
+    /// `report_load_loop` swaps `req_count` to 0 every 5 s for its
+    /// per-window rate calc, which races the F188 maintenance
+    /// scheduler's diff-based req_per_sec gate (the gate would see
+    /// req_per_sec=0 right after a swap and dispatch BG work during a
+    /// real FG storm). The scheduler now diffs against this monotonic
+    /// counter instead, so it sees true delta over its own interval.
+    pub req_count_monotonic: std::sync::atomic::AtomicU64,
     pub imm_full_count: std::sync::atomic::AtomicU64,
     /// Bytes resident: SST total + active.bytes + Σ imm.bytes. Updated
     /// after each flush + memtable rotate (cheap; under borrow_mut).
@@ -1845,12 +1853,13 @@ impl PartitionServer {
 
             for (pid, m, ctx, gtx) in snapshots {
                 // Foreground-awareness: compute req/sec across the last
-                // interval. We do NOT swap req_count (that belongs to
-                // report_load_loop); we read it and diff against the
-                // previous reading. Race with report_load_loop's swap is
-                // benign — it just means our diff lands at zero for one
-                // interval.
-                let req_now = m.req_count.load(Relaxed);
+                // interval. F189-fix MED-3: diff against the never-reset
+                // `req_count_monotonic` instead of `req_count`. The
+                // latter is swap-reset to 0 every 5 s by
+                // `report_load_loop`, which raced this diff and
+                // produced false-zero rates during real fg storms,
+                // defeating the foreground-awareness gate.
+                let req_now = m.req_count_monotonic.load(Relaxed);
                 let prev = last_req_count.insert(pid, req_now).unwrap_or(req_now);
                 let req_per_sec = req_now.saturating_sub(prev) / SCHEDULE_INTERVAL_SECS;
                 if (req_per_sec as u32) > fg_qps_quota {
@@ -3714,10 +3723,18 @@ async fn handle_incoming_req(
     revision: i64,
 ) {
     // F183: bump per-partition request counter for the policy engine.
-    part.borrow()
-        .metrics
-        .req_count
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // F189-fix MED-3: also bump the never-reset monotonic twin used by
+    // the F188 maintenance scheduler's req_per_sec diff. Two atomic
+    // adds is ~5 ns total — cheap on the request hot path.
+    {
+        let p = part.borrow();
+        p.metrics
+            .req_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        p.metrics
+            .req_count_monotonic
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 
     // F185: reject mutating ops while frozen-for-merge so writes never
     // land in a log_stream tail past the to-be-captured commit_length.

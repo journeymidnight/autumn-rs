@@ -102,6 +102,7 @@
 | F187 | GC + compaction maintenance advisory (Stage 1) — debt metrics + PolicyEngine emits POLICY_KIND_GC/COMPACT alongside SPLIT/MERGE | partition/manager/client |
 | F188 | GC + compaction Stage 2 — PS-level priority maintenance scheduler + foreground awareness + shared IO token bucket between GC + compact | partition |
 | F189 | GC + compaction Stage 3 — two-class admission controller (fg priority + bg elastic, CockroachDB kvadmission style) | partition |
+| F189-fix | Race-review fixes from distributed-systems audit: cooldown stamp on no-op ticks, scheduler diff against monotonic counter, inflight latch at dispatch, channel-backlog dedup at receiver | partition |
 | ~~F129~~ | ~~PutStream / GetStream — multipart + multi-frag VP~~ — SUPERSEDED by F186 (server code ripped out) | — |
 | ~~F130~~ | ~~GC active rewrite for multi-frag VPs~~ — SUPERSEDED by F186 (no multi-frag any more) | — |
 
@@ -355,6 +356,36 @@
 ---
 
 ## Open / Deferred designs
+
+### F189-fix · Race-review fixes (post-distributed-system audit)
+
+After F189 shipped, ran a focused distributed-system race review on F187 + F188 + F189. Four issues found and fixed in this commit; rest of the audit walked safe.
+
+**HIGH-1 fixed: futures::channel::mpsc capacity is `buffer + num_senders`, not `buffer`.** F188 created `compact_tx`/`gc_tx` with `mpsc::channel(1)` and cloned the senders into both PartitionData (P-log) and PartitionHandle (main thread for the scheduler). Effective capacity = 1 buffer + 2 senders = 3 backlogged messages. The F188 comment ("silently no-op via Full") was wrong: under load, scheduler + manual triggers could each enqueue without the receiver having drained. Fix: drain the channel at receive time and collapse the backlog. For compact, OR the bool payload (any major wins). For GC, union Force extents and drop redundant Autos.
+
+**HIGH-2 fixed: `last_gc_at` / `last_compact_at` only updated on success.** The scheduler's cooldown gate (`now - last_gc_at >= gc_cooldown_secs`) reads `last_gc_at == 0` as "never ran" → re-eligible immediately. After F188 dispatched a GC that found `holes.is_empty()` (or `run_gc` errored on extent-node hiccup), the timestamp stayed at 0 and the scheduler dispatched again on the next 5 s tick, indefinitely. Combined with HIGH-1's backlog this could spam GC per-second under transient extent-node failure. Fix: stamp `last_gc_at` / `last_compact_at` on EVERY loop iteration that ran the eligibility check, success or skip — semantic shift from "last successful punch" to "last evaluation time" (which is what cooldown actually wants).
+
+**MED-3 fixed: scheduler's `req_per_sec` diff raced `report_load_loop`'s swap.** The scheduler diffed `req_count` against the previous tick's value to estimate FG QPS for the foreground-awareness gate. But `report_load_loop` swap-resets `req_count` to 0 every 5 s for its OWN per-window rate calc; if the swap landed between two scheduler ticks, the diff went negative → saturating_sub returned 0 → `req_per_sec = 0` → scheduler thought FG was idle and dispatched BG work during a real FG storm. Fix: add a never-reset `PartitionMetrics.req_count_monotonic` AtomicU64, bumped alongside `req_count` on each request; scheduler now diffs against this. Two atomic adds per request (~5 ns) is the cost.
+
+**MED-4 fixed: `gc_inflight` / `compact_inflight` set after the gate, not at dispatch.** The flags exist for the scheduler to skip already-dispatched partitions, but they were latched only AFTER `gc_gate.acquire()` / `gate.acquire()` returned. The pre-gate `get_stream_info` / `get_extent_info` calls cross the manager — slow under contention or backpressure — and during that window the flag stays at 0, allowing the scheduler to fire 1-2 redundant dispatches. Fix: latch `*_inflight = 1` at the very top of the receive arm, clear at every exit path (via inline closure helpers `clear_inflight` / `clear_compact_inflight` to keep call sites tight). Each `continue` path now clears explicitly.
+
+INFO-9 (rkyv schema break on `PartitionLoad` extension): not fixed — single-binary deploy means atomic restart, no rolling upgrade path to break. Documented in this entry for future reference if/when external probes parse the wire format.
+
+Cleared by audit (no fix needed):
+1. parking_lot::Mutex held across `.await` in AdmissionController — confirmed dropped before sleep at lib.rs:1203 (fg) and lib.rs:1261 (bg).
+5. Crash-restart `last_*_at = 0` semantics — acceptable on its own; combined with HIGH-2 above it was the spam path; HIGH-2 fixes it.
+7. `do_compact` tables/sst_readers stability across awaits — F148-A invariant + clone-then-await pattern verified at background.rs:1004-1284.
+8. Window-reset boundary in `account_bg` — `maybe_reset_window` runs first, so `elapsed = 0` paired with `fg_bytes = 0` after reset → no artificial saturation spike.
+10. Manager `policy_tick_loop` advisory_cache write-write-write pattern — single-threaded compio + intermediate stale-read is benign for an advisory API.
+11. Channel cleanup on `open_partition` failure — channels go out of scope cleanly; no senders survive.
+12. Scheduler holding stale `compact_trigger` clone after partition unregister — `try_send` returns `SendError::is_disconnected()` and `is_ok()` returns false; silently ignored at lib.rs:1920+1930.
+
+**Tests after fixes:** 131/131 PS lib + 58/58 manager lib + 13/13 RPC. F189 admission tests still pass.
+
+**Files changed:**
+- `crates/partition-server/src/lib.rs` — `req_count_monotonic` field + bump site + scheduler diff source.
+- `crates/partition-server/src/background.rs` — `gc_inflight` / `compact_inflight` early latch + every-exit-path clear; `last_gc_at` / `last_compact_at` stamped on no-op + failure paths; channel-backlog drain at GC + compact receive arms.
+- `feature_list.md`, `claude-progress.txt` — docs.
 
 ### F189 · GC + compaction Stage 3 — two-class admission controller (fg priority + bg elastic)
 

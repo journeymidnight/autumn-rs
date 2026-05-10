@@ -95,12 +95,48 @@ pub(crate) async fn background_compact_loop(
 
         match task {
             CompactSelected::Recv(None) => break,
-            CompactSelected::Recv(Some(major)) => {
-                // F188: bool payload distinguishes major (true, manual
-                // `client compact` + has_overlap recovery) from minor
-                // (false, scheduler-dispatched routine compaction).
+            CompactSelected::Recv(Some(first)) => {
+                // F189-fix HIGH-1: futures::channel::mpsc capacity is
+                // `buffer + num_senders`, so cap=1 with 2 senders
+                // (PartitionData clone + PartitionHandle clone) admits
+                // up to 3 backlogged dispatches per partition — the
+                // F188 scheduler comment about "silently no-op via
+                // Full" was wrong. Drain everything that's already in
+                // the channel and collapse: any `true` (major) wins
+                // over `false` (minor). One pass is enough because
+                // both senders are bounded; `now_or_never()` ensures
+                // we never block here.
+                use futures::stream::StreamExt;
+                let mut major = first;
+                while let Some(Some(more)) = compact_rx.next().now_or_never() {
+                    if more {
+                        major = true;
+                    }
+                }
                 let tbls = part.borrow().tables.clone();
                 let metrics = part.borrow().metrics.clone();
+                // F189-fix MED-4: latch compact_inflight=1 at dequeue,
+                // not after gate.acquire(). The scheduler reads
+                // compact_inflight to gate duplicate dispatches; the
+                // gate.acquire() can block for seconds when other
+                // partitions hold AUTUMN_PS_MAJOR_COMPACT_PARALLELISM.
+                metrics
+                    .compact_inflight
+                    .store(1, std::sync::atomic::Ordering::Relaxed);
+                // F189-fix HIGH-2: stamp last_compact_at on EVERY recv
+                // arm exit (skip + ok + err), so the scheduler's
+                // cooldown gate engages even on no-op / failed ticks.
+                // See the matching gc_loop fix for full rationale.
+                let stamp_last_compact = || {
+                    metrics
+                        .last_compact_at
+                        .store(crate::now_secs() as i64, std::sync::atomic::Ordering::Relaxed);
+                };
+                let clear_compact_inflight = || {
+                    metrics
+                        .compact_inflight
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                };
                 if tbls.len() < 2 && part.borrow().has_overlap.get() == 0 {
                     tracing::info!(
                         "compact part {}: skipped (major={}) — tables={}, has_overlap=0",
@@ -110,6 +146,8 @@ pub(crate) async fn background_compact_loop(
                         compute_pending_compaction_bytes(&part),
                         std::sync::atomic::Ordering::Relaxed,
                     );
+                    stamp_last_compact();
+                    clear_compact_inflight();
                     continue;
                 }
 
@@ -123,19 +161,17 @@ pub(crate) async fn background_compact_loop(
                         compute_pending_compaction_bytes(&part),
                         std::sync::atomic::Ordering::Relaxed,
                     );
+                    stamp_last_compact();
+                    clear_compact_inflight();
                     continue;
                 }
 
                 // F104: serialize across partitions per
                 // AUTUMN_PS_MAJOR_COMPACT_PARALLELISM (default 1).
                 let _permit = gate.acquire().await;
-                metrics
-                    .compact_inflight
-                    .store(1, std::sync::atomic::Ordering::Relaxed);
+                // compact_inflight already latched at top of recv arm.
                 let result = do_compact(&part, compact_tbls, major).await;
-                metrics
-                    .compact_inflight
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                clear_compact_inflight();
                 match result {
                     Ok(s) => {
                         tracing::info!(
@@ -148,9 +184,6 @@ pub(crate) async fn background_compact_loop(
                         if major {
                             part.borrow().has_overlap.set(0);
                         }
-                        metrics
-                            .last_compact_at
-                            .store(crate::now_secs() as i64, std::sync::atomic::Ordering::Relaxed);
                         if truncate_id != 0 {
                             let (row_stream_id, part_sc) = {
                                 let p = part.borrow();
@@ -167,6 +200,7 @@ pub(crate) async fn background_compact_loop(
                     compute_pending_compaction_bytes(&part),
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                stamp_last_compact();
                 next_minor_delay = random_delay();
             }
             CompactSelected::Timeout => {
@@ -216,10 +250,6 @@ pub(crate) async fn background_compact_loop(
                                     _part_id, s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
                                     crate::human_size(s.output_bytes)
                                 );
-                                metrics.last_compact_at.store(
-                                    crate::now_secs() as i64,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
                                 if last_extent != 0 {
                                     let (row_stream_id, part_sc) = {
                                         let p = part.borrow();
@@ -234,6 +264,11 @@ pub(crate) async fn background_compact_loop(
                         }
                         metrics.pending_compaction_bytes.store(
                             compute_pending_compaction_bytes(&part),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        // F189-fix HIGH-2: stamp last_compact_at unconditionally.
+                        metrics.last_compact_at.store(
+                            crate::now_secs() as i64,
                             std::sync::atomic::Ordering::Relaxed,
                         );
                         continue;
@@ -296,11 +331,54 @@ pub(crate) async fn background_gc_loop(
 
         let gc_task = match task {
             GcSel::Recv(None) => break,
-            GcSel::Recv(Some(t)) => t,
+            GcSel::Recv(Some(first)) => {
+                // F189-fix HIGH-1: drain backlogged sends (cap=1 +
+                // 2 senders ⇒ up to 3 messages can accumulate). Any
+                // queued Force unions its extents into the chosen
+                // task; multiple Autos collapse to a single Auto.
+                use futures::stream::StreamExt;
+                let mut chosen = first;
+                while let Some(Some(more)) = gc_rx.next().now_or_never() {
+                    chosen = match (chosen, more) {
+                        (GcTask::Force { mut extent_ids }, GcTask::Force { extent_ids: more_eids }) => {
+                            for e in more_eids {
+                                if !extent_ids.contains(&e) {
+                                    extent_ids.push(e);
+                                }
+                            }
+                            GcTask::Force { extent_ids }
+                        }
+                        // Force preserves explicit operator intent; any
+                        // Auto dropped behind it is redundant (Auto's
+                        // discard-ratio scan would just pick whatever
+                        // Force already named, plus possibly more).
+                        (GcTask::Force { extent_ids }, GcTask::Auto) => GcTask::Force { extent_ids },
+                        (GcTask::Auto, GcTask::Force { extent_ids }) => GcTask::Force { extent_ids },
+                        (GcTask::Auto, GcTask::Auto) => GcTask::Auto,
+                    };
+                }
+                chosen
+            }
             GcSel::Timeout => {
                 next_auto_delay = random_delay();
                 GcTask::Auto
             }
+        };
+
+        // F189-fix MED-4: latch gc_inflight=1 at the very top of the
+        // loop iteration, not after gc_gate. The scheduler reads
+        // gc_inflight to gate duplicate dispatches; without the early
+        // latch, a slow get_stream_info / get_extent_info (manager
+        // RPC) leaves the flag at 0 for seconds and the scheduler
+        // queues redundant Auto tasks behind us. The cleanup at every
+        // exit path (continue + loop end) clears it back to 0.
+        let metrics = part.borrow().metrics.clone();
+        metrics
+            .gc_inflight
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let clear_inflight = |m: &PartitionMetrics| {
+            m.gc_inflight
+                .store(0, std::sync::atomic::Ordering::Relaxed);
         };
 
         let (log_stream_id, readers_snapshot, part_sc) = {
@@ -312,11 +390,13 @@ pub(crate) async fn background_gc_loop(
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("GC get_stream_info: {e}");
+                clear_inflight(&metrics);
                 continue;
             }
         };
         let extent_ids = stream_info.extent_ids;
         if extent_ids.len() < 2 {
+            clear_inflight(&metrics);
             continue;
         }
 
@@ -326,7 +406,6 @@ pub(crate) async fn background_gc_loop(
         // whether this tick will actually punch anything. The aggregate is
         // sum(reclaimable bytes on still-live sealed log_stream extents) —
         // exactly what an operator would call "GC debt".
-        let metrics = part.borrow().metrics.clone();
         let mut tick_discards = get_discards(&readers_snapshot);
         valid_discard(&mut tick_discards, sealed_extents);
         let gc_debt: u64 = tick_discards.values().map(|v| (*v).max(0) as u64).sum();
@@ -368,6 +447,18 @@ pub(crate) async fn background_gc_loop(
         };
 
         if holes.is_empty() {
+            // F189-fix HIGH-2: stamp last_gc_at even when there's nothing
+            // to punch. Without this the scheduler's cooldown gate
+            // (`now - last_gc_at >= gc_cooldown_secs`) reads
+            // last_gc_at=0 forever and re-dispatches every 5 s,
+            // burning RPCs with no useful work. The semantic shift is
+            // "last time we *evaluated* GC for this partition" rather
+            // than "last successful punch", which is what the cooldown
+            // actually wants.
+            metrics
+                .last_gc_at
+                .store(crate::now_secs() as i64, std::sync::atomic::Ordering::Relaxed);
+            clear_inflight(&metrics);
             continue;
         }
 
@@ -377,12 +468,8 @@ pub(crate) async fn background_gc_loop(
         // preceding read-only get_stream_info / get_extent_info RPCs.
         let _gc_permit = gc_gate.acquire().await;
         tracing::info!("GC: starting, extents={:?}", holes);
-        // F187: gc_inflight visible to the policy engine + operator dashboards
-        // for the entire holes-processing window.
-        metrics
-            .gc_inflight
-            .store(1, std::sync::atomic::Ordering::Relaxed);
-        let mut any_success = false;
+        // F189-fix MED-4: gc_inflight already latched at top of loop;
+        // hold through the punch and clear at the bottom.
         for eid in holes {
             let sealed_length = match part_sc.get_extent_info(eid).await {
                 Ok(info) => info.sealed_length as u32,
@@ -391,21 +478,18 @@ pub(crate) async fn background_gc_loop(
                     continue;
                 }
             };
-            match run_gc(&part, eid, sealed_length).await {
-                Ok(_) => {
-                    any_success = true;
-                }
-                Err(e) => tracing::error!("GC run_gc extent {eid}: {e}"),
+            if let Err(e) = run_gc(&part, eid, sealed_length).await {
+                tracing::error!("GC run_gc extent {eid}: {e}");
             }
         }
+        // F189-fix HIGH-2: stamp last_gc_at unconditionally (success +
+        // failure both engage the cooldown). Same rationale as the
+        // empty-holes branch above: "we ran the loop", not "we
+        // succeeded".
         metrics
-            .gc_inflight
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        if any_success {
-            metrics
-                .last_gc_at
-                .store(crate::now_secs() as i64, std::sync::atomic::Ordering::Relaxed);
-        }
+            .last_gc_at
+            .store(crate::now_secs() as i64, std::sync::atomic::Ordering::Relaxed);
+        clear_inflight(&metrics);
         drop(_gc_permit);
     }
 }

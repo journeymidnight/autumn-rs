@@ -1,77 +1,91 @@
 Date: 2026-05-10
 TaskStatus: completed
-Task scope: F189 — GC + compact Stage 3 (two-class admission control:
-            fg priority + bg elastic, CockroachDB kvadmission pattern).
-            Replaces F188's single-class IoTokenBucket; FG writes
-            now also consult the controller (vs F188 where they
-            bypassed entirely).
+Task scope: F189-fix — distributed-system race-review fixes for F187 +
+            F188 + F189. Two HIGH + two MEDIUM issues found and fixed.
 
-Live verification (4-node cluster, fg_rate=10 MiB/s, bg_rate=32 MiB/s,
-saturation threshold=0.5):
-  16-thread wbench at 8 KiB values: throttled to 9.98 MB/s (vs 10
-  MiB/s ceiling — 0.2% accuracy). Latency p50=12.5ms (vs ~1ms
-  unthrottled — expected queueing under admission cap).
+Audit produced 12 checks; 4 issues found, rest walked clear:
 
-Unit tests (f189_admission_tests, 7/7 passing):
-  fg_unlimited_no_sleep
-  bg_unlimited_no_sleep
-  bg_respects_own_rate
-  bg_yields_when_fg_saturated
-  bg_does_not_yield_when_fg_idle
-  bg_ignores_fg_when_fg_unlimited
-  window_resets_after_1s
+  HIGH-1: futures::channel::mpsc capacity is buffer + num_senders, not
+          buffer. compact_tx/gc_tx with cap=1 + 2 senders = 3 backlog.
+          Scheduler + manual triggers could each enqueue without
+          drain. Fixed by draining at receive time and collapsing
+          (compact: any major wins; gc: union Force extents, drop
+          redundant Autos).
+  HIGH-2: last_gc_at / last_compact_at only stamped on success; the
+          scheduler's cooldown gate read 0-as-never and re-dispatched
+          every 5 s under no-op (empty holes) or transient extent-node
+          failure. Fixed by stamping on every loop iteration that ran
+          the eligibility check (semantic shift: "last evaluation"
+          rather than "last successful punch", which is what cooldown
+          actually wants).
+  MED-3:  scheduler's req_per_sec diff against req_count raced
+          report_load_loop's swap-reset; FG-quota gate read 0 during
+          real FG storms. Fixed by adding never-reset
+          PartitionMetrics.req_count_monotonic; scheduler diffs
+          against this. Two atomic adds per request (~5 ns).
+  MED-4:  gc_inflight / compact_inflight latched after gate.acquire(),
+          which can block for seconds. During that window scheduler
+          fired redundant dispatches. Fixed by latching at top of
+          receive arm + explicit clear at every exit path (inline
+          closures keep the call sites tight).
+
+INFO-9 (PartitionLoad rkyv schema break): not fixed — single-binary
+deploy makes this a non-issue today. Documented for future rolling-
+upgrade considerations.
+
+Cleared by audit (no fix needed):
+  Check 1: parking_lot::Mutex never held across .await (verified
+           lib.rs:1203 + 1261).
+  Check 5: crash-restart last_*_at = 0 — combined with HIGH-2 was the
+           spam path; HIGH-2 fixes it.
+  Check 7: do_compact tables/sst_readers stability across awaits —
+           F148-A invariant + clone-then-await pattern verified.
+  Check 8: AdmissionController window-reset boundary — maybe_reset
+           runs first, so elapsed=0 + fg_bytes=0 after reset → no
+           artificial saturation spike.
+  Check 10: Manager policy_tick_loop advisory_cache write pattern —
+           single-threaded compio + intermediate stale-read is benign.
+  Check 11: Channel cleanup on open_partition failure — channels
+           scope-drop cleanly.
+  Check 12: Scheduler holding stale compact_trigger after partition
+           unregister — try_send returns SendError; silently ignored
+           via is_ok() at lib.rs:1920+1930.
 
 Files changed:
   crates/partition-server/src/lib.rs
-    - IoTokenBucket renamed to AdmissionController; state now tracks
-      fg_bytes + bg_bytes independently (single 1s wall-clock window)
-    - account() split into:
-        account_fg(bytes).await — sleeps only when fg_rate > 0 AND
-                                  exceeded; default unlimited
-        account_bg(bytes).await — sleeps until BOTH bg ceiling AND
-                                  fg-aware yield (when fg observed
-                                  rate > saturation_ratio * fg_rate)
-    - new env vars: AUTUMN_PS_FG_RATE_BYTES_PER_SEC (default 0),
-                    AUTUMN_PS_FG_SATURATED_THRESHOLD (default 0.8)
-                    AUTUMN_PS_BG_RATE_BYTES_PER_SEC (default 256 MiB/s,
-                    same as F188)
-    - new test module f189_admission_tests (7 tests)
+    + PartitionMetrics.req_count_monotonic field
+    + bump alongside req_count on each request (lib.rs:3727)
+    + scheduler reads req_count_monotonic for the FG-quota gate
   crates/partition-server/src/background.rs
-    - start_write_batch calls admission.account_fg(total_value_bytes)
-      .await once per batch before Phase 2 launch (the FG hot path)
-    - all BG sites: io_bucket.account(...) → io_bucket.account_bg(...)
+    + gc_inflight latched at top of receive arm; clear_inflight closure
+      called on every continue path
+    + compact_inflight latched at top of recv arm; clear_compact_inflight
+      closure called on every continue path
+    + last_gc_at stamped on empty-holes + completion paths
+    + last_compact_at stamped on skip + len<2 + completion paths
+    + Channel-backlog drain at compact recv arm (drain pending bools,
+      OR them — any major wins)
+    + Channel-backlog drain at gc recv arm (drain pending GcTasks,
+      union Force extents, drop redundant Autos)
   feature_list.md
-    - F189 row + Open/Deferred entry (mechanism + verification + Stage 4
-      future deferrals)
-  crates/partition-server/CLAUDE.md
-    - note 11 extended with F189 admission controller details
+    F189-fix entry under Open / Deferred designs
   claude-progress.txt
-    - this file
+    this file
 
 Tests:
-  cargo check -p autumn-partition-server          : clean
+  cargo check --workspace --exclude autumn-fuse: clean
+  cargo test -p autumn-rpc                     : 13/13
+  cargo test -p autumn-manager --lib            : 58/58
   cargo test -p autumn-partition-server --lib
-                                  -- --test-threads=1 : 131/131
-                                  (was 124, +7 F189)
-  cargo test -p autumn-rpc                        : 13/13
-  cargo test -p autumn-manager --lib              : 58/58
-  Live cluster: fg ceiling honored to 0.2%
+                              -- --test-threads=1: 131/131
 
-Cluster currently RUNNING with Stage 3 active. Default config in
-production should be:
-  AUTUMN_PS_FG_RATE_BYTES_PER_SEC=0           (unlimited; backwards-compat)
-  AUTUMN_PS_BG_RATE_BYTES_PER_SEC=268435456   (256 MiB/s)
-  AUTUMN_PS_FG_SATURATED_THRESHOLD=0.8
+Next steps (deferred, not in scope):
+  - persist last_gc_at / last_compact_at to a per-extent meta record
+    so the cooldown survives PS restart (would close finding 5 fully)
+  - migrate PartitionLoad to prost so wire format tolerates field
+    additions for rolling upgrades (would close INFO-9)
+  - integrate F183 advisory's published per-bucket req_per_sec into
+    AdmissionController's saturation calc (Stage 4 follow-up)
 
-Operators who want to enforce a fg ceiling for predictable bg
-behaviour can set AUTUMN_PS_FG_RATE_BYTES_PER_SEC > 0; the bg fg-aware
-yield activates at that point.
-
-Next steps:
-  - Distributed-system race review (in progress in the conversation
-    after this commit)
-  - Stage 4 (deferred): per-op priority hints, per-extent-node
-    bandwidth attribution, integrate with F183 advisory's req_per_sec
-    instead of local 1s window.
-
-Final commit: pending.
+Cluster currently RUNNING; race-fixes need restart to take effect for
+any further load testing.
