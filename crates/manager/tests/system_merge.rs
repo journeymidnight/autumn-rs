@@ -1080,6 +1080,195 @@ fn split_merge_split_with_concurrent_writes() {
     });
 }
 
+/// F185 — same scenario as `split_merge_split_with_concurrent_writes`
+/// but routes the merge through the manager-orchestrated
+/// `MSG_MERGE_PARTITIONS` path. The orchestrator freezes both PSes
+/// (drains pending+inflight, flushes all imm) BEFORE capturing
+/// commit_length, so the F184-K loss window of "writes after FLUSH but
+/// before manager commit land in a tail that vp_head bypasses" is
+/// closed at the source. Asserts 0 lost writes (vs F184-K's ≤20%).
+#[test]
+#[ignore]
+fn f185_orchestrated_merge_zero_loss_concurrent_writes() {
+    use autumn_client::ClusterClient;
+
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
+    let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 101).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 14001, log, row, meta, b"a", b"z").await;
+
+        let ps_addr = pick_addr();
+        start_partition_server(101, mgr_addr, ps_addr);
+        compio::time::sleep(Duration::from_millis(2000)).await;
+        let _ps = RpcClient::connect(ps_addr).await.unwrap();
+        let router = PsRouter::new(mgr_addr, ps_addr);
+
+        // Pre-seed enough keys so split has a clean mid_key.
+        for i in 0u8..20 {
+            psr_put(&router, 14001, format!("k{:03}", i).as_bytes(), b"seed").await;
+        }
+        psr_flush(&router, 14001).await;
+        psr_compact(&router, 14001).await;
+        compio::time::sleep(Duration::from_millis(2500)).await;
+
+        let cluster = std::rc::Rc::new(
+            ClusterClient::connect(&mgr_addr.to_string())
+                .await
+                .expect("ClusterClient::connect"),
+        );
+        // Tighter timeout: freeze + commit window is sub-second on the
+        // happy path; 2 s gives the writer's retry path one bounded
+        // wait per ConnectionError.
+        cluster.set_rpc_timeout(Duration::from_secs(2));
+
+        // Concurrent writer task — drives writes during topology changes.
+        let stop = std::rc::Rc::new(std::cell::Cell::new(false));
+        let acked = std::rc::Rc::new(std::cell::RefCell::new(Vec::<Vec<u8>>::new()));
+        let unavailable_errors = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let other_errors = std::rc::Rc::new(std::cell::Cell::new(0u64));
+
+        let writer = {
+            let stop = stop.clone();
+            let acked = acked.clone();
+            let cluster = cluster.clone();
+            let unavailable_errors = unavailable_errors.clone();
+            let other_errors = other_errors.clone();
+            compio::runtime::spawn(async move {
+                let mut counter: u64 = 1000;
+                while !stop.get() {
+                    counter += 1;
+                    let prefix = if counter % 2 == 0 { "b" } else { "n" };
+                    let key = format!("{prefix}-{counter:06}").into_bytes();
+                    match cluster.put(&key, b"v").await {
+                        Ok(()) => acked.borrow_mut().push(key),
+                        Err(autumn_client::AutumnError::ServerError(msg))
+                            if msg.contains("frozen for merge") =>
+                        {
+                            // Expected during the merge window. Refresh
+                            // routing and retry; the post-commit reload
+                            // will surface the new owning partition.
+                            unavailable_errors.set(unavailable_errors.get() + 1);
+                            let _ = cluster.refresh_regions().await;
+                            compio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        Err(_) => {
+                            other_errors.set(other_errors.get() + 1);
+                            let _ = cluster.refresh_regions().await;
+                            compio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                    compio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+        };
+
+        compio::time::sleep(Duration::from_secs(2)).await;
+
+        // SPLIT
+        let r = router.client_for(14001).await
+            .call(
+                partition_rpc::MSG_SPLIT_PART,
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 14001 }),
+            )
+            .await.expect("split #1");
+        let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&r).unwrap();
+        assert_eq!(sr.code, partition_rpc::CODE_OK, "split: {}", sr.message);
+
+        let _ = poll_until_async(
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+            || async {
+                let r = get_regions(&mgr).await;
+                r.regions.len() == 2 && r.part_addrs.len() == 2
+            },
+        ).await;
+        let regions = get_regions(&mgr).await;
+        let mut s1 = 0u64; let mut v1 = 0u64;
+        for (pid, r) in &regions.regions {
+            if let Some(rg) = &r.rg {
+                if rg.start_key == b"a".to_vec() { s1 = *pid; } else { v1 = *pid; }
+            }
+        }
+
+        compio::time::sleep(Duration::from_secs(2)).await;
+
+        psr_compact(&router, s1).await;
+        psr_compact(&router, v1).await;
+        compio::time::sleep(Duration::from_millis(3000)).await;
+
+        // MERGE via the orchestrated F185 path. ClusterClient.merge_partitions
+        // now sends MSG_MERGE_PARTITIONS to the manager, which handles
+        // freeze + capture + txn atomically.
+        cluster.merge_partitions(s1, v1).await.expect("merge_partitions OK");
+        compio::time::sleep(Duration::from_millis(3000)).await;
+        assert_eq!(get_regions(&mgr).await.regions.len(), 1, "after merge");
+
+        // Continue writes against the merged topology so we exercise the
+        // post-merge region_sync reload + frozen-PartitionData drop.
+        compio::time::sleep(Duration::from_secs(2)).await;
+
+        stop.set(true);
+        writer.await;
+
+        let final_acked = acked.borrow().clone();
+        let n = final_acked.len();
+        assert!(n >= 20, "writer should have acked many keys, got {n}");
+
+        let _ = cluster.refresh_regions().await;
+
+        let mut missing: Vec<Vec<u8>> = Vec::new();
+        for key in &final_acked {
+            match cluster.get(key).await {
+                Ok(Some(v)) if v == b"v".to_vec() => {}
+                _ => missing.push(key.clone()),
+            }
+        }
+
+        let lost_pct = (missing.len() as f64 / n as f64) * 100.0;
+        eprintln!(
+            "F185 orchestrated merge: {} acked, {} read back, {} lost ({:.2}%), \
+             {} unavailable-retried (expected during freeze window), {} other-errors",
+            n, n - missing.len(), missing.len(), lost_pct,
+            unavailable_errors.get(), other_errors.get()
+        );
+
+        // F185 contract: 0 loss on the orchestrated path. The CLI
+        // orchestration left ~5 % loss; the freeze-drain closes that
+        // entirely. Allowing a 1-key tolerance for the rare case where
+        // a write's PS reply was in flight when the connection got
+        // dropped, but assert tightly otherwise.
+        assert!(
+            missing.is_empty()
+                || (missing.len() as f64 / n as f64) < 0.001,
+            "F185 expected 0 loss; got {} of {} ({:.3}%). First missing: {:?}",
+            missing.len(),
+            n,
+            lost_pct,
+            missing.iter().take(5).map(|k| String::from_utf8_lossy(k).to_string()).collect::<Vec<_>>()
+        );
+        // Some unavailability is expected during the freeze window —
+        // assertion proves the writer actually hit the frozen state
+        // (otherwise the test isn't exercising F185's contract).
+        assert!(
+            unavailable_errors.get() > 0,
+            "expected the writer to hit at least one CODE_UNAVAILABLE during the merge \
+             freeze window — either the orchestrator skipped freeze or the freeze \
+             drain raced ahead of the writer"
+        );
+    });
+}
+
 /// F184 stress: split → put → merge → put → split with batches of writes
 /// interleaved between topology ops. Verifies all written keys remain
 /// readable across the full lifecycle.

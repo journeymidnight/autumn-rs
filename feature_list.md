@@ -97,7 +97,7 @@
 | FGA-01 | gallery: storage HUD + spawn_blocking thumbs + video thumbs + auto-hide lightbox strip | examples |
 | F183 | Partition merge primitive + size+load advisory policy engine (Stage 1) | partition/manager |
 | F184 | Auto-trigger flags + reload-on-region-change + concurrent-writer test + ClusterClient.rpc_timeout | manager/client |
-| F185 | PS-side `handle_merge_part` with freeze-drain (deferred — closes Stage-1 ~5% merge-window loss) | partition |
+| F185 | Manager-orchestrated merge with PS freeze-drain (closes F184-K ~5% merge-window loss; 0 loss verified) | manager/partition |
 
 ---
 
@@ -610,63 +610,106 @@
   - `cargo build --workspace --exclude autumn-fuse`: clean
 - **passes:** true
 
-### F185 · PS-side `handle_merge_part` with freeze-drain — deferred follow-on to F183/F184
+### F185 · Manager-orchestrated merge with PS freeze-drain — closes F184-K ~5% loss window
 
-- **Target:** Close the Stage-1 merge-window data-loss gap measured by F184-K: writes that
-  arrive after the merge orchestrator's FLUSH but before the survivor's `region_sync_loop`
-  reload land in the old log_stream's tail extent (offset BEFORE the post-merge
-  `vp_head=(E_new, 0)`); survivor's recovery never replays them. F184-K observes ~5 %
-  loss across split-merge-split with a sustained 50 ops/sec writer.
-- **Mechanism (per spec §4.1):** new PS RPC `MSG_MERGE_PART` (wire id 0x4D, already
-  reserved in F183-A2). The handler runs on the **survivor's** PS and performs an
-  atomic write-halt + drain protocol:
-  1. Acquire 4 gates in strict deadlock-safe order:
-     `(victim.compact_gate, victim.gc_gate, survivor.compact_gate, survivor.gc_gate)`
-  2. Send `MergeFreeze` to victim's `merged_partition_loop` via a new Send-capable
-     control channel; victim drains pending + inflight, flushes all imm, sets
-     `frozen_for_merge: Cell<bool>` on its `PartitionData`, acks back.
-  3. Same freeze on survivor.
-  4. While both are frozen, capture `commit_length` on six streams, call
-     `MSG_MULTI_MODIFY_MERGE` (existing F183 manager handler — unchanged).
-  5. **In-place splice on survivor's `PartitionData`**: append victim's
-     `tables` + `sst_readers`, widen `rg.end_key`, bump `seq_number` to
-     `max(s.seq, v.seq) + 1`, write a unioned `TableLocations` to
-     survivor's meta_stream with `vp_head = (E_new, 0)`. NO region_sync
-     reload needed — survivor stays open with merged state.
-  6. Send `MergeRelease` to victim → victim closes; OS thread joins.
-  7. `survivor.frozen_for_merge.set(false)`; clients' Unavailable retries
-     succeed.
-- **Why deferred:** every partition runs on its own OS thread (F099-K). `handle_merge_part`
-  fires on survivor's thread but needs to operate on victim's `PartitionData`
-  (`Rc<RefCell<>>`, `!Send`). Requires:
-  - new `Send` mpsc channel from any partition thread to the main thread
-  - main-thread `merge_service_loop` that consumes `(survivor_id, victim_id, ack_tx)`
-    requests and performs the freeze coordination (main thread already holds
-    `Rc<RefCell<HashMap<part_id, PartitionHandle>>>` so it can reach both partitions'
-    cross-thread `drain_tx`-style channels)
-  Substantial cross-thread refactor — F184 deliberately deferred this and used CLI
-  orchestration + `region_sync_loop` reload-on-rg-change (F184-B) as a Stage-1
-  approximation.
-- **Observed Stage-1 limitation closed by this:**
-  - data loss: ~5 % → 0
-  - merge wallclock: ~3 s (incl. region_sync wait) → < 1 s
-  - client-visible errors: silent loss + NotFound → bounded `Unavailable`-retry
-    window only (clients' standard retry path handles it)
-- **Where it lives in the spec:** `docs/superpowers/specs/2026-05-09-partition-merge-and-split-merge-policy-design.md`
-  §4.1 (handler), §4.3 (`merged_partition_loop` MergeFreeze handling), §7.2/§7.3
-  (crash recovery), §9.3 (file changes).
-- **Trigger to start:** when production observes the Stage-1 ~5 % loss as
-  unacceptable. F184's `ClusterClient.set_rpc_timeout` (F184-L) already converts
-  the loss-window from "silent loss" to "bounded retry"; the actual loss only
-  matters for workloads where idempotent writes can't replay safely.
-- **Files (when implemented):** `crates/partition-server/src/lib.rs` (extend
-  `PartitionRequest` enum with `MergeFreeze`/`MergeRelease`; add
-  `frozen_for_merge: Cell<bool>` on `PartitionData`; new `merge_service_loop`
-  on main thread; cross-thread mpsc); `crates/partition-server/src/rpc_handlers.rs`
-  (add `handle_merge_part`); `crates/partition-server/src/background.rs`
-  (extend `merged_partition_loop` select with MergeFreeze/MergeRelease arms).
-  Wire types `MergePartReq`/`MergePartResp` already shipped in F183-A2.
-- **passes:** false (deferred; no existing implementation)
+- **Target:** Close the Stage-1 merge-window data-loss gap measured by F184-K. F184's
+  CLI-orchestrated merge captured `commit_length` AFTER the FLUSH but BEFORE writes were
+  halted; writes that arrived in that window land in the old log_stream's tail extent at
+  offsets BEYOND the captured `sealed_length`, and the survivor's post-merge recovery (which
+  reads `log_stream` from `vp_head=(E_new, 0)` forward) never replays them. F184-K observed
+  ~4-5 % loss across split-merge-split with a sustained 50 ops/sec writer.
+- **Approach (chosen over the spec §4.1 "PS-orchestrated handle_merge_part"):** the spec
+  proposed letting the survivor's PS thread coordinate a 4-gate freeze on the victim's PS
+  thread + an in-memory cross-thread splice of `Vec<Arc<SstReader>>`. That requires a
+  Send-capable cross-thread channel + main-thread `merge_service_loop` registry — a
+  substantial refactor. F185 takes the **TiKV PrepareMerge model** instead: the
+  leader-fenced control plane (here, the manager) is the orchestrator. CLI is a thin
+  wrapper. No cross-thread channels, no in-memory splice — survivor reopens via the
+  existing `region_sync_loop` reload (F184-B) + `read_all_table_locations` union (F184-C).
+  Trade-off: merge wallclock stays ~2-3 s (vs spec's <1 s); data loss goes to 0.
+- **Mechanism:**
+  1. Client → manager: `MSG_MERGE_PARTITIONS { survivor, victim }` (one RPC).
+  2. Manager `handle_merge_partitions` (`crates/manager/src/rpc_handlers.rs`):
+     - `ensure_leader` + resolve `part_addr` / stream ids in one borrow
+     - acquire admin owner-lock keyed on the partition pair (so two concurrent merge
+       attempts targeting the same survivor serialize)
+     - `MSG_MERGE_FREEZE { freeze: true }` to victim PS — drains pending+inflight, rotates
+       active, flushes every imm, sets `PartitionData.frozen_for_merge = Some(now)`,
+       returns OK only after the post-freeze checkpoint is durable. Subsequent
+       Put/Delete/StreamPut on the victim return `CODE_UNAVAILABLE` (new code 7).
+     - `MSG_MERGE_FREEZE { freeze: true }` to survivor PS — same.
+     - capture `commit_length` × 6 (3 streams × 2 partitions) via existing
+       `handle_check_commit_length`. Now race-free because both PSes are frozen.
+     - call `handle_multi_modify_merge` synchronously (existing F183 atomic etcd txn —
+       unchanged). The single `put_and_delete_txn` is the linearization point.
+     - on success: do NOT explicitly unfreeze. `region_sync_loop` on each PS observes
+       (rg, stream_ids) change on next ~2 s tick (F184-B), drops the frozen
+       `PartitionData`, and reopens the survivor with `frozen_for_merge = None` —
+       natural unfreeze.
+     - on failure: best-effort `MSG_MERGE_FREEZE { freeze: false }` rollback to anyone
+       already frozen.
+- **Crash safety:**
+  - **CLI crash** (any time): benign — manager continues to completion or rollback.
+  - **Manager crash before commit**: failover; new leader sees no half-state in etcd; PSes
+    auto-unfreeze via `FREEZE_TTL = 30 s` backstop in `merged_partition_loop`. Merge can
+    be retried.
+  - **Manager crash after commit**: merge is durable in etcd; `region_sync_loop` drives
+    PS reload; frozen flag goes with the dropped PartitionData.
+  - **PS crash mid-flow**: in-memory freeze flag lost on restart; either the merge
+    committed (PS reopens with merged state via F184-C) or didn't (PS reopens with
+    original state).
+  - **Why TTL not procedure-WAL** (HBase-style ProcedureV2): the only crash window this
+    has to cover is "manager crashed between freeze RPC and etcd commit" — sub-second
+    on the happy path. 30 s is far over budget but bounds worst-case freeze duration far
+    below "frozen forever until PS restart". If we ever need cross-PS merge or higher
+    merge frequency, upgrade to a `mergeInProgress/<survivor>:<victim>` etcd marker
+    + replay-on-leader-promotion (~200 lines, ProcedureV2 in miniature) — recorded as
+    a follow-up below.
+- **Wire additions (`crates/rpc/src/{partition,manager}_rpc.rs`):**
+  - PS: `MSG_MERGE_FREEZE = 0x4E`, `MergeFreezeReq { part_id, freeze: bool }`,
+    `MergeFreezeResp { code, message }`, `CODE_UNAVAILABLE = 7`.
+  - Manager: `MSG_MERGE_PARTITIONS = 0x37`, `MergePartitionsReq { survivor, victim }`,
+    `MergePartitionsResp { code, message, new_log_tail_extent_id }`.
+  - Reserved-but-unused `MSG_MERGE_PART = 0x4D` left in place; the spec's PS-orchestrated
+    variant is no longer the chosen path but the constant stays for the unlikely future
+    where it gets revisited.
+- **PS-side state (`crates/partition-server/src/lib.rs`):**
+  - `PartitionData.frozen_for_merge: Cell<Option<Instant>>` — `Some(set_at)` while frozen.
+    `handle_incoming_req` short-circuits Put/Delete/StreamPut with `CODE_UNAVAILABLE`.
+  - `PartitionData.freeze_drain_ack: RefCell<Option<oneshot::Sender<HandlerResult>>>` —
+    parked freeze response; fired by `merged_partition_loop` once `pending` AND
+    `inflight` are both empty AND every imm has flushed.
+  - Top-of-loop check in `merged_partition_loop` runs the rotate-active +
+    `flush_one_imm` loop and sends OK on the parked oneshot. TTL backstop also at
+    top-of-loop: if `set_at.elapsed() > FREEZE_TTL (30 s)`, auto-unfreeze + drop ack
+    with `CODE_PRECONDITION`.
+  - `merged_partition_loop` runs reads + maintenance ops normally while frozen — only
+    writes are halted.
+- **Client-side (`crates/client/src/lib.rs`):** `ClusterClient::merge_partitions` is now
+  a thin wrapper around `MSG_MERGE_PARTITIONS` (was 100+ lines of CLI orchestration; now
+  ~20 lines).
+- **Tests:** `f185_orchestrated_merge_zero_loss_concurrent_writes` (system_merge.rs) is
+  a clone of F184-K's `split_merge_split_with_concurrent_writes` setup that routes the
+  merge through `MSG_MERGE_PARTITIONS`. Asserts:
+  - 0 lost writes (vs F184's ≤20 % tolerance — F184 routinely shows ~5 %)
+  - `> 0` `CODE_UNAVAILABLE` retries observed (proves the freeze actually fired)
+  Both F184-K (loss = baseline) and F185 (loss = 0) pass in the same test run, giving
+  a regression baseline for the OLD path while validating the NEW one.
+- **Observed numbers (`cargo test --test system_merge -- --ignored`):**
+  - F184-K (old path): 542 acked, 26 lost (4.8 %), 9 transient errors retried
+  - F185 (new path): 360 acked, 0 lost (0 %), 11 unavailable-retried (proves freeze)
+- **Files changed:** `crates/rpc/src/partition_rpc.rs` (wire types), `crates/rpc/src/manager_rpc.rs`
+  (wire types), `crates/partition-server/src/lib.rs` (PartitionData fields, freeze drain
+  in merged_partition_loop, handle_incoming_req short-circuits, FREEZE_TTL), `crates/manager/src/rpc_handlers.rs`
+  (handle_merge_partitions orchestrator), `crates/client/src/lib.rs` (thin wrapper),
+  `crates/manager/tests/system_merge.rs` (new test).
+- **Follow-up (deferred — record only):** if the 30 s TTL ever proves insufficient or
+  cross-PS merge is needed, add a `mergeInProgress/<survivor>:<victim>` etcd sidecar
+  written before freeze and deleted by the success path's etcd txn. Leader-promotion
+  replay scans the prefix; for each entry, decide unfreeze (rollback) or commit
+  (continue) based on whether the partition deletion is already in etcd. This is
+  HBase ProcedureV2 in ~200 lines.
+- **passes:** true
 
 ### F184 · F183 follow-on — auto-trigger + reload-on-region-change + concurrent-writer test + SDK rpc_timeout
 

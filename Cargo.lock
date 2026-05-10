@@ -234,6 +234,7 @@ name = "autumn-manager"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "autumn-client",
  "autumn-common",
  "autumn-etcd",
  "autumn-partition-server",

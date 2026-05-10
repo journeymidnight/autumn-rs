@@ -913,9 +913,23 @@ impl ClusterClient {
     ///      unavailability during the reopen is the trade-off for not
     ///      requiring a PS-side splice handler in Stage 1.
     ///
-    /// Caller is responsible for stopping writes to both partitions
-    /// during the window between FLUSH and the manager call. Stage 2/3
-    /// would add a proper PS-side handler with dual-gate + drain.
+    /// F185: thin wrapper around the manager-orchestrated `MSG_MERGE_PARTITIONS`.
+    ///
+    /// The manager (which is leader-fenced and crash-recoverable via etcd)
+    /// owns the full sequence:
+    ///   - acquire admin owner-lock for the partition pair
+    ///   - send `MSG_MERGE_FREEZE` to both PSes (drains pending+inflight,
+    ///     flushes all imm, halts new writes with `CODE_UNAVAILABLE`)
+    ///   - capture `commit_length` × 6 under the freeze (closes the
+    ///     ~5 % loss window measured by F184-K)
+    ///   - run the F183 atomic etcd merge txn
+    ///   - on success: leave PSes frozen — region_sync_loop drops the
+    ///     frozen `PartitionData` on its next ~2 s tick
+    ///   - on failure: send `freeze=false` rollback to both PSes
+    ///
+    /// CLI crashes mid-call are now benign: the manager continues
+    /// serving the orchestrated merge, and a 30 s `FREEZE_TTL` on the
+    /// PS side is the final backstop for an orchestrator crash.
     pub async fn merge_partitions(
         &self,
         survivor_part_id: u64,
@@ -923,108 +937,15 @@ impl ClusterClient {
     ) -> std::result::Result<(), AutumnError> {
         self.flush(survivor_part_id).await?;
         self.flush(victim_part_id).await?;
-
-        // Acquire an admin owner-lock for the merge sequence.
-        let owner_key = format!("admin-merge:{survivor_part_id}:{victim_part_id}");
-        let lock_resp_bytes = self
-            .mgr_call(
-                MSG_ACQUIRE_OWNER_LOCK,
-                rkyv_encode(&AcquireOwnerLockReq { owner_key: owner_key.clone() }),
-            )
-            .await
-            .map_err(|e| AutumnError::ServerError(e.to_string()))?;
-        let lock_resp: AcquireOwnerLockResp =
-            rkyv_decode(&lock_resp_bytes).map_err(AutumnError::ServerError)?;
-        if lock_resp.code != autumn_rpc::manager_rpc::CODE_OK {
-            return Err(AutumnError::ServerError(lock_resp.message));
-        }
-        let revision = lock_resp.revision;
-
-        // Resolve stream IDs.
-        let regions = {
-            let resp_bytes = self
-                .mgr_call(MSG_GET_REGIONS, Bytes::new())
-                .await
-                .map_err(|e| AutumnError::ServerError(e.to_string()))?;
-            let resp: GetRegionsResp =
-                rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
-            if resp.code != autumn_rpc::manager_rpc::CODE_OK {
-                return Err(AutumnError::ServerError(resp.message));
-            }
-            resp.regions
-        };
-        let find_region = |pid: u64| -> std::result::Result<MgrRegionInfo, AutumnError> {
-            regions
-                .iter()
-                .find(|(id, _)| *id == pid)
-                .map(|(_, r)| r.clone())
-                .ok_or(AutumnError::NotFound)
-        };
-        let s_region = find_region(survivor_part_id)?;
-        let v_region = find_region(victim_part_id)?;
-
-        // commit_length per stream.
-        async fn commit_len_helper(
-            client: &ClusterClient,
-            stream_id: u64,
-            owner_key: &str,
-            revision: i64,
-        ) -> std::result::Result<u64, AutumnError> {
-            let req = rkyv_encode(&CheckCommitLengthReq {
-                stream_id,
-                owner_key: owner_key.to_string(),
-                revision,
-            });
-            let resp_bytes = client
-                .mgr_call(MSG_CHECK_COMMIT_LENGTH, req)
-                .await
-                .map_err(|e| AutumnError::ServerError(e.to_string()))?;
-            let resp: CheckCommitLengthResp =
-                rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
-            if resp.code != autumn_rpc::manager_rpc::CODE_OK {
-                return Err(AutumnError::ServerError(resp.message));
-            }
-            Ok(resp.end as u64)
-        }
-        let log_lens = [
-            commit_len_helper(self, s_region.log_stream, &owner_key, revision)
-                .await?
-                .max(1),
-            commit_len_helper(self, v_region.log_stream, &owner_key, revision)
-                .await?
-                .max(1),
-        ];
-        let row_lens = [
-            commit_len_helper(self, s_region.row_stream, &owner_key, revision)
-                .await?
-                .max(1),
-            commit_len_helper(self, v_region.row_stream, &owner_key, revision)
-                .await?
-                .max(1),
-        ];
-        let meta_lens = [
-            commit_len_helper(self, s_region.meta_stream, &owner_key, revision)
-                .await?
-                .max(1),
-            commit_len_helper(self, v_region.meta_stream, &owner_key, revision)
-                .await?
-                .max(1),
-        ];
-
-        let req = rkyv_encode(&MultiModifyMergeReq {
+        let req = rkyv_encode(&MergePartitionsReq {
             survivor_part_id,
             victim_part_id,
-            owner_key,
-            revision,
-            log_sealed_lengths: log_lens,
-            row_sealed_lengths: row_lens,
-            meta_sealed_lengths: meta_lens,
         });
         let resp_bytes = self
-            .mgr_call(MSG_MULTI_MODIFY_MERGE, req)
+            .mgr_call(MSG_MERGE_PARTITIONS, req)
             .await
             .map_err(|e| AutumnError::ServerError(e.to_string()))?;
-        let resp: MultiModifyMergeResp =
+        let resp: MergePartitionsResp =
             rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
         if resp.code != autumn_rpc::manager_rpc::CODE_OK {
             return Err(AutumnError::ServerError(resp.message));

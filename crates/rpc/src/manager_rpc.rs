@@ -56,6 +56,16 @@ pub const MSG_MULTI_MODIFY_MERGE: u8 = 0x34;
 pub const MSG_GET_POLICY_CANDIDATES: u8 = 0x35;
 // F183: per-partition load metrics report (PS → manager, 5 s cadence).
 pub const MSG_REPORT_PARTITION_LOAD: u8 = 0x36;
+// F185: orchestrated partition merge — inputs are just (survivor, victim).
+// The manager (which is leader-fenced + persistent) acquires its own
+// admin owner lock, freezes both PSes via MSG_MERGE_FREEZE, captures the
+// 6 commit_lengths under the freeze, then runs the existing
+// MSG_MULTI_MODIFY_MERGE handler logic atomically. CLI is a thin wrapper
+// so a CLI crash mid-merge is benign — the manager either commits the
+// txn (region_sync_loop on the survivor's PS picks up the wider rg and
+// drops the frozen PartitionData on next tick) or it doesn't (PSes
+// auto-unfreeze after FREEZE_TTL seconds).
+pub const MSG_MERGE_PARTITIONS: u8 = 0x37;
 
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
@@ -672,6 +682,26 @@ pub struct MultiModifyMergeResp {
     /// extent_id of the freshly allocated empty tail for survivor's
     /// log_stream; used as vp_head when writing the merged
     /// TableLocations checkpoint on the PS.
+    pub new_log_tail_extent_id: u64,
+}
+
+// --- F185: MergePartitions (manager-orchestrated merge) ---
+//
+// Drop-in replacement for the F183 client-orchestrated merge sequence.
+// Caller passes only the two partition ids; the manager handles owner-
+// lock acquisition, PS freeze, commit_length capture, and the multi-
+// modify-merge txn internally. This relocates the orchestration's
+// failure boundary onto the leader-fenced + etcd-replayable manager.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MergePartitionsReq {
+    pub survivor_part_id: u64,
+    pub victim_part_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MergePartitionsResp {
+    pub code: u8,
+    pub message: String,
     pub new_log_tail_extent_id: u64,
 }
 

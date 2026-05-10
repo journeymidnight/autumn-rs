@@ -274,6 +274,18 @@ const VALUE_THROTTLE: usize = 4 * 1024;
 const VALUE_POINTER_SIZE: usize = 16;
 const OP_VALUE_POINTER: u8 = 0x80;
 
+/// F185: backstop TTL for `PartitionData.frozen_for_merge`. The manager's
+/// merge orchestrator (`handle_merge_partitions`) commits in <1 s on the
+/// happy path and explicitly unfreezes on rollback. This TTL fires only
+/// when the orchestrator crashed mid-flow before either committing the
+/// merge txn (which causes the survivor's region_sync_loop to drop the
+/// frozen `PartitionData` and reopen with frozen=false) or unfreezing on
+/// failure. 30 s gives the manager's leader-election + replay path enough
+/// runway while bounding the worst-case write-halt window — far below the
+/// alternative of "frozen forever until PS restart" that a crash-bare
+/// design would imply.
+const FREEZE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 // F129 op flags. Single-bit flags on the WAL/memtable op byte. The
 // existing `OP_VALUE_POINTER = 0x80` continues to mark single-fragment
 // VPs. New entries:
@@ -704,6 +716,29 @@ pub(crate) struct PartitionData {
     /// at most). Not worth GC'ing the map; deleted extents leave benign
     /// stale entries with count=0.
     pub(crate) extent_pins: std::cell::RefCell<std::collections::HashMap<u64, std::rc::Rc<std::sync::atomic::AtomicI64>>>,
+    /// F185: PrepareMerge-style write halt. `Some(instant_set)` while the
+    /// partition is in the merge-window write-halt; `None` otherwise.
+    /// Set by `MSG_MERGE_FREEZE`; cleared by an explicit unfreeze RPC
+    /// (manager rollback path), by partition reopen on rg/stream-id
+    /// change (the normal post-commit recovery), or by `FREEZE_TTL`
+    /// expiry inside `merged_partition_loop` (backstop for orchestrator
+    /// crash). While Some, the loop rejects Put/Delete/StreamPut with
+    /// `CODE_UNAVAILABLE` so writes never land in a log_stream tail
+    /// past the to-be-captured `commit_length`. In-memory only — a PS
+    /// crash mid-freeze loses the flag, which is correct because the
+    /// merge txn either committed (next reopen sees the merged region)
+    /// or didn't (reopen serves the pre-merge region normally).
+    pub(crate) frozen_for_merge: Cell<Option<std::time::Instant>>,
+    /// F185: stashed `MSG_MERGE_FREEZE` response oneshot. `handle_incoming_req`
+    /// flips `frozen_for_merge=true` and parks the caller's resp here without
+    /// replying; `merged_partition_loop` consumes it once `pending` AND
+    /// `inflight` are both empty AND every imm has been flushed, then sends
+    /// the OK reply. The caller (CLI / autumn-client merge) thus blocks
+    /// until every acked-pre-freeze write is durable on log_stream + has
+    /// flushed through to a row_stream SST referenced by a meta_stream
+    /// checkpoint, which is the strict precondition that makes
+    /// `MSG_CHECK_COMMIT_LENGTH` safe to capture for the merge txn.
+    pub(crate) freeze_drain_ack: std::cell::RefCell<Option<oneshot::Sender<HandlerResult>>>,
     /// F183: per-partition load metrics for the manager's policy engine.
     /// Counters are bumped by `merged_partition_loop` (req on each
     /// dispatch, imm_full each time the imm cap stalls intake). The
@@ -2581,6 +2616,8 @@ async fn partition_thread_main(
         compact_gate: compact_gate.clone(),
         gc_gate: gc_gate.clone(),
         extent_pins: std::cell::RefCell::new(std::collections::HashMap::new()),
+        frozen_for_merge: Cell::new(None),
+        freeze_drain_ack: std::cell::RefCell::new(None),
         upload_sessions: std::collections::HashMap::new(),
         metrics: metrics_arc.clone(),
     }));
@@ -2854,6 +2891,48 @@ async fn merged_partition_loop(
             break;
         }
 
+        // F185 — freeze drain completion. If a MSG_MERGE_FREEZE arrived,
+        // it stashed `freeze_drain_ack` and flipped `frozen_for_merge` to
+        // Some(now). New writes are rejected by handle_incoming_req's
+        // CODE_UNAVAILABLE branch, so `pending` only ever shrinks from
+        // here. We fire the OK reply once pending+inflight are empty AND
+        // every imm has been flushed — at that point the captured-by-the-
+        // orchestrator commit_length is guaranteed to include every
+        // pre-freeze acked write.
+        //
+        // Done at top-of-loop (before the SQ/CQ wait branches) because
+        // once frozen, no new req_rx wakeups arrive — blocking on
+        // req_rx.next() in the wait branches would prevent the freeze
+        // ack from ever firing.
+        let need_freeze_drain = part.borrow().freeze_drain_ack.borrow().is_some();
+        if need_freeze_drain && pending.is_empty() && inflight.is_empty() {
+            {
+                let mut p = part.borrow_mut();
+                rotate_active(&mut p);
+            }
+            loop {
+                match flush_one_imm(&part).await {
+                    Ok(true) => continue,
+                    Ok(false) => break,
+                    Err(e) => {
+                        tracing::error!(part_id, "freeze drain flush_one_imm: {e:#}");
+                        break;
+                    }
+                }
+            }
+            let ack = part.borrow().freeze_drain_ack.borrow_mut().take();
+            if let Some(ack) = ack {
+                let resp = partition_rpc::MergeFreezeResp {
+                    code: partition_rpc::CODE_OK,
+                    message: String::new(),
+                };
+                let _ = ack.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                tracing::info!(part_id, "freeze drain complete — partition halted");
+            }
+            // Fall through; subsequent iterations continue serving reads
+            // and the (still-set) frozen_for_merge keeps rejecting writes.
+        }
+
         // (A) Opportunistic CQ drain — run Phase 3 for every completion that
         // is already ready without blocking.
         while let Some(Some(c)) = inflight.next().now_or_never() {
@@ -3085,6 +3164,30 @@ async fn merged_partition_loop(
                 }
             }
         }
+
+        // F185 — TTL backstop for freeze. The manager-side orchestrator
+        // (`handle_merge_partitions`) commits in <1 s on the happy path;
+        // a TTL fires only on orchestrator crash mid-flow, ensuring a
+        // partition cannot be stuck frozen indefinitely. On expiry we
+        // also drop any stale `freeze_drain_ack` (its caller is gone).
+        if let Some(at) = part.borrow().frozen_for_merge.get() {
+            if at.elapsed() >= FREEZE_TTL {
+                let p = part.borrow();
+                p.frozen_for_merge.set(None);
+                if let Some(ack) = p.freeze_drain_ack.borrow_mut().take() {
+                    let resp = partition_rpc::MergeFreezeResp {
+                        code: partition_rpc::CODE_PRECONDITION,
+                        message: "freeze TTL expired (orchestrator crash backstop)".to_string(),
+                    };
+                    let _ = ack.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                }
+                tracing::warn!(
+                    part_id,
+                    ttl_secs = FREEZE_TTL.as_secs(),
+                    "freeze TTL expired — auto-unfreeze"
+                );
+            }
+        }
     }
 
     // Shutdown path: drain any still-in-flight batches so clients get their
@@ -3151,10 +3254,106 @@ async fn handle_incoming_req(
         .metrics
         .req_count
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // F185: reject mutating ops while frozen-for-merge so writes never
+    // land in a log_stream tail past the to-be-captured commit_length.
+    // Reads + maintenance still flow normally (the freeze is a write
+    // halt, not a full quiesce — readers see the existing state).
+    let frozen = part.borrow().frozen_for_merge.get().is_some();
+    if frozen {
+        match req.msg_type {
+            MSG_PUT => {
+                let key = match partition_rpc::rkyv_decode::<PutReq>(&req.payload) {
+                    Ok(r) => r.key,
+                    Err(_) => Vec::new(),
+                };
+                let resp = PutResp {
+                    code: CODE_UNAVAILABLE,
+                    message: "partition frozen for merge — refresh routing and retry".to_string(),
+                    key,
+                };
+                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                return;
+            }
+            MSG_DELETE => {
+                let key = match partition_rpc::rkyv_decode::<DeleteReq>(&req.payload) {
+                    Ok(r) => r.key,
+                    Err(_) => Vec::new(),
+                };
+                let resp = DeleteResp {
+                    code: CODE_UNAVAILABLE,
+                    message: "partition frozen for merge — refresh routing and retry".to_string(),
+                    key,
+                };
+                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                return;
+            }
+            MSG_STREAM_PUT => {
+                let key = match partition_rpc::rkyv_decode::<StreamPutReq>(&req.payload) {
+                    Ok(r) => r.key,
+                    Err(_) => Vec::new(),
+                };
+                let resp = PutResp {
+                    code: CODE_UNAVAILABLE,
+                    message: "partition frozen for merge — refresh routing and retry".to_string(),
+                    key,
+                };
+                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                return;
+            }
+            _ => {} // reads + SPLIT/MAINTENANCE/MERGE_FREEZE flow through
+        }
+    }
+
     match req.msg_type {
         MSG_PUT => enqueue_put(req, pending),
         MSG_DELETE => enqueue_delete(req, pending),
         MSG_STREAM_PUT => enqueue_stream_put(req, pending),
+        // F185: freeze stashes its resp oneshot in PartitionData and
+        // returns without replying — the loop body sends OK once
+        // pending+inflight drain and every imm flushes (Phase 1.5
+        // analogue of TiKV's PrepareMerge: write halt + final
+        // checkpoint). `freeze=false` (the rollback path) clears the
+        // flag synchronously; nothing to drain.
+        MSG_MERGE_FREEZE => {
+            let req_msg = match partition_rpc::rkyv_decode::<MergeFreezeReq>(&req.payload) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = req.resp_tx.send(Err((StatusCode::InvalidArgument, e)));
+                    return;
+                }
+            };
+            if !req_msg.freeze {
+                part.borrow().frozen_for_merge.set(None);
+                let resp = MergeFreezeResp { code: CODE_OK, message: String::new() };
+                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                return;
+            }
+            // freeze=true. Idempotent: if a previous freeze is still
+            // waiting on drain, fail the new one rather than overwriting.
+            {
+                let p = part.borrow();
+                if p.frozen_for_merge.get().is_some() && p.freeze_drain_ack.borrow().is_none() {
+                    // Already fully drained-frozen — reply OK immediately.
+                    let resp = MergeFreezeResp { code: CODE_OK, message: String::new() };
+                    let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                    return;
+                }
+                if p.freeze_drain_ack.borrow().is_some() {
+                    let resp = MergeFreezeResp {
+                        code: CODE_PRECONDITION,
+                        message: "freeze already in progress".to_string(),
+                    };
+                    let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                    return;
+                }
+                p.frozen_for_merge.set(Some(std::time::Instant::now()));
+                *p.freeze_drain_ack.borrow_mut() = Some(req.resp_tx);
+            }
+            // Loop body fires the OK reply once every pre-freeze write
+            // has cleared pending → inflight → memtable → row_stream SST
+            // → meta_stream checkpoint.
+        }
         // Reads and low-frequency ops (SPLIT_PART, MAINTENANCE) go inline
         // via dispatch_partition_rpc — correctness-preserving.
         _ => {

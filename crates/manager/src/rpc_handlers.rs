@@ -13,7 +13,9 @@ use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::TcpStream;
 use compio::BufResult;
 
-use crate::{AutumnManager, PendingDelete};
+use std::rc::Rc;
+
+use crate::{AutumnManager, ConnPool, PendingDelete};
 
 impl AutumnManager {
     // ── Serve ──────────────────────────────────────────────────────────
@@ -94,6 +96,7 @@ impl AutumnManager {
             MSG_TRUNCATE => self.handle_truncate(payload).await,
             MSG_MULTI_MODIFY_SPLIT => self.handle_multi_modify_split(payload).await,
             MSG_MULTI_MODIFY_MERGE => self.handle_multi_modify_merge(payload).await,
+            MSG_MERGE_PARTITIONS => self.handle_merge_partitions(payload).await,
             MSG_GET_POLICY_CANDIDATES => self.handle_get_policy_candidates(payload).await,
             MSG_REPORT_PARTITION_LOAD => self.handle_report_partition_load(payload).await,
             MSG_REGISTER_PS => self.handle_register_ps(payload).await,
@@ -2024,6 +2027,293 @@ impl AutumnManager {
             code: CODE_OK,
             message: String::new(),
             new_log_tail_extent_id: p1.new_tail_id,
+        }))
+    }
+
+    // ── F185: handle_merge_partitions (orchestrated merge) ─────────────
+    //
+    // Wraps the F183 multi-modify-merge txn with a PrepareMerge-style
+    // freeze sequence, mirroring TiKV's pattern of letting the leader-
+    // fenced control plane drive the cross-PS choreography. The sequence:
+    //
+    //   1. ensure_leader (manager state belongs to one instance only)
+    //   2. resolve survivor + victim part_addr / stream ids in one borrow
+    //   3. acquire admin owner-lock (so the embedded MultiModifyMerge txn
+    //      has a fresh revision F149 can fence on)
+    //   4. send MSG_MERGE_FREEZE to victim's PS, await OK
+    //      (drains pending+inflight + flushes imm; no new writes accepted)
+    //   5. send MSG_MERGE_FREEZE to survivor's PS, await OK
+    //   6. capture commit_length × 6 (3 streams × 2 partitions) — these
+    //      are the sealed_lengths that the manager merge txn will use
+    //   7. invoke handle_multi_modify_merge synchronously (existing F183
+    //      Phase-1 / 1.5 / 2 / 3 logic; etcd put_and_delete_txn is the
+    //      atomic linearization point)
+    //   8a. on success: do NOT explicitly unfreeze — region_sync_loop on
+    //       both PSes will, on its next ~2 s tick, observe the new region
+    //       state (survivor's rg widened, victim's region gone) and drop
+    //       the frozen `PartitionData` entirely. The reopened survivor
+    //       starts fresh with `frozen_for_merge = None`.
+    //   8b. on failure: send freeze=false to anyone we already froze.
+    //       Best-effort — if the unfreeze RPC also fails, the PS-side
+    //       FREEZE_TTL (30 s) is the final backstop.
+    //
+    // Crash semantics:
+    //   - manager crash before step 7's etcd commit: failover sees no
+    //     in-progress merge in etcd, no rollback needed; PSes auto-
+    //     unfreeze via FREEZE_TTL.
+    //   - manager crash after step 7's etcd commit: merge is durable;
+    //     region_sync_loop on PSes drives the reload normally.
+    //   - PS crash mid-flow: in-memory freeze flag lost on restart;
+    //     either the merge committed (PS reopens with merged state) or
+    //     it didn't (PS reopens with original state).
+    pub(crate) async fn handle_merge_partitions(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&MergePartitionsResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                new_log_tail_extent_id: 0,
+            }));
+        }
+        let req: MergePartitionsReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // Resolve PS endpoints and stream ids in one borrow.
+        struct PartInfo {
+            part_addr: String,
+            log_stream: u64,
+            row_stream: u64,
+            meta_stream: u64,
+        }
+        let (s_info, v_info): (PartInfo, PartInfo) = {
+            let s = self.store.inner.borrow();
+            let resolve = |pid: u64| -> Result<PartInfo, AppError> {
+                let pm = s
+                    .partitions
+                    .get(&pid)
+                    .ok_or_else(|| AppError::NotFound(format!("partition {pid}")))?;
+                let addr = s
+                    .part_addrs
+                    .get(&pid)
+                    .cloned()
+                    .ok_or_else(|| {
+                        AppError::Precondition(format!("partition {pid} has no PS addr"))
+                    })?;
+                Ok(PartInfo {
+                    part_addr: addr,
+                    log_stream: pm.log_stream,
+                    row_stream: pm.row_stream,
+                    meta_stream: pm.meta_stream,
+                })
+            };
+            match (resolve(req.survivor_part_id), resolve(req.victim_part_id)) {
+                (Ok(s), Ok(v)) => (s, v),
+                (Err(e), _) | (_, Err(e)) => {
+                    return Ok(rkyv_encode(&MergePartitionsResp {
+                        code: Self::err_to_code(&e),
+                        message: e.to_string(),
+                        new_log_tail_extent_id: 0,
+                    }));
+                }
+            }
+        };
+
+        // Owner lock keyed on the partition pair so two concurrent merge
+        // attempts targeting the same survivor serialize on the manager.
+        let owner_key = format!(
+            "admin-merge:{}:{}",
+            req.survivor_part_id, req.victim_part_id
+        );
+        let revision = match self.acquire_owner_revision(&owner_key).await {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(rkyv_encode(&MergePartitionsResp {
+                    code: Self::err_to_code(&e),
+                    message: e.to_string(),
+                    new_log_tail_extent_id: 0,
+                }));
+            }
+        };
+
+        // Helper closures.
+        let send_freeze = |addr: String, part_id: u64, freeze: bool| {
+            let pool = self.conn_pool.clone();
+            async move {
+                let req = autumn_rpc::partition_rpc::MergeFreezeReq { part_id, freeze };
+                let payload = autumn_rpc::partition_rpc::rkyv_encode(&req);
+                let resp_bytes = pool
+                    .call(
+                        &addr,
+                        autumn_rpc::partition_rpc::MSG_MERGE_FREEZE,
+                        payload,
+                    )
+                    .await
+                    .map_err(|e| AppError::Internal(format!("freeze rpc to {addr}: {e}")))?;
+                let resp: autumn_rpc::partition_rpc::MergeFreezeResp =
+                    autumn_rpc::partition_rpc::rkyv_decode(&resp_bytes)
+                        .map_err(AppError::Internal)?;
+                if resp.code != autumn_rpc::partition_rpc::CODE_OK {
+                    return Err(AppError::Precondition(format!(
+                        "freeze({freeze}) on partition {part_id}: {}",
+                        resp.message
+                    )));
+                }
+                Ok(())
+            }
+        };
+
+        // Track which PSes we successfully froze, in reverse order, for
+        // best-effort rollback on failure.
+        let mut to_unfreeze: Vec<(String, u64)> = Vec::new();
+        let rollback = |list: Vec<(String, u64)>, pool: Rc<ConnPool>| async move {
+            for (addr, pid) in list.into_iter().rev() {
+                let unfreeze =
+                    autumn_rpc::partition_rpc::MergeFreezeReq { part_id: pid, freeze: false };
+                let payload = autumn_rpc::partition_rpc::rkyv_encode(&unfreeze);
+                let _ = pool
+                    .call(
+                        &addr,
+                        autumn_rpc::partition_rpc::MSG_MERGE_FREEZE,
+                        payload,
+                    )
+                    .await;
+            }
+        };
+
+        // Freeze victim first (matches the dual-gate ordering convention
+        // in `crates/partition-server/CLAUDE.md` — victim < survivor for
+        // deadlock-safe lock acquisition; here the freezes don't deadlock
+        // each other but we keep the order for consistency with future
+        // PS-side gate work).
+        if let Err(e) = send_freeze(
+            v_info.part_addr.clone(),
+            req.victim_part_id,
+            true,
+        )
+        .await
+        {
+            return Ok(rkyv_encode(&MergePartitionsResp {
+                code: Self::err_to_code(&e),
+                message: e.to_string(),
+                new_log_tail_extent_id: 0,
+            }));
+        }
+        to_unfreeze.push((v_info.part_addr.clone(), req.victim_part_id));
+
+        if let Err(e) = send_freeze(
+            s_info.part_addr.clone(),
+            req.survivor_part_id,
+            true,
+        )
+        .await
+        {
+            rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+            return Ok(rkyv_encode(&MergePartitionsResp {
+                code: Self::err_to_code(&e),
+                message: e.to_string(),
+                new_log_tail_extent_id: 0,
+            }));
+        }
+        to_unfreeze.push((s_info.part_addr.clone(), req.survivor_part_id));
+
+        // Capture commit_length on each of the 6 streams. Reuse the
+        // existing handle_check_commit_length so we hit the same
+        // sealed-vs-live + min-replica path the F183 code expects.
+        let read_commit_len = |stream_id: u64| {
+            let owner_key = owner_key.clone();
+            async move {
+                let req = CheckCommitLengthReq {
+                    stream_id,
+                    owner_key,
+                    revision,
+                };
+                let resp_bytes = self.handle_check_commit_length(rkyv_encode(&req)).await?;
+                let resp: CheckCommitLengthResp =
+                    rkyv_decode(&resp_bytes).map_err(|e| (StatusCode::Internal, e))?;
+                if resp.code != CODE_OK {
+                    return Err((
+                        StatusCode::Internal,
+                        format!("commit_length stream {stream_id}: {}", resp.message),
+                    ));
+                }
+                // Match the CLI's `.max(1)` — F183's manager treats 0 as
+                // "use the existing sealed_length" / no-op for this stream.
+                Ok::<u64, (StatusCode, String)>((resp.end as u64).max(1))
+            }
+        };
+
+        // Six commit_lengths in the order [survivor_log, victim_log,
+        // survivor_row, victim_row, survivor_meta, victim_meta]. Captured
+        // serially under the freeze; concurrency would not save much
+        // here and serial keeps the failure mode simpler.
+        let log_lens = match (
+            read_commit_len(s_info.log_stream).await,
+            read_commit_len(v_info.log_stream).await,
+        ) {
+            (Ok(s), Ok(v)) => [s, v],
+            (Err((code, msg)), _) | (_, Err((code, msg))) => {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Err((code, msg));
+            }
+        };
+        let row_lens = match (
+            read_commit_len(s_info.row_stream).await,
+            read_commit_len(v_info.row_stream).await,
+        ) {
+            (Ok(s), Ok(v)) => [s, v],
+            (Err((code, msg)), _) | (_, Err((code, msg))) => {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Err((code, msg));
+            }
+        };
+        let meta_lens = match (
+            read_commit_len(s_info.meta_stream).await,
+            read_commit_len(v_info.meta_stream).await,
+        ) {
+            (Ok(s), Ok(v)) => [s, v],
+            (Err((code, msg)), _) | (_, Err((code, msg))) => {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Err((code, msg));
+            }
+        };
+
+        // Run the existing F183 merge txn under the same owner-lock.
+        let mmm_req = MultiModifyMergeReq {
+            survivor_part_id: req.survivor_part_id,
+            victim_part_id: req.victim_part_id,
+            owner_key: owner_key.clone(),
+            revision,
+            log_sealed_lengths: log_lens,
+            row_sealed_lengths: row_lens,
+            meta_sealed_lengths: meta_lens,
+        };
+        let mmm_resp_bytes = match self.handle_multi_modify_merge(rkyv_encode(&mmm_req)).await
+        {
+            Ok(b) => b,
+            Err((code, msg)) => {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Err((code, msg));
+            }
+        };
+        let mmm_resp: MultiModifyMergeResp =
+            rkyv_decode(&mmm_resp_bytes).map_err(|e| (StatusCode::Internal, e))?;
+
+        if mmm_resp.code != CODE_OK {
+            // Rollback freezes — txn refused, both PSes should resume.
+            rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+            return Ok(rkyv_encode(&MergePartitionsResp {
+                code: mmm_resp.code,
+                message: mmm_resp.message,
+                new_log_tail_extent_id: 0,
+            }));
+        }
+
+        // Success path: leave both PSes frozen. Their region_sync_loop
+        // will, on its next ~2 s tick, observe the new region state and
+        // drop the frozen `PartitionData` entirely — natural unfreeze.
+        Ok(rkyv_encode(&MergePartitionsResp {
+            code: CODE_OK,
+            message: String::new(),
+            new_log_tail_extent_id: mmm_resp.new_log_tail_extent_id,
         }))
     }
 

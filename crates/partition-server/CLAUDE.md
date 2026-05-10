@@ -812,16 +812,53 @@ post-restart.
     consumes the per-partition windowed history (30 min, 1-min buckets)
     to emit advisory split/merge candidates.
 
-12. **F183 manual partition merge.** Stage 1 ships the merge primitive
+12. **F183/F185 partition merge.** F183 shipped the merge primitive
     as a manager-side atomic etcd txn (see `crates/manager/CLAUDE.md`
-    note 16), driven by the CLI:
-    `autumn-client merge <SURVIVOR> <VICTIM>`. The CLI flushes both
-    partitions, acquires an admin owner-lock, captures sealed lengths,
-    calls `MSG_MULTI_MODIFY_MERGE`. After the manager txn commits, the
-    survivor's PS picks up the wider rg + spliced extent_ids on the
-    next `region_sync_loop` tick (~2 s). **No PS-side
-    `handle_merge_part` in Stage 1** — operator must stop writes during
-    the merge window. Stage 2/3 (deferred per
-    `feedback_auto_split_before_merge.md`) adds a proper PS-side
-    handler with dual-gate + freeze-drain and auto-trigger from the
-    policy engine.
+    note 16). F185 closes the F184-K ~5% merge-window data-loss gap by
+    putting the orchestration in the manager (TiKV PrepareMerge model)
+    and adding a PS-side write halt:
+
+    Wire path: client → `MSG_MERGE_PARTITIONS { survivor, victim }` →
+    manager.handle_merge_partitions → `MSG_MERGE_FREEZE { freeze: true }`
+    to victim PS → same to survivor PS → 6× commit_length under the
+    freeze → handle_multi_modify_merge atomic etcd txn → return.
+
+    PS-side state on `PartitionData`:
+      - `frozen_for_merge: Cell<Option<Instant>>` — `Some(set_at)` while
+        the merge-window write halt is in effect.
+      - `freeze_drain_ack: RefCell<Option<oneshot::Sender>>` — parked
+        freeze response oneshot.
+
+    `handle_incoming_req` short-circuits Put / Delete / StreamPut with
+    `CODE_UNAVAILABLE` while frozen; reads + maintenance flow normally.
+
+    `merged_partition_loop` top-of-loop logic:
+      - if `freeze_drain_ack.is_some() && pending.is_empty() &&
+        inflight.is_empty()`: rotate active + flush every imm via
+        `flush_one_imm`, then send OK on the parked oneshot. This is
+        the strict precondition for the orchestrator's commit_length
+        capture to be race-free.
+      - if `frozen_for_merge.is_some_and(|t| t.elapsed() > FREEZE_TTL)`
+        (30 s): auto-unfreeze + drop any stale ack with PRECONDITION.
+        Backstop for orchestrator crash; happy path completes in <1 s
+        and is unfrozen by region_sync_loop dropping the PartitionData.
+
+    Recovery on success: the merge etcd txn deletes victim's region and
+    widens survivor's. `region_sync_loop` (F184-B) sees both changes
+    on its next tick (~2 s), drops the frozen `PartitionData` for
+    victim, and reopens the survivor with `frozen_for_merge = None`.
+    No explicit unfreeze needed.
+
+    Recovery on failure: manager sends `MSG_MERGE_FREEZE { freeze:
+    false }` rollback to anyone it already froze. If even that fails,
+    the FREEZE_TTL backstop fires.
+
+    Why not the spec §4.1 PS-orchestrated 4-gate design: it required
+    new Send-capable cross-thread channels + a main-thread
+    `merge_service_loop` registry to route freeze coordination between
+    survivor's and victim's partition threads (each `PartitionData` is
+    `Rc<RefCell<>>`, `!Send`). The TiKV-style "leader-fenced control
+    plane orchestrates" model achieves the same 0-loss guarantee with
+    no cross-thread plumbing. Trade-off: merge wallclock stays ~2-3 s
+    instead of <1 s — bounded by region_sync_loop tick — but the
+    write loss is what F184-K actually measured, and that's now 0.

@@ -527,3 +527,46 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     candidates over a 30-min sliding window with the thresholds in
     `policy.rs`, exposes via `MSG_GET_POLICY_CANDIDATES`. Stage 1 is
     advisory only.
+
+17. **F185 orchestrated merge — `handle_merge_partitions`.** Wraps the
+    F183 atomic merge txn with a TiKV-PrepareMerge-style freeze-drain
+    sequence so writes that would otherwise race the FLUSH→commit
+    window (the F184-K ~5% loss window) are halted at the source.
+
+    Sequence:
+      1. `ensure_leader` — manager state must be authoritative.
+      2. Resolve `part_addr` + stream ids for both partitions in one
+         borrow of `store.inner`.
+      3. Acquire admin owner-lock keyed on the partition pair (so
+         concurrent merge attempts targeting the same survivor
+         serialize on the manager).
+      4. `MSG_MERGE_FREEZE { freeze: true }` to victim PS — drains
+         pending+inflight, flushes every imm, halts new writes with
+         `CODE_UNAVAILABLE`. Returns OK only after the post-freeze
+         checkpoint is durable.
+      5. Same to survivor PS.
+      6. Capture `commit_length` × 6 (3 streams × 2 partitions) by
+         delegating to `handle_check_commit_length`. Race-free now
+         that both PSes are frozen.
+      7. Call `handle_multi_modify_merge` synchronously — its single
+         `put_and_delete_txn` is the linearization point.
+      8a. On OK: do NOT explicitly unfreeze. `region_sync_loop` on
+          each PS observes the new (rg, stream_ids) on next ~2 s tick
+          (F184-B), drops the frozen `PartitionData`, reopens the
+          survivor with the merged state — natural unfreeze.
+      8b. On error: best-effort `MSG_MERGE_FREEZE { freeze: false }`
+          rollback to anyone we already froze. PS-side `FREEZE_TTL`
+          (30 s) is the final backstop.
+
+    Why this doesn't need a procedure-WAL (HBase ProcedureV2 style):
+    the only crash window we have to cover is "manager crashed
+    between the freeze RPC and the etcd commit" — sub-second on the
+    happy path. TTL bounds worst-case freeze to 30 s, far below
+    "frozen forever until PS restart". If we ever need cross-PS merge
+    or merge frequency goes up, upgrade to a
+    `mergeInProgress/<survivor>:<victim>` etcd marker written before
+    freeze and deleted by the success-path txn; leader-promotion
+    replay scans the prefix and decides unfreeze (rollback) or commit
+    (continue) based on whether the partition deletion is already
+    persisted. ~200 lines, ProcedureV2 in miniature. Recorded as
+    deferred follow-up in `feature_list.md` F185.

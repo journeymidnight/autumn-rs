@@ -33,6 +33,20 @@ pub const MSG_PUT_ABORT: u8 = 0x4C;
 // F183: partition merge — sent to the SURVIVOR's PS.
 pub const MSG_MERGE_PART: u8 = 0x4D;
 
+// F185: PrepareMerge-style freeze. CLI/manager sends to BOTH the survivor and
+// victim's PS BEFORE capturing commit_length so writes that would otherwise
+// fall in the FLUSH→manager.commit window are halted at the source.
+//
+// `freeze=true`  → drain pending + inflight + flush all imm, set
+//                  PartitionData.frozen_for_merge=true, ack.
+//                  Subsequent Put/Delete/StreamPut return CODE_UNAVAILABLE
+//                  until either an unfreeze RPC clears the flag OR the
+//                  partition is reopened by region_sync_loop on rg/stream-id
+//                  change (post-merge).
+// `freeze=false` → reverse the flag (used by the CLI failure rollback path
+//                  if the manager-side merge txn rejects the request).
+pub const MSG_MERGE_FREEZE: u8 = 0x4E;
+
 // ── Status codes ────────────────────────────────────────────────────────────
 
 pub const CODE_OK: u8 = 0;
@@ -47,6 +61,11 @@ pub const CODE_VALUE_TOO_LARGE: u8 = 5;
 /// upload_id that doesn't exist on this PS. Could be: unknown id,
 /// expired (TTL), already committed, already aborted, or PS restart.
 pub const CODE_UPLOAD_NOT_FOUND: u8 = 6;
+/// F185: Put/Delete/StreamPut rejected because the partition is in the
+/// `frozen_for_merge` window. Caller should refresh routing and retry —
+/// the merged topology is committed on the manager and the survivor will
+/// reopen with the wider rg on its next region_sync tick.
+pub const CODE_UNAVAILABLE: u8 = 7;
 
 // ── Request/Response types ─────────────────────────────────────────────────
 
@@ -155,6 +174,25 @@ pub struct MergePartReq {
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct MergePartResp {
+    pub code: u8,
+    pub message: String,
+}
+
+// F185 — PrepareMerge-style freeze RPC. The CLI sends this to each
+// participating partition (survivor + victim) BEFORE capturing
+// commit_length so the merge txn cannot lose writes that would otherwise
+// race the FLUSH→commit window.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MergeFreezeReq {
+    pub part_id: u64,
+    /// true = enter frozen state (drain + flush + halt new writes);
+    /// false = leave frozen state (used by the CLI's rollback path on
+    /// manager-side failure).
+    pub freeze: bool,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MergeFreezeResp {
     pub code: u8,
     pub message: String,
 }
@@ -331,6 +369,7 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_PUT_COMMIT => rkyv_decode::<PutCommitReq>(payload).map(|r| r.part_id).unwrap_or(0),
         MSG_PUT_ABORT => rkyv_decode::<PutAbortReq>(payload).map(|r| r.part_id).unwrap_or(0),
         MSG_MERGE_PART => rkyv_decode::<MergePartReq>(payload).map(|r| r.survivor_part_id).unwrap_or(0),
+        MSG_MERGE_FREEZE => rkyv_decode::<MergeFreezeReq>(payload).map(|r| r.part_id).unwrap_or(0),
         _ => 0,
     }
 }

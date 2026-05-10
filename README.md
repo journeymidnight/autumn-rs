@@ -1272,7 +1272,7 @@ RPC path.
 
 ---
 
-## F183 — Partition merge + advisory policy (Stage 1)
+## F183 / F185 — Partition merge + advisory policy
 
 ### Manual partition merge
 
@@ -1281,16 +1281,24 @@ the victim is deleted from the manager. The merged partition's range becomes
 `[SURVIVOR.start, VICTIM.end)`.
 
 ```bash
-# Stop writes to both partitions first.
 autumn-client --manager 127.0.0.1:9001 merge <SURVIVOR_PART_ID> <VICTIM_PART_ID>
 ```
 
-Stage 1 contract: the CLI orchestrates the merge.
+**No need to stop writes** — F185 closes the previous Stage-1 ~5 % loss window
+by orchestrating freeze + commit on the manager. In-flight writes during the
+merge window receive `CODE_UNAVAILABLE` and are retried by the standard SDK
+`refresh_regions` path.
 
-1. `FLUSH` on both partitions (drains imm into durable SSTs)
-2. Acquire admin owner-lock; manager allocates a fresh revision
-3. Resolve the six stream IDs via `GetRegions`
-4. `CheckCommitLength` on each stream
+The CLI is a thin wrapper around one new manager RPC, `MSG_MERGE_PARTITIONS`.
+The manager (which is leader-fenced + crash-recoverable via etcd) drives the
+sequence:
+
+1. Acquire admin owner-lock keyed on the partition pair
+2. `MSG_MERGE_FREEZE { freeze: true }` to victim PS — drains pending+inflight,
+   flushes every imm, halts new writes; returns OK only after the post-freeze
+   checkpoint is durable
+3. Same to survivor PS
+4. Capture `commit_length` × 6 (3 streams × 2 partitions) — race-free now
 5. `MultiModifyMerge` — single atomic etcd txn (F124-style):
    - splices victim's stream extents into survivor's (refs++ CoW; same as
      split's `compute_duplicate_stream` but inverted)
@@ -1299,8 +1307,20 @@ Stage 1 contract: the CLI orchestrates the merge.
    - widens survivor's `rg.end_key` to victim's `rg.end_key`
    - deletes victim's `partitions/`, three `streams/`, `regions/`,
      `partitionVpRefs/`, `partitionLastOp/` etcd keys
-6. Survivor's PS picks up the wider `rg` + spliced `extent_ids` on the
-   next `region_sync_loop` tick (~2 s).
+6. On success: leave both PSes frozen — `region_sync_loop` (~2 s tick) drops
+   the frozen `PartitionData` and the survivor reopens with the merged state
+   and `frozen_for_merge = None`. On failure: `MSG_MERGE_FREEZE { freeze:
+   false }` rollback, plus the PS-side `FREEZE_TTL = 30 s` backstop for the
+   orchestrator-crash case.
+
+Crash safety:
+- **CLI crash** at any point: benign — manager continues to completion.
+- **Manager crash before commit**: failover; new leader sees no half-state in
+  etcd; PSes auto-unfreeze via `FREEZE_TTL`. Merge can be retried.
+- **Manager crash after commit**: merge is durable; `region_sync_loop` drives
+  the reload normally.
+- **PS crash mid-flow**: in-memory freeze flag lost on restart; partition
+  reopens with whichever state the etcd txn settled on.
 
 Preconditions enforced by the manager:
 - `survivor.end_key == victim.start_key` (adjacent in keyspace)
@@ -1308,10 +1328,6 @@ Preconditions enforced by the manager:
   `recovery_tasks` / `pending_extent_deletes`
 - F146-style verify-at-apply on `pre_bump_eversion` snapshot
 - F149 leader-fence on the etcd txn
-
-Stage 1 trade-off: no PS-side `handle_merge_part` with dual-gate +
-freeze-drain. Operator must stop writes during the merge window. Stage 2/3
-(deferred) adds the in-place splice and proper drain.
 
 ### Policy candidates
 
