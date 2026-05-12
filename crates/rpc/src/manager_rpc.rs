@@ -783,6 +783,14 @@ pub const POLICY_KIND_GC: u8 = 2;
 /// threshold for `policy.required_buckets` consecutive buckets and
 /// outside the compact cooldown.
 pub const POLICY_KIND_COMPACT: u8 = 3;
+/// F196 Stage D: hot/cold imbalance advisory. Emitted once per PS
+/// when sustained `max(req_per_sec) / min(req_per_sec) ≥ HOT_COLD_RATIO`
+/// AND hottest > `HOT_COLD_MIN_HOT_QPS`, OR the same imbalance on
+/// `size_bytes`. `primary_part_id` = hottest partition, `secondary_part_id`
+/// = coldest partition; `reason` carries `ps_id=N qps_ratio=N qps_hot=[…]
+/// qps_cold=[…] size_ratio=N size_hot=[…] size_cold=[…]`.
+/// `same_ps = true` always (the advisory is by definition per-PS).
+pub const POLICY_KIND_HOT_COLD: u8 = 4;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct PolicyCandidate {

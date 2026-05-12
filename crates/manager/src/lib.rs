@@ -616,12 +616,15 @@ impl AutumnManager {
                 p.compute_maintenance_advisory(now)
             };
             cands.append(&mut maint);
-            // F196 Stage D: hot/cold imbalance advisory. Pure log line,
-            // does NOT join the advisory_cache (operator-facing only).
-            {
+            // F196 Stage D: hot/cold imbalance advisory. Emits
+            // PolicyCandidate(s) with kind = POLICY_KIND_HOT_COLD; they
+            // ride the same advisory_cache so `client info` renders
+            // them next to SPLIT/MERGE/GC/COMPACT.
+            let mut hot_cold = {
                 let mut p = self.policy.borrow_mut();
-                p.compute_hot_cold_advisory(&owners, now);
-            }
+                p.compute_hot_cold_advisory(&owners, now)
+            };
+            cands.append(&mut hot_cold);
             // Persist the union into the advisory cache so
             // `MSG_GET_POLICY_CANDIDATES` returns SPLIT / MERGE / GC /
             // COMPACT in one call.
@@ -638,6 +641,7 @@ impl AutumnManager {
                         POLICY_KIND_MERGE => "MERGE",
                         autumn_rpc::manager_rpc::POLICY_KIND_GC => "GC",
                         autumn_rpc::manager_rpc::POLICY_KIND_COMPACT => "COMPACT",
+                        autumn_rpc::manager_rpc::POLICY_KIND_HOT_COLD => "HOT_COLD",
                         _ => "UNKNOWN",
                     };
                     tracing::info!(

@@ -1831,7 +1831,12 @@ impl PartitionServer {
     /// via MSG_REPORT_PARTITION_LOAD. Cheap — one RPC per cycle, payload
     /// scales with partition count.
     async fn report_load_loop(&self) {
-        const REPORT_INTERVAL_SECS: u64 = 5;
+        // F196: 5 s → 30 s. Manager aggregates into 60 s buckets and
+        // the policy window only inspects the last 5 buckets (5 min);
+        // 5 s upload was over-sampling by ~6× with no advisory benefit.
+        // At 30 s cadence each bucket still gets ≥1 sample and req/s
+        // is averaged over the 30 s window before the bucket close.
+        const REPORT_INTERVAL_SECS: u64 = 30;
         let mut ticker = compio::time::interval(Duration::from_secs(REPORT_INTERVAL_SECS));
         ticker.tick().await; // first tick is immediate
         loop {

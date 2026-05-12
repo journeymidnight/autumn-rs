@@ -37,6 +37,12 @@ Stage breakdown:
                  Aligns F183 QPS thresholds with measured ~30K
                  single-partition ceiling. Pre-F196 50K was
                  unreachable.
+  Stage D-r2:    PS report_load 5s→30s; POLICY_WINDOW_BUCKETS 30→10;
+                 HOT_COLD_MIN_HOT_QPS decoupled to 10K; hot/cold
+                 emits PolicyCandidate (kind=4) into advisory_cache
+                 so `client info policy` shows it. Hot/cold list
+                 simplified to "min/max-matched partition" so the
+                 2-partition PS case works.
   Stage E: cluster.sh env passthrough + even disjoint cpuset
            distribution (EN[i] + PS ranges); README updated; this
            progress file; feature_list F196 entry; commit.

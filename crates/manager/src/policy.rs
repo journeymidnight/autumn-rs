@@ -8,8 +8,8 @@ use std::collections::{HashMap, VecDeque};
 
 use autumn_common::MetadataState;
 use autumn_rpc::manager_rpc::{
-    PartitionLoad, PolicyCandidate, POLICY_KIND_COMPACT, POLICY_KIND_GC, POLICY_KIND_MERGE,
-    POLICY_KIND_SPLIT,
+    PartitionLoad, PolicyCandidate, POLICY_KIND_COMPACT, POLICY_KIND_GC, POLICY_KIND_HOT_COLD,
+    POLICY_KIND_MERGE, POLICY_KIND_SPLIT,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -52,20 +52,24 @@ pub const GC_COOLDOWN_SEC: i64 = 300;
 pub const COMPACT_COOLDOWN_SEC: i64 = 300;
 
 pub const POLICY_BUCKET_SEC: i64 = 60;
-pub const POLICY_WINDOW_BUCKETS: usize = 30;
+/// F196: trimmed 30 → 10 buckets. Only `REQUIRED_BUCKETS = 5` are ever
+/// consulted; the extra 25 buckets were dead memory. 10 keeps 2× safety
+/// margin for a future advisory that needs slightly more history.
+pub const POLICY_WINDOW_BUCKETS: usize = 10;
 pub const POLICY_REQUIRED_BUCKETS: usize = 5;
 pub const POLICY_TICK_INTERVAL_SEC: i64 = 60;
 
 /// F196 Stage D: hot/cold imbalance advisory thresholds. Per PS, the
 /// ratio `max(req_per_sec) / max(1, min(req_per_sec))` over
 /// `required_buckets` consecutive sustained windows must exceed this
-/// to trigger a single WARN line listing the hot + cold partitions.
+/// to trigger a single advisory candidate listing the hot + cold partitions.
 pub const HOT_COLD_RATIO: u32 = 10;
 /// The hottest partition must additionally exceed this floor so a
 /// uniformly-cold cluster (e.g. idle dev) doesn't spam the operator.
-/// Default = half of `SPLIT_QPS_HIGH` so the floor scales with the
-/// split threshold operators already tune for.
-pub const HOT_COLD_MIN_HOT_QPS: u32 = SPLIT_QPS_HIGH / 2;
+/// F196: pinned to **10_000** (≈ 1/3 of the measured ~30K single-partition
+/// QPS ceiling). Decoupled from `SPLIT_QPS_HIGH` — operators tuning
+/// the split threshold no longer auto-shift the hot/cold floor.
+pub const HOT_COLD_MIN_HOT_QPS: u32 = 10_000;
 /// F196 Stage D (size dimension): same 10× ratio, but on
 /// `size_bytes`. Catches large-value / low-QPS workloads that QPS
 /// imbalance can't see.
@@ -430,24 +434,30 @@ impl PolicyEngine {
     ///
     /// 1. **QPS**: `req_per_sec`. Triggers when the PS's `max(part.max_req)
     ///    / max(1, min(part.min_req)) >= HOT_COLD_RATIO (10)` AND the
-    ///    hottest's `max_req > HOT_COLD_MIN_HOT_QPS (SPLIT_QPS_HIGH/2)`.
+    ///    hottest's `max_req > HOT_COLD_MIN_HOT_QPS (10_000)`.
     /// 2. **Size**: `size_bytes`. Same 10× ratio with floor
     ///    `HOT_COLD_MIN_HOT_SIZE_BYTES (SPLIT_SIZE_HARD/2 = 25 GiB)`.
     ///    Catches large-value / low-QPS workloads that the QPS check
     ///    can't see.
     ///
-    /// Either dimension is enough to fire. A single WARN line per PS
-    /// lists which dimension(s) triggered + the hot/cold part_ids on
-    /// each. Cooldown is shared across dimensions: at most one WARN
-    /// per PS per `HOT_COLD_COOLDOWN_SEC` (5 min).
+    /// Either dimension is enough to fire. One `PolicyCandidate` per PS
+    /// is emitted (kind = `POLICY_KIND_HOT_COLD`), with the hottest +
+    /// coldest part_ids in `primary_part_id` / `secondary_part_id` and
+    /// the full hot/cold lists + ratios in `reason`. Shared per-PS
+    /// cooldown via `last_hot_cold_at`: at most one candidate per PS per
+    /// `HOT_COLD_COOLDOWN_SEC` (5 min).
     ///
-    /// Pure log: nothing is appended to `advisory_cache`, no RPC is
-    /// dispatched. Operator-visible only.
+    /// The returned candidates are appended to the manager's
+    /// `advisory_cache` by `policy_tick_loop`, so `client info`
+    /// (via `MSG_GET_POLICY_CANDIDATES`) renders them next to SPLIT /
+    /// MERGE / GC / COMPACT advisories. A matching `WARN` line is also
+    /// emitted to `manager.log` for at-a-glance operator awareness.
     pub fn compute_hot_cold_advisory(
         &mut self,
         region_owners: &HashMap<u64, u64>,
         now: i64,
-    ) {
+    ) -> Vec<PolicyCandidate> {
+        let mut out: Vec<PolicyCandidate> = Vec::new();
         let cfg = self.config.clone();
         // ps_id -> Vec<(part_id, min_req, max_req, min_size, max_size)>
         let mut by_ps: HashMap<u64, Vec<(u64, u32, u32, u64, u64)>> = HashMap::new();
@@ -498,22 +508,24 @@ impl PolicyEngine {
             }
             // ── Hot/cold lists per triggering dimension ────────────
             //
-            // QPS lists use the median of max_req across the PS; size
-            // lists use the median of max_size. A partition is "hot"
-            // when its own max ≥ 2× median; "cold" when median ≥ 2×
-            // its own min.
+            // Hot = every partition whose own max equals the PS's
+            // `hottest` (i.e. is "the busiest" — at least one partition
+            // always qualifies). Cold = every partition whose own min
+            // equals the PS's `coldest`. Ties (rare) put multiple
+            // partitions in the same list.
+            //
+            // The earlier median-based classification didn't work for
+            // 2-partition PSes (median == max → hot list empty), so
+            // this min/max-match approach is what we use.
             let (qps_hot, qps_cold) = if qps_fire {
-                let mut mids: Vec<u32> = parts.iter().map(|t| t.2).collect();
-                mids.sort_unstable();
-                let median = mids[mids.len() / 2].max(1);
                 let mut hot: Vec<u64> = parts
                     .iter()
-                    .filter(|t| t.2 >= median.saturating_mul(2))
+                    .filter(|t| t.2 == qps_hottest)
                     .map(|t| t.0)
                     .collect();
                 let mut cold: Vec<u64> = parts
                     .iter()
-                    .filter(|t| (median as u64) >= (t.1 as u64).saturating_mul(2))
+                    .filter(|t| t.1 == qps_coldest)
                     .map(|t| t.0)
                     .collect();
                 hot.sort_unstable();
@@ -523,17 +535,14 @@ impl PolicyEngine {
                 (Vec::new(), Vec::new())
             };
             let (size_hot, size_cold) = if size_fire {
-                let mut mids: Vec<u64> = parts.iter().map(|t| t.4).collect();
-                mids.sort_unstable();
-                let median = mids[mids.len() / 2].max(1);
                 let mut hot: Vec<u64> = parts
                     .iter()
-                    .filter(|t| t.4 >= median.saturating_mul(2))
+                    .filter(|t| t.4 == size_hottest)
                     .map(|t| t.0)
                     .collect();
                 let mut cold: Vec<u64> = parts
                     .iter()
-                    .filter(|t| median >= t.3.saturating_mul(2))
+                    .filter(|t| t.3 == size_coldest)
                     .map(|t| t.0)
                     .collect();
                 hot.sort_unstable();
@@ -542,23 +551,58 @@ impl PolicyEngine {
             } else {
                 (Vec::new(), Vec::new())
             };
+            let qps_ratio = qps_hottest / qps_coldest.max(1);
+            let size_ratio = size_hottest / size_coldest.max(1);
             tracing::warn!(
                 ps_id,
                 qps_fire,
-                qps_ratio = qps_hottest / qps_coldest.max(1),
+                qps_ratio,
                 qps_hottest,
                 qps_coldest,
                 qps_hot_parts = ?qps_hot,
                 qps_cold_parts = ?qps_cold,
                 size_fire,
-                size_ratio = size_hottest / size_coldest.max(1),
+                size_ratio,
                 size_hottest_mb = size_hottest / (1024 * 1024),
                 size_coldest_mb = size_coldest / (1024 * 1024),
                 size_hot_parts = ?size_hot,
                 size_cold_parts = ?size_cold,
                 "F196 hot/cold imbalance on PS — consider auto-split for the hot partitions, or merge the cold pair to free a core slot"
             );
+            // Hottest part = first qps_hot if QPS triggered else first
+            // size_hot; coldest = symmetric. Fall back to 0 when a
+            // dimension didn't trigger or its hot/cold list is empty.
+            let primary = qps_hot.first().copied()
+                .or_else(|| size_hot.first().copied())
+                .unwrap_or(0);
+            let secondary = qps_cold.first().copied()
+                .or_else(|| size_cold.first().copied())
+                .unwrap_or(0);
+            let mut reason_parts: Vec<String> = Vec::new();
+            reason_parts.push(format!("ps_id={ps_id}"));
+            if qps_fire {
+                reason_parts.push(format!(
+                    "qps_ratio={qps_ratio} hot={qps_hot:?} cold={qps_cold:?}"
+                ));
+            }
+            if size_fire {
+                reason_parts.push(format!(
+                    "size_ratio={size_ratio} hot={size_hot:?} cold={size_cold:?}"
+                ));
+            }
+            out.push(PolicyCandidate {
+                kind: POLICY_KIND_HOT_COLD,
+                primary_part_id: primary,
+                secondary_part_id: secondary,
+                reason: reason_parts.join(" "),
+                size_bytes: size_hottest,
+                req_per_sec: qps_hottest,
+                imm_full_per_sec: 0,
+                same_ps: true,
+                last_op_at: now,
+            });
             self.last_hot_cold_at.insert(ps_id, now);
         }
+        out
     }
 }

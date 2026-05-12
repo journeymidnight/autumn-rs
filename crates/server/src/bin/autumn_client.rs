@@ -1609,15 +1609,19 @@ async fn main() -> Result<()> {
                         autumn_rpc::manager_rpc::POLICY_KIND_MERGE => "merge",
                         autumn_rpc::manager_rpc::POLICY_KIND_GC => "gc",
                         autumn_rpc::manager_rpc::POLICY_KIND_COMPACT => "compact",
+                        autumn_rpc::manager_rpc::POLICY_KIND_HOT_COLD => "hotcold",
                         _ => "?",
                     };
                     // F187: GC/COMPACT advisories aren't bound by `same_ps`
                     // — they're always per-partition and locally feasible.
+                    // F196: HOT_COLD is by-construction per-PS, always
+                    // feasible from the operator's view.
                     // Render `feas` as "n/a" for them so operators don't
                     // misread the column.
                     let feas = match c.kind {
                         autumn_rpc::manager_rpc::POLICY_KIND_GC
-                        | autumn_rpc::manager_rpc::POLICY_KIND_COMPACT => "n/a",
+                        | autumn_rpc::manager_rpc::POLICY_KIND_COMPACT
+                        | autumn_rpc::manager_rpc::POLICY_KIND_HOT_COLD => "n/a",
                         _ if c.same_ps => "yes",
                         _ => "no",
                     };

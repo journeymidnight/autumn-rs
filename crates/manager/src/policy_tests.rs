@@ -809,3 +809,43 @@ fn hot_cold_advisory_size_below_floor_does_not_fire() {
         "size advisory must suppress when hottest size is below the floor"
     );
 }
+
+#[test]
+fn hot_cold_advisory_emits_policy_candidate_for_client_info() {
+    use autumn_rpc::manager_rpc::POLICY_KIND_HOT_COLD;
+    use crate::policy::{HOT_COLD_MIN_HOT_QPS};
+    let mut eng = PolicyEngine::default();
+    let now = 1_700_000_000;
+    fill_window(
+        &mut eng,
+        300,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 300,
+            req_per_sec: HOT_COLD_MIN_HOT_QPS.saturating_mul(2),
+            ..Default::default()
+        },
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    fill_window(
+        &mut eng,
+        301,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 301,
+            req_per_sec: 1,
+            ..Default::default()
+        },
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    let owners: HashMap<u64, u64> = vec![(300u64, 77u64), (301, 77)].into_iter().collect();
+    let cands = eng.compute_hot_cold_advisory(&owners, now);
+    assert_eq!(cands.len(), 1, "expected one HOT_COLD candidate, got {cands:?}");
+    let c = &cands[0];
+    assert_eq!(c.kind, POLICY_KIND_HOT_COLD);
+    assert_eq!(c.primary_part_id, 300, "primary = hottest");
+    assert_eq!(c.secondary_part_id, 301, "secondary = coldest");
+    assert!(c.reason.contains("ps_id=77"), "reason missing ps_id: {}", c.reason);
+    assert!(c.reason.contains("qps_ratio="), "reason missing qps_ratio: {}", c.reason);
+    assert!(c.same_ps, "HOT_COLD candidates are by-construction same_ps");
+}
