@@ -734,3 +734,78 @@ fn hot_cold_advisory_cooldown_dedupes() {
     let third = eng.last_hot_cold_at.get(&42).copied().unwrap_or(0);
     assert!(third > first, "advisory past cooldown must refire");
 }
+
+#[test]
+fn hot_cold_advisory_fires_on_size_imbalance() {
+    use crate::policy::{HOT_COLD_MIN_HOT_SIZE_BYTES, HOT_COLD_SIZE_RATIO};
+    let mut eng = PolicyEngine::default();
+    let now = 1_700_000_000;
+    // Hot partition: 2× the floor (so e.g. 50 GiB if floor is 25 GiB).
+    // Cold partition: 1 byte. QPS is 0 on both — only size triggers.
+    fill_window(
+        &mut eng,
+        200,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 200,
+            size_bytes: HOT_COLD_MIN_HOT_SIZE_BYTES.saturating_mul(2),
+            ..Default::default()
+        },
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    fill_window(
+        &mut eng,
+        201,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 201,
+            size_bytes: 1,
+            ..Default::default()
+        },
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    let owners: HashMap<u64, u64> = vec![(200u64, 99u64), (201, 99)].into_iter().collect();
+    eng.compute_hot_cold_advisory(&owners, now);
+    assert!(
+        eng.last_hot_cold_at.contains_key(&99),
+        "size-only imbalance >{}x should also trigger the advisory",
+        HOT_COLD_SIZE_RATIO,
+    );
+}
+
+#[test]
+fn hot_cold_advisory_size_below_floor_does_not_fire() {
+    use crate::policy::HOT_COLD_MIN_HOT_SIZE_BYTES;
+    let mut eng = PolicyEngine::default();
+    let now = 1_700_000_000;
+    // Both partitions are below the size floor; ratio is huge but
+    // it's a "small partitions, who cares" cluster.
+    fill_window(
+        &mut eng,
+        200,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 200,
+            size_bytes: HOT_COLD_MIN_HOT_SIZE_BYTES / 4, // below floor
+            ..Default::default()
+        },
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    fill_window(
+        &mut eng,
+        201,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 201,
+            size_bytes: 1,
+            ..Default::default()
+        },
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    let owners: HashMap<u64, u64> = vec![(200u64, 99u64), (201, 99)].into_iter().collect();
+    eng.compute_hot_cold_advisory(&owners, now);
+    assert!(
+        eng.last_hot_cold_at.get(&99).is_none(),
+        "size advisory must suppress when hottest size is below the floor"
+    );
+}
