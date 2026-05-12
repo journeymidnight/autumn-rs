@@ -777,9 +777,10 @@ autumn-extent-node --cpuset 0-3 --data /tmp/d1 ...
 autumn-ps          --cpuset 8-15 --psid 1 ...
 ```
 
-- **EN** sets `shards = cpuset_len` (one shard per core). `--shards` is
-  legacy and ignored when `--cpuset` is supplied — a WARN fires if the
-  operator passed both. `cpuset_len == 1` warns about no parallelism.
+- **EN** sets `shards = cpuset_len` (one shard per core). `--shards`
+  was removed in F196 — the binary refuses to start if the flag is
+  passed, with an error pointing at `--cpuset`. `cpuset_len == 1`
+  warns about no parallelism.
 - **PS** sets `max_partitions = cpuset_len / 2` (each partition reserves
   P-log + P-bulk). When the budget is exhausted, `split` returns
   `FailedPrecondition: PS core budget exhausted (N / M partitions)` and

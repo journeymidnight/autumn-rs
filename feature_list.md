@@ -2043,7 +2043,7 @@ Cleared by audit (no fix needed):
 - **Stages:**
   - **Stage A** — `autumn-common::cpu_pin`: `set_cpuset(Vec<usize>)`, `parse_cpuset(&str)`, `cpuset_len()`, `cpuset_explicit()`. CLI parses `--cpuset 4-11` / `0,2,4` / `0-3,8-11`. Mutually exclusive with `--cpu-start`. `pick_cpu_for_ord` returns `None` past end (no wraparound, no offset when cpuset is explicit).
   - **Stage B** — PartitionServer carries `partition_budget: Arc<PartitionBudget { max, current: AtomicUsize }>`. Init sets `max = cpuset_len / 2` iff `cpuset_explicit()`; else `usize::MAX` (gate off, pre-F196 behaviour). `sync_regions_once` bumps/decrements on insert/remove and skips opens past budget with WARN. `handle_split_part` refuses with `FailedPrecondition` before any flush/RPC when `would_exceed(1)`.
-  - **Stage C** — extent-node binary: when `--cpuset` is given and `--shards` left at the legacy default of 1, auto-size `shards = cpuset_len`. WARN when `--shards > cpuset_len` (surplus stays unpinned) or when `cpuset_len == 1` (no parallelism).
+  - **Stage C** — extent-node binary: `--shards` REMOVED (the binary refuses to start if the flag is passed). Shard count = `cpuset_len` (one shard per pre-allocated core). Pass `--cpuset 0` for a single-shard layout. WARN when `cpuset_len == 1` (no parallelism). `cluster.sh` translates the `AUTUMN_EXTENT_SHARDS` env into per-EN `--cpuset` ranges (`(i-1)*SHARDS - i*SHARDS-1`).
   - **Stage D** — manager `PolicyEngine::compute_hot_cold_advisory(region_owners, now)`: groups partitions by PS, requires ≥2 partitions per PS, fires a single WARN line per PS when sustained `max(req_per_sec) / max(1, min(req_per_sec)) >= HOT_COLD_RATIO (10)` over `required_buckets` AND hottest > `HOT_COLD_MIN_HOT_QPS (SPLIT_QPS_HIGH/2 = 25000)`. Per-PS cooldown via `last_hot_cold_at` (`HOT_COLD_COOLDOWN_SEC = 300s`). Pure log — does NOT join `advisory_cache`. Wired into `policy_tick_loop` after `compute_maintenance_advisory`.
   - **Stage E** — `cluster.sh` honors `AUTUMN_PS_CPUSET` / `AUTUMN_EN${i}_CPUSET` to forward `--cpuset` (legacy `--cpu-start` path preserved when neither is set). README documents the flag + advisory.
 - **Acceptance:**
@@ -2051,7 +2051,7 @@ Cleared by audit (no fix needed):
   - 7 new `cpu_pin::tests::parse_cpuset_*` pass.
   - 3 new `policy_tests::hot_cold_advisory_*` pass (fires on ≥10× imbalance, suppresses below QPS floor, respects 5-min cooldown).
   - Workspace lib tests stable: 131/131 PS lib + 65/65 manager lib + 7 (was 0) common cpu_pin = no regressions.
-  - Manual: `autumn-ps --cpuset 0 --psid 1 ... ` rejects 2nd split with `FailedPrecondition`; `autumn-ps --cpuset 0-1 --psid 1` permits 1 partition (cap = 1, P-log + P-bulk both on the 2 cores). `autumn-extent-node --cpuset 0-3 ...` boots with `shards=4` auto-sized.
+  - Manual: `autumn-ps --cpuset 0 --psid 1 ... ` rejects 2nd split with `FailedPrecondition`; `autumn-ps --cpuset 0-1 --psid 1` permits 1 partition (cap = 1, P-log + P-bulk both on the 2 cores). `autumn-extent-node --cpuset 0-3 ...` boots with `shards=4` derived from cpuset_len; `--shards` is rejected with an error.
 - **Out of scope (deferred):**
   - `NeedsMerge` wire response from manager dispatching split (user explicitly deferred — current behaviour is plain `FailedPrecondition` reject).
   - Auto-merge policy on advisory (still advisory-only; manager `--auto-merge` flag exists separately for merge dispatch).

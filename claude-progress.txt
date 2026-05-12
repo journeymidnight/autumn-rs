@@ -8,8 +8,9 @@ Final state:
     cpuset_explicit. `pick_cpu_for_ord` honors the explicit cpuset and
     returns None past end (no wraparound).
   - autumn-extent-node: --cpuset SPEC (taskset syntax) is the sole
-    sizing surface. shards = cpuset_len; --shards deprecated (WARN when
-    both --cpuset and --shards given).
+    sizing surface. shards = cpuset_len; --shards REMOVED (binary
+    refuses to start if it's passed). cluster.sh translates SHARDS env
+    into per-EN --cpuset ranges so existing scripts keep working.
   - autumn-ps: --cpuset SPEC + new partition_budget. cpuset_len/2 caps
     open_partition + handle_split_part. Split refuses with
     FailedPrecondition when budget exhausted; sync_regions_once skips

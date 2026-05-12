@@ -226,52 +226,42 @@ launch_extent_node() {
     local port=$(( 9100 + i ))
     local disk_arg
     disk_arg=$(disk_args_for_node "$i")
-    # F122-fix: each node owns SHARDS cores starting at (i-1)*SHARDS.
-    # PS gets cores starting after all extent-node ranges (see launch_ps).
-    # Skip --cpu-start when affinity is disabled (low core count / unknown
-    # platform) — the binary then leaves all threads unpinned.
-    #
-    # F196: if the operator pre-allocates an explicit cpuset for this
-    # extent-node via AUTUMN_EN${i}_CPUSET (taskset syntax, e.g. "0-3"),
-    # the binary uses --cpuset and the legacy --cpu-start math is
-    # bypassed. The binary auto-sizes --shards from cpuset_len when
-    # --shards was omitted.
+    # F196: EN has no --shards flag — shard count == cpuset_len. Each
+    # node gets its own slice of cores, computed from SHARDS env (which
+    # now means "shards per EN, also = cores per EN"). Operator can
+    # override per node via AUTUMN_EN${i}_CPUSET (taskset syntax).
+    # PS gets the remaining cores after all EN ranges (see launch_ps).
     local cpu_start=$(( (i - 1) * SHARDS ))
+    local cpu_end=$(( cpu_start + SHARDS - 1 ))
     local -a cpu_args=()
     local en_cpuset_var="AUTUMN_EN${i}_CPUSET"
     if [[ -n "${!en_cpuset_var:-}" ]]; then
         cpu_args=(--cpuset "${!en_cpuset_var}")
     elif (( ${AFFINITY_ENABLED:-0} == 1 )); then
-        cpu_args=(--cpu-start "$cpu_start")
+        cpu_args=(--cpuset "${cpu_start}-${cpu_end}")
+    fi
+    # Without --cpuset the EN auto-detects all cores via core_affinity,
+    # which on a dev box would spawn many shards — for the SHARDS=1
+    # legacy default we still want one shard. Bound it with taskset.
+    if [[ ${#cpu_args[@]} -eq 0 ]] && (( SHARDS == 1 )); then
+        cpu_args=(--cpuset "0")
     fi
     # shellcheck disable=SC2046  # intentional word splitting on commas
     mkdir -p $(echo "$disk_arg" | tr ',' ' ')
+    local -a stride_args=()
+    (( SHARDS > 1 )) && stride_args=(--shard-stride "$SHARD_STRIDE")
     if [[ "$disk_arg" == *,* ]]; then
-        if (( SHARDS > 1 )); then
-            start_proc "node$i" \
-                "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
-                --listen "$BIND_HOST" --transport "$TRANSPORT" \
-                --shards "$SHARDS" --shard-stride "$SHARD_STRIDE" \
-                ${cpu_args[@]:+"${cpu_args[@]}"}
-        else
-            start_proc "node$i" \
-                "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
-                --listen "$BIND_HOST" --transport "$TRANSPORT" \
-                ${cpu_args[@]:+"${cpu_args[@]}"}
-        fi
+        start_proc "node$i" \
+            "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
+            --listen "$BIND_HOST" --transport "$TRANSPORT" \
+            ${stride_args[@]:+"${stride_args[@]}"} \
+            ${cpu_args[@]:+"${cpu_args[@]}"}
     else
-        if (( SHARDS > 1 )); then
-            start_proc "node$i" \
-                "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR" \
-                --listen "$BIND_HOST" --transport "$TRANSPORT" \
-                --shards "$SHARDS" --shard-stride "$SHARD_STRIDE" \
-                ${cpu_args[@]:+"${cpu_args[@]}"}
-        else
-            start_proc "node$i" \
-                "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR" \
-                --listen "$BIND_HOST" --transport "$TRANSPORT" \
-                ${cpu_args[@]:+"${cpu_args[@]}"}
-        fi
+        start_proc "node$i" \
+            "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR" \
+            --listen "$BIND_HOST" --transport "$TRANSPORT" \
+            ${stride_args[@]:+"${stride_args[@]}"} \
+            ${cpu_args[@]:+"${cpu_args[@]}"}
     fi
     wait_port "$port" "node$i"
 }
@@ -311,25 +301,31 @@ register_extent_node() {
 # 9202, ...) come up only after partitions open, so we don't wait_port
 # here — bootstrap or region-sync handles readiness.
 launch_ps() {
-    # F122-fix: PS partitions pin starting AFTER all extent-node core ranges
-    # (each EN owns SHARDS cores, REPLICAS nodes total → PS starts at
-    # REPLICAS*SHARDS). Disjoint ranges prevent ord=0 collision on core 0.
-    # Skip --cpu-start when AFFINITY_ENABLED=0 (low core count).
+    # F196 even-distribution layout (single-host, multi-process cluster):
+    #   EN i ∈ [1..REPLICAS]  → cores [(i-1)*SHARDS .. i*SHARDS-1]
+    #   PS                    → cores [REPLICAS*SHARDS .. REPLICAS*SHARDS + 2*PS_PARTS_HINT - 1]
+    # Each PS partition reserves 2 cores (P-log + P-bulk). PS_PARTS_HINT
+    # (defaults to 8, matches perf_check.sh) sets how many partitions
+    # this PS has room for. compute_affinity_decision() guarantees
+    # AFFINITY_ENABLED=1 only when total cores >= REPLICAS*SHARDS +
+    # 2*PS_PARTS_HINT, so the EN ranges and the PS range are disjoint
+    # by construction.
     #
-    # F196: AUTUMN_PS_CPUSET (taskset syntax, e.g. "8-15") forwards directly
-    # to --cpuset and enables the PS's static partition budget gate
-    # (cpuset_len / 2). Without it, the legacy --cpu-start path runs and
-    # the gate is disabled (unlimited partitions, surplus threads unpinned
-    # with WARN — pre-F196 behaviour).
+    # AUTUMN_PS_CPUSET (taskset syntax, e.g. "8-15") overrides this auto
+    # layout — useful for cross-host deployments where PS owns whole
+    # ranges.
+    local ps_hint="${AUTUMN_PS_PARTS_HINT:-8}"
+    [[ "$ps_hint" =~ ^[0-9]+$ ]] && (( ps_hint >= 1 )) || ps_hint=8
     local ps_cpu_start=$(( REPLICAS * SHARDS ))
+    local ps_cpu_end=$(( ps_cpu_start + 2 * ps_hint - 1 ))
     local -a cpu_args=()
     local affinity_msg="affinity=off"
     if [[ -n "${AUTUMN_PS_CPUSET:-}" ]]; then
         cpu_args=(--cpuset "$AUTUMN_PS_CPUSET")
         affinity_msg="cpuset=${AUTUMN_PS_CPUSET}"
     elif (( ${AFFINITY_ENABLED:-0} == 1 )); then
-        cpu_args=(--cpu-start "$ps_cpu_start")
-        affinity_msg="cpu-start=$ps_cpu_start"
+        cpu_args=(--cpuset "${ps_cpu_start}-${ps_cpu_end}")
+        affinity_msg="cpuset=${ps_cpu_start}-${ps_cpu_end} (max_parts=$ps_hint)"
     fi
     # F195: operator-set AUTUMN_* env vars are translated explicitly to
     # per-binary CLI flags here — Rust libraries no longer read env
