@@ -37,6 +37,7 @@ struct Args {
     max_wal_gap: Option<u64>,
     shutdown_timeout_ms: Option<u64>,
     major_compact_parallelism: Option<usize>,
+    gc_parallelism: Option<usize>,
     conn_inflight_cap: Option<usize>,
     fg_rate_bytes_per_sec: Option<u64>,
     fg_iops_per_sec: Option<u64>,
@@ -78,6 +79,7 @@ fn parse_args() -> Args {
     let mut max_wal_gap: Option<u64> = None;
     let mut shutdown_timeout_ms: Option<u64> = None;
     let mut major_compact_parallelism: Option<usize> = None;
+    let mut gc_parallelism: Option<usize> = None;
     let mut conn_inflight_cap: Option<usize> = None;
     let mut fg_rate_bytes_per_sec: Option<u64> = None;
     let mut fg_iops_per_sec: Option<u64> = None;
@@ -187,6 +189,10 @@ fn parse_args() -> Args {
                 major_compact_parallelism = Some(
                     args[i].parse().expect("--major-compact-parallelism usize"),
                 );
+            }
+            "--gc-parallelism" => {
+                i += 1;
+                gc_parallelism = Some(args[i].parse().expect("--gc-parallelism usize"));
             }
             "--conn-inflight-cap" => {
                 i += 1;
@@ -322,6 +328,7 @@ fn parse_args() -> Args {
         max_wal_gap,
         shutdown_timeout_ms,
         major_compact_parallelism,
+        gc_parallelism,
         conn_inflight_cap,
         fg_rate_bytes_per_sec,
         fg_iops_per_sec,
@@ -371,6 +378,9 @@ fn apply_ps_tunables(args: &Args) {
     }
     if let Some(n) = args.major_compact_parallelism {
         ps::set_ps_major_compact_parallelism(n);
+    }
+    if let Some(n) = args.gc_parallelism {
+        ps::set_ps_gc_parallelism(n);
     }
     if let Some(n) = args.conn_inflight_cap {
         ps::set_ps_conn_inflight_cap(n);

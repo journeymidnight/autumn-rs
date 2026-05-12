@@ -65,6 +65,16 @@ Stage breakdown:
                  else 8 (PS_PARTS_HINT default). Aligns with
                  thread-per-core: one busy partition can't burn
                  sibling bg budgets via a shared Mutex.
+                 [SUPERSEDED by D-r6]
+  Stage D-r6:    Revert D-r5; unify admission. ONE Arc<Admission
+                 Controller> per PS again. The same controller now
+                 hosts compact + gc concurrency caps (folded in
+                 F104 compact_gate and the D-r5 gc_concurrency_gate).
+                 New API: account_fg/bg + acquire_compact/acquire_gc.
+                 F140 per-partition gc_gate (split vs gc sync) stays
+                 separate. Background loops + handle_split_part
+                 route through io_bucket for both rate AND
+                 concurrency.
   Stage E: cluster.sh env passthrough + even disjoint cpuset
            distribution (EN[i] + PS ranges); README updated; this
            progress file; feature_list F196 entry; commit.

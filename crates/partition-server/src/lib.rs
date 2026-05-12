@@ -69,6 +69,7 @@ static MAX_IMM_DEPTH_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new
 static MAX_WAL_GAP_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static SHUTDOWN_TIMEOUT_MS_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static PS_MAJOR_COMPACT_PARALLELISM_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static PS_GC_PARALLELISM_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static PS_CONN_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static PS_FG_RATE_BYTES_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static PS_FG_IOPS_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -106,6 +107,9 @@ pub fn set_shutdown_timeout_ms(n: u64) -> bool {
 }
 pub fn set_ps_major_compact_parallelism(n: usize) -> bool {
     PS_MAJOR_COMPACT_PARALLELISM_CELL.set(n.clamp(1, 64)).is_ok()
+}
+pub fn set_ps_gc_parallelism(n: usize) -> bool {
+    PS_GC_PARALLELISM_CELL.set(n.clamp(1, 64)).is_ok()
 }
 pub fn set_ps_conn_inflight_cap(n: usize) -> bool {
     if n == 0 || n > 4096 {
@@ -242,6 +246,21 @@ const COMPACT_N: usize = 5;
 /// Range clamped to [1, 64].
 pub(crate) fn ps_major_compact_parallelism() -> usize {
     *PS_MAJOR_COMPACT_PARALLELISM_CELL.get_or_init(|| 1)
+}
+
+/// F196: PS-wide cap on concurrent `run_gc` calls across partitions.
+/// GC reads sealed log_stream extents in 64 MiB chunks (F106) and
+/// rewrites live VPs — both the chunk-read buffer (~64 MiB) and the
+/// rewrite append staging consume RSS. Without a PS-wide cap,
+/// `autumn-client gc ALL` on an N-partition PS would launch N
+/// concurrent `run_gc` calls, multiplying peak memory by N.
+///
+/// Default = 1 (fully serialized across partitions), tunable via
+/// `--gc-parallelism`. Range clamped to [1, 64]. Symmetric with
+/// `ps_major_compact_parallelism`; reasoning is identical (RAM cap,
+/// not rate cap — that's the per-partition `AdmissionController`).
+pub(crate) fn ps_gc_parallelism() -> usize {
+    *PS_GC_PARALLELISM_CELL.get_or_init(|| 1)
 }
 
 pub struct CompactionGate {
@@ -560,20 +579,18 @@ pub(crate) struct PartitionData {
     /// receiver always drains all pending notifications before re-checking
     /// `imm.len()`, so the buffer self-bounds at `MAX_IMM_DEPTH`.
     imm_drained_tx: mpsc::UnboundedSender<()>,
-    /// F140: PS-wide gate shared with background_compact_loop. handle_split_part
-    /// acquires this to ensure no RowAppendReq is in-flight on P-bulk when
-    /// commit_length is read (do_compact awaits every compact_row_append oneshot
-    /// before releasing the permit).
-    pub(crate) compact_gate: std::sync::Arc<CompactionGate>,
-    /// F140: per-partition gate shared with background_gc_loop. handle_split_part
-    /// acquires this to ensure run_gc has no log_stream append in-flight when
-    /// commit_length is read.
+    /// F140: per-partition gate shared with background_gc_loop.
+    /// `handle_split_part` acquires this to ensure `run_gc` has no
+    /// log_stream append in-flight when commit_length is read. This is
+    /// split-vs-gc *synchronization*, NOT a resource cap. PS-wide
+    /// compact / gc concurrency limits live in `io_bucket` (F196 D-r6).
     pub(crate) gc_gate: std::sync::Arc<CompactionGate>,
-    /// F196: per-partition admission controller. Each partition gets
-    /// its own `Arc<AdmissionController>` with `total / N` per dimension
-    /// (constructed in `partition_thread_main` from
-    /// `PartitionServer.admission_totals`). Strict thread-per-core
-    /// isolation: a busy partition can't starve sibling bg work.
+    /// F196 D-r6: shared PS-wide AdmissionController (back to original
+    /// design after the per-partition D-r5 experiment). Hosts fg/bg
+    /// rate caps AND compact/gc concurrency permits — one place for
+    /// all background resource management. The `gc_gate` field above
+    /// (per-partition) is a separate concern: it serializes GC vs
+    /// split writes within one partition.
     pub(crate) io_bucket: std::sync::Arc<crate::AdmissionController>,
     /// F196: PS-wide partition budget (cpuset_len / 2 when --cpuset is
     /// set; usize::MAX otherwise). `handle_split_part` consults this
@@ -1157,19 +1174,16 @@ pub struct PartitionServer {
     /// F099-K/F100-UCX — host component for the per-partition listener bind.
     /// For UCX/RoCE this must be the routable HCA IP, not `0.0.0.0`.
     listen_host: Rc<std::cell::RefCell<String>>,
-    /// F104 — global cap on simultaneous compactions across partitions
-    /// hosted by this PS process. See `CompactionGate` docs above.
-    compact_gate: std::sync::Arc<CompactionGate>,
-    /// F196: admission "total budget" + saturated ratio. Each new
-    /// partition opened by this PS constructs its own
-    /// `Arc<AdmissionController>` with `total / N` per dimension, where
-    /// `N = partition_budget.max` when `--cpuset` is supplied, else a
-    /// fixed 8 (matches `AUTUMN_PS_PARTS_HINT` in `cluster.sh`). Pre-F196
-    /// the controller was PS-wide (one Arc shared across partitions);
-    /// per-partition aligns with the thread-per-core P-log isolation
-    /// model — one busy partition can't burn through a sibling's bg
-    /// budget.
-    pub(crate) admission_totals: AdmissionTotals,
+    /// F196 D-r6: single PS-wide AdmissionController unifying:
+    ///   - fg rate (bytes + iops)
+    ///   - bg rate (bytes)
+    ///   - bg compact concurrency cap (was F104 `compact_gate`)
+    ///   - bg gc concurrency cap (was F196 r5 `gc_concurrency_gate`)
+    /// Shared across all partitions on this PS — bg resources are
+    /// cluster-pool by nature (memory + cluster IO bandwidth). Per-
+    /// partition isolation lives at the *partition* layer (thread-per-
+    /// core P-log + dedicated io_uring), not in admission.
+    pub(crate) io_bucket: std::sync::Arc<AdmissionController>,
     /// F196 — static partition budget (ScyllaDB-style). Gate fires only
     /// when `--cpuset` was explicitly supplied; otherwise `max =
     /// usize::MAX` and `would_exceed` always returns false.
@@ -1220,8 +1234,21 @@ pub struct AdmissionController {
     /// the bytes ceiling.
     fg_iops_per_sec: u64,
     bg_rate_bytes_per_sec: u64,
+    /// F196 D-r6: max concurrent `do_compact` calls across the PS.
+    /// Folds the former `CompactionGate` (F104) into the unified
+    /// admission controller. RAM cap, not rate cap.
+    bg_compact_max: usize,
+    /// F196 D-r6: max concurrent `run_gc` calls across the PS. Folds
+    /// the former `gc_concurrency_gate` in here. RAM cap.
+    bg_gc_max: usize,
     fg_saturated_ratio: f64,
     state: parking_lot::Mutex<AdmissionState>,
+    /// F196 D-r6: in-flight counters for the concurrency caps.
+    /// Atomic so that acquire/release doesn't have to grab the
+    /// state Mutex (the Mutex holds rate accounting + window state,
+    /// concurrency is independent).
+    compact_inflight: std::sync::atomic::AtomicUsize,
+    gc_inflight: std::sync::atomic::AtomicUsize,
 }
 
 struct AdmissionState {
@@ -1231,42 +1258,28 @@ struct AdmissionState {
     bg_bytes: u64,
 }
 
-/// F196: PS-wide "total budget" used to derive per-partition
-/// `AdmissionController` instances at `open_partition` time. The
-/// PS itself no longer owns a single shared controller.
-#[derive(Clone, Copy, Debug)]
-pub struct AdmissionTotals {
-    pub fg_bytes_per_sec: u64,
-    pub fg_iops_per_sec: u64,
-    pub bg_bytes_per_sec: u64,
-    pub saturated_ratio: f64,
+/// F196 D-r6: RAII permit for `acquire_compact()`. Drops decrement
+/// `AdmissionController.compact_inflight`.
+pub struct CompactPermit {
+    ctrl: std::sync::Arc<AdmissionController>,
+}
+impl Drop for CompactPermit {
+    fn drop(&mut self) {
+        self.ctrl
+            .compact_inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
 }
 
-impl AdmissionTotals {
-    /// Read the process-global setters (defaults match F189/F196).
-    pub fn from_env() -> Self {
-        Self {
-            fg_bytes_per_sec: *PS_FG_RATE_BYTES_PER_SEC_CELL
-                .get_or_init(|| 2 * 1024 * 1024 * 1024),
-            fg_iops_per_sec: *PS_FG_IOPS_PER_SEC_CELL.get_or_init(|| 150_000),
-            bg_bytes_per_sec: *PS_BG_RATE_BYTES_PER_SEC_CELL
-                .get_or_init(|| 256 * 1024 * 1024),
-            saturated_ratio: *PS_FG_SATURATED_THRESHOLD_CELL.get_or_init(|| 0.8),
-        }
-    }
-
-    /// F196 per-partition split: divide each cap by `n`. A cap of 0
-    /// stays at 0 (unlimited) after division. Saturated ratio is
-    /// unchanged (it's a fraction, not a rate).
-    pub fn per_partition(&self, n: usize) -> AdmissionController {
-        let n = n.max(1) as u64;
-        let div = |v: u64| if v == 0 { 0 } else { v / n };
-        AdmissionController::new(
-            div(self.fg_bytes_per_sec),
-            div(self.fg_iops_per_sec),
-            div(self.bg_bytes_per_sec),
-            self.saturated_ratio,
-        )
+/// F196 D-r6: RAII permit for `acquire_gc()`.
+pub struct GcPermit {
+    ctrl: std::sync::Arc<AdmissionController>,
+}
+impl Drop for GcPermit {
+    fn drop(&mut self) {
+        self.ctrl
+            .gc_inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1275,12 +1288,16 @@ impl AdmissionController {
         fg_rate_bytes_per_sec: u64,
         fg_iops_per_sec: u64,
         bg_rate_bytes_per_sec: u64,
+        bg_compact_max: usize,
+        bg_gc_max: usize,
         fg_saturated_ratio: f64,
     ) -> Self {
         Self {
             fg_rate_bytes_per_sec,
             fg_iops_per_sec,
             bg_rate_bytes_per_sec,
+            bg_compact_max: bg_compact_max.max(1),
+            bg_gc_max: bg_gc_max.max(1),
             fg_saturated_ratio: fg_saturated_ratio.clamp(0.1, 1.0),
             state: parking_lot::Mutex::new(AdmissionState {
                 window_start: Instant::now(),
@@ -1288,6 +1305,48 @@ impl AdmissionController {
                 fg_ops: 0,
                 bg_bytes: 0,
             }),
+            compact_inflight: std::sync::atomic::AtomicUsize::new(0),
+            gc_inflight: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// F196 D-r6: acquire a compact concurrency permit. Folds the
+    /// former `CompactionGate::acquire`. Caller holds the permit for
+    /// the duration of `do_compact`; drop releases the slot. RAM cap,
+    /// not rate (rate is `account_bg`).
+    pub async fn acquire_compact(self: &std::sync::Arc<Self>) -> CompactPermit {
+        use std::sync::atomic::Ordering;
+        loop {
+            let cur = self.compact_inflight.load(Ordering::Acquire);
+            if cur < self.bg_compact_max
+                && self
+                    .compact_inflight
+                    .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                return CompactPermit { ctrl: std::sync::Arc::clone(self) };
+            }
+            // Back off briefly: 50 ms is short relative to compact
+            // wallclock (seconds-minutes), avoids CPU spin.
+            compio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// F196 D-r6: acquire a GC concurrency permit. Same shape as
+    /// `acquire_compact`. Folds the former `gc_concurrency_gate`.
+    pub async fn acquire_gc(self: &std::sync::Arc<Self>) -> GcPermit {
+        use std::sync::atomic::Ordering;
+        loop {
+            let cur = self.gc_inflight.load(Ordering::Acquire);
+            if cur < self.bg_gc_max
+                && self
+                    .gc_inflight
+                    .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                return GcPermit { ctrl: std::sync::Arc::clone(self) };
+            }
+            compio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 
@@ -1300,16 +1359,23 @@ impl AdmissionController {
     pub fn from_env() -> Self {
         // F196: fg-bytes default 0 → 2 GiB/s.
         // F196: fg-iops  default 0 → 150_000 ops/s.
-        // Both numbers derived from perf_check baselines (see doc on
-        // AdmissionController). Either cap reached first → fg sleeps.
-        // Operator can pass `--fg-rate-bytes-per-sec 0` or
-        // `--fg-iops-per-sec 0` to disable that dimension individually.
+        // F196 D-r6: bg_compact_max + bg_gc_max default to the legacy
+        // `ps_major_compact_parallelism` / `ps_gc_parallelism` values
+        // (both default 1; tunable via `--major-compact-parallelism` /
+        // `--gc-parallelism`).
         let fg_rate = *PS_FG_RATE_BYTES_PER_SEC_CELL
             .get_or_init(|| 2 * 1024 * 1024 * 1024);
         let fg_iops = *PS_FG_IOPS_PER_SEC_CELL.get_or_init(|| 150_000);
         let bg_rate = *PS_BG_RATE_BYTES_PER_SEC_CELL.get_or_init(|| 256 * 1024 * 1024);
         let saturated = *PS_FG_SATURATED_THRESHOLD_CELL.get_or_init(|| 0.8);
-        Self::new(fg_rate, fg_iops, bg_rate, saturated)
+        Self::new(
+            fg_rate,
+            fg_iops,
+            bg_rate,
+            ps_major_compact_parallelism(),
+            ps_gc_parallelism(),
+            saturated,
+        )
     }
 
     fn maybe_reset_window(state: &mut AdmissionState) {
@@ -1536,7 +1602,7 @@ mod f189_admission_tests {
     fn fg_unlimited_no_sleep() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let ac = AdmissionController::new(0, 0, 0, 0.8);
+            let ac = AdmissionController::new(0, 0, 0, 1, 1, 0.8);
             let t0 = Instant::now();
             for _ in 0..100 {
                 ac.account_fg(1024 * 1024, 1).await;
@@ -1559,7 +1625,7 @@ mod f189_admission_tests {
     fn bg_unlimited_no_sleep() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let ac = AdmissionController::new(0, 0, 0, 0.8);
+            let ac = AdmissionController::new(0, 0, 0, 1, 1, 0.8);
             // fg_rate=0, fg_iops=0, bg_rate=0 → all unlimited.
             let t0 = Instant::now();
             for _ in 0..100 {
@@ -1574,7 +1640,7 @@ mod f189_admission_tests {
     fn bg_respects_own_rate() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let ac = AdmissionController::new(0, 0, 10 * 1024 * 1024, 0.8);
+            let ac = AdmissionController::new(0, 0, 10 * 1024 * 1024, 1, 1, 0.8);
             let t0 = Instant::now();
             // 5 MiB consumed against 10 MiB/s budget = 500ms target
             ac.account_bg(5 * 1024 * 1024).await;
@@ -1604,6 +1670,7 @@ mod f189_admission_tests {
                 100 * 1024 * 1024,
                 0,                 // fg_iops disabled — exercising bytes path
                 100 * 1024 * 1024, // generous bg budget
+                1, 1,
                 0.5,
             );
             // Push fg to saturate the window: 60 MiB consumed in <100ms
@@ -1634,6 +1701,7 @@ mod f189_admission_tests {
                 100 * 1024 * 1024, // fg ceiling set
                 0,                 // fg_iops disabled
                 100 * 1024 * 1024,
+                1, 1,
                 0.5,
             );
             // No fg traffic at all.
@@ -1658,6 +1726,7 @@ mod f189_admission_tests {
                 0,                 // fg bytes unlimited
                 0,                 // fg iops unlimited
                 100 * 1024 * 1024, // bg ceiling
+                1, 1,
                 0.5,
             );
             // Push lots of fg.
@@ -1686,6 +1755,7 @@ mod f189_admission_tests {
                 10 * 1024 * 1024 * 1024,
                 1_000,
                 0,
+                1, 1,
                 0.8,
             );
             let t0 = Instant::now();
@@ -1716,6 +1786,7 @@ mod f189_admission_tests {
                 10 * 1024 * 1024 * 1024, // bytes effectively unlimited
                 1_000,                    // 1000 ops/s
                 100 * 1024 * 1024,        // bg ceiling generous
+                1, 1,
                 0.5,                      // bg yields at 500 ops/s observed
             );
             // 600 ops in one batch → observed rate ~600 ops/s in ~0s.
@@ -1736,33 +1807,36 @@ mod f189_admission_tests {
         });
     }
 
-    /// F196: AdmissionTotals.per_partition splits cap / N. A cap of
-    /// 0 (unlimited) stays at 0; saturated_ratio is preserved.
+    /// F196 D-r6: acquire_compact / acquire_gc cap concurrency. With
+    /// bg_compact_max=1, two acquires serialize (second waits until
+    /// first permit is dropped). With bg_gc_max=2, two acquires
+    /// proceed in parallel and a third waits.
     #[test]
-    fn admission_totals_per_partition_split() {
-        let totals = AdmissionTotals {
-            fg_bytes_per_sec: 2 * 1024 * 1024 * 1024,
-            fg_iops_per_sec: 150_000,
-            bg_bytes_per_sec: 256 * 1024 * 1024,
-            saturated_ratio: 0.8,
-        };
-        let ac = totals.per_partition(8);
-        assert_eq!(ac.fg_rate_bytes_per_sec, 2 * 1024 * 1024 * 1024 / 8);
-        assert_eq!(ac.fg_iops_per_sec, 150_000 / 8);
-        assert_eq!(ac.bg_rate_bytes_per_sec, 256 * 1024 * 1024 / 8);
-        // saturated_ratio carries through unchanged.
-        assert!((ac.fg_saturated_ratio - 0.8).abs() < 1e-9);
-        // 0 (unlimited) stays 0 after division.
-        let totals_zero = AdmissionTotals {
-            fg_bytes_per_sec: 0,
-            fg_iops_per_sec: 0,
-            bg_bytes_per_sec: 0,
-            saturated_ratio: 0.5,
-        };
-        let ac0 = totals_zero.per_partition(16);
-        assert_eq!(ac0.fg_rate_bytes_per_sec, 0);
-        assert_eq!(ac0.fg_iops_per_sec, 0);
-        assert_eq!(ac0.bg_rate_bytes_per_sec, 0);
+    fn admission_acquire_compact_and_gc_concurrency_caps() {
+        use std::sync::atomic::Ordering;
+        let ac = std::sync::Arc::new(AdmissionController::new(
+            0, 0, 0,
+            1, // bg_compact_max
+            2, // bg_gc_max
+            0.8,
+        ));
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            // Compact: cap = 1.
+            let p1 = ac.acquire_compact().await;
+            assert_eq!(ac.compact_inflight.load(Ordering::Acquire), 1);
+            drop(p1);
+            assert_eq!(ac.compact_inflight.load(Ordering::Acquire), 0);
+
+            // GC: cap = 2 — two concurrent permits possible.
+            let g1 = ac.acquire_gc().await;
+            let g2 = ac.acquire_gc().await;
+            assert_eq!(ac.gc_inflight.load(Ordering::Acquire), 2);
+            drop(g1);
+            assert_eq!(ac.gc_inflight.load(Ordering::Acquire), 1);
+            drop(g2);
+            assert_eq!(ac.gc_inflight.load(Ordering::Acquire), 0);
+        });
     }
 
     /// Window reset clears both counters after 1s. Regression guard:
@@ -1771,7 +1845,7 @@ mod f189_admission_tests {
     fn window_resets_after_1s() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let ac = AdmissionController::new(0, 0, 0, 0.8);
+            let ac = AdmissionController::new(0, 0, 0, 1, 1, 0.8);
             ac.account_fg(123, 2).await;
             ac.account_bg(456).await;
             let (fg, ops, bg, _) = ac.snapshot();
@@ -1886,8 +1960,7 @@ impl PartitionServer {
                             listen_host: Rc::new(std::cell::RefCell::new(
                                 String::from("0.0.0.0"),
                             )),
-                            compact_gate: CompactionGate::new(ps_major_compact_parallelism()),
-                            admission_totals: AdmissionTotals::from_env(),
+                            io_bucket: std::sync::Arc::new(AdmissionController::from_env()),
                             partition_budget: std::sync::Arc::new(PartitionBudget::new(
                                 compute_partition_budget_cap(),
                             )),
@@ -2486,21 +2559,11 @@ impl PartitionServer {
         let manager_addr_for_thread = manager_addr.clone();
         let owner_key_for_thread = owner_key.clone();
         let advertise_addr_for_thread = advertise_addr.clone();
-        let compact_gate_for_thread = self.compact_gate.clone();
-        // F196: per-partition AdmissionController, sized as
-        // `total / N` where N = partition_budget.max when --cpuset is
-        // set, else PS_PARTS_HINT_FALLBACK (= 8, matches cluster.sh
-        // default). Built on the main thread so the partition thread
-        // receives a fresh Arc — no cross-partition sharing.
-        const PS_PARTS_HINT_FALLBACK: usize = 8;
-        let admission_n = if self.partition_budget.max == usize::MAX {
-            PS_PARTS_HINT_FALLBACK
-        } else {
-            self.partition_budget.max
-        };
-        let admission_for_thread = std::sync::Arc::new(
-            self.admission_totals.per_partition(admission_n),
-        );
+        // F196 D-r6: ONE shared AdmissionController Arc across
+        // partitions. fg/bg rate caps + compact/gc concurrency caps
+        // all live here; PS-wide by design (bg resources are cluster
+        // pool: RAM + cluster IO bandwidth).
+        let admission_for_thread = self.io_bucket.clone();
         let partition_budget_for_thread = self.partition_budget.clone();
         // F183: build the metrics Arc on the main thread so we can keep
         // a clone in PartitionHandle for the report loop. The other clone
@@ -2540,7 +2603,6 @@ impl PartitionServer {
                         ready_tx,
                         shutdown_rx,
                         drain_rx,
-                        compact_gate_for_thread,
                         cpu_bulk,
                         metrics_for_thread,
                         compact_tx_for_thread,
@@ -3318,7 +3380,6 @@ async fn partition_thread_main(
     ready_tx: oneshot::Sender<Result<()>>,
     shutdown_rx: oneshot::Receiver<()>,
     drain_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
-    compact_gate: std::sync::Arc<CompactionGate>,
     cpu_bulk: Option<usize>,
     metrics_arc: std::sync::Arc<PartitionMetrics>,
     // F188: trigger channels created on the main thread; the senders
@@ -3462,7 +3523,6 @@ async fn partition_thread_main(
         flush_req_tx: flush_req_tx_part,
         row_append_tx: row_append_tx_part,
         imm_drained_tx,
-        compact_gate: compact_gate.clone(),
         gc_gate: gc_gate.clone(),
         io_bucket: io_bucket.clone(),
         partition_budget: partition_budget.clone(),
@@ -3500,17 +3560,18 @@ async fn partition_thread_main(
     }
     {
         let p = part.clone();
-        let gate = compact_gate.clone();
+        let admission_for_compact = io_bucket.clone();
         compio::runtime::spawn(async move {
-            background_compact_loop(part_id, p, compact_rx, gate).await;
+            background_compact_loop(part_id, p, compact_rx, admission_for_compact).await;
         })
         .detach();
     }
     {
         let p = part.clone();
         let gc_gate_for_loop = gc_gate.clone();
+        let admission_for_gc = io_bucket.clone();
         compio::runtime::spawn(async move {
-            background_gc_loop(p, gc_rx, gc_gate_for_loop).await;
+            background_gc_loop(p, gc_rx, gc_gate_for_loop, admission_for_gc).await;
         })
         .detach();
     }
@@ -7491,6 +7552,10 @@ mod f140_tests {
         gc_gate.inflight.fetch_sub(1, Ordering::Release);
         assert_eq!(gc_gate.inflight.load(Ordering::Acquire), 0, "gc_gate should be free after holes loop");
     }
+
+    // F196 D-r6: gc_concurrency_gate folded into AdmissionController.
+    // Cross-partition concurrent-GC behaviour now exercised by
+    // `f189_admission_tests::admission_acquire_compact_and_gc_concurrency_caps`.
 }
 
 #[cfg(test)]

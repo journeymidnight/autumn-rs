@@ -352,6 +352,9 @@ launch_ps() {
     if [[ -n "${AUTUMN_PS_MAJOR_COMPACT_PARALLELISM:-}" ]]; then
         tunable_args+=(--major-compact-parallelism "$AUTUMN_PS_MAJOR_COMPACT_PARALLELISM")
     fi
+    if [[ -n "${AUTUMN_PS_GC_PARALLELISM:-}" ]]; then
+        tunable_args+=(--gc-parallelism "$AUTUMN_PS_GC_PARALLELISM")
+    fi
     if [[ -n "${AUTUMN_PS_CONN_INFLIGHT_CAP:-}" ]]; then
         tunable_args+=(--conn-inflight-cap "$AUTUMN_PS_CONN_INFLIGHT_CAP")
     fi

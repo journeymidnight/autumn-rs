@@ -81,7 +81,10 @@ pub(crate) async fn background_compact_loop(
     _part_id: u64,
     part: Rc<RefCell<PartitionData>>,
     mut compact_rx: mpsc::Receiver<bool>,
-    gate: std::sync::Arc<crate::CompactionGate>,
+    // F196 D-r6: the compact concurrency cap is now hosted by the
+    // unified PS-wide AdmissionController. Caller passes the same Arc
+    // that PartitionData.io_bucket holds.
+    admission: std::sync::Arc<crate::AdmissionController>,
 ) {
     // F188: short timer kept to refresh `pending_compaction_bytes` for
     // the maintenance scheduler — it polls metrics on the main thread,
@@ -199,7 +202,7 @@ pub(crate) async fn background_compact_loop(
 
                 // F104: serialize across partitions per
                 // AUTUMN_PS_MAJOR_COMPACT_PARALLELISM (default 1).
-                let _permit = gate.acquire().await;
+                let _permit = admission.acquire_compact().await;
                 // compact_inflight already latched at top of recv arm.
                 let result = do_compact(&part, compact_tbls, major).await;
                 match result {
@@ -274,7 +277,7 @@ pub(crate) async fn background_compact_loop(
                     let tbls = part.borrow().tables.clone();
                     if tbls.len() >= 1 {
                         let last_extent = tbls.last().map(|t| t.extent_id).unwrap_or(0);
-                        let _permit = gate.acquire().await;
+                        let _permit = admission.acquire_compact().await;
                         metrics
                             .compact_inflight
                             .store(1, std::sync::atomic::Ordering::Relaxed);
@@ -329,7 +332,12 @@ pub(crate) async fn background_compact_loop(
 pub(crate) async fn background_gc_loop(
     part: Rc<RefCell<PartitionData>>,
     mut gc_rx: mpsc::Receiver<GcTask>,
+    // F140 per-partition split-vs-gc sync (unchanged).
     gc_gate: std::sync::Arc<crate::CompactionGate>,
+    // F196 D-r6: GC concurrency cap now hosted by the unified
+    // AdmissionController. Caller passes the same Arc as
+    // PartitionData.io_bucket.
+    admission: std::sync::Arc<crate::AdmissionController>,
 ) {
     const MAX_GC_ONCE: usize = 3;
     const GC_DISCARD_RATIO: f64 = 0.4;
@@ -530,6 +538,13 @@ pub(crate) async fn background_gc_loop(
             continue;
         }
 
+        // F196 D-r6: PS-wide GC concurrency cap (via the unified
+        // AdmissionController). Acquired BEFORE the per-partition
+        // gc_gate so multiple partitions on the same PS don't all
+        // enter run_gc together — each holds ~64 MiB chunk buffer +
+        // rewrite staging. Default 1 (full serialization), tunable
+        // via `--gc-parallelism`.
+        let _gc_conc_permit = admission.acquire_gc().await;
         // F140: acquire gc_gate around the actual run_gc calls so that
         // handle_split_part can wait for no log_stream appends in-flight.
         // Gate is held only for the holes-processing loop, not for the
