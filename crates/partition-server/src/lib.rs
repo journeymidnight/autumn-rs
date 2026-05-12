@@ -1184,13 +1184,23 @@ pub struct PartitionServer {
 /// happens outside the lock.
 ///
 /// Configuration (env, applied via `from_env`):
-///   AUTUMN_PS_FG_RATE_BYTES_PER_SEC  — fg ceiling (0 = unlimited; default 0)
+///   AUTUMN_PS_FG_RATE_BYTES_PER_SEC  — fg ceiling (0 = unlimited; default 2 GiB/s)
 ///   AUTUMN_PS_BG_RATE_BYTES_PER_SEC  — bg ceiling (0 = unlimited; default 256 MiB/s)
 ///   AUTUMN_PS_FG_SATURATED_THRESHOLD — fg observed-rate ratio above
 ///       which bg yields entirely to the next window. Default 0.8;
 ///       only meaningful when AUTUMN_PS_FG_RATE_BYTES_PER_SEC > 0.
 ///       When fg rate is 0 (unlimited), bg uses ONLY its own ceiling
 ///       — no fg-aware throttle (we don't know fg's "intended" rate).
+///
+/// F196 — default fg cap changed from `0` (unlimited) to **2 GiB/s**.
+/// Rationale from perf_check baselines (real TCP, no SHM loopback):
+///   - 4 KiB writes peak ~425 MB/s (TCP p16 d8) → 2 GiB/s = ~5× headroom
+///   - 8 MiB writes peak ~1741 MB/s (TCP p8 d8) → 2 GiB/s = ~15% headroom
+///   - SHM loopback exceeds 2 GiB/s for 8M values, but per the
+///     `[[loopback-numa-artifact]]` rule SHM bench is not production
+/// Net effect: real TCP workloads never hit the cap; the cap activates
+/// the fg-aware-yield mechanism in `account_bg` so GC/compact properly
+/// defer when fg is using >80% of its budget (1.6 GiB/s observed rate).
 pub struct AdmissionController {
     fg_rate_bytes_per_sec: u64,
     bg_rate_bytes_per_sec: u64,
@@ -1229,7 +1239,11 @@ impl AdmissionController {
     /// `from_env` for call-site stability; semantically it is now
     /// "from process-global config setters."
     pub fn from_env() -> Self {
-        let fg_rate = *PS_FG_RATE_BYTES_PER_SEC_CELL.get_or_init(|| 0);
+        // F196: fg default 0 → 2 GiB/s. See doc comment above for the
+        // perf_check rationale. Operator can pass `--fg-rate-bytes-per-sec 0`
+        // to restore the pre-F196 unlimited behaviour.
+        let fg_rate = *PS_FG_RATE_BYTES_PER_SEC_CELL
+            .get_or_init(|| 2 * 1024 * 1024 * 1024);
         let bg_rate = *PS_BG_RATE_BYTES_PER_SEC_CELL.get_or_init(|| 256 * 1024 * 1024);
         let saturated = *PS_FG_SATURATED_THRESHOLD_CELL.get_or_init(|| 0.8);
         Self::new(fg_rate, bg_rate, saturated)

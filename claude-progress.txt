@@ -43,6 +43,12 @@ Stage breakdown:
                  so `client info policy` shows it. Hot/cold list
                  simplified to "min/max-matched partition" so the
                  2-partition PS case works.
+  Stage D-r3:    F189 fg admission default 0 → 2 GiB/s. Activates
+                 the existing fg ceiling + bg fg-aware yield by
+                 default. Derived from perf_check TCP peaks
+                 (~1.74 GB/s for 8M values; 2 GiB/s leaves 15%
+                 headroom). Operator can re-enable unlimited via
+                 `--fg-rate-bytes-per-sec 0`.
   Stage E: cluster.sh env passthrough + even disjoint cpuset
            distribution (EN[i] + PS ranges); README updated; this
            progress file; feature_list F196 entry; commit.
