@@ -297,7 +297,16 @@ start_cluster_for() {
         if (( USE_3DISK )); then
             cluster_3disk=(--3disk)
         fi
+        # F196: cluster.sh default PS cpuset budget = PS_PARTS_HINT (8).
+        # If this bench asks for more partitions, the PS would silently
+        # skip openings past the budget. Bump the hint to match the
+        # bench's partition count so all partitions actually open.
+        local ps_parts_hint_for_bench="${AUTUMN_PS_PARTS_HINT:-}"
+        if [[ -z "$ps_parts_hint_for_bench" ]] && (( parts > 8 )); then
+            ps_parts_hint_for_bench="$parts"
+        fi
         AUTUMN_EXTENT_SHARDS="${AUTUMN_EXTENT_SHARDS:-4}" \
+        AUTUMN_PS_PARTS_HINT="${ps_parts_hint_for_bench:-8}" \
         AUTUMN_TRANSPORT="$mode" bash "$SCRIPT_DIR/cluster.sh" start 3 \
             "${cluster_3disk[@]}" \
             || { echo "[perf-check] FAILED to start cluster (mode=$mode parts=$parts)"; return 1; }
