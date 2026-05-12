@@ -29,11 +29,17 @@ Stage breakdown:
   Stage B: PartitionBudget (Arc<AtomicUsize+max>), wired through
            PartitionServer + PartitionData + partition_thread_main.
            sync_regions_once inc/dec; handle_split_part gate.
-  Stage C: EN auto-sizes shards from cpuset_len; --shards deprecated.
-  Stage D: PolicyEngine::compute_hot_cold_advisory + 3 unit tests +
-           call site in policy_tick_loop.
-  Stage E: cluster.sh env passthrough; README updated; this progress
-           file; feature_list F196 entry; commit.
+  Stage C: EN auto-sizes shards from cpuset_len; --shards REMOVED.
+  Stage D: PolicyEngine::compute_hot_cold_advisory dual-dimension
+           (QPS + size_bytes), 5 unit tests, call site in
+           policy_tick_loop.
+  Stage D-recal: SPLIT_QPS_HIGH 50K→15K, MERGE_QPS_LOW 5K→1.5K.
+                 Aligns F183 QPS thresholds with measured ~30K
+                 single-partition ceiling. Pre-F196 50K was
+                 unreachable.
+  Stage E: cluster.sh env passthrough + even disjoint cpuset
+           distribution (EN[i] + PS ranges); README updated; this
+           progress file; feature_list F196 entry; commit.
 
 Test pass:
   cargo test -p autumn-common cpu_pin          → 7/7

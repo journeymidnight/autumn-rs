@@ -16,12 +16,23 @@ const GIB: u64 = 1024 * 1024 * 1024;
 
 pub const SPLIT_SIZE_HARD: u64 = 50 * GIB;
 pub const SPLIT_SIZE_MIN: u64 = GIB;
-pub const SPLIT_QPS_HIGH: u32 = 50_000;
+/// F196: recalibrated 50K → 15K. autumn-rs's measured single-partition
+/// QPS ceiling on the perf_check workload is ~30K (one P-log thread,
+/// one io_uring). 15K = 50% of ceiling — "this partition is using
+/// half its single-thread budget, time to split." Pre-F196 the value
+/// was 50K which is unreachable on this engine; condition ② of the
+/// SPLIT predicate (`req_per_sec > SPLIT_QPS_HIGH && size > SPLIT_
+/// SIZE_MIN`) was effectively dead code.
+pub const SPLIT_QPS_HIGH: u32 = 15_000;
 pub const SPLIT_IMMFULL_HIGH: u32 = 10;
 pub const SPLIT_COOLDOWN_SEC: i64 = 3600;
 
 pub const MERGE_SIZE_LOW: u64 = GIB;
-pub const MERGE_QPS_LOW: u32 = 5_000;
+/// F196: recalibrated 5K → 1.5K to preserve the 10× hysteresis ratio
+/// against the new `SPLIT_QPS_HIGH = 15K`. 1.5K = 5% of single-partition
+/// ceiling — "two adjacent cold partitions barely make a dent, merge
+/// them to free a core slot."
+pub const MERGE_QPS_LOW: u32 = 1_500;
 pub const MERGE_COOLDOWN_SEC: i64 = 6 * 3600;
 
 /// F187: GC debt advisory threshold. Default 1 GiB sustained — large
