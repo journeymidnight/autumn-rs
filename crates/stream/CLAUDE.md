@@ -405,6 +405,85 @@ node ever scales to 10k+ extents, switch to chunked rotation
 (bounded id batches per sweep, rotating through the full set over
 multiple sweeps).
 
+### Concurrency control: `ConcurrencyController` (F194 → renamed F196 D-r7)
+
+Cross-extent concurrency cap for the two memory-heavy background paths
+on each shard: `handle_convert_to_ec` and `run_recovery_task`. Renamed
+from `ExtentNodeGate` in F196 D-r7 to mirror PS's
+`partition_server::ConcurrencyController` — same role on both sides
+("how many can run at once before RAM is at risk"), same `acquire_*()`
++ RAII permit API.
+
+```rust
+pub struct ConcurrencyController {
+    ec_convert_max: usize,
+    recovery_max: usize,
+    ec_convert_inflight: Cell<usize>,
+    recovery_inflight:   Cell<usize>,
+}
+// Methods (async):
+//   acquire_ec_convert() -> EcConvertPermit
+//   acquire_recovery()   -> RecoveryPermit
+// Permits decrement their counter on Drop.
+```
+
+One `Rc<ConcurrencyController>` per `ExtentNode` shard; both call
+sites (`handle_convert_to_ec` and `run_recovery_task`) acquire from
+the same Arc. The two counters are independent — saturating EC
+convert doesn't block recovery and vice versa (verified by
+`f194_concurrency_gate_tests::ec_convert_and_recovery_counters_are_independent`).
+
+**Cell vs AtomicUsize.** The extent-node shard runs on a
+single-threaded compio runtime — every acquire and release happens on
+the same OS thread. `Cell<usize>` is sufficient, no cross-thread atomic
+needed. PS's counterpart uses `AtomicUsize` because it's shared across
+partition threads. The two implementations are otherwise identical in
+shape (CAS loop replaced by `cur + 1` set, 50 ms backoff polling on
+contention — fine relative to EC/recovery wallclock of seconds-minutes).
+
+**Why not the per-extent locks alone?** `ec_conversion_locks` (F153)
+only serialises requests for the SAME `extent_id`; `recovery_inflight`
+(F109) only blocks duplicate requests for the SAME `extent_id`. Both
+allow unbounded cross-extent fanout: a single manager
+`recovery_dispatch_loop` tick finding 8 different extents to recover
+spawns 8 detached `run_recovery_task` tasks, each holding ~`payload × 2`
+memory through fetch + write. The concurrency controller caps that to
+`recovery_max` (default 2) across all extents.
+
+### Concurrency vs rate limiting (and why there's no rate cap on EN)
+
+EN has concurrency caps but **no bytes/s rate limit** today. This is
+deliberate — the resource shapes differ from PS's:
+
+| Operation | What dominates | Why concurrency cap is enough |
+|-----------|----------------|------------------------------|
+| `handle_convert_to_ec` | CPU (`spawn_blocking(ec_encode)`) + network (parallel WriteShard fanout) | Each in-flight encode holds ~`payload × 2` of GF(256) intermediates. cap=1 default keeps peak RAM at one encode. |
+| `run_recovery_task` | Network (CopyExtent reads) + disk (full-extent write + sync) | F115 chunked I/O caps per-syscall buffer at 256 MiB; per-task RAM ~one chunk. cap=2 default keeps peak at 512 MiB. |
+
+Both paths are bounded in time (seconds to minutes per extent) and
+self-throttled by 3-replica fanout latency; the manager dispatches at
+~2 s ticks, so the natural rate is ~30 extents/min/shard with cap=1.
+A bytes/s cap could be layered in if production observes runaway
+extent-node bandwidth (would mirror PS's `RateController.account_*`
+shape on Mutex<RateState>) — track as F197+ if needed.
+
+PS's situation is different: foreground writes hit the partition's
+write path thousands of times/sec at small batch sizes — that's where
+rate limits (bytes/s + iops) matter. EN's heavy paths are bulk
+operations measured in seconds, where concurrency = RAM cap is the
+load-bearing constraint.
+
+### Configuration
+
+| CLI flag | Env var | Default | Range |
+|----------|---------|---------|-------|
+| `--ec-convert-parallelism` | `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM` | 1 | [1, 16] |
+| `--recovery-parallelism` | `AUTUMN_EXTENT_RECOVERY_PARALLELISM` | 2 | [1, 16] |
+
+Clamps live on `ExtentNodeConfig::with_*` builder methods. The values
+flow through `ExtentNodeConfig` into `ConcurrencyController::new(ec,
+recovery)` at `ExtentNode::new`.
+
 ---
 
 ## StreamClient — Client Side

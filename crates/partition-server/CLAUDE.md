@@ -555,170 +555,201 @@ in-flight RPC. F106 fixes both: chunked carry-streaming (peak GC RAM
 size for the streaming read inside `run_gc`. Matches Go's
 ~1000-block (≈ 64 MiB) `replayLog` window in `valuelog.go::runGC`.
 
-## AdmissionController (F189) — Background-IO Rate Limiting
+## Admission: rate limiting + concurrency control (F189 → F196 D-r7)
 
-PS-wide two-class rate limiter shared by every partition's GC + compact
-+ foreground write paths. Lives at `crates/partition-server/src/lib.rs`
-around line 1125-1273. `Arc<AdmissionController>` on `PartitionServer`,
-cloned into every `PartitionData.io_bucket`.
+Background-IO admission split into TWO orthogonal mechanisms after
+F196 D-r7. The split mirrors the physical resource they protect:
+**rates** are per-partition because IO patterns are partition-local;
+**concurrency** is PS-wide because the protected resource is process
+RAM (each compact / GC operation holds ~hundreds of MB of buffers).
+
+| Type | Scope | What it controls | Default | Code |
+|------|-------|-----------------|---------|------|
+| `RateController` | **per-partition** | fg bytes/s + fg iops + compact bytes/s + gc bytes/s | fg 256 MiB/s + 30K iops; compact 64 MiB/s; gc 32 MiB/s | `lib.rs::RateController` |
+| `ConcurrencyController` | **PS-wide** (`Arc<>`) | compact + gc concurrency permits | compact_max=1, gc_max=1 | `lib.rs::ConcurrencyController` |
+
+`PartitionServer` carries one `Arc<ConcurrencyController>`; each
+`PartitionData` carries its own fresh `Arc<RateController>` (independent
+mutex/state) plus a clone of the PS-wide concurrency Arc.
+
+### RateController — per-partition rate caps
+
+Four independent rate dimensions in one 1-second window (lazy fixed-
+window token bucket):
+
+```rust
+struct RateState {
+    window_start: Instant,    // updated only when elapsed >= 1 s
+    fg_bytes: u64,
+    fg_ops: u64,
+    compact_bytes: u64,
+    gc_bytes: u64,
+}
+```
+
+Public methods (all async, all sleep OUTSIDE the lock):
+
+| Method | Semantics |
+|--------|-----------|
+| `account_fg(bytes, ops)` | fg write hot path. EITHER bytes OR ops cap reached → sleep (larger sleep wins). Default 256 MiB/s + 30K ops/s catches both 8 MiB-Put bytes-bound and 4 KiB-Put IOPS-bound workloads. |
+| `account_compact(bytes)` | compact write. Sleeps until BOTH own compact rate AND fg-aware-yield allow. |
+| `account_gc(bytes)` | gc write. Symmetric to compact, separate counter. |
+
+**fg-aware yield** (inside `account_compact` and `account_gc`): yields
+the remainder of the 1-s window when `fg_observed_bytes_rate > 0.8 × fg_rate`
+OR `fg_observed_iops > 0.8 × fg_iops`. Disabled per-dimension when
+that fg cap is 0. Each partition checks ITS OWN fg counters — cold
+partition's compact doesn't yield because of hot partition's fg
+pressure (partitions are isolated).
+
+**Independent counters** (key invariant tested by
+`compact_and_gc_rates_are_independent`): saturating compact does NOT
+throttle gc and vice versa. Pre-D-r7 they shared a single `bg_rate_bytes_per_sec`
+counter; the split lets operators allocate budgets independently
+(compact tends to be bulk/burst; gc is more sustained).
+
+Why per-partition? In a multi-partition PS, a hot partition's fg
+pressure consuming a shared bg budget would starve cold partitions'
+maintenance work. Per-partition rates also align with the thread-per-
+core P-log model — each partition has its own io_uring; no reason its
+admission state should fight other partitions' on a shared Mutex.
+
+### ConcurrencyController — PS-wide RAM cap
+
+Each `do_compact` holds ~2× SST bytes in memory; each `run_gc` holds
+~64 MiB of chunk-read buffer + rewrite staging. Without a global cap,
+`autumn-client compact ALL` would launch N concurrent compactions and
+multiply peak RSS by N (the F104 incident hit 44 GB RSS).
+
+```rust
+pub struct ConcurrencyController {
+    compact_max: usize,
+    gc_max: usize,
+    compact_inflight: AtomicUsize,
+    gc_inflight: AtomicUsize,
+}
+```
+
+Public methods:
+
+| Method | Returns | Drop semantics |
+|--------|---------|----------------|
+| `acquire_compact()` | `CompactPermit` | decrements `compact_inflight` |
+| `acquire_gc()` | `GcPermit` | decrements `gc_inflight` |
+
+Atomic counters + 50 ms backoff loop (mirrors EN's
+`stream::ConcurrencyController`). `parking_lot::Mutex` NOT used here
+because per-Arc concurrency operations are inherently cross-thread
+(multiple partition threads acquire from the same Arc) and Atomic
+CAS is the right primitive.
+
+### Call sites
+
+| Path | Call |
+|------|------|
+| `background::start_write_batch` (fg hot path) | `rate_ctrl.account_fg(bytes, ops)` |
+| `background::do_compact` (chunk emit + final emit) | `rate_ctrl.account_compact(chunk_bytes)` |
+| `background::flush_gc_batch` (write side) | `rate_ctrl.account_gc(batch_bytes)` |
+| `background::run_gc` (chunk read side) | `rate_ctrl.account_gc(chunk_len)` |
+| `background::background_compact_loop` | `concurrency_ctrl.acquire_compact()` |
+| `background::background_gc_loop` | `concurrency_ctrl.acquire_gc()` (in addition to per-partition F140 `gc_gate`) |
+| `rpc_handlers::handle_split_part` | `concurrency_ctrl.acquire_compact()` + per-partition F140 `gc_gate.acquire()` |
+
+F141's per-partition `GcRateLimiter` survives as a deprecated inner
+cap layered before `account_gc`; it stays for back-compat with the
+`--gc-rate-bytes-per-sec` flag (distinct from D-r7's
+`--admission-gc-rate-bytes-per-sec`).
+
+### Configuration (CLI flags + cluster.sh env)
+
+| Flag | Env | Default | Knob |
+|------|-----|---------|------|
+| `--fg-rate-bytes-per-sec` | `AUTUMN_PS_FG_RATE_BYTES_PER_SEC` | 256 MiB/s | per-partition fg bytes |
+| `--fg-iops-per-sec` | `AUTUMN_PS_FG_IOPS_PER_SEC` | 30_000 | per-partition fg ops |
+| `--admission-compact-rate-bytes-per-sec` | `AUTUMN_PS_ADMISSION_COMPACT_RATE_BYTES_PER_SEC` | 64 MiB/s | per-partition compact bytes |
+| `--admission-gc-rate-bytes-per-sec` | `AUTUMN_PS_ADMISSION_GC_RATE_BYTES_PER_SEC` | 32 MiB/s | per-partition gc bytes |
+| `--fg-saturated-threshold` | `AUTUMN_PS_FG_SATURATED_THRESHOLD` | 0.8 | fg-aware yield trigger ratio |
+| `--major-compact-parallelism` | `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM` | 1 | PS-wide compact concurrency |
+| `--gc-parallelism` | `AUTUMN_PS_GC_PARALLELISM` | 1 | PS-wide gc concurrency |
+
+`0` on any rate flag = unlimited for that dimension (per-dimension
+opt-out without disabling the others). Removed in D-r7:
+`--bg-rate-bytes-per-sec` (split into compact + gc), with a migration
+error message at the CLI parser.
+
+### Pre-D-r7 history (for archeologists)
+
+- F141 (per-partition `GcRateLimiter`): standalone gc bytes/s limiter.
+  Kept as a layered inner cap.
+- F188 (`IoTokenBucket`): single PS-wide bg bytes/s cap. Replaced by F189.
+- F189 (`AdmissionController` Stage 3): two-class (fg + bg) admission
+  with fg-aware yield. PS-wide single Arc.
+- D-r5 (early F196): made it per-partition with `total/N` split. **Bug**:
+  one busy partition couldn't use full pool, double-bookkeeping vs
+  F104's PS-wide compact_gate. Reverted by D-r6.
+- D-r6: unified back to PS-wide AND folded F104 compact_gate +
+  gc_concurrency_gate into the single controller. Cleaner but
+  confused two orthogonal concerns (rate vs concurrency).
+- **D-r7 (current)**: separates rate (per-partition `RateController`)
+  from concurrency (PS-wide `ConcurrencyController`). compact/gc rates
+  are split into independent counters.
 
 ### Algorithm: lazy fixed-window token bucket
 
-Despite the original "sliding window" framing in the docs, this is
-mathematically equivalent to a **lazy-evaluated token bucket** with
-`capacity = rate × 1 s`, step-function refill at window boundary:
-
-```rust
-struct AdmissionState {
-    window_start: Instant,   // updated only when elapsed >= 1 s
-    fg_bytes: u64,           // bumped per account_fg call
-    bg_bytes: u64,           // bumped per account_bg call
-}
-```
-
-Every `account_xx(bytes)` call:
-
-1. acquire `parking_lot::Mutex<AdmissionState>` (uncontended ~15 ns)
-2. if `window_start.elapsed() >= 1 s`: reset window
-   (`window_start = Instant::now()`, `fg_bytes = 0`, `bg_bytes = 0`)
-3. `xx_bytes += bytes`
-4. compute `target_secs = xx_bytes / xx_rate_bytes_per_sec`
-5. compute `elapsed = window_start.elapsed()` (vDSO `clock_gettime`)
-6. `sleep_for = max(0, target_secs - elapsed)`
-7. **drop the lock** (NEVER held across .await)
-8. `compio::time::sleep(sleep_for).await` if non-zero
-
-`Instant::elapsed()` is a vDSO `clock_gettime(CLOCK_MONOTONIC)` call
-(~20 ns user-space, no syscall). The `window_start` field updates only
-once per second, so the lock-internal write set is just `fg_bytes` /
-`bg_bytes` per call — same atomic-write count as a continuous-refill
-token bucket would have.
-
-### Why "fixed-window" not classic continuous token bucket
-
-Same write count, simpler mental model, less state. Trade-off: at the
-1-second boundary you can write `rate` bytes in 0.001 s, then again
-right after the boundary — peak 2× rate over a 0.002 s span. For our
-workloads (256 MB compact chunks + 4 MiB GC batches), this micro-burst
-is a feature: a single chunk doesn't get sliced across windows.
-
-### Two-class extension (F189)
-
-`account_fg(bytes).await`:
-- `fg_rate = 0` (default unlimited): single Mutex acquire + atomic add,
-  no sleep. Designed to be cheap on the FG hot path.
-- `fg_rate > 0`: sleeps to fit FG ceiling, same algorithm as above.
-
-`account_bg(bytes).await`: sleeps until BOTH constraints hold:
-1. **bg's own rate ceiling** — same fixed-window logic
-2. **fg-aware yield** — when `fg_observed_rate = fg_bytes / elapsed`
-   exceeds `fg_saturated_ratio × fg_rate` (default 0.8), bg waits for
-   the remainder of the current 1-s window. Disabled when `fg_rate = 0`
-   (no baseline to detect saturation).
-
-`fg_bytes` is incremented BEFORE `account_fg` sleeps — so a long FG
-sleep that intends to write a lot of bytes immediately bumps the
-"observed rate" that BG sees. This implements CockroachDB
-`kvadmission`'s "fg expresses intent, bg yields immediately" semantic
-without any cross-task signaling.
-
-### parking_lot::Mutex constraint
-
-The lock is `parking_lot::Mutex`, NOT async-aware. Holding the guard
-across `.await` would deadlock the compio runtime (same thread =
-recursive lock = futex_wait on self). Pattern in
-`account_fg` / `account_bg`:
+Each rate dimension uses the same shape: a 1-s wall-clock window with
+step-function reset, lazy `Instant::elapsed()` checks (vDSO
+`clock_gettime`, ~20 ns user-space). The `parking_lot::Mutex` guards
+synchronous accounting only — the sleep happens OUTSIDE the lock
+(holding a non-async mutex across `.await` would deadlock the compio
+runtime, same thread = recursive lock = futex_wait on self):
 
 ```rust
 let sleep_for = {
-    let mut s = self.state.lock();    // acquire
-    // synchronous accounting only
+    let mut s = self.state.lock();
+    Self::maybe_reset_window(&mut s);
+    s.<dim>_bytes += bytes;
     compute_sleep(&mut s)
-};                                     // guard dropped here
+};                                  // guard dropped here
 if let Some(d) = sleep_for {
-    compio::time::sleep(d).await;     // await OUTSIDE lock
+    compio::time::sleep(d).await;   // await OUTSIDE lock
 }
 ```
 
-Guard scope is wrapped in an explicit block to make the drop visible
-to reviewers.
+Trade-off vs continuous-refill token bucket: at the 1-s boundary you
+can burst 2× rate over a ~2 ms window. For our workloads (256 MB
+compact chunks + 4 MiB GC batches) this is a feature — a single chunk
+never gets sliced across windows.
 
-### Wire sites (where account_xx is actually called)
+### Industry comparison (legacy F189 notes)
 
-**Foreground (1 site):**
-- `background.rs:start_write_batch` — at the end of Phase 1, before
-  the Phase 2 `append_segments` future is launched. Once per batch
-  (≤ 256 ops), so per-op overhead is ~0.4 ns amortized.
-
-**Background (3 sites):**
-- `background.rs:do_compact` — `account_bg(chunk_bytes)` before each
-  `compact_row_append` (chunk-emit + final-emit, each ~256 MB)
-- `background.rs:flush_gc_batch` — after `append_segments`, before
-  returning. ~4 MiB GC rewrite batches.
-- `background.rs:run_gc` — after each 64 MiB chunk read of the sealed
-  log_stream extent. Throttles GC's READ side so it doesn't saturate
-  extent-node fanout.
-
-F141's per-partition `GcRateLimiter` is preserved as an inner cap (so
-GC has both PS-wide and per-partition limits). Defense in depth.
-
-### Configuration
-
-```bash
-AUTUMN_PS_FG_RATE_BYTES_PER_SEC=0          # unlimited (default)
-AUTUMN_PS_BG_RATE_BYTES_PER_SEC=268435456  # 256 MiB/s default
-AUTUMN_PS_FG_SATURATED_THRESHOLD=0.8       # bg yields when fg
-                                            # observed > 0.8 × fg_rate
-```
-
-### Industry comparison
-
-The closest production analogs:
-
-- **RocksDB `GenericRateLimiter`** (`util/rate_limiter.cc`): same
-  fixed-window + sleep design, 100 ms refill period (vs our 1 s),
-  separate high/low priority queues (vs our fg/bg counters).
+- **RocksDB `GenericRateLimiter`**: fixed-window + sleep, 100 ms refill,
+  separate hi/lo priority queues.
 - **TiKV `file_system::RateLimiter`**: direct port of RocksDB.
-- **Linux cgroups `blkio.throttle.{read,write}_bps_device`** (kernel,
-  `block/blk-throttle.c`): same fixed-window slice + jiffies-based
-  reset. We are essentially the user-space equivalent.
-- **PostgreSQL VACUUM cost-based delay**: same intent (background
-  work yields), implemented as credit accumulation + fixed sleep
-  rather than proportional sleep.
-- **CockroachDB `kvadmission`**: the inspiration for our fg/bg split.
-  Far more sophisticated (multi-priority levels, multi-class granters,
-  dynamic disk-bandwidth feedback, ~3000 lines Go); we ship the
-  minimum viable subset (~50 lines Rust).
-- **Cassandra 4.x compaction throttle**: switched from naive
-  byte-then-sleep to Guava `SmoothBursty` (continuous-refill token
-  bucket). Continuous refill smooths the boundary jitter our
-  fixed-window has.
-- **Nginx `limit_req`**: leaky bucket (no burst allowed). Different
-  goal (HTTP request gating vs background bandwidth budgeting).
+- **Linux cgroups `blkio.throttle`**: kernel-side fixed-window slice
+  with jiffies reset — we're the user-space equivalent.
+- **CockroachDB `kvadmission`**: inspiration for fg/bg + fg-aware yield.
+  Far more sophisticated; we ship the minimum viable subset.
 
-If we ever need multi-priority + dynamic disk-bandwidth reflection,
-follow CockroachDB `kvadmission`'s structure. The fg/bg counter
-fields are already laid out for extension.
+If we ever need multi-priority + dynamic disk-bandwidth feedback,
+follow CockroachDB's structure. The four counters in `RateState` are
+already laid out for extension.
 
-### Race-review history (F189-fix + F189-fix-r2)
+### Cooldown / scheduler invariants (F189-fix race-review notes)
 
-Two rounds of distributed-system race review on F187/F188/F189 found
-7 bugs total, all fixed. AdmissionController itself was cleared on
-both passes (Mutex never held across .await; window-reset boundary
-race-free; cross-partition shared state intentional). The bugs were
-in the surrounding scheduler / cooldown logic. Notes:
-- `last_gc_at` / `last_compact_at` MUST be stamped on every gc/compact
-  loop iteration that ran the eligibility check (not just on success),
-  or the scheduler's cooldown gate gets stuck and re-dispatches every
-  5 s.
+Distributed-system race review of F187/F188/F189 found 7 bugs in
+surrounding scheduler/cooldown logic (the controller itself was clean):
+- `last_gc_at` / `last_compact_at` MUST be stamped on every loop
+  iteration that ran eligibility check (not just on success) — the
+  scheduler's cooldown gate gets stuck and re-dispatches every 5 s
+  otherwise.
 - `*_inflight` flags MUST be latched at receive-arm top (not after
-  gate.acquire), to prevent the scheduler from firing duplicates
-  during the manager-RPC pre-flight.
+  `acquire`), to prevent the scheduler from firing duplicates during
+  the manager-RPC pre-flight.
 - The compact channel's `bool` payload means `is_major`; receivers
   drain backlog and OR-merge to handle futures-channel's `cap +
   num_senders` semantics.
 - The scheduler reads `req_count_monotonic` (never-reset) for the
-  fg-quota gate; `req_count` (swap-reset by report_load_loop) is
+  fg-quota gate; `req_count` (swap-reset by `report_load_loop`) is
   unsafe for diff-based rate calc.
 
 ## Partition Split
