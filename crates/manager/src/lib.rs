@@ -1106,19 +1106,39 @@ impl AutumnManager {
     /// concentrated load on the first `count` nodes by ID — e.g. a 4-node
     /// cluster {1,3,5,7} with 3-replica streams placed every extent on
     /// {1,3,5}, leaving node 7 idle until one of the first three failed.
+    ///
+    /// F190: `exclude_node_ids` carries the writer's per-stream "recently
+    /// failed" set (30 s TTL on the client). Filter the candidate pool by
+    /// this set BEFORE the online-disk filter; if the result is too small
+    /// to satisfy `count`, drop the exclusion and retry — never block
+    /// allocation on a stale exclude.
     fn select_nodes(
         nodes: &HashMap<u64, MgrNodeInfo>,
         disks: &HashMap<u64, MgrDiskInfo>,
         count: usize,
+        exclude_node_ids: &[u64],
     ) -> Result<Vec<MgrNodeInfo>, AppError> {
         use rand::seq::SliceRandom;
-        let all: Vec<MgrNodeInfo> = nodes.values().cloned().collect();
-        if all.len() < count {
+        let all_unfiltered: Vec<MgrNodeInfo> = nodes.values().cloned().collect();
+        if all_unfiltered.len() < count {
             return Err(AppError::Precondition(format!(
                 "not enough nodes: need {count}, got {}",
-                all.len()
+                all_unfiltered.len()
             )));
         }
+        let exclude_set: HashSet<u64> = exclude_node_ids.iter().copied().collect();
+        let after_exclude: Vec<MgrNodeInfo> = all_unfiltered
+            .iter()
+            .filter(|n| !exclude_set.contains(&n.node_id))
+            .cloned()
+            .collect();
+        // F190: only honor the exclude set if at least `count` non-excluded
+        // nodes remain — otherwise stale excludes would block allocation.
+        let all = if after_exclude.len() >= count {
+            after_exclude
+        } else {
+            all_unfiltered
+        };
         let healthy: Vec<MgrNodeInfo> = all
             .iter()
             .filter(|n| {
@@ -2771,6 +2791,7 @@ mod tests {
                 owner_key,
                 revision: rev,
                 end: 100,
+                exclude_node_ids: vec![],
             });
             let resp = m.handle_stream_alloc_extent(req).await.unwrap();
             let r: StreamAllocExtentResp = rkyv_decode(&resp).unwrap();
@@ -3695,7 +3716,7 @@ mod tests {
         const ITERS: usize = 1000;
         let mut counts: HashMap<u64, usize> = HashMap::new();
         for _ in 0..ITERS {
-            let picked = AutumnManager::select_nodes(&nodes, &disks, 3).unwrap();
+            let picked = AutumnManager::select_nodes(&nodes, &disks, 3, &[]).unwrap();
             assert_eq!(picked.len(), 3);
             let mut ids: Vec<u64> = picked.iter().map(|n| n.node_id).collect();
             ids.sort();
@@ -3738,7 +3759,7 @@ mod tests {
 
         let mut first_node_seen: HashSet<u64> = HashSet::new();
         for _ in 0..200 {
-            let picked = AutumnManager::select_nodes(&nodes, &disks, 1).unwrap();
+            let picked = AutumnManager::select_nodes(&nodes, &disks, 1, &[]).unwrap();
             first_node_seen.insert(picked[0].node_id);
         }
         assert!(
@@ -4242,6 +4263,7 @@ mod tests {
                 owner_key: owner_key.clone(),
                 revision,
                 end: 100,
+                exclude_node_ids: vec![],
             });
             let resp = m.handle_stream_alloc_extent(req).await.unwrap();
             let r: StreamAllocExtentResp = rkyv_decode(&resp).unwrap();
@@ -4316,6 +4338,7 @@ mod tests {
                 owner_key: owner_key.clone(),
                 revision,
                 end: 100,
+                exclude_node_ids: vec![],
             });
             let resp = m.handle_stream_alloc_extent(req).await.unwrap();
             let r: StreamAllocExtentResp = rkyv_decode(&resp).unwrap();

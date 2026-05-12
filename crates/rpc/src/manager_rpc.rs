@@ -377,6 +377,13 @@ pub struct StreamAllocExtentReq {
     pub owner_key: String,
     pub revision: i64,
     pub end: u32,
+    /// F190: per-stream "recently failed" node ids the writer wants the
+    /// manager to skip when picking nodes for the new extent. Empty Vec
+    /// means "no exclusions" (legacy / cold-start clients). The manager
+    /// filters candidate nodes by this set before scoring; if the filter
+    /// empties the pool, it falls back to the full set rather than
+    /// blocking allocation on stale excludes.
+    pub exclude_node_ids: Vec<u64>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]

@@ -174,6 +174,7 @@ fn ec_2_1_failover_and_recovery() {
                     owner_key: client.owner_key().to_string(),
                     revision: client.revision(),
                     end: result.end,
+                    exclude_node_ids: vec![],
                 }),
             )
             .await

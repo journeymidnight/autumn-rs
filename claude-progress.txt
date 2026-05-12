@@ -1,65 +1,43 @@
 Date: 2026-05-12
-TaskStatus: completed
-Task scope: F190-F193 — design entries written to feature_list.md.
-            No code in this commit; entries documented as deferred-work
-            so the next session can pick them up cleanly.
+TaskStatus: not_completed
+Task scope: F190-F193 — multi-feature loop. F190 implemented + tested
+            and ready to commit; F191-F193 still to go.
 
-Conversation context:
-  Live cluster (4 extent-nodes + 1 PS at 127.0.0.1) was running
-  gallery thumb-generation traffic. Operator observed:
-    1. `info` showed `disk-3 online=false` on extent-node 9103
-       even though the process was alive. manager.log showed flap:
-       online → offline → online → offline within 90 s windows.
-    2. `forcegc 27 24` printed success but no GC ran. Diagnosis:
-       partition 27's log_stream id is 24 (NOT an extent_id). The
-       Force branch in background.rs filters extent_ids ∉ sealed_log_extents
-       and silently produces an empty `holes` set; there is no warn log.
-    3. Per-extent-node RSS at 369–770 MB; previous peak observed at
-       ~3 GB during EC conversion of a 3.2 GB extent.
+F190 done in this commit:
+  - StreamAllocExtentReq.exclude_node_ids field (rkyv schema extension)
+  - StreamClient per-stream bad_nodes map (Rc<RefCell<>> shared between
+    worker apply_completion path and public-API alloc_new_extent_once)
+  - StreamTail.replica_node_ids parallel to replica_addrs
+  - apply_completion marks failing replica node_id on Err (skips
+    LockedByOther — control-plane fence event, not health signal)
+  - 30 s TTL (env: AUTUMN_STREAM_BAD_NODES_TTL_SECS, clamped 1-600 s)
+  - select_nodes + fallback walk filter by exclude_node_ids; fall back
+    to unfiltered set if exclusion under-fills the pool
+  - 5 new unit tests: 3 bad_nodes semantics + 2 wire-compat round trip
+  - 45/45 stream lib + 58/58 manager lib + 13/13 rpc lib all green
+  - 2 pre-existing flaky f099i_* partition-server timing tests remain
+    failing pre-F190 (verified via git stash baseline)
 
-Root cause for the flap:
-  Manager's `disk_status_update_loop` (recovery.rs:445) calls
-  `conn_pool.call(EXT_MSG_DF, ...)` — the `// F121: bound df at 5 s`
-  comment is wrong; the call has no timeout. Single failure marks
-  all of that node's disks offline. Under heavy data-plane load
-  (CONVERT_TO_EC, COPY_EXTENT) the shared `ConnPool` connection
-  to the extent-node is monopolized; DF queues, the background
-  reader/writer task in autumn-rpc may exit on a transient TCP
-  hiccup, and the next DF returns `ConnectionClosed`. Next 10 s
-  tick succeeds → online again. Repeat.
+Next steps (this loop):
+  F191: ExtentNode bind 2nd listener at port+1000; --control-port flag.
+        MgrNodeInfo.control_address rkyv schema extension.
+        Manager carries control_pool: Rc<ConnPool>.
+        disk_status_update_loop + recovery_collect_loop DF calls switch
+        to control_pool. Replace conn_pool.call(EXT_MSG_DF) with
+        control_pool.call_timeout(..., 5s) — longstanding P0 bug fix.
+        cluster.sh + autumn-client info display both addresses.
+  F192: depends on F191. New MSG_REPORT_DISK_FAILURE over control_pool;
+        StreamClient fires fire-and-forget on apply_completion Err.
+        Manager 60 s window, 3-distinct-reporter_part_id quorum →
+        mark_node_disks_offline. disk_status_update_loop success
+        clears the entry.
+  F193: independent. Pipelined EC encode (Option B, 2-chunk inflight),
+        chunked recovery/copy_extent, jemallocator with dirty_decay_ms.
 
-Real fix is not "fix the timeout + add a flap counter" — by the
-time the polling loop gets right, alloc has already bounced 3
-times against the failed disk because alloc decisions happen
-in milliseconds while DF polling is 10 s. The right fix is to
-make the data-plane failure signal flow back to manager in real
-time and to give per-call alloc retries direct knowledge of which
-nodes just failed.
-
-Plan documented in feature_list.md (passes:false):
-  F190: per-stream `bad_nodes` exclusion — StreamClient passes
-        recently-failed node_ids to manager's alloc handler.
-        Self-healing per stream, no manager state change.
-        TTL 30 s, no clear-on-success.
-  F191: ExtentNode binds a second listener (port +1000); manager
-        carries a separate `control_pool`; DF + future heartbeat
-        + REPORT_DISK_FAILURE travel on it. Carries the
-        long-standing P0 timeout fix for DF.
-  F192: New `MSG_REPORT_DISK_FAILURE` over `control_pool`.
-        Manager debounces with quorum (3 distinct partition_ids
-        within 60 s) before flipping `disk.online`. Does NOT
-        trigger require_recovery immediately — leaves it to the
-        existing dispatch loop.
-  F193: Streaming EC encode + chunked recovery to bound
-        extent-node RSS. Peak EC convert ~7 GB → target < 1.5 GB.
-        Independent of F190/F191/F192.
-
-Files changed in this commit:
-  feature_list.md  — F190, F191, F192, F193 entries
-  claude-progress.txt — this file
-
-Next steps:
-  Begin F190 implementation: rkyv field-extend on
-  StreamAllocExtentReq, StreamClient bad_nodes map + integration
-  with apply_completion + alloc_new_extent, manager-side filter
-  in handle_stream_alloc_extent.
+Conversation context (carried from prior commit):
+  Live cluster (4 extent-nodes + 1 PS at 127.0.0.1) showed
+    1. disk-3 flap on extent-node 9103 (root cause: shared ConnPool
+       backpressure under EC convert; F191 fixes via control_pool).
+    2. forcegc 27 24 silent no-op (separate issue, deferred).
+    3. extent-node RSS at 369-770 MB steady, ~3 GB peak during EC
+       convert (F193 fixes).

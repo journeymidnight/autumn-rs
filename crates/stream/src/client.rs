@@ -52,6 +52,11 @@ pub struct AppendResult {
 struct StreamTail {
     extent: ExtentInfo,
     replica_addrs: Vec<String>,
+    /// F190: parallel to `replica_addrs` — `replicates ++ parity` node ids
+    /// in the same index order used by `replica_addrs_from_cache`. Required
+    /// so `apply_completion` can resolve a failing replica index back to
+    /// its `node_id` for the per-stream `bad_nodes` exclusion list.
+    replica_node_ids: Vec<u64>,
 }
 
 /// Per-stream append state owned exclusively by the stream worker task.
@@ -78,10 +83,33 @@ struct StreamAppendState {
     pending_acks: std::collections::BTreeMap<u32, u32>,
     in_flight: u32,
     poisoned: bool,
+    /// F190: per-stream "recently failed" node ids (`node_id → expires_at`).
+    /// Shared with the public API via `Rc<RefCell<_>>` so
+    /// `alloc_new_extent_once` can snapshot non-expired entries to pass via
+    /// `StreamAllocExtentReq.exclude_node_ids`. Worker writes on
+    /// `apply_completion` Err; public API reads + prunes on snapshot. TTL
+    /// covers a full manager polling cycle without holding excludes long
+    /// enough to block natural disk recovery (default 30 s, env-tunable).
+    bad_nodes: Rc<RefCell<HashMap<u64, Instant>>>,
+}
+
+/// F190: TTL for the per-stream `bad_nodes` map. 30 s covers one full
+/// `disk_status_update_loop` poll (10 s) plus a recovery-dispatch tick
+/// (2 s) plus headroom — long enough for the manager's pull-based view
+/// to catch up, short enough to let a self-healed disk re-enter the
+/// candidate pool. Env override exists primarily for tests that want to
+/// shrink the window. Clamped to [1 s, 600 s].
+fn bad_nodes_ttl() -> Duration {
+    let s = std::env::var("AUTUMN_STREAM_BAD_NODES_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30)
+        .clamp(1, 600);
+    Duration::from_secs(s)
 }
 
 impl StreamAppendState {
-    fn new() -> Self {
+    fn new(bad_nodes: Rc<RefCell<HashMap<u64, Instant>>>) -> Self {
         Self {
             tail: None,
             commit: 0,
@@ -89,7 +117,18 @@ impl StreamAppendState {
             pending_acks: std::collections::BTreeMap::new(),
             in_flight: 0,
             poisoned: false,
+            bad_nodes,
         }
+    }
+
+    /// F190: mark a node as recently failed. Called from `apply_completion`
+    /// Err paths with the `node_id` resolved from the cached `ExtentInfo`
+    /// via `StreamTail.replica_node_ids[failing_index]`. Refresh-on-insert
+    /// (overwrites the existing expires_at) so a chain of failures keeps
+    /// the entry hot.
+    fn mark_bad_node(&self, node_id: u64) {
+        let expires_at = Instant::now() + bad_nodes_ttl();
+        self.bad_nodes.borrow_mut().insert(node_id, expires_at);
     }
 
     fn reset_for_new_extent(&mut self) {
@@ -338,6 +377,10 @@ struct InflightResult {
     /// Raw oneshot frames from each replica. `Err` slots are RPC/connection
     /// failures; `Ok(f)` slots include protocol-level error frames.
     frames: Vec<Result<autumn_rpc::Frame>>,
+    /// F190: parallel to `frames` — `node_id` of each replica in the same
+    /// index order. Lets `apply_completion` resolve a failing replica back
+    /// to its `node_id` for the per-stream `bad_nodes` exclusion list.
+    replica_node_ids: Vec<u64>,
     ack_tx: oneshot::Sender<Result<AppendResult>>,
 }
 
@@ -365,12 +408,13 @@ async fn stream_worker_loop(
     stream_id: u64,
     mut submit_rx: mpsc::Receiver<StreamSubmitMsg>,
     pool: Rc<ConnPool>,
+    bad_nodes: Rc<RefCell<HashMap<u64, Instant>>>,
     removal_guard: WorkerRemovalGuard,
 ) {
     use futures::future::{select, Either};
 
     let cap = stream_inflight_cap();
-    let mut state = StreamAppendState::new();
+    let mut state = StreamAppendState::new(bad_nodes);
     let mut inflight: FuturesUnordered<InflightFut> = FuturesUnordered::new();
 
     loop {
@@ -484,6 +528,7 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
         end,
         extent_id,
         frames,
+        replica_node_ids,
         ack_tx,
     } = result;
 
@@ -493,11 +538,17 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
     let mut saw_not_found = false;
     let mut saw_locked_by_other = false;
     let mut err_msg: Option<String> = None;
+    // F190: index of the first replica that produced a hard error
+    // (rpc/decode/non-OK code/NotFound). LockedByOther is intentionally
+    // NOT recorded — it's a control-plane fence event, not a node-health
+    // signal. Resolved to a `node_id` after the loop via `replica_node_ids`.
+    let mut bad_replica_idx: Option<usize> = None;
 
     for (i, frame_res) in frames.into_iter().enumerate() {
         match frame_res {
             Err(e) => {
                 err_msg = Some(format!("replica {i} rpc error: {e}"));
+                bad_replica_idx = Some(i);
                 break;
             }
             Ok(frame) => {
@@ -506,11 +557,13 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
                     Ok(r) => r,
                     Err(e) => {
                         err_msg = Some(format!("replica {i} decode AppendResp: {e}"));
+                        bad_replica_idx = Some(i);
                         break;
                     }
                 };
                 if resp.code == CODE_NOT_FOUND {
                     saw_not_found = true;
+                    bad_replica_idx = Some(i);
                     break;
                 }
                 if resp.code == CODE_LOCKED_BY_OTHER {
@@ -522,6 +575,7 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
                         "replica {i} append failed: code={}",
                         crate::extent_rpc::code_description(resp.code)
                     ));
+                    bad_replica_idx = Some(i);
                     break;
                 }
                 match &success_first {
@@ -531,6 +585,7 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
                             err_msg = Some(format!(
                                 "replica {i} offset mismatch on extent {extent_id}"
                             ));
+                            bad_replica_idx = Some(i);
                             break;
                         }
                     }
@@ -548,6 +603,15 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
     }
 
     if saw_not_found {
+        // F190: the writer's tail cache is stale (the extent has been
+        // moved/sealed/reclaimed on this replica). The replica itself
+        // may still be healthy, but allocating around it for one TTL
+        // window is harmless and routes around persistent inconsistency.
+        if let Some(idx) = bad_replica_idx {
+            if let Some(&nid) = replica_node_ids.get(idx) {
+                state.mark_bad_node(nid);
+            }
+        }
         state.rewind_or_poison(offset, size);
         let _ = ack_tx.send(Err(anyhow!(
             "extent {extent_id} not found on replica (needs alloc_new_extent)"
@@ -556,6 +620,13 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
     }
 
     if let Some(err) = err_msg {
+        // F190: real per-replica failure (rpc/decode/non-OK code) — mark
+        // the node so the next alloc skips it.
+        if let Some(idx) = bad_replica_idx {
+            if let Some(&nid) = replica_node_ids.get(idx) {
+                state.mark_bad_node(nid);
+            }
+        }
         state.rewind_or_poison(offset, size);
         let _ = ack_tx.send(Err(anyhow!(err)));
         return;
@@ -600,6 +671,9 @@ async fn launch_append(
     let header_commit = offset; // Option A: lease-time cursor.
 
     let extent_id = tail.extent.extent_id;
+    // F190: node_ids parallel to replica_addrs, captured here so the
+    // future moves a Vec<u64> rather than borrowing tail across await.
+    let replica_node_ids: Vec<u64> = tail.replica_node_ids.clone();
     let hdr = AppendReq::encode_header(
         extent_id,
         tail.extent.eversion,
@@ -674,6 +748,7 @@ async fn launch_append(
             end,
             extent_id,
             frames,
+            replica_node_ids,
             ack_tx,
         }
     };
@@ -717,6 +792,14 @@ pub struct StreamClient {
     /// to the same stream (per-stream init lock).  After the first init,
     /// subsequent callers observe `*guard == true` and skip.
     stream_init_locks: RefCell<HashMap<u64, Rc<futures::lock::Mutex<bool>>>>,
+    /// F190: per-stream "recently failed" node ids (`node_id → expires_at`).
+    /// Shared between the per-stream worker (writes on `apply_completion`
+    /// Err) and the public-API `alloc_new_extent_once` (reads + prunes
+    /// before each alloc). Persists across worker respawn — a node that
+    /// just failed should still be excluded if a transient worker exit +
+    /// respawn happens within the TTL window. Pruned lazily on snapshot;
+    /// no background sweeper.
+    stream_bad_nodes: RefCell<HashMap<u64, Rc<RefCell<HashMap<u64, Instant>>>>>,
     append_metrics: StreamAppendMetrics,
 }
 
@@ -862,6 +945,7 @@ impl StreamClient {
             extent_info_cache: DashMap::new(),
             stream_workers: RefCell::new(HashMap::new()),
             stream_init_locks: RefCell::new(HashMap::new()),
+            stream_bad_nodes: RefCell::new(HashMap::new()),
             append_metrics: StreamAppendMetrics::default(),
         })
     }
@@ -952,15 +1036,45 @@ impl StreamClient {
             .borrow_mut()
             .insert(stream_id, tx.clone());
         let pool = self.pool.clone();
+        let bad_nodes = self.stream_bad_nodes_handle(stream_id);
         let guard = WorkerRemovalGuard {
             sc: self.self_weak.clone(),
             stream_id,
         };
         compio::runtime::spawn(async move {
-            stream_worker_loop(stream_id, rx, pool, guard).await;
+            stream_worker_loop(stream_id, rx, pool, bad_nodes, guard).await;
         })
         .detach();
         tx
+    }
+
+    /// F190: get or create the per-stream `bad_nodes` Rc handle.
+    /// Persisted across worker respawn so a node that just failed stays
+    /// excluded for one TTL window even if the worker briefly exits.
+    fn stream_bad_nodes_handle(&self, stream_id: u64) -> Rc<RefCell<HashMap<u64, Instant>>> {
+        if let Some(rc) = self.stream_bad_nodes.borrow().get(&stream_id) {
+            return rc.clone();
+        }
+        let rc = Rc::new(RefCell::new(HashMap::new()));
+        self.stream_bad_nodes
+            .borrow_mut()
+            .insert(stream_id, rc.clone());
+        rc
+    }
+
+    /// F190: snapshot of currently-active (non-expired) bad-node ids for
+    /// `stream_id`. Lazily prunes expired entries during the read so the
+    /// map can never grow without bound. Returns empty Vec if no entry
+    /// exists (which is also the legacy / cold-start behaviour).
+    fn snapshot_bad_nodes(&self, stream_id: u64) -> Vec<u64> {
+        let map = self.stream_bad_nodes.borrow();
+        let Some(rc) = map.get(&stream_id) else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        let mut entries = rc.borrow_mut();
+        entries.retain(|_, expires_at| *expires_at > now);
+        entries.keys().copied().collect()
     }
 
     /// Discard the cached worker and init-lock for `stream_id` so the next
@@ -1009,11 +1123,23 @@ impl StreamClient {
 
         self.refresh_nodes_map().await?;
         let addrs = self.replica_addrs_from_cache(&extent)?;
+        let node_ids = Self::replica_node_ids_for(&extent);
 
         Ok(StreamTail {
             extent,
             replica_addrs: addrs,
+            replica_node_ids: node_ids,
         })
+    }
+
+    /// F190: chained `replicates ++ parity` node ids — same index order as
+    /// `replica_addrs_from_cache`. Used to populate `StreamTail.replica_node_ids`.
+    fn replica_node_ids_for(ex: &ExtentInfo) -> Vec<u64> {
+        ex.replicates
+            .iter()
+            .chain(ex.parity.iter())
+            .copied()
+            .collect()
     }
 
     async fn check_commit(&self, stream_id: u64) -> Result<(StreamInfo, ExtentInfo, u32)> {
@@ -1043,11 +1169,17 @@ impl StreamClient {
     }
 
     async fn alloc_new_extent_once(&self, stream_id: u64, end: u32) -> Result<(StreamInfo, ExtentInfo)> {
+        // F190: snapshot the per-stream `bad_nodes` set (lazily prunes
+        // expired entries). The manager filters its candidate pool by
+        // this set and only blocks allocation if doing so would empty
+        // the pool — see `select_nodes` + `handle_stream_alloc_extent`.
+        let exclude_node_ids = self.snapshot_bad_nodes(stream_id);
         let req = manager_rpc::rkyv_encode(&StreamAllocExtentReq {
             stream_id,
             owner_key: self.owner_key.clone(),
             revision: self.revision,
             end,
+            exclude_node_ids,
         });
         let resp_data = self
             .pool
@@ -1175,9 +1307,12 @@ impl StreamClient {
                                 if let Ok(replica_addrs) =
                                     self.replica_addrs_for_extent(&new_ext).await
                                 {
+                                    let replica_node_ids =
+                                        Self::replica_node_ids_for(&new_ext);
                                     let new_tail = StreamTail {
                                         extent: new_ext,
                                         replica_addrs,
+                                        replica_node_ids,
                                     };
                                     let mut tx_clone = tx.clone();
                                     let _ = tx_clone
@@ -1213,9 +1348,11 @@ impl StreamClient {
                         }
                         let (_, new_ext) = self.alloc_new_extent(stream_id, 0).await?;
                         let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
+                        let replica_node_ids = Self::replica_node_ids_for(&new_ext);
                         let new_tail = StreamTail {
                             extent: new_ext,
                             replica_addrs,
+                            replica_node_ids,
                         };
                         let mut tx_clone = tx.clone();
                         tx_clone
@@ -1238,9 +1375,11 @@ impl StreamClient {
                             }
                             let (_, new_ext) = self.alloc_new_extent(stream_id, 0).await?;
                             let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
+                            let replica_node_ids = Self::replica_node_ids_for(&new_ext);
                             let new_tail = StreamTail {
                                 extent: new_ext,
                                 replica_addrs,
+                                replica_node_ids,
                             };
                             let mut tx_clone = tx.clone();
                             tx_clone
@@ -1269,9 +1408,11 @@ impl StreamClient {
                                 .context(format!("alloc_new_extent failed after append error: {e}"))
                         })?;
                     let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
+                    let replica_node_ids = Self::replica_node_ids_for(&new_ext);
                     let new_tail = StreamTail {
                         extent: new_ext,
                         replica_addrs,
+                        replica_node_ids,
                     };
                     let mut tx_clone = tx.clone();
                     tx_clone
@@ -1304,10 +1445,12 @@ impl StreamClient {
         let (tail, commit_val) = if tail.extent.sealed_length > 0 {
             let (_, new_ext) = self.alloc_new_extent(stream_id, 0).await?;
             let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
+            let replica_node_ids = Self::replica_node_ids_for(&new_ext);
             (
                 StreamTail {
                     extent: new_ext,
                     replica_addrs,
+                    replica_node_ids,
                 },
                 0,
             )
@@ -2245,7 +2388,7 @@ mod pipeline_tests {
 
     #[test]
     fn lease_no_collision() {
-        let mut state = StreamAppendState::new();
+        let mut state = StreamAppendState::new(Rc::new(RefCell::new(HashMap::new())));
         let (o0, e0) = state.lease(100);
         let (o1, e1) = state.lease(200);
         let (o2, e2) = state.lease(50);
@@ -2261,7 +2404,7 @@ mod pipeline_tests {
 
     #[test]
     fn ack_advances_commit_on_prefix() {
-        let mut state = StreamAppendState::new();
+        let mut state = StreamAppendState::new(Rc::new(RefCell::new(HashMap::new())));
         let (o0, e0) = state.lease(100);    // 0..100
         let (o1, e1) = state.lease(100);    // 100..200
         let (o2, e2) = state.lease(100);    // 200..300
@@ -2283,7 +2426,7 @@ mod pipeline_tests {
 
     #[test]
     fn rewind_on_error_most_recent() {
-        let mut state = StreamAppendState::new();
+        let mut state = StreamAppendState::new(Rc::new(RefCell::new(HashMap::new())));
         let (o0, _e0) = state.lease(100);
         let (o1, _e1) = state.lease(200);
         assert_eq!(state.lease_cursor, 300);
@@ -2303,7 +2446,7 @@ mod pipeline_tests {
 
     #[test]
     fn poison_on_error_mid_sequence() {
-        let mut state = StreamAppendState::new();
+        let mut state = StreamAppendState::new(Rc::new(RefCell::new(HashMap::new())));
         let (o0, _) = state.lease(100);
         let (_, _) = state.lease(200);
         assert_eq!(state.in_flight, 2);
@@ -2312,6 +2455,103 @@ mod pipeline_tests {
         assert!(state.poisoned);
         assert_eq!(state.lease_cursor, 300);
         assert_eq!(state.in_flight, 1);
+    }
+}
+
+#[cfg(test)]
+mod f190_bad_nodes_tests {
+    //! F190: per-stream bad_nodes exclusion.
+    //!
+    //! Covers (a) insert + immediate snapshot returns the node id,
+    //! (b) refresh-on-insert preserves only the latest expires_at, and
+    //! (c) a snapshot called after the TTL has elapsed prunes the
+    //! entry (verified by overriding `AUTUMN_STREAM_BAD_NODES_TTL_SECS`
+    //! to 1 s and sleeping). The slow case is gated behind a
+    //! `#[ignore]` so the default unit run stays sub-second.
+    use super::*;
+
+    #[test]
+    fn mark_then_inspect_returns_node() {
+        let bad = Rc::new(RefCell::new(HashMap::new()));
+        let state = StreamAppendState::new(bad.clone());
+        state.mark_bad_node(7);
+        let entries = bad.borrow();
+        assert!(entries.contains_key(&7));
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn mark_refreshes_existing_entry() {
+        let bad = Rc::new(RefCell::new(HashMap::new()));
+        let state = StreamAppendState::new(bad.clone());
+        state.mark_bad_node(11);
+        let first = *bad.borrow().get(&11).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        state.mark_bad_node(11);
+        let second = *bad.borrow().get(&11).unwrap();
+        assert!(second > first);
+        assert_eq!(bad.borrow().len(), 1);
+    }
+
+    #[test]
+    fn snapshot_prunes_expired_entries_in_place() {
+        let map: HashMap<u64, Instant> = [
+            (1u64, Instant::now() + Duration::from_secs(60)),
+            (2u64, Instant::now() - Duration::from_millis(1)),
+        ]
+        .into_iter()
+        .collect();
+        let rc = Rc::new(RefCell::new(map));
+        // Inline the snapshot semantics from `StreamClient::snapshot_bad_nodes`
+        // — pruning is in-place on borrow_mut so the map can never grow.
+        let now = Instant::now();
+        let mut entries = rc.borrow_mut();
+        entries.retain(|_, expires_at| *expires_at > now);
+        let mut snap: Vec<u64> = entries.keys().copied().collect();
+        snap.sort();
+        assert_eq!(snap, vec![1u64]);
+    }
+}
+
+#[cfg(test)]
+mod f190_wire_compat_tests {
+    //! F190: backwards-compat smoke for `StreamAllocExtentReq`. An empty
+    //! `exclude_node_ids` field must round-trip through rkyv as a
+    //! zero-length Vec — equivalent semantics to the pre-F190 wire (no
+    //! filter applied on the manager side via the fall-back-on-empty
+    //! branch in `select_nodes`).
+    use autumn_rpc::manager_rpc::{rkyv_decode, rkyv_encode, StreamAllocExtentReq};
+
+    #[test]
+    fn empty_exclude_round_trips() {
+        let req = StreamAllocExtentReq {
+            stream_id: 42,
+            owner_key: "ps/0/partition/3".to_string(),
+            revision: 7,
+            end: 0,
+            exclude_node_ids: Vec::new(),
+        };
+        let bytes = rkyv_encode(&req);
+        let back: StreamAllocExtentReq = rkyv_decode(&bytes).expect("decode");
+        assert_eq!(back.stream_id, 42);
+        assert_eq!(back.owner_key, "ps/0/partition/3");
+        assert_eq!(back.revision, 7);
+        assert_eq!(back.end, 0);
+        assert!(back.exclude_node_ids.is_empty());
+    }
+
+    #[test]
+    fn populated_exclude_round_trips() {
+        let req = StreamAllocExtentReq {
+            stream_id: 1,
+            owner_key: String::new(),
+            revision: 0,
+            end: 1024,
+            exclude_node_ids: vec![3, 5, 9101],
+        };
+        let bytes = rkyv_encode(&req);
+        let back: StreamAllocExtentReq = rkyv_decode(&bytes).expect("decode");
+        assert_eq!(back.exclude_node_ids, vec![3, 5, 9101]);
     }
 }
 

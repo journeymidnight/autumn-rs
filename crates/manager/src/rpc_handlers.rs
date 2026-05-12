@@ -355,7 +355,7 @@ impl AutumnManager {
 
         let (stream_id, extent_id, selected) = {
             let mut s = self.store.inner.borrow_mut();
-            let selected = match Self::select_nodes(&s.nodes, &s.disks, total_replicas) {
+            let selected = match Self::select_nodes(&s.nodes, &s.disks, total_replicas, &[]) {
                 Ok(v) => v,
                 Err(err) => {
                     return Ok(rkyv_encode(&CreateStreamResp {
@@ -811,7 +811,7 @@ impl AutumnManager {
             } else {
                 tail.replicates.len()
             };
-            let selected = match Self::select_nodes(&s.nodes, &s.disks, data) {
+            let selected = match Self::select_nodes(&s.nodes, &s.disks, data, &req.exclude_node_ids) {
                 Ok(v) => v,
                 Err(err) => {
                     return Ok(rkyv_encode(&StreamAllocExtentResp {
@@ -932,11 +932,24 @@ impl AutumnManager {
         let mut node_ids = Vec::with_capacity(selected.len());
         let mut disk_ids = Vec::with_capacity(selected.len());
         let selected_ids: HashSet<u64> = selected.iter().map(|n| n.node_id).collect();
-        let mut fallback_nodes: Vec<MgrNodeInfo> = nodes_map
+        // F190: prefer fallbacks not in the writer's recent-failure set; fall
+        // back to the unfiltered set if the exclusion would empty the iter.
+        let exclude_set: HashSet<u64> = req.exclude_node_ids.iter().copied().collect();
+        let unfiltered: Vec<MgrNodeInfo> = nodes_map
             .values()
             .filter(|n| !selected_ids.contains(&n.node_id))
             .cloned()
             .collect();
+        let after_exclude: Vec<MgrNodeInfo> = unfiltered
+            .iter()
+            .filter(|n| !exclude_set.contains(&n.node_id))
+            .cloned()
+            .collect();
+        let mut fallback_nodes = if after_exclude.is_empty() {
+            unfiltered
+        } else {
+            after_exclude
+        };
         // F144: walk fallbacks in random order — ID-sorted order
         // re-introduces the same low-ID bias that `select_nodes` was
         // changed to avoid.
@@ -1794,7 +1807,7 @@ impl AutumnManager {
                 } else {
                     3
                 };
-                let selected = Self::select_nodes(&s.nodes, &s.disks, target_replicas)?;
+                let selected = Self::select_nodes(&s.nodes, &s.disks, target_replicas, &[])?;
                 let new_tail = MgrExtentInfo {
                     extent_id: new_tail_id,
                     replicates: selected.iter().map(|n| n.node_id).collect(),

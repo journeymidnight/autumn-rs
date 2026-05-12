@@ -285,6 +285,7 @@ fn stream_manager_alloc_and_truncate_flow() {
                     owner_key: "owner/stream/1".to_string(),
                     revision: lock.revision,
                     end: 128,
+                    exclude_node_ids: vec![],
                 }),
             )
             .await
