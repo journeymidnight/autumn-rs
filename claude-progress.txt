@@ -1,37 +1,52 @@
 Date: 2026-05-12
-TaskStatus: not_completed
+TaskStatus: completed
 Task scope: F195 — eliminate env::var reads from production rs code,
-            route all config via CLI args. Multi-wave migration.
+            route all config via CLI args. All 5 waves shipped.
 
-Wave 1 (manager) — DONE this commit:
-  - AutumnManager fields: report_disk_failure_window: Cell<Duration>,
-    report_disk_failure_quorum: Cell<usize>. Defaults 60s / 3
-    (match F192 env defaults).
-  - Builder: set_report_disk_failure_config(window, quorum).
-  - handle_report_disk_failure reads from self fields, no env::var.
-  - Manager binary parses --report-disk-failure-window-secs and
-    --report-disk-failure-quorum, applies via builder.
-  - 4 F192 unit tests still pass (they use defaults).
+Final state:
+  $ grep -rn "std::env::var" crates/ --include="*.rs" \
+        | grep -v tests/ | grep -v OUT_DIR
+  → zero matches
 
-Waves remaining:
-  Wave 2 — autumn-stream:
-    client.rs: BAD_NODES_TTL_SECS, INFLIGHT_CAP, APPEND_TIMEOUT_MS,
-               READ_CHUNK_BYTES, SYNCED_POLL_MS, SYNCED_TIMEOUT_MS
-    extent_node.rs: EC_CONVERT_PARALLELISM, RECOVERY_PARALLELISM,
-                    INFLIGHT_CAP
-  Wave 3 — autumn-partition-server (~16 vars):
-    GROUP_COMMIT_CAP, INFLIGHT_CAP, BULK_INFLIGHT_CAP, MAX_IMM_DEPTH,
-    MAX_WAL_GAP, SHUTDOWN_TIMEOUT_MS, MAJOR_COMPACT_PARALLELISM,
-    FG_RATE_BYTES_PER_SEC, BG_RATE_BYTES_PER_SEC,
-    FG_SATURATED_THRESHOLD, FG_QPS_QUOTA, GC_DEBT_HIGH_BYTES,
-    COMPACT_PENDING_HIGH_BYTES, GC_COOLDOWN_SECS,
-    COMPACT_COOLDOWN_SECS, CONN_INFLIGHT_CAP, MIN_BATCH,
-    GC_READ_CHUNK_BYTES, GC_BATCH_RECORDS, GC_BATCH_BYTES,
-    GC_RATE_BYTES_PER_SEC
-  Wave 4 — autumn-rpc + binary-level:
-    AUTUMN_RPC_FRAME_V1 (rpc/frame.rs OnceLock cache),
-    AUTUMN_GROUP_COMMIT_CAP (autumn-client wbench),
-    AUTUMN_PPROF_* (autumn-ps debug knobs)
-  Wave 5 — cluster.sh + perf_check:
-    Replace `env | grep AUTUMN_` leak with explicit --flag translation
-    per binary.
+Per-wave summary:
+  Wave 1 (commit fbeb482): manager F192 quorum debounce → 2 vars
+  Wave 2 (commit 0357fc2): stream + extent-node binary → 11 vars
+  Wave 3 (this commit): partition-server → 21 vars
+  Wave 4 (this commit): rpc frame V1 + autumn-client + pprof → 4 vars
+  Wave 5 (this commit): autumn-ps CLI + cluster.sh translation
+
+  Cumulative: 38 of 38 env vars eliminated.
+
+Wave 3 design pattern:
+  Each `static CELL: OnceLock<T>` previously hidden inside an env-
+  reading helper function is now lifted to module scope:
+    static MAX_WRITE_BATCH_CELL: OnceLock<usize> = OnceLock::new();
+  Paired with:
+    pub fn set_max_write_batch(n: usize) -> bool {
+        MAX_WRITE_BATCH_CELL.set(n.clamp(...)).is_ok()
+    }
+  Reader stays the same shape, with the env::var() call replaced by
+  the constant default:
+    fn max_write_batch() -> usize {
+        *MAX_WRITE_BATCH_CELL.get_or_init(|| DEFAULT_MAX_WRITE_BATCH)
+    }
+  Binary main() calls every set_* before constructing PartitionServer
+  via apply_ps_tunables(&args). First-call-wins guarantees the binary
+  value lands.
+
+Workspace lib tests stable:
+  13 rpc + 50 stream + 62 manager + 131 PS lib pass
+  (2 pre-existing flaky f099i_* timing tests unchanged from F190-F194
+   baseline; they fail intermittently regardless of F195 changes)
+
+cluster.sh now translates AUTUMN_PS_* env vars into per-binary
+`--<flag>` invocations via the new launch_ps tunable_args array.
+The `env | grep AUTUMN_` snapshot in save_cluster_config is kept
+for restart fidelity (it captures operator intent at first start),
+but it no longer flows config into the binary through process env —
+the snapshot is sourced on restart, then translated to CLI flags
+the same way.
+
+Closes the F195 series. The "production rs code never reads env"
+project rule (recorded in memory) is now enforced by grep at the
+file level.

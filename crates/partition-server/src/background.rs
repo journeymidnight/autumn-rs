@@ -26,15 +26,46 @@ use crate::sstable::{IterItem, MergeIterator, SstBuilder, SstReader, TableIterat
 /// and pending typically can't reach 256 → second batch never launches →
 /// effective depth=1 per partition. Use `AUTUMN_PS_MIN_BATCH=32` or similar.
 const DEFAULT_MIN_PIPELINE_BATCH: usize = 256;
+// F195: process-global setter cells for the 5 background.rs knobs.
+// Pre-F195 each was an inner static OnceLock+env read; now lifted to
+// module scope with paired pub setters that the autumn-ps binary calls
+// from main() based on CLI args.
+pub(crate) static MIN_PIPELINE_BATCH_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+pub(crate) static GC_READ_CHUNK_BYTES_CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+pub(crate) static GC_BATCH_RECORDS_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+pub(crate) static GC_BATCH_BYTES_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+pub(crate) static GC_RATE_BYTES_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+pub fn set_min_pipeline_batch(n: usize) -> bool {
+    if n == 0 {
+        return false;
+    }
+    MIN_PIPELINE_BATCH_CELL.set(n).is_ok()
+}
+pub fn set_gc_read_chunk_bytes(n: u32) -> bool {
+    if n == 0 {
+        return false;
+    }
+    GC_READ_CHUNK_BYTES_CELL.set(n).is_ok()
+}
+pub fn set_gc_batch_records(n: usize) -> bool {
+    if !(1..=4096).contains(&n) {
+        return false;
+    }
+    GC_BATCH_RECORDS_CELL.set(n).is_ok()
+}
+pub fn set_gc_batch_bytes(n: usize) -> bool {
+    if !(64 * 1024..=256 * 1024 * 1024).contains(&n) {
+        return false;
+    }
+    GC_BATCH_BYTES_CELL.set(n).is_ok()
+}
+pub fn set_gc_rate_bytes_per_sec(n: u64) -> bool {
+    GC_RATE_BYTES_PER_SEC_CELL.set(n).is_ok()
+}
+
 pub(crate) fn min_pipeline_batch() -> usize {
-    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var("AUTUMN_PS_MIN_BATCH")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n >= 1 && n <= 10_000)
-            .unwrap_or(DEFAULT_MIN_PIPELINE_BATCH)
-    })
+    *MIN_PIPELINE_BATCH_CELL.get_or_init(|| DEFAULT_MIN_PIPELINE_BATCH)
 }
 pub(crate) const MIN_PIPELINE_BATCH: usize = DEFAULT_MIN_PIPELINE_BATCH;
 
@@ -1449,46 +1480,35 @@ pub(crate) fn valid_discard(discards: &mut HashMap<u64, i64>, extent_ids: &[u64]
 /// causing foreground put fanout against partitions sharing that node
 /// to time out at the StreamClient's 5 s ceiling. Smaller chunks keep
 /// the extent-node's read I/O slot returning often enough that
-/// foreground appends don't hit the timeout. Tunable via env.
+/// foreground appends don't hit the timeout. F195: overridable via
+/// `set_gc_read_chunk_bytes` (CLI flag `--gc-read-chunk-bytes`).
 fn gc_read_chunk_bytes() -> u32 {
-    std::env::var("AUTUMN_PS_GC_READ_CHUNK_BYTES")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(8 * 1024 * 1024)
+    *GC_READ_CHUNK_BYTES_CELL.get_or_init(|| 8 * 1024 * 1024)
 }
 
 /// F141: max records per GC append batch. Defaults to 256 to match
-/// `MAX_WRITE_BATCH` on the foreground put path.
+/// `MAX_WRITE_BATCH` on the foreground put path. F195: overridable
+/// via `set_gc_batch_records`.
 fn gc_batch_records() -> usize {
-    std::env::var("AUTUMN_PS_GC_BATCH_RECORDS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n >= 1 && n <= 4096)
-        .unwrap_or(256)
+    *GC_BATCH_RECORDS_CELL.get_or_init(|| 256)
 }
 
 /// F141: max bytes per GC append batch. Defaults to 4 MiB so a single
 /// `append_segments` payload is bounded regardless of how large the
 /// individual VP values are. Hit the records cap first on small VPs;
-/// hit the bytes cap first on large VPs.
+/// hit the bytes cap first on large VPs. F195: overridable via
+/// `set_gc_batch_bytes`.
 fn gc_batch_bytes() -> usize {
-    std::env::var("AUTUMN_PS_GC_BATCH_BYTES")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n >= 64 * 1024 && n <= 256 * 1024 * 1024)
-        .unwrap_or(4 * 1024 * 1024)
+    *GC_BATCH_BYTES_CELL.get_or_init(|| 4 * 1024 * 1024)
 }
 
 /// F141: GC log_stream rewrite throttle in bytes/sec. 0 = unlimited.
 /// Default 64 MiB/s — bounded headroom relative to typical foreground
 /// put traffic so GC doesn't starve client writes on the shared
-/// log_stream worker / extent-node fanout.
+/// log_stream worker / extent-node fanout. F195: overridable via
+/// `set_gc_rate_bytes_per_sec`.
 fn gc_rate_bytes_per_sec() -> u64 {
-    std::env::var("AUTUMN_PS_GC_RATE_BYTES_PER_SEC")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(64 * 1024 * 1024)
+    *GC_RATE_BYTES_PER_SEC_CELL.get_or_init(|| 64 * 1024 * 1024)
 }
 
 /// Per-record metadata kept alongside the encoded segments for memtable

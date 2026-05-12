@@ -23,6 +23,36 @@ struct Args {
     bind_host: String,
     transport: TransportKind,
     cpu_start: usize,
+    // F195: PS tunables previously env::var-gated, now CLI flags.
+    // `None` = library default. Defaults match pre-F195 env defaults.
+    group_commit_cap: Option<usize>,
+    ps_inflight_cap: Option<usize>,
+    ps_bulk_inflight_cap: Option<usize>,
+    max_imm_depth: Option<usize>,
+    max_wal_gap: Option<u64>,
+    shutdown_timeout_ms: Option<u64>,
+    major_compact_parallelism: Option<usize>,
+    conn_inflight_cap: Option<usize>,
+    fg_rate_bytes_per_sec: Option<u64>,
+    bg_rate_bytes_per_sec: Option<u64>,
+    fg_saturated_threshold: Option<f64>,
+    fg_qps_quota: Option<u32>,
+    gc_debt_high_bytes: Option<u64>,
+    compact_pending_high_bytes: Option<u64>,
+    gc_cooldown_secs: Option<i64>,
+    compact_cooldown_secs: Option<i64>,
+    min_pipeline_batch: Option<usize>,
+    gc_read_chunk_bytes: Option<u32>,
+    gc_batch_records: Option<usize>,
+    gc_batch_bytes: Option<usize>,
+    gc_rate_bytes_per_sec: Option<u64>,
+    // F195: pprof CLI flags (replaces AUTUMN_PPROF_* env reads).
+    #[cfg(feature = "profiling")]
+    pprof_secs: Option<u64>,
+    #[cfg(feature = "profiling")]
+    pprof_out: Option<String>,
+    #[cfg(feature = "profiling")]
+    pprof_threads: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -33,6 +63,34 @@ fn parse_args() -> Args {
     let mut bind_host = String::from("0.0.0.0");
     let mut transport = TransportKind::Tcp;
     let mut cpu_start: usize = 0;
+    // F195 tunables — None = library default.
+    let mut group_commit_cap: Option<usize> = None;
+    let mut ps_inflight_cap: Option<usize> = None;
+    let mut ps_bulk_inflight_cap: Option<usize> = None;
+    let mut max_imm_depth: Option<usize> = None;
+    let mut max_wal_gap: Option<u64> = None;
+    let mut shutdown_timeout_ms: Option<u64> = None;
+    let mut major_compact_parallelism: Option<usize> = None;
+    let mut conn_inflight_cap: Option<usize> = None;
+    let mut fg_rate_bytes_per_sec: Option<u64> = None;
+    let mut bg_rate_bytes_per_sec: Option<u64> = None;
+    let mut fg_saturated_threshold: Option<f64> = None;
+    let mut fg_qps_quota: Option<u32> = None;
+    let mut gc_debt_high_bytes: Option<u64> = None;
+    let mut compact_pending_high_bytes: Option<u64> = None;
+    let mut gc_cooldown_secs: Option<i64> = None;
+    let mut compact_cooldown_secs: Option<i64> = None;
+    let mut min_pipeline_batch: Option<usize> = None;
+    let mut gc_read_chunk_bytes: Option<u32> = None;
+    let mut gc_batch_records: Option<usize> = None;
+    let mut gc_batch_bytes: Option<usize> = None;
+    let mut gc_rate_bytes_per_sec: Option<u64> = None;
+    #[cfg(feature = "profiling")]
+    let mut pprof_secs: Option<u64> = None;
+    #[cfg(feature = "profiling")]
+    let mut pprof_out: Option<String> = None;
+    #[cfg(feature = "profiling")]
+    let mut pprof_threads: Option<String> = None;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -83,6 +141,111 @@ fn parse_args() -> Args {
                     "--conn-threads is a no-op post F099-J; worker pool removed"
                 );
             }
+            // F195 PS tunables. Each flag mirrors the pre-F195 env var
+            // of the same suffix (lowercased + kebab-cased).
+            "--group-commit-cap" => {
+                i += 1;
+                group_commit_cap = Some(args[i].parse().expect("--group-commit-cap u64"));
+            }
+            "--ps-inflight-cap" => {
+                i += 1;
+                ps_inflight_cap = Some(args[i].parse().expect("--ps-inflight-cap usize"));
+            }
+            "--ps-bulk-inflight-cap" => {
+                i += 1;
+                ps_bulk_inflight_cap = Some(args[i].parse().expect("--ps-bulk-inflight-cap usize"));
+            }
+            "--max-imm-depth" => {
+                i += 1;
+                max_imm_depth = Some(args[i].parse().expect("--max-imm-depth usize"));
+            }
+            "--max-wal-gap" => {
+                i += 1;
+                max_wal_gap = Some(args[i].parse().expect("--max-wal-gap u64 bytes"));
+            }
+            "--shutdown-timeout-ms" => {
+                i += 1;
+                shutdown_timeout_ms = Some(args[i].parse().expect("--shutdown-timeout-ms u64"));
+            }
+            "--major-compact-parallelism" => {
+                i += 1;
+                major_compact_parallelism = Some(
+                    args[i].parse().expect("--major-compact-parallelism usize"),
+                );
+            }
+            "--conn-inflight-cap" => {
+                i += 1;
+                conn_inflight_cap = Some(args[i].parse().expect("--conn-inflight-cap usize"));
+            }
+            "--fg-rate-bytes-per-sec" => {
+                i += 1;
+                fg_rate_bytes_per_sec = Some(args[i].parse().expect("--fg-rate-bytes-per-sec u64"));
+            }
+            "--bg-rate-bytes-per-sec" => {
+                i += 1;
+                bg_rate_bytes_per_sec = Some(args[i].parse().expect("--bg-rate-bytes-per-sec u64"));
+            }
+            "--fg-saturated-threshold" => {
+                i += 1;
+                fg_saturated_threshold = Some(args[i].parse().expect("--fg-saturated-threshold f64"));
+            }
+            "--fg-qps-quota" => {
+                i += 1;
+                fg_qps_quota = Some(args[i].parse().expect("--fg-qps-quota u32"));
+            }
+            "--gc-debt-high-bytes" => {
+                i += 1;
+                gc_debt_high_bytes = Some(args[i].parse().expect("--gc-debt-high-bytes u64"));
+            }
+            "--compact-pending-high-bytes" => {
+                i += 1;
+                compact_pending_high_bytes = Some(
+                    args[i].parse().expect("--compact-pending-high-bytes u64"),
+                );
+            }
+            "--gc-cooldown-secs" => {
+                i += 1;
+                gc_cooldown_secs = Some(args[i].parse().expect("--gc-cooldown-secs i64"));
+            }
+            "--compact-cooldown-secs" => {
+                i += 1;
+                compact_cooldown_secs = Some(args[i].parse().expect("--compact-cooldown-secs i64"));
+            }
+            "--min-pipeline-batch" => {
+                i += 1;
+                min_pipeline_batch = Some(args[i].parse().expect("--min-pipeline-batch usize"));
+            }
+            "--gc-read-chunk-bytes" => {
+                i += 1;
+                gc_read_chunk_bytes = Some(args[i].parse().expect("--gc-read-chunk-bytes u32"));
+            }
+            "--gc-batch-records" => {
+                i += 1;
+                gc_batch_records = Some(args[i].parse().expect("--gc-batch-records usize"));
+            }
+            "--gc-batch-bytes" => {
+                i += 1;
+                gc_batch_bytes = Some(args[i].parse().expect("--gc-batch-bytes usize"));
+            }
+            "--gc-rate-bytes-per-sec" => {
+                i += 1;
+                gc_rate_bytes_per_sec = Some(args[i].parse().expect("--gc-rate-bytes-per-sec u64"));
+            }
+            #[cfg(feature = "profiling")]
+            "--pprof-secs" => {
+                i += 1;
+                pprof_secs = Some(args[i].parse().expect("--pprof-secs u64"));
+            }
+            #[cfg(feature = "profiling")]
+            "--pprof-out" => {
+                i += 1;
+                pprof_out = Some(args[i].clone());
+            }
+            #[cfg(feature = "profiling")]
+            "--pprof-threads" => {
+                i += 1;
+                pprof_threads = Some(args[i].clone());
+            }
             "--help" | "-h" => {
                 eprintln!("Usage: autumn-ps --psid <ID> [OPTIONS]");
                 eprintln!();
@@ -119,6 +282,103 @@ fn parse_args() -> Args {
         bind_host,
         transport,
         cpu_start,
+        group_commit_cap,
+        ps_inflight_cap,
+        ps_bulk_inflight_cap,
+        max_imm_depth,
+        max_wal_gap,
+        shutdown_timeout_ms,
+        major_compact_parallelism,
+        conn_inflight_cap,
+        fg_rate_bytes_per_sec,
+        bg_rate_bytes_per_sec,
+        fg_saturated_threshold,
+        fg_qps_quota,
+        gc_debt_high_bytes,
+        compact_pending_high_bytes,
+        gc_cooldown_secs,
+        compact_cooldown_secs,
+        min_pipeline_batch,
+        gc_read_chunk_bytes,
+        gc_batch_records,
+        gc_batch_bytes,
+        gc_rate_bytes_per_sec,
+        #[cfg(feature = "profiling")]
+        pprof_secs,
+        #[cfg(feature = "profiling")]
+        pprof_out,
+        #[cfg(feature = "profiling")]
+        pprof_threads,
+    }
+}
+
+/// F195: apply CLI-derived tunables BEFORE the first PartitionServer
+/// construction. Each setter is first-call-wins, so calling here
+/// guarantees the binary's values land before any library reader fires.
+fn apply_ps_tunables(args: &Args) {
+    use autumn_partition_server as ps;
+    if let Some(n) = args.group_commit_cap {
+        ps::set_max_write_batch(n);
+    }
+    if let Some(n) = args.ps_inflight_cap {
+        ps::set_ps_inflight_cap(n);
+    }
+    if let Some(n) = args.ps_bulk_inflight_cap {
+        ps::set_ps_bulk_inflight_cap(n);
+    }
+    if let Some(n) = args.max_imm_depth {
+        ps::set_max_imm_depth(n);
+    }
+    if let Some(n) = args.max_wal_gap {
+        ps::set_max_wal_gap(n);
+    }
+    if let Some(n) = args.shutdown_timeout_ms {
+        ps::set_shutdown_timeout_ms(n);
+    }
+    if let Some(n) = args.major_compact_parallelism {
+        ps::set_ps_major_compact_parallelism(n);
+    }
+    if let Some(n) = args.conn_inflight_cap {
+        ps::set_ps_conn_inflight_cap(n);
+    }
+    if let Some(n) = args.fg_rate_bytes_per_sec {
+        ps::set_admission_fg_rate(n);
+    }
+    if let Some(n) = args.bg_rate_bytes_per_sec {
+        ps::set_admission_bg_rate(n);
+    }
+    if let Some(n) = args.fg_saturated_threshold {
+        ps::set_admission_fg_saturated_threshold(n);
+    }
+    if let Some(n) = args.fg_qps_quota {
+        ps::set_fg_qps_quota(n);
+    }
+    if let Some(n) = args.gc_debt_high_bytes {
+        ps::set_gc_debt_high(n);
+    }
+    if let Some(n) = args.compact_pending_high_bytes {
+        ps::set_compact_pending_high(n);
+    }
+    if let Some(n) = args.gc_cooldown_secs {
+        ps::set_gc_cooldown_secs(n);
+    }
+    if let Some(n) = args.compact_cooldown_secs {
+        ps::set_compact_cooldown_secs(n);
+    }
+    if let Some(n) = args.min_pipeline_batch {
+        ps::background::set_min_pipeline_batch(n);
+    }
+    if let Some(n) = args.gc_read_chunk_bytes {
+        ps::background::set_gc_read_chunk_bytes(n);
+    }
+    if let Some(n) = args.gc_batch_records {
+        ps::background::set_gc_batch_records(n);
+    }
+    if let Some(n) = args.gc_batch_bytes {
+        ps::background::set_gc_batch_bytes(n);
+    }
+    if let Some(n) = args.gc_rate_bytes_per_sec {
+        ps::background::set_gc_rate_bytes_per_sec(n);
     }
 }
 
@@ -131,66 +391,59 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // F164: dump AUTUMN_* env vars at startup so env-flag-gated features
-    // (e.g. F163 V1 rollout) can confirm propagation through the launcher
-    // chain (cluster.sh → start_proc → bash → autumn-ps). Useful when
-    // debugging why a process doesn't appear to honour an env var that
-    // was exported in the parent shell.
-    let autumn_env: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| k.starts_with("AUTUMN_"))
-        .collect();
-    if autumn_env.is_empty() {
-        tracing::info!("F164: no AUTUMN_* env vars at startup");
-    } else {
-        for (k, v) in &autumn_env {
-            tracing::info!(key = %k, value = %v, "F164: env var");
-        }
-    }
+    // F195: F164 env-dump removed — production rs code no longer reads
+    // AUTUMN_* env vars, so dumping them at startup was misleading. The
+    // remaining AUTUMN_* in the operator's shell (e.g. for cluster.sh's
+    // own use) are no longer the source of truth for binary config.
 
-    // ---- pprof-rs profiling hook (R2 diagnosis) ----
+    let args = parse_args();
+
+    // ---- F195: pprof CLI flags (replaces AUTUMN_PPROF_* env reads) ----
     #[cfg(feature = "profiling")]
     {
-        if let Ok(secs_s) = std::env::var("AUTUMN_PPROF_SECS") {
-            if let Ok(secs) = secs_s.parse::<u64>() {
-                if secs > 0 {
-                    let out_path = std::env::var("AUTUMN_PPROF_OUT")
-                        .unwrap_or_else(|_| "/tmp/autumn_ps_pprof.svg".to_string());
-                    let thread_filter = std::env::var("AUTUMN_PPROF_THREADS").ok();
-                    std::thread::spawn(move || {
-                        let guard = pprof::ProfilerGuardBuilder::default()
-                            .frequency(99)
-                            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
-                            .build()
-                            .expect("pprof guard");
-                        std::thread::sleep(std::time::Duration::from_secs(secs));
-                        let report = guard.report().build().expect("pprof report");
-                        let mut file = std::fs::File::create(&out_path).expect("pprof outfile");
-                        report.flamegraph(&mut file).expect("flamegraph write");
-                        if let Some(prefix) = thread_filter {
-                            let txt_path = format!("{}.threads.txt", out_path);
-                            if let Ok(mut txt) = std::fs::File::create(&txt_path) {
-                                use std::io::Write;
-                                for (frames, count) in &report.data {
-                                    if frames.thread_name.starts_with(&prefix) {
-                                        writeln!(
-                                            txt,
-                                            "thread={} count={}",
-                                            frames.thread_name, count
-                                        )
-                                        .ok();
-                                    }
+        if let Some(secs) = args.pprof_secs {
+            if secs > 0 {
+                let out_path = args
+                    .pprof_out
+                    .clone()
+                    .unwrap_or_else(|| "/tmp/autumn_ps_pprof.svg".to_string());
+                let thread_filter = args.pprof_threads.clone();
+                std::thread::spawn(move || {
+                    let guard = pprof::ProfilerGuardBuilder::default()
+                        .frequency(99)
+                        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+                        .build()
+                        .expect("pprof guard");
+                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                    let report = guard.report().build().expect("pprof report");
+                    let mut file = std::fs::File::create(&out_path).expect("pprof outfile");
+                    report.flamegraph(&mut file).expect("flamegraph write");
+                    if let Some(prefix) = thread_filter {
+                        let txt_path = format!("{}.threads.txt", out_path);
+                        if let Ok(mut txt) = std::fs::File::create(&txt_path) {
+                            use std::io::Write;
+                            for (frames, count) in &report.data {
+                                if frames.thread_name.starts_with(&prefix) {
+                                    writeln!(
+                                        txt,
+                                        "thread={} count={}",
+                                        frames.thread_name, count
+                                    )
+                                    .ok();
                                 }
                             }
                         }
-                        eprintln!("[R2] pprof flamegraph written: {}", out_path);
-                    });
-                }
+                    }
+                    eprintln!("[R2] pprof flamegraph written: {}", out_path);
+                });
             }
         }
     }
     // ---- end pprof hook ----
 
-    let args = parse_args();
+    // F195: apply PS-library tunables before any library reader fires.
+    apply_ps_tunables(&args);
+
     let _ = autumn_transport::init_with(args.transport);
     autumn_common::set_cpu_offset(args.cpu_start);
 

@@ -172,33 +172,31 @@ impl Frame {
     }
 }
 
-/// F163 / F165: cached `AUTUMN_RPC_FRAME_V1` env-var lookup. Reads once on
-/// first access and memoises (so toggling the env mid-process has no effect
-/// — the encoder choice must be process-stable to avoid mid-stream wire-
-/// format changes that the decoder couldn't follow).
+/// F163 / F165: process-stable V1-encoder toggle. Reads `ENABLED` once
+/// (via `get_or_init`); first reader locks in either the default (V1
+/// on) or whatever the binary's main() set via `set_v1_encoder_enabled`.
 ///
 /// F165 flipped the default from V0 to V1: F164 verified V1 works
-/// end-to-end (root-caused the F161/F163 "cluster break" as stale release
-/// binaries, not a real wire-format bug). With V1 default-on, the 7
-/// verified hot-path corruption surfaces from F161's audit (header field
-/// corruption silently passed to handle_append, payload bytes corrupted
-/// in transit, length-field poisoning, eversion bypass, etc.) are now
-/// closed in production deployments — not just for users who opt in.
+/// end-to-end. With V1 default-on, the 7 verified hot-path corruption
+/// surfaces from F161's audit (header field corruption, payload byte
+/// corruption, length poisoning, eversion bypass, etc.) are closed in
+/// production deployments.
 ///
-/// Opt-out: `AUTUMN_RPC_FRAME_V1=0` (or `false` / `no` / `off`) reverts
-/// to legacy V0 wire format. Use this only if (a) you observe the ~10%
-/// CRC32C compute cost is not acceptable for your workload AND (b) you
-/// understand the corruption surfaces it leaves open. The whole cluster
-/// (manager + extent-nodes + PSes + clients) MUST agree on the wire
-/// version: per-process flips would create decode mismatches.
+/// F195: pre-F195 read `AUTUMN_RPC_FRAME_V1` env var inside `get_or_init`;
+/// post-F195 the env read is gone. Operators opt out (revert to V0) via
+/// the per-binary CLI flag `--rpc-frame-v1=false` which calls
+/// `set_v1_encoder_enabled(false)` before any frame encode/decode runs.
+/// The whole cluster (manager + extent-nodes + PSes + clients) MUST
+/// agree on the wire version: per-process flips would create decode
+/// mismatches, so every binary needs the same flag.
+static V1_ENCODER_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub fn set_v1_encoder_enabled(enabled: bool) -> bool {
+    V1_ENCODER_ENABLED.set(enabled).is_ok()
+}
+
 fn v1_encoder_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("AUTUMN_RPC_FRAME_V1")
-            .map(|v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
-            .unwrap_or(true)
-    })
+    *V1_ENCODER_ENABLED.get_or_init(|| true)
 }
 
 /// F161 (DEFERRED): compute CRC32C over a multi-segment payload by rolling

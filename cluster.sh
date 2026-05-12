@@ -311,6 +311,73 @@ launch_ps() {
         cpu_args=(--cpu-start "$ps_cpu_start")
         affinity_msg="cpu-start=$ps_cpu_start"
     fi
+    # F195: operator-set AUTUMN_* env vars are translated explicitly to
+    # per-binary CLI flags here — Rust libraries no longer read env
+    # vars. Each is opt-in: only emit the flag if the env is set.
+    local -a tunable_args=()
+    if [[ -n "${AUTUMN_GROUP_COMMIT_CAP:-}" ]]; then
+        tunable_args+=(--group-commit-cap "$AUTUMN_GROUP_COMMIT_CAP")
+    fi
+    if [[ -n "${AUTUMN_PS_INFLIGHT_CAP:-}" ]]; then
+        tunable_args+=(--ps-inflight-cap "$AUTUMN_PS_INFLIGHT_CAP")
+    fi
+    if [[ -n "${AUTUMN_PS_BULK_INFLIGHT_CAP:-}" ]]; then
+        tunable_args+=(--ps-bulk-inflight-cap "$AUTUMN_PS_BULK_INFLIGHT_CAP")
+    fi
+    if [[ -n "${AUTUMN_PS_MAX_IMM_DEPTH:-}" ]]; then
+        tunable_args+=(--max-imm-depth "$AUTUMN_PS_MAX_IMM_DEPTH")
+    fi
+    if [[ -n "${AUTUMN_PS_MAX_WAL_GAP:-}" ]]; then
+        tunable_args+=(--max-wal-gap "$AUTUMN_PS_MAX_WAL_GAP")
+    fi
+    if [[ -n "${AUTUMN_PS_SHUTDOWN_TIMEOUT_MS:-}" ]]; then
+        tunable_args+=(--shutdown-timeout-ms "$AUTUMN_PS_SHUTDOWN_TIMEOUT_MS")
+    fi
+    if [[ -n "${AUTUMN_PS_MAJOR_COMPACT_PARALLELISM:-}" ]]; then
+        tunable_args+=(--major-compact-parallelism "$AUTUMN_PS_MAJOR_COMPACT_PARALLELISM")
+    fi
+    if [[ -n "${AUTUMN_PS_CONN_INFLIGHT_CAP:-}" ]]; then
+        tunable_args+=(--conn-inflight-cap "$AUTUMN_PS_CONN_INFLIGHT_CAP")
+    fi
+    if [[ -n "${AUTUMN_PS_FG_RATE_BYTES_PER_SEC:-}" ]]; then
+        tunable_args+=(--fg-rate-bytes-per-sec "$AUTUMN_PS_FG_RATE_BYTES_PER_SEC")
+    fi
+    if [[ -n "${AUTUMN_PS_BG_RATE_BYTES_PER_SEC:-}" ]]; then
+        tunable_args+=(--bg-rate-bytes-per-sec "$AUTUMN_PS_BG_RATE_BYTES_PER_SEC")
+    fi
+    if [[ -n "${AUTUMN_PS_FG_SATURATED_THRESHOLD:-}" ]]; then
+        tunable_args+=(--fg-saturated-threshold "$AUTUMN_PS_FG_SATURATED_THRESHOLD")
+    fi
+    if [[ -n "${AUTUMN_PS_FG_QPS_QUOTA:-}" ]]; then
+        tunable_args+=(--fg-qps-quota "$AUTUMN_PS_FG_QPS_QUOTA")
+    fi
+    if [[ -n "${AUTUMN_PS_GC_DEBT_HIGH_BYTES:-}" ]]; then
+        tunable_args+=(--gc-debt-high-bytes "$AUTUMN_PS_GC_DEBT_HIGH_BYTES")
+    fi
+    if [[ -n "${AUTUMN_PS_COMPACT_PENDING_HIGH_BYTES:-}" ]]; then
+        tunable_args+=(--compact-pending-high-bytes "$AUTUMN_PS_COMPACT_PENDING_HIGH_BYTES")
+    fi
+    if [[ -n "${AUTUMN_PS_GC_COOLDOWN_SECS:-}" ]]; then
+        tunable_args+=(--gc-cooldown-secs "$AUTUMN_PS_GC_COOLDOWN_SECS")
+    fi
+    if [[ -n "${AUTUMN_PS_COMPACT_COOLDOWN_SECS:-}" ]]; then
+        tunable_args+=(--compact-cooldown-secs "$AUTUMN_PS_COMPACT_COOLDOWN_SECS")
+    fi
+    if [[ -n "${AUTUMN_PS_MIN_BATCH:-}" ]]; then
+        tunable_args+=(--min-pipeline-batch "$AUTUMN_PS_MIN_BATCH")
+    fi
+    if [[ -n "${AUTUMN_PS_GC_READ_CHUNK_BYTES:-}" ]]; then
+        tunable_args+=(--gc-read-chunk-bytes "$AUTUMN_PS_GC_READ_CHUNK_BYTES")
+    fi
+    if [[ -n "${AUTUMN_PS_GC_BATCH_RECORDS:-}" ]]; then
+        tunable_args+=(--gc-batch-records "$AUTUMN_PS_GC_BATCH_RECORDS")
+    fi
+    if [[ -n "${AUTUMN_PS_GC_BATCH_BYTES:-}" ]]; then
+        tunable_args+=(--gc-batch-bytes "$AUTUMN_PS_GC_BATCH_BYTES")
+    fi
+    if [[ -n "${AUTUMN_PS_GC_RATE_BYTES_PER_SEC:-}" ]]; then
+        tunable_args+=(--gc-rate-bytes-per-sec "$AUTUMN_PS_GC_RATE_BYTES_PER_SEC")
+    fi
     start_proc ps \
         "$PS" \
         --psid 1 --port 9201 \
@@ -318,7 +385,8 @@ launch_ps() {
         --listen "$BIND_HOST" \
         --advertise "${BIND_HOST}:9201" \
         --transport "$TRANSPORT" \
-        ${cpu_args[@]:+"${cpu_args[@]}"}
+        ${cpu_args[@]:+"${cpu_args[@]}"} \
+        ${tunable_args[@]:+"${tunable_args[@]}"}
     echo "[cluster] PS launched (F099-K: per-partition listeners bind on partition open; $affinity_msg)"
 }
 

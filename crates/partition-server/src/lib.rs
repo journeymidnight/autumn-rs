@@ -1,4 +1,7 @@
-mod background;
+// F195: `background` module made public so the autumn-ps binary can
+// reach its `set_*` setters (`set_min_pipeline_batch`,
+// `set_gc_*`). The module's internal symbols stay `pub(crate)`/private.
+pub mod background;
 mod rpc_handlers;
 mod sstable;
 mod wal_record;
@@ -44,18 +47,109 @@ const MAX_SKIP_LIST: u64 = 256 * 1024 * 1024;
 const WRITE_CHANNEL_CAP: usize = 1024;
 const DEFAULT_MAX_WRITE_BATCH: usize = WRITE_CHANNEL_CAP * 3;
 
-/// Group-commit request count cap. Read once from env `AUTUMN_GROUP_COMMIT_CAP`
-/// if set to a positive integer in [1, 1_000_000]; otherwise falls back to
-/// DEFAULT_MAX_WRITE_BATCH (3072). See docs/superpowers/specs/2026-04-18-*.md.
+// F195: process-global PS tunables. Pre-F195 each `xxx()` function read
+// env::var inside an inner static OnceLock — the cell was hidden inside
+// the function so no setter could override it from the binary. F195
+// lifts each cell to module scope and exposes a paired `pub fn set_xxx`
+// that the autumn-ps binary calls from main() based on CLI args. The
+// reader functions still use `get_or_init` for thread-safe lazy default
+// fallback — but the init closure no longer touches the environment.
+//
+// First-call-wins semantics: any reader that fires before main() applied
+// its setter will lock in the default. The binary's main() always calls
+// the setters BEFORE constructing PartitionServer, so this is fine in
+// production. Tests that need overrides must call `set_xxx` early too;
+// tests running in parallel against the same process share the cells,
+// same constraint as the previous env::var approach.
+
+static MAX_WRITE_BATCH_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static PS_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static PS_BULK_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MAX_IMM_DEPTH_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MAX_WAL_GAP_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static SHUTDOWN_TIMEOUT_MS_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static PS_MAJOR_COMPACT_PARALLELISM_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static PS_CONN_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static PS_FG_RATE_BYTES_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static PS_BG_RATE_BYTES_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static PS_FG_SATURATED_THRESHOLD_CELL: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+static PS_FG_QPS_QUOTA_CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+static PS_GC_DEBT_HIGH_BYTES_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static PS_COMPACT_PENDING_HIGH_BYTES_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static PS_GC_COOLDOWN_SECS_CELL: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+static PS_COMPACT_COOLDOWN_SECS_CELL: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+/// F195: setter for the group-commit request cap. First-call-wins.
+/// `[1, 1_000_000]` clamp matches pre-F195 env-default behavior.
+pub fn set_max_write_batch(n: usize) -> bool {
+    MAX_WRITE_BATCH_CELL
+        .set(n.clamp(1, 1_000_000))
+        .is_ok()
+}
+pub fn set_ps_inflight_cap(n: usize) -> bool {
+    PS_INFLIGHT_CAP_CELL.set(n.clamp(1, 64)).is_ok()
+}
+pub fn set_ps_bulk_inflight_cap(n: usize) -> bool {
+    PS_BULK_INFLIGHT_CAP_CELL.set(n.clamp(1, 16)).is_ok()
+}
+pub fn set_max_imm_depth(n: usize) -> bool {
+    MAX_IMM_DEPTH_CELL.set(n.clamp(1, 64)).is_ok()
+}
+pub fn set_max_wal_gap(n: u64) -> bool {
+    MAX_WAL_GAP_CELL
+        .set(n.clamp(128 * 1024 * 1024, 64 * 1024 * 1024 * 1024))
+        .is_ok()
+}
+pub fn set_shutdown_timeout_ms(n: u64) -> bool {
+    SHUTDOWN_TIMEOUT_MS_CELL.set(n.clamp(1_000, 600_000)).is_ok()
+}
+pub fn set_ps_major_compact_parallelism(n: usize) -> bool {
+    PS_MAJOR_COMPACT_PARALLELISM_CELL.set(n.clamp(1, 64)).is_ok()
+}
+pub fn set_ps_conn_inflight_cap(n: usize) -> bool {
+    if n == 0 || n > 4096 {
+        return false;
+    }
+    PS_CONN_INFLIGHT_CAP_CELL.set(n).is_ok()
+}
+pub fn set_admission_fg_rate(n: u64) -> bool {
+    PS_FG_RATE_BYTES_PER_SEC_CELL.set(n).is_ok()
+}
+pub fn set_admission_bg_rate(n: u64) -> bool {
+    PS_BG_RATE_BYTES_PER_SEC_CELL.set(n).is_ok()
+}
+pub fn set_admission_fg_saturated_threshold(n: f64) -> bool {
+    PS_FG_SATURATED_THRESHOLD_CELL.set(n).is_ok()
+}
+pub fn set_fg_qps_quota(n: u32) -> bool {
+    if n == 0 {
+        return false;
+    }
+    PS_FG_QPS_QUOTA_CELL.set(n).is_ok()
+}
+pub fn set_gc_debt_high(n: u64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    PS_GC_DEBT_HIGH_BYTES_CELL.set(n).is_ok()
+}
+pub fn set_compact_pending_high(n: u64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    PS_COMPACT_PENDING_HIGH_BYTES_CELL.set(n).is_ok()
+}
+pub fn set_gc_cooldown_secs(n: i64) -> bool {
+    PS_GC_COOLDOWN_SECS_CELL.set(n).is_ok()
+}
+pub fn set_compact_cooldown_secs(n: i64) -> bool {
+    PS_COMPACT_COOLDOWN_SECS_CELL.set(n).is_ok()
+}
+
+/// Group-commit request count cap. F195: defaults to DEFAULT_MAX_WRITE_BATCH
+/// (3072); overridable via `set_max_write_batch` from the binary main().
 fn max_write_batch() -> usize {
-    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var("AUTUMN_GROUP_COMMIT_CAP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0 && n <= 1_000_000)
-            .unwrap_or(DEFAULT_MAX_WRITE_BATCH)
-    })
+    *MAX_WRITE_BATCH_CELL.get_or_init(|| DEFAULT_MAX_WRITE_BATCH)
 }
 /// R4 4.4 — maximum number of P-log `append_batch` futures in flight
 /// concurrently per partition. Higher values give more pipeline depth so
@@ -64,33 +158,19 @@ fn max_write_batch() -> usize {
 /// `MAX_WRITE_BATCH_BYTES` = 30 MB of encoded segments).
 ///
 /// Default = 8 → up to 8 × 30 MB = 240 MB worst-case memory per partition.
-/// Range clamped to [1, 64]. Read once from env `AUTUMN_PS_INFLIGHT_CAP`.
+/// Range clamped to [1, 64]. F195: overridable via `set_ps_inflight_cap`.
 pub(crate) fn ps_inflight_cap() -> usize {
-    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var("AUTUMN_PS_INFLIGHT_CAP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|n| n.clamp(1, 64))
-            .unwrap_or(8)
-    })
+    *PS_INFLIGHT_CAP_CELL.get_or_init(|| 8)
 }
 
 /// R4 4.4 — maximum number of P-bulk (flush) in-flight SST uploads per
 /// partition. Each in-flight request holds a full 128 MB SSTable buffer
 /// (peak), so this cap is deliberately small. Default = 2 lets the next
 /// flush start its `build_sst_bytes` while the previous one's 128 MB
-/// `row_stream.append` is streaming. Range clamped to [1, 16]. Read once
-/// from env `AUTUMN_PS_BULK_INFLIGHT_CAP`.
+/// `row_stream.append` is streaming. Range clamped to [1, 16]. F195:
+/// overridable via `set_ps_bulk_inflight_cap`.
 pub(crate) fn ps_bulk_inflight_cap() -> usize {
-    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var("AUTUMN_PS_BULK_INFLIGHT_CAP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|n| n.clamp(1, 16))
-            .unwrap_or(2)
-    })
+    *PS_BULK_INFLIGHT_CAP_CELL.get_or_init(|| 2)
 }
 
 /// F120-A — maximum imm queue depth per partition. When `imm.len()` reaches
@@ -98,20 +178,13 @@ pub(crate) fn ps_bulk_inflight_cap() -> usize {
 /// back-pressure) and waits for `flush_one_imm` to pop one entry before
 /// resuming. Worst-case unflushed-WAL window per partition is therefore
 /// `MAX_IMM_DEPTH * FLUSH_MEM_BYTES + active.bytes` = 4 × 256 MB + 256 MB
-/// = 1.25 GB (vs. unbounded pre-F120). Range clamped to [1, 64]. Read once
-/// from env `AUTUMN_PS_MAX_IMM_DEPTH`. RocksDB analogue:
+/// = 1.25 GB (vs. unbounded pre-F120). Range clamped to [1, 64]. F195:
+/// overridable via `set_max_imm_depth`. RocksDB analogue:
 /// `max_write_buffer_number` (default 2). Default 4 because our memtable
 /// is 4× RocksDB's default `write_buffer_size` and bulk uploads are
 /// network-bound 128 MB SSTs.
 pub(crate) fn max_imm_depth() -> usize {
-    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var("AUTUMN_PS_MAX_IMM_DEPTH")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|n| n.clamp(1, 64))
-            .unwrap_or(4)
-    })
+    *MAX_IMM_DEPTH_CELL.get_or_init(|| 4)
 }
 
 /// F120-B — maximum unflushed log_stream gap per partition. When
@@ -121,36 +194,20 @@ pub(crate) fn max_imm_depth() -> usize {
 /// the workload is dominated by large values (small memtable footprint
 /// per record but full payload sits in log_stream as VPs) or by small
 /// writes that drip in below the rotate threshold. Range clamped to
-/// [128 MiB, 64 GiB]. Read once from env `AUTUMN_PS_MAX_WAL_GAP`.
+/// [128 MiB, 64 GiB]. F195: overridable via `set_max_wal_gap`.
 /// RocksDB analogue: `max_total_wal_size` (default
 /// `write_buffer_size × max_write_buffer_number × 4`).
 pub(crate) fn max_wal_gap() -> u64 {
-    static CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        const DEFAULT: u64 = 1 * 1024 * 1024 * 1024;
-        const MIN: u64 = 128 * 1024 * 1024;
-        const MAX: u64 = 64 * 1024 * 1024 * 1024;
-        std::env::var("AUTUMN_PS_MAX_WAL_GAP")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|n| n.clamp(MIN, MAX))
-            .unwrap_or(DEFAULT)
-    })
+    const DEFAULT: u64 = 1 * 1024 * 1024 * 1024;
+    *MAX_WAL_GAP_CELL.get_or_init(|| DEFAULT)
 }
 
 /// F120-C — graceful shutdown deadline. After SIGTERM, `PartitionServer::
 /// shutdown()` waits at most this many milliseconds for each partition's
 /// drain (rotate active + flush all imm). Range clamped to [1 s, 10 min].
-/// Read once from env `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS`.
+/// F195: overridable via `set_shutdown_timeout_ms`.
 pub(crate) fn shutdown_timeout_ms() -> u64 {
-    static CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var("AUTUMN_PS_SHUTDOWN_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|n| n.clamp(1_000, 600_000))
-            .unwrap_or(60_000)
-    })
+    *SHUTDOWN_TIMEOUT_MS_CELL.get_or_init(|| 60_000)
 }
 
 // CPU affinity policy lives in `autumn_common::cpu_pin`. Both OS threads
@@ -176,17 +233,11 @@ const COMPACT_N: usize = 5;
 /// This gate caps cross-partition compaction concurrency. Default = 1
 /// (fully serialized across partitions, matching the safe-fix lower
 /// bound). Operators with plenty of RAM can raise it via
-/// `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM` to trade memory for throughput.
+/// `set_ps_major_compact_parallelism` (CLI flag
+/// `--major-compact-parallelism`) to trade memory for throughput.
 /// Range clamped to [1, 64].
 pub(crate) fn ps_major_compact_parallelism() -> usize {
-    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var("AUTUMN_PS_MAJOR_COMPACT_PARALLELISM")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|n| n.clamp(1, 64))
-            .unwrap_or(1)
-    })
+    *PS_MAJOR_COMPACT_PARALLELISM_CELL.get_or_init(|| 1)
 }
 
 pub struct CompactionGate {
@@ -1162,19 +1213,16 @@ impl AdmissionController {
         }
     }
 
+    /// F195: defaults match pre-F195 env defaults. Override via the
+    /// process-global setters `set_admission_fg_rate`,
+    /// `set_admission_bg_rate`, `set_admission_fg_saturated_threshold`
+    /// before constructing `PartitionServer`. Naming kept as
+    /// `from_env` for call-site stability; semantically it is now
+    /// "from process-global config setters."
     pub fn from_env() -> Self {
-        let fg_rate = std::env::var("AUTUMN_PS_FG_RATE_BYTES_PER_SEC")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        let bg_rate = std::env::var("AUTUMN_PS_BG_RATE_BYTES_PER_SEC")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(256 * 1024 * 1024);
-        let saturated = std::env::var("AUTUMN_PS_FG_SATURATED_THRESHOLD")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.8);
+        let fg_rate = *PS_FG_RATE_BYTES_PER_SEC_CELL.get_or_init(|| 0);
+        let bg_rate = *PS_BG_RATE_BYTES_PER_SEC_CELL.get_or_init(|| 256 * 1024 * 1024);
+        let saturated = *PS_FG_SATURATED_THRESHOLD_CELL.get_or_init(|| 0.8);
         Self::new(fg_rate, bg_rate, saturated)
     }
 
@@ -1771,35 +1819,20 @@ impl PartitionServer {
         const SCHEDULE_INTERVAL_SECS: u64 = 5;
         // Match F183's required-buckets default (5) — 5 × 5 s = 25 s of
         // metric history before we'll fire something off the timer.
-        let fg_qps_quota: u32 = std::env::var("AUTUMN_PS_FG_QPS_QUOTA")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&n: &u32| n > 0)
-            .unwrap_or(50_000);
+        // F195: read once from process-global setter-cached cells.
+        // Defaults match pre-F195 env defaults.
+        let fg_qps_quota: u32 = *PS_FG_QPS_QUOTA_CELL.get_or_init(|| 50_000);
         // Same defaults as the F187 PolicyConfig — the scheduler is the
         // local executor of the same advisories, so keeping the trigger
         // threshold == advisory threshold makes the two layers coherent.
-        let gc_debt_high: u64 = std::env::var("AUTUMN_PS_GC_DEBT_HIGH_BYTES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&n: &u64| n > 0)
-            .unwrap_or(1024 * 1024 * 1024);
-        let compact_pending_high: u64 = std::env::var("AUTUMN_PS_COMPACT_PENDING_HIGH_BYTES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&n: &u64| n > 0)
-            .unwrap_or(4 * 1024 * 1024 * 1024);
+        let gc_debt_high: u64 = *PS_GC_DEBT_HIGH_BYTES_CELL.get_or_init(|| 1024 * 1024 * 1024);
+        let compact_pending_high: u64 =
+            *PS_COMPACT_PENDING_HIGH_BYTES_CELL.get_or_init(|| 4 * 1024 * 1024 * 1024);
         // Cooldown between scheduler-driven dispatches per partition+kind.
         // Picks from PS-side `last_*_at` metrics so the gate respects
         // actual completion, not just dispatch.
-        let gc_cooldown_secs: i64 = std::env::var("AUTUMN_PS_GC_COOLDOWN_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(300);
-        let compact_cooldown_secs: i64 = std::env::var("AUTUMN_PS_COMPACT_COOLDOWN_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(300);
+        let gc_cooldown_secs: i64 = *PS_GC_COOLDOWN_SECS_CELL.get_or_init(|| 300);
+        let compact_cooldown_secs: i64 = *PS_COMPACT_COOLDOWN_SECS_CELL.get_or_init(|| 300);
 
         // Per-partition rolling avg of req/sec across the last
         // SCHEDULE_INTERVAL_SECS window. Computed by diffing the
@@ -2449,16 +2482,10 @@ impl PartitionServer {
 /// EINVAL / "submit error: connection closed" under 256 × d=8 load —
 /// we believe due to the aggregate rate of tx.send()-awaiting futures
 /// overwhelming either the mpsc reservation pool or the PS's extent-node
-/// RpcConn writer_task.  Tuning knob `AUTUMN_PS_CONN_INFLIGHT_CAP`.
+/// RpcConn writer_task. F195: overridable via `set_ps_conn_inflight_cap`
+/// (CLI flag `--conn-inflight-cap`); default 4.
 fn ps_conn_inflight_cap() -> usize {
-    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var("AUTUMN_PS_CONN_INFLIGHT_CAP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|v| *v > 0 && *v <= 4096)
-            .unwrap_or(4)
-    })
+    *PS_CONN_INFLIGHT_CAP_CELL.get_or_init(|| 4)
 }
 
 /// F099-I-fix — observability counter for the d=1 fast path. Incremented

@@ -201,6 +201,8 @@ enum Command {
         update_baseline: bool,
         partitions: usize,
         pipeline_depth: usize,
+        /// F195: was env `AUTUMN_GROUP_COMMIT_CAP`; recorded in baseline.
+        group_commit_cap: Option<usize>,
     },
     Info {
         json: bool,
@@ -707,6 +709,12 @@ fn parse_args() -> Args {
             let mut update_baseline = false;
             let mut partitions_meta_from_flag: usize = 1;
             let mut pipeline_depth: usize = 1;
+            // F195: was `AUTUMN_GROUP_COMMIT_CAP` env read at baseline-
+            // write time. Now an explicit CLI flag — operators pass the
+            // same value to autumn-ps (`--group-commit-cap N`) AND to
+            // perf-check (`--group-commit-cap N`) so the baseline JSON
+            // reflects the server config that was active.
+            let mut group_commit_cap: Option<usize> = None;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--threads" | "-t" => {
@@ -753,6 +761,12 @@ fn parse_args() -> Args {
                             usage();
                         }
                     }
+                    "--group-commit-cap" => {
+                        i += 1;
+                        group_commit_cap = Some(
+                            raw[i].parse().expect("--group-commit-cap must be a u64"),
+                        );
+                    }
                     other => {
                         eprintln!("unknown perf-check flag: {other}");
                         usage();
@@ -770,6 +784,7 @@ fn parse_args() -> Args {
                 update_baseline,
                 partitions: partitions_meta_from_flag,
                 pipeline_depth,
+                group_commit_cap,
             }
         }
         "info" => {
@@ -2110,6 +2125,7 @@ async fn main() -> Result<()> {
             update_baseline,
             partitions: partitions_meta_from_flag,
             pipeline_depth,
+            group_commit_cap,
         } => {
             let pipeline_depth = pipeline_depth.max(1);
             // ---- Write phase ----
@@ -2455,9 +2471,8 @@ async fn main() -> Result<()> {
                         part_id: None,
                         reuse_value: true,
                         partition_count: partitions_meta_from_flag,
-                        group_commit_cap: std::env::var("AUTUMN_GROUP_COMMIT_CAP")
-                            .ok()
-                            .and_then(|s| s.parse::<usize>().ok()),
+                        // F195: explicit CLI flag (was env read at baseline-write time).
+                        group_commit_cap,
                     },
                     recorded_at: now_secs,
                 };
