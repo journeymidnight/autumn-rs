@@ -1795,9 +1795,48 @@ impl ExtentNode {
     /// and handles them cooperatively. TCP-only socket tuning gated on
     /// `Conn::as_tcp()` so UCX paths skip the TCP setsockopt calls.
     pub async fn serve(&self, addr: SocketAddr) -> Result<()> {
+        self.accept_loop(addr, "data").await
+    }
+
+    /// F191: serve BOTH the data-plane and a separate control-plane
+    /// listener on the same `ExtentNode` instance. The control listener
+    /// reuses `handle_connection` (same SQ/CQ machinery) but only
+    /// receives small-payload control RPCs (`MSG_DF`, future
+    /// `MSG_REPORT_DISK_FAILURE`, future heartbeat) so its `tx_bufs`
+    /// flush and `FuturesUnordered` cap stay minimal in practice.
+    ///
+    /// We spawn the control listener as a detached compio task and run
+    /// the data accept loop inline. If the control listener fails to
+    /// bind, log + WARN and continue with data only (legacy behaviour
+    /// preserved) — the manager's `control_address` fallback also
+    /// covers a node whose control bind failed for an operator reason.
+    pub async fn serve_with_control(
+        &self,
+        data_addr: SocketAddr,
+        control_addr: SocketAddr,
+    ) -> Result<()> {
+        let ctl_node = self.clone();
+        compio::runtime::spawn(async move {
+            tracing::info!(addr = %control_addr, "extent node CONTROL listener");
+            if let Err(e) = ctl_node.accept_loop(control_addr, "control").await {
+                tracing::warn!(
+                    addr = %control_addr,
+                    error = %e,
+                    "control listener exited"
+                );
+            }
+        })
+        .detach();
+        self.accept_loop(data_addr, "data").await
+    }
+
+    /// Shared accept loop used by both `serve` and `serve_with_control`.
+    /// `role` is a free-form label ("data" / "control") that goes into
+    /// the listening log line for operator triage.
+    async fn accept_loop(&self, addr: SocketAddr, role: &'static str) -> Result<()> {
         let transport = autumn_transport::current_or_init();
         let mut listener = transport.bind(addr).await?;
-        tracing::info!(addr = %addr, kind = ?transport.kind(), "extent node listening");
+        tracing::info!(addr = %addr, role, kind = ?transport.kind(), "extent node listening");
         loop {
             let (conn, peer) = listener.accept().await?;
             if let Some(s) = conn.as_tcp() {
@@ -1808,9 +1847,9 @@ impl ExtentNode {
             }
             let node = self.clone();
             compio::runtime::spawn(async move {
-                tracing::debug!(peer = %peer, "new rpc connection");
+                tracing::debug!(peer = %peer, role, "new rpc connection");
                 if let Err(e) = Self::handle_connection(conn, node).await {
-                    tracing::debug!(peer = %peer, error = %e, "rpc connection ended");
+                    tracing::debug!(peer = %peer, role, error = %e, "rpc connection ended");
                 }
             })
             .detach();

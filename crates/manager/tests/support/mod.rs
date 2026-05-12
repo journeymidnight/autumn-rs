@@ -121,6 +121,7 @@ pub async fn register_node(mgr: &RpcClient, addr: &str, disk_uuid: &str) -> Regi
                 addr: addr.to_string(),
                 disk_uuids: vec![disk_uuid.to_string()],
                 shard_ports: vec![],
+                control_address: String::new(),
             }),
         )
         .await

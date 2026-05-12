@@ -404,18 +404,34 @@ impl AutumnManager {
                 let Some(node) = nodes.get(&node_id) else {
                     continue;
                 };
-                let addr = Self::normalize_endpoint(&node.address);
+                // F191: prefer the control_address; fall back to data
+                // plane address for legacy / not-yet-re-registered nodes.
+                let raw_addr = if node.control_address.is_empty() {
+                    &node.address
+                } else {
+                    &node.control_address
+                };
+                let addr = Self::normalize_endpoint(raw_addr);
                 let payload = rkyv_encode(&ExtDfReq {
                     tasks: node_tasks,
                     disk_ids: Vec::new(),
                 });
-                let resp = match self.conn_pool.call(&addr, EXT_MSG_DF, payload).await {
+                // F191 P0: bound DF at 5 s via control_pool.call_timeout.
+                // Pre-F191 the comment in disk_status_update_loop claimed
+                // the call was timeout-bounded but the conn_pool.call
+                // path had no timeout, so a single slow / stuck DF could
+                // hang the loop tick.
+                let resp = match self
+                    .control_pool
+                    .call_timeout(&addr, EXT_MSG_DF, payload, Duration::from_secs(5))
+                    .await
+                {
                     Ok(v) => v,
                     Err(_) => {
                         // F121: peer is unreachable — mark all of its
                         // disks offline so allocation/recovery skip it.
-                        // `ConnPool::call` already evicts the broken
-                        // conn so the next poll reconnects.
+                        // `ConnPool::call_timeout` already evicts the
+                        // broken conn so the next poll reconnects.
                         Self::mark_node_disks_offline(&self.store, node);
                         continue;
                     }
@@ -450,16 +466,31 @@ impl AutumnManager {
             };
 
             for node in nodes.values() {
-                let addr = Self::normalize_endpoint(&node.address);
+                // F191: route DF over the dedicated control_pool against
+                // node.control_address (fall back to address for legacy
+                // nodes). Replaces the F121 "bound df at 5 s" comment
+                // with the actually-applied 5 s timeout via
+                // control_pool.call_timeout — the previous conn_pool.call
+                // had no timeout, so under heavy data-plane load
+                // (CONVERT_TO_EC, COPY_EXTENT, RECOVERY) on the same
+                // multiplexed RpcClient the next DF could stall long
+                // enough to surface as ConnectionClosed and falsely
+                // mark the node offline.
+                let raw_addr = if node.control_address.is_empty() {
+                    &node.address
+                } else {
+                    &node.control_address
+                };
+                let addr = Self::normalize_endpoint(raw_addr);
                 let payload = rkyv_encode(&ExtDfReq {
                     tasks: Vec::new(),
                     disk_ids: Vec::new(),
                 });
-                // F121: bound df at 5 s; on failure mark this node's
-                // disks offline (the pre-F121 `Err(_) => continue` left
-                // a stale `online=true` and `info` would lie about a
-                // dead node indefinitely).
-                let resp = match self.conn_pool.call(&addr, EXT_MSG_DF, payload).await {
+                let resp = match self
+                    .control_pool
+                    .call_timeout(&addr, EXT_MSG_DF, payload, Duration::from_secs(5))
+                    .await
+                {
                     Ok(v) => v,
                     Err(_) => {
                         // F121: see recovery_collect_loop comment.

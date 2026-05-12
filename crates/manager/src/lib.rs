@@ -261,6 +261,42 @@ impl ConnPool {
         result
     }
 
+    /// F191: bound an RPC at `timeout`. Same connection / eviction
+    /// semantics as `call`; on the timeout branch we deliberately evict
+    /// because the underlying connection is now mid-protocol (we sent a
+    /// request but stopped reading) and reusing it could deadlock the
+    /// next caller waiting on an unrelated response.
+    async fn call_timeout(
+        &self,
+        addr: &str,
+        msg_type: u8,
+        payload: Bytes,
+        timeout: std::time::Duration,
+    ) -> Result<Bytes> {
+        let sock = parse_addr(addr)?;
+        let conn = self.get_or_connect(sock).await?;
+        // SAFETY: single-threaded compio runtime — no concurrent borrow possible.
+        let conn_ptr = conn.as_ptr();
+        let result = compio::time::timeout(
+            timeout,
+            unsafe { &mut *conn_ptr }.call(msg_type, payload),
+        )
+        .await;
+        match result {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(e)) => {
+                self.conns.borrow_mut().remove(&sock);
+                Err(e)
+            }
+            Err(_elapsed) => {
+                // Mid-protocol: we sent a request but stopped reading.
+                // Reusing this conn could starve the next caller.
+                self.conns.borrow_mut().remove(&sock);
+                Err(anyhow::anyhow!("rpc to {addr} timed out after {timeout:?}"))
+            }
+        }
+    }
+
 
     async fn get_or_connect(&self, addr: SocketAddr) -> Result<Rc<RefCell<RpcConn>>> {
         if let Some(conn) = self.conns.borrow().get(&addr) {
@@ -297,6 +333,17 @@ pub struct AutumnManager {
     runtime_started: Rc<Cell<bool>>,
     ps_last_heartbeat: Rc<RefCell<HashMap<u64, Instant>>>,
     conn_pool: Rc<ConnPool>,
+    /// F191: dedicated pool for control-plane RPCs to extent nodes
+    /// (`EXT_MSG_DF`, future `MSG_REPORT_DISK_FAILURE`, future heartbeat).
+    /// Separate from `conn_pool` (which carries data-plane RPCs like
+    /// `CONVERT_TO_EC`, `COPY_EXTENT`, `RECOVERY`). The split prevents a
+    /// large data-plane RPC's TCP send buffer / io_uring CQ pressure
+    /// from delaying the next DF probe to the point where the
+    /// `RpcClient` flips its `closed` flag and the disk_status loop
+    /// flaps the node `online → offline → online`. All DF traffic goes
+    /// here at `node.control_address` (or `node.address` for legacy
+    /// nodes whose `control_address` is empty).
+    control_pool: Rc<ConnPool>,
     /// F109: extents whose refcount dropped to 0 and whose physical
     /// `.dat`/`.meta` files still need to be unlinked on every replica.
     /// Drained by `extent_delete_loop`. In-memory only — manager
@@ -339,6 +386,7 @@ impl AutumnManager {
             runtime_started: Rc::new(Cell::new(false)),
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),
             conn_pool: Rc::new(ConnPool::new()),
+            control_pool: Rc::new(ConnPool::new()),
             pending_extent_deletes: Rc::new(RefCell::new(VecDeque::new())),
             last_op_at: Rc::new(RefCell::new(HashMap::new())),
             policy: Rc::new(RefCell::new(crate::policy::PolicyEngine::default())),
@@ -2148,6 +2196,7 @@ mod tests {
                 addr: "127.0.0.1:4001".to_string(),
                 disk_uuids: vec!["d1".to_string()],
                 shard_ports: vec![],
+                control_address: String::new(),
             });
             let resp = m.handle_register_node(req).await.unwrap();
             let r: RegisterNodeResp = rkyv_decode(&resp).unwrap();
@@ -2157,6 +2206,7 @@ mod tests {
                 addr: "127.0.0.1:4001".to_string(),
                 disk_uuids: vec!["d2".to_string()],
                 shard_ports: vec![],
+                control_address: String::new(),
             });
             let resp2 = m.handle_register_node(req2).await.unwrap();
             let r2: RegisterNodeResp = rkyv_decode(&resp2).unwrap();
@@ -2732,6 +2782,7 @@ mod tests {
                     addr: addr.to_string(),
                     disk_uuids: vec![format!("disk-{nid}")],
                     shard_ports: vec![],
+                    control_address: String::new(),
                 });
                 let resp = m.handle_register_node(req).await.unwrap();
                 let r: RegisterNodeResp = rkyv_decode(&resp).unwrap();
@@ -3701,6 +3752,7 @@ mod tests {
                     address: format!("127.0.0.1:{}", 9000 + nid),
                     disks: vec![did],
                     shard_ports: vec![],
+                    control_address: String::new(),
                 },
             );
             disks.insert(
@@ -3753,6 +3805,7 @@ mod tests {
                     address: format!("127.0.0.1:{}", 9000 + nid),
                     disks: vec![100 + nid],
                     shard_ports: vec![],
+                    control_address: String::new(),
                 },
             );
         }

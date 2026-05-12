@@ -168,6 +168,9 @@ enum Command {
         /// Empty = legacy single-thread extent-node (client routes all
         /// extents to `addr`).
         shard_ports: Vec<u16>,
+        /// F191: control-plane listener address. Empty = manager falls
+        /// back to `addr` for DF (legacy behaviour).
+        control_address: String,
     },
     Format {
         listen: String,
@@ -552,6 +555,9 @@ fn parse_args() -> Args {
             let mut addr = String::new();
             let mut disks: Vec<String> = Vec::new();
             let mut shard_ports: Vec<u16> = Vec::new();
+            // F191: optional --control-address override; default = empty
+            // (manager falls back to data-plane addr).
+            let mut control_address = String::new();
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--addr" => { i += 1; addr = raw[i].clone(); }
@@ -566,6 +572,7 @@ fn parse_args() -> Args {
                             shard_ports.push(port);
                         }
                     }
+                    "--control-address" => { i += 1; control_address = raw[i].clone(); }
                     _ => {}
                 }
                 i += 1;
@@ -577,7 +584,7 @@ fn parse_args() -> Args {
             if disks.is_empty() {
                 disks.push("disk-default".to_string());
             }
-            Command::RegisterNode { addr, disks, shard_ports }
+            Command::RegisterNode { addr, disks, shard_ports, control_address }
         }
         "format" => {
             let mut listen = String::new();
@@ -1075,6 +1082,25 @@ fn parse_write_results(json: &str) -> Result<(Vec<BenchResult>, usize)> {
 // Format helpers
 // ---------------------------------------------------------------------------
 
+/// F191: derive the default control-plane address from a data-plane
+/// `host:port` (or `[v6]:port`). Returns the same host with `port + 1000`.
+/// Returns the empty string on parse failure — the manager treats empty
+/// `control_address` as "fall back to the data-plane addr". Tested below.
+pub(crate) fn derive_control_address(advertise: &str) -> String {
+    let Some(colon) = advertise.rfind(':') else {
+        return String::new();
+    };
+    let (host, port_str) = advertise.split_at(colon);
+    let port_str = &port_str[1..];
+    let Ok(port) = port_str.parse::<u16>() else {
+        return String::new();
+    };
+    let Some(ctl_port) = port.checked_add(1000) else {
+        return String::new();
+    };
+    format!("{host}:{ctl_port}")
+}
+
 fn format_disk(dir: &str) -> Result<String> {
     for byte in 0u8..=255 {
         let subdir = format!("{}/{:02x}", dir, byte);
@@ -1091,6 +1117,36 @@ fn format_disk(dir: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F191: control-address derivation defaults to `host:port + 1000`,
+    /// falls back to empty on bogus input.
+    #[test]
+    fn derive_control_address_ipv4_offsets_port_by_1000() {
+        assert_eq!(
+            super::derive_control_address("127.0.0.1:9101"),
+            "127.0.0.1:10101"
+        );
+        assert_eq!(
+            super::derive_control_address("10.0.0.42:9201"),
+            "10.0.0.42:10201"
+        );
+    }
+
+    #[test]
+    fn derive_control_address_v6_bracketed_offsets_port_by_1000() {
+        assert_eq!(
+            super::derive_control_address("[fe80::1]:9101"),
+            "[fe80::1]:10101"
+        );
+    }
+
+    #[test]
+    fn derive_control_address_falls_back_to_empty_on_bad_input() {
+        assert_eq!(super::derive_control_address("no-port-here"), "");
+        assert_eq!(super::derive_control_address(""), "");
+        // port overflow → empty
+        assert_eq!(super::derive_control_address("127.0.0.1:65000"), "");
+    }
 
     #[test]
     fn parse_bool_flag_accepts_expected_values() {
@@ -1591,13 +1647,14 @@ async fn main() -> Result<()> {
             println!("forcegc triggered for partition {part_id}, extents={extent_ids:?}");
         }
 
-        Command::RegisterNode { addr, disks, shard_ports } => {
+        Command::RegisterNode { addr, disks, shard_ports, control_address } => {
             // Retry on CODE_NOT_LEADER: manager may still be completing etcd
             // leader election when cluster.sh fires the first register-node.
             let req_bytes = rkyv_encode(&RegisterNodeReq {
                 addr: addr.clone(),
                 disk_uuids: disks,
                 shard_ports: shard_ports.clone(),
+                control_address: control_address.clone(),
             });
             let mut attempt = 0u32;
             let resp = loop {
@@ -1636,6 +1693,12 @@ async fn main() -> Result<()> {
                 disk_uuids.push(uuid);
             }
 
+            // F191: derive the control address from `advertise` by
+            // offsetting the port by +1000 (matching the ExtentNode
+            // default control listener). If parsing fails (unusual host
+            // form), fall back to empty so the manager keeps using the
+            // data-plane addr.
+            let control_address = derive_control_address(&advertise);
             let resp_bytes = client
                 .mgr()?
                 .call(
@@ -1645,6 +1708,7 @@ async fn main() -> Result<()> {
                         disk_uuids: disk_uuids.clone(),
                         // F099-M: format path always uses legacy single-shard mode.
                         shard_ports: vec![],
+                        control_address,
                     }),
                 )
                 .await
@@ -2650,7 +2714,16 @@ async fn main() -> Result<()> {
                 if part.is_none() && top.is_none() {
                     println!("=== Nodes ===");
                     for (nid, n) in &nodes_sorted {
-                        println!("  node {}: addr={}", nid, n.address);
+                        // F191: display the control_address when present.
+                        // Empty = legacy node; manager falls back to addr.
+                        if n.control_address.is_empty() {
+                            println!("  node {}: addr={}", nid, n.address);
+                        } else {
+                            println!(
+                                "  node {}: addr={}, control_addr={}",
+                                nid, n.address, n.control_address
+                            );
+                        }
                         for did in &n.disks {
                             if let Some(d) = disk_map.get(did) {
                                 println!("    disk {}: uuid={}, online={}", did, d.uuid, d.online);

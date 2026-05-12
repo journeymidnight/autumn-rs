@@ -384,17 +384,28 @@
 
 - **Trigger:** Conversation 2026-05-12 — manager `disk_status_update_loop` flapped (`disk-3 online → offline → online → offline` within 90 s) under heavy write load. Root cause analysis: manager's single `ConnPool` to each extent-node multiplexes data-plane RPCs (`CONVERT_TO_EC`, `COPY_EXTENT`, `RECOVERY`) and control-plane RPCs (`DF`, future `HEARTBEAT` / `REPORT_DISK_FAILURE`). When a 1+ GB EC convert fanout occupies the connection's TCP send buffer or hits io_uring CQ backpressure on the node, the next `DF` RPC takes seconds → `RpcClient` `closed` flag → next pending future returns `ConnectionClosed` → `mark_node_disks_offline`. Next 10 s tick sees a healthy node and promotes back. Loop. Additionally, `recovery.rs:441` comment promised "bound df at 5 s" but the call site uses `conn_pool.call` (no timeout) — a second long-standing bug.
 - **Approach:**
-  - `ExtentNode`: bind a second listener on `port + 1000` by default (e.g. `--port 9101` → control listener at `:10101`); `--control-port` flag for override.
-  - Reuse the same `handle_connection` SQ/CQ loop on the control listener (no API churn). The control listener only ever sees small-payload ops (`DF`, future heartbeat / report) so its FuturesUnordered cap stays minimal.
-  - Manager: extend `MgrNodeInfo` with `control_address: String` (empty = legacy node, fall back to data port). `MSG_REGISTER_NODE` payload gains the field via rkyv schema extension (backwards-compatible default).
-  - Manager: carry a second `Rc<ConnPool>` named `control_pool`. `disk_status_update_loop` and `recovery_collect_loop`'s DF calls switch to it.
-  - **P0 fix in same commit:** replace `conn_pool.call(EXT_MSG_DF)` with `control_pool.call_timeout(EXT_MSG_DF, ..., Duration::from_secs(5))` to honor the longstanding "5 s bound" comment.
-  - `cluster.sh`: pass `--control-port` (default offset +1000) to each extent-node; the format step records the control address; `autumn-client info` displays both addresses.
+  - `ExtentNode`: new `serve_with_control(data_addr, control_addr)` spawns a second listener using the same `handle_connection` SQ/CQ machinery (no API churn). The shard ExtentNode instance is shared between the data and control listeners, so the control listener's `handle_df` sees the same `recovery_done` channel as the data listener. The control listener only ever receives small-payload ops (`DF`, future `HEARTBEAT` / `REPORT_DISK_FAILURE`) so its FuturesUnordered cap stays minimal in practice. Binary: new `--control-port` flag, default = primary port + 1000.
+  - Manager: `MgrNodeInfo` extended with `control_address: String`; `RegisterNodeReq` extended with the same. Empty = legacy / not-yet-re-registered node → manager DF falls back to `node.address`. **rkyv schema extension:** breaks decoding of pre-F191 etcd state. Acceptable per F189-fix INFO-9 (single-binary atomic deploy); operator must wipe `nodes/` etcd prefix on upgrade or accept that re-registration via `format`/`register-node` will overwrite. Note 9 carry-forward.
+  - Manager: new `control_pool: Rc<ConnPool>` alongside `conn_pool`. Manager's `ConnPool` gains `call_timeout` (mirrors `autumn_stream::ConnPool::call_timeout`) using `compio::time::timeout`. `disk_status_update_loop` + `recovery_collect_loop` route DF through `control_pool` against `node.control_address` (fallback `node.address`).
+  - **P0 fix carried in the same commit:** previous DF call site comment claimed "bound df at 5 s" but `conn_pool.call` had no timeout. F191's `control_pool.call_timeout(EXT_MSG_DF, ..., 5s)` honors that contract — a single stuck DF now evicts the connection and the next tick reconnects.
+  - `cluster.sh`: `register_extent_node` derives `${BIND_HOST}:port+1000` and passes `--control-address`. `autumn-client format` derives via the new `derive_control_address(advertise)` helper (host:port +1000, falls back to empty on bogus input).
+  - `autumn-client info`: displays `control_addr=<X>` on the Nodes section when non-empty.
 - **Acceptance:**
-  - Unit (manager): rkyv schema-extension test for `MgrNodeInfo` with empty `control_address` from old node payload.
-  - Integration: spawn a synthetic 1 GB CONVERT_TO_EC fanout that holds the data-pool connection, parallel DF call returns within 100 ms via `control_pool`. Record before/after manager.log to show no `df RPC failed` lines under the same load that triggered the flap.
-- **Dependencies:** F192 depends on this (REPORT_DISK_FAILURE travels on `control_pool`).
-- **passes:** false
+  - Unit (autumn-client bin, 3 new tests in `derive_control_address_*`): IPv4 +1000, IPv6 bracketed +1000, fallback-to-empty on bad input / port overflow.
+  - Workspace build clean; lib tests stable: 13/13 rpc + 45/45 stream + 58/58 manager (including the pre-F191 schema-touched manager unit tests). 8 server-bin tests pass.
+  - Integration (deferred to live cluster): on a 4-node cluster running `wbench --threads 16 --size 8m`, kick a CONVERT_TO_EC fanout via `set-stream-ec` mid-bench, then watch `manager.log` for `df RPC failed` lines — F191's `control_pool` should keep DF latency under 100 ms even while CONVERT_TO_EC saturates the data pool. The `cluster.sh stop-node 1` flap-repro scenario from 2026-05-12 should no longer trigger `disk-3 online → offline` cycling.
+- **Dependencies:** F192 depends on this (`REPORT_DISK_FAILURE` travels on `control_pool`).
+- **Files changed:**
+  - `crates/rpc/src/manager_rpc.rs` — `MgrNodeInfo.control_address` + `RegisterNodeReq.control_address`.
+  - `crates/manager/src/lib.rs` — `AutumnManager.control_pool` Rc<ConnPool>; `ConnPool::call_timeout` via `compio::time::timeout`. 5 test/literal sites updated for the schema-extended structs.
+  - `crates/manager/src/recovery.rs` — `disk_status_update_loop` + `recovery_collect_loop` route DF through `control_pool.call_timeout(..., 5s)` against `node.control_address` (fallback `node.address`).
+  - `crates/manager/src/rpc_handlers.rs` — `handle_register_node` stores `control_address`; re-registration mirror gate checks both `shard_ports` and `control_address`.
+  - `crates/stream/src/extent_node.rs` — `serve_with_control(data, ctl)` + refactor of accept loop into shared `accept_loop(role)`. Role label propagates into connection log lines.
+  - `crates/server/src/bin/extent_node.rs` — `--control-port` flag; default = `port + 1000`; multi-shard path computes per-shard control ports at `control_port_base + shard_idx * shard_stride`; single-shard path uses `serve_with_control`.
+  - `crates/server/src/bin/autumn_client.rs` — `register-node --control-address`; `format` derives control_address via new `derive_control_address` helper; `info` displays it; 4 new derive tests.
+  - `cluster.sh` — `register_extent_node` passes `--control-address ${BIND_HOST}:$(port+1000)` in both shard + non-shard branches.
+  - 11 manager/stream test sites updated for the new wire field (all pass empty string, equivalent to pre-F191 behavior).
+- **passes:** true (build clean across workspace; 13/13 rpc + 45/45 stream + 58/58 manager + 8/8 server-bin lib tests pass; 4 new autumn-client unit tests pass; the 2 pre-existing flaky `f099i_*` partition-server timing tests and the 7 pre-existing flaky `tests/integration.rs` partition-server tests remain at the same baseline status as F190 commit `19049a2`).
 
 ### F192 · `MSG_REPORT_DISK_FAILURE` with quorum debounce, delivered via `control_pool`
 

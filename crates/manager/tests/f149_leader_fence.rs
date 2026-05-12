@@ -132,6 +132,7 @@ fn f149_deposed_leader_etcd_writes_are_fenced() {
                     addr: "127.0.0.1:7771".to_string(),
                     disk_uuids: vec!["uuid-149-a".to_string()],
                     shard_ports: vec![],
+                    control_address: String::new(),
                 }),
             )
             .await
@@ -170,6 +171,7 @@ fn f149_deposed_leader_etcd_writes_are_fenced() {
                     addr: "127.0.0.1:7772".to_string(),
                     disk_uuids: vec!["uuid-149-b".to_string()],
                     shard_ports: vec![],
+                    control_address: String::new(),
                 }),
             )
             .await
@@ -191,6 +193,7 @@ fn f149_deposed_leader_etcd_writes_are_fenced() {
                     addr: "127.0.0.1:7773".to_string(),
                     disk_uuids: vec!["uuid-149-c".to_string()],
                     shard_ports: vec![],
+                    control_address: String::new(),
                 }),
             )
             .await

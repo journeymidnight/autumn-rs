@@ -270,6 +270,11 @@ launch_extent_node() {
 register_extent_node() {
     local i="$1"
     local port=$(( 9100 + i ))
+    # F191: derive the control-plane address as port + 1000 (matches the
+    # extent-node binary's default `--control-port`). Always passed so
+    # manager DF probes use the dedicated control_pool instead of the
+    # data-plane multiplex.
+    local ctl_port=$(( port + 1000 ))
     if (( SHARDS > 1 )); then
         local shard_ports_csv=""
         for (( s=0; s<SHARDS; s++ )); do
@@ -282,9 +287,12 @@ register_extent_node() {
         done
         "$AC" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" register-node \
             --addr "${BIND_HOST}:$port" --disk "disk-$i" \
-            --shard-ports "$shard_ports_csv"
+            --shard-ports "$shard_ports_csv" \
+            --control-address "${BIND_HOST}:$ctl_port"
     else
-        "$AC" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" register-node --addr "${BIND_HOST}:$port" --disk "disk-$i"
+        "$AC" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" register-node \
+            --addr "${BIND_HOST}:$port" --disk "disk-$i" \
+            --control-address "${BIND_HOST}:$ctl_port"
     fi
 }
 

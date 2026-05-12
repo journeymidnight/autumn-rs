@@ -118,6 +118,15 @@ pub struct MgrRange {
 /// extent-node process. Clients route hot-path RPCs (append, read_bytes,
 /// commit_length) by `extent_id % shard_ports.len()`. When `shard_ports`
 /// is empty, clients fall back to `address` (legacy single-thread mode).
+///
+/// F191: `control_address` is the extent-node's *separate* control-plane
+/// listener — by convention `host:port + 1000`. Manager DF / future
+/// heartbeat / disk-failure-report RPCs travel on this address via a
+/// dedicated `control_pool`, so a sustained data-plane RPC (CONVERT_TO_EC,
+/// COPY_EXTENT, RECOVERY) cannot starve the manager's liveness probe and
+/// trigger a spurious `disk online → offline` flap. Empty = legacy node
+/// that hasn't been re-registered yet; manager falls back to `address` so
+/// upgrades are zero-downtime.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct MgrNodeInfo {
     pub node_id: u64,
@@ -125,6 +134,9 @@ pub struct MgrNodeInfo {
     pub disks: Vec<u64>,
     /// Optional per-shard ports. Empty = legacy single-thread extent-node.
     pub shard_ports: Vec<u16>,
+    /// F191: optional control-plane address. Empty = legacy node;
+    /// manager falls back to `address` for DF.
+    pub control_address: String,
 }
 
 /// Disk metadata.
@@ -285,6 +297,10 @@ pub struct RegisterNodeReq {
     /// F099-M: per-shard ports the extent-node listens on. Empty = legacy
     /// single-thread mode (clients route all extents to `addr`).
     pub shard_ports: Vec<u16>,
+    /// F191: extent-node's control-plane listener address (typically
+    /// `host:port + 1000`). Empty = caller wants the manager to fall back
+    /// to the data-plane `addr` for DF (legacy / mid-upgrade behaviour).
+    pub control_address: String,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]

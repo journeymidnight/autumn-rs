@@ -25,6 +25,11 @@ struct Args {
     /// First core to pin shard threads to. Multi-process clusters on one host
     /// need disjoint values across processes so they don't share cores.
     cpu_start: usize,
+    /// F191: control-plane listener port. None → derive as `port + 1000`.
+    /// Each shard binds its own control listener at
+    /// `control_port + shard_idx * shard_stride`. Operators only need
+    /// to override this when 1000 collides on a non-default deployment.
+    control_port: Option<u16>,
 }
 
 fn parse_args() -> Args {
@@ -46,6 +51,8 @@ fn parse_args() -> Args {
     let mut bind_host = String::from("0.0.0.0");
     let mut transport = TransportKind::Tcp;
     let mut cpu_start: usize = 0;
+    // F191: optional override; default = port + 1000.
+    let mut control_port: Option<u16> = None;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -98,6 +105,10 @@ fn parse_args() -> Args {
                 i += 1;
                 cpu_start = args[i].parse().expect("--cpu-start must be a number");
             }
+            "--control-port" => {
+                i += 1;
+                control_port = Some(args[i].parse().expect("--control-port must be a number"));
+            }
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
@@ -117,6 +128,7 @@ fn parse_args() -> Args {
         bind_host,
         transport,
         cpu_start,
+        control_port,
     }
 }
 
@@ -135,6 +147,13 @@ fn main() -> Result<()> {
     // F099-M: each shard i listens on port + i * shard_stride.
     let shard_ports: Vec<u16> = (0..args.shards)
         .map(|i| args.port + (i as u16) * args.shard_stride)
+        .collect();
+    // F191: per-shard control port. Operator can override the shard-0
+    // base via --control-port; per-shard stride matches data plane so
+    // shard-N has its own control listener too.
+    let control_port_base = args.control_port.unwrap_or(args.port + 1000);
+    let control_ports: Vec<u16> = (0..args.shards)
+        .map(|i| control_port_base + (i as u16) * args.shard_stride)
         .collect();
 
     // Sibling addresses — used by each shard to forward control-plane RPCs
@@ -175,6 +194,7 @@ fn main() -> Result<()> {
         let bind_host = args.bind_host.clone();
         let cpu = autumn_common::pick_cpu_for_ord(shard_idx as usize);
 
+        let control_listen_port = control_ports[shard_idx as usize];
         let join = std::thread::Builder::new()
             .name(format!("extent-shard-{shard_idx}"))
             .spawn(move || -> Result<()> {
@@ -188,6 +208,13 @@ fn main() -> Result<()> {
                         .context("parse listen address")?;
                     autumn_transport::check_listen_addr(addr, autumn_transport::current().kind())
                         .ok();
+                    // F191: per-shard control listener — same SQ/CQ
+                    // machinery, no API churn.
+                    let ctl_addr = autumn_transport::format_listen_addr(
+                        &bind_host,
+                        control_listen_port,
+                    )
+                    .context("parse control listen address")?;
 
                     let mut cfg = if data_dirs.len() == 1 && disk_id.is_some() {
                         let data = data_dirs.into_iter().next().unwrap();
@@ -203,12 +230,13 @@ fn main() -> Result<()> {
                     tracing::info!(
                         shard_idx,
                         addr = %addr,
+                        ctl_addr = %ctl_addr,
                         "extent-node shard listening"
                     );
 
                     let node = ExtentNode::new(cfg).await
                         .with_context(|| format!("create ExtentNode shard {shard_idx}"))?;
-                    node.serve(addr).await
+                    node.serve_with_control(addr, ctl_addr).await
                 })
             })
             .with_context(|| format!("spawn extent-shard-{shard_idx}"))?;
@@ -234,10 +262,14 @@ fn run_single_shard(args: Args) -> Result<()> {
         .build()
         .context("create compio runtime")?;
     tracing::info!(?cpu, "extent-node (single-shard) runtime ready");
+    // F191: control port defaults to port + 1000.
+    let ctl_port = args.control_port.unwrap_or(args.port + 1000);
     rt.block_on(async move {
         let addr = autumn_transport::format_listen_addr(&args.bind_host, args.port)
             .context("parse listen address")?;
         autumn_transport::check_listen_addr(addr, autumn_transport::current().kind()).ok();
+        let ctl_addr = autumn_transport::format_listen_addr(&args.bind_host, ctl_port)
+            .context("parse control listen address")?;
 
         let config = if args.data_dirs.len() == 1 && args.disk_id.is_some() {
             let data = args.data_dirs.into_iter().next().unwrap();
@@ -254,10 +286,14 @@ fn run_single_shard(args: Args) -> Result<()> {
             c
         };
 
-        tracing::info!("autumn-extent-node listening on {addr}");
+        tracing::info!(
+            data_addr = %addr,
+            ctl_addr = %ctl_addr,
+            "autumn-extent-node listening"
+        );
 
         let node = ExtentNode::new(config).await.context("create ExtentNode")?;
-        node.serve(addr).await?;
+        node.serve_with_control(addr, ctl_addr).await?;
         Ok(())
     })
 }

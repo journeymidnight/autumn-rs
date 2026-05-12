@@ -189,14 +189,21 @@ impl AutumnManager {
                 }));
             }
 
-            // Update shard_ports if the node restarted with a different config.
+            // Update shard_ports + control_address if the node restarted
+            // with a different config.
             // F152: etcd-first ordering (CLAUDE.md note 1) — mirror to etcd
             // BEFORE updating in-memory store. The shard_ports change drives
             // route resolution; a crash mid-mirror leaves the new leader
             // routing to the OLD shard layout while the deposed leader's
             // memory had the new one.
-            if existing_node.shard_ports != req.shard_ports {
+            // F191: same applies to `control_address` — the manager's DF
+            // probe uses it; updating in-memory before mirror could cause
+            // the new leader to inherit a stale value on replay.
+            if existing_node.shard_ports != req.shard_ports
+                || existing_node.control_address != req.control_address
+            {
                 existing_node.shard_ports = req.shard_ports;
+                existing_node.control_address = req.control_address;
                 if let Err(err) = self.mirror_register_node(&existing_node, &[]).await {
                     return Ok(rkyv_encode(&RegisterNodeResp {
                         code: Self::err_to_code(&err),
@@ -252,6 +259,7 @@ impl AutumnManager {
                 address: req.addr,
                 disks: disk_ids,
                 shard_ports: req.shard_ports,
+                control_address: req.control_address,
             };
             (node, disk_infos, uuid_map, node_id)
         };

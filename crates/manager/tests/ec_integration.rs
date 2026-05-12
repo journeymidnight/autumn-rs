@@ -87,6 +87,7 @@ async fn setup_ec_stream(
                     addr: addr.to_string(),
                     disk_uuids: vec![disk.to_string()],
                     shard_ports: vec![],
+                    control_address: String::new(),
                 }),
             )
             .await

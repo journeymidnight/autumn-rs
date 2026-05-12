@@ -1,31 +1,43 @@
 Date: 2026-05-12
 TaskStatus: not_completed
-Task scope: F190-F193 — multi-feature loop. F190 implemented + tested
-            and ready to commit; F191-F193 still to go.
+Task scope: F190-F193 — multi-feature loop. F190 + F191 implemented and
+            ready to commit; F192-F193 still to go.
 
-F190 done in this commit:
+F190 done (commit 19049a2):
   - StreamAllocExtentReq.exclude_node_ids field (rkyv schema extension)
-  - StreamClient per-stream bad_nodes map (Rc<RefCell<>> shared between
-    worker apply_completion path and public-API alloc_new_extent_once)
+  - StreamClient per-stream bad_nodes map (Rc<RefCell<>>)
   - StreamTail.replica_node_ids parallel to replica_addrs
-  - apply_completion marks failing replica node_id on Err (skips
-    LockedByOther — control-plane fence event, not health signal)
-  - 30 s TTL (env: AUTUMN_STREAM_BAD_NODES_TTL_SECS, clamped 1-600 s)
+  - apply_completion marks failing replica node_id on Err
+    (skips LockedByOther)
+  - 30 s TTL (env AUTUMN_STREAM_BAD_NODES_TTL_SECS)
   - select_nodes + fallback walk filter by exclude_node_ids; fall back
     to unfiltered set if exclusion under-fills the pool
-  - 5 new unit tests: 3 bad_nodes semantics + 2 wire-compat round trip
-  - 45/45 stream lib + 58/58 manager lib + 13/13 rpc lib all green
-  - 2 pre-existing flaky f099i_* partition-server timing tests remain
-    failing pre-F190 (verified via git stash baseline)
+  - 5 new unit tests
+  - 45/45 stream + 58/58 manager + 13/13 rpc lib all green
+
+F191 done in this next commit:
+  - MgrNodeInfo.control_address + RegisterNodeReq.control_address
+    (rkyv schema extension — breaks pre-F191 etcd state, acceptable
+    per F189-fix INFO-9 atomic deploy; document operator action)
+  - ExtentNode.serve_with_control(data, ctl) spawns 2nd listener
+    using same handle_connection SQ/CQ machinery (shared instance)
+  - extent_node binary: --control-port flag, default port + 1000;
+    per-shard control ports at control_port_base + shard_idx * stride
+  - autumn-client register-node: --control-address flag
+  - autumn-client format: derives control_address via new helper
+    derive_control_address(advertise) → host:port + 1000
+  - autumn-client info: prints control_addr when present
+  - cluster.sh register_extent_node passes --control-address
+  - Manager: control_pool: Rc<ConnPool>; manager ConnPool gains
+    call_timeout via compio::time::timeout
+  - disk_status_update_loop + recovery_collect_loop route DF via
+    control_pool.call_timeout(..., 5s) against control_address
+    (fallback address for legacy nodes)
+  - P0 fix carried: replaces the long-standing "bound df at 5 s"
+    comment with actually-bounded behaviour
+  - 4 new autumn-client tests; workspace build + lib tests clean
 
 Next steps (this loop):
-  F191: ExtentNode bind 2nd listener at port+1000; --control-port flag.
-        MgrNodeInfo.control_address rkyv schema extension.
-        Manager carries control_pool: Rc<ConnPool>.
-        disk_status_update_loop + recovery_collect_loop DF calls switch
-        to control_pool. Replace conn_pool.call(EXT_MSG_DF) with
-        control_pool.call_timeout(..., 5s) — longstanding P0 bug fix.
-        cluster.sh + autumn-client info display both addresses.
   F192: depends on F191. New MSG_REPORT_DISK_FAILURE over control_pool;
         StreamClient fires fire-and-forget on apply_completion Err.
         Manager 60 s window, 3-distinct-reporter_part_id quorum →
@@ -34,10 +46,8 @@ Next steps (this loop):
   F193: independent. Pipelined EC encode (Option B, 2-chunk inflight),
         chunked recovery/copy_extent, jemallocator with dirty_decay_ms.
 
-Conversation context (carried from prior commit):
-  Live cluster (4 extent-nodes + 1 PS at 127.0.0.1) showed
-    1. disk-3 flap on extent-node 9103 (root cause: shared ConnPool
-       backpressure under EC convert; F191 fixes via control_pool).
-    2. forcegc 27 24 silent no-op (separate issue, deferred).
-    3. extent-node RSS at 369-770 MB steady, ~3 GB peak during EC
-       convert (F193 fixes).
+Pre-existing flaky tests carried unchanged from F190 baseline:
+  - 2 partition-server timing tests (f099i_d1_fast_path_no_fu_allocation,
+    f099i_fast_path_inactive_under_batch)
+  - 7 manager integration tests (partition_server_put_get_and_split_flow,
+    f029/f030/f031, f037 — flush/compact/split flow)

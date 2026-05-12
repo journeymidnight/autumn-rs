@@ -111,6 +111,7 @@ async fn setup_stream_3rep(mgr_addr: SocketAddr, n_addrs: [SocketAddr; 3]) -> u6
                     addr: addr.to_string(),
                     disk_uuids: vec![format!("disk-fanout-{i}")],
                     shard_ports: vec![],
+                    control_address: String::new(),
                 }),
             )
             .await
@@ -143,6 +144,7 @@ async fn setup_stream(mgr_addr: SocketAddr, n_addr: SocketAddr) -> u64 {
                 addr: n_addr.to_string(),
                 disk_uuids: vec!["disk-sqcq".to_string()],
                 shard_ports: vec![],
+                control_address: String::new(),
             }),
         )
         .await
