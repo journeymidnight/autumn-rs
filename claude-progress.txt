@@ -1,52 +1,50 @@
 Date: 2026-05-12
 TaskStatus: completed
-Task scope: F195 — eliminate env::var reads from production rs code,
-            route all config via CLI args. All 5 waves shipped.
+Task scope: F196 — static cpuset pre-allocation for EN/PS + PS reject-only
+            split gate + EN shards-from-cpuset + manager hot/cold advisory.
 
 Final state:
-  $ grep -rn "std::env::var" crates/ --include="*.rs" \
-        | grep -v tests/ | grep -v OUT_DIR
-  → zero matches
+  - autumn-common: cpu_pin gains set_cpuset / parse_cpuset / cpuset_len /
+    cpuset_explicit. `pick_cpu_for_ord` honors the explicit cpuset and
+    returns None past end (no wraparound).
+  - autumn-extent-node: --cpuset SPEC (taskset syntax) is the sole
+    sizing surface. shards = cpuset_len; --shards deprecated (WARN when
+    both --cpuset and --shards given).
+  - autumn-ps: --cpuset SPEC + new partition_budget. cpuset_len/2 caps
+    open_partition + handle_split_part. Split refuses with
+    FailedPrecondition when budget exhausted; sync_regions_once skips
+    new opens past budget with WARN. Pre-F196 deployments unaffected
+    (gate off when --cpuset omitted).
+  - autumn-manager policy.rs: compute_hot_cold_advisory(region_owners,
+    now) — single WARN line per PS when max/min(req_per_sec) >= 10
+    sustained AND hottest > SPLIT_QPS_HIGH/2, 5-min per-PS cooldown.
+    Pure log; does NOT join advisory_cache.
+  - cluster.sh: AUTUMN_PS_CPUSET + AUTUMN_EN${i}_CPUSET env passthrough
+    to --cpuset; legacy --cpu-start path preserved when neither set.
 
-Per-wave summary:
-  Wave 1 (commit fbeb482): manager F192 quorum debounce → 2 vars
-  Wave 2 (commit 0357fc2): stream + extent-node binary → 11 vars
-  Wave 3 (this commit): partition-server → 21 vars
-  Wave 4 (this commit): rpc frame V1 + autumn-client + pprof → 4 vars
-  Wave 5 (this commit): autumn-ps CLI + cluster.sh translation
+Stage breakdown:
+  Stage A: cpu_pin helper + CLI parsing on both binaries.
+           7 new parse_cpuset_* unit tests pass.
+  Stage B: PartitionBudget (Arc<AtomicUsize+max>), wired through
+           PartitionServer + PartitionData + partition_thread_main.
+           sync_regions_once inc/dec; handle_split_part gate.
+  Stage C: EN auto-sizes shards from cpuset_len; --shards deprecated.
+  Stage D: PolicyEngine::compute_hot_cold_advisory + 3 unit tests +
+           call site in policy_tick_loop.
+  Stage E: cluster.sh env passthrough; README updated; this progress
+           file; feature_list F196 entry; commit.
 
-  Cumulative: 38 of 38 env vars eliminated.
+Test pass:
+  cargo test -p autumn-common cpu_pin          → 7/7
+  cargo test -p autumn-manager --lib            → 65/65 (incl 3 new
+                                                  hot_cold_advisory_*)
+  cargo test -p autumn-partition-server --lib   → 131/131
 
-Wave 3 design pattern:
-  Each `static CELL: OnceLock<T>` previously hidden inside an env-
-  reading helper function is now lifted to module scope:
-    static MAX_WRITE_BATCH_CELL: OnceLock<usize> = OnceLock::new();
-  Paired with:
-    pub fn set_max_write_batch(n: usize) -> bool {
-        MAX_WRITE_BATCH_CELL.set(n.clamp(...)).is_ok()
-    }
-  Reader stays the same shape, with the env::var() call replaced by
-  the constant default:
-    fn max_write_batch() -> usize {
-        *MAX_WRITE_BATCH_CELL.get_or_init(|| DEFAULT_MAX_WRITE_BATCH)
-    }
-  Binary main() calls every set_* before constructing PartitionServer
-  via apply_ps_tunables(&args). First-call-wins guarantees the binary
-  value lands.
+Out of scope (deferred):
+  - NeedsMerge wire response (user deferred; reject-only for now).
+  - Auto-merge on advisory (advisory stays informational).
+  - Dynamic cpuset resize without process restart.
+  - Manager-side awareness of per-PS core budgets for routing.
 
-Workspace lib tests stable:
-  13 rpc + 50 stream + 62 manager + 131 PS lib pass
-  (2 pre-existing flaky f099i_* timing tests unchanged from F190-F194
-   baseline; they fail intermittently regardless of F195 changes)
-
-cluster.sh now translates AUTUMN_PS_* env vars into per-binary
-`--<flag>` invocations via the new launch_ps tunable_args array.
-The `env | grep AUTUMN_` snapshot in save_cluster_config is kept
-for restart fidelity (it captures operator intent at first start),
-but it no longer flows config into the binary through process env —
-the snapshot is sourced on restart, then translated to CLI flags
-the same way.
-
-Closes the F195 series. The "production rs code never reads env"
-project rule (recorded in memory) is now enforced by grep at the
-file level.
+Closes F196. Next-session starting point: feature_list.md F196 entry +
+this file's "Final state" section together describe what shipped.

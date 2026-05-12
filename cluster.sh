@@ -230,9 +230,20 @@ launch_extent_node() {
     # PS gets cores starting after all extent-node ranges (see launch_ps).
     # Skip --cpu-start when affinity is disabled (low core count / unknown
     # platform) — the binary then leaves all threads unpinned.
+    #
+    # F196: if the operator pre-allocates an explicit cpuset for this
+    # extent-node via AUTUMN_EN${i}_CPUSET (taskset syntax, e.g. "0-3"),
+    # the binary uses --cpuset and the legacy --cpu-start math is
+    # bypassed. The binary auto-sizes --shards from cpuset_len when
+    # --shards was omitted.
     local cpu_start=$(( (i - 1) * SHARDS ))
     local -a cpu_args=()
-    (( ${AFFINITY_ENABLED:-0} == 1 )) && cpu_args=(--cpu-start "$cpu_start")
+    local en_cpuset_var="AUTUMN_EN${i}_CPUSET"
+    if [[ -n "${!en_cpuset_var:-}" ]]; then
+        cpu_args=(--cpuset "${!en_cpuset_var}")
+    elif (( ${AFFINITY_ENABLED:-0} == 1 )); then
+        cpu_args=(--cpu-start "$cpu_start")
+    fi
     # shellcheck disable=SC2046  # intentional word splitting on commas
     mkdir -p $(echo "$disk_arg" | tr ',' ' ')
     if [[ "$disk_arg" == *,* ]]; then
@@ -304,10 +315,19 @@ launch_ps() {
     # (each EN owns SHARDS cores, REPLICAS nodes total → PS starts at
     # REPLICAS*SHARDS). Disjoint ranges prevent ord=0 collision on core 0.
     # Skip --cpu-start when AFFINITY_ENABLED=0 (low core count).
+    #
+    # F196: AUTUMN_PS_CPUSET (taskset syntax, e.g. "8-15") forwards directly
+    # to --cpuset and enables the PS's static partition budget gate
+    # (cpuset_len / 2). Without it, the legacy --cpu-start path runs and
+    # the gate is disabled (unlimited partitions, surplus threads unpinned
+    # with WARN — pre-F196 behaviour).
     local ps_cpu_start=$(( REPLICAS * SHARDS ))
     local -a cpu_args=()
     local affinity_msg="affinity=off"
-    if (( ${AFFINITY_ENABLED:-0} == 1 )); then
+    if [[ -n "${AUTUMN_PS_CPUSET:-}" ]]; then
+        cpu_args=(--cpuset "$AUTUMN_PS_CPUSET")
+        affinity_msg="cpuset=${AUTUMN_PS_CPUSET}"
+    elif (( ${AFFINITY_ENABLED:-0} == 1 )); then
         cpu_args=(--cpu-start "$ps_cpu_start")
         affinity_msg="cpu-start=$ps_cpu_start"
     fi

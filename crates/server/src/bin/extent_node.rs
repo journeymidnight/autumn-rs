@@ -44,7 +44,13 @@ struct Args {
     transport: TransportKind,
     /// First core to pin shard threads to. Multi-process clusters on one host
     /// need disjoint values across processes so they don't share cores.
+    /// Mutually exclusive with `--cpuset`.
     cpu_start: usize,
+    /// F196: explicit list of cores this binary may pin to, taskset
+    /// syntax (e.g. `4-11`, `0,2,4`, `0-3,8-11`). Overrides
+    /// `core_affinity::get_core_ids()` snapshot and disables
+    /// `--cpu-start`. When unset, behaviour matches pre-F196.
+    cpuset: Option<Vec<usize>>,
     /// F191: control-plane listener port. None → derive as `port + 1000`.
     /// Each shard binds its own control listener at
     /// `control_port + shard_idx * shard_stride`. Operators only need
@@ -73,6 +79,7 @@ fn parse_args() -> Args {
     let mut bind_host = String::from("0.0.0.0");
     let mut transport = TransportKind::Tcp;
     let mut cpu_start: usize = 0;
+    let mut cpuset: Option<Vec<usize>> = None;
     // F191: optional override; default = port + 1000.
     let mut control_port: Option<u16> = None;
     // F195: F194 + F099-I knobs as Option<usize>; library defaults when None.
@@ -131,6 +138,13 @@ fn parse_args() -> Args {
                 i += 1;
                 cpu_start = args[i].parse().expect("--cpu-start must be a number");
             }
+            "--cpuset" => {
+                i += 1;
+                cpuset = Some(autumn_common::parse_cpuset(&args[i]).unwrap_or_else(|e| {
+                    eprintln!("--cpuset parse error: {e}");
+                    std::process::exit(2);
+                }));
+            }
             "--control-port" => {
                 i += 1;
                 control_port = Some(args[i].parse().expect("--control-port must be a number"));
@@ -160,6 +174,14 @@ fn parse_args() -> Args {
         data_dirs.push(PathBuf::from("/tmp/autumn-extent"));
     }
 
+    // F196: --cpuset and --cpu-start are mutually exclusive at the CLI
+    // layer. cpuset is the final list; offset has no meaning on top of
+    // an explicit list.
+    if cpuset.is_some() && cpu_start != 0 {
+        eprintln!("error: --cpuset and --cpu-start are mutually exclusive");
+        std::process::exit(2);
+    }
+
     Args {
         port,
         data_dirs,
@@ -170,6 +192,7 @@ fn parse_args() -> Args {
         bind_host,
         transport,
         cpu_start,
+        cpuset,
         control_port,
         ec_convert_parallelism,
         recovery_parallelism,
@@ -203,9 +226,44 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let args = parse_args();
+    let mut args = parse_args();
     let _ = autumn_transport::init_with(args.transport);
-    autumn_common::set_cpu_offset(args.cpu_start);
+    // F196: --cpuset (if given) is installed BEFORE any cpu_pin reader
+    // fires, so the cached core list reflects the override. Otherwise
+    // fall back to the legacy --cpu-start offset.
+    let cpuset_given = args.cpuset.is_some();
+    let shards_given = args.shards != 1; // 1 is the legacy CLI default
+    if let Some(cs) = args.cpuset.clone() {
+        let _ = autumn_common::set_cpuset(cs);
+    } else {
+        autumn_common::set_cpu_offset(args.cpu_start);
+    }
+    // F196: `--cpuset` is the sole sizing surface. When given, shard count
+    // = cpuset_len; `--shards` (legacy) is ignored with a WARN if the
+    // operator passed it explicitly. Without `--cpuset`, `--shards` keeps
+    // the pre-F196 behaviour for back-compat.
+    let cpuset_n = autumn_common::cpuset_len();
+    if cpuset_given {
+        if shards_given && args.shards as usize != cpuset_n {
+            tracing::warn!(
+                shards = args.shards,
+                cpuset_len = cpuset_n,
+                "F196: --shards is deprecated when --cpuset is supplied; using cpuset_len as the shard count"
+            );
+        }
+        args.shards = cpuset_n.max(1) as u32;
+        tracing::info!(
+            cpuset_len = cpuset_n,
+            shards = args.shards,
+            "F196: EN sized from --cpuset"
+        );
+        if cpuset_n <= 1 {
+            tracing::warn!(
+                "F196: EN started with a single-core --cpuset; no parallelism across extent shards. \
+                 Consider growing --cpuset for production loads."
+            );
+        }
+    }
 
     // F099-M: each shard i listens on port + i * shard_stride.
     let shard_ports: Vec<u16> = (0..args.shards)

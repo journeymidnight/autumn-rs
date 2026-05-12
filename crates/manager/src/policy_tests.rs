@@ -618,3 +618,119 @@ fn maintenance_advisory_partial_window_no_trigger() {
     let out = eng.compute_maintenance_advisory(now);
     assert!(out.is_empty());
 }
+
+// ── F196 Stage D: hot/cold advisory ─────────────────────────────────────
+
+#[test]
+fn hot_cold_advisory_fires_on_10x_imbalance_same_ps() {
+    use crate::policy::{HOT_COLD_MIN_HOT_QPS, HOT_COLD_RATIO};
+    let mut eng = PolicyEngine::default();
+    let now = 1_700_000_000;
+    // Two partitions on PS=42: one hot (req_per_sec = HOT_COLD_MIN_HOT_QPS * 2),
+    // one cold (1 qps). Ratio > HOT_COLD_RATIO.
+    fill_window(
+        &mut eng,
+        100,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 100,
+            req_per_sec: HOT_COLD_MIN_HOT_QPS.saturating_mul(2),
+            ..Default::default()
+        },
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    fill_window(
+        &mut eng,
+        101,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 101,
+            req_per_sec: 1,
+            ..Default::default()
+        },
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    let owners: HashMap<u64, u64> = vec![(100u64, 42u64), (101, 42)].into_iter().collect();
+    // First call should record a cooldown entry.
+    eng.compute_hot_cold_advisory(&owners, now);
+    assert!(
+        eng.last_hot_cold_at.contains_key(&42),
+        "hot/cold advisory expected to fire on >{}x imbalance",
+        HOT_COLD_RATIO,
+    );
+}
+
+#[test]
+fn hot_cold_advisory_skips_when_hottest_below_floor() {
+    use crate::policy::HOT_COLD_MIN_HOT_QPS;
+    let mut eng = PolicyEngine::default();
+    let now = 1_700_000_000;
+    fill_window(
+        &mut eng,
+        100,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 100,
+            req_per_sec: HOT_COLD_MIN_HOT_QPS / 2, // below the floor
+            ..Default::default()
+        },
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    fill_window(
+        &mut eng,
+        101,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 101,
+            req_per_sec: 1,
+            ..Default::default()
+        },
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    let owners: HashMap<u64, u64> = vec![(100u64, 42u64), (101, 42)].into_iter().collect();
+    eng.compute_hot_cold_advisory(&owners, now);
+    assert!(
+        eng.last_hot_cold_at.get(&42).is_none(),
+        "advisory must suppress when hottest is below the QPS floor"
+    );
+}
+
+#[test]
+fn hot_cold_advisory_cooldown_dedupes() {
+    use crate::policy::{HOT_COLD_COOLDOWN_SEC, HOT_COLD_MIN_HOT_QPS};
+    let mut eng = PolicyEngine::default();
+    let t0 = 1_700_000_000;
+    fill_window(
+        &mut eng,
+        100,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 100,
+            req_per_sec: HOT_COLD_MIN_HOT_QPS.saturating_mul(2),
+            ..Default::default()
+        },
+        t0 - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    fill_window(
+        &mut eng,
+        101,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 101,
+            req_per_sec: 1,
+            ..Default::default()
+        },
+        t0 - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    let owners: HashMap<u64, u64> = vec![(100u64, 42u64), (101, 42)].into_iter().collect();
+    eng.compute_hot_cold_advisory(&owners, t0);
+    let first = eng.last_hot_cold_at.get(&42).copied().unwrap_or(0);
+    // Tick again well within cooldown — last_hot_cold_at must NOT update.
+    eng.compute_hot_cold_advisory(&owners, t0 + HOT_COLD_COOLDOWN_SEC / 2);
+    let second = eng.last_hot_cold_at.get(&42).copied().unwrap_or(0);
+    assert_eq!(first, second, "advisory inside cooldown must not refire");
+    // Past cooldown: refires.
+    eng.compute_hot_cold_advisory(&owners, t0 + HOT_COLD_COOLDOWN_SEC + 1);
+    let third = eng.last_hot_cold_at.get(&42).copied().unwrap_or(0);
+    assert!(third > first, "advisory past cooldown must refire");
+}

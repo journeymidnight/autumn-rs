@@ -766,6 +766,44 @@ autumn-ps --psid 1 --port 9201 --manager 127.0.0.1:9001 \
           --data /tmp/ps-wal --advertise 127.0.0.1:9201
 ```
 
+### F196 — static cpuset pre-allocation (ScyllaDB-style)
+
+Both `autumn-extent-node` and `autumn-ps` accept `--cpuset <SPEC>` using
+`taskset` syntax. When supplied, it overrides the auto-detected core
+list, disables `--cpu-start`, and enables per-binary static budgets:
+
+```
+autumn-extent-node --cpuset 0-3 --data /tmp/d1 ...
+autumn-ps          --cpuset 8-15 --psid 1 ...
+```
+
+- **EN** sets `shards = cpuset_len` (one shard per core). `--shards` is
+  legacy and ignored when `--cpuset` is supplied — a WARN fires if the
+  operator passed both. `cpuset_len == 1` warns about no parallelism.
+- **PS** sets `max_partitions = cpuset_len / 2` (each partition reserves
+  P-log + P-bulk). When the budget is exhausted, `split` returns
+  `FailedPrecondition: PS core budget exhausted (N / M partitions)` and
+  newly-assigned partitions from the manager are skipped at
+  `sync_regions` time with a WARN so the operator can grow `--cpuset`
+  or migrate the partition elsewhere.
+
+For `cluster.sh`, point `AUTUMN_PS_CPUSET` / `AUTUMN_EN{i}_CPUSET` at
+disjoint ranges:
+
+```bash
+AUTUMN_EN1_CPUSET=0-1 AUTUMN_EN2_CPUSET=2-3 AUTUMN_EN3_CPUSET=4-5 \
+AUTUMN_PS_CPUSET=6-15 \
+  ./cluster.sh up
+```
+
+The manager also emits a hot/cold imbalance advisory: a single WARN
+line per PS, at most every 5 minutes, when a partition's `req_per_sec`
+runs ≥ 10× another partition on the same PS for at least 5 consecutive
+1-minute buckets and the hottest is above `SPLIT_QPS_HIGH/2`. The
+advisory is informational — operators can use it to plan splits before
+the core budget gates further growth, or to plan merges of cold pairs
+to free a slot.
+
 ---
 
 ## Operations

@@ -45,6 +45,20 @@ pub const POLICY_WINDOW_BUCKETS: usize = 30;
 pub const POLICY_REQUIRED_BUCKETS: usize = 5;
 pub const POLICY_TICK_INTERVAL_SEC: i64 = 60;
 
+/// F196 Stage D: hot/cold imbalance advisory thresholds. Per PS, the
+/// ratio `max(req_per_sec) / max(1, min(req_per_sec))` over
+/// `required_buckets` consecutive sustained windows must exceed this
+/// to trigger a single WARN line listing the hot + cold partitions.
+pub const HOT_COLD_RATIO: u32 = 10;
+/// The hottest partition must additionally exceed this floor so a
+/// uniformly-cold cluster (e.g. idle dev) doesn't spam the operator.
+/// Default = half of `SPLIT_QPS_HIGH` so the floor scales with the
+/// split threshold operators already tune for.
+pub const HOT_COLD_MIN_HOT_QPS: u32 = SPLIT_QPS_HIGH / 2;
+/// Per-PS advisory cooldown — suppress re-emission for 5 min so the
+/// operator log isn't flooded while imbalance persists.
+pub const HOT_COLD_COOLDOWN_SEC: i64 = 300;
+
 /// F184: runtime-configurable policy thresholds. Production uses the
 /// `*_DEFAULT` constants above; tests can lower `required_buckets` and
 /// `tick_interval_sec` to exercise the full policy_tick_loop fast.
@@ -125,6 +139,9 @@ pub struct PolicyEngine {
     /// F184: runtime-configurable thresholds. Default production values;
     /// tests can override via `set_config`.
     pub config: PolicyConfig,
+    /// F196 Stage D: per-PS hot/cold advisory cooldown. Keyed by
+    /// `ps_id`; value is the unix-epoch second of the last WARN.
+    pub last_hot_cold_at: HashMap<u64, i64>,
 }
 
 impl PolicyEngine {
@@ -383,5 +400,111 @@ impl PolicyEngine {
         }
 
         out
+    }
+
+    /// F196 Stage D — hot/cold imbalance advisory.
+    ///
+    /// Groups partitions by their owning PS via `region_owners` and, for
+    /// every PS that hosts at least two metrics-tracked partitions,
+    /// computes the most recent `req_per_sec` of each. When the ratio
+    /// `max / max(1, min)` reaches `HOT_COLD_RATIO` over `required_buckets`
+    /// consecutive buckets AND the hottest exceeds `HOT_COLD_MIN_HOT_QPS`,
+    /// emits a single `WARN` line with the hot and cold partition ids.
+    ///
+    /// Pure log: nothing is appended to `advisory_cache`, no RPC is
+    /// dispatched. Operator-visible only.
+    ///
+    /// Per-PS cooldown via `last_hot_cold_at` keeps repeated emissions
+    /// at most once per `HOT_COLD_COOLDOWN_SEC` (5 min) even when the
+    /// imbalance persists for hours.
+    pub fn compute_hot_cold_advisory(
+        &mut self,
+        region_owners: &HashMap<u64, u64>,
+        now: i64,
+    ) {
+        let cfg = self.config.clone();
+        // ps_id -> Vec<(part_id, sustained_min_req, sustained_max_req)>
+        let mut by_ps: HashMap<u64, Vec<(u64, u32, u32)>> = HashMap::new();
+        for (&part_id, window) in self.metrics.iter() {
+            let bs: Vec<&(i64, PartitionLoad)> = window
+                .buckets
+                .iter()
+                .rev()
+                .take(cfg.required_buckets)
+                .collect();
+            if bs.len() < cfg.required_buckets {
+                continue;
+            }
+            let ps_id = match region_owners.get(&part_id) {
+                Some(p) => *p,
+                None => continue,
+            };
+            let min_req = bs
+                .iter()
+                .map(|(_, l)| l.req_per_sec)
+                .min()
+                .unwrap_or(0);
+            let max_req = bs
+                .iter()
+                .map(|(_, l)| l.req_per_sec)
+                .max()
+                .unwrap_or(0);
+            by_ps
+                .entry(ps_id)
+                .or_default()
+                .push((part_id, min_req, max_req));
+        }
+        for (ps_id, parts) in by_ps {
+            if parts.len() < 2 {
+                continue;
+            }
+            // Hottest = max of any partition's sustained max; coldest =
+            // min of any partition's sustained min. Using these endpoints
+            // (rather than per-partition averages) lets the advisory fire
+            // when the imbalance is sustained on both ends.
+            let hottest = parts.iter().map(|(_, _, mx)| *mx).max().unwrap_or(0);
+            let coldest = parts.iter().map(|(_, mn, _)| *mn).min().unwrap_or(0);
+            if hottest < HOT_COLD_MIN_HOT_QPS {
+                continue;
+            }
+            if hottest / coldest.max(1) < HOT_COLD_RATIO {
+                continue;
+            }
+            // Cooldown.
+            if let Some(&last) = self.last_hot_cold_at.get(&ps_id) {
+                if now - last < HOT_COLD_COOLDOWN_SEC {
+                    continue;
+                }
+            }
+            // Split parts list into hot vs cold by the same ratio against
+            // the median req_per_sec on this PS. Operator gets the lists
+            // straight, no sorting needed at the log reader.
+            let mut mids: Vec<u32> =
+                parts.iter().map(|(_, _, mx)| *mx).collect();
+            mids.sort_unstable();
+            let median = mids[mids.len() / 2].max(1);
+            let mut hot: Vec<u64> = parts
+                .iter()
+                .filter(|(_, _, mx)| *mx >= median.saturating_mul(2))
+                .map(|(p, _, _)| *p)
+                .collect();
+            let mut cold: Vec<u64> = parts
+                .iter()
+                .filter(|(_, mn, _)| (median as i64) >= (*mn as i64) * 2)
+                .map(|(p, _, _)| *p)
+                .collect();
+            hot.sort_unstable();
+            cold.sort_unstable();
+            tracing::warn!(
+                ps_id,
+                ratio = hottest / coldest.max(1),
+                hottest_qps = hottest,
+                coldest_qps = coldest,
+                hot_parts = ?hot,
+                cold_parts = ?cold,
+                "F196 hot/cold imbalance on PS — consider auto-split for the hot partitions, or merge the cold pair to free a core slot"
+            );
+            self.last_hot_cold_at.insert(ps_id, now);
+        }
     }
 }

@@ -3,6 +3,9 @@ pub mod error;
 pub mod metrics;
 pub mod store;
 
-pub use cpu_pin::{affinity_set, pick_cpu_for_ord, set_cpu_offset};
+pub use cpu_pin::{
+    affinity_set, cpuset_explicit, cpuset_len, parse_cpuset, pick_cpu_for_ord, set_cpu_offset,
+    set_cpuset,
+};
 pub use error::{AppError, AppResult};
 pub use store::{MetadataState, MetadataStore};

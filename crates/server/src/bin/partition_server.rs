@@ -23,6 +23,11 @@ struct Args {
     bind_host: String,
     transport: TransportKind,
     cpu_start: usize,
+    /// F196: explicit list of cores this binary may pin to, taskset
+    /// syntax (e.g. `4-11`, `0,2,4`, `0-3,8-11`). Overrides
+    /// `core_affinity::get_core_ids()` snapshot and disables
+    /// `--cpu-start`. Mutually exclusive with `--cpu-start`.
+    cpuset: Option<Vec<usize>>,
     // F195: PS tunables previously env::var-gated, now CLI flags.
     // `None` = library default. Defaults match pre-F195 env defaults.
     group_commit_cap: Option<usize>,
@@ -63,6 +68,7 @@ fn parse_args() -> Args {
     let mut bind_host = String::from("0.0.0.0");
     let mut transport = TransportKind::Tcp;
     let mut cpu_start: usize = 0;
+    let mut cpuset: Option<Vec<usize>> = None;
     // F195 tunables — None = library default.
     let mut group_commit_cap: Option<usize> = None;
     let mut ps_inflight_cap: Option<usize> = None;
@@ -127,6 +133,13 @@ fn parse_args() -> Args {
             "--cpu-start" => {
                 i += 1;
                 cpu_start = args[i].parse().expect("--cpu-start must be a number");
+            }
+            "--cpuset" => {
+                i += 1;
+                cpuset = Some(autumn_common::parse_cpuset(&args[i]).unwrap_or_else(|e| {
+                    eprintln!("--cpuset parse error: {e}");
+                    std::process::exit(2);
+                }));
             }
             // F099-J: `--conn-threads` is a no-op. Pre-F099-J it sized the
             // compio Dispatcher worker pool that ran ps-conn tasks; after
@@ -261,6 +274,11 @@ fn parse_args() -> Args {
                 eprintln!("  --cpu-start <N>      First core to pin partition threads to [default: 0]");
                 eprintln!("                       Multi-process clusters on one host need disjoint values");
                 eprintln!("                       so PS partitions don't share cores with extent-nodes.");
+                eprintln!("                       (F196: prefer --cpuset for explicit pre-allocation.)");
+                eprintln!("  --cpuset <SPEC>      F196: explicit core list, taskset syntax");
+                eprintln!("                       (e.g. 4-11, 0,2,4, 0-3,8-11). Overrides the");
+                eprintln!("                       auto-detected core list and disables --cpu-start.");
+                eprintln!("                       PS uses cpuset_len/2 as max partition budget.");
                 eprintln!("  --conn-threads <N>   [DEPRECATED, F099-J] accepted but ignored");
                 std::process::exit(0);
             }
@@ -274,6 +292,14 @@ fn parse_args() -> Args {
         std::process::exit(1);
     }
 
+    // F196: --cpuset and --cpu-start are mutually exclusive at the CLI
+    // layer. cpuset is the final list; offset has no meaning on top of
+    // an explicit list.
+    if cpuset.is_some() && cpu_start != 0 {
+        eprintln!("error: --cpuset and --cpu-start are mutually exclusive");
+        std::process::exit(2);
+    }
+
     Args {
         port,
         psid,
@@ -282,6 +308,7 @@ fn parse_args() -> Args {
         bind_host,
         transport,
         cpu_start,
+        cpuset,
         group_commit_cap,
         ps_inflight_cap,
         ps_bulk_inflight_cap,
@@ -445,7 +472,14 @@ async fn main() -> Result<()> {
     apply_ps_tunables(&args);
 
     let _ = autumn_transport::init_with(args.transport);
-    autumn_common::set_cpu_offset(args.cpu_start);
+    // F196: --cpuset (if given) is installed BEFORE any cpu_pin reader
+    // fires, so the cached core list reflects the override. Otherwise
+    // fall back to the legacy --cpu-start offset.
+    if let Some(cs) = args.cpuset.clone() {
+        let _ = autumn_common::set_cpuset(cs);
+    } else {
+        autumn_common::set_cpu_offset(args.cpu_start);
+    }
 
     #[cfg(unix)]
     unsafe {

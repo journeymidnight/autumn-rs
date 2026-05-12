@@ -342,6 +342,28 @@ pub(crate) async fn handle_split_part(
         return Err((StatusCode::FailedPrecondition, "cannot split: partition has overlapping keys".to_string()));
     }
 
+    // F196: refuse split when this PS's static core budget can't host the
+    // right child. The check fires only when `--cpuset` was supplied;
+    // pre-F196 deployments keep the legacy unlimited behaviour. We reject
+    // BEFORE any flush/commit_length/multi_modify_split so retries don't
+    // burn extent-node IO. Operator response: grow --cpuset, migrate
+    // partitions to another PS, or (future Stage D advisory) merge a cold
+    // partition first to free a slot.
+    {
+        let budget = part.borrow().partition_budget.clone();
+        if budget.would_exceed(1) {
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "F196: PS core budget exhausted ({} / {} partitions); split refused. \
+                     Operator: grow --cpuset or merge a cold partition first.",
+                    budget.current(),
+                    budget.max,
+                ),
+            ));
+        }
+    }
+
     // F140: Acquire compact_gate then gc_gate before reading commit_length.
     // compact_gate ensures no RowAppendReq is in-flight on P-bulk (do_compact
     // holds the gate for its full duration and awaits every compact_row_append

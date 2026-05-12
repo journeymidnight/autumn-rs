@@ -616,6 +616,12 @@ impl AutumnManager {
                 p.compute_maintenance_advisory(now)
             };
             cands.append(&mut maint);
+            // F196 Stage D: hot/cold imbalance advisory. Pure log line,
+            // does NOT join the advisory_cache (operator-facing only).
+            {
+                let mut p = self.policy.borrow_mut();
+                p.compute_hot_cold_advisory(&owners, now);
+            }
             // Persist the union into the advisory cache so
             // `MSG_GET_POLICY_CANDIDATES` returns SPLIT / MERGE / GC /
             // COMPACT in one call.

@@ -570,6 +570,11 @@ pub(crate) struct PartitionData {
     /// `io_bucket.account(bytes).await` before each write so a single PS
     /// can't blow past the cluster's BG_RATE budget.
     pub(crate) io_bucket: std::sync::Arc<crate::AdmissionController>,
+    /// F196: PS-wide partition budget (cpuset_len / 2 when --cpuset is
+    /// set; usize::MAX otherwise). `handle_split_part` consults this
+    /// before calling `multi_modify_split` so a split that would push
+    /// the PS past its core budget is rejected rather than oversubscribing.
+    pub(crate) partition_budget: std::sync::Arc<crate::PartitionBudget>,
     /// F162 (MED-2): per-extent reader-pin map. `handle_get → resolve_value`
     /// reads a ValuePointer from an SST, drops the partition borrow, and
     /// awaits `read_bytes_from_extent` on log_stream. Without coordination,
@@ -1156,6 +1161,10 @@ pub struct PartitionServer {
     /// tokens is Stage 3 territory). Default rate: 256 MiB/s. Tunable
     /// via env `AUTUMN_PS_BG_RATE_BYTES_PER_SEC` (0 = unlimited).
     pub(crate) io_bucket: std::sync::Arc<AdmissionController>,
+    /// F196 — static partition budget (ScyllaDB-style). Gate fires only
+    /// when `--cpuset` was explicitly supplied; otherwise `max =
+    /// usize::MAX` and `would_exceed` always returns false.
+    pub(crate) partition_budget: std::sync::Arc<PartitionBudget>,
 }
 
 /// F189 — two-class admission controller (CockroachDB `kvadmission`
@@ -1326,6 +1335,90 @@ impl AdmissionController {
     pub(crate) fn snapshot(&self) -> (u64, u64, Duration) {
         let s = self.state.lock();
         (s.fg_bytes, s.bg_bytes, s.window_start.elapsed())
+    }
+}
+
+/// F196: ScyllaDB-style static partition budget.
+///
+/// When the operator passes `--cpuset` to the PS binary, each partition
+/// reserves 2 cores (P-log + P-bulk), so the budget is `cpuset_len / 2`.
+/// `sync_regions_once` bumps `current` on insert and dec on remove;
+/// `handle_split_part` refuses to call `multi_modify_split` when adding
+/// one more partition would exceed `max`.
+///
+/// `max == usize::MAX` means "no gate" — surfaced when `--cpuset` was
+/// not supplied (legacy pre-F196 behaviour: surplus threads stay
+/// unpinned with a WARN).
+pub(crate) struct PartitionBudget {
+    pub(crate) max: usize,
+    pub(crate) current: std::sync::atomic::AtomicUsize,
+}
+
+impl PartitionBudget {
+    pub(crate) fn new(max: usize) -> Self {
+        Self {
+            max,
+            current: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    pub(crate) fn inc(&self) -> usize {
+        self.current
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+    pub(crate) fn dec(&self) -> usize {
+        let prev = self
+            .current
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if prev == 0 {
+            self.current
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            0
+        } else {
+            prev - 1
+        }
+    }
+    pub(crate) fn current(&self) -> usize {
+        self.current.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Returns `true` iff adding `delta` more partitions would push past
+    /// the budget. `max == usize::MAX` always returns `false` (gate off).
+    pub(crate) fn would_exceed(&self, delta: usize) -> bool {
+        if self.max == usize::MAX {
+            return false;
+        }
+        self.current().saturating_add(delta) > self.max
+    }
+}
+
+/// F196: pick the partition cap for this PS.
+///
+/// - When `--cpuset` was supplied explicitly (`cpuset_explicit() == true`),
+///   the cap is `cpuset_len / 2` because each partition reserves 2 OS
+///   threads (P-log + P-bulk). Floored at 1 so a single-core cpuset
+///   still permits one partition.
+/// - Otherwise the cap is `usize::MAX` (gate off — pre-F196 behaviour).
+pub(crate) fn compute_partition_budget_cap() -> usize {
+    use autumn_common::{cpuset_explicit, cpuset_len};
+    if cpuset_explicit() {
+        let n = cpuset_len();
+        let cap = n / 2;
+        if cap == 0 {
+            tracing::warn!(
+                cpuset_len = n,
+                "F196: --cpuset has < 2 cores; PS partition budget set to 1 (no headroom for P-bulk pinning)"
+            );
+            1
+        } else {
+            tracing::info!(
+                cpuset_len = n,
+                max_partitions = cap,
+                "F196: PS partition budget enforced (2 cores per partition)"
+            );
+            cap
+        }
+    } else {
+        usize::MAX
     }
 }
 
@@ -1591,6 +1684,9 @@ impl PartitionServer {
                             )),
                             compact_gate: CompactionGate::new(ps_major_compact_parallelism()),
                             io_bucket: std::sync::Arc::new(AdmissionController::from_env()),
+                            partition_budget: std::sync::Arc::new(PartitionBudget::new(
+                                compute_partition_budget_cap(),
+                            )),
                         };
                         return Ok(server);
                     } else if resp.code == manager_rpc::CODE_NOT_LEADER {
@@ -2057,7 +2153,11 @@ impl PartitionServer {
                     "PS {} F184 reloading partition {part_id} due to region change",
                     self.ps_id
                 );
-                self.partitions.borrow_mut().remove(&part_id);
+                if self.partitions.borrow_mut().remove(&part_id).is_some() {
+                    // F196: keep budget counter in sync with the live
+                    // partition map.
+                    self.partition_budget.dec();
+                }
             }
         }
 
@@ -2066,12 +2166,31 @@ impl PartitionServer {
             if self.partitions.borrow().contains_key(&part_id) {
                 continue;
             }
+            // F196: refuse to open a NEW partition when the static budget
+            // is exhausted. Manager assigned more partitions than the
+            // operator pre-allocated cores for; leave the slot uncovered
+            // so the operator sees `ps=unknown` in `client info` and can
+            // either grow --cpuset or add more PSes. Existing partitions
+            // are unaffected.
+            if self.partition_budget.would_exceed(1) {
+                tracing::warn!(
+                    ps_id = self.ps_id,
+                    part_id,
+                    current = self.partition_budget.current(),
+                    max = self.partition_budget.max,
+                    "F196: refusing to open partition — PS core budget exhausted (cpuset_len/2). \
+                     Operator must grow --cpuset or migrate this partition to another PS."
+                );
+                continue;
+            }
             tracing::info!("PS {} opening partition {part_id}", self.ps_id);
             let handle = self
                 .open_partition(part_id, rg, log_stream_id, row_stream_id, meta_stream_id)
                 .await?;
             tracing::info!("PS {} partition {part_id} opened", self.ps_id);
             self.partitions.borrow_mut().insert(part_id, handle);
+            // F196: bump budget counter only after a successful insert.
+            self.partition_budget.inc();
         }
         Ok(())
     }
@@ -2160,6 +2279,7 @@ impl PartitionServer {
         let advertise_addr_for_thread = advertise_addr.clone();
         let compact_gate_for_thread = self.compact_gate.clone();
         let io_bucket_for_thread = self.io_bucket.clone();
+        let partition_budget_for_thread = self.partition_budget.clone();
         // F183: build the metrics Arc on the main thread so we can keep
         // a clone in PartitionHandle for the report loop. The other clone
         // is moved into the partition thread and threaded into PartitionData.
@@ -2206,6 +2326,7 @@ impl PartitionServer {
                         gc_tx_for_thread,
                         gc_rx_main,
                         io_bucket_for_thread,
+                        partition_budget_for_thread,
                     )
                     .await
                     {
@@ -2987,6 +3108,7 @@ async fn partition_thread_main(
     gc_tx: mpsc::Sender<GcTask>,
     gc_rx: mpsc::Receiver<GcTask>,
     io_bucket: std::sync::Arc<crate::AdmissionController>,
+    partition_budget: std::sync::Arc<crate::PartitionBudget>,
 ) -> Result<()> {
     // F099-J: create the same-thread ps-conn ↔ merged_partition_loop
     // channel. Both endpoints live on THIS compio runtime, so sends and
@@ -3121,6 +3243,7 @@ async fn partition_thread_main(
         compact_gate: compact_gate.clone(),
         gc_gate: gc_gate.clone(),
         io_bucket: io_bucket.clone(),
+        partition_budget: partition_budget.clone(),
         extent_pins: std::cell::RefCell::new(std::collections::HashMap::new()),
         frozen_for_merge: Cell::new(None),
         freeze_drain_ack: std::cell::RefCell::new(None),
