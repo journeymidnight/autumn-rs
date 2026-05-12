@@ -569,10 +569,11 @@ pub(crate) struct PartitionData {
     /// acquires this to ensure run_gc has no log_stream append in-flight when
     /// commit_length is read.
     pub(crate) gc_gate: std::sync::Arc<CompactionGate>,
-    /// F188: PS-wide background-IO token bucket. Shared with every other
-    /// partition on this PS; GC + compact append paths call
-    /// `io_bucket.account(bytes).await` before each write so a single PS
-    /// can't blow past the cluster's BG_RATE budget.
+    /// F196: per-partition admission controller. Each partition gets
+    /// its own `Arc<AdmissionController>` with `total / N` per dimension
+    /// (constructed in `partition_thread_main` from
+    /// `PartitionServer.admission_totals`). Strict thread-per-core
+    /// isolation: a busy partition can't starve sibling bg work.
     pub(crate) io_bucket: std::sync::Arc<crate::AdmissionController>,
     /// F196: PS-wide partition budget (cpuset_len / 2 when --cpuset is
     /// set; usize::MAX otherwise). `handle_split_part` consults this
@@ -1159,12 +1160,16 @@ pub struct PartitionServer {
     /// F104 — global cap on simultaneous compactions across partitions
     /// hosted by this PS process. See `CompactionGate` docs above.
     compact_gate: std::sync::Arc<CompactionGate>,
-    /// F188 — PS-wide background-IO token bucket. Shared by every
-    /// partition's GC + compact append paths. Foreground writes do NOT
-    /// consult it (true admission control with elastic vs priority
-    /// tokens is Stage 3 territory). Default rate: 256 MiB/s. Tunable
-    /// via env `AUTUMN_PS_BG_RATE_BYTES_PER_SEC` (0 = unlimited).
-    pub(crate) io_bucket: std::sync::Arc<AdmissionController>,
+    /// F196: admission "total budget" + saturated ratio. Each new
+    /// partition opened by this PS constructs its own
+    /// `Arc<AdmissionController>` with `total / N` per dimension, where
+    /// `N = partition_budget.max` when `--cpuset` is supplied, else a
+    /// fixed 8 (matches `AUTUMN_PS_PARTS_HINT` in `cluster.sh`). Pre-F196
+    /// the controller was PS-wide (one Arc shared across partitions);
+    /// per-partition aligns with the thread-per-core P-log isolation
+    /// model — one busy partition can't burn through a sibling's bg
+    /// budget.
+    pub(crate) admission_totals: AdmissionTotals,
     /// F196 — static partition budget (ScyllaDB-style). Gate fires only
     /// when `--cpuset` was explicitly supplied; otherwise `max =
     /// usize::MAX` and `would_exceed` always returns false.
@@ -1224,6 +1229,45 @@ struct AdmissionState {
     fg_bytes: u64,
     fg_ops: u64,
     bg_bytes: u64,
+}
+
+/// F196: PS-wide "total budget" used to derive per-partition
+/// `AdmissionController` instances at `open_partition` time. The
+/// PS itself no longer owns a single shared controller.
+#[derive(Clone, Copy, Debug)]
+pub struct AdmissionTotals {
+    pub fg_bytes_per_sec: u64,
+    pub fg_iops_per_sec: u64,
+    pub bg_bytes_per_sec: u64,
+    pub saturated_ratio: f64,
+}
+
+impl AdmissionTotals {
+    /// Read the process-global setters (defaults match F189/F196).
+    pub fn from_env() -> Self {
+        Self {
+            fg_bytes_per_sec: *PS_FG_RATE_BYTES_PER_SEC_CELL
+                .get_or_init(|| 2 * 1024 * 1024 * 1024),
+            fg_iops_per_sec: *PS_FG_IOPS_PER_SEC_CELL.get_or_init(|| 150_000),
+            bg_bytes_per_sec: *PS_BG_RATE_BYTES_PER_SEC_CELL
+                .get_or_init(|| 256 * 1024 * 1024),
+            saturated_ratio: *PS_FG_SATURATED_THRESHOLD_CELL.get_or_init(|| 0.8),
+        }
+    }
+
+    /// F196 per-partition split: divide each cap by `n`. A cap of 0
+    /// stays at 0 (unlimited) after division. Saturated ratio is
+    /// unchanged (it's a fraction, not a rate).
+    pub fn per_partition(&self, n: usize) -> AdmissionController {
+        let n = n.max(1) as u64;
+        let div = |v: u64| if v == 0 { 0 } else { v / n };
+        AdmissionController::new(
+            div(self.fg_bytes_per_sec),
+            div(self.fg_iops_per_sec),
+            div(self.bg_bytes_per_sec),
+            self.saturated_ratio,
+        )
+    }
 }
 
 impl AdmissionController {
@@ -1692,6 +1736,35 @@ mod f189_admission_tests {
         });
     }
 
+    /// F196: AdmissionTotals.per_partition splits cap / N. A cap of
+    /// 0 (unlimited) stays at 0; saturated_ratio is preserved.
+    #[test]
+    fn admission_totals_per_partition_split() {
+        let totals = AdmissionTotals {
+            fg_bytes_per_sec: 2 * 1024 * 1024 * 1024,
+            fg_iops_per_sec: 150_000,
+            bg_bytes_per_sec: 256 * 1024 * 1024,
+            saturated_ratio: 0.8,
+        };
+        let ac = totals.per_partition(8);
+        assert_eq!(ac.fg_rate_bytes_per_sec, 2 * 1024 * 1024 * 1024 / 8);
+        assert_eq!(ac.fg_iops_per_sec, 150_000 / 8);
+        assert_eq!(ac.bg_rate_bytes_per_sec, 256 * 1024 * 1024 / 8);
+        // saturated_ratio carries through unchanged.
+        assert!((ac.fg_saturated_ratio - 0.8).abs() < 1e-9);
+        // 0 (unlimited) stays 0 after division.
+        let totals_zero = AdmissionTotals {
+            fg_bytes_per_sec: 0,
+            fg_iops_per_sec: 0,
+            bg_bytes_per_sec: 0,
+            saturated_ratio: 0.5,
+        };
+        let ac0 = totals_zero.per_partition(16);
+        assert_eq!(ac0.fg_rate_bytes_per_sec, 0);
+        assert_eq!(ac0.fg_iops_per_sec, 0);
+        assert_eq!(ac0.bg_rate_bytes_per_sec, 0);
+    }
+
     /// Window reset clears both counters after 1s. Regression guard:
     /// the reset path must not panic on first call and must zero fg+bg.
     #[test]
@@ -1814,7 +1887,7 @@ impl PartitionServer {
                                 String::from("0.0.0.0"),
                             )),
                             compact_gate: CompactionGate::new(ps_major_compact_parallelism()),
-                            io_bucket: std::sync::Arc::new(AdmissionController::from_env()),
+                            admission_totals: AdmissionTotals::from_env(),
                             partition_budget: std::sync::Arc::new(PartitionBudget::new(
                                 compute_partition_budget_cap(),
                             )),
@@ -2414,7 +2487,20 @@ impl PartitionServer {
         let owner_key_for_thread = owner_key.clone();
         let advertise_addr_for_thread = advertise_addr.clone();
         let compact_gate_for_thread = self.compact_gate.clone();
-        let io_bucket_for_thread = self.io_bucket.clone();
+        // F196: per-partition AdmissionController, sized as
+        // `total / N` where N = partition_budget.max when --cpuset is
+        // set, else PS_PARTS_HINT_FALLBACK (= 8, matches cluster.sh
+        // default). Built on the main thread so the partition thread
+        // receives a fresh Arc — no cross-partition sharing.
+        const PS_PARTS_HINT_FALLBACK: usize = 8;
+        let admission_n = if self.partition_budget.max == usize::MAX {
+            PS_PARTS_HINT_FALLBACK
+        } else {
+            self.partition_budget.max
+        };
+        let admission_for_thread = std::sync::Arc::new(
+            self.admission_totals.per_partition(admission_n),
+        );
         let partition_budget_for_thread = self.partition_budget.clone();
         // F183: build the metrics Arc on the main thread so we can keep
         // a clone in PartitionHandle for the report loop. The other clone
@@ -2461,7 +2547,7 @@ impl PartitionServer {
                         compact_rx_main,
                         gc_tx_for_thread,
                         gc_rx_main,
-                        io_bucket_for_thread,
+                        admission_for_thread,
                         partition_budget_for_thread,
                     )
                     .await

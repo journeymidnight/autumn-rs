@@ -57,6 +57,14 @@ Stage breakdown:
                  bytes-only (compact/GC are bulk). 9/9 admission
                  tests; new `--fg-iops-per-sec` CLI flag +
                  AUTUMN_PS_FG_IOPS_PER_SEC env passthrough.
+  Stage D-r5:    Admission becomes per-partition (was PS-wide).
+                 PartitionServer now holds AdmissionTotals (4 raw
+                 numbers); each open_partition constructs its own
+                 Arc<AdmissionController> with `total / N`. N is
+                 partition_budget.max when --cpuset is supplied,
+                 else 8 (PS_PARTS_HINT default). Aligns with
+                 thread-per-core: one busy partition can't burn
+                 sibling bg budgets via a shared Mutex.
   Stage E: cluster.sh env passthrough + even disjoint cpuset
            distribution (EN[i] + PS ranges); README updated; this
            progress file; feature_list F196 entry; commit.
