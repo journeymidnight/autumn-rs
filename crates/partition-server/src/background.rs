@@ -813,12 +813,15 @@ pub(crate) async fn start_write_batch(
     // when first waiter arrives; flush builds SST in parallel).
     let phase1_ns = duration_to_ns(phase1_started_at.elapsed());
 
-    // F189: foreground admission. Per-batch single Mutex acquire +
-    // bytes accounting. By default (AUTUMN_PS_FG_RATE_BYTES_PER_SEC=0)
-    // returns immediately after the lock — no sleep on the hot path.
-    // When set, this is the back-pressure point that lets bg writers
-    // see fg's actual rate and choose to yield via account_bg.
-    admission.account_fg(total_value_bytes).await;
+    // F189 + F196: foreground admission. Per-batch single Mutex acquire +
+    // (bytes, ops) accounting. bytes catches large-value workloads;
+    // ops catches small-value IOPS-bound workloads (4 KiB Puts saturate
+    // P-log long before bytes hit the cap). EITHER cap reached → fg
+    // sleeps. With both caps at 0 (unlimited) returns immediately —
+    // hot path stays cheap.
+    admission
+        .account_fg(total_value_bytes, valid.len() as u64)
+        .await;
 
     // Launch Phase 2 as a future (not awaited yet).
     let phase2_started_at = Instant::now();

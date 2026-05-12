@@ -39,6 +39,7 @@ struct Args {
     major_compact_parallelism: Option<usize>,
     conn_inflight_cap: Option<usize>,
     fg_rate_bytes_per_sec: Option<u64>,
+    fg_iops_per_sec: Option<u64>,
     bg_rate_bytes_per_sec: Option<u64>,
     fg_saturated_threshold: Option<f64>,
     fg_qps_quota: Option<u32>,
@@ -79,6 +80,7 @@ fn parse_args() -> Args {
     let mut major_compact_parallelism: Option<usize> = None;
     let mut conn_inflight_cap: Option<usize> = None;
     let mut fg_rate_bytes_per_sec: Option<u64> = None;
+    let mut fg_iops_per_sec: Option<u64> = None;
     let mut bg_rate_bytes_per_sec: Option<u64> = None;
     let mut fg_saturated_threshold: Option<f64> = None;
     let mut fg_qps_quota: Option<u32> = None;
@@ -193,6 +195,10 @@ fn parse_args() -> Args {
             "--fg-rate-bytes-per-sec" => {
                 i += 1;
                 fg_rate_bytes_per_sec = Some(args[i].parse().expect("--fg-rate-bytes-per-sec u64"));
+            }
+            "--fg-iops-per-sec" => {
+                i += 1;
+                fg_iops_per_sec = Some(args[i].parse().expect("--fg-iops-per-sec u64"));
             }
             "--bg-rate-bytes-per-sec" => {
                 i += 1;
@@ -318,6 +324,7 @@ fn parse_args() -> Args {
         major_compact_parallelism,
         conn_inflight_cap,
         fg_rate_bytes_per_sec,
+        fg_iops_per_sec,
         bg_rate_bytes_per_sec,
         fg_saturated_threshold,
         fg_qps_quota,
@@ -370,6 +377,9 @@ fn apply_ps_tunables(args: &Args) {
     }
     if let Some(n) = args.fg_rate_bytes_per_sec {
         ps::set_admission_fg_rate(n);
+    }
+    if let Some(n) = args.fg_iops_per_sec {
+        ps::set_admission_fg_iops(n);
     }
     if let Some(n) = args.bg_rate_bytes_per_sec {
         ps::set_admission_bg_rate(n);

@@ -358,6 +358,9 @@ launch_ps() {
     if [[ -n "${AUTUMN_PS_FG_RATE_BYTES_PER_SEC:-}" ]]; then
         tunable_args+=(--fg-rate-bytes-per-sec "$AUTUMN_PS_FG_RATE_BYTES_PER_SEC")
     fi
+    if [[ -n "${AUTUMN_PS_FG_IOPS_PER_SEC:-}" ]]; then
+        tunable_args+=(--fg-iops-per-sec "$AUTUMN_PS_FG_IOPS_PER_SEC")
+    fi
     if [[ -n "${AUTUMN_PS_BG_RATE_BYTES_PER_SEC:-}" ]]; then
         tunable_args+=(--bg-rate-bytes-per-sec "$AUTUMN_PS_BG_RATE_BYTES_PER_SEC")
     fi

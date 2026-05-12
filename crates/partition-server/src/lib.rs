@@ -71,6 +71,7 @@ static SHUTDOWN_TIMEOUT_MS_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock:
 static PS_MAJOR_COMPACT_PARALLELISM_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static PS_CONN_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static PS_FG_RATE_BYTES_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static PS_FG_IOPS_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static PS_BG_RATE_BYTES_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static PS_FG_SATURATED_THRESHOLD_CELL: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 static PS_FG_QPS_QUOTA_CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -114,6 +115,9 @@ pub fn set_ps_conn_inflight_cap(n: usize) -> bool {
 }
 pub fn set_admission_fg_rate(n: u64) -> bool {
     PS_FG_RATE_BYTES_PER_SEC_CELL.set(n).is_ok()
+}
+pub fn set_admission_fg_iops(n: u64) -> bool {
+    PS_FG_IOPS_PER_SEC_CELL.set(n).is_ok()
 }
 pub fn set_admission_bg_rate(n: u64) -> bool {
     PS_BG_RATE_BYTES_PER_SEC_CELL.set(n).is_ok()
@@ -1203,6 +1207,13 @@ pub struct PartitionServer {
 /// defer when fg is using >80% of its budget (1.6 GiB/s observed rate).
 pub struct AdmissionController {
     fg_rate_bytes_per_sec: u64,
+    /// F196: fg additionally rate-limited on op count. The bytes cap
+    /// catches large-value workloads (8M Puts at 1.7 GB/s) and the
+    /// ops cap catches small-value workloads (4K Puts at 110K ops/s
+    /// is IOPS-bound long before bytes hit the ceiling). Bg is bulk
+    /// IO (256 MB compact chunks, 4 MiB GC batches) and only needs
+    /// the bytes ceiling.
+    fg_iops_per_sec: u64,
     bg_rate_bytes_per_sec: u64,
     fg_saturated_ratio: f64,
     state: parking_lot::Mutex<AdmissionState>,
@@ -1211,22 +1222,26 @@ pub struct AdmissionController {
 struct AdmissionState {
     window_start: Instant,
     fg_bytes: u64,
+    fg_ops: u64,
     bg_bytes: u64,
 }
 
 impl AdmissionController {
     pub fn new(
         fg_rate_bytes_per_sec: u64,
+        fg_iops_per_sec: u64,
         bg_rate_bytes_per_sec: u64,
         fg_saturated_ratio: f64,
     ) -> Self {
         Self {
             fg_rate_bytes_per_sec,
+            fg_iops_per_sec,
             bg_rate_bytes_per_sec,
             fg_saturated_ratio: fg_saturated_ratio.clamp(0.1, 1.0),
             state: parking_lot::Mutex::new(AdmissionState {
                 window_start: Instant::now(),
                 fg_bytes: 0,
+                fg_ops: 0,
                 bg_bytes: 0,
             }),
         }
@@ -1239,45 +1254,67 @@ impl AdmissionController {
     /// `from_env` for call-site stability; semantically it is now
     /// "from process-global config setters."
     pub fn from_env() -> Self {
-        // F196: fg default 0 → 2 GiB/s. See doc comment above for the
-        // perf_check rationale. Operator can pass `--fg-rate-bytes-per-sec 0`
-        // to restore the pre-F196 unlimited behaviour.
+        // F196: fg-bytes default 0 → 2 GiB/s.
+        // F196: fg-iops  default 0 → 150_000 ops/s.
+        // Both numbers derived from perf_check baselines (see doc on
+        // AdmissionController). Either cap reached first → fg sleeps.
+        // Operator can pass `--fg-rate-bytes-per-sec 0` or
+        // `--fg-iops-per-sec 0` to disable that dimension individually.
         let fg_rate = *PS_FG_RATE_BYTES_PER_SEC_CELL
             .get_or_init(|| 2 * 1024 * 1024 * 1024);
+        let fg_iops = *PS_FG_IOPS_PER_SEC_CELL.get_or_init(|| 150_000);
         let bg_rate = *PS_BG_RATE_BYTES_PER_SEC_CELL.get_or_init(|| 256 * 1024 * 1024);
         let saturated = *PS_FG_SATURATED_THRESHOLD_CELL.get_or_init(|| 0.8);
-        Self::new(fg_rate, bg_rate, saturated)
+        Self::new(fg_rate, fg_iops, bg_rate, saturated)
     }
 
     fn maybe_reset_window(state: &mut AdmissionState) {
         if state.window_start.elapsed() >= Duration::from_secs(1) {
             state.window_start = Instant::now();
             state.fg_bytes = 0;
+            state.fg_ops = 0;
             state.bg_bytes = 0;
         }
     }
 
-    /// Foreground accounting. Sleeps only when an explicit fg ceiling
-    /// is set (`fg_rate_bytes_per_sec > 0`) AND the current window's
-    /// fg consumption would exceed it. Default (rate=0) returns
-    /// immediately after a single Mutex acquire — keep this CHEAP, it
-    /// runs on the request hot path.
-    pub async fn account_fg(&self, bytes: u64) {
+    /// Foreground accounting. Sleeps only when EITHER an explicit
+    /// fg-bytes or fg-iops ceiling is set AND the current window's
+    /// fg consumption would exceed it. Both caps are evaluated; the
+    /// LARGER required sleep wins (both constraints must hold). With
+    /// both rates at 0 (unlimited) this returns immediately after a
+    /// single Mutex acquire — keep this CHEAP, it runs on the request
+    /// hot path.
+    ///
+    /// `bytes` = total payload bytes in this batch (group commit unit).
+    /// `ops`   = number of user operations in this batch (1 per Put /
+    ///           Delete; callers pass `valid.len() as u64`).
+    pub async fn account_fg(&self, bytes: u64, ops: u64) {
         let sleep_for = {
             let mut s = self.state.lock();
             Self::maybe_reset_window(&mut s);
             s.fg_bytes = s.fg_bytes.saturating_add(bytes);
-            if self.fg_rate_bytes_per_sec == 0 {
+            s.fg_ops = s.fg_ops.saturating_add(ops);
+            let elapsed = s.window_start.elapsed();
+            let bytes_sleep: Option<Duration> = if self.fg_rate_bytes_per_sec == 0 {
                 None
             } else {
-                let target_secs = s.fg_bytes as f64 / self.fg_rate_bytes_per_sec as f64;
-                let target = Duration::from_secs_f64(target_secs);
-                let elapsed = s.window_start.elapsed();
-                if target > elapsed {
-                    Some(target - elapsed)
-                } else {
-                    None
-                }
+                let target = Duration::from_secs_f64(
+                    s.fg_bytes as f64 / self.fg_rate_bytes_per_sec as f64,
+                );
+                if target > elapsed { Some(target - elapsed) } else { None }
+            };
+            let iops_sleep: Option<Duration> = if self.fg_iops_per_sec == 0 {
+                None
+            } else {
+                let target = Duration::from_secs_f64(
+                    s.fg_ops as f64 / self.fg_iops_per_sec as f64,
+                );
+                if target > elapsed { Some(target - elapsed) } else { None }
+            };
+            match (bytes_sleep, iops_sleep) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
             }
         };
         if let Some(d) = sleep_for {
@@ -1310,26 +1347,34 @@ impl AdmissionController {
                     None
                 }
             };
-            // (2) fg-aware yield. Only active when an fg ceiling is set
-            // (otherwise we'd treat any fg activity as "saturated").
-            let fg_aware_sleep: Option<Duration> = if self.fg_rate_bytes_per_sec > 0 {
+            // (2) fg-aware yield. Active when EITHER fg ceiling
+            // (bytes or iops) is set. Yields when fg observed rate
+            // exceeds `fg_saturated_ratio` of EITHER cap — covers both
+            // bytes-bound large-value workloads and IOPS-bound small-
+            // value workloads.
+            let fg_aware_sleep: Option<Duration> = {
                 let elapsed_secs = elapsed.as_secs_f64().max(0.001);
-                let fg_observed_rate = s.fg_bytes as f64 / elapsed_secs;
-                let saturated_at =
-                    self.fg_rate_bytes_per_sec as f64 * self.fg_saturated_ratio;
-                if fg_observed_rate > saturated_at {
-                    let remaining =
-                        Duration::from_secs(1).saturating_sub(elapsed);
-                    if remaining > Duration::ZERO {
-                        Some(remaining)
-                    } else {
-                        None
+                let mut saturated = false;
+                if self.fg_rate_bytes_per_sec > 0 {
+                    let fg_observed = s.fg_bytes as f64 / elapsed_secs;
+                    let at = self.fg_rate_bytes_per_sec as f64 * self.fg_saturated_ratio;
+                    if fg_observed > at {
+                        saturated = true;
                     }
+                }
+                if !saturated && self.fg_iops_per_sec > 0 {
+                    let fg_observed = s.fg_ops as f64 / elapsed_secs;
+                    let at = self.fg_iops_per_sec as f64 * self.fg_saturated_ratio;
+                    if fg_observed > at {
+                        saturated = true;
+                    }
+                }
+                if saturated {
+                    let remaining = Duration::from_secs(1).saturating_sub(elapsed);
+                    if remaining > Duration::ZERO { Some(remaining) } else { None }
                 } else {
                     None
                 }
-            } else {
-                None
             };
             // Take the larger of the two sleeps so both constraints hold.
             match (bg_rate_sleep, fg_aware_sleep) {
@@ -1344,11 +1389,12 @@ impl AdmissionController {
     }
 
     /// Test-only snapshot of the current window's accounting state.
-    /// Locks briefly. Used by `f189_admission_tests`.
+    /// Returns `(fg_bytes, fg_ops, bg_bytes, elapsed)`. Locks briefly.
+    /// Used by `f189_admission_tests`.
     #[cfg(test)]
-    pub(crate) fn snapshot(&self) -> (u64, u64, Duration) {
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64, Duration) {
         let s = self.state.lock();
-        (s.fg_bytes, s.bg_bytes, s.window_start.elapsed())
+        (s.fg_bytes, s.fg_ops, s.bg_bytes, s.window_start.elapsed())
     }
 }
 
@@ -1446,10 +1492,10 @@ mod f189_admission_tests {
     fn fg_unlimited_no_sleep() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let ac = AdmissionController::new(0, 0, 0.8);
+            let ac = AdmissionController::new(0, 0, 0, 0.8);
             let t0 = Instant::now();
             for _ in 0..100 {
-                ac.account_fg(1024 * 1024).await;
+                ac.account_fg(1024 * 1024, 1).await;
             }
             let elapsed = t0.elapsed();
             assert!(
@@ -1457,8 +1503,9 @@ mod f189_admission_tests {
                 "fg with rate=0 must not sleep, elapsed={:?}",
                 elapsed
             );
-            let (fg, bg, _) = ac.snapshot();
+            let (fg, ops, bg, _) = ac.snapshot();
             assert!(fg >= 100 * 1024 * 1024, "fg counter not bumped: {fg}");
+            assert_eq!(ops, 100, "fg ops counter must be bumped to 100, got {ops}");
             assert_eq!(bg, 0);
         });
     }
@@ -1468,7 +1515,8 @@ mod f189_admission_tests {
     fn bg_unlimited_no_sleep() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let ac = AdmissionController::new(0, 0, 0.8);
+            let ac = AdmissionController::new(0, 0, 0, 0.8);
+            // fg_rate=0, fg_iops=0, bg_rate=0 → all unlimited.
             let t0 = Instant::now();
             for _ in 0..100 {
                 ac.account_bg(1024 * 1024).await;
@@ -1482,7 +1530,7 @@ mod f189_admission_tests {
     fn bg_respects_own_rate() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let ac = AdmissionController::new(0, 10 * 1024 * 1024, 0.8);
+            let ac = AdmissionController::new(0, 0, 10 * 1024 * 1024, 0.8);
             let t0 = Instant::now();
             // 5 MiB consumed against 10 MiB/s budget = 500ms target
             ac.account_bg(5 * 1024 * 1024).await;
@@ -1510,12 +1558,13 @@ mod f189_admission_tests {
             // threshold = 50 MiB/s observed.
             let ac = AdmissionController::new(
                 100 * 1024 * 1024,
+                0,                 // fg_iops disabled — exercising bytes path
                 100 * 1024 * 1024, // generous bg budget
                 0.5,
             );
             // Push fg to saturate the window: 60 MiB consumed in <100ms
             // gives observed rate >> 50 MiB/s threshold.
-            ac.account_fg(60 * 1024 * 1024).await;
+            ac.account_fg(60 * 1024 * 1024, 1).await;
             // Now bg attempt — should yield to the *remaining* time in
             // the current 1s window. fg's account_fg call took ~600ms
             // already (60 MiB at 100 MiB/s), so the remaining gap is
@@ -1539,6 +1588,7 @@ mod f189_admission_tests {
         rt.block_on(async {
             let ac = AdmissionController::new(
                 100 * 1024 * 1024, // fg ceiling set
+                0,                 // fg_iops disabled
                 100 * 1024 * 1024,
                 0.5,
             );
@@ -1561,12 +1611,13 @@ mod f189_admission_tests {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
             let ac = AdmissionController::new(
-                0,                 // fg unlimited
+                0,                 // fg bytes unlimited
+                0,                 // fg iops unlimited
                 100 * 1024 * 1024, // bg ceiling
                 0.5,
             );
             // Push lots of fg.
-            ac.account_fg(500 * 1024 * 1024).await;
+            ac.account_fg(500 * 1024 * 1024, 1).await;
             // bg should still be free (well under bg ceiling).
             let t0 = Instant::now();
             ac.account_bg(1024).await;
@@ -1577,23 +1628,89 @@ mod f189_admission_tests {
         });
     }
 
+    /// F196: fg-iops cap throttles small-value workloads even when
+    /// bytes is far under the bytes cap. With fg_iops=1000/s and a
+    /// burst of 100 ops at ~zero bytes, second batch should sleep
+    /// toward the 100/1000 = 100 ms target before returning.
+    #[test]
+    fn fg_iops_cap_throttles_small_value_workloads() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            // bytes=10 GiB/s (effectively unlimited for this test),
+            // iops=1000/s, 100 ops/batch.
+            let ac = AdmissionController::new(
+                10 * 1024 * 1024 * 1024,
+                1_000,
+                0,
+                0.8,
+            );
+            let t0 = Instant::now();
+            // 100 ops × 8 bytes each = ~negligible bytes, but
+            // 100 / 1000 = 100 ms iops-target.
+            ac.account_fg(800, 100).await;
+            // Second batch: another 100 ops → cumulative 200/1000 =
+            // 200 ms target. By now ~100 ms elapsed since window
+            // start, so this call should sleep ~100 ms more.
+            ac.account_fg(800, 100).await;
+            let elapsed = t0.elapsed();
+            assert!(
+                elapsed >= Duration::from_millis(150)
+                    && elapsed <= Duration::from_millis(500),
+                "fg-iops cap should throttle 200 ops at 1k ops/s to ~200ms, got {:?}",
+                elapsed
+            );
+        });
+    }
+
+    /// F196: bg yields when fg observed IOPS exceeds 0.8 × fg_iops,
+    /// even if fg bytes is way under the bytes cap.
+    #[test]
+    fn bg_yields_when_fg_iops_saturated() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let ac = AdmissionController::new(
+                10 * 1024 * 1024 * 1024, // bytes effectively unlimited
+                1_000,                    // 1000 ops/s
+                100 * 1024 * 1024,        // bg ceiling generous
+                0.5,                      // bg yields at 500 ops/s observed
+            );
+            // 600 ops in one batch → observed rate ~600 ops/s in ~0s.
+            // Will sleep to fit the iops cap (600/1000 = 600 ms target).
+            ac.account_fg(0, 600).await;
+            // Now bg attempt — fg observed iops (600) >= 0.8 × 1000 =
+            // 800? No, 600 < 800. Push more: another 400 ops to
+            // exceed 0.5 × 1000 = 500 saturation in the new threshold.
+            // (We set ratio=0.5 above, so 500 ops/s observed = saturated.)
+            let t0 = Instant::now();
+            ac.account_bg(1024).await;
+            let elapsed = t0.elapsed();
+            assert!(
+                elapsed >= Duration::from_millis(200),
+                "bg should yield when fg-iops observed exceeds saturation threshold, got {:?}",
+                elapsed
+            );
+        });
+    }
+
     /// Window reset clears both counters after 1s. Regression guard:
     /// the reset path must not panic on first call and must zero fg+bg.
     #[test]
     fn window_resets_after_1s() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let ac = AdmissionController::new(0, 0, 0.8);
-            ac.account_fg(123).await;
+            let ac = AdmissionController::new(0, 0, 0, 0.8);
+            ac.account_fg(123, 2).await;
             ac.account_bg(456).await;
-            let (fg, bg, _) = ac.snapshot();
+            let (fg, ops, bg, _) = ac.snapshot();
             assert_eq!(fg, 123);
+            assert_eq!(ops, 2);
             assert_eq!(bg, 456);
             compio::time::sleep(Duration::from_millis(1100)).await;
             // Trigger a reset via a fresh call.
-            ac.account_fg(7).await;
-            let (fg, bg, _) = ac.snapshot();
+            ac.account_fg(7, 1).await;
+            let (fg, ops, bg, _) = ac.snapshot();
             assert_eq!(fg, 7, "fg should reset to fresh accounting after window");
+            assert_eq!(ops, 1, "fg ops should reset to fresh accounting");
             assert_eq!(bg, 0, "bg should reset");
         });
     }

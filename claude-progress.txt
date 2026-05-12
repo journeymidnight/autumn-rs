@@ -49,6 +49,14 @@ Stage breakdown:
                  (~1.74 GB/s for 8M values; 2 GiB/s leaves 15%
                  headroom). Operator can re-enable unlimited via
                  `--fg-rate-bytes-per-sec 0`.
+  Stage D-r4:    fg admission grows IOPS dimension. account_fg now
+                 takes (bytes, ops); EITHER cap reached → sleep.
+                 bg-aware-yield triggers on either fg observed
+                 rate. Default fg-iops 150K (≈ 36% headroom over
+                 measured 110K perf_check 4K peak). bg stays
+                 bytes-only (compact/GC are bulk). 9/9 admission
+                 tests; new `--fg-iops-per-sec` CLI flag +
+                 AUTUMN_PS_FG_IOPS_PER_SEC env passthrough.
   Stage E: cluster.sh env passthrough + even disjoint cpuset
            distribution (EN[i] + PS ranges); README updated; this
            progress file; feature_list F196 entry; commit.
