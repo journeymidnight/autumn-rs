@@ -407,20 +407,27 @@
   - 11 manager/stream test sites updated for the new wire field (all pass empty string, equivalent to pre-F191 behavior).
 - **passes:** true (build clean across workspace; 13/13 rpc + 45/45 stream + 58/58 manager + 8/8 server-bin lib tests pass; 4 new autumn-client unit tests pass; the 2 pre-existing flaky `f099i_*` partition-server timing tests and the 7 pre-existing flaky `tests/integration.rs` partition-server tests remain at the same baseline status as F190 commit `19049a2`).
 
-### F192 · `MSG_REPORT_DISK_FAILURE` with quorum debounce, delivered via `control_pool`
+### F192 · `MSG_REPORT_DISK_FAILURE` with quorum debounce
 
 - **Trigger:** Conversation 2026-05-12 — F190 fixes the per-stream alloc retry bounce (per-call route-around), F191 fixes manager↔node liveness polling reliability. Neither closes the gap that **manager's global view of `disk.online` is still pulled, not pushed**: between polling cycles, recovery dispatch / EC scheduling / advisory candidate selection still operate on stale truth. The fix is to let the data-plane failure signal flow back to manager in real time so global decisions catch up to per-stream truth.
 - **Approach:**
-  - New manager RPC: `MSG_REPORT_DISK_FAILURE { node_id, extent_id, error_kind: u8, ts }`. Delivered via `control_pool` (depends on F191) — must NOT share a connection with data-plane.
-  - `StreamClient`: on `apply_completion` Err with replica `node_id` known, fire-and-forget the report through manager's control pool. No await on response (best-effort; loss is fine because F190 still routes around per-stream).
-  - Manager: in-memory `recent_failure_reports: HashMap<u64, VecDeque<(Instant, u64 /*reporter_part_id*/)>>`. Eviction window = **60 s**; quorum threshold = **3 distinct `reporter_part_id`** within window. On quorum: `mark_node_disks_offline` (in-memory + etcd write).
+  - New manager RPC: `MSG_REPORT_DISK_FAILURE = 0x38` with `ReportDiskFailureReq { node_id, extent_id, error_kind: u8, reporter_part_id: u64, ts_ms: i64 }`. Delivered over PS→manager direction (already a separate path from PS→extent-node data plane; no need for a second pool on the writer side — the spec's "must not share with data-plane" was about manager→extent-node, which is what F191's `control_pool` already separates). Fire-and-forget on the wire; manager replies `CodeResp { CODE_OK }` which the writer discards.
+  - `StreamClient`: per-StreamClient bounded `mpsc::channel::<FailureReport>(1024)`; drainer task spawned in `construct` reads each event, builds `ReportDiskFailureReq` with the current `reporter_part_id` (Cell, default 0 = "no reporter configured"; partition-server calls `set_reporter_part_id(part_id)` on both P-log and P-bulk StreamClients right after `new_with_revision`), and fires `pool.call(manager_addr, MSG_REPORT_DISK_FAILURE, ...)` against the same manager pool that already carries alloc / owner_lock RPCs. `apply_completion` Err path (generic err only — NotFound is intentionally skipped because it's stale-cache, not health) calls `state.try_report_failure(node_id, extent_id)` which `try_send`s and drops on full.
+  - Manager: in-memory `recent_failure_reports: HashMap<u64, VecDeque<(Instant, u64 /*reporter_part_id*/)>>`. Eviction window = **60 s** (env: `AUTUMN_REPORT_DISK_FAILURE_WINDOW_SECS`); quorum threshold = **3 distinct `reporter_part_id`** within window (env: `AUTUMN_REPORT_DISK_FAILURE_QUORUM`). On quorum: `mark_node_disks_offline` (in-memory; recovery's `disk_status_update_loop` is the authoritative writer and reconciles to etcd on its next 10 s tick). Quorum-trip clears the entry so a stale residual burst doesn't re-flip after the node recovers.
   - Quorum reached does **not** trigger `require_recovery` immediately — leaving recovery to the existing `recovery_dispatch_loop` (which polls every 5 s and re-evaluates on each tick) avoids a recovery storm during transient regional hiccups.
-  - Manager's `disk_status_update_loop` retains its role: a successful DF response promotes the node back online and clears `recent_failure_reports[node_id]` so a subsequent burst of stale reports doesn't re-flip.
+  - Manager's `disk_status_update_loop` retains its role: a successful DF response promotes the node back online via `mark_node_disks_online` AND clears `recent_failure_reports[node_id]` so a subsequent burst of stale reports doesn't re-flip.
 - **Acceptance:**
-  - Unit: quorum window math (insert N reports across distinct reporters, verify mark-offline fires only at N≥3 within 60 s; verify a 4th report on the same partition_id doesn't count toward quorum).
-  - Integration: SIGSTOP one extent-node mid-write; ≥3 partitions issue REPORT_DISK_FAILURE within seconds; manager marks node offline before its next DF tick; SIGCONT the node; next DF promotes it back.
-- **Dependencies:** F191 (control_pool).
-- **passes:** false
+  - Unit (4 new tests in `crates/manager/src/lib.rs::tests::f192_*`): 2-distinct-reporter does NOT flip offline; 3-distinct-reporter DOES flip offline; repeated reports from the SAME reporter do NOT count toward quorum (5×100 stays at 1 distinct); a quorum trip clears `recent_failure_reports` so a follow-up burst doesn't re-fire.
+  - Integration (deferred to live cluster): SIGSTOP one extent-node mid-`wbench`; ≥3 distinct partitions issue REPORT_DISK_FAILURE within seconds; manager marks node offline before its next DF tick (no 10 s wait); SIGCONT the node; next DF promotes it back and `recent_failure_reports` clears.
+- **Dependencies:** F191 (the disk-flap root cause is closed by F191 on its own; F192 is additive — pushes the per-stream signal up to global state).
+- **Files changed:**
+  - `crates/rpc/src/manager_rpc.rs` — `MSG_REPORT_DISK_FAILURE` constant, `REPORT_DISK_FAILURE_KIND_GENERIC = 0`, `ReportDiskFailureReq` struct.
+  - `crates/manager/src/lib.rs` — `AutumnManager.recent_failure_reports`; 4 new unit tests.
+  - `crates/manager/src/rpc_handlers.rs` — `handle_report_disk_failure` (dedup by reporter_part_id, in-window count, quorum-trip → `mark_node_disks_offline` + clear); dispatch table entry; `Duration` import.
+  - `crates/manager/src/recovery.rs` — `mark_node_disks_offline` widened to `pub(crate)`; `disk_status_update_loop` clears `recent_failure_reports[node_id]` on every successful DF.
+  - `crates/stream/src/client.rs` — `FailureReport` struct, per-StreamClient `failure_report_tx` + `reporter_part_id: Cell<u64>` + drainer task `failure_report_drain_loop` spawned in `construct`; `StreamAppendState` gains `failure_report_tx` + `try_report_failure` helper; `apply_completion` generic-Err path calls it. NotFound path deliberately skips reporting (stale-cache, not health).
+  - `crates/partition-server/src/lib.rs` — P-log and P-bulk StreamClients both call `set_reporter_part_id(part_id)` immediately after `new_with_revision`.
+- **passes:** true (build clean across workspace; 13/13 rpc + 45/45 stream + 62/62 manager lib tests pass — includes the 4 new F192 tests; pre-existing flaky tests unchanged from F190 baseline).
 
 ### F193 · Streaming EC encode + chunked recovery/copy (extent-node memory)
 

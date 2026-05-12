@@ -1,48 +1,30 @@
 Date: 2026-05-12
 TaskStatus: not_completed
-Task scope: F190-F193 — multi-feature loop. F190 + F191 implemented and
-            ready to commit; F192-F193 still to go.
+Task scope: F190-F193 — multi-feature loop. F190, F191, F192 done;
+            F193 still to go.
 
-F190 done (commit 19049a2):
-  - StreamAllocExtentReq.exclude_node_ids field (rkyv schema extension)
-  - StreamClient per-stream bad_nodes map (Rc<RefCell<>>)
-  - StreamTail.replica_node_ids parallel to replica_addrs
-  - apply_completion marks failing replica node_id on Err
-    (skips LockedByOther)
-  - 30 s TTL (env AUTUMN_STREAM_BAD_NODES_TTL_SECS)
-  - select_nodes + fallback walk filter by exclude_node_ids; fall back
-    to unfiltered set if exclusion under-fills the pool
-  - 5 new unit tests
-  - 45/45 stream + 58/58 manager + 13/13 rpc lib all green
+F190 (commit 19049a2): per-stream bad_nodes exclusion at alloc time.
+F191 (commit 7981faa): ExtentNode control-plane port + manager
+                       control_pool + DF timeout fix.
 
-F191 done in this next commit:
-  - MgrNodeInfo.control_address + RegisterNodeReq.control_address
-    (rkyv schema extension — breaks pre-F191 etcd state, acceptable
-    per F189-fix INFO-9 atomic deploy; document operator action)
-  - ExtentNode.serve_with_control(data, ctl) spawns 2nd listener
-    using same handle_connection SQ/CQ machinery (shared instance)
-  - extent_node binary: --control-port flag, default port + 1000;
-    per-shard control ports at control_port_base + shard_idx * stride
-  - autumn-client register-node: --control-address flag
-  - autumn-client format: derives control_address via new helper
-    derive_control_address(advertise) → host:port + 1000
-  - autumn-client info: prints control_addr when present
-  - cluster.sh register_extent_node passes --control-address
-  - Manager: control_pool: Rc<ConnPool>; manager ConnPool gains
-    call_timeout via compio::time::timeout
-  - disk_status_update_loop + recovery_collect_loop route DF via
-    control_pool.call_timeout(..., 5s) against control_address
-    (fallback address for legacy nodes)
-  - P0 fix carried: replaces the long-standing "bound df at 5 s"
-    comment with actually-bounded behaviour
-  - 4 new autumn-client tests; workspace build + lib tests clean
+F192 done in this next commit:
+  - MSG_REPORT_DISK_FAILURE wire (0x38) + ReportDiskFailureReq
+    (node_id, extent_id, error_kind, reporter_part_id, ts_ms)
+  - Manager handler: in-memory recent_failure_reports HashMap with
+    60 s sliding window, quorum=3 distinct reporter_part_id →
+    mark_node_disks_offline + clear entry. Env-tunable:
+    AUTUMN_REPORT_DISK_FAILURE_WINDOW_SECS,
+    AUTUMN_REPORT_DISK_FAILURE_QUORUM. Successful DF in
+    disk_status_update_loop clears the entry.
+  - StreamClient: bounded mpsc::channel(1024) + drainer task
+    spawned in construct; apply_completion generic-Err path calls
+    state.try_report_failure; NotFound deliberately skipped (stale
+    cache, not health). reporter_part_id Cell + setter.
+  - PartitionData: P-log and P-bulk StreamClients both call
+    set_reporter_part_id(part_id) right after new_with_revision
+  - 4 manager-side unit tests pass (62/62 manager lib)
 
 Next steps (this loop):
-  F192: depends on F191. New MSG_REPORT_DISK_FAILURE over control_pool;
-        StreamClient fires fire-and-forget on apply_completion Err.
-        Manager 60 s window, 3-distinct-reporter_part_id quorum →
-        mark_node_disks_offline. disk_status_update_loop success
-        clears the entry.
   F193: independent. Pipelined EC encode (Option B, 2-chunk inflight),
         chunked recovery/copy_extent, jemallocator with dirty_decay_ms.
 

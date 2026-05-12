@@ -2978,6 +2978,11 @@ async fn partition_thread_main(
     )
     .await
     .context("create per-partition StreamClient")?;
+    // F192: tag the per-partition StreamClient with `part_id` so the
+    // F190 worker's failure-report drainer can attribute reports to
+    // this partition (the manager's quorum debounce dedups by
+    // `reporter_part_id`).
+    part_sc.set_reporter_part_id(part_id);
 
     // Check commit length on all streams before recovery (Go: checkCommitLength).
     // This ensures the last extent of each stream has consistent commit length
@@ -4717,6 +4722,10 @@ fn spawn_bulk_thread(
                         return;
                     }
                 };
+                // F192: same reporter_part_id as the P-log StreamClient so
+                // bulk-thread row_stream / compact append failures bucket
+                // into the same partition for the manager's quorum count.
+                bulk_sc.set_reporter_part_id(part_id);
                 tracing::info!(part_id, "bulk thread ready");
                 flush_worker_loop(bulk_sc, flush_req_rx, row_append_rx).await;
                 tracing::info!(part_id, "bulk thread exiting");

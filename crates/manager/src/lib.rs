@@ -366,6 +366,16 @@ pub struct AutumnManager {
     /// F184: feature flag — enable auto-orchestrated MERGE for same-PS
     /// adjacent cold pairs. Default off.
     pub(crate) auto_merge_enabled: Rc<Cell<bool>>,
+    /// F192: per-node sliding-window of push-based failure reports from
+    /// PSes. Eviction window = 60 s; quorum threshold = 3 distinct
+    /// `reporter_part_id` → `mark_node_disks_offline` (in-memory only —
+    /// the result reflects truth that the manager learns from
+    /// `disk_status_update_loop` on the next 10 s tick, so it does NOT
+    /// need to persist to etcd). A successful DF in
+    /// `disk_status_update_loop` clears this entry so a stale burst of
+    /// reports doesn't re-trip the quorum after the node recovers.
+    pub(crate) recent_failure_reports:
+        Rc<RefCell<HashMap<u64, std::collections::VecDeque<(Instant, u64)>>>>,
 }
 
 impl Default for AutumnManager {
@@ -392,6 +402,7 @@ impl AutumnManager {
             policy: Rc::new(RefCell::new(crate::policy::PolicyEngine::default())),
             auto_split_enabled: Rc::new(Cell::new(false)),
             auto_merge_enabled: Rc::new(Cell::new(false)),
+            recent_failure_reports: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -2185,6 +2196,118 @@ mod tests {
 
     fn run<F: std::future::Future<Output = T>, T>(f: F) -> T {
         compio::runtime::Runtime::new().unwrap().block_on(f)
+    }
+
+    /// F192: registers a node in-memory so a subsequent
+    /// `handle_report_disk_failure` quorum trip has a node to flip
+    /// offline. Skips etcd / mirror by writing to the in-memory store
+    /// directly. Used only by the F192 unit tests below.
+    fn add_node_and_disk(m: &AutumnManager, node_id: u64, disk_id: u64) {
+        let mut s = m.store.inner.borrow_mut();
+        s.nodes.insert(
+            node_id,
+            MgrNodeInfo {
+                node_id,
+                address: format!("127.0.0.1:{}", 9100 + node_id),
+                disks: vec![disk_id],
+                shard_ports: vec![],
+                control_address: format!("127.0.0.1:{}", 10100 + node_id),
+            },
+        );
+        s.disks.insert(
+            disk_id,
+            MgrDiskInfo {
+                disk_id,
+                online: true,
+                uuid: format!("uuid-{disk_id}"),
+            },
+        );
+    }
+
+    fn fire_report(
+        m: &AutumnManager,
+        node_id: u64,
+        reporter_part_id: u64,
+        ts_ms: i64,
+    ) -> CodeResp {
+        let req = rkyv_encode(&ReportDiskFailureReq {
+            node_id,
+            extent_id: 1,
+            error_kind: REPORT_DISK_FAILURE_KIND_GENERIC,
+            reporter_part_id,
+            ts_ms,
+        });
+        let resp = run(async { m.handle_report_disk_failure(req).await.unwrap() });
+        rkyv_decode::<CodeResp>(&resp).expect("decode CodeResp")
+    }
+
+    #[test]
+    fn f192_two_distinct_reporters_below_quorum_no_offline() {
+        let m = AutumnManager::new();
+        add_node_and_disk(&m, 7, 70);
+
+        let r = fire_report(&m, 7, 100, 0);
+        assert_eq!(r.code, CODE_OK);
+        let r = fire_report(&m, 7, 101, 0);
+        assert_eq!(r.code, CODE_OK);
+
+        let s = m.store.inner.borrow();
+        let disk = s.disks.get(&70).unwrap();
+        assert!(disk.online, "node 7's disk must still be online below quorum");
+    }
+
+    #[test]
+    fn f192_three_distinct_reporters_flips_offline() {
+        let m = AutumnManager::new();
+        add_node_and_disk(&m, 7, 70);
+
+        for rp in [100u64, 101, 102] {
+            let r = fire_report(&m, 7, rp, 0);
+            assert_eq!(r.code, CODE_OK);
+        }
+
+        let s = m.store.inner.borrow();
+        let disk = s.disks.get(&70).unwrap();
+        assert!(
+            !disk.online,
+            "node 7's disk must be flipped offline at 3 distinct reporters"
+        );
+    }
+
+    #[test]
+    fn f192_duplicate_reporter_does_not_count_toward_quorum() {
+        let m = AutumnManager::new();
+        add_node_and_disk(&m, 7, 70);
+
+        // Same reporter_part_id repeated five times — must NOT count
+        // toward the 3-distinct quorum. The window may grow, but
+        // distinct.len() stays at 1.
+        for _ in 0..5 {
+            let r = fire_report(&m, 7, 100, 0);
+            assert_eq!(r.code, CODE_OK);
+        }
+
+        let s = m.store.inner.borrow();
+        let disk = s.disks.get(&70).unwrap();
+        assert!(disk.online, "duplicate reporter must not trip quorum");
+    }
+
+    #[test]
+    fn f192_quorum_clears_after_trip_and_does_not_re_fire() {
+        let m = AutumnManager::new();
+        add_node_and_disk(&m, 7, 70);
+
+        for rp in [100u64, 101, 102] {
+            let _ = fire_report(&m, 7, rp, 0);
+        }
+        // After the quorum trip, the handler clears the per-node entry
+        // so a stale burst of reports doesn't re-trip after the disk
+        // is promoted back online externally.
+        let reports = m.recent_failure_reports.borrow();
+        assert!(
+            reports.get(&7).map_or(true, |v| v.is_empty()),
+            "quorum trip must clear recent_failure_reports for the node"
+        );
     }
 
     #[test]

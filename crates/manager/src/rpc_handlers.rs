@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use autumn_common::AppError;
@@ -99,6 +99,7 @@ impl AutumnManager {
             MSG_MERGE_PARTITIONS => self.handle_merge_partitions(payload).await,
             MSG_GET_POLICY_CANDIDATES => self.handle_get_policy_candidates(payload).await,
             MSG_REPORT_PARTITION_LOAD => self.handle_report_partition_load(payload).await,
+            MSG_REPORT_DISK_FAILURE => self.handle_report_disk_failure(payload).await,
             MSG_REGISTER_PS => self.handle_register_ps(payload).await,
             MSG_UPSERT_PARTITION => self.handle_upsert_partition(payload).await,
             MSG_GET_REGIONS => self.handle_get_regions().await,
@@ -2365,6 +2366,110 @@ impl AutumnManager {
             p.metrics.entry(load.part_id).or_default().push(now, load);
         }
         drop(p);
+        Ok(rkyv_encode(&CodeResp {
+            code: CODE_OK,
+            message: String::new(),
+        }))
+    }
+
+    /// F192: PS pushes a per-replica failure observation; manager
+    /// debounces with a 60 s sliding window and 3-distinct-reporter
+    /// quorum before flipping `node.disks[*].online = false`. The flip
+    /// is in-memory only and the call is fire-and-forget on the wire
+    /// — leader-fence isn't required for correctness because
+    /// `disk_status_update_loop` (every 10 s) is the authoritative
+    /// truth and will overwrite this purely-advisory state on the
+    /// next successful DF. We deliberately do NOT trigger
+    /// `require_recovery` from here — that's still owned by
+    /// `recovery_dispatch_loop` (5 s tick) so a transient regional
+    /// hiccup doesn't kick off a recovery storm.
+    pub(crate) async fn handle_report_disk_failure(
+        &self,
+        payload: Bytes,
+    ) -> HandlerResult {
+        let req: ReportDiskFailureReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // Even on a follower (non-leader) we accept the report — the
+        // follower will replay manager state on promotion and the
+        // quorum is purely advisory. Skip the leader gate; the call
+        // is fire-and-forget so the client doesn't observe a refusal.
+        let now = Instant::now();
+        let window = Duration::from_secs(
+            std::env::var("AUTUMN_REPORT_DISK_FAILURE_WINDOW_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(60),
+        );
+        let quorum: usize = std::env::var("AUTUMN_REPORT_DISK_FAILURE_QUORUM")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(3);
+        let cutoff = now.checked_sub(window).unwrap_or(now);
+
+        let reached_quorum = {
+            let mut reports = self.recent_failure_reports.borrow_mut();
+            let entry = reports.entry(req.node_id).or_default();
+            // Evict expired first so the deduplicated-reporter count
+            // reflects only the current window.
+            while let Some(&(t, _)) = entry.front() {
+                if t < cutoff {
+                    entry.pop_front();
+                } else {
+                    break;
+                }
+            }
+            // Avoid double-counting the same reporter_part_id within the
+            // active window. The producer's per-stream bad_nodes TTL
+            // (30 s) bounds spam from the same writer; this dedup is
+            // belt-and-braces against multi-stream PSes that observe
+            // the same dead node from multiple streams in the same
+            // window — they should count as ONE reporter for quorum.
+            if !entry.iter().any(|(_, rp)| *rp == req.reporter_part_id) {
+                entry.push_back((now, req.reporter_part_id));
+            }
+            let distinct: HashSet<u64> = entry.iter().map(|(_, rp)| *rp).collect();
+            tracing::debug!(
+                node_id = req.node_id,
+                extent_id = req.extent_id,
+                error_kind = req.error_kind,
+                reporter = req.reporter_part_id,
+                ts_ms = req.ts_ms,
+                window_size = entry.len(),
+                distinct_reporters = distinct.len(),
+                quorum,
+                "f192 report_disk_failure"
+            );
+            distinct.len() >= quorum
+        };
+
+        if reached_quorum {
+            // Apply: mark every disk on the node offline. Same path
+            // taken by `disk_status_update_loop` on a failed DF.
+            let nodes_clone = {
+                let s = self.store.inner.borrow();
+                s.nodes.clone()
+            };
+            if let Some(node) = nodes_clone.get(&req.node_id) {
+                Self::mark_node_disks_offline(&self.store, node);
+                tracing::warn!(
+                    node_id = req.node_id,
+                    quorum,
+                    "f192 quorum reached — node marked offline (advisory; \
+                     disk_status_update_loop reconciles on next DF tick)"
+                );
+            }
+            // Defuse: clear so we don't re-flip on a stale residual
+            // burst after the next successful DF promotes the node
+            // back online.
+            self.recent_failure_reports
+                .borrow_mut()
+                .remove(&req.node_id);
+        }
+
+        // Fire-and-forget on the wire; reply is technically dropped
+        // by the client but we still return a CODE_OK frame so the
+        // RpcServer doesn't surface this as an error.
         Ok(rkyv_encode(&CodeResp {
             code: CODE_OK,
             message: String::new(),

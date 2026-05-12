@@ -513,6 +513,14 @@ impl AutumnManager {
                 // the extent-node and propagated through dedicated
                 // recovery RPCs.
                 Self::mark_node_disks_online(&self.store, node);
+                // F192: drop any pending push-based failure reports for
+                // this node — the call-level liveness signal proves the
+                // node is reachable, so a residual stale burst of
+                // reports must not re-flip the node offline on the next
+                // tick's quorum check.
+                self.recent_failure_reports
+                    .borrow_mut()
+                    .remove(&node.node_id);
             }
         }
     }
@@ -522,7 +530,7 @@ impl AutumnManager {
     /// disk state from etcd on leader promotion via `replay_from_etcd`,
     /// and a recovered node will overwrite `online=true` on the next
     /// successful `df` poll.
-    fn mark_node_disks_offline(
+    pub(crate) fn mark_node_disks_offline(
         store: &autumn_common::MetadataStore,
         node: &autumn_rpc::manager_rpc::MgrNodeInfo,
     ) {

@@ -66,6 +66,14 @@ pub const MSG_REPORT_PARTITION_LOAD: u8 = 0x36;
 // drops the frozen PartitionData on next tick) or it doesn't (PSes
 // auto-unfreeze after FREEZE_TTL seconds).
 pub const MSG_MERGE_PARTITIONS: u8 = 0x37;
+// F192: PS → manager push-based disk failure signal. Fire-and-forget
+// (req_id = 0); manager deduplicates by reporter_part_id, applies a
+// 60 s sliding window + 3-distinct-reporter quorum before flipping
+// `node.disks[*].online = false`. Pre-F192 the manager's disk online
+// view was purely pull-based via `disk_status_update_loop` (10 s
+// cadence), so between F190's per-stream alloc route-around and the
+// next DF poll the global view lagged the per-stream truth.
+pub const MSG_REPORT_DISK_FAILURE: u8 = 0x38;
 
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
@@ -798,6 +806,33 @@ pub struct GetPolicyCandidatesResp {
     pub message: String,
     pub candidates: Vec<PolicyCandidate>,
 }
+
+// --- ReportDiskFailure (F192) ---
+/// Generic transport/append failure on a known replica. The manager
+/// does not act on `error_kind` directly today; it's surfaced for
+/// future per-kind policy tuning (e.g. demote vs. trigger immediate
+/// recovery) and for operator log readability.
+pub const REPORT_DISK_FAILURE_KIND_GENERIC: u8 = 0;
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ReportDiskFailureReq {
+    /// Replica node_id that produced the failure.
+    pub node_id: u64,
+    /// The extent the append/operation was targeting; carried so the
+    /// manager log makes the failure attributable end-to-end.
+    pub extent_id: u64,
+    /// One of the `REPORT_DISK_FAILURE_KIND_*` constants.
+    pub error_kind: u8,
+    /// Reporter partition id (used by the manager's debounce / quorum
+    /// — 3 distinct reporter_part_id within the eviction window).
+    pub reporter_part_id: u64,
+    /// Wall-clock ms when the failure was observed; informational
+    /// only — manager uses its own Instant for the sliding window.
+    pub ts_ms: i64,
+}
+
+// Response: fire-and-forget (req_id = 0). No reply needed; manager
+// logs are the operator-facing surface.
 
 // ── Extent msg_type constants (needed by manager for node calls) ──────────
 

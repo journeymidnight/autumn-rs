@@ -91,6 +91,10 @@ struct StreamAppendState {
     /// covers a full manager polling cycle without holding excludes long
     /// enough to block natural disk recovery (default 30 s, env-tunable).
     bad_nodes: Rc<RefCell<HashMap<u64, Instant>>>,
+    /// F192: cloned sender for the per-StreamClient failure-report
+    /// drainer. `try_send` from `apply_completion` Err; drops the event
+    /// silently when full (best-effort).
+    failure_report_tx: mpsc::Sender<FailureReport>,
 }
 
 /// F190: TTL for the per-stream `bad_nodes` map. 30 s covers one full
@@ -109,7 +113,10 @@ fn bad_nodes_ttl() -> Duration {
 }
 
 impl StreamAppendState {
-    fn new(bad_nodes: Rc<RefCell<HashMap<u64, Instant>>>) -> Self {
+    fn new(
+        bad_nodes: Rc<RefCell<HashMap<u64, Instant>>>,
+        failure_report_tx: mpsc::Sender<FailureReport>,
+    ) -> Self {
         Self {
             tail: None,
             commit: 0,
@@ -118,6 +125,7 @@ impl StreamAppendState {
             in_flight: 0,
             poisoned: false,
             bad_nodes,
+            failure_report_tx,
         }
     }
 
@@ -129,6 +137,16 @@ impl StreamAppendState {
     fn mark_bad_node(&self, node_id: u64) {
         let expires_at = Instant::now() + bad_nodes_ttl();
         self.bad_nodes.borrow_mut().insert(node_id, expires_at);
+    }
+
+    /// F192: best-effort fire of a `MSG_REPORT_DISK_FAILURE` event into
+    /// the per-StreamClient drainer. Drops on full channel — the manager
+    /// quorum debounce tolerates loss (per-stream alloc route-around via
+    /// F190 stays as the primary defense).
+    fn try_report_failure(&mut self, node_id: u64, extent_id: u64) {
+        let _ = self
+            .failure_report_tx
+            .try_send(FailureReport { node_id, extent_id });
     }
 
     fn reset_for_new_extent(&mut self) {
@@ -404,17 +422,70 @@ impl Drop for WorkerRemovalGuard {
     }
 }
 
+/// F192: drainer task for per-StreamClient failure reports. Holds a
+/// `Weak<StreamClient>` so it exits naturally when the StreamClient is
+/// dropped (mpsc Receiver close also exits the loop, but Weak coverage
+/// makes shutdown deterministic when senders survive in a worker mid-
+/// drop). Each report is sent fire-and-forget against the current
+/// manager address; failures are logged at trace and otherwise
+/// ignored — F190's per-stream alloc route-around remains the primary
+/// defense.
+async fn failure_report_drain_loop(
+    sc: Weak<StreamClient>,
+    mut rx: mpsc::Receiver<FailureReport>,
+) {
+    use futures::StreamExt;
+    while let Some(report) = rx.next().await {
+        let Some(sc) = sc.upgrade() else {
+            return;
+        };
+        let reporter = sc.reporter_part_id.get();
+        if reporter == 0 {
+            // No reporter id configured — skip rather than poll the
+            // manager with sentinel zeros.
+            continue;
+        }
+        let ts_ms = autumn_common::metrics::unix_time_ms() as i64;
+        let req = manager_rpc::rkyv_encode(&manager_rpc::ReportDiskFailureReq {
+            node_id: report.node_id,
+            extent_id: report.extent_id,
+            error_kind: manager_rpc::REPORT_DISK_FAILURE_KIND_GENERIC,
+            reporter_part_id: reporter,
+            ts_ms,
+        });
+        let addr = sc.manager_addr().to_string();
+        // Fire-and-forget: best-effort. The handler does not return
+        // a meaningful response payload (CODE_OK CodeResp), and a
+        // dropped report is benign — F190's per-stream alloc route-
+        // around handles the per-call need.
+        if let Err(e) = sc
+            .pool
+            .call(&addr, manager_rpc::MSG_REPORT_DISK_FAILURE, req)
+            .await
+        {
+            tracing::trace!(
+                manager = %addr,
+                node_id = report.node_id,
+                extent_id = report.extent_id,
+                error = %e,
+                "f192 report_disk_failure send failed"
+            );
+        }
+    }
+}
+
 async fn stream_worker_loop(
     stream_id: u64,
     mut submit_rx: mpsc::Receiver<StreamSubmitMsg>,
     pool: Rc<ConnPool>,
     bad_nodes: Rc<RefCell<HashMap<u64, Instant>>>,
+    failure_report_tx: mpsc::Sender<FailureReport>,
     removal_guard: WorkerRemovalGuard,
 ) {
     use futures::future::{select, Either};
 
     let cap = stream_inflight_cap();
-    let mut state = StreamAppendState::new(bad_nodes);
+    let mut state = StreamAppendState::new(bad_nodes, failure_report_tx);
     let mut inflight: FuturesUnordered<InflightFut> = FuturesUnordered::new();
 
     loop {
@@ -610,6 +681,9 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
         if let Some(idx) = bad_replica_idx {
             if let Some(&nid) = replica_node_ids.get(idx) {
                 state.mark_bad_node(nid);
+                // F192: NotFound is stale-cache, not a node-health
+                // signal — do NOT report it. The manager's quorum
+                // would otherwise misclassify it as a real failure.
             }
         }
         state.rewind_or_poison(offset, size);
@@ -622,9 +696,13 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
     if let Some(err) = err_msg {
         // F190: real per-replica failure (rpc/decode/non-OK code) — mark
         // the node so the next alloc skips it.
+        // F192: same failure pushes a manager-side report so the
+        // global view catches up to the per-stream truth without
+        // waiting for the next 10 s `disk_status_update_loop` tick.
         if let Some(idx) = bad_replica_idx {
             if let Some(&nid) = replica_node_ids.get(idx) {
                 state.mark_bad_node(nid);
+                state.try_report_failure(nid, extent_id);
             }
         }
         state.rewind_or_poison(offset, size);
@@ -800,7 +878,30 @@ pub struct StreamClient {
     /// respawn happens within the TTL window. Pruned lazily on snapshot;
     /// no background sweeper.
     stream_bad_nodes: RefCell<HashMap<u64, Rc<RefCell<HashMap<u64, Instant>>>>>,
+    /// F192: fire-and-forget reporter for `MSG_REPORT_DISK_FAILURE`.
+    /// Worker (`apply_completion` Err path) pushes here via `try_send`
+    /// (drop on full — pure best-effort). The drainer task (spawned in
+    /// `construct`) holds the `Receiver`, reads each report, builds a
+    /// `ReportDiskFailureReq` with the current `reporter_part_id`, and
+    /// sends to the manager. The channel is bounded so a misbehaving
+    /// peer can't OOM us; F190's per-stream alloc route-around remains
+    /// the primary defense, so dropped reports don't hurt correctness.
+    failure_report_tx: mpsc::Sender<FailureReport>,
+    /// F192: identifier the manager dedups by inside its quorum
+    /// debounce window. Each `PartitionData` sets this to its own
+    /// `part_id` after `StreamClient::new_with_revision`. Default 0
+    /// means "no reporter id configured" — drainer skips sending to
+    /// avoid polluting the manager's quorum count with a sentinel.
+    reporter_part_id: Cell<u64>,
     append_metrics: StreamAppendMetrics,
+}
+
+/// F192: payload of one failure-observation event passed from a
+/// per-stream worker to the per-StreamClient drainer task.
+#[derive(Clone, Copy, Debug)]
+struct FailureReport {
+    node_id: u64,
+    extent_id: u64,
 }
 
 impl StreamClient {
@@ -924,7 +1025,8 @@ impl StreamClient {
     }
 
     /// Private ctor: `Rc::new_cyclic` captures a weak self-ref for the
-    /// per-stream workers' removal guard.
+    /// per-stream workers' removal guard and for the F192 failure-report
+    /// drainer task.
     fn construct(
         manager_addrs: Vec<String>,
         current_mgr: usize,
@@ -933,7 +1035,12 @@ impl StreamClient {
         max_extent_size: u32,
         pool: Rc<ConnPool>,
     ) -> Rc<Self> {
-        Rc::new_cyclic(|weak| Self {
+        // F192: bounded channel — drop reports on overflow rather than
+        // OOMing the writer. F190's per-stream alloc route-around is
+        // the primary defense; reports are pure advisory.
+        let (failure_report_tx, failure_report_rx) =
+            mpsc::channel::<FailureReport>(1024);
+        let rc = Rc::new_cyclic(|weak| Self {
             self_weak: weak.clone(),
             manager_addrs,
             current_mgr: Cell::new(current_mgr),
@@ -946,8 +1053,26 @@ impl StreamClient {
             stream_workers: RefCell::new(HashMap::new()),
             stream_init_locks: RefCell::new(HashMap::new()),
             stream_bad_nodes: RefCell::new(HashMap::new()),
+            failure_report_tx,
+            reporter_part_id: Cell::new(0),
             append_metrics: StreamAppendMetrics::default(),
-        })
+        });
+        // F192: spawn the drainer task on the current compio runtime.
+        // The Weak<Self> exits the loop when StreamClient is dropped.
+        let weak = Rc::downgrade(&rc);
+        compio::runtime::spawn(failure_report_drain_loop(weak, failure_report_rx))
+            .detach();
+        rc
+    }
+
+    /// F192: set the partition id that the manager-side quorum debounce
+    /// dedups by. Each `PartitionData` calls this once after
+    /// `new_with_revision`. Leaving it at 0 disables the F192 send path
+    /// (the drainer skips events with reporter=0) — safe for tests and
+    /// for the rare server-level `StreamClient` that doesn't belong to
+    /// a partition.
+    pub fn set_reporter_part_id(&self, part_id: u64) {
+        self.reporter_part_id.set(part_id);
     }
 
     pub fn revision(&self) -> i64 {
@@ -1037,12 +1162,17 @@ impl StreamClient {
             .insert(stream_id, tx.clone());
         let pool = self.pool.clone();
         let bad_nodes = self.stream_bad_nodes_handle(stream_id);
+        // F192: clone the failure-report sender into the worker so
+        // `apply_completion` Err can fire reports without an extra
+        // hop through the StreamClient.
+        let failure_report_tx = self.failure_report_tx.clone();
         let guard = WorkerRemovalGuard {
             sc: self.self_weak.clone(),
             stream_id,
         };
         compio::runtime::spawn(async move {
-            stream_worker_loop(stream_id, rx, pool, bad_nodes, guard).await;
+            stream_worker_loop(stream_id, rx, pool, bad_nodes, failure_report_tx, guard)
+                .await;
         })
         .detach();
         tx
@@ -2388,7 +2518,10 @@ mod pipeline_tests {
 
     #[test]
     fn lease_no_collision() {
-        let mut state = StreamAppendState::new(Rc::new(RefCell::new(HashMap::new())));
+        let mut state = StreamAppendState::new(
+            Rc::new(RefCell::new(HashMap::new())),
+            mpsc::channel::<FailureReport>(1).0,
+        );
         let (o0, e0) = state.lease(100);
         let (o1, e1) = state.lease(200);
         let (o2, e2) = state.lease(50);
@@ -2404,7 +2537,10 @@ mod pipeline_tests {
 
     #[test]
     fn ack_advances_commit_on_prefix() {
-        let mut state = StreamAppendState::new(Rc::new(RefCell::new(HashMap::new())));
+        let mut state = StreamAppendState::new(
+            Rc::new(RefCell::new(HashMap::new())),
+            mpsc::channel::<FailureReport>(1).0,
+        );
         let (o0, e0) = state.lease(100);    // 0..100
         let (o1, e1) = state.lease(100);    // 100..200
         let (o2, e2) = state.lease(100);    // 200..300
@@ -2426,7 +2562,10 @@ mod pipeline_tests {
 
     #[test]
     fn rewind_on_error_most_recent() {
-        let mut state = StreamAppendState::new(Rc::new(RefCell::new(HashMap::new())));
+        let mut state = StreamAppendState::new(
+            Rc::new(RefCell::new(HashMap::new())),
+            mpsc::channel::<FailureReport>(1).0,
+        );
         let (o0, _e0) = state.lease(100);
         let (o1, _e1) = state.lease(200);
         assert_eq!(state.lease_cursor, 300);
@@ -2446,7 +2585,10 @@ mod pipeline_tests {
 
     #[test]
     fn poison_on_error_mid_sequence() {
-        let mut state = StreamAppendState::new(Rc::new(RefCell::new(HashMap::new())));
+        let mut state = StreamAppendState::new(
+            Rc::new(RefCell::new(HashMap::new())),
+            mpsc::channel::<FailureReport>(1).0,
+        );
         let (o0, _) = state.lease(100);
         let (_, _) = state.lease(200);
         assert_eq!(state.in_flight, 2);
@@ -2473,7 +2615,10 @@ mod f190_bad_nodes_tests {
     #[test]
     fn mark_then_inspect_returns_node() {
         let bad = Rc::new(RefCell::new(HashMap::new()));
-        let state = StreamAppendState::new(bad.clone());
+        let state = StreamAppendState::new(
+            bad.clone(),
+            mpsc::channel::<FailureReport>(1).0,
+        );
         state.mark_bad_node(7);
         let entries = bad.borrow();
         assert!(entries.contains_key(&7));
@@ -2483,7 +2628,10 @@ mod f190_bad_nodes_tests {
     #[test]
     fn mark_refreshes_existing_entry() {
         let bad = Rc::new(RefCell::new(HashMap::new()));
-        let state = StreamAppendState::new(bad.clone());
+        let state = StreamAppendState::new(
+            bad.clone(),
+            mpsc::channel::<FailureReport>(1).0,
+        );
         state.mark_bad_node(11);
         let first = *bad.borrow().get(&11).unwrap();
         std::thread::sleep(Duration::from_millis(5));
