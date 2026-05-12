@@ -29,3 +29,7 @@ perf_baseline*.json
 
 # Claude Code local session state (not part of the project)
 .claude/
+
+# Tooling caches / generated lockfiles for nested crates
+.codex
+/python/Cargo.lock
