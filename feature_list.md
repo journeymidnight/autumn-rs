@@ -358,6 +358,67 @@
 
 ## Open / Deferred designs
 
+### F190 · Per-stream `bad_nodes` exclusion at alloc time
+
+- **Trigger:** Conversation 2026-05-12 — under heavy write load (gallery thumb generation) extent-node 9103's `disk-3` flapped online/offline. When an extent-node fails an append, its `mark_disk_offline_for_extent` only flips a local in-memory flag; the manager doesn't learn for up to 10 s (next `disk_status_update_loop` tick). Meanwhile `StreamClient`'s retry loop immediately calls `alloc_new_extent`, and the manager picks the same broken disk again because its `MetadataStore.disks[id].online` is still `true`. The retry loop bounces against the freshly-failed disk for the entire polling window before the manager catches up.
+- **Approach:**
+  - `StreamClient`: `StreamAppendState` gains `bad_nodes: HashMap<u64 /*node_id*/, Instant /*expires_at*/>` with TTL **30 s**. TTL covers a full manager polling cycle + a recovery-dispatch window without holding excludes long enough to block the disk's natural self-recovery.
+  - `apply_completion` Err path: resolve the failing replica's `node_id` from the cached `ExtentInfo` and insert/refresh the entry.
+  - `alloc_new_extent`: snapshot still-active (non-expired) entries, pass via new field `StreamAllocExtentReq.exclude_node_ids: Vec<u64>`.
+  - Manager `handle_stream_alloc_extent`: filter candidate nodes by `exclude_node_ids` before scoring; if the filter empties the candidate set, fall back to the full set so progress isn't blocked by stale excludes.
+  - Successful append does **not** clear `bad_nodes` — success on the remaining N-1 replicas doesn't prove the excluded one is healthy. Only TTL eviction.
+- **Acceptance:**
+  - Unit: insert/expiry/snapshot semantics on `bad_nodes`; rkyv schema-extension test for `StreamAllocExtentReq` with backwards compat (empty `exclude_node_ids` = old client behavior).
+  - Integration: kill one of 3 extent-nodes mid-append; the next alloc on that stream skips the dead node within a single retry; restart it; after 30 s the same stream resumes allocating onto it.
+- **Out of scope:** does not touch manager-side disk online/offline state machine — that's F192.
+- **passes:** false
+
+### F191 · ExtentNode control-plane port + manager `control_pool` (carries P0 timeout fix)
+
+- **Trigger:** Conversation 2026-05-12 — manager `disk_status_update_loop` flapped (`disk-3 online → offline → online → offline` within 90 s) under heavy write load. Root cause analysis: manager's single `ConnPool` to each extent-node multiplexes data-plane RPCs (`CONVERT_TO_EC`, `COPY_EXTENT`, `RECOVERY`) and control-plane RPCs (`DF`, future `HEARTBEAT` / `REPORT_DISK_FAILURE`). When a 1+ GB EC convert fanout occupies the connection's TCP send buffer or hits io_uring CQ backpressure on the node, the next `DF` RPC takes seconds → `RpcClient` `closed` flag → next pending future returns `ConnectionClosed` → `mark_node_disks_offline`. Next 10 s tick sees a healthy node and promotes back. Loop. Additionally, `recovery.rs:441` comment promised "bound df at 5 s" but the call site uses `conn_pool.call` (no timeout) — a second long-standing bug.
+- **Approach:**
+  - `ExtentNode`: bind a second listener on `port + 1000` by default (e.g. `--port 9101` → control listener at `:10101`); `--control-port` flag for override.
+  - Reuse the same `handle_connection` SQ/CQ loop on the control listener (no API churn). The control listener only ever sees small-payload ops (`DF`, future heartbeat / report) so its FuturesUnordered cap stays minimal.
+  - Manager: extend `MgrNodeInfo` with `control_address: String` (empty = legacy node, fall back to data port). `MSG_REGISTER_NODE` payload gains the field via rkyv schema extension (backwards-compatible default).
+  - Manager: carry a second `Rc<ConnPool>` named `control_pool`. `disk_status_update_loop` and `recovery_collect_loop`'s DF calls switch to it.
+  - **P0 fix in same commit:** replace `conn_pool.call(EXT_MSG_DF)` with `control_pool.call_timeout(EXT_MSG_DF, ..., Duration::from_secs(5))` to honor the longstanding "5 s bound" comment.
+  - `cluster.sh`: pass `--control-port` (default offset +1000) to each extent-node; the format step records the control address; `autumn-client info` displays both addresses.
+- **Acceptance:**
+  - Unit (manager): rkyv schema-extension test for `MgrNodeInfo` with empty `control_address` from old node payload.
+  - Integration: spawn a synthetic 1 GB CONVERT_TO_EC fanout that holds the data-pool connection, parallel DF call returns within 100 ms via `control_pool`. Record before/after manager.log to show no `df RPC failed` lines under the same load that triggered the flap.
+- **Dependencies:** F192 depends on this (REPORT_DISK_FAILURE travels on `control_pool`).
+- **passes:** false
+
+### F192 · `MSG_REPORT_DISK_FAILURE` with quorum debounce, delivered via `control_pool`
+
+- **Trigger:** Conversation 2026-05-12 — F190 fixes the per-stream alloc retry bounce (per-call route-around), F191 fixes manager↔node liveness polling reliability. Neither closes the gap that **manager's global view of `disk.online` is still pulled, not pushed**: between polling cycles, recovery dispatch / EC scheduling / advisory candidate selection still operate on stale truth. The fix is to let the data-plane failure signal flow back to manager in real time so global decisions catch up to per-stream truth.
+- **Approach:**
+  - New manager RPC: `MSG_REPORT_DISK_FAILURE { node_id, extent_id, error_kind: u8, ts }`. Delivered via `control_pool` (depends on F191) — must NOT share a connection with data-plane.
+  - `StreamClient`: on `apply_completion` Err with replica `node_id` known, fire-and-forget the report through manager's control pool. No await on response (best-effort; loss is fine because F190 still routes around per-stream).
+  - Manager: in-memory `recent_failure_reports: HashMap<u64, VecDeque<(Instant, u64 /*reporter_part_id*/)>>`. Eviction window = **60 s**; quorum threshold = **3 distinct `reporter_part_id`** within window. On quorum: `mark_node_disks_offline` (in-memory + etcd write).
+  - Quorum reached does **not** trigger `require_recovery` immediately — leaving recovery to the existing `recovery_dispatch_loop` (which polls every 5 s and re-evaluates on each tick) avoids a recovery storm during transient regional hiccups.
+  - Manager's `disk_status_update_loop` retains its role: a successful DF response promotes the node back online and clears `recent_failure_reports[node_id]` so a subsequent burst of stale reports doesn't re-flip.
+- **Acceptance:**
+  - Unit: quorum window math (insert N reports across distinct reporters, verify mark-offline fires only at N≥3 within 60 s; verify a 4th report on the same partition_id doesn't count toward quorum).
+  - Integration: SIGSTOP one extent-node mid-write; ≥3 partitions issue REPORT_DISK_FAILURE within seconds; manager marks node offline before its next DF tick; SIGCONT the node; next DF promotes it back.
+- **Dependencies:** F191 (control_pool).
+- **passes:** false
+
+### F193 · Streaming EC encode + chunked recovery/copy (extent-node memory)
+
+- **Trigger:** Conversation 2026-05-12 — `ps -o rss` shows extent-nodes at 369–770 MB steady-state with peak ≈3 GB observed during EC conversion. Source: `handle_convert_to_ec` (extent_node.rs:3891) materializes the whole extent in one `Vec<u8>` then allocates `K+M` shards (each ≈ `sealed_length / K` bytes) — peak ≈ `sealed_length × (1 + (K+M)/K)`, roughly **7 GB transient working set on a 3.2 GB sealed extent at K=3, M=1**. `handle_copy_extent` (3652), `handle_re_avali` (3530), and `run_recovery_task` (2400) similarly buffer the entire extent in one `Bytes`. F105/F115 chunked the *syscall* (256 MiB pread/pwrite to avoid macOS INT_MAX / Linux 0x7ffff000 EINVAL), but the result is concatenated into a single buffer — chunking is at syscall level, not memory level. Rust's default allocator doesn't aggressively `madvise(MADV_FREE)`, so RSS sits at the high-water mark indefinitely after a single EC convert.
+- **Approach (sketches — concrete design to be picked when work begins):**
+  - **Option A — per-chunk EC encode wire protocol:** stripe extent into 64–256 MB chunks; encode each chunk; fanout immediately; commit per-chunk on the manager. Requires new wire format with chunk index/seq, manager-side multi-chunk commit, replica reconciliation. Largest surface area; cleanest peak.
+  - **Option B — pipelined encode (preferred starting point):** keep current 2PC; restructure the encode loop to read + encode + fanout in a streaming pipeline with bounded inflight (e.g. 2 chunks). Peak memory ≈ `2 × chunk × (K+M)` instead of `full × (1 + (K+M)/K)`. No wire format change. Requires careful inflight ordering since the file_pwrite_chunked already streams writes — extending the same pattern through the encode + RPC fanout phases.
+  - **recovery / copy_extent:** switch `handle_copy_extent`'s pull-the-whole-extent-as-Bytes pattern to a sequence of bounded `read_bytes` reads streamed back as multiple response frames, or have callers use the existing `StreamClient::read_bytes_from_extent` chunked path directly (already does 256 MiB chunks RPC-side).
+  - **Allocator hygiene:** swap default allocator to `tikv-jemallocator` with `MALLOC_CONF=dirty_decay_ms:1000,muzzy_decay_ms:1000` so RSS returns to the OS after a transient spike. Cheap two-line Cargo.toml + main.rs change; can ship independently.
+- **Acceptance (target):**
+  - EC convert peak RSS bounded `< 1.5 GB` on a 3 GB extent (vs current ~7 GB peak).
+  - Recovery / copy peak RSS bounded `< 256 MiB` regardless of extent size.
+  - Steady-state RSS returns to ≈ 100–200 MB within 30 s of an EC convert completing (allocator hygiene).
+- **Dependencies:** none. Independent of F190/F191/F192. Best done after the flap series ships so we can isolate behavior changes from memory changes.
+- **passes:** false
+
 ### F189-fix-r2 · Round-2 race-review fixes (audit on the round-1 fixes themselves)
 
 After F189-fix shipped, ran a SECOND distributed-systems race review focused on (a) whether the round-1 fixes introduced new bugs and (b) edge cases round 1 didn't dig into. Three new findings, all in code introduced by F189-fix's commit (5352272). All three fixed in this commit.

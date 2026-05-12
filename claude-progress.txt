@@ -1,100 +1,65 @@
-Date: 2026-05-10
+Date: 2026-05-12
 TaskStatus: completed
-Task scope: F189-fix-r2 — round-2 distributed-systems race review
-            fixes. Audit on the round-1 fixes themselves (commit
-            5352272) found 3 new issues, all in code introduced by
-            that commit. All 3 fixed in this commit.
+Task scope: F190-F193 — design entries written to feature_list.md.
+            No code in this commit; entries documented as deferred-work
+            so the next session can pick them up cleanly.
 
-Round 2 findings:
+Conversation context:
+  Live cluster (4 extent-nodes + 1 PS at 127.0.0.1) was running
+  gallery thumb-generation traffic. Operator observed:
+    1. `info` showed `disk-3 online=false` on extent-node 9103
+       even though the process was alive. manager.log showed flap:
+       online → offline → online → offline within 90 s windows.
+    2. `forcegc 27 24` printed success but no GC ran. Diagnosis:
+       partition 27's log_stream id is 24 (NOT an extent_id). The
+       Force branch in background.rs filters extent_ids ∉ sealed_log_extents
+       and silently produces an empty `holes` set; there is no warn log.
+    3. Per-extent-node RSS at 369–770 MB; previous peak observed at
+       ~3 GB during EC conversion of a 3.2 GB extent.
 
-  HIGH (re-opens MED-4): compact paths stamped last_compact_at AFTER
-        clearing compact_inflight. Between them sat a logging match,
-        truncate(...) network await (seconds), and pending bytes
-        compute. Scheduler tick reading the (inflight, last_at,
-        pending) tuple could see (0, stale-0, stale-high) for a
-        partition that had JUST finished compacting → redundant
-        dispatch. Fix: stamp + refresh BEFORE clear in the do_compact
-        Recv path AND the expiry-major Timeout path. GC loop already
-        had correct order; only compact paths inverted it.
+Root cause for the flap:
+  Manager's `disk_status_update_loop` (recovery.rs:445) calls
+  `conn_pool.call(EXT_MSG_DF, ...)` — the `// F121: bound df at 5 s`
+  comment is wrong; the call has no timeout. Single failure marks
+  all of that node's disks offline. Under heavy data-plane load
+  (CONVERT_TO_EC, COPY_EXTENT) the shared `ConnPool` connection
+  to the extent-node is monopolized; DF queues, the background
+  reader/writer task in autumn-rpc may exit on a transient TCP
+  hiccup, and the next DF returns `ConnectionClosed`. Next 10 s
+  tick succeeds → online again. Repeat.
 
-  MEDIUM (re-opens HIGH-2): two GC early-continue paths skipped the
-        last_gc_at stamp:
-          - get_stream_info failure (transient manager/extent-node hiccup)
-          - extent_ids.len() < 2 (single-extent partition)
-        Cooldown gate read 0-as-never on these continue paths, letting
-        the scheduler re-dispatch every 5 s. Fix: extract
-        `stamp_last_gc` closure helper, call on every continue path
-        (and refactor the already-correct empty-holes + main-tail
-        paths to use the same helper for consistency).
+Real fix is not "fix the timeout + add a flap counter" — by the
+time the polling loop gets right, alloc has already bounced 3
+times against the failed disk because alloc decisions happen
+in milliseconds while DF polling is 10 s. The right fix is to
+make the data-plane failure signal flow back to manager in real
+time and to give per-call alloc retries direct knowledge of which
+nodes just failed.
 
-  LOW: GC drain `(Auto, Force)` collapse silently drops the Auto.
-        Force is operator-named extents; Auto is threshold-based scan
-        of top-3 high-debt extents. Generally different extent sets.
-        Fix: documented as accepted one-tick (5 s) deferral — the
-        Auto's high-debt extent gets re-dispatched on the next
-        scheduler tick once this run's stamp engages cooldown then
-        re-evaluates urgency.
+Plan documented in feature_list.md (passes:false):
+  F190: per-stream `bad_nodes` exclusion — StreamClient passes
+        recently-failed node_ids to manager's alloc handler.
+        Self-healing per stream, no manager state change.
+        TTL 30 s, no clear-on-success.
+  F191: ExtentNode binds a second listener (port +1000); manager
+        carries a separate `control_pool`; DF + future heartbeat
+        + REPORT_DISK_FAILURE travel on it. Carries the
+        long-standing P0 timeout fix for DF.
+  F192: New `MSG_REPORT_DISK_FAILURE` over `control_pool`.
+        Manager debounces with quorum (3 distinct partition_ids
+        within 60 s) before flipping `disk.online`. Does NOT
+        trigger require_recovery immediately — leaves it to the
+        existing dispatch loop.
+  F193: Streaming EC encode + chunked recovery to bound
+        extent-node RSS. Peak EC convert ~7 GB → target < 1.5 GB.
+        Independent of F190/F191/F192.
 
-Round 2 walked 14 additional checks (A1-A4 verifying round-1 fixes,
-B1-B4 AdmissionController internals, C1-C4 cross-thread Send-ness,
-D1-D3 stream-layer + manager interactions). Beyond the 3 above,
-everything else clear:
-  A1: futures-channel `next().now_or_never()` correctly drains backlog
-  A3: no `?` operators between inflight latch and clear
-  A4: req_count_monotonic bumped at every req_count.fetch_add site
-  B1: start_write_batch fully .await-d serially per partition (no
-      reordering possible across batches)
-  B2: shared-quota controller second-caller-pays-for-first is
-      intended steady-state semantic (CockroachDB style)
-  B3: bg yields the moment fg INTENDS to write (sees inflated
-      fg_bytes during fg's own sleep) — intended priority semantic
-  B4: PS-wide budget across N partitions is the intended scope
-  C1: closure capture of metrics by ref — no current bug
-  C2: snapshot pattern correct under main-thread serialization
-  C3: torn-read of (gc_debt, inflight, last_at) tuple bounded to
-      at-most-one redundant dispatch under correct ordering
-  C4: scheduler's req_per_sec diff race against monotonic writers
-      is benign
-  D1: GC reader-pin RAII intact; no leak in empty-holes path
-  D2: handle_maintenance routes via same channels; HIGH-1's drain
-      collapse covers both PS scheduler + manager auto-trigger paths
-  D3: drain happens BEFORE the various continue paths; no late-major
-      lost
+Files changed in this commit:
+  feature_list.md  — F190, F191, F192, F193 entries
+  claude-progress.txt — this file
 
-Files changed:
-  crates/partition-server/src/background.rs
-    + Compact Recv arm: pending_bytes refresh + stamp_last_compact +
-      clear_compact_inflight reordered to stamp-before-clear
-    + Expiry-major Timeout arm: same reorder
-    + GC loop: stamp_last_gc closure helper added
-    + GC get_stream_info failure: stamp_last_gc + clear_inflight
-      (was: clear_inflight only)
-    + GC extent_ids<2: stamp_last_gc + clear_inflight (was: clear only)
-    + GC empty-holes + main-tail: refactored to use stamp_last_gc
-      (was: inline metrics.last_gc_at.store)
-  feature_list.md
-    F189-fix-r2 entry under Open / Deferred designs
-  claude-progress.txt
-    this file
-
-Tests:
-  cargo check --workspace --exclude autumn-fuse: clean
-  cargo test -p autumn-rpc                     : 13/13
-  cargo test -p autumn-manager --lib            : 58/58
-  cargo test -p autumn-partition-server --lib
-                              -- --test-threads=1: 131/131
-
-After two rounds of distributed-systems race review covering 26
-distinct concurrency hazards, 7 bugs found total (4 round-1 + 3
-round-2), all fixed. Both rounds confirmed:
-  - Mutex never held across .await
-  - F148-A meta_stream publish ordering invariant intact
-  - Stream-layer single-writer invariants intact
-  - Cross-thread Send-ness correct
-  - Compio runtime serialization assumptions valid
-
-Stage 4 follow-ups deferred (not race-related):
-  - Persist last_gc_at / last_compact_at across restart
-  - Migrate PartitionLoad to prost for rolling-upgrade tolerance
-  - Integrate F183 advisory's per-bucket req_per_sec into
-    AdmissionController saturation calc
+Next steps:
+  Begin F190 implementation: rkyv field-extend on
+  StreamAllocExtentReq, StreamClient bad_nodes map + integration
+  with apply_completion + alloc_new_extent, manager-side filter
+  in handle_stream_alloc_extent.
