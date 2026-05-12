@@ -1,52 +1,53 @@
 Date: 2026-05-12
 TaskStatus: completed
-Task scope: F190-F193 — multi-feature loop. All four features
-            addressed; F193 ships in stages with B/C explicitly
-            deferred (recorded in feature_list).
+Task scope: F194 — extent-node EC + Recovery global concurrency caps.
+            Follow-up to F190-F193 series that addressed the disk-3
+            flap + EC convert RSS hangover.
 
-F190 (commit 19049a2): per-stream bad_nodes exclusion at alloc time.
-F191 (commit 7981faa): ExtentNode control-plane port + manager
-                       control_pool + DF timeout fix.
-F192 (commit eb27ecd): MSG_REPORT_DISK_FAILURE with quorum debounce.
+F194 done in this commit:
+  - ExtentNodeGate: Rc<Cell<usize>> counter + 50 ms backoff poll.
+    Mirror of PS's CompactionGate but Rc-based for single-threaded
+    extent-node shard.
+  - ExtentNode.ec_convert_gate (default parallelism=1, env
+    AUTUMN_EXTENT_EC_CONVERT_PARALLELISM, clamped [1, 16]).
+  - ExtentNode.recovery_gate (default parallelism=2, env
+    AUTUMN_EXTENT_RECOVERY_PARALLELISM, clamped [1, 16]).
+  - Acquire in handle_convert_to_ec AFTER F119-D idempotency
+    check so no-op skips don't consume permits.
+  - Acquire in run_recovery_task AFTER F147-C stale-snapshot
+    check for the same reason.
+  - 5 new unit tests in f194_concurrency_gate_tests cover:
+    * parallelism=1 serialises (timed race vs 200 ms)
+    * parallelism=2 allows two, blocks third
+    * permit drop wakes blocked acquire within one backoff window
+    * constructor clamps 0 → 1
+    * env parsing: defaults / valid / clamp-upper / clamp-lower /
+      non-numeric fallback
 
-F193 Stage A (this commit): allocator hygiene.
-  - tikv-jemallocator 0.6 added to autumn-server crate
-    (Linux-only via target.cfg)
-  - #[global_allocator] + MALLOC_CONF=dirty_decay_ms:1000,
-    muzzy_decay_ms:1000 in all three production binaries:
-    autumn-extent-node, autumn-ps, autumn-manager-server
-  - Linux-only via #[cfg(target_os = "linux")]; macOS dev
-    builds keep the system allocator
-  - Closes the steady-state RSS hangover (operator's primary
-    observed pain: "extent-nodes at 369-770 MB steady, ~3 GB
-    peak during EC convert" — peak unchanged, but RSS returns
-    to baseline within ~1 s of the spike subsiding)
+Why this closes a real gap:
+  Pre-F194 a recovery_dispatch_loop tick after a node-down event
+  could detached-spawn N concurrent recoveries on the same survivor
+  node (one per down extent). Each holds payload × 2 transient
+  memory through fetch + writeback. 6 simultaneous recoveries on 3
+  GiB extents → ~36 GiB peak. Manager's serial .await on dispatch
+  RPC doesn't gate node-side execution since require_recovery
+  early-returns and run_recovery_task is detached.
 
-F193 Stage B (deferred): pipelined EC encode.
-  - Analysis: Option B alone (chunked encode w/o wire change)
-    bounds peak at payload × (K+M)/K ≈ 4 GiB on a 3 GiB extent
-    at K=3 M=1. Below current ~7 GiB but above the 1.5 GiB
-    acceptance target.
-  - To hit < 1.5 GiB requires Option A: per-chunk
-    WriteShardReq with chunk index, manager-side multi-chunk
-    commit, replica reconciliation. Largest surface area;
-    deferred until operator pain re-surfaces post Stage A.
+  F194's gate caps this at parallelism × single-task peak ≈ 12 GiB
+  (recovery) or 7 GiB (EC, parallelism=1). Together with F193 Stage
+  A (jemalloc page return), steady-state RSS returns to live-heap
+  within ~1 s of the spike subsiding.
 
-F193 Stage C (deferred): chunked recovery / copy_extent.
-  - StreamClient::read_bytes_from_extent already chunks RPC
-    via F105 256 MiB chunks; callers (run_recovery_task,
-    handle_copy_extent, handle_re_avali) still accumulate the
-    Bytes into one writeback buffer.
-  - Switching to producer-consumer pipeline bounds peak at
-    one chunk = 256 MiB. Independent of Stage B; deferred.
+Workspace tests: 50/50 stream lib (was 45, +5 F194) + 13/13 rpc +
+62/62 manager lib all green. Pre-existing flaky partition-server
+timing tests (f099i_*) and integration tests
+(partition_server_put_get_and_split_flow, f029/f030/f031, f037)
+unchanged from F190-F193 baseline.
 
-This closes the F190-F193 loop. All four entries in
-feature_list.md updated to passes:true (F193 marked partial
-with explicit Stage A / B / C accounting).
-
-Workspace tests: 13 rpc + 45 stream + 62 manager lib tests
-all green. Pre-existing flaky partition-server timing tests
-(f099i_*) and integration tests (partition_server_put_get_and_
-split_flow, f029/f030/f031, f037) unchanged from F190 baseline.
-
-Production binaries link with jemalloc on Linux.
+Cumulative status of the F190-F194 series:
+  F190 — bad_nodes exclusion (commit 19049a2)
+  F191 — control-plane port + control_pool + DF timeout (7981faa)
+  F192 — MSG_REPORT_DISK_FAILURE quorum debounce (eb27ecd)
+  F193 Stage A — jemalloc hygiene (4803209)
+  F193 Stage B/C — deferred (Option A wire change required)
+  F194 — extent-node concurrency gates (this commit)

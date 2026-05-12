@@ -358,6 +358,24 @@
 
 ## Open / Deferred designs
 
+### F194 · Extent-node EC + Recovery global concurrency caps
+
+- **Trigger:** Conversation 2026-05-12 (post-F193 follow-up). PS already gates background work via `CompactionGate` (cross-partition major compact cap, env `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM`, default 1) + `AdmissionController` (fg/bg byte rate, F189) + per-partition GC limiter (F141). Extent-node has **NONE** of these: `ec_conversion_locks` (F153) and `recovery_inflight` (F109) are both per-extent_id, not cross-extent. Concrete failure mode: a `recovery_dispatch_loop` tick after a single node-down event detects 6 extents needing recovery and detached-spawns 6 concurrent `run_recovery_task` on the same survivor node — each peer-fetches ~payload bytes + writes ~payload bytes, multiplying transient working set to `6 × payload × 2 ≈ 36 GiB` on 3 GiB extents. Similarly for EC convert: manager's serial `.await` on dispatch doesn't gate node-side execution, so multiple converts on a single node interleave at `payload × (1+(K+M)/K)` peak each.
+- **Approach:**
+  - `ExtentNodeGate`: Rc-based mirror of PS's `CompactionGate` — `Cell<usize>` counter + 50 ms backoff poll. Single-threaded compio per shard means no atomic needed; `Rc` keeps construction cheap and matches existing extent-node patterns.
+  - Two gates on `ExtentNode`: `ec_convert_gate` (default parallelism=1, env `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM`) and `recovery_gate` (default parallelism=2, env `AUTUMN_EXTENT_RECOVERY_PARALLELISM`). Both clamped to `[1, 16]`.
+  - **Acquire timing matters**: gates are acquired AFTER existing cheap refuse-at-start checks (F119-D idempotent-skip for EC, F147-C stale-snapshot for recovery) so no-op paths don't consume permits. Per-extent F153 lock for EC remains the same-extent correctness gate; the new gate is the cross-extent memory-safety gate.
+  - Default rationale: EC=1 because it's an optimization (no latency cost from full serialisation); recovery=2 because it's repair work where concurrency speeds post-failure convergence and 2 × 3 GiB ≈ 12 GiB peak is comfortable on production nodes.
+- **Acceptance:**
+  - Unit (5 new tests in `f194_concurrency_gate_tests`): parallelism=1 serialises (timed race against 200 ms confirms blocking), parallelism=2 allows two then blocks third, permit drop wakes blocked acquire within one 50 ms backoff window, constructor clamps 0 → 1, env parsing handles defaults / valid / clamp-upper / clamp-lower / non-numeric fallback.
+  - Integration (deferred): on a 4-node cluster, kill one node, observe that `recovery_dispatch_loop` dispatches 6 recoveries but only 2 execute concurrently on each survivor node (jemalloc RSS growth bounded to ~12 GiB peak, returning to ~200 MB baseline within the F193 Stage A 1 s decay window).
+- **Files changed:**
+  - `crates/stream/src/extent_node.rs` — `ExtentNodeGate` + `ExtentNodePermit` types, `ec_convert_parallelism()` / `recovery_parallelism()` env helpers, `ExtentNode.ec_convert_gate` + `recovery_gate` fields with Clone forwarding, gate acquire in `handle_convert_to_ec` (after F119-D idempotency, line ~3641) and `run_recovery_task` (after F147-C check), 5-test `f194_concurrency_gate_tests` module.
+- **Dependencies:** none. Orthogonal to F193 — F193 reduces single-task peak; F194 reduces concurrent-task multiplier. Either ship without the other; together they bound `extent-node BG memory ≤ max(EC permit count × single-EC peak, recovery permit count × single-recovery peak)`.
+- **passes:** true (build clean across workspace; 50/50 stream lib + 13/13 rpc + 62/62 manager lib green; 5 new F194 gate tests pass; pre-existing flaky tests unchanged from F190-F193 baseline).
+
+---
+
 ### F190 · Per-stream `bad_nodes` exclusion at alloc time
 
 - **Trigger:** Conversation 2026-05-12 — under heavy write load (gallery thumb generation) extent-node 9103's `disk-3` flapped online/offline. When an extent-node fails an append, its `mark_disk_offline_for_extent` only flips a local in-memory flag; the manager doesn't learn for up to 10 s (next `disk_status_update_loop` tick). Meanwhile `StreamClient`'s retry loop immediately calls `alloc_new_extent`, and the manager picks the same broken disk again because its `MetadataStore.disks[id].online` is still `true`. The retry loop bounces against the freshly-failed disk for the entire polling window before the manager catches up.

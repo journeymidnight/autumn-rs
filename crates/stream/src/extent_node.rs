@@ -581,6 +581,98 @@ impl ExtentEntry {
     }
 }
 
+// ─── F194 ExtentNodeGate ─────────────────────────────────────────────────────
+//
+// Cross-extent concurrency cap for memory-heavy background paths
+// (`handle_convert_to_ec` and `run_recovery_task`). Pattern mirrors
+// `partition_server::CompactionGate` (atomic counter + 50 ms backoff
+// poll) but uses `Cell<usize>` instead of `AtomicUsize` because the
+// extent-node shard runs on a single-threaded compio runtime — all
+// gate acquires happen on one OS thread, so no cross-thread atomic
+// is needed. The polling backoff is fine here because EC + recovery
+// wallclock is seconds-to-minutes, far larger than 50 ms.
+//
+// Why not the per-extent locks alone? `ec_conversion_locks` (F153)
+// only serialises requests for the SAME extent_id; `recovery_inflight`
+// (F109) only blocks duplicate requests for the SAME extent_id. Both
+// allow unbounded cross-extent fanout: a single manager
+// `recovery_dispatch_loop` tick that finds 8 different extents needing
+// recovery on the same node spawns 8 detached `run_recovery_task`
+// tasks, each holding ~`payload × 2` memory through the fetch + write
+// phases. ExtentNodeGate caps that to N concurrent across all extents.
+
+pub struct ExtentNodeGate {
+    inflight: std::cell::Cell<usize>,
+    max_parallel: usize,
+}
+
+impl ExtentNodeGate {
+    pub fn new(max_parallel: usize) -> Rc<Self> {
+        Rc::new(Self {
+            inflight: std::cell::Cell::new(0),
+            max_parallel: max_parallel.max(1),
+        })
+    }
+
+    /// Acquire one permit. Polls with 50 ms backoff while at cap —
+    /// negligible relative to EC convert / recovery wallclock.
+    pub async fn acquire(self: &Rc<Self>) -> ExtentNodePermit {
+        loop {
+            let cur = self.inflight.get();
+            if cur < self.max_parallel {
+                self.inflight.set(cur + 1);
+                return ExtentNodePermit { gate: self.clone() };
+            }
+            compio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Snapshot of current inflight count. Test-only.
+    #[cfg(test)]
+    pub fn inflight(&self) -> usize {
+        self.inflight.get()
+    }
+}
+
+pub struct ExtentNodePermit {
+    gate: Rc<ExtentNodeGate>,
+}
+
+impl Drop for ExtentNodePermit {
+    fn drop(&mut self) {
+        let cur = self.gate.inflight.get();
+        self.gate.inflight.set(cur.saturating_sub(1));
+    }
+}
+
+/// F194: read `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM` env (default 1).
+/// 1 means "fully serialize EC converts on this shard" — matches PS's
+/// default major-compact parallelism. EC convert peak memory per call
+/// is ~`payload × (1 + (K+M)/K)`; without this cap, N concurrent
+/// converts multiply the peak by N. Clamped to [1, 16].
+fn ec_convert_parallelism() -> usize {
+    std::env::var("AUTUMN_EXTENT_EC_CONVERT_PARALLELISM")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(1, 16))
+        .unwrap_or(1)
+}
+
+/// F194: read `AUTUMN_EXTENT_RECOVERY_PARALLELISM` env (default 2).
+/// Default 2 because recovery is a repair operation — single-node
+/// concurrency speeds convergence after a node-down event when many
+/// extents need rebuild. Each `run_recovery_task` holds
+/// ~`payload × 2` (peer fetch buffer + writeback) so 2 × 3 GiB
+/// extents ≈ 12 GiB peak, comfortable on production nodes.
+/// Clamped to [1, 16].
+fn recovery_parallelism() -> usize {
+    std::env::var("AUTUMN_EXTENT_RECOVERY_PARALLELISM")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(1, 16))
+        .unwrap_or(2)
+}
+
 // ─── ExtentNode ───────────────────────────────────────────────────────────────
 
 pub struct ExtentNode {
@@ -617,6 +709,12 @@ pub struct ExtentNode {
     /// guard under the lock and exits as a no-op once the first finishes.
     /// Pattern mirrors `client.rs::stream_init_locks`.
     ec_conversion_locks: Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>>,
+    /// F194: per-shard cap on concurrent `handle_convert_to_ec` heavy
+    /// paths (i.e. not counting the F119-D idempotent skip). Default 1.
+    ec_convert_gate: Rc<ExtentNodeGate>,
+    /// F194: per-shard cap on concurrent `run_recovery_task` heavy
+    /// paths. Default 2. See `recovery_parallelism()` doc for rationale.
+    recovery_gate: Rc<ExtentNodeGate>,
 }
 
 impl Clone for ExtentNode {
@@ -632,6 +730,8 @@ impl Clone for ExtentNode {
             shard_count: self.shard_count,
             sibling_addrs: self.sibling_addrs.clone(),
             ec_conversion_locks: self.ec_conversion_locks.clone(),
+            ec_convert_gate: self.ec_convert_gate.clone(),
+            recovery_gate: self.recovery_gate.clone(),
         }
     }
 }
@@ -1418,6 +1518,8 @@ impl ExtentNode {
             shard_count: config.shard_count,
             sibling_addrs: Rc::new(config.sibling_addrs),
             ec_conversion_locks: Rc::new(RefCell::new(HashMap::new())),
+            ec_convert_gate: ExtentNodeGate::new(ec_convert_parallelism()),
+            recovery_gate: ExtentNodeGate::new(recovery_parallelism()),
         };
 
         // Load existing extents from all disks.
@@ -2364,6 +2466,20 @@ impl ExtentNode {
                 ));
             }
         }
+
+        // F194: gate cross-extent recovery concurrency. Acquired AFTER
+        // the cheap F147-C stale-snapshot check so a stale recovery
+        // doesn't consume a permit. Held until the end of the function
+        // via RAII (`_rec_permit`); released when the function returns
+        // or unwinds. Each `run_recovery_task` peer-fetches ~payload
+        // bytes then writes ~payload bytes (`payload × 2` transient
+        // working set); a single `recovery_dispatch_loop` tick can
+        // detect 6+ down extents and detached-spawn 6 concurrent
+        // recoveries on the same survivor node, multiplying the peak
+        // by N. Default parallelism=2 — repair work runs concurrently
+        // for faster post-failure convergence. Env tunable via
+        // `AUTUMN_EXTENT_RECOVERY_PARALLELISM` (clamped [1, 16]).
+        let _rec_permit = self.recovery_gate.acquire().await;
 
         // EC vs replication dispatch keys on `ec_converted` (set by the
         // manager's `apply_ec_conversion_done` after a sealed extent has
@@ -3640,6 +3756,18 @@ impl ExtentNode {
             }));
         }
 
+        // F194: gate cross-extent EC convert concurrency. Acquired AFTER
+        // the F119-D idempotent-skip check above so an already-converted
+        // extent (e.g. a deposed-leader redispatch) returns OK without
+        // consuming a permit. Held until the end of the function via
+        // RAII (`_ec_permit`); released when the function returns or
+        // unwinds. The per-extent F153 lock above remains the
+        // correctness gate against same-extent concurrent dispatches;
+        // this is the new memory-safety gate against cross-extent fan
+        // out. Default parallelism=1 — fully serialise. Env tunable
+        // via `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM` (clamped [1, 16]).
+        let _ec_permit = self.ec_convert_gate.acquire().await;
+
         // ── Check if coordinator's .ec.dat exists (prior prepare completed) ──
         //
         // If the coordinator's own staging file exists with the expected
@@ -4483,3 +4611,150 @@ mod f160_copy_extent_eversion_tests {
     }
 }
 
+#[cfg(test)]
+mod f194_concurrency_gate_tests {
+    //! F194: cross-extent concurrency cap for EC convert and recovery.
+    //! These tests target `ExtentNodeGate` directly — full end-to-end
+    //! coverage of `handle_convert_to_ec` / `run_recovery_task` with
+    //! concurrent dispatches would require multi-node peer fixtures
+    //! (see the F153 / F148 / F147c tests for the pattern, all in
+    //! the same file). The gate's behaviour is the load-bearing piece
+    //! and is fully testable in isolation.
+    use super::*;
+    use std::time::Duration;
+
+    #[compio::test]
+    async fn gate_parallelism_one_serialises_acquires() {
+        let gate = ExtentNodeGate::new(1);
+        let p1 = gate.acquire().await;
+        assert_eq!(gate.inflight(), 1, "first acquire must increment inflight");
+
+        // The second acquire would block forever — race it against a
+        // short timer and assert the timer wins. The 200 ms budget is
+        // 4× the gate's 50 ms backoff so a flaky scheduler doesn't
+        // make this flaky.
+        let race = futures::future::select(
+            Box::pin(gate.acquire()),
+            Box::pin(compio::time::sleep(Duration::from_millis(200))),
+        )
+        .await;
+        match race {
+            futures::future::Either::Left(_) => {
+                panic!("second acquire must NOT proceed while first permit is held")
+            }
+            futures::future::Either::Right(_) => {}
+        }
+        // Inflight still 1 — the blocked acquire didn't sneak through.
+        assert_eq!(gate.inflight(), 1);
+
+        // Drop the first permit; the next acquire proceeds promptly.
+        drop(p1);
+        assert_eq!(gate.inflight(), 0, "drop must decrement inflight");
+        let p2 = gate.acquire().await;
+        assert_eq!(gate.inflight(), 1);
+        drop(p2);
+        assert_eq!(gate.inflight(), 0);
+    }
+
+    #[compio::test]
+    async fn gate_parallelism_two_allows_two_then_blocks_third() {
+        let gate = ExtentNodeGate::new(2);
+        let _p1 = gate.acquire().await;
+        let _p2 = gate.acquire().await;
+        assert_eq!(gate.inflight(), 2);
+
+        let race = futures::future::select(
+            Box::pin(gate.acquire()),
+            Box::pin(compio::time::sleep(Duration::from_millis(200))),
+        )
+        .await;
+        assert!(
+            matches!(race, futures::future::Either::Right(_)),
+            "third acquire must block while two permits are held"
+        );
+        assert_eq!(gate.inflight(), 2);
+    }
+
+    #[compio::test]
+    async fn gate_drop_wakes_blocked_acquire() {
+        let gate = ExtentNodeGate::new(1);
+        let p1 = gate.acquire().await;
+
+        // Spawn a task that will acquire as soon as p1 drops.
+        let gate_clone = gate.clone();
+        let acquired = Rc::new(std::cell::Cell::new(false));
+        let acquired_clone = acquired.clone();
+        let task = compio::runtime::spawn(async move {
+            let _p = gate_clone.acquire().await;
+            acquired_clone.set(true);
+            // Hold briefly so the assertion below has time to observe.
+            compio::time::sleep(Duration::from_millis(20)).await;
+        });
+
+        // Yield a few ticks so the spawned task definitely enters the
+        // backoff sleep loop.
+        for _ in 0..3 {
+            compio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!acquired.get(), "must still be blocked on permit");
+
+        drop(p1);
+        // Give the gate one backoff tick (50 ms) + slack to wake up.
+        compio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            acquired.get(),
+            "drop must unblock the queued acquire within one backoff window"
+        );
+        task.await;
+    }
+
+    /// Constructor must clamp obviously-bad inputs to at least 1.
+    /// Test the public `new` directly — covers the `.max(1)` guard.
+    #[test]
+    fn gate_zero_parallelism_clamps_to_one() {
+        let gate = ExtentNodeGate::new(0);
+        assert_eq!(gate.max_parallel, 1, "0 must clamp to 1");
+    }
+
+    /// Env parser smoke tests. Use `unsafe { std::env::set_var }` so
+    /// the test is hermetic; restore the prior value at the end.
+    #[test]
+    fn parallelism_env_parses_and_clamps() {
+        let saved_ec = std::env::var("AUTUMN_EXTENT_EC_CONVERT_PARALLELISM").ok();
+        let saved_rec = std::env::var("AUTUMN_EXTENT_RECOVERY_PARALLELISM").ok();
+
+        // Defaults when unset.
+        std::env::remove_var("AUTUMN_EXTENT_EC_CONVERT_PARALLELISM");
+        std::env::remove_var("AUTUMN_EXTENT_RECOVERY_PARALLELISM");
+        assert_eq!(ec_convert_parallelism(), 1);
+        assert_eq!(recovery_parallelism(), 2);
+
+        // Valid override.
+        std::env::set_var("AUTUMN_EXTENT_EC_CONVERT_PARALLELISM", "4");
+        std::env::set_var("AUTUMN_EXTENT_RECOVERY_PARALLELISM", "8");
+        assert_eq!(ec_convert_parallelism(), 4);
+        assert_eq!(recovery_parallelism(), 8);
+
+        // Clamp upper.
+        std::env::set_var("AUTUMN_EXTENT_EC_CONVERT_PARALLELISM", "9999");
+        assert_eq!(ec_convert_parallelism(), 16);
+
+        // Clamp lower.
+        std::env::set_var("AUTUMN_EXTENT_EC_CONVERT_PARALLELISM", "0");
+        assert_eq!(ec_convert_parallelism(), 1);
+
+        // Non-numeric falls back to default.
+        std::env::set_var("AUTUMN_EXTENT_RECOVERY_PARALLELISM", "not-a-number");
+        assert_eq!(recovery_parallelism(), 2);
+
+        // Restore.
+        match saved_ec {
+            Some(v) => std::env::set_var("AUTUMN_EXTENT_EC_CONVERT_PARALLELISM", v),
+            None => std::env::remove_var("AUTUMN_EXTENT_EC_CONVERT_PARALLELISM"),
+        }
+        match saved_rec {
+            Some(v) => std::env::set_var("AUTUMN_EXTENT_RECOVERY_PARALLELISM", v),
+            None => std::env::remove_var("AUTUMN_EXTENT_RECOVERY_PARALLELISM"),
+        }
+    }
+}
