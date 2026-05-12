@@ -41,7 +41,8 @@ struct Args {
     conn_inflight_cap: Option<usize>,
     fg_rate_bytes_per_sec: Option<u64>,
     fg_iops_per_sec: Option<u64>,
-    bg_rate_bytes_per_sec: Option<u64>,
+    admission_compact_rate_bytes_per_sec: Option<u64>,
+    admission_gc_rate_bytes_per_sec: Option<u64>,
     fg_saturated_threshold: Option<f64>,
     fg_qps_quota: Option<u32>,
     gc_debt_high_bytes: Option<u64>,
@@ -83,7 +84,8 @@ fn parse_args() -> Args {
     let mut conn_inflight_cap: Option<usize> = None;
     let mut fg_rate_bytes_per_sec: Option<u64> = None;
     let mut fg_iops_per_sec: Option<u64> = None;
-    let mut bg_rate_bytes_per_sec: Option<u64> = None;
+    let mut admission_compact_rate_bytes_per_sec: Option<u64> = None;
+    let mut admission_gc_rate_bytes_per_sec: Option<u64> = None;
     let mut fg_saturated_threshold: Option<f64> = None;
     let mut fg_qps_quota: Option<u32> = None;
     let mut gc_debt_high_bytes: Option<u64> = None;
@@ -207,8 +209,27 @@ fn parse_args() -> Args {
                 fg_iops_per_sec = Some(args[i].parse().expect("--fg-iops-per-sec u64"));
             }
             "--bg-rate-bytes-per-sec" => {
+                eprintln!(
+                    "error: --bg-rate-bytes-per-sec was removed in F196 D-r7. \
+                     Use --compact-rate-bytes-per-sec + --gc-rate-bytes-per-sec instead."
+                );
+                std::process::exit(2);
+            }
+            "--admission-compact-rate-bytes-per-sec" => {
                 i += 1;
-                bg_rate_bytes_per_sec = Some(args[i].parse().expect("--bg-rate-bytes-per-sec u64"));
+                admission_compact_rate_bytes_per_sec = Some(
+                    args[i]
+                        .parse()
+                        .expect("--admission-compact-rate-bytes-per-sec u64"),
+                );
+            }
+            "--admission-gc-rate-bytes-per-sec" => {
+                i += 1;
+                admission_gc_rate_bytes_per_sec = Some(
+                    args[i]
+                        .parse()
+                        .expect("--admission-gc-rate-bytes-per-sec u64"),
+                );
             }
             "--fg-saturated-threshold" => {
                 i += 1;
@@ -332,7 +353,8 @@ fn parse_args() -> Args {
         conn_inflight_cap,
         fg_rate_bytes_per_sec,
         fg_iops_per_sec,
-        bg_rate_bytes_per_sec,
+        admission_compact_rate_bytes_per_sec,
+        admission_gc_rate_bytes_per_sec,
         fg_saturated_threshold,
         fg_qps_quota,
         gc_debt_high_bytes,
@@ -391,8 +413,11 @@ fn apply_ps_tunables(args: &Args) {
     if let Some(n) = args.fg_iops_per_sec {
         ps::set_admission_fg_iops(n);
     }
-    if let Some(n) = args.bg_rate_bytes_per_sec {
-        ps::set_admission_bg_rate(n);
+    if let Some(n) = args.admission_compact_rate_bytes_per_sec {
+        ps::set_admission_compact_rate(n);
+    }
+    if let Some(n) = args.admission_gc_rate_bytes_per_sec {
+        ps::set_admission_gc_rate(n);
     }
     if let Some(n) = args.fg_saturated_threshold {
         ps::set_admission_fg_saturated_threshold(n);

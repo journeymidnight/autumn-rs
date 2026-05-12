@@ -73,7 +73,10 @@ static PS_GC_PARALLELISM_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock:
 static PS_CONN_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static PS_FG_RATE_BYTES_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static PS_FG_IOPS_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-static PS_BG_RATE_BYTES_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+/// F196 D-r7: replaces the former `PS_BG_RATE_BYTES_PER_SEC_CELL`.
+/// Compact and GC each have their own per-partition bytes/s cap now.
+static PS_COMPACT_RATE_BYTES_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static PS_GC_RATE_BYTES_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static PS_FG_SATURATED_THRESHOLD_CELL: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 static PS_FG_QPS_QUOTA_CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 static PS_GC_DEBT_HIGH_BYTES_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -123,8 +126,14 @@ pub fn set_admission_fg_rate(n: u64) -> bool {
 pub fn set_admission_fg_iops(n: u64) -> bool {
     PS_FG_IOPS_PER_SEC_CELL.set(n).is_ok()
 }
-pub fn set_admission_bg_rate(n: u64) -> bool {
-    PS_BG_RATE_BYTES_PER_SEC_CELL.set(n).is_ok()
+/// F196 D-r7: per-partition compact rate cap (bytes/s). Replaces the
+/// former combined `set_admission_bg_rate`.
+pub fn set_admission_compact_rate(n: u64) -> bool {
+    PS_COMPACT_RATE_BYTES_PER_SEC_CELL.set(n).is_ok()
+}
+/// F196 D-r7: per-partition gc rate cap (bytes/s).
+pub fn set_admission_gc_rate(n: u64) -> bool {
+    PS_GC_RATE_BYTES_PER_SEC_CELL.set(n).is_ok()
 }
 pub fn set_admission_fg_saturated_threshold(n: f64) -> bool {
     PS_FG_SATURATED_THRESHOLD_CELL.set(n).is_ok()
@@ -585,13 +594,18 @@ pub(crate) struct PartitionData {
     /// split-vs-gc *synchronization*, NOT a resource cap. PS-wide
     /// compact / gc concurrency limits live in `io_bucket` (F196 D-r6).
     pub(crate) gc_gate: std::sync::Arc<CompactionGate>,
-    /// F196 D-r6: shared PS-wide AdmissionController (back to original
-    /// design after the per-partition D-r5 experiment). Hosts fg/bg
-    /// rate caps AND compact/gc concurrency permits — one place for
-    /// all background resource management. The `gc_gate` field above
-    /// (per-partition) is a separate concern: it serializes GC vs
-    /// split writes within one partition.
-    pub(crate) io_bucket: std::sync::Arc<crate::AdmissionController>,
+    /// F196 D-r7: per-partition rate controller. Fresh `Arc` per
+    /// partition — fg/compact/gc rates are isolated; a hot partition's
+    /// fg pressure cannot consume a cold sibling's budget. fg-aware
+    /// yield in `account_compact`/`account_gc` is per-partition too
+    /// (each partition compares its own fg activity against its own
+    /// fg cap).
+    pub(crate) rate_ctrl: std::sync::Arc<crate::RateController>,
+    /// F196 D-r7: PS-wide concurrency permits. Clone of
+    /// `PartitionServer.concurrency_ctrl`. Used by
+    /// `background_compact_loop` / `background_gc_loop` /
+    /// `handle_split_part`.
+    pub(crate) concurrency_ctrl: std::sync::Arc<crate::ConcurrencyController>,
     /// F196: PS-wide partition budget (cpuset_len / 2 when --cpuset is
     /// set; usize::MAX otherwise). `handle_split_part` consults this
     /// before calling `multi_modify_split` so a split that would push
@@ -1174,230 +1188,141 @@ pub struct PartitionServer {
     /// F099-K/F100-UCX — host component for the per-partition listener bind.
     /// For UCX/RoCE this must be the routable HCA IP, not `0.0.0.0`.
     listen_host: Rc<std::cell::RefCell<String>>,
-    /// F196 D-r6: single PS-wide AdmissionController unifying:
-    ///   - fg rate (bytes + iops)
-    ///   - bg rate (bytes)
-    ///   - bg compact concurrency cap (was F104 `compact_gate`)
-    ///   - bg gc concurrency cap (was F196 r5 `gc_concurrency_gate`)
-    /// Shared across all partitions on this PS — bg resources are
-    /// cluster-pool by nature (memory + cluster IO bandwidth). Per-
-    /// partition isolation lives at the *partition* layer (thread-per-
-    /// core P-log + dedicated io_uring), not in admission.
-    pub(crate) io_bucket: std::sync::Arc<AdmissionController>,
+    /// F196 D-r7: PS-wide concurrency caps for compact + GC. RAM cap,
+    /// shared by every partition on this PS. Per-partition rate
+    /// limiting lives in each `PartitionData.rate_ctrl`.
+    pub(crate) concurrency_ctrl: std::sync::Arc<ConcurrencyController>,
     /// F196 — static partition budget (ScyllaDB-style). Gate fires only
     /// when `--cpuset` was explicitly supplied; otherwise `max =
     /// usize::MAX` and `would_exceed` always returns false.
     pub(crate) partition_budget: std::sync::Arc<PartitionBudget>,
 }
 
-/// F189 — two-class admission controller (CockroachDB `kvadmission`
-/// pattern, simplified). Foreground (writes) gets priority tokens with
-/// at most a configurable hard ceiling; background (GC + compaction)
-/// gets elastic tokens that explicitly yield to foreground when fg
-/// pressure crosses a configurable share threshold.
+/// F196 D-r7: per-partition rate controller. Tracks FOUR independent
+/// rate dimensions in one 1-second sliding window:
+///   - fg bytes/sec
+///   - fg ops/sec (catches small-value IOPS-bound workloads)
+///   - compact bytes/sec (background SST merge writes)
+///   - gc bytes/sec       (background log_stream rewrite)
 ///
-/// Replaces F188's per-class `IoTokenBucket` for the GC + compact append
-/// paths AND adds a new `account_fg` call site at the foreground write
-/// path.
+/// Per-partition by ownership: each `PartitionData` holds its own
+/// `Arc<RateController>`. Hot-partition fg pressure does NOT consume
+/// cold-partition budget — the budgets are independent.
 ///
-/// Single 1-second wall-clock window; both classes share the same
-/// `Instant` reset boundary so fg's observed-rate estimate stays
-/// consistent with bg's accounting. parking_lot::Mutex is held only
-/// across the synchronous accounting calc — the sleep, when needed,
-/// happens outside the lock.
+/// fg-aware yield: `account_compact` and `account_gc` BOTH inspect
+/// `fg_bytes / fg_ops` saturation against the per-partition fg caps
+/// and yield the rest of the 1-second window when fg observed rate
+/// exceeds `fg_saturated_ratio × cap`. Disabled per-dimension when
+/// that fg cap is 0 (we lack a baseline to detect saturation).
 ///
-/// Configuration (env, applied via `from_env`):
-///   AUTUMN_PS_FG_RATE_BYTES_PER_SEC  — fg ceiling (0 = unlimited; default 2 GiB/s)
-///   AUTUMN_PS_BG_RATE_BYTES_PER_SEC  — bg ceiling (0 = unlimited; default 256 MiB/s)
-///   AUTUMN_PS_FG_SATURATED_THRESHOLD — fg observed-rate ratio above
-///       which bg yields entirely to the next window. Default 0.8;
-///       only meaningful when AUTUMN_PS_FG_RATE_BYTES_PER_SEC > 0.
-///       When fg rate is 0 (unlimited), bg uses ONLY its own ceiling
-///       — no fg-aware throttle (we don't know fg's "intended" rate).
+/// Defaults (process-global, set via `set_admission_*` setters before
+/// constructing PartitionServer; see CLI `--*-rate-bytes-per-sec` etc.):
+///   AUTUMN_PS_FG_RATE_BYTES_PER_SEC     — 256 MiB/s
+///   AUTUMN_PS_FG_IOPS_PER_SEC           — 30_000
+///   AUTUMN_PS_COMPACT_RATE_BYTES_PER_SEC— 64 MiB/s
+///   AUTUMN_PS_GC_RATE_BYTES_PER_SEC     — 32 MiB/s
+///   AUTUMN_PS_FG_SATURATED_THRESHOLD    — 0.8
+/// `0` on any rate disables that dimension (unlimited).
 ///
-/// F196 — default fg cap changed from `0` (unlimited) to **2 GiB/s**.
-/// Rationale from perf_check baselines (real TCP, no SHM loopback):
-///   - 4 KiB writes peak ~425 MB/s (TCP p16 d8) → 2 GiB/s = ~5× headroom
-///   - 8 MiB writes peak ~1741 MB/s (TCP p8 d8) → 2 GiB/s = ~15% headroom
-///   - SHM loopback exceeds 2 GiB/s for 8M values, but per the
-///     `[[loopback-numa-artifact]]` rule SHM bench is not production
-/// Net effect: real TCP workloads never hit the cap; the cap activates
-/// the fg-aware-yield mechanism in `account_bg` so GC/compact properly
-/// defer when fg is using >80% of its budget (1.6 GiB/s observed rate).
-pub struct AdmissionController {
+/// `parking_lot::Mutex` is held only across the synchronous accounting
+/// calc; sleep happens outside the lock. Per-partition controllers
+/// have no cross-thread contention since the partition owns its
+/// own Arc — the Mutex is uncontended in steady state.
+pub struct RateController {
     fg_rate_bytes_per_sec: u64,
-    /// F196: fg additionally rate-limited on op count. The bytes cap
-    /// catches large-value workloads (8M Puts at 1.7 GB/s) and the
-    /// ops cap catches small-value workloads (4K Puts at 110K ops/s
-    /// is IOPS-bound long before bytes hit the ceiling). Bg is bulk
-    /// IO (256 MB compact chunks, 4 MiB GC batches) and only needs
-    /// the bytes ceiling.
     fg_iops_per_sec: u64,
-    bg_rate_bytes_per_sec: u64,
-    /// F196 D-r6: max concurrent `do_compact` calls across the PS.
-    /// Folds the former `CompactionGate` (F104) into the unified
-    /// admission controller. RAM cap, not rate cap.
-    bg_compact_max: usize,
-    /// F196 D-r6: max concurrent `run_gc` calls across the PS. Folds
-    /// the former `gc_concurrency_gate` in here. RAM cap.
-    bg_gc_max: usize,
+    compact_rate_bytes_per_sec: u64,
+    gc_rate_bytes_per_sec: u64,
     fg_saturated_ratio: f64,
-    state: parking_lot::Mutex<AdmissionState>,
-    /// F196 D-r6: in-flight counters for the concurrency caps.
-    /// Atomic so that acquire/release doesn't have to grab the
-    /// state Mutex (the Mutex holds rate accounting + window state,
-    /// concurrency is independent).
-    compact_inflight: std::sync::atomic::AtomicUsize,
-    gc_inflight: std::sync::atomic::AtomicUsize,
+    state: parking_lot::Mutex<RateState>,
 }
 
-struct AdmissionState {
+struct RateState {
     window_start: Instant,
     fg_bytes: u64,
     fg_ops: u64,
-    bg_bytes: u64,
+    compact_bytes: u64,
+    gc_bytes: u64,
 }
 
-/// F196 D-r6: RAII permit for `acquire_compact()`. Drops decrement
-/// `AdmissionController.compact_inflight`.
-pub struct CompactPermit {
-    ctrl: std::sync::Arc<AdmissionController>,
-}
-impl Drop for CompactPermit {
-    fn drop(&mut self) {
-        self.ctrl
-            .compact_inflight
-            .fetch_sub(1, std::sync::atomic::Ordering::Release);
-    }
-}
-
-/// F196 D-r6: RAII permit for `acquire_gc()`.
-pub struct GcPermit {
-    ctrl: std::sync::Arc<AdmissionController>,
-}
-impl Drop for GcPermit {
-    fn drop(&mut self) {
-        self.ctrl
-            .gc_inflight
-            .fetch_sub(1, std::sync::atomic::Ordering::Release);
-    }
-}
-
-impl AdmissionController {
+impl RateController {
     pub fn new(
         fg_rate_bytes_per_sec: u64,
         fg_iops_per_sec: u64,
-        bg_rate_bytes_per_sec: u64,
-        bg_compact_max: usize,
-        bg_gc_max: usize,
+        compact_rate_bytes_per_sec: u64,
+        gc_rate_bytes_per_sec: u64,
         fg_saturated_ratio: f64,
     ) -> Self {
         Self {
             fg_rate_bytes_per_sec,
             fg_iops_per_sec,
-            bg_rate_bytes_per_sec,
-            bg_compact_max: bg_compact_max.max(1),
-            bg_gc_max: bg_gc_max.max(1),
+            compact_rate_bytes_per_sec,
+            gc_rate_bytes_per_sec,
             fg_saturated_ratio: fg_saturated_ratio.clamp(0.1, 1.0),
-            state: parking_lot::Mutex::new(AdmissionState {
+            state: parking_lot::Mutex::new(RateState {
                 window_start: Instant::now(),
                 fg_bytes: 0,
                 fg_ops: 0,
-                bg_bytes: 0,
+                compact_bytes: 0,
+                gc_bytes: 0,
             }),
-            compact_inflight: std::sync::atomic::AtomicUsize::new(0),
-            gc_inflight: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    /// F196 D-r6: acquire a compact concurrency permit. Folds the
-    /// former `CompactionGate::acquire`. Caller holds the permit for
-    /// the duration of `do_compact`; drop releases the slot. RAM cap,
-    /// not rate (rate is `account_bg`).
-    pub async fn acquire_compact(self: &std::sync::Arc<Self>) -> CompactPermit {
-        use std::sync::atomic::Ordering;
-        loop {
-            let cur = self.compact_inflight.load(Ordering::Acquire);
-            if cur < self.bg_compact_max
-                && self
-                    .compact_inflight
-                    .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                return CompactPermit { ctrl: std::sync::Arc::clone(self) };
-            }
-            // Back off briefly: 50 ms is short relative to compact
-            // wallclock (seconds-minutes), avoids CPU spin.
-            compio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
-    /// F196 D-r6: acquire a GC concurrency permit. Same shape as
-    /// `acquire_compact`. Folds the former `gc_concurrency_gate`.
-    pub async fn acquire_gc(self: &std::sync::Arc<Self>) -> GcPermit {
-        use std::sync::atomic::Ordering;
-        loop {
-            let cur = self.gc_inflight.load(Ordering::Acquire);
-            if cur < self.bg_gc_max
-                && self
-                    .gc_inflight
-                    .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                return GcPermit { ctrl: std::sync::Arc::clone(self) };
-            }
-            compio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
-    /// F195: defaults match pre-F195 env defaults. Override via the
-    /// process-global setters `set_admission_fg_rate`,
-    /// `set_admission_bg_rate`, `set_admission_fg_saturated_threshold`
-    /// before constructing `PartitionServer`. Naming kept as
-    /// `from_env` for call-site stability; semantically it is now
-    /// "from process-global config setters."
+    /// Reads process-global setters. Defaults derived from perf_check
+    /// baselines (real TCP, no SHM artifact per
+    /// `[[loopback-numa-artifact]]`):
+    ///   - fg 256 MiB/s = 5× headroom over single-partition TCP 4K peak
+    ///   - fg 30K ops/s = single-partition QPS ceiling
+    ///     (see `[[partition-qps-ceiling]]`)
+    ///   - compact 64 MiB/s, gc 32 MiB/s — bulk bg writes, lighter
+    ///     than fg
     pub fn from_env() -> Self {
-        // F196: fg-bytes default 0 → 2 GiB/s.
-        // F196: fg-iops  default 0 → 150_000 ops/s.
-        // F196 D-r6: bg_compact_max + bg_gc_max default to the legacy
-        // `ps_major_compact_parallelism` / `ps_gc_parallelism` values
-        // (both default 1; tunable via `--major-compact-parallelism` /
-        // `--gc-parallelism`).
         let fg_rate = *PS_FG_RATE_BYTES_PER_SEC_CELL
-            .get_or_init(|| 2 * 1024 * 1024 * 1024);
-        let fg_iops = *PS_FG_IOPS_PER_SEC_CELL.get_or_init(|| 150_000);
-        let bg_rate = *PS_BG_RATE_BYTES_PER_SEC_CELL.get_or_init(|| 256 * 1024 * 1024);
+            .get_or_init(|| 256 * 1024 * 1024);
+        let fg_iops = *PS_FG_IOPS_PER_SEC_CELL.get_or_init(|| 30_000);
+        let compact_rate = *PS_COMPACT_RATE_BYTES_PER_SEC_CELL
+            .get_or_init(|| 64 * 1024 * 1024);
+        let gc_rate = *PS_GC_RATE_BYTES_PER_SEC_CELL
+            .get_or_init(|| 32 * 1024 * 1024);
         let saturated = *PS_FG_SATURATED_THRESHOLD_CELL.get_or_init(|| 0.8);
-        Self::new(
-            fg_rate,
-            fg_iops,
-            bg_rate,
-            ps_major_compact_parallelism(),
-            ps_gc_parallelism(),
-            saturated,
-        )
+        Self::new(fg_rate, fg_iops, compact_rate, gc_rate, saturated)
     }
 
-    fn maybe_reset_window(state: &mut AdmissionState) {
+    fn maybe_reset_window(state: &mut RateState) {
         if state.window_start.elapsed() >= Duration::from_secs(1) {
             state.window_start = Instant::now();
             state.fg_bytes = 0;
             state.fg_ops = 0;
-            state.bg_bytes = 0;
+            state.compact_bytes = 0;
+            state.gc_bytes = 0;
         }
     }
 
-    /// Foreground accounting. Sleeps only when EITHER an explicit
-    /// fg-bytes or fg-iops ceiling is set AND the current window's
-    /// fg consumption would exceed it. Both caps are evaluated; the
-    /// LARGER required sleep wins (both constraints must hold). With
-    /// both rates at 0 (unlimited) this returns immediately after a
-    /// single Mutex acquire — keep this CHEAP, it runs on the request
-    /// hot path.
-    ///
-    /// `bytes` = total payload bytes in this batch (group commit unit).
-    /// `ops`   = number of user operations in this batch (1 per Put /
-    ///           Delete; callers pass `valid.len() as u64`).
+    /// Returns `true` iff fg observed rate (bytes OR ops) exceeds
+    /// `fg_saturated_ratio × cap`. Used by `account_compact` and
+    /// `account_gc` to decide whether to yield to fg.
+    fn fg_saturated(&self, s: &RateState, elapsed_secs: f64) -> bool {
+        if self.fg_rate_bytes_per_sec > 0 {
+            let obs = s.fg_bytes as f64 / elapsed_secs;
+            let at = self.fg_rate_bytes_per_sec as f64 * self.fg_saturated_ratio;
+            if obs > at {
+                return true;
+            }
+        }
+        if self.fg_iops_per_sec > 0 {
+            let obs = s.fg_ops as f64 / elapsed_secs;
+            let at = self.fg_iops_per_sec as f64 * self.fg_saturated_ratio;
+            if obs > at {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Foreground accounting. Sleeps when either fg-bytes or fg-iops
+    /// ceiling is set AND would be exceeded (LARGER sleep wins).
+    /// Both caps at 0 = unlimited (default in tests, NOT in production).
     pub async fn account_fg(&self, bytes: u64, ops: u64) {
         let sleep_for = {
             let mut s = self.state.lock();
@@ -1432,62 +1357,31 @@ impl AdmissionController {
         }
     }
 
-    /// Background accounting. Sleeps until BOTH constraints are met:
-    /// 1. bg's own rate ceiling (same logic as F188's IoTokenBucket);
-    /// 2. foreground-aware yield: when fg observed rate exceeds
-    ///    `fg_saturated_ratio * fg_rate`, bg waits till the next
-    ///    window. Disabled (no fg-aware sleep) when fg_rate = 0
-    ///    because we lack a baseline to detect "fg saturated".
-    pub async fn account_bg(&self, bytes: u64) {
+    /// Compact rate accounting. Sleeps until BOTH constraints hold:
+    /// (1) own compact ceiling; (2) fg-aware yield (yields when fg is
+    /// saturated).
+    pub async fn account_compact(&self, bytes: u64) {
         let sleep_for = {
             let mut s = self.state.lock();
             Self::maybe_reset_window(&mut s);
-            s.bg_bytes = s.bg_bytes.saturating_add(bytes);
+            s.compact_bytes = s.compact_bytes.saturating_add(bytes);
             let elapsed = s.window_start.elapsed();
-            // (1) bg's own ceiling
-            let bg_rate_sleep: Option<Duration> = if self.bg_rate_bytes_per_sec == 0 {
+            let own_sleep: Option<Duration> = if self.compact_rate_bytes_per_sec == 0 {
                 None
             } else {
                 let target = Duration::from_secs_f64(
-                    s.bg_bytes as f64 / self.bg_rate_bytes_per_sec as f64,
+                    s.compact_bytes as f64 / self.compact_rate_bytes_per_sec as f64,
                 );
-                if target > elapsed {
-                    Some(target - elapsed)
-                } else {
-                    None
-                }
+                if target > elapsed { Some(target - elapsed) } else { None }
             };
-            // (2) fg-aware yield. Active when EITHER fg ceiling
-            // (bytes or iops) is set. Yields when fg observed rate
-            // exceeds `fg_saturated_ratio` of EITHER cap — covers both
-            // bytes-bound large-value workloads and IOPS-bound small-
-            // value workloads.
-            let fg_aware_sleep: Option<Duration> = {
-                let elapsed_secs = elapsed.as_secs_f64().max(0.001);
-                let mut saturated = false;
-                if self.fg_rate_bytes_per_sec > 0 {
-                    let fg_observed = s.fg_bytes as f64 / elapsed_secs;
-                    let at = self.fg_rate_bytes_per_sec as f64 * self.fg_saturated_ratio;
-                    if fg_observed > at {
-                        saturated = true;
-                    }
-                }
-                if !saturated && self.fg_iops_per_sec > 0 {
-                    let fg_observed = s.fg_ops as f64 / elapsed_secs;
-                    let at = self.fg_iops_per_sec as f64 * self.fg_saturated_ratio;
-                    if fg_observed > at {
-                        saturated = true;
-                    }
-                }
-                if saturated {
-                    let remaining = Duration::from_secs(1).saturating_sub(elapsed);
-                    if remaining > Duration::ZERO { Some(remaining) } else { None }
-                } else {
-                    None
-                }
+            let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+            let yield_sleep: Option<Duration> = if self.fg_saturated(&s, elapsed_secs) {
+                let remaining = Duration::from_secs(1).saturating_sub(elapsed);
+                if remaining > Duration::ZERO { Some(remaining) } else { None }
+            } else {
+                None
             };
-            // Take the larger of the two sleeps so both constraints hold.
-            match (bg_rate_sleep, fg_aware_sleep) {
+            match (own_sleep, yield_sleep) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (Some(a), None) | (None, Some(a)) => Some(a),
                 (None, None) => None,
@@ -1498,13 +1392,140 @@ impl AdmissionController {
         }
     }
 
-    /// Test-only snapshot of the current window's accounting state.
-    /// Returns `(fg_bytes, fg_ops, bg_bytes, elapsed)`. Locks briefly.
-    /// Used by `f189_admission_tests`.
+    /// GC rate accounting. Symmetric to `account_compact`, separate
+    /// counter + cap so compact and gc don't fight for the same budget.
+    pub async fn account_gc(&self, bytes: u64) {
+        let sleep_for = {
+            let mut s = self.state.lock();
+            Self::maybe_reset_window(&mut s);
+            s.gc_bytes = s.gc_bytes.saturating_add(bytes);
+            let elapsed = s.window_start.elapsed();
+            let own_sleep: Option<Duration> = if self.gc_rate_bytes_per_sec == 0 {
+                None
+            } else {
+                let target = Duration::from_secs_f64(
+                    s.gc_bytes as f64 / self.gc_rate_bytes_per_sec as f64,
+                );
+                if target > elapsed { Some(target - elapsed) } else { None }
+            };
+            let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+            let yield_sleep: Option<Duration> = if self.fg_saturated(&s, elapsed_secs) {
+                let remaining = Duration::from_secs(1).saturating_sub(elapsed);
+                if remaining > Duration::ZERO { Some(remaining) } else { None }
+            } else {
+                None
+            };
+            match (own_sleep, yield_sleep) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            }
+        };
+        if let Some(d) = sleep_for {
+            compio::time::sleep(d).await;
+        }
+    }
+
+    /// Test-only snapshot: `(fg_bytes, fg_ops, compact_bytes, gc_bytes, elapsed)`.
     #[cfg(test)]
-    pub(crate) fn snapshot(&self) -> (u64, u64, u64, Duration) {
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64, Duration) {
         let s = self.state.lock();
-        (s.fg_bytes, s.fg_ops, s.bg_bytes, s.window_start.elapsed())
+        (
+            s.fg_bytes,
+            s.fg_ops,
+            s.compact_bytes,
+            s.gc_bytes,
+            s.window_start.elapsed(),
+        )
+    }
+}
+
+/// F196 D-r7: PS-wide concurrency controller. Caps the number of
+/// simultaneous `do_compact` / `run_gc` calls across all partitions
+/// on this PS. RAM-cap by purpose — each compact holds ~2× SST bytes
+/// and each GC holds ~64 MiB chunk buffer; without a global cap,
+/// `compact ALL` or `gc ALL` would multiply peak RSS by N partitions
+/// (the F104 incident hit 44 GB RSS).
+///
+/// One `Arc<ConcurrencyController>` per `PartitionServer`, cloned
+/// into each `PartitionData`. Folds the former standalone
+/// `CompactionGate`-backed `compact_gate` (F104) and
+/// `gc_concurrency_gate` (D-r5).
+pub struct ConcurrencyController {
+    compact_max: usize,
+    gc_max: usize,
+    compact_inflight: std::sync::atomic::AtomicUsize,
+    gc_inflight: std::sync::atomic::AtomicUsize,
+}
+
+/// F196 D-r7: RAII permit for `acquire_compact()`.
+pub struct CompactPermit {
+    ctrl: std::sync::Arc<ConcurrencyController>,
+}
+impl Drop for CompactPermit {
+    fn drop(&mut self) {
+        self.ctrl
+            .compact_inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// F196 D-r7: RAII permit for `acquire_gc()`.
+pub struct GcPermit {
+    ctrl: std::sync::Arc<ConcurrencyController>,
+}
+impl Drop for GcPermit {
+    fn drop(&mut self) {
+        self.ctrl
+            .gc_inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl ConcurrencyController {
+    pub fn new(compact_max: usize, gc_max: usize) -> Self {
+        Self {
+            compact_max: compact_max.max(1),
+            gc_max: gc_max.max(1),
+            compact_inflight: std::sync::atomic::AtomicUsize::new(0),
+            gc_inflight: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::new(ps_major_compact_parallelism(), ps_gc_parallelism())
+    }
+
+    pub async fn acquire_compact(self: &std::sync::Arc<Self>) -> CompactPermit {
+        use std::sync::atomic::Ordering;
+        loop {
+            let cur = self.compact_inflight.load(Ordering::Acquire);
+            if cur < self.compact_max
+                && self
+                    .compact_inflight
+                    .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                return CompactPermit { ctrl: std::sync::Arc::clone(self) };
+            }
+            compio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    pub async fn acquire_gc(self: &std::sync::Arc<Self>) -> GcPermit {
+        use std::sync::atomic::Ordering;
+        loop {
+            let cur = self.gc_inflight.load(Ordering::Acquire);
+            if cur < self.gc_max
+                && self
+                    .gc_inflight
+                    .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                return GcPermit { ctrl: std::sync::Arc::clone(self) };
+            }
+            compio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -1594,271 +1615,317 @@ pub(crate) fn compute_partition_budget_cap() -> usize {
 
 #[cfg(test)]
 mod f189_admission_tests {
+    //! F189 + F196 D-r7 admission tests. RateController is per-partition
+    //! (fg bytes/iops + compact bytes + gc bytes); ConcurrencyController
+    //! is PS-wide (compact + gc concurrency permits).
     use super::*;
 
-    /// fg_rate=0 (default unlimited): account_fg returns immediately
-    /// regardless of bytes consumed.
+    fn unlimited_rate() -> RateController {
+        RateController::new(0, 0, 0, 0, 0.8)
+    }
+
     #[test]
     fn fg_unlimited_no_sleep() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let ac = AdmissionController::new(0, 0, 0, 1, 1, 0.8);
+            let rc = unlimited_rate();
             let t0 = Instant::now();
             for _ in 0..100 {
-                ac.account_fg(1024 * 1024, 1).await;
+                rc.account_fg(1024 * 1024, 1).await;
             }
-            let elapsed = t0.elapsed();
             assert!(
-                elapsed < Duration::from_millis(50),
-                "fg with rate=0 must not sleep, elapsed={:?}",
-                elapsed
+                t0.elapsed() < Duration::from_millis(50),
+                "fg unlimited must not sleep"
             );
-            let (fg, ops, bg, _) = ac.snapshot();
-            assert!(fg >= 100 * 1024 * 1024, "fg counter not bumped: {fg}");
-            assert_eq!(ops, 100, "fg ops counter must be bumped to 100, got {ops}");
-            assert_eq!(bg, 0);
+            let (fg, ops, _c, _g, _) = rc.snapshot();
+            assert!(fg >= 100 * 1024 * 1024);
+            assert_eq!(ops, 100);
         });
     }
 
-    /// bg_rate=0 (unlimited): account_bg returns immediately.
     #[test]
-    fn bg_unlimited_no_sleep() {
+    fn compact_unlimited_no_sleep() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let ac = AdmissionController::new(0, 0, 0, 1, 1, 0.8);
-            // fg_rate=0, fg_iops=0, bg_rate=0 → all unlimited.
+            let rc = unlimited_rate();
             let t0 = Instant::now();
             for _ in 0..100 {
-                ac.account_bg(1024 * 1024).await;
+                rc.account_compact(1024 * 1024).await;
             }
             assert!(t0.elapsed() < Duration::from_millis(50));
         });
     }
 
-    /// bg_rate=10 MiB/s: 5 MiB writes should sleep ~500ms when done back-to-back.
     #[test]
-    fn bg_respects_own_rate() {
+    fn gc_unlimited_no_sleep() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let ac = AdmissionController::new(0, 0, 10 * 1024 * 1024, 1, 1, 0.8);
+            let rc = unlimited_rate();
             let t0 = Instant::now();
-            // 5 MiB consumed against 10 MiB/s budget = 500ms target
-            ac.account_bg(5 * 1024 * 1024).await;
-            // Next 5 MiB pushes us to the full second's budget
-            ac.account_bg(5 * 1024 * 1024).await;
+            for _ in 0..100 {
+                rc.account_gc(1024 * 1024).await;
+            }
+            assert!(t0.elapsed() < Duration::from_millis(50));
+        });
+    }
+
+    /// compact_rate=10 MiB/s: 5 MiB × 2 should sleep ~1s back-to-back.
+    #[test]
+    fn compact_respects_own_rate() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = RateController::new(0, 0, 10 * 1024 * 1024, 0, 0.8);
+            let t0 = Instant::now();
+            rc.account_compact(5 * 1024 * 1024).await;
+            rc.account_compact(5 * 1024 * 1024).await;
             let elapsed = t0.elapsed();
-            // Allow generous slop: should sleep close to 1s but
-            // window-reset boundary effects can cut it short on the
-            // second call.
             assert!(
                 elapsed >= Duration::from_millis(800)
                     && elapsed <= Duration::from_millis(1500),
-                "bg should sleep ~1s on 10 MiB at 10 MiB/s, got {:?}",
+                "compact should sleep ~1s on 10 MiB at 10 MiB/s, got {:?}",
                 elapsed
             );
         });
     }
 
-    /// fg saturated (fg observed rate > 0.8 * fg_rate): bg yields to next window.
+    /// gc_rate=10 MiB/s: same as compact but on its own counter.
     #[test]
-    fn bg_yields_when_fg_saturated() {
+    fn gc_respects_own_rate() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            // fg_rate = 100 MiB/s, fg_saturated_ratio = 0.5 → saturation
-            // threshold = 50 MiB/s observed.
-            let ac = AdmissionController::new(
-                100 * 1024 * 1024,
-                0,                 // fg_iops disabled — exercising bytes path
-                100 * 1024 * 1024, // generous bg budget
-                1, 1,
-                0.5,
-            );
-            // Push fg to saturate the window: 60 MiB consumed in <100ms
-            // gives observed rate >> 50 MiB/s threshold.
-            ac.account_fg(60 * 1024 * 1024, 1).await;
-            // Now bg attempt — should yield to the *remaining* time in
-            // the current 1s window. fg's account_fg call took ~600ms
-            // already (60 MiB at 100 MiB/s), so the remaining gap is
-            // ~400ms. Use a generous lower bound (300ms) to absorb
-            // wall-clock jitter on busy CI hosts.
+            let rc = RateController::new(0, 0, 0, 10 * 1024 * 1024, 0.8);
             let t0 = Instant::now();
-            ac.account_bg(1024).await; // tiny payload
+            rc.account_gc(5 * 1024 * 1024).await;
+            rc.account_gc(5 * 1024 * 1024).await;
             let elapsed = t0.elapsed();
             assert!(
-                elapsed >= Duration::from_millis(300),
-                "bg should yield to next window when fg saturated, got {:?}",
+                elapsed >= Duration::from_millis(800)
+                    && elapsed <= Duration::from_millis(1500),
+                "gc should sleep ~1s on 10 MiB at 10 MiB/s, got {:?}",
                 elapsed
             );
         });
     }
 
-    /// fg idle: bg uses its full ceiling without yielding.
+    /// F196 D-r7: compact and gc rate counters are independent. With
+    /// compact_rate=10 MiB/s and gc_rate=10 MiB/s, hammering compact
+    /// to its limit MUST NOT throttle gc — they have separate budgets.
     #[test]
-    fn bg_does_not_yield_when_fg_idle() {
+    fn compact_and_gc_rates_are_independent() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let ac = AdmissionController::new(
-                100 * 1024 * 1024, // fg ceiling set
-                0,                 // fg_iops disabled
-                100 * 1024 * 1024,
-                1, 1,
-                0.5,
-            );
-            // No fg traffic at all.
+            let rc = RateController::new(0, 0, 10 * 1024 * 1024, 10 * 1024 * 1024, 0.8);
+            // Saturate compact.
+            rc.account_compact(10 * 1024 * 1024).await;
+            // gc against its own (untouched) budget — should sleep
+            // far less than the compact-saturated path would.
             let t0 = Instant::now();
-            ac.account_bg(1024).await; // small bg payload
+            rc.account_gc(1024).await;
             let elapsed = t0.elapsed();
             assert!(
                 elapsed < Duration::from_millis(50),
-                "bg should not yield when fg idle, got {:?}",
+                "gc must not be throttled by compact saturation, got {:?}",
                 elapsed
             );
         });
     }
 
-    /// fg_rate=0 + fg active: bg ignores fg-aware throttle (we have
-    /// no rate baseline) and only respects its own ceiling.
+    /// fg saturated: compact yields to the rest of the 1-s window.
     #[test]
-    fn bg_ignores_fg_when_fg_unlimited() {
+    fn compact_yields_when_fg_saturated() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let ac = AdmissionController::new(
-                0,                 // fg bytes unlimited
-                0,                 // fg iops unlimited
-                100 * 1024 * 1024, // bg ceiling
-                1, 1,
+            // fg_rate=100 MiB/s, ratio=0.5 → saturated at 50 MiB/s
+            // observed; compact budget generous so own-rate doesn't fire.
+            let rc = RateController::new(
+                100 * 1024 * 1024,
+                0,
+                100 * 1024 * 1024,
+                0,
                 0.5,
             );
-            // Push lots of fg.
-            ac.account_fg(500 * 1024 * 1024, 1).await;
-            // bg should still be free (well under bg ceiling).
+            rc.account_fg(60 * 1024 * 1024, 1).await;
             let t0 = Instant::now();
-            ac.account_bg(1024).await;
+            rc.account_compact(1024).await;
             assert!(
-                t0.elapsed() < Duration::from_millis(50),
-                "bg should not yield to fg when fg has no ceiling"
+                t0.elapsed() >= Duration::from_millis(300),
+                "compact should yield to fg, got {:?}",
+                t0.elapsed()
             );
         });
     }
 
-    /// F196: fg-iops cap throttles small-value workloads even when
-    /// bytes is far under the bytes cap. With fg_iops=1000/s and a
-    /// burst of 100 ops at ~zero bytes, second batch should sleep
-    /// toward the 100/1000 = 100 ms target before returning.
+    /// fg saturated: gc yields too (symmetric).
+    #[test]
+    fn gc_yields_when_fg_saturated() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = RateController::new(
+                100 * 1024 * 1024,
+                0,
+                0,
+                100 * 1024 * 1024,
+                0.5,
+            );
+            rc.account_fg(60 * 1024 * 1024, 1).await;
+            let t0 = Instant::now();
+            rc.account_gc(1024).await;
+            assert!(
+                t0.elapsed() >= Duration::from_millis(300),
+                "gc should yield to fg, got {:?}",
+                t0.elapsed()
+            );
+        });
+    }
+
+    /// fg idle: compact + gc don't yield.
+    #[test]
+    fn compact_and_gc_do_not_yield_when_fg_idle() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = RateController::new(
+                100 * 1024 * 1024,
+                0,
+                100 * 1024 * 1024,
+                100 * 1024 * 1024,
+                0.5,
+            );
+            let t0 = Instant::now();
+            rc.account_compact(1024).await;
+            rc.account_gc(1024).await;
+            assert!(
+                t0.elapsed() < Duration::from_millis(50),
+                "no yield when fg idle, got {:?}",
+                t0.elapsed()
+            );
+        });
+    }
+
+    /// fg unlimited (both bytes and iops=0): compact/gc ignore fg-aware yield.
+    #[test]
+    fn compact_and_gc_ignore_fg_when_fg_unlimited() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = RateController::new(0, 0, 100 * 1024 * 1024, 100 * 1024 * 1024, 0.5);
+            rc.account_fg(500 * 1024 * 1024, 1).await;
+            let t0 = Instant::now();
+            rc.account_compact(1024).await;
+            rc.account_gc(1024).await;
+            assert!(
+                t0.elapsed() < Duration::from_millis(50),
+                "must ignore fg when no cap"
+            );
+        });
+    }
+
+    /// fg-iops cap throttles small-value workloads even when bytes is
+    /// far under the bytes cap.
     #[test]
     fn fg_iops_cap_throttles_small_value_workloads() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            // bytes=10 GiB/s (effectively unlimited for this test),
-            // iops=1000/s, 100 ops/batch.
-            let ac = AdmissionController::new(
-                10 * 1024 * 1024 * 1024,
-                1_000,
-                0,
-                1, 1,
-                0.8,
-            );
+            let rc = RateController::new(10 * 1024 * 1024 * 1024, 1_000, 0, 0, 0.8);
             let t0 = Instant::now();
-            // 100 ops × 8 bytes each = ~negligible bytes, but
-            // 100 / 1000 = 100 ms iops-target.
-            ac.account_fg(800, 100).await;
-            // Second batch: another 100 ops → cumulative 200/1000 =
-            // 200 ms target. By now ~100 ms elapsed since window
-            // start, so this call should sleep ~100 ms more.
-            ac.account_fg(800, 100).await;
+            rc.account_fg(800, 100).await;
+            rc.account_fg(800, 100).await;
             let elapsed = t0.elapsed();
             assert!(
                 elapsed >= Duration::from_millis(150)
                     && elapsed <= Duration::from_millis(500),
-                "fg-iops cap should throttle 200 ops at 1k ops/s to ~200ms, got {:?}",
+                "fg-iops cap should throttle 200 ops at 1k ops/s, got {:?}",
                 elapsed
             );
         });
     }
 
-    /// F196: bg yields when fg observed IOPS exceeds 0.8 × fg_iops,
-    /// even if fg bytes is way under the bytes cap.
+    /// compact yields when fg observed IOPS exceeds ratio × fg_iops.
     #[test]
-    fn bg_yields_when_fg_iops_saturated() {
+    fn compact_yields_when_fg_iops_saturated() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let ac = AdmissionController::new(
-                10 * 1024 * 1024 * 1024, // bytes effectively unlimited
-                1_000,                    // 1000 ops/s
-                100 * 1024 * 1024,        // bg ceiling generous
-                1, 1,
-                0.5,                      // bg yields at 500 ops/s observed
+            let rc = RateController::new(
+                10 * 1024 * 1024 * 1024, // bytes ~unlimited
+                1_000,                    // 1k ops/s
+                100 * 1024 * 1024,        // compact generous
+                0,
+                0.5, // bg yields at 500 ops/s observed
             );
-            // 600 ops in one batch → observed rate ~600 ops/s in ~0s.
-            // Will sleep to fit the iops cap (600/1000 = 600 ms target).
-            ac.account_fg(0, 600).await;
-            // Now bg attempt — fg observed iops (600) >= 0.8 × 1000 =
-            // 800? No, 600 < 800. Push more: another 400 ops to
-            // exceed 0.5 × 1000 = 500 saturation in the new threshold.
-            // (We set ratio=0.5 above, so 500 ops/s observed = saturated.)
+            rc.account_fg(0, 600).await;
             let t0 = Instant::now();
-            ac.account_bg(1024).await;
-            let elapsed = t0.elapsed();
+            rc.account_compact(1024).await;
             assert!(
-                elapsed >= Duration::from_millis(200),
-                "bg should yield when fg-iops observed exceeds saturation threshold, got {:?}",
-                elapsed
+                t0.elapsed() >= Duration::from_millis(200),
+                "compact should yield on fg-iops saturation, got {:?}",
+                t0.elapsed()
             );
         });
     }
 
-    /// F196 D-r6: acquire_compact / acquire_gc cap concurrency. With
-    /// bg_compact_max=1, two acquires serialize (second waits until
-    /// first permit is dropped). With bg_gc_max=2, two acquires
-    /// proceed in parallel and a third waits.
+    /// gc yields when fg observed IOPS exceeds ratio × fg_iops (gc twin).
     #[test]
-    fn admission_acquire_compact_and_gc_concurrency_caps() {
-        use std::sync::atomic::Ordering;
-        let ac = std::sync::Arc::new(AdmissionController::new(
-            0, 0, 0,
-            1, // bg_compact_max
-            2, // bg_gc_max
-            0.8,
-        ));
+    fn gc_yields_when_fg_iops_saturated() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            // Compact: cap = 1.
-            let p1 = ac.acquire_compact().await;
-            assert_eq!(ac.compact_inflight.load(Ordering::Acquire), 1);
-            drop(p1);
-            assert_eq!(ac.compact_inflight.load(Ordering::Acquire), 0);
-
-            // GC: cap = 2 — two concurrent permits possible.
-            let g1 = ac.acquire_gc().await;
-            let g2 = ac.acquire_gc().await;
-            assert_eq!(ac.gc_inflight.load(Ordering::Acquire), 2);
-            drop(g1);
-            assert_eq!(ac.gc_inflight.load(Ordering::Acquire), 1);
-            drop(g2);
-            assert_eq!(ac.gc_inflight.load(Ordering::Acquire), 0);
+            let rc = RateController::new(
+                10 * 1024 * 1024 * 1024,
+                1_000,
+                0,
+                100 * 1024 * 1024,
+                0.5,
+            );
+            rc.account_fg(0, 600).await;
+            let t0 = Instant::now();
+            rc.account_gc(1024).await;
+            assert!(
+                t0.elapsed() >= Duration::from_millis(200),
+                "gc should yield on fg-iops saturation, got {:?}",
+                t0.elapsed()
+            );
         });
     }
 
-    /// Window reset clears both counters after 1s. Regression guard:
-    /// the reset path must not panic on first call and must zero fg+bg.
+    /// Window reset clears all four counters after 1s.
     #[test]
     fn window_resets_after_1s() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let ac = AdmissionController::new(0, 0, 0, 1, 1, 0.8);
-            ac.account_fg(123, 2).await;
-            ac.account_bg(456).await;
-            let (fg, ops, bg, _) = ac.snapshot();
-            assert_eq!(fg, 123);
-            assert_eq!(ops, 2);
-            assert_eq!(bg, 456);
+            let rc = unlimited_rate();
+            rc.account_fg(123, 2).await;
+            rc.account_compact(456).await;
+            rc.account_gc(789).await;
+            let (fg, ops, c, g, _) = rc.snapshot();
+            assert_eq!((fg, ops, c, g), (123, 2, 456, 789));
             compio::time::sleep(Duration::from_millis(1100)).await;
-            // Trigger a reset via a fresh call.
-            ac.account_fg(7, 1).await;
-            let (fg, ops, bg, _) = ac.snapshot();
-            assert_eq!(fg, 7, "fg should reset to fresh accounting after window");
-            assert_eq!(ops, 1, "fg ops should reset to fresh accounting");
-            assert_eq!(bg, 0, "bg should reset");
+            rc.account_fg(7, 1).await;
+            let (fg, ops, c, g, _) = rc.snapshot();
+            assert_eq!(
+                (fg, ops, c, g),
+                (7, 1, 0, 0),
+                "window reset must zero all four counters"
+            );
+        });
+    }
+
+    /// PS-wide concurrency caps: acquire_compact / acquire_gc.
+    /// compact_max=1 serializes; gc_max=2 allows two concurrent permits.
+    #[test]
+    fn concurrency_acquire_compact_and_gc_caps() {
+        use std::sync::atomic::Ordering;
+        let cc = std::sync::Arc::new(ConcurrencyController::new(1, 2));
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let p1 = cc.acquire_compact().await;
+            assert_eq!(cc.compact_inflight.load(Ordering::Acquire), 1);
+            drop(p1);
+            assert_eq!(cc.compact_inflight.load(Ordering::Acquire), 0);
+
+            let g1 = cc.acquire_gc().await;
+            let g2 = cc.acquire_gc().await;
+            assert_eq!(cc.gc_inflight.load(Ordering::Acquire), 2);
+            drop(g1);
+            assert_eq!(cc.gc_inflight.load(Ordering::Acquire), 1);
+            drop(g2);
+            assert_eq!(cc.gc_inflight.load(Ordering::Acquire), 0);
         });
     }
 }
@@ -1960,7 +2027,9 @@ impl PartitionServer {
                             listen_host: Rc::new(std::cell::RefCell::new(
                                 String::from("0.0.0.0"),
                             )),
-                            io_bucket: std::sync::Arc::new(AdmissionController::from_env()),
+                            concurrency_ctrl: std::sync::Arc::new(
+                                ConcurrencyController::from_env(),
+                            ),
                             partition_budget: std::sync::Arc::new(PartitionBudget::new(
                                 compute_partition_budget_cap(),
                             )),
@@ -2559,11 +2628,10 @@ impl PartitionServer {
         let manager_addr_for_thread = manager_addr.clone();
         let owner_key_for_thread = owner_key.clone();
         let advertise_addr_for_thread = advertise_addr.clone();
-        // F196 D-r6: ONE shared AdmissionController Arc across
-        // partitions. fg/bg rate caps + compact/gc concurrency caps
-        // all live here; PS-wide by design (bg resources are cluster
-        // pool: RAM + cluster IO bandwidth).
-        let admission_for_thread = self.io_bucket.clone();
+        // F196 D-r7: hand the partition thread the PS-wide concurrency
+        // Arc (shared) + a fresh RateController per partition (built
+        // inside the thread from process-global setters).
+        let concurrency_for_thread = self.concurrency_ctrl.clone();
         let partition_budget_for_thread = self.partition_budget.clone();
         // F183: build the metrics Arc on the main thread so we can keep
         // a clone in PartitionHandle for the report loop. The other clone
@@ -2609,7 +2677,7 @@ impl PartitionServer {
                         compact_rx_main,
                         gc_tx_for_thread,
                         gc_rx_main,
-                        admission_for_thread,
+                        concurrency_for_thread,
                         partition_budget_for_thread,
                     )
                     .await
@@ -3390,9 +3458,12 @@ async fn partition_thread_main(
     compact_rx: mpsc::Receiver<bool>,
     gc_tx: mpsc::Sender<GcTask>,
     gc_rx: mpsc::Receiver<GcTask>,
-    io_bucket: std::sync::Arc<crate::AdmissionController>,
+    concurrency_ctrl: std::sync::Arc<crate::ConcurrencyController>,
     partition_budget: std::sync::Arc<crate::PartitionBudget>,
 ) -> Result<()> {
+    // F196 D-r7: per-partition rate controller. Built inside the
+    // partition thread; each partition gets its own Mutex/state.
+    let rate_ctrl = std::sync::Arc::new(crate::RateController::from_env());
     // F099-J: create the same-thread ps-conn ↔ merged_partition_loop
     // channel. Both endpoints live on THIS compio runtime, so sends and
     // wakes do not cross threads.
@@ -3524,7 +3595,8 @@ async fn partition_thread_main(
         row_append_tx: row_append_tx_part,
         imm_drained_tx,
         gc_gate: gc_gate.clone(),
-        io_bucket: io_bucket.clone(),
+        rate_ctrl: rate_ctrl.clone(),
+        concurrency_ctrl: concurrency_ctrl.clone(),
         partition_budget: partition_budget.clone(),
         extent_pins: std::cell::RefCell::new(std::collections::HashMap::new()),
         frozen_for_merge: Cell::new(None),
@@ -3560,18 +3632,18 @@ async fn partition_thread_main(
     }
     {
         let p = part.clone();
-        let admission_for_compact = io_bucket.clone();
+        let conc_for_compact = concurrency_ctrl.clone();
         compio::runtime::spawn(async move {
-            background_compact_loop(part_id, p, compact_rx, admission_for_compact).await;
+            background_compact_loop(part_id, p, compact_rx, conc_for_compact).await;
         })
         .detach();
     }
     {
         let p = part.clone();
         let gc_gate_for_loop = gc_gate.clone();
-        let admission_for_gc = io_bucket.clone();
+        let conc_for_gc = concurrency_ctrl.clone();
         compio::runtime::spawn(async move {
-            background_gc_loop(p, gc_rx, gc_gate_for_loop, admission_for_gc).await;
+            background_gc_loop(p, gc_rx, gc_gate_for_loop, conc_for_gc).await;
         })
         .detach();
     }

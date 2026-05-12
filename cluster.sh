@@ -364,8 +364,17 @@ launch_ps() {
     if [[ -n "${AUTUMN_PS_FG_IOPS_PER_SEC:-}" ]]; then
         tunable_args+=(--fg-iops-per-sec "$AUTUMN_PS_FG_IOPS_PER_SEC")
     fi
-    if [[ -n "${AUTUMN_PS_BG_RATE_BYTES_PER_SEC:-}" ]]; then
-        tunable_args+=(--bg-rate-bytes-per-sec "$AUTUMN_PS_BG_RATE_BYTES_PER_SEC")
+    # F196 D-r7: --bg-rate-bytes-per-sec was split into D-r7's admission
+    # compact + gc rate caps. Note: F141's `--gc-rate-bytes-per-sec` is
+    # a SEPARATE per-partition limiter wired via
+    # AUTUMN_PS_GC_RATE_BYTES_PER_SEC and stays as-is.
+    if [[ -n "${AUTUMN_PS_ADMISSION_COMPACT_RATE_BYTES_PER_SEC:-}" ]]; then
+        tunable_args+=(--admission-compact-rate-bytes-per-sec \
+            "$AUTUMN_PS_ADMISSION_COMPACT_RATE_BYTES_PER_SEC")
+    fi
+    if [[ -n "${AUTUMN_PS_ADMISSION_GC_RATE_BYTES_PER_SEC:-}" ]]; then
+        tunable_args+=(--admission-gc-rate-bytes-per-sec \
+            "$AUTUMN_PS_ADMISSION_GC_RATE_BYTES_PER_SEC")
     fi
     if [[ -n "${AUTUMN_PS_FG_SATURATED_THRESHOLD:-}" ]]; then
         tunable_args+=(--fg-saturated-threshold "$AUTUMN_PS_FG_SATURATED_THRESHOLD")

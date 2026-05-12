@@ -81,10 +81,9 @@ pub(crate) async fn background_compact_loop(
     _part_id: u64,
     part: Rc<RefCell<PartitionData>>,
     mut compact_rx: mpsc::Receiver<bool>,
-    // F196 D-r6: the compact concurrency cap is now hosted by the
-    // unified PS-wide AdmissionController. Caller passes the same Arc
-    // that PartitionData.io_bucket holds.
-    admission: std::sync::Arc<crate::AdmissionController>,
+    // F196 D-r7: PS-wide compact concurrency permit lives on the
+    // ConcurrencyController. Same Arc as PartitionData.concurrency_ctrl.
+    concurrency_ctrl: std::sync::Arc<crate::ConcurrencyController>,
 ) {
     // F188: short timer kept to refresh `pending_compaction_bytes` for
     // the maintenance scheduler — it polls metrics on the main thread,
@@ -202,7 +201,7 @@ pub(crate) async fn background_compact_loop(
 
                 // F104: serialize across partitions per
                 // AUTUMN_PS_MAJOR_COMPACT_PARALLELISM (default 1).
-                let _permit = admission.acquire_compact().await;
+                let _permit = concurrency_ctrl.acquire_compact().await;
                 // compact_inflight already latched at top of recv arm.
                 let result = do_compact(&part, compact_tbls, major).await;
                 match result {
@@ -277,7 +276,7 @@ pub(crate) async fn background_compact_loop(
                     let tbls = part.borrow().tables.clone();
                     if tbls.len() >= 1 {
                         let last_extent = tbls.last().map(|t| t.extent_id).unwrap_or(0);
-                        let _permit = admission.acquire_compact().await;
+                        let _permit = concurrency_ctrl.acquire_compact().await;
                         metrics
                             .compact_inflight
                             .store(1, std::sync::atomic::Ordering::Relaxed);
@@ -334,10 +333,9 @@ pub(crate) async fn background_gc_loop(
     mut gc_rx: mpsc::Receiver<GcTask>,
     // F140 per-partition split-vs-gc sync (unchanged).
     gc_gate: std::sync::Arc<crate::CompactionGate>,
-    // F196 D-r6: GC concurrency cap now hosted by the unified
-    // AdmissionController. Caller passes the same Arc as
-    // PartitionData.io_bucket.
-    admission: std::sync::Arc<crate::AdmissionController>,
+    // F196 D-r7: PS-wide GC concurrency permit lives on the
+    // ConcurrencyController.
+    concurrency_ctrl: std::sync::Arc<crate::ConcurrencyController>,
 ) {
     const MAX_GC_ONCE: usize = 3;
     const GC_DISCARD_RATIO: f64 = 0.4;
@@ -544,7 +542,7 @@ pub(crate) async fn background_gc_loop(
         // enter run_gc together — each holds ~64 MiB chunk buffer +
         // rewrite staging. Default 1 (full serialization), tunable
         // via `--gc-parallelism`.
-        let _gc_conc_permit = admission.acquire_gc().await;
+        let _gc_conc_permit = concurrency_ctrl.acquire_gc().await;
         // F140: acquire gc_gate around the actual run_gc calls so that
         // handle_split_part can wait for no log_stream appends in-flight.
         // Gate is held only for the holes-processing loop, not for the
@@ -720,7 +718,7 @@ pub(crate) async fn start_write_batch(
 
         let log_stream_id = p.log_stream_id;
         let part_sc = p.stream_client.clone();
-        let admission = p.io_bucket.clone();
+        let admission = p.rate_ctrl.clone();
         (valid, log_stream_id, part_sc, admission)
     };
     // borrow_mut released here — safe to await below.
@@ -1162,7 +1160,7 @@ pub(crate) async fn do_compact(
     let input_tables = tbls.len();
     let compact_keys: HashSet<(u64, u32)> = tbls.iter().map(|t| t.loc()).collect();
 
-    let (readers, row_stream_id, meta_stream_id, compact_vp_eid, compact_vp_off, rg, part_sc, row_append_tx, io_bucket) = {
+    let (readers, row_stream_id, meta_stream_id, compact_vp_eid, compact_vp_off, rg, part_sc, row_append_tx, rate_ctrl) = {
         let p = part.borrow();
         let mut rds: Vec<Arc<SstReader>> = Vec::new();
         for t in &tbls {
@@ -1170,7 +1168,7 @@ pub(crate) async fn do_compact(
                 rds.push(p.sst_readers[idx].clone());
             }
         }
-        (rds, p.row_stream_id, p.meta_stream_id, p.vp_extent_id, p.vp_offset, p.rg.clone(), p.stream_client.clone(), p.row_append_tx.clone(), p.io_bucket.clone())
+        (rds, p.row_stream_id, p.meta_stream_id, p.vp_extent_id, p.vp_offset, p.rg.clone(), p.stream_client.clone(), p.row_append_tx.clone(), p.rate_ctrl.clone())
     };
 
     if readers.is_empty() {
@@ -1297,12 +1295,11 @@ pub(crate) async fn do_compact(
                 .map_err(|_| anyhow!("compact builder finish join failed"))?;
             let chunk_bytes = sst_bytes.len() as u64;
             output_bytes += chunk_bytes;
-            // F188: PS-wide background-IO budget — sleeps if compact +
-            // GC across all partitions on this PS would exceed
-            // AUTUMN_PS_BG_RATE_BYTES_PER_SEC. Sleep happens BEFORE the
-            // append so the bucket reflects "intent to write" rather
-            // than counts after-the-fact, matching F141's pattern.
-            io_bucket.account_bg(chunk_bytes).await;
+            // F196 D-r7: per-partition compact rate cap (replaces
+            // F188's combined PS-wide bg cap). Sleep happens BEFORE the
+            // append so the counter reflects "intent to write" rather
+            // than after-the-fact, matching F141's pattern.
+            rate_ctrl.account_compact(chunk_bytes).await;
             // F135: route through P-bulk's StreamClient to preserve the
             // single-writer invariant on row_stream.
             let result = compact_row_append(&row_append_tx, &part_sc, row_stream_id, sst_bytes.clone()).await?;
@@ -1361,8 +1358,9 @@ pub(crate) async fn do_compact(
             .map_err(|_| anyhow!("compact final builder finish join failed"))?;
         let chunk_bytes = sst_bytes.len() as u64;
         output_bytes += chunk_bytes;
-        // F188: same PS-wide budget account as the per-chunk emit above.
-        io_bucket.account_bg(chunk_bytes).await;
+        // F196 D-r7: same per-partition compact rate account as the
+        // per-chunk emit above.
+        rate_ctrl.account_compact(chunk_bytes).await;
         // F135: route through P-bulk's StreamClient to preserve the
         // single-writer invariant on row_stream.
         let result = compact_row_append(&row_append_tx, &part_sc, row_stream_id, sst_bytes.clone()).await?;
@@ -1666,7 +1664,7 @@ async fn flush_gc_batch(
     part_sc: &Rc<StreamClient>,
     batch: &mut GcWriteBatch,
     rate_limiter: &mut GcRateLimiter,
-    io_bucket: &std::sync::Arc<crate::AdmissionController>,
+    rate_ctrl: &std::sync::Arc<crate::RateController>,
     moved: &mut usize,
 ) -> Result<()> {
     if batch.is_empty() {
@@ -1718,8 +1716,8 @@ async fn flush_gc_batch(
     if let Some(sleep_dur) = rate_limiter.account(batch_bytes) {
         compio::time::sleep(sleep_dur).await;
     }
-    // F188: PS-wide budget on the GC append side too.
-    io_bucket.account_bg(batch_bytes).await;
+    // F196 D-r7: per-partition gc rate cap (replaces F188's bg cap).
+    rate_ctrl.account_gc(batch_bytes).await;
 
     Ok(())
 }
@@ -1755,9 +1753,9 @@ pub(crate) async fn run_gc(
     extent_id: u64,
     sealed_length: u32,
 ) -> Result<()> {
-    let (log_stream_id, rg, part_sc, io_bucket) = {
+    let (log_stream_id, rg, part_sc, rate_ctrl) = {
         let p = part.borrow();
-        (p.log_stream_id, p.rg.clone(), p.stream_client.clone(), p.io_bucket.clone())
+        (p.log_stream_id, p.rg.clone(), p.stream_client.clone(), p.rate_ctrl.clone())
     };
 
     // F106 streaming: read the sealed extent in `gc_read_chunk_bytes()`
@@ -1817,7 +1815,7 @@ pub(crate) async fn run_gc(
             &mut moved,
             &mut batch,
             &mut rate_limiter,
-            &io_bucket,
+            &rate_ctrl,
         )
         .await?;
         if consumed < buf.len() {
@@ -1835,11 +1833,9 @@ pub(crate) async fn run_gc(
         if let Some(sleep_dur) = rate_limiter.account(chunk_len) {
             compio::time::sleep(sleep_dur).await;
         }
-        // F188: PS-wide background-IO budget — gates GC across all
-        // partitions on this PS, in addition to F141's per-partition
-        // limiter above. Prevents N partitions × per-partition rate
-        // from blowing past the cluster ceiling.
-        io_bucket.account_bg(chunk_len).await;
+        // F196 D-r7: per-partition gc rate cap on the read side (so
+        // GC's read pressure is throttled too, not just the write side).
+        rate_ctrl.account_gc(chunk_len).await;
     }
 
     if !carry.is_empty() {
@@ -1862,7 +1858,7 @@ pub(crate) async fn run_gc(
         &part_sc,
         &mut batch,
         &mut rate_limiter,
-        &io_bucket,
+        &rate_ctrl,
         &mut moved,
     )
     .await?;
@@ -1903,7 +1899,7 @@ async fn process_gc_chunk(
     moved: &mut usize,
     batch: &mut GcWriteBatch,
     rate_limiter: &mut GcRateLimiter,
-    io_bucket: &std::sync::Arc<crate::AdmissionController>,
+    rate_ctrl: &std::sync::Arc<crate::RateController>,
 ) -> Result<usize> {
     // F158: decode via shared codec — handles both V0 (legacy on-disk) and V1
     // (post-F158 with CRC). On a V1 CRC failure we log + skip + continue,
@@ -2032,7 +2028,7 @@ async fn process_gc_chunk(
                 part_sc,
                 batch,
                 rate_limiter,
-                io_bucket,
+                rate_ctrl,
                 moved,
             )
             .await?;

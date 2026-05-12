@@ -364,16 +364,16 @@ pub(crate) async fn handle_split_part(
         }
     }
 
-    // F140 + F196 D-r6: drain in-flight compact + GC before commit_length.
-    // compact's PS-wide concurrency permit now lives on the unified
-    // AdmissionController (`io_bucket.acquire_compact`). gc_gate stays a
+    // F140 + F196 D-r7: drain in-flight compact + GC before commit_length.
+    // compact's PS-wide concurrency permit lives on
+    // `ConcurrencyController.acquire_compact`. gc_gate stays a
     // per-partition CompactionGate for split-vs-gc synchronization within
     // this partition. Both held through multi_modify_split via RAII.
-    let (admission, gc_gate) = {
+    let (concurrency, gc_gate) = {
         let p = part.borrow();
-        (p.io_bucket.clone(), p.gc_gate.clone())
+        (p.concurrency_ctrl.clone(), p.gc_gate.clone())
     };
-    let _compact_permit = admission.acquire_compact().await;
+    let _compact_permit = concurrency.acquire_compact().await;
     let _gc_permit = gc_gate.acquire().await;
 
     // Fetch authoritative range from the manager. PartitionData.rg is set

@@ -75,6 +75,17 @@ Stage breakdown:
                  separate. Background loops + handle_split_part
                  route through io_bucket for both rate AND
                  concurrency.
+                 [SUPERSEDED by D-r7]
+  Stage D-r7:    Split admission into RateController (per-partition,
+                 4 independent rate dims: fg bytes/iops + compact
+                 bytes + gc bytes) and ConcurrencyController (PS-wide,
+                 compact + gc concurrency caps). fg-aware-yield kept
+                 on compact + gc paths. CLI: --bg-rate removed,
+                 replaced by --admission-compact-rate + --admission-
+                 gc-rate (separate from F141's --gc-rate-bytes-per-sec
+                 per-partition limiter which stays).
+                 Defaults from perf_check: fg 256 MiB/s + 30K iops,
+                 compact 64 MiB/s, gc 32 MiB/s.
   Stage E: cluster.sh env passthrough + even disjoint cpuset
            distribution (EN[i] + PS ranges); README updated; this
            progress file; feature_list F196 entry; commit.
