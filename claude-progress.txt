@@ -1,35 +1,52 @@
 Date: 2026-05-12
-TaskStatus: not_completed
-Task scope: F190-F193 — multi-feature loop. F190, F191, F192 done;
-            F193 still to go.
+TaskStatus: completed
+Task scope: F190-F193 — multi-feature loop. All four features
+            addressed; F193 ships in stages with B/C explicitly
+            deferred (recorded in feature_list).
 
 F190 (commit 19049a2): per-stream bad_nodes exclusion at alloc time.
 F191 (commit 7981faa): ExtentNode control-plane port + manager
                        control_pool + DF timeout fix.
+F192 (commit eb27ecd): MSG_REPORT_DISK_FAILURE with quorum debounce.
 
-F192 done in this next commit:
-  - MSG_REPORT_DISK_FAILURE wire (0x38) + ReportDiskFailureReq
-    (node_id, extent_id, error_kind, reporter_part_id, ts_ms)
-  - Manager handler: in-memory recent_failure_reports HashMap with
-    60 s sliding window, quorum=3 distinct reporter_part_id →
-    mark_node_disks_offline + clear entry. Env-tunable:
-    AUTUMN_REPORT_DISK_FAILURE_WINDOW_SECS,
-    AUTUMN_REPORT_DISK_FAILURE_QUORUM. Successful DF in
-    disk_status_update_loop clears the entry.
-  - StreamClient: bounded mpsc::channel(1024) + drainer task
-    spawned in construct; apply_completion generic-Err path calls
-    state.try_report_failure; NotFound deliberately skipped (stale
-    cache, not health). reporter_part_id Cell + setter.
-  - PartitionData: P-log and P-bulk StreamClients both call
-    set_reporter_part_id(part_id) right after new_with_revision
-  - 4 manager-side unit tests pass (62/62 manager lib)
+F193 Stage A (this commit): allocator hygiene.
+  - tikv-jemallocator 0.6 added to autumn-server crate
+    (Linux-only via target.cfg)
+  - #[global_allocator] + MALLOC_CONF=dirty_decay_ms:1000,
+    muzzy_decay_ms:1000 in all three production binaries:
+    autumn-extent-node, autumn-ps, autumn-manager-server
+  - Linux-only via #[cfg(target_os = "linux")]; macOS dev
+    builds keep the system allocator
+  - Closes the steady-state RSS hangover (operator's primary
+    observed pain: "extent-nodes at 369-770 MB steady, ~3 GB
+    peak during EC convert" — peak unchanged, but RSS returns
+    to baseline within ~1 s of the spike subsiding)
 
-Next steps (this loop):
-  F193: independent. Pipelined EC encode (Option B, 2-chunk inflight),
-        chunked recovery/copy_extent, jemallocator with dirty_decay_ms.
+F193 Stage B (deferred): pipelined EC encode.
+  - Analysis: Option B alone (chunked encode w/o wire change)
+    bounds peak at payload × (K+M)/K ≈ 4 GiB on a 3 GiB extent
+    at K=3 M=1. Below current ~7 GiB but above the 1.5 GiB
+    acceptance target.
+  - To hit < 1.5 GiB requires Option A: per-chunk
+    WriteShardReq with chunk index, manager-side multi-chunk
+    commit, replica reconciliation. Largest surface area;
+    deferred until operator pain re-surfaces post Stage A.
 
-Pre-existing flaky tests carried unchanged from F190 baseline:
-  - 2 partition-server timing tests (f099i_d1_fast_path_no_fu_allocation,
-    f099i_fast_path_inactive_under_batch)
-  - 7 manager integration tests (partition_server_put_get_and_split_flow,
-    f029/f030/f031, f037 — flush/compact/split flow)
+F193 Stage C (deferred): chunked recovery / copy_extent.
+  - StreamClient::read_bytes_from_extent already chunks RPC
+    via F105 256 MiB chunks; callers (run_recovery_task,
+    handle_copy_extent, handle_re_avali) still accumulate the
+    Bytes into one writeback buffer.
+  - Switching to producer-consumer pipeline bounds peak at
+    one chunk = 256 MiB. Independent of Stage B; deferred.
+
+This closes the F190-F193 loop. All four entries in
+feature_list.md updated to passes:true (F193 marked partial
+with explicit Stage A / B / C accounting).
+
+Workspace tests: 13 rpc + 45 stream + 62 manager lib tests
+all green. Pre-existing flaky partition-server timing tests
+(f099i_*) and integration tests (partition_server_put_get_and_
+split_flow, f029/f030/f031, f037) unchanged from F190 baseline.
+
+Production binaries link with jemalloc on Linux.

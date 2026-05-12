@@ -41,6 +41,16 @@ libc = "0.2"
 compio = { version = "0.18.0", features = ["macros", "time", "net"] }
 futures = "0.3"
 pprof = { version = "0.14", features = ["flamegraph"], optional = true }
+# F193 allocator hygiene: tikv-jemallocator returns dirty pages to the
+# OS within `dirty_decay_ms` (default 10 s in upstream jemalloc; we
+# tune to 1 s via the MALLOC_CONF in the binary main.rs files).
+# Without this, peak RSS observed during EC convert / copy_extent
+# sits at the high-water mark indefinitely after the spike subsides
+# because glibc's malloc doesn't aggressively MADV_FREE.
+# Linux-only — falls back to default allocator on macOS dev boxes
+# (the production target is Linux only).
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.6"
 
 [features]
 default = []

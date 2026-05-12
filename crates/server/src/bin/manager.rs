@@ -2,6 +2,19 @@ use anyhow::{Context, Result};
 use autumn_manager::AutumnManager;
 use autumn_transport::TransportKind;
 
+// F193 allocator hygiene — see crates/server/src/bin/extent_node.rs for
+// the rationale and the MALLOC_CONF tuning explanation. Manager's peak
+// RSS during etcd replay can also benefit, though the dominant case is
+// the extent-node EC path.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(target_os = "linux")]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+
 struct Args {
     port: u16,
     etcd: Vec<String>,
