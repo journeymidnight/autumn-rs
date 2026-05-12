@@ -117,6 +117,8 @@ PARTITIONS_LIST="1 8"             # default: both partition counts
 PIPELINE_DEPTH_LIST="8"           # depth is client-side only; d=8 is the representative throughput point
 SIZES_LIST="4096 8388608"         # default: 4 KB (small-msg) + 8 MB (rndv-zcopy)
 THREADS=16                        # default: 16 client OS threads (see header)
+DURATION=10                       # default: 10 s (baseline window). Use --duration 120
+                                  # to exercise compact/gc paths (F196 D-r7-recal).
 
 # Map a byte size to a short label used in baseline filenames:
 # 4096 → "4k", 8388608 → "8m", other → "<N>b" / "<N>k" / "<N>m".
@@ -176,6 +178,12 @@ while (( $# > 0 )); do
             [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 )) \
                 || { echo "--threads must be a positive integer" >&2; exit 1; }
             THREADS="$v"
+            ;;
+        --duration)
+            shift
+            v="${1:-}"
+            [[ "$v" =~ ^[0-9]+$ ]] || { echo "--duration needs a positive integer" >&2; exit 1; }
+            DURATION="$v"
             ;;
         -h|--help)
             sed -n '2,30p' "$0"
@@ -262,7 +270,7 @@ run_perf() {
     ${AC_PREFIX:-} "$AC" --manager "${AUTUMN_BIND_HOST:-127.0.0.1}:9001" --transport "$mode" \
         perf-check \
         --threads "$THREADS" \
-        --duration 10 \
+        --duration "$DURATION" \
         --size "$size" \
         --partitions "$parts" \
         --pipeline-depth "$depth" \
