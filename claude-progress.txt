@@ -85,7 +85,27 @@ Stage breakdown:
                  gc-rate (separate from F141's --gc-rate-bytes-per-sec
                  per-partition limiter which stays).
                  Defaults from perf_check: fg 256 MiB/s + 30K iops,
-                 compact 64 MiB/s, gc 32 MiB/s.
+                 compact 64 MiB/s, gc 32 MiB/s. [PARTIALLY SUPERSEDED
+                 by D-r7-recal]
+  Stage D-r7-recal:
+                 Bump defaults to match sustained workloads:
+                 fg 256→1024 MiB/s, compact 64→256 MiB/s,
+                 gc 32→128 MiB/s, compact_max 1→4, gc_max 1→4.
+                 Pre-recal compact 64 MiB/s × concurrency=1 = 64 MiB/s
+                 aggregate, 7× below 4K-p16 sustained flush input
+                 432 MB/s → SST queue + write back-pressure on long
+                 runs. perf_baseline_tcp_p16_d8_s4k 10s bench
+                 unaffected (per-partition 27 MB/s never approaches
+                 new caps).
+
+Stream crate (autumn-stream):
+  Stage D-r7-en: Rename ExtentNodeGate → ConcurrencyController to
+                 mirror PS. One struct, two counters (ec_convert +
+                 recovery). Distinct EcConvertPermit / RecoveryPermit
+                 types. Single ExtentNode.concurrency_ctrl field
+                 (was two separate gates). 6/6 f194 tests pass +
+                 new ec_convert_and_recovery_counters_are_independent
+                 invariant test.
   Stage E: cluster.sh env passthrough + even disjoint cpuset
            distribution (EN[i] + PS ranges); README updated; this
            progress file; feature_list F196 entry; commit.

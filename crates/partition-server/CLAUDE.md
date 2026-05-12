@@ -563,10 +563,10 @@ F196 D-r7. The split mirrors the physical resource they protect:
 **concurrency** is PS-wide because the protected resource is process
 RAM (each compact / GC operation holds ~hundreds of MB of buffers).
 
-| Type | Scope | What it controls | Default | Code |
-|------|-------|-----------------|---------|------|
-| `RateController` | **per-partition** | fg bytes/s + fg iops + compact bytes/s + gc bytes/s | fg 256 MiB/s + 30K iops; compact 64 MiB/s; gc 32 MiB/s | `lib.rs::RateController` |
-| `ConcurrencyController` | **PS-wide** (`Arc<>`) | compact + gc concurrency permits | compact_max=1, gc_max=1 | `lib.rs::ConcurrencyController` |
+| Type | Scope | What it controls | Default (post D-r7-recal) | Code |
+|------|-------|-----------------|---------------------------|------|
+| `RateController` | **per-partition** | fg bytes/s + fg iops + compact bytes/s + gc bytes/s | fg 1 GiB/s + 30K iops; compact 256 MiB/s; gc 128 MiB/s | `lib.rs::RateController` |
+| `ConcurrencyController` | **PS-wide** (`Arc<>`) | compact + gc concurrency permits | compact_max=4, gc_max=4 | `lib.rs::ConcurrencyController` |
 
 `PartitionServer` carries one `Arc<ConcurrencyController>`; each
 `PartitionData` carries its own fresh `Arc<RateController>` (independent
@@ -664,13 +664,17 @@ cap layered before `account_gc`; it stays for back-compat with the
 
 | Flag | Env | Default | Knob |
 |------|-----|---------|------|
-| `--fg-rate-bytes-per-sec` | `AUTUMN_PS_FG_RATE_BYTES_PER_SEC` | 256 MiB/s | per-partition fg bytes |
+| `--fg-rate-bytes-per-sec` | `AUTUMN_PS_FG_RATE_BYTES_PER_SEC` | **1 GiB/s** | per-partition fg bytes |
 | `--fg-iops-per-sec` | `AUTUMN_PS_FG_IOPS_PER_SEC` | 30_000 | per-partition fg ops |
-| `--admission-compact-rate-bytes-per-sec` | `AUTUMN_PS_ADMISSION_COMPACT_RATE_BYTES_PER_SEC` | 64 MiB/s | per-partition compact bytes |
-| `--admission-gc-rate-bytes-per-sec` | `AUTUMN_PS_ADMISSION_GC_RATE_BYTES_PER_SEC` | 32 MiB/s | per-partition gc bytes |
+| `--admission-compact-rate-bytes-per-sec` | `AUTUMN_PS_ADMISSION_COMPACT_RATE_BYTES_PER_SEC` | **256 MiB/s** | per-partition compact bytes |
+| `--admission-gc-rate-bytes-per-sec` | `AUTUMN_PS_ADMISSION_GC_RATE_BYTES_PER_SEC` | **128 MiB/s** | per-partition gc bytes |
 | `--fg-saturated-threshold` | `AUTUMN_PS_FG_SATURATED_THRESHOLD` | 0.8 | fg-aware yield trigger ratio |
-| `--major-compact-parallelism` | `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM` | 1 | PS-wide compact concurrency |
-| `--gc-parallelism` | `AUTUMN_PS_GC_PARALLELISM` | 1 | PS-wide gc concurrency |
+| `--major-compact-parallelism` | `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM` | **4** | PS-wide compact concurrency |
+| `--gc-parallelism` | `AUTUMN_PS_GC_PARALLELISM` | **4** | PS-wide gc concurrency |
+
+Defaults sized to perf_check baselines. See `feature_list.md` F196
+D-r7-recal entry for the derivation (4K p16 d8: per-partition fg
+27 MB/s, flush 27 MB/s; 8M p8 d8: per-partition fg 218 MB/s).
 
 `0` on any rate flag = unlimited for that dimension (per-dimension
 opt-out without disabling the others). Removed in D-r7:

@@ -247,14 +247,23 @@ const COMPACT_N: usize = 5;
 /// linearly. On a single PS hosting 4 partitions of ~5 GB SST each, the
 /// observed peak was ~44 GB RSS during `autumn-client compact ALL`.
 ///
-/// This gate caps cross-partition compaction concurrency. Default = 1
-/// (fully serialized across partitions, matching the safe-fix lower
-/// bound). Operators with plenty of RAM can raise it via
-/// `set_ps_major_compact_parallelism` (CLI flag
-/// `--major-compact-parallelism`) to trade memory for throughput.
-/// Range clamped to [1, 64].
+/// This gate caps cross-partition compaction concurrency. Default = **4**
+/// (post-D-r7-recal; was 1 pre-recal). With single-compact peak ~256 MB
+/// after F104-streaming + F169 spawn_blocking, 4 concurrent compacts =
+/// ~2 GB peak RSS — well below the F104 incident's 44 GB. Memory-
+/// constrained operators can lower via `--major-compact-parallelism 1`;
+/// throughput-bound operators can raise up to 64.
 pub(crate) fn ps_major_compact_parallelism() -> usize {
-    *PS_MAJOR_COMPACT_PARALLELISM_CELL.get_or_init(|| 1)
+    // F196 D-r7-recal: bumped 1 → 4. The F104 RAM-cap default was
+    // overly conservative — a single compact's spawn_blocking SST
+    // buffer is bounded at ~256 MB (MAX_SKIP_LIST), so 4 concurrent
+    // compacts peak at ~2 GB RSS, well within modern server budgets.
+    // The 1 default created a structural bottleneck: with N partitions
+    // doing sustained 4K writes (~27 MB/s flush per partition × 16 =
+    // 432 MB/s aggregate flush input), a serialized single compact at
+    // 256 MiB/s simply cannot keep up. Operator can lower via
+    // `--major-compact-parallelism` for memory-constrained hosts.
+    *PS_MAJOR_COMPACT_PARALLELISM_CELL.get_or_init(|| 4)
 }
 
 /// F196: PS-wide cap on concurrent `run_gc` calls across partitions.
@@ -264,12 +273,14 @@ pub(crate) fn ps_major_compact_parallelism() -> usize {
 /// `autumn-client gc ALL` on an N-partition PS would launch N
 /// concurrent `run_gc` calls, multiplying peak memory by N.
 ///
-/// Default = 1 (fully serialized across partitions), tunable via
-/// `--gc-parallelism`. Range clamped to [1, 64]. Symmetric with
+/// Default = **4** (post-D-r7-recal), tunable via `--gc-parallelism`.
+/// Range clamped to [1, 64]. Symmetric with
 /// `ps_major_compact_parallelism`; reasoning is identical (RAM cap,
-/// not rate cap — that's the per-partition `AdmissionController`).
+/// not rate cap — that's the per-partition `RateController`).
+/// 4 × 64 MiB chunk buffer = 256 MiB peak RSS, well below any
+/// reasonable budget.
 pub(crate) fn ps_gc_parallelism() -> usize {
-    *PS_GC_PARALLELISM_CELL.get_or_init(|| 1)
+    *PS_GC_PARALLELISM_CELL.get_or_init(|| 4)
 }
 
 pub struct CompactionGate {
@@ -1269,22 +1280,27 @@ impl RateController {
         }
     }
 
-    /// Reads process-global setters. Defaults derived from perf_check
-    /// baselines (real TCP, no SHM artifact per
-    /// `[[loopback-numa-artifact]]`):
-    ///   - fg 256 MiB/s = 5× headroom over single-partition TCP 4K peak
-    ///   - fg 30K ops/s = single-partition QPS ceiling
-    ///     (see `[[partition-qps-ceiling]]`)
-    ///   - compact 64 MiB/s, gc 32 MiB/s — bulk bg writes, lighter
-    ///     than fg
+    /// Reads process-global setters. Defaults recalibrated against
+    /// `perf_baseline_tcp_p16_d8_s4k.json` and the 8M peak observation
+    /// (see `[[partition-qps-ceiling]]` and the D-r7-recal analysis):
+    ///
+    ///   - fg 1 GiB/s     — 5× headroom over single-partition 8M TCP
+    ///                       peak (218 MB/s); 4K never engages.
+    ///   - fg 30K ops/s   — single-partition QPS ceiling
+    ///                       (see `[[partition-qps-ceiling]]`).
+    ///   - compact 256 MiB/s — single partition can sustainably ingest
+    ///                          fg writes' flush output (4K aggregate
+    ///                          437 MB/s flush = 27 MB/s per partition).
+    ///   - gc 128 MiB/s   — handles 50% overwrite rate on 8M workloads
+    ///                       (218 × 0.5 = 109 MB/s).
     pub fn from_env() -> Self {
         let fg_rate = *PS_FG_RATE_BYTES_PER_SEC_CELL
-            .get_or_init(|| 256 * 1024 * 1024);
+            .get_or_init(|| 1024 * 1024 * 1024);
         let fg_iops = *PS_FG_IOPS_PER_SEC_CELL.get_or_init(|| 30_000);
         let compact_rate = *PS_COMPACT_RATE_BYTES_PER_SEC_CELL
-            .get_or_init(|| 64 * 1024 * 1024);
+            .get_or_init(|| 256 * 1024 * 1024);
         let gc_rate = *PS_GC_RATE_BYTES_PER_SEC_CELL
-            .get_or_init(|| 32 * 1024 * 1024);
+            .get_or_init(|| 128 * 1024 * 1024);
         let saturated = *PS_FG_SATURATED_THRESHOLD_CELL.get_or_init(|| 0.8);
         Self::new(fg_rate, fg_iops, compact_rate, gc_rate, saturated)
     }
