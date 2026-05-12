@@ -32,6 +32,12 @@ struct Args {
     /// is `false` (production thresholds = 1 GiB / 4 GiB / 5-bucket /
     /// 60 s tick / 5-min cooldown).
     policy_fast_mode: bool,
+    /// F195 (was F192 env): MSG_REPORT_DISK_FAILURE sliding window
+    /// length in seconds. `None` = library default (60 s).
+    report_disk_failure_window_secs: Option<u64>,
+    /// F195 (was F192 env): MSG_REPORT_DISK_FAILURE distinct-reporter
+    /// quorum threshold. `None` = library default (3).
+    report_disk_failure_quorum: Option<usize>,
 }
 
 fn parse_args() -> Args {
@@ -42,6 +48,8 @@ fn parse_args() -> Args {
     let mut auto_split = false;
     let mut auto_merge = false;
     let mut policy_fast_mode = false;
+    let mut report_disk_failure_window_secs: Option<u64> = None;
+    let mut report_disk_failure_quorum: Option<usize> = None;
 
     let raw: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -72,6 +80,22 @@ fn parse_args() -> Args {
             "--auto-split" => auto_split = true,
             "--auto-merge" => auto_merge = true,
             "--policy-fast-mode" => policy_fast_mode = true,
+            "--report-disk-failure-window-secs" => {
+                i += 1;
+                report_disk_failure_window_secs = Some(
+                    raw[i]
+                        .parse()
+                        .expect("--report-disk-failure-window-secs must be a number"),
+                );
+            }
+            "--report-disk-failure-quorum" => {
+                i += 1;
+                report_disk_failure_quorum = Some(
+                    raw[i]
+                        .parse()
+                        .expect("--report-disk-failure-quorum must be a number"),
+                );
+            }
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
@@ -85,6 +109,8 @@ fn parse_args() -> Args {
         auto_split,
         auto_merge,
         policy_fast_mode,
+        report_disk_failure_window_secs,
+        report_disk_failure_quorum,
     }
 }
 
@@ -124,6 +150,23 @@ async fn main() -> Result<()> {
         tracing::warn!("F184: --auto-merge enabled; manager will orchestrate MERGE for cold same-PS pairs");
         manager.set_auto_merge(true);
     }
+    // F195: F192 quorum debounce config — applied if either flag was
+    // set. The library defaults (60 s / 3) match pre-F195 env defaults.
+    if args.report_disk_failure_window_secs.is_some()
+        || args.report_disk_failure_quorum.is_some()
+    {
+        let window = std::time::Duration::from_secs(
+            args.report_disk_failure_window_secs.unwrap_or(60),
+        );
+        let quorum = args.report_disk_failure_quorum.unwrap_or(3);
+        manager.set_report_disk_failure_config(window, quorum);
+        tracing::info!(
+            window_secs = window.as_secs(),
+            quorum,
+            "F192 quorum debounce configured"
+        );
+    }
+
     if args.policy_fast_mode {
         let mut cfg = autumn_manager::policy::PolicyConfig::default();
         cfg.required_buckets = 1;

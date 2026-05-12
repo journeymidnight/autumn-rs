@@ -2394,17 +2394,10 @@ impl AutumnManager {
         // quorum is purely advisory. Skip the leader gate; the call
         // is fire-and-forget so the client doesn't observe a refusal.
         let now = Instant::now();
-        let window = Duration::from_secs(
-            std::env::var("AUTUMN_REPORT_DISK_FAILURE_WINDOW_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(60),
-        );
-        let quorum: usize = std::env::var("AUTUMN_REPORT_DISK_FAILURE_QUORUM")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|n| *n >= 1)
-            .unwrap_or(3);
+        // F195: read F192 quorum config from `AutumnManager` fields
+        // populated at construction / binary-flag time. No env reads.
+        let window = self.report_disk_failure_window.get();
+        let quorum: usize = self.report_disk_failure_quorum.get();
         let cutoff = now.checked_sub(window).unwrap_or(now);
 
         let reached_quorum = {

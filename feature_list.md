@@ -358,6 +358,31 @@
 
 ## Open / Deferred designs
 
+### F195 · Eliminate env::var reads from production rs code; route all config via CLI args
+
+- **Trigger:** Project rule ("No env reads in rs code — production rs code takes config via CLI args; env→flag translation lives in cluster.sh, not Rust") violated by **38 distinct `AUTUMN_*` env vars** read from **42 `std::env::var` call sites** across **9 production source files**. The drift accumulated across F099/F104/F120/F141/F178/F184/F187/F189/F190-F194 — each feature added a knob, defaulting to "read env at the call site." Effect: a single binary's actual config surface is invisible to `--help` or `binary --print-config`; cluster.sh leaks AUTUMN_* via the process environment (see `cluster.sh` line ~335 `env | grep AUTUMN_`); test fixtures use `std::env::set_var` (mutating process-global state, hostile to parallel test runs).
+- **Migration shape:**
+  - Per crate, add a `LibraryConfig` struct (or extend existing) with one field per knob; library reads from `self.config.*` only.
+  - Library constructor takes the config; the existing default builders keep current behavior (so test fixtures and other callers compile unchanged); new builder methods (`set_*`) flip individual knobs from binary main().
+  - Binaries parse a new `--<flag-name>` for each knob; each binary's `Args` struct grows.
+  - `cluster.sh` translates env defaults to `--<flag>` arg lines instead of leaking via `env | grep AUTUMN_`.
+  - Tests that currently use `std::env::set_var` rewrite to construct the library with a custom config.
+- **Phasing (one commit per wave):**
+  - Wave 1 — **autumn-manager (2 vars):** F192 quorum debounce knobs (`AUTUMN_REPORT_DISK_FAILURE_WINDOW_SECS`, `AUTUMN_REPORT_DISK_FAILURE_QUORUM`) → fields on `AutumnManager` + `set_report_disk_failure_config(window, quorum)` + manager-binary `--report-disk-failure-window-secs` + `--report-disk-failure-quorum`.
+  - Wave 2 — **autumn-stream (9 vars):** 6 vars in `client.rs` (`BAD_NODES_TTL_SECS`, `INFLIGHT_CAP`, `APPEND_TIMEOUT_MS`, `READ_CHUNK_BYTES`, `SYNCED_POLL_MS`, `SYNCED_TIMEOUT_MS`) + 3 vars in `extent_node.rs` (`EC_CONVERT_PARALLELISM`, `RECOVERY_PARALLELISM`, `INFLIGHT_CAP`). `StreamClient.config: Rc<StreamClientConfig>` and `ExtentNodeConfig` extension fields.
+  - Wave 3 — **autumn-partition-server (16+ vars):** the biggest scope. `PartitionServerConfig` consolidating GC + admission + scheduling + bulk + group-commit knobs.
+  - Wave 4 — **autumn-rpc + binary-level:** `AUTUMN_RPC_FRAME_V1` (rpc/frame.rs, `OnceLock` cached) → library setter called from each binary main. `AUTUMN_GROUP_COMMIT_CAP` (autumn-client wbench), `AUTUMN_PPROF_*` (autumn-ps debug).
+  - Wave 5 — **cluster.sh + autumn-client (perf_check):** translate AUTUMN_* env defaults to per-binary `--<flag>` invocations; remove the `env | grep AUTUMN_` leak.
+- **Acceptance:**
+  - `grep -rn "std::env::var" crates/ --include="*.rs"` excluding `tests/` + `build.rs` + `OUT_DIR` returns **zero matches in production code**.
+  - Every library unit test that previously used `std::env::set_var` rewritten to construct the library with a custom config.
+  - cluster.sh still launches a working cluster from operator-set `AUTUMN_*` envs (translated to per-binary `--<flag>`).
+  - Workspace lib tests green across the migration.
+- **Status:** Wave 1 (manager) shipped this commit. Waves 2-5 follow in subsequent commits during this loop.
+- **passes:** partial — Wave 1 only.
+
+---
+
 ### F194 · Extent-node EC + Recovery global concurrency caps
 
 - **Trigger:** Conversation 2026-05-12 (post-F193 follow-up). PS already gates background work via `CompactionGate` (cross-partition major compact cap, env `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM`, default 1) + `AdmissionController` (fg/bg byte rate, F189) + per-partition GC limiter (F141). Extent-node has **NONE** of these: `ec_conversion_locks` (F153) and `recovery_inflight` (F109) are both per-extent_id, not cross-extent. Concrete failure mode: a `recovery_dispatch_loop` tick after a single node-down event detects 6 extents needing recovery and detached-spawns 6 concurrent `run_recovery_task` on the same survivor node — each peer-fetches ~payload bytes + writes ~payload bytes, multiplying transient working set to `6 × payload × 2 ≈ 36 GiB` on 3 GiB extents. Similarly for EC convert: manager's serial `.await` on dispatch doesn't gate node-side execution, so multiple converts on a single node interleave at `payload × (1+(K+M)/K)` peak each.

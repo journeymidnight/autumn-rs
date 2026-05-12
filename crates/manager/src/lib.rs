@@ -367,7 +367,8 @@ pub struct AutumnManager {
     /// adjacent cold pairs. Default off.
     pub(crate) auto_merge_enabled: Rc<Cell<bool>>,
     /// F192: per-node sliding-window of push-based failure reports from
-    /// PSes. Eviction window = 60 s; quorum threshold = 3 distinct
+    /// PSes. Eviction window = `report_disk_failure_window`; quorum
+    /// threshold = `report_disk_failure_quorum` distinct
     /// `reporter_part_id` → `mark_node_disks_offline` (in-memory only —
     /// the result reflects truth that the manager learns from
     /// `disk_status_update_loop` on the next 10 s tick, so it does NOT
@@ -376,6 +377,15 @@ pub struct AutumnManager {
     /// reports doesn't re-trip the quorum after the node recovers.
     pub(crate) recent_failure_reports:
         Rc<RefCell<HashMap<u64, std::collections::VecDeque<(Instant, u64)>>>>,
+    /// F195: F192 quorum debounce — sliding-window length. Default 60 s.
+    /// Configured via the manager binary's `--report-disk-failure-window-secs`
+    /// CLI flag (was previously `AUTUMN_REPORT_DISK_FAILURE_WINDOW_SECS`).
+    pub(crate) report_disk_failure_window: Cell<Duration>,
+    /// F195: F192 quorum debounce — distinct-reporter threshold to flip
+    /// node offline. Default 3. Configured via the manager binary's
+    /// `--report-disk-failure-quorum` CLI flag (was previously
+    /// `AUTUMN_REPORT_DISK_FAILURE_QUORUM`).
+    pub(crate) report_disk_failure_quorum: Cell<usize>,
 }
 
 impl Default for AutumnManager {
@@ -403,7 +413,19 @@ impl AutumnManager {
             auto_split_enabled: Rc::new(Cell::new(false)),
             auto_merge_enabled: Rc::new(Cell::new(false)),
             recent_failure_reports: Rc::new(RefCell::new(HashMap::new())),
+            // F195 defaults match the pre-F195 env defaults (F192).
+            report_disk_failure_window: Cell::new(Duration::from_secs(60)),
+            report_disk_failure_quorum: Cell::new(3),
         }
+    }
+
+    /// F195: F192 quorum debounce config setter. Called by the manager
+    /// binary's main() after CLI parsing; the public API mirrors the
+    /// existing `set_auto_split` / `set_policy_config` pattern.
+    /// `quorum` is clamped to at least 1.
+    pub fn set_report_disk_failure_config(&self, window: Duration, quorum: usize) {
+        self.report_disk_failure_window.set(window);
+        self.report_disk_failure_quorum.set(quorum.max(1));
     }
 
     /// F183: read the last_op_at timestamp for a partition (0 if never op'd).
