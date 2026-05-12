@@ -95,27 +95,22 @@ struct StreamAppendState {
     /// drainer. `try_send` from `apply_completion` Err; drops the event
     /// silently when full (best-effort).
     failure_report_tx: mpsc::Sender<FailureReport>,
+    /// F195: snapshotted F190 TTL — clone-on-spawn from StreamClientConfig
+    /// so the worker doesn't need to re-clone the config Rc per Err.
+    bad_nodes_ttl: Duration,
 }
 
-/// F190: TTL for the per-stream `bad_nodes` map. 30 s covers one full
-/// `disk_status_update_loop` poll (10 s) plus a recovery-dispatch tick
-/// (2 s) plus headroom — long enough for the manager's pull-based view
-/// to catch up, short enough to let a self-healed disk re-enter the
-/// candidate pool. Env override exists primarily for tests that want to
-/// shrink the window. Clamped to [1 s, 600 s].
-fn bad_nodes_ttl() -> Duration {
-    let s = std::env::var("AUTUMN_STREAM_BAD_NODES_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(30)
-        .clamp(1, 600);
-    Duration::from_secs(s)
-}
+/// F195: F190 TTL helper `bad_nodes_ttl()` removed. Value now lives on
+/// `StreamClientConfig.bad_nodes_ttl` (defined below) — set once at
+/// `StreamClient` construction, snapshotted into `StreamAppendState`
+/// for the worker. Was previously env `AUTUMN_STREAM_BAD_NODES_TTL_SECS`,
+/// now CLI-flag-driven on the PS binary.
 
 impl StreamAppendState {
     fn new(
         bad_nodes: Rc<RefCell<HashMap<u64, Instant>>>,
         failure_report_tx: mpsc::Sender<FailureReport>,
+        bad_nodes_ttl: Duration,
     ) -> Self {
         Self {
             tail: None,
@@ -126,6 +121,7 @@ impl StreamAppendState {
             poisoned: false,
             bad_nodes,
             failure_report_tx,
+            bad_nodes_ttl,
         }
     }
 
@@ -135,7 +131,7 @@ impl StreamAppendState {
     /// (overwrites the existing expires_at) so a chain of failures keeps
     /// the entry hot.
     fn mark_bad_node(&self, node_id: u64) {
-        let expires_at = Instant::now() + bad_nodes_ttl();
+        let expires_at = Instant::now() + self.bad_nodes_ttl;
         self.bad_nodes.borrow_mut().insert(node_id, expires_at);
     }
 
@@ -281,44 +277,79 @@ impl StreamAppendMetrics {
 /// on `send().await` — natural upstream back-pressure.
 const STREAM_SUBMIT_CAP: usize = 256;
 
-/// Reads `AUTUMN_STREAM_INFLIGHT_CAP` env var (default 32).  Caps the
-/// number of concurrent 3-replica appends a single stream worker holds
-/// in its FuturesUnordered.
-fn stream_inflight_cap() -> usize {
-    std::env::var("AUTUMN_STREAM_INFLIGHT_CAP")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(32)
+// F195: env-reading helpers `stream_inflight_cap()`,
+// `append_fanout_timeout()`, `read_chunk_bytes()` removed. Values live
+// on `StreamClientConfig` (defined below) — set once at construction,
+// CLI-flag-driven on the binary. Tests that need overrides build a
+// custom `StreamClientConfig` instead of setting process-global env
+// vars (hostile to parallel test runs).
+
+/// F195: Stream client tunables. Default values match the pre-F195
+/// env-default behaviour:
+///   - `bad_nodes_ttl`: 30 s (F190)
+///   - `inflight_cap`: 32 per-stream FU cap
+///   - `append_fanout_timeout`: 5 s per-replica append deadline (F121)
+///   - `read_chunk_bytes`: 256 MiB per replicated read chunk (F105)
+///   - `synced_poll`: 2 ms F178 flush-barrier poll interval
+///   - `synced_timeout`: 30 s F178 flush-barrier overall timeout
+#[derive(Clone, Debug)]
+pub struct StreamClientConfig {
+    pub bad_nodes_ttl: Duration,
+    pub inflight_cap: usize,
+    pub append_fanout_timeout: Duration,
+    pub read_chunk_bytes: u32,
+    pub synced_poll: Duration,
+    pub synced_timeout: Duration,
 }
 
-/// F121: per-replica append fanout deadline. Mirrors Go autumn's
-/// 5 s `context.WithTimeout` on `appendBlocks`. A dead replica whose
-/// TCP socket is half-open or stuck in send-buffer flushing will
-/// otherwise hang the join_all forever even when `RpcClient.closed`
-/// hasn't yet flipped. Default 5 s, env-tunable, clamped to
-/// [200 ms, 60 s].
-fn append_fanout_timeout() -> Duration {
-    let ms = std::env::var("AUTUMN_STREAM_APPEND_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(5_000)
-        .clamp(200, 60_000);
-    Duration::from_millis(ms)
+impl Default for StreamClientConfig {
+    fn default() -> Self {
+        Self {
+            bad_nodes_ttl: Duration::from_secs(30),
+            inflight_cap: 32,
+            append_fanout_timeout: Duration::from_secs(5),
+            read_chunk_bytes: 256 * 1024 * 1024,
+            synced_poll: Duration::from_millis(2),
+            synced_timeout: Duration::from_secs(30),
+        }
+    }
 }
 
-/// Reads `AUTUMN_STREAM_READ_CHUNK_BYTES` (default 256 MiB). Maximum
-/// per-RPC byte count for replicated `read_bytes_from_extent` reads.
-/// Required because macOS pread tops out at INT_MAX (~2 GiB) and Linux
-/// pread tops out at 0x7ffff000 — single-shot reads above that EINVAL.
-/// Tests override via env to exercise the chunked path with small
-/// extents.
-fn read_chunk_bytes() -> u32 {
-    std::env::var("AUTUMN_STREAM_READ_CHUNK_BYTES")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(256 * 1024 * 1024)
+impl StreamClientConfig {
+    /// F195: F190 TTL clamp `[1, 600]` seconds.
+    pub fn with_bad_nodes_ttl(mut self, ttl: Duration) -> Self {
+        let secs = ttl.as_secs().clamp(1, 600);
+        self.bad_nodes_ttl = Duration::from_secs(secs);
+        self
+    }
+    /// F195: F121 fanout clamp `[200 ms, 60 s]`.
+    pub fn with_append_fanout_timeout(mut self, t: Duration) -> Self {
+        let ms = t.as_millis().clamp(200, 60_000) as u64;
+        self.append_fanout_timeout = Duration::from_millis(ms);
+        self
+    }
+    /// F195: per-stream FU cap. 0 → default 32.
+    pub fn with_inflight_cap(mut self, cap: usize) -> Self {
+        self.inflight_cap = if cap == 0 { 32 } else { cap };
+        self
+    }
+    /// F195: F105 chunk size. 0 → default 256 MiB.
+    pub fn with_read_chunk_bytes(mut self, bytes: u32) -> Self {
+        self.read_chunk_bytes = if bytes == 0 { 256 * 1024 * 1024 } else { bytes };
+        self
+    }
+    /// F195: F178 flush-barrier poll interval `[1, 50] ms`.
+    pub fn with_synced_poll(mut self, p: Duration) -> Self {
+        let ms = p.as_millis().clamp(1, 50) as u64;
+        self.synced_poll = Duration::from_millis(ms);
+        self
+    }
+    /// F195: F178 flush-barrier overall timeout `≥ 100 ms`.
+    pub fn with_synced_timeout(mut self, t: Duration) -> Self {
+        let ms = (t.as_millis() as u64).max(100);
+        self.synced_timeout = Duration::from_millis(ms);
+        self
+    }
 }
 
 /// Pure slicing logic shared by `ec_read_full_and_slice`. Returns the
@@ -480,12 +511,16 @@ async fn stream_worker_loop(
     pool: Rc<ConnPool>,
     bad_nodes: Rc<RefCell<HashMap<u64, Instant>>>,
     failure_report_tx: mpsc::Sender<FailureReport>,
+    // F195: tunables snapshot — clone-of-Rc<StreamClientConfig> from
+    // the StreamClient, captured at spawn time. No env reads.
+    config: Rc<StreamClientConfig>,
     removal_guard: WorkerRemovalGuard,
 ) {
     use futures::future::{select, Either};
 
-    let cap = stream_inflight_cap();
-    let mut state = StreamAppendState::new(bad_nodes, failure_report_tx);
+    let cap = config.inflight_cap;
+    let append_timeout = config.append_fanout_timeout;
+    let mut state = StreamAppendState::new(bad_nodes, failure_report_tx, config.bad_nodes_ttl);
     let mut inflight: FuturesUnordered<InflightFut> = FuturesUnordered::new();
 
     loop {
@@ -522,6 +557,7 @@ async fn stream_worker_loop(
                         payload_parts,
                         revision,
                         ack_tx,
+                        append_timeout,
                     )
                     .await;
                 }
@@ -576,6 +612,7 @@ async fn stream_worker_loop(
                         payload_parts,
                         revision,
                         ack_tx,
+                        append_timeout,
                     )
                     .await;
                 }
@@ -726,6 +763,9 @@ async fn launch_append(
     payload_parts: Vec<Bytes>,
     revision: i64,
     ack_tx: oneshot::Sender<Result<AppendResult>>,
+    // F195: F121 per-replica deadline. Passed by the worker loop from
+    // its `config.append_fanout_timeout` snapshot.
+    append_timeout: Duration,
 ) {
     let tail = match &state.tail {
         Some(t) => t.clone(),
@@ -797,7 +837,7 @@ async fn launch_append(
     // Elapsed into a regular `replica N rpc error: ... timeout` makes
     // `apply_completion` classify it as a soft error, which the
     // public-API retry loop already escalates to alloc_new_extent.
-    let timeout = append_fanout_timeout();
+    let timeout = append_timeout;
     let fut = async move {
         let wait_futs = receivers.into_iter().map(|(addr, rx_res)| async move {
             match rx_res {
@@ -893,6 +933,10 @@ pub struct StreamClient {
     /// means "no reporter id configured" — drainer skips sending to
     /// avoid polluting the manager's quorum count with a sentinel.
     reporter_part_id: Cell<u64>,
+    /// F195: stream tunables. Defaults match pre-F195 env defaults.
+    /// Cloned into per-stream workers at spawn time (`Rc` keeps the
+    /// clone cheap).
+    config: Rc<StreamClientConfig>,
     append_metrics: StreamAppendMetrics,
 }
 
@@ -947,11 +991,31 @@ impl StreamClient {
         }
     }
 
+    /// Connect with the default `StreamClientConfig`. Equivalent to
+    /// `connect_with_config(..., StreamClientConfig::default())`.
     pub async fn connect(
         manager_endpoint: &str,
         owner_key: String,
         max_extent_size: u32,
         pool: Rc<ConnPool>,
+    ) -> Result<Rc<Self>> {
+        Self::connect_with_config(
+            manager_endpoint,
+            owner_key,
+            max_extent_size,
+            pool,
+            StreamClientConfig::default(),
+        )
+        .await
+    }
+
+    /// F195: connect with explicit tunables.
+    pub async fn connect_with_config(
+        manager_endpoint: &str,
+        owner_key: String,
+        max_extent_size: u32,
+        pool: Rc<ConnPool>,
+        config: StreamClientConfig,
     ) -> Result<Rc<Self>> {
         let mgr_addrs: Vec<String> = manager_endpoint
             .split(',')
@@ -997,18 +1061,39 @@ impl StreamClient {
             revision,
             max_extent_size,
             pool,
+            config,
         ))
     }
 
     /// Create a StreamClient that reuses an existing owner-lock revision
     /// without calling `acquire_owner_lock` again. Accepts comma-separated
-    /// manager endpoints.
+    /// manager endpoints. Uses `StreamClientConfig::default()`.
     pub async fn new_with_revision(
         manager_endpoint: &str,
         owner_key: String,
         revision: i64,
         max_extent_size: u32,
         pool: Rc<ConnPool>,
+    ) -> Result<Rc<Self>> {
+        Self::new_with_revision_and_config(
+            manager_endpoint,
+            owner_key,
+            revision,
+            max_extent_size,
+            pool,
+            StreamClientConfig::default(),
+        )
+        .await
+    }
+
+    /// F195: as `new_with_revision` but with explicit tunables.
+    pub async fn new_with_revision_and_config(
+        manager_endpoint: &str,
+        owner_key: String,
+        revision: i64,
+        max_extent_size: u32,
+        pool: Rc<ConnPool>,
+        config: StreamClientConfig,
     ) -> Result<Rc<Self>> {
         let mgr_addrs: Vec<String> = manager_endpoint
             .split(',')
@@ -1021,12 +1106,15 @@ impl StreamClient {
             revision,
             max_extent_size,
             pool,
+            config,
         ))
     }
 
     /// Private ctor: `Rc::new_cyclic` captures a weak self-ref for the
     /// per-stream workers' removal guard and for the F192 failure-report
-    /// drainer task.
+    /// drainer task. F195: `config` carries the (pre-F195 env-default-
+    /// equivalent) tunables; pass `StreamClientConfig::default()` to
+    /// keep historical behavior.
     fn construct(
         manager_addrs: Vec<String>,
         current_mgr: usize,
@@ -1034,7 +1122,9 @@ impl StreamClient {
         revision: i64,
         max_extent_size: u32,
         pool: Rc<ConnPool>,
+        config: StreamClientConfig,
     ) -> Rc<Self> {
+        let config = Rc::new(config);
         // F192: bounded channel — drop reports on overflow rather than
         // OOMing the writer. F190's per-stream alloc route-around is
         // the primary defense; reports are pure advisory.
@@ -1055,6 +1145,7 @@ impl StreamClient {
             stream_bad_nodes: RefCell::new(HashMap::new()),
             failure_report_tx,
             reporter_part_id: Cell::new(0),
+            config,
             append_metrics: StreamAppendMetrics::default(),
         });
         // F192: spawn the drainer task on the current compio runtime.
@@ -1166,13 +1257,24 @@ impl StreamClient {
         // `apply_completion` Err can fire reports without an extra
         // hop through the StreamClient.
         let failure_report_tx = self.failure_report_tx.clone();
+        // F195: hand the worker its tunables. `Rc<StreamClientConfig>`
+        // clone is O(1) ref-count bump.
+        let config = self.config.clone();
         let guard = WorkerRemovalGuard {
             sc: self.self_weak.clone(),
             stream_id,
         };
         compio::runtime::spawn(async move {
-            stream_worker_loop(stream_id, rx, pool, bad_nodes, failure_report_tx, guard)
-                .await;
+            stream_worker_loop(
+                stream_id,
+                rx,
+                pool,
+                bad_nodes,
+                failure_report_tx,
+                config,
+                guard,
+            )
+            .await;
         })
         .detach();
         tx
@@ -1772,16 +1874,10 @@ impl StreamClient {
         if min_offset == 0 {
             return Ok(());
         }
-        let poll_ms: u64 = std::env::var("AUTUMN_STREAM_SYNCED_POLL_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|v: &u64| (1..=50).contains(v))
-            .unwrap_or(2);
-        let timeout_ms: u64 = std::env::var("AUTUMN_STREAM_SYNCED_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|v: &u64| *v >= 100)
-            .unwrap_or(30_000);
+        // F195: F178 flush-barrier knobs come from StreamClientConfig.
+        // No env reads.
+        let poll_ms: u64 = self.config.synced_poll.as_millis() as u64;
+        let timeout_ms: u64 = self.config.synced_timeout.as_millis() as u64;
 
         let ex = self.fetch_extent_info(extent_id).await?;
         let addrs = self.replica_addrs_for_extent(&ex).await?;
@@ -2009,7 +2105,7 @@ impl StreamClient {
             length
         };
 
-        let chunk = read_chunk_bytes();
+        let chunk = self.config.read_chunk_bytes;
         if resolved <= chunk {
             return self.read_replicated_with_failover(ex, offset, length).await;
         }
@@ -2521,6 +2617,7 @@ mod pipeline_tests {
         let mut state = StreamAppendState::new(
             Rc::new(RefCell::new(HashMap::new())),
             mpsc::channel::<FailureReport>(1).0,
+            Duration::from_secs(30),
         );
         let (o0, e0) = state.lease(100);
         let (o1, e1) = state.lease(200);
@@ -2540,6 +2637,7 @@ mod pipeline_tests {
         let mut state = StreamAppendState::new(
             Rc::new(RefCell::new(HashMap::new())),
             mpsc::channel::<FailureReport>(1).0,
+            Duration::from_secs(30),
         );
         let (o0, e0) = state.lease(100);    // 0..100
         let (o1, e1) = state.lease(100);    // 100..200
@@ -2565,6 +2663,7 @@ mod pipeline_tests {
         let mut state = StreamAppendState::new(
             Rc::new(RefCell::new(HashMap::new())),
             mpsc::channel::<FailureReport>(1).0,
+            Duration::from_secs(30),
         );
         let (o0, _e0) = state.lease(100);
         let (o1, _e1) = state.lease(200);
@@ -2588,6 +2687,7 @@ mod pipeline_tests {
         let mut state = StreamAppendState::new(
             Rc::new(RefCell::new(HashMap::new())),
             mpsc::channel::<FailureReport>(1).0,
+            Duration::from_secs(30),
         );
         let (o0, _) = state.lease(100);
         let (_, _) = state.lease(200);
@@ -2618,6 +2718,7 @@ mod f190_bad_nodes_tests {
         let state = StreamAppendState::new(
             bad.clone(),
             mpsc::channel::<FailureReport>(1).0,
+            Duration::from_secs(30),
         );
         state.mark_bad_node(7);
         let entries = bad.borrow();
@@ -2631,6 +2732,7 @@ mod f190_bad_nodes_tests {
         let state = StreamAppendState::new(
             bad.clone(),
             mpsc::channel::<FailureReport>(1).0,
+            Duration::from_secs(30),
         );
         state.mark_bad_node(11);
         let first = *bad.borrow().get(&11).unwrap();

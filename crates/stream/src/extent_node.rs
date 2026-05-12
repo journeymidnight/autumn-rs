@@ -255,6 +255,20 @@ pub struct ExtentNodeConfig {
     /// require_recovery) to forward a mismatched extent_id to the
     /// owning sibling shard via localhost loopback.
     pub sibling_addrs: Vec<String>,
+    /// F195 (was F194 env `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM`):
+    /// cross-extent cap on concurrent `handle_convert_to_ec` heavy
+    /// paths. Default 1 = fully serialise. Clamped to [1, 16].
+    pub ec_convert_parallelism: usize,
+    /// F195 (was F194 env `AUTUMN_EXTENT_RECOVERY_PARALLELISM`):
+    /// cross-extent cap on concurrent `run_recovery_task` heavy paths.
+    /// Default 2 (repair work — some concurrency speeds post-failure
+    /// convergence). Clamped to [1, 16].
+    pub recovery_parallelism: usize,
+    /// F195 (was env `AUTUMN_EXTENT_INFLIGHT_CAP`, F099-I): per-conn
+    /// FuturesUnordered cap for the connection-task SQ/CQ loop. Caps
+    /// the per-client memory footprint at `cap × avg-frame`. Default
+    /// 64 matches the historical env default.
+    pub inflight_cap: usize,
 }
 
 impl ExtentNodeConfig {
@@ -266,6 +280,9 @@ impl ExtentNodeConfig {
             shard_idx: 0,
             shard_count: 1,
             sibling_addrs: Vec::new(),
+            ec_convert_parallelism: 1,
+            recovery_parallelism: 2,
+            inflight_cap: 64,
         }
     }
 
@@ -278,7 +295,29 @@ impl ExtentNodeConfig {
             shard_idx: 0,
             shard_count: 1,
             sibling_addrs: Vec::new(),
+            ec_convert_parallelism: 1,
+            recovery_parallelism: 2,
+            inflight_cap: 64,
         }
+    }
+
+    /// F195: F194 EC convert parallelism setter. Clamped to [1, 16].
+    pub fn with_ec_convert_parallelism(mut self, n: usize) -> Self {
+        self.ec_convert_parallelism = n.clamp(1, 16);
+        self
+    }
+
+    /// F195: F194 recovery parallelism setter. Clamped to [1, 16].
+    pub fn with_recovery_parallelism(mut self, n: usize) -> Self {
+        self.recovery_parallelism = n.clamp(1, 16);
+        self
+    }
+
+    /// F195: F099-I per-conn inflight cap setter. Must be > 0; falls
+    /// back to default 64 on 0.
+    pub fn with_inflight_cap(mut self, n: usize) -> Self {
+        self.inflight_cap = if n == 0 { 64 } else { n };
+        self
     }
 
     pub fn with_manager_endpoint(mut self, endpoint: impl Into<String>) -> Self {
@@ -645,33 +684,11 @@ impl Drop for ExtentNodePermit {
     }
 }
 
-/// F194: read `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM` env (default 1).
-/// 1 means "fully serialize EC converts on this shard" — matches PS's
-/// default major-compact parallelism. EC convert peak memory per call
-/// is ~`payload × (1 + (K+M)/K)`; without this cap, N concurrent
-/// converts multiply the peak by N. Clamped to [1, 16].
-fn ec_convert_parallelism() -> usize {
-    std::env::var("AUTUMN_EXTENT_EC_CONVERT_PARALLELISM")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.clamp(1, 16))
-        .unwrap_or(1)
-}
-
-/// F194: read `AUTUMN_EXTENT_RECOVERY_PARALLELISM` env (default 2).
-/// Default 2 because recovery is a repair operation — single-node
-/// concurrency speeds convergence after a node-down event when many
-/// extents need rebuild. Each `run_recovery_task` holds
-/// ~`payload × 2` (peer fetch buffer + writeback) so 2 × 3 GiB
-/// extents ≈ 12 GiB peak, comfortable on production nodes.
-/// Clamped to [1, 16].
-fn recovery_parallelism() -> usize {
-    std::env::var("AUTUMN_EXTENT_RECOVERY_PARALLELISM")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.clamp(1, 16))
-        .unwrap_or(2)
-}
+// F195: F194 env-reading helpers `ec_convert_parallelism()` and
+// `recovery_parallelism()` removed — values now live on
+// `ExtentNodeConfig.ec_convert_parallelism` / `.recovery_parallelism`,
+// set by the extent-node binary's CLI parser. The clamp([1, 16]) moved
+// to the `with_*` builder methods on ExtentNodeConfig.
 
 // ─── ExtentNode ───────────────────────────────────────────────────────────────
 
@@ -713,8 +730,12 @@ pub struct ExtentNode {
     /// paths (i.e. not counting the F119-D idempotent skip). Default 1.
     ec_convert_gate: Rc<ExtentNodeGate>,
     /// F194: per-shard cap on concurrent `run_recovery_task` heavy
-    /// paths. Default 2. See `recovery_parallelism()` doc for rationale.
+    /// paths. Default 2. See `ExtentNodeConfig::recovery_parallelism` for rationale.
     recovery_gate: Rc<ExtentNodeGate>,
+    /// F195 (was F099-I env `AUTUMN_EXTENT_INFLIGHT_CAP`): per-conn
+    /// FuturesUnordered cap. Read once at construction from
+    /// `ExtentNodeConfig.inflight_cap`; immutable after.
+    inflight_cap: usize,
 }
 
 impl Clone for ExtentNode {
@@ -732,6 +753,7 @@ impl Clone for ExtentNode {
             ec_conversion_locks: self.ec_conversion_locks.clone(),
             ec_convert_gate: self.ec_convert_gate.clone(),
             recovery_gate: self.recovery_gate.clone(),
+            inflight_cap: self.inflight_cap,
         }
     }
 }
@@ -933,16 +955,10 @@ fn spawn_read(
     .boxed_local()
 }
 
-/// Inflight cap — how many I/O futures `handle_connection` drives at once.
-/// Configurable via AUTUMN_EXTENT_INFLIGHT_CAP. Default 64 matches the
-/// client-side pipelining depth where extent_bench peaks.
-fn extent_inflight_cap() -> usize {
-    std::env::var("AUTUMN_EXTENT_INFLIGHT_CAP")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(64)
-}
+// F195: F099-I env-reading helper `extent_inflight_cap()` removed —
+// value now lives on `ExtentNodeConfig.inflight_cap`, set by the
+// extent-node binary's CLI parser. Default 64 matches the client-side
+// pipelining depth where extent_bench peaks.
 
 /// Decode all complete frames from `decoder`, group consecutive same-extent
 /// APPEND/READ frames, and push one I/O future per group onto `inflight`.
@@ -1518,8 +1534,11 @@ impl ExtentNode {
             shard_count: config.shard_count,
             sibling_addrs: Rc::new(config.sibling_addrs),
             ec_conversion_locks: Rc::new(RefCell::new(HashMap::new())),
-            ec_convert_gate: ExtentNodeGate::new(ec_convert_parallelism()),
-            recovery_gate: ExtentNodeGate::new(recovery_parallelism()),
+            // F195: parallelism comes from `ExtentNodeConfig`. CLI flag
+            // → builder → here. No env read.
+            ec_convert_gate: ExtentNodeGate::new(config.ec_convert_parallelism),
+            recovery_gate: ExtentNodeGate::new(config.recovery_parallelism),
+            inflight_cap: config.inflight_cap.max(1),
         };
 
         // Load existing extents from all disks.
@@ -2021,7 +2040,9 @@ impl ExtentNode {
         let (reader, mut writer) = conn.into_split();
         let mut decoder = FrameDecoder::new();
 
-        let cap = extent_inflight_cap();
+        // F195: per-conn inflight cap from `ExtentNodeConfig.inflight_cap`,
+        // set once at node construction. No env read.
+        let cap = node.inflight_cap;
         let mut inflight: FuturesUnordered<
             std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>>,
         > = FuturesUnordered::new();
@@ -4716,45 +4737,30 @@ mod f194_concurrency_gate_tests {
         assert_eq!(gate.max_parallel, 1, "0 must clamp to 1");
     }
 
-    /// Env parser smoke tests. Use `unsafe { std::env::set_var }` so
-    /// the test is hermetic; restore the prior value at the end.
+    /// F195: clamp test against the builder methods (replaces the
+    /// removed F194 env-parser smoke test). Process-global env mutation
+    /// removed — no more hostility to parallel test runs.
     #[test]
-    fn parallelism_env_parses_and_clamps() {
-        let saved_ec = std::env::var("AUTUMN_EXTENT_EC_CONVERT_PARALLELISM").ok();
-        let saved_rec = std::env::var("AUTUMN_EXTENT_RECOVERY_PARALLELISM").ok();
+    fn config_builder_clamps_parallelism() {
+        let cfg = ExtentNodeConfig::new(PathBuf::from("/tmp/x"), 1);
+        assert_eq!(cfg.ec_convert_parallelism, 1, "default ec=1");
+        assert_eq!(cfg.recovery_parallelism, 2, "default recovery=2");
+        assert_eq!(cfg.inflight_cap, 64, "default inflight=64");
 
-        // Defaults when unset.
-        std::env::remove_var("AUTUMN_EXTENT_EC_CONVERT_PARALLELISM");
-        std::env::remove_var("AUTUMN_EXTENT_RECOVERY_PARALLELISM");
-        assert_eq!(ec_convert_parallelism(), 1);
-        assert_eq!(recovery_parallelism(), 2);
+        let cfg = ExtentNodeConfig::new(PathBuf::from("/tmp/x"), 1)
+            .with_ec_convert_parallelism(9999)
+            .with_recovery_parallelism(0)
+            .with_inflight_cap(0);
+        assert_eq!(cfg.ec_convert_parallelism, 16, "9999 clamps to 16");
+        assert_eq!(cfg.recovery_parallelism, 1, "0 clamps to 1");
+        assert_eq!(cfg.inflight_cap, 64, "0 falls back to default 64");
 
-        // Valid override.
-        std::env::set_var("AUTUMN_EXTENT_EC_CONVERT_PARALLELISM", "4");
-        std::env::set_var("AUTUMN_EXTENT_RECOVERY_PARALLELISM", "8");
-        assert_eq!(ec_convert_parallelism(), 4);
-        assert_eq!(recovery_parallelism(), 8);
-
-        // Clamp upper.
-        std::env::set_var("AUTUMN_EXTENT_EC_CONVERT_PARALLELISM", "9999");
-        assert_eq!(ec_convert_parallelism(), 16);
-
-        // Clamp lower.
-        std::env::set_var("AUTUMN_EXTENT_EC_CONVERT_PARALLELISM", "0");
-        assert_eq!(ec_convert_parallelism(), 1);
-
-        // Non-numeric falls back to default.
-        std::env::set_var("AUTUMN_EXTENT_RECOVERY_PARALLELISM", "not-a-number");
-        assert_eq!(recovery_parallelism(), 2);
-
-        // Restore.
-        match saved_ec {
-            Some(v) => std::env::set_var("AUTUMN_EXTENT_EC_CONVERT_PARALLELISM", v),
-            None => std::env::remove_var("AUTUMN_EXTENT_EC_CONVERT_PARALLELISM"),
-        }
-        match saved_rec {
-            Some(v) => std::env::set_var("AUTUMN_EXTENT_RECOVERY_PARALLELISM", v),
-            None => std::env::remove_var("AUTUMN_EXTENT_RECOVERY_PARALLELISM"),
-        }
+        let cfg = ExtentNodeConfig::new(PathBuf::from("/tmp/x"), 1)
+            .with_ec_convert_parallelism(4)
+            .with_recovery_parallelism(8)
+            .with_inflight_cap(128);
+        assert_eq!(cfg.ec_convert_parallelism, 4);
+        assert_eq!(cfg.recovery_parallelism, 8);
+        assert_eq!(cfg.inflight_cap, 128);
     }
 }

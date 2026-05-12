@@ -378,8 +378,10 @@
   - Every library unit test that previously used `std::env::set_var` rewritten to construct the library with a custom config.
   - cluster.sh still launches a working cluster from operator-set `AUTUMN_*` envs (translated to per-binary `--<flag>`).
   - Workspace lib tests green across the migration.
-- **Status:** Wave 1 (manager) shipped this commit. Waves 2-5 follow in subsequent commits during this loop.
-- **passes:** partial — Wave 1 only.
+- **Status:** Waves 1-2 shipped. Waves 3-5 follow in subsequent commits during this loop.
+  - **Wave 1 (manager) — shipped commit `fbeb482`:** 2 vars (F192 quorum debounce knobs) moved to `AutumnManager.report_disk_failure_{window,quorum}` + `set_report_disk_failure_config` builder + manager-binary `--report-disk-failure-{window-secs,quorum}` flags.
+  - **Wave 2 (stream + extent-node binary) — shipped this commit:** 11 vars total. 6 in `client.rs` (BAD_NODES_TTL_SECS, INFLIGHT_CAP, APPEND_TIMEOUT_MS, READ_CHUNK_BYTES, SYNCED_POLL_MS, SYNCED_TIMEOUT_MS) → new `pub StreamClientConfig` struct + `with_*` builder methods + new `connect_with_config` / `new_with_revision_and_config` constructors (legacy ones unchanged via Default). 3 in `extent_node.rs` (F194 EC_CONVERT_PARALLELISM, RECOVERY_PARALLELISM, F099-I INFLIGHT_CAP) → fields on existing `pub ExtentNodeConfig` + 3 `with_*` builders. Removed the F194 `parallelism_env_parses_and_clamps` test (process-global env mutation, hostile to parallel test runs); replaced with builder-clamp test. Extent-node binary: 2 env reads removed (SHARDS + SHARD_STRIDE; cluster.sh already passes `--shards`/`--shard-stride` so no script change); 3 new CLI flags added (`--ec-convert-parallelism`, `--recovery-parallelism`, `--inflight-cap`).
+- **passes:** partial — Waves 1-2 complete (13/38 vars eliminated).
 
 ---
 

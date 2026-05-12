@@ -50,6 +50,14 @@ struct Args {
     /// `control_port + shard_idx * shard_stride`. Operators only need
     /// to override this when 1000 collides on a non-default deployment.
     control_port: Option<u16>,
+    /// F195 (was F194 env `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM`).
+    /// Default 1; clamped to [1, 16] by library.
+    ec_convert_parallelism: Option<usize>,
+    /// F195 (was F194 env `AUTUMN_EXTENT_RECOVERY_PARALLELISM`).
+    /// Default 2; clamped to [1, 16] by library.
+    recovery_parallelism: Option<usize>,
+    /// F195 (was env `AUTUMN_EXTENT_INFLIGHT_CAP`, F099-I). Default 64.
+    inflight_cap: Option<usize>,
 }
 
 fn parse_args() -> Args {
@@ -57,22 +65,20 @@ fn parse_args() -> Args {
     let mut data_dirs: Vec<PathBuf> = Vec::new();
     let mut disk_id: Option<u64> = None;
     let mut manager: Option<String> = None;
-    // Default shard count from AUTUMN_EXTENT_SHARDS env, else 1.
-    let mut shards: u32 = std::env::var("AUTUMN_EXTENT_SHARDS")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|v| *v >= 1)
-        .unwrap_or(1);
-    let mut shard_stride: u16 = std::env::var("AUTUMN_EXTENT_SHARD_STRIDE")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .filter(|v| *v >= 1)
-        .unwrap_or(10);
+    // F195: shard count + stride come from CLI flags (defaults 1 / 10).
+    // The AUTUMN_EXTENT_SHARDS / AUTUMN_EXTENT_SHARD_STRIDE env reads
+    // were removed; cluster.sh translates these to --shards / --shard-stride.
+    let mut shards: u32 = 1;
+    let mut shard_stride: u16 = 10;
     let mut bind_host = String::from("0.0.0.0");
     let mut transport = TransportKind::Tcp;
     let mut cpu_start: usize = 0;
     // F191: optional override; default = port + 1000.
     let mut control_port: Option<u16> = None;
+    // F195: F194 + F099-I knobs as Option<usize>; library defaults when None.
+    let mut ec_convert_parallelism: Option<usize> = None;
+    let mut recovery_parallelism: Option<usize> = None;
+    let mut inflight_cap: Option<usize> = None;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -129,6 +135,22 @@ fn parse_args() -> Args {
                 i += 1;
                 control_port = Some(args[i].parse().expect("--control-port must be a number"));
             }
+            "--ec-convert-parallelism" => {
+                i += 1;
+                ec_convert_parallelism = Some(
+                    args[i].parse().expect("--ec-convert-parallelism must be a number"),
+                );
+            }
+            "--recovery-parallelism" => {
+                i += 1;
+                recovery_parallelism = Some(
+                    args[i].parse().expect("--recovery-parallelism must be a number"),
+                );
+            }
+            "--inflight-cap" => {
+                i += 1;
+                inflight_cap = Some(args[i].parse().expect("--inflight-cap must be a number"));
+            }
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
@@ -149,7 +171,28 @@ fn parse_args() -> Args {
         transport,
         cpu_start,
         control_port,
+        ec_convert_parallelism,
+        recovery_parallelism,
+        inflight_cap,
     }
+}
+
+/// F195: helper — apply the F194 / F099-I CLI flags to an ExtentNodeConfig.
+/// `None` means "library default" and skips the builder call.
+fn apply_extent_tunables(
+    mut cfg: autumn_stream::ExtentNodeConfig,
+    args: &Args,
+) -> autumn_stream::ExtentNodeConfig {
+    if let Some(n) = args.ec_convert_parallelism {
+        cfg = cfg.with_ec_convert_parallelism(n);
+    }
+    if let Some(n) = args.recovery_parallelism {
+        cfg = cfg.with_recovery_parallelism(n);
+    }
+    if let Some(n) = args.inflight_cap {
+        cfg = cfg.with_inflight_cap(n);
+    }
+    cfg
 }
 
 fn main() -> Result<()> {
@@ -215,6 +258,10 @@ fn main() -> Result<()> {
         let cpu = autumn_common::pick_cpu_for_ord(shard_idx as usize);
 
         let control_listen_port = control_ports[shard_idx as usize];
+        // F195: capture F194 / F099-I tunable overrides for the thread.
+        let ec_par = args.ec_convert_parallelism;
+        let rec_par = args.recovery_parallelism;
+        let inflight = args.inflight_cap;
         let join = std::thread::Builder::new()
             .name(format!("extent-shard-{shard_idx}"))
             .spawn(move || -> Result<()> {
@@ -246,6 +293,16 @@ fn main() -> Result<()> {
                         cfg = cfg.with_manager_endpoint(mgr);
                     }
                     cfg = cfg.with_shard(shard_idx, shards, siblings);
+                    // F195: per-shard tunables.
+                    if let Some(n) = ec_par {
+                        cfg = cfg.with_ec_convert_parallelism(n);
+                    }
+                    if let Some(n) = rec_par {
+                        cfg = cfg.with_recovery_parallelism(n);
+                    }
+                    if let Some(n) = inflight {
+                        cfg = cfg.with_inflight_cap(n);
+                    }
 
                     tracing::info!(
                         shard_idx,
@@ -292,19 +349,21 @@ fn run_single_shard(args: Args) -> Result<()> {
             .context("parse control listen address")?;
 
         let config = if args.data_dirs.len() == 1 && args.disk_id.is_some() {
-            let data = args.data_dirs.into_iter().next().unwrap();
+            let data = args.data_dirs.iter().next().unwrap().clone();
             let mut c = ExtentNodeConfig::new(data, args.disk_id.unwrap());
-            if let Some(mgr) = args.manager {
+            if let Some(mgr) = args.manager.clone() {
                 c = c.with_manager_endpoint(mgr);
             }
             c
         } else {
-            let mut c = ExtentNodeConfig::new_multi(args.data_dirs);
-            if let Some(mgr) = args.manager {
+            let mut c = ExtentNodeConfig::new_multi(args.data_dirs.clone());
+            if let Some(mgr) = args.manager.clone() {
                 c = c.with_manager_endpoint(mgr);
             }
             c
         };
+        // F195: F194 / F099-I tunables.
+        let config = apply_extent_tunables(config, &args);
 
         tracing::info!(
             data_addr = %addr,
