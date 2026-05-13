@@ -97,6 +97,15 @@ Stage breakdown:
                  runs. perf_baseline_tcp_p16_d8_s4k 10s bench
                  unaffected (per-partition 27 MB/s never approaches
                  new caps).
+  F197:          background_flush_loop parallel via FuturesOrdered.
+                 Split flush_one_imm into run_flush_async_phase
+                 (concurrent-safe) + commit_flush_outcome (serial,
+                 F148-A invariant). Default cap=1 because 120s
+                 perf_check showed cap=4 doesn't help fg-saturated
+                 4K workloads (EN-side row_stream fsync is the wall,
+                 256 MB SST × 3-replica ≈ 3 s independent of P-log
+                 concurrency). Infrastructure preserved for future
+                 workload shifts; opt-in via --flush-inflight-cap.
 
 Stream crate (autumn-stream):
   Stage D-r7-en: Rename ExtentNodeGate → ConcurrencyController to

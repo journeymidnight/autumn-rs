@@ -65,6 +65,12 @@ const DEFAULT_MAX_WRITE_BATCH: usize = WRITE_CHANNEL_CAP * 3;
 static MAX_WRITE_BATCH_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static PS_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static PS_BULK_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// F197 — parallel-flush drain cap on P-log side. Sets how many imm
+/// entries `background_flush_loop` can have in flight concurrently
+/// (each doing build SST + upload row_stream + await response from
+/// P-bulk). Commit (`tables.push` + `meta_stream` save) is still
+/// strictly serial in launch order via `FuturesOrdered`.
+static PS_FLUSH_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MAX_IMM_DEPTH_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MAX_WAL_GAP_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 static SHUTDOWN_TIMEOUT_MS_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -96,6 +102,12 @@ pub fn set_ps_inflight_cap(n: usize) -> bool {
 }
 pub fn set_ps_bulk_inflight_cap(n: usize) -> bool {
     PS_BULK_INFLIGHT_CAP_CELL.set(n.clamp(1, 16)).is_ok()
+}
+/// F197: max concurrent in-flight imm flushes (parallel drain).
+/// Range [1, 64]; default = MAX_IMM_DEPTH so the imm queue can fully
+/// drain in parallel.
+pub fn set_ps_flush_inflight_cap(n: usize) -> bool {
+    PS_FLUSH_INFLIGHT_CAP_CELL.set(n.clamp(1, 64)).is_ok()
 }
 pub fn set_max_imm_depth(n: usize) -> bool {
     MAX_IMM_DEPTH_CELL.set(n.clamp(1, 64)).is_ok()
@@ -187,19 +199,40 @@ pub(crate) fn ps_inflight_cap() -> usize {
 /// `row_stream.append` is streaming. Range clamped to [1, 16]. F195:
 /// overridable via `set_ps_bulk_inflight_cap`.
 ///
-/// **Why bumping this doesn't speed up imm queue drain** (verified
-/// 2026-05-13 via 120s perf_check). `background_flush_loop` calls
-/// `flush_one_imm(part).await` in a tight loop; `flush_one_imm`
-/// internally sends ONE `FlushReq` to P-bulk and awaits the response
-/// before returning. So P-log never has more than 1 FlushReq in flight
-/// to P-bulk regardless of this cap. The cap only buys overlap when
-/// `do_compact` concurrently issues `RowAppendReq` on the same P-bulk
-/// — a path that fires rarely in fg-heavy workloads. To parallel-drain
-/// the imm queue would require redesigning `background_flush_loop` to
-/// issue multiple `flush_one_imm` concurrently with explicit ordering
-/// for the table-publish step (F148-A invariant).
+/// F197 (2026-05-13): `background_flush_loop` is now structurally
+/// parallel via `FuturesOrdered` and `ps_flush_inflight_cap()`. The
+/// parallel path defaults to cap=1 (serial behaviour) after 120 s
+/// perf_check showed cap=4 doesn't help fg-saturated 4K workloads
+/// — EN-side row_stream fsync is the wall, not P-log concurrency.
+/// Operators opting in to parallel flush via
+/// `--flush-inflight-cap N` should bump this knob to match so the
+/// P-bulk `FuturesUnordered` doesn't head-of-line block.
+/// Default returns to 2 (the long-standing R4 4.4 value).
 pub(crate) fn ps_bulk_inflight_cap() -> usize {
     *PS_BULK_INFLIGHT_CAP_CELL.get_or_init(|| 2)
+}
+
+/// F197 — parallel imm-flush drain cap on the P-log side.
+/// `background_flush_loop` uses `FuturesOrdered` with this cap; up to
+/// N imms can be building+uploading concurrently, then commit
+/// (`tables.push` / `imm.pop_front` / `save_table_locs_raw`) runs
+/// strictly serial in launch order — preserves F148-A invariant.
+/// Range clamped to [1, 64].
+///
+/// **Default = 1** (functionally equivalent to pre-F197 serial flow).
+/// The 120 s perf_check at p=16 d=8 4K showed bumping this to 4
+/// does NOT improve write p99 / throughput on the sustained-write
+/// pattern because the bottleneck is **EN-side row_stream fsync**,
+/// not P-log concurrency: 256 MB SST × 3-replica fsync ≈ 3 s
+/// regardless of how many SSTs are launched concurrently (writes
+/// to the same row_stream tail extent serialise at the extent file).
+///
+/// F197 still matters for *future* workloads where the bottleneck
+/// shifts — single-partition heavy churn (split-followup compaction),
+/// VP-heavy imm with small SST + big log_stream tail, short burst
+/// → drain. Operator can opt in via `--flush-inflight-cap N`.
+pub(crate) fn ps_flush_inflight_cap() -> usize {
+    *PS_FLUSH_INFLIGHT_CAP_CELL.get_or_init(|| 1)
 }
 
 /// F120-A — maximum imm queue depth per partition. When `imm.len()` reaches
@@ -4994,67 +5027,76 @@ pub(crate) fn maybe_rotate(part: &mut PartitionData) {
     }
 }
 
-pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
-    // Snapshot of what P-bulk needs + whether a bulk worker is wired up.
-    let (imm_mem, row_stream_id, meta_stream_id, log_stream_id, snap_vp_eid, snap_vp_off, req_tx, part_sc, invalidate_row) = {
+/// F197: outcome of `run_flush_async_phase` — the heavy build + upload
+/// is done, but `tables` / `imm.pop_front` / meta_stream checkpoint
+/// have NOT happened yet. Caller passes this to `commit_flush_outcome`
+/// in strict launch order.
+pub(crate) struct FlushOutcome {
+    pub new_meta: TableMeta,
+    pub reader: SstReader,
+    pub vp_eid: u64,
+    pub vp_off: u32,
+}
+
+/// F197: async / heavy phase of one imm flush. Safe to run concurrently
+/// for different imm entries (each captures its own `Arc<Memtable>`
+/// and `Arc<StreamClient>`). NO borrow_mut on `part` past the initial
+/// snapshot, so multiple concurrent calls are race-free against each
+/// other. NEVER `pop_front`s the imm queue — that's `commit_flush_outcome`'s
+/// job.
+pub(crate) async fn run_flush_async_phase(
+    part: Rc<RefCell<PartitionData>>,
+    imm_mem: Arc<Memtable>,
+) -> Result<FlushOutcome> {
+    let (row_stream_id, snap_vp_eid, snap_vp_off, req_tx_opt, part_sc, invalidate_row, meta_stream_id) = {
         let p = part.borrow();
-        let Some(imm_mem) = p.imm.front().cloned() else {
-            return Ok(false);
-        };
+        // need_invalidate_row_stream is fetch-and-clear semantics: the
+        // first concurrent flush takes it, later ones see false. That's
+        // correct — P-bulk only needs the invalidate signal once.
         let inv = p.need_invalidate_row_stream.replace(false);
         (
-            imm_mem,
             p.row_stream_id,
-            p.meta_stream_id,
-            p.log_stream_id,
             p.vp_extent_id,
             p.vp_offset,
             p.flush_req_tx.clone(),
             p.stream_client.clone(),
             inv,
+            p.meta_stream_id,
         )
     };
 
-    // F178 Phase 2: durability barrier moves from WRITE to FLUSH.
-    //
-    // F150 Phase B used to enforce durability via the rotation-trigger
-    // `must_sync=true` promotion in `start_write_batch` (background.rs);
-    // F178 Phase 2 dropped that promotion. The replacement: at FLUSH
-    // time we wait for quorum of log_stream replicas to have their
-    // per-extent fsync coalescer (Phase 1) advanced past the imm's
-    // VP head — which is exactly `(snap_vp_eid, snap_vp_off)`.
-    //
-    // Why this is sufficient (covers both new and pre-existing extents):
-    //   - For the LATEST log_stream extent the imm wrote to: the
-    //     coalescer is event-driven (no timer); the first waiter triggers
-    //     `sync_data` immediately and any append in flight rides along.
-    //     Typical wait ≈ one fsync syscall (~1 ms tmpfs / 5-15 ms NVMe).
-    //   - For OLDER log_stream extents the imm may also reference (rare
-    //     — only if rotation happened mid-imm): they are sealed by the
-    //     manager and `apply_extent_meta_durable` fsync'd them on the
-    //     0→sealed_length transition. The extent-node's
-    //     `handle_synced_length` returns `max(last_synced, sealed_length)`
-    //     so the older extent's wait is trivially satisfied.
-    //
-    // F148-A invariant survives: NO `.await` is introduced between the
-    // `borrow_mut` drop above and the `stream_client.append` mpsc send
-    // inside `save_table_locs_raw` BELOW (this `await_log_synced_to`
-    // sits BEFORE the `req_tx.send` and BEFORE
-    // `save_table_locs_raw`, neither of which is inside a `borrow_mut`
-    // block).
+    // F178 Phase 2 durability barrier — see flush_one_imm history comment.
     if snap_vp_off > 0 && snap_vp_eid != 0 {
         part_sc
             .await_log_synced_to(snap_vp_eid, snap_vp_off as u64)
             .await?;
     }
-    let _ = log_stream_id; // kept for future per-extent multi-VP barrier
 
-    let Some(mut req_tx) = req_tx else {
-        // P-bulk thread failed to spawn — fall back to in-thread flush so
-        // the partition keeps working (degraded performance, legacy path).
-        // Legacy path uses part_sc for row_stream; invalidation already
-        // happened on part_sc in handle_split_part.
-        return flush_one_imm_local(part, imm_mem, row_stream_id, meta_stream_id, snap_vp_eid, snap_vp_off).await;
+    let Some(mut req_tx) = req_tx_opt else {
+        // P-bulk not spawned — in-thread fallback (legacy single-flow,
+        // no parallelism). Build SST locally and return outcome.
+        let imm_clone = imm_mem.clone();
+        let (sst_bytes, last_seq) = compio::runtime::spawn_blocking(move || {
+            build_sst_bytes(&imm_clone, snap_vp_eid, snap_vp_off)
+        })
+        .await
+        .map_err(|_| anyhow!("SSTable build task failed"))?;
+        let result = part_sc.append(row_stream_id, &sst_bytes).await?;
+        let estimated_size = sst_bytes.len() as u64;
+        let reader = SstReader::from_bytes(Bytes::from(sst_bytes))?;
+        let _ = meta_stream_id;
+        return Ok(FlushOutcome {
+            new_meta: TableMeta {
+                extent_id: result.extent_id,
+                offset: result.offset,
+                len: result.end - result.offset,
+                estimated_size,
+                last_seq,
+            },
+            reader,
+            vp_eid: snap_vp_eid,
+            vp_off: snap_vp_off,
+        });
     };
 
     let (resp_tx, resp_rx) = oneshot::channel();
@@ -5074,94 +5116,64 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<b
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err(anyhow!("bulk thread dropped flush response")),
     };
+    Ok(FlushOutcome { new_meta, reader, vp_eid: snap_vp_eid, vp_off: snap_vp_off })
+}
 
-    let (tables_snapshot, vp_eid, vp_off) = {
-        // Atomic swap on P-log: push new table/reader, pop drained imm.
+/// F197: commit phase. Must be called in strict launch order (i.e. the
+/// outcome for imm at front of the queue) — handles the atomic swap
+/// (table-publish + imm.pop_front + meta_stream checkpoint). NEVER
+/// reordered with respect to other commits.
+///
+/// F148-A invariant: NO `.await` between the `borrow_mut` block and
+/// the `stream_client.append` mpsc-send inside `save_table_locs_raw`.
+/// `FuturesOrdered` in `background_flush_loop` guarantees the per-
+/// partition concurrent flushes commit in launch order, so commits
+/// from this function and from `do_compact` interleave at single-
+/// threaded P-log granularity — meta_stream record order = borrow_mut
+/// order, as before.
+pub(crate) async fn commit_flush_outcome(
+    part: &Rc<RefCell<PartitionData>>,
+    outcome: FlushOutcome,
+) -> Result<()> {
+    let (tables_snapshot, vp_eid, vp_off, part_sc, meta_stream_id) = {
         let mut p = part.borrow_mut();
-        p.tables.push(new_meta);
-        p.sst_readers.push(Arc::new(reader));
+        p.tables.push(outcome.new_meta);
+        p.sst_readers.push(Arc::new(outcome.reader));
         p.imm.pop_front();
-        // F120-A — wake `merged_partition_loop` if it's parked on imm-full.
+        // F120-A: wake merged_partition_loop on imm-full back-pressure.
         let _ = p.imm_drained_tx.unbounded_send(());
-
-        (p.tables.clone(), snap_vp_eid, snap_vp_off)
+        (
+            p.tables.clone(),
+            outcome.vp_eid,
+            outcome.vp_off,
+            p.stream_client.clone(),
+            p.meta_stream_id,
+        )
     };
-
-    // F148-A invariant — DO NOT introduce an `.await` between the
-    // borrow_mut drop above and the `stream_client.append` mpsc send
-    // inside `save_table_locs_raw` below. This call site relies on:
-    //   (1) compio P-log runtime is single-threaded;
-    //   (2) the borrow_mut block contains no .await;
-    //   (3) the path borrow_mut drop → rkyv_encode → stream_client.append
-    //       → mpsc send is purely synchronous, with the first await on
-    //       ack_rx (after the message is in the per-stream worker FIFO).
-    // Together (1)-(3) imply: `borrow_mut` order = mpsc-send order =
-    // meta_stream record order. The LATEST persisted record's
-    // `tables_snapshot` therefore necessarily reflects ALL prior
-    // borrow_mut mutations from this and any concurrent publisher
-    // (`do_compact`). A future refactor that inserts an `.await`
-    // between this comment and the mpsc send re-opens a stale-snapshot
-    // race against `do_compact` (background.rs:992-1003 holds the same
-    // invariant). Mirror in `do_compact` and `flush_one_imm_local`.
+    // F148-A: no `.await` between the borrow_mut drop above and the
+    // stream_client.append mpsc-send inside save_table_locs_raw.
     save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, vp_eid, vp_off).await?;
     sync_partition_vp_refs(part).await?;
-    Ok(true)
+    Ok(())
 }
 
-/// Legacy in-thread flush. Only used when the P-bulk thread fails to spawn.
-/// Keeps the old flush_one_imm behavior so a partition remains functional in
-/// that degraded mode.
-async fn flush_one_imm_local(
-    part: &Rc<RefCell<PartitionData>>,
-    imm_mem: Arc<Memtable>,
-    row_stream_id: u64,
-    meta_stream_id: u64,
-    snap_vp_eid: u64,
-    snap_vp_off: u32,
-) -> Result<bool> {
-    let part_sc = part.borrow().stream_client.clone();
-    // F178 Phase 2: same flush-time durability wait as the P-bulk path
-    // in `flush_one_imm`. See that comment for rationale.
-    if snap_vp_off > 0 && snap_vp_eid != 0 {
-        part_sc
-            .await_log_synced_to(snap_vp_eid, snap_vp_off as u64)
-            .await?;
-    }
-    let imm_clone = imm_mem.clone();
-    let (sst_bytes, last_seq) = compio::runtime::spawn_blocking(move || {
-        build_sst_bytes(&imm_clone, snap_vp_eid, snap_vp_off)
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("SSTable build task failed"))?;
-    let result = part_sc.append(row_stream_id, &sst_bytes).await?;
-
-    let estimated_size = sst_bytes.len() as u64;
-    let reader = Arc::new(SstReader::from_bytes(Bytes::from(sst_bytes))?);
-
-    let tables_snapshot = {
-        let mut p = part.borrow_mut();
-        p.tables.push(TableMeta {
-            extent_id: result.extent_id,
-            offset: result.offset,
-            len: result.end - result.offset,
-            estimated_size,
-            last_seq,
-        });
-        p.sst_readers.push(reader);
-        p.imm.pop_front();
-        // F120-A — wake merged_partition_loop on imm-full back-pressure.
-        let _ = p.imm_drained_tx.unbounded_send(());
-
-        p.tables.clone()
+/// Single-imm flush (legacy back-compat for `flush_memtable_locked`,
+/// `handle_split_part`, and test helpers). After F197, this is just
+/// `run_flush_async_phase` + `commit_flush_outcome` composed; the
+/// background loop bypasses this and runs the two phases concurrently.
+pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
+    let imm_mem = match part.borrow().imm.front().cloned() {
+        Some(m) => m,
+        None => return Ok(false),
     };
-
-    // F148-A invariant — see flush_one_imm above for the full statement.
-    // No `.await` may be introduced between the borrow_mut drop and the
-    // mpsc send inside `save_table_locs_raw`.
-    save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, snap_vp_eid, snap_vp_off).await?;
-    sync_partition_vp_refs(part).await?;
+    let outcome = run_flush_async_phase(part.clone(), imm_mem).await?;
+    commit_flush_outcome(part, outcome).await?;
     Ok(true)
 }
+
+// F197 removed `flush_one_imm_local` — the in-thread fallback now
+// lives inline in `run_flush_async_phase` (the `req_tx_opt == None`
+// branch).
 
 pub(crate) async fn flush_memtable_locked(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
     {
@@ -5183,19 +5195,79 @@ pub(crate) async fn flush_memtable_locked(part: &Rc<RefCell<PartitionData>>) -> 
 // Background loops
 // ---------------------------------------------------------------------------
 
+/// F197: parallel imm-flush drain.
+///
+/// `FuturesOrdered` drives up to `ps_flush_inflight_cap()` concurrent
+/// `run_flush_async_phase` futures. Each future captures one imm
+/// (`Arc<Memtable>` clone) at launch time; completions are pulled in
+/// strict launch order, then `commit_flush_outcome` runs serially
+/// (preserves F148-A invariant: borrow_mut order = mpsc-send order
+/// = meta_stream record order).
+///
+/// Why FuturesOrdered: matches the "concurrent build/upload, serial
+/// commit" semantics exactly without any reorder buffer or seq
+/// tagging — `.next()` yields in push order while all in-flight
+/// futures still make progress in parallel.
+///
+/// Error policy: fail-stop. If any in-flight async phase OR any
+/// commit returns Err, drain the remaining inflight (so they don't
+/// dangle) and break. The next `flush_rx` signal restarts the loop
+/// — same retry behaviour as pre-F197.
 async fn background_flush_loop(
     part: Rc<RefCell<PartitionData>>,
     mut flush_rx: mpsc::UnboundedReceiver<()>,
 ) {
+    use futures::stream::FuturesOrdered;
+    use futures::future::FutureExt;
+    type FlushFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<FlushOutcome>>>>;
+
+    let cap = ps_flush_inflight_cap();
+
     while flush_rx.next().await.is_some() {
+        let mut inflight: FuturesOrdered<FlushFuture> = FuturesOrdered::new();
+        let mut failed = false;
         loop {
-            match flush_one_imm(&part).await {
-                Ok(true) => continue,
-                Ok(false) => break,
-                Err(e) => {
-                    tracing::error!("background flush error: {e}");
-                    break;
+            // (A) Launch up to `cap` concurrent flushes. The next imm to
+            // launch sits at `imm[inflight.len()]` because commit pops
+            // front strictly in order, so the queue tracks 1:1 with
+            // in-flight + remaining unlaunched.
+            while !failed && inflight.len() < cap {
+                let imm_at_idx = {
+                    let p = part.borrow();
+                    p.imm.get(inflight.len()).cloned()
+                };
+                match imm_at_idx {
+                    Some(imm) => {
+                        let part_c = part.clone();
+                        inflight.push_back(
+                            run_flush_async_phase(part_c, imm).boxed_local(),
+                        );
+                    }
+                    None => break,
                 }
+            }
+            if inflight.is_empty() {
+                break;
+            }
+
+            // (B) Pull next in launch order; commit (or fail-stop drain).
+            match inflight.next().await {
+                Some(Ok(outcome)) => {
+                    if failed {
+                        // Drop the outcome (already partway through drain).
+                        continue;
+                    }
+                    if let Err(e) = commit_flush_outcome(&part, outcome).await {
+                        tracing::error!("background flush commit error: {e}");
+                        failed = true;
+                    }
+                }
+                Some(Err(e)) => {
+                    tracing::error!("background flush async-phase error: {e}");
+                    failed = true;
+                }
+                None => break,
             }
         }
     }

@@ -33,6 +33,7 @@ struct Args {
     group_commit_cap: Option<usize>,
     ps_inflight_cap: Option<usize>,
     ps_bulk_inflight_cap: Option<usize>,
+    ps_flush_inflight_cap: Option<usize>,
     max_imm_depth: Option<usize>,
     max_wal_gap: Option<u64>,
     shutdown_timeout_ms: Option<u64>,
@@ -76,6 +77,7 @@ fn parse_args() -> Args {
     let mut group_commit_cap: Option<usize> = None;
     let mut ps_inflight_cap: Option<usize> = None;
     let mut ps_bulk_inflight_cap: Option<usize> = None;
+    let mut ps_flush_inflight_cap: Option<usize> = None;
     let mut max_imm_depth: Option<usize> = None;
     let mut max_wal_gap: Option<u64> = None;
     let mut shutdown_timeout_ms: Option<u64> = None;
@@ -173,6 +175,11 @@ fn parse_args() -> Args {
             "--ps-bulk-inflight-cap" => {
                 i += 1;
                 ps_bulk_inflight_cap = Some(args[i].parse().expect("--ps-bulk-inflight-cap usize"));
+            }
+            "--flush-inflight-cap" => {
+                i += 1;
+                ps_flush_inflight_cap =
+                    Some(args[i].parse().expect("--flush-inflight-cap usize"));
             }
             "--max-imm-depth" => {
                 i += 1;
@@ -345,6 +352,7 @@ fn parse_args() -> Args {
         group_commit_cap,
         ps_inflight_cap,
         ps_bulk_inflight_cap,
+        ps_flush_inflight_cap,
         max_imm_depth,
         max_wal_gap,
         shutdown_timeout_ms,
@@ -388,6 +396,9 @@ fn apply_ps_tunables(args: &Args) {
     }
     if let Some(n) = args.ps_bulk_inflight_cap {
         ps::set_ps_bulk_inflight_cap(n);
+    }
+    if let Some(n) = args.ps_flush_inflight_cap {
+        ps::set_ps_flush_inflight_cap(n);
     }
     if let Some(n) = args.max_imm_depth {
         ps::set_max_imm_depth(n);

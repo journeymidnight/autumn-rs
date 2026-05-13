@@ -337,6 +337,9 @@ launch_ps() {
     if [[ -n "${AUTUMN_PS_INFLIGHT_CAP:-}" ]]; then
         tunable_args+=(--ps-inflight-cap "$AUTUMN_PS_INFLIGHT_CAP")
     fi
+    if [[ -n "${AUTUMN_PS_FLUSH_INFLIGHT_CAP:-}" ]]; then
+        tunable_args+=(--flush-inflight-cap "$AUTUMN_PS_FLUSH_INFLIGHT_CAP")
+    fi
     if [[ -n "${AUTUMN_PS_BULK_INFLIGHT_CAP:-}" ]]; then
         tunable_args+=(--ps-bulk-inflight-cap "$AUTUMN_PS_BULK_INFLIGHT_CAP")
     fi
