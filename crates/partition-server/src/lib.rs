@@ -186,6 +186,18 @@ pub(crate) fn ps_inflight_cap() -> usize {
 /// flush start its `build_sst_bytes` while the previous one's 128 MB
 /// `row_stream.append` is streaming. Range clamped to [1, 16]. F195:
 /// overridable via `set_ps_bulk_inflight_cap`.
+///
+/// **Why bumping this doesn't speed up imm queue drain** (verified
+/// 2026-05-13 via 120s perf_check). `background_flush_loop` calls
+/// `flush_one_imm(part).await` in a tight loop; `flush_one_imm`
+/// internally sends ONE `FlushReq` to P-bulk and awaits the response
+/// before returning. So P-log never has more than 1 FlushReq in flight
+/// to P-bulk regardless of this cap. The cap only buys overlap when
+/// `do_compact` concurrently issues `RowAppendReq` on the same P-bulk
+/// — a path that fires rarely in fg-heavy workloads. To parallel-drain
+/// the imm queue would require redesigning `background_flush_loop` to
+/// issue multiple `flush_one_imm` concurrently with explicit ordering
+/// for the table-publish step (F148-A invariant).
 pub(crate) fn ps_bulk_inflight_cap() -> usize {
     *PS_BULK_INFLIGHT_CAP_CELL.get_or_init(|| 2)
 }
