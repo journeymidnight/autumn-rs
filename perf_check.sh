@@ -313,7 +313,11 @@ start_cluster_for() {
         if [[ -z "$ps_parts_hint_for_bench" ]] && (( parts > 8 )); then
             ps_parts_hint_for_bench="$parts"
         fi
-        AUTUMN_EXTENT_SHARDS="${AUTUMN_EXTENT_SHARDS:-4}" \
+        # F197-followup (2026-05-13): bumped 4 → 8 after 120 s test
+        # showed SHARDS=8 gives read +9 % / read-p99 −11 % at no
+        # write cost (write is fsync-bound, the row_stream tail extent
+        # serialises on its single shard regardless of total shard count).
+        AUTUMN_EXTENT_SHARDS="${AUTUMN_EXTENT_SHARDS:-8}" \
         AUTUMN_PS_PARTS_HINT="${ps_parts_hint_for_bench:-8}" \
         AUTUMN_TRANSPORT="$mode" bash "$SCRIPT_DIR/cluster.sh" start 3 \
             "${cluster_3disk[@]}" \
