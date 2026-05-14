@@ -136,9 +136,13 @@ impl AutumnManager {
 
     async fn try_delete_one(&self, addr: &str, extent_id: u64) -> bool {
         let payload = rkyv_encode(&ExtDeleteExtentReq { extent_id });
+        // 10 s — DELETE_EXTENT is a single fs::remove pair on EN.
+        // Bounded so the per-2 s sweep loop doesn't get stuck behind
+        // one paged-out EN; the failed delete just gets retried on
+        // the next sweep (already up to 60 retries).
         let resp = match self
             .conn_pool
-            .call(addr, EXT_MSG_DELETE_EXTENT, payload)
+            .call_timeout(addr, EXT_MSG_DELETE_EXTENT, payload, Duration::from_secs(10))
             .await
         {
             Ok(v) => v,

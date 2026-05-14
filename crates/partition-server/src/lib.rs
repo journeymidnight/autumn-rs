@@ -2062,7 +2062,13 @@ impl PartitionServer {
         });
         let mut last_err = None;
         for (idx, addr) in mgr_addrs.iter().enumerate() {
-            match pool.call(addr, manager_rpc::MSG_ACQUIRE_OWNER_LOCK, req.clone()).await {
+            // 10 s — owner-lock acquisition is one etcd CAS on
+            // manager. Bounded so a hanging manager doesn't block
+            // PS startup; the loop walks to the next address.
+            match pool
+                .call_timeout(addr, manager_rpc::MSG_ACQUIRE_OWNER_LOCK, req.clone(), Duration::from_secs(10))
+                .await
+            {
                 Ok(resp_data) => {
                     let resp: manager_rpc::AcquireOwnerLockResp =
                         manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -2165,9 +2171,12 @@ impl PartitionServer {
             ps_id: self.ps_id,
             address,
         });
+        // 10 s — register_ps is one in-memory insert + etcd mirror on
+        // manager. Bounded so PS startup doesn't trap waiting for a
+        // hung manager.
         let resp_data = self
             .pool
-            .call(self.manager_addr(), manager_rpc::MSG_REGISTER_PS, req)
+            .call_timeout(self.manager_addr(), manager_rpc::MSG_REGISTER_PS, req, Duration::from_secs(10))
             .await
             .context("register ps")?;
         let resp: manager_rpc::CodeResp =
@@ -2187,7 +2196,15 @@ impl PartitionServer {
         loop {
             ticker.tick().await;
             let req = manager_rpc::rkyv_encode(&manager_rpc::HeartbeatPsReq { ps_id: self.ps_id });
-            match self.pool.call(self.manager_addr(), manager_rpc::MSG_HEARTBEAT_PS, req).await {
+            // 5 s — heartbeat is fired every 2 s; we tolerate up to 5
+            // consecutive failures (~10 s) before exiting. A 5 s
+            // ceiling keeps each tick tight; a missed beat shows up
+            // as Err and feeds the failure counter.
+            match self
+                .pool
+                .call_timeout(self.manager_addr(), manager_rpc::MSG_HEARTBEAT_PS, req, Duration::from_secs(5))
+                .await
+            {
                 Ok(resp_data) => {
                     consecutive_failures = 0;
                     let code = manager_rpc::rkyv_decode::<manager_rpc::CodeResp>(&resp_data)
@@ -2290,9 +2307,13 @@ impl PartitionServer {
                 ps_id: self.ps_id,
                 partitions: snapshots,
             });
+            // 10 s — telemetry report fired every 30 s. Bounded so a
+            // hung manager doesn't keep the report task alive past
+            // the next interval; missed report is benign (manager
+            // policy degrades gracefully on stale data).
             if let Err(e) = self
                 .pool
-                .call(self.manager_addr(), manager_rpc::MSG_REPORT_PARTITION_LOAD, req)
+                .call_timeout(self.manager_addr(), manager_rpc::MSG_REPORT_PARTITION_LOAD, req, Duration::from_secs(10))
                 .await
             {
                 tracing::debug!("F183 report_load failed: {e}");
@@ -2505,9 +2526,11 @@ impl PartitionServer {
     }
 
     pub async fn sync_regions_once(&self) -> Result<()> {
+        // 10 s — read-only manager call. Bounded so the periodic
+        // 2 s region_sync_loop doesn't pile up on a hung manager.
         let resp_data = self
             .pool
-            .call(self.manager_addr(), manager_rpc::MSG_GET_REGIONS, Bytes::new())
+            .call_timeout(self.manager_addr(), manager_rpc::MSG_GET_REGIONS, Bytes::new(), Duration::from_secs(10))
             .await
             .context("get regions")?;
         let resp: manager_rpc::GetRegionsResp =
@@ -3745,8 +3768,10 @@ async fn partition_thread_main(
                 continue;
             }
             let mgr_norm = autumn_stream::conn_pool::normalize_endpoint(mgr);
+            // 10 s — manager updates `part_addrs` (in-memory + etcd
+            // mirror). Bounded so partition open doesn't trap.
             match pool
-                .call(&mgr_norm, manager_rpc::MSG_REGISTER_PARTITION_ADDR, req.clone())
+                .call_timeout(&mgr_norm, manager_rpc::MSG_REGISTER_PARTITION_ADDR, req.clone(), Duration::from_secs(10))
                 .await
             {
                 Ok(bytes) => {
@@ -4961,8 +4986,13 @@ pub(crate) async fn sync_partition_vp_refs(part: &Rc<RefCell<PartitionData>>) ->
             continue;
         }
         let mgr_norm = autumn_stream::conn_pool::normalize_endpoint(mgr);
+        // 30 s — manager replaces the partition's full vp-ref
+        // snapshot (in-memory + etcd mirror) and diffs it to adjust
+        // every touched extent's `vp_table_refs`. Payload scales
+        // with live SST count; bounded so a hung manager doesn't
+        // block the flush/compact follow-up indefinitely.
         match pool
-            .call(&mgr_norm, manager_rpc::MSG_SYNC_PARTITION_VP_REFS, req.clone())
+            .call_timeout(&mgr_norm, manager_rpc::MSG_SYNC_PARTITION_VP_REFS, req.clone(), Duration::from_secs(30))
             .await
         {
             Ok(bytes) => match manager_rpc::rkyv_decode::<manager_rpc::SyncPartitionVpRefsResp>(&bytes) {

@@ -489,9 +489,11 @@ async fn failure_report_drain_loop(
         // a meaningful response payload (CODE_OK CodeResp), and a
         // dropped report is benign — F190's per-stream alloc route-
         // around handles the per-call need.
+        // 5 s — fire-and-forget telemetry; bounded so a slow manager
+        // doesn't keep this background task alive past a coarse SLO.
         if let Err(e) = sc
             .pool
-            .call(&addr, manager_rpc::MSG_REPORT_DISK_FAILURE, req)
+            .call_timeout(&addr, manager_rpc::MSG_REPORT_DISK_FAILURE, req, Duration::from_secs(5))
             .await
         {
             tracing::trace!(
@@ -1029,7 +1031,14 @@ impl StreamClient {
         let mut revision = 0i64;
         let mut ok = false;
         for (idx, addr) in mgr_addrs.iter().enumerate() {
-            match pool.call(addr, MSG_ACQUIRE_OWNER_LOCK, req.clone()).await {
+            // 10 s — owner-lock acquisition is one etcd CAS on the
+            // manager side. Bounded so a deposed/hanging manager
+            // doesn't trap a fresh PS startup; the loop walks to the
+            // next manager address on timeout.
+            match pool
+                .call_timeout(addr, MSG_ACQUIRE_OWNER_LOCK, req.clone(), Duration::from_secs(10))
+                .await
+            {
                 Ok(resp_data) => {
                     let resp: AcquireOwnerLockResp =
                         manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -1182,9 +1191,10 @@ impl StreamClient {
     }
 
     async fn refresh_nodes_map(&self) -> Result<()> {
+        // 5 s — read-only manager call, all in-memory state.
         let resp_data = self
             .pool
-            .call(self.manager_addr(), MSG_NODES_INFO, Bytes::new())
+            .call_timeout(self.manager_addr(), MSG_NODES_INFO, Bytes::new(), Duration::from_secs(5))
             .await?;
         let resp: NodesInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -1324,9 +1334,10 @@ impl StreamClient {
         let req = manager_rpc::rkyv_encode(&StreamInfoReq {
             stream_ids: vec![stream_id],
         });
+        // 5 s — read-only manager call, in-memory state.
         let resp_data = self
             .pool
-            .call(self.manager_addr(), MSG_STREAM_INFO, req)
+            .call_timeout(self.manager_addr(), MSG_STREAM_INFO, req, Duration::from_secs(5))
             .await?;
         let resp: StreamInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -1380,9 +1391,12 @@ impl StreamClient {
             owner_key: self.owner_key.clone(),
             revision: self.revision,
         });
+        // 15 s — manager fans out commit_length probes to every
+        // replica of the tail extent before responding; each replica
+        // call is itself bounded but the aggregate can take a few s.
         let resp_data = self
             .pool
-            .call(self.manager_addr(), MSG_CHECK_COMMIT_LENGTH, req)
+            .call_timeout(self.manager_addr(), MSG_CHECK_COMMIT_LENGTH, req, Duration::from_secs(15))
             .await?;
         let resp: CheckCommitLengthResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -1413,9 +1427,12 @@ impl StreamClient {
             end,
             exclude_node_ids,
         });
+        // 30 s — manager seals current tail (3-replica commit_length
+        // probe + etcd mirror) and allocs a fresh extent on each new
+        // replica node (alloc_extent_on_node bounded at 10 s each).
         let resp_data = self
             .pool
-            .call(self.manager_addr(), MSG_STREAM_ALLOC_EXTENT, req)
+            .call_timeout(self.manager_addr(), MSG_STREAM_ALLOC_EXTENT, req, Duration::from_secs(30))
             .await?;
         let resp: StreamAllocExtentResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -1728,7 +1745,14 @@ impl StreamClient {
                 extent_id: tail.extent.extent_id,
                 revision,
             };
-            let result = self.pool.call(addr, MSG_COMMIT_LENGTH, req.encode()).await;
+            // 5 s — commit_length is a tiny in-memory probe on EN.
+            // Per-replica timeout: a paged-out replica counts as a
+            // miss for the quorum tally rather than wedging the
+            // whole call.
+            let result = self
+                .pool
+                .call_timeout(addr, MSG_COMMIT_LENGTH, req.encode(), Duration::from_secs(5))
+                .await;
             let Ok(resp_bytes) = result else {
                 continue;
             };
@@ -1837,7 +1861,13 @@ impl StreamClient {
         extent_id: u64,
     ) -> Result<Option<u64>> {
         let req = SyncedLengthReq { extent_id };
-        let resp_bytes = self.pool.call(addr, MSG_SYNCED_LENGTH, req.encode()).await?;
+        // 5 s — atomic load of `entry.coalescer.last_synced` on EN.
+        // Quorum-aware caller (`await_log_synced_to`) tolerates per-
+        // replica failure, so the bound is generous.
+        let resp_bytes = self
+            .pool
+            .call_timeout(addr, MSG_SYNCED_LENGTH, req.encode(), Duration::from_secs(5))
+            .await?;
         let resp = SyncedLengthResp::decode(resp_bytes)
             .map_err(|e| anyhow!("synced_length decode: {e}"))?;
         if resp.code == CODE_OK {
@@ -1933,9 +1963,11 @@ impl StreamClient {
             revision: self.revision,
             extent_ids,
         });
+        // 30 s — manager updates extent refs + may schedule
+        // pending_extent_deletes; etcd mirror inside.
         let resp_data = self
             .pool
-            .call(self.manager_addr(), MSG_STREAM_PUNCH_HOLES, req)
+            .call_timeout(self.manager_addr(), MSG_STREAM_PUNCH_HOLES, req, Duration::from_secs(30))
             .await?;
         let resp: PunchHolesResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -1954,9 +1986,10 @@ impl StreamClient {
             revision: self.revision,
             extent_id,
         });
+        // 30 s — same shape as punch_holes; ref updates + etcd mirror.
         let resp_data = self
             .pool
-            .call(self.manager_addr(), MSG_TRUNCATE, req)
+            .call_timeout(self.manager_addr(), MSG_TRUNCATE, req, Duration::from_secs(30))
             .await?;
         let resp: TruncateResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -1972,9 +2005,10 @@ impl StreamClient {
         let req = manager_rpc::rkyv_encode(&StreamInfoReq {
             stream_ids: vec![stream_id],
         });
+        // 5 s — read-only manager call.
         let resp_data = self
             .pool
-            .call(self.manager_addr(), MSG_STREAM_INFO, req)
+            .call_timeout(self.manager_addr(), MSG_STREAM_INFO, req, Duration::from_secs(5))
             .await?;
         let resp: StreamInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -1998,9 +2032,11 @@ impl StreamClient {
             return Ok(ex.clone());
         }
         let req = manager_rpc::rkyv_encode(&ExtentInfoReq { extent_id });
+        // 5 s — read-only manager call. Hot in the EC stale-cache
+        // refetch path; bounded so that path doesn't wedge.
         let resp_data = self
             .pool
-            .call(self.manager_addr(), MSG_EXTENT_INFO, req)
+            .call_timeout(self.manager_addr(), MSG_EXTENT_INFO, req, Duration::from_secs(5))
             .await?;
         let resp: ExtentInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -2192,7 +2228,12 @@ impl StreamClient {
                 extent_id: ex.extent_id,
                 revision,
             };
-            let Ok(resp_bytes) = self.pool.call(addr, MSG_COMMIT_LENGTH, req.encode()).await
+            // 5 s — same shape as `current_commit` above; per-replica
+            // miss is tolerated by the quorum tally below.
+            let Ok(resp_bytes) = self
+                .pool
+                .call_timeout(addr, MSG_COMMIT_LENGTH, req.encode(), Duration::from_secs(5))
+                .await
             else {
                 continue;
             };
@@ -2475,7 +2516,18 @@ impl StreamClient {
                     offset: 0,
                     length: 0,
                 };
-                let result: Result<(Vec<u8>, u32)> = match pool.call(&addr, MSG_READ_BYTES, req.encode()).await {
+                // 5 s per shard — without this, a paged-out / dead EN
+                // can keep its spawned task alive forever, and since
+                // the outer `while rx.next().await` only exits when
+                // either `success >= data_shards` OR all senders
+                // drop, two slow shards in a K=3 EC layout would
+                // wedge `ec_read_full` indefinitely. Observed in
+                // production as 162 s VP-resolve latency on a single
+                // Get when one EN was paged out by macOS.
+                let result: Result<(Vec<u8>, u32)> = match pool
+                    .call_timeout(&addr, MSG_READ_BYTES, req.encode(), Duration::from_secs(5))
+                    .await
+                {
                     Ok(resp_bytes) => match ReadBytesResp::decode(resp_bytes) {
                         Ok(resp) if resp.code == CODE_OK => Ok((resp.payload.to_vec(), resp.end)),
                         Ok(resp) if resp.code == CODE_EVERSION_MISMATCH => {
@@ -2569,9 +2621,13 @@ impl StreamClient {
             row_stream_sealed_length: sealed_lengths[1] as u32,
             meta_stream_sealed_length: sealed_lengths[2] as u32,
         });
+        // 30 s — manager runs the split's atomic etcd txn (alloc 4
+        // ids + duplicate 3 streams + create new partition + update
+        // regions + sidecar last_op_at). Generous bound; the PS
+        // caller already has its own retry loop on top.
         let resp_data = self
             .pool
-            .call(self.manager_addr(), MSG_MULTI_MODIFY_SPLIT, req)
+            .call_timeout(self.manager_addr(), MSG_MULTI_MODIFY_SPLIT, req, Duration::from_secs(30))
             .await?;
         let resp: CodeResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;

@@ -2162,11 +2162,15 @@ impl AutumnManager {
             async move {
                 let req = autumn_rpc::partition_rpc::MergeFreezeReq { part_id, freeze };
                 let payload = autumn_rpc::partition_rpc::rkyv_encode(&req);
+                // 30 s — MERGE_FREEZE drains pending+inflight on PS,
+                // flushes every imm, halts new writes. Real work, but
+                // bounded to avoid manager wedging on a dead PS.
                 let resp_bytes = pool
-                    .call(
+                    .call_timeout(
                         &addr,
                         autumn_rpc::partition_rpc::MSG_MERGE_FREEZE,
                         payload,
+                        Duration::from_secs(30),
                     )
                     .await
                     .map_err(|e| AppError::Internal(format!("freeze rpc to {addr}: {e}")))?;
@@ -2191,11 +2195,14 @@ impl AutumnManager {
                 let unfreeze =
                     autumn_rpc::partition_rpc::MergeFreezeReq { part_id: pid, freeze: false };
                 let payload = autumn_rpc::partition_rpc::rkyv_encode(&unfreeze);
+                // 10 s — best-effort rollback unfreeze; PS may already
+                // be torn down. Don't wedge the rollback path either.
                 let _ = pool
-                    .call(
+                    .call_timeout(
                         &addr,
                         autumn_rpc::partition_rpc::MSG_MERGE_FREEZE,
                         payload,
+                        Duration::from_secs(10),
                     )
                     .await;
             }

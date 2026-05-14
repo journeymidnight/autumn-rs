@@ -88,9 +88,13 @@ impl AutumnManager {
             };
 
             let payload = rkyv_encode(&ExtRequireRecoveryReq { task: task.clone() });
+            // 30 s ceiling — REQUIRE_RECOVERY only kicks off the
+            // background `run_recovery_task` on the EN; the EN returns
+            // OK immediately. A paged-out / dead EN otherwise wedges
+            // this loop and starves recovery of all other extents.
             let resp = match self
                 .conn_pool
-                .call(&addr, EXT_MSG_REQUIRE_RECOVERY, payload)
+                .call_timeout(&addr, EXT_MSG_REQUIRE_RECOVERY, payload, Duration::from_secs(30))
                 .await
             {
                 Ok(v) => v,
@@ -345,9 +349,13 @@ impl AutumnManager {
                                 extent_id: ex.extent_id,
                                 eversion: ex.eversion,
                             });
+                            // 30 s — RE_AVALI may copy the full extent
+                            // from peers if local data lags
+                            // sealed_length, so allow real work; cap to
+                            // prevent paged-out-EN wedge.
                             if let Ok(resp) = self
                                 .conn_pool
-                                .call(&addr, EXT_MSG_RE_AVALI, payload)
+                                .call_timeout(&addr, EXT_MSG_RE_AVALI, payload, Duration::from_secs(30))
                                 .await
                             {
                                 if let Ok(r) = rkyv_decode::<ExtCodeResp>(&resp) {
@@ -796,9 +804,20 @@ impl AutumnManager {
                     eversion: new_eversion,
                 });
 
+                // 60 s ceiling so a paged-out / silently dead EN doesn't
+                // wedge the dispatch loop indefinitely. The convert path
+                // itself can take seconds (RS-encode of multi-GiB extents
+                // + 3-replica WriteShard fanout + commit-rename), so the
+                // bound is generous; the goal is only to bound the
+                // pathological case (TCP keepalive timer is hours).
                 let result = self
                     .conn_pool
-                    .call(&coordinator_addr, EXT_MSG_CONVERT_TO_EC, payload)
+                    .call_timeout(
+                        &coordinator_addr,
+                        EXT_MSG_CONVERT_TO_EC,
+                        payload,
+                        Duration::from_secs(60),
+                    )
                     .await;
 
                 // F138: keep the extent in ec_conversion_inflight until AFTER
@@ -816,7 +835,12 @@ impl AutumnManager {
                             );
                             false
                         }
-                        Err(_) => false,
+                        Err(e) => {
+                            tracing::warn!(
+                                "EC conversion: failed to decode response for extent {extent_id}: {e}"
+                            );
+                            false
+                        }
                     },
                     Err(e) => {
                         tracing::warn!("EC conversion failed for extent {extent_id}: {e}");

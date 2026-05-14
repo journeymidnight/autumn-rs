@@ -383,8 +383,11 @@ pub(crate) async fn handle_split_part(
     // rg can yield a key outside the manager's narrowed range, which
     // multi_modify_split then rejects.
     let auth_rg: Range = {
+        // 10 s — read-only manager call. Fetches authoritative range
+        // for the F103 stale-rg fix. Bounded so split doesn't wedge
+        // on a hung manager.
         let resp_bytes = pool
-            .call(manager_addr, manager_rpc::MSG_GET_REGIONS, Bytes::new())
+            .call_timeout(manager_addr, manager_rpc::MSG_GET_REGIONS, Bytes::new(), Duration::from_secs(10))
             .await
             .map_err(|e| (StatusCode::Internal, format!("get_regions: {e}")))?;
         let resp: manager_rpc::GetRegionsResp = manager_rpc::rkyv_decode(&resp_bytes)

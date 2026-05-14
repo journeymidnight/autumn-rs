@@ -20,6 +20,7 @@ use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use futures::future::join_all;
 
+use autumn_client::DEFAULT_RPC_TIMEOUT;
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::partition_rpc::{
     self, GetReq, GetResp, MSG_GET, rkyv_decode, rkyv_encode,
@@ -161,7 +162,15 @@ pub async fn execute(plan: ReadPlan) -> Result<Vec<u8>> {
         let zero_len = cr.fallback_zero_len;
         async move {
             let payload = rkyv_encode(&req);
-            let resp_bytes = match ps.call(MSG_GET, Bytes::from(payload)).await {
+            // Bounded so a paged-out / hung PS doesn't keep this
+            // chunk's future alive forever (would block the parent
+            // join_all and pin the FUSE callback). On error we degrade
+            // to zero bytes for this chunk, matching the existing
+            // fallback contract.
+            let resp_bytes = match ps
+                .call_timeout(MSG_GET, Bytes::from(payload), DEFAULT_RPC_TIMEOUT)
+                .await
+            {
                 Ok(b) => b,
                 Err(_) => return Err(zero_len),
             };

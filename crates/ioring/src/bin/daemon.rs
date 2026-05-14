@@ -49,7 +49,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use autumn_client::{AutumnError, ClusterClient};
+use autumn_client::{AutumnError, ClusterClient, DEFAULT_RPC_TIMEOUT};
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::partition_rpc::{
     rkyv_decode, rkyv_encode, GetReq, GetResp, CODE_NOT_FOUND, CODE_OK, MSG_GET,
@@ -401,7 +401,12 @@ async fn service_sqe(
                 length: 0,
             };
             let payload = rkyv_encode(&req);
-            let resp_bytes = match ps.call(MSG_GET, payload).await {
+            // Bounded so a paged-out / hung PS surfaces as EIO to the
+            // ioring user instead of wedging this Read SQE forever.
+            let resp_bytes = match ps
+                .call_timeout(MSG_GET, payload, DEFAULT_RPC_TIMEOUT)
+                .await
+            {
                 Ok(b) => b,
                 Err(_) => {
                     let _ = cluster; // unused warning suppression

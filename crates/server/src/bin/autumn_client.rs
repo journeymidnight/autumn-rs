@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use autumn_client::{ClusterClient, parse_addr, decode_err};
+use autumn_client::{ClusterClient, parse_addr, decode_err, DEFAULT_RPC_TIMEOUT};
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::partition_rpc::{
@@ -1344,8 +1344,10 @@ async fn main() -> Result<()> {
                     });
                     let mut attempt = 0u32;
                     loop {
-                        let resp_bytes = client.mgr()?
-                            .call(MSG_CREATE_STREAM, req_bytes.clone())
+                        // mgr_call honors ClusterClient.rpc_timeout
+                        // (default 30 s) — bounded RPC.
+                        let resp_bytes = client
+                            .mgr_call(MSG_CREATE_STREAM, req_bytes.clone())
                             .await
                             .with_context(|| format!("create {label} stream"))?;
                         let resp: CreateStreamResp =
@@ -1388,8 +1390,7 @@ async fn main() -> Result<()> {
                 let mut attempt = 0u32;
                 let resp = loop {
                     let resp_bytes = client
-                        .mgr()?
-                        .call(MSG_UPSERT_PARTITION, req_bytes.clone())
+                        .mgr_call(MSG_UPSERT_PARTITION, req_bytes.clone())
                         .await
                         .context("upsert partition")?;
                     let resp: UpsertPartitionResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
@@ -1437,8 +1438,8 @@ async fn main() -> Result<()> {
             });
             let mut attempt = 0u32;
             loop {
-                let resp_bytes = client.mgr()?
-                    .call(MSG_UPDATE_STREAM_EC, req_bytes.clone())
+                let resp_bytes = client
+                    .mgr_call(MSG_UPDATE_STREAM_EC, req_bytes.clone())
                     .await
                     .context("update stream EC")?;
                 let resp: UpdateStreamEcResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
@@ -1678,8 +1679,7 @@ async fn main() -> Result<()> {
             let mut attempt = 0u32;
             let resp = loop {
                 let resp_bytes = client
-                    .mgr()?
-                    .call(MSG_REGISTER_NODE, req_bytes.clone())
+                    .mgr_call(MSG_REGISTER_NODE, req_bytes.clone())
                     .await
                     .context("register node")?;
                 let resp: RegisterNodeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
@@ -1719,8 +1719,7 @@ async fn main() -> Result<()> {
             // data-plane addr.
             let control_address = derive_control_address(&advertise);
             let resp_bytes = client
-                .mgr()?
-                .call(
+                .mgr_call(
                     MSG_REGISTER_NODE,
                     rkyv_encode(&RegisterNodeReq {
                         addr: advertise.clone(),
@@ -2493,22 +2492,19 @@ async fn main() -> Result<()> {
         Command::Info { json, top, part } => {
             // === Fetch manager data ===
             let stream_resp_bytes = client
-                .mgr()?
-                .call(MSG_STREAM_INFO, rkyv_encode(&StreamInfoReq { stream_ids: Vec::new() }))
+                .mgr_call(MSG_STREAM_INFO, rkyv_encode(&StreamInfoReq { stream_ids: Vec::new() }))
                 .await
                 .context("stream info")?;
             let stream_resp: StreamInfoResp = rkyv_decode(&stream_resp_bytes).map_err(decode_err)?;
 
             let nodes_resp_bytes = client
-                .mgr()?
-                .call(MSG_NODES_INFO, Bytes::new())
+                .mgr_call(MSG_NODES_INFO, Bytes::new())
                 .await
                 .context("nodes info")?;
             let nodes_resp: NodesInfoResp = rkyv_decode(&nodes_resp_bytes).map_err(decode_err)?;
 
             let regions_resp_bytes = client
-                .mgr()?
-                .call(MSG_GET_REGIONS, Bytes::new())
+                .mgr_call(MSG_GET_REGIONS, Bytes::new())
                 .await
                 .context("get regions")?;
             let regions_resp: GetRegionsResp = rkyv_decode(&regions_resp_bytes).map_err(decode_err)?;
@@ -2554,7 +2550,10 @@ async fn main() -> Result<()> {
                         if let Some(addr) = node_map.get(node_id) {
                             if let Ok(en_client) = client.get_ps_client(addr).await {
                                 let req = ExtCommitLengthReq { extent_id: *eid, revision: 0 };
-                                if let Ok(resp_bytes) = en_client.call(EXT_MSG_COMMIT_LENGTH, req.encode()).await {
+                                if let Ok(resp_bytes) = en_client
+                                    .call_timeout(EXT_MSG_COMMIT_LENGTH, req.encode(), DEFAULT_RPC_TIMEOUT)
+                                    .await
+                                {
                                     if let Ok(resp) = ExtCommitLengthResp::decode(resp_bytes) {
                                         ext.sealed_length = resp.length as u64;
                                     }
@@ -2577,7 +2576,10 @@ async fn main() -> Result<()> {
                 if ps_addr.is_empty() { continue; }
                 let req_bytes = rkyv_encode(&GetDiscardsReq { part_id: *pid });
                 match client.get_ps_client(ps_addr).await {
-                    Ok(ps_client) => match ps_client.call(MSG_GET_DISCARDS, req_bytes).await {
+                    Ok(ps_client) => match ps_client
+                        .call_timeout(MSG_GET_DISCARDS, req_bytes, DEFAULT_RPC_TIMEOUT)
+                        .await
+                    {
                         Ok(resp_bytes) => match rkyv_decode::<GetDiscardsResp>(&resp_bytes) {
                             Ok(resp) if resp.code == autumn_rpc::partition_rpc::CODE_OK => {
                                 part_discards.insert(*pid, resp.discards);

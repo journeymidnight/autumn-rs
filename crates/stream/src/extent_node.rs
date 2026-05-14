@@ -1695,9 +1695,12 @@ impl ExtentNode {
             node_id: 0,
             extent_ids: extent_ids.clone(),
         });
+        // 10 s — read-only manager call (returns subset of submitted
+        // extent ids that are no longer in s.extents). Bounded so a
+        // hanging manager doesn't trap the periodic 5-min sweep.
         let resp_data = self
             .manager_pool
-            .call(&mgr, manager_rpc::MSG_RECONCILE_EXTENTS, req)
+            .call_timeout(&mgr, manager_rpc::MSG_RECONCILE_EXTENTS, req, Duration::from_secs(10))
             .await
             .map_err(|e| anyhow::anyhow!("reconcile_extents rpc: {e}"))?;
         let resp: manager_rpc::ReconcileExtentsResp =
@@ -1766,8 +1769,14 @@ impl ExtentNode {
         msg_type: u8,
         payload: Bytes,
     ) -> HandlerResult {
+        // 60 s — sibling shard forwarding can carry CONVERT_TO_EC,
+        // COPY_EXTENT, RECOVERY which do real work. The bound is
+        // generous but finite so the calling RPC handler doesn't
+        // wedge if the sibling shard is itself paged out / hung.
+        // The caller's own request will time out and the next retry
+        // can re-route.
         self.manager_pool
-            .call(sibling_addr, msg_type, payload)
+            .call_timeout(sibling_addr, msg_type, payload, Duration::from_secs(60))
             .await
             .map_err(|e| (StatusCode::Unavailable, format!("forward to shard {sibling_addr}: {e}")))
     }
@@ -2474,9 +2483,12 @@ impl ExtentNode {
             None => return Ok(None),
         };
         let req = manager_rpc::rkyv_encode(&manager_rpc::ExtentInfoReq { extent_id });
+        // 5 s — read-only manager call. Hot in F119-E
+        // (handle_convert_to_ec syncs sealed_length / eversion from
+        // manager) and the F147-C recovery verify-after-fetch path.
         let resp_data = self
             .manager_pool
-            .call(&mgr, autumn_rpc::manager_rpc::MSG_EXTENT_INFO, req)
+            .call_timeout(&mgr, autumn_rpc::manager_rpc::MSG_EXTENT_INFO, req, Duration::from_secs(5))
             .await
             .map_err(|e| format!("extent_info rpc: {e}"))?;
         let resp: manager_rpc::ExtentInfoResp =
@@ -2492,9 +2504,10 @@ impl ExtentNode {
             Some(ep) => crate::conn_pool::normalize_endpoint(ep),
             None => return Err("no manager endpoint configured".to_string()),
         };
+        // 5 s — read-only manager call.
         let resp_data = self
             .manager_pool
-            .call(&mgr, autumn_rpc::manager_rpc::MSG_NODES_INFO, Bytes::new())
+            .call_timeout(&mgr, autumn_rpc::manager_rpc::MSG_NODES_INFO, Bytes::new(), Duration::from_secs(5))
             .await
             .map_err(|e| format!("nodes_info rpc: {e}"))?;
         let resp: manager_rpc::NodesInfoResp =

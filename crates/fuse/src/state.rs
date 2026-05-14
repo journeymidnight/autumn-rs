@@ -48,7 +48,6 @@ impl FsState {
     /// Get a sub-range of a value from the KV store.
     pub async fn kv_get_range(&mut self, k: &[u8], offset: u32, length: u32) -> Result<Vec<u8>> {
         let (part_id, addr) = self.client.resolve_key(k).await?;
-        let ps = self.client.get_ps_client(&addr).await?;
         let req = GetReq {
             part_id,
             key: k.to_vec(),
@@ -56,7 +55,10 @@ impl FsState {
             length,
         };
         let payload = rkyv_encode(&req);
-        let resp_bytes = ps.call(MSG_GET, Bytes::from(payload)).await
+        // ps_call honors ClusterClient.rpc_timeout (default 30 s) so a
+        // paged-out / hung PS surfaces as ConnectionError instead of
+        // wedging the FUSE callback thread forever.
+        let resp_bytes = self.client.ps_call(&addr, MSG_GET, Bytes::from(payload)).await
             .context("KV get RPC")?;
         let resp: GetResp = rkyv_decode(&resp_bytes)
             .map_err(|e| anyhow!("decode GetResp: {}", e))?;
@@ -78,7 +80,6 @@ impl FsState {
     /// "durable Put".
     pub async fn kv_put(&mut self, k: &[u8], v: &[u8]) -> Result<()> {
         let (part_id, addr) = self.client.resolve_key(k).await?;
-        let ps = self.client.get_ps_client(&addr).await?;
         let req = PutReq {
             part_id,
             key: k.to_vec(),
@@ -86,7 +87,7 @@ impl FsState {
             expires_at: 0,
         };
         let payload = rkyv_encode(&req);
-        let resp_bytes = ps.call(MSG_PUT, Bytes::from(payload)).await
+        let resp_bytes = self.client.ps_call(&addr, MSG_PUT, Bytes::from(payload)).await
             .context("KV put RPC")?;
         let resp: PutResp = rkyv_decode(&resp_bytes)
             .map_err(|e| anyhow!("decode PutResp: {}", e))?;
@@ -105,13 +106,12 @@ impl FsState {
     /// Delete a key from the KV store.
     pub async fn kv_delete(&mut self, k: &[u8]) -> Result<()> {
         let (part_id, addr) = self.client.resolve_key(k).await?;
-        let ps = self.client.get_ps_client(&addr).await?;
         let req = DeleteReq {
             part_id,
             key: k.to_vec(),
         };
         let payload = rkyv_encode(&req);
-        let resp_bytes = ps.call(MSG_DELETE, Bytes::from(payload)).await
+        let resp_bytes = self.client.ps_call(&addr, MSG_DELETE, Bytes::from(payload)).await
             .context("KV delete RPC")?;
         let resp: DeleteResp = rkyv_decode(&resp_bytes)
             .map_err(|e| anyhow!("decode DeleteResp: {}", e))?;
@@ -127,7 +127,6 @@ impl FsState {
     /// Callers that need values must issue a separate `kv_get` per key.
     pub async fn kv_range_keys(&mut self, prefix: &[u8], start: &[u8], limit: u32) -> Result<Vec<Vec<u8>>> {
         let (part_id, addr) = self.client.resolve_key(prefix).await?;
-        let ps = self.client.get_ps_client(&addr).await?;
         let req = RangeReq {
             part_id,
             prefix: prefix.to_vec(),
@@ -135,7 +134,7 @@ impl FsState {
             limit,
         };
         let payload = rkyv_encode(&req);
-        let resp_bytes = ps.call(MSG_RANGE, Bytes::from(payload)).await
+        let resp_bytes = self.client.ps_call(&addr, MSG_RANGE, Bytes::from(payload)).await
             .context("KV range RPC")?;
         let resp: RangeResp = rkyv_decode(&resp_bytes)
             .map_err(|e| anyhow!("decode RangeResp: {}", e))?;
@@ -148,13 +147,12 @@ impl FsState {
     /// Check if a key exists (uses Head RPC).
     pub async fn kv_exists(&mut self, k: &[u8]) -> Result<bool> {
         let (part_id, addr) = self.client.resolve_key(k).await?;
-        let ps = self.client.get_ps_client(&addr).await?;
         let req = HeadReq {
             part_id,
             key: k.to_vec(),
         };
         let payload = rkyv_encode(&req);
-        let resp_bytes = ps.call(MSG_HEAD, Bytes::from(payload)).await
+        let resp_bytes = self.client.ps_call(&addr, MSG_HEAD, Bytes::from(payload)).await
             .context("KV head RPC")?;
         let resp: HeadResp = rkyv_decode(&resp_bytes)
             .map_err(|e| anyhow!("decode HeadResp: {}", e))?;

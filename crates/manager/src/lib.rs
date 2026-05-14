@@ -718,9 +718,18 @@ impl AutumnManager {
                 part_id: cand.primary_part_id,
             },
         );
+        // 60 s — split has to flush memtable + commit_length × 3 + a
+        // manager round-trip. PS-side flush can take a few seconds
+        // under contention, but anything > 60 s is a real wedge worth
+        // surfacing (auto-split policy will retry on the next tick).
         let resp_bytes = self
             .conn_pool
-            .call(&ps_addr, autumn_rpc::partition_rpc::MSG_SPLIT_PART, payload)
+            .call_timeout(
+                &ps_addr,
+                autumn_rpc::partition_rpc::MSG_SPLIT_PART,
+                payload,
+                Duration::from_secs(60),
+            )
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let resp: autumn_rpc::partition_rpc::SplitPartResp =
@@ -776,9 +785,16 @@ impl AutumnManager {
                         extent_ids: vec![],
                     },
                 );
-                pool.call(&addr, autumn_rpc::partition_rpc::MSG_MAINTENANCE, payload)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                // 60 s — MAINTENANCE_FLUSH rotates active + drains the
+                // imm queue (each imm is up to FLUSH_MEM_BYTES = 256 MiB).
+                pool.call_timeout(
+                    &addr,
+                    autumn_rpc::partition_rpc::MSG_MAINTENANCE,
+                    payload,
+                    Duration::from_secs(60),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
                 Ok::<(), anyhow::Error>(())
             }
         };
@@ -1909,9 +1925,13 @@ impl AutumnManager {
         let shard_ports = self.shard_ports_for_addr(&base);
         let routed = Self::shard_addr_for_extent(&base, &shard_ports, extent_id);
         let payload = rkyv_encode(&ExtAllocExtentReq { extent_id });
+        // 10 s — alloc_extent is a fast op (create empty file pair +
+        // sidecar fsync). A paged-out EN that doesn't respond inside
+        // 10 s is treated as a failed candidate; the caller's
+        // shuffled-fallback walk picks another node.
         let resp = self
             .conn_pool
-            .call(&routed, EXT_MSG_ALLOC_EXTENT, payload)
+            .call_timeout(&routed, EXT_MSG_ALLOC_EXTENT, payload, Duration::from_secs(10))
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
         let r: ExtAllocExtentResp =
@@ -1933,9 +1953,12 @@ impl AutumnManager {
             extent_id,
             revision: 0,
         };
+        // 5 s — commit_length is a tiny in-memory read on EN (atomic
+        // load of `entry.len`). Generous bound so a hiccupping EN
+        // doesn't hang split / commit-len consensus paths.
         let resp = self
             .conn_pool
-            .call(&routed, EXT_MSG_COMMIT_LENGTH, req.encode())
+            .call_timeout(&routed, EXT_MSG_COMMIT_LENGTH, req.encode(), Duration::from_secs(5))
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
         let r =
