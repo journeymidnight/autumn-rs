@@ -1394,6 +1394,40 @@ Cleared by audit (no fix needed):
 - **Files:** `feature_list.md`, `claude-progress.txt`. (No code changes.)
 - **passes:** true (audit-cleared)
 
+### F200 · EC sub-range reconstruction — eliminate full-extent decode on single shard failure
+- **Target:** User correctly pointed out 2026-05-14 that F199's GC failure cooldown only suppresses retries — the real bug is in `ec_subrange_read`'s fall-back path. When a per-shard read fails for a sub-range request (e.g., GC chunking through a 2.8 GB EC(3+1) extent reading 64 MiB at a time, touching only shard 0), the function falls back to `ec_read_full_and_slice` which:
+  1. Reads ALL `(K + M)` shards at full size via `ec_read_full` (each issues `length=0` = "read to end").
+  2. Decodes the entire payload via `ec_decode`.
+  3. Slices `[offset, offset+length)` from the decoded buffer.
+  This means a SINGLE 64 MiB chunk request that hits a transient shard-read failure triggers `4 × 933 MiB ≈ 3.7 GiB` of cross-network reads with 5 s per-shard timeouts. On a stressed macOS test box this:
+  - Saturates io_uring + TCP send buffers across all replicas.
+  - Causes the manager's `disk_status_update_loop` df probe to time out under load.
+  - Marks the probed node's disks `online=false` even though the underlying disk is healthy.
+  - Repeats every GC tick until F199's cooldown kicks in — but each cycle still does the 3.7 GiB amplification.
+- **Why sub-range reconstruction is correct:** galois-8 RS encodes byte-by-byte: at each row position `i` the `(K + M)` shard bytes form an independent RS codeword. So the sub-range `[a, b)` on a missing data shard can be reconstructed from `[a, b)` on any K healthy shards. No full-extent decode needed. Test `f200_reconstruct_shard_subrange_data_shard` (erasure.rs) locks in this invariant.
+- **Fix:**
+  - `ec_subrange_read` (client.rs): instead of `fall_back = true → ec_read_full_and_slice`, the per-plan-entry failure path now calls a new helper `ec_reconstruct_shard_subrange` which:
+    - Reads `[sh_off, sh_off + sh_len)` from all `(K + M) - 1` non-missing peers in parallel (5 s timeout each, same shape as `ec_read_full`).
+    - Stops as soon as K succeed.
+    - Calls `ec_reconstruct_shard` (existing erasure helper) on the K-aligned sub-shards.
+    - Returns the reconstructed missing-shard sub-range bytes.
+  - Failed plan entries are filled into `plan_results` after reconstruction; the final stitch concatenates in order as before.
+  - Eversion-stale (CODE_EVERSION_MISMATCH) short-circuits the whole call so the top-level `read_bytes_from_extent` 2-attempt loop refetches `ExtentInfo` and retries against the fresh EC layout.
+- **Bytes-on-the-wire comparison** (user's GC scenario: 64 MiB chunk on 2.8 GB EC(3+1) extent, shard 0 read fails):
+  - Pre-F200: 4 × 933 MiB = 3.7 GiB.
+  - Post-F200: 3 × 64 MiB = 192 MiB. **20× reduction**.
+  - Cluster-wide GC pressure on macOS test box drops accordingly; df probes no longer time out → disks no longer falsely flap offline → the cascade self-heals.
+- **Files:**
+  - `crates/stream/src/client.rs`: replace `fall_back` path with reconstruction + new helper `ec_reconstruct_shard_subrange`.
+  - `crates/stream/src/erasure.rs`: add 2 unit tests (`f200_reconstruct_shard_subrange_data_shard`, `f200_reconstruct_shard_subrange_with_one_parity_present`).
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-stream --lib`: 53/53 (51 pre-existing + 2 new F200).
+- **Relationship to F199:** F199's per-extent failure cooldown remains useful as a safety net for genuinely-broken extents (e.g., real disk failure where reconstruction also fails). F200 prevents the cooldown from being the primary mechanism — under normal pressure, sub-range reconstruction completes and GC succeeds.
+- **Deferred:**
+  - When a sub-range read fails on a PARITY-region offset (`start_shard >= data_shards`), `ec_subrange_read` still falls back to `ec_read_full_and_slice`. This is a stale-VP / out-of-range path; the bytes-on-the-wire cost would matter only for misbehaving callers and the data-loss surface is small. Reconstruction in this path is left for future iteration.
+- **passes:** true
+
 ### F199 · Per-extent GC failure cooldown — stop hammering broken EC layouts
 - **Target:** Reported by user 2026-05-14 on macOS test cluster: after upgrade + restart + `client compact 15`, the partition starts but the local `background_gc_loop` (5-7 s `random_delay` between auto ticks) keeps picking the same extent (extent 10, 2.8 GB EC(3+1)) whose `data[0]` host node has an offline disk (`disk 8: online=false`). Each `run_gc` chunk read hits `ec_subrange_read` → one shard read fails → fall back to `ec_read_full_and_slice` → 4 parallel reads of 933 MB shards with a 5 s per-shard timeout → "0/3 shards available for EC decode". Repeats every ~15 s indefinitely, saturating CPU/IO on the test machine.
 - **Approach (minimum change, per-extent cooldown):**

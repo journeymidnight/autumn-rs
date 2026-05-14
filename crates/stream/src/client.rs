@@ -2417,36 +2417,229 @@ impl StreamClient {
             .collect();
         let results = futures::future::join_all(read_futs).await;
 
-        // Single pass: stitch results, watch for eversion-stale (fail
-        // fast — every replica reports the same mismatch by
-        // construction) and short reads (fall back to full decode).
-        let mut data: Vec<u8> = Vec::with_capacity(read_len as usize);
+        // F200: per-plan-entry results. Failed entries get reconstructed
+        // via sub-range RS in a second pass — DO NOT fall back to
+        // `ec_read_full_and_slice` (which would read 4 × full-shard
+        // payloads to decode the whole extent just to slice out the
+        // requested sub-range). The amplification triggered macOS-side
+        // df-probe timeouts under heavy GC fanout, flapping disks
+        // offline (see F200 entry in feature_list.md).
+        let mut plan_results: Vec<Option<Vec<u8>>> = vec![None; shard_plan.len()];
+        let mut needs_reconstruct: Vec<usize> = Vec::new();
         let mut last_end: u32 = 0;
-        let mut fall_back = false;
         for (i, r) in results.into_iter().enumerate() {
             match r {
                 Ok((bytes, end_val)) => {
-                    if bytes.len() as u32 != shard_plan[i].2 {
-                        fall_back = true;
-                        break;
+                    let want = shard_plan[i].2 as usize;
+                    if bytes.len() != want {
+                        // short read — treat same as failure; reconstruct.
+                        needs_reconstruct.push(i);
+                        continue;
                     }
-                    data.extend_from_slice(&bytes);
+                    plan_results[i] = Some(bytes);
                     last_end = end_val;
                 }
                 Err(e) => {
                     if is_eversion_stale(&e) {
                         return Err(anyhow::Error::new(EversionStale));
                     }
-                    fall_back = true;
-                    break;
+                    needs_reconstruct.push(i);
                 }
             }
         }
 
-        if !fall_back {
-            return Ok((data, last_end));
+        if !needs_reconstruct.is_empty() {
+            // Sub-range RS reconstruction. For each failed plan entry,
+            // read the same [sh_off, sh_len] window from K healthy
+            // shards (the other data shards + parity) and call
+            // `ec_reconstruct_shard` on K-aligned sub-shards. Bytes-on-
+            // the-wire ≈ K × sh_len per failure, vs 4 × full-shard
+            // for the old fall-back path.
+            for &plan_idx in &needs_reconstruct {
+                let (failing_shard_idx, sh_off, sh_len) = shard_plan[plan_idx];
+                let recon = self
+                    .ec_reconstruct_shard_subrange(
+                        extent_id,
+                        ex,
+                        &addrs,
+                        failing_shard_idx,
+                        sh_off,
+                        sh_len,
+                    )
+                    .await?;
+                plan_results[plan_idx] = Some(recon);
+            }
+            // No `last_end` from reconstruction (the sub-range reads
+            // didn't surface server-side `end` watermarks). Fall back
+            // to the sealed_length as the safe overall end signal —
+            // matches what `read_replicated_with_failover` would
+            // return for a sealed extent.
+            if last_end == 0 {
+                last_end = ex.sealed_length as u32;
+            }
         }
-        self.ec_read_full_and_slice(extent_id, offset, length, ex).await
+
+        let mut data: Vec<u8> = Vec::with_capacity(read_len as usize);
+        for (i, slot) in plan_results.into_iter().enumerate() {
+            let bytes = slot.ok_or_else(|| {
+                anyhow!(
+                    "ec_subrange_read: plan entry {} unfilled after reconstruction (shard_idx={}, sh_off={}, sh_len={})",
+                    i,
+                    shard_plan[i].0,
+                    shard_plan[i].1,
+                    shard_plan[i].2,
+                )
+            })?;
+            data.extend_from_slice(&bytes);
+        }
+        Ok((data, last_end))
+    }
+
+    /// F200: reconstruct one data shard's sub-range `[sh_off, sh_off + sh_len)`
+    /// from K healthy peers (the other data shards + a parity shard).
+    /// Replaces the old `ec_read_full_and_slice` fall-back for the case where
+    /// a single per-shard sub-range read fails inside `ec_subrange_read`.
+    ///
+    /// Why sub-range reconstruction works: RS encodes byte-by-byte across
+    /// the K data shards (galois_8). Decoding any single missing shard at
+    /// row position `i` needs `data_shards` (K) byte values at the SAME row
+    /// position from healthy peers. So a sub-range `[sh_off, sh_off + sh_len)`
+    /// on the missing shard can be reconstructed from `[sh_off, sh_off + sh_len)`
+    /// on K healthy shards — no full-extent decode needed.
+    ///
+    /// Bytes-on-the-wire: `K × sh_len` (e.g., 3 × 64 MiB = 192 MiB for the
+    /// user's GC chunk read of a 3+1 extent), vs the pre-F200 fall-back
+    /// of `(K + M) × shard_size(sealed_length, K)` (e.g., 4 × 933 MiB ≈
+    /// 3.7 GiB for the same chunk on a 2.8 GiB extent). 20× reduction.
+    ///
+    /// Concurrency: launches reads to ALL `(K + M) - 1` non-missing
+    /// peers in parallel and stops as soon as `K` succeed. Any single
+    /// stale-eversion response short-circuits the whole call so the
+    /// top-level `read_bytes_from_extent` 2-attempt loop can refetch
+    /// `ExtentInfo` and retry against the fresh EC layout.
+    async fn ec_reconstruct_shard_subrange(
+        &self,
+        extent_id: u64,
+        ex: &ExtentInfo,
+        addrs: &[String],
+        missing_shard_idx: usize,
+        sh_off: u32,
+        sh_len: u32,
+    ) -> Result<Vec<u8>> {
+        let data_shards = ex.replicates.len();
+        let parity_shards = ex.parity.len();
+        let n = data_shards + parity_shards;
+
+        if sh_len == 0 {
+            return Ok(Vec::new());
+        }
+        if missing_shard_idx >= data_shards {
+            return Err(anyhow!(
+                "ec_reconstruct_shard_subrange: missing_shard_idx {missing_shard_idx} is in parity region (data_shards={data_shards}); refusing"
+            ));
+        }
+
+        let (tx, mut rx) =
+            futures::channel::mpsc::channel::<(usize, Result<Vec<u8>>)>(n);
+        let cached_eversion = ex.eversion;
+        for (i, addr) in addrs.iter().enumerate() {
+            if i == missing_shard_idx {
+                continue;
+            }
+            let mut tx_clone = tx.clone();
+            let addr_clone = addr.clone();
+            let pool = self.pool.clone();
+            compio::runtime::spawn(async move {
+                let req = ReadBytesReq {
+                    extent_id,
+                    eversion: cached_eversion,
+                    offset: sh_off,
+                    length: sh_len,
+                };
+                // 5 s — same shape as `ec_read_full`. Sub-range size
+                // is `sh_len` (≤ chunk_size, typically 64 MiB), so
+                // 5 s is generous even on a stressed loopback.
+                let result: Result<Vec<u8>> = match pool
+                    .call_timeout(
+                        &addr_clone,
+                        MSG_READ_BYTES,
+                        req.encode(),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                {
+                    Ok(resp_bytes) => match ReadBytesResp::decode(resp_bytes) {
+                        Ok(resp) if resp.code == CODE_OK => {
+                            if resp.payload.len() as u32 != sh_len {
+                                Err(anyhow!(
+                                    "ec_reconstruct: short read from {addr_clone}: got {} want {sh_len}",
+                                    resp.payload.len(),
+                                ))
+                            } else {
+                                Ok(resp.payload.to_vec())
+                            }
+                        }
+                        Ok(resp) if resp.code == CODE_EVERSION_MISMATCH => {
+                            Err(anyhow::Error::new(EversionStale)
+                                .context(format!("ec_reconstruct shard {i} from {addr_clone}")))
+                        }
+                        Ok(resp) => Err(anyhow!(
+                            "ec_reconstruct read_bytes from {}: code={}",
+                            addr_clone,
+                            crate::extent_rpc::code_description(resp.code)
+                        )),
+                        Err(e) => Err(anyhow!("decode ReadBytesResp from {addr_clone}: {e}")),
+                    },
+                    Err(e) => Err(anyhow!(e)),
+                };
+                let _ = futures::SinkExt::send(&mut tx_clone, (i, result)).await;
+            })
+            .detach();
+        }
+        drop(tx);
+
+        let mut shards: Vec<Option<Vec<u8>>> = vec![None; n];
+        let mut success: usize = 0;
+        let mut last_err = anyhow!(
+            "ec_reconstruct_shard_subrange: no shard responses for extent {extent_id}"
+        );
+        while let Some((idx, result)) = futures::StreamExt::next(&mut rx).await {
+            match result {
+                Ok(bytes) => {
+                    shards[idx] = Some(bytes);
+                    success += 1;
+                    if success >= data_shards {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if is_eversion_stale(&e) {
+                        return Err(e);
+                    }
+                    last_err = e;
+                }
+            }
+        }
+
+        if success < data_shards {
+            return Err(last_err.context(format!(
+                "ec_reconstruct_shard_subrange: only {success}/{data_shards} shards available for sub-range reconstruct (missing={missing_shard_idx}, sh_off={sh_off}, sh_len={sh_len})"
+            )));
+        }
+
+        // RS reconstruction is CPU-bound; offload to blocking pool.
+        let result = compio::runtime::spawn_blocking(move || {
+            crate::erasure::ec_reconstruct_shard(
+                shards,
+                data_shards,
+                parity_shards,
+                missing_shard_idx,
+            )
+        })
+        .await
+        .map_err(|_| anyhow!("ec_reconstruct_shard task panicked"))??;
+
+        Ok(result)
     }
 
     /// Decode the entire EC extent and slice `[offset, offset+length)`.

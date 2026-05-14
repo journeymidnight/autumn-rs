@@ -373,6 +373,78 @@ mod tests {
         assert_eq!(decoded, payload, "should recover from 1 data + 1 parity");
     }
 
+    /// F200: verify that `ec_reconstruct_shard` operates correctly on
+    /// SUB-RANGE shard slices (not full-size shards). This is the
+    /// load-bearing invariant for `ec_reconstruct_shard_subrange` in
+    /// `client.rs` — without it, sub-range reconstruction would have
+    /// to fall back to full-extent decode (the pre-F200 hot path that
+    /// caused macOS GC pressure).
+    ///
+    /// Galois-8 RS encodes byte-by-byte: at each row position `i` the
+    /// `(K + M)` shard bytes form an independent RS codeword. So a
+    /// sub-range `[a, b)` of length N on the missing shard can be
+    /// reconstructed from `[a, b)` of length N on K healthy shards.
+    #[test]
+    fn f200_reconstruct_shard_subrange_data_shard() {
+        let payload: Vec<u8> = (0..(1 << 16)).map(|i| (i % 251) as u8).collect();
+        let data_shards = 3usize;
+        let parity_shards = 1usize;
+        let shards = ec_encode(&payload, data_shards, parity_shards).unwrap();
+        let per_shard = shards[0].len();
+        // Take a sub-range [a, b) within the shard, away from edges.
+        let a = 1024usize;
+        let b = 5120usize;
+        assert!(b <= per_shard);
+
+        // Pre-compute the truth: shard 0's bytes at [a, b).
+        let truth = shards[0][a..b].to_vec();
+
+        // Build sub-range shards: shard 0 missing, others present at [a, b).
+        let sub_shards: Vec<Option<Vec<u8>>> = (0..(data_shards + parity_shards))
+            .map(|i| {
+                if i == 0 {
+                    None
+                } else {
+                    Some(shards[i][a..b].to_vec())
+                }
+            })
+            .collect();
+
+        let reconstructed =
+            ec_reconstruct_shard(sub_shards, data_shards, parity_shards, 0).unwrap();
+        assert_eq!(
+            reconstructed, truth,
+            "F200: sub-range reconstruction must match the original shard's sub-range"
+        );
+    }
+
+    /// F200: same property holds for K-1 healthy data shards + 1 parity
+    /// (the typical online-failure scenario where one data-shard host
+    /// is offline). Reconstructs shard 1's sub-range from shards
+    /// {0, 2, parity}.
+    #[test]
+    fn f200_reconstruct_shard_subrange_with_one_parity_present() {
+        let payload: Vec<u8> = (0..(1 << 18)).map(|i| (i % 251) as u8).collect();
+        let data_shards = 3usize;
+        let parity_shards = 1usize;
+        let shards = ec_encode(&payload, data_shards, parity_shards).unwrap();
+        let per_shard = shards[0].len();
+        let a = 100usize;
+        let b = per_shard - 100;
+        let truth = shards[1][a..b].to_vec();
+
+        let sub_shards: Vec<Option<Vec<u8>>> = vec![
+            Some(shards[0][a..b].to_vec()),
+            None, // missing
+            Some(shards[2][a..b].to_vec()),
+            Some(shards[3][a..b].to_vec()), // parity
+        ];
+
+        let reconstructed =
+            ec_reconstruct_shard(sub_shards, data_shards, parity_shards, 1).unwrap();
+        assert_eq!(reconstructed, truth);
+    }
+
     /// F128: verify the shard_size detection condition used by
     /// handle_convert_to_ec to detect a crash between rename(.ec.dat → .dat)
     /// and save_meta. After the crash, local file len == shard_size but meta

@@ -1,47 +1,81 @@
 Date: 2026-05-14
 TaskStatus: completed
-Task scope: F199 — per-extent GC failure cooldown (stop hammering
-            broken EC layouts on macOS test cluster).
+Task scope: F200 — proper fix for the EC sub-range fall-back path.
+            Replaces "decode whole extent on any shard-read failure"
+            with sub-range RS reconstruction.
 
-User-reported (2026-05-14, follow-on to F198):
-  - Test cluster with one node's disk offline (`disk 8: online=false`).
-  - Partition opens fine after F198, but local `background_gc_loop`
-    re-tries `run_gc` on the same 2.8 GB EC(3+1) extent every 5-7 s.
-  - Each failure path: `ec_subrange_read` → one shard read fails (disk
-    offline) → fall back to `ec_read_full_and_slice` → 4 × 933 MB
-    parallel reads with 5 s timeout → "0/3 shards available for EC
-    decode" → log error → next tick same thing.
-  - macOS CPU/IO saturated.
+User-corrected analysis (2026-05-14):
+  - F199 was a workaround (suppress retries). The real bug is in
+    `ec_subrange_read`'s fall-back path: on ANY single per-shard read
+    failure it calls `ec_read_full_and_slice`, which reads ALL K+M
+    shards at full size (length=0) and decodes the whole extent to
+    slice the requested sub-range.
+  - For a 64 MiB GC chunk read on a 2.8 GB EC(3+1) extent, this means
+    4 × 933 MiB ≈ 3.7 GiB cross-network for what should be a
+    K × 64 MiB ≈ 192 MiB reconstruction.
+  - The 3.7 GiB amplification saturates macOS, causes manager's df
+    probe to time out, marks healthy disks offline. F199's cooldown
+    suppressed retries but didn't fix the amplification on the first
+    attempt.
+
+Why sub-range reconstruction works:
+  - Galois-8 RS encodes byte-by-byte across K+M shards.
+  - At each row position i, the K+M shard bytes form an independent
+    RS codeword.
+  - So sub-range [a, b) on a missing data shard can be reconstructed
+    from [a, b) on K healthy shards. No full-extent decode.
 
 Fix:
-  - `background_gc_loop` carries a `HashMap<u64, Instant>` of recent
-    `run_gc` failures.
-  - `GC_FAILURE_COOLDOWN` = 5 min. Auto tasks filter holes against
-    this map; Force tasks bypass.
-  - Success → remove from map. Failure → stamp `Instant::now()`.
-  - Stale entries evicted lazily on each pickup pass.
+  - `crates/stream/src/client.rs`:
+    - `ec_subrange_read`: removed `fall_back = true → ec_read_full_and_slice`.
+      Failed plan entries now collected in `needs_reconstruct: Vec<usize>`.
+    - New helper `ec_reconstruct_shard_subrange(failing_shard_idx,
+      sh_off, sh_len)`:
+      - Reads [sh_off, sh_off+sh_len] from K+M-1 non-missing peers
+        in parallel (5 s timeout each).
+      - Stops when K succeed.
+      - Calls existing `ec_reconstruct_shard` on K-aligned
+        sub-shards (offloaded via spawn_blocking — RS math is
+        CPU-bound).
+      - Eversion-stale short-circuits to the top-level retry loop.
+  - `crates/stream/src/erasure.rs`:
+    - 2 new unit tests pinning the load-bearing invariant
+      "ec_reconstruct_shard works on sub-range slices":
+      - f200_reconstruct_shard_subrange_data_shard
+      - f200_reconstruct_shard_subrange_with_one_parity_present
+
+Bytes-on-the-wire (user's GC scenario, 64 MiB chunk on 2.8 GB
+EC(3+1) extent, shard 0 fails):
+  - Pre-F200: 4 × 933 MiB = 3.7 GiB.
+  - Post-F200: 3 × 64 MiB = 192 MiB. → 20× reduction.
+
+Relationship to F199:
+  - F199's per-extent failure cooldown stays as a safety net for
+    actual irrecoverable extents (e.g., 2+ shards truly unreachable
+    on 3+1 EC).
+  - Under normal pressure, F200 prevents F199 from ever triggering
+    because reconstruction succeeds.
 
 Files touched:
-  - crates/partition-server/src/background.rs: +30 lines.
-  - feature_list.md: F199 entry above F198.
+  - crates/stream/src/client.rs: +95, -10 (helper + reworked path)
+  - crates/stream/src/erasure.rs: +60 (2 tests)
+  - feature_list.md: F200 entry above F199.
   - claude-progress.txt: this file.
 
 Tests:
-  - cargo build -p autumn-partition-server --lib: clean.
-  - cargo test -p autumn-partition-server --lib: 138/139 passed.
-    The 1 fail (`f099i_d1_fast_path_no_fu_allocation`) is pre-existing
-    on main (poisoned mutex on global counter), unrelated to F199.
+  - cargo build --workspace --exclude autumn-fuse: clean.
+  - cargo test -p autumn-stream --lib: 53/53 (51 pre-existing + 2 new).
 
-Deferred (F200+):
-  - Sub-range RS reconstruction in `ec_subrange_read` so a missing
-    data shard doesn't trigger full-extent fall-back. The right
-    long-term fix; F199 only stops the retry storm.
-  - Configurable cooldown duration via env var.
+Deferred:
+  - Parity-region offset path (`start_shard >= data_shards`) still
+    falls back to ec_read_full_and_slice. That's the stale-VP path;
+    callers shouldn't hit it under normal operation. Reconstruction
+    in that path is left for a future iteration.
 
-Prior F198 status (still: completed):
-  - F198 rich `ecConversionInflight/` marker prevents EC dispatch
-    stuck-state on restart. Two commits: 187dab3 + c3d07b3 already
-    pushed to main.
+Prior-session F198/F199 status: still completed. F200 supersedes
+F199 as the primary GC-pressure mitigation; F199 stays as the
+safety net.
 
-Next session: feature_list.md F198 + F199 entries describe both
-shipped fixes.
+Next-session starting point: feature_list.md F198 + F199 + F200
+entries together describe the full fix chain (rich marker → GC
+cooldown → sub-range reconstruction).
