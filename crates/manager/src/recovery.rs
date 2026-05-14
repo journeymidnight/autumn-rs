@@ -700,21 +700,24 @@ impl AutumnManager {
                 let replay_params = self.pending_ec_dispatch.borrow().get(&extent_id).cloned();
 
                 // Pre-F198: blanket `if ec_conversion_inflight.contains(&extent_id) { continue; }`
-                // permanently blocked re-dispatch on replay-loaded markers,
-                // leaving the manager's `ec_converted=false` etcd state out
-                // of sync with the extent-node's already-bumped local
-                // eversion. Now: skip only if currently in-flight WITHIN
-                // this process AND we don't have stored params. The
-                // `ec_conversion_inflight` HashSet is the
-                // eversion-bump lock seen by other manager mutators
-                // (F138/F145/F146); on replay it's populated alongside
-                // `pending_ec_dispatch`, so the lock stays held while we
-                // re-drive the dispatch forward.
-                if replay_params.is_none()
-                    && self.ec_conversion_inflight.borrow().contains(&extent_id)
-                {
-                    continue;
-                }
+                // permanently blocked re-dispatch of replay-loaded markers
+                // (etcd state stayed `ec_converted=false` while the extent-
+                // node already had post-EC eversion). Now: the check is
+                // removed entirely because the dispatch loop body is
+                // sequential WITHIN a tick (dedup'd via the `seen` HashSet
+                // above) AND across ticks (next tick's sleep starts only
+                // after this body returns, removing the entry from
+                // `ec_conversion_inflight` + `pending_ec_dispatch`). So
+                // `ec_conversion_inflight.contains(&extent_id)` here only
+                // ever fires from a replay — either a post-F198 rich
+                // marker (handled by the `Some(params)` branch below) or
+                // a pre-F198 empty legacy marker (handled by the `None`
+                // branch which falls through to the fresh-dispatch path
+                // and OVERWRITES the etcd marker with a rich record on
+                // `persist_ec_conversion_inflight`). The coordinator's
+                // F119-D idempotency guard returns CODE_OK if the prior
+                // dispatch already completed, so a fresh re-dispatch is
+                // safe end-to-end.
 
                 let mut target_nodes: Vec<u64>;
                 let mut target_addrs: Vec<String> = Vec::new();
