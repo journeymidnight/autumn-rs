@@ -1,135 +1,102 @@
-Date: 2026-05-12
+Date: 2026-05-14
 TaskStatus: completed
-Task scope: F196 — static cpuset pre-allocation for EN/PS + PS reject-only
-            split gate + EN shards-from-cpuset + manager hot/cold advisory.
+Task scope: F198 — fix EC dispatch stuck-state on restart (rich
+            `ecConversionInflight/` marker + replay-aware dispatch +
+            PS open eversion-mismatch retry).
 
-Final state:
-  - autumn-common: cpu_pin gains set_cpuset / parse_cpuset / cpuset_len /
-    cpuset_explicit. `pick_cpu_for_ord` honors the explicit cpuset and
-    returns None past end (no wraparound).
-  - autumn-extent-node: --cpuset SPEC (taskset syntax) is the sole
-    sizing surface. shards = cpuset_len; --shards REMOVED (binary
-    refuses to start if it's passed). cluster.sh translates SHARDS env
-    into per-EN --cpuset ranges so existing scripts keep working.
-  - autumn-ps: --cpuset SPEC + new partition_budget. cpuset_len/2 caps
-    open_partition + handle_split_part. Split refuses with
-    FailedPrecondition when budget exhausted; sync_regions_once skips
-    new opens past budget with WARN. Pre-F196 deployments unaffected
-    (gate off when --cpuset omitted).
-  - autumn-manager policy.rs: compute_hot_cold_advisory(region_owners,
-    now) — single WARN line per PS when max/min(req_per_sec) >= 10
-    sustained AND hottest > SPLIT_QPS_HIGH/2, 5-min per-PS cooldown.
-    Pure log; does NOT join advisory_cache.
-  - cluster.sh: AUTUMN_PS_CPUSET + AUTUMN_EN${i}_CPUSET env passthrough
-    to --cpuset; legacy --cpu-start path preserved when neither set.
+User-reported bug (2026-05-14):
+  - `sh cluster.sh reset 4`, write large values to partition 15, split
+    15 + compact 15 several rounds, macOS slows down, then
+    `sh cluster.sh restart 4`.
+  - PS startup fails on partition 15 with `read SST from rowStream
+    extent=20 offset=0: eversion mismatch (stale extent_info_cache)`.
+  - `partition 15 thread exited before reporting listener readiness`.
 
-Stage breakdown:
-  Stage A: cpu_pin helper + CLI parsing on both binaries.
-           7 new parse_cpuset_* unit tests pass.
-  Stage B: PartitionBudget (Arc<AtomicUsize+max>), wired through
-           PartitionServer + PartitionData + partition_thread_main.
-           sync_regions_once inc/dec; handle_split_part gate.
-  Stage C: EN auto-sizes shards from cpuset_len; --shards REMOVED.
-  Stage D: PolicyEngine::compute_hot_cold_advisory dual-dimension
-           (QPS + size_bytes), 5 unit tests, call site in
-           policy_tick_loop.
-  Stage D-recal: SPLIT_QPS_HIGH 50K→15K, MERGE_QPS_LOW 5K→1.5K.
-                 Aligns F183 QPS thresholds with measured ~30K
-                 single-partition ceiling. Pre-F196 50K was
-                 unreachable.
-  Stage D-r2:    PS report_load 5s→30s; POLICY_WINDOW_BUCKETS 30→10;
-                 HOT_COLD_MIN_HOT_QPS decoupled to 10K; hot/cold
-                 emits PolicyCandidate (kind=4) into advisory_cache
-                 so `client info policy` shows it. Hot/cold list
-                 simplified to "min/max-matched partition" so the
-                 2-partition PS case works.
-  Stage D-r3:    F189 fg admission default 0 → 2 GiB/s. Activates
-                 the existing fg ceiling + bg fg-aware yield by
-                 default. Derived from perf_check TCP peaks
-                 (~1.74 GB/s for 8M values; 2 GiB/s leaves 15%
-                 headroom). Operator can re-enable unlimited via
-                 `--fg-rate-bytes-per-sec 0`.
-  Stage D-r4:    fg admission grows IOPS dimension. account_fg now
-                 takes (bytes, ops); EITHER cap reached → sleep.
-                 bg-aware-yield triggers on either fg observed
-                 rate. Default fg-iops 150K (≈ 36% headroom over
-                 measured 110K perf_check 4K peak). bg stays
-                 bytes-only (compact/GC are bulk). 9/9 admission
-                 tests; new `--fg-iops-per-sec` CLI flag +
-                 AUTUMN_PS_FG_IOPS_PER_SEC env passthrough.
-  Stage D-r5:    Admission becomes per-partition (was PS-wide).
-                 PartitionServer now holds AdmissionTotals (4 raw
-                 numbers); each open_partition constructs its own
-                 Arc<AdmissionController> with `total / N`. N is
-                 partition_budget.max when --cpuset is supplied,
-                 else 8 (PS_PARTS_HINT default). Aligns with
-                 thread-per-core: one busy partition can't burn
-                 sibling bg budgets via a shared Mutex.
-                 [SUPERSEDED by D-r6]
-  Stage D-r6:    Revert D-r5; unify admission. ONE Arc<Admission
-                 Controller> per PS again. The same controller now
-                 hosts compact + gc concurrency caps (folded in
-                 F104 compact_gate and the D-r5 gc_concurrency_gate).
-                 New API: account_fg/bg + acquire_compact/acquire_gc.
-                 F140 per-partition gc_gate (split vs gc sync) stays
-                 separate. Background loops + handle_split_part
-                 route through io_bucket for both rate AND
-                 concurrency.
-                 [SUPERSEDED by D-r7]
-  Stage D-r7:    Split admission into RateController (per-partition,
-                 4 independent rate dims: fg bytes/iops + compact
-                 bytes + gc bytes) and ConcurrencyController (PS-wide,
-                 compact + gc concurrency caps). fg-aware-yield kept
-                 on compact + gc paths. CLI: --bg-rate removed,
-                 replaced by --admission-compact-rate + --admission-
-                 gc-rate (separate from F141's --gc-rate-bytes-per-sec
-                 per-partition limiter which stays).
-                 Defaults from perf_check: fg 256 MiB/s + 30K iops,
-                 compact 64 MiB/s, gc 32 MiB/s. [PARTIALLY SUPERSEDED
-                 by D-r7-recal]
-  Stage D-r7-recal:
-                 Bump defaults to match sustained workloads:
-                 fg 256→1024 MiB/s, compact 64→256 MiB/s,
-                 gc 32→128 MiB/s, compact_max 1→4, gc_max 1→4.
-                 Pre-recal compact 64 MiB/s × concurrency=1 = 64 MiB/s
-                 aggregate, 7× below 4K-p16 sustained flush input
-                 432 MB/s → SST queue + write back-pressure on long
-                 runs. perf_baseline_tcp_p16_d8_s4k 10s bench
-                 unaffected (per-partition 27 MB/s never approaches
-                 new caps).
-  F197:          background_flush_loop parallel via FuturesOrdered.
-                 Split flush_one_imm into run_flush_async_phase
-                 (concurrent-safe) + commit_flush_outcome (serial,
-                 F148-A invariant). Default cap=1 because 120s
-                 perf_check showed cap=4 doesn't help fg-saturated
-                 4K workloads (EN-side row_stream fsync is the wall,
-                 256 MB SST × 3-replica ≈ 3 s independent of P-log
-                 concurrency). Infrastructure preserved for future
-                 workload shifts; opt-in via --flush-inflight-cap.
+Root cause:
+  1. EC conversion was mid-flight when the cluster died. The
+     extent-node's `commit_shard_local` bumped local eversion + wrote
+     shard data, but the manager's `apply_ec_conversion_done` didn't
+     commit to etcd. Etcd still has the pre-EC eversion.
+  2. On restart, the manager replays the etcd marker (F173) — but
+     the marker was empty. The dispatch loop body had
+     `if ec_conversion_inflight.contains(&id) { continue; }` which
+     permanently SKIPPED replay-loaded markers. Etcd state never
+     converged.
+  3. PS reads pulled `ExtentInfo.eversion` from manager (stale,
+     pre-EC) and sent it in `ReadBytesReq`. Extent-node's
+     `req.eversion < ev` check rejected with CODE_EVERSION_MISMATCH.
+     PS's 2-attempt `read_bytes_from_extent` refetch loop got the
+     same stale eversion every time → recover_partition failed →
+     partition thread exited.
 
-Stream crate (autumn-stream):
-  Stage D-r7-en: Rename ExtentNodeGate → ConcurrencyController to
-                 mirror PS. One struct, two counters (ec_convert +
-                 recovery). Distinct EcConvertPermit / RecoveryPermit
-                 types. Single ExtentNode.concurrency_ctrl field
-                 (was two separate gates). 6/6 f194 tests pass +
-                 new ec_convert_and_recovery_counters_are_independent
-                 invariant test.
-  Stage E: cluster.sh env passthrough + even disjoint cpuset
-           distribution (EN[i] + PS ranges); README updated; this
-           progress file; feature_list F196 entry; commit.
+Why F119-D + F173 alone didn't cover this:
+  - F119-D coordinator idempotency is fine for re-dispatch.
+  - F173 persisted the lock-set but used an EMPTY marker value.
+    Replay-loaded markers couldn't be safely re-dispatched without
+    the original `target_nodes` (a fresh `shuffle().take(extra)`
+    + `alloc_extent_on_node` would reset an already-converted
+    parity node's in-memory state and overwrite its .meta sidecar
+    — silently corrupting the EC layout. Manager would then commit
+    `ex.parity = [random_node]` to etcd, pointing AWAY from the
+    node that actually holds the parity shard).
 
-Test pass:
-  cargo test -p autumn-common cpu_pin          → 7/7
-  cargo test -p autumn-manager --lib            → 65/65 (incl 3 new
-                                                  hot_cold_advisory_*)
-  cargo test -p autumn-partition-server --lib   → 131/131
+Fix (F198):
+  - New rkyv struct `MgrEcDispatchInflight { extent_id,
+    target_nodes, extra_disk_ids, data_shards, new_eversion }` in
+    `crates/rpc/src/manager_rpc.rs`.
+  - `persist_ec_conversion_inflight(&record)` (signature changed) now
+    serialises the record into the etcd marker value.
+  - `replay_from_etcd` decodes marker values into
+    `pending_ec_dispatch: Rc<RefCell<HashMap<u64,
+    MgrEcDispatchInflight>>>`.
+  - `ec_conversion_dispatch_loop` body checks
+    `pending_ec_dispatch.get(&extent_id)` first. On replay match:
+    reuse persisted target_nodes + extra_disk_ids + new_eversion
+    exactly (no shuffle, no `alloc_extent_on_node`).
+  - Old `if ec_conversion_inflight.contains(&extent_id) { continue; }`
+    gated on `replay_params.is_none()` so concurrent-dispatch
+    semantics within a single process are preserved.
+  - Initial dispatch delay reduced from 5 s → 500 ms (one-shot)
+    so post-restart convergence is fast.
+  - PS-side `recover_partition` SST read wraps
+    `read_bytes_from_extent` in a 30 × 1 s retry on
+    `eversion mismatch` so the user's first `cluster.sh restart`
+    succeeds without a second manual restart — manager converges
+    within ~1 tick.
+
+Files touched:
+  - crates/rpc/src/manager_rpc.rs:      +25  (new struct + docs)
+  - crates/manager/src/lib.rs:          +85  (field, replay decode,
+                                              persist signature change,
+                                              2 unit tests)
+  - crates/manager/src/recovery.rs:     +85  (replay-aware branch,
+                                              initial-delay reduction)
+  - crates/partition-server/src/lib.rs: +30  (retry loop)
+  - feature_list.md:                    F198 entry above F173
+  - claude-progress.txt:                this file
+
+Tests:
+  - cargo build --workspace --exclude autumn-fuse: clean.
+  - cargo test -p autumn-manager --lib: 70/70 (was 68/68, +2 new F198
+                                                tests).
+  - cargo test -p autumn-stream --lib: 51/51 (no regressions).
+  - Pre-existing failures unrelated to F198:
+    - autumn-partition-server: 2 in f099i_tests (poisoned mutex on
+      global counter, pre-existing on main).
+    - autumn-manager tests/ec_integration.rs: replication_stream_works
+      (pre-existing on main).
 
 Out of scope (deferred):
-  - NeedsMerge wire response (user deferred; reject-only for now).
-  - Auto-merge on advisory (advisory stays informational).
-  - Dynamic cpuset resize without process restart.
-  - Manager-side awareness of per-PS core budgets for routing.
+  - Legacy empty-marker handling: replay logs WARN and skips. No
+    pre-F198 deployments exist with stale markers; operator clears
+    `ecConversionInflight/<id>` manually if needed.
+  - `apply_ec_conversion_done`'s memory-first/etcd-second ordering
+    violates the manager etcd-first rule (programming note 1) but
+    is idempotent on retry under F198; cleaning that up is a
+    separate refactor.
 
-Closes F196. Next-session starting point: feature_list.md F196 entry +
-this file's "Final state" section together describe what shipped.
+Closes user-reported "PS startup fails after split/compact/restart on
+large-value partition" bug.
+
+Next-session starting point: feature_list.md F198 entry + this file's
+"Fix" section together describe what shipped.

@@ -155,6 +155,30 @@ pub struct MgrDiskInfo {
     pub uuid: String,
 }
 
+/// F198: rkyv-encoded value of the `ecConversionInflight/<extent_id>` etcd
+/// marker. F173 originally persisted only the existence of the marker
+/// (empty value); on leader failover or process restart the new leader
+/// could not safely re-dispatch because it didn't know which `target_nodes`
+/// the deposed leader had selected (a fresh `shuffle().take(extra)` would
+/// pick different parity-node IDs, and `alloc_extent_on_node` against a
+/// node that already received shard data resets that node's in-memory
+/// state — silently corrupting EC layout). F198 widens the marker so
+/// re-dispatch can reuse the original assignment.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrEcDispatchInflight {
+    pub extent_id: u64,
+    /// Full data+parity node id list, in shard-index order (data shards
+    /// first, then parity shards). `replicates ++ parity` after a
+    /// successful `apply_ec_conversion_done`.
+    pub target_nodes: Vec<u64>,
+    /// Disk-id-per-extra-parity-node returned by `alloc_extent_on_node`
+    /// during the original dispatch. Used to rebuild `replicate_disks /
+    /// parity_disks` in `apply_ec_conversion_done` on re-dispatch.
+    pub extra_disk_ids: Vec<u64>,
+    pub data_shards: u32,
+    pub new_eversion: u64,
+}
+
 /// Extent metadata — mirrors proto ExtentInfo.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MgrExtentInfo {

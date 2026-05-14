@@ -1394,6 +1394,41 @@ Cleared by audit (no fix needed):
 - **Files:** `feature_list.md`, `claude-progress.txt`. (No code changes.)
 - **passes:** true (audit-cleared)
 
+### F198 · Rich `ec_conversion_inflight` marker — fix EC dispatch stuck-state on restart
+- **Target:** Reported by user 2026-05-14: cluster reset + many split/compact rounds on partition 15 with large values → macOS slowdown → `cluster.sh restart 4` → PS startup fails on `partition 15`: `read SST from rowStream extent=20 offset=0: eversion mismatch (stale extent_info_cache)`. Manager replays `ecConversionInflight/<id>` markers (F173) but the F173 marker carried only the extent_id, not the original dispatch's `target_nodes` assignment. The `ec_conversion_dispatch_loop` body further had `if ec_conversion_inflight.contains(&extent_id) { continue; }` which **permanently skipped** replay-loaded markers — the manager's etcd state (`ec_converted=false`, pre-EC eversion) never converged with the extent-node's local state (post-EC eversion bumped via `commit_shard_local`). Reads kept returning CODE_EVERSION_MISMATCH; the 2-attempt `read_bytes_from_extent` refetch loop re-loaded the same stale manager state every time.
+- **Why F173 wasn't enough:** F173 intended for the next `ec_conversion_dispatch_loop` tick to "re-fire the convert path which is idempotent (F119-D)" but the implementation skipped the tick on `contains(&extent_id)`. Even removing the skip alone is unsafe: the fresh dispatch path runs `shuffle().take(extra_needed)` + `alloc_extent_on_node` to pick parity nodes. A second call to `alloc_extent_on_node` on a node that already received shard data in the prior dispatch RESETS that node's in-memory ExtentEntry (eversion=1, sealed=0) and overwrites its `.meta` sidecar — silently corrupting EC layout. `apply_ec_conversion_done` would then write the new (possibly different) random parity assignment to etcd, abandoning whichever node actually holds the parity shard.
+- **Approach (rich marker + replay-aware dispatch):**
+  - New rkyv type `MgrEcDispatchInflight { extent_id, target_nodes, extra_disk_ids, data_shards, new_eversion }` (`crates/rpc/src/manager_rpc.rs`).
+  - `persist_ec_conversion_inflight(&record)` now serialises the record into the `ecConversionInflight/<id>` value (was empty).
+  - `replay_from_etcd` decodes marker values into `pending_ec_dispatch: Rc<RefCell<HashMap<u64, MgrEcDispatchInflight>>>` alongside the existing `ec_conversion_inflight` lock-set.
+  - `ec_conversion_dispatch_loop` checks `pending_ec_dispatch.get(&extent_id)` BEFORE running the shuffle/alloc path. On replay match: reuse persisted `target_nodes` + `extra_disk_ids` + `new_eversion` exactly (no shuffle, no `alloc_extent_on_node`). The old `contains(&extent_id)` skip is gated on `replay_params.is_none()` so the lock semantics for in-process duplicate dispatch are preserved.
+  - Initial dispatch delay reduced from 5 s → 500 ms (one-shot, then 5 s steady-state) so post-restart re-dispatch fires before PS retries time out.
+  - PS-side `recover_partition` SST read wraps `read_bytes_from_extent` in a 30 × 1 s retry on `eversion mismatch` so the operator's first `cluster.sh restart` succeeds without a second manual restart — the manager converges state within one tick.
+- **Why pre-F198 empty markers stay safe:**
+  - Replay logs a warning per legacy empty marker and skips the dispatch path; the F138/F145/F146 mutator-blocking semantics still hold via `decoded_ec_inflight`. Operator can clear the marker manually (delete `ecConversionInflight/<id>` from etcd) once the underlying data state is verified; thereafter the dispatch loop picks up the extent on its next tick as a fresh candidate. No production deployments exist with mixed pre-/post-F198 markers at this point.
+- **Cost:**
+  - Marker payload grows from 0 bytes to ~40-60 bytes (rkyv-encoded `MgrEcDispatchInflight` with 4 u64s + 4-element node Vec). Etcd marker lifespan is unchanged (seconds-bounded by the dispatch RPC).
+  - One additional `HashMap<u64, MgrEcDispatchInflight>` field on `AutumnManager`.
+- **Files:**
+  - `crates/rpc/src/manager_rpc.rs`: new `MgrEcDispatchInflight` rkyv struct.
+  - `crates/manager/src/lib.rs`: `pending_ec_dispatch` field, replay decoder, modified `persist_ec_conversion_inflight` signature, F198 unit tests.
+  - `crates/manager/src/recovery.rs`: replay-aware branch in `ec_conversion_dispatch_loop`; initial delay reduced to 500 ms.
+  - `crates/partition-server/src/lib.rs`: 30 × 1 s retry on `eversion mismatch` during `recover_partition` SST read.
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-manager --lib`: 70/70 (incl 2 new F198 tests: rkyv roundtrip + in-memory bookkeeping).
+  - `cargo test -p autumn-stream --lib`: 51/51 (no regressions).
+  - Pre-existing failures unrelated to this fix: 2 in `f099i_tests` (poisoned mutex on global counter); 1 in `tests/ec_integration.rs replication_stream_works` (also fails on main pre-F198).
+- **Manual test plan (the user's reported repro):**
+  1. `sh cluster.sh reset 4`.
+  2. `sh cluster.sh put-large <partition 15 key> <large-value>` (>4 KiB so it lands in log_stream as VP).
+  3. `sh cluster.sh client compact 15` then split 15 a few rounds.
+  4. SIGKILL all four PSes and the manager mid-write (forces a window where `apply_ec_conversion_done` hasn't committed).
+  5. `sh cluster.sh restart 4`.
+  6. **Before F198:** PS startup fails with `partition 15 thread exited before reporting listener readiness` and `eversion mismatch (stale extent_info_cache)`.
+  7. **After F198:** PS startup logs `F198: SST read returned eversion mismatch during open — waiting 1 s ...` for ~1-2 attempts, then proceeds. Total open delay <3 s.
+- **passes:** true
+
 ### F173 · Persist `ec_conversion_inflight` to etcd (defense-in-depth across leader failover)
 - **Target:** Close the remaining `ec_conversion_inflight` failover-window concern flagged in F154's deferred footnote. F138's eversion-bump-lock semantics ("while extent X ∈ `ec_conversion_inflight`, no other manager-side mutator may bump `ex.eversion`") only hold within a single leader's lifetime — the HashSet was purely in-memory. On leader failover the new leader's set was empty, so its `recovery_dispatch_loop` could fire `re_avali` / `require_recovery` on an extent the deposed leader was actively converting. Downstream defenses (F119-D coordinator idempotency, F153 extent-node per-extent EC lock, F119-C read-side eversion check) made the race non-corrupting in practice, but each fires post-hoc — F173 closes the window at the source.
 - **Approach:** persist a marker key per in-flight extent.

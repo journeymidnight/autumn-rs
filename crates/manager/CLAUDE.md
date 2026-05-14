@@ -603,3 +603,43 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     new thresholds + cooldowns (defaults: 1 GiB / 4 GiB / 300 s / 300 s).
     Tests in `policy_tests.rs` (7 new + 11 existing = 18 passing) cover
     the trigger / cooldown / inflight / partial-window cases.
+
+19. **F198 rich `ecConversionInflight/<id>` marker.** F173 persisted the
+    EC-conversion inflight marker to etcd to preserve F138's eversion-bump
+    lock across leader failover, but the marker had an EMPTY value and the
+    `ec_conversion_dispatch_loop` body's `if ec_conversion_inflight.contains
+    (&extent_id) { continue; }` permanently skipped replay-loaded markers.
+    Result: after a crash mid-`apply_ec_conversion_done` (manager-side
+    etcd commit didn't run, extent-node-side `commit_shard_local` already
+    bumped local eversion), the manager's etcd state stayed pre-EC
+    forever — every PS read against that extent surfaced the
+    eversion-mismatch with no convergence path.
+
+    F198 widens the marker to a rkyv-encoded `MgrEcDispatchInflight {
+    extent_id, target_nodes, extra_disk_ids, data_shards, new_eversion }`.
+    Replay decodes the value into `pending_ec_dispatch: Rc<RefCell<HashMap
+    <u64, MgrEcDispatchInflight>>>` ALONGSIDE the existing lock-set; the
+    dispatch loop checks `pending_ec_dispatch.get(&extent_id)` BEFORE the
+    shuffle/`alloc_extent_on_node` path and reuses the persisted
+    assignment exactly. The old skip is preserved (gated on
+    `replay_params.is_none()`) so concurrent-dispatch semantics within a
+    single process don't change.
+
+    Why we can't just remove the skip: a naive re-dispatch with a fresh
+    `shuffle().take(extra_needed)` could pick a different parity node
+    than the original. Calling `alloc_extent_on_node` on a node that
+    already received shard data RESETS that node's in-memory ExtentEntry
+    (eversion=1, sealed=0) and overwrites the .meta sidecar, then
+    `apply_ec_conversion_done` writes the new random parity to etcd —
+    silently corrupting EC layout. F198's rich marker eliminates the
+    randomness on re-dispatch.
+
+    Companion: `ec_conversion_dispatch_loop`'s first-tick delay was
+    reduced from 5 s → 500 ms so post-restart convergence is fast
+    enough that the PS-side `recover_partition` retry budget covers it.
+    PS side: `recover_partition`'s SST read now retries 30 × 1 s on
+    `eversion mismatch` so the operator's first `cluster.sh restart`
+    succeeds — pre-F198 they had to manually restart the PS a second
+    time after the manager finished re-dispatching (and even then,
+    re-dispatch was the no-op skip path so the first restart would
+    fail too).

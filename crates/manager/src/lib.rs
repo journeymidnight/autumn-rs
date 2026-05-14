@@ -330,6 +330,19 @@ pub struct AutumnManager {
     instance_id: Rc<String>,
     recovery_tasks: Rc<RefCell<HashMap<u64, MgrRecoveryTask>>>,
     ec_conversion_inflight: Rc<RefCell<HashSet<u64>>>,
+    /// F198: rich-marker companion to `ec_conversion_inflight`. Populated
+    /// from the etcd marker value on replay and on every fresh dispatch.
+    /// Reads: `ec_conversion_dispatch_loop` checks this BEFORE running the
+    /// shuffle / `alloc_extent_on_node` path so a replay-loaded marker
+    /// re-dispatches against the ORIGINAL target_nodes assignment.
+    /// Without this map, the dispatch loop's old line-685 check
+    /// `if ec_conversion_inflight.contains(&extent_id) { continue; }`
+    /// permanently blocked the new leader from finishing a crashed EC
+    /// conversion (it skipped — but `apply_ec_conversion_done` never
+    /// committed in etcd, so PS reads kept hitting the post-EC eversion
+    /// on the extent-node side via stale-cached `ExtentInfo` from the
+    /// manager).
+    pub(crate) pending_ec_dispatch: Rc<RefCell<HashMap<u64, MgrEcDispatchInflight>>>,
     runtime_started: Rc<Cell<bool>>,
     ps_last_heartbeat: Rc<RefCell<HashMap<u64, Instant>>>,
     conn_pool: Rc<ConnPool>,
@@ -403,6 +416,7 @@ impl AutumnManager {
             instance_id: Rc::new(uuid::Uuid::new_v4().to_string()),
             recovery_tasks: Rc::new(RefCell::new(HashMap::new())),
             ec_conversion_inflight: Rc::new(RefCell::new(HashSet::new())),
+            pending_ec_dispatch: Rc::new(RefCell::new(HashMap::new())),
             runtime_started: Rc::new(Cell::new(false)),
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),
             conn_pool: Rc::new(ConnPool::new()),
@@ -1122,11 +1136,40 @@ impl AutumnManager {
             decoded_regions.insert(id, region);
         }
 
-        // F173: parse extent_ids from `ecConversionInflight/` keys.
+        // F173 + F198: parse extent_ids from `ecConversionInflight/` keys
+        // AND decode the rkyv marker value into `pending_ec_dispatch` so
+        // the next `ec_conversion_dispatch_loop` tick re-dispatches with
+        // the ORIGINAL target_nodes (not a fresh shuffle).
         let mut decoded_ec_inflight: HashSet<u64> = HashSet::new();
+        let mut decoded_pending_dispatch: HashMap<u64, MgrEcDispatchInflight> = HashMap::new();
         for kv in &ec_inflight.kvs {
             let id = Self::parse_id_from_key("ecConversionInflight/", &kv.key)?;
             decoded_ec_inflight.insert(id);
+            if !kv.value.is_empty() {
+                match rkyv_decode::<MgrEcDispatchInflight>(&kv.value) {
+                    Ok(rec) => {
+                        decoded_pending_dispatch.insert(id, rec);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            extent_id = id,
+                            error = %e,
+                            "F198: failed to decode ecConversionInflight marker value; \
+                             leaving extent in inflight-locked state until next tick"
+                        );
+                    }
+                }
+            } else {
+                // Pre-F198 marker (empty value) — the eversion-bump lock is
+                // preserved via `decoded_ec_inflight`, but we cannot safely
+                // re-dispatch without the original target_nodes. Operator
+                // intervention may be needed; log so it's visible.
+                tracing::warn!(
+                    extent_id = id,
+                    "F198: legacy empty ecConversionInflight marker (no target_nodes); \
+                     dispatch loop will skip until marker is cleared by operator or apply"
+                );
+            }
         }
 
         // F183: parse partitionLastOp/ sidecar (i64 little-endian)
@@ -1160,6 +1203,9 @@ impl AutumnManager {
         // recovery_dispatch_loop could fire on extents the prior leader
         // was converting.
         *self.ec_conversion_inflight.borrow_mut() = decoded_ec_inflight;
+        // F198: install the rich-marker view alongside the lock-set so
+        // the dispatch loop can drive replay-loaded markers forward.
+        *self.pending_ec_dispatch.borrow_mut() = decoded_pending_dispatch;
         // F183: install last_op_at sidecar so policy engine cooldown
         // gating is correct on cold-start as well.
         *self.last_op_at.borrow_mut() = decoded_last_op;
@@ -2000,12 +2046,21 @@ impl AutumnManager {
     /// practice, but each defense fires post-hoc — F173 closes the
     /// window at the source.
     ///
-    /// The marker value is empty (existence is the signal).
-    async fn persist_ec_conversion_inflight(&self, extent_id: u64) -> Result<(), AppError> {
+    /// F198: marker value carries the full dispatch params (rkyv-encoded
+    /// `MgrEcDispatchInflight`). Pre-F198 the value was empty; replay
+    /// restored only the lock-set, and the dispatch loop's
+    /// `ec_conversion_inflight.contains` skip permanently blocked the
+    /// new leader from re-dispatching. Now replay decodes the params
+    /// into `pending_ec_dispatch` and the dispatch loop reuses them.
+    async fn persist_ec_conversion_inflight(
+        &self,
+        record: &MgrEcDispatchInflight,
+    ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
+            let value = rkyv_encode(record).to_vec();
             etcd.put_msgs_txn(vec![(
-                format!("ecConversionInflight/{}", extent_id),
-                Vec::new(),
+                format!("ecConversionInflight/{}", record.extent_id),
+                value,
             )])
             .await?;
         }
@@ -4862,5 +4917,64 @@ mod tests {
                 "F147-A: vp_table_refs must be 1 after sync"
             );
         })
+    }
+
+    // ── F198: rich-marker rkyv roundtrip + pending_ec_dispatch bookkeeping ──
+
+    /// The marker value persisted to etcd must round-trip rkyv encode/decode
+    /// without losing any field. Pre-F198 the marker had an empty value;
+    /// post-F198 the value carries `target_nodes` so re-dispatch after
+    /// failover uses the original assignment instead of a fresh shuffle.
+    #[test]
+    fn f198_ec_dispatch_inflight_rkyv_roundtrip() {
+        let original = MgrEcDispatchInflight {
+            extent_id: 42,
+            target_nodes: vec![1, 3, 5, 7],
+            extra_disk_ids: vec![19],
+            data_shards: 3,
+            new_eversion: 9,
+        };
+        let bytes = rkyv_encode(&original).to_vec();
+        let decoded: MgrEcDispatchInflight = rkyv_decode(&bytes).expect("decode");
+        assert_eq!(decoded.extent_id, original.extent_id);
+        assert_eq!(decoded.target_nodes, original.target_nodes);
+        assert_eq!(decoded.extra_disk_ids, original.extra_disk_ids);
+        assert_eq!(decoded.data_shards, original.data_shards);
+        assert_eq!(decoded.new_eversion, original.new_eversion);
+    }
+
+    /// `pending_ec_dispatch` is initialised empty and lives on
+    /// `AutumnManager`; insertions and removals on the in-memory map are
+    /// visible to the dispatch loop via the same `Rc<RefCell<_>>`.
+    #[test]
+    fn f198_pending_ec_dispatch_in_memory_bookkeeping() {
+        let m = AutumnManager::new();
+        assert!(
+            m.pending_ec_dispatch.borrow().is_empty(),
+            "F198: pending_ec_dispatch starts empty"
+        );
+
+        let rec = MgrEcDispatchInflight {
+            extent_id: 7,
+            target_nodes: vec![1, 3, 5, 7],
+            extra_disk_ids: vec![19],
+            data_shards: 3,
+            new_eversion: 4,
+        };
+        m.pending_ec_dispatch.borrow_mut().insert(rec.extent_id, rec.clone());
+        let got = m
+            .pending_ec_dispatch
+            .borrow()
+            .get(&7)
+            .cloned()
+            .expect("present");
+        assert_eq!(got.target_nodes, vec![1, 3, 5, 7]);
+        assert_eq!(got.new_eversion, 4);
+
+        m.pending_ec_dispatch.borrow_mut().remove(&7);
+        assert!(
+            m.pending_ec_dispatch.borrow().is_empty(),
+            "F198: cleared after apply"
+        );
     }
 }

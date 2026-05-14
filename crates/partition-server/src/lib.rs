@@ -4583,15 +4583,47 @@ async fn recover_partition(
             }
         }
         for loc in all_locs {
-            let (sst_bytes, _end) = part_sc
-                .read_bytes_from_extent(loc.extent_id, loc.offset, loc.len)
-                .await
-                .with_context(|| {
-                    format!(
-                        "read SST from rowStream extent={} offset={}",
-                        loc.extent_id, loc.offset
-                    )
-                })?;
+            // F198: bounded retry on eversion-mismatch during open. A
+            // post-restart manager whose `apply_ec_conversion_done` did
+            // not commit in its previous lifetime keeps stale (pre-EC)
+            // `ExtentInfo.eversion` in etcd while the extent-node's local
+            // file already holds the post-EC eversion. The manager-side
+            // `ec_conversion_dispatch_loop` re-dispatches via the F198
+            // rich marker and converges manager state within ~1 tick
+            // (≤ 0.5 s on first iter, then 5 s); we retry with backoff
+            // until convergence so the operator doesn't have to manually
+            // restart the PS a second time. Cap at ~30 s — past that we
+            // surface the error so it doesn't hide a non-EC fault.
+            let mut attempt: u32 = 0;
+            let (sst_bytes, _end) = loop {
+                match part_sc
+                    .read_bytes_from_extent(loc.extent_id, loc.offset, loc.len)
+                    .await
+                {
+                    Ok(v) => break v,
+                    Err(e) if attempt < 30 && e.to_string().contains("eversion mismatch") => {
+                        attempt += 1;
+                        tracing::warn!(
+                            part_id = _part_id,
+                            extent_id = loc.extent_id,
+                            offset = loc.offset,
+                            attempt,
+                            "F198: SST read returned eversion mismatch during open — \
+                             waiting 1 s for manager to converge state, will retry"
+                        );
+                        compio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "read SST from rowStream extent={} offset={}",
+                                loc.extent_id, loc.offset
+                            )
+                        });
+                    }
+                }
+            };
 
             let sst_bytes = Bytes::from(sst_bytes);
             let reader = SstReader::from_bytes(sst_bytes.clone()).with_context(|| {
