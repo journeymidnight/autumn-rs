@@ -1,102 +1,47 @@
 Date: 2026-05-14
 TaskStatus: completed
-Task scope: F198 — fix EC dispatch stuck-state on restart (rich
-            `ecConversionInflight/` marker + replay-aware dispatch +
-            PS open eversion-mismatch retry).
+Task scope: F199 — per-extent GC failure cooldown (stop hammering
+            broken EC layouts on macOS test cluster).
 
-User-reported bug (2026-05-14):
-  - `sh cluster.sh reset 4`, write large values to partition 15, split
-    15 + compact 15 several rounds, macOS slows down, then
-    `sh cluster.sh restart 4`.
-  - PS startup fails on partition 15 with `read SST from rowStream
-    extent=20 offset=0: eversion mismatch (stale extent_info_cache)`.
-  - `partition 15 thread exited before reporting listener readiness`.
+User-reported (2026-05-14, follow-on to F198):
+  - Test cluster with one node's disk offline (`disk 8: online=false`).
+  - Partition opens fine after F198, but local `background_gc_loop`
+    re-tries `run_gc` on the same 2.8 GB EC(3+1) extent every 5-7 s.
+  - Each failure path: `ec_subrange_read` → one shard read fails (disk
+    offline) → fall back to `ec_read_full_and_slice` → 4 × 933 MB
+    parallel reads with 5 s timeout → "0/3 shards available for EC
+    decode" → log error → next tick same thing.
+  - macOS CPU/IO saturated.
 
-Root cause:
-  1. EC conversion was mid-flight when the cluster died. The
-     extent-node's `commit_shard_local` bumped local eversion + wrote
-     shard data, but the manager's `apply_ec_conversion_done` didn't
-     commit to etcd. Etcd still has the pre-EC eversion.
-  2. On restart, the manager replays the etcd marker (F173) — but
-     the marker was empty. The dispatch loop body had
-     `if ec_conversion_inflight.contains(&id) { continue; }` which
-     permanently SKIPPED replay-loaded markers. Etcd state never
-     converged.
-  3. PS reads pulled `ExtentInfo.eversion` from manager (stale,
-     pre-EC) and sent it in `ReadBytesReq`. Extent-node's
-     `req.eversion < ev` check rejected with CODE_EVERSION_MISMATCH.
-     PS's 2-attempt `read_bytes_from_extent` refetch loop got the
-     same stale eversion every time → recover_partition failed →
-     partition thread exited.
-
-Why F119-D + F173 alone didn't cover this:
-  - F119-D coordinator idempotency is fine for re-dispatch.
-  - F173 persisted the lock-set but used an EMPTY marker value.
-    Replay-loaded markers couldn't be safely re-dispatched without
-    the original `target_nodes` (a fresh `shuffle().take(extra)`
-    + `alloc_extent_on_node` would reset an already-converted
-    parity node's in-memory state and overwrite its .meta sidecar
-    — silently corrupting the EC layout. Manager would then commit
-    `ex.parity = [random_node]` to etcd, pointing AWAY from the
-    node that actually holds the parity shard).
-
-Fix (F198):
-  - New rkyv struct `MgrEcDispatchInflight { extent_id,
-    target_nodes, extra_disk_ids, data_shards, new_eversion }` in
-    `crates/rpc/src/manager_rpc.rs`.
-  - `persist_ec_conversion_inflight(&record)` (signature changed) now
-    serialises the record into the etcd marker value.
-  - `replay_from_etcd` decodes marker values into
-    `pending_ec_dispatch: Rc<RefCell<HashMap<u64,
-    MgrEcDispatchInflight>>>`.
-  - `ec_conversion_dispatch_loop` body checks
-    `pending_ec_dispatch.get(&extent_id)` first. On replay match:
-    reuse persisted target_nodes + extra_disk_ids + new_eversion
-    exactly (no shuffle, no `alloc_extent_on_node`).
-  - Old `if ec_conversion_inflight.contains(&extent_id) { continue; }`
-    gated on `replay_params.is_none()` so concurrent-dispatch
-    semantics within a single process are preserved.
-  - Initial dispatch delay reduced from 5 s → 500 ms (one-shot)
-    so post-restart convergence is fast.
-  - PS-side `recover_partition` SST read wraps
-    `read_bytes_from_extent` in a 30 × 1 s retry on
-    `eversion mismatch` so the user's first `cluster.sh restart`
-    succeeds without a second manual restart — manager converges
-    within ~1 tick.
+Fix:
+  - `background_gc_loop` carries a `HashMap<u64, Instant>` of recent
+    `run_gc` failures.
+  - `GC_FAILURE_COOLDOWN` = 5 min. Auto tasks filter holes against
+    this map; Force tasks bypass.
+  - Success → remove from map. Failure → stamp `Instant::now()`.
+  - Stale entries evicted lazily on each pickup pass.
 
 Files touched:
-  - crates/rpc/src/manager_rpc.rs:      +25  (new struct + docs)
-  - crates/manager/src/lib.rs:          +85  (field, replay decode,
-                                              persist signature change,
-                                              2 unit tests)
-  - crates/manager/src/recovery.rs:     +85  (replay-aware branch,
-                                              initial-delay reduction)
-  - crates/partition-server/src/lib.rs: +30  (retry loop)
-  - feature_list.md:                    F198 entry above F173
-  - claude-progress.txt:                this file
+  - crates/partition-server/src/background.rs: +30 lines.
+  - feature_list.md: F199 entry above F198.
+  - claude-progress.txt: this file.
 
 Tests:
-  - cargo build --workspace --exclude autumn-fuse: clean.
-  - cargo test -p autumn-manager --lib: 70/70 (was 68/68, +2 new F198
-                                                tests).
-  - cargo test -p autumn-stream --lib: 51/51 (no regressions).
-  - Pre-existing failures unrelated to F198:
-    - autumn-partition-server: 2 in f099i_tests (poisoned mutex on
-      global counter, pre-existing on main).
-    - autumn-manager tests/ec_integration.rs: replication_stream_works
-      (pre-existing on main).
+  - cargo build -p autumn-partition-server --lib: clean.
+  - cargo test -p autumn-partition-server --lib: 138/139 passed.
+    The 1 fail (`f099i_d1_fast_path_no_fu_allocation`) is pre-existing
+    on main (poisoned mutex on global counter), unrelated to F199.
 
-Out of scope (deferred):
-  - Legacy empty-marker handling: replay logs WARN and skips. No
-    pre-F198 deployments exist with stale markers; operator clears
-    `ecConversionInflight/<id>` manually if needed.
-  - `apply_ec_conversion_done`'s memory-first/etcd-second ordering
-    violates the manager etcd-first rule (programming note 1) but
-    is idempotent on retry under F198; cleaning that up is a
-    separate refactor.
+Deferred (F200+):
+  - Sub-range RS reconstruction in `ec_subrange_read` so a missing
+    data shard doesn't trigger full-extent fall-back. The right
+    long-term fix; F199 only stops the retry storm.
+  - Configurable cooldown duration via env var.
 
-Closes user-reported "PS startup fails after split/compact/restart on
-large-value partition" bug.
+Prior F198 status (still: completed):
+  - F198 rich `ecConversionInflight/` marker prevents EC dispatch
+    stuck-state on restart. Two commits: 187dab3 + c3d07b3 already
+    pushed to main.
 
-Next-session starting point: feature_list.md F198 entry + this file's
-"Fix" section together describe what shipped.
+Next session: feature_list.md F198 + F199 entries describe both
+shipped fixes.

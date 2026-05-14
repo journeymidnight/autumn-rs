@@ -339,6 +339,20 @@ pub(crate) async fn background_gc_loop(
 ) {
     const MAX_GC_ONCE: usize = 3;
     const GC_DISCARD_RATIO: f64 = 0.4;
+    // F199: per-extent failure cooldown. When `run_gc` fails on an
+    // extent (typically because a data shard's host node has an
+    // offline disk → `ec_subrange_read` falls back to
+    // `ec_read_full_and_slice` which times out trying to download the
+    // whole 933+ MB shard set), skip that extent in subsequent local
+    // ticks for `GC_FAILURE_COOLDOWN`. Without this, the local 5-7 s
+    // random-delay loop hammered the broken extent every cycle —
+    // each cycle launching parallel reads across all replicas for
+    // multi-GB shards and timing out. Observed by user on macOS test
+    // cluster: continuous CPU/IO saturation from GC retries against
+    // a permanently-degraded EC layout (one node's disk offline).
+    const GC_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
+    let mut gc_failure_cooldown: std::collections::HashMap<u64, Instant> =
+        std::collections::HashMap::new();
     // F188: short timer for `gc_debt_bytes` metric refresh. The Auto
     // task that fires off the timer ALSO refreshes the metric, but
     // since we're keeping the loop responsive for scheduler dispatches
@@ -494,7 +508,8 @@ pub(crate) async fn background_gc_loop(
             .gc_debt_bytes
             .store(gc_debt, std::sync::atomic::Ordering::Relaxed);
 
-        let holes: Vec<u64> = match gc_task {
+        let is_force = matches!(gc_task, GcTask::Force { .. });
+        let mut holes: Vec<u64> = match gc_task {
             GcTask::Force { ref extent_ids } => {
                 let idx: HashSet<u64> = sealed_extents.iter().copied().collect();
                 extent_ids.iter().copied().filter(|e| idx.contains(e)).take(MAX_GC_ONCE).collect()
@@ -526,6 +541,30 @@ pub(crate) async fn background_gc_loop(
                 holes
             }
         };
+
+        // F199: filter against the per-extent failure cooldown. Force
+        // tasks bypass the cooldown (operator override), Auto tasks
+        // respect it. Stale entries (older than the cooldown window)
+        // are evicted lazily to keep the map bounded.
+        if !is_force {
+            let now = Instant::now();
+            gc_failure_cooldown
+                .retain(|_, t| now.duration_since(*t) < GC_FAILURE_COOLDOWN);
+            let initial_len = holes.len();
+            holes.retain(|eid| {
+                gc_failure_cooldown
+                    .get(eid)
+                    .map_or(true, |t| now.duration_since(*t) >= GC_FAILURE_COOLDOWN)
+            });
+            if holes.len() < initial_len {
+                tracing::info!(
+                    skipped = initial_len - holes.len(),
+                    remaining = holes.len(),
+                    cooldown_secs = GC_FAILURE_COOLDOWN.as_secs(),
+                    "F199: GC skipping recently-failed extents (cooldown active)"
+                );
+            }
+        }
 
         if holes.is_empty() {
             // F189-fix HIGH-2 + r2: same stamp-then-clear rationale as
@@ -559,8 +598,24 @@ pub(crate) async fn background_gc_loop(
                     continue;
                 }
             };
-            if let Err(e) = run_gc(&part, eid, sealed_length).await {
-                tracing::error!("GC run_gc extent {eid}: {e}");
+            match run_gc(&part, eid, sealed_length).await {
+                Ok(()) => {
+                    // F199: success → clear any prior failure stamp so
+                    // a transient EC fall-back hiccup doesn't suppress
+                    // the next legitimate GC need.
+                    gc_failure_cooldown.remove(&eid);
+                }
+                Err(e) => {
+                    tracing::error!("GC run_gc extent {eid}: {e}");
+                    // F199: stamp the failure so subsequent local ticks
+                    // skip this extent for GC_FAILURE_COOLDOWN. The
+                    // typical failure (`only N/K shards available for
+                    // EC decode`) means at least one data shard's host
+                    // disk is offline; retrying every 5-7 s would just
+                    // burn CPU/IO on doomed `ec_read_full_and_slice`
+                    // fall-back attempts.
+                    gc_failure_cooldown.insert(eid, Instant::now());
+                }
             }
         }
         // F189-fix HIGH-2 + r2: stamp BEFORE clear so the scheduler

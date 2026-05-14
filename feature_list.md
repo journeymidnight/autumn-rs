@@ -1394,6 +1394,32 @@ Cleared by audit (no fix needed):
 - **Files:** `feature_list.md`, `claude-progress.txt`. (No code changes.)
 - **passes:** true (audit-cleared)
 
+### F199 · Per-extent GC failure cooldown — stop hammering broken EC layouts
+- **Target:** Reported by user 2026-05-14 on macOS test cluster: after upgrade + restart + `client compact 15`, the partition starts but the local `background_gc_loop` (5-7 s `random_delay` between auto ticks) keeps picking the same extent (extent 10, 2.8 GB EC(3+1)) whose `data[0]` host node has an offline disk (`disk 8: online=false`). Each `run_gc` chunk read hits `ec_subrange_read` → one shard read fails → fall back to `ec_read_full_and_slice` → 4 parallel reads of 933 MB shards with a 5 s per-shard timeout → "0/3 shards available for EC decode". Repeats every ~15 s indefinitely, saturating CPU/IO on the test machine.
+- **Approach (minimum change, per-extent cooldown):**
+  - `background_gc_loop` carries a `HashMap<u64, Instant>` of recent `run_gc` failures.
+  - `GC_FAILURE_COOLDOWN` = 5 min. After picking holes from the discards map, Auto tasks filter out extents whose last failure is within the cooldown window. Force tasks (operator `client gc-force`) bypass the cooldown.
+  - On `run_gc` Ok: remove the extent from the cooldown map (so future legitimate triggers fire immediately).
+  - On `run_gc` Err: stamp `Instant::now()` for the extent.
+  - Stale entries (older than the cooldown) are evicted lazily on each pickup pass — bounded memory.
+- **Why this is the right knob:**
+  - The fundamental issue is that `ec_subrange_read` falls back to `ec_read_full_and_slice` (full extent decode) when ANY single shard read fails. For a 2.8 GB EC(3+1) extent that's 3 × 933 MB of cross-network reads with 5 s timeouts — doomed when even one host's disk is offline. F199 doesn't fix that path (proper fix would be sub-range RS reconstruction — deferred to F200+), it just stops GC from re-triggering it every 15 s.
+  - The user's specific layout is recoverable through manager-side `recovery_dispatch_loop` replacing the offline-disk slot with a fresh node (which uses `ec_reconstruct_shard` from data-shard peers). Once recovery completes, the next GC tick (after cooldown) finds K healthy shards and succeeds.
+  - Force tasks (`autumn-client gc-force <extent_id>`) deliberately bypass the cooldown so an operator can override after the underlying problem is fixed.
+- **Files:** `crates/partition-server/src/background.rs` (~30 lines added at top of `background_gc_loop` + at success/failure call site).
+- **Verification:**
+  - `cargo build -p autumn-partition-server --lib`: clean.
+  - `cargo test -p autumn-partition-server --lib`: 138/139 (the 1 fail is pre-existing `f099i_d1_fast_path_no_fu_allocation` poisoned-mutex, unrelated).
+- **Manual test plan:**
+  1. Cluster with a known-broken EC extent (e.g., reproduce user's setup: one node's disk offline).
+  2. Wait for partition to open + first GC tick to fail. Confirm `GC run_gc extent N: ...` error fires once.
+  3. Subsequent ticks log `F199: GC skipping recently-failed extents (cooldown active)` instead of re-running.
+  4. macOS CPU/IO pressure drops dramatically (1 failure per 5 min instead of 1 every 15 s).
+- **Deferred (F200+):**
+  - Sub-range RS reconstruction in `ec_subrange_read` so GC chunks can be served from K shards (skipping the broken one) without falling back to full-extent decode. Cleaner, but requires implementing partial-shard reconstruct in `ec_reconstruct_shard` callers.
+  - Configurable cooldown duration via env var.
+- **passes:** true
+
 ### F198 · Rich `ec_conversion_inflight` marker — fix EC dispatch stuck-state on restart
 - **Target:** Reported by user 2026-05-14: cluster reset + many split/compact rounds on partition 15 with large values → macOS slowdown → `cluster.sh restart 4` → PS startup fails on `partition 15`: `read SST from rowStream extent=20 offset=0: eversion mismatch (stale extent_info_cache)`. Manager replays `ecConversionInflight/<id>` markers (F173) but the F173 marker carried only the extent_id, not the original dispatch's `target_nodes` assignment. The `ec_conversion_dispatch_loop` body further had `if ec_conversion_inflight.contains(&extent_id) { continue; }` which **permanently skipped** replay-loaded markers — the manager's etcd state (`ec_converted=false`, pre-EC eversion) never converged with the extent-node's local state (post-EC eversion bumped via `commit_shard_local`). Reads kept returning CODE_EVERSION_MISMATCH; the 2-attempt `read_bytes_from_extent` refetch loop re-loaded the same stale manager state every time.
 - **Why F173 wasn't enough:** F173 intended for the next `ec_conversion_dispatch_loop` tick to "re-fire the convert path which is idempotent (F119-D)" but the implementation skipped the tick on `contains(&extent_id)`. Even removing the skip alone is unsafe: the fresh dispatch path runs `shuffle().take(extra_needed)` + `alloc_extent_on_node` to pick parity nodes. A second call to `alloc_extent_on_node` on a node that already received shard data in the prior dispatch RESETS that node's in-memory ExtentEntry (eversion=1, sealed=0) and overwrites its `.meta` sidecar — silently corrupting EC layout. `apply_ec_conversion_done` would then write the new (possibly different) random parity assignment to etcd, abandoning whichever node actually holds the parity shard.
