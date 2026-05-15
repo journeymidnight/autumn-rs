@@ -1394,6 +1394,54 @@ Cleared by audit (no fix needed):
 - **Files:** `feature_list.md`, `claude-progress.txt`. (No code changes.)
 - **passes:** true (audit-cleared)
 
+### F204 · Stale-VP read error attribution — structured sentinel + FailedPrecondition status
+- **Trigger:** User-reported 2026-05-15: `$AC get <key>` against a cluster carrying pre-2026-04-27 corruption surfaces as:
+  ```
+  Error: get: connection error: rpc status Internal:
+  ec_read_full_and_slice: offset 264784123 past decoded payload len 11570792
+    (requested length=10918365) for extent 29 (manager sealed_length=11570792)
+  ```
+  The `Internal` status code mis-signals this as a server bug. It's actually historical data corruption from the pre-fix `handle_stream_alloc_extent` × EC convert race (`crates/stream/CLAUDE.md` programming note 6 root-cause analysis): the manager's `sealed_length` value was shrunk down to `shard_size` during the pre-fix window, on-disk EC shards were physically truncated, bytes past `sealed_length` are not recoverable, and SSTs from that era hold `ValuePointer` triples pointing past the current `sealed_length`. Manager write-side paths are all fixed (F138/F145/F146/F147/F149 + the 2026-04-27 `tail.sealed_length > 0` guard); etcd state from the pre-fix era persists and cannot be self-detected.
+- **What this commit does:** structured error attribution at the read path so external operational tooling (per the `feedback_ops_tools_in_python` memory: future Python scripts that call `autumn-client`, NOT new `Command::*` variants) can distinguish "data permanently lost; clean up the key" from transient errors.
+  - New `pub struct StaleVpOffset` sentinel in `crates/stream/src/client.rs` (alongside the existing `EversionStale` pattern). Carries `(extent_id, requested_offset, requested_length, sealed_length)`. Display is a **stable wire contract**:
+    ```
+    stale_vp_offset_past_sealed_length: extent=<EID> offset=<OFF> length=<LEN> sealed_length=<SEAL>
+    ```
+    Prefix token and 4-field order MUST NOT change — Python regex contract.
+  - `ec_slice_decoded` signature gains `(extent_id, sealed_length)` so the out-of-bounds branch can construct the sentinel.
+  - `ec_read_full_and_slice` drops its outer `anyhow!("ec_read_full_and_slice: ...")` wrap; the sentinel surfaces unmodified through the anyhow chain.
+  - `crates/stream/src/lib.rs` re-exports `pub use client::StaleVpOffset` for downstream crates.
+  - `crates/partition-server/src/rpc_handlers.rs` adds `map_storage_error(&anyhow::Error) -> (StatusCode, String)` helper. It downcasts the anyhow chain for `StaleVpOffset` and returns `StatusCode::FailedPrecondition` with the sentinel's Display verbatim. Generic errors keep mapping to `StatusCode::Internal`. `handle_get` (line 192) is the only call site — `handle_range` returns keys only without VP resolve; `handle_head` reads metadata only.
+- **What this commit explicitly does NOT do** (user-driven scope reduction):
+  - **No `client audit-vps` CLI**: user signal "运维工具偏向 Python 实现，不要扩 autumn-client"; saved to memory `feedback-ops-tools-in-python`.
+  - **No `open_partition` startup integrity scan**: would need to walk every SST block; user explicitly said too slow.
+  - **No automated repair**: manager has no "previous correct sealed_length" to detect corruption; SSTs are immutable; physical shards were truncated. Cleanup is OP-driven via `client del <key>` + major compact.
+  - **No `replay_from_etcd` warn**: no reliable signal for "this loaded value is the historical wrong one".
+  - **No `apply_extent_meta` `fetch_max` guard on extent-node**: bug is on manager write-side which is already guarded; extent-node guard would defend against a class of bugs that doesn't currently exist (analysed in this commit's plan).
+- **Wire impact (none for clients that don't care)**: existing clients still get a string error message; behavior changes are (1) the status code shifts from `Internal` to `FailedPrecondition` and (2) the message prefix becomes `stale_vp_offset_past_sealed_length:` instead of `ec_read_full_and_slice:`. Any client doing exact-prefix matching on the old format will need to migrate — but nothing in the codebase does this currently.
+- **Files touched:**
+  - `crates/stream/src/client.rs`: `StaleVpOffset` struct + Display + Error impl (~30 lines); `ec_slice_decoded` signature change + sentinel construction (~10 lines); `ec_read_full_and_slice` wrap removal (~5 lines); test fixture update (~20 lines).
+  - `crates/stream/src/lib.rs`: `pub use` re-export (1 line).
+  - `crates/partition-server/src/rpc_handlers.rs`: `map_storage_error` helper (~25 lines); `handle_get` call-site update (1 line); 3 new unit tests in `f204_map_storage_error_tests` mod (~60 lines).
+  - `crates/stream/CLAUDE.md`: programming note 6 footer extension documenting the wire contract for Python tooling (~30 lines).
+  - `feature_list.md`: this entry.
+  - `claude-progress.txt`: task progress.
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-partition-server --lib f204`: 3/3 (sentinel detection, generic fallback, deep-chain recognition).
+  - `cargo test -p autumn-stream --lib ec_slice`: 6/6 (sentinel surfaces with correct fields + Display format).
+  - Pre-existing `f099i_tests::*` flakes (2 cases) are unrelated; same failures on F203 HEAD.
+  - **Manual e2e (the user-reported case)**:
+    ```bash
+    $AC get Patreon--leeesovely-October-2024-MissKON.com-054.jpg
+    # Expected output:
+    # Error: get: connection error: rpc status FailedPrecondition:
+    #   stale_vp_offset_past_sealed_length: extent=29 offset=264784123 length=10918365 sealed_length=11570792
+    ```
+    Python tooling can `re.match(r"stale_vp_offset_past_sealed_length: extent=(\d+) offset=(\d+) length=(\d+) sealed_length=(\d+)", msg)` and act on the four fields.
+- **Memory updates:** new memory `feedback-ops-tools-in-python` records user's design preference (ops tooling in Python, not autumn-client subcommands) for future sessions.
+- **passes:** true
+
 ### F203 · External-policy controller surface — delete in-kernel auto-dispatch (mechanism / policy separation Stage 3, final)
 - **Trigger:** Stage 3 (final) of the mechanism/policy separation plan (`~/.claude/plans/elegant-tumbling-pumpkin.md`). F201 fixed GC trigger logic. F202 unified advisories. F203 deletes the in-kernel auto-dispatch loops and exposes the OP-driven surface that external controllers need. After this commit the manager is a pure mechanism: it executes RPCs, maintains metadata, and surfaces `advisory_cache`. Any "auto" policy lives outside the binary.
 - **Manager deletions (`crates/manager/src/lib.rs`, `crates/manager/src/recovery.rs`, `crates/server/src/bin/manager.rs`):**

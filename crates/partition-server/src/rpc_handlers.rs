@@ -13,10 +13,33 @@ use autumn_common::metrics::ns_to_ms;
 use autumn_rpc::manager_rpc;
 use autumn_rpc::partition_rpc::{self, *};
 use autumn_rpc::{HandlerResult, StatusCode};
-use autumn_stream::{ConnPool, StreamClient};
+use autumn_stream::{ConnPool, StaleVpOffset, StreamClient};
 use bytes::Bytes;
 
 use crate::*;
+
+/// F204: translate VP-resolve errors into wire status codes that
+/// distinguish "data permanently lost; clean up the key" from
+/// "server bug; investigate".
+///
+/// Most read-side errors today bubble up as `anyhow::Error` and get
+/// uniformly mapped to `StatusCode::Internal`. That collapses two
+/// very different classes — transient/buggy server failures vs known
+/// historical data corruption (`StaleVpOffset` sentinel from
+/// `autumn-stream`). Operational tooling (per
+/// `feedback_ops_tools_in_python` memory: future Python scripts that
+/// consume `autumn-client` output) needs to distinguish them so it
+/// can decide between "retry" and "delete the key + major compact".
+///
+/// The sentinel's Display string is a stable wire contract — see the
+/// `StaleVpOffset` doc comment in `crates/stream/src/client.rs` for
+/// the prefix + field-order guarantees.
+fn map_storage_error(e: &anyhow::Error) -> (StatusCode, String) {
+    if let Some(stale) = e.chain().find_map(|c| c.downcast_ref::<StaleVpOffset>()) {
+        return (StatusCode::FailedPrecondition, stale.to_string());
+    }
+    (StatusCode::Internal, e.to_string())
+}
 
 // Per-partition read metrics, tracked in thread-local since partition thread is single-threaded.
 thread_local! {
@@ -189,7 +212,9 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
     drop(p);
 
     let vp_t0 = Instant::now();
-    let value = resolve_value(op, raw_value, &sc, req.offset, req.length).await.map_err(|e| (StatusCode::Internal, e.to_string()))?;
+    let value = resolve_value(op, raw_value, &sc, req.offset, req.length)
+        .await
+        .map_err(|e| map_storage_error(&e))?;
     let vp_resolve_ns = if is_vp { vp_t0.elapsed().as_nanos() as u64 } else { 0 };
     // _vp_pin guard drops here, releasing the pin.
 
@@ -546,4 +571,72 @@ pub(crate) async fn handle_get_discards(
         message: String::new(),
         discards: discards.into_iter().collect(),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// F204 — `map_storage_error` translation tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod f204_map_storage_error_tests {
+    use super::map_storage_error;
+    use autumn_rpc::StatusCode;
+    use autumn_stream::StaleVpOffset;
+
+    /// A `StaleVpOffset` anywhere in the anyhow chain must surface as
+    /// `FailedPrecondition` with the sentinel's stable Display string
+    /// preserved verbatim — the Python operational tooling contract.
+    #[test]
+    fn stale_vp_surfaces_as_failed_precondition() {
+        let stale = StaleVpOffset {
+            extent_id: 29,
+            requested_offset: 264_784_123,
+            requested_length: 10_918_365,
+            sealed_length: 11_570_792,
+        };
+        let raw = anyhow::Error::new(stale).context("resolve_value");
+        let (code, msg) = map_storage_error(&raw);
+        assert_eq!(code, StatusCode::FailedPrecondition);
+        // We surface the SENTINEL's Display, not anyhow's full chain.
+        assert!(
+            msg.starts_with("stale_vp_offset_past_sealed_length:"),
+            "wire-contract prefix preserved: {msg}"
+        );
+        assert!(msg.contains("extent=29"));
+        assert!(msg.contains("offset=264784123"));
+        assert!(msg.contains("length=10918365"));
+        assert!(msg.contains("sealed_length=11570792"));
+    }
+
+    /// Generic errors (network / disk / decode / etc.) keep mapping to
+    /// `Internal` so we don't accidentally promote unrelated failures
+    /// into the `FailedPrecondition` channel.
+    #[test]
+    fn unrecognised_error_falls_back_to_internal() {
+        let raw = anyhow::anyhow!("connection closed mid-read");
+        let (code, msg) = map_storage_error(&raw);
+        assert_eq!(code, StatusCode::Internal);
+        assert_eq!(msg, "connection closed mid-read");
+    }
+
+    /// Sentinel buried under multiple `.context()` layers must still
+    /// be recognised — `resolve_value` adds context, `read_value_from_log`
+    /// adds context, etc. The chain walk catches it at any depth.
+    #[test]
+    fn sentinel_deep_in_chain_still_recognised() {
+        let stale = StaleVpOffset {
+            extent_id: 7,
+            requested_offset: 100,
+            requested_length: 50,
+            sealed_length: 80,
+        };
+        let raw = anyhow::Error::new(stale)
+            .context("ec_subrange_read")
+            .context("read_bytes_from_extent")
+            .context("resolve_value");
+        let (code, msg) = map_storage_error(&raw);
+        assert_eq!(code, StatusCode::FailedPrecondition);
+        assert!(msg.contains("extent=7"));
+        assert!(msg.contains("sealed_length=80"));
+    }
 }

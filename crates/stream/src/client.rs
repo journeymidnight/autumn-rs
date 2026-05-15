@@ -34,6 +34,47 @@ impl std::error::Error for EversionStale {}
 fn is_eversion_stale(err: &anyhow::Error) -> bool {
     err.chain().any(|e| e.is::<EversionStale>())
 }
+
+/// F204: structured sentinel for "VP points past manager-recorded
+/// `sealed_length`" — historical data corruption from the
+/// pre-2026-04-27 `handle_stream_alloc_extent` race against EC
+/// conversion (see `crates/stream/CLAUDE.md` programming note 6).
+/// Manager writes to `sealed_length` are now monotonic-by-construction
+/// (F138/F145/F146/F147/F149 + the 2026-04-27 `if tail.sealed_length > 0`
+/// guard), so no NEW corruption can arise — but etcd values that were
+/// shrunken before those fixes shipped persist, and the physical EC
+/// shards were truncated during the bug window so the bytes past
+/// `sealed_length` are NOT recoverable.
+///
+/// External operational tooling (a Python audit/repair script per
+/// `feedback_ops_tools_in_python` memory) downcasts to this type via
+/// `anyhow::Error::chain()` to identify "this key is permanently
+/// gone; clean it up" vs transient errors. The Display string is a
+/// **stable wire contract**: the prefix `stale_vp_offset_past_sealed_length:`
+/// and the field order `extent= offset= length= sealed_length=` MUST
+/// NOT change.
+#[derive(Debug, Clone)]
+pub struct StaleVpOffset {
+    pub extent_id: u64,
+    pub requested_offset: u32,
+    pub requested_length: u32,
+    pub sealed_length: u64,
+}
+
+impl std::fmt::Display for StaleVpOffset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stale_vp_offset_past_sealed_length: extent={} offset={} length={} sealed_length={}",
+            self.extent_id,
+            self.requested_offset,
+            self.requested_length,
+            self.sealed_length,
+        )
+    }
+}
+
+impl std::error::Error for StaleVpOffset {}
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::channel::{mpsc, oneshot};
@@ -366,18 +407,34 @@ impl StreamClientConfig {
 /// `read_len` bytes (typically small), but the full-extent EC
 /// read path (the dominant case during recovery / VP fetches)
 /// is now zero-copy after `spawn_blocking(ec_decode)` returns.
-fn ec_slice_decoded(full_payload: Vec<u8>, offset: u32, length: u32) -> Result<Vec<u8>> {
+/// `extent_id` + `sealed_length` are pass-through context for the
+/// F204 `StaleVpOffset` sentinel — they're not used by the
+/// in-range slice path. We could derive `sealed_length` from
+/// `full_payload.len()` (they agree in the happy path), but the
+/// caller already has the manager-reported value and we want the
+/// sentinel to surface what the manager THINKS the sealed length
+/// is, not just what the decoded payload happens to be.
+fn ec_slice_decoded(
+    full_payload: Vec<u8>,
+    offset: u32,
+    length: u32,
+    extent_id: u64,
+    sealed_length: u64,
+) -> Result<Vec<u8>> {
     if offset == 0 && length == 0 {
         return Ok(full_payload);
     }
     let start = offset as usize;
     if start > full_payload.len() {
-        return Err(anyhow!(
-            "offset {} past decoded payload len {} (requested length={})",
-            start,
-            full_payload.len(),
-            length,
-        ));
+        // F204: structured sentinel so the PS read path can map this
+        // to `StatusCode::FailedPrecondition` and surface a stable
+        // diagnostic to Python operational tooling.
+        return Err(anyhow::Error::new(StaleVpOffset {
+            extent_id,
+            requested_offset: offset,
+            requested_length: length,
+            sealed_length,
+        }));
     }
     let read_len = if length == 0 {
         full_payload.len() - start
@@ -2665,14 +2722,15 @@ impl StreamClient {
         ex: &ExtentInfo,
     ) -> Result<(Vec<u8>, u32)> {
         let (full_payload, end) = self.ec_read_full(extent_id, ex).await?;
-        let bytes = ec_slice_decoded(full_payload, offset, length).map_err(|e| {
-            anyhow!(
-                "ec_read_full_and_slice: {} for extent {} (manager sealed_length={})",
-                e,
-                extent_id,
-                ex.sealed_length,
-            )
-        })?;
+        // F204: pass extent_id + sealed_length so `ec_slice_decoded`
+        // can build a structured `StaleVpOffset` sentinel on
+        // out-of-bounds. Pre-F204 we wrapped a stringy
+        // `anyhow!("ec_read_full_and_slice: ...")` here — that erased
+        // the downcast surface the PS layer relies on. Now the
+        // sentinel surfaces unmodified; the PS `map_storage_error`
+        // helper recognises it and returns `FailedPrecondition`
+        // instead of `Internal`.
+        let bytes = ec_slice_decoded(full_payload, offset, length, extent_id, ex.sealed_length)?;
         Ok((bytes, end))
     }
 
@@ -3062,13 +3120,19 @@ mod ec_slice_tests {
     //! `full_payload[start..slice_end]` with `start > full_payload.len()`,
     //! which panics with `range start index N out of range for slice of
     //! length L` and unwound the entire partition thread.
-    use super::ec_slice_decoded;
+    use super::{ec_slice_decoded, StaleVpOffset};
+
+    /// Test fixture: arbitrary extent_id + sealed_length context that
+    /// ec_slice_decoded threads through into the F204 sentinel on
+    /// out-of-bounds. The happy-path tests pass arbitrary values
+    /// because the data flow doesn't use them when offset is in range.
+    const TEST_EXTENT: u64 = 42;
 
     #[test]
     fn slice_in_range_returns_subslice() {
         let payload: Vec<u8> = (0u8..=199).collect();
         let expected = payload[50..80].to_vec();
-        let out = ec_slice_decoded(payload, 50, 30).expect("in-range slice");
+        let out = ec_slice_decoded(payload, 50, 30, TEST_EXTENT, 200).expect("in-range slice");
         assert_eq!(out.len(), 30);
         assert_eq!(out, expected);
     }
@@ -3077,7 +3141,7 @@ mod ec_slice_tests {
     fn slice_zero_length_means_to_end() {
         let payload: Vec<u8> = (0u8..=199).collect();
         let expected = payload[50..].to_vec();
-        let out = ec_slice_decoded(payload, 50, 0).expect("to-end slice");
+        let out = ec_slice_decoded(payload, 50, 0, TEST_EXTENT, 200).expect("to-end slice");
         assert_eq!(out, expected);
     }
 
@@ -3089,13 +3153,28 @@ mod ec_slice_tests {
         // caller can convert it into a "value short" RPC response and
         // the partition keeps serving other requests.
         let payload = vec![0u8; 45_479_123];
-        let err = ec_slice_decoded(payload, 49_541_652, 14_456_954)
+        let err = ec_slice_decoded(payload, 49_541_652, 14_456_954, 7, 45_479_123)
             .expect_err("offset past end must be rejected");
-        let msg = err.to_string();
+        // F204: must be the structured sentinel, not just a stringy error.
+        let stale = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<StaleVpOffset>())
+            .expect("error chain must contain StaleVpOffset");
+        assert_eq!(stale.extent_id, 7);
+        assert_eq!(stale.requested_offset, 49_541_652);
+        assert_eq!(stale.requested_length, 14_456_954);
+        assert_eq!(stale.sealed_length, 45_479_123);
+        // Display contract for Python regex consumers (memory:
+        // feedback-ops-tools-in-python).
+        let msg = stale.to_string();
         assert!(
-            msg.contains("past decoded payload len"),
-            "unexpected error message: {msg}"
+            msg.starts_with("stale_vp_offset_past_sealed_length:"),
+            "unexpected prefix: {msg}"
         );
+        assert!(msg.contains("extent=7"));
+        assert!(msg.contains("offset=49541652"));
+        assert!(msg.contains("length=14456954"));
+        assert!(msg.contains("sealed_length=45479123"));
     }
 
     #[test]
@@ -3104,7 +3183,7 @@ mod ec_slice_tests {
         // error. Required for callers that pass `offset = sealed_length`
         // and `length = 0` to mean "nothing left".
         let payload = vec![0u8; 100];
-        let out = ec_slice_decoded(payload, 100, 0).expect("offset==len is OK");
+        let out = ec_slice_decoded(payload, 100, 0, TEST_EXTENT, 100).expect("offset==len is OK");
         assert!(out.is_empty());
     }
 
@@ -3113,7 +3192,7 @@ mod ec_slice_tests {
         let payload: Vec<u8> = (0u8..=99).collect();
         let expected = payload[80..].to_vec();
         // Asking for 999 bytes from offset 80 should return 20.
-        let out = ec_slice_decoded(payload, 80, 999).expect("clamped slice");
+        let out = ec_slice_decoded(payload, 80, 999, TEST_EXTENT, 100).expect("clamped slice");
         assert_eq!(out.len(), 20);
         assert_eq!(out, expected);
     }
@@ -3128,7 +3207,7 @@ mod ec_slice_tests {
         payload.extend_from_slice(&(0u8..=199).collect::<Vec<u8>>());
         let in_ptr = payload.as_ptr();
         let in_cap = payload.capacity();
-        let out = ec_slice_decoded(payload, 0, 0).expect("full read");
+        let out = ec_slice_decoded(payload, 0, 0, TEST_EXTENT, 200).expect("full read");
         assert_eq!(out.as_ptr(), in_ptr, "full-read must NOT memcpy");
         assert_eq!(out.capacity(), in_cap, "capacity preserved → no realloc");
     }

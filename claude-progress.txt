@@ -1,132 +1,127 @@
 Date: 2026-05-15
 TaskStatus: completed
-Task scope: F203 — Stage 3 (final) of the mechanism/policy separation
-            refactor. Delete in-kernel auto-dispatch loops, expose
-            OP-driven surface for external controllers.
+Task scope: F204 — stale-VP read error attribution. Surface
+            pre-2026-04-27 historical corruption signals via a
+            structured sentinel error so external Python operational
+            tooling can distinguish "data permanently lost; clean
+            up the key" from transient server errors.
 
-End of plan `~/.claude/plans/elegant-tumbling-pumpkin.md`:
-  - F201 (done, commit 55ad7e3): GC trigger bug + cooldown + multi-tier
-  - F202 (done, commit 5d51071): 6-kind advisory unification
-  - F203 (this commit): delete auto + add OP surface
+User-reported symptom (the bug we attribute, not fix):
+  $AC get Patreon--leeesovely-October-2024-MissKON.com-054.jpg
+  Error: get: connection error: rpc status Internal:
+  ec_read_full_and_slice: offset 264784123 past decoded payload
+    len 11570792 (requested length=10918365) for extent 29
+    (manager sealed_length=11570792)
 
-Manager deletions:
-  - `auto_split_enabled` / `auto_merge_enabled` Cells removed from
-    AutumnManager + Default + setters (`set_auto_split` /
-    `set_auto_merge`).
-  - `policy_tick_loop`'s auto-dispatch arm gutted (loop continues to
-    populate advisory_cache — that's its only job now).
-  - `ec_conversion_dispatch_loop` refactored to drain-only:
-    candidates are `pending_ec_dispatch` keys (NOT a fresh
-    `s.streams` scan). The F198 leader-failover replay path
-    (rehydration via `replay_from_etcd`) is preserved verbatim;
-    its `Some(replay_params)` branch is now the only way the loop
-    dispatches. Stale-marker cleanup: extents that no longer exist
-    or are already `ec_converted` are pruned from
-    `pending_ec_dispatch` + etcd in the same tick.
-  - `auto_dispatch_split` / `auto_dispatch_merge` helpers kept as
-    mechanism layer; `force_auto_*` test fixtures continue to work.
-  - Two `*_fires_via_policy_tick_loop_fast_mode` tests in
-    system_merge.rs cfg'd out via `#[cfg(any())]` (they tested
-    deleted features; `force_auto_*` direct-path tests stay).
+  - The VP in some SST points (extent_id=29, offset=264MB, len=10MB)
+  - Manager records extent 29 sealed_length=11.5 MB
+  - On-disk EC shards physically encode 11.5 MB; bytes past it
+    do not exist anywhere
+  - Pre-2026-04-27 handle_stream_alloc_extent x EC convert race
+    shrunk sealed_length from the original (likely 34.7 MB) down
+    to shard_size (11.5 MB); F119-D double-encode then physically
+    rewrote shards to the sub-size
+  - All write-side fix paths are deployed (F138/F145/F146/F147/F149
+    + the 2026-04-27 `tail.sealed_length > 0` guard); etcd state
+    from the pre-fix era persists and cannot be self-detected
 
-Manager CLI flags removed:
-  - `--auto-split` / `--auto-merge` on autumn-manager-server.
-    Passing them now exits with a migration message
-    ("Use `client policy` + `client {split|merge}` to drive
-    policy externally").
+Decisions:
 
-PS deletions:
-  - `maintenance_scheduler_loop` (192-line F188 PS-level priority
-    scheduler) deleted entirely + spawn site removed.
-  - `background_gc_loop`'s `GcSel::Timeout` arm no longer emits
-    `GcTask::Auto`. The timer now only refreshes
-    `gc_debt_bytes` for the next `MSG_REPORT_PARTITION_LOAD`
-    pulse and continues. Auto GC entirely removed from kernel-
-    level timer policy.
-  - `background_compact_loop` unchanged: has_overlap +
-    expiry-major + size-tiered minor pickups remain (mechanism-
-    level must-cleanup paths).
+  - Surface, don't repair. Manager has no "previous correct value"
+    to compare against; SSTs are immutable; physical shards are
+    truncated. Cleanup must be OP-driven.
+  - No `client audit-vps` CLI (user preference: ops tools in
+    Python, not autumn-client). Saved to memory:
+    feedback-ops-tools-in-python.
+  - No open-time integrity scan (too slow).
+  - No replay_from_etcd warn (no reliable suspect signal).
+  - No extent-node-side monotonic guard (manager-side already
+    guarded; extent-node guard is speculative).
 
-New manager RPCs:
-  - `MSG_FORCE_EC_CONVERT = 0x39` (ForceEcConvertReq /
-    ForceEcConvertResp): validates extent (sealed, not
-    converted, on EC stream); allocates extra parity nodes via
-    the same shuffled-pool path the deleted fresh-dispatch
-    used; persists rich `pending_ec_dispatch` marker; returns
-    CODE_OK. Next dispatch tick drains via F198 replay.
-    Idempotent.
-  - `MSG_GET_PARTITION_DETAIL = 0x3A` (GetPartitionDetailReq /
-    GetPartitionDetailResp): returns most recent bucket from
-    `PolicyEngine.metrics[part_id]`. Sources `client info
-    --detail` without a dedicated PS RPC.
+Implementation:
 
-New `client` subcommands:
-  - `client force-ec-convert --extent <EXTID>` — sends
-    MSG_FORCE_EC_CONVERT.
-  - `client streams [--json]` — lists each stream's
-    `extent_id / sealed_length / ec_converted / replicas /
-    parity / refs / eversion`. JSON output sorted by
-    stream_id; plain text mirrors layout-typed extent labels.
-  - `client info --part PID --detail [--json]` — new `--detail`
-    flag. Sends MSG_GET_PARTITION_DETAIL, prints full
-    `PartitionLoad` including F202 fields (gc_debt_bytes,
-    pending_compaction_bytes, minor_compact_pending_bytes,
-    sst_tombstone_bytes, sst_expired_bytes,
-    sst_out_of_range_bytes, *_inflight, last_*_at,
-    sealed_log_extent_count).
+  1. crates/stream/src/client.rs:
+     - new `pub struct StaleVpOffset { extent_id, requested_offset,
+       requested_length, sealed_length }` sentinel + Display +
+       std::error::Error impls. Display contract is a STABLE wire
+       protocol:
+         stale_vp_offset_past_sealed_length: extent=<EID> offset=<OFF>
+         length=<LEN> sealed_length=<SEAL>
+       Python tooling regex consumers MUST treat the prefix and
+       4-field order as load-bearing.
+     - `ec_slice_decoded(payload, offset, length)` ->
+       `ec_slice_decoded(payload, offset, length, extent_id, sealed_length)`.
+       Out-of-bounds branch now returns
+       `Err(anyhow::Error::new(StaleVpOffset { ... }))` instead of
+       a stringy `anyhow!(...)`.
+     - `ec_read_full_and_slice` drops its outer
+       `anyhow!("ec_read_full_and_slice: ...")` wrap; the sentinel
+       surfaces unmodified through the chain.
+     - test mod ec_slice_tests updated:
+       slice_offset_past_end_returns_err_not_panic asserts the
+       error chain contains StaleVpOffset with all 4 fields
+       correct and the Display prefix.
 
-External-policy controller contract (README):
-  - New section under Operations describing the OP toolkit
-    workflow: `client policy --json` → optional
-    `client info --part PID --detail` → call appropriate
-    client command to act.
-  - cron + bash MVP controller example covering low-QPS
-    gating, business-hour windowing, dispatch cadencing.
+  2. crates/stream/src/lib.rs:
+     - `pub use client::StaleVpOffset` for downstream consumption.
 
-Wire-incompatible changes (same-commit upgrade — cluster.sh
-stops all roles before restart):
-  - 2 new manager RPC type codes (0x39, 0x3A).
-  - 2 manager CLI flags removed (`--auto-split` /
-    `--auto-merge`); migration error message on use.
+  3. crates/partition-server/src/rpc_handlers.rs:
+     - new `map_storage_error(&anyhow::Error) -> (StatusCode, String)`
+       helper. Downcasts the anyhow chain for StaleVpOffset; on
+       hit, returns
+       `(StatusCode::FailedPrecondition, stale.to_string())`.
+       Generic errors fall back to
+       `(StatusCode::Internal, e.to_string())`.
+     - `handle_get` (line 192) updated to use map_storage_error
+       instead of (StatusCode::Internal, e.to_string()).
+     - handle_range / handle_head don't resolve VPs; not touched.
+     - 3 new unit tests in `f204_map_storage_error_tests` mod:
+       stale_vp_surfaces_as_failed_precondition,
+       unrecognised_error_falls_back_to_internal,
+       sentinel_deep_in_chain_still_recognised.
 
-What stays as in-kernel mechanism (final, intentional):
-  - has_overlap-triggered major compact (split aftermath)
-  - expiry-triggered major compact (user TTL semantic)
-  - size-tiered minor compact (LSM hygiene)
-  - F198 marker replay across leader failover
-  - All F138/F139/F145/F146/F147/F149 correctness mutex/fence
-  - `auto_dispatch_*` internal helpers (mechanism API)
+  4. crates/stream/CLAUDE.md programming note 6 footer:
+     - F204 wire contract documented for future Python tooling:
+       prefix + field order + status code = stable promise.
+
+  5. feature_list.md F204 entry, this file, MEMORY.md update
+     (feedback_ops_tools_in_python.md memory).
 
 Tests:
+
   - cargo build --workspace --exclude autumn-fuse: clean.
-  - cargo test -p autumn-manager --lib: 78/78.
-  - cargo test -p autumn-partition-server --lib: 142/143
-    (same f099i_d1 flake from F201/F202; unrelated to F203).
+  - cargo test -p autumn-stream --lib ec_slice: 6/6.
+  - cargo test -p autumn-partition-server --lib f204: 3/3.
+  - Pre-existing f099i_tests::* (2 flakes) unrelated; fail on
+    pre-F204 HEAD too.
 
-Files touched:
-  - crates/manager/src/lib.rs: ~80 lines net delete.
-  - crates/manager/src/recovery.rs: drain-only refactor.
-  - crates/manager/src/rpc_handlers.rs: 2 new handlers
-    (~180 lines added).
-  - crates/manager/tests/system_merge.rs: cfg-gate 2 e2e tests.
-  - crates/partition-server/src/lib.rs: ~195 lines net delete.
-  - crates/partition-server/src/background.rs: gut GC Timeout
-    arm.
-  - crates/rpc/src/manager_rpc.rs: 2 new MSG_ consts + 4 new
-    wire types.
-  - crates/server/src/bin/manager.rs: ~30 lines net delete.
-  - crates/server/src/bin/autumn_client.rs: 3 new subcommands +
-    ~180 lines.
-  - autumn-rs/README.md: external-controller section.
-  - feature_list.md: F203 entry above F202.
-  - claude-progress.txt: this file.
+Wire impact:
 
-End of the mechanism/policy refactor. The advisory_cache is the
-manager's full policy surface; OP/external controllers consume it
-and call client subcommands. Future work can layer an actual
-policy controller binary on top, or wire MSG_GET_POLICY_CANDIDATES
-into Prometheus + alerting. Both are pure addition; the kernel
-stays mechanism.
+  - Status code shift: `Internal` -> `FailedPrecondition` for the
+    stale-VP case only. Generic errors unchanged.
+  - Error message prefix shift:
+    `ec_read_full_and_slice: ...` -> `stale_vp_offset_past_sealed_length: ...`.
+  - No exact-prefix matching on the old format exists in the
+    codebase; external clients that may have built such matching
+    need a one-line regex update (documented in CLAUDE.md).
 
-Next session starting point: nothing pending from this plan. Any
-new feature should start a fresh F-number above F203.
+Memory updates:
+  - new: feedback_ops_tools_in_python.md
+    Records: "future ops tooling in Python, not autumn-client".
+    Cross-ref: feedback_deferred_to_feature_list.md.
+
+What it does NOT close:
+
+  - The historical data on disk is still corrupt for affected
+    keys. OP needs to:
+      1. Read the failing key, observe FailedPrecondition with
+         stale_vp_offset_past_sealed_length signal.
+      2. `$AC del <key>` to write a tombstone.
+      3. `$AC compact <PARTID>` so major compaction drops the
+         tombstone + VP entry.
+    Steps 2-3 are mechanism primitives; the decision to do them
+    is policy (a Python script that consumes 1 and acts on 2+3).
+
+Next session starting point: user immediately asked to audit
+autumn-client commands and trim non-essential ones now that ops
+goes through Python. New planning session next.
