@@ -1394,6 +1394,37 @@ Cleared by audit (no fix needed):
 - **Files:** `feature_list.md`, `claude-progress.txt`. (No code changes.)
 - **passes:** true (audit-cleared)
 
+### F208 · Stale extent_inflight markers — auto-release with configurable threshold
+- **Trigger:** Real-cluster incident 2026-05-15. After F207-D/E, the user hit `force-ec-convert --extent 28` repeatedly failing with `extent 28 has in-flight Recovery; retry after it completes`. Root cause: at some point during F207-A/B/C testing, `recovery_dispatch_loop` had legitimately acquired a Recovery marker for extent 28 via `acquire_extent_inflight` (probably because a `commit_length` probe timed out transiently). The recovery RPC fired to an EN; the EN may or may not have run anything; `apply_recovery_done` never ran (manager restart broke the chain). The `extent_inflight/28` etcd key persisted across the subsequent F207-D restart and got loaded into the new leader's in-memory ledger. The F207-D stale-marker sweep was 5-min tick / 24-h threshold / **WARN-only** — so the operator had no automatic recovery path and had to manually `etcdctl del` (which itself caused in-memory ↔ etcd drift; they then had to restart the manager).
+- **F208 changes:**
+  - Sweep interval reduced from 300s → **60s** (env `AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS`, floor 1).
+  - Stale threshold reduced from 24h → **600s = 10 min** (env `AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS`, floor 60s).
+  - Behavior on match: **auto-release**, not just WARN. One atomic `etcd put_and_delete_txn(delete=[extent_inflight/<id>])` under the F149 leader fence, then `commit_extent_inflight_release` drops the in-memory shadow. Delete markers also clear the in-memory `delete_progress` entry (the per-attempt retry state that lived alongside the ledger).
+  - Loop body extracted into a separate `sweep_stale_inflight_once(now, threshold_secs)` async helper so unit tests can drive a single tick with controlled time + threshold.
+- **Safety argument (why auto-release doesn't risk data correctness):** the sweep ONLY touches the ledger marker. It does NOT mutate `extents/<id>` state and does NOT message any EN. If an EN-side task is genuinely still running when the marker is released, the worst case is wasted retry work:
+  - Recovery: EN completes the task, pushes `recovery_done`, next df probe drains it; `apply_recovery_done` runs with marker already cleared → no defer → apply proceeds normally.
+  - ConvertToEc: EN F119-D coordinator-side idempotency (`entry.eversion >= req.eversion && sealed_length > 0 && avali > 0 → CODE_OK no-op`) + F153 per-extent serialization make a re-dispatch a no-op.
+  - Delete: EN `handle_delete_extent` is idempotent (NotFound → Ok).
+- **Leader-failover-as-reconcile invariant:** `started_at` is in the rkyv'd `MgrExtentInflightRecord` payload, persisted at acquire time. New leader's `replay_from_etcd` loads it unchanged, so the stale-detection clock continues across failovers. Markers that were already stale on the deposed leader get released by the new leader's sweep without needing any handoff. **This is why F208 only does B (auto-release), not C (reconcile against etcd on each tick):** the failover path naturally serves as a full reconcile; per-tick reconcile would only help the "operator manually ran `etcdctl del` while same leader keeps running" case, which is a rare operator-error scenario whose supported remediation is "restart the manager".
+- **What this does NOT change:**
+  - `acquire_extent_inflight` / `release_extent_inflight_op` / the apply paths' release semantics — unchanged.
+  - The legitimate apply paths still release markers atomically as part of their own etcd txn (F207's invariant I3). F208 sweep is the **safety net** for markers that escape that path.
+  - F207-D's "no backward compat with pre-F207 etcd state" policy (F207-E) — unchanged.
+- **Tests added:**
+  - `f208_sweep_auto_releases_stale_markers`: inject one of each (ConvertToEc / Recovery / Delete), drive sweep with far-future `now` and 1s threshold, assert all three released + `delete_progress` cleaned for Delete.
+  - `f208_sweep_leaves_fresh_markers_alone`: inject ConvertToEc, drive sweep with current-time `now` and 600s threshold, assert marker survives.
+  - `f208_env_var_clamping`: verify env-var floors (`stale_threshold_secs >= 60`, `sweep_interval_secs >= 1`).
+- **Files touched:**
+  - `crates/manager/src/extent_inflight.rs`: rewrote `extent_inflight_stale_sweep_loop`; added `sweep_stale_inflight_once` + `stale_threshold_secs` + `stale_sweep_interval_secs`; 3 new unit tests.
+  - `crates/manager/CLAUDE.md`: programming note 21's stale-sweep paragraph updated to reflect F208 (replaces the F207-D WARN-only design).
+  - `feature_list.md` — this entry.
+  - `claude-progress.txt` — F208 status.
+- **Verification:**
+  - `cargo build -p autumn-manager`: clean.
+  - `cargo test -p autumn-manager --lib`: 88 passed (was 85; +3 new F208 tests).
+- **Operator action item for the live cluster (separate from this commit):** after rebuilding to F208 binary and restarting the manager (`sh cluster.sh restart 4`), the `extent_inflight/28` ghost will be picked up by the next 60s sweep tick and auto-released (its age far exceeds 10 min). Subsequent `force-ec-convert --extent 28` will proceed.
+- **passes:** true
+
 ### F207-E · Drop backward-compat scan from F207-D (user opted out)
 - **Trigger:** Investigation 2026-05-15 of user-reported "extent 23 has in-flight Recovery; defer alloc_extent until it completes" symptom on a fresh cluster after F207-D deploy. Root cause: F207-C's one-cycle backward-compat **fold-in** of legacy `ecConversionInflight/` / `recoveryTasks/` etcd markers loaded orphans-from-a-dead-prior-manager into the unified ledger as live Recovery records. PS's `alloc_new_extent` then refused indefinitely against extents 21 and 23 because their "in-flight" tasks were ghosts that no EN was actually running.
 - **F207-D mitigation (already shipped):** removed the fold-in. Kept a WARN-on-detect scan so an operator would notice orphan etcd state and run a Python ops scrub.

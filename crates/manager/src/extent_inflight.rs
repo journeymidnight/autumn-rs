@@ -366,23 +366,56 @@ impl AutumnManager {
         self.inflight.borrow_mut().insert(extent_id, record);
     }
 
-    /// F207-D: stale-marker WARN sweep. Iterates the in-memory ledger
-    /// every 5 minutes and logs WARN for any marker older than the
-    /// stale threshold (24h by default). Auto-clearing is intentionally
-    /// not done — a stuck marker usually signals a real bug we want to
-    /// surface, not silently paper over. Operator runs the Python ops
-    /// `--clear-stale-inflight extent <id>` script after investigating.
+    /// F208: stale-marker sweep with auto-release.
     ///
-    /// Invariant I2 in the F207 plan: every acquire has a matching
-    /// release, OR leader failover replay reclaims the in-memory shadow
-    /// from etcd. A stale marker means BOTH paths failed for some
-    /// extent — usually a manager bug (e.g., the apply path returned
-    /// early without bundling the release into its txn).
+    /// Runs on the manager (only when leader). Every
+    /// `AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS` (default 60s), iterates
+    /// the in-memory ledger; for any marker whose `started_at` is older
+    /// than `AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS` (default 600s =
+    /// 10 min), atomically releases it: one `txn_fenced` deletes
+    /// `extent_inflight/<id>` from etcd under the F149 leader fence,
+    /// then `commit_extent_inflight_release` drops the in-memory shadow.
+    /// The release is the same primitive the apply paths
+    /// (`apply_recovery_done` / `apply_ec_conversion_done` /
+    /// `extent_delete_loop::release_delete_marker`) use — atomic, no
+    /// mutation of `extents/<id>`, no EN-side RPC.
+    ///
+    /// **Safety against false positives:** auto-release only touches the
+    /// ledger marker, NOT the extent's `replicates / parity / eversion /
+    /// avali` state. If the EN-side task that the released marker
+    /// referred to is genuinely still running (long-running recovery on
+    /// a multi-GB extent over a slow network), the worst case is:
+    /// - Recovery: EN completes, pushes `recovery_done`, manager's next
+    ///   df probe drains it; `apply_recovery_done` runs with the
+    ///   marker already cleared → the in-memory `inflight` lookup
+    ///   misses → no defer → apply proceeds normally.
+    /// - ConvertToEc: EN's F119-D / F153 idempotency means a re-dispatch
+    ///   (if the next `ec_conversion_dispatch_loop` tick re-fires) is a
+    ///   no-op CODE_OK on the coordinator.
+    /// - Delete: EN-side `handle_delete_extent` is idempotent
+    ///   (NotFound is downgraded to Ok) — re-dispatch from a future
+    ///   GC tick is safe.
+    /// No data-correctness risk from a too-eager release; only wasted
+    /// work in the rare retry case.
+    ///
+    /// **Leader-failover-as-reconcile invariant:** when the leader
+    /// changes, the new leader's `replay_from_etcd` rebuilds the
+    /// in-memory ledger from etcd from scratch. `started_at` is part
+    /// of the rkyv'd `MgrExtentInflightRecord` payload, persisted
+    /// since acquire time — so the stale-detection clock continues
+    /// across leader changes. F208 sweep on the new leader picks up
+    /// any markers that were already stale on the deposed leader.
+    /// In-memory drift between manager state and etcd state ONLY
+    /// arises from a human running `etcdctl del extent_inflight/<id>`
+    /// directly; the supported remediation for that is to restart the
+    /// manager (or wait for next failover). F208 does NOT reconcile
+    /// against etcd on each tick — the operator-error scenario is too
+    /// rare to justify the per-tick prefix read.
     pub(crate) async fn extent_inflight_stale_sweep_loop(self) {
-        const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300); // 5 min
-        const STALE_THRESHOLD_SECS: i64 = 24 * 3600; // 24 h
+        let sweep_interval =
+            std::time::Duration::from_secs(Self::stale_sweep_interval_secs().max(1) as u64);
         loop {
-            compio::time::sleep(SWEEP_INTERVAL).await;
+            compio::time::sleep(sweep_interval).await;
             if !self.leader.get() {
                 continue;
             }
@@ -390,34 +423,100 @@ impl AutumnManager {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            let stale: Vec<(u64, ExtentOpKind, i64)> = self
-                .inflight
-                .borrow()
-                .iter()
-                .filter_map(|(eid, rec)| {
-                    rec.kind().and_then(|kind| {
-                        let age = now - rec.started_at;
-                        if age >= STALE_THRESHOLD_SECS {
-                            Some((*eid, kind, age))
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .collect();
-            for (eid, kind, age_secs) in stale {
-                tracing::warn!(
-                    extent_id = eid,
-                    op = ?kind,
-                    age_secs,
-                    "F207-D: stale extent_inflight marker (> 24h). Indicates a \
-                     leader-replay missed release or an aborted apply path. \
-                     Investigate with `etcdctl get extent_inflight/<id>`; run \
-                     Python ops `--clear-stale-inflight extent <id>` after \
-                     verifying the op is genuinely abandoned."
-                );
-            }
+            let threshold = Self::stale_threshold_secs();
+            self.sweep_stale_inflight_once(now, threshold).await;
         }
+    }
+
+    /// F208: stale threshold in seconds. Override with env
+    /// `AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS`. Default 600
+    /// (10 minutes) — generous for typical recovery / EC convert
+    /// durations on local + LAN setups; bumped if you have
+    /// multi-GiB extents on slow networks. Clamped to >= 60 to
+    /// avoid pathological values that would race against the
+    /// acquire path.
+    fn stale_threshold_secs() -> i64 {
+        std::env::var("AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(600)
+            .max(60)
+    }
+
+    /// F208: sweep interval in seconds. Override with env
+    /// `AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS`. Default 60s.
+    /// Clamped to >= 1.
+    fn stale_sweep_interval_secs() -> i64 {
+        std::env::var("AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(60)
+            .max(1)
+    }
+
+    /// F208: one sweep iteration. Extracted from the loop so unit tests
+    /// can drive it with controlled `now` + `threshold_secs` values.
+    pub(crate) async fn sweep_stale_inflight_once(
+        &self,
+        now: i64,
+        threshold_secs: i64,
+    ) -> usize {
+        // Snapshot stale candidates under a single ledger borrow so we
+        // don't hold the borrow across the await.
+        let stale: Vec<(u64, ExtentOpKind, i64)> = self
+            .inflight
+            .borrow()
+            .iter()
+            .filter_map(|(eid, rec)| {
+                rec.kind().and_then(|kind| {
+                    let age = now - rec.started_at;
+                    if age >= threshold_secs {
+                        Some((*eid, kind, age))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        let mut released = 0usize;
+        for (eid, kind, age_secs) in stale {
+            // Atomic etcd delete under F149 fence. On error, log and
+            // skip — next tick will retry.
+            if let Some(etcd) = &self.etcd {
+                if let Err(e) = etcd
+                    .put_and_delete_txn(Vec::new(), vec![Self::extent_inflight_key(eid)])
+                    .await
+                {
+                    tracing::warn!(
+                        extent_id = eid,
+                        op = ?kind,
+                        age_secs,
+                        error = %e,
+                        "F208: failed to auto-release stale inflight marker; \
+                         will retry next sweep tick"
+                    );
+                    continue;
+                }
+            }
+            // In-memory release. Also drop any Delete progress state
+            // (the per-attempt VecDeque entry is no longer load-bearing
+            // since we've abandoned the op).
+            self.commit_extent_inflight_release(eid);
+            if matches!(kind, ExtentOpKind::Delete) {
+                self.delete_progress.borrow_mut().remove(&eid);
+            }
+            tracing::warn!(
+                extent_id = eid,
+                op = ?kind,
+                age_secs,
+                threshold_secs,
+                "F208: auto-released stale inflight marker — no manager-side \
+                 apply within threshold. EN-side task (if any) remains \
+                 independent; idempotency on retry handles convergence."
+            );
+            released += 1;
+        }
+        released
     }
 
     /// Decode raw etcd values from the `extent_inflight/` prefix into
@@ -614,5 +713,88 @@ mod tests {
         );
         assert_eq!(decoded.len(), 1, "malformed record dropped");
         assert_eq!(decoded[0].0, 42);
+    }
+
+    /// F208: sweep auto-releases markers older than the threshold; leaves
+    /// fresh markers alone; cleans `delete_progress` for Delete markers.
+    #[test]
+    fn f208_sweep_auto_releases_stale_markers() {
+        run(async {
+            let m = AutumnManager::new();
+            // Three markers, one of each kind.
+            m.acquire_extent_inflight(10, ec_payload(10)).await.expect("ec");
+            m.acquire_extent_inflight(20, recovery_payload(20)).await.expect("recovery");
+            m.acquire_extent_inflight(30, delete_payload(30)).await.expect("delete");
+            // Mimic the populate-delete-progress step that enqueue_pending_deletes does.
+            m.delete_progress.borrow_mut().insert(
+                30,
+                crate::extent_delete::PendingDelete {
+                    extent_id: 30,
+                    pending_addrs: vec!["127.0.0.1:9101".to_string()],
+                    attempts: 0,
+                },
+            );
+
+            // All three are present.
+            assert_eq!(m.extent_inflight_op(10), Some(ExtentOpKind::ConvertToEc));
+            assert_eq!(m.extent_inflight_op(20), Some(ExtentOpKind::Recovery));
+            assert_eq!(m.extent_inflight_op(30), Some(ExtentOpKind::Delete));
+
+            // Sweep with `now` in the far future and a 1 s threshold —
+            // every marker is stale.
+            let now_future = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                + 7200;
+            let released = m.sweep_stale_inflight_once(now_future, 1).await;
+            assert_eq!(released, 3, "all three stale markers must be released");
+            assert_eq!(m.extent_inflight_op(10), None);
+            assert_eq!(m.extent_inflight_op(20), None);
+            assert_eq!(m.extent_inflight_op(30), None);
+            // Delete progress entry also cleaned.
+            assert!(
+                !m.delete_progress.borrow().contains_key(&30),
+                "F208: Delete release must also drop delete_progress entry"
+            );
+        })
+    }
+
+    /// F208: sweep does NOT release markers younger than the threshold.
+    #[test]
+    fn f208_sweep_leaves_fresh_markers_alone() {
+        run(async {
+            let m = AutumnManager::new();
+            m.acquire_extent_inflight(42, ec_payload(42)).await.expect("acquire");
+
+            // Sweep with `now` matching the marker's started_at — age = 0,
+            // way below any sensible threshold.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let released = m.sweep_stale_inflight_once(now, 600).await;
+            assert_eq!(released, 0, "fresh marker must not be released");
+            assert_eq!(
+                m.extent_inflight_op(42),
+                Some(ExtentOpKind::ConvertToEc),
+                "fresh ConvertToEc marker survives the sweep"
+            );
+        })
+    }
+
+    /// F208: env var overrides clamp to safe minimums.
+    #[test]
+    fn f208_env_var_clamping() {
+        std::env::set_var("AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS", "5");
+        std::env::set_var("AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS", "0");
+        // Threshold floor is 60, sweep interval floor is 1.
+        assert_eq!(AutumnManager::stale_threshold_secs(), 60);
+        assert_eq!(AutumnManager::stale_sweep_interval_secs(), 1);
+        std::env::remove_var("AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS");
+        std::env::remove_var("AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS");
+        // Without env, defaults apply.
+        assert_eq!(AutumnManager::stale_threshold_secs(), 600);
+        assert_eq!(AutumnManager::stale_sweep_interval_secs(), 60);
     }
 }

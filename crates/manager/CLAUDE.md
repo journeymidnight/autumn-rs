@@ -819,10 +819,44 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     `release_delete_marker`. Same invariant I3, same protection.
 
     **Stale-marker sweep (`extent_inflight_stale_sweep_loop`,
-    F207-D):** 5-min tick, WARN-only. Started by
-    `start_runtime_tasks` alongside the other loops. Auto-clearing
-    is INTENTIONALLY not done — a stuck marker usually signals a
-    real bug we want to surface, not silently paper over.
+    F208 — superseded F207-D's WARN-only design):**
+    - Tick: every `AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS` (default
+      60 s; floor 1).
+    - Stale threshold: `AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS`
+      (default 600 s = 10 min; floor 60).
+    - On match: atomic `etcd put_and_delete_txn(delete=[
+      extent_inflight/<id>])` under F149 leader fence, then
+      `commit_extent_inflight_release` drops the in-memory shadow.
+      Delete markers also clear the in-memory
+      `delete_progress` entry.
+    - WARN log per release with extent_id + op kind + age + threshold.
+    - Started by `start_runtime_tasks` alongside the other loops.
+
+    **Why auto-release is safe:** sweep ONLY touches the ledger marker.
+    It does NOT mutate `extents/<id>` state and does NOT message any EN.
+    If an EN-side task corresponding to a released marker is genuinely
+    still running, the worst case is wasted retry work, never a
+    data-correctness issue:
+    - Recovery: EN completes, pushes `recovery_done`, next df probe
+      drains it; `apply_recovery_done` runs with marker already cleared
+      → no defer → apply proceeds.
+    - ConvertToEc: EN F119-D / F153 make a re-dispatch idempotent.
+    - Delete: EN `handle_delete_extent` is idempotent (NotFound → Ok).
+
+    **Leader-failover-as-reconcile invariant:** `started_at` is in the
+    rkyv'd `MgrExtentInflightRecord` payload, persisted at acquire
+    time. New leader's `replay_from_etcd` loads it unchanged, so the
+    stale-detection clock continues across failovers. Markers that
+    were already stale on the deposed leader get released by the new
+    leader's sweep without needing any handoff.
+
+    **In-memory ↔ etcd drift:** the ONLY supported source of drift is
+    a human running `etcdctl del extent_inflight/<id>` directly. The
+    remediation is "restart the manager" (or wait for the next
+    failover); the new leader's replay rebuilds in-memory from etcd
+    from scratch. F208 deliberately does NOT do a per-tick prefix
+    read for reconcile — the operator-error scenario is too rare to
+    justify the cost, and the failover path already handles it.
 
     **No backward compatibility with pre-F207 etcd state.** F207-A/B/C
     transitional fold-in of legacy `ecConversionInflight/` and
