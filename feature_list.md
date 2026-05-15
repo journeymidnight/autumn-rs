@@ -1394,6 +1394,33 @@ Cleared by audit (no fix needed):
 - **Files:** `feature_list.md`, `claude-progress.txt`. (No code changes.)
 - **passes:** true (audit-cleared)
 
+### F207-D · Unified extent in-flight ledger — Phase 3 (cleanup)
+- **Trigger:** F207-C completed the migration of all four pre-F207 inflight bookkeeping mechanisms into the unified ledger. Phase 3 is housekeeping: remove the transitional backward-compat code paths (legacy etcd prefix replay arms + legacy-key entries in apply_* delete batches), add the stale-marker WARN sweep promised by F207-A's invariant I2, and update the `crates/manager/CLAUDE.md` programming notes to point at the unified mechanism.
+- **Backward-compat removals:**
+  - `replay_from_etcd` no longer reads the legacy `ecConversionInflight/` or `recoveryTasks/` etcd prefixes for fold-in. Instead it `get_prefix`'s them ONCE for detection: any non-empty result emits a WARN log instructing the operator to run the Python ops scrub script. The fold-in logic that lived in F207-B/C is gone; an operator who upgrades directly from a pre-F207 binary to F207-D MUST run the scrub before promotion, or accept that legacy markers will sit in etcd as orphan keys (harmless, but flagged).
+  - `apply_ec_conversion_done` `put_and_delete_txn` no longer includes `ecConversionInflight/<id>` in its delete list. Same for `apply_recovery_done` (both the layout_changed branch + the main success branch + the orphan-cleanup branch) — they no longer delete `recoveryTasks/<id>`. The atomic put-and-delete txn now exclusively touches the new `extent_inflight/<id>` key.
+  - All three apply paths shrink by one entry per delete batch; the atomicity property (invariant I3) is preserved against the new ledger key.
+- **`extent_inflight_stale_sweep_loop` (new):** spawned by `start_runtime_tasks` alongside the other background loops. 5-minute tick. Iterates the in-memory ledger; for any record whose `started_at` is more than 24h old, emits a WARN log with the extent_id + op kind + age in seconds. **Auto-clearing is intentionally NOT done** — a stuck marker usually signals a real bug worth surfacing (a manager release path that returned early without bundling the release into its txn, or a leader-replay that missed an entry). The operator runs the Python ops `--clear-stale-inflight extent <id>` script after investigating with `etcdctl get extent_inflight/<id>`.
+- **CLAUDE.md programming notes update:** added a new programming note 21 in `crates/manager/CLAUDE.md` covering: the F207 unified ledger design, the PS-layer ↔ stream-layer boundary clarification (Class A/B/C model from the F207 plan), the five invariants I1-I5 with where each is enforced, the atomicity headline (closing the pre-F207 latent marker-leak in `apply_ec_conversion_done`), the stale-marker sweep design, and test-helper conventions. Cross-references all the historical race-fix notes (F138/F139/F145/F146/F147-A/F198/F206) so a future reader can trace from "old individual race" to "unified F207 mechanism" without re-deriving.
+- **What does NOT change at F207-D:**
+  - F119-D coordinator-side idempotency check in extent_node.rs (defense in depth).
+  - F153 per-extent EC conversion serialisation lock (defense in depth).
+  - F146 / F147-A verify-at-apply pattern (Class B race defense; required even with the ledger).
+  - The Python ops toolkit's interface — F207-D's stale-marker sweep is WARN-only; the operator-facing command remains an explicit `--clear-stale-inflight extent <id>` invocation. No new RPC, no new CLI subcommand.
+- **Migration risk:** an operator upgrading directly from pre-F207 (e.g., F206 binary) to F207-D, bypassing the F207-A/B/C deploy cycle, will see WARN logs on first leader promotion if any `ecConversionInflight/` or `recoveryTasks/` markers existed in etcd. These markers are **harmless orphans** — they don't block new operations on those extents (the unified ledger CAS is the only gate). The recommended remediation is to run the Python ops scrub script that removes the orphans. The WARN log includes the instruction. Worst case: keep the orphans in etcd forever; they consume ~80 bytes each and never block anything.
+- **Files touched:**
+  - `crates/manager/src/lib.rs`: `replay_from_etcd` cleanups (legacy fold-in deleted, WARN detection retained); `start_runtime_tasks` spawns the new sweep loop.
+  - `crates/manager/src/recovery.rs`: legacy-key deletes removed from both `apply_ec_conversion_done` and `apply_recovery_done` (three branches: main success, layout_changed, orphan-cleanup).
+  - `crates/manager/src/extent_inflight.rs`: new `extent_inflight_stale_sweep_loop` method.
+  - `crates/manager/CLAUDE.md`: new programming note 21.
+  - `feature_list.md` — this entry.
+  - `claude-progress.txt` — F207-D status.
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-manager --lib`: 85 passed (unchanged count; no test diffs because F207-D is pure cleanup — the production code paths exercise the same ledger semantics that F207-B/C tests already cover).
+  - `cargo test -p autumn-stream --lib`: 53 passed (no regression).
+- **passes:** true
+
 ### F207-C · Unified extent in-flight ledger — Phase 2 (migrate Recovery + Delete)
 - **Trigger:** F207-B left Recovery + Delete on their separate bookkeeping mechanisms (`recovery_tasks: HashMap<u64, MgrRecoveryTask>` + `pending_extent_deletes: VecDeque<PendingDelete>`). Phase 2 migrates both into the unified `inflight` ledger. After this commit, **all** stream-layer ops in flight on any extent live in one etcd-backed source of truth; the 9 cross-domain refuse-at-start checks across `recovery.rs` + `rpc_handlers.rs` collapse to single-line `extent_inflight_op` reads (or two-snapshot helpers where the predicate is more nuanced).
 - **Writer migration:**

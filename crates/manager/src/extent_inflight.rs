@@ -366,6 +366,60 @@ impl AutumnManager {
         self.inflight.borrow_mut().insert(extent_id, record);
     }
 
+    /// F207-D: stale-marker WARN sweep. Iterates the in-memory ledger
+    /// every 5 minutes and logs WARN for any marker older than the
+    /// stale threshold (24h by default). Auto-clearing is intentionally
+    /// not done — a stuck marker usually signals a real bug we want to
+    /// surface, not silently paper over. Operator runs the Python ops
+    /// `--clear-stale-inflight extent <id>` script after investigating.
+    ///
+    /// Invariant I2 in the F207 plan: every acquire has a matching
+    /// release, OR leader failover replay reclaims the in-memory shadow
+    /// from etcd. A stale marker means BOTH paths failed for some
+    /// extent — usually a manager bug (e.g., the apply path returned
+    /// early without bundling the release into its txn).
+    pub(crate) async fn extent_inflight_stale_sweep_loop(self) {
+        const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300); // 5 min
+        const STALE_THRESHOLD_SECS: i64 = 24 * 3600; // 24 h
+        loop {
+            compio::time::sleep(SWEEP_INTERVAL).await;
+            if !self.leader.get() {
+                continue;
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let stale: Vec<(u64, ExtentOpKind, i64)> = self
+                .inflight
+                .borrow()
+                .iter()
+                .filter_map(|(eid, rec)| {
+                    rec.kind().and_then(|kind| {
+                        let age = now - rec.started_at;
+                        if age >= STALE_THRESHOLD_SECS {
+                            Some((*eid, kind, age))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+            for (eid, kind, age_secs) in stale {
+                tracing::warn!(
+                    extent_id = eid,
+                    op = ?kind,
+                    age_secs,
+                    "F207-D: stale extent_inflight marker (> 24h). Indicates a \
+                     leader-replay missed release or an aborted apply path. \
+                     Investigate with `etcdctl get extent_inflight/<id>`; run \
+                     Python ops `--clear-stale-inflight extent <id>` after \
+                     verifying the op is genuinely abandoned."
+                );
+            }
+        }
+    }
+
     /// Decode raw etcd values from the `extent_inflight/` prefix into
     /// `(extent_id, record)` pairs, dropping any malformed records with a
     /// WARN log. Called from `replay_from_etcd`.

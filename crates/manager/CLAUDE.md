@@ -748,3 +748,88 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
 
     Cross-reference: notes 10 (F138 ec_conversion_inflight lock),
     19 (F198 rich marker).
+
+21. **F207 unified extent in-flight ledger.** Replaces the four
+    pre-F207 scattered inflight bookkeeping mechanisms
+    (`ec_conversion_inflight: HashSet<u64>` F138, `pending_ec_dispatch:
+    HashMap<_, MgrEcDispatchInflight>` F198, `recovery_tasks:
+    HashMap<_, MgrRecoveryTask>`, `pending_extent_deletes:
+    VecDeque<PendingDelete>` F109) with a single etcd-backed ledger
+    keyed by extent_id. After F207-D, the previously-required
+    F126/F138/F139/F145/F147-A refuse-at-start checks all collapse
+    to a single `extent_inflight_op(eid)` probe (or two-snapshot
+    helpers where the predicate is more nuanced than "any op
+    blocks any other").
+
+    **Layer boundary (Class A/B/C model, set by user 2026-05-15):**
+    - The ledger is a STREAM-LAYER concept. Only stream-layer ops
+      enrol: ConvertToEc / Recovery / Delete (i.e. ops the manager
+      dispatches to extent-nodes as RPCs).
+    - PS-layer ops (split / merge / punch_holes / truncate /
+      sync_partition_vp_refs / alloc_extent) READ the ledger to
+      refuse-at-start when a touched extent has a stream-layer op
+      in flight, but DO NOT enrol themselves. They're
+      partition-scoped, not extent-scoped; enrolling them would
+      multiply etcd write traffic per split by source-extent count
+      while violating the layer boundary.
+    - Class A (PS handler starts while stream-layer op is in flight):
+      PS reads ledger, refuses with Precondition. Single-line
+      `extent_inflight_op` probe.
+    - Class B (stream-layer op fires mid-PS-await): F146 / F147-A
+      verify-at-apply pattern catches the snapshot-then-await race
+      by re-reading eversion before the etcd-mirror writeback.
+      Unchanged from notes 13 / 14.
+    - Class C (two stream-layer ops race): exclusive-per-extent CAS
+      via `acquire_extent_inflight`; second acquire returns
+      Precondition.
+
+    **Invariants (proved by code structure, not review):**
+    - **I1** Leader-only writes — F149 fence on every `txn_fenced`
+      call (note 15).
+    - **I2** Every acquire has a matching release, OR
+      `replay_from_etcd` reclaims the marker on leader failover.
+      Stale markers (`started_at` > 24h) surface via WARN log from
+      `extent_inflight_stale_sweep_loop` (5 min tick); operator
+      decides via Python ops `--clear-stale-inflight`.
+    - **I3** Release is bundled into the op's apply-done etcd txn
+      (`put_and_delete_txn(extents/<id>, deletes=[extent_inflight/<id>])`).
+      Atomic: either both effects land or neither does. Closes the
+      pre-F207 latent leak window in `apply_ec_conversion_done`
+      where the marker was deleted in a SEPARATE etcd round-trip
+      after the extents/<id> put.
+    - **I4** `replay_from_etcd` populates the in-memory shadow
+      BEFORE `recovery_dispatch_loop` / `ec_conversion_dispatch_loop`
+      / `extent_delete_loop` are spawned. Enforced by ordering
+      in `new_with_etcd` (`replay_from_etcd` -> `try_become_leader`
+      -> `start_runtime_tasks`).
+    - **I5** Every manager handler that mutates extent state calls
+      `extent_inflight_op` before clone-for-decision. Enforced by
+      review + the fact that there is now exactly one helper, not
+      five different sets to consult. Phase 2 (F207-C) migrated
+      all 9 historical sites.
+
+    **Atomicity headline:** pre-F207, `apply_ec_conversion_done`
+    did two separate etcd round-trips (put extents/<id>, then
+    delete ecConversionInflight/<id>). Manager crash between them
+    leaked the marker permanently — a latent bug that the
+    F119-D coordinator-side idempotency guard turned into a
+    silent stall rather than corruption. F207-B (and now F207-D)
+    bundles both into a single `txn_fenced`. F207-C did the same
+    for `apply_recovery_done` and `extent_delete_loop`'s
+    `release_delete_marker`. Same invariant I3, same protection.
+
+    **Stale-marker sweep (`extent_inflight_stale_sweep_loop`,
+    F207-D):** 5-min tick, WARN-only. Started by
+    `start_runtime_tasks` alongside the other loops. Auto-clearing
+    is INTENTIONALLY not done — a stuck marker usually signals a
+    real bug we want to surface, not silently paper over.
+
+    **Test helpers (`#[cfg(test)] _test_mark_*_inflight`):** unit
+    tests that simulate an in-flight op without going through etcd
+    use these helpers. They bypass the CAS + F149 fence; do NOT
+    use them in production code paths.
+
+    Cross-reference: notes 10 (F138), 11 (F139), 12 (F145),
+    13 (F146), 14 (F147-A), 19 (F198), 20 (F206). All those
+    notes describe the historical context for individual races
+    that F207 now unifies under one mechanism.

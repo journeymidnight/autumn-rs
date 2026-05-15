@@ -164,18 +164,16 @@ impl AutumnManager {
             }
         };
         if matches!(layout_changed, Some(true)) {
-            // F207-C: release the Recovery marker (both new ledger key and
-            // legacy recoveryTasks key) so the dedup check in
+            // F207-D: release the Recovery marker so the dedup check in
             // dispatch_recovery_task doesn't permanently block future
-            // attempts to repair this slot.
+            // attempts to repair this slot. Legacy `recoveryTasks/<id>`
+            // delete dropped (the backward-compat dual-key path lived in
+            // F207-C only).
             if let Some(etcd) = &self.etcd {
                 let _ = etcd
                     .put_and_delete_txn(
                         Vec::new(),
-                        vec![
-                            Self::extent_inflight_key(task.extent_id),
-                            format!("recoveryTasks/{}", task.extent_id),
-                        ],
+                        vec![Self::extent_inflight_key(task.extent_id)],
                     )
                     .await;
             }
@@ -239,15 +237,13 @@ impl AutumnManager {
                     Self::shard_addr_for_extent(&base, &n.shard_ports, task.extent_id)
                 })
             };
-            // Release Recovery (etcd + legacy + in-memory).
+            // Release Recovery (etcd + in-memory). F207-D removed the
+            // legacy-key delete entry.
             if let Some(etcd) = &self.etcd {
                 let _ = etcd
                     .put_and_delete_txn(
                         Vec::new(),
-                        vec![
-                            Self::extent_inflight_key(task.extent_id),
-                            format!("recoveryTasks/{}", task.extent_id),
-                        ],
+                        vec![Self::extent_inflight_key(task.extent_id)],
                     )
                     .await;
             }
@@ -267,19 +263,13 @@ impl AutumnManager {
         };
 
         if let Some(etcd) = &self.etcd {
-            // F207-C: atomic put + delete txn. Releases the Recovery
-            // marker (new ledger key + legacy recoveryTasks key) in the
-            // same txn that writes the updated extent state. Pre-F207-C
-            // it was already one txn (put_and_delete_txn), but the key
-            // list has grown by `extent_inflight/<id>` for the unified
-            // ledger.
+            // F207-D: atomic put + delete txn. Releases the Recovery
+            // marker in the same txn that writes the updated extent
+            // state. Legacy `recoveryTasks/<id>` delete dropped.
             let ex_payload = rkyv_encode(&updated_extent).to_vec();
             etcd.put_and_delete_txn(
                 vec![(format!("extents/{}", updated_extent.extent_id), ex_payload)],
-                vec![
-                    Self::extent_inflight_key(updated_extent.extent_id),
-                    format!("recoveryTasks/{}", updated_extent.extent_id),
-                ],
+                vec![Self::extent_inflight_key(updated_extent.extent_id)],
             )
             .await?;
         }
@@ -999,23 +989,19 @@ impl AutumnManager {
         };
 
         if let Some(etcd) = &self.etcd {
-            // F207-B: bundle the marker delete into the same etcd txn as
-            // the `extents/<id>` put. Pre-F207 this was two separate etcd
-            // round-trips (put extents/<id>, then later unpersist the
-            // marker); manager crash between them leaked the marker and
-            // blocked future ops on the extent until manual intervention.
-            // Now: atomic — either both effects land or neither does.
-            // Also delete the legacy `ecConversionInflight/<id>` key for
-            // one-cycle backward compat (no-op on F207-only clusters,
-            // one-shot cleanup on upgraded clusters).
+            // F207-B/D: bundle the marker delete into the same etcd txn
+            // as the `extents/<id>` put. Pre-F207 this was two separate
+            // etcd round-trips (put extents/<id>, then later unpersist
+            // the marker); manager crash between them leaked the marker
+            // and blocked future ops on the extent until manual
+            // intervention. Now: atomic — either both effects land or
+            // neither does. F207-D dropped the legacy
+            // `ecConversionInflight/<id>` delete entry.
             let key = format!("extents/{}", extent_id);
             let val = rkyv_encode(&updated).to_vec();
             etcd.put_and_delete_txn(
                 vec![(key, val)],
-                vec![
-                    Self::extent_inflight_key(extent_id),
-                    format!("ecConversionInflight/{}", extent_id),
-                ],
+                vec![Self::extent_inflight_key(extent_id)],
             )
             .await?;
         }

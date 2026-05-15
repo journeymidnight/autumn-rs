@@ -578,6 +578,18 @@ impl AutumnManager {
             mgr.policy_tick_loop().await;
         })
         .detach();
+
+        // F207-D: stale-marker WARN sweep. Iterates the inflight ledger
+        // every 5 minutes and logs WARN for any marker > 24h old.
+        // Auto-clearing is INTENTIONALLY not done — a stuck marker
+        // usually signals a real bug worth surfacing. Operator runs the
+        // Python ops `--clear-stale-inflight extent <id>` script after
+        // investigating.
+        let mgr = self.clone();
+        compio::runtime::spawn(async move {
+            mgr.extent_inflight_stale_sweep_loop().await;
+        })
+        .detach();
     }
 
     /// F183: every POLICY_TICK_INTERVAL_SEC, leader recomputes split/merge
@@ -1029,25 +1041,42 @@ impl AutumnManager {
         let disks = c.get_prefix("disks/").await?;
         let streams = c.get_prefix("streams/").await?;
         let extents = c.get_prefix("extents/").await?;
-        let tasks = c.get_prefix("recoveryTasks/").await?;
         let owner_locks = c.get_prefix("ownerLocks/").await?;
         let partitions = c.get_prefix("partitions/").await?;
         let partition_vp_refs = c.get_prefix("partitionVpRefs/").await?;
         let ps_nodes = c.get_prefix("psNodes/").await?;
         let regions = c.get_prefix("regions/").await?;
-        // F207-B: legacy F173/F198 `ecConversionInflight/` markers from
-        // pre-F207-B clusters. Folded into the unified `inflight` ledger
-        // as ConvertToEc records during replay; `apply_ec_conversion_done`
-        // additionally lists this legacy key in its delete batch so any
-        // stragglers are cleaned up on the next EC apply. One-cycle
-        // backward compat — to be removed in F207-D after a deploy cycle.
-        let ec_inflight_legacy = c.get_prefix("ecConversionInflight/").await?;
         // F183: per-partition last_op_at sidecar
         let last_op = c.get_prefix("partitionLastOp/").await?;
         // F207: unified extent in-flight ledger. Authoritative source of
         // truth for stream-layer ops in flight on each extent.
         let extent_inflight_raw = c.get_prefix(crate::extent_inflight::EXTENT_INFLIGHT_PREFIX).await?;
+        // F207-D: detect leftover legacy markers from a pre-F207
+        // cluster that skipped the F207-A/B/C deploy cycle. We do NOT
+        // fold them into the ledger (the F207-B/C transitional code is
+        // gone); we WARN so an operator can run the Python ops scrub
+        // before the orphan markers manifest as "stuck inflight"
+        // diagnostics. Empty on any cluster that went through
+        // F207-A/B/C as designed.
+        let legacy_ec_inflight = c.get_prefix("ecConversionInflight/").await?;
+        let legacy_recovery_tasks = c.get_prefix("recoveryTasks/").await?;
         drop(c);
+        if !legacy_ec_inflight.kvs.is_empty() {
+            tracing::warn!(
+                count = legacy_ec_inflight.kvs.len(),
+                "F207-D: found leftover `ecConversionInflight/` etcd markers from a \
+                 pre-F207 cluster. These are NOT folded into the unified ledger; run \
+                 the Python ops scrub script to clear them, or upgrade via an \
+                 F207-A/B/C binary first (which folds them automatically)."
+            );
+        }
+        if !legacy_recovery_tasks.kvs.is_empty() {
+            tracing::warn!(
+                count = legacy_recovery_tasks.kvs.len(),
+                "F207-D: found leftover `recoveryTasks/` etcd markers from a \
+                 pre-F207 cluster. Same remediation as for `ecConversionInflight/`."
+            );
+        }
 
         let mut max_id = 0u64;
         let mut decoded_nodes = HashMap::new();
@@ -1080,27 +1109,6 @@ impl AutumnManager {
             let ex: MgrExtentInfo = rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             max_id = max_id.max(id);
             decoded_extents.insert(id, ex);
-        }
-
-        // F207-C: legacy `recoveryTasks/<id>` etcd markers from pre-F207
-        // clusters. Fold into the unified ledger as Recovery records;
-        // `apply_recovery_done` also lists this legacy key in its
-        // delete batch so any stragglers get cleaned up on the next
-        // recovery apply. One-cycle backward compat — to be removed
-        // in F207-D after a deploy cycle.
-        let mut legacy_recovery_records: HashMap<
-            u64,
-            crate::extent_inflight::MgrExtentInflightRecord,
-        > = HashMap::new();
-        for kv in &tasks.kvs {
-            let id = Self::parse_id_from_key("recoveryTasks/", &kv.key)?;
-            let task: MgrRecoveryTask = rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
-            let record = crate::extent_inflight::MgrExtentInflightRecord::new(
-                id,
-                crate::extent_inflight::ExtentOpPayload::Recovery(task),
-                (*self.instance_id).clone(),
-            );
-            legacy_recovery_records.insert(id, record);
         }
 
         let mut decoded_owner_revs = HashMap::new();
@@ -1147,43 +1155,6 @@ impl AutumnManager {
             decoded_regions.insert(id, region);
         }
 
-        // F207-B: legacy `ecConversionInflight/` markers. Fold them into
-        // the unified `inflight` ledger as ConvertToEc records. Pre-F198
-        // empty-value markers can't be safely re-dispatched (no
-        // target_nodes); we log and skip — `apply_ec_conversion_done`'s
-        // delete batch will clean them up on a future successful convert,
-        // or operator runs the ops scrub script.
-        let mut legacy_ec_dispatched: HashMap<u64, crate::extent_inflight::MgrExtentInflightRecord> =
-            HashMap::new();
-        for kv in &ec_inflight_legacy.kvs {
-            let id = Self::parse_id_from_key("ecConversionInflight/", &kv.key)?;
-            if kv.value.is_empty() {
-                tracing::warn!(
-                    extent_id = id,
-                    "F207-B: legacy empty ecConversionInflight marker (pre-F198, no target_nodes); \
-                     cannot re-dispatch safely — operator must clear via ops tool"
-                );
-                continue;
-            }
-            match rkyv_decode::<MgrEcDispatchInflight>(&kv.value) {
-                Ok(rec) => {
-                    let record = crate::extent_inflight::MgrExtentInflightRecord::new(
-                        id,
-                        crate::extent_inflight::ExtentOpPayload::ConvertToEc(rec),
-                        (*self.instance_id).clone(),
-                    );
-                    legacy_ec_dispatched.insert(id, record);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        extent_id = id,
-                        error = %e,
-                        "F207-B: failed to decode legacy ecConversionInflight marker; skipping"
-                    );
-                }
-            }
-        }
-
         // F183: parse partitionLastOp/ sidecar (i64 little-endian)
         let mut decoded_last_op: HashMap<u64, i64> = HashMap::new();
         for kv in &last_op.kvs {
@@ -1211,15 +1182,13 @@ impl AutumnManager {
         // F183: install last_op_at sidecar so policy engine cooldown
         // gating is correct on cold-start as well.
         *self.last_op_at.borrow_mut() = decoded_last_op;
-        // F207-C: install the unified inflight ledger. Records with
+        // F207-D: install the unified inflight ledger. Records with
         // malformed op_kind/payload combinations are dropped with a WARN
-        // inside `decode_extent_inflight_kvs`. Legacy
-        // `ecConversionInflight/` (F198) and `recoveryTasks/` (pre-F207-C)
-        // markers from pre-F207 clusters are merged in below; the new
-        // prefix entries take precedence if both exist for the same extent
-        // (which only happens during the backward-compat window between
-        // F207 deploy and the next successful apply that clears the
-        // legacy key).
+        // inside `decode_extent_inflight_kvs`. F207-D removed the
+        // transitional fold-in of legacy `ecConversionInflight/` /
+        // `recoveryTasks/` prefixes; an operator deploying directly
+        // from a pre-F207 binary onto F207-D must run the Python ops
+        // scrub first (we WARN above on detecting any leftover keys).
         {
             let decoded = Self::decode_extent_inflight_kvs(extent_inflight_raw.kvs.iter().map(
                 |kv| {
@@ -1233,14 +1202,6 @@ impl AutumnManager {
             ));
             let mut map = self.inflight.borrow_mut();
             map.clear();
-            // Legacy first (Recovery, then ConvertToEc — both must be
-            // captured before new-prefix records can selectively override).
-            for (id, rec) in legacy_recovery_records {
-                map.insert(id, rec);
-            }
-            for (id, rec) in legacy_ec_dispatched {
-                map.insert(id, rec);
-            }
             for (id, rec) in decoded {
                 if id != 0 {
                     map.insert(id, rec);
