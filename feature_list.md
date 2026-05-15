@@ -1418,7 +1418,7 @@ Cleared by audit (no fix needed):
 #### F210-C · Write-pipeline atomicity (partition layer)
 - **C1** WAL replay uses `sst_max_seq` to dedupe (lib.rs:3923, background.rs:871, lib.rs:4618). With concurrent in-flight Phase3 inserts in seq-out-of-order, an acked low-seq batch missing from SST is silently skipped on replay → ack'd-write loss. Fix: per-key bitmap / internal-key set in checkpoint, or per-WAL-extent-offset high-water-mark.
 - **C2** `handle_split_part` (rpc_handlers.rs:438, 446, 456; background.rs:1011) does flush but no freeze-drain — in-flight WAL append can land bytes past seal_length → invisible on recovery. Reuse merge freeze (F185).
-- **C3** Merge freeze drain returns OK on flush failure (lib.rs:3860, 3864, 3869). Manager proceeds to merge; unflushed data → merged away. Return `CODE_UNAVAILABLE` + rollback freeze.
+- **C3** ✅ Done. Merge freeze drain now captures `flush_one_imm` failures and returns `CODE_UNAVAILABLE` (was: swallow + return CODE_OK). Manager's existing `send_freeze` closure already errors on non-OK + triggers `rollback` to unfreeze any already-frozen PS, so no manager-side change needed. Closes the silent-drop window where unflushed imm bytes were merged away because manager thought drain was complete.
 - **C4** SST checkpoint + `sync_partition_vp_refs` not atomic (lib.rs:5094-5095; manager rpc_handlers.rs:1191). SST published → VP-referenced; sync fails → manager `vp_table_refs` stale → `punch_holes` deletes VP extent. Either tx-bundle in manager, or block GC until sync succeeds.
 - **passes:** false
 

@@ -3856,24 +3856,54 @@ async fn merged_partition_loop(
                 let mut p = part.borrow_mut();
                 rotate_active(&mut p);
             }
+            // F210-C3: capture flush_one_imm failures and propagate to the
+            // freeze ack. Pre-F210-C3 the loop swallowed any error with
+            // `break` and unconditionally returned CODE_OK — manager
+            // thought drain was complete and proceeded with the merge
+            // commit_length capture + atomic txn, but imm with unflushed
+            // data was still in memory. After the merge txn deleted the
+            // victim partition, region_sync_loop dropped the
+            // PartitionData and any unflushed bytes were lost.
+            //
+            // Returning CODE_UNAVAILABLE signals manager to rollback the
+            // freeze (best-effort MSG_MERGE_FREEZE { freeze: false }) and
+            // abort the merge; client retries.
+            let mut drain_err: Option<String> = None;
             loop {
                 match flush_one_imm(&part).await {
                     Ok(true) => continue,
                     Ok(false) => break,
                     Err(e) => {
-                        tracing::error!(part_id, "freeze drain flush_one_imm: {e:#}");
+                        let msg = format!("{e:#}");
+                        tracing::error!(part_id, "freeze drain flush_one_imm: {msg}");
+                        drain_err = Some(msg);
                         break;
                     }
                 }
             }
             let ack = part.borrow().freeze_drain_ack.borrow_mut().take();
             if let Some(ack) = ack {
-                let resp = partition_rpc::MergeFreezeResp {
-                    code: partition_rpc::CODE_OK,
-                    message: String::new(),
+                let resp = match drain_err {
+                    None => partition_rpc::MergeFreezeResp {
+                        code: partition_rpc::CODE_OK,
+                        message: String::new(),
+                    },
+                    Some(e) => partition_rpc::MergeFreezeResp {
+                        code: partition_rpc::CODE_UNAVAILABLE,
+                        message: format!("freeze drain flush failed: {e}"),
+                    },
                 };
+                let succeeded = resp.code == partition_rpc::CODE_OK;
                 let _ = ack.send(Ok(partition_rpc::rkyv_encode(&resp)));
-                tracing::info!(part_id, "freeze drain complete — partition halted");
+                if succeeded {
+                    tracing::info!(part_id, "freeze drain complete — partition halted");
+                } else {
+                    tracing::warn!(
+                        part_id,
+                        "freeze drain reported flush failure to manager; \
+                         merge will be rolled back"
+                    );
+                }
             }
             // Fall through; subsequent iterations continue serving reads
             // and the (still-set) frozen_for_merge keeps rejecting writes.
