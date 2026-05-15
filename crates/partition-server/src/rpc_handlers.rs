@@ -116,7 +116,17 @@ pub(crate) async fn dispatch_partition_rpc(
         MSG_HEAD => handle_head(payload, part).await,
         MSG_RANGE => handle_range(payload, part).await,
         MSG_GET_DISCARDS => handle_get_discards(payload, part, part_sc).await,
-        MSG_SPLIT_PART => handle_split_part(payload, part, part_sc, pool, manager_addr, owner_key, revision).await,
+        // F210-C2: SPLIT_PART must NOT be invoked inline through
+        // dispatch_partition_rpc — handle_split_part awaits an internal
+        // drain signal that requires merged_partition_loop to run, and
+        // an inline call would self-deadlock (the loop's stack is parked
+        // here). MSG_SPLIT_PART is now intercepted in
+        // `handle_incoming_req` and dispatched via `compio::runtime::spawn`.
+        MSG_SPLIT_PART => Err((
+            StatusCode::Internal,
+            "MSG_SPLIT_PART must not be dispatched inline — F210-C2 requires spawned task; \
+             routed via handle_incoming_req's MSG_SPLIT_PART arm".to_string(),
+        )),
         MSG_MAINTENANCE => handle_maintenance(payload, part).await,
         // F129 server-side multipart (MSG_PUT_BEGIN/CHUNK/COMMIT/ABORT)
         // removed in F186. Stripe-write is now pure client-side via
@@ -435,14 +445,74 @@ pub(crate) async fn handle_split_part(
             format!("part has fewer than 2 in-range keys (have {}; run major compaction first)", user_keys.len())));
     }
 
-    flush_memtable_locked(part).await.map_err(|e| (StatusCode::Internal, e.to_string()))?;
-
     let mid = user_keys[user_keys.len() / 2].clone();
     let (log_stream_id, row_stream_id, meta_stream_id) = {
         let p = part.borrow();
         (p.log_stream_id, p.row_stream_id, p.meta_stream_id)
     };
 
+    // F210-C2: PrepareSplit-style freeze + drain. Pre-F210-C2 split called
+    // `flush_memtable_locked(part)` directly then `commit_length` — but
+    // merged_partition_loop could still process in-flight Phase 2 writes
+    // (their work is on stream_worker_loop, independent of split's stack)
+    // during the await window. Those writes' bytes landed on EN past the
+    // captured commit_length, then manager sealed at the captured value,
+    // leaving the trailing bytes invisible on recovery. The fix mirrors
+    // F185's merge freeze: set frozen_for_split → halt new Put/Delete via
+    // handle_incoming_req's reject branch → park split_drain_ack →
+    // merged_partition_loop drains pending+inflight+imm → fires the ack
+    // signal → split resumes. After this drain, commit_length is stable.
+    //
+    // handle_split_part runs on a spawned task (see MSG_SPLIT_PART in
+    // handle_incoming_req) so its awaits don't block merged_partition_loop.
+    //
+    // Idempotency: if a previous split is already in flight on this
+    // partition, refuse. Same shape as the merge freeze's "already in
+    // progress" check.
+    let (drain_tx, drain_rx) = futures::channel::oneshot::channel::<Result<(), String>>();
+    {
+        let p = part.borrow();
+        if p.split_drain_ack.borrow().is_some() || p.frozen_for_split.get().is_some() {
+            return Err((
+                StatusCode::FailedPrecondition,
+                "split already in progress on this partition".to_string(),
+            ));
+        }
+        if p.frozen_for_merge.get().is_some() {
+            return Err((
+                StatusCode::FailedPrecondition,
+                "partition is frozen for merge; retry split after merge completes".to_string(),
+            ));
+        }
+        p.frozen_for_split.set(Some(std::time::Instant::now()));
+        *p.split_drain_ack.borrow_mut() = Some(drain_tx);
+    }
+
+    // Await drain. On TTL-driven backstop, drain_rx receives
+    // Err(message). On flush failure, same Err path. Either way we
+    // unfreeze and propagate.
+    let drain_outcome = drain_rx.await;
+    match drain_outcome {
+        Ok(Ok(())) => {} // drain succeeded
+        Ok(Err(msg)) => {
+            // Drain hit a flush failure or TTL. Clean up.
+            part.borrow().frozen_for_split.set(None);
+            return Err((StatusCode::Internal, format!("split drain failed: {msg}")));
+        }
+        Err(_) => {
+            // Sender dropped without sending — shouldn't happen under
+            // single-threaded compio, but defensive.
+            part.borrow().frozen_for_split.set(None);
+            return Err((
+                StatusCode::Internal,
+                "split drain ack sender dropped without signaling".to_string(),
+            ));
+        }
+    }
+
+    // commit_length on each stream — now stable, because no in-flight
+    // Phase 2 can complete (drain emptied them) and no new writes can
+    // launch (frozen_for_split halts handle_incoming_req).
     let log_end = part_sc.commit_length(log_stream_id).await.unwrap_or(0).max(1);
     let row_end = part_sc.commit_length(row_stream_id).await.unwrap_or(0).max(1);
     let meta_end = part_sc.commit_length(meta_stream_id).await.unwrap_or(0).max(1);
@@ -469,6 +539,10 @@ pub(crate) async fn handle_split_part(
     }
 
     if !split_ok {
+        // F210-C2: unfreeze on multi_modify_split failure so the partition
+        // resumes serving writes (client will retry split). Without this
+        // the partition stays frozen until FREEZE_TTL backstop fires.
+        part.borrow().frozen_for_split.set(None);
         return Err((StatusCode::FailedPrecondition, split_err));
     }
 
@@ -506,6 +580,12 @@ pub(crate) async fn handle_split_part(
             p.has_overlap.set(1);
         }
     }
+
+    // F210-C2: unfreeze on success — split commit landed; the LEFT
+    // (this partition's) post-split rg is now in effect, and merged
+    // commit_length matches the manager's sealed_length. Writes can
+    // resume against the narrower range.
+    part.borrow().frozen_for_split.set(None);
 
     Ok(partition_rpc::rkyv_encode(&SplitPartResp { code: CODE_OK, message: String::new() }))
 }

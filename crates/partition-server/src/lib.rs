@@ -721,6 +721,24 @@ pub(crate) struct PartitionData {
     /// checkpoint, which is the strict precondition that makes
     /// `MSG_CHECK_COMMIT_LENGTH` safe to capture for the merge txn.
     pub(crate) freeze_drain_ack: std::cell::RefCell<Option<oneshot::Sender<HandlerResult>>>,
+    /// F210-C2: PrepareSplit-style write halt. Mirror of `frozen_for_merge`
+    /// but for the SPLIT path; needed because `handle_split_part` runs on
+    /// a spawned task (not inline through dispatch_partition_rpc) so it
+    /// can park here and let `merged_partition_loop` drain
+    /// pending+inflight+imm before `commit_length` is captured. Pre-F210-C2
+    /// split called `flush_memtable_locked` then `commit_length` directly,
+    /// but the inline await window let in-flight Phase 2 appends complete
+    /// past the captured `commit_length` — those bytes existed on EN disk
+    /// past sealed_length and were invisible on recovery.
+    pub(crate) frozen_for_split: Cell<Option<std::time::Instant>>,
+    /// F210-C2: internal oneshot signal from `merged_partition_loop` to
+    /// the spawned `handle_split_part` task — fired after drain completes.
+    /// Payload is `Result<(), String>`: `Ok(())` = drain succeeded,
+    /// commit_length is now safe to capture; `Err(msg)` = drain hit a
+    /// flush failure (same shape as F210-C3 merge error path) and the
+    /// split must abort.
+    pub(crate) split_drain_ack:
+        std::cell::RefCell<Option<oneshot::Sender<Result<(), String>>>>,
     /// F183: per-partition load metrics for the manager's policy engine.
     /// Counters are bumped by `merged_partition_loop` (req on each
     /// dispatch, imm_full each time the imm cap stalls intake). The
@@ -3562,6 +3580,8 @@ async fn partition_thread_main(
         extent_pins: std::cell::RefCell::new(std::collections::HashMap::new()),
         frozen_for_merge: Cell::new(None),
         freeze_drain_ack: std::cell::RefCell::new(None),
+        frozen_for_split: Cell::new(None),
+        split_drain_ack: std::cell::RefCell::new(None),
         metrics: metrics_arc.clone(),
     }));
 
@@ -3869,7 +3889,12 @@ async fn merged_partition_loop(
         // once frozen, no new req_rx wakeups arrive — blocking on
         // req_rx.next() in the wait branches would prevent the freeze
         // ack from ever firing.
-        let need_freeze_drain = part.borrow().freeze_drain_ack.borrow().is_some();
+        // F210-C2: same drain logic also serves split — split parks its own
+        // oneshot in `split_drain_ack` and awaits the signal here. Either
+        // (or both, in rare overlap) can be pending.
+        let need_merge_drain = part.borrow().freeze_drain_ack.borrow().is_some();
+        let need_split_drain = part.borrow().split_drain_ack.borrow().is_some();
+        let need_freeze_drain = need_merge_drain || need_split_drain;
         if need_freeze_drain && pending.is_empty() && inflight.is_empty() {
             {
                 let mut p = part.borrow_mut();
@@ -3900,9 +3925,10 @@ async fn merged_partition_loop(
                     }
                 }
             }
-            let ack = part.borrow().freeze_drain_ack.borrow_mut().take();
-            if let Some(ack) = ack {
-                let resp = match drain_err {
+            // Merge ack: external RPC resp.
+            let merge_ack = part.borrow().freeze_drain_ack.borrow_mut().take();
+            if let Some(ack) = merge_ack {
+                let resp = match &drain_err {
                     None => partition_rpc::MergeFreezeResp {
                         code: partition_rpc::CODE_OK,
                         message: String::new(),
@@ -3924,8 +3950,26 @@ async fn merged_partition_loop(
                     );
                 }
             }
+            // F210-C2: split ack: internal oneshot signal.
+            let split_ack = part.borrow().split_drain_ack.borrow_mut().take();
+            if let Some(ack) = split_ack {
+                let payload = match &drain_err {
+                    None => Ok(()),
+                    Some(e) => Err(e.clone()),
+                };
+                let _ = ack.send(payload);
+                if drain_err.is_none() {
+                    tracing::info!(part_id, "split drain complete — proceeding to commit_length capture");
+                } else {
+                    tracing::warn!(
+                        part_id,
+                        "split drain reported flush failure; split will abort"
+                    );
+                }
+            }
             // Fall through; subsequent iterations continue serving reads
-            // and the (still-set) frozen_for_merge keeps rejecting writes.
+            // and the (still-set) frozen_for_merge / frozen_for_split keep
+            // rejecting writes.
         }
 
         // (A) Opportunistic CQ drain — run Phase 3 for every completion that
@@ -4179,7 +4223,28 @@ async fn merged_partition_loop(
                 tracing::warn!(
                     part_id,
                     ttl_secs = FREEZE_TTL.as_secs(),
-                    "freeze TTL expired — auto-unfreeze"
+                    "merge freeze TTL expired — auto-unfreeze"
+                );
+            }
+        }
+        // F210-C2: symmetric TTL backstop for split. If the spawned
+        // handle_split_part task is wedged (e.g. manager unreachable
+        // for the entire multi_modify_split retry window ~12 s, or
+        // task panicked), unfreeze so the partition resumes serving
+        // writes — at worst the client retries split.
+        if let Some(at) = part.borrow().frozen_for_split.get() {
+            if at.elapsed() >= FREEZE_TTL {
+                let p = part.borrow();
+                p.frozen_for_split.set(None);
+                if let Some(ack) = p.split_drain_ack.borrow_mut().take() {
+                    let _ = ack.send(Err(
+                        "split freeze TTL expired (handler wedged)".to_string()
+                    ));
+                }
+                tracing::warn!(
+                    part_id,
+                    ttl_secs = FREEZE_TTL.as_secs(),
+                    "split freeze TTL expired — auto-unfreeze"
                 );
             }
         }
@@ -4258,11 +4323,15 @@ async fn handle_incoming_req(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // F185: reject mutating ops while frozen-for-merge so writes never
-    // land in a log_stream tail past the to-be-captured commit_length.
-    // Reads + maintenance still flow normally (the freeze is a write
-    // halt, not a full quiesce — readers see the existing state).
-    let frozen = part.borrow().frozen_for_merge.get().is_some();
+    // F185 + F210-C2: reject mutating ops while frozen-for-merge OR
+    // frozen-for-split so writes never land in a log_stream tail past
+    // the to-be-captured commit_length. Reads + maintenance still flow
+    // normally (the freeze is a write halt, not a full quiesce —
+    // readers see the existing state).
+    let frozen = {
+        let p = part.borrow();
+        p.frozen_for_merge.get().is_some() || p.frozen_for_split.get().is_some()
+    };
     if frozen {
         match req.msg_type {
             MSG_PUT => {
@@ -4357,8 +4426,41 @@ async fn handle_incoming_req(
             // has cleared pending → inflight → memtable → row_stream SST
             // → meta_stream checkpoint.
         }
-        // Reads and low-frequency ops (SPLIT_PART, MAINTENANCE) go inline
-        // via dispatch_partition_rpc — correctness-preserving.
+        // F210-C2: SPLIT_PART is spawned as a separate task on the same
+        // P-log runtime so its awaits (drain + commit_length + manager
+        // RPC) don't block merged_partition_loop. Without this, the loop
+        // can't process the drain (it's the only one that pulls inflight
+        // completions + flushes imm), causing a self-deadlock. Pre-F210-C2
+        // split ran inline via dispatch_partition_rpc; the drain wasn't
+        // needed because split didn't halt writes — but that was the
+        // source of the bug (in-flight WAL appends landed past the
+        // captured commit_length, invisible on recovery).
+        MSG_SPLIT_PART => {
+            let part_c = part.clone();
+            let part_sc_c = part_sc.clone();
+            let pool_c = pool.clone();
+            let manager_addr_c = manager_addr.to_string();
+            let owner_key_c = owner_key.to_string();
+            let revision_c = revision;
+            let payload = req.payload;
+            let resp_tx = req.resp_tx;
+            compio::runtime::spawn(async move {
+                let result = crate::rpc_handlers::handle_split_part(
+                    payload,
+                    &part_c,
+                    &part_sc_c,
+                    &pool_c,
+                    &manager_addr_c,
+                    &owner_key_c,
+                    revision_c,
+                )
+                .await;
+                let _ = resp_tx.send(result);
+            })
+            .detach();
+        }
+        // Reads and low-frequency ops (MAINTENANCE) go inline via
+        // dispatch_partition_rpc — correctness-preserving.
         _ => {
             let result = dispatch_partition_rpc(
                 req.msg_type,
