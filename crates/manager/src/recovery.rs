@@ -69,7 +69,35 @@ impl AutumnManager {
                 start_time: Self::epoch_seconds(),
             };
 
-            let payload = rkyv_encode(&ExtRequireRecoveryReq { task: task.clone() });
+            // F210-D3: acquire the unified inflight marker BEFORE the
+            // EN RPC. Pre-F210-D3 the order was reversed (RPC → check
+            // code → acquire): if `acquire_extent_inflight` failed
+            // (NotLeader during the etcd CAS await, etcd transient,
+            // or someone else acquired between our probe at L24 and
+            // our acquire), the EN was ALREADY running `run_recovery_task`
+            // with no corresponding manager ledger entry. apply_recovery_done
+            // (which validates state from the ledger) would later be
+            // missing the I3 atomic put_and_delete_txn's delete target,
+            // and the F207 ledger invariants drift.
+            //
+            // Now: acquire first; on success → RPC; if RPC fails or EN
+            // rejects, drain the marker (release etcd + in-memory) and
+            // try the next candidate. If acquire returns Precondition
+            // (someone else holds the marker), return Ok — the in-flight
+            // recovery is functionally what we wanted.
+            match self
+                .acquire_extent_inflight(
+                    extent.extent_id,
+                    crate::extent_inflight::ExtentOpPayload::Recovery(task.clone()),
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(AppError::Precondition(_)) => return Ok(()),
+                Err(other) => return Err(other),
+            }
+
+            let payload = rkyv_encode(&ExtRequireRecoveryReq { task });
             // 30 s ceiling — REQUIRE_RECOVERY only kicks off the
             // background `run_recovery_task` on the EN; the EN returns
             // OK immediately. A paged-out / dead EN otherwise wedges
@@ -80,34 +108,36 @@ impl AutumnManager {
                 .await
             {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(_) => {
+                    // RPC failed → release the marker we just acquired
+                    // and try the next candidate. We don't know if the
+                    // EN received the request; if it did, the EN-side
+                    // F139 recovery_inflight tracks it; we'll re-dispatch
+                    // on the next tick and the EN-side check will idempotently
+                    // refuse the duplicate.
+                    let _ = self.drain_extent_inflight_marker(extent.extent_id).await;
+                    continue;
+                }
             };
             let r: ExtCodeResp = match rkyv_decode(&resp) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(_) => {
+                    let _ = self.drain_extent_inflight_marker(extent.extent_id).await;
+                    continue;
+                }
             };
             if r.code != CODE_OK {
+                // EN rejected (e.g. extent exists locally already, or
+                // F139 recovery_inflight conflict). Release marker
+                // and try next candidate.
+                let _ = self.drain_extent_inflight_marker(extent.extent_id).await;
                 continue;
             }
 
-            // F207-C: acquire the unified inflight marker via CAS +
-            // F149 leader fence. Replaces the pre-F207-C
-            // `etcd.txn_fenced(create_revision==0, put recoveryTasks/<id>)`
-            // + in-memory `recovery_tasks.insert` pair with one call. The
-            // CAS makes "already in-flight" a clean Precondition error
-            // path (which we map to Ok — the caller's retry is moot
-            // because someone else is already on it).
-            match self
-                .acquire_extent_inflight(
-                    extent.extent_id,
-                    crate::extent_inflight::ExtentOpPayload::Recovery(task),
-                )
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(AppError::Precondition(_)) => return Ok(()),
-                Err(other) => return Err(other),
-            }
+            // Both acquire AND RPC succeeded. Marker stays in place
+            // until apply_recovery_done's atomic put_and_delete_txn
+            // releases it (F207 invariant I3).
+            return Ok(());
         }
 
         Err(AppError::Precondition(

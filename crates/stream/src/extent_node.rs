@@ -149,13 +149,30 @@ impl DiskFS {
             .join(format!("extent-{extent_id}.ec.dat"))
     }
 
-    /// F109: unlink the `.dat` and `.meta` files for an extent. Idempotent
-    /// — `NotFound` errors on either file are downgraded to `Ok(())` so
-    /// retries from the manager are safe. Returns Err only on a real I/O
-    /// failure (permission denied, etc.) so the caller can keep the entry
-    /// in the pending-delete queue and retry.
+    /// F109: unlink the `.dat`, `.meta`, and (F210-D2) `.ec.dat` files
+    /// for an extent. Idempotent — `NotFound` errors on any of the
+    /// three are downgraded to `Ok(())` so retries from the manager
+    /// are safe. Returns Err only on a real I/O failure (permission
+    /// denied, etc.) so the caller can keep the entry in the
+    /// pending-delete queue and retry.
+    ///
+    /// **F210-D2: `.ec.dat` staging files are now unlinked.** Pre-F210-D2
+    /// `remove_extent_files` only touched `.dat` + `.meta`, leaving any
+    /// `.ec.dat` from a crashed mid-conversion as a permanent orphan
+    /// (orphan-reconcile only scanned `self.extents`, not the directory).
+    /// With the F210-D1 op lock, a delete that races a convert is now
+    /// refused — but a CRASH mid-convert can still leave a `.ec.dat`
+    /// behind. Including it here ensures that when the manager
+    /// eventually issues `MSG_DELETE_EXTENT` for the extent (refs→0),
+    /// the staging file is also cleaned. The orphan reconcile loop
+    /// (F210-D2 second leg) handles the case where the extent's
+    /// `extent-{id}.dat` is already gone but `.ec.dat` survived.
     async fn remove_extent_files(&self, extent_id: u64) -> Result<()> {
-        for path in [self.extent_path(extent_id), self.meta_path(extent_id)] {
+        for path in [
+            self.extent_path(extent_id),
+            self.meta_path(extent_id),
+            self.ec_staging_path(extent_id),
+        ] {
             match compio::fs::remove_file(&path).await {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -217,12 +234,58 @@ impl DiskFS {
     }
 
     fn parse_extent_id(name: &str) -> Option<u64> {
+        // Reject `.ec.dat` (the F210-D2 ec-staging file) — that prefix
+        // also ends with ".dat" but parses as "42.ec" which fails
+        // parse::<u64>. Be explicit about the rejection so future
+        // maintainers don't accidentally match it here.
+        if name.ends_with(".ec.dat") {
+            return None;
+        }
         if name.starts_with("extent-") && name.ends_with(".dat") {
             let id_str = &name["extent-".len()..name.len() - ".dat".len()];
             id_str.parse().ok()
         } else {
             None
         }
+    }
+
+    /// F210-D2: parse the extent_id out of an `extent-{id}.ec.dat`
+    /// staging filename. Returns None for any other shape (including
+    /// `extent-{id}.dat`).
+    fn parse_ec_staging_extent_id(name: &str) -> Option<u64> {
+        if name.starts_with("extent-") && name.ends_with(".ec.dat") {
+            let id_str = &name["extent-".len()..name.len() - ".ec.dat".len()];
+            id_str.parse().ok()
+        } else {
+            None
+        }
+    }
+
+    /// F210-D2: scan all 256 hash subdirs for `extent-{id}.ec.dat`
+    /// staging files. Returns the extent_ids that have a `.ec.dat` on
+    /// disk. Used by the reconcile loop to also report ec-staging
+    /// orphans to the manager (the regular `scan_extents` only sees
+    /// `.dat` files; a crashed mid-convert that left `.ec.dat`
+    /// without a corresponding `.dat` was previously invisible to
+    /// reconcile). Sync — wraps `std::fs::read_dir`. Acceptable for
+    /// a 5-minute sweep; 256 directory reads is cheap.
+    fn scan_ec_staging_extent_ids(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        for byte in 0u8..=255 {
+            let subdir = self.base_dir.join(format!("{byte:02x}"));
+            let dir = match std::fs::read_dir(&subdir) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            for entry in dir.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if let Some(id) = Self::parse_ec_staging_extent_id(&name) {
+                    out.push(id);
+                }
+            }
+        }
+        out
     }
 
 }
@@ -771,6 +834,17 @@ pub struct ExtentNode {
     /// on the coordinator: the second one waits, then re-runs the F119-D
     /// guard under the lock and exits as a no-op once the first finishes.
     /// Pattern mirrors `client.rs::stream_init_locks`.
+    ///
+    /// **F210-D1: extended to a general "mutating-op lock"**. In addition
+    /// to EC convert, `handle_re_avali` now acquires this lock (its
+    /// write path — fetch_full_extent_from_sources + truncate + pwrite —
+    /// races with both convert and delete the same way). `handle_delete_extent`
+    /// `try_lock`s this and refuses with CODE_PRECONDITION if held,
+    /// closing the convert↔delete and re_avali↔delete races that F139's
+    /// `recovery_inflight` check alone didn't cover. The lock entry lives
+    /// for the lifetime of the node — bounded by the number of distinct
+    /// extents that ever ran a mutating op on this shard. Use
+    /// `get_or_create_extent_op_lock` to look up / create.
     ec_conversion_locks: Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>>,
     /// F194 → F196 D-r7: per-shard `ConcurrencyController` hosting both
     /// the EC-convert and recovery concurrency caps. Renamed from the
@@ -1679,12 +1753,37 @@ impl ExtentNode {
             Some(ep) => crate::conn_pool::normalize_endpoint(ep),
             None => return Ok(()),
         };
-        let extent_ids: Vec<u64> = self
+        let mut extent_ids: Vec<u64> = self
             .extents
             .iter()
             .map(|e| *e.key())
             .filter(|id| self.owns_extent(*id))
             .collect();
+
+        // F210-D2: also include extent_ids that have an
+        // `extent-{id}.ec.dat` staging file on disk. A CRASHED
+        // mid-`handle_convert_to_ec` may leave a `.ec.dat` without a
+        // corresponding `.dat` entry in `self.extents`. The F210-D2
+        // `remove_extent_files` unlinks `.ec.dat` too, but only when
+        // the manager TELLS us this extent is garbage — and the
+        // manager only sees the IDs we report here. Without the scan,
+        // the orphan `.ec.dat` persists forever (manager doesn't list
+        // it; we don't list it). After the scan we report it; manager
+        // says "yes, garbage"; we call `remove_extent_files` which
+        // unlinks the staging file. Idempotent — if the extent IS
+        // alive on the manager, no-op.
+        {
+            use std::collections::HashSet;
+            let mut seen: HashSet<u64> = extent_ids.iter().copied().collect();
+            for disk in self.disks.values() {
+                for id in disk.scan_ec_staging_extent_ids() {
+                    if self.owns_extent(id) && seen.insert(id) {
+                        extent_ids.push(id);
+                    }
+                }
+            }
+        }
+
         if extent_ids.is_empty() {
             return Ok(());
         }
@@ -1746,6 +1845,20 @@ impl ExtentNode {
     #[inline]
     pub(crate) fn owns_extent(&self, extent_id: u64) -> bool {
         self.shard_count <= 1 || (extent_id % self.shard_count as u64) as u32 == self.shard_idx
+    }
+
+    /// F210-D1: look up / create the per-extent mutating-op lock. Held
+    /// by `handle_convert_to_ec` and `handle_re_avali` for their full
+    /// duration; `try_lock`'d by `handle_delete_extent` to refuse
+    /// concurrent unlinks. Created lazily; lives for the node's
+    /// lifetime. See the field docstring on `ec_conversion_locks` for
+    /// the full semantic.
+    fn get_or_create_extent_op_lock(&self, extent_id: u64) -> Rc<futures::lock::Mutex<()>> {
+        let mut locks = self.ec_conversion_locks.borrow_mut();
+        locks
+            .entry(extent_id)
+            .or_insert_with(|| Rc::new(futures::lock::Mutex::new(())))
+            .clone()
     }
 
     /// F099-M: return the local sibling address that owns `extent_id`
@@ -3500,6 +3613,37 @@ impl ExtentNode {
             }));
         }
 
+        // F210-D1: try-acquire the per-extent mutating-op lock. If held
+        // by an in-flight `handle_convert_to_ec` or `handle_re_avali`,
+        // refuse the delete with CODE_PRECONDITION. Pre-F210-D1 the
+        // F139 check only covered the recovery↔delete pair; convert
+        // and re_avali could race with delete (data-loss paths
+        // documented in feature_list F210-D1):
+        //   - convert↔delete: delete unlinks `.dat`+`.meta` mid-encode;
+        //     convert's later `rename(.ec.dat, .dat)` resurrects an
+        //     orphan with no manager record + stale `.meta`.
+        //   - re_avali↔delete: delete unlinks `.dat`; re_avali's
+        //     `file_pwrite_chunked` writes to the unlinked inode
+        //     (POSIX preserves open fds); bytes evaporate on fd drop.
+        // Lock held across unlink + entry removal so a concurrent
+        // op blocks on the lock and observes NotFound after we release.
+        // Manager's extent_delete_loop has 60 × 2 s retry budget;
+        // covers the lock's typical hold (~seconds for convert, slightly
+        // more for re_avali on big extents).
+        let op_lock = self.get_or_create_extent_op_lock(req.extent_id);
+        let _op_guard = match op_lock.try_lock() {
+            Some(g) => g,
+            None => {
+                return Ok(rkyv_encode(&CodeResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "extent {} has in-flight mutating op (convert/re_avali); delete deferred",
+                        req.extent_id
+                    ),
+                }));
+            }
+        };
+
         // Pull the entry out of the map so any later append on this id
         // fails with NotFound rather than racing the unlink.
         let entry = self.extents.remove(&req.extent_id).map(|(_, v)| v);
@@ -3557,6 +3701,18 @@ impl ExtentNode {
                     .await;
             }
         }
+
+        // F210-D1: acquire the per-extent mutating-op lock for the
+        // entire re_avali. Held against concurrent
+        // `handle_convert_to_ec` (would corrupt the staging path) and
+        // `handle_delete_extent` (would unlink the inode while
+        // `file_pwrite_chunked` is writing to it). Released on
+        // function exit. Early-return paths (EC short-circuit,
+        // already-up-to-date) hold the lock only briefly. The actual
+        // long-running path (fetch_full_extent_from_sources + write)
+        // serialises with convert / delete via this lock.
+        let op_lock = self.get_or_create_extent_op_lock(req.extent_id);
+        let _op_guard = op_lock.lock().await;
 
         let extent = match self.get_extent(req.extent_id).await {
             Ok(v) => v,
@@ -3821,13 +3977,10 @@ impl ExtentNode {
         // lazily and lives for the lifetime of the node — bounded by the
         // number of extents ever EC-converted on this shard, which is
         // the same bound as the existing `extents` DashMap (~negligible).
-        let convert_lock = {
-            let mut locks = self.ec_conversion_locks.borrow_mut();
-            locks
-                .entry(extent_id)
-                .or_insert_with(|| Rc::new(futures::lock::Mutex::new(())))
-                .clone()
-        };
+        // F210-D1: now uses the shared `extent_op_lock` helper (same
+        // map, broadened semantic). handle_re_avali and the F210-D1
+        // delete try-lock route through the same lock.
+        let convert_lock = self.get_or_create_extent_op_lock(extent_id);
         let _convert_guard = convert_lock.lock().await;
 
         let entry = self.get_extent(extent_id).await?;
