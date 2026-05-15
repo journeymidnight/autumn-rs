@@ -210,17 +210,24 @@ impl AutumnManager {
             )));
         }
 
+        // F210-A1 etcd-first: compute updated_extent from a clone under
+        // read-only borrow. Pre-F210-A1 the borrow_mut block mutated
+        // s.extents[task.extent_id] in place, then the etcd put_and_delete_txn
+        // below ran. If etcd failed (NotLeader / fence break), the in-memory
+        // mutation had already advanced ex.replicates / eversion / avali —
+        // a window where reads observed the new state but etcd had the old.
+        // Replay rolled in-memory back later, but during the window other
+        // mutating handlers could derive their snapshots from the
+        // "fake-applied" state.
         let updated_extent = {
-            let mut s = self.store.inner.borrow_mut();
-            match s.extents.get_mut(&task.extent_id) {
+            let s = self.store.inner.borrow();
+            match s.extents.get(&task.extent_id) {
                 Some(ex) => {
                     let slot = match Self::extent_slot(ex, task.replace_id) {
                         Some(v) => v,
-                        // Unreachable under single-threaded compio:
-                        // the F209-B layout_changed.is_none() branch
-                        // above already covered this. Kept as defense
-                        // — if it ever fires, the marker leak is
-                        // bounded by F208's 10-min sweep.
+                        // Unreachable under single-threaded compio: the
+                        // F209-B layout_changed.is_none() branch above
+                        // already covered this. Kept as defense.
                         None => {
                             return Err(AppError::Precondition(format!(
                                 "replace_id {} not in extent {}",
@@ -229,24 +236,24 @@ impl AutumnManager {
                         }
                     };
 
-                    if slot < ex.replicates.len() {
-                        ex.replicates[slot] = task.node_id;
-                        if ex.replicate_disks.len() <= slot {
-                            ex.replicate_disks.resize(slot + 1, 0);
+                    let mut new_ex = ex.clone();
+                    if slot < new_ex.replicates.len() {
+                        new_ex.replicates[slot] = task.node_id;
+                        if new_ex.replicate_disks.len() <= slot {
+                            new_ex.replicate_disks.resize(slot + 1, 0);
                         }
-                        ex.replicate_disks[slot] = done_task.ready_disk_id;
+                        new_ex.replicate_disks[slot] = done_task.ready_disk_id;
                     } else {
-                        let parity_slot = slot - ex.replicates.len();
-                        ex.parity[parity_slot] = task.node_id;
-                        if ex.parity_disks.len() <= parity_slot {
-                            ex.parity_disks.resize(parity_slot + 1, 0);
+                        let parity_slot = slot - new_ex.replicates.len();
+                        new_ex.parity[parity_slot] = task.node_id;
+                        if new_ex.parity_disks.len() <= parity_slot {
+                            new_ex.parity_disks.resize(parity_slot + 1, 0);
                         }
-                        ex.parity_disks[parity_slot] = done_task.ready_disk_id;
+                        new_ex.parity_disks[parity_slot] = done_task.ready_disk_id;
                     }
-
-                    ex.avali |= 1u32 << slot;
-                    ex.eversion += 1;
-                    Some(ex.clone())
+                    new_ex.avali |= 1u32 << slot;
+                    new_ex.eversion += 1;
+                    Some(new_ex)
                 }
                 None => None,
             }
@@ -304,6 +311,13 @@ impl AutumnManager {
             .await?;
         }
 
+        // F210-A1: only AFTER etcd success do we apply to in-memory.
+        // (Pre-F210-A1 this was the borrow_mut block above; now the
+        // borrow_mut here is the sole in-memory write.)
+        {
+            let mut s = self.store.inner.borrow_mut();
+            s.extents.insert(updated_extent.extent_id, updated_extent.clone());
+        }
         self.commit_extent_inflight_release(updated_extent.extent_id);
         Ok(())
     }
@@ -984,49 +998,46 @@ impl AutumnManager {
         data_shards: usize,
         new_eversion: u64,
     ) -> Result<(), AppError> {
+        // F210-A1 etcd-first: compute `updated` from a clone under
+        // read-only borrow. Pre-F210-A1 the borrow_mut block mutated
+        // s.extents[extent_id] in place (ec_converted=true, replicates,
+        // parity, avali, eversion), then the etcd put_and_delete_txn
+        // ran. If etcd failed (NotLeader / fence break), in-memory had
+        // the new EC-converted shape but etcd still showed the pre-EC
+        // shape — replay rolled in-memory back later, but in the
+        // window concurrent reads observed EC state that wasn't durable.
         let updated = {
-            let mut s = self.store.inner.borrow_mut();
+            let s = self.store.inner.borrow();
             let ex = s
                 .extents
-                .get_mut(&extent_id)
+                .get(&extent_id)
                 .ok_or_else(|| AppError::NotFound(format!("extent {extent_id}")))?;
 
             let mut all_disks = ex.replicate_disks.clone();
             all_disks.extend_from_slice(&extra_disk_ids);
             all_disks.truncate(target_nodes.len());
 
-            ex.ec_converted = true;
-            ex.replicates = target_nodes[..data_shards].to_vec();
-            ex.parity = target_nodes[data_shards..].to_vec();
-            ex.replicate_disks = all_disks[..data_shards].to_vec();
-            ex.parity_disks = all_disks[data_shards..].to_vec();
+            let mut new_ex = ex.clone();
+            new_ex.ec_converted = true;
+            new_ex.replicates = target_nodes[..data_shards].to_vec();
+            new_ex.parity = target_nodes[data_shards..].to_vec();
+            new_ex.replicate_disks = all_disks[..data_shards].to_vec();
+            new_ex.parity_disks = all_disks[data_shards..].to_vec();
             // Use the eversion sent in-band to the extent nodes via
             // ExtConvertToEcReq. Manager + every shard host now agree on
             // the same post-EC eversion.
-            ex.eversion = new_eversion;
+            new_ex.eversion = new_eversion;
             // F206: post-EC the extent has K+M shards across K+M nodes;
-            // every slot is available by construction (write_shard_local
-            // succeeded on each target). Without this, `avali` keeps its
-            // pre-EC value (typically `all_bits(K)` from the seal path),
-            // leaving the parity slot(s) marked unavailable. The
-            // recovery_dispatch_loop then fires EXT_MSG_RE_AVALI on the
-            // parity holder every 2 s, which on the extent-node side
-            // ran fetch_full_extent_from_sources — allocating
-            // `sealed_length`-sized Vec<u8> per peer attempt and never
-            // converging because peers also only hold a shard.
-            ex.avali = Self::all_bits(target_nodes.len());
-            ex.clone()
+            // every slot is available by construction.
+            new_ex.avali = Self::all_bits(target_nodes.len());
+            new_ex
         };
 
         if let Some(etcd) = &self.etcd {
             // F207-B/D: bundle the marker delete into the same etcd txn
             // as the `extents/<id>` put. Pre-F207 this was two separate
-            // etcd round-trips (put extents/<id>, then later unpersist
-            // the marker); manager crash between them leaked the marker
-            // and blocked future ops on the extent until manual
-            // intervention. Now: atomic — either both effects land or
-            // neither does. F207-D dropped the legacy
-            // `ecConversionInflight/<id>` delete entry.
+            // etcd round-trips; F207 made them atomic. F210-A1 makes
+            // the in-memory apply happen ONLY after this txn lands.
             let key = format!("extents/{}", extent_id);
             let val = rkyv_encode(&updated).to_vec();
             etcd.put_and_delete_txn(
@@ -1034,6 +1045,12 @@ impl AutumnManager {
                 vec![Self::extent_inflight_key(extent_id)],
             )
             .await?;
+        }
+
+        // F210-A1: only after etcd success do we apply to in-memory.
+        {
+            let mut s = self.store.inner.borrow_mut();
+            s.extents.insert(extent_id, updated);
         }
 
         Ok(())

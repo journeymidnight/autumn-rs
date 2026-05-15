@@ -1399,10 +1399,16 @@ Cleared by audit (no fix needed):
 - **Scope:** open backlog. Sub-features status updated as each lands. Cross-reference: ~/.claude/plans/pure-crafting-comet.md (review-time plan).
 
 #### F210-A · Etcd-first + verify-BEFORE + replay-then-leader (architecture)
-- **A1** apply paths violate etcd-first (4 sites: `handle_stream_punch_holes`, `handle_truncate`, `apply_recovery_done`, `apply_ec_conversion_done`). In-mem mutation lands BEFORE the etcd txn — fence-break leaves durable state behind in-memory state. Refactor pattern: `borrow_pre → drop → etcd_txn → borrow_post → apply`.
-- **A2** verify-at-apply lands AFTER etcd commit (5 sites: `stream_alloc_extent`, `split`, `merge`, `sync_partition_vp_refs` — plus `force_ec_convert` already done in F209-D). Client sees `Precondition` but etcd already durable → linearization unexplainable. All 5 → verify-BEFORE-acquire/mirror pattern. F209-D shape is the template.
-- **A3** `set_leader(true)` at `lib.rs:987` is BEFORE `replay_from_etcd()` at `:988`. Handlers can run with stale in-mem state during replay. Swap to replay-then-set-leader; consider starting `leader_keepalive_loop` between CAS and replay so long replays don't lose the lease.
-- **passes:** false
+- **A1** ✅ Done (commit `<this>`). 4 apply paths refactored to true etcd-first per CLAUDE.md note 1:
+  - `handle_stream_punch_holes`: closure now uses `borrow()` (read-only), builds `(updated_stream, extent_puts, extent_deletes, pending_deletes)` from clones, returns plan; etcd mirror; on success `borrow_mut` applies the pre-computed plan.
+  - `handle_truncate`: same shape.
+  - `apply_recovery_done`: `updated_extent` built from a clone under `borrow()`; etcd `put_and_delete_txn` (atomic with marker release per F207 I3); only then `borrow_mut` inserts updated into store.
+  - `apply_ec_conversion_done`: `updated` built from a clone under `borrow()`; etcd txn; only then `borrow_mut` inserts.
+- **A2** ✅ Done (commit 377f66f). 5 sites (4 + F209-D's force_ec_convert): verify moved from after-mirror to before-mirror. Eversion drift detected before any etcd write → no orphan etcd revision, no linearization split.
+- **A3** ✅ Done (commit 377f66f). `set_leader(true)` swapped to after `replay_from_etcd()`; handlers reject during replay with NOT_LEADER, client retries land after replay completes.
+- **Why these bugs existed:** CLAUDE.md note 1 defines etcd-first as compute → persist → apply, but the codebase drifted to in-place mutate-then-mirror. F207 I3's atomic `put_and_delete_txn` covered the etcd-internal atomicity (marker release ⊕ state-put) but not the in-memory ↔ etcd boundary. F146's verify-AFTER-mirror was right for one op (alloc_extent — failover replay reconciles a stale orphan revision) and got copy-pasted to ops where the orphan etcd revision IS the bug (split/merge/sync_vp_refs/force_ec_convert).
+- **Followups (P3, deferred):** start `leader_keepalive_loop` between CAS and replay so multi-second replays don't lose the lease (needs a stop-signal on replay failure). PS-layer ops (alloc_extent / split / merge / punch_holes / truncate / sync_vp_refs) don't enroll in the F207 ledger (cross-extent + per-split-fanout would multiply etcd traffic); the residual mirror-RTT race after verify-BEFORE is closed by either (a) acquiring a temporary ledger marker, or (b) using etcd `mod_revision` CAS on the put.
+- **passes:** true
 
 #### F210-B · Write/Read quorum protocol asymmetry (stream layer)
 - **B1+B2** Write fanout is N-of-N (`client.rs:692-815 apply_completion` breaks on any error), read commit_length is majority, manager seal sets `min_size=1` (rpc_handlers.rs:683, 890). Three different quorum definitions in three places. Pick one (likely N-of-N write + N-of-N fsync-wait, slow-replica catches up via re_avali; or majority everywhere) and align.

@@ -1118,9 +1118,15 @@ impl AutumnManager {
         // semantics.
         let (ec_inflight_set, recovery_inflight_set) = self.inflight_snapshot_ec_recovery();
 
+        // F210-A1 etcd-first refactor (was: mutate-store then mirror-etcd
+        // then enqueue). The pre-F210-A1 form computed mutations inside a
+        // borrow_mut block — mirror failure (NotLeader / etcd transient)
+        // left in-memory state advanced while etcd was unchanged. note 1's
+        // step 1 says "compute mutations without modifying store". The
+        // closure below now does so by working on clones.
         let out = {
-            let mut guard = self.store.inner.borrow_mut();
-            let s: &mut autumn_common::MetadataState = &mut guard;
+            let guard = self.store.inner.borrow();
+            let s: &autumn_common::MetadataState = &guard;
             (|| -> Result<
                 (
                     MgrStreamInfo,
@@ -1134,8 +1140,9 @@ impl AutumnManager {
                 let requested: HashSet<u64> = req.extent_ids.into_iter().collect();
                 let stream = s
                     .streams
-                    .get_mut(&req.stream_id)
-                    .ok_or_else(|| AppError::NotFound(format!("stream {}", req.stream_id)))?;
+                    .get(&req.stream_id)
+                    .ok_or_else(|| AppError::NotFound(format!("stream {}", req.stream_id)))?
+                    .clone();
 
                 // F126: only operate on extents that actually belong to this
                 // stream. Without this, a malformed request could decrement
@@ -1148,11 +1155,6 @@ impl AutumnManager {
 
                 // F139 / F207-C: if any extent that would drop to refs=0
                 // is currently being recovered, refuse the entire call.
-                // Recovery's ensure_extent auto-creates on NotFound,
-                // risking write-to-unlinked-inode or resurrection. PS GC
-                // retry backs off until recovery completes. Predicate is
-                // narrower than F145 (only refs==1) because resurrection
-                // matters only on the unlink path.
                 for eid in &removed {
                     if recovery_inflight_set.contains(eid) {
                         if let Some(ex) = s.extents.get(eid) {
@@ -1165,13 +1167,7 @@ impl AutumnManager {
                         }
                     }
                 }
-                // F145 / F207-B: symmetric to the F139 recovery guard above.
-                // Refuse the whole RPC if any to-be-removed extent is mid-EC.
-                // punch_holes would otherwise bump eversion via the else
-                // branch (refs<=1 + ec_inflight) or the refs>1 branch — both
-                // violate F138's invariant that the EC marker is an
-                // eversion-bump lock. PS GC retry naturally covers the
-                // brief inflight window.
+                // F145 / F207-B: refuse if any to-be-removed extent is mid-EC.
                 for eid in &removed {
                     if ec_inflight_set.contains(eid) {
                         return Err(AppError::Precondition(format!(
@@ -1181,62 +1177,53 @@ impl AutumnManager {
                     }
                 }
 
-                stream.extent_ids.retain(|id| !removed.contains(id));
-                if stream.extent_ids.is_empty() {
+                let mut updated = stream;
+                updated.extent_ids.retain(|id| !removed.contains(id));
+                if updated.extent_ids.is_empty() {
                     return Err(AppError::Precondition(
                         "stream cannot be empty after punch holes".to_string(),
                     ));
                 }
-                let updated = stream.clone();
                 let mut extent_puts = Vec::new();
                 let mut extent_deletes = Vec::new();
                 let mut pending_deletes = Vec::new();
 
-                // F109: snapshot replica addrs requires reading `s.nodes`
-                // while we mutably touch `s.extents`. Capture the relevant
-                // node entries first so the borrow checker sees disjoint
-                // fields (split-borrow only works on a bare &mut struct,
-                // and even then nested calls confuse it).
-                // Skip extents undergoing EC conversion — their physical
-                // files must not be deleted until conversion completes.
-                let needed_addrs: HashMap<u64, MgrExtentInfo> = s
-                    .extents
-                    .iter()
-                    .filter(|(eid, e)| {
-                        removed.contains(eid)
-                            && e.refs == 1
-                            && e.vp_table_refs == 0
-                            && !ec_inflight_set.contains(eid)
-                    })
-                    .map(|(eid, e)| (*eid, e.clone()))
-                    .collect();
-                for (eid, extent) in &needed_addrs {
-                    let pending_addrs =
-                        Self::snapshot_replica_addrs(&s.nodes, *eid, extent);
-                    pending_deletes.push(PendingDelete {
-                        extent_id: *eid,
-                        pending_addrs,
-                        attempts: 0,
-                    });
+                // F109: build pending_deletes snapshot for extents that
+                // would physically delete (refs would hit 0 and not EC-inflight).
+                for &eid in &removed {
+                    if let Some(extent) = s.extents.get(&eid) {
+                        if extent.refs == 1
+                            && extent.vp_table_refs == 0
+                            && !ec_inflight_set.contains(&eid)
+                        {
+                            let pending_addrs =
+                                Self::snapshot_replica_addrs(&s.nodes, eid, extent);
+                            pending_deletes.push(PendingDelete {
+                                extent_id: eid,
+                                pending_addrs,
+                                attempts: 0,
+                            });
+                        }
+                    }
                 }
 
-                for extent_id in removed {
-                    if let Some(extent) = s.extents.get_mut(&extent_id) {
-                        if extent.refs <= 1 {
-                            extent.refs = 0;
-                            if Self::extent_can_delete(extent)
-                                && !ec_inflight_set.contains(&extent_id)
+                for extent_id in &removed {
+                    if let Some(extent) = s.extents.get(extent_id) {
+                        let mut new_ext = extent.clone();
+                        if new_ext.refs <= 1 {
+                            new_ext.refs = 0;
+                            if Self::extent_can_delete(&new_ext)
+                                && !ec_inflight_set.contains(extent_id)
                             {
-                                s.extents.remove(&extent_id);
-                                extent_deletes.push(extent_id);
+                                extent_deletes.push(*extent_id);
                             } else {
-                                extent.eversion += 1;
-                                extent_puts.push(extent.clone());
+                                new_ext.eversion += 1;
+                                extent_puts.push(new_ext);
                             }
                         } else {
-                            extent.refs -= 1;
-                            extent.eversion += 1;
-                            extent_puts.push(extent.clone());
+                            new_ext.refs -= 1;
+                            new_ext.eversion += 1;
+                            extent_puts.push(new_ext);
                         }
                     }
                 }
@@ -1246,6 +1233,8 @@ impl AutumnManager {
 
         match out {
             Ok((stream, extent_puts, extent_deletes, pending_deletes)) => {
+                // Step 2: persist to etcd FIRST. Failure → in-memory zero
+                // changes (the closure above produced clones only).
                 if let Err(err) = self
                     .mirror_stream_extent_mutation(&stream, &extent_puts, &extent_deletes)
                     .await
@@ -1256,8 +1245,20 @@ impl AutumnManager {
                         stream: None,
                     }));
                 }
-                // Enqueue physical-delete fanout only after etcd ack so a
-                // failed mirror never schedules stale unlinks.
+                // Step 3: apply pre-computed mutations to in-memory store.
+                // Etcd is authoritative; this just brings the cache forward.
+                {
+                    let mut s = self.store.inner.borrow_mut();
+                    if let Some(st) = s.streams.get_mut(&req.stream_id) {
+                        *st = stream.clone();
+                    }
+                    for ex in &extent_puts {
+                        s.extents.insert(ex.extent_id, ex.clone());
+                    }
+                    for &eid in &extent_deletes {
+                        s.extents.remove(&eid);
+                    }
+                }
                 // F207-C: each enqueue is now an etcd CAS via the unified
                 // ledger; errors are downgraded inside enqueue (with WARN
                 // logging) so a single failed acquire doesn't fail the
@@ -1292,9 +1293,10 @@ impl AutumnManager {
         // F207-C: snapshot ConvertToEc + Recovery inflight sets.
         let (ec_inflight_set, recovery_inflight_set) = self.inflight_snapshot_ec_recovery();
 
+        // F210-A1 etcd-first refactor (same shape as handle_stream_punch_holes).
         let out = {
-            let mut guard = self.store.inner.borrow_mut();
-            let s: &mut autumn_common::MetadataState = &mut guard;
+            let guard = self.store.inner.borrow();
+            let s: &autumn_common::MetadataState = &guard;
             (|| -> Result<
                 (
                     MgrStreamInfo,
@@ -1327,9 +1329,8 @@ impl AutumnManager {
 
                 let removed: HashSet<u64> = stream.extent_ids[..pos].iter().copied().collect();
 
-                // F139 / F207-C: symmetric guard to punch_holes — refuse
-                // if any extent that would drop to refs=0 is currently
-                // being recovered.
+                // F139 / F207-C: refuse if any to-be-removed extent is
+                // mid-recovery.
                 for eid in &removed {
                     if recovery_inflight_set.contains(eid) {
                         if let Some(ex) = s.extents.get(eid) {
@@ -1342,10 +1343,7 @@ impl AutumnManager {
                         }
                     }
                 }
-                // F145 / F207-B: symmetric to the F139 recovery guard above.
-                // Refuse if any to-be-truncated extent is mid-EC conversion,
-                // to preserve F138's eversion-bump lock invariant. Caller
-                // retries.
+                // F145 / F207-B: refuse if any to-be-truncated extent is mid-EC.
                 for eid in &removed {
                     if ec_inflight_set.contains(eid) {
                         return Err(AppError::Precondition(format!(
@@ -1355,58 +1353,47 @@ impl AutumnManager {
                     }
                 }
 
-                let st = s
-                    .streams
-                    .get_mut(&req.stream_id)
-                    .ok_or_else(|| AppError::NotFound(format!("stream {}", req.stream_id)))?;
-                st.extent_ids.retain(|id| !removed.contains(id));
-                let updated = st.clone();
+                let mut updated = stream;
+                updated.extent_ids.retain(|id| !removed.contains(id));
                 let mut extent_puts = Vec::new();
                 let mut extent_deletes = Vec::new();
                 let mut pending_deletes = Vec::new();
 
-                // F109: snapshot replica addrs for refs→0 extents BEFORE
-                // we mutably remove them from `s.extents`. See
-                // `handle_stream_punch_holes` for the same pattern.
-                // Skip extents undergoing EC conversion.
-                let needed_addrs: HashMap<u64, MgrExtentInfo> = s
-                    .extents
-                    .iter()
-                    .filter(|(eid, e)| {
-                        removed.contains(eid)
-                            && e.refs == 1
-                            && e.vp_table_refs == 0
-                            && !ec_inflight_set.contains(eid)
-                    })
-                    .map(|(eid, e)| (*eid, e.clone()))
-                    .collect();
-                for (eid, extent) in &needed_addrs {
-                    let pending_addrs =
-                        Self::snapshot_replica_addrs(&s.nodes, *eid, extent);
-                    pending_deletes.push(PendingDelete {
-                        extent_id: *eid,
-                        pending_addrs,
-                        attempts: 0,
-                    });
+                // F109: build pending_deletes for extents that physically delete.
+                for &eid in &removed {
+                    if let Some(extent) = s.extents.get(&eid) {
+                        if extent.refs == 1
+                            && extent.vp_table_refs == 0
+                            && !ec_inflight_set.contains(&eid)
+                        {
+                            let pending_addrs =
+                                Self::snapshot_replica_addrs(&s.nodes, eid, extent);
+                            pending_deletes.push(PendingDelete {
+                                extent_id: eid,
+                                pending_addrs,
+                                attempts: 0,
+                            });
+                        }
+                    }
                 }
 
-                for extent_id in removed {
-                    if let Some(extent) = s.extents.get_mut(&extent_id) {
-                        if extent.refs <= 1 {
-                            extent.refs = 0;
-                            if Self::extent_can_delete(extent)
-                                && !ec_inflight_set.contains(&extent_id)
+                for extent_id in &removed {
+                    if let Some(extent) = s.extents.get(extent_id) {
+                        let mut new_ext = extent.clone();
+                        if new_ext.refs <= 1 {
+                            new_ext.refs = 0;
+                            if Self::extent_can_delete(&new_ext)
+                                && !ec_inflight_set.contains(extent_id)
                             {
-                                s.extents.remove(&extent_id);
-                                extent_deletes.push(extent_id);
+                                extent_deletes.push(*extent_id);
                             } else {
-                                extent.eversion += 1;
-                                extent_puts.push(extent.clone());
+                                new_ext.eversion += 1;
+                                extent_puts.push(new_ext);
                             }
                         } else {
-                            extent.refs -= 1;
-                            extent.eversion += 1;
-                            extent_puts.push(extent.clone());
+                            new_ext.refs -= 1;
+                            new_ext.eversion += 1;
+                            extent_puts.push(new_ext);
                         }
                     }
                 }
@@ -1425,6 +1412,19 @@ impl AutumnManager {
                         message: err.to_string(),
                         updated_stream_info: None,
                     }));
+                }
+                // Step 3: apply pre-computed mutations to in-memory store.
+                {
+                    let mut s = self.store.inner.borrow_mut();
+                    if let Some(st) = s.streams.get_mut(&req.stream_id) {
+                        *st = stream.clone();
+                    }
+                    for ex in &extent_puts {
+                        s.extents.insert(ex.extent_id, ex.clone());
+                    }
+                    for &eid in &extent_deletes {
+                        s.extents.remove(&eid);
+                    }
                 }
                 let _ = self.enqueue_pending_deletes(pending_deletes).await;
                 Ok(rkyv_encode(&TruncateResp {
