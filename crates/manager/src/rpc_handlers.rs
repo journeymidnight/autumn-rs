@@ -787,26 +787,12 @@ impl AutumnManager {
             // guards, a concurrent EC conversion or recovery on the tail
             // extent would have its eversion+replicates writeback silently
             // overwritten by our verify-at-apply block below.
-            // F207-B: read the unified ledger (was F138 `ec_conversion_inflight`).
-            if matches!(
-                self.extent_inflight_op(tail_id),
-                Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
-            ) {
+            // F207-C: collapse F138 (EC) + F139 (Recovery) refuse-at-start
+            // checks into one ledger probe.
+            if let Some(op) = self.extent_inflight_op(tail_id) {
                 let msg = format!(
-                    "extent {tail_id} has in-flight EC conversion; \
-                     defer alloc_extent until conversion completes"
-                );
-                return Ok(rkyv_encode(&StreamAllocExtentResp {
-                    code: CODE_PRECONDITION,
-                    message: msg,
-                    stream_info: None,
-                    last_ex_info: None,
-                }));
-            }
-            if self.recovery_tasks.borrow().contains_key(&tail_id) {
-                let msg = format!(
-                    "extent {tail_id} has in-flight recovery; \
-                     defer alloc_extent until recovery completes"
+                    "extent {tail_id} has in-flight {op:?}; \
+                     defer alloc_extent until it completes"
                 );
                 return Ok(rkyv_encode(&StreamAllocExtentResp {
                     code: CODE_PRECONDITION,
@@ -1111,22 +1097,14 @@ impl AutumnManager {
         let req: PunchHolesReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // F207-B: snapshot the ConvertToEc-inflight set once. Replaces the
-        // old `let ec_inflight = self.ec_conversion_inflight.borrow();`
-        // pattern (a Ref into the deleted HashSet). The semantics are
-        // identical — single-threaded compio, snapshot-then-consult.
-        let ec_inflight_set: HashSet<u64> = self
-            .inflight
-            .borrow()
-            .iter()
-            .filter_map(|(id, rec)| match rec.kind() {
-                Some(crate::extent_inflight::ExtentOpKind::ConvertToEc) => Some(*id),
-                _ => None,
-            })
-            .collect();
+        // F207-C: snapshot the ConvertToEc + Recovery sets from the
+        // unified ledger once. Pre-F207 these were `ec_inflight` Ref into
+        // the deleted HashSet + `recovery_inflight` Ref into the deleted
+        // HashMap. Single-threaded compio — snapshot-then-consult preserves
+        // semantics.
+        let (ec_inflight_set, recovery_inflight_set) = self.inflight_snapshot_ec_recovery();
 
         let out = {
-            let recovery_inflight = self.recovery_tasks.borrow();
             let mut guard = self.store.inner.borrow_mut();
             let s: &mut autumn_common::MetadataState = &mut guard;
             (|| -> Result<
@@ -1154,15 +1132,15 @@ impl AutumnManager {
                     .filter(|id| members.contains(id))
                     .collect();
 
-                // F139: if any extent that would drop to refs=0 is currently
-                // being recovered, refuse the entire call. Recovery's
-                // ensure_extent auto-creates on NotFound, risking either a
-                // write-to-unlinked-inode (data evaporates) or an extent
-                // resurrection (orphan with no manager record). Returns
-                // Precondition so PS GC retry loop backs off until recovery
-                // completes. Symmetric to the ec_inflight guard above (F138).
+                // F139 / F207-C: if any extent that would drop to refs=0
+                // is currently being recovered, refuse the entire call.
+                // Recovery's ensure_extent auto-creates on NotFound,
+                // risking write-to-unlinked-inode or resurrection. PS GC
+                // retry backs off until recovery completes. Predicate is
+                // narrower than F145 (only refs==1) because resurrection
+                // matters only on the unlink path.
                 for eid in &removed {
-                    if recovery_inflight.contains_key(eid) {
+                    if recovery_inflight_set.contains(eid) {
                         if let Some(ex) = s.extents.get(eid) {
                             if ex.refs == 1 && ex.vp_table_refs == 0 {
                                 return Err(AppError::Precondition(format!(
@@ -1266,7 +1244,11 @@ impl AutumnManager {
                 }
                 // Enqueue physical-delete fanout only after etcd ack so a
                 // failed mirror never schedules stale unlinks.
-                self.enqueue_pending_deletes(pending_deletes);
+                // F207-C: each enqueue is now an etcd CAS via the unified
+                // ledger; errors are downgraded inside enqueue (with WARN
+                // logging) so a single failed acquire doesn't fail the
+                // whole punch_holes call.
+                let _ = self.enqueue_pending_deletes(pending_deletes).await;
                 Ok(rkyv_encode(&PunchHolesResp {
                     code: CODE_OK,
                     message: String::new(),
@@ -1293,19 +1275,10 @@ impl AutumnManager {
         let req: TruncateReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // F207-B: snapshot the ConvertToEc-inflight set (was F138 `ec_conversion_inflight`).
-        let ec_inflight_set: HashSet<u64> = self
-            .inflight
-            .borrow()
-            .iter()
-            .filter_map(|(id, rec)| match rec.kind() {
-                Some(crate::extent_inflight::ExtentOpKind::ConvertToEc) => Some(*id),
-                _ => None,
-            })
-            .collect();
+        // F207-C: snapshot ConvertToEc + Recovery inflight sets.
+        let (ec_inflight_set, recovery_inflight_set) = self.inflight_snapshot_ec_recovery();
 
         let out = {
-            let recovery_inflight = self.recovery_tasks.borrow();
             let mut guard = self.store.inner.borrow_mut();
             let s: &mut autumn_common::MetadataState = &mut guard;
             (|| -> Result<
@@ -1340,10 +1313,11 @@ impl AutumnManager {
 
                 let removed: HashSet<u64> = stream.extent_ids[..pos].iter().copied().collect();
 
-                // F139: symmetric guard to punch_holes — refuse if any extent
-                // that would drop to refs=0 is currently being recovered.
+                // F139 / F207-C: symmetric guard to punch_holes — refuse
+                // if any extent that would drop to refs=0 is currently
+                // being recovered.
                 for eid in &removed {
-                    if recovery_inflight.contains_key(eid) {
+                    if recovery_inflight_set.contains(eid) {
                         if let Some(ex) = s.extents.get(eid) {
                             if ex.refs == 1 && ex.vp_table_refs == 0 {
                                 return Err(AppError::Precondition(format!(
@@ -1438,7 +1412,7 @@ impl AutumnManager {
                         updated_stream_info: None,
                     }));
                 }
-                self.enqueue_pending_deletes(pending_deletes);
+                let _ = self.enqueue_pending_deletes(pending_deletes).await;
                 Ok(rkyv_encode(&TruncateResp {
                     code: CODE_OK,
                     message: String::new(),
@@ -1524,12 +1498,15 @@ impl AutumnManager {
                 // source-stream extent. apply_recovery_done bumps eversion and
                 // rewrites replicates; Phase-3's apply_split_mutations would
                 // overwrite both with the Phase-1 captured snapshot.
+                // F146 / F207-C: read Recovery from the unified ledger.
                 {
-                    let recovery_inflight = self.recovery_tasks.borrow();
                     for &sid in &[src_meta.log_stream, src_meta.row_stream, src_meta.meta_stream] {
                         if let Some(stream) = s.streams.get(&sid) {
                             for &eid in &stream.extent_ids {
-                                if recovery_inflight.contains_key(&eid) {
+                                if matches!(
+                                    self.extent_inflight_op(eid),
+                                    Some(crate::extent_inflight::ExtentOpKind::Recovery)
+                                ) {
                                     return Err(AppError::Precondition(format!(
                                         "recovery in flight on extent {eid}; retry split"
                                     )));
@@ -1795,30 +1772,20 @@ impl AutumnManager {
                     victim_meta.meta_stream,
                 ];
                 {
-                    // F207-B: read ConvertToEc via the unified ledger.
-                    let recovery_inflight = self.recovery_tasks.borrow();
-                    let pending_deletes = self.pending_extent_deletes.borrow();
-                    let pending_eids: HashSet<u64> =
-                        pending_deletes.iter().map(|p| p.extent_id).collect();
+                    // F207-C: collapse the EC + Recovery + Delete checks
+                    // into one ledger probe. Pre-F207 this was three
+                    // separate Refs (ec_conversion_inflight,
+                    // recovery_tasks, pending_extent_deletes) each
+                    // queried per-extent. Now: one probe per extent
+                    // returning the typed op kind. The typed error
+                    // message preserves the operator-facing semantics
+                    // (caller can tell which class of op is blocking).
                     for &sid in &all_streams {
                         if let Some(stream) = s.streams.get(&sid) {
                             for &eid in &stream.extent_ids {
-                                if matches!(
-                                    self.extent_inflight_op(eid),
-                                    Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
-                                ) {
+                                if let Some(op) = self.extent_inflight_op(eid) {
                                     return Err(AppError::Precondition(format!(
-                                        "ec conversion in flight on extent {eid}; retry merge"
-                                    )));
-                                }
-                                if recovery_inflight.contains_key(&eid) {
-                                    return Err(AppError::Precondition(format!(
-                                        "recovery in flight on extent {eid}; retry merge"
-                                    )));
-                                }
-                                if pending_eids.contains(&eid) {
-                                    return Err(AppError::Precondition(format!(
-                                        "extent {eid} pending delete; retry merge"
+                                        "extent {eid} has in-flight {op:?}; retry merge"
                                     )));
                                 }
                             }
@@ -2976,7 +2943,11 @@ impl AutumnManager {
                         ),
                     }));
                 }
-                if self.recovery_tasks.borrow().contains_key(&extent_id) {
+                // F207-C: Recovery check via the unified ledger.
+                if matches!(
+                    self.extent_inflight_op(extent_id),
+                    Some(crate::extent_inflight::ExtentOpKind::Recovery)
+                ) {
                     return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
                         code: CODE_PRECONDITION,
                         message: format!(

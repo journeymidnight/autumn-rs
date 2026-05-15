@@ -329,19 +329,29 @@ pub struct AutumnManager {
     /// identity in its leader-fence compare without shipping a string per
     /// txn (F149).
     instance_id: Rc<String>,
-    recovery_tasks: Rc<RefCell<HashMap<u64, MgrRecoveryTask>>>,
-    /// F207-B: unified extent-level in-flight ledger. Replaces (after
-    /// Phase 2 migrates recovery + delete) the four scattered inflight
-    /// bookkeeping mechanisms; Phase 1 (this commit) migrated EC convert,
-    /// so `ec_conversion_inflight` HashSet + `pending_ec_dispatch` HashMap
-    /// + their `ecConversionInflight/` etcd prefix are gone. Persisted at
-    /// etcd prefix `extent_inflight/`. See
+    /// F207-C: unified extent-level in-flight ledger. Authoritative
+    /// source of truth for every stream-layer op currently in flight
+    /// (ConvertToEc / Recovery / Delete). Replaces the four scattered
+    /// inflight bookkeeping mechanisms that existed pre-F207
+    /// (`ec_conversion_inflight` HashSet, `pending_ec_dispatch` HashMap,
+    /// `recovery_tasks` HashMap, `pending_extent_deletes` VecDeque).
+    /// Persisted at etcd prefix `extent_inflight/`. See
     /// `crates/manager/src/extent_inflight.rs` for the API + invariants
     /// and `~/.claude/plans/stream-merge-split-ps-sorted-dijkstra.md` for
     /// the migration plan.
     pub(crate) inflight: Rc<
         RefCell<HashMap<u64, crate::extent_inflight::MgrExtentInflightRecord>>,
     >,
+    /// F207-C: in-memory live retry state for Delete ops. The ledger
+    /// entry's `PersistedPendingDelete` payload is a snapshot of the
+    /// original addrs (captured at enqueue time); the live "which
+    /// addrs are still pending an ack" state lives here and is NOT
+    /// persisted (retry attempts reset on failover, which is correct —
+    /// a new leader's first attempt is its own "attempt 1"). Populated
+    /// on `enqueue_pending_deletes` and on `replay_from_etcd` (from
+    /// Delete-kind ledger entries with attempts=0).
+    pub(crate) delete_progress:
+        Rc<RefCell<HashMap<u64, crate::extent_delete::PendingDelete>>>,
     runtime_started: Rc<Cell<bool>>,
     ps_last_heartbeat: Rc<RefCell<HashMap<u64, Instant>>>,
     conn_pool: Rc<ConnPool>,
@@ -356,12 +366,13 @@ pub struct AutumnManager {
     /// here at `node.control_address` (or `node.address` for legacy
     /// nodes whose `control_address` is empty).
     control_pool: Rc<ConnPool>,
-    /// F109: extents whose refcount dropped to 0 and whose physical
-    /// `.dat`/`.meta` files still need to be unlinked on every replica.
-    /// Drained by `extent_delete_loop`. In-memory only — manager
-    /// restart loses pending entries; orphans then reaped by node
-    /// startup reconcile.
-    pub(crate) pending_extent_deletes: Rc<RefCell<VecDeque<PendingDelete>>>,
+    // F207-C: `pending_extent_deletes` field deleted. Replaced by
+    // `inflight` (etcd-persisted exclusion + snapshot for failover) +
+    // `delete_progress` (in-memory live retry state). The F109
+    // semantics — "extents whose refs dropped to 0 still need to be
+    // unlinked on every replica" — are unchanged; the persistence
+    // model upgraded from in-memory only to etcd-backed (closes the
+    // pre-F207 footnote that manager restart lost pending entries).
     /// F183: per-partition unix-epoch timestamp of the last split or merge
     /// involving this partition. Sourced from etcd prefix
     /// `partitionLastOp/<part_id>` (i64 little-endian). Default 0 for
@@ -411,13 +422,12 @@ impl AutumnManager {
             leader: Rc::new(Cell::new(true)),
             etcd: None,
             instance_id: Rc::new(uuid::Uuid::new_v4().to_string()),
-            recovery_tasks: Rc::new(RefCell::new(HashMap::new())),
             inflight: Rc::new(RefCell::new(HashMap::new())),
+            delete_progress: Rc::new(RefCell::new(HashMap::new())),
             runtime_started: Rc::new(Cell::new(false)),
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),
             conn_pool: Rc::new(ConnPool::new()),
             control_pool: Rc::new(ConnPool::new()),
-            pending_extent_deletes: Rc::new(RefCell::new(VecDeque::new())),
             last_op_at: Rc::new(RefCell::new(HashMap::new())),
             policy: Rc::new(RefCell::new(crate::policy::PolicyEngine::default())),
             recent_failure_reports: Rc::new(RefCell::new(HashMap::new())),
@@ -1072,11 +1082,25 @@ impl AutumnManager {
             decoded_extents.insert(id, ex);
         }
 
-        let mut decoded_tasks = HashMap::new();
+        // F207-C: legacy `recoveryTasks/<id>` etcd markers from pre-F207
+        // clusters. Fold into the unified ledger as Recovery records;
+        // `apply_recovery_done` also lists this legacy key in its
+        // delete batch so any stragglers get cleaned up on the next
+        // recovery apply. One-cycle backward compat — to be removed
+        // in F207-D after a deploy cycle.
+        let mut legacy_recovery_records: HashMap<
+            u64,
+            crate::extent_inflight::MgrExtentInflightRecord,
+        > = HashMap::new();
         for kv in &tasks.kvs {
             let id = Self::parse_id_from_key("recoveryTasks/", &kv.key)?;
             let task: MgrRecoveryTask = rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
-            decoded_tasks.insert(id, task);
+            let record = crate::extent_inflight::MgrExtentInflightRecord::new(
+                id,
+                crate::extent_inflight::ExtentOpPayload::Recovery(task),
+                (*self.instance_id).clone(),
+            );
+            legacy_recovery_records.insert(id, record);
         }
 
         let mut decoded_owner_revs = HashMap::new();
@@ -1184,18 +1208,18 @@ impl AutumnManager {
             s.regions = decoded_regions;
             s.next_id = s.next_id.max(max_id.saturating_add(1));
         }
-        *self.recovery_tasks.borrow_mut() = decoded_tasks;
         // F183: install last_op_at sidecar so policy engine cooldown
         // gating is correct on cold-start as well.
         *self.last_op_at.borrow_mut() = decoded_last_op;
-        // F207-B: install the unified inflight ledger. Records with
+        // F207-C: install the unified inflight ledger. Records with
         // malformed op_kind/payload combinations are dropped with a WARN
         // inside `decode_extent_inflight_kvs`. Legacy
-        // `ecConversionInflight/` markers from pre-F207 clusters are
-        // merged in below; the new prefix entries take precedence if both
-        // exist for the same extent (which only happens during the
-        // backward-compat window between F207-B deploy and the next
-        // successful EC apply that clears the legacy key).
+        // `ecConversionInflight/` (F198) and `recoveryTasks/` (pre-F207-C)
+        // markers from pre-F207 clusters are merged in below; the new
+        // prefix entries take precedence if both exist for the same extent
+        // (which only happens during the backward-compat window between
+        // F207 deploy and the next successful apply that clears the
+        // legacy key).
         {
             let decoded = Self::decode_extent_inflight_kvs(extent_inflight_raw.kvs.iter().map(
                 |kv| {
@@ -1209,13 +1233,40 @@ impl AutumnManager {
             ));
             let mut map = self.inflight.borrow_mut();
             map.clear();
-            // Legacy first, then authoritative new-prefix records overwrite.
+            // Legacy first (Recovery, then ConvertToEc — both must be
+            // captured before new-prefix records can selectively override).
+            for (id, rec) in legacy_recovery_records {
+                map.insert(id, rec);
+            }
             for (id, rec) in legacy_ec_dispatched {
                 map.insert(id, rec);
             }
             for (id, rec) in decoded {
                 if id != 0 {
                     map.insert(id, rec);
+                }
+            }
+        }
+        // F207-C: rehydrate in-memory `delete_progress` from Delete-kind
+        // ledger entries so the new leader's extent_delete_loop picks up
+        // pending fanouts immediately. Attempts reset to 0 (correct
+        // behaviour — a new leader's first attempt is its own "1").
+        {
+            let inflight = self.inflight.borrow();
+            let mut progress = self.delete_progress.borrow_mut();
+            progress.clear();
+            for (id, rec) in inflight.iter() {
+                if let Some((_, crate::extent_inflight::ExtentOpPayload::Delete(p))) =
+                    rec.unpack()
+                {
+                    progress.insert(
+                        *id,
+                        crate::extent_delete::PendingDelete {
+                            extent_id: p.extent_id,
+                            pending_addrs: p.pending_addrs,
+                            attempts: 0,
+                        },
+                    );
                 }
             }
         }
@@ -3192,9 +3243,7 @@ mod tests {
                 node_id: 7, // already in parity[]
                 start_time: 0,
             };
-            m.recovery_tasks
-                .borrow_mut()
-                .insert(extent_id, task.clone());
+            m._test_mark_recovery_inflight(extent_id, task.clone());
 
             let done = MgrRecoveryTaskDone {
                 task,
@@ -3210,7 +3259,7 @@ mod tests {
             // can re-attempt (e.g., once the original failed node is back
             // online, re_avali can repair without going through dispatch).
             assert!(
-                !m.recovery_tasks.borrow().contains_key(&extent_id),
+                !matches!(m.extent_inflight_op(extent_id), Some(crate::extent_inflight::ExtentOpKind::Recovery)),
                 "stale recovery task must be removed on duplicate-node rejection"
             );
             // Extent layout must be unchanged.
@@ -3252,9 +3301,7 @@ mod tests {
                 node_id: 9, // fresh node, NOT in extent_nodes
                 start_time: 0,
             };
-            m.recovery_tasks
-                .borrow_mut()
-                .insert(extent_id, task.clone());
+            m._test_mark_recovery_inflight(extent_id, task.clone());
 
             let done = MgrRecoveryTaskDone {
                 task,
@@ -3290,8 +3337,12 @@ mod tests {
         }
     }
 
-    /// apply_recovery_done must defer (return Err, preserve recovery_tasks
-    /// entry) when ec_conversion_inflight contains the extent.
+    /// apply_recovery_done must defer (return Err) when a ConvertToEc op
+    /// is in flight on the extent. F207-C: the exclusive ledger makes
+    /// "EC + Recovery simultaneously in flight" structurally impossible,
+    /// so this test now exercises the defense-in-depth path:
+    /// apply_recovery_done sees a ConvertToEc marker (left behind by a
+    /// concurrent dispatch tick) and refuses to write through.
     #[test]
     fn f138_apply_recovery_done_during_ec_inflight_defers() {
         run(async {
@@ -3303,19 +3354,16 @@ mod tests {
                 .extents
                 .insert(extent_id, make_ec_extent(extent_id, 5));
 
-            // Simulate EC dispatch: acquire the inflight lock.
+            // Ledger holds ConvertToEc (simulates EC dispatch ahead of
+            // recovery completion).
             m._test_mark_ec_inflight(extent_id);
 
-            // Recovery task was already dispatched.
             let task = MgrRecoveryTask {
                 extent_id,
                 replace_id: 1,
                 node_id: 9,
                 start_time: 0,
             };
-            m.recovery_tasks.borrow_mut().insert(extent_id, task.clone());
-
-            // Recovery completes while EC is in flight — must be deferred.
             let done = MgrRecoveryTaskDone {
                 task: task.clone(),
                 ready_disk_id: 99,
@@ -3323,11 +3371,12 @@ mod tests {
             let result = m.apply_recovery_done(done.clone()).await;
             assert!(
                 result.is_err(),
-                "F138: apply_recovery_done must return Err while ec_conversion_inflight"
+                "F138: apply_recovery_done must return Err while ConvertToEc in flight"
             );
-            assert!(
-                m.recovery_tasks.borrow().contains_key(&extent_id),
-                "F138: recovery_tasks entry must be preserved for retry"
+            assert_eq!(
+                m.extent_inflight_op(extent_id),
+                Some(crate::extent_inflight::ExtentOpKind::ConvertToEc),
+                "F207-C: ConvertToEc marker must be preserved on deferral"
             );
             let s = m.store.inner.borrow();
             let ex = s.extents.get(&extent_id).unwrap();
@@ -3335,8 +3384,9 @@ mod tests {
             assert_eq!(ex.eversion, 5, "eversion unchanged during deferral");
             drop(s);
 
-            // EC clears — retry now succeeds.
+            // EC clears (transitions to Recovery being the active op); retry succeeds.
             m._test_clear_inflight(extent_id);
+            m._test_mark_recovery_inflight(extent_id, task);
             let result = m.apply_recovery_done(done).await;
             assert!(result.is_ok(), "F138: recovery apply must succeed after EC clears");
             let s = m.store.inner.borrow();
@@ -3403,16 +3453,19 @@ mod tests {
             };
             let new_eversion_for_ec = captured_eversion + 1; // = 6
 
-            // Step 2: recovery completes during EC, gets deferred.
+            // Step 2: recovery's done report arrives during EC. F207-C: under
+            // the exclusive ledger we can't ALSO have a Recovery marker;
+            // the ConvertToEc marker alone is what triggers the defer.
+            // apply_recovery_done's defense-in-depth check fires and
+            // refuses to apply, preserving the EC's pending eversion bump.
             let task = MgrRecoveryTask {
                 extent_id,
                 replace_id: 1,
                 node_id: 9,
                 start_time: 0,
             };
-            m.recovery_tasks.borrow_mut().insert(extent_id, task.clone());
             let done = MgrRecoveryTaskDone {
-                task,
+                task: task.clone(),
                 ready_disk_id: 99,
             };
             let r = m.apply_recovery_done(done.clone()).await;
@@ -3431,7 +3484,10 @@ mod tests {
             // Step 3b: lock released (mirrors the moved remove in ec_conversion_dispatch_loop).
             m._test_clear_inflight(extent_id);
 
-            // Step 4: deferred recovery retries — must succeed now.
+            // Step 4: deferred recovery retries — must succeed now. Under
+            // F207-C, retry rehydrates the Recovery marker (mimicking
+            // recovery_collect_loop's behaviour after the EC tick cleared).
+            m._test_mark_recovery_inflight(extent_id, task);
             let r = m.apply_recovery_done(done).await;
             assert!(r.is_ok(), "recovery apply must succeed after EC clears: {r:?}");
 
@@ -3724,7 +3780,7 @@ mod tests {
             let r: MultiModifyMergeResp = rkyv_decode(&resp).unwrap();
             assert_ne!(r.code, CODE_OK);
             assert!(
-                r.message.contains("ec conversion in flight"),
+                r.message.contains("in-flight ConvertToEc"),
                 "error must identify EC inflight: {}",
                 r.message
             );
@@ -3790,7 +3846,7 @@ mod tests {
                 }
             }
             // Simulate active recovery on victim's row_stream extent.
-            m.recovery_tasks.borrow_mut().insert(
+            m._test_mark_recovery_inflight(
                 201,
                 MgrRecoveryTask {
                     extent_id: 201,
@@ -3813,7 +3869,7 @@ mod tests {
             let r: MultiModifyMergeResp = rkyv_decode(&resp).unwrap();
             assert_ne!(r.code, CODE_OK);
             assert!(
-                r.message.contains("recovery in flight"),
+                r.message.contains("in-flight Recovery"),
                 "must identify recovery inflight cause: {}",
                 r.message
             );
@@ -3879,11 +3935,7 @@ mod tests {
                 }
             }
             // Queue extent 100 (survivor's log_stream extent) for physical delete.
-            m.pending_extent_deletes.borrow_mut().push_back(PendingDelete {
-                extent_id: 100,
-                pending_addrs: vec![],
-                attempts: 0,
-            });
+            m._test_mark_delete_inflight(100, vec![]);
 
             let req = rkyv_encode(&MultiModifyMergeReq {
                 survivor_part_id: 1,
@@ -3898,7 +3950,7 @@ mod tests {
             let r: MultiModifyMergeResp = rkyv_decode(&resp).unwrap();
             assert_ne!(r.code, CODE_OK);
             assert!(
-                r.message.contains("pending delete"),
+                r.message.contains("in-flight Delete"),
                 "must identify pending-delete cause: {}",
                 r.message
             );
@@ -4029,13 +4081,7 @@ mod tests {
                 .insert(extent_id, make_ec_extent(extent_id, 1));
 
             // Simulate GC having queued a delete for this extent.
-            m.pending_extent_deletes
-                .borrow_mut()
-                .push_back(PendingDelete {
-                    extent_id,
-                    pending_addrs: vec!["127.0.0.1:9101".to_string()],
-                    attempts: 0,
-                });
+            m._test_mark_delete_inflight(extent_id, vec!["127.0.0.1:9101".to_string()]);
 
             // dispatch_recovery_task must skip — delete is already queued.
             let result = m.dispatch_recovery_task(extent_id, /*replace_id=*/ 1).await;
@@ -4044,7 +4090,7 @@ mod tests {
                 "F139: dispatch_recovery_task must return Ok when delete queued: {result:?}"
             );
             assert!(
-                !m.recovery_tasks.borrow().contains_key(&extent_id),
+                !matches!(m.extent_inflight_op(extent_id), Some(crate::extent_inflight::ExtentOpKind::Recovery)),
                 "F139: recovery_tasks must NOT be populated when delete is queued"
             );
         })
@@ -4086,7 +4132,7 @@ mod tests {
             }
 
             // Mark this extent as in-flight for recovery.
-            m.recovery_tasks.borrow_mut().insert(
+            m._test_mark_recovery_inflight(
                 extent_id,
                 MgrRecoveryTask {
                     extent_id,
@@ -4123,8 +4169,8 @@ mod tests {
             drop(s);
             // No pending delete must have been enqueued.
             assert!(
-                m.pending_extent_deletes.borrow().is_empty(),
-                "F139: pending_extent_deletes must be empty on rejection"
+                m.delete_progress.borrow().is_empty(),
+                "F139: delete_progress must be empty on rejection"
             );
         })
     }
@@ -4167,7 +4213,7 @@ mod tests {
             }
 
             // extent_a is being recovered — truncate should be refused.
-            m.recovery_tasks.borrow_mut().insert(
+            m._test_mark_recovery_inflight(
                 extent_a,
                 MgrRecoveryTask {
                     extent_id: extent_a,
@@ -4242,7 +4288,7 @@ mod tests {
             }
 
             // Recovery is in flight.
-            m.recovery_tasks.borrow_mut().insert(
+            m._test_mark_recovery_inflight(
                 extent_id,
                 MgrRecoveryTask {
                     extent_id,
@@ -4264,7 +4310,7 @@ mod tests {
             assert_ne!(r.code, CODE_OK, "Phase 1: punch_holes must be rejected");
 
             // Phase 2: recovery completes — clear recovery_tasks.
-            m.recovery_tasks.borrow_mut().remove(&extent_id);
+            m._test_clear_inflight(extent_id);
 
             // Phase 3: punch_holes must now succeed.
             let resp2 = m.handle_stream_punch_holes(req_bytes).await.unwrap();
@@ -4279,13 +4325,16 @@ mod tests {
                 "F139: extent must be removed from stream after successful punch_holes"
             );
             drop(s);
-            // Extent must be queued for physical deletion.
+            // Extent must be queued for physical deletion. F207-C: check
+            // both the in-memory progress map and the unified ledger.
             assert!(
-                m.pending_extent_deletes
-                    .borrow()
-                    .iter()
-                    .any(|p| p.extent_id == extent_id),
+                m.delete_progress.borrow().contains_key(&extent_id),
                 "F139: extent must be enqueued for physical deletion after refs→0"
+            );
+            assert_eq!(
+                m.extent_inflight_op(extent_id),
+                Some(crate::extent_inflight::ExtentOpKind::Delete),
+                "F207-C: ledger entry must reflect Delete in flight"
             );
         })
     }
@@ -4358,7 +4407,7 @@ mod tests {
             );
             drop(s);
             assert!(
-                m.pending_extent_deletes.borrow().is_empty(),
+                m.delete_progress.borrow().is_empty(),
                 "F145: no pending delete must be enqueued on rejection"
             );
 
@@ -4515,8 +4564,8 @@ mod tests {
 
             assert_ne!(r.code, CODE_OK, "F146: alloc_extent must be rejected when tail is mid-EC");
             assert!(
-                r.message.contains("in-flight EC conversion"),
-                "error must mention in-flight EC conversion: {}",
+                r.message.contains("in-flight ConvertToEc"),
+                "error must mention in-flight ConvertToEc: {}",
                 r.message
             );
             let ev_after = m.store.inner.borrow().extents[&tail_id].eversion;
@@ -4570,7 +4619,7 @@ mod tests {
             }
 
             // Tail is under active recovery: alloc_extent must refuse.
-            m.recovery_tasks.borrow_mut().insert(tail_id, MgrRecoveryTask {
+            m._test_mark_recovery_inflight(tail_id, MgrRecoveryTask {
                 extent_id: tail_id,
                 replace_id: 0,
                 node_id: 1,
@@ -4590,8 +4639,8 @@ mod tests {
 
             assert_ne!(r.code, CODE_OK, "F146: alloc_extent must be rejected when tail is mid-recovery");
             assert!(
-                r.message.contains("in-flight recovery"),
-                "error must mention in-flight recovery: {}",
+                r.message.contains("in-flight Recovery"),
+                "error must mention in-flight Recovery: {}",
                 r.message
             );
             let ev_after = m.store.inner.borrow().extents[&tail_id].eversion;
@@ -4666,7 +4715,7 @@ mod tests {
             }
 
             // Simulate recovery in flight on the log_stream's extent.
-            m.recovery_tasks.borrow_mut().insert(log_extent, MgrRecoveryTask {
+            m._test_mark_recovery_inflight(log_extent, MgrRecoveryTask {
                 extent_id: log_extent,
                 replace_id: 0,
                 node_id: 2,
@@ -4801,7 +4850,7 @@ mod tests {
             m.store.inner.borrow_mut().extents.get_mut(&extent_id).unwrap().eversion = 3;
 
             // Inject a recovery task on the extent so the refuse-at-start guard fires.
-            m.recovery_tasks.borrow_mut().insert(extent_id, MgrRecoveryTask {
+            m._test_mark_recovery_inflight(extent_id, MgrRecoveryTask {
                 extent_id,
                 replace_id: 0,
                 node_id: 1,
@@ -4855,7 +4904,7 @@ mod tests {
             // same function). A compile-time deletion of the guard would break
             // the refuse-at-start assertion above. This satisfies the requirement
             // that "if the guard was deleted, the test would fail."
-            m.recovery_tasks.borrow_mut().remove(&extent_id);
+            m._test_clear_inflight(extent_id);
 
             // Now call with no in-flight tasks: handler must succeed.
             let req_ok = rkyv_encode(&SyncPartitionVpRefsReq {

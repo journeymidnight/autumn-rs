@@ -15,39 +15,16 @@ impl AutumnManager {
         extent_id: u64,
         replace_id: u64,
     ) -> Result<(), AppError> {
-        if self.recovery_tasks.borrow().contains_key(&extent_id) {
-            return Ok(());
-        }
-
-        // F126 / F207-B: do not dispatch recovery while EC conversion is in
-        // flight on this extent. Recovery would write a full replica copy
-        // to the node's `.dat` file; EC conversion's `commit_shard_local`
-        // then renames `.ec.dat` over the same path, silently clobbering
-        // recovery's data and leaving the recovery target node holding
-        // parity bytes while `apply_recovery_done` still rewrites
-        // `replicates[slot]` to point there — producing a duplicate-node
-        // corrupt state. F207-B: this check now reads the unified inflight
-        // ledger via `extent_inflight_op` instead of the old
-        // `ec_conversion_inflight` HashSet.
-        if matches!(
-            self.extent_inflight_op(extent_id),
-            Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
-        ) {
-            return Ok(());
-        }
-
-        // F139: skip recovery dispatch if the extent is already queued for
-        // physical deletion. Once the queue drains, s.extents will no longer
-        // contain this extent and dispatch_recovery_task returns NotFound on
-        // the next tick — recovery is automatically moot. Symmetric to the
-        // F126 ec_conversion_inflight guard above.
-        if self
-            .pending_extent_deletes
-            .borrow()
-            .iter()
-            .any(|p| p.extent_id == extent_id)
-        {
-            return Ok(());
+        // F126 / F139 / F207-C: any in-flight stream-layer op on this
+        // extent blocks recovery dispatch. Pre-F207-C this was three
+        // separate ad-hoc checks (recovery_tasks dedup, ec_conversion_inflight,
+        // pending_extent_deletes). F207-C collapses them into one ledger
+        // read. The probe distinguishes "already-recovering (idempotent
+        // OK)" from "different op in flight (caller retries)".
+        match self.extent_inflight_op(extent_id) {
+            Some(crate::extent_inflight::ExtentOpKind::Recovery) => return Ok(()),
+            Some(_) => return Ok(()),
+            None => {}
         }
 
         let (extent, candidates) = {
@@ -113,27 +90,24 @@ impl AutumnManager {
                 continue;
             }
 
-            if let Some(etcd) = &self.etcd {
-                // F149: route through the leader-fenced txn helper. The
-                // create_revision==0 CAS guarantees we don't double-record an
-                // in-flight recovery task; if a task already exists we return
-                // Ok(()) (caller retries on next dispatch tick). If the
-                // leader fence itself fails, NotLeader bubbles up so the
-                // background loop short-circuits and the new leader takes
-                // over.
-                let key = format!("recoveryTasks/{extent_id}");
-                let payload = rkyv_encode(&task).to_vec();
-                let extra_cmp = vec![autumn_etcd::Cmp::create_revision(key.as_bytes(), 0)];
-                let put_op = autumn_etcd::Op::put(key.as_bytes(), &payload);
-                if !etcd.txn_fenced(extra_cmp, vec![put_op], vec![]).await? {
-                    return Ok(());
-                }
+            // F207-C: acquire the unified inflight marker via CAS +
+            // F149 leader fence. Replaces the pre-F207-C
+            // `etcd.txn_fenced(create_revision==0, put recoveryTasks/<id>)`
+            // + in-memory `recovery_tasks.insert` pair with one call. The
+            // CAS makes "already in-flight" a clean Precondition error
+            // path (which we map to Ok — the caller's retry is moot
+            // because someone else is already on it).
+            match self
+                .acquire_extent_inflight(
+                    extent.extent_id,
+                    crate::extent_inflight::ExtentOpPayload::Recovery(task),
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(AppError::Precondition(_)) => return Ok(()),
+                Err(other) => return Err(other),
             }
-
-            self.recovery_tasks
-                .borrow_mut()
-                .insert(extent.extent_id, task);
-            return Ok(());
         }
 
         Err(AppError::Precondition(
@@ -190,17 +164,22 @@ impl AutumnManager {
             }
         };
         if matches!(layout_changed, Some(true)) {
-            self.recovery_tasks
-                .borrow_mut()
-                .remove(&task.extent_id);
+            // F207-C: release the Recovery marker (both new ledger key and
+            // legacy recoveryTasks key) so the dedup check in
+            // dispatch_recovery_task doesn't permanently block future
+            // attempts to repair this slot.
             if let Some(etcd) = &self.etcd {
                 let _ = etcd
                     .put_and_delete_txn(
                         Vec::new(),
-                        vec![format!("recoveryTasks/{}", task.extent_id)],
+                        vec![
+                            Self::extent_inflight_key(task.extent_id),
+                            format!("recoveryTasks/{}", task.extent_id),
+                        ],
                     )
                     .await;
             }
+            self.commit_extent_inflight_release(task.extent_id);
             return Err(AppError::Precondition(format!(
                 "recovery target {} for extent {} already in extent node list at a different slot; \
                  likely EC conversion completed during recovery — discarding stale apply",
@@ -247,9 +226,12 @@ impl AutumnManager {
 
         let Some(updated_extent) = updated_extent else {
             // The extent was removed from manager state before recovery
-            // completed. F139: enqueue a targeted delete for the recovering
-            // node so the resurrected on-disk files are reaped promptly
-            // instead of waiting for the 5-minute orphan-reconcile sweep.
+            // completed. F139 / F207-C: release the Recovery marker, then
+            // enqueue a targeted delete for the recovering node so the
+            // resurrected on-disk files are reaped promptly instead of
+            // waiting for the 5-minute orphan-reconcile sweep. Recovery
+            // release MUST happen before the Delete acquire because the
+            // ledger is exclusive-per-extent.
             let maybe_addr: Option<String> = {
                 let s = self.store.inner.borrow();
                 s.nodes.get(&task.node_id).map(|n| {
@@ -257,29 +239,52 @@ impl AutumnManager {
                     Self::shard_addr_for_extent(&base, &n.shard_ports, task.extent_id)
                 })
             };
-            if let Some(addr) = maybe_addr {
-                self.enqueue_pending_deletes(vec![PendingDelete {
-                    extent_id: task.extent_id,
-                    pending_addrs: vec![addr],
-                    attempts: 0,
-                }]);
+            // Release Recovery (etcd + legacy + in-memory).
+            if let Some(etcd) = &self.etcd {
+                let _ = etcd
+                    .put_and_delete_txn(
+                        Vec::new(),
+                        vec![
+                            Self::extent_inflight_key(task.extent_id),
+                            format!("recoveryTasks/{}", task.extent_id),
+                        ],
+                    )
+                    .await;
             }
-            self.recovery_tasks.borrow_mut().remove(&task.extent_id);
+            self.commit_extent_inflight_release(task.extent_id);
+            // Then enqueue Delete (best effort — extent_delete_loop will
+            // pick it up on next tick).
+            if let Some(addr) = maybe_addr {
+                let _ = self
+                    .enqueue_pending_deletes(vec![PendingDelete {
+                        extent_id: task.extent_id,
+                        pending_addrs: vec![addr],
+                        attempts: 0,
+                    }])
+                    .await;
+            }
             return Ok(());
         };
 
         if let Some(etcd) = &self.etcd {
+            // F207-C: atomic put + delete txn. Releases the Recovery
+            // marker (new ledger key + legacy recoveryTasks key) in the
+            // same txn that writes the updated extent state. Pre-F207-C
+            // it was already one txn (put_and_delete_txn), but the key
+            // list has grown by `extent_inflight/<id>` for the unified
+            // ledger.
             let ex_payload = rkyv_encode(&updated_extent).to_vec();
             etcd.put_and_delete_txn(
                 vec![(format!("extents/{}", updated_extent.extent_id), ex_payload)],
-                vec![format!("recoveryTasks/{}", updated_extent.extent_id)],
+                vec![
+                    Self::extent_inflight_key(updated_extent.extent_id),
+                    format!("recoveryTasks/{}", updated_extent.extent_id),
+                ],
             )
             .await?;
         }
 
-        self.recovery_tasks
-            .borrow_mut()
-            .remove(&updated_extent.extent_id);
+        self.commit_extent_inflight_release(updated_extent.extent_id);
         Ok(())
     }
 
@@ -412,7 +417,17 @@ impl AutumnManager {
                 continue;
             }
 
-            let tasks = self.recovery_tasks.borrow().clone();
+            // F207-C: source the active Recovery tasks from the unified
+            // ledger instead of the deleted `recovery_tasks` HashMap.
+            let tasks: Vec<MgrRecoveryTask> = self
+                .inflight
+                .borrow()
+                .values()
+                .filter_map(|rec| match rec.unpack() {
+                    Some((_, crate::extent_inflight::ExtentOpPayload::Recovery(t))) => Some(t),
+                    _ => None,
+                })
+                .collect();
             if tasks.is_empty() {
                 continue;
             }
@@ -423,7 +438,7 @@ impl AutumnManager {
             };
 
             let mut by_node: HashMap<u64, Vec<MgrRecoveryTask>> = HashMap::new();
-            for task in tasks.values() {
+            for task in &tasks {
                 by_node.entry(task.node_id).or_default().push(task.clone());
             }
 
@@ -639,11 +654,15 @@ impl AutumnManager {
             //
             // Recovery-inflight skip (F126) still applies to avoid
             // colliding with `run_recovery_task` on the same extent.
+            // F207-C: read from the unified ledger.
             let recovery_inflight_extents: HashSet<u64> = self
-                .recovery_tasks
+                .inflight
                 .borrow()
-                .keys()
-                .copied()
+                .iter()
+                .filter_map(|(id, rec)| match rec.kind() {
+                    Some(crate::extent_inflight::ExtentOpKind::Recovery) => Some(*id),
+                    _ => None,
+                })
                 .collect();
 
             // F172-B: snapshot node_addrs ONCE per loop tick.

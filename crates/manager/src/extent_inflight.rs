@@ -258,13 +258,66 @@ impl AutumnManager {
     /// Read-only probe — returns the op kind currently in flight on
     /// `extent_id`, or `None` if none. Single-line replacement for the 9
     /// scattered "ec_inflight.contains || recovery_tasks.contains_key ||
-    /// pending_deletes…" checks across `rpc_handlers.rs` (to be migrated
-    /// in F207-C).
+    /// pending_deletes…" checks across `rpc_handlers.rs`.
     pub(crate) fn extent_inflight_op(&self, extent_id: u64) -> Option<ExtentOpKind> {
         self.inflight
             .borrow()
             .get(&extent_id)
             .and_then(|r| r.kind())
+    }
+
+    /// F207-C helper for PS-layer handlers that iterate over many
+    /// extent_ids and need to consult the ledger multiple times under a
+    /// `store.inner.borrow_mut`. Snapshots the ConvertToEc-kind and
+    /// Recovery-kind sets in one ledger borrow. Replaces the pre-F207
+    /// `(let ec_inflight = self.ec_conversion_inflight.borrow(); let
+    /// recovery_inflight = self.recovery_tasks.borrow())` pair.
+    pub(crate) fn inflight_snapshot_ec_recovery(
+        &self,
+    ) -> (std::collections::HashSet<u64>, std::collections::HashSet<u64>) {
+        let mut ec = std::collections::HashSet::new();
+        let mut rec = std::collections::HashSet::new();
+        for (id, r) in self.inflight.borrow().iter() {
+            match r.kind() {
+                Some(ExtentOpKind::ConvertToEc) => {
+                    ec.insert(*id);
+                }
+                Some(ExtentOpKind::Recovery) => {
+                    rec.insert(*id);
+                }
+                _ => {}
+            }
+        }
+        (ec, rec)
+    }
+
+    /// F207-C helper: ec + recovery + delete snapshot. Used by
+    /// `handle_multi_modify_merge` which today consults all three sets.
+    pub(crate) fn inflight_snapshot_three(
+        &self,
+    ) -> (
+        std::collections::HashSet<u64>,
+        std::collections::HashSet<u64>,
+        std::collections::HashSet<u64>,
+    ) {
+        let mut ec = std::collections::HashSet::new();
+        let mut rec = std::collections::HashSet::new();
+        let mut del = std::collections::HashSet::new();
+        for (id, r) in self.inflight.borrow().iter() {
+            match r.kind() {
+                Some(ExtentOpKind::ConvertToEc) => {
+                    ec.insert(*id);
+                }
+                Some(ExtentOpKind::Recovery) => {
+                    rec.insert(*id);
+                }
+                Some(ExtentOpKind::Delete) => {
+                    del.insert(*id);
+                }
+                _ => {}
+            }
+        }
+        (ec, rec, del)
     }
 
     /// Test-only convenience: simulate that `extent_id` is in flight with
@@ -291,6 +344,26 @@ impl AutumnManager {
     #[cfg(test)]
     pub(crate) fn _test_clear_inflight(&self, extent_id: u64) {
         self.inflight.borrow_mut().remove(&extent_id);
+    }
+
+    /// F207-C: test-only convenience for the Recovery op kind. Mirrors
+    /// `_test_mark_ec_inflight` but inserts a Recovery payload.
+    #[cfg(test)]
+    pub(crate) fn _test_mark_recovery_inflight(&self, extent_id: u64, task: MgrRecoveryTask) {
+        let payload = ExtentOpPayload::Recovery(task);
+        let record = MgrExtentInflightRecord::new(extent_id, payload, "test".to_string());
+        self.inflight.borrow_mut().insert(extent_id, record);
+    }
+
+    /// F207-C: test-only convenience for the Delete op kind.
+    #[cfg(test)]
+    pub(crate) fn _test_mark_delete_inflight(&self, extent_id: u64, pending_addrs: Vec<String>) {
+        let payload = ExtentOpPayload::Delete(PersistedPendingDelete {
+            extent_id,
+            pending_addrs,
+        });
+        let record = MgrExtentInflightRecord::new(extent_id, payload, "test".to_string());
+        self.inflight.borrow_mut().insert(extent_id, record);
     }
 
     /// Decode raw etcd values from the `extent_inflight/` prefix into
