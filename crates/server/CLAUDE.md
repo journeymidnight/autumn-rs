@@ -61,9 +61,11 @@ autumn-client --manager 127.0.0.1:9001 <COMMAND>
 | Command | Description |
 |---------|-------------|
 | `bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal\|N:hexstring]` | Create streams + partition(s). `--log-ec`/`--row-ec` set EC shape for log/row streams (replicates=K+M); meta always plain replication. `cluster.sh` auto-sets EC based on replica count. |
-| `set-stream-ec --stream <ID> --ec K+M` | Change an existing stream's EC policy (FOPS-03). The background ec_conversion_dispatch_loop converts sealed extents within ~5 s. |
+| `set-stream-ec --stream <ID> --ec K+M` | Change an existing stream's EC policy. F203: this only mutates `MgrStreamInfo.ec_data_shard / ec_parity_shard`. The post-F203 `ec_conversion_dispatch_loop` is **drain-only** — actual conversion happens per-extent via `force-ec-convert` (or an external Python controller iterating over advisory candidates). Set-stream-ec is the prerequisite for force-ec-convert: `handle_force_ec_convert` rejects extents on streams with `ec_parity_shard == 0`. |
+| `force-ec-convert --extent <EXTID>` | F203: per-extent EC trigger. Persists a rich `pending_ec_dispatch` marker; the next `ec_conversion_dispatch_loop` tick (~5 s) drains it via the F198 replay path. Requires the extent's parent stream to have EC policy (`ec_parity_shard > 0`); use `set-stream-ec` first if needed. |
 | `put <KEY> <FILE>` | Write key with value from file |
-| `streamput <KEY> <FILE>` | Stream-put large file in 512KB chunks via `StreamPut` RPC |
+| `put-stream [--chunk-size N] <KEY> <FILE-or->>` | F186 ceph-style client-side stripe-put (4 MiB chunk default). The modern path for large values; F205 removed the legacy `streamput` single-RPC alias. |
+| `get-stream [--chunk-size N] [--out FILE] <KEY>` | Chunked stream get. |
 | `get <KEY>` | Read value, write to stdout |
 | `del <KEY>` | Delete key |
 | `head <KEY>` | Show key metadata (length) |

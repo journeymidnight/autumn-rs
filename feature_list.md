@@ -1394,6 +1394,40 @@ Cleared by audit (no fix needed):
 - **Files:** `feature_list.md`, `claude-progress.txt`. (No code changes.)
 - **passes:** true (audit-cleared)
 
+### F205 · Trim autumn-client — drop redundant surfaces now that ops tooling goes Python
+- **Trigger:** User audit 2026-05-15 after F201/F202/F203 landed the mechanism/policy split. Question: "整理 autumn-client 的命令，重新思考，只留下必要重要的命令，以后运维代码走 python 比如 set-stream-ec 还需要吗？" Walked the full command surface end-to-end; user picked three removals via AskUserQuestion (`streams`, `info --top`, `streamput`); explicitly kept `set-stream-ec` (it's the prerequisite primitive for `force-ec-convert` on replicates-only streams) and `register-node`.
+- **Why these three specifically:**
+  - **`streams [--json]`** (F203, added in commit `df44af7` two commits ago — so removing it before it ships is cheap): completely redundant with `info --json | jq '.streams'`. F203 added it as part of the "Stage 3 OP toolkit", but the existing `info --json` covers the same data with one extra `jq` filter. Keeping it would have meant two ways to query the same thing.
+  - **`info --top N` flag**: human-convenience ranking ("top N partitions by size"). Python consumers do `info --json | jq 'sort_by(.live_size) | reverse | .[:N]'` — the kernel shouldn't host this sort policy. Removed both the JSON branch's truncation and the text branch's sort+truncate path. Both branches now return the full set, sorted consistently by `live_size` desc (so output is reproducible).
+  - **`streamput`**: legacy single-RPC `MSG_STREAM_PUT` path. F186 client-side ceph-style striperados (`put-stream` / `putstream`) is the modern chunked path with atomic commit-by-meta semantics and better large-value handling. The CLI command is dead weight; SDK `client.stream_put()` and the server-side `MSG_STREAM_PUT` handler stay (they're wire infrastructure that may be used by callers outside this codebase + F185 freeze handling references it).
+- **Aligned with `feedback-ops-tools-in-python` memory:** future ops tooling consumes the existing CLI / RPC surface from Python scripts; we deliberately don't grow new `Command::*` variants for ops use cases. This commit moves the existing surface in the same direction — less is more.
+- **Migration messages:** running `info --top N` after this commit exits with code 2 and:
+  ```
+  --top removed in F205; use `info --json | jq 'sort_by(.size_bytes) | reverse | .[:N]'` instead
+  ```
+  `streamput`/`streams` give the standard "unknown command" usage. No silent behavior change.
+- **What stays (just to record the audit conclusion):**
+  - Data plane: `put / get / del / head / ls / put-stream / putstream / get-stream / getstream`.
+  - Mechanism primitives: `split / merge / compact / gc / forcegc / set-stream-ec / force-ec-convert`.
+  - Observability: `info / policy`.
+  - One-time admin: `bootstrap / format / register-node`.
+  - Engineering: `wbench / rbench / perf-check`.
+- **`set-stream-ec` rationale (specifically asked by user):**
+  - Post-F203, the dispatch loop is drain-only. `set-stream-ec` ONLY mutates `MgrStreamInfo.ec_data_shard / ec_parity_shard`; it no longer triggers any automatic conversion of existing extents.
+  - But it remains essential: `handle_force_ec_convert` rejects extents whose parent stream has `ec_parity_shard == 0` with `CODE_PRECONDITION: "extent {EID} is not on an EC-policy stream (set-stream-ec first)"`. `compute_ec_advisory` (F202) also filters replicates-only streams out — so a stream not declared as EC will never be advised either.
+  - Therefore: `set-stream-ec` is the prerequisite primitive to flip a stream from replicates-only → EC-eligible. Removing it would force ALL EC policy declarations through `bootstrap` and prohibit upgrading an existing replicates-only cluster to EC after the fact. Rare but irreversible-on-removal; keep.
+- **Files touched:**
+  - `crates/server/src/bin/autumn_client.rs`: removed `Command::Streams` + `Command::StreamPut` variants, their parse arms, dispatch bodies, and the `top: Option<usize>` field on `Info` (~120 lines net delete). `--top` flag's parse arm emits a migration message. Both branches of `Info`'s dispatch simplified (no truncation; no top-vs-part XOR check). `usage()` reflects the trimmed surface.
+  - `crates/server/CLAUDE.md`: command table updated; `streamput` row removed; `set-stream-ec` row updated to note its post-F203 role as a prerequisite primitive (no longer auto-converts); `force-ec-convert` row added; `put-stream` row added.
+  - SDK `client.stream_put()` method NOT touched — still present, still callable; the CLI surface is the only thing trimmed.
+  - Server-side `MSG_STREAM_PUT` handler in partition-server NOT touched — wire-compatible.
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test --workspace --exclude autumn-fuse --lib`: unchanged (same set as F204 HEAD; the pre-existing `f099i_d1_fast_path_no_fu_allocation` flake remains).
+  - Manual: `$AC info --top 3` exits with the migration message; `$AC streams --json` gets "unknown command"; `$AC streamput foo bar` gets "unknown command"; `$AC info --json | jq '.streams'` returns the same data the old `streams` subcommand did.
+- **No memory addition needed** — the design principle ("ops tools in Python, not autumn-client") is already in `feedback-ops-tools-in-python` from F204; this commit applies it.
+- **passes:** true
+
 ### F204 · Stale-VP read error attribution — structured sentinel + FailedPrecondition status
 - **Trigger:** User-reported 2026-05-15: `$AC get <key>` against a cluster carrying pre-2026-04-27 corruption surfaces as:
   ```

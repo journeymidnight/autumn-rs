@@ -1,127 +1,104 @@
 Date: 2026-05-15
 TaskStatus: completed
-Task scope: F204 — stale-VP read error attribution. Surface
-            pre-2026-04-27 historical corruption signals via a
-            structured sentinel error so external Python operational
-            tooling can distinguish "data permanently lost; clean
-            up the key" from transient server errors.
+Task scope: F205 — autumn-client command audit and trim. Removed
+            three redundant CLI surfaces now that ops tooling goes
+            Python (per feedback-ops-tools-in-python memory): the
+            F203 `streams` subcommand, the `info --top N` flag, and
+            the legacy `streamput` subcommand. Kept everything else
+            after walking the full command surface end-to-end.
 
-User-reported symptom (the bug we attribute, not fix):
-  $AC get Patreon--leeesovely-October-2024-MissKON.com-054.jpg
-  Error: get: connection error: rpc status Internal:
-  ec_read_full_and_slice: offset 264784123 past decoded payload
-    len 11570792 (requested length=10918365) for extent 29
-    (manager sealed_length=11570792)
+User-driven audit:
+  - User question (2026-05-15): "整理 autumn-client 的命令, 重新
+    思考, 只留下必要重要的命令, 以后运维代码走 python. 比如
+    set-stream-ec 还需要吗?"
+  - Walked the full command surface and proposed a 4-category
+    classification (data plane / mechanism primitives / one-time
+    admin / observability / benchmarks). Confirmed set-stream-ec
+    stays (it's the prerequisite for force-ec-convert on
+    replicates-only streams). User picked three removals via
+    AskUserQuestion.
 
-  - The VP in some SST points (extent_id=29, offset=264MB, len=10MB)
-  - Manager records extent 29 sealed_length=11.5 MB
-  - On-disk EC shards physically encode 11.5 MB; bytes past it
-    do not exist anywhere
-  - Pre-2026-04-27 handle_stream_alloc_extent x EC convert race
-    shrunk sealed_length from the original (likely 34.7 MB) down
-    to shard_size (11.5 MB); F119-D double-encode then physically
-    rewrote shards to the sub-size
-  - All write-side fix paths are deployed (F138/F145/F146/F147/F149
-    + the 2026-04-27 `tail.sealed_length > 0` guard); etcd state
-    from the pre-fix era persists and cannot be self-detected
+What was removed:
 
-Decisions:
+  1. `streams [--json]` subcommand (added by F203 only 2 commits
+     ago, `df44af7`). Redundant with
+     `info --json | jq '.streams'`. Removed:
+     - Command::Streams variant (autumn_client.rs)
+     - "streams" parse arm
+     - dispatch body
+     - usage() line
 
-  - Surface, don't repair. Manager has no "previous correct value"
-    to compare against; SSTs are immutable; physical shards are
-    truncated. Cleanup must be OP-driven.
-  - No `client audit-vps` CLI (user preference: ops tools in
-    Python, not autumn-client). Saved to memory:
-    feedback-ops-tools-in-python.
-  - No open-time integrity scan (too slow).
-  - No replay_from_etcd warn (no reliable suspect signal).
-  - No extent-node-side monotonic guard (manager-side already
-    guarded; extent-node guard is speculative).
+  2. `info --top N` flag. Human-convenience top-K partition
+     ranking. Removed:
+     - top: Option<usize> field on Command::Info
+     - "--top" parse arm (emits migration message + exits 2)
+     - top.is_some() branches in both JSON and text dispatch paths
+     - Truncation logic; JSON branch now always returns full set
+       sorted by live_size desc. Text branch removed the
+       sort-by-stream-total + truncate block.
+     - usage() updated.
 
-Implementation:
+  3. `streamput` subcommand. Legacy MSG_STREAM_PUT single-RPC
+     large-value path. F186 ceph-style `put-stream`/`putstream`
+     is the modern chunked path with atomic commit-via-meta
+     semantics. Removed:
+     - Command::StreamPut variant
+     - "streamput" parse arm
+     - dispatch body
+     - usage() line.
+     The SDK client.stream_put() method stays (used by other
+     callers potentially; safe wire infrastructure). Server-side
+     MSG_STREAM_PUT handler stays. Only the CLI surface is gone.
 
-  1. crates/stream/src/client.rs:
-     - new `pub struct StaleVpOffset { extent_id, requested_offset,
-       requested_length, sealed_length }` sentinel + Display +
-       std::error::Error impls. Display contract is a STABLE wire
-       protocol:
-         stale_vp_offset_past_sealed_length: extent=<EID> offset=<OFF>
-         length=<LEN> sealed_length=<SEAL>
-       Python tooling regex consumers MUST treat the prefix and
-       4-field order as load-bearing.
-     - `ec_slice_decoded(payload, offset, length)` ->
-       `ec_slice_decoded(payload, offset, length, extent_id, sealed_length)`.
-       Out-of-bounds branch now returns
-       `Err(anyhow::Error::new(StaleVpOffset { ... }))` instead of
-       a stringy `anyhow!(...)`.
-     - `ec_read_full_and_slice` drops its outer
-       `anyhow!("ec_read_full_and_slice: ...")` wrap; the sentinel
-       surfaces unmodified through the chain.
-     - test mod ec_slice_tests updated:
-       slice_offset_past_end_returns_err_not_panic asserts the
-       error chain contains StaleVpOffset with all 4 fields
-       correct and the Display prefix.
+set-stream-ec specifically (asked by user):
+  - Kept. Post-F203 it only mutates MgrStreamInfo.ec_data_shard /
+    ec_parity_shard; dispatch loop is drain-only so it does NOT
+    auto-convert anything anymore.
+  - handle_force_ec_convert rejects extents on replicates-only
+    streams with CODE_PRECONDITION ("set-stream-ec first").
+    compute_ec_advisory (F202) also filters them out.
+  - Therefore set-stream-ec is the prerequisite primitive to flip
+    a stream from replicates-only -> EC-eligible. The OP toolkit
+    workflow is: set-stream-ec --stream X --ec K+M, then for each
+    sealed extent on X that's not converted yet, force-ec-convert
+    --extent EID. Both are mechanism primitives consumed by a
+    Python controller, not by the manager kernel.
+  - Without set-stream-ec, the only path to EC would be
+    bootstrap-time `--log-ec` / `--row-ec`. Upgrading an existing
+    replicates-only stream to EC after cluster lifetime would be
+    impossible. Rare scenario but irreversible-on-removal.
 
-  2. crates/stream/src/lib.rs:
-     - `pub use client::StaleVpOffset` for downstream consumption.
+Migration UX:
+  - `info --top N` -> exits with code 2 + message pointing to jq.
+  - `streams` -> "unknown command"; user runs
+    `info --json | jq '.streams'`.
+  - `streamput` -> "unknown command"; user runs `put-stream`.
 
-  3. crates/partition-server/src/rpc_handlers.rs:
-     - new `map_storage_error(&anyhow::Error) -> (StatusCode, String)`
-       helper. Downcasts the anyhow chain for StaleVpOffset; on
-       hit, returns
-       `(StatusCode::FailedPrecondition, stale.to_string())`.
-       Generic errors fall back to
-       `(StatusCode::Internal, e.to_string())`.
-     - `handle_get` (line 192) updated to use map_storage_error
-       instead of (StatusCode::Internal, e.to_string()).
-     - handle_range / handle_head don't resolve VPs; not touched.
-     - 3 new unit tests in `f204_map_storage_error_tests` mod:
-       stale_vp_surfaces_as_failed_precondition,
-       unrecognised_error_falls_back_to_internal,
-       sentinel_deep_in_chain_still_recognised.
-
-  4. crates/stream/CLAUDE.md programming note 6 footer:
-     - F204 wire contract documented for future Python tooling:
-       prefix + field order + status code = stable promise.
-
-  5. feature_list.md F204 entry, this file, MEMORY.md update
-     (feedback_ops_tools_in_python.md memory).
+What stays (the audit conclusion):
+  - Data plane: put / get / del / head / ls / put-stream /
+    putstream / get-stream / getstream.
+  - Mechanism primitives: split / merge / compact / gc / forcegc /
+    set-stream-ec / force-ec-convert.
+  - Observability: info (with --json / --part / --detail) / policy.
+  - One-time admin: bootstrap / format / register-node.
+  - Engineering: wbench / rbench / perf-check.
 
 Tests:
-
   - cargo build --workspace --exclude autumn-fuse: clean.
-  - cargo test -p autumn-stream --lib ec_slice: 6/6.
-  - cargo test -p autumn-partition-server --lib f204: 3/3.
-  - Pre-existing f099i_tests::* (2 flakes) unrelated; fail on
-    pre-F204 HEAD too.
+  - cargo test --workspace --exclude autumn-fuse --lib: unchanged
+    from F204 HEAD (same pre-existing f099i_d1 flake).
 
-Wire impact:
+Files touched:
+  - crates/server/src/bin/autumn_client.rs: ~120 lines net delete.
+  - crates/server/CLAUDE.md: command table updated.
+  - feature_list.md: F205 entry.
+  - claude-progress.txt: this file.
 
-  - Status code shift: `Internal` -> `FailedPrecondition` for the
-    stale-VP case only. Generic errors unchanged.
-  - Error message prefix shift:
-    `ec_read_full_and_slice: ...` -> `stale_vp_offset_past_sealed_length: ...`.
-  - No exact-prefix matching on the old format exists in the
-    codebase; external clients that may have built such matching
-    need a one-line regex update (documented in CLAUDE.md).
+Memory:
+  - No new memory needed. The driving principle ("ops tools in
+    Python, not autumn-client") was already saved as
+    feedback-ops-tools-in-python in F204. This commit applies it.
 
-Memory updates:
-  - new: feedback_ops_tools_in_python.md
-    Records: "future ops tooling in Python, not autumn-client".
-    Cross-ref: feedback_deferred_to_feature_list.md.
-
-What it does NOT close:
-
-  - The historical data on disk is still corrupt for affected
-    keys. OP needs to:
-      1. Read the failing key, observe FailedPrecondition with
-         stale_vp_offset_past_sealed_length signal.
-      2. `$AC del <key>` to write a tombstone.
-      3. `$AC compact <PARTID>` so major compaction drops the
-         tombstone + VP entry.
-    Steps 2-3 are mechanism primitives; the decision to do them
-    is policy (a Python script that consumes 1 and acts on 2+3).
-
-Next session starting point: user immediately asked to audit
-autumn-client commands and trim non-essential ones now that ops
-goes through Python. New planning session next.
+Next session starting point: no pending. Manager and PS kernels
+are now in their "mechanism only" steady state per the F201-F205
+refactor arc. New work uses F206+.

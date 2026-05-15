@@ -106,18 +106,7 @@ enum Command {
     ForceEcConvert {
         extent_id: u64,
     },
-    /// F203: list streams + extents (manager-side state). Equivalent to
-    /// `info --json` filtered to the streams section for controllers
-    /// that only need that view.
-    Streams {
-        json: bool,
-    },
     Put {
-        key: String,
-        file: String,
-        nosync: bool,
-    },
-    StreamPut {
         key: String,
         file: String,
         nosync: bool,
@@ -228,7 +217,6 @@ enum Command {
     },
     Info {
         json: bool,
-        top: Option<usize>,
         part: Option<u64>,
         /// F203: print PartitionLoad detail (F202 fields) for `part`.
         /// Requires `--part PID`. Reads from the manager's cached
@@ -250,13 +238,11 @@ fn usage() -> ! {
     eprintln!("  bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal|N:hexstring]");
     eprintln!("                                    Create initial partition(s) and streams");
     eprintln!("  set-stream-ec --stream <ID> --ec K+M");
-    eprintln!("  force-ec-convert --extent <EXTID> (F203: per-extent EC trigger)");
-    eprintln!("  streams [--json]                 (F203: list streams + extents)");
     eprintln!("                                    Change EC policy of an existing stream (FOPS-03)");
+    eprintln!("  force-ec-convert --extent <EXTID> (F203: per-extent EC trigger)");
     eprintln!("  put <KEY> <FILE>                  Put key with value from file");
-    eprintln!("  streamput <KEY> <FILE>            Stream-put large file in 512KB chunks");
     eprintln!("  put-stream [--chunk-size N] <KEY> <FILE-or->>");
-    eprintln!("                                    Chunked stream put (default 4 MiB chunks)");
+    eprintln!("                                    Chunked stream put (default 4 MiB chunks; F186)");
     eprintln!("  get <KEY>                         Get value for key");
     eprintln!("  get-stream [--chunk-size N] [--out FILE] <KEY>");
     eprintln!("                                    Chunked stream get (default 4 MiB chunks)");
@@ -281,7 +267,7 @@ fn usage() -> ! {
     eprintln!("                                    Read benchmark");
     eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K]");
     eprintln!("                                    Quick write+read bench; warns if >threshold regression vs baseline");
-    eprintln!("  info [--json] [--top N | --part PID] [--detail]  Show cluster info (F203 --detail: PartitionLoad snapshot)");
+    eprintln!("  info [--json] [--part PID] [--detail]  Show cluster info (F203 --detail: PartitionLoad snapshot)");
     std::process::exit(1);
 }
 
@@ -408,22 +394,6 @@ fn parse_args() -> Args {
             let key = raw[i].clone();
             let file = raw[i + 1].clone();
             Command::Put { key, file, nosync }
-        }
-        "streamput" => {
-            let nosync = false; // F178: always durable
-            while i < raw.len() && raw[i].starts_with('-') {
-                if raw[i] == "--nosync" {
-                    warn_nosync_deprecated_once();
-                }
-                i += 1;
-            }
-            if i + 1 >= raw.len() {
-                eprintln!("streamput requires <KEY> <FILE>");
-                std::process::exit(1);
-            }
-            let key = raw[i].clone();
-            let file = raw[i + 1].clone();
-            Command::StreamPut { key, file, nosync }
         }
         "put-stream" | "putstream" => {
             // put-stream [--chunk-size N] <KEY> <FILE-or-->
@@ -867,24 +837,27 @@ fn parse_args() -> Args {
             }
         }
         "info" => {
+            // F205: dropped `--top N` flag. Python scripts use
+            // `info --json | jq sort_by(...)` for ranking; no need
+            // for the kernel to host that policy logic.
             let mut json = false;
-            let mut top: Option<usize> = None;
             let mut part: Option<u64> = None;
             let mut detail = false;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--json" => { json = true; }
-                    "--top" => {
-                        i += 1;
-                        if i >= raw.len() { eprintln!("--top requires a number"); usage(); }
-                        top = Some(raw[i].parse().unwrap_or_else(|_| { eprintln!("--top requires a number"); usage() }));
-                    }
                     "--part" => {
                         i += 1;
                         if i >= raw.len() { eprintln!("--part requires a number"); usage(); }
                         part = Some(raw[i].parse().unwrap_or_else(|_| { eprintln!("--part requires a number"); usage() }));
                     }
                     "--detail" => { detail = true; }
+                    "--top" => {
+                        // F205: removed. Helpful migration message
+                        // (passes nothing on; just exits).
+                        eprintln!("--top removed in F205; use `info --json | jq 'sort_by(.size_bytes) | reverse | .[:N]'` instead");
+                        std::process::exit(2);
+                    }
                     other => {
                         eprintln!("unknown info flag: {other}");
                         usage();
@@ -892,15 +865,11 @@ fn parse_args() -> Args {
                 }
                 i += 1;
             }
-            if top.is_some() && part.is_some() {
-                eprintln!("--top and --part are mutually exclusive");
-                usage();
-            }
             if detail && part.is_none() {
                 eprintln!("--detail requires --part <PID>");
                 usage();
             }
-            Command::Info { json, top, part, detail }
+            Command::Info { json, part, detail }
         }
         "force-ec-convert" => {
             // F203: force-ec-convert --extent <EXTID>
@@ -924,18 +893,6 @@ fn parse_args() -> Args {
                 std::process::exit(1);
             });
             Command::ForceEcConvert { extent_id }
-        }
-        "streams" => {
-            // F203: streams [--json]
-            let mut json = false;
-            while i < raw.len() {
-                match raw[i].as_str() {
-                    "--json" => { json = true; }
-                    _ => break,
-                }
-                i += 1;
-            }
-            Command::Streams { json }
         }
         other => {
             eprintln!("unknown command: {other}");
@@ -1656,84 +1613,11 @@ async fn main() -> Result<()> {
             println!("{}", resp.message);
         }
 
-        Command::Streams { json } => {
-            // F203: same data as `info --json`'s streams section, but
-            // smaller surface for controllers that only need the
-            // stream + extent map.
-            let stream_resp_bytes = client
-                .mgr_call(MSG_STREAM_INFO, rkyv_encode(&StreamInfoReq { stream_ids: Vec::new() }))
-                .await
-                .context("stream info")?;
-            let stream_resp: StreamInfoResp =
-                rkyv_decode(&stream_resp_bytes).map_err(decode_err)?;
-            let extent_map: HashMap<u64, MgrExtentInfo> = stream_resp.extents.into_iter().collect();
-            let mut streams: Vec<MgrStreamInfo> = stream_resp.streams.into_iter().map(|(_, s)| s).collect();
-            streams.sort_by_key(|s| s.stream_id);
-            if json {
-                let mut arr = Vec::new();
-                for s in &streams {
-                    let mut ext_arr = Vec::new();
-                    for &eid in &s.extent_ids {
-                        if let Some(ex) = extent_map.get(&eid) {
-                            ext_arr.push(serde_json::json!({
-                                "extent_id": eid,
-                                "sealed_length": ex.sealed_length,
-                                "ec_converted": ex.ec_converted,
-                                "replicates": ex.replicates,
-                                "parity": ex.parity,
-                                "refs": ex.refs,
-                                "eversion": ex.eversion,
-                            }));
-                        }
-                    }
-                    arr.push(serde_json::json!({
-                        "stream_id": s.stream_id,
-                        "ec_data_shard": s.ec_data_shard,
-                        "ec_parity_shard": s.ec_parity_shard,
-                        "replicates": s.replicates,
-                        "extents": ext_arr,
-                    }));
-                }
-                println!("{}", serde_json::to_string_pretty(&arr).context("serialize streams")?);
-            } else {
-                for s in &streams {
-                    println!(
-                        "stream {} (replicates={}, EC={}+{}): {} extent(s)",
-                        s.stream_id, s.replicates, s.ec_data_shard, s.ec_parity_shard,
-                        s.extent_ids.len()
-                    );
-                    for &eid in &s.extent_ids {
-                        if let Some(ex) = extent_map.get(&eid) {
-                            let layout = if ex.ec_converted {
-                                format!("EC({}+{})", s.ec_data_shard, s.ec_parity_shard)
-                            } else if ex.sealed_length == 0 {
-                                "open".to_string()
-                            } else {
-                                format!("replicas={:?}", ex.replicates)
-                            };
-                            println!(
-                                "  extent {} sealed={} {}  refs={}",
-                                eid, ex.sealed_length, layout, ex.refs
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
         Command::Put { key, file, nosync: _ } => {
             let value = std::fs::read(&file).with_context(|| format!("read file {file}"))?;
             client.put(key.as_bytes(), &value).await
                 .map_err(|e| anyhow!("put: {e}"))?;
             println!("ok");
-        }
-
-        Command::StreamPut { key, file, nosync: _ } => {
-            let value = std::fs::read(&file).with_context(|| format!("read file {file}"))?;
-            let file_size = value.len();
-            client.stream_put(key.as_bytes(), &value).await
-                .map_err(|e| anyhow!("stream put: {e}"))?;
-            println!("ok ({file_size} bytes)");
         }
 
         Command::PutStream { key, file, chunk_size } => {
@@ -2769,7 +2653,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Info { json, top, part, detail } => {
+        Command::Info { json, part, detail } => {
             // F203: --detail prints only the PartitionLoad snapshot for
             // `part`, sourced from the manager's cached metric window.
             // Short-circuits the full info path.
@@ -3031,44 +2915,32 @@ async fn main() -> Result<()> {
                     })
                     .collect();
 
+                // F205: sort by live_size desc kept (consistent
+                // ordering for human eyes when the same partition
+                // table is dumped). Top-N truncation was removed —
+                // Python consumers do `jq 'sort_by(.live_size) | reverse | .[:N]'`.
                 partitions_view.sort_by(|a, b| b.live_size.cmp(&a.live_size));
-                if let Some(n) = top {
-                    partitions_view.truncate(n);
-                }
 
                 if let Some(pid) = part {
                     match partitions_view.into_iter().find(|p| p.part_id == pid) {
                         Some(pv) => println!("{}", serde_json::to_string_pretty(&pv)?),
                         None => eprintln!("partition {pid} not found"),
                     }
-                } else if top.is_some() {
-                    println!("{}", serde_json::to_string_pretty(&partitions_view)?);
                 } else {
                     let snapshot = InfoSnapshot { nodes: nodes_view, extents: extents_view, streams: streams_view, partitions: partitions_view };
                     println!("{}", serde_json::to_string_pretty(&snapshot)?);
                 }
             } else {
                 // === Text output ===
-                // Determine which partitions to show and in what order
+                // Determine which partitions to show. F205 removed --top.
                 let show_pids: Vec<u64> = if let Some(pid) = part {
                     vec![pid]
                 } else {
-                    let mut v = part_ids.clone();
-                    if top.is_some() {
-                        v.sort_by(|a, b| {
-                            let sa: u64 = regions.get(a).map(|r| [r.log_stream, r.row_stream, r.meta_stream].iter()
-                                .filter_map(|sid| stream_map.get(sid)).map(|s| stream_total(s, &extent_map)).sum()).unwrap_or(0);
-                            let sb: u64 = regions.get(b).map(|r| [r.log_stream, r.row_stream, r.meta_stream].iter()
-                                .filter_map(|sid| stream_map.get(sid)).map(|s| stream_total(s, &extent_map)).sum()).unwrap_or(0);
-                            sb.cmp(&sa)
-                        });
-                        if let Some(n) = top { v.truncate(n); }
-                    }
-                    v
+                    part_ids.clone()
                 };
 
                 // Nodes / Extents / Streams sections only in full mode
-                if part.is_none() && top.is_none() {
+                if part.is_none() {
                     println!("=== Nodes ===");
                     for (nid, n) in &nodes_sorted {
                         // F191: display the control_address when present.
@@ -3141,9 +3013,7 @@ async fn main() -> Result<()> {
                 }
 
                 // === Partitions section ===
-                let section_header = if let Some(n) = top {
-                    format!("\n=== Partitions (top {n}) ===")
-                } else if let Some(pid) = part {
+                let section_header = if let Some(pid) = part {
                     format!("\n=== Partition {pid} ===")
                 } else {
                     "\n=== Partitions ===".to_string()
