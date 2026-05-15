@@ -185,12 +185,42 @@ impl AutumnManager {
             )));
         }
 
+        // F209-B: layout_changed == None ⇒ the extent exists but
+        // `task.replace_id` is no longer in any slot (extent_slot
+        // returned None above). Pre-F209-B this case fell through to
+        // the apply block where the inner `slot None` branch did
+        // `return Err(...)` from inside borrow_mut WITHOUT releasing
+        // the Recovery marker — violating invariant I3 (every
+        // acquire has a matching release). The marker survived until
+        // F208's 10-min sweep, blocking any other op on the extent
+        // for that window. Release now, then return.
+        if layout_changed.is_none() {
+            if let Some(etcd) = &self.etcd {
+                let _ = etcd
+                    .put_and_delete_txn(
+                        Vec::new(),
+                        vec![Self::extent_inflight_key(task.extent_id)],
+                    )
+                    .await;
+            }
+            self.commit_extent_inflight_release(task.extent_id);
+            return Err(AppError::Precondition(format!(
+                "replace_id {} not in extent {}",
+                task.replace_id, task.extent_id
+            )));
+        }
+
         let updated_extent = {
             let mut s = self.store.inner.borrow_mut();
             match s.extents.get_mut(&task.extent_id) {
                 Some(ex) => {
                     let slot = match Self::extent_slot(ex, task.replace_id) {
                         Some(v) => v,
+                        // Unreachable under single-threaded compio:
+                        // the F209-B layout_changed.is_none() branch
+                        // above already covered this. Kept as defense
+                        // — if it ever fires, the marker leak is
+                        // bounded by F208's 10-min sweep.
                         None => {
                             return Err(AppError::Precondition(format!(
                                 "replace_id {} not in extent {}",
@@ -928,7 +958,7 @@ impl AutumnManager {
     /// extent that has been deleted or that has incompatible state (e.g.,
     /// already EC-converted) — best-effort cleanup so the next tick's
     /// candidate set shrinks. Idempotent.
-    async fn drain_extent_inflight_marker(&self, extent_id: u64) -> Result<(), AppError> {
+    pub(crate) async fn drain_extent_inflight_marker(&self, extent_id: u64) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             let del_op = self.build_extent_inflight_release_op(extent_id);
             // Use `put_and_delete_txn` (one-element delete list) so the F149
@@ -946,7 +976,7 @@ impl AutumnManager {
         Ok(())
     }
 
-    pub(crate) async fn apply_ec_conversion_done(
+    pub async fn apply_ec_conversion_done(
         &self,
         extent_id: u64,
         target_nodes: Vec<u64>,

@@ -2542,6 +2542,21 @@ impl AutumnManager {
         }
         target_nodes.truncate(total_shards);
 
+        // F209-D verify-at-apply: capture `pre_eversion` from the L2436
+        // snapshot. Between that snapshot and the `acquire_extent_inflight`
+        // below there are N `alloc_extent_on_node` awaits — during them an
+        // `apply_recovery_done` for this extent could complete (acquiring +
+        // releasing its own Recovery marker, since no ConvertToEc marker
+        // exists yet to block it via F207's exclusive ledger CAS) and bump
+        // `ex.eversion` + rewrite `ex.replicates`. If we don't verify, the
+        // marker we acquire below carries a stale `new_eversion = ex.eversion
+        // + 1`, and the dispatch loop's `apply_ec_conversion_done` would
+        // later unconditionally write that stale eversion to etcd, reverting
+        // the recovery's eversion bump and silently undoing the slot
+        // replacement. Same race F146 closed for `handle_stream_alloc_extent`
+        // and `handle_multi_modify_split`.
+        let pre_eversion = ex.eversion;
+
         let new_eversion = ex.eversion + 1;
         let dispatch_record = MgrEcDispatchInflight {
             extent_id,
@@ -2574,6 +2589,42 @@ impl AutumnManager {
             }));
         }
 
+        // F209-D verify-at-apply step 2: re-read `ex.eversion` under a
+        // fresh borrow. If it changed during the await window, the marker
+        // payload's `new_eversion` is stale — drain the marker (so a
+        // future force-ec-convert can retry with fresh state) and refuse.
+        let live_eversion = self
+            .store
+            .inner
+            .borrow()
+            .extents
+            .get(&extent_id)
+            .map(|e| e.eversion);
+        let live_eversion = match live_eversion {
+            Some(v) => v,
+            None => {
+                // Extent vanished during the await window (punch_holes /
+                // truncate). Drop the marker; nothing to convert.
+                let _ = self.drain_extent_inflight_marker(extent_id).await;
+                return Ok(rkyv_encode(&ForceEcConvertResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "extent {extent_id} removed during force-ec-convert (concurrent gc)"
+                    ),
+                }));
+            }
+        };
+        if live_eversion != pre_eversion {
+            let _ = self.drain_extent_inflight_marker(extent_id).await;
+            return Ok(rkyv_encode(&ForceEcConvertResp {
+                code: CODE_PRECONDITION,
+                message: format!(
+                    "extent {extent_id} eversion changed during force-ec-convert \
+                     (pre={pre_eversion}, live={live_eversion}); retry to pick up new state"
+                ),
+            }));
+        }
+
         Ok(rkyv_encode(&ForceEcConvertResp {
             code: CODE_OK,
             message: format!(
@@ -2591,6 +2642,19 @@ impl AutumnManager {
         &self,
         payload: Bytes,
     ) -> HandlerResult {
+        // F209-A: followers' `policy.metrics` is empty (only the leader's
+        // policy_tick_loop populates it from MSG_REPORT_PARTITION_LOAD).
+        // Without this gate, querying a follower silently returned
+        // `CODE_OK` + all-zero PartitionLoad — operators couldn't tell
+        // "no metrics yet" from "queried the wrong node".
+        if !self.leader.get() {
+            return Ok(rkyv_encode(&GetPartitionDetailResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                load: PartitionLoad::default(),
+                bucket_ts: 0,
+            }));
+        }
         let req: GetPartitionDetailReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         let p = self.policy.borrow();

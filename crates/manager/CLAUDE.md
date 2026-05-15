@@ -832,16 +832,32 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     - WARN log per release with extent_id + op kind + age + threshold.
     - Started by `start_runtime_tasks` alongside the other loops.
 
-    **Why auto-release is safe:** sweep ONLY touches the ledger marker.
-    It does NOT mutate `extents/<id>` state and does NOT message any EN.
-    If an EN-side task corresponding to a released marker is genuinely
-    still running, the worst case is wasted retry work, never a
-    data-correctness issue:
+    **Why auto-release is safe (for Recovery + Delete):** sweep ONLY
+    touches the ledger marker. It does NOT mutate `extents/<id>` state
+    and does NOT message any EN. If an EN-side task corresponding to a
+    released marker is genuinely still running, the worst case is
+    wasted retry work, never a data-correctness issue:
     - Recovery: EN completes, pushes `recovery_done`, next df probe
       drains it; `apply_recovery_done` runs with marker already cleared
       → no defer → apply proceeds.
-    - ConvertToEc: EN F119-D / F153 make a re-dispatch idempotent.
     - Delete: EN `handle_delete_extent` is idempotent (NotFound → Ok).
+
+    **F209-C: ConvertToEc is WARN-only and is NEVER auto-released.**
+    Releasing a ConvertToEc marker opens a race with the original
+    EN-side dispatch: a fresh `handle_force_ec_convert` (or the
+    external Python policy controller's retry) can succeed in the gap
+    between marker release and the original `apply_ec_conversion_done`
+    landing, and shuffle a **different** parity-node assignment. Then
+    the dispatch loop runs `apply_ec_conversion_done` with the new
+    layout while the original EN-side bytes are what hit disk. F153's
+    per-extent mutex serialises the two on the EN coordinator, but the
+    manager state can still record the second dispatch's `target_nodes`
+    / `extra_disk_ids` while the first dispatch's bytes are what
+    physically landed — exactly the failure mode F198's rich marker
+    was added to prevent. The sweep emits a WARN every tick for a
+    stale ConvertToEc marker; operator must inspect EN state and
+    decide manually (Python ops: confirm EN finished, then
+    `etcdctl del extent_inflight/<id>`).
 
     **Leader-failover-as-reconcile invariant:** `started_at` is in the
     rkyv'd `MgrExtentInflightRecord` payload, persisted at acquire
@@ -883,3 +899,39 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     13 (F146), 14 (F147-A), 19 (F198), 20 (F206). All those
     notes describe the historical context for individual races
     that F207 now unifies under one mechanism.
+
+    **F209 hardening (post-review, 2026-05-15):**
+    - **F209-A** `handle_get_partition_detail` now gates on
+      `self.leader.get()`. A follower's `policy.metrics` is empty;
+      pre-F209-A the handler silently returned `CODE_OK` + all-zero
+      `PartitionLoad`, so `client info --part PID --detail` against
+      a follower was indistinguishable from "PS hasn't reported yet".
+    - **F209-B** `apply_recovery_done` slot-mismatch (`replace_id`
+      not in extent's node list) now releases the Recovery marker
+      before returning `Precondition`. Pre-F209-B the early-return
+      happened inside `borrow_mut` and skipped the release —
+      violating invariant I3 (every acquire has a matching release);
+      F208 sweep was the safety net. Matches the existing
+      `layout_changed == Some(true)` release pattern.
+    - **F209-C** F208 sweep no longer auto-releases ConvertToEc
+      markers — WARN-only with operator-driven remediation. See the
+      block above.
+    - **F209-D** `handle_force_ec_convert` adds the F146
+      verify-at-apply pattern. Pre-F209-D the `new_eversion` in the
+      ConvertToEc marker payload was captured from a clone taken
+      BEFORE the `alloc_extent_on_node` awaits and the
+      `acquire_extent_inflight` await. A concurrent
+      `apply_recovery_done` for the same extent could complete in
+      that window (no ConvertToEc marker yet to refuse it via I5),
+      bumping `ex.eversion`. The dispatch loop's
+      `apply_ec_conversion_done` would then unconditionally write
+      the stale `new_eversion` to etcd, silently undoing the
+      recovery's slot replacement. F209-D re-reads `ex.eversion`
+      after `acquire_extent_inflight` returns OK and refuses with
+      `Precondition` (after `drain_extent_inflight_marker`) when
+      drift is detected. Same defense pattern F146 added for
+      `handle_stream_alloc_extent` and `handle_multi_modify_split`.
+    - **F209-E** `crates/manager/tests/f209_apply_done_atomicity.rs`
+      (`#[ignore]`, requires embedded etcd) asserts the I3
+      atomicity claim end-to-end: success path lands both effects,
+      F149-fence-failed apply rolls back both atomically.

@@ -36,13 +36,13 @@ use crate::AutumnManager;
 /// in F207-D. The new prefix matches our other snake_case prefixes
 /// (`partitionVpRefs/` is the camelCase outlier; consistency was already
 /// imperfect — pick whichever).
-pub(crate) const EXTENT_INFLIGHT_PREFIX: &str = "extent_inflight/";
+pub const EXTENT_INFLIGHT_PREFIX: &str = "extent_inflight/";
 
 /// Discriminator for the kind of stream-layer op currently in flight on an
 /// extent. Returned by the `extent_inflight_op` read-only probe so callers
 /// can render a useful refuse-at-start error message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ExtentOpKind {
+pub enum ExtentOpKind {
     ConvertToEc,
     Recovery,
     Delete,
@@ -114,14 +114,14 @@ pub struct MgrExtentInflightRecord {
 /// "exactly one variant populated" invariant; `op_kind()` derives the
 /// discriminator from the variant rather than relying on the byte field.
 #[derive(Clone, Debug)]
-pub(crate) enum ExtentOpPayload {
+pub enum ExtentOpPayload {
     ConvertToEc(MgrEcDispatchInflight),
     Recovery(MgrRecoveryTask),
     Delete(PersistedPendingDelete),
 }
 
 impl ExtentOpPayload {
-    pub(crate) fn kind(&self) -> ExtentOpKind {
+    pub fn kind(&self) -> ExtentOpKind {
         match self {
             Self::ConvertToEc(_) => ExtentOpKind::ConvertToEc,
             Self::Recovery(_) => ExtentOpKind::Recovery,
@@ -193,7 +193,7 @@ impl MgrExtentInflightRecord {
 #[allow(dead_code)]
 impl AutumnManager {
     /// Compose the etcd key for a given extent_id.
-    pub(crate) fn extent_inflight_key(extent_id: u64) -> String {
+    pub fn extent_inflight_key(extent_id: u64) -> String {
         format!("{}{}", EXTENT_INFLIGHT_PREFIX, extent_id)
     }
 
@@ -210,7 +210,7 @@ impl AutumnManager {
     ///
     /// **Phase 0 note:** this function is NOT yet called by any production
     /// handler. It's added now so F207-B / F207-C only swap call sites.
-    pub(crate) async fn acquire_extent_inflight(
+    pub async fn acquire_extent_inflight(
         &self,
         extent_id: u64,
         payload: ExtentOpPayload,
@@ -384,19 +384,31 @@ impl AutumnManager {
     /// ledger marker, NOT the extent's `replicates / parity / eversion /
     /// avali` state. If the EN-side task that the released marker
     /// referred to is genuinely still running (long-running recovery on
-    /// a multi-GB extent over a slow network), the worst case is:
+    /// a multi-GB extent over a slow network), the worst case for the
+    /// auto-released kinds is:
     /// - Recovery: EN completes, pushes `recovery_done`, manager's next
     ///   df probe drains it; `apply_recovery_done` runs with the
     ///   marker already cleared → the in-memory `inflight` lookup
     ///   misses → no defer → apply proceeds normally.
-    /// - ConvertToEc: EN's F119-D / F153 idempotency means a re-dispatch
-    ///   (if the next `ec_conversion_dispatch_loop` tick re-fires) is a
-    ///   no-op CODE_OK on the coordinator.
     /// - Delete: EN-side `handle_delete_extent` is idempotent
     ///   (NotFound is downgraded to Ok) — re-dispatch from a future
     ///   GC tick is safe.
-    /// No data-correctness risk from a too-eager release; only wasted
-    /// work in the rare retry case.
+    ///
+    /// **ConvertToEc is WARN-only (F209-C, supersedes F208's blanket
+    /// auto-release).** A released ConvertToEc marker opens a race with
+    /// the original EN-side dispatch: a fresh `handle_force_ec_convert`
+    /// can succeed in the gap and shuffle a *different* parity node
+    /// assignment, then apply_ec_conversion_done writes the new layout
+    /// while the original EN-side `convert_to_ec` is still running. F153
+    /// serialises the two on the coordinator, but the manager state can
+    /// still record the second dispatch's `target_nodes` while the first
+    /// dispatch's bytes are what hit disk. This is exactly the failure
+    /// mode F198's rich marker was added to prevent. The remediation for
+    /// a stuck ConvertToEc marker is operator intervention via Python
+    /// ops (`etcdctl get extent_inflight/<id>` + inspect EN state +
+    /// decide whether to manually delete the marker after confirming EN
+    /// finished). The WARN log fires every sweep tick so operators get
+    /// the signal.
     ///
     /// **Leader-failover-as-reconcile invariant:** when the leader
     /// changes, the new leader's `replay_from_etcd` rebuilds the
@@ -456,6 +468,10 @@ impl AutumnManager {
 
     /// F208: one sweep iteration. Extracted from the loop so unit tests
     /// can drive it with controlled `now` + `threshold_secs` values.
+    ///
+    /// F209-C: ConvertToEc markers are WARN-only and never auto-released —
+    /// see the loop's docstring for the safety argument. Only Recovery
+    /// and Delete are auto-released here.
     pub(crate) async fn sweep_stale_inflight_once(
         &self,
         now: i64,
@@ -480,6 +496,23 @@ impl AutumnManager {
             .collect();
         let mut released = 0usize;
         for (eid, kind, age_secs) in stale {
+            // F209-C: ConvertToEc is WARN-only. Releasing the marker would
+            // open a race with the original EN-side dispatch — a fresh
+            // force-ec-convert could shuffle a different parity assignment
+            // and apply_ec_conversion_done would write the new layout while
+            // the original EN-side bytes are what hit disk. Operator must
+            // manually remediate (Python ops tooling).
+            if matches!(kind, ExtentOpKind::ConvertToEc) {
+                tracing::warn!(
+                    extent_id = eid,
+                    age_secs,
+                    threshold_secs,
+                    "F209-C: stale ConvertToEc inflight marker — NOT auto-released. \
+                     Operator must inspect EN state and decide manually. \
+                     See crates/manager/CLAUDE.md note 21 for rationale."
+                );
+                continue;
+            }
             // Atomic etcd delete under F149 fence. On error, log and
             // skip — next tick will retry.
             if let Some(etcd) = &self.etcd {
@@ -715,8 +748,9 @@ mod tests {
         assert_eq!(decoded[0].0, 42);
     }
 
-    /// F208: sweep auto-releases markers older than the threshold; leaves
-    /// fresh markers alone; cleans `delete_progress` for Delete markers.
+    /// F208 + F209-C: sweep auto-releases Recovery + Delete markers
+    /// older than the threshold; ConvertToEc is WARN-only and survives;
+    /// fresh markers stay alone; cleans `delete_progress` for Delete.
     #[test]
     fn f208_sweep_auto_releases_stale_markers() {
         run(async {
@@ -748,8 +782,14 @@ mod tests {
                 .as_secs() as i64
                 + 7200;
             let released = m.sweep_stale_inflight_once(now_future, 1).await;
-            assert_eq!(released, 3, "all three stale markers must be released");
-            assert_eq!(m.extent_inflight_op(10), None);
+            // F209-C: only Recovery (20) + Delete (30) are auto-released.
+            // ConvertToEc (10) is WARN-only and survives.
+            assert_eq!(released, 2, "only Recovery + Delete are released; ConvertToEc is WARN-only");
+            assert_eq!(
+                m.extent_inflight_op(10),
+                Some(ExtentOpKind::ConvertToEc),
+                "F209-C: stale ConvertToEc marker must survive sweep"
+            );
             assert_eq!(m.extent_inflight_op(20), None);
             assert_eq!(m.extent_inflight_op(30), None);
             // Delete progress entry also cleaned.
@@ -757,6 +797,33 @@ mod tests {
                 !m.delete_progress.borrow().contains_key(&30),
                 "F208: Delete release must also drop delete_progress entry"
             );
+        })
+    }
+
+    /// F209-C: stale ConvertToEc marker is WARN-only across multiple
+    /// sweep ticks — never auto-released. Operator must manually
+    /// remediate via Python ops tooling.
+    #[test]
+    fn f209_c_sweep_excludes_convert_to_ec_from_auto_release() {
+        run(async {
+            let m = AutumnManager::new();
+            m.acquire_extent_inflight(77, ec_payload(77)).await.expect("acquire");
+
+            let now_future = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                + 7200;
+            // Sweep multiple times — ConvertToEc must survive every tick.
+            for _ in 0..3 {
+                let released = m.sweep_stale_inflight_once(now_future, 1).await;
+                assert_eq!(released, 0, "ConvertToEc must never count toward released");
+                assert_eq!(
+                    m.extent_inflight_op(77),
+                    Some(ExtentOpKind::ConvertToEc),
+                    "stale ConvertToEc marker survives every sweep tick"
+                );
+            }
         })
     }
 

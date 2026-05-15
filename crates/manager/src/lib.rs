@@ -1,5 +1,5 @@
 mod extent_delete;
-mod extent_inflight;
+pub mod extent_inflight;
 pub mod policy;
 #[cfg(test)]
 mod policy_tests;
