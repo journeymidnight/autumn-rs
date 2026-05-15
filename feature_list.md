@@ -1394,6 +1394,53 @@ Cleared by audit (no fix needed):
 - **Files:** `feature_list.md`, `claude-progress.txt`. (No code changes.)
 - **passes:** true (audit-cleared)
 
+### F202 · Advisory unification — 6 policy kinds in one cache (mechanism / policy separation Stage 2)
+- **Trigger:** Stage 2 of the mechanism/policy separation refactor approved by user 2026-05-14 (plan `~/.claude/plans/elegant-tumbling-pumpkin.md`). Stage 1 (F201) fixed GC trigger bugs and added multi-tier params. Stage 2 makes the manager's `advisory_cache` carry all 6 actionable kinds (SPLIT, MERGE, GC, MINOR_COMPACT, MAJOR_COMPACT, EC) plus HOT_COLD, so an external policy controller has one query (`MSG_GET_POLICY_CANDIDATES`) for everything it needs to decide on.
+- **Wire changes (backward-incompatible at rkyv level, same-commit upgrade — cluster.sh stops all roles before restart):**
+  - Two new `POLICY_KIND_*` constants in `manager_rpc.rs`:
+    - `POLICY_KIND_MINOR_COMPACT = 5` — partition-level "minor compact would pick up ≥ threshold bytes for ≥ N consecutive windows".
+    - `POLICY_KIND_EC = 6` — per-extent "sealed-unconverted extent ≥ 64 MiB on an EC-policy stream".
+  - `POLICY_KIND_COMPACT` (value 3) renamed to `POLICY_KIND_MAJOR_COMPACT`. Old name retained as `#[deprecated]` alias for back-compat with external consumers / test fixtures.
+  - `PartitionLoad` gains 5 new fields (all u64/u32, default 0): `sst_tombstone_bytes`, `sst_expired_bytes`, `sst_out_of_range_bytes`, `minor_compact_pending_bytes`, `sealed_log_extent_count`. These flow PS → manager → advisory computation.
+- **PS-side metric collection (`crates/partition-server/src/`):**
+  - `PartitionMetrics` (in `lib.rs`) grows the 5 atomic counters paralleling the wire fields.
+  - New `refresh_f202_metrics(part)` helper (in `background.rs`) computes:
+    - `sst_expired_bytes`: Σ `estimated_size` for tables whose paired `SstReader.min_expires_at` is non-zero and ≤ `now`. Conservative upper bound (whole-SST count; tightening needs an on-disk aggregate change deferred to a future stage).
+    - `sst_out_of_range_bytes`: Σ `estimated_size` of all tables when `has_overlap == 1`; 0 otherwise. Same shape as `pending_compaction_bytes`'s overlap branch.
+    - `minor_compact_pending_bytes`: Σ `estimated_size` of `pickup_tables` output when `has_overlap == 0`.
+    - `sst_tombstone_bytes` / `sealed_log_extent_count`: left 0 — computing the first requires SST-format aggregates (deferred); the second needs a cached `get_stream_info` result PS doesn't keep authoritatively. Advisory treats 0 as "no signal" for these dimensions.
+  - Refresh hooks: every site that previously updated `pending_compaction_bytes` (4 sites in `background_compact_loop`) now also calls `refresh_f202_metrics`. Plus a new call in `commit_flush_outcome` after each flush, since the new SST changes the dead-data + minor-pending breakdown.
+  - `report_load_loop` (in `lib.rs`) reads the new atomics and stuffs them into `PartitionLoad` for the 30-second ship-to-manager pulse.
+- **Manager-side advisory generation (`crates/manager/src/policy.rs`):**
+  - `compute_maintenance_advisory` (existing F187 helper) gains a third arm: MINOR_COMPACT, gated by `minor_compact_pending_bytes > MINOR_COMPACT_PENDING_HIGH` (default 512 MiB) sustained across `required_buckets` AND `minor_compact_pending_bytes > 0` in the latest bucket (common-sense filter: don't suggest minor compact when there's no minor compact work) AND outside the cooldown (`minor_compact_cooldown_sec`, default 120s — shorter than major because minor is much cheaper).
+  - New `compute_ec_advisory(state, now)` helper iterates `state.streams` and `state.extents` directly (EC is per-extent, not bucketed). Filters: stream has EC policy attached (`ec_data_shard > 0`); extent is sealed (`sealed_length > 0`); not already converted; `sealed_length >= ec_min_extent_bytes` (default 64 MiB, common-sense filter against negative-EV conversions). Emits `POLICY_KIND_EC` with `primary_part_id = 0`, `secondary_part_id = extent_id`, `size_bytes = sealed_length`.
+  - `PolicyConfig` extended with `minor_compact_pending_high`, `minor_compact_cooldown_sec`, `ec_min_extent_bytes`.
+  - `policy_tick_loop` (in `lib.rs`) now unions: `compute_candidates` (split/merge) + `compute_maintenance_advisory` (gc/major/minor) + `compute_hot_cold_advisory` (hot_cold) + `compute_ec_advisory` (ec) → all into `advisory_cache`. `MSG_GET_POLICY_CANDIDATES` returns the union.
+- **`client policy` rendering:** mapping updated to print 7 strings: `split / merge / gc / major / minor / ec / hotcold`. `feas` column reads "n/a" for all maintenance/EC kinds (per-partition or per-extent feasibility is implicit).
+- **What's NOT in Stage 2 (deferred to Stage 2-followup):**
+  - `client info --part PID --detail` — needs new manager (or PS) RPC for raw per-partition F202 metric snapshot; not strictly required because the advisory candidates already carry actionable signals (`size_bytes`, `reason`).
+  - `client set-stream-ec --extent <EXTID>` — needs new manager RPC bypassing the dispatch loop for a single extent. Today OP uses `set-stream-ec --stream <ID>` which lets the existing dispatch loop pick up sealed-unconverted extents (correct but coarser-grained than advisory candidates suggest).
+  - `client streams [--json]` — redundant with existing `client info --json` which already returns stream + extent details.
+  - `sst_tombstone_bytes` accurate measurement (needs SST on-disk format aggregate); `sealed_log_extent_count` (needs PS-cached `get_stream_info` result).
+  - These are scope-bounded follow-ups; the user-facing deliverable (advisory_cache carries all 6 actionable kinds → external controller can query one endpoint) is complete.
+- **Files touched:**
+  - `crates/rpc/src/manager_rpc.rs`: new POLICY_KIND_* constants, rename to POLICY_KIND_MAJOR_COMPACT with deprecated alias, 5 new PartitionLoad fields (~40 lines).
+  - `crates/partition-server/src/lib.rs`: 5 new PartitionMetrics fields; report_load_loop updated to ship them.
+  - `crates/partition-server/src/background.rs`: `refresh_f202_metrics` helper (~50 lines); call sites in compact loop arms + flush commit.
+  - `crates/manager/src/policy.rs`: new MINOR_COMPACT_* + EC_MIN_EXTENT_BYTES consts; PolicyConfig extension; minor advisory arm in `compute_maintenance_advisory`; new `compute_ec_advisory` helper (~80 lines).
+  - `crates/manager/src/lib.rs`: `policy_tick_loop` unions EC advisory + updated kind names in trace.
+  - `crates/manager/src/policy_tests.rs`: 8 new F202 tests (3 minor-compact, 5 ec-advisory); shared `mk_stream` / `mk_extent` fixtures.
+  - `crates/server/src/bin/autumn_client.rs`: kind mapping updated for 7 kinds; `feas` column update.
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-manager --lib policy_tests`: 32/32 (24 pre-existing + 8 new F202).
+  - Pre-existing `f099i_tests::*` flakes in partition-server (2 cases) are unrelated to F202; same fails on F201 HEAD.
+- **Stage roadmap reminder:**
+  - **F201** (done): GC bug fix + cooldown classification + multi-tier params.
+  - **F202** (this commit): advisory unification across 6 kinds.
+  - **F203** (next): delete the in-kernel auto-dispatch loops; only must-cleanup (has_overlap / expiry / minor / F198 marker replay) stays in-kernel. Adds `client info --detail` and `client set-stream-ec --extent` as the OP toolkit needed to actually drive policy from outside.
+- **passes:** true
+
 ### F201 · GC trigger logic overhaul: empty-sealed bug fix + multi-tier params + cooldown classification (mechanism / policy separation Stage 1)
 - **Trigger:** User reported 2026-05-14 with `info` output showing partition 15's log_stream extents `[26, 27, 28, 29, 30]` where 27/28 were `(open), 0 B` (sealed by position in `extent_ids[..len-1]` but with `sealed_length=0` on the manager — extents allocated then immediately sealed by `stream_alloc_extent`'s commit_length capture before any append). These slots were pinned in `extent_ids` forever:
   1. `background_gc_loop::GcTask::Auto` built `candidates` from `discards.keys()` (line 520), but empty extents never appear in any SST's `MetaBlock.discards` → they were never even *considered* for GC.

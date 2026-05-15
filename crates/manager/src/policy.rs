@@ -8,8 +8,8 @@ use std::collections::{HashMap, VecDeque};
 
 use autumn_common::MetadataState;
 use autumn_rpc::manager_rpc::{
-    PartitionLoad, PolicyCandidate, POLICY_KIND_COMPACT, POLICY_KIND_GC, POLICY_KIND_HOT_COLD,
-    POLICY_KIND_MERGE, POLICY_KIND_SPLIT,
+    PartitionLoad, PolicyCandidate, POLICY_KIND_EC, POLICY_KIND_GC, POLICY_KIND_HOT_COLD,
+    POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT, POLICY_KIND_SPLIT,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -39,7 +39,7 @@ pub const MERGE_COOLDOWN_SEC: i64 = 6 * 3600;
 /// enough to filter normal write churn, small enough that operators
 /// notice before disk pressure. Tunable via `PolicyConfig`.
 pub const GC_DEBT_HIGH: u64 = GIB;
-/// F187: compaction debt advisory threshold. Default 4 GiB — higher
+/// F187: major-compaction debt advisory threshold. Default 4 GiB — higher
 /// than GC because compact's pending bytes naturally accumulate to
 /// MAX_SKIP_LIST × N tables before the periodic loop fires.
 pub const COMPACT_PENDING_HIGH: u64 = 4 * GIB;
@@ -50,6 +50,19 @@ pub const COMPACT_PENDING_HIGH: u64 = 4 * GIB;
 pub const GC_COOLDOWN_SEC: i64 = 300;
 /// F187: compaction advisory cooldown.
 pub const COMPACT_COOLDOWN_SEC: i64 = 300;
+
+/// F202: minor-compaction advisory threshold. 512 MiB — minor compact
+/// is much cheaper than major (size-tiered pickup of < 32 MiB tables
+/// only), so the bar to surface as advisory is correspondingly lower.
+pub const MINOR_COMPACT_PENDING_HIGH: u64 = 512 * 1024 * 1024;
+/// F202: minor-compact advisory cooldown.
+pub const MINOR_COMPACT_COOLDOWN_SEC: i64 = 120;
+/// F202: minimum sealed-extent size to even consider EC advice. Below
+/// this, the EC encode + K+M shard write + manager state churn
+/// outweigh the (replication - K/(K+M)) × `sealed_length` saved.
+/// Aligned with the deferred PS-side `EC_MIN_EXTENT_BYTES` const in
+/// the plan; 64 MiB matches WAS lazy-EC heuristics.
+pub const EC_MIN_EXTENT_BYTES: u64 = 64 * 1024 * 1024;
 
 pub const POLICY_BUCKET_SEC: i64 = 60;
 /// F196: trimmed 30 → 10 buckets. Only `REQUIRED_BUCKETS = 5` are ever
@@ -109,6 +122,16 @@ pub struct PolicyConfig {
     pub gc_cooldown_sec: i64,
     /// F187: compact advisory cooldown (seconds since `last_compact_at`).
     pub compact_cooldown_sec: i64,
+    /// F202: minor-compact advisory threshold (bytes, sustained over
+    /// `required_buckets`).
+    pub minor_compact_pending_high: u64,
+    /// F202: minor-compact advisory cooldown (seconds since
+    /// `last_compact_at` — same field; minor and major share it
+    /// because they share the PS-side `do_compact` infrastructure).
+    pub minor_compact_cooldown_sec: i64,
+    /// F202: minimum sealed-extent size below which EC advisory is
+    /// suppressed (encode overhead would outweigh the savings).
+    pub ec_min_extent_bytes: u64,
 }
 
 impl Default for PolicyConfig {
@@ -130,6 +153,9 @@ impl Default for PolicyConfig {
             compact_pending_high: COMPACT_PENDING_HIGH,
             gc_cooldown_sec: GC_COOLDOWN_SEC,
             compact_cooldown_sec: COMPACT_COOLDOWN_SEC,
+            minor_compact_pending_high: MINOR_COMPACT_PENDING_HIGH,
+            minor_compact_cooldown_sec: MINOR_COMPACT_COOLDOWN_SEC,
+            ec_min_extent_bytes: EC_MIN_EXTENT_BYTES,
         }
     }
 }
@@ -395,7 +421,7 @@ impl PolicyEngine {
                 });
             }
 
-            // ── Compact advisory ──────────────────────────────────────
+            // ── Major-compact advisory ────────────────────────────────
             if recent.compact_inflight == 0
                 && (recent.last_compact_at == 0
                     || now - recent.last_compact_at >= cfg.compact_cooldown_sec)
@@ -404,7 +430,7 @@ impl PolicyEngine {
                 })
             {
                 out.push(PolicyCandidate {
-                    kind: POLICY_KIND_COMPACT,
+                    kind: POLICY_KIND_MAJOR_COMPACT,
                     primary_part_id: part_id,
                     secondary_part_id: 0,
                     reason: format!(
@@ -420,8 +446,113 @@ impl PolicyEngine {
                     last_op_at: recent.last_compact_at,
                 });
             }
+
+            // ── F202: Minor-compact advisory ──────────────────────────
+            // Independent from the major path: minor compact addresses
+            // size-tiered write-amp hygiene, not dead-data cleanup.
+            // Common-sense filter: only emit if the PS-side
+            // `minor_compact_pending_bytes` is non-zero (i.e.
+            // `pickup_tables` actually had something to do) so we
+            // don't spam advisories for partitions with no real work.
+            if recent.compact_inflight == 0
+                && recent.minor_compact_pending_bytes > 0
+                && (recent.last_compact_at == 0
+                    || now - recent.last_compact_at >= cfg.minor_compact_cooldown_sec)
+                && bs.iter().all(|(_, l)| {
+                    l.minor_compact_pending_bytes > cfg.minor_compact_pending_high
+                })
+            {
+                out.push(PolicyCandidate {
+                    kind: POLICY_KIND_MINOR_COMPACT,
+                    primary_part_id: part_id,
+                    secondary_part_id: 0,
+                    reason: format!(
+                        "minor_compact_pending_bytes>{} ({} MiB) sustained {}m",
+                        cfg.minor_compact_pending_high,
+                        recent.minor_compact_pending_bytes / (1024 * 1024),
+                        cfg.required_buckets * cfg.bucket_sec as usize / 60,
+                    ),
+                    size_bytes: recent.minor_compact_pending_bytes,
+                    req_per_sec: recent.req_per_sec,
+                    imm_full_per_sec: recent.imm_full_per_sec,
+                    same_ps: true,
+                    last_op_at: recent.last_compact_at,
+                });
+            }
         }
 
+        out
+    }
+
+    /// F202: EC-conversion advisory. Scans the manager state for
+    /// sealed-but-not-converted extents that exceed
+    /// `cfg.ec_min_extent_bytes`. Emits one `POLICY_KIND_EC`
+    /// candidate per such extent. Stage 2 is advisory-only.
+    ///
+    /// **Note**: this advisory's input is `MetadataState`, not the
+    /// per-partition `metrics` window — EC is per-extent, not
+    /// per-partition. `secondary_part_id` carries the extent_id;
+    /// `primary_part_id = 0` (no partition association). `size_bytes`
+    /// carries `sealed_length` so external controllers can sort by
+    /// payoff.
+    ///
+    /// Common-sense filter: small sealed extents (< 64 MiB by
+    /// default) are NOT surfaced. Below that threshold, EC overhead
+    /// (network fanout + ec_encode CPU + metadata churn) outweighs
+    /// the 3 → K/(K+M) replication savings; we'd be advising a
+    /// negative-EV operation. Operators who still want to convert
+    /// such extents can use `client set-stream-ec --stream <ID>`
+    /// which bypasses the advisory layer entirely.
+    pub fn compute_ec_advisory(
+        &self,
+        state: &MetadataState,
+        now: i64,
+    ) -> Vec<PolicyCandidate> {
+        let mut out = Vec::new();
+        let cfg = &self.config;
+        for stream in state.streams.values() {
+            if stream.ec_data_shard == 0 || stream.ec_parity_shard == 0 {
+                // Replication-only stream — no EC policy attached, so
+                // there's nothing to convert.
+                continue;
+            }
+            for &eid in &stream.extent_ids {
+                let ext = match state.extents.get(&eid) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                if ext.ec_converted {
+                    continue;
+                }
+                if ext.sealed_length == 0 {
+                    // Open or sealed-at-zero — encode has nothing to
+                    // do. Open-tail won't be EC'd until sealed; F201
+                    // GC empty-extent picks reclaims sealed-at-zero.
+                    continue;
+                }
+                if ext.sealed_length < cfg.ec_min_extent_bytes {
+                    continue;
+                }
+                out.push(PolicyCandidate {
+                    kind: POLICY_KIND_EC,
+                    primary_part_id: 0,
+                    secondary_part_id: eid,
+                    reason: format!(
+                        "stream {} ec={}+{} sealed_length={} ({} MiB) not-converted",
+                        stream.stream_id,
+                        stream.ec_data_shard,
+                        stream.ec_parity_shard,
+                        ext.sealed_length,
+                        ext.sealed_length / (1024 * 1024),
+                    ),
+                    size_bytes: ext.sealed_length,
+                    req_per_sec: 0,
+                    imm_full_per_sec: 0,
+                    same_ps: true,
+                    last_op_at: now, // EC has no per-extent cooldown stamp; this is freshness only
+                });
+            }
+        }
         out
     }
 

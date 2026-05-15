@@ -982,6 +982,53 @@ cooldown classifier puts that extent on a 30 s soft cooldown (instead
 of 5 min) so a manual retry, or the periodic GC tick, picks it up
 again as soon as the EC convert completes.
 
+#### F202 — advisory unified across 6 actionable kinds (2026-05-15)
+
+`client policy` now prints up to 7 kinds in one query:
+
+| kind | source | when it fires |
+|---|---|---|
+| `split` | `PolicyEngine::compute_candidates` | sustained size > 50 GiB, qps > 15k, or imm_full > 10/s |
+| `merge` | same | adjacent cold pair (size < 1 GiB AND qps < 1.5k each) |
+| `gc` | `compute_maintenance_advisory` | `gc_debt_bytes > 1 GiB` sustained |
+| `major` | same | `pending_compaction_bytes > 4 GiB` sustained |
+| `minor` | same (F202) | `minor_compact_pending_bytes > 512 MiB` sustained AND pickup-tables non-empty |
+| `ec` | `compute_ec_advisory` (F202) | sealed-unconverted extent on EC-policy stream, `sealed_length ≥ 64 MiB` |
+| `hotcold` | `compute_hot_cold_advisory` | ≥10× qps or size ratio between hottest/coldest partition on a PS |
+
+Common-sense filters built into the advisory layer:
+- EC: extents < 64 MiB are NOT surfaced (encode + 3-replica fanout
+  overhead would exceed the 3 → K/(K+M) replication savings).
+- Minor compact: requires `pickup_tables` to actually have work to do
+  in the most recent bucket — avoids spamming "minor compact this
+  partition" when there's nothing to compact.
+
+An external policy controller can act on this in a one-liner. Example
+cron + bash for an MVP controller:
+
+```bash
+# /etc/cron.d/autumn-policy: */5 * * * * /usr/local/bin/autumn-policy.sh
+$AC policy --json | jq -c '.[]' | while read -r cand; do
+  kind=$(echo "$cand" | jq -r .kind)
+  pid=$(echo "$cand" | jq -r .primary_part_id)
+  sec=$(echo "$cand" | jq -r .secondary_part_id)
+  size=$(echo "$cand" | jq -r .size_bytes)
+  case "$kind" in
+    ec)    [ "$size" -ge 67108864 ] && $AC set-stream-ec --stream "<resolve from $sec>" --ec 3+1 ;;
+    gc)    qps=$(curl -s prom/api/v1/query?query=fg_qps_partition\{p=\"$pid\"\} | jq -r .data.result[0].value[1])
+           [ "$qps" -lt 1000 ] && $AC gc "$pid" ;;
+    major) $AC compact "$pid" ;;
+    # split / merge / minor / hotcold left as exercise
+  esac
+done
+```
+
+Note: per-extent EC convert (`set-stream-ec --extent <EXTID>`) is a
+Stage 3 deliverable; today's controller resolves extent_id → stream_id
+via `info --json` and triggers stream-level conversion, which the
+existing manager dispatch loop will then apply to sealed-unconverted
+extents on that stream.
+
 ### Benchmarks
 
 ```bash

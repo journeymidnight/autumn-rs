@@ -761,6 +761,11 @@ pub struct MergePartitionsResp {
 }
 
 // --- ReportPartitionLoad (PS → manager periodic metrics) ---
+//
+// F202 wire change (backward-incompatible): adds 5 new fields
+// surfacing per-partition SST dead-data breakdown and minor-compact
+// debt. Same-commit upgrade required (cluster.sh stops all roles
+// before restart).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct PartitionLoad {
     pub part_id: u64,
@@ -773,7 +778,7 @@ pub struct PartitionLoad {
     pub gc_debt_bytes: u64,
     /// F187: bytes that the next compact tick would feed into `do_compact`
     /// (overlap-tagged tables when has_overlap == 1, else
-    /// pickup_tables(...)). "Compaction debt".
+    /// pickup_tables(...)). "Major-compaction debt".
     pub pending_compaction_bytes: u64,
     /// F187: 1 while `background_gc_loop` is inside `run_gc`, else 0.
     pub gc_inflight: u32,
@@ -786,6 +791,26 @@ pub struct PartitionLoad {
     /// F187: unix-epoch seconds of the last successful `do_compact`.
     /// 0 = never since process start.
     pub last_compact_at: i64,
+    /// F202: total bytes occupied by tombstone (op==2) records inside
+    /// the partition's live SSTs. Drives external controllers'
+    /// "should-major-compact" decisions; advisory-only here.
+    pub sst_tombstone_bytes: u64,
+    /// F202: total bytes occupied by SST records with `expires_at <= now`.
+    /// Dead-data driver alongside tombstones.
+    pub sst_expired_bytes: u64,
+    /// F202: total bytes of SST records whose keys fall outside the
+    /// partition's current `rg` range (only > 0 when `has_overlap == 1`,
+    /// i.e. post-split CoW-shared SSTables haven't been compacted yet).
+    pub sst_out_of_range_bytes: u64,
+    /// F202: total bytes the next *minor* compact tick would feed into
+    /// `do_compact` (size-tiered + head-extent pickup output). Distinct
+    /// from `pending_compaction_bytes` which captures the major-compact
+    /// pickup. Both can be non-zero simultaneously.
+    pub minor_compact_pending_bytes: u64,
+    /// F202: number of sealed log_stream extents currently in
+    /// `extent_ids[..len-1]` (informational; helps OP correlate
+    /// `gc_debt_bytes` against the extent population).
+    pub sealed_log_extent_count: u32,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
@@ -802,11 +827,17 @@ pub const POLICY_KIND_MERGE: u8 = 1;
 /// consecutive sliding-window buckets and the partition is outside the
 /// gc cooldown window. Stage 1 is advisory-only — no auto-trigger.
 pub const POLICY_KIND_GC: u8 = 2;
-/// F187: compaction debt advisory — partition's
+/// F187: major-compaction debt advisory — partition's
 /// `pending_compaction_bytes` exceeds the configured high-water
 /// threshold for `policy.required_buckets` consecutive buckets and
-/// outside the compact cooldown.
-pub const POLICY_KIND_COMPACT: u8 = 3;
+/// outside the compact cooldown. F202 renamed from `POLICY_KIND_COMPACT`
+/// to disambiguate against the new minor-compact advisory.
+pub const POLICY_KIND_MAJOR_COMPACT: u8 = 3;
+/// F202 compatibility alias: pre-F202 callers used `POLICY_KIND_COMPACT`.
+/// Same wire value (3). Marked `#[deprecated]` so new code prefers the
+/// `_MAJOR_COMPACT` name.
+#[deprecated(note = "use POLICY_KIND_MAJOR_COMPACT (F202 rename, same wire value)")]
+pub const POLICY_KIND_COMPACT: u8 = POLICY_KIND_MAJOR_COMPACT;
 /// F196 Stage D: hot/cold imbalance advisory. Emitted once per PS
 /// when sustained `max(req_per_sec) / min(req_per_sec) ≥ HOT_COLD_RATIO`
 /// AND hottest > `HOT_COLD_MIN_HOT_QPS`, OR the same imbalance on
@@ -815,6 +846,22 @@ pub const POLICY_KIND_COMPACT: u8 = 3;
 /// qps_cold=[…] size_ratio=N size_hot=[…] size_cold=[…]`.
 /// `same_ps = true` always (the advisory is by definition per-PS).
 pub const POLICY_KIND_HOT_COLD: u8 = 4;
+/// F202: minor-compaction debt advisory. PS-local `pickup_tables`
+/// would emit a non-empty set on the next tick and the partition's
+/// `minor_compact_pending_bytes` exceeds the configured low-water
+/// threshold over `required_buckets` consecutive buckets.
+/// `primary_part_id` = partition; `secondary_part_id = 0`;
+/// `reason` carries the byte volume.
+pub const POLICY_KIND_MINOR_COMPACT: u8 = 5;
+/// F202: EC-conversion advisory. A sealed log/row stream extent has
+/// not been EC-converted yet AND its `sealed_length` exceeds the
+/// minimum-payoff threshold (default 64 MiB — below that, EC
+/// overhead outweighs the space savings, so we don't even suggest
+/// it). `primary_part_id = 0` (EC is per-extent, not per-partition);
+/// `secondary_part_id` carries the extent_id; `size_bytes` carries
+/// `sealed_length`. Manager emits these from a direct scan of
+/// `s.streams`, NOT from PartitionLoad.
+pub const POLICY_KIND_EC: u8 = 6;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct PolicyCandidate {

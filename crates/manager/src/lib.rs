@@ -633,29 +633,42 @@ impl AutumnManager {
             // F196 Stage D: hot/cold imbalance advisory. Emits
             // PolicyCandidate(s) with kind = POLICY_KIND_HOT_COLD; they
             // ride the same advisory_cache so `client info` renders
-            // them next to SPLIT/MERGE/GC/COMPACT.
+            // them next to SPLIT/MERGE/GC/MAJOR_COMPACT/MINOR_COMPACT/EC.
             let mut hot_cold = {
                 let mut p = self.policy.borrow_mut();
                 p.compute_hot_cold_advisory(&owners, now)
             };
             cands.append(&mut hot_cold);
+            // F202: EC advisory pass. Per-extent, sourced from
+            // `state_snapshot.streams + extents`, not from the
+            // per-partition windowed metrics (EC is not a partition-
+            // level concern). Common-sense filter inside the helper
+            // suppresses extents < `cfg.ec_min_extent_bytes`.
+            let mut ec_adv = {
+                let p = self.policy.borrow();
+                p.compute_ec_advisory(&state_snapshot, now)
+            };
+            cands.append(&mut ec_adv);
             // Persist the union into the advisory cache so
-            // `MSG_GET_POLICY_CANDIDATES` returns SPLIT / MERGE / GC /
-            // COMPACT in one call.
+            // `MSG_GET_POLICY_CANDIDATES` returns all 7 kinds (split,
+            // merge, gc, major_compact, hot_cold, minor_compact, ec)
+            // in one call.
             {
                 let mut p = self.policy.borrow_mut();
                 p.advisory_cache = cands.clone();
                 p.advisory_cache_at = now;
             }
             if !cands.is_empty() {
-                tracing::info!("F183/F187 policy: {} candidate(s)", cands.len());
+                tracing::info!("F183/F187/F202 policy: {} candidate(s)", cands.len());
                 for c in &cands {
                     let kind = match c.kind {
                         POLICY_KIND_SPLIT => "SPLIT",
                         POLICY_KIND_MERGE => "MERGE",
                         autumn_rpc::manager_rpc::POLICY_KIND_GC => "GC",
-                        autumn_rpc::manager_rpc::POLICY_KIND_COMPACT => "COMPACT",
+                        autumn_rpc::manager_rpc::POLICY_KIND_MAJOR_COMPACT => "MAJOR_COMPACT",
                         autumn_rpc::manager_rpc::POLICY_KIND_HOT_COLD => "HOT_COLD",
+                        autumn_rpc::manager_rpc::POLICY_KIND_MINOR_COMPACT => "MINOR_COMPACT",
+                        autumn_rpc::manager_rpc::POLICY_KIND_EC => "EC",
                         _ => "UNKNOWN",
                     };
                     tracing::info!(

@@ -179,6 +179,7 @@ pub(crate) async fn background_compact_loop(
                         compute_pending_compaction_bytes(&part),
                         std::sync::atomic::Ordering::Relaxed,
                     );
+                    refresh_f202_metrics(&part);
                     stamp_last_compact();
                     clear_compact_inflight();
                     continue;
@@ -194,6 +195,7 @@ pub(crate) async fn background_compact_loop(
                         compute_pending_compaction_bytes(&part),
                         std::sync::atomic::Ordering::Relaxed,
                     );
+                    refresh_f202_metrics(&part);
                     stamp_last_compact();
                     clear_compact_inflight();
                     continue;
@@ -240,6 +242,7 @@ pub(crate) async fn background_compact_loop(
                     compute_pending_compaction_bytes(&part),
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                refresh_f202_metrics(&part);
                 stamp_last_compact();
                 clear_compact_inflight();
                 next_minor_delay = random_delay();
@@ -249,11 +252,15 @@ pub(crate) async fn background_compact_loop(
 
                 // F187: refresh pending_compaction_bytes every periodic
                 // tick — independent of whether we end up compacting.
+                // F202: same cadence refreshes the dead-data + minor-
+                // compact-debt gauges (`sst_expired_bytes`,
+                // `sst_out_of_range_bytes`, `minor_compact_pending_bytes`).
                 let metrics = part.borrow().metrics.clone();
                 metrics.pending_compaction_bytes.store(
                     compute_pending_compaction_bytes(&part),
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                refresh_f202_metrics(&part);
 
                 // F188: timeout branch is now metric-refresh-only.
                 // Actual compactions only fire on `compact_rx` triggers
@@ -1127,6 +1134,74 @@ pub(crate) fn compute_pending_compaction_bytes(part: &Rc<RefCell<PartitionData>>
     }
     let (compact_tbls, _) = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
     compact_tbls.iter().map(|t| t.estimated_size).sum()
+}
+
+/// F202: refresh the per-partition dead-data + minor-compact-debt
+/// gauges. Called at the same points as `compute_pending_compaction_bytes`
+/// (every compact tick) AND after flush completes (tables change).
+///
+/// Approximations:
+/// - `sst_expired_bytes`: Σ `estimated_size` for tables whose paired
+///   `SstReader.min_expires_at` is non-zero and `<= now`. Conservative
+///   upper bound (counts whole SST, not just expired entries; tightening
+///   needs an on-disk aggregate change deferred to a future stage).
+/// - `sst_out_of_range_bytes`: Σ `estimated_size` of all tables when
+///   `has_overlap == 1` (post-split CoW-shared SSTs); 0 otherwise. Same
+///   conservative shape as `pending_compaction_bytes`'s overlap branch.
+/// - `minor_compact_pending_bytes`: Σ `estimated_size` of
+///   `pickup_tables` output when `has_overlap == 0`. 0 when overlap is
+///   set (a major would run instead, accounted for in
+///   `pending_compaction_bytes`).
+/// - `sst_tombstone_bytes`: left at 0. Computing it without an SST
+///   on-disk aggregate (which would require a format bump) means
+///   scanning every block — expensive on the hot refresh path. The
+///   advisory layer treats 0 as "no signal" for this dimension.
+/// - `sealed_log_extent_count`: left at 0. The PS doesn't keep a
+///   cached log-stream extent count without an RPC; future stages
+///   can plumb this from the GC loop's `get_stream_info` call.
+pub(crate) fn refresh_f202_metrics(part: &Rc<RefCell<PartitionData>>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = crate::now_secs() as u64;
+
+    let (tbls, readers, overlap, metrics) = {
+        let p = part.borrow();
+        (
+            p.tables.clone(),
+            p.sst_readers.clone(),
+            p.has_overlap.get(),
+            p.metrics.clone(),
+        )
+    };
+
+    // `tables` and `sst_readers` are aligned by index by construction
+    // (see partition-server/CLAUDE.md programming note 7). zip is safe.
+    let sst_expired: u64 = tbls
+        .iter()
+        .zip(readers.iter())
+        .filter(|(_, r)| r.min_expires_at > 0 && r.min_expires_at <= now)
+        .map(|(t, _)| t.estimated_size)
+        .sum();
+    metrics.sst_expired_bytes.store(sst_expired, Relaxed);
+
+    let sst_oor: u64 = if overlap == 1 {
+        tbls.iter().map(|t| t.estimated_size).sum()
+    } else {
+        0
+    };
+    metrics.sst_out_of_range_bytes.store(sst_oor, Relaxed);
+
+    let minor_pending: u64 = if overlap == 0 {
+        let (picked, _) = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
+        picked.iter().map(|t| t.estimated_size).sum()
+    } else {
+        0
+    };
+    metrics
+        .minor_compact_pending_bytes
+        .store(minor_pending, Relaxed);
+
+    // sst_tombstone_bytes + sealed_log_extent_count: deferred. The
+    // advisory layer treats 0 in these dimensions as "no signal".
 }
 
 pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<TableMeta>, u64) {

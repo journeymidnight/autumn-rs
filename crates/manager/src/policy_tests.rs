@@ -4,16 +4,25 @@ use std::collections::HashMap;
 
 use autumn_common::MetadataState;
 use autumn_rpc::manager_rpc::{
-    MgrPartitionMeta, MgrRange, PartitionLoad, POLICY_KIND_COMPACT, POLICY_KIND_GC,
-    POLICY_KIND_MERGE, POLICY_KIND_SPLIT,
+    MgrExtentInfo, MgrPartitionMeta, MgrRange, MgrStreamInfo,
+    PartitionLoad, POLICY_KIND_EC, POLICY_KIND_GC, POLICY_KIND_MAJOR_COMPACT,
+    POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT, POLICY_KIND_SPLIT,
 };
 
 use crate::policy::{
-    ComputeArgs, PolicyEngine, COMPACT_COOLDOWN_SEC, COMPACT_PENDING_HIGH, GC_COOLDOWN_SEC,
-    GC_DEBT_HIGH, MERGE_COOLDOWN_SEC, MERGE_QPS_LOW, MERGE_SIZE_LOW, POLICY_BUCKET_SEC,
+    ComputeArgs, PolicyEngine, COMPACT_COOLDOWN_SEC, COMPACT_PENDING_HIGH, EC_MIN_EXTENT_BYTES,
+    GC_COOLDOWN_SEC, GC_DEBT_HIGH, MERGE_COOLDOWN_SEC, MERGE_QPS_LOW, MERGE_SIZE_LOW,
+    MINOR_COMPACT_COOLDOWN_SEC, MINOR_COMPACT_PENDING_HIGH, POLICY_BUCKET_SEC,
     POLICY_REQUIRED_BUCKETS, SPLIT_COOLDOWN_SEC, SPLIT_IMMFULL_HIGH, SPLIT_QPS_HIGH,
     SPLIT_SIZE_HARD,
 };
+
+/// F202 compatibility: the old `POLICY_KIND_COMPACT` constant maps to
+/// `POLICY_KIND_MAJOR_COMPACT` (same wire value 3). Existing tests use
+/// the major-compact path; re-export under both names to keep them
+/// compiling without churn.
+#[allow(dead_code)]
+const POLICY_KIND_COMPACT: u8 = POLICY_KIND_MAJOR_COMPACT;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -848,4 +857,197 @@ fn hot_cold_advisory_emits_policy_candidate_for_client_info() {
     assert!(c.reason.contains("ps_id=77"), "reason missing ps_id: {}", c.reason);
     assert!(c.reason.contains("qps_ratio="), "reason missing qps_ratio: {}", c.reason);
     assert!(c.same_ps, "HOT_COLD candidates are by-construction same_ps");
+}
+
+// ===========================================================================
+// F202 — minor compact + EC advisory tests
+// ===========================================================================
+
+fn mk_stream(state: &mut MetadataState, sid: u64, ec: (u32, u32), extent_ids: &[u64]) {
+    state.streams.insert(
+        sid,
+        MgrStreamInfo {
+            stream_id: sid,
+            extent_ids: extent_ids.to_vec(),
+            ec_data_shard: ec.0,
+            ec_parity_shard: ec.1,
+            replicates: 3,
+        },
+    );
+}
+
+fn mk_extent(state: &mut MetadataState, eid: u64, sealed_length: u64, ec_converted: bool) {
+    state.extents.insert(
+        eid,
+        MgrExtentInfo {
+            extent_id: eid,
+            replicates: vec![1, 3, 5],
+            parity: vec![],
+            eversion: 1,
+            refs: 1,
+            vp_table_refs: 0,
+            sealed_length,
+            avali: if sealed_length > 0 { 1 } else { 0 },
+            replicate_disks: vec![2, 4, 6],
+            parity_disks: vec![],
+            ec_converted,
+        },
+    );
+}
+
+/// F202: minor compact advisory fires when sustained
+/// `minor_compact_pending_bytes` exceeds threshold across the window.
+#[test]
+fn minor_compact_fires_when_sustained_above_threshold() {
+    let mut eng = PolicyEngine::default();
+    let now = 10_000;
+    fill_window(
+        &mut eng,
+        500,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 500,
+            minor_compact_pending_bytes: MINOR_COMPACT_PENDING_HIGH * 2,
+            ..Default::default()
+        },
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    let out = eng.compute_maintenance_advisory(now);
+    assert_eq!(out.len(), 1, "expected one MINOR_COMPACT candidate: {out:?}");
+    assert_eq!(out[0].kind, POLICY_KIND_MINOR_COMPACT);
+    assert_eq!(out[0].primary_part_id, 500);
+    assert!(
+        out[0].size_bytes >= MINOR_COMPACT_PENDING_HIGH,
+        "size_bytes carries the recent pending volume"
+    );
+}
+
+/// F202: minor compact advisory is SUPPRESSED when the latest bucket has
+/// `minor_compact_pending_bytes == 0` (i.e. `pickup_tables` had nothing
+/// to do — common-sense filter "don't suggest minor compact when there's
+/// no minor compact work").
+#[test]
+fn minor_compact_suppressed_when_latest_bucket_empty() {
+    let mut eng = PolicyEngine::default();
+    let now = 10_000;
+    // Fill the window with a HIGH-ish historic value then a 0 most-recent.
+    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    fill_window(
+        &mut eng,
+        501,
+        POLICY_REQUIRED_BUCKETS - 1,
+        PartitionLoad {
+            part_id: 501,
+            minor_compact_pending_bytes: MINOR_COMPACT_PENDING_HIGH * 2,
+            ..Default::default()
+        },
+        base,
+    );
+    // Latest bucket = 0 → filter trips at "recent.minor_compact_pending_bytes > 0".
+    eng.metrics.entry(501).or_default().push(
+        base + POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        PartitionLoad {
+            part_id: 501,
+            minor_compact_pending_bytes: 0,
+            ..Default::default()
+        },
+    );
+    let out = eng.compute_maintenance_advisory(now);
+    assert!(
+        out.iter().all(|c| c.kind != POLICY_KIND_MINOR_COMPACT),
+        "minor advisory must not fire when latest pending = 0: {out:?}"
+    );
+}
+
+/// F202: minor compact respects its own cooldown — distinct from major.
+#[test]
+fn minor_compact_respects_cooldown() {
+    let mut eng = PolicyEngine::default();
+    let now = 10_000;
+    fill_window(
+        &mut eng,
+        502,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 502,
+            minor_compact_pending_bytes: MINOR_COMPACT_PENDING_HIGH * 2,
+            // Just-completed compact → cooldown active.
+            last_compact_at: now - MINOR_COMPACT_COOLDOWN_SEC + 10,
+            ..Default::default()
+        },
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    let out = eng.compute_maintenance_advisory(now);
+    assert!(
+        out.iter().all(|c| c.kind != POLICY_KIND_MINOR_COMPACT),
+        "in cooldown — must not fire: {out:?}"
+    );
+}
+
+/// F202: EC advisory fires for sealed-unconverted extents ≥ threshold.
+#[test]
+fn ec_advisory_fires_for_large_sealed_unconverted_extent() {
+    let mut state = MetadataState::default();
+    mk_stream(&mut state, 100, (3, 1), &[1001]);
+    mk_extent(&mut state, 1001, EC_MIN_EXTENT_BYTES * 2, false);
+    let eng = PolicyEngine::default();
+    let out = eng.compute_ec_advisory(&state, 999);
+    assert_eq!(out.len(), 1, "expected one EC candidate: {out:?}");
+    let c = &out[0];
+    assert_eq!(c.kind, POLICY_KIND_EC);
+    assert_eq!(c.primary_part_id, 0, "EC is per-extent, not per-partition");
+    assert_eq!(c.secondary_part_id, 1001, "secondary carries extent_id");
+    assert_eq!(c.size_bytes, EC_MIN_EXTENT_BYTES * 2);
+}
+
+/// F202: EC advisory common-sense filter — extents below
+/// `ec_min_extent_bytes` are NOT surfaced (encode overhead > savings).
+#[test]
+fn ec_advisory_suppresses_small_extents() {
+    let mut state = MetadataState::default();
+    mk_stream(&mut state, 101, (3, 1), &[1002, 1003]);
+    // Below threshold — should not be advised.
+    mk_extent(&mut state, 1002, EC_MIN_EXTENT_BYTES / 2, false);
+    // Above threshold — should be advised.
+    mk_extent(&mut state, 1003, EC_MIN_EXTENT_BYTES + 1, false);
+    let eng = PolicyEngine::default();
+    let out = eng.compute_ec_advisory(&state, 0);
+    assert_eq!(out.len(), 1, "small extent filtered out: {out:?}");
+    assert_eq!(out[0].secondary_part_id, 1003);
+}
+
+/// F202: EC advisory skips already-converted extents.
+#[test]
+fn ec_advisory_skips_converted() {
+    let mut state = MetadataState::default();
+    mk_stream(&mut state, 102, (3, 1), &[1004]);
+    mk_extent(&mut state, 1004, EC_MIN_EXTENT_BYTES * 4, true);
+    let eng = PolicyEngine::default();
+    let out = eng.compute_ec_advisory(&state, 0);
+    assert!(out.is_empty(), "ec_converted=true should be skipped: {out:?}");
+}
+
+/// F202: EC advisory skips replication-only streams (no EC policy
+/// attached → nothing to convert toward).
+#[test]
+fn ec_advisory_skips_non_ec_streams() {
+    let mut state = MetadataState::default();
+    // ec=(0,0) → replication-only.
+    mk_stream(&mut state, 103, (0, 0), &[1005]);
+    mk_extent(&mut state, 1005, EC_MIN_EXTENT_BYTES * 4, false);
+    let eng = PolicyEngine::default();
+    let out = eng.compute_ec_advisory(&state, 0);
+    assert!(out.is_empty(), "non-EC stream should not be advised: {out:?}");
+}
+
+/// F202: EC advisory skips sealed_length=0 extents (open OR
+/// sealed-at-zero — both are GC empty-extent territory, not EC).
+#[test]
+fn ec_advisory_skips_empty_extents() {
+    let mut state = MetadataState::default();
+    mk_stream(&mut state, 104, (3, 1), &[1006]);
+    mk_extent(&mut state, 1006, 0, false);
+    let eng = PolicyEngine::default();
+    let out = eng.compute_ec_advisory(&state, 0);
+    assert!(out.is_empty(), "sealed_length=0 should be skipped: {out:?}");
 }

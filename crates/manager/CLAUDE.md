@@ -581,13 +581,46 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     default 300 s), and skips a partition when its corresponding
     `*_inflight` flag is 1.
 
-    Emits `POLICY_KIND_GC` (= 2) / `POLICY_KIND_COMPACT` (= 3)
+    Emits `POLICY_KIND_GC` (= 2) / `POLICY_KIND_MAJOR_COMPACT` (= 3,
+    renamed from `POLICY_KIND_COMPACT` in F202 with #[deprecated] alias)
     candidates appended to the same `advisory_cache` returned by
     `MSG_GET_POLICY_CANDIDATES`. `policy_tick_loop` (lib.rs ~520) calls
     `compute_maintenance_advisory(now)` after `compute_candidates(...)`
     each tick, then OVERWRITES `advisory_cache` with the union — so the
-    cache always carries the freshest 4-kind set. The handler at
+    cache always carries the freshest 7-kind set (after F202:
+    split / merge / gc / major / minor / ec / hotcold). The handler at
     `rpc_handlers.rs:2327` reads the cache untouched.
+
+    **F202 — extended to 6 actionable advisory kinds + filters.**
+    Stage 2 of the mechanism/policy separation refactor (plan
+    `~/.claude/plans/elegant-tumbling-pumpkin.md`). Adds:
+
+    - `POLICY_KIND_MINOR_COMPACT = 5`: third arm inside
+      `compute_maintenance_advisory`. Gated by sustained
+      `minor_compact_pending_bytes > MINOR_COMPACT_PENDING_HIGH`
+      (default 512 MiB) AND non-empty pickup_tables in the latest
+      bucket (common-sense filter) AND outside
+      `minor_compact_cooldown_sec` (default 120 s — shorter than
+      major because minor is cheaper).
+    - `POLICY_KIND_EC = 6`: new `compute_ec_advisory(state, now)`.
+      Iterates `state.streams + state.extents` directly (EC is
+      per-extent, not bucketed). Filters: stream has EC policy
+      (`ec_data_shard > 0`), extent is sealed, not converted,
+      `sealed_length >= ec_min_extent_bytes` (default 64 MiB —
+      common-sense filter against negative-EV EC conversions on
+      small extents — below threshold the encode + K+M shard
+      fanout + metadata churn outweighs the
+      3 → K/(K+M) replication savings).
+    - `PartitionLoad` extended with 5 fields:
+      `sst_tombstone_bytes / sst_expired_bytes /
+      sst_out_of_range_bytes / minor_compact_pending_bytes /
+      sealed_log_extent_count`. PS-side `refresh_f202_metrics`
+      populates the first 4 (the 5th left at 0 for Stage 2 —
+      needs a PS-cached `get_stream_info` result). The advisory
+      layer treats 0 in any dimension as "no signal".
+    - `PolicyConfig` extended with `minor_compact_pending_high /
+      minor_compact_cooldown_sec / ec_min_extent_bytes`, all
+      runtime-tunable via `set_policy_config`.
 
     **Stage 1 only** — advisory is purely informational. `last_op_at`
     and `auto_dispatch_*` paths are NOT touched (those would be Stage

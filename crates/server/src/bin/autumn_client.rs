@@ -1731,19 +1731,24 @@ async fn main() -> Result<()> {
                         autumn_rpc::manager_rpc::POLICY_KIND_SPLIT => "split",
                         autumn_rpc::manager_rpc::POLICY_KIND_MERGE => "merge",
                         autumn_rpc::manager_rpc::POLICY_KIND_GC => "gc",
-                        autumn_rpc::manager_rpc::POLICY_KIND_COMPACT => "compact",
+                        autumn_rpc::manager_rpc::POLICY_KIND_MAJOR_COMPACT => "major",
                         autumn_rpc::manager_rpc::POLICY_KIND_HOT_COLD => "hotcold",
+                        // F202 additions
+                        autumn_rpc::manager_rpc::POLICY_KIND_MINOR_COMPACT => "minor",
+                        autumn_rpc::manager_rpc::POLICY_KIND_EC => "ec",
                         _ => "?",
                     };
-                    // F187: GC/COMPACT advisories aren't bound by `same_ps`
-                    // — they're always per-partition and locally feasible.
-                    // F196: HOT_COLD is by-construction per-PS, always
-                    // feasible from the operator's view.
-                    // Render `feas` as "n/a" for them so operators don't
-                    // misread the column.
+                    // F187/F202: GC/COMPACT/EC advisories aren't bound by
+                    // `same_ps` — they're always per-partition (or
+                    // per-extent for EC) and locally feasible. F196:
+                    // HOT_COLD is by-construction per-PS, always feasible
+                    // from the operator's view. Render `feas` as "n/a"
+                    // for them so operators don't misread the column.
                     let feas = match c.kind {
                         autumn_rpc::manager_rpc::POLICY_KIND_GC
-                        | autumn_rpc::manager_rpc::POLICY_KIND_COMPACT
+                        | autumn_rpc::manager_rpc::POLICY_KIND_MAJOR_COMPACT
+                        | autumn_rpc::manager_rpc::POLICY_KIND_MINOR_COMPACT
+                        | autumn_rpc::manager_rpc::POLICY_KIND_EC
                         | autumn_rpc::manager_rpc::POLICY_KIND_HOT_COLD => "n/a",
                         _ if c.same_ps => "yes",
                         _ => "no",

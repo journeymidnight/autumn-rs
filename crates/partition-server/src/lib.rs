@@ -773,6 +773,23 @@ pub struct PartitionMetrics {
     /// commit. 0 if never run since process start. Used for compact
     /// cooldown.
     pub last_compact_at: std::sync::atomic::AtomicI64,
+    /// F202: Σ bytes occupied by tombstone (op==2) records inside the
+    /// partition's live SSTs. Refreshed after every flush + compact
+    /// commit. Drives external controller's "should major compact"
+    /// decisions; advisory-only here.
+    pub sst_tombstone_bytes: std::sync::atomic::AtomicU64,
+    /// F202: Σ bytes of SST records whose `expires_at` has passed.
+    pub sst_expired_bytes: std::sync::atomic::AtomicU64,
+    /// F202: Σ bytes of SST records whose keys fall outside the
+    /// partition's current `rg` range. Only > 0 while `has_overlap == 1`.
+    pub sst_out_of_range_bytes: std::sync::atomic::AtomicU64,
+    /// F202: bytes the next *minor* compact tick's `pickup_tables`
+    /// would feed into `do_compact`. Distinct from
+    /// `pending_compaction_bytes` (major). Both can be non-zero
+    /// simultaneously.
+    pub minor_compact_pending_bytes: std::sync::atomic::AtomicU64,
+    /// F202: count of sealed log_stream extents (informational).
+    pub sealed_log_extent_count: std::sync::atomic::AtomicU32,
 }
 
 impl PartitionData {
@@ -2317,6 +2334,17 @@ impl PartitionServer {
                         let compact_inflight = handle.metrics.compact_inflight.load(Relaxed);
                         let last_gc_at = handle.metrics.last_gc_at.load(Relaxed);
                         let last_compact_at = handle.metrics.last_compact_at.load(Relaxed);
+                        // F202: dead-data + minor-compact debt + sealed-extent count.
+                        let sst_tombstone_bytes =
+                            handle.metrics.sst_tombstone_bytes.load(Relaxed);
+                        let sst_expired_bytes =
+                            handle.metrics.sst_expired_bytes.load(Relaxed);
+                        let sst_out_of_range_bytes =
+                            handle.metrics.sst_out_of_range_bytes.load(Relaxed);
+                        let minor_compact_pending_bytes =
+                            handle.metrics.minor_compact_pending_bytes.load(Relaxed);
+                        let sealed_log_extent_count =
+                            handle.metrics.sealed_log_extent_count.load(Relaxed);
                         manager_rpc::PartitionLoad {
                             part_id: *part_id,
                             size_bytes,
@@ -2329,6 +2357,11 @@ impl PartitionServer {
                             compact_inflight,
                             last_gc_at,
                             last_compact_at,
+                            sst_tombstone_bytes,
+                            sst_expired_bytes,
+                            sst_out_of_range_bytes,
+                            minor_compact_pending_bytes,
+                            sealed_log_extent_count,
                         }
                     })
                     .collect()
@@ -5249,6 +5282,10 @@ pub(crate) async fn commit_flush_outcome(
     // stream_client.append mpsc-send inside save_table_locs_raw.
     save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, vp_eid, vp_off).await?;
     sync_partition_vp_refs(part).await?;
+    // F202: tables changed (new SST committed) → refresh the
+    // advisory-input metrics so the next report_load_loop tick carries
+    // accurate dead-data / minor-compact-pending volumes.
+    crate::background::refresh_f202_metrics(part);
     Ok(())
 }
 
