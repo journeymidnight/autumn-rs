@@ -1394,6 +1394,61 @@ Cleared by audit (no fix needed):
 - **Files:** `feature_list.md`, `claude-progress.txt`. (No code changes.)
 - **passes:** true (audit-cleared)
 
+### F210 · 4-layer distributed-systems review backlog (post-codex)
+- **Trigger:** 2026-05-15 multi-agent layered review (codex × 3 layers + general-purpose × stream layer). 26 findings across 8 themes (A–H). Lands one theme at a time; each sub-feature is its own commit. F210-A first (most cross-cutting), then by priority.
+- **Scope:** open backlog. Sub-features status updated as each lands. Cross-reference: ~/.claude/plans/pure-crafting-comet.md (review-time plan).
+
+#### F210-A · Etcd-first + verify-BEFORE + replay-then-leader (architecture)
+- **A1** apply paths violate etcd-first (4 sites: `handle_stream_punch_holes`, `handle_truncate`, `apply_recovery_done`, `apply_ec_conversion_done`). In-mem mutation lands BEFORE the etcd txn — fence-break leaves durable state behind in-memory state. Refactor pattern: `borrow_pre → drop → etcd_txn → borrow_post → apply`.
+- **A2** verify-at-apply lands AFTER etcd commit (5 sites: `stream_alloc_extent`, `split`, `merge`, `sync_partition_vp_refs` — plus `force_ec_convert` already done in F209-D). Client sees `Precondition` but etcd already durable → linearization unexplainable. All 5 → verify-BEFORE-acquire/mirror pattern. F209-D shape is the template.
+- **A3** `set_leader(true)` at `lib.rs:987` is BEFORE `replay_from_etcd()` at `:988`. Handlers can run with stale in-mem state during replay. Swap to replay-then-set-leader; consider starting `leader_keepalive_loop` between CAS and replay so long replays don't lose the lease.
+- **passes:** false
+
+#### F210-B · Write/Read quorum protocol asymmetry (stream layer)
+- **B1+B2** Write fanout is N-of-N (`client.rs:692-815 apply_completion` breaks on any error), read commit_length is majority, manager seal sets `min_size=1` (rpc_handlers.rs:683, 890). Three different quorum definitions in three places. Pick one (likely N-of-N write + N-of-N fsync-wait, slow-replica catches up via re_avali; or majority everywhere) and align.
+- **B3** EN reserves `entry.len = total_end` before pwrite+fsync (`extent_node.rs:1359`), `handle_commit_length` returns the reservation (`:3197`). Cross-RPC peer (EC convert peer-copy gap fill) sees in-memory reservation higher than what's on disk. Fix the visibility (only expose post-fsync len, or distinct counters).
+- **passes:** false
+
+#### F210-C · Write-pipeline atomicity (partition layer)
+- **C1** WAL replay uses `sst_max_seq` to dedupe (lib.rs:3923, background.rs:871, lib.rs:4618). With concurrent in-flight Phase3 inserts in seq-out-of-order, an acked low-seq batch missing from SST is silently skipped on replay → ack'd-write loss. Fix: per-key bitmap / internal-key set in checkpoint, or per-WAL-extent-offset high-water-mark.
+- **C2** `handle_split_part` (rpc_handlers.rs:438, 446, 456; background.rs:1011) does flush but no freeze-drain — in-flight WAL append can land bytes past seal_length → invisible on recovery. Reuse merge freeze (F185).
+- **C3** Merge freeze drain returns OK on flush failure (lib.rs:3860, 3864, 3869). Manager proceeds to merge; unflushed data → merged away. Return `CODE_UNAVAILABLE` + rollback freeze.
+- **C4** SST checkpoint + `sync_partition_vp_refs` not atomic (lib.rs:5094-5095; manager rpc_handlers.rs:1191). SST published → VP-referenced; sync fails → manager `vp_table_refs` stale → `punch_holes` deletes VP extent. Either tx-bundle in manager, or block GC until sync succeeds.
+- **passes:** false
+
+#### F210-D · EN-side cross-op mutex gaps
+- **D1** `handle_delete_extent` (`extent_node.rs:3486-3501`) checks `recovery_inflight` only — does not guard `ec_conversion_locks` or in-flight `handle_re_avali`. Convert↔delete race exists post-failover. Symmetric `try_lock(ec_conversion_locks[id])` + refuse with `Precondition` on contention.
+- **D2** `remove_extent_files` (`extent_node.rs:157-172`) does not unlink `.ec.dat`. Orphan reconcile (`:1677`) only scans `self.extents`. Fix unlinks + reconcile must scan `.ec.dat` filenames.
+- **D3** `dispatch_recovery_task` (recovery.rs:72) sends `EXT_MSG_REQUIRE_RECOVERY` BEFORE `acquire_extent_inflight` (`:100`). If acquire fails, EN already running with no manager ledger. Move acquire before RPC.
+- **passes:** false
+
+#### F210-E · Resource amplification / tail latency
+- **E1** `handle_re_avali` replicated path (`extent_node.rs:3548-3666`) has no concurrency permit, allocates `sealed_length`-sized Vec per peer attempt (F206 only fixed EC path). Add `acquire_recovery()` permit at top of replicated branch.
+- **E2** Bloom FPR accumulates linearly; 100 SST → ~63% false-positive (rpc_handlers.rs:151, background.rs:2311). Cap L0/SST count, or partition-level secondary index.
+- **E3** `compute_ec_advisory` (policy.rs:506) has no per-tick cap. 10K backlog inflates advisory cache + RPC payload. Sort by sealed_length desc + clamp at e.g. 256.
+- **passes:** false
+
+#### F210-F · Policy / advisory protocol stability
+- **F1** Policy kind wire enum (manager_rpc.rs:835) is `SPLIT=0..EC=6`; CLAUDE.md note 18 says `1..7`. Python controller harcoded against docs → all kinds off-by-one. Fix: freeze enum docs, manager exposes a const-dump RPC, controller imports.
+- **F2** "Sustained N buckets" actually counts reports not seconds (rpc_handlers.rs:2369, policy.rs:168). 30s reports × 5 buckets = 150s, not the 5 min advertised. Aggregate by `bucket_sec`, or document honestly.
+- **F3** Metrics have no freshness / ownership check (policy.rs:217, 386). Post-split / merge / PS-evict, stale metrics still drive advisory.
+- **F4** Hot/cold uses partition-window min/max, then PS-wide max/min (policy.rs:609, 628). Rotating hotspots register as both hot AND cold. Add "same partition sustained-N-buckets in hot OR cold band" condition.
+- **F5** `PolicyConfig.window_buckets` (policy.rs:112) exists but `push` hardcodes `POLICY_WINDOW_BUCKETS` (:169) — config field is dead.
+- **F6** `MSG_GET_POLICY_CANDIDATES` has no leader gate (rpc_handlers.rs:2356). F209-A sister bug; same fix.
+- **passes:** false
+
+#### F210-G · Replay completeness
+- **G1** PS eviction (`ps_liveness_check_loop` lib.rs:1407): only deletes from memory; `mirror_partition_snapshot` (`:2178-2200`) doesn't `delete psNodes/<id>`. Failover replay resurrects the evicted PS. `ps_last_heartbeat` not persisted → after replay the resurrected PS becomes永远 unevictable (`None => false` at `:1389-1391`). Fix: explicit delete in mirror; persist `ps_last_heartbeat` to etcd (or accept that liveness check uses an absent-key probe).
+- **G2** `extent_delete_loop` (extent_delete.rs:149) gives up after 60 attempts (~2 min), depends on node-restart `MSG_RECONCILE_EXTENTS`. Bridge that to an etcd-persisted "failed-delete" prefix that the manager periodically retries (with backoff).
+- **passes:** false
+
+#### F210-H · Wire / sentinel completeness
+- **H1** Replicated `handle_read_bytes` (extent_node.rs:3108-3128) returns short payload silently when `offset > total_len`. F204 sentinel only on EC path. Operations grepping `stale_vp_offset_past_sealed_length:` miss replicated cases. Mirror the sentinel.
+- **H2** `handle_commit_length` (extent_node.rs:3165) skips fence check when `req.revision == 0`. F119-C-style loophole. Drop the `> 0` guard.
+- **passes:** false
+
+---
+
 ### F209 · F202–F208 review-driven hardening (5 fixes in one batch)
 - **Trigger:** post-F208 code review of F202–F207 (2026-05-15). Five issues identified; user agreed to all five. Landed as one feature with sub-letters A–E so the rationale stays bundled.
 

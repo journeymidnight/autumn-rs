@@ -1019,29 +1019,27 @@ impl AutumnManager {
             stream_after
         };
 
-        if let Err(err) = self
-            .mirror_stream_alloc_extent(&stream_after, &tail, &new_extent)
-            .await
+        // F210-A2 verify-BEFORE-mirror (replaces the pre-F210-A2 F146
+        // verify-AFTER-mirror form). If a concurrent mutator
+        // (recovery_done, ec_conversion_done, punch_holes, truncate,
+        // split) bumped `tail.eversion` during our commit_length /
+        // alloc_extent_on_node await window above, the etcd write we
+        // would otherwise make is stale relative to live memory.
+        //
+        // Pre-F210-A2 the check ran AFTER the etcd mirror — when verify
+        // failed, the client got `Precondition` but etcd had already
+        // durable-committed the stale write. Failover replay then
+        // re-loaded the stale write as if successful, while the client
+        // believed the call failed. Linearization point unexplainable.
+        //
+        // Verify-BEFORE keeps both etcd and in-memory untouched on the
+        // failure path. A narrow residual window remains (concurrent
+        // mutation during the etcd mirror RTT itself); fully closing it
+        // requires acquiring an exclusive ledger marker for the
+        // alloc_extent op, which is filed as F210-A1-followup (PS-layer
+        // ops currently don't enroll in the F207 ledger by design).
         {
-            return Ok(rkyv_encode(&StreamAllocExtentResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-                stream_info: None,
-                last_ex_info: None,
-            }));
-        }
-
-        {
-            let mut s = self.store.inner.borrow_mut();
-            // F146: verify the captured tail's eversion is still current.
-            // If a concurrent mutator (recovery_done, ec_conversion_done,
-            // punch_holes, truncate, or split) bumped it during the
-            // commit_length / alloc_extent_on_node / etcd-mirror await
-            // window above, the etcd write we just made is stale relative
-            // to live memory. Refuse to stomp live state; client retries
-            // with a fresh snapshot. The orphan stale etcd revision is
-            // benign — failover replay reads the latest revision per key,
-            // which the successful retry will produce.
+            let s = self.store.inner.borrow();
             let live_eversion = match s.extents.get(&tail.extent_id) {
                 Some(ex) => ex.eversion,
                 None => {
@@ -1070,6 +1068,22 @@ impl AutumnManager {
                     last_ex_info: None,
                 }));
             }
+        }
+
+        if let Err(err) = self
+            .mirror_stream_alloc_extent(&stream_after, &tail, &new_extent)
+            .await
+        {
+            return Ok(rkyv_encode(&StreamAllocExtentResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                stream_info: None,
+                last_ex_info: None,
+            }));
+        }
+
+        {
+            let mut s = self.store.inner.borrow_mut();
             if let Some(st) = s.streams.get_mut(&req.stream_id) {
                 *st = stream_after.clone();
             }
@@ -1580,6 +1594,31 @@ impl AutumnManager {
 
         match out {
             Ok((new_streams, modified_extents, left, right, right_snapshot, pre_bump_eversion)) => {
+                // F210-A2 verify-BEFORE-mirror (was verify-after-mirror at
+                // Phase 3 in the F146 form). If any source-stream extent's
+                // eversion drifted during the Phase-1 awaits, the etcd txn
+                // we'd otherwise send is computed from a stale base —
+                // refuse before committing to etcd. Pre-F210-A2 we caught
+                // this AFTER the etcd commit, leaving etcd durable but
+                // returning `Precondition` to the client (replay would
+                // load the stale write as if successful).
+                {
+                    let s = self.store.inner.borrow();
+                    for (eid, expected) in &pre_bump_eversion {
+                        if let Some(live) = s.extents.get(eid).map(|ex| ex.eversion) {
+                            if live != *expected {
+                                return Ok(rkyv_encode(&CodeResp {
+                                    code: CODE_PRECONDITION,
+                                    message: format!(
+                                        "extent {eid} eversion drift during split \
+                                         ({expected} -> {live}); retry split"
+                                    ),
+                                }));
+                            }
+                        }
+                    }
+                }
+
                 // Phase 2: Persist ALL mutations to etcd in ONE atomic txn
                 // (F124: partitions + regions are included here, not in a
                 // separate txn, to prevent orphan streams on crash.)
@@ -1635,27 +1674,12 @@ impl AutumnManager {
                         .map_err(|e| Self::err_to_status(&e))?;
                 }
 
-                // Phase 3: Apply to in-memory store AFTER etcd success
+                // Phase 3: Apply to in-memory store AFTER etcd success.
+                // F210-A2: verify moved up before the Phase-2 mirror; here
+                // we only apply (no verify).
                 {
                     let mut s = self.store.inner.borrow_mut();
-                    // F146: verify no source-stream extent's eversion drifted
-                    // during Phase-2's etcd await. apply_split_mutations would
-                    // overwrite the live state with the Phase-1 captured
-                    // snapshot otherwise — losing a concurrent recovery_done's
-                    // slot replacement or EC conversion's replicates rewrite.
-                    for (eid, expected) in &pre_bump_eversion {
-                        if let Some(live) = s.extents.get(eid).map(|ex| ex.eversion) {
-                            if live != *expected {
-                                return Ok(rkyv_encode(&CodeResp {
-                                    code: CODE_PRECONDITION,
-                                    message: format!(
-                                        "extent {eid} eversion drift during split \
-                                         ({expected} -> {live}); retry split"
-                                    ),
-                                }));
-                            }
-                        }
-                    }
+                    let _ = pre_bump_eversion; // captured for the verify-BEFORE block above
                     let left_id = left.part_id;
                     let right_id = right.part_id;
                     Self::apply_split_mutations(
@@ -1967,6 +1991,29 @@ impl AutumnManager {
             e_new.replicate_disks = final_disk_ids;
         }
 
+        // F210-A2 verify-BEFORE-mirror (was verify-after-mirror at
+        // Phase 3 in the F183/F185 form). If any source-stream extent's
+        // eversion drifted during Phase 1.5 awaits (alloc_extent_on_node
+        // for E_new across each replica node), the etcd txn we'd send
+        // is computed from a stale base. Refuse before committing.
+        {
+            let s = self.store.inner.borrow();
+            for (eid, expected) in &p1.pre_bump_eversion {
+                if let Some(live) = s.extents.get(eid).map(|ex| ex.eversion) {
+                    if live != *expected {
+                        return Ok(rkyv_encode(&MultiModifyMergeResp {
+                            code: CODE_PRECONDITION,
+                            message: format!(
+                                "extent {eid} eversion drift during merge \
+                                 ({expected} -> {live}); retry merge"
+                            ),
+                            new_log_tail_extent_id: 0,
+                        }));
+                    }
+                }
+            }
+        }
+
         // Phase 2: single fenced etcd txn.
         if let Some(etcd) = &self.etcd {
             let now = Self::epoch_seconds();
@@ -2015,23 +2062,10 @@ impl AutumnManager {
                 .map_err(|e| Self::err_to_status(&e))?;
         }
 
-        // Phase 3: in-memory apply with verify-at-apply.
+        // Phase 3: in-memory apply. F210-A2: verify moved up before the
+        // Phase-2 mirror; here we only apply.
         {
             let mut s = self.store.inner.borrow_mut();
-            for (eid, expected) in &p1.pre_bump_eversion {
-                if let Some(live) = s.extents.get(eid).map(|ex| ex.eversion) {
-                    if live != *expected {
-                        return Ok(rkyv_encode(&MultiModifyMergeResp {
-                            code: CODE_PRECONDITION,
-                            message: format!(
-                                "extent {eid} eversion drift during merge \
-                                 ({expected} -> {live}); retry merge"
-                            ),
-                            new_log_tail_extent_id: 0,
-                        }));
-                    }
-                }
-            }
             Self::apply_merge_mutations(
                 &mut s,
                 &p1.new_streams,
@@ -3039,6 +3073,30 @@ impl AutumnManager {
                 .collect();
             (puts, evs)
         };
+
+        // F210-A2 verify-BEFORE-mirror (replaces the post-F147-A
+        // verify-after-mirror form). If any touched extent's eversion
+        // drifted between the snapshot above and now, the etcd write
+        // we'd otherwise make is computed from a stale base; refuse
+        // before committing to etcd.
+        {
+            let s = self.store.inner.borrow();
+            for (&extent_id, &pre_ev) in &pre_eversion {
+                if let Some(live) = s.extents.get(&extent_id) {
+                    if live.eversion != pre_ev {
+                        return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
+                            code: CODE_PRECONDITION,
+                            message: format!(
+                                "extent {extent_id} eversion changed ({pre_ev} → {}) \
+                                 during vp_refs build; PS must retry",
+                                live.eversion
+                            ),
+                        }));
+                    }
+                }
+            }
+        }
+
         if let Err(err) = self.mirror_partition_vp_refs(&snapshot, &extent_puts).await {
             return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
                 code: Self::err_to_code(&err),
@@ -3047,25 +3105,6 @@ impl AutumnManager {
         }
         {
             let mut s = self.store.inner.borrow_mut();
-            // F147-A: verify-at-apply — if any touched extent's eversion drifted
-            // during the etcd await, another mutator ran concurrently and our
-            // pre-await blobs would overwrite its fresher data in etcd. Refuse
-            // and let the PS retry; the stale etcd entry from mirror_partition_vp_refs
-            // is benign (failover replay will see the retry's fresher write).
-            for (&extent_id, &pre_ev) in &pre_eversion {
-                if let Some(live) = s.extents.get(&extent_id) {
-                    if live.eversion != pre_ev {
-                        return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
-                            code: CODE_PRECONDITION,
-                            message: format!(
-                                "extent {extent_id} eversion changed ({pre_ev} → {}) \
-                                 during vp_refs mirror; PS must retry",
-                                live.eversion
-                            ),
-                        }));
-                    }
-                }
-            }
             Self::apply_partition_vp_refs(&mut s, snapshot);
         }
         Ok(rkyv_encode(&SyncPartitionVpRefsResp {

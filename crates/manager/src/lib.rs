@@ -984,11 +984,31 @@ impl AutumnManager {
             return Ok(false);
         }
 
-        self.set_leader(true);
+        // F210-A3: replay_from_etcd BEFORE set_leader(true). Pre-F210-A3,
+        // set_leader(true) ran first; during the (typically short) replay
+        // window any concurrent mutating RPC saw leader=true but the
+        // in-memory store was still empty / being repopulated, and could
+        // compute mutations against a stale base, durably mirroring them
+        // to etcd via the F149 fence (which only checks instance_id, not
+        // "post-replay"). Replay then re-overwrote in-memory with the
+        // (now-corrupted) etcd state.
+        //
+        // After F210-A3: ensure_leader() (= self.leader.get()) returns
+        // false during replay; mutating handlers reject with
+        // CODE_NOT_LEADER; client retries land after replay completes and
+        // the handler runs with a fully-rebuilt store.
+        //
+        // Lease TTL is 10 s. Typical replay is sub-second; if etcd is so
+        // big replay exceeds 10 s, the lease expires before set_leader
+        // and the next mutating RPC's F149 fence flips us back to
+        // non-leader — the election loop retries. The deeper fix (start
+        // keepalive between CAS and replay so the lease stays alive
+        // through arbitrarily long replays) is filed as a P3 follow-up
+        // — it needs a stop-signal to revoke the lease on replay error.
         if let Err(err) = self.replay_from_etcd().await {
-            self.set_leader(false);
             return Err(err);
         }
+        self.set_leader(true);
 
         let mgr = self.clone();
         compio::runtime::spawn(async move {
