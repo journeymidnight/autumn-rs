@@ -958,7 +958,7 @@ impl AutumnManager {
     /// extent that has been deleted or that has incompatible state (e.g.,
     /// already EC-converted) — best-effort cleanup so the next tick's
     /// candidate set shrinks. Idempotent.
-    pub(crate) async fn drain_extent_inflight_marker(&self, extent_id: u64) -> Result<(), AppError> {
+    async fn drain_extent_inflight_marker(&self, extent_id: u64) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             let del_op = self.build_extent_inflight_release_op(extent_id);
             // Use `put_and_delete_txn` (one-element delete list) so the F149

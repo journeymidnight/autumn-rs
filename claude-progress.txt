@@ -42,8 +42,8 @@ F209 sub-features:
       (expect 2/3 released, ConvertToEc survives). New
       f209_c_sweep_excludes_convert_to_ec_from_auto_release.
 
-  F209-D `handle_force_ec_convert` verify-at-apply (F146 pattern)
-    - crates/manager/src/rpc_handlers.rs:2545-2625
+  F209-D `handle_force_ec_convert` verify-BEFORE-acquire
+    - crates/manager/src/rpc_handlers.rs:2545-2640
     - Bug: new_eversion captured from a clone taken BEFORE the
       alloc_extent_on_node awaits + the acquire_extent_inflight await.
       During those awaits, a concurrent apply_recovery_done for the
@@ -51,11 +51,18 @@ F209 sub-features:
       it), bumping ex.eversion. The dispatch loop's
       apply_ec_conversion_done would then write the stale new_eversion
       to etcd, silently undoing the recovery.
-    - Fix: capture pre_eversion at the snapshot, after
-      acquire_extent_inflight returns OK re-read ex.eversion; on
-      mismatch (or extent vanished) call drain_extent_inflight_marker
-      to release the marker + return CODE_PRECONDITION.
-    - drain_extent_inflight_marker bumped from private to pub(crate).
+    - Initial form (committed in 444ede0): verify-AFTER-acquire with
+      drain-on-mismatch. Codex review flagged: if
+      drain_extent_inflight_marker fails (NotLeader or transient etcd
+      error), the stale marker persists in etcd and the dispatch
+      loop applies the stale state — the bug F209-D was meant to
+      prevent.
+    - Revised form: verify-BEFORE-acquire. Re-read ex.eversion under
+      a fresh borrow before acquire_extent_inflight. If different,
+      return Precondition WITHOUT writing a marker. No drain needed.
+      After our acquire succeeds, F207's exclusive CAS + other
+      mutators' refuse-at-start guarantees ex.eversion is frozen
+      until our apply runs.
 
   F209-E F207 apply-done atomicity integration test
     - crates/manager/tests/f209_apply_done_atomicity.rs (#[ignore])

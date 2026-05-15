@@ -2542,22 +2542,69 @@ impl AutumnManager {
         }
         target_nodes.truncate(total_shards);
 
-        // F209-D verify-at-apply: capture `pre_eversion` from the L2436
-        // snapshot. Between that snapshot and the `acquire_extent_inflight`
-        // below there are N `alloc_extent_on_node` awaits — during them an
-        // `apply_recovery_done` for this extent could complete (acquiring +
-        // releasing its own Recovery marker, since no ConvertToEc marker
-        // exists yet to block it via F207's exclusive ledger CAS) and bump
-        // `ex.eversion` + rewrite `ex.replicates`. If we don't verify, the
-        // marker we acquire below carries a stale `new_eversion = ex.eversion
-        // + 1`, and the dispatch loop's `apply_ec_conversion_done` would
-        // later unconditionally write that stale eversion to etcd, reverting
-        // the recovery's eversion bump and silently undoing the slot
-        // replacement. Same race F146 closed for `handle_stream_alloc_extent`
-        // and `handle_multi_modify_split`.
+        // F209-D verify-BEFORE-acquire (revised after codex review of
+        // F209-D's initial verify-AFTER-acquire form). The race we close:
+        // between the L2436 snapshot and our `acquire_extent_inflight`
+        // call below there are N `alloc_extent_on_node` awaits — during
+        // them an `apply_recovery_done` for this extent can complete
+        // (Recovery marker present at snapshot time would have been
+        // caught by L2416's `extent_inflight_op` probe; the race is for
+        // a Recovery that started after L2416 finished and completed
+        // during alloc await). Recovery bumps `ex.eversion` + rewrites
+        // `ex.replicates`. If we proceeded to acquire with our stale
+        // snapshot's `ex.eversion + 1`, the dispatch loop would later
+        // run `apply_ec_conversion_done` with that stale `new_eversion`
+        // and overwrite recovery's slot change.
+        //
+        // **Why verify-before, not verify-after:** an initial F209-D
+        // form did verify-after-acquire + drain-on-mismatch. Codex
+        // review flagged: if `drain_extent_inflight_marker` fails
+        // (NotLeader during the drain await, or transient etcd error),
+        // the stale marker stays in etcd. The dispatch loop's next
+        // 5 s tick (or a successor leader's replay) then runs
+        // `apply_ec_conversion_done` with the stale `new_eversion` —
+        // exactly the corruption the check was supposed to prevent.
+        //
+        // Verify-before sidesteps the problem entirely: no marker is
+        // ever written if the state has drifted, so no drain is needed.
+        // After our `acquire_extent_inflight` succeeds, `ex.eversion`
+        // is frozen until our `apply_ec_conversion_done` runs —
+        // every other mutator (apply_recovery_done, handle_*_punch_holes,
+        // handle_truncate, handle_multi_modify_split / merge,
+        // handle_sync_partition_vp_refs, handle_stream_alloc_extent)
+        // checks `extent_inflight_op` and refuses on ConvertToEc.
+        // Recovery cannot even start (its `acquire_extent_inflight` CAS
+        // would fail against our marker). So no verify-after is needed.
         let pre_eversion = ex.eversion;
+        let live_eversion = self
+            .store
+            .inner
+            .borrow()
+            .extents
+            .get(&extent_id)
+            .map(|e| e.eversion);
+        let live_eversion = match live_eversion {
+            Some(v) => v,
+            None => {
+                return Ok(rkyv_encode(&ForceEcConvertResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "extent {extent_id} removed during force-ec-convert (concurrent gc)"
+                    ),
+                }));
+            }
+        };
+        if live_eversion != pre_eversion {
+            return Ok(rkyv_encode(&ForceEcConvertResp {
+                code: CODE_PRECONDITION,
+                message: format!(
+                    "extent {extent_id} eversion changed during force-ec-convert \
+                     (pre={pre_eversion}, live={live_eversion}); retry to pick up new state"
+                ),
+            }));
+        }
 
-        let new_eversion = ex.eversion + 1;
+        let new_eversion = live_eversion + 1;
         let dispatch_record = MgrEcDispatchInflight {
             extent_id,
             target_nodes,
@@ -2586,42 +2633,6 @@ impl AutumnManager {
                     _ => CODE_ERROR,
                 },
                 message: format!("acquire marker: {e}"),
-            }));
-        }
-
-        // F209-D verify-at-apply step 2: re-read `ex.eversion` under a
-        // fresh borrow. If it changed during the await window, the marker
-        // payload's `new_eversion` is stale — drain the marker (so a
-        // future force-ec-convert can retry with fresh state) and refuse.
-        let live_eversion = self
-            .store
-            .inner
-            .borrow()
-            .extents
-            .get(&extent_id)
-            .map(|e| e.eversion);
-        let live_eversion = match live_eversion {
-            Some(v) => v,
-            None => {
-                // Extent vanished during the await window (punch_holes /
-                // truncate). Drop the marker; nothing to convert.
-                let _ = self.drain_extent_inflight_marker(extent_id).await;
-                return Ok(rkyv_encode(&ForceEcConvertResp {
-                    code: CODE_PRECONDITION,
-                    message: format!(
-                        "extent {extent_id} removed during force-ec-convert (concurrent gc)"
-                    ),
-                }));
-            }
-        };
-        if live_eversion != pre_eversion {
-            let _ = self.drain_extent_inflight_marker(extent_id).await;
-            return Ok(rkyv_encode(&ForceEcConvertResp {
-                code: CODE_PRECONDITION,
-                message: format!(
-                    "extent {extent_id} eversion changed during force-ec-convert \
-                     (pre={pre_eversion}, live={live_eversion}); retry to pick up new state"
-                ),
             }));
         }
 

@@ -916,21 +916,35 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     - **F209-C** F208 sweep no longer auto-releases ConvertToEc
       markers — WARN-only with operator-driven remediation. See the
       block above.
-    - **F209-D** `handle_force_ec_convert` adds the F146
-      verify-at-apply pattern. Pre-F209-D the `new_eversion` in the
-      ConvertToEc marker payload was captured from a clone taken
-      BEFORE the `alloc_extent_on_node` awaits and the
-      `acquire_extent_inflight` await. A concurrent
-      `apply_recovery_done` for the same extent could complete in
-      that window (no ConvertToEc marker yet to refuse it via I5),
-      bumping `ex.eversion`. The dispatch loop's
-      `apply_ec_conversion_done` would then unconditionally write
-      the stale `new_eversion` to etcd, silently undoing the
-      recovery's slot replacement. F209-D re-reads `ex.eversion`
-      after `acquire_extent_inflight` returns OK and refuses with
-      `Precondition` (after `drain_extent_inflight_marker`) when
-      drift is detected. Same defense pattern F146 added for
-      `handle_stream_alloc_extent` and `handle_multi_modify_split`.
+    - **F209-D** `handle_force_ec_convert` adds the F146 eversion
+      verify pattern, but **verify-BEFORE-acquire** rather than the
+      verify-after-acquire shape that F146 uses for
+      `handle_stream_alloc_extent` / `handle_multi_modify_split`.
+      The race: between the L2436 snapshot and the acquire below
+      there are N `alloc_extent_on_node` awaits — during them a
+      Recovery that started after the L2416 `extent_inflight_op`
+      probe can complete (acquire + apply + release its own marker)
+      and bump `ex.eversion` + rewrite `ex.replicates`. Proceeding
+      to acquire ConvertToEc with the stale snapshot's
+      `ex.eversion + 1` would mean the dispatch loop's
+      `apply_ec_conversion_done` later writes the stale
+      `new_eversion` to etcd and overwrites the recovery's slot
+      replacement.
+      **Why verify-BEFORE, not verify-after** (the original F209-D
+      shape, revised after codex review): a verify-after-acquire +
+      drain-on-mismatch path has a failure mode where
+      `drain_extent_inflight_marker` itself fails (NotLeader during
+      the drain await, or transient etcd error) — the stale marker
+      stays in etcd, the dispatch loop's next tick (or a successor
+      leader's replay) picks it up, and applies the stale state.
+      Verify-BEFORE-acquire skips the problem: no marker is ever
+      written if state has drifted, so no drain is needed. After
+      our acquire succeeds, F207's exclusive ledger CAS + every
+      other mutator's `extent_inflight_op` refuse-at-start
+      (apply_recovery_done, handle_*_punch_holes, handle_truncate,
+      handle_multi_modify_split / merge, handle_sync_partition_vp_refs,
+      handle_stream_alloc_extent) freezes `ex.eversion` until our
+      apply runs.
     - **F209-E** `crates/manager/tests/f209_apply_done_atomicity.rs`
       (`#[ignore]`, requires embedded etcd) asserts the I3
       atomicity claim end-to-end: success path lands both effects,

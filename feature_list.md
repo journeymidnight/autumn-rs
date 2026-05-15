@@ -1416,11 +1416,13 @@ Cleared by audit (no fix needed):
 - **Tests:** existing `f208_sweep_auto_releases_stale_markers` updated to expect only 2/3 releases (ConvertToEc survives). New `f209_c_sweep_excludes_convert_to_ec_from_auto_release` exercises multi-tick survival.
 - **passes:** true (89 lib tests, was 88).
 
-#### F209-D · `handle_force_ec_convert` verify-at-apply
-- **Location:** `crates/manager/src/rpc_handlers.rs:2545-2625`.
+#### F209-D · `handle_force_ec_convert` verify-BEFORE-acquire
+- **Location:** `crates/manager/src/rpc_handlers.rs:2545-2640`.
 - **Bug:** `new_eversion = ex.eversion + 1` in the marker payload was computed from a clone (`ex`) captured BEFORE the `alloc_extent_on_node` awaits and the `acquire_extent_inflight` await. During those awaits, a concurrent `apply_recovery_done` for the same extent could complete (no ConvertToEc marker yet, so I5 doesn't refuse it), bumping `ex.eversion` and rewriting `ex.replicates`. The dispatch loop's `apply_ec_conversion_done` would then unconditionally write the stale `new_eversion` to etcd, silently reverting the recovery's slot replacement + eversion bump. Same snapshot-then-await race F146 closed for `handle_stream_alloc_extent` and `handle_multi_modify_split` — F207 missed extending the same treatment here.
-- **Fix:** F146 verify-at-apply pattern. Captured `pre_eversion` from the snapshot, after the marker is acquired re-read `ex.eversion` under a fresh borrow; on mismatch (or extent vanished), `drain_extent_inflight_marker` to release + return `CODE_PRECONDITION` with a diagnostic.
-- **passes:** true. (Race-condition coverage relies on F209-E integration test; lib tests confirm positive path.)
+- **Initial fix shape (verify-AFTER-acquire + drain-on-mismatch):** mirrored F146's pattern — acquire marker, then re-read eversion; on mismatch, call `drain_extent_inflight_marker` and return Precondition.
+- **Codex review (post-commit 444ede0) flagged a hole in that shape:** if `drain_extent_inflight_marker` itself fails (NotLeader during the drain await, or transient etcd error), the stale ConvertToEc marker stays in etcd. The dispatch loop's next tick (or a successor leader's replay) picks it up and applies the stale `new_eversion` — exactly the corruption verify-at-apply was supposed to prevent.
+- **Revised fix (this commit): verify-BEFORE-acquire.** Re-read `ex.eversion` under a fresh borrow BEFORE calling `acquire_extent_inflight`. If the live eversion differs from the snapshot, return Precondition without writing a marker — no drain needed. After our acquire succeeds, F207's exclusive ledger CAS + every other mutator's `extent_inflight_op` refuse-at-start guarantees `ex.eversion` is frozen until our `apply_ec_conversion_done` runs. So verify-before alone is sufficient; no verify-after, no drain, no drain-failure-leaks-marker risk.
+- **passes:** true. Race-condition coverage relies on F209-E integration test; lib tests confirm positive path.
 
 #### F209-E · F207 apply-done txn atomicity integration test
 - **Location:** `crates/manager/tests/f209_apply_done_atomicity.rs` (`#[ignore]`, requires embedded etcd via Go runtime).
