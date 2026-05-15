@@ -1394,6 +1394,35 @@ Cleared by audit (no fix needed):
 - **Files:** `feature_list.md`, `claude-progress.txt`. (No code changes.)
 - **passes:** true (audit-cleared)
 
+### F207-E · Drop backward-compat scan from F207-D (user opted out)
+- **Trigger:** Investigation 2026-05-15 of user-reported "extent 23 has in-flight Recovery; defer alloc_extent until it completes" symptom on a fresh cluster after F207-D deploy. Root cause: F207-C's one-cycle backward-compat **fold-in** of legacy `ecConversionInflight/` / `recoveryTasks/` etcd markers loaded orphans-from-a-dead-prior-manager into the unified ledger as live Recovery records. PS's `alloc_new_extent` then refused indefinitely against extents 21 and 23 because their "in-flight" tasks were ghosts that no EN was actually running.
+- **F207-D mitigation (already shipped):** removed the fold-in. Kept a WARN-on-detect scan so an operator would notice orphan etcd state and run a Python ops scrub.
+- **User decision (2026-05-15):** "我不需要后向兼容" — no need for backward compatibility. Drop the WARN scan entirely. Future deploys go through `cluster.sh reset` (which clears etcd) when crossing the F207 boundary.
+- **What this commit removes:**
+  - The `legacy_ec_inflight = c.get_prefix("ecConversionInflight/")` + `legacy_recovery_tasks = c.get_prefix("recoveryTasks/")` queries in `replay_from_etcd`.
+  - The two WARN-emission blocks that fired when non-empty.
+  - Stale comment block in `replay_from_etcd` referencing the F207-D scrub workflow.
+- **What this commit DOES NOT change:**
+  - `extent_inflight_stale_sweep_loop` (`extent_inflight_stale_sweep_loop`, 5-min tick) — still in place. Surfaces NEW stale markers (acquired but never released within 24h) which is a different problem from legacy etcd orphans.
+  - `apply_ec_conversion_done` / `apply_recovery_done` delete batches — already F207-D-clean (only touch `extent_inflight/<id>`).
+  - F207 unit tests — none referenced the legacy scan.
+- **Why this is safe (the EN-side independence argument):** the EN's recovery and EC convert handlers (`crates/stream/src/extent_node.rs::handle_require_recovery` and `handle_convert_to_ec`) detach the work and either (a) push completion to `recovery_done` for the manager's df probe to drain, or (b) advance to a CODE_OK return on idempotent retry (F119-D / F153). Manager-side markers are commands-already-sent receipts, not authoritative work tracking. A new leader either (a) sees the EN report a completion in df, or (b) re-dispatches via `recovery_dispatch_loop` / `ec_conversion_dispatch_loop` and the EN-side idempotency makes the re-dispatch a no-op. No legacy etcd state is load-bearing.
+- **Migration policy going forward:** F207 is a one-way etcd schema migration. Pre-F207 → F207 requires `cluster.sh reset` (full data + etcd wipe). The operator-facing contract is documented in `crates/manager/CLAUDE.md` programming note 21 (updated by this commit).
+- **CLAUDE.md update:** programming note 21 gains a "No backward compatibility with pre-F207 etcd state" paragraph documenting the policy + the EN-side independence rationale + cross-reference to F207-C's fold-in bug as the cautionary tale.
+- **Files touched:**
+  - `crates/manager/src/lib.rs`: `replay_from_etcd` cleanup (legacy scan + WARN blocks deleted; comment block trimmed).
+  - `crates/manager/CLAUDE.md`: programming note 21 extended with the no-backward-compat policy paragraph.
+  - `feature_list.md` — this entry.
+  - `claude-progress.txt` — F207-E status.
+- **Verification:**
+  - `cargo build -p autumn-manager`: clean.
+  - `cargo test -p autumn-manager --lib`: 85 passed (unchanged).
+- **Operator action item (separate from this commit):** the user's cluster currently has 2 orphan `recoveryTasks/{21,23}` keys in etcd from a pre-F207 binary. Under F207-E they're inert (not scanned), so cleanup is optional. If desired:
+  ```bash
+  etcdctl --endpoints=127.0.0.1:2379 del recoveryTasks/21 recoveryTasks/23
+  ```
+- **passes:** true
+
 ### F207-D · Unified extent in-flight ledger — Phase 3 (cleanup)
 - **Trigger:** F207-C completed the migration of all four pre-F207 inflight bookkeeping mechanisms into the unified ledger. Phase 3 is housekeeping: remove the transitional backward-compat code paths (legacy etcd prefix replay arms + legacy-key entries in apply_* delete batches), add the stale-marker WARN sweep promised by F207-A's invariant I2, and update the `crates/manager/CLAUDE.md` programming notes to point at the unified mechanism.
 - **Backward-compat removals:**

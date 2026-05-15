@@ -1051,32 +1051,7 @@ impl AutumnManager {
         // F207: unified extent in-flight ledger. Authoritative source of
         // truth for stream-layer ops in flight on each extent.
         let extent_inflight_raw = c.get_prefix(crate::extent_inflight::EXTENT_INFLIGHT_PREFIX).await?;
-        // F207-D: detect leftover legacy markers from a pre-F207
-        // cluster that skipped the F207-A/B/C deploy cycle. We do NOT
-        // fold them into the ledger (the F207-B/C transitional code is
-        // gone); we WARN so an operator can run the Python ops scrub
-        // before the orphan markers manifest as "stuck inflight"
-        // diagnostics. Empty on any cluster that went through
-        // F207-A/B/C as designed.
-        let legacy_ec_inflight = c.get_prefix("ecConversionInflight/").await?;
-        let legacy_recovery_tasks = c.get_prefix("recoveryTasks/").await?;
         drop(c);
-        if !legacy_ec_inflight.kvs.is_empty() {
-            tracing::warn!(
-                count = legacy_ec_inflight.kvs.len(),
-                "F207-D: found leftover `ecConversionInflight/` etcd markers from a \
-                 pre-F207 cluster. These are NOT folded into the unified ledger; run \
-                 the Python ops scrub script to clear them, or upgrade via an \
-                 F207-A/B/C binary first (which folds them automatically)."
-            );
-        }
-        if !legacy_recovery_tasks.kvs.is_empty() {
-            tracing::warn!(
-                count = legacy_recovery_tasks.kvs.len(),
-                "F207-D: found leftover `recoveryTasks/` etcd markers from a \
-                 pre-F207 cluster. Same remediation as for `ecConversionInflight/`."
-            );
-        }
 
         let mut max_id = 0u64;
         let mut decoded_nodes = HashMap::new();
@@ -1182,13 +1157,10 @@ impl AutumnManager {
         // F183: install last_op_at sidecar so policy engine cooldown
         // gating is correct on cold-start as well.
         *self.last_op_at.borrow_mut() = decoded_last_op;
-        // F207-D: install the unified inflight ledger. Records with
+        // F207: install the unified inflight ledger. Records with
         // malformed op_kind/payload combinations are dropped with a WARN
-        // inside `decode_extent_inflight_kvs`. F207-D removed the
-        // transitional fold-in of legacy `ecConversionInflight/` /
-        // `recoveryTasks/` prefixes; an operator deploying directly
-        // from a pre-F207 binary onto F207-D must run the Python ops
-        // scrub first (we WARN above on detecting any leftover keys).
+        // inside `decode_extent_inflight_kvs`. The `extent_inflight/`
+        // prefix is the single source of truth — no legacy fold-in.
         {
             let decoded = Self::decode_extent_inflight_kvs(extent_inflight_raw.kvs.iter().map(
                 |kv| {

@@ -824,6 +824,22 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     is INTENTIONALLY not done — a stuck marker usually signals a
     real bug we want to surface, not silently paper over.
 
+    **No backward compatibility with pre-F207 etcd state.** F207-A/B/C
+    transitional fold-in of legacy `ecConversionInflight/` and
+    `recoveryTasks/` prefixes is gone (F207-E). Deploying F207
+    onto an existing pre-F207 cluster's etcd state is unsupported —
+    the prior cluster must be torn down (`cluster.sh reset`). The
+    EN-side recovery / EC convert task lifecycles are independent
+    of the manager marker (e.g.
+    `crates/stream/src/extent_node.rs::handle_require_recovery`
+    detaches the work and pushes to `recovery_done`), so any
+    abandoned legacy markers are inert — they would only mislead
+    a fold-in path into treating dead state as live work. F207-C's
+    fold-in turned out to be a real bug surface (alloc_extent
+    refused indefinitely against a "ghost" Recovery task that no
+    EN was actually running); F207-D removed it; F207-E removed
+    even the WARN-on-detection path.
+
     **Test helpers (`#[cfg(test)] _test_mark_*_inflight`):** unit
     tests that simulate an in-flight op without going through etcd
     use these helpers. They bypass the CAS + F149 fence; do NOT

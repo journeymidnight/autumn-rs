@@ -1,115 +1,117 @@
 Date: 2026-05-15
 TaskStatus: completed
-Task scope: F207-D — unified extent in-flight ledger, Phase 3
-            (cleanup). Removed backward-compat dual-replay arms +
-            legacy-key delete entries; added the stale-marker WARN
-            sweep promised by F207-A's invariant I2; added a new
-            programming note (21) in crates/manager/CLAUDE.md
-            documenting the unified F207 mechanism.
+Task scope: F207-E — drop backward-compat legacy-prefix scan from
+            F207-D. User opted out of backward compatibility
+            ("我不需要后向兼容") after the F207-C fold-in bug
+            (legacy `recoveryTasks/{21,23}` orphans treated as live
+            Recovery → alloc_extent permanently refused on those
+            extents) surfaced in a real cluster.
 
-Backward-compat removals:
-  - `replay_from_etcd` no longer FOLDS legacy `ecConversionInflight/`
-    or `recoveryTasks/` markers into the unified ledger. It still
-    `get_prefix`'s them ONCE on each promotion for detection: any
-    non-empty result emits a WARN log instructing the operator to
-    run the Python ops scrub script.
-  - `apply_ec_conversion_done`: legacy `ecConversionInflight/<id>`
-    removed from the delete batch. Only `extent_inflight/<id>` is
-    deleted (in the same `txn_fenced` as the `extents/<id>` put;
-    invariant I3 preserved).
-  - `apply_recovery_done`: legacy `recoveryTasks/<id>` removed from
-    all three apply branches (main success path, layout_changed
-    refusal, orphan-cleanup). Same invariant I3 preservation.
+Root-cause recap (from the user-reported symptom):
+  - User restarted cluster with pre-F207 binary at some point,
+    which left `recoveryTasks/{21,23}` etcd markers behind.
+  - User upgraded binary to F207-C.
+  - F207-C's `replay_from_etcd` "one-cycle backward compat" code
+    folded those legacy markers into the unified ledger as
+    `ExtentOpPayload::Recovery` records.
+  - In-memory ledger now had Recovery in flight on extents 21
+    and 23, but no EN was actually running those tasks (they
+    were orphans from a dead prior manager).
+  - PS's `alloc_new_extent` saw Recovery in flight on the tail
+    extent (23) and refused with Precondition.
+  - PS retried 20 times every 500ms, gave up — write path
+    blocked forever.
+  - Recovery_collect_loop's df probe found no `recovery_done`
+    entries (because the EN tasks were never started under the
+    new manager's lifetime), so the ledger entries never cleared.
+  - Permanently stuck.
 
-Stale-marker sweep (new):
-  - `extent_inflight_stale_sweep_loop` in extent_inflight.rs:
-    * 5-minute tick (longer than other background loops; stale
-      markers are slow-burn).
-    * 24-hour stale threshold from `started_at`.
-    * WARN log per stale marker with extent_id + op kind + age
-      seconds + remediation instructions.
-    * Auto-clearing INTENTIONALLY NOT done — a stuck marker
-      usually signals a real bug worth surfacing.
-    * Operator runs Python ops `--clear-stale-inflight extent <id>`
-      after investigating with `etcdctl get extent_inflight/<id>`.
-  - Spawned by `start_runtime_tasks` alongside the other loops
-    (recovery_dispatch, recovery_collect, disk_status_update,
-    ec_conversion_dispatch, ps_liveness_check, extent_delete,
-    policy_tick).
+F207-D mitigation (already shipped at commit 18adeeb): removed
+the fold-in. Kept a WARN-on-detect scan so an operator would see
+orphan etcd state and run a Python ops scrub script.
 
-CLAUDE.md programming note 21 (new) covers:
-  - F207 unified ledger design (replaces 4 pre-F207 mechanisms).
-  - PS-layer ↔ stream-layer boundary (Class A/B/C interaction
-    model from the F207 plan).
-  - Five invariants I1-I5 with where each is enforced:
-    I1 (leader-only) via F149 fence, I2 (acquire-release or
-    replay) via apply txn + replay + stale-sweep WARN, I3
-    (atomic release-with-apply) by put_and_delete_txn shape,
-    I4 (replay before loop spawn) by new_with_etcd ordering,
-    I5 (every mutator consults ledger) by single helper +
-    review.
-  - Atomicity headline (closes pre-F207 latent marker-leak in
-    apply_ec_conversion_done).
-  - Stale-marker sweep design + rationale (WARN-only, not
-    auto-clear).
-  - Test helper conventions (_test_mark_*_inflight bypass CAS).
-  - Cross-references to all historical race-fix notes
-    (F138/F139/F145/F146/F147-A/F198/F206).
+F207-E (this commit): user said no need for backward compat.
+Future deploys go through `cluster.sh reset` (which clears etcd)
+when crossing the F207 boundary. Drop the WARN scan entirely.
 
-What does NOT change at F207-D:
-  - F119-D coordinator-side idempotency check (defense in depth).
-  - F153 per-extent EC conversion serialisation lock (DiD).
-  - F146 / F147-A verify-at-apply pattern (Class B race defense).
-  - Python ops toolkit interface — sweep is WARN-only; explicit
-    operator command remains.
+What F207-E removes:
+  - `let legacy_ec_inflight = c.get_prefix("ecConversionInflight/")`
+    query in `replay_from_etcd`.
+  - `let legacy_recovery_tasks = c.get_prefix("recoveryTasks/")`
+    query in `replay_from_etcd`.
+  - The two WARN-emission blocks that fired on non-empty results.
+  - A comment block in `replay_from_etcd` referencing the scrub
+    workflow.
 
-Migration risk: operator upgrading directly pre-F207 → F207-D
-(skipping F207-A/B/C) sees WARN on first leader promotion if any
-legacy markers exist. These are harmless orphans (don't block any
-new operations because the unified ledger CAS is the only gate);
-remediation via the Python scrub. Worst case: orphans persist in
-etcd forever, ~80 bytes each, no functional impact.
+What F207-E DOES NOT change:
+  - `extent_inflight_stale_sweep_loop` (24-hour stale-marker
+    WARN) — still in place. That's for NEW stale markers
+    (acquired but never released), a different scenario from
+    pre-F207 legacy orphans.
+  - `apply_ec_conversion_done` / `apply_recovery_done` delete
+    batches — already F207-D-clean (only touch new ledger key).
+  - F207 unit tests — none referenced the legacy scan.
+
+Why this is safe (the EN-side independence argument):
+  - EN's `handle_require_recovery` (crates/stream/src/extent_node.rs:3422)
+    detaches `run_recovery_task` via `compio::runtime::spawn`,
+    returns CODE_OK to manager immediately, and pushes
+    completion to `recovery_done` for the next manager df probe
+    to drain.
+  - EN's `handle_convert_to_ec` has F119-D + F153 idempotency
+    guards (eversion-based no-op if already converted).
+  - Manager-side markers are "commands-already-sent receipts",
+    not authoritative work tracking.
+  - A new leader either (a) sees the EN report completion in df,
+    or (b) re-dispatches via the recovery/EC convert loops and
+    EN-side idempotency makes the re-dispatch a no-op.
+  - No legacy etcd state is load-bearing.
+
+Migration policy going forward:
+  - F207 is a ONE-WAY etcd schema migration.
+  - Pre-F207 → F207 requires `cluster.sh reset` (full data +
+    etcd wipe).
+  - The operator-facing contract is documented in
+    crates/manager/CLAUDE.md programming note 21 (updated by
+    this commit with a "No backward compatibility with pre-F207
+    etcd state" paragraph).
+
+CLAUDE.md note 21 update covers:
+  - The no-backward-compat policy.
+  - The EN-side independence rationale.
+  - Cross-reference to F207-C's fold-in bug as the cautionary
+    tale that justified F207-D/E.
 
 Files touched:
-  - crates/manager/src/lib.rs: replay_from_etcd cleanups
-    (legacy fold-in deleted, WARN detection retained);
-    start_runtime_tasks spawns new sweep loop.
-  - crates/manager/src/recovery.rs: legacy-key deletes removed
-    from apply_ec_conversion_done + apply_recovery_done's three
-    branches.
-  - crates/manager/src/extent_inflight.rs: new
-    extent_inflight_stale_sweep_loop method.
-  - crates/manager/CLAUDE.md: new programming note 21.
-  - feature_list.md: F207-D entry.
+  - crates/manager/src/lib.rs: replay_from_etcd cleanup
+    (legacy scan + WARN blocks deleted; comment block trimmed).
+  - crates/manager/CLAUDE.md: programming note 21 extended.
+  - feature_list.md: F207-E entry.
   - claude-progress.txt: this file.
 
 Verification:
-  - cargo build --workspace --exclude autumn-fuse: clean.
-  - cargo test -p autumn-manager --lib: 85 passed (unchanged count;
-    F207-D is pure cleanup — production code paths exercise the
-    same ledger semantics that F207-B/C tests already cover).
-  - cargo test -p autumn-stream --lib: 53 passed.
+  - cargo build -p autumn-manager: clean (8 pre-existing
+    warnings, unchanged).
+  - cargo test -p autumn-manager --lib: 85 passed (unchanged
+    count; no test references the deleted scan).
 
-F207 refactor: COMPLETE.
+Operator action item (separate from this commit):
+  The user's cluster currently has 2 orphan `recoveryTasks/{21,23}`
+  keys in etcd from a pre-F207 binary. Under F207-E they're inert
+  (not scanned), so cleanup is optional. If desired:
+    etcdctl --endpoints=127.0.0.1:2379 del recoveryTasks/21 recoveryTasks/23
+
+F207 refactor: STILL COMPLETE.
   - F207-A: infrastructure (commit baa38c2)
   - F207-B: migrate EC convert (commit dca5a22)
   - F207-C: migrate Recovery + Delete (commit b2df29f)
-  - F207-D: cleanup + CLAUDE.md docs (this commit)
-
-The four scattered pre-F207 inflight bookkeeping mechanisms
-(ec_conversion_inflight HashSet, pending_ec_dispatch HashMap,
-recovery_tasks HashMap, pending_extent_deletes VecDeque) are
-GONE. The five F-numbers (F126/F138/F139/F145/F147-A) that each
-implemented "if-extent-in-set then refuse" across nine sites
-all consult ONE probe now. The latent marker-leak race in
-apply_ec_conversion_done is structurally closed. Delete state
-now survives leader failover (closes F109 footnote). All 85
-manager unit tests pass against the migrated ledger.
+  - F207-D: cleanup + CLAUDE.md docs (commit 18adeeb)
+  - F207-E: drop unused backward-compat scan (this commit)
 
 Memory:
   - No new memory entry. F207 design rationale lives in
-    feature_list.md F207-A/B/C/D and the plan file
+    feature_list.md F207-A/B/C/D/E and the plan file
     ~/.claude/plans/stream-merge-split-ps-sorted-dijkstra.md.
 
-Next session starting point: F208+. F207 is done; the refactor
-arc that started with F206's avali bug analysis is complete.
+Next session starting point: F208+. The F207 refactor arc is
+fully closed.
