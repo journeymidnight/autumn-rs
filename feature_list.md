@@ -1394,6 +1394,31 @@ Cleared by audit (no fix needed):
 - **Files:** `feature_list.md`, `claude-progress.txt`. (No code changes.)
 - **passes:** true (audit-cleared)
 
+### F207-A · Unified extent in-flight ledger — Phase 0 (infrastructure only)
+- **Trigger:** User 2026-05-15 architectural review after F206. Five separate F-numbers (F126 / F138 / F139 / F145 / F147-A) all implement the same "if-extent-in-set then refuse" pattern across four scattered inflight bookkeeping mechanisms (`ec_conversion_inflight` HashSet, `pending_ec_dispatch` HashMap, `recovery_tasks` HashMap, `pending_extent_deletes` VecDeque). User asked for a unified ledger. Architectural side-decision: ledger covers only stream-layer ops (ConvertToEc / Recovery / Delete); PS-layer ops (split / merge / punch_holes / truncate / sync_partition_vp_refs / alloc_extent) READ the ledger to refuse-at-start but do NOT enroll — they're partition-scoped, not extent-scoped.
+- **Phase 0 scope (this commit):** infrastructure only. New file `crates/manager/src/extent_inflight.rs` with `MgrExtentInflightRecord` + `ExtentOpKind` + `ExtentOpPayload` types and the three core APIs (`acquire_extent_inflight` / `build_extent_inflight_release_op` + `commit_extent_inflight_release` / `extent_inflight_op`). New `inflight` field on `AutumnManager`. New `replay_from_etcd` arm for the `extent_inflight/` prefix. NO production handler migrated yet — Phase 0 is dormant infrastructure verified only by unit tests, so existing tests pass unchanged.
+- **Data model:** etcd key `extent_inflight/<extent_id>` → rkyv(`MgrExtentInflightRecord { extent_id, op_kind: u8, started_at, leader_id, ec_payload, recovery_payload, delete_payload }`). The flat-struct shape (op_kind byte + three Option payloads, exactly one Some by invariant) avoids being the proving ground for rkyv 0.8 enum CheckBytes support — every existing rkyv-derived type in this codebase is a struct, not an enum. Typed `ExtentOpPayload` enum is a Rust-level view layered on top via `MgrExtentInflightRecord::new` (constructor enforces invariant) and `unpack` (replay-time validator).
+- **API:**
+  - `acquire_extent_inflight(extent_id, payload)` — CAS via `create_revision == 0` + F149 fence. Returns `Err(Precondition)` on contention, `Err(NotLeader)` on fence break.
+  - `build_extent_inflight_release_op(extent_id) → autumn_etcd::RequestOp` — caller appends to its own apply-done txn batch so release is atomic with state mutation (invariant I3, F207-B will leverage this).
+  - `commit_extent_inflight_release(extent_id)` — in-memory cleanup after caller's etcd txn returns OK.
+  - `extent_inflight_op(extent_id) → Option<ExtentOpKind>` — single-line replacement for the 9 scattered refuse-at-start sites (to be migrated in F207-C).
+- **PS-layer ↔ stream-layer interaction (recorded for reviewer reference; will fully apply in F207-B/C):**
+  - Class A — PS handler runs while a stream-layer op is in flight → PS reads ledger, refuses with Precondition.
+  - Class B — stream-layer op fires during PS's await window → verify-at-apply (F146 / F147-A) catches it; F207 makes this a required invariant on any PS handler that consults the ledger.
+  - Class C — two stream-layer ops race → exclusive CAS acquire, second one fails.
+- **Files touched:**
+  - `crates/manager/src/extent_inflight.rs` — NEW (~370 lines including tests).
+  - `crates/manager/src/lib.rs` — `mod extent_inflight;` declaration; `inflight: Rc<RefCell<HashMap<...>>>` field added to `AutumnManager`; initialised in `new()`; replay arm added to `replay_from_etcd`.
+  - `feature_list.md` — this entry.
+  - `claude-progress.txt` — F207-A status.
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-manager --lib f207`: 6 new unit tests pass — `f207_acquire_extent_inflight_succeeds_when_empty`, `f207_acquire_extent_inflight_rejects_duplicate`, `f207_commit_extent_inflight_release_clears_probe`, `f207_record_rkyv_round_trip_all_variants`, `f207_unpack_rejects_malformed_records`, `f207_decode_drops_malformed`.
+  - `cargo test -p autumn-manager --lib`: 85 passed (79 → 85, +6 new). No regression in F126 / F138 / F139 / F145 / F147 / F198 / F206 (all still pass since no handler is migrated yet).
+- **README update intentionally deferred:** Phase 0 has zero operator-facing surface. The operator's `etcdctl watch --prefix extent_inflight/` walkthrough lands with F207-B when the prefix actually starts receiving writes. Per project rule #11, README manual-verification steps must remain executable; nothing in Phase 0 changes what an operator can or should do.
+- **passes:** true
+
 ### F206 · Post-EC `avali` not refreshed → infinite RE_AVALI loop with multi-GB RSS churn
 - **Trigger:** User observation 2026-05-15 on a 4-node macOS cluster: after `sh cluster.sh restart 4`, extent-node RSS swung between 2 MB and 2.6 GB across the four nodes on an idle cluster (no client traffic). `vmmap` showed `MALLOC_LARGE (empty) 2.8 GB / 24 regions / peak footprint 4.6 GB` — many ~941 MB allocations freed back into the allocator's free list but not returned to the OS. Manager log flapped: `df RPC failed; marked node disks offline … df RPC succeeded; disk back online` every few seconds against nodes 9102 and 9103.
 - **Root cause (two-bug chain):**

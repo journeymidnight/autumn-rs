@@ -1,4 +1,5 @@
 mod extent_delete;
+mod extent_inflight;
 pub mod policy;
 #[cfg(test)]
 mod policy_tests;
@@ -343,6 +344,18 @@ pub struct AutumnManager {
     /// on the extent-node side via stale-cached `ExtentInfo` from the
     /// manager).
     pub(crate) pending_ec_dispatch: Rc<RefCell<HashMap<u64, MgrEcDispatchInflight>>>,
+    /// F207 Phase 0: unified extent-level in-flight ledger. Phase 0 (this
+    /// commit) wires the infrastructure; no production handler reads or
+    /// writes this yet. Migrating from `ec_conversion_inflight` /
+    /// `pending_ec_dispatch` / `recovery_tasks` / `pending_extent_deletes`
+    /// happens in F207-B / F207-C / F207-D. Persisted at etcd prefix
+    /// `extent_inflight/`. See `crates/manager/src/extent_inflight.rs`
+    /// for the API + invariants and
+    /// `~/.claude/plans/stream-merge-split-ps-sorted-dijkstra.md` for the
+    /// migration plan.
+    pub(crate) inflight: Rc<
+        RefCell<HashMap<u64, crate::extent_inflight::MgrExtentInflightRecord>>,
+    >,
     runtime_started: Rc<Cell<bool>>,
     ps_last_heartbeat: Rc<RefCell<HashMap<u64, Instant>>>,
     conn_pool: Rc<ConnPool>,
@@ -415,6 +428,7 @@ impl AutumnManager {
             recovery_tasks: Rc::new(RefCell::new(HashMap::new())),
             ec_conversion_inflight: Rc::new(RefCell::new(HashSet::new())),
             pending_ec_dispatch: Rc::new(RefCell::new(HashMap::new())),
+            inflight: Rc::new(RefCell::new(HashMap::new())),
             runtime_started: Rc::new(Cell::new(false)),
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),
             conn_pool: Rc::new(ConnPool::new()),
@@ -1034,6 +1048,13 @@ impl AutumnManager {
         let ec_inflight = c.get_prefix("ecConversionInflight/").await?;
         // F183: per-partition last_op_at sidecar
         let last_op = c.get_prefix("partitionLastOp/").await?;
+        // F207 Phase 0: unified extent in-flight ledger. New prefix that
+        // will replace `ecConversionInflight/` (F198) and `recoveryTasks/`
+        // once F207-B / F207-C migrations land. Phase 0 reads the prefix
+        // into `self.inflight` so the wiring is verified now; the prefix
+        // is empty on any pre-F207 cluster, so the in-memory map starts
+        // empty too.
+        let extent_inflight_raw = c.get_prefix(crate::extent_inflight::EXTENT_INFLIGHT_PREFIX).await?;
         drop(c);
 
         let mut max_id = 0u64;
@@ -1193,6 +1214,28 @@ impl AutumnManager {
         // F183: install last_op_at sidecar so policy engine cooldown
         // gating is correct on cold-start as well.
         *self.last_op_at.borrow_mut() = decoded_last_op;
+        // F207 Phase 0: install unified inflight ledger view. Records
+        // with malformed op_kind/payload combinations are dropped with a
+        // WARN inside decode_extent_inflight_kvs.
+        {
+            let decoded = Self::decode_extent_inflight_kvs(extent_inflight_raw.kvs.iter().map(
+                |kv| {
+                    let id = Self::parse_id_from_key(
+                        crate::extent_inflight::EXTENT_INFLIGHT_PREFIX,
+                        &kv.key,
+                    )
+                    .unwrap_or(0);
+                    (id, kv.value.as_slice())
+                },
+            ));
+            let mut map = self.inflight.borrow_mut();
+            map.clear();
+            for (id, rec) in decoded {
+                if id != 0 {
+                    map.insert(id, rec);
+                }
+            }
+        }
 
         Ok(())
     }

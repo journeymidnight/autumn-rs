@@ -1,90 +1,101 @@
 Date: 2026-05-15
 TaskStatus: completed
-Task scope: F206 — post-EC `avali` not refreshed, causing infinite
-            RE_AVALI loop with multi-GB RSS churn on restart.
+Task scope: F207-A — unified extent in-flight ledger, Phase 0
+            (infrastructure only). NEW file
+            crates/manager/src/extent_inflight.rs with types + API +
+            replay arm; NEW `inflight` field on AutumnManager. NO
+            production handler migrated this phase.
 
-User-driven diagnosis (turn-by-turn):
-  - User question 1: "sh cluster.sh restart 4 后 macOS 上的
-    extent node 为什么占用这么多内存？"
-  - First investigation pass: confirmed processes alive, all 4
-    nodes hold the same 941 MB extent-10.dat (3+1 EC shard size,
-    matches sealed_length / K = 2961566856 / 3), RSS rotates
-    among nodes (2 MB / 2.6 GB / 596 MB / 1.84 GB then
-    decreasing/redistributing). `vmmap` confirmed MALLOC_LARGE
-    (empty) 2.8 GB / 24 regions / peak footprint 4.6 GB — large
-    allocations freed but held by allocator's free list.
-  - User pushback 2: "EC 跑完了但 manager 仍然不知道，这是
-    严重的 BUG！" — diagnosis correction: manager DOES know
-    (`/streams --json` shows `ec_converted: true, eversion: 4,
-    parity: [7], replicates: [3, 5, 1]`), BUT the avali bitmap
-    was never refreshed post-EC.
-  - Found exact bug pair: Bug A in
-    `crates/manager/src/recovery.rs::apply_ec_conversion_done`
-    (misses `avali` update), Bug B in
-    `crates/stream/src/extent_node.rs::handle_re_avali` (compares
-    local shard size to logical sealed_length without checking
-    `ec_converted`). The two bugs combined to drive the
-    recovery loop into firing RE_AVALI on the parity holder every
-    2 s, which triggered fetch_full_extent_from_sources to
-    allocate ~941 MB per peer attempt (4 peers × 941 MB ≈ 3.7 GB
-    per tick).
-  - User said "ok" to proceed with the surgical fix.
+Architectural context:
+  - User architectural review after F206 (avali bug): EC convert had
+    accumulated 13 F-numbers of mutex / inflight bookkeeping bugs.
+    User asked whether moving coordinator from EN to manager would
+    help. Conclusion: no — violates control/data-plane separation,
+    multiplies network 2.5x, only eliminates 2 of 13 bug classes.
+  - Real lever: 5 of those bug classes (F126/F138/F139/F145/F147-A)
+    are the same "if-extent-in-set then refuse" pattern done five
+    times across 4 scattered inflight mechanisms. F207 collapses
+    them into one etcd-backed ledger.
+  - Layer boundary correction (user): split/merge are PS-layer
+    (partition-scoped), not stream-layer. The ledger is a stream-
+    layer concept covering ConvertToEc / Recovery / Delete only.
+    PS-layer handlers READ the ledger but do not enroll.
+  - PS-layer ↔ stream-layer interaction: three classes (A/B/C)
+    handled by refuse-at-start / verify-at-apply (F146 pattern) /
+    exclusive CAS — composes via asymmetric read/write
+    responsibilities.
 
-What was changed:
+What F207-A specifically did:
+  1. NEW crates/manager/src/extent_inflight.rs (~370 lines incl.
+     tests). Types:
+       - MgrExtentInflightRecord (flat-struct on-disk shape with
+         op_kind byte + three Option payloads, exactly one Some by
+         invariant — avoids being the proving ground for rkyv 0.8
+         enum CheckBytes support).
+       - ExtentOpKind discriminator (ConvertToEc / Recovery / Delete).
+       - ExtentOpPayload typed view enum (Rust-only, not rkyv).
+       - PersistedPendingDelete (drops the in-memory `attempts`
+         counter from the existing PendingDelete).
+     APIs:
+       - acquire_extent_inflight: CAS via create_revision==0 +
+         F149 leader fence (txn_fenced).
+       - build_extent_inflight_release_op: returns the etcd delete
+         Op for caller to bundle into its own apply-done txn (I3).
+       - commit_extent_inflight_release: in-memory cleanup.
+       - extent_inflight_op: read-only probe.
+       - decode_extent_inflight_kvs: replay-time decoder that drops
+         malformed records with WARN.
+  2. crates/manager/src/lib.rs:
+       - `mod extent_inflight;` declaration.
+       - `inflight: Rc<RefCell<HashMap<u64,
+         MgrExtentInflightRecord>>>` field on AutumnManager.
+       - Initialised in `new()`.
+       - Replay arm added to `replay_from_etcd` for the
+         `extent_inflight/` etcd prefix. Empty on pre-F207 clusters.
 
-  1. `crates/manager/src/recovery.rs` — added one line in
-     `apply_ec_conversion_done`:
-         ex.avali = Self::all_bits(target_nodes.len());
-     plus a multi-paragraph comment block explaining the
-     RE_AVALI / fetch_full_extent_from_sources chain that the
-     missing assignment had enabled.
+Six new unit tests cover the API:
+  - f207_acquire_extent_inflight_succeeds_when_empty
+  - f207_acquire_extent_inflight_rejects_duplicate
+  - f207_commit_extent_inflight_release_clears_probe
+  - f207_record_rkyv_round_trip_all_variants
+  - f207_unpack_rejects_malformed_records
+  - f207_decode_drops_malformed
 
-  2. `crates/stream/src/extent_node.rs::handle_re_avali` —
-     short-circuit `CODE_OK` return when
-     `extent_info.ec_converted == true`, placed AFTER
-     `apply_extent_meta_durable` (so local meta still refreshes
-     from manager on stale eversion) but BEFORE the
-     `local_len >= sealed_length` check. Also load-bearing as
-     the self-heal migration path for pre-F206 etcd entries.
-
-  3. `crates/manager/src/lib.rs` — new unit test
-     `f206_apply_ec_conversion_done_sets_avali_for_all_shards`.
-     Pre-EC fixture has K=3 replicas + avali=0x7; calls
-     apply_ec_conversion_done with target_nodes=[1,3,5,7]
-     (K=3+M=1); asserts ex.avali == 0xF post-call.
-
-  4. `crates/manager/tests/system_extent_recovery.rs` — tightened
-     existing assertion from `ext.avali > 0` to
-     `ext.avali == all_bits(replicates + parity)`. The old
-     looseness is exactly what let F206 ship undetected.
-
-  5. `crates/manager/CLAUDE.md` — programming note 20 added.
-  6. `crates/stream/CLAUDE.md` — Re-Avali section updated.
-  7. `feature_list.md` — F206 entry added (passes: true).
-  8. `README.md` — manual verification step added.
-  9. `claude-progress.txt` — this file.
+NOT in this phase (deferred to F207-B / F207-C / F207-D):
+  - Migration of EC convert (ec_conversion_dispatch_loop,
+    apply_ec_conversion_done, handle_force_ec_convert) — F207-B.
+  - Migration of recovery (dispatch_recovery_task,
+    apply_recovery_done) and delete (extent_delete_loop) — F207-C.
+  - Migration of the 9 scattered refuse-at-start sites in
+    rpc_handlers.rs to a single-line extent_inflight_op read —
+    F207-C.
+  - Cleanup of dual-replay backward-compat arms, stale-marker
+    sweep, CLAUDE.md note rewrites — F207-D.
 
 Verification:
-  - `cargo build --workspace --exclude autumn-fuse`: clean.
-  - `cargo test -p autumn-manager --lib`: 79 passed (78 → 79 with
-    new F206 test).
-  - `cargo test -p autumn-stream --lib`: 53 passed (no regression).
-  - User's running cluster: not migrated yet — they will rebuild
-    and observe the self-heal as the manager's
-    recovery_dispatch_loop hits the next tick (~2 s after
-    pointing extent-nodes + manager at the new binary).
+  - cargo build --workspace --exclude autumn-fuse: clean.
+  - cargo test -p autumn-manager --lib: 85 passed (was 79; +6 F207).
+    No regression in F126 / F138 / F139 / F145 / F147 / F198 / F206
+    suites — they all still pass because no handler is migrated yet.
 
 Backward compatibility:
-  - No wire / etcd schema change (avali field already exists).
-  - Pre-F206 etcd entries with `avali = all_bits(K)` on EC'd
-    extents auto-heal: the manager fires RE_AVALI for the parity
-    slot, extent-node returns CODE_OK immediately (Bug B fix),
-    manager's mark_extent_available ORs in the bit and persists.
-    No manual repair script needed.
+  - Phase 0 introduces a NEW etcd prefix (extent_inflight/) that no
+    handler writes to yet. Existing prefixes
+    (ecConversionInflight/, recoveryTasks/) untouched.
+  - On any cluster, the replay arm reads an empty prefix → in-memory
+    map starts empty → API is dormant until F207-B writes the first
+    record. Zero behavioural diff in Phase 0.
 
 Memory:
-  - No new memory needed. This is a code-resident bug fix; the
-    rationale lives in feature_list.md F206 + the two CLAUDE.md
-    updates.
+  - No new memory entry. The architectural rationale + layer
+    boundary clarification live in feature_list.md F207-A and the
+    plan file ~/.claude/plans/stream-merge-split-ps-sorted-
+    dijkstra.md.
 
-Next session starting point: no pending. New work uses F207+.
+Next session starting point: F207-B (Phase 1 — migrate EC convert).
+The plan file has the detailed walkthrough including before/after
+code snippets for handle_force_ec_convert, ec_conversion_dispatch_
+loop, and apply_ec_conversion_done. Critical atomicity improvement:
+F207-B bundles `put extents/<id>` + `delete extent_inflight/<id>`
+into a single txn_fenced call, closing the latent leak window
+between today's two separate etcd writes in apply_ec_conversion_done.
