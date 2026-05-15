@@ -933,6 +933,55 @@ reconcile path manually: stop a node before running `gc`, run the
 GC, then restart that node and observe its data dir shrink as the
 reconcile completes during boot.
 
+#### F201 — multi-tier `client gc` flags (2026-05-15)
+
+The `gc` command accepts optional filter flags so operators (and
+external policy controllers) can target specific tiers of reclaimable
+extents without rebuilding the PS:
+
+```bash
+# Default (matches pre-F201): discard_ratio > 0.4 AND F201 empty-extent
+# pick — punches both garbage-heavy AND empty sealed slots.
+$AC gc <PARTID>
+
+# Only sealed-length=0 non-tail extents (cheapest possible — no rewrite).
+# Use this when `info` shows empty `(open), 0 B` sealed slots.
+$AC gc <PARTID> --empty-only
+
+# Aggressive: 10% dead is enough.
+$AC gc <PARTID> --ratio 0.1
+
+# Mixed: relax ratio for small extents (any extent < 16 MiB that is at
+# least 10% dead becomes eligible).
+$AC gc <PARTID> --max-size 16MiB --ratio 0.1
+
+# Stream-debt-aware: when the partition's total reclaimable bytes
+# exceed 1 GiB, the PS halves the ratio internally for this dispatch.
+$AC gc <PARTID> --stream-debt 1GiB --ratio 0.4
+```
+
+Byte-size flags (`--max-size`, `--stream-debt`) accept K/M/G/T(i)B
+suffixes case-insensitively (e.g. `512K`, `16MiB`, `1G`, `2T`).
+
+The F201 user-reported case (`(open), 0 B` sealed extents stuck in
+`extent_ids` forever):
+
+```bash
+cluster.sh reset 4 && cluster.sh start
+$AC bootstrap --replication 3+0 --log-ec 3+1 --row-ec 3+1
+$AC perf-check --duration 60        # produces 0-byte sealed log_stream extents
+
+$AC info                            # observe `(open), 0 B` on some sealed-position extents
+$AC gc <PARTID> --empty-only        # cheapest cleanup path
+$AC info                            # 0-byte sealed extents are gone
+```
+
+If you run `client gc` concurrently with an EC convert on the same
+extent, the manager refuses the punch with `CODE_PRECONDITION`. F201's
+cooldown classifier puts that extent on a 30 s soft cooldown (instead
+of 5 min) so a manual retry, or the periodic GC tick, picks it up
+again as soon as the EC convert completes.
+
 ### Benchmarks
 
 ```bash

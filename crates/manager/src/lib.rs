@@ -797,6 +797,11 @@ impl AutumnManager {
                         part_id: pid,
                         op: autumn_rpc::partition_rpc::MAINTENANCE_FLUSH,
                         extent_ids: vec![],
+                        // F201 wire fields — ignored for FLUSH op.
+                        gc_ratio: None,
+                        gc_max_size: None,
+                        gc_stream_debt: None,
+                        gc_empty_only: false,
                     },
                 );
                 // 60 s — MAINTENANCE_FLUSH rotates active + drains the

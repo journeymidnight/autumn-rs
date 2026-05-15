@@ -1394,6 +1394,53 @@ Cleared by audit (no fix needed):
 - **Files:** `feature_list.md`, `claude-progress.txt`. (No code changes.)
 - **passes:** true (audit-cleared)
 
+### F201 · GC trigger logic overhaul: empty-sealed bug fix + multi-tier params + cooldown classification (mechanism / policy separation Stage 1)
+- **Trigger:** User reported 2026-05-14 with `info` output showing partition 15's log_stream extents `[26, 27, 28, 29, 30]` where 27/28 were `(open), 0 B` (sealed by position in `extent_ids[..len-1]` but with `sealed_length=0` on the manager — extents allocated then immediately sealed by `stream_alloc_extent`'s commit_length capture before any append). These slots were pinned in `extent_ids` forever:
+  1. `background_gc_loop::GcTask::Auto` built `candidates` from `discards.keys()` (line 520), but empty extents never appear in any SST's `MetaBlock.discards` → they were never even *considered* for GC.
+  2. Even if they had reached the loop body, `if sealed_length == 0 { continue; }` (line 533) unconditionally skipped them.
+  Combined with the user's broader request "把 auto policy 放到外面" (mechanism / policy separation), this is Stage 1 of a 3-stage refactor: fix the mechanism-level bugs and add the multi-tier knobs that external controllers / OP scripts need before Stage 2/3 actually delete the in-kernel auto-dispatch.
+- **Three changes (all isolated mechanism-level improvements; no policy retreat yet):**
+  1. **GC candidate-set expanded + empty-extent picks** (`background.rs::background_gc_loop`):
+     - `candidates` now iterates ALL `sealed_extents` (slice = `extent_ids[..len-1]`), sorted by reclaimable bytes desc; zero-discard extents land last but reachable.
+     - `if sealed_length == 0 { ... }` is now a positive branch: push to `holes` directly (the `tail` exclusion is already enforced by the `sealed_extents` slice, so any extent reaching this branch is by construction not the tail). `run_gc(eid, 0)` skips the `while cur < sealed_length` read loop and proceeds straight to `flush_gc_batch` (no-op) + `punch_holes` — exactly what an empty slot needs.
+  2. **F199 cooldown classification by error type** (new pure helper `classify_gc_failure_cooldown`):
+     - Pre-F201: single 300 s window for every `run_gc` failure.
+     - Post-F201: 30 s soft window for failures whose anyhow chain contains `"precondition failed"` (manager rejects `punch_holes` because the target extent is in `ec_conversion_inflight` per F138/F145) or `"eversion mismatch"` (autumn-stream `EversionStale` sentinel — stale `extent_info_cache` after an EC bump). 300 s hard window for everything else (network timeout, irrecoverable EC shard shortage, decode error).
+     - String-based classification is intentional: both phrases are documented wire surfaces (manager `AppError::Precondition` Display + stream-client `EversionStale` Display) and grepping them here is a defense-in-depth: any future rename of either sentinel immediately demotes the classifier to "hard cooldown", which is safe.
+     - `gc_failure_cooldown` map shape changed from `HashMap<u64, Instant>` to `HashMap<u64, (Instant, Duration)>` so each entry carries its own window; the retain/skip checks now read the per-entry duration.
+  3. **Multi-tier `GcTask::Auto` params + `client gc` CLI flags + wire change**:
+     - `GcTask::Auto` now carries `GcAutoParams { ratio, max_size, stream_debt, empty_only }`. `Default` reproduces pre-F201 single-tier behaviour (`ratio = None → 0.4`, no upper bound, no stream-debt relaxation, not empty-only) + the F201 empty-extent pick path.
+     - `MaintenanceReq` (wire struct) gained four optional fields: `gc_ratio: Option<f64>`, `gc_max_size: Option<u64>`, `gc_stream_debt: Option<u64>`, `gc_empty_only: bool`. **Backward-incompatible** at rkyv level — same-commit upgrade for manager + PS + client required (cluster.sh handles this by stopping all roles before restart).
+     - `client gc` CLI accepts: `--ratio R` / `--max-size B[K|M|G|T]i?B?` / `--stream-debt B[K|M|G|T]i?B?` / `--empty-only`. New helper `parse_byte_size` accepts human-readable suffixes (`16M`, `1GiB`, etc.).
+     - SDK adds `ClusterClient::gc_with_params(part_id, GcAutoParams)`; existing `gc(part_id)` now wraps `gc_with_params(part_id, Default::default())` for back-compat.
+- **Why this is "mechanism" not "policy" (per Stage 1 boundary):**
+  - The empty-extent picks and the cooldown classification are pure bug fixes — the existing single-tier policy was logically wrong, and now it's right. No new auto-dispatch added.
+  - The multi-tier params are a *capability* exposed to the OP / external controller. The PS still passes them through to the existing single-pass selection — there's no PS-internal "tier scheduler". External controllers (or `cron + bash`) compose effective tiers by issuing multiple `client gc` invocations back-to-back with different flags.
+  - Stage 2 (F202) will route advisory output to `advisory_cache` for all 6 op kinds. Stage 3 (F203) will delete the in-kernel auto-dispatch loops outright.
+- **Files touched:**
+  - `crates/partition-server/src/background.rs`: GC candidate expansion + empty-extent pick + cooldown helper + tests (~120 lines).
+  - `crates/partition-server/src/lib.rs`: `GcTask::Auto` variant carries `GcAutoParams`; scheduler dispatch updated to pass `Default::default()`.
+  - `crates/partition-server/src/rpc_handlers.rs`: `MaintenanceReq` decoder forwards new fields to `GcAutoParams`.
+  - `crates/rpc/src/partition_rpc.rs`: 4 new fields on `MaintenanceReq` (wire change marked in the struct doc).
+  - `crates/client/src/lib.rs`: `gc_with_params` + public `GcAutoParams`; legacy `maintenance()` helper updated to send default values for the new fields.
+  - `crates/server/src/bin/autumn_client.rs`: `Gc` command extended; new `parse_byte_size` helper + 3 unit tests; `usage()` updated.
+  - `crates/manager/src/lib.rs`: `MaintenanceReq` construction in merge orchestration updated to include new default fields.
+  - `crates/manager/tests/{support,integration}.rs`: test fixtures updated.
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse` (lib + tests): clean.
+  - `cargo test -p autumn-partition-server --lib f201`: 4/4 (cooldown classifier sentinel cases).
+  - `cargo test -p autumn-server --bin autumn-client -- parse_byte_size`: 3/3.
+  - Two pre-existing `f099i_tests::*` flakes are unrelated (fail on pre-F201 HEAD too).
+- **Manual test (the user-reported case):**
+  1. `cluster.sh reset 4 && cluster.sh start`
+  2. `$AC bootstrap --replication 3+0 --log-ec 3+1 --row-ec 3+1`
+  3. `$AC perf-check --duration 60` — produces 0-byte sealed log_stream extents during alloc/seal cycles
+  4. `$AC info` — observe `(open), 0 B` on some sealed-position extents
+  5. `$AC gc <PARTID>` — empty extents now get picked and `punch_holes`'d on the very next GC dispatch
+  6. `$AC info` — 0-byte sealed extents are gone
+- **Stage roadmap reminder:** F202 = advisory_cache unified across 6 op kinds; F203 = delete in-kernel auto-dispatch + must-cleanup-only kernel + cron-based external controller example. See plan `elegant-tumbling-pumpkin.md`.
+- **passes:** true
+
 ### F200 · EC sub-range reconstruction — eliminate full-extent decode on single shard failure
 - **Target:** User correctly pointed out 2026-05-14 that F199's GC failure cooldown only suppresses retries — the real bug is in `ec_subrange_read`'s fall-back path. When a per-shard read fails for a sub-range request (e.g., GC chunking through a 2.8 GB EC(3+1) extent reading 64 MiB at a time, touching only shard 0), the function falls back to `ec_read_full_and_slice` which:
   1. Reads ALL `(K + M)` shards at full size via `ec_read_full` (each issues `length=0` = "read to end").

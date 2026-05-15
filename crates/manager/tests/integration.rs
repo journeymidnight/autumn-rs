@@ -142,6 +142,10 @@ async fn ps_flush(ps: &RpcClient, part_id: u64) {
                 part_id,
                 op: partition_rpc::MAINTENANCE_FLUSH,
                 extent_ids: vec![],
+                gc_ratio: None,
+                gc_max_size: None,
+                gc_stream_debt: None,
+                gc_empty_only: false,
             }),
         )
         .await
@@ -160,6 +164,10 @@ async fn ps_compact(ps: &RpcClient, part_id: u64) {
                 part_id,
                 op: partition_rpc::MAINTENANCE_COMPACT,
                 extent_ids: vec![],
+                gc_ratio: None,
+                gc_max_size: None,
+                gc_stream_debt: None,
+                gc_empty_only: false,
             }),
         )
         .await
@@ -177,6 +185,10 @@ async fn ps_gc(ps: &RpcClient, part_id: u64) {
                 part_id,
                 op: partition_rpc::MAINTENANCE_AUTO_GC,
                 extent_ids: vec![],
+                gc_ratio: None,
+                gc_max_size: None,
+                gc_stream_debt: None,
+                gc_empty_only: false,
             }),
         )
         .await

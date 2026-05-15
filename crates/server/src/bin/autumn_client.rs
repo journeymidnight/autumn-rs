@@ -156,6 +156,15 @@ enum Command {
     },
     Gc {
         part_id: u64,
+        /// F201: discard-ratio threshold; None = use PS default (0.4).
+        ratio: Option<f64>,
+        /// F201: only consider sealed extents at most this many bytes.
+        max_size: Option<u64>,
+        /// F201: when partition's total reclaimable bytes exceed this,
+        /// PS halves the per-extent ratio for this dispatch.
+        stream_debt: Option<u64>,
+        /// F201: only pick `sealed_length == 0` non-tail extents.
+        empty_only: bool,
     },
     ForceGc {
         part_id: u64,
@@ -221,18 +230,30 @@ fn usage() -> ! {
     eprintln!("Usage: autumn-client --manager <ADDR> <COMMAND>");
     eprintln!();
     eprintln!("Commands:");
-    eprintln!("  bootstrap [--replication 3+0] [--presplit 1:normal|N:hexstring]");
-    eprintln!("                                    Create initial partition(s)");
+    eprintln!("  bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal|N:hexstring]");
+    eprintln!("                                    Create initial partition(s) and streams");
+    eprintln!("  set-stream-ec --stream <ID> --ec K+M");
+    eprintln!("                                    Change EC policy of an existing stream (FOPS-03)");
     eprintln!("  put <KEY> <FILE>                  Put key with value from file");
-    eprintln!("  streamput <KEY> <FILE>             Stream-put large file in chunks");
+    eprintln!("  streamput <KEY> <FILE>            Stream-put large file in 512KB chunks");
+    eprintln!("  put-stream [--chunk-size N] <KEY> <FILE-or->>");
+    eprintln!("                                    Chunked stream put (default 4 MiB chunks)");
     eprintln!("  get <KEY>                         Get value for key");
+    eprintln!("  get-stream [--chunk-size N] [--out FILE] <KEY>");
+    eprintln!("                                    Chunked stream get (default 4 MiB chunks)");
     eprintln!("  del <KEY>                         Delete key");
     eprintln!("  head <KEY>                        Get key metadata (size)");
     eprintln!("  ls [--prefix P] [--start S] [--limit N]  List keys");
     eprintln!("  split <PARTID>                    Split partition");
+    eprintln!("  merge <SURVIVOR_PARTID> <VICTIM_PARTID>");
+    eprintln!("                                    Merge two adjacent partitions on the same PS (F183)");
+    eprintln!("  policy                            Show advisory split/merge candidates from the manager (F183)");
     eprintln!("  compact <PARTID>                  Trigger major compaction");
-    eprintln!("  gc <PARTID>                       Trigger auto GC");
+    eprintln!("  gc [--ratio R] [--max-size B] [--stream-debt B] [--empty-only] <PARTID>");
+    eprintln!("                                    Trigger auto GC (F201: optional multi-tier filters)");
     eprintln!("  forcegc <PARTID> <EXTID>...       Force GC specific extents");
+    eprintln!("  register-node --addr <ADDR> --disk <UUID> [--disk <UUID>...] [--shard-ports P1,P2,...] [--control-address <ADDR>]");
+    eprintln!("                                    Register an already-formatted extent node with the manager");
     eprintln!("  format --listen <ADDR> --advertise <ADDR> <DIR>...");
     eprintln!("                                    Format disks and register node");
     eprintln!("  wbench [--threads 4] [--duration 10] [--size 8192] [--report-interval 1] [--part-id ID] [--reuse-value true|false]");
@@ -524,12 +545,51 @@ fn parse_args() -> Args {
             }
         }
         "gc" => {
+            // F201: gc [--ratio R] [--max-size B] [--stream-debt B] [--empty-only] <PARTID>
+            let mut ratio: Option<f64> = None;
+            let mut max_size: Option<u64> = None;
+            let mut stream_debt: Option<u64> = None;
+            let mut empty_only = false;
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--ratio" => {
+                        i += 1;
+                        ratio = Some(raw[i].parse().unwrap_or_else(|_| {
+                            eprintln!("--ratio expects a float 0.0..=1.0");
+                            std::process::exit(1);
+                        }));
+                    }
+                    "--max-size" => {
+                        i += 1;
+                        max_size = Some(parse_byte_size(&raw[i]).unwrap_or_else(|e| {
+                            eprintln!("--max-size: {e}");
+                            std::process::exit(1);
+                        }));
+                    }
+                    "--stream-debt" => {
+                        i += 1;
+                        stream_debt = Some(parse_byte_size(&raw[i]).unwrap_or_else(|e| {
+                            eprintln!("--stream-debt: {e}");
+                            std::process::exit(1);
+                        }));
+                    }
+                    "--empty-only" => {
+                        empty_only = true;
+                    }
+                    _ => break,
+                }
+                i += 1;
+            }
             if i >= raw.len() {
                 eprintln!("gc requires <PARTID>");
                 std::process::exit(1);
             }
             Command::Gc {
                 part_id: raw[i].parse().expect("PARTID must be a number"),
+                ratio,
+                max_size,
+                stream_debt,
+                empty_only,
             }
         }
         "forcegc" => {
@@ -841,6 +901,40 @@ fn warn_nosync_deprecated_once() {
              unchanged from --sync."
         );
     });
+}
+
+/// F201: accept human-readable byte sizes for `--max-size` / `--stream-debt`.
+/// Plain integers are bytes; suffixes (B/K/M/G/Ki/Mi/Gi, case-insensitive,
+/// optional "B" tail) scale accordingly. Examples: "16777216", "16MiB",
+/// "1G", "512K".
+fn parse_byte_size(s: &str) -> Result<u64> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        bail!("empty byte-size value");
+    }
+    let bytes = trimmed.as_bytes();
+    let mut split = bytes.len();
+    for (i, &b) in bytes.iter().enumerate() {
+        if !b.is_ascii_digit() && b != b'.' {
+            split = i;
+            break;
+        }
+    }
+    let (num, unit) = trimmed.split_at(split);
+    let num: f64 = num.parse().context("byte-size numeric prefix")?;
+    let mul: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" | "kib" => 1024.0,
+        "m" | "mb" | "mib" => 1024.0 * 1024.0,
+        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "tb" | "tib" => 1024.0_f64.powi(4),
+        other => bail!("unknown byte-size suffix {other:?}"),
+    };
+    let n = (num * mul).round();
+    if n.is_sign_negative() || !n.is_finite() {
+        bail!("byte-size out of range");
+    }
+    Ok(n as u64)
 }
 
 fn parse_replication(s: &str) -> Result<u32> {
@@ -1161,6 +1255,34 @@ mod tests {
         assert_eq!(super::derive_control_address(""), "");
         // port overflow → empty
         assert_eq!(super::derive_control_address("127.0.0.1:65000"), "");
+    }
+
+    /// F201: --max-size / --stream-debt accept human-readable byte
+    /// sizes. Test the canonical shapes operators are most likely to
+    /// type.
+    #[test]
+    fn parse_byte_size_accepts_plain_integer() {
+        assert_eq!(super::parse_byte_size("16777216").unwrap(), 16 * 1024 * 1024);
+        assert_eq!(super::parse_byte_size("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_byte_size_accepts_suffixes() {
+        assert_eq!(super::parse_byte_size("512K").unwrap(), 512 * 1024);
+        assert_eq!(super::parse_byte_size("16M").unwrap(), 16 * 1024 * 1024);
+        assert_eq!(super::parse_byte_size("16MiB").unwrap(), 16 * 1024 * 1024);
+        assert_eq!(super::parse_byte_size("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(super::parse_byte_size("1GiB").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(super::parse_byte_size("2T").unwrap(), 2u64 * 1024 * 1024 * 1024 * 1024);
+        // case insensitive
+        assert_eq!(super::parse_byte_size("4mib").unwrap(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_byte_size_rejects_garbage() {
+        assert!(super::parse_byte_size("").is_err());
+        assert!(super::parse_byte_size("foo").is_err());
+        assert!(super::parse_byte_size("16XB").is_err());
     }
 
     #[test]
@@ -1652,10 +1774,23 @@ async fn main() -> Result<()> {
             println!("compact triggered for partition {part_id}");
         }
 
-        Command::Gc { part_id } => {
-            client.gc(part_id).await
+        Command::Gc { part_id, ratio, max_size, stream_debt, empty_only } => {
+            // F201: forward multi-tier params. Default (no flags) →
+            // pre-F201 single-tier behaviour + empty-sealed pick.
+            let params = autumn_client::GcAutoParams {
+                ratio,
+                max_size,
+                stream_debt,
+                empty_only,
+            };
+            client
+                .gc_with_params(part_id, params.clone())
+                .await
                 .map_err(|e| anyhow!("gc: {e}"))?;
-            println!("gc triggered for partition {part_id}");
+            println!(
+                "gc triggered for partition {part_id} (ratio={:?} max_size={:?} stream_debt={:?} empty_only={})",
+                params.ratio, params.max_size, params.stream_debt, params.empty_only
+            );
         }
 
         Command::ForceGc {

@@ -223,12 +223,34 @@ pub struct StreamPutReq {
 // commit point.
 
 /// Maintenance operations.
+///
+/// **F201 wire change (backward-incompatible)**: added four optional
+/// fields to carry auto-GC filter parameters (`gc_ratio`,
+/// `gc_max_size`, `gc_stream_debt`, `gc_empty_only`). Old binaries
+/// that still encode the 3-field shape will fail to decode against
+/// the new struct, and vice versa. Same-commit upgrade required;
+/// cluster.sh handles this by stopping all roles before restart.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct MaintenanceReq {
     pub part_id: u64,
-    /// 0 = compact, 1 = auto_gc, 2 = force_gc
+    /// 0 = compact, 1 = auto_gc, 2 = force_gc, 3 = flush
     pub op: u8,
     pub extent_ids: Vec<u64>,
+    /// F201: filter — discard ratio threshold (0.0..=1.0). `None` → 0.4
+    /// (`GC_DISCARD_RATIO`). Used only when `op == MAINTENANCE_AUTO_GC`.
+    pub gc_ratio: Option<f64>,
+    /// F201: filter — only consider sealed extents whose `sealed_length`
+    /// is at most this many bytes. Combined with a lower `gc_ratio`
+    /// lets the caller say "punch small extents at even 10% dead".
+    pub gc_max_size: Option<u64>,
+    /// F201: stream-level dead-byte high-water hint. When the partition's
+    /// total reclaimable bytes exceed this, the per-extent ratio is
+    /// halved for this dispatch.
+    pub gc_stream_debt: Option<u64>,
+    /// F201: only pick `sealed_length == 0` non-tail extents (cheapest
+    /// possible GC — no rewrite, just punch_holes). Overrides
+    /// `gc_ratio` / `gc_max_size` when true.
+    pub gc_empty_only: bool,
 }
 
 pub const MAINTENANCE_COMPACT: u8 = 0;

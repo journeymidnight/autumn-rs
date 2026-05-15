@@ -932,7 +932,37 @@ impl ClusterClient {
 
     /// Trigger automatic GC on a partition.
     pub async fn gc(&self, part_id: u64) -> std::result::Result<(), AutumnError> {
-        self.maintenance(part_id, MAINTENANCE_AUTO_GC, vec![]).await
+        self.gc_with_params(part_id, GcAutoParams::default()).await
+    }
+
+    /// F201: trigger automatic GC with multi-tier filter parameters.
+    /// `params` is forwarded verbatim to the PS-side selection logic.
+    /// Default `GcAutoParams::default()` matches pre-F201 behaviour
+    /// (`discard_ratio > 0.4`, plus the new empty-sealed-extent free
+    /// path).
+    pub async fn gc_with_params(
+        &self,
+        part_id: u64,
+        params: GcAutoParams,
+    ) -> std::result::Result<(), AutumnError> {
+        let req = MaintenanceReq {
+            part_id,
+            op: MAINTENANCE_AUTO_GC,
+            extent_ids: vec![],
+            gc_ratio: params.ratio,
+            gc_max_size: params.max_size,
+            gc_stream_debt: params.stream_debt,
+            gc_empty_only: params.empty_only,
+        };
+        let resp_bytes = self
+            .call_ps_for_part(part_id, MSG_MAINTENANCE, rkyv_encode(&req))
+            .await?;
+        let resp: MaintenanceResp =
+            rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
+        if resp.code != partition_rpc::CODE_OK {
+            return Err(code_to_error(resp.code, resp.message));
+        }
+        Ok(())
     }
 
     /// Force GC of specific extents on a partition.
@@ -1019,7 +1049,19 @@ impl ClusterClient {
     async fn maintenance(&self, part_id: u64, op: u8, extent_ids: Vec<u64>) -> std::result::Result<(), AutumnError> {
         let resp_bytes = self.call_ps_for_part(
             part_id, MSG_MAINTENANCE,
-            rkyv_encode(&MaintenanceReq { part_id, op, extent_ids }),
+            rkyv_encode(&MaintenanceReq {
+                part_id,
+                op,
+                extent_ids,
+                // F201: legacy callers (compact / force_gc / flush)
+                // don't supply GC tier params — they're ignored when
+                // op != MAINTENANCE_AUTO_GC anyway. Defaults match
+                // pre-F201 wire shape semantically.
+                gc_ratio: None,
+                gc_max_size: None,
+                gc_stream_debt: None,
+                gc_empty_only: false,
+            }),
         ).await?;
         let resp: MaintenanceResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code != partition_rpc::CODE_OK {
@@ -1027,6 +1069,17 @@ impl ClusterClient {
         }
         Ok(())
     }
+}
+
+/// F201: SDK-visible mirror of the PS-side `GcAutoParams`. Forwarded
+/// verbatim through `MaintenanceReq` to the partition's GC loop.
+/// Default matches pre-F201 behaviour (`discard_ratio > 0.4`).
+#[derive(Default, Clone, Debug)]
+pub struct GcAutoParams {
+    pub ratio: Option<f64>,
+    pub max_size: Option<u64>,
+    pub stream_debt: Option<u64>,
+    pub empty_only: bool,
 }
 
 // ── F186 client-side striperados (Ceph-style) ─────────────────────────────

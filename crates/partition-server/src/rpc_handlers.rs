@@ -495,8 +495,22 @@ pub(crate) async fn handle_maintenance(payload: Bytes, part: &Rc<RefCell<Partiti
     let mut p = part.borrow_mut();
     let result = match req.op {
         MAINTENANCE_COMPACT => p.compact_tx.try_send(true).map_err(|_| "compaction busy"),
-        MAINTENANCE_AUTO_GC => p.gc_tx.try_send(GcTask::Auto).map_err(|_| "gc busy"),
-        MAINTENANCE_FORCE_GC => p.gc_tx.try_send(GcTask::Force { extent_ids: req.extent_ids }).map_err(|_| "gc busy"),
+        MAINTENANCE_AUTO_GC => {
+            // F201: decode multi-tier filter params from wire request.
+            let params = crate::GcAutoParams {
+                ratio: req.gc_ratio,
+                max_size: req.gc_max_size,
+                stream_debt: req.gc_stream_debt,
+                empty_only: req.gc_empty_only,
+            };
+            p.gc_tx
+                .try_send(GcTask::Auto(params))
+                .map_err(|_| "gc busy")
+        }
+        MAINTENANCE_FORCE_GC => p
+            .gc_tx
+            .try_send(GcTask::Force { extent_ids: req.extent_ids })
+            .map_err(|_| "gc busy"),
         _ => Err("unknown op"),
     };
     match result {

@@ -339,19 +339,31 @@ pub(crate) async fn background_gc_loop(
 ) {
     const MAX_GC_ONCE: usize = 3;
     const GC_DISCARD_RATIO: f64 = 0.4;
-    // F199: per-extent failure cooldown. When `run_gc` fails on an
-    // extent (typically because a data shard's host node has an
-    // offline disk → `ec_subrange_read` falls back to
-    // `ec_read_full_and_slice` which times out trying to download the
-    // whole 933+ MB shard set), skip that extent in subsequent local
-    // ticks for `GC_FAILURE_COOLDOWN`. Without this, the local 5-7 s
-    // random-delay loop hammered the broken extent every cycle —
-    // each cycle launching parallel reads across all replicas for
-    // multi-GB shards and timing out. Observed by user on macOS test
-    // cluster: continuous CPU/IO saturation from GC retries against
-    // a permanently-degraded EC layout (one node's disk offline).
+    // F199 + F201: per-extent failure cooldown. F199 introduced a
+    // single 300 s window covering "hard" faults (broken EC layout,
+    // dead node, etc.) so repeated 5-7 s ticks didn't keep
+    // hammering doomed `ec_read_full_and_slice` fall-backs. F201
+    // splits this into two windows by error class:
+    //
+    //   - Hard fault (300 s): network/disk timeout, decode error,
+    //     EC shards genuinely unreachable. Retrying every 5-7 s
+    //     wastes IO with no chance of success until upstream heals.
+    //   - Recoverable race (30 s): `precondition failed` or
+    //     `eversion mismatch`. Typical cause is a concurrent EC
+    //     conversion holding `ec_conversion_inflight` (F138/F145) →
+    //     manager refuses `punch_holes` with CODE_PRECONDITION.
+    //     The competing operation completes in seconds; a 5 min
+    //     suppression is far too long for what is, by construction,
+    //     a transient cooperative race. 30 s ≪ 300 s but still
+    //     long enough to absorb the typical EC-convert window
+    //     (a few seconds) plus a few `ec_conversion_dispatch_loop`
+    //     ticks (5 s each).
     const GC_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
-    let mut gc_failure_cooldown: std::collections::HashMap<u64, Instant> =
+    const GC_FAILURE_COOLDOWN_SOFT: Duration = Duration::from_secs(30);
+    // (Instant, Duration) lets each entry carry its own cooldown so
+    // a soft+hard mix on the same partition uses the right window
+    // per extent.
+    let mut gc_failure_cooldown: std::collections::HashMap<u64, (Instant, Duration)> =
         std::collections::HashMap::new();
     // F188: short timer for `gc_debt_bytes` metric refresh. The Auto
     // task that fires off the timer ALSO refreshes the metric, but
@@ -431,16 +443,19 @@ pub(crate) async fn background_gc_loop(
                             }
                             GcTask::Force { extent_ids }
                         }
-                        (GcTask::Force { extent_ids }, GcTask::Auto) => GcTask::Force { extent_ids },
-                        (GcTask::Auto, GcTask::Force { extent_ids }) => GcTask::Force { extent_ids },
-                        (GcTask::Auto, GcTask::Auto) => GcTask::Auto,
+                        (GcTask::Force { extent_ids }, GcTask::Auto(_)) => GcTask::Force { extent_ids },
+                        (GcTask::Auto(_), GcTask::Force { extent_ids }) => GcTask::Force { extent_ids },
+                        // F201: when two Auto ticks coalesce, keep the
+                        // most-recent params (the operator's latest
+                        // intent supersedes anything queued behind it).
+                        (GcTask::Auto(_), GcTask::Auto(p2)) => GcTask::Auto(p2),
                     };
                 }
                 chosen
             }
             GcSel::Timeout => {
                 next_auto_delay = random_delay();
-                GcTask::Auto
+                GcTask::Auto(crate::GcAutoParams::default())
             }
         };
 
@@ -514,14 +529,51 @@ pub(crate) async fn background_gc_loop(
                 let idx: HashSet<u64> = sealed_extents.iter().copied().collect();
                 extent_ids.iter().copied().filter(|e| idx.contains(e)).take(MAX_GC_ONCE).collect()
             }
-            GcTask::Auto => {
+            GcTask::Auto(ref params) => {
                 let discards = tick_discards;
 
-                let mut candidates: Vec<u64> = discards.keys().copied().collect();
-                candidates.sort_by(|a, b| discards[b].cmp(&discards[a]));
+                // F201: candidate set is ALL sealed (non-tail) extents,
+                // not just those with non-zero discard. Empty sealed
+                // extents (sealed_length == 0, allocated but never
+                // received data before stream_alloc_extent sealed them
+                // via commit_length capture) never appear in any SST's
+                // `discards` map, so the pre-F201 code path (which
+                // built `candidates` from `discards.keys()`) never even
+                // considered them — they stayed pinned in `extent_ids`
+                // forever. We now iterate every sealed extent, sorted
+                // by reclaimable bytes desc (zero-discard extents land
+                // last but still reachable).
+                let mut candidates: Vec<u64> =
+                    sealed_extents.iter().copied().collect();
+                candidates.sort_by(|a, b| {
+                    let da = discards.get(a).copied().unwrap_or(0);
+                    let db = discards.get(b).copied().unwrap_or(0);
+                    db.cmp(&da)
+                });
+
+                // F201: resolve effective filter parameters. If the
+                // caller asked for `empty_only`, short-circuit other
+                // filters. Else apply `ratio` (default 0.4) optionally
+                // halved when stream-level dead bytes cross
+                // `stream_debt`, plus `max_size` upper bound.
+                let stream_dead: u64 = discards.values()
+                    .map(|v| (*v).max(0) as u64)
+                    .sum();
+                let stream_debt_hit = params
+                    .stream_debt
+                    .map_or(false, |hw| stream_dead >= hw);
+                let effective_ratio = if params.empty_only {
+                    f64::INFINITY // ratio gate unreachable
+                } else {
+                    let r = params.ratio.unwrap_or(GC_DISCARD_RATIO);
+                    if stream_debt_hit { r * 0.5 } else { r }
+                };
 
                 let mut holes = Vec::new();
-                for eid in candidates.into_iter().take(MAX_GC_ONCE) {
+                for eid in candidates {
+                    if holes.len() >= MAX_GC_ONCE {
+                        break;
+                    }
                     let info = match part_sc.get_extent_info(eid).await {
                         Ok(info) => info,
                         Err(e) => {
@@ -531,10 +583,32 @@ pub(crate) async fn background_gc_loop(
                     };
                     let sealed_length = info.sealed_length as u32;
                     if sealed_length == 0 {
+                        // F201: empty sealed extent — no live data to
+                        // rewrite, just punch. `run_gc` with
+                        // sealed_length=0 skips the read loop and goes
+                        // straight to flush_gc_batch (no-op) +
+                        // punch_holes. Pre-F201 line 533
+                        // unconditionally skipped these, even when
+                        // they were non-tail. Empty-sealed extents are
+                        // always eligible (they don't read `ratio` /
+                        // `max_size`) — they're a strict win.
+                        holes.push(eid);
                         continue;
                     }
-                    let ratio = discards[&eid] as f64 / sealed_length as f64;
-                    if ratio > GC_DISCARD_RATIO {
+                    if params.empty_only {
+                        continue;
+                    }
+                    if let Some(mx) = params.max_size {
+                        if (sealed_length as u64) > mx {
+                            continue;
+                        }
+                    }
+                    let discard_bytes = discards.get(&eid).copied().unwrap_or(0);
+                    if discard_bytes <= 0 {
+                        continue;
+                    }
+                    let ratio = discard_bytes as f64 / sealed_length as f64;
+                    if ratio > effective_ratio {
                         holes.push(eid);
                     }
                 }
@@ -548,20 +622,20 @@ pub(crate) async fn background_gc_loop(
         // are evicted lazily to keep the map bounded.
         if !is_force {
             let now = Instant::now();
+            // Evict stale entries (past their own cooldown window).
             gc_failure_cooldown
-                .retain(|_, t| now.duration_since(*t) < GC_FAILURE_COOLDOWN);
+                .retain(|_, (t, dur)| now.duration_since(*t) < *dur);
             let initial_len = holes.len();
             holes.retain(|eid| {
                 gc_failure_cooldown
                     .get(eid)
-                    .map_or(true, |t| now.duration_since(*t) >= GC_FAILURE_COOLDOWN)
+                    .map_or(true, |(t, dur)| now.duration_since(*t) >= *dur)
             });
             if holes.len() < initial_len {
                 tracing::info!(
                     skipped = initial_len - holes.len(),
                     remaining = holes.len(),
-                    cooldown_secs = GC_FAILURE_COOLDOWN.as_secs(),
-                    "F199: GC skipping recently-failed extents (cooldown active)"
+                    "F199+F201: GC skipping recently-failed extents (cooldown active)"
                 );
             }
         }
@@ -606,15 +680,17 @@ pub(crate) async fn background_gc_loop(
                     gc_failure_cooldown.remove(&eid);
                 }
                 Err(e) => {
-                    tracing::error!("GC run_gc extent {eid}: {e}");
-                    // F199: stamp the failure so subsequent local ticks
-                    // skip this extent for GC_FAILURE_COOLDOWN. The
-                    // typical failure (`only N/K shards available for
-                    // EC decode`) means at least one data shard's host
-                    // disk is offline; retrying every 5-7 s would just
-                    // burn CPU/IO on doomed `ec_read_full_and_slice`
-                    // fall-back attempts.
-                    gc_failure_cooldown.insert(eid, Instant::now());
+                    let dur = classify_gc_failure_cooldown(
+                        &e,
+                        GC_FAILURE_COOLDOWN_SOFT,
+                        GC_FAILURE_COOLDOWN,
+                    );
+                    tracing::error!(
+                        extent_id = eid,
+                        cooldown_secs = dur.as_secs(),
+                        "GC run_gc extent: {e}"
+                    );
+                    gc_failure_cooldown.insert(eid, (Instant::now(), dur));
                 }
             }
         }
@@ -1520,6 +1596,31 @@ pub(crate) fn remove_compacted_tables(part: &mut PartitionData, compact_keys: &H
         } else {
             i += 1;
         }
+    }
+}
+
+/// F201: classify a `run_gc` failure into a cooldown duration. Scans
+/// the anyhow chain for sentinel substrings used by recoverable
+/// cooperative races: `"precondition failed"` (from
+/// `AppError::Precondition` Display — manager rejects punch_holes
+/// while `ec_conversion_inflight` per F138/F145) and `"eversion
+/// mismatch"` (from autumn-stream's private `EversionStale` sentinel
+/// — stale `extent_info_cache` after an EC bump). Soft cooldown lets
+/// these recover in ~30 s; hard cooldown applies to anything else
+/// (timeouts, irrecoverable EC shard shortage, etc.).
+pub(crate) fn classify_gc_failure_cooldown(
+    e: &anyhow::Error,
+    soft: Duration,
+    hard: Duration,
+) -> Duration {
+    let recoverable = e.chain().any(|cause| {
+        let msg = cause.to_string();
+        msg.contains("precondition failed") || msg.contains("eversion mismatch")
+    });
+    if recoverable {
+        soft
+    } else {
+        hard
     }
 }
 
@@ -2734,5 +2835,80 @@ mod gc_streaming_tests {
                 assert_eq!(got.2, want.2, "split={split}: value mismatch");
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F201 — GC failure-cooldown classification tests
+// ---------------------------------------------------------------------------
+//
+// Pure-fn coverage for `classify_gc_failure_cooldown`. The full GC loop
+// is harder to unit-test (requires PartitionData + StreamClient
+// fixtures); this covers the classifier itself end-to-end via anyhow
+// chains representative of the production error shapes.
+
+#[cfg(test)]
+mod f201_classify_cooldown_tests {
+    use super::classify_gc_failure_cooldown;
+    use anyhow::anyhow;
+    use std::time::Duration;
+
+    const SOFT: Duration = Duration::from_secs(30);
+    const HARD: Duration = Duration::from_secs(300);
+
+    /// Manager rejects punch_holes with CODE_PRECONDITION while a
+    /// concurrent EC conversion holds `ec_conversion_inflight`. The
+    /// stream-client surfaces this as `anyhow!("punch_holes failed:
+    /// precondition failed: ...")`. Soft cooldown so we retry once
+    /// EC completes (typically within seconds).
+    #[test]
+    fn precondition_in_chain_uses_soft_cooldown() {
+        let inner = anyhow!("precondition failed: ec_conversion_inflight contains 42");
+        let outer = inner.context("punch_holes failed");
+        assert_eq!(
+            classify_gc_failure_cooldown(&outer, SOFT, HARD),
+            SOFT
+        );
+    }
+
+    /// Stream client returns `eversion mismatch (stale extent_info_cache)`
+    /// after the 2-attempt retry loop exhausts and the cache is still
+    /// stale — typically a momentary EC dispatch finishing mid-GC read.
+    /// Soft cooldown.
+    #[test]
+    fn eversion_mismatch_uses_soft_cooldown() {
+        let inner = anyhow!("eversion mismatch (stale extent_info_cache)");
+        let wrapped = inner.context("run_gc extent 42 process_gc_chunk read failed");
+        assert_eq!(
+            classify_gc_failure_cooldown(&wrapped, SOFT, HARD),
+            SOFT
+        );
+    }
+
+    /// Network timeout / disk failure / decode error — anything not on
+    /// the sentinel substring list gets the hard 300 s cooldown so we
+    /// don't burn IO retrying every 5-7 s against a broken EC layout.
+    #[test]
+    fn unrecognised_failure_uses_hard_cooldown() {
+        let err = anyhow!("connection closed mid-read");
+        assert_eq!(
+            classify_gc_failure_cooldown(&err, SOFT, HARD),
+            HARD
+        );
+    }
+
+    /// Empty top-level message but recognisable substring deeper in
+    /// the chain — still soft. Defends the classifier against future
+    /// callsite refactors that wrap the original error in additional
+    /// context layers.
+    #[test]
+    fn sentinel_deep_in_chain_still_recognised() {
+        let bottom = anyhow!("precondition failed: locked by ec");
+        let middle = bottom.context("manager rejected request");
+        let top = middle.context("punch_holes failed");
+        assert_eq!(
+            classify_gc_failure_cooldown(&top, SOFT, HARD),
+            SOFT
+        );
     }
 }

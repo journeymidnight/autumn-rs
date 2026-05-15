@@ -1,81 +1,130 @@
-Date: 2026-05-14
+Date: 2026-05-15
 TaskStatus: completed
-Task scope: F200 — proper fix for the EC sub-range fall-back path.
-            Replaces "decode whole extent on any shard-read failure"
-            with sub-range RS reconstruction.
+Task scope: F201 — Stage 1 of the mechanism/policy separation refactor.
+            Fix GC trigger logic, classify F199 cooldown by error type,
+            expose multi-tier params on `client gc` + Maintenance RPC.
 
-User-corrected analysis (2026-05-14):
-  - F199 was a workaround (suppress retries). The real bug is in
-    `ec_subrange_read`'s fall-back path: on ANY single per-shard read
-    failure it calls `ec_read_full_and_slice`, which reads ALL K+M
-    shards at full size (length=0) and decodes the whole extent to
-    slice the requested sub-range.
-  - For a 64 MiB GC chunk read on a 2.8 GB EC(3+1) extent, this means
-    4 × 933 MiB ≈ 3.7 GiB cross-network for what should be a
-    K × 64 MiB ≈ 192 MiB reconstruction.
-  - The 3.7 GiB amplification saturates macOS, causes manager's df
-    probe to time out, marks healthy disks offline. F199's cooldown
-    suppressed retries but didn't fix the amplification on the first
-    attempt.
+User-driven design path (multi-turn 2026-05-14 → 2026-05-15):
+  - Started from CLI `usage()` audit: `policy` / `merge` / `set-stream-ec`
+    were supported but not listed; usage text updated first.
+  - User asked whether `policy` still emits SPLIT advice while auto-split
+    is off — confirmed via lib.rs:678 `auto_split_enabled` flag gate.
+  - User then requested a deeper review of GC and major-compact trigger
+    logic; concrete repro case: stream 9 with extents [26, 27, 28, 29, 30]
+    where 27/28 were `(open), 0 B` and 29 was 11 MiB EC'd. Two Explore
+    agents traced background_gc_loop and background_compact_loop to find:
+      a) `if sealed_length == 0 { continue; }` at line 533 skipped non-tail
+         empty extents (it should only skip the tail).
+      b) The `discards.keys()`-driven candidate set never even surfaced
+         empty extents to that check.
+      c) Major compact has no density-based trigger (only has_overlap +
+         expiry + manual + scheduler urgency on pickup_tables output,
+         which is wrong-signal anyway).
+  - Successive refinements via AskUserQuestion:
+      - All policy → advisory_cache, each opt-in. → User: GC off, EC on,
+        major compact "must-cleanup auto, density off (HBase-aligned)".
+      - User asked about HBase major compact specifically → confirmed
+        "must-cleanup on / density off" matches HBase + we don't add
+        the 7-day timer (which production usually disables).
+      - User added: "minor compact 一直就是自动的" → no toggle, always on.
+      - User added: "EC 要看 load + extent 大小" → load + size gates.
+      - User asked "EC + GC 同时发起怎么办?" → traced F138/F145 mutex
+        guards; added per-error-type cooldown so the race recovers in
+        30 s not 5 min.
+      - User said: "EC convert 也改为默认手动触发" → unified principle:
+        all policy-aware dispatch defaults off.
+      - User finally said: "我在做思考, 要不要彻底把这些 auto policy
+        放到外面, rust 代码不用写 auto policy, 而是把决定交给外面的
+        脚本或者 AI, 这样 policy 的变化也灵活" → AskUserQuestion → user
+        picked "彻底外置".
+  - Final plan (`elegant-tumbling-pumpkin.md`): mechanism/policy split
+    over 3 stages. Approved.
 
-Why sub-range reconstruction works:
-  - Galois-8 RS encodes byte-by-byte across K+M shards.
-  - At each row position i, the K+M shard bytes form an independent
-    RS codeword.
-  - So sub-range [a, b) on a missing data shard can be reconstructed
-    from [a, b) on K healthy shards. No full-extent decode.
+Stage 1 (this commit) — concrete changes:
 
-Fix:
-  - `crates/stream/src/client.rs`:
-    - `ec_subrange_read`: removed `fall_back = true → ec_read_full_and_slice`.
-      Failed plan entries now collected in `needs_reconstruct: Vec<usize>`.
-    - New helper `ec_reconstruct_shard_subrange(failing_shard_idx,
-      sh_off, sh_len)`:
-      - Reads [sh_off, sh_off+sh_len] from K+M-1 non-missing peers
-        in parallel (5 s timeout each).
-      - Stops when K succeed.
-      - Calls existing `ec_reconstruct_shard` on K-aligned
-        sub-shards (offloaded via spawn_blocking — RS math is
-        CPU-bound).
-      - Eversion-stale short-circuits to the top-level retry loop.
-  - `crates/stream/src/erasure.rs`:
-    - 2 new unit tests pinning the load-bearing invariant
-      "ec_reconstruct_shard works on sub-range slices":
-      - f200_reconstruct_shard_subrange_data_shard
-      - f200_reconstruct_shard_subrange_with_one_parity_present
+  1. `background.rs` GC trigger (Task #1, fully unblocks empty-extent
+     reclamation):
+       - candidate set = all `sealed_extents` (not just `discards.keys()`).
+       - empty (sealed_length=0) non-tail extents → push to holes, no
+         rewrite. `run_gc(eid, 0)` already skips the read loop and
+         proceeds to `flush_gc_batch` (no-op) + `punch_holes`.
 
-Bytes-on-the-wire (user's GC scenario, 64 MiB chunk on 2.8 GB
-EC(3+1) extent, shard 0 fails):
-  - Pre-F200: 4 × 933 MiB = 3.7 GiB.
-  - Post-F200: 3 × 64 MiB = 192 MiB. → 20× reduction.
+  2. `background.rs` F199 cooldown classification (Task #2):
+       - `gc_failure_cooldown: HashMap<u64, (Instant, Duration)>` so
+         each entry carries its own window.
+       - New pure helper `classify_gc_failure_cooldown(e, soft, hard)`:
+         30 s window for anyhow chains containing `"precondition failed"`
+         or `"eversion mismatch"`; 300 s otherwise.
+       - 4 unit tests in `f201_classify_cooldown_tests` cover the
+         sentinel substring shapes (top of chain, deep in chain,
+         unrecognised → hard).
 
-Relationship to F199:
-  - F199's per-extent failure cooldown stays as a safety net for
-    actual irrecoverable extents (e.g., 2+ shards truly unreachable
-    on 3+1 EC).
-  - Under normal pressure, F200 prevents F199 from ever triggering
-    because reconstruction succeeds.
-
-Files touched:
-  - crates/stream/src/client.rs: +95, -10 (helper + reworked path)
-  - crates/stream/src/erasure.rs: +60 (2 tests)
-  - feature_list.md: F200 entry above F199.
-  - claude-progress.txt: this file.
+  3. `GcTask` multi-tier params + wire change (Task #3):
+       - `GcTask::Auto(GcAutoParams { ratio, max_size, stream_debt,
+         empty_only })` in `partition-server/src/lib.rs`.
+       - `background_gc_loop` Auto arm consumes the params:
+           - `empty_only` short-circuits to empty-extent-only picks.
+           - `stream_debt` halves the per-extent ratio when total
+             reclaimable bytes exceed the threshold.
+           - `max_size` caps the per-extent `sealed_length`.
+       - `MaintenanceReq` wire struct gains 4 optional fields
+         (`gc_ratio` / `gc_max_size` / `gc_stream_debt` / `gc_empty_only`).
+         Backward-incompatible at rkyv level; same-commit upgrade for
+         manager + PS + client (cluster.sh stops all roles before
+         restart). Struct doc says so explicitly.
+       - SDK adds `ClusterClient::gc_with_params(part_id, GcAutoParams)`;
+         legacy `gc(part_id)` wraps with `Default::default()`.
+       - `client gc` CLI gains `--ratio R / --max-size B / --stream-debt B
+         / --empty-only` flags; `parse_byte_size` accepts K/M/G/T(i)B
+         suffixes. 3 unit tests cover parsing.
 
 Tests:
-  - cargo build --workspace --exclude autumn-fuse: clean.
-  - cargo test -p autumn-stream --lib: 53/53 (51 pre-existing + 2 new).
+  - `cargo build --workspace --exclude autumn-fuse --tests`: clean.
+  - `cargo test -p autumn-partition-server --lib f201`: 4/4.
+  - `cargo test -p autumn-server --bin autumn-client -- parse_byte_size`:
+    3/3.
+  - Pre-existing `f099i_tests::*` flakes are not F201-introduced (fail
+    on HEAD without F201 changes).
 
-Deferred:
-  - Parity-region offset path (`start_shard >= data_shards`) still
-    falls back to ec_read_full_and_slice. That's the stale-VP path;
-    callers shouldn't hit it under normal operation. Reconstruction
-    in that path is left for a future iteration.
+Files touched:
+  - crates/partition-server/src/background.rs: +~120 lines (GC body
+    rewrite + classifier + tests).
+  - crates/partition-server/src/lib.rs: +~30 lines (GcTask::Auto variant
+    + GcAutoParams struct; scheduler call site updated).
+  - crates/partition-server/src/rpc_handlers.rs: forward new wire fields
+    into GcAutoParams.
+  - crates/rpc/src/partition_rpc.rs: 4 new fields on MaintenanceReq with
+    doc-level "F201 wire change" note.
+  - crates/client/src/lib.rs: gc_with_params + public GcAutoParams;
+    legacy maintenance() updated.
+  - crates/server/src/bin/autumn_client.rs: Gc command variant extended;
+    parse_byte_size + 3 unit tests; usage() updated.
+  - crates/manager/src/lib.rs: MaintenanceReq construction in merge
+    orchestration updated with default new fields.
+  - crates/manager/tests/{support,integration}.rs: test fixtures updated.
+  - feature_list.md: F201 entry above F200.
+  - claude-progress.txt: this file.
 
-Prior-session F198/F199 status: still completed. F200 supersedes
-F199 as the primary GC-pressure mitigation; F199 stays as the
-safety net.
+Next session starting point (Stage 2 = F202):
+  - Add POLICY_KIND_MINOR_COMPACT (5) + POLICY_KIND_EC (6) + rename
+    POLICY_KIND_COMPACT → POLICY_KIND_MAJOR_COMPACT in
+    `autumn-rpc/src/manager_rpc.rs`.
+  - PS reports new metrics via MSG_REPORT_PARTITION_LOAD:
+    sst_tombstone_bytes / sst_expired_bytes / sst_out_of_range_bytes /
+    sealed_log_extent_count / sealed_log_dead_bytes.
+  - Manager `PolicyEngine` adds minor + ec advisory generation.
+  - Advisory generation has a minimal "common sense" filter (EC < 64 MiB
+    not output; minor-compact only output when pickup_tables would
+    actually do work).
+  - New CLI commands: `client info --detail`, `client streams`,
+    `client set-stream-ec --extent <EXTID> --ec K+M`.
+  - Plan reference: `elegant-tumbling-pumpkin.md` §2.2.4 + §2.3 + §3.1.
 
-Next-session starting point: feature_list.md F198 + F199 + F200
-entries together describe the full fix chain (rich marker → GC
-cooldown → sub-range reconstruction).
+Stage 3 (F203) — deletion + docs (not in this commit):
+  - Delete in-kernel auto-dispatch: manager `policy_tick_loop` auto-split
+    / auto-merge, `ec_conversion_dispatch_loop` new-candidate scan
+    (keep F198 marker replay), PS `maintenance_scheduler_loop` (whole
+    function), `background_gc_loop` Auto-tick.
+  - Delete `auto_*_enabled` Cells + CLI flags.
+  - README + CLAUDE.md update describing the external controller
+    contract; cron + bash example.

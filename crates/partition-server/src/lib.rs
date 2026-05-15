@@ -914,8 +914,41 @@ mod f162_reader_pin_tests {
 // ---------------------------------------------------------------------------
 
 pub(crate) enum GcTask {
-    Auto,
+    /// Pick GC candidates by policy. Parameters describe WHICH extents
+    /// are eligible (multi-tier filtering). Default = standard
+    /// `discard_ratio > 0.4` over all sealed non-tail extents (the
+    /// pre-F201 single-tier behaviour) PLUS empty-sealed slots that
+    /// the F201 candidate-set fix unblocked.
+    Auto(GcAutoParams),
     Force { extent_ids: Vec<u64> },
+}
+
+/// F201: parameters passed by callers (CLI / external controller) to
+/// the auto-GC candidate selection. All fields are optional; `Default`
+/// reproduces pre-F201 single-tier behaviour augmented with the
+/// empty-sealed punch path. The PS does not mix tiers — exactly one
+/// of (default ratio, custom ratio + optional max_size, empty_only)
+/// applies per dispatch — but the external controller can issue
+/// multiple ticks back-to-back with different params to compose
+/// effective tiers.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct GcAutoParams {
+    /// Discard ratio threshold (0.0..=1.0). `None` → 0.4
+    /// (`GC_DISCARD_RATIO`).
+    pub ratio: Option<f64>,
+    /// Only consider sealed extents whose `sealed_length` is at most
+    /// this many bytes. Combined with a lower `ratio` lets the caller
+    /// say "punch small extents at even 10% dead". `None` → no upper
+    /// bound.
+    pub max_size: Option<u64>,
+    /// Whole-stream dead-byte high-water hint. When the stream's total
+    /// reclaimable bytes exceed this, the per-extent ratio is halved
+    /// (so 0.4 → 0.2 etc.) for this dispatch. `None` → no relaxation.
+    pub stream_debt: Option<u64>,
+    /// If `true`, pick ONLY `sealed_length == 0` non-tail extents.
+    /// Cheapest possible GC (no rewrite, just `punch_holes`). Overrides
+    /// `ratio` / `max_size` when set.
+    pub empty_only: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2498,7 +2531,7 @@ impl PartitionServer {
                         }
                     }
                     "gc" => {
-                        if gtx.try_send(GcTask::Auto).is_ok() {
+                        if gtx.try_send(GcTask::Auto(GcAutoParams::default())).is_ok() {
                             tracing::info!(
                                 "F188 dispatched gc part {} urgency={:.2} debt={}MB",
                                 cand.part_id,

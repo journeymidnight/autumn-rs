@@ -477,10 +477,34 @@ in memory, multiplying per-partition peak by N.
 Targets the **logStream** where large values (ValuePointers) are stored.
 
 **Trigger**: periodic (30–60s jitter), via `gc_tx` channel (capacity 1), or via the `Maintenance` gRPC RPC. Two public methods on `PartitionServer`:
-- `trigger_gc(part_id) -> Result<(), &'static str>` — enqueue `GcTask::Auto`
+- `trigger_gc(part_id) -> Result<(), &'static str>` — enqueue `GcTask::Auto(GcAutoParams::default())`
 - `trigger_force_gc(part_id, extent_ids) -> Result<(), &'static str>` — enqueue `GcTask::Force { extent_ids }`
 
-Auto-selects sealed extents with discard ratio > 40% (`GC_DISCARD_RATIO`), up to 3 per run (`MAX_GC_ONCE`).
+**F201 candidate selection** (`background.rs::background_gc_loop` Auto arm):
+1. Candidates = all `sealed_extents` (`extent_ids[..len-1]`), sorted by reclaimable bytes desc. Pre-F201 candidates came only from `discards.keys()`, so empty sealed extents (no SST ever referenced them → never in any discards map) were invisible to the loop.
+2. For each candidate, `get_extent_info(eid)`:
+   - `sealed_length == 0` → push to holes (empty slot, no rewrite). `run_gc(eid, 0)` skips the read loop and goes straight to `flush_gc_batch` (no-op) + `punch_holes`.
+   - Else apply the F201 multi-tier filter:
+     - If `GcAutoParams::empty_only` is set → skip non-empty.
+     - If `max_size` is set and `sealed_length > max_size` → skip.
+     - Effective `ratio = max(GC_DISCARD_RATIO, params.ratio)`; halved when stream total discard ≥ `stream_debt` high-water.
+     - Push if `discard_bytes / sealed_length > effective_ratio`.
+3. Cap at `MAX_GC_ONCE` (3) per dispatch.
+
+**F201 multi-tier params** (`GcTask::Auto(GcAutoParams)`):
+- `ratio: Option<f64>` — discard-ratio threshold, default 0.4
+- `max_size: Option<u64>` — only consider extents at most this size
+- `stream_debt: Option<u64>` — when total reclaimable bytes ≥ threshold, halve the ratio
+- `empty_only: bool` — pick only `sealed_length == 0` (cheapest, no rewrite)
+
+External controllers / `client gc --ratio X --max-size Y --stream-debt Z --empty-only` compose effective tiers by issuing multiple dispatches back-to-back. The PS does not internally "schedule across tiers"; it executes exactly the set of params each dispatch carries.
+
+**F201 cooldown classification** (`classify_gc_failure_cooldown`):
+- Soft window (30 s) when the failure's anyhow chain contains `"precondition failed"` (manager refuses `punch_holes` while `ec_conversion_inflight` per F138/F145) or `"eversion mismatch"` (private `EversionStale` sentinel from autumn-stream — stale `extent_info_cache` after an EC bump).
+- Hard window (300 s, was the only window pre-F201) for everything else.
+- `gc_failure_cooldown` map shape is `HashMap<u64, (Instant, Duration)>` so each entry carries its own window.
+
+Wire surface: `MaintenanceReq` carries 4 new optional fields (`gc_ratio` / `gc_max_size` / `gc_stream_debt` / `gc_empty_only`) — backward-incompatible at rkyv level; same-commit upgrade required (cluster.sh stops all roles before restart). Legacy callers (FLUSH, COMPACT, FORCE_GC) pass default values for these fields.
 
 **Discard snapshot RPC** (`MSG_GET_DISCARDS = 0x48`, FOPS-01): `handle_get_discards` in `rpc_handlers.rs`
 reads a live snapshot of the partition's discard map without any manager state. It:
