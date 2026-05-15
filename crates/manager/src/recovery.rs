@@ -993,6 +993,17 @@ impl AutumnManager {
             // ExtConvertToEcReq. Manager + every shard host now agree on
             // the same post-EC eversion.
             ex.eversion = new_eversion;
+            // F206: post-EC the extent has K+M shards across K+M nodes;
+            // every slot is available by construction (write_shard_local
+            // succeeded on each target). Without this, `avali` keeps its
+            // pre-EC value (typically `all_bits(K)` from the seal path),
+            // leaving the parity slot(s) marked unavailable. The
+            // recovery_dispatch_loop then fires EXT_MSG_RE_AVALI on the
+            // parity holder every 2 s, which on the extent-node side
+            // ran fetch_full_extent_from_sources — allocating
+            // `sealed_length`-sized Vec<u8> per peer attempt and never
+            // converging because peers also only hold a shard.
+            ex.avali = Self::all_bits(target_nodes.len());
             ex.clone()
         };
 

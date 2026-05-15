@@ -710,3 +710,41 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     time after the manager finished re-dispatching (and even then,
     re-dispatch was the no-op skip path so the first restart would
     fail too).
+
+20. **F206 `apply_ec_conversion_done` must refresh `avali` to cover all
+    K+M slots.** Pre-F206 the function updated `replicates`, `parity`,
+    `replicate_disks`, `parity_disks`, and `eversion` but **not**
+    `avali`. The pre-EC `avali` (`all_bits(K)` from the seal path)
+    persisted post-EC, so every parity slot bit stayed 0 — and
+    `recovery_dispatch_loop` (`recovery.rs:339` `if (ex.avali & bit) ==
+    0`) fired `EXT_MSG_RE_AVALI` to the parity holder every 2 s
+    indefinitely. On the extent-node side `handle_re_avali`
+    (pre-F206) didn't branch on `ec_converted`, so it compared the
+    local shard size (~`sealed_length / K`) against the logical
+    `sealed_length`, fell through to `fetch_full_extent_from_sources`,
+    and allocated a `sealed_length`-sized `Vec<u8>` per peer attempt.
+    Symptom: an idle 4-node cluster after `cluster.sh restart` showed
+    extent-node RSS swinging through multiple GB per tick on the
+    parity holder, plus `df` probe timeouts because the single
+    compio core was tied up servicing the bogus copy traffic.
+
+    Fix is one line in `apply_ec_conversion_done`:
+    `ex.avali = Self::all_bits(target_nodes.len());`. The companion
+    extent-node fix (`handle_re_avali` short-circuits with `CODE_OK`
+    when `extent_info.ec_converted`) is load-bearing as a
+    self-healing migration: existing pre-F206 etcd entries with the
+    buggy `avali = all_bits(K)` are auto-repaired on the next
+    dispatch tick — `mark_extent_available` runs on the RE_AVALI
+    `CODE_OK` response and ORs in the missing slot bit, persisting
+    `avali = all_bits(K+M)` to etcd. No data migration needed.
+
+    Tests:
+    - `f206_apply_ec_conversion_done_sets_avali_for_all_shards` (lib
+      unit test) — asserts `ex.avali == 0xF` for a K=3+M=1 convert.
+    - `system_extent_recovery.rs` — assertion strengthened from
+      `ext.avali > 0` to `ext.avali == all_bits(replicates + parity)`,
+      which would have caught the bug if it'd existed at landing
+      time of EC.
+
+    Cross-reference: notes 10 (F138 ec_conversion_inflight lock),
+    19 (F198 rich marker).

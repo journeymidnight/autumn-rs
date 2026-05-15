@@ -95,7 +95,16 @@ fn extent_recovery_replaces_dead_node() {
         // has all replicas available (avali bits set).
         sc.invalidate_extent_cache(extent_id);
         let ext = sc.get_extent_info(extent_id).await.expect("extent info");
-        assert!(ext.avali > 0, "sealed extent should have avali bits set");
+        // F206: assert every slot bit is set, not just `> 0`. Pre-F206 a
+        // post-EC extent had `avali = all_bits(K)` instead of
+        // `all_bits(K + M)`, which the looser `> 0` check let through.
+        let total_slots = ext.replicates.len() + ext.parity.len();
+        let expected = if total_slots >= 32 { u32::MAX } else { (1u32 << total_slots) - 1 };
+        assert_eq!(
+            ext.avali, expected,
+            "sealed extent should have every slot's avali bit set (replicates={} + parity={})",
+            ext.replicates.len(), ext.parity.len(),
+        );
 
         // Read data from the sealed extent
         let (read_data, _) = sc

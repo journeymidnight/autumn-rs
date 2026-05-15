@@ -1394,6 +1394,36 @@ Cleared by audit (no fix needed):
 - **Files:** `feature_list.md`, `claude-progress.txt`. (No code changes.)
 - **passes:** true (audit-cleared)
 
+### F206 · Post-EC `avali` not refreshed → infinite RE_AVALI loop with multi-GB RSS churn
+- **Trigger:** User observation 2026-05-15 on a 4-node macOS cluster: after `sh cluster.sh restart 4`, extent-node RSS swung between 2 MB and 2.6 GB across the four nodes on an idle cluster (no client traffic). `vmmap` showed `MALLOC_LARGE (empty) 2.8 GB / 24 regions / peak footprint 4.6 GB` — many ~941 MB allocations freed back into the allocator's free list but not returned to the OS. Manager log flapped: `df RPC failed; marked node disks offline … df RPC succeeded; disk back online` every few seconds against nodes 9102 and 9103.
+- **Root cause (two-bug chain):**
+  - **Bug A — `crates/manager/src/recovery.rs::apply_ec_conversion_done`**: when the EC conversion 2PC commits on the manager, the function updated `replicates`, `parity`, `replicate_disks`, `parity_disks`, and `eversion` — but **not** `avali`. The pre-EC `avali = all_bits(K)` (set by the seal path in `handle_stream_alloc_extent`) survived the convert, leaving the M parity-slot bit(s) at 0. Nine other manager sites correctly call `Self::all_bits(replicates.len() + parity.len())` after a topology change (`handle_stream_alloc_extent` seal block, `multi_modify_split`'s five mutators); the EC done path was the missing site.
+  - **Bug B — `crates/stream/src/extent_node.rs::handle_re_avali`**: the handler compared `extent.len` (local file size) against `extent_info.sealed_length` (logical pre-EC payload) and called `fetch_full_extent_from_sources` when local was short. For an EC'd extent the local shard size = `sealed_length / K`, so the check fell through unconditionally. `fetch_full_extent_from_sources` then iterated the 4 peers, each `copy_bytes_from_source` materialising a fresh ~941 MB `Vec<u8>`; every peer returned only a shard (their local file), so the `payload.len() < sealed_length` rejection fired and the function moved to the next peer — burning ~4 × 941 MB per dispatch tick. If by chance it had succeeded, the handler would have written raw replicated bytes over the local EC shard, corrupting the on-disk layout.
+- **How the two bugs combined:** `recovery_dispatch_loop` (2 s tick) iterated every sealed extent's K+M slots and fired `EXT_MSG_RE_AVALI` whenever `(ex.avali & (1 << slot)) == 0`. With Bug A, the parity slot bit was permanently 0 for every EC'd extent, so the loop dispatched RE_AVALI to the parity holder forever. Bug B turned each dispatch into a multi-GB allocation storm on the receiver and on the three peers it called via `MSG_READ_BYTES`. The single-thread compio runtime on each extent-node then couldn't service the manager's 5 s `df` probe in time, marking disks offline and amplifying the loop with `dispatch_recovery_task` calls on top of RE_AVALI.
+- **Fix:**
+  - Manager (`recovery.rs`): add `ex.avali = Self::all_bits(target_nodes.len());` at the end of the `apply_ec_conversion_done` borrow-mut block.
+  - Extent-node (`extent_node.rs::handle_re_avali`): short-circuit with `CodeResp { code: CODE_OK, .. }` when `extent_info.ec_converted == true`, before the `local_len >= sealed_length` check. This is also load-bearing as a self-healing migration: on a pre-F206 cluster with the buggy `avali = all_bits(K)` stored in etcd, the next `recovery_dispatch_loop` tick fires RE_AVALI for the parity slot, the extent-node now returns OK immediately, and the manager's `mark_extent_available` ORs in the missing bit and persists `avali = all_bits(K+M)`. No data migration script needed; the cluster repairs itself within 2 s of the manager pointing at the new binary.
+- **Backward compatibility:** no wire/etcd schema change (`avali` field already exists). Pre-F206 etcd entries with buggy `avali` auto-heal via the mechanism above.
+- **Tests:**
+  - `crates/manager/src/lib.rs::f206_apply_ec_conversion_done_sets_avali_for_all_shards`: new unit test that calls `apply_ec_conversion_done` with K=3, M=1 and asserts `ex.avali == 0xF`. Would have failed pre-fix.
+  - `crates/manager/tests/system_extent_recovery.rs`: tightened the existing `assert!(ext.avali > 0)` to `assert_eq!(ext.avali, all_bits(replicates + parity))`. The old assertion let `0b0111` (post-EC bug) pass — that's exactly how F206 went unnoticed for so long.
+- **Files touched:**
+  - `crates/manager/src/recovery.rs` — one line added inside `apply_ec_conversion_done` plus a multi-line comment block explaining why.
+  - `crates/stream/src/extent_node.rs` — short-circuit block added at the top of `handle_re_avali`'s post-eversion-check stage.
+  - `crates/manager/src/lib.rs` — F206 unit test.
+  - `crates/manager/tests/system_extent_recovery.rs` — assertion strengthened.
+  - `crates/manager/CLAUDE.md` — programming note 20 added.
+  - `crates/stream/CLAUDE.md` — Re-Avali section updated to call out the EC short-circuit + migration semantics.
+  - `feature_list.md` — this entry.
+  - `claude-progress.txt` — F206 status.
+  - `README.md` — manual verification step added (post-restart RSS sanity check).
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-manager --lib`: 79 passed (was 78; new F206 test).
+  - `cargo test -p autumn-stream --lib`: 53 passed (no regression).
+  - Manual: on a cluster carrying a pre-F206 EC'd extent (large `extent-10.dat` with `avali = 0b0111`), restart manager+extent-nodes against the new binary. Within one `recovery_dispatch_loop` tick (≤ 2 s), the manager's etcd `extents/10` value should flip to `avali = 0xF` and per-node RSS should stabilise at sub-100 MB (no further `df` flap in `manager.log`).
+- **passes:** true
+
 ### F205 · Trim autumn-client — drop redundant surfaces now that ops tooling goes Python
 - **Trigger:** User audit 2026-05-15 after F201/F202/F203 landed the mechanism/policy split. Question: "整理 autumn-client 的命令，重新思考，只留下必要重要的命令，以后运维代码走 python 比如 set-stream-ec 还需要吗？" Walked the full command surface end-to-end; user picked three removals via AskUserQuestion (`streams`, `info --top`, `streamput`); explicitly kept `set-stream-ec` (it's the prerequisite primitive for `force-ec-convert` on replicates-only streams) and `register-node`.
 - **Why these three specifically:**

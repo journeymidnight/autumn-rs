@@ -3599,6 +3599,24 @@ impl ExtentNode {
             }));
         }
 
+        // F206: RE_AVALI is a replicated-extent repair primitive. For an
+        // EC'd extent the local shard size is `sealed_length / K`, so
+        // the `local_len >= sealed_length` check below would always fall
+        // through to `fetch_full_extent_from_sources` — which allocates a
+        // `sealed_length`-sized Vec<u8> per peer and (on success) would
+        // overwrite the local shard with raw bytes, corrupting EC.
+        // Missing-shard repair on an EC'd extent must route through
+        // EXT_MSG_REQUIRE_RECOVERY → run_ec_recovery_payload. Returning
+        // CODE_OK here also lets the manager's recovery_dispatch_loop
+        // self-heal pre-F206 buggy `avali` values via mark_extent_available
+        // on the next 2 s tick.
+        if extent_info.ec_converted {
+            return Ok(rkyv_encode(&CodeResp {
+                code: CODE_OK,
+                message: String::new(),
+            }));
+        }
+
         let local_len = extent.len.load(Ordering::SeqCst);
         if local_len >= extent_info.sealed_length {
             return Ok(rkyv_encode(&CodeResp {

@@ -299,7 +299,8 @@ Triggered by the manager when a replica node fails:
 
 ### Re-Avali (`re_avali` RPC)
 
-Used to bring a **sealed** extent's lagging replica up to date (e.g., after a node comes back online):
+Used to bring a **sealed, replicated** extent's lagging replica up to date (e.g., after a node comes back online):
+- **F206**: if `extent_info.ec_converted == true` → return OK immediately. RE_AVALI is a replicated-extent-only repair primitive. On an EC'd extent the local shard size equals `sealed_length / K`, so the `local_len >= sealed_length` check below would never short-circuit and the handler would call `fetch_full_extent_from_sources` — which allocates a `sealed_length`-sized `Vec<u8>` per peer attempt and (on the impossible success case) would write raw bytes over the local shard, corrupting EC. Missing-shard repair on an EC'd extent must route through `EXT_MSG_REQUIRE_RECOVERY` → `run_ec_recovery_payload` instead. The same OK response auto-heals pre-F206 buggy `avali` etcd values: the manager's `mark_extent_available` on the RE_AVALI OK response ORs in the parity-slot bit and persists.
 - If local data >= `sealed_length`: already up to date, return OK.
 - Otherwise: copy full extent from peers, truncate, rewrite, sync.
 

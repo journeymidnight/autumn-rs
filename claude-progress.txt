@@ -1,104 +1,90 @@
 Date: 2026-05-15
 TaskStatus: completed
-Task scope: F205 — autumn-client command audit and trim. Removed
-            three redundant CLI surfaces now that ops tooling goes
-            Python (per feedback-ops-tools-in-python memory): the
-            F203 `streams` subcommand, the `info --top N` flag, and
-            the legacy `streamput` subcommand. Kept everything else
-            after walking the full command surface end-to-end.
+Task scope: F206 — post-EC `avali` not refreshed, causing infinite
+            RE_AVALI loop with multi-GB RSS churn on restart.
 
-User-driven audit:
-  - User question (2026-05-15): "整理 autumn-client 的命令, 重新
-    思考, 只留下必要重要的命令, 以后运维代码走 python. 比如
-    set-stream-ec 还需要吗?"
-  - Walked the full command surface and proposed a 4-category
-    classification (data plane / mechanism primitives / one-time
-    admin / observability / benchmarks). Confirmed set-stream-ec
-    stays (it's the prerequisite for force-ec-convert on
-    replicates-only streams). User picked three removals via
-    AskUserQuestion.
+User-driven diagnosis (turn-by-turn):
+  - User question 1: "sh cluster.sh restart 4 后 macOS 上的
+    extent node 为什么占用这么多内存？"
+  - First investigation pass: confirmed processes alive, all 4
+    nodes hold the same 941 MB extent-10.dat (3+1 EC shard size,
+    matches sealed_length / K = 2961566856 / 3), RSS rotates
+    among nodes (2 MB / 2.6 GB / 596 MB / 1.84 GB then
+    decreasing/redistributing). `vmmap` confirmed MALLOC_LARGE
+    (empty) 2.8 GB / 24 regions / peak footprint 4.6 GB — large
+    allocations freed but held by allocator's free list.
+  - User pushback 2: "EC 跑完了但 manager 仍然不知道，这是
+    严重的 BUG！" — diagnosis correction: manager DOES know
+    (`/streams --json` shows `ec_converted: true, eversion: 4,
+    parity: [7], replicates: [3, 5, 1]`), BUT the avali bitmap
+    was never refreshed post-EC.
+  - Found exact bug pair: Bug A in
+    `crates/manager/src/recovery.rs::apply_ec_conversion_done`
+    (misses `avali` update), Bug B in
+    `crates/stream/src/extent_node.rs::handle_re_avali` (compares
+    local shard size to logical sealed_length without checking
+    `ec_converted`). The two bugs combined to drive the
+    recovery loop into firing RE_AVALI on the parity holder every
+    2 s, which triggered fetch_full_extent_from_sources to
+    allocate ~941 MB per peer attempt (4 peers × 941 MB ≈ 3.7 GB
+    per tick).
+  - User said "ok" to proceed with the surgical fix.
 
-What was removed:
+What was changed:
 
-  1. `streams [--json]` subcommand (added by F203 only 2 commits
-     ago, `df44af7`). Redundant with
-     `info --json | jq '.streams'`. Removed:
-     - Command::Streams variant (autumn_client.rs)
-     - "streams" parse arm
-     - dispatch body
-     - usage() line
+  1. `crates/manager/src/recovery.rs` — added one line in
+     `apply_ec_conversion_done`:
+         ex.avali = Self::all_bits(target_nodes.len());
+     plus a multi-paragraph comment block explaining the
+     RE_AVALI / fetch_full_extent_from_sources chain that the
+     missing assignment had enabled.
 
-  2. `info --top N` flag. Human-convenience top-K partition
-     ranking. Removed:
-     - top: Option<usize> field on Command::Info
-     - "--top" parse arm (emits migration message + exits 2)
-     - top.is_some() branches in both JSON and text dispatch paths
-     - Truncation logic; JSON branch now always returns full set
-       sorted by live_size desc. Text branch removed the
-       sort-by-stream-total + truncate block.
-     - usage() updated.
+  2. `crates/stream/src/extent_node.rs::handle_re_avali` —
+     short-circuit `CODE_OK` return when
+     `extent_info.ec_converted == true`, placed AFTER
+     `apply_extent_meta_durable` (so local meta still refreshes
+     from manager on stale eversion) but BEFORE the
+     `local_len >= sealed_length` check. Also load-bearing as
+     the self-heal migration path for pre-F206 etcd entries.
 
-  3. `streamput` subcommand. Legacy MSG_STREAM_PUT single-RPC
-     large-value path. F186 ceph-style `put-stream`/`putstream`
-     is the modern chunked path with atomic commit-via-meta
-     semantics. Removed:
-     - Command::StreamPut variant
-     - "streamput" parse arm
-     - dispatch body
-     - usage() line.
-     The SDK client.stream_put() method stays (used by other
-     callers potentially; safe wire infrastructure). Server-side
-     MSG_STREAM_PUT handler stays. Only the CLI surface is gone.
+  3. `crates/manager/src/lib.rs` — new unit test
+     `f206_apply_ec_conversion_done_sets_avali_for_all_shards`.
+     Pre-EC fixture has K=3 replicas + avali=0x7; calls
+     apply_ec_conversion_done with target_nodes=[1,3,5,7]
+     (K=3+M=1); asserts ex.avali == 0xF post-call.
 
-set-stream-ec specifically (asked by user):
-  - Kept. Post-F203 it only mutates MgrStreamInfo.ec_data_shard /
-    ec_parity_shard; dispatch loop is drain-only so it does NOT
-    auto-convert anything anymore.
-  - handle_force_ec_convert rejects extents on replicates-only
-    streams with CODE_PRECONDITION ("set-stream-ec first").
-    compute_ec_advisory (F202) also filters them out.
-  - Therefore set-stream-ec is the prerequisite primitive to flip
-    a stream from replicates-only -> EC-eligible. The OP toolkit
-    workflow is: set-stream-ec --stream X --ec K+M, then for each
-    sealed extent on X that's not converted yet, force-ec-convert
-    --extent EID. Both are mechanism primitives consumed by a
-    Python controller, not by the manager kernel.
-  - Without set-stream-ec, the only path to EC would be
-    bootstrap-time `--log-ec` / `--row-ec`. Upgrading an existing
-    replicates-only stream to EC after cluster lifetime would be
-    impossible. Rare scenario but irreversible-on-removal.
+  4. `crates/manager/tests/system_extent_recovery.rs` — tightened
+     existing assertion from `ext.avali > 0` to
+     `ext.avali == all_bits(replicates + parity)`. The old
+     looseness is exactly what let F206 ship undetected.
 
-Migration UX:
-  - `info --top N` -> exits with code 2 + message pointing to jq.
-  - `streams` -> "unknown command"; user runs
-    `info --json | jq '.streams'`.
-  - `streamput` -> "unknown command"; user runs `put-stream`.
+  5. `crates/manager/CLAUDE.md` — programming note 20 added.
+  6. `crates/stream/CLAUDE.md` — Re-Avali section updated.
+  7. `feature_list.md` — F206 entry added (passes: true).
+  8. `README.md` — manual verification step added.
+  9. `claude-progress.txt` — this file.
 
-What stays (the audit conclusion):
-  - Data plane: put / get / del / head / ls / put-stream /
-    putstream / get-stream / getstream.
-  - Mechanism primitives: split / merge / compact / gc / forcegc /
-    set-stream-ec / force-ec-convert.
-  - Observability: info (with --json / --part / --detail) / policy.
-  - One-time admin: bootstrap / format / register-node.
-  - Engineering: wbench / rbench / perf-check.
+Verification:
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-manager --lib`: 79 passed (78 → 79 with
+    new F206 test).
+  - `cargo test -p autumn-stream --lib`: 53 passed (no regression).
+  - User's running cluster: not migrated yet — they will rebuild
+    and observe the self-heal as the manager's
+    recovery_dispatch_loop hits the next tick (~2 s after
+    pointing extent-nodes + manager at the new binary).
 
-Tests:
-  - cargo build --workspace --exclude autumn-fuse: clean.
-  - cargo test --workspace --exclude autumn-fuse --lib: unchanged
-    from F204 HEAD (same pre-existing f099i_d1 flake).
-
-Files touched:
-  - crates/server/src/bin/autumn_client.rs: ~120 lines net delete.
-  - crates/server/CLAUDE.md: command table updated.
-  - feature_list.md: F205 entry.
-  - claude-progress.txt: this file.
+Backward compatibility:
+  - No wire / etcd schema change (avali field already exists).
+  - Pre-F206 etcd entries with `avali = all_bits(K)` on EC'd
+    extents auto-heal: the manager fires RE_AVALI for the parity
+    slot, extent-node returns CODE_OK immediately (Bug B fix),
+    manager's mark_extent_available ORs in the bit and persists.
+    No manual repair script needed.
 
 Memory:
-  - No new memory needed. The driving principle ("ops tools in
-    Python, not autumn-client") was already saved as
-    feedback-ops-tools-in-python in F204. This commit applies it.
+  - No new memory needed. This is a code-resident bug fix; the
+    rationale lives in feature_list.md F206 + the two CLAUDE.md
+    updates.
 
-Next session starting point: no pending. Manager and PS kernels
-are now in their "mechanism only" steady state per the F201-F205
-refactor arc. New work uses F206+.
+Next session starting point: no pending. New work uses F207+.

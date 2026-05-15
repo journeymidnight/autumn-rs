@@ -4961,4 +4961,63 @@ mod tests {
             "F198: cleared after apply"
         );
     }
+
+    /// F206: `apply_ec_conversion_done` must set `avali` to
+    /// `all_bits(K + M)`. Pre-F206 it left `avali` at the pre-EC value
+    /// (`all_bits(K)`), leaving the parity slot(s) marked unavailable.
+    /// The `recovery_dispatch_loop` then fired RE_AVALI on parity holders
+    /// every 2 s, which on the extent-node side ran
+    /// `fetch_full_extent_from_sources` and allocated sealed_length-sized
+    /// Vec<u8> per peer attempt (observed as multi-GB RSS swings on an
+    /// idle cluster after `cluster.sh restart`).
+    #[test]
+    fn f206_apply_ec_conversion_done_sets_avali_for_all_shards() {
+        run(async {
+            let m = AutumnManager::new();
+            let extent_id = 206u64;
+            // Pre-EC: 3 replicates, K data shards = 3, M parity = 0.
+            // The seal path would have set avali = all_bits(3) = 0b0111.
+            let pre = MgrExtentInfo {
+                extent_id,
+                replicates: vec![1, 3, 5],
+                parity: vec![],
+                eversion: 3,
+                refs: 1,
+                vp_table_refs: 0,
+                sealed_length: 2_961_566_856,
+                avali: 0x7,
+                replicate_disks: vec![10, 30, 50],
+                parity_disks: vec![],
+                ec_converted: false,
+            };
+            m.store.inner.borrow_mut().extents.insert(extent_id, pre);
+
+            // EC convert with K=3, M=1; coordinator picked node 7 / disk 70
+            // as the new parity holder.
+            m.apply_ec_conversion_done(
+                extent_id,
+                vec![1, 3, 5, 7],
+                vec![70],
+                3,
+                4,
+            )
+            .await
+            .expect("apply_ec_conversion_done");
+
+            let s = m.store.inner.borrow();
+            let ex = s.extents.get(&extent_id).expect("extent present");
+            assert!(ex.ec_converted, "ec_converted must flip true");
+            assert_eq!(ex.replicates, vec![1, 3, 5]);
+            assert_eq!(ex.parity, vec![7]);
+            assert_eq!(ex.eversion, 4);
+            // The load-bearing assertion: avali covers ALL K+M = 4 slots,
+            // not just the K=3 from the pre-EC seal path.
+            assert_eq!(
+                ex.avali, 0xF,
+                "F206: avali must mark every post-EC slot available; \
+                 leaving the parity bit clear causes the recovery loop to \
+                 fire RE_AVALI on the parity holder indefinitely"
+            );
+        })
+    }
 }

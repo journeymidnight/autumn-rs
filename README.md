@@ -1199,6 +1199,49 @@ $NODE --port 9104 \
       --manager 127.0.0.1:9001
 ```
 
+### F206 — post-EC `avali` regression check (2026-05-15)
+
+Quick sanity check that the post-EC `avali` bitmap covers all K+M
+slots. Pre-F206 the bitmap kept its pre-EC value (`all_bits(K)`),
+which caused the manager's `recovery_dispatch_loop` to fire
+`EXT_MSG_RE_AVALI` on the parity holder every 2 s; each dispatch
+allocated `sealed_length`-sized buffers on the extent-node. Visible
+symptom: multi-GB RSS swings + `df RPC failed; marked node disks
+offline` flap on an idle cluster after `cluster.sh restart`.
+
+```bash
+# 1) Find a fully EC-converted extent.
+AC=./target/release/autumn-client
+$AC --manager 127.0.0.1:9001 info --json \
+    | jq '.streams[].extents[] | select(.ec_converted == true)'
+
+# 2) Capture its replicates + parity counts.
+EID=10
+TOTAL=$($AC --manager 127.0.0.1:9001 info --json \
+        | jq --argjson e $EID \
+          '[.streams[].extents[] | select(.extent_id == $e)
+             | (.replicates | length) + (.parity | length)] | first')
+EXPECTED=$(( (1 << TOTAL) - 1 ))
+
+# 3) etcd-side `avali` MUST equal (1 << (K+M)) - 1.
+#    Pre-F206 it would have been (1 << K) - 1 (e.g. 0b0111 for K=3+M=1).
+#    Decoding rkyv is non-trivial from the shell; the simplest check
+#    is to watch the manager log for a steady-state cluster:
+#       NO `df RPC failed; marked node disks offline` lines after
+#       the first 30 s post-restart.
+tail -F /tmp/autumn-rs-logs/manager.log | grep -E "df RPC failed"
+
+# 4) Per-node RSS should stabilise under ~100 MB on an idle cluster.
+pgrep -f autumn-extent-node | xargs -n1 ps -o pid,rss,command -p
+```
+
+A cluster running an EC-policy stream that has already been EC-converted
+on a pre-F206 binary will **self-heal** within ~2 s of restarting both
+manager and extent-nodes against an F206-or-later binary: the manager's
+RE_AVALI to the parity holder now returns OK immediately (see Bug B
+fix in `handle_re_avali`), which causes `mark_extent_available` to OR
+in the missing slot bit and persist the corrected `avali` to etcd.
+
 ---
 
 ## Python bindings (asyncio)
