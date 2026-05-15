@@ -561,6 +561,27 @@ pub(crate) async fn background_gc_loop(
             .gc_debt_bytes
             .store(gc_debt, std::sync::atomic::Ordering::Relaxed);
 
+        // F210-C4: skip GC while vp_refs sync is dirty. Manager's
+        // `vp_table_refs` is stale (a flush/compact's sync RPC hasn't
+        // succeeded), so an extent that's actually referenced by a
+        // newly-published SST might show vp_table_refs=0 on the
+        // manager. If GC calls punch_holes/truncate and refs drops to
+        // 0, `extent_can_delete` (refs==0 && vp_table_refs==0) would
+        // fire on stale state → physical deletion → orphan live VPs →
+        // data loss on subsequent Get. `vp_refs_retry_loop` retries
+        // until success; this gate releases when dirty clears. Metric
+        // refresh (above) still happens so operators see GC debt
+        // building up.
+        if part.borrow().vp_refs_dirty.get() {
+            tracing::debug!(
+                part_id = part.borrow().part_id,
+                "F210-C4: GC skipped — vp_refs sync dirty; waiting for retry"
+            );
+            stamp_last_gc();
+            clear_inflight(&metrics);
+            continue;
+        }
+
         let is_force = matches!(gc_task, GcTask::Force { .. });
         let mut holes: Vec<u64> = match gc_task {
             GcTask::Force { ref extent_ids } => {
@@ -1660,7 +1681,9 @@ pub(crate) async fn do_compact(
         // order = mpsc-send order = meta_stream record order, so the
         // latest record always reflects the latest in-memory state.
         save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, compact_vp_eid, compact_vp_off).await?;
-        sync_partition_vp_refs(part).await?;
+        // F210-C4: see commit_flush_outcome — checkpoint published; sync
+        // failure marks dirty rather than failing compaction.
+        crate::sync_partition_vp_refs_or_mark_dirty(part).await;
         return Ok(CompactStats { input_tables, output_tables: 0, entries_kept: 0, entries_discarded, output_bytes: 0 });
     }
 
@@ -1689,7 +1712,9 @@ pub(crate) async fn do_compact(
     // statement. No `.await` may be introduced between the borrow_mut
     // drop and the mpsc send inside `save_table_locs_raw`.
     save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, compact_vp_eid, compact_vp_off).await?;
-    sync_partition_vp_refs(part).await?;
+    // F210-C4: same as the head-extent path above; mark dirty on sync
+    // failure rather than fail the compaction.
+    crate::sync_partition_vp_refs_or_mark_dirty(part).await;
     Ok(CompactStats { input_tables, output_tables, entries_kept, entries_discarded, output_bytes })
 }
 

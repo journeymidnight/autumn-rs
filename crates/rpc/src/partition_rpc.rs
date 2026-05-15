@@ -50,6 +50,19 @@ pub const MSG_MERGE_PART: u8 = 0x4D;
 //                  if the manager-side merge txn rejects the request).
 pub const MSG_MERGE_FREEZE: u8 = 0x4E;
 
+// F210-C4: manager → PS RPC. Manager pulls the partition's current
+// vp_refs snapshot from PS so manager-side merge/split orchestration
+// (`handle_multi_modify_split`, `handle_merge_partitions`) operates on
+// a fresh view of `vp_table_refs` instead of trusting the cached
+// snapshot (which may be stale if a previous PS-initiated sync
+// failed). PS responds with the current `vp_deps` of every live SST,
+// computed under a single `borrow()`. Manager applies via the same
+// `apply_partition_vp_refs` path that handles regular
+// MSG_SYNC_PARTITION_VP_REFS. If PS rejects (CODE_NOT_FOUND for
+// not-owning the partition, CODE_PRECONDITION for ongoing
+// open/recovery), manager aborts the merge/split with FailedPrecondition.
+pub const MSG_PULL_VP_REFS: u8 = 0x4F;
+
 // ── Status codes ────────────────────────────────────────────────────────────
 
 pub const CODE_OK: u8 = 0;
@@ -202,6 +215,22 @@ pub struct MergeFreezeReq {
 pub struct MergeFreezeResp {
     pub code: u8,
     pub message: String,
+}
+
+/// F210-C4: manager → PS pull of the partition's current vp_refs.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct PullVpRefsReq {
+    pub part_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct PullVpRefsResp {
+    pub code: u8,
+    pub message: String,
+    /// `(extent_id, count)` pairs — same shape as
+    /// `SyncPartitionVpRefsReq.refs`. Count is the number of live SSTs
+    /// whose `vp_deps` mention this extent within this partition.
+    pub refs: Vec<(u64, u32)>,
 }
 
 /// StreamPut: entire value in one message (no chunked streaming).

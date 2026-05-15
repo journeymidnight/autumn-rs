@@ -18,6 +18,72 @@ use std::rc::Rc;
 use crate::{AutumnManager, ConnPool, PendingDelete};
 
 impl AutumnManager {
+    // ── F210-C4: pull-sync vp_refs from PS ──────────────────────────────
+    //
+    // Before `handle_multi_modify_split` / `handle_merge_partitions`
+    // commit their atomic etcd txn, manager actively pulls the
+    // current vp_refs snapshot from the relevant PS and applies it
+    // via the same path `handle_sync_partition_vp_refs` uses. This
+    // closes the race where a previous PS-initiated sync failed
+    // (PS marked dirty per F210-C4's wrapper), leaving manager's
+    // `vp_table_refs` stale, and a subsequent merge/split would
+    // compute `modified_extents` against that stale view —
+    // potentially under-counting refs and approving deletion of
+    // extents whose live VPs are in a newly-published SST.
+    async fn pull_and_apply_vp_refs(
+        &self,
+        part_id: u64,
+        part_addr: &str,
+    ) -> Result<(), AppError> {
+        let req = autumn_rpc::partition_rpc::PullVpRefsReq { part_id };
+        let payload = autumn_rpc::partition_rpc::rkyv_encode(&req);
+        // 10 s — partition-side handler is a single `borrow()` over
+        // sst_readers' vp_deps; bounded so a wedged PS doesn't make
+        // merge/split hang indefinitely.
+        let resp_bytes = self
+            .conn_pool
+            .call_timeout(
+                part_addr,
+                autumn_rpc::partition_rpc::MSG_PULL_VP_REFS,
+                payload,
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!(
+                "F210-C4 pull_vp_refs RPC to {part_addr}: {e}"
+            )))?;
+        let resp: autumn_rpc::partition_rpc::PullVpRefsResp =
+            autumn_rpc::partition_rpc::rkyv_decode(&resp_bytes)
+                .map_err(AppError::Internal)?;
+        if resp.code != autumn_rpc::partition_rpc::CODE_OK {
+            return Err(AppError::Precondition(format!(
+                "F210-C4 pull_vp_refs from {part_addr}: {}",
+                resp.message
+            )));
+        }
+        // Synthesize a SyncPartitionVpRefsReq and feed it through the
+        // existing handler. This re-uses all the F147-A refuse-at-start
+        // checks, verify-BEFORE-mirror (F210-A2), and etcd txn logic.
+        let sync_req = SyncPartitionVpRefsReq {
+            part_id,
+            refs: resp.refs,
+        };
+        let sync_payload = rkyv_encode(&sync_req);
+        let sync_resp_bytes = self
+            .handle_sync_partition_vp_refs(sync_payload)
+            .await
+            .map_err(|(_, msg)| AppError::Internal(msg))?;
+        let sync_resp: SyncPartitionVpRefsResp =
+            rkyv_decode(&sync_resp_bytes).map_err(AppError::Internal)?;
+        if sync_resp.code != CODE_OK {
+            return Err(AppError::Precondition(format!(
+                "F210-C4 apply pulled vp_refs for part {part_id}: {}",
+                sync_resp.message
+            )));
+        }
+        Ok(())
+    }
+
     // ── Serve ──────────────────────────────────────────────────────────
 
     pub async fn serve(&self, addr: SocketAddr) -> Result<()> {
@@ -1452,6 +1518,34 @@ impl AutumnManager {
         let req: MultiModifySplitReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
+        // F210-C4: pull-sync vp_refs from the source partition's PS
+        // BEFORE the atomic etcd txn below. Pre-F210-C4 the txn used
+        // the cached `partition_vp_refs[req.part_id]` snapshot, which
+        // could be stale if a previous PS sync_partition_vp_refs
+        // failed. A stale snapshot under-counts `vp_table_refs` on
+        // extents referenced by SSTs that were published since the
+        // last successful sync — `apply_split_mutations` would split
+        // those into left/right children with a wrong count, and a
+        // subsequent `extent_can_delete` check could approve deletion
+        // of an extent whose live VPs are still in some SST. By
+        // pulling here we refresh the manager's view to the
+        // authoritative PS-side state before committing.
+        let part_addr = {
+            let s = self.store.inner.borrow();
+            s.part_addrs.get(&req.part_id).cloned()
+        };
+        if let Some(addr) = part_addr {
+            if let Err(e) = self.pull_and_apply_vp_refs(req.part_id, &addr).await {
+                return Ok(rkyv_encode(&CodeResp {
+                    code: Self::err_to_code(&e),
+                    message: format!("F210-C4 pull_vp_refs pre-split: {e}"),
+                }));
+            }
+        }
+        // If part_addr is unknown (PS hasn't registered yet), skip the
+        // pull — split would fail later for other reasons (no PS to
+        // serve the split children either way).
+
         // Phase 1: Compute all mutations without modifying store
         // (only alloc_ids touches state.next_id, which is safe to waste on failure)
         let out = {
@@ -2282,6 +2376,29 @@ impl AutumnManager {
             }));
         }
         to_unfreeze.push((s_info.part_addr.clone(), req.survivor_part_id));
+
+        // F210-C4: pull-sync vp_refs from BOTH PSes after freeze
+        // succeeds but BEFORE capturing commit_length / running the
+        // atomic merge txn. Freeze guarantees no new writes can land,
+        // so the pulled snapshot is stable. Without this, the manager's
+        // `partition_vp_refs` for either partition might be stale if a
+        // previous flush/compact sync failed — `apply_merge_mutations`
+        // would compute the merged snapshot against the stale view and
+        // miss vp_table_refs on extents that the survivor/victim's SSTs
+        // actually reference, opening a deletion race after merge.
+        for (addr, pid) in &[
+            (&v_info.part_addr, req.victim_part_id),
+            (&s_info.part_addr, req.survivor_part_id),
+        ] {
+            if let Err(e) = self.pull_and_apply_vp_refs(*pid, addr).await {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Ok(rkyv_encode(&MergePartitionsResp {
+                    code: Self::err_to_code(&e),
+                    message: format!("F210-C4 pull_vp_refs pre-merge: {e}"),
+                    new_log_tail_extent_id: 0,
+                }));
+            }
+        }
 
         // Capture commit_length on each of the 6 streams. Reuse the
         // existing handle_check_commit_length so we hit the same
