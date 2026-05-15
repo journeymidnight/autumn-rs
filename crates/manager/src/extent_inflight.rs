@@ -121,7 +121,7 @@ pub(crate) enum ExtentOpPayload {
 }
 
 impl ExtentOpPayload {
-    pub fn kind(&self) -> ExtentOpKind {
+    pub(crate) fn kind(&self) -> ExtentOpKind {
         match self {
             Self::ConvertToEc(_) => ExtentOpKind::ConvertToEc,
             Self::Recovery(_) => ExtentOpKind::Recovery,
@@ -131,7 +131,7 @@ impl ExtentOpPayload {
 }
 
 impl MgrExtentInflightRecord {
-    pub fn new(extent_id: u64, payload: ExtentOpPayload, leader_id: String) -> Self {
+    pub(crate) fn new(extent_id: u64, payload: ExtentOpPayload, leader_id: String) -> Self {
         let op_kind = payload.kind().as_byte();
         let started_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -157,7 +157,7 @@ impl MgrExtentInflightRecord {
     /// flat-struct invariant. Returns `None` if `op_kind` and the
     /// populated payload field disagree (malformed record — caller should
     /// log and skip on replay).
-    pub fn unpack(&self) -> Option<(ExtentOpKind, ExtentOpPayload)> {
+    pub(crate) fn unpack(&self) -> Option<(ExtentOpKind, ExtentOpPayload)> {
         let kind = ExtentOpKind::from_byte(self.op_kind)?;
         match kind {
             ExtentOpKind::ConvertToEc => self
@@ -181,7 +181,7 @@ impl MgrExtentInflightRecord {
     /// Cheap kind probe without cloning the payload. `None` if `op_kind`
     /// is an unknown discriminator byte (replay-time defense; in-memory
     /// records always have valid op_kind by construction).
-    pub fn kind(&self) -> Option<ExtentOpKind> {
+    pub(crate) fn kind(&self) -> Option<ExtentOpKind> {
         ExtentOpKind::from_byte(self.op_kind)
     }
 }
@@ -265,6 +265,32 @@ impl AutumnManager {
             .borrow()
             .get(&extent_id)
             .and_then(|r| r.kind())
+    }
+
+    /// Test-only convenience: simulate that `extent_id` is in flight with
+    /// a ConvertToEc op. Replaces today's
+    /// `m.ec_conversion_inflight.borrow_mut().insert(extent_id)` pattern in
+    /// F138 / mark_extent_available / split / etc. tests. Bypasses etcd
+    /// CAS and the F149 fence for direct in-memory state injection.
+    #[cfg(test)]
+    pub(crate) fn _test_mark_ec_inflight(&self, extent_id: u64) {
+        let payload = ExtentOpPayload::ConvertToEc(MgrEcDispatchInflight {
+            extent_id,
+            target_nodes: vec![],
+            extra_disk_ids: vec![],
+            data_shards: 0,
+            new_eversion: 0,
+        });
+        let record = MgrExtentInflightRecord::new(extent_id, payload, "test".to_string());
+        self.inflight.borrow_mut().insert(extent_id, record);
+    }
+
+    /// Test-only convenience: clear an in-flight marker (any op kind) on
+    /// `extent_id`. Replaces today's
+    /// `m.ec_conversion_inflight.borrow_mut().remove(&extent_id)` pattern.
+    #[cfg(test)]
+    pub(crate) fn _test_clear_inflight(&self, extent_id: u64) {
+        self.inflight.borrow_mut().remove(&extent_id);
     }
 
     /// Decode raw etcd values from the `extent_inflight/` prefix into

@@ -330,29 +330,15 @@ pub struct AutumnManager {
     /// txn (F149).
     instance_id: Rc<String>,
     recovery_tasks: Rc<RefCell<HashMap<u64, MgrRecoveryTask>>>,
-    ec_conversion_inflight: Rc<RefCell<HashSet<u64>>>,
-    /// F198: rich-marker companion to `ec_conversion_inflight`. Populated
-    /// from the etcd marker value on replay and on every fresh dispatch.
-    /// Reads: `ec_conversion_dispatch_loop` checks this BEFORE running the
-    /// shuffle / `alloc_extent_on_node` path so a replay-loaded marker
-    /// re-dispatches against the ORIGINAL target_nodes assignment.
-    /// Without this map, the dispatch loop's old line-685 check
-    /// `if ec_conversion_inflight.contains(&extent_id) { continue; }`
-    /// permanently blocked the new leader from finishing a crashed EC
-    /// conversion (it skipped — but `apply_ec_conversion_done` never
-    /// committed in etcd, so PS reads kept hitting the post-EC eversion
-    /// on the extent-node side via stale-cached `ExtentInfo` from the
-    /// manager).
-    pub(crate) pending_ec_dispatch: Rc<RefCell<HashMap<u64, MgrEcDispatchInflight>>>,
-    /// F207 Phase 0: unified extent-level in-flight ledger. Phase 0 (this
-    /// commit) wires the infrastructure; no production handler reads or
-    /// writes this yet. Migrating from `ec_conversion_inflight` /
-    /// `pending_ec_dispatch` / `recovery_tasks` / `pending_extent_deletes`
-    /// happens in F207-B / F207-C / F207-D. Persisted at etcd prefix
-    /// `extent_inflight/`. See `crates/manager/src/extent_inflight.rs`
-    /// for the API + invariants and
-    /// `~/.claude/plans/stream-merge-split-ps-sorted-dijkstra.md` for the
-    /// migration plan.
+    /// F207-B: unified extent-level in-flight ledger. Replaces (after
+    /// Phase 2 migrates recovery + delete) the four scattered inflight
+    /// bookkeeping mechanisms; Phase 1 (this commit) migrated EC convert,
+    /// so `ec_conversion_inflight` HashSet + `pending_ec_dispatch` HashMap
+    /// + their `ecConversionInflight/` etcd prefix are gone. Persisted at
+    /// etcd prefix `extent_inflight/`. See
+    /// `crates/manager/src/extent_inflight.rs` for the API + invariants
+    /// and `~/.claude/plans/stream-merge-split-ps-sorted-dijkstra.md` for
+    /// the migration plan.
     pub(crate) inflight: Rc<
         RefCell<HashMap<u64, crate::extent_inflight::MgrExtentInflightRecord>>,
     >,
@@ -426,8 +412,6 @@ impl AutumnManager {
             etcd: None,
             instance_id: Rc::new(uuid::Uuid::new_v4().to_string()),
             recovery_tasks: Rc::new(RefCell::new(HashMap::new())),
-            ec_conversion_inflight: Rc::new(RefCell::new(HashSet::new())),
-            pending_ec_dispatch: Rc::new(RefCell::new(HashMap::new())),
             inflight: Rc::new(RefCell::new(HashMap::new())),
             runtime_started: Rc::new(Cell::new(false)),
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),
@@ -1041,19 +1025,17 @@ impl AutumnManager {
         let partition_vp_refs = c.get_prefix("partitionVpRefs/").await?;
         let ps_nodes = c.get_prefix("psNodes/").await?;
         let regions = c.get_prefix("regions/").await?;
-        // F173: replay ec_conversion_inflight markers so the new leader
-        // sees the deposed leader's in-flight EC conversions and skips
-        // them in recovery_dispatch_loop until the next
-        // ec_conversion_dispatch_loop tick re-enters the convert path.
-        let ec_inflight = c.get_prefix("ecConversionInflight/").await?;
+        // F207-B: legacy F173/F198 `ecConversionInflight/` markers from
+        // pre-F207-B clusters. Folded into the unified `inflight` ledger
+        // as ConvertToEc records during replay; `apply_ec_conversion_done`
+        // additionally lists this legacy key in its delete batch so any
+        // stragglers are cleaned up on the next EC apply. One-cycle
+        // backward compat — to be removed in F207-D after a deploy cycle.
+        let ec_inflight_legacy = c.get_prefix("ecConversionInflight/").await?;
         // F183: per-partition last_op_at sidecar
         let last_op = c.get_prefix("partitionLastOp/").await?;
-        // F207 Phase 0: unified extent in-flight ledger. New prefix that
-        // will replace `ecConversionInflight/` (F198) and `recoveryTasks/`
-        // once F207-B / F207-C migrations land. Phase 0 reads the prefix
-        // into `self.inflight` so the wiring is verified now; the prefix
-        // is empty on any pre-F207 cluster, so the in-memory map starts
-        // empty too.
+        // F207: unified extent in-flight ledger. Authoritative source of
+        // truth for stream-layer ops in flight on each extent.
         let extent_inflight_raw = c.get_prefix(crate::extent_inflight::EXTENT_INFLIGHT_PREFIX).await?;
         drop(c);
 
@@ -1141,39 +1123,40 @@ impl AutumnManager {
             decoded_regions.insert(id, region);
         }
 
-        // F173 + F198: parse extent_ids from `ecConversionInflight/` keys
-        // AND decode the rkyv marker value into `pending_ec_dispatch` so
-        // the next `ec_conversion_dispatch_loop` tick re-dispatches with
-        // the ORIGINAL target_nodes (not a fresh shuffle).
-        let mut decoded_ec_inflight: HashSet<u64> = HashSet::new();
-        let mut decoded_pending_dispatch: HashMap<u64, MgrEcDispatchInflight> = HashMap::new();
-        for kv in &ec_inflight.kvs {
+        // F207-B: legacy `ecConversionInflight/` markers. Fold them into
+        // the unified `inflight` ledger as ConvertToEc records. Pre-F198
+        // empty-value markers can't be safely re-dispatched (no
+        // target_nodes); we log and skip — `apply_ec_conversion_done`'s
+        // delete batch will clean them up on a future successful convert,
+        // or operator runs the ops scrub script.
+        let mut legacy_ec_dispatched: HashMap<u64, crate::extent_inflight::MgrExtentInflightRecord> =
+            HashMap::new();
+        for kv in &ec_inflight_legacy.kvs {
             let id = Self::parse_id_from_key("ecConversionInflight/", &kv.key)?;
-            decoded_ec_inflight.insert(id);
-            if !kv.value.is_empty() {
-                match rkyv_decode::<MgrEcDispatchInflight>(&kv.value) {
-                    Ok(rec) => {
-                        decoded_pending_dispatch.insert(id, rec);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            extent_id = id,
-                            error = %e,
-                            "F198: failed to decode ecConversionInflight marker value; \
-                             leaving extent in inflight-locked state until next tick"
-                        );
-                    }
-                }
-            } else {
-                // Pre-F198 marker (empty value) — the eversion-bump lock is
-                // preserved via `decoded_ec_inflight`, but we cannot safely
-                // re-dispatch without the original target_nodes. Operator
-                // intervention may be needed; log so it's visible.
+            if kv.value.is_empty() {
                 tracing::warn!(
                     extent_id = id,
-                    "F198: legacy empty ecConversionInflight marker (no target_nodes); \
-                     dispatch loop will skip until marker is cleared by operator or apply"
+                    "F207-B: legacy empty ecConversionInflight marker (pre-F198, no target_nodes); \
+                     cannot re-dispatch safely — operator must clear via ops tool"
                 );
+                continue;
+            }
+            match rkyv_decode::<MgrEcDispatchInflight>(&kv.value) {
+                Ok(rec) => {
+                    let record = crate::extent_inflight::MgrExtentInflightRecord::new(
+                        id,
+                        crate::extent_inflight::ExtentOpPayload::ConvertToEc(rec),
+                        (*self.instance_id).clone(),
+                    );
+                    legacy_ec_dispatched.insert(id, record);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        extent_id = id,
+                        error = %e,
+                        "F207-B: failed to decode legacy ecConversionInflight marker; skipping"
+                    );
+                }
             }
         }
 
@@ -1202,21 +1185,17 @@ impl AutumnManager {
             s.next_id = s.next_id.max(max_id.saturating_add(1));
         }
         *self.recovery_tasks.borrow_mut() = decoded_tasks;
-        // F173: install the EC-inflight markers BEFORE the leader-key
-        // flip completes its caller (try_become_leader). Without this
-        // hook, the very first tick of the new leader's
-        // recovery_dispatch_loop could fire on extents the prior leader
-        // was converting.
-        *self.ec_conversion_inflight.borrow_mut() = decoded_ec_inflight;
-        // F198: install the rich-marker view alongside the lock-set so
-        // the dispatch loop can drive replay-loaded markers forward.
-        *self.pending_ec_dispatch.borrow_mut() = decoded_pending_dispatch;
         // F183: install last_op_at sidecar so policy engine cooldown
         // gating is correct on cold-start as well.
         *self.last_op_at.borrow_mut() = decoded_last_op;
-        // F207 Phase 0: install unified inflight ledger view. Records
-        // with malformed op_kind/payload combinations are dropped with a
-        // WARN inside decode_extent_inflight_kvs.
+        // F207-B: install the unified inflight ledger. Records with
+        // malformed op_kind/payload combinations are dropped with a WARN
+        // inside `decode_extent_inflight_kvs`. Legacy
+        // `ecConversionInflight/` markers from pre-F207 clusters are
+        // merged in below; the new prefix entries take precedence if both
+        // exist for the same extent (which only happens during the
+        // backward-compat window between F207-B deploy and the next
+        // successful EC apply that clears the legacy key).
         {
             let decoded = Self::decode_extent_inflight_kvs(extent_inflight_raw.kvs.iter().map(
                 |kv| {
@@ -1230,6 +1209,10 @@ impl AutumnManager {
             ));
             let mut map = self.inflight.borrow_mut();
             map.clear();
+            // Legacy first, then authoritative new-prefix records overwrite.
+            for (id, rec) in legacy_ec_dispatched {
+                map.insert(id, rec);
+            }
             for (id, rec) in decoded {
                 if id != 0 {
                     map.insert(id, rec);
@@ -2060,68 +2043,17 @@ impl AutumnManager {
     /// from THIS leader's perspective. Called BEFORE the
     /// `EXT_MSG_CONVERT_TO_EC` RPC is dispatched. If this leader dies
     /// mid-flight, the new leader's `replay_from_etcd` repopulates
-    /// `ec_conversion_inflight` from the prefix, preserving the F138
-    /// eversion-bump-lock semantics across the failover boundary.
-    ///
-    /// Pre-F173 the `ec_conversion_inflight` HashSet was purely
-    /// in-memory; on leader failover the new leader's set was empty,
-    /// and `recovery_dispatch_loop` could fire `re_avali` /
-    /// `require_recovery` on extents the deposed leader was actively
-    /// converting. The downstream defenses (F119-D coordinator
-    /// idempotency, F153 extent-node per-extent EC lock, F119-C
-    /// read-side eversion check) made the race non-corrupting in
-    /// practice, but each defense fires post-hoc — F173 closes the
-    /// window at the source.
-    ///
-    /// F198: marker value carries the full dispatch params (rkyv-encoded
-    /// `MgrEcDispatchInflight`). Pre-F198 the value was empty; replay
-    /// restored only the lock-set, and the dispatch loop's
-    /// `ec_conversion_inflight.contains` skip permanently blocked the
-    /// new leader from re-dispatching. Now replay decodes the params
-    /// into `pending_ec_dispatch` and the dispatch loop reuses them.
-    async fn persist_ec_conversion_inflight(
-        &self,
-        record: &MgrEcDispatchInflight,
-    ) -> Result<(), AppError> {
-        if let Some(etcd) = &self.etcd {
-            let value = rkyv_encode(record).to_vec();
-            etcd.put_msgs_txn(vec![(
-                format!("ecConversionInflight/{}", record.extent_id),
-                value,
-            )])
-            .await?;
-        }
-        Ok(())
-    }
-
-    /// F173: clear the EC-inflight marker after `apply_ec_conversion_done`
-    /// completes (or after the dispatch RPC returns failure — in either
-    /// case the conversion is no longer in flight from this leader).
-    /// On failure to clear etcd (network blip), the marker is harmless
-    /// — it just causes an extra `recovery_dispatch_loop` skip on the
-    /// next tick, and the next `ec_conversion_dispatch_loop` re-fires
-    /// the convert path which is idempotent (F119-D).
-    async fn unpersist_ec_conversion_inflight(&self, extent_id: u64) -> Result<(), AppError> {
-        if let Some(etcd) = &self.etcd {
-            etcd.put_and_delete_txn(
-                Vec::new(),
-                vec![format!("ecConversionInflight/{}", extent_id)],
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
     async fn mark_extent_available(&self, extent_id: u64, slot: usize) -> Result<(), AppError> {
-        // F138: defer while EC conversion is in flight on this extent.
-        // re_avali was sent to the extent-node (eversion bump there), but the
-        // manager-side eversion bump must not race apply_ec_conversion_done's
-        // overwrite. The recovery_dispatch_loop retries on the next tick.
-        if self
-            .ec_conversion_inflight
-            .borrow()
-            .contains(&extent_id)
-        {
+        // F138 / F207-B: defer while EC conversion is in flight on this
+        // extent. re_avali was sent to the extent-node (eversion bump
+        // there), but the manager-side eversion bump must not race
+        // apply_ec_conversion_done's overwrite. The recovery_dispatch_loop
+        // retries on the next tick. F207-B: reads the unified ledger via
+        // `extent_inflight_op`.
+        if matches!(
+            self.extent_inflight_op(extent_id),
+            Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+        ) {
             return Err(AppError::Precondition(format!(
                 "ec conversion in flight on extent {extent_id}; deferring mark_extent_available"
             )));
@@ -3372,7 +3304,7 @@ mod tests {
                 .insert(extent_id, make_ec_extent(extent_id, 5));
 
             // Simulate EC dispatch: acquire the inflight lock.
-            m.ec_conversion_inflight.borrow_mut().insert(extent_id);
+            m._test_mark_ec_inflight(extent_id);
 
             // Recovery task was already dispatched.
             let task = MgrRecoveryTask {
@@ -3404,7 +3336,7 @@ mod tests {
             drop(s);
 
             // EC clears — retry now succeeds.
-            m.ec_conversion_inflight.borrow_mut().remove(&extent_id);
+            m._test_clear_inflight(extent_id);
             let result = m.apply_recovery_done(done).await;
             assert!(result.is_ok(), "F138: recovery apply must succeed after EC clears");
             let s = m.store.inner.borrow();
@@ -3425,7 +3357,7 @@ mod tests {
             ex.avali = 0x6; // slot 0 unavailable
             m.store.inner.borrow_mut().extents.insert(extent_id, ex);
 
-            m.ec_conversion_inflight.borrow_mut().insert(extent_id);
+            m._test_mark_ec_inflight(extent_id);
 
             let result = m.mark_extent_available(extent_id, 0).await;
             assert!(
@@ -3439,7 +3371,7 @@ mod tests {
             drop(s);
 
             // After EC clears, retry succeeds.
-            m.ec_conversion_inflight.borrow_mut().remove(&extent_id);
+            m._test_clear_inflight(extent_id);
             let result = m.mark_extent_available(extent_id, 0).await;
             assert!(result.is_ok(), "F138: mark_extent_available must succeed after EC clears");
             let s = m.store.inner.borrow();
@@ -3464,7 +3396,7 @@ mod tests {
                 .insert(extent_id, make_ec_extent(extent_id, 5));
 
             // Step 1: EC dispatch — acquire lock, capture eversion.
-            m.ec_conversion_inflight.borrow_mut().insert(extent_id);
+            m._test_mark_ec_inflight(extent_id);
             let captured_eversion = {
                 let s = m.store.inner.borrow();
                 s.extents.get(&extent_id).unwrap().eversion
@@ -3497,7 +3429,7 @@ mod tests {
             .await
             .unwrap();
             // Step 3b: lock released (mirrors the moved remove in ec_conversion_dispatch_loop).
-            m.ec_conversion_inflight.borrow_mut().remove(&extent_id);
+            m._test_clear_inflight(extent_id);
 
             // Step 4: deferred recovery retries — must succeed now.
             let r = m.apply_recovery_done(done).await;
@@ -3592,7 +3524,7 @@ mod tests {
             }
 
             // Lock the row_stream's extent — simulates EC conversion in flight.
-            m.ec_conversion_inflight.borrow_mut().insert(row_extent);
+            m._test_mark_ec_inflight(row_extent);
 
             let req = rkyv_encode(&MultiModifySplitReq {
                 part_id,
@@ -3777,7 +3709,7 @@ mod tests {
                 }
             }
             // Mark victim's row_stream extent as EC-inflight.
-            m.ec_conversion_inflight.borrow_mut().insert(201);
+            m._test_mark_ec_inflight(201);
 
             let req = rkyv_encode(&MultiModifyMergeReq {
                 survivor_part_id: 1,
@@ -4396,7 +4328,7 @@ mod tests {
             }
 
             // Simulate EC dispatch: extent is mid-conversion.
-            m.ec_conversion_inflight.borrow_mut().insert(extent_id);
+            m._test_mark_ec_inflight(extent_id);
             let eversion_before = m.store.inner.borrow().extents[&extent_id].eversion;
 
             let req = rkyv_encode(&PunchHolesReq {
@@ -4431,7 +4363,7 @@ mod tests {
             );
 
             // After EC completes (remove from inflight), punch_holes must succeed.
-            m.ec_conversion_inflight.borrow_mut().remove(&extent_id);
+            m._test_clear_inflight(extent_id);
             let req2 = rkyv_encode(&PunchHolesReq {
                 stream_id,
                 owner_key: owner_key.clone(),
@@ -4487,7 +4419,7 @@ mod tests {
             }
 
             // extent_a is mid-EC conversion — truncate should be refused.
-            m.ec_conversion_inflight.borrow_mut().insert(extent_a);
+            m._test_mark_ec_inflight(extent_a);
             let eversion_before = m.store.inner.borrow().extents[&extent_a].eversion;
 
             let req = rkyv_encode(&TruncateReq {
@@ -4568,7 +4500,7 @@ mod tests {
             }
 
             // Tail is mid-EC: alloc_extent must refuse immediately.
-            m.ec_conversion_inflight.borrow_mut().insert(tail_id);
+            m._test_mark_ec_inflight(tail_id);
             let eversion_before = m.store.inner.borrow().extents[&tail_id].eversion;
 
             let req = rkyv_encode(&StreamAllocExtentReq {
@@ -4970,15 +4902,15 @@ mod tests {
         assert_eq!(decoded.new_eversion, original.new_eversion);
     }
 
-    /// `pending_ec_dispatch` is initialised empty and lives on
-    /// `AutumnManager`; insertions and removals on the in-memory map are
-    /// visible to the dispatch loop via the same `Rc<RefCell<_>>`.
+    /// F198 / F207-B: the unified inflight ledger (the post-F207-B
+    /// successor to `pending_ec_dispatch`) starts empty; acquire +
+    /// commit_release round-trip ConvertToEc payloads correctly.
     #[test]
     fn f198_pending_ec_dispatch_in_memory_bookkeeping() {
         let m = AutumnManager::new();
         assert!(
-            m.pending_ec_dispatch.borrow().is_empty(),
-            "F198: pending_ec_dispatch starts empty"
+            m.inflight.borrow().is_empty(),
+            "F207-B: ledger starts empty"
         );
 
         let rec = MgrEcDispatchInflight {
@@ -4988,20 +4920,33 @@ mod tests {
             data_shards: 3,
             new_eversion: 4,
         };
-        m.pending_ec_dispatch.borrow_mut().insert(rec.extent_id, rec.clone());
-        let got = m
-            .pending_ec_dispatch
-            .borrow()
-            .get(&7)
-            .cloned()
-            .expect("present");
-        assert_eq!(got.target_nodes, vec![1, 3, 5, 7]);
-        assert_eq!(got.new_eversion, 4);
+        run(async {
+            m.acquire_extent_inflight(
+                rec.extent_id,
+                crate::extent_inflight::ExtentOpPayload::ConvertToEc(rec.clone()),
+            )
+            .await
+            .expect("acquire");
+        });
+        let inflight_view = m.inflight.borrow();
+        let stored = inflight_view.get(&7).expect("present").clone();
+        drop(inflight_view);
+        match stored.unpack().expect("valid record").1 {
+            crate::extent_inflight::ExtentOpPayload::ConvertToEc(p) => {
+                assert_eq!(p.target_nodes, vec![1, 3, 5, 7]);
+                assert_eq!(p.new_eversion, 4);
+            }
+            _ => panic!("expected ConvertToEc payload"),
+        }
+        assert_eq!(
+            m.extent_inflight_op(7),
+            Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+        );
 
-        m.pending_ec_dispatch.borrow_mut().remove(&7);
+        m.commit_extent_inflight_release(7);
         assert!(
-            m.pending_ec_dispatch.borrow().is_empty(),
-            "F198: cleared after apply"
+            m.inflight.borrow().is_empty(),
+            "F207-B: ledger cleared after release"
         );
     }
 

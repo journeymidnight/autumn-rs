@@ -787,7 +787,11 @@ impl AutumnManager {
             // guards, a concurrent EC conversion or recovery on the tail
             // extent would have its eversion+replicates writeback silently
             // overwritten by our verify-at-apply block below.
-            if self.ec_conversion_inflight.borrow().contains(&tail_id) {
+            // F207-B: read the unified ledger (was F138 `ec_conversion_inflight`).
+            if matches!(
+                self.extent_inflight_op(tail_id),
+                Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+            ) {
                 let msg = format!(
                     "extent {tail_id} has in-flight EC conversion; \
                      defer alloc_extent until conversion completes"
@@ -1107,8 +1111,21 @@ impl AutumnManager {
         let req: PunchHolesReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
+        // F207-B: snapshot the ConvertToEc-inflight set once. Replaces the
+        // old `let ec_inflight = self.ec_conversion_inflight.borrow();`
+        // pattern (a Ref into the deleted HashSet). The semantics are
+        // identical — single-threaded compio, snapshot-then-consult.
+        let ec_inflight_set: HashSet<u64> = self
+            .inflight
+            .borrow()
+            .iter()
+            .filter_map(|(id, rec)| match rec.kind() {
+                Some(crate::extent_inflight::ExtentOpKind::ConvertToEc) => Some(*id),
+                _ => None,
+            })
+            .collect();
+
         let out = {
-            let ec_inflight = self.ec_conversion_inflight.borrow();
             let recovery_inflight = self.recovery_tasks.borrow();
             let mut guard = self.store.inner.borrow_mut();
             let s: &mut autumn_common::MetadataState = &mut guard;
@@ -1156,14 +1173,15 @@ impl AutumnManager {
                         }
                     }
                 }
-                // F145: symmetric to the F139 recovery guard above. Refuse the
-                // whole RPC if any to-be-removed extent is mid-EC. punch_holes
-                // would otherwise bump eversion via the else branch (refs<=1 +
-                // ec_inflight) or the refs>1 branch — both violate F138's
-                // invariant that ec_conversion_inflight is an eversion-bump lock.
-                // PS GC retry naturally covers the brief inflight window.
+                // F145 / F207-B: symmetric to the F139 recovery guard above.
+                // Refuse the whole RPC if any to-be-removed extent is mid-EC.
+                // punch_holes would otherwise bump eversion via the else
+                // branch (refs<=1 + ec_inflight) or the refs>1 branch — both
+                // violate F138's invariant that the EC marker is an
+                // eversion-bump lock. PS GC retry naturally covers the
+                // brief inflight window.
                 for eid in &removed {
-                    if ec_inflight.contains(eid) {
+                    if ec_inflight_set.contains(eid) {
                         return Err(AppError::Precondition(format!(
                             "extent {eid} has in-flight EC conversion; \
                              defer punch_holes until conversion completes"
@@ -1196,7 +1214,7 @@ impl AutumnManager {
                         removed.contains(eid)
                             && e.refs == 1
                             && e.vp_table_refs == 0
-                            && !ec_inflight.contains(eid)
+                            && !ec_inflight_set.contains(eid)
                     })
                     .map(|(eid, e)| (*eid, e.clone()))
                     .collect();
@@ -1215,7 +1233,7 @@ impl AutumnManager {
                         if extent.refs <= 1 {
                             extent.refs = 0;
                             if Self::extent_can_delete(extent)
-                                && !ec_inflight.contains(&extent_id)
+                                && !ec_inflight_set.contains(&extent_id)
                             {
                                 s.extents.remove(&extent_id);
                                 extent_deletes.push(extent_id);
@@ -1275,8 +1293,18 @@ impl AutumnManager {
         let req: TruncateReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
+        // F207-B: snapshot the ConvertToEc-inflight set (was F138 `ec_conversion_inflight`).
+        let ec_inflight_set: HashSet<u64> = self
+            .inflight
+            .borrow()
+            .iter()
+            .filter_map(|(id, rec)| match rec.kind() {
+                Some(crate::extent_inflight::ExtentOpKind::ConvertToEc) => Some(*id),
+                _ => None,
+            })
+            .collect();
+
         let out = {
-            let ec_inflight = self.ec_conversion_inflight.borrow();
             let recovery_inflight = self.recovery_tasks.borrow();
             let mut guard = self.store.inner.borrow_mut();
             let s: &mut autumn_common::MetadataState = &mut guard;
@@ -1326,11 +1354,12 @@ impl AutumnManager {
                         }
                     }
                 }
-                // F145: symmetric to the F139 recovery guard above. Refuse if
-                // any to-be-truncated extent is mid-EC conversion, to preserve
-                // F138's eversion-bump lock invariant. Caller retries.
+                // F145 / F207-B: symmetric to the F139 recovery guard above.
+                // Refuse if any to-be-truncated extent is mid-EC conversion,
+                // to preserve F138's eversion-bump lock invariant. Caller
+                // retries.
                 for eid in &removed {
-                    if ec_inflight.contains(eid) {
+                    if ec_inflight_set.contains(eid) {
                         return Err(AppError::Precondition(format!(
                             "extent {eid} has in-flight EC conversion; \
                              defer truncate until conversion completes"
@@ -1359,7 +1388,7 @@ impl AutumnManager {
                         removed.contains(eid)
                             && e.refs == 1
                             && e.vp_table_refs == 0
-                            && !ec_inflight.contains(eid)
+                            && !ec_inflight_set.contains(eid)
                     })
                     .map(|(eid, e)| (*eid, e.clone()))
                     .collect();
@@ -1378,7 +1407,7 @@ impl AutumnManager {
                         if extent.refs <= 1 {
                             extent.refs = 0;
                             if Self::extent_can_delete(extent)
-                                && !ec_inflight.contains(&extent_id)
+                                && !ec_inflight_set.contains(&extent_id)
                             {
                                 s.extents.remove(&extent_id);
                                 extent_deletes.push(extent_id);
@@ -1468,17 +1497,21 @@ impl AutumnManager {
                     ));
                 }
 
-                // F138: reject split if any source-stream extent is undergoing EC
-                // conversion. compute_duplicate_stream bumps eversion on the
-                // source extents; if apply_ec_conversion_done runs concurrently it
-                // would overwrite those bumps. Fail fast — client retries with
-                // backoff.
+                // F138 / F207-B: reject split if any source-stream extent
+                // is undergoing EC conversion. compute_duplicate_stream
+                // bumps eversion on the source extents; if
+                // apply_ec_conversion_done runs concurrently it would
+                // overwrite those bumps. Fail fast — client retries with
+                // backoff. F207-B: reads the unified ledger via
+                // `extent_inflight_op`.
                 {
-                    let ec_inflight = self.ec_conversion_inflight.borrow();
                     for &sid in &[src_meta.log_stream, src_meta.row_stream, src_meta.meta_stream] {
                         if let Some(stream) = s.streams.get(&sid) {
                             for &eid in &stream.extent_ids {
-                                if ec_inflight.contains(&eid) {
+                                if matches!(
+                                    self.extent_inflight_op(eid),
+                                    Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+                                ) {
                                     return Err(AppError::Precondition(format!(
                                         "ec conversion in flight on extent {eid}; retry split"
                                     )));
@@ -1762,7 +1795,7 @@ impl AutumnManager {
                     victim_meta.meta_stream,
                 ];
                 {
-                    let ec_inflight = self.ec_conversion_inflight.borrow();
+                    // F207-B: read ConvertToEc via the unified ledger.
                     let recovery_inflight = self.recovery_tasks.borrow();
                     let pending_deletes = self.pending_extent_deletes.borrow();
                     let pending_eids: HashSet<u64> =
@@ -1770,7 +1803,10 @@ impl AutumnManager {
                     for &sid in &all_streams {
                         if let Some(stream) = s.streams.get(&sid) {
                             for &eid in &stream.extent_ids {
-                                if ec_inflight.contains(&eid) {
+                                if matches!(
+                                    self.extent_inflight_op(eid),
+                                    Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+                                ) {
                                     return Err(AppError::Precondition(format!(
                                         "ec conversion in flight on extent {eid}; retry merge"
                                     )));
@@ -2406,12 +2442,26 @@ impl AutumnManager {
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         let extent_id = req.extent_id;
 
-        // Already pending? Idempotent OK.
-        if self.pending_ec_dispatch.borrow().contains_key(&extent_id) {
-            return Ok(rkyv_encode(&ForceEcConvertResp {
-                code: CODE_OK,
-                message: "already pending dispatch".to_string(),
-            }));
+        // F207-B: already in-flight (any stream-layer op)? Idempotent OK
+        // for the ConvertToEc case (caller's intent matches the in-flight
+        // op); Precondition for Recovery / Delete (different ops, retry
+        // later).
+        match self.extent_inflight_op(extent_id) {
+            Some(crate::extent_inflight::ExtentOpKind::ConvertToEc) => {
+                return Ok(rkyv_encode(&ForceEcConvertResp {
+                    code: CODE_OK,
+                    message: "already pending dispatch".to_string(),
+                }));
+            }
+            Some(other) => {
+                return Ok(rkyv_encode(&ForceEcConvertResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "extent {extent_id} has in-flight {other:?}; retry after it completes"
+                    ),
+                }));
+            }
+            None => {}
         }
 
         // Look up current state + the owning stream's EC shape under
@@ -2534,18 +2584,28 @@ impl AutumnManager {
             new_eversion,
         };
 
-        if let Err(e) = self.persist_ec_conversion_inflight(&dispatch_record).await {
+        // F207-B: acquire the unified inflight marker. CAS via
+        // create_revision==0 + F149 leader fence in a single etcd txn —
+        // replaces the pre-F207 `persist_ec_conversion_inflight + in-memory
+        // insert` pair (two operations, the in-memory write could observe
+        // an etcd failure post-facto). The CAS makes "already in-flight"
+        // a clean Precondition error path rather than a silent overwrite.
+        if let Err(e) = self
+            .acquire_extent_inflight(
+                extent_id,
+                crate::extent_inflight::ExtentOpPayload::ConvertToEc(dispatch_record),
+            )
+            .await
+        {
             return Ok(rkyv_encode(&ForceEcConvertResp {
-                code: CODE_ERROR,
-                message: format!("persist marker: {e}"),
+                code: match &e {
+                    AppError::Precondition(_) => CODE_PRECONDITION,
+                    AppError::NotLeader => CODE_NOT_LEADER,
+                    _ => CODE_ERROR,
+                },
+                message: format!("acquire marker: {e}"),
             }));
         }
-        self.pending_ec_dispatch
-            .borrow_mut()
-            .insert(extent_id, dispatch_record);
-        // ec_conversion_inflight is set lazily by the dispatch loop
-        // when it actually fires the RPC; matching the fresh-dispatch
-        // ordering pre-F203.
 
         Ok(rkyv_encode(&ForceEcConvertResp {
             code: CODE_OK,
@@ -2903,7 +2963,11 @@ impl AutumnManager {
             // data in etcd (last-writer-wins). PS must retry after the
             // in-flight op clears.
             for extent_id in deltas.keys().copied() {
-                if self.ec_conversion_inflight.borrow().contains(&extent_id) {
+                // F207-B: read the unified ledger (was F138/F147-A `ec_conversion_inflight`).
+                if matches!(
+                    self.extent_inflight_op(extent_id),
+                    Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+                ) {
                     return Ok(rkyv_encode(&SyncPartitionVpRefsResp {
                         code: CODE_PRECONDITION,
                         message: format!(

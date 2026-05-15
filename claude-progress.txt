@@ -1,101 +1,154 @@
 Date: 2026-05-15
 TaskStatus: completed
-Task scope: F207-A — unified extent in-flight ledger, Phase 0
-            (infrastructure only). NEW file
-            crates/manager/src/extent_inflight.rs with types + API +
-            replay arm; NEW `inflight` field on AutumnManager. NO
-            production handler migrated this phase.
+Task scope: F207-B — unified extent in-flight ledger, Phase 1.
+            EC convert (`ec_conversion_dispatch_loop` +
+            `apply_ec_conversion_done` + `handle_force_ec_convert`) +
+            9 cross-domain reader sites all migrated to the unified
+            ledger. `ec_conversion_inflight` + `pending_ec_dispatch`
+            fields + `persist/unpersist_ec_conversion_inflight`
+            helpers DELETED. Atomic put+delete txn in
+            `apply_ec_conversion_done` closes a latent marker-leak
+            bug that existed pre-F207-B.
 
-Architectural context:
-  - User architectural review after F206 (avali bug): EC convert had
-    accumulated 13 F-numbers of mutex / inflight bookkeeping bugs.
-    User asked whether moving coordinator from EN to manager would
-    help. Conclusion: no — violates control/data-plane separation,
-    multiplies network 2.5x, only eliminates 2 of 13 bug classes.
-  - Real lever: 5 of those bug classes (F126/F138/F139/F145/F147-A)
-    are the same "if-extent-in-set then refuse" pattern done five
-    times across 4 scattered inflight mechanisms. F207 collapses
-    them into one etcd-backed ledger.
-  - Layer boundary correction (user): split/merge are PS-layer
-    (partition-scoped), not stream-layer. The ledger is a stream-
-    layer concept covering ConvertToEc / Recovery / Delete only.
-    PS-layer handlers READ the ledger but do not enroll.
-  - PS-layer ↔ stream-layer interaction: three classes (A/B/C)
-    handled by refuse-at-start / verify-at-apply (F146 pattern) /
-    exclusive CAS — composes via asymmetric read/write
-    responsibilities.
+Atomicity headline:
+  Pre-F207-B `apply_ec_conversion_done` did:
+    1. etcd put_msgs_txn(extents/<id>) — one network round-trip
+    2. in-memory remove from ec_conversion_inflight + pending_ec_dispatch
+    3. etcd put_and_delete_txn(deletes=[ecConversionInflight/<id>]) —
+       another round-trip
+  Manager crash between steps 1 and 3 leaked the etcd marker. New
+  leader's replay reloaded it, blocking future EC convert dispatch
+  on that extent indefinitely (the F119-D coordinator-side guard
+  made it a stall, not corruption — but still a bug).
 
-What F207-A specifically did:
-  1. NEW crates/manager/src/extent_inflight.rs (~370 lines incl.
-     tests). Types:
-       - MgrExtentInflightRecord (flat-struct on-disk shape with
-         op_kind byte + three Option payloads, exactly one Some by
-         invariant — avoids being the proving ground for rkyv 0.8
-         enum CheckBytes support).
-       - ExtentOpKind discriminator (ConvertToEc / Recovery / Delete).
-       - ExtentOpPayload typed view enum (Rust-only, not rkyv).
-       - PersistedPendingDelete (drops the in-memory `attempts`
-         counter from the existing PendingDelete).
-     APIs:
-       - acquire_extent_inflight: CAS via create_revision==0 +
-         F149 leader fence (txn_fenced).
-       - build_extent_inflight_release_op: returns the etcd delete
-         Op for caller to bundle into its own apply-done txn (I3).
-       - commit_extent_inflight_release: in-memory cleanup.
-       - extent_inflight_op: read-only probe.
-       - decode_extent_inflight_kvs: replay-time decoder that drops
-         malformed records with WARN.
-  2. crates/manager/src/lib.rs:
-       - `mod extent_inflight;` declaration.
-       - `inflight: Rc<RefCell<HashMap<u64,
-         MgrExtentInflightRecord>>>` field on AutumnManager.
-       - Initialised in `new()`.
-       - Replay arm added to `replay_from_etcd` for the
-         `extent_inflight/` etcd prefix. Empty on pre-F207 clusters.
+  Post-F207-B:
+    1. mutate in-memory state
+    2. ONE etcd put_and_delete_txn(
+         puts=[extents/<id>],
+         deletes=[extent_inflight/<id>, ecConversionInflight/<id>]
+       ) — single txn under F149 leader fence
+    3. in-memory commit_extent_inflight_release (after etcd OK,
+       per etcd-first invariant)
+  Either both etcd keys move together or neither does. Marker
+  leaks impossible. Invariant I3 enforced structurally.
 
-Six new unit tests cover the API:
-  - f207_acquire_extent_inflight_succeeds_when_empty
-  - f207_acquire_extent_inflight_rejects_duplicate
-  - f207_commit_extent_inflight_release_clears_probe
-  - f207_record_rkyv_round_trip_all_variants
-  - f207_unpack_rejects_malformed_records
-  - f207_decode_drops_malformed
+Writer migration:
+  - handle_force_ec_convert (rpc_handlers.rs:2395):
+    persist_ec_conversion_inflight + pending_ec_dispatch.insert →
+    acquire_extent_inflight(eid, ConvertToEc(record)). CAS via
+    create_revision==0 makes "already in-flight" a clean
+    Precondition error path; idempotent OK if existing op IS
+    ConvertToEc on the same extent.
+  - ec_conversion_dispatch_loop (recovery.rs:593-…):
+      * candidates sourced from inflight ledger filter ConvertToEc
+      * "fresh dispatch" branch (compute fresh target_nodes inside
+        the loop) DELETED — under F203 + F207-B the marker is
+        ALWAYS authoritative (handle_force_ec_convert wrote it or
+        replay restored it).
+      * stale-marker drain via new drain_extent_inflight_marker
+        helper (F149-fenced delete).
+      * post-RPC: rpc_ok → apply_done's atomic txn cleared etcd
+        marker; loop calls commit_extent_inflight_release for
+        in-memory cleanup.
+  - apply_ec_conversion_done (recovery.rs:968-…):
+      atomic put_and_delete_txn as described. Delete list
+      includes legacy ecConversionInflight/<id> for one-cycle
+      backward compat (one-shot cleanup on upgraded clusters).
 
-NOT in this phase (deferred to F207-B / F207-C / F207-D):
-  - Migration of EC convert (ec_conversion_dispatch_loop,
-    apply_ec_conversion_done, handle_force_ec_convert) — F207-B.
+Cross-domain reader migration (9 sites):
+  - lib.rs mark_extent_available — single line ledger read
+  - recovery.rs dispatch_recovery_task (F126 check)
+  - recovery.rs apply_recovery_done defer (F138 check)
+  - recovery.rs recovery_dispatch_loop filter (F172-A)
+  - rpc_handlers.rs handle_stream_alloc_extent (tail check)
+  - rpc_handlers.rs handle_stream_punch_holes (F139/F145)
+  - rpc_handlers.rs handle_truncate (F139/F145)
+  - rpc_handlers.rs handle_multi_modify_split (F138/F146)
+  - rpc_handlers.rs handle_multi_modify_merge (F183/F185)
+  - rpc_handlers.rs handle_sync_partition_vp_refs (F147-A)
+
+  Pattern: where the value was consulted multiple times inside a
+  closure under a borrow_mut of the store, a snapshot
+  `ec_inflight_set: HashSet<u64>` is taken at the top of the
+  handler. Single-threaded compio + snapshot-then-consult
+  preserves the semantics of the old `let ec_inflight =
+  self.ec_conversion_inflight.borrow();` pattern.
+
+Replay backward compat:
+  Legacy `ecConversionInflight/<id>` etcd markers (pre-F207-B)
+  are folded into the unified ledger as ConvertToEc records
+  during `replay_from_etcd`. apply_ec_conversion_done's delete
+  batch additionally targets the legacy key, so the first
+  successful EC apply post-deploy cleans up the old marker for
+  that extent. The legacy prefix replay arm + the legacy key in
+  apply's delete batch will be removed in F207-D after a deploy
+  cycle.
+
+Test migration:
+  - 11 sites in lib.rs tests that wrote directly to the deleted
+    ec_conversion_inflight HashSet now call
+    `_test_mark_ec_inflight` / `_test_clear_inflight` helpers
+    (added in F207-A).
+  - f198_pending_ec_dispatch_in_memory_bookkeeping rewritten to
+    exercise acquire_extent_inflight +
+    commit_extent_inflight_release against the new ledger.
+  - All 85 manager lib tests pass unchanged (count includes the 6
+    F207-A unit tests + the rewrites).
+
+What stays (defense in depth, per the plan):
+  - F119-D coordinator-side idempotency check in extent_node.rs
+  - F153 per-extent EC conversion serialisation lock in
+    extent_node.rs
+  Neither touched this phase — F207-B is purely manager-side.
+
+NOT in this phase (deferred to F207-C / F207-D):
   - Migration of recovery (dispatch_recovery_task,
-    apply_recovery_done) and delete (extent_delete_loop) — F207-C.
-  - Migration of the 9 scattered refuse-at-start sites in
-    rpc_handlers.rs to a single-line extent_inflight_op read —
+    apply_recovery_done, recovery_collect_loop) — F207-C.
+  - Migration of delete (extent_delete_loop +
+    pending_extent_deletes VecDeque) — F207-C.
+  - Folding the 6 reader sites' remaining recovery_tasks /
+    pending_extent_deletes checks into one ledger-read line —
     F207-C.
-  - Cleanup of dual-replay backward-compat arms, stale-marker
-    sweep, CLAUDE.md note rewrites — F207-D.
+  - Removal of the backward-compat dual-replay arm
+    (`ecConversionInflight/`) and legacy-key delete in
+    apply_ec_conversion_done — F207-D.
+  - Stale-marker WARN sweep — F207-D.
+  - CLAUDE.md programming notes 10-15 rewrites — F207-D.
 
 Verification:
   - cargo build --workspace --exclude autumn-fuse: clean.
-  - cargo test -p autumn-manager --lib: 85 passed (was 79; +6 F207).
-    No regression in F126 / F138 / F139 / F145 / F147 / F198 / F206
-    suites — they all still pass because no handler is migrated yet.
+  - cargo test -p autumn-manager --lib: 85 passed
+    (was 85 in F207-A → still 85; no count change because Phase 1
+     re-routes existing F138/F126/F145/F147 regression tests
+     through the new ledger without adding net new tests).
+  - cargo test -p autumn-stream --lib: 53 passed (no regression).
 
 Backward compatibility:
-  - Phase 0 introduces a NEW etcd prefix (extent_inflight/) that no
-    handler writes to yet. Existing prefixes
-    (ecConversionInflight/, recoveryTasks/) untouched.
-  - On any cluster, the replay arm reads an empty prefix → in-memory
-    map starts empty → API is dormant until F207-B writes the first
-    record. Zero behavioural diff in Phase 0.
+  - Pre-F207-B clusters with `ecConversionInflight/<id>` markers
+    in etcd: legacy replay fold-in restores them as ConvertToEc
+    ledger entries on next leader promotion; apply_ec_conversion_done
+    deletes legacy keys on next successful EC apply.
+  - Manager wire surface unchanged (no RPC type changes).
+  - Behavioural diff: marker leak window between two pre-F207-B
+    etcd writes is now closed.
 
 Memory:
-  - No new memory entry. The architectural rationale + layer
-    boundary clarification live in feature_list.md F207-A and the
-    plan file ~/.claude/plans/stream-merge-split-ps-sorted-
-    dijkstra.md.
+  - No new memory entry needed. Rationale lives in feature_list.md
+    F207-B and the plan file
+    ~/.claude/plans/stream-merge-split-ps-sorted-dijkstra.md.
 
-Next session starting point: F207-B (Phase 1 — migrate EC convert).
-The plan file has the detailed walkthrough including before/after
-code snippets for handle_force_ec_convert, ec_conversion_dispatch_
-loop, and apply_ec_conversion_done. Critical atomicity improvement:
-F207-B bundles `put extents/<id>` + `delete extent_inflight/<id>`
-into a single txn_fenced call, closing the latent leak window
-between today's two separate etcd writes in apply_ec_conversion_done.
+Next session starting point: F207-C (Phase 2 — migrate recovery +
+delete). Major work:
+  - dispatch_recovery_task / apply_recovery_done acquire / release
+    via the ledger (instead of recoveryTasks/ etcd + in-memory
+    recovery_tasks HashMap).
+  - extent_delete_loop acquires Delete before EXT_DELETE_EXTENT,
+    releases on ack.
+  - Collapse the 6 rpc_handlers.rs reader sites' remaining
+    recovery_tasks / pending_extent_deletes checks into single
+    extent_inflight_op probes.
+  - Delete recovery_tasks + pending_extent_deletes fields.
+  - One-cycle backward compat: replay reads `recoveryTasks/`
+    prefix into ledger as Recovery records.
+
+After F207-C, F207-D cleans up backward-compat arms + CLAUDE.md notes.

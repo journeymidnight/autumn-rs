@@ -19,15 +19,20 @@ impl AutumnManager {
             return Ok(());
         }
 
-        // F126: do not dispatch recovery while EC conversion is in flight on
-        // this extent. Recovery would write a full replica copy to the node's
-        // `.dat` file; EC conversion's `commit_shard_local` then renames
-        // `.ec.dat` over the same path, silently clobbering recovery's data
-        // and leaving the recovery target node holding parity bytes while
-        // `apply_recovery_done` still rewrites `replicates[slot]` to point
-        // there — producing a duplicate-node corrupt state where the same
-        // node id appears in both `replicates` and `parity`.
-        if self.ec_conversion_inflight.borrow().contains(&extent_id) {
+        // F126 / F207-B: do not dispatch recovery while EC conversion is in
+        // flight on this extent. Recovery would write a full replica copy
+        // to the node's `.dat` file; EC conversion's `commit_shard_local`
+        // then renames `.ec.dat` over the same path, silently clobbering
+        // recovery's data and leaving the recovery target node holding
+        // parity bytes while `apply_recovery_done` still rewrites
+        // `replicates[slot]` to point there — producing a duplicate-node
+        // corrupt state. F207-B: this check now reads the unified inflight
+        // ledger via `extent_inflight_op` instead of the old
+        // `ec_conversion_inflight` HashSet.
+        if matches!(
+            self.extent_inflight_op(extent_id),
+            Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+        ) {
             return Ok(());
         }
 
@@ -142,16 +147,16 @@ impl AutumnManager {
     ) -> Result<(), AppError> {
         let task = &done_task.task;
 
-        // F138: if EC conversion is in flight for this extent, defer the
-        // recovery apply. apply_ec_conversion_done would overwrite both
-        // ex.replicates (reverting the slot replacement) and ex.eversion
-        // (losing the recovery's eversion bump). The recovery_collect_loop
-        // retries on the next 2 s tick after EC clears.
-        if self
-            .ec_conversion_inflight
-            .borrow()
-            .contains(&task.extent_id)
-        {
+        // F138 / F207-B: if EC conversion is in flight for this extent,
+        // defer the recovery apply. apply_ec_conversion_done would
+        // overwrite both ex.replicates (reverting the slot replacement)
+        // and ex.eversion (losing the recovery's eversion bump). The
+        // recovery_collect_loop retries on the next 2 s tick after EC
+        // clears. F207-B: reads the unified ledger via `extent_inflight_op`.
+        if matches!(
+            self.extent_inflight_op(task.extent_id),
+            Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+        ) {
             return Err(AppError::Precondition(format!(
                 "ec conversion in flight on extent {}; deferring recovery apply",
                 task.extent_id
@@ -301,11 +306,25 @@ impl AutumnManager {
             // tick's worth of dispatch latency on the racing extent).
             let (extents, nodes, disks) = {
                 let s = self.store.inner.borrow();
-                let ec_inflight = self.ec_conversion_inflight.borrow();
+                // F207-B: read the unified inflight ledger instead of the
+                // old `ec_conversion_inflight` HashSet. We filter for
+                // ConvertToEc specifically — recovery dispatch on an extent
+                // that's mid-Recovery or mid-Delete is handled by
+                // `dispatch_recovery_task`'s own refuse-at-start (F207-C
+                // collapses those into the same probe).
+                let inflight = self.inflight.borrow();
                 let extents: Vec<MgrExtentInfo> = s
                     .extents
                     .values()
-                    .filter(|ex| ex.sealed_length > 0 && !ec_inflight.contains(&ex.extent_id))
+                    .filter(|ex| {
+                        if ex.sealed_length == 0 {
+                            return false;
+                        }
+                        !matches!(
+                            inflight.get(&ex.extent_id).and_then(|r| r.kind()),
+                            Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+                        )
+                    })
                     .cloned()
                     .collect();
                 (extents, s.nodes.clone(), s.disks.clone())
@@ -629,14 +648,16 @@ impl AutumnManager {
 
             // F172-B: snapshot node_addrs ONCE per loop tick.
             let node_addrs: HashMap<u64, String>;
-            // Candidate set = `pending_ec_dispatch` keys. The matching
-            // extent + stream entries are looked up under the same
-            // borrow so we get a consistent snapshot.
+            // F207-B: candidate set = ledger entries with kind == ConvertToEc.
+            // Pre-F207 this was `pending_ec_dispatch` keys; the ledger
+            // collapses that map + `ec_conversion_inflight` HashSet into one
+            // source of truth. The matching extent + stream entries are
+            // looked up under the same borrow so we get a consistent
+            // snapshot.
             //
             // F119-D dedup is structural here: HashMap keys are unique
-            // by construction, so the seen-set guard is no longer
-            // needed.
-            let candidates: Vec<(MgrExtentInfo, MgrStreamInfo)>;
+            // by construction, so the seen-set guard is no longer needed.
+            let candidates: Vec<(MgrExtentInfo, MgrStreamInfo, MgrEcDispatchInflight)>;
             {
                 let s = self.store.inner.borrow();
                 node_addrs = s
@@ -644,28 +665,31 @@ impl AutumnManager {
                     .iter()
                     .map(|(id, n)| (*id, n.address.clone()))
                     .collect();
-                let pending: Vec<u64> = self
-                    .pending_ec_dispatch
+                let pending: Vec<(u64, MgrEcDispatchInflight)> = self
+                    .inflight
                     .borrow()
-                    .keys()
-                    .copied()
+                    .iter()
+                    .filter_map(|(eid, rec)| match rec.unpack() {
+                        Some((_, crate::extent_inflight::ExtentOpPayload::ConvertToEc(p))) => {
+                            Some((*eid, p))
+                        }
+                        _ => None,
+                    })
                     .collect();
                 let mut out = Vec::new();
-                for eid in pending {
+                for (eid, params) in pending {
                     if recovery_inflight_extents.contains(&eid) {
                         continue;
                     }
                     let ex = match s.extents.get(&eid) {
                         Some(e) => e.clone(),
                         None => {
-                            // Marker for an extent that no longer
-                            // exists (deleted between marker write and
-                            // this tick). Drop the marker.
-                            let pep = self.pending_ec_dispatch.clone();
+                            // Marker for an extent that no longer exists
+                            // (deleted between marker write and this
+                            // tick). Drop the marker.
                             let mgr = self.clone();
                             compio::runtime::spawn(async move {
-                                pep.borrow_mut().remove(&eid);
-                                let _ = mgr.unpersist_ec_conversion_inflight(eid).await;
+                                let _ = mgr.drain_extent_inflight_marker(eid).await;
                             })
                             .detach();
                             continue;
@@ -674,20 +698,18 @@ impl AutumnManager {
                     if ex.ec_converted || ex.sealed_length == 0 {
                         // Marker stale (already converted, or extent
                         // got truncated to 0). Drop the marker.
-                        let pep = self.pending_ec_dispatch.clone();
                         let mgr = self.clone();
                         compio::runtime::spawn(async move {
-                            pep.borrow_mut().remove(&eid);
-                            let _ = mgr.unpersist_ec_conversion_inflight(eid).await;
+                            let _ = mgr.drain_extent_inflight_marker(eid).await;
                         })
                         .detach();
                         continue;
                     }
-                    // Find the stream that owns this extent so we
-                    // recover its EC shape. CoW-shared extents
-                    // (refs >= 2) appear in multiple streams; any
-                    // pick works because `compute_duplicate_stream`
-                    // clones `(ec_data_shard, ec_parity_shard)`.
+                    // Find the stream that owns this extent so we recover
+                    // its EC shape. CoW-shared extents (refs >= 2) appear
+                    // in multiple streams; any pick works because
+                    // `compute_duplicate_stream` clones
+                    // `(ec_data_shard, ec_parity_shard)`.
                     let stream = s
                         .streams
                         .values()
@@ -699,158 +721,90 @@ impl AutumnManager {
                         Some(s) => s,
                         None => continue,
                     };
-                    out.push((ex, stream));
+                    out.push((ex, stream, params));
                 }
                 candidates = out;
             }
 
-            for (ex, stream) in candidates {
+            for (ex, stream, replay_params) in candidates {
                 let extent_id = ex.extent_id;
                 let data_shards = stream.ec_data_shard as usize;
                 let parity_shards = stream.ec_parity_shard as usize;
                 let total_shards = data_shards + parity_shards;
 
-                // F198: check for a replay-loaded rich marker. If present,
-                // the previous leader (or our prior lifetime) was mid-EC
-                // and persisted the original `target_nodes` assignment.
-                // We re-dispatch against the SAME assignment — calling
-                // `alloc_extent_on_node` on a node that already received
-                // shard data would reset its in-memory state (eversion=1,
-                // sealed=0) and silently corrupt the EC layout.
-                let replay_params = self.pending_ec_dispatch.borrow().get(&extent_id).cloned();
+                // F198 / F207-B: the marker in the ledger IS the rich
+                // dispatch record — every iteration enters this loop with a
+                // valid `MgrEcDispatchInflight`. There is no "pre-F198 empty
+                // legacy marker" branch under F207-B because the ledger only
+                // accepts typed records. Replay folds legacy markers into
+                // the ledger or drops them with WARN (see
+                // `replay_from_etcd`).
+                //
+                // We split the path into "replay re-use" vs "fresh assign"
+                // based on whether the marker pre-existed BEFORE this tick
+                // (replay) or we're about to write it (fresh). For
+                // simplicity we treat the marker's presence as load-bearing:
+                // since `acquire_extent_inflight` is the only writer and is
+                // called below in the "fresh" branch, any marker we observe
+                // at the top of this iteration came from either replay or
+                // `handle_force_ec_convert` — both of which represent an
+                // authoritative assignment we should reuse.
 
-                // Pre-F198: blanket `if ec_conversion_inflight.contains(&extent_id) { continue; }`
-                // permanently blocked re-dispatch of replay-loaded markers
-                // (etcd state stayed `ec_converted=false` while the extent-
-                // node already had post-EC eversion). Now: the check is
-                // removed entirely because the dispatch loop body is
-                // sequential WITHIN a tick (dedup'd via the `seen` HashSet
-                // above) AND across ticks (next tick's sleep starts only
-                // after this body returns, removing the entry from
-                // `ec_conversion_inflight` + `pending_ec_dispatch`). So
-                // `ec_conversion_inflight.contains(&extent_id)` here only
-                // ever fires from a replay — either a post-F198 rich
-                // marker (handled by the `Some(params)` branch below) or
-                // a pre-F198 empty legacy marker (handled by the `None`
-                // branch which falls through to the fresh-dispatch path
-                // and OVERWRITES the etcd marker with a rich record on
-                // `persist_ec_conversion_inflight`). The coordinator's
-                // F119-D idempotency guard returns CODE_OK if the prior
-                // dispatch already completed, so a fresh re-dispatch is
-                // safe end-to-end.
+                // F207-B: the ledger marker is authoritative — reuse the
+                // exact target_nodes + extra_disk_ids + new_eversion that
+                // were committed when the marker was acquired (either by
+                // `handle_force_ec_convert` or restored by
+                // `replay_from_etcd`). Under F203 the dispatch loop is
+                // drain-only; under F207-B it never computes a fresh
+                // assignment of its own. If `handle_force_ec_convert`
+                // ever needs to choose between data_shards (K) and
+                // K+M targets, it does so at acquire time and the loop
+                // body just consumes.
+                let params = &replay_params;
+                let target_nodes = params.target_nodes.clone();
+                let extra_disk_ids = params.extra_disk_ids.clone();
+                let new_eversion = params.new_eversion;
 
-                let mut target_nodes: Vec<u64>;
-                let mut target_addrs: Vec<String> = Vec::new();
-                let mut extra_disk_ids: Vec<u64>;
-                let new_eversion: u64;
-
-                if let Some(params) = replay_params.as_ref() {
-                    // F198 replay path: reuse persisted assignment exactly.
-                    target_nodes = params.target_nodes.clone();
-                    extra_disk_ids = params.extra_disk_ids.clone();
-                    new_eversion = params.new_eversion;
-                    for &nid in &target_nodes {
-                        if let Some(addr) = node_addrs.get(&nid) {
-                            target_addrs.push(addr.clone());
-                        } else {
-                            target_addrs.clear();
-                            break;
-                        }
-                    }
-                    if target_addrs.len() < target_nodes.len() {
-                        tracing::warn!(
-                            extent_id,
-                            target_nodes = ?params.target_nodes,
-                            "F198: replay-loaded target_node missing from cluster; deferring re-dispatch"
-                        );
-                        continue;
-                    }
-                } else {
-                    // Fresh dispatch: derive target_nodes from current state,
-                    // shuffle for parity, alloc empty files on new parity nodes.
-                    target_nodes = ex.replicates.clone();
-                    extra_disk_ids = Vec::new();
-
-                    for &nid in &target_nodes {
-                        if let Some(addr) = node_addrs.get(&nid) {
-                            target_addrs.push(addr.clone());
-                        } else {
-                            target_addrs.clear();
-                            break;
-                        }
-                    }
-                    if target_addrs.is_empty() {
-                        continue;
-                    }
-
-                    if total_shards > target_nodes.len() {
-                        let extra_needed = total_shards - target_nodes.len();
-                        // F144: shuffle candidates so EC parity slots don't
-                        // always land on the same low-`node_id` peers.
-                        let extra_candidates: Vec<_> = {
-                            use rand::seq::SliceRandom;
-                            let s = self.store.inner.borrow();
-                            let existing: HashSet<u64> = target_nodes.iter().copied().collect();
-                            let mut pool: Vec<_> = s
-                                .nodes
-                                .values()
-                                .filter(|n| !existing.contains(&n.node_id))
-                                .cloned()
-                                .collect();
-                            pool.shuffle(&mut rand::thread_rng());
-                            pool.into_iter().take(extra_needed).collect()
-                        };
-                        if extra_candidates.len() < extra_needed {
-                            continue;
-                        }
-                        for node in &extra_candidates {
-                            match self.alloc_extent_on_node(&node.address, extent_id).await {
-                                Ok(disk_id) => {
-                                    target_nodes.push(node.node_id);
-                                    target_addrs.push(node.address.clone());
-                                    extra_disk_ids.push(disk_id);
-                                }
-                                Err(_) => {
-                                    target_nodes.clear();
-                                    break;
-                                }
-                            }
-                        }
-                        if target_nodes.len() < total_shards {
-                            continue;
-                        }
-                    }
-
-                    target_nodes.truncate(total_shards);
-                    target_addrs.truncate(total_shards);
-
-                    new_eversion = ex.eversion + 1;
+                // Discard total_shards-mismatched markers loudly — these
+                // only arise from operator-induced inconsistency (e.g.,
+                // calling `set-stream-ec` to change K+M between
+                // `handle_force_ec_convert` and a later dispatch tick).
+                // Dropping the marker is the conservative choice; the
+                // operator can re-issue `force-ec-convert` to start a
+                // fresh dispatch under the new shape.
+                if target_nodes.len() != total_shards {
+                    tracing::warn!(
+                        extent_id,
+                        marker_targets = target_nodes.len(),
+                        stream_total_shards = total_shards,
+                        "F207-B: dispatch marker target count != stream K+M; \
+                         dropping stale marker"
+                    );
+                    let mgr = self.clone();
+                    compio::runtime::spawn(async move {
+                        let _ = mgr.drain_extent_inflight_marker(extent_id).await;
+                    })
+                    .detach();
+                    continue;
                 }
 
-                // F173 + F198: persist the rich marker (target_nodes +
-                // disk_ids + data_shards + new_eversion) to etcd BEFORE
-                // dispatching the EC RPC. On crash mid-flight, the new
-                // leader's `replay_from_etcd` + this loop re-dispatch with
-                // the SAME assignment via the `replay_params` branch above.
-                let dispatch_record = MgrEcDispatchInflight {
-                    extent_id,
-                    target_nodes: target_nodes.clone(),
-                    extra_disk_ids: extra_disk_ids.clone(),
-                    data_shards: data_shards as u32,
-                    new_eversion,
-                };
-                if let Err(e) = self.persist_ec_conversion_inflight(&dispatch_record).await {
+                let mut target_addrs: Vec<String> = Vec::with_capacity(target_nodes.len());
+                for &nid in &target_nodes {
+                    if let Some(addr) = node_addrs.get(&nid) {
+                        target_addrs.push(addr.clone());
+                    } else {
+                        target_addrs.clear();
+                        break;
+                    }
+                }
+                if target_addrs.len() < target_nodes.len() {
                     tracing::warn!(
-                        "F173: failed to persist ec_conversion_inflight for extent {extent_id}: {e}; will retry next tick"
+                        extent_id,
+                        target_nodes = ?params.target_nodes,
+                        "F207-B: marker target_node missing from cluster; deferring re-dispatch"
                     );
                     continue;
                 }
-                self.ec_conversion_inflight
-                    .borrow_mut()
-                    .insert(extent_id);
-                self.pending_ec_dispatch
-                    .borrow_mut()
-                    .insert(extent_id, dispatch_record);
 
                 // F099-M: coordinator is the shard that owns `extent_id` on
                 // the first replica. For convert_to_ec, the coordinator reads
@@ -906,11 +860,12 @@ impl AutumnManager {
                     )
                     .await;
 
-                // F138: keep the extent in ec_conversion_inflight until AFTER
-                // apply_ec_conversion_done. The lock must cover the full
-                // dispatch → RPC await → apply window so that apply_recovery_done,
-                // mark_extent_available, and handle_multi_modify_split see the lock
-                // and defer rather than racing the in-memory + etcd write.
+                // F138 / F207-B: the ledger marker is the eversion-bump
+                // lock; it must cover the full dispatch → RPC await → apply
+                // window. `apply_ec_conversion_done` releases it atomically
+                // with the `extents/<id>` etcd write (one `txn_fenced` for
+                // both keys); the in-memory ledger entry is then cleared
+                // in this loop after apply succeeds.
                 let rpc_ok = match result {
                     Ok(resp_data) => match rkyv_decode::<ExtCodeResp>(&resp_data) {
                         Ok(r) if r.code == CODE_OK => true,
@@ -945,24 +900,41 @@ impl AutumnManager {
                         )
                         .await;
                 }
-
-                // Release the lock only after apply completes (or after RPC failure).
-                self.ec_conversion_inflight.borrow_mut().remove(&extent_id);
-                // F198: clear the rich-marker companion in-memory entry
-                // alongside the lock.
-                self.pending_ec_dispatch.borrow_mut().remove(&extent_id);
-                // F173: clear the etcd marker AFTER apply (or RPC fail).
-                // A lingering marker is harmless — `replay_from_etcd`
-                // would reload it on a future restart and the next
-                // `ec_conversion_dispatch_loop` tick re-enters the
-                // convert path which is idempotent (F119-D + F198).
-                if let Err(e) = self.unpersist_ec_conversion_inflight(extent_id).await {
-                    tracing::warn!(
-                        "F173: failed to clear ec_conversion_inflight marker for extent {extent_id}: {e}; will be cleaned up on next conversion or restart"
-                    );
+                // F207-B: on RPC failure the ledger marker stays in place;
+                // the next tick re-dispatches against the SAME assignment
+                // (coordinator's F119-D / F153 make repeated convert calls
+                // idempotent). On RPC success `apply_ec_conversion_done`
+                // already deleted the etcd marker as part of its atomic
+                // put-and-delete txn; we just clear the in-memory shadow
+                // here.
+                if rpc_ok {
+                    self.commit_extent_inflight_release(extent_id);
                 }
             }
         }
+    }
+
+    /// F207-B: drop a stale or no-longer-valid `extent_inflight/<id>` marker.
+    /// Used by the dispatch loop when it observes a ledger entry for an
+    /// extent that has been deleted or that has incompatible state (e.g.,
+    /// already EC-converted) — best-effort cleanup so the next tick's
+    /// candidate set shrinks. Idempotent.
+    async fn drain_extent_inflight_marker(&self, extent_id: u64) -> Result<(), AppError> {
+        if let Some(etcd) = &self.etcd {
+            let del_op = self.build_extent_inflight_release_op(extent_id);
+            // Use `put_and_delete_txn` (one-element delete list) so the F149
+            // fence applies. A `false` return from the underlying CAS is
+            // impossible here (no extra_cmp); only NotLeader can happen and
+            // bubbles up.
+            etcd.put_and_delete_txn(
+                Vec::new(),
+                vec![Self::extent_inflight_key(extent_id)],
+            )
+            .await?;
+            let _ = del_op; // silence unused (kept for symmetry with apply path)
+        }
+        self.commit_extent_inflight_release(extent_id);
+        Ok(())
     }
 
     pub(crate) async fn apply_ec_conversion_done(
@@ -1008,9 +980,25 @@ impl AutumnManager {
         };
 
         if let Some(etcd) = &self.etcd {
+            // F207-B: bundle the marker delete into the same etcd txn as
+            // the `extents/<id>` put. Pre-F207 this was two separate etcd
+            // round-trips (put extents/<id>, then later unpersist the
+            // marker); manager crash between them leaked the marker and
+            // blocked future ops on the extent until manual intervention.
+            // Now: atomic — either both effects land or neither does.
+            // Also delete the legacy `ecConversionInflight/<id>` key for
+            // one-cycle backward compat (no-op on F207-only clusters,
+            // one-shot cleanup on upgraded clusters).
             let key = format!("extents/{}", extent_id);
             let val = rkyv_encode(&updated).to_vec();
-            etcd.put_msgs_txn(vec![(key, val)]).await?;
+            etcd.put_and_delete_txn(
+                vec![(key, val)],
+                vec![
+                    Self::extent_inflight_key(extent_id),
+                    format!("ecConversionInflight/{}", extent_id),
+                ],
+            )
+            .await?;
         }
 
         Ok(())
