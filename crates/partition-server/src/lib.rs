@@ -3780,9 +3780,19 @@ async fn partition_thread_main(
 ///     overhead.
 ///
 /// Preserves:
-///   - R4 4.4 SQ/CQ pattern — `FuturesUnordered` holds up to
-///     `ps_inflight_cap()` Phase-2 futures, MIN_PIPELINE_BATCH=256 gate for
-///     non-first batches, out-of-order completion handling.
+///   - R4 4.4 SQ/CQ pattern — Phase-2 futures execute concurrently up
+///     to `ps_inflight_cap()`, MIN_PIPELINE_BATCH=256 gate for
+///     non-first batches.
+///   - **F210-C1: `FuturesOrdered` (was `FuturesUnordered`) — Phase 3
+///     runs in launch order = seq order**, guaranteeing that a rotated
+///     active memtable contains a contiguous seq range. This is what
+///     makes the recovery-time dedup `if ts <= sst_max_seq { continue; }`
+///     sound. Pre-F210-C1 `FuturesUnordered` allowed out-of-order
+///     Phase 3, so an SST could have `last_seq = 200` while batch A's
+///     seqs 1-100 were still in-flight; on crash before A's Phase 3,
+///     replay's dedup silently dropped A. p99 trade-off: head-of-line
+///     wait, bounded by Phase 2 latency variance; measured negligible
+///     in F197's symmetric change on `background_flush_loop`.
 ///   - LockedByOther self-eviction (drain remaining inflight, exit cleanly).
 ///   - Read-op inlining: GET/HEAD/RANGE are processed directly on this
 ///     task via `dispatch_partition_rpc` so a busy write pipeline does
@@ -3822,9 +3832,18 @@ async fn merged_partition_loop(
     // pulling new items from `req_rx` and head for the tail-drain block.
     let mut drain_ack: Option<oneshot::Sender<()>> = None;
 
+    // F210-C1: switched from FuturesUnordered to FuturesOrdered. Phase 2
+    // futures still execute concurrently; only the yield order changes.
+    // FuturesOrdered guarantees Phase 3 (memtable insert) runs in launch
+    // order = seq order, so a rotated active memtable always contains a
+    // contiguous seq range — the precondition that makes the
+    // recover_partition dedup (`if ts <= sst_max_seq { continue; }`)
+    // sound. See the doc comment above and feature_list.md F210-C1 for
+    // the bug pre-F210-C1 enabled and the perf analysis.
     type CompletionFut =
         std::pin::Pin<Box<dyn std::future::Future<Output = InflightCompletion>>>;
-    let mut inflight: FuturesUnordered<CompletionFut> = FuturesUnordered::new();
+    let mut inflight: futures::stream::FuturesOrdered<CompletionFut> =
+        futures::stream::FuturesOrdered::new();
 
     'outer: loop {
         if locked_by_other.get() {
@@ -4576,7 +4595,25 @@ async fn recover_partition(
         }
     }
 
-    // Replay logStream
+    // Replay logStream.
+    //
+    // F210-C1: the dedup `if ts <= sst_max_seq { continue; }` below is
+    // safe because `merged_partition_loop` now uses `FuturesOrdered`
+    // (was `FuturesUnordered`). Phase 3 (memtable insert) is therefore
+    // strictly in launch order = strictly in seq order; a rotated
+    // active contains a contiguous seq range [start, max_seq], and the
+    // SST flushed from it has the invariant "every seq <= last_seq is
+    // in this SST or an earlier SST". `sst_max_seq` is then a sound
+    // upper bound for "seqs already in some SST".
+    //
+    // Pre-F210-C1 this used `FuturesUnordered`, which yielded Phase 2
+    // completions in completion order, not launch order. Phase 3
+    // therefore ran out-of-order: batch B (seq 101-200) could insert
+    // into active and trigger rotation before batch A (seq 1-100)
+    // completed Phase 2. The flushed SST then had `last_seq = 200` but
+    // was MISSING seqs 1-100. Replay's `ts <= 200 → skip` predicate
+    // then silently dropped batch A on crash recovery — see F210-C1 in
+    // feature_list.md.
     let sst_max_seq = max_seq;
     let active = Memtable::new();
 

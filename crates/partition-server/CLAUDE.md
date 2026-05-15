@@ -272,19 +272,42 @@ pending has grown to the full burst size (256 — matches the
 `--threads 256` perf_check workload). The first batch after an idle
 period always launches (avoiding starvation on low-load streams).
 
-### Out-of-order completion is correct
+### In-order Phase 3 commit (F210-C1, post-2026-05-15)
 
-Phase 2 completions may arrive in a different order than launch order
-(e.g., batch B finishes before batch A if A had a larger payload and
-consequently higher write bandwidth). This is fine because:
-- **Seq numbers** were assigned in Phase 1 in batch-launch order, so A
-  always has lower seqs than B.
+Phase 2 futures execute concurrently up to `ps_inflight_cap()`, but
+`merged_partition_loop` uses **`FuturesOrdered`** (not
+`FuturesUnordered`) so Phase 3 yields are strictly in launch order =
+strictly in seq order. This is a load-bearing invariant for recovery
+correctness.
+
+Pre-F210-C1 (`FuturesUnordered`): completions could yield out of order.
+Phase 3 inserts ran in completion order, not seq order. The rotated
+active memtable was therefore NOT guaranteed to contain a contiguous
+seq range — e.g. batch B (seq 101-200) could be Phase 3'd and the
+active rotated to imm + flushed → SST with `last_seq=200`, while
+batch A (seq 1-100) was still in flight. On crash before A's Phase 3,
+replay's dedup predicate `if ts <= sst_max_seq { continue; }` would
+skip seq 1-100 records (since `50 <= 200`), silently dropping ack'd
+writes. Lost data was bounded by the in-flight cap (8 batches × 256
+records each, up to 2K records / partition).
+
+Post-F210-C1 (`FuturesOrdered`): rotated memtable = contiguous seq
+range, SST.last_seq = bound on "every seq <= last_seq is in this SST
+or an earlier one". Replay's dedup is sound. The trade-off — small
+p99 latency uptick from head-of-line wait when in-flight batches'
+Phase 2 latencies are unequal — is bounded by Phase 2 p99 (typically
+~5-10 ms with F178 coalesced fsync); throughput unchanged.
+
+Properties that still hold (unchanged from pre-F210-C1):
+- **Seq numbers** assigned in Phase 1 in batch-launch order.
 - **Memtable MVCC keys** are `user_key ++ 0x00 ++ BE(u64::MAX - seq)`.
   Byte-sort order is independent of insertion order.
-- **Client oneshot replies** are per-request, not per-batch-order.
+- **Client oneshot replies** are per-request — Phase 3's response
+  emission happens in seq order under `FuturesOrdered`, which is a
+  side effect of the change but doesn't break clients.
 - **LogStream ordering** is preserved by the stream worker's
-  lease/ack cursor (step 4.3): both batches land at distinct contiguous
-  offsets regardless of Phase 2 completion order.
+  lease/ack cursor (step 4.3); concurrent Phase 2 still lands at
+  distinct contiguous offsets regardless of Phase 2 completion order.
 
 ### Cross-layer SQ/CQ stack (post-R4)
 
