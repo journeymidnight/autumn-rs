@@ -370,15 +370,13 @@ pub struct AutumnManager {
     /// cooldown.
     pub(crate) last_op_at: Rc<RefCell<HashMap<u64, i64>>>,
     /// F183: policy engine — split/merge candidate computation over a
-    /// 30-min sliding window of per-partition load metrics.
+    /// 30-min sliding window of per-partition load metrics. F202
+    /// extended it to also generate minor-compact + EC advisories.
+    /// F203 deleted the auto-dispatch consumer of this output — the
+    /// engine is now advisory-only; external controllers query
+    /// `MSG_GET_POLICY_CANDIDATES` and call client subcommands to
+    /// act on what they see.
     pub(crate) policy: Rc<RefCell<crate::policy::PolicyEngine>>,
-    /// F184: feature flag — enable auto-trigger of SPLIT for hot
-    /// partitions. When true, `policy_tick_loop` dispatches MSG_SPLIT_PART
-    /// to the owning PS for each SPLIT candidate. Default off (advisory).
-    pub(crate) auto_split_enabled: Rc<Cell<bool>>,
-    /// F184: feature flag — enable auto-orchestrated MERGE for same-PS
-    /// adjacent cold pairs. Default off.
-    pub(crate) auto_merge_enabled: Rc<Cell<bool>>,
     /// F192: per-node sliding-window of push-based failure reports from
     /// PSes. Eviction window = `report_disk_failure_window`; quorum
     /// threshold = `report_disk_failure_quorum` distinct
@@ -424,8 +422,6 @@ impl AutumnManager {
             pending_extent_deletes: Rc::new(RefCell::new(VecDeque::new())),
             last_op_at: Rc::new(RefCell::new(HashMap::new())),
             policy: Rc::new(RefCell::new(crate::policy::PolicyEngine::default())),
-            auto_split_enabled: Rc::new(Cell::new(false)),
-            auto_merge_enabled: Rc::new(Cell::new(false)),
             recent_failure_reports: Rc::new(RefCell::new(HashMap::new())),
             // F195 defaults match the pre-F195 env defaults (F192).
             report_disk_failure_window: Cell::new(Duration::from_secs(60)),
@@ -445,19 +441,6 @@ impl AutumnManager {
     /// F183: read the last_op_at timestamp for a partition (0 if never op'd).
     pub(crate) fn last_op_at_for(&self, part_id: u64) -> i64 {
         self.last_op_at.borrow().get(&part_id).copied().unwrap_or(0)
-    }
-
-    /// F184: enable auto-dispatch of SPLIT for SPLIT candidates from the
-    /// policy engine. Default off; toggle via the manager binary CLI flag
-    /// `--auto-split` or programmatically.
-    pub fn set_auto_split(&self, enabled: bool) {
-        self.auto_split_enabled.set(enabled);
-    }
-
-    /// F184: enable auto-orchestration of MERGE for same-PS adjacent
-    /// cold pairs. Default off.
-    pub fn set_auto_merge(&self, enabled: bool) {
-        self.auto_merge_enabled.set(enabled);
     }
 
     /// F184 test helper: dispatch a SPLIT against `part_id` as if the
@@ -685,38 +668,21 @@ impl AutumnManager {
                 }
             }
 
-            // F184 Stage 2/3: auto-dispatch when feature flag is on.
-            // Per-tick rate-limit: at most 1 split + 1 merge per tick to
-            // bound blast radius if the policy mis-fires.
-            if self.auto_split_enabled.get() {
-                if let Some(c) = cands
-                    .iter()
-                    .find(|c| c.kind == POLICY_KIND_SPLIT)
-                {
-                    if let Err(e) = self.auto_dispatch_split(c, &state_snapshot).await {
-                        tracing::warn!(
-                            "F184 auto-split part={} failed: {e}",
-                            c.primary_part_id
-                        );
-                    }
-                }
-            }
-            if self.auto_merge_enabled.get() {
-                if let Some(c) = cands
-                    .iter()
-                    .find(|c| c.kind == POLICY_KIND_MERGE && c.same_ps)
-                {
-                    if let Err(e) = self
-                        .auto_dispatch_merge(c, &state_snapshot)
-                        .await
-                    {
-                        tracing::warn!(
-                            "F184 auto-merge survivor={} victim={} failed: {e}",
-                            c.primary_part_id, c.secondary_part_id
-                        );
-                    }
-                }
-            }
+            // F203: in-kernel auto-dispatch removed. The advisory_cache
+            // is the manager's only contribution to operational policy;
+            // an external controller queries `MSG_GET_POLICY_CANDIDATES`
+            // (or `client policy`) and acts via the existing client
+            // subcommands. The `auto_dispatch_split` /
+            // `auto_dispatch_merge` helpers below remain as the
+            // mechanism layer; tests + a future programmable trigger
+            // surface still depend on them. Keeping the helpers but
+            // dropping the in-loop dispatch is the entire point of the
+            // mechanism / policy separation.
+            //
+            // Reference: state_snapshot is no longer consumed inside
+            // this tick body; PolicyEngine's compute_*_advisory calls
+            // already captured everything they need.
+            let _ = state_snapshot;
         }
     }
 

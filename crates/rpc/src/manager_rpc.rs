@@ -75,6 +75,18 @@ pub const MSG_MERGE_PARTITIONS: u8 = 0x37;
 // next DF poll the global view lagged the per-stream truth.
 pub const MSG_REPORT_DISK_FAILURE: u8 = 0x38;
 
+// F203: per-extent EC convert trigger. Replaces the deleted
+// ec_conversion_dispatch_loop fresh-candidate scan. Persists a rich
+// `pending_ec_dispatch` marker for `extent_id`; the next dispatch_loop
+// tick drains it via the F198 replay path.
+pub const MSG_FORCE_EC_CONVERT: u8 = 0x39;
+
+// F203: external policy controller helper — query the manager's
+// latest cached `PartitionLoad` for a given partition. Lets `client
+// info --part PID --detail` surface SST tombstone / expired /
+// out-of-range / minor pending byte counts without a separate PS RPC.
+pub const MSG_GET_PARTITION_DETAIL: u8 = 0x3A;
+
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
 /// Serialize a value to Bytes using rkyv.
@@ -912,6 +924,37 @@ pub struct ReportDiskFailureReq {
 
 // Response: fire-and-forget (req_id = 0). No reply needed; manager
 // logs are the operator-facing surface.
+
+// --- ForceEcConvert (F203) ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ForceEcConvertReq {
+    /// Sealed-but-unconverted extent the OP wants to EC-encode now.
+    pub extent_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ForceEcConvertResp {
+    pub code: u8,
+    pub message: String,
+}
+
+// --- GetPartitionDetail (F203) ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetPartitionDetailReq {
+    pub part_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetPartitionDetailResp {
+    pub code: u8,
+    pub message: String,
+    /// Latest cached PartitionLoad in the manager's policy window.
+    /// `part_id == 0` if the partition has no metrics history (PS
+    /// hasn't sent a `MSG_REPORT_PARTITION_LOAD` for it yet).
+    pub load: PartitionLoad,
+    /// Unix-epoch seconds of the bucket this load was stamped at.
+    pub bucket_ts: i64,
+}
 
 // ── Extent msg_type constants (needed by manager for node calls) ──────────
 

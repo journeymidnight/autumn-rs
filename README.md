@@ -1029,6 +1029,117 @@ via `info --json` and triggers stream-level conversion, which the
 existing manager dispatch loop will then apply to sealed-unconverted
 extents on that stream.
 
+#### F203 — External-policy controller surface (2026-05-15)
+
+End of the mechanism/policy separation refactor. The manager no
+longer auto-dispatches anything based on advisory candidates; it
+just publishes `advisory_cache` via `MSG_GET_POLICY_CANDIDATES`. To
+make use of those advisories, run an external policy controller (a
+bash script, a cron job, a Python daemon, a custom binary — the
+contract is the same).
+
+**OP toolkit (every command idempotent, every command safe to retry):**
+
+| Read | Action |
+|---|---|
+| `client policy [--json]` | inspect all advisory candidates |
+| `client info [--json]` | full cluster state snapshot |
+| `client info --part PID --detail [--json]` (**F203**) | latest F202 metrics for one partition |
+| `client streams [--json]` (**F203**) | stream + extent map |
+| `client gc PID [--ratio R | --max-size B | --empty-only | --stream-debt B]` | trigger GC (F201) |
+| `client compact PID` | trigger major compact |
+| `client forcegc PID EXTID...` | force GC specific extents |
+| `client split PID` | trigger split |
+| `client merge SURVIVOR VICTIM` | trigger merge |
+| `client set-stream-ec --stream SID --ec K+M` | change stream EC policy |
+| `client force-ec-convert --extent EXTID` (**F203**) | convert one extent now |
+
+**Why no `--auto-*` flags remain on `autumn-manager-server`**: in
+prior versions `--auto-split` and `--auto-merge` opt'd the manager
+into auto-dispatching the corresponding candidates. F203 removed
+both. Passing them now exits with a migration message pointing here.
+Reasoning: policy is environment-dependent (cluster quiet hours,
+business-tier preferences, SLO targets, capacity planning windows),
+and embedding even simple "fire when threshold > X" decisions inside
+the manager forces every operator to rebuild + redeploy when those
+inputs change. The advisory output is plenty for a 30-line bash
+controller to do what production needs.
+
+**MVP controller example (cron + bash, every 5 minutes):**
+
+```bash
+# /etc/cron.d/autumn-policy: */5 * * * * /usr/local/bin/autumn-policy.sh
+#!/usr/bin/env bash
+set -euo pipefail
+AC="autumn-client --manager 10.0.0.1:9001"
+PROM="http://prometheus.internal/api/v1/query"
+
+# Business hours? Skip all heavy ops between 09:00 and 18:00.
+hour=$(date +%H)
+if [ "$hour" -ge 9 ] && [ "$hour" -lt 18 ]; then
+  exit 0
+fi
+
+# Cluster-wide foreground QPS gate. Defer ALL dispatch if user
+# traffic is above 50K — leave the kernel's must-cleanup paths
+# (expiry-major / has_overlap-major / minor-compact) to handle
+# the steady-state.
+fg_qps=$(curl -fsS "$PROM?query=sum(rate(fg_put_qps_total[1m]))" | jq -r '.data.result[0].value[1] // "0"')
+if (( $(echo "$fg_qps > 50000" | bc -l) )); then
+  exit 0
+fi
+
+$AC policy --json | jq -c '.[]' | while read -r cand; do
+  kind=$(echo "$cand" | jq -r .kind)
+  pid=$(echo "$cand"  | jq -r .primary_part_id)
+  sec=$(echo "$cand"  | jq -r .secondary_part_id)
+  size=$(echo "$cand" | jq -r .size_bytes)
+  case "$kind" in
+    ec)
+      # F202 generator already filtered extents < 64 MiB.
+      $AC force-ec-convert --extent "$sec"
+      ;;
+    gc)
+      # Per-partition QPS gate — only GC partitions that aren't
+      # actively serving heavy reads. Read F202 detail first.
+      p_qps=$(curl -fsS "$PROM?query=fg_put_qps_total{p=\"$pid\"}" | jq -r '.data.result[0].value[1] // "0"')
+      if (( $(echo "$p_qps < 1000" | bc -l) )); then
+        $AC gc "$pid"
+      fi
+      ;;
+    major)
+      $AC compact "$pid"
+      ;;
+    minor)
+      # No-op: minor compact is already kernel-driven (LSM hygiene).
+      # We just log here for visibility.
+      echo "$(date -u +%FT%TZ) minor advisory for part $pid (kernel handles)" >&2
+      ;;
+    split|merge|hotcold)
+      # Range reassignment — page a human instead of auto-acting.
+      echo "$(date -u +%FT%TZ) policy advisory: kind=$kind part=$pid secondary=$sec" \
+        | mailx -s "autumn policy alert" oncall@example.com
+      ;;
+  esac
+done
+```
+
+**Failure model**: if the controller crashes mid-loop, nothing is
+left dangling — every action is idempotent at the manager (re-issuing
+`split` against an already-split partition fails fast with
+`PRECONDITION`; `force-ec-convert` against a pending or converted
+extent returns OK; etc.). Worst case the next cron tick re-tries.
+The cluster degrades to the kernel's must-cleanup behaviour
+(expiry-major, has_overlap-major, size-tiered minor) which is the
+intended floor.
+
+**Want fancier? upgrade the controller, not the kernel**: ML-based
+load prediction, predictive split based on hot-key trajectory,
+SLO-aware compact windowing — all of it is pure addition outside the
+binary. The kernel's job is to expose accurate signals and execute
+RPCs reliably; deciding when to call them is a separate concern with
+its own iteration cadence.
+
 ### Benchmarks
 
 ```bash

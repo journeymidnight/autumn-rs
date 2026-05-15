@@ -605,35 +605,21 @@ impl AutumnManager {
                 continue;
             }
 
-            // F119-D: dedupe candidates by extent_id. After a partition
-            // split, a CoW-shared extent (refs >= 2) appears in BOTH
-            // child streams' extent_ids. Without dedup, the inner for
-            // loop processes the same extent twice — the first pass
-            // encodes the original payload into K data + M parity
-            // shards, and the second pass reads the (now-shard) local
-            // file and RE-ENCODES it as if it were the original
-            // payload, producing sub-shards of size
-            // shard_size(shard_size(original)) = original / K^2. The
-            // manager state (ec_converted=true, sealed_length=original)
-            // looks correct, but on-disk shards only encode original/K
-            // bytes — every read past offset shard_size returns short
-            // data and surfaces upstream as `logStream value short` or
-            // `ec_read_full_and_slice: offset N past decoded payload
-            // len M`.
+            // F203: drain-only. Pre-F203 this loop scanned `s.streams` and
+            // built a fresh candidate set from every sealed-not-converted
+            // extent. Stage 3 of the mechanism/policy separation refactor
+            // removes that — the manager is no longer the policy decider;
+            // an external controller queries `MSG_GET_POLICY_CANDIDATES`
+            // (where `POLICY_KIND_EC` advice lives, F202) and calls
+            // `MSG_FORCE_EC_CONVERT` (F203) to ask for a specific extent.
+            // That handler persists a rich `pending_ec_dispatch` marker
+            // to etcd; this loop is the consumer that drains the marker
+            // set. F198 leader-failover replay continues to work the
+            // same way — `replay_from_etcd` rehydrates the markers and
+            // the next tick drains them.
             //
-            // Use a HashSet on extent_id to keep the first stream's
-            // entry and skip the duplicate. Stream-specific fields
-            // (ec_data_shard, ec_parity_shard) are identical across
-            // CoW-shared streams by construction (compute_duplicate_stream
-            // copies them), so picking either stream is equivalent.
-            // F126: snapshot recovery_tasks so we skip extents that have an
-            // in-flight recovery. Without this, an EC conversion can dispatch
-            // shards (write_shard_local + commit_shard_local rename) to the
-            // SAME node that recovery is concurrently writing a full-replica
-            // copy to — the rename clobbers recovery's data, leaving the
-            // recovering node holding parity bytes while the manager later
-            // updates `replicates[slot]` to point at it (duplicate-node
-            // corrupt state).
+            // Recovery-inflight skip (F126) still applies to avoid
+            // colliding with `run_recovery_task` on the same extent.
             let recovery_inflight_extents: HashSet<u64> = self
                 .recovery_tasks
                 .borrow()
@@ -641,18 +627,16 @@ impl AutumnManager {
                 .copied()
                 .collect();
 
-            // F172-B: snapshot node_addrs ONCE per loop tick. Pre-F172 we
-            // re-collected the full `s.nodes -> address` map inside the
-            // `for (ex, stream) in candidates` loop (one clone per
-            // candidate extent), even though `s.nodes` is identical for
-            // every iteration of a single tick — N candidates × M nodes
-            // of String clones × 5 s cadence. Hoisting saves
-            // `O((candidates - 1) * nodes)` String allocations per tick
-            // while preserving the existing same-tick consistency
-            // semantics (race vs concurrent register_node lasts at most
-            // 5 s, recovered on next tick).
-            let candidates: Vec<(MgrExtentInfo, MgrStreamInfo)>;
+            // F172-B: snapshot node_addrs ONCE per loop tick.
             let node_addrs: HashMap<u64, String>;
+            // Candidate set = `pending_ec_dispatch` keys. The matching
+            // extent + stream entries are looked up under the same
+            // borrow so we get a consistent snapshot.
+            //
+            // F119-D dedup is structural here: HashMap keys are unique
+            // by construction, so the seen-set guard is no longer
+            // needed.
+            let candidates: Vec<(MgrExtentInfo, MgrStreamInfo)>;
             {
                 let s = self.store.inner.borrow();
                 node_addrs = s
@@ -660,26 +644,62 @@ impl AutumnManager {
                     .iter()
                     .map(|(id, n)| (*id, n.address.clone()))
                     .collect();
+                let pending: Vec<u64> = self
+                    .pending_ec_dispatch
+                    .borrow()
+                    .keys()
+                    .copied()
+                    .collect();
                 let mut out = Vec::new();
-                let mut seen: HashSet<u64> = HashSet::new();
-                for stream in s.streams.values() {
-                    if stream.ec_parity_shard == 0 {
+                for eid in pending {
+                    if recovery_inflight_extents.contains(&eid) {
                         continue;
                     }
-                    for &eid in &stream.extent_ids {
-                        if !seen.insert(eid) {
+                    let ex = match s.extents.get(&eid) {
+                        Some(e) => e.clone(),
+                        None => {
+                            // Marker for an extent that no longer
+                            // exists (deleted between marker write and
+                            // this tick). Drop the marker.
+                            let pep = self.pending_ec_dispatch.clone();
+                            let mgr = self.clone();
+                            compio::runtime::spawn(async move {
+                                pep.borrow_mut().remove(&eid);
+                                let _ = mgr.unpersist_ec_conversion_inflight(eid).await;
+                            })
+                            .detach();
                             continue;
                         }
-                        if recovery_inflight_extents.contains(&eid) {
-                            continue;
-                        }
-                        if let Some(ex) = s.extents.get(&eid) {
-                            if ex.sealed_length == 0 || ex.ec_converted {
-                                continue;
-                            }
-                            out.push((ex.clone(), stream.clone()));
-                        }
+                    };
+                    if ex.ec_converted || ex.sealed_length == 0 {
+                        // Marker stale (already converted, or extent
+                        // got truncated to 0). Drop the marker.
+                        let pep = self.pending_ec_dispatch.clone();
+                        let mgr = self.clone();
+                        compio::runtime::spawn(async move {
+                            pep.borrow_mut().remove(&eid);
+                            let _ = mgr.unpersist_ec_conversion_inflight(eid).await;
+                        })
+                        .detach();
+                        continue;
                     }
+                    // Find the stream that owns this extent so we
+                    // recover its EC shape. CoW-shared extents
+                    // (refs >= 2) appear in multiple streams; any
+                    // pick works because `compute_duplicate_stream`
+                    // clones `(ec_data_shard, ec_parity_shard)`.
+                    let stream = s
+                        .streams
+                        .values()
+                        .find(|st| {
+                            st.ec_parity_shard > 0 && st.extent_ids.contains(&eid)
+                        })
+                        .cloned();
+                    let stream = match stream {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    out.push((ex, stream));
                 }
                 candidates = out;
             }

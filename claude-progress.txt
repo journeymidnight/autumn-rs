@@ -1,145 +1,132 @@
 Date: 2026-05-15
 TaskStatus: completed
-Task scope: F202 — Stage 2 of the mechanism/policy separation refactor.
-            Unify the advisory_cache across 6 actionable policy kinds
-            (split/merge/gc/major_compact/minor_compact/ec) plus
-            hot_cold, so an external policy controller has ONE query
-            (MSG_GET_POLICY_CANDIDATES) for everything it needs.
+Task scope: F203 — Stage 3 (final) of the mechanism/policy separation
+            refactor. Delete in-kernel auto-dispatch loops, expose
+            OP-driven surface for external controllers.
 
-Stage 2 (this commit) — concrete changes:
+End of plan `~/.claude/plans/elegant-tumbling-pumpkin.md`:
+  - F201 (done, commit 55ad7e3): GC trigger bug + cooldown + multi-tier
+  - F202 (done, commit 5d51071): 6-kind advisory unification
+  - F203 (this commit): delete auto + add OP surface
 
-  1. Wire layer (autumn-rpc/src/manager_rpc.rs):
-       - POLICY_KIND_COMPACT renamed → POLICY_KIND_MAJOR_COMPACT
-         (same wire value 3). Old name kept as #[deprecated] alias
-         for back-compat with external consumers.
-       - POLICY_KIND_MINOR_COMPACT = 5 (new) — partition-level minor
-         compact debt advisory.
-       - POLICY_KIND_EC = 6 (new) — per-extent EC convert advisory.
-       - PartitionLoad gains 5 new fields:
-           sst_tombstone_bytes, sst_expired_bytes,
-           sst_out_of_range_bytes, minor_compact_pending_bytes,
-           sealed_log_extent_count
-         All default 0; advisory layer treats 0 as "no signal".
-       Wire is backward-incompatible at rkyv level; same-commit
-       upgrade for manager + PS + client (cluster.sh stops all
-       roles before restart). Struct doc notes this.
+Manager deletions:
+  - `auto_split_enabled` / `auto_merge_enabled` Cells removed from
+    AutumnManager + Default + setters (`set_auto_split` /
+    `set_auto_merge`).
+  - `policy_tick_loop`'s auto-dispatch arm gutted (loop continues to
+    populate advisory_cache — that's its only job now).
+  - `ec_conversion_dispatch_loop` refactored to drain-only:
+    candidates are `pending_ec_dispatch` keys (NOT a fresh
+    `s.streams` scan). The F198 leader-failover replay path
+    (rehydration via `replay_from_etcd`) is preserved verbatim;
+    its `Some(replay_params)` branch is now the only way the loop
+    dispatches. Stale-marker cleanup: extents that no longer exist
+    or are already `ec_converted` are pruned from
+    `pending_ec_dispatch` + etcd in the same tick.
+  - `auto_dispatch_split` / `auto_dispatch_merge` helpers kept as
+    mechanism layer; `force_auto_*` test fixtures continue to work.
+  - Two `*_fires_via_policy_tick_loop_fast_mode` tests in
+    system_merge.rs cfg'd out via `#[cfg(any())]` (they tested
+    deleted features; `force_auto_*` direct-path tests stay).
 
-  2. PS-side metric collection (partition-server):
-       - PartitionMetrics gains 5 atomic counters paralleling
-         PartitionLoad's new fields.
-       - new helper `refresh_f202_metrics(part)` in background.rs:
-           sst_expired_bytes: Σ estimated_size for tables whose
-             paired SstReader.min_expires_at is non-zero & <= now.
-             Conservative upper bound (whole-SST count).
-           sst_out_of_range_bytes: Σ estimated_size when has_overlap
-             == 1, else 0.
-           minor_compact_pending_bytes: Σ estimated_size of
-             pickup_tables output when has_overlap == 0.
-           sst_tombstone_bytes / sealed_log_extent_count: left 0
-             (require SST on-disk aggregate / cached
-             get_stream_info; deferred to a future stage).
-       - Refresh hook sites: every place that updates
-         pending_compaction_bytes (4 sites in
-         background_compact_loop) + commit_flush_outcome after
-         each flush.
-       - report_load_loop reads the new atomics, populates
-         PartitionLoad on each 30 s pulse.
+Manager CLI flags removed:
+  - `--auto-split` / `--auto-merge` on autumn-manager-server.
+    Passing them now exits with a migration message
+    ("Use `client policy` + `client {split|merge}` to drive
+    policy externally").
 
-  3. Manager-side advisory generation (manager/src/policy.rs):
-       - new consts: MINOR_COMPACT_PENDING_HIGH (512 MiB),
-         MINOR_COMPACT_COOLDOWN_SEC (120 s — shorter than major
-         because minor is cheaper), EC_MIN_EXTENT_BYTES (64 MiB —
-         common-sense filter against negative-EV EC conversions
-         on small extents).
-       - PolicyConfig extended with three corresponding fields.
-       - compute_maintenance_advisory gains a third arm for
-         MINOR_COMPACT:
-           gated by `minor_compact_pending_bytes >
-             MINOR_COMPACT_PENDING_HIGH` sustained across
-             `required_buckets`
-           AND `minor_compact_pending_bytes > 0` in latest bucket
-             (common-sense filter: don't suggest minor compact
-             when pickup_tables had nothing to do)
-           AND outside the minor cooldown.
-       - new compute_ec_advisory(state, now): iterates s.streams
-         + s.extents directly (EC is per-extent, not bucketed).
-         Filters:
-           stream has EC policy attached (ec_data_shard > 0)
-           extent is sealed (sealed_length > 0)
-           not already converted
-           sealed_length >= ec_min_extent_bytes (common-sense)
-         Emits POLICY_KIND_EC with primary_part_id=0,
-         secondary_part_id=extent_id, size_bytes=sealed_length.
-       - policy_tick_loop unions all 4 compute_*_advisory outputs
-         into advisory_cache.
+PS deletions:
+  - `maintenance_scheduler_loop` (192-line F188 PS-level priority
+    scheduler) deleted entirely + spawn site removed.
+  - `background_gc_loop`'s `GcSel::Timeout` arm no longer emits
+    `GcTask::Auto`. The timer now only refreshes
+    `gc_debt_bytes` for the next `MSG_REPORT_PARTITION_LOAD`
+    pulse and continues. Auto GC entirely removed from kernel-
+    level timer policy.
+  - `background_compact_loop` unchanged: has_overlap +
+    expiry-major + size-tiered minor pickups remain (mechanism-
+    level must-cleanup paths).
 
-  4. Client (autumn_client.rs):
-       - policy command kind mapping prints 7 strings:
-         split / merge / gc / major / minor / ec / hotcold
-       - feas column shows "n/a" for all maintenance/EC kinds.
+New manager RPCs:
+  - `MSG_FORCE_EC_CONVERT = 0x39` (ForceEcConvertReq /
+    ForceEcConvertResp): validates extent (sealed, not
+    converted, on EC stream); allocates extra parity nodes via
+    the same shuffled-pool path the deleted fresh-dispatch
+    used; persists rich `pending_ec_dispatch` marker; returns
+    CODE_OK. Next dispatch tick drains via F198 replay.
+    Idempotent.
+  - `MSG_GET_PARTITION_DETAIL = 0x3A` (GetPartitionDetailReq /
+    GetPartitionDetailResp): returns most recent bucket from
+    `PolicyEngine.metrics[part_id]`. Sources `client info
+    --detail` without a dedicated PS RPC.
 
-What's NOT in Stage 2 (deferred to F202-followup):
-  - `client info --part PID --detail` (per-partition raw metric
-    snapshot) — needs new RPC; not strictly required because
-    advisory candidates carry actionable signals.
-  - `client set-stream-ec --extent <EXTID>` (per-extent EC
-    trigger) — needs new manager RPC bypassing dispatch_loop;
-    today OP uses `set-stream-ec --stream` which lets the
-    existing loop catch sealed-unconverted extents.
-  - `client streams [--json]` — redundant with existing
-    `info --json`.
-  - Accurate `sst_tombstone_bytes` (needs SST on-disk format
-    aggregate) and `sealed_log_extent_count` (needs PS-cached
-    get_stream_info result).
+New `client` subcommands:
+  - `client force-ec-convert --extent <EXTID>` — sends
+    MSG_FORCE_EC_CONVERT.
+  - `client streams [--json]` — lists each stream's
+    `extent_id / sealed_length / ec_converted / replicas /
+    parity / refs / eversion`. JSON output sorted by
+    stream_id; plain text mirrors layout-typed extent labels.
+  - `client info --part PID --detail [--json]` — new `--detail`
+    flag. Sends MSG_GET_PARTITION_DETAIL, prints full
+    `PartitionLoad` including F202 fields (gc_debt_bytes,
+    pending_compaction_bytes, minor_compact_pending_bytes,
+    sst_tombstone_bytes, sst_expired_bytes,
+    sst_out_of_range_bytes, *_inflight, last_*_at,
+    sealed_log_extent_count).
+
+External-policy controller contract (README):
+  - New section under Operations describing the OP toolkit
+    workflow: `client policy --json` → optional
+    `client info --part PID --detail` → call appropriate
+    client command to act.
+  - cron + bash MVP controller example covering low-QPS
+    gating, business-hour windowing, dispatch cadencing.
+
+Wire-incompatible changes (same-commit upgrade — cluster.sh
+stops all roles before restart):
+  - 2 new manager RPC type codes (0x39, 0x3A).
+  - 2 manager CLI flags removed (`--auto-split` /
+    `--auto-merge`); migration error message on use.
+
+What stays as in-kernel mechanism (final, intentional):
+  - has_overlap-triggered major compact (split aftermath)
+  - expiry-triggered major compact (user TTL semantic)
+  - size-tiered minor compact (LSM hygiene)
+  - F198 marker replay across leader failover
+  - All F138/F139/F145/F146/F147/F149 correctness mutex/fence
+  - `auto_dispatch_*` internal helpers (mechanism API)
 
 Tests:
   - cargo build --workspace --exclude autumn-fuse: clean.
-  - cargo test -p autumn-manager --lib policy_tests: 32/32
-    (24 pre-existing + 8 new F202):
-      F202 tests cover:
-      - minor_compact_fires_when_sustained_above_threshold
-      - minor_compact_suppressed_when_latest_bucket_empty
-        (common-sense filter)
-      - minor_compact_respects_cooldown
-      - ec_advisory_fires_for_large_sealed_unconverted_extent
-      - ec_advisory_suppresses_small_extents
-        (common-sense filter)
-      - ec_advisory_skips_converted
-      - ec_advisory_skips_non_ec_streams
-      - ec_advisory_skips_empty_extents
-  - Pre-existing f099i_tests::* flakes in partition-server
-    (2 cases) are unrelated; same fails on F201 HEAD without
-    F202 changes.
+  - cargo test -p autumn-manager --lib: 78/78.
+  - cargo test -p autumn-partition-server --lib: 142/143
+    (same f099i_d1 flake from F201/F202; unrelated to F203).
 
 Files touched:
-  - crates/rpc/src/manager_rpc.rs: POLICY_KIND_* constants +
-    PartitionLoad fields (~40 lines).
-  - crates/partition-server/src/lib.rs: PartitionMetrics fields,
-    report_load_loop wiring.
-  - crates/partition-server/src/background.rs: refresh_f202_metrics
-    helper + call site wiring (~50 lines).
-  - crates/manager/src/policy.rs: MINOR_COMPACT + EC consts;
-    PolicyConfig fields; minor arm in compute_maintenance_advisory;
-    new compute_ec_advisory (~80 lines).
-  - crates/manager/src/lib.rs: policy_tick_loop EC union + kind name
-    update.
-  - crates/manager/src/policy_tests.rs: 8 new F202 tests + shared
-    mk_stream/mk_extent fixtures (~180 lines).
-  - crates/server/src/bin/autumn_client.rs: kind mapping update.
-  - feature_list.md: F202 entry above F201.
+  - crates/manager/src/lib.rs: ~80 lines net delete.
+  - crates/manager/src/recovery.rs: drain-only refactor.
+  - crates/manager/src/rpc_handlers.rs: 2 new handlers
+    (~180 lines added).
+  - crates/manager/tests/system_merge.rs: cfg-gate 2 e2e tests.
+  - crates/partition-server/src/lib.rs: ~195 lines net delete.
+  - crates/partition-server/src/background.rs: gut GC Timeout
+    arm.
+  - crates/rpc/src/manager_rpc.rs: 2 new MSG_ consts + 4 new
+    wire types.
+  - crates/server/src/bin/manager.rs: ~30 lines net delete.
+  - crates/server/src/bin/autumn_client.rs: 3 new subcommands +
+    ~180 lines.
+  - autumn-rs/README.md: external-controller section.
+  - feature_list.md: F203 entry above F202.
   - claude-progress.txt: this file.
 
-Next session starting point (Stage 3 = F203):
-  - Per plan §1: delete in-kernel auto-dispatch:
-      manager: policy_tick_loop auto-split / auto-merge,
-        ec_conversion_dispatch_loop new-candidate scan (keep F198
-        marker replay), `auto_*_enabled` Cells + CLI flags.
-      PS: maintenance_scheduler_loop (whole function),
-        background_gc_loop Auto-tick path (only Force survives).
-  - Per plan §3: add `client info --detail`, `client streams`,
-    `client set-stream-ec --extent <EXTID>` (F202 deferred items
-    that become essential once auto is deleted).
-  - Update README + CLAUDE.md describing the external controller
-    contract; add a cron + bash example for an MVP controller.
-  - Stage 3 is a breaking change (removes `--auto-split` flag etc.);
-    cluster.sh same-commit upgrade.
+End of the mechanism/policy refactor. The advisory_cache is the
+manager's full policy surface; OP/external controllers consume it
+and call client subcommands. Future work can layer an actual
+policy controller binary on top, or wire MSG_GET_POLICY_CANDIDATES
+into Prometheus + alerting. Both are pure addition; the kernel
+stays mechanism.
+
+Next session starting point: nothing pending from this plan. Any
+new feature should start a fresh F-number above F203.

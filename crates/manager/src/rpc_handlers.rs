@@ -108,6 +108,8 @@ impl AutumnManager {
             MSG_SYNC_PARTITION_VP_REFS => self.handle_sync_partition_vp_refs(payload).await,
             MSG_RECONCILE_EXTENTS => self.handle_reconcile_extents(payload).await,
             MSG_UPDATE_STREAM_EC => self.handle_update_stream_ec(payload).await,
+            MSG_FORCE_EC_CONVERT => self.handle_force_ec_convert(payload).await,
+            MSG_GET_PARTITION_DETAIL => self.handle_get_partition_detail(payload).await,
             _ => Err((
                 StatusCode::InvalidArgument,
                 format!("unknown msg_type {msg_type}"),
@@ -2376,6 +2378,205 @@ impl AutumnManager {
         Ok(rkyv_encode(&CodeResp {
             code: CODE_OK,
             message: String::new(),
+        }))
+    }
+
+    /// F203: OP-driven per-extent EC convert trigger. Validates the
+    /// extent is sealed, not already converted, and references an
+    /// EC-policy stream. Persists a rich `pending_ec_dispatch` marker
+    /// to etcd + memory; the next `ec_conversion_dispatch_loop` tick
+    /// (within ~5 s) drains it via the F198 replay path and runs the
+    /// existing 2PC encode + commit flow.
+    ///
+    /// Idempotent: re-invocation against an already-pending or
+    /// already-converted extent returns CODE_OK. Out-of-policy
+    /// requests (non-EC stream, sealed_length=0, missing extent)
+    /// return CODE_PRECONDITION with a descriptive message.
+    pub(crate) async fn handle_force_ec_convert(
+        &self,
+        payload: Bytes,
+    ) -> HandlerResult {
+        if !self.leader.get() {
+            return Ok(rkyv_encode(&ForceEcConvertResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+            }));
+        }
+        let req: ForceEcConvertReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let extent_id = req.extent_id;
+
+        // Already pending? Idempotent OK.
+        if self.pending_ec_dispatch.borrow().contains_key(&extent_id) {
+            return Ok(rkyv_encode(&ForceEcConvertResp {
+                code: CODE_OK,
+                message: "already pending dispatch".to_string(),
+            }));
+        }
+
+        // Look up current state + the owning stream's EC shape under
+        // a single borrow.
+        let (ex, stream, node_addrs) = {
+            let s = self.store.inner.borrow();
+            let ex = match s.extents.get(&extent_id) {
+                Some(e) => e.clone(),
+                None => {
+                    return Ok(rkyv_encode(&ForceEcConvertResp {
+                        code: CODE_PRECONDITION,
+                        message: format!("extent {extent_id} not found"),
+                    }));
+                }
+            };
+            if ex.sealed_length == 0 {
+                return Ok(rkyv_encode(&ForceEcConvertResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "extent {extent_id} not sealed (sealed_length=0); use GC for empty slots"
+                    ),
+                }));
+            }
+            if ex.ec_converted {
+                return Ok(rkyv_encode(&ForceEcConvertResp {
+                    code: CODE_OK,
+                    message: format!("extent {extent_id} already ec_converted"),
+                }));
+            }
+            let stream = s.streams.values().find(|st| {
+                st.ec_parity_shard > 0 && st.extent_ids.contains(&extent_id)
+            });
+            let stream = match stream {
+                Some(s) => s.clone(),
+                None => {
+                    return Ok(rkyv_encode(&ForceEcConvertResp {
+                        code: CODE_PRECONDITION,
+                        message: format!(
+                            "extent {extent_id} is not on an EC-policy stream (set-stream-ec first)"
+                        ),
+                    }));
+                }
+            };
+            let node_addrs: HashMap<u64, String> = s
+                .nodes
+                .iter()
+                .map(|(id, n)| (*id, n.address.clone()))
+                .collect();
+            (ex, stream, node_addrs)
+        };
+
+        // Derive target_nodes + extra_disk_ids the same way
+        // `ec_conversion_dispatch_loop` did in its pre-F203 fresh path.
+        let data_shards = stream.ec_data_shard as usize;
+        let parity_shards = stream.ec_parity_shard as usize;
+        let total_shards = data_shards + parity_shards;
+
+        let mut target_nodes = ex.replicates.clone();
+        let mut extra_disk_ids: Vec<u64> = Vec::new();
+        let mut target_addrs: Vec<String> = Vec::new();
+        for &nid in &target_nodes {
+            match node_addrs.get(&nid) {
+                Some(addr) => target_addrs.push(addr.clone()),
+                None => {
+                    return Ok(rkyv_encode(&ForceEcConvertResp {
+                        code: CODE_PRECONDITION,
+                        message: format!("target node {nid} not in nodes map"),
+                    }));
+                }
+            }
+        }
+
+        if total_shards > target_nodes.len() {
+            let extra_needed = total_shards - target_nodes.len();
+            let extra_candidates: Vec<_> = {
+                use rand::seq::SliceRandom;
+                let s = self.store.inner.borrow();
+                let existing: HashSet<u64> = target_nodes.iter().copied().collect();
+                let mut pool: Vec<_> = s
+                    .nodes
+                    .values()
+                    .filter(|n| !existing.contains(&n.node_id))
+                    .cloned()
+                    .collect();
+                pool.shuffle(&mut rand::thread_rng());
+                pool.into_iter().take(extra_needed).collect()
+            };
+            if extra_candidates.len() < extra_needed {
+                return Ok(rkyv_encode(&ForceEcConvertResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "not enough nodes for EC {data_shards}+{parity_shards} ({} of {total_shards} available)",
+                        target_nodes.len() + extra_candidates.len()
+                    ),
+                }));
+            }
+            for node in &extra_candidates {
+                match self.alloc_extent_on_node(&node.address, extent_id).await {
+                    Ok(disk_id) => {
+                        target_nodes.push(node.node_id);
+                        extra_disk_ids.push(disk_id);
+                    }
+                    Err(e) => {
+                        return Ok(rkyv_encode(&ForceEcConvertResp {
+                            code: CODE_ERROR,
+                            message: format!("alloc_extent_on_node({}): {e}", node.address),
+                        }));
+                    }
+                }
+            }
+        }
+        target_nodes.truncate(total_shards);
+
+        let new_eversion = ex.eversion + 1;
+        let dispatch_record = MgrEcDispatchInflight {
+            extent_id,
+            target_nodes,
+            extra_disk_ids,
+            data_shards: data_shards as u32,
+            new_eversion,
+        };
+
+        if let Err(e) = self.persist_ec_conversion_inflight(&dispatch_record).await {
+            return Ok(rkyv_encode(&ForceEcConvertResp {
+                code: CODE_ERROR,
+                message: format!("persist marker: {e}"),
+            }));
+        }
+        self.pending_ec_dispatch
+            .borrow_mut()
+            .insert(extent_id, dispatch_record);
+        // ec_conversion_inflight is set lazily by the dispatch loop
+        // when it actually fires the RPC; matching the fresh-dispatch
+        // ordering pre-F203.
+
+        Ok(rkyv_encode(&ForceEcConvertResp {
+            code: CODE_OK,
+            message: format!(
+                "marker persisted for extent {extent_id}; next ec dispatch tick (~5s) will convert"
+            ),
+        }))
+    }
+
+    /// F203: external policy controller — return the manager's most
+    /// recent cached `PartitionLoad` for `part_id`. Sourced from the
+    /// last bucket of `PolicyEngine.metrics`, populated by
+    /// `MSG_REPORT_PARTITION_LOAD`. Lets `client info --detail`
+    /// surface per-partition F202 metrics without a dedicated PS RPC.
+    pub(crate) async fn handle_get_partition_detail(
+        &self,
+        payload: Bytes,
+    ) -> HandlerResult {
+        let req: GetPartitionDetailReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let p = self.policy.borrow();
+        let bucket = p.metrics.get(&req.part_id).and_then(|w| w.buckets.back());
+        let (load, bucket_ts) = match bucket {
+            Some((ts, l)) => (l.clone(), *ts),
+            None => (PartitionLoad::default(), 0),
+        };
+        Ok(rkyv_encode(&GetPartitionDetailResp {
+            code: CODE_OK,
+            message: String::new(),
+            load,
+            bucket_ts,
         }))
     }
 

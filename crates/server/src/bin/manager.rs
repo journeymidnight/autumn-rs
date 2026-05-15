@@ -20,12 +20,6 @@ struct Args {
     etcd: Vec<String>,
     bind_host: String,
     transport: TransportKind,
-    /// F184: Stage 2 — auto-dispatch SPLIT to owning PS based on
-    /// policy-engine candidates. Default off.
-    auto_split: bool,
-    /// F184: Stage 3 — auto-orchestrate MERGE for same-PS adjacent
-    /// candidates. Default off.
-    auto_merge: bool,
     /// F187: enable fast-mode policy thresholds for load testing —
     /// 1-bucket / 5 s tick / 1 MiB GC debt / 4 MiB compact pending /
     /// 30 s cooldowns. Production should never use this; the default
@@ -45,8 +39,6 @@ fn parse_args() -> Args {
     let mut etcd: Vec<String> = Vec::new();
     let mut bind_host = String::from("0.0.0.0");
     let mut transport = TransportKind::Tcp;
-    let mut auto_split = false;
-    let mut auto_merge = false;
     let mut policy_fast_mode = false;
     let mut report_disk_failure_window_secs: Option<u64> = None;
     let mut report_disk_failure_quorum: Option<usize> = None;
@@ -77,8 +69,18 @@ fn parse_args() -> Args {
                         std::process::exit(2);
                     });
             }
-            "--auto-split" => auto_split = true,
-            "--auto-merge" => auto_merge = true,
+            // F203: --auto-split / --auto-merge removed. Mechanism /
+            // policy separation puts dispatch decisions in an external
+            // controller. Read `client policy` + call `client split` /
+            // `client merge` to act.
+            "--auto-split" | "--auto-merge" => {
+                eprintln!(
+                    "{}: removed in F203. Use `client policy` + `client {}` to drive policy externally.",
+                    raw[i],
+                    if raw[i] == "--auto-split" { "split" } else { "merge" },
+                );
+                std::process::exit(2);
+            }
             "--policy-fast-mode" => policy_fast_mode = true,
             "--report-disk-failure-window-secs" => {
                 i += 1;
@@ -106,8 +108,6 @@ fn parse_args() -> Args {
         etcd,
         bind_host,
         transport,
-        auto_split,
-        auto_merge,
         policy_fast_mode,
         report_disk_failure_window_secs,
         report_disk_failure_quorum,
@@ -142,14 +142,9 @@ async fn main() -> Result<()> {
             .context("connect to etcd")?
     };
 
-    if args.auto_split {
-        tracing::warn!("F184: --auto-split enabled; manager will dispatch SPLIT for hot partitions");
-        manager.set_auto_split(true);
-    }
-    if args.auto_merge {
-        tracing::warn!("F184: --auto-merge enabled; manager will orchestrate MERGE for cold same-PS pairs");
-        manager.set_auto_merge(true);
-    }
+    // F203: in-kernel auto-dispatch deleted. The manager's policy_tick_loop
+    // produces an advisory_cache via `MSG_GET_POLICY_CANDIDATES`; external
+    // operators / controllers act on it.
     // F195: F192 quorum debounce config — applied if either flag was
     // set. The library defaults (60 s / 3) match pre-F195 env defaults.
     if args.report_disk_failure_window_secs.is_some()

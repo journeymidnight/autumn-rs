@@ -618,6 +618,14 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
 /// (no manual force_auto_merge call). Exercises the full closed loop:
 /// `MSG_REPORT_PARTITION_LOAD → metrics window → compute_candidates →
 /// auto_dispatch_merge → multi_modify_merge`.
+///
+/// F203 removed the in-kernel auto-dispatch loop; this test now only
+/// compiles as a pre-F203 reference and is permanently `#[ignore]`'d. The
+/// `force_auto_merge` direct path is still exercised by
+/// `auto_dispatch_merge_orchestrates_full_flow` above. To restore an
+/// equivalent end-to-end test, drive the merge from outside via
+/// `client policy` → `client merge` instead.
+#[cfg(any())]
 #[test]
 #[ignore]
 fn auto_merge_fires_via_policy_tick_loop_fast_mode() {
@@ -703,6 +711,12 @@ fn auto_merge_fires_via_policy_tick_loop_fast_mode() {
 /// with a 1-bucket / 1-second config + low SPLIT_SIZE_HARD threshold,
 /// send synthetic high-load metrics for one partition, verify
 /// policy_tick_loop fires SPLIT automatically.
+///
+/// F203 removed the in-kernel auto-dispatch loop; `cfg(any())` excludes
+/// the body so the symbol stays as historical reference. The
+/// `force_auto_split` direct path is still exercised by
+/// `auto_dispatch_split_dispatches_msg_split_part` below.
+#[cfg(any())]
 #[test]
 #[ignore]
 fn auto_split_fires_via_policy_tick_loop_fast_mode() {

@@ -99,6 +99,19 @@ enum Command {
         ec_data: u32,
         ec_parity: u32,
     },
+    /// F203: per-extent EC convert trigger. OP runs this after reading
+    /// `client policy` to act on a specific `POLICY_KIND_EC` advisory.
+    /// The manager persists a marker; the next ec dispatch tick (~5s)
+    /// drives the conversion.
+    ForceEcConvert {
+        extent_id: u64,
+    },
+    /// F203: list streams + extents (manager-side state). Equivalent to
+    /// `info --json` filtered to the streams section for controllers
+    /// that only need that view.
+    Streams {
+        json: bool,
+    },
     Put {
         key: String,
         file: String,
@@ -217,6 +230,10 @@ enum Command {
         json: bool,
         top: Option<usize>,
         part: Option<u64>,
+        /// F203: print PartitionLoad detail (F202 fields) for `part`.
+        /// Requires `--part PID`. Reads from the manager's cached
+        /// `MSG_GET_PARTITION_DETAIL`, not from the PS directly.
+        detail: bool,
     },
 }
 
@@ -233,6 +250,8 @@ fn usage() -> ! {
     eprintln!("  bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal|N:hexstring]");
     eprintln!("                                    Create initial partition(s) and streams");
     eprintln!("  set-stream-ec --stream <ID> --ec K+M");
+    eprintln!("  force-ec-convert --extent <EXTID> (F203: per-extent EC trigger)");
+    eprintln!("  streams [--json]                 (F203: list streams + extents)");
     eprintln!("                                    Change EC policy of an existing stream (FOPS-03)");
     eprintln!("  put <KEY> <FILE>                  Put key with value from file");
     eprintln!("  streamput <KEY> <FILE>            Stream-put large file in 512KB chunks");
@@ -262,7 +281,7 @@ fn usage() -> ! {
     eprintln!("                                    Read benchmark");
     eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K]");
     eprintln!("                                    Quick write+read bench; warns if >threshold regression vs baseline");
-    eprintln!("  info [--json] [--top N | --part PID]  Show cluster info");
+    eprintln!("  info [--json] [--top N | --part PID] [--detail]  Show cluster info (F203 --detail: PartitionLoad snapshot)");
     std::process::exit(1);
 }
 
@@ -851,6 +870,7 @@ fn parse_args() -> Args {
             let mut json = false;
             let mut top: Option<usize> = None;
             let mut part: Option<u64> = None;
+            let mut detail = false;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--json" => { json = true; }
@@ -864,6 +884,7 @@ fn parse_args() -> Args {
                         if i >= raw.len() { eprintln!("--part requires a number"); usage(); }
                         part = Some(raw[i].parse().unwrap_or_else(|_| { eprintln!("--part requires a number"); usage() }));
                     }
+                    "--detail" => { detail = true; }
                     other => {
                         eprintln!("unknown info flag: {other}");
                         usage();
@@ -875,7 +896,46 @@ fn parse_args() -> Args {
                 eprintln!("--top and --part are mutually exclusive");
                 usage();
             }
-            Command::Info { json, top, part }
+            if detail && part.is_none() {
+                eprintln!("--detail requires --part <PID>");
+                usage();
+            }
+            Command::Info { json, top, part, detail }
+        }
+        "force-ec-convert" => {
+            // F203: force-ec-convert --extent <EXTID>
+            let mut extent_id: Option<u64> = None;
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--extent" => {
+                        i += 1;
+                        if i >= raw.len() { eprintln!("--extent requires a number"); usage(); }
+                        extent_id = Some(raw[i].parse().unwrap_or_else(|_| {
+                            eprintln!("--extent requires a number");
+                            usage()
+                        }));
+                    }
+                    _ => break,
+                }
+                i += 1;
+            }
+            let extent_id = extent_id.unwrap_or_else(|| {
+                eprintln!("force-ec-convert requires --extent <EXTID>");
+                std::process::exit(1);
+            });
+            Command::ForceEcConvert { extent_id }
+        }
+        "streams" => {
+            // F203: streams [--json]
+            let mut json = false;
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--json" => { json = true; }
+                    _ => break,
+                }
+                i += 1;
+            }
+            Command::Streams { json }
         }
         other => {
             eprintln!("unknown command: {other}");
@@ -1578,6 +1638,86 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 bail!("set-stream-ec failed: code={} {}", resp.code, resp.message);
+            }
+        }
+
+        Command::ForceEcConvert { extent_id } => {
+            // F203
+            let req = rkyv_encode(&autumn_rpc::manager_rpc::ForceEcConvertReq { extent_id });
+            let resp_bytes = client
+                .mgr_call(autumn_rpc::manager_rpc::MSG_FORCE_EC_CONVERT, req)
+                .await
+                .context("force-ec-convert")?;
+            let resp: autumn_rpc::manager_rpc::ForceEcConvertResp =
+                rkyv_decode(&resp_bytes).map_err(decode_err)?;
+            if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+                bail!("force-ec-convert: code={} {}", resp.code, resp.message);
+            }
+            println!("{}", resp.message);
+        }
+
+        Command::Streams { json } => {
+            // F203: same data as `info --json`'s streams section, but
+            // smaller surface for controllers that only need the
+            // stream + extent map.
+            let stream_resp_bytes = client
+                .mgr_call(MSG_STREAM_INFO, rkyv_encode(&StreamInfoReq { stream_ids: Vec::new() }))
+                .await
+                .context("stream info")?;
+            let stream_resp: StreamInfoResp =
+                rkyv_decode(&stream_resp_bytes).map_err(decode_err)?;
+            let extent_map: HashMap<u64, MgrExtentInfo> = stream_resp.extents.into_iter().collect();
+            let mut streams: Vec<MgrStreamInfo> = stream_resp.streams.into_iter().map(|(_, s)| s).collect();
+            streams.sort_by_key(|s| s.stream_id);
+            if json {
+                let mut arr = Vec::new();
+                for s in &streams {
+                    let mut ext_arr = Vec::new();
+                    for &eid in &s.extent_ids {
+                        if let Some(ex) = extent_map.get(&eid) {
+                            ext_arr.push(serde_json::json!({
+                                "extent_id": eid,
+                                "sealed_length": ex.sealed_length,
+                                "ec_converted": ex.ec_converted,
+                                "replicates": ex.replicates,
+                                "parity": ex.parity,
+                                "refs": ex.refs,
+                                "eversion": ex.eversion,
+                            }));
+                        }
+                    }
+                    arr.push(serde_json::json!({
+                        "stream_id": s.stream_id,
+                        "ec_data_shard": s.ec_data_shard,
+                        "ec_parity_shard": s.ec_parity_shard,
+                        "replicates": s.replicates,
+                        "extents": ext_arr,
+                    }));
+                }
+                println!("{}", serde_json::to_string_pretty(&arr).context("serialize streams")?);
+            } else {
+                for s in &streams {
+                    println!(
+                        "stream {} (replicates={}, EC={}+{}): {} extent(s)",
+                        s.stream_id, s.replicates, s.ec_data_shard, s.ec_parity_shard,
+                        s.extent_ids.len()
+                    );
+                    for &eid in &s.extent_ids {
+                        if let Some(ex) = extent_map.get(&eid) {
+                            let layout = if ex.ec_converted {
+                                format!("EC({}+{})", s.ec_data_shard, s.ec_parity_shard)
+                            } else if ex.sealed_length == 0 {
+                                "open".to_string()
+                            } else {
+                                format!("replicas={:?}", ex.replicates)
+                            };
+                            println!(
+                                "  extent {} sealed={} {}  refs={}",
+                                eid, ex.sealed_length, layout, ex.refs
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -2629,7 +2769,63 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Info { json, top, part } => {
+        Command::Info { json, top, part, detail } => {
+            // F203: --detail prints only the PartitionLoad snapshot for
+            // `part`, sourced from the manager's cached metric window.
+            // Short-circuits the full info path.
+            if detail {
+                let pid = part.expect("--detail requires --part PID; checked at parse time");
+                let req = rkyv_encode(&autumn_rpc::manager_rpc::GetPartitionDetailReq {
+                    part_id: pid,
+                });
+                let resp_bytes = client
+                    .mgr_call(autumn_rpc::manager_rpc::MSG_GET_PARTITION_DETAIL, req)
+                    .await
+                    .context("get partition detail")?;
+                let resp: autumn_rpc::manager_rpc::GetPartitionDetailResp =
+                    rkyv_decode(&resp_bytes).map_err(decode_err)?;
+                if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+                    bail!("get_partition_detail: code={} {}", resp.code, resp.message);
+                }
+                if json {
+                    let l = &resp.load;
+                    let v = serde_json::json!({
+                        "part_id": pid,
+                        "bucket_ts": resp.bucket_ts,
+                        "size_bytes": l.size_bytes,
+                        "req_per_sec": l.req_per_sec,
+                        "imm_full_per_sec": l.imm_full_per_sec,
+                        "p99_us": l.p99_us,
+                        "gc_debt_bytes": l.gc_debt_bytes,
+                        "pending_compaction_bytes": l.pending_compaction_bytes,
+                        "minor_compact_pending_bytes": l.minor_compact_pending_bytes,
+                        "sst_tombstone_bytes": l.sst_tombstone_bytes,
+                        "sst_expired_bytes": l.sst_expired_bytes,
+                        "sst_out_of_range_bytes": l.sst_out_of_range_bytes,
+                        "gc_inflight": l.gc_inflight,
+                        "compact_inflight": l.compact_inflight,
+                        "last_gc_at": l.last_gc_at,
+                        "last_compact_at": l.last_compact_at,
+                        "sealed_log_extent_count": l.sealed_log_extent_count,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&v).context("serialize detail")?);
+                } else {
+                    let l = &resp.load;
+                    println!("=== Partition {pid} (bucket_ts={}) ===", resp.bucket_ts);
+                    println!("  size_bytes={}", l.size_bytes);
+                    println!("  req_per_sec={}  imm_full_per_sec={}", l.req_per_sec, l.imm_full_per_sec);
+                    println!("  gc_debt_bytes={} ({} MiB)", l.gc_debt_bytes, l.gc_debt_bytes / (1024*1024));
+                    println!("  pending_compaction_bytes={} ({} MiB)  [major]", l.pending_compaction_bytes, l.pending_compaction_bytes / (1024*1024));
+                    println!("  minor_compact_pending_bytes={} ({} MiB)", l.minor_compact_pending_bytes, l.minor_compact_pending_bytes / (1024*1024));
+                    println!("  sst_tombstone_bytes={}  sst_expired_bytes={}  sst_out_of_range_bytes={}",
+                        l.sst_tombstone_bytes, l.sst_expired_bytes, l.sst_out_of_range_bytes);
+                    println!("  gc_inflight={}  compact_inflight={}", l.gc_inflight, l.compact_inflight);
+                    println!("  last_gc_at={}  last_compact_at={}", l.last_gc_at, l.last_compact_at);
+                    println!("  sealed_log_extent_count={}", l.sealed_log_extent_count);
+                }
+                return Ok(());
+            }
+
             // === Fetch manager data ===
             let stream_resp_bytes = client
                 .mgr_call(MSG_STREAM_INFO, rkyv_encode(&StreamInfoReq { stream_ids: Vec::new() }))

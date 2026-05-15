@@ -2199,13 +2199,15 @@ impl PartitionServer {
         let s = server.clone();
         compio::runtime::spawn(async move { s.report_load_loop().await }).detach();
 
-        // F188: PS-level maintenance scheduler. Replaces the per-partition
-        // random-jitter compact/gc timers with a foreground-aware priority
-        // dispatcher that picks the partition with the highest debt-to-
-        // threshold ratio under per-PS concurrency caps + skips when
-        // sustained foreground req/sec exceeds AUTUMN_PS_FG_QPS_QUOTA.
-        let s = server.clone();
-        compio::runtime::spawn(async move { s.maintenance_scheduler_loop().await }).detach();
+        // F203: maintenance_scheduler_loop deleted. Pre-F203 this task
+        // picked the highest-debt partition each tick and dispatched
+        // GC / minor / major compact internally. Per the mechanism /
+        // policy separation refactor, that policy lives in an external
+        // controller now; the PS reacts to manual `Maintenance` RPCs
+        // (`client gc / compact / forcegc / flush`) and to its own
+        // expiry-triggered + has_overlap-triggered + size-tiered
+        // minor compact (mechanism-level must-cleanup paths preserved
+        // in `background_compact_loop`'s timer arm).
 
         server.sync_regions_once().await?;
 
@@ -2387,197 +2389,6 @@ impl PartitionServer {
         }
     }
 
-    /// F188 PS-level maintenance scheduler. Runs on the main thread; uses
-    /// the per-partition metrics already collected by `PartitionMetrics`
-    /// (Arc<>, Send-safe). Replaces the per-partition random-jitter
-    /// compact/gc timers with a foreground-aware priority dispatcher:
-    ///
-    /// 1. Every `SCHEDULE_INTERVAL_SECS` seconds, walk every PartitionHandle.
-    /// 2. Compute compact + GC priority per partition: `debt_bytes /
-    ///    threshold` (urgency); zero if below threshold or already
-    ///    inflight or last-run-too-recent.
-    /// 3. Skip a partition entirely when its sustained foreground req/sec
-    ///    over the last interval exceeds `AUTUMN_PS_FG_QPS_QUOTA`
-    ///    (default 50K) — matches the F183 advisory's spirit ("don't
-    ///    crush the system") at the dispatch layer.
-    /// 4. Sort by urgency desc; for the top-K (capped to keep this loop
-    ///    cheap), `try_send` the trigger via the partition's compact /
-    ///    gc Sender clone held in PartitionHandle. Already-busy partitions
-    ///    silently no-op via the channel's `Full` error since the in-thread
-    ///    receiver hasn't drained yet.
-    ///
-    /// This does NOT remove the in-thread compact/gc loops; they still
-    /// service these triggers. F188-B kills only the random-jitter timer
-    /// inside those loops, leaving the channel-driven path as the sole
-    /// trigger source besides the manual `client compact|gc` RPCs.
-    async fn maintenance_scheduler_loop(&self) {
-        const SCHEDULE_INTERVAL_SECS: u64 = 5;
-        // Match F183's required-buckets default (5) — 5 × 5 s = 25 s of
-        // metric history before we'll fire something off the timer.
-        // F195: read once from process-global setter-cached cells.
-        // Defaults match pre-F195 env defaults.
-        let fg_qps_quota: u32 = *PS_FG_QPS_QUOTA_CELL.get_or_init(|| 50_000);
-        // Same defaults as the F187 PolicyConfig — the scheduler is the
-        // local executor of the same advisories, so keeping the trigger
-        // threshold == advisory threshold makes the two layers coherent.
-        let gc_debt_high: u64 = *PS_GC_DEBT_HIGH_BYTES_CELL.get_or_init(|| 1024 * 1024 * 1024);
-        let compact_pending_high: u64 =
-            *PS_COMPACT_PENDING_HIGH_BYTES_CELL.get_or_init(|| 4 * 1024 * 1024 * 1024);
-        // Cooldown between scheduler-driven dispatches per partition+kind.
-        // Picks from PS-side `last_*_at` metrics so the gate respects
-        // actual completion, not just dispatch.
-        let gc_cooldown_secs: i64 = *PS_GC_COOLDOWN_SECS_CELL.get_or_init(|| 300);
-        let compact_cooldown_secs: i64 = *PS_COMPACT_COOLDOWN_SECS_CELL.get_or_init(|| 300);
-
-        // Per-partition rolling avg of req/sec across the last
-        // SCHEDULE_INTERVAL_SECS window. Computed by diffing the
-        // `req_count` Atomic across iterations.
-        let mut last_req_count: HashMap<u64, u64> = HashMap::new();
-
-        let mut ticker = compio::time::interval(Duration::from_secs(SCHEDULE_INTERVAL_SECS));
-        ticker.tick().await; // first tick immediate
-
-        tracing::info!(
-            "F188 maintenance scheduler armed: fg_qps_quota={}, gc_debt_high={}MB, compact_pending_high={}MB, gc_cooldown={}s, compact_cooldown={}s",
-            fg_qps_quota,
-            gc_debt_high / (1024 * 1024),
-            compact_pending_high / (1024 * 1024),
-            gc_cooldown_secs,
-            compact_cooldown_secs,
-        );
-
-        loop {
-            ticker.tick().await;
-            let now = now_secs() as i64;
-            // Snapshot all partitions' state under one borrow; release
-            // before any cross-thread `try_send`.
-            let snapshots: Vec<(u64, std::sync::Arc<PartitionMetrics>, mpsc::Sender<bool>, mpsc::Sender<GcTask>)> = {
-                let parts = self.partitions.borrow();
-                parts
-                    .iter()
-                    .map(|(pid, h)| {
-                        (
-                            *pid,
-                            h.metrics.clone(),
-                            h.compact_trigger.clone(),
-                            h.gc_trigger.clone(),
-                        )
-                    })
-                    .collect()
-            };
-
-            use std::sync::atomic::Ordering::Relaxed;
-
-            // Build candidate list per kind, with urgency = debt / threshold.
-            #[derive(Clone)]
-            struct Candidate {
-                part_id: u64,
-                kind: &'static str, // "compact" or "gc"
-                urgency: f64,
-                _debt: u64,
-            }
-            let mut cands: Vec<(Candidate, mpsc::Sender<bool>, mpsc::Sender<GcTask>)> =
-                Vec::new();
-
-            for (pid, m, ctx, gtx) in snapshots {
-                // Foreground-awareness: compute req/sec across the last
-                // interval. F189-fix MED-3: diff against the never-reset
-                // `req_count_monotonic` instead of `req_count`. The
-                // latter is swap-reset to 0 every 5 s by
-                // `report_load_loop`, which raced this diff and
-                // produced false-zero rates during real fg storms,
-                // defeating the foreground-awareness gate.
-                let req_now = m.req_count_monotonic.load(Relaxed);
-                let prev = last_req_count.insert(pid, req_now).unwrap_or(req_now);
-                let req_per_sec = req_now.saturating_sub(prev) / SCHEDULE_INTERVAL_SECS;
-                if (req_per_sec as u32) > fg_qps_quota {
-                    tracing::debug!(
-                        "F188 part {} skipped: req_per_sec={} > fg_qps_quota={}",
-                        pid,
-                        req_per_sec,
-                        fg_qps_quota
-                    );
-                    continue;
-                }
-
-                let gc_debt = m.gc_debt_bytes.load(Relaxed);
-                let gc_inflight = m.gc_inflight.load(Relaxed) > 0;
-                let last_gc_at = m.last_gc_at.load(Relaxed);
-                let gc_eligible = !gc_inflight
-                    && gc_debt > gc_debt_high
-                    && (last_gc_at == 0 || now - last_gc_at >= gc_cooldown_secs);
-                if gc_eligible {
-                    cands.push((
-                        Candidate {
-                            part_id: pid,
-                            kind: "gc",
-                            urgency: gc_debt as f64 / gc_debt_high as f64,
-                            _debt: gc_debt,
-                        },
-                        ctx.clone(),
-                        gtx.clone(),
-                    ));
-                }
-
-                let compact_pending = m.pending_compaction_bytes.load(Relaxed);
-                let compact_inflight = m.compact_inflight.load(Relaxed) > 0;
-                let last_compact_at = m.last_compact_at.load(Relaxed);
-                let compact_eligible = !compact_inflight
-                    && compact_pending > compact_pending_high
-                    && (last_compact_at == 0
-                        || now - last_compact_at >= compact_cooldown_secs);
-                if compact_eligible {
-                    cands.push((
-                        Candidate {
-                            part_id: pid,
-                            kind: "compact",
-                            urgency: compact_pending as f64 / compact_pending_high as f64,
-                            _debt: compact_pending,
-                        },
-                        ctx,
-                        gtx,
-                    ));
-                }
-            }
-
-            // Sort by urgency desc and dispatch top-K. `CompactionGate`
-            // already serialises actual work across partitions; the
-            // top-K cap here is just to avoid filling all the trigger
-            // channels in one tick (which would block try_send).
-            cands.sort_by(|a, b| b.0.urgency.partial_cmp(&a.0.urgency).unwrap_or(std::cmp::Ordering::Equal));
-            const DISPATCH_PER_TICK: usize = 4;
-            for (cand, mut ctx, mut gtx) in cands.into_iter().take(DISPATCH_PER_TICK) {
-                match cand.kind {
-                    "compact" => {
-                        // F188: scheduler dispatches MINOR compaction
-                        // (false). Manual `client compact` dispatches
-                        // major (true). Major still goes through this
-                        // same channel; the in-loop branch picks
-                        // tables based on the bool.
-                        if ctx.try_send(false).is_ok() {
-                            tracing::info!(
-                                "F188 dispatched compact (minor) part {} urgency={:.2} debt={}MB",
-                                cand.part_id,
-                                cand.urgency,
-                                cand._debt / (1024 * 1024)
-                            );
-                        }
-                    }
-                    "gc" => {
-                        if gtx.try_send(GcTask::Auto(GcAutoParams::default())).is_ok() {
-                            tracing::info!(
-                                "F188 dispatched gc part {} urgency={:.2} debt={}MB",
-                                cand.part_id,
-                                cand.urgency,
-                                cand._debt / (1024 * 1024)
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
 
     async fn region_sync_loop(&self) {
         let mut ticker = compio::time::interval(Duration::from_secs(2));

@@ -408,7 +408,14 @@ pub(crate) async fn background_gc_loop(
             .await
         };
 
-        let gc_task = match task {
+        // F203: GcSel::Timeout no longer dispatches `GcTask::Auto`.
+        // The PS maintenance_scheduler_loop is gone; auto GC is no
+        // longer a kernel-level policy. The timer arm now refreshes
+        // `gc_debt_bytes` (so the manager's advisory window stays
+        // fresh between explicit dispatches) and loops back to
+        // wait. Explicit `Maintenance(MAINTENANCE_AUTO_GC | FORCE_GC)`
+        // RPCs from `client gc` are the only dispatch trigger.
+        let gc_task: GcTask = match task {
             GcSel::Recv(None) => break,
             GcSel::Recv(Some(first)) => {
                 // F189-fix HIGH-1: drain backlogged sends (cap=1 +
@@ -462,7 +469,31 @@ pub(crate) async fn background_gc_loop(
             }
             GcSel::Timeout => {
                 next_auto_delay = random_delay();
-                GcTask::Auto(crate::GcAutoParams::default())
+                // F203: refresh `gc_debt_bytes` metric without
+                // dispatching. `report_load_loop` and any external
+                // policy controller queries see fresh debt without
+                // the loop deciding to act on it.
+                let metrics = part.borrow().metrics.clone();
+                let (log_stream_id, readers_snapshot, part_sc) = {
+                    let p = part.borrow();
+                    (p.log_stream_id, p.sst_readers.clone(), p.stream_client.clone())
+                };
+                if let Ok(stream_info) = part_sc.get_stream_info(log_stream_id).await {
+                    let extent_ids = stream_info.extent_ids;
+                    if extent_ids.len() >= 2 {
+                        let sealed = &extent_ids[..extent_ids.len() - 1];
+                        let mut discards = get_discards(&readers_snapshot);
+                        valid_discard(&mut discards, sealed);
+                        let gc_debt: u64 = discards
+                            .values()
+                            .map(|v| (*v).max(0) as u64)
+                            .sum();
+                        metrics
+                            .gc_debt_bytes
+                            .store(gc_debt, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                continue;
             }
         };
 

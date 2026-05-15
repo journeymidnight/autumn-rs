@@ -1394,6 +1394,63 @@ Cleared by audit (no fix needed):
 - **Files:** `feature_list.md`, `claude-progress.txt`. (No code changes.)
 - **passes:** true (audit-cleared)
 
+### F203 · External-policy controller surface — delete in-kernel auto-dispatch (mechanism / policy separation Stage 3, final)
+- **Trigger:** Stage 3 (final) of the mechanism/policy separation plan (`~/.claude/plans/elegant-tumbling-pumpkin.md`). F201 fixed GC trigger logic. F202 unified advisories. F203 deletes the in-kernel auto-dispatch loops and exposes the OP-driven surface that external controllers need. After this commit the manager is a pure mechanism: it executes RPCs, maintains metadata, and surfaces `advisory_cache`. Any "auto" policy lives outside the binary.
+- **Manager deletions (`crates/manager/src/lib.rs`, `crates/manager/src/recovery.rs`, `crates/server/src/bin/manager.rs`):**
+  - `auto_split_enabled` + `auto_merge_enabled` Cells dropped from `AutumnManager`.
+  - `set_auto_split` / `set_auto_merge` setters deleted.
+  - `--auto-split` / `--auto-merge` CLI flags removed; passing them now exits with a clear migration message ("Use `client policy` + `client split|merge` to drive policy externally").
+  - `policy_tick_loop`'s auto-dispatch arm gutted. The loop continues to populate `advisory_cache`; nothing else.
+  - `ec_conversion_dispatch_loop` refactored to **drain-only**: candidates now come exclusively from `pending_ec_dispatch` (which `MSG_FORCE_EC_CONVERT` populates + `replay_from_etcd` rehydrates on leader promotion). Pre-F203 fresh-candidate scan over `s.streams` deleted. The F198 replay path is preserved verbatim; its `Some(replay_params)` branch is now the ONLY way the loop dispatches.
+  - Stale-marker cleanup: candidates whose extent is gone (deleted) or already `ec_converted` are pruned from `pending_ec_dispatch` + etcd inside the same tick.
+  - `auto_dispatch_split` / `auto_dispatch_merge` helpers retained as the mechanism layer used by `force_auto_*` test fixtures.
+  - The two `*_fires_via_policy_tick_loop_fast_mode` tests (auto-merge + auto-split) in `crates/manager/tests/system_merge.rs` cfg'd out via `#[cfg(any())]`. They tested a deleted feature; the `force_auto_*` direct-path tests next to them stay.
+- **PS deletions (`crates/partition-server/src/lib.rs`, `crates/partition-server/src/background.rs`):**
+  - `maintenance_scheduler_loop` (192-line function, the F188 PS-level priority scheduler) **deleted entirely** along with its spawn site.
+  - `background_gc_loop`'s `GcSel::Timeout` arm no longer emits `GcTask::Auto`. The timer now only refreshes `gc_debt_bytes` (so `MSG_REPORT_PARTITION_LOAD` carries fresh debt for advisory) and continues. Auto GC entirely removed from PS-side timer policy.
+  - `background_compact_loop` unchanged: its expiry-major (TTL) + has_overlap (post-split) + size-tiered minor pickups are all **mechanism**-level must-cleanup paths and stay.
+- **New manager RPCs (`crates/rpc/src/manager_rpc.rs`):**
+  - `MSG_FORCE_EC_CONVERT = 0x39` (`ForceEcConvertReq { extent_id }` / `ForceEcConvertResp { code, message }`). Validates extent is sealed + not converted + on an EC-policy stream; allocates extra-parity nodes via the same `alloc_extent_on_node` + shuffled-pool path the deleted fresh-dispatch used; persists a rich `pending_ec_dispatch` marker to etcd; returns CODE_OK. The next `ec_conversion_dispatch_loop` tick drains the marker via F198 replay. Idempotent: re-invocation against a pending or converted extent returns OK.
+  - `MSG_GET_PARTITION_DETAIL = 0x3A` (`GetPartitionDetailReq { part_id }` / `GetPartitionDetailResp { code, message, load: PartitionLoad, bucket_ts }`). Returns the most recent bucket from `PolicyEngine.metrics[part_id]`, including all F202 dimensions. Sources `client info --detail` without needing a dedicated PS RPC.
+- **New `client` subcommands (`crates/server/src/bin/autumn_client.rs`):**
+  - `client force-ec-convert --extent <EXTID>` — sends `MSG_FORCE_EC_CONVERT`.
+  - `client streams [--json]` — returns each stream's `extent_id / sealed_length / ec_converted / replicas / parity / refs / eversion`. JSON output sorted by stream_id; plain text mirrors the layout-typed extent labels used by `info`.
+  - `client info --part PID --detail [--json]` — flag added to existing `info`. Sends `MSG_GET_PARTITION_DETAIL`, prints the full `PartitionLoad` snapshot including F202 fields (`gc_debt_bytes`, `pending_compaction_bytes`, `minor_compact_pending_bytes`, `sst_tombstone_bytes`, `sst_expired_bytes`, `sst_out_of_range_bytes`, `*_inflight`, `last_*_at`, `sealed_log_extent_count`).
+  - `usage()` updated; `--detail` requires `--part PID` (enforced at parse time).
+- **External-policy controller contract (`autumn-rs/README.md`):**
+  - Added a new section under `Operations` describing the OP toolkit: read `client policy --json` → for each candidate kind, optionally fetch `client info --detail --part PID --json` for finer signals → call the appropriate client command (`split` / `merge` / `compact` / `gc [--ratio R | --empty-only | …]` / `force-ec-convert --extent EXTID`) to act.
+  - 30-line bash + cron example controller showing the canonical decision tree (low-QPS gating, business-hour windowing, dispatch cadencing).
+  - Note on idempotency: every client command is safe to re-issue under transient failure.
+- **What stays as in-kernel mechanism (recap, for future readers):**
+  - has_overlap-triggered major compact (split aftermath; not optional).
+  - expiry-triggered major compact (user TTL; not optional).
+  - size-tiered minor compact (LSM hygiene; would never be configurable off).
+  - F198 `pending_ec_dispatch` marker replay across leader failover.
+  - All F138/F139/F145/F146/F147/F149 correctness mutex/fence guards.
+  - `auto_dispatch_split` / `auto_dispatch_merge` internal helpers (test entry-points + future API surface; the `policy_tick_loop` consumer is gone).
+- **Wire-incompatible changes (same-commit upgrade — cluster.sh stops all roles):**
+  - Two new manager RPC type codes (0x39, 0x3A). Old clients sending these to a pre-F203 manager get `unknown msg_type`. New clients calling `force-ec-convert` / `info --detail` / `streams` against a pre-F203 manager will see `CODE_INVALID_ARGUMENT`.
+  - Two old CLI flags removed (`--auto-split` / `--auto-merge` on `autumn-manager-server`). Scripts that pass them now exit with a migration message.
+- **Files touched:**
+  - `crates/manager/src/lib.rs`: drop Cells + setters + auto-dispatch arm (~80 lines net delete).
+  - `crates/manager/src/recovery.rs`: drain-only refactor of dispatch loop (~30 lines refactor).
+  - `crates/manager/src/rpc_handlers.rs`: 2 new handlers + dispatch wiring (~180 lines added).
+  - `crates/manager/tests/system_merge.rs`: cfg-gate the two policy-loop e2e tests.
+  - `crates/partition-server/src/lib.rs`: delete maintenance_scheduler_loop + spawn (~195 lines net delete).
+  - `crates/partition-server/src/background.rs`: gut GC Timeout arm (~25 lines refactor).
+  - `crates/rpc/src/manager_rpc.rs`: 2 new msg_type consts + 4 new wire types (~50 lines).
+  - `crates/server/src/bin/manager.rs`: delete 2 CLI flags + Args fields (~30 lines net delete).
+  - `crates/server/src/bin/autumn_client.rs`: 3 new subcommands + dispatch + usage (~180 lines added).
+  - `autumn-rs/README.md`: external-controller section (~80 lines added).
+  - Various `CLAUDE.md` updates noting the mechanism / policy split.
+- **Verification:**
+  - `cargo build --workspace --exclude autumn-fuse`: clean.
+  - `cargo test -p autumn-manager --lib`: 78/78 (no regressions; F202 advisory tests still pass, F201 cooldown tests still pass).
+  - `cargo test -p autumn-partition-server --lib`: 142/143 (the same `f099i_d1_fast_path_no_fu_allocation` flake from F201/F202; unrelated to F203).
+  - Manual e2e: `cluster.sh reset 4 && cluster.sh start && $AC bootstrap … && $AC policy --json` — every candidate kind printable; `$AC info --part <PID> --detail` returns F202 fields; `$AC force-ec-convert --extent <EXTID>` against a sealed extent triggers conversion within ~5 s.
+- **End of the mechanism/policy refactor.** F201 + F202 + F203 together implement what the user asked for on 2026-05-14: "all 6 op kinds in advisory; manager only mechanism; OP drives policy". Future F-numbers can layer an actual policy controller binary on top of this surface, or wire `MSG_GET_POLICY_CANDIDATES` into a monitoring dashboard.
+- **passes:** true
+
 ### F202 · Advisory unification — 6 policy kinds in one cache (mechanism / policy separation Stage 2)
 - **Trigger:** Stage 2 of the mechanism/policy separation refactor approved by user 2026-05-14 (plan `~/.claude/plans/elegant-tumbling-pumpkin.md`). Stage 1 (F201) fixed GC trigger bugs and added multi-tier params. Stage 2 makes the manager's `advisory_cache` carry all 6 actionable kinds (SPLIT, MERGE, GC, MINOR_COMPACT, MAJOR_COMPACT, EC) plus HOT_COLD, so an external policy controller has one query (`MSG_GET_POLICY_CANDIDATES`) for everything it needs to decide on.
 - **Wire changes (backward-incompatible at rkyv level, same-commit upgrade — cluster.sh stops all roles before restart):**

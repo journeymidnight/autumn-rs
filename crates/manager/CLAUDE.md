@@ -622,6 +622,40 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       minor_compact_cooldown_sec / ec_min_extent_bytes`, all
       runtime-tunable via `set_policy_config`.
 
+    **F203 — end of the mechanism/policy refactor.** The manager is
+    now PURE mechanism for operational decisions:
+
+    - `auto_split_enabled` / `auto_merge_enabled` Cells deleted.
+    - `set_auto_split` / `set_auto_merge` setters deleted.
+    - `policy_tick_loop`'s auto-dispatch arm deleted. The loop still
+      builds `advisory_cache` from all 4 compute_*_advisory helpers;
+      that's its only job.
+    - `ec_conversion_dispatch_loop` is **drain-only**: candidates
+      come from `pending_ec_dispatch` keys, not from a fresh
+      `s.streams` scan. New EC conversions enter via
+      `MSG_FORCE_EC_CONVERT` (handler validates + persists rich
+      marker + relies on the next tick to fire through the F198
+      replay path). Leader-failover replay (`replay_from_etcd`
+      rehydrating markers) works identically.
+    - `--auto-split` / `--auto-merge` CLI flags removed from
+      `autumn-manager-server`. Passing them now exits with a
+      migration message.
+
+    What stays in-kernel (correctness must-cleanup):
+    - has_overlap-major / expiry-major / size-tiered minor compact
+      (all on the PS side, mechanism-level).
+    - F198 marker replay (etcd persistence for in-flight EC convert
+      across failover — not optional).
+    - All F138/F139/F145/F146/F147/F149 correctness mutex/fence
+      guards.
+    - `auto_dispatch_split` / `auto_dispatch_merge` helpers stay as
+      mechanism layer; tests + the new `MSG_FORCE_EC_CONVERT` /
+      `MSG_GET_PARTITION_DETAIL` RPCs are the external-policy
+      surface.
+
+    See `README.md` for the OP-driven workflow + cron + bash MVP
+    controller example.
+
     **Stage 1 only** — advisory is purely informational. `last_op_at`
     and `auto_dispatch_*` paths are NOT touched (those would be Stage
     2/3 territory: a PS-local priority maintenance scheduler + shared
