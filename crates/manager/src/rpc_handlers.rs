@@ -746,8 +746,17 @@ impl AutumnManager {
                 }
             }
         }
+        // F210-B2: majority quorum for replicated extents (was: min_size=1).
+        // Single-replica seal was safe for ack'd-data invariants under
+        // F178+B3 (writer N-of-N + EN returns last_synced), but bumping
+        // to majority closes two operational concerns: (a) defense against
+        // future write-path regressions that might weaken N-of-N, and
+        // (b) reduces sealed_length drift when only the leading replica
+        // happens to respond. Aligned with Raft / Ceph industry norm. EC
+        // path unchanged: K data shards needed for reconstruction = the
+        // same `replicates.len()` that was already there.
         let min_size = if ex.parity.is_empty() {
-            1usize
+            ex.replicates.len() / 2 + 1
         } else {
             ex.replicates.len()
         };
@@ -953,8 +962,11 @@ impl AutumnManager {
                     }
                 }
             }
+            // F210-B2: see handle_check_commit_length above for the same
+            // majority-quorum rationale. Same fix here in the seal-during-
+            // alloc path.
             let min_size = if tail.parity.is_empty() {
-                1usize
+                tail.replicates.len() / 2 + 1
             } else {
                 tail.replicates.len()
             };

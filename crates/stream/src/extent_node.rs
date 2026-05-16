@@ -3275,39 +3275,56 @@ impl ExtentNode {
                 )
             })?;
 
-        if req.revision > 0 {
-            let last = entry.last_revision.load(Ordering::SeqCst);
-            if req.revision < last {
-                return Ok(CommitLengthResp {
-                    code: CODE_LOCKED_BY_OTHER,
-                    length: 0,
-                }
-                .encode());
+        // F210-H2: drop the `req.revision > 0` escape hatch so a stale
+        // / zero-revision caller can't bypass the owner-lock fence and
+        // observe commit_length. Symmetric to F119-C's same fix on
+        // eversion=0 in the read path. EN startup default is
+        // `last_revision = 0`, so a fresh extent with `req.revision = 0`
+        // still passes the `>= last` check (0 >= 0). Only the
+        // "explicitly skip fence" escape is closed.
+        let last = entry.last_revision.load(Ordering::SeqCst);
+        if req.revision < last {
+            return Ok(CommitLengthResp {
+                code: CODE_LOCKED_BY_OTHER,
+                length: 0,
             }
-            if req.revision > last {
-                entry.last_revision.store(req.revision, Ordering::SeqCst);
-                let _ = self.save_meta(req.extent_id, &entry).await;
-            }
+            .encode());
+        }
+        if req.revision > last {
+            entry.last_revision.store(req.revision, Ordering::SeqCst);
+            let _ = self.save_meta(req.extent_id, &entry).await;
         }
         // F119-E: for sealed extents, return the LOGICAL sealed length
         // (the original payload length, agreed with the manager). For
-        // open extents, return the current file length (commit point).
+        // open extents, return the **F210-B3 fix**: the durable
+        // high-water (`coalescer.last_synced`), NOT `entry.len`.
         //
-        // Pre-fix this always returned `entry.len`, which after EC
-        // conversion is the per-shard size (`shard_size(payload, K)`),
-        // not the original payload length. That polluted
-        // `StreamClient::current_commit` → `SeedCursor`, leading the
-        // worker to seed `state.commit` with the shard size instead of
-        // the logical end. Cosmetic for sealed extents (writes get
-        // rejected by the sealed check anyway), but `current_commit` is
-        // also called when initialising new stream-client workers for a
-        // CoW-shared sealed-EC tail post-split, where the seeded commit
-        // surfaces upstream as a misleading commit_length value.
+        // Pre-F210-B3 this returned `entry.len`, which is set to
+        // `total_end` BEFORE the pwrite + fsync future is even returned
+        // (see `build_append_future` step 7). A concurrent peer (e.g.
+        // EC convert peer-copy gap fill, or manager seal) querying
+        // commit_length during the pwrite-to-fsync window would read
+        // the reservation and treat it as committed. Manager would
+        // then seal at a non-durable value; on this replica's crash
+        // before fsync, the file shrinks back below sealed_length →
+        // permanent inconsistency in etcd.
+        //
+        // F178's per-extent coalescer maintains `last_synced` =
+        // post-fsync durable high-water. Returning it gives the strict
+        // "what's actually on disk" guarantee that seal needs.
+        // Trade-off: bytes between `last_synced` and `entry.len` (in
+        // flight pwrites) are temporarily invisible to commit_length;
+        // they reappear on the next coalescer tick (1-5 ms later).
+        // For the original F119-E concern (post-EC-conversion shard
+        // size), `last_synced` is also bounded above by
+        // `sealed_length` for sealed extents (set in
+        // `apply_extent_meta_durable`), so the EC-shard-size confusion
+        // doesn't recur.
         let sealed = entry.sealed_length.load(Ordering::SeqCst);
         let length = if sealed > 0 {
             sealed
         } else {
-            entry.len.load(Ordering::SeqCst)
+            entry.coalescer.last_synced.load(Ordering::SeqCst)
         };
         Ok(CommitLengthResp {
             code: CODE_OK,

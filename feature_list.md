@@ -1411,8 +1411,9 @@ Cleared by audit (no fix needed):
 - **passes:** true
 
 #### F210-B · Write/Read quorum protocol asymmetry (stream layer)
-- **B1+B2** Write fanout is N-of-N (`client.rs:692-815 apply_completion` breaks on any error), read commit_length is majority, manager seal sets `min_size=1` (rpc_handlers.rs:683, 890). Three different quorum definitions in three places. Pick one (likely N-of-N write + N-of-N fsync-wait, slow-replica catches up via re_avali; or majority everywhere) and align.
-- **B3** EN reserves `entry.len = total_end` before pwrite+fsync (`extent_node.rs:1359`), `handle_commit_length` returns the reservation (`:3197`). Cross-RPC peer (EC convert peer-copy gap fill) sees in-memory reservation higher than what's on disk. Fix the visibility (only expose post-fsync len, or distinct counters).
+- **B1** ⏸ Deferred. Write fanout stays N-of-N + F178 per-replica fsync wait. Switching to majority writes would require new "missed-bytes re_avali on lagging replica" protocol (machinery doesn't exist today). N-of-N writes preserve the strong invariant "every ack'd byte is durable on every designated replica" — keep it. Operational concern (1 slow replica blocks writer) is acceptable for current scale.
+- **B2** ✅ Done. Manager seal `min_size` raised from `1` to `replicates.len()/2 + 1` (majority) for replicated extents. Two sites: `handle_check_commit_length` (rpc_handlers.rs:749) + `handle_stream_alloc_extent` (rpc_handlers.rs:956). EC path unchanged (still requires K data shards). Aligns with Raft / Ceph industry norm. Single-replica seal was technically safe under N-of-N writes + B3, but bumping is defense-in-depth: protects against future write-path regressions and reduces sealed_length drift in edge cases. Trade-off: 2-of-3-dead now blocks seal until recovery brings a third replica back; previously would have proceeded with the sole responder (unsafe under any write-path weakening).
+- **B3** ✅ Done. EN `handle_commit_length` (extent_node.rs:3306-3311) for open extents now returns `entry.coalescer.last_synced` (the F178 post-fsync durable high-water), not `entry.len` (the pre-fsync pwrite reservation set in build_append_future step 7). Pre-fix, a concurrent peer querying commit_length during a pwrite-to-fsync window would read the reservation; manager seal could then seal at a non-durable value; replica crash before fsync would leave etcd with `sealed_length > actual_durable_bytes`. The fix narrows the visible commit_length to "what's actually on disk", at the cost of bytes between `last_synced` and `entry.len` being temporarily invisible until the next 1-5 ms coalescer tick. Sealed extents continue to return `sealed_length` (unchanged).
 - **passes:** false
 
 #### F210-C · Write-pipeline atomicity (partition layer)
@@ -1454,7 +1455,7 @@ Cleared by audit (no fix needed):
 
 #### F210-H · Wire / sentinel completeness
 - **H1** Replicated `handle_read_bytes` (extent_node.rs:3108-3128) returns short payload silently when `offset > total_len`. F204 sentinel only on EC path. Operations grepping `stale_vp_offset_past_sealed_length:` miss replicated cases. Mirror the sentinel.
-- **H2** `handle_commit_length` (extent_node.rs:3165) skips fence check when `req.revision == 0`. F119-C-style loophole. Drop the `> 0` guard.
+- **H2** ✅ Done (folded into B2/B3 commit). `handle_commit_length` (extent_node.rs:3278) no longer wraps the fence check in `if req.revision > 0`. Symmetric to F119-C's same fix on eversion=0 in the read path. EN startup default is `last_revision = 0`, so a fresh extent with `req.revision = 0` still passes the `>= last` check (0 >= 0); only the explicit "skip fence" escape hatch is closed.
 - **passes:** false
 
 ---
