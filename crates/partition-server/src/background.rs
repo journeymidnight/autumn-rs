@@ -26,6 +26,16 @@ use crate::sstable::{IterItem, MergeIterator, SstBuilder, SstReader, TableIterat
 /// and pending typically can't reach 256 → second batch never launches →
 /// effective depth=1 per partition. Use `AUTUMN_PS_MIN_BATCH=32` or similar.
 const DEFAULT_MIN_PIPELINE_BATCH: usize = 256;
+
+/// F210-E2: per-partition SST count threshold above which the compact
+/// loop's timer arm auto-triggers a minor compaction. Set high enough
+/// to leave steady-state operation (post-flush + post-minor-compact)
+/// untouched, but below the FPR cliff where per-Get miss-path block
+/// reads dominate. At 1% per-SST bloom FPR, N=32 ≈ 28% cumulative
+/// false-positive on a miss vs. 63% at N=100 — keeping reads cheap
+/// on workloads where external policy hasn't kept up. Not tunable
+/// because it's a mechanism-level defensive bound, not a policy knob.
+const MAX_SST_BEFORE_AUTO_COMPACT: usize = 32;
 // F195: process-global setter cells for the 5 background.rs knobs.
 // Pre-F195 each was an inner static OnceLock+env read; now lifted to
 // module scope with paired pub setters that the autumn-ps binary calls
@@ -329,6 +339,73 @@ pub(crate) async fn background_compact_loop(
                 // `pending_compaction_bytes` (which we just refreshed
                 // above). The Recv branch handles BOTH manual triggers
                 // and scheduler dispatches via the same channel.
+
+                // F210-E2: defensive auto-compact when SST count grows
+                // past `MAX_SST_BEFORE_AUTO_COMPACT`. Per-SST bloom is
+                // tuned to 1% FPR but reads consult EVERY reader for a
+                // miss (`p.sst_readers.iter().rev()` in `handle_get`),
+                // so the cumulative chance that AT LEAST ONE bloom
+                // false-positives is `1 - 0.99^N`: 39% at N=50, 63% at
+                // N=100, 87% at N=200. Each false-positive costs one
+                // block read + decode on the miss path. F203 deleted
+                // the PS-side maintenance scheduler in favour of
+                // external policy, but FPR runaway is a mechanism-
+                // level concern (no operator can be expected to
+                // monitor `tables.len()` per partition) so we keep a
+                // cheap auto-trigger here. Uses the existing
+                // `pickup_tables` size-tiered selector — drains the
+                // smallest cohort each tick, converging to a stable
+                // <`MAX_SST_BEFORE_AUTO_COMPACT` count over a few
+                // ticks without monopolising the compact permit. The
+                // recv arm handles externally-dispatched majors
+                // unchanged; the threshold is intentionally larger
+                // than typical steady-state so this only fires when
+                // external policy is absent or has fallen behind.
+                let sst_count = part.borrow().sst_readers.len();
+                if sst_count > MAX_SST_BEFORE_AUTO_COMPACT
+                    && metrics.compact_inflight.load(std::sync::atomic::Ordering::Relaxed) == 0
+                {
+                    let tbls = part.borrow().tables.clone();
+                    let (compact_tbls, truncate_id) = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
+                    if compact_tbls.len() >= 2 {
+                        let _permit = concurrency_ctrl.acquire_compact().await;
+                        metrics
+                            .compact_inflight
+                            .store(1, std::sync::atomic::Ordering::Relaxed);
+                        let result = do_compact(&part, compact_tbls, false).await;
+                        match result {
+                            Ok(s) => {
+                                tracing::info!(
+                                    "compact part {}: auto-trim (sst_count was {}), input={} tables, output={} tables, kept={}, discarded={}, output={}",
+                                    _part_id, sst_count,
+                                    s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
+                                    crate::human_size(s.output_bytes)
+                                );
+                                if truncate_id != 0 {
+                                    let (row_stream_id, part_sc) = {
+                                        let p = part.borrow();
+                                        (p.row_stream_id, p.stream_client.clone())
+                                    };
+                                    if let Err(e) = part_sc.truncate(row_stream_id, truncate_id).await {
+                                        tracing::warn!("auto-trim truncate: {e}");
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::error!("auto-trim compaction: {e}"),
+                        }
+                        metrics.pending_compaction_bytes.store(
+                            compute_pending_compaction_bytes(&part),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        metrics.last_compact_at.store(
+                            crate::now_secs() as i64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        metrics
+                            .compact_inflight
+                            .store(0, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
             }
         }
     }

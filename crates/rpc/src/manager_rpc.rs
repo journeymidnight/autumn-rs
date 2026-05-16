@@ -87,6 +87,16 @@ pub const MSG_FORCE_EC_CONVERT: u8 = 0x39;
 // out-of-range / minor pending byte counts without a separate PS RPC.
 pub const MSG_GET_PARTITION_DETAIL: u8 = 0x3A;
 
+// F210-F1: const-dump of the `POLICY_KIND_*` enum so external
+// controllers (Python, ops scripts) can introspect the wire values
+// without hardcoding them. The values themselves are wire-stable
+// (frozen — pre-F210-F1 a docstring drift made the docs say `1..7`
+// while the code said `0..6`, which produced an off-by-one bug in
+// every Python controller that trusted the docs). After F210-F1 the
+// names + values come from the manager binary as the single source
+// of truth; any future addition appends a new `(name, value)` pair.
+pub const MSG_GET_POLICY_KIND_NAMES: u8 = 0x3B;
+
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
 /// Serialize a value to Bytes using rkyv.
@@ -832,6 +842,17 @@ pub struct ReportPartitionLoadReq {
 }
 
 // --- GetPolicyCandidates (advisory) ---
+//
+// F210-F1: **WIRE-STABILITY CONTRACT** — the numeric values below are
+// frozen. New advisory kinds must be APPENDED with the next unused
+// value (POLICY_KIND_EC = 6 → next would be 7). Renumbering breaks
+// every external controller, dashboard, and historical log analysis.
+// Operators discovered this when an off-by-one between this code
+// (SPLIT=0..EC=6) and a stale CLAUDE.md note (which said "1..7")
+// caused every Python `cluster/policy_controller.py` decision to
+// fire on the wrong kind. Treat docs + this file + the const-dump
+// (`MSG_GET_POLICY_KIND_NAMES`) as a CI-checkable triad — drift on
+// any one is a wire-breaking event.
 pub const POLICY_KIND_SPLIT: u8 = 0;
 pub const POLICY_KIND_MERGE: u8 = 1;
 /// F187: GC debt advisory — partition's `gc_debt_bytes` exceeds the
@@ -896,6 +917,39 @@ pub struct GetPolicyCandidatesResp {
     pub code: u8,
     pub message: String,
     pub candidates: Vec<PolicyCandidate>,
+}
+
+// --- GetPolicyKindNames (F210-F1 const-dump) ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct GetPolicyKindNamesReq {}
+
+/// `(name, value)` pairs for every defined `POLICY_KIND_*` constant in
+/// THIS binary. External controllers should pull this at startup and
+/// resolve string names locally rather than hardcoding numeric values
+/// — the numeric values are wire-stable by contract (see freeze
+/// docstring above the `POLICY_KIND_*` block), but new kinds may be
+/// added at any binary release.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetPolicyKindNamesResp {
+    pub code: u8,
+    pub message: String,
+    pub kinds: Vec<(String, u8)>,
+}
+
+/// Returns the canonical name → wire-value mapping for every
+/// currently-defined `POLICY_KIND_*` constant. Update this list when
+/// a new kind is added (the binary is the source of truth for what
+/// it serves; external tooling reads via `MSG_GET_POLICY_KIND_NAMES`).
+pub fn policy_kind_names() -> Vec<(String, u8)> {
+    vec![
+        ("POLICY_KIND_SPLIT".to_string(), POLICY_KIND_SPLIT),
+        ("POLICY_KIND_MERGE".to_string(), POLICY_KIND_MERGE),
+        ("POLICY_KIND_GC".to_string(), POLICY_KIND_GC),
+        ("POLICY_KIND_MAJOR_COMPACT".to_string(), POLICY_KIND_MAJOR_COMPACT),
+        ("POLICY_KIND_HOT_COLD".to_string(), POLICY_KIND_HOT_COLD),
+        ("POLICY_KIND_MINOR_COMPACT".to_string(), POLICY_KIND_MINOR_COMPACT),
+        ("POLICY_KIND_EC".to_string(), POLICY_KIND_EC),
+    ]
 }
 
 // --- ReportDiskFailure (F192) ---

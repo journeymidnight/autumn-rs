@@ -917,6 +917,28 @@ sufficient (and cheaper than DashMap).
     to handle `Err` — never assume a returned receiver will
     resolve.
 
+18. **F210-E1 + H1: re_avali permit + stale-VP sentinel mirror.**
+
+    **E1.** `handle_re_avali`'s replicated repair path now acquires
+    `concurrency_ctrl.acquire_recovery()` AFTER the EC short-circuit
+    and the already-up-to-date check (so cheap requests don't consume
+    a permit) and BEFORE `fetch_full_extent_from_sources`. Held by
+    RAII for the duration of the peer-fetch + truncate + pwrite +
+    fsync. Uses the same shared pool as `run_recovery_task`; both
+    paths have the same `payload × 2` transient working set per
+    in-flight task and benefit from a unified cap.
+
+    **H1.** `StreamClient::read_with_layout` constructs and returns
+    `StaleVpOffset` upfront when `ex.sealed_length > 0 && offset >
+    ex.sealed_length`, BEFORE the `ec_converted` branch. Covers both
+    replicated and EC paths uniformly so operational tooling's
+    `stale_vp_offset_past_sealed_length:` regex (programming note 6
+    F204 wire contract) fires on replicated VPs too. EC's
+    `ec_slice_decoded` retains its own check as defense-in-depth on
+    the decoded payload. Skips the wasted server round-trip + EC
+    decode on a known-stale VP. Open extents (sealed_length=0) are
+    untouched — there's no authoritative bound to check against.
+
 ---
 
 ## RPC Wire Protocol (extent_rpc.rs)

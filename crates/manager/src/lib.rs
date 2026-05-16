@@ -352,6 +352,17 @@ pub struct AutumnManager {
     /// Delete-kind ledger entries with attempts=0).
     pub(crate) delete_progress:
         Rc<RefCell<HashMap<u64, crate::extent_delete::PendingDelete>>>,
+    /// F210-G2: persisted "tried 60 times in extent_delete_loop and still
+    /// failed" queue. Hydrated from the `extentDeleteRetry/` etcd
+    /// prefix at replay; updated by `persist_failed_delete` and
+    /// `extent_delete_retry_loop`. Survives manager restart + leader
+    /// failover (the in-memory shadow rebuilds from etcd; an extent
+    /// stays in the queue until every replica's `EXT_MSG_DELETE_EXTENT`
+    /// acks). Independent from `delete_progress` (primary 2 s loop)
+    /// and from the inflight ledger (Delete marker is released when
+    /// the entry moves to this queue).
+    pub(crate) failed_deletes:
+        Rc<RefCell<HashMap<u64, crate::extent_delete::MgrExtentDeleteRetry>>>,
     runtime_started: Rc<Cell<bool>>,
     ps_last_heartbeat: Rc<RefCell<HashMap<u64, Instant>>>,
     conn_pool: Rc<ConnPool>,
@@ -424,6 +435,7 @@ impl AutumnManager {
             instance_id: Rc::new(uuid::Uuid::new_v4().to_string()),
             inflight: Rc::new(RefCell::new(HashMap::new())),
             delete_progress: Rc::new(RefCell::new(HashMap::new())),
+            failed_deletes: Rc::new(RefCell::new(HashMap::new())),
             runtime_started: Rc::new(Cell::new(false)),
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),
             conn_pool: Rc::new(ConnPool::new()),
@@ -572,6 +584,14 @@ impl AutumnManager {
         })
         .detach();
 
+        // F210-G2: persisted-retry slow loop for deletes that exhausted
+        // the primary 60-attempt budget.
+        let mgr = self.clone();
+        compio::runtime::spawn(async move {
+            mgr.extent_delete_retry_loop().await;
+        })
+        .detach();
+
         // F183: policy advisory tick.
         let mgr = self.clone();
         compio::runtime::spawn(async move {
@@ -615,6 +635,16 @@ impl AutumnManager {
             let last_op = self.last_op_at.borrow().clone();
             let state_snapshot: autumn_common::MetadataState =
                 (*self.store.inner.borrow()).clone();
+            // F210-F3: prune metrics for partitions that no longer
+            // exist (post-split / merge / PS-evict) and whose latest
+            // bucket has aged past STALE_METRICS_AGE_SEC. Without
+            // this, advisories continued to fire off zombie metrics
+            // for ~indefinite duration after a partition was merged
+            // away.
+            {
+                let mut p = self.policy.borrow_mut();
+                p.prune_stale_metrics(&state_snapshot, now);
+            }
             let mut cands: Vec<PolicyCandidate> = {
                 let mut p = self.policy.borrow_mut();
                 p.compute_candidates(crate::policy::ComputeArgs {
@@ -1071,6 +1101,11 @@ impl AutumnManager {
         // F207: unified extent in-flight ledger. Authoritative source of
         // truth for stream-layer ops in flight on each extent.
         let extent_inflight_raw = c.get_prefix(crate::extent_inflight::EXTENT_INFLIGHT_PREFIX).await?;
+        // F210-G2: persisted retry queue for extent deletes that
+        // exhausted the primary in-memory loop's budget.
+        let failed_delete_raw = c
+            .get_prefix(crate::extent_delete::EXTENT_DELETE_RETRY_PREFIX)
+            .await?;
         drop(c);
 
         let mut max_id = 0u64;
@@ -1174,6 +1209,25 @@ impl AutumnManager {
             s.regions = decoded_regions;
             s.next_id = s.next_id.max(max_id.saturating_add(1));
         }
+        // F210-G1: seed `ps_last_heartbeat` with `Instant::now()` for
+        // every replayed PS. Pre-F210-G1 the map was empty post-failover,
+        // and the liveness loop's `None` arm treated unknown PSes as
+        // "alive" — so a PS that died right before the failover (with
+        // its evicted etcd entry still lingering pre-F210-G1) was
+        // resurrected on replay and stayed forever unevictable. Seeding
+        // grants every replayed PS a fresh `PS_DEAD_TIMEOUT` window to
+        // start heartbeating again. If it doesn't, the regular eviction
+        // path fires after the window expires (now reachable because
+        // `Some(t)` from the seed engages the `.elapsed() > timeout`
+        // branch).
+        {
+            let mut hb = self.ps_last_heartbeat.borrow_mut();
+            let now = Instant::now();
+            let s = self.store.inner.borrow();
+            for ps_id in s.ps_nodes.keys() {
+                hb.entry(*ps_id).or_insert(now);
+            }
+        }
         // F183: install last_op_at sidecar so policy engine cooldown
         // gating is correct on cold-start as well.
         *self.last_op_at.borrow_mut() = decoded_last_op;
@@ -1221,6 +1275,42 @@ impl AutumnManager {
                         },
                     );
                 }
+            }
+        }
+        // F210-G2: rehydrate `failed_deletes` from the persisted retry
+        // prefix. `attempts` + `last_attempt_at` are kept as written so
+        // the new leader respects any in-flight backoff window from
+        // the deposed leader's most recent attempt.
+        {
+            let mut map = self.failed_deletes.borrow_mut();
+            map.clear();
+            for kv in &failed_delete_raw.kvs {
+                let id = match Self::parse_id_from_key(
+                    crate::extent_delete::EXTENT_DELETE_RETRY_PREFIX,
+                    &kv.key,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "F210-G2: replay skipped malformed extentDeleteRetry/ key"
+                        );
+                        continue;
+                    }
+                };
+                let entry: crate::extent_delete::MgrExtentDeleteRetry =
+                    match autumn_rpc::manager_rpc::rkyv_decode(&kv.value) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                extent_id = id,
+                                error = %e,
+                                "F210-G2: replay skipped malformed extentDeleteRetry/ payload"
+                            );
+                            continue;
+                        }
+                    };
+                map.insert(id, entry);
             }
         }
 
@@ -1433,6 +1523,24 @@ impl AutumnManager {
                 let mut hb = self.ps_last_heartbeat.borrow_mut();
                 for ps_id in &dead_ps {
                     hb.remove(ps_id);
+                }
+            }
+
+            // F210-G1: explicit delete of every evicted PS's etcd key.
+            // `mirror_partition_snapshot` only PUTs survivors and never
+            // DELETEs — pre-F210-G1 the evicted `psNodes/<id>` key
+            // persisted in etcd indefinitely. On manager failover the
+            // new leader's `replay_from_etcd` rehydrated it back into
+            // `s.ps_nodes`, but `ps_last_heartbeat` (in-memory only) was
+            // empty, so the liveness check's `None` arm short-circuited
+            // to `false` (treated as live) and the resurrected ghost
+            // PS was unevictable forever. Deleting the etcd key here
+            // closes the resurrection path entirely.
+            if let Some(etcd) = &self.etcd {
+                let deletes: Vec<String> =
+                    dead_ps.iter().map(|id| format!("psNodes/{id}")).collect();
+                if let Err(e) = etcd.put_and_delete_txn(Vec::new(), deletes).await {
+                    tracing::error!("delete evicted psNodes/ keys failed: {e}");
                 }
             }
 

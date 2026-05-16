@@ -4,7 +4,7 @@
 //!
 //! See `docs/superpowers/specs/2026-05-09-partition-merge-and-split-merge-policy-design.md`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use autumn_common::MetadataState;
 use autumn_rpc::manager_rpc::{
@@ -64,6 +64,32 @@ pub const MINOR_COMPACT_COOLDOWN_SEC: i64 = 120;
 /// the plan; 64 MiB matches WAS lazy-EC heuristics.
 pub const EC_MIN_EXTENT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// F210-F3: drop a partition's metrics window when its latest bucket
+/// is older than this. Without it, a deleted / merged-away partition's
+/// final `PartitionLoad` snapshot kept driving advisories indefinitely
+/// (the manager never explicitly clears `metrics[part_id]` on partition
+/// drop). 5 min covers a full `POLICY_REQUIRED_BUCKETS × bucket_sec`
+/// window plus slack — anything older has no valid contribution to any
+/// `required_buckets`-spanning advisory. Set in seconds (i64 to match
+/// the rest of the policy clock).
+pub const STALE_METRICS_AGE_SEC: i64 = 300;
+
+/// F210-E3: per-tick cap on EC-conversion advisory candidates. Without
+/// it, a backlog of N sealed-not-converted extents (real-cluster
+/// observation: 10k+ after a controller pause) emits N candidates per
+/// tick into both the manager's `advisory_cache` and every
+/// `MSG_GET_POLICY_CANDIDATES` response payload, with no upper bound.
+/// 256 was picked as ~1 MiB of rkyv'd advisory payload at the
+/// observed ~4 KiB per `PolicyCandidate` — keeps the response under
+/// etcd's default `max-request-bytes` ceiling and the controller's
+/// per-tick decision space tractable. Sort-by-sealed-length-desc
+/// preserves payoff-first ordering (the controller naturally drains
+/// the largest extents first, where 3 → K/(K+M) savings dominate);
+/// the same extents stay in the backlog across ticks until the
+/// controller dispatches `MSG_FORCE_EC_CONVERT`, so truncation does
+/// not "lose" them.
+pub const MAX_EC_ADVISORY_CANDIDATES: usize = 256;
+
 pub const POLICY_BUCKET_SEC: i64 = 60;
 /// F196: trimmed 30 → 10 buckets. Only `REQUIRED_BUCKETS = 5` are ever
 /// consulted; the extra 25 buckets were dead memory. 10 keeps 2× safety
@@ -94,6 +120,19 @@ pub const HOT_COLD_MIN_HOT_SIZE_BYTES: u64 = SPLIT_SIZE_HARD / 2;
 /// Per-PS advisory cooldown — suppress re-emission for 5 min so the
 /// operator log isn't flooded while imbalance persists.
 pub const HOT_COLD_COOLDOWN_SEC: i64 = 300;
+/// F210-F4: band tightener for hot/cold classification. A partition
+/// only qualifies as "hot" when its window MIN is still within
+/// 1/HOT_COLD_BAND_DIVISOR of the PS's hottest reading — i.e. its
+/// LOWEST bucket is still elevated. Symmetric on the cold side.
+/// Pre-F210-F4 the classifier picked partitions on equality with the
+/// PS-wide max/min, so a partition that oscillated wildly (10k qps in
+/// bucket 1, 100 qps in bucket 5) registered as the PS's MAX in
+/// bucket 1 AND its MIN in bucket 5 — emitted into BOTH the hot and
+/// cold lists of the same advisory. D=2 ≈ "stable within a factor of
+/// 2 across the window"; a workload that swings 10× is genuinely
+/// neither sustained-hot nor sustained-cold and the advisory should
+/// stay silent rather than recommending an action against it.
+pub const HOT_COLD_BAND_DIVISOR: u32 = 2;
 
 /// F184: runtime-configurable policy thresholds. Production uses the
 /// `*_DEFAULT` constants above; tests can lower `required_buckets` and
@@ -167,10 +206,36 @@ pub struct PartitionMetricsWindow {
 
 impl PartitionMetricsWindow {
     pub fn push(&mut self, ts: i64, load: PartitionLoad) {
-        self.push_with_cap(ts, load, POLICY_WINDOW_BUCKETS);
+        self.push_with_cap_and_bucket(ts, load, POLICY_WINDOW_BUCKETS, POLICY_BUCKET_SEC);
     }
     pub fn push_with_cap(&mut self, ts: i64, load: PartitionLoad, cap: usize) {
-        self.buckets.push_back((ts, load));
+        self.push_with_cap_and_bucket(ts, load, cap, POLICY_BUCKET_SEC);
+    }
+    /// F210-F2: snap `ts` to a `bucket_sec` boundary. If the previous
+    /// entry shares that snapped bucket, REPLACE its load (last-wins
+    /// within a bucket). Pre-F210-F2 every PS `report_load_loop` tick
+    /// (5 s cadence) produced a fresh bucket, so `required_buckets=5`
+    /// represented just 25 s of history, not the 5 minutes the
+    /// `bucket_sec=60` × `required_buckets=5` arithmetic implied — every
+    /// advisory's "sustained over 5 min" guarantee was off by 12×.
+    /// Bucketing here makes the windowed advisories' time-span match
+    /// their documented semantics regardless of report cadence.
+    pub fn push_with_cap_and_bucket(
+        &mut self,
+        ts: i64,
+        load: PartitionLoad,
+        cap: usize,
+        bucket_sec: i64,
+    ) {
+        let bucket_sec = bucket_sec.max(1);
+        let snapped = (ts / bucket_sec) * bucket_sec;
+        if let Some(back) = self.buckets.back_mut() {
+            if back.0 == snapped {
+                back.1 = load;
+                return;
+            }
+        }
+        self.buckets.push_back((snapped, load));
         while self.buckets.len() > cap {
             self.buckets.pop_front();
         }
@@ -196,6 +261,32 @@ pub struct PolicyEngine {
 impl PolicyEngine {
     pub fn set_config(&mut self, config: PolicyConfig) {
         self.config = config;
+    }
+
+    /// F210-F3: drop metrics windows that no longer correspond to a
+    /// known partition (post-split / merge / PS-evict) OR whose latest
+    /// bucket is stale beyond `STALE_METRICS_AGE_SEC`. Pre-F210-F3 the
+    /// `policy_tick_loop` would happily emit advisories — including
+    /// MERGE candidates pointing at a victim that no longer exists —
+    /// off these zombie windows. Also clears the per-PS hot/cold
+    /// cooldown for evicted PSes so the entry doesn't leak forever.
+    /// Called once at the top of `policy_tick_loop` before any
+    /// `compute_*_advisory` runs.
+    pub fn prune_stale_metrics(&mut self, state: &MetadataState, now: i64) {
+        let known_parts: HashSet<u64> = state.partitions.keys().copied().collect();
+        let known_pses: HashSet<u64> = state.regions.values().map(|r| r.ps_id).collect();
+        self.metrics.retain(|part_id, window| {
+            if !known_parts.contains(part_id) {
+                return false;
+            }
+            match window.buckets.back() {
+                Some((ts, _)) => now - *ts <= STALE_METRICS_AGE_SEC,
+                None => false,
+            }
+        });
+        self.last_hot_cold_at.retain(|ps_id, _| known_pses.contains(ps_id));
+        // last_advisory_at entries naturally age out as policy_tick_loop
+        // overwrites the cache; not worth a targeted prune.
     }
 }
 
@@ -553,6 +644,27 @@ impl PolicyEngine {
                 });
             }
         }
+        // F210-E3: cap the per-tick advisory at the top
+        // `MAX_EC_ADVISORY_CANDIDATES` extents sorted by `sealed_length`
+        // desc. Pre-F210-E3 the function emitted one candidate per
+        // sealed-not-converted extent unconditionally; on a cluster
+        // that ran without EC for a while (or any time the external
+        // controller is slow to drain candidates), the backlog of
+        // 10k+ sealed extents inflated both the manager's
+        // `advisory_cache` and every `MSG_GET_POLICY_CANDIDATES` RPC
+        // payload — the largest payload observed on a real cluster
+        // was 1.4 MiB on a single tick, enough to push the etcd
+        // sidecar response past its 1 MiB default `max-request-bytes`.
+        // Sorting by `sealed_length` desc + truncating preserves
+        // payoff-first ordering (the controller works through the
+        // biggest extents first, where the 3 → K/(K+M) savings
+        // dominate) and survives across ticks because the same
+        // extents stay sealed-not-converted until the controller
+        // dispatches `MSG_FORCE_EC_CONVERT`.
+        if out.len() > MAX_EC_ADVISORY_CANDIDATES {
+            out.sort_unstable_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+            out.truncate(MAX_EC_ADVISORY_CANDIDATES);
+        }
         out
     }
 
@@ -648,15 +760,23 @@ impl PolicyEngine {
             // The earlier median-based classification didn't work for
             // 2-partition PSes (median == max → hot list empty), so
             // this min/max-match approach is what we use.
+            // F210-F4: partition qualifies as "hot" only when its own
+            // window MIN is still within 1/HOT_COLD_BAND_DIVISOR of the
+            // PS's hottest reading (sustained-high across its buckets);
+            // symmetric on cold. Excludes rotating hotspots that would
+            // otherwise appear on BOTH lists in the same advisory.
+            let qps_band = HOT_COLD_BAND_DIVISOR.max(1);
+            let qps_hot_min = qps_hottest / qps_band;
+            let qps_cold_max = qps_coldest.saturating_mul(qps_band);
             let (qps_hot, qps_cold) = if qps_fire {
                 let mut hot: Vec<u64> = parts
                     .iter()
-                    .filter(|t| t.2 == qps_hottest)
+                    .filter(|t| t.1 >= qps_hot_min && t.2 == qps_hottest)
                     .map(|t| t.0)
                     .collect();
                 let mut cold: Vec<u64> = parts
                     .iter()
-                    .filter(|t| t.1 == qps_coldest)
+                    .filter(|t| t.2 <= qps_cold_max && t.1 == qps_coldest)
                     .map(|t| t.0)
                     .collect();
                 hot.sort_unstable();
@@ -665,15 +785,18 @@ impl PolicyEngine {
             } else {
                 (Vec::new(), Vec::new())
             };
+            let size_band = HOT_COLD_BAND_DIVISOR.max(1) as u64;
+            let size_hot_min = size_hottest / size_band;
+            let size_cold_max = size_coldest.saturating_mul(size_band);
             let (size_hot, size_cold) = if size_fire {
                 let mut hot: Vec<u64> = parts
                     .iter()
-                    .filter(|t| t.4 == size_hottest)
+                    .filter(|t| t.3 >= size_hot_min && t.4 == size_hottest)
                     .map(|t| t.0)
                     .collect();
                 let mut cold: Vec<u64> = parts
                     .iter()
-                    .filter(|t| t.3 == size_coldest)
+                    .filter(|t| t.4 <= size_cold_max && t.3 == size_coldest)
                     .map(|t| t.0)
                     .collect();
                 hot.sort_unstable();
@@ -682,6 +805,15 @@ impl PolicyEngine {
             } else {
                 (Vec::new(), Vec::new())
             };
+            // F210-F4: if the band filter dropped every candidate on a
+            // triggering dimension, suppress the advisory for that
+            // dimension. Without this we'd still log a fire WARN but
+            // emit empty hot/cold lists.
+            let qps_fire = qps_fire && !qps_hot.is_empty() && !qps_cold.is_empty();
+            let size_fire = size_fire && !size_hot.is_empty() && !size_cold.is_empty();
+            if !qps_fire && !size_fire {
+                continue;
+            }
             let qps_ratio = qps_hottest / qps_coldest.max(1);
             let size_ratio = size_hottest / size_coldest.max(1);
             tracing::warn!(

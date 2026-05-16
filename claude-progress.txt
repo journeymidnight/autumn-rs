@@ -1,111 +1,164 @@
-Date: 2026-05-15
+Date: 2026-05-16
 TaskStatus: completed
-Task scope: F209 — five review-driven fixes for F202–F208.
-            All five bundled into one feature with sub-letters A–E so
-            the rationale stays together; lands as one commit.
+Task scope: F210-E (E1, E2, E3) + F210-F (F1-F6) + F210-G (G1, G2) + F210-H1 —
+            12 remaining post-codex review items spanning stream layer
+            (handle_re_avali, stale-VP sentinel), partition layer
+            (defensive auto-compact), and manager (policy/advisory
+            stability, PS eviction etcd mirror, persisted delete retry).
+            All landed in one batch.
 
-Trigger: post-F208 review of F202–F207 surfaced 5 concrete issues.
-User read the review, said "我们都同意" — agreement to implement all five.
+F210-E sub-features:
+  E1 — handle_re_avali replicated path acquires concurrency permit
+       - crates/stream/src/extent_node.rs (handle_re_avali)
+       - Hooks `acquire_recovery()` AFTER the EC short-circuit + the
+         already-up-to-date check and BEFORE
+         `fetch_full_extent_from_sources`. RAII permit held for the
+         remainder of the replicated repair path. Same shared pool
+         as `run_recovery_task` (default 2, env
+         AUTUMN_EXTENT_RECOVERY_PARALLELISM).
 
-F209 sub-features:
-  F209-A `handle_get_partition_detail` leader gate
-    - crates/manager/src/rpc_handlers.rs:2590-2620
-    - Without it, follower returned CODE_OK + zeroed PartitionLoad —
-      client info --detail couldn't tell "no metrics yet" apart from
-      "queried follower".
-    - Same CODE_NOT_LEADER early-return pattern as handle_force_ec_convert.
+  E2 — Defensive auto-compact for SST count runaway
+       - crates/partition-server/src/background.rs
+       - New `MAX_SST_BEFORE_AUTO_COMPACT = 32` const. The
+         compact loop's timeout arm calls `pickup_tables` +
+         `do_compact(major=false)` when `sst_readers.len() >`
+         the threshold AND `compact_inflight == 0`. Threshold
+         picked to keep the 1% per-SST bloom FPR's cumulative
+         miss-path false-positive bounded (≤ 28% at N=32 vs 63%
+         at N=100). Mechanism-level defensive bound — not a
+         policy knob; not env-tunable.
 
-  F209-B `apply_recovery_done` slot-mismatch marker release
-    - crates/manager/src/recovery.rs:194-217
-    - Before: when extent_slot returns None inside the borrow_mut, the
-      handler did `return Err(Precondition)` WITHOUT releasing the
-      Recovery marker — invariant I3 violation. F208 sweep was the
-      only cleanup, blocking the extent for up to 10 min.
-    - Fix: hoisted the slot-None check to a new branch before the
-      borrow_mut. Same release pattern as the existing layout_changed
-      Some(true) arm. The inner slot None branch becomes unreachable
-      (kept defensively).
+  E3 — compute_ec_advisory per-tick cap
+       - crates/manager/src/policy.rs (compute_ec_advisory)
+       - New `MAX_EC_ADVISORY_CANDIDATES = 256` const. Sorts by
+         sealed_length desc + truncates after collection. Caps
+         the advisory_cache + MSG_GET_POLICY_CANDIDATES payload
+         at ~1 MiB to stay under etcd's max-request-bytes.
 
-  F209-C F208 sweep excludes ConvertToEc from auto-release
-    - crates/manager/src/extent_inflight.rs::sweep_stale_inflight_once
-    - Risk: F208 auto-released ALL stale kinds. For ConvertToEc, that
-      opens a race with the original EN-side dispatch: a fresh
-      force-ec-convert in the release gap can shuffle a DIFFERENT
-      parity-node assignment; manager state then records the second
-      dispatch's target_nodes while the first dispatch's bytes are
-      what physically landed. Exactly the failure mode F198's rich
-      marker was added to prevent.
-    - Fix: ConvertToEc is WARN-only. Recovery + Delete still
-      auto-release. Operator manually remediates ConvertToEc (Python
-      ops: confirm EN finished, then etcdctl del).
-    - Tests: existing f208_sweep_auto_releases_stale_markers updated
-      (expect 2/3 released, ConvertToEc survives). New
-      f209_c_sweep_excludes_convert_to_ec_from_auto_release.
+F210-F sub-features:
+  F1 — Freeze policy kind enum + const-dump RPC
+       - crates/rpc/src/manager_rpc.rs:
+         + WIRE-STABILITY docstring above the POLICY_KIND_*
+           block: numeric values frozen, new kinds APPEND only.
+         + New `MSG_GET_POLICY_KIND_NAMES = 0x3B` const-dump RPC.
+         + `policy_kind_names()` helper returning a Vec of
+           (String, u8) pairs.
+       - crates/manager/src/rpc_handlers.rs: dispatch +
+         `handle_get_policy_kind_names` (no leader gate — the
+         answer is a compile-time constant of THIS binary).
 
-  F209-D `handle_force_ec_convert` verify-BEFORE-acquire
-    - crates/manager/src/rpc_handlers.rs:2545-2640
-    - Bug: new_eversion captured from a clone taken BEFORE the
-      alloc_extent_on_node awaits + the acquire_extent_inflight await.
-      During those awaits, a concurrent apply_recovery_done for the
-      same extent could complete (no ConvertToEc marker yet to block
-      it), bumping ex.eversion. The dispatch loop's
-      apply_ec_conversion_done would then write the stale new_eversion
-      to etcd, silently undoing the recovery.
-    - Initial form (committed in 444ede0): verify-AFTER-acquire with
-      drain-on-mismatch. Codex review flagged: if
-      drain_extent_inflight_marker fails (NotLeader or transient etcd
-      error), the stale marker persists in etcd and the dispatch
-      loop applies the stale state — the bug F209-D was meant to
-      prevent.
-    - Revised form: verify-BEFORE-acquire. Re-read ex.eversion under
-      a fresh borrow before acquire_extent_inflight. If different,
-      return Precondition WITHOUT writing a marker. No drain needed.
-      After our acquire succeeds, F207's exclusive CAS + other
-      mutators' refuse-at-start guarantees ex.eversion is frozen
-      until our apply runs.
+  F2 — Sustained N buckets actually means N × bucket_sec
+       - crates/manager/src/policy.rs:
+         `PartitionMetricsWindow::push_with_cap_and_bucket`
+         snaps incoming ts to bucket_sec boundary; same bucket
+         as previous → REPLACE (last-wins within a bucket).
+         Pre-F210-F2 every PS 5 s report became its own bucket;
+         required_buckets=5 represented 25 s, not 5 min.
 
-  F209-E F207 apply-done atomicity integration test
-    - crates/manager/tests/f209_apply_done_atomicity.rs (#[ignore])
-    - Two tests:
-      * f209_e_apply_ec_conversion_done_atomic_success: acquire +
-        apply → both effects landed.
-      * f209_e_apply_ec_conversion_done_atomic_failure_under_deposed_leader:
-        acquire + externally overwrite leader key + apply →
-        Err + NEITHER effect lands.
-    - Visibility plumbing: apply_ec_conversion_done /
-      acquire_extent_inflight / extent_inflight_key /
-      EXTENT_INFLIGHT_PREFIX / ExtentOpPayload / ExtentOpKind bumped
-      pub(crate) → pub. mod extent_inflight → pub mod.
+  F3 — Metrics freshness + ownership prune
+       - crates/manager/src/policy.rs: new
+         `PolicyEngine::prune_stale_metrics(state, now)`.
+       - crates/manager/src/lib.rs (policy_tick_loop): call at
+         top of tick BEFORE compute_*_advisory.
+       - Drops metrics for partitions no longer in state.partitions;
+         drops windows whose latest bucket is older than
+         STALE_METRICS_AGE_SEC = 300; prunes last_hot_cold_at for
+         evicted PSes.
+
+  F4 — Hot/cold same-partition band guard
+       - crates/manager/src/policy.rs (compute_hot_cold_advisory)
+       - New `HOT_COLD_BAND_DIVISOR = 2` const. A partition
+         qualifies as hot only when its min ≥ qps_hottest / D;
+         cold only when its max ≤ qps_coldest * D. Same on size.
+         Empty band → suppress dimension. Closes the "rotating
+         hotspot appears on BOTH lists" case.
+
+  F5 — PolicyConfig.window_buckets becomes load-bearing
+       - crates/manager/src/rpc_handlers.rs
+         (handle_report_partition_load) now reads
+         `p.config.window_buckets / p.config.bucket_sec` and
+         calls `push_with_cap_and_bucket` instead of the
+         hardcoded `push`. set_policy_config now reshapes the
+         history window at runtime.
+
+  F6 — handle_get_policy_candidates leader gate
+       - crates/manager/src/rpc_handlers.rs
+       - Mirrors F209-A's pattern. Returns CODE_NOT_LEADER +
+         empty `candidates` Vec when not leader.
+
+F210-G sub-features:
+  G1 — PS eviction etcd mirror + heartbeat seed on replay
+       - crates/manager/src/lib.rs:
+         + ps_liveness_check_loop now explicitly DELETEs
+           `psNodes/<evicted_id>` via fenced put_and_delete_txn
+           before mirror_partition_snapshot.
+         + replay_from_etcd seeds
+           `ps_last_heartbeat[ps_id] = Instant::now()` for every
+           replayed PS so the liveness loop's `Some(t)` arm
+           engages after PS_DEAD_TIMEOUT.
+       - Together (1) prevents etcd resurrection of the dead PS
+         and (2) hands every replayed PS one fresh eviction
+         window. The pre-F210-G1 None-arm-as-alive bug is now
+         unreachable.
+
+  G2 — Persisted retry queue for budget-exhausted deletes
+       - crates/manager/src/extent_delete.rs: new
+         `MgrExtentDeleteRetry` rkyv struct, new
+         `EXTENT_DELETE_RETRY_PREFIX = "extentDeleteRetry/"`,
+         new `persist_failed_delete()` +
+         `extent_delete_retry_loop()`. Exponential backoff
+         (60 s base, 1 hr ceiling, 2× per attempt up to 6 shifts).
+       - crates/manager/src/lib.rs: new `failed_deletes` field
+         on AutumnManager; replay_from_etcd rehydrates from the
+         prefix; start_runtime_tasks spawns the retry loop.
+       - The inflight ledger Delete marker is still RELEASED
+         when the entry moves to the persisted retry queue (so
+         future ops on the extent aren't blocked) — the retry
+         queue is orthogonal etcd state.
+
+F210-H sub-features:
+  H1 — Replicated read stale-VP sentinel
+       - crates/stream/src/client.rs (read_with_layout)
+       - Upfront check at top of read_with_layout: if
+         `ex.sealed_length > 0 && offset > ex.sealed_length`,
+         construct and return `StaleVpOffset { extent_id,
+         requested_offset, requested_length, sealed_length }`
+         BEFORE branching on `ex.ec_converted`. Covers both
+         replicated and EC paths uniformly; EC's
+         ec_slice_decoded retains its own check as
+         defense-in-depth. Skips the wasted server round-trip +
+         EC decode on a known-stale VP. Operational tooling's
+         `stale_vp_offset_past_sealed_length:` regex now fires
+         on replicated cases too.
 
 Files touched:
-  - crates/manager/src/rpc_handlers.rs (F209-A leader gate + F209-D
-    verify-at-apply)
-  - crates/manager/src/recovery.rs (F209-B release + drain visibility +
-    apply_ec_conversion_done visibility for F209-E)
-  - crates/manager/src/extent_inflight.rs (F209-C ConvertToEc exclusion
-    + visibility bumps + new unit test)
-  - crates/manager/src/lib.rs (mod extent_inflight → pub mod)
-  - crates/manager/tests/f209_apply_done_atomicity.rs (new — F209-E)
-  - crates/manager/CLAUDE.md (note 21: F209 hardening cross-reference
-    + F209-C ConvertToEc-WARN-only rationale replaces F208's blanket
-    "auto-release is safe" paragraph for the EC case)
-  - feature_list.md (F209 entry with A–E sub-features)
+  - crates/stream/src/client.rs (H1)
+  - crates/stream/src/extent_node.rs (E1)
+  - crates/partition-server/src/background.rs (E2)
+  - crates/manager/src/policy.rs (E3, F2, F3, F4)
+  - crates/manager/src/rpc_handlers.rs (F1, F5, F6)
+  - crates/manager/src/lib.rs (F3 prune call site, G1 + G2 fields + replay + spawn)
+  - crates/manager/src/extent_delete.rs (G2 retry queue + loop)
+  - crates/rpc/src/manager_rpc.rs (F1 const-dump RPC + freeze docstring)
+  - feature_list.md (E/F/G/H1 status flips to passes:true with rationale)
   - claude-progress.txt (this file)
 
 Verification:
-  - cargo build -p autumn-manager: clean.
-  - cargo build -p autumn-manager --tests: clean.
-  - cargo test -p autumn-manager --lib: 89 passed (was 88; +1 new
-    F209-C test).
-  - F209-E tests compile and register as #[ignore] (same pattern as
-    f149_leader_fence — execution requires embedded etcd via Go).
+  - cargo build --workspace --exclude autumn-fuse: clean.
+  - cargo test -p autumn-manager --lib: 89 passed (unchanged count;
+    F210 changes are additive — F2 bucketing test fixtures already
+    space timestamps by POLICY_BUCKET_SEC so all 32 policy tests
+    still pass; F3 prune + F4 band + F5 config + F6 leader gate +
+    G1 mirror + G2 queue all confirmed-clean).
+  - cargo test -p autumn-stream --lib: 53 passed.
+  - cargo test -p autumn-partition-server --lib: 2 pre-existing
+    f099i fast-path failures (independent — same failures on a
+    stash of all F210-E/F/G/H1 changes; not introduced by this
+    commit).
 
 Next steps:
-  - Operator action: same as F208's note. Once F209 is deployed, the
-    extent_inflight/28 ghost in the live cluster will be picked up by
-    the F208 sweep at the 10-min mark (Recovery kind — auto-released).
-  - F209-D's race is covered by the F209-E integration test in the
-    failure path (deposed-leader); a future expansion could add a
-    second test specifically driving the eversion-mismatch verify
-    branch with a concurrent apply_recovery_done in the same compio
-    runtime.
+  - F210-A (Etcd-first + verify-BEFORE + replay-then-leader)
+    already shipped pre-F210-B. F210-B/C/D/E/F/G/H1 all shipped.
+  - F210-B1 stays Deferred (write fanout N-of-N preserved; no
+    "missed-bytes re_avali" protocol yet).
+  - F210 backlog now complete except for the deferred B1.

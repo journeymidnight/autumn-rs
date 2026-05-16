@@ -2180,6 +2180,27 @@ impl StreamClient {
         length: u32,
         ex: &ExtentInfo,
     ) -> Result<(Vec<u8>, u32)> {
+        // F210-H1: mirror the F204 `StaleVpOffset` sentinel for the
+        // replicated path. Pre-F210-H1 only `ec_slice_decoded` produced
+        // it; a VP read on a sealed replicated extent whose offset was
+        // past `sealed_length` was silently short-circuited by the
+        // server (`handle_read_bytes` returns `code=OK end=total_len
+        // payload=[]` when `read_offset > total_len`). Operations
+        // grepping the wire contract `stale_vp_offset_past_sealed_length:`
+        // never saw the replicated case. Detecting upfront here covers
+        // BOTH layouts and skips the wasted server round-trip / EC
+        // decode on a known-stale VP. Matches `ec_slice_decoded`'s
+        // `if start > full_payload.len()` semantics — only fires when
+        // the extent has a recorded `sealed_length`, since pre-seal
+        // there's no authoritative bound to check against.
+        if ex.sealed_length > 0 && offset as u64 > ex.sealed_length {
+            return Err(anyhow::Error::new(StaleVpOffset {
+                extent_id,
+                requested_offset: offset,
+                requested_length: length,
+                sealed_length: ex.sealed_length,
+            }));
+        }
         if ex.ec_converted {
             return self.ec_subrange_read(extent_id, offset, length, ex).await;
         }

@@ -26,8 +26,37 @@ use std::time::Duration;
 
 use autumn_common::error::AppError;
 use autumn_rpc::manager_rpc::*;
+use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::AutumnManager;
+
+/// F210-G2: long-lived persisted retry queue for deletes whose primary
+/// retry budget (`MAX_ATTEMPTS = 60`) was exhausted. Etcd prefix. Without
+/// this, deleted-extent metadata in etcd already had refs=0 but the
+/// physical files persisted on the offline replica until that node's
+/// startup `MSG_RECONCILE_EXTENTS` round-trip eventually reaped them —
+/// unbounded "free space leak" for any node that stayed down longer
+/// than 2 minutes. Persisting lets the manager keep retrying with
+/// backoff after failover or process restart.
+pub(crate) const EXTENT_DELETE_RETRY_PREFIX: &str = "extentDeleteRetry/";
+
+pub(crate) fn extent_delete_retry_key(extent_id: u64) -> String {
+    format!("{EXTENT_DELETE_RETRY_PREFIX}{extent_id}")
+}
+
+/// rkyv-persisted payload for the retry queue. `attempts` carries the
+/// accumulated retry count (used by the in-memory backoff calculator);
+/// `last_attempt_at` is the unix-epoch seconds of the most recent try
+/// (resets after a manager restart — recomputed retry timing is
+/// equivalent to "try now" which is acceptable since the queue is
+/// already a backstop path).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrExtentDeleteRetry {
+    pub extent_id: u64,
+    pub pending_addrs: Vec<String>,
+    pub attempts: u32,
+    pub last_attempt_at: i64,
+}
 
 /// One outstanding delete the manager still needs to ship to one or
 /// more replicas. F207-C: the etcd persistence side lives in the
@@ -48,6 +77,31 @@ pub(crate) struct PendingDelete {
 /// At ~2s per sweep, 60 attempts = ~2 min retry window per replica.
 const MAX_ATTEMPTS: u32 = 60;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
+
+/// F210-G2: backoff cadence for the persisted retry loop. Each
+/// `MgrExtentDeleteRetry` increments `attempts` once per attempt; the
+/// backoff for the next try is `RETRY_BACKOFF_BASE * 2^min(attempts, MAX_SHIFT)`,
+/// floor `RETRY_BACKOFF_BASE`, ceiling `RETRY_BACKOFF_MAX`. With base
+/// = 60 s and max shift = 6, the schedule grows 60 s → 2 min → 4 min →
+/// 8 min → 16 min → 32 min → 1 hr. Ceiling = 1 hr keeps the loop
+/// retrying long-down extents without spamming.
+const RETRY_LOOP_INTERVAL: Duration = Duration::from_secs(60);
+const RETRY_BACKOFF_BASE_SECS: i64 = 60;
+const RETRY_BACKOFF_MAX_SECS: i64 = 3600;
+const RETRY_BACKOFF_MAX_SHIFT: u32 = 6;
+
+fn retry_backoff_secs(attempts: u32) -> i64 {
+    let shift = attempts.min(RETRY_BACKOFF_MAX_SHIFT);
+    let v = RETRY_BACKOFF_BASE_SECS.saturating_mul(1i64 << shift);
+    v.min(RETRY_BACKOFF_MAX_SECS).max(RETRY_BACKOFF_BASE_SECS)
+}
+
+fn epoch_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 impl AutumnManager {
     /// F207-C: enqueue pending deletes. Acquires a Delete entry in the
@@ -151,11 +205,31 @@ impl AutumnManager {
                         extent_id = entry.extent_id,
                         attempts = entry.attempts,
                         remaining_replicas = entry.pending_addrs.len(),
-                        "F109 extent delete: max retries exhausted; orphan files will be reaped on node-startup reconcile",
+                        "F109 extent delete: max retries exhausted in primary loop; \
+                         moving to F210-G2 persisted retry queue",
                     );
-                    // Even on exhaustion, release the ledger so the
-                    // extent isn't blocked for future ops. The orphan
-                    // files are reaped by the per-node startup reconcile.
+                    // F210-G2: instead of abandoning to the
+                    // node-startup reconcile backstop (unbounded
+                    // free-space-leak window for any node that stays
+                    // down >2 min), persist the pending addrs to the
+                    // `extentDeleteRetry/` etcd prefix so the slow
+                    // retry loop keeps trying with backoff across
+                    // manager restart / leader failover. The inflight
+                    // ledger marker is still released so future ops on
+                    // the extent aren't blocked — the retry queue is
+                    // an independent etcd record orthogonal to the
+                    // inflight ledger.
+                    if let Err(e) = self
+                        .persist_failed_delete(entry.extent_id, entry.pending_addrs.clone())
+                        .await
+                    {
+                        tracing::error!(
+                            extent_id = entry.extent_id,
+                            error = %e,
+                            "F210-G2: persist failed delete to etcd failed; \
+                             will fall back to node-startup reconcile"
+                        );
+                    }
                     self.release_delete_marker(entry.extent_id).await;
                 }
             }
@@ -220,6 +294,129 @@ impl AutumnManager {
             // are already unreachable.
         }
         addrs
+    }
+
+    /// F210-G2: persist a long-lived retry entry to etcd + the in-memory
+    /// shadow. Idempotent: re-persisting an existing entry simply updates
+    /// the `attempts` / `last_attempt_at` fields.
+    pub(crate) async fn persist_failed_delete(
+        &self,
+        extent_id: u64,
+        pending_addrs: Vec<String>,
+    ) -> Result<(), AppError> {
+        let entry = MgrExtentDeleteRetry {
+            extent_id,
+            pending_addrs,
+            attempts: 0,
+            last_attempt_at: epoch_seconds(),
+        };
+        if let Some(etcd) = &self.etcd {
+            let key = extent_delete_retry_key(extent_id);
+            let value = autumn_rpc::manager_rpc::rkyv_encode(&entry).to_vec();
+            etcd.put_msgs_txn(vec![(key, value)]).await?;
+        }
+        self.failed_deletes
+            .borrow_mut()
+            .insert(extent_id, entry);
+        Ok(())
+    }
+
+    /// F210-G2: slow retry loop for entries persisted to the
+    /// `extentDeleteRetry/` etcd prefix. Wakes every
+    /// `RETRY_LOOP_INTERVAL` (1 min). For each entry whose `last_attempt_at`
+    /// + per-entry exponential backoff has elapsed, retries every
+    /// remaining replica address via `try_delete_one`. On success
+    /// (every replica acked), deletes the etcd key. On partial / total
+    /// failure, increments `attempts` and updates `last_attempt_at` so
+    /// the next attempt is further out.
+    ///
+    /// Cleanup on failover: a new leader's `replay_from_etcd` rehydrates
+    /// `failed_deletes` from the etcd prefix; `attempts` is reset to 0
+    /// implicitly (we trust the persisted counter), `last_attempt_at`
+    /// stays as written so the new leader respects the in-flight
+    /// backoff window. If the new leader wakes inside the backoff
+    /// window, the first tick is a no-op for that entry and the next
+    /// tick after the window expires picks it up.
+    pub(crate) async fn extent_delete_retry_loop(self) {
+        loop {
+            compio::time::sleep(RETRY_LOOP_INTERVAL).await;
+            if !self.leader.get() {
+                continue;
+            }
+
+            let now = epoch_seconds();
+            let due: Vec<MgrExtentDeleteRetry> = {
+                let queue = self.failed_deletes.borrow();
+                queue
+                    .values()
+                    .filter(|e| now - e.last_attempt_at >= retry_backoff_secs(e.attempts))
+                    .cloned()
+                    .collect()
+            };
+            if due.is_empty() {
+                continue;
+            }
+
+            for mut entry in due {
+                let extent_id = entry.extent_id;
+                let mut still_pending = Vec::new();
+                let addrs = std::mem::take(&mut entry.pending_addrs);
+                for addr in addrs {
+                    let acked = self.try_delete_one(&addr, extent_id).await;
+                    if !acked {
+                        still_pending.push(addr);
+                    }
+                }
+                if still_pending.is_empty() {
+                    tracing::info!(
+                        extent_id,
+                        attempts = entry.attempts + 1,
+                        "F210-G2: persisted-retry delete finally acked on every replica",
+                    );
+                    self.failed_deletes.borrow_mut().remove(&extent_id);
+                    if let Some(etcd) = &self.etcd {
+                        let key = extent_delete_retry_key(extent_id);
+                        if let Err(e) =
+                            etcd.put_and_delete_txn(Vec::new(), vec![key]).await
+                        {
+                            tracing::warn!(
+                                extent_id,
+                                error = %e,
+                                "F210-G2: failed to clear retry etcd key; will re-clear next tick"
+                            );
+                            // Re-insert so the next tick retries clearing.
+                            self.failed_deletes.borrow_mut().insert(
+                                extent_id,
+                                MgrExtentDeleteRetry {
+                                    extent_id,
+                                    pending_addrs: Vec::new(),
+                                    attempts: entry.attempts.saturating_add(1),
+                                    last_attempt_at: now,
+                                },
+                            );
+                        }
+                    }
+                    continue;
+                }
+                entry.pending_addrs = still_pending;
+                entry.attempts = entry.attempts.saturating_add(1);
+                entry.last_attempt_at = now;
+                if let Some(etcd) = &self.etcd {
+                    let key = extent_delete_retry_key(extent_id);
+                    let value = autumn_rpc::manager_rpc::rkyv_encode(&entry).to_vec();
+                    if let Err(e) = etcd.put_msgs_txn(vec![(key, value)]).await {
+                        tracing::warn!(
+                            extent_id,
+                            error = %e,
+                            "F210-G2: failed to update retry etcd key; in-memory still updated"
+                        );
+                    }
+                }
+                self.failed_deletes
+                    .borrow_mut()
+                    .insert(extent_id, entry);
+            }
+        }
     }
 
     async fn try_delete_one(&self, addr: &str, extent_id: u64) -> bool {

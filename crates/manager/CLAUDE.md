@@ -949,3 +949,81 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       (`#[ignore]`, requires embedded etcd) asserts the I3
       atomicity claim end-to-end: success path lands both effects,
       F149-fence-failed apply rolls back both atomically.
+
+22. **F210-F/G policy + replay hardening (2026-05-16).**
+    Closes a backlog of correctness gaps in the advisory pipeline,
+    the PS-liveness etcd mirror, and the long-tail extent-delete
+    retry queue. All are independent additive fixes.
+
+    - **F210-F1** Wire-stability contract on the `POLICY_KIND_*` enum:
+      numeric values frozen, new kinds APPEND only.
+      `MSG_GET_POLICY_KIND_NAMES = 0x3B` const-dump RPC +
+      `policy_kind_names()` helper let external controllers
+      introspect the binary's actual mapping instead of hardcoding
+      values that drift across releases.
+    - **F210-F2** `PartitionMetricsWindow::push_with_cap_and_bucket`
+      snaps `ts` to `bucket_sec` boundary; same-bucket pushes
+      REPLACE. `take(required_buckets)` now spans the documented
+      `required_buckets × bucket_sec` seconds regardless of report
+      cadence. Pre-F210-F2 every 5 s PS report became its own
+      bucket → all windowed advisories' "sustained over 5 min" was
+      off by 12×.
+    - **F210-F3** `PolicyEngine::prune_stale_metrics(state, now)`
+      runs at top of `policy_tick_loop` before any compute_*. Drops
+      metrics for partitions not in `state.partitions` (post-split /
+      merge / PS-evict) and windows older than
+      `STALE_METRICS_AGE_SEC = 300`. Also prunes `last_hot_cold_at`
+      for evicted PSes. Closes the "zombie metrics keep firing
+      advisories forever" gap.
+    - **F210-F4** Hot/cold band guard. A partition qualifies as
+      "hot" only when its min ≥ `qps_hottest / HOT_COLD_BAND_DIVISOR`
+      (D=2), and "cold" only when max ≤ `qps_coldest * D`. Same on
+      size. Empty band → suppress dimension entirely. Closes the
+      "rotating hotspot on both lists" case.
+    - **F210-F5** `handle_report_partition_load` now reads
+      `p.config.window_buckets / bucket_sec` and dispatches
+      `push_with_cap_and_bucket`. `PolicyConfig.window_buckets` is
+      now load-bearing.
+    - **F210-F6** `handle_get_policy_candidates` leader gate
+      (returns `CODE_NOT_LEADER` + empty list on follower). Sister
+      to F209-A.
+    - **F210-G1** PS eviction etcd mirror now explicit. The
+      `ps_liveness_check_loop` issues a fenced
+      `put_and_delete_txn(deletes=[psNodes/<id>])` for each dead PS
+      before calling `mirror_partition_snapshot`. Plus
+      `replay_from_etcd` seeds `ps_last_heartbeat[ps_id] =
+      Instant::now()` for every replayed PS so the liveness loop's
+      `Some(t)` arm engages within `PS_DEAD_TIMEOUT` instead of the
+      `None`-arm-as-alive zombie. The two together close the
+      failover-resurrects-dead-PS path without persisting `Instant`
+      to etcd (which would require wall-clock serialization).
+    - **F210-G2** Persisted retry queue for budget-exhausted extent
+      deletes. New `extentDeleteRetry/<id>` prefix +
+      `MgrExtentDeleteRetry` rkyv struct. When
+      `extent_delete_loop` exhausts the in-memory 60-attempt
+      budget, the entry is persisted to etcd + moved to
+      `failed_deletes: HashMap<u64, MgrExtentDeleteRetry>` instead
+      of abandoned to the per-node startup reconcile. A new
+      `extent_delete_retry_loop` (1 min cadence) walks the map
+      with per-entry exponential backoff (60 s → 1 hr ceiling,
+      2× per attempt up to 6 shifts) and retries every remaining
+      replica. On full ack, etcd key + map entry are removed. The
+      inflight ledger Delete marker is still RELEASED when the
+      entry transitions to this queue, so future ops on the extent
+      aren't blocked — the retry queue is independent etcd state.
+      Replay rehydrates the map from the prefix; `attempts` +
+      `last_attempt_at` survive failover so backoff windows are
+      respected by the new leader.
+
+    What this does NOT change:
+    - F207 unified inflight ledger semantics — unchanged.
+    - F208 stale-marker sweep (still auto-releases Recovery +
+      Delete markers older than 10 min; ConvertToEc is WARN-only
+      per F209-C). F210-G2's retry queue is orthogonal: the
+      Delete marker is released the moment the entry enters the
+      retry queue, so F208's sweep never sees a stale Delete
+      marker coexisting with a long-lived retry entry.
+    - F149 leader fence on every etcd write txn — all new
+      mirrors (psNodes/ delete, extentDeleteRetry/) route through
+      `put_and_delete_txn` / `put_msgs_txn` which thread the
+      fence unchanged.

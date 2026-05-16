@@ -3798,6 +3798,21 @@ impl ExtentNode {
             }));
         }
 
+        // F210-E1: gate cross-extent re_avali concurrency through the
+        // shared recovery permit pool. Pre-F210-E1 only `run_recovery_task`
+        // acquired it; the replicated re_avali path
+        // (`fetch_full_extent_from_sources` + `file_pwrite_chunked`) had
+        // the same `payload × 2` transient working set as recovery but
+        // no cap, so a leader's recovery dispatch fan-out to several
+        // surviving nodes could push peak RAM proportional to
+        // `concurrent_re_avali × sealed_length` per node. Acquired AFTER
+        // the EC short-circuit and the already-up-to-date check so cheap
+        // requests don't consume a permit. Held until function exit via
+        // RAII. Permit pool shared with `run_recovery_task`; both are
+        // logically "bulk repair work" and benefit from a unified cap
+        // (env `AUTUMN_EXTENT_RECOVERY_PARALLELISM`, default 2).
+        let _rec_permit = self.concurrency_ctrl.acquire_recovery().await;
+
         let copied = self.fetch_full_extent_from_sources(&extent_info, &[]).await;
         let raw_payload = match copied {
             Ok(v) => v,

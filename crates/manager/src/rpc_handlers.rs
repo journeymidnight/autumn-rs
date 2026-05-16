@@ -176,6 +176,7 @@ impl AutumnManager {
             MSG_UPDATE_STREAM_EC => self.handle_update_stream_ec(payload).await,
             MSG_FORCE_EC_CONVERT => self.handle_force_ec_convert(payload).await,
             MSG_GET_PARTITION_DETAIL => self.handle_get_partition_detail(payload).await,
+            MSG_GET_POLICY_KIND_NAMES => self.handle_get_policy_kind_names(payload).await,
             _ => Err((
                 StatusCode::InvalidArgument,
                 format!("unknown msg_type {msg_type}"),
@@ -2520,12 +2521,44 @@ impl AutumnManager {
         &self,
         _payload: Bytes,
     ) -> HandlerResult {
+        // F210-F6: leader gate. Pre-F210-F6 the handler returned
+        // `advisory_cache` on any node, but only the leader's
+        // `policy_tick_loop` populates the cache (follower's stays
+        // empty). An external controller polling `MSG_GET_POLICY_CANDIDATES`
+        // against a follower silently received an empty candidate list
+        // — indistinguishable from "nothing to do" — and would never
+        // notice it was asking the wrong node. Same fix pattern as
+        // F209-A's `handle_get_partition_detail` gate.
+        if !self.leader.get() {
+            return Ok(rkyv_encode(&GetPolicyCandidatesResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                candidates: Vec::new(),
+            }));
+        }
         let p = self.policy.borrow();
         let candidates = p.advisory_cache.clone();
         Ok(rkyv_encode(&GetPolicyCandidatesResp {
             code: CODE_OK,
             message: String::new(),
             candidates,
+        }))
+    }
+
+    /// F210-F1: const-dump of the `POLICY_KIND_*` enum so external
+    /// controllers can introspect the wire mapping at startup rather
+    /// than hardcoding numeric values that may have drifted across
+    /// docs/code (the pre-F210-F1 off-by-one was caused by exactly
+    /// that drift). No leader gate — the answer is a compile-time
+    /// constant of THIS binary; any node can serve it.
+    pub(crate) async fn handle_get_policy_kind_names(
+        &self,
+        _payload: Bytes,
+    ) -> HandlerResult {
+        Ok(rkyv_encode(&GetPolicyKindNamesResp {
+            code: CODE_OK,
+            message: String::new(),
+            kinds: policy_kind_names(),
         }))
     }
 
@@ -2537,8 +2570,19 @@ impl AutumnManager {
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         let now = Self::epoch_seconds();
         let mut p = self.policy.borrow_mut();
+        // F210-F5: honour the configured `window_buckets / bucket_sec`
+        // (was hardcoded `POLICY_WINDOW_BUCKETS / POLICY_BUCKET_SEC`,
+        // making the `PolicyConfig` fields dead). With this in place
+        // `set_policy_config` actually reshapes the history window;
+        // tests using a small `window_buckets / bucket_sec` no longer
+        // need to call internal helpers.
+        let cap = p.config.window_buckets.max(1);
+        let bucket_sec = p.config.bucket_sec.max(1);
         for load in req.partitions {
-            p.metrics.entry(load.part_id).or_default().push(now, load);
+            p.metrics
+                .entry(load.part_id)
+                .or_default()
+                .push_with_cap_and_bucket(now, load, cap, bucket_sec);
         }
         drop(p);
         Ok(rkyv_encode(&CodeResp {
