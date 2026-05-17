@@ -19,8 +19,12 @@ Sub-feature status:
   F211-F EC convert auto-abandon on fenced coord:      completed
          - ec_conversion_dispatch_loop suspected-skip in place
          - ec_abandon.rs auto-abandon on fence implemented
-  F211-G Python OP policy script:                      not_completed
-         - Stub planned but not implemented yet
+  F211-G Python OP policy script:                      completed
+         - python/node_policy.py (10 subcommands, integrated
+           decommission flow, auto-reissue advisory)
+         - companion: crates/server/src/bin/autumn_op.rs Rust CLI
+           that shells out from the Python script (rkyv encoding
+           lives in Rust, no duplication)
   F211-H Recovery rate limiter + priority:             completed
          - per-source/target/global limits + backoff
          - mgr_recovery_stats RPC for monitoring

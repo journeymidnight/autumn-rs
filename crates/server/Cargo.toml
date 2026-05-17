@@ -20,6 +20,10 @@ path = "src/bin/partition_server.rs"
 name = "autumn-client"
 path = "src/bin/autumn_client.rs"
 
+[[bin]]
+name = "autumn-op"
+path = "src/bin/autumn_op.rs"
+
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true

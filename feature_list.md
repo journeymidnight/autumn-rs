@@ -2817,7 +2817,7 @@ Background: autumn-rs 当前节点死亡判定模型过于激进——心跳 10s
 - **Acceptance:**
   - 手动验证完整 runbook（fence → 等 recovery → remove → reissue-ec）。
   - dry-run 模式产生合理输出。
-- **passes:** false
+- **passes:** true
 
 ### F211-H · Recovery 节流 + 优先级（漏洞 #1）
 - **Trigger:** 一个大节点死亡 = 几千 extent 同时需 recovery；当前无任何限流，会饱和网络 + 打爆源/目标节点 IO + 拖慢 client。
