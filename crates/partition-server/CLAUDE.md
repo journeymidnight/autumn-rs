@@ -19,13 +19,13 @@ Accept OS thread (blocking)
 
 Partition threads — 2 OS threads per partition:
 ├─ part-N (P-log): OWNS
-│     • merged_partition_loop (request dispatch + group-commit SQ/CQ)
+│     • partition_loop (request dispatch + group-commit SQ/CQ)
 │     • fd-drain task: fd_rx.next() → compio::TcpStream → spawn ps-conn task
 │     • ps-conn task × K (one per live client connection, all on this runtime)
 │     • background_flush_loop, background_compact_loop, background_gc_loop
 │     • PartitionData (Rc<RefCell>) shared across all tasks on this runtime
 │     • dedicated StreamClient + ConnPool for log_stream/meta_stream
-│     • F099-D: write loop inlined into merged_partition_loop (no spawn/oneshot)
+│     • F099-D: write loop inlined into partition_loop (no spawn/oneshot)
 │     • F099-J: ps-conn tasks collocated here; per-request mpsc hop is now
 │       same-thread (no eventfd, no cross-thread futex).
 ├─ part-N-bulk (P-bulk): flush_worker_loop
@@ -49,13 +49,13 @@ progress concurrently with SST uploads.
 **How ps-conn handoff works (F099-J + F099-K)**:
 - Post F099-K, each partition OS thread binds its OWN `compio::net::TcpListener`
   on a unique port (`base_port + ord`) and runs its own accept loop + ps-conn
-  tasks on the SAME compio runtime as `merged_partition_loop`. The main thread
+  tasks on the SAME compio runtime as `partition_loop`. The main thread
   does NOT forward fds across partitions; clients connect directly to the
   owning partition's port (part_addr reported via `MSG_REGISTER_PARTITION_ADDR`
   and served to clients via `GetRegions.part_addrs`).
 - Each ps-conn task runs `handle_ps_connection` on THIS runtime. Its
   `req_tx.send(req).await` is a same-thread mpsc send; the matching
-  `req_rx.next().await` inside `merged_partition_loop` wakes via a local
+  `req_rx.next().await` inside `partition_loop` wakes via a local
   Waker (Rc-based) — no eventfd, no cross-thread futex.
 
 **ps-conn handler — F099-I true SQ/CQ inner loop (commit f099i)**:
@@ -154,7 +154,7 @@ by partition id.
 │  │  meta_stream_id  ← TableLocations checkpoint      │    │
 │  │                                                   │    │
 │  │  (F099-D: no write_tx — writes come directly from │    │
-│  │   req_rx via merged_partition_loop)                │    │
+│  │   req_rx via partition_loop)                │    │
 │  │  seq_number: monotonic MVCC counter               │    │
 │  │  has_overlap: AtomicU32                           │    │
 │  └───────────────────────────────────────────────────┘   │
@@ -198,8 +198,8 @@ Put(key, value, part_id, must_sync):
               encode Frame::response }` onto the per-conn inflight
      FuturesUnordered. MULTIPLE frames from the same TCP read end up in
      the inflight set concurrently.
-  2. Same-thread mpsc: PartitionRequest delivered into merged_partition_loop.
-  3. P-log merged_partition_loop: decode PutReq inline, push a
+  2. Same-thread mpsc: PartitionRequest delivered into partition_loop.
+  3. P-log partition_loop: decode PutReq inline, push a
      WriteRequest with a direct `WriteResponder::Put { outer: resp_tx, key }`
      into the `pending` Vec. NO compio::spawn, NO inner oneshot.
   4. ps-conn awaits the outer resp_tx via the inflight future — the SAME
@@ -209,7 +209,7 @@ Put(key, value, part_id, must_sync):
      `tx_bufs` via ONE `write_vectored_all` syscall — coalescing all Put
      responses that became ready since the previous flush.
 
-merged_partition_loop (per partition, F099-D fold-in of the old
+partition_loop (per partition, F099-D fold-in of the old
                        background_write_loop_r1):
   OWNS:   FuturesUnordered<Pin<Box<dyn Future<Output = InflightCompletion>>>>
   CAP:    AUTUMN_PS_INFLIGHT_CAP (default 8, range [1, 64])
@@ -275,7 +275,7 @@ period always launches (avoiding starvation on low-load streams).
 ### In-order Phase 3 commit (F210-C1, post-2026-05-15)
 
 Phase 2 futures execute concurrently up to `ps_inflight_cap()`, but
-`merged_partition_loop` uses **`FuturesOrdered`** (not
+`partition_loop` uses **`FuturesOrdered`** (not
 `FuturesUnordered`) so Phase 3 yields are strictly in launch order =
 strictly in seq order. This is a load-bearing invariant for recovery
 correctness.
@@ -312,7 +312,7 @@ Properties that still hold (unchanged from pre-F210-C1):
 ### Cross-layer SQ/CQ stack (post-R4)
 
 ```
-┌─ PS merged_partition_loop  (this crate, 4.4 + F099-D)        ┐
+┌─ PS partition_loop  (this crate, 4.4 + F099-D)        ┐
 │    FU<InflightCompletion>, cap 8                              │
 │    (was background_write_loop_r1 before F099-D; merged with   │
 │     the request-dispatch loop to remove the per-Put spawn +   │
@@ -805,7 +805,7 @@ surrounding scheduler/cooldown logic (the controller itself was clean):
 
 ## Partition Split
 
-`handle_split_part` runs inline on `merged_partition_loop` (the P-log
+`handle_split_part` runs inline on `partition_loop` (the P-log
 task) via `dispatch_partition_rpc`, so all partition-state mutations are
 single-writer on the partition thread.
 
@@ -908,7 +908,7 @@ simple and authoritative.
 
 ## Fault Recovery: LockedByOther Self-Eviction
 
-If the `merged_partition_loop` receives a `CODE_LOCKED_BY_OTHER` error from the stream layer
+If the `partition_loop` receives a `CODE_LOCKED_BY_OTHER` error from the stream layer
 (meaning a newer partition owner has taken the lock), it sets a `locked_by_other` flag.
 The main partition loop checks this flag on each request and exits if set.
 This prevents split-brain where two PS nodes serve the same partition.
@@ -1009,7 +1009,7 @@ post-restart.
 
 **The three fixes:**
 
-1. **F120-A — imm depth cap + back-pressure.** `merged_partition_loop` reads
+1. **F120-A — imm depth cap + back-pressure.** `partition_loop` reads
    `imm_full = part.imm.len() >= MAX_IMM_DEPTH` at top of loop. When full it
    skips both batch launches (B) and `req_rx.next()` (D), only polling
    `inflight.next()` and a new `imm_drained_rx` channel. `flush_one_imm`
@@ -1019,7 +1019,7 @@ post-restart.
    `MAX_IMM_DEPTH * FLUSH_MEM_BYTES + active.bytes` = 1.25 GB.
 
 2. **F120-B — WAL-gap forced rotate.** After each iteration of
-   `merged_partition_loop`, compute `gap = active.bytes + Σ imm[i].bytes`.
+   `partition_loop`, compute `gap = active.bytes + Σ imm[i].bytes`.
    If `gap > MAX_WAL_GAP` AND `imm.len() < MAX_IMM_DEPTH`, call
    `rotate_active`. Bounds replay window for workloads that don't fill
    `FLUSH_MEM_BYTES` before triggering rotate (e.g. mostly-large-value
@@ -1027,7 +1027,7 @@ post-restart.
 
 3. **F120-C — graceful shutdown.** New `PartitionServer::shutdown()` sends
    a `oneshot::Sender<()>` per partition through `drain_tx`. The
-   `merged_partition_loop` picks it up via select, sets `drain_ack`, exits
+   `partition_loop` picks it up via select, sets `drain_ack`, exits
    the main loop, runs the existing tail-drain block (in-flight + pending),
    THEN rotates `active` and loops `flush_one_imm` until imm empties,
    replies on the oneshot, exits. `serve_until_shutdown(addr,
@@ -1047,7 +1047,7 @@ post-restart.
 
 5. **No local WAL file** — logStream is the sole WAL. All writes (small and large) go to logStream via `append_batch`. Recovery reads logStream from the VP head checkpoint in metaStream. If no checkpoint exists (tables is empty AND vp_eid == 0), recovery replays logStream from the very first extent, offset 0 — this covers partitions that accepted writes but were killed before their first flush. Unflushed imm tables that are in memory are also covered: logStream contains all records newer than the last SSTable flush.
 
-6. **Group commit batching (post-F178)** — the merged_partition_loop drains up to MAX_WRITE_BATCH (256) requests per RPC cycle. The batch's `must_sync` is the OR of caller flags only; the F150 Phase B rotation-trigger barrier (which auto-promoted `must_sync=true` when the active memtable would cross `FLUSH_MEM_BYTES`) was removed in F178 Phase 2. Durability is now guaranteed in two complementary places:
+6. **Group commit batching (post-F178)** — the partition_loop drains up to MAX_WRITE_BATCH (256) requests per RPC cycle. The batch's `must_sync` is the OR of caller flags only; the F150 Phase B rotation-trigger barrier (which auto-promoted `must_sync=true` when the active memtable would cross `FLUSH_MEM_BYTES`) was removed in F178 Phase 2. Durability is now guaranteed in two complementary places:
    - **Per-write coverage**: the extent-node's per-extent fsync coalescer (F178 Phase 1) fires `sync_data` every 1-5 ms; every append's bytes become durable within one coalesce window regardless of the AppendReq.must_sync flag.
    - **Flush barrier**: `flush_one_imm` (and `flush_one_imm_local`) call `part_sc.await_log_synced_to(vp_extent_id, vp_offset)` BEFORE uploading the SST. Quorum-min of log_stream replicas must report `last_synced >= vp_offset` first. This guarantees that every byte the imm's ValuePointers reference is durable on a quorum BEFORE the SST that names them is checkpointed. On the happy path this waits ≈ 0 because the coalescer fires every 2 ms in parallel with SST build; on the worst case it waits one coalesce window.
    Why this is better than F150 Phase B: the rotation-triggering writer no longer pays a 5-15 ms (real SSD) fsync cost as a tail-latency spike — every Put pays the same 1-5 ms coalesce floor. The fsync work moves entirely to background flush, latency-invisible to clients. F178 Phase 3 removed `--nosync` from CLI surfaces; the `must_sync` field on PutReq/AppendReq is kept for wire back-compat but always true in practice.
@@ -1058,7 +1058,7 @@ post-restart.
 
 7. **`sst_readers` and `tables` are always aligned by index** — `tables[i]` and `sst_readers[i]` refer to the same SSTable. Operations on these must maintain alignment. Compaction's atomic swap replaces slices, not individual elements.
 
-9. **Memtable backing = `parking_lot::RwLock<BTreeMap>` (F099-C)** — the active memtable has exactly one writer (the P-log thread's `merged_partition_loop` Phase 3) and N readers (ps-conn `handle_get` call sites + P-log itself). Correctness properties:
+9. **Memtable backing = `parking_lot::RwLock<BTreeMap>` (F099-C)** — the active memtable has exactly one writer (the P-log thread's `partition_loop` Phase 3) and N readers (ps-conn `handle_get` call sites + P-log itself). Correctness properties:
    - Writer holds the write lock for the duration of one `insert_batch` call (hot path, up to 256 entries), then releases. Subsequent readers take the read lock AFTER the writer releases → linearisable Put-then-Get.
    - Rotation (`rotate_active`) replaces the whole `Memtable` struct via `std::mem::replace` on the owning `PartitionData`; this is safe because `rotate_active` runs exclusively on P-log inside a `RefCell::borrow_mut`.
    - `imm: VecDeque<Arc<Memtable>>` — after rotation, frozen memtables are read-only from both P-log (during flush + GC + compaction) and P-bulk (during `build_sst_bytes`). Multiple readers acquire the read lock concurrently.
@@ -1076,7 +1076,7 @@ post-restart.
 
 11. **F183 metrics export.** Each `PartitionData` carries an
     `Arc<PartitionMetrics>` whose AtomicU64 counters are bumped by
-    `merged_partition_loop` (req_count on each `handle_incoming_req`,
+    `partition_loop` (req_count on each `handle_incoming_req`,
     imm_full_count when the imm cap stalls intake). The same Arc is
     cloned into the `PartitionHandle` on the main thread; the main
     thread's `report_load_loop` (5 s cadence) snapshots all live
@@ -1189,7 +1189,7 @@ post-restart.
     `handle_incoming_req` short-circuits Put / Delete / StreamPut with
     `CODE_UNAVAILABLE` while frozen; reads + maintenance flow normally.
 
-    `merged_partition_loop` top-of-loop logic:
+    `partition_loop` top-of-loop logic:
       - if `freeze_drain_ack.is_some() && pending.is_empty() &&
         inflight.is_empty()`: rotate active + flush every imm via
         `flush_one_imm`, then send OK on the parked oneshot. This is

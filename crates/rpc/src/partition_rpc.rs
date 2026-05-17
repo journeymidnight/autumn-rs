@@ -346,6 +346,7 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_GET_DISCARDS => rkyv_decode::<GetDiscardsReq>(payload).map(|r| r.part_id).unwrap_or(0),
         MSG_MERGE_PART => rkyv_decode::<MergePartReq>(payload).map(|r| r.survivor_part_id).unwrap_or(0),
         MSG_MERGE_FREEZE => rkyv_decode::<MergeFreezeReq>(payload).map(|r| r.part_id).unwrap_or(0),
+        MSG_PULL_VP_REFS => rkyv_decode::<PullVpRefsReq>(payload).map(|r| r.part_id).unwrap_or(0),
         _ => 0,
     }
 }
@@ -360,6 +361,7 @@ mod msg_type_tests {
             MSG_PUT, MSG_GET, MSG_DELETE, MSG_HEAD, MSG_RANGE,
             MSG_SPLIT_PART, MSG_STREAM_PUT, MSG_MAINTENANCE,
             MSG_GET_DISCARDS, MSG_MERGE_PART, MSG_MERGE_FREEZE,
+            MSG_PULL_VP_REFS,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {

@@ -1,7 +1,7 @@
 //! RPC dispatch and handler functions for partition operations.
 //!
 //! F099-D: `handle_put`, `handle_delete`, and `handle_stream_put` are gone —
-//! writes decode inline in `merged_partition_loop::handle_incoming_req` and
+//! writes decode inline in `partition_loop::handle_incoming_req` and
 //! push directly into the SQ/CQ pipeline's pending queue. Only read ops and
 //! low-frequency control ops (SPLIT_PART, MAINTENANCE) are handled here.
 
@@ -97,7 +97,7 @@ impl ReadMetrics {
     }
 }
 
-/// F099-D: PUT / DELETE / STREAM_PUT are handled by `merged_partition_loop`'s
+/// F099-D: PUT / DELETE / STREAM_PUT are handled by `partition_loop`'s
 /// direct `handle_incoming_req` path (no spawn, no inner oneshot). Only
 /// reads and low-frequency control ops route through this dispatch function.
 /// Receiving a write op here is a bug — we short-circuit with an error.
@@ -118,7 +118,7 @@ pub(crate) async fn dispatch_partition_rpc(
         MSG_GET_DISCARDS => handle_get_discards(payload, part, part_sc).await,
         // F210-C2: SPLIT_PART must NOT be invoked inline through
         // dispatch_partition_rpc — handle_split_part awaits an internal
-        // drain signal that requires merged_partition_loop to run, and
+        // drain signal that requires partition_loop to run, and
         // an inline call would self-deadlock (the loop's stack is parked
         // here). MSG_SPLIT_PART is now intercepted in
         // `handle_incoming_req` and dispatched via `compio::runtime::spawn`.
@@ -135,7 +135,7 @@ pub(crate) async fn dispatch_partition_rpc(
         // ClusterClient::put_stream_begin (Ceph striperados pattern).
         MSG_PUT | MSG_DELETE | MSG_STREAM_PUT => Err((
             StatusCode::Internal,
-            format!("write msg_type {msg_type} must be routed via merged_partition_loop"),
+            format!("write msg_type {msg_type} must be routed via partition_loop"),
         )),
         _ => Err((StatusCode::InvalidArgument, format!("unknown msg_type {msg_type}"))),
     }
@@ -455,18 +455,18 @@ pub(crate) async fn handle_split_part(
 
     // F210-C2: PrepareSplit-style freeze + drain. Pre-F210-C2 split called
     // `flush_memtable_locked(part)` directly then `commit_length` — but
-    // merged_partition_loop could still process in-flight Phase 2 writes
+    // partition_loop could still process in-flight Phase 2 writes
     // (their work is on stream_worker_loop, independent of split's stack)
     // during the await window. Those writes' bytes landed on EN past the
     // captured commit_length, then manager sealed at the captured value,
     // leaving the trailing bytes invisible on recovery. The fix mirrors
     // F185's merge freeze: set frozen_for_split → halt new Put/Delete via
     // handle_incoming_req's reject branch → park split_drain_ack →
-    // merged_partition_loop drains pending+inflight+imm → fires the ack
+    // partition_loop drains pending+inflight+imm → fires the ack
     // signal → split resumes. After this drain, commit_length is stable.
     //
     // handle_split_part runs on a spawned task (see MSG_SPLIT_PART in
-    // handle_incoming_req) so its awaits don't block merged_partition_loop.
+    // handle_incoming_req) so its awaits don't block partition_loop.
     //
     // Idempotency: if a previous split is already in flight on this
     // partition, refuse. Same shape as the merge freeze's "already in
@@ -488,6 +488,13 @@ pub(crate) async fn handle_split_part(
         }
         p.frozen_for_split.set(Some(std::time::Instant::now()));
         *p.split_drain_ack.borrow_mut() = Some(drain_tx);
+        // F210-C2 fix — wake partition_loop so its idle-path
+        // select observes that split_drain_ack just transitioned to
+        // Some. Without this the loop sleeps through the full
+        // FREEZE_TTL (30s) on an idle partition and the TTL backstop
+        // is the only thing that ever unwedges the handler. See
+        // PartitionData.split_wake_tx docstring for the full story.
+        let _ = p.split_wake_tx.unbounded_send(());
     }
 
     // Await drain. On TTL-driven backstop, drain_rx receives

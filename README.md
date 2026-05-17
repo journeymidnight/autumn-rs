@@ -127,7 +127,7 @@ Tunables:
 
 | env var | default | range | role |
 |---------|---------|-------|------|
-| `AUTUMN_PS_MAX_IMM_DEPTH` | `4` | `[1, 64]` | imm queue cap; merged_partition_loop stalls req intake when reached (RocksDB analogue: `max_write_buffer_number`) |
+| `AUTUMN_PS_MAX_IMM_DEPTH` | `4` | `[1, 64]` | imm queue cap; partition_loop stalls req intake when reached (RocksDB analogue: `max_write_buffer_number`) |
 | `AUTUMN_PS_MAX_WAL_GAP` | `2 GiB` | `[128 MiB, 64 GiB]` | force-rotate active when `active.bytes + Σ imm.bytes` exceeds this (RocksDB analogue: `max_total_wal_size`) |
 | `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS` | `60_000` | `[1_000, 600_000]` | per-partition drain deadline; SIGKILL fallback after this |
 

@@ -236,7 +236,7 @@ pub(crate) fn ps_flush_inflight_cap() -> usize {
 }
 
 /// F120-A — maximum imm queue depth per partition. When `imm.len()` reaches
-/// this cap, `merged_partition_loop` stops pulling from `req_rx` (write
+/// this cap, `partition_loop` stops pulling from `req_rx` (write
 /// back-pressure) and waits for `flush_one_imm` to pop one entry before
 /// resuming. Worst-case unflushed-WAL window per partition is therefore
 /// `MAX_IMM_DEPTH * FLUSH_MEM_BYTES + active.bytes` = 4 × 256 MB + 256 MB
@@ -250,7 +250,7 @@ pub(crate) fn max_imm_depth() -> usize {
 }
 
 /// F120-B — maximum unflushed log_stream gap per partition. When
-/// `active.bytes + Σ imm[i].bytes > MAX_WAL_GAP`, `merged_partition_loop`
+/// `active.bytes + Σ imm[i].bytes > MAX_WAL_GAP`, `partition_loop`
 /// force-rotates `active` to imm even if it hasn't reached
 /// `FLUSH_MEM_BYTES = 256 MB`. Bounds `open_partition` replay time when
 /// the workload is dominated by large values (small memtable footprint
@@ -639,11 +639,26 @@ pub(crate) struct PartitionData {
     /// `None` when P-bulk failed to spawn (legacy fallback uses part_sc).
     row_append_tx: Option<mpsc::Sender<RowAppendReq>>,
     /// F120-A: signaled (one item per pop) by `flush_one_imm` after every
-    /// successful `imm.pop_front()` so that `merged_partition_loop` can
+    /// successful `imm.pop_front()` so that `partition_loop` can
     /// wake from its imm-full back-pressure wait. Unbounded because the
     /// receiver always drains all pending notifications before re-checking
     /// `imm.len()`, so the buffer self-bounds at `MAX_IMM_DEPTH`.
     imm_drained_tx: mpsc::UnboundedSender<()>,
+    /// Wake signal for `partition_loop` after a SPLIT freeze has
+    /// parked its drain ack. F210-C2 spawns `handle_split_part` off the
+    /// loop's dispatch stack so the loop is free to drain; but after
+    /// the spawn returns, the loop sleeps on its (D) idle select
+    /// (`req_rx + F120-C drain`) — neither receiver carries the
+    /// "split_drain_ack just transitioned to Some" event, so the
+    /// top-of-loop drain check is unreachable until incidental traffic
+    /// arrives. In an idle partition that meant a full FREEZE_TTL (30s)
+    /// of dead time before the watchdog forced the handler to error
+    /// out. The spawned handler sends `()` here right after parking
+    /// the ack; the loop's idle selects watch this rx and wake.
+    /// Specific to SPLIT — MSG_MERGE_FREEZE runs inline in
+    /// `handle_incoming_req`, so its parking happens on the loop's
+    /// active stack and the next iteration's top check fires naturally.
+    pub(crate) split_wake_tx: mpsc::UnboundedSender<()>,
     /// F140: per-partition gate shared with background_gc_loop.
     /// `handle_split_part` acquires this to ensure `run_gc` has no
     /// log_stream append in-flight when commit_length is read. This is
@@ -703,7 +718,7 @@ pub(crate) struct PartitionData {
     /// Set by `MSG_MERGE_FREEZE`; cleared by an explicit unfreeze RPC
     /// (manager rollback path), by partition reopen on rg/stream-id
     /// change (the normal post-commit recovery), or by `FREEZE_TTL`
-    /// expiry inside `merged_partition_loop` (backstop for orchestrator
+    /// expiry inside `partition_loop` (backstop for orchestrator
     /// crash). While Some, the loop rejects Put/Delete/StreamPut with
     /// `CODE_UNAVAILABLE` so writes never land in a log_stream tail
     /// past the to-be-captured `commit_length`. In-memory only — a PS
@@ -713,7 +728,7 @@ pub(crate) struct PartitionData {
     pub(crate) frozen_for_merge: Cell<Option<std::time::Instant>>,
     /// F185: stashed `MSG_MERGE_FREEZE` response oneshot. `handle_incoming_req`
     /// flips `frozen_for_merge=true` and parks the caller's resp here without
-    /// replying; `merged_partition_loop` consumes it once `pending` AND
+    /// replying; `partition_loop` consumes it once `pending` AND
     /// `inflight` are both empty AND every imm has been flushed, then sends
     /// the OK reply. The caller (CLI / autumn-client merge) thus blocks
     /// until every acked-pre-freeze write is durable on log_stream + has
@@ -724,14 +739,14 @@ pub(crate) struct PartitionData {
     /// F210-C2: PrepareSplit-style write halt. Mirror of `frozen_for_merge`
     /// but for the SPLIT path; needed because `handle_split_part` runs on
     /// a spawned task (not inline through dispatch_partition_rpc) so it
-    /// can park here and let `merged_partition_loop` drain
+    /// can park here and let `partition_loop` drain
     /// pending+inflight+imm before `commit_length` is captured. Pre-F210-C2
     /// split called `flush_memtable_locked` then `commit_length` directly,
     /// but the inline await window let in-flight Phase 2 appends complete
     /// past the captured `commit_length` — those bytes existed on EN disk
     /// past sealed_length and were invisible on recovery.
     pub(crate) frozen_for_split: Cell<Option<std::time::Instant>>,
-    /// F210-C2: internal oneshot signal from `merged_partition_loop` to
+    /// F210-C2: internal oneshot signal from `partition_loop` to
     /// the spawned `handle_split_part` task — fired after drain completes.
     /// Payload is `Result<(), String>`: `Ok(())` = drain succeeded,
     /// commit_length is now safe to capture; `Err(msg)` = drain hit a
@@ -750,7 +765,7 @@ pub(crate) struct PartitionData {
     /// it clears this flag and GC resumes.
     pub(crate) vp_refs_dirty: Cell<bool>,
     /// F183: per-partition load metrics for the manager's policy engine.
-    /// Counters are bumped by `merged_partition_loop` (req on each
+    /// Counters are bumped by `partition_loop` (req on each
     /// dispatch, imm_full each time the imm cap stalls intake). The
     /// PS-level `report_load_loop` snapshots and resets these every 5 s
     /// and ships them via MSG_REPORT_PARTITION_LOAD.
@@ -1226,7 +1241,7 @@ impl WriteLoopMetrics {
 //     ceiling.
 //
 // F099-J context preserved for the per-partition path: handle_ps_connection
-// still runs on the same runtime as merged_partition_loop, so the request
+// still runs on the same runtime as partition_loop, so the request
 // handoff is a same-thread mpsc + oneshot with no eventfd/futex wake.
 //
 // See `docs/superpowers/specs/2026-04-20-perf-f099-h-kernel-rtt.md` §2.3
@@ -1234,7 +1249,7 @@ impl WriteLoopMetrics {
 // F099-K fans the load out across N P-log threads).
 
 /// A request dispatched from a ps-conn task (running on P-log runtime)
-/// into `merged_partition_loop` for write group-commit or for inline
+/// into `partition_loop` for write group-commit or for inline
 /// read/maintenance dispatch. After F099-J this channel's endpoints BOTH
 /// live on the same compio runtime, so `futures::channel::mpsc`'s wake
 /// path stays in-process (no eventfd).
@@ -2469,7 +2484,7 @@ impl PartitionServer {
         // Remove partitions no longer assigned. Dropping the PartitionHandle
         // closes its `fd_tx`; the P-log fd-drain task sees `.next() == None`
         // and exits, which in turn closes every ps-conn task's `req_tx`
-        // clone — merged_partition_loop observes `req_rx.next() == None` and
+        // clone — partition_loop observes `req_rx.next() == None` and
         // drains. The partition thread then joins on its own.
         //
         // F184: also detect partitions whose (rg, stream_ids) changed since
@@ -2709,7 +2724,7 @@ impl PartitionServer {
 
     /// F120-C — graceful shutdown. For each open partition:
     ///   1. Send a `oneshot::Sender<()>` via `drain_tx`. The partition's
-    ///      `merged_partition_loop` stops pulling new requests, drains
+    ///      `partition_loop` stops pulling new requests, drains
     ///      inflight, rotates `active`, calls `flush_one_imm` until imm
     ///      is empty, then replies on the oneshot.
     ///   2. Await the oneshot with `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS`
@@ -2825,7 +2840,7 @@ impl PartitionServer {
     //     region_sync_loop). No listener, no accept, no fd dispatch.
     //   - N × 2 partition OS threads: per-partition P-log + P-bulk. P-log
     //     binds its OWN `compio::net::TcpListener` on a unique port and
-    //     runs its OWN accept task + ps-conn tasks + merged_partition_loop
+    //     runs its OWN accept task + ps-conn tasks + partition_loop
     //     on the same compio runtime. The only mpsc on the hot path is
     //     same-thread `PartitionRequest` (ps-conn → merged_loop). Total
     //     OS threads at N partitions: `1 + 2N` (pre-F099-K it was `2 + 2N`
@@ -2940,7 +2955,7 @@ impl PartitionServer {
 /// `tx_bufs`. Default 4 is chosen so that the total across N conns
 /// (typical benchmark N=256) stays bounded at N × CAP = 1024 — roughly
 /// the `futures::channel::mpsc` `WRITE_CHANNEL_CAP = 1024` that carries
-/// PartitionRequests into merged_partition_loop.  Higher caps (8+) caused
+/// PartitionRequests into partition_loop.  Higher caps (8+) caused
 /// EINVAL / "submit error: connection closed" under 256 × d=8 load —
 /// we believe due to the aggregate rate of tx.send()-awaiting futures
 /// overwhelming either the mpsc reservation pool or the PS's extent-node
@@ -3208,7 +3223,7 @@ async fn d1_fast_path_round_trip(
 ///
 /// Arguments:
 ///   * `stream`      — client socket (owned; split into read/write halves).
-///   * `req_tx`      — sender into merged_partition_loop's request channel.
+///   * `req_tx`      — sender into partition_loop's request channel.
 ///                     Owned by this fn; cloned once per in-flight future.
 ///                     When this fn returns, the last clone drops, closing
 ///                     the mpsc (merged_loop sees `req_rx.next() == None`
@@ -3453,7 +3468,7 @@ async fn partition_thread_main(
     // F196 D-r7: per-partition rate controller. Built inside the
     // partition thread; each partition gets its own Mutex/state.
     let rate_ctrl = std::sync::Arc::new(crate::RateController::from_env());
-    // F099-J: create the same-thread ps-conn ↔ merged_partition_loop
+    // F099-J: create the same-thread ps-conn ↔ partition_loop
     // channel. Both endpoints live on THIS compio runtime, so sends and
     // wakes do not cross threads.
     let (req_tx, req_rx) = mpsc::channel::<PartitionRequest>(WRITE_CHANNEL_CAP);
@@ -3514,9 +3529,14 @@ async fn partition_thread_main(
     // `open_partition` and passed in as parameters so PartitionHandle on
     // main can hold a Send Sender for the maintenance scheduler.
     // F120-A: signal channel from flush_one_imm (after each imm.pop_front)
-    // back to merged_partition_loop for back-pressure wakeup. Both ends
+    // back to partition_loop for back-pressure wakeup. Both ends
     // live on this thread so the unbounded futures::channel is fine.
     let (imm_drained_tx, imm_drained_rx) = mpsc::unbounded::<()>();
+    // F210-C2 fix: wake channel for split freeze (see field doc on
+    // PartitionData.split_wake_tx). Unbounded + small payload — a few
+    // stranded `()` items between split attempts is harmless because
+    // the loop drains them via `now_or_never` at iteration top.
+    let (split_wake_tx, split_wake_rx) = mpsc::unbounded::<()>();
 
     // F088: spawn a dedicated OS thread (P-bulk) that owns its own compio
     // runtime + io_uring + ConnPool. Flush requests are forwarded to it via
@@ -3583,6 +3603,7 @@ async fn partition_thread_main(
         flush_req_tx: flush_req_tx_part,
         row_append_tx: row_append_tx_part,
         imm_drained_tx,
+        split_wake_tx,
         gc_gate: gc_gate.clone(),
         rate_ctrl: rate_ctrl.clone(),
         concurrency_ctrl: concurrency_ctrl.clone(),
@@ -3609,7 +3630,7 @@ async fn partition_thread_main(
     // Spawn background loops on this thread's compio runtime.
     //
     // F099-D: the write loop is NO LONGER a separate compio task. Writes
-    // are serviced inline by `merged_partition_loop` below, collapsing the
+    // are serviced inline by `partition_loop` below, collapsing the
     // old `partition_thread_main → spawn_write_request → handle_put →
     // write_tx.send → background_write_loop_r1` chain into one task. See
     // F099-A flame graph analysis (docs/superpowers/specs/2026-04-20-*.md
@@ -3734,7 +3755,7 @@ async fn partition_thread_main(
     //
     // IMPORTANT: this task holds a clone of `req_tx`. When it exits, its
     // clone is dropped. Once every per-connection task's clone is also
-    // dropped, merged_partition_loop observes `req_rx.next() == None` and
+    // dropped, partition_loop observes `req_rx.next() == None` and
     // shuts down cleanly.
     {
         let req_tx_for_accept = req_tx.clone();
@@ -3787,11 +3808,12 @@ async fn partition_thread_main(
     drop(req_tx);
 
     // F099-D: merged request + write loop runs directly on this task.
-    merged_partition_loop(
+    partition_loop(
         part_id,
         part.clone(),
         req_rx,
         imm_drained_rx,
+        split_wake_rx,
         drain_rx,
         locked_by_other,
         part_sc.clone(),
@@ -3850,11 +3872,12 @@ async fn partition_thread_main(
 ///     cascade through a second compio task.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
-async fn merged_partition_loop(
+async fn partition_loop(
     part_id: u64,
     part: Rc<RefCell<PartitionData>>,
     mut req_rx: mpsc::Receiver<PartitionRequest>,
     mut imm_drained_rx: mpsc::UnboundedReceiver<()>,
+    mut split_wake_rx: mpsc::UnboundedReceiver<()>,
     mut drain_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
     locked_by_other: Rc<Cell<bool>>,
     part_sc: Rc<StreamClient>,
@@ -4026,6 +4049,10 @@ async fn merged_partition_loop(
         // F120-A — drain any pending imm-pop notifications so we don't
         // accidentally wake on a stale signal in the wait branches below.
         while let Some(Some(())) = imm_drained_rx.next().now_or_never() {}
+        // F210-C2 fix — same hygiene for split freeze wakes. Stale items
+        // are harmless (the drain check itself is idempotent) but
+        // draining them keeps the wait branches from spuriously waking.
+        while let Some(Some(())) = split_wake_rx.next().now_or_never() {}
 
         let n_inflight = inflight.len();
         let at_cap = n_inflight >= cap;
@@ -4121,14 +4148,19 @@ async fn merged_partition_loop(
         }
 
         // (D) Pipeline has room and imm not full; race SQ (req_rx),
-        // CQ (inflight), and drain.
+        // CQ (inflight), split-wake, and drain.
         if n_inflight == 0 {
-            // Fully idle: race req_rx vs drain.
+            // Fully idle: race req_rx vs split-wake vs F120-C drain.
+            // F210-C2 fix: split_wake_rx is the wake source for split
+            // freeze parking — without it an idle loop sleeps through
+            // the entire FREEZE_TTL window.
             let req_fut = req_rx.next();
+            let wake_fut = split_wake_rx.next();
             let drain_fut = drain_rx.next();
-            futures::pin_mut!(req_fut);
-            futures::pin_mut!(drain_fut);
-            match select(req_fut, drain_fut).await {
+            futures::pin_mut!(req_fut, wake_fut, drain_fut);
+            // First race req vs wake; whichever wins, also poll drain
+            // via now_or_never below to fold the third receiver in.
+            match select(req_fut, select(wake_fut, drain_fut)).await {
                 Either::Left((maybe_req, _)) => match maybe_req {
                     Some(req) => {
                         handle_incoming_req(
@@ -4139,11 +4171,17 @@ async fn merged_partition_loop(
                     }
                     None => break,
                 },
-                Either::Right((maybe_drain, _)) => {
-                    if let Some(ack) = maybe_drain {
-                        drain_ack = Some(ack);
+                Either::Right((inner, _)) => match inner {
+                    Either::Left(_) => {
+                        // split wake — just iterate; top-of-loop drain
+                        // check will fire.
                     }
-                }
+                    Either::Right((maybe_drain, _)) => {
+                        if let Some(ack) = maybe_drain {
+                            drain_ack = Some(ack);
+                        }
+                    }
+                },
             }
         } else {
             let req_fut = req_rx.next();
@@ -4451,7 +4489,7 @@ async fn handle_incoming_req(
         }
         // F210-C2: SPLIT_PART is spawned as a separate task on the same
         // P-log runtime so its awaits (drain + commit_length + manager
-        // RPC) don't block merged_partition_loop. Without this, the loop
+        // RPC) don't block partition_loop. Without this, the loop
         // can't process the drain (it's the only one that pulls inflight
         // completions + flushes imm), causing a self-deadlock. Pre-F210-C2
         // split ran inline via dispatch_partition_rpc; the drain wasn't
@@ -4723,7 +4761,7 @@ async fn recover_partition(
     // Replay logStream.
     //
     // F210-C1: the dedup `if ts <= sst_max_seq { continue; }` below is
-    // safe because `merged_partition_loop` now uses `FuturesOrdered`
+    // safe because `partition_loop` now uses `FuturesOrdered`
     // (was `FuturesUnordered`). Phase 3 (memtable insert) is therefore
     // strictly in launch order = strictly in seq order; a rotated
     // active contains a contiguous seq range [start, max_seq], and the
@@ -5337,7 +5375,7 @@ pub(crate) async fn commit_flush_outcome(
         p.tables.push(outcome.new_meta);
         p.sst_readers.push(Arc::new(outcome.reader));
         p.imm.pop_front();
-        // F120-A: wake merged_partition_loop on imm-full back-pressure.
+        // F120-A: wake partition_loop on imm-full back-pressure.
         let _ = p.imm_drained_tx.unbounded_send(());
         (
             p.tables.clone(),
@@ -6523,7 +6561,7 @@ mod f120_knob_tests {
 // is out of scope for an in-process unit test.
 
 // ---------------------------------------------------------------------------
-// F099-D — merged_partition_loop direct-response path tests.
+// F099-D — partition_loop direct-response path tests.
 //
 // These tests exercise the enqueue_put / enqueue_delete / enqueue_stream_put
 // helpers and the WriteResponder::send_ok / send_err contract. The full
@@ -6749,7 +6787,7 @@ mod merged_loop_tests {
 // These tests pin the two properties of the F099-J refactor:
 //   1. `handle_ps_connection` no longer requires an Arc<PartitionRouter>
 //      DashMap — it runs on the owning partition's compio runtime and
-//      communicates with `merged_partition_loop` via a same-thread
+//      communicates with `partition_loop` via a same-thread
 //      `mpsc::Sender<PartitionRequest>`. No cross-thread wake (eventfd
 //      + futex) on the write hot path.
 //   2. Under load (1000 sequential ops on one TCP connection), the full

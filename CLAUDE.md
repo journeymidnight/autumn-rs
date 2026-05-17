@@ -111,11 +111,11 @@ On crash recovery, the partition replays: metaStream checkpoint → rowStream SS
 Put(key, value, must_sync)
   │
   └─ ps-conn task (on P-log runtime): PartitionRequest{msg_type=MSG_PUT, payload, resp_tx}
-             → same-thread mpsc → merged_partition_loop (same runtime)
+             → same-thread mpsc → partition_loop (same runtime)
              (F099-J: ps-conn is spawned by P-log's fd-drain task; the
               main compio thread only forwards fds across partitions.)
        │
-       └─ merged_partition_loop (F099-D: request dispatch + group commit in one task):
+       └─ partition_loop (F099-D: request dispatch + group commit in one task):
             ├─ Decode PutReq inline (no spawn, no inner oneshot)
             ├─ Push WriteRequest with direct WriteResponder::Put{outer=resp_tx, key}
             │    into `pending` Vec
@@ -148,7 +148,7 @@ locking (`DashMap<stream_id, Arc<Mutex<StreamAppendState>>>`), so no external Mu
 The server-level `PartitionServer.stream_client` is reserved for split coordination RPCs only.
 
 **Two OS threads per partition (F088 + F099-J)**: After F099-J, P-log also
-hosts the ps-conn tasks for its partition — ps-conn ↔ merged_partition_loop
+hosts the ps-conn tasks for its partition — ps-conn ↔ partition_loop
 runs on the same compio runtime (no cross-thread wake). Each partition
 additionally owns a **P-bulk** thread
 running its own compio runtime + ConnPool + StreamClient (also via `new_with_revision` to

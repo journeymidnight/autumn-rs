@@ -93,7 +93,7 @@ After F099-K, each partition binds its own TCP listener at `base_port + ord`.
 The PS-level address from `register_ps` (cached in `ps_details[ps_id].address`)
 only owns the FIRST partition opened on that PS — sending a RangeReq /
 PutReq / GetReq for any other partition to that address gets back
-`CODE_NOT_FOUND` from the receiving merged_partition_loop's mis-routed-frame
+`CODE_NOT_FOUND` from the receiving partition_loop's mis-routed-frame
 fast path.
 
 Every cross-partition / per-partition call site MUST resolve via

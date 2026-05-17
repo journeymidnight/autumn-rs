@@ -874,7 +874,7 @@ fn auto_dispatch_split_dispatches_msg_split_part() {
 ///    correct partition
 ///
 /// Why this matters: handle_split_part runs inline on the partition's
-/// merged_partition_loop and serialises against writes via the F140
+/// partition_loop and serialises against writes via the F140
 /// dual-gate. Merge orchestration FLUSHes both partitions then drops
 /// their PartitionHandles to force region_sync reload — during which
 /// reads/writes against the merging partitions can fail with NotFound

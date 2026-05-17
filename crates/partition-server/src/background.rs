@@ -840,7 +840,7 @@ pub(crate) async fn background_gc_loop(
 
 
 /// F099-D: `background_write_loop` and its R1/LF dispatch helpers are gone —
-/// the write loop is now inlined into `merged_partition_loop` on the main
+/// the write loop is now inlined into `partition_loop` on the main
 /// P-log task. The primitives below (`start_write_batch`, `finish_write_batch`,
 /// `handle_completion`, `InflightCompletion`, `InFlightBatch`, `BatchData`)
 /// remain as building blocks used by that merged loop.
@@ -1663,7 +1663,7 @@ pub(crate) async fn do_compact(
         entries_kept += 1;
 
         // F168: cooperative yield to keep the compio runtime responsive
-        // for other tasks (merged_partition_loop, ps-conn, etc.).
+        // for other tasks (partition_loop, ps-conn, etc.).
         entries_since_yield += 1;
         if entries_since_yield >= COMPACT_YIELD_EVERY {
             yield_to_runtime().await;
@@ -1977,7 +1977,7 @@ impl GcRateLimiter {
 }
 
 /// F141 / F168: cooperative single-step yield. Lets other tasks on
-/// this compio runtime (merged_partition_loop, ps-conn,
+/// this compio runtime (partition_loop, ps-conn,
 /// background_flush_loop, etc.) make forward progress between
 /// long stretches of inline CPU work that would otherwise starve
 /// the event loop.
@@ -2073,7 +2073,7 @@ async fn flush_gc_batch(
     *moved += n;
 
     // Cooperative yield: even if the rate limiter has no budget to
-    // burn, give merged_partition_loop / ps-conn a turn before the
+    // burn, give partition_loop / ps-conn a turn before the
     // next batch.
     gc_yield_now().await;
 
