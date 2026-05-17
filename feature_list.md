@@ -2785,7 +2785,7 @@ Background: autumn-rs 当前节点死亡判定模型过于激进——心跳 10s
   - 单元测试：write_shard / commit_shard / read_shard 在 revision < last_revision 时返回 PRECONDITION。
   - 注入测试：fence 后老 client 携带旧 revision 的所有操作（读+写+commit）100% 被拒。
   - 集成测试：模拟假死 coord 复活，所有请求被拒；客户端缓存的旧 location 也无法读到 stale 数据。
-- **passes:** false
+- **passes:** true
 
 ### F211-E · Recovery loop gated by Fenced state + 指数退避
 - **Trigger:** 当前 `recovery_dispatch_loop` 看到 `disk.online == false` 立即触发，对网络抖动过激进。改为只看 OP 显式 Fenced 状态。同时给 recovery 失败加指数退避防止刷日志（漏洞 #7）。

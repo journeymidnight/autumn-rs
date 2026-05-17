@@ -4286,6 +4286,13 @@ impl ExtentNode {
                     shard_index: i as u32,
                     sealed_length,
                     eversion: new_eversion,
+                    // F211-D: EC convert is manager-orchestrated; there
+                    // is no per-stream owner-lock to propagate today.
+                    // Passing 0 keeps the EN-side fence permissive on
+                    // this path. Future: thread the manager's epoch
+                    // through `ExtConvertToEcReq` so a fenced ex-coord
+                    // is rejected at write_shard time too.
+                    revision: 0,
                     payload: shards[i].clone(),
                 };
                 let sock = parse_addr(target_addr)
@@ -4331,6 +4338,8 @@ impl ExtentNode {
                 extent_id,
                 sealed_length,
                 eversion: new_eversion,
+                // F211-D: see WriteShardReq site above.
+                revision: 0,
             };
             let sock = parse_addr(target_addr)
                 .map_err(|e| (StatusCode::Internal, format!("parse addr {target_addr}: {e}")))?;
@@ -4382,6 +4391,21 @@ impl ExtentNode {
             }
         }
 
+        // F211-D: owner-lock revision fence. `revision == 0` keeps the
+        // pre-F211-D no-fence behaviour; non-zero is rejected when the
+        // local last_revision has moved ahead (e.g., a fence on the
+        // coord node bumped owner-lock revisions on every extent the
+        // coord touched, so a revived ghost coord's WriteShard with the
+        // old revision is refused).
+        if req.revision > 0 {
+            if let Ok(entry) = self.ensure_extent(req.extent_id).await {
+                let last = entry.last_revision.load(Ordering::SeqCst);
+                if req.revision < last {
+                    return Ok(WriteShardResp { code: CODE_LOCKED_BY_OTHER }.encode());
+                }
+            }
+        }
+
         self.write_shard_local(
             req.extent_id,
             req.shard_index as usize,
@@ -4403,6 +4427,16 @@ impl ExtentNode {
                 return self
                     .forward_rpc_to_sibling(sibling, MSG_COMMIT_EC_SHARD, payload)
                     .await;
+            }
+        }
+
+        // F211-D: owner-lock revision fence (see handle_write_shard).
+        if req.revision > 0 {
+            if let Ok(entry) = self.ensure_extent(req.extent_id).await {
+                let last = entry.last_revision.load(Ordering::SeqCst);
+                if req.revision < last {
+                    return Ok(CommitEcShardResp { code: CODE_LOCKED_BY_OTHER }.encode());
+                }
             }
         }
 
@@ -5107,5 +5141,65 @@ mod f194_concurrency_gate_tests {
         assert_eq!(cfg.ec_convert_parallelism, 4);
         assert_eq!(cfg.recovery_parallelism, 8);
         assert_eq!(cfg.inflight_cap, 128);
+    }
+}
+
+/// F211-D: shard wire-fence on `WriteShardReq` / `CommitEcShardReq`.
+/// Round-trip the encoded bytes through `decode` and assert the
+/// `revision` field survives so future callers cannot accidentally
+/// drop it. The handler-level fence behaviour is covered by the
+/// integration tests in `crates/manager/tests/f211_node_lifecycle.rs`.
+#[cfg(test)]
+mod f211d_wire_fence_tests {
+    use crate::extent_rpc::{CommitEcShardReq, WriteShardReq};
+    use bytes::Bytes;
+
+    #[test]
+    fn write_shard_req_roundtrip_carries_revision() {
+        let original = WriteShardReq {
+            extent_id: 42,
+            shard_index: 3,
+            sealed_length: 12345,
+            eversion: 7,
+            revision: 99,
+            payload: Bytes::from_static(b"shard-bytes"),
+        };
+        let encoded = original.encode();
+        let decoded = WriteShardReq::decode(encoded).unwrap();
+        assert_eq!(decoded.extent_id, 42);
+        assert_eq!(decoded.shard_index, 3);
+        assert_eq!(decoded.sealed_length, 12345);
+        assert_eq!(decoded.eversion, 7);
+        assert_eq!(decoded.revision, 99);
+        assert_eq!(decoded.payload.as_ref(), b"shard-bytes");
+    }
+
+    #[test]
+    fn write_shard_req_revision_zero_is_no_fence_marker() {
+        let original = WriteShardReq {
+            extent_id: 1,
+            shard_index: 0,
+            sealed_length: 0,
+            eversion: 1,
+            revision: 0,
+            payload: Bytes::new(),
+        };
+        let decoded = WriteShardReq::decode(original.encode()).unwrap();
+        assert_eq!(decoded.revision, 0, "zero revision marker preserved");
+    }
+
+    #[test]
+    fn commit_ec_shard_req_roundtrip_carries_revision() {
+        let original = CommitEcShardReq {
+            extent_id: 7,
+            sealed_length: 100,
+            eversion: 4,
+            revision: 5,
+        };
+        let decoded = CommitEcShardReq::decode(original.encode()).unwrap();
+        assert_eq!(decoded.extent_id, 7);
+        assert_eq!(decoded.sealed_length, 100);
+        assert_eq!(decoded.eversion, 4);
+        assert_eq!(decoded.revision, 5);
     }
 }

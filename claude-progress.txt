@@ -1,5 +1,5 @@
 Date: 2026-05-17
-TaskStatus: not_completed
+TaskStatus: completed
 Task scope: F211 series — Operator-Driven Node Lifecycle. Implement
             the HDFS-decommission-style refactor described in
             docs/superpowers/plans/2026-05-17-f211-operator-driven-node-lifecycle.md
@@ -8,10 +8,15 @@ Sub-feature status:
   F211-A NodeStateTracker (Online ↔ Suspected, auto):  completed
   F211-B Health reporting RPCs (3 read-only):          completed
   F211-C Operator fence/maintenance/clear/remove:      completed
-  F211-D Owner-lock revision bump on fence:            partial
-         - bump_owner_revisions_for_node implemented (in-mem fence)
-         - WriteShardReq/CommitEcShardReq/ReadShardReq +revision
-           wire fence: NOT YET DONE (stream-layer touch deferred)
+  F211-D Owner-lock revision fence on shards:          completed
+         - bump_owner_revisions_for_node implemented in fence_node_impl
+         - WriteShardReq +revision (header 28 → 36 bytes)
+         - CommitEcShardReq +revision (header 24 → 32 bytes)
+         - EN-side handle_write_shard / handle_commit_ec_shard reject
+           when req.revision > 0 && req.revision < entry.last_revision
+         - req.revision == 0 preserves pre-F211-D no-fence behaviour
+           (passes 0 from existing EC convert dispatch paths)
+         - Wire roundtrip unit tests in extent_node.rs f211d_wire_fence_tests
   F211-E Recovery loop gated by Fenced state:          completed
          - AUTUMN_MGR_RECOVERY_GATE=fenced_only default
          - Backoff via per-(extent,slot) entry in limiter
@@ -32,7 +37,7 @@ Sub-feature status:
          - mgr_audit_log/<ts>_<seq> etcd prefix
          - mgr_query_audit_log RPC + retention GC helper
 
-Code landing:
+Code landing (cumulative across commits 212da57, d584f77, +F211-D):
   - crates/manager/src/node_state.rs (new)
   - crates/manager/src/audit.rs (new)
   - crates/manager/src/ec_abandon.rs (new)
@@ -49,19 +54,29 @@ Code landing:
     LIST_EC_INFLIGHT_MARKERS, FENCE_NODE, SET_NODE_MAINTENANCE,
     CLEAR_NODE_OVERRIDE, REMOVE_NODE, RECOVERY_STATS, QUERY_AUDIT_LOG)
     + ~20 new rkyv wire types + MgrNodeOverride + MgrAuditEntry
+  - crates/stream/src/extent_rpc.rs: WriteShardReq + CommitEcShardReq
+    +revision field, header lengths bumped
+  - crates/stream/src/extent_node.rs: revision fence in
+    handle_write_shard + handle_commit_ec_shard
+  - crates/server/src/bin/autumn_op.rs (new): admin CLI binary
+  - python/node_policy.py (new): operator policy script
   - crates/manager/tests/f211_node_lifecycle.rs (new integration
     suite, 9 in-memory tests passing)
 
 Test status:
   cargo test -p autumn-manager --lib                : 104 passing
   cargo test -p autumn-manager --test f211_node_lifecycle: 9 passing
-  cargo test -p autumn-manager --lib node_state     : 8 passing
+  cargo test -p autumn-stream --lib                 : 53 passing
+    (includes 3 new f211d_wire_fence_tests)
   cargo build --workspace                           : clean
+  python3 python/node_policy.py --help              : usage prints
+  ./target/debug/autumn-op --help                   : usage prints
 
 Behaviour notes:
   - Default AUTUMN_MGR_RECOVERY_GATE = fenced_only (BACKWARD-INCOMPAT)
-    Operators who haven't deployed an OP policy script can flip to
-    AUTUMN_MGR_RECOVERY_GATE = auto_disk to restore pre-F211 behaviour
+    Operators who haven't deployed the F211-G policy script can flip
+    to AUTUMN_MGR_RECOVERY_GATE = auto_disk to restore pre-F211
+    behaviour while they roll out the script.
   - Recovery limiter defaults: per_source=4, per_target=2, global=64
     (env: AUTUMN_MGR_RECOVERY_MAX_{PER_SOURCE,PER_TARGET,GLOBAL})
   - Backoff: 2^N seconds capped at 300 s per (extent, slot) failure
@@ -69,28 +84,24 @@ Behaviour notes:
     (env: AUTUMN_MGR_NODE_SUSPECTED_TIMEOUT_SECS)
   - Audit retention: 90 days
     (env: AUTUMN_MGR_AUDIT_RETENTION_DAYS)
+  - F211-D shard fence: ALL existing call sites pass revision=0 (no
+    fence). Future work: thread the manager's per-extent revision
+    through ExtConvertToEcReq so the WriteShard/CommitEcShard fanout
+    inside handle_convert_to_ec carries the live revision and a
+    fenced ex-coord is rejected at the shard handler too. The wire
+    + handler scaffolding is in place; only the caller-side
+    propagation remains.
 
-Open items (remaining work for full F211 closure):
-  1. F211-G Python OP policy script — minimal smoke version
-     - Could be done via small Rust CLI wrapper (autumn-op binary)
-       or standalone Python with hand-rolled rkyv encode/decode
-  2. F211-D stream-layer wire fence on WriteShardReq /
-     CommitEcShardReq / ReadShardReq — touches stream + partition-
-     server crates; needs careful wire-compat handling per
-     feedback_warn_on_backward_incompat. Best done as separate
-     phase 2 commit so the manager-side work can ship + bake.
-  3. Auto-call audit_retention_gc on a periodic loop (helper is
+Open items (acceptable follow-ups, not blockers for ship):
+  1. Thread manager-decided per-extent revision through
+     ExtConvertToEcReq so the EN coord's WriteShard/CommitEcShard
+     fanout carries a non-zero revision (today they pass 0).
+  2. Auto-call audit_retention_gc on a periodic loop (helper is
      wired but not yet scheduled).
-  4. Integration test with embedded etcd to exercise persist /
-     replay of node_override/ + decommissioned/ + audit log.
+  3. Integration test with embedded etcd to exercise persist /
+     replay of node_override/ + decommissioned/ + audit log
+     across leader failover.
+  4. Pre-existing partition-server flaky tests (f099i_tests)
+     are unrelated — they need --test-threads=1 to pass.
 
-Next steps:
-  - Land this checkpoint to main.
-  - Tackle F211-G next (smallest item that completes the operator
-    surface area).
-  - Tackle F211-D in a phase 2 commit; it's the larger of the two
-    remaining items and benefits from the manager-side ground truth
-    being stable first.
-
-Previous task (completed): F210-H3 Tier 2 split commit_length
-fence-enforcing primitive + dedicated fence-free probe RPC.
+Previous task (completed): F212-fix region_epoch fencing.

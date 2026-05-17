@@ -658,19 +658,26 @@ impl CopyExtentResp {
 
 // ── WriteShard (binary — large payload) ─────────────────────────────────────
 
-/// WriteShardRequest: [extent_id: u64 LE][shard_index: u32 LE][sealed_length: u64 LE][eversion: u64 LE][payload...]
+/// WriteShardRequest: [extent_id: u64 LE][shard_index: u32 LE][sealed_length: u64 LE][eversion: u64 LE][revision: i64 LE][payload...]
 ///
 /// `eversion` is the post-EC eversion the manager has decided on. The
 /// receiving extent node bumps `entry.eversion` to this value when it
 /// installs the shard, so subsequent ReadBytes requests with a stale
 /// (pre-EC) eversion are rejected with `CODE_EVERSION_MISMATCH`.
-pub const WRITE_SHARD_HEADER_LEN: usize = 28;
+///
+/// `revision` (F211-D) carries the owner-lock revision the caller
+/// claims. When `revision > 0` the extent-node refuses with
+/// `CODE_LOCKED_BY_OTHER` if `revision < entry.last_revision` — same
+/// fence model as the append path. `revision = 0` means "no fence
+/// requested" (pre-F211-D wire-compat).
+pub const WRITE_SHARD_HEADER_LEN: usize = 36;
 
 pub struct WriteShardReq {
     pub extent_id: u64,
     pub shard_index: u32,
     pub sealed_length: u64,
     pub eversion: u64,
+    pub revision: i64,
     pub payload: Bytes,
 }
 
@@ -681,6 +688,7 @@ impl WriteShardReq {
         buf.put_u32_le(self.shard_index);
         buf.put_u64_le(self.sealed_length);
         buf.put_u64_le(self.eversion);
+        buf.put_i64_le(self.revision);
         buf.extend_from_slice(&self.payload);
         buf.freeze()
     }
@@ -693,8 +701,9 @@ impl WriteShardReq {
         let shard_index = data.get_u32_le();
         let sealed_length = data.get_u64_le();
         let eversion = data.get_u64_le();
+        let revision = data.get_i64_le();
         let payload = data;
-        Ok(Self { extent_id, shard_index, sealed_length, eversion, payload })
+        Ok(Self { extent_id, shard_index, sealed_length, eversion, revision, payload })
     }
 }
 
@@ -718,13 +727,16 @@ impl WriteShardResp {
 
 // ── CommitEcShard (binary — phase-2 of 2PC EC conversion) ────────────────────
 
-/// CommitEcShardRequest: [extent_id: u64 LE][sealed_length: u64 LE][eversion: u64 LE]
-pub const COMMIT_EC_SHARD_HEADER_LEN: usize = 24;
+/// CommitEcShardRequest: [extent_id: u64 LE][sealed_length: u64 LE][eversion: u64 LE][revision: i64 LE]
+///
+/// F211-D: `revision` fence — see `WriteShardReq` for semantics.
+pub const COMMIT_EC_SHARD_HEADER_LEN: usize = 32;
 
 pub struct CommitEcShardReq {
     pub extent_id: u64,
     pub sealed_length: u64,
     pub eversion: u64,
+    pub revision: i64,
 }
 
 impl CommitEcShardReq {
@@ -733,6 +745,7 @@ impl CommitEcShardReq {
         buf.put_u64_le(self.extent_id);
         buf.put_u64_le(self.sealed_length);
         buf.put_u64_le(self.eversion);
+        buf.put_i64_le(self.revision);
         buf.freeze()
     }
 
@@ -743,7 +756,8 @@ impl CommitEcShardReq {
         let extent_id = data.get_u64_le();
         let sealed_length = data.get_u64_le();
         let eversion = data.get_u64_le();
-        Ok(Self { extent_id, sealed_length, eversion })
+        let revision = data.get_i64_le();
+        Ok(Self { extent_id, sealed_length, eversion, revision })
     }
 }
 
