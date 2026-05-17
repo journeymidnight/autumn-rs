@@ -1,219 +1,85 @@
 Date: 2026-05-17
-TaskStatus: completed
-Task scope: F210-H3 Tier 2 — split commit_length into a clean
-            fence-enforcing primitive + a dedicated fence-free
-            probe RPC. Supersedes the interim H3 revert (which
-            kept rev=0 as a "documented sentinel"; user pushed
-            back that a sentinel is still a sentinel).
+TaskStatus: not_completed
+Task scope: F211 series — Operator-Driven Node Lifecycle (plan
+            only, no code yet). Refactor autumn-rs node-death
+            judgment from "manager auto-detects + immediate
+            recovery" to HDFS decommission style "OP-driven
+            fence + manager exposes facts". Addresses:
+              (a) EC convert coordinator 永久死亡时 marker 卡死
+                  导致 F138 互斥锁死 recovery 的死局
+              (b) 当前节点故障判定过于激进 (心跳 10s 超时立即
+                  dispatch recovery), 网络抖动引发不必要的
+                  跨节点重建
+              (c) 缺乏 fencing 防护，假死复活节点可对 sealed EC
+                  extent 造成 split-brain
 
-Design:
-  - MSG_COMMIT_LENGTH now REJECTS revision <= 0 (was: bypass
-    sentinel). Surviving logic is the clean fence primitive:
-    rev<last → LOCKED, rev>last → bump+persist .meta.
-  - New MSG_PROBE_EXTENT = 14: 8-byte req (extent_id),
-    5-byte resp (code, length). No revision, no fence, no
-    mutation. Same `(code, length)` shape as CommitLengthResp.
-  - Manager helpers: commit_length_on_node now takes
-    `revision: i64` (debug_assert > 0); new probe_extent_on_node
-    sibling.
-  - Seal call sites pass req.revision (validated by
-    ensure_owner_revision): handle_check_commit_length:749 +
-    handle_stream_alloc_extent:965. Side-effect: fence handover
-    now happens at seal probe, EARLIER than first append.
-  - Probe-only call sites switched to probe_extent_on_node:
-    recovery_dispatch_loop liveness check, autumn-client info
-    open-extent length display, 3 test helpers
-    (extent_restart_recovery ×2, f021_multi_disk ×2).
-  - Wire docstrings on extent_rpc::CommitLengthReq +
-    ProbeExtentReq + MSG_PROBE_EXTENT const + manager_rpc
-    mirrors lock the contract: rev=0 on MSG_COMMIT_LENGTH is
-    protocol error, not sentinel.
+Design summary (full plan in
+/Users/zhangdongmao/.claude/plans/ec-convert-marker-coordiator-enumerated-adleman.md):
+  - Manager 自动跟踪 Online ↔ Suspected (心跳), 不自动进 Down
+  - OP policy script 综合外部证据 (ssh/k8s/监控) + manager 事实
+    后通过 admin RPC 显式 fence
+  - Fence 是 cleanup 同步点: bump owner-lock revision +
+    auto-abandon 关联 EC marker + 让 recovery 接管副本重建
+  - EC convert reissue 不自动, 由 OP script 自己发现 advisory
+    后调 force_ec_convert
+  - 业界对标: HDFS decommission 模式 / Ceph noout + osd out
+  - Fencing 复用 owner-lock revision (新加 shard read/write/
+    commit fence), 假死 coord 复活后写入被拒
 
-Backward compat: manager + EN must upgrade together (rev=0 now
-rejected on wire). External clients never sent rev=0, no
-end-user impact. autumn-client's `info` upgraded in same
-binary, atomic.
+子 feature 拆分 (passes:false, 待实现):
+  F211-A  NodeStateTracker (Online ↔ Suspected, auto in-memory)
+  F211-B  Health reporting RPCs (list_node_states /
+          extent_health_report / list_ec_inflight_markers)
+  F211-C  Operator fence / maintenance / clear / remove admin
+          RPCs (含容量预检 #5 + zombie 防护 #2 + maintenance
+          TTL #6)
+  F211-D  Owner-lock revision bump on fence + shard
+          read/write/commit revision fence (含读路径 fence #4)
+  F211-E  Recovery loop gated by Fenced state + 指数退避 (#7)
+  F211-F  EC convert auto-abandon on fence + Suspected-window
+          dispatch 跳过 (#3)
+  F211-G  Python OP policy script (python/node_policy.py)
+  F211-H  Recovery 节流 + 优先级 (per-source/target/global
+          concurrency limits, #1)
+  F211-I  Operator action audit log (#8)
 
-Verified:
-  - cargo test -p autumn-stream --lib (53 passed)
-  - cargo test -p autumn-manager --lib (89 passed)
-  - cargo test -p autumn-stream --test extent_restart_recovery
-    --test f021_multi_disk (6 passed)
-  - cluster.sh restart 4 → all 3 partitions open cleanly first
-    try, all commit_length OK
-  - autumn-client info shows open-extent sizes via probe
-  - put/get smoke test round-trips
+落地顺序: A → B → I → C → D → H → G → E → F
+  - 1-7 (A,B,I,C,D,H,G) 是基建, 可一起合到 main
+  - 8-9 (E,F) 是行为切换, 必须 G policy script 就绪后才能上线
 
-Date: 2026-05-17 (earlier)
-TaskStatus: completed
-Task scope: F210-H3 (interim revert, superseded by Tier 2 above).
-            Originally just restored `if req.revision > 0 &&
-            req.revision < last` in handle_commit_length to fix
-            the post-upgrade restart loop. User pushed back that
-            rev=0 sentinel is still a code smell; Tier 2 split
-            the RPCs and removed the sentinel entirely.
+向后兼容警告 (per feedback_warn_on_backward_incompat):
+  - 节点故障默认不再自动重建 (env var AUTUMN_MGR_RECOVERY_GATE=
+    auto_disk 临时回滚)
+  - EC convert 不再 stuck 等运维 etcdctl (fence 后自动 abandon)
+  - Recovery 现在有并发上限 (默认 max_global=64)
+  - 新 etcd prefix: node_override/, ec_convert_advisory/,
+    decommissioned/, mgr_audit_log/ (回滚需 etcdctl 清空)
+  - 9 个新 MSG_ 常量; WriteShardReq/CommitEcShardReq/
+    ReadShardReq 加 revision (rkyv 字段扩展, partition server
+    需同步升级)
+  - Fenced/Decommissioned 节点 register 会被拒
 
-Date: 2026-05-16
-TaskStatus: completed
-Task scope: F210-E (E1, E2, E3) + F210-F (F1-F6) + F210-G (G1, G2) + F210-H1 —
-            12 remaining post-codex review items spanning stream layer
-            (handle_re_avali, stale-VP sentinel), partition layer
-            (defensive auto-compact), and manager (policy/advisory
-            stability, PS eviction etcd mirror, persisted delete retry).
-            All landed in one batch.
+关键不变量 (本 plan 完全不动):
+  - F138 marker 在阻塞 recovery (marker 删除仍是同步点)
+  - F149 leader fence
+  - F119-D EC convert 幂等 guard
+  - F153 per-extent ec_conversion_locks
+  - F207 marker rich state + replay
+  - Reed-Solomon 编码确定性
+  - owner-lock revision 协议 (新增使用点, 协议本身不变)
 
-F210-E sub-features:
-  E1 — handle_re_avali replicated path acquires concurrency permit
-       - crates/stream/src/extent_node.rs (handle_re_avali)
-       - Hooks `acquire_recovery()` AFTER the EC short-circuit + the
-         already-up-to-date check and BEFORE
-         `fetch_full_extent_from_sources`. RAII permit held for the
-         remainder of the replicated repair path. Same shared pool
-         as `run_recovery_task` (default 2, env
-         AUTUMN_EXTENT_RECOVERY_PARALLELISM).
-
-  E2 — Defensive auto-compact for SST count runaway
-       - crates/partition-server/src/background.rs
-       - New `MAX_SST_BEFORE_AUTO_COMPACT = 32` const. The
-         compact loop's timeout arm calls `pickup_tables` +
-         `do_compact(major=false)` when `sst_readers.len() >`
-         the threshold AND `compact_inflight == 0`. Threshold
-         picked to keep the 1% per-SST bloom FPR's cumulative
-         miss-path false-positive bounded (≤ 28% at N=32 vs 63%
-         at N=100). Mechanism-level defensive bound — not a
-         policy knob; not env-tunable.
-
-  E3 — compute_ec_advisory per-tick cap
-       - crates/manager/src/policy.rs (compute_ec_advisory)
-       - New `MAX_EC_ADVISORY_CANDIDATES = 256` const. Sorts by
-         sealed_length desc + truncates after collection. Caps
-         the advisory_cache + MSG_GET_POLICY_CANDIDATES payload
-         at ~1 MiB to stay under etcd's max-request-bytes.
-
-F210-F sub-features:
-  F1 — Freeze policy kind enum + const-dump RPC
-       - crates/rpc/src/manager_rpc.rs:
-         + WIRE-STABILITY docstring above the POLICY_KIND_*
-           block: numeric values frozen, new kinds APPEND only.
-         + New `MSG_GET_POLICY_KIND_NAMES = 0x3B` const-dump RPC.
-         + `policy_kind_names()` helper returning a Vec of
-           (String, u8) pairs.
-       - crates/manager/src/rpc_handlers.rs: dispatch +
-         `handle_get_policy_kind_names` (no leader gate — the
-         answer is a compile-time constant of THIS binary).
-
-  F2 — Sustained N buckets actually means N × bucket_sec
-       - crates/manager/src/policy.rs:
-         `PartitionMetricsWindow::push_with_cap_and_bucket`
-         snaps incoming ts to bucket_sec boundary; same bucket
-         as previous → REPLACE (last-wins within a bucket).
-         Pre-F210-F2 every PS 5 s report became its own bucket;
-         required_buckets=5 represented 25 s, not 5 min.
-
-  F3 — Metrics freshness + ownership prune
-       - crates/manager/src/policy.rs: new
-         `PolicyEngine::prune_stale_metrics(state, now)`.
-       - crates/manager/src/lib.rs (policy_tick_loop): call at
-         top of tick BEFORE compute_*_advisory.
-       - Drops metrics for partitions no longer in state.partitions;
-         drops windows whose latest bucket is older than
-         STALE_METRICS_AGE_SEC = 300; prunes last_hot_cold_at for
-         evicted PSes.
-
-  F4 — Hot/cold same-partition band guard
-       - crates/manager/src/policy.rs (compute_hot_cold_advisory)
-       - New `HOT_COLD_BAND_DIVISOR = 2` const. A partition
-         qualifies as hot only when its min ≥ qps_hottest / D;
-         cold only when its max ≤ qps_coldest * D. Same on size.
-         Empty band → suppress dimension. Closes the "rotating
-         hotspot appears on BOTH lists" case.
-
-  F5 — PolicyConfig.window_buckets becomes load-bearing
-       - crates/manager/src/rpc_handlers.rs
-         (handle_report_partition_load) now reads
-         `p.config.window_buckets / p.config.bucket_sec` and
-         calls `push_with_cap_and_bucket` instead of the
-         hardcoded `push`. set_policy_config now reshapes the
-         history window at runtime.
-
-  F6 — handle_get_policy_candidates leader gate
-       - crates/manager/src/rpc_handlers.rs
-       - Mirrors F209-A's pattern. Returns CODE_NOT_LEADER +
-         empty `candidates` Vec when not leader.
-
-F210-G sub-features:
-  G1 — PS eviction etcd mirror + heartbeat seed on replay
-       - crates/manager/src/lib.rs:
-         + ps_liveness_check_loop now explicitly DELETEs
-           `psNodes/<evicted_id>` via fenced put_and_delete_txn
-           before mirror_partition_snapshot.
-         + replay_from_etcd seeds
-           `ps_last_heartbeat[ps_id] = Instant::now()` for every
-           replayed PS so the liveness loop's `Some(t)` arm
-           engages after PS_DEAD_TIMEOUT.
-       - Together (1) prevents etcd resurrection of the dead PS
-         and (2) hands every replayed PS one fresh eviction
-         window. The pre-F210-G1 None-arm-as-alive bug is now
-         unreachable.
-
-  G2 — Persisted retry queue for budget-exhausted deletes
-       - crates/manager/src/extent_delete.rs: new
-         `MgrExtentDeleteRetry` rkyv struct, new
-         `EXTENT_DELETE_RETRY_PREFIX = "extentDeleteRetry/"`,
-         new `persist_failed_delete()` +
-         `extent_delete_retry_loop()`. Exponential backoff
-         (60 s base, 1 hr ceiling, 2× per attempt up to 6 shifts).
-       - crates/manager/src/lib.rs: new `failed_deletes` field
-         on AutumnManager; replay_from_etcd rehydrates from the
-         prefix; start_runtime_tasks spawns the retry loop.
-       - The inflight ledger Delete marker is still RELEASED
-         when the entry moves to the persisted retry queue (so
-         future ops on the extent aren't blocked) — the retry
-         queue is orthogonal etcd state.
-
-F210-H sub-features:
-  H1 — Replicated read stale-VP sentinel
-       - crates/stream/src/client.rs (read_with_layout)
-       - Upfront check at top of read_with_layout: if
-         `ex.sealed_length > 0 && offset > ex.sealed_length`,
-         construct and return `StaleVpOffset { extent_id,
-         requested_offset, requested_length, sealed_length }`
-         BEFORE branching on `ex.ec_converted`. Covers both
-         replicated and EC paths uniformly; EC's
-         ec_slice_decoded retains its own check as
-         defense-in-depth. Skips the wasted server round-trip +
-         EC decode on a known-stale VP. Operational tooling's
-         `stale_vp_offset_past_sealed_length:` regex now fires
-         on replicated cases too.
-
-Files touched:
-  - crates/stream/src/client.rs (H1)
-  - crates/stream/src/extent_node.rs (E1)
-  - crates/partition-server/src/background.rs (E2)
-  - crates/manager/src/policy.rs (E3, F2, F3, F4)
-  - crates/manager/src/rpc_handlers.rs (F1, F5, F6)
-  - crates/manager/src/lib.rs (F3 prune call site, G1 + G2 fields + replay + spawn)
-  - crates/manager/src/extent_delete.rs (G2 retry queue + loop)
-  - crates/rpc/src/manager_rpc.rs (F1 const-dump RPC + freeze docstring)
-  - feature_list.md (E/F/G/H1 status flips to passes:true with rationale)
-  - claude-progress.txt (this file)
-
-Verification:
-  - cargo build --workspace --exclude autumn-fuse: clean.
-  - cargo test -p autumn-manager --lib: 89 passed (unchanged count;
-    F210 changes are additive — F2 bucketing test fixtures already
-    space timestamps by POLICY_BUCKET_SEC so all 32 policy tests
-    still pass; F3 prune + F4 band + F5 config + F6 leader gate +
-    G1 mirror + G2 queue all confirmed-clean).
-  - cargo test -p autumn-stream --lib: 53 passed.
-  - cargo test -p autumn-partition-server --lib: 2 pre-existing
-    f099i fast-path failures (independent — same failures on a
-    stash of all F210-E/F/G/H1 changes; not introduced by this
-    commit).
+Status: plan approved by user, feature_list.md entries written
+(F211-A through F211-I, passes:false). 代码实现尚未开始, 由用户
+后续推进。
 
 Next steps:
-  - F210-A (Etcd-first + verify-BEFORE + replay-then-leader)
-    already shipped pre-F210-B. F210-B/C/D/E/F/G/H1 all shipped.
-  - F210-B1 stays Deferred (write fanout N-of-N preserved; no
-    "missed-bytes re_avali" protocol yet).
-  - F210 backlog now complete except for the deferred B1.
+  - 实现按落地顺序逐个 sub-feature 推进
+  - 每个 sub-feature commit 时更新 feature_list.md 的 passes
+    字段
+  - F211-E 切换前确认 F211-G policy script 已部署 + 监控渠道
+    准备好
+  - 阶段化部署: F211-A/B/I/C/D/H/G 合一波 (基建),
+    F211-E/F 单独上线 + 观察
+
+Previous task (completed): F210-H3 Tier 2 split commit_length
+fence-enforcing primitive + dedicated fence-free probe RPC.

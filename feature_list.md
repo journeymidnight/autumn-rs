@@ -2732,3 +2732,112 @@ Cleared by audit (no fix needed):
 - **Default decision:** `ps_flush_inflight_cap` defaults to **1** (functional parity with pre-F197). Operators with workloads where the bottleneck isn't EN-disk (single-partition split-followup compaction, VP-heavy imm with small SST + big log_stream tail, short burst → drain) can opt in via `--flush-inflight-cap 4`. `ps_bulk_inflight_cap` default reverted to 2 (the R4 4.4 long-standing value).
 - **Files:** `crates/partition-server/src/lib.rs` (new `FlushOutcome`/`run_flush_async_phase`/`commit_flush_outcome`/rewritten `background_flush_loop`; deleted `flush_one_imm_local`; new `PS_FLUSH_INFLIGHT_CAP_CELL` + setter); `crates/server/src/bin/partition_server.rs` (CLI flag); `cluster.sh` (env passthrough); 139/139 PS lib pass.
 - **passes:** true. 120 s long-run cap=1 (effective serial flow) matches pre-F197 numbers within noise. Parallel infrastructure validated by code review + 139 tests; speedup is preserved for future workload shifts.
+
+---
+
+## P6 — Operator-Driven Node Lifecycle (F211 series)
+
+Background: autumn-rs 当前节点死亡判定模型过于激进——心跳 10s 超时即立即 dispatch recovery，一次网络抖动就触发跨节点重建；同时 EC convert 过于保守（F209-C WARN-only），coordinator 永久死亡时 marker 卡在 etcd 形成死局。F211 series 重构整个模型走业界主流 OP-driven 路线（类比 HDFS decommission / Ceph `noout`）：manager 提供事实（Online/Suspected 自动跟踪 + extent health 报告），OP policy script 综合外部证据后通过 admin RPC 显式 fence。Plan 详见 `/Users/zhangdongmao/.claude/plans/ec-convert-marker-coordiator-enumerated-adleman.md`。
+
+### F211-A · NodeStateTracker (Online ↔ Suspected, auto in-memory)
+- **Trigger:** 单节点心跳/df 超时 10s 后 manager 需要软标记节点状态，但**不能**自动判定为 Down（业界主流不让 manager 自动判死）。
+- **Goal:** 新增 `crates/manager/src/node_state.rs` 含 `enum NodeAutoState { Online, Suspected { since: Instant } }` + `struct NodeStateTracker`。`Online → Suspected` 心跳/df 失败 ≥ `AUTUMN_MGR_NODE_SUSPECTED_TIMEOUT_SECS`（默认 10s）；`Suspected → Online` 心跳恢复；**没有自动 Down 转换**。
+- **Hook points:** `crates/manager/src/lib.rs:1305-1350` PS liveness loop 接入 tracker（保留现有 evict 并存观察）；`crates/manager/src/recovery.rs:571-641` `disk_status_update_loop` 喂 df 结果。
+- **Acceptance:**
+  - 单元测试：Online ↔ Suspected 转换分支（心跳成功、心跳失败、df 失败、tick 推进）。
+  - 集成测试：模拟 EN 不响应 10s → tracker 显示 Suspected；30 min 后仍为 Suspected（不自动 Down）。
+- **passes:** false
+
+### F211-B · Health reporting RPCs（manager 暴露事实，只读）
+- **Trigger:** OP policy script 需要从 manager 拉取节点健康事实 + extent 副本健康度 + inflight EC marker 关联状态，才能综合判断是否 fence。
+- **Goal:** 3 个新只读 RPC：
+  - `mgr_list_node_states() -> Vec<NodeStateEntry>` 含 auto state + override + last_heartbeat_secs_ago。
+  - `mgr_extent_health_report(filter?) -> Vec<ExtentHealth>` 每个 extent 各 slot 健康（avali 位图 + 持有 node_id 的状态）；可按 node_id filter。
+  - `mgr_list_ec_inflight_markers() -> Vec<InflightWithCoordState>` marker 列表 + coord 当前节点状态。
+- **Files:** `crates/manager/src/rpc_handlers.rs` 新增 handler；`crates/rpc/src/manager_rpc.rs` 新 MSG_ 常量 + rkyv Req/Resp 结构。
+- **Acceptance:**
+  - 单元测试：聚合逻辑（按 node_id filter、unhealthy 判定）。
+  - 集成测试：模拟一个节点 Suspected → 调 RPC 返回 last_heartbeat_secs_ago 准确。
+- **passes:** false
+
+### F211-C · Operator fence / maintenance / clear / remove admin RPCs (etcd-persisted)
+- **Trigger:** 运维需要 4 种显式操作：fence（确认死亡触发 cleanup）、maintenance（暂时不可用但不要重建）、clear（撤销 override）、remove（recovery 完成后彻底移除）。覆盖 HDFS decommission 全流程。
+- **Goal:** 新 etcd prefix `node_override/{node_id}` → rkyv `MgrNodeOverride { kind, set_at, set_by, reason, expire_at?: Option<u64> }`。4 个 admin RPC:
+  - `mgr_fence_node(node_id, reason)` — 含**容量预检**（漏洞 #5）：计算待迁移数据 + 剩余可用容量，不足时返回 PRECONDITION，运维 `--force` 跳过。
+  - `mgr_set_node_maintenance(node_id, reason, expire_at?)` — 支持 TTL（漏洞 #6）：`NodeStateTracker.tick()` 检测过期自动 clear。
+  - `mgr_clear_node_override(node_id)` — 撤销 override。
+  - `mgr_remove_node(node_id)` — 安全前置：节点必须 Fenced + 无任何 extent.replicates/parity 引用 + 无任何 inflight marker.target_nodes 引用，全部通过后原子 etcd txn 删 override + 删节点注册 + 写 `decommissioned/{node_id}` 永久墓碑（漏洞 #2 zombie 防护）。
+- **Zombie 防护（漏洞 #2）:** 节点注册路径检查 `decommissioned/{node_id}` 或 `node_override/{node_id}=Fenced` → 拒绝注册。防止已移除 node_id 复用 + Fenced 节点偷偷复活重连。
+- **F149 leader fence:** failover 时从 etcd replay overrides。`mgr_fence_node` 触发 F211-D + F211-F 内部逻辑（fence 是 cleanup 同步点）。
+- **Acceptance:**
+  - 单元测试：override 优先于 auto state；remove 在节点非 Fenced 时返回 PRECONDITION；remove 在仍有 extent / marker 引用时返回 PRECONDITION + 详细列表；容量预检在剩余容量不足时拒绝；maintenance TTL 过期自动 clear。
+  - 集成测试：fence → 等 recovery → remove 完整 lifecycle。
+- **passes:** false
+
+### F211-D · Owner-lock revision bump on fence + shard read/write/commit revision fence
+- **Trigger:** Fence 之后必须防止假死复活的老 coord 继续向 target ENs 写数据 / 服务 stale read。当前只 append 路径有 owner-lock revision fence，shard 读/写/commit 三个 handler 都没有 fence。
+- **Goal:** `mgr_fence_node` 处理流程内部对该节点持有 ownership 的所有 extent batch bump owner-lock revision（复用 `acquire_owner_lock` 或新建 batch 函数）。**三个 EN handler 都加 revision fence**：
+  - `handle_write_shard` (`extent_node.rs:4372-4395`)：拒绝 `req.revision < last_revision`。
+  - `commit_shard_local` (`extent_node.rs:2954`)：同样加 fence。
+  - **`handle_read_shard` / 读 extent 路径**（漏洞 #4）：加 fence 防止 client 通过 stale cache 读到老 EN 过期 shard；fence 失败返回明确错误让客户端回 manager 取最新 location。
+- **Wire-compat（per `feedback_warn_on_backward_incompat`）:** `WriteShardReq` / `CommitEcShardReq` / `ReadShardReq` 加 `revision: u64` — rkyv 结构变化，需 V2 message id 或字段末尾追加 + 兼容回退。读路径变化要求 partition server client 也升级。
+- **Acceptance:**
+  - 单元测试：write_shard / commit_shard / read_shard 在 revision < last_revision 时返回 PRECONDITION。
+  - 注入测试：fence 后老 client 携带旧 revision 的所有操作（读+写+commit）100% 被拒。
+  - 集成测试：模拟假死 coord 复活，所有请求被拒；客户端缓存的旧 location 也无法读到 stale 数据。
+- **passes:** false
+
+### F211-E · Recovery loop gated by Fenced state + 指数退避
+- **Trigger:** 当前 `recovery_dispatch_loop` 看到 `disk.online == false` 立即触发，对网络抖动过激进。改为只看 OP 显式 Fenced 状态。同时给 recovery 失败加指数退避防止刷日志（漏洞 #7）。
+- **Goal:** `recovery.rs:355-484` `recovery_dispatch_loop` 判定条件从 `disk.online == false` 改为 `node 状态为 Fenced`。每 (extent_id, slot) 维护 in-memory retry 状态 `{ last_attempt_at, consecutive_failures }`，失败时指数退避（2^N 秒，上限 5 min），成功清空。F138 互斥**完全不动**（marker 在仍阻塞）。
+- **Backward-incompat（per `feedback_warn_on_backward_incompat`）:** 单节点故障默认不再自动重建，必须 OP 显式 fence；env var `AUTUMN_MGR_RECOVERY_GATE = auto_disk | fenced_only`（default `fenced_only`）可临时回滚。**必须先让 F211-G policy script 上线**后才能切此改动，否则故障永不修复。
+- **Acceptance:**
+  - 集成测试：节点故障但未 fence → recovery 不触发；fence 后才触发。
+  - 集成测试：注入持续失败的 recovery 任务 → 验证指数退避（日志频率随时间衰减）。
+  - 性能验证：transient 故障（< soft_timeout 内恢复）不再引发误重建。
+- **passes:** false
+
+### F211-F · EC convert auto-abandon on coord fenced + Suspected-window dispatch 跳过
+- **Trigger:** Coord 节点 Fenced 后 inflight marker 必须自动 abandon（释放 F138 互斥），同时 dispatch loop 在 Suspected 窗口不该刷无效 dispatch 日志（漏洞 #3）。
+- **Goal:** 新文件 `crates/manager/src/ec_abandon.rs`。监听 `mgr_fence_node` 完成 → 扫 inflight markers 找 `target_nodes[0] == node_id` 的 → 原子 etcd txn delete marker + put `ec_convert_advisory/{id}` 审计 entry + 同步清理内存 ledger（revision 已在 F211-D bump）。`extent_inflight_stale_sweep_loop` (`extent_inflight.rs:426`) 从 WARN-only 改为**只写 advisory entry，不删 marker**（visibility，让 OP script 周期扫发现"该考虑 fence"）。`ec_conversion_dispatch_loop` (`recovery.rs:700`) 每次 dispatch 前查 NodeStateTracker：coord 为 Suspected/Fenced/Maintenance 则**本 tick 跳过**（不报错、不刷日志）。**EC convert reissue 不自动**——由 OP policy script 自己发现后调 `force_ec_convert`。
+- **Acceptance:**
+  - 集成测试：fence coord 节点 → inflight marker 自动消失 + advisory entry 出现。
+  - 集成测试：调 force_ec_convert 重发后 advisory 自动清除。
+  - 集成测试：coord Suspected 窗口期 ec_conversion_dispatch_loop 不刷错误日志。
+- **passes:** false
+
+### F211-G · Python OP policy script (`python/node_policy.py`)
+- **Trigger:** F211-E 切语义后 manager 不再自动 recovery，必须有 OP 工具周期消费 health RPC + 触发 admin action，否则集群故障无人修。
+- **Goal:** 新文件 `python/node_policy.py`（遵循 `feedback_ops_tools_in_python.md`，不动 autumn-client）。周期/一次性两种模式。命令：
+  - 只读视图：`list` / `inspect <node>` / `inspect-extent <id>` / `list-stale-markers`
+  - 决策 admin：`fence <node>` / `maintenance <node> [--expire 1h]` / `unfence <node>` / `remove <node>` / `reissue-ec <extent_id>`
+  - 整合 lifecycle：`decommission <node>` — fence → 轮询等 recovery → remove（类比 `hdfs dfsadmin -decommission`）
+  - 半自动：`auto-reissue --dry-run` — 扫 advisory + 验证 extent 3R 健康 + 调 force_ec_convert
+- **安全:** fence/remove 前显示 manager view + 交互式 confirm（`--yes` 跳过）。
+- **Acceptance:**
+  - 手动验证完整 runbook（fence → 等 recovery → remove → reissue-ec）。
+  - dry-run 模式产生合理输出。
+- **passes:** false
+
+### F211-H · Recovery 节流 + 优先级（漏洞 #1）
+- **Trigger:** 一个大节点死亡 = 几千 extent 同时需 recovery；当前无任何限流，会饱和网络 + 打爆源/目标节点 IO + 拖慢 client。
+- **Goal:** `crates/manager/src/recovery_rate_limiter.rs`（新文件）含 `RecoveryRateLimiter`：
+  - `max_concurrent_per_source: u32`（默认 4，从源节点同时拉数据）
+  - `max_concurrent_per_target: u32`（默认 2，target 同时写入）
+  - `max_global_concurrent: u32`（默认 64，全局上限）
+- `recovery_dispatch_loop` 每次选 candidate 时跑限流检查。优先级队列：副本数最少的 extent 优先（接近不可恢复阈值的优先），同优先级按 extent_id 排序保证公平。
+- env vars: `AUTUMN_MGR_RECOVERY_MAX_PER_SOURCE` / `..._PER_TARGET` / `..._MAX_GLOBAL`。新 RPC `mgr_recovery_stats() -> RecoveryStatsResp`（in-flight count、queue depth、per-node IO 估算）暴露监控。
+- **Acceptance:**
+  - 单元测试：限流器在达到阈值时阻塞新 dispatch。
+  - 集成测试：fence 一个大节点（100+ extents）→ 验证 dispatch 并发不超过 max_global。
+  - 性能测试：限流下 client 读写延迟不被 recovery IO 显著拖慢。
+- **passes:** false
+
+### F211-I · Operator action audit log（漏洞 #8）
+- **Trigger:** 当前 `node_override` 只记最后一次 set，没有完整操作历史，合规 / 调试需要审计：谁 fence 了什么、何时、原因。
+- **Goal:** 新文件 `crates/manager/src/audit.rs` + 新 etcd prefix `mgr_audit_log/{timestamp_ns}_{op_id}` → rkyv `MgrAuditEntry { op, node_id?, extent_id?, by, reason, result }`。所有 admin RPC 内部 wrap 一层：成功/失败后 append audit entry。覆盖：fence_node / set_node_maintenance / clear_node_override / remove_node / force_ec_convert / force_abandon_ec_marker。新 RPC `mgr_query_audit_log(filter, limit, since?, until?) -> Vec<MgrAuditEntry>`。GC 策略：定期删除老于 `AUTUMN_MGR_AUDIT_RETENTION_DAYS`（默认 90 天）的 entry。
+- **Acceptance:**
+  - 单元测试：每个 admin RPC 后写入 audit entry。
+  - 集成测试：query_audit_log 按 时间 / op type / node_id filter 正确。
+  - 持久性测试：leader failover 后 audit log 完整。
+- **passes:** false
