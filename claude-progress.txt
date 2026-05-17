@@ -1,3 +1,25 @@
+Date: 2026-05-17
+TaskStatus: completed
+Task scope: F210-H3 — revert F210-H2 (commit_length fence loophole
+            closure). Post-upgrade restart regression: every PS
+            partition open looped `available nodes 0 less than required 2`
+            and recovery_dispatch fired spurious copies. Root cause:
+            manager's internal probe path (`commit_length_on_node` in
+            lib.rs:2116) passes `revision: 0` from two call sites
+            (handle_check_commit_length's seal-consensus fanout +
+            recovery liveness probe). After F210-H2 dropped the rev=0
+            escape, every extent with last_revision > 0 (i.e. every
+            previously-written extent) returned LOCKED_BY_OTHER to the
+            probe → alive=0 → seal refused → PS retry loop forever.
+            Fix: restored `if req.revision > 0 && req.revision < last`
+            in handle_commit_length with a multi-paragraph comment
+            naming both manager probe paths and explaining why
+            commit_length doesn't need write-fencing (handle_append is
+            the load-bearing site for owner-lock).
+            Verified: cluster.sh restart 4 → all 3 partitions open
+            cleanly first try (logStream/rowStream/metaStream
+            commit_length OK), put/get smoke test passes.
+
 Date: 2026-05-16
 TaskStatus: completed
 Task scope: F210-E (E1, E2, E3) + F210-F (F1-F6) + F210-G (G1, G2) + F210-H1 —

@@ -3275,15 +3275,39 @@ impl ExtentNode {
                 )
             })?;
 
-        // F210-H2: drop the `req.revision > 0` escape hatch so a stale
-        // / zero-revision caller can't bypass the owner-lock fence and
-        // observe commit_length. Symmetric to F119-C's same fix on
-        // eversion=0 in the read path. EN startup default is
-        // `last_revision = 0`, so a fresh extent with `req.revision = 0`
-        // still passes the `>= last` check (0 >= 0). Only the
-        // "explicitly skip fence" escape is closed.
+        // The `req.revision > 0` escape hatch is load-bearing for the
+        // manager's two internal probe paths, both of which pass
+        // `revision: 0` because they have no PS-owner context:
+        //   - `handle_check_commit_length`'s per-replica probe
+        //     (`commit_length_on_node` in manager/lib.rs) — the PS
+        //     hits this every partition open and every seal.
+        //   - `dispatch_recovery_loop`'s liveness probe (same helper,
+        //     called via `recovery.rs::is_ok()`).
+        // Without the escape, any extent whose `last_revision > 0`
+        // (i.e. ever written to by a prior PS session) rejects the
+        // probe with CODE_LOCKED_BY_OTHER. The manager treats that as
+        // "node unavailable" → alive=0 in the seal path (refusing
+        // partition open with "available nodes 0 less than required 2"),
+        // and as "replica dead" in the recovery loop (firing spurious
+        // recovery dispatches that surface as "no source replica
+        // available for copy" once they hit the recovering EN).
+        //
+        // F210-H2 (commit 816df57, reverted here) closed the escape on
+        // the grounds that it "let any caller observe commit_length on
+        // a stream they don't own". That conflates two distinct
+        // concerns:
+        //   - owner-lock fence: prevents stale writers from corrupting
+        //     the seal point. Enforced in `handle_append` for the write
+        //     path; that's the right place.
+        //   - read access control: not a property the extent-node was
+        //     ever designed to provide — there's no authentication on
+        //     EN RPCs, and `read_bytes` is unfenced too.
+        // The write fence is unaffected by this escape (no append path
+        // honours revision=0). The `if req.revision > last` mutation
+        // below requires strictly-positive revision to advance, so a
+        // zero-revision probe can never weaken the fence either.
         let last = entry.last_revision.load(Ordering::SeqCst);
-        if req.revision < last {
+        if req.revision > 0 && req.revision < last {
             return Ok(CommitLengthResp {
                 code: CODE_LOCKED_BY_OTHER,
                 length: 0,
