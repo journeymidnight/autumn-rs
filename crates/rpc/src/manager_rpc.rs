@@ -275,6 +275,14 @@ pub struct MgrPartitionVpRefs {
 }
 
 /// Region (partition→PS assignment).
+///
+/// `region_epoch` is a monotonic counter bumped by the manager whenever
+/// `rg` is rewritten — split (both children get a new epoch), merge
+/// (survivor gets a new epoch). Modeled after TiKV's `region_epoch`:
+/// clients stamp their cached epoch on every PS request so the PS can
+/// reject stale routing without a manager round-trip. Bootstrap value
+/// is 1; `0` is reserved as "unknown / skip check" so legacy callers
+/// and tests that don't populate it stay backward-compatible.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct MgrRegionInfo {
     pub rg: Option<MgrRange>,
@@ -283,6 +291,7 @@ pub struct MgrRegionInfo {
     pub log_stream: u64,
     pub row_stream: u64,
     pub meta_stream: u64,
+    pub region_epoch: u64,
 }
 
 /// Partition server detail.

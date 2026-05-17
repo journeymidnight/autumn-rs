@@ -146,6 +146,16 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
 
     let lookup_t0 = Instant::now();
     let p = part.borrow();
+    // TiKV-style region epoch check. `0` from the client = "skip check"
+    // (bootstrap / tests / legacy callers). On mismatch surface a
+    // FailedPrecondition frame error so the SDK's existing `Err`-arm
+    // refresh+retry path in `call_ps_for_key` engages.
+    if req.region_epoch != 0 && req.region_epoch != p.region_epoch {
+        return Err((StatusCode::FailedPrecondition, format!(
+            "region epoch stale: part_id={} have={} got={}",
+            p.part_id, p.region_epoch, req.region_epoch
+        )));
+    }
     if !in_range(&p.rg, &req.key) {
         return Err((StatusCode::InvalidArgument, "key is out of range".to_string()));
     }
@@ -259,6 +269,12 @@ pub(crate) async fn handle_head(payload: Bytes, part: &Rc<RefCell<PartitionData>
     let req: HeadReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
     let p = part.borrow();
+    if req.region_epoch != 0 && req.region_epoch != p.region_epoch {
+        return Err((StatusCode::FailedPrecondition, format!(
+            "region epoch stale: part_id={} have={} got={}",
+            p.part_id, p.region_epoch, req.region_epoch
+        )));
+    }
     if !in_range(&p.rg, &req.key) {
         return Err((StatusCode::InvalidArgument, "key is out of range".to_string()));
     }
@@ -288,8 +304,24 @@ pub(crate) async fn handle_range(payload: Bytes, part: &Rc<RefCell<PartitionData
     let req: RangeReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
     let p = part.borrow();
+    // F-this: this is the load-bearing check for `range()` correctness
+    // after a split. Pre-this, mismatched-epoch range requests were
+    // silently filtered per-key (`continue` at line 351 below) and
+    // returned a valid-but-partial result with `code:OK` — the gallery
+    // bug. Now any range with a stale snapshot's epoch is rejected
+    // up-front; SDK refreshes + re-runs.
+    if req.region_epoch != 0 && req.region_epoch != p.region_epoch {
+        return Err((StatusCode::FailedPrecondition, format!(
+            "region epoch stale: part_id={} have={} got={}",
+            p.part_id, p.region_epoch, req.region_epoch
+        )));
+    }
+    // F-this Phase 4: snapshot the PS's authoritative end_key so the
+    // response can carry it as a resume cursor for the SDK. Empty =
+    // unbounded right side (last partition in the keyspace).
+    let cur_end_key = p.rg.end_key.clone();
     if req.limit == 0 {
-        return Ok(partition_rpc::rkyv_encode(&RangeResp { code: CODE_OK, message: String::new(), entries: vec![], has_more: true }));
+        return Ok(partition_rpc::rkyv_encode(&RangeResp { code: CODE_OK, message: String::new(), entries: vec![], has_more: true, cur_end_key }));
     }
 
     let start_user_key = if req.start.is_empty() { req.prefix.clone() } else { req.start.clone() };
@@ -361,7 +393,7 @@ pub(crate) async fn handle_range(payload: Bytes, part: &Rc<RefCell<PartitionData
     }
 
     let has_more = out.len() == req.limit as usize;
-    Ok(partition_rpc::rkyv_encode(&RangeResp { code: CODE_OK, message: String::new(), entries: out, has_more }))
+    Ok(partition_rpc::rkyv_encode(&RangeResp { code: CODE_OK, message: String::new(), entries: out, has_more, cur_end_key }))
 }
 
 pub(crate) async fn handle_split_part(

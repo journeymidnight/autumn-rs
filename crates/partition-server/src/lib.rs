@@ -612,6 +612,14 @@ impl TableMeta {
 pub(crate) struct PartitionData {
     part_id: u64,
     rg: Range,
+    /// Monotonic epoch assigned by the manager, bumped whenever `rg` is
+    /// rewritten (split: both children new; merge: survivor new). Picked
+    /// up from `MgrRegionInfo.region_epoch` by `sync_regions_once` and
+    /// passed in at open time. Once Phase 3 wires it onto the request
+    /// path, ps-conn stamps it on every response so the SDK can detect
+    /// stale routing without a manager round-trip (TiKV `region_epoch`
+    /// pattern). Until then it is plumbed but unused on the wire.
+    pub(crate) region_epoch: u64,
     active: Memtable,
     imm: VecDeque<Arc<Memtable>>,
     flush_tx: mpsc::UnboundedSender<()>,
@@ -1293,11 +1301,14 @@ struct PartitionHandle {
     compact_trigger: mpsc::Sender<bool>,
     /// F188: same shape for GC.
     gc_trigger: mpsc::Sender<GcTask>,
-    /// F184: snapshot of (rg, log/row/meta stream ids) at open time.
-    /// `sync_regions_once` compares this against the latest manager
-    /// regions snapshot to detect a wider rg (post-merge) or new
-    /// stream IDs and force a reopen.
-    opened_with: (Range, u64, u64, u64),
+    /// F184 + epoch: snapshot of (rg, log/row/meta stream ids,
+    /// region_epoch) at open time. `sync_regions_once` compares this
+    /// against the latest manager regions snapshot to detect a wider rg
+    /// (post-merge) or new stream IDs and force a reopen. The epoch
+    /// field is redundant today (any rg change bumps epoch in the
+    /// manager) but included as a forward-compatible signal for future
+    /// schemes that bump epoch without changing rg.
+    opened_with: (Range, u64, u64, u64, u64),
     /// JoinHandle retained for RAII.
     #[allow(dead_code)]
     join: Option<std::thread::JoinHandle<()>>,
@@ -2459,10 +2470,12 @@ impl PartitionServer {
             return Err(anyhow!("get_regions failed: {}", resp.message));
         }
 
-        let mut wanted: BTreeMap<u64, (Range, u64, u64, u64)> = BTreeMap::new();
+        // Tuple shape mirrors `PartitionHandle.opened_with`:
+        //   (rg, log_stream, row_stream, meta_stream, region_epoch)
+        let mut wanted: BTreeMap<u64, (Range, u64, u64, u64, u64)> = BTreeMap::new();
         tracing::debug!("PS {} sync: got {} regions, my ps_id={}", self.ps_id, resp.regions.len(), self.ps_id);
         for (part_id, region) in resp.regions {
-            tracing::debug!("PS {} sync: region part_id={} ps_id={}", self.ps_id, part_id, region.ps_id);
+            tracing::debug!("PS {} sync: region part_id={} ps_id={} epoch={}", self.ps_id, part_id, region.ps_id, region.region_epoch);
             if region.ps_id == self.ps_id {
                 if let Some(rg) = region.rg {
                     wanted.insert(
@@ -2475,6 +2488,7 @@ impl PartitionServer {
                             region.log_stream,
                             region.row_stream,
                             region.meta_stream,
+                            region.region_epoch,
                         ),
                     );
                 }
@@ -2517,7 +2531,7 @@ impl PartitionServer {
         }
 
         // Open new partitions.
-        for (part_id, (rg, log_stream_id, row_stream_id, meta_stream_id)) in wanted {
+        for (part_id, (rg, log_stream_id, row_stream_id, meta_stream_id, region_epoch)) in wanted {
             if self.partitions.borrow().contains_key(&part_id) {
                 continue;
             }
@@ -2540,7 +2554,7 @@ impl PartitionServer {
             }
             tracing::info!("PS {} opening partition {part_id}", self.ps_id);
             let handle = self
-                .open_partition(part_id, rg, log_stream_id, row_stream_id, meta_stream_id)
+                .open_partition(part_id, rg, region_epoch, log_stream_id, row_stream_id, meta_stream_id)
                 .await?;
             tracing::info!("PS {} partition {part_id} opened", self.ps_id);
             self.partitions.borrow_mut().insert(part_id, handle);
@@ -2568,6 +2582,7 @@ impl PartitionServer {
         &self,
         part_id: u64,
         rg: Range,
+        region_epoch: u64,
         log_stream_id: u64,
         row_stream_id: u64,
         meta_stream_id: u64,
@@ -2579,7 +2594,18 @@ impl PartitionServer {
         // F184: snapshot the open-time params for sync_regions_once
         // change-detection (post-merge widening, post-split narrowing,
         // stream-ID rotation).
-        let opened_with = (rg.clone(), log_stream_id, row_stream_id, meta_stream_id);
+        // F184 + epoch: drop+reopen when rg / stream IDs / region_epoch
+        // changes vs open-time snapshot. rg change implies an epoch bump
+        // in our manager-side rule, but include the epoch explicitly so
+        // a future scheme (e.g., epoch bump on PS reassignment without
+        // rg change) is caught without modifying the comparison logic.
+        let opened_with = (
+            rg.clone(),
+            log_stream_id,
+            row_stream_id,
+            meta_stream_id,
+            region_epoch,
+        );
 
         // F099-K port allocation: reserve the next ordinal eagerly so a
         // later `open_partition` never collides with this one even if the
@@ -2663,6 +2689,7 @@ impl PartitionServer {
                     if let Err(e) = partition_thread_main(
                         part_id,
                         rg,
+                        region_epoch,
                         log_stream_id,
                         row_stream_id,
                         meta_stream_id,
@@ -3440,6 +3467,7 @@ async fn handle_ps_connection(
 async fn partition_thread_main(
     part_id: u64,
     rg: Range,
+    region_epoch: u64,
     log_stream_id: u64,
     row_stream_id: u64,
     meta_stream_id: u64,
@@ -3582,6 +3610,7 @@ async fn partition_thread_main(
     let part = Rc::new(RefCell::new(PartitionData {
         part_id,
         rg,
+        region_epoch,
         active: recovered_active,
         imm: VecDeque::new(),
         flush_tx,
@@ -4438,10 +4467,21 @@ async fn handle_incoming_req(
         }
     }
 
+    // Snapshot the per-partition epoch + id ONCE so the write-path
+    // enqueue helpers can perform the same TiKV-style region epoch
+    // check the read handlers do. `0` from the client = "skip check"
+    // (bootstrap / tests / legacy callers). Reads already perform this
+    // inside their respective handlers (`handle_get` / `handle_head`
+    // / `handle_range` in `rpc_handlers.rs`).
+    let (part_region_epoch, part_id_for_err) = {
+        let p = part.borrow();
+        (p.region_epoch, p.part_id)
+    };
+
     match req.msg_type {
-        MSG_PUT => enqueue_put(req, pending),
-        MSG_DELETE => enqueue_delete(req, pending),
-        MSG_STREAM_PUT => enqueue_stream_put(req, pending),
+        MSG_PUT => enqueue_put(req, pending, part_region_epoch, part_id_for_err),
+        MSG_DELETE => enqueue_delete(req, pending, part_region_epoch, part_id_for_err),
+        MSG_STREAM_PUT => enqueue_stream_put(req, pending, part_region_epoch, part_id_for_err),
         // F185: freeze stashes its resp oneshot in PartitionData and
         // returns without replying — the loop body sends OK once
         // pending+inflight drain and every imm flushes (Phase 1.5
@@ -4539,9 +4579,16 @@ async fn handle_incoming_req(
     }
 }
 
-fn enqueue_put(req: PartitionRequest, pending: &mut Vec<WriteRequest>) {
+fn enqueue_put(req: PartitionRequest, pending: &mut Vec<WriteRequest>, part_region_epoch: u64, part_id_for_err: u64) {
     match partition_rpc::rkyv_decode::<PutReq>(&req.payload) {
         Ok(put_req) => {
+            if put_req.region_epoch != 0 && put_req.region_epoch != part_region_epoch {
+                let _ = req.resp_tx.send(Err((StatusCode::FailedPrecondition, format!(
+                    "region epoch stale: part_id={} have={} got={}",
+                    part_id_for_err, part_region_epoch, put_req.region_epoch
+                ))));
+                return;
+            }
             // F129: regular `Put` rejects values exceeding the inline
             // cap. Caller should retry via PutBegin/Chunk/Commit.
             if put_req.value.len() > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize {
@@ -4577,9 +4624,16 @@ fn enqueue_put(req: PartitionRequest, pending: &mut Vec<WriteRequest>) {
     }
 }
 
-fn enqueue_delete(req: PartitionRequest, pending: &mut Vec<WriteRequest>) {
+fn enqueue_delete(req: PartitionRequest, pending: &mut Vec<WriteRequest>, part_region_epoch: u64, part_id_for_err: u64) {
     match partition_rpc::rkyv_decode::<DeleteReq>(&req.payload) {
         Ok(del_req) => {
+            if del_req.region_epoch != 0 && del_req.region_epoch != part_region_epoch {
+                let _ = req.resp_tx.send(Err((StatusCode::FailedPrecondition, format!(
+                    "region epoch stale: part_id={} have={} got={}",
+                    part_id_for_err, part_region_epoch, del_req.region_epoch
+                ))));
+                return;
+            }
             let key_vec = del_req.key.clone();
             pending.push(WriteRequest {
                 op: WriteOp::Delete { user_key: del_req.key },
@@ -4595,9 +4649,16 @@ fn enqueue_delete(req: PartitionRequest, pending: &mut Vec<WriteRequest>) {
     }
 }
 
-fn enqueue_stream_put(req: PartitionRequest, pending: &mut Vec<WriteRequest>) {
+fn enqueue_stream_put(req: PartitionRequest, pending: &mut Vec<WriteRequest>, part_region_epoch: u64, part_id_for_err: u64) {
     match partition_rpc::rkyv_decode::<StreamPutReq>(&req.payload) {
         Ok(sp_req) => {
+            if sp_req.region_epoch != 0 && sp_req.region_epoch != part_region_epoch {
+                let _ = req.resp_tx.send(Err((StatusCode::FailedPrecondition, format!(
+                    "region epoch stale: part_id={} have={} got={}",
+                    part_id_for_err, part_region_epoch, sp_req.region_epoch
+                ))));
+                return;
+            }
             let key_vec = sp_req.key.clone();
             pending.push(WriteRequest {
                 op: WriteOp::Put {
@@ -6602,6 +6663,7 @@ mod merged_loop_tests {
             key: key.to_vec(),
             value: value.to_vec(),
             expires_at,
+            region_epoch: 0,
         };
         let payload = partition_rpc::rkyv_encode(&req);
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -6621,6 +6683,7 @@ mod merged_loop_tests {
         let req = DeleteReq {
             part_id: 0,
             key: key.to_vec(),
+            region_epoch: 0,
         };
         let payload = partition_rpc::rkyv_encode(&req);
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -6642,7 +6705,8 @@ mod merged_loop_tests {
     fn merged_loop_put_direct_response() {
         let (req, resp_rx) = build_put_partition_request(b"hello", b"world", 0);
         let mut pending: Vec<WriteRequest> = Vec::new();
-        enqueue_put(req, &mut pending);
+        // Test sends epoch=0 on the wire, so 0 here matches and bypasses the check.
+        enqueue_put(req, &mut pending, 0, 0);
 
         assert_eq!(pending.len(), 1, "exactly one WriteRequest enqueued");
         let w = pending.pop().unwrap();
@@ -6679,7 +6743,7 @@ mod merged_loop_tests {
         let (req, resp_rx) =
             build_put_partition_request(b"big-key", &big_value, 0);
         let mut pending: Vec<WriteRequest> = Vec::new();
-        enqueue_put(req, &mut pending);
+        enqueue_put(req, &mut pending, 0, 0);
 
         // No WriteRequest queued — the cap fires before pipeline insert.
         assert_eq!(pending.len(), 0, "oversized Put must not enter pipeline");
@@ -6702,7 +6766,7 @@ mod merged_loop_tests {
         let (req, _resp_rx) =
             build_put_partition_request(b"k", &exact_cap_value, 0);
         let mut pending: Vec<WriteRequest> = Vec::new();
-        enqueue_put(req, &mut pending);
+        enqueue_put(req, &mut pending, 0, 0);
         assert_eq!(pending.len(), 1, "value at exact cap must enqueue normally");
     }
 
@@ -6717,9 +6781,9 @@ mod merged_loop_tests {
         let (d1, rx3) = build_delete_partition_request(b"k3");
 
         let mut pending: Vec<WriteRequest> = Vec::new();
-        enqueue_put(p1, &mut pending);
-        enqueue_put(p2, &mut pending);
-        enqueue_delete(d1, &mut pending);
+        enqueue_put(p1, &mut pending, 0, 0);
+        enqueue_put(p2, &mut pending, 0, 0);
+        enqueue_delete(d1, &mut pending, 0, 0);
 
         assert_eq!(pending.len(), 3);
         // Order preserved (FIFO).
@@ -6852,6 +6916,7 @@ mod f099j_tests {
                 key: b"hello".to_vec(),
                 value: b"world".to_vec(),
                 expires_at: 0,
+                region_epoch: 0,
             };
             let payload = partition_rpc::rkyv_encode(&put);
             let frame = Frame::request(42, MSG_PUT, Bytes::from(payload));
@@ -6943,6 +7008,7 @@ mod f099j_tests {
                     key: key.clone(),
                     value,
                     expires_at: 0,
+                    region_epoch: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
                 let f = Frame::request(i + 1, MSG_PUT, Bytes::from(payload));
@@ -7141,6 +7207,7 @@ mod f099k_tests {
                     key: b"k_n1".to_vec(),
                     value: b"v_n1".to_vec(),
                     expires_at: 0,
+                    region_epoch: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
                 let frame = Frame::request(1, MSG_PUT, Bytes::from(payload)).encode();
@@ -7219,6 +7286,7 @@ mod f099k_tests {
                         key: format!("k-{o}").into_bytes(),
                         value: format!("v-{o}").into_bytes(),
                         expires_at: 0,
+                        region_epoch: 0,
                     };
                     let payload = partition_rpc::rkyv_encode(&put);
                     let f =
@@ -7252,6 +7320,7 @@ mod f099k_tests {
                         key: b"bogus".to_vec(),
                         value: b"bogus".to_vec(),
                         expires_at: 0,
+                        region_epoch: 0,
                     };
                     let payload = partition_rpc::rkyv_encode(&wrong);
                     let f =
@@ -7351,6 +7420,7 @@ mod f099i_tests {
                 key: b"one-frame".to_vec(),
                 value: b"v".to_vec(),
                 expires_at: 0,
+                region_epoch: 0,
             };
             let payload = partition_rpc::rkyv_encode(&put);
             let frame_bytes = Frame::request(77, MSG_PUT, Bytes::from(payload)).encode();
@@ -7468,6 +7538,7 @@ mod f099i_tests {
                     key: format!("batch-{i}").into_bytes(),
                     value: b"v".to_vec(),
                     expires_at: 0,
+                    region_epoch: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
                 let f = Frame::request(100 + i, MSG_PUT, Bytes::from(payload)).encode();
@@ -7645,6 +7716,7 @@ mod f099i_tests {
                             key: format!("bp-{i:03}").into_bytes(),
                             value: b"v".to_vec(),
                             expires_at: 0,
+                            region_epoch: 0,
                         };
                         let payload = partition_rpc::rkyv_encode(&put);
                         let f = Frame::request(
@@ -7780,6 +7852,7 @@ mod f099i_tests {
                     key: format!("fast-{i:02}").into_bytes(),
                     value: b"v".to_vec(),
                     expires_at: 0,
+                    region_epoch: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
                 let frame_bytes =
@@ -7871,6 +7944,7 @@ mod f099i_tests {
                     key: format!("batch-{i}").into_bytes(),
                     value: b"v".to_vec(),
                     expires_at: 0,
+                    region_epoch: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
                 let f = Frame::request(6000 + i, MSG_PUT, Bytes::from(payload)).encode();

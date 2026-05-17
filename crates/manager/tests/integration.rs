@@ -109,6 +109,7 @@ async fn ps_put(
                 key: key.to_vec(),
                 value: value.to_vec(),
                 expires_at: 0,
+                region_epoch: 0,
             }),
         )
         .await
@@ -126,6 +127,7 @@ async fn ps_get(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rpc::GetR
                 key: key.to_vec(),
                 offset: 0,
                 length: 0,
+                region_epoch: 0,
             }),
         )
         .await
@@ -1134,6 +1136,7 @@ fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
                     start: b"a".to_vec(),
                     prefix: vec![],
                     limit: 100,
+                    region_epoch: 0,
                 }),
             )
             .await

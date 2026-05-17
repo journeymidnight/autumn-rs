@@ -931,6 +931,40 @@ eviction (network blip, etcd lease hiccup) self-heals. Pre-F111 the
 manager silently returned `CODE_OK` for unknown ps_id, so the running
 PS never noticed it had been evicted.
 
+## region_epoch check (TiKV-style, 2026-05-16)
+
+Each `PartitionData` carries `region_epoch: u64`, populated at open
+time from `MgrRegionInfo.region_epoch` (manager bumps on every `rg`
+rewrite — split / merge). Hot-path handlers compare the request's
+stamped `region_epoch` against `p.region_epoch`; mismatch returns
+`StatusCode::FailedPrecondition` so the SDK's `Err`-arm refresh path
+engages.
+
+Check sites:
+- `rpc_handlers.rs::handle_get` — before in_range
+- `rpc_handlers.rs::handle_head` — same
+- `rpc_handlers.rs::handle_range` — at top; **this is the load-bearing
+  one** for the gallery list bug. Pre-this, `handle_range` silently
+  filtered out-of-range keys via `continue` and returned partial
+  `Ok(RangeResp)` — the SDK couldn't tell. Now any stale-epoch range
+  is rejected up front.
+- `lib.rs::enqueue_put` / `enqueue_delete` / `enqueue_stream_put` —
+  write path. `handle_incoming_req` snapshots `(region_epoch, part_id)`
+  under one `borrow()` and threads it through.
+
+`0` on the wire = "skip check" (tests / bench / legacy). Production
+callers always stamp non-zero from `ClusterClient.lookup_epoch_for_part`.
+
+`RangeResp.cur_end_key` carries `p.rg.end_key` as the resume cursor
+for the SDK — CockroachDB-style ResumeSpan. The SDK uses it to
+advance across partition boundaries within a single `range()` call,
+so a split mid-scan auto-resolves.
+
+`PartitionHandle.opened_with` extends to `(rg, log/row/meta, region_epoch)`
+so `sync_regions_once`'s drop+reopen check catches an epoch bump even
+in the (theoretical) case where rg byte-for-byte matches but epoch
+moved.
+
 ## SSTable Format
 
 ### File Layout

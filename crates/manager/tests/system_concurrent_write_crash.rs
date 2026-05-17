@@ -142,6 +142,7 @@ fn concurrent_writers_during_split() {
                             value: val.as_bytes().to_vec(),
 
                             expires_at: 0,
+                            region_epoch: 0,
                         }),
                     )
                     .await

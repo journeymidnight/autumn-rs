@@ -112,6 +112,60 @@ state):
 silently dropping one partition's response would return a half-empty
 `Ok(RangeResult)`, which is indistinguishable from a true empty result.
 
+### TiKV-style `region_epoch` + CockroachDB-style resume cursor (2026-05-16)
+
+The SDK stamps a `region_epoch: u64` (cached from `MgrRegionInfo.region_epoch`,
+bumped by the manager on every `rg` rewrite — split / merge) on every
+hot-path request. The PS rejects with `FailedPrecondition` when the
+stamped epoch doesn't match its current epoch. The existing
+`call_ps_for_key` `Err`-arm refresh path picks it up: drop conn,
+`refresh_regions`, retry.
+
+**Wire surface** (post-this — backward-incompat with prior etcd
+`regions/` blob; `cluster.sh reset` for the migration):
+
+- `MgrRegionInfo` gains `region_epoch: u64`.
+- `PutReq` / `GetReq` / `DeleteReq` / `HeadReq` / `RangeReq` /
+  `StreamPutReq` gain `region_epoch: u64`. Admin ops
+  (`MaintenanceReq`, `SplitPartReq`, `MergePartReq`) are exempt — the
+  operator is the authoritative caller.
+- `RangeResp` gains `cur_end_key: Vec<u8>` — the PS's authoritative
+  `rg.end_key`; the SDK uses it as the resume cursor.
+- `CODE_REGION_EPOCH_STALE = 8` is reserved for future inline use
+  (today the PS surfaces this via `StatusCode::FailedPrecondition`
+  at the frame level).
+
+**SDK plumbing**:
+
+- `lookup_epoch_for_part(part_id)` — public helper. Used by FUSE /
+  ioring / CLI / SDK internals to stamp the cached epoch when
+  manually assembling a Req struct.
+- `call_ps_for_key`'s build closure shape is now `Fn(u64, u64) -> Bytes`
+  (`(part_id, region_epoch)`). On retry it re-invokes with the
+  freshly-cached epoch so the second attempt reflects the post-
+  refresh routing.
+
+**`range()` resume cursor**:
+
+The pre-this snapshot-based scan was replaced with a cursor-driven
+loop: each successful `RangeResp` returns `cur_end_key` which the SDK
+uses as the start_key for the next iteration. A split that happens
+mid-scan auto-resolves on the next `resolve_key` against the
+(possibly refreshed) cache. On epoch-stale error, results from
+already-successful partitions are KEPT; only the failing partition
+gets re-resolved + re-scanned. Up to `MAX_RANGE_REFRESHES` (3) refresh
+cycles per call, `MAX_RANGE_ITERATIONS` (10_000) iteration cap as a
+defensive bound against pathological churn.
+
+**Tests / benches**: stamp `region_epoch: 0` — `0` is the wire-level
+"skip check" sentinel. Production callers always stamp non-zero from
+the cache.
+
+`0` reservation has one practical implication: a `lookup_epoch_for_part`
+on a partition that's not in the cache returns `0` (skip check) rather
+than failing — the resolver path handles the "no such partition" case
+already; epoch is opportunistic.
+
 ## Dependencies
 
 - `autumn-rpc`: RPC client + wire codec (partition_rpc, manager_rpc)

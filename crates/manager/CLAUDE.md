@@ -121,9 +121,34 @@ multi_modify_split(part_id, mid_key, owner_key, revision, log_sealed_len, row_se
   6. duplicate_stream(meta_stream, meta_sealed_len) → new meta stream (shares extents)
   7. Left partition: update range to [start_key, mid_key)
   8. Right partition: create with range [mid_key, end_key), new stream IDs
-  9. rebalance_regions()
+  9. rebalance_regions()  ← also bumps left's region_epoch (rg changed)
+                            and seeds right's region_epoch = 1 (new partition)
   10. Persist everything to etcd in one transaction
 ```
+
+### `region_epoch` bumping (TiKV-style)
+
+`MgrRegionInfo` carries a monotonic `region_epoch: u64`. The
+manager bumps it whenever it rewrites a region's `rg`. Both
+`rebalance_regions` (in-memory shadow) and
+`compute_region_for_partition` (etcd-bound writer) route the bump
+through the same helper `next_region_epoch(state, part_id, new_rg)`:
+
+- No prior region → epoch = 1 (bootstrap; `0` is reserved on the wire
+  as "skip check").
+- rg byte-for-byte unchanged → epoch unchanged (idempotent rebalance,
+  PS reassignment without range change).
+- rg changed → epoch += 1.
+
+Effect on the wire: SDKs stamp the cached epoch on every Put / Get /
+Delete / Head / Range / StreamPut request; the PS rejects with
+`StatusCode::FailedPrecondition` on mismatch (`enqueue_*`,
+`handle_get/head/range`); SDK refreshes + retries. See the rpc and
+partition-server CLAUDE.md for the wire details.
+
+**Backward-incompat with pre-this etcd state**: the `regions/<id>`
+rkyv blob shape changed; `cluster.sh reset` is the migration path
+(matches the repo's standard same-commit deploy pattern).
 
 ### `duplicate_stream(src_stream_id, sealed_length)`
 ```

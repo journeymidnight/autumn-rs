@@ -48,11 +48,13 @@ impl FsState {
     /// Get a sub-range of a value from the KV store.
     pub async fn kv_get_range(&mut self, k: &[u8], offset: u32, length: u32) -> Result<Vec<u8>> {
         let (part_id, addr) = self.client.resolve_key(k).await?;
+        let region_epoch = self.client.lookup_epoch_for_part(part_id);
         let req = GetReq {
             part_id,
             key: k.to_vec(),
             offset,
             length,
+            region_epoch,
         };
         let payload = rkyv_encode(&req);
         // ps_call honors ClusterClient.rpc_timeout (default 30 s) so a
@@ -80,11 +82,13 @@ impl FsState {
     /// "durable Put".
     pub async fn kv_put(&mut self, k: &[u8], v: &[u8]) -> Result<()> {
         let (part_id, addr) = self.client.resolve_key(k).await?;
+        let region_epoch = self.client.lookup_epoch_for_part(part_id);
         let req = PutReq {
             part_id,
             key: k.to_vec(),
             value: v.to_vec(),
             expires_at: 0,
+            region_epoch,
         };
         let payload = rkyv_encode(&req);
         let resp_bytes = self.client.ps_call(&addr, MSG_PUT, Bytes::from(payload)).await
@@ -106,9 +110,11 @@ impl FsState {
     /// Delete a key from the KV store.
     pub async fn kv_delete(&mut self, k: &[u8]) -> Result<()> {
         let (part_id, addr) = self.client.resolve_key(k).await?;
+        let region_epoch = self.client.lookup_epoch_for_part(part_id);
         let req = DeleteReq {
             part_id,
             key: k.to_vec(),
+            region_epoch,
         };
         let payload = rkyv_encode(&req);
         let resp_bytes = self.client.ps_call(&addr, MSG_DELETE, Bytes::from(payload)).await
@@ -127,11 +133,13 @@ impl FsState {
     /// Callers that need values must issue a separate `kv_get` per key.
     pub async fn kv_range_keys(&mut self, prefix: &[u8], start: &[u8], limit: u32) -> Result<Vec<Vec<u8>>> {
         let (part_id, addr) = self.client.resolve_key(prefix).await?;
+        let region_epoch = self.client.lookup_epoch_for_part(part_id);
         let req = RangeReq {
             part_id,
             prefix: prefix.to_vec(),
             start: start.to_vec(),
             limit,
+            region_epoch,
         };
         let payload = rkyv_encode(&req);
         let resp_bytes = self.client.ps_call(&addr, MSG_RANGE, Bytes::from(payload)).await
@@ -147,9 +155,11 @@ impl FsState {
     /// Check if a key exists (uses Head RPC).
     pub async fn kv_exists(&mut self, k: &[u8]) -> Result<bool> {
         let (part_id, addr) = self.client.resolve_key(k).await?;
+        let region_epoch = self.client.lookup_epoch_for_part(part_id);
         let req = HeadReq {
             part_id,
             key: k.to_vec(),
+            region_epoch,
         };
         let payload = rkyv_encode(&req);
         let resp_bytes = self.client.ps_call(&addr, MSG_HEAD, Bytes::from(payload)).await

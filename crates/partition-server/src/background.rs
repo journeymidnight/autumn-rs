@@ -200,7 +200,21 @@ pub(crate) async fn background_compact_loop(
                 } else {
                     pickup_tables(&tbls, 2 * MAX_SKIP_LIST)
                 };
-                if compact_tbls.len() < 2 {
+                // Skip when the size-tiered selector couldn't pick a mergeable
+                // pair (minor only) or when there's literally nothing to
+                // compact. Major mode falls through with a single table so
+                // overlap cleanup (drop out-of-range keys → clear
+                // `has_overlap` at line 229) can unblock split. The earlier
+                // guard at line 183 already filters out "1 SST + no overlap",
+                // so reaching here in major mode with `compact_tbls.len() < 2`
+                // implies `has_overlap == 1` and `do_compact` will rewrite
+                // the SST without the out-of-range keys.
+                let skip_compact = if major {
+                    compact_tbls.is_empty()
+                } else {
+                    compact_tbls.len() < 2
+                };
+                if skip_compact {
                     metrics.pending_compaction_bytes.store(
                         compute_pending_compaction_bytes(&part),
                         std::sync::atomic::Ordering::Relaxed,

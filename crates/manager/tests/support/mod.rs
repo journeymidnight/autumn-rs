@@ -212,6 +212,7 @@ pub async fn ps_put(
                 key: key.to_vec(),
                 value: value.to_vec(),
                 expires_at: 0,
+                region_epoch: 0, // test helper: skip epoch check
             }),
         )
         .await
@@ -229,6 +230,7 @@ pub async fn ps_get(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rpc::
                 key: key.to_vec(),
                 offset: 0,
                 length: 0,
+                region_epoch: 0, // test helper: skip epoch check
             }),
         )
         .await
@@ -310,6 +312,7 @@ pub async fn ps_delete(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rp
             partition_rpc::rkyv_encode(&partition_rpc::DeleteReq {
                 part_id,
                 key: key.to_vec(),
+                region_epoch: 0,
             }),
         )
         .await
@@ -327,6 +330,7 @@ pub async fn ps_head(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rpc:
             partition_rpc::rkyv_encode(&partition_rpc::HeadReq {
                 part_id,
                 key: key.to_vec(),
+                region_epoch: 0,
             }),
         )
         .await
@@ -350,6 +354,7 @@ pub async fn ps_range(
                 prefix: prefix.to_vec(),
                 start: start.to_vec(),
                 limit,
+                region_epoch: 0,
             }),
         )
         .await

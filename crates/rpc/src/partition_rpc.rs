@@ -3,6 +3,22 @@
 //! All 8 PartitionKv RPCs use rkyv serialization.
 //! Message type constants are in the 0x40–0x4F range.
 //! Every request includes `part_id` for thread-per-partition routing.
+//!
+//! ## `region_epoch` (TiKV-style)
+//!
+//! Hot-path data RPCs (Put/Get/Delete/Head/Range/StreamPut) carry a
+//! `region_epoch: u64` field. The client stamps the epoch it has
+//! cached for the partition; the PS rejects the request with
+//! `StatusCode::FailedPrecondition` when the stamp doesn't match its
+//! current `region_epoch`, surfaced from `MgrRegionInfo.region_epoch`.
+//! The manager bumps the epoch on every `rg` rewrite (split / merge).
+//! `0` = "skip check" (bootstrap, tests, legacy callers).
+//!
+//! `RangeResp` additionally carries `cur_end_key: Vec<u8>` — the PS's
+//! authoritative `rg.end_key`. The SDK uses it as a CockroachDB-style
+//! ResumeSpan cursor so a split that happens DURING a multi-partition
+//! scan auto-resolves on the next `resolve_key`. See
+//! `crates/client/CLAUDE.md` for the SDK-side loop.
 
 pub use crate::manager_rpc::{rkyv_decode, rkyv_encode};
 
@@ -87,6 +103,15 @@ pub const CODE_VALUE_TOO_LARGE: u8 = 5;
 /// reopen with the wider rg on its next region_sync tick.
 pub const CODE_UNAVAILABLE: u8 = 7;
 
+/// Request's `region_epoch` doesn't match the PS's current
+/// `MgrRegionInfo.region_epoch` — the partition's `rg` has been
+/// rewritten on the manager (split / merge) since the client cached
+/// it. SDK refreshes regions and retries. Reserved for future use as
+/// an inline body code; today the PS surfaces this condition via
+/// `StatusCode::FailedPrecondition` frame error which routes through
+/// the same SDK refresh path.
+pub const CODE_REGION_EPOCH_STALE: u8 = 8;
+
 // ── Request/Response types ─────────────────────────────────────────────────
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -98,6 +123,11 @@ pub struct PutReq {
     /// now durable via the extent-node fsync coalescer (RocksDB-style
     /// group commit). The PS no longer threads any sync flag through.
     pub expires_at: u64,
+    /// TiKV-style region epoch: client stamps the epoch from its
+    /// routing cache; PS rejects with FailedPrecondition when its own
+    /// epoch differs (split / merge has happened). `0` = skip check
+    /// (bootstrap, tests, legacy paths).
+    pub region_epoch: u64,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -115,6 +145,8 @@ pub struct GetReq {
     pub offset: u32,
     /// Sub-range read: number of bytes to read. 0 = read entire value.
     pub length: u32,
+    /// See `PutReq.region_epoch`.
+    pub region_epoch: u64,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -128,6 +160,8 @@ pub struct GetResp {
 pub struct DeleteReq {
     pub part_id: u64,
     pub key: Vec<u8>,
+    /// See `PutReq.region_epoch`.
+    pub region_epoch: u64,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -141,6 +175,8 @@ pub struct DeleteResp {
 pub struct HeadReq {
     pub part_id: u64,
     pub key: Vec<u8>,
+    /// See `PutReq.region_epoch`.
+    pub region_epoch: u64,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -157,6 +193,12 @@ pub struct RangeReq {
     pub prefix: Vec<u8>,
     pub start: Vec<u8>,
     pub limit: u32,
+    /// See `PutReq.region_epoch`. Especially important for range:
+    /// `handle_range` historically `continue`d on out-of-range keys
+    /// (rpc_handlers.rs:351), returning `Ok(RangeResp{entries: ...})`
+    /// with valid-but-partial data after a split. Stamping epoch
+    /// converts the silent-truncation failure into a refresh+retry.
+    pub region_epoch: u64,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -171,6 +213,14 @@ pub struct RangeResp {
     pub message: String,
     pub entries: Vec<RangeEntry>,
     pub has_more: bool,
+    /// CockroachDB-style ResumeSpan cursor: the PS's authoritative
+    /// `rg.end_key` (the byte AFTER the last key this partition owns).
+    /// On a successful scan, the SDK uses this as the start_key for
+    /// the next partition lookup — so a split that happened DURING
+    /// the scan auto-resolves: the cursor naturally falls into the
+    /// new sibling's range on the next ps_call. Empty = end of
+    /// keyspace (last partition's end_key was unbounded).
+    pub cur_end_key: Vec<u8>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -241,6 +291,8 @@ pub struct StreamPutReq {
     pub value: Vec<u8>,
     /// F178 follow-up: see `PutReq.must_sync` comment for context.
     pub expires_at: u64,
+    /// See `PutReq.region_epoch`.
+    pub region_epoch: u64,
 }
 // Response: PutResp
 

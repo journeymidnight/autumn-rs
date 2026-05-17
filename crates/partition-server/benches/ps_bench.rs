@@ -263,6 +263,7 @@ fn run_scenario(
                                     value: value.clone(),
 
                                     expires_at: 0,
+                                    region_epoch: 0,
                                 };
                                 (MSG_PUT, rkyv_encode(&req))
                             }
@@ -272,6 +273,7 @@ fn run_scenario(
                                     key: key.as_bytes().to_vec(),
                                     offset: 0,
                                     length: 0,
+                                    region_epoch: 0,
                                 };
                                 (MSG_GET, rkyv_encode(&req))
                             }
@@ -380,6 +382,7 @@ fn warmup(cfg: &Config, target_part: u64, ps_addr: SocketAddr) {
                 value: value.clone(),
 
                 expires_at: 0,
+                region_epoch: 0,
             };
             let _ = ps.call(MSG_PUT, rkyv_encode(&req)).await;
         }
@@ -410,6 +413,7 @@ fn seed_read_keys(cfg: &Config, target_part: u64, ps_addr: SocketAddr, count: u6
                     value: value.clone(),
 
                     expires_at: 0,
+                    region_epoch: 0,
                 };
                 let bytes = rkyv_encode(&req);
                 let ps_clone = ps.clone();
@@ -470,6 +474,7 @@ fn run_read_scenario(
                             key: format!("psb_read_{idx}").into_bytes(),
                             offset: 0,
                             length: 0,
+                            region_epoch: 0,
                         };
                         let payload = rkyv_encode(&req);
                         let ps_clone = ps.clone();

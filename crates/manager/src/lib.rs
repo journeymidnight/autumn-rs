@@ -1550,6 +1550,30 @@ impl AutumnManager {
         }
     }
 
+    /// Compute the `region_epoch` for a region about to be (re)written.
+    ///
+    /// Rules:
+    ///   - No prior region in state → start at `1` (bootstrap). `0` is
+    ///     reserved as "unknown / skip check" on the wire.
+    ///   - rg byte-for-byte equal to prior → keep old epoch (idempotent
+    ///     rebalance, PS reassignment without range change, etc.).
+    ///   - rg changed (split narrowing, merge widening) → bump by 1.
+    ///
+    /// Called from BOTH `compute_region_for_partition` (etcd-bound
+    /// rkyv blob) and `rebalance_regions` (in-memory shadow). Both
+    /// MUST agree or etcd ↔ memory drifts on leader failover.
+    fn next_region_epoch(
+        state: &autumn_common::MetadataState,
+        part_id: u64,
+        new_rg: &Option<MgrRange>,
+    ) -> u64 {
+        match state.regions.get(&part_id) {
+            Some(r) if r.rg == *new_rg => r.region_epoch.max(1),
+            Some(r) => r.region_epoch.saturating_add(1).max(2),
+            None => 1,
+        }
+    }
+
     fn rebalance_regions(state: &mut autumn_common::MetadataState) {
         let part_ids: HashSet<u64> = state.partitions.keys().copied().collect();
         let stale: Vec<u64> = state
@@ -1608,6 +1632,7 @@ impl AutumnManager {
                 }
             };
 
+            let region_epoch = Self::next_region_epoch(state, part_id, &meta.rg);
             state.regions.insert(
                 part_id,
                 MgrRegionInfo {
@@ -1617,6 +1642,7 @@ impl AutumnManager {
                     log_stream: meta.log_stream,
                     row_stream: meta.row_stream,
                     meta_stream: meta.meta_stream,
+                    region_epoch,
                 },
             );
         }
@@ -1642,6 +1668,7 @@ impl AutumnManager {
                 load.into_iter().min_by_key(|&(_, cnt)| cnt).map(|(id, _)| id)
             })
             .unwrap_or(0);
+        let region_epoch = Self::next_region_epoch(state, part.part_id, &part.rg);
         MgrRegionInfo {
             rg: part.rg.clone(),
             part_id: part.part_id,
@@ -1649,6 +1676,7 @@ impl AutumnManager {
             log_stream: part.log_stream,
             row_stream: part.row_stream,
             meta_stream: part.meta_stream,
+            region_epoch,
         }
     }
 
@@ -3042,6 +3070,7 @@ mod tests {
                 log_stream: 1,
                 row_stream: 2,
                 meta_stream: 3,
+                region_epoch: 1,
             },
         );
 
@@ -3082,6 +3111,7 @@ mod tests {
                     log_stream: part_id,
                     row_stream: part_id + 100,
                     meta_stream: part_id + 200,
+                    region_epoch: 1,
                 },
             );
         }

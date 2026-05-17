@@ -2037,6 +2037,10 @@ async fn main() -> Result<()> {
                                         key: key.as_bytes().to_vec(),
                                         value,
                                         expires_at: 0,
+                                        // Bench captures topology up front and assumes
+                                        // a static cluster; stamp 0 to bypass the
+                                        // post-Phase-3 epoch check.
+                                        region_epoch: 0,
                                     }),
                                 )
                                 .await;
@@ -2225,6 +2229,8 @@ async fn main() -> Result<()> {
                                         key: key.as_bytes().to_vec(),
                                         offset: 0,
                                         length: 0,
+                                        // Bench: static topology, skip epoch check.
+                                        region_epoch: 0,
                                     }),
                                 )
                                 .await;
@@ -2372,6 +2378,8 @@ async fn main() -> Result<()> {
                                     key: key.as_bytes().to_vec(),
                                     value: value_bytes.clone(),
                                     expires_at: 0,
+                                    // Bench: static topology, skip epoch check.
+                                    region_epoch: 0,
                                 });
                                 let ps_clone = ps.clone();
                                 let t0 = Instant::now();
@@ -2505,6 +2513,8 @@ async fn main() -> Result<()> {
                                     key: key.as_bytes().to_vec(),
                                     offset: 0,
                                     length: 0,
+                                    // Bench: static topology, skip epoch check.
+                                    region_epoch: 0,
                                 });
                                 let t0 = Instant::now();
                                 inflight.push(async move {

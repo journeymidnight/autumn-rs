@@ -124,6 +124,7 @@ pub async fn prepare(
 
         let ck = key::chunk_key(ino, chunk_idx);
         let (part_id, addr) = state.client.resolve_key(&ck).await?;
+        let region_epoch = state.client.lookup_epoch_for_part(part_id);
         let ps = state.client.get_ps_client(&addr).await?;
         requests.push(ChunkRequest {
             ps,
@@ -132,6 +133,7 @@ pub async fn prepare(
                 key: ck,
                 offset: sub_offset,
                 length: sub_length,
+                region_epoch,
             },
             fallback_zero_len: sub_length,
         });

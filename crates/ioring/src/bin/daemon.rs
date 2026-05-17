@@ -394,11 +394,13 @@ async fn service_sqe(
             // extra 4 KB memcpy per op on the PS side, which under
             // single-runtime daemon load was the difference between
             // 137 k (length=0) and 103 k (length=4096) ops/s.
+            let region_epoch = cluster.lookup_epoch_for_part(part_id);
             let req = GetReq {
                 part_id,
                 key,
                 offset: 0,
                 length: 0,
+                region_epoch,
             };
             let payload = rkyv_encode(&req);
             // Bounded so a paged-out / hung PS surfaces as EIO to the

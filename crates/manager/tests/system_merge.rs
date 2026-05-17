@@ -1471,6 +1471,7 @@ async fn try_psr_put(
             key: key.to_vec(),
             value: value.to_vec(),
             expires_at: 0,
+            region_epoch: 0,
         }),
     ).await;
     let resp_bytes = match resp { Ok(b) => b, Err(_) => return Err(()) };

@@ -395,6 +395,21 @@ impl ClusterClient {
         self.rpc_timeout.get()
     }
 
+    /// Look up the cached `region_epoch` for a partition. Returns 0 when
+    /// the partition is unknown (no cached region) — `0` is the wire-level
+    /// "skip check" sentinel so a request stamped with 0 is processed
+    /// without epoch validation. Used internally by `call_ps_for_key`
+    /// + `call_ps_for_part`; FUSE / ioring / CLI perf-check call it
+    /// directly when assembling a Req struct manually.
+    pub fn lookup_epoch_for_part(&self, part_id: u64) -> u64 {
+        self.regions
+            .borrow()
+            .iter()
+            .find(|(_, r)| r.part_id == part_id)
+            .map(|(_, r)| r.region_epoch)
+            .unwrap_or(0)
+    }
+
     pub fn lookup_key(&self, key: &[u8]) -> Option<(u64, String)> {
         let regions = self.regions.borrow();
         if regions.is_empty() {
@@ -509,16 +524,24 @@ impl ClusterClient {
     // ── Internal: PS call with routing retry ─────────────────────────────────
 
     /// Resolve key to (part_id, ps_addr), call PS, retry once on failure with refresh.
+    ///
+    /// The `build_payload` closure is invoked with `(part_id, region_epoch)`
+    /// so callers can stamp the epoch from the SDK's routing cache into
+    /// every request. After a refresh the closure is re-invoked with the
+    /// freshly-cached epoch so the retry attempt is rejected only if the
+    /// manager state has changed AGAIN between refresh and retry — the
+    /// normal "wait for region_sync_loop to converge" path.
     async fn call_ps_for_key(
         &self,
         key: &[u8],
         msg_type: u8,
-        build_payload: impl Fn(u64) -> Bytes,
+        build_payload: impl Fn(u64, u64) -> Bytes,
     ) -> std::result::Result<Bytes, AutumnError> {
         for attempt in 0..2 {
             let (part_id, ps_addr) = self.resolve_key(key).await
                 .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
-            match self.ps_call(&ps_addr, msg_type, build_payload(part_id)).await {
+            let region_epoch = self.lookup_epoch_for_part(part_id);
+            match self.ps_call(&ps_addr, msg_type, build_payload(part_id, region_epoch)).await {
                 Ok(b) => return Ok(b),
                 Err(_) if attempt == 0 => { let _ = self.refresh_regions().await; }
                 Err(e) => return Err(AutumnError::ConnectionError(e.to_string())),
@@ -528,6 +551,11 @@ impl ClusterClient {
     }
 
     /// Resolve part_id to ps_addr, call PS, retry once on failure with refresh.
+    ///
+    /// Stays `payload: Bytes` (not a closure like `call_ps_for_key`)
+    /// because admin ops (split/compact/gc/flush) don't carry
+    /// `region_epoch` on the wire — the operator/manager is the
+    /// authoritative caller.
     async fn call_ps_for_part(
         &self,
         part_id: u64,
@@ -596,8 +624,8 @@ impl ClusterClient {
         }
         let key = key.to_vec();
         let value = value.to_vec();
-        let resp_bytes = self.call_ps_for_key(&key, MSG_PUT, |part_id| {
-            rkyv_encode(&PutReq { part_id, key: key.clone(), value: value.clone(), expires_at })
+        let resp_bytes = self.call_ps_for_key(&key, MSG_PUT, |part_id, region_epoch| {
+            rkyv_encode(&PutReq { part_id, key: key.clone(), value: value.clone(), expires_at, region_epoch })
         }).await?;
         let resp: PutResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code == partition_rpc::CODE_VALUE_TOO_LARGE {
@@ -634,8 +662,8 @@ impl ClusterClient {
         length: u32,
     ) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
         let key = key.to_vec();
-        let resp_bytes = self.call_ps_for_key(&key, MSG_GET, |part_id| {
-            rkyv_encode(&GetReq { part_id, key: key.clone(), offset, length })
+        let resp_bytes = self.call_ps_for_key(&key, MSG_GET, |part_id, region_epoch| {
+            rkyv_encode(&GetReq { part_id, key: key.clone(), offset, length, region_epoch })
         }).await?;
         let resp: GetResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code == partition_rpc::CODE_NOT_FOUND {
@@ -650,8 +678,8 @@ impl ClusterClient {
     /// Delete a key. Returns Ok(()) even if key didn't exist.
     pub async fn delete(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
         let key = key.to_vec();
-        let resp_bytes = self.call_ps_for_key(&key, MSG_DELETE, |part_id| {
-            rkyv_encode(&DeleteReq { part_id, key: key.clone() })
+        let resp_bytes = self.call_ps_for_key(&key, MSG_DELETE, |part_id, region_epoch| {
+            rkyv_encode(&DeleteReq { part_id, key: key.clone(), region_epoch })
         }).await?;
         let resp: DeleteResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code != partition_rpc::CODE_OK && resp.code != partition_rpc::CODE_NOT_FOUND {
@@ -663,42 +691,75 @@ impl ClusterClient {
     /// Get key metadata (existence and value length).
     pub async fn head(&self, key: &[u8]) -> std::result::Result<KeyMeta, AutumnError> {
         let key = key.to_vec();
-        let resp_bytes = self.call_ps_for_key(&key, MSG_HEAD, |part_id| {
-            rkyv_encode(&HeadReq { part_id, key: key.clone() })
+        let resp_bytes = self.call_ps_for_key(&key, MSG_HEAD, |part_id, region_epoch| {
+            rkyv_encode(&HeadReq { part_id, key: key.clone(), region_epoch })
         }).await?;
         let resp: HeadResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         Ok(KeyMeta { found: resp.found, value_length: resp.value_length })
     }
 
     /// Range scan with prefix filter. Scans across partitions like Go's Range().
+    ///
+    /// CockroachDB-style resume cursor. The SDK drives a per-partition
+    /// loop using `RangeResp.cur_end_key` from each successful response
+    /// as the next cursor — so a split that happened DURING the scan
+    /// auto-resolves when the cursor falls into the new sibling's range
+    /// on the next `resolve_key`. Already-accumulated results from
+    /// successful earlier partitions are KEPT across refresh+retry; only
+    /// the partition that returned epoch-stale gets re-resolved and
+    /// re-scanned from `cursor` (= the failing partition's expected
+    /// start). At most `MAX_RANGE_REFRESHES` refresh cycles per call to
+    /// bound work under pathological topology churn.
     pub async fn range(
         &self,
         prefix: &[u8],
         start: &[u8],
         limit: u32,
     ) -> std::result::Result<RangeResult, AutumnError> {
-        // Ensure regions are loaded
+        const MAX_RANGE_REFRESHES: u32 = 3;
+        // Defensive iteration cap. Per-call work is also bounded by
+        // `limit`; this only fires under truly pathological topology
+        // churn (every partition splitting between requests).
+        const MAX_RANGE_ITERATIONS: u32 = 10_000;
+
         if self.regions.borrow().is_empty() {
             self.refresh_regions().await
                 .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
         }
 
-        let search_key = if start.is_empty() { prefix } else { start };
+        let mut cursor: Vec<u8> = if start.is_empty() { prefix.to_vec() } else { start.to_vec() };
+        let mut all_entries: Vec<RangeEntry> = Vec::new();
+        let mut remaining = limit;
+        let mut has_more = false;
+        let mut refreshes_used: u32 = 0;
+        let mut iterations: u32 = 0;
 
-        // Snapshot the routing info into Vec<(part_id, ps_addr, start_key)>
-        // upfront so we can drop the borrow before any await. F112: prefer
-        // per-partition listener (F099-K) — same lookup pattern as
-        // `lookup_key` / `resolve_part_id` / `all_partitions`.
-        let snapshot: Vec<(u64, String, Vec<u8>)> = {
-            let regions = self.regions.borrow();
-            let part_addrs = self.part_addrs.borrow();
-            let ps_details = self.ps_details.borrow();
-            let start_idx = regions.partition_point(|(_, region)| match region.rg.as_ref() {
-                Some(rg) if !rg.end_key.is_empty() => rg.end_key.as_slice() <= search_key,
-                _ => false,
-            });
-            let mut out = Vec::new();
-            for (_, region) in regions.iter().skip(start_idx) {
+        loop {
+            if remaining == 0 {
+                has_more = true;
+                break;
+            }
+            iterations += 1;
+            if iterations > MAX_RANGE_ITERATIONS {
+                return Err(AutumnError::ConnectionError(
+                    "range scan exceeded MAX_RANGE_ITERATIONS — topology churning".to_string(),
+                ));
+            }
+
+            // Resolve cursor → partition under a tight borrow scope.
+            let (part_id, ps_addr, region_start_key, region_epoch) = {
+                let regions = self.regions.borrow();
+                let part_addrs = self.part_addrs.borrow();
+                let ps_details = self.ps_details.borrow();
+                let idx = regions.partition_point(|(_, region)| match region.rg.as_ref() {
+                    Some(rg) if !rg.end_key.is_empty() => rg.end_key.as_slice() <= cursor.as_slice(),
+                    _ => false,
+                });
+                if idx >= regions.len() {
+                    // Past the last partition's end_key → scan done.
+                    break;
+                }
+                let (_, region) = &regions[idx];
                 let ps_addr = match part_addrs.get(&region.part_id) {
                     Some(a) => a.clone(),
                     None => match ps_details.get(&region.ps_id) {
@@ -716,27 +777,19 @@ impl ClusterClient {
                     .as_ref()
                     .map(|r| r.start_key.clone())
                     .unwrap_or_default();
-                out.push((region.part_id, ps_addr, region_start_key));
-            }
-            out
-        };
+                (region.part_id, ps_addr, region_start_key, region.region_epoch)
+            };
 
-        let mut remaining = limit;
-        let mut all_entries = Vec::new();
-        let mut has_more = false;
-
-        for (idx, (part_id, ps_addr, region_start_key)) in snapshot.iter().enumerate() {
-            if remaining == 0 {
-                has_more = true;
-                break;
-            }
-            // For partitions after the first, check if start_key still has the prefix
-            if idx != 0 && !prefix.is_empty() {
+            // Prefix-exit: only after we've made forward progress.
+            // The first iteration might legitimately land on a
+            // partition whose `start_key` is lexically past `prefix`
+            // when the user passed an explicit `start` outside the
+            // prefix range.
+            if iterations > 1 && !prefix.is_empty() {
                 if !region_start_key.is_empty() && !region_start_key.starts_with(prefix) {
                     break;
                 }
             }
-            let part_id = *part_id;
 
             let resp_bytes = match self
                 .ps_call(
@@ -745,21 +798,28 @@ impl ClusterClient {
                     rkyv_encode(&RangeReq {
                         part_id,
                         prefix: prefix.to_vec(),
-                        start: start.to_vec(),
+                        start: cursor.clone(),
                         limit: remaining,
+                        region_epoch,
                     }),
                 )
                 .await
             {
                 Ok(b) => b,
                 Err(e) => {
-                    // F112: refresh regions then surface — silently
-                    // skipping a partition truncates the result without
-                    // the caller knowing.
+                    // Epoch stale or transport error. Keep results
+                    // accumulated so far; refresh, retry with same
+                    // cursor (which now resolves against the fresh
+                    // routing map → typically the NEW sibling that
+                    // owns this key range after split).
+                    if refreshes_used >= MAX_RANGE_REFRESHES {
+                        return Err(AutumnError::ConnectionError(format!(
+                            "range on partition {part_id} after {refreshes_used} refreshes: {e}"
+                        )));
+                    }
+                    refreshes_used += 1;
                     let _ = self.refresh_regions().await;
-                    return Err(AutumnError::ConnectionError(format!(
-                        "range on partition {part_id}: {e}"
-                    )));
+                    continue;
                 }
             };
             let resp: RangeResp = rkyv_decode(&resp_bytes)
@@ -774,6 +834,20 @@ impl ClusterClient {
             if resp.has_more {
                 has_more = true;
             }
+
+            if resp.cur_end_key.is_empty() {
+                // Last partition in the keyspace (unbounded right).
+                break;
+            }
+            // Defensive: assert forward progress. A bogus PS that
+            // returned a non-advancing cur_end_key would otherwise
+            // spin this loop forever.
+            if resp.cur_end_key.as_slice() <= cursor.as_slice() {
+                return Err(AutumnError::ServerError(format!(
+                    "range on partition {part_id}: cur_end_key did not advance cursor"
+                )));
+            }
+            cursor = resp.cur_end_key;
         }
 
         // Dedup by key — after split, overlapping SSTables may return
@@ -800,8 +874,8 @@ impl ClusterClient {
     ) -> std::result::Result<(), AutumnError> {
         let key = key.to_vec();
         let value = value.to_vec();
-        let resp_bytes = self.call_ps_for_key(&key, MSG_STREAM_PUT, |part_id| {
-            rkyv_encode(&StreamPutReq { part_id, key: key.clone(), value: value.clone(), expires_at: 0 })
+        let resp_bytes = self.call_ps_for_key(&key, MSG_STREAM_PUT, |part_id, region_epoch| {
+            rkyv_encode(&StreamPutReq { part_id, key: key.clone(), value: value.clone(), expires_at: 0, region_epoch })
         }).await?;
         let resp: PutResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code != partition_rpc::CODE_OK {
