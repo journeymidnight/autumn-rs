@@ -103,6 +103,20 @@ impl TestConn {
         CommitLengthResp::decode(resp).expect("decode CommitLengthResp")
     }
 
+    /// F210-H3 Tier 2 fence-free probe. Use this instead of
+    /// `commit_length(eid, 0)` when the test only wants to verify
+    /// "extent exists + what's its current length" without
+    /// claiming an owner lock.
+    pub async fn probe_extent(&self, extent_id: u64) -> ProbeExtentResp {
+        let req = ProbeExtentReq { extent_id };
+        let resp = self
+            .pool
+            .call(&self.addr, MSG_PROBE_EXTENT, req.encode())
+            .await
+            .expect("probe_extent RPC");
+        ProbeExtentResp::decode(resp).expect("decode ProbeExtentResp")
+    }
+
     pub async fn read_bytes(
         &self,
         extent_id: u64,

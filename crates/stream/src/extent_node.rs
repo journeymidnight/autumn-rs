@@ -2353,6 +2353,7 @@ impl ExtentNode {
             MSG_DELETE_EXTENT => self.handle_delete_extent(payload).await,
             MSG_COMMIT_EC_SHARD => self.handle_commit_ec_shard(payload).await,
             MSG_SYNCED_LENGTH => self.handle_synced_length(payload).await,
+            MSG_PROBE_EXTENT => self.handle_probe_extent(payload).await,
             _ => Err((StatusCode::InvalidArgument, format!("unknown msg_type {msg_type}"))),
         }
     }
@@ -3275,39 +3276,39 @@ impl ExtentNode {
                 )
             })?;
 
-        // The `req.revision > 0` escape hatch is load-bearing for the
-        // manager's two internal probe paths, both of which pass
-        // `revision: 0` because they have no PS-owner context:
-        //   - `handle_check_commit_length`'s per-replica probe
-        //     (`commit_length_on_node` in manager/lib.rs) — the PS
-        //     hits this every partition open and every seal.
-        //   - `dispatch_recovery_loop`'s liveness probe (same helper,
-        //     called via `recovery.rs::is_ok()`).
-        // Without the escape, any extent whose `last_revision > 0`
-        // (i.e. ever written to by a prior PS session) rejects the
-        // probe with CODE_LOCKED_BY_OTHER. The manager treats that as
-        // "node unavailable" → alive=0 in the seal path (refusing
-        // partition open with "available nodes 0 less than required 2"),
-        // and as "replica dead" in the recovery loop (firing spurious
-        // recovery dispatches that surface as "no source replica
-        // available for copy" once they hit the recovering EN).
+        // F210-H3 Tier 2 (post-2026-05-17): `req.revision <= 0` is a
+        // protocol error, not a sentinel. The pre-F210-H2 "revision == 0
+        // bypasses the fence" escape hatch tangled three call sites
+        // (seal probe, recovery liveness, autumn-client info) onto one
+        // RPC and forced ad-hoc fence skipping; F210-H2 closed it and
+        // broke the seal+recovery paths; the Tier 2 redesign splits
+        // probe-without-fence onto `MSG_PROBE_EXTENT` and tightens THIS
+        // RPC into a clean fence-enforcing primitive. Callers that
+        // legitimately don't have an owner (manager recovery liveness,
+        // `autumn-client info` display) now use `handle_probe_extent`.
         //
-        // F210-H2 (commit 816df57, reverted here) closed the escape on
-        // the grounds that it "let any caller observe commit_length on
-        // a stream they don't own". That conflates two distinct
-        // concerns:
-        //   - owner-lock fence: prevents stale writers from corrupting
-        //     the seal point. Enforced in `handle_append` for the write
-        //     path; that's the right place.
-        //   - read access control: not a property the extent-node was
-        //     ever designed to provide — there's no authentication on
-        //     EN RPCs, and `read_bytes` is unfenced too.
-        // The write fence is unaffected by this escape (no append path
-        // honours revision=0). The `if req.revision > last` mutation
-        // below requires strictly-positive revision to advance, so a
-        // zero-revision probe can never weaken the fence either.
+        // Fence handover semantics on the surviving (revision > 0) path:
+        //   revision < last_revision → CODE_LOCKED_BY_OTHER (stale owner)
+        //   revision = last_revision → no-op, return length
+        //   revision > last_revision → bump + persist .meta (handover)
+        // The handover-on-bump is load-bearing: when a new owner first
+        // contacts an EN with a higher revision (via manager's
+        // `handle_check_commit_length` per-replica probe carrying the
+        // PS's validated revision), this is what advances the fence
+        // BEFORE the new owner's first append. Old owners get
+        // CODE_LOCKED_BY_OTHER on their next append.
+        if req.revision <= 0 {
+            return Err((
+                StatusCode::InvalidArgument,
+                format!(
+                    "commit_length requires revision > 0 (got {}); use \
+                     MSG_PROBE_EXTENT for fence-free probes",
+                    req.revision
+                ),
+            ));
+        }
         let last = entry.last_revision.load(Ordering::SeqCst);
-        if req.revision > 0 && req.revision < last {
+        if req.revision < last {
             return Ok(CommitLengthResp {
                 code: CODE_LOCKED_BY_OTHER,
                 length: 0,
@@ -3351,6 +3352,65 @@ impl ExtentNode {
             entry.coalescer.last_synced.load(Ordering::SeqCst)
         };
         Ok(CommitLengthResp {
+            code: CODE_OK,
+            length: length as u32,
+        }
+        .encode())
+    }
+
+    /// F210-H3 Tier 2: manager-only fence-free length+existence probe.
+    ///
+    /// Two call sites only:
+    ///   - `manager/src/recovery.rs::recovery_dispatch_loop` — uses
+    ///     `code == CODE_OK` to decide whether to fire
+    ///     `dispatch_recovery_task`; ignores `length`.
+    ///   - `autumn-client info` open-extent live-length display —
+    ///     uses `length` to render commit_length on streams where no
+    ///     PS-owner context is available (the `info` CLI doesn't hold
+    ///     an owner lock).
+    ///
+    /// Differs from `handle_commit_length` in exactly two ways:
+    ///   (a) takes no revision — request is 8 bytes, not 16.
+    ///   (b) does NOT touch the owner-lock fence — never returns
+    ///       LOCKED_BY_OTHER, never mutates `last_revision`, never
+    ///       writes `.meta`.
+    /// Length-source semantics are identical to commit_length so the
+    /// `info` CLI display matches what a real owner would see.
+    async fn handle_probe_extent(&self, payload: Bytes) -> HandlerResult {
+        let req = ProbeExtentReq::decode(payload)
+            .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
+
+        if !self.owns_extent(req.extent_id) {
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "extent {} belongs to shard {} not shard {} (shard_count={})",
+                    req.extent_id,
+                    req.extent_id % self.shard_count as u64,
+                    self.shard_idx,
+                    self.shard_count,
+                ),
+            ));
+        }
+
+        let entry = match self.extents.get(&req.extent_id) {
+            Some(e) => e,
+            None => {
+                return Ok(ProbeExtentResp {
+                    code: CODE_NOT_FOUND,
+                    length: 0,
+                }
+                .encode())
+            }
+        };
+
+        let sealed = entry.sealed_length.load(Ordering::SeqCst);
+        let length = if sealed > 0 {
+            sealed
+        } else {
+            entry.coalescer.last_synced.load(Ordering::SeqCst)
+        };
+        Ok(ProbeExtentResp {
             code: CODE_OK,
             length: length as u32,
         }

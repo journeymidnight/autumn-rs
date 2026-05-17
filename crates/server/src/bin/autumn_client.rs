@@ -2769,12 +2769,18 @@ async fn main() -> Result<()> {
                     if let Some(node_id) = ext.replicates.first() {
                         if let Some(addr) = node_map.get(node_id) {
                             if let Ok(en_client) = client.get_ps_client(addr).await {
-                                let req = ExtCommitLengthReq { extent_id: *eid, revision: 0 };
+                                // F210-H3 Tier 2: `info` has no PS-owner
+                                // context so it must NOT use the
+                                // fence-gated commit_length RPC. The
+                                // dedicated probe RPC returns the same
+                                // `(code, length)` shape without
+                                // touching `last_revision`.
+                                let req = ExtProbeExtentReq { extent_id: *eid };
                                 if let Ok(resp_bytes) = en_client
-                                    .call_timeout(EXT_MSG_COMMIT_LENGTH, req.encode(), DEFAULT_RPC_TIMEOUT)
+                                    .call_timeout(EXT_MSG_PROBE_EXTENT, req.encode(), DEFAULT_RPC_TIMEOUT)
                                     .await
                                 {
-                                    if let Ok(resp) = ExtCommitLengthResp::decode(resp_bytes) {
+                                    if let Ok(resp) = ExtProbeExtentResp::decode(resp_bytes) {
                                         ext.sealed_length = resp.length as u64;
                                     }
                                 }

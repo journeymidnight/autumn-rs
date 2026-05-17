@@ -2113,13 +2113,31 @@ impl AutumnManager {
         Ok(r.disk_id)
     }
 
-    async fn commit_length_on_node(&self, addr: &str, extent_id: u64) -> Result<u32, AppError> {
+    /// Seal-consensus probe: query an EN's `commit_length` for one extent
+    /// under the caller's validated owner-lock revision. F210-H3 Tier 2
+    /// (2026-05-17) plumbs the PS-validated revision through (was: hardcoded
+    /// `0` + EN-side escape hatch) so the EN's fence-handover side-effect
+    /// (`if req.revision > last { bump + persist .meta }`) actually fires
+    /// when a new owner first contacts an EN. Callers without an owner
+    /// context (recovery liveness, autumn-client info display) MUST use
+    /// `probe_extent_on_node` instead — that helper hits `MSG_PROBE_EXTENT`,
+    /// which skips the fence entirely.
+    async fn commit_length_on_node(
+        &self,
+        addr: &str,
+        extent_id: u64,
+        revision: i64,
+    ) -> Result<u32, AppError> {
+        debug_assert!(
+            revision > 0,
+            "commit_length_on_node requires revision > 0; use probe_extent_on_node for fence-free probes"
+        );
         let base = Self::normalize_endpoint(addr);
         let shard_ports = self.shard_ports_for_addr(&base);
         let routed = Self::shard_addr_for_extent(&base, &shard_ports, extent_id);
         let req = ExtCommitLengthReq {
             extent_id,
-            revision: 0,
+            revision,
         };
         // 5 s — commit_length is a tiny in-memory read on EN (atomic
         // load of `entry.len`). Generous bound so a hiccupping EN
@@ -2134,6 +2152,45 @@ impl AutumnManager {
         if r.code != CODE_OK {
             return Err(AppError::Internal(format!(
                 "commit_length failed on {routed}: code {}",
+                r.code
+            )));
+        }
+        Ok(r.length)
+    }
+
+    /// F210-H3 Tier 2 fence-free probe. Used by:
+    ///   - `recovery_dispatch_loop` liveness check (ignores `length`,
+    ///     uses `code == CODE_OK` to decide whether to fire
+    ///     `dispatch_recovery_task`).
+    ///   - Future: any manager-internal "is this extent on this EN +
+    ///     what's its current length" query without an owner context.
+    /// Does NOT touch the EN's `last_revision`. NotFound (extent missing
+    /// locally) and RPC error are both surfaced as `Err(Internal(...))`
+    /// so callers can treat both as "dispatch recovery" without branching.
+    pub(crate) async fn probe_extent_on_node(
+        &self,
+        addr: &str,
+        extent_id: u64,
+    ) -> Result<u32, AppError> {
+        let base = Self::normalize_endpoint(addr);
+        let shard_ports = self.shard_ports_for_addr(&base);
+        let routed = Self::shard_addr_for_extent(&base, &shard_ports, extent_id);
+        let req = ExtProbeExtentReq { extent_id };
+        let resp = self
+            .conn_pool
+            .call_timeout(
+                &routed,
+                EXT_MSG_PROBE_EXTENT,
+                req.encode(),
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let r =
+            ExtProbeExtentResp::decode(resp).map_err(|e| AppError::Internal(e.to_string()))?;
+        if r.code != CODE_OK {
+            return Err(AppError::Internal(format!(
+                "probe_extent on {routed}: code {}",
                 r.code
             )));
         }

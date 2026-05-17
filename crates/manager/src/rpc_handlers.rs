@@ -741,7 +741,14 @@ impl AutumnManager {
         let mut alive = 0usize;
         for node_id in all_nodes {
             if let Some(n) = nodes.get(&node_id) {
-                if let Ok(v) = self.commit_length_on_node(&n.address, ex.extent_id).await {
+                // F210-H3 Tier 2: pass `req.revision` (validated by
+                // `ensure_owner_revision` above) so the EN's fence-handover
+                // side-effect fires on first probe — pre-Tier 2 this
+                // hardcoded 0 and relied on a server-side escape hatch.
+                if let Ok(v) = self
+                    .commit_length_on_node(&n.address, ex.extent_id, req.revision)
+                    .await
+                {
                     alive += 1;
                     min_len = Some(min_len.map_or(v, |cur| cur.min(v)));
                 }
@@ -956,7 +963,14 @@ impl AutumnManager {
             let mut alive = 0usize;
             for (idx, node_id) in all_nodes.iter().enumerate() {
                 if let Some(node) = nodes_map.get(node_id) {
-                    if let Ok(v) = self.commit_length_on_node(&node.address, tail.extent_id).await {
+                    // F210-H3 Tier 2: pass req.revision (validated by
+                    // ensure_owner_revision above) — same rationale as
+                    // handle_check_commit_length, this is the
+                    // seal-during-alloc twin probe.
+                    if let Ok(v) = self
+                        .commit_length_on_node(&node.address, tail.extent_id, req.revision)
+                        .await
+                    {
                         alive += 1;
                         avali |= 1 << idx;
                         min_len = Some(min_len.map_or(v, |cur| cur.min(v)));

@@ -33,6 +33,21 @@ pub const MSG_COMMIT_EC_SHARD: u8 = 12;
 /// `flush_one_imm` to await durability of all log_stream bytes referenced
 /// by the to-be-flushed memtable's ValuePointers BEFORE uploading the SST.
 pub const MSG_SYNCED_LENGTH: u8 = 13;
+/// Manager-only probe RPC. Returns CommitLengthResp-shaped
+/// `(code, length)` without touching the owner-lock fence — no
+/// revision check, no mutation of `last_revision`, no `.meta`
+/// rewrite. Two call sites today:
+///   - `manager/src/recovery.rs`'s `recovery_dispatch_loop`
+///     liveness probe (uses `code == CODE_OK` to decide whether
+///     to fire `dispatch_recovery_task`; ignores `length`).
+///   - `autumn-client info`'s open-extent live-length display
+///     (uses `length` to render `commit_length` for streams
+///     where no PS-owner context is available).
+/// External (non-manager) callers MUST NOT use this RPC for
+/// seal/consensus reads — those go through `MSG_COMMIT_LENGTH`
+/// with a real revision so the EN's fence handover side-effect
+/// fires (see `extent_node.rs::handle_commit_length`).
+pub const MSG_PROBE_EXTENT: u8 = 14;
 // MSG_TYPE_PING = 0xFF is reserved by autumn-rpc for heartbeat
 
 // ── Append (hot path) ────────────────────────────────────────────────────────
@@ -202,6 +217,28 @@ impl ReadBytesResp {
 
 /// CommitLengthRequest: 16 bytes.
 /// [extent_id: u64 LE][revision: i64 LE]
+///
+/// **Wire contract on `revision` (post-F210-H3 Tier 2, 2026-05-17):**
+///
+/// `revision` is an i64 but MUST be `> 0` on the wire — it carries the
+/// caller's owner-lock claim. The EN's `handle_commit_length`:
+///   - returns `CODE_INVALID_ARGUMENT` if `revision <= 0` (no
+///     "probe sentinel" path — that escape hatch existed pre-F210-H2
+///     and broke fence semantics; see `MSG_PROBE_EXTENT` instead);
+///   - returns `CODE_LOCKED_BY_OTHER` if `revision < entry.last_revision`
+///     (caller is a stale owner; reject);
+///   - if `revision > entry.last_revision`, performs **fence handover**:
+///     bumps `last_revision` and persists `.meta` so subsequent writes
+///     from older owners are rejected by `handle_append` immediately.
+///
+/// This RPC is the canonical seal-consensus + ownership-acquisition
+/// primitive. Manager's `commit_length_on_node(addr, eid, revision)`
+/// helper forwards the caller's validated `req.revision` through
+/// `handle_check_commit_length` and `handle_stream_alloc_extent`.
+/// Manager probes WITHOUT an owner context (recovery liveness,
+/// `autumn-client info` display) use `MSG_PROBE_EXTENT` instead —
+/// that RPC returns the same `(code, length)` shape but skips the
+/// fence interaction entirely.
 pub struct CommitLengthReq {
     pub extent_id: u64,
     pub revision: i64,
@@ -251,6 +288,41 @@ impl CommitLengthResp {
         })
     }
 }
+
+// ── ProbeExtent (manager-only, no fence) ────────────────────────────────────
+
+/// ProbeExtentRequest: 8 bytes. `[extent_id: u64 LE]`
+///
+/// Manager-only liveness + length probe; see `MSG_PROBE_EXTENT` const
+/// docstring for the call-site contract. Response shape matches
+/// `CommitLengthResp` (`(code, length)`) so the manager can reuse the
+/// same `(addr, eid)` plumbing without separate decode paths.
+pub struct ProbeExtentReq {
+    pub extent_id: u64,
+}
+
+impl ProbeExtentReq {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(8);
+        buf.put_u64_le(self.extent_id);
+        buf.freeze()
+    }
+
+    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
+        if data.len() < 8 {
+            return Err("probe_extent request too short");
+        }
+        Ok(Self {
+            extent_id: data.get_u64_le(),
+        })
+    }
+}
+
+/// ProbeExtentResponse: 5 bytes. `[code: u8][length: u32 LE]`. Same shape
+/// as `CommitLengthResp` — `code` is `CODE_OK` (extent present) or
+/// `CODE_NOT_FOUND` (extent missing locally); `length` carries
+/// `coalescer.last_synced` for open extents or `sealed_length` for sealed.
+pub type ProbeExtentResp = CommitLengthResp;
 
 // (F150 Phase B removed SyncExtentReq/Resp + MSG_SYNC_EXTENT — the F142
 // fsync barrier is now folded into `start_write_batch`'s rotation-trigger

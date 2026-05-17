@@ -84,11 +84,11 @@ async fn f021_multi_disk_load_extents() {
     .await;
     let conn = TestConn::new(addr);
 
-    // commit_length should succeed for both extents, confirming they were loaded.
-    let r100 = conn.commit_length(100, 0).await;
+    // F210-H3 Tier 2: probe_extent — verifying multi-disk load, not fence.
+    let r100 = conn.probe_extent(100).await;
     assert_eq!(r100.length, 5, "extent 100 should have 5 bytes");
 
-    let r200 = conn.commit_length(200, 0).await;
+    let r200 = conn.probe_extent(200).await;
     assert_eq!(r200.length, 5, "extent 200 should have 5 bytes");
 }
 

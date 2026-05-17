@@ -459,9 +459,18 @@ impl AutumnManager {
                         continue;
                     }
 
+                    // F210-H3 Tier 2: switched from `commit_length_on_node`
+                    // (fence-gated, requires PS-owner revision) to the
+                    // dedicated fence-free `probe_extent_on_node`. The
+                    // recovery loop has no owner context and only uses
+                    // `.is_ok()` for liveness — gating it on the
+                    // owner-lock fence was always wrong (pre-Tier 2 we
+                    // worked around it by hardcoding `revision: 0` + a
+                    // server-side escape hatch; that escape silently
+                    // broke under F210-H2 and forced this same fix).
                     let healthy = match node {
                         Some(n) => self
-                            .commit_length_on_node(&n.address, ex.extent_id)
+                            .probe_extent_on_node(&n.address, ex.extent_id)
                             .await
                             .is_ok(),
                         None => false,

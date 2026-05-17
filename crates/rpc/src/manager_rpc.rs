@@ -705,6 +705,11 @@ pub struct ExtConvertToEcReq {
 // ── CommitLength binary codec (hot path, duplicated from extent_rpc) ───────
 
 /// CommitLengthRequest: 16 bytes. [extent_id: u64 LE][revision: i64 LE]
+///
+/// Wire contract on `revision`: see `extent_rpc::CommitLengthReq` docstring.
+/// Manager-side construction MUST pass a strictly-positive revision
+/// (the caller's validated owner-lock claim). For fence-free probes
+/// without an owner context, use `ExtProbeExtentReq` instead.
 pub struct ExtCommitLengthReq {
     pub extent_id: u64,
     pub revision: i64,
@@ -736,6 +741,30 @@ impl ExtCommitLengthResp {
         })
     }
 }
+
+// ── ProbeExtent binary codec (manager-only, duplicated from extent_rpc) ────
+
+/// `MSG_PROBE_EXTENT` request: 8 bytes. `[extent_id: u64 LE]`
+///
+/// See `extent_rpc::ProbeExtentReq` for full semantics. Manager
+/// construction sites: `commit_length_on_node`'s probe sibling
+/// `probe_extent_on_node` (recovery liveness check + autumn-client
+/// info open-extent display).
+pub struct ExtProbeExtentReq {
+    pub extent_id: u64,
+}
+
+impl ExtProbeExtentReq {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(8);
+        buf.put_u64_le(self.extent_id);
+        buf.freeze()
+    }
+}
+
+/// `MSG_PROBE_EXTENT` response: 5 bytes (same shape as
+/// `ExtCommitLengthResp`). `code` is `CODE_OK` / `CODE_NOT_FOUND`.
+pub type ExtProbeExtentResp = ExtCommitLengthResp;
 
 // ── F183: partition merge + policy advisory ────────────────────────────────
 
@@ -1020,3 +1049,4 @@ pub const EXT_MSG_RE_AVALI: u8 = 7;
 pub const EXT_MSG_CONVERT_TO_EC: u8 = 9;
 pub const EXT_MSG_DELETE_EXTENT: u8 = 11;
 pub const EXT_MSG_COMMIT_EC_SHARD: u8 = 12;
+pub const EXT_MSG_PROBE_EXTENT: u8 = 14;
