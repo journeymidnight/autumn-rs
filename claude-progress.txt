@@ -66,11 +66,31 @@ Code landing (cumulative across commits 212da57, d584f77, +F211-D):
 Test status:
   cargo test -p autumn-manager --lib                : 104 passing
   cargo test -p autumn-manager --test f211_node_lifecycle: 9 passing
+  cargo test -p autumn-manager --test f211_e2e_lifecycle: 8 passing
+    (full-stack: real manager + real ENs + RPC fanout):
+    - phantom_node_goes_suspected_after_df_timeout (~10 s)
+    - fence_persists_and_blocks_reregister
+    - fence_triggers_recovery_dispatch (~5 s; cross-node rebuild)
+    - remove_blocked_by_active_extents
+    - audit_log_captures_admin_ops
+    - recovery_stats_baseline
+    - extent_health_report_reflects_overrides
+    - list_ec_inflight_markers_empty_baseline
   cargo test -p autumn-stream --lib                 : 53 passing
     (includes 3 new f211d_wire_fence_tests)
   cargo build --workspace                           : clean
   python3 python/node_policy.py --help              : usage prints
   ./target/debug/autumn-op --help                   : usage prints
+
+Fix discovered during E2E:
+  recovery_dispatch_loop's pre-F211 short-circuit (probe ok → no
+  dispatch) prevented fence-triggered recovery on a Fenced node
+  whose probe still succeeded (the node was operator-marked dead
+  but the underlying process was still running). Added an explicit
+  "if is_fenced → dispatch immediately, skip probe shortcuts" arm
+  in recovery_dispatch_loop. Crystallised by the
+  fence_triggers_recovery_dispatch e2e test which hung for 60 s
+  pre-fix; passes in ~5 s post-fix.
 
 Behaviour notes:
   - Default AUTUMN_MGR_RECOVERY_GATE = fenced_only (BACKWARD-INCOMPAT)

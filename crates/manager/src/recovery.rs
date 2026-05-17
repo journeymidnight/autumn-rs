@@ -466,6 +466,23 @@ impl AutumnManager {
                         continue;
                     }
 
+                    // F211-E: a Fenced node MUST have all its slots
+                    // rebuilt regardless of probe outcome (the whole
+                    // point of fence is to migrate data off). Skip the
+                    // disk + probe shortcuts and dispatch immediately.
+                    if is_fenced {
+                        let res = self
+                            .dispatch_recovery_task(ex.extent_id, node_id)
+                            .await;
+                        self.record_dispatch_outcome(
+                            ex.extent_id,
+                            slot as u32,
+                            now_s,
+                            res.is_ok(),
+                        );
+                        continue;
+                    }
+
                     // Check per-disk health: if the disk holding this replica is
                     // offline, dispatch recovery even if the node is reachable.
                     let disk_id = if slot < ex.replicate_disks.len() {
