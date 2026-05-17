@@ -1674,6 +1674,79 @@ the staging order is `auto-split first` (Stage 2), `auto-merge second`
 `docs/superpowers/specs/2026-05-09-partition-merge-and-split-merge-policy-design.md`
 §6 for burn-in criteria.
 
+## F211 — Operator-Driven Node Lifecycle (2026-05-17)
+
+autumn-rs no longer auto-recovers extents on a transient node failure.
+Manager tracks `Online ↔ Suspected` per EN automatically, but only a
+human operator (via `mgr_fence_node`) flips a node to `Fenced` —
+which is what kicks `recovery_dispatch_loop` and the EC abandon path.
+Modelled on HDFS decommission + Ceph `noout`.
+
+### New manager admin RPCs
+
+| MSG | Wire id | Purpose |
+|---|---|---|
+| `MSG_LIST_NODE_STATES` | 0x3C | Read-only — every EN's auto state + override |
+| `MSG_EXTENT_HEALTH_REPORT` | 0x3D | Read-only — per-slot health for filtered or unhealthy extents |
+| `MSG_LIST_EC_INFLIGHT_MARKERS` | 0x3E | Read-only — EC convert markers + coord state |
+| `MSG_FENCE_NODE` | 0x3F | Operator confirms node dead; triggers cleanup |
+| `MSG_SET_NODE_MAINTENANCE` | 0x40 | Soft-pause without recovery |
+| `MSG_CLEAR_NODE_OVERRIDE` | 0x41 | Undo a fence/maintenance |
+| `MSG_REMOVE_NODE` | 0x42 | Hard delete after fence + drain |
+| `MSG_RECOVERY_STATS` | 0x43 | Inflight + per-source/target counters |
+| `MSG_QUERY_AUDIT_LOG` | 0x44 | All operator-action history (90 d retention) |
+
+### Operator runbook (manual smoke)
+
+```bash
+# Identify suspected nodes (auto state). Use the F211-G Python script
+# once it lands; for now this is a manager-RPC-direct path.
+
+# Confirm a specific node is permanently dead (ssh, k8s, monitoring).
+# Then explicitly fence via the manager RPC. Effects:
+#   - Writes node_override/{node_id} to etcd (persistent)
+#   - Bumps owner-lock revisions on every extent the node touched
+#   - Auto-abandons EC convert markers whose target_nodes[0] == node
+#     (writes ec_convert_advisory/<extent_id> for OP follow-up)
+#   - recovery_dispatch_loop now proceeds to recover all the slots
+
+# After recovery has drained, remove the node. Preconditions:
+#   - Node must already be Fenced
+#   - No extent.replicates / .parity list still references it
+#   - No inflight marker's target_nodes contains it
+# Effect: hard delete + writes decommissioned/{node_id} tombstone.
+```
+
+### Backwards-incompat behaviour switches
+
+The dispatch gate is configurable so legacy ops can opt out for the
+first deployment window:
+
+```bash
+# Default (recommended). Recovery fires ONLY when operator has
+# explicitly fenced the failing node.
+AUTUMN_MGR_RECOVERY_GATE=fenced_only autumn-manager-server ...
+
+# Legacy: trigger on disk.online == false (pre-F211 behaviour).
+AUTUMN_MGR_RECOVERY_GATE=auto_disk autumn-manager-server ...
+```
+
+Recovery throttling (F211-H, on by default):
+
+```bash
+AUTUMN_MGR_RECOVERY_MAX_GLOBAL=64       # cluster-wide concurrent recoveries
+AUTUMN_MGR_RECOVERY_MAX_PER_SOURCE=4    # per-source-EN concurrent reads
+AUTUMN_MGR_RECOVERY_MAX_PER_TARGET=2    # per-target-EN concurrent writes
+```
+
+Other tunables:
+
+```bash
+AUTUMN_MGR_NODE_SUSPECTED_TIMEOUT_SECS=10   # auto Online → Suspected
+AUTUMN_MGR_AUDIT_RETENTION_DAYS=90           # audit log GC
+```
+
+
 ---
 
 ## Notes

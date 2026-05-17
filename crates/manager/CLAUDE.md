@@ -1052,3 +1052,82 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       mirrors (psNodes/ delete, extentDeleteRetry/) route through
       `put_and_delete_txn` / `put_msgs_txn` which thread the
       fence unchanged.
+
+23. **F211 operator-driven node lifecycle (2026-05-17).**
+    Reshapes node failure handling from "manager auto-detects + immediately
+    rebuilds" to HDFS-decommission-style "manager exposes facts +
+    operator confirms via admin RPC". Two layers:
+
+    **Layer 1 — automatic, in-memory only (`crates/manager/src/node_state.rs`):**
+    `NodeStateTracker` tracks `Online ↔ Suspected` per EN based on
+    `disk_status_update_loop`'s df outcome. **Crucially: there is no
+    automatic `Down` transition.** Fed at three points: (i) df failure
+    in `disk_status_update_loop`, (ii) df success there, (iii)
+    `register_node` initial-OK heartbeat. Replay seeds every EN node
+    OK on leader-promotion so the new leader gets a fresh soft-timeout
+    window before its judgement settles.
+
+    **Layer 2 — operator-driven, etcd-persisted (`crates/manager/src/
+    rpc_handlers.rs` F211-C handlers + `node_override/` prefix):**
+    `mgr_fence_node` / `mgr_set_node_maintenance` / `mgr_clear_node_override`
+    / `mgr_remove_node`. The persistent `MgrNodeOverride` keyed by
+    `node_id` is the trigger for cleanup. Effects on `mgr_fence_node`:
+    (i) write `node_override/<id>` (etcd), (ii) bump owner-lock
+    revision for every extent the node touches (defence against
+    revived ghost writes), (iii) `auto_abandon_for_fenced_node`
+    sweeps ConvertToEc markers whose `target_nodes[0] == fenced_node`,
+    atomically deletes them + writes `ec_convert_advisory/<id>` for
+    operator follow-up. `mgr_remove_node` has the safe-decommission
+    preconditions: must be Fenced AND no extent / marker still
+    references the node — failure returns `Precondition` with the
+    blocking extent/marker IDs in the response.
+
+    **Recovery dispatch gate (`crates/manager/src/recovery.rs`):**
+    `recovery_dispatch_loop` reads `AUTUMN_MGR_RECOVERY_GATE` (default
+    `fenced_only`). In `fenced_only` mode, a per-slot replica is
+    rebuilt ONLY when its owning node's override is `Fenced`.
+    `auto_disk` rolls back to the legacy "trigger on disk.online ==
+    false" path. This is a backward-incompat default — operators
+    that haven't deployed a policy script can flip the env var.
+
+    **Recovery rate limiter (`crates/manager/src/recovery_rate_limiter.rs`,
+    F211-H):** per-source/target/global concurrency caps prevent a
+    single fence from saturating cross-node bandwidth. Backoff is
+    keyed by `(extent_id, slot)`: 2^N seconds capped at 300 s, reset
+    on first success. `mgr_recovery_stats` exposes inflight + queue
+    snapshot for monitoring.
+
+    **EC dispatch suspended-skip (`crates/manager/src/recovery.rs`
+    F211-F):** before each ConvertToEc dispatch the loop checks the
+    coord's `(auto_state, override_kind)`. If Suspected/Fenced/
+    Maintenance, the iteration silently skips — no log spam during a
+    flap. The marker stays in the ledger and is picked up when the
+    coord recovers or when `auto_abandon_for_fenced_node` deletes it.
+
+    **Maintenance TTL (`crates/manager/src/recovery.rs`
+    `tick_maintenance_ttl`):** invoked once per `recovery_dispatch_loop`
+    tick. Walks `node_overrides`; any `Maintenance` entry with
+    non-zero `expire_at <= now` is deleted from etcd + memory and
+    logged INFO. No audit entry (the system, not the operator,
+    triggered the clear — operator already set the expiry).
+
+    **Zombie defense (`handle_register_node` F211-C #2):** if the
+    requester's address is associated with a `node_id` whose override
+    is currently `Fenced` OR which appears in the `decommissioned/`
+    tombstone prefix, registration is refused with `Precondition`.
+    Operator must `clear_node_override` (Fenced case) or pick a fresh
+    address (decommissioned case) before the node can come back.
+
+    **Audit log (`crates/manager/src/audit.rs`, F211-I):** etcd
+    prefix `mgr_audit_log/<ts_ns>_<seq>` → rkyv `MgrAuditEntry`.
+    Every F211-C admin RPC handler wraps its return in
+    `append_audit`. Best-effort persistence — failure logs WARN but
+    doesn't fail the primary op (the audit miss is the lesser of two
+    bads; replay still has the override). `mgr_query_audit_log`
+    RPC for retrieval; `audit_retention_gc` helper for 90-day GC.
+
+    Cross-reference: notes 15 (F149 leader fence — every F211 etcd
+    write routes through `txn_fenced`), 21 (F207 unified inflight
+    ledger — F211-F's auto-abandon writes through the same release
+    primitive `commit_extent_inflight_release` after the atomic
+    delete + advisory put).

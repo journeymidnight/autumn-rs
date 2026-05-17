@@ -1,9 +1,13 @@
+pub mod audit;
+pub mod ec_abandon;
 mod extent_delete;
 pub mod extent_inflight;
+pub mod node_state;
 pub mod policy;
 #[cfg(test)]
 mod policy_tests;
 mod recovery;
+pub mod recovery_rate_limiter;
 mod rpc_handlers;
 
 pub(crate) use extent_delete::PendingDelete;
@@ -29,6 +33,16 @@ use compio::BufResult;
 /// Etcd path for the manager leader-key. F149: also used as the fence target
 /// for every manager etcd write txn.
 pub(crate) const LEADER_KEY: &str = "autumn-rs/stream-manager/leader";
+
+/// F211-C: etcd prefix for persistent operator overrides
+/// (`node_override/<node_id>` → rkyv'd `MgrNodeOverride`).
+pub const NODE_OVERRIDE_PREFIX: &str = "node_override/";
+
+/// F211-C: etcd prefix for hard-removed node tombstones
+/// (`decommissioned/<node_id>` → rkyv'd `MgrNodeOverride`). Same value
+/// shape as the override prefix — the existence of the key is what
+/// blocks re-registration.
+pub const DECOMMISSIONED_PREFIX: &str = "decommissioned/";
 
 #[derive(Clone)]
 pub(crate) struct EtcdMirror {
@@ -409,6 +423,33 @@ pub struct AutumnManager {
     /// reports doesn't re-trip the quorum after the node recovers.
     pub(crate) recent_failure_reports:
         Rc<RefCell<HashMap<u64, std::collections::VecDeque<(Instant, u64)>>>>,
+    /// F211-A: per-extent-node auto-tracked liveness (Online ↔ Suspected).
+    /// Fed by `disk_status_update_loop` (df ok / fail) and `register_node`
+    /// (initial heartbeat). Consumed by F211-B health-report RPCs,
+    /// F211-E recovery dispatch gate, and F211-F EC dispatch loop's
+    /// Suspected-window skip. **No automatic Down transition** — fence
+    /// is operator-driven (F211-C `mgr_fence_node`).
+    pub(crate) node_states: Rc<RefCell<crate::node_state::NodeStateTracker>>,
+    /// F211-C: persistent operator overrides keyed on node_id. Mirrors
+    /// the etcd prefix `node_override/<node_id>`. Mutated only via the
+    /// admin RPCs `mgr_fence_node` / `mgr_set_node_maintenance` /
+    /// `mgr_clear_node_override` / by Maintenance TTL expiry inside
+    /// `node_states.tick()`. Survives leader failover via etcd replay.
+    pub(crate) node_overrides: Rc<RefCell<HashMap<u64, MgrNodeOverride>>>,
+    /// F211-C: tombstones for `mgr_remove_node`. Etcd prefix
+    /// `decommissioned/<node_id>` — written when the OP removes a node.
+    /// Read by `handle_register_node`'s zombie-defense check.
+    pub(crate) decommissioned: Rc<RefCell<HashMap<u64, MgrNodeOverride>>>,
+    /// F211-H: in-memory recovery throttle counters (per-source /
+    /// per-target / global). Mutated by `dispatch_recovery_task` on
+    /// acquire and by `apply_recovery_done` / `drain_extent_inflight_marker`
+    /// on release. NOT persisted — limits are advisory, not safety
+    /// invariants.
+    pub(crate) recovery_limiter: Rc<RefCell<crate::recovery_rate_limiter::RecoveryRateLimiter>>,
+    /// F211-I: per-process audit-log sequence counter. Combined with
+    /// the unix-nanosecond timestamp to form the `mgr_audit_log/`
+    /// suffix so ordering is unique even for concurrent appends.
+    pub(crate) audit_seq: Rc<Cell<u64>>,
     /// F195: F192 quorum debounce — sliding-window length. Default 60 s.
     /// Configured via the manager binary's `--report-disk-failure-window-secs`
     /// CLI flag (was previously `AUTUMN_REPORT_DISK_FAILURE_WINDOW_SECS`).
@@ -446,6 +487,18 @@ impl AutumnManager {
             // F195 defaults match the pre-F195 env defaults (F192).
             report_disk_failure_window: Cell::new(Duration::from_secs(60)),
             report_disk_failure_quorum: Cell::new(3),
+            // F211-A: env-controlled soft-timeout, default 10 s.
+            node_states: Rc::new(RefCell::new(
+                crate::node_state::NodeStateTracker::default(),
+            )),
+            // F211-C: starts empty; populated by replay / admin RPCs.
+            node_overrides: Rc::new(RefCell::new(HashMap::new())),
+            decommissioned: Rc::new(RefCell::new(HashMap::new())),
+            // F211-H: starts at the env-configured default limits.
+            recovery_limiter: Rc::new(RefCell::new(
+                crate::recovery_rate_limiter::RecoveryRateLimiter::from_env(),
+            )),
+            audit_seq: Rc::new(Cell::new(0)),
         }
     }
 
@@ -1106,6 +1159,9 @@ impl AutumnManager {
         let failed_delete_raw = c
             .get_prefix(crate::extent_delete::EXTENT_DELETE_RETRY_PREFIX)
             .await?;
+        // F211-C: persistent operator overrides + decommissioned tombstones.
+        let node_override_raw = c.get_prefix(NODE_OVERRIDE_PREFIX).await?;
+        let decommissioned_raw = c.get_prefix(DECOMMISSIONED_PREFIX).await?;
         drop(c);
 
         let mut max_id = 0u64;
@@ -1208,6 +1264,60 @@ impl AutumnManager {
             s.ps_nodes = decoded_ps_nodes;
             s.regions = decoded_regions;
             s.next_id = s.next_id.max(max_id.saturating_add(1));
+        }
+        // F211-A: seed the node-state tracker with an OK heartbeat for
+        // every replayed EN node so the new leader starts with all
+        // nodes Online; the next `df` poll (10 s tick) will re-derive
+        // the truth from RPC outcomes. Mirrors the F210-G1 approach
+        // for PS heartbeats below.
+        {
+            let mut t = self.node_states.borrow_mut();
+            let s = self.store.inner.borrow();
+            for node_id in s.nodes.keys() {
+                t.on_heartbeat_ok(*node_id);
+            }
+        }
+        // F211-C: replay persistent operator overrides (Fenced /
+        // Maintenance). Overrides survive leader failover so the new
+        // leader's `recovery_dispatch_loop` (F211-E) sees the same
+        // Fenced set as the deposed leader.
+        {
+            let mut overrides = self.node_overrides.borrow_mut();
+            overrides.clear();
+            for kv in &node_override_raw.kvs {
+                let id = Self::parse_id_from_key(NODE_OVERRIDE_PREFIX, &kv.key)?;
+                let ovr: MgrNodeOverride = match rkyv_decode(&kv.value) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            node_id = id,
+                            error = %e,
+                            "F211-C: skipping malformed node_override entry"
+                        );
+                        continue;
+                    }
+                };
+                overrides.insert(id, ovr);
+            }
+        }
+        {
+            let mut decom = self.decommissioned.borrow_mut();
+            decom.clear();
+            for kv in &decommissioned_raw.kvs {
+                let id = Self::parse_id_from_key(DECOMMISSIONED_PREFIX, &kv.key)?;
+                let ovr: MgrNodeOverride = match rkyv_decode(&kv.value) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            node_id = id,
+                            error = %e,
+                            "F211-C: skipping malformed decommissioned entry"
+                        );
+                        continue;
+                    }
+                };
+                decom.insert(id, ovr);
+            }
         }
         // F210-G1: seed `ps_last_heartbeat` with `Instant::now()` for
         // every replayed PS. Pre-F210-G1 the map was empty post-failover,

@@ -1,85 +1,92 @@
 Date: 2026-05-17
 TaskStatus: not_completed
-Task scope: F211 series — Operator-Driven Node Lifecycle (plan
-            only, no code yet). Refactor autumn-rs node-death
-            judgment from "manager auto-detects + immediate
-            recovery" to HDFS decommission style "OP-driven
-            fence + manager exposes facts". Addresses:
-              (a) EC convert coordinator 永久死亡时 marker 卡死
-                  导致 F138 互斥锁死 recovery 的死局
-              (b) 当前节点故障判定过于激进 (心跳 10s 超时立即
-                  dispatch recovery), 网络抖动引发不必要的
-                  跨节点重建
-              (c) 缺乏 fencing 防护，假死复活节点可对 sealed EC
-                  extent 造成 split-brain
+Task scope: F211 series — Operator-Driven Node Lifecycle. Implement
+            the HDFS-decommission-style refactor described in
+            docs/superpowers/plans/2026-05-17-f211-operator-driven-node-lifecycle.md
 
-Design summary (full plan in
-/Users/zhangdongmao/.claude/plans/ec-convert-marker-coordiator-enumerated-adleman.md):
-  - Manager 自动跟踪 Online ↔ Suspected (心跳), 不自动进 Down
-  - OP policy script 综合外部证据 (ssh/k8s/监控) + manager 事实
-    后通过 admin RPC 显式 fence
-  - Fence 是 cleanup 同步点: bump owner-lock revision +
-    auto-abandon 关联 EC marker + 让 recovery 接管副本重建
-  - EC convert reissue 不自动, 由 OP script 自己发现 advisory
-    后调 force_ec_convert
-  - 业界对标: HDFS decommission 模式 / Ceph noout + osd out
-  - Fencing 复用 owner-lock revision (新加 shard read/write/
-    commit fence), 假死 coord 复活后写入被拒
+Sub-feature status:
+  F211-A NodeStateTracker (Online ↔ Suspected, auto):  completed
+  F211-B Health reporting RPCs (3 read-only):          completed
+  F211-C Operator fence/maintenance/clear/remove:      completed
+  F211-D Owner-lock revision bump on fence:            partial
+         - bump_owner_revisions_for_node implemented (in-mem fence)
+         - WriteShardReq/CommitEcShardReq/ReadShardReq +revision
+           wire fence: NOT YET DONE (stream-layer touch deferred)
+  F211-E Recovery loop gated by Fenced state:          completed
+         - AUTUMN_MGR_RECOVERY_GATE=fenced_only default
+         - Backoff via per-(extent,slot) entry in limiter
+         - AUTUMN_MGR_RECOVERY_GATE=auto_disk preserves legacy
+  F211-F EC convert auto-abandon on fenced coord:      completed
+         - ec_conversion_dispatch_loop suspected-skip in place
+         - ec_abandon.rs auto-abandon on fence implemented
+  F211-G Python OP policy script:                      not_completed
+         - Stub planned but not implemented yet
+  F211-H Recovery rate limiter + priority:             completed
+         - per-source/target/global limits + backoff
+         - mgr_recovery_stats RPC for monitoring
+  F211-I Operator action audit log:                    completed
+         - mgr_audit_log/<ts>_<seq> etcd prefix
+         - mgr_query_audit_log RPC + retention GC helper
 
-子 feature 拆分 (passes:false, 待实现):
-  F211-A  NodeStateTracker (Online ↔ Suspected, auto in-memory)
-  F211-B  Health reporting RPCs (list_node_states /
-          extent_health_report / list_ec_inflight_markers)
-  F211-C  Operator fence / maintenance / clear / remove admin
-          RPCs (含容量预检 #5 + zombie 防护 #2 + maintenance
-          TTL #6)
-  F211-D  Owner-lock revision bump on fence + shard
-          read/write/commit revision fence (含读路径 fence #4)
-  F211-E  Recovery loop gated by Fenced state + 指数退避 (#7)
-  F211-F  EC convert auto-abandon on fence + Suspected-window
-          dispatch 跳过 (#3)
-  F211-G  Python OP policy script (python/node_policy.py)
-  F211-H  Recovery 节流 + 优先级 (per-source/target/global
-          concurrency limits, #1)
-  F211-I  Operator action audit log (#8)
+Code landing:
+  - crates/manager/src/node_state.rs (new)
+  - crates/manager/src/audit.rs (new)
+  - crates/manager/src/ec_abandon.rs (new)
+  - crates/manager/src/recovery_rate_limiter.rs (new)
+  - crates/manager/src/rpc_handlers.rs: 9 new MSG_ dispatch arms,
+    F211-B/C/H/I handlers, register_node zombie defense (F211-C #2)
+  - crates/manager/src/recovery.rs: F211-E/F gating, backoff hook,
+    maintenance-TTL tick, RecoveryGateMode enum
+  - crates/manager/src/lib.rs: 4 new fields on AutumnManager
+    (node_states / node_overrides / decommissioned / recovery_limiter
+    / audit_seq), replay arms for node_override/ + decommissioned/
+  - crates/rpc/src/manager_rpc.rs: 9 new MSG_ constants
+    (LIST_NODE_STATES, EXTENT_HEALTH_REPORT,
+    LIST_EC_INFLIGHT_MARKERS, FENCE_NODE, SET_NODE_MAINTENANCE,
+    CLEAR_NODE_OVERRIDE, REMOVE_NODE, RECOVERY_STATS, QUERY_AUDIT_LOG)
+    + ~20 new rkyv wire types + MgrNodeOverride + MgrAuditEntry
+  - crates/manager/tests/f211_node_lifecycle.rs (new integration
+    suite, 9 in-memory tests passing)
 
-落地顺序: A → B → I → C → D → H → G → E → F
-  - 1-7 (A,B,I,C,D,H,G) 是基建, 可一起合到 main
-  - 8-9 (E,F) 是行为切换, 必须 G policy script 就绪后才能上线
+Test status:
+  cargo test -p autumn-manager --lib                : 104 passing
+  cargo test -p autumn-manager --test f211_node_lifecycle: 9 passing
+  cargo test -p autumn-manager --lib node_state     : 8 passing
+  cargo build --workspace                           : clean
 
-向后兼容警告 (per feedback_warn_on_backward_incompat):
-  - 节点故障默认不再自动重建 (env var AUTUMN_MGR_RECOVERY_GATE=
-    auto_disk 临时回滚)
-  - EC convert 不再 stuck 等运维 etcdctl (fence 后自动 abandon)
-  - Recovery 现在有并发上限 (默认 max_global=64)
-  - 新 etcd prefix: node_override/, ec_convert_advisory/,
-    decommissioned/, mgr_audit_log/ (回滚需 etcdctl 清空)
-  - 9 个新 MSG_ 常量; WriteShardReq/CommitEcShardReq/
-    ReadShardReq 加 revision (rkyv 字段扩展, partition server
-    需同步升级)
-  - Fenced/Decommissioned 节点 register 会被拒
+Behaviour notes:
+  - Default AUTUMN_MGR_RECOVERY_GATE = fenced_only (BACKWARD-INCOMPAT)
+    Operators who haven't deployed an OP policy script can flip to
+    AUTUMN_MGR_RECOVERY_GATE = auto_disk to restore pre-F211 behaviour
+  - Recovery limiter defaults: per_source=4, per_target=2, global=64
+    (env: AUTUMN_MGR_RECOVERY_MAX_{PER_SOURCE,PER_TARGET,GLOBAL})
+  - Backoff: 2^N seconds capped at 300 s per (extent, slot) failure
+  - NodeStateTracker soft timeout: 10 s
+    (env: AUTUMN_MGR_NODE_SUSPECTED_TIMEOUT_SECS)
+  - Audit retention: 90 days
+    (env: AUTUMN_MGR_AUDIT_RETENTION_DAYS)
 
-关键不变量 (本 plan 完全不动):
-  - F138 marker 在阻塞 recovery (marker 删除仍是同步点)
-  - F149 leader fence
-  - F119-D EC convert 幂等 guard
-  - F153 per-extent ec_conversion_locks
-  - F207 marker rich state + replay
-  - Reed-Solomon 编码确定性
-  - owner-lock revision 协议 (新增使用点, 协议本身不变)
-
-Status: plan approved by user, feature_list.md entries written
-(F211-A through F211-I, passes:false). 代码实现尚未开始, 由用户
-后续推进。
+Open items (remaining work for full F211 closure):
+  1. F211-G Python OP policy script — minimal smoke version
+     - Could be done via small Rust CLI wrapper (autumn-op binary)
+       or standalone Python with hand-rolled rkyv encode/decode
+  2. F211-D stream-layer wire fence on WriteShardReq /
+     CommitEcShardReq / ReadShardReq — touches stream + partition-
+     server crates; needs careful wire-compat handling per
+     feedback_warn_on_backward_incompat. Best done as separate
+     phase 2 commit so the manager-side work can ship + bake.
+  3. Auto-call audit_retention_gc on a periodic loop (helper is
+     wired but not yet scheduled).
+  4. Integration test with embedded etcd to exercise persist /
+     replay of node_override/ + decommissioned/ + audit log.
 
 Next steps:
-  - 实现按落地顺序逐个 sub-feature 推进
-  - 每个 sub-feature commit 时更新 feature_list.md 的 passes
-    字段
-  - F211-E 切换前确认 F211-G policy script 已部署 + 监控渠道
-    准备好
-  - 阶段化部署: F211-A/B/I/C/D/H/G 合一波 (基建),
-    F211-E/F 单独上线 + 观察
+  - Land this checkpoint to main.
+  - Tackle F211-G next (smallest item that completes the operator
+    surface area).
+  - Tackle F211-D in a phase 2 commit; it's the larger of the two
+    remaining items and benefits from the manager-side ground truth
+    being stable first.
 
 Previous task (completed): F210-H3 Tier 2 split commit_length
 fence-enforcing primitive + dedicated fence-free probe RPC.

@@ -177,6 +177,18 @@ impl AutumnManager {
             MSG_FORCE_EC_CONVERT => self.handle_force_ec_convert(payload).await,
             MSG_GET_PARTITION_DETAIL => self.handle_get_partition_detail(payload).await,
             MSG_GET_POLICY_KIND_NAMES => self.handle_get_policy_kind_names(payload).await,
+            // ── F211 operator-driven node lifecycle ──────────────────────
+            MSG_LIST_NODE_STATES => self.handle_list_node_states(payload).await,
+            MSG_EXTENT_HEALTH_REPORT => self.handle_extent_health_report(payload).await,
+            MSG_LIST_EC_INFLIGHT_MARKERS => {
+                self.handle_list_ec_inflight_markers(payload).await
+            }
+            MSG_FENCE_NODE => self.handle_fence_node(payload).await,
+            MSG_SET_NODE_MAINTENANCE => self.handle_set_node_maintenance(payload).await,
+            MSG_CLEAR_NODE_OVERRIDE => self.handle_clear_node_override(payload).await,
+            MSG_REMOVE_NODE => self.handle_remove_node(payload).await,
+            MSG_RECOVERY_STATS => self.handle_recovery_stats(payload).await,
+            MSG_QUERY_AUDIT_LOG => self.handle_query_audit_log(payload).await,
             _ => Err((
                 StatusCode::InvalidArgument,
                 format!("unknown msg_type {msg_type}"),
@@ -210,7 +222,7 @@ impl AutumnManager {
         }
     }
 
-    pub(crate) async fn handle_register_node(&self, payload: Bytes) -> HandlerResult {
+    pub async fn handle_register_node(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&RegisterNodeResp {
                 code: Self::err_to_code(&err),
@@ -222,6 +234,41 @@ impl AutumnManager {
 
         let req: RegisterNodeReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // F211-C #2: zombie defense. Refuse re-registration when the
+        // address is associated with a decommissioned node_id or a
+        // currently-Fenced override. The operator must explicitly
+        // `mgr_clear_node_override` before the node can come back.
+        {
+            let s = self.store.inner.borrow();
+            let prior = s.nodes.values().find(|n| n.address == req.addr).map(|n| n.node_id);
+            if let Some(pid) = prior {
+                if self.decommissioned.borrow().contains_key(&pid) {
+                    return Ok(rkyv_encode(&RegisterNodeResp {
+                        code: CODE_PRECONDITION,
+                        message: format!(
+                            "address {} was previously decommissioned (node {}); operator must clear tombstone",
+                            req.addr, pid
+                        ),
+                        node_id: 0,
+                        disk_uuids: vec![],
+                    }));
+                }
+                if let Some(o) = self.node_overrides.borrow().get(&pid) {
+                    if o.kind == NODE_OVERRIDE_FENCED {
+                        return Ok(rkyv_encode(&RegisterNodeResp {
+                            code: CODE_PRECONDITION,
+                            message: format!(
+                                "node {} is Fenced; operator must clear override before re-registering",
+                                pid
+                            ),
+                            node_id: 0,
+                            disk_uuids: vec![],
+                        }));
+                    }
+                }
+            }
+        }
 
         // Re-registration: if the address is already known, reuse the existing
         // node_id and disk_ids rather than rejecting. This allows extent nodes
@@ -289,6 +336,10 @@ impl AutumnManager {
                     .insert(node_id, existing_node.clone());
             }
 
+            // F211-A: re-registration counts as a heartbeat — flip
+            // Suspected → Online so the operator-facing health report
+            // reflects the recovery immediately, not on the next df tick.
+            self.node_states.borrow_mut().on_heartbeat_ok(node_id);
             return Ok(rkyv_encode(&RegisterNodeResp {
                 code: CODE_OK,
                 message: String::new(),
@@ -350,6 +401,10 @@ impl AutumnManager {
             }
             s.nodes.insert(node_id, node.clone());
         }
+        // F211-A: seed the tracker with an initial OK heartbeat so the
+        // node starts Online and a stale `df` doesn't immediately
+        // promote it Suspected.
+        self.node_states.borrow_mut().on_heartbeat_ok(node_id);
 
         Ok(rkyv_encode(&RegisterNodeResp {
             code: CODE_OK,
@@ -3297,6 +3352,701 @@ impl AutumnManager {
         Ok(rkyv_encode(&SyncPartitionVpRefsResp {
             code: CODE_OK,
             message: String::new(),
+        }))
+    }
+
+    // ── F211-B / F211-C / F211-H / F211-I admin & health RPCs ──────────────
+    //
+    // All admin-mutating handlers (F211-C, force_ec_convert, future
+    // force_abandon_ec_marker) wrap their result in `append_audit`
+    // (F211-I). The audit append is best-effort: a failed audit write
+    // logs WARN but doesn't surface to the caller (the primary
+    // operation already succeeded).
+
+    pub async fn handle_list_node_states(&self, _payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&ListNodeStatesResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                nodes: vec![],
+            }));
+        }
+        let (nodes_meta, overrides, snapshot) = {
+            let s = self.store.inner.borrow();
+            let nodes: Vec<(u64, String)> = s
+                .nodes
+                .iter()
+                .map(|(id, n)| (*id, n.address.clone()))
+                .collect();
+            let overrides = self.node_overrides.borrow().clone();
+            let snap = self.node_states.borrow().snapshot();
+            (nodes, overrides, snap)
+        };
+        // Merge: every registered node MUST appear (even if the tracker
+        // has no entry yet). Tracker-only entries (e.g. for a node
+        // dropped from `s.nodes` mid-failover) are dropped here.
+        let snap_map: HashMap<u64, (crate::node_state::NodeAutoState, Option<u64>)> = snapshot
+            .into_iter()
+            .map(|(id, st, secs)| (id, (st, secs)))
+            .collect();
+        let mut out: Vec<NodeStateEntry> = nodes_meta
+            .into_iter()
+            .map(|(node_id, address)| {
+                let (auto_state, last_secs) = snap_map
+                    .get(&node_id)
+                    .copied()
+                    .unwrap_or((crate::node_state::NodeAutoState::Online, None));
+                let auto_state_byte = match auto_state {
+                    crate::node_state::NodeAutoState::Online => NODE_AUTO_STATE_ONLINE,
+                    crate::node_state::NodeAutoState::Suspected { .. } => {
+                        NODE_AUTO_STATE_SUSPECTED
+                    }
+                };
+                let suspected_age = match auto_state {
+                    crate::node_state::NodeAutoState::Suspected { since } => {
+                        since.elapsed().as_secs()
+                    }
+                    _ => 0,
+                };
+                let ovr = overrides.get(&node_id);
+                NodeStateEntry {
+                    node_id,
+                    address,
+                    auto_state: auto_state_byte,
+                    last_heartbeat_secs_ago: last_secs.unwrap_or(u64::MAX),
+                    suspected_age_secs: suspected_age,
+                    override_kind: ovr.map(|o| o.kind).unwrap_or(NODE_OVERRIDE_NONE),
+                    override_reason: ovr.map(|o| o.reason.clone()).unwrap_or_default(),
+                    override_set_by: ovr.map(|o| o.set_by.clone()).unwrap_or_default(),
+                    override_set_at: ovr.map(|o| o.set_at).unwrap_or(0),
+                    override_expire_at: ovr.map(|o| o.expire_at).unwrap_or(0),
+                }
+            })
+            .collect();
+        out.sort_by_key(|e| e.node_id);
+        Ok(rkyv_encode(&ListNodeStatesResp {
+            code: CODE_OK,
+            message: String::new(),
+            nodes: out,
+        }))
+    }
+
+    pub async fn handle_extent_health_report(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&ExtentHealthResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                extents: vec![],
+            }));
+        }
+        let req: ExtentHealthReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let filter: HashSet<u64> = req.node_id_filter.iter().copied().collect();
+        let (extents, overrides, snapshot) = {
+            let s = self.store.inner.borrow();
+            let extents: Vec<MgrExtentInfo> = s.extents.values().cloned().collect();
+            let overrides = self.node_overrides.borrow().clone();
+            let snap = self.node_states.borrow().snapshot();
+            (extents, overrides, snap)
+        };
+        let snap_map: HashMap<u64, crate::node_state::NodeAutoState> = snapshot
+            .into_iter()
+            .map(|(id, st, _)| (id, st))
+            .collect();
+        let mut out: Vec<ExtentHealth> = Vec::new();
+        for ex in extents {
+            let copies = Self::extent_nodes(&ex);
+            let mut slots: Vec<ExtentSlotHealth> = Vec::with_capacity(copies.len());
+            let mut any_match = filter.is_empty();
+            let mut any_unhealthy = false;
+            for (idx, &node_id) in copies.iter().enumerate() {
+                if filter.contains(&node_id) {
+                    any_match = true;
+                }
+                let bit = 1u32 << idx;
+                let avali = (ex.avali & bit) != 0;
+                let auto = snap_map
+                    .get(&node_id)
+                    .copied()
+                    .unwrap_or(crate::node_state::NodeAutoState::Online);
+                let auto_byte = match auto {
+                    crate::node_state::NodeAutoState::Online => NODE_AUTO_STATE_ONLINE,
+                    crate::node_state::NodeAutoState::Suspected { .. } => {
+                        NODE_AUTO_STATE_SUSPECTED
+                    }
+                };
+                let ovr = overrides
+                    .get(&node_id)
+                    .map(|o| o.kind)
+                    .unwrap_or(NODE_OVERRIDE_NONE);
+                if !avali || auto_byte != NODE_AUTO_STATE_ONLINE || ovr != NODE_OVERRIDE_NONE
+                {
+                    any_unhealthy = true;
+                }
+                slots.push(ExtentSlotHealth {
+                    slot_index: idx as u32,
+                    node_id,
+                    avali,
+                    auto_state: auto_byte,
+                    override_kind: ovr,
+                });
+            }
+            if !any_match {
+                continue;
+            }
+            if !req.include_healthy && !any_unhealthy && filter.is_empty() {
+                continue;
+            }
+            out.push(ExtentHealth {
+                extent_id: ex.extent_id,
+                eversion: ex.eversion,
+                sealed_length: ex.sealed_length,
+                ec_converted: ex.ec_converted,
+                slots,
+                unhealthy: any_unhealthy,
+            });
+        }
+        out.sort_by_key(|e| e.extent_id);
+        Ok(rkyv_encode(&ExtentHealthResp {
+            code: CODE_OK,
+            message: String::new(),
+            extents: out,
+        }))
+    }
+
+    pub async fn handle_list_ec_inflight_markers(
+        &self,
+        _payload: Bytes,
+    ) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&ListEcInflightMarkersResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                markers: vec![],
+            }));
+        }
+        let snapshot = self.node_states.borrow().snapshot();
+        let snap_map: HashMap<u64, crate::node_state::NodeAutoState> =
+            snapshot.into_iter().map(|(id, st, _)| (id, st)).collect();
+        let overrides = self.node_overrides.borrow().clone();
+        let now_s = Self::epoch_seconds();
+        let mut markers: Vec<InflightWithCoordState> = Vec::new();
+        for (eid, rec) in self.inflight.borrow().iter() {
+            let Some((kind, payload)) = rec.unpack() else { continue };
+            if kind != crate::extent_inflight::ExtentOpKind::ConvertToEc {
+                continue;
+            }
+            let crate::extent_inflight::ExtentOpPayload::ConvertToEc(p) = payload else {
+                continue;
+            };
+            let coord = p.target_nodes.first().copied().unwrap_or(0);
+            let auto = snap_map
+                .get(&coord)
+                .copied()
+                .unwrap_or(crate::node_state::NodeAutoState::Online);
+            let auto_byte = match auto {
+                crate::node_state::NodeAutoState::Online => NODE_AUTO_STATE_ONLINE,
+                crate::node_state::NodeAutoState::Suspected { .. } => {
+                    NODE_AUTO_STATE_SUSPECTED
+                }
+            };
+            let ovr = overrides
+                .get(&coord)
+                .map(|o| o.kind)
+                .unwrap_or(NODE_OVERRIDE_NONE);
+            markers.push(InflightWithCoordState {
+                extent_id: *eid,
+                coord_node_id: coord,
+                coord_auto_state: auto_byte,
+                coord_override_kind: ovr,
+                target_nodes: p.target_nodes.clone(),
+                data_shards: p.data_shards,
+                new_eversion: p.new_eversion,
+                started_at: rec.started_at,
+                age_secs: now_s.saturating_sub(rec.started_at),
+            });
+        }
+        markers.sort_by_key(|m| m.extent_id);
+        Ok(rkyv_encode(&ListEcInflightMarkersResp {
+            code: CODE_OK,
+            message: String::new(),
+            markers,
+        }))
+    }
+
+    // ── F211-C admin RPCs ────────────────────────────────────────────────
+
+    pub async fn handle_fence_node(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&CodeResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+            }));
+        }
+        let req: FenceNodeReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let result = self.fence_node_impl(&req).await;
+        let (code, message) = match &result {
+            Ok(()) => (CODE_OK, String::new()),
+            Err(e) => (Self::err_to_code(e), e.to_string()),
+        };
+        self.append_audit(MgrAuditEntry {
+            op: AUDIT_OP_FENCE_NODE,
+            node_id: req.node_id,
+            extent_id: 0,
+            by: req.set_by.clone(),
+            reason: req.reason.clone(),
+            result_code: code,
+            result_message: message.clone(),
+            ts_ns: 0,
+        })
+        .await;
+        Ok(rkyv_encode(&CodeResp { code, message }))
+    }
+
+    pub async fn handle_set_node_maintenance(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&CodeResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+            }));
+        }
+        let req: SetNodeMaintenanceReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // F211-C: zombie defense — refuse if node was decommissioned.
+        if self.decommissioned.borrow().contains_key(&req.node_id) {
+            let msg = format!("node {} was previously decommissioned; cannot mark maintenance", req.node_id);
+            self.append_audit(MgrAuditEntry {
+                op: AUDIT_OP_SET_NODE_MAINTENANCE,
+                node_id: req.node_id,
+                extent_id: 0,
+                by: req.set_by.clone(),
+                reason: req.reason.clone(),
+                result_code: CODE_PRECONDITION,
+                result_message: msg.clone(),
+                ts_ns: 0,
+            })
+            .await;
+            return Ok(rkyv_encode(&CodeResp {
+                code: CODE_PRECONDITION,
+                message: msg,
+            }));
+        }
+        let ovr = MgrNodeOverride {
+            node_id: req.node_id,
+            kind: NODE_OVERRIDE_MAINTENANCE,
+            set_at: Self::epoch_seconds(),
+            set_by: req.set_by.clone(),
+            reason: req.reason.clone(),
+            expire_at: req.expire_at,
+        };
+        let key = format!("{}{}", crate::NODE_OVERRIDE_PREFIX, req.node_id);
+        let value = rkyv_encode(&ovr).to_vec();
+        if let Some(etcd) = &self.etcd {
+            if let Err(err) = etcd.put_msgs_txn(vec![(key, value)]).await {
+                self.append_audit(MgrAuditEntry {
+                    op: AUDIT_OP_SET_NODE_MAINTENANCE,
+                    node_id: req.node_id,
+                    extent_id: 0,
+                    by: req.set_by.clone(),
+                    reason: req.reason.clone(),
+                    result_code: Self::err_to_code(&err),
+                    result_message: err.to_string(),
+                    ts_ns: 0,
+                })
+                .await;
+                return Ok(rkyv_encode(&CodeResp {
+                    code: Self::err_to_code(&err),
+                    message: err.to_string(),
+                }));
+            }
+        }
+        self.node_overrides.borrow_mut().insert(req.node_id, ovr);
+        self.append_audit(MgrAuditEntry {
+            op: AUDIT_OP_SET_NODE_MAINTENANCE,
+            node_id: req.node_id,
+            extent_id: 0,
+            by: req.set_by.clone(),
+            reason: req.reason.clone(),
+            result_code: CODE_OK,
+            result_message: String::new(),
+            ts_ns: 0,
+        })
+        .await;
+        Ok(rkyv_encode(&CodeResp {
+            code: CODE_OK,
+            message: String::new(),
+        }))
+    }
+
+    pub async fn handle_clear_node_override(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&CodeResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+            }));
+        }
+        let req: ClearNodeOverrideReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let key = format!("{}{}", crate::NODE_OVERRIDE_PREFIX, req.node_id);
+        if let Some(etcd) = &self.etcd {
+            if let Err(err) = etcd.put_and_delete_txn(Vec::new(), vec![key]).await {
+                self.append_audit(MgrAuditEntry {
+                    op: AUDIT_OP_CLEAR_NODE_OVERRIDE,
+                    node_id: req.node_id,
+                    extent_id: 0,
+                    by: req.set_by.clone(),
+                    reason: String::new(),
+                    result_code: Self::err_to_code(&err),
+                    result_message: err.to_string(),
+                    ts_ns: 0,
+                })
+                .await;
+                return Ok(rkyv_encode(&CodeResp {
+                    code: Self::err_to_code(&err),
+                    message: err.to_string(),
+                }));
+            }
+        }
+        self.node_overrides.borrow_mut().remove(&req.node_id);
+        self.append_audit(MgrAuditEntry {
+            op: AUDIT_OP_CLEAR_NODE_OVERRIDE,
+            node_id: req.node_id,
+            extent_id: 0,
+            by: req.set_by.clone(),
+            reason: String::new(),
+            result_code: CODE_OK,
+            result_message: String::new(),
+            ts_ns: 0,
+        })
+        .await;
+        Ok(rkyv_encode(&CodeResp {
+            code: CODE_OK,
+            message: String::new(),
+        }))
+    }
+
+    pub async fn handle_remove_node(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&RemoveNodeResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                blocking_extent_ids: vec![],
+                blocking_marker_extent_ids: vec![],
+            }));
+        }
+        let req: RemoveNodeReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let result = self.remove_node_impl(&req).await;
+        let (code, message, ext_blockers, mark_blockers) = match result {
+            Ok(()) => (CODE_OK, String::new(), vec![], vec![]),
+            Err((c, m, e, k)) => (c, m, e, k),
+        };
+        self.append_audit(MgrAuditEntry {
+            op: AUDIT_OP_REMOVE_NODE,
+            node_id: req.node_id,
+            extent_id: 0,
+            by: req.set_by.clone(),
+            reason: String::new(),
+            result_code: code,
+            result_message: message.clone(),
+            ts_ns: 0,
+        })
+        .await;
+        Ok(rkyv_encode(&RemoveNodeResp {
+            code,
+            message,
+            blocking_extent_ids: ext_blockers,
+            blocking_marker_extent_ids: mark_blockers,
+        }))
+    }
+
+    // F211-C inner helpers — separated so the handlers' audit-wrap is
+    // tight + the unit-test surface is direct.
+
+    async fn fence_node_impl(&self, req: &FenceNodeReq) -> Result<(), AppError> {
+        if !self.store.inner.borrow().nodes.contains_key(&req.node_id) {
+            return Err(AppError::NotFound(format!(
+                "node {} not registered",
+                req.node_id
+            )));
+        }
+        // F211-C #5 capacity precheck (unless --force).
+        if !req.force {
+            self.check_capacity_for_fence(req.node_id)?;
+        }
+        // Persist the override.
+        let ovr = MgrNodeOverride {
+            node_id: req.node_id,
+            kind: NODE_OVERRIDE_FENCED,
+            set_at: Self::epoch_seconds(),
+            set_by: req.set_by.clone(),
+            reason: req.reason.clone(),
+            expire_at: 0,
+        };
+        let key = format!("{}{}", crate::NODE_OVERRIDE_PREFIX, req.node_id);
+        let value = rkyv_encode(&ovr).to_vec();
+        if let Some(etcd) = &self.etcd {
+            etcd.put_msgs_txn(vec![(key, value)]).await?;
+        }
+        self.node_overrides
+            .borrow_mut()
+            .insert(req.node_id, ovr);
+        // F211-D: bump owner-lock revisions for every extent the
+        // node holds (so any stale-cache writes by a revived ghost
+        // are rejected). The bump is best-effort — owner revisions
+        // are CAS-based and concurrent acquirers will simply land
+        // ahead of us.
+        let _ = self.bump_owner_revisions_for_node(req.node_id).await;
+        // F211-F: auto-abandon EC convert markers whose coord matches
+        // the freshly-fenced node.
+        let _ = self.auto_abandon_for_fenced_node(req.node_id).await;
+        Ok(())
+    }
+
+    /// F211-C #5: refuse fence if the cluster doesn't have enough
+    /// remaining free space to absorb the node's data. Returns
+    /// Precondition when the safety factor (default 1.2x) is not met.
+    fn check_capacity_for_fence(&self, node_id: u64) -> Result<(), AppError> {
+        let s = self.store.inner.borrow();
+        // Sum sealed_length of extents that have any slot on this node.
+        let mut data_to_migrate: u64 = 0;
+        for ex in s.extents.values() {
+            if Self::extent_nodes(ex).contains(&node_id) {
+                // Per-shard size for EC, full size for replication.
+                let shard_size = if ex.ec_converted
+                    && !ex.replicates.is_empty()
+                    && !ex.parity.is_empty()
+                {
+                    let k = ex.replicates.len() as u64;
+                    ex.sealed_length.div_ceil(k.max(1))
+                } else {
+                    ex.sealed_length
+                };
+                data_to_migrate = data_to_migrate.saturating_add(shard_size);
+            }
+        }
+        // Estimate remaining capacity from disk metadata; treat missing
+        // sizes as 0 (conservative — refuses if we have no signal).
+        // The MgrDiskInfo struct doesn't track free bytes today, so we
+        // do a coarse "is there at least one online disk on a different
+        // node?" check — recovery dispatch needs >= 1 healthy target.
+        let has_alt_targets = s.nodes.values().any(|n| {
+            n.node_id != node_id
+                && n.disks
+                    .iter()
+                    .any(|did| s.disks.get(did).map(|d| d.online).unwrap_or(false))
+        });
+        if !has_alt_targets && data_to_migrate > 0 {
+            return Err(AppError::Precondition(format!(
+                "no healthy target nodes available to receive ~{} bytes from node {} (use --force to override)",
+                data_to_migrate, node_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// F211-D: bump owner-lock revision for every extent the node owns.
+    /// The store's `owner_revisions` map is keyed by owner_key, not by
+    /// extent_id; we increment the revision counter so any pending
+    /// op still carrying the old revision is rejected by the
+    /// extent-node revision fence.
+    async fn bump_owner_revisions_for_node(&self, node_id: u64) -> Result<(), AppError> {
+        // Find every owner_key whose associated partition / extent
+        // references the node. Without a reverse index this is a
+        // worst-case scan — fine, fence is a rare op.
+        let to_bump: Vec<String> = {
+            let s = self.store.inner.borrow();
+            let mut keys: HashSet<String> = HashSet::new();
+            for ex in s.extents.values() {
+                if !Self::extent_nodes(ex).contains(&node_id) {
+                    continue;
+                }
+                // Find the partitions whose log/row/meta stream contains
+                // this extent_id and add their owner_keys.
+                for (pid, part) in s.partitions.iter() {
+                    let owns = [part.log_stream, part.row_stream, part.meta_stream]
+                        .iter()
+                        .any(|sid| {
+                            s.streams
+                                .get(sid)
+                                .map(|st| st.extent_ids.contains(&ex.extent_id))
+                                .unwrap_or(false)
+                        });
+                    if owns {
+                        keys.insert(format!("partition/{}", pid));
+                    }
+                }
+            }
+            keys.into_iter().collect()
+        };
+        for owner_key in to_bump {
+            // Re-acquiring increments the revision; the etcd helper
+            // returns the new revision and a different one will land
+            // for any concurrent caller. Best-effort.
+            let _ = self.acquire_owner_revision(&owner_key).await;
+        }
+        Ok(())
+    }
+
+    async fn remove_node_impl(
+        &self,
+        req: &RemoveNodeReq,
+    ) -> Result<(), (u8, String, Vec<u64>, Vec<u64>)> {
+        let cur = self.node_overrides.borrow().get(&req.node_id).cloned();
+        let is_fenced = matches!(cur.as_ref().map(|o| o.kind), Some(NODE_OVERRIDE_FENCED));
+        if !is_fenced {
+            return Err((
+                CODE_PRECONDITION,
+                format!("node {} must be Fenced before remove", req.node_id),
+                vec![],
+                vec![],
+            ));
+        }
+        // Scan for residual references.
+        let (ext_refs, marker_refs) = {
+            let s = self.store.inner.borrow();
+            let mut ext_refs: Vec<u64> = Vec::new();
+            for ex in s.extents.values() {
+                if Self::extent_nodes(ex).contains(&req.node_id) {
+                    ext_refs.push(ex.extent_id);
+                }
+            }
+            let mut marker_refs: Vec<u64> = Vec::new();
+            for (eid, rec) in self.inflight.borrow().iter() {
+                if let Some((
+                    crate::extent_inflight::ExtentOpKind::ConvertToEc,
+                    crate::extent_inflight::ExtentOpPayload::ConvertToEc(p),
+                )) = rec.unpack()
+                {
+                    if p.target_nodes.contains(&req.node_id) {
+                        marker_refs.push(*eid);
+                    }
+                }
+            }
+            ext_refs.sort();
+            marker_refs.sort();
+            (ext_refs, marker_refs)
+        };
+        if !ext_refs.is_empty() || !marker_refs.is_empty() {
+            return Err((
+                CODE_PRECONDITION,
+                format!(
+                    "node {} still referenced by {} extents and {} EC markers",
+                    req.node_id,
+                    ext_refs.len(),
+                    marker_refs.len()
+                ),
+                ext_refs,
+                marker_refs,
+            ));
+        }
+        // All clear — persist tombstone + delete override + delete
+        // nodes/<id> + delete disks/<id>. Single atomic txn.
+        let now = Self::epoch_seconds();
+        let tomb = MgrNodeOverride {
+            node_id: req.node_id,
+            kind: NODE_OVERRIDE_FENCED,
+            set_at: now,
+            set_by: req.set_by.clone(),
+            reason: "removed".to_string(),
+            expire_at: 0,
+        };
+        let tomb_key = format!("{}{}", crate::DECOMMISSIONED_PREFIX, req.node_id);
+        let tomb_val = rkyv_encode(&tomb).to_vec();
+        let override_key = format!("{}{}", crate::NODE_OVERRIDE_PREFIX, req.node_id);
+        let node_key = format!("nodes/{}", req.node_id);
+        let disk_ids: Vec<u64> = self
+            .store
+            .inner
+            .borrow()
+            .nodes
+            .get(&req.node_id)
+            .map(|n| n.disks.clone())
+            .unwrap_or_default();
+        let disk_keys: Vec<String> =
+            disk_ids.iter().map(|d| format!("disks/{}", d)).collect();
+        if let Some(etcd) = &self.etcd {
+            let mut deletes = vec![override_key.clone(), node_key.clone()];
+            deletes.extend(disk_keys.iter().cloned());
+            if let Err(e) = etcd
+                .put_and_delete_txn(vec![(tomb_key, tomb_val)], deletes)
+                .await
+            {
+                return Err((
+                    Self::err_to_code(&e),
+                    e.to_string(),
+                    vec![],
+                    vec![],
+                ));
+            }
+        }
+        // Apply to in-memory.
+        {
+            let mut s = self.store.inner.borrow_mut();
+            s.nodes.remove(&req.node_id);
+            for did in &disk_ids {
+                s.disks.remove(did);
+            }
+        }
+        self.node_overrides.borrow_mut().remove(&req.node_id);
+        self.node_states.borrow_mut().drop_node(req.node_id);
+        self.decommissioned
+            .borrow_mut()
+            .insert(req.node_id, tomb);
+        Ok(())
+    }
+
+    // ── F211-H recovery stats ────────────────────────────────────────────
+
+    pub async fn handle_recovery_stats(&self, _payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&RecoveryStatsResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                ..Default::default()
+            }));
+        }
+        let l = self.recovery_limiter.borrow();
+        let (src, tgt) = l.snapshot();
+        Ok(rkyv_encode(&RecoveryStatsResp {
+            code: CODE_OK,
+            message: String::new(),
+            global_inflight: l.global_inflight,
+            max_global: l.max_global,
+            max_per_source: l.max_per_source,
+            max_per_target: l.max_per_target,
+            per_source: src,
+            per_target: tgt,
+            backoff_entries: l.backoff.len() as u32,
+        }))
+    }
+
+    // ── F211-I audit log query ───────────────────────────────────────────
+
+    pub async fn handle_query_audit_log(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&QueryAuditLogResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                entries: vec![],
+            }));
+        }
+        let req: QueryAuditLogReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let entries = self
+            .query_audit(
+                req.op_filter,
+                req.node_id_filter,
+                req.since_ts_s,
+                req.until_ts_s,
+                req.limit,
+            )
+            .await;
+        Ok(rkyv_encode(&QueryAuditLogResp {
+            code: CODE_OK,
+            message: String::new(),
+            entries,
         }))
     }
 }

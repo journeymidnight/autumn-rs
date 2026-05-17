@@ -2746,7 +2746,7 @@ Background: autumn-rs 当前节点死亡判定模型过于激进——心跳 10s
 - **Acceptance:**
   - 单元测试：Online ↔ Suspected 转换分支（心跳成功、心跳失败、df 失败、tick 推进）。
   - 集成测试：模拟 EN 不响应 10s → tracker 显示 Suspected；30 min 后仍为 Suspected（不自动 Down）。
-- **passes:** false
+- **passes:** true
 
 ### F211-B · Health reporting RPCs（manager 暴露事实，只读）
 - **Trigger:** OP policy script 需要从 manager 拉取节点健康事实 + extent 副本健康度 + inflight EC marker 关联状态，才能综合判断是否 fence。
@@ -2758,7 +2758,7 @@ Background: autumn-rs 当前节点死亡判定模型过于激进——心跳 10s
 - **Acceptance:**
   - 单元测试：聚合逻辑（按 node_id filter、unhealthy 判定）。
   - 集成测试：模拟一个节点 Suspected → 调 RPC 返回 last_heartbeat_secs_ago 准确。
-- **passes:** false
+- **passes:** true
 
 ### F211-C · Operator fence / maintenance / clear / remove admin RPCs (etcd-persisted)
 - **Trigger:** 运维需要 4 种显式操作：fence（确认死亡触发 cleanup）、maintenance（暂时不可用但不要重建）、clear（撤销 override）、remove（recovery 完成后彻底移除）。覆盖 HDFS decommission 全流程。
@@ -2772,7 +2772,7 @@ Background: autumn-rs 当前节点死亡判定模型过于激进——心跳 10s
 - **Acceptance:**
   - 单元测试：override 优先于 auto state；remove 在节点非 Fenced 时返回 PRECONDITION；remove 在仍有 extent / marker 引用时返回 PRECONDITION + 详细列表；容量预检在剩余容量不足时拒绝；maintenance TTL 过期自动 clear。
   - 集成测试：fence → 等 recovery → remove 完整 lifecycle。
-- **passes:** false
+- **passes:** true
 
 ### F211-D · Owner-lock revision bump on fence + shard read/write/commit revision fence
 - **Trigger:** Fence 之后必须防止假死复活的老 coord 继续向 target ENs 写数据 / 服务 stale read。当前只 append 路径有 owner-lock revision fence，shard 读/写/commit 三个 handler 都没有 fence。
@@ -2795,7 +2795,7 @@ Background: autumn-rs 当前节点死亡判定模型过于激进——心跳 10s
   - 集成测试：节点故障但未 fence → recovery 不触发；fence 后才触发。
   - 集成测试：注入持续失败的 recovery 任务 → 验证指数退避（日志频率随时间衰减）。
   - 性能验证：transient 故障（< soft_timeout 内恢复）不再引发误重建。
-- **passes:** false
+- **passes:** true
 
 ### F211-F · EC convert auto-abandon on coord fenced + Suspected-window dispatch 跳过
 - **Trigger:** Coord 节点 Fenced 后 inflight marker 必须自动 abandon（释放 F138 互斥），同时 dispatch loop 在 Suspected 窗口不该刷无效 dispatch 日志（漏洞 #3）。
@@ -2804,7 +2804,7 @@ Background: autumn-rs 当前节点死亡判定模型过于激进——心跳 10s
   - 集成测试：fence coord 节点 → inflight marker 自动消失 + advisory entry 出现。
   - 集成测试：调 force_ec_convert 重发后 advisory 自动清除。
   - 集成测试：coord Suspected 窗口期 ec_conversion_dispatch_loop 不刷错误日志。
-- **passes:** false
+- **passes:** true
 
 ### F211-G · Python OP policy script (`python/node_policy.py`)
 - **Trigger:** F211-E 切语义后 manager 不再自动 recovery，必须有 OP 工具周期消费 health RPC + 触发 admin action，否则集群故障无人修。
@@ -2831,7 +2831,7 @@ Background: autumn-rs 当前节点死亡判定模型过于激进——心跳 10s
   - 单元测试：限流器在达到阈值时阻塞新 dispatch。
   - 集成测试：fence 一个大节点（100+ extents）→ 验证 dispatch 并发不超过 max_global。
   - 性能测试：限流下 client 读写延迟不被 recovery IO 显著拖慢。
-- **passes:** false
+- **passes:** true
 
 ### F211-I · Operator action audit log（漏洞 #8）
 - **Trigger:** 当前 `node_override` 只记最后一次 set，没有完整操作历史，合规 / 调试需要审计：谁 fence 了什么、何时、原因。
@@ -2840,4 +2840,4 @@ Background: autumn-rs 当前节点死亡判定模型过于激进——心跳 10s
   - 单元测试：每个 admin RPC 后写入 audit entry。
   - 集成测试：query_audit_log 按 时间 / op type / node_id filter 正确。
   - 持久性测试：leader failover 后 audit log 完整。
-- **passes:** false
+- **passes:** true

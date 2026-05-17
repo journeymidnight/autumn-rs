@@ -359,6 +359,31 @@ impl AutumnManager {
                 continue;
             }
 
+            // F211-E: gate on `AUTUMN_MGR_RECOVERY_GATE`:
+            //   - `fenced_only` (default): trigger recovery ONLY when the
+            //     replica's node is operator-Fenced. Pre-fence transient
+            //     failures stop causing cross-node rebuilds.
+            //   - `auto_disk`: legacy behaviour (trigger on disk.online
+            //     == false). For ops who haven't yet stood up the F211-G
+            //     OP policy script.
+            let gate_mode = Self::recovery_gate_mode();
+
+            // F211-E: maintenance-TTL tick — clear expired Maintenance
+            // overrides before the dispatch decision. Cheap.
+            self.tick_maintenance_ttl().await;
+
+            // F211-F: snapshot operator overrides + auto-state so the
+            // body's filter is consistent with the policy decision.
+            let overrides = self.node_overrides.borrow().clone();
+            let auto_states: HashMap<u64, crate::node_state::NodeAutoState> = self
+                .node_states
+                .borrow()
+                .snapshot()
+                .into_iter()
+                .map(|(id, st, _)| (id, st))
+                .collect();
+            let now_s = Self::epoch_seconds();
+
             // F172-A: pre-filter under the store borrow so we DON'T clone
             // extents that the loop body will skip on the next line. The
             // loop body's first checks are `if ex.sealed_length == 0
@@ -405,6 +430,42 @@ impl AutumnManager {
                     let bit = 1u32 << slot;
                     let node = nodes.get(&node_id).cloned();
 
+                    // F211-E: backoff gate. If the (extent, slot) pair
+                    // has consecutive failures, skip this tick.
+                    if self
+                        .recovery_limiter
+                        .borrow()
+                        .in_backoff(ex.extent_id, slot as u32, now_s)
+                    {
+                        continue;
+                    }
+
+                    // F211-E: under `fenced_only`, only dispatch when the
+                    // replica's owning node has an operator Fenced
+                    // override. Suspected alone is NOT enough (matches
+                    // the HDFS decommission analogue). Under `auto_disk`,
+                    // fall through to the legacy disk.online check below.
+                    let is_fenced = matches!(
+                        overrides.get(&node_id).map(|o| o.kind),
+                        Some(NODE_OVERRIDE_FENCED)
+                    );
+                    let _is_suspected = matches!(
+                        auto_states.get(&node_id).copied(),
+                        Some(crate::node_state::NodeAutoState::Suspected { .. })
+                    );
+                    let _is_maintenance = matches!(
+                        overrides.get(&node_id).map(|o| o.kind),
+                        Some(NODE_OVERRIDE_MAINTENANCE)
+                    );
+
+                    // F211-E: under `fenced_only`, the operator must
+                    // explicitly fence before we dispatch recovery. The
+                    // backoff-from-failure path still applies once a
+                    // dispatch attempt does fire.
+                    if gate_mode == RecoveryGateMode::FencedOnly && !is_fenced {
+                        continue;
+                    }
+
                     // Check per-disk health: if the disk holding this replica is
                     // offline, dispatch recovery even if the node is reachable.
                     let disk_id = if slot < ex.replicate_disks.len() {
@@ -416,9 +477,15 @@ impl AutumnManager {
                     if let Some(did) = disk_id {
                         if let Some(disk) = disks.get(&did) {
                             if !disk.online {
-                                let _ = self
+                                let res = self
                                     .dispatch_recovery_task(ex.extent_id, node_id)
                                     .await;
+                                self.record_dispatch_outcome(
+                                    ex.extent_id,
+                                    slot as u32,
+                                    now_s,
+                                    res.is_ok(),
+                                );
                                 continue;
                             }
                         }
@@ -455,7 +522,13 @@ impl AutumnManager {
                                 }
                             }
                         }
-                        let _ = self.dispatch_recovery_task(ex.extent_id, node_id).await;
+                        let res = self.dispatch_recovery_task(ex.extent_id, node_id).await;
+                        self.record_dispatch_outcome(
+                            ex.extent_id,
+                            slot as u32,
+                            now_s,
+                            res.is_ok(),
+                        );
                         continue;
                     }
 
@@ -476,12 +549,95 @@ impl AutumnManager {
                         None => false,
                     };
                     if !healthy {
-                        let _ = self.dispatch_recovery_task(ex.extent_id, node_id).await;
+                        let res = self.dispatch_recovery_task(ex.extent_id, node_id).await;
+                        self.record_dispatch_outcome(
+                            ex.extent_id,
+                            slot as u32,
+                            now_s,
+                            res.is_ok(),
+                        );
                     }
                 }
             }
         }
     }
+
+    /// F211-E: load the dispatch gate mode from env. Default
+    /// `fenced_only` (operator-driven). `auto_disk` opts back into the
+    /// pre-F211 always-auto-rebuild behaviour for ops who haven't yet
+    /// stood up the OP policy script.
+    pub(crate) fn recovery_gate_mode() -> RecoveryGateMode {
+        match std::env::var("AUTUMN_MGR_RECOVERY_GATE")
+            .ok()
+            .as_deref()
+            .unwrap_or("fenced_only")
+        {
+            "auto_disk" => RecoveryGateMode::AutoDisk,
+            _ => RecoveryGateMode::FencedOnly,
+        }
+    }
+
+    /// F211-H: record a (success / failure) outcome for the
+    /// (extent, slot) pair so the rate-limiter's backoff window
+    /// updates correctly.
+    pub(crate) fn record_dispatch_outcome(
+        &self,
+        extent_id: u64,
+        slot: u32,
+        now_s: i64,
+        ok: bool,
+    ) {
+        let mut l = self.recovery_limiter.borrow_mut();
+        if ok {
+            l.record_success(extent_id, slot);
+        } else {
+            l.record_failure(extent_id, slot, now_s);
+        }
+    }
+
+    /// F211-C #6: Maintenance auto-clear. Walk overrides; for any
+    /// Maintenance entry whose `expire_at` is in the past, delete the
+    /// etcd key + in-memory entry. Logs an INFO; no audit entry (the
+    /// system, not the operator, did this — the operator scheduled it
+    /// via `expire_at`).
+    pub(crate) async fn tick_maintenance_ttl(&self) {
+        let now = Self::epoch_seconds() as u64;
+        let expired: Vec<u64> = self
+            .node_overrides
+            .borrow()
+            .iter()
+            .filter_map(|(id, o)| {
+                if o.kind == NODE_OVERRIDE_MAINTENANCE
+                    && o.expire_at > 0
+                    && o.expire_at <= now
+                {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for id in expired {
+            let key = format!("{}{}", crate::NODE_OVERRIDE_PREFIX, id);
+            if let Some(etcd) = &self.etcd {
+                let _ = etcd.put_and_delete_txn(Vec::new(), vec![key]).await;
+            }
+            self.node_overrides.borrow_mut().remove(&id);
+            tracing::info!(
+                node_id = id,
+                "F211-C: Maintenance override expired; auto-cleared"
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecoveryGateMode {
+    AutoDisk,
+    FencedOnly,
+}
+
+impl crate::AutumnManager {
 
     pub(crate) async fn recovery_collect_loop(self) {
         loop {
@@ -610,6 +766,14 @@ impl AutumnManager {
                     Err(_) => {
                         // F121: see recovery_collect_loop comment.
                         Self::mark_node_disks_offline(&self.store, node);
+                        // F211-A: feed the auto-state tracker so the
+                        // operator-facing health report sees this node
+                        // transition Online → Suspected after the soft
+                        // timeout. NOT a recovery trigger — that requires
+                        // explicit fence (F211-E).
+                        self.node_states
+                            .borrow_mut()
+                            .on_heartbeat_fail(node.node_id);
                         continue;
                     }
                 };
@@ -636,6 +800,10 @@ impl AutumnManager {
                 self.recent_failure_reports
                     .borrow_mut()
                     .remove(&node.node_id);
+                // F211-A: heartbeat OK → flip Suspected back to Online.
+                self.node_states
+                    .borrow_mut()
+                    .on_heartbeat_ok(node.node_id);
             }
         }
     }
@@ -768,10 +936,39 @@ impl AutumnManager {
                         _ => None,
                     })
                     .collect();
+                // F211-F: skip dispatch when the coord (target_nodes[0])
+                // is currently Suspected / Fenced / Maintenance. Pre-F211-F
+                // this loop hammered every 5 s against a known-dead coord
+                // producing a steady stream of WARN logs and CONNECT failures.
+                // The skip is silent — the OP policy script's
+                // `mgr_list_ec_inflight_markers` surfaces the situation to
+                // a human, who decides whether to fence.
+                let node_state_snap: HashMap<u64, crate::node_state::NodeAutoState> = self
+                    .node_states
+                    .borrow()
+                    .snapshot()
+                    .into_iter()
+                    .map(|(id, st, _)| (id, st))
+                    .collect();
+                let overrides_snap = self.node_overrides.borrow().clone();
                 let mut out = Vec::new();
                 for (eid, params) in pending {
                     if recovery_inflight_extents.contains(&eid) {
                         continue;
+                    }
+                    if let Some(coord) = params.target_nodes.first() {
+                        let auto_st = node_state_snap
+                            .get(coord)
+                            .copied()
+                            .unwrap_or(crate::node_state::NodeAutoState::Online);
+                        let is_overridden = overrides_snap.contains_key(coord);
+                        if auto_st.is_suspected() || is_overridden {
+                            // Silent skip — no log spam. The marker stays
+                            // in the ledger and will be picked up when
+                            // either the node recovers or the OP fences it
+                            // (which triggers `auto_abandon_for_fenced_node`).
+                            continue;
+                        }
                     }
                     let ex = match s.extents.get(&eid) {
                         Some(e) => e.clone(),

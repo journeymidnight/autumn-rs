@@ -97,6 +97,27 @@ pub const MSG_GET_PARTITION_DETAIL: u8 = 0x3A;
 // of truth; any future addition appends a new `(name, value)` pair.
 pub const MSG_GET_POLICY_KIND_NAMES: u8 = 0x3B;
 
+// ── F211 operator-driven node lifecycle ─────────────────────────────────────
+//
+// F211-B: read-only health reporting — the operator policy script reads
+// these to decide whether to `mgr_fence_node` / `mgr_set_node_maintenance`.
+pub const MSG_LIST_NODE_STATES: u8 = 0x3C;
+pub const MSG_EXTENT_HEALTH_REPORT: u8 = 0x3D;
+pub const MSG_LIST_EC_INFLIGHT_MARKERS: u8 = 0x3E;
+
+// F211-C: admin RPCs that mutate `node_override/<node_id>` (etcd-persisted)
+// — operator explicitly fences / maintains / clears / removes nodes.
+pub const MSG_FENCE_NODE: u8 = 0x3F;
+pub const MSG_SET_NODE_MAINTENANCE: u8 = 0x40;
+pub const MSG_CLEAR_NODE_OVERRIDE: u8 = 0x41;
+pub const MSG_REMOVE_NODE: u8 = 0x42;
+
+// F211-H: monitoring of the recovery throttle / queue depth.
+pub const MSG_RECOVERY_STATS: u8 = 0x43;
+
+// F211-I: append-only operator audit log query.
+pub const MSG_QUERY_AUDIT_LOG: u8 = 0x44;
+
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
 /// Serialize a value to Bytes using rkyv.
@@ -1059,3 +1080,248 @@ pub const EXT_MSG_CONVERT_TO_EC: u8 = 9;
 pub const EXT_MSG_DELETE_EXTENT: u8 = 11;
 pub const EXT_MSG_COMMIT_EC_SHARD: u8 = 12;
 pub const EXT_MSG_PROBE_EXTENT: u8 = 14;
+
+// ── F211 wire types ─────────────────────────────────────────────────────────
+//
+// All F211 message payloads use the same rkyv encode/decode helpers as the
+// rest of this file. New `MgrNode*` types are append-only; existing wire
+// shapes (MgrNodeInfo, MgrExtentInfo, etc.) are unchanged.
+
+/// F211-A/B: auto-tracked state byte. Wire-stable.
+pub const NODE_AUTO_STATE_ONLINE: u8 = 0;
+pub const NODE_AUTO_STATE_SUSPECTED: u8 = 1;
+
+/// F211-C: operator override kind. Wire-stable; new kinds APPEND-only.
+pub const NODE_OVERRIDE_NONE: u8 = 0;
+pub const NODE_OVERRIDE_FENCED: u8 = 1;
+pub const NODE_OVERRIDE_MAINTENANCE: u8 = 2;
+
+/// F211-C: rkyv'd value at etcd prefix `node_override/<node_id>`. Replayed
+/// on leader failover; cleared by `mgr_clear_node_override` or by the
+/// `NodeStateTracker.tick()` Maintenance-TTL sweep.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrNodeOverride {
+    pub node_id: u64,
+    /// `NODE_OVERRIDE_FENCED` or `NODE_OVERRIDE_MAINTENANCE`. `NONE` is
+    /// never serialised (caller deletes the etcd key instead).
+    pub kind: u8,
+    pub set_at: i64,
+    pub set_by: String,
+    pub reason: String,
+    /// Optional Maintenance TTL — unix-epoch seconds at which the
+    /// `NodeStateTracker.tick()` automatically clears the override.
+    /// `0` = no TTL (Fenced is permanent until explicit clear).
+    pub expire_at: u64,
+}
+
+// --- ListNodeStates (F211-B) ---
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ListNodeStatesReq {}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct NodeStateEntry {
+    pub node_id: u64,
+    pub address: String,
+    /// `NODE_AUTO_STATE_*`.
+    pub auto_state: u8,
+    /// Seconds since the most recent successful df, or `u64::MAX` if
+    /// the manager has never observed one (e.g. node registered but no
+    /// df probe completed yet).
+    pub last_heartbeat_secs_ago: u64,
+    /// Seconds since auto_state flipped to Suspected, or 0 when Online.
+    pub suspected_age_secs: u64,
+    /// Operator override if any (`NODE_OVERRIDE_NONE` if absent).
+    pub override_kind: u8,
+    pub override_reason: String,
+    pub override_set_by: String,
+    pub override_set_at: i64,
+    pub override_expire_at: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ListNodeStatesResp {
+    pub code: u8,
+    pub message: String,
+    pub nodes: Vec<NodeStateEntry>,
+}
+
+// --- ExtentHealthReport (F211-B) ---
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ExtentHealthReq {
+    /// Empty Vec = "every unhealthy extent". Non-empty = "every extent
+    /// whose any-slot's node_id appears in this filter, healthy or not".
+    pub node_id_filter: Vec<u64>,
+    /// If true and `node_id_filter` is empty, return ALL extents
+    /// regardless of health (used by `inspect-extent` paths). Default
+    /// false (only unhealthy) keeps the typical OP poll cheap.
+    pub include_healthy: bool,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ExtentSlotHealth {
+    /// 0..(K+M-1). Layered: data shards first, then parity shards.
+    pub slot_index: u32,
+    pub node_id: u64,
+    /// Mirror of `MgrExtentInfo.avali bit & (1<<slot)`.
+    pub avali: bool,
+    /// Node's `NODE_AUTO_STATE_*` at report time.
+    pub auto_state: u8,
+    /// `NODE_OVERRIDE_*` at report time.
+    pub override_kind: u8,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ExtentHealth {
+    pub extent_id: u64,
+    pub eversion: u64,
+    pub sealed_length: u64,
+    pub ec_converted: bool,
+    pub slots: Vec<ExtentSlotHealth>,
+    /// True iff any slot has `avali == false` OR any slot's node is
+    /// Suspected / Fenced / Maintenance.
+    pub unhealthy: bool,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ExtentHealthResp {
+    pub code: u8,
+    pub message: String,
+    pub extents: Vec<ExtentHealth>,
+}
+
+// --- ListEcInflightMarkers (F211-B) ---
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ListEcInflightMarkersReq {}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct InflightWithCoordState {
+    pub extent_id: u64,
+    pub coord_node_id: u64,
+    pub coord_auto_state: u8,
+    pub coord_override_kind: u8,
+    pub target_nodes: Vec<u64>,
+    pub data_shards: u32,
+    pub new_eversion: u64,
+    /// Marker `started_at` from `MgrExtentInflightRecord` (unix-epoch s).
+    pub started_at: i64,
+    /// Convenience: now - started_at, in seconds.
+    pub age_secs: i64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ListEcInflightMarkersResp {
+    pub code: u8,
+    pub message: String,
+    pub markers: Vec<InflightWithCoordState>,
+}
+
+// --- FenceNode / SetNodeMaintenance / ClearNodeOverride / RemoveNode (F211-C) ---
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct FenceNodeReq {
+    pub node_id: u64,
+    pub reason: String,
+    pub set_by: String,
+    /// If true, skip the capacity precheck (operator accepts risk).
+    pub force: bool,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SetNodeMaintenanceReq {
+    pub node_id: u64,
+    pub reason: String,
+    pub set_by: String,
+    /// `0` = no TTL.
+    pub expire_at: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ClearNodeOverrideReq {
+    pub node_id: u64,
+    pub set_by: String,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RemoveNodeReq {
+    pub node_id: u64,
+    pub set_by: String,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RemoveNodeResp {
+    pub code: u8,
+    pub message: String,
+    /// Populated on `CODE_PRECONDITION` so the OP sees exactly which
+    /// extents / markers still reference the node.
+    pub blocking_extent_ids: Vec<u64>,
+    pub blocking_marker_extent_ids: Vec<u64>,
+}
+
+// --- RecoveryStats (F211-H) ---
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RecoveryStatsReq {}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RecoveryStatsResp {
+    pub code: u8,
+    pub message: String,
+    pub global_inflight: u32,
+    pub max_global: u32,
+    pub max_per_source: u32,
+    pub max_per_target: u32,
+    /// `(node_id, inflight_count)` snapshot of per-source counters.
+    pub per_source: Vec<(u64, u32)>,
+    pub per_target: Vec<(u64, u32)>,
+    /// Number of (extent, slot) entries currently in exponential
+    /// backoff (consecutive_failures > 0).
+    pub backoff_entries: u32,
+}
+
+// --- Audit log (F211-I) ---
+
+pub const AUDIT_OP_FENCE_NODE: u8 = 1;
+pub const AUDIT_OP_SET_NODE_MAINTENANCE: u8 = 2;
+pub const AUDIT_OP_CLEAR_NODE_OVERRIDE: u8 = 3;
+pub const AUDIT_OP_REMOVE_NODE: u8 = 4;
+pub const AUDIT_OP_FORCE_EC_CONVERT: u8 = 5;
+pub const AUDIT_OP_FORCE_ABANDON_EC_MARKER: u8 = 6;
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrAuditEntry {
+    /// `AUDIT_OP_*`.
+    pub op: u8,
+    pub node_id: u64,
+    pub extent_id: u64,
+    pub by: String,
+    pub reason: String,
+    /// 0 = OK; non-zero = `CODE_*` failure.
+    pub result_code: u8,
+    pub result_message: String,
+    /// Unix-epoch nanoseconds for unique key suffix.
+    pub ts_ns: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct QueryAuditLogReq {
+    /// `0` = no filter; otherwise only entries with matching `op` byte.
+    pub op_filter: u8,
+    /// `0` = no filter.
+    pub node_id_filter: u64,
+    /// Unix-epoch seconds; `0` = no lower bound.
+    pub since_ts_s: i64,
+    /// Unix-epoch seconds; `0` = no upper bound.
+    pub until_ts_s: i64,
+    /// `0` = unlimited (caller should cap).
+    pub limit: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct QueryAuditLogResp {
+    pub code: u8,
+    pub message: String,
+    pub entries: Vec<MgrAuditEntry>,
+}
