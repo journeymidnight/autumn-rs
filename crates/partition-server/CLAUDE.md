@@ -965,6 +965,23 @@ so `sync_regions_once`'s drop+reopen check catches an epoch bump even
 in the (theoretical) case where rg byte-for-byte matches but epoch
 moved.
 
+**`handle_split_part` must bump `p.region_epoch` locally** (post-fix
+above the rg/has_overlap update). The manager bumps the region epoch
+in lock-step with rg rewrites (`next_region_epoch` in manager/src/lib.rs),
+but the PS partition thread can't see that bump until either (a) the
+next `sync_regions_once` tick drops + reopens this partition (seconds
+later, expensive), or (b) it updates its own copy in place. Without
+the in-place bump, a gallery `range()` call issued in the gap routes
+to a partition whose `p.region_epoch` still matches the SDK's stale
+cached epoch — the check passes, handle_range filters the SSTables
+against the just-narrowed `part_rg`, returns left-only entries with
+`cur_end_key = mid`, and the SDK's still-stale routing cache loops
+back to the same partition, hits the cursor-non-advance defensive
+trip, and the user sees an empty list. SDK additionally falls back
+to `refresh_regions` + retry on the non-advance trip as a defensive
+second layer (`crates/client/src/lib.rs::range`), so a future PS-side
+bug of this shape self-heals instead of erroring out.
+
 ## SSTable Format
 
 ### File Layout

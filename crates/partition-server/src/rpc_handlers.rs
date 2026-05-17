@@ -604,6 +604,18 @@ pub(crate) async fn handle_split_part(
     // re-evaluate has_overlap against the SSTables. Without this,
     // sync_regions_once would leave the partition with a stale wide rg
     // and a stale has_overlap=0, perpetuating the bug above.
+    //
+    // F212-fix: bump `region_epoch` in lock-step with the manager's
+    // `next_region_epoch` rule (rg-rewrite ⇒ +1). Pre-fix, a gallery
+    // `range(b"", b"", MAX)` issued before `region_sync_loop` had a
+    // chance to drop+reopen this partition saw BOTH sides stale at the
+    // old epoch: handle_range passed the epoch check, returned the
+    // left-only entries with `cur_end_key = new_rg.end_key (= mid)`,
+    // SDK's still-stale cache routed the next iteration back to the
+    // same partition with `cursor = mid`, handle_range now returned
+    // empty (past the narrowed range) + `cur_end_key = mid`, SDK's
+    // defensive "cur_end_key didn't advance" trip fired, and the user
+    // saw an empty list (HTTP 500 in gallery's `list_handler_inner`).
     {
         let mut p = part.borrow_mut();
         let new_rg = Range { start_key: auth_rg.start_key.clone(), end_key: mid.clone() };
@@ -620,6 +632,7 @@ pub(crate) async fn handle_split_part(
         if overlap {
             p.has_overlap.set(1);
         }
+        p.region_epoch = p.region_epoch.saturating_add(1).max(2);
     }
 
     // F210-C2: unfreeze on success — split commit landed; the LEFT

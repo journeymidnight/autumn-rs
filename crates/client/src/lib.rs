@@ -839,13 +839,25 @@ impl ClusterClient {
                 // Last partition in the keyspace (unbounded right).
                 break;
             }
-            // Defensive: assert forward progress. A bogus PS that
-            // returned a non-advancing cur_end_key would otherwise
-            // spin this loop forever.
+            // Forward-progress check. A non-advancing cur_end_key almost
+            // always means our routing cache is stale: we just hit a
+            // partition whose end_key is at-or-before the cursor we
+            // sent, so partition_point will keep landing on the same
+            // partition next iteration and we'd loop forever. Refresh
+            // the cache and retry from the same cursor — typically the
+            // post-split sibling now appears in the cache and the next
+            // iteration's partition_point routes correctly. Bounded by
+            // MAX_RANGE_REFRESHES so a genuinely bogus PS still
+            // surfaces an error.
             if resp.cur_end_key.as_slice() <= cursor.as_slice() {
-                return Err(AutumnError::ServerError(format!(
-                    "range on partition {part_id}: cur_end_key did not advance cursor"
-                )));
+                if refreshes_used >= MAX_RANGE_REFRESHES {
+                    return Err(AutumnError::ServerError(format!(
+                        "range on partition {part_id}: cur_end_key did not advance cursor after {refreshes_used} refreshes"
+                    )));
+                }
+                refreshes_used += 1;
+                let _ = self.refresh_regions().await;
+                continue;
             }
             cursor = resp.cur_end_key;
         }
