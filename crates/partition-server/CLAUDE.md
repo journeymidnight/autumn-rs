@@ -982,6 +982,50 @@ to `refresh_regions` + retry on the non-advance trip as a defensive
 second layer (`crates/client/src/lib.rs::range`), so a future PS-side
 bug of this shape self-heals instead of erroring out.
 
+**`handle_split_part` must ALSO publish the new tuple to
+`opened_with_shared`** so `sync_regions_once` skips the drop+reopen
+that pre-fix-2 caused a 5-60+ s outage on every split (F212-fix-2).
+`PartitionHandle.opened_with` is now
+`Arc<parking_lot::Mutex<(Range, u64, u64, u64, u64)>>` shared with
+`PartitionData.opened_with_shared` on the partition thread. The
+in-place rg/epoch update block in `handle_split_part` is followed
+by a second `borrow + lock + write` block that publishes the
+post-split tuple. Same pattern as `Arc<PartitionMetrics>`
+(programming note 11) and `Arc<ConcurrencyController>` (F196 D-r7) —
+cross-thread shared state for low-frequency cross-thread reads.
+
+Why this is load-bearing: pre-fix-2, `opened_with` was a frozen
+snapshot from `open_partition` time. After `handle_split_part`
+narrowed `p.rg` + bumped `p.region_epoch` in-place on the
+partition thread, the snapshot stayed stale. On the next
+`region_sync_loop` tick (~2 s), `sync_regions_once` compared the
+stale snapshot against the manager's latest, saw `prev != latest`,
+and dropped + reopened the SOURCE partition even though its
+in-memory state was already perfectly correct. The reopen ran a
+full `recover_partition` (log_stream replay), allocated a new
+F099-K port, and during that window (5-60+ s depending on WAL
+depth) the partition was unreachable. The user observed >2 min
+gallery emptiness from this on a partition with a deep WAL tail.
+
+Post-fix, only the **right child** still has an inherent open
+window: it's a brand-new partition that has to be opened from
+scratch on its assigned PS (~2 s `region_sync_loop` tick + the
+new partition's `open_partition`). The SDK absorbs that window
+via TiKV-style retry in `crates/client/src/lib.rs::range`,
+`call_ps_for_key`, and `call_ps_for_part`
+(`MAX_PS_REFRESHES = 10`, base 100 ms, cap 2000 ms, cumulative
+~9 s — well over the typical 2-4 s convergence). The retry is
+deliberately NOT large enough to hide multi-minute PS-side bugs
+of the same shape (so the next one fails loudly here instead of
+being masked).
+
+Future in-place updaters of `PartitionData.rg` / `region_epoch`
+(e.g., a future merge-survivor in-place widening) MUST follow
+the same pattern: update local fields → release `borrow_mut` →
+take a fresh `borrow` and lock `opened_with_shared` → write the
+new tuple. Skip either step and the partition gets needlessly
+torn down on the next `region_sync_loop` tick.
+
 ## SSTable Format
 
 ### File Layout

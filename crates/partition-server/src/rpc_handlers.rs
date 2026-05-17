@@ -635,6 +635,29 @@ pub(crate) async fn handle_split_part(
         p.region_epoch = p.region_epoch.saturating_add(1).max(2);
     }
 
+    // F212-fix-2: publish the new (rg, log, row, meta, region_epoch)
+    // tuple to the cross-thread mirror so `sync_regions_once` on the
+    // main thread observes `prev == latest` on its next tick and
+    // SKIPS the drop+reopen. Pre-fix this mirror was a frozen
+    // snapshot from open time; the partition would get torn down on
+    // every split's first tick even though its in-memory state was
+    // already perfectly correct. The lock is held for one tuple
+    // write; no I/O while holding it. Written AFTER the rg/epoch
+    // borrow_mut block above so a concurrent `sync_regions_once`
+    // observes either the fully-old or fully-new state, never a
+    // half-updated tuple.
+    {
+        let p = part.borrow();
+        let mut shared = p.opened_with_shared.lock();
+        *shared = (
+            p.rg.clone(),
+            p.log_stream_id,
+            p.row_stream_id,
+            p.meta_stream_id,
+            p.region_epoch,
+        );
+    }
+
     // F210-C2: unfreeze on success — split commit landed; the LEFT
     // (this partition's) post-split rg is now in effect, and merged
     // commit_length matches the manager's sealed_length. Writes can

@@ -778,6 +778,16 @@ pub(crate) struct PartitionData {
     /// PS-level `report_load_loop` snapshots and resets these every 5 s
     /// and ships them via MSG_REPORT_PARTITION_LOAD.
     pub(crate) metrics: std::sync::Arc<PartitionMetrics>,
+    /// F212-fix-2: cross-thread mirror of `PartitionHandle.opened_with`.
+    /// `handle_split_part` (and any future in-place updater of `rg` /
+    /// `region_epoch`) MUST write the new tuple here after updating
+    /// the local fields so `sync_regions_once` on the main thread
+    /// observes a matching `(rg, log, row, meta, epoch)` and skips
+    /// drop+reopen. Without this, the next `region_sync_loop` tick
+    /// tears down the source partition even though its in-memory
+    /// state is already correct — a 5-60+ s outage per split.
+    pub(crate) opened_with_shared:
+        std::sync::Arc<parking_lot::Mutex<(Range, u64, u64, u64, u64)>>,
 }
 
 #[derive(Default)]
@@ -1302,13 +1312,26 @@ struct PartitionHandle {
     /// F188: same shape for GC.
     gc_trigger: mpsc::Sender<GcTask>,
     /// F184 + epoch: snapshot of (rg, log/row/meta stream ids,
-    /// region_epoch) at open time. `sync_regions_once` compares this
-    /// against the latest manager regions snapshot to detect a wider rg
-    /// (post-merge) or new stream IDs and force a reopen. The epoch
-    /// field is redundant today (any rg change bumps epoch in the
-    /// manager) but included as a forward-compatible signal for future
-    /// schemes that bump epoch without changing rg.
-    opened_with: (Range, u64, u64, u64, u64),
+    /// region_epoch) describing the partition's CURRENT in-memory
+    /// shape. `sync_regions_once` compares this against the latest
+    /// manager regions snapshot to detect a wider rg (post-merge),
+    /// new stream IDs, or an epoch bump and force a reopen.
+    ///
+    /// **F212-fix-2 — shared with the partition thread.** Pre-fix,
+    /// this was a frozen snapshot from `open_partition` time. After
+    /// `handle_split_part` narrowed `p.rg` + bumped `p.region_epoch`
+    /// in-place on the partition thread, this snapshot stayed stale,
+    /// so the next `sync_regions_once` tick saw `prev != latest` and
+    /// dropped + reopened a partition whose in-memory state was
+    /// already perfectly correct — a 5-60+ s outage on every split.
+    /// Post-fix, `handle_split_part` (and any future in-place updater)
+    /// MUST take the lock and write the new tuple after updating
+    /// `PartitionData`. `parking_lot::Mutex` is fine: written ~1/split,
+    /// read 1/2s/partition by `region_sync_loop` — both rates are
+    /// dwarfed by the lock's ~25 ns uncontended cost. Same pattern as
+    /// `Arc<PartitionMetrics>` (CLAUDE.md programming note 11) and
+    /// `Arc<ConcurrencyController>` (F196 D-r7).
+    opened_with: std::sync::Arc<parking_lot::Mutex<(Range, u64, u64, u64, u64)>>,
     /// JoinHandle retained for RAII.
     #[allow(dead_code)]
     join: Option<std::thread::JoinHandle<()>>,
@@ -2510,7 +2533,12 @@ impl PartitionServer {
             let drop_for_reload = match wanted.get(&part_id) {
                 None => true,
                 Some(latest) => {
-                    let opened = self.partitions.borrow().get(&part_id).map(|h| h.opened_with.clone());
+                    // F212-fix-2: `opened_with` is now Arc<Mutex<_>>;
+                    // lock + clone the tuple, then compare. The lock is
+                    // ~25 ns uncontended and is held only for the
+                    // tuple clone (no I/O between borrow and lock).
+                    let opened = self.partitions.borrow().get(&part_id)
+                        .map(|h| h.opened_with.lock().clone());
                     match opened {
                         Some(prev) => prev != *latest,
                         None => false,
@@ -2599,13 +2627,19 @@ impl PartitionServer {
         // in our manager-side rule, but include the epoch explicitly so
         // a future scheme (e.g., epoch bump on PS reassignment without
         // rg change) is caught without modifying the comparison logic.
-        let opened_with = (
-            rg.clone(),
-            log_stream_id,
-            row_stream_id,
-            meta_stream_id,
-            region_epoch,
-        );
+        //
+        // F212-fix-2: wrap in Arc<Mutex<>> so the partition thread can
+        // update this in-place after `handle_split_part` (and future
+        // in-place updaters) without going through a drop+reopen.
+        let opened_with: std::sync::Arc<parking_lot::Mutex<(Range, u64, u64, u64, u64)>> =
+            std::sync::Arc::new(parking_lot::Mutex::new((
+                rg.clone(),
+                log_stream_id,
+                row_stream_id,
+                meta_stream_id,
+                region_epoch,
+            )));
+        let opened_with_for_thread = opened_with.clone();
 
         // F099-K port allocation: reserve the next ordinal eagerly so a
         // later `open_partition` never collides with this one even if the
@@ -2710,6 +2744,7 @@ impl PartitionServer {
                         gc_rx_main,
                         concurrency_for_thread,
                         partition_budget_for_thread,
+                        opened_with_for_thread,
                     )
                     .await
                     {
@@ -3492,6 +3527,12 @@ async fn partition_thread_main(
     gc_rx: mpsc::Receiver<GcTask>,
     concurrency_ctrl: std::sync::Arc<crate::ConcurrencyController>,
     partition_budget: std::sync::Arc<crate::PartitionBudget>,
+    // F212-fix-2: cross-thread mirror of `PartitionHandle.opened_with`.
+    // Written by `handle_split_part` (and future in-place updaters) so
+    // `sync_regions_once` on the main thread sees the post-update tuple
+    // and doesn't drop+reopen a partition whose in-memory state is
+    // already correct.
+    opened_with_shared: std::sync::Arc<parking_lot::Mutex<(Range, u64, u64, u64, u64)>>,
 ) -> Result<()> {
     // F196 D-r7: per-partition rate controller. Built inside the
     // partition thread; each partition gets its own Mutex/state.
@@ -3644,6 +3685,7 @@ async fn partition_thread_main(
         split_drain_ack: std::cell::RefCell::new(None),
         vp_refs_dirty: Cell::new(false),
         metrics: metrics_arc.clone(),
+        opened_with_shared: opened_with_shared.clone(),
     }));
 
     sync_partition_vp_refs(&part)

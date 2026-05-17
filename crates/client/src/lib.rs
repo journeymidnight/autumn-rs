@@ -85,6 +85,55 @@ fn code_to_error(code: u8, message: String) -> AutumnError {
 /// from the message would require parsing, which we skip).
 pub const CLIENT_PUT_HARD_CAP: u64 = 256 * 1024 * 1024;
 
+// ── F212-fix-2 — TiKV-style retry/backoff for async-split-tolerant routing ─
+//
+// Split is async on this codebase (see `crates/partition-server/CLAUDE.md`
+// "Partition Split"): `handle_split_part` returns the moment
+// `multi_modify_split` commits to etcd. The new sibling is opened on its
+// assigned PS asynchronously by `region_sync_loop` (~2 s tick) +
+// `open_partition`'s log_stream replay (variable; tens of seconds for
+// deep WAL tails). The SOURCE partition is ALSO dropped + reopened on
+// its host PS because `opened_with` no longer matches the post-split
+// (rg, region_epoch). During those windows clients see either
+// CODE_NOT_FOUND (mis-routed via `ps_details` fallback under F099-K)
+// or TCP-refused/timeout (listener torn down for reopen).
+//
+// Modelled on `tikv-client-rust/src/backoff.rs::NoJitterBackoff`:
+// exponential backoff with cap + bounded retry count + refresh routing
+// cache between attempts. TiKV defaults `(base=2ms, cap=500ms,
+// attempts=10)` work because their region split is ~100 ms; our
+// `open_partition` replay can run ~1000× longer, so the budget is
+// correspondingly larger. CockroachDB's DistSender + Cassandra's
+// coordinator retry loops follow the same pattern: hide async control
+// plane convergence behind client-side retry so the user sees one
+// "send-receive" with a latency spike, not a hard error during
+// topology change.
+//
+// Defaults: `MAX_PS_REFRESHES = 10`, `base=100ms`, `cap=2000ms`.
+// Cumulative max wait through attempt 10: ~9 s. Typical 1-2 retries
+// finish in <500 ms. This budget targets the inherent right-child
+// open window (~2-4 s). It is deliberately NOT large enough to mask
+// PS-side correctness bugs that produce minute-scale unavailability
+// (e.g., the F212-fix-2 `opened_with` staleness that caused the
+// SOURCE partition to be needlessly dropped + reopened by
+// `sync_regions_once`). Such bugs should fail loudly here so they
+// get fixed at the source, not papered over with bigger retries.
+pub(crate) const MAX_PS_REFRESHES: u32 = 10;
+
+/// TiKV-style `NoJitterBackoff` step: sleep BEFORE the Nth refresh.
+/// Sequence: 100, 200, 400, 800, 1600, 2000, 2000, ..., 2000 ms.
+/// Cumulative: 100, 300, 700, 1500, 3100, 5100, 7100, 9100 ms at
+/// attempt=10. Attempt 0 returns `Duration::ZERO` for callers that
+/// gate the first call without sleeping.
+pub(crate) fn refresh_backoff(attempt: u32) -> Duration {
+    if attempt == 0 {
+        return Duration::ZERO;
+    }
+    let shift = (attempt - 1).min(10);
+    let ms = 100u64.saturating_mul(1u64 << shift);
+    Duration::from_millis(ms.min(2000))
+}
+
 // ── Range scan result ───────────────────────────────────────────────────────
 
 pub struct RangeResult {
@@ -523,55 +572,95 @@ impl ClusterClient {
 
     // ── Internal: PS call with routing retry ─────────────────────────────────
 
-    /// Resolve key to (part_id, ps_addr), call PS, retry once on failure with refresh.
+    /// Resolve key to (part_id, ps_addr), call PS, retry with TiKV-style
+    /// backoff on failure.
+    ///
+    /// F212-fix-2: same retry shape as `range()` so point queries
+    /// (get/put/delete/head/stream_put) absorb the same async-split
+    /// / async-merge convergence window. Pre-fix this had only ONE
+    /// retry with no backoff — adequate for stable steady state but
+    /// not for the post-split window where the right child takes
+    /// seconds to open. See module-level `refresh_backoff` doc for
+    /// the TiKV `NoJitterBackoff` derivation.
     ///
     /// The `build_payload` closure is invoked with `(part_id, region_epoch)`
     /// so callers can stamp the epoch from the SDK's routing cache into
     /// every request. After a refresh the closure is re-invoked with the
-    /// freshly-cached epoch so the retry attempt is rejected only if the
-    /// manager state has changed AGAIN between refresh and retry — the
-    /// normal "wait for region_sync_loop to converge" path.
+    /// freshly-cached epoch.
     async fn call_ps_for_key(
         &self,
         key: &[u8],
         msg_type: u8,
         build_payload: impl Fn(u64, u64) -> Bytes,
     ) -> std::result::Result<Bytes, AutumnError> {
-        for attempt in 0..2 {
+        let mut attempt: u32 = 0;
+        let mut last_err: Option<String> = None;
+        while attempt <= MAX_PS_REFRESHES {
             let (part_id, ps_addr) = self.resolve_key(key).await
                 .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
             let region_epoch = self.lookup_epoch_for_part(part_id);
             match self.ps_call(&ps_addr, msg_type, build_payload(part_id, region_epoch)).await {
                 Ok(b) => return Ok(b),
-                Err(_) if attempt == 0 => { let _ = self.refresh_regions().await; }
-                Err(e) => return Err(AutumnError::ConnectionError(e.to_string())),
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    if attempt >= MAX_PS_REFRESHES {
+                        break;
+                    }
+                    attempt += 1;
+                    let sleep = refresh_backoff(attempt);
+                    if !sleep.is_zero() {
+                        compio::time::sleep(sleep).await;
+                    }
+                    let _ = self.refresh_regions().await;
+                }
             }
         }
-        unreachable!()
+        Err(AutumnError::ConnectionError(format!(
+            "ps_call after {attempt} refreshes: {}",
+            last_err.unwrap_or_else(|| "unknown".to_string())
+        )))
     }
 
-    /// Resolve part_id to ps_addr, call PS, retry once on failure with refresh.
+    /// Resolve part_id to ps_addr, call PS, retry with TiKV-style
+    /// backoff on failure.
     ///
-    /// Stays `payload: Bytes` (not a closure like `call_ps_for_key`)
-    /// because admin ops (split/compact/gc/flush) don't carry
-    /// `region_epoch` on the wire — the operator/manager is the
-    /// authoritative caller.
+    /// F212-fix-2: same retry shape as `call_ps_for_key`. Admin ops
+    /// (split/compact/gc/flush) don't carry `region_epoch` on the
+    /// wire, but they CAN race the same post-split topology change
+    /// window — e.g. `compact <new_part_id>` issued immediately
+    /// after split can land while the new partition's part_addr
+    /// isn't registered yet.
     async fn call_ps_for_part(
         &self,
         part_id: u64,
         msg_type: u8,
         payload: Bytes,
     ) -> std::result::Result<Bytes, AutumnError> {
-        for attempt in 0..2 {
+        let mut attempt: u32 = 0;
+        let mut last_err: Option<String> = None;
+        while attempt <= MAX_PS_REFRESHES {
             let ps_addr = self.resolve_part_id(part_id).await
                 .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
             match self.ps_call(&ps_addr, msg_type, payload.clone()).await {
                 Ok(b) => return Ok(b),
-                Err(_) if attempt == 0 => { let _ = self.refresh_regions().await; }
-                Err(e) => return Err(AutumnError::ConnectionError(e.to_string())),
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                    if attempt >= MAX_PS_REFRESHES {
+                        break;
+                    }
+                    attempt += 1;
+                    let sleep = refresh_backoff(attempt);
+                    if !sleep.is_zero() {
+                        compio::time::sleep(sleep).await;
+                    }
+                    let _ = self.refresh_regions().await;
+                }
             }
         }
-        unreachable!()
+        Err(AutumnError::ConnectionError(format!(
+            "ps_call(part {part_id}) after {attempt} refreshes: {}",
+            last_err.unwrap_or_else(|| "unknown".to_string())
+        )))
     }
 
     // ── High-level SDK API ──────────────────────────────────────────────────
@@ -716,7 +805,10 @@ impl ClusterClient {
         start: &[u8],
         limit: u32,
     ) -> std::result::Result<RangeResult, AutumnError> {
-        const MAX_RANGE_REFRESHES: u32 = 3;
+        // F212-fix-2 — uses the shared `refresh_backoff` + `MAX_PS_REFRESHES`
+        // helpers (module-level docs explain the TiKV-style budget). Same
+        // retry shape as point queries (`call_ps_for_key`) so async-split
+        // / async-merge windows are absorbed uniformly.
         // Defensive iteration cap. Per-call work is also bounded by
         // `limit`; this only fires under truly pathological topology
         // churn (every partition splitting between requests).
@@ -807,17 +899,21 @@ impl ClusterClient {
             {
                 Ok(b) => b,
                 Err(e) => {
-                    // Epoch stale or transport error. Keep results
-                    // accumulated so far; refresh, retry with same
-                    // cursor (which now resolves against the fresh
-                    // routing map → typically the NEW sibling that
-                    // owns this key range after split).
-                    if refreshes_used >= MAX_RANGE_REFRESHES {
+                    // Epoch stale, transport error (incl. CODE_NOT_FOUND
+                    // from a mis-routed fallback on a freshly-split right
+                    // child whose part_addr isn't registered yet), or
+                    // generic connection failure. Keep results accumulated
+                    // so far; back off → refresh → retry with same cursor.
+                    if refreshes_used >= MAX_PS_REFRESHES {
                         return Err(AutumnError::ConnectionError(format!(
                             "range on partition {part_id} after {refreshes_used} refreshes: {e}"
                         )));
                     }
                     refreshes_used += 1;
+                    let sleep = refresh_backoff(refreshes_used);
+                    if !sleep.is_zero() {
+                        compio::time::sleep(sleep).await;
+                    }
                     let _ = self.refresh_regions().await;
                     continue;
                 }
@@ -847,15 +943,19 @@ impl ClusterClient {
             // the cache and retry from the same cursor — typically the
             // post-split sibling now appears in the cache and the next
             // iteration's partition_point routes correctly. Bounded by
-            // MAX_RANGE_REFRESHES so a genuinely bogus PS still
+            // MAX_PS_REFRESHES so a genuinely bogus PS still
             // surfaces an error.
             if resp.cur_end_key.as_slice() <= cursor.as_slice() {
-                if refreshes_used >= MAX_RANGE_REFRESHES {
+                if refreshes_used >= MAX_PS_REFRESHES {
                     return Err(AutumnError::ServerError(format!(
                         "range on partition {part_id}: cur_end_key did not advance cursor after {refreshes_used} refreshes"
                     )));
                 }
                 refreshes_used += 1;
+                let sleep = refresh_backoff(refreshes_used);
+                if !sleep.is_zero() {
+                    compio::time::sleep(sleep).await;
+                }
                 let _ = self.refresh_regions().await;
                 continue;
             }
