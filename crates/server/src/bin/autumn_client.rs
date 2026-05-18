@@ -56,7 +56,6 @@ enum Command {
     Put {
         key: String,
         file: String,
-        nosync: bool,
     },
     /// F129: multipart upload of a large value via PutBegin/Chunk/Commit.
     /// Reads `file` (or stdin if file = "-"), splits into `chunk_size`
@@ -78,7 +77,6 @@ enum Command {
     },
     Del {
         key: String,
-        nosync: bool,
     },
     Head {
         key: String,
@@ -92,7 +90,6 @@ enum Command {
         threads: usize,
         duration_secs: u64,
         value_size: usize,
-        nosync: bool,
         report_interval_secs: u64,
         part_id: Option<u64>,
         reuse_value: bool,
@@ -106,7 +103,6 @@ enum Command {
         threads: usize,
         duration_secs: u64,
         value_size: usize,
-        nosync: bool,
         baseline_file: String,
         threshold: f64,
         update_baseline: bool,
@@ -203,7 +199,6 @@ fn parse_args() -> Args {
             Command::OpStub { args }
         }
         "put" => {
-            let nosync = false; // F178: always durable; --nosync ignored
             while i < raw.len() && raw[i].starts_with('-') {
                 if raw[i] == "--nosync" {
                     warn_nosync_deprecated_once();
@@ -216,7 +211,7 @@ fn parse_args() -> Args {
             }
             let key = raw[i].clone();
             let file = raw[i + 1].clone();
-            Command::Put { key, file, nosync }
+            Command::Put { key, file }
         }
         "put-stream" | "putstream" => {
             // put-stream [--chunk-size N] <KEY> <FILE-or-->
@@ -270,7 +265,6 @@ fn parse_args() -> Args {
             }
         }
         "del" => {
-            let nosync = false; // F178: always durable
             while i < raw.len() && raw[i].starts_with('-') {
                 if raw[i] == "--nosync" {
                     warn_nosync_deprecated_once();
@@ -283,7 +277,6 @@ fn parse_args() -> Args {
             }
             Command::Del {
                 key: raw[i].clone(),
-                nosync,
             }
         }
         "head" => {
@@ -331,7 +324,6 @@ fn parse_args() -> Args {
             let mut threads: usize = 4;
             let mut duration_secs: u64 = 10;
             let mut value_size: usize = 8192;
-            let nosync = false; // F178: always durable
             let mut report_interval_secs: u64 = 1;
             let mut part_id: Option<u64> = None;
             let mut reuse_value = true;
@@ -376,7 +368,6 @@ fn parse_args() -> Args {
                 threads,
                 duration_secs,
                 value_size,
-                nosync,
                 report_interval_secs,
                 part_id,
                 reuse_value,
@@ -414,7 +405,6 @@ fn parse_args() -> Args {
             let mut threads = 256usize;
             let mut duration_secs = 10u64;
             let mut value_size = 4096usize;
-            let nosync = false; // F178: always durable
             let mut baseline_file = "perf_baseline.json".to_string();
             let mut threshold = 0.8f64;
             let mut update_baseline = false;
@@ -489,7 +479,6 @@ fn parse_args() -> Args {
                 threads,
                 duration_secs,
                 value_size,
-                nosync,
                 baseline_file,
                 threshold,
                 update_baseline,
@@ -532,16 +521,6 @@ fn parse_bool_flag(value: &str, flag: &str) -> Result<bool> {
     }
 }
 
-fn parse_positive_usize_flag(value: &str, flag: &str) -> Result<usize> {
-    let parsed = value
-        .parse::<usize>()
-        .with_context(|| format!("{flag} must be a positive number"))?;
-    if parsed == 0 {
-        bail!("{flag} must be a positive number");
-    }
-    Ok(parsed)
-}
-
 // ---------------------------------------------------------------------------
 // Benchmark helpers
 // ---------------------------------------------------------------------------
@@ -558,7 +537,6 @@ struct BenchConfig {
     threads: usize,
     duration_secs: u64,
     value_size: usize,
-    nosync: bool,
     report_interval_secs: u64,
     part_id: Option<u64>,
     reuse_value: bool,
@@ -703,16 +681,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_positive_usize_flag_rejects_zero() {
-        assert_eq!(
-            parse_positive_usize_flag("8", "--channels-per-ps").unwrap(),
-            8
-        );
-        assert!(parse_positive_usize_flag("0", "--channels-per-ps").is_err());
-        assert!(parse_positive_usize_flag("abc", "--channels-per-ps").is_err());
-    }
-
-    #[test]
     fn parse_write_results_supports_legacy_format() {
         let json = serde_json::to_string(&vec![BenchResult {
             key: "k1".to_string(),
@@ -734,7 +702,6 @@ mod tests {
                 threads: 4,
                 duration_secs: 10,
                 value_size: 8192,
-                nosync: true,
                 report_interval_secs: 1,
                 part_id: Some(7),
                 reuse_value: true,
@@ -843,7 +810,7 @@ async fn main() -> Result<()> {
 
     match args.command {
         Command::OpStub { .. } => unreachable!("handled before connect"),
-        Command::Put { key, file, nosync: _ } => {
+        Command::Put { key, file } => {
             let value = std::fs::read(&file).with_context(|| format!("read file {file}"))?;
             client.put(key.as_bytes(), &value).await
                 .map_err(|e| anyhow!("put: {e}"))?;
@@ -922,7 +889,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Del { key, nosync: _nosync } => {
+        Command::Del { key } => {
             client.delete(key.as_bytes()).await
                 .map_err(|e| anyhow!("delete: {e}"))?;
             println!("ok");
@@ -957,7 +924,6 @@ async fn main() -> Result<()> {
             threads,
             duration_secs,
             value_size,
-            nosync,
             report_interval_secs,
             part_id,
             reuse_value,
@@ -1150,7 +1116,6 @@ async fn main() -> Result<()> {
                     threads,
                     duration_secs,
                     value_size,
-                    nosync,
                     report_interval_secs,
                     part_id,
                     reuse_value,
@@ -1321,7 +1286,6 @@ async fn main() -> Result<()> {
             threads,
             duration_secs,
             value_size,
-            nosync,
             baseline_file,
             threshold,
             update_baseline,
@@ -1672,7 +1636,6 @@ async fn main() -> Result<()> {
                         threads,
                         duration_secs,
                         value_size,
-                        nosync,
                         report_interval_secs: 1,
                         part_id: None,
                         reuse_value: true,
