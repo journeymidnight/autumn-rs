@@ -929,7 +929,7 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     - **F209-A** `handle_get_partition_detail` now gates on
       `self.leader.get()`. A follower's `policy.metrics` is empty;
       pre-F209-A the handler silently returned `CODE_OK` + all-zero
-      `PartitionLoad`, so `client info --part PID --detail` against
+      `PartitionLoad`, so `autumn-op info --part PID --detail` against
       a follower was indistinguishable from "PS hasn't reported yet".
     - **F209-B** `apply_recovery_done` slot-mismatch (`replace_id`
       not in extent's node list) now releases the Recovery marker

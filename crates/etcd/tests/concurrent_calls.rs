@@ -7,7 +7,7 @@
 //! `already borrowed: BorrowMutError` when its `borrow_mut()` fired.
 //!
 //! Repro on the production cluster: 4 partitions racing on
-//! `autumn-client gc <part>` → 4 concurrent `handle_stream_punch_holes`
+//! `autumn-op gc <part>` → 4 concurrent `handle_stream_punch_holes`
 //! invocations on the manager → 4 concurrent `EtcdClient::txn` → panic on
 //! the second one. Workaround was "GC one partition at a time"; F108
 //! removes the workaround.

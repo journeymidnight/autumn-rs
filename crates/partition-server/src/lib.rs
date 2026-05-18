@@ -290,7 +290,7 @@ const COMPACT_N: usize = 5;
 /// — roughly 2× the on-disk SST size of one partition. With N partitions
 /// running compactions concurrently on the same process this multiplies
 /// linearly. On a single PS hosting 4 partitions of ~5 GB SST each, the
-/// observed peak was ~44 GB RSS during `autumn-client compact ALL`.
+/// observed peak was ~44 GB RSS during `autumn-op compact ALL`.
 ///
 /// This gate caps cross-partition compaction concurrency. Default = **4**
 /// (post-D-r7-recal; was 1 pre-recal). With single-compact peak ~256 MB
@@ -315,7 +315,7 @@ pub(crate) fn ps_major_compact_parallelism() -> usize {
 /// GC reads sealed log_stream extents in 64 MiB chunks (F106) and
 /// rewrites live VPs — both the chunk-read buffer (~64 MiB) and the
 /// rewrite append staging consume RSS. Without a PS-wide cap,
-/// `autumn-client gc ALL` on an N-partition PS would launch N
+/// `autumn-op gc ALL` on an N-partition PS would launch N
 /// concurrent `run_gc` calls, multiplying peak memory by N.
 ///
 /// Default = **4** (post-D-r7-recal), tunable via `--gc-parallelism`.
@@ -738,7 +738,7 @@ pub(crate) struct PartitionData {
     /// flips `frozen_for_merge=true` and parks the caller's resp here without
     /// replying; `partition_loop` consumes it once `pending` AND
     /// `inflight` are both empty AND every imm has been flushed, then sends
-    /// the OK reply. The caller (CLI / autumn-client merge) thus blocks
+    /// the OK reply. The caller (CLI / autumn-op merge) thus blocks
     /// until every acked-pre-freeze write is durable on log_stream + has
     /// flushed through to a row_stream SST referenced by a meta_stream
     /// checkpoint, which is the strict precondition that makes

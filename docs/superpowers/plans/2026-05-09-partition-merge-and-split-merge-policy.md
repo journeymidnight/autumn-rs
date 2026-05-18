@@ -2633,7 +2633,7 @@ What landed in this commit family:
 
   Client + CLI:
     - ClusterClient.merge_partitions + policy_candidates
-    - autumn-client merge / autumn-client policy candidates
+    - autumn-op merge / autumn-op policy-candidates
 
   Tests:
     - 4 manager unit tests (compute_merge_streams, merged_partition_vp_refs,

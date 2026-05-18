@@ -26,7 +26,7 @@ Rust rewrite of `autumn`: a distributed KV storage engine with a stream layer an
   └── drives extent recovery
 ```
 
-**Key concept — 3 streams per partition:** The 3 streams are created by `autumn-client bootstrap`,
+**Key concept — 3 streams per partition:** The 3 streams are created by `autumn-op bootstrap`,
 not by the partition server. The PS receives the stream IDs from the manager on startup and uses
 them to store its data.
 
@@ -197,9 +197,10 @@ random `count`-subset, so all four nodes share replica + EC-parity load.
 
 ```bash
 bash cluster.sh reset 4
-AC="./target/debug/autumn-client --manager 127.0.0.1:9001"
+AC="./target/debug/autumn-client --manager 127.0.0.1:9001"   # data plane
+AO="./target/debug/autumn-op     --manager 127.0.0.1:9001"   # op plane (F213)
 for i in $(seq 1 20); do echo data$i | $AC put key$i /dev/stdin; done
-$AC info | grep -E 'extent .*replicas=|extent .*data='
+$AO info | grep -E 'extent .*replicas=|extent .*data='
 # Expected: across ~20 extents node 7 should appear in roughly 75% of
 # the replica/data sets (same as nodes 1, 3, 5). Pre-F144 node 7 would
 # show up in 0 of them.
@@ -230,19 +231,20 @@ Manual repro (verifying the gates prevent divergence):
 
 ```bash
 bash cluster.sh reset 4
-AC="./target/debug/autumn-client --manager 127.0.0.1:9001"
+AC="./target/debug/autumn-client --manager 127.0.0.1:9001"   # data plane
+AO="./target/debug/autumn-op     --manager 127.0.0.1:9001"   # op plane (F213)
 # fill data so compaction and GC have work to do
 bash cluster.sh wbench 2G
 PARTID=$($AC ls | awk 'NR==1{print $1}')
 # kick off concurrent compact + GC, then split
-$AC compact "$PARTID" &
-$AC gc "$PARTID" &
-$AC split "$PARTID"
+$AO compact "$PARTID" &
+$AO gc "$PARTID" &
+$AO split "$PARTID"
 bash cluster.sh restart-ps
 # Post-restart: no MetaBlock CRC mismatch in the ps log
 grep -i "crc mismatch\|meta_len" /tmp/autumn-rs-logs/ps.log
 # Verify replica sizes converge for the row_stream tail extent
-SID=$($AC info --json "$PARTID" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['row_stream_id'])")
+SID=$($AO info --json "$PARTID" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['row_stream_id'])")
 for d in /tmp/autumn-rs/d{1..4}/$SID; do stat -c '%s %n' "$d"/extent-*.dat 2>/dev/null; done
 # All four replicas should report the same size for the sealed tail extent
 ```
@@ -276,10 +278,11 @@ the pwritev then landed bytes past the new `sealed_length`. Fix: re-check
 
 ```bash
 bash cluster.sh reset 4
-AC="./target/debug/autumn-client --manager 127.0.0.1:9001"
+AC="./target/debug/autumn-client --manager 127.0.0.1:9001"   # data plane
+AO="./target/debug/autumn-op     --manager 127.0.0.1:9001"   # op plane (F213)
 bash cluster.sh wbench 4G
 # Trigger concurrent alloc_extent + EC conversion + recovery to exercise HIGH-1/2.
-LOG_STREAM=$($AC info --json | python3 -c "import sys,json; p=json.load(sys.stdin)['partitions'][0]; print(p['log_stream_id'])")
+LOG_STREAM=$($AO info --json | python3 -c "import sys,json; p=json.load(sys.stdin)['partitions'][0]; print(p['log_stream_id'])")
 $AC update-stream-ec "$LOG_STREAM" 2 1 &
 bash cluster.sh stop-node 2   # triggers recovery on replicas hosted by node 2
 bash cluster.sh start-node 2  # recovery starts; manager.log will show
@@ -290,7 +293,7 @@ bash cluster.sh start-node 2  # recovery starts; manager.log will show
 bash cluster.sh stop-node 3 && bash cluster.sh start-node 3
 # Post-F146: all three paths retry safely with Precondition/CODE_PRECONDITION
 # until the competing operation completes.
-$AC info | grep -E 'extent.*eversion|extent.*replicates'
+$AO info | grep -E 'extent.*eversion|extent.*replicates'
 ```
 
 ---
@@ -479,19 +482,20 @@ extent is in `ec_conversion_inflight`. The PS GC retry loop already handles
 
 ```bash
 bash cluster.sh reset 4
-AC="./target/debug/autumn-client --manager 127.0.0.1:9001"
+AC="./target/debug/autumn-client --manager 127.0.0.1:9001"   # data plane
+AO="./target/debug/autumn-op     --manager 127.0.0.1:9001"   # op plane (F213)
 bash cluster.sh wbench 4G
 # Trigger EC conversion on the log_stream while GC is running
-LOG_STREAM=$($AC info --json | python3 -c "import sys,json; p=json.load(sys.stdin)['partitions'][0]; print(p['log_stream_id'])")
+LOG_STREAM=$($AO info --json | python3 -c "import sys,json; p=json.load(sys.stdin)['partitions'][0]; print(p['log_stream_id'])")
 $AC update-stream-ec "$LOG_STREAM" 2 1 &
 PARTID=$($AC ls | awk 'NR==1{print $1}')
-$AC gc "$PARTID"
+$AO gc "$PARTID"
 # Post-F145: gc retries with "in-flight EC conversion" until EC completes,
 # then succeeds. Pre-F145: manager etcd had refs=0 records with eversion
 # equal to the EC new_eversion; on leader-failover the replayed state was
 # internally inconsistent (replicates referred to nodes that no longer
 # owned the extent).
-$AC info | grep -E 'extent.*refs=0|extent.*ec_converted'
+$AO info | grep -E 'extent.*refs=0|extent.*ec_converted'
 ```
 
 ---
@@ -517,18 +521,19 @@ Manual repro (verifying the guard fires under concurrent GC + recovery):
 
 ```bash
 bash cluster.sh reset 4          # 4-node cluster, EC enabled
-AC="./target/debug/autumn-client --manager 127.0.0.1:9001"
+AC="./target/debug/autumn-client --manager 127.0.0.1:9001"   # data plane
+AO="./target/debug/autumn-op     --manager 127.0.0.1:9001"   # op plane (F213)
 # Sustained writes to fill at least one extent rotation
 for i in $(seq 1 200); do dd if=/dev/urandom bs=4k count=1 2>/dev/null | $AC put k$i /dev/stdin; done
 bash cluster.sh stop-node 2      # triggers recovery dispatch on ext-node-2 slots
 # Concurrently issue GC on a partition whose log_stream tail extent is recovering
 PARTID=$($AC ls | awk 'NR==1{print $1}')
-$AC gc "$PARTID" &
+$AO gc "$PARTID" &
 sleep 30
 # Verify: no orphan .dat files and no "recovery_done apply" for a concurrently-deleted extent
 grep -i "extent.*recovery.*precondition\|pending.*delete.*queued" /tmp/autumn-rs-logs/manager.log
 # Expected: at most a few CODE_PRECONDITION retries, then clean convergence
-$AC info --json | python3 -c "import sys,json; d=json.load(sys.stdin); print('orphans:', [e for e in d.get('extents',[]) if not e.get('in_stream',True)])"
+$AO info --json | python3 -c "import sys,json; d=json.load(sys.stdin); print('orphans:', [e for e in d.get('extents',[]) if not e.get('in_stream',True)])"
 ```
 
 ---
@@ -553,20 +558,22 @@ Manual repro (verifying the deferral path is reachable):
 ```bash
 bash cluster.sh reset 4
 # enable EC on the first stream; write some data
-AC="./target/debug/autumn-client --manager 127.0.0.1:9001"
+AC="./target/debug/autumn-client --manager 127.0.0.1:9001"   # data plane
+AO="./target/debug/autumn-op     --manager 127.0.0.1:9001"   # op plane (F213)
 bash cluster.sh stop-node 1          # kill node 1 mid-cluster
 for i in $(seq 1 20); do echo data$i | $AC put k$i /dev/stdin; done
 # node 1 outage triggers recovery AND EC conversion on the same extents.
 # Manager log shows: "ec conversion in flight on extent N; deferring recovery apply"
 # After EC clears, recovery completes and eversion is bumped twice (EC + recovery).
-$AC info | grep 'extent .* eversion'
+$AO info | grep 'extent .* eversion'
 ```
 
 After `start`, the script prints ready-to-use CLI examples:
 
 ```
-AC="./target/debug/autumn-client --manager 127.0.0.1:9001"
-$AC info
+AC="./target/debug/autumn-client --manager 127.0.0.1:9001"   # data plane
+AO="./target/debug/autumn-op     --manager 127.0.0.1:9001"   # op plane (F213)
+$AO info
 echo hello | $AC put mykey /dev/stdin
 $AC get mykey
 $AC ls
@@ -586,7 +593,8 @@ MANAGER=./target/debug/autumn-manager-server
 NODE=./target/debug/autumn-extent-node
 PS=./target/debug/autumn-ps
 SC=./target/debug/autumn-stream-cli
-AC=./target/debug/autumn-client
+AC=./target/debug/autumn-client   # data plane
+AO=./target/debug/autumn-op       # op plane (F213)
 
 # Clean up any previous run
 pkill -f autumn-manager-server; pkill -f autumn-extent-node; pkill -f autumn-ps
@@ -623,13 +631,13 @@ sleep 1
 #   This is where the 3 streams are created.
 #   After this, the PS polls GetRegions(), finds the new partition,
 #   and calls open_partition() to start serving it.
-$AC bootstrap --replication 1+0
+$AO bootstrap --replication 1+0
 # Expected: "bootstrap succeeded: 1 partition(s)"
 
 sleep 1   # wait for PS to pick up the new partition
 
 # Step 7 — verify
-$AC info
+$AO info
 # Expected: 1 node, 3 streams, 1 partition
 
 echo "hello autumn" | $AC put mykey /dev/stdin
@@ -639,7 +647,7 @@ $AC get mykey
 
 ### What happens in bootstrap
 
-`autumn-client bootstrap --replication 1+0` does:
+`autumn-op bootstrap --replication 1+0` does:
 
 1. `CreateStream(data_shard=1, parity_shard=0)` → **log_stream** (id=1)
 2. `CreateStream(data_shard=1, parity_shard=0)` → **row_stream**  (id=2)
@@ -659,7 +667,8 @@ MANAGER=./target/debug/autumn-manager-server
 NODE=./target/debug/autumn-extent-node
 PS=./target/debug/autumn-ps
 SC=./target/debug/autumn-stream-cli
-AC=./target/debug/autumn-client
+AC=./target/debug/autumn-client   # data plane
+AO=./target/debug/autumn-op       # op plane (F213)
 
 pkill -f autumn-manager-server; pkill -f autumn-extent-node; pkill -f autumn-ps
 rm -rf /tmp/autumn-etcd /tmp/d1 /tmp/d2 /tmp/d3 /tmp/autumn-ps
@@ -685,10 +694,10 @@ $PS --psid 1 --port 9201 --manager 127.0.0.1:9001 \
     --data /tmp/autumn-ps --advertise 127.0.0.1:9201 &
 sleep 1
 
-$AC bootstrap --replication 3+0
+$AO bootstrap --replication 3+0
 sleep 1
 
-$AC info
+$AO info
 echo "hello" | $AC put mykey /dev/stdin
 $AC get mykey
 ```
@@ -812,7 +821,8 @@ to free a slot.
 ### KV operations
 
 ```bash
-AC=./target/debug/autumn-client
+AC=./target/debug/autumn-client   # data plane
+AO=./target/debug/autumn-op       # op plane (F213)
 
 echo "hello" > /tmp/v.txt
 $AC put mykey /tmp/v.txt
@@ -852,44 +862,44 @@ diff /tmp/huge.bin /tmp/huge.copy
 
 ```bash
 # Get partition IDs from info
-$AC info
+$AO info
 
 # Split a partition (server picks mid-key automatically)
-$AC split <PARTID>
+$AO split <PARTID>
 
 # Trigger major compaction (clears overlap after split, reclaims space)
-$AC compact <PARTID>
+$AO compact <PARTID>
 
 # Repeated rightmost split + compact should preserve existing keys while
 # clearing overlap on each descendant.
-$AC split <PARTID>
-$AC compact <RIGHT_CHILD_PARTID>
-$AC split <RIGHT_CHILD_PARTID>
+$AO split <PARTID>
+$AO compact <RIGHT_CHILD_PARTID>
+$AO split <RIGHT_CHILD_PARTID>
 
 # Trigger auto GC (reclaims logStream extents with >40% discard)
-$AC gc <PARTID>
+$AO gc <PARTID>
 
 # Force GC on specific extents
-$AC forcegc <PARTID> <EXTID1> <EXTID2>
+$AO forcegc <PARTID> <EXTID1> <EXTID2>
 ```
 
 ### Cluster info
 
 ```bash
 # Full text report (nodes / extents / streams / partitions)
-$AC info
+$AO info
 
 # Machine-readable JSON dump (pipeable to jq)
-$AC info --json | jq '.partitions | length'
+$AO info --json | jq '.partitions | length'
 
-# Top 3 partitions by live size, JSON
-$AC info --json --top 3
+# Top 3 partitions by live size — jq filter (F205 removed --top)
+$AO info --json | jq '.partitions | sort_by(.live_size) | reverse | .[:3]'
 
 # Detail for partition 0 (3 streams + pending GC discards)
-$AC info --part 0
+$AO info --part 0
 
 # Same but JSON
-$AC info --json --part 0
+$AO info --json --part 0
 ```
 
 Each partition's `log` stream line shows pending GC discard when non-zero:
@@ -916,7 +926,7 @@ unlinked within ~2 s (one sweep of `extent_delete_loop`).
 du -sh /tmp/autumn-rs/d1/  /tmp/autumn-rs/d2/  /tmp/autumn-rs/d3/
 
 # Trigger GC for the partition you want to reclaim from
-$AC gc <PARTID>
+$AO gc <PARTID>
 
 # Wait ~5s for the manager's extent_delete_loop sweep + per-replica unlink
 sleep 5
@@ -942,22 +952,22 @@ extents without rebuilding the PS:
 ```bash
 # Default (matches pre-F201): discard_ratio > 0.4 AND F201 empty-extent
 # pick — punches both garbage-heavy AND empty sealed slots.
-$AC gc <PARTID>
+$AO gc <PARTID>
 
 # Only sealed-length=0 non-tail extents (cheapest possible — no rewrite).
 # Use this when `info` shows empty `(open), 0 B` sealed slots.
-$AC gc <PARTID> --empty-only
+$AO gc <PARTID> --empty-only
 
 # Aggressive: 10% dead is enough.
-$AC gc <PARTID> --ratio 0.1
+$AO gc <PARTID> --ratio 0.1
 
 # Mixed: relax ratio for small extents (any extent < 16 MiB that is at
 # least 10% dead becomes eligible).
-$AC gc <PARTID> --max-size 16MiB --ratio 0.1
+$AO gc <PARTID> --max-size 16MiB --ratio 0.1
 
 # Stream-debt-aware: when the partition's total reclaimable bytes
 # exceed 1 GiB, the PS halves the ratio internally for this dispatch.
-$AC gc <PARTID> --stream-debt 1GiB --ratio 0.4
+$AO gc <PARTID> --stream-debt 1GiB --ratio 0.4
 ```
 
 Byte-size flags (`--max-size`, `--stream-debt`) accept K/M/G/T(i)B
@@ -968,12 +978,12 @@ The F201 user-reported case (`(open), 0 B` sealed extents stuck in
 
 ```bash
 cluster.sh reset 4 && cluster.sh start
-$AC bootstrap --replication 3+0 --log-ec 3+1 --row-ec 3+1
+$AO bootstrap --replication 3+0 --log-ec 3+1 --row-ec 3+1
 $AC perf-check --duration 60        # produces 0-byte sealed log_stream extents
 
-$AC info                            # observe `(open), 0 B` on some sealed-position extents
-$AC gc <PARTID> --empty-only        # cheapest cleanup path
-$AC info                            # 0-byte sealed extents are gone
+$AO info                            # observe `(open), 0 B` on some sealed-position extents
+$AO gc <PARTID> --empty-only        # cheapest cleanup path
+$AO info                            # 0-byte sealed extents are gone
 ```
 
 If you run `client gc` concurrently with an EC convert on the same
@@ -1008,16 +1018,16 @@ cron + bash for an MVP controller:
 
 ```bash
 # /etc/cron.d/autumn-policy: */5 * * * * /usr/local/bin/autumn-policy.sh
-$AC policy --json | jq -c '.[]' | while read -r cand; do
+$AO policy --json | jq -c '.[]' | while read -r cand; do
   kind=$(echo "$cand" | jq -r .kind)
   pid=$(echo "$cand" | jq -r .primary_part_id)
   sec=$(echo "$cand" | jq -r .secondary_part_id)
   size=$(echo "$cand" | jq -r .size_bytes)
   case "$kind" in
-    ec)    [ "$size" -ge 67108864 ] && $AC set-stream-ec --stream "<resolve from $sec>" --ec 3+1 ;;
+    ec)    [ "$size" -ge 67108864 ] && $AO set-stream-ec --stream "<resolve from $sec>" --ec 3+1 ;;
     gc)    qps=$(curl -s prom/api/v1/query?query=fg_qps_partition\{p=\"$pid\"\} | jq -r .data.result[0].value[1])
-           [ "$qps" -lt 1000 ] && $AC gc "$pid" ;;
-    major) $AC compact "$pid" ;;
+           [ "$qps" -lt 1000 ] && $AO gc "$pid" ;;
+    major) $AO compact "$pid" ;;
     # split / merge / minor / hotcold left as exercise
   esac
 done
@@ -1089,7 +1099,7 @@ if (( $(echo "$fg_qps > 50000" | bc -l) )); then
   exit 0
 fi
 
-$AC policy --json | jq -c '.[]' | while read -r cand; do
+$AO policy --json | jq -c '.[]' | while read -r cand; do
   kind=$(echo "$cand" | jq -r .kind)
   pid=$(echo "$cand"  | jq -r .primary_part_id)
   sec=$(echo "$cand"  | jq -r .secondary_part_id)
@@ -1097,18 +1107,18 @@ $AC policy --json | jq -c '.[]' | while read -r cand; do
   case "$kind" in
     ec)
       # F202 generator already filtered extents < 64 MiB.
-      $AC force-ec-convert --extent "$sec"
+      $AO force-ec-convert --extent "$sec"
       ;;
     gc)
       # Per-partition QPS gate — only GC partitions that aren't
       # actively serving heavy reads. Read F202 detail first.
       p_qps=$(curl -fsS "$PROM?query=fg_put_qps_total{p=\"$pid\"}" | jq -r '.data.result[0].value[1] // "0"')
       if (( $(echo "$p_qps < 1000" | bc -l) )); then
-        $AC gc "$pid"
+        $AO gc "$pid"
       fi
       ;;
     major)
-      $AC compact "$pid"
+      $AO compact "$pid"
       ;;
     minor)
       # No-op: minor compact is already kernel-driven (LSM hygiene).
@@ -1185,11 +1195,12 @@ For write-path profiling, run the partition server and client with `RUST_LOG=inf
 ### Add a new extent node to a running cluster
 
 ```bash
-AC=./target/debug/autumn-client
+AC=./target/debug/autumn-client   # data plane
+AO=./target/debug/autumn-op       # op plane (F213)
 NODE=./target/debug/autumn-extent-node
 
 # Format the disk and register the node with the manager
-$AC format --listen 127.0.0.1:9104 --advertise 127.0.0.1:9104 /tmp/d4
+$AO format --listen 127.0.0.1:9104 --advertise 127.0.0.1:9104 /tmp/d4
 # Prints: node_id=N, disk_id=M, writes /tmp/d4/node_id and /tmp/d4/disk_id
 
 # Start the extent node

@@ -491,7 +491,7 @@ After minor compaction, `do_compact` is called with `major=false`.
 `do_compact` and drops the permit on RAII when the call returns. Default
 parallelism = 1 (fully serialized across all partitions on this PS),
 overridable via `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM` env var, range [1, 64].
-Without this cap, `autumn-client compact ALL` against an N-partition PS
+Without this cap, `autumn-op compact ALL` against an N-partition PS
 would launch N concurrent `do_compact` calls each holding ~2× SST bytes
 in memory, multiplying per-partition peak by N.
 
@@ -665,7 +665,7 @@ admission state should fight other partitions' on a shared Mutex.
 
 Each `do_compact` holds ~2× SST bytes in memory; each `run_gc` holds
 ~64 MiB of chunk-read buffer + rewrite staging. Without a global cap,
-`autumn-client compact ALL` would launch N concurrent compactions and
+`autumn-op compact ALL` would launch N concurrent compactions and
 multiply peak RSS by N (the F104 incident hit 44 GB RSS).
 
 ```rust

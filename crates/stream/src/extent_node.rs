@@ -81,7 +81,7 @@ thread_local! {
 ///
 /// Files are stored in a hash-based layout:
 /// `{base_dir}/{crc32c(extent_id_le)&0xFF:02x}/extent-{id}.dat`
-/// This matches the 256 subdirs created by `autumn-client format`.
+/// This matches the 256 subdirs created by `autumn-op format`.
 /// Hash subdirs are created on-demand when the first extent is written.
 struct DiskFS {
     base_dir: PathBuf,
@@ -90,7 +90,7 @@ struct DiskFS {
 }
 
 impl DiskFS {
-    /// Open a disk directory formatted by `autumn-client format`.
+    /// Open a disk directory formatted by `autumn-op format`.
     /// Reads `disk_id` from `{base_dir}/disk_id`.
     async fn open(base_dir: PathBuf) -> Result<Self> {
         let disk_id_path = base_dir.join("disk_id");
@@ -300,7 +300,7 @@ impl DiskFS {
 ///
 /// - `new(data_dir, io_mode, disk_id)`: single disk with explicit disk_id (tests, simple deploys).
 /// - `new_multi(data_dirs, io_mode)`: multiple disks; each dir must have a `disk_id` file
-///   written by `autumn-client format`.
+///   written by `autumn-op format`.
 #[derive(Clone)]
 pub struct ExtentNodeConfig {
     /// (dir, disk_id): None disk_id → read from `disk_id` file in dir.
@@ -350,7 +350,7 @@ impl ExtentNodeConfig {
     }
 
     /// Multi-disk constructor. Each directory must have a `disk_id` file
-    /// written by `autumn-client format`.
+    /// written by `autumn-op format`.
     pub fn new_multi(data_dirs: Vec<PathBuf>) -> Self {
         Self {
             disks: data_dirs.into_iter().map(|d| (d, None)).collect(),

@@ -172,7 +172,7 @@ pub struct GetPolicyCandidatesResp {
 }
 ```
 
-Used by `autumn-client policy candidates` (§5) and by Stage 2/3 auto-trigger loops.
+Used by `autumn-op policy-candidates` (§5) and by Stage 2/3 auto-trigger loops.
 
 ### 2.5 New RPC: `MSG_REPORT_PARTITION_LOAD` (PS → manager, every 5 s)
 
@@ -491,8 +491,8 @@ By design (the dual-gate ensures merge runs in mutual exclusion with these). Sur
 
 | Command | Behavior |
 |---|---|
-| `autumn-client merge <SURVIVOR_PART_ID> <VICTIM_PART_ID>` | Calls survivor PS's `MSG_MERGE_PART`. Prints OK or error. |
-| `autumn-client policy candidates` | Calls manager's `MSG_GET_POLICY_CANDIDATES`. Prints table. |
+| `autumn-op merge <SURVIVOR_PART_ID> <VICTIM_PART_ID>` | Calls survivor PS's `MSG_MERGE_PART`. Prints OK or error. |
+| `autumn-op policy-candidates` | Calls manager's `MSG_GET_POLICY_CANDIDATES`. Prints table. |
 
 **`policy candidates` output format:**
 
@@ -506,7 +506,7 @@ merge  44       45         qualifying but on different PS          892 MB   180 
 
 `FEAS` column: `no` for advisory candidates that auto-trigger (Stage 2/3) cannot act on (cross-PS, has_overlap=1, etc.). Operator can still act manually.
 
-### 5.1 `autumn-client info` extension
+### 5.1 `autumn-op info` extension
 
 Existing `info` output gains a per-partition `last_op_at` line (from `MgrPartitionMeta`).
 
@@ -518,7 +518,7 @@ Existing `info` output gains a per-partition `last_op_at` line (from `MgrPartiti
 Stage 1 (this commit family — F183):
   ├─ MSG_MULTI_MODIFY_MERGE / MSG_MERGE_PART implemented
   ├─ Policy engine running, advisory only (no auto-trigger)
-  ├─ CLI `autumn-client merge` + `autumn-client policy candidates`
+  ├─ CLI `autumn-op merge` + `autumn-op policy-candidates`
   ├─ Heartbeat carries PartitionLoad
   ├─ MgrPartitionMeta.last_op_at populated by split + merge handlers
   └─ Tests + manual repro in README
@@ -614,7 +614,7 @@ Tests live in `crates/manager/tests/` (integration) and `crates/manager/src/lib.
 | `merge_refuses_when_either_has_overlap` | Force has_overlap=1 on one side; merge returns Precondition. |
 | `merge_concurrent_with_compaction_serialises` | Trigger major compact on victim; merge waits on compact_gate; succeeds after compact finishes. |
 | `merge_invalidates_survivor_stream_workers` | Verify cached StreamWorker tail is stale post-merge → would be wrong without invalidation; assert the invalidation clears it. |
-| `merge_advisory_then_manual_executes` | Run policy_candidates after writing low-load adjacent pair; observe candidate; run `autumn-client merge`; observe candidate disappears next tick. |
+| `merge_advisory_then_manual_executes` | Run policy_candidates after writing low-load adjacent pair; observe candidate; run `autumn-op merge`; observe candidate disappears next tick. |
 
 ---
 
@@ -673,7 +673,7 @@ Tests live in `crates/manager/tests/` (integration) and `crates/manager/src/lib.
 | Survivor `sst_readers` doubles → bloom-FP rate doubles → read latency bump | Same shape as post-split has_overlap state; major compaction unifies. Document in PS CLAUDE.md. |
 | Long `extent_ids` lists → `MSG_STREAM_INFO` wire bloat | At 100 GB partition, ~37 KB worst case; acceptable. Policy can refuse merging two huge partitions back-to-back via the `MERGE_SIZE_LOW=1 GB` threshold (already ensures both sides are small). |
 | Merge-then-immediate-split oscillation | `SPLIT_COOLDOWN=1h`, `MERGE_COOLDOWN=6h`, plus 10× hysteresis between `SPLIT_QPS_HIGH=50K` and `MERGE_QPS_LOW=5K`. |
-| Cross-PS merge attempted via direct CLI bypass | `handle_merge_part` returns Precondition with clear message; documented in `autumn-client merge --help`. |
+| Cross-PS merge attempted via direct CLI bypass | `handle_merge_part` returns Precondition with clear message; documented in `autumn-op merge --help`. |
 | TPC: merged partition single-core ceiling reached | Auto-merge gated behind feature flag (Stage 3); advisory mode in Stage 1+2 surfaces the concern via the `same_ps` + `qps_sum` columns in `policy candidates`. |
 
 ---
