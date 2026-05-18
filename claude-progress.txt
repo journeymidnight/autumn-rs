@@ -1,127 +1,78 @@
-Date: 2026-05-17
+Date: 2026-05-18
 TaskStatus: completed
-Task scope: F211 series — Operator-Driven Node Lifecycle. Implement
-            the HDFS-decommission-style refactor described in
-            docs/superpowers/plans/2026-05-17-f211-operator-driven-node-lifecycle.md
+Task scope: F213 — migrate all cluster/partition op subcommands from
+            autumn-client to autumn-op (sibling-binary pattern).
 
-Sub-feature status:
-  F211-A NodeStateTracker (Online ↔ Suspected, auto):  completed
-  F211-B Health reporting RPCs (3 read-only):          completed
-  F211-C Operator fence/maintenance/clear/remove:      completed
-  F211-D Owner-lock revision fence on shards:          completed
-         - bump_owner_revisions_for_node implemented in fence_node_impl
-         - WriteShardReq +revision (header 28 → 36 bytes)
-         - CommitEcShardReq +revision (header 24 → 32 bytes)
-         - EN-side handle_write_shard / handle_commit_ec_shard reject
-           when req.revision > 0 && req.revision < entry.last_revision
-         - req.revision == 0 preserves pre-F211-D no-fence behaviour
-           (passes 0 from existing EC convert dispatch paths)
-         - Wire roundtrip unit tests in extent_node.rs f211d_wire_fence_tests
-  F211-E Recovery loop gated by Fenced state:          completed
-         - AUTUMN_MGR_RECOVERY_GATE=fenced_only default
-         - Backoff via per-(extent,slot) entry in limiter
-         - AUTUMN_MGR_RECOVERY_GATE=auto_disk preserves legacy
-  F211-F EC convert auto-abandon on fenced coord:      completed
-         - ec_conversion_dispatch_loop suspected-skip in place
-         - ec_abandon.rs auto-abandon on fence implemented
-  F211-G Python OP policy script:                      completed
-         - python/node_policy.py (10 subcommands, integrated
-           decommission flow, auto-reissue advisory)
-         - companion: crates/server/src/bin/autumn_op.rs Rust CLI
-           that shells out from the Python script (rkyv encoding
-           lives in Rust, no duplication)
-  F211-H Recovery rate limiter + priority:             completed
-         - per-source/target/global limits + backoff
-         - mgr_recovery_stats RPC for monitoring
-  F211-I Operator action audit log:                    completed
-         - mgr_audit_log/<ts>_<seq> etcd prefix
-         - mgr_query_audit_log RPC + retention GC helper
+Summary:
+  autumn-op (F211-G companion CLI) is now the canonical interface to
+  the manager control plane. autumn-client is data-plane only (put /
+  get / ls / wbench / rbench / perf-check). The Python policy script
+  already shells out to autumn-op exclusively; no Python-side change
+  needed beyond making `auto-reissue --dry-run=false` actually
+  reissue via `_op()` instead of printing an advisory.
 
-Code landing (cumulative across commits 212da57, d584f77, +F211-D):
-  - crates/manager/src/node_state.rs (new)
-  - crates/manager/src/audit.rs (new)
-  - crates/manager/src/ec_abandon.rs (new)
-  - crates/manager/src/recovery_rate_limiter.rs (new)
-  - crates/manager/src/rpc_handlers.rs: 9 new MSG_ dispatch arms,
-    F211-B/C/H/I handlers, register_node zombie defense (F211-C #2)
-  - crates/manager/src/recovery.rs: F211-E/F gating, backoff hook,
-    maintenance-TTL tick, RecoveryGateMode enum
-  - crates/manager/src/lib.rs: 4 new fields on AutumnManager
-    (node_states / node_overrides / decommissioned / recovery_limiter
-    / audit_seq), replay arms for node_override/ + decommissioned/
-  - crates/rpc/src/manager_rpc.rs: 9 new MSG_ constants
-    (LIST_NODE_STATES, EXTENT_HEALTH_REPORT,
-    LIST_EC_INFLIGHT_MARKERS, FENCE_NODE, SET_NODE_MAINTENANCE,
-    CLEAR_NODE_OVERRIDE, REMOVE_NODE, RECOVERY_STATS, QUERY_AUDIT_LOG)
-    + ~20 new rkyv wire types + MgrNodeOverride + MgrAuditEntry
-  - crates/stream/src/extent_rpc.rs: WriteShardReq + CommitEcShardReq
-    +revision field, header lengths bumped
-  - crates/stream/src/extent_node.rs: revision fence in
-    handle_write_shard + handle_commit_ec_shard
-  - crates/server/src/bin/autumn_op.rs (new): admin CLI binary
-  - python/node_policy.py (new): operator policy script
-  - crates/manager/tests/f211_node_lifecycle.rs (new integration
-    suite, 9 in-memory tests passing)
+  12 subcommands moved to autumn-op:
+    Read:   info / policy-candidates
+    Admin:  bootstrap / set-stream-ec / force-ec-convert / split /
+            merge / compact / gc / forcegc / register-node / format
 
-Test status:
-  cargo test -p autumn-manager --lib                : 104 passing
-  cargo test -p autumn-manager --test f211_node_lifecycle: 9 passing
-  cargo test -p autumn-manager --test f211_e2e_lifecycle: 8 passing
-    (full-stack: real manager + real ENs + RPC fanout):
-    - phantom_node_goes_suspected_after_df_timeout (~10 s)
-    - fence_persists_and_blocks_reregister
-    - fence_triggers_recovery_dispatch (~5 s; cross-node rebuild)
-    - remove_blocked_by_active_extents
-    - audit_log_captures_admin_ops
-    - recovery_stats_baseline
-    - extent_health_report_reflects_overrides
-    - list_ec_inflight_markers_empty_baseline
-  cargo test -p autumn-stream --lib                 : 53 passing
-    (includes 3 new f211d_wire_fence_tests)
-  cargo build --workspace                           : clean
-  python3 python/node_policy.py --help              : usage prints
-  ./target/debug/autumn-op --help                   : usage prints
+  autumn-client autumn-client.rs went from 3081 to ~1660 lines.
 
-Fix discovered during E2E:
-  recovery_dispatch_loop's pre-F211 short-circuit (probe ok → no
-  dispatch) prevented fence-triggered recovery on a Fenced node
-  whose probe still succeeded (the node was operator-marked dead
-  but the underlying process was still running). Added an explicit
-  "if is_fenced → dispatch immediately, skip probe shortcuts" arm
-  in recovery_dispatch_loop. Crystallised by the
-  fence_triggers_recovery_dispatch e2e test which hung for 60 s
-  pre-fix; passes in ~5 s post-fix.
+5 commits landed on main:
+  F213-1 (feb7d97)  add 12 op subcommands to autumn-op (+1916/-70)
+                    + 6 helpers + 8 unit tests
+  F213-2 (d18e2d6)  cluster.sh + node_policy.py switch to autumn-op
+                    (+34/-13). cluster.sh now has AO=$BIN/autumn-op
+                    next to AC; 4 invocations migrated; node_policy
+                    auto_reissue now drives the reissue itself.
+  F213-3 (8e3113c)  autumn-client deletes 12 op subcommands + adds
+                    `op` stub (+56/-1439). The stub fires BEFORE
+                    ClusterClient::connect so it doesn't wait on a
+                    manager. Greppable invariant established:
+                      grep -cE 'mgr_call\(MSG_' \
+                        crates/server/src/bin/autumn_client.rs
+                    must be 0 going forward.
+  F213-4 (919bbf2)  docs sync (+123/-99): README, crates/server +
+                    manager + partition-server + stream CLAUDE.md
+                    and src comments, etcd test comment, F183 merge
+                    design + plan doc.
+  F213-5 (this)     feature_list.md F213 entry under new P7 heading
+                    + this progress file.
 
-Behaviour notes:
-  - Default AUTUMN_MGR_RECOVERY_GATE = fenced_only (BACKWARD-INCOMPAT)
-    Operators who haven't deployed the F211-G policy script can flip
-    to AUTUMN_MGR_RECOVERY_GATE = auto_disk to restore pre-F211
-    behaviour while they roll out the script.
-  - Recovery limiter defaults: per_source=4, per_target=2, global=64
-    (env: AUTUMN_MGR_RECOVERY_MAX_{PER_SOURCE,PER_TARGET,GLOBAL})
-  - Backoff: 2^N seconds capped at 300 s per (extent, slot) failure
-  - NodeStateTracker soft timeout: 10 s
-    (env: AUTUMN_MGR_NODE_SUSPECTED_TIMEOUT_SECS)
-  - Audit retention: 90 days
-    (env: AUTUMN_MGR_AUDIT_RETENTION_DAYS)
-  - F211-D shard fence: ALL existing call sites pass revision=0 (no
-    fence). Future work: thread the manager's per-extent revision
-    through ExtConvertToEcReq so the WriteShard/CommitEcShard fanout
-    inside handle_convert_to_ec carries the live revision and a
-    fenced ex-coord is rejected at the shard handler too. The wire
-    + handler scaffolding is in place; only the caller-side
-    propagation remains.
+Acceptance verified:
+  $ cargo build --release --workspace           # clean (pre-existing warnings only)
+  $ cargo test --release --bin autumn-op        # 8/8 pass
+  $ cargo test --release --bin autumn-client    # 5/5 pass
+  $ ./target/release/autumn-op --help           # 3-section usage prints
+  $ ./target/release/autumn-client op           # hint prints, exit 1
+  $ ./target/release/autumn-client op split 7   # hint + "did you mean autumn-op split 7"
+  $ grep -cE 'mgr_call\(MSG_' \
+      crates/server/src/bin/autumn_client.rs    # 0
+
+Behaviour notes / forward-looking rule:
+  - autumn-client must not regrow `mgr_call(MSG_*)` for admin RPCs.
+    Encoded in crates/server/CLAUDE.md ("Architectural rule" para)
+    and in the F213 feature_list entry as a greppable invariant.
+  - If future autumn-client needs op data, route through autumn-op
+    (separate proposal — do NOT add direct manager calls or extract
+    a shared lib without explicit discussion).
+  - autumn-client's `op` stub does NOT subprocess-fork autumn-op.
+    Print-and-exit is sufficient and matches HDFS dfs+dfsadmin
+    convention.
+  - autumn-op's new commands all accept --json; bootstrap / format /
+    register-node previously had only println output, now offer
+    structured JSON for Python automation.
+  - cluster.sh runs autumn-op WITHOUT --transport (manager link is
+    pure TCP; data-plane transport flag was autumn-client-only).
 
 Open items (acceptable follow-ups, not blockers for ship):
-  1. Thread manager-decided per-extent revision through
-     ExtConvertToEcReq so the EN coord's WriteShard/CommitEcShard
-     fanout carries a non-zero revision (today they pass 0).
-  2. Auto-call audit_retention_gc on a periodic loop (helper is
-     wired but not yet scheduled).
-  3. Integration test with embedded etcd to exercise persist /
-     replay of node_override/ + decommissioned/ + audit log
-     across leader failover.
-  4. Pre-existing partition-server flaky tests (f099i_tests)
-     are unrelated — they need --test-threads=1 to pass.
+  1. The `Put { nosync: bool }` field in autumn-client's Command enum
+     is now read-only (warning). Pre-existing dead code from F178 —
+     unrelated to F213. Can be cleaned in a separate sweep.
+  2. The `parse_positive_usize_flag` helper in autumn-client is
+     pre-existing dead code (warning). Same as above.
+  3. No e2e test currently verifies autumn-op bootstrap → put → get
+     round-trip; cluster.sh smoke is the manual gate. An integration
+     test under crates/manager/tests would be a nice addition.
 
-Previous task (completed): F212-fix region_epoch fencing.
+Previous task (completed): F211 series + F212 region_epoch fixes.

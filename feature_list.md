@@ -2841,3 +2841,28 @@ Background: autumn-rs 当前节点死亡判定模型过于激进——心跳 10s
   - 集成测试：query_audit_log 按 时间 / op type / node_id filter 正确。
   - 持久性测试：leader failover 后 audit log 完整。
 - **passes:** true
+
+## P7 — CLI control-plane consolidation (F213)
+
+### F213 · Migrate cluster/partition op subcommands from autumn-client to autumn-op
+- **Trigger:** Post-F211-G, `autumn-op` was scoped to node-lifecycle RPCs (fence-node / maintenance / unfence / remove + 5 read views), while `autumn-client` still owned the historical op surface (bootstrap / set-stream-ec / force-ec-convert / split / merge / policy-candidates / compact / gc / forcegc / register-node / format / info). This violated single-responsibility — `autumn-client` was both data-plane CLI and admin entry — and risked autumn-client regrowing direct admin RPCs that would bypass the F211 audit + fence path. Choice forced by user direction during F213 planning: **sibling binaries, no shared lib, no subprocess passthrough**, matching HDFS `dfs`+`dfsadmin` / Ceph `rados`+`ceph` pattern.
+- **Goal:**
+  - autumn-op gains 12 new subcommands (bootstrap / set-stream-ec / force-ec-convert / split / merge / compact / gc / forcegc / register-node / format / info / policy-candidates), all with optional `--json` for Python consumption. JSON schema for `info` preserves the existing top-level `nodes / extents / streams / partitions` arrays so existing README jq/python parsers keep working.
+  - 6 helpers move with their callers: `hex_split_ranges`, `parse_byte_size`, `parse_replication`, `parse_ec_flag`, `derive_control_address`, `format_disk`. Their unit tests (8 of them) move too.
+  - autumn-client deletes all 12 op `Command` variants + parse arms + run handlers + helpers + `Info{Disk,Node,Extent,Stream,Discard,Partition,Snapshot}View` structs. ~1440 lines deleted.
+  - autumn-client adds a single `op` stub command: typing `autumn-client op <anything>` (or any of the legacy spellings like `autumn-client split 7`) prints a hint pointing at `autumn-op` and exits 1, BEFORE attempting to connect to the manager. No subprocess fork — the stub is pure print-and-exit.
+  - cluster.sh: new `AO=$BIN/autumn-op` variable; the 4 op invocations (`register-node x2`, `format`, `bootstrap`) call `$AO`. `--transport` flag dropped (autumn-op talks pure TCP to manager).
+  - python/node_policy.py:cmd_auto_reissue: was advisory-only with a "manually run autumn-client force-ec-convert" hint. Now drives the reissue via `_op(["force-ec-convert", "--extent", str(eid)])` loop when `--dry-run=false`.
+  - All CLAUDE.md + design docs + source-comment references updated.
+- **Architectural rule (enforced via code review, not compile time):** `autumn-client` MUST NOT contain `mgr_call(MSG_*)` for admin/observability RPCs. If a future need arises to surface op data through `autumn-client`, route through `autumn-op` (sibling binary) — do not add direct manager calls and do not extract a shared library without a separate proposal. Greppable: `grep -cE 'mgr_call\(MSG_' crates/server/src/bin/autumn_client.rs` MUST be 0.
+- **Acceptance:**
+  - All 12 commands functional under `autumn-op` (preserve flags and JSON schema).
+  - `autumn-client op <anything>` exits 1 with a hint and does NOT connect to manager.
+  - `autumn-client split 7` (bare legacy spelling) also routes to the stub.
+  - cluster.sh `reset 1` works end-to-end via autumn-op for format/bootstrap/register-node.
+  - `python/node_policy.py auto-reissue --dry-run=false` actually reissues, not just prints.
+  - `grep -cE 'mgr_call\(MSG_' crates/server/src/bin/autumn_client.rs` returns 0.
+  - cargo test --release --bin autumn-op: 8 passing (helper tests moved over).
+  - cargo test --release --bin autumn-client: 5 passing (data-plane bench helpers).
+  - cargo build --workspace: clean.
+- **passes:** true
