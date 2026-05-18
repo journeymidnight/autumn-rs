@@ -328,12 +328,13 @@ def cmd_decommission(args: argparse.Namespace) -> int:
 # ── Half-auto: reissue EC converts after recovery ────────────────────────────
 
 def cmd_auto_reissue(args: argparse.Namespace) -> int:
-    """Scan the EC convert advisory entries and surface extents that are
-    now 3R-healthy and ready for `force_ec_convert` reissue.
+    """Scan extent health and reissue `force_ec_convert` for sealed
+    extents that are not yet EC-encoded and whose all slots are Online.
 
-    Today this only reports candidates (the actual `force_ec_convert`
-    call lives in `autumn-client force-ec-convert`); future iterations
-    can shell to it. `--dry-run` (default) just prints.
+    F213: `force-ec-convert` now lives on `autumn-op`, same binary this
+    script already shells to — so when `--dry-run=false`, drive the
+    reissue from here instead of asking the operator to type it.
+    `--dry-run` (default) just prints the candidate list.
     """
     # The advisory etcd prefix is not directly exposed via a manager RPC;
     # the closest signal is "list-ec-markers" which now also reflects
@@ -358,7 +359,20 @@ def cmd_auto_reissue(args: argparse.Namespace) -> int:
         print(f"  extent {e['extent_id']}  sealed={e['sealed_length']}")
     if not args.dry_run:
         print()
-        print("(actual reissue not yet automated — invoke `autumn-client force-ec-convert --extent ID` manually)")
+        print(f"issuing force-ec-convert for {len(cand)} extent(s) via autumn-op:")
+        failures: List[Tuple[int, str]] = []
+        for e in cand:
+            eid = e["extent_id"]
+            try:
+                resp = _op(["force-ec-convert", "--extent", str(eid)])
+                msg = resp.get("message", "") if isinstance(resp, dict) else ""
+                print(f"  extent {eid}: ok {msg}")
+            except OpError as oe:
+                failures.append((eid, str(oe)))
+                print(f"  extent {eid}: FAILED {oe}", file=sys.stderr)
+        if failures:
+            print(f"\n{len(failures)} of {len(cand)} reissue(s) failed", file=sys.stderr)
+            return 2
     return 0
 
 

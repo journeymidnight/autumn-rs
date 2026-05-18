@@ -35,6 +35,10 @@ MANAGER="$BIN/autumn-manager-server"
 NODE="$BIN/autumn-extent-node"
 PS="$BIN/autumn-ps"
 AC="$BIN/autumn-client"
+# F213: all cluster/partition op commands (bootstrap / register-node /
+# format / split / merge / compact / gc / info / ...) live on autumn-op.
+# autumn-client is data-plane only.
+AO="$BIN/autumn-op"
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -286,12 +290,12 @@ register_extent_node() {
                 shard_ports_csv="${shard_ports_csv},${sp}"
             fi
         done
-        "$AC" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" register-node \
+        "$AO" --manager "$MANAGER_ADDR" register-node \
             --addr "${BIND_HOST}:$port" --disk "disk-$i" \
             --shard-ports "$shard_ports_csv" \
             --control-address "${BIND_HOST}:$ctl_port"
     else
-        "$AC" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" register-node \
+        "$AO" --manager "$MANAGER_ADDR" register-node \
             --addr "${BIND_HOST}:$port" --disk "disk-$i" \
             --control-address "${BIND_HOST}:$ctl_port"
     fi
@@ -469,6 +473,7 @@ do_start() {
     need_bin "$NODE"
     need_bin "$PS"
     need_bin "$AC"
+    need_bin "$AO"
 
     # Create data dirs for etcd and ps; node dirs are created per-node below.
     mkdir -p "$DATA_ROOT/etcd" "$DATA_ROOT/ps"
@@ -509,7 +514,7 @@ do_start() {
         mkdir -p $(echo "$disk_arg" | tr ',' ' ')
     done
 
-    # In --multidisk-1node mode, `autumn-client format` must run BEFORE the
+    # In --multidisk-1node mode, `autumn-op format` must run BEFORE the
     # extent-node starts. Format registers the node with the manager and
     # writes the `disk_id` file in every data directory — ExtentNodeConfig::
     # new_multi requires those files on open. The format call also replaces
@@ -518,7 +523,7 @@ do_start() {
         local disk_arg
         disk_arg=$(disk_args_for_node 1)
         # shellcheck disable=SC2086  # intentional word splitting for positional args
-        "$AC" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" format \
+        "$AO" --manager "$MANAGER_ADDR" format \
             --listen ":9101" \
             --advertise "${BIND_HOST}:9101" \
             $(echo "$disk_arg" | tr ',' ' ')
@@ -635,7 +640,7 @@ do_start() {
             [[ "$n_parts_arg" =~ ^[0-9]+$ ]] || n_parts_arg=1
             bootstrap_args+=( --presplit "${n_parts_arg}:hexstring" )
         fi
-        "$AC" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" bootstrap "${bootstrap_args[@]}"
+        "$AO" --manager "$MANAGER_ADDR" bootstrap "${bootstrap_args[@]}"
         touch "$bootstrap_marker"
         # Wait for PS to pick up the new partition(s) and finish opening them.
         # Each partition's open() runs stream commit_length calls serially against
@@ -666,8 +671,9 @@ do_start() {
     echo "[cluster]   partition: ${BIND_HOST}:9201"
     echo "[cluster]   logs     : $LOG_DIR"
     echo ""
-    echo "  AC=(\"$AC\" --manager \"$MANAGER_ADDR\")"
-    echo "  \"\${AC[@]}\" info"
+    echo "  AC=(\"$AC\" --manager \"$MANAGER_ADDR\")     # data plane (put/get/ls/bench)"
+    echo "  AO=(\"$AO\" --manager \"$MANAGER_ADDR\")     # op plane (info/split/merge/...)"
+    echo "  \"\${AO[@]}\" info"
     echo "  echo hello | \"\${AC[@]}\" put mykey /dev/stdin"
     echo "  \"\${AC[@]}\" get mykey"
     echo "  \"\${AC[@]}\" ls"
@@ -684,6 +690,7 @@ do_start_node() {
     (( i <= REPLICAS )) || die "node$i exceeds REPLICAS=$REPLICAS in saved config; re-run '$0 start $i' to extend"
     need_bin "$NODE"
     need_bin "$AC"
+    need_bin "$AO"
     local pf; pf="$(pid_file "node$i")"
     if [[ -f "$pf" ]] && kill -0 "$(cat "$pf")" 2>/dev/null; then
         die "node$i already running (pid $(cat "$pf"))"
