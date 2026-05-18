@@ -1,6 +1,10 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use autumn_client::ClusterClient;
+use autumn_rpc::manager_rpc::{
+    rkyv_decode, rkyv_encode, GetClusterIdReq, GetClusterIdResp, CODE_OK, MSG_GET_CLUSTER_ID,
+};
 use autumn_stream::{ExtentNode, ExtentNodeConfig};
 use autumn_transport::TransportKind;
 
@@ -29,9 +33,10 @@ struct Args {
     /// `port + shard_idx * shard_stride` (default stride 10).
     port: u16,
     /// One or more data directories. Comma-separated or repeated --data flags.
+    /// F214-D: every dir must be formatted via `autumn-op format` first;
+    /// the EN reads `disk_id` + `cluster_id` from each dir's sentinel
+    /// files. The old `--disk-id` CLI bypass is gone.
     data_dirs: Vec<PathBuf>,
-    /// Optional explicit disk_id for single-disk backward-compat mode.
-    disk_id: Option<u64>,
     manager: Option<String>,
     /// F099-M: port stride between sibling shards. Shard count itself
     /// (F196) is always `cpuset_len` — supply `--cpuset` to control it.
@@ -66,7 +71,6 @@ struct Args {
 fn parse_args() -> Args {
     let mut port: u16 = 9101;
     let mut data_dirs: Vec<PathBuf> = Vec::new();
-    let mut disk_id: Option<u64> = None;
     let mut manager: Option<String> = None;
     // F196: `--shards` was removed. Shard count = cpuset_len; supply
     // `--cpuset` to control it. `--shard-stride` survives as the
@@ -101,8 +105,20 @@ fn parse_args() -> Args {
                 }
             }
             "--disk-id" => {
+                // F214-D: --disk-id removed. Every data dir must be
+                // formatted via `autumn-op format` first; the EN reads
+                // `disk_id` from the dir's sentinel file. Print a
+                // migration error and exit 2, matching the --shards
+                // pattern below.
                 i += 1;
-                disk_id = Some(args[i].parse().expect("--disk-id must be a number"));
+                let _ = args[i].clone();
+                eprintln!(
+                    "error: --disk-id was removed in F214-D. \
+                     Run `autumn-op format --advertise <ADDR> <DIR>...` \
+                     first; the EN reads disk_id from each dir's \
+                     `disk_id` sentinel file."
+                );
+                std::process::exit(2);
             }
             "--manager" => {
                 i += 1;
@@ -184,7 +200,6 @@ fn parse_args() -> Args {
     Args {
         port,
         data_dirs,
-        disk_id,
         manager,
         shard_stride,
         bind_host,
@@ -216,6 +231,91 @@ fn apply_extent_tunables(
     cfg
 }
 
+/// F214-D: async manager cross-check. Connects to the manager once,
+/// fetches its cluster_id, and verifies it matches the value stamped
+/// in our data dirs. Catches the "EN pointed at the wrong manager"
+/// misconfiguration that the on-disk consistency check alone cannot
+/// see. No retry — if the manager isn't reachable at startup we want
+/// to bubble up the error fast.
+async fn verify_manager_cluster_id(manager: &str, stamped: &str) -> Result<()> {
+    let client = ClusterClient::connect(manager)
+        .await
+        .with_context(|| format!("connect to manager {manager} for cluster_id verify"))?;
+    let resp_bytes = client
+        .mgr_call(MSG_GET_CLUSTER_ID, rkyv_encode(&GetClusterIdReq {}))
+        .await
+        .context("get cluster_id from manager")?;
+    let resp: GetClusterIdResp =
+        rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("decode GetClusterIdResp: {e}"))?;
+    if resp.code != CODE_OK {
+        anyhow::bail!(
+            "manager replied error to GetClusterId: code={} msg={}",
+            resp.code,
+            resp.message
+        );
+    }
+    if resp.cluster_id != stamped {
+        anyhow::bail!(
+            "cluster_id mismatch: data dirs stamped for cluster {} but manager {} reports {}. \
+             Point at the correct manager, or re-run `autumn-op format` against this cluster.",
+            stamped,
+            manager,
+            resp.cluster_id
+        );
+    }
+    Ok(())
+}
+
+/// F214-D: read the `cluster_id` sentinel file from each data dir and
+/// verify they all agree. Returns the shared cluster_id string. Panics
+/// (via `Result::Err` → main returns) with an actionable message if any
+/// dir is unformatted, partially-formatted, or formatted for a different
+/// cluster than its siblings. Run synchronously in main()'s prelude so
+/// shard threads never start against a misconfigured dir set.
+fn read_and_verify_cluster_id(data_dirs: &[PathBuf]) -> Result<String> {
+    if data_dirs.is_empty() {
+        anyhow::bail!("no --data dirs supplied");
+    }
+    let mut shared: Option<String> = None;
+    for dir in data_dirs {
+        let cid_path = dir.join("cluster_id");
+        if !cid_path.exists() {
+            anyhow::bail!(
+                "data dir {} is not formatted (no cluster_id sentinel). \
+                 Run `autumn-op format --advertise <HOST:PORT> {}` first.",
+                dir.display(),
+                dir.display()
+            );
+        }
+        let cid = std::fs::read_to_string(&cid_path)
+            .with_context(|| format!("read cluster_id in {}", dir.display()))?
+            .trim()
+            .to_string();
+        if cid.is_empty() {
+            anyhow::bail!(
+                "data dir {} has an empty cluster_id file — re-run \
+                 `autumn-op format` against this dir",
+                dir.display()
+            );
+        }
+        match &shared {
+            None => shared = Some(cid),
+            Some(prev) if prev == &cid => {}
+            Some(prev) => {
+                anyhow::bail!(
+                    "data dirs disagree on cluster_id: {} reports {} but a prior \
+                     dir reports {}. All --data dirs for one EN must belong to \
+                     the same cluster.",
+                    dir.display(),
+                    cid,
+                    prev
+                );
+            }
+        }
+    }
+    Ok(shared.unwrap())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -226,6 +326,16 @@ fn main() -> Result<()> {
 
     let args = parse_args();
     let _ = autumn_transport::init_with(args.transport);
+
+    // F214-D: verify every --data dir has a matching cluster_id
+    // sentinel file before launching shard threads. The manager
+    // cross-check happens inside the per-shard async block below
+    // (needs a compio runtime to do an RPC).
+    let stamped_cluster_id = read_and_verify_cluster_id(&args.data_dirs)?;
+    tracing::info!(
+        cluster_id = %stamped_cluster_id,
+        "F214-D: data dirs verified consistent"
+    );
     // F196: --cpuset (if given) is installed BEFORE any cpu_pin reader
     // fires, so the cached core list reflects the override. Without
     // --cpuset we fall back to the legacy --cpu-start offset over
@@ -289,7 +399,7 @@ fn main() -> Result<()> {
 
     if shards == 1 {
         // Single-shard fast path — preserve exact pre-F196 behaviour.
-        return run_single_shard(args);
+        return run_single_shard(args, stamped_cluster_id);
     }
 
     // Multi-shard: spawn one OS thread per shard, each with its own compio
@@ -298,8 +408,8 @@ fn main() -> Result<()> {
     let mut joins = Vec::with_capacity(shards as usize);
     for shard_idx in 0..shards {
         let data_dirs = args.data_dirs.clone();
-        let disk_id = args.disk_id;
         let manager = args.manager.clone();
+        let stamped_cluster_id = stamped_cluster_id.clone();
         let siblings = sibling_addrs.clone();
         let shards_for_thread = shards;
         let listen_port = shard_ports[shard_idx as usize];
@@ -332,12 +442,17 @@ fn main() -> Result<()> {
                     )
                     .context("parse control listen address")?;
 
-                    let mut cfg = if data_dirs.len() == 1 && disk_id.is_some() {
-                        let data = data_dirs.into_iter().next().unwrap();
-                        ExtentNodeConfig::new(data, disk_id.unwrap())
-                    } else {
-                        ExtentNodeConfig::new_multi(data_dirs)
-                    };
+                    // F214-D: only shard 0 runs the manager cross-check;
+                    // it's the same check for every shard, so doing it
+                    // once is sufficient. Skipped when no manager is
+                    // configured (test deployments).
+                    if shard_idx == 0 {
+                        if let Some(mgr) = manager.as_ref() {
+                            verify_manager_cluster_id(mgr, &stamped_cluster_id).await?;
+                        }
+                    }
+
+                    let mut cfg = ExtentNodeConfig::new_multi(data_dirs);
                     if let Some(mgr) = manager {
                         cfg = cfg.with_manager_endpoint(mgr);
                     }
@@ -381,7 +496,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_single_shard(args: Args) -> Result<()> {
+fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
     let cpu = autumn_common::pick_cpu_for_ord(0);
     let rt = compio::runtime::RuntimeBuilder::new()
         .thread_affinity(autumn_common::affinity_set(cpu))
@@ -397,20 +512,15 @@ fn run_single_shard(args: Args) -> Result<()> {
         let ctl_addr = autumn_transport::format_listen_addr(&args.bind_host, ctl_port)
             .context("parse control listen address")?;
 
-        let config = if args.data_dirs.len() == 1 && args.disk_id.is_some() {
-            let data = args.data_dirs.iter().next().unwrap().clone();
-            let mut c = ExtentNodeConfig::new(data, args.disk_id.unwrap());
-            if let Some(mgr) = args.manager.clone() {
-                c = c.with_manager_endpoint(mgr);
-            }
-            c
-        } else {
-            let mut c = ExtentNodeConfig::new_multi(args.data_dirs.clone());
-            if let Some(mgr) = args.manager.clone() {
-                c = c.with_manager_endpoint(mgr);
-            }
-            c
-        };
+        // F214-D: manager cross-check (skipped when --manager is omitted).
+        if let Some(mgr) = args.manager.as_ref() {
+            verify_manager_cluster_id(mgr, &stamped_cluster_id).await?;
+        }
+
+        let mut config = ExtentNodeConfig::new_multi(args.data_dirs.clone());
+        if let Some(mgr) = args.manager.clone() {
+            config = config.with_manager_endpoint(mgr);
+        }
         // F195: F194 / F099-I tunables.
         let config = apply_extent_tunables(config, &args);
 

@@ -57,8 +57,9 @@ fn usage() -> ! {
     eprintln!("  compact <PARTID>");
     eprintln!("  gc [--ratio R] [--max-size B] [--stream-debt B] [--empty-only] <PARTID>");
     eprintln!("  forcegc <PARTID> <EXTID>...");
-    eprintln!("  register-node --addr <ADDR> --disk <UUID> [--disk <UUID>...] [--shard-ports P1,P2,...] [--control-address <ADDR>]");
+    // F214-C: `register-node` removed; `format` is the single per-EN setup.
     eprintln!("  format --listen <ADDR> --advertise <ADDR> <DIR>...");
+    eprintln!("                               format dir(s), register node, stamp cluster_id");
     std::process::exit(1);
 }
 
@@ -147,12 +148,10 @@ enum Command {
         part_id: u64,
         extent_ids: Vec<u64>,
     },
-    RegisterNode {
-        addr: String,
-        disks: Vec<String>,
-        shard_ports: Vec<u16>,
-        control_address: String,
-    },
+    // F214-C: `register-node` merged into `format`. Variant kept so
+    // the parser can route the legacy spelling to a migration stub
+    // (in run()) instead of failing at parse with "unknown subcommand".
+    RegisterNode,
     Format {
         listen: String,
         advertise: String,
@@ -569,54 +568,12 @@ fn parse() -> Args {
             }
         }
         "register-node" => {
-            let mut addr = String::new();
-            let mut disks: Vec<String> = Vec::new();
-            let mut shard_ports: Vec<u16> = Vec::new();
-            let mut control_address = String::new();
+            // F214-C: route to the migration stub. Consume any remaining
+            // arguments so the parser doesn't misinterpret them.
             while i < raw.len() {
-                match raw[i].as_str() {
-                    "--addr" => {
-                        i += 1;
-                        addr = raw[i].clone();
-                    }
-                    "--disk" => {
-                        i += 1;
-                        disks.push(raw[i].clone());
-                    }
-                    "--shard-ports" => {
-                        i += 1;
-                        for part in raw[i].split(',') {
-                            let p = part.trim();
-                            if p.is_empty() {
-                                continue;
-                            }
-                            let port: u16 = p
-                                .parse()
-                                .expect("--shard-ports entries must be u16");
-                            shard_ports.push(port);
-                        }
-                    }
-                    "--control-address" => {
-                        i += 1;
-                        control_address = raw[i].clone();
-                    }
-                    _ => {}
-                }
                 i += 1;
             }
-            if addr.is_empty() {
-                eprintln!("register-node requires --addr");
-                std::process::exit(1);
-            }
-            if disks.is_empty() {
-                disks.push("disk-default".to_string());
-            }
-            Command::RegisterNode {
-                addr,
-                disks,
-                shard_ports,
-                control_address,
-            }
+            Command::RegisterNode
         }
         "format" => {
             let mut listen = String::new();
@@ -800,6 +757,67 @@ fn format_disk(dir: &str) -> Result<String> {
     Ok(disk_uuid)
 }
 
+/// F214-C: fetch the manager's cluster_id. Retries on `CODE_NOT_LEADER`
+/// (same pattern as other admin RPCs in this binary). Returns an error
+/// if the cluster has never been imprinted (manager replied with
+/// `CODE_ERROR` "not yet bootstrapped"), which only happens before the
+/// first leader election against a fresh etcd.
+async fn fetch_cluster_id(client: &ClusterClient) -> Result<String> {
+    let req_bytes = rkyv_encode(&GetClusterIdReq {});
+    let mut attempt = 0u32;
+    loop {
+        let resp_bytes = client
+            .mgr_call(MSG_GET_CLUSTER_ID, req_bytes.clone())
+            .await
+            .context("get cluster_id")?;
+        let resp: GetClusterIdResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+        if resp.code == CODE_OK {
+            if resp.cluster_id.is_empty() {
+                bail!("manager replied OK with empty cluster_id");
+            }
+            return Ok(resp.cluster_id);
+        }
+        if resp.code == CODE_NOT_LEADER && attempt < 60 {
+            attempt += 1;
+            compio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        bail!(
+            "get cluster_id failed: code={} {}",
+            resp.code, resp.message
+        );
+    }
+}
+
+/// F214-C: probe a data dir for prior `format` state. The dedicated
+/// `cluster_id` + `disk_uuid` sentinel files (added in F214-C) are the
+/// canonical "already formatted" signal. Returns `(cluster_id, disk_uuid)`
+/// when both files are present and readable; `None` for a fresh dir.
+fn read_existing_format(dir: &str) -> Result<Option<(String, String)>> {
+    let cluster_path = format!("{dir}/cluster_id");
+    if !std::path::Path::new(&cluster_path).exists() {
+        return Ok(None);
+    }
+    let cid = std::fs::read_to_string(&cluster_path)
+        .with_context(|| format!("read cluster_id in {dir}"))?
+        .trim()
+        .to_string();
+    let uuid_path = format!("{dir}/disk_uuid");
+    if !std::path::Path::new(&uuid_path).exists() {
+        // Defensive: cluster_id present but disk_uuid missing means a
+        // partially-formatted dir (interrupted previous run, or a
+        // pre-F214 dir that's been hand-patched). Treat as fresh and
+        // let the new format overwrite — the operator hit this path
+        // intentionally by running format on this dir.
+        return Ok(None);
+    }
+    let did = std::fs::read_to_string(&uuid_path)
+        .with_context(|| format!("read disk_uuid in {dir}"))?
+        .trim()
+        .to_string();
+    Ok(Some((cid, did)))
+}
+
 fn human_size(bytes: u64) -> String {
     if bytes >= 1 << 30 {
         format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
@@ -954,6 +972,19 @@ struct InfoSnapshot {
 // ---------------------------------------------------------------------------
 
 async fn run(args: Args) -> Result<()> {
+    // F214-C: the register-node migration stub must print BEFORE we
+    // try to connect to the manager — otherwise users hit "manager
+    // unreachable" instead of the actionable migration message.
+    if matches!(args.cmd, Command::RegisterNode) {
+        eprintln!(
+            "register-node has merged into 'autumn-op format'.\n\
+             Run: autumn-op --manager <ADDR> format --listen :<PORT> \\\n\
+                  --advertise <HOST:PORT> <DIR> [<DIR>...]\n\
+             'format' fetches the cluster_id, registers the node, \
+             and stamps every data dir in one step."
+        );
+        std::process::exit(1);
+    }
     let client = ClusterClient::connect(&args.manager).await?;
     match args.cmd {
         // ---------------- F211 read ----------------
@@ -1594,71 +1625,70 @@ async fn run(args: Args) -> Result<()> {
                 );
             }
         }
-        Command::RegisterNode {
-            addr,
-            disks,
-            shard_ports,
-            control_address,
-        } => {
-            let req_bytes = rkyv_encode(&RegisterNodeReq {
-                addr: addr.clone(),
-                disk_uuids: disks,
-                shard_ports: shard_ports.clone(),
-                control_address: control_address.clone(),
-            });
-            let mut attempt = 0u32;
-            let resp = loop {
-                let resp_bytes = client
-                    .mgr_call(MSG_REGISTER_NODE, req_bytes.clone())
-                    .await
-                    .context("register node")?;
-                let resp: RegisterNodeResp =
-                    rkyv_decode(&resp_bytes).map_err(decode_err)?;
-                if resp.code == CODE_OK {
-                    break resp;
-                }
-                if resp.code == CODE_NOT_LEADER && attempt < 60 {
-                    attempt += 1;
-                    compio::time::sleep(Duration::from_millis(500)).await;
-                    continue;
-                }
-                bail!("register-node failed: code={} {}", resp.code, resp.message);
-            };
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "code": resp.code,
-                        "node_id": resp.node_id,
-                        "addr": addr,
-                        "disks": resp.disk_uuids.iter()
-                            .map(|(u, id)| serde_json::json!({"uuid": u, "disk_id": id}))
-                            .collect::<Vec<_>>(),
-                    }))?
-                );
-            } else {
-                println!("node registered: node_id={}, addr={}", resp.node_id, addr);
-                for (uuid, disk_id) in &resp.disk_uuids {
-                    println!("  disk {uuid} → disk_id={disk_id}");
-                }
-            }
+        Command::RegisterNode => {
+            // Already handled by the pre-connect stub above.
+            unreachable!("Command::RegisterNode handled before connect");
         }
         Command::Format {
             listen,
             advertise,
             dirs,
         } => {
+            // F214-C: fetch the manager's cluster_id BEFORE touching
+            // any disk. Failure here means the manager is not yet
+            // leader (retries internally) or has never bootstrapped
+            // (fatal — operator must start the manager first).
+            let cluster_id = fetch_cluster_id(&client).await?;
+
+            // For each dir, decide whether to fresh-format or reuse
+            // existing. Refuse on cluster_id mismatch — that's the
+            // "wrong cluster" diagnostic.
             let mut disk_uuids = Vec::new();
+            let mut freshly_formatted: Vec<bool> = Vec::with_capacity(dirs.len());
             for dir in &dirs {
                 std::fs::create_dir_all(dir)
                     .with_context(|| format!("create dir {dir}"))?;
-                let uuid = format_disk(dir)?;
-                if !args.json {
-                    println!("formatted {dir}: disk_uuid={uuid}");
+                match read_existing_format(dir)? {
+                    Some((existing_cid, existing_did)) if existing_cid == cluster_id => {
+                        // Idempotent path — already formatted for this
+                        // cluster. Reuse the disk_uuid so the manager's
+                        // re-register branch returns the existing
+                        // disk_id without allocating a fresh one.
+                        if !args.json {
+                            println!(
+                                "{dir}: already formatted (cluster_id matches), reusing disk_uuid={existing_did}"
+                            );
+                        }
+                        disk_uuids.push(existing_did);
+                        freshly_formatted.push(false);
+                    }
+                    Some((existing_cid, _)) => {
+                        // Different cluster — refuse rather than risk
+                        // joining a disk to the wrong cluster.
+                        bail!(
+                            "{dir} is already formatted for cluster {existing_cid}, \
+                             but the manager at {} reports cluster {}. \
+                             Wipe the dir or point at the original cluster.",
+                            args.manager,
+                            cluster_id
+                        );
+                    }
+                    None => {
+                        // Fresh dir — full format: 256 hash subdirs +
+                        // fresh disk_uuid.
+                        let uuid = format_disk(dir)?;
+                        if !args.json {
+                            println!("formatted {dir}: disk_uuid={uuid}");
+                        }
+                        disk_uuids.push(uuid);
+                        freshly_formatted.push(true);
+                    }
                 }
-                disk_uuids.push(uuid);
             }
 
+            // F214-C: register against the manager. Re-register branch
+            // (existing address known) returns the existing node_id +
+            // matching disk_ids, so idempotency holds end-to-end.
             let control_address = derive_control_address(&advertise);
             let resp_bytes = client
                 .mgr_call(
@@ -1683,6 +1713,14 @@ async fn run(args: Args) -> Result<()> {
                     .find(|(u, _)| u == disk_uuid)
                     .map(|(_, id)| *id)
                     .unwrap_or(0);
+                // F214-C: cluster_id + disk_uuid sentinel files. The
+                // extent-node binary's startup check reads cluster_id
+                // and cross-checks against the manager; disk_uuid is
+                // used by re-formats to preserve idempotency.
+                std::fs::write(format!("{dir}/cluster_id"), &cluster_id)
+                    .with_context(|| format!("write cluster_id in {dir}"))?;
+                std::fs::write(format!("{dir}/disk_uuid"), disk_uuid)
+                    .with_context(|| format!("write disk_uuid in {dir}"))?;
                 std::fs::write(format!("{dir}/node_id"), node_id.to_string())
                     .with_context(|| format!("write node_id in {dir}"))?;
                 std::fs::write(format!("{dir}/disk_id"), disk_id.to_string())
@@ -1695,6 +1733,7 @@ async fn run(args: Args) -> Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "node_id": node_id,
+                        "cluster_id": cluster_id,
                         "listen": listen,
                         "advertise": advertise,
                         "disks": disk_assignments.iter()
@@ -1706,6 +1745,7 @@ async fn run(args: Args) -> Result<()> {
                 );
             } else {
                 println!("node registered: node_id={node_id}");
+                println!("cluster_id={cluster_id}");
                 for (dir, _u, disk_id) in &disk_assignments {
                     println!("  {dir}: node_id={node_id}, disk_id={disk_id}");
                 }
