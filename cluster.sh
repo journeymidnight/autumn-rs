@@ -162,9 +162,10 @@ disk_args_for_node() {
 #
 # Used by:
 #   - do_start (full bring-up): writes the config snapshot once everything
-#     is staged, then re-uses launch_extent_node / register_extent_node /
+#     is staged, then re-uses launch_extent_node / format_extent_node /
 #     launch_ps so the per-process subcommands take exactly the same code
-#     path as the bulk start.
+#     path as the bulk start. (F214: format_extent_node replaces the
+#     pre-F214 register_extent_node — see its doc above.)
 #   - do_start_node / do_stop_node / do_start_ps / do_stop_ps: load the
 #     snapshot so a recovery test can `stop-node 2 && start-node 2`
 #     without re-typing flags or remembering env vars.
@@ -254,51 +255,44 @@ launch_extent_node() {
     mkdir -p $(echo "$disk_arg" | tr ',' ' ')
     local -a stride_args=()
     (( SHARDS > 1 )) && stride_args=(--shard-stride "$SHARD_STRIDE")
-    if [[ "$disk_arg" == *,* ]]; then
-        start_proc "node$i" \
-            "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
-            --listen "$BIND_HOST" --transport "$TRANSPORT" \
-            ${stride_args[@]:+"${stride_args[@]}"} \
-            ${cpu_args[@]:+"${cpu_args[@]}"}
-    else
-        start_proc "node$i" \
-            "$NODE" --port "$port" --disk-id "$i" --data "$disk_arg" --manager "$MANAGER_ADDR" \
-            --listen "$BIND_HOST" --transport "$TRANSPORT" \
-            ${stride_args[@]:+"${stride_args[@]}"} \
-            ${cpu_args[@]:+"${cpu_args[@]}"}
-    fi
+    # F214-D: --disk-id was removed. Single-disk and multi-disk paths
+    # are now uniform — `autumn-op format` writes the disk_id sentinel
+    # file per dir, which the EN reads on startup.
+    start_proc "node$i" \
+        "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
+        --listen "$BIND_HOST" --transport "$TRANSPORT" \
+        ${stride_args[@]:+"${stride_args[@]}"} \
+        ${cpu_args[@]:+"${cpu_args[@]}"}
     wait_port "$port" "node$i"
 }
 
-# Register one extent-node ($1 = 1-indexed) with the manager. No-op for
-# multidisk-1node — the `format` step already registered.
-register_extent_node() {
+# Format one extent-node's data dir(s) ($1 = 1-indexed). Calls
+# `autumn-op format` which queries the manager's cluster_id, allocates
+# a fresh disk_uuid per dir, registers the node, and stamps the
+# cluster_id / disk_uuid / node_id / disk_id sentinel files. Must run
+# AFTER the manager is up and BEFORE the EN binary starts (the EN
+# refuses to start without the sentinel files — F214-D).
+#
+# F214-C unification: this replaces the pre-F214 fork between
+# `format` (used only for multidisk-1node) and `register-node`
+# (used everywhere else with the `--disk-id N` flag). Both paths
+# now go through `autumn-op format`, which handles single-disk
+# and multi-disk uniformly.
+format_extent_node() {
     local i="$1"
     local port=$(( 9100 + i ))
-    # F191: derive the control-plane address as port + 1000 (matches the
-    # extent-node binary's default `--control-port`). Always passed so
-    # manager DF probes use the dedicated control_pool instead of the
-    # data-plane multiplex.
-    local ctl_port=$(( port + 1000 ))
-    if (( SHARDS > 1 )); then
-        local shard_ports_csv=""
-        for (( s=0; s<SHARDS; s++ )); do
-            local sp=$(( port + s * SHARD_STRIDE ))
-            if [[ -z "$shard_ports_csv" ]]; then
-                shard_ports_csv="$sp"
-            else
-                shard_ports_csv="${shard_ports_csv},${sp}"
-            fi
-        done
-        "$AO" --manager "$MANAGER_ADDR" register-node \
-            --addr "${BIND_HOST}:$port" --disk "disk-$i" \
-            --shard-ports "$shard_ports_csv" \
-            --control-address "${BIND_HOST}:$ctl_port"
-    else
-        "$AO" --manager "$MANAGER_ADDR" register-node \
-            --addr "${BIND_HOST}:$port" --disk "disk-$i" \
-            --control-address "${BIND_HOST}:$ctl_port"
-    fi
+    local disk_arg
+    disk_arg=$(disk_args_for_node "$i")
+    # Ensure each dir exists before format touches it. `format` would
+    # also create them, but cluster.sh has historically pre-created so
+    # the launch path can rely on them.
+    # shellcheck disable=SC2046  # intentional word splitting on commas
+    mkdir -p $(echo "$disk_arg" | tr ',' ' ')
+    # shellcheck disable=SC2086  # intentional word splitting for positional args
+    "$AO" --manager "$MANAGER_ADDR" format \
+        --listen ":$port" \
+        --advertise "${BIND_HOST}:$port" \
+        $(echo "$disk_arg" | tr ',' ' ')
 }
 
 # Launch the partition server. F099-K: the per-partition listeners (9201,
@@ -514,21 +508,6 @@ do_start() {
         mkdir -p $(echo "$disk_arg" | tr ',' ' ')
     done
 
-    # In --multidisk-1node mode, `autumn-op format` must run BEFORE the
-    # extent-node starts. Format registers the node with the manager and
-    # writes the `disk_id` file in every data directory — ExtentNodeConfig::
-    # new_multi requires those files on open. The format call also replaces
-    # register-node for this mode.
-    if [[ "${CLUSTER_MODE:-default}" == "multidisk-1node" ]]; then
-        local disk_arg
-        disk_arg=$(disk_args_for_node 1)
-        # shellcheck disable=SC2086  # intentional word splitting for positional args
-        "$AO" --manager "$MANAGER_ADDR" format \
-            --listen ":9101" \
-            --advertise "${BIND_HOST}:9101" \
-            $(echo "$disk_arg" | tr ',' ' ')
-    fi
-
     # F099-M: when AUTUMN_EXTENT_SHARDS is set, launch each extent-node
     # with K shards (see compute_shard_config + launch_extent_node above).
     compute_shard_config
@@ -537,20 +516,17 @@ do_start() {
         echo "[cluster] F099-M: extent-node shards=$SHARDS stride=$SHARD_STRIDE"
     fi
 
-    # Launch extent-node processes.
+    # F214-C/D: format each EN's data dirs BEFORE launching the EN
+    # binary. `autumn-op format` queries the manager's cluster_id,
+    # registers the node, and stamps the per-dir sentinel files; the
+    # EN binary refuses to start without them. The previous separate
+    # `register-node` post-launch loop and the `multidisk-1node`
+    # special case are both subsumed into this single per-node call.
     for (( i=1; i<=replicas; i++ )); do
+        format_extent_node "$i"
         launch_extent_node "$i"
     done
-
-    # register extent node(s) — skip for multidisk-1node (format already registered).
-    if [[ "${CLUSTER_MODE:-default}" != "multidisk-1node" ]]; then
-        for (( i=1; i<=replicas; i++ )); do
-            register_extent_node "$i"
-        done
-        echo "[cluster] extent node(s) registered"
-    else
-        echo "[cluster] extent node registered via format (multidisk-1node)"
-    fi
+    echo "[cluster] extent node(s) formatted + launched"
 
     if [[ -n "${AUTUMN_GROUP_COMMIT_CAP:-}" ]]; then
         echo "[cluster] AUTUMN_GROUP_COMMIT_CAP=$AUTUMN_GROUP_COMMIT_CAP (forwarding to PS)"
@@ -695,14 +671,16 @@ do_start_node() {
     if [[ -f "$pf" ]] && kill -0 "$(cat "$pf")" 2>/dev/null; then
         die "node$i already running (pid $(cat "$pf"))"
     fi
+    # F214-C: idempotent re-format. The dir's existing cluster_id /
+    # disk_uuid sentinel files match the manager → format reuses the
+    # existing disk_uuid and re-calls register-node. This is the safety
+    # net for "manager lost in-memory state (no etcd mode) after a
+    # restart" — the deposed manager's node table is gone, but format
+    # re-imprints it. With etcd, this call is a no-op aside from
+    # bumping the heartbeat timestamp.
+    format_extent_node "$i"
     launch_extent_node "$i"
-    if [[ "$MODE" != "multidisk-1node" ]]; then
-        # register-node is now idempotent on duplicate addr (manager
-        # rpc_handlers.rs handle_register_node) — safe to call on every
-        # restart so a manager that lost state re-learns the node.
-        register_extent_node "$i"
-        echo "[cluster] node$i registered"
-    fi
+    echo "[cluster] node$i formatted + launched"
 }
 
 do_stop_node() {
