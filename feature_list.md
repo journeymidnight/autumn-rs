@@ -2866,3 +2866,59 @@ Background: autumn-rs 当前节点死亡判定模型过于激进——心跳 10s
   - cargo test --release --bin autumn-client: 5 passing (data-plane bench helpers).
   - cargo build --workspace: clean.
 - **passes:** true
+
+## P8 — EN bootstrap / register-node / format-disk unification (F214)
+
+### F214 · Cluster identity + Suspend state + format-absorbs-register
+- **Trigger:** Three overlapping commands (`autumn-op format` / `autumn-op register-node` / `autumn-extent-node --disk-id`) for bringing an EN online, with three subtle bugs:
+  1. Two registration paths (format + register-node) doing the same `MSG_REGISTER_NODE` work, plus two disk-identity systems (UUID file vs integer `--disk-id N` flag) coexisting.
+  2. No cluster identity imprinted on disk — an EN whose `--data` points at a previously-formatted dir from a different cluster silently mounts; only fails opaquely at the manager.
+  3. 10-20 s "ghost EN" window after `register-node` where `disk.online=true` + `node_states=Online` were both seeded synchronously — extent allocation could target an EN whose binary had never started, wasting per-RPC timeouts.
+  Per user pushback during planning: don't overload `disk.online` to mean "EN never verified"; introduce a proper state machine with `Suspend` as the post-format state.
+- **Goal:** Ceph-mkfs-style model — one explicit per-disk preparation step, daemons refuse to start without it, cluster identity is verified end-to-end, and a registered-but-not-yet-running EN does not get traffic. Five sub-features:
+
+  **F214-A · cluster_id imprint in manager** (commit c460698):
+  - New etcd key `autumn-rs/cluster_id` holds a UUID written exactly once. First leader's `try_become_leader` CAS-creates via `create_revision==0` through `txn_fenced` (inherits F149 leader fence). Subsequent leaders re-CAS, observe `succeeded==false`, and read the existing value.
+  - `AutumnManager.cluster_id: Rc<RefCell<String>>`; `replay_from_etcd` loads via dedicated single-key get(); memory-only mode keeps the per-process UUID from `Self::new()`.
+  - New `MSG_GET_CLUSTER_ID` (0x45) + `GetClusterIdReq` / `GetClusterIdResp`. No leader gate (followers answer from replayed state).
+  - `handle_get_cluster_id` returns `CODE_ERROR` "manager not yet bootstrapped" when the UUID is missing — autumn-op retries.
+
+  **F214-B · Suspend state in node state machine** (commit c460698):
+  - `NodeAutoState` gains a third variant: `Suspend` (registered, never verified alive). Distinct from `Suspected` (was alive, now flaky) so the operator-facing health report tells "format ran but EN never started" apart from "EN was running and crashed".
+  - `on_register_first(node_id)` seeds Suspend without touching `last_ok`. `on_heartbeat_fail` and `tick()` never auto-promote Suspend→Suspected (Suspected requires a prior verified baseline).
+  - `handle_register_node` first-register branch swapped from `on_heartbeat_ok` → `on_register_first`. Re-register branch keeps `on_heartbeat_ok` (operator explicitly vouched).
+  - `select_nodes` takes `&HashSet<u64> online_node_ids` — captured via `node_states.borrow().online_node_ids()` before the store borrow. F121 cold-leader fallback preserved.
+  - Wire-stable `NODE_AUTO_STATE_SUSPEND=2`. `autumn-op info` shows "Suspend" via `auto_state_str`.
+  - EC dispatch loop's Suspected-window skip extends to Suspend too.
+
+  **F214-C · `autumn-op format` absorbs register-node** (commit c4f0d09):
+  - `format` queries `MSG_GET_CLUSTER_ID` before touching any disk; failure means the cluster hasn't been bootstrapped.
+  - `read_existing_format()` probes each dir for `cluster_id` + `disk_uuid` sentinel pair. Three cases: fresh → format_disk + register; match → idempotent (reuse disk_uuid, re-register); mismatch → refuse with both cluster_ids in the error.
+  - Marker files written per dir: `cluster_id`, `disk_uuid`, `node_id`, `disk_id`. cluster_id is the load-bearing sentinel.
+  - `register-node` subcommand removed; parser routes the legacy spelling to a migration stub that fires BEFORE `ClusterClient::connect` (matches F213's `op` stub pattern).
+  - `MSG_REGISTER_NODE` wire RPC unchanged.
+
+  **F214-D · extent-node verifies cluster_id + drops --disk-id** (commit c4f0d09):
+  - `--disk-id N` removed. Parser emits the same "feature removed" error as `--shards` (F196) and exits 2.
+  - `read_and_verify_cluster_id()` runs synchronously in `main()`'s prelude (before shard threads launch). Reads each `--data` dir's `cluster_id` file; refuses on missing / empty / inter-dir mismatch.
+  - `verify_manager_cluster_id()` runs once on shard 0 (or `run_single_shard`'s), connects to manager via `autumn-client::ClusterClient`, fetches its cluster_id, refuses on mismatch.
+  - `ExtentNodeConfig` construction collapses to a single `new_multi(data_dirs)` path; the `disk_id`-conditional `new()` branch is gone (library constructor preserved for unit tests).
+
+  **F214-E · cluster.sh format-then-launch unification** (commit ec8ca6d):
+  - `launch_extent_node` drops `--disk-id`. Single-disk and multi-disk paths uniform.
+  - `register_extent_node` → `format_extent_node`, calling `autumn-op format --listen :PORT --advertise HOST:PORT <DIRS>`.
+  - `do_start` sequence: manager → (per EN: format → launch) → bootstrap → PS. Multidisk-1node special case removed (MODE label kept as a disk-args path selector).
+  - `do_start_node` recovery test path: format BEFORE launch, idempotent for matching cluster_id.
+
+- **Architectural rule:** Cluster identity is the single source of truth for "which cluster does this disk belong to". An EN refuses to serve a disk whose stamped `cluster_id` doesn't match the manager's. `disk.online` keeps a single clean meaning (per-disk health from EN df) — the node-level state machine handles "is this node verified alive at all".
+
+- **Acceptance:**
+  - `cluster.sh reset 1` works end-to-end: format stamps sentinel files, EN launches, bootstrap succeeds, put/get roundtrips, `autumn-op list-nodes` shows Online (after first df).
+  - Sentinel files written: `cluster_id`, `disk_uuid`, `node_id`, `disk_id` in every formatted dir.
+  - `autumn-extent-node --disk-id 5` exits 2 with migration message.
+  - `autumn-extent-node --data /tmp/empty-dir` refuses with "not formatted; run autumn-op format ... first".
+  - `autumn-op register-node ...` prints migration stub + exits 1 BEFORE connecting to manager.
+  - `cargo build --workspace` clean.
+  - 108/108 manager lib tests pass (4 new for Suspend semantics); 8/8 autumn-op tests pass.
+
+- **passes:** true

@@ -1,78 +1,111 @@
 Date: 2026-05-18
 TaskStatus: completed
-Task scope: F213 — migrate all cluster/partition op subcommands from
-            autumn-client to autumn-op (sibling-binary pattern).
+Task scope: F214 — unify EN bootstrap / register-node / format-disk
+            (cluster_id imprint + Suspend node state machine +
+            format-absorbs-register).
 
 Summary:
-  autumn-op (F211-G companion CLI) is now the canonical interface to
-  the manager control plane. autumn-client is data-plane only (put /
-  get / ls / wbench / rbench / perf-check). The Python policy script
-  already shells out to autumn-op exclusively; no Python-side change
-  needed beyond making `auto-reissue --dry-run=false` actually
-  reissue via `_op()` instead of printing an advisory.
+  Replaces the pre-F214 fork between `autumn-op format` / `autumn-op
+  register-node` / `autumn-extent-node --disk-id` with a single
+  Ceph-mkfs-style flow: manager imprints a cluster_id on first
+  leader-promotion → `autumn-op format` queries it and stamps each
+  formatted dir → `autumn-extent-node` refuses to start without the
+  sentinel files and cross-checks the stamped cluster_id against
+  the manager.
 
-  12 subcommands moved to autumn-op:
-    Read:   info / policy-candidates
-    Admin:  bootstrap / set-stream-ec / force-ec-convert / split /
-            merge / compact / gc / forcegc / register-node / format
-
-  autumn-client autumn-client.rs went from 3081 to ~1660 lines.
+  Per user pushback during planning, the post-format node state is
+  a proper state machine variant (`NodeAutoState::Suspend`) rather
+  than overloading `disk.online=false`. `select_nodes` gates fresh
+  extent allocation on `Online` state — Suspend nodes don't get
+  traffic until the manager's 10 s `disk_status_update_loop` verifies
+  them via df.
 
 5 commits landed on main:
-  F213-1 (feb7d97)  add 12 op subcommands to autumn-op (+1916/-70)
-                    + 6 helpers + 8 unit tests
-  F213-2 (d18e2d6)  cluster.sh + node_policy.py switch to autumn-op
-                    (+34/-13). cluster.sh now has AO=$BIN/autumn-op
-                    next to AC; 4 invocations migrated; node_policy
-                    auto_reissue now drives the reissue itself.
-  F213-3 (8e3113c)  autumn-client deletes 12 op subcommands + adds
-                    `op` stub (+56/-1439). The stub fires BEFORE
-                    ClusterClient::connect so it doesn't wait on a
-                    manager. Greppable invariant established:
-                      grep -cE 'mgr_call\(MSG_' \
-                        crates/server/src/bin/autumn_client.rs
-                    must be 0 going forward.
-  F213-4 (919bbf2)  docs sync (+123/-99): README, crates/server +
-                    manager + partition-server + stream CLAUDE.md
-                    and src comments, etcd test comment, F183 merge
-                    design + plan doc.
-  F213-5 (this)     feature_list.md F213 entry under new P7 heading
-                    + this progress file.
+  F214-A/B (c460698)  manager cluster_id imprint via etcd CAS +
+                      NodeAutoState::Suspend variant + select_nodes
+                      gates on Online state. Wire-stable
+                      NODE_AUTO_STATE_SUSPEND=2, autumn-op info shows
+                      "Suspend". 12/12 node_state tests pass; 108/108
+                      manager lib tests pass.
+  F214-C/D (c4f0d09)  autumn-op format absorbs register-node (queries
+                      MSG_GET_CLUSTER_ID, refuses on cluster_id
+                      mismatch, idempotent on match). autumn-extent-node
+                      reads cluster_id from every --data dir + cross-
+                      checks via MSG_GET_CLUSTER_ID before binding the
+                      listener. `--disk-id N` removed; `register-node`
+                      subcommand routes legacy invocations to a print-
+                      and-exit migration stub that fires BEFORE
+                      ClusterClient::connect.
+  F214-E (ec8ca6d)    cluster.sh format-then-launch unification —
+                      register_extent_node → format_extent_node;
+                      single-disk and multi-disk paths uniform;
+                      multidisk-1node format special case removed.
+  F214-F (this)       docs sync — feature_list.md F214 entry under
+                      new P8 heading; crates/manager/CLAUDE.md note 24
+                      with full F214 design rationale; crates/server/
+                      CLAUDE.md startup ordering rewritten; README
+                      1-node + 3-node walkthrough + Add-a-new-EN
+                      section updated to F214 format flow.
 
-Acceptance verified:
-  $ cargo build --release --workspace           # clean (pre-existing warnings only)
-  $ cargo test --release --bin autumn-op        # 8/8 pass
-  $ cargo test --release --bin autumn-client    # 5/5 pass
-  $ ./target/release/autumn-op --help           # 3-section usage prints
-  $ ./target/release/autumn-client op           # hint prints, exit 1
-  $ ./target/release/autumn-client op split 7   # hint + "did you mean autumn-op split 7"
-  $ grep -cE 'mgr_call\(MSG_' \
-      crates/server/src/bin/autumn_client.rs    # 0
+Acceptance verified (end-to-end smoke):
+  $ ./cluster.sh reset 1
+    - manager up
+    - autumn-op format → "formatted /tmp/autumn-rs/d1:
+                          disk_uuid=ca86cb2f-...
+                          node registered: node_id=1,
+                          cluster_id=dfd70fa3-..."
+    - EN launches, opens listener on :9101
+    - bootstrap → "partition 0 created"
+  $ echo "hello F214" | autumn-client put mykey /dev/stdin
+    - ok
+  $ autumn-client get mykey
+    - hello F214
+  $ autumn-op list-nodes
+    - "Online" (after first df sweep)
+  $ ls /tmp/autumn-rs/d1/cluster_id disk_uuid node_id disk_id
+    - all 4 sentinel files present
+  $ autumn-op register-node --addr foo --disk bar
+    - prints migration stub, exits 1, BEFORE manager connect
+  $ autumn-extent-node --disk-id 5
+    - exits 2 with "feature removed; run autumn-op format first"
+  $ autumn-extent-node --data /tmp/empty-dir
+    - exits with "not formatted; run autumn-op format ... first"
+  $ cargo build --workspace
+    - clean (pre-existing warnings only)
+  $ cargo test -p autumn-manager --lib
+    - 108/108 pass
+  $ cargo test --bin autumn-op
+    - 8/8 pass
 
 Behaviour notes / forward-looking rule:
-  - autumn-client must not regrow `mgr_call(MSG_*)` for admin RPCs.
-    Encoded in crates/server/CLAUDE.md ("Architectural rule" para)
-    and in the F213 feature_list entry as a greppable invariant.
-  - If future autumn-client needs op data, route through autumn-op
-    (separate proposal — do NOT add direct manager calls or extract
-    a shared lib without explicit discussion).
-  - autumn-client's `op` stub does NOT subprocess-fork autumn-op.
-    Print-and-exit is sufficient and matches HDFS dfs+dfsadmin
-    convention.
-  - autumn-op's new commands all accept --json; bootstrap / format /
-    register-node previously had only println output, now offer
-    structured JSON for Python automation.
-  - cluster.sh runs autumn-op WITHOUT --transport (manager link is
-    pure TCP; data-plane transport flag was autumn-client-only).
+  - cluster_id is the single source of truth for "which cluster does
+    this disk belong to". A future operator misconfiguration (point
+    EN at wrong manager) is now caught at startup with both UUIDs
+    in the error.
+  - Suspend → Online transition takes 10-20 s (one disk_status_update_loop
+    cycle + soft-timeout debounce). Bootstrap's cold-leader fallback
+    in select_nodes preserves the existing "no df sweep yet" path.
+  - Re-running `autumn-op format` against a dir with matching
+    cluster_id is idempotent — reuses the stored disk_uuid so the
+    manager's re-register branch returns the same disk_id. This is
+    the safety net for "manager lost in-memory state in no-etcd mode"
+    in do_start_node's restart path.
+  - autumn-stream-cli's `register-node` subcommand was NOT touched
+    (low-level debugging CLI; the MSG_REGISTER_NODE wire RPC stays).
+  - The pre-existing autumn-stream test compile errors
+    (`WriteShardReq.revision` missing — from F211-D landing) are
+    UNRELATED to F214 and pre-date this PR.
 
 Open items (acceptable follow-ups, not blockers for ship):
-  1. The `Put { nosync: bool }` field in autumn-client's Command enum
-     is now read-only (warning). Pre-existing dead code from F178 —
-     unrelated to F213. Can be cleaned in a separate sweep.
-  2. The `parse_positive_usize_flag` helper in autumn-client is
-     pre-existing dead code (warning). Same as above.
-  3. No e2e test currently verifies autumn-op bootstrap → put → get
-     round-trip; cluster.sh smoke is the manual gate. An integration
-     test under crates/manager/tests would be a nice addition.
+  1. autumn-stream integration tests under crates/stream/tests
+     still don't compile (F211-D legacy). Separate cleanup PR.
+  2. autumn-client README table still lists pre-F213 commands
+     (bootstrap / split / compact / gc / forcegc / format / info).
+     These are stale documentation from before the F213 split; the
+     binary's actual `op` stub handles them. Out of F214 scope.
+  3. README autumn-stream-cli table still lists `register-node`. It
+     works (low-level wire RPC); intentionally kept for stream-layer
+     debugging.
 
-Previous task (completed): F211 series + F212 region_epoch fixes.
+Previous task (completed): F213 — autumn-op split (data-plane vs
+op-plane sibling binaries).

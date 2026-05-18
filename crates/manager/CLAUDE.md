@@ -1131,3 +1131,96 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     ledger — F211-F's auto-abandon writes through the same release
     primitive `commit_extent_inflight_release` after the atomic
     delete + advisory put).
+
+24. **F214 cluster identity + Suspend state (2026-05-18).**
+    Unifies the pre-F214 split of `autumn-op format` / `autumn-op
+    register-node` / `autumn-extent-node --disk-id` into a single
+    explicit per-disk preparation step plus a proper node-level
+    state machine.
+
+    **Cluster identity (`CLUSTER_ID_KEY`, F214-A).** Manager
+    CAS-imprints `autumn-rs/cluster_id = <UUID>` exactly once on
+    first leader-promotion through `try_become_leader` →
+    `imprint_cluster_id`. Subsequent leaders re-CAS, observe
+    `succeeded == false`, and re-read. `replay_from_etcd` installs
+    the value on every leader-promotion. Memory-only mode (no etcd)
+    keeps the per-process UUID from `Self::new()` so dev/test
+    flows still work end-to-end. New RPC `MSG_GET_CLUSTER_ID = 0x45`
+    exposes the value — no leader gate (followers answer from
+    replayed state); the only failure mode is "manager never
+    bootstrapped" which returns `CODE_ERROR`.
+
+    **`autumn-op format` (F214-C) is the single per-EN entry point.**
+    Calls `MSG_GET_CLUSTER_ID`, allocates a `disk_uuid` per dir,
+    fires `MSG_REGISTER_NODE`, then writes `cluster_id` +
+    `disk_uuid` + `node_id` + `disk_id` sentinel files in each dir.
+    Idempotent: re-running against a dir whose `cluster_id` matches
+    the manager reuses the stored `disk_uuid` so the manager's
+    re-register branch returns the same `disk_id`. Mismatched
+    cluster_id → refuse with both UUIDs in the error message.
+    The standalone `register-node` CLI subcommand is gone — replaced
+    by a print-and-exit migration stub that fires BEFORE
+    `ClusterClient::connect` (matches the F213 `autumn-client op`
+    pattern).
+
+    **EN startup verification (F214-D).** `autumn-extent-node`
+    runs two pre-flight checks before the listener binds:
+    (a) `read_and_verify_cluster_id` — sync, in main() prelude.
+        Reads each `--data` dir's `cluster_id` file; refuses on
+        missing / empty / inter-dir disagreement. Shard threads
+        never start against a misconfigured dir set.
+    (b) `verify_manager_cluster_id` — async, runs on shard 0's
+        compio runtime (or `run_single_shard`'s). One `MSG_GET_CLUSTER_ID`
+        round-trip; refuses on mismatch. Caught the "wrong manager"
+        misconfiguration that (a) alone cannot see.
+    The pre-F214 `--disk-id N` CLI bypass was removed; same
+    "feature removed; run `autumn-op format` first" error pattern
+    as `--shards` (F196).
+
+    **Suspend node state (F214-B).** `NodeAutoState` extends from
+    `{Online, Suspected}` to `{Online, Suspected, Suspend}`. The
+    new variant is the initial state for any node freshly added
+    via `handle_register_node`'s first-register branch (line ~407)
+    — `on_register_first(node_id)` seeds Suspend without touching
+    `last_ok`. Transitions:
+    - **Suspend → Online**: on first successful `df` heartbeat
+      from `disk_status_update_loop`. The 10 s sweep cadence means
+      a Suspend node typically reaches Online within 10-20 s of
+      `MSG_REGISTER_NODE`.
+    - **Suspend → Suspected**: NEVER. `on_heartbeat_fail` and
+      `tick()` both no-op on Suspend; Suspected requires a prior
+      verified-alive baseline (it means "was alive, now flaky").
+    - **Suspend → Online**: also via operator re-register
+      (`handle_register_node` re-register branch keeps the
+      pre-F214 `on_heartbeat_ok` call — operator explicit vouches).
+    - **Online ↔ Suspected**: unchanged from F211-A.
+
+    **`select_nodes` gates on Online (F214-B).** The function takes
+    a new `&HashSet<u64> online_node_ids` parameter. Each caller
+    (`handle_create_stream`, `handle_stream_alloc_extent`,
+    `handle_multi_modify_merge`) captures the set via
+    `self.node_states.borrow().online_node_ids()` BEFORE the
+    `store.inner.borrow_mut()` (the two RefCells are disjoint so
+    holding the snapshot doesn't conflict with the borrow).
+    F121's cold-leader fallback is preserved: when too few Online
+    nodes exist (e.g. fresh cluster where no df sweep has run yet),
+    the pool widens to the full set — the post-RPC walk in
+    `handle_stream_alloc_extent` still recovers via per-RPC
+    fallback. The EC dispatch loop's Suspected-window skip
+    (`recovery.rs::ec_conversion_dispatch_loop`) extends to Suspend
+    too — a never-verified coord is even less appropriate for
+    shard fanout than a flaky one.
+
+    **Why this beats the original `disk.online=false` proposal.**
+    `disk.online` keeps one clean meaning (per-disk health from EN
+    df), and the state machine becomes the primary control-plane
+    abstraction. `select_nodes` ANDs both filters — Online node
+    AND online disk. Operators looking at `autumn-op info` see
+    `Suspend` as distinct from `Suspected` (`auto_state_str` was
+    extended). `NODE_AUTO_STATE_SUSPEND = 2` is wire-stable; new
+    variants append-only.
+
+    Cross-reference: notes 7 (F121 `disk.online` filter — Suspend
+    rides on top), 15 (F149 `txn_fenced` — F214-A cluster_id CAS
+    inherits the leader fence), 23 (F211 NodeStateTracker — F214-B
+    extends the same struct with the third variant).

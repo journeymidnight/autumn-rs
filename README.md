@@ -610,14 +610,17 @@ sleep 0.5
 $MANAGER --port 9001 --etcd 127.0.0.1:2379 &
 sleep 0.5
 
-# Step 3 — extent node: data plane (stores raw extent files on disk)
-$NODE --port 9101 --disk-id 1 --data /tmp/d1 --manager 127.0.0.1:9001 &
-sleep 0.5
+# Step 3 — F214: format the data dir BEFORE launching the EN. Format
+# fetches the manager's cluster_id, allocates a disk_uuid, calls
+# MSG_REGISTER_NODE, and stamps cluster_id/disk_uuid/node_id/disk_id
+# sentinel files in /tmp/d1. The EN refuses to start without these.
+$AO format --listen :9101 --advertise 127.0.0.1:9101 /tmp/d1
 
-# Step 4 — register the extent node with the manager
-#   Without this, the manager does not know the node exists and cannot
-#   assign extents to it.
-$SC register-node --addr 127.0.0.1:9101 --disk disk-1
+# Step 4 — extent node: data plane (stores raw extent files on disk).
+# Reads cluster_id + disk_id from /tmp/d1, cross-checks cluster_id
+# against the manager before binding the listener.
+$NODE --port 9101 --data /tmp/d1 --manager 127.0.0.1:9001 &
+sleep 0.5
 
 # Step 5 — partition server: KV API layer
 #   Starts up, registers itself with the manager (RegisterPs),
@@ -681,14 +684,17 @@ sleep 0.5
 $MANAGER --port 9001 --etcd 127.0.0.1:2379 &
 sleep 0.5
 
-$NODE --port 9101 --disk-id 1 --data /tmp/d1 --manager 127.0.0.1:9001 &
-$NODE --port 9102 --disk-id 2 --data /tmp/d2 --manager 127.0.0.1:9001 &
-$NODE --port 9103 --disk-id 3 --data /tmp/d3 --manager 127.0.0.1:9001 &
-sleep 0.5
+# F214: format each dir BEFORE launching the EN. Each format call
+# fetches cluster_id, allocates the disk_uuid, registers the node,
+# and stamps the per-dir sentinel files.
+$AO format --listen :9101 --advertise 127.0.0.1:9101 /tmp/d1
+$AO format --listen :9102 --advertise 127.0.0.1:9102 /tmp/d2
+$AO format --listen :9103 --advertise 127.0.0.1:9103 /tmp/d3
 
-$SC register-node --addr 127.0.0.1:9101 --disk disk-1
-$SC register-node --addr 127.0.0.1:9102 --disk disk-2
-$SC register-node --addr 127.0.0.1:9103 --disk disk-3
+$NODE --port 9101 --data /tmp/d1 --manager 127.0.0.1:9001 &
+$NODE --port 9102 --data /tmp/d2 --manager 127.0.0.1:9001 &
+$NODE --port 9103 --data /tmp/d3 --manager 127.0.0.1:9001 &
+sleep 0.5
 
 $PS --psid 1 --port 9201 --manager 127.0.0.1:9001 \
     --data /tmp/autumn-ps --advertise 127.0.0.1:9201 &
@@ -769,7 +775,12 @@ Key flags:
 ```
 autumn-manager-server --port 9001 --etcd 127.0.0.1:2379
 
-autumn-extent-node --port 9101 --disk-id 1 --data /tmp/d1 --manager 127.0.0.1:9001
+# F214: format the dir BEFORE launching the EN. autumn-extent-node
+# reads cluster_id + disk_id from sentinel files in /tmp/d1 and
+# refuses to start if they're missing.
+autumn-op --manager 127.0.0.1:9001 format \
+          --listen :9101 --advertise 127.0.0.1:9101 /tmp/d1
+autumn-extent-node --port 9101 --data /tmp/d1 --manager 127.0.0.1:9001
 
 autumn-ps --psid 1 --port 9201 --manager 127.0.0.1:9001 \
           --data /tmp/ps-wal --advertise 127.0.0.1:9201
@@ -1199,15 +1210,13 @@ AC=./target/debug/autumn-client   # data plane
 AO=./target/debug/autumn-op       # op plane (F213)
 NODE=./target/debug/autumn-extent-node
 
-# Format the disk and register the node with the manager
-$AO format --listen 127.0.0.1:9104 --advertise 127.0.0.1:9104 /tmp/d4
-# Prints: node_id=N, disk_id=M, writes /tmp/d4/node_id and /tmp/d4/disk_id
+# Format the disk and register the node with the manager. F214: writes
+# cluster_id / disk_uuid / node_id / disk_id sentinel files in /tmp/d4.
+$AO format --listen :9104 --advertise 127.0.0.1:9104 /tmp/d4
 
-# Start the extent node
-$NODE --port 9104 \
-      --disk-id $(cat /tmp/d4/disk_id) \
-      --data /tmp/d4 \
-      --manager 127.0.0.1:9001
+# Start the extent node. It reads the sentinel files on startup and
+# cross-checks the stamped cluster_id against the manager (F214-D).
+$NODE --port 9104 --data /tmp/d4 --manager 127.0.0.1:9001
 ```
 
 ### F206 — post-EC `avali` regression check (2026-05-15)

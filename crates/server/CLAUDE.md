@@ -24,13 +24,15 @@ autumn-manager-server [--port 9001] [--etcd 127.0.0.1:2379,...]
 **Default port**: 9101
 
 ```
-autumn-extent-node --data /path/to/data [--port 9101] [--disk-id <UUID>] [--manager 127.0.0.1:9001]
+autumn-extent-node --data /path/to/data [,/path/to/data2,...] [--port 9101] [--manager 127.0.0.1:9001]
 ```
 
-- `--data`: directory where extent files are stored (`extent-{id}.dat` + `extent-{id}.meta`)
-- `--disk-id`: identifies this disk to the manager (used for replica placement); auto-generated UUID if not provided
-- `--manager`: manager address for self-registration (`RegisterNode`) and for fetching ExtentInfo during recovery/re-avali
-- On startup: registers itself with the manager, then serves `ExtentService` gRPC
+- `--data`: directory where extent files are stored (`extent-{id}.dat` + `extent-{id}.meta`). Comma-separated or repeated `--data` flags for multi-disk EN.
+- `--manager`: manager address. F214-D: also used at startup for the cluster_id cross-check.
+- **F214-D startup requirements:** each `--data` dir MUST be pre-formatted via `autumn-op format` — the EN refuses to start without the `cluster_id` + `disk_id` sentinel files. Pre-flight checks:
+  1. `read_and_verify_cluster_id` (sync, before shard threads): reads `cluster_id` file from each dir, verifies they all agree.
+  2. `verify_manager_cluster_id` (async, shard 0 only): fetches the manager's `cluster_id` via `MSG_GET_CLUSTER_ID` and refuses on mismatch.
+- The pre-F214 `--disk-id N` flag was removed; the EN reads disk_id from each dir's `disk_id` sentinel file.
 
 ### `autumn-ps` (`src/bin/partition_server.rs`)
 
@@ -88,7 +90,9 @@ autumn-op [--manager 127.0.0.1:9001] [--json] <COMMAND>
 |----------|----------|
 | Read / observability | `list-nodes`, `extent-health [--node N] [--all]`, `list-ec-markers`, `recovery-stats`, `audit-log [--op N --node N --since/--until --limit L]`, `info [--part PID] [--detail]`, `policy-candidates` |
 | Node lifecycle (F211) | `fence-node <id> --reason ... --by ... [--force]`, `maintenance <id> --reason ... --by ... [--expire UNIX_TS]`, `unfence <id> --by ...`, `remove <id> --by ...` |
-| Cluster / partition admin (F213) | `bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal\|N:hexstring]`, `set-stream-ec --stream <ID> --ec K+M`, `force-ec-convert --extent <EXTID>`, `split <PARTID>`, `merge <SURVIVOR_PARTID> <VICTIM_PARTID>`, `compact <PARTID>`, `gc [--ratio R --max-size B --stream-debt B --empty-only] <PARTID>`, `forcegc <PARTID> <EXTID>...`, `register-node --addr <ADDR> --disk <UUID> [--shard-ports P1,P2,...] [--control-address <ADDR>]`, `format --listen <ADDR> --advertise <ADDR> <DIR>...` |
+| Cluster / partition admin (F213 + F214) | `bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal\|N:hexstring]`, `set-stream-ec --stream <ID> --ec K+M`, `force-ec-convert --extent <EXTID>`, `split <PARTID>`, `merge <SURVIVOR_PARTID> <VICTIM_PARTID>`, `compact <PARTID>`, `gc [--ratio R --max-size B --stream-debt B --empty-only] <PARTID>`, `forcegc <PARTID> <EXTID>...`, `format --listen <ADDR> --advertise <ADDR> <DIR>...` |
+
+**F214-C**: `register-node` subcommand removed; merged into `format`. The legacy spelling routes to a migration stub that prints + exits 1 BEFORE connecting to the manager. `MSG_REGISTER_NODE` wire RPC unchanged — `format` calls it internally.
 
 All commands accept `--json` for Python policy consumption. The JSON schema for `info` mirrors the F205 layout (top-level `nodes / extents / streams / partitions` arrays); legacy `jq` filters and `python3 -c "import json; ..."` snippets in the README continue to work.
 
@@ -130,18 +134,23 @@ repair-metastream --manager 127.0.0.1:9001 --meta-stream <ID> \
 
 ## Startup Ordering
 
-For a fresh cluster:
-1. Start `autumn-extent-node` instances (at least as many as `data_shard + parity_shard`)
-2. Start `autumn-manager-server`
-3. Run `autumn-op bootstrap` to create streams and initial partition
-4. Start `autumn-ps` with a unique `--psid`
+For a fresh cluster (F214):
+1. Start `autumn-manager-server` first — it CAS-imprints the cluster_id on first leader-promotion.
+2. For each EN: run `autumn-op format --advertise HOST:PORT <DIR>...` BEFORE launching `autumn-extent-node`. `format` fetches the cluster_id, allocates disk_uuid(s), calls `MSG_REGISTER_NODE`, and stamps the per-dir sentinel files (`cluster_id`, `disk_uuid`, `node_id`, `disk_id`).
+3. Launch `autumn-extent-node` for each formatted EN. It refuses to start without the sentinel files; on startup it cross-checks the stamped cluster_id against the manager's.
+4. Run `autumn-op bootstrap` to create streams and initial partition.
+5. Start `autumn-ps` with a unique `--psid`.
+
+Newly-registered nodes start in `NodeAutoState::Suspend`. The manager's 10-s `disk_status_update_loop` flips them to `Online` on the first successful `df` response. `select_nodes` gates allocation on `Online` state but falls back to the full node set when none are Online (cold-leader / fresh-bootstrap path).
 
 ## Common CLI Patterns
 
 ```bash
 # Start a minimal 1-node cluster (no replication, testing only)
-autumn-extent-node --data /tmp/extent0 --port 9101 --manager 127.0.0.1:9001 &
 autumn-manager-server --port 9001 &
+autumn-op --manager 127.0.0.1:9001 format \
+    --listen :9101 --advertise 127.0.0.1:9101 /tmp/extent0
+autumn-extent-node --data /tmp/extent0 --port 9101 --manager 127.0.0.1:9001 &
 autumn-op --manager 127.0.0.1:9001 bootstrap --replication 1+0
 autumn-ps --psid 1 --port 9201 --manager 127.0.0.1:9001 --data /tmp/ps1 &
 
