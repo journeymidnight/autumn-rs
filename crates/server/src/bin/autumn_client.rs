@@ -1,7 +1,6 @@
 #[cfg(unix)]
 extern crate libc;
 
-use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,51 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use autumn_client::{ClusterClient, parse_addr, decode_err, DEFAULT_RPC_TIMEOUT};
+use autumn_client::{ClusterClient, parse_addr};
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
-use autumn_rpc::partition_rpc::{
-    PutReq, GetReq, MSG_PUT, MSG_GET,
-    GetDiscardsReq, GetDiscardsResp, MSG_GET_DISCARDS,
-};
-use bytes::Bytes;
+use autumn_rpc::partition_rpc::{PutReq, GetReq, MSG_PUT, MSG_GET};
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// Hex presplit algorithm
-// ---------------------------------------------------------------------------
-
-fn hex_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
-    if n <= 1 {
-        return vec![(vec![], vec![])];
-    }
-    let start: u64 = 0x00000000;
-    let end: u64 = 0xFFFFFFFF;
-    let size = (end - start) / n as u64;
-
-    let mut split_points: Vec<Vec<u8>> = Vec::new();
-    for i in 1..n {
-        let point = start + size * i as u64;
-        let hex_str = format!("{:08x}", point);
-        split_points.push(hex_str.into_bytes());
-    }
-
-    let mut ranges = Vec::new();
-    for i in 0..n {
-        let start_key = if i == 0 {
-            vec![]
-        } else {
-            split_points[i - 1].clone()
-        };
-        let end_key = if i == n - 1 {
-            vec![]
-        } else {
-            split_points[i].clone()
-        };
-        ranges.push((start_key, end_key));
-    }
-    ranges
-}
+// (F213: hex_split_ranges moved to autumn_op.rs along with `bootstrap`.)
 
 /// F099-N-c — generate a bench key guaranteed to lie in the partition
 /// identified by `start_key`. Returns an ASCII string so it remains
@@ -86,25 +47,11 @@ fn key_for_partition(start_key: &[u8], tag: &str, tid: usize, seq: u64) -> Strin
 // ---------------------------------------------------------------------------
 
 enum Command {
-    Bootstrap {
-        replication: String,
-        presplit: String,
-        /// parsed `--log-ec K+M`; None = use same replicates as meta_stream, no EC
-        log_ec: Option<(u32, u32)>,
-        /// parsed `--row-ec K+M`; None = use same replicates as meta_stream, no EC
-        row_ec: Option<(u32, u32)>,
-    },
-    SetStreamEc {
-        stream_id: u64,
-        ec_data: u32,
-        ec_parity: u32,
-    },
-    /// F203: per-extent EC convert trigger. OP runs this after reading
-    /// `client policy` to act on a specific `POLICY_KIND_EC` advisory.
-    /// The manager persists a marker; the next ec dispatch tick (~5s)
-    /// drives the conversion.
-    ForceEcConvert {
-        extent_id: u64,
+    /// F213: stub that points to `autumn-op` (all op subcommands moved).
+    /// `args` carries everything after the literal `op` token so we can
+    /// suggest the equivalent autumn-op invocation.
+    OpStub {
+        args: Vec<String>,
     },
     Put {
         key: String,
@@ -141,53 +88,6 @@ enum Command {
         start: String,
         limit: u32,
     },
-    Split {
-        part_id: u64,
-    },
-    /// F183: merge two adjacent partitions on the same PS.
-    /// Survivor keeps its part_id; victim is deleted.
-    Merge {
-        survivor_part_id: u64,
-        victim_part_id: u64,
-    },
-    /// F183: show advisory split/merge candidates from the manager's
-    /// policy engine.
-    PolicyCandidates,
-    Compact {
-        part_id: u64,
-    },
-    Gc {
-        part_id: u64,
-        /// F201: discard-ratio threshold; None = use PS default (0.4).
-        ratio: Option<f64>,
-        /// F201: only consider sealed extents at most this many bytes.
-        max_size: Option<u64>,
-        /// F201: when partition's total reclaimable bytes exceed this,
-        /// PS halves the per-extent ratio for this dispatch.
-        stream_debt: Option<u64>,
-        /// F201: only pick `sealed_length == 0` non-tail extents.
-        empty_only: bool,
-    },
-    ForceGc {
-        part_id: u64,
-        extent_ids: Vec<u64>,
-    },
-    RegisterNode {
-        addr: String,
-        disks: Vec<String>,
-        /// F099-M: per-shard listener ports on the extent-node process.
-        /// Empty = legacy single-thread extent-node (client routes all
-        /// extents to `addr`).
-        shard_ports: Vec<u16>,
-        /// F191: control-plane listener address. Empty = manager falls
-        /// back to `addr` for DF (legacy behaviour).
-        control_address: String,
-    },
-    Format {
-        listen: String,
-        advertise: String,
-        dirs: Vec<String>,
-    },
     WBench {
         threads: usize,
         duration_secs: u64,
@@ -215,14 +115,6 @@ enum Command {
         /// F195: was env `AUTUMN_GROUP_COMMIT_CAP`; recorded in baseline.
         group_commit_cap: Option<usize>,
     },
-    Info {
-        json: bool,
-        part: Option<u64>,
-        /// F203: print PartitionLoad detail (F202 fields) for `part`.
-        /// Requires `--part PID`. Reads from the manager's cached
-        /// `MSG_GET_PARTITION_DETAIL`, not from the PS directly.
-        detail: bool,
-    },
 }
 
 struct Args {
@@ -234,12 +126,7 @@ struct Args {
 fn usage() -> ! {
     eprintln!("Usage: autumn-client --manager <ADDR> <COMMAND>");
     eprintln!();
-    eprintln!("Commands:");
-    eprintln!("  bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal|N:hexstring]");
-    eprintln!("                                    Create initial partition(s) and streams");
-    eprintln!("  set-stream-ec --stream <ID> --ec K+M");
-    eprintln!("                                    Change EC policy of an existing stream (FOPS-03)");
-    eprintln!("  force-ec-convert --extent <EXTID> (F203: per-extent EC trigger)");
+    eprintln!("Data-plane commands (KV + bench):");
     eprintln!("  put <KEY> <FILE>                  Put key with value from file");
     eprintln!("  put-stream [--chunk-size N] <KEY> <FILE-or->>");
     eprintln!("                                    Chunked stream put (default 4 MiB chunks; F186)");
@@ -249,25 +136,17 @@ fn usage() -> ! {
     eprintln!("  del <KEY>                         Delete key");
     eprintln!("  head <KEY>                        Get key metadata (size)");
     eprintln!("  ls [--prefix P] [--start S] [--limit N]  List keys");
-    eprintln!("  split <PARTID>                    Split partition");
-    eprintln!("  merge <SURVIVOR_PARTID> <VICTIM_PARTID>");
-    eprintln!("                                    Merge two adjacent partitions on the same PS (F183)");
-    eprintln!("  policy                            Show advisory split/merge candidates from the manager (F183)");
-    eprintln!("  compact <PARTID>                  Trigger major compaction");
-    eprintln!("  gc [--ratio R] [--max-size B] [--stream-debt B] [--empty-only] <PARTID>");
-    eprintln!("                                    Trigger auto GC (F201: optional multi-tier filters)");
-    eprintln!("  forcegc <PARTID> <EXTID>...       Force GC specific extents");
-    eprintln!("  register-node --addr <ADDR> --disk <UUID> [--disk <UUID>...] [--shard-ports P1,P2,...] [--control-address <ADDR>]");
-    eprintln!("                                    Register an already-formatted extent node with the manager");
-    eprintln!("  format --listen <ADDR> --advertise <ADDR> <DIR>...");
-    eprintln!("                                    Format disks and register node");
     eprintln!("  wbench [--threads 4] [--duration 10] [--size 8192] [--report-interval 1] [--part-id ID] [--reuse-value true|false]");
     eprintln!("                                    Write benchmark (always durable; F178 removed --nosync)");
     eprintln!("  rbench [--threads 40] [--duration 10] <RESULT_FILE>");
     eprintln!("                                    Read benchmark");
     eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K]");
     eprintln!("                                    Quick write+read bench; warns if >threshold regression vs baseline");
-    eprintln!("  info [--json] [--part PID] [--detail]  Show cluster info (F203 --detail: PartitionLoad snapshot)");
+    eprintln!();
+    eprintln!("Operator / admin commands moved to `autumn-op` (F213):");
+    eprintln!("  bootstrap, set-stream-ec, force-ec-convert, split, merge,");
+    eprintln!("  compact, gc, forcegc, register-node, format, info, policy-candidates");
+    eprintln!("  Run `autumn-op --help` for the full list.");
     std::process::exit(1);
 }
 
@@ -306,78 +185,22 @@ fn parse_args() -> Args {
     i += 1;
 
     let command = match subcmd {
-        "bootstrap" => {
-            let mut replication = String::from("3+0");
-            let mut presplit = String::from("1:normal");
-            let mut log_ec: Option<(u32, u32)> = None;
-            let mut row_ec: Option<(u32, u32)> = None;
-            while i < raw.len() {
-                match raw[i].as_str() {
-                    "--replication" => {
-                        i += 1;
-                        replication = raw[i].clone();
-                    }
-                    "--presplit" => {
-                        i += 1;
-                        presplit = raw[i].clone();
-                    }
-                    "--log-ec" => {
-                        i += 1;
-                        log_ec = Some(parse_ec_flag(&raw[i]).unwrap_or_else(|e| {
-                            eprintln!("--log-ec: {e}");
-                            std::process::exit(1);
-                        }));
-                    }
-                    "--row-ec" => {
-                        i += 1;
-                        row_ec = Some(parse_ec_flag(&raw[i]).unwrap_or_else(|e| {
-                            eprintln!("--row-ec: {e}");
-                            std::process::exit(1);
-                        }));
-                    }
-                    _ => break,
-                }
-                i += 1;
+        // F213: op commands moved to autumn-op. Common typos and the
+        // explicit `op` namespace prefix all route here.
+        "op" | "bootstrap" | "set-stream-ec" | "force-ec-convert" | "split" | "merge"
+        | "policy-candidates" | "policy_candidates" | "policy" | "compact" | "gc"
+        | "forcegc" | "register-node" | "format" | "info" => {
+            // Reconstruct the equivalent autumn-op invocation. For
+            // bare `op`, the original args[i..] are the autumn-op
+            // command + flags. For other typos (e.g. `autumn-client
+            // split 1`), we re-prepend the matched subcommand so the
+            // hint is `autumn-op split 1`.
+            let mut args: Vec<String> = Vec::new();
+            if subcmd != "op" {
+                args.push(subcmd.to_string());
             }
-            Command::Bootstrap {
-                replication,
-                presplit,
-                log_ec,
-                row_ec,
-            }
-        }
-        "set-stream-ec" => {
-            let mut stream_id: Option<u64> = None;
-            let mut ec: Option<(u32, u32)> = None;
-            while i < raw.len() {
-                match raw[i].as_str() {
-                    "--stream" => {
-                        i += 1;
-                        stream_id = Some(raw[i].parse().unwrap_or_else(|_| {
-                            eprintln!("--stream requires a numeric stream ID");
-                            std::process::exit(1);
-                        }));
-                    }
-                    "--ec" => {
-                        i += 1;
-                        ec = Some(parse_ec_flag(&raw[i]).unwrap_or_else(|e| {
-                            eprintln!("--ec: {e}");
-                            std::process::exit(1);
-                        }));
-                    }
-                    _ => break,
-                }
-                i += 1;
-            }
-            let stream_id = stream_id.unwrap_or_else(|| {
-                eprintln!("set-stream-ec requires --stream <ID>");
-                std::process::exit(1);
-            });
-            let (ec_data, ec_parity) = ec.unwrap_or_else(|| {
-                eprintln!("set-stream-ec requires --ec K+M");
-                std::process::exit(1);
-            });
-            Command::SetStreamEc { stream_id, ec_data, ec_parity }
+            args.extend(raw[i..].iter().cloned());
+            Command::OpStub { args }
         }
         "put" => {
             let nosync = false; // F178: always durable; --nosync ignored
@@ -502,167 +325,6 @@ fn parse_args() -> Args {
                 prefix,
                 start,
                 limit,
-            }
-        }
-        "split" => {
-            if i >= raw.len() {
-                eprintln!("split requires <PARTID>");
-                std::process::exit(1);
-            }
-            Command::Split {
-                part_id: raw[i].parse().expect("PARTID must be a number"),
-            }
-        }
-        "merge" => {
-            if i + 1 >= raw.len() {
-                eprintln!("merge requires <SURVIVOR_PART_ID> <VICTIM_PART_ID>");
-                std::process::exit(1);
-            }
-            Command::Merge {
-                survivor_part_id: raw[i].parse().expect("SURVIVOR_PART_ID must be a number"),
-                victim_part_id: raw[i + 1].parse().expect("VICTIM_PART_ID must be a number"),
-            }
-        }
-        "policy-candidates" | "policy_candidates" | "policy" => Command::PolicyCandidates,
-        "compact" => {
-            if i >= raw.len() {
-                eprintln!("compact requires <PARTID>");
-                std::process::exit(1);
-            }
-            Command::Compact {
-                part_id: raw[i].parse().expect("PARTID must be a number"),
-            }
-        }
-        "gc" => {
-            // F201: gc [--ratio R] [--max-size B] [--stream-debt B] [--empty-only] <PARTID>
-            let mut ratio: Option<f64> = None;
-            let mut max_size: Option<u64> = None;
-            let mut stream_debt: Option<u64> = None;
-            let mut empty_only = false;
-            while i < raw.len() {
-                match raw[i].as_str() {
-                    "--ratio" => {
-                        i += 1;
-                        ratio = Some(raw[i].parse().unwrap_or_else(|_| {
-                            eprintln!("--ratio expects a float 0.0..=1.0");
-                            std::process::exit(1);
-                        }));
-                    }
-                    "--max-size" => {
-                        i += 1;
-                        max_size = Some(parse_byte_size(&raw[i]).unwrap_or_else(|e| {
-                            eprintln!("--max-size: {e}");
-                            std::process::exit(1);
-                        }));
-                    }
-                    "--stream-debt" => {
-                        i += 1;
-                        stream_debt = Some(parse_byte_size(&raw[i]).unwrap_or_else(|e| {
-                            eprintln!("--stream-debt: {e}");
-                            std::process::exit(1);
-                        }));
-                    }
-                    "--empty-only" => {
-                        empty_only = true;
-                    }
-                    _ => break,
-                }
-                i += 1;
-            }
-            if i >= raw.len() {
-                eprintln!("gc requires <PARTID>");
-                std::process::exit(1);
-            }
-            Command::Gc {
-                part_id: raw[i].parse().expect("PARTID must be a number"),
-                ratio,
-                max_size,
-                stream_debt,
-                empty_only,
-            }
-        }
-        "forcegc" => {
-            if i >= raw.len() {
-                eprintln!("forcegc requires <PARTID> <EXTID>...");
-                std::process::exit(1);
-            }
-            let part_id: u64 = raw[i].parse().expect("PARTID must be a number");
-            i += 1;
-            let mut extent_ids = Vec::new();
-            while i < raw.len() {
-                extent_ids.push(raw[i].parse::<u64>().expect("EXTID must be a number"));
-                i += 1;
-            }
-            if extent_ids.is_empty() {
-                eprintln!("forcegc requires at least one <EXTID>");
-                std::process::exit(1);
-            }
-            Command::ForceGc {
-                part_id,
-                extent_ids,
-            }
-        }
-        "register-node" => {
-            let mut addr = String::new();
-            let mut disks: Vec<String> = Vec::new();
-            let mut shard_ports: Vec<u16> = Vec::new();
-            // F191: optional --control-address override; default = empty
-            // (manager falls back to data-plane addr).
-            let mut control_address = String::new();
-            while i < raw.len() {
-                match raw[i].as_str() {
-                    "--addr" => { i += 1; addr = raw[i].clone(); }
-                    "--disk" => { i += 1; disks.push(raw[i].clone()); }
-                    "--shard-ports" => {
-                        i += 1;
-                        for part in raw[i].split(',') {
-                            let p = part.trim();
-                            if p.is_empty() { continue; }
-                            let port: u16 = p.parse()
-                                .expect("--shard-ports entries must be u16");
-                            shard_ports.push(port);
-                        }
-                    }
-                    "--control-address" => { i += 1; control_address = raw[i].clone(); }
-                    _ => {}
-                }
-                i += 1;
-            }
-            if addr.is_empty() {
-                eprintln!("register-node requires --addr");
-                std::process::exit(1);
-            }
-            if disks.is_empty() {
-                disks.push("disk-default".to_string());
-            }
-            Command::RegisterNode { addr, disks, shard_ports, control_address }
-        }
-        "format" => {
-            let mut listen = String::new();
-            let mut advertise = String::new();
-            let mut dirs = Vec::new();
-            while i < raw.len() {
-                match raw[i].as_str() {
-                    "--listen" => {
-                        i += 1;
-                        listen = raw[i].clone();
-                    }
-                    "--advertise" => {
-                        i += 1;
-                        advertise = raw[i].clone();
-                    }
-                    _ => dirs.push(raw[i].clone()),
-                }
-                i += 1;
-            }
-            if listen.is_empty() || advertise.is_empty() || dirs.is_empty() {
-                eprintln!("format requires --listen <ADDR> --advertise <ADDR> <DIR>...");
-                std::process::exit(1);
-            }
-            Command::Format {
-                listen,
-                advertise,
-                dirs,
             }
         }
         "wbench" => {
@@ -836,64 +498,6 @@ fn parse_args() -> Args {
                 group_commit_cap,
             }
         }
-        "info" => {
-            // F205: dropped `--top N` flag. Python scripts use
-            // `info --json | jq sort_by(...)` for ranking; no need
-            // for the kernel to host that policy logic.
-            let mut json = false;
-            let mut part: Option<u64> = None;
-            let mut detail = false;
-            while i < raw.len() {
-                match raw[i].as_str() {
-                    "--json" => { json = true; }
-                    "--part" => {
-                        i += 1;
-                        if i >= raw.len() { eprintln!("--part requires a number"); usage(); }
-                        part = Some(raw[i].parse().unwrap_or_else(|_| { eprintln!("--part requires a number"); usage() }));
-                    }
-                    "--detail" => { detail = true; }
-                    "--top" => {
-                        // F205: removed. Helpful migration message
-                        // (passes nothing on; just exits).
-                        eprintln!("--top removed in F205; use `info --json | jq 'sort_by(.size_bytes) | reverse | .[:N]'` instead");
-                        std::process::exit(2);
-                    }
-                    other => {
-                        eprintln!("unknown info flag: {other}");
-                        usage();
-                    }
-                }
-                i += 1;
-            }
-            if detail && part.is_none() {
-                eprintln!("--detail requires --part <PID>");
-                usage();
-            }
-            Command::Info { json, part, detail }
-        }
-        "force-ec-convert" => {
-            // F203: force-ec-convert --extent <EXTID>
-            let mut extent_id: Option<u64> = None;
-            while i < raw.len() {
-                match raw[i].as_str() {
-                    "--extent" => {
-                        i += 1;
-                        if i >= raw.len() { eprintln!("--extent requires a number"); usage(); }
-                        extent_id = Some(raw[i].parse().unwrap_or_else(|_| {
-                            eprintln!("--extent requires a number");
-                            usage()
-                        }));
-                    }
-                    _ => break,
-                }
-                i += 1;
-            }
-            let extent_id = extent_id.unwrap_or_else(|| {
-                eprintln!("force-ec-convert requires --extent <EXTID>");
-                std::process::exit(1);
-            });
-            Command::ForceEcConvert { extent_id }
-        }
         other => {
             eprintln!("unknown command: {other}");
             usage();
@@ -918,63 +522,6 @@ fn warn_nosync_deprecated_once() {
              unchanged from --sync."
         );
     });
-}
-
-/// F201: accept human-readable byte sizes for `--max-size` / `--stream-debt`.
-/// Plain integers are bytes; suffixes (B/K/M/G/Ki/Mi/Gi, case-insensitive,
-/// optional "B" tail) scale accordingly. Examples: "16777216", "16MiB",
-/// "1G", "512K".
-fn parse_byte_size(s: &str) -> Result<u64> {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        bail!("empty byte-size value");
-    }
-    let bytes = trimmed.as_bytes();
-    let mut split = bytes.len();
-    for (i, &b) in bytes.iter().enumerate() {
-        if !b.is_ascii_digit() && b != b'.' {
-            split = i;
-            break;
-        }
-    }
-    let (num, unit) = trimmed.split_at(split);
-    let num: f64 = num.parse().context("byte-size numeric prefix")?;
-    let mul: f64 = match unit.trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 1.0,
-        "k" | "kb" | "kib" => 1024.0,
-        "m" | "mb" | "mib" => 1024.0 * 1024.0,
-        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
-        "t" | "tb" | "tib" => 1024.0_f64.powi(4),
-        other => bail!("unknown byte-size suffix {other:?}"),
-    };
-    let n = (num * mul).round();
-    if n.is_sign_negative() || !n.is_finite() {
-        bail!("byte-size out of range");
-    }
-    Ok(n as u64)
-}
-
-fn parse_replication(s: &str) -> Result<u32> {
-    let n_str = s.split('+').next().unwrap_or(s);
-    let n: u32 = n_str.parse().context("parse replica count")?;
-    if n == 0 {
-        bail!("replication count must be >= 1");
-    }
-    Ok(n)
-}
-
-/// Parse `K+M` EC shape string into `(data_shards, parity_shards)`.
-fn parse_ec_flag(s: &str) -> Result<(u32, u32)> {
-    let parts: Vec<&str> = s.splitn(2, '+').collect();
-    if parts.len() != 2 {
-        bail!("EC shape must be K+M (e.g. '3+1'), got '{s}'");
-    }
-    let k: u32 = parts[0].parse().with_context(|| format!("parse K in EC '{s}'"))?;
-    let m: u32 = parts[1].parse().with_context(|| format!("parse M in EC '{s}'"))?;
-    if k == 0 || m == 0 {
-        bail!("EC K and M must both be >= 1, got '{s}'");
-    }
-    Ok((k, m))
 }
 
 fn parse_bool_flag(value: &str, flag: &str) -> Result<bool> {
@@ -1057,72 +604,8 @@ struct PerfBaseline {
     recorded_at: u64,
 }
 
-// ---------------------------------------------------------------------------
-// `info` JSON output types
-// ---------------------------------------------------------------------------
-
-#[derive(Serialize)]
-struct InfoDiskView {
-    disk_id: u64,
-    uuid: String,
-    online: bool,
-}
-
-#[derive(Serialize)]
-struct InfoNodeView {
-    node_id: u64,
-    address: String,
-    disks: Vec<InfoDiskView>,
-}
-
-#[derive(Serialize)]
-struct InfoExtentView {
-    extent_id: u64,
-    size: u64,
-    open: bool,
-    replicas: Vec<u64>,
-    parity: Vec<u64>,
-    refs: u64,
-    eversion: u64,
-}
-
-#[derive(Serialize)]
-struct InfoStreamView {
-    stream_id: u64,
-    replicates: u32,
-    ec_data: u32,
-    ec_parity: u32,
-    extent_ids: Vec<u64>,
-    total_size: u64,
-}
-
-#[derive(Serialize)]
-struct InfoDiscardEntry {
-    extent_id: u64,
-    bytes: i64,
-}
-
-#[derive(Serialize)]
-struct InfoPartitionView {
-    part_id: u64,
-    ps_addr: String,
-    range_start: String,
-    range_end: String,
-    live_size: u64,
-    total_extents: usize,
-    log_stream_id: u64,
-    row_stream_id: u64,
-    meta_stream_id: u64,
-    discards: Vec<InfoDiscardEntry>,
-}
-
-#[derive(Serialize)]
-struct InfoSnapshot {
-    nodes: Vec<InfoNodeView>,
-    extents: Vec<InfoExtentView>,
-    streams: Vec<InfoStreamView>,
-    partitions: Vec<InfoPartitionView>,
-}
+// (F213: Info{Disk,Node,Extent,Stream,Discard,Partition,Snapshot}View
+// moved to autumn_op.rs along with the `info` subcommand.)
 
 struct LatencyHist {
     samples_ms: Vec<f64>,
@@ -1204,103 +687,12 @@ fn parse_write_results(json: &str) -> Result<(Vec<BenchResult>, usize)> {
     Ok((report.results, value_size))
 }
 
-// ---------------------------------------------------------------------------
-// Format helpers
-// ---------------------------------------------------------------------------
-
-/// F191: derive the default control-plane address from a data-plane
-/// `host:port` (or `[v6]:port`). Returns the same host with `port + 1000`.
-/// Returns the empty string on parse failure — the manager treats empty
-/// `control_address` as "fall back to the data-plane addr". Tested below.
-pub(crate) fn derive_control_address(advertise: &str) -> String {
-    let Some(colon) = advertise.rfind(':') else {
-        return String::new();
-    };
-    let (host, port_str) = advertise.split_at(colon);
-    let port_str = &port_str[1..];
-    let Ok(port) = port_str.parse::<u16>() else {
-        return String::new();
-    };
-    let Some(ctl_port) = port.checked_add(1000) else {
-        return String::new();
-    };
-    format!("{host}:{ctl_port}")
-}
-
-fn format_disk(dir: &str) -> Result<String> {
-    for byte in 0u8..=255 {
-        let subdir = format!("{}/{:02x}", dir, byte);
-        std::fs::create_dir_all(&subdir)
-            .with_context(|| format!("create hash subdir {subdir}"))?;
-    }
-    let disk_uuid = uuid::Uuid::new_v4().to_string();
-    let marker_path = format!("{}/{}", dir, disk_uuid);
-    std::fs::File::create(&marker_path)
-        .with_context(|| format!("create UUID marker {marker_path}"))?;
-    Ok(disk_uuid)
-}
+// (F213: derive_control_address + format_disk moved to autumn_op.rs
+// along with the `format` subcommand.)
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// F191: control-address derivation defaults to `host:port + 1000`,
-    /// falls back to empty on bogus input.
-    #[test]
-    fn derive_control_address_ipv4_offsets_port_by_1000() {
-        assert_eq!(
-            super::derive_control_address("127.0.0.1:9101"),
-            "127.0.0.1:10101"
-        );
-        assert_eq!(
-            super::derive_control_address("10.0.0.42:9201"),
-            "10.0.0.42:10201"
-        );
-    }
-
-    #[test]
-    fn derive_control_address_v6_bracketed_offsets_port_by_1000() {
-        assert_eq!(
-            super::derive_control_address("[fe80::1]:9101"),
-            "[fe80::1]:10101"
-        );
-    }
-
-    #[test]
-    fn derive_control_address_falls_back_to_empty_on_bad_input() {
-        assert_eq!(super::derive_control_address("no-port-here"), "");
-        assert_eq!(super::derive_control_address(""), "");
-        // port overflow → empty
-        assert_eq!(super::derive_control_address("127.0.0.1:65000"), "");
-    }
-
-    /// F201: --max-size / --stream-debt accept human-readable byte
-    /// sizes. Test the canonical shapes operators are most likely to
-    /// type.
-    #[test]
-    fn parse_byte_size_accepts_plain_integer() {
-        assert_eq!(super::parse_byte_size("16777216").unwrap(), 16 * 1024 * 1024);
-        assert_eq!(super::parse_byte_size("0").unwrap(), 0);
-    }
-
-    #[test]
-    fn parse_byte_size_accepts_suffixes() {
-        assert_eq!(super::parse_byte_size("512K").unwrap(), 512 * 1024);
-        assert_eq!(super::parse_byte_size("16M").unwrap(), 16 * 1024 * 1024);
-        assert_eq!(super::parse_byte_size("16MiB").unwrap(), 16 * 1024 * 1024);
-        assert_eq!(super::parse_byte_size("1G").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(super::parse_byte_size("1GiB").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(super::parse_byte_size("2T").unwrap(), 2u64 * 1024 * 1024 * 1024 * 1024);
-        // case insensitive
-        assert_eq!(super::parse_byte_size("4mib").unwrap(), 4 * 1024 * 1024);
-    }
-
-    #[test]
-    fn parse_byte_size_rejects_garbage() {
-        assert!(super::parse_byte_size("").is_err());
-        assert!(super::parse_byte_size("foo").is_err());
-        assert!(super::parse_byte_size("16XB").is_err());
-    }
 
     #[test]
     fn parse_bool_flag_accepts_expected_values() {
@@ -1426,193 +818,31 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args();
+
+    // F213: handle the `op` stub BEFORE attempting to connect to the
+    // manager — the user is trying to run an op command via the wrong
+    // binary; making them wait on a connection attempt would be hostile.
+    if let Command::OpStub { args: op_args } = &args.command {
+        eprintln!("admin / operator commands moved to `autumn-op`.");
+        eprintln!("  autumn-op --help              # list subcommands");
+        eprintln!("  autumn-op list-nodes");
+        eprintln!("  autumn-op fence-node <id> --reason \"...\"");
+        if !op_args.is_empty() {
+            eprintln!();
+            eprintln!(
+                "hint: did you mean `autumn-op --manager {} {}`?",
+                args.manager,
+                op_args.join(" ")
+            );
+        }
+        std::process::exit(1);
+    }
+
     let _ = autumn_transport::init_with(args.transport);
-    let mut client = ClusterClient::connect(&args.manager).await?;
+    let client = ClusterClient::connect(&args.manager).await?;
 
     match args.command {
-        Command::Bootstrap {
-            replication,
-            presplit,
-            log_ec,
-            row_ec,
-        } => {
-            let meta_replicates = parse_replication(&replication)?;
-
-            // Per-stream (replicates, ec_data, ec_parity):
-            // - Replica streams: replicates=N, ec_data=N, ec_parity=0.
-            // - EC streams: replicates is the OPEN-EXTENT replica count
-            //   (= meta_replicates, typically 3), and (ec_data,
-            //   ec_parity) describes the POST-SEAL EC encoding (e.g.
-            //   4+1, 7+1). The two are independent — the
-            //   `ec_conversion_dispatch_loop` reads the sealed payload
-            //   from one of the open replicas and re-encodes it into
-            //   K+M shards, allocating any extra host slots beyond
-            //   `replicates` on the fly. So a 3-replica stream can be
-            //   converted to 4+1, 7+1, etc.
-            //
-            //   Pre-fix we sent `replicates=K+M`, forcing open extents
-            //   onto K+M nodes (each holding a full replica). The M
-            //   extra replicas got overwritten with parity bytes on
-            //   conversion anyway — pure waste — and the seal/EC race
-            //   blast radius was wider than necessary.
-            let log_params = log_ec
-                .map(|(k, m)| (meta_replicates, k, m))
-                .unwrap_or((meta_replicates, meta_replicates, 0));
-            let row_params = row_ec
-                .map(|(k, m)| (meta_replicates, k, m))
-                .unwrap_or((meta_replicates, meta_replicates, 0));
-            let meta_params = (meta_replicates, meta_replicates, 0u32);
-
-            let ranges: Vec<(Vec<u8>, Vec<u8>)> = {
-                let parts: Vec<&str> = presplit.splitn(2, ':').collect();
-                let n: usize = parts[0].parse().unwrap_or(1);
-                let kind = parts.get(1).copied().unwrap_or("normal");
-                match kind {
-                    "hexstring" => hex_split_ranges(n),
-                    _ => vec![(vec![], vec![])],
-                }
-            };
-
-            let create_stream_once = |label: &'static str, replicates: u32, ec_data: u32, ec_parity: u32| {
-                let client = &client;
-                async move {
-                    let req_bytes = rkyv_encode(&CreateStreamReq {
-                        replicates,
-                        ec_data_shard: ec_data,
-                        ec_parity_shard: ec_parity,
-                    });
-                    let mut attempt = 0u32;
-                    loop {
-                        // mgr_call honors ClusterClient.rpc_timeout
-                        // (default 30 s) — bounded RPC.
-                        let resp_bytes = client
-                            .mgr_call(MSG_CREATE_STREAM, req_bytes.clone())
-                            .await
-                            .with_context(|| format!("create {label} stream"))?;
-                        let resp: CreateStreamResp =
-                            rkyv_decode(&resp_bytes).map_err(decode_err)?;
-                        if resp.code == CODE_OK {
-                            return Ok::<u64, anyhow::Error>(
-                                resp.stream.map(|s| s.stream_id).unwrap_or(0),
-                            );
-                        }
-                        if resp.code == CODE_NOT_LEADER && attempt < 60 {
-                            attempt += 1;
-                            compio::time::sleep(Duration::from_millis(500)).await;
-                            continue;
-                        }
-                        bail!("create {label} stream failed: code={} {}", resp.code, resp.message);
-                    }
-                }
-            };
-
-            for (idx, (start_key, end_key)) in ranges.iter().enumerate() {
-                let (log_repl, log_k, log_m) = log_params;
-                let (row_repl, row_k, row_m) = row_params;
-                let (meta_repl, meta_k, meta_m) = meta_params;
-                let log_stream_id = create_stream_once("log", log_repl, log_k, log_m).await?;
-                let row_stream_id = create_stream_once("row", row_repl, row_k, row_m).await?;
-                let meta_stream_id = create_stream_once("meta", meta_repl, meta_k, meta_m).await?;
-
-                let meta = MgrPartitionMeta {
-                    log_stream: log_stream_id,
-                    row_stream: row_stream_id,
-                    meta_stream: meta_stream_id,
-                    part_id: 0, // auto-assigned by manager via alloc_ids
-                    rg: Some(MgrRange {
-                        start_key: start_key.clone(),
-                        end_key: end_key.clone(),
-                    }),
-                };
-
-                let req_bytes = rkyv_encode(&UpsertPartitionReq { meta });
-                let mut attempt = 0u32;
-                let resp = loop {
-                    let resp_bytes = client
-                        .mgr_call(MSG_UPSERT_PARTITION, req_bytes.clone())
-                        .await
-                        .context("upsert partition")?;
-                    let resp: UpsertPartitionResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-                    if resp.code == CODE_OK {
-                        break resp;
-                    }
-                    if resp.code == CODE_NOT_LEADER && attempt < 60 {
-                        attempt += 1;
-                        compio::time::sleep(Duration::from_millis(500)).await;
-                        continue;
-                    }
-                    bail!("bootstrap partition {} failed: code={} {}", idx, resp.code, resp.message);
-                };
-
-                let start_s = if start_key.is_empty() {
-                    String::from("\"\"")
-                } else {
-                    String::from_utf8_lossy(start_key).to_string()
-                };
-                let end_s = if end_key.is_empty() {
-                    String::from("\"\"")
-                } else {
-                    String::from_utf8_lossy(end_key).to_string()
-                };
-                let (_, log_k, log_m) = log_params;
-                let (_, row_k, row_m) = row_params;
-                let (_, meta_k, meta_m) = meta_params;
-                println!(
-                    "partition {} created: id={} log={} ({}+{}) row={} ({}+{}) meta={} ({}+{}) range=[{}..{})",
-                    idx, resp.part_id,
-                    log_stream_id, log_k, log_m,
-                    row_stream_id, row_k, row_m,
-                    meta_stream_id, meta_k, meta_m,
-                    start_s, end_s,
-                );
-            }
-            println!("bootstrap succeeded: {} partition(s)", ranges.len());
-        }
-
-        Command::SetStreamEc { stream_id, ec_data, ec_parity } => {
-            let req_bytes = rkyv_encode(&UpdateStreamEcReq {
-                stream_id,
-                ec_data_shard: ec_data,
-                ec_parity_shard: ec_parity,
-            });
-            let mut attempt = 0u32;
-            loop {
-                let resp_bytes = client
-                    .mgr_call(MSG_UPDATE_STREAM_EC, req_bytes.clone())
-                    .await
-                    .context("update stream EC")?;
-                let resp: UpdateStreamEcResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-                if resp.code == CODE_OK {
-                    println!(
-                        "stream {} EC updated to {}+{}; conversion will run on next manager tick (~5s)",
-                        stream_id, ec_data, ec_parity
-                    );
-                    break;
-                }
-                if resp.code == CODE_NOT_LEADER && attempt < 60 {
-                    attempt += 1;
-                    compio::time::sleep(Duration::from_millis(500)).await;
-                    continue;
-                }
-                bail!("set-stream-ec failed: code={} {}", resp.code, resp.message);
-            }
-        }
-
-        Command::ForceEcConvert { extent_id } => {
-            // F203
-            let req = rkyv_encode(&autumn_rpc::manager_rpc::ForceEcConvertReq { extent_id });
-            let resp_bytes = client
-                .mgr_call(autumn_rpc::manager_rpc::MSG_FORCE_EC_CONVERT, req)
-                .await
-                .context("force-ec-convert")?;
-            let resp: autumn_rpc::manager_rpc::ForceEcConvertResp =
-                rkyv_decode(&resp_bytes).map_err(decode_err)?;
-            if resp.code != autumn_rpc::manager_rpc::CODE_OK {
-                bail!("force-ec-convert: code={} {}", resp.code, resp.message);
-            }
-            println!("{}", resp.message);
-        }
-
+        Command::OpStub { .. } => unreachable!("handled before connect"),
         Command::Put { key, file, nosync: _ } => {
             let value = std::fs::read(&file).with_context(|| format!("read file {file}"))?;
             client.put(key.as_bytes(), &value).await
@@ -1721,207 +951,6 @@ async fn main() -> Result<()> {
             if result.has_more {
                 eprintln!("(truncated, more results available)");
             }
-        }
-
-        Command::Split { part_id } => {
-            client.split(part_id).await
-                .map_err(|e| anyhow!("split: {e}"))?;
-            println!("split ok");
-        }
-
-        Command::Merge { survivor_part_id, victim_part_id } => {
-            eprintln!(
-                "F183: stop writes to partitions {survivor_part_id} and {victim_part_id} \
-                 before continuing. The CLI will FLUSH both, then issue the manager merge. \
-                 The survivor's PS picks up the wider range on the next region_sync (~2 s)."
-            );
-            client.merge_partitions(survivor_part_id, victim_part_id).await
-                .map_err(|e| anyhow!("merge: {e}"))?;
-            println!("merge ok: partition {victim_part_id} merged into {survivor_part_id}");
-        }
-
-        Command::PolicyCandidates => {
-            let cands = client.policy_candidates().await
-                .map_err(|e| anyhow!("policy_candidates: {e}"))?;
-            if cands.is_empty() {
-                println!("(no candidates)");
-            } else {
-                println!(
-                    "{:<7} {:<10} {:<10} {:<46} {:<10} {:<8} {:<6} {:<5}",
-                    "KIND", "PRIMARY", "SECONDARY", "REASON", "SIZE", "QPS", "IMM/s", "FEAS"
-                );
-                for c in cands {
-                    let kind = match c.kind {
-                        autumn_rpc::manager_rpc::POLICY_KIND_SPLIT => "split",
-                        autumn_rpc::manager_rpc::POLICY_KIND_MERGE => "merge",
-                        autumn_rpc::manager_rpc::POLICY_KIND_GC => "gc",
-                        autumn_rpc::manager_rpc::POLICY_KIND_MAJOR_COMPACT => "major",
-                        autumn_rpc::manager_rpc::POLICY_KIND_HOT_COLD => "hotcold",
-                        // F202 additions
-                        autumn_rpc::manager_rpc::POLICY_KIND_MINOR_COMPACT => "minor",
-                        autumn_rpc::manager_rpc::POLICY_KIND_EC => "ec",
-                        _ => "?",
-                    };
-                    // F187/F202: GC/COMPACT/EC advisories aren't bound by
-                    // `same_ps` — they're always per-partition (or
-                    // per-extent for EC) and locally feasible. F196:
-                    // HOT_COLD is by-construction per-PS, always feasible
-                    // from the operator's view. Render `feas` as "n/a"
-                    // for them so operators don't misread the column.
-                    let feas = match c.kind {
-                        autumn_rpc::manager_rpc::POLICY_KIND_GC
-                        | autumn_rpc::manager_rpc::POLICY_KIND_MAJOR_COMPACT
-                        | autumn_rpc::manager_rpc::POLICY_KIND_MINOR_COMPACT
-                        | autumn_rpc::manager_rpc::POLICY_KIND_EC
-                        | autumn_rpc::manager_rpc::POLICY_KIND_HOT_COLD => "n/a",
-                        _ if c.same_ps => "yes",
-                        _ => "no",
-                    };
-                    let secondary = if c.secondary_part_id == 0 {
-                        "-".to_string()
-                    } else {
-                        c.secondary_part_id.to_string()
-                    };
-                    println!(
-                        "{:<7} {:<10} {:<10} {:<46} {:<10} {:<8} {:<6} {:<5}",
-                        kind,
-                        c.primary_part_id,
-                        secondary,
-                        c.reason,
-                        format!("{} MB", c.size_bytes / (1024 * 1024)),
-                        c.req_per_sec,
-                        c.imm_full_per_sec,
-                        feas,
-                    );
-                }
-            }
-        }
-
-        Command::Compact { part_id } => {
-            client.compact(part_id).await
-                .map_err(|e| anyhow!("compact: {e}"))?;
-            println!("compact triggered for partition {part_id}");
-        }
-
-        Command::Gc { part_id, ratio, max_size, stream_debt, empty_only } => {
-            // F201: forward multi-tier params. Default (no flags) →
-            // pre-F201 single-tier behaviour + empty-sealed pick.
-            let params = autumn_client::GcAutoParams {
-                ratio,
-                max_size,
-                stream_debt,
-                empty_only,
-            };
-            client
-                .gc_with_params(part_id, params.clone())
-                .await
-                .map_err(|e| anyhow!("gc: {e}"))?;
-            println!(
-                "gc triggered for partition {part_id} (ratio={:?} max_size={:?} stream_debt={:?} empty_only={})",
-                params.ratio, params.max_size, params.stream_debt, params.empty_only
-            );
-        }
-
-        Command::ForceGc {
-            part_id,
-            extent_ids,
-        } => {
-            client.force_gc(part_id, extent_ids.clone()).await
-                .map_err(|e| anyhow!("forcegc: {e}"))?;
-            println!("forcegc triggered for partition {part_id}, extents={extent_ids:?}");
-        }
-
-        Command::RegisterNode { addr, disks, shard_ports, control_address } => {
-            // Retry on CODE_NOT_LEADER: manager may still be completing etcd
-            // leader election when cluster.sh fires the first register-node.
-            let req_bytes = rkyv_encode(&RegisterNodeReq {
-                addr: addr.clone(),
-                disk_uuids: disks,
-                shard_ports: shard_ports.clone(),
-                control_address: control_address.clone(),
-            });
-            let mut attempt = 0u32;
-            let resp = loop {
-                let resp_bytes = client
-                    .mgr_call(MSG_REGISTER_NODE, req_bytes.clone())
-                    .await
-                    .context("register node")?;
-                let resp: RegisterNodeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-                if resp.code == CODE_OK {
-                    break resp;
-                }
-                if resp.code == CODE_NOT_LEADER && attempt < 60 {
-                    attempt += 1;
-                    compio::time::sleep(Duration::from_millis(500)).await;
-                    continue;
-                }
-                bail!("register-node failed: code={} {}", resp.code, resp.message);
-            };
-            println!("node registered: node_id={}, addr={}", resp.node_id, addr);
-            for (uuid, disk_id) in &resp.disk_uuids {
-                println!("  disk {uuid} → disk_id={disk_id}");
-            }
-        }
-
-        Command::Format {
-            listen,
-            advertise,
-            dirs,
-        } => {
-            let mut disk_uuids = Vec::new();
-            for dir in &dirs {
-                std::fs::create_dir_all(dir).with_context(|| format!("create dir {dir}"))?;
-                let uuid = format_disk(dir)?;
-                println!("formatted {dir}: disk_uuid={uuid}");
-                disk_uuids.push(uuid);
-            }
-
-            // F191: derive the control address from `advertise` by
-            // offsetting the port by +1000 (matching the ExtentNode
-            // default control listener). If parsing fails (unusual host
-            // form), fall back to empty so the manager keeps using the
-            // data-plane addr.
-            let control_address = derive_control_address(&advertise);
-            let resp_bytes = client
-                .mgr_call(
-                    MSG_REGISTER_NODE,
-                    rkyv_encode(&RegisterNodeReq {
-                        addr: advertise.clone(),
-                        disk_uuids: disk_uuids.clone(),
-                        // F099-M: format path always uses legacy single-shard mode.
-                        shard_ports: vec![],
-                        control_address,
-                    }),
-                )
-                .await
-                .context("register node")?;
-            let resp: RegisterNodeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-
-            let node_id = resp.node_id;
-            println!("node registered: node_id={node_id}");
-
-            for (dir, disk_uuid) in dirs.iter().zip(disk_uuids.iter()) {
-                let disk_id = resp
-                    .disk_uuids
-                    .iter()
-                    .find(|(u, _)| u == disk_uuid)
-                    .map(|(_, id)| *id)
-                    .unwrap_or(0);
-                std::fs::write(format!("{dir}/node_id"), node_id.to_string())
-                    .with_context(|| format!("write node_id in {dir}"))?;
-                std::fs::write(format!("{dir}/disk_id"), disk_id.to_string())
-                    .with_context(|| format!("write disk_id in {dir}"))?;
-                println!("  {dir}: node_id={node_id}, disk_id={disk_id}");
-            }
-            println!("\nFormat complete.");
-            println!("listen={listen}, advertise={advertise}");
-            println!("Start the extent node with:");
-            println!(
-                "  autumn-extent-node --port {} --manager {} --data {}",
-                listen.split(':').last().unwrap_or("9101"),
-                args.manager,
-                dirs.join(",")
-            );
         }
 
         Command::WBench {
@@ -2174,7 +1203,7 @@ async fn main() -> Result<()> {
                         .build()
                         .unwrap()
                         .block_on(async {
-                        let mut cc = match ClusterClient::connect(&manager_addr).await {
+                        let cc = match ClusterClient::connect(&manager_addr).await {
                             Ok(c) => c,
                             Err(e) => {
                                 eprintln!("thread {tid} connect error: {e}");
@@ -2663,418 +1692,6 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Info { json, part, detail } => {
-            // F203: --detail prints only the PartitionLoad snapshot for
-            // `part`, sourced from the manager's cached metric window.
-            // Short-circuits the full info path.
-            if detail {
-                let pid = part.expect("--detail requires --part PID; checked at parse time");
-                let req = rkyv_encode(&autumn_rpc::manager_rpc::GetPartitionDetailReq {
-                    part_id: pid,
-                });
-                let resp_bytes = client
-                    .mgr_call(autumn_rpc::manager_rpc::MSG_GET_PARTITION_DETAIL, req)
-                    .await
-                    .context("get partition detail")?;
-                let resp: autumn_rpc::manager_rpc::GetPartitionDetailResp =
-                    rkyv_decode(&resp_bytes).map_err(decode_err)?;
-                if resp.code != autumn_rpc::manager_rpc::CODE_OK {
-                    bail!("get_partition_detail: code={} {}", resp.code, resp.message);
-                }
-                if json {
-                    let l = &resp.load;
-                    let v = serde_json::json!({
-                        "part_id": pid,
-                        "bucket_ts": resp.bucket_ts,
-                        "size_bytes": l.size_bytes,
-                        "req_per_sec": l.req_per_sec,
-                        "imm_full_per_sec": l.imm_full_per_sec,
-                        "p99_us": l.p99_us,
-                        "gc_debt_bytes": l.gc_debt_bytes,
-                        "pending_compaction_bytes": l.pending_compaction_bytes,
-                        "minor_compact_pending_bytes": l.minor_compact_pending_bytes,
-                        "sst_tombstone_bytes": l.sst_tombstone_bytes,
-                        "sst_expired_bytes": l.sst_expired_bytes,
-                        "sst_out_of_range_bytes": l.sst_out_of_range_bytes,
-                        "gc_inflight": l.gc_inflight,
-                        "compact_inflight": l.compact_inflight,
-                        "last_gc_at": l.last_gc_at,
-                        "last_compact_at": l.last_compact_at,
-                        "sealed_log_extent_count": l.sealed_log_extent_count,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&v).context("serialize detail")?);
-                } else {
-                    let l = &resp.load;
-                    println!("=== Partition {pid} (bucket_ts={}) ===", resp.bucket_ts);
-                    println!("  size_bytes={}", l.size_bytes);
-                    println!("  req_per_sec={}  imm_full_per_sec={}", l.req_per_sec, l.imm_full_per_sec);
-                    println!("  gc_debt_bytes={} ({} MiB)", l.gc_debt_bytes, l.gc_debt_bytes / (1024*1024));
-                    println!("  pending_compaction_bytes={} ({} MiB)  [major]", l.pending_compaction_bytes, l.pending_compaction_bytes / (1024*1024));
-                    println!("  minor_compact_pending_bytes={} ({} MiB)", l.minor_compact_pending_bytes, l.minor_compact_pending_bytes / (1024*1024));
-                    println!("  sst_tombstone_bytes={}  sst_expired_bytes={}  sst_out_of_range_bytes={}",
-                        l.sst_tombstone_bytes, l.sst_expired_bytes, l.sst_out_of_range_bytes);
-                    println!("  gc_inflight={}  compact_inflight={}", l.gc_inflight, l.compact_inflight);
-                    println!("  last_gc_at={}  last_compact_at={}", l.last_gc_at, l.last_compact_at);
-                    println!("  sealed_log_extent_count={}", l.sealed_log_extent_count);
-                }
-                return Ok(());
-            }
-
-            // === Fetch manager data ===
-            let stream_resp_bytes = client
-                .mgr_call(MSG_STREAM_INFO, rkyv_encode(&StreamInfoReq { stream_ids: Vec::new() }))
-                .await
-                .context("stream info")?;
-            let stream_resp: StreamInfoResp = rkyv_decode(&stream_resp_bytes).map_err(decode_err)?;
-
-            let nodes_resp_bytes = client
-                .mgr_call(MSG_NODES_INFO, Bytes::new())
-                .await
-                .context("nodes info")?;
-            let nodes_resp: NodesInfoResp = rkyv_decode(&nodes_resp_bytes).map_err(decode_err)?;
-
-            let regions_resp_bytes = client
-                .mgr_call(MSG_GET_REGIONS, Bytes::new())
-                .await
-                .context("get regions")?;
-            let regions_resp: GetRegionsResp = rkyv_decode(&regions_resp_bytes).map_err(decode_err)?;
-
-            // === Build lookup maps ===
-            let mut extent_map: HashMap<u64, MgrExtentInfo> = stream_resp.extents.into_iter().collect();
-            let disk_map: HashMap<u64, MgrDiskInfo> = nodes_resp.disks_info.into_iter().collect();
-
-            let mut nodes_sorted: Vec<(u64, MgrNodeInfo)> = nodes_resp.nodes.into_iter().collect();
-            nodes_sorted.sort_by_key(|(id, _)| *id);
-            let node_map: HashMap<u64, String> = nodes_sorted.iter().map(|(id, n)| (*id, n.address.clone())).collect();
-
-            let mut streams_sorted: Vec<(u64, MgrStreamInfo)> = stream_resp.streams.into_iter().collect();
-            streams_sorted.sort_by_key(|(id, _)| *id);
-            let stream_map: HashMap<u64, MgrStreamInfo> = streams_sorted.iter().cloned().collect();
-
-            let regions: HashMap<u64, MgrRegionInfo> = regions_resp.regions.into_iter().collect();
-            let ps_details: HashMap<u64, MgrPsDetail> = regions_resp.ps_details.into_iter().collect();
-            let part_addr_map: HashMap<u64, String> = regions_resp.part_addrs.into_iter().collect();
-
-            let mut part_ids: Vec<u64> = regions.keys().copied().collect();
-            part_ids.sort();
-
-            // === Query commit_length for open extents ===
-            // When --part is given, only probe that partition's extents.
-            let probe_set: HashSet<u64> = if let Some(pid) = part {
-                regions.get(&pid).into_iter()
-                    .flat_map(|r| [r.log_stream, r.row_stream, r.meta_stream])
-                    .flat_map(|sid| stream_map.get(&sid).into_iter().flat_map(|s| s.extent_ids.iter().copied()))
-                    .collect()
-            } else {
-                HashSet::new()
-            };
-
-            let mut open_extents: HashSet<u64> = HashSet::new();
-            for (eid, ext) in extent_map.iter_mut() {
-                if ext.sealed_length == 0 {
-                    open_extents.insert(*eid);
-                    if part.is_some() && !probe_set.contains(eid) {
-                        continue;
-                    }
-                    if let Some(node_id) = ext.replicates.first() {
-                        if let Some(addr) = node_map.get(node_id) {
-                            if let Ok(en_client) = client.get_ps_client(addr).await {
-                                // F210-H3 Tier 2: `info` has no PS-owner
-                                // context so it must NOT use the
-                                // fence-gated commit_length RPC. The
-                                // dedicated probe RPC returns the same
-                                // `(code, length)` shape without
-                                // touching `last_revision`.
-                                let req = ExtProbeExtentReq { extent_id: *eid };
-                                if let Ok(resp_bytes) = en_client
-                                    .call_timeout(EXT_MSG_PROBE_EXTENT, req.encode(), DEFAULT_RPC_TIMEOUT)
-                                    .await
-                                {
-                                    if let Ok(resp) = ExtProbeExtentResp::decode(resp_bytes) {
-                                        ext.sealed_length = resp.length as u64;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // === Fetch pending discard snapshots from each PS ===
-            let pids_to_query: Vec<u64> = if let Some(pid) = part { vec![pid] } else { part_ids.clone() };
-            let mut part_discards: HashMap<u64, Vec<(u64, i64)>> = HashMap::new();
-            for pid in &pids_to_query {
-                let r = match regions.get(pid) { Some(r) => r, None => continue };
-                let ps_addr = part_addr_map.get(pid)
-                    .or_else(|| ps_details.get(&r.ps_id).map(|d| &d.address))
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                if ps_addr.is_empty() { continue; }
-                let req_bytes = rkyv_encode(&GetDiscardsReq { part_id: *pid });
-                match client.get_ps_client(ps_addr).await {
-                    Ok(ps_client) => match ps_client
-                        .call_timeout(MSG_GET_DISCARDS, req_bytes, DEFAULT_RPC_TIMEOUT)
-                        .await
-                    {
-                        Ok(resp_bytes) => match rkyv_decode::<GetDiscardsResp>(&resp_bytes) {
-                            Ok(resp) if resp.code == autumn_rpc::partition_rpc::CODE_OK => {
-                                part_discards.insert(*pid, resp.discards);
-                            }
-                            Ok(resp) => eprintln!("[warning] discard fetch part {pid}: {}", resp.message),
-                            Err(e) => eprintln!("[warning] discard decode part {pid}: {e}"),
-                        },
-                        Err(e) => eprintln!("[warning] discard fetch failed for part {pid}: {e}"),
-                    },
-                    Err(e) => eprintln!("[warning] connect PS for part {pid}: {e}"),
-                }
-            }
-
-            fn human_size(bytes: u64) -> String {
-                if bytes >= 1 << 30 {
-                    format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
-                } else if bytes >= 1 << 20 {
-                    format!("{:.1} MB", bytes as f64 / (1u64 << 20) as f64)
-                } else if bytes >= 1 << 10 {
-                    format!("{:.1} KB", bytes as f64 / (1u64 << 10) as f64)
-                } else {
-                    format!("{} B", bytes)
-                }
-            }
-
-            fn stream_total(s: &MgrStreamInfo, extent_map: &HashMap<u64, MgrExtentInfo>) -> u64 {
-                s.extent_ids.iter().filter_map(|eid| extent_map.get(eid)).map(|e| e.sealed_length).sum()
-            }
-
-            if json {
-                // === JSON output ===
-                let nodes_view: Vec<InfoNodeView> = nodes_sorted.iter()
-                    .map(|(nid, n)| InfoNodeView {
-                        node_id: *nid,
-                        address: n.address.clone(),
-                        disks: n.disks.iter().map(|did| InfoDiskView {
-                            disk_id: *did,
-                            uuid: disk_map.get(did).map(|d| d.uuid.clone()).unwrap_or_default(),
-                            online: disk_map.get(did).map(|d| d.online).unwrap_or(false),
-                        }).collect(),
-                    })
-                    .collect();
-
-                let extents_view: Vec<InfoExtentView> = {
-                    let mut v: Vec<_> = extent_map.iter()
-                        .map(|(eid, e)| InfoExtentView {
-                            extent_id: *eid,
-                            size: e.sealed_length,
-                            open: open_extents.contains(eid),
-                            replicas: e.replicates.clone(),
-                            parity: e.parity.clone(),
-                            refs: e.refs,
-                            eversion: e.eversion,
-                        })
-                        .collect();
-                    v.sort_by_key(|e| e.extent_id);
-                    v
-                };
-
-                let streams_view: Vec<InfoStreamView> = streams_sorted.iter()
-                    .map(|(sid, s)| {
-                        let r = if s.replicates > 0 {
-                            s.replicates
-                        } else {
-                            s.extent_ids.iter()
-                                .find_map(|eid| extent_map.get(eid)
-                                    .filter(|e| !e.ec_converted)
-                                    .map(|e| e.replicates.len() as u32))
-                                .unwrap_or(0)
-                        };
-                        InfoStreamView {
-                            stream_id: *sid,
-                            replicates: r,
-                            ec_data: s.ec_data_shard,
-                            ec_parity: s.ec_parity_shard,
-                            extent_ids: s.extent_ids.clone(),
-                            total_size: stream_total(s, &extent_map),
-                        }
-                    })
-                    .collect();
-
-                let mut partitions_view: Vec<InfoPartitionView> = part_ids.iter()
-                    .filter_map(|pid| {
-                        let r = regions.get(pid)?;
-                        let rg = r.rg.as_ref()?;
-                        let ps_addr = part_addr_map.get(pid)
-                            .or_else(|| ps_details.get(&r.ps_id).map(|d| &d.address))
-                            .cloned()
-                            .unwrap_or_else(|| "unknown".to_string());
-                        let mut live_size = 0u64;
-                        let mut total_extents = 0usize;
-                        for sid in [r.log_stream, r.row_stream, r.meta_stream] {
-                            if let Some(s) = stream_map.get(&sid) {
-                                live_size += stream_total(s, &extent_map);
-                                total_extents += s.extent_ids.len();
-                            }
-                        }
-                        let discards = part_discards.get(pid)
-                            .map(|v| v.iter().map(|&(eid, bytes)| InfoDiscardEntry { extent_id: eid, bytes }).collect())
-                            .unwrap_or_default();
-                        Some(InfoPartitionView {
-                            part_id: *pid,
-                            ps_addr,
-                            range_start: String::from_utf8_lossy(&rg.start_key).into_owned(),
-                            range_end: if rg.end_key.is_empty() { String::new() } else { String::from_utf8_lossy(&rg.end_key).into_owned() },
-                            live_size,
-                            total_extents,
-                            log_stream_id: r.log_stream,
-                            row_stream_id: r.row_stream,
-                            meta_stream_id: r.meta_stream,
-                            discards,
-                        })
-                    })
-                    .collect();
-
-                // F205: sort by live_size desc kept (consistent
-                // ordering for human eyes when the same partition
-                // table is dumped). Top-N truncation was removed —
-                // Python consumers do `jq 'sort_by(.live_size) | reverse | .[:N]'`.
-                partitions_view.sort_by(|a, b| b.live_size.cmp(&a.live_size));
-
-                if let Some(pid) = part {
-                    match partitions_view.into_iter().find(|p| p.part_id == pid) {
-                        Some(pv) => println!("{}", serde_json::to_string_pretty(&pv)?),
-                        None => eprintln!("partition {pid} not found"),
-                    }
-                } else {
-                    let snapshot = InfoSnapshot { nodes: nodes_view, extents: extents_view, streams: streams_view, partitions: partitions_view };
-                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
-                }
-            } else {
-                // === Text output ===
-                // Determine which partitions to show. F205 removed --top.
-                let show_pids: Vec<u64> = if let Some(pid) = part {
-                    vec![pid]
-                } else {
-                    part_ids.clone()
-                };
-
-                // Nodes / Extents / Streams sections only in full mode
-                if part.is_none() {
-                    println!("=== Nodes ===");
-                    for (nid, n) in &nodes_sorted {
-                        // F191: display the control_address when present.
-                        // Empty = legacy node; manager falls back to addr.
-                        if n.control_address.is_empty() {
-                            println!("  node {}: addr={}", nid, n.address);
-                        } else {
-                            println!(
-                                "  node {}: addr={}, control_addr={}",
-                                nid, n.address, n.control_address
-                            );
-                        }
-                        for did in &n.disks {
-                            if let Some(d) = disk_map.get(did) {
-                                println!("    disk {}: uuid={}, online={}", did, d.uuid, d.online);
-                            } else {
-                                println!("    disk {}: (no info)", did);
-                            }
-                        }
-                    }
-
-                    println!("\n=== Extents ===");
-                    let mut extents: Vec<(&u64, &MgrExtentInfo)> = extent_map.iter().collect();
-                    extents.sort_by_key(|(id, _)| **id);
-                    for (eid, e) in &extents {
-                        let tag = if open_extents.contains(eid) { " (open)" } else { "" };
-                        // `ec_converted` is the authoritative EC marker — set
-                        // only by `apply_ec_conversion_done` after a sealed
-                        // extent is actually RS-encoded. Open / pre-conversion
-                        // extents on EC streams still hold full replicated
-                        // data on every K+M node despite having `parity != []`
-                        // pre-filled by `stream_alloc_extent`.
-                        let layout = if e.ec_converted {
-                            format!("EC({}+{}), data={:?}, parity={:?}",
-                                e.replicates.len(), e.parity.len(), e.replicates, e.parity)
-                        } else if e.parity.is_empty() {
-                            format!("replicas={:?}", e.replicates)
-                        } else {
-                            let mut all = e.replicates.clone();
-                            all.extend(e.parity.iter().copied());
-                            format!("replicas={:?}", all)
-                        };
-                        println!("  extent {}: size={}{}, {}, refs={}, eversion={}",
-                            eid, human_size(e.sealed_length), tag, layout, e.refs, e.eversion);
-                    }
-
-                    println!("\n=== Streams ===");
-                    for (sid, s) in &streams_sorted {
-                        let total = stream_total(s, &extent_map);
-                        // (replicates, ec_data, ec_parity) triple. For
-                        // legacy streams without `replicates` (default 0),
-                        // derive from a non-EC-converted extent.
-                        let r = if s.replicates > 0 {
-                            s.replicates
-                        } else {
-                            s.extent_ids.iter()
-                                .find_map(|eid| extent_map.get(eid)
-                                    .filter(|e| !e.ec_converted)
-                                    .map(|e| e.replicates.len() as u32))
-                                .unwrap_or(0)
-                        };
-                        let layout = if s.ec_parity_shard == 0 {
-                            format!("repl={}", r)
-                        } else {
-                            format!("repl={}, EC={}+{}", r, s.ec_data_shard, s.ec_parity_shard)
-                        };
-                        println!("  stream {} ({}): extents={:?}, total={}",
-                            sid, layout, s.extent_ids, human_size(total));
-                    }
-                }
-
-                // === Partitions section ===
-                let section_header = if let Some(pid) = part {
-                    format!("\n=== Partition {pid} ===")
-                } else {
-                    "\n=== Partitions ===".to_string()
-                };
-                println!("{section_header}");
-
-                for pid in &show_pids {
-                    let r = match regions.get(pid) {
-                        Some(r) => r,
-                        None => { println!("  part {pid}: not found"); continue; }
-                    };
-                    let rg = match r.rg.as_ref() { Some(r) => r, None => continue };
-                    let ps_addr = part_addr_map.get(pid)
-                        .or_else(|| ps_details.get(&r.ps_id).map(|d| &d.address))
-                        .map(|s| s.as_str())
-                        .unwrap_or("unknown");
-                    println!("  part {}: ps={}, range=[{}..{})",
-                        pid, ps_addr,
-                        String::from_utf8_lossy(&rg.start_key),
-                        if rg.end_key.is_empty() { "\u{221e}".to_string() } else { String::from_utf8_lossy(&rg.end_key).to_string() }
-                    );
-                    let discards = part_discards.get(pid);
-                    let mut part_total = 0u64;
-                    let mut part_extents = 0usize;
-                    for (label, sid) in [("log", r.log_stream), ("row", r.row_stream), ("meta", r.meta_stream)] {
-                        if let Some(s) = stream_map.get(&sid) {
-                            let total = stream_total(s, &extent_map);
-                            part_total += total;
-                            part_extents += s.extent_ids.len();
-                            let mut line = format!("    {}: stream {}, extents={:?}, size={}", label, sid, s.extent_ids, human_size(total));
-                            if label == "log" {
-                                if let Some(d) = discards {
-                                    if !d.is_empty() {
-                                        let total_discard: i64 = d.iter().map(|(_, b)| b).sum();
-                                        line.push_str(&format!(", discard: {} ext / {} pending", d.len(), human_size(total_discard as u64)));
-                                    }
-                                }
-                            }
-                            println!("{line}");
-                        }
-                    }
-                    println!("    total: {} extents, {}", part_extents, human_size(part_total));
-                }
-            }
-        }
     }
 
     Ok(())
