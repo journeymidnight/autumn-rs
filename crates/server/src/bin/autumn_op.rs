@@ -828,6 +828,9 @@ fn auto_state_str(b: u8) -> &'static str {
     match b {
         NODE_AUTO_STATE_ONLINE => "Online",
         NODE_AUTO_STATE_SUSPECTED => "Suspected",
+        // F214-B: registered, never verified alive. Distinct from
+        // Suspected — Suspended means "was alive, now flaky".
+        NODE_AUTO_STATE_SUSPEND => "Suspend",
         _ => "Unknown",
     }
 }

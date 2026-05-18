@@ -19,11 +19,19 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// Auto-tracked per-node state. There are deliberately only two states —
-/// `Online` and `Suspected`. `Down` / `Fenced` are operator-driven and
-/// persisted separately in `node_override/<id>` (F211-C).
+/// Auto-tracked per-node state. F214-B added `Suspend` — a registered
+/// node that has never had a successful heartbeat. Distinct from
+/// `Suspected` (which means "was alive and verified, now flaky") so the
+/// operator-facing health report can distinguish "format ran but EN
+/// never started" from "EN was running and crashed". `Down` / `Fenced`
+/// remain operator-driven and live in `node_override/<id>` (F211-C).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeAutoState {
+    /// F214-B: post-register, pre-first-df. The state machine entry
+    /// point. Transitions to `Online` on the first successful heartbeat
+    /// (df ok), or via operator re-register. Never transitions to
+    /// `Suspected` — Suspended requires a prior verified-alive baseline.
+    Suspend,
     Online,
     Suspected { since: Instant },
 }
@@ -35,6 +43,10 @@ impl NodeAutoState {
 
     pub fn is_suspected(self) -> bool {
         matches!(self, NodeAutoState::Suspected { .. })
+    }
+
+    pub fn is_suspend(self) -> bool {
+        matches!(self, NodeAutoState::Suspend)
     }
 }
 
@@ -84,25 +96,41 @@ impl NodeStateTracker {
         self.states.insert(node_id, NodeAutoState::Online);
     }
 
-    /// Heartbeat failure. Mark `Suspected` if (a) we already have a
-    /// last_ok stamp and the soft timeout has elapsed since it, or
-    /// (b) this is the first signal we've ever had for the node
-    /// (defensive — registration should always touch last_ok first,
-    /// but make sure a never-seen-then-failed node still surfaces).
+    /// F214-B: first-time register seed. Sets the state to `Suspend` and
+    /// does **not** touch `last_ok` — we have no first heartbeat yet, so
+    /// any later `on_heartbeat_fail` defensively flips us to `Suspected`
+    /// only after the soft timeout (its `last_ok` lookup falls through
+    /// to `Duration::MAX`). The first successful df transitions to
+    /// `Online` via `on_heartbeat_ok`.
     ///
-    /// `Suspected → Suspected` is a no-op (keeps the original
-    /// `since` timestamp so the operator sees "how long has it been
-    /// flaky").
+    /// Re-register (operator re-runs format / register-node against an
+    /// already-known address) goes through `on_heartbeat_ok` instead —
+    /// the operator's explicit re-registration counts as vouching the
+    /// node alive, matching the pre-F214 F211-A behaviour.
+    pub fn on_register_first(&mut self, node_id: u64) {
+        self.states.insert(node_id, NodeAutoState::Suspend);
+        // No last_ok insert — see doc above.
+    }
+
+    /// Heartbeat failure. Mark `Suspected` only when we already have a
+    /// verified-alive baseline (`last_ok` set) AND the soft timeout has
+    /// elapsed. F214-B: a `Suspend` node — registered but never
+    /// verified — stays `Suspend` on failure; never auto-promoted to
+    /// `Suspected` because the "was alive, now flaky" framing requires
+    /// the prior verified state.
+    ///
+    /// `Suspected → Suspected` is a no-op (keeps the original `since`
+    /// timestamp so the operator sees "how long has it been flaky").
     pub fn on_heartbeat_fail(&mut self, node_id: u64) {
         let now = Instant::now();
-        let elapsed_since_ok = self
-            .last_ok
-            .get(&node_id)
-            .map(|t| now.duration_since(*t))
-            .unwrap_or(Duration::MAX);
+        let elapsed_since_ok = match self.last_ok.get(&node_id) {
+            Some(t) => now.duration_since(*t),
+            None => return, // never verified → stay Suspend (or whatever caller set)
+        };
         let cur = self.states.get(&node_id).copied();
         match cur {
             Some(NodeAutoState::Suspected { .. }) => {}
+            Some(NodeAutoState::Suspend) => {} // F214-B: no auto-promotion
             Some(NodeAutoState::Online) | None => {
                 if elapsed_since_ok >= self.soft_timeout {
                     self.states
@@ -114,6 +142,8 @@ impl NodeStateTracker {
 
     /// Periodic tick — promote stale `Online` entries even without an
     /// explicit failure call (defensive against missed failure paths).
+    /// F214-B: `Suspend` nodes (no `last_ok` ever) are not affected — the
+    /// filter on `self.last_ok.iter()` naturally skips them.
     pub fn tick(&mut self) {
         let now = Instant::now();
         let timeout = self.soft_timeout;
@@ -160,6 +190,25 @@ impl NodeStateTracker {
             Some(NodeAutoState::Suspected { since }) => Some(since.elapsed().as_secs()),
             _ => None,
         }
+    }
+
+    /// F214-B test helper: seed a node directly into the `Suspend` state.
+    #[cfg(test)]
+    pub(crate) fn _test_register_first(&mut self, node_id: u64) {
+        self.on_register_first(node_id);
+    }
+
+    /// F214-B: return the set of node_ids whose state is `Online`. Used
+    /// by `select_nodes` to gate fresh extent allocation on a verified-
+    /// alive baseline. Pre-F214-B, allocation gated only on
+    /// `disk.online`, which is a per-disk-health signal — that left a
+    /// 10-20 s "Pending" window after `register-node` where the
+    /// allocation could target an EN whose binary had never started.
+    pub fn online_node_ids(&self) -> std::collections::HashSet<u64> {
+        self.states
+            .iter()
+            .filter_map(|(id, st)| if st.is_online() { Some(*id) } else { None })
+            .collect()
     }
 
     /// Snapshot: `(node_id, state, last_heartbeat_secs_ago)` for every
@@ -260,6 +309,53 @@ mod tests {
         // is gone, not stale.
         assert_eq!(t.state_of(7), NodeAutoState::Online);
         assert!(t.last_heartbeat_secs_ago(7).is_none());
+    }
+
+    // ── F214-B ──────────────────────────────────────────────────────
+
+    #[test]
+    fn register_first_seeds_suspend() {
+        let mut t = NodeStateTracker::new(Duration::from_secs(10));
+        t.on_register_first(7);
+        assert_eq!(t.state_of(7), NodeAutoState::Suspend);
+        assert!(t.state_of(7).is_suspend());
+        assert!(!t.state_of(7).is_online());
+        assert!(t.last_heartbeat_secs_ago(7).is_none());
+    }
+
+    #[test]
+    fn suspend_then_df_ok_transitions_to_online() {
+        let mut t = NodeStateTracker::new(Duration::from_secs(10));
+        t.on_register_first(7);
+        assert!(t.state_of(7).is_suspend());
+        t.on_heartbeat_ok(7);
+        assert_eq!(t.state_of(7), NodeAutoState::Online);
+        assert!(t.last_heartbeat_secs_ago(7).is_some());
+    }
+
+    #[test]
+    fn suspend_does_not_auto_promote_to_suspected() {
+        let mut t = NodeStateTracker::new(Duration::from_secs(0));
+        t.on_register_first(7);
+        // Even with zero soft_timeout, a failure on a Suspend node
+        // must NOT promote to Suspected — Suspected semantics require
+        // a prior verified-alive baseline.
+        t.on_heartbeat_fail(7);
+        assert!(t.state_of(7).is_suspend(), "got {:?}", t.state_of(7));
+        // tick() likewise does not touch Suspend (no last_ok to iterate).
+        t.tick();
+        assert!(t.state_of(7).is_suspend(), "got {:?}", t.state_of(7));
+    }
+
+    #[test]
+    fn re_register_skips_suspend_via_heartbeat_ok() {
+        let mut t = NodeStateTracker::new(Duration::from_secs(10));
+        // Simulate a node already known and verified.
+        t.on_register_first(7);
+        t.on_heartbeat_ok(7);
+        // Operator re-runs `register-node` — handler uses on_heartbeat_ok.
+        t.on_heartbeat_ok(7);
+        assert_eq!(t.state_of(7), NodeAutoState::Online);
     }
 
     #[test]

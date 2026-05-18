@@ -118,6 +118,14 @@ pub const MSG_RECOVERY_STATS: u8 = 0x43;
 // F211-I: append-only operator audit log query.
 pub const MSG_QUERY_AUDIT_LOG: u8 = 0x44;
 
+// F214-A: read-only cluster identity. The manager CAS-writes a UUID to
+// etcd `autumn-rs/cluster_id` on first leader promotion; this RPC exposes
+// it to `autumn-op format` (stamps cluster_id into each formatted disk)
+// and to `autumn-extent-node` (verifies the disk's stamped cluster_id
+// matches the manager's before serving). Followers can answer from
+// replayed state — no leader check.
+pub const MSG_GET_CLUSTER_ID: u8 = 0x45;
+
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
 /// Serialize a value to Bytes using rkyv.
@@ -1087,9 +1095,12 @@ pub const EXT_MSG_PROBE_EXTENT: u8 = 14;
 // rest of this file. New `MgrNode*` types are append-only; existing wire
 // shapes (MgrNodeInfo, MgrExtentInfo, etc.) are unchanged.
 
-/// F211-A/B: auto-tracked state byte. Wire-stable.
+/// F211-A/B + F214-B: auto-tracked state byte. Wire-stable; APPEND-only.
 pub const NODE_AUTO_STATE_ONLINE: u8 = 0;
 pub const NODE_AUTO_STATE_SUSPECTED: u8 = 1;
+/// F214-B: registered, never verified alive (no successful df yet).
+/// Initial state for any node freshly added via `MSG_REGISTER_NODE`.
+pub const NODE_AUTO_STATE_SUSPEND: u8 = 2;
 
 /// F211-C: operator override kind. Wire-stable; new kinds APPEND-only.
 pub const NODE_OVERRIDE_NONE: u8 = 0;
@@ -1324,4 +1335,17 @@ pub struct QueryAuditLogResp {
     pub code: u8,
     pub message: String,
     pub entries: Vec<MgrAuditEntry>,
+}
+
+// --- GetClusterId ---
+// F214-A: read-only cluster identity exposed via MSG_GET_CLUSTER_ID.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetClusterIdReq {}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetClusterIdResp {
+    pub code: u8,
+    pub message: String,
+    /// UUID string. Empty when `code` != `CODE_OK`.
+    pub cluster_id: String,
 }

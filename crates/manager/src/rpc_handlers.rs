@@ -189,6 +189,7 @@ impl AutumnManager {
             MSG_REMOVE_NODE => self.handle_remove_node(payload).await,
             MSG_RECOVERY_STATS => self.handle_recovery_stats(payload).await,
             MSG_QUERY_AUDIT_LOG => self.handle_query_audit_log(payload).await,
+            MSG_GET_CLUSTER_ID => self.handle_get_cluster_id().await,
             _ => Err((
                 StatusCode::InvalidArgument,
                 format!("unknown msg_type {msg_type}"),
@@ -202,6 +203,27 @@ impl AutumnManager {
         Ok(rkyv_encode(&CodeResp {
             code: CODE_OK,
             message: String::new(),
+        }))
+    }
+
+    /// F214-A: read-only cluster identity. Servable from any replica
+    /// (followers answer from replayed state); no leader gate. The only
+    /// failure mode is "the manager has never run leader election yet
+    /// against a fresh etcd" — surfaced as `CODE_UNAVAILABLE` so the
+    /// caller (typically `autumn-op format`) knows to retry.
+    async fn handle_get_cluster_id(&self) -> HandlerResult {
+        let id = self.cluster_id.borrow().clone();
+        if id.is_empty() {
+            return Ok(rkyv_encode(&GetClusterIdResp {
+                code: CODE_ERROR,
+                message: "manager not yet bootstrapped".to_string(),
+                cluster_id: String::new(),
+            }));
+        }
+        Ok(rkyv_encode(&GetClusterIdResp {
+            code: CODE_OK,
+            message: String::new(),
+            cluster_id: id,
         }))
     }
 
@@ -401,10 +423,13 @@ impl AutumnManager {
             }
             s.nodes.insert(node_id, node.clone());
         }
-        // F211-A: seed the tracker with an initial OK heartbeat so the
-        // node starts Online and a stale `df` doesn't immediately
-        // promote it Suspected.
-        self.node_states.borrow_mut().on_heartbeat_ok(node_id);
+        // F214-B: first-time register seeds `Suspend` — a registered
+        // but never-verified-alive state. The first successful df from
+        // `disk_status_update_loop` transitions to `Online` via
+        // `on_heartbeat_ok`. Pre-F214-B this seeded `Online` directly,
+        // which created a 10-20 s ghost window where a registered-but-
+        // not-yet-started EN was eligible for `select_nodes`.
+        self.node_states.borrow_mut().on_register_first(node_id);
 
         Ok(rkyv_encode(&RegisterNodeResp {
             code: CODE_OK,
@@ -486,9 +511,21 @@ impl AutumnManager {
             }));
         }
 
+        // F214-B: capture the verified-online node set BEFORE borrowing
+        // the store; select_nodes uses it as the primary allocation
+        // filter so a freshly-registered (but not-yet-df'd) EN doesn't
+        // get picked. Two separate borrows are fine — node_states is an
+        // independent RefCell.
+        let online_node_ids = self.node_states.borrow().online_node_ids();
         let (stream_id, extent_id, selected) = {
             let mut s = self.store.inner.borrow_mut();
-            let selected = match Self::select_nodes(&s.nodes, &s.disks, total_replicas, &[]) {
+            let selected = match Self::select_nodes(
+                &s.nodes,
+                &s.disks,
+                &online_node_ids,
+                total_replicas,
+                &[],
+            ) {
                 Ok(v) => v,
                 Err(err) => {
                     return Ok(rkyv_encode(&CreateStreamResp {
@@ -874,6 +911,9 @@ impl AutumnManager {
         let req: StreamAllocExtentReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
+        // F214-B: capture the verified-online node set before borrowing
+        // the store. See `handle_create_stream` for the same pattern.
+        let online_node_ids = self.node_states.borrow().online_node_ids();
         let (mut tail, selected, extent_id, data, nodes_map) = {
             let mut s = self.store.inner.borrow_mut();
             if let Err(err) = Self::ensure_owner_revision(&req.owner_key, req.revision, &s) {
@@ -950,7 +990,13 @@ impl AutumnManager {
             } else {
                 tail.replicates.len()
             };
-            let selected = match Self::select_nodes(&s.nodes, &s.disks, data, &req.exclude_node_ids) {
+            let selected = match Self::select_nodes(
+                &s.nodes,
+                &s.disks,
+                &online_node_ids,
+                data,
+                &req.exclude_node_ids,
+            ) {
                 Ok(v) => v,
                 Err(err) => {
                     return Ok(rkyv_encode(&StreamAllocExtentResp {
@@ -1907,6 +1953,10 @@ impl AutumnManager {
         let req: MultiModifyMergeReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
+        // F214-B: capture verified-online node set BEFORE borrowing the
+        // store. Passed into the Phase-1 select_nodes call.
+        let online_node_ids = self.node_states.borrow().online_node_ids();
+
         // Phase 1: compute under borrow_mut, NO awaits inside.
         // Returns alloc-IDs reserved + selected nodes for Phase 1.5.
         struct Phase1Result {
@@ -2021,7 +2071,13 @@ impl AutumnManager {
                 } else {
                     3
                 };
-                let selected = Self::select_nodes(&s.nodes, &s.disks, target_replicas, &[])?;
+                let selected = Self::select_nodes(
+                    &s.nodes,
+                    &s.disks,
+                    &online_node_ids,
+                    target_replicas,
+                    &[],
+                )?;
                 let new_tail = MgrExtentInfo {
                     extent_id: new_tail_id,
                     replicates: selected.iter().map(|n| n.node_id).collect(),
@@ -3401,6 +3457,7 @@ impl AutumnManager {
                     crate::node_state::NodeAutoState::Suspected { .. } => {
                         NODE_AUTO_STATE_SUSPECTED
                     }
+                    crate::node_state::NodeAutoState::Suspend => NODE_AUTO_STATE_SUSPEND,
                 };
                 let suspected_age = match auto_state {
                     crate::node_state::NodeAutoState::Suspected { since } => {
@@ -3474,6 +3531,7 @@ impl AutumnManager {
                     crate::node_state::NodeAutoState::Suspected { .. } => {
                         NODE_AUTO_STATE_SUSPECTED
                     }
+                    crate::node_state::NodeAutoState::Suspend => NODE_AUTO_STATE_SUSPEND,
                 };
                 let ovr = overrides
                     .get(&node_id)
@@ -3549,6 +3607,7 @@ impl AutumnManager {
                 crate::node_state::NodeAutoState::Suspected { .. } => {
                     NODE_AUTO_STATE_SUSPECTED
                 }
+                crate::node_state::NodeAutoState::Suspend => NODE_AUTO_STATE_SUSPEND,
             };
             let ovr = overrides
                 .get(&coord)

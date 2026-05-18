@@ -44,6 +44,13 @@ pub const NODE_OVERRIDE_PREFIX: &str = "node_override/";
 /// blocks re-registration.
 pub const DECOMMISSIONED_PREFIX: &str = "decommissioned/";
 
+/// F214-A: cluster identity key. Written exactly once: the first leader
+/// to win the election CAS-creates this key (create_revision==0) with a
+/// fresh UUID. Subsequent leaders inherit via `replay_from_etcd`. Read
+/// by `MSG_GET_CLUSTER_ID` so `autumn-op format` can stamp each
+/// formatted disk and `autumn-extent-node` can verify on startup.
+pub const CLUSTER_ID_KEY: &str = "autumn-rs/cluster_id";
+
 #[derive(Clone)]
 pub(crate) struct EtcdMirror {
     client: Rc<RefCell<autumn_etcd::EtcdClient>>,
@@ -459,6 +466,14 @@ pub struct AutumnManager {
     /// `--report-disk-failure-quorum` CLI flag (was previously
     /// `AUTUMN_REPORT_DISK_FAILURE_QUORUM`).
     pub(crate) report_disk_failure_quorum: Cell<usize>,
+    /// F214-A: persistent cluster identity. CAS-created in etcd
+    /// (`autumn-rs/cluster_id`) by the first leader; inherited by
+    /// subsequent leaders via `replay_from_etcd`. Empty when the manager
+    /// is running in memory-only mode (no etcd) — in that mode
+    /// `MSG_GET_CLUSTER_ID` reports the per-process random UUID set in
+    /// `Self::new()` so dev/test workflows still work end-to-end. Read
+    /// by `handle_get_cluster_id`.
+    pub(crate) cluster_id: Rc<RefCell<String>>,
 }
 
 impl Default for AutumnManager {
@@ -499,6 +514,10 @@ impl AutumnManager {
                 crate::recovery_rate_limiter::RecoveryRateLimiter::from_env(),
             )),
             audit_seq: Rc::new(Cell::new(0)),
+            // F214-A: in memory-only mode this serves as the cluster
+            // identity. Overwritten by `try_become_leader` /
+            // `replay_from_etcd` when etcd is configured.
+            cluster_id: Rc::new(RefCell::new(uuid::Uuid::new_v4().to_string())),
         }
     }
 
@@ -1093,6 +1112,20 @@ impl AutumnManager {
         }
         self.set_leader(true);
 
+        // F214-A: ensure the cluster identity is imprinted in etcd. The
+        // CAS uses create_revision==0, so only the first leader ever to
+        // run against a fresh etcd actually writes; subsequent leaders
+        // re-CAS, observe `succeeded == false`, and read the existing
+        // value. `replay_from_etcd` already loaded any prior value, so
+        // this path also handles "I'm the first leader on a never-bootstrapped
+        // etcd". Best-effort: a failure here logs WARN and leaves the
+        // per-process UUID as the cluster_id; the next election retry
+        // will try again. Wire through `txn_fenced` so the write
+        // inherits the F149 leader-fence guarantee.
+        if let Err(err) = self.imprint_cluster_id().await {
+            tracing::warn!(error = %err, "F214-A: imprint_cluster_id failed");
+        }
+
         let mgr = self.clone();
         compio::runtime::spawn(async move {
             mgr.leader_keepalive_loop(lease_id).await;
@@ -1100,6 +1133,75 @@ impl AutumnManager {
         .detach();
 
         Ok(true)
+    }
+
+    /// F214-A: CAS-imprint the cluster_id key in etcd. Idempotent.
+    /// On first ever leader: generates a fresh UUID and CAS-writes
+    /// `create_revision==0`. On subsequent leaders the CAS fails (key
+    /// already exists), and we read the existing value to install it
+    /// in-memory. Memory-only mode (no etcd) short-circuits with the
+    /// per-process UUID seeded in `Self::new()`.
+    async fn imprint_cluster_id(&self) -> Result<(), AppError> {
+        let etcd = match &self.etcd {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+
+        // If replay already populated cluster_id from etcd, we're done.
+        // The `Self::new()` seed is a random UUID; distinguish "replayed
+        // from etcd" from "still the new() seed" by re-reading etcd.
+        let existing = {
+            let c = etcd.client.as_ptr();
+            unsafe { &mut *c }
+                .get(CLUSTER_ID_KEY.as_bytes())
+                .await
+                .map_err(|e| AppError::Internal(format!("get cluster_id: {e}")))?
+        };
+        if let Some(kv) = existing.kvs.first() {
+            let id = str::from_utf8(&kv.value)
+                .map_err(|e| AppError::Internal(format!("cluster_id utf8: {e}")))?
+                .to_string();
+            *self.cluster_id.borrow_mut() = id;
+            return Ok(());
+        }
+
+        // Key doesn't exist — try to create it. The CAS races other
+        // leaders only in pathological promotion-storm scenarios; any
+        // race loser re-reads and installs the winner's value.
+        let fresh = uuid::Uuid::new_v4().to_string();
+        let cmp = autumn_etcd::Cmp::create_revision(CLUSTER_ID_KEY.as_bytes(), 0);
+        let put = autumn_etcd::Op::put(CLUSTER_ID_KEY.as_bytes(), fresh.as_bytes());
+        match etcd.txn_fenced(vec![cmp], vec![put], vec![]).await? {
+            true => {
+                *self.cluster_id.borrow_mut() = fresh;
+                tracing::info!(
+                    cluster_id = %self.cluster_id.borrow().as_str(),
+                    "F214-A: imprinted fresh cluster_id"
+                );
+                Ok(())
+            }
+            false => {
+                // CAS lost — re-read whoever wrote first.
+                let resp = {
+                    let c = etcd.client.as_ptr();
+                    unsafe { &mut *c }
+                        .get(CLUSTER_ID_KEY.as_bytes())
+                        .await
+                        .map_err(|e| AppError::Internal(format!("re-get cluster_id: {e}")))?
+                };
+                if let Some(kv) = resp.kvs.first() {
+                    let id = str::from_utf8(&kv.value)
+                        .map_err(|e| AppError::Internal(format!("cluster_id utf8: {e}")))?
+                        .to_string();
+                    *self.cluster_id.borrow_mut() = id;
+                    Ok(())
+                } else {
+                    Err(AppError::Internal(
+                        "cluster_id CAS lost but key absent on re-read".into(),
+                    ))
+                }
+            }
+        }
     }
 
     async fn leader_keepalive_loop(self, lease_id: i64) {
@@ -1162,6 +1264,8 @@ impl AutumnManager {
         // F211-C: persistent operator overrides + decommissioned tombstones.
         let node_override_raw = c.get_prefix(NODE_OVERRIDE_PREFIX).await?;
         let decommissioned_raw = c.get_prefix(DECOMMISSIONED_PREFIX).await?;
+        // F214-A: cluster identity (single key, not a prefix).
+        let cluster_id_kv = c.get(CLUSTER_ID_KEY.as_bytes()).await?;
         drop(c);
 
         let mut max_id = 0u64;
@@ -1387,6 +1491,17 @@ impl AutumnManager {
                 }
             }
         }
+        // F214-A: install cluster_id from etcd. The key may legitimately
+        // be absent on a brand-new cluster where no leader has yet run
+        // `imprint_cluster_id`; in that case `try_become_leader` will
+        // write it right after replay completes. Followers see the
+        // stable value on every subsequent replay.
+        if let Some(kv) = cluster_id_kv.kvs.first() {
+            let id = str::from_utf8(&kv.value)
+                .map_err(|e| anyhow::anyhow!("cluster_id utf8: {e}"))?
+                .to_string();
+            *self.cluster_id.borrow_mut() = id;
+        }
         // F210-G2: rehydrate `failed_deletes` from the persisted retry
         // prefix. `attempts` + `last_attempt_at` are kept as written so
         // the new leader respects any in-flight backoff window from
@@ -1479,9 +1594,19 @@ impl AutumnManager {
     /// this set BEFORE the online-disk filter; if the result is too small
     /// to satisfy `count`, drop the exclusion and retry — never block
     /// allocation on a stale exclude.
+    ///
+    /// F214-B: `online_node_ids` is the set of nodes whose
+    /// `NodeStateTracker` state is `Online` (i.e. registered AND verified
+    /// alive via at least one successful df). Suspend / Suspected nodes
+    /// are excluded at the primary filter; the cold-leader fallback
+    /// still applies — when too few `Online` nodes exist (e.g. the
+    /// manager has just won leader election and hasn't run its first
+    /// df sweep), the pool widens to honour the existing
+    /// "fall-back-to-fresh-node" path in `handle_stream_alloc_extent`.
     fn select_nodes(
         nodes: &HashMap<u64, MgrNodeInfo>,
         disks: &HashMap<u64, MgrDiskInfo>,
+        online_node_ids: &HashSet<u64>,
         count: usize,
         exclude_node_ids: &[u64],
     ) -> Result<Vec<MgrNodeInfo>, AppError> {
@@ -1506,8 +1631,13 @@ impl AutumnManager {
         } else {
             all_unfiltered
         };
+        // F214-B + F121: prefer nodes that are BOTH verified-Online AND
+        // have at least one online disk. The two filters layer naturally
+        // — the state filter is the new gate, the disk filter is the
+        // existing post-df health signal.
         let healthy: Vec<MgrNodeInfo> = all
             .iter()
+            .filter(|n| online_node_ids.contains(&n.node_id))
             .filter(|n| {
                 n.disks
                     .iter()
@@ -1521,11 +1651,13 @@ impl AutumnManager {
             pool.shuffle(&mut rng);
             return Ok(pool.into_iter().take(count).collect());
         }
-        // Degraded fallback: not enough online disks observed; preserve
-        // the pre-F121 behaviour of using the full node set so the
-        // post-RPC fall-back path in `handle_stream_alloc_extent` can
-        // still recover (it pings the candidate per-RPC and walks
-        // alternates on failure).
+        // Degraded fallback: not enough verified-online nodes with
+        // online disks. Preserve the pre-F121 / pre-F214-B fallback —
+        // widen to the full node set so the post-RPC fall-back path
+        // in `handle_stream_alloc_extent` can still recover (it pings
+        // the candidate per-RPC and walks alternates on failure). Cold-
+        // leader case (no df sweep yet → online_node_ids empty) is
+        // covered here.
         let mut pool = all;
         pool.shuffle(&mut rng);
         Ok(pool.into_iter().take(count).collect())
@@ -4267,10 +4399,19 @@ mod tests {
             );
         }
 
+        // F214-B: tests assume all nodes are verified-Online.
+        let online_node_ids: HashSet<u64> = nodes.keys().copied().collect();
         const ITERS: usize = 1000;
         let mut counts: HashMap<u64, usize> = HashMap::new();
         for _ in 0..ITERS {
-            let picked = AutumnManager::select_nodes(&nodes, &disks, 3, &[]).unwrap();
+            let picked = AutumnManager::select_nodes(
+                &nodes,
+                &disks,
+                &online_node_ids,
+                3,
+                &[],
+            )
+            .unwrap();
             assert_eq!(picked.len(), 3);
             let mut ids: Vec<u64> = picked.iter().map(|n| n.node_id).collect();
             ids.sort();
@@ -4312,9 +4453,20 @@ mod tests {
             );
         }
 
+        // F214-B: tests assume all nodes are verified-Online; the
+        // degraded fallback here is "no online disks" (empty `disks`
+        // map), not "no Online state nodes".
+        let online_node_ids: HashSet<u64> = nodes.keys().copied().collect();
         let mut first_node_seen: HashSet<u64> = HashSet::new();
         for _ in 0..200 {
-            let picked = AutumnManager::select_nodes(&nodes, &disks, 1, &[]).unwrap();
+            let picked = AutumnManager::select_nodes(
+                &nodes,
+                &disks,
+                &online_node_ids,
+                1,
+                &[],
+            )
+            .unwrap();
             first_node_seen.insert(picked[0].node_id);
         }
         assert!(

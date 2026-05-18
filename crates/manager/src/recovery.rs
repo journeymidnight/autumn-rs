@@ -979,11 +979,18 @@ impl crate::AutumnManager {
                             .copied()
                             .unwrap_or(crate::node_state::NodeAutoState::Online);
                         let is_overridden = overrides_snap.contains_key(coord);
-                        if auto_st.is_suspected() || is_overridden {
-                            // Silent skip — no log spam. The marker stays
-                            // in the ledger and will be picked up when
-                            // either the node recovers or the OP fences it
-                            // (which triggers `auto_abandon_for_fenced_node`).
+                        // F211-F + F214-B: skip dispatch when the coord
+                        // can't be trusted to receive shards — Suspected
+                        // (was alive, now flaky), Suspend (never verified
+                        // alive), or operator-overridden (Fenced /
+                        // Maintenance). The marker stays in the ledger
+                        // and is picked up when the coord recovers or
+                        // when the OP fences it (which triggers
+                        // `auto_abandon_for_fenced_node`).
+                        if auto_st.is_suspected()
+                            || auto_st.is_suspend()
+                            || is_overridden
+                        {
                             continue;
                         }
                     }
