@@ -156,6 +156,12 @@ enum Command {
         listen: String,
         advertise: String,
         dirs: Vec<String>,
+        /// F099-M: per-shard listener ports the EN binds. Empty = single-
+        /// shard mode (manager routes everything to `advertise`). Multi-
+        /// shard clusters (AUTUMN_EXTENT_SHARDS>1) MUST pass these so
+        /// the manager can route extent ops to the owning shard by
+        /// `extent_id % shard_count`.
+        shard_ports: Vec<u16>,
     },
 }
 
@@ -579,6 +585,7 @@ fn parse() -> Args {
             let mut listen = String::new();
             let mut advertise = String::new();
             let mut dirs = Vec::new();
+            let mut shard_ports: Vec<u16> = Vec::new();
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--listen" => {
@@ -589,18 +596,37 @@ fn parse() -> Args {
                         i += 1;
                         advertise = raw[i].clone();
                     }
+                    "--shard-ports" => {
+                        // Comma-separated u16 list. Required for
+                        // F099-M multi-shard ENs so the manager can
+                        // route per-extent ops to the owning shard.
+                        i += 1;
+                        for part in raw[i].split(',') {
+                            let p = part.trim();
+                            if p.is_empty() {
+                                continue;
+                            }
+                            let port: u16 = p
+                                .parse()
+                                .expect("--shard-ports entries must be u16");
+                            shard_ports.push(port);
+                        }
+                    }
                     _ => dirs.push(raw[i].clone()),
                 }
                 i += 1;
             }
             if listen.is_empty() || advertise.is_empty() || dirs.is_empty() {
-                eprintln!("format requires --listen <ADDR> --advertise <ADDR> <DIR>...");
+                eprintln!(
+                    "format requires --listen <ADDR> --advertise <ADDR> [--shard-ports P1,P2,...] <DIR>..."
+                );
                 std::process::exit(1);
             }
             Command::Format {
                 listen,
                 advertise,
                 dirs,
+                shard_ports,
             }
         }
         _ => usage(),
@@ -1633,6 +1659,7 @@ async fn run(args: Args) -> Result<()> {
             listen,
             advertise,
             dirs,
+            shard_ports,
         } => {
             // F214-C: fetch the manager's cluster_id BEFORE touching
             // any disk. Failure here means the manager is not yet
@@ -1689,6 +1716,10 @@ async fn run(args: Args) -> Result<()> {
             // F214-C: register against the manager. Re-register branch
             // (existing address known) returns the existing node_id +
             // matching disk_ids, so idempotency holds end-to-end.
+            // F099-M: pass `shard_ports` so the manager routes
+            // per-extent operations to the owning shard via
+            // `extent_id % shard_count`. Empty vec = single-shard EN
+            // (manager routes everything to `advertise`).
             let control_address = derive_control_address(&advertise);
             let resp_bytes = client
                 .mgr_call(
@@ -1696,7 +1727,7 @@ async fn run(args: Args) -> Result<()> {
                     rkyv_encode(&RegisterNodeReq {
                         addr: advertise.clone(),
                         disk_uuids: disk_uuids.clone(),
-                        shard_ports: vec![],
+                        shard_ports: shard_ports.clone(),
                         control_address,
                     }),
                 )

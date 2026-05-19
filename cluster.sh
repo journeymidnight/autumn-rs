@@ -288,10 +288,31 @@ format_extent_node() {
     # the launch path can rely on them.
     # shellcheck disable=SC2046  # intentional word splitting on commas
     mkdir -p $(echo "$disk_arg" | tr ',' ' ')
+    # F099-M: when AUTUMN_EXTENT_SHARDS > 1, the EN binds K sibling
+    # ports at `port + idx*shard_stride`. Pass them to the manager via
+    # --shard-ports so it routes per-extent ops to the owning shard.
+    # Pre-this fix (post-F214 regression), format hardcoded shard_ports
+    # to empty; with SHARDS=8 every alloc_extent_on_node hit shard 0
+    # which forwarded to siblings, but the perf path needs direct
+    # routing for throughput.
+    local -a shard_args=()
+    if (( SHARDS > 1 )); then
+        local shard_ports_csv=""
+        for (( s=0; s<SHARDS; s++ )); do
+            local sp=$(( port + s * SHARD_STRIDE ))
+            if [[ -z "$shard_ports_csv" ]]; then
+                shard_ports_csv="$sp"
+            else
+                shard_ports_csv="${shard_ports_csv},${sp}"
+            fi
+        done
+        shard_args=(--shard-ports "$shard_ports_csv")
+    fi
     # shellcheck disable=SC2086  # intentional word splitting for positional args
     "$AO" --manager "$MANAGER_ADDR" format \
         --listen ":$port" \
         --advertise "${BIND_HOST}:$port" \
+        ${shard_args[@]:+"${shard_args[@]}"} \
         $(echo "$disk_arg" | tr ',' ' ')
 }
 
