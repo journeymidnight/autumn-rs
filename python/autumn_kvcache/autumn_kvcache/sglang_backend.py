@@ -60,6 +60,11 @@ def _build_tenant_suffix(cfg) -> str:
     if cfg is None:
         return "default"
     model = getattr(cfg, "model_name", None) or "unknown"
+    # sglang passes the raw `--model-path` value here, which is commonly a
+    # filesystem path like `/data/models/Qwen3-VL-32B-Instruct`. Slashes
+    # work in autumn keys but produce noisy `kvc//data/...` strings; strip
+    # leading slashes and replace inner ones to keep keys readable.
+    model = str(model).strip("/").replace("/", "_")
     is_mla = bool(getattr(cfg, "is_mla_model", False))
     tp_rank = getattr(cfg, "tp_rank", 0)
     tp_size = getattr(cfg, "tp_size", 1)
@@ -89,12 +94,20 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
     """
 
     def __init__(self, storage_config=None, extra_kwargs: Optional[dict] = None):
-        # `extra_kwargs` carries everything from
-        # `--hicache-storage-backend-extra-config '{...}'` after the factory
-        # strips its own bookkeeping fields (backend_name / module_path /
-        # class_name / interface_v1).
+        # `storage_config.extra_config` is the parsed JSON dict from
+        # `--hicache-storage-backend-extra-config '{...}'`. sglang's
+        # `_create_dynamic_backend` does NOT split out individual keys from
+        # extra_config into kwargs; everything lives on the dataclass.
+        # `extra_kwargs` is just whatever the factory's caller passed (today
+        # always {}), kept for forward-compat.
         extra_kwargs = extra_kwargs or {}
-        endpoint = extra_kwargs.get("endpoint") or extra_kwargs.get("manager")
+        extra_config = getattr(storage_config, "extra_config", None) or {}
+        endpoint = (
+            extra_config.get("endpoint")
+            or extra_config.get("manager")
+            or extra_kwargs.get("endpoint")
+            or extra_kwargs.get("manager")
+        )
         if not endpoint:
             raise ValueError(
                 "AutumnKVCacheStorage requires 'endpoint' in extra_config "
@@ -135,17 +148,28 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
     def _page_view(self, idx: int):
         """Resolve a host_index to a buffer-protocol view of the pinned page.
 
-        sglang's HostKVCache.get_data_page returns a torch.Tensor (1D, uint8
-        view of the page bytes) when called with `flat=True`. The tensor's
-        `.numpy()` view satisfies Python's buffer protocol without any data
-        copy; that's what we feed to autumn's `put_from` / `get_into`.
+        sglang's HostKVCache.get_data_page(idx, flat=True) returns a 1-D
+        torch.Tensor view into the pinned host pool. Its dtype matches the
+        model's KV cache dtype (commonly bfloat16 or float16).
+
+        autumn's `put_from` / `get_into` use PyBuffer<u8>, so we reinterpret
+        the tensor as uint8 before exposing it. `.view(torch.uint8)` is a
+        zero-copy bit-reinterpret on the same storage; `.numpy()` then yields
+        a numpy view of the same bytes (numpy has no native bfloat16 dtype,
+        so calling `.numpy()` directly on a bf16 tensor raises TypeError).
         """
         if self._mem_pool_host is None:
             raise RuntimeError("register_mem_pool_host has not been called")
         page = self._mem_pool_host.get_data_page(int(idx), flat=True)
-        # Convert torch.Tensor → buffer-protocol view.
-        if hasattr(page, "numpy"):
-            return page.numpy()
+        # torch.Tensor branch: bf16/fp16/fp32 → uint8 byte view → numpy.
+        if hasattr(page, "view") and hasattr(page, "dtype") and hasattr(page, "numpy"):
+            try:
+                import torch  # lazy; available wherever sglang runs
+                return page.view(torch.uint8).numpy()
+            except ImportError:
+                # Fall through to direct .numpy() — works for already-uint8
+                # tensors (numpy/torch agree on uint8).
+                return page.numpy()
         # numpy / memoryview / bytes already.
         return page
 
@@ -201,6 +225,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
             if not exists:
                 break
             count += 1
+        log.debug("batch_exists n=%d hit=%d", len(keys), count)
         return count
 
     # ── v0 thin wrappers (off hot path once interface_v1=1) ────────────────
