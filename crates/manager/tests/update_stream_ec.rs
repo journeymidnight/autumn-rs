@@ -265,6 +265,28 @@ fn update_stream_ec_triggers_conversion() {
         let resp = call_update_stream_ec(&mgr, stream_id, 2, 1).await;
         assert_eq!(resp.code, CODE_OK, "update_stream_ec: {}", resp.message);
 
+        // F203: ec_conversion_dispatch_loop is drain-only. update_stream_ec
+        // changes the stream's EC params but does NOT enqueue conversion
+        // markers for existing sealed extents — callers must explicitly
+        // trigger via MSG_FORCE_EC_CONVERT (per the manager / external
+        // policy controller split). Same pattern as ec_failover.
+        let force_resp = mgr
+            .call(
+                MSG_FORCE_EC_CONVERT,
+                rkyv_encode(&ForceEcConvertReq {
+                    extent_id: first_extent_id,
+                }),
+            )
+            .await
+            .expect("force-ec-convert");
+        let force: ForceEcConvertResp =
+            rkyv_decode(&force_resp).expect("decode ForceEcConvertResp");
+        assert_eq!(
+            force.code, CODE_OK,
+            "force-ec-convert failed: {}",
+            force.message
+        );
+
         // Wait up to 30 s for the ec_conversion_dispatch_loop (fires every 5 s).
         let mut converted = false;
         for _ in 0..15 {

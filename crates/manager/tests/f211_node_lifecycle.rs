@@ -31,8 +31,11 @@ fn register(m: &AutumnManager, addr: &str) -> u64 {
     resp.node_id
 }
 
+// F214-B: first-time register seeds NodeAutoState::Suspend, not Online.
+// The first successful df transitions to Online. Renamed from
+// `list_node_states_starts_online` to reflect the new initial state.
 #[test]
-fn list_node_states_starts_online() {
+fn list_node_states_starts_suspend() {
     let m = AutumnManager::new();
     let n1 = register(&m, "127.0.0.1:9001");
     let n2 = register(&m, "127.0.0.1:9002");
@@ -41,7 +44,7 @@ fn list_node_states_starts_online() {
     assert_eq!(resp.code, CODE_OK);
     assert_eq!(resp.nodes.len(), 2);
     for entry in &resp.nodes {
-        assert_eq!(entry.auto_state, NODE_AUTO_STATE_ONLINE);
+        assert_eq!(entry.auto_state, NODE_AUTO_STATE_SUSPEND);
         assert_eq!(entry.override_kind, NODE_OVERRIDE_NONE);
     }
     let ids: Vec<u64> = resp.nodes.iter().map(|n| n.node_id).collect();

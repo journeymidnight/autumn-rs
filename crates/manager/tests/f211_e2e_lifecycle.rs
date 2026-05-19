@@ -109,10 +109,19 @@ async fn query_audit(mgr: &RpcClient, op: u8, node_id: u64) -> Vec<MgrAuditEntry
     resp.entries
 }
 
-// ── E2E test 1: phantom node transitions to Suspected ────────────────
+// ── E2E test 1: phantom node stays Suspend (F214-B) ─────────────────
+//
+// Pre-F214 a phantom node (registered, no real EN listening) seeded
+// Online and was promoted to Suspected after df failed for the soft-
+// timeout window. Post-F214-B (state-machine refactor), an
+// unverified-alive node starts in `Suspend`; `on_heartbeat_fail` and
+// `tick()` no longer auto-promote Suspend → Suspected because the
+// "Suspected" semantic requires a prior verified-alive baseline. So
+// the phantom stays Suspend forever — which is the correct
+// operator-facing diagnostic ("format ran but EN never started").
 
 #[test]
-fn f211_e2e_phantom_node_goes_suspected_after_df_timeout() {
+fn f211_e2e_phantom_node_stays_suspend() {
     fast_node_timeout();
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -126,38 +135,21 @@ fn f211_e2e_phantom_node_goes_suspected_after_df_timeout() {
         assert_eq!(resp.code, CODE_OK);
         let phantom_id = resp.node_id;
 
-        // Initially the registration seeds the tracker as Online (per F211-A).
+        // F214-B: first-time register seeds Suspend (was Online pre-F214).
         let nodes = list_nodes(&mgr).await;
         let me = nodes.iter().find(|n| n.node_id == phantom_id).expect("me");
-        assert_eq!(me.auto_state, NODE_AUTO_STATE_ONLINE);
+        assert_eq!(me.auto_state, NODE_AUTO_STATE_SUSPEND);
 
-        // Wait for at least one df cycle (10 s) + soft timeout (2 s) →
-        // ~12 s budget. We poll list_node_states every second.
-        let suspected = poll_until_async(
-            Duration::from_secs(20),
-            Duration::from_secs(1),
-            || async {
-                let ns = list_nodes(&mgr).await;
-                ns.iter()
-                    .find(|n| n.node_id == phantom_id)
-                    .map(|n| n.auto_state == NODE_AUTO_STATE_SUSPECTED)
-                    .unwrap_or(false)
-            },
-        )
-        .await;
-        assert!(suspected, "phantom node did not transition to Suspected");
-
-        // Suspected age can be 0 if we polled right at the transition.
-        // The key invariant is the auto_state flip; age is informational.
+        // Wait long enough that pre-F214 the node would have been
+        // promoted to Suspected (one df cycle + soft timeout). With
+        // F214-B the state stays Suspend forever.
+        compio::time::sleep(Duration::from_secs(15)).await;
         let nodes = list_nodes(&mgr).await;
         let me = nodes.iter().find(|n| n.node_id == phantom_id).unwrap();
-        assert_eq!(me.auto_state, NODE_AUTO_STATE_SUSPECTED);
-        // last_heartbeat_secs_ago should be at least the soft timeout
-        // (we waited that long for the transition).
-        assert!(
-            me.last_heartbeat_secs_ago >= 1,
-            "last_heartbeat_secs_ago={}",
-            me.last_heartbeat_secs_ago
+        assert_eq!(
+            me.auto_state, NODE_AUTO_STATE_SUSPEND,
+            "phantom must stay Suspend; got auto_state={}",
+            me.auto_state
         );
     });
 }
