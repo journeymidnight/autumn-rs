@@ -188,18 +188,14 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         """Return contiguous-prefix length (NOT per-key list).
 
         Matches the HiCacheStorage `batch_exists` contract documented in
-        docs/hicache_l3_interface.md:62-64. autumn's PyO3 client does not yet
-        expose a per-key `head` RPC — we use `get` as a stand-in. This is
-        called off the hot path (prefetch admission decision), so the extra
-        bytes read is acceptable for MVP. Optimization: add `Client.head` to
-        the binding when the cost shows up in profiles.
+        docs/hicache_l3_interface.md:62-64. Uses `head` (metadata-only) so
+        admission probing doesn't transfer the value bytes.
         """
         count = 0
         for k in keys:
             full = self._full_key(k)
             try:
-                data = run(lambda: self._client.get(full))
-                exists = data is not None
+                exists = bool(run(lambda: self._client.head(full)))
             except Exception:  # noqa: BLE001
                 exists = False
             if not exists:
@@ -248,7 +244,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
     def exists(self, key) -> bool:
         full = self._full_key(key)
         try:
-            return run(lambda: self._client.get(full)) is not None
+            return bool(run(lambda: self._client.head(full)))
         except Exception:  # noqa: BLE001
             return False
 

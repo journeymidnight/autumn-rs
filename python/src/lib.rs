@@ -111,6 +111,10 @@ enum Op {
         prefix: Vec<u8>,
         handle: PyHandle,
     },
+    Head {
+        key: Vec<u8>,
+        handle: PyHandle,
+    },
     PutFrom {
         key: Vec<u8>,
         buf: PyBuffer<u8>,
@@ -196,6 +200,14 @@ async fn handle_op(client: &mut ClusterClient, op: Op) {
             match do_batch_delete(client, &prefix).await {
                 Ok(n) => handle.resolve(move |py| Ok(n.into_pyobject(py)?.into_any().unbind())),
                 Err(msg) => handle.reject(msg),
+            }
+        }
+        Op::Head { key, handle } => {
+            match client.head(&key).await {
+                Ok(meta) => handle.resolve(move |py| {
+                    Ok(meta.found.into_pyobject(py)?.to_owned().into_any().unbind())
+                }),
+                Err(e) => handle.reject(e.to_string()),
             }
         }
         Op::PutFrom { key, buf, handle } => {
@@ -381,6 +393,18 @@ impl Client {
         let (handle, fut) = make_handle(py)?;
         self.dispatch(Op::BatchDelete {
             prefix: prefix.to_vec(),
+            handle,
+        })?;
+        Ok(fut)
+    }
+
+    /// Existence check — returns True if the key is present, False otherwise.
+    /// Does NOT transfer the value, so it's the right primitive for sglang
+    /// HiCache's `batch_exists` admission probe.
+    fn head<'py>(&self, py: Python<'py>, key: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+        let (handle, fut) = make_handle(py)?;
+        self.dispatch(Op::Head {
+            key: key.to_vec(),
             handle,
         })?;
         Ok(fut)
