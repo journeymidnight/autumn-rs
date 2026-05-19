@@ -1296,10 +1296,88 @@ asyncio.run(main())
 ```
 
 API: `Client.connect(addr)`, `put(k, v)`, `get(k)`, `delete(k)`,
-`range(prefix, start=b"", limit=100)`, `batch_delete(prefix)`, `close()`.
-All methods are awaitable. `range` returns a list of `(key, value)`
-tuples — the partition server fills only the key slot, so call `get` for
-values you actually need.
+`range(prefix, start=b"", limit=100)`, `batch_delete(prefix)`, `close()`,
+plus zero-copy `put_from(k, buf)` and `get_into(k, buf)` for buffer-protocol
+arguments (numpy / torch tensor / memoryview). All methods are awaitable.
+`range` returns a list of `(key, value)` tuples — the partition server fills
+only the key slot, so call `get` for values you actually need.
+
+## autumn-kvcache (sglang HiCache L3 backend)
+
+`python/autumn_kvcache/` is a thin Python adapter that plugs autumn into
+sglang as a [HiCache L3 storage backend][hicache] via the `dynamic` plugin
+mechanism — no sglang source patch required. Architecture: pure Python
+adapter over the `autumn` PyO3 client; **no sidecar daemon, no local DRAM
+LRU**. partition layer's memtable + block cache serves as the implicit DRAM
+tier (see `docs/autumn_kvcache_plan.md` for rationale).
+
+[hicache]: docs/hicache_l3_interface.md
+
+### Install
+
+```bash
+# Build + install the autumn PyO3 client (one-time, plus on Rust changes).
+cd python
+python3 -m venv /tmp/autumn-py-venv
+/tmp/autumn-py-venv/bin/pip install maturin numpy
+VIRTUAL_ENV=/tmp/autumn-py-venv /tmp/autumn-py-venv/bin/maturin develop --release
+
+# Install the sglang adapter package (pure Python).
+/tmp/autumn-py-venv/bin/pip install -e autumn_kvcache
+```
+
+### Run with sglang
+
+```bash
+sglang ... \
+  --enable-hierarchical-cache \
+  --hicache-storage-backend dynamic \
+  --hicache-storage-backend-extra-config '{
+    "backend_name":"autumn",
+    "module_path":"autumn_kvcache.sglang_backend",
+    "class_name":"AutumnKVCacheStorage",
+    "interface_v1":1,
+    "endpoint":"127.0.0.1:9001"
+  }'
+```
+
+`interface_v1: 1` is **required** — it routes sglang's cache controller
+through the zero-copy v1 path (`batch_get_v1` / `batch_set_v1`); without it
+v0 batch methods are used and lose zero-copy.
+
+`endpoint` is the autumn manager address (or comma-separated list for
+multi-manager). The adapter holds one connection per process and uses the
+same routing / failover as `autumn-client`.
+
+### Tenant isolation
+
+The adapter stores partition keys as
+`f"kvc/{tenant_suffix}/kv/{sha256_hex}"`. `tenant_suffix` is built per
+sglang's `HiCacheFile._get_suffixed_key` from the `HiCacheStorageConfig`:
+
+| Field | Effect |
+|-------|--------|
+| `model_name` | First segment of `tenant_suffix` |
+| `tp_rank`, `tp_size` | `_{tp_rank}_{tp_size}` appended (skipped for MLA models) |
+| `pp_rank`, `pp_size` | `_pp{pp_rank}_{pp_size}` appended if `pp_size > 1` |
+| `is_mla_model` | Drops the tp segment; all TP ranks share one bundle key |
+
+`kv/` is a reserved pool name slot — MVP only supports the KV pool, but the
+key format reserves it so future v2 multi-pool support (Mamba / SWA /
+hybrid models) doesn't require a key migration.
+
+### Smoke test (no sglang required)
+
+After `cluster.sh reset 1`:
+
+```bash
+AUTUMN_KVCACHE_ENDPOINT=127.0.0.1:9001 \
+  /tmp/autumn-py-venv/bin/python python/autumn_kvcache/tests/test_smoke.py
+```
+
+Validates: tenant key format, `batch_set_v1` / `batch_get_v1` zero-copy
+round-trip on a numpy-backed fake pinned-host pool, `batch_exists`
+contiguous-prefix semantics, v0 method fallbacks, and `clear()`.
 
 ## Tests
 

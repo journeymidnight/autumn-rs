@@ -19,6 +19,11 @@ Thumbs.db
 python/target
 python/*.so
 
+# Python packaging metadata (pip install -e leftovers, __pycache__)
+python/**/*.egg-info/
+python/**/__pycache__/
+python/**/*.pyc
+
 # Ignore all perf_baseline*.json — users regenerate these locally via
 # `perf_check.sh --update-baseline`. ONE representative baseline is
 # committed (perf_baseline_tcp_p16_d8_s4k.json, the headline TCP 4 K

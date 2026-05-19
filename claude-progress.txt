@@ -1,81 +1,93 @@
 Date: 2026-05-19
 TaskStatus: completed
-Task scope: Phase 0 of autumn-kvcache initiative — investigate sglang HiCache
-            L3 storage backend interface and produce design input doc.
-            No code changes.
+Task scope: F216 — autumn-kvcache MVP (sglang HiCache L3 backend,
+            Python-adapter-only form, no Rust daemon / no L3a DRAM cache).
 
 Summary:
-  Researched sgl-project/sglang `main` (around commit 66ef97c) to characterize
-  the HiCache L3 storage backend extension point that autumn-kvcache will
-  implement. Output: docs/hicache_l3_interface.md (~500 lines).
+  Implemented autumn-kvcache as a thin Python adapter (`python/autumn_kvcache/`)
+  layered over the existing `autumn` PyO3 client. No new Rust crate, no
+  sidecar daemon, no local DRAM LRU — partition layer's memtable + block
+  cache serves as the implicit DRAM tier.
 
-Key findings driving the autumn-kvcache design:
+  Design convergence is documented in `docs/autumn_kvcache_plan.md`
+  (written this session). The earlier F216 entry that called for a
+  `crates/kvcache/` Rust crate + local DRAM LRU was rewritten to match
+  the new design: deployment is single-sglang-per-node (possibly
+  multi-node via TP/PP), so the daemon's only justification (cross-
+  process same-node sharing) does not apply.
 
-  1. Interface is `HiCacheStorage` in
-     python/sglang/srt/mem_cache/hicache_storage.py. Three coexisting APIs:
-       - v0 (legacy, abstract methods, marked TODO Deprecate)
-       - v1 (zero-copy single-pool — our main path)
-       - v2 (multi-pool for Mamba/SWA/DeepSeek-V4, still evolving)
+Work completed in F216-A/B/C/D:
 
-  2. Plug-in mechanism: use `dynamic` backend via
-       --hicache-storage-backend dynamic
-       --hicache-storage-backend-extra-config '{
-           "backend_name":"autumn",
-           "module_path":"autumn_kvcache.sglang_backend",
-           "class_name":"AutumnKVCacheStorage",
-           "interface_v1":1,
-           ...
-       }'
-     No sglang source patch needed. `interface_v1: 1` is critical — without
-     it cache_controller routes through slow v0 path.
+  F216-A · Zero-copy buffer API on autumn PyO3 binding
+    - Added `put_from(key, buf: PyBuffer)` and `get_into(key, buf: PyBuffer)`
+      to `python/src/lib.rs Client`. Both accept Python buffer-protocol
+      objects (numpy / torch / memoryview) directly — no PyBytes round-trip.
+    - Fixed a pre-existing compile error (`client.put(&key, &value, true)`
+      vs current 2-arg signature) — the `python` crate is not in the
+      workspace and had bit-rotted silently.
+    - `python` crate now compiles cleanly via `maturin build --release`.
 
-  3. Memory model: backend NEVER sees GPU memory. It receives
-     `host_indices: torch.Tensor` (page indices into pinned-host KV pool that
-     it registered up-front via `register_mem_pool_host`). Block layout is
-     `layer_first` (default) or `page_first*`, exposed via
-     `storage_config.is_page_first_layout`.
+  F216-B · `python/autumn_kvcache/` package
+    - New pure-Python package with `setuptools` packaging.
+    - `_bridge.py`: dedicated asyncio event loop on a daemon thread; `run`
+      helper takes a thunk so PyO3 awaitables (which require a running
+      loop at construction) are created inside the worker loop.
+    - `sglang_backend.py`: `class AutumnKVCacheStorage(HiCacheStorage)`
+      implementing v1 (`batch_get_v1` / `batch_set_v1` zero-copy path),
+      `batch_exists` (contiguous-prefix int — NOT per-key list),
+      v0 wrappers (`get`/`set`/`exists`/`batch_get`/`batch_set`),
+      `register_mem_pool_host`, `clear`, `get_stats`.
+    - Falls back to `object` base class when sglang is not importable,
+      so the module loads in test/standalone environments.
+    - Partition key format: `kvc/{tenant_suffix}/kv/{sha256_hex}`.
+      `kv` pool slot reserved for future v2 multi-pool.
 
-  4. Keys are SHA-256 hex digests computed by sglang controller (Merkle-style
-     chained per page). Backend must NOT hash; must add tenant suffix
-     (model_name, tp_rank, tp_size, pp_rank, pp_size, is_mla_model) per
-     HiCacheFile._get_suffixed_key.
+  F216-C · README documentation
+    - New section `## autumn-kvcache (sglang HiCache L3 backend)` in
+      `README.md` covering install (maturin develop + pip install -e),
+      sglang launch command with full `extra_config` JSON, tenant
+      suffix wiring, and smoke-test recipe.
 
-  5. Concurrency: sync calls from sglang's prefetch + backup daemon threads.
-     Batched per call. Prefetch budget is hard: 2s + 0.1s/Ki-tok, cap 30s.
-     Slow backend → sglang abandons the request; host_indices get recycled.
-     autumn-kvcache MUST return fast (success or False), never block past
-     budget.
+  F216-D · Local smoke test (no sglang dep)
+    - `python/autumn_kvcache/tests/test_smoke.py` against a real 1-node
+      autumn cluster. Validates:
+        1. Tenant key format (`kvc/{model}_{tp}_{tp_size}/kv/{hash}`)
+        2. `batch_set_v1` + `batch_get_v1` zero-copy round-trip with
+           byte-exact content verification on numpy pinned-host stand-in
+        3. `batch_exists` contiguous-prefix int semantics (all-present,
+           mixed-with-gap, head-missing)
+        4. v0 set/get/exists wrappers
+        5. `get_stats()` counters increment as expected
+        6. `clear()` deletes the correct count of keys
+    - Verified end-to-end: `ALL SMOKE TESTS PASSED`, exit 0, against a
+      live `cluster.sh reset 1` cluster.
 
-  6. Eviction: sglang NEVER calls delete. L3 must self-manage capacity
-     (LRU/TTL/cap) and surface metrics via `get_stats()`.
+Architecture invariants enforced:
+  - All persistence via `autumn-client` → partition layer (no parallel
+    data plane, [[feedback_no_parallel_data_plane]]).
+  - No sglang-side delete is ever issued — sglang never calls delete on
+    L3; capacity is partition TTL/GC's job (autumn-kvcache surfaces
+    nothing).
+  - Backend returns fast: `False` on miss, exception on RPC error;
+    never blocks past sglang's prefetch budget (2s + 0.1s/Kitok).
+  - Idempotent put: same key/value re-set is a no-op.
 
-  7. Reference backend to copy: MooncakeStore
-     (python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py).
-     Mooncake's pattern (thin Python facade over native zero-copy store, with
-     `_batch_preprocess(host_indices)` translating page indices to
-     (ptr, size) pairs) maps cleanly onto our planned architecture
-     (ClusterClient + local DRAM cache + future peer RDMA).
-     Do NOT copy LMCache pattern — it bypasses L3 abstraction entirely.
-
-Architecture reminder (from project_three_interfaces memory, validated by
-this research):
-  - autumn-kvcache = sglang HiCache L3 backend (this is the API edge)
-  - Internally: local DRAM LRU + peer DRAM share (future) + fall through
-    to ClusterClient (partition layer) for persistence
-  - Partition layer = THE distributed persistence; no parallel data plane
-  - Phase 0 (this task): docs/hicache_l3_interface.md ✓
-  - Phase 1 next: autumn-kvcache crate + Python binding MVP
-  - Phase 2 next: UCX one-sided RDMA + peer DRAM share
-  - Phase 3 next: autumn-fuse page cache + GDS + shared cache daemon
+Memory updates (kept stable for future conversations):
+  - `project_sglang_deployment_shape.md` — deployment is multi-node, one
+    sglang per node, single sglang may span multi-node (TP/PP).
+  - `project_autumn_kvcache_architecture.md` — Python-adapter-only,
+    no daemon, no L3a DRAM cache; revisit only if benchmarks show
+    partition latency is the bottleneck.
 
 Open items / not in this task:
-  - Did NOT touch feature_list.md — Phase 1/2/3 F-cards to be added when
-    user wants to commit to a numbered plan.
-  - Did NOT verify sglang version against any specific tag; investigation
-    used `main` HEAD-ish snapshot. Before Phase 1 code, pin a sglang tag
-    and re-verify the L3 interface against it.
-  - Did NOT clone sglang locally — used WebFetch on GitHub raw URLs. If
-    Phase 1 implementation needs deeper dive, clone into a side dir.
+  - End-to-end sglang TTFT benchmark with a real model — needs GPU +
+    sglang runtime; will become its own feature when needed.
+  - vLLM `KVConnectorV1` adapter — Phase 3+ non-goal.
+  - HiCache v2 multi-pool (mamba / swa) — Phase 2+; key namespace
+    already reserves the pool slot to avoid future key migration.
+  - autumn-client `head` RPC binding — `batch_exists` currently uses
+    `get` which loads the value; cheap optimization later if profile
+    shows it matters.
 
-Previous task (completed): F214 — autumn-op format-absorbs-register
-unification + Ceph-mkfs-style cluster_id imprint.
+Previous task (completed): Phase 0 — autumn-kvcache sglang HiCache
+research (output `docs/hicache_l3_interface.md`).

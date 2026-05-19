@@ -22,7 +22,8 @@ use std::sync::Mutex;
 use autumn_client::{AutumnError, ClusterClient};
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::buffer::PyBuffer;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
@@ -110,10 +111,32 @@ enum Op {
         prefix: Vec<u8>,
         handle: PyHandle,
     },
+    PutFrom {
+        key: Vec<u8>,
+        buf: PyBuffer<u8>,
+        handle: PyHandle,
+    },
+    GetInto {
+        key: Vec<u8>,
+        dest_ptr: usize,
+        dest_len: usize,
+        _buf_keepalive: PyBuffer<u8>,
+        handle: PyHandle,
+    },
     Close {
         handle: PyHandle,
     },
 }
+
+// PyBuffer<u8> is Send+Sync by virtue of the buffer protocol's pinning
+// guarantee (the underlying memory does not move during the view's lifetime).
+// `Drop` for PyBuffer acquires the GIL internally, so handing one off to the
+// compio worker thread is safe even though no GIL is held there.
+//
+// The raw `dest_ptr` (usize-cast pointer) in GetInto is only dereferenced from
+// the compio worker thread, and only for the duration of one in-flight op.
+// `_buf_keepalive` holds the underlying Python buffer view alive across that
+// window, guaranteeing the pointed-at memory is valid and won't be remapped.
 
 // ── compio worker loop ─────────────────────────────────────────────────────
 
@@ -132,7 +155,7 @@ async fn event_loop(mut client: ClusterClient, mut rx: UnboundedReceiver<Op>) {
 async fn handle_op(client: &mut ClusterClient, op: Op) {
     match op {
         Op::Put { key, value, handle } => {
-            match client.put(&key, &value, true).await {
+            match client.put(&key, &value).await {
                 Ok(()) => handle.resolve(|py| Ok(py.None())),
                 Err(e) => handle.reject(e.to_string()),
             }
@@ -174,6 +197,59 @@ async fn handle_op(client: &mut ClusterClient, op: Op) {
                 Ok(n) => handle.resolve(move |py| Ok(n.into_pyobject(py)?.into_any().unbind())),
                 Err(msg) => handle.reject(msg),
             }
+        }
+        Op::PutFrom { key, buf, handle } => {
+            // SAFETY: buf is held by this Op until handle_op returns; PyBuffer's
+            // pinning contract guarantees the pointed-at memory is stable.
+            let value = unsafe {
+                std::slice::from_raw_parts(buf.buf_ptr() as *const u8, buf.item_count())
+            };
+            match client.put(&key, value).await {
+                Ok(()) => handle.resolve(|py| Ok(py.None())),
+                Err(e) => handle.reject(e.to_string()),
+            }
+            drop(buf); // explicit; PyBuffer::drop reacquires the GIL itself
+        }
+        Op::GetInto {
+            key,
+            dest_ptr,
+            dest_len,
+            _buf_keepalive,
+            handle,
+        } => {
+            match client.get(&key).await {
+                Ok(Some(v)) => {
+                    if v.len() == dest_len {
+                        // SAFETY: dest_ptr / dest_len come from a PyBuffer that
+                        // `_buf_keepalive` keeps alive for the duration of this
+                        // block. We have exclusive use of the view; the buffer
+                        // protocol guarantees pinned memory.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                v.as_ptr(),
+                                dest_ptr as *mut u8,
+                                dest_len,
+                            );
+                        }
+                        handle.resolve(|py| {
+                            Ok(true.into_pyobject(py)?.to_owned().into_any().unbind())
+                        });
+                    } else {
+                        // Size mismatch — surface as False so the sglang backend can
+                        // treat it as a cache miss without raising.
+                        handle.resolve(|py| {
+                            Ok(false.into_pyobject(py)?.to_owned().into_any().unbind())
+                        });
+                    }
+                }
+                Ok(None) => {
+                    handle.resolve(|py| {
+                        Ok(false.into_pyobject(py)?.to_owned().into_any().unbind())
+                    });
+                }
+                Err(e) => handle.reject(e.to_string()),
+            }
+            drop(_buf_keepalive);
         }
         Op::Close { .. } => unreachable!("Close handled in event_loop"),
     }
@@ -305,6 +381,65 @@ impl Client {
         let (handle, fut) = make_handle(py)?;
         self.dispatch(Op::BatchDelete {
             prefix: prefix.to_vec(),
+            handle,
+        })?;
+        Ok(fut)
+    }
+
+    /// Zero-copy put. `buf` is any Python buffer-protocol object (numpy array,
+    /// torch tensor, memoryview, etc.) holding the value bytes. The buffer's
+    /// memory is read directly when the put RPC is encoded — no intermediate
+    /// Python `bytes` is allocated.
+    ///
+    /// Requires `buf` to be C-contiguous. Returns an awaitable that resolves
+    /// to None on success and raises on RPC error.
+    fn put_from<'py>(
+        &self,
+        py: Python<'py>,
+        key: &[u8],
+        buf: PyBuffer<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if !buf.is_c_contiguous() {
+            return Err(PyValueError::new_err("buf must be C-contiguous"));
+        }
+        let (handle, fut) = make_handle(py)?;
+        self.dispatch(Op::PutFrom {
+            key: key.to_vec(),
+            buf,
+            handle,
+        })?;
+        Ok(fut)
+    }
+
+    /// Zero-copy get. `buf` is a writable Python buffer-protocol object whose
+    /// length matches the stored value's length. The value is written directly
+    /// into `buf` without going through a Python `bytes`.
+    ///
+    /// Returns an awaitable that resolves to:
+    ///   - `True`  — value found and successfully copied into `buf`.
+    ///   - `False` — key missing OR stored value size != buf length (treated
+    ///               as a cache miss for the sglang HiCache backend).
+    /// Raises on RPC error.
+    fn get_into<'py>(
+        &self,
+        py: Python<'py>,
+        key: &[u8],
+        buf: PyBuffer<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if buf.readonly() {
+            return Err(PyValueError::new_err("buf must be writable"));
+        }
+        if !buf.is_c_contiguous() {
+            return Err(PyValueError::new_err("buf must be C-contiguous"));
+        }
+        let dest_ptr = buf.buf_ptr() as usize;
+        let dest_len = buf.item_count();
+        let (handle, fut) = make_handle(py)?;
+        self.dispatch(Op::GetInto {
+            key: key.to_vec(),
+            dest_ptr,
+            dest_len,
+            _buf_keepalive: buf,
             handle,
         })?;
         Ok(fut)
