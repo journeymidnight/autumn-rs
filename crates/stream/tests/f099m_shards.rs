@@ -33,8 +33,8 @@ use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::StatusCode;
 use autumn_stream::extent_rpc::{
-    AllocExtentReq, AllocExtentResp, AppendReq, AppendResp, CommitLengthReq, CommitLengthResp,
-    MSG_ALLOC_EXTENT, MSG_APPEND, MSG_COMMIT_LENGTH,
+    AllocExtentReq, AllocExtentResp, AppendReq, AppendResp, ProbeExtentReq, ProbeExtentResp,
+    MSG_ALLOC_EXTENT, MSG_APPEND, MSG_PROBE_EXTENT,
 };
 use autumn_stream::{shard_addr_for_extent, ConnPool, ExtentNode, ExtentNodeConfig};
 use bytes::Bytes;
@@ -95,17 +95,24 @@ async fn alloc_on(addr: SocketAddr, extent_id: u64) -> AllocExtentResp {
     rkyv_decode::<AllocExtentResp>(&resp).expect("decode")
 }
 
+/// Fence-free length probe — uses `MSG_PROBE_EXTENT` (F210-H3 Tier 2).
+///
+/// Pre-F210-H3 this called `MSG_COMMIT_LENGTH` with `revision: 0` as
+/// a "skip fence" sentinel. F210-H3 Tier 2 tightened the
+/// `MSG_COMMIT_LENGTH` wire contract: `revision <= 0` now returns
+/// `CODE_INVALID_ARGUMENT` (the probe sentinel escape hatch was
+/// removed; see `MSG_PROBE_EXTENT` instead). The tests are pure
+/// length probes with no owner context — exactly what
+/// `MSG_PROBE_EXTENT` is for. Response shape is `(code, length)`,
+/// same as `CommitLengthResp`.
 async fn commit_length_on(
     addr: SocketAddr,
     extent_id: u64,
-) -> Result<CommitLengthResp, autumn_rpc::RpcError> {
-    let req = CommitLengthReq {
-        extent_id,
-        revision: 0,
-    };
+) -> Result<ProbeExtentResp, autumn_rpc::RpcError> {
+    let req = ProbeExtentReq { extent_id };
     let client = RpcClient::connect(addr).await.expect("rpc connect");
-    let bytes = client.call(MSG_COMMIT_LENGTH, req.encode()).await?;
-    Ok(CommitLengthResp::decode(bytes).expect("decode"))
+    let bytes = client.call(MSG_PROBE_EXTENT, req.encode()).await?;
+    Ok(ProbeExtentResp::decode(bytes).expect("decode"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────

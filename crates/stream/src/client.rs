@@ -9,10 +9,10 @@ use autumn_common::metrics::{duration_to_ns, ns_to_ms, unix_time_ms};
 use autumn_rpc::manager_rpc::{self, *};
 use crate::ConnPool;
 use crate::extent_rpc::{
-    AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, ReadBytesReq,
-    ReadBytesResp, StreamInfo, SyncedLengthReq, SyncedLengthResp, CODE_EVERSION_MISMATCH,
-    CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK, MSG_APPEND, MSG_COMMIT_LENGTH, MSG_READ_BYTES,
-    MSG_SYNCED_LENGTH,
+    AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, ProbeExtentReq,
+    ProbeExtentResp, ReadBytesReq, ReadBytesResp, StreamInfo, SyncedLengthReq, SyncedLengthResp,
+    CODE_EVERSION_MISMATCH, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK, MSG_APPEND,
+    MSG_COMMIT_LENGTH, MSG_PROBE_EXTENT, MSG_READ_BYTES, MSG_SYNCED_LENGTH,
 };
 
 /// Sentinel error attached to `anyhow::Error` when a `MSG_READ_BYTES`
@@ -2295,27 +2295,49 @@ impl StreamClient {
     /// commit at a position only the lone surviving responder held,
     /// permanently losing data if that responder later died before
     /// re-replicating to the unreachable peers.
+    ///
+    /// **Fence-free**: uses `MSG_PROBE_EXTENT` rather than
+    /// `MSG_COMMIT_LENGTH`. Pre-fix this called `MSG_COMMIT_LENGTH`
+    /// with the StreamClient's owner revision, which causes the EN to
+    /// run fence handover (bumps `last_revision` if our revision is
+    /// higher). Two harmful side-effects in production:
+    ///   1. A reader StreamClient created with a NEW owner_key
+    ///      (higher revision) silently fences the original writer's
+    ///      next append → CODE_LOCKED_BY_OTHER. Reproducible via the
+    ///      f029 integration test: PS appends meta_stream 3× with
+    ///      revision=1; test creates external StreamClient
+    ///      (revision=2) for read-only `read_last_extent_data`; that
+    ///      call falls through to this helper which bumps EN's
+    ///      last_revision to 2; PS's 4th append (compact's checkpoint)
+    ///      fails with LockedByOther.
+    ///   2. The same shape can hit production whenever an external
+    ///      reader (e.g. autumn-stream-cli read, or any consumer that
+    ///      opens its own StreamClient against the same stream) does
+    ///      a `read_bytes_from_extent(_, _, 0)` against an active
+    ///      writer's stream.
+    /// `MSG_PROBE_EXTENT` returns the same `(code, length)` shape but
+    /// skips the fence interaction entirely — exactly what a read path
+    /// needs.
     async fn commit_length_for_extent(&self, ex: &ExtentInfo) -> Result<u32> {
         let addrs = self.replica_addrs_for_extent(ex).await?;
-        let revision = self.revision;
         let mut min_len: Option<u32> = None;
         let mut success: usize = 0;
         let total = addrs.len();
         for addr in &addrs {
-            let req = CommitLengthReq {
+            let req = ProbeExtentReq {
                 extent_id: ex.extent_id,
-                revision,
             };
-            // 5 s — same shape as `current_commit` above; per-replica
-            // miss is tolerated by the quorum tally below.
+            // 5 s — same per-replica budget as the historical
+            // commit_length path. Per-replica miss is tolerated by
+            // the quorum tally below.
             let Ok(resp_bytes) = self
                 .pool
-                .call_timeout(addr, MSG_COMMIT_LENGTH, req.encode(), Duration::from_secs(5))
+                .call_timeout(addr, MSG_PROBE_EXTENT, req.encode(), Duration::from_secs(5))
                 .await
             else {
                 continue;
             };
-            let Ok(resp) = CommitLengthResp::decode(resp_bytes) else {
+            let Ok(resp) = ProbeExtentResp::decode(resp_bytes) else {
                 continue;
             };
             if resp.code != CODE_OK {
@@ -2327,7 +2349,7 @@ impl StreamClient {
         let quorum = total / 2 + 1;
         if success < quorum {
             return Err(anyhow!(
-                "insufficient quorum for commit_length on extent {}: got {} of {} (need {})",
+                "insufficient quorum for probe_extent on extent {}: got {} of {} (need {})",
                 ex.extent_id,
                 success,
                 total,
@@ -2336,7 +2358,7 @@ impl StreamClient {
         }
         min_len.ok_or_else(|| {
             anyhow!(
-                "no replica responded to commit_length for extent {}",
+                "no replica responded to probe_extent for extent {}",
                 ex.extent_id
             )
         })

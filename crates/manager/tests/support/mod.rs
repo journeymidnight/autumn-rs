@@ -323,8 +323,14 @@ pub async fn ps_delete(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rp
 }
 
 /// Check if a key exists without fetching the value.
+///
+/// Returns a synthetic `found = false` response when the PS rejects
+/// with "key is out of range" — that error path is the expected
+/// behaviour for cross-partition probes (e.g. post-split tests that
+/// ask each child whether it holds a key). Other RPC errors still
+/// panic via `.expect("head")`.
 pub async fn ps_head(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rpc::HeadResp {
-    let resp = ps
+    match ps
         .call(
             partition_rpc::MSG_HEAD,
             partition_rpc::rkyv_encode(&partition_rpc::HeadReq {
@@ -334,8 +340,18 @@ pub async fn ps_head(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rpc:
             }),
         )
         .await
-        .expect("head");
-    partition_rpc::rkyv_decode(&resp).expect("decode HeadResp")
+    {
+        Ok(bytes) => partition_rpc::rkyv_decode(&bytes).expect("decode HeadResp"),
+        Err(e) if e.to_string().contains("key is out of range") => {
+            partition_rpc::HeadResp {
+                code: partition_rpc::CODE_OK,
+                message: String::new(),
+                found: false,
+                value_length: 0,
+            }
+        }
+        Err(e) => panic!("head: {e}"),
+    }
 }
 
 /// Range scan with prefix, start key, and limit.

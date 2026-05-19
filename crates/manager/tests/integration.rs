@@ -771,28 +771,7 @@ fn f030_recovery_from_meta_and_row_streams() {
     });
 }
 
-// **Pre-existing bug, NOT a test setup issue.** In this in-process
-// integration test, compact's `save_table_locs_raw` call deterministically
-// hangs inside `stream_client.append(meta_stream_id, ...)` — the meta_stream
-// per-stream worker accepts the message (no immediate error) but the ack
-// future never resolves. The preceding 3 flush-driven save_table_locs_raw
-// calls succeed against the same meta_stream and same StreamClient,
-// suggesting state corruption introduced by compact_row_append on row_stream
-// just before the meta_stream call. Adding eprintln! at every step of
-// save_table_locs_raw confirms: "about to append" fires, "append done" never
-// does.
-//
-// This bug pre-dates F214 (verified by `git stash + cargo test`); the same
-// hang reproduces against the working tree without F214 changes. Production
-// users do not hit it because the cluster.sh smoke harness drives compact
-// via `autumn-op compact <PARTID>` against real binaries with separate
-// processes / clean stream client state; verified working in the 4-node E2E.
-//
-// Marking `#[ignore]` with this precise pointer rather than leaving the
-// test red. Tracked as separate work: instrument `stream_worker_loop` to
-// surface where the ack vanishes, then fix the underlying race.
 #[test]
-#[ignore = "pre-existing: stream_client.append on meta_stream hangs during compact in this in-process test setup; verified working in cluster.sh E2E"]
 fn f029_compaction_merges_small_tables() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(105);
 

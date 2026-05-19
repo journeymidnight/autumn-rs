@@ -538,6 +538,41 @@ async fn coalescer_loop(
         let synced = extent.coalescer.last_synced.load(Ordering::SeqCst);
         let have_waiters = !extent.coalescer.inner.borrow().waiters.is_empty();
 
+        // Bug fix (truncate path): a `truncate_to_commit` shrinks
+        // `extent.len` + the following pwrite stores a smaller
+        // `pending_fsync` (e.g. 10 → set_len(6) + pwrite 1 byte → 7).
+        // `truncate_to_commit` already issued `sync_data` for the
+        // shrink, so `last_synced` still reflects the previous larger
+        // value (10). Any waiter with `end <= last_synced` (here 7 ≤
+        // 10) is already durable — satisfy them without a fresh fsync
+        // call. Pre-fix the coalescer's `if pending > synced` skipped
+        // the fsync branch, then parked on wake_rx forever even though
+        // the waiters were trivially satisfiable. Reproducer:
+        // `extent_append_semantics::append_with_mid_byte_commit_truncates_and_succeeds`
+        // hung indefinitely on its second append (`commit=6` then
+        // pwrite "!").
+        if pending <= synced && have_waiters {
+            let waiters = {
+                let mut inner = extent.coalescer.inner.borrow_mut();
+                std::mem::take(&mut inner.waiters)
+            };
+            let mut still = Vec::new();
+            for (end, tx) in waiters {
+                if end <= synced {
+                    let _ = tx.send(Ok(()));
+                } else {
+                    still.push((end, tx));
+                }
+            }
+            if !still.is_empty() {
+                extent.coalescer.inner.borrow_mut().waiters.extend(still);
+            }
+            // Re-loop: state may have changed (new waiters could have
+            // arrived during the borrow_mut drops). If nothing left to
+            // do, the park-or-exit block below handles cleanup.
+            continue;
+        }
+
         if pending > synced && have_waiters {
             // POSIX-correct group commit: snapshot `pending` BEFORE
             // issuing `sync_data`. Per POSIX, `fdatasync` only
@@ -2524,6 +2559,15 @@ impl ExtentNode {
         // will sync content separately.
         f.sync_data().await.map_err(|e| e.to_string())?;
         extent.len.store(commit as u64, Ordering::SeqCst);
+        // Bug fix: align the coalescer's view with the actual file
+        // length post-truncate. `last_synced` is what `MSG_COMMIT_LENGTH`
+        // and `MSG_PROBE_EXTENT` return; if we leave it at the
+        // pre-truncate value, commit_length reports a length that no
+        // longer exists on disk. `pending_fsync` follows the same
+        // shrink — the subsequent pwrite (if any) will store its own
+        // larger end value via the regular F178 path.
+        extent.coalescer.last_synced.store(commit as u64, Ordering::SeqCst);
+        extent.coalescer.pending_fsync.store(commit as u64, Ordering::SeqCst);
         Ok(())
     }
 
