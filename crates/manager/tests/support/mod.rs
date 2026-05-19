@@ -652,6 +652,102 @@ where
     }
 }
 
+// ── Embedded etcd ─────────────────────────────────────────────────────
+//
+// Spawns the real `etcd` binary in single-member dev mode against a
+// tempdir. Replaces the pre-this Go helper (`tests/support/embedded_etcd/main.go`)
+// which required a Go toolchain to compile `go.etcd.io/etcd/server/v3/embed`
+// at test time. The binary approach has no build-time dependency and
+// uses whatever etcd version is installed on the system (verified
+// against 3.5.x).
+//
+// All etcd-dependent tests (`f149_leader_fence`, `f209_apply_done_atomicity`,
+// `system_manager_failover`, `etcd_stream_integration`) call
+// `start_etcd()` and drop the returned guard at test exit.
+
+/// RAII guard that kills the spawned etcd child + cleans up its data
+/// dir on drop. Tests bind this to an `_etcd_guard` local with a
+/// leading underscore to signal "kept alive for the test body, not
+/// referenced directly."
+pub struct EtcdGuard {
+    child: Option<std::process::Child>,
+    _data_dir: tempfile::TempDir,
+}
+
+impl Drop for EtcdGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Block until the etcd endpoint responds to a `get` call or the
+/// timeout elapses. Panics on timeout so tests fail loudly when etcd
+/// isn't reachable (e.g. binary missing, port collision, peer URL
+/// already in use).
+pub async fn wait_for_etcd(endpoint: &str, timeout: Duration) {
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(c) = autumn_etcd::EtcdClient::connect(endpoint).await {
+            if c.get("health-check").await.is_ok() {
+                return;
+            }
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "etcd did not become ready within {timeout:?}"
+        );
+        compio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Spawn a single-member etcd instance for tests. Picks two free ports
+/// (client + peer) on loopback, writes data to a tempdir, and returns
+/// `(guard, "http://127.0.0.1:<client_port>")`.
+///
+/// Looks for `etcd` on `$PATH`; override with `AUTUMN_TEST_ETCD_BIN` if
+/// the binary lives somewhere unusual (CI image, dev box, etc.).
+pub async fn start_etcd() -> (EtcdGuard, String) {
+    let etcd_bin = std::env::var("AUTUMN_TEST_ETCD_BIN").unwrap_or_else(|_| "etcd".to_string());
+    let client_addr = pick_addr();
+    let peer_addr = pick_addr();
+    let client_url = format!("http://{}", client_addr);
+    let peer_url = format!("http://{}", peer_addr);
+
+    let data_dir = tempfile::tempdir().expect("etcd tempdir");
+    let data_path = data_dir.path().join("etcd-data");
+
+    let mut cmd = std::process::Command::new(&etcd_bin);
+    cmd.arg("--name").arg("n1")
+        .arg("--data-dir").arg(&data_path)
+        .arg("--listen-client-urls").arg(&client_url)
+        .arg("--advertise-client-urls").arg(&client_url)
+        .arg("--listen-peer-urls").arg(&peer_url)
+        .arg("--initial-advertise-peer-urls").arg(&peer_url)
+        .arg("--initial-cluster").arg(format!("n1={peer_url}"))
+        .arg("--initial-cluster-state").arg("new")
+        .arg("--log-level").arg("error")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    let child = cmd.spawn().unwrap_or_else(|e| {
+        panic!(
+            "spawn etcd binary `{etcd_bin}`: {e} — install etcd or set AUTUMN_TEST_ETCD_BIN"
+        )
+    });
+    wait_for_etcd(&client_url, Duration::from_secs(30)).await;
+
+    (
+        EtcdGuard {
+            child: Some(child),
+            _data_dir: data_dir,
+        },
+        client_url,
+    )
+}
+
 // ── TableLocations decoder ────────────────────────────────────────────
 
 /// Decode the last TableLocations record from raw metaStream bytes.

@@ -9,94 +9,18 @@
 //!    txn is atomically rejected — etcd shows the original
 //!    `extent_inflight/<id>` still present AND no `extents/<id>` write.
 //!
-//! Requires embedded etcd (Go toolchain). Marked `#[ignore]` per repo
-//! convention for etcd-dependent tests.
+//! Requires the `etcd` binary on `$PATH` (or override via
+//! `AUTUMN_TEST_ETCD_BIN`). Marked `#[ignore]` per repo convention.
 
 mod support;
-
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
 
 use autumn_manager::extent_inflight::{ExtentOpPayload, EXTENT_INFLIGHT_PREFIX};
 use autumn_manager::AutumnManager;
 use autumn_rpc::manager_rpc::{MgrEcDispatchInflight, MgrExtentInfo};
 
-use support::pick_addr;
+use support::start_etcd;
 
 const LEADER_KEY: &str = "autumn-rs/stream-manager/leader";
-
-struct EtcdGuard {
-    child: Option<Child>,
-    _data_dir: tempfile::TempDir,
-}
-
-impl Drop for EtcdGuard {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-fn repo_root() -> PathBuf {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest.ancestors().nth(3).expect("repo root").to_path_buf()
-}
-
-async fn wait_for_etcd(endpoint: &str, timeout: Duration) {
-    let start = Instant::now();
-    loop {
-        if let Ok(c) = autumn_etcd::EtcdClient::connect(endpoint).await {
-            if c.get("health-check").await.is_ok() {
-                return;
-            }
-        }
-        assert!(start.elapsed() < timeout, "etcd did not become ready");
-        compio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-async fn start_embedded_etcd() -> (EtcdGuard, String) {
-    let client_addr = pick_addr();
-    let peer_addr = pick_addr();
-    let client_url = format!("http://{}", client_addr);
-    let peer_url = format!("http://{}", peer_addr);
-
-    let data_dir = tempfile::tempdir().expect("tempdir");
-    let data_path = data_dir.path().join("etcd-data");
-
-    let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/embedded_etcd/main.go");
-
-    let mut cmd = Command::new("go");
-    cmd.current_dir(repo_root())
-        .arg("run")
-        .arg(helper)
-        .arg("--name")
-        .arg("n1")
-        .arg("--dir")
-        .arg(data_path)
-        .arg("--client")
-        .arg(client_url.clone())
-        .arg("--peer")
-        .arg(peer_url.clone())
-        .arg("--cluster")
-        .arg(format!("n1={peer_url}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    let child = cmd.spawn().expect("spawn embedded etcd");
-    wait_for_etcd(&client_url, Duration::from_secs(30)).await;
-
-    (
-        EtcdGuard {
-            child: Some(child),
-            _data_dir: data_dir,
-        },
-        client_url,
-    )
-}
 
 fn extent_inflight_key(eid: u64) -> String {
     format!("{}{}", EXTENT_INFLIGHT_PREFIX, eid)
@@ -133,7 +57,7 @@ fn make_dispatch_record(extent_id: u64) -> MgrEcDispatchInflight {
 #[ignore] // requires embedded etcd (go runtime)
 fn f209_e_apply_ec_conversion_done_atomic_success() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let (_etcd_guard, etcd_endpoint) = start_embedded_etcd().await;
+        let (_etcd_guard, etcd_endpoint) = start_etcd().await;
 
         // Manager M1 — becomes leader on construction.
         let m = AutumnManager::new_with_etcd(vec![etcd_endpoint.clone()])
@@ -208,7 +132,7 @@ fn f209_e_apply_ec_conversion_done_atomic_success() {
 #[ignore] // requires embedded etcd (go runtime)
 fn f209_e_apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let (_etcd_guard, etcd_endpoint) = start_embedded_etcd().await;
+        let (_etcd_guard, etcd_endpoint) = start_etcd().await;
 
         let m = AutumnManager::new_with_etcd(vec![etcd_endpoint.clone()])
             .await

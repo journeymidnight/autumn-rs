@@ -1,103 +1,21 @@
+//! Etcd-backed stream-manager integration tests.
+//!
+//! Spawns the `etcd` binary on `$PATH` (override via
+//! `AUTUMN_TEST_ETCD_BIN`). Marked `#[ignore]` per repo convention.
+
+mod support;
+
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use autumn_manager::AutumnManager;
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
 use autumn_stream::{ConnPool, ExtentNode, ExtentNodeConfig, StreamClient};
 
-fn pick_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-    addr
-}
-
-struct EtcdGuard {
-    child: Option<Child>,
-    _data_dir: tempfile::TempDir,
-}
-
-impl Drop for EtcdGuard {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-fn repo_root() -> PathBuf {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .ancestors()
-        .nth(3)
-        .expect("repo root")
-        .to_path_buf()
-}
-
-async fn wait_for_etcd(endpoint: &str, timeout: Duration) {
-    let start = Instant::now();
-    loop {
-        // Try to connect with autumn-etcd
-        match autumn_etcd::EtcdClient::connect(endpoint).await {
-            Ok(c) => {
-                if c.get("health-check").await.is_ok() {
-                    return;
-                }
-            }
-            Err(_) => {}
-        }
-        assert!(
-            start.elapsed() < timeout,
-            "etcd did not become ready: {endpoint}"
-        );
-        compio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-async fn start_embedded_etcd() -> (EtcdGuard, String) {
-    let client_addr = pick_addr();
-    let peer_addr = pick_addr();
-    let client_url = format!("http://{}", client_addr);
-    let peer_url = format!("http://{}", peer_addr);
-
-    let data_dir = tempfile::tempdir().expect("tempdir");
-    let data_path = data_dir.path().join("etcd-data");
-
-    let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/embedded_etcd/main.go");
-
-    let mut cmd = Command::new("go");
-    cmd.current_dir(repo_root())
-        .arg("run")
-        .arg(helper)
-        .arg("--name")
-        .arg("n1")
-        .arg("--dir")
-        .arg(data_path)
-        .arg("--client")
-        .arg(client_url.clone())
-        .arg("--peer")
-        .arg(peer_url.clone())
-        .arg("--cluster")
-        .arg(format!("n1={peer_url}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    let child = cmd.spawn().expect("spawn embedded etcd");
-    wait_for_etcd(&client_url, Duration::from_secs(30)).await;
-
-    (
-        EtcdGuard {
-            child: Some(child),
-            _data_dir: data_dir,
-        },
-        client_url,
-    )
-}
+use support::{pick_addr, start_etcd};
 
 /// Start manager with etcd on its own thread, return addr.
 fn start_etcd_manager(
@@ -176,7 +94,7 @@ async fn create_stream(mgr: &RpcClient, replicates: u32) -> u64 {
 #[test]
 fn stream_manager_with_real_etcd() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let (etcd_guard, etcd_endpoint) = start_embedded_etcd().await;
+        let (etcd_guard, etcd_endpoint) = start_etcd().await;
 
         let mgr_addr = pick_addr();
         start_etcd_manager(mgr_addr, etcd_endpoint.clone());
@@ -255,7 +173,7 @@ fn stream_manager_with_real_etcd() {
 #[test]
 fn etcd_replay_owner_lock_allows_check_commit_length_without_reacquire() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let (etcd_guard, etcd_endpoint) = start_embedded_etcd().await;
+        let (etcd_guard, etcd_endpoint) = start_etcd().await;
 
         // Manager 1
         let mgr1_addr = pick_addr();
@@ -337,7 +255,7 @@ fn etcd_replay_owner_lock_allows_check_commit_length_without_reacquire() {
 #[test]
 fn etcd_replicated_append_and_recovery_flow() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let (etcd_guard, etcd_endpoint) = start_embedded_etcd().await;
+        let (etcd_guard, etcd_endpoint) = start_etcd().await;
 
         let mgr_addr = pick_addr();
         start_etcd_manager(mgr_addr, etcd_endpoint.clone());
@@ -446,7 +364,7 @@ fn etcd_replicated_append_and_recovery_flow() {
 #[test]
 fn etcd_election_and_replay_on_second_manager() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let (etcd_guard, etcd_endpoint) = start_embedded_etcd().await;
+        let (etcd_guard, etcd_endpoint) = start_etcd().await;
 
         // Manager 1
         let mgr1_addr = pick_addr();
