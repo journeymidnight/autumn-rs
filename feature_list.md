@@ -2933,3 +2933,104 @@ Background: autumn-rs 当前节点死亡判定模型过于激进——心跳 10s
   - `concurrent_writers_during_split` re-enables strict ≤20% loss bound (matching F185 merge tolerance).
   - End-to-end smoke: split during 1000 concurrent puts → zero acknowledged-but-missing keys.
 - **passes:** false (deferred)
+
+## P9 — autumn-kvcache (sglang HiCache L3 backend)
+
+**Background:** New product surface — a third top-level interface alongside `autumn-fuse` and `autumn-client`. Targets sglang/vllm inference workload, specifically the KV cache offload tier. Architecture: autumn-kvcache is a thin DRAM cache + protocol adapter that plugs into sglang's HiCache as an L3 storage backend; persistence falls through to the existing partition layer (ClusterClient). **Does NOT bypass partition layer for persistence** — partition's replication/EC/owner-lock/recovery are reused as-is.
+
+Phase 0 (research) completed 2026-05-19, output: `docs/hicache_l3_interface.md`.
+
+### F216 · autumn-kvcache Phase 1 MVP (HiCache L3 backend, no peer RDMA)
+- **Trigger:** Phase 0 (`docs/hicache_l3_interface.md`) established the sglang HiCache L3 storage backend contract: `HiCacheStorage` ABC in `python/sglang/srt/mem_cache/hicache_storage.py`, plugged in via `--hicache-storage-backend dynamic` + `extra_config.interface_v1=1`. Reference backend to copy: `MooncakeStore` (thin Python facade over native zero-copy store with `_batch_preprocess(host_indices)` → `(ptr, size)` translation). No autumn code path currently exposes a KV cache interface to inference engines; sglang prefix-caching prefetch hits cold partition with full ~ms-scale RPC latency every miss, blowing the 2s+0.1s/Ki-tok prefetch budget on warmup.
+- **Goal:** Ship a working sglang HiCache L3 backend with: ClusterClient-backed persistence, local pinned-DRAM LRU above it, Python binding, and one end-to-end perf measurement. Four sub-features:
+
+  **F216-A · `autumn-kvcache` Rust crate skeleton + ClusterClient wrapper**
+  - New crate `crates/kvcache/` (workspace member).
+  - `pub struct KvCacheClient { inner: ClusterClient, tenant_prefix: String }` wrapping autumn-client.
+  - Methods (mirror HiCache batch shape): `get_block(key) -> Option<Bytes>`, `put_block(key, &[u8])`, `exists(key) -> bool`, `batch_get(&[key]) -> Vec<Option<Bytes>>`, `batch_set(&[(key, bytes)]) -> Vec<bool>`, `batch_exists_prefix(&[key]) -> usize` (returns contiguous-prefix length, NOT per-key list — matches HiCache `batch_exists` contract).
+  - Key namespacing: stored partition key = `format!("kvcache/{}/{}", tenant_prefix, hash)`. `tenant_prefix` carries `model_name/tp/pp/mla` per `HiCacheFile._get_suffixed_key`.
+  - Configurable manager endpoint via `KvCacheClient::connect(manager_addr, tenant_prefix)`.
+  - Idempotent `put_block` (sglang may re-set same key).
+  - No local cache yet (every call hits partition) — F216-B adds that.
+
+  **F216-B · Local pinned-DRAM LRU above ClusterClient**
+  - Fixed-capacity LRU layer inside `KvCacheClient` (configurable: `cache_bytes` or `cache_slots`).
+  - Pinned host memory via mmap + mlock (hugetlbfs if available, fall back to anonymous). NUMA-aware allocation (bind to caller's NUMA node).
+  - Slab allocator: slot size = `bytes_per_page` (passed at construction; sglang model determines this and it's constant for a run).
+  - On `get_block`: try LRU first (target latency <100µs for hit, no RPC); on miss → ClusterClient.get → insert into LRU → return.
+  - On `put_block`: write to LRU + writeback to ClusterClient (`write_through` policy from sglang's `--hicache-write-policy` default). `write_back` mode (deferred persistence) is out of scope for F216.
+  - Capacity-driven eviction: clock or simple LRU; evicted slots already persisted to partition so no data loss on evict.
+  - `get_stats()`: hit_count, miss_count, evict_count, bytes_in_use, slot_count.
+
+  **F216-C · Python binding implementing `HiCacheStorage`**
+  - New `python/autumn_kvcache/` package.
+  - PyO3 binding (`crates/kvcache/src/python.rs` with `cfg(feature = "python")`) exposing `KvCacheClient` to Python; build via maturin (add to existing python build flow if any, else introduce).
+  - `python/autumn_kvcache/sglang_backend.py`: `class AutumnKVCacheStorage(HiCacheStorage)` implementing:
+    - v0 abstract: `get`, `batch_get`, `set`, `batch_set`, `exists`, `batch_exists` (thin wrappers; not on hot path once v1 enabled).
+    - v1 zero-copy: `batch_get_v1(keys, host_indices, extra_info)`, `batch_set_v1(...)` — use `mem_pool_host.get_data_page(idx, flat=True)` to resolve `host_indices` to `(ptr, size)`, hand to Rust as `(*mut u8, usize)`.
+    - `register_mem_pool_host(host)`: cache base + stride for v1 zero-copy lookups.
+    - `clear()`, `get_stats()`.
+  - Tenant suffix construction per `HiCacheFile._get_suffixed_key` (model_name + tp + pp + mla).
+  - `__init__(self, storage_config: HiCacheStorageConfig, extra_kwargs: dict)` parses `endpoint`, `cache_bytes`, etc. from `extra_kwargs` and `storage_config.extra_config`.
+  - Pin sglang version: test against sglang `main` snapshot from 2026-05-19 (commit at-or-after `66ef97c`). Document the pinned version in `docs/hicache_l3_interface.md`.
+
+  **F216-D · End-to-end smoke test + perf baseline**
+  - Test harness script (`scripts/kvcache_e2e.sh` or `python/test_kvcache_e2e.py`):
+    1. Start 1-node autumn cluster (manager + EN + PS) via cluster.sh.
+    2. `pip install -e python/autumn_kvcache/`.
+    3. Launch sglang with `--enable-hierarchical-cache --hicache-storage-backend dynamic --hicache-storage-backend-extra-config '{"backend_name":"autumn","module_path":"autumn_kvcache.sglang_backend","class_name":"AutumnKVCacheStorage","interface_v1":1,"endpoint":"127.0.0.1:9001","cache_bytes":17179869184}'` against a small model (e.g., Qwen-0.5B for CI affordability).
+    4. Send prefix-heavy benchmark requests (reuse sglang's `bench_serving.py --dataset-name sharegpt`).
+    5. Collect: TTFT distribution with/without L3, sglang's reported `hicache_storage_hit_rate`, autumn-kvcache `get_stats()`.
+  - Baseline doc `docs/kvcache_perf.md` with run instructions + observed numbers.
+  - Backend liveness: 0 errors, 0 drops over 10-min run, p99 per-`batch_get_v1` latency < 500ms (well under sglang's 2s base prefetch budget).
+
+- **Architectural rules (carry from project_three_interfaces memory):**
+  - Persistence MUST go through partition layer (ClusterClient). No direct stream-layer writes from kvcache.
+  - autumn-kvcache is internal LRU + adapter; replication/EC/recovery is the partition layer's job.
+  - sglang NEVER calls delete on L3 — capacity management is purely autumn-kvcache's responsibility.
+  - Backend MUST return fast (success or False); never block past sglang's prefetch budget.
+
+- **Acceptance:**
+  - `cargo build -p autumn-kvcache --release` clean (no warnings beyond workspace baseline).
+  - Unit tests on `KvCacheClient`: put → get round-trip, exists, batch_exists contiguous-prefix semantics, LRU eviction + writeback, capacity bound respected.
+  - `pip install -e python/autumn_kvcache` succeeds; `python -c "from autumn_kvcache.sglang_backend import AutumnKVCacheStorage"` works.
+  - sglang launches with the dynamic backend config above and serves at least one request end-to-end without backend errors.
+  - F216-D smoke test passes: hit_rate > 0 on the second prefix-heavy run (warm L3), TTFT improvement measurable.
+  - `docs/kvcache_perf.md` committed with numbers.
+
+- **Out of scope (deferred to F217/F218):**
+  - UCX one-sided RDMA + peer DRAM share (F217).
+  - autumn-fuse improvements for model weights — different workload, separate feature (F218).
+  - v2 multi-pool support (Mamba/SWA/DSA hybrid models) — only KV pool in F216.
+  - GPUDirect Storage / NIC→GPU direct path — Phase 3+.
+  - write_back policy support — F216 is write_through only.
+
+- **passes:** false
+
+### F217 (deferred) · autumn-kvcache Phase 2 — UCX one-sided RDMA + peer DRAM share
+- **Trigger:** F216 MVP every miss hits partition (~ms-scale RPC). Multiple inference replicas on same cluster have idle DRAM that could form a shared L2 pool, served at sub-µs latency via RDMA. Reference: Mooncake transfer engine pattern.
+- **Goal:**
+  - Extend `crates/transport/src/ucx/` with `ucp_put_nbx` / `ucp_get_nbx` (currently only `ucp_stream_send_nbx`/`recv_nbx`).
+  - Memory region registration (`ucp_mem_map`) + rkey exchange protocol (gossip or manager-mediated).
+  - autumn-kvcache: on local LRU miss → try peer pool via consistent-hashed peer lookup + one-sided GET → fall through to partition only on peer miss.
+  - Writes: local LRU only; peers populate via demand (cold reads pull from owner).
+  - Eviction policy: when peer is offline (heartbeat lost), redirect its keyspace shard to fallback (partition direct).
+- **Acceptance:**
+  - p99 peer-hit latency < 50µs on 25Gbps IB/RoCE.
+  - Cluster of 4 nodes, kill 1, no data unavailability (peer miss → partition direct fall-through).
+  - Bench: 2x TTFT improvement over F216 on a multi-replica prefix-sharing workload.
+- **passes:** false (deferred)
+
+### F218 (deferred) · autumn-fuse Phase 3 — page cache + GDS + node-level shared cache daemon
+- **Trigger:** Model weights (Llama-70B ~140GB, 405B ~810GB) currently load via FUSE with `FOPEN_DIRECT_IO` (bypasses kernel page cache), so 8 inference replicas on a node pull 8× from storage. mmap-heavy safetensors path needs verification with larger readahead. GDS would enable NIC → GPU direct for tensor pages.
+- **Goal:**
+  - Branch on file type in `crates/fuse/src/ops.rs`: bulk-immutable files (models) → no `FOPEN_DIRECT_IO`, rely on kernel page cache; KV-cache-style files → keep DIRECT_IO.
+  - Node-level shared cache daemon (`autumn-fuse-cache`): unix socket service, multiple FUSE mounts on same node share one tiered cache (DRAM → local NVMe → autumn cluster). Alluxio-worker pattern.
+  - GDS path: integrate `cufile` for tensor block reads when target is GPU memory. Optional — requires GPUDirect-RDMA capable NIC and CUDA toolkit.
+  - Increase `max_readahead` from 16MB to 64-128MB for mmap-heavy paths.
+  - Atomic model version switch (namespace snapshot + inode redirect) so in-flight mmap doesn't read torn data during model promotion.
+- **Acceptance:**
+  - Llama-70B load via FUSE on second replica completes in <10% of first-replica time (page cache hit verified via `/proc/meminfo` Cached delta).
+  - sglang/vllm startup with autumn-fuse-mounted weights produces identical model output as native filesystem load (no NaN, no missing tensors).
+  - mmap path correctness: HF transformers `from_pretrained` on a 70B safetensors model succeeds end-to-end via autumn-fuse.
+- **passes:** false (deferred)
