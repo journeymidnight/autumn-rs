@@ -622,6 +622,26 @@ pub(crate) struct PartitionData {
     pub(crate) region_epoch: u64,
     active: Memtable,
     imm: VecDeque<Arc<Memtable>>,
+    /// Set of imm `Arc::as_ptr` values currently being flushed.
+    /// Prevents `flush_one_imm` (called inline by `flush_memtable_locked`)
+    /// from racing `background_flush_loop` on the same imm[0]: pre-fix,
+    /// both paths cloned imm.front() in their synchronous claim step,
+    /// then each ran `run_flush_async_phase` to produce an SST and each
+    /// called `commit_flush_outcome` to push to `tables`. Result: two
+    /// SSTs in `tables` with identical content but different
+    /// (extent_id, offset), and `imm.pop_front()` ran twice (the second
+    /// pop was a no-op on the now-empty queue). The duplicate SSTs
+    /// silently inflated table count and corrupted the `f029` /
+    /// `f030_*` invariants.
+    ///
+    /// Lifetimes:
+    /// - INSERT at claim time (synchronous, inside `borrow_mut`).
+    /// - REMOVE at the bottom of `commit_flush_outcome` (synchronous,
+    ///   inside the same `borrow_mut` block that pops imm.front).
+    /// - A duplicate claim attempt sees the ptr already present and
+    ///   returns Ok(false) — the caller treats it as "nothing to flush"
+    ///   and moves on. The other path's commit will eventually clear it.
+    flushing_imm_ptrs: RefCell<HashSet<usize>>,
     flush_tx: mpsc::UnboundedSender<()>,
     compact_tx: mpsc::Sender<bool>,
     gc_tx: mpsc::Sender<GcTask>,
@@ -3670,6 +3690,7 @@ async fn partition_thread_main(
         region_epoch,
         active: recovered_active,
         imm: VecDeque::new(),
+        flushing_imm_ptrs: RefCell::new(HashSet::new()),
         flush_tx,
         compact_tx,
         gc_tx,
@@ -5493,7 +5514,15 @@ pub(crate) async fn commit_flush_outcome(
         let mut p = part.borrow_mut();
         p.tables.push(outcome.new_meta);
         p.sst_readers.push(Arc::new(outcome.reader));
-        p.imm.pop_front();
+        // Release the claim-by-ptr (see `flush_one_imm` / the
+        // background loop). The popped imm IS the one whose Phase 2
+        // we just finished — FuturesOrdered in the background loop and
+        // single-task serial `await` in flush_one_imm guarantee
+        // FIFO commit order.
+        if let Some(popped) = p.imm.pop_front() {
+            let ptr = Arc::as_ptr(&popped) as usize;
+            p.flushing_imm_ptrs.borrow_mut().remove(&ptr);
+        }
         // F120-A: wake partition_loop on imm-full back-pressure.
         let _ = p.imm_drained_tx.unbounded_send(());
         (
@@ -5524,10 +5553,31 @@ pub(crate) async fn commit_flush_outcome(
 /// `handle_split_part`, and test helpers). After F197, this is just
 /// `run_flush_async_phase` + `commit_flush_outcome` composed; the
 /// background loop bypasses this and runs the two phases concurrently.
+///
+/// **Claim-by-ptr invariant**: before running Phase 2 we record the
+/// imm's `Arc::as_ptr()` in `flushing_imm_ptrs`. If the front imm is
+/// already being flushed by `background_flush_loop`, return Ok(false)
+/// so the caller (`flush_memtable_locked`'s drain loop) moves on
+/// instead of building a duplicate SST. `commit_flush_outcome` is the
+/// pair that REMOVES the ptr.
 pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
-    let imm_mem = match part.borrow().imm.front().cloned() {
-        Some(m) => m,
-        None => return Ok(false),
+    let imm_mem = {
+        let p = part.borrow();
+        let imm = match p.imm.front().cloned() {
+            Some(m) => m,
+            None => return Ok(false),
+        };
+        let ptr = Arc::as_ptr(&imm) as usize;
+        let mut inflight = p.flushing_imm_ptrs.borrow_mut();
+        if inflight.contains(&ptr) {
+            // Already being flushed by another path (typically
+            // background_flush_loop reached imm[0] first). The other
+            // path's commit will publish the SST; we treat this as
+            // "no-op" and let the caller proceed.
+            return Ok(false);
+        }
+        inflight.insert(ptr);
+        imm
     };
     let outcome = run_flush_async_phase(part.clone(), imm_mem).await?;
     commit_flush_outcome(part, outcome).await?;
@@ -5596,9 +5646,31 @@ async fn background_flush_loop(
             // front strictly in order, so the queue tracks 1:1 with
             // in-flight + remaining unlaunched.
             while !failed && inflight.len() < cap {
+                // Same claim-by-ptr pattern as flush_one_imm. The
+                // `inflight.len()` index walks the queue front→back so
+                // the launch order matches FuturesOrdered's pull order.
+                // If the imm at this index is already claimed by an
+                // inline `flush_one_imm` (called from
+                // flush_memtable_locked / split / merge), skip it —
+                // its commit_flush_outcome will pop it for us.
                 let imm_at_idx = {
                     let p = part.borrow();
-                    p.imm.get(inflight.len()).cloned()
+                    match p.imm.get(inflight.len()).cloned() {
+                        Some(imm) => {
+                            let ptr = Arc::as_ptr(&imm) as usize;
+                            let mut set = p.flushing_imm_ptrs.borrow_mut();
+                            if set.contains(&ptr) {
+                                // Another path owns this imm; its
+                                // commit_flush_outcome will publish.
+                                // Skip launching for this index.
+                                None
+                            } else {
+                                set.insert(ptr);
+                                Some(imm)
+                            }
+                        }
+                        None => None,
+                    }
                 };
                 match imm_at_idx {
                     Some(imm) => {

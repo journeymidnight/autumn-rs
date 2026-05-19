@@ -143,10 +143,41 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
         "manager did not open port {mgr_port}"
     );
 
+    // ── format the EN dir via autumn-op (F214-C) ────────────────────
+    // F214 unified `register-node` into `format`: one call fetches the
+    // manager's cluster_id, allocates disk_uuid, registers the node,
+    // and stamps sentinel files (`cluster_id` / `disk_uuid` /
+    // `node_id` / `disk_id`) per data dir. The EN binary refuses to
+    // start without these files (F214-D), so format MUST run before
+    // the extent-node spawn.
+    {
+        let mut cmd = Command::new(AUTUMN_OP_BIN);
+        cmd.args([
+            "--manager",
+            &mgr_addr,
+            "format",
+            "--listen",
+            &format!(":{en_port}"),
+            "--advertise",
+            &en_addr,
+            data_dir.to_str().unwrap(),
+        ]);
+        let stdout = run_or_panic("autumn-op format", cmd);
+        let text = String::from_utf8_lossy(&stdout);
+        assert!(
+            text.contains("node registered"),
+            "format output unexpected: {text}"
+        );
+        assert!(
+            text.contains("cluster_id="),
+            "format output missing cluster_id: {text}"
+        );
+    }
+
     // ── extent-node ─────────────────────────────────────────────────
-    // `--cpuset 0` pins to a single core / single shard, so we don't
-    // need to reserve a port range for sibling shards (F099-M sibling
-    // ports at base+10/+20/... can collide with neighbouring tests).
+    // `--cpuset 0` pins to a single core / single shard. F214-D
+    // removed `--disk-id`; disk_id now comes from the sentinel file
+    // written by `autumn-op format` above.
     let _extent_node = ChildGuard::new(
         "extent-node",
         Command::new(EXTENT_NODE_BIN)
@@ -159,8 +190,6 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
                 &mgr_addr,
                 "--data",
                 data_dir.to_str().unwrap(),
-                "--disk-id",
-                "1",
                 "--cpuset",
                 "0",
             ])
@@ -173,26 +202,6 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
         wait_port_open(en_port, Duration::from_secs(10)),
         "extent-node did not open port {en_port}"
     );
-
-    // ── register EN via autumn-op ───────────────────────────────────
-    {
-        let mut cmd = Command::new(AUTUMN_OP_BIN);
-        cmd.args([
-            "--manager",
-            &mgr_addr,
-            "register-node",
-            "--addr",
-            &en_addr,
-            "--disk",
-            "disk-1",
-        ]);
-        let stdout = run_or_panic("autumn-op register-node", cmd);
-        let text = String::from_utf8_lossy(&stdout);
-        assert!(
-            text.contains("node registered"),
-            "register-node output unexpected: {text}"
-        );
-    }
 
     // ── partition-server ────────────────────────────────────────────
     // F099-K note: PS does NOT bind `--port` itself; instead each

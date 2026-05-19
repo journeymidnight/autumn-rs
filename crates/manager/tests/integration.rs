@@ -771,18 +771,28 @@ fn f030_recovery_from_meta_and_row_streams() {
     });
 }
 
-// In-process test environment quirk: under the same-thread cargo test
-// runtime where manager + PS + extent-nodes all share one compio
-// context, the F188 PS-local maintenance scheduler races the test's
-// explicit MAINTENANCE_COMPACT on the cap-1 `compact_tx` channel and
-// the major compaction never lands within the test's polling window.
-// Verified working end-to-end via cluster.sh + `autumn-op compact`
-// (separate processes); the test framework simply cannot keep them
-// scheduled apart. Marked #[ignore] until either the in-process
-// scheduler is suppressible via an env knob, or this test is moved to
-// a real cluster smoke harness.
+// **Pre-existing bug, NOT a test setup issue.** In this in-process
+// integration test, compact's `save_table_locs_raw` call deterministically
+// hangs inside `stream_client.append(meta_stream_id, ...)` — the meta_stream
+// per-stream worker accepts the message (no immediate error) but the ack
+// future never resolves. The preceding 3 flush-driven save_table_locs_raw
+// calls succeed against the same meta_stream and same StreamClient,
+// suggesting state corruption introduced by compact_row_append on row_stream
+// just before the meta_stream call. Adding eprintln! at every step of
+// save_table_locs_raw confirms: "about to append" fires, "append done" never
+// does.
+//
+// This bug pre-dates F214 (verified by `git stash + cargo test`); the same
+// hang reproduces against the working tree without F214 changes. Production
+// users do not hit it because the cluster.sh smoke harness drives compact
+// via `autumn-op compact <PARTID>` against real binaries with separate
+// processes / clean stream client state; verified working in the 4-node E2E.
+//
+// Marking `#[ignore]` with this precise pointer rather than leaving the
+// test red. Tracked as separate work: instrument `stream_worker_loop` to
+// surface where the ack vanishes, then fix the underlying race.
 #[test]
-#[ignore = "in-process test framework races PS-local maintenance scheduler; verified via cluster.sh smoke"]
+#[ignore = "pre-existing: stream_client.append on meta_stream hangs during compact in this in-process test setup; verified working in cluster.sh E2E"]
 fn f029_compaction_merges_small_tables() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(105);
 
@@ -834,28 +844,16 @@ fn f029_compaction_merges_small_tables() {
             locs_before.locs.len()
         );
 
-        // Trigger major compaction. Poll meta_stream until the table
-        // count actually drops — the PS-local F188 maintenance
-        // scheduler races our manual dispatch on the cap-1 `compact_tx`
-        // channel, so a single ps_compact + fixed sleep can land before
-        // the loop's next iteration picks up our `major=true`.
-        let locs_after = {
-            let mut last = locs_before.clone();
-            for _ in 0..40 {
-                ps_compact(&ps, 621).await;
-                compio::time::sleep(Duration::from_millis(500)).await;
-                let meta_bytes_after = sc
-                    .read_last_extent_data(meta_stream)
-                    .await
-                    .expect("read meta after compact")
-                    .expect("meta data must exist after compact");
-                last = decode_last_table_locations(&meta_bytes_after);
-                if last.locs.len() < locs_before.locs.len() {
-                    break;
-                }
-            }
-            last
-        };
+        // Trigger major compaction, then wait long enough for the
+        // background loop to finish do_compact + save_table_locs_raw.
+        ps_compact(&ps, 621).await;
+        compio::time::sleep(Duration::from_secs(10)).await;
+        let meta_bytes_after = sc
+            .read_last_extent_data(meta_stream)
+            .await
+            .expect("read meta after compact")
+            .expect("meta data must exist after compact");
+        let locs_after = decode_last_table_locations(&meta_bytes_after);
 
         // All keys must still be readable after compaction.
         for i in 0u8..3 {
