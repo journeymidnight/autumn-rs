@@ -166,11 +166,14 @@ impl TestConn {
         eversion: u64,
         payload: Vec<u8>,
     ) -> WriteShardResp {
+        // F211-D added `revision`; tests use 0 (the documented
+        // "no fence requested" wire-compat sentinel).
         let req = WriteShardReq {
             extent_id,
             shard_index,
             sealed_length,
             eversion,
+            revision: 0,
             payload: Bytes::from(payload),
         };
         let resp = self
@@ -191,6 +194,8 @@ impl TestConn {
             extent_id,
             sealed_length,
             eversion,
+            // F211-D: tests pass 0 (no-fence sentinel).
+            revision: 0,
         };
         let resp = self
             .pool

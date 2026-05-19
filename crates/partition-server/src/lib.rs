@@ -3036,6 +3036,22 @@ fn ps_conn_inflight_cap() -> usize {
 pub(crate) static PS_FAST_PATH_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Workspace-wide serialization guard for tests that exercise
+/// `handle_ps_connection`. The function bumps a process-global counter
+/// (`PS_FAST_PATH_HITS`) so any parallel test using the same path
+/// invalidates `f099i_tests`' exact-delta assertions. All such tests
+/// acquire this lock for the duration of their TCP round-trips.
+///
+/// `parking_lot::Mutex` is used instead of `std::sync::Mutex` so a
+/// failing test in this set doesn't poison the lock and cascade-fail
+/// every subsequent run. Held only during the test body; non-test
+/// code paths never see this.
+#[cfg(test)]
+pub(crate) fn ps_conn_test_lock() -> parking_lot::MutexGuard<'static, ()> {
+    static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    LOCK.lock()
+}
+
 /// F099-I — outcome of one persistent read future iteration.  The future
 /// owns both the reader and the buffer across iterations so it can be left
 /// pinned in the event loop's `select` without ever being dropped
@@ -6913,6 +6929,9 @@ mod f099j_tests {
     /// arrives with the exact key echoed.
     #[test]
     fn f099j_single_threaded_write_path_no_router() {
+        // Serialize with f099i_tests + sqcq_tests to keep
+        // PS_FAST_PATH_HITS coherent across the test process.
+        let _g = super::ps_conn_test_lock();
         let rt = compio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             // Bind a loopback listener and a client socket on the same runtime.
@@ -7006,6 +7025,7 @@ mod f099j_tests {
     /// generous — this is a correctness check, not a perf test.
     #[test]
     fn f099j_n1_load_basic_sanity() {
+        let _g = super::ps_conn_test_lock();
         let rt = compio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             let listener = compio::net::TcpListener::bind("127.0.0.1:0")
@@ -7426,6 +7446,7 @@ mod f099i_tests {
     /// baseline — MUST NOT regress.
     #[test]
     fn f099i_single_frame_passthrough() {
+        let _g = fast_path_counter_lock();
         let rt = compio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             let listener = compio::net::TcpListener::bind("127.0.0.1:0")
@@ -7509,6 +7530,7 @@ mod f099i_tests {
     /// peak == 1 (one frame in, one reply out, loop).
     #[test]
     fn f099i_multi_frame_batches_write() {
+        let _g = fast_path_counter_lock();
         let rt = compio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             let listener = compio::net::TcpListener::bind("127.0.0.1:0")
@@ -7648,6 +7670,11 @@ mod f099i_tests {
     fn f099i_backpressure_at_cap() {
         const CAP: usize = 4;
         const N_FRAMES: u32 = 100;
+
+        // Hold the workspace ps-conn lock across the spawned thread so
+        // PS_FAST_PATH_HITS stays coherent for the two counter-asserting
+        // tests in this module.
+        let _g = fast_path_counter_lock();
 
         // Run in a dedicated thread with the env var set BEFORE the
         // OnceLock is initialised.
@@ -7823,13 +7850,12 @@ mod f099i_tests {
         handle.join().expect("bp test thread panicked");
     }
 
-    /// Serialise all tests that read `PS_FAST_PATH_HITS` — the global
-    /// counter is shared process-wide and concurrent tests would mutate
-    /// it unpredictably.  Short-lived lock held only during the test
-    /// body; other tests not in this module are unaffected.
-    fn fast_path_counter_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().expect("fast_path_counter_lock poisoned")
+    /// Re-exported workspace-wide lock — see `ps_conn_test_lock` above.
+    /// Held across the entire f099i test body so concurrent
+    /// `handle_ps_connection`-using tests don't race the
+    /// `PS_FAST_PATH_HITS` counter and break the exact-delta assertion.
+    fn fast_path_counter_lock() -> parking_lot::MutexGuard<'static, ()> {
+        super::ps_conn_test_lock()
     }
 
     /// F099-I-fix test — the d=1 fast path MUST engage when exactly one

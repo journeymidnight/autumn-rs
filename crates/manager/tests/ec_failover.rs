@@ -8,7 +8,6 @@ use std::time::Duration;
 use autumn_manager::AutumnManager;
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
-use autumn_stream::extent_rpc::{self, ConvertToEcReq, CodeResp as ExtCodeResp};
 use autumn_stream::{ConnPool, ExtentNode, ExtentNodeConfig, StreamClient};
 
 fn pick_addr() -> SocketAddr {
@@ -187,6 +186,28 @@ fn ec_2_1_failover_and_recovery() {
         eprintln!(
             "stream {} extents: {:?}",
             stream_id, stream_info.extent_ids
+        );
+
+        // F203: ec_conversion_dispatch_loop is drain-only — only
+        // markers placed via `MSG_FORCE_EC_CONVERT` (or replayed from
+        // etcd) are processed. Auto-conversion of newly-sealed extents
+        // was removed during the mechanism/policy refactor. Trigger
+        // the conversion explicitly so the dispatch loop has something
+        // to drain.
+        let force_resp = mgr
+            .call(
+                MSG_FORCE_EC_CONVERT,
+                rkyv_encode(&ForceEcConvertReq {
+                    extent_id: first_extent_id,
+                }),
+            )
+            .await
+            .expect("force-ec-convert");
+        let force: ForceEcConvertResp = rkyv_decode(&force_resp).expect("decode");
+        assert_eq!(
+            force.code, CODE_OK,
+            "force-ec-convert failed: {}",
+            force.message
         );
 
         // Wait for EC conversion (up to 30s).
