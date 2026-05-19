@@ -2922,3 +2922,14 @@ Background: autumn-rs 当前节点死亡判定模型过于激进——心跳 10s
   - 108/108 manager lib tests pass (4 new for Suspend semantics); 8/8 autumn-op tests pass.
 
 - **passes:** true
+
+### F215 (deferred follow-up) · Port F185 orchestrated-freeze pattern to split
+- **Trigger:** `system_concurrent_write_crash::concurrent_writers_during_split` empirically shows ~65% of writes acknowledged during a concurrent split are lost from BOTH children. Unlike merge (F185), `handle_split_part` runs PS-local under the partition thread without halting incoming writes. A Put that lands AFTER the split's commit_length capture but BEFORE the manager's atomic txn commits gets acked into the OLD log_stream tail extent, whose post-seal commit_length captures the pre-Put value. The RIGHT child's duplicated stream inherits the smaller sealed_length so vp_head replay skips those bytes; the LEFT child also narrowed its range, so keys ≥ mid_key fall out of range even if recovered.
+- **Goal:** Wrap `handle_split_part` with the same orchestrator-driven freeze pattern F185 added for merge:
+  - New `MSG_SPLIT_FREEZE` RPC (PS-local).
+  - Manager-side `handle_split_partition` acquires admin lock, fires SPLIT_FREEZE to halt writes + flush memtable, captures commit_length under the freeze, then runs the existing atomic split txn.
+  - PS-side: extend `frozen_for_merge` cell + handle_incoming_req short-circuit to cover split as well (rename to `frozen_for_topology`).
+- **Acceptance:**
+  - `concurrent_writers_during_split` re-enables strict ≤20% loss bound (matching F185 merge tolerance).
+  - End-to-end smoke: split during 1000 concurrent puts → zero acknowledged-but-missing keys.
+- **passes:** false (deferred)

@@ -109,7 +109,10 @@ async fn setup_ec_stream(
         .await
         .expect("create_stream");
     let created: CreateStreamResp = rkyv_decode(&resp).expect("decode");
-    let stream_id = created.stream.expect("stream").stream_id;
+    let stream_id = created
+        .stream
+        .unwrap_or_else(|| panic!("create_stream returned code={} msg={}", created.code, created.message))
+        .stream_id;
 
     let pool = Rc::new(ConnPool::new());
     let client = StreamClient::connect(
@@ -222,6 +225,12 @@ fn ec_policy_stream_large_payload() {
 }
 
 /// Pure replication stream (no EC policy) still works.
+///
+/// Convention update: pre-some-refactor `(ec_data=0, ec_parity=0)` meant
+/// "no EC at all". Post-validation tightening the manager requires
+/// `ec_data >= 1`; pure replication is now `(ec_data=N, ec_parity=0)`
+/// where N == replicates. The wire shape is unchanged — only the
+/// validation rule shifted.
 #[test]
 fn replication_stream_works() {
     let d1 = tempfile::tempdir().unwrap();
@@ -229,11 +238,11 @@ fn replication_stream_works() {
     let d3 = tempfile::tempdir().unwrap();
 
     let (mgr_addr, n1_addr, n2_addr, n3_addr) =
-        setup_cluster_3nodes(d1.path(), d2.path(), d3.path(), 0, 0);
+        setup_cluster_3nodes(d1.path(), d2.path(), d3.path(), 3, 0);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (stream_id, client) =
-            setup_ec_stream(mgr_addr, n1_addr, n2_addr, n3_addr, 0, 0).await;
+            setup_ec_stream(mgr_addr, n1_addr, n2_addr, n3_addr, 3, 0).await;
 
         let payload = b"replicated data payload";
         let r = client

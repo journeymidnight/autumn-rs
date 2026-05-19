@@ -540,21 +540,52 @@ impl AutumnManager {
             (start, start + 1, selected)
         };
 
+        // F121/F190-style fallback walk: if a selected node refuses
+        // alloc_extent (process dead, port closed, etc.), try another
+        // node from the remaining pool. Pre-this, handle_create_stream
+        // failed fast on the first replica's error, so a stream couldn't
+        // be created when ANY one of the picked nodes was unreachable —
+        // even though other healthy nodes existed. Mirrors the pattern
+        // in handle_stream_alloc_extent above.
+        let selected_ids: HashSet<u64> = selected.iter().map(|n| n.node_id).collect();
+        let mut fallback_nodes: Vec<MgrNodeInfo> = {
+            let s = self.store.inner.borrow();
+            s.nodes
+                .values()
+                .filter(|n| !selected_ids.contains(&n.node_id))
+                .cloned()
+                .collect()
+        };
+        {
+            use rand::seq::SliceRandom;
+            fallback_nodes.shuffle(&mut rand::thread_rng());
+        }
+        let mut fallback_iter = fallback_nodes.into_iter();
+
         let mut node_ids = Vec::with_capacity(selected.len());
         let mut disk_ids = Vec::with_capacity(selected.len());
         for n in &selected {
-            node_ids.push(n.node_id);
-            let disk = match self.alloc_extent_on_node(&n.address, extent_id).await {
-                Ok(d) => d,
-                Err(err) => {
-                    return Ok(rkyv_encode(&CreateStreamResp {
-                        code: Self::err_to_code(&err),
-                        message: err.to_string(),
-                        stream: None,
-                        extent: None,
-                    }));
+            let mut candidate = n.clone();
+            let (node_id, disk) = loop {
+                match self.alloc_extent_on_node(&candidate.address, extent_id).await {
+                    Ok(disk) => break (candidate.node_id, disk),
+                    Err(_) => match fallback_iter.next() {
+                        Some(alt) => candidate = alt,
+                        None => {
+                            let err = AppError::Precondition(format!(
+                                "no healthy node available to allocate extent {extent_id} for new stream"
+                            ));
+                            return Ok(rkyv_encode(&CreateStreamResp {
+                                code: Self::err_to_code(&err),
+                                message: err.to_string(),
+                                stream: None,
+                                extent: None,
+                            }));
+                        }
+                    },
                 }
             };
+            node_ids.push(node_id);
             disk_ids.push(disk);
         }
 

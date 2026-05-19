@@ -143,7 +143,10 @@ pub async fn create_stream(mgr: &RpcClient, replicates: u32) -> u64 {
         .await
         .expect("create stream");
     let created: CreateStreamResp = rkyv_decode(&resp).expect("decode CreateStreamResp");
-    created.stream.expect("stream").stream_id
+    created
+        .stream
+        .unwrap_or_else(|| panic!("create_stream code={} msg={}", created.code, created.message))
+        .stream_id
 }
 
 /// Create three streams (log, row, meta) for a partition.
