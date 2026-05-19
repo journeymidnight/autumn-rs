@@ -3006,19 +3006,12 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
 
 - **passes:** true (2026-05-19; smoke test green, full code path verified)
 
-### F217 (deferred) · autumn-kvcache Phase 2 — UCX one-sided RDMA + peer DRAM share
-- **Trigger:** F216 MVP every miss hits partition (~ms-scale RPC). Multiple inference replicas on same cluster have idle DRAM that could form a shared L2 pool, served at sub-µs latency via RDMA. Reference: Mooncake transfer engine pattern.
-- **Goal:**
-  - Extend `crates/transport/src/ucx/` with `ucp_put_nbx` / `ucp_get_nbx` (currently only `ucp_stream_send_nbx`/`recv_nbx`).
-  - Memory region registration (`ucp_mem_map`) + rkey exchange protocol (gossip or manager-mediated).
-  - autumn-kvcache: on local LRU miss → try peer pool via consistent-hashed peer lookup + one-sided GET → fall through to partition only on peer miss.
-  - Writes: local LRU only; peers populate via demand (cold reads pull from owner).
-  - Eviction policy: when peer is offline (heartbeat lost), redirect its keyspace shard to fallback (partition direct).
-- **Acceptance:**
-  - p99 peer-hit latency < 50µs on 25Gbps IB/RoCE.
-  - Cluster of 4 nodes, kill 1, no data unavailability (peer miss → partition direct fall-through).
-  - Bench: 2x TTFT improvement over F216 on a multi-replica prefix-sharing workload.
-- **passes:** false (deferred)
+### F217 (SUPERSEDED) · autumn-kvcache Phase 2 — UCX one-sided RDMA + peer DRAM share
+- **Status:** **superseded** 2026-05-19 by F216's final architecture (Python-adapter-only, partition handles all cross-node sharing). See `docs/autumn_kvcache_plan.md` §3.2 ("不做哪些事 / design rationale") and the [[project_autumn_kvcache_architecture]] memory.
+- **Why superseded:** The premise — "multiple inference replicas have idle DRAM that could form a shared L2 pool" — assumed a sidecar daemon holding local LRU per node. F216 collapsed to a stateless Python adapter; there's no daemon to host a peer mesh. More importantly, autumn's **partition layer is already a distributed in-memory KV** (memtable + block cache + UCX RDMA path), so a separate peer DRAM mesh would re-implement what partition already provides. Adding one would violate [[feedback_no_parallel_data_plane]].
+- **What replaces it:** Cross-node KV cache sharing now goes entirely through partition: writer (sglang on node A) → `batch_set_v1` → autumn-kvcache adapter → partition.put; reader (sglang on node B) → `batch_get_v1` → autumn-kvcache adapter → partition.get. The "sub-µs" target was wrong scope — partition's UCX RDMA path is sub-ms, well inside sglang's 2s+0.1s/Kitok prefetch budget.
+- **If revisited in the future:** the trigger would be a benchmark showing partition's per-key lookup is the bottleneck (e.g., P99 > 100ms on prefix-heavy workload), and that a node-local DRAM cache between the adapter and partition would close the gap. Until then, do not re-introduce a peer mesh — extend autumn-rpc / UCX path inside partition instead.
+- **passes:** n/a (superseded; not a deliverable)
 
 ### F218 (deferred) · autumn-fuse Phase 3 — page cache + GDS + node-level shared cache daemon
 - **Trigger:** Model weights (Llama-70B ~140GB, 405B ~810GB) currently load via FUSE with `FOPEN_DIRECT_IO` (bypasses kernel page cache), so 8 inference replicas on a node pull 8× from storage. mmap-heavy safetensors path needs verification with larger readahead. GDS would enable NIC → GPU direct for tensor pages.
