@@ -112,7 +112,7 @@ pub(crate) async fn dispatch_partition_rpc(
     revision: i64,
 ) -> HandlerResult {
     match msg_type {
-        MSG_GET => handle_get(payload, part, part_sc).await,
+        MSG_GET => handle_get(payload, part).await,
         MSG_HEAD => handle_head(payload, part).await,
         MSG_RANGE => handle_range(payload, part).await,
         MSG_GET_DISCARDS => handle_get_discards(payload, part, part_sc).await,
@@ -141,7 +141,7 @@ pub(crate) async fn dispatch_partition_rpc(
     }
 }
 
-pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>, _part_sc: &Rc<StreamClient>) -> HandlerResult {
+pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
     let req: GetReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
     let lookup_t0 = Instant::now();

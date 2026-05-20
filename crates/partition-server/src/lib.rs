@@ -3128,6 +3128,9 @@ fn spawn_ps_read(
 fn push_one_frame_to_inflight(
     frame: Frame,
     req_tx: &mpsc::Sender<PartitionRequest>,
+    // F216 (Option B): `Some` in production → GET served locally here; `None`
+    // in the mock-loop unit tests (which only drive writes) → GET delegates.
+    part: &Option<Rc<RefCell<PartitionData>>>,
     owner_part: u64,
     inflight: &mut FuturesUnordered<futures::future::LocalBoxFuture<'static, Bytes>>,
 ) {
@@ -3147,6 +3150,36 @@ fn push_one_frame_to_inflight(
         let bytes = Frame::error(req_id, msg_type, err_payload).encode();
         inflight.push(async move { bytes }.boxed_local());
         return;
+    }
+
+    // F216 (Option B): serve GET reads LOCALLY in this ps-conn task's FU —
+    // no `req_tx` hop, no detour through `partition_loop`. Reads need only a
+    // consistent read of `PartitionData` (memtable + SSTs), not the
+    // single-writer group-commit actor, so routing them through
+    // `partition_loop` was pure overhead (an mpsc hop + a per-op spawn).
+    // `handle_get` borrows the partition only across synchronous code (it
+    // drops the borrow before the `resolve_value` await), and the whole
+    // P-log runtime is single-threaded, so concurrent reads in this FU never
+    // overlap a borrow with each other or with `partition_loop`'s writes
+    // (`borrow_mut`). This keeps `partition_loop` focused on writes.
+    if msg_type == MSG_GET {
+        if let Some(part) = part {
+            let part_c = part.clone();
+            let fut = async move {
+                let resp_frame = match crate::rpc_handlers::handle_get(payload, &part_c).await {
+                    Ok(p) => Frame::response(req_id, msg_type, p),
+                    Err((code, message)) => Frame::error(
+                        req_id,
+                        msg_type,
+                        autumn_rpc::RpcError::encode_status(code, &message),
+                    ),
+                };
+                resp_frame.encode()
+            };
+            inflight.push(fut.boxed_local());
+            return;
+        }
+        // part == None (unit-test mode): fall through to the req_tx delegate.
     }
 
     let mut tx = req_tx.clone();
@@ -3206,6 +3239,7 @@ fn push_one_frame_to_inflight(
 async fn push_frames_to_inflight(
     decoder: &mut FrameDecoder,
     req_tx: &mpsc::Sender<PartitionRequest>,
+    part: &Option<Rc<RefCell<PartitionData>>>,
     owner_part: u64,
     inflight: &mut FuturesUnordered<futures::future::LocalBoxFuture<'static, Bytes>>,
     tx_bufs: &mut Vec<Bytes>,
@@ -3222,7 +3256,7 @@ async fn push_frames_to_inflight(
                         break;
                     }
                 }
-                push_one_frame_to_inflight(frame, req_tx, owner_part, inflight);
+                push_one_frame_to_inflight(frame, req_tx, part, owner_part, inflight);
             }
             Some(_) => continue, // req_id == 0 fire-and-forget
             None => break,
@@ -3250,6 +3284,7 @@ async fn push_frames_to_inflight(
 async fn d1_fast_path_round_trip(
     frame: Frame,
     req_tx: &mpsc::Sender<PartitionRequest>,
+    part: &Option<Rc<RefCell<PartitionData>>>,
     owner_part: u64,
 ) -> Bytes {
     let req_id = frame.req_id;
@@ -3263,6 +3298,23 @@ async fn d1_fast_path_round_trip(
             &format!("partition {part_id} not served by this P-log (owner={owner_part})"),
         );
         return Frame::error(req_id, msg_type, err_payload).encode();
+    }
+
+    // F216 (Option B): d=1 GET served locally too — same rationale as
+    // push_one_frame_to_inflight. No req_tx hop / partition_loop detour.
+    if msg_type == MSG_GET {
+        if let Some(part) = part {
+            return match crate::rpc_handlers::handle_get(payload, part).await {
+                Ok(p) => Frame::response(req_id, msg_type, p),
+                Err((code, message)) => Frame::error(
+                    req_id,
+                    msg_type,
+                    autumn_rpc::RpcError::encode_status(code, &message),
+                ),
+            }
+            .encode();
+        }
+        // part == None (unit-test mode): fall through to the req_tx delegate.
     }
 
     let (resp_tx, resp_rx) = oneshot::channel();
@@ -3332,6 +3384,13 @@ async fn d1_fast_path_round_trip(
 async fn handle_ps_connection(
     conn: autumn_transport::Conn,
     req_tx: mpsc::Sender<PartitionRequest>,
+    // F216 (Option B): this task serves GET reads locally (in its own FU)
+    // when `Some` — `handle_get` only needs read access to PartitionData (it
+    // pulls the StreamClient from `part.stream_client` internally). Writes
+    // still delegate to `partition_loop` via `req_tx`. `None` is the
+    // mock-loop unit-test mode (those tests drive only writes), where GET
+    // would fall back to the req_tx delegate.
+    part: Option<Rc<RefCell<PartitionData>>>,
     owner_part: u64,
 ) -> Result<()> {
     use futures::future::{select, Either, LocalBoxFuture};
@@ -3420,7 +3479,7 @@ async fn handle_ps_connection(
                             PS_FAST_PATH_HITS
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let resp_bytes = d1_fast_path_round_trip(
-                                frame, &req_tx, owner_part,
+                                frame, &req_tx, &part, owner_part,
                             )
                             .await;
                             let BufResult(wr, _) = writer.write_all(resp_bytes).await;
@@ -3433,13 +3492,13 @@ async fn handle_ps_connection(
                         // then drain whatever else is buffered.
                         if frame.req_id != 0 {
                             push_one_frame_to_inflight(
-                                frame, &req_tx, owner_part, &mut inflight,
+                                frame, &req_tx, &part, owner_part, &mut inflight,
                             );
                         }
                         if let Some(second) = more {
                             if second.req_id != 0 {
                                 push_one_frame_to_inflight(
-                                    second, &req_tx, owner_part, &mut inflight,
+                                    second, &req_tx, &part, owner_part, &mut inflight,
                                 );
                             }
                         }
@@ -3448,6 +3507,7 @@ async fn handle_ps_connection(
                     push_frames_to_inflight(
                         &mut decoder,
                         &req_tx,
+                        &part,
                         owner_part,
                         &mut inflight,
                         &mut tx_bufs,
@@ -3509,6 +3569,7 @@ async fn handle_ps_connection(
                         push_frames_to_inflight(
                             &mut decoder,
                             &req_tx,
+                            &part,
                             owner_part,
                             &mut inflight,
                             &mut tx_bufs,
@@ -3867,6 +3928,9 @@ async fn partition_thread_main(
     // shuts down cleanly.
     {
         let req_tx_for_accept = req_tx.clone();
+        // F216 (Option B): the accept task hands each ps-conn task a clone of
+        // `part` so it can serve GET reads locally in its own FU.
+        let part_for_accept = part.clone();
         compio::runtime::spawn(async move {
             let mut shutdown_rx = shutdown_rx;
             use futures::future::{select, Either};
@@ -3888,9 +3952,10 @@ async fn partition_thread_main(
                             let _ = s.set_nodelay(true);
                         }
                         let req_tx_conn = req_tx_for_accept.clone();
+                        let part_conn = part_for_accept.clone();
                         compio::runtime::spawn(async move {
                             if let Err(e) =
-                                handle_ps_connection(conn, req_tx_conn, part_id).await
+                                handle_ps_connection(conn, req_tx_conn, Some(part_conn), part_id).await
                             {
                                 tracing::debug!(part_id, peer = %peer, error = %e, "ps connection ended");
                             }
@@ -7067,7 +7132,7 @@ mod f099j_tests {
 
             // Spawn the ps-conn task with the direct req_tx (no router).
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(autumn_transport::Conn::Tcp(server_stream), req_tx, /*owner_part=*/ 7).await
+                handle_ps_connection(autumn_transport::Conn::Tcp(server_stream), req_tx, None, /*owner_part=*/ 7).await
             });
 
             // Spawn a simulated merged_loop that answers the single Put.
@@ -7155,7 +7220,7 @@ mod f099j_tests {
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(128);
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, 1).await
+                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 1).await
             });
 
             // Simulated merged_loop: echo every Put.
@@ -7332,6 +7397,7 @@ mod f099k_tests {
                                             let _ = handle_ps_connection(
                                                 autumn_transport::Conn::Tcp(stream),
                                                 tx,
+                                                None,
                                                 owner_part,
                                             )
                                             .await;
@@ -7576,7 +7642,7 @@ mod f099i_tests {
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, /*owner_part=*/ 7).await
+                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, /*owner_part=*/ 7).await
             });
 
             let loop_handle = compio::runtime::spawn(async move {
@@ -7663,7 +7729,7 @@ mod f099i_tests {
             let cur = Rc::new(Cell::new(0usize));
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, 9).await
+                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 9).await
             });
 
             let peak_c = peak.clone();
@@ -7831,7 +7897,7 @@ mod f099i_tests {
                         mpsc::channel::<PartitionRequest>(4096);
 
                     let conn_handle = compio::runtime::spawn(async move {
-                        handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, 5).await
+                        handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 5).await
                     });
 
                     let peak_c = peak.clone();
@@ -8008,7 +8074,7 @@ mod f099i_tests {
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(8);
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, /*owner_part=*/ 11).await
+                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, /*owner_part=*/ 11).await
             });
 
             // Responder: answer each request immediately so the fast-path
@@ -8103,7 +8169,7 @@ mod f099i_tests {
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, 13).await
+                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 13).await
             });
 
             let loop_handle = compio::runtime::spawn(async move {
