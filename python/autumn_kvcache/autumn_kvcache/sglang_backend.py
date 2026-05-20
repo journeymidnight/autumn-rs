@@ -23,7 +23,7 @@ from typing import List, Optional
 
 import autumn
 
-from ._bridge import run, run_on, new_loop, run_sharded_on_loops
+from ._bridge import run, run_on, new_loop
 
 try:
     from sglang.srt.mem_cache.hicache_storage import (
@@ -145,36 +145,25 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
                 log.info("autumn transport set to %s", transport)
             except Exception as e:  # noqa: BLE001
                 log.warning("set_transport(%s) failed, falling back to tcp: %r", transport, e)
-        # Per-call concurrency cap. autumn's UCX worker has a read-concurrency
-        # cliff: batch_get throughput is ~310 MB/s up to ~16 in-flight but
-        # collapses past ~32 (single-threaded worker, rendezvous scaling).
-        # Chunk batch ops into sub-batches of this size, issued sequentially,
-        # to stay in the fast region. TCP has no cliff (default 0 = no chunk).
-        # Override via extra_config "max_inflight".
-        default_chunk = 16 if transport == "ucx" else 0
-        self._max_inflight = int(extra_config.get("max_inflight", default_chunk))
-        # Multi-worker client fan-out. autumn's per-UCX-worker throughput
-        # caps at ~480 MB/s (256 KB pages); aggregate scales ~linearly with
-        # independent client connections (each Client spawns its own compio
-        # thread + UCX worker). Shard each batch across `client_workers`
-        # connections to lift the ceiling (4 → ~1.2 GB/s measured). TCP shows
-        # the same per-thread cap, so default >1 there too.
-        # Multi-worker fan-out is opt-in (default 1). Measured ceiling: each
-        # client gets its own asyncio loop thread, but in-process scaling is
-        # GIL-bound — 2 workers ≈ +15% (540 MB/s), 4 flat, 8 breaks. The
-        # heavy memcpy is in Rust (GIL freed) but per-op asyncio/list/numpy
-        # work is enough Python to serialize. Real multi-GB/s needs a single
-        # GIL-releasing Rust batch op (see worker.rs note). Multi-PROCESS
-        # scales (separate GILs) but sglang is one process. Override via
-        # extra_config "client_workers".
+        # Hot path: the GIL-releasing Rust BatchClient. One PyO3 call extracts
+        # all dest pointers under the GIL, then py.allow_threads while Rust
+        # workers pipeline transfers + memcpy into the pinned pages. This both
+        # lifts throughput (~600 MB/s vs ~480 on the asyncio path) and frees
+        # the GIL during a batch so sglang's other threads run concurrently.
+        #
+        # per_worker_cap bounds in-flight depth per worker, keeping UCX under
+        # its single-worker rendezvous cliff (≤16). client_workers is the
+        # number of Rust worker threads; in-process scaling is currently
+        # capped by the shared process-global ucp_context (workers serialize
+        # on it), so default 1 — >1 is wired for when per-thread contexts land.
+        default_cap = 16 if transport == "ucx" else 64
+        self._max_inflight = int(extra_config.get("max_inflight", default_cap))
         n_workers = max(1, int(extra_config.get("client_workers", 1)))
-        self._loops = [new_loop() for _ in range(n_workers)]
-        self._clients = [
-            run_on(loop, lambda: autumn.Client.connect(endpoint))
-            for loop in self._loops
-        ]
-        self._client = self._clients[0]  # v0 wrappers + batch_exists use one
-        self._loop0 = self._loops[0]
+        self._batch = autumn.BatchClient(endpoint, n_workers, max(1, self._max_inflight))
+        # Low-frequency v0 / batch_exists / clear paths use a regular async
+        # Client on its own loop thread.
+        self._loop0 = new_loop()
+        self._client = run_on(self._loop0, lambda: autumn.Client.connect(endpoint))
         self._mem_pool_host = None
         self._stats = {
             "get_hit": 0,
@@ -233,67 +222,16 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
 
     # ── v1 zero-copy hot path ──────────────────────────────────────────────
 
-    def _shard_bounds(self, n: int):
-        """Split [0, n) into len(self._clients) near-equal contiguous shards.
-
-        Contiguous (not round-robin) so each shard's keys keep their relative
-        order; results are concatenated back in shard order = original order.
-        """
-        k = len(self._clients)
-        if k <= 1 or n == 0:
-            return [(0, n)]
-        per = (n + k - 1) // k
-        return [(s, min(s + per, n)) for s in range(0, n, per)]
-
-    def _run_sharded(self, op_name, full_keys, views):
-        """Fan `op_name` ('batch_get_into'|'batch_put_from') across clients.
-
-        Each client handles a contiguous shard, internally chunked to
-        _max_inflight (sequential sub-batches to stay under the UCX
-        single-worker cliff). Shards run concurrently via run_coros. Returns
-        a bool list aligned to `full_keys`.
-        """
-        chunk = self._max_inflight
-        bounds = self._shard_bounds(len(full_keys))
-
-        async def _shard(client, fk, vw):
-            step = chunk if chunk > 0 else len(fk)
-            if step <= 0:
-                step = len(fk) or 1
-            out: List[bool] = []
-            for s in range(0, len(fk), step):
-                sub_k, sub_v = fk[s:s + step], vw[s:s + step]
-                meth = getattr(client, op_name)
-                out.extend(await meth(sub_k, sub_v))
-            return out
-
-        loops, thunks = [], []
-        for i, (s, e_) in enumerate(bounds):
-            client = self._clients[i % len(self._clients)]
-            loop = self._loops[i % len(self._loops)]
-            fk, vw = full_keys[s:e_], views[s:e_]
-            loops.append(loop)
-            thunks.append(lambda client=client, fk=fk, vw=vw: _shard(client, fk, vw))
-        try:
-            shard_results = run_sharded_on_loops(loops, thunks)
-        except Exception as e:  # noqa: BLE001
-            log.debug("%s sharded error (n=%d): %r", op_name, len(full_keys), e)
-            return [False] * len(full_keys)
-        results: List[bool] = []
-        for r in shard_results:
-            results.extend(r)
-        return results
-
     def batch_get_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
         full_keys = [self._full_key(k) for k in keys]
         try:
             starts = _page_start_indices(keys, host_indices)
             views = [self._page_view(s) for s in starts]
+            results = list(self._batch.get_into(full_keys, views))
         except Exception as e:  # noqa: BLE001
-            log.debug("page view error (n=%d): %r", len(keys), e)
+            log.debug("batch get_into error (n=%d): %r", len(keys), e)
             self._stats["get_error"] += len(keys)
             return [False] * len(keys)
-        results = self._run_sharded("batch_get_into", full_keys, views)
         for ok in results:
             self._stats["get_hit" if ok else "get_miss"] += 1
         return results
@@ -303,11 +241,11 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         try:
             starts = _page_start_indices(keys, host_indices)
             views = [self._page_view(s) for s in starts]
+            results = list(self._batch.put_from(full_keys, views))
         except Exception as e:  # noqa: BLE001
-            log.debug("page view error (n=%d): %r", len(keys), e)
+            log.debug("batch put_from error (n=%d): %r", len(keys), e)
             self._stats["set_error"] += len(keys)
             return [False] * len(keys)
-        results = self._run_sharded("batch_put_from", full_keys, views)
         for ok in results:
             self._stats["set_ok" if ok else "set_error"] += 1
         return results

@@ -715,11 +715,243 @@ fn set_transport(kind: &str) -> PyResult<()> {
     }
 }
 
+// ── BatchClient: GIL-releasing multi-worker batch engine ─────────────────────
+//
+// The async `Client` above pays per-op asyncio + GIL overhead: each get/put is
+// a Python future resolved via `call_soon_threadsafe`. For a 128-page batch
+// that's 128 GIL-serialized round-trips → ~480 MB/s ceiling regardless of how
+// many client workers you stack (the GIL serializes the marshaling).
+//
+// `BatchClient` removes that: ONE PyO3 call extracts all N (key, dest-ptr,
+// len) under the GIL, then `py.allow_threads` releases it while K dedicated
+// worker threads — each with its own compio runtime + ClusterClient + UCX
+// worker — pipeline the transfers and memcpy directly into the pinned dest
+// pages in Rust. No per-op Python, no asyncio. Concurrency per worker is
+// capped (`buffered`) to stay under the UCX single-worker rendezvous cliff.
+
+use std::sync::mpsc as smpsc;
+
+#[derive(Clone, Copy)]
+enum BatchOp {
+    Get,
+    Put,
+}
+
+/// One page of work. `ptr`/`len` address a pinned host page kept alive by the
+/// PyBuffer held in the calling PyO3 method across `allow_threads`.
+struct WorkItem {
+    key: Vec<u8>,
+    ptr: usize,
+    len: usize,
+}
+// SAFETY: `ptr` is a raw address into a Python buffer the caller pins for the
+// duration of the batch; only the owning worker thread dereferences it, and
+// only while the PyO3 method is blocked in `allow_threads` (no concurrent
+// Python access).
+unsafe impl Send for WorkItem {}
+
+struct BatchJob {
+    op: BatchOp,
+    items: Vec<WorkItem>,
+    done: smpsc::Sender<Vec<bool>>,
+}
+
+struct BatchWorker {
+    job_tx: UnboundedSender<BatchJob>,
+}
+
+#[pyclass]
+struct BatchClient {
+    workers: Vec<BatchWorker>,
+    per_worker_cap: usize,
+}
+
+async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, cap: usize) -> Vec<bool> {
+    let cap = cap.max(1);
+    match op {
+        BatchOp::Get => {
+            futures::stream::iter(items.into_iter())
+                .map(|it| async move {
+                    match client.get(&it.key).await {
+                        Ok(Some(v)) if v.len() == it.len => {
+                            // SAFETY: it.ptr/len address a pinned dest page held
+                            // alive by the caller; exclusive write here.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(v.as_ptr(), it.ptr as *mut u8, it.len);
+                            }
+                            true
+                        }
+                        _ => false,
+                    }
+                })
+                .buffered(cap)
+                .collect::<Vec<bool>>()
+                .await
+        }
+        BatchOp::Put => {
+            futures::stream::iter(items.into_iter())
+                .map(|it| async move {
+                    // SAFETY: it.ptr/len address a pinned source page held alive
+                    // by the caller for the whole batch.
+                    let val = unsafe { std::slice::from_raw_parts(it.ptr as *const u8, it.len) };
+                    client.put(&it.key, val).await.is_ok()
+                })
+                .buffered(cap)
+                .collect::<Vec<bool>>()
+                .await
+        }
+    }
+}
+
+#[pymethods]
+impl BatchClient {
+    /// Blocking constructor: spawn `n_workers` threads, each connecting its own
+    /// ClusterClient, and wait until all are ready. `per_worker_cap` bounds the
+    /// in-flight pipeline depth per worker (keep ≤ ~16-32 on UCX to dodge the
+    /// rendezvous cliff).
+    #[new]
+    #[pyo3(signature = (manager, n_workers=4, per_worker_cap=16))]
+    fn new(py: Python<'_>, manager: String, n_workers: usize, per_worker_cap: usize) -> PyResult<Self> {
+        let n_workers = n_workers.max(1);
+        let result: Result<Vec<BatchWorker>, String> = py.allow_threads(|| {
+            let mut workers = Vec::with_capacity(n_workers);
+            for i in 0..n_workers {
+                let (job_tx, mut job_rx) = unbounded::<BatchJob>();
+                let (ready_tx, ready_rx) = smpsc::channel::<Result<(), String>>();
+                let endpoint = manager.clone();
+                std::thread::Builder::new()
+                    .name(format!("autumn-batch-{i}"))
+                    .spawn(move || {
+                        let rt = match compio::runtime::Runtime::new() {
+                            Ok(rt) => rt,
+                            Err(e) => {
+                                let _ = ready_tx.send(Err(format!("compio runtime: {e}")));
+                                return;
+                            }
+                        };
+                        rt.block_on(async move {
+                            let client = match ClusterClient::connect(&endpoint).await {
+                                Ok(c) => {
+                                    let _ = ready_tx.send(Ok(()));
+                                    c
+                                }
+                                Err(e) => {
+                                    let _ = ready_tx.send(Err(e.to_string()));
+                                    return;
+                                }
+                            };
+                            while let Some(job) = job_rx.next().await {
+                                let res = run_job(&client, job.op, job.items, per_worker_cap).await;
+                                let _ = job.done.send(res);
+                            }
+                        });
+                    })
+                    .map_err(|e| format!("spawn batch worker: {e}"))?;
+                ready_rx
+                    .recv()
+                    .map_err(|_| "batch worker died during connect".to_string())??;
+                workers.push(BatchWorker { job_tx });
+            }
+            Ok(workers)
+        });
+        let workers = result.map_err(PyRuntimeError::new_err)?;
+        Ok(BatchClient { workers, per_worker_cap })
+    }
+
+    /// Batched zero-copy get. Returns list[bool] aligned to `keys`: True iff the
+    /// key was found AND its stored size == the buffer length (value copied into
+    /// the buffer). Fans across worker threads with the GIL released.
+    fn get_into(&self, py: Python<'_>, keys: Vec<Vec<u8>>, bufs: Vec<PyBuffer<u8>>) -> PyResult<Vec<bool>> {
+        self.run_batch(py, BatchOp::Get, keys, bufs, true)
+    }
+
+    /// Batched zero-copy put. Returns list[bool] aligned to `keys`.
+    fn put_from(&self, py: Python<'_>, keys: Vec<Vec<u8>>, bufs: Vec<PyBuffer<u8>>) -> PyResult<Vec<bool>> {
+        self.run_batch(py, BatchOp::Put, keys, bufs, false)
+    }
+
+    fn n_workers(&self) -> usize {
+        self.workers.len()
+    }
+}
+
+impl BatchClient {
+    fn run_batch(
+        &self,
+        py: Python<'_>,
+        op: BatchOp,
+        keys: Vec<Vec<u8>>,
+        bufs: Vec<PyBuffer<u8>>,
+        writable: bool,
+    ) -> PyResult<Vec<bool>> {
+        let n = keys.len();
+        if bufs.len() != n {
+            return Err(PyValueError::new_err("keys and bufs must have equal length"));
+        }
+        // Extract raw (ptr, len) under the GIL; validate buffers.
+        let mut items: Vec<WorkItem> = Vec::with_capacity(n);
+        for (k, buf) in keys.into_iter().zip(bufs.iter()) {
+            if writable && buf.readonly() {
+                return Err(PyValueError::new_err("every buf must be writable"));
+            }
+            if !buf.is_c_contiguous() {
+                return Err(PyValueError::new_err("every buf must be C-contiguous"));
+            }
+            items.push(WorkItem {
+                key: k,
+                ptr: buf.buf_ptr() as usize,
+                len: buf.item_count(),
+            });
+        }
+
+        let k = self.workers.len();
+        // Split into k contiguous shards (preserves order on reassembly).
+        let per = n.div_ceil(k).max(1);
+        let mut shards: Vec<Vec<WorkItem>> = Vec::with_capacity(k);
+        let mut it = items.into_iter();
+        for _ in 0..k {
+            let chunk: Vec<WorkItem> = it.by_ref().take(per).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            shards.push(chunk);
+        }
+
+        let results = py.allow_threads(|| {
+            let mut dones: Vec<(smpsc::Receiver<Vec<bool>>, usize)> = Vec::with_capacity(shards.len());
+            for (wi, chunk) in shards.into_iter().enumerate() {
+                let chunk_len = chunk.len();
+                let (done_tx, done_rx) = smpsc::channel::<Vec<bool>>();
+                let job = BatchJob { op, items: chunk, done: done_tx };
+                if self.workers[wi].job_tx.unbounded_send(job).is_err() {
+                    // Worker dead: synthesize a failed chunk so output stays aligned.
+                    let (tx, rx) = smpsc::channel::<Vec<bool>>();
+                    let _ = tx.send(vec![false; chunk_len]);
+                    dones.push((rx, chunk_len));
+                } else {
+                    dones.push((done_rx, chunk_len));
+                }
+            }
+            let mut out: Vec<bool> = Vec::with_capacity(n);
+            for (rx, chunk_len) in dones {
+                match rx.recv() {
+                    Ok(part) => out.extend(part),
+                    Err(_) => out.extend(std::iter::repeat(false).take(chunk_len)),
+                }
+            }
+            out
+        });
+        drop(bufs); // release pinned buffers only after all workers finished
+        Ok(results)
+    }
+}
+
 // ── Python module ───────────────────────────────────────────────────────────
 
 #[pymodule]
 fn autumn(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
+    m.add_class::<BatchClient>()?;
     m.add_function(wrap_pyfunction!(set_transport, m)?)?;
     Ok(())
 }
