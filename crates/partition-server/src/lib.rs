@@ -4639,8 +4639,53 @@ async fn handle_incoming_req(
             })
             .detach();
         }
-        // Reads and low-frequency ops (MAINTENANCE) go inline via
-        // dispatch_partition_rpc — correctness-preserving.
+        // F216: GET reads of large (256 KB-class) values spend ~93 % of
+        // their server time in `resolve_value` — a request/response read of
+        // the 256 KB payload from the extent node (the PS holds only the
+        // VP). That cost is mostly round-trip LATENCY (the 256 KB transfers
+        // in ~40 µs; the rest is the EN read + framing round-trip). Awaiting
+        // it inline parks `partition_loop` for the whole ~480 µs, so gets
+        // execute strictly one-at-a-time regardless of client pipeline depth
+        // (profiled: ops/s ≈ 1/per-op-handle-time, ~477 MB/s @256K). SPAWN
+        // the get as a detached task so the loop immediately picks up the
+        // next request and many extent reads overlap — overlapping the
+        // latency is the lever. No artificial concurrency cap: spawned reads
+        // are already bounded upstream by the per-connection ps-conn inflight
+        // cap (a ps-conn task won't issue request N+cap until earlier ones
+        // reply) and downstream by the stream/EN admission. `handle_get`
+        // only holds the partition `borrow()` across synchronous code (it
+        // drops the borrow before the resolve_value await), and compio is
+        // single-threaded, so concurrent spawned gets never overlap a borrow
+        // with each other or with Phase 3's borrow_mut.
+        MSG_GET => {
+            let part_c = part.clone();
+            let part_sc_c = part_sc.clone();
+            let pool_c = pool.clone();
+            let manager_addr_c = manager_addr.to_string();
+            let owner_key_c = owner_key.to_string();
+            let revision_c = revision;
+            let payload = req.payload;
+            let resp_tx = req.resp_tx;
+            compio::runtime::spawn(async move {
+                let result = dispatch_partition_rpc(
+                    MSG_GET,
+                    payload,
+                    &part_c,
+                    &part_sc_c,
+                    &pool_c,
+                    &manager_addr_c,
+                    &owner_key_c,
+                    revision_c,
+                )
+                .await;
+                let _ = resp_tx.send(result);
+            })
+            .detach();
+        }
+        // Other reads (HEAD/RANGE/GET_DISCARDS) + low-frequency ops
+        // (MAINTENANCE) go inline via dispatch_partition_rpc. HEAD is
+        // synchronous (no value read); RANGE/MAINTENANCE are not on the
+        // kvcache hot path and keep their existing inline semantics.
         _ => {
             let result = dispatch_partition_rpc(
                 req.msg_type,
