@@ -54,3 +54,40 @@ def run(thunk):
 
     fut = asyncio.run_coroutine_threadsafe(_wrap(), get_loop())
     return fut.result()
+
+
+def new_loop() -> asyncio.AbstractEventLoop:
+    """Create and start a fresh asyncio loop on its own daemon thread.
+
+    Used to give each autumn Client its own loop so result marshaling
+    (`set_result` on completion) doesn't serialize through one loop thread —
+    the bottleneck that made in-process multi-client fan-out not scale.
+    """
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, name="autumn-kvcache-loop", daemon=True).start()
+    return loop
+
+
+def run_on(loop, thunk):
+    """Submit `thunk` to a specific loop and block until result/exception."""
+    return asyncio.run_coroutine_threadsafe(_wrap_thunk(thunk), loop).result()
+
+
+async def _wrap_thunk(thunk):
+    return await thunk()
+
+
+def run_sharded_on_loops(loops, thunks):
+    """Run thunks[i] on loops[i] CONCURRENTLY, block for all, return results.
+
+    Each (loop, thunk) pair runs on its own loop thread, so K shards' awaits
+    + completion callbacks proceed in parallel. The blocking `.result()`
+    waits release the GIL, and the heavy per-page memcpy happens in Rust on
+    each client's compio thread — so this actually scales with K (unlike a
+    single shared loop). Results are returned in input order.
+    """
+    futs = [
+        asyncio.run_coroutine_threadsafe(_wrap_thunk(t), loop)
+        for loop, t in zip(loops, thunks)
+    ]
+    return [f.result() for f in futs]
