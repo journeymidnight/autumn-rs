@@ -5,20 +5,25 @@
 //! - One `ucp_worker_h` per compio runtime thread, kept in thread-local
 //!   storage and lazily created on first `connect`/`bind` from that thread.
 //! - A long-lived progress task per compio runtime drives
-//!   `ucp_worker_progress` every 50 µs. The task is bound to the runtime
-//!   that started it and dies cleanly when the runtime drops; we re-spawn
-//!   on the next runtime via the `Rc` strong-count sentinel below.
+//!   `ucp_worker_progress`. The task is bound to the runtime that started
+//!   it and dies cleanly when the runtime drops; we re-spawn on the next
+//!   runtime via the `Rc` strong-count sentinel below.
 //!
-//! ### Why polling instead of `ucp_worker_arm` + eventfd?
+//! ### Progress model: eventfd-driven (drain → arm → POLL_ADD → repeat)
 //!
-//! The eventfd-driven model (spec §5.1's preferred design) wraps
-//! `ucp_worker_get_efd()` in `compio::fs::AsyncFd` and waits via
-//! `arm → fd.read → progress`. In single-thread mode this hit a
-//! chicken-and-egg in initial integration tests (UCX won't signal the
-//! eventfd until progress runs; progress is gated on the read await).
-//! Resolving it cleanly needs careful drain-before-arm sequencing —
-//! tracked as a Phase 5 perf task. 50 µs polling adds bounded latency
-//! and is correct.
+//! `progress_loop` (below) is fully event-driven: it drains all ready
+//! completions, arms the worker, then parks on the UCX eventfd via
+//! `IORING_OP_POLL_ADD` (compio `PollOnce`) until UCX signals a new event.
+//! The earlier 50 µs polling model (and its eventfd chicken-and-egg) is
+//! gone — the canonical drain-before-arm sequence resolved it.
+//!
+//! KNOWN LIMITATION (kvcache "read cliff"): a single worker handling many
+//! (≳32) concurrent large-message *receives* degrades super-linearly
+//! (≈310 MB/s at depth 16 → single-digit MB/s at depth 128). Root cause is
+//! in the rendezvous receive scaling on one worker, not the progress loop.
+//! Callers that fan out big concurrent reads should cap in-flight depth
+//! (the autumn-kvcache adapter chunks batch reads to ~16). A proper fix
+//! (multi-worker, or rendezvous tuning) is a separate perf task.
 
 use crate::ucx::ffi::*;
 use std::ffi::c_void;

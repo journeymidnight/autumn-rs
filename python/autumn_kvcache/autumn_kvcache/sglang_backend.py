@@ -145,6 +145,14 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
                 log.info("autumn transport set to %s", transport)
             except Exception as e:  # noqa: BLE001
                 log.warning("set_transport(%s) failed, falling back to tcp: %r", transport, e)
+        # Per-call concurrency cap. autumn's UCX worker has a read-concurrency
+        # cliff: batch_get throughput is ~310 MB/s up to ~16 in-flight but
+        # collapses past ~32 (single-threaded worker, rendezvous scaling).
+        # Chunk batch ops into sub-batches of this size, issued sequentially,
+        # to stay in the fast region. TCP has no cliff (default 0 = no chunk).
+        # Override via extra_config "max_inflight".
+        default_chunk = 16 if transport == "ucx" else 0
+        self._max_inflight = int(extra_config.get("max_inflight", default_chunk))
         self._client = run(lambda: autumn.Client.connect(endpoint))
         self._mem_pool_host = None
         self._stats = {
@@ -204,16 +212,35 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
 
     # ── v1 zero-copy hot path ──────────────────────────────────────────────
 
+    def _chunks(self, n: int):
+        """Yield (start, end) sub-ranges of [0, n) capped at _max_inflight.
+
+        _max_inflight == 0 means no cap (one chunk). Used to keep UCX read
+        concurrency in the fast region (see __init__).
+        """
+        step = self._max_inflight if self._max_inflight > 0 else n
+        if step <= 0:
+            step = n or 1
+        for s in range(0, n, step):
+            yield s, min(s + step, n)
+
     def batch_get_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
         full_keys = [self._full_key(k) for k in keys]
         try:
             starts = _page_start_indices(keys, host_indices)
             views = [self._page_view(s) for s in starts]
-            results = list(run(lambda: self._client.batch_get_into(full_keys, views)))
         except Exception as e:  # noqa: BLE001
-            log.debug("batch_get_into error (n=%d): %r", len(keys), e)
+            log.debug("page view error (n=%d): %r", len(keys), e)
             self._stats["get_error"] += len(keys)
             return [False] * len(keys)
+        results: List[bool] = []
+        for s, e_ in self._chunks(len(full_keys)):
+            fk, vw = full_keys[s:e_], views[s:e_]
+            try:
+                results.extend(run(lambda fk=fk, vw=vw: self._client.batch_get_into(fk, vw)))
+            except Exception as e:  # noqa: BLE001
+                log.debug("batch_get_into error (chunk %d:%d): %r", s, e_, e)
+                results.extend([False] * (e_ - s))
         for ok in results:
             self._stats["get_hit" if ok else "get_miss"] += 1
         return results
@@ -223,11 +250,18 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         try:
             starts = _page_start_indices(keys, host_indices)
             views = [self._page_view(s) for s in starts]
-            results = list(run(lambda: self._client.batch_put_from(full_keys, views)))
         except Exception as e:  # noqa: BLE001
-            log.debug("batch_put_from error (n=%d): %r", len(keys), e)
+            log.debug("page view error (n=%d): %r", len(keys), e)
             self._stats["set_error"] += len(keys)
             return [False] * len(keys)
+        results: List[bool] = []
+        for s, e_ in self._chunks(len(full_keys)):
+            fk, vw = full_keys[s:e_], views[s:e_]
+            try:
+                results.extend(run(lambda fk=fk, vw=vw: self._client.batch_put_from(fk, vw)))
+            except Exception as e:  # noqa: BLE001
+                log.debug("batch_put_from error (chunk %d:%d): %r", s, e_, e)
+                results.extend([False] * (e_ - s))
         for ok in results:
             self._stats["set_ok" if ok else "set_error"] += 1
         return results
