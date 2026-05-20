@@ -85,6 +85,26 @@ def _normalize_indices(host_indices) -> List[int]:
     return list(host_indices)
 
 
+def _page_start_indices(keys, host_indices) -> List[int]:
+    """Resolve the starting host_index of each page.
+
+    With page_size>1, sglang passes `page_size` host_indices PER page (the
+    indices of every token in the page), so len(host_indices) ==
+    len(keys) * page_size. `get_data_page` wants the page's first index and
+    returns the whole flattened page. Mirror sglang's own
+    `host_indices[i * page_size]` (cache_controller `_generic_page_set`).
+
+    page_size is derived as len(indices) // len(keys) so we don't need to
+    track it separately; for page_size==1 this is the identity.
+    """
+    indices = _normalize_indices(host_indices)
+    n = len(keys)
+    if n == 0:
+        return []
+    page_size = max(1, len(indices) // n)
+    return [indices[i * page_size] for i in range(n)]
+
+
 class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
     """sglang HiCache L3 backend.
 
@@ -176,10 +196,10 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
     # ── v1 zero-copy hot path ──────────────────────────────────────────────
 
     def batch_get_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
-        indices = _normalize_indices(host_indices)
         full_keys = [self._full_key(k) for k in keys]
         try:
-            views = [self._page_view(idx) for idx in indices]
+            starts = _page_start_indices(keys, host_indices)
+            views = [self._page_view(s) for s in starts]
             results = list(run(lambda: self._client.batch_get_into(full_keys, views)))
         except Exception as e:  # noqa: BLE001
             log.debug("batch_get_into error (n=%d): %r", len(keys), e)
@@ -190,10 +210,10 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         return results
 
     def batch_set_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
-        indices = _normalize_indices(host_indices)
         full_keys = [self._full_key(k) for k in keys]
         try:
-            views = [self._page_view(idx) for idx in indices]
+            starts = _page_start_indices(keys, host_indices)
+            views = [self._page_view(s) for s in starts]
             results = list(run(lambda: self._client.batch_put_from(full_keys, views)))
         except Exception as e:  # noqa: BLE001
             log.debug("batch_put_from error (n=%d): %r", len(keys), e)
