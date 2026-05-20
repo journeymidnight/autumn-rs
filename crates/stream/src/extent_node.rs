@@ -2140,6 +2140,21 @@ impl ExtentNode {
         data_addr: SocketAddr,
         control_addr: SocketAddr,
     ) -> Result<()> {
+        // F191 separate control listener. Under UCX a second ucp_listener on
+        // the same RoCE device fails to bind ("Device is busy" / "Address
+        // already in use"), so we serve control RPCs on the data listener
+        // instead — `handle_connection` dispatches by msg_type, so DF and the
+        // other small control RPCs are handled identically there. The manager
+        // is told an empty control_address (see autumn-op format) and routes
+        // DF to the data address. TCP keeps the separate listener for
+        // head-of-line isolation between bulk data and control RPCs.
+        if autumn_transport::current_or_init().kind() == autumn_transport::TransportKind::Ucx {
+            tracing::info!(
+                data_addr = %data_addr,
+                "UCX: control RPCs share the data listener (no separate control listener)"
+            );
+            return self.accept_loop(data_addr, "data").await;
+        }
         let ctl_node = self.clone();
         compio::runtime::spawn(async move {
             tracing::info!(addr = %control_addr, "extent node CONTROL listener");

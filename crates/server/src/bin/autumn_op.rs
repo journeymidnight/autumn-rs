@@ -1738,7 +1738,17 @@ async fn run(args: Args) -> Result<()> {
             // per-extent operations to the owning shard via
             // `extent_id % shard_count`. Empty vec = single-shard EN
             // (manager routes everything to `advertise`).
-            let control_address = derive_control_address(&advertise);
+            // F191 control-plane port. Under UCX a second ucp_listener on the
+            // same RoCE device can't bind ("Device is busy"), so the extent
+            // node serves control RPCs on the data listener instead. Register
+            // an empty control_address so the manager's DF falls back to the
+            // data address (manager treats "" as "use addr"). TCP keeps the
+            // separate control port for HoL isolation.
+            let control_address = if args.transport == TransportKind::Ucx {
+                String::new()
+            } else {
+                derive_control_address(&advertise)
+            };
             let resp_bytes = client
                 .mgr_call(
                     MSG_REGISTER_NODE,
