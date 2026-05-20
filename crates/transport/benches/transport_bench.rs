@@ -382,7 +382,12 @@ async fn regbw_ucx(
         let warm = u64::from_le_bytes(b[..8].try_into().unwrap());
         // Persistent buffer for reused/registered modes (ptr stable: never realloc).
         let mut reuse = vec![0u8; size];
-        let _reg = if mode == "registered" {
+        // "registered" = ucp_mem_map the recv buffer but still read_exact
+        // (copy-out — memh NOT passed). "memh" = same registration AND pass
+        // memh to ucp_stream_recv_nbx → true zero-copy receive (RDMA into the
+        // registered dest, no bounce). Comparing the two isolates the memh
+        // effect.
+        let _reg = if mode == "registered" || mode == "memh" {
             Some(
                 autumn_transport::register_memory(reuse.as_mut_ptr() as *mut std::ffi::c_void, size)
                     .expect("register recv buffer"),
@@ -394,6 +399,15 @@ async fn regbw_ucx(
             if mode == "fresh" {
                 let BufResult(res, _) = r.read_exact(vec![0u8; size]).await;
                 if res.is_err() { return; }
+            } else if mode == "memh" {
+                let reg = _reg.as_ref().unwrap();
+                let mut filled = 0usize;
+                while filled < size {
+                    match r.recv_registered(&mut reuse[filled..], reg).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => filled += n,
+                    }
+                }
             } else {
                 let BufResult(res, b) = r.read_exact(std::mem::take(&mut reuse)).await;
                 if res.is_err() { return; }
@@ -407,6 +421,15 @@ async fn regbw_ucx(
             if mode == "fresh" {
                 let BufResult(res, _) = r.read_exact(vec![0u8; size]).await;
                 if res.is_err() { return; }
+            } else if mode == "memh" {
+                let reg = _reg.as_ref().unwrap();
+                let mut filled = 0usize;
+                while filled < size {
+                    match r.recv_registered(&mut reuse[filled..], reg).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => filled += n,
+                    }
+                }
             } else {
                 let BufResult(res, b) = r.read_exact(std::mem::take(&mut reuse)).await;
                 if res.is_err() { return; }
@@ -553,19 +576,18 @@ async fn main() {
         // — i.e. whether per-op buffer churn is what caps the get path.
         println!();
         println!("UCX recv-buffer registration comparison");
+        println!("(fresh/reused/registered all copy-out; memh = zero-copy receive via UCP_OP_ATTR_FIELD_MEMH)");
         println!("---------------------------------------");
-        println!("{:>10} | {:>12} {:>12} | {:>12} {:>12} | {:>12} {:>12}",
-            "size", "fresh MB/s", "fresh msg/s", "reused MB/s", "reused msg/s",
-            "reg MB/s", "reg msg/s");
+        println!("{:>10} | {:>14} | {:>14} | {:>14} | {:>14}",
+            "size", "fresh MB/s", "reused MB/s", "registered MB/s", "memh MB/s");
         for &s in &sizes {
             let fresh = regbw_ucx(autumn_transport::UcxTransport, ucx_addr, s, duration, "fresh").await;
             let reused = regbw_ucx(autumn_transport::UcxTransport, ucx_addr, s, duration, "reused").await;
             let reg = regbw_ucx(autumn_transport::UcxTransport, ucx_addr, s, duration, "registered").await;
-            println!("{:>10} | {:>12.1} {} | {:>12.1} {} | {:>12.1} {}",
+            let memh = regbw_ucx(autumn_transport::UcxTransport, ucx_addr, s, duration, "memh").await;
+            println!("{:>10} | {:>14.1} | {:>14.1} | {:>14.1} | {:>14.1}",
                 fmt_size(s),
-                fresh.mb_per_s(), fmt_msg_rate(fresh.msg_per_s()),
-                reused.mb_per_s(), fmt_msg_rate(reused.msg_per_s()),
-                reg.mb_per_s(), fmt_msg_rate(reg.msg_per_s()));
+                fresh.mb_per_s(), reused.mb_per_s(), reg.mb_per_s(), memh.mb_per_s());
         }
     }
 }

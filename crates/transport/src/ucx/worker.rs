@@ -103,6 +103,11 @@ impl RegisteredMem {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+    /// The UCX memory handle, for passing to `ucp_*_nbx` via
+    /// `params.memh` + `UCP_OP_ATTR_FIELD_MEMH` (zero-copy recv/send).
+    pub(crate) fn memh(&self) -> ucp_mem_h {
+        self.memh
+    }
 }
 
 impl Drop for RegisteredMem {

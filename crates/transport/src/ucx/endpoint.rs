@@ -432,6 +432,28 @@ impl compio::io::AsyncRead for UcxReadHalf {
     }
 }
 
+impl UcxReadHalf {
+    /// F216 zero-copy recv: `ucp_stream_recv_nbx` into `buf` with the
+    /// registered region's `memh` passed via `UCP_OP_ATTR_FIELD_MEMH`, so UCX
+    /// can RDMA directly into it (zero-copy) instead of the default copy-out
+    /// (bounce buffer → memcpy). Single recv — may return < buf.len(); the
+    /// caller loops for read_exact semantics. `buf` must lie inside `reg`'s
+    /// registered range.
+    pub async fn recv_registered(
+        &mut self,
+        buf: &mut [u8],
+        reg: &crate::RegisteredMem,
+    ) -> io::Result<usize> {
+        ucx_recv_raw(
+            self.ep.ptr(),
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len(),
+            reg.memh(),
+        )
+        .await
+    }
+}
+
 impl compio::io::AsyncWrite for UcxWriteHalf {
     async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
         ucx_send(self.ep.ptr(), buf).await
@@ -545,6 +567,74 @@ pub(crate) async fn ucx_flush(ep: *mut ucp_ep) -> io::Result<()> {
                 Ok(())
             } else {
                 Err(ucs_err(status, "ucp_ep_flush cb"))
+            }
+        }
+    }
+}
+
+/// Raw recv into a borrowed buffer (ptr+cap), optionally with a registered
+/// `memh` for zero-copy receive. `memh.is_null()` → default copy-out path
+/// (identical to `ucx_recv`). Returns bytes received. Cancel-safe: the
+/// `InflightSlot` guard drains UCX before returning; the buffer is borrowed
+/// by the caller (no ManuallyDrop leak on cancel).
+async fn ucx_recv_raw(
+    ep: *mut ucp_ep,
+    ptr: *mut c_void,
+    cap: usize,
+    memh: ucp_mem_h,
+) -> io::Result<usize> {
+    if cap == 0 {
+        return Ok(0);
+    }
+    let slot = slot_acquire();
+
+    let mut params: ucp_request_param_t = unsafe { std::mem::zeroed() };
+    let mut mask = ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK
+        | ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA
+        | ucp_op_attr_t::UCP_OP_ATTR_FLAG_NO_IMM_CMPL;
+    if !memh.is_null() {
+        // Zero-copy receive: tell UCX the dest is registered so it RDMAs
+        // straight in (no bounce buffer / copy-out).
+        mask |= ucp_op_attr_t::UCP_OP_ATTR_FIELD_MEMH;
+        params.memh = memh;
+    }
+    params.op_attr_mask = mask as u32;
+    params.cb.recv_stream = Some(cb_recv);
+    params.user_data = slot as *mut c_void;
+
+    let mut got: usize = 0;
+    let r = unsafe { ucp_stream_recv_nbx(ep, ptr, cap, &mut got, &params) };
+    match classify_ptr(r) {
+        PtrStatus::Done => {
+            unsafe { slot_release(slot) };
+            Ok(got)
+        }
+        PtrStatus::Err(st) => {
+            unsafe { slot_release(slot) };
+            Err(ucs_err(st, "ucp_stream_recv_nbx"))
+        }
+        PtrStatus::Pending(req) => {
+            let worker = with_thread_ctx(|c| c.worker);
+            let guard = InflightSlot {
+                request: req,
+                worker,
+                slot,
+                cleaned_up: Cell::new(false),
+            };
+            for _ in 0..SPIN_ITERS {
+                if unsafe { (*slot).is_done() } {
+                    break;
+                }
+                unsafe { ucp_worker_progress(worker); }
+            }
+            WaitSlot { slot: slot as *const Slot }.await;
+            let status = unsafe { (*slot).status.get() };
+            let n = unsafe { (*slot).length.get() };
+            drop(guard);
+            if status == ucs_status_t::UCS_OK {
+                Ok(n)
+            } else {
+                Err(ucs_err(status, "ucp_stream_recv cb"))
             }
         }
     }

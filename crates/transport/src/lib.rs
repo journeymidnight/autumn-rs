@@ -411,6 +411,25 @@ impl compio::io::AsyncRead for ReadHalf {
     }
 }
 
+#[cfg(feature = "ucx")]
+impl ReadHalf {
+    /// F216 zero-copy recv into a pre-registered buffer (UCX only). Single
+    /// recv (may be partial). See `UcxReadHalf::recv_registered`.
+    pub async fn recv_registered(
+        &mut self,
+        buf: &mut [u8],
+        reg: &RegisteredMem,
+    ) -> io::Result<usize> {
+        match self {
+            ReadHalf::Ucx(r) => r.recv_registered(buf, reg).await,
+            ReadHalf::Tcp(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "recv_registered is UCX-only",
+            )),
+        }
+    }
+}
+
 impl compio::io::AsyncWrite for WriteHalf {
     async fn write<B: compio::buf::IoBuf>(
         &mut self,
