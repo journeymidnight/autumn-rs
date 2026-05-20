@@ -10,6 +10,7 @@ pub(crate) mod listener;
 
 pub use endpoint::UcxConn;
 pub use listener::UcxListener;
+pub use worker::{register_memory, RegisteredMem};
 
 use crate::{AutumnTransport, Conn, Listener, TransportKind};
 use async_trait::async_trait;

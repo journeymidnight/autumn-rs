@@ -75,6 +75,62 @@ pub(crate) fn process_context() -> *mut ucp_context {
     .0
 }
 
+// ---- Memory registration (for zero-copy recv/send into pinned buffers) ----
+
+/// A UCX-registered memory region. Holds the `ucp_mem_h` and unmaps on drop.
+/// Registering a buffer up-front populates UCX's registration cache so that
+/// `ucp_stream_recv`/`send` into it skips per-op MR setup (the cost the get
+/// path pays today because each op recvs into a freshly-allocated Vec — a new
+/// address that misses the rcache and forces a fresh registration every time).
+pub struct RegisteredMem {
+    ctx: *mut ucp_context,
+    memh: ucp_mem_h,
+    ptr: *mut c_void,
+    len: usize,
+}
+// SAFETY: the handle is tied to the process-global context; the registered
+// range is caller-owned and kept alive by the caller for the region's lifetime.
+unsafe impl Send for RegisteredMem {}
+unsafe impl Sync for RegisteredMem {}
+
+impl RegisteredMem {
+    pub fn ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Drop for RegisteredMem {
+    fn drop(&mut self) {
+        unsafe {
+            ucp_mem_unmap(self.ctx, self.memh);
+        }
+    }
+}
+
+/// Register `[ptr, ptr+len)` with the process-global UCX context so recv/send
+/// into it is zero-copy (no per-op registration). Idempotent-safe to call once
+/// per stable buffer (e.g. sglang's pinned host KV pool) at setup.
+pub fn register_memory(ptr: *mut c_void, len: usize) -> io::Result<RegisteredMem> {
+    let ctx = process_context();
+    let mut params: ucp_mem_map_params_t = unsafe { std::mem::zeroed() };
+    params.field_mask = (ucp_mem_map_params_field::UCP_MEM_MAP_PARAM_FIELD_ADDRESS
+        | ucp_mem_map_params_field::UCP_MEM_MAP_PARAM_FIELD_LENGTH) as u64;
+    params.address = ptr;
+    params.length = len;
+    let mut memh: ucp_mem_h = ptr::null_mut();
+    let st = unsafe { ucp_mem_map(ctx, &params, &mut memh) };
+    if st != ucs_status_t::UCS_OK {
+        return Err(ucs_err(st, "ucp_mem_map"));
+    }
+    Ok(RegisteredMem { ctx, memh, ptr, len })
+}
+
 fn capture_context_info(ctx: *mut ucp_context) -> String {
     let mut buf: *mut libc::c_char = ptr::null_mut();
     let mut size: libc::size_t = 0;

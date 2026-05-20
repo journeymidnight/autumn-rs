@@ -55,6 +55,8 @@ fn main() {
         .allowlist_function("ucp_conn_request_query")
         .allowlist_function("ucp_stream_send_nbx")
         .allowlist_function("ucp_stream_recv_nbx")
+        .allowlist_function("ucp_mem_map")
+        .allowlist_function("ucp_mem_unmap")
         .allowlist_function("ucp_request_cancel")
         .allowlist_function("ucp_request_check_status")
         .allowlist_function("ucp_request_free")

@@ -352,6 +352,93 @@ async fn bw_k<T: AutumnTransport + Clone + 'static>(
     BwResult { msgs: total_msgs, elapsed: max_elapsed, size }
 }
 
+/// UCX-only: measure single-connection streaming-recv bandwidth under three
+/// destination-buffer strategies, to isolate the cost of UCX memory
+/// registration on the recv side.
+///   * "fresh"      — a new Vec per recv (rcache MISS every op; models the
+///                    current get path which allocates a Vec per value).
+///   * "reused"     — one buffer reused across recvs (rcache hits after op 1).
+///   * "registered" — one buffer reused AND ucp_mem_map'd up front.
+/// If fresh << reused ≈ registered, the lever is "stop churning the recv
+/// buffer" (i.e. recv straight into the stable, registered dest page).
+#[cfg(feature = "ucx")]
+async fn regbw_ucx(
+    t: autumn_transport::UcxTransport,
+    addr: SocketAddr,
+    size: usize,
+    duration: Duration,
+    mode: &'static str,
+) -> BwResult {
+    use compio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut listener = t.bind(addr).await.expect("bind");
+    let bound = listener.local_addr().expect("local_addr");
+
+    let server = compio::runtime::spawn(async move {
+        let (c, _) = listener.accept().await.expect("accept");
+        let (mut r, _w) = c.into_split();
+        // warmup count
+        let BufResult(res, b) = r.read_exact(vec![0u8; 8]).await;
+        if res.is_err() { return; }
+        let warm = u64::from_le_bytes(b[..8].try_into().unwrap());
+        // Persistent buffer for reused/registered modes (ptr stable: never realloc).
+        let mut reuse = vec![0u8; size];
+        let _reg = if mode == "registered" {
+            Some(
+                autumn_transport::register_memory(reuse.as_mut_ptr() as *mut std::ffi::c_void, size)
+                    .expect("register recv buffer"),
+            )
+        } else {
+            None
+        };
+        for _ in 0..warm {
+            if mode == "fresh" {
+                let BufResult(res, _) = r.read_exact(vec![0u8; size]).await;
+                if res.is_err() { return; }
+            } else {
+                let BufResult(res, b) = r.read_exact(std::mem::take(&mut reuse)).await;
+                if res.is_err() { return; }
+                reuse = b;
+            }
+        }
+        let BufResult(res, b) = r.read_exact(vec![0u8; 8]).await;
+        if res.is_err() { return; }
+        let timed = u64::from_le_bytes(b[..8].try_into().unwrap());
+        for _ in 0..timed {
+            if mode == "fresh" {
+                let BufResult(res, _) = r.read_exact(vec![0u8; size]).await;
+                if res.is_err() { return; }
+            } else {
+                let BufResult(res, b) = r.read_exact(std::mem::take(&mut reuse)).await;
+                if res.is_err() { return; }
+                reuse = b;
+            }
+        }
+        drop(_reg);
+    });
+
+    let c = t.connect(bound).await.expect("connect");
+    let (_r, mut w) = c.into_split();
+    let payload: Bytes = Bytes::from(vec![0xa5u8; size]);
+    let warm_iters: u64 = 64;
+    w.write_all(warm_iters.to_le_bytes().to_vec()).await.0.expect("send warm count");
+    let warm_t0 = Instant::now();
+    for _ in 0..warm_iters {
+        w.write_all(payload.clone()).await.0.expect("warm write");
+    }
+    let per_msg = warm_t0.elapsed().as_secs_f64() / warm_iters as f64;
+    let timed_iters: u64 = ((duration.as_secs_f64() / per_msg).max(64.0) as u64).min(50_000_000);
+    w.write_all(timed_iters.to_le_bytes().to_vec()).await.0.expect("send timed count");
+    let t0 = Instant::now();
+    for _ in 0..timed_iters {
+        w.write_all(payload.clone()).await.0.expect("timed write");
+    }
+    let elapsed = t0.elapsed();
+    drop(w);
+    drop(_r);
+    let _ = server.await;
+    BwResult { msgs: timed_iters, elapsed, size }
+}
+
 fn fmt_size(b: usize) -> String {
     if b >= 1024 * 1024 {
         format!("{}M", b / (1024 * 1024))
@@ -460,5 +547,25 @@ async fn main() {
             rtt_iters_cap,
         )
         .await;
+
+        // Registration comparison: fresh vs reused vs registered recv buffer.
+        // Tests whether ucp_mem_map (or just buffer reuse) lifts recv bandwidth
+        // — i.e. whether per-op buffer churn is what caps the get path.
+        println!();
+        println!("UCX recv-buffer registration comparison");
+        println!("---------------------------------------");
+        println!("{:>10} | {:>12} {:>12} | {:>12} {:>12} | {:>12} {:>12}",
+            "size", "fresh MB/s", "fresh msg/s", "reused MB/s", "reused msg/s",
+            "reg MB/s", "reg msg/s");
+        for &s in &sizes {
+            let fresh = regbw_ucx(autumn_transport::UcxTransport, ucx_addr, s, duration, "fresh").await;
+            let reused = regbw_ucx(autumn_transport::UcxTransport, ucx_addr, s, duration, "reused").await;
+            let reg = regbw_ucx(autumn_transport::UcxTransport, ucx_addr, s, duration, "registered").await;
+            println!("{:>10} | {:>12.1} {} | {:>12.1} {} | {:>12.1} {}",
+                fmt_size(s),
+                fresh.mb_per_s(), fmt_msg_rate(fresh.msg_per_s()),
+                reused.mb_per_s(), fmt_msg_rate(reused.msg_per_s()),
+                reg.mb_per_s(), fmt_msg_rate(reg.msg_per_s()));
+        }
     }
 }

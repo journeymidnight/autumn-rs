@@ -32,6 +32,8 @@ pub use probe::parse_transport_flag;
 pub use tcp::TcpTransport;
 #[cfg(feature = "ucx")]
 pub use ucx::UcxTransport;
+#[cfg(feature = "ucx")]
+pub use ucx::{register_memory, RegisteredMem};
 
 static GLOBAL: OnceLock<Box<dyn AutumnTransport>> = OnceLock::new();
 
