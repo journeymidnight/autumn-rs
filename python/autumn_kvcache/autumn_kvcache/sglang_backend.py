@@ -136,6 +136,15 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
 
         self.storage_config = storage_config
         self._tenant_suffix = _build_tenant_suffix(storage_config)
+        # Optional transport selection ("tcp" default, or "ucx" for RDMA).
+        # Must be set before the first connect; idempotent process-global.
+        transport = (extra_config.get("transport") or "tcp").lower()
+        if transport != "tcp":
+            try:
+                autumn.set_transport(transport)
+                log.info("autumn transport set to %s", transport)
+            except Exception as e:  # noqa: BLE001
+                log.warning("set_transport(%s) failed, falling back to tcp: %r", transport, e)
         self._client = run(lambda: autumn.Client.connect(endpoint))
         self._mem_pool_host = None
         self._stats = {
