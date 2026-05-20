@@ -679,10 +679,47 @@ impl Drop for Client {
     }
 }
 
+// ── Transport selection ──────────────────────────────────────────────────────
+
+/// Select the process-global transport. Must be called BEFORE the first
+/// `Client.connect`. Idempotent (first call wins, per
+/// `autumn_transport::init_with`). `"tcp"` (default) or `"ucx"`.
+///
+/// `"ucx"` requires the wheel to be built with `maturin build --features ucx`;
+/// otherwise it raises (the underlying transport panics on a UCX request in a
+/// non-UCX build, which we surface as a Python error here).
+#[pyfunction]
+fn set_transport(kind: &str) -> PyResult<()> {
+    match kind {
+        "tcp" => {
+            autumn_transport::init_with(autumn_transport::TransportKind::Tcp);
+            Ok(())
+        }
+        "ucx" => {
+            #[cfg(feature = "ucx")]
+            {
+                autumn_transport::init_with(autumn_transport::TransportKind::Ucx);
+                Ok(())
+            }
+            #[cfg(not(feature = "ucx"))]
+            {
+                Err(PyRuntimeError::new_err(
+                    "autumn was built without the `ucx` feature; \
+                     rebuild with `maturin build --features ucx`",
+                ))
+            }
+        }
+        other => Err(PyValueError::new_err(format!(
+            "transport must be 'tcp' or 'ucx', got {other:?}"
+        ))),
+    }
+}
+
 // ── Python module ───────────────────────────────────────────────────────────
 
 #[pymodule]
 fn autumn(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
+    m.add_function(wrap_pyfunction!(set_transport, m)?)?;
     Ok(())
 }

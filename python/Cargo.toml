@@ -7,9 +7,15 @@ edition = "2021"
 name = "autumn"
 crate-type = ["cdylib"]
 
+[features]
+# Build the wheel with `maturin build --features ucx` to compile in the UCX
+# transport. At runtime call `autumn.set_transport("ucx")` before connect.
+ucx = ["autumn-client/ucx", "autumn-rpc/ucx", "autumn-transport/ucx"]
+
 [dependencies]
 pyo3 = { version = "0.24", features = ["extension-module"] }
 autumn-client = { path = "../crates/client" }
 autumn-rpc = { path = "../crates/rpc" }
+autumn-transport = { path = "../crates/transport" }
 compio = { version = "0.18", features = ["runtime", "time"] }
 futures = "0.3"
