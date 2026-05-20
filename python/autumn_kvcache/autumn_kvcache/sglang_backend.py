@@ -177,35 +177,30 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
 
     def batch_get_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
         indices = _normalize_indices(host_indices)
-        results: List[bool] = []
-        for k, idx in zip(keys, indices):
-            full = self._full_key(k)
-            try:
-                view = self._page_view(idx)
-                ok = bool(run(lambda: self._client.get_into(full, view)))
-            except Exception as e:  # noqa: BLE001
-                log.debug("get_into error key=%s idx=%s: %r", k, idx, e)
-                self._stats["get_error"] += 1
-                ok = False
+        full_keys = [self._full_key(k) for k in keys]
+        try:
+            views = [self._page_view(idx) for idx in indices]
+            results = list(run(lambda: self._client.batch_get_into(full_keys, views)))
+        except Exception as e:  # noqa: BLE001
+            log.debug("batch_get_into error (n=%d): %r", len(keys), e)
+            self._stats["get_error"] += len(keys)
+            return [False] * len(keys)
+        for ok in results:
             self._stats["get_hit" if ok else "get_miss"] += 1
-            results.append(ok)
         return results
 
     def batch_set_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
         indices = _normalize_indices(host_indices)
-        results: List[bool] = []
-        for k, idx in zip(keys, indices):
-            full = self._full_key(k)
-            try:
-                view = self._page_view(idx)
-                run(lambda: self._client.put_from(full, view))
-                self._stats["set_ok"] += 1
-                ok = True
-            except Exception as e:  # noqa: BLE001
-                log.debug("put_from error key=%s idx=%s: %r", k, idx, e)
-                self._stats["set_error"] += 1
-                ok = False
-            results.append(ok)
+        full_keys = [self._full_key(k) for k in keys]
+        try:
+            views = [self._page_view(idx) for idx in indices]
+            results = list(run(lambda: self._client.batch_put_from(full_keys, views)))
+        except Exception as e:  # noqa: BLE001
+            log.debug("batch_put_from error (n=%d): %r", len(keys), e)
+            self._stats["set_error"] += len(keys)
+            return [False] * len(keys)
+        for ok in results:
+            self._stats["set_ok" if ok else "set_error"] += 1
         return results
 
     def batch_exists(self, keys, extra_info=None) -> int:
@@ -215,14 +210,16 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         docs/hicache_l3_interface.md:62-64. Uses `head` (metadata-only) so
         admission probing doesn't transfer the value bytes.
         """
+        full_keys = [self._full_key(k) for k in keys]
+        try:
+            founds = list(run(lambda: self._client.batch_head(full_keys)))
+        except Exception as e:  # noqa: BLE001
+            log.debug("batch_head error (n=%d): %r", len(keys), e)
+            return 0
+        # Contiguous-prefix length: stop at the first missing key.
         count = 0
-        for k in keys:
-            full = self._full_key(k)
-            try:
-                exists = bool(run(lambda: self._client.head(full)))
-            except Exception:  # noqa: BLE001
-                exists = False
-            if not exists:
+        for ok in founds:
+            if not ok:
                 break
             count += 1
         log.debug("batch_exists n=%d hit=%d", len(keys), count)

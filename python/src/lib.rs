@@ -115,6 +115,10 @@ enum Op {
         key: Vec<u8>,
         handle: PyHandle,
     },
+    BatchHead {
+        keys: Vec<Vec<u8>>,
+        handle: PyHandle,
+    },
     PutFrom {
         key: Vec<u8>,
         buf: PyBuffer<u8>,
@@ -125,6 +129,18 @@ enum Op {
         dest_ptr: usize,
         dest_len: usize,
         _buf_keepalive: PyBuffer<u8>,
+        handle: PyHandle,
+    },
+    BatchPutFrom {
+        keys: Vec<Vec<u8>>,
+        bufs: Vec<PyBuffer<u8>>,
+        handle: PyHandle,
+    },
+    BatchGetInto {
+        keys: Vec<Vec<u8>>,
+        dest_ptrs: Vec<usize>,
+        dest_lens: Vec<usize>,
+        _bufs_keepalive: Vec<PyBuffer<u8>>,
         handle: PyHandle,
     },
     Close {
@@ -144,19 +160,23 @@ enum Op {
 
 // ── compio worker loop ─────────────────────────────────────────────────────
 
-async fn event_loop(mut client: ClusterClient, mut rx: UnboundedReceiver<Op>) {
+async fn event_loop(client: ClusterClient, mut rx: UnboundedReceiver<Op>) {
+    // All ClusterClient data ops take `&self` and scope every RefCell borrow
+    // across `.await` (see crates/client/src/lib.rs:162), so a shared `&client`
+    // is safe to hand to several concurrent in-flight RPCs — which is exactly
+    // what the batch ops below do via `join_all`.
     while let Some(op) = rx.next().await {
         match op {
             Op::Close { handle } => {
                 handle.resolve(|py| Ok(py.None()));
                 break;
             }
-            other => handle_op(&mut client, other).await,
+            other => handle_op(&client, other).await,
         }
     }
 }
 
-async fn handle_op(client: &mut ClusterClient, op: Op) {
+async fn handle_op(client: &ClusterClient, op: Op) {
     match op {
         Op::Put { key, value, handle } => {
             match client.put(&key, &value).await {
@@ -209,6 +229,18 @@ async fn handle_op(client: &mut ClusterClient, op: Op) {
                 }),
                 Err(e) => handle.reject(e.to_string()),
             }
+        }
+        Op::BatchHead { keys, handle } => {
+            // Pipeline all existence probes concurrently. Returns list[bool]
+            // (found per key); the caller derives the contiguous-prefix length.
+            // RPC error on a key surfaces as False (treated as "not present").
+            let futs = keys.iter().map(|k| client.head(k));
+            let results = futures::future::join_all(futs).await;
+            let founds: Vec<bool> = results
+                .into_iter()
+                .map(|r| r.map(|m| m.found).unwrap_or(false))
+                .collect();
+            handle.resolve(move |py| Ok(pyo3::types::PyList::new(py, founds)?.into_any().unbind()));
         }
         Op::PutFrom { key, buf, handle } => {
             // SAFETY: buf is held by this Op until handle_op returns; PyBuffer's
@@ -263,11 +295,66 @@ async fn handle_op(client: &mut ClusterClient, op: Op) {
             }
             drop(_buf_keepalive);
         }
+        Op::BatchPutFrom { keys, bufs, handle } => {
+            // Pipeline all puts concurrently on this single compio thread. The
+            // partition server's group-commit (F099-D) coalesces them at the
+            // WAL level — same pattern perf-check uses, just driven from one
+            // batch op instead of N Python round-trips.
+            let futs = keys.iter().zip(bufs.iter()).map(|(k, buf)| {
+                // SAFETY: each buf is held in `bufs` for the whole join_all;
+                // PyBuffer pins the underlying memory.
+                let value =
+                    unsafe { std::slice::from_raw_parts(buf.buf_ptr() as *const u8, buf.item_count()) };
+                client.put(k, value)
+            });
+            let results = futures::future::join_all(futs).await;
+            let oks: Vec<bool> = results.iter().map(|r| r.is_ok()).collect();
+            handle.resolve(move |py| {
+                Ok(pyo3::types::PyList::new(py, oks)?.into_any().unbind())
+            });
+            drop(bufs);
+        }
+        Op::BatchGetInto {
+            keys,
+            dest_ptrs,
+            dest_lens,
+            _bufs_keepalive,
+            handle,
+        } => {
+            let futs = keys.iter().map(|k| client.get(k));
+            let results = futures::future::join_all(futs).await;
+            // Any RPC error surfaces as False for that key (cache miss), never
+            // an exception — sglang's prefetch budget must not be blown by a
+            // raise. A whole-batch transport failure still resolves per-key.
+            let mut oks: Vec<bool> = Vec::with_capacity(results.len());
+            for (i, res) in results.into_iter().enumerate() {
+                let ok = match res {
+                    Ok(Some(v)) if v.len() == dest_lens[i] => {
+                        // SAFETY: dest_ptrs[i]/dest_lens[i] come from a PyBuffer
+                        // kept alive in `_bufs_keepalive` for this whole block.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                v.as_ptr(),
+                                dest_ptrs[i] as *mut u8,
+                                dest_lens[i],
+                            );
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                oks.push(ok);
+            }
+            handle.resolve(move |py| {
+                Ok(pyo3::types::PyList::new(py, oks)?.into_any().unbind())
+            });
+            drop(_bufs_keepalive);
+        }
         Op::Close { .. } => unreachable!("Close handled in event_loop"),
     }
 }
 
-async fn do_batch_delete(client: &mut ClusterClient, prefix: &[u8]) -> Result<u64, String> {
+async fn do_batch_delete(client: &ClusterClient, prefix: &[u8]) -> Result<u64, String> {
     let res = client
         .range(prefix, &[], u32::MAX)
         .await
@@ -410,6 +497,20 @@ impl Client {
         Ok(fut)
     }
 
+    /// Batched existence probe. Pipelines all `head` RPCs concurrently and
+    /// resolves to a `list[bool]` (found per key, in input order). This is the
+    /// throughput path for sglang HiCache `batch_exists`, which probes up to
+    /// `storage_batch_size` keys before each prefetch.
+    fn batch_head<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Vec<Vec<u8>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (handle, fut) = make_handle(py)?;
+        self.dispatch(Op::BatchHead { keys, handle })?;
+        Ok(fut)
+    }
+
     /// Zero-copy put. `buf` is any Python buffer-protocol object (numpy array,
     /// torch tensor, memoryview, etc.) holding the value bytes. The buffer's
     /// memory is read directly when the put RPC is encoded — no intermediate
@@ -464,6 +565,70 @@ impl Client {
             dest_ptr,
             dest_len,
             _buf_keepalive: buf,
+            handle,
+        })?;
+        Ok(fut)
+    }
+
+    /// Batched zero-copy put. `keys` and `bufs` are parallel lists; all puts
+    /// are pipelined concurrently on the worker thread (the partition server
+    /// group-commits them). One awaitable resolves to a `list[bool]`, where
+    /// element i is True iff `keys[i]` was stored successfully.
+    ///
+    /// This is the throughput path for sglang HiCache `batch_set_v1`: a single
+    /// op carrying N pages instead of N separate round-trips.
+    fn batch_put_from<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Vec<Vec<u8>>,
+        bufs: Vec<PyBuffer<u8>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if keys.len() != bufs.len() {
+            return Err(PyValueError::new_err("keys and bufs must have equal length"));
+        }
+        for buf in &bufs {
+            if !buf.is_c_contiguous() {
+                return Err(PyValueError::new_err("every buf must be C-contiguous"));
+            }
+        }
+        let (handle, fut) = make_handle(py)?;
+        self.dispatch(Op::BatchPutFrom { keys, bufs, handle })?;
+        Ok(fut)
+    }
+
+    /// Batched zero-copy get. `keys` and `bufs` are parallel lists; all gets
+    /// are pipelined concurrently. One awaitable resolves to a `list[bool]`,
+    /// where element i is True iff `keys[i]` was found AND its stored size
+    /// matched `bufs[i]` length (value copied directly into `bufs[i]`).
+    ///
+    /// This is the throughput path for sglang HiCache `batch_get_v1`.
+    fn batch_get_into<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Vec<Vec<u8>>,
+        bufs: Vec<PyBuffer<u8>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if keys.len() != bufs.len() {
+            return Err(PyValueError::new_err("keys and bufs must have equal length"));
+        }
+        let mut dest_ptrs = Vec::with_capacity(bufs.len());
+        let mut dest_lens = Vec::with_capacity(bufs.len());
+        for buf in &bufs {
+            if buf.readonly() {
+                return Err(PyValueError::new_err("every buf must be writable"));
+            }
+            if !buf.is_c_contiguous() {
+                return Err(PyValueError::new_err("every buf must be C-contiguous"));
+            }
+            dest_ptrs.push(buf.buf_ptr() as usize);
+            dest_lens.push(buf.item_count());
+        }
+        let (handle, fut) = make_handle(py)?;
+        self.dispatch(Op::BatchGetInto {
+            keys,
+            dest_ptrs,
+            dest_lens,
+            _bufs_keepalive: bufs,
             handle,
         })?;
         Ok(fut)
