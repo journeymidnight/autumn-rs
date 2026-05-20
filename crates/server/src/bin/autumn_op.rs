@@ -24,6 +24,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use autumn_client::{decode_err, ClusterClient, DEFAULT_RPC_TIMEOUT};
 use autumn_rpc::manager_rpc::*;
+use autumn_transport::TransportKind;
 use autumn_rpc::partition_rpc::{GetDiscardsReq, GetDiscardsResp, MSG_GET_DISCARDS};
 use bytes::Bytes;
 use serde::Serialize;
@@ -66,6 +67,7 @@ fn usage() -> ! {
 struct Args {
     manager: String,
     json: bool,
+    transport: TransportKind,
     cmd: Command,
 }
 
@@ -169,6 +171,7 @@ fn parse() -> Args {
     let raw: Vec<String> = std::env::args().collect();
     let mut manager = "127.0.0.1:9001".to_string();
     let mut json = false;
+    let mut transport = TransportKind::Tcp;
     let mut i = 1usize;
     while i < raw.len() {
         match raw[i].as_str() {
@@ -179,6 +182,18 @@ fn parse() -> Args {
             }
             "--json" => {
                 json = true;
+                i += 1;
+            }
+            // Must match the manager's transport — a TCP autumn-op cannot
+            // talk to a UCX-only manager (the connect/RPC just hangs).
+            "--transport" => {
+                i += 1;
+                let raw_t = raw.get(i).cloned().unwrap_or_else(|| usage());
+                transport = autumn_transport::parse_transport_flag(&raw_t)
+                    .unwrap_or_else(|bad| {
+                        eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
+                        usage()
+                    });
                 i += 1;
             }
             "--help" | "-h" => usage(),
@@ -631,7 +646,7 @@ fn parse() -> Args {
         }
         _ => usage(),
     };
-    Args { manager, json, cmd }
+    Args { manager, json, transport, cmd }
 }
 
 fn parse_admin_flags(raw: &[String], i: &mut usize) -> (String, String, bool) {
@@ -1011,6 +1026,9 @@ async fn run(args: Args) -> Result<()> {
         );
         std::process::exit(1);
     }
+    // Select the process-global transport before connecting. Without this an
+    // autumn-op invoked against a UCX manager would default to TCP and hang.
+    let _ = autumn_transport::init_with(args.transport);
     let client = ClusterClient::connect(&args.manager).await?;
     match args.cmd {
         // ---------------- F211 read ----------------

@@ -309,7 +309,7 @@ format_extent_node() {
         shard_args=(--shard-ports "$shard_ports_csv")
     fi
     # shellcheck disable=SC2086  # intentional word splitting for positional args
-    "$AO" --manager "$MANAGER_ADDR" format \
+    "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" format \
         --listen ":$port" \
         --advertise "${BIND_HOST}:$port" \
         ${shard_args[@]:+"${shard_args[@]}"} \
@@ -637,7 +637,7 @@ do_start() {
             [[ "$n_parts_arg" =~ ^[0-9]+$ ]] || n_parts_arg=1
             bootstrap_args+=( --presplit "${n_parts_arg}:hexstring" )
         fi
-        "$AO" --manager "$MANAGER_ADDR" bootstrap "${bootstrap_args[@]}"
+        "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" bootstrap "${bootstrap_args[@]}"
         touch "$bootstrap_marker"
         # Wait for PS to pick up the new partition(s) and finish opening them.
         # Each partition's open() runs stream commit_length calls serially against
