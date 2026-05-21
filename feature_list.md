@@ -3319,3 +3319,72 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   - sglang/vllm startup with autumn-fuse-mounted weights produces identical model output as native filesystem load (no NaN, no missing tensors).
   - mmap path correctness: HF transformers `from_pretrained` on a 70B safetensors model succeeds end-to-end via autumn-fuse.
 - **passes:** false (deferred)
+
+## P10 — Per-link transport selection (F219)
+
+### F219 (deferred / 设计未定) · Locality-aware per-link transport (TCP local / UCX remote)
+- **Trigger / 动机:** Today transport is a **process-global singleton** (`autumn_transport::init_with` / `current()`); a process listens AND dials with one transport. In a co-located deployment (PS + EN on the same host, only clients remote), forcing UCX everywhere makes the intra-host PS↔EN path go over UCX `cma`, which is **slower than TCP loopback** for small/medium messages (perf_check.sh's own note: UCX only wins ≳8 MiB over real RDMA; "at 4 KB it's pure overhead"). Observed live: local TCP > cma. We want transport chosen per link, not per process.
+- **决定的模型 (locality-based, NOT a static role matrix):**
+  ```
+  pick(target):
+    if !ucx_enabled            -> TCP    # 默认全 TCP；--transport ucx 打开开关
+    if target == manager       -> TCP    # 到 manager 恒 TCP（控制面）
+    if target 在本机(same host) -> TCP    # loopback 比 cma 快
+    else                       -> UCX    # 异地走 RoCE
+  # client->PS 天然异地 -> UCX；PS->本地EN/EN->本地EN -> TCP；PS->外地EN/EN->外地EN -> UCX
+  ```
+  - "本机判定": 目标 IP ∈ 本机网卡 IP(含 loopback)。复用 transport crate `check_listen_addr` 已有的网卡枚举(`crates/transport/src/lib.rs`)。
+  - 到 manager 一律 TCP（用户明确）。manager 自身监听 TCP。
+- **现状关键发现(实现锚点):**
+  - 3 个出向建连收口点,均读 `autumn_transport::current_or_init()`:
+    1. `crates/rpc/src/client.rs:171` `RpcConnection::connect` — stream `ConnPool` 用(PS↔EN、PS↔manager、EN→manager、EN→sibling-shard)。
+    2. `crates/stream/src/extent_node.rs:917` `rpc_oneshot` — EN↔EN(recovery copy / EC shard fetch / convert 的 WriteShard+CommitEcShard 扇出)。
+    3. `crates/manager/src/lib.rs:211` manager `RpcConn::connect` — manager→EN、manager→PS。
+  - `StreamClient` 用**同一个 `self.pool`** 同时连 manager(`call_timeout(self.manager_addr(),…)`)和 EN(`send_vectored(en_addr,…)`),按 SocketAddr 分流 → 拨号点本就知道目标角色,可直接套 locality 规则。
+  - `crates/stream/src/client.rs:2172` 的 UCX 零拷贝读 gate 现读全局 `current().kind()`,需改读"这条 EN 连接实际 transport"。
+  - etcd 走 `autumn-etcd`,不经过 transport 抽象,无关。
+- **关键后果 — 服务端需双监听(完整版):** 同一个 EN 既被本地 PS 用 TCP 拨、又被外地 PS 用 UCX 拨(它对别人是"外地")。一个 listener 只绑一种 transport,故 **EN/PS 在 ucx 打开时须同时监听 TCP+UCX 两个 listener**,接受两种拨入丢给同一 handler。双监听顺带解决 manager→PS(本地 manager 走 PS 的 TCP listener,远程 client 走 UCX listener)。manager 例外恒 TCP 单监听。
+- **两档实现(本任务未定选哪档):**
+  - **档 1 (MVP):** 只在 3 个收口点落地 locality 拨号规则 + manager 恒 TCP;服务端仍单监听(co-locate 测试:PS 监听 UCX、EN 监听 TCP、manager TCP)。覆盖 client→PS UCX / PS→EN TCP / EN→EN TCP。缺口:co-locate 下 manager→PS split/merge(PS 仅听 UCX),perf 测不触发。不碰 listener 架构。
+  - **档 2 (完整):** EN、PS 双监听 TCP+UCX(EN 每 shard、PS 每 partition 各起两个 accept loop);locality 规则在任意拓扑正确,manager→PS 自然通。改动大。
+- **实现要点(供后续):** 加 `transport_for(kind)->&'static dyn AutumnTransport`(让一个进程同时持有 Tcp+Ucx);`RpcConnection/RpcClient::connect_with(addr, kind)`,`connect()` 退化为 `current()` 旧行为;`ConnPool` 按 SocketAddr 用 locality 解析 kind(或 call 点显式传 kind);改 `client.rs:2172` 的 ZC gate 读连接实际 transport。
+- **Acceptance(待档位确定后细化):**
+  - `cargo build --workspace` clean,WITH 和 WITHOUT `--features ucx`。
+  - co-locate 集群(P=ucx, 其余 TCP):client→PS 走 UCX(`is_ucx()`/rc_mlx5 验证),PS→本地EN 走 TCP(抓包/日志确认无 cma),put/get + zc-get 字节一致;`cargo test -p autumn-stream / -p autumn-partition-server / -p autumn-rpc / -p autumn-transport` 绿。
+  - (档 2) 跨机拓扑:PS→外地EN 走 UCX、PS→本地EN 走 TCP 同时成立;manager→PS 控制 RPC 通。
+- **passes:** false (deferred — 改动较大,档位未定 2026-05-21)
+
+## P11 — cluster.sh UCX/multi-shard robustness (F220)
+
+### F220 · cluster.sh PS partition-listener port grid avoids extent-node shard ports
+- **Trigger / 动机:** With `AUTUMN_EXTENT_SHARDS=16`, each extent-node binds shard
+  ports `9100+i + s*SHARD_STRIDE` (s∈[0,SHARDS)), climbing to ~9251–9253. The PS
+  per-partition listeners (F099-K) bind at base `9201 + ordinal`, so partitions
+  collide with the EN shards sitting on **9201 / 9211** (and would on 9221… for
+  >16 partitions). Each collision is logged as `region sync failed: partition N
+  failed to bind listener on …:9201` and self-heals only on the next
+  region-sync tick (~2s/collision) by falling back to the next free port. Cosmetic
+  warnings + avoidable startup latency; risk grows with shard/partition count.
+- **Scope / boundary:** `cluster.sh` only. Move the PS partition-listener base
+  port off the EN shard grid. Single source of truth `PS_BASE_PORT`
+  (default `9301`, overridable via `AUTUMN_PS_BASE_PORT`), used for `launch_ps`'s
+  `--port` + `--advertise`, the `wait_port` readiness probes (TCP-mode `nc -z`
+  uses the port arg, so all must move together), the ready-banner echo, and the
+  comments. Out of scope: the PS binary's own `--port` default (cluster.sh always
+  passes it explicitly); `scripts/perf_r2_flamegraph.sh` (standalone single-shard
+  perf tool, leaves its hardcoded 9201); the EN shard port layout itself; any
+  dynamic per-config auto-compute of the base (fixed 9301 is predictable).
+- **Why 9301:** EN shard ports top out at ~9253 (16 shards, ≤3 replicas, stride
+  10); 9301 leaves ~48 ports of headroom (good for ≤20 shards). Clients are
+  unaffected — autumn-client/autumn-op resolve partition addresses from the
+  manager's `GetRegions`, so they follow whatever the PS advertises.
+- **Acceptance:**
+  - `bash -n cluster.sh` clean; `grep -c 9201 cluster.sh` shows no functional PS
+    references remain (only historical comments if any).
+  - Fresh `reset 1` with `AUTUMN_TRANSPORT=ucx AUTUMN_EXTENT_SHARDS=16
+    AUTUMN_PS_PARTS_HINT=16 AUTUMN_BOOTSTRAP_PRESPLIT=16:hexstring`: ps.log has
+    **0** `region sync failed … failed to bind listener` warnings; all 16
+    partition listeners bound on the 9301+ grid; `put`/`get` over UCX round-trips.
+  - `AUTUMN_PS_BASE_PORT=<N>` override is honored (listeners bind at N+ordinal).
+  - TCP-mode `reset 1` still comes up (readiness `nc -z` probes the new port).
+- **passes:** false (pending implementation — 2026-05-21)
