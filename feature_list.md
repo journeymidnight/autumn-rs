@@ -3278,11 +3278,25 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
     byte-identical (sha256 match); PS log `PS write-recv ZC engaged …
     transport="tcp(pooled)" value_len=8388608`, no panic/crc-mismatch.
   - perf-check 8M TCP runs `[ZC: MSG_PUT_ZC; read regular]` end-to-end, no crash.
-- **Deferred:** client←PS read (`get_into`/`call_into_dest`) TCP recv-into-dest
-  (cancel-safety needs the read_loop-owns-buffer variant, not raw caller ptr);
-  the production read path is UCX, and regular TCP `get` already benefits via the
-  PS←EN change. Client send-side V1 frame-crc for `put_zc` still computed (drop it
-  by sending put_zc V0 on TCP — separate wire decision).
+- **Follow-up (same feature, 2026-05-21):**
+  - **client←PS `get_into` TCP recv-into-dest** (no longer deferred):
+    `ReadHalf::read_exact_into_raw(ptr, filled, target)` + a `RawDest` `'static`
+    owned compio buffer over the caller's `*mut u8` recv the large value
+    (≥ 64 KiB) straight into the caller's dest in the rpc `read_loop` `IntoDest`
+    branch — no FrameDecoder accumulation + no `finish_into_dest` memcpy. Cancel
+    contract is IDENTICAL to the existing UCX `call_into_dest` (dest outlives the
+    call; `get_into` has no per-call timeout). perf-check `zc_read` enabled on TCP
+    for values ≥ 64 KiB so the client←PS read is also single-copy.
+  - **regpool pools unregistered slabs (critical fix):** `PooledBuf::Drop`
+    previously freed unregistered slabs (`reg.is_none()`), so on a **non-ucx
+    build** (what `cluster.sh`/perf builds) EVERY recv-into-pooled op did a fresh
+    `vec![0u8; class]` (malloc + zero the whole slab) + free — measured **3× WORSE**
+    8 MiB TCP write before the fix. Now non-ucx builds re-pool + reuse (amortizes
+    the alloc + the zeroing); ucx builds keep freeing the rare over-memlock-cap
+    fallback (`#[cfg(feature="ucx")]` guard). This is what makes the F219 TCP
+    paths an actual win rather than a regression.
+- **Client send-side V1 frame-crc for `put_zc` still computed** (drop by sending
+  put_zc V0 on TCP — separate wire decision).
 - **passes:** true
 
 ### F217 (SUPERSEDED) · autumn-kvcache Phase 2 — UCX one-sided RDMA + peer DRAM share

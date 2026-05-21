@@ -825,6 +825,60 @@ async fn read_loop(
                 // else: small value → normal decode path below.
             }
 
+            // ── call_into_dest on TCP (F219): recv the large value straight into
+            //    the CALLER's dest (compio owned read over a raw-ptr buffer),
+            //    skipping the FrameDecoder accumulation + finish_into_dest memcpy.
+            //    Same cancel contract as the UCX call_into_dest path (dest
+            //    outlives the call; no per-call timeout — get_into honours this).
+            //    Small values fall through to finish_into_dest_from_frame. ──
+            if is_into && !reader.is_ucx() {
+                let value_len = (payload_len as usize).saturating_sub(ZC_META_LEN);
+                if (payload_len as usize) >= ZC_META_LEN
+                    && value_len >= TCP_RECV_INTO_POOLED_MIN_BYTES
+                {
+                    if decoder.buffered_len() < crate::frame::HEADER_LEN + ZC_META_LEN {
+                        break; // wait for the meta prefix
+                    }
+                    let Some(Pending::IntoDest(into)) = pending.borrow_mut().remove(&req_id)
+                    else {
+                        unreachable!("is_into checked above");
+                    };
+                    decoder.consume(crate::frame::HEADER_LEN);
+                    let mut meta = [0u8; ZC_META_LEN];
+                    let _ = decoder.drain_into(&mut meta);
+                    let (code, _m_vlen, _crc) = parse_zc_meta(&meta);
+                    if value_len > into.dest_cap {
+                        let _ = into.meta_tx.send(Err(RpcError::status(
+                            crate::error::StatusCode::InvalidArgument,
+                            "zc value larger than dest buffer",
+                        )));
+                        return Err(RpcError::status(
+                            crate::error::StatusCode::InvalidArgument,
+                            "zc value larger than dest buffer",
+                        ));
+                    }
+                    // SAFETY: caller holds `dest` alive until meta_tx fires (it
+                    // awaits the receiver); same compio thread; no per-call timeout.
+                    let dest =
+                        unsafe { std::slice::from_raw_parts_mut(into.dest, value_len) };
+                    let filled = decoder.drain_into(dest);
+                    // Recv the remainder straight into the caller dest (single copy).
+                    match unsafe {
+                        reader.read_exact_into_raw(into.dest, filled, value_len).await
+                    } {
+                        Ok(()) => {
+                            let _ = into.meta_tx.send(Ok(DestMeta { code, value_len }));
+                        }
+                        Err(e) => {
+                            let _ = into.meta_tx.send(Err(e.into()));
+                            return Err(RpcError::ConnectionClosed);
+                        }
+                    }
+                    continue;
+                }
+                // else: small value → normal decode path below.
+            }
+
             // ── normal path: full frame decode ──
             match decoder.try_decode()? {
                 Some(frame) => match pending.borrow_mut().remove(&frame.req_id) {
