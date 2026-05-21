@@ -113,6 +113,20 @@ impl PooledBuf {
         self.slab.as_ref().expect("slab present").reg.as_ref()
     }
 
+    /// Disjoint split-borrow of the dest slice + its registration, so a single
+    /// `recv_into(buf, reg)` call can take both from one `PooledBuf` (the
+    /// `dest_mut()` + `reg()` pair can't be held simultaneously). This is the
+    /// shape every server recv-into-registered loop needs: the loop owns the
+    /// `PooledBuf`, calls `recv_into(dest, reg)`, and — because the recv's
+    /// `InflightSlot` drains UCX on drop while the `PooledBuf` is still owned
+    /// here — a cancelled recv can never leave the NIC writing a freed/recycled
+    /// registered buffer (cancel-safety, see module note).
+    pub fn dest_and_reg(&mut self) -> (&mut [u8], Option<&RegisteredMem>) {
+        let used = self.used;
+        let Slab { buf, reg } = self.slab.as_mut().expect("slab present");
+        (&mut buf[..used], reg.as_ref())
+    }
+
     /// Read-only view of the filled region (for sending the value onward).
     pub fn filled(&self) -> &[u8] {
         let used = self.used;

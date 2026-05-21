@@ -139,3 +139,61 @@ async fn drop_read_mid_await_is_safe() {
     // Wait for the server to finish so we don't tear it down early.
     let _ = server.await;
 }
+
+/// Cancel-safety for `recv_into` a REGISTERED RegPool buffer — the foundation
+/// every server-side recv-into-registered hop rests on. A recv posted into a
+/// `ucp_mem_map`-registered buffer means the NIC will DMA into it asynchronously;
+/// if the recv future is dropped mid-flight, the buffer must NOT be freed /
+/// returned-to-pool / reused until UCX confirms it's done. `recv_into`'s
+/// `InflightSlot` drains UCX (`ucp_request_cancel` + progress-to-completion) on
+/// drop, and because the `PooledBuf` is owned across the recv (drop order:
+/// recv guard before `PooledBuf`), the registered slab is safe to re-pool after.
+/// This test drops a registered recv mid-await, then REUSES the pool for a
+/// clean recv — a corrupted slab / still-in-flight DMA would crash or garble it.
+#[compio::test]
+async fn drop_recv_into_registered_mid_await_is_safe() {
+    use autumn_transport::{regpool_acquire, AutumnTransport};
+    use compio::io::AsyncWriteExt as _;
+    use std::time::Duration;
+
+    const LEN: usize = 256 * 1024; // big enough to be a real registered/rendezvous recv
+
+    let t = UcxTransport;
+    let mut listener = t.bind(bind_addr()).await.unwrap();
+    let bound = listener.local_addr().unwrap();
+
+    let server = compio::runtime::spawn(async move {
+        let (c, _) = listener.accept().await.unwrap();
+        // Sleep so the first recv sits pending long enough to be cancelled,
+        // then send twice (the cancelled recv + the clean reuse recv).
+        compio::time::sleep(Duration::from_millis(200)).await;
+        let (_r, mut w) = c.into_split();
+        let _ = w.write_all(vec![0xa5u8; LEN]).await;
+        let _ = w.write_all(vec![0x5au8; LEN]).await;
+    });
+
+    let c = t.connect(bound).await.unwrap();
+    let (mut r, _w) = c.into_split();
+
+    // (1) Registered recv dropped mid-await by a 1ms timeout.
+    {
+        let mut pb = regpool_acquire(LEN);
+        assert!(pb.reg().is_some(), "buffer should be registered (under memlock cap)");
+        let race = async {
+            let (dest, reg) = pb.dest_and_reg();
+            let _ = r.recv_into(dest, reg).await;
+        };
+        let _ = compio::time::timeout(Duration::from_millis(1), race).await;
+        // pb drops here → registered slab returns to the pool. Safe ONLY because
+        // recv_into's InflightSlot drained UCX before `race` unwound.
+    }
+
+    // (2) Reuse the pool for a clean registered recv that completes. If (1) had
+    // corrupted the slab or left the NIC mid-DMA into it, this corrupts/crashes.
+    let mut pb2 = regpool_acquire(LEN);
+    let (dest, reg) = pb2.dest_and_reg();
+    let n = r.recv_into(dest, reg).await.expect("clean registered recv");
+    assert!(n > 0, "reuse recv returned {n} bytes");
+
+    let _ = server.await;
+}
