@@ -82,6 +82,13 @@ pub struct DestMeta {
 enum Pending {
     Frame(oneshot::Sender<Frame>),
     IntoDest(IntoDest),
+    /// `call_into_pooled`: the READ_LOOP owns the dest buffer — it acquires a
+    /// `PooledBuf` at recv time, recvs the value into it, and hands the filled
+    /// buffer back here. On caller-cancel the receiver is gone → the read_loop
+    /// drops the `PooledBuf` → returns to pool (no leak; cancel-safe, since the
+    /// cancellable caller never owns the in-flight buffer). Carries the status
+    /// code alongside the buffer.
+    IntoPooled(oneshot::Sender<Result<(autumn_transport::PooledBuf, u8), RpcError>>),
 }
 
 /// Recv-into-dest state. `dest`/`reg` are raw because the read_loop and the
@@ -286,6 +293,40 @@ impl RpcClient {
         };
         // Insert BEFORE submit — same ordering invariant as send_frame.
         self.pending.borrow_mut().insert(req_id, Pending::IntoDest(into));
+        let bytes = frame.encode();
+        if let Err(e) = self.submit(SubmitMsg::Single { bytes, req_id }).await {
+            self.pending.borrow_mut().remove(&req_id);
+            return Err(e);
+        }
+        match meta_rx.await {
+            Ok(res) => res,
+            Err(_) => Err(RpcError::ConnectionClosed),
+        }
+    }
+
+    /// F216-E cancel-safe zero-copy read: send a request whose value response
+    /// the READ_LOOP recvs straight into a freshly-acquired `PooledBuf` (which
+    /// the read_loop owns), then hands back here. Unlike `call_into_dest`, the
+    /// caller never owns the in-flight buffer — so a cancelled/timed-out caller
+    /// can NOT leave the NIC writing a freed/recycled buffer, and the buffer is
+    /// always reclaimed (handed back on success, dropped→pool on cancel — never
+    /// leaked). Returns `(filled PooledBuf, status code)`. On UCX the value
+    /// RDMAs into the registered pool buffer (memh zero-copy); on TCP the value
+    /// is copied off the wire into a (plain) pool buffer.
+    pub async fn call_into_pooled(
+        &self,
+        msg_type: u8,
+        payload: Bytes,
+    ) -> Result<(autumn_transport::PooledBuf, u8), RpcError> {
+        if self.closed.get() {
+            return Err(RpcError::ConnectionClosed);
+        }
+        let req_id = self.next_req_id();
+        let frame = Frame::request(req_id, msg_type, payload);
+        let (meta_tx, meta_rx) = oneshot::channel();
+        self.pending
+            .borrow_mut()
+            .insert(req_id, Pending::IntoPooled(meta_tx));
         let bytes = frame.encode();
         if let Err(e) = self.submit(SubmitMsg::Single { bytes, req_id }).await {
             self.pending.borrow_mut().remove(&req_id);
@@ -663,6 +704,74 @@ async fn read_loop(
                 continue;
             }
 
+            // ── call_into_pooled: read_loop owns the dest (cancel-safe) ──
+            let is_pooled =
+                matches!(pending.borrow().get(&req_id), Some(Pending::IntoPooled(_)));
+            if is_pooled && reader.is_ucx() {
+                if (payload_len as usize) < ZC_META_LEN
+                    || decoder.buffered_len() < crate::frame::HEADER_LEN + ZC_META_LEN
+                {
+                    if (payload_len as usize) < ZC_META_LEN {
+                        if let Some(Pending::IntoPooled(tx)) =
+                            pending.borrow_mut().remove(&req_id)
+                        {
+                            let _ = tx.send(Err(RpcError::status(
+                                crate::error::StatusCode::Internal,
+                                "zc value frame shorter than meta",
+                            )));
+                        }
+                        return Err(RpcError::status(
+                            crate::error::StatusCode::Internal,
+                            "zc value frame shorter than meta",
+                        ));
+                    }
+                    break; // need more bytes for the meta prefix
+                }
+                let Some(Pending::IntoPooled(tx)) = pending.borrow_mut().remove(&req_id)
+                else {
+                    unreachable!("is_pooled checked above");
+                };
+                decoder.consume(crate::frame::HEADER_LEN);
+                let mut meta = [0u8; ZC_META_LEN];
+                let _ = decoder.drain_into(&mut meta);
+                let (code, _m_vlen, crc) = parse_zc_meta(&meta);
+                let value_len = payload_len as usize - ZC_META_LEN;
+                // READ_LOOP acquires + owns the buffer. On caller-cancel the
+                // send below fails and `pb` drops → pool (no leak); the buffer
+                // is never owned by the cancellable caller.
+                let mut pb = autumn_transport::regpool_acquire(value_len);
+                let (dest, reg) = pb.dest_and_reg();
+                let mut filled = decoder.drain_into(dest);
+                let mut recv_err: Option<RpcError> = None;
+                while filled < value_len {
+                    match reader.recv_into(&mut dest[filled..], reg).await {
+                        Ok(0) => {
+                            let _ = tx.send(Err(RpcError::ConnectionClosed));
+                            return Ok(());
+                        }
+                        Ok(k) => filled += k,
+                        Err(e) => {
+                            recv_err = Some(e.into());
+                            break;
+                        }
+                    }
+                }
+                if let Some(e) = recv_err {
+                    let _ = tx.send(Err(e));
+                    return Err(RpcError::ConnectionClosed);
+                }
+                let computed = crc32c::crc32c(dest);
+                let _ = drop((dest, reg)); // end the borrow of pb before moving it
+                if computed == crc {
+                    let _ = tx.send(Ok((pb, code)));
+                } else {
+                    let _ = tx.send(Err(RpcError::Frame(
+                        crate::frame::FrameError::CrcMismatch { stored: crc, computed },
+                    )));
+                }
+                continue;
+            }
+
             // ── normal path: full frame decode ──
             match decoder.try_decode()? {
                 Some(frame) => match pending.borrow_mut().remove(&frame.req_id) {
@@ -674,6 +783,12 @@ async fn read_loop(
                         // decoded; copy the value into dest (one memcpy — TCP
                         // always pays the kernel copy anyway).
                         finish_into_dest_from_frame(into, &frame.payload);
+                    }
+                    Some(Pending::IntoPooled(tx)) => {
+                        // TCP / non-UCX: copy the value into a (plain) pool
+                        // buffer and hand it back. The read_loop owns it until
+                        // the send; on caller-cancel it drops → pool.
+                        finish_into_pooled_from_frame(tx, &frame.payload);
                     }
                     None => {
                         tracing::trace!(
@@ -716,6 +831,39 @@ fn finish_into_dest_from_frame(into: IntoDest, payload: &[u8]) {
         into.meta_tx.send(Ok(DestMeta { code, value_len: value.len() }))
     } else {
         into.meta_tx.send(Err(RpcError::Frame(
+            crate::frame::FrameError::CrcMismatch { stored: crc, computed },
+        )))
+    };
+}
+
+/// Complete a `call_into_pooled` from a fully-decoded value frame (TCP /
+/// non-UCX path). `payload` = `[ZC meta][value]`. The read_loop acquires a
+/// (plain, on TCP) pool buffer, copies the value in, and hands it back; on
+/// caller-cancel `tx.send` fails and the buffer drops → pool.
+fn finish_into_pooled_from_frame(
+    tx: oneshot::Sender<Result<(autumn_transport::PooledBuf, u8), RpcError>>,
+    payload: &[u8],
+) {
+    if payload.len() < ZC_META_LEN {
+        let _ = tx.send(Err(RpcError::status(
+            crate::error::StatusCode::Internal,
+            "zc value frame shorter than meta",
+        )));
+        return;
+    }
+    let (code, _m_vlen, crc) = parse_zc_meta(&payload[..ZC_META_LEN]);
+    let value = &payload[ZC_META_LEN..];
+    let mut pb = autumn_transport::regpool_acquire(value.len());
+    let (ok, computed) = {
+        let (dest, _reg) = pb.dest_and_reg();
+        dest.copy_from_slice(value);
+        let c = crc32c::crc32c(dest);
+        (c == crc, c)
+    };
+    let _ = if ok {
+        tx.send(Ok((pb, code)))
+    } else {
+        tx.send(Err(RpcError::Frame(
             crate::frame::FrameError::CrcMismatch { stored: crc, computed },
         )))
     };
