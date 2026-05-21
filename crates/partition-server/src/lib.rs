@@ -3053,29 +3053,21 @@ impl PartitionServer {
 /// once. Once at cap, transport reads stop (back-pressure) until one completion
 /// drains into `tx_bufs`.
 ///
-/// **Why the default rose 4 → 16 (F216-E).** The old default 4 dated to the
-/// pre-F099-K topology: 256 client threads all opened connections to ONE PS
-/// listener, so the cap had to keep `N_conns × CAP` under
-/// `WRITE_CHANNEL_CAP = 1024` — `256 × 4 = 1024`. Caps of 8+ then caused
-/// EINVAL / "submit error: connection closed" because too many concurrent
-/// `req_tx.send()`-awaiting futures overwhelmed the mpsc reservation pool /
-/// the EN RpcConn writer_task. Two things changed:
-///   1. **F099-K**: each partition binds its OWN listener, so a listener now
-///      sees ONE connection (the client opens one conn per partition addr,
-///      shared across threads). At P8 that's 8 conns total, not 256 →
-///      `8 × 16 = 128 ≪ 1024`. The aggregate-rate concern is gone.
-///   2. **F216-E (Option B)**: GET reads are served LOCALLY in the `inflight`
-///      FU (no `req_tx` hop, no `partition_loop` detour). For the read path
-///      the cap bounds only concurrent `handle_get` futures — there is NO
-///      shared-channel pressure at all. A deeper cap is exactly what lets the
-///      single P-log core overlap more in-flight EN round-trips per partition
-///      (matters most cross-host, where the RoCE round-trip is the latency to
-///      hide; intra-host the path is CPU-bound and saturates by ~4–8).
-///
-/// F195: overridable via `set_ps_conn_inflight_cap` (CLI flag
-/// `--conn-inflight-cap`); default 16.
+/// **Default is 4.** Originally chosen for the pre-F099-K topology (256 client
+/// conns to ONE PS listener → keep `N_conns × CAP` under
+/// `WRITE_CHANNEL_CAP = 1024`; caps of 8+ then caused EINVAL under that load).
+/// Post-F099-K each partition has its own listener (1 conn each) and post-F216-E
+/// GET reads are served FU-locally (no `req_tx` hop, no shared-channel
+/// pressure), so that constraint is gone — but a 4→16 bump was TRIED (commit
+/// d6aa298) and REVERTED after measurement showed NO read benefit at any size:
+/// cross-host 8 MiB read is NIC-bound (cap4 ≈ cap16 ≈ ~12 GB/s; even cap4 =
+/// 4×8 MiB ≫ the RoCE bandwidth-delay product, so the pipe is already full),
+/// and intra-host reads are per-op-CPU-bound and saturate by depth ~4. The
+/// deeper cap only added a tiny intra-host regression. Keep 4; raise per-deploy
+/// via `set_ps_conn_inflight_cap` (CLI `--conn-inflight-cap`) if a future
+/// workload ever shows a need.
 fn ps_conn_inflight_cap() -> usize {
-    *PS_CONN_INFLIGHT_CAP_CELL.get_or_init(|| 16)
+    *PS_CONN_INFLIGHT_CAP_CELL.get_or_init(|| 4)
 }
 
 /// F099-I-fix — observability counter for the d=1 fast path. Incremented
