@@ -698,6 +698,30 @@ fn set_transport(kind: &str) -> PyResult<()> {
         "ucx" => {
             #[cfg(feature = "ucx")]
             {
+                // F216-E: this process becomes an RDMA endpoint — UCX rc_mlx5
+                // pins registered send/recv buffers (ibv_reg_mr) against
+                // RLIMIT_MEMLOCK. The default soft limit (often 8 MiB) faults
+                // libibverbs on the first large transfer (observed: client
+                // SIGSEGV in ucp_worker_progress under 256 KiB+ pages). Raise to
+                // INFINITY (falls back to soft-up-to-hard if INFINITY is refused;
+                // raising the HARD limit needs CAP_SYS_RESOURCE, so the launcher /
+                // systemd `LimitMEMLOCK=infinity` is the production backstop).
+                #[cfg(unix)]
+                unsafe {
+                    let inf = libc::rlimit {
+                        rlim_cur: libc::RLIM_INFINITY,
+                        rlim_max: libc::RLIM_INFINITY,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_MEMLOCK, &inf) != 0 {
+                        let mut ml = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                        if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut ml) == 0
+                            && ml.rlim_cur < ml.rlim_max
+                        {
+                            ml.rlim_cur = ml.rlim_max;
+                            libc::setrlimit(libc::RLIMIT_MEMLOCK, &ml);
+                        }
+                    }
+                }
                 autumn_transport::init_with(autumn_transport::TransportKind::Ucx);
                 Ok(())
             }
@@ -764,24 +788,39 @@ struct BatchWorker {
 struct BatchClient {
     workers: Vec<BatchWorker>,
     per_worker_cap: usize,
+    zc: bool,
 }
 
-async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, cap: usize) -> Vec<bool> {
+async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, cap: usize, zc: bool) -> Vec<bool> {
     let cap = cap.max(1);
     match op {
         BatchOp::Get => {
             futures::stream::iter(items.into_iter())
                 .map(|it| async move {
-                    match client.get(&it.key).await {
-                        Ok(Some(v)) if v.len() == it.len => {
-                            // SAFETY: it.ptr/len address a pinned dest page held
-                            // alive by the caller; exclusive write here.
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(v.as_ptr(), it.ptr as *mut u8, it.len);
+                    if zc {
+                        // F216-E zero-copy read: recv the value straight into the
+                        // pinned dest page (MSG_GET_ZC + call_into_dest). reg=None
+                        // here (pinned page not pre-registered via memh) → still one
+                        // copy off the wire on UCX but no Vec alloc + no second
+                        // memcpy vs the regular path's get()+copy_nonoverlapping.
+                        // SAFETY: it.ptr/len address a pinned dest page the caller
+                        // keeps alive for the whole batch; exclusive write here.
+                        let dest = unsafe {
+                            std::slice::from_raw_parts_mut(it.ptr as *mut u8, it.len)
+                        };
+                        matches!(client.get_into(&it.key, dest, None).await, Ok(Some(n)) if n == it.len)
+                    } else {
+                        match client.get(&it.key).await {
+                            Ok(Some(v)) if v.len() == it.len => {
+                                // SAFETY: it.ptr/len address a pinned dest page held
+                                // alive by the caller; exclusive write here.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(v.as_ptr(), it.ptr as *mut u8, it.len);
+                                }
+                                true
                             }
-                            true
+                            _ => false,
                         }
-                        _ => false,
                     }
                 })
                 .buffered(cap)
@@ -791,10 +830,25 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, cap:
         BatchOp::Put => {
             futures::stream::iter(items.into_iter())
                 .map(|it| async move {
-                    // SAFETY: it.ptr/len address a pinned source page held alive
-                    // by the caller for the whole batch.
-                    let val = unsafe { std::slice::from_raw_parts(it.ptr as *const u8, it.len) };
-                    client.put(&it.key, val).await.is_ok()
+                    if zc {
+                        // F216-E zero-copy write: send the value as its own iovec
+                        // straight from the pinned source page (MSG_PUT_ZC) — no
+                        // to_vec/clone/rkyv copy; on UCX the rcache makes the send
+                        // zero-copy. SAFETY: it.ptr/len address a pinned source page
+                        // kept alive by the caller for the whole batch (until
+                        // allow_threads returns); the `Bytes::from_static` view is
+                        // consumed by put_zc within this await and its Drop is a
+                        // no-op (never frees the page).
+                        let page: &'static [u8] = unsafe {
+                            std::slice::from_raw_parts(it.ptr as *const u8, it.len)
+                        };
+                        client.put_zc(&it.key, bytes::Bytes::from_static(page)).await.is_ok()
+                    } else {
+                        // SAFETY: it.ptr/len address a pinned source page held alive
+                        // by the caller for the whole batch.
+                        let val = unsafe { std::slice::from_raw_parts(it.ptr as *const u8, it.len) };
+                        client.put(&it.key, val).await.is_ok()
+                    }
                 })
                 .buffered(cap)
                 .collect::<Vec<bool>>()
@@ -810,8 +864,8 @@ impl BatchClient {
     /// in-flight pipeline depth per worker (keep ≤ ~16-32 on UCX to dodge the
     /// rendezvous cliff).
     #[new]
-    #[pyo3(signature = (manager, n_workers=4, per_worker_cap=16))]
-    fn new(py: Python<'_>, manager: String, n_workers: usize, per_worker_cap: usize) -> PyResult<Self> {
+    #[pyo3(signature = (manager, n_workers=4, per_worker_cap=16, zc=false))]
+    fn new(py: Python<'_>, manager: String, n_workers: usize, per_worker_cap: usize, zc: bool) -> PyResult<Self> {
         let n_workers = n_workers.max(1);
         let result: Result<Vec<BatchWorker>, String> = py.allow_threads(|| {
             let mut workers = Vec::with_capacity(n_workers);
@@ -841,7 +895,7 @@ impl BatchClient {
                                 }
                             };
                             while let Some(job) = job_rx.next().await {
-                                let res = run_job(&client, job.op, job.items, per_worker_cap).await;
+                                let res = run_job(&client, job.op, job.items, per_worker_cap, zc).await;
                                 let _ = job.done.send(res);
                             }
                         });
@@ -855,7 +909,13 @@ impl BatchClient {
             Ok(workers)
         });
         let workers = result.map_err(PyRuntimeError::new_err)?;
-        Ok(BatchClient { workers, per_worker_cap })
+        Ok(BatchClient { workers, per_worker_cap, zc })
+    }
+
+    /// Whether this client uses the F216-E zero-copy path (MSG_PUT_ZC /
+    /// MSG_GET_ZC) — set at construction via `zc=True`.
+    fn zc(&self) -> bool {
+        self.zc
     }
 
     /// Batched zero-copy get. Returns list[bool] aligned to `keys`: True iff the

@@ -19,3 +19,5 @@ autumn-rpc = { path = "../crates/rpc" }
 autumn-transport = { path = "../crates/transport" }
 compio = { version = "0.18", features = ["runtime", "time"] }
 futures = "0.3"
+bytes = "1"
+libc = "0.2"

@@ -159,7 +159,20 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         default_cap = 16 if transport == "ucx" else 64
         self._max_inflight = int(extra_config.get("max_inflight", default_cap))
         n_workers = max(1, int(extra_config.get("client_workers", 1)))
-        self._batch = autumn.BatchClient(endpoint, n_workers, max(1, self._max_inflight))
+        # F216-E zero-copy path (MSG_PUT_ZC write + MSG_GET_ZC read). Opt-in via
+        # extra_config "zc": true. Measured benefit through this adapter is a
+        # modest write speedup (~1.05–1.25×, larger at bigger page sizes) and
+        # ~parity reads intra-host — the transport-level ~2× write win is diluted
+        # by the per-op Python/dispatch/routing overhead. The bigger payoff is
+        # expected cross-host RDMA. Default off until the deep UCX multi-worker
+        # path is hardened (high client_workers × partitions can collapse UCX).
+        zc = bool(extra_config.get("zc", False)) and transport == "ucx"
+        try:
+            self._batch = autumn.BatchClient(endpoint, n_workers, max(1, self._max_inflight), zc)
+        except TypeError:
+            # Wheel predates the zc arg — fall back to the regular path.
+            self._batch = autumn.BatchClient(endpoint, n_workers, max(1, self._max_inflight))
+        self._zc = zc
         # Low-frequency v0 / batch_exists / clear paths use a regular async
         # Client on its own loop thread.
         self._loop0 = new_loop()
