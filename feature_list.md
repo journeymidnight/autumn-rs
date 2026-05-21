@@ -3056,9 +3056,10 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
     SIGSEGV'd the PS on concurrent 8 MiB reads (rcache send registration). Latent
     RDMA deployment gap exposed by the perf re-test; not ZC-specific.
 - **Remaining (both internal PS↔EN hops deferred for cancel-safety / scope):**
-  - PS←EN READ hop (R3): **CODE DONE + UNIT-TESTED 2026-05-21; live UCX e2e
-    pending a fresh session** (cluster bring-up was blocked by a degraded
-    long-session shell, not code). Commits a343473/93b57a7/c60e1cc/f2aabf8/
+  - PS←EN READ hop (R3): **DONE + UNIT-TESTED + LIVE UCX E2E PASSED 2026-05-21**
+    (1-node UCX rc_mlx5: put-zc + zc-get a 256K VP value == byte-identical via
+    MSG_READ_BYTES_ZC + read_value_into_pooled; small/not-found ok; rc_mlx5 on
+    EN+PS; no errors/fallback; PS alive). Commits a343473/93b57a7/c60e1cc/f2aabf8/
     0a3a2b5/fdc2a0b: EN `MSG_READ_BYTES_ZC` 2-Bytes (no encode copies);
     RegPool transport-agnostic; `RpcClient::call_into_pooled` = read_loop owns
     the PooledBuf, hands it back on success, drops→pool on cancel (no leak —

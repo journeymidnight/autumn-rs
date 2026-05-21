@@ -51,10 +51,14 @@ Current summary:
       autumn-client `put-zc <KEY> <FILE>` CLI (registers source on ucx).
 
 Main gaps (NOT done — next session):
-  1. PS <- EN hop (R3) — CODE DONE + UNIT-TESTED 2026-05-21; only the live
-     UCX cluster e2e remains (blocked by a degraded long-session shell — every
-     cluster.sh bring-up form failed with empty logs/exit1; NOT a code issue).
-     Run the e2e FIRST in a fresh session (recipe in Next steps).
+  1. PS <- EN hop (R3) — DONE + UNIT-TESTED + LIVE UCX E2E PASSED 2026-05-21.
+     e2e (1-node UCX, RoCE rc_mlx5): put-zc + zc-get a 256K value (VP in
+     log_stream → drives MSG_READ_BYTES_ZC + read_value_into_pooled) ==
+     original byte-identical; small(inline)/not-found correct; rc_mlx5 active
+     on EN+PS (10/10); zero errors/eversion/fallback/panic in logs; PS alive
+     throughout. (The bring-up that was blocked earlier worked from a clean
+     minimal detached launch — `(./cluster.sh reset 1 > log &)` with NO
+     preceding kill-loop in the same command + a separate poll/e2e command.)
      Implemented (6 commits a343473, 93b57a7, c60e1cc, f2aabf8, 0a3a2b5,
      fdc2a0b): EN MSG_READ_BYTES_ZC (extent_rpc=15) emits V0 [zc_meta][value]
      2 Bytes (no encode copies); RegPool made transport-agnostic (top-level
@@ -87,24 +91,12 @@ Main gaps (NOT done — next session):
      would be new (rcache already makes it zero-copy). Low priority.
 
 Next steps:
-  - FRESH SESSION FIRST: run the R3 live e2e (blocked here by a degraded shell,
-    not code). It is the same shape as the already-passing client<-PS zc-get
-    e2e (commit 28b4c64); a 256K value is a VP in log_stream so zc-get exercises
-    the new EN MSG_READ_BYTES_ZC + read_value_into_pooled path:
-      cargo build --release -p autumn-server --features ucx
-      ulimit -l unlimited
-      AUTUMN_TRANSPORT=ucx AUTUMN_BIND_HOST="[fdbd:dc62:3:302::14]" \
-        UCX_TLS="^sysv,posix" AUTUMN_EXTENT_SHARDS=8 \
-        AUTUMN_BOOTSTRAP_PRESPLIT="8:hexstring" ./cluster.sh reset 1
-      AC="./target/release/autumn-client --manager [fdbd:dc62:3:302::14]:9001 --transport ucx"
-      head -c 262144 /dev/urandom > /tmp/v.bin
-      $AC put-zc r3 /tmp/v.bin && $AC zc-get r3 > /tmp/o.bin && cmp /tmp/v.bin /tmp/o.bin
-      # expect identical; grep rc_mlx5 in node1.log + ps.log; PS stays alive.
-    (Tip: this long session degraded cluster bring-up via the Bash tool — a
-    fresh session has clean shell/process state.)
-  - Then R4 (drop the final copies): resolve_value returns the PooledBuf (or a
-    Bytes aliasing it); handle_get_zc emits [zc_meta][value-alias] vectored
-    instead of the extend_from_slice concat. Closes the last read-path copy.
+  - R4 (drop the final read-path copies): resolve_value returns the PooledBuf
+    (or a Bytes aliasing it); handle_get_zc emits [zc_meta][value-alias]
+    vectored instead of the extend_from_slice concat. Closes the last pb->Vec
+    + concat copies (R3 left them to keep resolve_value -> Vec / no ripple).
+  - (lower priority) PS->EN WRITE explicit source registration; the deep UCX
+    multi-worker / DC-transport scaling (separate from R3).
   - Then the python BatchClient get_into + maturin rebuild.
 
 Verification this session:
