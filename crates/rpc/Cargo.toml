@@ -18,3 +18,10 @@ rkyv = { version = "0.8.15", features = ["alloc"] }
 thiserror.workspace = true
 futures = "0.3"
 tracing = "0.1"
+
+[dev-dependencies]
+libc = "0.2"
+
+[[bench]]
+name = "ps_read_bench"
+harness = false

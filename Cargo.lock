@@ -283,6 +283,7 @@ dependencies = [
  "compio",
  "crc32c",
  "futures",
+ "libc",
  "rkyv",
  "thiserror 2.0.18",
  "tracing",

@@ -69,6 +69,33 @@ fn parse_zc_meta(b: &[u8]) -> (u8, u32, u32) {
     )
 }
 
+/// F216-E read-path CRC toggle. The value crc32c verify on the ZC read path
+/// (`call_into_pooled` / `call_into_dest`, both TCP and UCX) costs a full
+/// crc32c pass over every value (~20% of one core at 8 MiB). On RDMA the NIC's
+/// hardware ICRC already guards the wire, and at-rest data is covered by scrub,
+/// so operators can disable this per-op verify. Default ON (keeps the F165
+/// guarantee); flip via [`set_verify_read_crc`].
+static VERIFY_READ_CRC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Enable/disable the read-path value crc32c verify (see [`VERIFY_READ_CRC`]).
+pub fn set_verify_read_crc(on: bool) {
+    VERIFY_READ_CRC.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Verify `dest` against `crc` iff the read-path CRC is enabled. Returns
+/// `(ok, computed)`; when disabled it skips the crc32c pass entirely and
+/// reports `(true, crc)`.
+#[inline]
+fn read_crc_ok(dest: &[u8], crc: u32) -> (bool, u32) {
+    if VERIFY_READ_CRC.load(std::sync::atomic::Ordering::Relaxed) {
+        let c = crc32c::crc32c(dest);
+        (c == crc, c)
+    } else {
+        (true, crc)
+    }
+}
+
 /// Result of a `call_into_dest`: the value bytes are already in the caller's
 /// `dest`; this carries the status code + how many bytes were written.
 #[derive(Debug, Clone, Copy)]
@@ -693,8 +720,8 @@ async fn read_loop(
                         }
                     }
                 }
-                let computed = crc32c::crc32c(dest);
-                let _ = if computed == crc {
+                let (ok, computed) = read_crc_ok(dest, crc);
+                let _ = if ok {
                     into.meta_tx.send(Ok(DestMeta { code, value_len }))
                 } else {
                     into.meta_tx.send(Err(RpcError::Frame(
@@ -760,9 +787,9 @@ async fn read_loop(
                     let _ = tx.send(Err(e));
                     return Err(RpcError::ConnectionClosed);
                 }
-                let computed = crc32c::crc32c(dest);
+                let (ok, computed) = read_crc_ok(dest, crc);
                 let _ = drop((dest, reg)); // end the borrow of pb before moving it
-                if computed == crc {
+                if ok {
                     let _ = tx.send(Ok((pb, code)));
                 } else {
                     let _ = tx.send(Err(RpcError::Frame(
@@ -826,8 +853,8 @@ fn finish_into_dest_from_frame(into: IntoDest, payload: &[u8]) {
     // SAFETY: caller holds the dest buffer alive until meta_tx fires.
     let dest = unsafe { std::slice::from_raw_parts_mut(into.dest, value.len()) };
     dest.copy_from_slice(value);
-    let computed = crc32c::crc32c(dest);
-    let _ = if computed == crc {
+    let (ok, computed) = read_crc_ok(dest, crc);
+    let _ = if ok {
         into.meta_tx.send(Ok(DestMeta { code, value_len: value.len() }))
     } else {
         into.meta_tx.send(Err(RpcError::Frame(
@@ -857,8 +884,7 @@ fn finish_into_pooled_from_frame(
     let (ok, computed) = {
         let (dest, _reg) = pb.dest_and_reg();
         dest.copy_from_slice(value);
-        let c = crc32c::crc32c(dest);
-        (c == crc, c)
+        read_crc_ok(dest, crc)
     };
     let _ = if ok {
         tx.send(Ok((pb, code)))
