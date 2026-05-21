@@ -1668,17 +1668,32 @@ fn build_read_future(
             // `.clone()` before any `.await`.
             let file_rc = extent.file_rc();
             let f: &CompioFile = &*file_rc;
-            let buf = vec![0u8; read_size as usize];
-            let BufResult(result, buf) = f.read_exact_at(buf, read_offset).await;
-            match result {
-                Ok(_) => {
-                    if zc {
-                        // 2 Bytes: [header+zc_meta], [value]. The value aliases
-                        // the pread buffer — no ReadBytesResp/Frame encode copy.
-                        let value = Bytes::from(buf);
+            if zc {
+                // F216-E: pread straight into a registered, pooled, zeroed-once
+                // slab — no per-op `vec![0u8; read_size]` alloc, no per-op 8 MiB
+                // memset (the pread overwrites it anyway), and the UCX send finds
+                // the `ucp_mem_map` registration via the rcache (stable slab
+                // address). The value `Bytes` aliases the slab
+                // (`Bytes::from_owner`) and returns it to the pool when the
+                // response write completes. 2 Bytes on the wire:
+                // [header+zc_meta], [value] — no ReadBytesResp/Frame encode copy.
+                let pb = autumn_transport::regpool_acquire(read_size as usize);
+                let BufResult(result, pb) = f.read_exact_at(pb, read_offset).await;
+                match result {
+                    Ok(_) => {
+                        let value = Bytes::from_owner(pb);
                         out.push(zc_read_head(slot.req_id, CODE_OK, &value));
                         out.push(value);
-                    } else {
+                    }
+                    Err(_e) => {
+                        out.push(zc_read_head(slot.req_id, CODE_ERROR, &[]));
+                    }
+                }
+            } else {
+                let buf = vec![0u8; read_size as usize];
+                let BufResult(result, buf) = f.read_exact_at(buf, read_offset).await;
+                match result {
+                    Ok(_) => {
                         out.push(
                             Frame::response(
                                 slot.req_id,
@@ -1689,11 +1704,7 @@ fn build_read_future(
                             .encode(),
                         );
                     }
-                }
-                Err(e) => {
-                    if zc {
-                        out.push(zc_read_head(slot.req_id, CODE_ERROR, &[]));
-                    } else {
+                    Err(e) => {
                         out.push(err_bytes(
                             slot.req_id,
                             MSG_READ_BYTES,

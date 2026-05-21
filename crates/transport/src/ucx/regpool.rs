@@ -158,6 +158,44 @@ impl AsRef<[u8]> for PooledBuf {
     }
 }
 
+// F216-E: make `PooledBuf` a first-class compio buffer so the EN read path can
+// `read_exact_at(pb, off)` straight into the registered, zeroed-once, pooled
+// slab — eliminating the per-op `vec![0u8; read_size]` (per-op malloc + an 8 MiB
+// memset that the pread immediately overwrites) and letting the UCX send find
+// the `ucp_mem_map` registration in the rcache (stable address = rcache hit).
+//
+// compio's `read_exact_at` reads exactly `buf_capacity()` (= `as_uninit().len()`)
+// bytes and tracks progress with its own counter, so exposing the requested
+// `used` bytes as the capacity makes it read exactly the value length. `set_len`
+// is a no-op: the slab is fixed-size and always fully initialized (allocated
+// zeroed), and `used` is fixed at acquire — the read loop never relies on
+// `set_len` to size the next read.
+impl compio::buf::IoBuf for PooledBuf {
+    fn as_init(&self) -> &[u8] {
+        self.filled()
+    }
+}
+
+impl compio::buf::SetLen for PooledBuf {
+    unsafe fn set_len(&mut self, _len: usize) {}
+}
+
+impl compio::buf::IoBufMut for PooledBuf {
+    fn as_uninit(&mut self) -> &mut [std::mem::MaybeUninit<u8>] {
+        let used = self.used;
+        let buf = &mut self.slab.as_mut().expect("slab present").buf[..used];
+        // SAFETY: `u8` and `MaybeUninit<u8>` share layout; these bytes are
+        // already initialized (the slab is zeroed on first alloc), so viewing
+        // them as MaybeUninit is sound. `read_at` writes them before read-back.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                buf.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>,
+                used,
+            )
+        }
+    }
+}
+
 impl Drop for PooledBuf {
     fn drop(&mut self) {
         let Some(slab) = self.slab.take() else { return };
@@ -263,5 +301,36 @@ mod tests {
         assert_eq!(p.dest_mut().len(), 1000);
         assert_eq!(p.class, 4096);
         assert_eq!(p.len(), 1000);
+    }
+
+    // F216-E: `read_exact_at` into a PooledBuf must read exactly `used` bytes,
+    // NOT the full slab `class`. `used=5000` rounds to `class=8192`; a file of
+    // 5000 bytes would EOF-error if the read targeted the whole 8192-slab.
+    // Validates the IoBufMut impl (as_uninit exposes `used`) on the no-ucx
+    // build too (regpool returns an unregistered slab there; trait impl is the
+    // same). Runs without UCX — pure compio file I/O.
+    #[test]
+    fn read_exact_at_into_pooled_reads_used_not_class() {
+        use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
+        let n = 5000usize;
+        let pattern: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let path = std::env::temp_dir()
+            .join(format!("autumn_regpool_pread_{}.bin", std::process::id()));
+        let rt = compio::runtime::Runtime::new().expect("compio rt");
+        rt.block_on(async {
+            {
+                let mut f = compio::fs::File::create(&path).await.expect("create");
+                f.write_all_at(pattern.clone(), 0).await.0.expect("write");
+                f.sync_all().await.expect("sync");
+            }
+            let f = compio::fs::File::open(&path).await.expect("open");
+            let pb = acquire(n);
+            assert_eq!(pb.class, 8192, "5000 rounds to 8192");
+            let compio::BufResult(res, pb) = f.read_exact_at(pb, 0).await;
+            res.expect("read_exact_at must fill exactly `used` bytes (not class)");
+            assert_eq!(pb.len(), n);
+            assert_eq!(pb.filled(), &pattern[..], "pooled slab must hold file bytes");
+            let _ = compio::fs::remove_file(&path).await;
+        });
     }
 }
