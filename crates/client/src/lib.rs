@@ -732,6 +732,98 @@ impl ClusterClient {
         Ok(())
     }
 
+    /// F216-E zero-copy PUT: write a value with NO intermediate value copy on
+    /// the client. The value is sent as its own iovec (via `MSG_PUT_ZC` +
+    /// `RpcClient::call_vectored`) straight from `value`'s backing memory — on
+    /// UCX that is a zero-copy send via rcache when `value`'s memory is
+    /// `ucp_mem_map`-registered (the kvcache caller holds a `RegisteredMem` over
+    /// the sglang source pool and passes a `Bytes` aliasing it → 0 copies). The
+    /// regular `put` path copies the value 3× (to_vec → clone → rkyv_encode);
+    /// this copies 0. Same routing + epoch-stale refresh + RPC-retry shape as
+    /// `call_ps_for_key`. Inline-cap rules are identical to `put` (PS rejects
+    /// over the inline cap with `CODE_VALUE_TOO_LARGE`).
+    pub async fn put_zc(
+        &self,
+        key: &[u8],
+        value: Bytes,
+    ) -> std::result::Result<(), AutumnError> {
+        self.put_zc_opts(key, value, 0).await
+    }
+
+    async fn put_zc_opts(
+        &self,
+        key: &[u8],
+        value: Bytes,
+        expires_at: u64,
+    ) -> std::result::Result<(), AutumnError> {
+        if value.len() as u64 > CLIENT_PUT_HARD_CAP {
+            return Err(AutumnError::ValueTooLarge {
+                size: value.len() as u64,
+                cap: CLIENT_PUT_HARD_CAP,
+            });
+        }
+        let key = key.to_vec();
+        let mut attempt: u32 = 0;
+        let mut last_err: Option<String> = None;
+        while attempt <= MAX_PS_REFRESHES {
+            let (part_id, ps_addr) = self
+                .resolve_key(&key)
+                .await
+                .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+            let region_epoch = self.lookup_epoch_for_part(part_id);
+            let meta =
+                partition_rpc::encode_put_zc_meta(part_id, region_epoch, expires_at, &key);
+            match self.get_ps_client(&ps_addr).await {
+                Ok(client) => {
+                    // [meta, value] — value is a zero-copy iovec; no copy here.
+                    match client
+                        .call_vectored(partition_rpc::MSG_PUT_ZC, vec![meta, value.clone()])
+                        .await
+                    {
+                        Ok(resp_bytes) => {
+                            let resp: PutResp = rkyv_decode(&resp_bytes)
+                                .map_err(AutumnError::ServerError)?;
+                            match resp.code {
+                                partition_rpc::CODE_OK => return Ok(()),
+                                partition_rpc::CODE_VALUE_TOO_LARGE => {
+                                    return Err(AutumnError::ValueTooLarge {
+                                        size: value.len() as u64,
+                                        cap: 0,
+                                    });
+                                }
+                                // Epoch stale / frozen-for-merge → refresh + retry.
+                                partition_rpc::CODE_PRECONDITION
+                                | partition_rpc::CODE_REGION_EPOCH_STALE
+                                | partition_rpc::CODE_UNAVAILABLE => {
+                                    last_err = Some(resp.message);
+                                }
+                                other => return Err(code_to_error(other, resp.message)),
+                            }
+                        }
+                        Err(e) => {
+                            self.ps_conns.borrow_mut().remove(&ps_addr);
+                            last_err = Some(e.to_string());
+                        }
+                    }
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+            if attempt >= MAX_PS_REFRESHES {
+                break;
+            }
+            attempt += 1;
+            let sleep = refresh_backoff(attempt);
+            if !sleep.is_zero() {
+                compio::time::sleep(sleep).await;
+            }
+            let _ = self.refresh_regions().await;
+        }
+        Err(AutumnError::ConnectionError(format!(
+            "put_zc after {attempt} refreshes: {}",
+            last_err.unwrap_or_else(|| "unknown".to_string())
+        )))
+    }
+
     /// Get a value by key. Returns None if not found.
     pub async fn get(&self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
         self.get_range(key, 0, 0).await

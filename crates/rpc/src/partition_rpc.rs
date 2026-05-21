@@ -87,6 +87,76 @@ pub const MSG_PULL_VP_REFS: u8 = 0x4F;
 // MSG_GET keeps the rkyv GetResp form.
 pub const MSG_GET_ZC: u8 = 0x50;
 
+// F216-E zero-copy PUT (client -> PS write hop). Same semantics as MSG_PUT but
+// value-separable so the client sends the value as its OWN iovec straight from
+// the (registered) sglang source pool — no `value.to_vec()`/clone/rkyv copy on
+// the client, and the PS slices the value zero-copy out of the frame (vs an
+// rkyv decode copy). Wire payload:
+//   [part_id: u64 LE][region_epoch: u64 LE][expires_at: u64 LE][key_len: u32 LE]
+//   [key: key_len bytes][value: rest]
+// Sent via RpcClient::call_vectored(MSG_PUT_ZC, [meta, value]) — on UCX the
+// value iovec is zero-copy via rcache when its memory is ucp_mem_map-registered;
+// the V1 frame CRC (when enabled) covers [meta||value] just like MSG_PUT. The
+// response is a normal rkyv `PutResp` (tiny — no ZC framing needed back).
+pub const MSG_PUT_ZC: u8 = 0x51;
+
+/// Fixed prefix of the MSG_PUT_ZC meta: part_id(8)+region_epoch(8)+
+/// expires_at(8)+key_len(4).
+pub const PUT_ZC_HEADER_LEN: usize = 28;
+
+/// Build the MSG_PUT_ZC meta block `[part_id][region_epoch][expires_at]
+/// [key_len][key]` (value is appended by the caller as a separate iovec).
+pub fn encode_put_zc_meta(
+    part_id: u64,
+    region_epoch: u64,
+    expires_at: u64,
+    key: &[u8],
+) -> bytes::Bytes {
+    use bytes::BufMut;
+    let mut b = bytes::BytesMut::with_capacity(PUT_ZC_HEADER_LEN + key.len());
+    b.put_u64_le(part_id);
+    b.put_u64_le(region_epoch);
+    b.put_u64_le(expires_at);
+    b.put_u32_le(key.len() as u32);
+    b.put_slice(key);
+    b.freeze()
+}
+
+/// Parsed MSG_PUT_ZC meta + the offset where the value begins in the payload.
+pub struct PutZcMeta {
+    pub part_id: u64,
+    pub region_epoch: u64,
+    pub expires_at: u64,
+    pub key_len: usize,
+    /// Byte offset of the value within the original payload.
+    pub value_offset: usize,
+}
+
+/// Parse the fixed prefix + key length of a MSG_PUT_ZC payload. Returns `None`
+/// if the payload is too short to hold the header + declared key. The caller
+/// reads the key as `payload[PUT_ZC_HEADER_LEN..value_offset]` and the value as
+/// `payload[value_offset..]` (both zero-copy slices).
+pub fn parse_put_zc_meta(payload: &[u8]) -> Option<PutZcMeta> {
+    if payload.len() < PUT_ZC_HEADER_LEN {
+        return None;
+    }
+    let part_id = u64::from_le_bytes(payload[0..8].try_into().ok()?);
+    let region_epoch = u64::from_le_bytes(payload[8..16].try_into().ok()?);
+    let expires_at = u64::from_le_bytes(payload[16..24].try_into().ok()?);
+    let key_len = u32::from_le_bytes(payload[24..28].try_into().ok()?) as usize;
+    let value_offset = PUT_ZC_HEADER_LEN.checked_add(key_len)?;
+    if payload.len() < value_offset {
+        return None;
+    }
+    Some(PutZcMeta {
+        part_id,
+        region_epoch,
+        expires_at,
+        key_len,
+        value_offset,
+    })
+}
+
 // ── Status codes ────────────────────────────────────────────────────────────
 
 pub const CODE_OK: u8 = 0;
@@ -396,6 +466,12 @@ pub struct TableLocations {
 pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
     match msg_type {
         MSG_PUT => rkyv_decode::<PutReq>(payload).map(|r| r.part_id).unwrap_or(0),
+        // MSG_PUT_ZC meta is binary: part_id is the first u64 LE.
+        MSG_PUT_ZC => payload
+            .get(0..8)
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0),
         MSG_GET | MSG_GET_ZC => rkyv_decode::<GetReq>(payload).map(|r| r.part_id).unwrap_or(0),
         MSG_DELETE => rkyv_decode::<DeleteReq>(payload).map(|r| r.part_id).unwrap_or(0),
         MSG_HEAD => rkyv_decode::<HeadReq>(payload).map(|r| r.part_id).unwrap_or(0),

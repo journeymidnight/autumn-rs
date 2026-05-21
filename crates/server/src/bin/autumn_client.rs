@@ -72,6 +72,13 @@ enum Command {
         chunk_size: u32,
         out: Option<String>,
     },
+    /// F216-E verification: zero-copy PUT via ClusterClient::put_zc. Reads
+    /// `file` into a Bytes, registers it for UCX zero-copy send (ucx build),
+    /// writes via MSG_PUT_ZC (value sent as its own iovec, no client-side copy).
+    PutZc {
+        key: String,
+        file: String,
+    },
     Get {
         key: String,
     },
@@ -218,6 +225,16 @@ fn parse_args() -> Args {
             let key = raw[i].clone();
             let file = raw[i + 1].clone();
             Command::Put { key, file }
+        }
+        "put-zc" => {
+            if i + 1 >= raw.len() {
+                eprintln!("put-zc requires <KEY> <FILE>");
+                std::process::exit(1);
+            }
+            Command::PutZc {
+                key: raw[i].clone(),
+                file: raw[i + 1].clone(),
+            }
         }
         "put-stream" | "putstream" => {
             // put-stream [--chunk-size N] <KEY> <FILE-or-->
@@ -829,6 +846,25 @@ async fn main() -> Result<()> {
             let value = std::fs::read(&file).with_context(|| format!("read file {file}"))?;
             client.put(key.as_bytes(), &value).await
                 .map_err(|e| anyhow!("put: {e}"))?;
+            println!("ok");
+        }
+
+        Command::PutZc { key, file } => {
+            let value = std::fs::read(&file).with_context(|| format!("read file {file}"))?;
+            let value = bytes::Bytes::from(value);
+            // Register the value's backing memory so the UCX send is zero-copy
+            // via rcache (ucx build). Hold the RegisteredMem until put_zc
+            // completes. On TCP / no-ucx this is a no-op.
+            #[cfg(feature = "ucx")]
+            let _reg = (!value.is_empty())
+                .then(|| autumn_transport::register_memory(
+                    value.as_ptr() as *mut std::ffi::c_void,
+                    value.len(),
+                ))
+                .transpose()
+                .map_err(|e| anyhow!("put-zc register source: {e}"))?;
+            client.put_zc(key.as_bytes(), value).await
+                .map_err(|e| anyhow!("put-zc: {e}"))?;
             println!("ok");
         }
 

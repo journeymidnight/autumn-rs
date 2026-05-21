@@ -4610,6 +4610,18 @@ async fn handle_incoming_req(
                 let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                 return;
             }
+            MSG_PUT_ZC => {
+                let key = partition_rpc::parse_put_zc_meta(&req.payload)
+                    .map(|m| req.payload[PUT_ZC_HEADER_LEN..m.value_offset].to_vec())
+                    .unwrap_or_default();
+                let resp = PutResp {
+                    code: CODE_UNAVAILABLE,
+                    message: "partition frozen for merge — refresh routing and retry".to_string(),
+                    key,
+                };
+                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                return;
+            }
             MSG_DELETE => {
                 let key = match partition_rpc::rkyv_decode::<DeleteReq>(&req.payload) {
                     Ok(r) => r.key,
@@ -4653,6 +4665,7 @@ async fn handle_incoming_req(
 
     match req.msg_type {
         MSG_PUT => enqueue_put(req, pending, part_region_epoch, part_id_for_err),
+        MSG_PUT_ZC => enqueue_put_zc(req, pending, part_region_epoch, part_id_for_err),
         MSG_DELETE => enqueue_delete(req, pending, part_region_epoch, part_id_for_err),
         MSG_STREAM_PUT => enqueue_stream_put(req, pending, part_region_epoch, part_id_for_err),
         // F185: freeze stashes its resp oneshot in PartitionData and
@@ -4801,6 +4814,56 @@ fn enqueue_put(req: PartitionRequest, pending: &mut Vec<WriteRequest>, part_regi
             let _ = req.resp_tx.send(Err((StatusCode::InvalidArgument, e)));
         }
     }
+}
+
+/// F216-E zero-copy PUT enqueue. Mirrors `enqueue_put` but decodes the binary
+/// `[meta][value]` framing (`partition_rpc::parse_put_zc_meta`) instead of rkyv,
+/// and slices BOTH key and value as **zero-copy `Bytes`** out of `req.payload`
+/// (no per-field copy). Same region-epoch + inline-cap checks and the same
+/// rkyv `PutResp` response shape as `enqueue_put`.
+fn enqueue_put_zc(req: PartitionRequest, pending: &mut Vec<WriteRequest>, part_region_epoch: u64, part_id_for_err: u64) {
+    let Some(meta) = partition_rpc::parse_put_zc_meta(&req.payload) else {
+        let _ = req.resp_tx.send(Err((
+            StatusCode::InvalidArgument,
+            "malformed MSG_PUT_ZC payload".to_string(),
+        )));
+        return;
+    };
+    if meta.region_epoch != 0 && meta.region_epoch != part_region_epoch {
+        let _ = req.resp_tx.send(Err((StatusCode::FailedPrecondition, format!(
+            "region epoch stale: part_id={} have={} got={}",
+            part_id_for_err, part_region_epoch, meta.region_epoch
+        ))));
+        return;
+    }
+    // Zero-copy slices of the frame payload (Bytes refcount, no memcpy).
+    let key = req.payload.slice(PUT_ZC_HEADER_LEN..meta.value_offset);
+    let value = req.payload.slice(meta.value_offset..);
+    if value.len() > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize {
+        let resp = PutResp {
+            code: CODE_VALUE_TOO_LARGE,
+            message: format!(
+                "value {} bytes exceeds inline cap {} — use PutStream",
+                value.len(),
+                AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT
+            ),
+            key: key.to_vec(),
+        };
+        let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+        return;
+    }
+    let key_vec = key.to_vec();
+    pending.push(WriteRequest {
+        op: WriteOp::Put {
+            user_key: key,
+            value,
+            expires_at: meta.expires_at,
+        },
+        resp: WriteResponder::Put {
+            outer: req.resp_tx,
+            key: key_vec,
+        },
+    });
 }
 
 fn enqueue_delete(req: PartitionRequest, pending: &mut Vec<WriteRequest>, part_region_epoch: u64, part_id_for_err: u64) {
