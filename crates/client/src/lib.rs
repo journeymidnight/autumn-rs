@@ -764,6 +764,83 @@ impl ClusterClient {
         Ok(Some(resp.value))
     }
 
+    /// F216 zero-copy GET: read a key's value straight into `dest` (no
+    /// intermediate Vec). Returns `Some(value_len)` (value written to
+    /// `dest[..value_len]`) or `None` if not found. `dest` must be at least the
+    /// value size; pass `reg = Some(&RegisteredMem)` covering `dest` for UCX
+    /// zero-copy receive (RDMA into the registered dest), or `None` (TCP /
+    /// unregistered → one copy off the wire). Uses MSG_GET_ZC +
+    /// `RpcClient::call_into_dest`; same routing + epoch-stale refresh + RPC
+    /// retry shape as `call_ps_for_key`.
+    pub async fn get_into(
+        &self,
+        key: &[u8],
+        dest: &mut [u8],
+        reg: Option<&autumn_rpc::RegisteredMem>,
+    ) -> std::result::Result<Option<usize>, AutumnError> {
+        let key = key.to_vec();
+        let mut attempt: u32 = 0;
+        let mut last_err: Option<String> = None;
+        while attempt <= MAX_PS_REFRESHES {
+            let (part_id, ps_addr) = self
+                .resolve_key(&key)
+                .await
+                .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+            let region_epoch = self.lookup_epoch_for_part(part_id);
+            let payload = rkyv_encode(&GetReq {
+                part_id,
+                key: key.clone(),
+                offset: 0,
+                length: 0,
+                region_epoch,
+            });
+            match self.get_ps_client(&ps_addr).await {
+                Ok(client) => {
+                    match client
+                        .call_into_dest(
+                            partition_rpc::MSG_GET_ZC,
+                            payload,
+                            dest.as_mut_ptr(),
+                            dest.len(),
+                            reg,
+                        )
+                        .await
+                    {
+                        Ok(meta) => match meta.code {
+                            partition_rpc::CODE_OK => return Ok(Some(meta.value_len)),
+                            partition_rpc::CODE_NOT_FOUND => return Ok(None),
+                            // Epoch stale → fall through to refresh + retry.
+                            partition_rpc::CODE_PRECONDITION
+                            | partition_rpc::CODE_REGION_EPOCH_STALE => {
+                                last_err = Some("region epoch stale".to_string());
+                            }
+                            other => return Err(code_to_error(other, String::new())),
+                        },
+                        Err(e) => {
+                            // Drop the conn so the next attempt reconnects.
+                            self.ps_conns.borrow_mut().remove(&ps_addr);
+                            last_err = Some(e.to_string());
+                        }
+                    }
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+            if attempt >= MAX_PS_REFRESHES {
+                break;
+            }
+            attempt += 1;
+            let sleep = refresh_backoff(attempt);
+            if !sleep.is_zero() {
+                compio::time::sleep(sleep).await;
+            }
+            let _ = self.refresh_regions().await;
+        }
+        Err(AutumnError::ConnectionError(format!(
+            "get_into after {attempt} refreshes: {}",
+            last_err.unwrap_or_else(|| "unknown".to_string())
+        )))
+    }
+
     /// Delete a key. Returns Ok(()) even if key didn't exist.
     pub async fn delete(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
         let key = key.to_vec();

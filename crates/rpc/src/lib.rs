@@ -17,6 +17,10 @@ pub mod pool;
 
 pub use error::{RpcError, Result, StatusCode};
 pub use frame::{Frame, FrameDecoder, HEADER_LEN};
+/// Re-exported so consumers of `RpcClient::call_into_dest(reg: Option<&RegisteredMem>)`
+/// don't need a direct autumn-transport dependency. (Uninhabited stub on
+/// non-ucx builds — `reg` is always `None` there.)
+pub use autumn_transport::RegisteredMem;
 
 /// Handler result type for RPC dispatch.
 pub type HandlerResult = std::result::Result<bytes::Bytes, (StatusCode, String)>;
