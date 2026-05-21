@@ -48,6 +48,16 @@ pub const MSG_SYNCED_LENGTH: u8 = 13;
 /// with a real revision so the EN's fence handover side-effect
 /// fires (see `extent_node.rs::handle_commit_length`).
 pub const MSG_PROBE_EXTENT: u8 = 14;
+/// F216-E zero-copy read (EN -> PS). Same request shape as MSG_READ_BYTES
+/// (ReadBytesReq), but the response is value-separable for recv-into-registered:
+/// a V0 frame whose payload is `[ZC meta: code(1)+value_len(4)+value_crc32c(4)]
+/// [raw value]` (autumn_rpc::client::ZC_META_LEN). The EN emits it as TWO Bytes
+/// (header+meta, value) so the value Bytes aliases the pread buffer — no
+/// `ReadBytesResp.encode()` + `Frame::encode()` double copy. The PS recvs the
+/// value straight into a registered RegPool buffer via call_into_pooled. No
+/// `end` field — VP-value reads (resolve_value) discard it. Falls back to
+/// MSG_READ_BYTES for EC / chunked / TCP.
+pub const MSG_READ_BYTES_ZC: u8 = 15;
 // MSG_TYPE_PING = 0xFF is reserved by autumn-rpc for heartbeat
 
 // ── Append (hot path) ────────────────────────────────────────────────────────

@@ -1267,7 +1267,51 @@ async fn process_frames_backpressured(
                 }
             };
             backpressure!();
-            inflight.push(build_read_future(extent, slots));
+            inflight.push(build_read_future(extent, slots, false));
+        } else if msg_type == MSG_READ_BYTES_ZC {
+            // F216-E zero-copy read grouping — mirrors MSG_READ_BYTES but every
+            // response (ok + error) is ZC-shaped (`zc_read_head` + value Bytes)
+            // so the PS's call_into_pooled always parses a zc_meta.
+            let first_req = match ReadBytesReq::decode(frames[i].payload.clone()) {
+                Ok(r) => r,
+                Err(_) => {
+                    let bytes = zc_read_head(frames[i].req_id, CODE_ERROR, &[]);
+                    inflight.push(Box::pin(async move { vec![bytes] }));
+                    i += 1;
+                    continue;
+                }
+            };
+            let anchor_extent = first_req.extent_id;
+            let mut slots: Vec<ReadSlot> = Vec::with_capacity(8);
+            slots.push(ReadSlot { req: first_req, req_id: frames[i].req_id });
+            i += 1;
+            while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES_ZC {
+                match ReadBytesReq::decode(frames[i].payload.clone()) {
+                    Ok(r) if r.extent_id == anchor_extent => {
+                        slots.push(ReadSlot { req: r, req_id: frames[i].req_id });
+                        i += 1;
+                    }
+                    Ok(_) => break,
+                    Err(_) => {
+                        let bytes = zc_read_head(frames[i].req_id, CODE_ERROR, &[]);
+                        inflight.push(Box::pin(async move { vec![bytes] }));
+                        i += 1;
+                    }
+                }
+            }
+            let extent = match node.get_extent(anchor_extent).await {
+                Ok(e) => e,
+                Err((_code, _msg)) => {
+                    let bytes_list: Vec<Bytes> = slots
+                        .iter()
+                        .map(|s| zc_read_head(s.req_id, CODE_ERROR, &[]))
+                        .collect();
+                    inflight.push(Box::pin(async move { bytes_list }));
+                    continue;
+                }
+            };
+            backpressure!();
+            inflight.push(build_read_future(extent, slots, true));
         } else {
             // Control RPC — no hot-path grouping. Build a future that
             // dispatches and encodes one response frame.
@@ -1548,9 +1592,27 @@ async fn build_append_future(
 /// Build the async future that services a same-extent READ batch. Reads
 /// are processed sequentially inside ONE future — each pread is ~1µs and
 /// the responses are written back together.
+/// F216-E: build a MSG_READ_BYTES_ZC response head = `[V0 frame header]
+/// [zc_meta: code(1)+value_len(4)+value_crc32c(4)]`. The value (if any) is
+/// pushed as a SEPARATE `Bytes` right after, so it aliases the pread buffer —
+/// no copy. `value` is borrowed only to compute the meta (crc + len).
+fn zc_read_head(req_id: u32, code: u8, value: &[u8]) -> Bytes {
+    use bytes::BufMut;
+    let meta = autumn_rpc::client::encode_zc_meta(code, value);
+    let payload_len = meta.len() + value.len();
+    let mut head = bytes::BytesMut::with_capacity(autumn_rpc::HEADER_LEN + meta.len());
+    head.put_u32_le(req_id);
+    head.put_u8(MSG_READ_BYTES_ZC);
+    head.put_u8(autumn_rpc::frame::FLAG_RESPONSE); // V0; value crc rides in the meta
+    head.put_u32_le(payload_len as u32);
+    head.put_slice(&meta);
+    head.freeze()
+}
+
 fn build_read_future(
     extent: std::rc::Rc<ExtentEntry>,
     slots: Vec<ReadSlot>,
+    zc: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>> {
     Box::pin(async move {
         use compio::io::AsyncReadAtExt;
@@ -1572,19 +1634,23 @@ fn build_read_future(
             // error, which surfaced as a generic transport error and
             // never triggered the cache refresh.
             if req.eversion < ev {
-                out.push(
-                    Frame::response(
-                        slot.req_id,
-                        MSG_READ_BYTES,
-                        ReadBytesResp {
-                            code: CODE_EVERSION_MISMATCH,
-                            end: 0,
-                            payload: Bytes::new(),
-                        }
+                if zc {
+                    out.push(zc_read_head(slot.req_id, CODE_EVERSION_MISMATCH, &[]));
+                } else {
+                    out.push(
+                        Frame::response(
+                            slot.req_id,
+                            MSG_READ_BYTES,
+                            ReadBytesResp {
+                                code: CODE_EVERSION_MISMATCH,
+                                end: 0,
+                                payload: Bytes::new(),
+                            }
+                            .encode(),
+                        )
                         .encode(),
-                    )
-                    .encode(),
-                );
+                    );
+                }
                 continue;
             }
 
@@ -1604,26 +1670,39 @@ fn build_read_future(
             let f: &CompioFile = &*file_rc;
             let buf = vec![0u8; read_size as usize];
             let BufResult(result, buf) = f.read_exact_at(buf, read_offset).await;
-            let bytes = match result {
-                Ok(_) => Frame::response(
-                    slot.req_id,
-                    MSG_READ_BYTES,
-                    ReadBytesResp {
-                        code: CODE_OK,
-                        end,
-                        payload: Bytes::from(buf),
+            match result {
+                Ok(_) => {
+                    if zc {
+                        // 2 Bytes: [header+zc_meta], [value]. The value aliases
+                        // the pread buffer — no ReadBytesResp/Frame encode copy.
+                        let value = Bytes::from(buf);
+                        out.push(zc_read_head(slot.req_id, CODE_OK, &value));
+                        out.push(value);
+                    } else {
+                        out.push(
+                            Frame::response(
+                                slot.req_id,
+                                MSG_READ_BYTES,
+                                ReadBytesResp { code: CODE_OK, end, payload: Bytes::from(buf) }
+                                    .encode(),
+                            )
+                            .encode(),
+                        );
                     }
-                    .encode(),
-                )
-                .encode(),
-                Err(e) => err_bytes(
-                    slot.req_id,
-                    MSG_READ_BYTES,
-                    StatusCode::Internal,
-                    &e.to_string(),
-                ),
-            };
-            out.push(bytes);
+                }
+                Err(e) => {
+                    if zc {
+                        out.push(zc_read_head(slot.req_id, CODE_ERROR, &[]));
+                    } else {
+                        out.push(err_bytes(
+                            slot.req_id,
+                            MSG_READ_BYTES,
+                            StatusCode::Internal,
+                            &e.to_string(),
+                        ));
+                    }
+                }
+            }
         }
         out
     })
