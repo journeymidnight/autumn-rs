@@ -158,10 +158,18 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
             message: "key not found".to_string(),
             value: vec![],
         })),
+        // `value.into()` (NOT `to_vec()`): bytes' `From<Bytes> for Vec<u8>`
+        // RECLAIMS the underlying Vec with no copy when this `Bytes` uniquely
+        // owns a Vec-backed buffer — which is the copy-path case
+        // (`read_value_from_log` → `Bytes::from(data)` on TCP / non-pooled VP
+        // reads). `to_vec()` always copied, which regressed the generic large
+        // read by one full value memcpy after R4 made `resolve_value` return
+        // `Bytes` (caught by the perf baseline: TCP 8M read −25%). The rkyv
+        // encode below still copies once (unavoidable for the wire archive).
         GetOutcome::Value(value) => Ok(partition_rpc::rkyv_encode(&GetResp {
             code: CODE_OK,
             message: String::new(),
-            value: value.to_vec(),
+            value: value.into(),
         })),
     }
 }
