@@ -68,10 +68,13 @@ Main gaps (NOT done — next session):
      replicated, single-chunk, non-EC case (EC / chunked / failover-exhaust
      fall back to the untouched copy path); resolve_value returns the
      PooledBuf; handle_get_zc sends it to the client (no first-cut concat).
-  2. python/src/lib.rs BatchClient (#12 python): register the sglang host
-     pool ONCE at construction; replace copy_nonoverlapping with get_into
-     (read) and use put_zc with a Bytes aliasing the pool (write). Needs a
-     maturin rebuild + sglang env (deferred).
+  2. (DONE 2026-05-21) python BatchClient(zc=True): writes→put_zc, reads→
+     get_into into the pinned page; set_transport("ucx") raises RLIMIT_MEMLOCK;
+     adapter opt-in extra_config["zc"]; bench_zc.py A/B (256K write 1.13×/read
+     1.08×; 1M write 1.15-1.25×/read parity — transport ~2× write diluted by
+     Python/dispatch overhead). NOT YET: register sglang pool once for memh
+     reads (low value, reads parity); harden deep UCX multi-worker (high
+     workers×partitions collapses).
   3. PS->client first-cut concat copy in handle_get_zc -> vectored (Phase 2
      polish), once resolve_value returns a PooledBuf the value can be
      emitted as an aliasing Bytes (no concat).

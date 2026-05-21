@@ -3072,8 +3072,14 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
     makes it zero-copy). Low priority.
   - PS→client first-cut concat copy in `handle_get_zc` → vectored (emit the
     PooledBuf value as an aliasing Bytes) — paired with the PS←EN hop.
-  - python `BatchClient`: register the sglang host pool once + `get_into` /
-    `put_zc` (needs maturin rebuild + sglang env).
+  - (DONE 2026-05-21) python `BatchClient(zc=True)`: writes→put_zc, reads→
+    get_into into the pinned page; `set_transport("ucx")` raises RLIMIT_MEMLOCK;
+    adapter opt-in `extra_config["zc"]`; `bench_zc.py` A/B. Measured modest win
+    (256K write 1.13× read 1.08×; 1M write 1.15-1.25× read parity) — transport
+    ~2× write win diluted by Python/dispatch/routing overhead (RPC-bound, not
+    copy-bound, intra-host). NOT YET: register the sglang host pool once for
+    memh reads (reads parity so low value intra-host) + harden deep UCX
+    multi-worker (high workers×partitions collapses).
 - **Acceptance:**
   - `cargo build --workspace` clean with AND without `--features ucx`.
   - Single-conn read (256 KB): zero-copy value byte-identical to `get`,
