@@ -80,31 +80,60 @@ start_proc() {
     save_pid "$name" $!
 }
 
+# True iff $1 is a live, schedulable process — alive AND not a zombie.
+#
+# A daemon that cluster.sh backgrounds outlives the launching script: once
+# `do_start` exits, the daemon reparents to pid 1. In a normal host pid 1
+# (systemd/init) reaps it on exit. In a container whose pid 1 is NOT a
+# reaper (here pid 1 is literally `sleep`), an exited daemon becomes an
+# unwaitable ZOMBIE (`STAT Z`): the PID slot lingers forever holding only
+# the exit status — all real resources (memory, sockets, ports) are already
+# released. Crucially `kill -0 <zombie>` still SUCCEEDS and `kill -9` is a
+# no-op, so the pre-fix `while kill -0` loop below would burn its full 60s
+# SIGKILL deadline on every orphaned corpse (UCX daemons hit this constantly
+# — they exit/crash more readily and nothing reaps them → "stop hangs").
+# Treat state Z as "gone" so stop is instant against corpses while still
+# giving a genuinely-alive PS its 60s graceful-drain window.
+proc_alive() {
+    local pid="$1"
+    kill -0 "$pid" 2>/dev/null || return 1
+    local st; st="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    [[ "$st" == Z* ]] && return 1
+    return 0
+}
+
 kill_proc() {
     local name="$1"
     local pf; pf="$(pid_file "$name")"
     if [[ -f "$pf" ]]; then
         local pid; pid="$(cat "$pf")"
-        if kill -0 "$pid" 2>/dev/null; then
+        if proc_alive "$pid"; then
             kill "$pid" 2>/dev/null || true
             # F120-C: wait up to 60s for process to exit gracefully — autumn-ps
             # now drains active+imm to row_stream on SIGTERM (PartitionServer::
             # shutdown), which can take seconds per partition with EC bulk
             # uploads. SIGKILL if still stuck after the deadline (replay on
-            # restart covers any unflushed data).
+            # restart covers any unflushed data). The loop breaks the instant
+            # the process exits — including when it exits into an unreaped
+            # zombie (proc_alive returns false on Z), so a daemon that drained
+            # in 1ms doesn't cost 60s just because pid 1 won't bury the corpse.
             # NOTE: use pre-increment `((++i))` — `((i++))` returns the OLD value,
             # which is 0 on the first iteration and trips `set -e`.
             local i=0
-            while kill -0 "$pid" 2>/dev/null && (( i < 600 )); do
+            while proc_alive "$pid" && (( i < 600 )); do
                 sleep 0.1
                 (( ++i ))
             done
-            if kill -0 "$pid" 2>/dev/null; then
+            if proc_alive "$pid"; then
                 echo "[cluster] $name (pid $pid) did not exit within 60s; SIGKILL"
                 kill -9 "$pid" 2>/dev/null || true
                 sleep 0.2
             fi
             echo "[cluster] stopped $name (pid $pid)"
+        elif kill -0 "$pid" 2>/dev/null; then
+            # Corpse: real process already dead, just not reaped (non-reaping
+            # pid 1). Its ports/sockets are free, so a fresh start can rebind.
+            echo "[cluster] $name (pid $pid) already exited (unreaped zombie — pid 1 is not a reaper)"
         fi
         rm -f "$pf"
     fi
@@ -116,6 +145,7 @@ wait_port() {
     # 127.0.0.1 only — pass that explicitly when waiting for it.
     local host="${4:-${BIND_HOST//[\[\]]/}}"
     echo -n "[cluster] waiting for $name on :$port (host=$host)..."
+    sleep 3
     if [[ "$TRANSPORT" == "ucx" ]]; then
         local log=""
         local pattern=""
