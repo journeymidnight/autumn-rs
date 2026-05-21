@@ -388,14 +388,16 @@ registered dest with no intermediate copies across all three tiers
 (`EN → PS → client`). The seam is `resolve_value`/`read_value_from_log`
 (`background.rs`) returning **`Bytes`**, not `Vec<u8>`:
 
-- **VP value over UCX**: `read_value_from_log` calls
-  `StreamClient::read_value_into_pooled` (R3), which recvs the value straight
-  into a registered `RegPool` `PooledBuf` (EN emits `[zc_meta][value]` as 2
-  `Bytes`, value aliases the EN pread buffer — no encode copy). The PS then
-  hands the value onward as `Bytes::from_owner(pb)` (R4) — the value `Bytes`
-  ALIASES the pool buffer; the buffer returns to the pool when that `Bytes`
-  drops (after the client write completes). Falls back to the
-  `read_bytes_from_extent` copy path for non-UCX / EC / chunked / stale-eversion.
+- **VP value (UCX + TCP, F219)**: `read_value_from_log` calls
+  `StreamClient::read_value_into_pooled`, which recvs the value straight into a
+  `RegPool` `PooledBuf` (EN emits `[zc_meta][value]` as 2 `Bytes`, value aliases
+  the EN pread buffer — no encode copy). **UCX** recvs into a *registered* buffer
+  (RDMA); **TCP** (F219, gate relaxed from UCX-only) recvs via a compio owned
+  read (`read_exact_into_pooled`) — only the kernel copy, no FrameDecoder copy.
+  The PS hands the value onward as `Bytes::from_owner(pb)` (the value `Bytes`
+  ALIASES the pool buffer; returns to the pool when that `Bytes` drops after the
+  client write completes). Falls back to the `read_bytes_from_extent` copy path
+  for EC / chunked / stale-eversion / length==0. No value crc is verified (F219).
 - **inline value**: `resolve_value` returns a zero-copy `raw_value.slice(..)`
   of the memtable `Bytes`.
 - **`handle_get_zc`** (`rpc_handlers.rs`) returns the response as TWO segments
@@ -424,34 +426,44 @@ that OWNS the `PooledBuf` (returns it to the pool on cancel — never leaks); se
 
 Symmetric to the read path, on the WRITE recv side. `drain_zc_writes` (lib.rs)
 runs in the ps-conn read loop right after `decoder.feed`, BEFORE the normal
-decode: if the FRONT frame is a UCX `MSG_PUT_ZC` whose value is
+decode: if the FRONT frame is a `MSG_PUT_ZC` whose value is
 `≥ AUTUMN_PS_ZC_RECV_MIN_BYTES` (64 KiB), it recvs the value straight into a
-registered `PooledBuf` via `ReadHalf::recv_into(dest, reg)` instead of letting
-`FrameDecoder` accumulate (and copy) the whole value. Mechanics:
+`PooledBuf` instead of letting `FrameDecoder` accumulate (and copy) the whole
+value. **Both transports (F219)**: UCX recvs into a *registered* buffer via
+`ReadHalf::recv_into(dest, reg)` (RDMA, no off-wire copy); TCP recvs via
+`ReadHalf::read_exact_into_pooled` (a compio *owned* read — only the unavoidable
+kernel→userspace copy, no FrameDecoder copy). Mechanics:
 
 - `peek_header` + `peek_payload` (new on `FrameDecoder`) read the frame header
   and the `[part_id][..][key_len][key]` meta WITHOUT consuming, to locate the
-  value boundary. Gated on `reader.is_ucx()` (TCP keeps the proven decode path),
-  `part_id == owner_part` (mis-routed → normal path synths NotFound), and the
-  size band `[64 KiB, AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT]`.
+  value boundary. Gated on `part_id == owner_part` (mis-routed → normal path
+  synths NotFound) and the size band `[64 KiB,
+  AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT]`.
 - It then `consume`s the header+meta+key, `drain_into`s any buffered value
-  prefix into the `PooledBuf`, and `recv_into`s the remainder. The **V1 payload
-  CRC** (over `meta‖key‖value`) is validated via `compute_payload_crc([meta_key,
-  value])` against the wire trailer (keeps the F165 guarantee).
+  prefix into the `PooledBuf`, and recvs the remainder (UCX `recv_into` / TCP
+  `read_exact_into_pooled`). **F219 removed the per-value CRC**: the V1 frame-crc
+  trailer is still consumed off the wire (stream alignment) but no longer
+  validated — value integrity is the transport's job (UCX NIC ICRC / TCP kernel
+  segment checksum). Normal (non-ZC) frames keep their V1 frame-CRC (F165).
 - The value rides onward as `Bytes::from_owner(pb)` (aliases the pool buffer, no
   copy) via a NEW `PartitionRequest.zc_value: Option<Bytes>` field; `payload`
   carries only `[meta][key]`. `enqueue_put_zc` uses `zc_value` directly when
   present (else slices from `payload` as before). The value never gets the
   off-wire / decoder-accumulation copy; the PS→EN `append_batch` send is already
-  rcache-zero-copy from the registered buffer.
-- Cancel-safe: `drain_zc_writes` owns the `PooledBuf` across the recv; on conn
-  error / task drop, `recv_into`'s `InflightSlot` drains UCX before the buffer
-  returns to the pool. The d=1 fast path is skipped when `drain_zc_writes`
-  queued a reply (`inflight.is_empty()` guard) to keep in-order replies.
-- `PS_ZC_WRITE_RECV_HITS` counts engagements; logged once on first engage.
+  rcache-zero-copy (UCX) / Arc-Bytes (TCP) from the pool buffer.
+- Cancel-safe on both transports: `drain_zc_writes` owns the `PooledBuf` across
+  the recv. UCX → `recv_into`'s `InflightSlot` drains the NIC on drop; TCP →
+  compio retains the owned buffer until the read CQE lands. Either way the buffer
+  returns to the pool, never freed-under-the-kernel. The d=1 fast path is skipped
+  when `drain_zc_writes` queued a reply (`inflight.is_empty()` guard) to keep
+  in-order replies.
+- `PS_ZC_WRITE_RECV_HITS` counts engagements; logged once on first engage
+  (`transport="ucx(registered)"` / `"tcp(pooled)"`).
 
-Small writes (< 64 KiB) and TCP keep the unchanged FrameDecoder path — the only
-added cost there is one `peek_header` + a size-check branch per frame.
+Small writes (< 64 KiB) keep the unchanged FrameDecoder path on both transports
+— the only added cost there is one `peek_header` + a size-check branch per frame.
+On TCP, only callers that send `MSG_PUT_ZC` engage this (perf-check + `put-zc`
+CLI, for values ≥ 64 KiB); regular `MSG_PUT` writes are unaffected.
 
 ## Flush Pipeline (F088: cross-thread hand-off)
 

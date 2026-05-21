@@ -89,17 +89,24 @@ Error responses encode status as: `[status_code: u8][message bytes]`.
   payload, dest: *mut u8, dest_cap, reg: Option<&RegisteredMem>) -> DestMeta`
   reads the response value straight into `dest` with no intermediate Vec:
   - Wire: a **V0** response frame whose payload is `[ZC meta][value]`, where
-    `encode_zc_meta(code, value) = [code:1][value_len:4 LE][crc32c:4 LE]`
-    (`ZC_META_LEN = 9`). `DestMeta { code, value_len }` is returned to the
-    caller; `value` lands in `dest[..value_len]`.
+    `encode_zc_meta(code, value) = [code:1][value_len:4 LE][reserved:4 LE]`
+    (`ZC_META_LEN = 9`). The 3rd field was the value crc32c; **F219 removed the
+    ZC value crc** (it cost a full crc32c pass per value and duplicated the
+    transport's own integrity), so the field is now reserved/0 — the 9-byte
+    layout is kept for wire-compat. `DestMeta { code, value_len }` is returned to
+    the caller; `value` lands in `dest[..value_len]`.
   - `read_loop` dual-path on the matching `req_id`: **UCX** → `peek_header`
     + `drain_into` the buffered meta prefix out of the `FrameDecoder`, then
     `ReadHalf::recv_into(&mut dest[filled..], reg)` for the value remainder
-    (memh RDMA when `reg=Some`); **TCP / non-UCX** → normal `try_decode` then
-    `finish_into_dest_from_frame` (memcpy `payload[9..]` into dest). Both
-    verify `crc32c(dest) == meta.crc` (keeps the F165 corruption guarantee).
-    All other msg_types go through the untouched `Pending::Frame` path →
-    **TCP fully compatible, no regression**.
+    (memh RDMA when `reg=Some`); **TCP / non-UCX** `call_into_dest` → normal
+    `try_decode` then `finish_into_dest_from_frame` (memcpy `payload[9..]` into
+    dest). **`call_into_pooled` on TCP (F219)** instead recvs the value (≥ 64 KiB,
+    `TCP_RECV_INTO_POOLED_MIN_BYTES`) straight into the read_loop-owned `PooledBuf`
+    via `ReadHalf::read_exact_into_pooled` (a compio owned read) — no FrameDecoder
+    accumulation copy. No value crc is verified anywhere (F219); integrity is the
+    transport's (UCX NIC ICRC / TCP kernel checksum). Normal (non-ZC) frames keep
+    their V1 frame-CRC (F165). All other msg_types go through the untouched
+    `Pending::Frame` path → **TCP fully compatible, no regression**.
   - `RegisteredMem` is re-exported from `autumn-transport` (uninhabited stub on
     non-ucx builds, so `reg` is always `None` there and the code compiles
     uniformly).

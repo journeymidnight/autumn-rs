@@ -1,62 +1,65 @@
 Date: 2026-05-21
 TaskStatus: completed
-Task scope: F216-E W1 — PS write-recv zero-copy. Recv LARGE MSG_PUT_ZC values
-            straight into a registered PooledBuf on the PS (UCX RDMA, no
-            off-wire copy) instead of FrameDecoder-accumulating them. Size-gated
-            (the user's "transport auto-selects ZC by size" direction, applied
-            to the write recv).
+Task scope: F219 — TCP recv-side copy elimination (read + write), reusing the
+            regpool + size threshold from F216-E, PLUS removal of the ZC-path
+            value CRC from the PS hot path (per user: "把 PS 里面 hot path 的
+            CRC 全部删除，不要 enable 啥的"). User ask: "复用 regpool+threshold
+            让 tcp 也尽量 zero copy".
 
 Current summary:
-  DONE + verified. `drain_zc_writes` (lib.rs) runs in the ps-conn read loop
-  right after decoder.feed, before normal decode:
-    - If the FRONT frame is a UCX MSG_PUT_ZC with value >=
-      AUTUMN_PS_ZC_RECV_MIN_BYTES (64 KiB) and <= the inline cap, and
-      part_id == owner_part: peek_header + peek_payload (new FrameDecoder
-      helpers) locate the value boundary WITHOUT consuming; consume header+
-      meta+key; drain buffered value prefix into a PooledBuf; recv_into the
-      remainder (registered RDMA on UCX). V1 payload CRC validated over
-      meta||key||value via compute_payload_crc.
-    - Value rides onward as Bytes::from_owner(pb) via a NEW
-      PartitionRequest.zc_value: Option<Bytes>; payload carries only
-      [meta][key]. enqueue_put_zc uses zc_value directly when present (no
-      concat-back copy), else slices from payload as before.
-    - Gated on reader.is_ucx() (TCP unchanged); small writes (< 64 KiB) keep
-      the FrameDecoder path (only added cost there: one peek_header + branch).
-    - d=1 fast path skipped when drain_zc_writes queued a reply
-      (inflight.is_empty() guard) to preserve in-order replies.
-    - Cancel-safe: drain_zc_writes owns the PooledBuf across the recv; on conn
-      error / task drop, recv_into's InflightSlot drains UCX before the buffer
-      returns to the pool (no leak — same rule as the read path).
-    - PS_ZC_WRITE_RECV_HITS counts engagements; logged once on first engage.
+  DONE + verified end-to-end on a live 1-node TCP cluster.
 
-  Why W1 only (not W2/EN-recv): W2 is structurally limited — EN uses buffered
-  pwrite (no O_DIRECT), so recv-into-registered only saves one memcpy and breaks
-  the EN batch-pwritev model. True NIC->disk DMA needs O_DIRECT + io_uring
-  registered buffers (3FS model), a bigger change. PS-recv (W1) is clean: large
-  value -> registered buffer -> forwarded to EN (send already rcache-ZC), value
-  never enters memtable (only the VP does).
+  Both recv loops now recv large values straight into a PooledBuf on TCP via a
+  compio OWNED read (no FrameDecoder accumulation copy; only the unavoidable
+  kernel→userspace copy remains). TCP can't be true zero-copy, so the goal is
+  "single-copy". Send side was already vectored/zero-copy on both transports.
+
+  1. New primitive `ReadHalf::read_exact_into_pooled(pb, filled, target)`
+     (crates/transport/src/lib.rs): fills pb[filled..target] via
+     `pb.slice(filled..target)` + compio `read_exact`, returns the buffer.
+     Cancel-safe (compio retains the owned buffer until the read CQE lands).
+     UCX errors (callers gate on !is_ucx and use recv_into there).
+
+  2. READ (PS←EN VP value): rpc read_loop IntoPooled gains a TCP branch
+     (value ≥ TCP_RECV_INTO_POOLED_MIN_BYTES = 64 KiB) that drains the buffered
+     prefix then read_exact_into_pooled the rest. `StreamClient::read_value_into_pooled`
+     UCX-only gate relaxed → TCP regular `get` of a VP value now routes through
+     MSG_READ_BYTES_ZC (EN side already pooled + value-separable → also delivers
+     F216-F's EN-send win for free; F216-F subsumed).
+
+  3. WRITE (PS←client large MSG_PUT_ZC): drain_zc_writes `!is_ucx` early-return
+     removed; TCP branch recvs the value via read_exact_into_pooled. perf-check +
+     `put-zc` CLI send MSG_PUT_ZC on TCP only for values ≥ 64 KiB (small writes
+     stay regular MSG_PUT — 4 KiB hot path is QPS-critical, no copy win there).
+
+  4. CRC removed from the PS hot path, NO toggle: encode_zc_meta writes 0 in the
+     crc field (kills EN read-resp + PS get-resp crc passes); read_crc_ok +
+     VERIFY_READ_CRC + set_verify_read_crc deleted (kills PS←EN + client←PS
+     verify); drain_zc_writes consumes the V1 trailer for stream alignment but no
+     longer validates it. 9-byte zc_meta layout unchanged (field reserved/0 →
+     wire-compatible). Normal non-ZC frames keep their V1 frame-CRC (F165).
+     Value integrity now left to the transport (UCX NIC ICRC / TCP kernel cksum).
 
 Verification:
-  - Builds clean WITH and WITHOUT `ucx` (partition-server, autumn-server).
-    Unit tests: partition 146, rpc 15 (incl the new FrameDecoder peek_payload).
-  - Live UCX cluster (rc_mlx5), put-zc roundtrip byte-identical: 256K, 8M
-    (both >= 64K -> W1 ZC-recv), 1000B (< 64K -> normal path); interop
-    put-zc -> normal get (8M) MATCH. ps.log confirms
-    "PS write-recv ZC engaged (MSG_PUT_ZC recv into registered buffer)
-     value_len=262144" — the path actually fired, CRC validated (no mismatch),
-    no panic/eof, PS alive.
-  - Write smoke (P=1 d8 t8 UCX): 4K write 58 MB/s, 8M write 345 MB/s — no
-    cliff; large writes flow through W1 ZC-recv.
+  - Builds clean WITH and WITHOUT --features ucx (rpc, partition-server, server).
+  - Unit: rpc 16 (incl new call_into_pooled_tcp_large_value_recv_into_pooled),
+    partition-server 146, stream 56 — all green.
+  - Live 1-node TCP cluster: put-zc 8 MiB → get + zc-get round-trip
+    byte-identical (sha256 match). ps.log: "PS write-recv ZC engaged …
+    transport=\"tcp(pooled)\" value_len=8388608", no panic / no crc mismatch.
+  - perf-check 8M TCP runs "[ZC: MSG_PUT_ZC; read regular]" end-to-end, no crash
+    (P=1 smoke only — NOT a perf claim; real A/B needs P>=8 matrix).
 
-Main gaps (lower priority, next sessions):
-  1. W2 (EN write-recv ZC) — needs O_DIRECT + io_uring registered buffers to be
-     worthwhile (3FS model). Structural, deferred.
-  2. The "let UCX auto-select ZC on recv" experiment (drop explicit memh, lean
-     on rcache + buffer reuse → could remove the app-level size thresholds).
-  3. Register the sglang host pool once for memh reads (production regpool
-     replacement on the real kvcache path).
-  4. Deep UCX multi-worker / DC scaling.
+Main gaps / next steps (lower priority):
+  1. Proper P>=8 perf A/B (8M intra-host TCP read+write) vs parent commit to
+     quantify the win + refresh perf_baseline.json.
+  2. client←PS read (get_into/call_into_dest) TCP recv-into-dest deferred
+     (cancel-safety needs read_loop-owns-buffer variant; production read = UCX,
+     and regular TCP get already benefits via the PS←EN change).
+  3. Client send-side V1 frame-crc for put_zc still computed on TCP — drop by
+     sending put_zc as V0 on TCP (separate wire decision).
+  4. regpool_acquire still calls ibv_reg_mr on ucx-feature builds even under TCP
+     transport (wasteful but correct; reg unused for TCP). Could skip when
+     transport != UCX at runtime.
 
-Previous tasks (completed 2026-05-21): F216-E R4 (fully zero-copy
-  EN->PS->client read, commit dcf9c18); "ucx => zerocopy" default + --zc flag
-  removal with size-guarded reads (commit 8e3636a).
+Previous task (completed 2026-05-21): F216-E W1 PS write-recv ZC (UCX).

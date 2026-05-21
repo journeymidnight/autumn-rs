@@ -1444,6 +1444,44 @@ Writes win at every size (drop 3 client copies + rkyv encode). Reads win big at
 large sizes (the R4 fully-zero-copy read path) but regress at 4 KiB, hence the
 size guard. (`--zc` is kept as a warn-once no-op so old scripts don't break.)
 
+### F219 — TCP recv-side single-copy (read + write) + ZC-CRC removal
+
+F216-E made the **UCX** recv paths zero-copy. F219 does the analogous thing on
+**TCP**: the two server recv loops recv a large value straight into a pooled
+buffer via a compio *owned* read, skipping the `FrameDecoder` accumulation copy.
+TCP can't be true zero-copy (the kernel socket copy is mandatory) — the goal is
+**single-copy** (kill the extra app-level copy):
+
+- **Read (PS←EN VP value):** regular `get` of a value > 4 KiB (a VP in
+  `log_stream`) now routes through `MSG_READ_BYTES_ZC` on TCP too —
+  `read_value_into_pooled` → `call_into_pooled` recvs the value into a
+  `PooledBuf` (`ReadHalf::read_exact_into_pooled`). The EN response is already
+  pooled + value-separable, so the EN send side also drops its per-op alloc /
+  zeroing / encode copy (this subsumes the old F216-F item).
+- **Write (PS←client large `MSG_PUT_ZC`):** `drain_zc_writes` recvs values
+  ≥ 64 KiB into a `PooledBuf` on TCP (no decoder copy). `perf-check` and the
+  `put-zc` CLI send `MSG_PUT_ZC` on TCP for values ≥ 64 KiB; **small writes
+  (4 KiB) stay regular `MSG_PUT`** — a vectored put_zc gives no copy win at that
+  size and the 4 KiB path is QPS-critical.
+- **ZC value CRC removed (no toggle):** the per-value crc32c on the ZC path
+  (compute on send + verify on recv = two full passes over every value) is gone.
+  Value integrity is left to the transport (UCX NIC ICRC / TCP kernel segment
+  checksum). **Normal (non-ZC) RPC frames keep their V1 frame-CRC** — only the
+  ZC-read/write value crc is removed.
+
+Manual verification (TCP, single-copy recv + CRC-off round-trip is byte-exact):
+
+```bash
+./cluster.sh reset 1
+head -c 8388608 /dev/urandom > /tmp/v.bin                  # 8 MiB -> VP/log_stream
+AC="./target/release/autumn-client --manager 127.0.0.1:9001 --transport tcp"
+$AC put-zc k /tmp/v.bin                                     # TCP write -> drain_zc_writes recv-into-pooled
+$AC get   k > /tmp/g.bin                                    # TCP read  -> read_value_into_pooled (PS<-EN)
+$AC zc-get k > /tmp/z.bin                                   # client<-PS ZC read framing
+cmp /tmp/v.bin /tmp/g.bin && cmp /tmp/v.bin /tmp/z.bin && echo "F219 TCP round-trip == original"
+grep "write-recv ZC engaged" /tmp/autumn-rs-logs/ps.log     # expect transport="tcp(pooled)"
+```
+
 ## Tests
 
 ```bash

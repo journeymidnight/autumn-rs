@@ -51,49 +51,42 @@ use crate::frame::{Frame, FrameDecoder};
 /// Length of the zero-copy value-response meta prefix.
 pub const ZC_META_LEN: usize = 9;
 
+/// F219 — minimum value size at which the **TCP** `call_into_pooled` read path
+/// recvs the value straight into a `PooledBuf` (compio owned read) instead of
+/// letting the `FrameDecoder` accumulate it then copying into the pool buffer.
+/// Below this the FrameDecoder path is cheaper (it batch-decodes multiple small
+/// frames per socket read and a small value's whole payload is usually already
+/// buffered, so recv-into-pooled would only add a pool acquire + an extra
+/// syscall). Mirrors the UCX read threshold (`UCX_ZC_READ_MIN_BYTES`); TCP
+/// can't be true zero-copy (the kernel copy is unavoidable) but this removes the
+/// extra app-level copy for large values.
+pub const TCP_RECV_INTO_POOLED_MIN_BYTES: usize = 64 * 1024;
+
 /// Build the ZC meta prefix for `value`. Returns `[code][value_len][crc32c]`.
+///
+/// F219: the `crc32c` field is now always `0`. The per-value ZC crc on the hot
+/// path (compute on send + verify on recv = two full crc32c passes over every
+/// value) was removed — it cost ~20% of a core at 8 MiB and duplicated the
+/// integrity already provided by the transport (UCX NIC ICRC / TCP kernel
+/// segment checksum). The 9-byte layout is kept (wire-compatible) so the field
+/// is reserved/zero rather than dropped. Normal RPC frames keep their V1
+/// frame-CRC (F165) — only the ZC-read value crc is gone.
 pub fn encode_zc_meta(code: u8, value: &[u8]) -> [u8; ZC_META_LEN] {
     let mut m = [0u8; ZC_META_LEN];
     m[0] = code;
     m[1..5].copy_from_slice(&(value.len() as u32).to_le_bytes());
-    m[5..9].copy_from_slice(&crc32c::crc32c(value).to_le_bytes());
+    // m[5..9] left zero — ZC value crc removed (F219).
     m
 }
 
-/// Parse a ZC meta prefix → `(code, value_len, value_crc32c)`.
+/// Parse a ZC meta prefix → `(code, value_len, reserved)`. The third field
+/// (formerly the value crc32c) is reserved/zero since F219.
 fn parse_zc_meta(b: &[u8]) -> (u8, u32, u32) {
     (
         b[0],
         u32::from_le_bytes(b[1..5].try_into().unwrap()),
         u32::from_le_bytes(b[5..9].try_into().unwrap()),
     )
-}
-
-/// F216-E read-path CRC toggle. The value crc32c verify on the ZC read path
-/// (`call_into_pooled` / `call_into_dest`, both TCP and UCX) costs a full
-/// crc32c pass over every value (~20% of one core at 8 MiB). On RDMA the NIC's
-/// hardware ICRC already guards the wire, and at-rest data is covered by scrub,
-/// so operators can disable this per-op verify. Default ON (keeps the F165
-/// guarantee); flip via [`set_verify_read_crc`].
-static VERIFY_READ_CRC: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-
-/// Enable/disable the read-path value crc32c verify (see [`VERIFY_READ_CRC`]).
-pub fn set_verify_read_crc(on: bool) {
-    VERIFY_READ_CRC.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Verify `dest` against `crc` iff the read-path CRC is enabled. Returns
-/// `(ok, computed)`; when disabled it skips the crc32c pass entirely and
-/// reports `(true, crc)`.
-#[inline]
-fn read_crc_ok(dest: &[u8], crc: u32) -> (bool, u32) {
-    if VERIFY_READ_CRC.load(std::sync::atomic::Ordering::Relaxed) {
-        let c = crc32c::crc32c(dest);
-        (c == crc, c)
-    } else {
-        (true, crc)
-    }
 }
 
 /// Result of a `call_into_dest`: the value bytes are already in the caller's
@@ -683,7 +676,7 @@ async fn read_loop(
                 let mut meta = [0u8; ZC_META_LEN];
                 let got = decoder.drain_into(&mut meta);
                 debug_assert_eq!(got, ZC_META_LEN);
-                let (code, _m_vlen, crc) = parse_zc_meta(&meta);
+                let (code, _m_vlen, _crc) = parse_zc_meta(&meta);
                 let value_len = payload_len as usize - ZC_META_LEN;
                 if value_len > into.dest_cap {
                     let _ = into.meta_tx.send(Err(RpcError::status(
@@ -720,14 +713,9 @@ async fn read_loop(
                         }
                     }
                 }
-                let (ok, computed) = read_crc_ok(dest, crc);
-                let _ = if ok {
-                    into.meta_tx.send(Ok(DestMeta { code, value_len }))
-                } else {
-                    into.meta_tx.send(Err(RpcError::Frame(
-                        crate::frame::FrameError::CrcMismatch { stored: crc, computed },
-                    )))
-                };
+                // F219: ZC value crc removed — value integrity is the transport's
+                // job (UCX ICRC / TCP kernel checksum).
+                let _ = into.meta_tx.send(Ok(DestMeta { code, value_len }));
                 continue;
             }
 
@@ -761,7 +749,7 @@ async fn read_loop(
                 decoder.consume(crate::frame::HEADER_LEN);
                 let mut meta = [0u8; ZC_META_LEN];
                 let _ = decoder.drain_into(&mut meta);
-                let (code, _m_vlen, crc) = parse_zc_meta(&meta);
+                let (code, _m_vlen, _crc) = parse_zc_meta(&meta);
                 let value_len = payload_len as usize - ZC_META_LEN;
                 // READ_LOOP acquires + owns the buffer. On caller-cancel the
                 // send below fails and `pb` drops → pool (no leak); the buffer
@@ -787,16 +775,54 @@ async fn read_loop(
                     let _ = tx.send(Err(e));
                     return Err(RpcError::ConnectionClosed);
                 }
-                let (ok, computed) = read_crc_ok(dest, crc);
                 let _ = drop((dest, reg)); // end the borrow of pb before moving it
-                if ok {
-                    let _ = tx.send(Ok((pb, code)));
-                } else {
-                    let _ = tx.send(Err(RpcError::Frame(
-                        crate::frame::FrameError::CrcMismatch { stored: crc, computed },
-                    )));
-                }
+                // F219: ZC value crc removed (transport integrity covers it).
+                let _ = tx.send(Ok((pb, code)));
                 continue;
+            }
+
+            // ── call_into_pooled on TCP: recv the large value straight into a
+            //    read_loop-owned PooledBuf (compio owned read), skipping the
+            //    FrameDecoder accumulation + finish_into_pooled_from_frame copy.
+            //    Only the kernel→userspace copy remains (TCP can't be true ZC).
+            //    Small values (< threshold) fall through to the normal decode
+            //    path — finish_into_pooled_from_frame still serves them. ──
+            if is_pooled && !reader.is_ucx() {
+                let value_len = (payload_len as usize).saturating_sub(ZC_META_LEN);
+                if (payload_len as usize) >= ZC_META_LEN
+                    && value_len >= TCP_RECV_INTO_POOLED_MIN_BYTES
+                {
+                    // Need header + meta buffered to parse the meta prefix.
+                    if decoder.buffered_len() < crate::frame::HEADER_LEN + ZC_META_LEN {
+                        break; // wait for the next read to accumulate the meta
+                    }
+                    let Some(Pending::IntoPooled(tx)) = pending.borrow_mut().remove(&req_id)
+                    else {
+                        unreachable!("is_pooled checked above");
+                    };
+                    decoder.consume(crate::frame::HEADER_LEN);
+                    let mut meta = [0u8; ZC_META_LEN];
+                    let _ = decoder.drain_into(&mut meta);
+                    let (code, _m_vlen, _crc) = parse_zc_meta(&meta);
+                    // READ_LOOP owns the buffer (cancel-safe). Drain the buffered
+                    // value prefix, then recv the remainder off the wire.
+                    let mut pb = autumn_transport::regpool_acquire(value_len);
+                    let filled = {
+                        let (dest, _reg) = pb.dest_and_reg();
+                        decoder.drain_into(dest)
+                    };
+                    match reader.read_exact_into_pooled(pb, filled, value_len).await {
+                        Ok(p) => pb = p,
+                        Err(e) => {
+                            let _ = tx.send(Err(e.into()));
+                            return Err(RpcError::ConnectionClosed);
+                        }
+                    }
+                    // F219: ZC value crc removed (transport integrity covers it).
+                    let _ = tx.send(Ok((pb, code)));
+                    continue;
+                }
+                // else: small value → normal decode path below.
             }
 
             // ── normal path: full frame decode ──
@@ -841,7 +867,7 @@ fn finish_into_dest_from_frame(into: IntoDest, payload: &[u8]) {
         )));
         return;
     }
-    let (code, _m_vlen, crc) = parse_zc_meta(&payload[..ZC_META_LEN]);
+    let (code, _m_vlen, _crc) = parse_zc_meta(&payload[..ZC_META_LEN]);
     let value = &payload[ZC_META_LEN..];
     if value.len() > into.dest_cap {
         let _ = into.meta_tx.send(Err(RpcError::status(
@@ -853,14 +879,8 @@ fn finish_into_dest_from_frame(into: IntoDest, payload: &[u8]) {
     // SAFETY: caller holds the dest buffer alive until meta_tx fires.
     let dest = unsafe { std::slice::from_raw_parts_mut(into.dest, value.len()) };
     dest.copy_from_slice(value);
-    let (ok, computed) = read_crc_ok(dest, crc);
-    let _ = if ok {
-        into.meta_tx.send(Ok(DestMeta { code, value_len: value.len() }))
-    } else {
-        into.meta_tx.send(Err(RpcError::Frame(
-            crate::frame::FrameError::CrcMismatch { stored: crc, computed },
-        )))
-    };
+    // F219: ZC value crc removed (transport integrity covers it).
+    let _ = into.meta_tx.send(Ok(DestMeta { code, value_len: value.len() }));
 }
 
 /// Complete a `call_into_pooled` from a fully-decoded value frame (TCP /
@@ -878,21 +898,15 @@ fn finish_into_pooled_from_frame(
         )));
         return;
     }
-    let (code, _m_vlen, crc) = parse_zc_meta(&payload[..ZC_META_LEN]);
+    let (code, _m_vlen, _crc) = parse_zc_meta(&payload[..ZC_META_LEN]);
     let value = &payload[ZC_META_LEN..];
     let mut pb = autumn_transport::regpool_acquire(value.len());
-    let (ok, computed) = {
+    {
         let (dest, _reg) = pb.dest_and_reg();
         dest.copy_from_slice(value);
-        read_crc_ok(dest, crc)
-    };
-    let _ = if ok {
-        tx.send(Ok((pb, code)))
-    } else {
-        tx.send(Err(RpcError::Frame(
-            crate::frame::FrameError::CrcMismatch { stored: crc, computed },
-        )))
-    };
+    }
+    // F219: ZC value crc removed (transport integrity covers it).
+    let _ = tx.send(Ok((pb, code)));
 }
 
 // ── F121 tests ─────────────────────────────────────────────────────────
@@ -1044,6 +1058,52 @@ mod tests {
             .expect("call_into_pooled");
         assert_eq!(code, 0);
         assert_eq!(pb.filled(), &value[..], "value bytes landed in the pool buffer");
+        srv.join().expect("server thread");
+    }
+
+    /// F219 — `call_into_pooled` over TCP with a value ABOVE
+    /// `TCP_RECV_INTO_POOLED_MIN_BYTES` engages the new read_loop recv-into-pooled
+    /// branch: the value is recv'd straight into the PooledBuf via a compio owned
+    /// read (`read_exact_into_pooled`), skipping the FrameDecoder accumulation +
+    /// finish_into_pooled_from_frame copy. A 256 KiB value forces multiple socket
+    /// reads (64 KiB read_loop scratch), exercising drain-prefix + read-remainder.
+    #[compio::test]
+    async fn call_into_pooled_tcp_large_value_recv_into_pooled() {
+        use std::io::{Read, Write};
+        let _ = autumn_transport::current_or_init(); // TCP
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+        let n = 256 * 1024usize; // > 64 KiB threshold; spans many read_loop reads
+        let value: Vec<u8> = (0..n).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
+        let value_srv = value.clone();
+
+        let srv = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut hdr = [0u8; 10];
+            sock.read_exact(&mut hdr).expect("read req hdr");
+            let req_id = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+            let plen = u32::from_le_bytes(hdr[6..10].try_into().unwrap()) as usize;
+            let mut req_payload = vec![0u8; plen];
+            sock.read_exact(&mut req_payload).expect("read req payload");
+            let meta = encode_zc_meta(0 /*OK*/, &value_srv);
+            let mut payload = Vec::with_capacity(meta.len() + value_srv.len());
+            payload.extend_from_slice(&meta);
+            payload.extend_from_slice(&value_srv);
+            // V0 frame: payload = [ZC meta][value] (mirrors zc_read_head / ps_zc_head).
+            let bytes = Frame::response(req_id, 15, Bytes::from(payload)).encode_v0();
+            sock.write_all(&bytes).expect("write resp");
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        let client = RpcClient::connect(server_addr).await.expect("connect");
+        let (pb, code) = client
+            .call_into_pooled(15, Bytes::from_static(b"req"))
+            .await
+            .expect("call_into_pooled");
+        assert_eq!(code, 0);
+        assert_eq!(pb.len(), n, "full value length");
+        assert_eq!(pb.filled(), &value[..], "large value bytes landed in the pool buffer");
         srv.join().expect("server thread");
     }
 }

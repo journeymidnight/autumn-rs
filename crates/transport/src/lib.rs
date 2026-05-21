@@ -482,10 +482,52 @@ impl ReadHalf {
                 let _ = (buf, reg);
                 Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "recv_into is UCX-only; TCP uses the read_loop decode+memcpy path",
+                    "recv_into is UCX-only; TCP uses read_exact_into_pooled / decode+memcpy",
                 ))
             }
         }
+    }
+
+    /// F219 — TCP recv the remaining `[filled..target]` bytes of a value
+    /// straight into a `PooledBuf` via compio owned reads, eliminating the
+    /// FrameDecoder accumulation copy (only the unavoidable kernel→userspace
+    /// copy remains). The counterpart to UCX's `recv_into` on the recv-side
+    /// zero-copy paths (PS←EN read = `call_into_pooled`, PS←client write =
+    /// `drain_zc_writes`). Reads exactly `target - filled` bytes; returns the
+    /// filled buffer.
+    ///
+    /// Cancel-safe: the caller (a read_loop / ps-conn task) OWNS `pb` across the
+    /// await, and compio retains the owned buffer until the in-flight read CQE
+    /// lands even if the task is dropped — so `pb` returns to the pool on cancel,
+    /// never a freed buffer the kernel is still writing into. This is the same
+    /// rule as the UCX recv path, just via compio's owned-buffer semantics
+    /// instead of UCX's `InflightSlot` drain.
+    ///
+    /// UCX errors (callers gate on `!is_ucx()` and use `recv_into` there).
+    pub async fn read_exact_into_pooled(
+        &mut self,
+        pb: crate::PooledBuf,
+        filled: usize,
+        target: usize,
+    ) -> io::Result<crate::PooledBuf> {
+        debug_assert!(filled <= target && target <= pb.len());
+        if self.is_ucx() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "read_exact_into_pooled is TCP-only; UCX uses recv_into",
+            ));
+        }
+        if filled >= target {
+            return Ok(pb);
+        }
+        use compio::buf::{IntoInner, IoBuf};
+        use compio::io::AsyncReadExt;
+        // `read_exact` fills the slice's `buf_capacity()` (= target - filled)
+        // bytes, writing into the underlying pool memory at `[filled..target]`.
+        let slice = pb.slice(filled..target);
+        let compio::BufResult(r, slice) = self.read_exact(slice).await;
+        r?;
+        Ok(slice.into_inner())
     }
 }
 

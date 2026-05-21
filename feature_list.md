@@ -3222,6 +3222,68 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   - `cargo test -p autumn-stream / -p autumn-rpc / -p autumn-partition-server`
     green; UCX path unaffected.
 - **passes:** false
+- **Note (F219):** F216-F's recv-side claim ("TCP recv is also unavoidably
+  copy-bound … FrameDecoder accumulate") is **superseded** — F219 eliminates the
+  FrameDecoder-accumulate copy on TCP recv via recv-into-PooledBuf. The EN
+  send-side win F216-F describes is delivered for free by F219's read change
+  (TCP routed through `MSG_READ_BYTES_ZC`, whose EN path is already pooled +
+  value-separable). F216-F can be closed as subsumed.
+
+### F219 · TCP recv-side copy elimination (read + write) — recv into PooledBuf, drop ZC value CRC
+- **Status:** **completed** 2026-05-21. Implements the user's "复用 regpool +
+  threshold 让 TCP 也尽量 zero copy" for the two server recv loops, plus removal of
+  the ZC-path value CRC from the PS hot path.
+- **Context / motivation:** F216-E made the **UCX** read+write recv paths
+  zero-copy (recv into a registered `PooledBuf`). On **TCP** the same recv loops
+  still let `FrameDecoder` accumulate the whole value (an app-level memcpy on top
+  of the unavoidable kernel→userspace copy), and `drain_zc_writes` early-returned
+  for `!is_ucx`. TCP can't be *true* zero-copy (no RDMA; the kernel socket copy is
+  mandatory), but the extra app-level copies CAN be removed → "single-copy".
+- **Scope (both recv sides; the recv loops are where the avoidable copies live —
+  send side is already vectored/zero-copy on both transports):**
+  1. **Read recv (PS←EN VP value):** `ReadHalf::read_exact_into_pooled`
+     (`crates/transport`) recvs the value remainder straight into a `PooledBuf`
+     via a compio owned read (`pb.slice(filled..target)` + `read_exact`). The rpc
+     `read_loop` `IntoPooled` branch uses it on TCP for values ≥
+     `TCP_RECV_INTO_POOLED_MIN_BYTES` (64 KiB); below that the proven decode path
+     (`finish_into_pooled_from_frame`) serves. `StreamClient::read_value_into_pooled`
+     UCX-only gate relaxed to allow TCP, so regular `get` of a VP value routes
+     through `MSG_READ_BYTES_ZC` (EN side already pooled + value-separable →
+     subsumes F216-F).
+  2. **Write recv (PS←client large `MSG_PUT_ZC`):** `drain_zc_writes`'s
+     `!is_ucx` early-return removed; the TCP branch recvs the value via
+     `read_exact_into_pooled` (no FrameDecoder accumulation). perf-check + the
+     `put-zc` CLI send `MSG_PUT_ZC` on TCP for values ≥ 64 KiB (small writes stay
+     regular `MSG_PUT` — at 4 KiB a vectored put_zc has no copy win and the hot
+     path is QPS-critical).
+  3. **CRC removal (per user "把 PS 里面 hot path 的 CRC 全部删除，不要 enable 啥的"):**
+     the per-value ZC CRC (compute on send + verify on recv = two full crc32c
+     passes over every value, ~20% of a core at 8 MiB) is **deleted, no toggle**.
+     `encode_zc_meta` writes `0` in the crc field (kills sender passes: EN
+     read-resp + PS get-resp); `read_crc_ok` + `VERIFY_READ_CRC` removed (kills
+     verify on PS←EN and client←PS); `drain_zc_writes` consumes the V1 frame-crc
+     trailer for stream alignment but no longer validates it. Value integrity is
+     left to the transport (UCX NIC ICRC / TCP kernel segment checksum). The
+     **9-byte `zc_meta` layout is unchanged** (field reserved/0 → wire-compatible)
+     and **normal (non-ZC) RPC frames keep their V1 frame-CRC (F165)**.
+- **Cancel-safety:** both recv loops OWN the `PooledBuf` across the await; compio
+  retains the owned buffer until the in-flight read CQE lands even on task drop →
+  buffer returns to the pool, never freed-under-the-kernel. Same guarantee as the
+  UCX `recv_into` path.
+- **Acceptance (met):**
+  - `cargo build --workspace` clean WITH and WITHOUT `--features ucx`.
+  - `cargo test -p autumn-rpc` (16, incl. new `call_into_pooled_tcp_large_value_recv_into_pooled`),
+    `-p autumn-partition-server` (146), `-p autumn-stream` (56) green.
+  - Live 1-node **TCP** cluster: `put-zc` (8 MiB) → `get` + `zc-get` round-trip
+    byte-identical (sha256 match); PS log `PS write-recv ZC engaged …
+    transport="tcp(pooled)" value_len=8388608`, no panic/crc-mismatch.
+  - perf-check 8M TCP runs `[ZC: MSG_PUT_ZC; read regular]` end-to-end, no crash.
+- **Deferred:** client←PS read (`get_into`/`call_into_dest`) TCP recv-into-dest
+  (cancel-safety needs the read_loop-owns-buffer variant, not raw caller ptr);
+  the production read path is UCX, and regular TCP `get` already benefits via the
+  PS←EN change. Client send-side V1 frame-crc for `put_zc` still computed (drop it
+  by sending put_zc V0 on TCP — separate wire decision).
+- **passes:** true
 
 ### F217 (SUPERSEDED) · autumn-kvcache Phase 2 — UCX one-sided RDMA + peer DRAM share
 - **Status:** **superseded** 2026-05-19 by F216's final architecture (Python-adapter-only, partition handles all cross-node sharing). See `docs/autumn_kvcache_plan.md` §3.2 ("不做哪些事 / design rationale") and the [[project_autumn_kvcache_architecture]] memory.

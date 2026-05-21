@@ -198,10 +198,9 @@ fn main() {
         _ => TransportKind::Tcp,
     };
     autumn_transport::init_with(transport);
-    let nocrc = std::env::var("AUTUMN_PSREAD_NOCRC").is_ok();
-    if nocrc {
-        autumn_rpc::client::set_verify_read_crc(false);
-    }
+    // F219: the ZC value crc on the hot path was removed entirely (no toggle).
+    // AUTUMN_PSREAD_NOCRC is now a no-op kept for script back-compat.
+    let _ = std::env::var("AUTUMN_PSREAD_NOCRC").is_ok();
 
     let bind: SocketAddr = std::env::var("AUTUMN_UCX_TEST_BIND")
         .unwrap_or_else(|_| "127.0.0.1:0".into())

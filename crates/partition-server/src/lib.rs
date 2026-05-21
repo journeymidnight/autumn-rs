@@ -443,8 +443,9 @@ pub(crate) const AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT: u32 = 64 * 1024 * 1024;
 /// off-wire copy) instead of letting the `FrameDecoder` accumulate it. Below
 /// this the per-op recv-into-registered overhead (regpool_acquire + memh +
 /// staged recv) exceeds the copy saved — same size-asymmetry as the read path's
-/// `UCX_ZC_READ_MIN_BYTES`. Only consulted on the UCX transport (`reader.is_ucx()`);
-/// TCP keeps the proven FrameDecoder path. 64 KiB matches the read threshold.
+/// `UCX_ZC_READ_MIN_BYTES`. Consulted on BOTH transports (F219): UCX recvs into a
+/// registered buffer, TCP into a pooled buffer via a compio owned read; below
+/// this both keep the proven FrameDecoder path. 64 KiB matches the read threshold.
 pub(crate) const AUTUMN_PS_ZC_RECV_MIN_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy)]
@@ -3161,24 +3162,30 @@ fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Option<Bytes>)) {
     }
 }
 
-/// F216-E (PS write-recv ZC, W1) — drain LARGE `MSG_PUT_ZC` frames at the FRONT
-/// of `decoder`, recv'ing each value straight into a registered `PooledBuf`
-/// (UCX RDMA, no off-wire copy) instead of letting `FrameDecoder` accumulate it
-/// (which would copy the whole value into the decoder buffer). Each is routed as
-/// a `PartitionRequest { payload = [meta][key], zc_value = Some(value) }` so
+/// F216-E W1 (UCX) + F219 (TCP) — drain LARGE `MSG_PUT_ZC` frames at the FRONT
+/// of `decoder`, recv'ing each value straight into a `PooledBuf` instead of
+/// letting `FrameDecoder` accumulate it (which would copy the whole value into
+/// the decoder buffer). On UCX the buffer is registered → RDMA recv, no off-wire
+/// copy; on TCP the value is recv'd via a compio owned read
+/// (`read_exact_into_pooled`) → only the unavoidable kernel→userspace copy
+/// remains (the app-level FrameDecoder copy is gone). Each is routed as a
+/// `PartitionRequest { payload = [meta][key], zc_value = Some(value) }` so
 /// `enqueue_put_zc` uses the value directly (no concat back). Returns as soon as
-/// the front frame is NOT an eligible large UCX `MSG_PUT_ZC` (the caller then
-/// runs the normal decode path on the remainder).
+/// the front frame is NOT an eligible large `MSG_PUT_ZC` (the caller then runs
+/// the normal decode path on the remainder).
 ///
-/// The V1 payload CRC (over `meta || key || value`) is validated incrementally:
-/// the small `[meta][key]` prefix is copied out, the value lands in the
-/// `PooledBuf`, and `compute_payload_crc([meta_key, value])` is checked against
-/// the wire trailer (keeps the F165 corruption guarantee end-to-end).
+/// F219: the per-value ZC crc on the hot path is removed (it cost a full crc32c
+/// pass over every large value — the same memory-bandwidth the copy-elimination
+/// recovers — and duplicated the transport's own integrity: UCX NIC ICRC / TCP
+/// kernel segment checksum). The MSG_PUT_ZC frame is still V1, so its 4-byte
+/// frame-crc trailer is CONSUMED off the wire (stream alignment) but no longer
+/// validated. Normal (non-ZC) RPC frames keep their V1 frame-CRC (F165).
 ///
-/// Cancel-safe: the `PooledBuf` is owned here for the whole recv; on connection
-/// error / task drop the `recv_into`'s `InflightSlot` drains UCX before the
-/// buffer drops back to the pool (no leak, no NIC-writes-to-freed-memory).
-/// UCX-only (gated on `reader.is_ucx()`); TCP keeps the proven decode path.
+/// Cancel-safe on both transports: the `PooledBuf` is owned here for the whole
+/// recv. On UCX, `recv_into`'s `InflightSlot` drains the NIC before the buffer
+/// drops back to the pool; on TCP, compio retains the owned buffer until the
+/// in-flight read CQE lands. Either way: no leak, no DMA/kernel-writes-to-freed.
+/// Small writes (< `AUTUMN_PS_ZC_RECV_MIN_BYTES`) keep the proven decode path.
 #[allow(clippy::too_many_arguments)]
 async fn drain_zc_writes(
     decoder: &mut FrameDecoder,
@@ -3190,10 +3197,10 @@ async fn drain_zc_writes(
     cap: usize,
 ) -> Result<()> {
     use futures::FutureExt;
-    // Only UCX benefits (registered RDMA recv); TCP recv_into is unsupported.
-    if !reader.is_ucx() {
-        return Ok(());
-    }
+    // F219: both transports recv the large value straight into a PooledBuf,
+    // skipping the FrameDecoder accumulation copy. UCX recvs into a *registered*
+    // buffer (RDMA, no off-wire copy); TCP recvs via a compio owned read (only
+    // the unavoidable kernel→userspace copy remains — no app-level copy).
     loop {
         let Some((req_id, msg_type, flags, payload_len)) = decoder.peek_header() else {
             return Ok(());
@@ -3248,13 +3255,18 @@ async fn drain_zc_writes(
             }
         }
 
-        // Commit: drop header + meta + key, recv the value into a registered buf.
+        // Commit: drop header + meta + key, recv the value into a pooled buf.
         decoder.consume(autumn_rpc::HEADER_LEN + value_offset);
         let mut pb = autumn_transport::regpool_acquire(value_len);
-        let mut filled;
-        {
+        // Drain any buffered value prefix into the pool buffer (no socket).
+        let filled = {
+            let (dest, _reg) = pb.dest_and_reg();
+            decoder.drain_into(dest)
+        };
+        if reader.is_ucx() {
+            // UCX: registered RDMA recv straight into the pinned buffer.
+            let mut filled = filled;
             let (dest, reg) = pb.dest_and_reg();
-            filled = decoder.drain_into(dest); // buffered value prefix (no socket)
             while filled < value_len {
                 let n = reader.recv_into(&mut dest[filled..], reg).await?;
                 if n == 0 {
@@ -3264,30 +3276,52 @@ async fn drain_zc_writes(
                 }
                 filled += n;
             }
+        } else {
+            // TCP: compio owned read straight into the pool buffer (no
+            // FrameDecoder accumulation copy).
+            pb = reader
+                .read_exact_into_pooled(pb, filled, value_len)
+                .await
+                .map_err(|e| anyhow!("eof/io mid MSG_PUT_ZC value (tcp zc-recv): {e}"))?;
         }
         let value = Bytes::from_owner(pb);
-        // Validate the V1 payload CRC over meta || key || value.
+        // F219: the ZC value crc on the hot path is removed. The MSG_PUT_ZC frame
+        // is still sent V1, so the 4-byte frame-crc trailer is on the wire — we
+        // CONSUME it to keep the byte stream aligned for the next frame, but no
+        // longer compute/compare it on the PS (value integrity is the
+        // transport's job: UCX NIC ICRC / TCP kernel segment checksum).
         if has_crc {
-            let mut crc_buf = [0u8; 4];
-            let mut got = decoder.drain_into(&mut crc_buf);
-            while got < 4 {
-                let n = reader.recv_into(&mut crc_buf[got..], None).await?;
-                if n == 0 {
-                    return Err(anyhow!("eof mid MSG_PUT_ZC crc"));
+            let mut trailer = [0u8; 4];
+            let got = decoder.drain_into(&mut trailer);
+            if got < 4 {
+                if reader.is_ucx() {
+                    let mut g = got;
+                    while g < 4 {
+                        let n = reader.recv_into(&mut trailer[g..], None).await?;
+                        if n == 0 {
+                            return Err(anyhow!("eof mid MSG_PUT_ZC crc trailer"));
+                        }
+                        g += n;
+                    }
+                } else {
+                    // TCP: the trailer follows the value on the socket (the value
+                    // recv read exactly value_len bytes).
+                    use compio::io::AsyncReadExt;
+                    let tail = vec![0u8; 4 - got];
+                    let compio::BufResult(r, tail) = reader.read_exact(tail).await;
+                    r.map_err(|e| anyhow!("eof mid MSG_PUT_ZC crc trailer (tcp): {e}"))?;
+                    let _ = tail; // discarded — PS no longer validates the crc
                 }
-                got += n;
             }
-            let want = autumn_rpc::frame::compute_payload_crc(&[meta_key.clone(), value.clone()]);
-            if crc_buf != want {
-                return Err(anyhow!("MSG_PUT_ZC crc mismatch (zc-recv)"));
-            }
+            let _ = &trailer; // discarded — PS no longer validates the crc
         }
 
         // Observability: count + log-once that the ZC write-recv path is live.
         if PS_ZC_WRITE_RECV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
             tracing::info!(
                 value_len,
-                "F216-E: PS write-recv ZC engaged (MSG_PUT_ZC recv into registered buffer)"
+                transport = if reader.is_ucx() { "ucx(registered)" } else { "tcp(pooled)" },
+                "PS write-recv ZC engaged (MSG_PUT_ZC recv into pooled buffer; F216-E UCX / F219 TCP)"
             );
         }
 
@@ -3690,11 +3724,12 @@ async fn handle_ps_connection(
                 PsReadBurst::Data { buf, n, mut reader } => {
                     decoder.feed(&buf[..n]);
 
-                    // F216-E W1: recv any LARGE MSG_PUT_ZC value(s) at the front
-                    // straight into a registered PooledBuf (no off-wire copy)
-                    // before the normal decode buffers them. UCX-only; no-op
-                    // otherwise. May push write replies onto `inflight`, which
-                    // disables the d=1 fast path below (guarded by is_empty()).
+                    // F216-E W1 / F219: recv any LARGE MSG_PUT_ZC value(s) at the
+                    // front straight into a PooledBuf (UCX registered RDMA / TCP
+                    // compio owned read — no FrameDecoder accumulation copy)
+                    // before the normal decode buffers them. May push write
+                    // replies onto `inflight`, which disables the d=1 fast path
+                    // below (guarded by is_empty()).
                     drain_zc_writes(
                         &mut decoder, &mut reader, &req_tx, owner_part,
                         &mut inflight, &mut tx_bufs, cap,
@@ -3846,8 +3881,8 @@ async fn handle_ps_connection(
                     PsReadBurst::Err { e, .. } => return Err(e.into()),
                     PsReadBurst::Data { buf, n, mut reader } => {
                         decoder.feed(&buf[..n]);
-                        // F216-E W1: recv large MSG_PUT_ZC values into registered
-                        // buffers first (UCX-only; no-op otherwise).
+                        // F216-E W1 / F219: recv large MSG_PUT_ZC values into
+                        // pooled buffers first (UCX registered / TCP owned read).
                         drain_zc_writes(
                             &mut decoder, &mut reader, &req_tx, owner_part,
                             &mut inflight, &mut tx_bufs, cap,

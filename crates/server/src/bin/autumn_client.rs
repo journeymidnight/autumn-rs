@@ -1407,12 +1407,18 @@ async fn main() -> Result<()> {
             // F216-E "ucx ⟹ zerocopy": writes always ZC on UCX (cheaper at every
             // size); reads ZC on UCX only when the value is big enough to repay
             // the registered-recv overhead (small reads regress — see
-            // UCX_ZC_READ_MIN_BYTES). On TCP both stay the regular path.
-            let zc_write = is_ucx;
+            // UCX_ZC_READ_MIN_BYTES).
+            // F219: on TCP, LARGE writes also go ZC (MSG_PUT_ZC) — the PS recvs
+            // the value straight into a pooled buffer (no decoder copy) and the
+            // client drops the rkyv encode. Small writes stay regular: at 4 KiB a
+            // vectored put_zc has no copy win and the hot path is QPS-critical.
+            // TCP reads need no flag here — regular `get` already routes VP-value
+            // reads through the PS←EN recv-into-pooled path (read_value_into_pooled).
+            let zc_write = is_ucx || value_size >= autumn_client::UCX_ZC_READ_MIN_BYTES;
             let zc_read = is_ucx && value_size >= autumn_client::UCX_ZC_READ_MIN_BYTES;
             let zc_tag = match (zc_write, zc_read) {
                 (true, true) => " [ZC: MSG_PUT_ZC + MSG_GET_ZC]",
-                (true, false) => " [ZC: MSG_PUT_ZC; read regular (value < ZC threshold)]",
+                (true, false) => " [ZC: MSG_PUT_ZC; read regular]",
                 _ => "",
             };
             // ---- Write phase ----

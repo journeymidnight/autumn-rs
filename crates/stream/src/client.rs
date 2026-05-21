@@ -2154,12 +2154,13 @@ impl StreamClient {
         unreachable!("read_bytes_from_extent: 2-attempt loop must terminate")
     }
 
-    /// F216-E zero-copy read fast path: recv the value straight into a
-    /// read_loop-owned registered `PooledBuf` (MSG_READ_BYTES_ZC +
-    /// call_into_pooled). Returns `Some((pb, len))` on a clean OK; returns
-    /// `Ok(None)` for ANYTHING the simple replicated path can't handle (non-UCX,
-    /// EC extent, length==0/unknown, multi-chunk, eversion-stale, non-OK code,
-    /// all replicas failed) so the caller falls back to the proven copy path
+    /// F216-E (UCX) / F219 (TCP) recv-side copy-elimination fast path: recv the
+    /// value straight into a read_loop-owned `PooledBuf` (MSG_READ_BYTES_ZC +
+    /// call_into_pooled). UCX → registered RDMA recv (zero-copy); TCP → compio
+    /// owned read (one kernel copy, no app-level copy). Returns `Some((pb, len))`
+    /// on a clean OK; returns `Ok(None)` for ANYTHING the simple replicated path
+    /// can't handle (EC extent, length==0/unknown, multi-chunk, eversion-stale,
+    /// non-OK code, all replicas failed) so the caller falls back to the copy path
     /// (`read_bytes_from_extent`, which owns eversion-retry / EC / chunking /
     /// failover). Cancel-safe: call_into_pooled keeps the buffer with the
     /// read_loop, so a timeout reclaims it (no leak).
@@ -2169,9 +2170,14 @@ impl StreamClient {
         offset: u32,
         length: u32,
     ) -> Result<Option<(autumn_rpc::PooledBuf, usize)>> {
-        if autumn_transport::current().kind() != autumn_transport::TransportKind::Ucx
-            || length == 0
-        {
+        // F219: both transports use this fast path now. UCX recvs the value into
+        // a *registered* buffer (RDMA, no off-wire copy); TCP recvs it into a
+        // pooled buffer via a compio owned read in the rpc read_loop (no
+        // FrameDecoder accumulation copy — only the unavoidable kernel copy).
+        // The EN `MSG_READ_BYTES_ZC` response is value-separable + pooled on both
+        // transports, so the EN send side also drops its per-op alloc/zeroing +
+        // encode copy (subsumes F216-F).
+        if length == 0 {
             return Ok(None);
         }
         let ex = self.fetch_extent_info(extent_id).await?;
