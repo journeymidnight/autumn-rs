@@ -327,6 +327,25 @@ fn main() -> Result<()> {
     let args = parse_args();
     let _ = autumn_transport::init_with(args.transport);
 
+    // F216-E: RDMA (UCX rc_mlx5) pins every registered send/recv buffer against
+    // RLIMIT_MEMLOCK via ibv_reg_mr. The default soft limit (often 8 MiB) faults
+    // libibverbs on large (e.g. 8 MiB) value transfers — raise to INFINITY,
+    // same as the PS. Harmless on TCP. Falls back to soft-up-to-hard.
+    #[cfg(unix)]
+    unsafe {
+        let inf = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        if libc::setrlimit(libc::RLIMIT_MEMLOCK, &inf) != 0 {
+            let mut ml = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut ml) == 0 && ml.rlim_cur < ml.rlim_max {
+                ml.rlim_cur = ml.rlim_max;
+                libc::setrlimit(libc::RLIMIT_MEMLOCK, &ml);
+            }
+        }
+    }
+
     // F214-D: verify every --data dir has a matching cluster_id
     // sentinel file before launching shard threads. The manager
     // cross-check happens inside the per-shard async block below

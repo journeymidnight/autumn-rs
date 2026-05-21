@@ -12,6 +12,18 @@
 
 set -euo pipefail
 
+# F216-E: RDMA (UCX rc_mlx5) pins every registered send/recv buffer against
+# RLIMIT_MEMLOCK via ibv_reg_mr. The default soft limit (often 8 MiB) faults
+# libibverbs on large (e.g. 8 MiB) value transfers — observed as a PS SIGSEGV
+# in ucp_stream_send_nbx -> rcache -> ibv_reg_mr_iova2 under concurrent 8 MiB
+# reads. Raise to unlimited here so every child (manager/extent-node/ps)
+# inherits it; raising the HARD limit needs CAP_SYS_RESOURCE which the binaries
+# don't have once launched, so it must happen in this launcher. Best-effort:
+# under an unprivileged shell this is a no-op and the binaries still raise the
+# soft limit up to the hard limit themselves. In production use a systemd unit
+# with `LimitMEMLOCK=infinity`.
+ulimit -l unlimited 2>/dev/null || true
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$SCRIPT_DIR/target/release"
 LOG_DIR="/tmp/autumn-rs-logs"

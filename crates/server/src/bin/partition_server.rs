@@ -544,6 +544,26 @@ async fn main() -> Result<()> {
             rl.rlim_cur = rl.rlim_max.min(65535);
             libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
         }
+        // F216-E: RDMA (UCX rc_mlx5) registers every send/recv buffer with the
+        // NIC via ibv_reg_mr, pinning pages against RLIMIT_MEMLOCK. The default
+        // soft limit (often 8 MiB) is far too small for large values — a single
+        // 8 MiB value send exceeds it and ibv_reg_mr FAULTS inside libibverbs
+        // (observed: PS SIGSEGV in ucp_stream_send_nbx -> rcache ->
+        // ibv_reg_mr_iova2 under concurrent 8 MiB reads; 4 KiB reads were fine).
+        // Raise to INFINITY — standard for RDMA daemons, sibling to the
+        // RLIMIT_NOFILE raise above. Harmless on TCP (nothing pins). Falls back
+        // to raising the soft limit up to the hard limit if INFINITY is refused.
+        let inf = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        if libc::setrlimit(libc::RLIMIT_MEMLOCK, &inf) != 0 {
+            let mut ml = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut ml) == 0 && ml.rlim_cur < ml.rlim_max {
+                ml.rlim_cur = ml.rlim_max;
+                libc::setrlimit(libc::RLIMIT_MEMLOCK, &ml);
+            }
+        }
     }
     let addr = autumn_transport::format_listen_addr(&args.bind_host, args.port)
         .context("parse listen address")?;
