@@ -97,6 +97,33 @@ impl ConnPool {
         }
     }
 
+    /// F216-E: send an RPC and recv the value response into a read_loop-owned
+    /// `PooledBuf` (cancel-safe — see RpcClient::call_into_pooled). Wraps the
+    /// timeout here; on expiry the inner future drops and the read_loop reclaims
+    /// the buffer (no leak). Returns `(filled PooledBuf, status code)`.
+    pub async fn call_into_pooled(
+        &self,
+        addr: &str,
+        msg_type: u8,
+        payload: Bytes,
+        timeout: Duration,
+    ) -> Result<(autumn_rpc::PooledBuf, u8)> {
+        let sock = parse_addr(addr)?;
+        let client = self.get_client(sock).await?;
+        let fut = client.call_into_pooled(msg_type, payload);
+        match compio::time::timeout(timeout, fut).await {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) => {
+                self.evict(sock);
+                Err(anyhow!("{}", e))
+            }
+            Err(_) => {
+                self.evict(sock);
+                Err(anyhow!("call_into_pooled timed out after {:?}", timeout))
+            }
+        }
+    }
+
     /// Send an RPC with payload already split into parts (zero-copy).
     pub async fn call_vectored(
         &self,

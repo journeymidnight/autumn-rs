@@ -12,7 +12,7 @@ use crate::extent_rpc::{
     AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, ProbeExtentReq,
     ProbeExtentResp, ReadBytesReq, ReadBytesResp, StreamInfo, SyncedLengthReq, SyncedLengthResp,
     CODE_EVERSION_MISMATCH, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK, MSG_APPEND,
-    MSG_COMMIT_LENGTH, MSG_PROBE_EXTENT, MSG_READ_BYTES, MSG_SYNCED_LENGTH,
+    MSG_COMMIT_LENGTH, MSG_PROBE_EXTENT, MSG_READ_BYTES, MSG_READ_BYTES_ZC, MSG_SYNCED_LENGTH,
 };
 
 /// Sentinel error attached to `anyhow::Error` when a `MSG_READ_BYTES`
@@ -2152,6 +2152,58 @@ impl StreamClient {
             }
         }
         unreachable!("read_bytes_from_extent: 2-attempt loop must terminate")
+    }
+
+    /// F216-E zero-copy read fast path: recv the value straight into a
+    /// read_loop-owned registered `PooledBuf` (MSG_READ_BYTES_ZC +
+    /// call_into_pooled). Returns `Some((pb, len))` on a clean OK; returns
+    /// `Ok(None)` for ANYTHING the simple replicated path can't handle (non-UCX,
+    /// EC extent, length==0/unknown, multi-chunk, eversion-stale, non-OK code,
+    /// all replicas failed) so the caller falls back to the proven copy path
+    /// (`read_bytes_from_extent`, which owns eversion-retry / EC / chunking /
+    /// failover). Cancel-safe: call_into_pooled keeps the buffer with the
+    /// read_loop, so a timeout reclaims it (no leak).
+    pub async fn read_value_into_pooled(
+        &self,
+        extent_id: u64,
+        offset: u32,
+        length: u32,
+    ) -> Result<Option<(autumn_rpc::PooledBuf, usize)>> {
+        if autumn_transport::current().kind() != autumn_transport::TransportKind::Ucx
+            || length == 0
+        {
+            return Ok(None);
+        }
+        let ex = self.fetch_extent_info(extent_id).await?;
+        // EC / chunked / stale-VP-offset → let the copy path handle it.
+        if ex.ec_converted
+            || length > self.config.read_chunk_bytes
+            || (ex.sealed_length > 0 && offset as u64 > ex.sealed_length)
+        {
+            return Ok(None);
+        }
+        let addrs = self.replica_addrs_for_extent(&ex).await?;
+        for addr in &addrs {
+            let req = ReadBytesReq { extent_id, eversion: ex.eversion, offset, length }.encode();
+            match self
+                .pool
+                .call_into_pooled(addr, MSG_READ_BYTES_ZC, req, Duration::from_secs(3))
+                .await
+            {
+                Ok((pb, code)) if code == CODE_OK => return Ok(Some((pb, length as usize))),
+                Ok((_pb, _code)) => {
+                    // eversion mismatch / EN-side error → bail to the copy path
+                    // (it refetches ExtentInfo + re-routes EC). pb drops → pool.
+                    self.extent_info_cache.remove(&extent_id);
+                    return Ok(None);
+                }
+                Err(_e) => {
+                    // transport/timeout error → evict + try next replica.
+                    self.extent_info_cache.remove(&extent_id);
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Branch on the (cached) extent layout: EC sub-range read for

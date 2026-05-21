@@ -2539,6 +2539,18 @@ pub(crate) async fn read_value_from_log(
         let len = if length == 0 { vp.len - off } else { length.min(vp.len - off) };
         (vp.offset + off, len)
     };
+    // F216-E R3: zero-copy fast path — recv the value straight into a registered
+    // RegPool buffer over UCX (MSG_READ_BYTES_ZC, removing the EN's encode
+    // copies + the off-wire copy). We still copy pb -> Vec here to keep
+    // resolve_value's `Vec` return (R4 will hand the PooledBuf onward to drop
+    // this last copy). Any non-OK / EC / chunked / non-UCX case returns None →
+    // the proven read_bytes_from_extent copy path below.
+    if let Ok(Some((pb, _n))) = stream_client
+        .read_value_into_pooled(vp.extent_id, read_off, read_len)
+        .await
+    {
+        return Ok(pb.filled().to_vec());
+    }
     let (data, _) = stream_client
         .read_bytes_from_extent(vp.extent_id, read_off, read_len)
         .await?;
