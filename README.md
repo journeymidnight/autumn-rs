@@ -1410,6 +1410,22 @@ Status: both client↔PS hops (read `get_into`/`zc-get` + write `put_zc`/`put-zc
 done + verified (TCP + UCX rc_mlx5). The internal PS↔EN hops and the python
 `BatchClient` wiring are tracked in `feature_list.md` F216-E ("Remaining").
 
+**A/B the ZC path vs the regular path** with `perf-check --zc` (write→`MSG_PUT_ZC`,
+read→`MSG_GET_ZC` into a registered RegPool dest; without `--zc` the regular
+`MSG_PUT`/`MSG_GET` path is unchanged):
+
+```bash
+AC="./target/release/autumn-client --manager [<roce-ip>]:9001 --transport ucx"
+$AC perf-check --partitions 8 --pipeline-depth 8 --threads 16 --size 8388608        # regular
+$AC perf-check --partitions 8 --pipeline-depth 8 --threads 16 --size 8388608 --zc   # zero-copy
+```
+
+Measured (1-replica P8 d8 t16 UCX rc_mlx5): **ZC write is ~2× faster** (4K +60%,
+8M +105% → 1180 MB/s) from dropping the 3 client-side value copies + rkyv encode;
+**ZC read is ~parity** intra-host (the recv copy isn't the bottleneck — copy-out
+already saturates; the read win is expected on cross-host RDMA). Recommendation:
+use ZC for writes on UCX; reads opportunistically.
+
 ## Tests
 
 ```bash

@@ -3044,6 +3044,17 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
     decode copy); `autumn-client put-zc` CLI (registers the source on ucx).
     Verified byte-identical round-trip (put-zc → get/zc-get) + put↔put-zc
     interop, TCP + UCX (rc_mlx5 on PS and EN).
+  - BENCH: `perf-check --zc` A/Bs ZC vs the regular path (write→MSG_PUT_ZC,
+    read→MSG_GET_ZC into a registered RegPool dest; regular path unchanged).
+    Measured 1-replica P8 d8 t16 UCX rc_mlx5: **ZC write ~2× faster** (4K +60%,
+    8M +105% → 1180 MB/s, from dropping 3 client copies + rkyv encode); **ZC read
+    ~parity** intra-host (recv copy not the bottleneck; copy-out already saturates
+    — real read win expected cross-host RDMA). → adopt ZC for writes; reads
+    opportunistically.
+  - FIX: PS + EN raise RLIMIT_MEMLOCK at startup (+ cluster.sh `ulimit -l
+    unlimited`). RDMA ibv_reg_mr pins pages against memlock; the default 8 MiB
+    SIGSEGV'd the PS on concurrent 8 MiB reads (rcache send registration). Latent
+    RDMA deployment gap exposed by the perf re-test; not ZC-specific.
 - **Remaining (both internal PS↔EN hops deferred for cancel-safety / scope):**
   - PS←EN READ hop: EN `MSG_READ_BYTES_ZC` (V0 2-Bytes `[zc_meta][value]`,
     removes the EN double value copy) + StreamClient read-into-pooled fast path
