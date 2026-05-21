@@ -10,10 +10,15 @@ use autumn_transport::TransportKind;
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// `_rjem_malloc_conf` (NOT `malloc_conf`): tikv-jemallocator 0.6 is `_rjem_`-
+// prefixed, so the old unprefixed symbol was a silent no-op. `oversize_threshold:0`
+// keeps large allocations in normal arenas (warm reuse) — see
+// crates/server/src/bin/extent_node.rs for the full F193/F216-E rationale.
+// Override at runtime via `_RJEM_MALLOC_CONF` (cluster.sh / prod launcher).
 #[cfg(target_os = "linux")]
 #[allow(non_upper_case_globals)]
-#[export_name = "malloc_conf"]
-pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8] = b"oversize_threshold:0\0";
 
 struct Args {
     port: u16,

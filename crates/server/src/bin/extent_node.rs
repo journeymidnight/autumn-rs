@@ -8,25 +8,36 @@ use autumn_rpc::manager_rpc::{
 use autumn_stream::{ExtentNode, ExtentNodeConfig};
 use autumn_transport::TransportKind;
 
-// F193 allocator hygiene. tikv-jemallocator's `dirty_decay_ms` /
-// `muzzy_decay_ms` knobs make the allocator MADV_FREE / MADV_DONTNEED
-// dirty pages back to the OS within ~1 s of becoming unused. Without
-// this, the peak working set during EC convert + copy_extent (~3 GiB
-// on a 3 GiB sealed extent at K=3, M=1) stays mapped indefinitely
-// after the spike, leaving the process RSS at the high-water mark
-// even when the live heap is back to a few hundred MB.
+// F193 allocator hygiene + F216-E read-perf fix. jemalloc (vs glibc) keeps the
+// EC-convert / copy_extent peak working set (~3 GiB on a 3 GiB sealed extent at
+// K=3, M=1) from sitting at the high-water RSS mark indefinitely — its decay
+// timers MADV_FREE idle pages back to the OS within seconds.
 //
-// MALLOC_CONF can be overridden at process launch time; the static
-// here is the default. Linux-only — the binary is a Linux-only
-// production target; macOS dev builds use the system allocator.
+// TWO load-bearing details:
+//   1. The config symbol jemalloc reads is `_rjem_malloc_conf`, NOT
+//      `malloc_conf`: tikv-jemallocator 0.6 builds jemalloc with the `_rjem_`
+//      prefix, so the earlier `#[export_name="malloc_conf"]` was a SILENT NO-OP
+//      (jemalloc never saw it; the `dirty_decay_ms:1000` it set never applied —
+//      the allocator ran on jemalloc's defaults the whole time).
+//   2. `oversize_threshold:0`: jemalloc 5.x's default oversize_threshold is
+//      8 MiB, so 8 MiB read/append buffers landed in the dedicated oversize
+//      arena that PURGES pages on free — every large read page-faulted cold
+//      pages (~2× slower; a TCP 8 MiB read regression bisected to F193).
+//      Threshold 0 routes them through normal arenas (warm dirty-page reuse,
+//      ~3.1 GB/s vs ~1.6) while decay still returns idle pages.
+//
+// RUNTIME-CONFIGURABLE: `_RJEM_MALLOC_CONF` (set by cluster.sh / the prod
+// launcher, like UCX_TLS) is read after this symbol and overrides/extends it
+// per deployment — e.g. `_RJEM_MALLOC_CONF=oversize_threshold:0,dirty_decay_ms:1000`
+// to also tighten the EC-spike decay. Linux-only (production target).
 #[cfg(target_os = "linux")]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[cfg(target_os = "linux")]
 #[allow(non_upper_case_globals)]
-#[export_name = "malloc_conf"]
-pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8] = b"oversize_threshold:0\0";
 
 struct Args {
     /// Primary (shard 0) listen port. Sibling shards use

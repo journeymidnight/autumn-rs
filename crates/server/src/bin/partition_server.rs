@@ -4,16 +4,28 @@ extern crate libc;
 use autumn_partition_server::PartitionServer;
 use autumn_transport::TransportKind;
 
-// F193 allocator hygiene — see crates/server/src/bin/extent_node.rs for
-// the rationale and the MALLOC_CONF tuning explanation.
+// F193 allocator hygiene + F216-E read-perf fix — see
+// crates/server/src/bin/extent_node.rs for the full rationale.
 #[cfg(target_os = "linux")]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// The config symbol jemalloc actually reads is `_rjem_malloc_conf`:
+// tikv-jemallocator 0.6 builds jemalloc with the `_rjem_` prefix, so the old
+// `#[export_name="malloc_conf"]` was a SILENT NO-OP (jemalloc never saw it; its
+// `dirty_decay_ms:1000` never applied). `oversize_threshold:0` is the load-
+// bearing setting: jemalloc 5.x's default oversize_threshold is 8 MiB, so 8 MiB
+// VP value reads landed in the dedicated oversize arena that PURGES pages on
+// free — every read then page-faulted cold pages (~2× slower; a TCP 8 MiB read
+// regression bisected to F193). Threshold 0 routes them through normal arenas
+// with warm dirty-page reuse (~3.1 GB/s vs ~1.6), while jemalloc's default
+// decay still returns idle pages (the RSS hygiene F193 wanted). RUNTIME-
+// CONFIGURABLE: `_RJEM_MALLOC_CONF` (set by cluster.sh / the prod launcher,
+// like UCX_TLS) is read after this symbol and overrides/extends it per deploy.
 #[cfg(target_os = "linux")]
 #[allow(non_upper_case_globals)]
-#[export_name = "malloc_conf"]
-pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8] = b"oversize_threshold:0\0";
 
 struct Args {
     port: u16,
