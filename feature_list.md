@@ -3018,38 +3018,51 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
     NO partition-layer bypass / no direct client->EN (preserves "partition is
     the only data plane" [[feedback_no_parallel_data_plane]] + avoids the
     VP-vs-GC race [[project_med2_known_bug]]).
-  - **READ path first**; WRITE + send-registration is Phase 2.
+  - **READ path first**, then the client↔PS WRITE hop (done 2026-05-21).
   - Single zero-copy mode (register + memh), not a dual register/copy toggle.
   - kvcache values are non-uniform in size; send memory must also be registered
     (Phase 2); EN is a first-class zero-copy tier.
 - **Goal / scope:** value flows recv-into-registered-dest + send-from-registered-
   src with no intermediate copies across all three tiers. UCX needs the dest
   registered (`ucp_mem_map`) AND the recv to pass `UCP_OP_ATTR_FIELD_MEMH`.
-- **Done (verified e2e — client <- PS hop):**
+- **Done (verified e2e — client←PS READ hop + client→PS WRITE hop):**
   - RegPool (`crates/transport/src/ucx/regpool.rs`); `ReadHalf::recv_into`
     seam (`crates/transport/src/lib.rs`); memh wiring in
     `ucx_recv`/`ucx_recv_raw` (`crates/transport/src/ucx/endpoint.rs`) — the
     pivotal fix (registration was a silent no-op pre-fix).
-  - `RpcClient::call_into_dest` + ZC frame meta `[code:1][value_len:4][crc32c:4]`
-    + frame header-only decode (`crates/rpc/src/{client,frame}.rs`), CRC
-    verified over dest.
-  - PS `handle_get_zc` / `MSG_GET_ZC = 0x50` (`crates/partition-server`);
-    `ClusterClient::get_into` (`crates/client`); `autumn-client zc-get`
-    verification CLI.
-- **Remaining:**
-  - PS <- EN hop: EN `MSG_READ_BYTES_ZC` (V0 2-Bytes `[zc_meta][value]`, removes
-    the EN double value copy) + StreamClient read-into-pooled fast path
+  - READ: `RpcClient::call_into_dest` + ZC frame meta
+    `[code:1][value_len:4][crc32c:4]` + frame header-only decode
+    (`crates/rpc/src/{client,frame}.rs`), CRC verified over dest. PS
+    `handle_get_zc` / `MSG_GET_ZC = 0x50` (`crates/partition-server`);
+    `ClusterClient::get_into` (`crates/client`); `autumn-client zc-get` CLI.
+  - WRITE: `MSG_PUT_ZC = 0x51` + binary meta codec
+    `[part_id][region_epoch][expires_at][key_len][key][value]`
+    (`crates/rpc/src/partition_rpc.rs`); `ClusterClient::put_zc(key, value:
+    Bytes)` sends `[meta, value]` via `call_vectored` (value = its own iovec,
+    0 client copies; zero-copy send via rcache when the source is registered);
+    PS `enqueue_put_zc` slices key+value zero-copy from the frame (vs rkyv
+    decode copy); `autumn-client put-zc` CLI (registers the source on ucx).
+    Verified byte-identical round-trip (put-zc → get/zc-get) + put↔put-zc
+    interop, TCP + UCX (rc_mlx5 on PS and EN).
+- **Remaining (both internal PS↔EN hops deferred for cancel-safety / scope):**
+  - PS←EN READ hop: EN `MSG_READ_BYTES_ZC` (V0 2-Bytes `[zc_meta][value]`,
+    removes the EN double value copy) + StreamClient read-into-pooled fast path
     (replicated / single-chunk / non-EC; EC+chunked+failover fall back to the
     untouched copy path) + `resolve_value` returns a PooledBuf. **Must use the
     read_loop-owns-PooledBuf handoff variant of call_into_dest — recv-into-
     caller-dest is NOT cancel-safe here because the EN read uses a 3 s timeout +
     replica failover (a dropped/timed-out call could leave the multiplexed
-    read_loop writing into a freed dest = UAF). The client <- PS hop is safe
-    because it has no timeout and the sglang page outlives the call.**
-  - PS->client first-cut concat copy in `handle_get_zc` -> vectored (emit the
-    PooledBuf value as an aliasing Bytes).
-  - python `BatchClient`: register the sglang host pool once + `get_into`
-    (needs maturin rebuild + sglang env).
+    read_loop writing into a freed dest = UAF). The client↔PS hops are safe
+    because they have no timeout and the source/dest outlives the call.**
+  - PS→EN WRITE hop: the value the PS received (a zero-copy Bytes slice of the
+    frame) is appended to log_stream via `append_batch` — already Arc-`Bytes`
+    end to end (`encode_v1_segments` keeps the same Arc), so no extra copy; only
+    explicit source registration on the PS→EN send would be new (rcache already
+    makes it zero-copy). Low priority.
+  - PS→client first-cut concat copy in `handle_get_zc` → vectored (emit the
+    PooledBuf value as an aliasing Bytes) — paired with the PS←EN hop.
+  - python `BatchClient`: register the sglang host pool once + `get_into` /
+    `put_zc` (needs maturin rebuild + sglang env).
 - **Acceptance:**
   - `cargo build --workspace` clean with AND without `--features ucx`.
   - Single-conn read (256 KB): zero-copy value byte-identical to `get`,
@@ -3057,10 +3070,11 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   - kvcache adapter batch-get cached-read MB/s improves vs the F216 baseline.
   - `cargo test -p autumn-rpc / -p autumn-transport / -p autumn-stream /
     -p autumn-partition-server` green; TCP perf-check stays green.
-- **passes (client <- PS hop):** true (2026-05-21; `zc-get` byte-identical to
-  `get`, TCP + UCX rc_mlx5, large/small/not-found; rpc+transport unit tests +
-  loopback_ucx 5/5 over RoCE).
-- **passes (full F216-E):** false (PS <- EN hop + python remaining).
+- **passes (client↔PS READ + WRITE hops):** true (2026-05-21; `zc-get`
+  byte-identical to `get`, `put-zc` byte-identical round-trip + interop, TCP +
+  UCX rc_mlx5, large/small/not-found; rpc 14 + partition-server 146 + transport
+  unit tests + loopback_ucx 5/5 over RoCE).
+- **passes (full F216-E):** false (internal PS↔EN hops + python remaining).
 
 ### F217 (SUPERSEDED) · autumn-kvcache Phase 2 — UCX one-sided RDMA + peer DRAM share
 - **Status:** **superseded** 2026-05-19 by F216's final architecture (Python-adapter-only, partition handles all cross-node sharing). See `docs/autumn_kvcache_plan.md` §3.2 ("不做哪些事 / design rationale") and the [[project_autumn_kvcache_architecture]] memory.

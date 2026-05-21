@@ -23,6 +23,14 @@ Main entry point. Connect via `ClusterClient::connect("addr1,addr2")`.
   RPC-retry shape as `call_ps_for_key`. Caller sizes `dest` (e.g. from `head`).
   No per-call timeout — `dest` MUST outlive the call (cancel-safety, see
   autumn-rpc CLAUDE `call_into_dest`).
+- `put_zc(key, value: Bytes)` — **F216-E zero-copy write.** Writes the value with
+  NO client-side copy via `MSG_PUT_ZC` + `RpcClient::call_vectored` (value sent as
+  its own iovec straight from `value`'s backing memory; on UCX zero-copy via
+  rcache when that memory is `ucp_mem_map`-registered — caller holds a
+  `RegisteredMem` and passes a `Bytes` aliasing the registered region). `put`
+  copies the value 3× (to_vec → clone → rkyv_encode); this copies 0. Same
+  routing + epoch-stale refresh + RPC-retry as `call_ps_for_key`; same inline-cap
+  rules as `put`. The PS slices key+value zero-copy from the frame.
 - `delete(key)` — delete a key
 - `head(key) → KeyMeta` — get metadata (found, value_length)
 - `range(prefix, start, limit) → RangeResult` — prefix scan

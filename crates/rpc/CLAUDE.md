@@ -111,6 +111,14 @@ Error responses encode status as: `[status_code: u8][message bytes]`.
     timeout / failover (e.g. PS←EN) must instead use the planned
     read_loop-owns-the-PooledBuf-and-hands-it-back variant — see
     `feature_list.md` F216-E "Remaining".
+  - **Write counterpart (`MSG_PUT_ZC`)** needs no new RPC primitive: the client
+    sends `[meta][value]` via the existing `call_vectored` (value = its own
+    iovec, zero-copy via rcache when its memory is registered; V1 frame CRC
+    covers `[meta||value]`). The value-separable framing lives in
+    `partition_rpc` (`encode/parse_put_zc_meta`); the PS slices the value
+    zero-copy out of the reassembled frame. So WRITE zero-copy is send-side
+    framing only; READ zero-copy needs `call_into_dest` because the value must
+    land in a specific caller dest.
 
 ### `server.rs`
 - `RpcServer::new(handler)`: create server with async handler `Fn(u8, Bytes) -> Result<Bytes, (StatusCode, String)>`

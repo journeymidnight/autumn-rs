@@ -6,12 +6,15 @@ Task scope: F216-E — UCX end-to-end zero-copy READ data path for the
             is Phase 2. Plan: /root/.claude/plans/flickering-sauteeing-pearl.md.
 
 Current summary:
-  The client <- PS hop is DONE and verified end-to-end on a live 1-node
-  cluster, both transports, byte-identical to the normal `get`:
-    - TCP: large(256K, VP/log_stream path) / small(inline) / not-found.
-    - UCX: same, with rc_mlx5 active in the PS log -> the registered
-      zero-copy receive (memh) path is genuinely exercised over RDMA;
-      the value CRC is verified over the registered dest.
+  BOTH client-facing hops are DONE and verified end-to-end on a live 1-node
+  cluster, both transports, byte-identical to the normal get/put:
+    - client←PS READ (get_into / MSG_GET_ZC): TCP + UCX(rc_mlx5),
+      large(256K VP/log_stream) / small(inline) / not-found; value CRC
+      verified over the registered dest (memh recv over RDMA).
+    - client→PS WRITE (put_zc / MSG_PUT_ZC, 2026-05-21): value sent as its
+      own iovec (0 client copies vs put's 3), sliced zero-copy on the PS;
+      verified byte-identical round-trip (put-zc → get/zc-get) + put↔put-zc
+      interop, TCP + UCX(rc_mlx5 on PS and EN = registered RDMA send).
 
   Primitives shipped (all unit-tested, build clean with AND without `ucx`):
     - RegPool (crates/transport/src/ucx/regpool.rs, 8464122): thread-local
@@ -39,6 +42,13 @@ Current summary:
       shape of call_ps_for_key; reg=Some -> RDMA into the registered dest.
     - autumn-client `zc-get <KEY>` verification CLI (28b4c64): heads the
       key, registers a dest (ucx build), get_into, stdout.
+    - WRITE hop (688d0b6): MSG_PUT_ZC=0x51 + binary meta codec
+      [part_id][region_epoch][expires_at][key_len][key][value]
+      (partition_rpc); ClusterClient::put_zc(key, value: Bytes) sends
+      [meta, value] via call_vectored (value = own iovec, 0 client copies;
+      zero-copy send via rcache when source registered); PS enqueue_put_zc
+      slices key+value zero-copy from the frame (vs rkyv decode copy);
+      autumn-client `put-zc <KEY> <FILE>` CLI (registers source on ucx).
 
 Main gaps (NOT done — next session):
   1. PS <- EN hop (#9/#10) — the EN->PS value copy is still present. Design
@@ -59,11 +69,17 @@ Main gaps (NOT done — next session):
      fall back to the untouched copy path); resolve_value returns the
      PooledBuf; handle_get_zc sends it to the client (no first-cut concat).
   2. python/src/lib.rs BatchClient (#12 python): register the sglang host
-     pool ONCE at construction, replace copy_nonoverlapping with get_into.
-     Needs a maturin rebuild + sglang env (deferred).
+     pool ONCE at construction; replace copy_nonoverlapping with get_into
+     (read) and use put_zc with a Bytes aliasing the pool (write). Needs a
+     maturin rebuild + sglang env (deferred).
   3. PS->client first-cut concat copy in handle_get_zc -> vectored (Phase 2
      polish), once resolve_value returns a PooledBuf the value can be
      emitted as an aliasing Bytes (no concat).
+  4. PS->EN WRITE hop: the value the PS received is already a zero-copy Bytes
+     slice of the frame and is appended to log_stream via append_batch, which
+     is Arc-Bytes end to end (encode_v1_segments keeps the same Arc) -> no
+     extra copy already. Only explicit source registration on the PS->EN send
+     would be new (rcache already makes it zero-copy). Low priority.
 
 Next steps:
   - Implement the read_loop-owns-PooledBuf handoff variant of call_into_dest
