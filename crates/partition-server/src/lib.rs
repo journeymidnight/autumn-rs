@@ -3162,19 +3162,34 @@ fn push_one_frame_to_inflight(
     // P-log runtime is single-threaded, so concurrent reads in this FU never
     // overlap a borrow with each other or with `partition_loop`'s writes
     // (`borrow_mut`). This keeps `partition_loop` focused on writes.
-    if msg_type == MSG_GET {
+    if msg_type == MSG_GET || msg_type == MSG_GET_ZC {
         if let Some(part) = part {
             let part_c = part.clone();
             let fut = async move {
-                let resp_frame = match crate::rpc_handlers::handle_get(payload, &part_c).await {
-                    Ok(p) => Frame::response(req_id, msg_type, p),
-                    Err((code, message)) => Frame::error(
-                        req_id,
-                        msg_type,
-                        autumn_rpc::RpcError::encode_status(code, &message),
-                    ),
-                };
-                resp_frame.encode()
+                if msg_type == MSG_GET_ZC {
+                    // F216: value-separable V0 frame so the client recvs the
+                    // value straight into its registered dest. handle_get_zc
+                    // never errors (status rides in the meta code).
+                    match crate::rpc_handlers::handle_get_zc(payload, &part_c).await {
+                        Ok(p) => Frame::response(req_id, msg_type, p).encode_v0(),
+                        Err((code, message)) => Frame::error(
+                            req_id,
+                            msg_type,
+                            autumn_rpc::RpcError::encode_status(code, &message),
+                        )
+                        .encode(),
+                    }
+                } else {
+                    match crate::rpc_handlers::handle_get(payload, &part_c).await {
+                        Ok(p) => Frame::response(req_id, msg_type, p).encode(),
+                        Err((code, message)) => Frame::error(
+                            req_id,
+                            msg_type,
+                            autumn_rpc::RpcError::encode_status(code, &message),
+                        )
+                        .encode(),
+                    }
+                }
             };
             inflight.push(fut.boxed_local());
             return;
@@ -3302,6 +3317,20 @@ async fn d1_fast_path_round_trip(
 
     // F216 (Option B): d=1 GET served locally too — same rationale as
     // push_one_frame_to_inflight. No req_tx hop / partition_loop detour.
+    if msg_type == MSG_GET_ZC {
+        if let Some(part) = part {
+            // Always V0 ZC framing (handle_get_zc never errors).
+            return match crate::rpc_handlers::handle_get_zc(payload, part).await {
+                Ok(p) => Frame::response(req_id, msg_type, p).encode_v0(),
+                Err((code, message)) => Frame::error(
+                    req_id,
+                    msg_type,
+                    autumn_rpc::RpcError::encode_status(code, &message),
+                )
+                .encode(),
+            };
+        }
+    }
     if msg_type == MSG_GET {
         if let Some(part) = part {
             return match crate::rpc_handlers::handle_get(payload, part).await {

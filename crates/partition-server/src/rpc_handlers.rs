@@ -141,7 +141,58 @@ pub(crate) async fn dispatch_partition_rpc(
     }
 }
 
+/// Outcome of the shared GET resolve core: the value bytes, or a not-found.
+pub(crate) enum GetOutcome {
+    NotFound,
+    Value(Vec<u8>),
+}
+
+/// rkyv-framed GET (generic SDK path).
 pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
+    match get_value(payload, part).await? {
+        GetOutcome::NotFound => Ok(partition_rpc::rkyv_encode(&GetResp {
+            code: CODE_NOT_FOUND,
+            message: "key not found".to_string(),
+            value: vec![],
+        })),
+        GetOutcome::Value(value) => Ok(partition_rpc::rkyv_encode(&GetResp {
+            code: CODE_OK,
+            message: String::new(),
+            value,
+        })),
+    }
+}
+
+/// F216 zero-copy GET (MSG_GET_ZC): value-separable payload
+/// `[ZC meta: code+value_len+value_crc32c][raw value]` so the client recvs the
+/// value straight into its registered dest. NOTE: this still concatenates meta
+/// + value once on the PS (first cut); the PS send becomes vectored (no concat)
+/// in a follow-up. The client receive is already zero-copy.
+pub(crate) async fn handle_get_zc(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
+    // ALL outcomes (incl errors) map to a V0 ZC response — a V1 error frame
+    // would corrupt the client's recv-into-dest parsing. The status rides in
+    // the meta `code`; the SDK's get_into maps non-OK codes to refresh/retry.
+    // StatusCode discriminants align with the partition CODE_* for the
+    // GET-relevant cases (InvalidArgument=2, FailedPrecondition=3, Internal=4).
+    let (code, value): (u8, Vec<u8>) = match get_value(payload, part).await {
+        Ok(GetOutcome::Value(v)) => (CODE_OK, v),
+        Ok(GetOutcome::NotFound) => (CODE_NOT_FOUND, Vec::new()),
+        Err((status, _msg)) => (status as u8, Vec::new()),
+    };
+    let meta = autumn_rpc::client::encode_zc_meta(code, &value);
+    let mut out = Vec::with_capacity(meta.len() + value.len());
+    out.extend_from_slice(&meta);
+    out.extend_from_slice(&value);
+    Ok(Bytes::from(out))
+}
+
+/// Shared GET resolve core: epoch/range check → memtable/imm/SST lookup →
+/// VP resolve (read_value_from_log). Used by both `handle_get` (rkyv) and
+/// `handle_get_zc` (value-separable). Carries the read metrics.
+async fn get_value(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> Result<GetOutcome, (StatusCode, String)> {
     let req: GetReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
     let lookup_t0 = Instant::now();
@@ -186,7 +237,7 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
                 m.ops += 1; m.lookup_ns += lookup_ns; m.not_found += 1;
                 m.maybe_report();
             });
-            return Ok(partition_rpc::rkyv_encode(&GetResp { code: CODE_NOT_FOUND, message: "key not found".to_string(), value: vec![] }));
+            return Ok(GetOutcome::NotFound);
         }
     };
     if op == 2 || (expires_at > 0 && expires_at <= now_secs()) {
@@ -195,7 +246,7 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
             m.ops += 1; m.lookup_ns += lookup_ns; m.not_found += 1;
             m.maybe_report();
         });
-        return Ok(partition_rpc::rkyv_encode(&GetResp { code: CODE_NOT_FOUND, message: "key not found".to_string(), value: vec![] }));
+        return Ok(GetOutcome::NotFound);
     }
 
     let sc = p.stream_client.clone();
@@ -221,11 +272,7 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
                     m.ops += 1; m.lookup_ns += lookup_ns; m.not_found += 1;
                     m.maybe_report();
                 });
-                return Ok(partition_rpc::rkyv_encode(&GetResp {
-                    code: CODE_NOT_FOUND,
-                    message: "extent reclaimed by GC".to_string(),
-                    value: vec![],
-                }));
+                return Ok(GetOutcome::NotFound);
             }
         }
     } else {
@@ -240,15 +287,10 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
     let vp_resolve_ns = if is_vp { vp_t0.elapsed().as_nanos() as u64 } else { 0 };
     // _vp_pin guard drops here, releasing the pin.
 
-    let encode_t0 = Instant::now();
-    let resp = partition_rpc::rkyv_encode(&GetResp { code: CODE_OK, message: String::new(), value });
-    let encode_ns = encode_t0.elapsed().as_nanos() as u64;
-
     READ_METRICS.with(|m| {
         let mut m = m.borrow_mut();
         m.ops += 1;
         m.lookup_ns += lookup_ns;
-        m.encode_ns += encode_ns;
         if is_vp {
             m.vp_resolve_ns += vp_resolve_ns;
             m.vp_resolve_count += 1;
@@ -262,7 +304,7 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
         m.maybe_report();
     });
 
-    Ok(resp)
+    Ok(GetOutcome::Value(value))
 }
 
 pub(crate) async fn handle_head(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
