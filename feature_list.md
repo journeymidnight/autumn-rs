@@ -3080,6 +3080,19 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
     copy-bound, intra-host). NOT YET: register the sglang host pool once for
     memh reads (reads parity so low value intra-host) + harden deep UCX
     multi-worker (high workers×partitions collapses).
+  - **UCX multi-worker collapse — crashes FIXED, scaling residual OPEN
+    (2026-05-21, commit b992c43).** Root-caused bottom-up. The SIGSEGV crashes
+    under many eps/worker were two autumn bugs: (a) `RLIMIT_MEMLOCK` not raised
+    on the manager (RDMA ibv_reg_mr faults under load) — now raised in
+    `process_context()` for every UCX process; (b) the shared process-global
+    `ucp_context` lacked `mt_workers_shared=1` (concurrent rcache/registration
+    from many worker threads raced). Both fixed → PS no longer crashes at any
+    thread count. `estimated_num_eps` deliberately unset (a high value selects
+    DC transport `dc_mlx5`, which fatal-aborts here). RESIDUAL (open): smooth
+    throughput degradation as eps-per-worker climbs (1/worker = full speed,
+    4+/worker → ~0) = the rc_mlx5 one-QP-per-ep + single-worker-progress scaling
+    limit. Real fix = DC transport (O(1) QPs, needs hardening) or hold ~1-2
+    conns/worker (client connection-per-partition discipline).
 - **Acceptance:**
   - `cargo build --workspace` clean with AND without `--features ucx`.
   - Single-conn read (256 KB): zero-copy value byte-identical to `get`,
