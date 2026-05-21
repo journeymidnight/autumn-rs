@@ -123,11 +123,6 @@ enum Command {
         pipeline_depth: usize,
         /// F195: was env `AUTUMN_GROUP_COMMIT_CAP`; recorded in baseline.
         group_commit_cap: Option<usize>,
-        /// F216-E: route the write phase through MSG_PUT_ZC (value as its own
-        /// iovec, rcache zero-copy send) and the read phase through
-        /// MSG_GET_ZC + call_into_dest (recv into a registered RegPool dest).
-        /// For A/B vs the regular MSG_PUT/MSG_GET path.
-        zc: bool,
     },
 }
 
@@ -154,7 +149,7 @@ fn usage() -> ! {
     eprintln!("                                    Write benchmark (always durable; F178 removed --nosync)");
     eprintln!("  rbench [--threads 40] [--duration 10] <RESULT_FILE>");
     eprintln!("                                    Read benchmark");
-    eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K] [--zc]");
+    eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K]   (zero-copy auto on --transport ucx)");
     eprintln!("                                    Quick write+read bench; warns if >threshold regression vs baseline");
     eprintln!();
     eprintln!("Operator / admin commands moved to `autumn-op` (F213):");
@@ -453,11 +448,15 @@ fn parse_args() -> Args {
             // perf-check (`--group-commit-cap N`) so the baseline JSON
             // reflects the server config that was active.
             let mut group_commit_cap: Option<usize> = None;
-            let mut zc = false;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--zc" => {
-                        zc = true;
+                        // F216-E: removed. Zero-copy is now the DEFAULT on the
+                        // UCX transport (writes always; reads when value >=
+                        // UCX_ZC_READ_MIN_BYTES). Kept as a no-op so existing
+                        // perf_check.sh / scripts don't hard-fail; on TCP it
+                        // stays the regular path. Same spirit as --nosync.
+                        warn_zc_flag_deprecated_once();
                     }
                     "--threads" | "-t" => {
                         i += 1;
@@ -526,7 +525,6 @@ fn parse_args() -> Args {
                 partitions: partitions_meta_from_flag,
                 pipeline_depth,
                 group_commit_cap,
-                zc,
             }
         }
         other => {
@@ -551,6 +549,18 @@ fn warn_nosync_deprecated_once() {
             "[autumn-client] note: --nosync was removed in F178 (LevelDB-style \
              coalescing makes writes always durable). Flag ignored, behaviour \
              unchanged from --sync."
+        );
+    });
+}
+
+fn warn_zc_flag_deprecated_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[autumn-client] note: --zc was removed (F216-E). Zero-copy is now \
+             the DEFAULT on --transport ucx: writes always; reads when value \
+             >= {} B. On --transport tcp the regular path is used. Flag ignored.",
+            autumn_client::UCX_ZC_READ_MIN_BYTES
         );
     });
 }
@@ -849,6 +859,11 @@ async fn main() -> Result<()> {
 
     let _ = autumn_transport::init_with(args.transport);
     let client = ClusterClient::connect(&args.manager).await?;
+
+    // F216-E: "ucx ⟹ zerocopy" — perf-check defaults to the ZC data path on
+    // the UCX transport (no more --zc flag). Writes always; reads size-guarded
+    // (see UCX_ZC_READ_MIN_BYTES). On TCP the regular MSG_PUT/MSG_GET path runs.
+    let is_ucx = matches!(args.transport, autumn_transport::TransportKind::Ucx);
 
     match args.command {
         Command::OpStub { .. } => unreachable!("handled before connect"),
@@ -1387,10 +1402,19 @@ async fn main() -> Result<()> {
             partitions: partitions_meta_from_flag,
             pipeline_depth,
             group_commit_cap,
-            zc,
         } => {
             let pipeline_depth = pipeline_depth.max(1);
-            let zc_tag = if zc { " [ZC: MSG_PUT_ZC/MSG_GET_ZC]" } else { "" };
+            // F216-E "ucx ⟹ zerocopy": writes always ZC on UCX (cheaper at every
+            // size); reads ZC on UCX only when the value is big enough to repay
+            // the registered-recv overhead (small reads regress — see
+            // UCX_ZC_READ_MIN_BYTES). On TCP both stay the regular path.
+            let zc_write = is_ucx;
+            let zc_read = is_ucx && value_size >= autumn_client::UCX_ZC_READ_MIN_BYTES;
+            let zc_tag = match (zc_write, zc_read) {
+                (true, true) => " [ZC: MSG_PUT_ZC + MSG_GET_ZC]",
+                (true, false) => " [ZC: MSG_PUT_ZC; read regular (value < ZC threshold)]",
+                _ => "",
+            };
             // ---- Write phase ----
             if pipeline_depth > 1 {
                 println!(
@@ -1473,9 +1497,9 @@ async fn main() -> Result<()> {
                                 // Non-ZC: rkyv PutReq. Single async block so the FU
                                 // has one concrete future type (no boxing).
                                 let val = value_zc.clone();
-                                let value_vec = if zc { Vec::new() } else { value_bytes.clone() };
+                                let value_vec = if zc_write { Vec::new() } else { value_bytes.clone() };
                                 inflight.push(async move {
-                                    let res = if zc {
+                                    let res = if zc_write {
                                         let meta =
                                             encode_put_zc_meta(part_id, 0, 0, key.as_bytes());
                                         ps_clone
@@ -1629,7 +1653,7 @@ async fn main() -> Result<()> {
                                 // once + reuses). DestMeta -> Bytes so both arms yield
                                 // the same Result type. Single async block = one FU type.
                                 inflight.push(async move {
-                                    let res = if zc {
+                                    let res = if zc_read {
                                         #[cfg(feature = "ucx")]
                                         {
                                             let mut pb =

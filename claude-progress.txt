@@ -1,78 +1,67 @@
 Date: 2026-05-21
 TaskStatus: completed
-Task scope: F216-E — UCX end-to-end zero-copy READ data path for the
-            kvcache (sglang HiCache L3). Relay topology (client <- PS <- EN,
-            no partition-layer bypass). R4 (final read-path copy elimination)
-            implemented + unit-tested + live-UCX e2e PASSED this session.
-            Plan: /root/.claude/plans/flickering-sauteeing-pearl.md.
+Task scope: F216-E follow-up — make zero-copy the DEFAULT on the UCX transport
+            and REMOVE the `--zc` opt-in flag ("只要transport是ucx,就默认是
+            zerocopy"), gated on a fresh perf_check A/B (post-R4).
 
 Current summary:
-  The read path is now FULLY zero-copy EN -> PS -> client over UCX, and the
-  client-facing WRITE hop (put_zc / MSG_PUT_ZC) was done earlier. R4 closed the
-  last PS-side copies:
-    - resolve_value / read_value_from_log / get_value (background.rs +
-      rpc_handlers.rs) now return `Bytes` instead of `Vec<u8>`. The VP-over-UCX
-      fast path returns `Bytes::from_owner(pb)` ALIASING the registered RegPool
-      buffer (no pb->Vec copy; pb returns to the pool when the Bytes drops). The
-      inline path returns a zero-copy `raw_value.slice(..)`. (`impl AsRef<[u8]>
-      for PooledBuf` added so from_owner can back a Bytes.)
-    - handle_get_zc returns the response as TWO segments `(head, value)`:
-      head = [V0 frame header][zc_meta] (ps_zc_head, mirrors EN zc_read_head),
-      value = the aliasing Bytes. The ps-conn inflight FU output changed
-      Bytes -> (Bytes, Option<Bytes>); push_resp pushes head then value into
-      tx_bufs so ONE write_vectored_all emits them as a single wire frame with
-      NO concat copy. d=1 fast path uses write_vectored_all([head,value]) for ZC,
-      plain write_all(head) otherwise (no write-path regression). On-wire bytes
-      are byte-identical to the pre-R4 concat form -> client read path unchanged.
-    - handle_get (rkyv GetResp, generic SDK) does value.to_vec(); the rkyv
-      encode copies regardless, so the Bytes return does NOT regress it (copy
-      just moves). Net value copies: VP-over-UCX get_into = 0; generic get = same.
+  DONE + verified. Zero-copy is now automatic whenever the transport is UCX;
+  the `--zc` flag is removed (kept as a warn-once no-op for old scripts).
 
-  Builds clean WITH and WITHOUT `ucx`. Unit tests: PS 146, rpc 15, stream 56,
-  transport 5 — all green both configs.
+  Policy (size-asymmetric, derived from a perf_check A/B):
+    - WRITES: ZC always on UCX (MSG_PUT_ZC). Cheaper at every size — drops the
+      regular put's to_vec + clone + rkyv encode. A/B: 4K 2.6×, 8M 1.96×.
+    - READS: ZC on UCX only when value >= UCX_ZC_READ_MIN_BYTES (64 KiB), else
+      regular. A/B: 4K read 0.82× (−18%, registered-recv per-op overhead >
+      the tiny copy) → guarded to regular; 8M read 2.34× (the R4 fully-ZC read
+      path, was "parity" pre-R4). Crossover ≈ 16–64 K; 64 K is the safe guard.
+    - TCP: regular path unchanged.
 
-  LIVE UCX E2E PASSED (1-node, RoCE rc_mlx5, /tmp/autumn-r4):
-    - put-zc + zc-get byte-identical at 1000B (inline), 256K (VP), 8M (VP).
-    - interop both ways: put-zc -> normal get MATCH (handle_get rkyv path);
-      normal put -> zc-get MATCH (R4 vectored path on a normally-written value).
-    - rc_mlx5 active on PS + EN (20/20); zero panic/error/fallback/eversion/
-      short in PS+EN logs; PS alive throughout.
-    (Launch that worked: minimal detached
-     `(AUTUMN_TRANSPORT=ucx AUTUMN_BIND_HOST="[fdbd:dc62:3:302::14]"
-       UCX_TLS="^sysv,posix" AUTUMN_DATA_ROOT=/tmp/autumn-r4 ./cluster.sh reset 1
-       > log &)` as its OWN command, then a SEPARATE poll + put-zc/zc-get/cmp.)
+  Implementation (one threshold const, 3 callers):
+    - crates/client/src/lib.rs: pub const UCX_ZC_READ_MIN_BYTES = 64*1024
+      (shared source of truth for CLI + python).
+    - autumn-client perf-check (crates/server/src/bin/autumn_client.rs):
+      removed `--zc` flag + the PerfCheck.zc field; `is_ucx` from
+      args.transport; zc_write=is_ucx, zc_read=is_ucx && value_size>=thresh;
+      warn_zc_flag_deprecated_once() no-op for back-compat.
+    - python (python/src/lib.rs): global IS_UCX set by set_transport; run_job
+      takes is_ucx (per-page size guard on reads, always-ZC writes);
+      BatchClient::new dropped the `zc` param (derives from IS_UCX); zc()
+      accessor now reports is_ucx.
+    - kvcache adapter (sglang_backend.py): removed extra_config["zc"] opt-in;
+      auto on transport=="ucx". bench_zc.py rewritten to single-path (A/B is
+      now transport-level: run once per AUTUMN_TRANSPORT).
 
-Earlier hops (all DONE + verified, prior sessions):
-  - client<-PS READ (get_into / MSG_GET_ZC): TCP + UCX, large/small/not-found.
-  - client->PS WRITE (put_zc / MSG_PUT_ZC): value as own iovec, sliced
-    zero-copy on PS; byte-identical round-trip + put<->put-zc interop.
-  - PS<-EN READ (R3, MSG_READ_BYTES_ZC + read_value_into_pooled): EN emits
-    [zc_meta][value] 2 Bytes (no encode copy); RpcClient::call_into_pooled
-    read_loop OWNS the PooledBuf, hands it back on success, drops->pool on
-    cancel (no leak). RegPool made transport-agnostic (top-level mod).
-  - primitives: recv_into seam, memh wiring (UCP_OP_ATTR_FIELD_MEMH),
-    RegPool, call_into_dest, RLIMIT_MEMLOCK raise + mt_workers_shared.
+  Verification:
+    - Builds clean WITH and WITHOUT `ucx`: autumn-server, autumn-client,
+      python (via manifest). Unit tests: client 6, partition 146, rpc 15,
+      stream 56, transport 5.
+    - Live UCX cluster (8 partitions, rc_mlx5): auto path-selection correct —
+      4K tag "[ZC: MSG_PUT_ZC; read regular (value < ZC threshold)]", 8M tag
+      "[ZC: MSG_PUT_ZC + MSG_GET_ZC]". perf_check A/B numbers as above.
+    - Python wheel rebuilt (maturin develop --release --features ucx); live
+      smoke: set_transport("ucx") → bc.zc()==True → 64×256K put_from+get_into
+      byte-identical over rc_mlx5.
 
-Main gaps (NOT done — lower priority, next sessions):
-  1. python BatchClient(zc=True) get_into into the pinned sglang page + register
-     the sglang pool once for memh reads + maturin rebuild + re-bench kvcache
-     (reads were parity; write transport ~2x diluted by Python/dispatch).
-  2. PS->EN WRITE explicit source registration (rcache already makes it
-     zero-copy; the value is already an Arc-Bytes slice end-to-end). Low value.
-  3. Deep UCX multi-worker / DC-transport scaling (separate from the copy work;
-     established as per-op overhead + process serialization, not a real collapse).
+Design note (regpool / UCX auto bcopy-vs-zcopy — user asked, decided to KEEP):
+  UCX auto-selects bcopy/zcopy and even auto-registers via rcache, BUT only
+  amortizes if buffers are REUSED — UCX can't decide to reuse YOUR buffers, and
+  the recv must land in a specific dest. So regpool's real job = buffer reuse +
+  cancel-safe lifecycle, NOT protocol switching (sends already fully UCX-managed,
+  no regpool). Decision: keep the proven memh+regpool; the simplification (drop
+  explicit memh, lean on rcache + reuse; production = register the sglang pool
+  once so the standalone regpool isn't needed on the real path) is a follow-up.
 
-Next steps:
-  - Re-bench kvcache over UCX with the full zero-copy read path (R3+R4) wired
-    into the python adapter (item 1). The intra-host read is RPC/round-trip
-    bound, so the copy elimination's win shows most on large values / fewer RPCs;
-    the real cross-host lever remains one-sided RDMA (3FS model), TCP-incompatible.
+Main gaps (lower priority, next sessions):
+  1. (follow-up) Investigate dropping explicit memh on recv + leaning on rcache
+     auto bcopy/zcopy with buffer reuse — could remove the size-guard too if
+     UCX auto-picks cheap bcopy for small. Needs measurement.
+  2. Register the sglang host pool once for memh reads (production regpool
+     replacement on the real path).
+  3. PS→EN WRITE explicit source registration (rcache already zero-copy).
+  4. Deep UCX multi-worker / DC scaling (per-op overhead + process
+     serialization, not a real collapse).
 
-Verification this session:
-  cargo test -p autumn-partition-server (146), -p autumn-rpc (15),
-  -p autumn-stream (56), -p autumn-transport (5) — all ok. Builds clean
-  -p autumn-partition-server (no-ucx) and -p autumn-server --features ucx.
-  Live UCX e2e as above.
-
-Previous task (completed 2026-05-19): F216 autumn-kvcache MVP
-  (Python-adapter-only sglang HiCache L3 backend, F216-A..D).
+Previous task (completed 2026-05-21): F216-E R4 — fully zero-copy
+  EN→PS→client UCX read (resolve_value→Bytes::from_owner, handle_get_zc
+  2-segment vectored). Commit dcf9c18.

@@ -3055,6 +3055,24 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
     unlimited`). RDMA ibv_reg_mr pins pages against memlock; the default 8 MiB
     SIGSEGV'd the PS on concurrent 8 MiB reads (rcache send registration). Latent
     RDMA deployment gap exposed by the perf re-test; not ZC-specific.
+  - **"ucx ⟹ zerocopy" DEFAULT — `--zc` flag REMOVED (2026-05-21, post-R4).**
+    Zero-copy is now automatic on the UCX transport (no opt-in): **writes always**
+    (MSG_PUT_ZC — cheaper at every size), **reads when value ≥
+    `UCX_ZC_READ_MIN_BYTES` = 64 KiB** (`crates/client/src/lib.rs`), else regular.
+    Post-R4 perf_check A/B (1-replica P8 d8 t16 UCX rc_mlx5, ZC vs regular):
+    4K **write 2.6×** (32.5K vs 12.4K ops/s) / read **0.82× (−18%)** → guarded to
+    regular; 8M **write 1.96×** (1518 vs 775 MB/s) / **read 2.34×** (2981 vs 1275
+    MB/s — the R4 fully-ZC read materializing, was "parity" pre-R4). Crossover ≈
+    16–64 K; 64 K is the conservative guard. Wired uniformly in 3 callers:
+    autumn-client `perf-check` (`is_ucx` from `args.transport`; `zc_write=is_ucx`,
+    `zc_read=is_ucx && size≥thresh`), python `BatchClient` (global `IS_UCX` set by
+    `set_transport`; per-page size guard in `run_job`), kvcache `sglang_backend`
+    (auto on `transport=="ucx"`, removed `extra_config["zc"]`). `--zc` / `zc=`
+    kept as warn-once no-ops for back-compat. Verified: builds both configs; unit
+    tests (client 6, partition 146, rpc 15, stream 56, transport 5); live UCX
+    auto path-selection correct (4K tag = write-ZC/read-regular, 8M = both-ZC);
+    python smoke (`bc.zc()=True`, 64×256K put_from+get_into byte-identical over
+    rc_mlx5).
 - **Remaining (both internal PS↔EN hops deferred for cancel-safety / scope):**
   - PS←EN READ hop (R3): **DONE + UNIT-TESTED + LIVE UCX E2E PASSED 2026-05-21**
     (1-node UCX rc_mlx5: put-zc + zc-get a 256K VP value == byte-identical via

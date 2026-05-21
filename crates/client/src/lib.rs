@@ -85,6 +85,18 @@ fn code_to_error(code: u8, message: String) -> AutumnError {
 /// from the message would require parsing, which we skip).
 pub const CLIENT_PUT_HARD_CAP: u64 = 256 * 1024 * 1024;
 
+/// F216-E — minimum value size for which the UCX zero-copy READ path
+/// (`get_into` / `MSG_GET_ZC`) is worth taking. Below this, the per-op
+/// registered-recv machinery (regpool_acquire + `UCP_OP_ATTR_FIELD_MEMH` +
+/// the 2-stage header/value recv) costs MORE than the single small copy it
+/// saves, so a small read regresses (~18% at 4 KiB in the perf_check A/B).
+/// At/above this, ZC reads are parity→2.3× (8 MiB). This is the
+/// "ucx ⟹ zerocopy" READ default's size guard; WRITES are always ZC on UCX
+/// (cheaper at every size — they drop the rkyv encode + value copies).
+/// The inline/VP boundary is `VALUE_THROTTLE` (4 KiB); 64 KiB is the
+/// conservative crossover (the mid-range is parity, large is a clear win).
+pub const UCX_ZC_READ_MIN_BYTES: usize = 64 * 1024;
+
 // ── F212-fix-2 — TiKV-style retry/backoff for async-split-tolerant routing ─
 //
 // Split is async on this codebase (see `crates/partition-server/CLAUDE.md`

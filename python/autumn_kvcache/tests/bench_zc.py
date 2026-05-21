@@ -1,17 +1,26 @@
-"""F216-E kvcache ZC A/B micro-bench (no sglang).
+"""F216-E kvcache data-path micro-bench (no sglang).
 
 Drives autumn.BatchClient over a contiguous pinned-style host pool (numpy),
 exactly the kvcache v1 hot path (per-page put_from / get_into into pinned
-pages), and compares the regular path (zc=False) vs the zero-copy path
-(zc=True: MSG_PUT_ZC write + MSG_GET_ZC read).
+pages), and reports write/read throughput.
 
-Run against a live UCX cluster:
-    AUTUMN_KVCACHE_ENDPOINT="[<roce-ip>]:9001" \
+F216-E "ucx ⟹ zerocopy": there is no longer a `zc` flag. The zero-copy data
+path (MSG_PUT_ZC write + MSG_GET_ZC read for large pages) is the DEFAULT on the
+UCX transport; the regular path runs on TCP. So the A/B is now done at the
+TRANSPORT level — run this once per transport (separate processes, since the
+transport is process-global, first-call-wins):
+
+    # regular (TCP)
+    AUTUMN_KVCACHE_ENDPOINT="127.0.0.1:9001" AUTUMN_TRANSPORT=tcp \
+      AUTUMN_BENCH_PAGES=512 AUTUMN_BENCH_PAGE_KB=256 \
+      /tmp/autumn-py-venv/bin/python -m autumn_kvcache.tests.bench_zc
+    # zero-copy (UCX/RoCE)
+    AUTUMN_KVCACHE_ENDPOINT="[<roce-ip>]:9001" AUTUMN_TRANSPORT=ucx \
       AUTUMN_BENCH_PAGES=512 AUTUMN_BENCH_PAGE_KB=256 \
       /tmp/autumn-py-venv/bin/python -m autumn_kvcache.tests.bench_zc
 """
 from __future__ import annotations
-import os, time, sys
+import os, time
 import numpy as np
 import autumn
 
@@ -24,45 +33,41 @@ CAP = int(os.environ.get("AUTUMN_BENCH_CAP", "8"))
 ROUNDS = int(os.environ.get("AUTUMN_BENCH_ROUNDS", "5"))
 
 
-def run(zc: bool):
-    bc = autumn.BatchClient(ENDPOINT, N_WORKERS, CAP, zc)
+def run():
+    # ZC is auto-derived from the transport (set below). bc.zc() reports it.
+    bc = autumn.BatchClient(ENDPOINT, N_WORKERS, CAP)
     # One contiguous pool; per-page views (zero-copy numpy slices).
     pool = np.zeros(N_PAGES * PAGE, dtype=np.uint8)
     for i in range(N_PAGES):
         pool[i * PAGE] = (i % 251) + 1  # make pages distinguishable
     views = [pool[i * PAGE:(i + 1) * PAGE] for i in range(N_PAGES)]
-    keys = [f"zcbench/{zc}/{i:08d}".encode() for i in range(N_PAGES)]
+    keys = [f"zcbench/{i:08d}".encode() for i in range(N_PAGES)]
     total_mb = N_PAGES * PAGE / 1e6
 
-    # Warm (also the write under test).
     def time_put():
         t = time.perf_counter()
         ok = bc.put_from(keys, views)
-        dt = time.perf_counter() - t
-        return sum(ok), dt
+        return sum(ok), time.perf_counter() - t
+
     def time_get():
-        # read into a fresh pool to verify content separately if desired
         t = time.perf_counter()
         ok = bc.get_into(keys, views)
-        dt = time.perf_counter() - t
-        return sum(ok), dt
+        return sum(ok), time.perf_counter() - t
 
     okw, _ = time_put()  # warm + first write
     best_w = min(time_put()[1] for _ in range(ROUNDS))
     okr = time_get()[0]
     best_r = min(time_get()[1] for _ in range(ROUNDS))
-    print(f"  zc={zc!s:5}  write {total_mb/best_w:8.1f} MB/s ({N_PAGES/best_w:7.0f} pg/s, ok={okw}/{N_PAGES})"
+    print(f"  zerocopy={bc.zc()!s:5}  write {total_mb/best_w:8.1f} MB/s ({N_PAGES/best_w:7.0f} pg/s, ok={okw}/{N_PAGES})"
           f"  |  read {total_mb/best_r:8.1f} MB/s ({N_PAGES/best_r:7.0f} pg/s, ok={okr}/{N_PAGES})")
-    return total_mb / best_w, total_mb / best_r
 
 
 def main():
     autumn.set_transport(TRANSPORT)
     print(f"endpoint={ENDPOINT} transport={TRANSPORT} pages={N_PAGES} page={PAGE//1024}KiB "
           f"workers={N_WORKERS} cap={CAP} rounds={ROUNDS}")
-    w0, r0 = run(False)
-    w1, r1 = run(True)
-    print(f"  => write ZC/regular = {w1/w0:.2f}x   read ZC/regular = {r1/r0:.2f}x")
+    run()
+    print("  (A/B: re-run with AUTUMN_TRANSPORT=tcp vs =ucx)")
 
 
 if __name__ == "__main__":

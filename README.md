@@ -1415,24 +1415,34 @@ aliasing that buffer — `write_vectored_all`, no concat copy). E2E (1-node UCX
 rc_mlx5): byte-identical at 1000 B (inline) / 256 KiB / 8 MiB, both interop
 directions (`put-zc`↔`get`, `put`↔`zc-get`). The client↔PS write hop
 (`put_zc`/`put-zc`) is also done. Remaining (lower priority, see `feature_list.md`
-F216-E): PS→EN explicit send registration (rcache already zero-copy) and the
-python `BatchClient(zc=True)` re-bench.
+F216-E): PS→EN explicit send registration (rcache already zero-copy) and
+registering the sglang host pool once for memh reads.
 
-**A/B the ZC path vs the regular path** with `perf-check --zc` (write→`MSG_PUT_ZC`,
-read→`MSG_GET_ZC` into a registered RegPool dest; without `--zc` the regular
-`MSG_PUT`/`MSG_GET` path is unchanged):
+**Zero-copy is the DEFAULT on the UCX transport** (F216-E — the old `--zc` flag
+was removed). With `--transport ucx`, `perf-check` (and the python `BatchClient`
+/ kvcache adapter) automatically use the ZC data path: **writes always**
+(MSG_PUT_ZC — cheaper at every size), **reads when the value ≥ 64 KiB**
+(`UCX_ZC_READ_MIN_BYTES`; below that the registered-recv per-op overhead exceeds
+the small copy it saves, so small reads stay on the regular path). On
+`--transport tcp` the regular `MSG_PUT`/`MSG_GET` path runs. So the A/B is now at
+the **transport level** — run once per transport:
 
 ```bash
-AC="./target/release/autumn-client --manager [<roce-ip>]:9001 --transport ucx"
-$AC perf-check --partitions 8 --pipeline-depth 8 --threads 16 --size 8388608        # regular
-$AC perf-check --partitions 8 --pipeline-depth 8 --threads 16 --size 8388608 --zc   # zero-copy
+AC="./target/release/autumn-client --manager [<roce-ip>]:9001"
+$AC --transport tcp perf-check --partitions 8 --pipeline-depth 8 --threads 16 --size 8388608  # regular
+$AC --transport ucx perf-check --partitions 8 --pipeline-depth 8 --threads 16 --size 8388608  # auto zero-copy
 ```
 
-Measured (1-replica P8 d8 t16 UCX rc_mlx5): **ZC write is ~2× faster** (4K +60%,
-8M +105% → 1180 MB/s) from dropping the 3 client-side value copies + rkyv encode;
-**ZC read is ~parity** intra-host (the recv copy isn't the bottleneck — copy-out
-already saturates; the read win is expected on cross-host RDMA). Recommendation:
-use ZC for writes on UCX; reads opportunistically.
+Measured (1-replica P8 d8 t16 UCX rc_mlx5, ZC vs regular on the same UCX cluster):
+
+| size | write ZC/reg | read ZC/reg |
+|------|-------------|-------------|
+| 4 KiB | **2.6×** (32.5K vs 12.4K ops/s) | 0.82× (−18%) → read stays **regular** below 64 KiB |
+| 8 MiB | **1.96×** (1518 vs 775 MB/s) | **2.34×** (2981 vs 1275 MB/s) |
+
+Writes win at every size (drop 3 client copies + rkyv encode). Reads win big at
+large sizes (the R4 fully-zero-copy read path) but regress at 4 KiB, hence the
+size guard. (`--zc` is kept as a warn-once no-op so old scripts don't break.)
 
 ## Tests
 
