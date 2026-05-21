@@ -1,93 +1,88 @@
-Date: 2026-05-19
-TaskStatus: completed
-Task scope: F216 — autumn-kvcache MVP (sglang HiCache L3 backend,
-            Python-adapter-only form, no Rust daemon / no L3a DRAM cache).
+Date: 2026-05-21
+TaskStatus: not_completed
+Task scope: F216-E — UCX end-to-end zero-copy READ data path for the
+            kvcache (sglang HiCache L3). Relay topology (client <- PS <- EN,
+            no partition-layer bypass). Read path first; write/send-registration
+            is Phase 2. Plan: /root/.claude/plans/flickering-sauteeing-pearl.md.
 
-Summary:
-  Implemented autumn-kvcache as a thin Python adapter (`python/autumn_kvcache/`)
-  layered over the existing `autumn` PyO3 client. No new Rust crate, no
-  sidecar daemon, no local DRAM LRU — partition layer's memtable + block
-  cache serves as the implicit DRAM tier.
+Current summary:
+  The client <- PS hop is DONE and verified end-to-end on a live 1-node
+  cluster, both transports, byte-identical to the normal `get`:
+    - TCP: large(256K, VP/log_stream path) / small(inline) / not-found.
+    - UCX: same, with rc_mlx5 active in the PS log -> the registered
+      zero-copy receive (memh) path is genuinely exercised over RDMA;
+      the value CRC is verified over the registered dest.
 
-  Design convergence is documented in `docs/autumn_kvcache_plan.md`
-  (written this session). The earlier F216 entry that called for a
-  `crates/kvcache/` Rust crate + local DRAM LRU was rewritten to match
-  the new design: deployment is single-sglang-per-node (possibly
-  multi-node via TP/PP), so the daemon's only justification (cross-
-  process same-node sharing) does not apply.
+  Primitives shipped (all unit-tested, build clean with AND without `ucx`):
+    - RegPool (crates/transport/src/ucx/regpool.rs, 8464122): thread-local
+      pool of UCX-registered buffers, pow2 classes, per-thread memlock cap,
+      over-cap -> unregistered fallback.
+    - recv_into seam (crates/transport/src/lib.rs, e6be8d2):
+      ReadHalf::recv_into(buf, Option<&RegisteredMem>) — UCX+Some ->
+      recv_registered(memh); UCX+None -> recv_unregistered; uniform across
+      feature builds (uninhabited RegisteredMem stub on non-ucx).
+    - memh wiring (crates/transport/src/ucx/endpoint.rs, a41b82f): THE
+      pivotal fix — ucx_recv/ucx_recv_raw now set params.memh +
+      UCP_OP_ATTR_FIELD_MEMH when memh is non-null. Pre-fix registration
+      was a silent no-op (the "registration doesn't help" artifact).
+    - call_into_dest + frame header-only decode (crates/rpc, bc4210b):
+      Pending::IntoDest, RpcClient::call_into_dest(msg_type, payload, dest,
+      cap, reg) -> DestMeta{code, value_len}; ZC framing
+      [code:1][value_len:4 LE][crc32c:4 LE] (ZC_META_LEN=9) + value tail;
+      read_loop dual-path (UCX recv-into-dest vs TCP try_decode +
+      finish_into_dest_from_frame); CRC verified over dest. TCP loopback
+      unit test passes.
+    - PS handle_get_zc (MSG_GET_ZC=0x50, partition-server, b59e632):
+      maps every GetOutcome (value/not-found/error) to a V0 ZC payload;
+      ps-conn emits V0 frame for MSG_GET_ZC, V1 for MSG_GET.
+    - ClusterClient::get_into (crates/client, 6041e7d): retry/epoch-stale
+      shape of call_ps_for_key; reg=Some -> RDMA into the registered dest.
+    - autumn-client `zc-get <KEY>` verification CLI (28b4c64): heads the
+      key, registers a dest (ucx build), get_into, stdout.
 
-Work completed in F216-A/B/C/D:
+Main gaps (NOT done — next session):
+  1. PS <- EN hop (#9/#10) — the EN->PS value copy is still present. Design
+     decided but DELIBERATELY not rushed: a naive call_into_dest into a
+     caller-owned dest is NOT cancel-safe on this path because the EN read
+     uses a 3 s timeout + replica failover. If the call times out / a
+     replica is dropped, the multiplexed read_loop (separate task) can
+     still write into a dest the caller has freed (use-after-free). The
+     client <- PS hop avoids this (no timeout; the sglang page outlives the
+     call). The SAFE design for PS <- EN: the read_loop OWNS a RegPool
+     PooledBuf, recvs into it, and hands the PooledBuf back via the meta
+     channel; on caller-cancel the read_loop drains into the pool buf and
+     returns it to the pool (no UAF). Then EN gets a new additive
+     MSG_READ_BYTES_ZC that emits a V0 frame [zc_meta:9][value] as 2 Bytes
+     (also removes the EN-side ReadBytesResp.encode()+Frame::encode() double
+     value copy); StreamClient gets a read-into-pooled fast path for the
+     replicated, single-chunk, non-EC case (EC / chunked / failover-exhaust
+     fall back to the untouched copy path); resolve_value returns the
+     PooledBuf; handle_get_zc sends it to the client (no first-cut concat).
+  2. python/src/lib.rs BatchClient (#12 python): register the sglang host
+     pool ONCE at construction, replace copy_nonoverlapping with get_into.
+     Needs a maturin rebuild + sglang env (deferred).
+  3. PS->client first-cut concat copy in handle_get_zc -> vectored (Phase 2
+     polish), once resolve_value returns a PooledBuf the value can be
+     emitted as an aliasing Bytes (no concat).
 
-  F216-A · Zero-copy buffer API on autumn PyO3 binding
-    - Added `put_from(key, buf: PyBuffer)` and `get_into(key, buf: PyBuffer)`
-      to `python/src/lib.rs Client`. Both accept Python buffer-protocol
-      objects (numpy / torch / memoryview) directly — no PyBytes round-trip.
-    - Fixed a pre-existing compile error (`client.put(&key, &value, true)`
-      vs current 2-arg signature) — the `python` crate is not in the
-      workspace and had bit-rotted silently.
-    - `python` crate now compiles cleanly via `maturin build --release`.
+Next steps:
+  - Implement the read_loop-owns-PooledBuf handoff variant of call_into_dest
+    (cancel-safe), then the EN MSG_READ_BYTES_ZC + StreamClient read-into-
+    pooled fast path + resolve_value/handle_get_zc wiring; verify e2e + no
+    regression (cargo test -p autumn-stream / -p autumn-partition-server,
+    TCP perf-check stays green).
+  - Then the python BatchClient get_into + maturin rebuild.
 
-  F216-B · `python/autumn_kvcache/` package
-    - New pure-Python package with `setuptools` packaging.
-    - `_bridge.py`: dedicated asyncio event loop on a daemon thread; `run`
-      helper takes a thunk so PyO3 awaitables (which require a running
-      loop at construction) are created inside the worker loop.
-    - `sglang_backend.py`: `class AutumnKVCacheStorage(HiCacheStorage)`
-      implementing v1 (`batch_get_v1` / `batch_set_v1` zero-copy path),
-      `batch_exists` (contiguous-prefix int — NOT per-key list),
-      v0 wrappers (`get`/`set`/`exists`/`batch_get`/`batch_set`),
-      `register_mem_pool_host`, `clear`, `get_stats`.
-    - Falls back to `object` base class when sglang is not importable,
-      so the module loads in test/standalone environments.
-    - Partition key format: `kvc/{tenant_suffix}/kv/{sha256_hex}`.
-      `kv` pool slot reserved for future v2 multi-pool.
+Verification this session:
+  cargo test -p autumn-rpc (14 ok, incl call_into_dest_tcp), -p
+  autumn-transport (all ok, incl --features ucx), loopback_ucx 5/5 ok over
+  RoCE (AUTUMN_UCX_TEST_BIND=[fdbd:dc62:3:302::14]:0). e2e zc-get TCP+UCX.
 
-  F216-C · README documentation
-    - New section `## autumn-kvcache (sglang HiCache L3 backend)` in
-      `README.md` covering install (maturin develop + pip install -e),
-      sglang launch command with full `extra_config` JSON, tenant
-      suffix wiring, and smoke-test recipe.
+Commits this session: 8464122 (RegPool), a41b82f (memh), 5412473 (bench
+  consolidation), bc4210b (call_into_dest), b59e632 (PS MSG_GET_ZC),
+  6041e7d (client get_into), 28b4c64 (zc-get CLI). Earlier in the arc:
+  e6be8d2 (recv_into seam), 09cddc4/9832b5d/8e8b63b (ps-conn FU + spawn
+  de-serialization).
 
-  F216-D · Local smoke test (no sglang dep)
-    - `python/autumn_kvcache/tests/test_smoke.py` against a real 1-node
-      autumn cluster. Validates:
-        1. Tenant key format (`kvc/{model}_{tp}_{tp_size}/kv/{hash}`)
-        2. `batch_set_v1` + `batch_get_v1` zero-copy round-trip with
-           byte-exact content verification on numpy pinned-host stand-in
-        3. `batch_exists` contiguous-prefix int semantics (all-present,
-           mixed-with-gap, head-missing)
-        4. v0 set/get/exists wrappers
-        5. `get_stats()` counters increment as expected
-        6. `clear()` deletes the correct count of keys
-    - Verified end-to-end: `ALL SMOKE TESTS PASSED`, exit 0, against a
-      live `cluster.sh reset 1` cluster.
-
-Architecture invariants enforced:
-  - All persistence via `autumn-client` → partition layer (no parallel
-    data plane, [[feedback_no_parallel_data_plane]]).
-  - No sglang-side delete is ever issued — sglang never calls delete on
-    L3; capacity is partition TTL/GC's job (autumn-kvcache surfaces
-    nothing).
-  - Backend returns fast: `False` on miss, exception on RPC error;
-    never blocks past sglang's prefetch budget (2s + 0.1s/Kitok).
-  - Idempotent put: same key/value re-set is a no-op.
-
-Memory updates (kept stable for future conversations):
-  - `project_sglang_deployment_shape.md` — deployment is multi-node, one
-    sglang per node, single sglang may span multi-node (TP/PP).
-  - `project_autumn_kvcache_architecture.md` — Python-adapter-only,
-    no daemon, no L3a DRAM cache; revisit only if benchmarks show
-    partition latency is the bottleneck.
-
-Open items / not in this task:
-  - End-to-end sglang TTFT benchmark with a real model — needs GPU +
-    sglang runtime; will become its own feature when needed.
-  - vLLM `KVConnectorV1` adapter — Phase 3+ non-goal.
-  - HiCache v2 multi-pool (mamba / swa) — Phase 2+; key namespace
-    already reserves the pool slot to avoid future key migration.
-  - autumn-client `head` RPC binding — `batch_exists` currently uses
-    `get` which loads the value; cheap optimization later if profile
-    shows it matters.
-
-Previous task (completed): Phase 0 — autumn-kvcache sglang HiCache
-research (output `docs/hicache_l3_interface.md`).
+Previous task (completed 2026-05-19): F216 autumn-kvcache MVP
+  (Python-adapter-only sglang HiCache L3 backend, F216-A..D).

@@ -728,6 +728,7 @@ Default manager address: `127.0.0.1:9001`
 | `putstream <KEY> <FILE> [--chunk-size N]` | F129 multipart upload — splits FILE into chunks (default 4 MiB), each one `MSG_PUT_CHUNK` to log_stream; final commit installs a multi-fragment ValuePointer. The only path for values > 64 MiB. |
 | `getstream <KEY> [--chunk-size N] [--out FILE]` | F129 streaming read — pulls chunks via offset/length GetReqs; writes to FILE or stdout. Use for large values to avoid buffering the full payload in client memory. |
 | `get <KEY>` | Read value (writes raw bytes to stdout) |
+| `zc-get <KEY>` | F216-E zero-copy read: heads the key, reads the value straight into a dest buffer via `ClusterClient::get_into` (`MSG_GET_ZC`); on a `ucx`-feature build the dest is `ucp_mem_map`-registered so the value lands by RDMA (memh) with no intermediate copy. Writes raw bytes to stdout — byte-identical to `get`; used to verify the client←PS zero-copy path. |
 | `del <KEY>` | Delete key |
 | `head <KEY>` | Show key metadata (length only) |
 | `ls [--prefix P] [--start S] [--limit N]` | Scan keys |
@@ -1378,6 +1379,33 @@ AUTUMN_KVCACHE_ENDPOINT=127.0.0.1:9001 \
 Validates: tenant key format, `batch_set_v1` / `batch_get_v1` zero-copy
 round-trip on a numpy-backed fake pinned-host pool, `batch_exists`
 contiguous-prefix semantics, v0 method fallbacks, and `clear()`.
+
+### F216-E zero-copy read path verification (`zc-get`)
+
+The client←PS hop reads a value straight into a registered dest buffer with no
+intermediate copy (RDMA into the registered dest on UCX). To verify it is
+byte-identical to a normal `get`:
+
+```bash
+# TCP cluster
+./cluster.sh reset 1
+head -c 262144 /dev/urandom > /tmp/v.bin                 # 256 KiB (>4 KiB -> VP/log_stream path)
+./target/release/autumn-client put k /tmp/v.bin
+./target/release/autumn-client zc-get k > /tmp/zc.bin
+cmp /tmp/v.bin /tmp/zc.bin && echo "zero-copy == original"
+
+# UCX cluster (RoCE) — build the ucx binaries first, then point at the RoCE addr.
+# zc-get registers the dest so the value lands by RDMA; rc_mlx5 should appear in ps.log.
+cargo build --release -p autumn-server --features ucx
+export AUTUMN_TRANSPORT=ucx AUTUMN_BIND_HOST="[<roce-ip>]" UCX_TLS="^sysv,posix"
+./cluster.sh reset 1
+AC="./target/release/autumn-client --manager [<roce-ip>]:9001 --transport ucx"
+$AC put k /tmp/v.bin && $AC zc-get k > /tmp/zc.bin && cmp /tmp/v.bin /tmp/zc.bin
+```
+
+Status: client←PS hop done + verified (TCP + UCX rc_mlx5). The PS←EN hop and
+the python `BatchClient.get_into` wiring are tracked in `feature_list.md`
+F216-E ("Remaining").
 
 ## Tests
 

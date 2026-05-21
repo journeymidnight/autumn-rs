@@ -14,6 +14,15 @@ Main entry point. Connect via `ClusterClient::connect("addr1,addr2")`.
 - `put(key, value, must_sync)` — write a key-value pair
 - `put_with_ttl(key, value, must_sync, ttl_secs)` — write with TTL (seconds)
 - `get(key) → Option<Vec<u8>>` — read, returns None if not found
+- `get_into(key, dest: &mut [u8], reg: Option<&autumn_rpc::RegisteredMem>) → Option<usize>` —
+  **F216-E zero-copy read.** Reads the value straight into `dest` (no Vec) via
+  `MSG_GET_ZC` + `RpcClient::call_into_dest`; returns `Some(value_len)`
+  (`dest[..value_len]` filled) or `None` if not found. `reg=Some(&RegisteredMem)`
+  covering `dest` → UCX RDMA into the registered dest (zero-copy); `None` → one
+  copy off the wire (TCP / unregistered). Same routing + epoch-stale refresh +
+  RPC-retry shape as `call_ps_for_key`. Caller sizes `dest` (e.g. from `head`).
+  No per-call timeout — `dest` MUST outlive the call (cancel-safety, see
+  autumn-rpc CLAUDE `call_into_dest`).
 - `delete(key)` — delete a key
 - `head(key) → KeyMeta` — get metadata (found, value_length)
 - `range(prefix, start, limit) → RangeResult` — prefix scan

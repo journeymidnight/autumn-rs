@@ -3006,6 +3006,62 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
 
 - **passes:** true (2026-05-19; smoke test green, full code path verified)
 
+### F216-E · UCX end-to-end zero-copy READ data path (relay topology)
+- **Status:** **in progress** (2026-05-21). Started after the F216 MVP shipped
+  TCP-equivalent UCX throughput but no true zero-copy: the kvcache value was
+  copied ~6× on the read path and a 256 KB single-conn read was ~925 MB/s while
+  `ucx_perftest` does 14-20 GB/s on the same stock UCX (proven NOT a UCX bug,
+  NOT disk — path/copy/round-trip bound). Plan:
+  `/root/.claude/plans/flickering-sauteeing-pearl.md`.
+- **Decisions (locked, do NOT rewrite):**
+  - **Relay topology** — keep `client <- PS <- EN`, make each hop copy-free.
+    NO partition-layer bypass / no direct client->EN (preserves "partition is
+    the only data plane" [[feedback_no_parallel_data_plane]] + avoids the
+    VP-vs-GC race [[project_med2_known_bug]]).
+  - **READ path first**; WRITE + send-registration is Phase 2.
+  - Single zero-copy mode (register + memh), not a dual register/copy toggle.
+  - kvcache values are non-uniform in size; send memory must also be registered
+    (Phase 2); EN is a first-class zero-copy tier.
+- **Goal / scope:** value flows recv-into-registered-dest + send-from-registered-
+  src with no intermediate copies across all three tiers. UCX needs the dest
+  registered (`ucp_mem_map`) AND the recv to pass `UCP_OP_ATTR_FIELD_MEMH`.
+- **Done (verified e2e — client <- PS hop):**
+  - RegPool (`crates/transport/src/ucx/regpool.rs`); `ReadHalf::recv_into`
+    seam (`crates/transport/src/lib.rs`); memh wiring in
+    `ucx_recv`/`ucx_recv_raw` (`crates/transport/src/ucx/endpoint.rs`) — the
+    pivotal fix (registration was a silent no-op pre-fix).
+  - `RpcClient::call_into_dest` + ZC frame meta `[code:1][value_len:4][crc32c:4]`
+    + frame header-only decode (`crates/rpc/src/{client,frame}.rs`), CRC
+    verified over dest.
+  - PS `handle_get_zc` / `MSG_GET_ZC = 0x50` (`crates/partition-server`);
+    `ClusterClient::get_into` (`crates/client`); `autumn-client zc-get`
+    verification CLI.
+- **Remaining:**
+  - PS <- EN hop: EN `MSG_READ_BYTES_ZC` (V0 2-Bytes `[zc_meta][value]`, removes
+    the EN double value copy) + StreamClient read-into-pooled fast path
+    (replicated / single-chunk / non-EC; EC+chunked+failover fall back to the
+    untouched copy path) + `resolve_value` returns a PooledBuf. **Must use the
+    read_loop-owns-PooledBuf handoff variant of call_into_dest — recv-into-
+    caller-dest is NOT cancel-safe here because the EN read uses a 3 s timeout +
+    replica failover (a dropped/timed-out call could leave the multiplexed
+    read_loop writing into a freed dest = UAF). The client <- PS hop is safe
+    because it has no timeout and the sglang page outlives the call.**
+  - PS->client first-cut concat copy in `handle_get_zc` -> vectored (emit the
+    PooledBuf value as an aliasing Bytes).
+  - python `BatchClient`: register the sglang host pool once + `get_into`
+    (needs maturin rebuild + sglang env).
+- **Acceptance:**
+  - `cargo build --workspace` clean with AND without `--features ucx`.
+  - Single-conn read (256 KB): zero-copy value byte-identical to `get`,
+    value-CRC verifies over dest; on UCX `rc_mlx5` is the active transport.
+  - kvcache adapter batch-get cached-read MB/s improves vs the F216 baseline.
+  - `cargo test -p autumn-rpc / -p autumn-transport / -p autumn-stream /
+    -p autumn-partition-server` green; TCP perf-check stays green.
+- **passes (client <- PS hop):** true (2026-05-21; `zc-get` byte-identical to
+  `get`, TCP + UCX rc_mlx5, large/small/not-found; rpc+transport unit tests +
+  loopback_ucx 5/5 over RoCE).
+- **passes (full F216-E):** false (PS <- EN hop + python remaining).
+
 ### F217 (SUPERSEDED) · autumn-kvcache Phase 2 — UCX one-sided RDMA + peer DRAM share
 - **Status:** **superseded** 2026-05-19 by F216's final architecture (Python-adapter-only, partition handles all cross-node sharing). See `docs/autumn_kvcache_plan.md` §3.2 ("不做哪些事 / design rationale") and the [[project_autumn_kvcache_architecture]] memory.
 - **Why superseded:** The premise — "multiple inference replicas have idle DRAM that could form a shared L2 pool" — assumed a sidecar daemon holding local LRU per node. F216 collapsed to a stateless Python adapter; there's no daemon to host a peer mesh. More importantly, autumn's **partition layer is already a distributed in-memory KV** (memtable + block cache + UCX RDMA path), so a separate peer DRAM mesh would re-implement what partition already provides. Adding one would violate [[feedback_no_parallel_data_plane]].
