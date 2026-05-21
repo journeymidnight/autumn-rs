@@ -571,6 +571,27 @@ do_start() {
         mkdir -p $(echo "$disk_arg" | tr ',' ' ')
     done
 
+    # F221: auto-size the PS partition budget from the presplit count when the
+    # operator didn't set AUTUMN_PS_PARTS_HINT. Each partition needs 2 PS cores
+    # (P-log + P-bulk); the PS refuses partitions past cpuset_len/2, and
+    # cluster.sh sizes the PS cpuset from AUTUMN_PS_PARTS_HINT (default 8). So
+    # presplitting >8 partitions without bumping the hint silently strands the
+    # surplus ("F196: core budget exhausted"). Raise the hint to the presplit
+    # count so a fresh start "just works". Only ever RAISES above the default 8
+    # (≤8 keeps the default); an explicit AUTUMN_PS_PARTS_HINT always wins. If
+    # the box lacks REPLICAS*SHARDS + 2*hint cores, compute_affinity_decision
+    # disables pinning and the PS falls back to all-core auto-detect (a wide
+    # budget), so this never over-constrains. NOTE: only fires when
+    # AUTUMN_BOOTSTRAP_PRESPLIT is in the env (fresh start/reset); a bare
+    # `restart` without it needs AUTUMN_PS_PARTS_HINT (or re-pass presplit).
+    if [[ -z "${AUTUMN_PS_PARTS_HINT:-}" && -n "${AUTUMN_BOOTSTRAP_PRESPLIT:-}" ]]; then
+        local _presplit_n="${AUTUMN_BOOTSTRAP_PRESPLIT%%:*}"
+        if [[ "$_presplit_n" =~ ^[0-9]+$ ]] && (( _presplit_n > 8 )); then
+            export AUTUMN_PS_PARTS_HINT="$_presplit_n"
+            echo "[cluster] F221: auto PS_PARTS_HINT=$_presplit_n (from presplit; PS budget = $(( _presplit_n * 2 )) cores)"
+        fi
+    fi
+
     # F099-M: when AUTUMN_EXTENT_SHARDS is set, launch each extent-node
     # with K shards (see compute_shard_config + launch_extent_node above).
     compute_shard_config

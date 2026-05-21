@@ -3388,3 +3388,38 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   - `AUTUMN_PS_BASE_PORT=<N>` override is honored (listeners bind at N+ordinal).
   - TCP-mode `reset 1` still comes up (readiness `nc -z` probes the new port).
 - **passes:** false (pending implementation — 2026-05-21)
+
+### F221 · cluster.sh auto-derives PS partition budget from the presplit count
+- **Trigger / 动机:** Each partition needs 2 PS cores (P-log + P-bulk); the PS
+  refuses to open partitions past `cpuset_len/2` (`F196: core budget exhausted`).
+  cluster.sh sizes the PS cpuset from `AUTUMN_PS_PARTS_HINT` (default **8**), so
+  `AUTUMN_BOOTSTRAP_PRESPLIT="16:hexstring"` without also setting
+  `AUTUMN_PS_PARTS_HINT=16` silently strands partitions 8–15 (observed live:
+  ids 65/72/…/114 refused, `current=8 max=8`; client ops to those key ranges
+  then fail with `unknown msg_type` — no listener). Operators forget the hint
+  repeatedly.
+- **Scope / boundary:** `cluster.sh` `do_start` only. When `AUTUMN_PS_PARTS_HINT`
+  is unset AND `AUTUMN_BOOTSTRAP_PRESPLIT` is set with count > 8, export
+  `AUTUMN_PS_PARTS_HINT = presplit_count` before `compute_affinity_decision` /
+  `launch_ps`. Only ever **raises** above the default 8 (≤8 keeps the default);
+  an explicit `AUTUMN_PS_PARTS_HINT` always wins. Out of scope: bare `restart`
+  without the presplit env (pass the hint or re-pass presplit; the derived value
+  is persisted into `cluster_config` by `save_cluster_config` for per-process
+  subcommands); querying the manager for the live partition count; the F220
+  port-grid change.
+- **No over-constraint:** if the box lacks `REPLICAS*SHARDS + 2*hint` cores,
+  `compute_affinity_decision` disables pinning and the PS falls back to all-core
+  auto-detect (a wide `cpuset_len/2` budget), so raising the hint never makes
+  things worse than before.
+- **Acceptance:**
+  - `bash -n cluster.sh` clean.
+  - `reset 1` with `AUTUMN_EXTENT_SHARDS=16 AUTUMN_BOOTSTRAP_PRESPLIT=16:hexstring`
+    and **no** `AUTUMN_PS_PARTS_HINT`: cluster.sh prints `F221: auto
+    PS_PARTS_HINT=16`; ps.log has **0** `core budget exhausted`; all 16 partition
+    listeners bound; put/get round-trips.
+  - explicit `AUTUMN_PS_PARTS_HINT=4` still wins (not overridden); presplit ≤ 8
+    leaves the default 8.
+- **passes:** true (2026-05-21 — verified: `reset 1` w/o the hint auto-set
+  PS_PARTS_HINT=16 → cpuset=16-47 (max_parts=16), 16/16 partition listeners
+  bound, 0 `core budget exhausted`, UCX put/get round-trips; override-wins is
+  by the `-z` guard, presplit≤8 keeps default 8.)

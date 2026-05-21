@@ -1768,6 +1768,15 @@ If you need more total client concurrency, add partitions
 gets its own listener / worker, so total per-PS UCX progress capacity
 scales linearly with partition count.
 
+> **cluster.sh note (F221):** each partition needs 2 PS cores (P-log +
+> P-bulk) and the PS refuses partitions past `cpuset_len/2`. When you launch
+> via `cluster.sh`, the PS core budget is **auto-derived from the presplit
+> count** — `AUTUMN_BOOTSTRAP_PRESPLIT=16:hexstring` makes cluster.sh give the
+> PS 32 cores (`cpuset 16-47`) so all 16 partitions open. Set
+> `AUTUMN_PS_PARTS_HINT=N` to override. Without this (pre-F221) a 16-partition
+> presplit on the default 8-partition budget stranded partitions 8–15 with
+> `F196: core budget exhausted`.
+
 **TCP transport has no equivalent ceiling** at this scale — kernel
 sockets fan accept/recv I/O across cores. If your workload genuinely
 needs more concurrent inbound EPs per PS-side worker than UCX supports
