@@ -287,6 +287,44 @@ impl FrameDecoder {
             payload,
         }))
     }
+
+    /// F216 zero-copy support — bytes currently buffered (not yet decoded).
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Peek the next frame's header without consuming it. Returns
+    /// `(req_id, msg_type, flags, payload_len)` once `HEADER_LEN` bytes are
+    /// buffered. Lets the read_loop decide whether to recv a value-response
+    /// straight into a registered dest (`call_into_dest`) before `try_decode`
+    /// would buffer the whole payload.
+    pub fn peek_header(&self) -> Option<(u32, u8, u8, u32)> {
+        if self.buf.len() < HEADER_LEN {
+            return None;
+        }
+        Some((
+            u32::from_le_bytes(self.buf[0..4].try_into().unwrap()),
+            self.buf[4],
+            self.buf[5],
+            u32::from_le_bytes(self.buf[6..10].try_into().unwrap()),
+        ))
+    }
+
+    /// Advance past `n` already-buffered bytes (e.g. a peeked header).
+    pub fn consume(&mut self, n: usize) {
+        self.buf.advance(n);
+    }
+
+    /// Copy up to `dest.len()` buffered bytes into `dest`, advancing the
+    /// decoder by the amount moved. Returns the count. Used to drain a
+    /// value's already-buffered prefix into a recv-into-dest target before
+    /// recv'ing the remainder straight off the wire.
+    pub fn drain_into(&mut self, dest: &mut [u8]) -> usize {
+        let n = dest.len().min(self.buf.len());
+        dest[..n].copy_from_slice(&self.buf[..n]);
+        self.buf.advance(n);
+        n
+    }
 }
 
 impl Default for FrameDecoder {

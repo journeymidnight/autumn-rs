@@ -37,6 +37,13 @@ pub use ucx::{
     regpool_acquire, register_memory, set_regpool_cap_bytes, PooledBuf, RegisteredMem,
 };
 
+/// Placeholder when built without the `ucx` feature — never constructed (TCP
+/// has no memory registration). Lets autumn-rpc's
+/// `call_into_dest(reg: Option<&RegisteredMem>)` and the recv-into-dest seam
+/// compile uniformly across features; `reg` is always `None` on TCP-only builds.
+#[cfg(not(feature = "ucx"))]
+pub enum RegisteredMem {}
+
 static GLOBAL: OnceLock<Box<dyn AutumnTransport>> = OnceLock::new();
 
 /// Initialise the process-global transport with an explicit `TransportKind`.
@@ -400,6 +407,22 @@ impl Listener {
 
 // ---- Half APIs ----
 
+impl ReadHalf {
+    /// True for the UCX variant. The autumn-rpc read_loop uses this to choose
+    /// the recv-into-registered-dest path (UCX) vs decode+memcpy (TCP) for
+    /// `call_into_dest`.
+    pub fn is_ucx(&self) -> bool {
+        #[cfg(feature = "ucx")]
+        {
+            matches!(self, ReadHalf::Ucx(_))
+        }
+        #[cfg(not(feature = "ucx"))]
+        {
+            false
+        }
+    }
+}
+
 impl compio::io::AsyncRead for ReadHalf {
     async fn read<B: compio::buf::IoBufMut>(
         &mut self,
@@ -413,10 +436,10 @@ impl compio::io::AsyncRead for ReadHalf {
     }
 }
 
-#[cfg(feature = "ucx")]
 impl ReadHalf {
     /// F216 zero-copy recv into a pre-registered buffer (UCX only). Single
     /// recv (may be partial). See `UcxReadHalf::recv_registered`.
+    #[cfg(feature = "ucx")]
     pub async fn recv_registered(
         &mut self,
         buf: &mut [u8],
@@ -435,21 +458,26 @@ impl ReadHalf {
     /// `None` (regpool over-cap fallback) → UCX recv into the slice (copy-out).
     /// Single recv (may be partial); caller loops for read_exact semantics.
     /// TCP errors — the autumn-rpc read_loop handles TCP recv-into-dest via the
-    /// normal decode + memcpy path, never this seam.
+    /// normal decode + memcpy path, never this seam. Defined for all builds so
+    /// autumn-rpc compiles uniformly; on TCP-only builds it always errors.
     pub async fn recv_into(
         &mut self,
         buf: &mut [u8],
         reg: Option<&RegisteredMem>,
     ) -> io::Result<usize> {
         match self {
+            #[cfg(feature = "ucx")]
             ReadHalf::Ucx(r) => match reg {
                 Some(reg) => r.recv_registered(buf, reg).await,
                 None => r.recv_unregistered(buf).await,
             },
-            ReadHalf::Tcp(_) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "recv_into is UCX-only; TCP uses the read_loop decode+memcpy path",
-            )),
+            ReadHalf::Tcp(_) => {
+                let _ = (buf, reg);
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "recv_into is UCX-only; TCP uses the read_loop decode+memcpy path",
+                ))
+            }
         }
     }
 }
