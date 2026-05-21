@@ -3174,6 +3174,55 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   unit tests + loopback_ucx 5/5 over RoCE).
 - **passes (full F216-E):** false (internal PS↔EN hops + python remaining).
 
+### F216-F · TCP read send-side copy elimination (value-separable framing, no registration)
+- **Status:** **not_completed** (defined 2026-05-21; design only — not implemented).
+- **Context / motivation:** F216-E made the **UCX** READ path zero-copy. The **TCP**
+  read path still pays two avoidable EN-send-side costs that are transport-INdependent
+  (pure userspace work, NOT the RDMA/registration win):
+  1. **8 MiB encode copy** — the non-ZC `build_read_future` branch builds the
+     response via `ReadBytesResp { payload }.encode()`, which `extend_from_slice`s
+     the whole value into the frame buffer. The ZC branch already avoids this by
+     emitting `[head][value]` as 2 separate `Bytes` + `write_vectored_all` (head
+     encoded, value aliases the read buffer — no concat).
+  2. **per-op 8 MiB zeroing** — the non-ZC branch reads into `vec![0u8; read_size]`,
+     memset-zeroing 8 MiB that the pread immediately overwrites. (The F216-E
+     EN-regpool change removed this on the ZC branch ONLY — `read_exact_at` into a
+     pooled, zeroed-once `PooledBuf`; `crates/transport/src/ucx/regpool.rs` +
+     `crates/stream/src/extent_node.rs::build_read_future`.)
+- **Explicitly OUT of scope (cannot help TCP):** the registration/memh part of
+  F216-E. TCP send is a kernel `sendmsg` (userspace→socket-buffer copy) — no RDMA
+  memory registration. TCP **recv** is also unavoidably copy-bound (kernel→userspace
+  + FrameDecoder accumulate) and TCP's cross-host collapse is the protocol stack +
+  wire, not the buffer. This feature targets ONLY the EN SEND side; it does NOT make
+  TCP fully zero-copy.
+- **Goal / scope:** the EN read response on TCP encodes ONLY the header (+ meta /
+  crc trailer) and `write_vectored`s the value as a separate `Bytes` aliasing a
+  pooled (zeroed-once) read buffer — eliminating the per-op alloc, the per-op 8 MiB
+  zeroing, and the 8 MiB encode copy. On-wire bytes byte-identical to today so the
+  client decode path is unchanged.
+- **Two candidate implementations (pick at impl time):**
+  1. **Route TCP internal reads through the existing `MSG_READ_BYTES_ZC` framing**
+     (already value-separable + 2-Bytes + pooled via the F216-E EN change). Only
+     change: relax the PS gating in `resolve_value`/`read_value_from_log`
+     (`crates/partition-server/src/background.rs`) so TCP also uses
+     `read_value_into_pooled` instead of falling back to `read_bytes_from_extent`.
+     Smallest change, reuses validated code; V0 frame + value-crc-in-meta means no
+     V1 frame-crc pass either.
+  2. **Make `MSG_READ_BYTES` itself value-separable** — EN emits
+     `[frame_header+code+end]` (head) + value + (V1) crc trailer as a 3-iovec
+     `write_vectored`, instead of `ReadBytesResp.encode()`. Keeps the V1 crc pass
+     (read-only, no copy). Touches `extent_rpc` / `build_read_future` framing.
+- **Acceptance:**
+  - TCP `get` of a large VP value byte-identical to pre-change (wire unchanged);
+    `cargo build --workspace` clean with AND without `--features ucx`.
+  - EN non-ZC read path no longer allocates+zeroes a per-op `vec![0u8; read_size]`
+    and no longer `extend_from_slice`s the value (code + unit test on chosen path).
+  - TCP perf-check 8M read intra-host ≥ current baseline (saved memset + copy is
+    CPU → small intra-host uptick is the expected signal; no regression).
+  - `cargo test -p autumn-stream / -p autumn-rpc / -p autumn-partition-server`
+    green; UCX path unaffected.
+- **passes:** false
+
 ### F217 (SUPERSEDED) · autumn-kvcache Phase 2 — UCX one-sided RDMA + peer DRAM share
 - **Status:** **superseded** 2026-05-19 by F216's final architecture (Python-adapter-only, partition handles all cross-node sharing). See `docs/autumn_kvcache_plan.md` §3.2 ("不做哪些事 / design rationale") and the [[project_autumn_kvcache_architecture]] memory.
 - **Why superseded:** The premise — "multiple inference replicas have idle DRAM that could form a shared L2 pool" — assumed a sidecar daemon holding local LRU per node. F216 collapsed to a stateless Python adapter; there's no daemon to host a peer mesh. More importantly, autumn's **partition layer is already a distributed in-memory KV** (memtable + block cache + UCX RDMA path), so a separate peer DRAM mesh would re-implement what partition already provides. Adding one would violate [[feedback_no_parallel_data_plane]].
