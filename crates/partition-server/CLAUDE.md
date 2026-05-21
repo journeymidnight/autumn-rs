@@ -381,6 +381,45 @@ Get(key, part_id):
        else → return raw value
 ```
 
+### F216-E — UCX end-to-end zero-copy read (MSG_GET_ZC)
+
+The kvcache SDK's `get_into` issues `MSG_GET_ZC` so the value lands in its
+registered dest with no intermediate copies across all three tiers
+(`EN → PS → client`). The seam is `resolve_value`/`read_value_from_log`
+(`background.rs`) returning **`Bytes`**, not `Vec<u8>`:
+
+- **VP value over UCX**: `read_value_from_log` calls
+  `StreamClient::read_value_into_pooled` (R3), which recvs the value straight
+  into a registered `RegPool` `PooledBuf` (EN emits `[zc_meta][value]` as 2
+  `Bytes`, value aliases the EN pread buffer — no encode copy). The PS then
+  hands the value onward as `Bytes::from_owner(pb)` (R4) — the value `Bytes`
+  ALIASES the pool buffer; the buffer returns to the pool when that `Bytes`
+  drops (after the client write completes). Falls back to the
+  `read_bytes_from_extent` copy path for non-UCX / EC / chunked / stale-eversion.
+- **inline value**: `resolve_value` returns a zero-copy `raw_value.slice(..)`
+  of the memtable `Bytes`.
+- **`handle_get_zc`** (`rpc_handlers.rs`) returns the response as TWO segments
+  `(head, value)`: `head = [V0 frame header][zc_meta: code+value_len+crc32c]`
+  (built by `ps_zc_head`, mirrors `extent_node::zc_read_head`), `value` is the
+  aliasing `Bytes`. The ps-conn's inflight FU output type is
+  `(Bytes, Option<Bytes>)`; `push_resp` pushes `head` then `value` into
+  `tx_bufs` so ONE `write_vectored_all` emits them as a single wire frame with
+  **no concat copy** (the d=1 fast path uses `write_vectored_all([head, value])`
+  for ZC, plain `write_all(head)` otherwise — no regression). The on-the-wire
+  bytes are identical to the pre-R4 concatenated form, so the client read path
+  (`call_into_dest` / `call_into_pooled`) is unchanged.
+
+`handle_get` (rkyv `GetResp`, generic SDK) copies the value once
+(`value.to_vec()`); the rkyv encode copies regardless, so returning `Bytes`
+from `resolve_value` does not regress it — the copy just moves. Net read-path
+value copies: VP-over-UCX `get_into` = **0**, generic `get` = same as before.
+
+UCX send from the registered `PooledBuf` is zero-copy via the rcache (the
+buffer is `ucp_mem_map`-registered, so the unregistered `ucx_send` still finds
+the registration). Cancel-safety of the registered recv lives in the read_loop
+that OWNS the `PooledBuf` (returns it to the pool on cancel — never leaks); see
+`autumn-transport/src/ucx/regpool.rs` + `autumn-rpc/src/client.rs`.
+
 ## Flush Pipeline (F088: cross-thread hand-off)
 
 Triggered when `active` exceeds `FLUSH_MEM_BYTES` (256 MB).

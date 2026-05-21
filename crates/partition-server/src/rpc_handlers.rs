@@ -142,9 +142,12 @@ pub(crate) async fn dispatch_partition_rpc(
 }
 
 /// Outcome of the shared GET resolve core: the value bytes, or a not-found.
+/// `Value` is a `Bytes` that, for a VP read over UCX, ALIASES the registered
+/// RegPool buffer (R4) — `handle_get_zc` sends it as its own iovec (no copy);
+/// `handle_get` copies it into the rkyv `GetResp` (which copies regardless).
 pub(crate) enum GetOutcome {
     NotFound,
-    Value(Vec<u8>),
+    Value(Bytes),
 }
 
 /// rkyv-framed GET (generic SDK path).
@@ -158,32 +161,52 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
         GetOutcome::Value(value) => Ok(partition_rpc::rkyv_encode(&GetResp {
             code: CODE_OK,
             message: String::new(),
-            value,
+            value: value.to_vec(),
         })),
     }
 }
 
-/// F216 zero-copy GET (MSG_GET_ZC): value-separable payload
-/// `[ZC meta: code+value_len+value_crc32c][raw value]` so the client recvs the
-/// value straight into its registered dest. NOTE: this still concatenates meta
-/// + value once on the PS (first cut); the PS send becomes vectored (no concat)
-/// in a follow-up. The client receive is already zero-copy.
-pub(crate) async fn handle_get_zc(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
-    // ALL outcomes (incl errors) map to a V0 ZC response — a V1 error frame
-    // would corrupt the client's recv-into-dest parsing. The status rides in
-    // the meta `code`; the SDK's get_into maps non-OK codes to refresh/retry.
-    // StatusCode discriminants align with the partition CODE_* for the
-    // GET-relevant cases (InvalidArgument=2, FailedPrecondition=3, Internal=4).
-    let (code, value): (u8, Vec<u8>) = match get_value(payload, part).await {
+/// F216 zero-copy GET (MSG_GET_ZC): returns the response as TWO segments —
+/// `(head, value)` where `head = [V0 frame header][ZC meta: code + value_len +
+/// value_crc32c]` and `value` ALIASES the RegPool buffer (R4: `Bytes::from_owner`
+/// from `resolve_value`, no copy). The ps-conn pushes `head` then `value` into
+/// `tx_bufs` so the single `write_vectored_all` emits them as one wire frame with
+/// NO concat copy — fully zero-copy EN->PS->client. (Pre-R4 this concatenated
+/// `[meta][value]` into a Vec, copied again by `encode_v0`.)
+///
+/// ALL outcomes (incl errors) map to a V0 ZC response — a V1 error frame would
+/// corrupt the client's recv-into-dest parsing. The status rides in the meta
+/// `code`; the SDK's get_into maps non-OK codes to refresh/retry. StatusCode
+/// discriminants align with the partition CODE_* for the GET-relevant cases
+/// (InvalidArgument=2, FailedPrecondition=3, Internal=4). So this never errors.
+pub(crate) async fn handle_get_zc(
+    req_id: u32,
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> (Bytes, Bytes) {
+    let (code, value): (u8, Bytes) = match get_value(payload, part).await {
         Ok(GetOutcome::Value(v)) => (CODE_OK, v),
-        Ok(GetOutcome::NotFound) => (CODE_NOT_FOUND, Vec::new()),
-        Err((status, _msg)) => (status as u8, Vec::new()),
+        Ok(GetOutcome::NotFound) => (CODE_NOT_FOUND, Bytes::new()),
+        Err((status, _msg)) => (status as u8, Bytes::new()),
     };
-    let meta = autumn_rpc::client::encode_zc_meta(code, &value);
-    let mut out = Vec::with_capacity(meta.len() + value.len());
-    out.extend_from_slice(&meta);
-    out.extend_from_slice(&value);
-    Ok(Bytes::from(out))
+    (ps_zc_head(req_id, code, &value), value)
+}
+
+/// Build the MSG_GET_ZC response head = `[V0 frame header][zc_meta]`. The value
+/// is sent as a SEPARATE `Bytes` right after (aliasing the RegPool buffer) so it
+/// is never copied. Mirrors `extent_node::zc_read_head`. The header's
+/// `payload_len` covers meta + value, so the client recvs the whole payload.
+pub(crate) fn ps_zc_head(req_id: u32, code: u8, value: &[u8]) -> Bytes {
+    use bytes::BufMut;
+    let meta = autumn_rpc::client::encode_zc_meta(code, value);
+    let payload_len = meta.len() + value.len();
+    let mut head = bytes::BytesMut::with_capacity(autumn_rpc::HEADER_LEN + meta.len());
+    head.put_u32_le(req_id);
+    head.put_u8(MSG_GET_ZC);
+    head.put_u8(autumn_rpc::frame::FLAG_RESPONSE); // V0; value crc rides in the meta
+    head.put_u32_le(payload_len as u32);
+    head.put_slice(&meta);
+    head.freeze()
 }
 
 /// Shared GET resolve core: epoch/range check → memtable/imm/SST lookup →

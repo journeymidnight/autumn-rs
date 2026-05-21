@@ -3067,18 +3067,34 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
     `read_value_into_pooled` (UCX/replicated/single-chunk fast path; everything
     else → copy-path fallback); `read_value_from_log` uses it then copies
     pb→Vec. Tests: rpc 15 (incl `call_into_pooled_tcp` + `drop_recv_into_
-    registered_mid_await` over RoCE), stream 56, partition 146. **R4 remaining**:
-    `resolve_value`/`handle_get_zc` return/alias the PooledBuf to drop the final
-    pb→Vec + concat copies. (Cancel-safety rationale: the EN read has a 3 s
-    timeout + failover, so recv-into-caller-dest would be UAF; read_loop-owns-
-    buffer makes it safe AND leak-free.)
+    registered_mid_await` over RoCE), stream 56, partition 146. (Cancel-safety
+    rationale: the EN read has a 3 s timeout + failover, so recv-into-caller-dest
+    would be UAF; read_loop-owns-buffer makes it safe AND leak-free.)
+  - PS←EN/PS→client final copy elimination (R4): **DONE + UNIT-TESTED + LIVE
+    UCX E2E PASSED 2026-05-21.** `resolve_value`/`read_value_from_log`/`get_value`
+    return `Bytes` (not `Vec<u8>`); the VP-over-UCX path returns
+    `Bytes::from_owner(pb)` ALIASING the registered RegPool buffer (drops the
+    pb→Vec copy; `impl AsRef<[u8]> for PooledBuf` added); inline returns a
+    zero-copy `raw_value.slice(..)`. `handle_get_zc` returns 2 segments
+    `(head, value)` (head = `ps_zc_head` = [V0 header][zc_meta], mirrors EN
+    `zc_read_head`); the ps-conn inflight FU output went `Bytes` →
+    `(Bytes, Option<Bytes>)`, `push_resp` pushes head then value so ONE
+    `write_vectored_all` emits them with NO concat copy (d=1 fast path uses
+    `write_vectored_all([head,value])` for ZC, `write_all(head)` otherwise — no
+    write-path regression). On-wire bytes byte-identical to pre-R4 → client read
+    path unchanged. `handle_get` (rkyv) does `value.to_vec()` (rkyv copies
+    regardless → no regression). Net value copies: VP-over-UCX `get_into` = **0**,
+    generic `get` = same. E2E (1-node UCX rc_mlx5): put-zc/zc-get byte-identical
+    at 1000B/256K/8M; interop both ways (put-zc→get, put→zc-get); rc_mlx5 on
+    PS+EN; zero errors/fallback/short; PS alive. Tests: PS 146, rpc 15, stream
+    56, transport 5, all green both `ucx`/no-`ucx`.
   - PS→EN WRITE hop: the value the PS received (a zero-copy Bytes slice of the
     frame) is appended to log_stream via `append_batch` — already Arc-`Bytes`
     end to end (`encode_v1_segments` keeps the same Arc), so no extra copy; only
     explicit source registration on the PS→EN send would be new (rcache already
     makes it zero-copy). Low priority.
   - PS→client first-cut concat copy in `handle_get_zc` → vectored (emit the
-    PooledBuf value as an aliasing Bytes) — paired with the PS←EN hop.
+    PooledBuf value as an aliasing Bytes) — **DONE 2026-05-21 (R4 above)**.
   - (DONE 2026-05-21) python `BatchClient(zc=True)`: writes→put_zc, reads→
     get_into into the pinned page; `set_transport("ucx")` raises RLIMIT_MEMLOCK;
     adapter opt-in `extra_config["zc"]`; `bench_zc.py` A/B. Measured modest win

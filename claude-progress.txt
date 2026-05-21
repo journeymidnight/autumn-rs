@@ -1,114 +1,78 @@
 Date: 2026-05-21
-TaskStatus: not_completed
+TaskStatus: completed
 Task scope: F216-E — UCX end-to-end zero-copy READ data path for the
             kvcache (sglang HiCache L3). Relay topology (client <- PS <- EN,
-            no partition-layer bypass). Read path first; write/send-registration
-            is Phase 2. Plan: /root/.claude/plans/flickering-sauteeing-pearl.md.
+            no partition-layer bypass). R4 (final read-path copy elimination)
+            implemented + unit-tested + live-UCX e2e PASSED this session.
+            Plan: /root/.claude/plans/flickering-sauteeing-pearl.md.
 
 Current summary:
-  BOTH client-facing hops are DONE and verified end-to-end on a live 1-node
-  cluster, both transports, byte-identical to the normal get/put:
-    - client←PS READ (get_into / MSG_GET_ZC): TCP + UCX(rc_mlx5),
-      large(256K VP/log_stream) / small(inline) / not-found; value CRC
-      verified over the registered dest (memh recv over RDMA).
-    - client→PS WRITE (put_zc / MSG_PUT_ZC, 2026-05-21): value sent as its
-      own iovec (0 client copies vs put's 3), sliced zero-copy on the PS;
-      verified byte-identical round-trip (put-zc → get/zc-get) + put↔put-zc
-      interop, TCP + UCX(rc_mlx5 on PS and EN = registered RDMA send).
+  The read path is now FULLY zero-copy EN -> PS -> client over UCX, and the
+  client-facing WRITE hop (put_zc / MSG_PUT_ZC) was done earlier. R4 closed the
+  last PS-side copies:
+    - resolve_value / read_value_from_log / get_value (background.rs +
+      rpc_handlers.rs) now return `Bytes` instead of `Vec<u8>`. The VP-over-UCX
+      fast path returns `Bytes::from_owner(pb)` ALIASING the registered RegPool
+      buffer (no pb->Vec copy; pb returns to the pool when the Bytes drops). The
+      inline path returns a zero-copy `raw_value.slice(..)`. (`impl AsRef<[u8]>
+      for PooledBuf` added so from_owner can back a Bytes.)
+    - handle_get_zc returns the response as TWO segments `(head, value)`:
+      head = [V0 frame header][zc_meta] (ps_zc_head, mirrors EN zc_read_head),
+      value = the aliasing Bytes. The ps-conn inflight FU output changed
+      Bytes -> (Bytes, Option<Bytes>); push_resp pushes head then value into
+      tx_bufs so ONE write_vectored_all emits them as a single wire frame with
+      NO concat copy. d=1 fast path uses write_vectored_all([head,value]) for ZC,
+      plain write_all(head) otherwise (no write-path regression). On-wire bytes
+      are byte-identical to the pre-R4 concat form -> client read path unchanged.
+    - handle_get (rkyv GetResp, generic SDK) does value.to_vec(); the rkyv
+      encode copies regardless, so the Bytes return does NOT regress it (copy
+      just moves). Net value copies: VP-over-UCX get_into = 0; generic get = same.
 
-  Primitives shipped (all unit-tested, build clean with AND without `ucx`):
-    - RegPool (crates/transport/src/ucx/regpool.rs, 8464122): thread-local
-      pool of UCX-registered buffers, pow2 classes, per-thread memlock cap,
-      over-cap -> unregistered fallback.
-    - recv_into seam (crates/transport/src/lib.rs, e6be8d2):
-      ReadHalf::recv_into(buf, Option<&RegisteredMem>) — UCX+Some ->
-      recv_registered(memh); UCX+None -> recv_unregistered; uniform across
-      feature builds (uninhabited RegisteredMem stub on non-ucx).
-    - memh wiring (crates/transport/src/ucx/endpoint.rs, a41b82f): THE
-      pivotal fix — ucx_recv/ucx_recv_raw now set params.memh +
-      UCP_OP_ATTR_FIELD_MEMH when memh is non-null. Pre-fix registration
-      was a silent no-op (the "registration doesn't help" artifact).
-    - call_into_dest + frame header-only decode (crates/rpc, bc4210b):
-      Pending::IntoDest, RpcClient::call_into_dest(msg_type, payload, dest,
-      cap, reg) -> DestMeta{code, value_len}; ZC framing
-      [code:1][value_len:4 LE][crc32c:4 LE] (ZC_META_LEN=9) + value tail;
-      read_loop dual-path (UCX recv-into-dest vs TCP try_decode +
-      finish_into_dest_from_frame); CRC verified over dest. TCP loopback
-      unit test passes.
-    - PS handle_get_zc (MSG_GET_ZC=0x50, partition-server, b59e632):
-      maps every GetOutcome (value/not-found/error) to a V0 ZC payload;
-      ps-conn emits V0 frame for MSG_GET_ZC, V1 for MSG_GET.
-    - ClusterClient::get_into (crates/client, 6041e7d): retry/epoch-stale
-      shape of call_ps_for_key; reg=Some -> RDMA into the registered dest.
-    - autumn-client `zc-get <KEY>` verification CLI (28b4c64): heads the
-      key, registers a dest (ucx build), get_into, stdout.
-    - WRITE hop (688d0b6): MSG_PUT_ZC=0x51 + binary meta codec
-      [part_id][region_epoch][expires_at][key_len][key][value]
-      (partition_rpc); ClusterClient::put_zc(key, value: Bytes) sends
-      [meta, value] via call_vectored (value = own iovec, 0 client copies;
-      zero-copy send via rcache when source registered); PS enqueue_put_zc
-      slices key+value zero-copy from the frame (vs rkyv decode copy);
-      autumn-client `put-zc <KEY> <FILE>` CLI (registers source on ucx).
+  Builds clean WITH and WITHOUT `ucx`. Unit tests: PS 146, rpc 15, stream 56,
+  transport 5 — all green both configs.
 
-Main gaps (NOT done — next session):
-  1. PS <- EN hop (R3) — DONE + UNIT-TESTED + LIVE UCX E2E PASSED 2026-05-21.
-     e2e (1-node UCX, RoCE rc_mlx5): put-zc + zc-get a 256K value (VP in
-     log_stream → drives MSG_READ_BYTES_ZC + read_value_into_pooled) ==
-     original byte-identical; small(inline)/not-found correct; rc_mlx5 active
-     on EN+PS (10/10); zero errors/eversion/fallback/panic in logs; PS alive
-     throughout. (The bring-up that was blocked earlier worked from a clean
-     minimal detached launch — `(./cluster.sh reset 1 > log &)` with NO
-     preceding kill-loop in the same command + a separate poll/e2e command.)
-     Implemented (6 commits a343473, 93b57a7, c60e1cc, f2aabf8, 0a3a2b5,
-     fdc2a0b): EN MSG_READ_BYTES_ZC (extent_rpc=15) emits V0 [zc_meta][value]
-     2 Bytes (no encode copies); RegPool made transport-agnostic (top-level
-     mod, register call cfg(ucx)) so no feature cascade; RpcClient::
-     call_into_pooled — READ_LOOP owns the PooledBuf, hands it back on success,
-     drops->pool on cancel (NO leak — the corrected design; mem::forget was
-     wrong, see [[feedback-zc-recv-no-leak-on-cancel]]); ConnPool::
-     call_into_pooled timeout wrapper; StreamClient::read_value_into_pooled
-     (UCX + replicated + single-chunk fast path; non-UCX/EC/chunked/eversion/
-     err -> Ok(None) -> read_bytes_from_extent copy path); read_value_from_log
-     uses it then copies pb->Vec (keeps resolve_value -> Vec; R4 will alias).
-     Builds both configs; tests: rpc 15 (incl call_into_pooled_tcp +
-     drop_recv_into_registered_mid_await over RoCE), stream 56, partition 146.
-     NOT YET (R4): resolve_value/handle_get_zc return/alias the PooledBuf to
-     drop the final pb->Vec + handle_get_zc concat copies.
-  2. (DONE 2026-05-21) python BatchClient(zc=True): writes→put_zc, reads→
-     get_into into the pinned page; set_transport("ucx") raises RLIMIT_MEMLOCK;
-     adapter opt-in extra_config["zc"]; bench_zc.py A/B (256K write 1.13×/read
-     1.08×; 1M write 1.15-1.25×/read parity — transport ~2× write diluted by
-     Python/dispatch overhead). NOT YET: register sglang pool once for memh
-     reads (low value, reads parity); harden deep UCX multi-worker (high
-     workers×partitions collapses).
-  3. PS->client first-cut concat copy in handle_get_zc -> vectored (Phase 2
-     polish), once resolve_value returns a PooledBuf the value can be
-     emitted as an aliasing Bytes (no concat).
-  4. PS->EN WRITE hop: the value the PS received is already a zero-copy Bytes
-     slice of the frame and is appended to log_stream via append_batch, which
-     is Arc-Bytes end to end (encode_v1_segments keeps the same Arc) -> no
-     extra copy already. Only explicit source registration on the PS->EN send
-     would be new (rcache already makes it zero-copy). Low priority.
+  LIVE UCX E2E PASSED (1-node, RoCE rc_mlx5, /tmp/autumn-r4):
+    - put-zc + zc-get byte-identical at 1000B (inline), 256K (VP), 8M (VP).
+    - interop both ways: put-zc -> normal get MATCH (handle_get rkyv path);
+      normal put -> zc-get MATCH (R4 vectored path on a normally-written value).
+    - rc_mlx5 active on PS + EN (20/20); zero panic/error/fallback/eversion/
+      short in PS+EN logs; PS alive throughout.
+    (Launch that worked: minimal detached
+     `(AUTUMN_TRANSPORT=ucx AUTUMN_BIND_HOST="[fdbd:dc62:3:302::14]"
+       UCX_TLS="^sysv,posix" AUTUMN_DATA_ROOT=/tmp/autumn-r4 ./cluster.sh reset 1
+       > log &)` as its OWN command, then a SEPARATE poll + put-zc/zc-get/cmp.)
+
+Earlier hops (all DONE + verified, prior sessions):
+  - client<-PS READ (get_into / MSG_GET_ZC): TCP + UCX, large/small/not-found.
+  - client->PS WRITE (put_zc / MSG_PUT_ZC): value as own iovec, sliced
+    zero-copy on PS; byte-identical round-trip + put<->put-zc interop.
+  - PS<-EN READ (R3, MSG_READ_BYTES_ZC + read_value_into_pooled): EN emits
+    [zc_meta][value] 2 Bytes (no encode copy); RpcClient::call_into_pooled
+    read_loop OWNS the PooledBuf, hands it back on success, drops->pool on
+    cancel (no leak). RegPool made transport-agnostic (top-level mod).
+  - primitives: recv_into seam, memh wiring (UCP_OP_ATTR_FIELD_MEMH),
+    RegPool, call_into_dest, RLIMIT_MEMLOCK raise + mt_workers_shared.
+
+Main gaps (NOT done — lower priority, next sessions):
+  1. python BatchClient(zc=True) get_into into the pinned sglang page + register
+     the sglang pool once for memh reads + maturin rebuild + re-bench kvcache
+     (reads were parity; write transport ~2x diluted by Python/dispatch).
+  2. PS->EN WRITE explicit source registration (rcache already makes it
+     zero-copy; the value is already an Arc-Bytes slice end-to-end). Low value.
+  3. Deep UCX multi-worker / DC-transport scaling (separate from the copy work;
+     established as per-op overhead + process serialization, not a real collapse).
 
 Next steps:
-  - R4 (drop the final read-path copies): resolve_value returns the PooledBuf
-    (or a Bytes aliasing it); handle_get_zc emits [zc_meta][value-alias]
-    vectored instead of the extend_from_slice concat. Closes the last pb->Vec
-    + concat copies (R3 left them to keep resolve_value -> Vec / no ripple).
-  - (lower priority) PS->EN WRITE explicit source registration; the deep UCX
-    multi-worker / DC-transport scaling (separate from R3).
-  - Then the python BatchClient get_into + maturin rebuild.
+  - Re-bench kvcache over UCX with the full zero-copy read path (R3+R4) wired
+    into the python adapter (item 1). The intra-host read is RPC/round-trip
+    bound, so the copy elimination's win shows most on large values / fewer RPCs;
+    the real cross-host lever remains one-sided RDMA (3FS model), TCP-incompatible.
 
 Verification this session:
-  cargo test -p autumn-rpc (14 ok, incl call_into_dest_tcp), -p
-  autumn-transport (all ok, incl --features ucx), loopback_ucx 5/5 ok over
-  RoCE (AUTUMN_UCX_TEST_BIND=[fdbd:dc62:3:302::14]:0). e2e zc-get TCP+UCX.
-
-Commits this session: 8464122 (RegPool), a41b82f (memh), 5412473 (bench
-  consolidation), bc4210b (call_into_dest), b59e632 (PS MSG_GET_ZC),
-  6041e7d (client get_into), 28b4c64 (zc-get CLI). Earlier in the arc:
-  e6be8d2 (recv_into seam), 09cddc4/9832b5d/8e8b63b (ps-conn FU + spawn
-  de-serialization).
+  cargo test -p autumn-partition-server (146), -p autumn-rpc (15),
+  -p autumn-stream (56), -p autumn-transport (5) — all ok. Builds clean
+  -p autumn-partition-server (no-ucx) and -p autumn-server --features ucx.
+  Live UCX e2e as above.
 
 Previous task (completed 2026-05-19): F216 autumn-kvcache MVP
   (Python-adapter-only sglang HiCache L3 backend, F216-A..D).

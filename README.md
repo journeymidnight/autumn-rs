@@ -1406,9 +1406,17 @@ AC="./target/release/autumn-client --manager [<roce-ip>]:9001 --transport ucx"
 $AC put-zc k /tmp/v.bin && $AC zc-get k > /tmp/zc.bin && cmp /tmp/v.bin /tmp/zc.bin
 ```
 
-Status: both client↔PS hops (read `get_into`/`zc-get` + write `put_zc`/`put-zc`)
-done + verified (TCP + UCX rc_mlx5). The internal PS↔EN hops and the python
-`BatchClient` wiring are tracked in `feature_list.md` F216-E ("Remaining").
+Status: the **READ path is now fully zero-copy EN → PS → client** over UCX
+(R3 + R4, done + verified). A 256 KiB / 8 MiB value is a VP in `log_stream`, so
+`zc-get` exercises the EN→PS hop (`MSG_READ_BYTES_ZC` + `read_value_into_pooled`,
+value recv'd into a registered RegPool buffer) and the PS→client hop
+(`handle_get_zc` emits `[V0 header][zc_meta]` + the value as a SEPARATE iovec
+aliasing that buffer — `write_vectored_all`, no concat copy). E2E (1-node UCX
+rc_mlx5): byte-identical at 1000 B (inline) / 256 KiB / 8 MiB, both interop
+directions (`put-zc`↔`get`, `put`↔`zc-get`). The client↔PS write hop
+(`put_zc`/`put-zc`) is also done. Remaining (lower priority, see `feature_list.md`
+F216-E): PS→EN explicit send registration (rcache already zero-copy) and the
+python `BatchClient(zc=True)` re-bench.
 
 **A/B the ZC path vs the regular path** with `perf-check --zc` (write→`MSG_PUT_ZC`,
 read→`MSG_GET_ZC` into a registered RegPool dest; without `--zc` the regular

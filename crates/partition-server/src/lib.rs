@@ -3118,9 +3118,23 @@ fn spawn_ps_read(
     .boxed_local()
 }
 
+/// F216 R4 — push a completed response `(head, Option<value>)` into `tx_bufs`.
+/// `head` (frame header + any meta) goes first; for MSG_GET_ZC the `value`
+/// (aliasing the RegPool buffer, no copy) goes immediately after so the next
+/// `write_vectored_all` emits both as one contiguous wire frame. Keeping the
+/// pair adjacent preserves per-connection in-order reply semantics.
+#[inline]
+fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Option<Bytes>)) {
+    let (head, value) = done;
+    tx_bufs.push(head);
+    if let Some(value) = value {
+        tx_bufs.push(value);
+    }
+}
+
 /// F099-I — push ONE frame onto `inflight`, encoded into a
-/// LocalBoxFuture<Bytes>.  Shared by `push_frames_to_inflight` (slow-path
-/// drain) and any caller that already has a single frame in hand.
+/// LocalBoxFuture<(Bytes, Option<Bytes>)>.  Shared by `push_frames_to_inflight`
+/// (slow-path drain) and any caller that already has a single frame in hand.
 ///
 /// Misrouted frames synth an error frame with no mpsc hop.  Caller must
 /// have checked `frame.req_id != 0`; fire-and-forget frames are the
@@ -3132,7 +3146,14 @@ fn push_one_frame_to_inflight(
     // in the mock-loop unit tests (which only drive writes) → GET delegates.
     part: &Option<Rc<RefCell<PartitionData>>>,
     owner_part: u64,
-    inflight: &mut FuturesUnordered<futures::future::LocalBoxFuture<'static, Bytes>>,
+    // F216 R4: each completion is `(head, Option<value>)` — `Some(value)` ONLY
+    // for MSG_GET_ZC, whose value `Bytes` aliases the RegPool buffer and is
+    // emitted as its own iovec (no concat copy). All other frames are `(frame,
+    // None)`. The drain sites push `head` then `value` consecutively into
+    // `tx_bufs` so one `write_vectored_all` flushes them as a single wire frame.
+    inflight: &mut FuturesUnordered<
+        futures::future::LocalBoxFuture<'static, (Bytes, Option<Bytes>)>,
+    >,
 ) {
     use futures::FutureExt;
     let req_id = frame.req_id;
@@ -3148,7 +3169,7 @@ fn push_one_frame_to_inflight(
             &format!("partition {part_id} not served by this P-log (owner={owner_part})"),
         );
         let bytes = Frame::error(req_id, msg_type, err_payload).encode();
-        inflight.push(async move { bytes }.boxed_local());
+        inflight.push(async move { (bytes, None) }.boxed_local());
         return;
     }
 
@@ -3167,20 +3188,16 @@ fn push_one_frame_to_inflight(
             let part_c = part.clone();
             let fut = async move {
                 if msg_type == MSG_GET_ZC {
-                    // F216: value-separable V0 frame so the client recvs the
-                    // value straight into its registered dest. handle_get_zc
-                    // never errors (status rides in the meta code).
-                    match crate::rpc_handlers::handle_get_zc(payload, &part_c).await {
-                        Ok(p) => Frame::response(req_id, msg_type, p).encode_v0(),
-                        Err((code, message)) => Frame::error(
-                            req_id,
-                            msg_type,
-                            autumn_rpc::RpcError::encode_status(code, &message),
-                        )
-                        .encode(),
-                    }
+                    // F216 R4: 2-segment value-separable V0 response — head =
+                    // [V0 header][zc_meta], value aliases the RegPool buffer
+                    // (no concat). handle_get_zc never errors (status rides in
+                    // the meta code). The drain pushes head then value so the
+                    // client recvs the value straight into its registered dest.
+                    let (head, value) =
+                        crate::rpc_handlers::handle_get_zc(req_id, payload, &part_c).await;
+                    (head, Some(value))
                 } else {
-                    match crate::rpc_handlers::handle_get(payload, &part_c).await {
+                    let frame = match crate::rpc_handlers::handle_get(payload, &part_c).await {
                         Ok(p) => Frame::response(req_id, msg_type, p).encode(),
                         Err((code, message)) => Frame::error(
                             req_id,
@@ -3188,7 +3205,8 @@ fn push_one_frame_to_inflight(
                             autumn_rpc::RpcError::encode_status(code, &message),
                         )
                         .encode(),
-                    }
+                    };
+                    (frame, None)
                 }
             };
             inflight.push(fut.boxed_local());
@@ -3232,7 +3250,7 @@ fn push_one_frame_to_inflight(
                 ),
             }
         };
-        resp_frame.encode()
+        (resp_frame.encode(), None)
     };
     inflight.push(fut.boxed_local());
 }
@@ -3256,7 +3274,9 @@ async fn push_frames_to_inflight(
     req_tx: &mpsc::Sender<PartitionRequest>,
     part: &Option<Rc<RefCell<PartitionData>>>,
     owner_part: u64,
-    inflight: &mut FuturesUnordered<futures::future::LocalBoxFuture<'static, Bytes>>,
+    inflight: &mut FuturesUnordered<
+        futures::future::LocalBoxFuture<'static, (Bytes, Option<Bytes>)>,
+    >,
     tx_bufs: &mut Vec<Bytes>,
     cap: usize,
 ) -> Result<()> {
@@ -3266,7 +3286,7 @@ async fn push_frames_to_inflight(
                 // Back-pressure: drain one completion if we're at cap.
                 while inflight.len() >= cap {
                     if let Some(done) = inflight.next().await {
-                        tx_bufs.push(done);
+                        push_resp(tx_bufs, done);
                     } else {
                         break;
                     }
@@ -3301,7 +3321,7 @@ async fn d1_fast_path_round_trip(
     req_tx: &mpsc::Sender<PartitionRequest>,
     part: &Option<Rc<RefCell<PartitionData>>>,
     owner_part: u64,
-) -> Bytes {
+) -> (Bytes, Option<Bytes>) {
     let req_id = frame.req_id;
     let msg_type = frame.msg_type;
     let payload = frame.payload;
@@ -3312,28 +3332,23 @@ async fn d1_fast_path_round_trip(
             StatusCode::NotFound,
             &format!("partition {part_id} not served by this P-log (owner={owner_part})"),
         );
-        return Frame::error(req_id, msg_type, err_payload).encode();
+        return (Frame::error(req_id, msg_type, err_payload).encode(), None);
     }
 
     // F216 (Option B): d=1 GET served locally too — same rationale as
     // push_one_frame_to_inflight. No req_tx hop / partition_loop detour.
     if msg_type == MSG_GET_ZC {
         if let Some(part) = part {
-            // Always V0 ZC framing (handle_get_zc never errors).
-            return match crate::rpc_handlers::handle_get_zc(payload, part).await {
-                Ok(p) => Frame::response(req_id, msg_type, p).encode_v0(),
-                Err((code, message)) => Frame::error(
-                    req_id,
-                    msg_type,
-                    autumn_rpc::RpcError::encode_status(code, &message),
-                )
-                .encode(),
-            };
+            // F216 R4: 2-segment ZC response (head + value-alias, no concat).
+            // handle_get_zc never errors (status rides in the meta code).
+            let (head, value) =
+                crate::rpc_handlers::handle_get_zc(req_id, payload, part).await;
+            return (head, Some(value));
         }
     }
     if msg_type == MSG_GET {
         if let Some(part) = part {
-            return match crate::rpc_handlers::handle_get(payload, part).await {
+            let frame = match crate::rpc_handlers::handle_get(payload, part).await {
                 Ok(p) => Frame::response(req_id, msg_type, p),
                 Err((code, message)) => Frame::error(
                     req_id,
@@ -3342,6 +3357,7 @@ async fn d1_fast_path_round_trip(
                 ),
             }
             .encode();
+            return (frame, None);
         }
         // part == None (unit-test mode): fall through to the req_tx delegate.
     }
@@ -3380,7 +3396,7 @@ async fn d1_fast_path_round_trip(
             ),
         }
     };
-    resp_frame.encode()
+    (resp_frame.encode(), None)
 }
 
 /// Handle a single client connection on the P-log runtime.
@@ -3430,7 +3446,9 @@ async fn handle_ps_connection(
     let mut decoder = FrameDecoder::new();
 
     let cap = ps_conn_inflight_cap();
-    let mut inflight: FuturesUnordered<LocalBoxFuture<'static, Bytes>> =
+    // F216 R4: completion = `(head, Option<value>)`; `Some` only for MSG_GET_ZC
+    // (value aliases the RegPool buffer, emitted as its own iovec — no concat).
+    let mut inflight: FuturesUnordered<LocalBoxFuture<'static, (Bytes, Option<Bytes>)>> =
         FuturesUnordered::new();
     let mut tx_bufs: Vec<Bytes> = Vec::with_capacity(64);
 
@@ -3442,7 +3460,7 @@ async fn handle_ps_connection(
     loop {
         // (A) Opportunistic drain of already-ready completions.
         while let Some(Some(done)) = inflight.next().now_or_never() {
-            tx_bufs.push(done);
+            push_resp(&mut tx_bufs, done);
         }
 
         // (B) Flush accumulated replies with ONE vectored write.
@@ -3507,12 +3525,25 @@ async fn handle_ps_connection(
                             // Engage fast path.
                             PS_FAST_PATH_HITS
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let resp_bytes = d1_fast_path_round_trip(
+                            let (head, value) = d1_fast_path_round_trip(
                                 frame, &req_tx, &part, owner_part,
                             )
                             .await;
-                            let BufResult(wr, _) = writer.write_all(resp_bytes).await;
-                            wr?;
+                            // F216 R4: MSG_GET_ZC returns a separate value iovec
+                            // — write [head, value] vectored; everything else is
+                            // a single frame via write_all (no regression).
+                            match value {
+                                None => {
+                                    let BufResult(wr, _) = writer.write_all(head).await;
+                                    wr?;
+                                }
+                                Some(value) => {
+                                    let BufResult(wr, _) = writer
+                                        .write_vectored_all(vec![head, value])
+                                        .await;
+                                    wr?;
+                                }
+                            }
                             read_fut = Some(spawn_ps_read(reader, buf));
                             continue;
                         }
@@ -3553,7 +3584,7 @@ async fn handle_ps_connection(
             // Back-pressure — only await a completion. The read future
             // stays pinned in `read_fut` untouched.
             if let Some(done) = inflight.next().await {
-                tx_bufs.push(done);
+                push_resp(&mut tx_bufs, done);
             }
             continue;
         }
@@ -3567,7 +3598,7 @@ async fn handle_ps_connection(
         // completion alone, matching the ExtentNode v3 fast-path branch.
         if n_inflight == 1 {
             if let Some(done) = inflight.next().await {
-                tx_bufs.push(done);
+                push_resp(&mut tx_bufs, done);
             }
             continue;
         }
@@ -3584,7 +3615,7 @@ async fn handle_ps_connection(
                         // Drain remaining inflight so clients get their
                         // final replies before we return.
                         while let Some(done) = inflight.next().await {
-                            tx_bufs.push(done);
+                            push_resp(&mut tx_bufs, done);
                         }
                         if !tx_bufs.is_empty() {
                             let bufs = std::mem::take(&mut tx_bufs);
@@ -3613,7 +3644,7 @@ async fn handle_ps_connection(
                 // Completion won; preserve the read future for next iter.
                 read_fut = Some(rfut_back);
                 if let Some(done) = maybe_done {
-                    tx_bufs.push(done);
+                    push_resp(&mut tx_bufs, done);
                 }
             }
         }

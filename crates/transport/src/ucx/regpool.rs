@@ -148,6 +148,16 @@ impl PooledBuf {
     }
 }
 
+/// So a `PooledBuf` can back a `bytes::Bytes` via `Bytes::from_owner(pb)` — the
+/// value aliases the pool buffer (no copy) and returns to the pool when the last
+/// `Bytes` clone drops. Used by `resolve_value` (R4) to hand the EN-read value
+/// onward zero-copy.
+impl AsRef<[u8]> for PooledBuf {
+    fn as_ref(&self) -> &[u8] {
+        self.filled()
+    }
+}
+
 impl Drop for PooledBuf {
     fn drop(&mut self) {
         let Some(slab) = self.slab.take() else { return };

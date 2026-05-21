@@ -2505,7 +2505,7 @@ pub(crate) async fn resolve_value(
     stream_client: &Rc<StreamClient>,
     offset: u32,
     length: u32,
-) -> Result<Vec<u8>> {
+) -> Result<Bytes> {
     if op & OP_VALUE_POINTER != 0 {
         if raw_value.len() < VALUE_POINTER_SIZE {
             return Err(anyhow!("ValuePointer too short"));
@@ -2513,25 +2513,30 @@ pub(crate) async fn resolve_value(
         let vp = ValuePointer::decode(&raw_value[..VALUE_POINTER_SIZE]);
         read_value_from_log(&vp, stream_client, offset, length).await
     } else {
-        let v = raw_value.to_vec();
+        // Inline value already in a memtable Bytes — slice it zero-copy.
+        let n = raw_value.len();
         if offset == 0 && length == 0 {
-            Ok(v)
+            Ok(raw_value)
         } else {
-            let start = (offset as usize).min(v.len());
-            let end = if length == 0 { v.len() } else { (start + length as usize).min(v.len()) };
-            Ok(v[start..end].to_vec())
+            let start = (offset as usize).min(n);
+            let end = if length == 0 { n } else { (start + length as usize).min(n) };
+            Ok(raw_value.slice(start..end))
         }
     }
 }
 
 /// Read value bytes from logStream. VP.offset points to value start.
-/// `offset`/`length` = 0/0 means read the entire value.
+/// `offset`/`length` = 0/0 means read the entire value. Returns a `Bytes`:
+/// R4 — on the UCX zero-copy fast path the value `Bytes` ALIASES the registered
+/// RegPool buffer (`Bytes::from_owner(pb)`, no copy), so handle_get_zc can send
+/// it as its own iovec (fully copy-free EN->PS->client); on the copy-path
+/// fallback the Vec is moved into a Bytes.
 pub(crate) async fn read_value_from_log(
     vp: &ValuePointer,
     stream_client: &Rc<StreamClient>,
     offset: u32,
     length: u32,
-) -> Result<Vec<u8>> {
+) -> Result<Bytes> {
     let (read_off, read_len) = if offset == 0 && length == 0 {
         (vp.offset, vp.len)
     } else {
@@ -2539,17 +2544,16 @@ pub(crate) async fn read_value_from_log(
         let len = if length == 0 { vp.len - off } else { length.min(vp.len - off) };
         (vp.offset + off, len)
     };
-    // F216-E R3: zero-copy fast path — recv the value straight into a registered
-    // RegPool buffer over UCX (MSG_READ_BYTES_ZC, removing the EN's encode
-    // copies + the off-wire copy). We still copy pb -> Vec here to keep
-    // resolve_value's `Vec` return (R4 will hand the PooledBuf onward to drop
-    // this last copy). Any non-OK / EC / chunked / non-UCX case returns None →
-    // the proven read_bytes_from_extent copy path below.
+    // F216-E R3/R4: zero-copy fast path — recv the value straight into a
+    // registered RegPool buffer over UCX (MSG_READ_BYTES_ZC) and hand it onward
+    // as a Bytes ALIASING that buffer (from_owner; pb returns to the pool when
+    // the Bytes drops). No off-wire copy, no pb->Vec. Any non-OK / EC / chunked
+    // / non-UCX case returns None -> the proven read_bytes_from_extent copy path.
     if let Ok(Some((pb, _n))) = stream_client
         .read_value_into_pooled(vp.extent_id, read_off, read_len)
         .await
     {
-        return Ok(pb.filled().to_vec());
+        return Ok(Bytes::from_owner(pb));
     }
     let (data, _) = stream_client
         .read_bytes_from_extent(vp.extent_id, read_off, read_len)
@@ -2560,7 +2564,7 @@ pub(crate) async fn read_value_from_log(
             read_len, data.len(), vp.extent_id, read_off
         ));
     }
-    Ok(data)
+    Ok(Bytes::from(data))
 }
 
 // ---------------------------------------------------------------------------
