@@ -979,4 +979,45 @@ mod tests {
         assert_eq!(dest, value, "value bytes landed in dest");
         srv.join().expect("server thread");
     }
+
+    /// F216-E — `call_into_pooled` recvs a value-separable response into a
+    /// read_loop-owned `PooledBuf` (TCP path = decode + copy), value CRC
+    /// verified, `(PooledBuf, code)` handed back. Proves the cancel-safe
+    /// primitive's happy path before the UCX zero-copy + EN/PS wiring.
+    #[compio::test]
+    async fn call_into_pooled_tcp_returns_filled_buffer() {
+        use std::io::{Read, Write};
+        let _ = autumn_transport::current_or_init(); // TCP
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+        let value: Vec<u8> = (0..4096u32).map(|i| ((i * 7) & 0xff) as u8).collect();
+        let value_srv = value.clone();
+
+        let srv = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut hdr = [0u8; 10];
+            sock.read_exact(&mut hdr).expect("read req hdr");
+            let req_id = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+            let plen = u32::from_le_bytes(hdr[6..10].try_into().unwrap()) as usize;
+            let mut req_payload = vec![0u8; plen];
+            sock.read_exact(&mut req_payload).expect("read req payload");
+            let meta = encode_zc_meta(0 /*OK*/, &value_srv);
+            let mut payload = Vec::with_capacity(meta.len() + value_srv.len());
+            payload.extend_from_slice(&meta);
+            payload.extend_from_slice(&value_srv);
+            let bytes = Frame::response(req_id, 15, Bytes::from(payload)).encode_v0();
+            sock.write_all(&bytes).expect("write resp");
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        let client = RpcClient::connect(server_addr).await.expect("connect");
+        let (pb, code) = client
+            .call_into_pooled(15, Bytes::from_static(b"req"))
+            .await
+            .expect("call_into_pooled");
+        assert_eq!(code, 0);
+        assert_eq!(pb.filled(), &value[..], "value bytes landed in the pool buffer");
+        srv.join().expect("server thread");
+    }
 }
