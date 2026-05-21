@@ -1,67 +1,62 @@
 Date: 2026-05-21
 TaskStatus: completed
-Task scope: F216-E follow-up — make zero-copy the DEFAULT on the UCX transport
-            and REMOVE the `--zc` opt-in flag ("只要transport是ucx,就默认是
-            zerocopy"), gated on a fresh perf_check A/B (post-R4).
+Task scope: F216-E W1 — PS write-recv zero-copy. Recv LARGE MSG_PUT_ZC values
+            straight into a registered PooledBuf on the PS (UCX RDMA, no
+            off-wire copy) instead of FrameDecoder-accumulating them. Size-gated
+            (the user's "transport auto-selects ZC by size" direction, applied
+            to the write recv).
 
 Current summary:
-  DONE + verified. Zero-copy is now automatic whenever the transport is UCX;
-  the `--zc` flag is removed (kept as a warn-once no-op for old scripts).
+  DONE + verified. `drain_zc_writes` (lib.rs) runs in the ps-conn read loop
+  right after decoder.feed, before normal decode:
+    - If the FRONT frame is a UCX MSG_PUT_ZC with value >=
+      AUTUMN_PS_ZC_RECV_MIN_BYTES (64 KiB) and <= the inline cap, and
+      part_id == owner_part: peek_header + peek_payload (new FrameDecoder
+      helpers) locate the value boundary WITHOUT consuming; consume header+
+      meta+key; drain buffered value prefix into a PooledBuf; recv_into the
+      remainder (registered RDMA on UCX). V1 payload CRC validated over
+      meta||key||value via compute_payload_crc.
+    - Value rides onward as Bytes::from_owner(pb) via a NEW
+      PartitionRequest.zc_value: Option<Bytes>; payload carries only
+      [meta][key]. enqueue_put_zc uses zc_value directly when present (no
+      concat-back copy), else slices from payload as before.
+    - Gated on reader.is_ucx() (TCP unchanged); small writes (< 64 KiB) keep
+      the FrameDecoder path (only added cost there: one peek_header + branch).
+    - d=1 fast path skipped when drain_zc_writes queued a reply
+      (inflight.is_empty() guard) to preserve in-order replies.
+    - Cancel-safe: drain_zc_writes owns the PooledBuf across the recv; on conn
+      error / task drop, recv_into's InflightSlot drains UCX before the buffer
+      returns to the pool (no leak — same rule as the read path).
+    - PS_ZC_WRITE_RECV_HITS counts engagements; logged once on first engage.
 
-  Policy (size-asymmetric, derived from a perf_check A/B):
-    - WRITES: ZC always on UCX (MSG_PUT_ZC). Cheaper at every size — drops the
-      regular put's to_vec + clone + rkyv encode. A/B: 4K 2.6×, 8M 1.96×.
-    - READS: ZC on UCX only when value >= UCX_ZC_READ_MIN_BYTES (64 KiB), else
-      regular. A/B: 4K read 0.82× (−18%, registered-recv per-op overhead >
-      the tiny copy) → guarded to regular; 8M read 2.34× (the R4 fully-ZC read
-      path, was "parity" pre-R4). Crossover ≈ 16–64 K; 64 K is the safe guard.
-    - TCP: regular path unchanged.
+  Why W1 only (not W2/EN-recv): W2 is structurally limited — EN uses buffered
+  pwrite (no O_DIRECT), so recv-into-registered only saves one memcpy and breaks
+  the EN batch-pwritev model. True NIC->disk DMA needs O_DIRECT + io_uring
+  registered buffers (3FS model), a bigger change. PS-recv (W1) is clean: large
+  value -> registered buffer -> forwarded to EN (send already rcache-ZC), value
+  never enters memtable (only the VP does).
 
-  Implementation (one threshold const, 3 callers):
-    - crates/client/src/lib.rs: pub const UCX_ZC_READ_MIN_BYTES = 64*1024
-      (shared source of truth for CLI + python).
-    - autumn-client perf-check (crates/server/src/bin/autumn_client.rs):
-      removed `--zc` flag + the PerfCheck.zc field; `is_ucx` from
-      args.transport; zc_write=is_ucx, zc_read=is_ucx && value_size>=thresh;
-      warn_zc_flag_deprecated_once() no-op for back-compat.
-    - python (python/src/lib.rs): global IS_UCX set by set_transport; run_job
-      takes is_ucx (per-page size guard on reads, always-ZC writes);
-      BatchClient::new dropped the `zc` param (derives from IS_UCX); zc()
-      accessor now reports is_ucx.
-    - kvcache adapter (sglang_backend.py): removed extra_config["zc"] opt-in;
-      auto on transport=="ucx". bench_zc.py rewritten to single-path (A/B is
-      now transport-level: run once per AUTUMN_TRANSPORT).
-
-  Verification:
-    - Builds clean WITH and WITHOUT `ucx`: autumn-server, autumn-client,
-      python (via manifest). Unit tests: client 6, partition 146, rpc 15,
-      stream 56, transport 5.
-    - Live UCX cluster (8 partitions, rc_mlx5): auto path-selection correct —
-      4K tag "[ZC: MSG_PUT_ZC; read regular (value < ZC threshold)]", 8M tag
-      "[ZC: MSG_PUT_ZC + MSG_GET_ZC]". perf_check A/B numbers as above.
-    - Python wheel rebuilt (maturin develop --release --features ucx); live
-      smoke: set_transport("ucx") → bc.zc()==True → 64×256K put_from+get_into
-      byte-identical over rc_mlx5.
-
-Design note (regpool / UCX auto bcopy-vs-zcopy — user asked, decided to KEEP):
-  UCX auto-selects bcopy/zcopy and even auto-registers via rcache, BUT only
-  amortizes if buffers are REUSED — UCX can't decide to reuse YOUR buffers, and
-  the recv must land in a specific dest. So regpool's real job = buffer reuse +
-  cancel-safe lifecycle, NOT protocol switching (sends already fully UCX-managed,
-  no regpool). Decision: keep the proven memh+regpool; the simplification (drop
-  explicit memh, lean on rcache + reuse; production = register the sglang pool
-  once so the standalone regpool isn't needed on the real path) is a follow-up.
+Verification:
+  - Builds clean WITH and WITHOUT `ucx` (partition-server, autumn-server).
+    Unit tests: partition 146, rpc 15 (incl the new FrameDecoder peek_payload).
+  - Live UCX cluster (rc_mlx5), put-zc roundtrip byte-identical: 256K, 8M
+    (both >= 64K -> W1 ZC-recv), 1000B (< 64K -> normal path); interop
+    put-zc -> normal get (8M) MATCH. ps.log confirms
+    "PS write-recv ZC engaged (MSG_PUT_ZC recv into registered buffer)
+     value_len=262144" — the path actually fired, CRC validated (no mismatch),
+    no panic/eof, PS alive.
+  - Write smoke (P=1 d8 t8 UCX): 4K write 58 MB/s, 8M write 345 MB/s — no
+    cliff; large writes flow through W1 ZC-recv.
 
 Main gaps (lower priority, next sessions):
-  1. (follow-up) Investigate dropping explicit memh on recv + leaning on rcache
-     auto bcopy/zcopy with buffer reuse — could remove the size-guard too if
-     UCX auto-picks cheap bcopy for small. Needs measurement.
-  2. Register the sglang host pool once for memh reads (production regpool
-     replacement on the real path).
-  3. PS→EN WRITE explicit source registration (rcache already zero-copy).
-  4. Deep UCX multi-worker / DC scaling (per-op overhead + process
-     serialization, not a real collapse).
+  1. W2 (EN write-recv ZC) — needs O_DIRECT + io_uring registered buffers to be
+     worthwhile (3FS model). Structural, deferred.
+  2. The "let UCX auto-select ZC on recv" experiment (drop explicit memh, lean
+     on rcache + buffer reuse → could remove the app-level size thresholds).
+  3. Register the sglang host pool once for memh reads (production regpool
+     replacement on the real kvcache path).
+  4. Deep UCX multi-worker / DC scaling.
 
-Previous task (completed 2026-05-21): F216-E R4 — fully zero-copy
-  EN→PS→client UCX read (resolve_value→Bytes::from_owner, handle_get_zc
-  2-segment vectored). Commit dcf9c18.
+Previous tasks (completed 2026-05-21): F216-E R4 (fully zero-copy
+  EN->PS->client read, commit dcf9c18); "ucx => zerocopy" default + --zc flag
+  removal with size-guarded reads (commit 8e3636a).

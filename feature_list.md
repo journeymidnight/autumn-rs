@@ -3073,6 +3073,28 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
     auto path-selection correct (4K tag = write-ZC/read-regular, 8M = both-ZC);
     python smoke (`bc.zc()=True`, 64×256K put_from+get_into byte-identical over
     rc_mlx5).
+  - **W1 — PS write-recv ZC (size-gated, 2026-05-21).** `drain_zc_writes`
+    (partition-server lib.rs) recvs LARGE `MSG_PUT_ZC` values (≥
+    `AUTUMN_PS_ZC_RECV_MIN_BYTES` = 64 KiB, ≤ inline cap) straight into a
+    registered `PooledBuf` via `ReadHalf::recv_into` instead of
+    FrameDecoder-accumulating them — saves the off-wire + decoder-accumulation
+    copy of the value on the PS. Runs in the ps-conn read loop after `feed`,
+    before normal decode; uses new `FrameDecoder::peek_payload` to read
+    part_id/key_len without consuming; validates the V1 CRC over `meta‖key‖value`
+    (`compute_payload_crc`); routes via a new `PartitionRequest.zc_value:
+    Option<Bytes>` (= `Bytes::from_owner(pb)`, no concat-back). Gated on
+    `reader.is_ucx()` + `part_id==owner_part` (TCP / small / mis-routed →
+    unchanged FrameDecoder path; d=1 fast path skipped when a ZC reply was
+    queued, in-order preserved). Cancel-safe (owns the PooledBuf across the
+    recv). `PS_ZC_WRITE_RECV_HITS` counter + once-log. Verified: builds both
+    configs; partition 146 / rpc 15 tests; live UCX put-zc 256K/8M byte-identical
+    + ps.log "PS write-recv ZC engaged value_len=262144" + small(1000B) via
+    normal path + interop; write smoke no cliff. Resolves the earlier "don't ZC
+    write-recv" (that was "don't ZC SMALL write-recv"; the size gate fixes it).
+    **W2 (EN write-recv) deferred — structural** (EN buffered pwrite has no
+    O_DIRECT, so recv-into-registered only saves one memcpy AND breaks
+    batch-pwritev; true NIC→disk DMA needs O_DIRECT + io_uring registered
+    buffers, the 3FS model).
 - **Remaining (both internal PS↔EN hops deferred for cancel-safety / scope):**
   - PS←EN READ hop (R3): **DONE + UNIT-TESTED + LIVE UCX E2E PASSED 2026-05-21**
     (1-node UCX rc_mlx5: put-zc + zc-get a 256K VP value == byte-identical via

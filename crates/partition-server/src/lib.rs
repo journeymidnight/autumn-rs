@@ -438,6 +438,15 @@ const FREEZE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 // `put_stream_begin` (client-side striping).
 pub(crate) const AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT: u32 = 64 * 1024 * 1024;
 
+/// F216-E (PS write-recv ZC, W1): minimum `MSG_PUT_ZC` value size for which the
+/// ps-conn recvs the value straight into a registered `PooledBuf` (UCX RDMA, no
+/// off-wire copy) instead of letting the `FrameDecoder` accumulate it. Below
+/// this the per-op recv-into-registered overhead (regpool_acquire + memh +
+/// staged recv) exceeds the copy saved — same size-asymmetry as the read path's
+/// `UCX_ZC_READ_MIN_BYTES`. Only consulted on the UCX transport (`reader.is_ucx()`);
+/// TCP keeps the proven FrameDecoder path. 64 KiB matches the read threshold.
+pub(crate) const AUTUMN_PS_ZC_RECV_MIN_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ValuePointer {
     extent_id: u64,
@@ -1295,6 +1304,14 @@ pub struct PartitionRequest {
     msg_type: u8,
     payload: Bytes,
     resp_tx: oneshot::Sender<HandlerResult>,
+    /// F216-E (PS write-recv ZC, W1): for a LARGE `MSG_PUT_ZC`, the ps-conn
+    /// recvs the value straight into a registered `PooledBuf` (no off-wire
+    /// copy) and carries it here as a `Bytes` aliasing that buffer; `payload`
+    /// then holds only `[meta][key]`. `enqueue_put_zc` uses this directly
+    /// instead of slicing the value out of `payload` (which would require
+    /// concatenating it back in — the copy we're avoiding). `None` for every
+    /// other request (the value, if any, is sliced from `payload` as before).
+    zc_value: Option<Bytes>,
 }
 
 /// Handle to a running partition thread.
@@ -3056,6 +3073,12 @@ fn ps_conn_inflight_cap() -> usize {
 pub(crate) static PS_FAST_PATH_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// F216-E (W1) — count of `MSG_PUT_ZC` values recv'd straight into a registered
+/// `PooledBuf` by `drain_zc_writes` (the PS write-recv zero-copy path). Logged
+/// once on first engage so operators / e2e can confirm the path is live.
+pub(crate) static PS_ZC_WRITE_RECV_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Workspace-wide serialization guard for tests that exercise
 /// `handle_ps_connection`. The function bumps a process-global counter
 /// (`PS_FAST_PATH_HITS`) so any parallel test using the same path
@@ -3129,6 +3152,180 @@ fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Option<Bytes>)) {
     tx_bufs.push(head);
     if let Some(value) = value {
         tx_bufs.push(value);
+    }
+}
+
+/// F216-E (PS write-recv ZC, W1) — drain LARGE `MSG_PUT_ZC` frames at the FRONT
+/// of `decoder`, recv'ing each value straight into a registered `PooledBuf`
+/// (UCX RDMA, no off-wire copy) instead of letting `FrameDecoder` accumulate it
+/// (which would copy the whole value into the decoder buffer). Each is routed as
+/// a `PartitionRequest { payload = [meta][key], zc_value = Some(value) }` so
+/// `enqueue_put_zc` uses the value directly (no concat back). Returns as soon as
+/// the front frame is NOT an eligible large UCX `MSG_PUT_ZC` (the caller then
+/// runs the normal decode path on the remainder).
+///
+/// The V1 payload CRC (over `meta || key || value`) is validated incrementally:
+/// the small `[meta][key]` prefix is copied out, the value lands in the
+/// `PooledBuf`, and `compute_payload_crc([meta_key, value])` is checked against
+/// the wire trailer (keeps the F165 corruption guarantee end-to-end).
+///
+/// Cancel-safe: the `PooledBuf` is owned here for the whole recv; on connection
+/// error / task drop the `recv_into`'s `InflightSlot` drains UCX before the
+/// buffer drops back to the pool (no leak, no NIC-writes-to-freed-memory).
+/// UCX-only (gated on `reader.is_ucx()`); TCP keeps the proven decode path.
+#[allow(clippy::too_many_arguments)]
+async fn drain_zc_writes(
+    decoder: &mut FrameDecoder,
+    reader: &mut autumn_transport::ReadHalf,
+    req_tx: &mpsc::Sender<PartitionRequest>,
+    owner_part: u64,
+    inflight: &mut FuturesUnordered<futures::future::LocalBoxFuture<'static, (Bytes, Option<Bytes>)>>,
+    tx_bufs: &mut Vec<Bytes>,
+    cap: usize,
+) -> Result<()> {
+    use futures::FutureExt;
+    // Only UCX benefits (registered RDMA recv); TCP recv_into is unsupported.
+    if !reader.is_ucx() {
+        return Ok(());
+    }
+    loop {
+        let Some((req_id, msg_type, flags, payload_len)) = decoder.peek_header() else {
+            return Ok(());
+        };
+        if msg_type != MSG_PUT_ZC || req_id == 0 {
+            return Ok(()); // not a ZC write at the front → normal path
+        }
+        let has_crc = flags & autumn_rpc::frame::FLAG_CRC != 0;
+        let inner_len = if has_crc {
+            (payload_len as usize).saturating_sub(4)
+        } else {
+            payload_len as usize
+        };
+        if inner_len < AUTUMN_PS_ZC_RECV_MIN_BYTES {
+            return Ok(()); // small write → cheaper via FrameDecoder
+        }
+        // Need the fixed meta prefix buffered to read part_id + key_len.
+        let Some(meta_prefix) = decoder.peek_payload(PUT_ZC_HEADER_LEN) else {
+            return Ok(()); // not enough buffered yet → next read accumulates it
+        };
+        let part_id = u64::from_le_bytes(meta_prefix[0..8].try_into().unwrap());
+        let key_len = u32::from_le_bytes(meta_prefix[24..28].try_into().unwrap()) as usize;
+        if part_id != owner_part {
+            return Ok(()); // mis-routed → normal path synths the NotFound
+        }
+        let Some(value_offset) = PUT_ZC_HEADER_LEN.checked_add(key_len) else {
+            return Ok(());
+        };
+        if value_offset > inner_len {
+            return Ok(()); // malformed → let normal decode reject it
+        }
+        let value_len = inner_len - value_offset;
+        if value_len < AUTUMN_PS_ZC_RECV_MIN_BYTES
+            || value_len > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize
+        {
+            // Below threshold, or over the inline cap (enqueue_put_zc rejects
+            // the latter) — let the normal path handle it.
+            return Ok(());
+        }
+        // Need the full [meta][key] buffered to locate the value boundary.
+        let Some(meta_key_slice) = decoder.peek_payload(value_offset) else {
+            return Ok(()); // wait for more (meta+key is tiny; ~always next read)
+        };
+        let meta_key = Bytes::copy_from_slice(meta_key_slice); // small copy
+
+        // Back-pressure before adding another in-flight reply.
+        while inflight.len() >= cap {
+            if let Some(done) = inflight.next().await {
+                push_resp(tx_bufs, done);
+            } else {
+                break;
+            }
+        }
+
+        // Commit: drop header + meta + key, recv the value into a registered buf.
+        decoder.consume(autumn_rpc::HEADER_LEN + value_offset);
+        let mut pb = autumn_transport::regpool_acquire(value_len);
+        let mut filled;
+        {
+            let (dest, reg) = pb.dest_and_reg();
+            filled = decoder.drain_into(dest); // buffered value prefix (no socket)
+            while filled < value_len {
+                let n = reader.recv_into(&mut dest[filled..], reg).await?;
+                if n == 0 {
+                    return Err(anyhow!(
+                        "eof mid MSG_PUT_ZC value (got {filled}/{value_len})"
+                    ));
+                }
+                filled += n;
+            }
+        }
+        let value = Bytes::from_owner(pb);
+        // Validate the V1 payload CRC over meta || key || value.
+        if has_crc {
+            let mut crc_buf = [0u8; 4];
+            let mut got = decoder.drain_into(&mut crc_buf);
+            while got < 4 {
+                let n = reader.recv_into(&mut crc_buf[got..], None).await?;
+                if n == 0 {
+                    return Err(anyhow!("eof mid MSG_PUT_ZC crc"));
+                }
+                got += n;
+            }
+            let want = autumn_rpc::frame::compute_payload_crc(&[meta_key.clone(), value.clone()]);
+            if crc_buf != want {
+                return Err(anyhow!("MSG_PUT_ZC crc mismatch (zc-recv)"));
+            }
+        }
+
+        // Observability: count + log-once that the ZC write-recv path is live.
+        if PS_ZC_WRITE_RECV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            tracing::info!(
+                value_len,
+                "F216-E: PS write-recv ZC engaged (MSG_PUT_ZC recv into registered buffer)"
+            );
+        }
+
+        // Route into partition_loop (writes are single-writer there).
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let req = PartitionRequest {
+            msg_type: MSG_PUT_ZC,
+            payload: meta_key,
+            resp_tx,
+            zc_value: Some(value),
+        };
+        let mut tx = req_tx.clone();
+        let fut = async move {
+            let resp_frame = if tx.send(req).await.is_err() {
+                Frame::error(
+                    req_id,
+                    MSG_PUT_ZC,
+                    autumn_rpc::RpcError::encode_status(
+                        StatusCode::Internal,
+                        "partition thread closed",
+                    ),
+                )
+            } else {
+                match resp_rx.await {
+                    Ok(Ok(p)) => Frame::response(req_id, MSG_PUT_ZC, p),
+                    Ok(Err((code, message))) => Frame::error(
+                        req_id,
+                        MSG_PUT_ZC,
+                        autumn_rpc::RpcError::encode_status(code, &message),
+                    ),
+                    Err(_) => Frame::error(
+                        req_id,
+                        MSG_PUT_ZC,
+                        autumn_rpc::RpcError::encode_status(
+                            StatusCode::Internal,
+                            "partition response dropped",
+                        ),
+                    ),
+                }
+            };
+            (resp_frame.encode(), None)
+        };
+        inflight.push(fut.boxed_local());
+        // Loop to handle a possible next large MSG_PUT_ZC at the new front.
     }
 }
 
@@ -3222,6 +3419,7 @@ fn push_one_frame_to_inflight(
             msg_type,
             payload,
             resp_tx,
+            zc_value: None,
         };
         let resp_frame = if tx.send(req).await.is_err() {
             Frame::error(
@@ -3367,6 +3565,7 @@ async fn d1_fast_path_round_trip(
         msg_type,
         payload,
         resp_tx,
+        zc_value: None,
     };
     let mut tx = req_tx.clone();
     let resp_frame = if tx.send(req).await.is_err() {
@@ -3482,8 +3681,19 @@ async fn handle_ps_connection(
             match rfut.await {
                 PsReadBurst::Eof { .. } => return Ok(()),
                 PsReadBurst::Err { e, .. } => return Err(e.into()),
-                PsReadBurst::Data { buf, n, reader } => {
+                PsReadBurst::Data { buf, n, mut reader } => {
                     decoder.feed(&buf[..n]);
+
+                    // F216-E W1: recv any LARGE MSG_PUT_ZC value(s) at the front
+                    // straight into a registered PooledBuf (no off-wire copy)
+                    // before the normal decode buffers them. UCX-only; no-op
+                    // otherwise. May push write replies onto `inflight`, which
+                    // disables the d=1 fast path below (guarded by is_empty()).
+                    drain_zc_writes(
+                        &mut decoder, &mut reader, &req_tx, owner_part,
+                        &mut inflight, &mut tx_bufs, cap,
+                    )
+                    .await?;
 
                     // F099-I-fix — d=1 fast path.
                     //
@@ -3521,7 +3731,11 @@ async fn handle_ps_connection(
                     let first = decoder.try_decode().map_err(|e| anyhow!(e))?;
                     if let Some(frame) = first {
                         let more = decoder.try_decode().map_err(|e| anyhow!(e))?;
-                        if more.is_none() && frame.req_id != 0 {
+                        // `inflight.is_empty()`: drain_zc_writes above may have
+                        // queued a write reply — if so, the d=1 inline path would
+                        // write its response ahead of that reply, breaking in-order
+                        // semantics. Fall through to the FU path in that case.
+                        if more.is_none() && frame.req_id != 0 && inflight.is_empty() {
                             // Engage fast path.
                             PS_FAST_PATH_HITS
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3624,8 +3838,15 @@ async fn handle_ps_connection(
                         return Ok(());
                     }
                     PsReadBurst::Err { e, .. } => return Err(e.into()),
-                    PsReadBurst::Data { buf, n, reader } => {
+                    PsReadBurst::Data { buf, n, mut reader } => {
                         decoder.feed(&buf[..n]);
+                        // F216-E W1: recv large MSG_PUT_ZC values into registered
+                        // buffers first (UCX-only; no-op otherwise).
+                        drain_zc_writes(
+                            &mut decoder, &mut reader, &req_tx, owner_part,
+                            &mut inflight, &mut tx_bufs, cap,
+                        )
+                        .await?;
                         push_frames_to_inflight(
                             &mut decoder,
                             &req_tx,
@@ -4869,7 +5090,14 @@ fn enqueue_put_zc(req: PartitionRequest, pending: &mut Vec<WriteRequest>, part_r
     }
     // Zero-copy slices of the frame payload (Bytes refcount, no memcpy).
     let key = req.payload.slice(PUT_ZC_HEADER_LEN..meta.value_offset);
-    let value = req.payload.slice(meta.value_offset..);
+    // F216-E W1: a LARGE value was recv'd straight into a registered PooledBuf
+    // by the ps-conn (zc_value = a Bytes aliasing it, no off-wire copy); use it
+    // directly. Otherwise (small / TCP) slice the value out of `payload` as
+    // before. `payload` holds only `[meta][key]` in the zc_value case.
+    let value = match req.zc_value {
+        Some(v) => v,
+        None => req.payload.slice(meta.value_offset..),
+    };
     if value.len() > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize {
         let resp = PutResp {
             code: CODE_VALUE_TOO_LARGE,
@@ -6996,6 +7224,7 @@ mod merged_loop_tests {
                 msg_type: MSG_PUT,
                 payload: Bytes::from(payload),
                 resp_tx,
+                zc_value: None,
             },
             resp_rx,
         )
@@ -7016,6 +7245,7 @@ mod merged_loop_tests {
                 msg_type: MSG_DELETE,
                 payload: Bytes::from(payload),
                 resp_tx,
+                zc_value: None,
             },
             resp_rx,
         )

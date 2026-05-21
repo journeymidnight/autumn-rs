@@ -420,6 +420,39 @@ the registration). Cancel-safety of the registered recv lives in the read_loop
 that OWNS the `PooledBuf` (returns it to the pool on cancel — never leaks); see
 `autumn-transport/src/ucx/regpool.rs` + `autumn-rpc/src/client.rs`.
 
+### F216-E W1 — PS write-recv zero-copy (`MSG_PUT_ZC`, large values)
+
+Symmetric to the read path, on the WRITE recv side. `drain_zc_writes` (lib.rs)
+runs in the ps-conn read loop right after `decoder.feed`, BEFORE the normal
+decode: if the FRONT frame is a UCX `MSG_PUT_ZC` whose value is
+`≥ AUTUMN_PS_ZC_RECV_MIN_BYTES` (64 KiB), it recvs the value straight into a
+registered `PooledBuf` via `ReadHalf::recv_into(dest, reg)` instead of letting
+`FrameDecoder` accumulate (and copy) the whole value. Mechanics:
+
+- `peek_header` + `peek_payload` (new on `FrameDecoder`) read the frame header
+  and the `[part_id][..][key_len][key]` meta WITHOUT consuming, to locate the
+  value boundary. Gated on `reader.is_ucx()` (TCP keeps the proven decode path),
+  `part_id == owner_part` (mis-routed → normal path synths NotFound), and the
+  size band `[64 KiB, AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT]`.
+- It then `consume`s the header+meta+key, `drain_into`s any buffered value
+  prefix into the `PooledBuf`, and `recv_into`s the remainder. The **V1 payload
+  CRC** (over `meta‖key‖value`) is validated via `compute_payload_crc([meta_key,
+  value])` against the wire trailer (keeps the F165 guarantee).
+- The value rides onward as `Bytes::from_owner(pb)` (aliases the pool buffer, no
+  copy) via a NEW `PartitionRequest.zc_value: Option<Bytes>` field; `payload`
+  carries only `[meta][key]`. `enqueue_put_zc` uses `zc_value` directly when
+  present (else slices from `payload` as before). The value never gets the
+  off-wire / decoder-accumulation copy; the PS→EN `append_batch` send is already
+  rcache-zero-copy from the registered buffer.
+- Cancel-safe: `drain_zc_writes` owns the `PooledBuf` across the recv; on conn
+  error / task drop, `recv_into`'s `InflightSlot` drains UCX before the buffer
+  returns to the pool. The d=1 fast path is skipped when `drain_zc_writes`
+  queued a reply (`inflight.is_empty()` guard) to keep in-order replies.
+- `PS_ZC_WRITE_RECV_HITS` counts engagements; logged once on first engage.
+
+Small writes (< 64 KiB) and TCP keep the unchanged FrameDecoder path — the only
+added cost there is one `peek_header` + a size-check branch per frame.
+
 ## Flush Pipeline (F088: cross-thread hand-off)
 
 Triggered when `active` exceeds `FLUSH_MEM_BYTES` (256 MB).

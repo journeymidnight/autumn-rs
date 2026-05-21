@@ -310,6 +310,19 @@ impl FrameDecoder {
         ))
     }
 
+    /// Peek the first `n` payload bytes (the bytes after the `HEADER_LEN`
+    /// header) without consuming, once they are buffered. Returns `None` until
+    /// `HEADER_LEN + n` bytes are present. Lets a server read_loop read a
+    /// value-separable request's meta/key prefix (e.g. `MSG_PUT_ZC`'s
+    /// `[part_id][..][key_len][key]`) to locate the value boundary BEFORE
+    /// deciding to recv the value straight into a registered dest.
+    pub fn peek_payload(&self, n: usize) -> Option<&[u8]> {
+        if self.buf.len() < HEADER_LEN + n {
+            return None;
+        }
+        Some(&self.buf[HEADER_LEN..HEADER_LEN + n])
+    }
+
     /// Advance past `n` already-buffered bytes (e.g. a peeked header).
     pub fn consume(&mut self, n: usize) {
         self.buf.advance(n);
