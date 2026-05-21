@@ -75,6 +75,12 @@ enum Command {
     Get {
         key: String,
     },
+    /// F216 verification: zero-copy GET via ClusterClient::get_into. heads
+    /// the key, allocates a dest buffer, registers it for UCX zero-copy
+    /// (ucx build only), reads the value straight into dest, writes to stdout.
+    ZcGet {
+        key: String,
+    },
     Del {
         key: String,
     },
@@ -261,6 +267,15 @@ fn parse_args() -> Args {
                 std::process::exit(1);
             }
             Command::Get {
+                key: raw[i].clone(),
+            }
+        }
+        "zc-get" => {
+            if i >= raw.len() {
+                eprintln!("zc-get requires <KEY>");
+                std::process::exit(1);
+            }
+            Command::ZcGet {
                 key: raw[i].clone(),
             }
         }
@@ -886,6 +901,40 @@ async fn main() -> Result<()> {
                     std::process::exit(2);
                 }
                 Err(e) => bail!("get: {e}"),
+            }
+        }
+
+        Command::ZcGet { key } => {
+            // Size the dest from head() (kvcache caller knows the size; the
+            // CLI discovers it). Then read the value straight into dest.
+            let meta = client.head(key.as_bytes()).await
+                .map_err(|e| anyhow!("zc-get head: {e}"))?;
+            if !meta.found {
+                eprintln!("key not found");
+                std::process::exit(2);
+            }
+            let mut dest = vec![0u8; meta.value_length as usize];
+            // Register dest for true UCX zero-copy receive (ucx build only).
+            #[cfg(feature = "ucx")]
+            let reg = (!dest.is_empty())
+                .then(|| autumn_transport::register_memory(
+                    dest.as_mut_ptr() as *mut std::ffi::c_void,
+                    dest.len(),
+                ))
+                .transpose()
+                .map_err(|e| anyhow!("zc-get register dest: {e}"))?;
+            #[cfg(not(feature = "ucx"))]
+            let reg: Option<autumn_rpc::RegisteredMem> = None;
+            match client.get_into(key.as_bytes(), &mut dest, reg.as_ref()).await {
+                Ok(Some(n)) => {
+                    use std::io::Write;
+                    std::io::stdout().write_all(&dest[..n])?;
+                }
+                Ok(None) => {
+                    eprintln!("key not found");
+                    std::process::exit(2);
+                }
+                Err(e) => bail!("zc-get: {e}"),
             }
         }
 
