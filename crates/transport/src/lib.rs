@@ -33,7 +33,9 @@ pub use tcp::TcpTransport;
 #[cfg(feature = "ucx")]
 pub use ucx::UcxTransport;
 #[cfg(feature = "ucx")]
-pub use ucx::{register_memory, RegisteredMem};
+pub use ucx::{
+    regpool_acquire, register_memory, set_regpool_cap_bytes, PooledBuf, RegisteredMem,
+};
 
 static GLOBAL: OnceLock<Box<dyn AutumnTransport>> = OnceLock::new();
 
