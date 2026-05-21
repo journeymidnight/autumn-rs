@@ -45,14 +45,70 @@ static CTX: OnceLock<CtxPtr> = OnceLock::new();
 
 pub(crate) fn process_context() -> *mut ucp_context {
     CTX.get_or_init(|| {
+        // RDMA registers send/recv buffers (ibv_reg_mr) which pin pages against
+        // RLIMIT_MEMLOCK. The default soft limit (often 8 MiB) is fatal under
+        // load: a failed/over-cap registration surfaces either as a SIGSEGV in
+        // ibv_reg_mr_iova2 or, worse, later as a CQE-with-error on the QP that
+        // UCX treats as a FATAL transport failure and aborts the process
+        // (observed on the manager: uct_dc_mlx5_ep_handle_failure ->
+        // ucs_fatal_error). Raise to INFINITY here — the ONE chokepoint every
+        // UCX process (manager / PS / EN / client / python) hits before the
+        // first endpoint. Falls back to soft-up-to-hard; raising the HARD limit
+        // needs CAP_SYS_RESOURCE, so the launcher (cluster.sh `ulimit -l
+        // unlimited`) / systemd `LimitMEMLOCK=infinity` remains the backstop.
+        #[cfg(unix)]
+        unsafe {
+            let inf = libc::rlimit {
+                rlim_cur: libc::RLIM_INFINITY,
+                rlim_max: libc::RLIM_INFINITY,
+            };
+            if libc::setrlimit(libc::RLIMIT_MEMLOCK, &inf) != 0 {
+                let mut ml = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut ml) == 0 && ml.rlim_cur < ml.rlim_max {
+                    ml.rlim_cur = ml.rlim_max;
+                    libc::setrlimit(libc::RLIMIT_MEMLOCK, &ml);
+                }
+            }
+            // Surface the effective limit so a too-low cap (unprivileged launch,
+            // hard limit pinned at 8 MiB) is diagnosable from the logs.
+            let mut now = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut now) == 0 {
+                tracing::info!(
+                    memlock_cur = now.rlim_cur,
+                    memlock_max = now.rlim_max,
+                    "autumn-transport ucx: RLIMIT_MEMLOCK"
+                );
+            }
+        }
         let mut params: ucp_params_t = unsafe { std::mem::zeroed() };
-        params.field_mask = ucp_params_field::UCP_PARAM_FIELD_FEATURES as u64;
+        params.field_mask = (ucp_params_field::UCP_PARAM_FIELD_FEATURES
+            | ucp_params_field::UCP_PARAM_FIELD_MT_WORKERS_SHARED)
+            as u64;
         // STREAM = ucp_stream_*_nbx send/recv ops.
         // WAKEUP = enables ucp_worker_get_efd + ucp_worker_arm so the
         // progress task can wait on the eventfd via io_uring POLL_ADD
         // instead of polling.
         params.features =
             (ucp_feature::UCP_FEATURE_STREAM | ucp_feature::UCP_FEATURE_WAKEUP) as u64;
+        // ROOT-CAUSE FIX (multi-worker collapse): this ONE process-global
+        // ucp_context is shared by MANY worker threads — PS has 2 per partition
+        // (P-log + P-bulk), the perf-check/BatchClient clients have one per
+        // thread (dozens). Context-level operations (the registration cache /
+        // ibv_reg_mr that every stream send/recv hits on an rcache miss) are
+        // NOT thread-safe unless the context is created with mt_workers_shared.
+        // Without it, concurrent registration from multiple workers raced the
+        // rcache → SIGSEGV inside ibv_reg_mr_iova2 under load, far worse with
+        // multi-rail (10 RoCE devices => one reg per device per op). This is
+        // the real fix — NOT an efd/wakeup or timer issue (busy-poll did not
+        // help; restricting to one device only narrowed the race window).
+        params.mt_workers_shared = 1;
+        // NOTE: deliberately NOT setting estimated_num_eps. A high value makes
+        // UCX select the DC (dc_mlx5) transport, which fatally aborts here on a
+        // completion-with-error (uct_dc_mlx5_ep_handle_failure) even at low load
+        // on this 10-device RoCE box. Leaving it unset keeps rc_mlx5. DC is the
+        // proper scalable transport for many eps and is the real lever for the
+        // multi-worker collapse — but it needs separate hardening before it can
+        // be enabled (tracked as the deep fix).
 
         let mut cfg: *mut ucp_config_t = ptr::null_mut();
         let st = unsafe { ucp_config_read(ptr::null(), ptr::null(), &mut cfg) };
