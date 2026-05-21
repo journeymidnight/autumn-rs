@@ -452,6 +452,18 @@ impl UcxReadHalf {
         )
         .await
     }
+
+    /// Recv into a borrowed slice WITHOUT a memh (copy-out path). Used when the
+    /// dest buffer is the regpool over-cap unregistered fallback. Single recv.
+    pub async fn recv_unregistered(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        ucx_recv_raw(
+            self.ep.ptr(),
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len(),
+            std::ptr::null_mut(),
+        )
+        .await
+    }
 }
 
 impl compio::io::AsyncWrite for UcxWriteHalf {

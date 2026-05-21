@@ -430,6 +430,28 @@ impl ReadHalf {
             )),
         }
     }
+
+    /// F216 recv-into-dest seam. `Some(reg)` → zero-copy receive via memh;
+    /// `None` (regpool over-cap fallback) → UCX recv into the slice (copy-out).
+    /// Single recv (may be partial); caller loops for read_exact semantics.
+    /// TCP errors — the autumn-rpc read_loop handles TCP recv-into-dest via the
+    /// normal decode + memcpy path, never this seam.
+    pub async fn recv_into(
+        &mut self,
+        buf: &mut [u8],
+        reg: Option<&RegisteredMem>,
+    ) -> io::Result<usize> {
+        match self {
+            ReadHalf::Ucx(r) => match reg {
+                Some(reg) => r.recv_registered(buf, reg).await,
+                None => r.recv_unregistered(buf).await,
+            },
+            ReadHalf::Tcp(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "recv_into is UCX-only; TCP uses the read_loop decode+memcpy path",
+            )),
+        }
+    }
 }
 
 impl compio::io::AsyncWrite for WriteHalf {
