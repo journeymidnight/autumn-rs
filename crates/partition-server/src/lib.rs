@@ -3049,19 +3049,33 @@ impl PartitionServer {
 // ---------------------------------------------------------------------------
 
 /// F099-I — per-conn inflight cap. Maximum number of concurrently-awaiting
-/// PartitionRequest futures `handle_ps_connection` holds at once. Once at
-/// cap, TCP reads stop (back-pressure) until one completion drains into
-/// `tx_bufs`. Default 4 is chosen so that the total across N conns
-/// (typical benchmark N=256) stays bounded at N × CAP = 1024 — roughly
-/// the `futures::channel::mpsc` `WRITE_CHANNEL_CAP = 1024` that carries
-/// PartitionRequests into partition_loop.  Higher caps (8+) caused
-/// EINVAL / "submit error: connection closed" under 256 × d=8 load —
-/// we believe due to the aggregate rate of tx.send()-awaiting futures
-/// overwhelming either the mpsc reservation pool or the PS's extent-node
-/// RpcConn writer_task. F195: overridable via `set_ps_conn_inflight_cap`
-/// (CLI flag `--conn-inflight-cap`); default 4.
+/// futures `handle_ps_connection` holds in its `inflight` FuturesUnordered at
+/// once. Once at cap, transport reads stop (back-pressure) until one completion
+/// drains into `tx_bufs`.
+///
+/// **Why the default rose 4 → 16 (F216-E).** The old default 4 dated to the
+/// pre-F099-K topology: 256 client threads all opened connections to ONE PS
+/// listener, so the cap had to keep `N_conns × CAP` under
+/// `WRITE_CHANNEL_CAP = 1024` — `256 × 4 = 1024`. Caps of 8+ then caused
+/// EINVAL / "submit error: connection closed" because too many concurrent
+/// `req_tx.send()`-awaiting futures overwhelmed the mpsc reservation pool /
+/// the EN RpcConn writer_task. Two things changed:
+///   1. **F099-K**: each partition binds its OWN listener, so a listener now
+///      sees ONE connection (the client opens one conn per partition addr,
+///      shared across threads). At P8 that's 8 conns total, not 256 →
+///      `8 × 16 = 128 ≪ 1024`. The aggregate-rate concern is gone.
+///   2. **F216-E (Option B)**: GET reads are served LOCALLY in the `inflight`
+///      FU (no `req_tx` hop, no `partition_loop` detour). For the read path
+///      the cap bounds only concurrent `handle_get` futures — there is NO
+///      shared-channel pressure at all. A deeper cap is exactly what lets the
+///      single P-log core overlap more in-flight EN round-trips per partition
+///      (matters most cross-host, where the RoCE round-trip is the latency to
+///      hide; intra-host the path is CPU-bound and saturates by ~4–8).
+///
+/// F195: overridable via `set_ps_conn_inflight_cap` (CLI flag
+/// `--conn-inflight-cap`); default 16.
 fn ps_conn_inflight_cap() -> usize {
-    *PS_CONN_INFLIGHT_CAP_CELL.get_or_init(|| 4)
+    *PS_CONN_INFLIGHT_CAP_CELL.get_or_init(|| 16)
 }
 
 /// F099-I-fix — observability counter for the d=1 fast path. Incremented
