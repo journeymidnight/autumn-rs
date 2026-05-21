@@ -3056,15 +3056,21 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
     SIGSEGV'd the PS on concurrent 8 MiB reads (rcache send registration). Latent
     RDMA deployment gap exposed by the perf re-test; not ZC-specific.
 - **Remaining (both internal PS↔EN hops deferred for cancel-safety / scope):**
-  - PS←EN READ hop: EN `MSG_READ_BYTES_ZC` (V0 2-Bytes `[zc_meta][value]`,
-    removes the EN double value copy) + StreamClient read-into-pooled fast path
-    (replicated / single-chunk / non-EC; EC+chunked+failover fall back to the
-    untouched copy path) + `resolve_value` returns a PooledBuf. **Must use the
-    read_loop-owns-PooledBuf handoff variant of call_into_dest — recv-into-
-    caller-dest is NOT cancel-safe here because the EN read uses a 3 s timeout +
-    replica failover (a dropped/timed-out call could leave the multiplexed
-    read_loop writing into a freed dest = UAF). The client↔PS hops are safe
-    because they have no timeout and the source/dest outlives the call.**
+  - PS←EN READ hop (R3): **CODE DONE + UNIT-TESTED 2026-05-21; live UCX e2e
+    pending a fresh session** (cluster bring-up was blocked by a degraded
+    long-session shell, not code). Commits a343473/93b57a7/c60e1cc/f2aabf8/
+    0a3a2b5/fdc2a0b: EN `MSG_READ_BYTES_ZC` 2-Bytes (no encode copies);
+    RegPool transport-agnostic; `RpcClient::call_into_pooled` = read_loop owns
+    the PooledBuf, hands it back on success, drops→pool on cancel (no leak —
+    the corrected cancel-safe design; `mem::forget` was wrong); StreamClient
+    `read_value_into_pooled` (UCX/replicated/single-chunk fast path; everything
+    else → copy-path fallback); `read_value_from_log` uses it then copies
+    pb→Vec. Tests: rpc 15 (incl `call_into_pooled_tcp` + `drop_recv_into_
+    registered_mid_await` over RoCE), stream 56, partition 146. **R4 remaining**:
+    `resolve_value`/`handle_get_zc` return/alias the PooledBuf to drop the final
+    pb→Vec + concat copies. (Cancel-safety rationale: the EN read has a 3 s
+    timeout + failover, so recv-into-caller-dest would be UAF; read_loop-owns-
+    buffer makes it safe AND leak-free.)
   - PS→EN WRITE hop: the value the PS received (a zero-copy Bytes slice of the
     frame) is appended to log_stream via `append_batch` — already Arc-`Bytes`
     end to end (`encode_v1_segments` keeps the same Arc), so no extra copy; only

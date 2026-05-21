@@ -51,23 +51,25 @@ Current summary:
       autumn-client `put-zc <KEY> <FILE>` CLI (registers source on ucx).
 
 Main gaps (NOT done — next session):
-  1. PS <- EN hop (#9/#10) — the EN->PS value copy is still present. Design
-     decided but DELIBERATELY not rushed: a naive call_into_dest into a
-     caller-owned dest is NOT cancel-safe on this path because the EN read
-     uses a 3 s timeout + replica failover. If the call times out / a
-     replica is dropped, the multiplexed read_loop (separate task) can
-     still write into a dest the caller has freed (use-after-free). The
-     client <- PS hop avoids this (no timeout; the sglang page outlives the
-     call). The SAFE design for PS <- EN: the read_loop OWNS a RegPool
-     PooledBuf, recvs into it, and hands the PooledBuf back via the meta
-     channel; on caller-cancel the read_loop drains into the pool buf and
-     returns it to the pool (no UAF). Then EN gets a new additive
-     MSG_READ_BYTES_ZC that emits a V0 frame [zc_meta:9][value] as 2 Bytes
-     (also removes the EN-side ReadBytesResp.encode()+Frame::encode() double
-     value copy); StreamClient gets a read-into-pooled fast path for the
-     replicated, single-chunk, non-EC case (EC / chunked / failover-exhaust
-     fall back to the untouched copy path); resolve_value returns the
-     PooledBuf; handle_get_zc sends it to the client (no first-cut concat).
+  1. PS <- EN hop (R3) — CODE DONE + UNIT-TESTED 2026-05-21; only the live
+     UCX cluster e2e remains (blocked by a degraded long-session shell — every
+     cluster.sh bring-up form failed with empty logs/exit1; NOT a code issue).
+     Run the e2e FIRST in a fresh session (recipe in Next steps).
+     Implemented (6 commits a343473, 93b57a7, c60e1cc, f2aabf8, 0a3a2b5,
+     fdc2a0b): EN MSG_READ_BYTES_ZC (extent_rpc=15) emits V0 [zc_meta][value]
+     2 Bytes (no encode copies); RegPool made transport-agnostic (top-level
+     mod, register call cfg(ucx)) so no feature cascade; RpcClient::
+     call_into_pooled — READ_LOOP owns the PooledBuf, hands it back on success,
+     drops->pool on cancel (NO leak — the corrected design; mem::forget was
+     wrong, see [[feedback-zc-recv-no-leak-on-cancel]]); ConnPool::
+     call_into_pooled timeout wrapper; StreamClient::read_value_into_pooled
+     (UCX + replicated + single-chunk fast path; non-UCX/EC/chunked/eversion/
+     err -> Ok(None) -> read_bytes_from_extent copy path); read_value_from_log
+     uses it then copies pb->Vec (keeps resolve_value -> Vec; R4 will alias).
+     Builds both configs; tests: rpc 15 (incl call_into_pooled_tcp +
+     drop_recv_into_registered_mid_await over RoCE), stream 56, partition 146.
+     NOT YET (R4): resolve_value/handle_get_zc return/alias the PooledBuf to
+     drop the final pb->Vec + handle_get_zc concat copies.
   2. (DONE 2026-05-21) python BatchClient(zc=True): writes→put_zc, reads→
      get_into into the pinned page; set_transport("ucx") raises RLIMIT_MEMLOCK;
      adapter opt-in extra_config["zc"]; bench_zc.py A/B (256K write 1.13×/read
@@ -85,11 +87,24 @@ Main gaps (NOT done — next session):
      would be new (rcache already makes it zero-copy). Low priority.
 
 Next steps:
-  - Implement the read_loop-owns-PooledBuf handoff variant of call_into_dest
-    (cancel-safe), then the EN MSG_READ_BYTES_ZC + StreamClient read-into-
-    pooled fast path + resolve_value/handle_get_zc wiring; verify e2e + no
-    regression (cargo test -p autumn-stream / -p autumn-partition-server,
-    TCP perf-check stays green).
+  - FRESH SESSION FIRST: run the R3 live e2e (blocked here by a degraded shell,
+    not code). It is the same shape as the already-passing client<-PS zc-get
+    e2e (commit 28b4c64); a 256K value is a VP in log_stream so zc-get exercises
+    the new EN MSG_READ_BYTES_ZC + read_value_into_pooled path:
+      cargo build --release -p autumn-server --features ucx
+      ulimit -l unlimited
+      AUTUMN_TRANSPORT=ucx AUTUMN_BIND_HOST="[fdbd:dc62:3:302::14]" \
+        UCX_TLS="^sysv,posix" AUTUMN_EXTENT_SHARDS=8 \
+        AUTUMN_BOOTSTRAP_PRESPLIT="8:hexstring" ./cluster.sh reset 1
+      AC="./target/release/autumn-client --manager [fdbd:dc62:3:302::14]:9001 --transport ucx"
+      head -c 262144 /dev/urandom > /tmp/v.bin
+      $AC put-zc r3 /tmp/v.bin && $AC zc-get r3 > /tmp/o.bin && cmp /tmp/v.bin /tmp/o.bin
+      # expect identical; grep rc_mlx5 in node1.log + ps.log; PS stays alive.
+    (Tip: this long session degraded cluster bring-up via the Bash tool — a
+    fresh session has clean shell/process state.)
+  - Then R4 (drop the final copies): resolve_value returns the PooledBuf (or a
+    Bytes aliasing it); handle_get_zc emits [zc_meta][value-alias] vectored
+    instead of the extend_from_slice concat. Closes the last read-path copy.
   - Then the python BatchClient get_into + maturin rebuild.
 
 Verification this session:
