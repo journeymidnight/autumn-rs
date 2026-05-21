@@ -31,10 +31,16 @@
 //! returns an UNREGISTERED buffer (correctness preserved — recv falls back to
 //! copy-out — just not zero-copy), logged once.
 
-use crate::ucx::worker::{register_memory, RegisteredMem};
+// Transport-agnostic pool (declared as a top-level `mod regpool` in lib.rs, so
+// it compiles with AND without `ucx`). On `ucx` a fresh slab is registered with
+// the NIC (ibv_reg_mr via `register_memory`); without `ucx`, `RegisteredMem` is
+// the uninhabited stub so `reg` is always `None` (recv falls back to copy-out —
+// the path autumn-rpc takes on TCP anyway). This keeps the "only the transport
+// leaf is cfg-gated, everyone above is uniform" pattern: autumn-rpc/stream use
+// `PooledBuf` with no `cfg`.
+use crate::RegisteredMem;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::os::raw::c_void;
 
 /// Smallest size class. Values below this still round up to it.
 const MIN_CLASS: usize = 4096;
@@ -181,8 +187,10 @@ pub fn acquire(need: usize) -> PooledBuf {
     }
 
     // Allocate a fresh slab. zeroed (avoids reading uninit before recv).
+    #[cfg_attr(not(feature = "ucx"), allow(unused_mut))]
     let mut buf = vec![0u8; class];
-    let reg = match register_memory(buf.as_mut_ptr() as *mut c_void, class) {
+    #[cfg(feature = "ucx")]
+    let reg = match crate::register_memory(buf.as_mut_ptr() as *mut std::os::raw::c_void, class) {
         Ok(r) => Some(r),
         Err(e) => {
             POOL.with(|p| {
@@ -199,6 +207,9 @@ pub fn acquire(need: usize) -> PooledBuf {
             None
         }
     };
+    // No-ucx: RegisteredMem is uninhabited, so `reg` is always None.
+    #[cfg(not(feature = "ucx"))]
+    let reg: Option<RegisteredMem> = None;
     PooledBuf { slab: Some(Slab { buf, reg }), class, used: need }
 }
 

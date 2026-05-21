@@ -28,14 +28,21 @@ mod tcp;
 #[cfg(feature = "ucx")]
 mod ucx;
 
+// F216-E: the registered-buffer pool is transport-agnostic (compiles with and
+// without `ucx`); only the `ibv_reg_mr` call inside is `cfg(ucx)`. Declared at
+// top level (file lives under ucx/ for history) so autumn-rpc/stream can use
+// `PooledBuf` with no `cfg` — preserving the "only the transport leaf is
+// cfg-gated" pattern.
+#[path = "ucx/regpool.rs"]
+mod regpool;
+
 pub use probe::parse_transport_flag;
+pub use regpool::{acquire as regpool_acquire, set_regpool_cap_bytes, PooledBuf};
 pub use tcp::TcpTransport;
 #[cfg(feature = "ucx")]
 pub use ucx::UcxTransport;
 #[cfg(feature = "ucx")]
-pub use ucx::{
-    regpool_acquire, register_memory, set_regpool_cap_bytes, PooledBuf, RegisteredMem,
-};
+pub use ucx::{register_memory, RegisteredMem};
 
 /// Placeholder when built without the `ucx` feature — never constructed (TCP
 /// has no memory registration). Lets autumn-rpc's

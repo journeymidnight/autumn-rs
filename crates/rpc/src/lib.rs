@@ -21,6 +21,10 @@ pub use frame::{Frame, FrameDecoder, HEADER_LEN};
 /// don't need a direct autumn-transport dependency. (Uninhabited stub on
 /// non-ucx builds — `reg` is always `None` there.)
 pub use autumn_transport::RegisteredMem;
+/// Re-exported so `call_into_pooled` consumers (autumn-stream's StreamClient)
+/// reference `autumn_rpc::PooledBuf` without a direct autumn-transport dep.
+/// Transport-agnostic: registered on `ucx`, plain (copy-out) on TCP/no-ucx.
+pub use autumn_transport::{regpool_acquire, PooledBuf};
 
 /// Handler result type for RPC dispatch.
 pub type HandlerResult = std::result::Result<bytes::Bytes, (StatusCode, String)>;

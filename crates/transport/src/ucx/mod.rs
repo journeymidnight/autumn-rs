@@ -7,11 +7,10 @@ pub(crate) mod sockaddr;
 pub(crate) mod worker;
 pub(crate) mod endpoint;
 pub(crate) mod listener;
-pub(crate) mod regpool;
+// regpool is now a top-level `mod regpool` in lib.rs (transport-agnostic).
 
 pub use endpoint::UcxConn;
 pub use listener::UcxListener;
-pub use regpool::{acquire as regpool_acquire, set_regpool_cap_bytes, PooledBuf};
 pub use worker::{register_memory, RegisteredMem};
 
 use crate::{AutumnTransport, Conn, Listener, TransportKind};
