@@ -41,6 +41,16 @@ case "$TRANSPORT" in
     *) echo "AUTUMN_TRANSPORT must be 'tcp' or 'ucx', got '$TRANSPORT'" >&2; exit 2 ;;
 esac
 unset AUTUMN_TRANSPORT  # don't leak to child processes
+# F220: base port for the PS per-partition listeners (F099-K binds
+# PS_BASE_PORT + ordinal). Kept clear of the extent-node shard port grid
+# (9100+i + s*SHARD_STRIDE, climbs to ~9253 at 16 shards) so partition
+# listeners don't lose their first bind to an EN shard and force a
+# region-sync reopen — which also climbs the monotonic partition ord and
+# overflows the PS cpuset (the cpu_pin "stays unpinned" warning). 9301
+# leaves ~48 ports of headroom; override via AUTUMN_PS_BASE_PORT. Clients
+# resolve partition addrs from the manager's GetRegions, so they follow
+# automatically. (Also re-derived in load_cluster_config for start-ps.)
+PS_BASE_PORT="${AUTUMN_PS_BASE_PORT:-9301}"
 ETCD_DIR="$DATA_ROOT/etcd"
 
 MANAGER="$BIN/autumn-manager-server"
@@ -358,7 +368,7 @@ format_extent_node() {
         $(echo "$disk_arg" | tr ',' ' ')
 }
 
-# Launch the partition server. F099-K: the per-partition listeners (9201,
+# Launch the partition server. F099-K: the per-partition listeners (PS_BASE_PORT+1,
 # 9202, ...) come up only after partitions open, so we don't wait_port
 # here — bootstrap or region-sync handles readiness.
 launch_ps() {
@@ -475,10 +485,10 @@ launch_ps() {
     fi
     start_proc ps \
         "$PS" \
-        --psid 1 --port 9201 \
+        --psid 1 --port "$PS_BASE_PORT" \
         --manager "$MANAGER_ADDR" \
         --listen "$BIND_HOST" \
-        --advertise "${BIND_HOST}:9201" \
+        --advertise "${BIND_HOST}:${PS_BASE_PORT}" \
         --transport "$TRANSPORT" \
         ${cpu_args[@]:+"${cpu_args[@]}"} \
         ${tunable_args[@]:+"${tunable_args[@]}"}
@@ -511,6 +521,9 @@ load_cluster_config() {
     export CLUSTER_MODE="$MODE"
     BIND_HOST="${AUTUMN_BIND_HOST:-127.0.0.1}"
     MANAGER_ADDR="${BIND_HOST}:9001"
+    # F220: re-derive after sourcing so a persisted AUTUMN_PS_BASE_PORT
+    # (saved by save_cluster_config) takes effect for start-ps/stop-ps.
+    PS_BASE_PORT="${AUTUMN_PS_BASE_PORT:-9301}"
     compute_shard_config
     compute_affinity_decision
 }
@@ -622,7 +635,7 @@ do_start() {
     if [[ -f "$bootstrap_marker" ]]; then
         echo "[cluster] skipping bootstrap (already done — use 'restart' for a fresh cluster)"
         # Give PS a moment to sync regions and re-bind listeners on restart.
-        wait_port 9201 ps 60
+        wait_port "$PS_BASE_PORT" ps 60
     else
         # Auto-select EC shape (FOPS-02).
         #
@@ -716,9 +729,9 @@ do_start() {
         echo "[cluster] waiting ${wait_secs}s for PS to open ${n_parts} partition(s)..."
         sleep "$wait_secs"
         # F099-K: confirm the first partition's listener is actually up.
-        # Under F099-K the per-partition listener on :9201 only exists
+        # Under F099-K the per-partition listener on :$PS_BASE_PORT only exists
         # once partition 0 has been opened and registered with the mgr.
-        wait_port 9201 "partition 0 listener" 60
+        wait_port "$PS_BASE_PORT" "partition 0 listener" 60
     fi
 
     # F102: snapshot launch params so per-process subcommands can replay
@@ -728,7 +741,7 @@ do_start() {
     echo ""
     echo "[cluster] ✓ cluster ready (replicas=$replicas)"
     echo "[cluster]   manager  : $MANAGER_ADDR"
-    echo "[cluster]   partition: ${BIND_HOST}:9201"
+    echo "[cluster]   partition: ${BIND_HOST}:${PS_BASE_PORT}"
     echo "[cluster]   logs     : $LOG_DIR"
     echo ""
     echo "  AC=(\"$AC\" --manager \"$MANAGER_ADDR\")     # data plane (put/get/ls/bench)"
@@ -781,10 +794,10 @@ do_start_ps() {
         die "ps already running (pid $(cat "$pf"))"
     fi
     launch_ps
-    # Per-partition listener on :9201 only comes up after partition 0
+    # Per-partition listener on :$PS_BASE_PORT only comes up after partition 0
     # opens (F099-K). Wait for it so a recovery test can `start-ps` and
     # immediately drive traffic.
-    wait_port 9201 ps 60
+    wait_port "$PS_BASE_PORT" ps 60
 }
 
 do_stop_ps() {

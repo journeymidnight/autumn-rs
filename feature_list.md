@@ -3387,7 +3387,17 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
     partition listeners bound on the 9301+ grid; `put`/`get` over UCX round-trips.
   - `AUTUMN_PS_BASE_PORT=<N>` override is honored (listeners bind at N+ordinal).
   - TCP-mode `reset 1` still comes up (readiness `nc -z` probes the new port).
-- **passes:** false (pending implementation — 2026-05-21)
+  - **(folded in during impl)** 0 `cpu_pin … stays unpinned` warnings: the bind
+    collisions were the *only* source of partition reopens, and the monotonic
+    `next_port_ord` (lib.rs:2684) drives both the listener port AND the CPU pin
+    index (`2*ord_zero`), so a reopen climbed the pin index past the cpuset.
+    No collisions → exactly N opens → ords stay in range → no cpu_pin warn.
+- **passes:** true (2026-05-21 — verified: ucx + 16 shard + 16 part `reset 1`
+  → PS on 9301; ps.log 0 bind failures, 0 cpu_pin unpinned, 0 core-budget;
+  16/16 listeners on 9301–9316; exactly 16 opens (no reopens); UCX put/get
+  round-trips. Note: an unrelated UCX/RoCE listener-teardown lag on manager
+  :9001 can fail a *rapid back-to-back* reset — retry after a few seconds;
+  tracked separately, not an F220 regression.)
 
 ### F221 · cluster.sh auto-derives PS partition budget from the presplit count
 - **Trigger / 动机:** Each partition needs 2 PS cores (P-log + P-bulk); the PS
