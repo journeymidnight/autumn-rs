@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use autumn_client::{ClusterClient, parse_addr};
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
-use autumn_rpc::partition_rpc::{PutReq, GetReq, MSG_PUT, MSG_GET};
+use autumn_rpc::partition_rpc::{PutReq, GetReq, MSG_PUT, MSG_GET, MSG_PUT_ZC, MSG_GET_ZC, encode_put_zc_meta};
 use serde::{Deserialize, Serialize};
 
 // (F213: hex_split_ranges moved to autumn_op.rs along with `bootstrap`.)
@@ -123,6 +123,11 @@ enum Command {
         pipeline_depth: usize,
         /// F195: was env `AUTUMN_GROUP_COMMIT_CAP`; recorded in baseline.
         group_commit_cap: Option<usize>,
+        /// F216-E: route the write phase through MSG_PUT_ZC (value as its own
+        /// iovec, rcache zero-copy send) and the read phase through
+        /// MSG_GET_ZC + call_into_dest (recv into a registered RegPool dest).
+        /// For A/B vs the regular MSG_PUT/MSG_GET path.
+        zc: bool,
     },
 }
 
@@ -149,7 +154,7 @@ fn usage() -> ! {
     eprintln!("                                    Write benchmark (always durable; F178 removed --nosync)");
     eprintln!("  rbench [--threads 40] [--duration 10] <RESULT_FILE>");
     eprintln!("                                    Read benchmark");
-    eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K]");
+    eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K] [--zc]");
     eprintln!("                                    Quick write+read bench; warns if >threshold regression vs baseline");
     eprintln!();
     eprintln!("Operator / admin commands moved to `autumn-op` (F213):");
@@ -448,8 +453,12 @@ fn parse_args() -> Args {
             // perf-check (`--group-commit-cap N`) so the baseline JSON
             // reflects the server config that was active.
             let mut group_commit_cap: Option<usize> = None;
+            let mut zc = false;
             while i < raw.len() {
                 match raw[i].as_str() {
+                    "--zc" => {
+                        zc = true;
+                    }
                     "--threads" | "-t" => {
                         i += 1;
                         threads = raw[i].parse().expect("--threads must be a number");
@@ -517,6 +526,7 @@ fn parse_args() -> Args {
                 partitions: partitions_meta_from_flag,
                 pipeline_depth,
                 group_commit_cap,
+                zc,
             }
         }
         other => {
@@ -1377,16 +1387,18 @@ async fn main() -> Result<()> {
             partitions: partitions_meta_from_flag,
             pipeline_depth,
             group_commit_cap,
+            zc,
         } => {
             let pipeline_depth = pipeline_depth.max(1);
+            let zc_tag = if zc { " [ZC: MSG_PUT_ZC/MSG_GET_ZC]" } else { "" };
             // ---- Write phase ----
             if pipeline_depth > 1 {
                 println!(
-                    "==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B, depth={pipeline_depth})"
+                    "==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B, depth={pipeline_depth}){zc_tag}"
                 );
             } else {
                 println!(
-                    "==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B)"
+                    "==> perf-check: write ({threads} threads, {duration_secs}s, {value_size}B){zc_tag}"
                 );
             }
 
@@ -1441,6 +1453,10 @@ async fn main() -> Result<()> {
                         let mut local_latencies: Vec<f64> = Vec::new();
                         let mut local_keyinfo: Vec<(String, u64, SocketAddr)> = Vec::new();
                         let mut inflight = FuturesUnordered::new();
+                        // F216-E ZC: one reusable Bytes for the value, sent as
+                        // its own iovec each op — on UCX the rcache registers it
+                        // once (reused buffer) -> zero-copy send. No to_vec/rkyv.
+                        let value_zc: bytes::Bytes = bytes::Bytes::from(value_bytes.clone());
                         loop {
                             // Refill pipeline up to max_depth while deadline not expired.
                             while inflight.len() < max_depth
@@ -1451,18 +1467,31 @@ async fn main() -> Result<()> {
                                 // "key out of range".
                                 let key = key_for_partition(&start_key, "pc", tid, seq);
                                 seq += 1;
-                                let req_bytes = rkyv_encode(&PutReq {
-                                    part_id,
-                                    key: key.as_bytes().to_vec(),
-                                    value: value_bytes.clone(),
-                                    expires_at: 0,
-                                    // Bench: static topology, skip epoch check.
-                                    region_epoch: 0,
-                                });
                                 let ps_clone = ps.clone();
                                 let t0 = Instant::now();
+                                // ZC: send value as its own iovec (Arc bump, no copy).
+                                // Non-ZC: rkyv PutReq. Single async block so the FU
+                                // has one concrete future type (no boxing).
+                                let val = value_zc.clone();
+                                let value_vec = if zc { Vec::new() } else { value_bytes.clone() };
                                 inflight.push(async move {
-                                    let res = ps_clone.call(MSG_PUT, req_bytes).await;
+                                    let res = if zc {
+                                        let meta =
+                                            encode_put_zc_meta(part_id, 0, 0, key.as_bytes());
+                                        ps_clone
+                                            .call_vectored(MSG_PUT_ZC, vec![meta, val])
+                                            .await
+                                    } else {
+                                        let req_bytes = rkyv_encode(&PutReq {
+                                            part_id,
+                                            key: key.as_bytes().to_vec(),
+                                            value: value_vec,
+                                            expires_at: 0,
+                                            // Bench: static topology, skip epoch check.
+                                            region_epoch: 0,
+                                        });
+                                        ps_clone.call(MSG_PUT, req_bytes).await
+                                    };
                                     (res, key, t0.elapsed())
                                 });
                             }
@@ -1595,8 +1624,41 @@ async fn main() -> Result<()> {
                                     region_epoch: 0,
                                 });
                                 let t0 = Instant::now();
+                                // ZC read: recv the value straight into a registered
+                                // RegPool dest (UCX memh zero-copy; pool registers
+                                // once + reuses). DestMeta -> Bytes so both arms yield
+                                // the same Result type. Single async block = one FU type.
                                 inflight.push(async move {
-                                    let res = ps.call(MSG_GET, req_bytes).await;
+                                    let res = if zc {
+                                        #[cfg(feature = "ucx")]
+                                        {
+                                            let mut pb =
+                                                autumn_transport::regpool_acquire(value_size);
+                                            let (ptr, cap) = {
+                                                let d = pb.dest_mut();
+                                                (d.as_mut_ptr(), d.len())
+                                            };
+                                            let reg = pb.reg();
+                                            ps.call_into_dest(MSG_GET_ZC, req_bytes, ptr, cap, reg)
+                                                .await
+                                                .map(|_| bytes::Bytes::new())
+                                        }
+                                        #[cfg(not(feature = "ucx"))]
+                                        {
+                                            let mut dest = vec![0u8; value_size];
+                                            ps.call_into_dest(
+                                                MSG_GET_ZC,
+                                                req_bytes,
+                                                dest.as_mut_ptr(),
+                                                dest.len(),
+                                                None,
+                                            )
+                                            .await
+                                            .map(|_| bytes::Bytes::new())
+                                        }
+                                    } else {
+                                        ps.call(MSG_GET, req_bytes).await
+                                    };
                                     (res, t0.elapsed())
                                 });
                             }
