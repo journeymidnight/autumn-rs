@@ -570,7 +570,10 @@ impl ReadHalf {
     /// `call_into_dest` (client←PS read): the value lands in the caller's buffer
     /// with no intermediate copy beyond the unavoidable kernel→userspace one.
     ///
-    /// SAFETY (caller contract — identical to the UCX `call_into_dest` path):
+    /// UCX errors (callers gate on `!is_ucx()` and use `recv_into` there).
+    ///
+    /// # Safety
+    /// Caller contract — identical to the UCX `call_into_dest` path:
     /// `ptr[0..target]` must be valid for writes AND outlive this future. Unlike
     /// `read_exact_into_pooled`, the in-flight read writes into memory the
     /// read_loop does NOT own, so cancel-safety relies on the caller never
@@ -579,8 +582,6 @@ impl ReadHalf {
     /// the `RawDest` ptr-wrapper on cancel, but that does not keep the pointed-to
     /// memory alive — so a caller that frees `dest` mid-recv would UAF, exactly as
     /// the UCX `recv_into(&mut dest[..])` path would.)
-    ///
-    /// UCX errors (callers gate on `!is_ucx()` and use `recv_into` there).
     pub async unsafe fn read_exact_into_raw(
         &mut self,
         ptr: *mut u8,

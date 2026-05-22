@@ -775,8 +775,9 @@ async fn read_loop(
                     let _ = tx.send(Err(e));
                     return Err(RpcError::ConnectionClosed);
                 }
-                let _ = drop((dest, reg)); // end the borrow of pb before moving it
                 // F219: ZC value crc removed (transport integrity covers it).
+                // (`dest`/`reg` borrows of `pb` end at the recv loop above — NLL
+                // lets `pb` move into the send below; no explicit drop needed.)
                 let _ = tx.send(Ok((pb, code)));
                 continue;
             }

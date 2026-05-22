@@ -3325,48 +3325,96 @@ async fn drain_zc_writes(
             );
         }
 
-        // Route into partition_loop (writes are single-writer there).
-        let (resp_tx, resp_rx) = oneshot::channel();
-        let req = PartitionRequest {
-            msg_type: MSG_PUT_ZC,
-            payload: meta_key,
-            resp_tx,
-            zc_value: Some(value),
-        };
-        let mut tx = req_tx.clone();
-        let fut = async move {
-            let resp_frame = if tx.send(req).await.is_err() {
-                Frame::error(
-                    req_id,
-                    MSG_PUT_ZC,
-                    autumn_rpc::RpcError::encode_status(
-                        StatusCode::Internal,
-                        "partition thread closed",
-                    ),
-                )
-            } else {
-                match resp_rx.await {
-                    Ok(Ok(p)) => Frame::response(req_id, MSG_PUT_ZC, p),
-                    Ok(Err((code, message))) => Frame::error(
-                        req_id,
-                        MSG_PUT_ZC,
-                        autumn_rpc::RpcError::encode_status(code, &message),
-                    ),
-                    Err(_) => Frame::error(
-                        req_id,
-                        MSG_PUT_ZC,
-                        autumn_rpc::RpcError::encode_status(
-                            StatusCode::Internal,
-                            "partition response dropped",
-                        ),
-                    ),
-                }
-            };
-            (resp_frame.encode(), None)
-        };
-        inflight.push(fut.boxed_local());
+        // Route into partition_loop (writes are single-writer there); value
+        // rides as zc_value (aliases the pool buffer, no concat).
+        let tx = req_tx.clone();
+        inflight.push(
+            async move {
+                (delegate_round_trip(tx, req_id, MSG_PUT_ZC, meta_key, Some(value)).await, None)
+            }
+            .boxed_local(),
+        );
         // Loop to handle a possible next large MSG_PUT_ZC at the new front.
     }
+}
+
+/// Mis-routed-frame error (part_id != owner_part): a `NotFound` frame, no mpsc
+/// hop. Single-sourced for `push_one_frame_to_inflight` + `d1_fast_path_round_trip`.
+/// TODO(F099-K): forward to the owning P-log's req_tx instead of synthing here.
+fn misroute_frame(req_id: u32, msg_type: u8, part_id: u64, owner_part: u64) -> Bytes {
+    let err_payload = autumn_rpc::RpcError::encode_status(
+        StatusCode::NotFound,
+        &format!("partition {part_id} not served by this P-log (owner={owner_part})"),
+    );
+    Frame::error(req_id, msg_type, err_payload).encode()
+}
+
+/// F216 (Option B) — serve a GET / GET_ZC LOCALLY in the ps-conn task (no req_tx
+/// hop / partition_loop detour). Returns `(head, Some(value))` for MSG_GET_ZC
+/// (value-separable: value aliases the RegPool buffer, emitted as its own iovec)
+/// or `(frame, None)` for MSG_GET. `handle_get` borrows the partition only across
+/// synchronous code (drops it before the `resolve_value` await), so on the
+/// single-threaded P-log runtime concurrent reads never overlap a borrow with
+/// each other or with `partition_loop`'s `borrow_mut` writes.
+async fn serve_get_local(
+    req_id: u32,
+    msg_type: u8,
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> (Bytes, Option<Bytes>) {
+    if msg_type == MSG_GET_ZC {
+        // handle_get_zc never errors (status rides in the meta code).
+        let (head, value) = crate::rpc_handlers::handle_get_zc(req_id, payload, part).await;
+        return (head, Some(value));
+    }
+    let frame = match crate::rpc_handlers::handle_get(payload, part).await {
+        Ok(p) => Frame::response(req_id, msg_type, p),
+        Err((code, message)) => {
+            Frame::error(req_id, msg_type, autumn_rpc::RpcError::encode_status(code, &message))
+        }
+    }
+    .encode();
+    (frame, None)
+}
+
+/// Delegate a request to `partition_loop` over the same-thread mpsc and await its
+/// response, returning the encoded response frame. Single-sources the
+/// "partition thread closed" / "partition response dropped" wording shared by the
+/// three delegate sites (`drain_zc_writes`, `push_one_frame_to_inflight`,
+/// `d1_fast_path_round_trip`). A plain `async fn` (NOT boxed) so the d=1 fast path
+/// can await it inline without the per-frame heap alloc F099-I avoids.
+async fn delegate_round_trip(
+    mut tx: mpsc::Sender<PartitionRequest>,
+    req_id: u32,
+    msg_type: u8,
+    payload: Bytes,
+    zc_value: Option<Bytes>,
+) -> Bytes {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    let req = PartitionRequest { msg_type, payload, resp_tx, zc_value };
+    let resp_frame = if tx.send(req).await.is_err() {
+        Frame::error(
+            req_id,
+            msg_type,
+            autumn_rpc::RpcError::encode_status(StatusCode::Internal, "partition thread closed"),
+        )
+    } else {
+        match resp_rx.await {
+            Ok(Ok(p)) => Frame::response(req_id, msg_type, p),
+            Ok(Err((code, message))) => {
+                Frame::error(req_id, msg_type, autumn_rpc::RpcError::encode_status(code, &message))
+            }
+            Err(_) => Frame::error(
+                req_id,
+                msg_type,
+                autumn_rpc::RpcError::encode_status(
+                    StatusCode::Internal,
+                    "partition response dropped",
+                ),
+            ),
+        }
+    };
+    resp_frame.encode()
 }
 
 /// F099-I — push ONE frame onto `inflight`, encoded into a
@@ -3399,98 +3447,31 @@ fn push_one_frame_to_inflight(
     let part_id = partition_rpc::extract_part_id(msg_type, &payload);
 
     if part_id != owner_part {
-        // Mis-routed — synth error frame, no mpsc hop.
-        // TODO(F099-K): forward to owning P-log's req_tx.
-        let err_payload = autumn_rpc::RpcError::encode_status(
-            StatusCode::NotFound,
-            &format!("partition {part_id} not served by this P-log (owner={owner_part})"),
-        );
-        let bytes = Frame::error(req_id, msg_type, err_payload).encode();
+        let bytes = misroute_frame(req_id, msg_type, part_id, owner_part);
         inflight.push(async move { (bytes, None) }.boxed_local());
         return;
     }
 
-    // F216 (Option B): serve GET reads LOCALLY in this ps-conn task's FU —
-    // no `req_tx` hop, no detour through `partition_loop`. Reads need only a
-    // consistent read of `PartitionData` (memtable + SSTs), not the
-    // single-writer group-commit actor, so routing them through
-    // `partition_loop` was pure overhead (an mpsc hop + a per-op spawn).
-    // `handle_get` borrows the partition only across synchronous code (it
-    // drops the borrow before the `resolve_value` await), and the whole
-    // P-log runtime is single-threaded, so concurrent reads in this FU never
-    // overlap a borrow with each other or with `partition_loop`'s writes
-    // (`borrow_mut`). This keeps `partition_loop` focused on writes.
+    // F216 (Option B): serve GET reads LOCALLY in this FU (no req_tx hop /
+    // partition_loop detour) — reads need a consistent PartitionData snapshot,
+    // not the single-writer group-commit actor. part == None is unit-test mode →
+    // fall through to the delegate.
     if msg_type == MSG_GET || msg_type == MSG_GET_ZC {
         if let Some(part) = part {
             let part_c = part.clone();
-            let fut = async move {
-                if msg_type == MSG_GET_ZC {
-                    // F216 R4: 2-segment value-separable V0 response — head =
-                    // [V0 header][zc_meta], value aliases the RegPool buffer
-                    // (no concat). handle_get_zc never errors (status rides in
-                    // the meta code). The drain pushes head then value so the
-                    // client recvs the value straight into its registered dest.
-                    let (head, value) =
-                        crate::rpc_handlers::handle_get_zc(req_id, payload, &part_c).await;
-                    (head, Some(value))
-                } else {
-                    let frame = match crate::rpc_handlers::handle_get(payload, &part_c).await {
-                        Ok(p) => Frame::response(req_id, msg_type, p).encode(),
-                        Err((code, message)) => Frame::error(
-                            req_id,
-                            msg_type,
-                            autumn_rpc::RpcError::encode_status(code, &message),
-                        )
-                        .encode(),
-                    };
-                    (frame, None)
-                }
-            };
-            inflight.push(fut.boxed_local());
+            inflight.push(
+                async move { serve_get_local(req_id, msg_type, payload, &part_c).await }
+                    .boxed_local(),
+            );
             return;
         }
-        // part == None (unit-test mode): fall through to the req_tx delegate.
     }
 
-    let mut tx = req_tx.clone();
-    let fut = async move {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        let req = PartitionRequest {
-            msg_type,
-            payload,
-            resp_tx,
-            zc_value: None,
-        };
-        let resp_frame = if tx.send(req).await.is_err() {
-            Frame::error(
-                req_id,
-                msg_type,
-                autumn_rpc::RpcError::encode_status(
-                    StatusCode::Internal,
-                    "partition thread closed",
-                ),
-            )
-        } else {
-            match resp_rx.await {
-                Ok(Ok(p)) => Frame::response(req_id, msg_type, p),
-                Ok(Err((code, message))) => Frame::error(
-                    req_id,
-                    msg_type,
-                    autumn_rpc::RpcError::encode_status(code, &message),
-                ),
-                Err(_) => Frame::error(
-                    req_id,
-                    msg_type,
-                    autumn_rpc::RpcError::encode_status(
-                        StatusCode::Internal,
-                        "partition response dropped",
-                    ),
-                ),
-            }
-        };
-        (resp_frame.encode(), None)
-    };
-    inflight.push(fut.boxed_local());
+    let tx = req_tx.clone();
+    inflight.push(
+        async move { (delegate_round_trip(tx, req_id, msg_type, payload, None).await, None) }
+            .boxed_local(),
+    );
 }
 
 /// F099-I — drain all complete frames from `decoder`, pushing one future
@@ -3566,76 +3547,19 @@ async fn d1_fast_path_round_trip(
     let part_id = partition_rpc::extract_part_id(msg_type, &payload);
 
     if part_id != owner_part {
-        let err_payload = autumn_rpc::RpcError::encode_status(
-            StatusCode::NotFound,
-            &format!("partition {part_id} not served by this P-log (owner={owner_part})"),
-        );
-        return (Frame::error(req_id, msg_type, err_payload).encode(), None);
+        return (misroute_frame(req_id, msg_type, part_id, owner_part), None);
     }
 
     // F216 (Option B): d=1 GET served locally too — same rationale as
-    // push_one_frame_to_inflight. No req_tx hop / partition_loop detour.
-    if msg_type == MSG_GET_ZC {
+    // push_one_frame_to_inflight. part == None (unit tests) → delegate.
+    if msg_type == MSG_GET || msg_type == MSG_GET_ZC {
         if let Some(part) = part {
-            // F216 R4: 2-segment ZC response (head + value-alias, no concat).
-            // handle_get_zc never errors (status rides in the meta code).
-            let (head, value) =
-                crate::rpc_handlers::handle_get_zc(req_id, payload, part).await;
-            return (head, Some(value));
+            return serve_get_local(req_id, msg_type, payload, part).await;
         }
-    }
-    if msg_type == MSG_GET {
-        if let Some(part) = part {
-            let frame = match crate::rpc_handlers::handle_get(payload, part).await {
-                Ok(p) => Frame::response(req_id, msg_type, p),
-                Err((code, message)) => Frame::error(
-                    req_id,
-                    msg_type,
-                    autumn_rpc::RpcError::encode_status(code, &message),
-                ),
-            }
-            .encode();
-            return (frame, None);
-        }
-        // part == None (unit-test mode): fall through to the req_tx delegate.
     }
 
-    let (resp_tx, resp_rx) = oneshot::channel();
-    let req = PartitionRequest {
-        msg_type,
-        payload,
-        resp_tx,
-        zc_value: None,
-    };
-    let mut tx = req_tx.clone();
-    let resp_frame = if tx.send(req).await.is_err() {
-        Frame::error(
-            req_id,
-            msg_type,
-            autumn_rpc::RpcError::encode_status(
-                StatusCode::Internal,
-                "partition thread closed",
-            ),
-        )
-    } else {
-        match resp_rx.await {
-            Ok(Ok(p)) => Frame::response(req_id, msg_type, p),
-            Ok(Err((code, message))) => Frame::error(
-                req_id,
-                msg_type,
-                autumn_rpc::RpcError::encode_status(code, &message),
-            ),
-            Err(_) => Frame::error(
-                req_id,
-                msg_type,
-                autumn_rpc::RpcError::encode_status(
-                    StatusCode::Internal,
-                    "partition response dropped",
-                ),
-            ),
-        }
-    };
-    (resp_frame.encode(), None)
+    let tx = req_tx.clone();
+    (delegate_round_trip(tx, req_id, msg_type, payload, None).await, None)
 }
 
 /// Handle a single client connection on the P-log runtime.
@@ -3736,38 +3660,15 @@ async fn handle_ps_connection(
                     )
                     .await?;
 
-                    // F099-I-fix — d=1 fast path.
-                    //
-                    // When a TCP read yields exactly one full frame AND
-                    // nothing is already in flight, skip FU entirely: do
-                    // the request→response→write inline using `write_all`
-                    // (single iov path, matches pre-F099-I cost). This
-                    // path dominates at `--pipeline-depth=1` (the client
-                    // awaits each reply before sending the next), so the
-                    // FU-based slow path was paying per-frame heap alloc
-                    // (Box::pin) + push/pop ceremony + write_vectored_all
-                    // with one iovec for every Put. F099-I measured
-                    // -6.5 % at d=1 from that overhead; this restores the
-                    // baseline while preserving d≥2 batching gains.
-                    //
-                    // Preconditions (all checked):
-                    //   * inflight.is_empty() — guaranteed by the
-                    //     `n_inflight == 0` branch we just entered.
-                    //   * tx_bufs.is_empty() — flushed above at (B).
-                    //   * decoder yields exactly one frame: first
-                    //     try_decode returns Some, next returns None.
-                    //     (If any bytes remain in decoder after the
-                    //     first frame, there is either a complete second
-                    //     frame — fall back to slow path for ordering —
-                    //     or a partial frame header for the next read.
-                    //     In the latter case the next try_decode returns
-                    //     None, which is exactly the fast-path condition.)
-                    //   * frame.req_id != 0 (real request, not fire-
-                    //     and-forget).
-                    //
-                    // Correctness: because inflight+tx_bufs are empty,
-                    // no earlier frame's reply is waiting to be written.
-                    // Running the round-trip inline preserves in-order
+                    // F099-I-fix — d=1 fast path: when this read yielded exactly
+                    // one full frame and nothing else is pending, run the
+                    // request→response→write inline (no FU push, no Box::pin, no
+                    // write_vectored). F099-I measured -6.5% at d=1 from that
+                    // per-frame ceremony; this restores the baseline while keeping
+                    // the d≥2 batching gains. The engage guard below
+                    // (`more.is_none() && req_id != 0 && inflight.is_empty()`) is
+                    // load-bearing: with inflight + tx_bufs empty no earlier
+                    // reply is waiting, so the inline write preserves in-order
                     // reply semantics for this connection.
                     let first = decoder.try_decode().map_err(|e| anyhow!(e))?;
                     if let Some(frame) = first {
@@ -3835,9 +3736,14 @@ async fn handle_ps_connection(
             continue;
         }
 
-        if at_cap {
-            // Back-pressure — only await a completion. The read future
-            // stays pinned in `read_fut` untouched.
+        // Await a completion alone (don't race the read) when either:
+        //  - `at_cap`: back-pressure — no room to launch more anyway; or
+        //  - `n_inflight == 1`: the client is typically waiting on THIS reply
+        //    before submitting more, so racing the read buys nothing (it stays
+        //    Pending until the completion lands) and costs ~5-10 µs/iter of
+        //    polling. Matches the ExtentNode v3 fast-path branch.
+        // The read future stays pinned in `read_fut`, untouched.
+        if at_cap || n_inflight == 1 {
             if let Some(done) = inflight.next().await {
                 push_resp(&mut tx_bufs, done);
             }
@@ -3845,19 +3751,6 @@ async fn handle_ps_connection(
         }
 
         // (D) Race read vs completion.
-        //
-        // Fast path: when n_inflight == 1, the client is typically waiting
-        // on THIS one response before submitting more, so racing the read
-        // buys nothing (the read stays Pending until the completion lands)
-        // but costs ~5-10 µs of per-iter polling overhead. Await the
-        // completion alone, matching the ExtentNode v3 fast-path branch.
-        if n_inflight == 1 {
-            if let Some(done) = inflight.next().await {
-                push_resp(&mut tx_bufs, done);
-            }
-            continue;
-        }
-
         let rfut = read_fut.take().expect("read_fut: Some in race arm");
         let cfut = inflight.next();
         match select(rfut, Box::pin(cfut)).await {
@@ -4311,11 +4204,13 @@ async fn partition_thread_main(
         split_wake_rx,
         drain_rx,
         locked_by_other,
-        part_sc.clone(),
-        pool.clone(),
-        manager_addr.clone(),
-        owner_key.clone(),
-        revision,
+        Routing {
+            part_sc: part_sc.clone(),
+            pool: pool.clone(),
+            manager_addr: manager_addr.clone(),
+            owner_key: owner_key.clone(),
+            revision,
+        },
     )
     .await;
 
@@ -4375,11 +4270,7 @@ async fn partition_loop(
     mut split_wake_rx: mpsc::UnboundedReceiver<()>,
     mut drain_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
     locked_by_other: Rc<Cell<bool>>,
-    part_sc: Rc<StreamClient>,
-    pool: Rc<ConnPool>,
-    manager_addr: String,
-    owner_key: String,
-    revision: i64,
+    routing: Routing,
 ) {
     use futures::future::{select, Either};
 
@@ -4400,11 +4291,8 @@ async fn partition_loop(
     // contiguous seq range — the precondition that makes the
     // recover_partition dedup (`if ts <= sst_max_seq { continue; }`)
     // sound. See the doc comment above and feature_list.md F210-C1 for
-    // the bug pre-F210-C1 enabled and the perf analysis.
-    type CompletionFut =
-        std::pin::Pin<Box<dyn std::future::Future<Output = InflightCompletion>>>;
-    let mut inflight: futures::stream::FuturesOrdered<CompletionFut> =
-        futures::stream::FuturesOrdered::new();
+    // the bug pre-F210-C1 enabled and the perf analysis. (Type: `InflightQueue`.)
+    let mut inflight: InflightQueue = InflightQueue::new();
 
     'outer: loop {
         if locked_by_other.get() {
@@ -4417,101 +4305,12 @@ async fn partition_loop(
             break;
         }
 
-        // F185 — freeze drain completion. If a MSG_MERGE_FREEZE arrived,
-        // it stashed `freeze_drain_ack` and flipped `frozen_for_merge` to
-        // Some(now). New writes are rejected by handle_incoming_req's
-        // CODE_UNAVAILABLE branch, so `pending` only ever shrinks from
-        // here. We fire the OK reply once pending+inflight are empty AND
-        // every imm has been flushed — at that point the captured-by-the-
-        // orchestrator commit_length is guaranteed to include every
-        // pre-freeze acked write.
-        //
-        // Done at top-of-loop (before the SQ/CQ wait branches) because
-        // once frozen, no new req_rx wakeups arrive — blocking on
-        // req_rx.next() in the wait branches would prevent the freeze
-        // ack from ever firing.
-        // F210-C2: same drain logic also serves split — split parks its own
-        // oneshot in `split_drain_ack` and awaits the signal here. Either
-        // (or both, in rare overlap) can be pending.
-        let need_merge_drain = part.borrow().freeze_drain_ack.borrow().is_some();
-        let need_split_drain = part.borrow().split_drain_ack.borrow().is_some();
-        let need_freeze_drain = need_merge_drain || need_split_drain;
-        if need_freeze_drain && pending.is_empty() && inflight.is_empty() {
-            {
-                let mut p = part.borrow_mut();
-                rotate_active(&mut p);
-            }
-            // F210-C3: capture flush_one_imm failures and propagate to the
-            // freeze ack. Pre-F210-C3 the loop swallowed any error with
-            // `break` and unconditionally returned CODE_OK — manager
-            // thought drain was complete and proceeded with the merge
-            // commit_length capture + atomic txn, but imm with unflushed
-            // data was still in memory. After the merge txn deleted the
-            // victim partition, region_sync_loop dropped the
-            // PartitionData and any unflushed bytes were lost.
-            //
-            // Returning CODE_UNAVAILABLE signals manager to rollback the
-            // freeze (best-effort MSG_MERGE_FREEZE { freeze: false }) and
-            // abort the merge; client retries.
-            let mut drain_err: Option<String> = None;
-            loop {
-                match flush_one_imm(&part).await {
-                    Ok(true) => continue,
-                    Ok(false) => break,
-                    Err(e) => {
-                        let msg = format!("{e:#}");
-                        tracing::error!(part_id, "freeze drain flush_one_imm: {msg}");
-                        drain_err = Some(msg);
-                        break;
-                    }
-                }
-            }
-            // Merge ack: external RPC resp.
-            let merge_ack = part.borrow().freeze_drain_ack.borrow_mut().take();
-            if let Some(ack) = merge_ack {
-                let resp = match &drain_err {
-                    None => partition_rpc::MergeFreezeResp {
-                        code: partition_rpc::CODE_OK,
-                        message: String::new(),
-                    },
-                    Some(e) => partition_rpc::MergeFreezeResp {
-                        code: partition_rpc::CODE_UNAVAILABLE,
-                        message: format!("freeze drain flush failed: {e}"),
-                    },
-                };
-                let succeeded = resp.code == partition_rpc::CODE_OK;
-                let _ = ack.send(Ok(partition_rpc::rkyv_encode(&resp)));
-                if succeeded {
-                    tracing::info!(part_id, "freeze drain complete — partition halted");
-                } else {
-                    tracing::warn!(
-                        part_id,
-                        "freeze drain reported flush failure to manager; \
-                         merge will be rolled back"
-                    );
-                }
-            }
-            // F210-C2: split ack: internal oneshot signal.
-            let split_ack = part.borrow().split_drain_ack.borrow_mut().take();
-            if let Some(ack) = split_ack {
-                let payload = match &drain_err {
-                    None => Ok(()),
-                    Some(e) => Err(e.clone()),
-                };
-                let _ = ack.send(payload);
-                if drain_err.is_none() {
-                    tracing::info!(part_id, "split drain complete — proceeding to commit_length capture");
-                } else {
-                    tracing::warn!(
-                        part_id,
-                        "split drain reported flush failure; split will abort"
-                    );
-                }
-            }
-            // Fall through; subsequent iterations continue serving reads
-            // and the (still-set) frozen_for_merge / frozen_for_split keep
-            // rejecting writes.
-        }
+        // F185 + F210-C2 — freeze drain completion (merge + split). Done at
+        // top-of-loop (before the SQ/CQ wait branches) because once frozen no
+        // new req_rx wakeups arrive, so blocking on req_rx.next() below would
+        // prevent the parked freeze ack from ever firing. See the helper for
+        // the F210-C3 flush-error propagation rationale.
+        try_complete_freeze_drain(&part, part_id, pending.is_empty(), inflight.is_empty()).await;
 
         // (A) Opportunistic CQ drain — run Phase 3 for every completion that
         // is already ready without blocking.
@@ -4522,16 +4321,11 @@ async fn partition_loop(
             }
         }
 
-        // F120-A — sample imm depth + WAL gap snapshot under one borrow.
-        // `imm_full` blocks new request intake (and new batch launches);
-        // `force_rotate` is consulted after we already have a Phase-3 done
-        // (in `finish_write_batch::maybe_rotate`).
-        let (imm_full, _gap_now) = {
-            let p = part.borrow();
-            let gap = p.active.mem_bytes()
-                + p.imm.iter().map(|m| m.mem_bytes()).sum::<u64>();
-            (p.imm.len() >= imm_cap, gap)
-        };
+        // F120-A — sample imm depth. `imm_full` blocks new request intake (and
+        // new batch launches). (The WAL-gap snapshot is computed where it's used,
+        // in the F120-B force-rotate block below — C: dropped the dead duplicate
+        // gap calc that was bound to `_gap_now` and discarded here.)
+        let imm_full = part.borrow().imm.len() >= imm_cap;
         // F183: track imm_full back-pressure events (per-iteration; coarse
         // but matches the spec's "events/sec" semantics — per-tick rate).
         if imm_full {
@@ -4658,11 +4452,7 @@ async fn partition_loop(
             match select(req_fut, select(wake_fut, drain_fut)).await {
                 Either::Left((maybe_req, _)) => match maybe_req {
                     Some(req) => {
-                        handle_incoming_req(
-                            req, &mut pending, &part, &part_sc, &pool,
-                            &manager_addr, &owner_key, revision,
-                        )
-                        .await;
+                        handle_incoming_req(req, &mut pending, &part, &routing).await;
                     }
                     None => break,
                 },
@@ -4689,11 +4479,7 @@ async fn partition_loop(
             match select(req_fut, Box::pin(cfut)).await {
                 Either::Left((maybe_req, _cfut_dropped)) => match maybe_req {
                     Some(req) => {
-                        handle_incoming_req(
-                            req, &mut pending, &part, &part_sc, &pool,
-                            &manager_addr, &owner_key, revision,
-                        )
-                        .await;
+                        handle_incoming_req(req, &mut pending, &part, &routing).await;
                     }
                     None => {
                         // Channel closed: drain remaining inflight, then exit.
@@ -4749,93 +4535,64 @@ async fn partition_loop(
             while pending.len() < max_write_batch() {
                 match req_rx.next().now_or_never() {
                     Some(Some(req)) => {
-                        handle_incoming_req(
-                            req, &mut pending, &part, &part_sc, &pool,
-                            &manager_addr, &owner_key, revision,
-                        )
-                        .await;
+                        handle_incoming_req(req, &mut pending, &part, &routing).await;
                     }
                     _ => break,
                 }
             }
         }
 
-        // F185 — TTL backstop for freeze. The manager-side orchestrator
-        // (`handle_merge_partitions`) commits in <1 s on the happy path;
-        // a TTL fires only on orchestrator crash mid-flow, ensuring a
-        // partition cannot be stuck frozen indefinitely. On expiry we
-        // also drop any stale `freeze_drain_ack` (its caller is gone).
-        if let Some(at) = part.borrow().frozen_for_merge.get() {
-            if at.elapsed() >= FREEZE_TTL {
-                let p = part.borrow();
-                p.frozen_for_merge.set(None);
-                if let Some(ack) = p.freeze_drain_ack.borrow_mut().take() {
-                    let resp = partition_rpc::MergeFreezeResp {
-                        code: partition_rpc::CODE_PRECONDITION,
-                        message: "freeze TTL expired (orchestrator crash backstop)".to_string(),
-                    };
-                    let _ = ack.send(Ok(partition_rpc::rkyv_encode(&resp)));
-                }
-                tracing::warn!(
-                    part_id,
-                    ttl_secs = FREEZE_TTL.as_secs(),
-                    "merge freeze TTL expired — auto-unfreeze"
-                );
-            }
-        }
-        // F210-C2: symmetric TTL backstop for split. If the spawned
-        // handle_split_part task is wedged (e.g. manager unreachable
-        // for the entire multi_modify_split retry window ~12 s, or
-        // task panicked), unfreeze so the partition resumes serving
-        // writes — at worst the client retries split.
-        if let Some(at) = part.borrow().frozen_for_split.get() {
-            if at.elapsed() >= FREEZE_TTL {
-                let p = part.borrow();
-                p.frozen_for_split.set(None);
-                if let Some(ack) = p.split_drain_ack.borrow_mut().take() {
-                    let _ = ack.send(Err(
-                        "split freeze TTL expired (handler wedged)".to_string()
-                    ));
-                }
-                tracing::warn!(
-                    part_id,
-                    ttl_secs = FREEZE_TTL.as_secs(),
-                    "split freeze TTL expired — auto-unfreeze"
-                );
-            }
-        }
+        // F185 + F210-C2 — TTL backstops for merge/split freeze (orchestrator
+        // crash / wedged split handler): auto-unfreeze past FREEZE_TTL.
+        check_freeze_ttls(&part, part_id);
     }
 
-    // Shutdown path: drain any still-in-flight batches so clients get their
-    // final ack (success or error), then flush any residual pending as one
-    // last batch.
+    // Shutdown: drain in-flight batches, flush residual pending, then (if the
+    // loop exited via `drain_rx`) run the F120-C graceful imm drain + ack.
+    drain_and_shutdown(
+        &part,
+        part_id,
+        &mut metrics,
+        &locked_by_other,
+        &mut inflight,
+        &mut pending,
+        drain_ack,
+    )
+    .await;
+}
+
+/// F099-D / F120-C shutdown tail (extracted from `partition_loop`): drain any
+/// still-in-flight batches so clients get their final ack, flush residual
+/// `pending` as one last batch, then — if the loop exited via `drain_rx` — rotate
+/// `active` and synchronously flush every imm before replying on `drain_ack`.
+async fn drain_and_shutdown(
+    part: &Rc<RefCell<PartitionData>>,
+    part_id: u64,
+    metrics: &mut WriteLoopMetrics,
+    locked_by_other: &Rc<Cell<bool>>,
+    inflight: &mut InflightQueue,
+    pending: &mut Vec<WriteRequest>,
+    drain_ack: Option<oneshot::Sender<()>>,
+) {
     while let Some(c) = inflight.next().await {
-        handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+        handle_completion(part, metrics, locked_by_other, part_id, c).await;
     }
     if !pending.is_empty() {
-        let batch = std::mem::take(&mut pending);
-        if let Ok(Some(mut flight)) = start_write_batch(&part, batch).await {
+        let batch = std::mem::take(pending);
+        if let Ok(Some(mut flight)) = start_write_batch(part, batch).await {
             let r = (&mut flight.phase2_fut).await;
-            let _ = finish_write_batch(&part, flight.data, r).await;
+            let _ = finish_write_batch(part, flight.data, r).await;
         }
     }
     metrics.flush(part_id);
 
-    // F120-C — graceful drain. If the loop exited because of `drain_rx`,
-    // rotate `active` to imm and synchronously flush every imm via
-    // `flush_one_imm` (which uses the existing P-bulk hand-off, or the
-    // in-thread fallback). Reply on the oneshot once `imm` is empty.
     if let Some(ack) = drain_ack {
-        // Rotate any leftover `active`. `rotate_active` is a no-op on
-        // empty memtables.
         {
             let mut p = part.borrow_mut();
             rotate_active(&mut p);
         }
-        // Drain imm in order. `flush_one_imm` returns `Ok(false)` when
-        // the deque is empty.
         loop {
-            match flush_one_imm(&part).await {
+            match flush_one_imm(part).await {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(e) => {
@@ -4849,21 +4606,150 @@ async fn partition_loop(
     }
 }
 
+/// Inflight queue type for `partition_loop`'s Phase 2 group-commit futures.
+/// `FuturesOrdered` (not Unordered) so Phase 3 yields in launch = seq order —
+/// load-bearing for recovery dedup (see `partition_loop` doc / F210-C1).
+type InflightQueue = futures::stream::FuturesOrdered<
+    std::pin::Pin<Box<dyn std::future::Future<Output = InflightCompletion>>>,
+>;
+
+/// Per-partition routing / streaming context threaded from `open_partition` into
+/// `partition_loop` + `handle_incoming_req` (bundled to cut the per-call
+/// argument churn). All fields are cheap to clone (`Rc` / `String` / `i64`).
+struct Routing {
+    part_sc: Rc<StreamClient>,
+    pool: Rc<ConnPool>,
+    manager_addr: String,
+    owner_key: String,
+    revision: i64,
+}
+
+/// F185 + F210-C2 freeze-drain completion (extracted from `partition_loop`).
+/// When a merge-freeze or split-freeze has parked its ack and the pipeline is
+/// fully quiesced (`pending` + `inflight` empty), rotate + flush every imm so the
+/// orchestrator's commit_length capture includes every pre-freeze acked write,
+/// then reply on whichever ack(s) are parked. A flush error is reported back so
+/// the orchestrator rolls back instead of committing a lossy merge/split.
+async fn try_complete_freeze_drain(
+    part: &Rc<RefCell<PartitionData>>,
+    part_id: u64,
+    pending_empty: bool,
+    inflight_empty: bool,
+) {
+    let need_merge_drain = part.borrow().freeze_drain_ack.borrow().is_some();
+    let need_split_drain = part.borrow().split_drain_ack.borrow().is_some();
+    if !(need_merge_drain || need_split_drain) || !pending_empty || !inflight_empty {
+        return;
+    }
+    {
+        let mut p = part.borrow_mut();
+        rotate_active(&mut p);
+    }
+    let mut drain_err: Option<String> = None;
+    loop {
+        match flush_one_imm(part).await {
+            Ok(true) => continue,
+            Ok(false) => break,
+            Err(e) => {
+                let msg = format!("{e:#}");
+                tracing::error!(part_id, "freeze drain flush_one_imm: {msg}");
+                drain_err = Some(msg);
+                break;
+            }
+        }
+    }
+    // Merge ack: external RPC resp.
+    let merge_ack = part.borrow().freeze_drain_ack.borrow_mut().take();
+    if let Some(ack) = merge_ack {
+        let resp = match &drain_err {
+            None => partition_rpc::MergeFreezeResp {
+                code: partition_rpc::CODE_OK,
+                message: String::new(),
+            },
+            Some(e) => partition_rpc::MergeFreezeResp {
+                code: partition_rpc::CODE_UNAVAILABLE,
+                message: format!("freeze drain flush failed: {e}"),
+            },
+        };
+        let succeeded = resp.code == partition_rpc::CODE_OK;
+        let _ = ack.send(Ok(partition_rpc::rkyv_encode(&resp)));
+        if succeeded {
+            tracing::info!(part_id, "freeze drain complete — partition halted");
+        } else {
+            tracing::warn!(
+                part_id,
+                "freeze drain reported flush failure to manager; \
+                 merge will be rolled back"
+            );
+        }
+    }
+    // Split ack: internal oneshot signal.
+    let split_ack = part.borrow().split_drain_ack.borrow_mut().take();
+    if let Some(ack) = split_ack {
+        let payload = match &drain_err {
+            None => Ok(()),
+            Some(e) => Err(e.clone()),
+        };
+        let _ = ack.send(payload);
+        if drain_err.is_none() {
+            tracing::info!(part_id, "split drain complete — proceeding to commit_length capture");
+        } else {
+            tracing::warn!(part_id, "split drain reported flush failure; split will abort");
+        }
+    }
+}
+
+/// F185 + F210-C2 freeze TTL backstops (extracted from `partition_loop`). If a
+/// merge/split freeze has been held past `FREEZE_TTL` (orchestrator crashed or
+/// the split handler wedged), auto-unfreeze and fail any parked ack so the
+/// partition resumes serving writes.
+fn check_freeze_ttls(part: &Rc<RefCell<PartitionData>>, part_id: u64) {
+    if let Some(at) = part.borrow().frozen_for_merge.get() {
+        if at.elapsed() >= FREEZE_TTL {
+            let p = part.borrow();
+            p.frozen_for_merge.set(None);
+            if let Some(ack) = p.freeze_drain_ack.borrow_mut().take() {
+                let resp = partition_rpc::MergeFreezeResp {
+                    code: partition_rpc::CODE_PRECONDITION,
+                    message: "freeze TTL expired (orchestrator crash backstop)".to_string(),
+                };
+                let _ = ack.send(Ok(partition_rpc::rkyv_encode(&resp)));
+            }
+            tracing::warn!(
+                part_id,
+                ttl_secs = FREEZE_TTL.as_secs(),
+                "merge freeze TTL expired — auto-unfreeze"
+            );
+        }
+    }
+    if let Some(at) = part.borrow().frozen_for_split.get() {
+        if at.elapsed() >= FREEZE_TTL {
+            let p = part.borrow();
+            p.frozen_for_split.set(None);
+            if let Some(ack) = p.split_drain_ack.borrow_mut().take() {
+                let _ = ack.send(Err(
+                    "split freeze TTL expired (handler wedged)".to_string()
+                ));
+            }
+            tracing::warn!(
+                part_id,
+                ttl_secs = FREEZE_TTL.as_secs(),
+                "split freeze TTL expired — auto-unfreeze"
+            );
+        }
+    }
+}
+
 /// F099-D — decode one incoming `PartitionRequest` and route it. Writes
 /// (PUT/DELETE/STREAM_PUT) decode inline and push into `pending` with a
 /// direct `WriteResponder` into the outer oneshot; reads (GET/HEAD/RANGE)
 /// and other ops dispatch inline. No `compio::runtime::spawn`, no inner
 /// oneshot on the write hot path.
-#[allow(clippy::too_many_arguments)]
 async fn handle_incoming_req(
     req: PartitionRequest,
     pending: &mut Vec<WriteRequest>,
     part: &Rc<RefCell<PartitionData>>,
-    part_sc: &Rc<StreamClient>,
-    pool: &Rc<ConnPool>,
-    manager_addr: &str,
-    owner_key: &str,
-    revision: i64,
+    routing: &Routing,
 ) {
     // F183: bump per-partition request counter for the policy engine.
     // F189-fix MED-3: also bump the never-reset monotonic twin used by
@@ -5017,11 +4903,11 @@ async fn handle_incoming_req(
         // captured commit_length, invisible on recovery).
         MSG_SPLIT_PART => {
             let part_c = part.clone();
-            let part_sc_c = part_sc.clone();
-            let pool_c = pool.clone();
-            let manager_addr_c = manager_addr.to_string();
-            let owner_key_c = owner_key.to_string();
-            let revision_c = revision;
+            let part_sc_c = routing.part_sc.clone();
+            let pool_c = routing.pool.clone();
+            let manager_addr_c = routing.manager_addr.clone();
+            let owner_key_c = routing.owner_key.clone();
+            let revision_c = routing.revision;
             let payload = req.payload;
             let resp_tx = req.resp_tx;
             compio::runtime::spawn(async move {
@@ -5052,11 +4938,11 @@ async fn handle_incoming_req(
                 req.msg_type,
                 req.payload,
                 part,
-                part_sc,
-                pool,
-                manager_addr,
-                owner_key,
-                revision,
+                &routing.part_sc,
+                &routing.pool,
+                &routing.manager_addr,
+                &routing.owner_key,
+                routing.revision,
             )
             .await;
             let _ = req.resp_tx.send(result);
