@@ -3759,3 +3759,43 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
     level health surfacing so a dead loop is never silent.
 - **passes:** false (deferred 2026-05-22 — audit done, fix not started; logged so
   the PS/EN surface isn't forgotten now that the manager side is closed by F228.)
+
+### F230 · partition_loop 95% CPU busy-spin after merge/split reopen (closed drain_rx)
+- **Trigger / 動機:** Found while running the etcd-gated integration suite to
+  validate F227/F228: `system_merge::split_merge_split_with_interleaved_writes`
+  hung — `sample` showed a partition thread spinning at ~95% CPU in
+  `partition_loop`'s idle `select`, leaf =
+  `futures_channel::mpsc::UnboundedReceiver::poll_next`/`pop_spin`. Confirmed
+  PRE-EXISTING (spins identically on the parent commit 773ae63 with F227/F228
+  reverted). Root cause: when a partition is reopened (region_sync drops the
+  `PartitionHandle` on a merge widen / split rotation / PS eviction), the
+  handle's `drain_tx` drops — closing `drain_rx` (EOF) — BEFORE the
+  ps-conn-held `req_tx` clones drop. The idle branch
+  `select(req, select(split_wake, drain))` then keeps selecting the closed
+  `drain_rx`, which returns `Ready(None)` instantly every iteration → the
+  select never blocks → busy-spin until `req_rx` finally closes (forever if any
+  client connection stays open). On a real PS this wedges one core per
+  reopened-then-still-connected partition.
+- **Scope / boundary:** `crates/partition-server/src/lib.rs` `partition_loop`
+  only (+ a test-robustness fix in `crates/manager/tests/support/mod.rs`).
+- **Fix:**
+  1. `drain_closed: bool` latch. When `drain_rx.next()` returns `None` (EOF) in
+     either the idle select or the non-idle `now_or_never` drain poll, set the
+     latch and STOP polling `drain_rx`. Do NOT `break` — `req_rx` may still have
+     queued/in-flight requests to serve; the loop still exits on `req_rx` EOF
+     (the intended reopen/shutdown signal, see the ~2560 comment). (An initial
+     `break`-on-EOF attempt was rejected: it exited while clients had unserved
+     requests → hang.)
+  2. Test helper `PsRouter::client_for` now retries with region re-resolution
+     (50 × 100 ms) instead of `.expect()`-panicking on the first connect miss
+     during the brief reopen window — mirrors the production SDK's
+     `call_ps_for_part` refresh+retry. (The product behavior — a partition is
+     briefly unreachable mid-reopen — is expected and SDK-handled; the test
+     helper was just fragile.)
+- **passes:** true (2026-05-22 — `split_merge_split_with_interleaved_writes`
+  now passes in ~17 s (was: ∞ spin). No regression: manager-lib 113 / stream-lib
+  56 green; partition-server-lib 145/146 (the 1 = `f099i_d1_fast_path` perf-counter
+  assertion, flaky only under full-suite parallel load, passes 3/3 in isolation,
+  unrelated to this change). Reopen-heavy integration green: system_range_split 3,
+  system_multi_split_chain 2, system_ps_failover 2, system_split_writes 1,
+  f211_e2e_lifecycle 8, all 9 system_merge tests (each in its own process).)

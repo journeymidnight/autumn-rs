@@ -53,4 +53,24 @@ Commit: F227 + F228 committed this session (source + docs + ledgers). Did NOT
   commit write_result.json (bench artifact), .venv/, python/d.py, python/del_prefix.py
   (pre-existing untracked, unrelated). Branch f222-f224-recovery-completion-fixes.
 
-Next (optional): F229 implementation; clean-env etcd integration tests.
+== F230 — partition_loop reopen busy-spin (found during clean-env integration run), passes: TRUE ==
+Ran etcd-gated integration suite (clean env: tests self-spawn ephemeral etcd +
+  random ports, isolated from any live cluster). F227/F228-relevant tests all
+  green: extent_failover/recovery/seal, f211_*, ps/manager_failover, leader_fence,
+  apply_done_atomicity, split/range/multi_split_chain, merge (each in own process).
+Found a PRE-EXISTING (spins on parent too) hang:
+  system_merge::split_merge_split_with_interleaved_writes → partition_loop ~95%
+  CPU spin. Root: on reopen, PartitionHandle drop closes drain_rx (EOF) before
+  req_rx; idle select kept selecting the closed drain_rx (instant Ready(None)).
+Fix (crates/partition-server/src/lib.rs partition_loop): drain_closed latch —
+  stop polling drain_rx once EOF, keep serving req_rx, exit on req_rx EOF (NOT
+  break-on-drain-EOF, which stranded queued requests → hang).
+  + test helper crates/manager/tests/support/mod.rs PsRouter::client_for now
+  retries with region re-resolve (mirrors prod SDK) instead of expect()-panic
+  in the reopen window.
+Verified: the test passes ~17s (was ∞). No regression (lib + reopen integration
+  green; the 1 partition-server-lib failure under full parallel load is the
+  pre-existing flaky f099i_d1_fast_path perf-counter assertion, passes in isolation).
+
+Next (optional): F229 (PS/EN loop supervision/timeouts — F230 fixed one concrete
+  PS-loop spin but the broader 1A/1C-for-PS/EN audit-fix is still deferred).
