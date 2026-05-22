@@ -3111,7 +3111,7 @@ impl AutumnManager {
 
         if reached_quorum {
             // Apply: mark every disk on the node offline. Same path
-            // taken by `disk_status_update_loop` on a failed DF.
+            // taken by `node_health_loop` (F222) on a failed DF.
             let nodes_clone = {
                 let s = self.store.inner.borrow();
                 s.nodes.clone()
@@ -3122,7 +3122,7 @@ impl AutumnManager {
                     node_id = req.node_id,
                     quorum,
                     "f192 quorum reached — node marked offline (advisory; \
-                     disk_status_update_loop reconciles on next DF tick)"
+                     node_health_loop reconciles on next DF tick)"
                 );
             }
             // Defuse: clear so we don't re-flip on a stale residual

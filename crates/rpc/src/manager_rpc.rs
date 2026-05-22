@@ -70,9 +70,10 @@ pub const MSG_MERGE_PARTITIONS: u8 = 0x37;
 // (req_id = 0); manager deduplicates by reporter_part_id, applies a
 // 60 s sliding window + 3-distinct-reporter quorum before flipping
 // `node.disks[*].online = false`. Pre-F192 the manager's disk online
-// view was purely pull-based via `disk_status_update_loop` (10 s
-// cadence), so between F190's per-stream alloc route-around and the
-// next DF poll the global view lagged the per-stream truth.
+// view was purely pull-based via the df loop (`node_health_loop` since
+// F222, 2 s; was `disk_status_update_loop`, 10 s), so between F190's
+// per-stream alloc route-around and the next DF poll the global view
+// lagged the per-stream truth.
 pub const MSG_REPORT_DISK_FAILURE: u8 = 0x38;
 
 // F203: per-extent EC convert trigger. Replaces the deleted

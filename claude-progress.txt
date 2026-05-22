@@ -1,65 +1,68 @@
-Date: 2026-05-21
+Date: 2026-05-22
 TaskStatus: completed
-Task scope: F219 — TCP recv-side copy elimination (read + write), reusing the
-            regpool + size threshold from F216-E, PLUS removal of the ZC-path
-            value CRC from the PS hot path (per user: "把 PS 里面 hot path 的
-            CRC 全部删除，不要 enable 啥的"). User ask: "复用 regpool+threshold
-            让 tcp 也尽量 zero copy".
+Task scope: F222 + F223 + F224 — operator-driven recovery actually works end to end.
+  F222: merge manager's two df-calling loops (recovery_collect_loop +
+        disk_status_update_loop) into one node_health_loop (close the
+        recovery-completion-discard race). User: "都是调用df,应当写成一个loop".
+  F223: chunk copy_bytes_from_source so >2 GB extent recovery works.
+  F224: reseed the F211-H rate limiter from the ledger each tick so caps are
+        enforced + recovery-stats reports real numbers.
 
 Current summary:
-  DONE + verified end-to-end on a live 1-node TCP cluster.
+  ALL THREE DONE + unit-tested + e2e-verified on a live 5-node TCP cluster.
 
-  Both recv loops now recv large values straight into a PooledBuf on TCP via a
-  compio OWNED read (no FrameDecoder accumulation copy; only the unavoidable
-  kernel→userspace copy remains). TCP can't be true zero-copy, so the goal is
-  "single-copy". Send side was already vectored/zero-copy on both transports.
+  E2E (2026-05-22, fresh `cluster.sh reset 5`, 4 GB wbench): fence node 7 (held
+  sealed 3 GB extent 12 = [7,3,9]) →
+    t+5s : recovery-stats `global: 1/64` (F224 — was always 0), inflight marker=1
+    t+10s: extent 12 = [1,3,9] eversion 2→3 (F222 apply ran), marker released
+           (NOT via the 10-min F208 sweep); the 3 GB copy succeeded (F223 — pre-fix
+           it failed 10x/10 "no source replica available for copy").
+  cargo build --workspace clean; cargo test -p autumn-manager --lib 108/0.
 
-  1. New primitive `ReadHalf::read_exact_into_pooled(pb, filled, target)`
-     (crates/transport/src/lib.rs): fills pb[filled..target] via
-     `pb.slice(filled..target)` + compio `read_exact`, returns the buffer.
-     Cancel-safe (compio retains the owned buffer until the read CQE lands).
-     UCX errors (callers gate on !is_ucx and use recv_into there).
+  Root-cause chain that started this (forensics on a live 4->5 node TCP cluster):
+    - User fenced node 7; recovery "didn't seem to happen".
+    - Found: recovery DID reach the EN and copied data (extent-33.dat written to
+      the target node's disk after boot), but manager-side apply_recovery_done
+      NEVER ran -> metadata not updated, recovered copy became an orphan, inflight
+      marker stuck until F208 stale-sweep released it ~10 min later.
+    - Bug 1 (df-drain race): EN handle_df does std::mem::take on recovery_done
+      when req.tasks.is_empty(). disk_status_update_loop (10 s) sent empty tasks
+      and DISCARDED the returned done_tasks (only updated disk status). Whenever
+      its sweep won the race vs recovery_collect_loop (2 s), the completion was
+      lost forever. crates/stream/src/extent_node.rs:3712-3739 (EN drain);
+      crates/manager/src/recovery.rs (the two loops).
 
-  2. READ (PS←EN VP value): rpc read_loop IntoPooled gains a TCP branch
-     (value ≥ TCP_RECV_INTO_POOLED_MIN_BYTES = 64 KiB) that drains the buffered
-     prefix then read_exact_into_pooled the rest. `StreamClient::read_value_into_pooled`
-     UCX-only gate relaxed → TCP regular `get` of a VP value now routes through
-     MSG_READ_BYTES_ZC (EN side already pooled + value-separable → also delivers
-     F216-F's EN-send win for free; F216-F subsumed).
+  F222 fix (this change):
+    - crates/manager/src/recovery.rs: deleted recovery_collect_loop +
+      disk_status_update_loop; added node_health_loop -- ONE df caller, 2 s, all
+      nodes, empty tasks (EN drains full recovery_done), and ALWAYS applies every
+      done_task AND updates disk status + node_states (Suspected/Online) +
+      recent_failure_reports. One caller = no race.
+    - crates/manager/src/lib.rs start_runtime_tasks: two spawns -> one.
+    - crates/manager/src/rpc_handlers.rs: 2 stale message/comment refs updated.
+    - Build OK. `cargo test -p autumn-manager --lib` = 108 passed / 0 failed.
 
-  3. WRITE (PS←client large MSG_PUT_ZC): drain_zc_writes `!is_ucx` early-return
-     removed; TCP branch recvs the value via read_exact_into_pooled. perf-check +
-     `put-zc` CLI send MSG_PUT_ZC on TCP only for values ≥ 64 KiB (small writes
-     stay regular MSG_PUT — 4 KiB hot path is QPS-critical, no copy win there).
+Files changed:
+  - crates/manager/src/recovery.rs: F222 node_health_loop (replaces the two
+    loops); F224 limiter reseed at tick top + try_acquire gate in
+    dispatch_recovery_task (release on RPC-fail, Ok-on-rate-limited).
+  - crates/manager/src/lib.rs: F222 single spawn.
+  - crates/manager/src/recovery_rate_limiter.rs: F224 reset_counts + seed_inflight.
+  - crates/stream/src/extent_node.rs: F223 chunked copy_bytes_from_source +
+    read_bytes_chunk helper; fetch_full_extent_from_sources passes sealed_length.
+  - rpc_handlers.rs + 5 CLAUDE.md / source comments: doc sync (loop rename,
+    cadence 10s->2s, F222 Programming Note 25).
 
-  4. CRC removed from the PS hot path, NO toggle: encode_zc_meta writes 0 in the
-     crc field (kills EN read-resp + PS get-resp crc passes); read_crc_ok +
-     VERIFY_READ_CRC + set_verify_read_crc deleted (kills PS←EN + client←PS
-     verify); drain_zc_writes consumes the V1 trailer for stream alignment but no
-     longer validates it. 9-byte zc_meta layout unchanged (field reserved/0 →
-     wire-compatible). Normal non-ZC frames keep their V1 frame-CRC (F165).
-     Value integrity now left to the transport (UCX NIC ICRC / TCP kernel cksum).
+Remaining / follow-ups (non-blocking, NOT started):
+  - >4 GiB extent recovery: ReadBytesReq.offset is u32, so F223 covers up to
+    4 GiB (guarded with an explicit error). Wider wire offset = separate change
+    if max_extent_size ever exceeds 4 GiB.
+  - Orphan reconcile: Bug-1-era orphans (recovered copies the manager never
+    adopted) get LOADED on EN restart and make handle_require_recovery return
+    PRECONDITION "extent already exists" (extent_node.rs:3776). F222 stops NEW
+    orphans; existing ones are reaped by the F109/F113 reconcile sweep.
 
-Verification:
-  - Builds clean WITH and WITHOUT --features ucx (rpc, partition-server, server).
-  - Unit: rpc 16 (incl new call_into_pooled_tcp_large_value_recv_into_pooled),
-    partition-server 146, stream 56 — all green.
-  - Live 1-node TCP cluster: put-zc 8 MiB → get + zc-get round-trip
-    byte-identical (sha256 match). ps.log: "PS write-recv ZC engaged …
-    transport=\"tcp(pooled)\" value_len=8388608", no panic / no crc mismatch.
-  - perf-check 8M TCP runs "[ZC: MSG_PUT_ZC; read regular]" end-to-end, no crash
-    (P=1 smoke only — NOT a perf claim; real A/B needs P>=8 matrix).
-
-Main gaps / next steps (lower priority):
-  1. Proper P>=8 perf A/B (8M intra-host TCP read+write) vs parent commit to
-     quantify the win + refresh perf_baseline.json.
-  2. client←PS read (get_into/call_into_dest) TCP recv-into-dest deferred
-     (cancel-safety needs read_loop-owns-buffer variant; production read = UCX,
-     and regular TCP get already benefits via the PS←EN change).
-  3. Client send-side V1 frame-crc for put_zc still computed on TCP — drop by
-     sending put_zc as V0 on TCP (separate wire decision).
-  4. regpool_acquire still calls ibv_reg_mr on ucx-feature builds even under TCP
-     transport (wasteful but correct; reg unused for TCP). Could skip when
-     transport != UCX at runtime.
-
-Previous task (completed 2026-05-21): F216-E W1 PS write-recv ZC (UCX).
+Next steps:
+  1. Commit F222+F223+F224 (on a branch — currently on main).
+  2. Optional: integration test for F223 chunking (small
+     AUTUMN_STREAM_READ_CHUNK_BYTES) + F224 limiter reseed.

@@ -451,6 +451,15 @@ spawns 8 detached `run_recovery_task` tasks, each holding ~`payload × 2`
 memory through fetch + write. The concurrency controller caps that to
 `recovery_max` (default 2) across all extents.
 
+**Keep `recovery_max` aligned with the manager's
+`RecoveryRateLimiter.max_per_target`** (default 2; F211-H/F224). Both
+cap "concurrent recoveries landing on this EN" — manager throttles
+DISPATCH (network fan-out), this caps EXECUTION (RAM). Defense-in-depth,
+different processes (cannot be merged). If the manager's per-target cap
+exceeds `recovery_max`, surplus dispatches just block in
+`acquire_recovery()`'s 50 ms backoff until a permit frees. See
+`crates/manager/CLAUDE.md` Programming Note 27.
+
 ### Concurrency vs rate limiting (and why there's no rate cap on EN)
 
 EN has concurrency caps but **no bytes/s rate limit** today. This is
@@ -938,6 +947,29 @@ sufficient (and cheaper than DashMap).
     the decoded payload. Skips the wasted server round-trip + EC
     decode on a known-stale VP. Open extents (sealed_length=0) are
     untouched — there's no authoritative bound to check against.
+
+19. **F223 recovery source-fetch MUST be chunked
+    (`copy_bytes_from_source`).** The replicated-extent recovery path
+    (`fetch_full_extent_from_sources` → `copy_bytes_from_source`) used a
+    single `MSG_READ_BYTES` oneshot with `length: 0` (read-to-end). On a
+    multi-GB sealed extent that trips the same >2 GiB per-syscall pread
+    ceiling (macOS INT_MAX / Linux 0x7ffff000) + oversized rpc frame that
+    F105 (StreamClient reads, note 12) and F115 (EN local-file I/O, note
+    13) chunk everywhere else — this raw path was the one place that
+    didn't. Symptom: recovering a 3 GB extent from two healthy replicas
+    failed 10×/10 with "no source replica available for copy"; the source
+    EN logged nothing (the read died at rpc framing before the handler).
+    F223 makes `copy_bytes_from_source(addr, eid, eversion, total_len)`
+    loop 256 MiB (`FILE_IO_CHUNK_BYTES`) reads via `read_bytes_chunk`;
+    `fetch_full_extent_from_sources` passes `extent.sealed_length`. The
+    **EC** shard-recovery caller (`run_ec_recovery_payload`) keeps
+    `total_len = 0` (legacy to-end read — each shard is ~`sealed/K`, under
+    the threshold). **Caveat: `ReadBytesReq.offset` is u32, so this covers
+    extents up to 4 GiB** (guarded with an explicit error); a wider wire
+    offset is a separate change if `max_extent_size` ever exceeds 4 GiB.
+    **Invariant: any new full-extent fetch over `MSG_READ_BYTES` must
+    chunk — never issue a single `length: 0` read against a sealed
+    multi-GB extent.**
 
 ---
 

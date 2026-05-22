@@ -141,7 +141,7 @@ For a fresh cluster (F214):
 4. Run `autumn-op bootstrap` to create streams and initial partition.
 5. Start `autumn-ps` with a unique `--psid`.
 
-Newly-registered nodes start in `NodeAutoState::Suspend`. The manager's 10-s `disk_status_update_loop` flips them to `Online` on the first successful `df` response. `select_nodes` gates allocation on `Online` state but falls back to the full node set when none are Online (cold-leader / fresh-bootstrap path).
+Newly-registered nodes start in `NodeAutoState::Suspend`. The manager's 2-s `node_health_loop` (F222; was the 10-s `disk_status_update_loop`) flips them to `Online` on the first successful `df` response. `select_nodes` gates allocation on `Online` state but falls back to the full node set when none are Online (cold-leader / fresh-bootstrap path).
 
 ## Common CLI Patterns
 

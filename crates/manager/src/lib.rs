@@ -625,15 +625,13 @@ impl AutumnManager {
         })
         .detach();
 
+        // F222: single df caller — merges the former recovery_collect_loop
+        // (2 s, apply done_tasks) and disk_status_update_loop (10 s, disk +
+        // node liveness). Eliminates the race where the empty-`tasks` df
+        // drained the EN's recovery_done and discarded the completions.
         let mgr = self.clone();
         compio::runtime::spawn(async move {
-            mgr.recovery_collect_loop().await;
-        })
-        .detach();
-
-        let mgr = self.clone();
-        compio::runtime::spawn(async move {
-            mgr.disk_status_update_loop().await;
+            mgr.node_health_loop().await;
         })
         .detach();
 

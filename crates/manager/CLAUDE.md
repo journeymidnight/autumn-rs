@@ -207,13 +207,11 @@ Scans all sealed extents. For each replica slot:
 - If the node doesn't respond or returns an error: dispatch `require_recovery` to a healthy candidate node.
 - Tracks in-flight recoveries in `recovery_tasks` to avoid double-dispatching.
 
-### Disk Status Update Loop (every 10 seconds)
-Polls all registered extent nodes via `df` RPC to update per-disk online status in `store.disks`. Matches Go's `routineUpdateDF`. Disk status is also updated opportunistically in the collect loop when polling for recovery task completion.
-
-### Collect Loop (every 2 seconds)
-Polls all registered nodes with the `df` RPC. The response includes completed recovery tasks. For each completion:
-- Calls `apply_recovery_done`: replaces the failed node_id with the recovery node_id in `ExtentInfo.replicates`, increments eversion, marks slot as available.
-- Mirrors updated ExtentInfo to etcd.
+### Node Health Loop (every 2 seconds, F222 — merges the former Collect + Disk-Status loops)
+ONE `df` caller per node per tick. Pre-F222 there were two: a 2 s `recovery_collect_loop` (target nodes only, non-empty `tasks`, applied `done_tasks`) and a 10 s `disk_status_update_loop` (all nodes, empty `tasks`, updated liveness, **discarded** `done_tasks`). Because the EN's `handle_df` does `std::mem::take(recovery_done)` when `req.tasks.is_empty()`, the disk-status loop drained completions and threw them away whenever its sweep won the race — so `apply_recovery_done` never ran (recovery wasted, orphan copy, marker stuck until F208). The merged `node_health_loop` iterates ALL nodes, sends empty `tasks` (EN drains its full `recovery_done`), and on every successful `df`:
+- `mark_node_disks_online` + `recent_failure_reports.remove` + `node_states.on_heartbeat_ok` (F211-A Suspected→Online), and
+- `apply_recovery_done` for EVERY returned `done_task` (replaces the failed node_id in `ExtentInfo.replicates`, bumps eversion, marks slot available, mirrors to etcd, releases the inflight marker atomically).
+On `df` failure: `mark_node_disks_offline` + `node_states.on_heartbeat_fail` (Online→Suspected after the soft timeout; NOT a recovery trigger — that needs explicit fence, F211-E). One caller = the drain-and-discard race is structurally impossible. See Programming Note 25.
 
 ## Partition Assignment: `rebalance_regions`
 
@@ -257,8 +255,8 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
 6. **Rebalance is called eagerly** — `rebalance_regions` after every PS registration or partition upsert. This is safe because it's idempotent (keeps existing assignments, only changes unassigned ones).
 
 7. **F121 disk-online tracking is call-result-driven, NOT
-   payload-driven.** `disk_status_update_loop` and the `df` poll
-   inside `recovery_collect_loop` use the helpers
+   payload-driven.** The `df` poll in `node_health_loop` (F222; was
+   `disk_status_update_loop` + `recovery_collect_loop`) uses the helpers
    `mark_node_disks_offline(store, node)` on RPC error and
    `mark_node_disks_online(store, node)` on success. Both key on
    `MgrNodeInfo.disks` (manager-allocated `disk_id`s). The
@@ -1060,10 +1058,10 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
 
     **Layer 1 — automatic, in-memory only (`crates/manager/src/node_state.rs`):**
     `NodeStateTracker` tracks `Online ↔ Suspected` per EN based on
-    `disk_status_update_loop`'s df outcome. **Crucially: there is no
-    automatic `Down` transition.** Fed at three points: (i) df failure
-    in `disk_status_update_loop`, (ii) df success there, (iii)
-    `register_node` initial-OK heartbeat. Replay seeds every EN node
+    `node_health_loop`'s df outcome (F222; was `disk_status_update_loop`).
+    **Crucially: there is no automatic `Down` transition.** Fed at three
+    points: (i) df failure in `node_health_loop`, (ii) df success there,
+    (iii) `register_node` initial-OK heartbeat. Replay seeds every EN node
     OK on leader-promotion so the new leader gets a fresh soft-timeout
     window before its judgement settles.
 
@@ -1184,9 +1182,9 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     — `on_register_first(node_id)` seeds Suspend without touching
     `last_ok`. Transitions:
     - **Suspend → Online**: on first successful `df` heartbeat
-      from `disk_status_update_loop`. The 10 s sweep cadence means
-      a Suspend node typically reaches Online within 10-20 s of
-      `MSG_REGISTER_NODE`.
+      from `node_health_loop` (F222; was `disk_status_update_loop`).
+      The 2 s sweep cadence means a Suspend node typically reaches
+      Online within ~2-4 s of `MSG_REGISTER_NODE` (was 10-20 s).
     - **Suspend → Suspected**: NEVER. `on_heartbeat_fail` and
       `tick()` both no-op on Suspend; Suspected requires a prior
       verified-alive baseline (it means "was alive, now flaky").
@@ -1224,3 +1222,81 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     rides on top), 15 (F149 `txn_fenced` — F214-A cluster_id CAS
     inherits the leader fence), 23 (F211 NodeStateTracker — F214-B
     extends the same struct with the third variant).
+
+25. **F222 single df caller (`node_health_loop`).** The manager must
+    have exactly ONE loop calling `EXT_MSG_DF` per node, and it must
+    apply `done_tasks`. Pre-F222 a second df caller
+    (`disk_status_update_loop`, empty `tasks`) raced the recovery
+    collector: the EN's `handle_df` drains its ENTIRE `recovery_done`
+    via `std::mem::take` whenever `req.tasks.is_empty()`, and the
+    disk-status loop discarded what it drained. Whichever loop polled a
+    node first after a recovery completed won; when the disk-status
+    sweep won, the completion was lost permanently —
+    `apply_recovery_done` never ran, the slot stayed pointing at the
+    dead/fenced node, the EN's recovered copy became an orphan (reaped
+    later by F109/F113 reconcile, but only after being LOADED on the
+    next EN restart, where it then makes `handle_require_recovery`
+    return PRECONDITION "extent already exists" and blocks
+    re-recovery), and the inflight marker survived until the F208 stale
+    sweep (~10 min). **Invariant: never add a second `df` caller. If a
+    future loop needs disk/liveness info, fold it into
+    `node_health_loop` or have it apply any `done_tasks` it drains.**
+    Cross-ref: F208 (stale-marker sweep — the safety net that hid this
+    bug as a 10-min stall rather than a permanent one), 23 (F211-A
+    node_states, fed here on df ok/fail), 26 (F224 limiter reseed,
+    added here in the same loop).
+
+26. **F224 recovery rate limiter is reseeded from the ledger each
+    dispatch tick (it is NOT manually released).** Pre-F224
+    `RecoveryRateLimiter::try_acquire`/`release` were never called in
+    production — only in unit tests — so `recovery-stats`
+    `global`/per-source/per-target were permanently `0`/empty AND the
+    concurrency caps were unenforced (a big fence could still flood
+    recoveries, the exact thing F211-H was meant to prevent; only
+    `backoff_entries` was live). F224 implements the design the module
+    doc always described: at the top of `recovery_dispatch_loop`,
+    `reset_counts()` then `seed_inflight(replace_id, node_id)` for every
+    Recovery entry in the F207 inflight ledger. The ledger is the source
+    of truth (survives leader failover), so re-deriving every tick means
+    NO manual release bookkeeping — a completed recovery drops out of
+    the ledger and out of the count on the next tick. On NEW dispatches,
+    `dispatch_recovery_task` calls `try_acquire(replace_id, candidate)`
+    per candidate: cap-hit → try the next candidate; every candidate
+    capped → return `Ok(())` (DEFERRED, not a failure — no backoff,
+    retried next tick once capacity frees; distinct from
+    `candidates.is_empty()` which is a real `Err` → backoff). RPC-failure
+    paths `release` the slot they took (so an intra-tick failure doesn't
+    over-count before the next reseed). **Invariant: do not add manual
+    `release` calls in apply_recovery_done / drain — the per-tick reseed
+    is the single source of truth; a stray release would double-count
+    down.** Worst case after leader failover: one tick at pre-F211-H
+    concurrency before the first reseed. Cross-ref: 25 (F222, same loop),
+    21 (F207 ledger = the reseed source), 27 (per_target vs EN cap).
+
+27. **`RecoveryRateLimiter.max_per_target` (manager) should track the
+    extent-node's `ConcurrencyController.recovery_max` (EN).** These two
+    caps bound the SAME physical quantity — "concurrent recoveries
+    landing on one extent-node" — at two layers, and form
+    defense-in-depth, NOT a conflict (they live in different processes,
+    so they cannot and should not be merged into one object):
+    - manager `max_per_target` (default **2**, env
+      `AUTUMN_MGR_RECOVERY_MAX_PER_TARGET`): throttles DISPATCH fan-out
+      (network, "don't flood a target node").
+    - EN `recovery_max` (default **2**, flag `--recovery-parallelism` /
+      env `AUTUMN_EXTENT_RECOVERY_PARALLELISM`): caps EXECUTION (each
+      `run_recovery_task` holds ~payload×2 RAM; see
+      `crates/stream/CLAUDE.md` ConcurrencyController).
+    Aligned at 2 by default. If manager `max_per_target` is set HIGHER
+    than EN `recovery_max`, the surplus dispatches are not dropped —
+    they block in the EN's `acquire_recovery()` 50 ms backoff loop until
+    a permit frees (correct, just wasted dispatch RPCs + ledger churn).
+    If set LOWER, the EN never reaches its RAM ceiling (manager is the
+    binding constraint). Keep them equal unless you deliberately want
+    one layer to be the bottleneck. The other limiters are unrelated:
+    the PS `RateController` (byte-rate) and PS/EN `ConcurrencyController`
+    (RAM permits) protect different resources in different processes;
+    F196 D-r6→D-r7 deliberately SPLIT rate from concurrency after a
+    failed merge, so do not fold byte-rate and concurrency caps together.
+    `RecoveryRateLimiter` is a concurrency + per-(extent,slot) backoff
+    limiter (no byte-rate dimension) — closest in spirit to the
+    `ConcurrencyController`s, not to `RateController`.

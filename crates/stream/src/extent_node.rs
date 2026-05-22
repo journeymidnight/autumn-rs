@@ -2686,18 +2686,75 @@ impl ExtentNode {
     }
 
     /// Copy the full extent data from a remote source node using autumn-rpc.
+    /// F223: fetch a source replica's extent in 256 MiB chunks.
+    ///
+    /// Pre-F223 this issued ONE `MSG_READ_BYTES` with `length: 0`
+    /// (read-to-end). On a multi-GB sealed extent that trips the
+    /// >2 GiB per-syscall pread ceiling on the source EN (macOS
+    /// INT_MAX / Linux 0x7ffff000) and oversized rpc frames — exactly
+    /// what F105/F115 chunk every OTHER full-extent path for. The raw
+    /// recovery fetch bypassed all of it, so replicated-extent recovery
+    /// of any >2 GiB extent failed with "no source replica available
+    /// for copy" (10 retries, source nodes logged nothing — the read
+    /// died at rpc framing before the handler). `total_len` is the
+    /// extent's `sealed_length`; recovery only ever targets sealed
+    /// extents, so it is known. `total_len == 0` falls back to a single
+    /// to-end read (open-extent / unknown-length callers).
+    ///
+    /// NOTE: `ReadBytesReq.offset` is u32, so this covers extents up to
+    /// 4 GiB. `max_extent_size` keeps extents well under that; a wider
+    /// wire offset would be a separate change if extents ever exceed it.
     async fn copy_bytes_from_source(
         addr: &str,
         extent_id: u64,
         eversion: u64,
+        total_len: u64,
     ) -> Result<Vec<u8>, String> {
         let sock: std::net::SocketAddr = parse_addr(addr)
             .map_err(|e| e.to_string())?;
+        if total_len == 0 {
+            return Self::read_bytes_chunk(sock, addr, extent_id, eversion, 0, 0).await;
+        }
+        let chunk = FILE_IO_CHUNK_BYTES as u64;
+        let mut out: Vec<u8> = Vec::with_capacity(total_len as usize);
+        let mut offset: u64 = 0;
+        while offset < total_len {
+            let want = chunk.min(total_len - offset);
+            let off_u32: u32 = offset.try_into().map_err(|_| {
+                format!("extent {extent_id} recovery offset {offset} exceeds u32 (>4 GiB)")
+            })?;
+            let got =
+                Self::read_bytes_chunk(sock, addr, extent_id, eversion, off_u32, want as u32)
+                    .await?;
+            if got.is_empty() {
+                break;
+            }
+            let got_len = got.len() as u64;
+            out.extend_from_slice(&got);
+            offset += got_len;
+            if got_len < want {
+                break; // short read — source has no more data
+            }
+        }
+        Ok(out)
+    }
+
+    /// One `MSG_READ_BYTES` round-trip. `length == 0` means read-to-end
+    /// (legacy single-shot path); otherwise reads exactly `[offset,
+    /// offset+length)`.
+    async fn read_bytes_chunk(
+        sock: std::net::SocketAddr,
+        addr: &str,
+        extent_id: u64,
+        eversion: u64,
+        offset: u32,
+        length: u32,
+    ) -> Result<Vec<u8>, String> {
         let req = ReadBytesReq {
             extent_id,
             eversion,
-            offset: 0,
-            length: 0,
+            offset,
+            length,
         };
         let resp_bytes = rpc_oneshot(sock, MSG_READ_BYTES, req.encode())
             .await
@@ -2728,8 +2785,13 @@ impl ExtentNode {
             let Some(addr) = nodes.get(node_id) else {
                 continue;
             };
-            let copied =
-                Self::copy_bytes_from_source(addr, extent.extent_id, extent.eversion).await;
+            let copied = Self::copy_bytes_from_source(
+                addr,
+                extent.extent_id,
+                extent.eversion,
+                extent.sealed_length, // F223: chunked fetch of the full sealed extent
+            )
+            .await;
             if let Ok(payload) = copied {
                 if extent.sealed_length > 0 && payload.len() < extent.sealed_length as usize {
                     continue;
@@ -2942,7 +3004,11 @@ impl ExtentNode {
             let Some(addr) = nodes.get(&node_id) else {
                 continue;
             };
-            match Self::copy_bytes_from_source(addr, task.extent_id, extent_info.eversion).await {
+            // F223: EC shard read — each peer holds a shard of size
+            // ~sealed_length/K (well under the chunking threshold), so
+            // keep the legacy to-end single read (total_len=0). Only the
+            // replicated full-extent fetch needed chunking.
+            match Self::copy_bytes_from_source(addr, task.extent_id, extent_info.eversion, 0).await {
                 Ok(shard_bytes) => {
                     // Trim to sealed length if the extent is sealed.
                     let shard = if extent_info.sealed_length > 0

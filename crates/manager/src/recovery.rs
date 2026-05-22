@@ -53,7 +53,24 @@ impl AutumnManager {
             ));
         }
 
+        let mut rate_limited = false;
         for candidate in &candidates {
+            // F224: gate this (source -> target) dispatch on the rate
+            // limiter (reseeded from the ledger at the top of the dispatch
+            // loop). On cap-hit try the NEXT candidate — a different target
+            // may have headroom; if every candidate is capped we return Ok
+            // below (deferred, NOT a failure: no backoff, retried next tick
+            // once capacity frees). The slot is released on any RPC-failure
+            // path below; on success it stays counted (and is re-derived
+            // from the ledger on the next tick's reseed).
+            if !self
+                .recovery_limiter
+                .borrow_mut()
+                .try_acquire(replace_id, candidate.node_id)
+            {
+                rate_limited = true;
+                continue;
+            }
             let base = Self::normalize_endpoint(&candidate.address);
             // F099-M: recovery targets a specific extent_id → route to owner shard.
             let addr = Self::shard_addr_for_extent(
@@ -116,6 +133,10 @@ impl AutumnManager {
                     // on the next tick and the EN-side check will idempotently
                     // refuse the duplicate.
                     let _ = self.drain_extent_inflight_marker(extent.extent_id).await;
+                    // F224: release the limiter slot we took above.
+                    self.recovery_limiter
+                        .borrow_mut()
+                        .release(replace_id, candidate.node_id);
                     continue;
                 }
             };
@@ -123,6 +144,10 @@ impl AutumnManager {
                 Ok(v) => v,
                 Err(_) => {
                     let _ = self.drain_extent_inflight_marker(extent.extent_id).await;
+                    // F224: release the limiter slot we took above.
+                    self.recovery_limiter
+                        .borrow_mut()
+                        .release(replace_id, candidate.node_id);
                     continue;
                 }
             };
@@ -131,6 +156,10 @@ impl AutumnManager {
                 // F139 recovery_inflight conflict). Release marker
                 // and try next candidate.
                 let _ = self.drain_extent_inflight_marker(extent.extent_id).await;
+                // F224: release the limiter slot we took above.
+                self.recovery_limiter
+                    .borrow_mut()
+                    .release(replace_id, candidate.node_id);
                 continue;
             }
 
@@ -140,6 +169,14 @@ impl AutumnManager {
             return Ok(());
         }
 
+        // F224: if we never reached the RPC because every candidate was
+        // rate-limited, this is a deferral, not a failure. Return Ok so
+        // the dispatch loop records success (no backoff) and retries next
+        // tick once the limiter has headroom. A genuine all-candidates-
+        // RPC-rejected outcome (rate_limited == false) still backs off.
+        if rate_limited {
+            return Ok(());
+        }
         Err(AppError::Precondition(
             "all recovery candidates rejected".to_string(),
         ))
@@ -383,6 +420,27 @@ impl AutumnManager {
                 .map(|(id, st, _)| (id, st))
                 .collect();
             let now_s = Self::epoch_seconds();
+
+            // F224: reseed the recovery rate limiter from the inflight
+            // ledger so its counters reflect actually-in-flight recoveries.
+            // The ledger is the source of truth (survives leader failover);
+            // re-deriving every tick means no manual release bookkeeping
+            // (a completed recovery drops out of the ledger → out of the
+            // count next tick) and `recovery-stats` reports real numbers.
+            // Backoff state is preserved (reset_counts leaves it). The
+            // per-candidate `try_acquire` in `dispatch_recovery_task` then
+            // gates NEW dispatches against the caps on top of this baseline.
+            {
+                let mut lim = self.recovery_limiter.borrow_mut();
+                lim.reset_counts();
+                for rec in self.inflight.borrow().values() {
+                    if let Some((_, crate::extent_inflight::ExtentOpPayload::Recovery(t))) =
+                        rec.unpack()
+                    {
+                        lim.seed_inflight(t.replace_id, t.node_id);
+                    }
+                }
+            }
 
             // F172-A: pre-filter under the store borrow so we DON'T clone
             // extents that the loop body will skip on the next line. The
@@ -656,94 +714,32 @@ pub(crate) enum RecoveryGateMode {
 
 impl crate::AutumnManager {
 
-    pub(crate) async fn recovery_collect_loop(self) {
+    /// F222: unified node-health + recovery-collect loop. Merges the
+    /// former `recovery_collect_loop` (2 s, recovery-target nodes only,
+    /// non-empty `tasks`) and `disk_status_update_loop` (10 s, all nodes,
+    /// empty `tasks`) into a SINGLE `EXT_MSG_DF` caller per node per tick.
+    ///
+    /// Why merge: both old loops called `df` independently. The EN's
+    /// `handle_df` drains its ENTIRE `recovery_done` via `std::mem::take`
+    /// whenever `req.tasks.is_empty()` — which is exactly what
+    /// `disk_status_update_loop` sent. That loop then DISCARDED the
+    /// returned `done_tasks` (it only updated disk status), so whenever
+    /// its 10 s sweep won the race against the 2 s collect loop, the
+    /// recovery completion was lost: `apply_recovery_done` never ran, the
+    /// extent's slot was never repaired in manager metadata, the recovered
+    /// copy became an orphan, and the inflight marker sat until the F208
+    /// stale sweep released it ~10 min later. One loop = one df caller =
+    /// completions are always applied.
+    ///
+    /// Cadence 2 s (the recovery-responsive pace; `df` is a cheap
+    /// control-plane statvfs + Vec drain). The disk-status liveness signal
+    /// is now sampled every 2 s instead of 10 s — strictly better for
+    /// Suspected detection. `tasks` is always empty so the EN drains its
+    /// full `recovery_done`, and every completion is applied right here,
+    /// so nothing is ever stranded in the EN buffer.
+    pub(crate) async fn node_health_loop(self) {
         loop {
             compio::time::sleep(Duration::from_secs(2)).await;
-            if !self.leader.get() {
-                continue;
-            }
-
-            // F207-C: source the active Recovery tasks from the unified
-            // ledger instead of the deleted `recovery_tasks` HashMap.
-            let tasks: Vec<MgrRecoveryTask> = self
-                .inflight
-                .borrow()
-                .values()
-                .filter_map(|rec| match rec.unpack() {
-                    Some((_, crate::extent_inflight::ExtentOpPayload::Recovery(t))) => Some(t),
-                    _ => None,
-                })
-                .collect();
-            if tasks.is_empty() {
-                continue;
-            }
-
-            let nodes = {
-                let s = self.store.inner.borrow();
-                s.nodes.clone()
-            };
-
-            let mut by_node: HashMap<u64, Vec<MgrRecoveryTask>> = HashMap::new();
-            for task in &tasks {
-                by_node.entry(task.node_id).or_default().push(task.clone());
-            }
-
-            for (node_id, node_tasks) in by_node {
-                let Some(node) = nodes.get(&node_id) else {
-                    continue;
-                };
-                // F191: prefer the control_address; fall back to data
-                // plane address for legacy / not-yet-re-registered nodes.
-                let raw_addr = if node.control_address.is_empty() {
-                    &node.address
-                } else {
-                    &node.control_address
-                };
-                let addr = Self::normalize_endpoint(raw_addr);
-                let payload = rkyv_encode(&ExtDfReq {
-                    tasks: node_tasks,
-                    disk_ids: Vec::new(),
-                });
-                // F191 P0: bound DF at 5 s via control_pool.call_timeout.
-                // Pre-F191 the comment in disk_status_update_loop claimed
-                // the call was timeout-bounded but the conn_pool.call
-                // path had no timeout, so a single slow / stuck DF could
-                // hang the loop tick.
-                let resp = match self
-                    .control_pool
-                    .call_timeout(&addr, EXT_MSG_DF, payload, Duration::from_secs(5))
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(_) => {
-                        // F121: peer is unreachable — mark all of its
-                        // disks offline so allocation/recovery skip it.
-                        // `ConnPool::call_timeout` already evicts the
-                        // broken conn so the next poll reconnects.
-                        Self::mark_node_disks_offline(&self.store, node);
-                        continue;
-                    }
-                };
-                let df: ExtDfResp = match rkyv_decode(&resp) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                // F121: see disk_status_update_loop — promote on the
-                // call-level signal, not per-payload disk_id, because
-                // the wire status uses the extent-node's local disk_id.
-                Self::mark_node_disks_online(&self.store, node);
-                for done in df.done_tasks {
-                    let _ = self.apply_recovery_done(done).await;
-                }
-            }
-        }
-    }
-
-    /// Periodically polls all extent nodes for disk status updates.
-    /// Matches Go's `routineUpdateDF` (10-20s interval).
-    pub(crate) async fn disk_status_update_loop(self) {
-        loop {
-            compio::time::sleep(Duration::from_secs(10)).await;
             if !self.leader.get() {
                 continue;
             }
@@ -754,22 +750,18 @@ impl crate::AutumnManager {
             };
 
             for node in nodes.values() {
-                // F191: route DF over the dedicated control_pool against
-                // node.control_address (fall back to address for legacy
-                // nodes). Replaces the F121 "bound df at 5 s" comment
-                // with the actually-applied 5 s timeout via
-                // control_pool.call_timeout — the previous conn_pool.call
-                // had no timeout, so under heavy data-plane load
-                // (CONVERT_TO_EC, COPY_EXTENT, RECOVERY) on the same
-                // multiplexed RpcClient the next DF could stall long
-                // enough to surface as ConnectionClosed and falsely
-                // mark the node offline.
+                // F191: prefer the control_address; fall back to data
+                // plane address for legacy / not-yet-re-registered nodes.
                 let raw_addr = if node.control_address.is_empty() {
                     &node.address
                 } else {
                     &node.control_address
                 };
                 let addr = Self::normalize_endpoint(raw_addr);
+                // F222: empty `tasks` → EN returns its full `recovery_done`
+                // (std::mem::take). We apply ALL of it below, so no
+                // completion is ever discarded (the merge's whole point).
+                // F191 P0: bound DF at 5 s via control_pool.call_timeout.
                 let payload = rkyv_encode(&ExtDfReq {
                     tasks: Vec::new(),
                     disk_ids: Vec::new(),
@@ -781,39 +773,30 @@ impl crate::AutumnManager {
                 {
                     Ok(v) => v,
                     Err(_) => {
-                        // F121: see recovery_collect_loop comment.
+                        // F121: peer unreachable — mark its disks offline
+                        // so allocation/recovery skip it. ConnPool already
+                        // evicts the broken conn so the next poll reconnects.
+                        // F211-A: feed the auto-state tracker (Online →
+                        // Suspected after the soft timeout). NOT a recovery
+                        // trigger — that requires explicit fence (F211-E).
                         Self::mark_node_disks_offline(&self.store, node);
-                        // F211-A: feed the auto-state tracker so the
-                        // operator-facing health report sees this node
-                        // transition Online → Suspected after the soft
-                        // timeout. NOT a recovery trigger — that requires
-                        // explicit fence (F211-E).
                         self.node_states
                             .borrow_mut()
                             .on_heartbeat_fail(node.node_id);
                         continue;
                     }
                 };
-                if rkyv_decode::<ExtDfResp>(&resp).is_err() {
-                    continue;
-                }
-                // F121: a successful df proves the node is reachable, so
-                // promote each of its `MgrNodeInfo.disks` back to
-                // `online=true`. The per-disk-id status carried in the
-                // response keys on the *extent-node's* local disk_id
-                // (e.g. `--disk-id 4`), which is unrelated to the
-                // manager's allocated disk_id (e.g. 8). Treating the
-                // call result as the liveness signal sidesteps that
-                // mismatch entirely; recovery-side per-disk failure is
-                // still surfaced via `mark_disk_offline_for_extent` on
-                // the extent-node and propagated through dedicated
-                // recovery RPCs.
+                let df: ExtDfResp = match rkyv_decode(&resp) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                // F121: a successful df proves the node reachable — promote
+                // on the call-level signal, not per-payload disk_id (the
+                // wire status keys on the extent-node's local disk_id,
+                // unrelated to the manager's allocated disk_id).
                 Self::mark_node_disks_online(&self.store, node);
-                // F192: drop any pending push-based failure reports for
-                // this node — the call-level liveness signal proves the
-                // node is reachable, so a residual stale burst of
-                // reports must not re-flip the node offline on the next
-                // tick's quorum check.
+                // F192: drop stale push-based failure reports so a residual
+                // burst can't re-flip the node offline on the next tick.
                 self.recent_failure_reports
                     .borrow_mut()
                     .remove(&node.node_id);
@@ -821,9 +804,15 @@ impl crate::AutumnManager {
                 self.node_states
                     .borrow_mut()
                     .on_heartbeat_ok(node.node_id);
+                // F222: apply EVERY completed recovery task — the step the
+                // old disk_status_update_loop omitted (it discarded them).
+                for done in df.done_tasks {
+                    let _ = self.apply_recovery_done(done).await;
+                }
             }
         }
     }
+
 
     /// F121 helper: flip `online=false` for every disk owned by `node`
     /// when its `df` RPC fails. In-memory only — the manager reseeds

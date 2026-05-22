@@ -122,6 +122,32 @@ impl RecoveryRateLimiter {
         }
     }
 
+    /// F224: clear the in-flight counters (global / per-source /
+    /// per-target) WITHOUT touching backoff state. The dispatch loop
+    /// calls this then reseeds from the inflight ledger each tick, so
+    /// the counters always reflect actually-in-flight recoveries —
+    /// `recovery-stats` reports real numbers and the per-candidate
+    /// `try_acquire` gate enforces the caps. Pre-F224 `try_acquire`
+    /// was never called in production, so `global` was stuck at 0 and
+    /// the caps were unenforced (a big fence could still flood
+    /// recoveries — the exact thing this limiter was added to prevent).
+    pub fn reset_counts(&mut self) {
+        self.global_inflight = 0;
+        self.per_source.clear();
+        self.per_target.clear();
+    }
+
+    /// F224: unconditionally count one in-flight recovery. Used only to
+    /// reseed from the F207 ledger (the ledger is truth and may exceed
+    /// the caps after a leader failover — reseeding must reflect
+    /// reality, not clamp it; clamping is the job of `try_acquire` on
+    /// NEW dispatches).
+    pub fn seed_inflight(&mut self, source_node: u64, target_node: u64) {
+        self.global_inflight += 1;
+        *self.per_source.entry(source_node).or_insert(0) += 1;
+        *self.per_target.entry(target_node).or_insert(0) += 1;
+    }
+
     /// Record a failure for backoff. Returns the new
     /// `consecutive_failures` count.
     pub fn record_failure(&mut self, extent_id: u64, slot: u32, now_s: i64) -> u32 {

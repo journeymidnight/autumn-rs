@@ -3433,3 +3433,97 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   PS_PARTS_HINT=16 → cpuset=16-47 (max_parts=16), 16/16 partition listeners
   bound, 0 `core budget exhausted`, UCX put/get round-trips; override-wins is
   by the `-z` guard, presplit≤8 keeps default 8.)
+
+## P12 — recovery completion / liveness loop unification (F222+)
+
+### F222 · Merge recovery_collect_loop + disk_status_update_loop into one df caller
+- **Trigger / 动机:** Manager had TWO loops calling `EXT_MSG_DF` on extent nodes:
+  `recovery_collect_loop` (2 s, recovery-target nodes, non-empty `tasks`, applies
+  `done_tasks`) and `disk_status_update_loop` (10 s, all nodes, empty `tasks`,
+  updates disk/node liveness, DISCARDS `done_tasks`). The EN's `handle_df`
+  (`extent_node.rs:3712`) does `std::mem::take(recovery_done)` whenever
+  `req.tasks.is_empty()` — exactly what `disk_status_update_loop` sent. So when the
+  10 s sweep won the race vs the 2 s collect loop, the recovery completion was
+  drained and thrown away: `apply_recovery_done` never ran, the extent's slot was
+  never repaired in manager metadata, the recovered copy became an orphan, and the
+  inflight marker sat until the F208 stale-sweep released it ~10 min later.
+  Observed live (2026-05-22): fence node 7 → EN copied extent-33 to the target
+  disk, but manager never adopted it; F208 WARN-released markers 33/35/36/49 at
+  age ~620 s.
+- **Scope / boundary:** `crates/manager/src/recovery.rs` + `lib.rs` only. No wire,
+  etcd, or EN-side change. Delete both loops; add `node_health_loop` — single df
+  caller, 2 s cadence, iterate ALL nodes, send empty `tasks` (EN drains its full
+  `recovery_done`), and on every successful df: `mark_node_disks_online` +
+  `recent_failure_reports.remove` + `node_states.on_heartbeat_ok` + apply EVERY
+  `done_task`; on df failure: `mark_node_disks_offline` + `on_heartbeat_fail`.
+  One caller = the drain-and-discard race is structurally impossible. Out of scope:
+  the EN-side `handle_df` filter path (left intact, just unused by the manager now);
+  the F211-H limiter wiring (F224); large-extent recovery (F223).
+- **Acceptance:**
+  - `cargo build -p autumn-manager` clean; `cargo test -p autumn-manager --lib`
+    all green (apply_recovery_done / node-state tests unaffected).
+  - Live: fence a node holding a ≤2 GB sealed REPLICATED extent on a cluster with
+    a spare node → within a few s the extent's slot flips off the fenced node in
+    `extent-health`, the inflight marker disappears from etcd (NOT after the 10-min
+    F208 sweep), no orphan left on the target.
+- **passes:** true (2026-05-22 — `cargo test -p autumn-manager --lib` 108/0;
+  build clean. Live e2e on a fresh 5-node TCP cluster: fence node 7 (held sealed
+  3 GB extent 12 = [7,3,9]) → within ~10 s extent 12 flipped to [1,3,9],
+  eversion 2→3, the etcd inflight marker disappeared (NOT after the 10-min F208
+  sweep), no orphan stuck. Verified jointly with F223 (the 3 GB copy) + F224
+  (`recovery-stats` showed `global: 1/64` mid-copy).)
+
+### F223 · Chunk copy_bytes_from_source so >2 GB extent recovery works
+- **Trigger / 动机:** `fetch_full_extent_from_sources` →
+  `copy_bytes_from_source` (`crates/stream/src/extent_node.rs:2689`) reads the
+  source replica via a RAW `MSG_READ_BYTES` oneshot with `length: 0` (read-to-end)
+  and NO chunking. F105/F115 added 256 MiB chunking to `StreamClient` and the EN
+  local-file helpers precisely because a single >2 GB read trips the per-syscall
+  pread ceiling (macOS INT_MAX / Linux 0x7ffff000) and oversized rpc frames. This
+  raw recovery path bypasses all of it. Observed live (2026-05-22): recovering the
+  3 GB sealed extent 12 from two healthy replicas failed 10×/10 with "no source
+  replica available for copy"; source nodes logged nothing (fail at rpc framing
+  before the handler). Replicated-extent recovery of ANY >2 GB extent is broken.
+- **Scope / boundary:** `copy_bytes_from_source` (+ caller) only. Either route the
+  fetch through `StreamClient::read_bytes_from_extent` (already F105-chunked, EC-
+  aware) or replicate its chunk loop over `AUTUMN_STREAM_READ_CHUNK_BYTES`
+  (default 256 MiB) using repeated `MSG_READ_BYTES` with explicit offset/length.
+  Out of scope: the EC recovery path (`run_ec_recovery_payload`, already per-shard
+  bounded); the F222 loop merge.
+- **Acceptance:**
+  - Recover a >2 GB sealed replicated extent: target writes the full
+    `sealed_length` bytes, `apply_recovery_done` lands, slot repaired.
+  - Integration test sets `AUTUMN_STREAM_READ_CHUNK_BYTES` small to exercise the
+    multi-chunk loop without writing GBs.
+- **Implementation:** `copy_bytes_from_source` (`crates/stream/src/extent_node.rs`)
+  now takes `total_len` and loops 256 MiB (`FILE_IO_CHUNK_BYTES`) reads via the new
+  `read_bytes_chunk` helper; `fetch_full_extent_from_sources` passes
+  `extent.sealed_length`. EC shard-recovery caller keeps `total_len=0` (legacy
+  to-end single read — shards are ~sealed/K, under the threshold). `ReadBytesReq.offset`
+  is u32, so this covers extents up to 4 GiB (guarded with an explicit error);
+  a wider wire offset is a separate future change if `max_extent_size` ever exceeds it.
+- **passes:** true (2026-05-22 — live e2e: 3 GB sealed extent 12 recovered from
+  its peers and applied (was failing 10×/10 with "no source replica available for
+  copy" pre-fix). `cargo build --workspace` clean.)
+
+### F224 (candidate) · Wire the F211-H recovery rate limiter into dispatch
+- **Trigger / 动机:** `RecoveryRateLimiter::try_acquire/release` are never called
+  outside unit tests — `recovery_dispatch_loop` calls `dispatch_recovery_task`
+  directly with no slot acquire. Result: the concurrency caps (`max_global=64`,
+  `per_source=4`, `per_target=2`) are NOT enforced (a big fence can still flood
+  recoveries — the exact thing F211-H was meant to prevent), and `recovery-stats`
+  `global`/`per_source`/`per_target` are permanently `0`/empty (only
+  `backoff_entries` is live), which is confusing/misleading.
+- **Scope / boundary:** `crates/manager/src/recovery.rs` dispatch path. Acquire a
+  slot before the EN RPC; release on apply/drain. Keep the backoff path as-is.
+- **Implementation (reseed-from-ledger, per the module doc's stated design):**
+  added `reset_counts()` + `seed_inflight()` to `RecoveryRateLimiter`. The dispatch
+  loop reseeds the limiter from the F207 inflight ledger every tick (counts reflect
+  actually-in-flight recoveries; no manual release bookkeeping — a completed recovery
+  drops out of the ledger → out of the count next tick). `dispatch_recovery_task`
+  calls `try_acquire(replace_id, candidate)` per candidate: cap-hit → try next
+  candidate; all candidates capped → return Ok (deferred, NO backoff, retried next
+  tick); RPC-failure paths `release` the slot they took. Backoff state untouched.
+- **passes:** true (2026-05-22 — live e2e: during the 3 GB recovery copy
+  `recovery-stats` showed `global: 1/64` then back to `0/64` on completion — was
+  permanently `0/64` pre-fix. `cargo test -p autumn-manager --lib` 108/0.)

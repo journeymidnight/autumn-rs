@@ -794,7 +794,8 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
         // the node so the next alloc skips it.
         // F192: same failure pushes a manager-side report so the
         // global view catches up to the per-stream truth without
-        // waiting for the next 10 s `disk_status_update_loop` tick.
+        // waiting for the next `node_health_loop` df tick (F222: 2 s;
+        // was the 10 s `disk_status_update_loop`).
         if let Some(idx) = bad_replica_idx {
             if let Some(&nid) = replica_node_ids.get(idx) {
                 state.mark_bad_node(nid);
