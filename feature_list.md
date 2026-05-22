@@ -3560,3 +3560,202 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   **0.005 s** with `precondition failed: cannot split: partition has overlapping
   keys`; was ~9 s + the noisy `after 10 refreshes` wrapper. `cargo build
   --workspace` clean.)
+
+### F226 · `recovery-stats` surfaces backoff detail + reason (not just a count)
+- **Trigger / 动机:** After fencing a node, `autumn-op recovery-stats` shows
+  `backoff_entries=N` with **no explanation of why** those (extent, slot) pairs
+  are backing off. The reason is lost at two layers, and is also unrecoverable
+  from manager logs:
+  1. The limiter only stores `consecutive_failures` + `last_attempt_at` per
+     `(extent_id, slot)` (`recovery_rate_limiter.rs:153-158`); the actual
+     `AppError` from `dispatch_recovery_task` is discarded at the call site —
+     `record_dispatch_outcome` takes `ok: bool`, not the `Result`
+     (`recovery.rs:535-540 / 601-606 / 658-671`).
+  2. `RecoveryStatsResp.backoff_entries: u32` is just `l.backoff.len()`
+     (`rpc_handlers.rs:4111`); the per-entry detail the manager already holds
+     in memory (`extent_id / slot / consecutive_failures / last_attempt_at`)
+     is never serialized into the response.
+  3. The two `dispatch_recovery_task` `Err` exits are silent (no `warn!`), so
+     the reason isn't in the manager log either.
+  Net effect: an operator watching recovery after a fence cannot tell whether
+  a backoff is "no candidate node for recovery" (cluster too small / occupied
+  set covers all nodes — note `occupied` still includes the fenced node until
+  `apply_recovery_done` swaps it out) vs "all recovery candidates rejected"
+  (target EN already holds the extent / F139 `recovery_inflight` conflict) vs
+  a NotLeader/etcd blip from `acquire_extent_inflight`. (Rate-limited is NOT
+  backoff — it returns Ok/deferred, `recovery.rs:172-179`.)
+- **Scope / boundary:** `crates/rpc/src/manager_rpc.rs` (response struct),
+  `crates/manager/src/recovery.rs` (capture the last error string),
+  `crates/manager/src/recovery_rate_limiter.rs` (store the reason on
+  `BackoffState`), `crates/manager/src/rpc_handlers.rs` (`handle_recovery_stats`
+  fill), `crates/server/src/bin/autumn_op.rs` (print + `--json`). No new RPC;
+  extend the existing `MSG_RECOVERY_STATS` response.
+- **Proposed implementation:**
+  1. Add `last_reason: String` to `BackoffState`; change
+     `record_dispatch_outcome` to accept `res: &Result<(), AppError>` and pass
+     the `Err` string into `record_failure(extent_id, slot, now_s, reason)`.
+  2. Add `backoff: Vec<(u64 /*extent_id*/, u32 /*slot*/, u32 /*consecutive_failures*/,
+     i64 /*last_attempt_at*/, String /*reason*/)>` to `RecoveryStatsResp`
+     (rkyv append-only field → backward-compatible wire change; verify against
+     [[feedback_warn_on_backward_incompat]] — appending to the end of an rkyv
+     struct is the supported same-commit-deploy pattern, but call it out).
+  3. `handle_recovery_stats` fills it from `l.backoff`.
+  4. `autumn-op recovery-stats` prints a `backoff:` section
+     (`extent <id> slot <s>  fails=N  age=Ts  reason="..."`); `--json` carries
+     the array.
+- **Acceptance:**
+  - `cargo build --workspace` clean; `cargo test -p autumn-manager --lib` green.
+  - After a fence on a small cluster, `recovery-stats` shows each backoff
+    entry's extent/slot/consecutive_failures/age and the reason string
+    (e.g. `no candidate node for recovery`).
+- **passes:** false (proposed 2026-05-22 — observability gap found while
+  explaining `backoff_entries=3` after an operator fence; not yet implemented.)
+
+### F227 · WAS-faithful commit/seal length — remove quorum, exclude catching-up members
+- **Trigger / 动机:** Live-cluster forensics (operator fenced node 1 mid-write)
+  surfaced a key whose `get` failed with
+  `stale_vp_offset_past_sealed_length: extent=38 offset=20401974 length=147461
+  sealed_length=14305` while `head` returned the full length. extent 38 is a
+  **replicated (non-EC)** log_stream extent; the value's VP pointed 20.4 MB into
+  an extent the manager had sealed at only 14305 bytes. The 31 MB full copy was
+  intact on the fenced node's disk — so this was NOT the F204 EC-residue case
+  (data not lost), but a **durability-invariant violation**: acked data (the
+  append path is all-replica-ACK via `apply_completion`) had been rolled back on
+  the surviving replicas, then the extent was sealed at the rolled-back length.
+  Root cause = this is a WAS stream layer (all-replica-ACK, **no quorum on the
+  data path**), but F156/F210-B2 introduced **majority quorum + min-over-responders**
+  into the commit-length/seal path, and F178's flush barrier used a **fsync
+  quorum**. A subset `min` can (a) sit BELOW the acked length when it includes a
+  short/catching-up replica (→ next append's `header.commit` truncates acked data
+  → silent loss), or (b) sit ABOVE it when it excludes a member (→ keeps un-acked
+  data). Under all-replica-ACK every committed member holds ≥ the acked length, so
+  `min` over the committed members is always safe — the quorum was the bug.
+- **Scope / boundary:**
+  - `crates/manager/src/rpc_handlers.rs`: `handle_stream_alloc_extent` failover
+    seal (`req.end == 0` branch) + `handle_check_commit_length`. New helpers
+    `recovering_nodes_for_extent` (F207-ledger-driven catching-up set) and
+    `seal_durability_floor`.
+  - `crates/stream/src/client.rs`: `current_commit` (tail-init seed source) +
+    `await_extent_synced_to` (flush barrier) + `ensure_tail_initialised`
+    (`unwrap_or(0)` → `?`).
+  - `req.end > 0` seal path (writer supplies its own all-acked commit) is left
+    unchanged — it is already all-ACK-faithful.
+- **Implementation:**
+  1. **Exclude catching-up members** (nodes with an in-flight Recovery for the
+     extent, from the F207 ledger) from every commit-length `min`. A re-replication
+     target holds a partial replica; its short length must never lower the seal.
+  2. **No quorum.** `min` is taken over the committed (non-catching-up) members;
+     **require all committed members to respond** (else `Precondition` → caller
+     retries). A permanently-dead committed member is reconfigured out of the set
+     by the existing operator fence → recovery lifecycle (its slot then becomes
+     catching-up and is excluded). `AUTUMN_MGR_SEAL_DURABILITY_FLOOR` (default 1)
+     is a durability gate, not a quorum vote on the position.
+  3. **Flush barrier** `await_extent_synced_to`: require ALL replicas synced past
+     `vp_offset` (was `⌊N/2⌋+1`). On a healthy cluster this is already satisfied
+     because the append acked all-replicas.
+  4. **`ensure_tail_initialised`**: a `current_commit` failure now propagates
+     (`?`) instead of seeding cursor 0 — the pre-fix `unwrap_or(0)` turned a
+     transient probe failure into a `header.commit=0` that truncated EVERY replica
+     to 0 (catastrophic). `Ok(0)` (genuinely empty extent) still seeds nothing.
+- **Backward-incompat:** behavioral — seals/commits now block (retry) when a
+  committed replica is unreachable instead of proceeding on a majority. This is
+  the intended WAS consistency-over-availability tradeoff; liveness for a dead
+  node is via fence → recovery. No wire/format change.
+- **Acceptance:**
+  - `cargo build --workspace` clean; `cargo test -p autumn-manager --lib` +
+    `-p autumn-stream --lib` green.
+  - Unit test (pure decision fn): 3 replicas all-ack at 20 MB, 1 slot
+    catching-up → seal = 20 MB (excludes the catching-up short replica), NOT the
+    cratered value. Not-all-committed-respond → refuse.
+  - Live re-test: fence a node mid-write, seal → `sealed_length` ≥ the acked
+    high-water (was: cratered to a subset min).
+- **passes:** true (2026-05-22 — unit + live e2e verified. 4 sites refactored
+  through one pure `compute_commit_seal`; `cargo build --workspace` clean;
+  `cargo test --lib` manager 113 (108 + 5 F227 pure-fn tests incl.
+  `excludes_catching_up_member_does_not_crater_min`) / stream 56 / etcd 3.
+  **Live e2e** (`cluster.sh reset 5`, RF=3 replicated log tail): wrote 8 KiB
+  values (VP path), fenced node 7, kept writing at full throughput (11k ops/s,
+  874 MB) while it was fenced+down → seals excluded the catching-up member and
+  rolled to healthy nodes; all 8 sampled keys written during the fence
+  `get` back **exactly 8192 bytes with NO `stale_vp_offset_past_sealed_length`**
+  (the incident symptom). Note: this is a functional smoke test — it confirms no
+  acked-data loss / no cratered seal on fence, not a deterministic reproduction
+  of the exact byte-level cratering (hard to force). Deferred: etcd-gated
+  integration tests (`system_extent_failover.rs`, `f211_*`) in a clean env may
+  assert old majority-quorum seal-with-node-down and need updating to the
+  all-replica + fence/recovery model.)
+
+### F228 · Manager background-loop resilience — bound every await (1A) + supervise every loop (1C)
+- **Trigger / 动機:** Root cause 1 of the live incident: `node_health_loop`
+  (the sole `df` caller AND sole `apply_recovery_done` caller after F222) wedged
+  ~11 min on an unbounded etcd await while every OTHER detached loop kept
+  running — node 1 stuck `Suspected`, recoveries orphaned (F208 had to release
+  them), all silently. Two structural defects, both spanning ALL 9 manager
+  background loops (audited, not just node_health):
+  1. **Unbounded awaits (1A).** `autumn-etcd`'s `unary_call` (every KV/txn op)
+     had NO request timeout — etcd over h2c has no built-in deadline, so a
+     half-open TCP / stuck server hangs forever. Also `manager::ConnPool::
+     get_or_connect`'s `RpcConn::connect` was OUTSIDE `call_timeout`'s wrapper,
+     so a hung TCP connect wedged a loop despite call_timeout. (EN/PS *request*
+     RPCs in loops already used `call_timeout` — audit confirmed no bare
+     `pool.call(`.)
+  2. **No supervision (1C).** Every loop was `compio::runtime::spawn(...).detach()`
+     with no panic isolation, no restart, no log — a panic (RefCell double-borrow,
+     index OOB) silently kills one task while the manager looks alive.
+- **Scope / boundary:** `crates/etcd/src/lib.rs` (unary_call + reconnect),
+  `crates/manager/src/lib.rs` (ConnPool::get_or_connect, spawn_supervised,
+  start_runtime_tasks, ps_liveness_check_loop receiver), `crates/manager/Cargo.toml`
+  (+`futures`). No wire/format change.
+- **Implementation:**
+  - **1A-a** `unary_call` wraps both `call_with_sender` awaits + `reconnect` in
+    `compio::time::timeout` (`AUTUMN_ETCD_REQUEST_TIMEOUT_MS`, default 10 s);
+    a timeout falls through to reconnect+retry, same as a connection error. One
+    chokepoint covers get/range/put/delete/txn/lease_grant for every loop.
+  - **1A-b** `ConnPool::get_or_connect` bounds `RpcConn::connect`
+    (`AUTUMN_MGR_CONNECT_TIMEOUT_MS`, default 5 s).
+  - **1C** new `AutumnManager::spawn_supervised(name, make)` runs the loop under
+    `AssertUnwindSafe(make()).catch_unwind()`; on panic OR unexpected return it
+    logs `ERROR bg_loop=<name>` and restarts after 1 s, cloning a fresh manager
+    handle each time. All 9 loops routed through it. `ps_liveness_check_loop`
+    changed `&self` → `self` for uniformity (loop must own its handle per restart).
+  - **Why both:** `catch_unwind` cannot rescue a *hung* await (a stuck future
+    never returns); 1A's bounded awaits prevent the hang, 1C catches panics.
+    Together they close both failure modes.
+- **Acceptance:** `cargo build --workspace` clean; `cargo test` lib green for
+  etcd (3) / manager (113) / stream (56).
+- **passes:** true (2026-05-22 — implemented + builds + lib tests green. Audit:
+  the only unbounded awaits reachable from loops were etcd + ConnPool connect,
+  both now bounded; all 9 loops supervised. **Optional follow-up (not done):** a
+  per-loop heartbeat watchdog for stall *observability* — structurally redundant
+  now that 1A bounds awaits and 1C catches panics, but would surface a future
+  unknown-cause stall faster.)
+
+### F229 · PS / extent-node background-loop resilience (extend F228 1A/1C off the manager)
+- **Trigger / 動機:** F228 audit + fix covered the MANAGER's 9 background loops
+  (the control-plane SPOF where the live incident happened). A parallel audit
+  found the SAME `spawn(...).detach()` no-supervision pattern (1C) on the other
+  two roles, so a panic there silently kills a per-role loop:
+  - **PS** (`crates/partition-server/src/lib.rs`): `heartbeat_loop`,
+    `report_load_loop`, `region_sync_loop`, the per-partition `flush` /
+    `compact` / `gc` loops, `maintenance_scheduler_loop`, and the per-conn
+    handler/loop spawns — all `.detach()`.
+  - **EN** (`crates/stream/src/extent_node.rs`): `coalescer_loop` (per extent),
+    `spawn_reconcile_orphans_loop` — `.detach()`.
+- **Why deferred (not folded into F228):** PS loops run on per-partition
+  `!Send Rc<RefCell<PartitionData>>` compio runtimes; "restart on panic" is NOT
+  the mechanical clone-and-rerun the manager allows (its loops re-derive from the
+  shared store each tick). A PS loop panicking mid-flush/compact can leave
+  partition state mid-mutation, so a naive catch_unwind+restart could resurrect
+  inconsistent in-memory state or double-run a flush. This needs per-loop restart
+  semantics (which state is safe to re-enter, what to reset) + its own tests —
+  materially larger and riskier than F228. Blast radius is also smaller/partly
+  self-correcting (one PS; `heartbeat_loop` death → manager evicts via F069/F111).
+- **Scope (when done):**
+  - 1A: audit PS→manager / PS→EN / EN-internal awaits for missing timeouts
+    (StreamClient append already has F121 fanout timeout; verify read /
+    manager-RPC / connect paths).
+  - 1C: a PS/EN-appropriate supervisor with per-loop-defined restart safety
+    (NOT a blind clone-restart), or at minimum catch_unwind+ERROR-log+process-
+    level health surfacing so a dead loop is never silent.
+- **passes:** false (deferred 2026-05-22 — audit done, fix not started; logged so
+  the PS/EN surface isn't forgotten now that the manager side is closed by F228.)

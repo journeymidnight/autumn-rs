@@ -1,78 +1,56 @@
 Date: 2026-05-22
 TaskStatus: completed
-Task scope: F222 + F223 + F224 — operator-driven recovery actually works end to end.
-  F222: merge manager's two df-calling loops (recovery_collect_loop +
-        disk_status_update_loop) into one node_health_loop (close the
-        recovery-completion-discard race). User: "都是调用df,应当写成一个loop".
-  F223: chunk copy_bytes_from_source so >2 GB extent recovery works.
-  F224: reseed the F211-H rate limiter from the ledger each tick so caps are
-        enforced + recovery-stats reports real numbers.
-  F225 (later, same session): admin ops (split/compact/gc/flush) surface terminal
-        preconditions immediately instead of 10× region-refresh (~9s). ps_call
-        returns typed AutumnError (rpc_status_to_error, preserved in anyhow);
-        call_ps_for_part short-circuits PreconditionFailed/InvalidArgument/
-        ValueTooLarge. call_ps_for_key UNCHANGED (its FailedPrecondition = stale
-        epoch, must retry). User: "干净版 fix".
-        Verified: `split 17` (has_overlap) now fails in 0.005s with "precondition
-        failed: cannot split: partition has overlapping keys" (was ~9s). Build clean.
-        NOT yet committed (F222-F224 are on branch f222-f224-recovery-completion-fixes;
-        F225 is uncommitted in the working tree).
+Task scope: F227 (WAS-faithful commit/seal — remove quorum) + F228 (manager
+  background-loop resilience). Both root causes of the live incident (operator
+  fenced node 1 mid-write -> stale_vp + 11-min silent node_health_loop freeze).
+  F229 (PS/EN loop resilience) audited + logged as deferred.
 
-Current summary:
-  ALL THREE DONE + unit-tested + e2e-verified on a live 5-node TCP cluster.
+== F227 — root cause 2 (durability invariant), passes: TRUE ==
+Invariant (WAS/Azure): all-replica-ACK; NO quorum on the commit path.
+  commit/seal length = min over COMMITTED members (safe >= acked BECAUSE of
+  all-ack). Bug was F156/F210-B2 majority-quorum + min-over-responders + F178
+  flush fsync-quorum. Truncation of beyond-commit (un-acked) bytes stays correct
+  — no floor (user-corrected an earlier wrong proposal).
+Code:
+  - manager/rpc_handlers.rs: pure compute_commit_seal + recovering_nodes_for_extent
+    (F207 ledger) + seal_durability_floor (AUTUMN_MGR_SEAL_DURABILITY_FLOOR=1).
+    handle_stream_alloc_extent failover seal (req.end==0) + handle_check_commit_length
+    call it. req.end>0 path unchanged. commit_length_for_extent (READ path) left
+    quorum-min on purpose.
+  - stream/client.rs: current_commit + await_extent_synced_to -> all-replica;
+    ensure_tail_initialised current_commit failure propagates (?) not unwrap_or(0).
+Verified: 5 pure-fn unit tests; manager 113 / stream 56 / etcd 3 lib green;
+  LIVE e2e (cluster.sh reset 5): fence node 7 mid-write, kept writing full speed,
+  8 keys written-during-fence get back exactly 8192 bytes, NO stale_vp.
 
-  E2E (2026-05-22, fresh `cluster.sh reset 5`, 4 GB wbench): fence node 7 (held
-  sealed 3 GB extent 12 = [7,3,9]) →
-    t+5s : recovery-stats `global: 1/64` (F224 — was always 0), inflight marker=1
-    t+10s: extent 12 = [1,3,9] eversion 2→3 (F222 apply ran), marker released
-           (NOT via the 10-min F208 sweep); the 3 GB copy succeeded (F223 — pre-fix
-           it failed 10x/10 "no source replica available for copy").
-  cargo build --workspace clean; cargo test -p autumn-manager --lib 108/0.
+== F228 — root cause 1 (loop resilience), passes: TRUE ==
+Audited all 9 manager loops; only unbounded awaits were etcd unary_call +
+  ConnPool::get_or_connect connect (EN/PS request RPCs already call_timeout).
+Code:
+  - etcd/lib.rs unary_call: timeout both call_with_sender + reconnect
+    (AUTUMN_ETCD_REQUEST_TIMEOUT_MS=10s) -> reconnect+retry on timeout.
+  - manager/lib.rs ConnPool::get_or_connect: bound RpcConn::connect
+    (AUTUMN_MGR_CONNECT_TIMEOUT_MS=5s).
+  - manager/lib.rs spawn_supervised (AssertUnwindSafe+catch_unwind+ERROR+1s
+    restart) wraps all 9 loops; +futures dep; ps_liveness_check_loop &self->self.
+  - 1A prevents hangs (catch_unwind can't rescue a stuck await); 1C catches panics.
+Verified: LIVE e2e same run — before+after fence all heartbeats 0s
+  (node_health_loop alive, vs incident's frozen); manager.log 0 panic / 0 ERROR /
+  0 bg_loop restart; recovery dispatched+completed for node 7. Incident does not
+  recur.
 
-  Root-cause chain that started this (forensics on a live 4->5 node TCP cluster):
-    - User fenced node 7; recovery "didn't seem to happen".
-    - Found: recovery DID reach the EN and copied data (extent-33.dat written to
-      the target node's disk after boot), but manager-side apply_recovery_done
-      NEVER ran -> metadata not updated, recovered copy became an orphan, inflight
-      marker stuck until F208 stale-sweep released it ~10 min later.
-    - Bug 1 (df-drain race): EN handle_df does std::mem::take on recovery_done
-      when req.tasks.is_empty(). disk_status_update_loop (10 s) sent empty tasks
-      and DISCARDED the returned done_tasks (only updated disk status). Whenever
-      its sweep won the race vs recovery_collect_loop (2 s), the completion was
-      lost forever. crates/stream/src/extent_node.rs:3712-3739 (EN drain);
-      crates/manager/src/recovery.rs (the two loops).
+== F229 — PS/EN loop resilience, passes: FALSE (deferred, logged) ==
+Same detached-spawn pattern on PS (heartbeat/report_load/region_sync/per-partition
+  flush·compact·gc/conn) + EN (coalescer/reconcile). NOT fixed: PS loops on
+  per-partition !Send Rc<RefCell> runtimes need per-loop restart safety (panic
+  mid-flush leaves partition state mid-mutation) — bigger + riskier than the
+  manager's clone-restart. See feature_list F229.
 
-  F222 fix (this change):
-    - crates/manager/src/recovery.rs: deleted recovery_collect_loop +
-      disk_status_update_loop; added node_health_loop -- ONE df caller, 2 s, all
-      nodes, empty tasks (EN drains full recovery_done), and ALWAYS applies every
-      done_task AND updates disk status + node_states (Suspected/Online) +
-      recent_failure_reports. One caller = no race.
-    - crates/manager/src/lib.rs start_runtime_tasks: two spawns -> one.
-    - crates/manager/src/rpc_handlers.rs: 2 stale message/comment refs updated.
-    - Build OK. `cargo test -p autumn-manager --lib` = 108 passed / 0 failed.
+Build/test: cargo build --workspace clean; lib tests green (manager 113 / stream
+  56 / etcd 3).
 
-Files changed:
-  - crates/manager/src/recovery.rs: F222 node_health_loop (replaces the two
-    loops); F224 limiter reseed at tick top + try_acquire gate in
-    dispatch_recovery_task (release on RPC-fail, Ok-on-rate-limited).
-  - crates/manager/src/lib.rs: F222 single spawn.
-  - crates/manager/src/recovery_rate_limiter.rs: F224 reset_counts + seed_inflight.
-  - crates/stream/src/extent_node.rs: F223 chunked copy_bytes_from_source +
-    read_bytes_chunk helper; fetch_full_extent_from_sources passes sealed_length.
-  - rpc_handlers.rs + 5 CLAUDE.md / source comments: doc sync (loop rename,
-    cadence 10s->2s, F222 Programming Note 25).
+Commit: F227 + F228 committed this session (source + docs + ledgers). Did NOT
+  commit write_result.json (bench artifact), .venv/, python/d.py, python/del_prefix.py
+  (pre-existing untracked, unrelated). Branch f222-f224-recovery-completion-fixes.
 
-Remaining / follow-ups (non-blocking, NOT started):
-  - >4 GiB extent recovery: ReadBytesReq.offset is u32, so F223 covers up to
-    4 GiB (guarded with an explicit error). Wider wire offset = separate change
-    if max_extent_size ever exceeds 4 GiB.
-  - Orphan reconcile: Bug-1-era orphans (recovered copies the manager never
-    adopted) get LOADED on EN restart and make handle_require_recovery return
-    PRECONDITION "extent already exists" (extent_node.rs:3776). F222 stops NEW
-    orphans; existing ones are reaped by the F109/F113 reconcile sweep.
-
-Next steps:
-  1. Commit F222+F223+F224 (on a branch — currently on main).
-  2. Optional: integration test for F223 chunking (small
-     AUTUMN_STREAM_READ_CHUNK_BYTES) + F224 limiter reseed.
+Next (optional): F229 implementation; clean-env etcd integration tests.

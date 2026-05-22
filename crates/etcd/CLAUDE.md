@@ -66,6 +66,8 @@ Single-threaded compio (`Rc<RefCell<GrpcChannel>>`). Not Send/Sync — matches t
 
 When adding a new RPC method here, **never** write `self.channel.borrow_mut().<anything>().await`. Use `let mut sender = self.channel.borrow().sender();` (drop the borrow at the semicolon) and then `call_with_sender(&mut sender, path, body).await`.
 
+**F228 (1A): every unary RPC is timeout-bounded.** `unary_call` wraps both `call_with_sender` awaits AND `reconnect` in `compio::time::timeout` (`request_timeout()`, env `AUTUMN_ETCD_REQUEST_TIMEOUT_MS`, default 10 s). etcd-over-h2c has no built-in per-request deadline, so without this a half-open TCP / stuck server hangs the caller **forever** — and every autumn-manager background loop ultimately awaits an etcd call, so one such hang silently froze `node_health_loop` for ~11 min in production (no `df`, no recovery apply, while other loops kept running). A timeout falls through to the reconnect + retry path, identical to a connection error; the retry is also bounded, and a second timeout returns `Err` (caller retries / surfaces NotLeader). Any new path here MUST go through `unary_call` (or replicate its timeout) — never add a bare unbounded `call_with_sender`.
+
 ## Dependencies
 
 - `compio` (net, time, io-compat) — async runtime + TCP

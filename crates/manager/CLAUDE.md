@@ -1300,3 +1300,94 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     `RecoveryRateLimiter` is a concurrency + per-(extent,slot) backoff
     limiter (no byte-rate dimension) — closest in spirit to the
     `ConcurrencyController`s, not to `RateController`.
+
+28. **F227 commit/seal length is all-replica, NOT quorum (supersedes the
+    F156 / F210-B2 majority-quorum on the manager seal path).** This is a
+    WAS stream layer: the append path is all-replica-ACK
+    (`client.rs::apply_completion` acks only when every replica wrote), so
+    the committed length = `min` over the COMMITTED members is always
+    ≥ the acked length and never drops acked data. The pre-F227
+    majority-quorum + min-over-responders was the bug: a subset `min` can
+    sit BELOW the acked length (include a short / catching-up replica →
+    the next append's `header.commit` truncates acked data on the
+    up-to-date replicas → silent loss) or ABOVE it (exclude a member →
+    keep un-acked data). Surfaced in production as
+    `stale_vp_offset_past_sealed_length` on a **non-EC** extent (data not
+    lost — intact on the fenced node — distinct from the F204 EC-residue
+    case where it is).
+
+    The two seal/commit sites — `handle_stream_alloc_extent` failover seal
+    (`req.end == 0` branch only; `req.end > 0` trusts the writer's own
+    all-acked commit and is unchanged) and `handle_check_commit_length` —
+    now both:
+    - **exclude catching-up members** via `recovering_nodes_for_extent`
+      (nodes with an in-flight Recovery in the F207 ledger; a
+      re-replication target holds a partial replica and must never lower
+      the `min`),
+    - probe only committed members and feed the results to the shared pure
+      `compute_commit_seal(members, recovering, responses, floor)`,
+    - **require ALL committed members to respond** (no quorum vote). A
+      dead committed member is reconfigured out of the set by the operator
+      fence → recovery lifecycle (its slot then becomes catching-up and is
+      excluded next attempt); until then the seal/commit refuses
+      (`Precondition`) and the caller retries.
+    - `AUTUMN_MGR_SEAL_DURABILITY_FLOOR` (default 1) is a **durability
+      gate** (min committed members that must exist + respond), NOT a
+      quorum vote on the commit *position* — the position is always `min`
+      over the responding committed members.
+
+    **Truncation is correct and must stay** — bytes beyond the committed
+    length are un-acked speculation and SHOULD be truncated; do NOT add a
+    floor that retains them (an earlier proposal of mine, retracted).
+
+    **Backward-incompat (behavioral, no wire change):** seals/commits now
+    block (retry) when a committed replica is unreachable instead of
+    proceeding on a majority — the intended WAS consistency-over-
+    availability tradeoff. Companion stream-side changes: `current_commit`
+    (all-replica), `await_extent_synced_to` flush barrier (all-replica),
+    and `ensure_tail_initialised` (`current_commit` failure now propagates
+    instead of seeding cursor 0 — the old `unwrap_or(0)` made the next
+    append's `header.commit=0` truncate every replica to 0). See
+    `crates/stream/CLAUDE.md`. Pure-fn tests:
+    `rpc_handlers::f227_commit_seal_tests`. Cross-ref: notes 21 (F207
+    ledger = the catching-up signal), 23/24 (F211/F214 fence → recovery
+    lifecycle that reconfigures dead members out).
+
+29. **F228 background-loop resilience — bound every await (1A) + supervise
+    every loop (1C).** The node_health_loop production freeze (note 25 / the
+    F227 incident) had two structural enablers that span ALL background
+    loops, not just node_health:
+    - **1A — no unbounded awaits.** A loop that hangs on an await never
+      returns and silently stops doing its job. Audited all 9 loops: the
+      only unbounded awaits reachable were (a) `autumn-etcd`'s `unary_call`
+      (etcd-over-h2c has no request deadline — see `crates/etcd/CLAUDE.md`)
+      and (b) `ConnPool::get_or_connect`'s `RpcConn::connect`, which sat
+      OUTSIDE `call_timeout`'s wrapper (a hung TCP connect wedged the loop
+      despite call_timeout). EN/PS *request* RPCs already used
+      `call_timeout` (`commit_length_on_node` / `probe_extent_on_node` 5 s,
+      `extent_delete` 10 s, `df` 5 s, `require_recovery` 5 s) — no bare
+      `pool.call(` exists. Fixes: etcd `unary_call` timeout
+      (`AUTUMN_ETCD_REQUEST_TIMEOUT_MS`, 10 s) + `get_or_connect` connect
+      timeout (`AUTUMN_MGR_CONNECT_TIMEOUT_MS`, 5 s).
+    - **1C — no unsupervised loops.** Pre-F228 every loop was
+      `compio::runtime::spawn(...).detach()` — a panic killed that one task
+      silently while the manager looked alive. `spawn_supervised(name,
+      make)` runs the loop under `AssertUnwindSafe(make()).catch_unwind()`;
+      on panic OR unexpected return it logs `ERROR bg_loop=<name>` and
+      restarts after 1 s with a fresh `mgr.clone()`. All 9 loops route
+      through it (`start_runtime_tasks`). `ps_liveness_check_loop` changed
+      `&self` → `self` so its future owns the per-restart handle (the other
+      8 were already `self`).
+
+    **Why both, not either:** `catch_unwind` cannot rescue a *hung* await (a
+    stuck future never returns, so the supervisor waits forever too) — 1A
+    prevents the hang. 1A cannot catch a *panic* — 1C does. **Invariant:
+    never add a bare `spawn(...).detach()` for a manager loop (use
+    `spawn_supervised`), and never add an unbounded await reachable from a
+    loop (etcd → `unary_call`; any new pool RPC → `call_timeout`; any new
+    connect → bound it).** Optional follow-up (not built): a per-loop
+    heartbeat watchdog for stall *observability* — structurally redundant
+    once 1A bounds awaits + 1C catches panics, but would surface a future
+    unknown-cause stall faster than the F208 10-min sweep did. Cross-ref:
+    note 25 (F222 — node_health_loop is the single df + apply caller, the
+    thing that froze).

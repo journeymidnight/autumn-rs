@@ -789,6 +789,84 @@ impl AutumnManager {
         }))
     }
 
+    /// F227: nodes with an in-flight Recovery targeting `extent_id`.
+    /// These are *catching-up* members — they hold only a partial replica
+    /// while their slot is being rebuilt — so they MUST be excluded from
+    /// any commit-length `min`. Including a catching-up replica's short
+    /// length would crater the seal below the all-replica-ACK'd commit
+    /// length and silently drop acked data. See the seal/commit sites for
+    /// the full rationale.
+    fn recovering_nodes_for_extent(&self, extent_id: u64) -> std::collections::HashSet<u64> {
+        let mut set = std::collections::HashSet::new();
+        for rec in self.inflight.borrow().values() {
+            if let Some((_, crate::extent_inflight::ExtentOpPayload::Recovery(t))) = rec.unpack() {
+                if t.extent_id == extent_id {
+                    set.insert(t.replace_id);
+                }
+            }
+        }
+        set
+    }
+
+    /// F227: minimum number of committed (non-catching-up) members that
+    /// must be reachable to seal / read a commit length. Default 1 — under
+    /// all-replica-ACK any single committed member holds the full acked
+    /// prefix, so 1 already prevents acked-data loss; raise for a stricter
+    /// durability posture. This is a durability gate, NOT a quorum vote on
+    /// the commit *position* (the position is always `min` over the
+    /// committed members that respond).
+    fn seal_durability_floor() -> usize {
+        std::env::var("AUTUMN_MGR_SEAL_DURABILITY_FLOOR")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// F227: pure WAS-faithful commit/seal-length decision (unit-tested,
+    /// shared by `handle_stream_alloc_extent` seal + `handle_check_commit_length`).
+    ///
+    /// `members` = (slot_idx, node_id) over `replicates ++ parity` in slot
+    /// order. `recovering` = catching-up node_ids (in-flight Recovery) to
+    /// EXCLUDE. `responses` = node_id → reported commit_length for committed
+    /// members that answered the probe.
+    ///
+    /// Returns `(commit_len, avali_bits)` where `commit_len` is the `min`
+    /// over the committed (non-catching-up) members — which under
+    /// all-replica-ACK is always ≥ the acked length, so it never drops acked
+    /// data. Returns `Err` when fewer than `floor` committed members exist OR
+    /// not every committed member responded: we refuse rather than seal at a
+    /// quorum subset min (which could sit below the acked length by including
+    /// a short replica, or above it by excluding a member).
+    pub(crate) fn compute_commit_seal(
+        members: &[(usize, u64)],
+        recovering: &std::collections::HashSet<u64>,
+        responses: &std::collections::HashMap<u64, u32>,
+        floor: usize,
+    ) -> std::result::Result<(u32, u32), String> {
+        let mut min_len: Option<u32> = None;
+        let mut avali: u32 = 0;
+        let mut committed = 0usize;
+        let mut reachable = 0usize;
+        for &(idx, node_id) in members {
+            if recovering.contains(&node_id) {
+                continue;
+            }
+            committed += 1;
+            if let Some(&v) = responses.get(&node_id) {
+                reachable += 1;
+                avali |= 1u32 << idx;
+                min_len = Some(min_len.map_or(v, |c| c.min(v)));
+            }
+        }
+        if committed < floor || reachable < committed {
+            return Err(format!(
+                "{reachable}/{committed} committed members reachable (need all; floor {floor})"
+            ));
+        }
+        Ok((min_len.unwrap_or(0), avali))
+    }
+
     pub(crate) async fn handle_check_commit_length(&self, payload: Bytes) -> HandlerResult {
         let req: CheckCommitLengthReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
@@ -854,62 +932,53 @@ impl AutumnManager {
             }));
         }
 
-        let all_nodes = ex
+        // F227: WAS-faithful commit-length read. The append path is
+        // all-replica-ACK (`apply_completion` requires every replica to
+        // ack), so every COMMITTED member holds >= the acked commit
+        // length. Therefore `min` over the committed members never drops
+        // acked data — PROVIDED we (a) exclude catching-up members
+        // (in-flight Recovery, partial replica) from the min, and
+        // (b) require all committed members to agree (no majority quorum
+        // subset, which could seal below the acked length by including a
+        // short catching-up replica, or above it by excluding a member).
+        // F227: probe committed members, then decide via the shared pure
+        // `compute_commit_seal` (no quorum; excludes catching-up members;
+        // requires all committed members to respond).
+        let recovering = self.recovering_nodes_for_extent(ex.extent_id);
+        let members: Vec<(usize, u64)> = ex
             .replicates
             .iter()
             .copied()
             .chain(ex.parity.iter().copied())
-            .collect::<Vec<_>>();
-        let mut min_len: Option<u32> = None;
-        let mut alive = 0usize;
-        for node_id in all_nodes {
+            .enumerate()
+            .collect();
+        let mut responses: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for &(_, node_id) in &members {
+            if recovering.contains(&node_id) {
+                continue;
+            }
             if let Some(n) = nodes.get(&node_id) {
-                // F210-H3 Tier 2: pass `req.revision` (validated by
-                // `ensure_owner_revision` above) so the EN's fence-handover
-                // side-effect fires on first probe — pre-Tier 2 this
-                // hardcoded 0 and relied on a server-side escape hatch.
+                // F210-H3 Tier 2: pass `req.revision` (validated above) so
+                // the EN's fence-handover side-effect fires on first probe.
                 if let Ok(v) = self
                     .commit_length_on_node(&n.address, ex.extent_id, req.revision)
                     .await
                 {
-                    alive += 1;
-                    min_len = Some(min_len.map_or(v, |cur| cur.min(v)));
+                    responses.insert(node_id, v);
                 }
             }
         }
-        // F210-B2: majority quorum for replicated extents (was: min_size=1).
-        // Single-replica seal was safe for ack'd-data invariants under
-        // F178+B3 (writer N-of-N + EN returns last_synced), but bumping
-        // to majority closes two operational concerns: (a) defense against
-        // future write-path regressions that might weaken N-of-N, and
-        // (b) reduces sealed_length drift when only the leading replica
-        // happens to respond. Aligned with Raft / Ceph industry norm. EC
-        // path unchanged: K data shards needed for reconstruction = the
-        // same `replicates.len()` that was already there.
-        let min_size = if ex.parity.is_empty() {
-            ex.replicates.len() / 2 + 1
-        } else {
-            ex.replicates.len()
-        };
-        if alive < min_size {
-            let err = AppError::Precondition(format!(
-                "available nodes {} less than required {} for extent {}",
-                alive, min_size, ex.extent_id
-            ));
-            return Ok(rkyv_encode(&CheckCommitLengthResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-                stream_info: None,
-                end: 0,
-                last_ex_info: None,
-            }));
-        }
-        let end = match min_len {
-            Some(v) => v,
-            None => {
+        let end = match Self::compute_commit_seal(
+            &members,
+            &recovering,
+            &responses,
+            Self::seal_durability_floor(),
+        ) {
+            Ok((len, _avali)) => len,
+            Err(reason) => {
                 let err = AppError::Precondition(format!(
-                    "no available node for commit length, extent {}",
-                    ex.extent_id
+                    "commit-length extent {}: {}",
+                    ex.extent_id, reason
                 ));
                 return Ok(rkyv_encode(&CheckCommitLengthResp {
                     code: Self::err_to_code(&err),
@@ -1086,48 +1155,70 @@ impl AutumnManager {
             min_len = Some(req.end);
             avali = Self::all_bits(tail.replicates.len() + tail.parity.len());
         } else {
-            let all_nodes = tail
+            // F227: WAS-faithful failover seal (the writer did not supply a
+            // known commit via `req.end`, so this owner must derive it).
+            // commit length = `min` over COMMITTED members only. The append
+            // path is all-replica-ACK, so every committed member holds >=
+            // the acked length; min over them is therefore >= acked and
+            // never drops acked data — as long as catching-up members are
+            // excluded and all committed members agree (no quorum subset).
+            //
+            // Pre-F227 this took `min` over a majority-quorum subset of
+            // responders: a catching-up replica (partial data from an
+            // in-flight recovery) included in the min cratered
+            // sealed_length below the acked length (silent data loss); a
+            // leading-only subset could also seal above the true commit
+            // (keeping un-acked data).
+            let recovering = self.recovering_nodes_for_extent(tail.extent_id);
+            let members: Vec<(usize, u64)> = tail
                 .replicates
                 .iter()
                 .copied()
                 .chain(tail.parity.iter().copied())
-                .collect::<Vec<_>>();
-            let mut alive = 0usize;
-            for (idx, node_id) in all_nodes.iter().enumerate() {
-                if let Some(node) = nodes_map.get(node_id) {
-                    // F210-H3 Tier 2: pass req.revision (validated by
-                    // ensure_owner_revision above) — same rationale as
-                    // handle_check_commit_length, this is the
-                    // seal-during-alloc twin probe.
+                .enumerate()
+                .collect();
+            let mut responses: std::collections::HashMap<u64, u32> =
+                std::collections::HashMap::new();
+            for &(_, node_id) in &members {
+                if recovering.contains(&node_id) {
+                    continue;
+                }
+                if let Some(node) = nodes_map.get(&node_id) {
+                    // F210-H3 Tier 2: pass req.revision (validated above)
+                    // so the EN's fence-handover side-effect fires.
                     if let Ok(v) = self
                         .commit_length_on_node(&node.address, tail.extent_id, req.revision)
                         .await
                     {
-                        alive += 1;
-                        avali |= 1 << idx;
-                        min_len = Some(min_len.map_or(v, |cur| cur.min(v)));
+                        responses.insert(node_id, v);
                     }
                 }
             }
-            // F210-B2: see handle_check_commit_length above for the same
-            // majority-quorum rationale. Same fix here in the seal-during-
-            // alloc path.
-            let min_size = if tail.parity.is_empty() {
-                tail.replicates.len() / 2 + 1
-            } else {
-                tail.replicates.len()
-            };
-            if alive < min_size {
-                let err = AppError::Precondition(format!(
-                    "available nodes {} less than required {} for extent {}",
-                    alive, min_size, tail.extent_id
-                ));
-                return Ok(rkyv_encode(&StreamAllocExtentResp {
-                    code: Self::err_to_code(&err),
-                    message: err.to_string(),
-                    stream_info: None,
-                    last_ex_info: None,
-                }));
+            // Shared pure decision: no quorum, exclude catching-up members,
+            // require all committed members to respond. apply_recovery_done
+            // sets a catching-up slot's avali bit when its rebuild completes.
+            match Self::compute_commit_seal(
+                &members,
+                &recovering,
+                &responses,
+                Self::seal_durability_floor(),
+            ) {
+                Ok((len, av)) => {
+                    min_len = Some(len);
+                    avali = av;
+                }
+                Err(reason) => {
+                    let err = AppError::Precondition(format!(
+                        "seal extent {}: {}",
+                        tail.extent_id, reason
+                    ));
+                    return Ok(rkyv_encode(&StreamAllocExtentResp {
+                        code: Self::err_to_code(&err),
+                        message: err.to_string(),
+                        stream_info: None,
+                        last_ex_info: None,
+                    }));
+                }
             }
         }
 
@@ -4138,6 +4229,82 @@ impl AutumnManager {
             message: String::new(),
             entries,
         }))
+    }
+}
+
+#[cfg(test)]
+mod f227_commit_seal_tests {
+    use crate::AutumnManager;
+    use std::collections::{HashMap, HashSet};
+
+    // Slots: idx 0 -> node 1, idx 1 -> node 3, idx 2 -> node 5.
+    fn members3() -> Vec<(usize, u64)> {
+        vec![(0, 1u64), (1, 3u64), (2, 5u64)]
+    }
+
+    #[test]
+    fn all_committed_respond_takes_min_all_avali() {
+        let m = members3();
+        let rec = HashSet::new();
+        let mut resp = HashMap::new();
+        resp.insert(1u64, 20_000_000u32);
+        resp.insert(3u64, 20_000_000u32);
+        resp.insert(5u64, 18_000_000u32);
+        let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp, 1).unwrap();
+        assert_eq!(len, 18_000_000, "seal = min over all committed members");
+        assert_eq!(avali, 0b111);
+    }
+
+    #[test]
+    fn excludes_catching_up_member_does_not_crater_min() {
+        // F227 core invariant: slot 5 is catching-up (in-flight Recovery).
+        // It holds only a partial replica, so it must NOT contribute to the
+        // min. The seal = min over committed members {1,3} = 20 MB, NOT the
+        // short value a catching-up replica would report (the production bug
+        // cratered sealed_length to a recovery target's partial length).
+        let m = members3();
+        let rec: HashSet<u64> = [5u64].into_iter().collect();
+        let mut resp = HashMap::new();
+        resp.insert(1u64, 20_000_000u32);
+        resp.insert(3u64, 20_000_000u32);
+        // node 5 deliberately absent (would have reported a short length).
+        let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp, 1).unwrap();
+        assert_eq!(len, 20_000_000);
+        assert_eq!(avali, 0b011, "slot 2 (node 5) avali bit stays unset");
+    }
+
+    #[test]
+    fn refuses_when_a_committed_member_did_not_respond() {
+        // No quorum: every committed member must answer, else refuse (the
+        // caller retries; fence/recovery reconfigures a dead member out).
+        let m = members3();
+        let rec = HashSet::new();
+        let mut resp = HashMap::new();
+        resp.insert(1u64, 20_000_000u32);
+        resp.insert(3u64, 20_000_000u32);
+        // node 5 committed but silent.
+        assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 1).is_err());
+    }
+
+    #[test]
+    fn refuses_below_durability_floor() {
+        // All members catching-up -> 0 committed -> below floor 1.
+        let m = members3();
+        let rec: HashSet<u64> = [1u64, 3, 5].into_iter().collect();
+        let resp = HashMap::new();
+        assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 1).is_err());
+    }
+
+    #[test]
+    fn floor_gates_committed_member_count() {
+        // 2 committed members (5 catching-up) both respond.
+        let m = members3();
+        let rec: HashSet<u64> = [5u64].into_iter().collect();
+        let mut resp = HashMap::new();
+        resp.insert(1u64, 20u32);
+        resp.insert(3u64, 20u32);
+        assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 3).is_err());
+        assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 2).is_ok());
     }
 }
 // end of rpc_handlers.rs
