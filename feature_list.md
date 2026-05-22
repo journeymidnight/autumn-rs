@@ -3527,3 +3527,36 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
 - **passes:** true (2026-05-22 — live e2e: during the 3 GB recovery copy
   `recovery-stats` showed `global: 1/64` then back to `0/64` on completion — was
   permanently `0/64` pre-fix. `cargo test -p autumn-manager --lib` 108/0.)
+
+### F225 · Admin ops surface terminal preconditions immediately (no 10× refresh)
+- **Trigger / 动机:** `autumn-op split <p>` against a partition with overlapping
+  keys blocked ~9 s then errored `connection error: ps_call(part 37) after 10
+  refreshes: rpc status FailedPrecondition: cannot split: partition has
+  overlapping keys`. `call_ps_for_part` (split/compact/gc/flush, F212-fix-2) had a
+  blanket Err arm: ANY `ps_call` error → `refresh_regions` + backoff ×
+  `MAX_PS_REFRESHES` (10, ~9 s). It couldn't classify because (a) the loop didn't
+  branch on error kind and (b) `ps_call` stringified the typed `RpcError` into a
+  bare `anyhow!("{e}")`, dropping the `StatusCode`. The retried error was
+  deterministic — refreshing routing can't fix "overlapping keys" — so the 9 s was
+  pure waste. (Admin ops are region_epoch-EXEMPT, so a FailedPrecondition there is
+  NEVER the transient stale-epoch case that `call_ps_for_key` legitimately retries.)
+- **Scope / boundary:** `crates/client/src/lib.rs` only. (1) New `rpc_status_to_error`
+  maps a frame-level `RpcError::Status{code,msg}` → typed `AutumnError` (distinct
+  from `code_to_error`, which maps application-level `CODE_*` in a response body).
+  (2) `ps_call` returns `anyhow::Error::new(rpc_status_to_error(e))` — typed error
+  preserved inside `anyhow` (downcastable), signature unchanged so no caller breaks.
+  (3) `call_ps_for_part` Err arm `downcast::<AutumnError>()` and short-circuits
+  `PreconditionFailed | InvalidArgument | ValueTooLarge` (deterministic) — returns
+  immediately; transient (NotFound from a not-yet-registered post-split partition /
+  ConnectionError / routing miss) still refresh + retry. **`call_ps_for_key`
+  deliberately UNCHANGED** — there FailedPrecondition is (often) stale region_epoch,
+  which MUST refresh + retry (F212 epoch path).
+- **Acceptance:**
+  - `cargo build --workspace` clean.
+  - `autumn-op split <overlapping-part>` returns `precondition failed: cannot
+    split: partition has overlapping keys` in < 0.1 s (was ~9 s).
+  - Transient post-split `compact <new_part>` still converges via refresh+retry.
+- **passes:** true (2026-05-22 — live: `split 17` (has_overlap) returned in
+  **0.005 s** with `precondition failed: cannot split: partition has overlapping
+  keys`; was ~9 s + the noisy `after 10 refreshes` wrapper. `cargo build
+  --workspace` clean.)

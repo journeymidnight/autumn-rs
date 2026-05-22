@@ -154,6 +154,31 @@ stamped epoch doesn't match its current epoch. The existing
 `call_ps_for_key` `Err`-arm refresh path picks it up: drop conn,
 `refresh_regions`, retry.
 
+### F225 — error classification: terminal vs transient (admin ops fail fast)
+
+`ps_call` no longer stringifies the PS error: on a frame-level
+`RpcError::Status{code,msg}` it returns the typed `AutumnError` via
+`rpc_status_to_error` (preserved inside `anyhow`, downcastable; signature
+unchanged so no caller breaks). This lets the routing-retry loops branch on
+error kind instead of string-matching.
+
+- **`call_ps_for_part`** (admin ops: split/compact/gc/flush) short-circuits
+  `PreconditionFailed | InvalidArgument | ValueTooLarge` — these are
+  DETERMINISTIC (e.g. "partition has overlapping keys", "needs >= 2 keys") and
+  refreshing routing can't fix them, so it returns immediately instead of
+  burning `MAX_PS_REFRESHES` (10, ~9 s). Admin ops are region_epoch-EXEMPT, so a
+  FailedPrecondition here is never the stale-epoch case. Transient errors
+  (NotFound from a not-yet-registered post-split partition / ConnectionError /
+  routing miss) still refresh + retry — that's the F212-fix-2 window this loop
+  exists for.
+- **`call_ps_for_key`** (data ops) is deliberately UNCHANGED: there a
+  FailedPrecondition is (often) a stale `region_epoch`, which MUST refresh +
+  retry. Do not add the short-circuit to the data path.
+
+Two error channels remain distinct: `rpc_status_to_error` maps frame-level
+`StatusCode` (handler returned `Err((StatusCode, msg))`); `code_to_error` maps
+application-level `CODE_*` carried in a successful response body.
+
 **Wire surface** (post-this — backward-incompat with prior etcd
 `regions/` blob; `cluster.sh reset` for the migration):
 

@@ -7,6 +7,16 @@ Task scope: F222 + F223 + F224 — operator-driven recovery actually works end t
   F223: chunk copy_bytes_from_source so >2 GB extent recovery works.
   F224: reseed the F211-H rate limiter from the ledger each tick so caps are
         enforced + recovery-stats reports real numbers.
+  F225 (later, same session): admin ops (split/compact/gc/flush) surface terminal
+        preconditions immediately instead of 10× region-refresh (~9s). ps_call
+        returns typed AutumnError (rpc_status_to_error, preserved in anyhow);
+        call_ps_for_part short-circuits PreconditionFailed/InvalidArgument/
+        ValueTooLarge. call_ps_for_key UNCHANGED (its FailedPrecondition = stale
+        epoch, must retry). User: "干净版 fix".
+        Verified: `split 17` (has_overlap) now fails in 0.005s with "precondition
+        failed: cannot split: partition has overlapping keys" (was ~9s). Build clean.
+        NOT yet committed (F222-F224 are on branch f222-f224-recovery-completion-fixes;
+        F225 is uncommitted in the working tree).
 
 Current summary:
   ALL THREE DONE + unit-tested + e2e-verified on a live 5-node TCP cluster.

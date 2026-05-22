@@ -8,6 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::partition_rpc::{self, *};
+use autumn_rpc::{RpcError, StatusCode};
 use bytes::Bytes;
 
 // ── Re-exports for SDK consumers ────────────────────────────────────────────
@@ -74,6 +75,33 @@ fn code_to_error(code: u8, message: String) -> AutumnError {
             AutumnError::ValueTooLarge { size: 0, cap: 0 }
         }
         _ => AutumnError::ServerError(message),
+    }
+}
+
+/// F225: map an autumn-rpc FRAME-level error (`Err((StatusCode, msg))` returned
+/// by a PS handler — e.g. `handle_split_part`'s overlap precondition) into a
+/// typed `AutumnError`. `ps_call` returns this (wrapped in `anyhow`) instead of
+/// stringifying, so the routing-retry loops can classify terminal vs transient
+/// failures by `downcast`-ing rather than string-matching. Distinct from
+/// `code_to_error` above, which maps APPLICATION-level `CODE_*` carried in a
+/// successful response body.
+fn rpc_status_to_error(e: RpcError) -> AutumnError {
+    match e {
+        RpcError::Status { code, message } => match code {
+            StatusCode::NotFound => AutumnError::NotFound,
+            StatusCode::InvalidArgument => AutumnError::InvalidArgument(message),
+            StatusCode::FailedPrecondition => AutumnError::PreconditionFailed(message),
+            // Unavailable is transient (overloaded / draining) → keep retryable.
+            StatusCode::Unavailable => AutumnError::ConnectionError(message),
+            // Ok-as-error / Internal / AlreadyExists: surface as ServerError
+            // (retryable in the loops, same as the pre-F225 stringified path).
+            StatusCode::Ok | StatusCode::Internal | StatusCode::AlreadyExists => {
+                AutumnError::ServerError(message)
+            }
+        },
+        // Non-status RpcError (ConnectionClosed / Cancelled / Frame / Io) is a
+        // transport failure → ConnectionError so the loops refresh + retry.
+        other => AutumnError::ConnectionError(other.to_string()),
     }
 }
 
@@ -429,7 +457,10 @@ impl ClusterClient {
             Err(e) => {
                 // Drop connection so next call reconnects
                 self.ps_conns.borrow_mut().remove(ps_addr);
-                Err(anyhow!("{e}"))
+                // F225: preserve the typed error inside anyhow (downcastable)
+                // instead of stringifying, so the routing-retry loops can tell
+                // a deterministic precondition from a transient routing miss.
+                Err(anyhow::Error::new(rpc_status_to_error(e)))
             }
         }
     }
@@ -656,7 +687,24 @@ impl ClusterClient {
             match self.ps_call(&ps_addr, msg_type, payload.clone()).await {
                 Ok(b) => return Ok(b),
                 Err(e) => {
-                    last_err = Some(e.to_string());
+                    // F225: short-circuit DETERMINISTIC failures. Admin ops
+                    // (split/compact/gc/flush) are region_epoch-exempt, so a
+                    // FailedPrecondition here is never stale-routing — it's a
+                    // real precondition (e.g. "partition has overlapping keys",
+                    // "needs >= 2 keys") that refreshing routing cannot fix.
+                    // Surface it immediately instead of burning MAX_PS_REFRESHES
+                    // (~9 s of backoff). Only transient errors (routing miss /
+                    // NotFound from a not-yet-registered post-split partition /
+                    // connection) fall through to refresh + retry.
+                    match e.downcast::<AutumnError>() {
+                        Ok(ae @ (AutumnError::PreconditionFailed(_)
+                            | AutumnError::InvalidArgument(_)
+                            | AutumnError::ValueTooLarge { .. })) => {
+                            return Err(ae);
+                        }
+                        Ok(ae) => last_err = Some(ae.to_string()),
+                        Err(other) => last_err = Some(other.to_string()),
+                    }
                     if attempt >= MAX_PS_REFRESHES {
                         break;
                     }
