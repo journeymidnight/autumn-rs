@@ -1,5 +1,42 @@
 Date: 2026-05-24
 TaskStatus: completed
+Task scope: F229 — PS/EN background-loop resilience (extend F228's manager-only
+  1A/1C onto the partition-server + extent-node). Plus reconciled the F226/F233
+  duplicate (ledger-only). User: "a 然后 b" (a = F226/F233 merge, b = F229).
+
+Summary (F229):
+  1C (silent-death fix): no PS/EN background loop is a bare spawn().detach()
+     anymore — they swallowed panics.
+     - spawn_supervised (catch_unwind + ERROR + 1s restart) for RESTARTABLE
+       loops (re-derive each tick, no moved resource): PS heartbeat /
+       report_load / region_sync / vp_refs_retry; EN reconcile-orphans.
+     - spawn_failstop (normal return = no-op; PANIC = ERROR + process::exit(1))
+       for NON-restartable durability/serving loops that own a moved channel
+       receiver / TcpListener: PS flush/compact/gc/accept; EN coalescer.
+       Fail-stop (not restart) because the receiver can't be reacquired and
+       re-running on half-mutated state could double-apply; exit -> manager
+       evicts -> reopen from durable streams/on-disk journal (no committed loss).
+       Per-partition self-evict (smaller blast radius) = documented future.
+  1A (bound awaits): closed the F228-analog gap — ConnPool::get_client's
+     RpcClient::connect was unbounded (call_timeout only bounds the call AFTER
+     connect). Bounded with CONNECT_TIMEOUT=5s const (conn_pool.rs, env-free per
+     F195). Verified all loop RPCs already bounded (PS->mgr 5-30s, EN reconcile
+     10s, StreamClient append F121 + commit_length 5s).
+     Residual: StreamClient read-path per-call timeout (after-connect) on
+     read_bytes_from_extent — connect now bounded; per-call read timeout is the
+     only open 1A sub-item (mostly request-path, partly open_partition replay).
+  Test: f229_spawn_supervised_restarts_after_panic (PS lib). failstop exit path
+     not in-process-testable.
+  Docs: feature_list F229 passes:true; partition-server/CLAUDE.md note 13;
+     stream/CLAUDE.md "F229 background-loop supervision" section.
+
+Verification (F229): build clean both feature sets; PS lib 147 (incl new test),
+  stream lib 56; final full --include-ignored e2e (manager+stream+server)
+  running/clean. NOT committed yet — awaiting go-ahead.
+
+----- previous task (completed 2026-05-24) -----
+Date: 2026-05-24
+TaskStatus: completed
 Task scope: F233 — recovery backoff observability + fix flaky e2e test
   `split_merge_split_with_concurrent_writes` (user: "修复这个失败，并且补上
   backoff 可观测性"). Both in the merged recovery series' code, not F232.

@@ -1398,3 +1398,30 @@ post-restart.
     no cross-thread plumbing. Trade-off: merge wallclock stays ~2-3 s
     instead of <1 s — bounded by region_sync_loop tick — but the
     write loss is what F184-K actually measured, and that's now 0.
+
+13. **F229 background-loop supervision — no loop dies silently; durability
+    loops fail-stop.** Every PS background loop runs under a supervisor wrapper
+    instead of a bare `spawn(..).detach()` (which swallowed panics → a dead
+    flush/heartbeat loop with no signal). Two helpers in `lib.rs`:
+    - `spawn_supervised(name, make)` — catch_unwind + ERROR-log + 1 s restart.
+      For RESTARTABLE loops that re-derive state each tick and own no moved
+      resource: `heartbeat_loop`, `report_load_loop`, `region_sync_loop`,
+      `vp_refs_retry_loop`. Mirrors manager F228 (note 29 there).
+    - `spawn_failstop(name, fut)` — catch_unwind; NORMAL return is the expected
+      shutdown (no-op); PANIC → ERROR-log + `std::process::exit(1)`. For
+      NON-restartable loops that own a moved channel receiver / `TcpListener` and
+      are durability/serving-critical: per-partition `background_flush_loop` /
+      `background_compact_loop` / `background_gc_loop` and the per-partition
+      accept loop. **Why fail-stop, not restart:** the moved receiver can't be
+      re-acquired, and re-running on a mid-panic half-mutated `PartitionData`
+      could double-apply; exiting lets the manager evict (F069/F111) and reopen
+      the partition from the durable streams (log_stream WAL = source of truth →
+      no committed loss). **Invariant: never reintroduce a bare
+      `spawn(..).detach()` for a PS background loop — pick supervised (re-derive-
+      safe) or failstop (moved-resource / durability).** Per-partition
+      self-eviction (smaller blast radius than process exit) is a future
+      refinement. 1A companion: `ConnPool::get_client` connect is bounded
+      (`CONNECT_TIMEOUT`, stream crate) so a blackholed peer can't hang
+      `region_sync`'s `open_partition`. Per-conn `handle_ps_connection` spawns
+      are intentionally NOT wrapped — a panic there drops one client connection
+      (request-scoped), not a background loop.

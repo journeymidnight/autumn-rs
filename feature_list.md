@@ -3763,8 +3763,42 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   - 1C: a PS/EN-appropriate supervisor with per-loop-defined restart safety
     (NOT a blind clone-restart), or at minimum catch_unwind+ERROR-log+process-
     level health surfacing so a dead loop is never silent.
-- **passes:** false (deferred 2026-05-22 — audit done, fix not started; logged so
-  the PS/EN surface isn't forgotten now that the manager side is closed by F228.)
+- **Implementation (2026-05-24):**
+  - **1C (supervision — the silent-death fix):** added `spawn_supervised` (catch_unwind
+    + ERROR-log + 1 s restart, mirrors manager F228) and `spawn_failstop` (catch_unwind;
+    normal return = expected shutdown no-op; **panic = ERROR-log + `process::exit(1)`**)
+    to PS (`lib.rs`) and EN (`extent_node.rs`, `en_*` prefixed). Rewired every
+    background loop off bare `spawn(..).detach()`:
+    - RESTARTABLE (re-derive each tick, no moved resource): PS `heartbeat` /
+      `report_load` / `region_sync` / `vp_refs_retry`; EN reconcile-orphans →
+      `spawn_supervised`.
+    - NON-restartable (own a moved channel receiver / `TcpListener`, durability/
+      serving-critical, mid-panic state may be half-mutated): PS `flush` / `compact` /
+      `gc` / per-partition accept; EN per-extent `coalescer` → `spawn_failstop`.
+      Rationale for fail-stop over restart: the moved receiver can't be re-acquired
+      and re-running on half-mutated state could double-apply; process exit → manager
+      evicts (F069/F111) → partition/extent reopens from the **durable streams /
+      on-disk journal** (nothing committed is lost). Smaller-blast-radius
+      per-partition self-eviction is a documented future refinement.
+  - **1A (bound awaits):** the F228-analogous gap was `ConnPool::get_client`'s
+    `RpcClient::connect` (unbounded — `call_timeout` only bounds the call AFTER
+    connect). Bounded it with a fixed `CONNECT_TIMEOUT = 5 s` const
+    (`crates/stream/src/conn_pool.rs`; env-free per F195). Audit of the loop RPCs
+    confirmed all already bounded: PS→manager (register_ps 10s / heartbeat 5s /
+    report_load 10s / get_regions 10s / register_partition_addr 10s /
+    sync_partition_vp_refs 30s), EN reconcile (`MSG_RECONCILE_EXTENTS` 10s),
+    StreamClient append (F121 fanout) + `current_commit`/`commit_length` (5s/replica).
+  - Test: `f229_spawn_supervised_restarts_after_panic` (PS lib) — a make-closure that
+    panics on first call is caught + re-invoked (call count ≥ 2) within the restart
+    window. (The `spawn_failstop` exit path can't be in-process unit-tested.)
+- **Residual (smaller follow-up, noted):** StreamClient READ-path per-call timeout
+  (after-connect) on `read_bytes_from_extent` — mostly request-path, partly
+  loop-reachable via `open_partition` replay; the connect is now bounded (main hang
+  risk) but a connected-then-hung read on that path is not yet per-call-bounded.
+- **passes:** true (1C complete + 1A connect-gap closed & loop RPCs verified bounded;
+  2026-05-24. builds clean both feature sets; PS lib 147 incl. the new test, stream
+  lib 56; full `--include-ignored` e2e re-validated. The read-call residual above is
+  the only un-closed 1A sub-item.)
 
 ### F230 · partition_loop 95% CPU busy-spin after merge/split reopen (closed drain_rx)
 - **Trigger / 動機:** Found while running the etcd-gated integration suite to

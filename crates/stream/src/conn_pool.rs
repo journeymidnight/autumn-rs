@@ -22,6 +22,17 @@ use anyhow::{anyhow, Result};
 use autumn_rpc::client::RpcClient;
 use bytes::Bytes;
 
+/// F229 (1A): bound the TCP connect so a blackholed peer (SYN dropped) can't
+/// hang `get_client` — and therefore any PS/EN background loop that reaches it
+/// (region_sync `open_partition` → `commit_length`, EN reconcile, recovery
+/// fanout) — indefinitely. `call_timeout` only bounds the call AFTER connect;
+/// the connect itself had no deadline. Mirrors the manager-side F228 fix
+/// (`AUTUMN_MGR_CONNECT_TIMEOUT_MS`); a fixed constant here (not a tuning knob)
+/// keeps it env-free per the F195 config rule. 5 s is generous for
+/// datacenter / loopback (sub-second normal); on expiry the entry is not
+/// cached, so the next call retries a fresh connect.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct ConnPool {
     clients: RefCell<HashMap<SocketAddr, Rc<RpcClient>>>,
 }
@@ -52,9 +63,19 @@ impl ConnPool {
         // Evict any closed entry under a fresh borrow so the upcoming
         // `connect.await` doesn't hold the RefCell across a yield.
         self.clients.borrow_mut().remove(&addr);
-        let client = RpcClient::connect(addr)
-            .await
-            .map_err(|e| anyhow!("connect {}: {}", addr, e))?;
+        // F229 (1A): bound the connect (see CONNECT_TIMEOUT). On timeout the
+        // entry stays uncached so the next call retries a fresh connect.
+        let client = match compio::time::timeout(CONNECT_TIMEOUT, RpcClient::connect(addr)).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return Err(anyhow!("connect {}: {}", addr, e)),
+            Err(_) => {
+                return Err(anyhow!(
+                    "connect {} timed out after {:?}",
+                    addr,
+                    CONNECT_TIMEOUT
+                ))
+            }
+        };
         self.clients.borrow_mut().insert(addr, client.clone());
         Ok(client)
     }

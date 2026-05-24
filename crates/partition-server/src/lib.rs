@@ -2308,11 +2308,17 @@ impl PartitionServer {
         // commit_length on 3 streams + replays the WAL), which used to push
         // the first heartbeat past the deadline and silently evict the PS.
         let s = server.clone();
-        compio::runtime::spawn(async move { s.heartbeat_loop().await }).detach();
+        spawn_supervised("ps_heartbeat", move || {
+            let s = s.clone();
+            async move { s.heartbeat_loop().await }
+        });
 
         // F183: per-partition load metrics report (5 s cadence).
         let s = server.clone();
-        compio::runtime::spawn(async move { s.report_load_loop().await }).detach();
+        spawn_supervised("ps_report_load", move || {
+            let s = s.clone();
+            async move { s.report_load_loop().await }
+        });
 
         // F203: maintenance_scheduler_loop deleted. Pre-F203 this task
         // picked the highest-debt partition each tick and dispatched
@@ -3019,7 +3025,10 @@ impl PartitionServer {
         // register_ps succeeds, so it stays alive across the (potentially
         // long) initial sync_regions_once.
         let s = self.clone();
-        compio::runtime::spawn(async move { s.region_sync_loop().await }).detach();
+        spawn_supervised("ps_region_sync", move || {
+            let s = s.clone();
+            async move { s.region_sync_loop().await }
+        });
 
         // F099-K: region_sync_loop above drives all open/close of partition
         // threads. Partitions bind their own listeners. F120-C: park here
@@ -4022,27 +4031,24 @@ async fn partition_thread_main(
     // 256 × d=1 came from spawn + inner oneshot + Waker cascade).
     {
         let p = part.clone();
-        compio::runtime::spawn(async move {
+        spawn_failstop(format!("flush[part {part_id}]"), async move {
             background_flush_loop(p, flush_rx).await;
-        })
-        .detach();
+        });
     }
     {
         let p = part.clone();
         let conc_for_compact = concurrency_ctrl.clone();
-        compio::runtime::spawn(async move {
+        spawn_failstop(format!("compact[part {part_id}]"), async move {
             background_compact_loop(part_id, p, compact_rx, conc_for_compact).await;
-        })
-        .detach();
+        });
     }
     {
         let p = part.clone();
         let gc_gate_for_loop = gc_gate.clone();
         let conc_for_gc = concurrency_ctrl.clone();
-        compio::runtime::spawn(async move {
+        spawn_failstop(format!("gc[part {part_id}]"), async move {
             background_gc_loop(p, gc_rx, gc_gate_for_loop, conc_for_gc).await;
-        })
-        .detach();
+        });
     }
     // F210-C4: retry loop for failed vp_refs sync. Every 5 s checks the
     // dirty flag; if set, attempts a fresh `sync_partition_vp_refs`. On
@@ -4051,10 +4057,10 @@ async fn partition_thread_main(
     // wasted retries cost only one RPC every 5s.
     {
         let p = part.clone();
-        compio::runtime::spawn(async move {
-            vp_refs_retry_loop(p).await;
-        })
-        .detach();
+        spawn_supervised("ps_vp_refs_retry", move || {
+            let p = p.clone();
+            async move { vp_refs_retry_loop(p).await }
+        });
     }
     let locked_by_other = Rc::new(Cell::new(false));
 
@@ -4146,7 +4152,7 @@ async fn partition_thread_main(
         // F216 (Option B): the accept task hands each ps-conn task a clone of
         // `part` so it can serve GET reads locally in its own FU.
         let part_for_accept = part.clone();
-        compio::runtime::spawn(async move {
+        spawn_failstop(format!("accept[part {part_id}]"), async move {
             let mut shutdown_rx = shutdown_rx;
             use futures::future::{select, Either};
             loop {
@@ -4186,8 +4192,7 @@ async fn partition_thread_main(
                 }
             }
             tracing::info!(part_id, "accept task exiting");
-        })
-        .detach();
+        });
     }
 
     // Drop our extra clone of req_tx — the accept task's clone (and any
@@ -6017,6 +6022,71 @@ pub(crate) async fn flush_memtable_locked(part: &Rc<RefCell<PartitionData>>) -> 
 /// tagging — `.next()` yields in push order while all in-flight
 /// futures still make progress in parallel.
 ///
+/// F229 (1C): supervise a RESTARTABLE PS background loop — catch_unwind,
+/// ERROR-log on panic OR unexpected return, restart after 1 s. Use ONLY for
+/// loops that re-derive their state each tick (take Clone handles, no moved
+/// channel receiver, no multi-step partition mutation that a mid-panic could
+/// leave half-applied): `heartbeat_loop`, `report_load_loop`,
+/// `region_sync_loop`, `vp_refs_retry_loop`. Mirrors manager F228
+/// `spawn_supervised`. Pre-F229 these were bare `spawn(..).detach()`, so a
+/// panic killed the loop silently (e.g. heartbeats stop → manager evicts with
+/// no log on the PS side explaining why).
+pub(crate) fn spawn_supervised<F, Fut>(name: &'static str, make: F)
+where
+    F: Fn() -> Fut + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    compio::runtime::spawn(async move {
+        use futures::future::FutureExt;
+        loop {
+            let outcome = std::panic::AssertUnwindSafe(make()).catch_unwind().await;
+            match outcome {
+                Ok(()) => tracing::error!(
+                    bg_loop = name,
+                    "PS background loop returned unexpectedly; restarting in 1s"
+                ),
+                Err(_) => tracing::error!(
+                    bg_loop = name,
+                    "PS background loop PANICKED; restarting in 1s"
+                ),
+            }
+            compio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .detach();
+}
+
+/// F229 (1C): supervise a NON-restartable loop that owns a unique moved
+/// resource (channel receiver / `TcpListener`) so it cannot be re-created, and
+/// whose mid-panic in-memory state may be half-mutated: the per-partition
+/// `flush` / `compact` / `gc` loops and the per-partition accept loop. A NORMAL
+/// return is the expected shutdown path (channels closed / shutdown signaled) —
+/// no-op. A PANIC means the partition's durability or serving pipeline broke on
+/// possibly-inconsistent state; restart-in-place is unsafe (the receiver is
+/// gone, and re-running could double-apply or resurrect half-mutated state), so
+/// **fail-stop the process** (loud, never silent). The manager evicts via
+/// F069/F111 and every partition is reopened from its durable streams (the
+/// log_stream WAL is the source of truth → no committed data lost). Smaller-
+/// blast-radius per-partition self-eviction is a future refinement — see F229.
+pub(crate) fn spawn_failstop<Fut>(name: String, fut: Fut)
+where
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    compio::runtime::spawn(async move {
+        use futures::future::FutureExt;
+        if std::panic::AssertUnwindSafe(fut).catch_unwind().await.is_err() {
+            tracing::error!(
+                bg_loop = %name,
+                "PS background loop PANICKED on a moved-resource loop; \
+                 fail-stopping the process so the manager reassigns and the \
+                 partition reopens from durable streams (clean recovery)"
+            );
+            std::process::exit(1);
+        }
+    })
+    .detach();
+}
+
 /// Error policy: fail-stop. If any in-flight async phase OR any
 /// commit returns Err, drain the remaining inflight (so they don't
 /// dangle) and break. The next `flush_rx` signal restarts the loop
@@ -6362,6 +6432,42 @@ pub(crate) fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F229 (1C): a supervised loop that PANICS is caught + restarted, not
+    /// silently dead. The make closure panics on its first invocation and
+    /// records each call; after the 1 s restart backoff it must have been
+    /// re-invoked (call count >= 2), proving the panic was caught and the loop
+    /// restarted rather than the task dying silently.
+    #[test]
+    fn f229_spawn_supervised_restarts_after_panic() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let calls = Rc::new(Cell::new(0u32));
+            let c = calls.clone();
+            spawn_supervised("test_loop", move || {
+                let c = c.clone();
+                async move {
+                    let n = c.get() + 1;
+                    c.set(n);
+                    if n == 1 {
+                        panic!("first invocation panics on purpose");
+                    }
+                    // Subsequent invocations park forever (a healthy loop never
+                    // returns); the test only needs to observe the restart.
+                    std::future::pending::<()>().await;
+                }
+            });
+            // First call (panic) is immediate; restart waits 1 s. Give it margin.
+            compio::time::sleep(Duration::from_millis(1500)).await;
+            assert!(
+                calls.get() >= 2,
+                "supervised loop should have restarted after the panic; calls={}",
+                calls.get()
+            );
+        });
+    }
 
     #[test]
     fn compio_timer_in_spawn() {

@@ -1018,3 +1018,31 @@ See `benches/bench_results.md` for full results and historical comparison.
 2. **pread batch** — consecutive MSG_READ_BYTES processed sequentially, responses collected
 3. **write_vectored_all** — ALL responses from one TCP read written in one syscall
 4. **Client pipelining** — sliding window depth hides RTT, enables server-side batching
+
+---
+
+## F229 background-loop supervision (extent-node)
+
+Every EN background loop runs under a supervisor instead of a bare
+`spawn(..).detach()` (which swallowed panics). Two helpers in `extent_node.rs`:
+
+- `en_spawn_supervised(name, make)` — catch_unwind + ERROR-log + 1 s restart,
+  for the RESTARTABLE orphan-reconcile sweep (`spawn_reconcile_orphans_loop`) —
+  re-derives from `node.clone()` each tick, owns no moved resource.
+- `en_spawn_failstop(name, fut)` — catch_unwind; NORMAL return = expected lazy
+  exit (no-op); PANIC → ERROR-log + `std::process::exit(1)`, for the per-extent
+  `coalescer_loop` which owns its moved wake-channel receiver and is
+  durability-critical (the fsync coalescer). Restart-in-place is impossible (the
+  receiver is gone) and unsafe; fail-stop → EN restarts and recovers extents
+  from disk (the data files are the journal; nothing committed is lost).
+
+**1A — bounded connect.** `ConnPool::get_client` (`conn_pool.rs`) wraps
+`RpcClient::connect` in a fixed `CONNECT_TIMEOUT` (5 s) so a blackholed peer
+(SYN dropped) can't hang any caller — `call_timeout` only bounds the call AFTER
+connect. Mirrors the manager-side F228 connect-timeout fix; env-free per F195.
+
+**Invariant:** never reintroduce a bare `spawn(..).detach()` for an EN
+background loop — use `en_spawn_supervised` (re-derive-safe) or
+`en_spawn_failstop` (moved-resource / durability). Request-triggered detached
+tasks (`run_recovery_task`, EC convert) are NOT loops — a panic there fails one
+operation (retried), so they stay as-is.

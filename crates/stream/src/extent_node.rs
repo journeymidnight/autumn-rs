@@ -522,9 +522,64 @@ pub(crate) fn register_sync_waiter(
     };
     if let Some(wrx) = new_wake_rx {
         let extent_clone = Rc::clone(extent);
-        compio::runtime::spawn(coalescer_loop(extent_clone, wrx)).detach();
+        en_spawn_failstop("en_coalescer".to_string(), coalescer_loop(extent_clone, wrx));
     }
     rx
+}
+
+/// F229 (1C): supervise a RESTARTABLE extent-node background loop —
+/// catch_unwind, ERROR-log on panic/unexpected return, restart after 1 s. Use
+/// ONLY for re-derive-each-tick loops with no moved resource (the orphan
+/// reconcile sweep). Mirrors manager F228 / PS `spawn_supervised`. Pre-F229
+/// these were bare `spawn(..).detach()` → a panic killed the loop silently.
+pub(crate) fn en_spawn_supervised<F, Fut>(name: &'static str, make: F)
+where
+    F: Fn() -> Fut + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    compio::runtime::spawn(async move {
+        use futures::future::FutureExt;
+        loop {
+            let outcome = std::panic::AssertUnwindSafe(make()).catch_unwind().await;
+            match outcome {
+                Ok(()) => tracing::error!(
+                    bg_loop = name,
+                    "extent-node background loop returned unexpectedly; restarting in 1s"
+                ),
+                Err(_) => tracing::error!(
+                    bg_loop = name,
+                    "extent-node background loop PANICKED; restarting in 1s"
+                ),
+            }
+            compio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .detach();
+}
+
+/// F229 (1C): supervise a NON-restartable extent-node loop that owns a moved
+/// resource (the per-extent fsync coalescer owns its wake-channel receiver) and
+/// is durability-critical. NORMAL return is the expected lazy-exit path
+/// (no-op). A PANIC means the fsync-coalescing path broke on possibly-
+/// inconsistent state; restart-in-place is unsafe (the receiver is gone), so
+/// **fail-stop the process** — the EN restarts and recovers extents from disk
+/// (the data files are the journal; nothing committed is lost). See F229.
+pub(crate) fn en_spawn_failstop<Fut>(name: String, fut: Fut)
+where
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    compio::runtime::spawn(async move {
+        use futures::future::FutureExt;
+        if std::panic::AssertUnwindSafe(fut).catch_unwind().await.is_err() {
+            tracing::error!(
+                bg_loop = %name,
+                "extent-node background loop PANICKED on a moved-resource loop; \
+                 fail-stopping the process (extents recover from disk on restart)"
+            );
+            std::process::exit(1);
+        }
+    })
+    .detach();
 }
 
 async fn coalescer_loop(
@@ -1854,19 +1909,21 @@ impl ExtentNode {
             return;
         }
         let node = self.clone();
-        compio::runtime::spawn(async move {
-            const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
-            loop {
-                if let Err(e) = node.reconcile_orphans_with_manager().await {
-                    tracing::warn!(
-                        error = %e,
-                        "F113 reconcile failed (will retry next sweep)",
-                    );
+        en_spawn_supervised("en_reconcile_orphans", move || {
+            let node = node.clone();
+            async move {
+                const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+                loop {
+                    if let Err(e) = node.reconcile_orphans_with_manager().await {
+                        tracing::warn!(
+                            error = %e,
+                            "F113 reconcile failed (will retry next sweep)",
+                        );
+                    }
+                    compio::time::sleep(SWEEP_INTERVAL).await;
                 }
-                compio::time::sleep(SWEEP_INTERVAL).await;
             }
-        })
-        .detach();
+        });
     }
 
     /// F109: best-effort startup orphan reconcile.
