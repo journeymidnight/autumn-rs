@@ -3610,8 +3610,12 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   - After a fence on a small cluster, `recovery-stats` shows each backoff
     entry's extent/slot/consecutive_failures/age and the reason string
     (e.g. `no candidate node for recovery`).
-- **passes:** false (proposed 2026-05-22 — observability gap found while
-  explaining `backoff_entries=3` after an operator fence; not yet implemented.)
+- **passes:** true (IMPLEMENTED 2026-05-24 — see F233, commit dfa8105. NOTE: the
+  implementation was filed under a duplicate F-number F233 because this F226
+  proposal was missed at the time; F233 is the authoritative implementation
+  record and matches this proposal's scope exactly — `BackoffState.last_reason`,
+  `record_dispatch_outcome(&Result)`, `RecoveryStatsResp.backoff` appended,
+  `handle_recovery_stats` fill, `autumn-op recovery-stats` table + `--json`.)
 
 ### F227 · WAS-faithful commit/seal length — remove quorum, exclude catching-up members
 - **Trigger / 动机:** Live-cluster forensics (operator fenced node 1 mid-write)
@@ -3820,6 +3824,12 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
 ## P13 — Recovery backoff observability + flaky merge-test fix (F233)
 
 ### F233 · Recovery backoff: capture + expose the failure reason; fix flaky `split_merge_split_with_concurrent_writes`
+- **DUPLICATE-NUMBER NOTE:** the backoff-observability half of this entry is the
+  implementation of the earlier **F226** proposal (same scope, same code
+  locations) — F226 was not spotted when this work started, so it landed under a
+  new F-number. F226 is now marked `passes: true` pointing here; this F233 entry
+  is the authoritative implementation record (commit dfa8105 references F233). The
+  flaky-test fix below has no prior proposal and is genuinely new to F233.
 - **Trigger:** User, after reading the merged recovery series (F211-H/F224): "有 backoff 了,是不是 marker 也彻底删除了、不会重试了?并且现在也不支持显示 backoff 的原因". Investigation confirmed (a) backoff does NOT delete the F207 Recovery marker and does NOT stop retries — the two are independent: the marker only exists while a recovery is in-flight (released atomically by `apply_recovery_done`, F207 I3), while backoff (`recovery_rate_limiter`, in-memory) just spaces out re-dispatch of an `(extent_id, slot)` by `2^N s` cap 300 s; candidates are re-derived every 2 s tick from `s.extents`, so a dead slot is retried forever until success — there is no give-up. (b) The failure REASON was genuinely not captured: `record_dispatch_outcome` took only `ok: bool` (the `dispatch_recovery_task` `AppError` was discarded at the call sites via `res.is_ok()`), `BackoffState` had no reason field, and `recovery-stats` exposed only `backoff_entries: u32` (a count — not which extents, since when, until when, or why).
 - **Backoff observability changes:**
   - `BackoffState` (`recovery_rate_limiter.rs`): dropped `Copy`, added `last_reason: String`. `record_failure(extent_id, slot, now_s, reason: &str)` stores it. New `backoff_snapshot() -> Vec<(extent_id, slot, consecutive_failures, last_attempt_at, next_retry_at, reason)>` (only `consecutive_failures > 0`, sorted, `next_retry_at = last_attempt_at + backoff_secs(...)`).
