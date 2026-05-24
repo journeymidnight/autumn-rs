@@ -2862,6 +2862,112 @@ impl ExtentNode {
         Err("no source replica available for copy".to_string())
     }
 
+    /// F193 Stage C: stream the full sealed extent from a healthy peer straight
+    /// into `dest`, chunk-by-chunk (read one `FILE_IO_CHUNK_BYTES` chunk →
+    /// `pwrite` it → drop it), so peak RAM is ONE chunk regardless of extent
+    /// size — unlike `fetch_full_extent_from_sources`, which materialized the
+    /// whole extent in a single `Vec<u8>` before the writeback. `dest` is
+    /// truncated to 0 before each source attempt, so a mid-stream source failure
+    /// or short read abandons that source and the next one restarts cleanly from
+    /// offset 0 (set_len(0) discards the partial write — no corruption). Returns
+    /// the bytes written; succeeds only when a source delivered the full
+    /// `sealed_length` (or `sealed_length == 0` read-to-end). Does NOT fsync —
+    /// the caller syncs once after a successful return.
+    async fn stream_extent_from_sources(
+        &self,
+        extent: &ExtentInfo,
+        exclude_node_ids: &[u64],
+        dest: &Rc<ExtentEntry>,
+    ) -> Result<u64, String> {
+        let nodes = self
+            .nodes_map_from_manager()
+            .await
+            .map_err(|e| format!("nodes_map: {e}"))?;
+        let total = extent.sealed_length;
+        for node_id in extent.replicates.iter().chain(extent.parity.iter()) {
+            if exclude_node_ids.contains(node_id) {
+                continue;
+            }
+            let Some(addr) = nodes.get(node_id) else {
+                continue;
+            };
+            let Ok(sock) = parse_addr(addr) else {
+                continue;
+            };
+            // Reset before each attempt — a previous source's partial stream
+            // must not bleed into this one.
+            if dest.file_rc().set_len(0).await.is_err() {
+                continue;
+            }
+            match Self::stream_one_source(
+                sock,
+                addr,
+                extent.extent_id,
+                extent.eversion,
+                total,
+                &dest.file_rc(),
+            )
+            .await
+            {
+                Ok(written) if total == 0 || written >= total => return Ok(written),
+                Ok(_short) => continue, // source had < sealed_length — try next
+                Err(_e) => continue,    // source failed mid-stream — next restarts from 0
+            }
+        }
+        Err("no source replica available for streaming copy".to_string())
+    }
+
+    /// One source's contribution to `stream_extent_from_sources`: read
+    /// `[0, total)` from `addr` in `FILE_IO_CHUNK_BYTES` chunks, writing each
+    /// chunk to `dest_file` at its offset before reading the next, so only one
+    /// chunk is resident at a time. Returns bytes written. `total == 0` =
+    /// read-to-end single shot (unsealed; recovery normally runs on sealed
+    /// extents, so this is the rare path).
+    async fn stream_one_source(
+        sock: std::net::SocketAddr,
+        addr: &str,
+        extent_id: u64,
+        eversion: u64,
+        total: u64,
+        dest_file: &Rc<CompioFile>,
+    ) -> Result<u64, String> {
+        if total == 0 {
+            let got = Self::read_bytes_chunk(sock, addr, extent_id, eversion, 0, 0).await?;
+            let n = got.len() as u64;
+            if !got.is_empty() {
+                file_pwrite(dest_file.clone(), 0, Bytes::from(got))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            return Ok(n);
+        }
+        let chunk = FILE_IO_CHUNK_BYTES as u64;
+        let mut offset: u64 = 0;
+        while offset < total {
+            let want = chunk.min(total - offset);
+            let off_u32: u32 = offset.try_into().map_err(|_| {
+                format!("extent {extent_id} stream offset {offset} exceeds u32 (>4 GiB)")
+            })?;
+            let got =
+                Self::read_bytes_chunk(sock, addr, extent_id, eversion, off_u32, want as u32)
+                    .await?;
+            if got.is_empty() {
+                break;
+            }
+            let got_len = got.len() as u64;
+            // Write this chunk, then it drops at the next loop iteration — peak
+            // resident = one chunk.
+            file_pwrite(dest_file.clone(), offset, Bytes::from(got))
+                .await
+                .map_err(|e| e.to_string())?;
+            offset += got_len;
+            if got_len < want {
+                break; // short read — source has no more data
+            }
+        }
+        Ok(offset)
+    }
+
     pub(crate) async fn extent_info_from_manager(&self, extent_id: u64) -> Result<Option<ExtentInfo>, String> {
         let mgr = match &self.manager_endpoint {
             Some(ep) => crate::conn_pool::normalize_endpoint(ep),
@@ -2954,31 +3060,33 @@ impl ExtentNode {
         // `stream_alloc_extent` — are still full-replicated on every K+M
         // node, so they must take the replication path even though
         // `extent_info.parity` is non-empty.
-        let payload = if !extent_info.ec_converted {
-            // Replication recovery: copy full extent from any healthy peer.
-            let raw = self
-                .fetch_full_extent_from_sources(&extent_info, &[task.node_id, task.replace_id])
-                .await?;
-            if extent_info.sealed_length > 0 {
-                raw[..(extent_info.sealed_length as usize)].to_vec()
-            } else {
-                raw
-            }
-        } else {
-            // EC recovery: read individual shards from healthy peers and reconstruct
-            // the missing shard for this node's slot in the extent.
-            self.run_ec_recovery_payload(&task, &extent_info).await?
-        };
-
         let extent = self.ensure_extent(task.extent_id).await?;
 
-        extent.file_rc()
-            .set_len(0)
-            .await
-            .map_err(|e| e.to_string())?;
-        let payload_len = payload.len() as u64;
-        file_pwrite_chunked(extent.file_rc(), 0, Bytes::from(payload)).await
-            .map_err(|e| e.to_string())?;
+        let payload_len = if !extent_info.ec_converted {
+            // Replication recovery — F193 Stage C: stream the full extent from a
+            // healthy peer chunk-by-chunk straight into the file (peak = one
+            // FILE_IO_CHUNK_BYTES chunk), instead of materializing the whole
+            // extent in a Vec then writing it back. stream_* truncates to 0 and
+            // writes each chunk; succeeds only on a full sealed_length transfer.
+            self.stream_extent_from_sources(
+                &extent_info,
+                &[task.node_id, task.replace_id],
+                &extent,
+            )
+            .await?
+        } else {
+            // EC recovery: read individual shards from healthy peers and
+            // reconstruct the missing shard for this node's slot. Shard-sized
+            // buffering (≈ sealed_length / K), not full-extent; streaming RS
+            // decode would be F193 Stage B.
+            let payload = self.run_ec_recovery_payload(&task, &extent_info).await?;
+            let len = payload.len() as u64;
+            extent.file_rc().set_len(0).await.map_err(|e| e.to_string())?;
+            file_pwrite_chunked(extent.file_rc(), 0, Bytes::from(payload))
+                .await
+                .map_err(|e| e.to_string())?;
+            len
+        };
         extent.file_rc().sync_data().await
             .map_err(|e| e.to_string())?;
 
@@ -4172,9 +4280,17 @@ impl ExtentNode {
         // (env `AUTUMN_EXTENT_RECOVERY_PARALLELISM`, default 2).
         let _rec_permit = self.concurrency_ctrl.acquire_recovery().await;
 
-        let copied = self.fetch_full_extent_from_sources(&extent_info, &[]).await;
-        let raw_payload = match copied {
-            Ok(v) => v,
+        // F193 Stage C: stream the full extent from a healthy peer chunk-by-chunk
+        // straight into the file (peak = one FILE_IO_CHUNK_BYTES chunk) instead
+        // of buffering the whole extent in a Vec before writeback. stream_*
+        // succeeds only on a full sealed_length transfer (a short/failed source
+        // is retried against the next, all-failed → Err → CODE_ERROR), so the
+        // pre-this explicit "payload too short" check is subsumed.
+        let payload_len = match self
+            .stream_extent_from_sources(&extent_info, &[], &extent)
+            .await
+        {
+            Ok(n) => n,
             Err(err) => {
                 return Ok(rkyv_encode(&CodeResp {
                     code: CODE_ERROR,
@@ -4182,24 +4298,6 @@ impl ExtentNode {
                 }));
             }
         };
-
-        let want = extent_info.sealed_length as usize;
-        if raw_payload.len() < want {
-            return Ok(rkyv_encode(&CodeResp {
-                code: CODE_ERROR,
-                message: format!("copied payload too short: {} < {}", raw_payload.len(), want),
-            }));
-        }
-        let write_payload = Bytes::from(raw_payload[..want].to_vec());
-
-
-        extent.file_rc()
-            .set_len(0)
-            .await
-            .map_err(|e| (StatusCode::Internal, e.to_string()))?;
-        let payload_len = write_payload.len() as u64;
-        file_pwrite_chunked(extent.file_rc(), 0, write_payload).await
-            .map_err(|e| (StatusCode::Internal, e.to_string()))?;
         extent.file_rc().sync_data().await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
         extent.len.store(payload_len, Ordering::SeqCst);

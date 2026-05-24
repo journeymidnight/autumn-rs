@@ -1046,3 +1046,35 @@ background loop — use `en_spawn_supervised` (re-derive-safe) or
 `en_spawn_failstop` (moved-resource / durability). Request-triggered detached
 tasks (`run_recovery_task`, EC convert) are NOT loops — a panic there fails one
 operation (retried), so they stay as-is.
+
+---
+
+## F193 Stage C — streaming recovery / re_avali (extent-node memory)
+
+Replication recovery (`run_recovery_task`) and `handle_re_avali` stream the full
+sealed extent from a healthy peer **chunk-by-chunk** via `stream_extent_from_sources`
+instead of `fetch_full_extent_from_sources` (which materialized the whole extent
+in one `Vec<u8>` before writeback). Per chunk: read one `FILE_IO_CHUNK_BYTES`
+(256 MiB) range via `MSG_READ_BYTES` → `pwrite` at its offset → drop → next.
+**Peak resident = one chunk**, independent of extent size; one `sync_data` after
+the full write.
+
+Failover: `dest` is truncated to 0 before each source attempt, so a mid-stream
+source failure / short read abandons that source and the next restarts from
+offset 0 (the partial write is discarded — no corruption). Succeeds only on a
+full `sealed_length` transfer; all-sources-failed → `Err`.
+
+NOT changed (intentionally): `handle_copy_extent` already serves `[offset, size)`
+ranges (`file_pread_chunked`) and has no production originator (only the
+sibling-shard forward), and the recovery read path is `MSG_READ_BYTES`, not
+`MSG_COPY_EXTENT`. EC recovery (`run_ec_recovery_payload`) and the
+`handle_convert_to_ec` peer-copy still buffer — shard-sized / Stage-B territory
+(the subsequent `ec_encode` holds the full payload regardless). Bounding the EC
+*encode* peak was F193 Stage B — **CLEARED/won't-do** (2026-05-24): the EC-convert
+transient self-decays (Stage A jemalloc) and is concurrency-capped to 1 (F194), so
+the per-chunk `WriteShardReq` wire change isn't worth it. Reopen only on a real
+EC-convert OOM signal.
+
+**Invariant:** any new full-extent peer-copy-then-writeback path must stream via
+`stream_extent_from_sources` (or an equivalent read-chunk→write-chunk→drop loop),
+never `fetch_full_extent_from_sources` + buffer, unless it is shard-sized.

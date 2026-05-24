@@ -1,5 +1,37 @@
 Date: 2026-05-24
 TaskStatus: completed
+Task scope: F193 Stage C — streaming recovery / re_avali (extent-node memory).
+  User: "就只完成C就可以" (only Stage C). Plus prior ledger fixes this session:
+  F215 superseded-by-F210-C2, F131/F132 superseded-by-F186, F133 won't-do.
+
+Summary (F193 Stage C):
+  Replication recovery (run_recovery_task) + handle_re_avali no longer
+  fetch_full_extent_from_sources (whole-extent Vec) then write back. New
+  stream_extent_from_sources: read one FILE_IO_CHUNK_BYTES (256 MiB) range via
+  MSG_READ_BYTES -> pwrite at offset -> drop -> next. Peak resident = one chunk
+  regardless of extent size; one sync_data after. Failover: set_len(0) before
+  each source attempt, mid-stream failure/short read -> next source restarts
+  from 0 (no partial-write corruption); Ok only on full sealed_length transfer.
+  NOT touched (intentional): handle_copy_extent already serves [offset,size)
+  ranges + no production originator (recovery read = MSG_READ_BYTES); EC recovery
+  (run_ec_recovery_payload) + handle_convert_to_ec peer-copy keep buffering
+  (shard-sized / Stage-B — the ec_encode holds full payload anyway). fetch_full +
+  copy_bytes still used by those, not dead.
+  F193 now: Stage A + C done; Stage B (pipelined EC encode) CLEARED/won't-do per
+  user decision 2026-05-24 — EC-convert transient self-decays (A) + concurrency-
+  capped to 1 (F194), so the per-chunk WriteShardReq wire change isn't worth it.
+  F193 fully resolved (passes:true); reopen Stage B only on a real OOM signal.
+  Docs: feature_list F193 (Stage C SHIPPED, acceptance ✅, passes still partial);
+  stream/CLAUDE.md "F193 Stage C" section.
+
+Verification (F193 Stage C): build clean WITH and WITHOUT --features ucx (via
+  autumn-server); stream lib 56; recovery/failover/re_avali e2e
+  (system_extent_recovery/failover/ps_recovery/ec_failover) = 7/0 under
+  --include-ignored; full --include-ignored e2e running/clean. NOT committed yet.
+
+----- previous task (completed 2026-05-24) -----
+Date: 2026-05-24
+TaskStatus: completed
 Task scope: F229 — PS/EN background-loop resilience (extend F228's manager-only
   1A/1C onto the partition-server + extent-node). Plus reconciled the F226/F233
   duplicate (ledger-only). User: "a 然后 b" (a = F226/F233 merge, b = F229).
