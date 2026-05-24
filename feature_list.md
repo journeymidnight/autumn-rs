@@ -2933,7 +2933,21 @@ Background: autumn-rs 当前节点死亡判定模型过于激进——心跳 10s
 - **Acceptance:**
   - `concurrent_writers_during_split` re-enables strict ≤20% loss bound (matching F185 merge tolerance).
   - End-to-end smoke: split during 1000 concurrent puts → zero acknowledged-but-missing keys.
-- **passes:** false (deferred)
+- **passes:** true (SUPERSEDED by **F210-C2** — already implemented when the
+  `f222-f224-recovery-completion-fixes` branch merged 2026-05-23. This F215 entry
+  (filed on main 2026-05-21, before the branch landed) is a merge-collision stale
+  proposal, same family as F226/F233 / F222→F231 / F223→F232. **No `MSG_SPLIT_FREEZE`
+  RPC was needed** — the F215 proposal copied merge's cross-PS orchestration, but
+  split is single-PS, so F210-C2 does a simpler **PS-local self-freeze**:
+  `handle_split_part` runs on a spawned task, sets `frozen_for_split`
+  (`handle_incoming_req` rejects new Put/Delete with `CODE_UNAVAILABLE`), parks
+  `split_drain_ack`, lets `merged_partition_loop` drain pending+inflight+imm,
+  captures `commit_length` AFTER the drain, runs the existing `MSG_MULTI_MODIFY_SPLIT`
+  txn, unfreezes (30 s FREEZE_TTL backstop). The existing split APIs
+  (`MSG_SPLIT_PART` trigger + `MSG_MULTI_MODIFY_SPLIT` txn) are unchanged. Acceptance
+  met: `concurrent_writers_during_split` (asserts ALL concurrent writes survive —
+  stronger than the ≤20% bound above) passes in the full `--include-ignored` e2e.
+  See feature_list F210-C2.)
 
 ## P9 — autumn-kvcache (sglang HiCache L3 backend)
 
