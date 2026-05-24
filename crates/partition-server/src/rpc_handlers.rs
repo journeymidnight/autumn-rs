@@ -175,14 +175,14 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
 }
 
 /// F216 zero-copy GET (MSG_GET_ZC): returns the response as TWO segments —
-/// `(head, value)` where `head = [V0 frame header][ZC meta: code + value_len +
-/// value_crc32c]` and `value` ALIASES the RegPool buffer (R4: `Bytes::from_owner`
+/// `(head, value)` where `head = [CRC-less frame header][ZC meta: code +
+/// value_len + reserved]` and `value` ALIASES the RegPool buffer (R4: `Bytes::from_owner`
 /// from `resolve_value`, no copy). The ps-conn pushes `head` then `value` into
 /// `tx_bufs` so the single `write_vectored_all` emits them as one wire frame with
 /// NO concat copy — fully zero-copy EN->PS->client. (Pre-R4 this concatenated
 /// `[meta][value]` into a Vec, copied again by `encode_v0`.)
 ///
-/// ALL outcomes (incl errors) map to a V0 ZC response — a V1 error frame would
+/// ALL outcomes (incl errors) map to a CRC-less ZC response — a CRC frame would
 /// corrupt the client's recv-into-dest parsing. The status rides in the meta
 /// `code`; the SDK's get_into maps non-OK codes to refresh/retry. StatusCode
 /// discriminants align with the partition CODE_* for the GET-relevant cases
@@ -200,9 +200,9 @@ pub(crate) async fn handle_get_zc(
     (ps_zc_head(req_id, code, &value), value)
 }
 
-/// Build the MSG_GET_ZC response head = `[V0 frame header][zc_meta]`. The value
-/// is sent as a SEPARATE `Bytes` right after (aliasing the RegPool buffer) so it
-/// is never copied. Mirrors `extent_node::zc_read_head`. The header's
+/// Build the MSG_GET_ZC response head = `[CRC-less frame header][zc_meta]`. The
+/// value is sent as a SEPARATE `Bytes` right after (aliasing the RegPool buffer)
+/// so it is never copied. Mirrors `extent_node::zc_read_head`. The header's
 /// `payload_len` covers meta + value, so the client recvs the whole payload.
 pub(crate) fn ps_zc_head(req_id: u32, code: u8, value: &[u8]) -> Bytes {
     use bytes::BufMut;
@@ -211,7 +211,9 @@ pub(crate) fn ps_zc_head(req_id: u32, code: u8, value: &[u8]) -> Bytes {
     let mut head = bytes::BytesMut::with_capacity(autumn_rpc::HEADER_LEN + meta.len());
     head.put_u32_le(req_id);
     head.put_u8(MSG_GET_ZC);
-    head.put_u8(autumn_rpc::frame::FLAG_RESPONSE); // V0; value crc rides in the meta
+    // CRC-less frame (FLAG_CRC unset): recv-into-dest can't strip a trailer;
+    // value integrity is the transport's (F219).
+    head.put_u8(autumn_rpc::frame::FLAG_RESPONSE);
     head.put_u32_le(payload_len as u32);
     head.put_slice(&meta);
     head.freeze()

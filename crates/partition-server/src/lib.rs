@@ -3177,9 +3177,9 @@ fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Option<Bytes>)) {
 /// F219: the per-value ZC crc on the hot path is removed (it cost a full crc32c
 /// pass over every large value — the same memory-bandwidth the copy-elimination
 /// recovers — and duplicated the transport's own integrity: UCX NIC ICRC / TCP
-/// kernel segment checksum). The MSG_PUT_ZC frame is still V1, so its 4-byte
-/// frame-crc trailer is CONSUMED off the wire (stream alignment) but no longer
-/// validated. Normal (non-ZC) RPC frames keep their V1 frame-CRC (F165).
+/// kernel segment checksum). The MSG_PUT_ZC frame still carries the frame CRC,
+/// so its 4-byte frame-crc trailer is CONSUMED off the wire (stream alignment)
+/// but no longer validated. Normal (non-ZC) RPC frames keep their frame-CRC (F165).
 ///
 /// Cancel-safe on both transports: the `PooledBuf` is owned here for the whole
 /// recv. On UCX, `recv_into`'s `InflightSlot` drains the NIC before the buffer
@@ -3286,7 +3286,7 @@ async fn drain_zc_writes(
         }
         let value = Bytes::from_owner(pb);
         // F219: the ZC value crc on the hot path is removed. The MSG_PUT_ZC frame
-        // is still sent V1, so the 4-byte frame-crc trailer is on the wire — we
+        // still carries the frame CRC, so the 4-byte trailer is on the wire — we
         // CONSUME it to keep the byte stream aligned for the next frame, but no
         // longer compute/compare it on the PS (value integrity is the
         // transport's job: UCX NIC ICRC / TCP kernel segment checksum).

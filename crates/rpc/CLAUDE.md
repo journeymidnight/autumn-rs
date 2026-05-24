@@ -16,10 +16,30 @@ Custom binary RPC framework built on compio (completion-based I/O, thread-per-co
 |-------|------|-------------|
 | req_id | 4B | Multiplexing ID. Client picks, server echoes. 0 = fire-and-forget. |
 | msg_type | 1B | RPC method identifier (0-255 per service) |
-| flags | 1B | bit 0: is_response, bit 1: is_error, bit 2: stream_end |
-| payload_len | 4B | Payload size in bytes (max 512MB) |
+| flags | 1B | bit 0: is_response, bit 1: is_error, bit 2: stream_end, bit 3: crc |
+| payload_len | 4B | Payload size in bytes (max 512MB); includes the 4-byte CRC trailer when bit 3 is set |
 
 Error responses encode status as: `[status_code: u8][message bytes]`.
+
+### Per-frame CRC32C (F165; single frame protocol since F223)
+
+There is exactly **one** frame protocol — no "V0/V1" versions, no encoder toggle,
+no back-compat (the whole cluster restarts together). Every frame from
+`Frame::encode` carries a 4-byte CRC32C trailer over the payload: `FLAG_CRC`
+(bit 3) set, `payload_len` counts the trailer. The decoder verifies + strips it;
+mismatch → `FrameError::CrcMismatch`. Rationale (vs Kafka/HDFS/Ceph, which all
+ship checksums by default): a flipped `extent_id`/`eversion`/`revision` over TCP
+is a silent wrong-extent write or fence bypass that TCP's 16-bit checksum + NIC
+offload bugs can let through; on-disk CRC can't catch in-transit corruption. HW
+CRC32C (SSE4.2) is negligible on the small control frames it now covers.
+
+**The one CRC-less frame** is the zero-copy value response, built by
+`Frame::encode_no_crc` (and hand-built in production: `partition-server::ps_zc_head`
+/ `stream::zc_read_head`): `call_into_dest` / `call_into_pooled` recv the value
+straight into a caller dest and cannot strip a trailer, so it omits the CRC
+(FLAG_CRC unset) and relies on the transport's own integrity (UCX NIC ICRC / TCP
+kernel checksum, per F219). The decoder's `FLAG_CRC` dispatch branch exists to
+handle this one shape — a ZC design constraint, not a legacy version.
 
 ## Modules
 

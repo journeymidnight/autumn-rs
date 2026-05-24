@@ -1592,10 +1592,11 @@ async fn build_append_future(
 /// Build the async future that services a same-extent READ batch. Reads
 /// are processed sequentially inside ONE future — each pread is ~1µs and
 /// the responses are written back together.
-/// F216-E: build a MSG_READ_BYTES_ZC response head = `[V0 frame header]
-/// [zc_meta: code(1)+value_len(4)+value_crc32c(4)]`. The value (if any) is
+/// F216-E: build a MSG_READ_BYTES_ZC response head = `[CRC-less frame header]
+/// [zc_meta: code(1)+value_len(4)+reserved(4)]`. The value (if any) is
 /// pushed as a SEPARATE `Bytes` right after, so it aliases the pread buffer —
-/// no copy. `value` is borrowed only to compute the meta (crc + len).
+/// no copy. `value` is borrowed only to compute the meta len (the reserved
+/// field held a value crc before F219 removed it).
 fn zc_read_head(req_id: u32, code: u8, value: &[u8]) -> Bytes {
     use bytes::BufMut;
     let meta = autumn_rpc::client::encode_zc_meta(code, value);
@@ -1603,7 +1604,9 @@ fn zc_read_head(req_id: u32, code: u8, value: &[u8]) -> Bytes {
     let mut head = bytes::BytesMut::with_capacity(autumn_rpc::HEADER_LEN + meta.len());
     head.put_u32_le(req_id);
     head.put_u8(MSG_READ_BYTES_ZC);
-    head.put_u8(autumn_rpc::frame::FLAG_RESPONSE); // V0; value crc rides in the meta
+    // CRC-less frame (FLAG_CRC unset): recv-into-dest can't strip a trailer;
+    // value integrity is the transport's (F219).
+    head.put_u8(autumn_rpc::frame::FLAG_RESPONSE);
     head.put_u32_le(payload_len as u32);
     head.put_slice(&meta);
     head.freeze()

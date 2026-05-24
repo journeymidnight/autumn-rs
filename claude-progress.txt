@@ -1,5 +1,46 @@
-Date: 2026-05-21
+Date: 2026-05-24
 TaskStatus: completed
+Task scope: F223 — collapse RPC frame to a SINGLE permanent V1 (CRC) format;
+            delete the V0 encoder runtime toggle + back-compat (per user:
+            "参考别的系统到底应该打开 CRC 还是关闭；决定了就只留一个版本，不
+            考虑后向兼容"). Decision = CRC ON, single version. Also corrected
+            stale ledger status (F161/F163 passes:false→true via F165; F216-F
+            SUBSUMED by F219; renumbered the deferred per-link-transport entry
+            F219→F222 to fix an id collision with the completed F219).
+
+Current summary (F223):
+  DONE + verified by build + unit tests (no live cluster needed — wire-only,
+  behavior-neutral since the deleted toggle had zero callers; V1 was already
+  the always-on default).
+
+  frame.rs: encode / encode_header / encode_request_header now unconditionally
+  emit the CRC frame (FLAG_CRC + payload_len incl. 4-byte CRC trailer);
+  encode_v1 inlined into encode. Deleted V1_ENCODER_ENABLED OnceLock +
+  set_v1_encoder_enabled + v1_encoder_enabled. compute_payload_crc
+  de-dead-coded (used by client::send_vectored).
+
+  De-V0/V1 naming (per user "全是V1，老的V0就不要了，省得引起疑惑"): one frame
+  protocol, no version vocabulary. encode_v0 RENAMED -> encode_no_crc. All
+  "V0/V1 frame" comments + test names across frame.rs / partition_rpc.rs /
+  client.rs / rpc_handlers.rs / lib.rs / extent_node.rs(zc_read_head) reworded
+  to "CRC / CRC-less frame". (Unrelated F157 extent-.meta and F158 WAL-record
+  V0/V1 left untouched — different concepts.)
+
+  KEPT on purpose (NOT back-compat): encode_no_crc (CRC-less) + the decoder's
+  FLAG_CRC dispatch branch — they back the zero-copy value-response framing
+  (call_into_dest/call_into_pooled recv into a caller dest, can't strip a
+  trailer; integrity = transport's per F219). Production hand-builds that
+  CRC-less header in ps_zc_head / zc_read_head; encode_no_crc now only backs ZC
+  test fixtures.
+
+  Verification: cargo build --workspace --exclude autumn-fuse clean WITH and
+  WITHOUT --features ucx; rpc 16 / stream 56 / partition-server 146 lib tests
+  green. Docs: feature_list F223 + F165 follow-up note; crates/rpc/CLAUDE.md
+  wire-format section.
+
+  NOTE: code committed? NO — awaiting user go-ahead to commit.
+
+----- previous task (completed 2026-05-21) -----
 Task scope: F219 — TCP recv-side copy elimination (read + write), reusing the
             regpool + size threshold from F216-E, PLUS removal of the ZC-path
             value CRC from the PS hot path (per user: "把 PS 里面 hot path 的

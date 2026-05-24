@@ -80,9 +80,10 @@ pub const MSG_MERGE_FREEZE: u8 = 0x4E;
 pub const MSG_PULL_VP_REFS: u8 = 0x4F;
 
 // F216 zero-copy GET. Same request shape as MSG_GET (GetReq), but the response
-// is value-separable for recv-into-registered-dest: a V0 frame whose payload is
-// `[ZC meta: code(1)+value_len(4)+value_crc32c(4)][raw value]` (see
-// autumn_rpc::client::ZC_META_LEN). The client uses RpcClient::call_into_dest to
+// is value-separable for recv-into-registered-dest: a CRC-less frame whose
+// payload is `[ZC meta: code(1)+value_len(4)+reserved(4)][raw value]` (see
+// autumn_rpc::client::ZC_META_LEN; the reserved field held a value crc32c
+// before F219 removed it). The client uses RpcClient::call_into_dest to
 // land the value straight in its registered buffer (sglang page). Generic
 // MSG_GET keeps the rkyv GetResp form.
 pub const MSG_GET_ZC: u8 = 0x50;
@@ -96,7 +97,7 @@ pub const MSG_GET_ZC: u8 = 0x50;
 //   [key: key_len bytes][value: rest]
 // Sent via RpcClient::call_vectored(MSG_PUT_ZC, [meta, value]) — on UCX the
 // value iovec is zero-copy via rcache when its memory is ucp_mem_map-registered;
-// the V1 frame CRC (when enabled) covers [meta||value] just like MSG_PUT. The
+// the frame CRC covers [meta||value] just like MSG_PUT. The
 // response is a normal rkyv `PutResp` (tiny — no ZC framing needed back).
 pub const MSG_PUT_ZC: u8 = 0x51;
 

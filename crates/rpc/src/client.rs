@@ -41,12 +41,13 @@ use crate::frame::{Frame, FrameDecoder};
 // response uses a value-separable framing so the raw value is a contiguous
 // tail the receiver can land directly in `dest`:
 //
-//   frame payload = [ZC meta: code(1) value_len(4 LE) value_crc32c(4 LE)][value]
+//   frame payload = [ZC meta: code(1) value_len(4 LE) reserved(4 LE)][value]
 //
-// The frame is emitted V0 (no frame CRC) — integrity is the per-value crc32c in
-// the meta, verified over `dest` after recv. This keeps the corruption guard
-// without forcing the value through the V1 frame-CRC path (which would require a
-// copy). `ZC_META_LEN` bytes precede the value.
+// The frame is emitted CRC-less (no frame CRC) so the value tail can be recv'd
+// straight into `dest` without stripping a trailer. Value integrity is the
+// transport's (UCX NIC ICRC / TCP kernel segment checksum) — F219 removed the
+// per-value crc that used to ride in the meta's now-reserved 3rd field.
+// `ZC_META_LEN` bytes precede the value.
 
 /// Length of the zero-copy value-response meta prefix.
 pub const ZC_META_LEN: usize = 9;
@@ -69,7 +70,7 @@ pub const TCP_RECV_INTO_POOLED_MIN_BYTES: usize = 64 * 1024;
 /// value) was removed — it cost ~20% of a core at 8 MiB and duplicated the
 /// integrity already provided by the transport (UCX NIC ICRC / TCP kernel
 /// segment checksum). The 9-byte layout is kept (wire-compatible) so the field
-/// is reserved/zero rather than dropped. Normal RPC frames keep their V1
+/// is reserved/zero rather than dropped. Normal RPC frames keep their
 /// frame-CRC (F165) — only the ZC-read value crc is gone.
 pub fn encode_zc_meta(code: u8, value: &[u8]) -> [u8; ZC_META_LEN] {
     let mut m = [0u8; ZC_META_LEN];
@@ -446,9 +447,8 @@ impl RpcClient {
         }
         let req_id = self.next_req_id();
         let inner_payload_len: usize = payload_parts.iter().map(|p| p.len()).sum();
-        // F163: encode_request_header dispatches V0/V1 internally; under V1 it
-        // bumps the wire `payload_len` field by 4 to account for the trailer
-        // we append below.
+        // encode_request_header sets FLAG_CRC and bumps the wire `payload_len`
+        // field by 4 to account for the CRC trailer we append below.
         let hdr = Frame::encode_request_header(req_id, msg_type, inner_payload_len as u32);
 
         let (tx, rx) = oneshot::channel();
@@ -646,8 +646,8 @@ async fn read_loop(
 
             if is_into && reader.is_ucx() {
                 // ── UCX zero-copy recv-into-dest ──
-                // Value frame is V0: payload = [ZC meta][value]. Need header +
-                // meta buffered to parse the meta prefix; else read more.
+                // Value frame is CRC-less: payload = [ZC meta][value]. Need header
+                // + meta buffered to parse the meta prefix; else read more.
                 if (payload_len as usize) < ZC_META_LEN
                     || decoder.buffered_len() < crate::frame::HEADER_LEN + ZC_META_LEN
                 {
@@ -1051,13 +1051,13 @@ mod tests {
             let plen = u32::from_le_bytes(hdr[6..10].try_into().unwrap()) as usize;
             let mut req_payload = vec![0u8; plen];
             sock.read_exact(&mut req_payload).expect("read req payload");
-            // Build a V0 value response: payload = [ZC meta][value].
+            // Build a CRC-less value response: payload = [ZC meta][value].
             let meta = encode_zc_meta(0 /*OK*/, &value_srv);
             let mut payload = Vec::with_capacity(meta.len() + value_srv.len());
             payload.extend_from_slice(&meta);
             payload.extend_from_slice(&value_srv);
             let frame = Frame::response(req_id, 7, Bytes::from(payload));
-            let bytes = frame.encode_v0();
+            let bytes = frame.encode_no_crc();
             sock.write_all(&bytes).expect("write resp");
             // Hold the socket open briefly so the client finishes reading.
             std::thread::sleep(Duration::from_millis(50));
@@ -1101,7 +1101,7 @@ mod tests {
             let mut payload = Vec::with_capacity(meta.len() + value_srv.len());
             payload.extend_from_slice(&meta);
             payload.extend_from_slice(&value_srv);
-            let bytes = Frame::response(req_id, 15, Bytes::from(payload)).encode_v0();
+            let bytes = Frame::response(req_id, 15, Bytes::from(payload)).encode_no_crc();
             sock.write_all(&bytes).expect("write resp");
             std::thread::sleep(Duration::from_millis(50));
         });
@@ -1145,8 +1145,8 @@ mod tests {
             let mut payload = Vec::with_capacity(meta.len() + value_srv.len());
             payload.extend_from_slice(&meta);
             payload.extend_from_slice(&value_srv);
-            // V0 frame: payload = [ZC meta][value] (mirrors zc_read_head / ps_zc_head).
-            let bytes = Frame::response(req_id, 15, Bytes::from(payload)).encode_v0();
+            // CRC-less frame: payload = [ZC meta][value] (mirrors zc_read_head / ps_zc_head).
+            let bytes = Frame::response(req_id, 15, Bytes::from(payload)).encode_no_crc();
             sock.write_all(&bytes).expect("write resp");
             std::thread::sleep(Duration::from_millis(50));
         });

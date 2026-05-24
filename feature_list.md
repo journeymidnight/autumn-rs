@@ -1,6 +1,6 @@
 # autumn go→rust feature list
 
-**Last updated:** 2026-05-05
+**Last updated:** 2026-05-24
 
 **Rules:**
 - `passes` and `notes` are the only mutable fields after a feature is created.
@@ -2273,6 +2273,7 @@ Cleared by audit (no fix needed):
   - `cargo test -p autumn-partition-server --lib -- --test-threads=1`: 122/122 pass.
   - End-to-end V1 default: `cluster.sh reset 1` (no env var) + 3-key put/get round-trip ok. F164 dump confirms "no AUTUMN_* env vars at startup".
   - End-to-end V0 opt-out: `AUTUMN_RPC_FRAME_V1=0 cluster.sh reset 1` + put/get ok. F164 dump confirms `AUTUMN_RPC_FRAME_V1=0` propagated. Legacy V0 wire format used.
+- **Follow-up (F223, 2026-05-24):** the V0 opt-out described above is **GONE** — F223 collapsed the RPC frame to a single frame protocol (CRC always on) and deleted the runtime toggle. `AUTUMN_RPC_FRAME_V1` no longer does anything. The "V0/V1" vocabulary was also removed from code to avoid confusion: `encode_v1` was inlined into `encode`; the CRC-less `encode_v0` (the zero-copy value-response framing, not a toggle) was renamed `encode_no_crc`.
 - **passes:** true
 
 ### F164 · F163 V1 encoder UNBLOCKED — root-caused stale release binaries; ships startup env-dump diagnostic
@@ -2318,7 +2319,7 @@ Cleared by audit (no fix needed):
   - Build a wire-format observer (e.g., a simple proxy that logs every byte) to capture the exact byte sequence on a failing V1 connection. Compare against expected V1 frame layout to find the mismatch.
   - Audit ALL byte-producing paths systematically — every place that calls `writer.write_*` directly, not just those that obviously use `Frame::encode()`. Possible culprits: a CodeResp encoder, a hand-built error response, an autumn-rpc Server somewhere I haven't traced.
   - Verify `tracing::error!` from inside `compio::runtime::spawn`-ed handlers actually reaches the log file (this iteration found that diagnostics from inside `handle_ps_connection` don't surface — separate operational issue worth fixing first).
-- **passes:** false (V1 encoder rollout still pending — V0 default unchanged, V1 infrastructure shipped + tested in unit tests)
+- **passes:** true (infrastructure shipped + unit-tested; the "V1 encoder rollout still pending / default V0" caveat above is SUPERSEDED — F164 root-caused the cluster break (stale release binaries) and F165 flipped V1 to default-on, now the production default)
 
 ### F162 · MED-2 reader-pin protocol (closes spurious-NotFound on `handle_get` vs concurrent GC)
 - **Target:** Close the longest-deferred audit item — MED-2 — `handle_get → resolve_value` racing background GC's `punch_holes` on the same `log_stream` extent. The race window: `handle_get` reads a `ValuePointer` from an SST, drops the partition borrow, and awaits `read_bytes_from_extent` on log_stream. Without coordination, `run_gc` could call `punch_holes` on the same extent (after compaction has rewritten the SSTs that referenced it, decrementing `vp_table_refs` to 0), the manager enqueues a physical delete, MSG_DELETE_EXTENT lands at the extent-node, and the extent file is unlinked. The in-flight resolve_value's read RPC arrives at the extent-node and either (a) gets `CODE_NOT_FOUND` if the delete already processed — a spurious user-visible read failure on data that was perfectly valid at the moment the SST was looked up, OR (b) returns the original bytes via the still-open fd if the delete is in-flight — correct but timing-dependent.
@@ -2340,7 +2341,7 @@ Cleared by audit (no fix needed):
   - End-to-end: `cluster.sh reset 1` + 3-key put/get round-trip ok (the small-value fast path doesn't exercise the pin since values < VALUE_THROTTLE go inline; large-value VP path is exercised under perf-check).
 - **passes:** true
 
-### F161 · DEFERRED — hot-path RPC frame CRC32C (decoder support shipped, encoder withheld)
+### F161 · hot-path RPC frame CRC32C — SHIPPED via F163→F165 (was DEFERRED: decoder shipped, encoder withheld)
 - **Audit:** A focused audit on hot-path binary RPC frames (Audit 1: AppendReq/ReadBytesReq/CommitLengthReq + responses) verified 7 corruption surfaces — all rooted in the same gap: hot-path frames decode by hand without rkyv bytecheck (which F155 covered for control-plane RPCs only) and have no application-level CRC. TCP CRC catches most network bit flips but the per-segment 16-bit CRC is known to leak ~1 in 10⁸–10¹⁰ corrupt segments past detection (Stone & Partridge 2000); TX/RX checksum offload bugs in NIC drivers can present uncorrected bytes to the receiver. A flipped bit in `extent_id` / `eversion` / `commit` / `revision` would be silently trusted by `handle_append`'s decoder, landing a write on the wrong extent or bypassing the seal/owner-lock fence.
 - **Design:** Per-frame CRC32C trailer at the autumn-rpc layer covers all frames in one shot. Wire format: V1 frame sets a new `FLAG_CRC = 0x08` in the existing flags byte, includes a 4-byte CRC32C trailer at the end of payload, and the announced `payload_len` covers the trailer. Decoder dispatches: V1 (FLAG_CRC set) → verify CRC + strip trailer; V0 (FLAG_CRC unset) → legacy decode unchanged. Backward-compatible: V1 binary reads V0 data; V0 binary on V1 data fails inner-protocol decode (acceptable for restart-all-together).
 - **Status — DEFERRED:** A first-attempt encoder rollout broke the cluster. Bootstrap RPCs (manager-side) decoded correctly; PS-side puts failed with `Connection reset by peer` and the autumn-client receiver decoded a `flags=0x01` (V0) response from somewhere. The mismatched encoder/decoder state was not isolated within this iteration's budget. Reverted the encoder changes; the **decoder support + the `compute_payload_crc` helper + tests for the decoder path all remain in place**, so a future iteration can flip the encoder under controlled rollout (feature flag, decoder-first deploy, then encoder-flip after verify). Documenting the design + the 7 verified corruption surfaces here so the next attempt has full context.
@@ -2360,7 +2361,7 @@ Cleared by audit (no fix needed):
   - Add a `RPC_FRAME_VERSION` env var (`v0` default, `v1` opt-in) to gate the encoder.
   - Trace ALL Frame producers — especially in extent_node.rs and the manager rpc_handlers — to confirm every path goes through `Frame::encode()` (no hand-rolled byte building).
   - Add an integration test that exercises a full client → server → response round-trip with V1 enabled before flipping the default.
-- **passes:** false (deferred — encoder rollout pending)
+- **passes:** true (CRC32C hot-path protection now SHIPPED + default-on via F163→F164→F165; the "deferred — encoder rollout pending" status above is SUPERSEDED)
 
 ### F160 · F119-C tightening on `handle_copy_extent` + clears Audit 2 #2 (vp_refs race)
 - **F160 fix:** F119-C closed the read-side `eversion=0` silent-skip loophole in `handle_read_bytes` (line 2536) and `build_read_future` (line 1008) by dropping the `req.eversion > 0` clause from the comparison. The same loophole still existed in `handle_copy_extent`'s `Ok(None)` branch (line 3074) and `Err(_)` branch (line 3086), both used by `run_recovery_task` and `handle_re_avali`. Production callers fetch `ExtentInfo` from the manager before dispatch so eversion is normally fresh, but defense-in-depth: removing the `> 0 &&` clause closes a future-bug class where uninitialised eversion would bypass the EC-shape mismatch detection and copy shard bytes as if they were full payload (the F119-D corruption shape).
@@ -3174,7 +3175,7 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   unit tests + loopback_ucx 5/5 over RoCE).
 - **passes (full F216-E):** false (internal PS↔EN hops + python remaining).
 
-### F216-F · TCP read send-side copy elimination (value-separable framing, no registration)
+### F216-F (SUBSUMED by F219) · TCP read send-side copy elimination (value-separable framing, no registration)
 - **Status:** **not_completed** (defined 2026-05-21; design only — not implemented).
 - **Context / motivation:** F216-E made the **UCX** READ path zero-copy. The **TCP**
   read path still pays two avoidable EN-send-side costs that are transport-INdependent
@@ -3221,7 +3222,7 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
     CPU → small intra-host uptick is the expected signal; no regression).
   - `cargo test -p autumn-stream / -p autumn-rpc / -p autumn-partition-server`
     green; UCX path unaffected.
-- **passes:** false
+- **passes:** n/a (SUBSUMED by the completed F219 "TCP recv-side copy elimination"; see Note below — recv-side claim superseded, EN send-side win delivered for free)
 - **Note (F219):** F216-F's recv-side claim ("TCP recv is also unavoidably
   copy-bound … FrameDecoder accumulate") is **superseded** — F219 eliminates the
   FrameDecoder-accumulate copy on TCP recv via recv-into-PooledBuf. The EN
@@ -3320,9 +3321,10 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   - mmap path correctness: HF transformers `from_pretrained` on a 70B safetensors model succeeds end-to-end via autumn-fuse.
 - **passes:** false (deferred)
 
-## P10 — Per-link transport selection (F219)
+## P10 — Per-link transport selection (F222)
 
-### F219 (deferred / 设计未定) · Locality-aware per-link transport (TCP local / UCX remote)
+### F222 (deferred / 设计未定) · Locality-aware per-link transport (TCP local / UCX remote)
+- **Note:** renumbered from F219 → F222 on 2026-05-24 — the F219 id was reused by the *completed* "TCP recv-side copy elimination" feature; this deferred design takes the next free id.
 - **Trigger / 动机:** Today transport is a **process-global singleton** (`autumn_transport::init_with` / `current()`); a process listens AND dials with one transport. In a co-located deployment (PS + EN on the same host, only clients remote), forcing UCX everywhere makes the intra-host PS↔EN path go over UCX `cma`, which is **slower than TCP loopback** for small/medium messages (perf_check.sh's own note: UCX only wins ≳8 MiB over real RDMA; "at 4 KB it's pure overhead"). Observed live: local TCP > cma. We want transport chosen per link, not per process.
 - **决定的模型 (locality-based, NOT a static role matrix):**
   ```
@@ -3433,3 +3435,19 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   PS_PARTS_HINT=16 → cpuset=16-47 (max_parts=16), 16/16 partition listeners
   bound, 0 `core budget exhausted`, UCX put/get round-trips; override-wins is
   by the `-z` guard, presplit≤8 keeps default 8.)
+
+## P12 — RPC frame single-version cleanup (F223)
+
+### F223 · Collapse RPC frame to a single permanent V1 (CRC) format — delete V0 encoder toggle + back-compat
+- **Trigger / decision:** "参考别的系统，到底应该打开 CRC 还是关闭？决定了就只留一个版本，不考虑后向兼容" (2026-05-24). Decision = **keep frame CRC ON, single version.** Reference systems: Kafka (per-batch CRC32C, always on), HDFS (per-chunk CRC, end-to-end), Ceph (msgr2 + bluestore), Cassandra 4.0 / ScyllaDB (internode frame CRC). The decisive case is **control-plane field integrity over TCP**: a flipped bit in `extent_id` / `eversion` / `commit` / `revision` is a silent wrong-extent write or owner-lock fence bypass; TCP's 16-bit checksum + NIC offload bugs let such flips through (Stone & Partridge 2000), and on-disk CRC can't catch in-transit corruption. Post-F219 the perf cost is gone for the primary workload — large-value ZC paths already skip the value CRC (transport ICRC/kernel-cksum), so the remaining V1 frame CRC covers only small control/metadata frames where CRC32C is nanoseconds. F165 had made V1 the default but left the V0 encoder + `AUTUMN_RPC_FRAME_V1` runtime toggle as dead, opt-out machinery (the setter had ZERO callers).
+- **Scope (single-version收口 + de-V0/V1 naming):**
+  - `crates/rpc/src/frame.rs`: `encode` / `encode_header` / `encode_request_header` now **unconditionally** emit the CRC frame (FLAG_CRC set, `payload_len += 4`). `encode_v1` inlined into `encode` (deleted as a separate method). Deleted the runtime toggle: `V1_ENCODER_ENABLED` OnceLock + `set_v1_encoder_enabled` + `v1_encoder_enabled`. `compute_payload_crc` lost its stale `#[allow(dead_code)]` / "currently unused" comment (it's used by `client::send_vectored`).
+  - **De-confused the naming (per user: "全是V1，老的V0就不要了，省得引起疑惑"):** removed all "V0/V1" *frame* vocabulary from code — there is now one frame protocol, not two versions. `encode_v0` → renamed **`encode_no_crc`** (it is the CRC-less zero-copy value-response framing, NOT an old version). All doc comments / test names in `frame.rs`, plus ZC-framing comments in `rpc/partition_rpc.rs`, `rpc/client.rs`, `partition-server/{rpc_handlers,lib}.rs`, `stream/extent_node.rs` (`zc_read_head`) reworded from "V0/V1 frame" → "CRC / CRC-less frame". (The unrelated F157 extent-`.meta` V0/V1 and F158 WAL-record V0/V1 are different concepts — left untouched.)
+  - **Kept on purpose:** `encode_no_crc` (CRC-less) + the decoder's `FLAG_CRC` dispatch branch + `FrameError::CrcMissing/CrcMismatch`. These are **not** back-compat — they back the zero-copy value response (`call_into_dest` / `call_into_pooled` recv the value straight into a caller dest and cannot strip a CRC trailer; integrity there is the transport's, per F219). Production hand-builds that CRC-less header in `partition-server::ps_zc_head` + `stream::zc_read_head`; `encode_no_crc` now only backs ZC test fixtures.
+  - No CLI flag / cluster.sh change needed — F195 already removed the `AUTUMN_RPC_FRAME_V1` env read; `set_v1_encoder_enabled` had no caller, so removal is behavior-neutral (CRC was already always-on).
+- **Back-compat:** intentionally NONE. A new binary cannot decode a CRC-less *normal* frame from an old pre-CRC peer → whole cluster must restart together (already the deploy model; frames are wire-only, never persisted, so no on-disk migration).
+- **Acceptance:**
+  - `cargo build --workspace --exclude autumn-fuse` clean WITH and WITHOUT `--features ucx`.
+  - `cargo test -p autumn-rpc --lib` (16) + `-p autumn-stream --lib` (56) + `-p autumn-partition-server --lib` (146) all green.
+  - `grep -rn "set_v1_encoder_enabled\|v1_encoder_enabled\|AUTUMN_RPC_FRAME_V1" crates/ --include="*.rs"` returns only the two explanatory doc-comment mentions in frame.rs. No `\bV0\b`/`\bV1\b` left in the RPC-frame code paths (only the unrelated extent-meta / WAL-record uses remain).
+- **passes:** true (2026-05-24 — builds clean both feature sets; rpc 16 / stream 56 / partition-server 146 green; toggle removed, "V0/V1" frame naming removed, ZC CRC-less framing + decoder dual-path preserved).
