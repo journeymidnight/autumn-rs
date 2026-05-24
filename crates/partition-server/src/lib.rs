@@ -4283,6 +4283,16 @@ async fn partition_loop(
     // F120-C — set when `drain_rx` delivered a request; once set, stop
     // pulling new items from `req_rx` and head for the tail-drain block.
     let mut drain_ack: Option<oneshot::Sender<()>> = None;
+    // F228-fix: set once `drain_rx` returns EOF (the PartitionHandle was
+    // dropped — region_sync reopened/removed this partition). The handle's
+    // `drain_tx` drops BEFORE the ps-conn-held `req_tx` clones do, so for a
+    // window (potentially forever, if a client connection stays open) the
+    // idle select would keep selecting the now-closed `drain_rx` — which
+    // returns `Ready(None)` instantly and busy-spins at ~95% CPU (the
+    // `split_merge_split_with_interleaved_writes` hang). Once closed we stop
+    // polling it and keep serving `req_rx` until IT closes (4457), the
+    // intended reopen/shutdown exit signal (see ~2560 comment).
+    let mut drain_closed = false;
 
     // F210-C1: switched from FuturesUnordered to FuturesOrdered. Phase 2
     // futures still execute concurrently; only the yield order changes.
@@ -4445,28 +4455,60 @@ async fn partition_loop(
             // the entire FREEZE_TTL window.
             let req_fut = req_rx.next();
             let wake_fut = split_wake_rx.next();
-            let drain_fut = drain_rx.next();
-            futures::pin_mut!(req_fut, wake_fut, drain_fut);
-            // First race req vs wake; whichever wins, also poll drain
-            // via now_or_never below to fold the third receiver in.
-            match select(req_fut, select(wake_fut, drain_fut)).await {
-                Either::Left((maybe_req, _)) => match maybe_req {
-                    Some(req) => {
-                        handle_incoming_req(req, &mut pending, &part, &routing).await;
-                    }
-                    None => break,
-                },
-                Either::Right((inner, _)) => match inner {
-                    Either::Left(_) => {
-                        // split wake — just iterate; top-of-loop drain
-                        // check will fire.
-                    }
-                    Either::Right((maybe_drain, _)) => {
-                        if let Some(ack) = maybe_drain {
-                            drain_ack = Some(ack);
+            futures::pin_mut!(req_fut, wake_fut);
+            if drain_closed {
+                // F228-fix: drain_rx already EOF (handle dropped on reopen).
+                // Polling it again returns `Ready(None)` instantly and would
+                // busy-spin, so race only req_rx vs split-wake. The loop
+                // still exits on req_rx EOF (the intended signal).
+                match select(req_fut, wake_fut).await {
+                    Either::Left((maybe_req, _)) => match maybe_req {
+                        Some(req) => {
+                            handle_incoming_req(req, &mut pending, &part, &routing).await;
                         }
+                        None => break,
+                    },
+                    Either::Right((_maybe_wake, _)) => {
+                        // split/merge freeze wake (or closed) — just iterate.
                     }
-                },
+                }
+            } else {
+                let drain_fut = drain_rx.next();
+                futures::pin_mut!(drain_fut);
+                // First race req vs wake; whichever wins, also poll drain
+                // via the inner select to fold the third receiver in.
+                match select(req_fut, select(wake_fut, drain_fut)).await {
+                    Either::Left((maybe_req, _)) => match maybe_req {
+                        Some(req) => {
+                            handle_incoming_req(req, &mut pending, &part, &routing).await;
+                        }
+                        None => break,
+                    },
+                    Either::Right((inner, _)) => match inner {
+                        Either::Left(_) => {
+                            // split/merge freeze wake — just iterate;
+                            // top-of-loop drain check will fire.
+                        }
+                        Either::Right((maybe_drain, _)) => match maybe_drain {
+                            Some(ack) => drain_ack = Some(ack),
+                            // F228-fix: drain_rx EOF = the PartitionHandle was
+                            // dropped (region_sync removed/reopened this
+                            // partition: merge victim, split reopen, PS
+                            // eviction). The handle's `drain_tx` drops BEFORE
+                            // the ps-conn-held `req_tx` clones, so we'd keep
+                            // re-selecting the closed `drain_rx` (instant
+                            // `Ready(None)`) → 95% CPU busy-spin until req_rx
+                            // finally closes — forever if a client connection
+                            // stays open (the
+                            // `split_merge_split_with_interleaved_writes`
+                            // hang). Mark it closed and stop polling it; we
+                            // still serve req_rx and exit on its EOF. Do NOT
+                            // break here — req_rx may still have in-flight /
+                            // queued requests that must be served first.
+                            None => drain_closed = true,
+                        },
+                    },
+                }
             }
         } else {
             let req_fut = req_rx.next();
@@ -4508,8 +4550,12 @@ async fn partition_loop(
                 }
             }
             // Non-blocking drain check after either branch.
-            if let Some(Some(ack)) = drain_fut.now_or_never() {
-                drain_ack = Some(ack);
+            // F228-fix: also latch `drain_closed` on EOF so the idle branch
+            // doesn't busy-spin on the closed receiver next iteration.
+            match drain_fut.now_or_never() {
+                Some(Some(ack)) => drain_ack = Some(ack),
+                Some(None) => drain_closed = true,
+                None => {}
             }
         }
 

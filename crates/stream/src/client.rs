@@ -794,7 +794,8 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
         // the node so the next alloc skips it.
         // F192: same failure pushes a manager-side report so the
         // global view catches up to the per-stream truth without
-        // waiting for the next 10 s `disk_status_update_loop` tick.
+        // waiting for the next `node_health_loop` df tick (F222: 2 s;
+        // was the 10 s `disk_status_update_loop`).
         if let Some(idx) = bad_replica_idx {
             if let Some(&nid) = replica_node_ids.get(idx) {
                 state.mark_bad_node(nid);
@@ -1761,7 +1762,14 @@ impl StreamClient {
                 0,
             )
         } else {
-            let commit_val = self.current_commit(&tail).await.unwrap_or(0);
+            // F227: propagate a commit_length failure instead of seeding 0.
+            // Pre-F227 `unwrap_or(0)` turned an inability to determine the
+            // committed length (e.g. a replica down) into cursor=0 — the
+            // next append then sent `header.commit=0` and the EN truncated
+            // EVERY replica back to 0, destroying all pre-existing acked
+            // data. A failure here must refuse init so the caller retries
+            // (Ok(0) is still a legitimate "fresh empty extent").
+            let commit_val = self.current_commit(&tail).await?;
             (tail, commit_val)
         };
         let mut tx_clone = tx.clone();
@@ -1784,14 +1792,19 @@ impl StreamClient {
     /// Query commit length from all replicas (min). Called on first append
     /// to an existing extent (commit==0) to avoid truncating pre-existing data.
     ///
-    /// F156: requires majority quorum to respond before returning the min.
-    /// Pre-F156 the function returned the min of WHATEVER subset responded
-    /// (down to a single replica), which could commit at a position higher
-    /// than what the unreachable replicas actually held — if the lone
-    /// responder then crashed before the unreachable replicas recovered
-    /// those bytes via re-replication, the data was permanently lost.
-    /// Required quorum = ⌊N/2⌋+1 (majority): R=1→1, R=2→2, R=3→2,
-    /// R=4→3, R=5→3. Mirrors Raft/Paxos majority semantics.
+    /// F227: NO quorum. This is a WAS stream layer — the append path is
+    /// all-replica-ACK (`apply_completion` acks only when every replica
+    /// wrote the record), so the committed length must be derived from ALL
+    /// replicas. A subset `min` (the pre-F227 majority-quorum) can sit
+    /// BELOW the acked length when it includes a short / catching-up
+    /// replica (→ next append's `header.commit` truncates acked data on
+    /// the up-to-date replicas → silent loss), or ABOVE it when it
+    /// excludes a member (→ keeps un-acked data). We require every replica
+    /// to respond and take the min over all of them; on any miss we return
+    /// `Err` so the caller refuses to seed a cursor (NEVER seed a subset
+    /// min — see `ensure_tail_initialised`). A permanently-dead replica is
+    /// reconfigured out of the set by the manager seal + operator
+    /// fence/recovery lifecycle, after which all remaining members respond.
     async fn current_commit(&self, tail: &StreamTail) -> Result<u32> {
         let mut min_len: Option<u32> = None;
         let mut success: usize = 0;
@@ -1822,14 +1835,13 @@ impl StreamClient {
             success += 1;
             min_len = Some(min_len.map_or(resp.length, |cur| cur.min(resp.length)));
         }
-        let quorum = total / 2 + 1;
-        if success < quorum {
+        // F227: require ALL replicas to respond — no quorum (see fn doc).
+        if success < total {
             return Err(anyhow!(
-                "insufficient quorum for commit_length on extent {}: got {} of {} (need {})",
+                "commit_length on extent {}: only {}/{} replicas responded (need all)",
                 tail.extent.extent_id,
                 success,
-                total,
-                quorum
+                total
             ));
         }
         min_len.ok_or_else(|| anyhow!("no available replica for commit_length"))
@@ -1934,15 +1946,20 @@ impl StreamClient {
         }
     }
 
-    /// F178 Phase 2: wait until the per-extent fsync coalescer on **quorum**
+    /// F178 Phase 2: wait until the per-extent fsync coalescer on **all**
     /// of `extent_id`'s replicas has flushed bytes covering `min_offset`.
     ///
-    /// Mirrors the F156 `current_commit` quorum pattern: the result is the
-    /// minimum of the responding replicas' `last_synced` values; we treat
-    /// the wait as satisfied when at least `⌊N/2⌋ + 1` replicas have
-    /// `synced >= min_offset`. Sealed extents on the server side already
-    /// report `max(last_synced, sealed_length)`, so this trivially
-    /// succeeds against sealed sources.
+    /// F227: NO quorum. The append path is all-replica-ACK, so a VP at
+    /// `min_offset` is durable on every replica the moment its append
+    /// acked; the flush barrier must therefore require ALL replicas to
+    /// have synced past `min_offset` before the SST that names the VP is
+    /// checkpointed — a fsync-quorum (the pre-F227 `⌊N/2⌋+1`) could
+    /// publish an SST whose VP bytes are durable on only a subset, so a
+    /// later min-commit truncation on the un-synced replica could orphan
+    /// the VP. On a healthy cluster this is satisfied immediately (all-ACK
+    /// already made it durable everywhere). Sealed extents report
+    /// `max(last_synced, sealed_length)`, so this trivially succeeds
+    /// against sealed sources.
     ///
     /// Polls every `AUTUMN_STREAM_SYNCED_POLL_MS` (default 2 ms — matches
     /// the coalescer cadence), bounded by
@@ -1974,7 +1991,8 @@ impl StreamClient {
                 "await_extent_synced_to: no replica addrs for extent {extent_id}"
             ));
         }
-        let quorum = total / 2 + 1;
+        // F227: require ALL replicas synced — no quorum (see fn doc).
+        let required = total;
 
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
@@ -1984,14 +2002,14 @@ impl StreamClient {
                     Ok(Some(synced)) if synced >= min_offset => covered += 1,
                     _ => {}
                 }
-                if covered >= quorum {
-                    return Ok(());
-                }
+            }
+            if covered >= required {
+                return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(anyhow!(
                     "await_extent_synced_to: timeout waiting for extent {extent_id} to sync \
-                     past offset {min_offset} (quorum {covered}/{quorum} of {total})"
+                     past offset {min_offset} (all-replica {covered}/{required})"
                 ));
             }
             compio::time::sleep(Duration::from_millis(poll_ms)).await;

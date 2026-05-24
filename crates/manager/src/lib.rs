@@ -324,10 +324,29 @@ impl ConnPool {
         if let Some(conn) = self.conns.borrow().get(&addr) {
             return Ok(conn.clone());
         }
-        let conn = Rc::new(RefCell::new(RpcConn::connect(addr).await?));
+        // F228 (1A): bound the TCP connect. `call_timeout` wraps only the
+        // request future, NOT this connect — a hung connect to a dead /
+        // firewalled peer would wedge the calling background loop forever
+        // despite call_timeout. Default 5 s, env AUTUMN_MGR_CONNECT_TIMEOUT_MS.
+        let connect_to = connect_timeout();
+        let raw = compio::time::timeout(connect_to, RpcConn::connect(addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("connect to {addr} timed out after {connect_to:?}"))??;
+        let conn = Rc::new(RefCell::new(raw));
         self.conns.borrow_mut().insert(addr, conn.clone());
         Ok(conn)
     }
+}
+
+/// F228 (1A): TCP connect timeout for the manager's ConnPool. See
+/// `get_or_connect`. Env `AUTUMN_MGR_CONNECT_TIMEOUT_MS` (default 5 s).
+fn connect_timeout() -> std::time::Duration {
+    let ms = std::env::var("AUTUMN_MGR_CONNECT_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5_000)
+        .max(500);
+    std::time::Duration::from_millis(ms)
 }
 
 fn parse_addr(addr: &str) -> Result<SocketAddr> {
@@ -604,72 +623,99 @@ impl AutumnManager {
 
     /// Start background loops. Called from `new_with_etcd` and `serve`.
     /// Idempotent — safe to call multiple times.
+    /// F228 (1C): spawn a manager background loop with panic-isolation +
+    /// auto-restart. Pre-F228 each loop was a bare
+    /// `compio::runtime::spawn(...).detach()` with NO supervision: a panic
+    /// (e.g. a RefCell double-borrow, an index out of bounds) silently
+    /// killed just that one task while the rest of the manager kept
+    /// running — there was no log, no restart, no signal. That is exactly
+    /// the failure shape that let the node_health_loop freeze go
+    /// undetected for ~11 minutes in production. The supervisor wraps the
+    /// loop future in `catch_unwind`; on a panic OR an unexpected return
+    /// it logs ERROR (loud, greppable) and restarts the loop after a 1 s
+    /// backoff, cloning a fresh manager handle each time.
+    ///
+    /// NOTE: `catch_unwind` cannot rescue a *hung* `.await` — a stuck
+    /// future never returns, so the supervisor would wait forever too.
+    /// Hangs are prevented separately by F228 (1A): every await a loop can
+    /// reach is now bounded (etcd `unary_call` timeout, ConnPool connect +
+    /// request timeouts). The two together close both failure modes.
+    fn spawn_supervised<F, Fut>(name: &'static str, make: F)
+    where
+        F: Fn() -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        compio::runtime::spawn(async move {
+            use futures::future::FutureExt;
+            loop {
+                let outcome = std::panic::AssertUnwindSafe(make()).catch_unwind().await;
+                match outcome {
+                    Ok(()) => tracing::error!(
+                        bg_loop = name,
+                        "manager background loop returned unexpectedly; restarting in 1s"
+                    ),
+                    Err(_) => tracing::error!(
+                        bg_loop = name,
+                        "manager background loop PANICKED; restarting in 1s"
+                    ),
+                }
+                compio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        })
+        .detach();
+    }
+
     pub fn start_runtime_tasks(&self) {
         if self.runtime_started.get() {
             return;
         }
         self.runtime_started.set(true);
 
+        // F228 (1C): every loop runs under spawn_supervised (panic ->
+        // ERROR log + restart) instead of a bare detached spawn.
+
         // Leader election only needed with etcd (non-etcd is always leader).
         if self.etcd.is_some() {
             let mgr = self.clone();
-            compio::runtime::spawn(async move {
-                mgr.leader_election_loop().await;
-            })
-            .detach();
+            Self::spawn_supervised("leader_election", move || mgr.clone().leader_election_loop());
         }
 
         let mgr = self.clone();
-        compio::runtime::spawn(async move {
-            mgr.recovery_dispatch_loop().await;
-        })
-        .detach();
+        Self::spawn_supervised("recovery_dispatch", move || {
+            mgr.clone().recovery_dispatch_loop()
+        });
+
+        // F222: single df caller — merges the former recovery_collect_loop
+        // (2 s, apply done_tasks) and disk_status_update_loop (10 s, disk +
+        // node liveness). Eliminates the race where the empty-`tasks` df
+        // drained the EN's recovery_done and discarded the completions.
+        let mgr = self.clone();
+        Self::spawn_supervised("node_health", move || mgr.clone().node_health_loop());
 
         let mgr = self.clone();
-        compio::runtime::spawn(async move {
-            mgr.recovery_collect_loop().await;
-        })
-        .detach();
+        Self::spawn_supervised("ec_conversion_dispatch", move || {
+            mgr.clone().ec_conversion_dispatch_loop()
+        });
 
         let mgr = self.clone();
-        compio::runtime::spawn(async move {
-            mgr.disk_status_update_loop().await;
-        })
-        .detach();
-
-        let mgr = self.clone();
-        compio::runtime::spawn(async move {
-            mgr.ec_conversion_dispatch_loop().await;
-        })
-        .detach();
-
-        let mgr = self.clone();
-        compio::runtime::spawn(async move {
-            mgr.ps_liveness_check_loop().await;
-        })
-        .detach();
+        Self::spawn_supervised("ps_liveness_check", move || {
+            mgr.clone().ps_liveness_check_loop()
+        });
 
         // F109: physical extent file deletion fanout.
         let mgr = self.clone();
-        compio::runtime::spawn(async move {
-            mgr.extent_delete_loop().await;
-        })
-        .detach();
+        Self::spawn_supervised("extent_delete", move || mgr.clone().extent_delete_loop());
 
         // F210-G2: persisted-retry slow loop for deletes that exhausted
         // the primary 60-attempt budget.
         let mgr = self.clone();
-        compio::runtime::spawn(async move {
-            mgr.extent_delete_retry_loop().await;
-        })
-        .detach();
+        Self::spawn_supervised("extent_delete_retry", move || {
+            mgr.clone().extent_delete_retry_loop()
+        });
 
         // F183: policy advisory tick.
         let mgr = self.clone();
-        compio::runtime::spawn(async move {
-            mgr.policy_tick_loop().await;
-        })
-        .detach();
+        Self::spawn_supervised("policy_tick", move || mgr.clone().policy_tick_loop());
 
         // F207-D: stale-marker WARN sweep. Iterates the inflight ledger
         // every 5 minutes and logs WARN for any marker > 24h old.
@@ -678,10 +724,9 @@ impl AutumnManager {
         // Python ops `--clear-stale-inflight extent <id>` script after
         // investigating.
         let mgr = self.clone();
-        compio::runtime::spawn(async move {
-            mgr.extent_inflight_stale_sweep_loop().await;
-        })
-        .detach();
+        Self::spawn_supervised("extent_inflight_stale_sweep", move || {
+            mgr.clone().extent_inflight_stale_sweep_loop()
+        });
     }
 
     /// F183: every POLICY_TICK_INTERVAL_SEC, leader recomputes split/merge
@@ -1723,7 +1768,10 @@ impl AutumnManager {
 
     // ── Background loops ───────────────────────────────────────────────
 
-    async fn ps_liveness_check_loop(&self) {
+    // F228 (1C): takes `self` by value (was `&self`) for uniformity with the
+    // other 8 supervised loops — `spawn_supervised` clones a fresh handle per
+    // restart, so the loop future must own it.
+    async fn ps_liveness_check_loop(self) {
         const CHECK_INTERVAL: Duration = Duration::from_secs(2);
         const PS_DEAD_TIMEOUT: Duration = Duration::from_secs(10);
 

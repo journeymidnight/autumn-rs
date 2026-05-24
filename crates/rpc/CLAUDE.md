@@ -21,7 +21,7 @@ Custom binary RPC framework built on compio (completion-based I/O, thread-per-co
 
 Error responses encode status as: `[status_code: u8][message bytes]`.
 
-### Per-frame CRC32C (F165; single frame protocol since F223)
+### Per-frame CRC32C (F165; single frame protocol since F232)
 
 There is exactly **one** frame protocol — no "V0/V1" versions, no encoder toggle,
 no back-compat (the whole cluster restarts together). Every frame from

@@ -420,20 +420,43 @@ impl PsRouter {
     /// pointing at a dead FD. Test-scale cost of a reconnect per call
     /// is negligible.
     pub async fn client_for(&self, part_id: u64) -> Rc<autumn_rpc::client::RpcClient> {
-        // Fetch latest part_addrs from manager.
-        let mgr = RpcClient::connect(self.mgr_addr).await.expect("connect mgr");
-        let regions = get_regions(&mgr).await;
-        let mut addr: Option<SocketAddr> = None;
-        for (pid, part_addr) in regions.part_addrs {
-            if pid == part_id {
-                if let Ok(sa) = part_addr.parse::<SocketAddr>() {
-                    addr = Some(sa);
+        // Retry with region re-resolution: a partition can be mid-reopen
+        // (split / merge widen its rg → region_sync drops + reopens it on a
+        // fresh per-partition listener), during which its addr is briefly
+        // unpublished or its listener not yet bound. The production SDK
+        // handles this by refreshing regions + reconnecting
+        // (`call_ps_for_part`, MAX_PS_REFRESHES); this test router mirrors
+        // that instead of panicking on the first transient miss.
+        let mut last_err = String::new();
+        for _ in 0..50 {
+            let mgr = match RpcClient::connect(self.mgr_addr).await {
+                Ok(m) => m,
+                Err(e) => {
+                    last_err = format!("connect mgr: {e}");
+                    compio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
                 }
-                break;
+            };
+            let regions = get_regions(&mgr).await;
+            let mut addr: Option<SocketAddr> = None;
+            for (pid, part_addr) in regions.part_addrs {
+                if pid == part_id {
+                    if let Ok(sa) = part_addr.parse::<SocketAddr>() {
+                        addr = Some(sa);
+                    }
+                    break;
+                }
             }
+            match addr {
+                Some(target) => match RpcClient::connect(target).await {
+                    Ok(c) => return c,
+                    Err(e) => last_err = format!("connect part {part_id} @ {target}: {e}"),
+                },
+                None => last_err = format!("part {part_id} not in regions yet"),
+            }
+            compio::time::sleep(Duration::from_millis(100)).await;
         }
-        let target = addr.unwrap_or(self.fallback_addr);
-        RpcClient::connect(target).await.expect("connect partition")
+        panic!("connect partition {part_id} after retries: {last_err}");
     }
 }
 

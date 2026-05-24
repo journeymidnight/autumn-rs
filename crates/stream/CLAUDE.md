@@ -279,9 +279,18 @@ Step 5 (commit-based truncation) is the key to consistency: it effectively repla
 
 The `StreamClient` computes `commit = min(commit_length on all replicas)` before each append. Any replica that got ahead (e.g., partially acknowledged data before a crash) is truncated back to the consensus point on the next append. Per-node durability comes from the F178 Phase 1 fsync coalescer — the first must_sync waiter at an idle extent triggers `sync_data` immediately (event-driven, RocksDB group-commit style); subsequent appends that complete before the syscall returns are durable on the same syscall. After F150 Phase A- there is no separate WAL file.
 
-**F178 Phase 2 — flush-time durability barrier (replaces F150 Phase B's rotation barrier).** Pre-F178 the partition layer's `start_write_batch` promoted `must_sync=true` on the rotation-triggering batch, putting the entire memtable's worth of fsync cost on one unlucky writer. Post-F178 every Put pays exactly one coalesce window (1-5 ms) regardless of rotation; the durability wait moves to `flush_one_imm` via `MSG_SYNCED_LENGTH`. The flush calls `await_log_synced_to(vp_extent_id, vp_offset)` BEFORE uploading the SST — quorum-min of replicas must report `last_synced >= vp_offset`. On the happy path this waits ≈ 0 because the coalescer fires every 2 ms and flush builds the SST in parallel; on the worst case it waits one coalesce window. Flush is background, so this is invisible to clients.
+**F178 Phase 2 — flush-time durability barrier (replaces F150 Phase B's rotation barrier).** Pre-F178 the partition layer's `start_write_batch` promoted `must_sync=true` on the rotation-triggering batch, putting the entire memtable's worth of fsync cost on one unlucky writer. Post-F178 every Put pays exactly one coalesce window (1-5 ms) regardless of rotation; the durability wait moves to `flush_one_imm` via `MSG_SYNCED_LENGTH`. The flush calls `await_log_synced_to(vp_extent_id, vp_offset)` BEFORE uploading the SST — **F227: ALL replicas** (was quorum-min) must report `last_synced >= vp_offset`. On the happy path this waits ≈ 0 because the append already acked all-replicas (and the coalescer fires every 2 ms while flush builds the SST in parallel); on the worst case it waits one coalesce window. Flush is background, so this is invisible to clients.
 
-**F156: majority quorum required.** `commit_length_for_extent` and `current_commit` (`crates/stream/src/client.rs`) require `success >= ⌊N/2⌋ + 1` replica responses before treating their min as authoritative. Pre-F156 they accepted any subset — even a single response — which could commit at a position only the lone responder held. If that responder then died before re-replicating to the unreachable peers, the data was permanently lost. With quorum: writes halt under majority failure rather than silently risking data loss; degraded operation (≥1 dead but quorum reachable) continues normally.
+**F156 (SUPERSEDED by F227): majority quorum required.** F156 made `current_commit` require `success >= ⌊N/2⌋ + 1` before treating its min as authoritative. **F227 removed this — there must be NO quorum on the commit path.**
+
+**F227: all-replica, no quorum.** This is a WAS stream layer: the append path is all-replica-ACK (`apply_completion` acks only when every replica wrote), so the committed length must be derived from ALL replicas, not a quorum subset. A subset `min` can sit BELOW the acked length (include a short / catching-up replica → the next append's `header.commit` truncates acked data on the up-to-date replicas → silent loss) or ABOVE it (exclude a member → keep un-acked data). The majority-quorum was the bug, not the fix. F227 changes:
+- `current_commit` requires ALL replicas to respond (else `Err`); `ensure_tail_initialised` propagates that `Err` instead of the old `unwrap_or(0)` — seeding cursor 0 made the next append's `header.commit=0` truncate EVERY replica to 0 (catastrophic). `Ok(0)` (genuinely empty extent) still seeds nothing.
+- `await_extent_synced_to` (flush barrier) requires ALL replicas synced past `vp_offset` (was `⌊N/2⌋+1` of `last_synced`); on a healthy cluster this is already satisfied because the append acked all-replicas.
+- Manager-side seal/commit (`handle_stream_alloc_extent` / `handle_check_commit_length`) take `min` over COMMITTED members only (catching-up = in-flight Recovery, excluded), require all committed to respond, no quorum. See `crates/manager/CLAUDE.md` note 28.
+
+F156's stated worry ("commit at a position only one replica holds") was really a durability concern (operating at RF=1), conflated with commit-length correctness; under all-replica-ACK the committed prefix is on every replica, so `min` over the reachable committed members is always ≥ acked. Liveness when a node is down is handled by the manager seal + operator fence → recovery (reconfigure the dead member out), not by lowering a quorum threshold. **Truncation of beyond-commit bytes stays correct — those are un-acked and must be removed; do not add a floor that keeps them.**
+
+**Scope: F227 targets the WRITE / SEAL / commit-truncation path** (the silent-loss vector). `commit_length_for_extent` (the READ-path helper that resolves a `length=0` "to-end" read on an *open* extent) is intentionally LEFT as quorum-min: it neither seals nor truncates, so its worst case is a short read (surfaced as an error), not data loss — and reads should tolerate a replica being down (the whole point of replication), so requiring all-replica there would be an availability regression.
 
 ### Recovery (`require_recovery` RPC)
 
@@ -450,6 +459,15 @@ allow unbounded cross-extent fanout: a single manager
 spawns 8 detached `run_recovery_task` tasks, each holding ~`payload × 2`
 memory through fetch + write. The concurrency controller caps that to
 `recovery_max` (default 2) across all extents.
+
+**Keep `recovery_max` aligned with the manager's
+`RecoveryRateLimiter.max_per_target`** (default 2; F211-H/F224). Both
+cap "concurrent recoveries landing on this EN" — manager throttles
+DISPATCH (network fan-out), this caps EXECUTION (RAM). Defense-in-depth,
+different processes (cannot be merged). If the manager's per-target cap
+exceeds `recovery_max`, surplus dispatches just block in
+`acquire_recovery()`'s 50 ms backoff until a permit frees. See
+`crates/manager/CLAUDE.md` Programming Note 27.
 
 ### Concurrency vs rate limiting (and why there's no rate cap on EN)
 
@@ -938,6 +956,29 @@ sufficient (and cheaper than DashMap).
     the decoded payload. Skips the wasted server round-trip + EC
     decode on a known-stale VP. Open extents (sealed_length=0) are
     untouched — there's no authoritative bound to check against.
+
+19. **F223 recovery source-fetch MUST be chunked
+    (`copy_bytes_from_source`).** The replicated-extent recovery path
+    (`fetch_full_extent_from_sources` → `copy_bytes_from_source`) used a
+    single `MSG_READ_BYTES` oneshot with `length: 0` (read-to-end). On a
+    multi-GB sealed extent that trips the same >2 GiB per-syscall pread
+    ceiling (macOS INT_MAX / Linux 0x7ffff000) + oversized rpc frame that
+    F105 (StreamClient reads, note 12) and F115 (EN local-file I/O, note
+    13) chunk everywhere else — this raw path was the one place that
+    didn't. Symptom: recovering a 3 GB extent from two healthy replicas
+    failed 10×/10 with "no source replica available for copy"; the source
+    EN logged nothing (the read died at rpc framing before the handler).
+    F223 makes `copy_bytes_from_source(addr, eid, eversion, total_len)`
+    loop 256 MiB (`FILE_IO_CHUNK_BYTES`) reads via `read_bytes_chunk`;
+    `fetch_full_extent_from_sources` passes `extent.sealed_length`. The
+    **EC** shard-recovery caller (`run_ec_recovery_payload`) keeps
+    `total_len = 0` (legacy to-end read — each shard is ~`sealed/K`, under
+    the threshold). **Caveat: `ReadBytesReq.offset` is u32, so this covers
+    extents up to 4 GiB** (guarded with an explicit error); a wider wire
+    offset is a separate change if `max_extent_size` ever exceeds 4 GiB.
+    **Invariant: any new full-extent fetch over `MSG_READ_BYTES` must
+    chunk — never issue a single `length: 0` read against a sealed
+    multi-GB extent.**
 
 ---
 

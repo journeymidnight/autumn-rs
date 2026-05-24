@@ -195,31 +195,46 @@ impl EtcdClient {
         req: &Req,
     ) -> Result<Resp> {
         let body = grpc_encode(req);
+        let timeout = request_timeout();
 
         // F108: clone the SendRequest out of the RefCell, then drop the borrow
         // before awaiting. Holding `RefMut<GrpcChannel>` across `.await` would
         // panic the next concurrent caller on the same single-threaded runtime
         // (e.g. 4 partitions racing on `handle_stream_punch_holes`).
+        //
+        // F228 (1A): bound the call with `compio::time::timeout`. Without this
+        // a stuck server / half-open TCP hangs the caller forever — the
+        // node_health_loop production freeze. A timeout falls through to the
+        // reconnect + retry path, same as a connection error.
         let mut sender = self.channel.borrow().sender();
-        match call_with_sender(&mut sender, path, body.clone()).await {
-            Ok(resp_bytes) => return grpc_decode::<Resp>(&resp_bytes),
-            Err(e) => {
+        match compio::time::timeout(timeout, call_with_sender(&mut sender, path, body.clone()))
+            .await
+        {
+            Ok(Ok(resp_bytes)) => return grpc_decode::<Resp>(&resp_bytes),
+            Ok(Err(e)) => {
                 // Connection might be dead. Try reconnecting to another endpoint.
-                tracing::warn!(
-                    path,
-                    error = %e,
-                    "etcd call failed, attempting reconnect"
-                );
+                tracing::warn!(path, error = %e, "etcd call failed, attempting reconnect");
+            }
+            Err(_elapsed) => {
+                tracing::warn!(path, ?timeout, "etcd call timed out, attempting reconnect");
             }
         }
 
         // Reconnect: try each endpoint once (round-robin from the next one).
-        self.reconnect().await?;
+        // F228 (1A): also bounded — a hung connect must not wedge the loop.
+        compio::time::timeout(timeout, self.reconnect())
+            .await
+            .map_err(|_| anyhow::anyhow!("etcd reconnect timed out after {timeout:?}"))??;
 
         // Retry on the new connection (re-clone after the channel was swapped).
         let mut sender = self.channel.borrow().sender();
-        let resp_bytes = call_with_sender(&mut sender, path, body).await?;
-        grpc_decode::<Resp>(&resp_bytes)
+        match compio::time::timeout(timeout, call_with_sender(&mut sender, path, body)).await {
+            Ok(Ok(resp_bytes)) => grpc_decode::<Resp>(&resp_bytes),
+            Ok(Err(e)) => Err(e),
+            Err(_elapsed) => {
+                Err(anyhow::anyhow!("etcd call '{path}' timed out after retry ({timeout:?})"))
+            }
+        }
     }
 
     /// Reconnect to the next available etcd endpoint (round-robin).
@@ -229,6 +244,23 @@ impl EtcdClient {
 }
 
 /// Reconnect to the next available etcd endpoint (round-robin).
+/// F228 (1A): per-request timeout for every etcd unary RPC. etcd over h2c
+/// has no built-in request deadline, so a half-open TCP connection or a
+/// stuck server would hang the caller forever. Every manager background
+/// loop ultimately awaits an etcd call; an unbounded hang here silently
+/// froze `node_health_loop` for ~11 min in production (no df, no recovery
+/// apply). Default 10 s — generous enough never to false-trip a healthy
+/// etcd (ops are normally sub-ms), tight enough to convert a true hang
+/// into a retryable error. Env `AUTUMN_ETCD_REQUEST_TIMEOUT_MS`.
+fn request_timeout() -> std::time::Duration {
+    let ms = std::env::var("AUTUMN_ETCD_REQUEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10_000)
+        .max(1_000);
+    std::time::Duration::from_millis(ms)
+}
+
 async fn reconnect_shared(
     channel: &Rc<RefCell<GrpcChannel>>,
     endpoints: &[String],

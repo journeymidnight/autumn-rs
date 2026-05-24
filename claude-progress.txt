@@ -1,14 +1,29 @@
+Date: 2026-05-23
+TaskStatus: completed
+Task scope: merge branch `f222-f224-recovery-completion-fixes` into main.
+  All source code auto-merged cleanly; only the two ledger files conflicted.
+  Resolved an F-number collision — both sides independently used F222/F223:
+    - branch KEEPS F222–F230 (recovery series; 54 source-comment refs intact).
+    - main's per-link-transport  F222 -> F231 (deferred, ledger-only, 0 code).
+    - main's RPC-frame cleanup   F223 -> F232 (1 rpc/CLAUDE.md ref updated;
+      commit 7b06a72's message keeps "F223" as immutable history).
+  feature_list.md: P10=F231, P12=recovery(F222-F230), P13=RPC-frame(F232).
+Verification: cargo build --workspace clean (code auto-merged, +futures dep).
+
+----- merged task: RPC frame single-version cleanup (F232, was F223; completed 2026-05-24) -----
 Date: 2026-05-24
 TaskStatus: completed
-Task scope: F223 — collapse RPC frame to a SINGLE permanent V1 (CRC) format;
+Task scope: F232 (renumbered from F223 on merge) — collapse RPC frame to a SINGLE permanent V1 (CRC) format;
             delete the V0 encoder runtime toggle + back-compat (per user:
             "参考别的系统到底应该打开 CRC 还是关闭；决定了就只留一个版本，不
             考虑后向兼容"). Decision = CRC ON, single version. Also corrected
             stale ledger status (F161/F163 passes:false→true via F165; F216-F
             SUBSUMED by F219; renumbered the deferred per-link-transport entry
-            F219→F222 to fix an id collision with the completed F219).
+            F219→F222→F231 (F222 later collided with the merged recovery
+            series, so it took F231) to fix an id collision with the completed
+            F219).
 
-Current summary (F223):
+Current summary (F232, was F223):
   DONE + verified by build + unit tests (no live cluster needed — wire-only,
   behavior-neutral since the deleted toggle had zero callers; V1 was already
   the always-on default).
@@ -46,61 +61,80 @@ Task scope: F219 — TCP recv-side copy elimination (read + write), reusing the
             value CRC from the PS hot path (per user: "把 PS 里面 hot path 的
             CRC 全部删除，不要 enable 啥的"). User ask: "复用 regpool+threshold
             让 tcp 也尽量 zero copy".
+----- merged task: recovery completion fixes F222–F230 (completed 2026-05-22) -----
+Date: 2026-05-22
+TaskStatus: completed
+Task scope: F227 (WAS-faithful commit/seal — remove quorum) + F228 (manager
+  background-loop resilience). Both root causes of the live incident (operator
+  fenced node 1 mid-write -> stale_vp + 11-min silent node_health_loop freeze).
+  F229 (PS/EN loop resilience) audited + logged as deferred.
 
-Current summary:
-  DONE + verified end-to-end on a live 1-node TCP cluster.
+== F227 — root cause 2 (durability invariant), passes: TRUE ==
+Invariant (WAS/Azure): all-replica-ACK; NO quorum on the commit path.
+  commit/seal length = min over COMMITTED members (safe >= acked BECAUSE of
+  all-ack). Bug was F156/F210-B2 majority-quorum + min-over-responders + F178
+  flush fsync-quorum. Truncation of beyond-commit (un-acked) bytes stays correct
+  — no floor (user-corrected an earlier wrong proposal).
+Code:
+  - manager/rpc_handlers.rs: pure compute_commit_seal + recovering_nodes_for_extent
+    (F207 ledger) + seal_durability_floor (AUTUMN_MGR_SEAL_DURABILITY_FLOOR=1).
+    handle_stream_alloc_extent failover seal (req.end==0) + handle_check_commit_length
+    call it. req.end>0 path unchanged. commit_length_for_extent (READ path) left
+    quorum-min on purpose.
+  - stream/client.rs: current_commit + await_extent_synced_to -> all-replica;
+    ensure_tail_initialised current_commit failure propagates (?) not unwrap_or(0).
+Verified: 5 pure-fn unit tests; manager 113 / stream 56 / etcd 3 lib green;
+  LIVE e2e (cluster.sh reset 5): fence node 7 mid-write, kept writing full speed,
+  8 keys written-during-fence get back exactly 8192 bytes, NO stale_vp.
 
-  Both recv loops now recv large values straight into a PooledBuf on TCP via a
-  compio OWNED read (no FrameDecoder accumulation copy; only the unavoidable
-  kernel→userspace copy remains). TCP can't be true zero-copy, so the goal is
-  "single-copy". Send side was already vectored/zero-copy on both transports.
+== F228 — root cause 1 (loop resilience), passes: TRUE ==
+Audited all 9 manager loops; only unbounded awaits were etcd unary_call +
+  ConnPool::get_or_connect connect (EN/PS request RPCs already call_timeout).
+Code:
+  - etcd/lib.rs unary_call: timeout both call_with_sender + reconnect
+    (AUTUMN_ETCD_REQUEST_TIMEOUT_MS=10s) -> reconnect+retry on timeout.
+  - manager/lib.rs ConnPool::get_or_connect: bound RpcConn::connect
+    (AUTUMN_MGR_CONNECT_TIMEOUT_MS=5s).
+  - manager/lib.rs spawn_supervised (AssertUnwindSafe+catch_unwind+ERROR+1s
+    restart) wraps all 9 loops; +futures dep; ps_liveness_check_loop &self->self.
+  - 1A prevents hangs (catch_unwind can't rescue a stuck await); 1C catches panics.
+Verified: LIVE e2e same run — before+after fence all heartbeats 0s
+  (node_health_loop alive, vs incident's frozen); manager.log 0 panic / 0 ERROR /
+  0 bg_loop restart; recovery dispatched+completed for node 7. Incident does not
+  recur.
 
-  1. New primitive `ReadHalf::read_exact_into_pooled(pb, filled, target)`
-     (crates/transport/src/lib.rs): fills pb[filled..target] via
-     `pb.slice(filled..target)` + compio `read_exact`, returns the buffer.
-     Cancel-safe (compio retains the owned buffer until the read CQE lands).
-     UCX errors (callers gate on !is_ucx and use recv_into there).
+== F229 — PS/EN loop resilience, passes: FALSE (deferred, logged) ==
+Same detached-spawn pattern on PS (heartbeat/report_load/region_sync/per-partition
+  flush·compact·gc/conn) + EN (coalescer/reconcile). NOT fixed: PS loops on
+  per-partition !Send Rc<RefCell> runtimes need per-loop restart safety (panic
+  mid-flush leaves partition state mid-mutation) — bigger + riskier than the
+  manager's clone-restart. See feature_list F229.
 
-  2. READ (PS←EN VP value): rpc read_loop IntoPooled gains a TCP branch
-     (value ≥ TCP_RECV_INTO_POOLED_MIN_BYTES = 64 KiB) that drains the buffered
-     prefix then read_exact_into_pooled the rest. `StreamClient::read_value_into_pooled`
-     UCX-only gate relaxed → TCP regular `get` of a VP value now routes through
-     MSG_READ_BYTES_ZC (EN side already pooled + value-separable → also delivers
-     F216-F's EN-send win for free; F216-F subsumed).
+Build/test: cargo build --workspace clean; lib tests green (manager 113 / stream
+  56 / etcd 3).
 
-  3. WRITE (PS←client large MSG_PUT_ZC): drain_zc_writes `!is_ucx` early-return
-     removed; TCP branch recvs the value via read_exact_into_pooled. perf-check +
-     `put-zc` CLI send MSG_PUT_ZC on TCP only for values ≥ 64 KiB (small writes
-     stay regular MSG_PUT — 4 KiB hot path is QPS-critical, no copy win there).
+Commit: F227 + F228 committed this session (source + docs + ledgers). Did NOT
+  commit write_result.json (bench artifact), .venv/, python/d.py, python/del_prefix.py
+  (pre-existing untracked, unrelated). Branch f222-f224-recovery-completion-fixes.
 
-  4. CRC removed from the PS hot path, NO toggle: encode_zc_meta writes 0 in the
-     crc field (kills EN read-resp + PS get-resp crc passes); read_crc_ok +
-     VERIFY_READ_CRC + set_verify_read_crc deleted (kills PS←EN + client←PS
-     verify); drain_zc_writes consumes the V1 trailer for stream alignment but no
-     longer validates it. 9-byte zc_meta layout unchanged (field reserved/0 →
-     wire-compatible). Normal non-ZC frames keep their V1 frame-CRC (F165).
-     Value integrity now left to the transport (UCX NIC ICRC / TCP kernel cksum).
+== F230 — partition_loop reopen busy-spin (found during clean-env integration run), passes: TRUE ==
+Ran etcd-gated integration suite (clean env: tests self-spawn ephemeral etcd +
+  random ports, isolated from any live cluster). F227/F228-relevant tests all
+  green: extent_failover/recovery/seal, f211_*, ps/manager_failover, leader_fence,
+  apply_done_atomicity, split/range/multi_split_chain, merge (each in own process).
+Found a PRE-EXISTING (spins on parent too) hang:
+  system_merge::split_merge_split_with_interleaved_writes → partition_loop ~95%
+  CPU spin. Root: on reopen, PartitionHandle drop closes drain_rx (EOF) before
+  req_rx; idle select kept selecting the closed drain_rx (instant Ready(None)).
+Fix (crates/partition-server/src/lib.rs partition_loop): drain_closed latch —
+  stop polling drain_rx once EOF, keep serving req_rx, exit on req_rx EOF (NOT
+  break-on-drain-EOF, which stranded queued requests → hang).
+  + test helper crates/manager/tests/support/mod.rs PsRouter::client_for now
+  retries with region re-resolve (mirrors prod SDK) instead of expect()-panic
+  in the reopen window.
+Verified: the test passes ~17s (was ∞). No regression (lib + reopen integration
+  green; the 1 partition-server-lib failure under full parallel load is the
+  pre-existing flaky f099i_d1_fast_path perf-counter assertion, passes in isolation).
 
-Verification:
-  - Builds clean WITH and WITHOUT --features ucx (rpc, partition-server, server).
-  - Unit: rpc 16 (incl new call_into_pooled_tcp_large_value_recv_into_pooled),
-    partition-server 146, stream 56 — all green.
-  - Live 1-node TCP cluster: put-zc 8 MiB → get + zc-get round-trip
-    byte-identical (sha256 match). ps.log: "PS write-recv ZC engaged …
-    transport=\"tcp(pooled)\" value_len=8388608", no panic / no crc mismatch.
-  - perf-check 8M TCP runs "[ZC: MSG_PUT_ZC; read regular]" end-to-end, no crash
-    (P=1 smoke only — NOT a perf claim; real A/B needs P>=8 matrix).
-
-Main gaps / next steps (lower priority):
-  1. Proper P>=8 perf A/B (8M intra-host TCP read+write) vs parent commit to
-     quantify the win + refresh perf_baseline.json.
-  2. client←PS read (get_into/call_into_dest) TCP recv-into-dest deferred
-     (cancel-safety needs read_loop-owns-buffer variant; production read = UCX,
-     and regular TCP get already benefits via the PS←EN change).
-  3. Client send-side V1 frame-crc for put_zc still computed on TCP — drop by
-     sending put_zc as V0 on TCP (separate wire decision).
-  4. regpool_acquire still calls ibv_reg_mr on ucx-feature builds even under TCP
-     transport (wasteful but correct; reg unused for TCP). Could skip when
-     transport != UCX at runtime.
-
-Previous task (completed 2026-05-21): F216-E W1 PS write-recv ZC (UCX).
+Next (optional): F229 (PS/EN loop supervision/timeouts — F230 fixed one concrete
+  PS-loop spin but the broader 1A/1C-for-PS/EN audit-fix is still deferred).
