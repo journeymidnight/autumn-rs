@@ -714,16 +714,17 @@ Cleared by audit (no fix needed):
   ("worth tackling only after F129 is in production") is moot: F129 never
   shipped.)
 
-### F133 · autumn-rpc native multi-frame (FLAG_STREAM_END activation)
+### F133 · autumn-rpc native multi-frame (FLAG_STREAM_END activation) — CLEARED, won't do (not needed)
 - **Target:** Activate the reserved `FLAG_STREAM_END = 0x04` frame flag so a single logical RPC can span N request and/or response frames. `RpcClient::call_streaming(req) → impl Stream<Item = Bytes>` + per-`req_id` frame-routing table on the server.
 - **Trigger:** (1) `MSG_RANGE` returning > 100 k rows hits the single-frame size limit, or (2) autumn-rs adds a watch / subscribe RPC whose semantics inherently require server streaming.
 - **Notes:** Multipart (F129) preferred for "one big payload" flows (idempotent commit, S3-shape resume); native streaming wins for "many small results from one logical query" (range scans) or "open-ended subscription". Wire compat: `FLAG_STREAM_END` is currently unused by all senders.
-- **passes:** false (NOT superseded by F186 — checked in the 2026-05-24
-  F129-family audit. F186 covers big-VALUE uploads; F133's use cases (a single
-  `MSG_RANGE` > 100 k rows, or a future watch/subscribe RPC) are orthogonal
-  native server-streaming needs. No current trigger: large scans page via the
-  `cur_end_key` resume cursor today, and no subscribe RPC exists yet. Genuinely
-  deferred, not moot.)
+- **passes:** true (CLEARED — won't do, per user decision 2026-05-24: "f133
+  不需要". Rationale stands from the same-day F129-family audit: the only two
+  triggers are (1) a single `MSG_RANGE` > 100 k rows — already covered by the
+  `cur_end_key` resume-cursor paging — and (2) a watch/subscribe RPC that does
+  not exist and isn't planned. Not superseded by F186 (orthogonal native
+  server-streaming), simply not needed. `FLAG_STREAM_END = 0x04` stays reserved/
+  unused. Reopen as a fresh feature if a subscribe RPC is ever added.)
 
 ### F134 · Frame-level Put early reject (perf hardening for F129 cap)
 - **Target:** Move `AUTUMN_PS_MAX_INLINE_BYTES` cap check from post-rkyv-decode into the autumn-rpc frame loop: when `payload_len > cap + overhead_bound`, drop the connection or return `CODE_VALUE_TOO_LARGE` without reading body bytes off the socket.
