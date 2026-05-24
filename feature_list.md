@@ -696,24 +696,44 @@ Cleared by audit (no fix needed):
 ### F131 · Concurrent fragment pread in `resolve_value` (perf follow-up to F129)
 - **Target:** Replace v1 sequential per-fragment `read_bytes_from_extent` with `FuturesUnordered`, capped at `AUTUMN_PS_RESOLVE_CONCURRENCY` (default 8). Result Vec assembled in fragment order despite out-of-order completion.
 - **Trigger:** 1 GiB `get_auto` total latency exceeds 60% of (single-fragment latency × n_frags), or `examples/gallery` Range read P99 across fragment boundaries materially exceeds intra-fragment P99.
-- **passes:** false
+- **passes:** true (SUPERSEDED by F186 — 2026-05-24 F129-family audit. The
+  server-side multi-fragment VP path this would parallelize was deleted by
+  F186's client-side striping; `resolve_value` now resolves only inline or
+  single-VP values (`background.rs`: "multi-frag VP … deleted with F186"), so
+  there are no N fragments to read concurrently. Moot.)
 
 ### F132 · PutStream resume across partition split / PS restart
 - **Target:** Persist `(upload_id, key, must_sync, expires_at, fragments[], total_bytes, last_chunk_index)` as a small region inside `meta_stream`; new owner (post-split / post-restart) loads the region and accepts continuation chunks under the same `upload_id`. New `PutChunkResp` field `RESUME_HINT { upload_id, last_committed_index, ps_addr_hint }` for transparent reconnection.
 - **Trigger:** Real workload sees frequent GB-class uploads colliding with split or PS rolls.
 - **Notes:** Split-time fragment ownership is the hard part: log_stream CoW makes chunk bytes visible to both halves; the half whose key range still contains `key` accepts continuation. Persistence cadence: `last_chunk_index` updated lazily (every K chunks or T seconds). Worth tackling only after F129 is in production and resume-cost is shown to matter.
-- **passes:** false
+- **passes:** true (SUPERSEDED by F186 — 2026-05-24 F129-family audit. This is
+  resume for the server-side multipart PutStream (F129); F186 replaced that with
+  stateless client-side striping (each chunk is an independent Put to a reserved
+  key), so there is NO server-side upload_id/fragment state to resume — resume is
+  handled client-side by re-putting missing chunk keys. The entry's own note
+  ("worth tackling only after F129 is in production") is moot: F129 never
+  shipped.)
 
 ### F133 · autumn-rpc native multi-frame (FLAG_STREAM_END activation)
 - **Target:** Activate the reserved `FLAG_STREAM_END = 0x04` frame flag so a single logical RPC can span N request and/or response frames. `RpcClient::call_streaming(req) → impl Stream<Item = Bytes>` + per-`req_id` frame-routing table on the server.
 - **Trigger:** (1) `MSG_RANGE` returning > 100 k rows hits the single-frame size limit, or (2) autumn-rs adds a watch / subscribe RPC whose semantics inherently require server streaming.
 - **Notes:** Multipart (F129) preferred for "one big payload" flows (idempotent commit, S3-shape resume); native streaming wins for "many small results from one logical query" (range scans) or "open-ended subscription". Wire compat: `FLAG_STREAM_END` is currently unused by all senders.
-- **passes:** false
+- **passes:** false (NOT superseded by F186 — checked in the 2026-05-24
+  F129-family audit. F186 covers big-VALUE uploads; F133's use cases (a single
+  `MSG_RANGE` > 100 k rows, or a future watch/subscribe RPC) are orthogonal
+  native server-streaming needs. No current trigger: large scans page via the
+  `cur_end_key` resume cursor today, and no subscribe RPC exists yet. Genuinely
+  deferred, not moot.)
 
 ### F134 · Frame-level Put early reject (perf hardening for F129 cap)
 - **Target:** Move `AUTUMN_PS_MAX_INLINE_BYTES` cap check from post-rkyv-decode into the autumn-rpc frame loop: when `payload_len > cap + overhead_bound`, drop the connection or return `CODE_VALUE_TOO_LARGE` without reading body bytes off the socket.
 - **Trigger:** Monitoring shows PS network ingress carries > 1% rate of `CODE_VALUE_TOO_LARGE` rejections (clients not using `put_auto`).
-- **passes:** false
+- **passes:** false (NOT superseded by F186 — checked 2026-05-24. The early-reject
+  is independent of the upload path: the inline-bytes cap (`AUTUMN_PS_MAX_INLINE_BYTES`)
+  still exists, and a client sending an oversized single Put still wastes ingress
+  reading the body before the post-decode reject. Trigger-gated (>1%
+  `CODE_VALUE_TOO_LARGE`), no current production signal. Genuinely deferred, not
+  moot.)
 
 ### F138 · `eversion` lost-update across await on the manager extent record
 - **Target:** `MgrExtentInfo.eversion` is mutated by four sites on the single-threaded manager runtime. The risky one is `ec_conversion_dispatch_loop`: it captures `new_eversion = ex.eversion + 1` BEFORE the `EXT_MSG_CONVERT_TO_EC` await, then `apply_ec_conversion_done` writes that captured value back unconditionally. If `apply_recovery_done`, `mark_extent_available`, or `handle_multi_modify_split` bumps `eversion` during that await, the unconditional write overwrites the intermediate bump. Worse: `apply_ec_conversion_done`'s `ex.replicates = target_nodes[..data_shards]` reverts a recovery's slot replacement, producing `replicates[slot] = old_failed_node_id` while `replicate_disks[slot] = recovery_disk_id` (inconsistent). Symptom: stale `eversion` → `CODE_EVERSION_MISMATCH` on freshly-EC-converted extents that don't auto-recover.
