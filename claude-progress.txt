@@ -8,9 +8,13 @@ Summary (FCI-01):
   Phase 2: clippy -> 0 under -D warnings on --lib --bins --tests --examples.
     - deny errors: absurd_extreme_comparisons (allow on future-proof bound),
       never_loop (seek_user_key -> .next()).
-    - F108-class fix: 6 manager etcd sites held RefMut<EtcdClient> across .await.
-      EtcdClient now derives Clone (all-Rc); borrow().clone() drops the borrow
-      before await (also pipelines concurrent manager etcd calls).
+    - F108-class fix + refactor: 6 manager etcd sites held RefMut<EtcdClient>
+      across .await. Final fix: EtcdMirror.client Rc<RefCell<EtcdClient>> ->
+      Rc<EtcdClient> (the RefCell was dead — all &self, never replaced, never
+      borrow_mut). Removed the RefCell + 6 borrow().clone() + 5 unsafe as_ptr
+      &mut *c hacks; manager RPCs are now plain self.client.method().await.
+      Validated: 9 etcd-integration tests (leader_fence/apply_done/manager_failover/
+      etcd_stream) pass, no RefCell-already-borrowed.
     - cosmetic/design lints allowed workspace-wide via [workspace.lints.clippy]
       (root + per-crate [lints] workspace=true): type_complexity,
       too_many_arguments, doc_lazy_continuation, doc_overindented_list_items.

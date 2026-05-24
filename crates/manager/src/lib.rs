@@ -52,7 +52,7 @@ pub const CLUSTER_ID_KEY: &str = "autumn-rs/cluster_id";
 
 #[derive(Clone)]
 pub(crate) struct EtcdMirror {
-    client: Rc<RefCell<autumn_etcd::EtcdClient>>,
+    client: Rc<autumn_etcd::EtcdClient>,
     /// F149: identity used in the leader-fence compare. Set at connect time
     /// from `AutumnManager::instance_id`.
     instance_id: Rc<String>,
@@ -70,7 +70,7 @@ impl EtcdMirror {
     ) -> Result<Self> {
         let client = autumn_etcd::EtcdClient::connect_many(&endpoints).await?;
         Ok(Self {
-            client: Rc::new(RefCell::new(client)),
+            client: Rc::new(client),
             instance_id,
             leader,
         })
@@ -110,8 +110,7 @@ impl EtcdMirror {
         };
 
         let resp = {
-            let c = self.client.as_ptr();
-            unsafe { &mut *c }
+            self.client
                 .txn(txn)
                 .await
                 .map_err(|e| AppError::Internal(e.to_string()))?
@@ -127,8 +126,7 @@ impl EtcdMirror {
         // refused because the key already exists). If it differs (or is
         // gone), we have been deposed.
         let got = {
-            let c = self.client.as_ptr();
-            unsafe { &mut *c }
+            self.client
                 .get(LEADER_KEY.as_bytes())
                 .await
                 .map_err(|e| AppError::Internal(e.to_string()))?
@@ -1063,7 +1061,7 @@ impl AutumnManager {
                     // CAS failed — another leader holds the key.
                     // Watch for deletion instead of blind polling.
                     if let Some(etcd) = &self.etcd {
-                        let addr = etcd.client.borrow().current_endpoint();
+                        let addr = etcd.client.current_endpoint();
                         tracing::info!("watching leader key for deletion");
                         match autumn_etcd::watch_key_until_delete(&addr, LEADER_KEY.as_bytes())
                             .await
@@ -1097,7 +1095,7 @@ impl AutumnManager {
         };
 
         let lease = {
-            let c = etcd.client.borrow().clone();
+            let c = etcd.client.clone();
             c.lease_grant(LEASE_TTL_SECS).await?
         };
         let lease_id = lease.id;
@@ -1114,7 +1112,7 @@ impl AutumnManager {
             failure: vec![],
         };
         let resp = {
-            let c = etcd.client.borrow().clone();
+            let c = etcd.client.clone();
             c.txn(txn).await?
         };
         if !resp.succeeded {
@@ -1184,8 +1182,7 @@ impl AutumnManager {
         // The `Self::new()` seed is a random UUID; distinguish "replayed
         // from etcd" from "still the new() seed" by re-reading etcd.
         let existing = {
-            let c = etcd.client.as_ptr();
-            unsafe { &mut *c }
+            etcd.client
                 .get(CLUSTER_ID_KEY.as_bytes())
                 .await
                 .map_err(|e| AppError::Internal(format!("get cluster_id: {e}")))?
@@ -1216,8 +1213,7 @@ impl AutumnManager {
             false => {
                 // CAS lost — re-read whoever wrote first.
                 let resp = {
-                    let c = etcd.client.as_ptr();
-                    unsafe { &mut *c }
+                    etcd.client
                         .get(CLUSTER_ID_KEY.as_bytes())
                         .await
                         .map_err(|e| AppError::Internal(format!("re-get cluster_id: {e}")))?
@@ -1240,7 +1236,7 @@ impl AutumnManager {
     async fn leader_keepalive_loop(self, lease_id: i64) {
         let keeper = {
             let c = match self.etcd.as_ref() {
-                Some(v) => v.client.borrow().clone(),
+                Some(v) => v.client.clone(),
                 None => {
                     self.set_leader(false);
                     return;
@@ -1273,7 +1269,7 @@ impl AutumnManager {
             None => return Ok(()),
         };
 
-        let c = etcd.client.borrow().clone();
+        let c = etcd.client.clone();
 
         let nodes = c.get_prefix("nodes/").await?;
         let disks = c.get_prefix("disks/").await?;
@@ -1734,8 +1730,7 @@ impl AutumnManager {
             let _ = etcd.txn_fenced(extra_cmp, vec![put_op], vec![]).await?;
 
             let got = {
-                let c = etcd.client.as_ptr();
-                unsafe { &mut *c }
+                etcd.client
                     .get(key.as_bytes())
                     .await
                     .map_err(|e| AppError::Internal(e.to_string()))?

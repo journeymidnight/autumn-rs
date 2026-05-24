@@ -22,11 +22,12 @@ use transport::{call_with_sender, GrpcChannel};
 ///
 /// Supports etcd clusters: stores all endpoints and automatically reconnects
 /// to the next endpoint when the current connection fails.
-/// Cheap to `Clone` — every field is an `Rc`, so clones share the same channel
-/// (and its internal F108 sender-clone path). Callers clone the client out of an
-/// `Rc<RefCell<EtcdClient>>` and drop the borrow before awaiting, so a manager
-/// etcd RPC never holds a `RefCell` borrow across `.await`.
-#[derive(Clone)]
+///
+/// All methods take `&self` (the inner `channel` is `Rc<RefCell<GrpcChannel>>`
+/// and is the only mutable state — swapped on reconnect; concurrent calls are
+/// F108-safe via the sender-clone-out-of-cell pattern). Callers therefore hold
+/// it as a plain `Rc<EtcdClient>` (no outer `RefCell`), so a manager etcd RPC
+/// never holds a borrow across `.await`.
 pub struct EtcdClient {
     channel: Rc<RefCell<GrpcChannel>>,
     endpoints: Vec<String>,

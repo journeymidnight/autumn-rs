@@ -2731,7 +2731,22 @@ Cleared by audit (no fix needed):
   - **Phase 1 — fmt:** `cargo fmt --all` (116 files); committed separately. `cargo fmt --all -- --check` now clean.
   - **Phase 2 — clippy → 0 under `-D warnings`** on `--lib --bins --tests --examples`. Breakdown:
     - Deny-level errors fixed: `absurd_extreme_comparisons` (frame.rs, `#[allow]` on the future-proof bound), `never_loop` (rewrote `seek_user_key` to `.next()`).
-    - **F108-class correctness fix:** 6 manager etcd call sites held a `RefMut<EtcdClient>` across `.await` (the exact anti-pattern the etcd CLAUDE.md warns against). `EtcdClient` now derives `Clone` (all-`Rc`); sites use `borrow().clone()` → drop the borrow before awaiting → no cross-await borrow + concurrent manager etcd calls now pipeline instead of serialize/panic.
+    - **F108-class correctness fix → then proper refactor.** 6 manager etcd call
+      sites held a `RefMut<EtcdClient>` across `.await` (the anti-pattern the etcd
+      CLAUDE.md warns against). The first pass cloned the client out
+      (`borrow().clone()`) to drop the borrow before awaiting. **Follow-up
+      refactor (same day):** the outer `RefCell<EtcdClient>` was found to be
+      entirely dead — `EtcdClient` is all-`&self`, constructed once, never
+      replaced, never `borrow_mut`'d — and the codebase even had **5 `unsafe`
+      `self.client.as_ptr()` + `&mut *c`** hacks working around it (aliasing-UB
+      risk under concurrency). So `EtcdMirror.client` changed
+      `Rc<RefCell<EtcdClient>>` → **`Rc<EtcdClient>`**: removes the RefCell, all 6
+      `borrow().clone()`, all 5 unsafe `as_ptr` derefs, and the `EtcdClient:
+      Clone` derive. Manager etcd RPCs are now plain `self.client.method().await`
+      (safe, no borrow across await; concurrent calls pipeline via the inner
+      channel's F108 sender-clone). Validated by the etcd-dependent integration
+      tests (f149_leader_fence / f209_apply_done_atomicity / etcd_stream_integration
+      / system_manager_failover) — 9/9, no `RefCell already borrowed` panics.
     - Cosmetic/design lints allowed workspace-wide via `[workspace.lints.clippy]` (root Cargo.toml + per-crate `[lints] workspace = true`): `type_complexity`, `too_many_arguments`, `doc_lazy_continuation`, `doc_overindented_list_items` — not bugs, churn-to-fix.
     - `await_holding_refcell_ref` false-positives (borrow `drop()`-ed before the await) allowed with justification on `get_value` / `do_compact` / the manager `mod tests`.
     - Mechanical fixes: `clippy --fix` bulk + manual (`!contains_key`, `.clamp()`, `push_back`, deferred-init for dead defaults, redundant-binding/struct-update/empty-line-doc removal, `iter().enumerate()` for `needless_range_loop`, `let _ =` for unused `Result`s).

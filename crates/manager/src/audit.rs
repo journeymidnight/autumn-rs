@@ -75,7 +75,7 @@ impl AutumnManager {
             None => return Vec::new(),
         };
         let raw = {
-            let c = etcd.client.borrow().clone();
+            let c = etcd.client.clone();
             match c.get_prefix(AUDIT_PREFIX).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -136,7 +136,7 @@ impl AutumnManager {
             None => return,
         };
         let raw = {
-            let c = etcd.client.borrow().clone();
+            let c = etcd.client.clone();
             match c.get_prefix(AUDIT_PREFIX).await {
                 Ok(v) => v,
                 Err(_) => return,
