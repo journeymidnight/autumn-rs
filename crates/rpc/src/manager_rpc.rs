@@ -1277,6 +1277,24 @@ pub struct RemoveNodeResp {
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct RecoveryStatsReq {}
 
+/// Per-(extent, slot) backoff detail so `recovery-stats` can show WHY a
+/// recovery is backing off (the last dispatch error), since when, and
+/// until when — not just a count.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RecoveryBackoffEntry {
+    pub extent_id: u64,
+    pub slot: u32,
+    pub consecutive_failures: u32,
+    /// Unix epoch seconds of the last failed dispatch attempt.
+    pub last_attempt_at: i64,
+    /// Unix epoch seconds when the dispatch loop will next retry this
+    /// (extent, slot): `last_attempt_at + 2^consecutive_failures` capped
+    /// at 300 s.
+    pub next_retry_at: i64,
+    /// The most recent dispatch error string.
+    pub reason: String,
+}
+
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct RecoveryStatsResp {
     pub code: u8,
@@ -1291,6 +1309,10 @@ pub struct RecoveryStatsResp {
     /// Number of (extent, slot) entries currently in exponential
     /// backoff (consecutive_failures > 0).
     pub backoff_entries: u32,
+    /// Per-entry backoff detail (one per `backoff_entries`): which
+    /// (extent, slot), how many consecutive failures, since when, next
+    /// retry time, and the last failure reason.
+    pub backoff: Vec<RecoveryBackoffEntry>,
 }
 
 // --- Audit log (F211-I) ---

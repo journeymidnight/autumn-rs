@@ -1217,6 +1217,14 @@ async fn run(args: Args) -> Result<()> {
                         "per_source": resp.per_source,
                         "per_target": resp.per_target,
                         "backoff_entries": resp.backoff_entries,
+                        "backoff": resp.backoff.iter().map(|b| serde_json::json!({
+                            "extent_id": b.extent_id,
+                            "slot": b.slot,
+                            "consecutive_failures": b.consecutive_failures,
+                            "last_attempt_at": b.last_attempt_at,
+                            "next_retry_at": b.next_retry_at,
+                            "reason": b.reason,
+                        })).collect::<Vec<_>>(),
                     }))?
                 );
             } else {
@@ -1238,6 +1246,29 @@ async fn run(args: Args) -> Result<()> {
                     println!("per-target:");
                     for (id, c) in resp.per_target {
                         println!("  node {:<4} {}", id, c);
+                    }
+                }
+                if !resp.backoff.is_empty() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    println!("backoff:");
+                    println!(
+                        "  {:<10} {:<4} {:<6} {:<10} {}",
+                        "extent", "slot", "fails", "retry_in", "reason"
+                    );
+                    for b in &resp.backoff {
+                        let retry_in = b.next_retry_at - now;
+                        let retry_str = if retry_in <= 0 {
+                            "now".to_string()
+                        } else {
+                            format!("{retry_in}s")
+                        };
+                        println!(
+                            "  {:<10} {:<4} {:<6} {:<10} {}",
+                            b.extent_id, b.slot, b.consecutive_failures, retry_str, b.reason
+                        );
                     }
                 }
             }

@@ -40,11 +40,16 @@ pub struct RecoveryRateLimiter {
     pub backoff: HashMap<(u64, u32), BackoffState>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct BackoffState {
     pub consecutive_failures: u32,
     /// Unix epoch seconds of the last failed attempt.
     pub last_attempt_at: i64,
+    /// Human-readable reason for the most recent failure (the dispatch
+    /// error string). Empty until the first failure. Surfaced by
+    /// `recovery-stats` so operators can see WHY an (extent, slot) is
+    /// backing off, not just that it is.
+    pub last_reason: String,
 }
 
 impl Default for RecoveryRateLimiter {
@@ -150,10 +155,11 @@ impl RecoveryRateLimiter {
 
     /// Record a failure for backoff. Returns the new
     /// `consecutive_failures` count.
-    pub fn record_failure(&mut self, extent_id: u64, slot: u32, now_s: i64) -> u32 {
+    pub fn record_failure(&mut self, extent_id: u64, slot: u32, now_s: i64, reason: &str) -> u32 {
         let entry = self.backoff.entry((extent_id, slot)).or_default();
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         entry.last_attempt_at = now_s;
+        entry.last_reason = reason.to_string();
         entry.consecutive_failures
     }
 
@@ -190,6 +196,36 @@ impl RecoveryRateLimiter {
             self.per_target.iter().map(|(k, v)| (*k, *v)).collect();
         tgt.sort_by_key(|(id, _)| *id);
         (src, tgt)
+    }
+
+    /// Per-entry backoff detail for `recovery-stats`. Only entries with
+    /// `consecutive_failures > 0`. Returns `(extent_id, slot,
+    /// consecutive_failures, last_attempt_at, next_retry_at, reason)`,
+    /// sorted by `(extent_id, slot)`. `next_retry_at` is when the dispatch
+    /// loop will next attempt this (extent, slot): `last_attempt_at +
+    /// backoff_secs(consecutive_failures)`. This lets an operator see not
+    /// just HOW MANY entries are backing off but WHICH ones, since when,
+    /// until when, and WHY (the last dispatch error).
+    pub fn backoff_snapshot(&self) -> Vec<(u64, u32, u32, i64, i64, String)> {
+        let mut out: Vec<(u64, u32, u32, i64, i64, String)> = self
+            .backoff
+            .iter()
+            .filter(|(_, st)| st.consecutive_failures > 0)
+            .map(|((eid, slot), st)| {
+                let next_retry_at =
+                    st.last_attempt_at + Self::backoff_secs(st.consecutive_failures);
+                (
+                    *eid,
+                    *slot,
+                    st.consecutive_failures,
+                    st.last_attempt_at,
+                    next_retry_at,
+                    st.last_reason.clone(),
+                )
+            })
+            .collect();
+        out.sort_by_key(|(eid, slot, ..)| (*eid, *slot));
+        out
     }
 }
 
@@ -240,12 +276,18 @@ mod tests {
     #[test]
     fn backoff_increments_and_caps() {
         let mut l = RecoveryRateLimiter::default();
-        assert_eq!(l.record_failure(7, 0, 100), 1);
-        assert_eq!(l.record_failure(7, 0, 110), 2);
-        assert_eq!(l.record_failure(7, 0, 120), 3);
+        assert_eq!(l.record_failure(7, 0, 100, "rpc timeout"), 1);
+        assert_eq!(l.record_failure(7, 0, 110, "rpc timeout"), 2);
+        assert_eq!(l.record_failure(7, 0, 120, "no candidates"), 3);
         // 2^3 = 8 s, last_attempt_at = 120 → in backoff until 128.
         assert!(l.in_backoff(7, 0, 125));
         assert!(!l.in_backoff(7, 0, 200));
+        // backoff_snapshot surfaces the latest reason + next_retry_at.
+        let snap = l.backoff_snapshot();
+        assert_eq!(snap.len(), 1);
+        let (eid, slot, fails, last_at, next_at, reason) = &snap[0];
+        assert_eq!((*eid, *slot, *fails, *last_at, *next_at), (7, 0, 3, 120, 128));
+        assert_eq!(reason, "no candidates");
     }
 
     #[test]
@@ -259,8 +301,9 @@ mod tests {
     #[test]
     fn record_success_clears_backoff() {
         let mut l = RecoveryRateLimiter::default();
-        l.record_failure(7, 0, 100);
+        l.record_failure(7, 0, 100, "rpc timeout");
         l.record_success(7, 0);
         assert!(!l.in_backoff(7, 0, 100));
+        assert!(l.backoff_snapshot().is_empty());
     }
 }

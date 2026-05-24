@@ -207,20 +207,39 @@ pub async fn ps_put(
     key: &[u8],
     value: &[u8],
 ) {
-    let resp = ps
-        .call(
-            partition_rpc::MSG_PUT,
-            partition_rpc::rkyv_encode(&partition_rpc::PutReq {
-                part_id,
-                key: key.to_vec(),
-                value: value.to_vec(),
-                expires_at: 0,
-                region_epoch: 0, // test helper: skip epoch check
-            }),
-        )
-        .await
-        .expect("put");
-    let _: partition_rpc::PutResp = partition_rpc::rkyv_decode(&resp).expect("decode PutResp");
+    // Bounded retry on transient errors. The first write on a stream
+    // triggers tail-init `current_commit`, which under F227 requires ALL
+    // replicas to answer `commit_length`; a momentary single-replica
+    // non-response (common on a loaded test cluster during a concurrent
+    // split/merge storm, or right after PS startup) surfaces as a
+    // retryable `Internal` error. The F227 contract is "the caller
+    // retries"; the production SDK (maps Internal → retryable ServerError)
+    // and the concurrent-writer task in `system_merge` both already do.
+    // This helper used to `.expect()` on the first attempt, so a transient
+    // miss panicked the seeding loop. Retry mirrors those callers; the
+    // success path is unchanged.
+    let payload = partition_rpc::rkyv_encode(&partition_rpc::PutReq {
+        part_id,
+        key: key.to_vec(),
+        value: value.to_vec(),
+        expires_at: 0,
+        region_epoch: 0, // test helper: skip epoch check
+    });
+    let mut last_err = String::new();
+    for _ in 0..30u32 {
+        match ps.call(partition_rpc::MSG_PUT, payload.clone()).await {
+            Ok(resp) => {
+                let _: partition_rpc::PutResp =
+                    partition_rpc::rkyv_decode(&resp).expect("decode PutResp");
+                return;
+            }
+            Err(e) => {
+                last_err = format!("{e:?}");
+                compio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    panic!("put failed after 30 retries: {last_err}");
 }
 
 /// Get a key's value.

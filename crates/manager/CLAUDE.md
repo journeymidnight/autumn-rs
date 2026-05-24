@@ -1391,3 +1391,29 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     unknown-cause stall faster than the F208 10-min sweep did. Cross-ref:
     note 25 (F222 — node_health_loop is the single df + apply caller, the
     thing that froze).
+
+30. **F233 backoff is independent of the recovery marker, and now carries
+    a reason.** Two facts operators (and future readers) get wrong:
+    - **Backoff ≠ marker; backoff never stops retries.** The F207 Recovery
+      inflight marker exists ONLY while a recovery is in-flight (released
+      atomically by `apply_recovery_done`, note 21 I3). Backoff
+      (`recovery_rate_limiter.backoff`, keyed `(extent_id, slot)`, IN-MEMORY
+      only) just delays *re-dispatch* of a failed slot by `2^N s` (cap
+      300 s). Candidates are re-derived every 2 s tick from `s.extents`
+      (note: `recovery_dispatch_loop` scans the store, not a marker), so a
+      dead slot keeps being retried forever until `record_success` clears
+      it — **there is no give-up / abandon for recovery** (unlike
+      ConvertToEc's fence auto-abandon or Delete's F210-G2 retry queue).
+      Because backoff is in-memory, manager restart / leader-failover
+      RESETS it → immediate retry (no window). So `backoff_entries=0` means
+      "nothing in a failure-backoff window right now", NOT "not retrying".
+    - **The failure reason is captured.** Pre-F233 `record_dispatch_outcome`
+      took `ok: bool` and threw away the `dispatch_recovery_task` error;
+      `BackoffState` had no reason. Now it takes `&Result<(), AppError>`,
+      stores `e.to_string()` in `BackoffState.last_reason`, and
+      `backoff_snapshot()` / `RecoveryStatsResp.backoff` /
+      `autumn-op recovery-stats` expose per-entry `(extent, slot,
+      consecutive_failures, last_attempt_at, next_retry_at, reason)`.
+      **Invariant: keep `record_dispatch_outcome` taking the `Result` (not
+      a bool) so the reason is never silently dropped again.** Cross-ref:
+      notes 21 (F207 marker lifecycle), 24 (F224 limiter reseed), 26.

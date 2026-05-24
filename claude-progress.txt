@@ -1,3 +1,40 @@
+Date: 2026-05-24
+TaskStatus: completed
+Task scope: F233 — recovery backoff observability + fix flaky e2e test
+  `split_merge_split_with_concurrent_writes` (user: "修复这个失败，并且补上
+  backoff 可观测性"). Both in the merged recovery series' code, not F232.
+
+Summary (F233):
+  1. Backoff observability. Backoff and the F207 Recovery marker are
+     independent (backoff only delays re-dispatch 2^N s cap 300s; never
+     deletes a marker, never stops retries — candidates re-derived from
+     s.extents every tick; no give-up). The failure REASON was being
+     dropped: record_dispatch_outcome took ok:bool, BackoffState had no
+     reason, recovery-stats showed only a count. Now:
+       - BackoffState gains last_reason:String (dropped Copy);
+         record_failure(.., reason:&str); new backoff_snapshot().
+       - record_dispatch_outcome takes &Result<(),AppError>; 4 call sites
+         pass &res (was res.is_ok()).
+       - wire: new RecoveryBackoffEntry; RecoveryStatsResp.backoff Vec
+         (kept backoff_entries count). Same-commit deploy.
+       - autumn-op recovery-stats prints a backoff table + --json array.
+     manager/CLAUDE.md note 30 documents the marker/backoff independence
+     + the keep-the-Result invariant.
+  2. Flaky-test fix. The panic was the seeding ps_put hitting F227's
+     all-replica current_commit at tail-init when one of 2 nodes
+     momentarily didn't answer commit_length. Production SDK + the test's
+     own writer task already retry this (Internal→retryable); only the raw
+     ps_put helper used .expect() with no retry. Fixed support/mod.rs::ps_put
+     to bounded-retry (30×100ms) then panic with last error. Test-infra
+     only; success path unchanged.
+
+Verification (F233):
+  cargo build --workspace --exclude autumn-fuse clean. manager lib recovery
+  tests 18/18 (incl extended backoff assertions). system_merge --ignored
+  full suite 9/9 (the previously-failing test now passes, no sibling
+  regression). NOT committed yet — awaiting user go-ahead.
+
+----- previous task (completed 2026-05-23) -----
 Date: 2026-05-23
 TaskStatus: completed
 Task scope: merge branch `f222-f224-recovery-completion-fixes` into main.

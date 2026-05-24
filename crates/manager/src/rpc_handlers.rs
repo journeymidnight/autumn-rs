@@ -4190,6 +4190,22 @@ impl AutumnManager {
         }
         let l = self.recovery_limiter.borrow();
         let (src, tgt) = l.snapshot();
+        let backoff: Vec<RecoveryBackoffEntry> = l
+            .backoff_snapshot()
+            .into_iter()
+            .map(
+                |(extent_id, slot, consecutive_failures, last_attempt_at, next_retry_at, reason)| {
+                    RecoveryBackoffEntry {
+                        extent_id,
+                        slot,
+                        consecutive_failures,
+                        last_attempt_at,
+                        next_retry_at,
+                        reason,
+                    }
+                },
+            )
+            .collect();
         Ok(rkyv_encode(&RecoveryStatsResp {
             code: CODE_OK,
             message: String::new(),
@@ -4200,6 +4216,7 @@ impl AutumnManager {
             per_source: src,
             per_target: tgt,
             backoff_entries: l.backoff.len() as u32,
+            backoff,
         }))
     }
 

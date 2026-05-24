@@ -536,7 +536,7 @@ impl AutumnManager {
                             ex.extent_id,
                             slot as u32,
                             now_s,
-                            res.is_ok(),
+                            &res,
                         );
                         continue;
                     }
@@ -559,7 +559,7 @@ impl AutumnManager {
                                     ex.extent_id,
                                     slot as u32,
                                     now_s,
-                                    res.is_ok(),
+                                    &res,
                                 );
                                 continue;
                             }
@@ -602,7 +602,7 @@ impl AutumnManager {
                             ex.extent_id,
                             slot as u32,
                             now_s,
-                            res.is_ok(),
+                            &res,
                         );
                         continue;
                     }
@@ -629,7 +629,7 @@ impl AutumnManager {
                             ex.extent_id,
                             slot as u32,
                             now_s,
-                            res.is_ok(),
+                            &res,
                         );
                     }
                 }
@@ -660,13 +660,17 @@ impl AutumnManager {
         extent_id: u64,
         slot: u32,
         now_s: i64,
-        ok: bool,
+        res: &Result<(), AppError>,
     ) {
         let mut l = self.recovery_limiter.borrow_mut();
-        if ok {
-            l.record_success(extent_id, slot);
-        } else {
-            l.record_failure(extent_id, slot, now_s);
+        match res {
+            Ok(()) => l.record_success(extent_id, slot),
+            // F-backoff-obs: capture WHY it failed so `recovery-stats`
+            // can show the reason, not just a count. Pre-this the call
+            // sites passed `res.is_ok()` and the error was discarded.
+            Err(e) => {
+                l.record_failure(extent_id, slot, now_s, &e.to_string());
+            }
         }
     }
 
