@@ -1,3 +1,4 @@
+#![allow(dead_code)] // integration-test file
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};

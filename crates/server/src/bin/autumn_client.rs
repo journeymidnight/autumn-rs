@@ -1095,18 +1095,16 @@ async fn main() -> Result<()> {
                         rlim_cur: 0,
                         rlim_max: 0,
                     };
-                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
-                        if rl.rlim_cur < needed {
-                            let target = needed.min(rl.rlim_max);
-                            rl.rlim_cur = target;
-                            if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 || target < needed {
-                                eprintln!(
-                                    "warning: need {} open files for {} threads, \
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 && rl.rlim_cur < needed {
+                        let target = needed.min(rl.rlim_max);
+                        rl.rlim_cur = target;
+                        if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 || target < needed {
+                            eprintln!(
+                                "warning: need {} open files for {} threads, \
                                      but limit is {} (hard limit {}). \
                                      Run: ulimit -n 65536",
-                                    needed, threads, target, rl.rlim_max
-                                );
-                            }
+                                needed, threads, target, rl.rlim_max
+                            );
                         }
                     }
                 }
@@ -1177,6 +1175,11 @@ async fn main() -> Result<()> {
 
                                 let t0 = Instant::now();
                                 let op_start = bench_start.elapsed().as_secs_f64();
+                                // `reuse_value` is a perf knob whose else-branch
+                                // (generate a fresh value per op) isn't implemented
+                                // yet — both paths clone the template. Keep the
+                                // branch so the flag's intent stays visible.
+                                #[allow(clippy::if_same_then_else)]
                                 let value = if reuse_value {
                                     value_template.clone()
                                 } else {
@@ -1312,7 +1315,7 @@ async fn main() -> Result<()> {
             let bench_start = Instant::now();
 
             let mut handles = Vec::new();
-            let keys_per_thread = (keys.len() + threads - 1) / threads;
+            let keys_per_thread = keys.len().div_ceil(threads);
 
             for tid in 0..threads {
                 let keys = Arc::clone(&keys);
@@ -1653,7 +1656,7 @@ async fn main() -> Result<()> {
                 Arc::new(std::time::SystemTime::now() + Duration::from_secs(duration_secs));
             let total_ops = Arc::new(AtomicU64::new(0));
             let bench_start = Instant::now();
-            let keys_per_thread = (pc_keyinfo.len() + threads - 1) / threads;
+            let keys_per_thread = pc_keyinfo.len().div_ceil(threads);
 
             let mut read_handles = Vec::new();
             for tid in 0..threads {

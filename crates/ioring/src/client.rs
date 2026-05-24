@@ -153,8 +153,7 @@ impl IoRingClient {
         //    sanity-check vs our local computation).
         let header = RingHeader::decode(&region.as_slice()[..HEADER_SIZE as usize])?;
         if header.session_id != resp.session_id {
-            return Err(ClientError::Io(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(ClientError::Io(io::Error::other(
                 "session_id mismatch between handshake response and SHM header",
             )));
         }

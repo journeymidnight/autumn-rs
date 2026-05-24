@@ -5,7 +5,6 @@ mod support;
 use std::time::Duration;
 
 use autumn_rpc::client::RpcClient;
-use autumn_rpc::manager_rpc::*;
 use autumn_rpc::partition_rpc;
 
 use support::*;
@@ -196,7 +195,7 @@ fn bulk_mixed_ops_split_restart_verify() {
         drop(ps);
         let ps2_addr = pick_addr();
         start_partition_server(96, mgr_addr, ps2_addr);
-        let ps2 = RpcClient::connect(ps2_addr).await.expect("connect ps2");
+        let _ps2 = RpcClient::connect(ps2_addr).await.expect("connect ps2");
         let router2 = PsRouter::new(mgr_addr, ps2_addr);
         compio::time::sleep(Duration::from_millis(6000)).await;
 

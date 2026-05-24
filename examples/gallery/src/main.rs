@@ -518,7 +518,7 @@ fn spawn_transcode(name: String, client: Client, map: TranscodeMap) {
     map.borrow_mut()
         .insert(name.clone(), TranscodeStatus::Queued);
     let fut = SendWrapper::new(transcode_video_task(name, client, map));
-    compio::runtime::spawn(async move { fut.await }).detach();
+    compio::runtime::spawn(fut).detach();
 }
 
 /// Startup recovery: scan KV for orphan video originals (uploaded but no HLS
@@ -747,7 +747,7 @@ fn stream_kv_range(
             }
         }
     });
-    compio::runtime::spawn(async move { producer.await }).detach();
+    compio::runtime::spawn(producer).detach();
 
     Body::from_stream(rx)
 }
@@ -1192,7 +1192,7 @@ async fn main() -> Result<()> {
         let client = client.clone();
         let map = transcodes.clone();
         let fut = SendWrapper::new(recover_pending_transcodes(client, map));
-        compio::runtime::spawn(async move { fut.await }).detach();
+        compio::runtime::spawn(fut).detach();
     }
 
     let app = Router::new()

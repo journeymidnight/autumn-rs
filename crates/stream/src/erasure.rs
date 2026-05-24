@@ -47,13 +47,13 @@ pub fn ec_encode(payload: &[u8], data_shards: usize, parity_shards: usize) -> Re
 
     // Copy payload across data shards.
     let mut remaining = size;
-    for i in 0..data_shards {
+    for (i, shard) in shards.iter_mut().enumerate().take(data_shards) {
         if remaining == 0 {
             break;
         }
         let start = i * per_shard;
         let n = remaining.min(per_shard);
-        shards[i][..n].copy_from_slice(&payload[start..start + n]);
+        shard[..n].copy_from_slice(&payload[start..start + n]);
         remaining -= n;
     }
 
@@ -119,11 +119,11 @@ pub fn ec_decode(
     // Concatenate data shards and truncate to original size.
     let mut out = Vec::with_capacity(original_size);
     let mut remaining = original_size;
-    for i in 0..data_shards {
+    for (i, shard_opt) in shards.iter().enumerate().take(data_shards) {
         if remaining == 0 {
             break;
         }
-        let shard = shards[i]
+        let shard = shard_opt
             .as_ref()
             .ok_or_else(|| anyhow!("data shard {} missing after reconstruct", i))?;
         let n = remaining.min(per_shard);
@@ -337,7 +337,7 @@ mod tests {
     fn test_partial_shards_cannot_decode() {
         let payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
         let shards = ec_encode(&payload, 2, 1).unwrap();
-        let per_shard = shards[0].len();
+        let _per_shard = shards[0].len();
 
         // Take a sub-range from each shard (simulating the old buggy behavior)
         let partial: Vec<Option<Vec<u8>>> =

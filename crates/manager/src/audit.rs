@@ -75,7 +75,7 @@ impl AutumnManager {
             None => return Vec::new(),
         };
         let raw = {
-            let c = etcd.client.borrow_mut();
+            let c = etcd.client.borrow().clone();
             match c.get_prefix(AUDIT_PREFIX).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -120,6 +120,7 @@ impl AutumnManager {
     /// Retention GC. Reads the prefix, finds entries older than the
     /// configured retention window, and deletes them in batches.
     /// Best-effort — partial progress is fine, next tick continues.
+    #[allow(dead_code)]
     pub(crate) async fn audit_retention_gc(&self) {
         let days = std::env::var("AUTUMN_MGR_AUDIT_RETENTION_DAYS")
             .ok()
@@ -135,7 +136,7 @@ impl AutumnManager {
             None => return,
         };
         let raw = {
-            let c = etcd.client.borrow_mut();
+            let c = etcd.client.borrow().clone();
             match c.get_prefix(AUDIT_PREFIX).await {
                 Ok(v) => v,
                 Err(_) => return,

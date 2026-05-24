@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
-use autumn_stream::{ConnPool, ExtentNode, ExtentNodeConfig, StreamClient};
+use autumn_stream::{ConnPool, StreamClient};
 
 use support::*;
 
@@ -86,8 +86,8 @@ fn extent_recovery_replaces_dead_node() {
             ext.sealed_length,
             result.end
         );
-        let orig_node1 = ext.replicates[0];
-        let orig_node2 = ext.replicates[1];
+        let _orig_node1 = ext.replicates[0];
+        let _orig_node2 = ext.replicates[1];
 
         // Now we need to make one replica "dead". We can't kill the node,
         // but we can unregister it from the manager. However, unregister

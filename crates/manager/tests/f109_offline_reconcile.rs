@@ -47,7 +47,7 @@ fn write_orphan_files(disk_dir: &Path, extent_id: u64) {
     let dat = hash_dir.join(format!("extent-{extent_id}.dat"));
     let meta = hash_dir.join(format!("extent-{extent_id}.meta"));
     std::fs::write(&dat, b"orphan-payload").expect("write orphan dat");
-    std::fs::write(&meta, &[0u8; 40]).expect("write orphan meta");
+    std::fs::write(&meta, [0u8; 40]).expect("write orphan meta");
     assert!(dat.exists());
     assert!(meta.exists());
 }

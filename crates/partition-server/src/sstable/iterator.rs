@@ -131,7 +131,7 @@ impl TableIterator {
     }
 
     pub fn valid(&self) -> bool {
-        self.err.is_none() && self.block_iter.as_ref().map_or(false, |bi| bi.valid())
+        self.err.is_none() && self.block_iter.as_ref().is_some_and(|bi| bi.valid())
     }
 
     pub fn item(&self) -> Option<&IterItem> {
@@ -271,13 +271,14 @@ impl MergeIterator {
             None => return,
         };
         for it in self.iters.iter_mut() {
-            if it.item().map_or(false, |i| i.key == min_key.as_slice()) {
+            if it.item().is_some_and(|i| i.key == min_key.as_slice()) {
                 it.next();
             }
         }
     }
 
     /// Seek all iterators to the first entry with key >= `target`.
+    #[allow(dead_code)]
     pub fn seek(&mut self, target: &[u8]) {
         for it in self.iters.iter_mut() {
             it.seek(target);
@@ -324,6 +325,7 @@ impl MemtableIterator {
         self.idx = self.entries.partition_point(|e| e.key.as_slice() < target);
     }
 
+    #[allow(dead_code)]
     pub fn rewind(&mut self) {
         self.idx = 0;
     }

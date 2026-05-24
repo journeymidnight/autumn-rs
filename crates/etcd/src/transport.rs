@@ -75,11 +75,6 @@ impl GrpcChannel {
     pub fn sender(&self) -> http2::SendRequest<Full<Bytes>> {
         self.sender.clone()
     }
-
-    /// Check if the HTTP/2 connection is still usable.
-    pub fn is_ready(&self) -> bool {
-        !self.sender.is_closed()
-    }
 }
 
 /// Send a unary gRPC call on the given sender clone and return the response body bytes.

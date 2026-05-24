@@ -1,3 +1,10 @@
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_must_use,
+    clippy::while_let_loop,
+    clippy::needless_range_loop
+)] // bench/throwaway perf code
 //! PS<-EN read-path microbench — isolates whether ONE RpcClient's `read_loop`
 //! serializes N concurrent 8 MiB `call_into_pooled` recvs (the PS uses ONE
 //! connection per partition->EN) versus N RpcClients (N read_loops).

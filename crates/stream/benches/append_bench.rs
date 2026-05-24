@@ -1,3 +1,10 @@
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_must_use,
+    clippy::while_let_loop,
+    clippy::needless_range_loop
+)] // bench/throwaway perf code
 //! Benchmark: ExtentNode 4KB append via autumn-rpc.
 
 use std::net::SocketAddr;

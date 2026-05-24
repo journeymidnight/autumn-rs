@@ -17,12 +17,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y etcd-server protobuf-compiler
-      - name: Format (non-gating — cleanup pending; see feature_list.md)
-        continue-on-error: true
+      - name: Format (gating, FCI-01)
         run: cargo fmt --all -- --check
-      - name: Clippy (non-gating — cleanup pending; see feature_list.md)
-        continue-on-error: true
-        run: cargo clippy --workspace --exclude autumn-fuse --all-targets
+      # FCI-01: gating. Scope excludes `--benches` deliberately — the 3 perf
+      # benches (stream append/extent, rpc ps_read) are stale against current
+      # APIs and don't compile; see feature_list.md FCI-01. lib + bins + tests +
+      # examples (the maintained code) must be clippy-clean under -D warnings.
+      - name: Clippy (gating, FCI-01)
+        run: cargo clippy --workspace --exclude autumn-fuse --lib --bins --tests --examples -- -D warnings
       - name: Build
         run: cargo build --workspace --exclude autumn-fuse
       - name: Unit tests

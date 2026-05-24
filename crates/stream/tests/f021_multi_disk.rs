@@ -6,7 +6,6 @@
 ///   f021_disk_offline_skip       — first disk offline → alloc goes to second
 mod test_helpers;
 
-use autumn_stream::extent_rpc::CODE_OK;
 use test_helpers::{pick_addr, start_node_multi, TestConn};
 
 /// Prepare a disk directory: write disk_id file.

@@ -55,6 +55,7 @@ impl SstReader {
     }
 
     /// Open from a slice: data[sst_base..sst_base+sst_len].
+    #[allow(dead_code)]
     pub fn open_slice(data: Bytes, sst_base: u32, sst_len: u32) -> Result<Self> {
         let base = sst_base as usize;
         let end = base + sst_len as usize;

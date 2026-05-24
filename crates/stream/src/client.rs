@@ -138,12 +138,11 @@ struct StreamAppendState {
     bad_nodes_ttl: Duration,
 }
 
-/// F195: F190 TTL helper `bad_nodes_ttl()` removed. Value now lives on
-/// `StreamClientConfig.bad_nodes_ttl` (defined below) — set once at
-/// `StreamClient` construction, snapshotted into `StreamAppendState`
-/// for the worker. Was previously env `AUTUMN_STREAM_BAD_NODES_TTL_SECS`,
-/// now CLI-flag-driven on the PS binary.
-
+// F195: F190 TTL helper `bad_nodes_ttl()` removed. Value now lives on
+// `StreamClientConfig.bad_nodes_ttl` (defined below) — set once at
+// `StreamClient` construction, snapshotted into `StreamAppendState`
+// for the worker. Was previously env `AUTUMN_STREAM_BAD_NODES_TTL_SECS`,
+// now CLI-flag-driven on the PS binary.
 impl StreamAppendState {
     fn new(
         bad_nodes: Rc<RefCell<HashMap<u64, Instant>>>,

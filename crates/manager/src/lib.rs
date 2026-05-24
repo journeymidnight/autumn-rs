@@ -13,7 +13,7 @@ mod rpc_handlers;
 pub(crate) use extent_delete::PendingDelete;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::str;
@@ -22,10 +22,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use autumn_common::{AppError, MetadataStore};
 use autumn_rpc::manager_rpc::*;
-use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
+use autumn_rpc::{Frame, FrameDecoder, StatusCode};
 use bytes::Bytes;
 use compio::io::{AsyncRead, AsyncWriteExt};
-use compio::net::TcpStream;
 use compio::BufResult;
 
 // ── EtcdMirror ─────────────────────────────────────────────────────────────
@@ -271,6 +270,7 @@ impl ConnPool {
         }
     }
 
+    #[allow(dead_code)]
     async fn call(&self, addr: &str, msg_type: u8, payload: Bytes) -> Result<Bytes> {
         let sock = parse_addr(addr)?;
         // Get or create the connection. We must drop the Rc<RefCell> borrow
@@ -545,6 +545,7 @@ impl AutumnManager {
     }
 
     /// F183: read the last_op_at timestamp for a partition (0 if never op'd).
+    #[allow(dead_code)]
     pub(crate) fn last_op_at_for(&self, part_id: u64) -> i64 {
         self.last_op_at.borrow().get(&part_id).copied().unwrap_or(0)
     }
@@ -1096,7 +1097,7 @@ impl AutumnManager {
         };
 
         let lease = {
-            let c = etcd.client.borrow_mut();
+            let c = etcd.client.borrow().clone();
             c.lease_grant(LEASE_TTL_SECS).await?
         };
         let lease_id = lease.id;
@@ -1113,7 +1114,7 @@ impl AutumnManager {
             failure: vec![],
         };
         let resp = {
-            let c = etcd.client.borrow_mut();
+            let c = etcd.client.borrow().clone();
             c.txn(txn).await?
         };
         if !resp.succeeded {
@@ -1141,9 +1142,7 @@ impl AutumnManager {
         // keepalive between CAS and replay so the lease stays alive
         // through arbitrarily long replays) is filed as a P3 follow-up
         // — it needs a stop-signal to revoke the lease on replay error.
-        if let Err(err) = self.replay_from_etcd().await {
-            return Err(err);
-        }
+        self.replay_from_etcd().await?;
         self.set_leader(true);
 
         // F214-A: ensure the cluster identity is imprinted in etcd. The
@@ -1241,7 +1240,7 @@ impl AutumnManager {
     async fn leader_keepalive_loop(self, lease_id: i64) {
         let keeper = {
             let c = match self.etcd.as_ref() {
-                Some(v) => v.client.borrow_mut(),
+                Some(v) => v.client.borrow().clone(),
                 None => {
                     self.set_leader(false);
                     return;
@@ -1274,7 +1273,7 @@ impl AutumnManager {
             None => return Ok(()),
         };
 
-        let c = etcd.client.borrow_mut();
+        let c = etcd.client.borrow().clone();
 
         let nodes = c.get_prefix("nodes/").await?;
         let disks = c.get_prefix("disks/").await?;
@@ -2420,7 +2419,7 @@ impl AutumnManager {
             )
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
-        let r: ExtAllocExtentResp = rkyv_decode(&resp).map_err(|e| AppError::Internal(e))?;
+        let r: ExtAllocExtentResp = rkyv_decode(&resp).map_err(AppError::Internal)?;
         if r.code != CODE_OK {
             return Err(AppError::Internal(format!(
                 "alloc_extent failed: {}",
@@ -2727,6 +2726,11 @@ impl AutumnManager {
 
 #[cfg(test)]
 mod tests {
+    // These tests borrow `store.inner` then `.await` a handler; clippy flags
+    // await_holding_refcell_ref, but every such borrow is explicitly `drop()`-ed
+    // before the await (and tests are single-threaded, so no concurrent borrow
+    // races). False-positive — allow at the module level.
+    #![allow(clippy::await_holding_refcell_ref)]
     use super::*;
 
     fn test_extent(extent_id: u64, refs: u64, vp_table_refs: u64) -> MgrExtentInfo {
@@ -2854,7 +2858,7 @@ mod tests {
         // is promoted back online externally.
         let reports = m.recent_failure_reports.borrow();
         assert!(
-            reports.get(&7).map_or(true, |v| v.is_empty()),
+            reports.get(&7).is_none_or(|v| v.is_empty()),
             "quorum trip must clear recent_failure_reports for the node"
         );
     }
@@ -3700,7 +3704,7 @@ mod tests {
             // With refs=1 and no vp_table_refs, it should have been deleted
             // from the extents map.
             assert!(
-                s.extents.get(&10).is_none(),
+                !s.extents.contains_key(&10),
                 "extent 10 should be removed (refs was 1)"
             );
         })
@@ -4552,7 +4556,7 @@ mod tests {
         m.remove(&2);
 
         assert_eq!(m.get(&1), Some(&now));
-        assert!(m.get(&2).is_none());
+        assert!(!m.contains_key(&2));
         // Suppress unused-state warning.
         let _ = state.partitions.is_empty();
         // Avoid `state` mut warning.
@@ -4610,7 +4614,7 @@ mod tests {
         for &nid in &[1u64, 3, 5, 7] {
             let c = *counts.get(&nid).unwrap_or(&0);
             assert!(
-                c >= 600 && c <= 900,
+                (600..=900).contains(&c),
                 "node {nid} appeared in {c}/{ITERS} selections; expected 600..=900"
             );
         }

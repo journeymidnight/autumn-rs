@@ -1058,8 +1058,8 @@ async fn run(args: Args) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
                 println!(
-                    "{:<6} {:<24} {:<10} {:<8} {:<8} {:<12} {}",
-                    "ID", "ADDRESS", "AUTO", "HB_AGO", "SUSP_AGE", "OVERRIDE", "REASON"
+                    "{:<6} {:<24} {:<10} {:<8} {:<8} {:<12} REASON",
+                    "ID", "ADDRESS", "AUTO", "HB_AGO", "SUSP_AGE", "OVERRIDE"
                 );
                 for n in resp.nodes {
                     let hb = if n.last_heartbeat_secs_ago == u64::MAX {
@@ -1253,8 +1253,8 @@ async fn run(args: Args) -> Result<()> {
                         .unwrap_or(0);
                     println!("backoff:");
                     println!(
-                        "  {:<10} {:<4} {:<6} {:<10} {}",
-                        "extent", "slot", "fails", "retry_in", "reason"
+                        "  {:<10} {:<4} {:<6} {:<10} reason",
+                        "extent", "slot", "fails", "retry_in"
                     );
                     for b in &resp.backoff {
                         let retry_in = b.next_retry_at - now;

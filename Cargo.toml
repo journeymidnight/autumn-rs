@@ -33,6 +33,22 @@ resolver = "2"
 edition = "2021"
 license = "Apache-2.0"
 
+# FCI-01: workspace-wide clippy lint policy. We gate CI on `-D warnings`, so a
+# handful of lints that are cosmetic or design-preference (rather than bugs) are
+# allowed here instead of churning the code to satisfy them:
+#   - type_complexity / too_many_arguments: this is a compio/futures systems
+#     codebase; complex future types and wide hot-path fns are deliberate. The
+#     "fix" (type aliases / arg structs) adds indirection without clarity.
+#   - doc_lazy_continuation / doc_overindented_list_items: CommonMark nitpicks on
+#     human-readable `///` docs (aligned tables, wrapped arithmetic). rustfmt
+#     doesn't manage doc markdown; the docs read fine.
+# Everything else stays a hard error so CI catches real issues.
+[workspace.lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+
 [workspace.dependencies]
 anyhow = "1"
 bytes = "1"

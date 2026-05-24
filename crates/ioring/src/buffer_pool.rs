@@ -71,7 +71,7 @@ impl BufferPoolLayout {
             });
         }
         let rel = buf_offset - self.pool_offset;
-        if rel % (self.slot_size as u64) != 0 {
+        if !rel.is_multiple_of(self.slot_size as u64) {
             return Err(BufferPoolError::Misaligned {
                 offset: buf_offset,
                 slot: self.slot_size,

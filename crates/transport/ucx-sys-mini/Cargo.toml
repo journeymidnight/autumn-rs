@@ -12,3 +12,6 @@ libc = "0.2"
 [build-dependencies]
 bindgen = "0.69"
 pkg-config = "0.3"
+
+[lints]
+workspace = true

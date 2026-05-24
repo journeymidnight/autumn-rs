@@ -28,7 +28,6 @@ use bytes::Bytes;
 use compio::fs::{File as CompioFile, OpenOptions};
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
-use compio::net::TcpListener;
 use compio::BufResult;
 use dashmap::DashMap;
 #[allow(unused_imports)]
@@ -203,8 +202,8 @@ impl DiskFS {
                 unsafe {
                     let mut stat: libc::statvfs = std::mem::zeroed();
                     if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
-                        let total = stat.f_blocks as u64 * stat.f_frsize as u64;
-                        let free = stat.f_bavail as u64 * stat.f_frsize as u64;
+                        let total = stat.f_blocks * stat.f_frsize;
+                        let free = stat.f_bavail * stat.f_frsize;
                         return (total, free);
                     }
                 }
@@ -514,18 +513,18 @@ pub(crate) fn register_sync_waiter(
     let new_wake_rx = {
         let mut inner = extent.coalescer.inner.borrow_mut();
         inner.waiters.push((end_offset, tx));
-        if inner.wake_tx.is_none() {
+        if let Some(wtx) = inner.wake_tx.as_ref() {
+            // Task is running. Send a wake; ignore Err (would only happen
+            // if the receiver was dropped, which shouldn't be possible
+            // while wake_tx is Some).
+            let _ = wtx.unbounded_send(());
+            None
+        } else {
             // No task running — create wake channel, take ownership of rx
             // so we can hand it to the new task.
             let (wtx, wrx) = futures::channel::mpsc::unbounded::<()>();
             inner.wake_tx = Some(wtx);
             Some(wrx)
-        } else {
-            // Task is running. Send a wake; ignore Err (would only happen
-            // if the receiver was dropped, which shouldn't be possible
-            // while wake_tx is Some).
-            let _ = inner.wake_tx.as_ref().unwrap().unbounded_send(());
-            None
         }
     };
     if let Some(wrx) = new_wake_rx {
@@ -663,7 +662,7 @@ async fn coalescer_loop(
             // `pending > synced` and issues a fresh fsync.
             let snapshot = pending; // already loaded at top of iteration
             let file_rc = extent.file_rc();
-            let f: &CompioFile = &*file_rc;
+            let f: &CompioFile = &file_rc;
             match f.sync_data().await {
                 Ok(_) => {
                     extent
@@ -1059,7 +1058,7 @@ async fn file_pwrite(
     offset: u64,
     data: impl compio::buf::IoBuf,
 ) -> Result<()> {
-    let mut f: &CompioFile = &*file;
+    let mut f: &CompioFile = &file;
     let BufResult(result, _) = f.write_all_at(data, offset).await;
     result.map_err(|e| anyhow::anyhow!(e))
 }
@@ -1067,7 +1066,7 @@ async fn file_pwrite(
 /// Positional read (pread). F171: see `file_pwrite` for the
 /// `Rc<CompioFile>` rationale.
 async fn file_pread(file: Rc<CompioFile>, offset: u64, len: usize) -> Result<Vec<u8>> {
-    let f: &CompioFile = &*file;
+    let f: &CompioFile = &file;
     let buf = vec![0u8; len];
     let BufResult(result, buf) = f.read_exact_at(buf, offset).await;
     result.map_err(|e| anyhow::anyhow!(e))?;
@@ -1249,10 +1248,7 @@ async fn process_frames_backpressured(
                 Ok(r) => r,
                 Err(e) => {
                     let req_id = frames[i].req_id;
-                    let p = autumn_rpc::RpcError::encode_status(
-                        StatusCode::InvalidArgument,
-                        &e.to_string(),
-                    );
+                    let p = autumn_rpc::RpcError::encode_status(StatusCode::InvalidArgument, e);
                     let bytes = Frame::error(req_id, MSG_APPEND, p).encode();
                     inflight.push(Box::pin(async move { vec![bytes] }));
                     i += 1;
@@ -1278,10 +1274,7 @@ async fn process_frames_backpressured(
                     Ok(_) => break,
                     Err(e) => {
                         let req_id = frames[i].req_id;
-                        let p = autumn_rpc::RpcError::encode_status(
-                            StatusCode::InvalidArgument,
-                            &e.to_string(),
-                        );
+                        let p = autumn_rpc::RpcError::encode_status(StatusCode::InvalidArgument, e);
                         let bytes = Frame::error(req_id, MSG_APPEND, p).encode();
                         inflight.push(Box::pin(async move { vec![bytes] }));
                         i += 1;
@@ -1316,10 +1309,7 @@ async fn process_frames_backpressured(
                 Ok(r) => r,
                 Err(e) => {
                     let req_id = frames[i].req_id;
-                    let p = autumn_rpc::RpcError::encode_status(
-                        StatusCode::InvalidArgument,
-                        &e.to_string(),
-                    );
+                    let p = autumn_rpc::RpcError::encode_status(StatusCode::InvalidArgument, e);
                     let bytes = Frame::error(req_id, MSG_READ_BYTES, p).encode();
                     inflight.push(Box::pin(async move { vec![bytes] }));
                     i += 1;
@@ -1345,10 +1335,7 @@ async fn process_frames_backpressured(
                     Ok(_) => break,
                     Err(e) => {
                         let req_id = frames[i].req_id;
-                        let p = autumn_rpc::RpcError::encode_status(
-                            StatusCode::InvalidArgument,
-                            &e.to_string(),
-                        );
+                        let p = autumn_rpc::RpcError::encode_status(StatusCode::InvalidArgument, e);
                         let bytes = Frame::error(req_id, MSG_READ_BYTES, p).encode();
                         inflight.push(Box::pin(async move { vec![bytes] }));
                         i += 1;
@@ -1660,7 +1647,7 @@ async fn build_append_future(
         // I/O completes — the old fd lives until the LAST clone drops.
         // The `RefCell` borrow is released immediately by `.clone()`.
         let file_rc = extent_for_io.file_rc();
-        let mut f: &CompioFile = &*file_rc;
+        let mut f: &CompioFile = &file_rc;
         let BufResult(wr, _) = f.write_vectored_at(bufs, file_start).await;
         if let Err(e) = wr {
             node.mark_disk_offline_for_extent(extent_id);
@@ -1816,7 +1803,7 @@ fn build_read_future(
             // build_append_future. The RefCell borrow is released by
             // `.clone()` before any `.await`.
             let file_rc = extent.file_rc();
-            let f: &CompioFile = &*file_rc;
+            let f: &CompioFile = &file_rc;
             if zc {
                 // F216-E: pread straight into a registered, pooled, zeroed-once
                 // slab — no per-op `vec![0u8; read_size]` alloc, no per-op 8 MiB
@@ -1904,6 +1891,7 @@ impl ExtentNode {
     const META_SIZE_V1: usize = 44;
     /// Backwards-compat alias for any external code reading the constant.
     /// Equal to V1 size (the size save_meta writes).
+    #[allow(dead_code)]
     const META_SIZE: usize = Self::META_SIZE_V1;
 
     pub async fn new(config: ExtentNodeConfig) -> Result<Self> {
@@ -2880,15 +2868,15 @@ impl ExtentNode {
     /// Pre-F223 this issued ONE `MSG_READ_BYTES` with `length: 0`
     /// (read-to-end). On a multi-GB sealed extent that trips the
     /// >2 GiB per-syscall pread ceiling on the source EN (macOS
-    /// INT_MAX / Linux 0x7ffff000) and oversized rpc frames — exactly
-    /// what F105/F115 chunk every OTHER full-extent path for. The raw
-    /// recovery fetch bypassed all of it, so replicated-extent recovery
-    /// of any >2 GiB extent failed with "no source replica available
-    /// for copy" (10 retries, source nodes logged nothing — the read
-    /// died at rpc framing before the handler). `total_len` is the
-    /// extent's `sealed_length`; recovery only ever targets sealed
-    /// extents, so it is known. `total_len == 0` falls back to a single
-    /// to-end read (open-extent / unknown-length callers).
+    /// > INT_MAX / Linux 0x7ffff000) and oversized rpc frames — exactly
+    /// > what F105/F115 chunk every OTHER full-extent path for. The raw
+    /// > recovery fetch bypassed all of it, so replicated-extent recovery
+    /// > of any >2 GiB extent failed with "no source replica available
+    /// > for copy" (10 retries, source nodes logged nothing — the read
+    /// > died at rpc framing before the handler). `total_len` is the
+    /// > extent's `sealed_length`; recovery only ever targets sealed
+    /// > extents, so it is known. `total_len == 0` falls back to a single
+    /// > to-end read (open-extent / unknown-length callers).
     ///
     /// NOTE: `ReadBytesReq.offset` is u32, so this covers extents up to
     /// 4 GiB. `max_extent_size` keeps extents well under that; a wider
@@ -3268,7 +3256,7 @@ impl ExtentNode {
         let _ = self.save_meta(task.extent_id, &extent).await;
 
         Ok(RecoveryTaskDone {
-            task: task,
+            task,
             ready_disk_id: extent.disk_id,
         })
     }
@@ -5739,7 +5727,7 @@ mod f194_concurrency_gate_tests {
         drop(p1);
         compio::time::sleep(Duration::from_millis(150)).await;
         assert!(acquired.get(), "drop must unblock queued acquire");
-        task.await;
+        let _ = task.await;
     }
 
     /// Constructor clamps both caps to at least 1.

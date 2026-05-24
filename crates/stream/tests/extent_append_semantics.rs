@@ -1,7 +1,5 @@
 mod test_helpers;
 
-use std::time::Duration;
-
 use autumn_stream::extent_rpc::{CODE_LOCKED_BY_OTHER, CODE_OK, CODE_PRECONDITION};
 use test_helpers::{pick_addr, start_node, TestConn};
 

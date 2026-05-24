@@ -106,10 +106,10 @@ pub(crate) async fn dispatch_partition_rpc(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
     part_sc: &Rc<StreamClient>,
-    pool: &Rc<ConnPool>,
-    manager_addr: &str,
-    owner_key: &str,
-    revision: i64,
+    _pool: &Rc<ConnPool>,
+    _manager_addr: &str,
+    _owner_key: &str,
+    _revision: i64,
 ) -> HandlerResult {
     match msg_type {
         MSG_GET => handle_get(payload, part).await,
@@ -226,6 +226,10 @@ pub(crate) fn ps_zc_head(req_id: u32, code: u8, value: &[u8]) -> Bytes {
 /// Shared GET resolve core: epoch/range check → memtable/imm/SST lookup →
 /// VP resolve (read_value_from_log). Used by both `handle_get` (rkyv) and
 /// `handle_get_zc` (value-separable). Carries the read metrics.
+// clippy false-positive: the `part.borrow()` (`p`) is explicitly `drop(p)`-ed
+// (see below) BEFORE the only `.await` (`resolve_value`). The lint flags the
+// borrow because an await exists later in the fn; it doesn't track the drop.
+#[allow(clippy::await_holding_refcell_ref)]
 async fn get_value(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
@@ -258,9 +262,8 @@ async fn get_value(
     // Track where the key was found.
     let mut source = 0u8; // 0=miss, 1=mem, 2=imm, 3=sst
     let found: Option<(u8, Bytes, u64)> = lookup_in_memtable(&p.active, &req.key)
-        .map(|r| {
+        .inspect(|_r| {
             source = 1;
-            r
         })
         .or_else(|| {
             for imm in p.imm.iter().rev() {

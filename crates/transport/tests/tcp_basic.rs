@@ -34,5 +34,5 @@ async fn tcp_connect_bind_round_trip() {
     assert_eq!(n.unwrap(), 5);
     assert_eq!(&b[..], b"world");
 
-    server.await;
+    let _ = server.await;
 }

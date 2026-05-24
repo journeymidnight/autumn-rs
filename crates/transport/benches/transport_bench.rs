@@ -1,3 +1,7 @@
+// The module doc below uses an intentionally aligned, table-like list whose
+// continuation indentation clippy's markdown lints dislike; keep the readable
+// alignment in this bench rather than reflow to satisfy cosmetic doc lints.
+#![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 //! Transport-level perf bench, in the same shape as `ucx_perftest`. Sweeps
 //! a ladder of message sizes for three scenarios:
 //!

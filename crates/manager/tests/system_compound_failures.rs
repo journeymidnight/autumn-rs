@@ -9,7 +9,6 @@ mod support;
 use std::time::Duration;
 
 use autumn_rpc::client::RpcClient;
-use autumn_rpc::manager_rpc::*;
 use autumn_rpc::partition_rpc;
 
 use support::*;
@@ -93,7 +92,7 @@ fn split_then_ps_crash_data_survives() {
         // PS2 takes over with the same ps_id
         let ps2_addr = pick_addr();
         start_partition_server(81, mgr_addr, ps2_addr);
-        let ps2 = RpcClient::connect(ps2_addr).await.expect("connect ps2");
+        let _ps2 = RpcClient::connect(ps2_addr).await.expect("connect ps2");
         // F099-K: after split, left and right live on different partition ports.
         let router2 = PsRouter::new(mgr_addr, ps2_addr);
 

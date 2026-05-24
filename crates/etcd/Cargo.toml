@@ -22,3 +22,6 @@ http-body = "1"
 [dev-dependencies]
 compio = { version = "0.18.0", features = ["net", "time", "io-compat", "macros"] }
 tracing-subscriber = "0.3"
+
+[lints]
+workspace = true

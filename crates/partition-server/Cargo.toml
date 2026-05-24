@@ -26,3 +26,6 @@ tempfile = "3"
 [[bench]]
 name = "ps_bench"
 harness = false
+
+[lints]
+workspace = true

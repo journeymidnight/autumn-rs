@@ -1,5 +1,41 @@
 Date: 2026-05-24
 TaskStatus: completed
+Task scope: FCI-01 — mass fmt + clippy cleanup + flip CI to gating. User: "FCI-01
+  + 整理代码可读性".
+
+Summary (FCI-01):
+  Phase 1: cargo fmt --all (116 files), separate commit. fmt --check clean.
+  Phase 2: clippy -> 0 under -D warnings on --lib --bins --tests --examples.
+    - deny errors: absurd_extreme_comparisons (allow on future-proof bound),
+      never_loop (seek_user_key -> .next()).
+    - F108-class fix: 6 manager etcd sites held RefMut<EtcdClient> across .await.
+      EtcdClient now derives Clone (all-Rc); borrow().clone() drops the borrow
+      before await (also pipelines concurrent manager etcd calls).
+    - cosmetic/design lints allowed workspace-wide via [workspace.lints.clippy]
+      (root + per-crate [lints] workspace=true): type_complexity,
+      too_many_arguments, doc_lazy_continuation, doc_overindented_list_items.
+    - await_holding_refcell_ref false-positives (borrow drop()-ed before await)
+      allowed w/ justification: get_value, do_compact, manager mod tests.
+    - mechanical: clippy --fix bulk + manual (!contains_key, .clamp(),
+      push_back, deferred-init, enumerate, let _=, struct-update/redundant-binding
+      removal).
+    - dead code: #[allow(dead_code)] on test toolboxes (tests/support/mod.rs,
+      test_helpers, benches) + future/feature-gated items.
+  Phase 3: ci.yml fmt+clippy steps un-continue-on-error'd (gating). clippy step
+    = --lib --bins --tests --examples -- -D warnings.
+  DEVIATION: --all-targets target NOT met — 3 perf benches (stream append/extent,
+    rpc ps_read) are STALE (removed serve_rpc / moved RpcClient / changed
+    handle_connection,OwnedReadHalf) and don't compile (pre-existing; build
+    --workspace skips benches). Excluded from gate; logged as FCI-02 (deferred).
+
+Verification (FCI-01): cargo fmt --all -- --check clean; clippy -D warnings
+  EXIT=0 on lib+bins+tests+examples WITH and effectively without ucx (workspace
+  build clean both); 419 workspace lib tests green; full --include-ignored e2e
+  (manager+stream+server) running/clean. NOT committed yet.
+
+----- previous task (completed 2026-05-24) -----
+Date: 2026-05-24
+TaskStatus: completed
 Task scope: F193 Stage C — streaming recovery / re_avali (extent-node memory).
   User: "就只完成C就可以" (only Stage C). Plus prior ledger fixes this session:
   F215 superseded-by-F210-C2, F131/F132 superseded-by-F186, F133 won't-do.

@@ -10,7 +10,6 @@ use autumn_rpc::manager_rpc::*;
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
 use bytes::Bytes;
 use compio::io::{AsyncRead, AsyncWriteExt};
-use compio::net::TcpStream;
 use compio::BufResult;
 
 use std::rc::Rc;
@@ -1140,8 +1139,10 @@ impl AutumnManager {
         // existing seal point.
         let already_sealed = tail.sealed_length > 0;
 
-        let mut min_len: Option<u32> = None;
-        let mut avali: u32 = 0;
+        // Assigned exactly once on every branch below (deferred init — no dead
+        // default, no `mut` needed).
+        let min_len: Option<u32>;
+        let avali: u32;
         if already_sealed {
             // Preserve the existing seal — do not touch sealed_length,
             // eversion, or avali. The new-tail allocation below proceeds.

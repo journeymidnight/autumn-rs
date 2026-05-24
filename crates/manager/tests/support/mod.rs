@@ -1,3 +1,4 @@
+#![allow(dead_code)] // shared test toolbox — not every helper is used by every test binary
 //! Shared test infrastructure for autumn-manager integration tests.
 //!
 //! Provides helper functions for starting components, RPC helpers,
@@ -14,7 +15,7 @@ use autumn_partition_server::PartitionServer;
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::partition_rpc::{self, TableLocations};
-use autumn_stream::{ConnPool, ExtentNode, ExtentNodeConfig, StreamClient};
+use autumn_stream::{ExtentNode, ExtentNodeConfig};
 
 // ── ShutdownHandle ────────────────────────────────────────────────────
 

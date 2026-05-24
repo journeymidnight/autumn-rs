@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
-use autumn_stream::{ConnPool, ExtentNode, ExtentNodeConfig, StreamClient};
+use autumn_stream::{ConnPool, StreamClient};
 
 use support::*;
 
@@ -99,7 +99,7 @@ fn extent_node_unreachable_stream_client_retries_on_new_extent() {
         // Verify all data is accessible via stream structure
         let final_info = sc.get_stream_info(stream_id).await.expect("final info");
         assert!(
-            final_info.extent_ids.len() >= 1,
+            !final_info.extent_ids.is_empty(),
             "stream should have at least 1 extent"
         );
     });

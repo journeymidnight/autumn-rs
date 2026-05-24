@@ -1,11 +1,10 @@
 //! Recovery dispatch/collect loops and EC conversion for AutumnManager.
 
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use autumn_common::AppError;
 use autumn_rpc::manager_rpc::*;
-use bytes::Bytes;
 
 use crate::{AutumnManager, PendingDelete};
 
@@ -219,15 +218,12 @@ impl AutumnManager {
         let layout_changed = {
             let s = self.store.inner.borrow();
             match s.extents.get(&task.extent_id) {
-                Some(ex) => match Self::extent_slot(ex, task.replace_id) {
-                    Some(slot) => Some(
-                        Self::extent_nodes(ex)
-                            .iter()
-                            .enumerate()
-                            .any(|(i, &id)| i != slot && id == task.node_id),
-                    ),
-                    None => None,
-                },
+                Some(ex) => Self::extent_slot(ex, task.replace_id).map(|slot| {
+                    Self::extent_nodes(ex)
+                        .iter()
+                        .enumerate()
+                        .any(|(i, &id)| i != slot && id == task.node_id)
+                }),
                 None => Some(false),
             }
         };

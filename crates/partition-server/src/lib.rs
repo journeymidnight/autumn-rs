@@ -25,8 +25,11 @@ use autumn_rpc::partition_rpc::{self, SstLocation, TableLocations, *};
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
 use autumn_stream::{ConnPool, StreamClient};
 use bytes::Bytes;
-use compio::io::{AsyncRead, AsyncWriteExt};
-use compio::net::TcpStream;
+use compio::io::AsyncWriteExt;
+// `AsyncRead` is only needed in scope for `.read()` in the #[cfg(test)] code;
+// importing it unconditionally trips clippy's unused-import on the lib target.
+#[cfg(test)]
+use compio::io::AsyncRead;
 use compio::BufResult;
 use futures::channel::{mpsc, oneshot};
 use futures::stream::FuturesUnordered;
@@ -262,7 +265,7 @@ pub(crate) fn max_imm_depth() -> usize {
 /// RocksDB analogue: `max_total_wal_size` (default
 /// `write_buffer_size × max_write_buffer_number × 4`).
 pub(crate) fn max_wal_gap() -> u64 {
-    const DEFAULT: u64 = 1 * 1024 * 1024 * 1024;
+    const DEFAULT: u64 = 1024 * 1024 * 1024;
     *MAX_WAL_GAP_CELL.get_or_init(|| DEFAULT)
 }
 
@@ -560,13 +563,11 @@ impl Memtable {
     fn seek_user_key(&self, user_key: &[u8]) -> Option<MemEntry> {
         let seek = key_with_ts(user_key, u64::MAX);
         let guard = self.data.read();
-        for (k, v) in guard.range(seek..) {
-            if parse_key(k) != user_key {
-                break;
-            }
-            return Some(v.clone());
-        }
-        None
+        // First internal key >= seek is the newest version of `user_key` (the
+        // MVCC suffix is inverted-seq, so newest sorts first). Return it iff its
+        // user-key prefix matches; otherwise this user_key has no entry.
+        let (k, v) = guard.range(seek..).next()?;
+        (parse_key(k) == user_key).then(|| v.clone())
     }
 
     fn snapshot_sorted(&self) -> Vec<IterItem> {
@@ -1169,6 +1170,7 @@ pub(crate) struct WriteRequest {
 }
 
 impl WriteRequest {
+    #[allow(dead_code)]
     fn encoded_size(&self) -> usize {
         match &self.op {
             WriteOp::Put {
@@ -1179,6 +1181,7 @@ impl WriteRequest {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)] // kept as a test constructor; not all tests use it
     pub(crate) fn new_for_test(op: WriteOp) -> Self {
         // Build a dangling responder (outer _rx dropped immediately). Tests
         // that exercise the responder should construct it explicitly.
@@ -1351,8 +1354,14 @@ struct PartitionHandle {
     /// compact runs without going through the loopback PS RPC. Same
     /// channel as the in-thread `PartitionData.compact_tx`; the receiver
     /// inside `background_compact_loop` is unchanged.
+    // Never read since F203 removed the manager-driven maintenance dispatch;
+    // kept as a held sender clone (harmless — the in-thread tx keeps the
+    // channel open regardless). #[allow] rather than delete to avoid churning
+    // the PartitionHandle construction sites for a vestigial field.
+    #[allow(dead_code)]
     compact_trigger: mpsc::Sender<bool>,
     /// F188: same shape for GC.
+    #[allow(dead_code)]
     gc_trigger: mpsc::Sender<GcTask>,
     /// F184 + epoch: snapshot of (rg, log/row/meta stream ids,
     /// region_epoch) describing the partition's CURRENT in-memory
@@ -2919,7 +2928,6 @@ impl PartitionServer {
 
         // Race each ack against the deadline.
         let waits = drain_rxs.into_iter().map(|(pid, ack_rx)| {
-            let timeout = timeout;
             async move {
                 use futures::future::{select, Either};
                 let sleep_fut = compio::time::sleep(timeout);
@@ -4371,8 +4379,6 @@ async fn partition_thread_main(
 ///     RPC response frame bytes inline on `send_ok` and drops directly
 ///     into the outer ps-conn oneshot. No inner oneshot, no Waker
 ///     cascade through a second compio task.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn partition_loop(
     part_id: u64,
     part: Rc<RefCell<PartitionData>>,
@@ -4491,7 +4497,7 @@ async fn partition_loop(
             match start_write_batch(&part, batch).await {
                 Ok(Some(mut flight)) => {
                     let data = flight.data;
-                    inflight.push(Box::pin(async move {
+                    inflight.push_back(Box::pin(async move {
                         let phase2_result = (&mut flight.phase2_fut).await;
                         InflightCompletion {
                             data,
@@ -5592,6 +5598,7 @@ async fn recover_partition(
 // Record encoding/decoding
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub(crate) fn encode_record(op: u8, key: &[u8], value: &[u8], expires_at: u64) -> Vec<u8> {
     // F158: now writes V1 envelope. Used by GC tests (background.rs
     // gc_streaming_tests) and lib.rs round-trip tests; both verify via the
@@ -5599,6 +5606,7 @@ pub(crate) fn encode_record(op: u8, key: &[u8], value: &[u8], expires_at: u64) -
     crate::wal_record::encode_v1(op, key, value, expires_at)
 }
 
+#[allow(dead_code)]
 pub(crate) fn decode_records_full(bytes: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>, u64)> {
     // F158: dispatches per-record on V0 vs V1 envelope; CRC failures on V1
     // log a WARN and skip past the corrupted record (advance by its declared
@@ -6448,6 +6456,10 @@ async fn flush_worker_loop(
 
     let cap = crate::ps_bulk_inflight_cap();
 
+    // Variants differ in size (Flush carries a TableMeta+SstReader); this is a
+    // short-lived local completion enum on a bounded (cap) FU, not stored en
+    // masse, so boxing the big variant isn't worth the indirection.
+    #[allow(clippy::large_enum_variant)]
     enum BulkCompletion {
         Flush {
             resp_tx: oneshot::Sender<Result<(TableMeta, SstReader)>>,
@@ -6514,10 +6526,7 @@ async fn flush_worker_loop(
                 } = req;
                 let bulk_sc = bulk_sc.clone();
                 Box::pin(async move {
-                    let result = bulk_sc
-                        .append_bytes(row_stream_id, sst_bytes)
-                        .await
-                        .map_err(Into::into);
+                    let result = bulk_sc.append_bytes(row_stream_id, sst_bytes).await;
                     BulkCompletion::RowAppend { resp_tx, result }
                 })
             }
@@ -7150,7 +7159,6 @@ mod tests {
         let rg = Range {
             start_key: b"b".to_vec(),
             end_key: b"e".to_vec(),
-            ..Default::default()
         };
         assert!(!in_range(&rg, b"a")); // before start
         assert!(in_range(&rg, b"b")); // exactly start
@@ -7165,7 +7173,6 @@ mod tests {
         let rg = Range {
             start_key: b"a".to_vec(),
             end_key: vec![], // open-ended
-            ..Default::default()
         };
         assert!(in_range(&rg, b"a"));
         assert!(in_range(&rg, b"z"));
@@ -7544,7 +7551,7 @@ mod f120_knob_tests {
     fn live_max_wal_gap_in_range() {
         let v = super::max_wal_gap();
         assert!(
-            v >= 128 * 1024 * 1024 && v <= 64 * 1024 * 1024 * 1024,
+            (128 * 1024 * 1024..=64 * 1024 * 1024 * 1024).contains(&v),
             "wal_gap out of range: {v}",
         );
     }
@@ -7617,7 +7624,7 @@ mod merged_loop_tests {
         (
             PartitionRequest {
                 msg_type: MSG_PUT,
-                payload: Bytes::from(payload),
+                payload,
                 resp_tx,
                 zc_value: None,
             },
@@ -7638,7 +7645,7 @@ mod merged_loop_tests {
         (
             PartitionRequest {
                 msg_type: MSG_DELETE,
-                payload: Bytes::from(payload),
+                payload,
                 resp_tx,
                 zc_value: None,
             },
@@ -7680,9 +7687,7 @@ mod merged_loop_tests {
         w.resp.send_ok();
 
         // The outer oneshot must have received an encoded PutResp frame.
-        let frame = compio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async { resp_rx.await });
+        let frame = compio::runtime::Runtime::new().unwrap().block_on(resp_rx);
         let bytes = frame
             .expect("outer oneshot dropped")
             .expect("send_ok should send Ok");
@@ -7706,9 +7711,7 @@ mod merged_loop_tests {
         assert_eq!(pending.len(), 0, "oversized Put must not enter pipeline");
 
         // The outer oneshot got a CODE_VALUE_TOO_LARGE PutResp frame.
-        let frame = compio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async { resp_rx.await });
+        let frame = compio::runtime::Runtime::new().unwrap().block_on(resp_rx);
         let bytes = frame
             .expect("outer oneshot dropped")
             .expect("encoded PutResp");
@@ -7779,9 +7782,7 @@ mod merged_loop_tests {
             key: b"x".to_vec(),
         };
         resp.send_err("key is out of range".to_string());
-        let got = compio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async { rx.await });
+        let got = compio::runtime::Runtime::new().unwrap().block_on(rx);
         let err = got.unwrap().err().unwrap();
         assert_eq!(err.0, StatusCode::InvalidArgument);
         assert_eq!(err.1, "key is out of range");
@@ -7793,9 +7794,7 @@ mod merged_loop_tests {
             key: b"y".to_vec(),
         };
         resp2.send_err("log_stream append_segments: boom".to_string());
-        let got2 = compio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async { rx2.await });
+        let got2 = compio::runtime::Runtime::new().unwrap().block_on(rx2);
         let err2 = got2.unwrap().err().unwrap();
         assert_eq!(err2.0, StatusCode::Internal);
     }
@@ -7883,7 +7882,7 @@ mod f099j_tests {
                 region_epoch: 0,
             };
             let payload = partition_rpc::rkyv_encode(&put);
-            let frame = Frame::request(42, MSG_PUT, Bytes::from(payload));
+            let frame = Frame::request(42, MSG_PUT, payload);
             let bytes = frame.encode();
 
             let (mut client_rd, mut client_wr) = client.into_split();
@@ -7977,7 +7976,7 @@ mod f099j_tests {
                     region_epoch: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
-                let f = Frame::request(i + 1, MSG_PUT, Bytes::from(payload));
+                let f = Frame::request(i + 1, MSG_PUT, payload);
                 big_buf.extend_from_slice(&f.encode()[..]);
             }
             let BufResult(r, _) = client_wr.write_all(big_buf).await;
@@ -8178,7 +8177,7 @@ mod f099k_tests {
                         region_epoch: 0,
                     };
                     let payload = partition_rpc::rkyv_encode(&put);
-                    let frame = Frame::request(1, MSG_PUT, Bytes::from(payload)).encode();
+                    let frame = Frame::request(1, MSG_PUT, payload).encode();
                     let BufResult(r, _) = wr.write_all(frame).await;
                     r.expect("write");
 
@@ -8263,7 +8262,7 @@ mod f099k_tests {
                             region_epoch: 0,
                         };
                         let payload = partition_rpc::rkyv_encode(&put);
-                        let f = Frame::request(10, MSG_PUT, Bytes::from(payload)).encode();
+                        let f = Frame::request(10, MSG_PUT, payload).encode();
                         let BufResult(r, _) = wr.write_all(f).await;
                         r.expect("write put");
 
@@ -8299,7 +8298,7 @@ mod f099k_tests {
                             region_epoch: 0,
                         };
                         let payload = partition_rpc::rkyv_encode(&wrong);
-                        let f = Frame::request(11, MSG_PUT, Bytes::from(payload)).encode();
+                        let f = Frame::request(11, MSG_PUT, payload).encode();
                         let BufResult(r, _) = wr.write_all(f).await;
                         r.expect("write mis-routed put");
 
@@ -8405,7 +8404,7 @@ mod f099i_tests {
                 region_epoch: 0,
             };
             let payload = partition_rpc::rkyv_encode(&put);
-            let frame_bytes = Frame::request(77, MSG_PUT, Bytes::from(payload)).encode();
+            let frame_bytes = Frame::request(77, MSG_PUT, payload).encode();
             let BufResult(r, _) = client_wr.write_all(frame_bytes).await;
             r.expect("write");
 
@@ -8524,7 +8523,7 @@ mod f099i_tests {
                     region_epoch: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
-                let f = Frame::request(100 + i, MSG_PUT, Bytes::from(payload)).encode();
+                let f = Frame::request(100 + i, MSG_PUT, payload).encode();
                 big.extend_from_slice(&f[..]);
             }
             let (mut client_rd, mut client_wr) = client.into_split();
@@ -8689,7 +8688,7 @@ mod f099i_tests {
                             }
                         }
                         // Drain any remaining.
-                        while let Some(_) = handlers.next().await {
+                        while handlers.next().await.is_some() {
                             drained += 1;
                         }
                         drained
@@ -8706,7 +8705,7 @@ mod f099i_tests {
                             region_epoch: 0,
                         };
                         let payload = partition_rpc::rkyv_encode(&put);
-                        let f = Frame::request(1000u32 + i, MSG_PUT, Bytes::from(payload)).encode();
+                        let f = Frame::request(1000u32 + i, MSG_PUT, payload).encode();
                         big.extend_from_slice(&f[..]);
                     }
                     let BufResult(r, _) = client_wr.write_all(big).await;
@@ -8841,7 +8840,7 @@ mod f099i_tests {
                     region_epoch: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
-                let frame_bytes = Frame::request(5000 + i, MSG_PUT, Bytes::from(payload)).encode();
+                let frame_bytes = Frame::request(5000 + i, MSG_PUT, payload).encode();
                 let BufResult(r, _) = client_wr.write_all(frame_bytes).await;
                 r.expect("write");
 
@@ -8931,7 +8930,7 @@ mod f099i_tests {
                     region_epoch: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
-                let f = Frame::request(6000 + i, MSG_PUT, Bytes::from(payload)).encode();
+                let f = Frame::request(6000 + i, MSG_PUT, payload).encode();
                 big.extend_from_slice(&f[..]);
             }
             let BufResult(r, _) = client_wr.write_all(big).await;
@@ -9191,7 +9190,7 @@ mod f148_publisher_invariant_tests {
 
             // Drop sender to let worker exit.
             drop(worker_tx);
-            worker_task.await;
+            let _ = worker_task.await;
 
             let recv = received.borrow();
             // (A1) both publishers reached the worker.

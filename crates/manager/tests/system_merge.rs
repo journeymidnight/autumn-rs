@@ -1,3 +1,9 @@
+#![allow(
+    dead_code,
+    unused_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::if_same_then_else
+)] // integration-test file
 //! F183 / F184 — System tests for partition merge primitive.
 //!
 //! Cluster topology: manager + 2 extent-nodes + 1 PS. Tests exercise
@@ -1034,7 +1040,7 @@ fn split_merge_split_with_concurrent_writes() {
                     counter += 1;
                     // Round-robin across the keyspace ('b-...' < 'm', 'n-...' >= 'm')
                     // so writes hit both halves of any post-split topology.
-                    let prefix = if counter % 2 == 0 { "b" } else { "n" };
+                    let prefix = if counter.is_multiple_of(2) { "b" } else { "n" };
                     let key = format!("{prefix}-{counter:06}").into_bytes();
                     // F184 SDK-level rpc_timeout (set on the cluster
                     // above) bounds each put. Expiry surfaces as
@@ -1280,7 +1286,7 @@ fn f185_orchestrated_merge_zero_loss_concurrent_writes() {
                 let mut counter: u64 = 1000;
                 while !stop.get() {
                     counter += 1;
-                    let prefix = if counter % 2 == 0 { "b" } else { "n" };
+                    let prefix = if counter.is_multiple_of(2) { "b" } else { "n" };
                     let key = format!("{prefix}-{counter:06}").into_bytes();
                     match cluster.put(&key, b"v").await {
                         Ok(()) => acked.borrow_mut().push(key),

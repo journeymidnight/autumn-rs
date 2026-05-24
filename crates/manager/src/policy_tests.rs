@@ -696,7 +696,7 @@ fn hot_cold_advisory_skips_when_hottest_below_floor() {
     let owners: HashMap<u64, u64> = vec![(100u64, 42u64), (101, 42)].into_iter().collect();
     eng.compute_hot_cold_advisory(&owners, now);
     assert!(
-        eng.last_hot_cold_at.get(&42).is_none(),
+        !eng.last_hot_cold_at.contains_key(&42),
         "advisory must suppress when hottest is below the QPS floor"
     );
 }
@@ -811,7 +811,7 @@ fn hot_cold_advisory_size_below_floor_does_not_fire() {
     let owners: HashMap<u64, u64> = vec![(200u64, 99u64), (201, 99)].into_iter().collect();
     eng.compute_hot_cold_advisory(&owners, now);
     assert!(
-        eng.last_hot_cold_at.get(&99).is_none(),
+        !eng.last_hot_cold_at.contains_key(&99),
         "size advisory must suppress when hottest size is below the floor"
     );
 }

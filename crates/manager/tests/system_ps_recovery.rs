@@ -11,8 +11,6 @@ mod support;
 use std::time::Duration;
 
 use autumn_rpc::client::RpcClient;
-use autumn_rpc::manager_rpc::*;
-use autumn_rpc::partition_rpc;
 
 use support::*;
 

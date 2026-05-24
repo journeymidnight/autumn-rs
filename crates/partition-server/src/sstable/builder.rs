@@ -103,10 +103,8 @@ impl SstBuilder {
             self.seq_num = ts;
         }
 
-        if expires_at > 0 {
-            if self.min_expires_at == 0 || expires_at < self.min_expires_at {
-                self.min_expires_at = expires_at;
-            }
+        if expires_at > 0 && (self.min_expires_at == 0 || expires_at < self.min_expires_at) {
+            self.min_expires_at = expires_at;
         }
 
         if self.smallest_key.is_empty() {
@@ -291,7 +289,7 @@ mod tests {
         // Force multiple blocks with many entries
         for i in 0u64..2000 {
             let uk = format!("key{i:06}");
-            b.add(&ikey(uk.as_bytes(), i), 1, &vec![0u8; 64], 0);
+            b.add(&ikey(uk.as_bytes(), i), 1, &[0u8; 64], 0);
         }
         let data = b.finish();
         let reader = SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader");

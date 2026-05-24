@@ -662,7 +662,13 @@ extern "C" fn handle_term_signal(_sig: libc::c_int) {
 #[cfg(unix)]
 fn install_term_handler() {
     unsafe {
-        libc::signal(libc::SIGTERM, handle_term_signal as libc::sighandler_t);
-        libc::signal(libc::SIGINT, handle_term_signal as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            handle_term_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            handle_term_signal as *const () as libc::sighandler_t,
+        );
     }
 }

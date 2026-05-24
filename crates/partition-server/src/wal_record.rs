@@ -51,6 +51,7 @@ pub(crate) const V1_SENTINEL: u8 = 0xff;
 /// Inner-payload header size (op + key_len + val_len + expires_at).
 pub(crate) const PAYLOAD_HEADER: usize = 17;
 /// V1 envelope overhead = sentinel(1) + length(4) + crc(4).
+#[allow(dead_code)]
 pub(crate) const V1_ENVELOPE_OVERHEAD: usize = 9;
 
 /// Decoded WAL record — borrows from the input buffer for zero-copy.
@@ -198,6 +199,7 @@ pub(crate) fn encode_v1_segments(
 
 /// Encode one WAL record as a single contiguous V1 envelope buffer. Used by
 /// callers that don't need vectored I/O (mostly tests + GC-rewrite path).
+#[allow(dead_code)]
 pub(crate) fn encode_v1(op: u8, key: &[u8], value: &[u8], expires_at: u64) -> Vec<u8> {
     let value_bytes = Bytes::copy_from_slice(value);
     let (h, v, c) = encode_v1_segments(op, key, value_bytes, expires_at);

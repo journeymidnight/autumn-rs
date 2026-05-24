@@ -8,7 +8,6 @@ mod support;
 use std::rc::Rc;
 
 use autumn_rpc::client::RpcClient;
-use autumn_rpc::manager_rpc::*;
 use autumn_stream::{ConnPool, StreamClient};
 
 use support::*;

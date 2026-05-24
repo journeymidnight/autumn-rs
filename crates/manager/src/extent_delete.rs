@@ -93,7 +93,7 @@ const RETRY_BACKOFF_MAX_SHIFT: u32 = 6;
 fn retry_backoff_secs(attempts: u32) -> i64 {
     let shift = attempts.min(RETRY_BACKOFF_MAX_SHIFT);
     let v = RETRY_BACKOFF_BASE_SECS.saturating_mul(1i64 << shift);
-    v.min(RETRY_BACKOFF_MAX_SECS).max(RETRY_BACKOFF_BASE_SECS)
+    v.clamp(RETRY_BACKOFF_BASE_SECS, RETRY_BACKOFF_MAX_SECS)
 }
 
 fn epoch_seconds() -> i64 {

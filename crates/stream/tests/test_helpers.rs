@@ -1,3 +1,4 @@
+#![allow(dead_code)] // test/bench support toolbox — not every helper is used by every target
 //! Shared test infrastructure for autumn-stream integration tests.
 //!
 //! Provides `TestConn` (typed RPC client over autumn-rpc) and `start_node`
@@ -6,7 +7,6 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use autumn_rpc::Frame;
 use autumn_stream::conn_pool::ConnPool;
 use autumn_stream::extent_rpc::*;
 use autumn_stream::{ExtentNode, ExtentNodeConfig};

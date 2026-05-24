@@ -794,7 +794,7 @@ impl ClusterClient {
                 })
             })
             .await?;
-        let resp: PutResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
+        let resp: PutResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
         if resp.code == partition_rpc::CODE_VALUE_TOO_LARGE {
             // PS-reported cap (lower than CLIENT_PUT_HARD_CAP). Surface the
             // value's size so the caller can size the next put_stream
@@ -927,7 +927,7 @@ impl ClusterClient {
                 })
             })
             .await?;
-        let resp: GetResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
+        let resp: GetResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
         if resp.code == partition_rpc::CODE_NOT_FOUND {
             return Ok(None);
         }
@@ -1026,7 +1026,7 @@ impl ClusterClient {
                 })
             })
             .await?;
-        let resp: DeleteResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
+        let resp: DeleteResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
         if resp.code != partition_rpc::CODE_OK && resp.code != partition_rpc::CODE_NOT_FOUND {
             return Err(code_to_error(resp.code, resp.message));
         }
@@ -1045,7 +1045,7 @@ impl ClusterClient {
                 })
             })
             .await?;
-        let resp: HeadResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
+        let resp: HeadResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
         Ok(KeyMeta {
             found: resp.found,
             value_length: resp.value_length,
@@ -1154,10 +1154,12 @@ impl ClusterClient {
             // partition whose `start_key` is lexically past `prefix`
             // when the user passed an explicit `start` outside the
             // prefix range.
-            if iterations > 1 && !prefix.is_empty() {
-                if !region_start_key.is_empty() && !region_start_key.starts_with(prefix) {
-                    break;
-                }
+            if iterations > 1
+                && !prefix.is_empty()
+                && !region_start_key.is_empty()
+                && !region_start_key.starts_with(prefix)
+            {
+                break;
             }
 
             let resp_bytes = match self
@@ -1195,8 +1197,7 @@ impl ClusterClient {
                     continue;
                 }
             };
-            let resp: RangeResp =
-                rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
+            let resp: RangeResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
             if resp.code != partition_rpc::CODE_OK {
                 return Err(code_to_error(resp.code, resp.message));
             }
@@ -1274,7 +1275,7 @@ impl ClusterClient {
                 })
             })
             .await?;
-        let resp: PutResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
+        let resp: PutResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
         if resp.code != partition_rpc::CODE_OK {
             return Err(code_to_error(resp.code, resp.message));
         }
@@ -1547,8 +1548,7 @@ impl ClusterClient {
                 }),
             )
             .await?;
-        let resp: MaintenanceResp =
-            rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
+        let resp: MaintenanceResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
         if resp.code != partition_rpc::CODE_OK {
             return Err(code_to_error(resp.code, resp.message));
         }

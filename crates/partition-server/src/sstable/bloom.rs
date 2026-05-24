@@ -34,7 +34,7 @@ impl BloomFilterBuilder {
         // k = (m/n) * ln(2)
         let k = ((m as f64 / n) * 2f64.ln()).round() as u32;
         let num_bits = m.max(8);
-        let num_bytes = (num_bits + 7) / 8;
+        let num_bytes = num_bits.div_ceil(8);
         BloomFilterBuilder {
             num_bits,
             num_hashes: k.max(1),

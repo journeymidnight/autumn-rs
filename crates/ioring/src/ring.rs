@@ -55,7 +55,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cqe::{Cqe, CQE_SIZE};
-use crate::header::{RingHeader, CACHE_LINE, HEADER_SIZE};
+use crate::header::RingHeader;
 use crate::sqe::{Sqe, SQE_SIZE};
 
 /// Capacity of the SQ ring. Always a power of 2; slot index =
@@ -76,10 +76,10 @@ fn cq_capacity(h: &RingHeader) -> u64 {
 /// expected to outlive the returned reference; in practice this is
 /// always true because the SHM region is owned for the lifetime of
 /// the ring.
-fn atomic_at<'a>(region: &'a [u8], offset: u64) -> &'a AtomicU64 {
+fn atomic_at(region: &[u8], offset: u64) -> &AtomicU64 {
     debug_assert!(offset as usize + 8 <= region.len(), "offset past region");
     debug_assert!(
-        offset as usize % std::mem::align_of::<AtomicU64>() == 0,
+        (offset as usize).is_multiple_of(std::mem::align_of::<AtomicU64>()),
         "offset not 8-byte aligned"
     );
     let ptr = unsafe { region.as_ptr().add(offset as usize) } as *const AtomicU64;
@@ -302,6 +302,10 @@ pub fn allocate_test_region(header: &RingHeader) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Imported here (not at module top) because these consts are only used by
+    // the tests; keeping them in the non-test import set tripped clippy's
+    // unused-import lint.
+    use crate::header::{CACHE_LINE, HEADER_SIZE};
     use crate::opcode::Opcode;
 
     fn small_header() -> RingHeader {

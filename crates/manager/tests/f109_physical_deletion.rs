@@ -8,11 +8,11 @@
 //!
 //! Skipping the partition-server stack here is deliberate: GC needs
 //! >2.5 GiB of dead VPs to roll a log_stream extent at the default
-//! `max_extent_size = 3 GiB`, which is impractical for an integration
-//! test. Setting `max_extent_size = 1 KiB` on a raw `StreamClient`
-//! produces multiple extents from a handful of small appends and lets
-//! us drive the same manager-side mutation path that GC drives in
-//! production.
+//! > `max_extent_size = 3 GiB`, which is impractical for an integration
+//! > test. Setting `max_extent_size = 1 KiB` on a raw `StreamClient`
+//! > produces multiple extents from a handful of small appends and lets
+//! > us drive the same manager-side mutation path that GC drives in
+//! > production.
 
 mod support;
 

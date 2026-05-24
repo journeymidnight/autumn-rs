@@ -1,3 +1,10 @@
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_must_use,
+    clippy::while_let_loop,
+    clippy::needless_range_loop
+)] // bench/throwaway perf code
 //! Benchmark: ExtentNode 4KB append/read throughput via autumn-rpc wire protocol.
 //!
 //! Single compio runtime thread. One extent, one connection, varying I/O depth.

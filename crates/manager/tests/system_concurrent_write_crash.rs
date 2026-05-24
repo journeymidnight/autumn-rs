@@ -1,3 +1,4 @@
+#![allow(clippy::redundant_pattern_matching)] // integration-test file
 //! Data integrity: concurrent writers + crash/split — no acknowledged writes lost.
 
 mod support;
@@ -5,7 +6,6 @@ mod support;
 use std::time::Duration;
 
 use autumn_rpc::client::RpcClient;
-use autumn_rpc::manager_rpc::*;
 use autumn_rpc::partition_rpc;
 
 use support::*;
@@ -135,7 +135,7 @@ fn concurrent_writers_during_split() {
             for i in 0u32..20 {
                 let key = format!("concurrent-{i:02}");
                 let val = format!("cv-{i:02}");
-                match write_ps
+                if let Ok(_) = write_ps
                     .call(
                         partition_rpc::MSG_PUT,
                         partition_rpc::rkyv_encode(&partition_rpc::PutReq {
@@ -149,8 +149,7 @@ fn concurrent_writers_during_split() {
                     )
                     .await
                 {
-                    Ok(_) => written.push(key),
-                    Err(_) => {}
+                    written.push(key)
                 }
             }
             written

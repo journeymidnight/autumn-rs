@@ -39,16 +39,15 @@ use crate::header::{
 /// message and vice-versa.
 pub const HANDSHAKE_MAGIC: u32 = u32::from_le_bytes(*b"AUSH");
 
-/// HelloRequest wire size: 4 (magic) + 2 (msg_type) + 2 (proto_version)
-/// + 4 (sq_entries) + 4 (cq_entries) + 8 (buf_pool_size) + 4
-/// (buf_slot_size) + 4 (capabilities) = 32 bytes.
+/// HelloRequest wire size = 32 bytes:
+/// 4 (magic) + 2 (msg_type) + 2 (proto_version) + 4 (sq_entries) +
+/// 4 (cq_entries) + 8 (buf_pool_size) + 4 (buf_slot_size) + 4 (capabilities).
 pub const HELLO_REQUEST_SIZE: usize = 32;
 
-/// HelloResponse wire size: 4 (magic) + 2 (msg_type) + 2 (status)
-/// + 4 (sq_entries) + 4 (cq_entries) + 8 (buf_pool_size) + 4
-/// (buf_slot_size) + 4 (capabilities) + 8 (session_id) = 40 bytes.
-/// (Plus `shm_fd` carried out-of-band via SCM_RIGHTS, not in the
-/// payload.)
+/// HelloResponse wire size = 40 bytes:
+/// 4 (magic) + 2 (msg_type) + 2 (status) + 4 (sq_entries) + 4 (cq_entries) +
+/// 8 (buf_pool_size) + 4 (buf_slot_size) + 4 (capabilities) + 8 (session_id).
+/// (Plus `shm_fd` carried out-of-band via SCM_RIGHTS, not in the payload.)
 pub const HELLO_RESPONSE_SIZE: usize = 40;
 
 /// Message type byte — opaque tag distinguishing request vs response

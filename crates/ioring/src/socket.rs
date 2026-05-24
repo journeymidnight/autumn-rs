@@ -69,8 +69,7 @@ pub fn send_response_with_fd(socket: RawFd, resp: &HelloResponse, shm_fd: RawFd)
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         if cmsg.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "CMSG_FIRSTHDR returned null (control buffer too small?)",
             ));
         }
@@ -134,40 +133,32 @@ pub fn recv_response_with_fd(socket: RawFd) -> io::Result<(HelloResponse, OwnedF
             ));
         }
         if msg.msg_flags & libc::MSG_CTRUNC != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "MSG_CTRUNC set: control buffer too small for ancillary data",
             ));
         }
 
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         if cmsg.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "no SCM_RIGHTS attached to handshake response",
             ));
         }
         if (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "unexpected cmsg: level={} type={}",
-                    (*cmsg).cmsg_level,
-                    (*cmsg).cmsg_type
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "unexpected cmsg: level={} type={}",
+                (*cmsg).cmsg_level,
+                (*cmsg).cmsg_type
+            )));
         }
         // We expect exactly one fd.
         let expected_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as libc::size_t;
         if (*cmsg).cmsg_len as libc::size_t != expected_len {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "unexpected cmsg payload size: got {} bytes, expected {}",
-                    (*cmsg).cmsg_len,
-                    expected_len
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "unexpected cmsg payload size: got {} bytes, expected {}",
+                (*cmsg).cmsg_len,
+                expected_len
+            )));
         }
         let mut fd_out: MaybeUninit<RawFd> = MaybeUninit::uninit();
         std::ptr::copy_nonoverlapping(

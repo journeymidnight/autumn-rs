@@ -36,3 +36,6 @@ harness = false
 [[bench]]
 name = "extent_bench"
 harness = false
+
+[lints]
+workspace = true

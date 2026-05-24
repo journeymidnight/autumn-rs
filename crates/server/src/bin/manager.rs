@@ -163,16 +163,18 @@ async fn main() -> Result<()> {
     }
 
     if args.policy_fast_mode {
-        let mut cfg = autumn_manager::policy::PolicyConfig::default();
-        cfg.required_buckets = 1;
-        cfg.tick_interval_sec = 5;
-        cfg.bucket_sec = 5;
-        cfg.gc_debt_high = 1024 * 1024;
-        cfg.compact_pending_high = 4 * 1024 * 1024;
-        cfg.gc_cooldown_sec = 30;
-        cfg.compact_cooldown_sec = 30;
-        cfg.split_cooldown_sec = 30;
-        cfg.merge_cooldown_sec = 30;
+        let cfg = autumn_manager::policy::PolicyConfig {
+            required_buckets: 1,
+            tick_interval_sec: 5,
+            bucket_sec: 5,
+            gc_debt_high: 1024 * 1024,
+            compact_pending_high: 4 * 1024 * 1024,
+            gc_cooldown_sec: 30,
+            compact_cooldown_sec: 30,
+            split_cooldown_sec: 30,
+            merge_cooldown_sec: 30,
+            ..Default::default()
+        };
         manager.set_policy_config(cfg);
         tracing::warn!(
             "F187: --policy-fast-mode enabled; thresholds={{gc_debt=1MiB, compact=4MiB, bucket=5s, tick=5s, required=1, cooldown=30s}}. NOT FOR PRODUCTION."

@@ -209,6 +209,13 @@ impl FrameDecoder {
 
         let payload_len = u32::from_le_bytes(self.buf[6..10].try_into().unwrap());
 
+        // Defensive bound, deliberately kept even though it is always false
+        // today (`MAX_PAYLOAD_LEN == u32::MAX`, and `payload_len` is a u32). It
+        // becomes load-bearing the moment `MAX_PAYLOAD_LEN` is lowered to a real
+        // practical cap — at which point removing it would be a silent
+        // regression. `#[allow]` rather than delete so that future-proofing
+        // stays in place.
+        #[allow(clippy::absurd_extreme_comparisons)]
         if payload_len > MAX_PAYLOAD_LEN {
             return Err(FrameError::PayloadTooLarge(payload_len));
         }

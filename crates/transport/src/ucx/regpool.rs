@@ -76,6 +76,10 @@ struct PoolState {
     buckets: HashMap<usize, Vec<Slab>>,
     /// total registered bytes currently held in `buckets` (free-list only).
     pooled_bytes: usize,
+    /// Read only on the `#[cfg(feature = "ucx")]` warn-once path (ucp_mem_map
+    /// failure); the field + its init are always compiled, so the default
+    /// (non-ucx) build sees it as never-read.
+    #[allow(dead_code)]
     warned_over_cap: bool,
 }
 

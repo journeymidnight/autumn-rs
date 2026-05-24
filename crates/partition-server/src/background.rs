@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use autumn_stream::StreamClient;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use futures::channel::mpsc;
 use futures::StreamExt;
 
@@ -77,6 +77,7 @@ pub fn set_gc_rate_bytes_per_sec(n: u64) -> bool {
 pub(crate) fn min_pipeline_batch() -> usize {
     *MIN_PIPELINE_BATCH_CELL.get_or_init(|| DEFAULT_MIN_PIPELINE_BATCH)
 }
+#[allow(dead_code)]
 pub(crate) const MIN_PIPELINE_BATCH: usize = DEFAULT_MIN_PIPELINE_BATCH;
 
 pub(crate) struct CompactStats {
@@ -308,7 +309,7 @@ pub(crate) async fn background_compact_loop(
                 };
                 if has_expired {
                     let tbls = part.borrow().tables.clone();
-                    if tbls.len() >= 1 {
+                    if !tbls.is_empty() {
                         let last_extent = tbls.last().map(|t| t.extent_id).unwrap_or(0);
                         let _permit = concurrency_ctrl.acquire_compact().await;
                         metrics
@@ -721,7 +722,7 @@ pub(crate) async fn background_gc_loop(
                 // forever. We now iterate every sealed extent, sorted
                 // by reclaimable bytes desc (zero-discard extents land
                 // last but still reachable).
-                let mut candidates: Vec<u64> = sealed_extents.iter().copied().collect();
+                let mut candidates: Vec<u64> = sealed_extents.to_vec();
                 candidates.sort_by(|a, b| {
                     let da = discards.get(a).copied().unwrap_or(0);
                     let db = discards.get(b).copied().unwrap_or(0);
@@ -734,7 +735,7 @@ pub(crate) async fn background_gc_loop(
                 // halved when stream-level dead bytes cross
                 // `stream_debt`, plus `max_size` upper bound.
                 let stream_dead: u64 = discards.values().map(|v| (*v).max(0) as u64).sum();
-                let stream_debt_hit = params.stream_debt.map_or(false, |hw| stream_dead >= hw);
+                let stream_debt_hit = params.stream_debt.is_some_and(|hw| stream_dead >= hw);
                 let effective_ratio = if params.empty_only {
                     f64::INFINITY // ratio gate unreachable
                 } else {
@@ -805,7 +806,7 @@ pub(crate) async fn background_gc_loop(
             holes.retain(|eid| {
                 gc_failure_cooldown
                     .get(eid)
-                    .map_or(true, |(t, dur)| now.duration_since(*t) >= *dur)
+                    .is_none_or(|(t, dur)| now.duration_since(*t) >= *dur)
             });
             if holes.len() < initial_len {
                 tracing::info!(
@@ -878,11 +879,11 @@ pub(crate) async fn background_gc_loop(
     }
 }
 
-/// F099-D: `background_write_loop` and its R1/LF dispatch helpers are gone —
-/// the write loop is now inlined into `partition_loop` on the main
-/// P-log task. The primitives below (`start_write_batch`, `finish_write_batch`,
-/// `handle_completion`, `InflightCompletion`, `InFlightBatch`, `BatchData`)
-/// remain as building blocks used by that merged loop.
+// F099-D: `background_write_loop` and its R1/LF dispatch helpers are gone —
+// the write loop is now inlined into `partition_loop` on the main
+// P-log task. The primitives below (`start_write_batch`, `finish_write_batch`,
+// `handle_completion`, `InflightCompletion`, `InFlightBatch`, `BatchData`)
+// remain as building blocks used by that merged loop.
 
 /// Carrier payload pushed through the FuturesUnordered completion queue.
 /// `data` is the Phase-1 validated batch; `phase2_result` is the return
@@ -1325,7 +1326,7 @@ pub(crate) fn compute_pending_compaction_bytes(part: &Rc<RefCell<PartitionData>>
 ///   can plumb this from the GC loop's `get_stream_info` call.
 pub(crate) fn refresh_f202_metrics(part: &Rc<RefCell<PartitionData>>) {
     use std::sync::atomic::Ordering::Relaxed;
-    let now = crate::now_secs() as u64;
+    let now = crate::now_secs();
 
     let (tbls, readers, overlap, metrics) = {
         let p = part.borrow();
@@ -1532,13 +1533,15 @@ async fn compact_row_append(
     } else {
         // Fallback: P-bulk failed to spawn → flush also runs on P-log,
         // so single-writer invariant is preserved by accident.
-        part_sc
-            .append_bytes(row_stream_id, sst_bytes)
-            .await
-            .map_err(Into::into)
+        part_sc.append_bytes(row_stream_id, sst_bytes).await
     }
 }
 
+// clippy false-positive: every `part.borrow_mut()` here is `drop(p)`-ed before
+// the following `.await` (the F148-A publish invariant requires exactly this —
+// no await between the borrow_mut drop and the meta-stream mpsc send). The lint
+// flags the borrow because awaits exist later in the fn; it doesn't track the drop.
+#[allow(clippy::await_holding_refcell_ref)]
 pub(crate) async fn do_compact(
     part: &Rc<RefCell<PartitionData>>,
     tbls: Vec<TableMeta>,
@@ -3046,14 +3049,14 @@ mod sqcq_tests {
         // Default (no env override) = 8. The env is read once via OnceLock;
         // we only assert default or that the cached value is valid.
         let v = crate::ps_inflight_cap();
-        assert!(v >= 1 && v <= 64, "ps_inflight_cap out of range: {}", v);
+        assert!((1..=64).contains(&v), "ps_inflight_cap out of range: {}", v);
     }
 
     #[test]
     fn ps_bulk_inflight_cap_default_and_bounds() {
         let v = crate::ps_bulk_inflight_cap();
         assert!(
-            v >= 1 && v <= 16,
+            (1..=16).contains(&v),
             "ps_bulk_inflight_cap out of range: {}",
             v
         );

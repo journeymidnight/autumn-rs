@@ -8,14 +8,12 @@
 mod support;
 
 use std::net::SocketAddr;
-use std::rc::Rc;
 use std::time::Duration;
 
 use autumn_manager::AutumnManager;
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::partition_rpc;
-use autumn_stream::{ConnPool, ExtentNode, ExtentNodeConfig, StreamClient};
 
 use support::*;
 
