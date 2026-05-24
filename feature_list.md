@@ -3401,7 +3401,50 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   - `cargo build --workspace` clean,WITH 和 WITHOUT `--features ucx`。
   - co-locate 集群(P=ucx, 其余 TCP):client→PS 走 UCX(`is_ucx()`/rc_mlx5 验证),PS→本地EN 走 TCP(抓包/日志确认无 cma),put/get + zc-get 字节一致;`cargo test -p autumn-stream / -p autumn-partition-server / -p autumn-rpc / -p autumn-transport` 绿。
   - (档 2) 跨机拓扑:PS→外地EN 走 UCX、PS→本地EN 走 TCP 同时成立;manager→PS 控制 RPC 通。
-- **passes:** false (deferred — 改动较大,档位未定 2026-05-21)
+- **Decision + analysis (2026-05-24, user review "有完成的必要吗?参考其他分布式系统"):**
+  **Not worth building now; defer.** Build the full per-link router only if a real
+  mixed topology (one PS connecting BOTH local and remote EN) is profiled and the
+  intra-host-over-UCX penalty is shown to matter. Rationale:
+  - **The big win is already captured.** The cross-host `client→PS` UCX advantage
+    (~4.6× on 8 MiB reads — see [[project_ucx_crosshost_wins]]) is delivered by the
+    existing global `--transport ucx`. F231 only additionally saves the **intra-host
+    PS↔EN `cma` penalty** — a conditional, bounded edge, behind a large change
+    (dual TCP+UCX listeners per EN/PS, per-target locality resolution).
+  - **Multi-ep / RC scaling reinforces this.** UCX gets *worse with more
+    connections* because RC = one QP per ep and the NIC's on-chip QP-context cache
+    (≈ a few hundred) thrashes beyond that — the classic **RC scalability cliff**
+    (eRPC/FaSST switched to UD/DC for exactly this). It's the **total active QPs
+    across the NIC** (workers × eps), not eps-per-worker, that matters: one worker
+    with 8 eps is healthy (929 MB/s, no cliff); the earlier "multi-worker collapse"
+    was a *misdiagnosis* (perf-check `--threads N` = N ucp_workers oversubscribing;
+    root cause was 2 autumn bugs — RLIMIT_MEMLOCK + missing `mt_workers_shared` —
+    fixed in commit b992c43, see [[project_ucx_intrahost_blocked]]). DC solves the
+    QP wall but **fatal-aborts in this env** (so `estimated_num_eps` is left unset →
+    autumn stays on RC). Net: UCX should be reserved for a FEW high-value cross-host
+    bulk links; pushing it onto intra-host PS↔EN ADDS QPs (worsens the wall) for a
+    path where TCP loopback already wins — so "intra-host TCP" is right, but the
+    cheap way to get it is NOT this router.
+  - **Cheaper alternatives, in priority order, if the penalty ever proves material:**
+    1. **Ceph-style role/network split** — client-facing transport = UCX,
+       intra-cluster (PS↔EN, EN↔EN) = TCP. Coarser than per-destination locality
+       but a fraction of the surface; Ceph's `public` vs `cluster` network + per-
+       network `ms_type` is exactly this.
+    2. **Deploy EN and PS on separate nodes** — PS↔EN becomes cross-host → UCX
+       wins → the intra-host-cma problem simply vanishes (a deployment choice, zero
+       code).
+    3. **Fix UCX intra-node TLS** — get a fast shm transport (posix / xpmem / knem)
+       working instead of falling to `cma`; this is the "let UCX do locality"
+       path — UCX_TLS already distinguishes intra-node shm from inter-node rc/dc, so
+       F231 is partly reimplementing UCX's own job.
+  - **Reference systems:** UCX itself does locality selection (UCX_TLS shm vs rc/dc)
+    → F231 partly duplicates it. Ceph = role/network split (not per-link locality).
+    TiKV / CockroachDB / ScyllaDB = single transport (gRPC/TCP), no RDMA locality.
+    NCCL / MPI = per-link topology selection, but that's bandwidth-critical collective
+    comm where every % counts; a storage data path doesn't warrant the same.
+- **passes:** false (deferred, low priority — decision recorded 2026-05-24: prefer
+  Ceph-style role-split / separate-node deployment / UCX intra-node TLS fix over
+  this full per-link router; build only on profiled mixed-topology need. Was:
+  "改动较大,档位未定 2026-05-21".)
 
 ## P11 — cluster.sh UCX/multi-shard robustness (F220)
 
