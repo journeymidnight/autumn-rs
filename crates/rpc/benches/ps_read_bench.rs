@@ -30,7 +30,10 @@ const MSG_READ_BYTES_ZC: u8 = 15;
 const CODE_OK: u8 = 0;
 
 fn env(k: &str, d: u64) -> u64 {
-    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(d)
 }
 
 fn pin_to(core: usize) {
@@ -97,8 +100,7 @@ async fn serve_conn(conn: autumn_transport::Conn, value: Bytes) {
         } else {
             // Non-ZC: regular framed response, value as the payload (the client's
             // `call` recvs it into the decode buffer — no recv-into-registered).
-            let resp =
-                autumn_rpc::frame::Frame::response(req_id, msg_type, value.clone()).encode();
+            let resp = autumn_rpc::frame::Frame::response(req_id, msg_type, value.clone()).encode();
             if w.write_all(resp).await.0.is_err() {
                 return;
             }
@@ -118,7 +120,10 @@ async fn client_shared(addr: SocketAddr, conns: usize, dur: Duration) -> f64 {
         let b = bytes.clone();
         tasks.push(compio::runtime::spawn(async move {
             while Instant::now() < deadline {
-                match c.call_into_pooled(MSG_READ_BYTES_ZC, Bytes::from_static(b"r")).await {
+                match c
+                    .call_into_pooled(MSG_READ_BYTES_ZC, Bytes::from_static(b"r"))
+                    .await
+                {
                     Ok((pb, _)) => b.set(b.get() + pb.len() as u64),
                     Err(_) => break,
                 }
@@ -142,7 +147,10 @@ async fn client_perconn(addr: SocketAddr, conns: usize, dur: Duration) -> f64 {
         tasks.push(compio::runtime::spawn(async move {
             let c = RpcClient::connect(addr).await.expect("connect");
             while Instant::now() < deadline {
-                match c.call_into_pooled(MSG_READ_BYTES_ZC, Bytes::from_static(b"r")).await {
+                match c
+                    .call_into_pooled(MSG_READ_BYTES_ZC, Bytes::from_static(b"r"))
+                    .await
+                {
                     Ok((pb, _)) => b.set(b.get() + pb.len() as u64),
                     Err(_) => break,
                 }
@@ -191,7 +199,9 @@ fn main() {
     let conns = env("AUTUMN_PSREAD_CONNS", 8) as usize;
     let dur = Duration::from_secs(env("AUTUMN_PSREAD_DURATION", 5));
     let core = env("AUTUMN_PSREAD_CORE", 3) as usize;
-    let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let ncpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
 
     let transport = match std::env::var("AUTUMN_TRANSPORT").as_deref() {
         Ok("ucx") => TransportKind::Ucx,
@@ -220,10 +230,7 @@ fn main() {
         pin_avoid(core, ncpu);
         let rt = compio::runtime::Runtime::new().expect("server rt");
         rt.block_on(async move {
-            let mut listener = autumn_transport::current()
-                .bind(bind)
-                .await
-                .expect("bind");
+            let mut listener = autumn_transport::current().bind(bind).await.expect("bind");
             tx.send(listener.local_addr().expect("local_addr")).unwrap();
             loop {
                 match listener.accept().await {

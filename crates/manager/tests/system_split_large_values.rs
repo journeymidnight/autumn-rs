@@ -81,7 +81,11 @@ fn split_with_large_values_preserves_vp_resolution() {
         compio::time::sleep(Duration::from_millis(6000)).await;
 
         let regions = get_regions(&mgr).await;
-        assert_eq!(regions.regions.len(), 2, "should have 2 partitions after split");
+        assert_eq!(
+            regions.regions.len(),
+            2,
+            "should have 2 partitions after split"
+        );
 
         let left_rg = regions
             .regions

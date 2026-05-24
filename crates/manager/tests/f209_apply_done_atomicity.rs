@@ -91,8 +91,10 @@ fn f209_e_apply_ec_conversion_done_atomic_success() {
             .await
             .expect("get marker");
         assert!(
-            pre_marker.kvs.iter().any(|kv| kv.key
-                == extent_inflight_key(extent_id).into_bytes()),
+            pre_marker
+                .kvs
+                .iter()
+                .any(|kv| kv.key == extent_inflight_key(extent_id).into_bytes()),
             "F207: extent_inflight marker must be in etcd after acquire"
         );
 

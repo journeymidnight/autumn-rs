@@ -54,7 +54,10 @@ fn ps_crash_unflushed_data_recoverable() {
         let resp = ps_get(&ps1, 801, b"key-0000").await;
         assert_eq!(resp.value, b"value-0", "data should be readable from PS1");
         let resp = ps_get(&ps1, 801, b"key-0049").await;
-        assert_eq!(resp.value, b"value-49", "last key should be readable from PS1");
+        assert_eq!(
+            resp.value, b"value-49",
+            "last key should be readable from PS1"
+        );
 
         // "Crash" PS1 by dropping the RPC client. Start PS2 with the SAME
         // ps_id so it takes over the partition assignment immediately.
@@ -110,7 +113,7 @@ fn sequential_ps_crash_data_accumulates() {
                 &ps1,
                 802,
                 format!("batch1-{i:02}").as_bytes(),
-                format!("val1-{i}").as_bytes()
+                format!("val1-{i}").as_bytes(),
             )
             .await;
         }
@@ -131,7 +134,7 @@ fn sequential_ps_crash_data_accumulates() {
                 &ps2,
                 802,
                 format!("batch2-{i:02}").as_bytes(),
-                format!("val2-{i}").as_bytes()
+                format!("val2-{i}").as_bytes(),
             )
             .await;
         }

@@ -178,7 +178,10 @@ async fn drop_recv_into_registered_mid_await_is_safe() {
     // (1) Registered recv dropped mid-await by a 1ms timeout.
     {
         let mut pb = regpool_acquire(LEN);
-        assert!(pb.reg().is_some(), "buffer should be registered (under memlock cap)");
+        assert!(
+            pb.reg().is_some(),
+            "buffer should be registered (under memlock cap)"
+        );
         let race = async {
             let (dest, reg) = pb.dest_and_reg();
             let _ = r.recv_into(dest, reg).await;

@@ -56,16 +56,14 @@ use autumn_rpc::partition_rpc::{
 };
 use clap::Parser;
 
-use autumn_ioring::handshake::{
-    self, DaemonLimits, HelloStatus,
-};
-use autumn_ioring::header::{HEADER_SIZE, RingHeader};
+use autumn_ioring::cqe::Cqe;
+use autumn_ioring::handshake::{self, DaemonLimits, HelloStatus};
+use autumn_ioring::header::{RingHeader, HEADER_SIZE};
 use autumn_ioring::mmap::{prot, MmapRegion};
 use autumn_ioring::opcode::Opcode;
 use autumn_ioring::ring::{CqProducer, SqConsumer};
-use autumn_ioring::cqe::Cqe;
-use autumn_ioring::sqe::Sqe;
 use autumn_ioring::socket;
+use autumn_ioring::sqe::Sqe;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -237,14 +235,11 @@ async fn handle_session(
         + (header.cq_entries as u64) * (autumn_ioring::cqe::CQE_SIZE as u64);
 
     let shm_size = header.total_size();
-    let memfd = socket::create_memfd(
-        &format!("autumn-ioring-{:016x}", session_id),
-        shm_size,
-    )
-    .context("create memfd")?;
+    let memfd = socket::create_memfd(&format!("autumn-ioring-{:016x}", session_id), shm_size)
+        .context("create memfd")?;
 
-    let mut region = MmapRegion::map(&memfd, shm_size as usize, prot::READ_WRITE)
-        .context("mmap memfd")?;
+    let mut region =
+        MmapRegion::map(&memfd, shm_size as usize, prot::READ_WRITE).context("mmap memfd")?;
     {
         let mut hbuf = [0u8; HEADER_SIZE as usize];
         header.encode(&mut hbuf);
@@ -283,8 +278,7 @@ async fn poller_loop(
     _memfd: std::os::unix::io::OwnedFd,
 ) -> Result<()> {
     let region: Rc<RefCell<MmapRegion>> = Rc::new(RefCell::new(region));
-    let ring_fds: Rc<RefCell<HashMap<u32, OpenedFile>>> =
-        Rc::new(RefCell::new(HashMap::new()));
+    let ring_fds: Rc<RefCell<HashMap<u32, OpenedFile>>> = Rc::new(RefCell::new(HashMap::new()));
     let next_fd: Rc<Cell<u32>> = Rc::new(Cell::new(1));
     let backoff = Duration::from_micros(idle_us);
 
@@ -306,15 +300,8 @@ async fn poller_loop(
             let ring_fds_c = ring_fds.clone();
             let next_fd_c = next_fd.clone();
             compio::runtime::spawn(async move {
-                let cqe = service_sqe(
-                    sqe,
-                    &region_c,
-                    &header,
-                    &cluster_c,
-                    &ring_fds_c,
-                    &next_fd_c,
-                )
-                .await;
+                let cqe =
+                    service_sqe(sqe, &region_c, &header, &cluster_c, &ring_fds_c, &next_fd_c).await;
                 let mut r = region_c.borrow_mut();
                 let mut prod = CqProducer::new(r.as_mut_slice(), header);
                 if prod.try_push(cqe).is_err() {
@@ -344,8 +331,7 @@ async fn service_sqe(
             }
             let path = {
                 let r = region.borrow();
-                r.as_slice()
-                    [sqe.buf_offset as usize..sqe.buf_offset as usize + sqe.length as usize]
+                r.as_slice()[sqe.buf_offset as usize..sqe.buf_offset as usize + sqe.length as usize]
                     .to_vec()
             };
             // Existence check — same semantics as before.
@@ -367,7 +353,14 @@ async fn service_sqe(
             };
             let fd = next_fd.get();
             next_fd.set(fd.checked_add(1).unwrap_or(1));
-            ring_fds.borrow_mut().insert(fd, OpenedFile { key: path, part_id, ps });
+            ring_fds.borrow_mut().insert(
+                fd,
+                OpenedFile {
+                    key: path,
+                    part_id,
+                    ps,
+                },
+            );
             Cqe::ok(sqe.user_data, fd as u64)
         }
 
@@ -405,10 +398,7 @@ async fn service_sqe(
             let payload = rkyv_encode(&req);
             // Bounded so a paged-out / hung PS surfaces as EIO to the
             // ioring user instead of wedging this Read SQE forever.
-            let resp_bytes = match ps
-                .call_timeout(MSG_GET, payload, DEFAULT_RPC_TIMEOUT)
-                .await
-            {
+            let resp_bytes = match ps.call_timeout(MSG_GET, payload, DEFAULT_RPC_TIMEOUT).await {
                 Ok(b) => b,
                 Err(_) => {
                     let _ = cluster; // unused warning suppression
@@ -433,8 +423,8 @@ async fn service_sqe(
             let n = end - start;
             {
                 let mut r = region.borrow_mut();
-                let dst = &mut r.as_mut_slice()
-                    [sqe.buf_offset as usize..sqe.buf_offset as usize + n];
+                let dst =
+                    &mut r.as_mut_slice()[sqe.buf_offset as usize..sqe.buf_offset as usize + n];
                 dst.copy_from_slice(&resp.value[start..end]);
             }
             Cqe::ok(sqe.user_data, n as u64)

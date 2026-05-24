@@ -86,9 +86,7 @@ impl Drop for ChildGuard {
 /// Wrapper around `Command::output` that includes stdout + stderr in
 /// the panic message so failures are debuggable.
 fn run_or_panic(name: &str, mut cmd: Command) -> Vec<u8> {
-    let out = cmd
-        .output()
-        .unwrap_or_else(|e| panic!("spawn {name}: {e}"));
+    let out = cmd.output().unwrap_or_else(|e| panic!("spawn {name}: {e}"));
     if !out.status.success() {
         panic!(
             "{name} exited {:?}\nstdout:\n{}\nstderr:\n{}",
@@ -127,12 +125,7 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
     let _manager = ChildGuard::new(
         "manager",
         Command::new(MANAGER_BIN)
-            .args([
-                "--port",
-                &mgr_port.to_string(),
-                "--listen",
-                "127.0.0.1",
-            ])
+            .args(["--port", &mgr_port.to_string(), "--listen", "127.0.0.1"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -237,13 +230,7 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
     // ── bootstrap ───────────────────────────────────────────────────
     {
         let mut cmd = Command::new(AUTUMN_OP_BIN);
-        cmd.args([
-            "--manager",
-            &mgr_addr,
-            "bootstrap",
-            "--replication",
-            "1+0",
-        ]);
+        cmd.args(["--manager", &mgr_addr, "bootstrap", "--replication", "1+0"]);
         let stdout = run_or_panic("autumn-op bootstrap", cmd);
         let text = String::from_utf8_lossy(&stdout);
         assert!(
@@ -305,8 +292,7 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("autumn-op")
-                && stderr.contains("split 1"),
+            stderr.contains("autumn-op") && stderr.contains("split 1"),
             "op stub stderr should mention autumn-op + the forwarded args, got:\n{stderr}"
         );
     }

@@ -81,7 +81,11 @@ struct PoolState {
 
 impl PoolState {
     fn new() -> Self {
-        Self { buckets: HashMap::new(), pooled_bytes: 0, warned_over_cap: false }
+        Self {
+            buckets: HashMap::new(),
+            pooled_bytes: 0,
+            warned_over_cap: false,
+        }
     }
 }
 
@@ -188,10 +192,7 @@ impl compio::buf::IoBufMut for PooledBuf {
         // already initialized (the slab is zeroed on first alloc), so viewing
         // them as MaybeUninit is sound. `read_at` writes them before read-back.
         unsafe {
-            std::slice::from_raw_parts_mut(
-                buf.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>,
-                used,
-            )
+            std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>, used)
         }
     }
 }
@@ -241,7 +242,11 @@ pub fn acquire(need: usize) -> PooledBuf {
     });
 
     if let Some(slab) = slab {
-        return PooledBuf { slab: Some(slab), class, used: need };
+        return PooledBuf {
+            slab: Some(slab),
+            class,
+            used: need,
+        };
     }
 
     // Allocate a fresh slab. zeroed (avoids reading uninit before recv).
@@ -268,7 +273,11 @@ pub fn acquire(need: usize) -> PooledBuf {
     // No-ucx: RegisteredMem is uninhabited, so `reg` is always None.
     #[cfg(not(feature = "ucx"))]
     let reg: Option<RegisteredMem> = None;
-    PooledBuf { slab: Some(Slab { buf, reg }), class, used: need }
+    PooledBuf {
+        slab: Some(Slab { buf, reg }),
+        class,
+        used: need,
+    }
 }
 
 #[cfg(test)]
@@ -324,8 +333,8 @@ mod tests {
         use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
         let n = 5000usize;
         let pattern: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
-        let path = std::env::temp_dir()
-            .join(format!("autumn_regpool_pread_{}.bin", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("autumn_regpool_pread_{}.bin", std::process::id()));
         let rt = compio::runtime::Runtime::new().expect("compio rt");
         rt.block_on(async {
             {
@@ -339,7 +348,11 @@ mod tests {
             let compio::BufResult(res, pb) = f.read_exact_at(pb, 0).await;
             res.expect("read_exact_at must fill exactly `used` bytes (not class)");
             assert_eq!(pb.len(), n);
-            assert_eq!(pb.filled(), &pattern[..], "pooled slab must hold file bytes");
+            assert_eq!(
+                pb.filled(),
+                &pattern[..],
+                "pooled slab must hold file bytes"
+            );
             let _ = compio::fs::remove_file(&path).await;
         });
     }

@@ -99,8 +99,7 @@ fn f109_startup_reconcile_unlinks_orphans() {
     let mgr_addr_str = mgr_addr.to_string();
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let cfg = ExtentNodeConfig::new(n_dir_path, 8001)
-                .with_manager_endpoint(mgr_addr_str);
+            let cfg = ExtentNodeConfig::new(n_dir_path, 8001).with_manager_endpoint(mgr_addr_str);
             let n = ExtentNode::new(cfg).await.expect("extent node new");
             let _ = n.serve(n_addr).await;
         });
@@ -122,11 +121,9 @@ fn f109_startup_reconcile_unlinks_orphans() {
         // Reconcile happens during ExtentNode::new (BEFORE serve()), so
         // by the time we observe the dir, the orphan should already be
         // unlinked. Poll briefly to absorb any startup jitter.
-        let unlinked = poll_until(
-            Duration::from_secs(4),
-            Duration::from_millis(100),
-            || !orphan_present(n_dir.path(), orphan_id),
-        )
+        let unlinked = poll_until(Duration::from_secs(4), Duration::from_millis(100), || {
+            !orphan_present(n_dir.path(), orphan_id)
+        })
         .await;
 
         assert!(

@@ -35,20 +35,24 @@ fn crash_during_compaction_no_data_loss() {
         // Write 20 keys, flush -> SSTable 1
         for i in 0u32..20 {
             ps_put(
-                &ps1, 901,
+                &ps1,
+                901,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes()
-            ).await;
+                format!("val-{i}").as_bytes(),
+            )
+            .await;
         }
         ps_flush(&ps1, 901).await;
 
         // Write 20 more, flush -> SSTable 2
         for i in 20u32..40 {
             ps_put(
-                &ps1, 901,
+                &ps1,
+                901,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes()
-            ).await;
+                format!("val-{i}").as_bytes(),
+            )
+            .await;
         }
         ps_flush(&ps1, 901).await;
 
@@ -103,10 +107,12 @@ fn crash_during_compaction_then_successful_compact() {
         // SSTable 1: 30 keys
         for i in 0u32..30 {
             ps_put(
-                &ps1, 902,
+                &ps1,
+                902,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes()
-            ).await;
+                format!("val-{i}").as_bytes(),
+            )
+            .await;
         }
         ps_flush(&ps1, 902).await;
 
@@ -119,10 +125,12 @@ fn crash_during_compaction_then_successful_compact() {
         // SSTable 3: 15 new keys
         for i in 30u32..45 {
             ps_put(
-                &ps1, 902,
+                &ps1,
+                902,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes()
-            ).await;
+                format!("val-{i}").as_bytes(),
+            )
+            .await;
         }
         ps_flush(&ps1, 902).await;
 
@@ -141,7 +149,11 @@ fn crash_during_compaction_then_successful_compact() {
         for i in 15u32..45 {
             let key = format!("key-{i:02}");
             let resp = ps_get(&ps2, 902, key.as_bytes()).await;
-            assert_eq!(resp.value, format!("val-{i}").as_bytes(), "{key} must survive");
+            assert_eq!(
+                resp.value,
+                format!("val-{i}").as_bytes(),
+                "{key} must survive"
+            );
         }
 
         // Second compaction must succeed cleanly
@@ -156,7 +168,11 @@ fn crash_during_compaction_then_successful_compact() {
         for i in 15u32..45 {
             let key = format!("key-{i:02}");
             let resp = ps_get(&ps2, 902, key.as_bytes()).await;
-            assert_eq!(resp.value, format!("val-{i}").as_bytes(), "{key} wrong after re-compact");
+            assert_eq!(
+                resp.value,
+                format!("val-{i}").as_bytes(),
+                "{key} wrong after re-compact"
+            );
         }
     });
 }

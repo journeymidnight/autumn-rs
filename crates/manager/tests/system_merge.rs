@@ -39,9 +39,16 @@ async fn merge_partitions(
     let lock_payload = rkyv_encode(&AcquireOwnerLockReq {
         owner_key: owner_key.clone(),
     });
-    let lock_bytes = mgr.call(MSG_ACQUIRE_OWNER_LOCK, lock_payload).await.unwrap();
+    let lock_bytes = mgr
+        .call(MSG_ACQUIRE_OWNER_LOCK, lock_payload)
+        .await
+        .unwrap();
     let lock_resp: AcquireOwnerLockResp = rkyv_decode(&lock_bytes).unwrap();
-    assert_eq!(lock_resp.code, CODE_OK, "acquire_owner_lock: {}", lock_resp.message);
+    assert_eq!(
+        lock_resp.code, CODE_OK,
+        "acquire_owner_lock: {}",
+        lock_resp.message
+    );
     let revision = lock_resp.revision;
 
     // Resolve stream IDs via GetRegions.
@@ -76,7 +83,11 @@ async fn merge_partitions(
             });
             let bytes = mgr.call(MSG_CHECK_COMMIT_LENGTH, req).await.unwrap();
             let resp: CheckCommitLengthResp = rkyv_decode(&bytes).unwrap();
-            assert_eq!(resp.code, CODE_OK, "commit_length stream={sid}: {}", resp.message);
+            assert_eq!(
+                resp.code, CODE_OK,
+                "commit_length stream={sid}: {}",
+                resp.message
+            );
             resp.end as u64
         }
     };
@@ -96,7 +107,10 @@ async fn merge_partitions(
     });
     let resp_bytes = mgr.call(MSG_MULTI_MODIFY_MERGE, req).await.unwrap();
     let resp: MultiModifyMergeResp = rkyv_decode(&resp_bytes).unwrap();
-    CodeResp { code: resp.code, message: resp.message }
+    CodeResp {
+        code: resp.code,
+        message: resp.message,
+    }
 }
 
 /// Happy path: split a partition, then merge children back. All keys
@@ -127,8 +141,20 @@ fn merge_split_round_trip_keys_intact() {
 
         // Write 10 keys spread across [a..z): "key-00".."key-09" + "merge-00".."merge-09"
         for i in 0u8..10 {
-            ps_put(&ps, 1001, format!("key-{:02}", i).as_bytes(), format!("LV{i}").as_bytes()).await;
-            ps_put(&ps, 1001, format!("merge-{:02}", i).as_bytes(), format!("RV{i}").as_bytes()).await;
+            ps_put(
+                &ps,
+                1001,
+                format!("key-{:02}", i).as_bytes(),
+                format!("LV{i}").as_bytes(),
+            )
+            .await;
+            ps_put(
+                &ps,
+                1001,
+                format!("merge-{:02}", i).as_bytes(),
+                format!("RV{i}").as_bytes(),
+            )
+            .await;
         }
         ps_flush(&ps, 1001).await;
 
@@ -161,8 +187,16 @@ fn merge_split_round_trip_keys_intact() {
         )
         .await;
         let regions = get_regions(&mgr).await;
-        assert_eq!(regions.regions.len(), 2, "expected 2 partitions after split");
-        assert_eq!(regions.part_addrs.len(), 2, "expected 2 part_addrs after split");
+        assert_eq!(
+            regions.regions.len(),
+            2,
+            "expected 2 partitions after split"
+        );
+        assert_eq!(
+            regions.part_addrs.len(),
+            2,
+            "expected 2 part_addrs after split"
+        );
         let mut survivor_id = 0u64;
         let mut victim_id = 0u64;
         for (pid, r) in &regions.regions {
@@ -194,7 +228,10 @@ fn merge_split_round_trip_keys_intact() {
 
         let regions = get_regions(&mgr).await;
         assert_eq!(regions.regions.len(), 1, "expected 1 partition after merge");
-        assert_eq!(regions.regions[0].0, survivor_id, "survivor must keep its part_id");
+        assert_eq!(
+            regions.regions[0].0, survivor_id,
+            "survivor must keep its part_id"
+        );
 
         // All 20 keys must still be readable from the survivor partition.
         for i in 0u8..10 {
@@ -342,9 +379,12 @@ fn merge_preserves_value_pointer_resolution() {
         for i in 0u8..3 {
             let r = psr_get(&router, 4001, format!("a-{:02}", i).as_bytes()).await;
             assert_eq!(
-                r.value, big_val,
+                r.value,
+                big_val,
                 "PRE-SPLIT: big_val a-{:02} corrupted (len={}, expected {})",
-                i, r.value.len(), big_val.len()
+                i,
+                r.value.len(),
+                big_val.len()
             );
         }
 
@@ -400,11 +440,25 @@ fn merge_preserves_value_pointer_resolution() {
         // spliced into survivor's log_stream by the manager merge.
         for i in 0u8..3 {
             let r = psr_get(&router, survivor_id, format!("a-{:02}", i).as_bytes()).await;
-            assert_eq!(r.value.len(), big_val.len(), "left big-val a-{:02} len mismatch", i);
+            assert_eq!(
+                r.value.len(),
+                big_val.len(),
+                "left big-val a-{:02} len mismatch",
+                i
+            );
             assert_eq!(r.value, big_val, "left big-val a-{:02} content mismatch", i);
             let r = psr_get(&router, survivor_id, format!("n-{:02}", i).as_bytes()).await;
-            assert_eq!(r.value.len(), big_val.len(), "right big-val n-{:02} len mismatch", i);
-            assert_eq!(r.value, big_val, "right big-val n-{:02} content mismatch", i);
+            assert_eq!(
+                r.value.len(),
+                big_val.len(),
+                "right big-val n-{:02} len mismatch",
+                i
+            );
+            assert_eq!(
+                r.value, big_val,
+                "right big-val n-{:02} content mismatch",
+                i
+            );
         }
     });
 }
@@ -507,8 +561,7 @@ fn merge_then_split_again_round_trip() {
             )
             .await
             .expect("split #2 call");
-        let sr2: partition_rpc::SplitPartResp =
-            partition_rpc::rkyv_decode(&r2).unwrap();
+        let sr2: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&r2).unwrap();
         assert_eq!(
             sr2.code,
             partition_rpc::CODE_OK,
@@ -554,7 +607,8 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
         let mgr_for_serve = manager.clone();
         compio::runtime::spawn(async move {
             let _ = mgr_for_serve.serve(mgr_addr).await;
-        }).detach();
+        })
+        .detach();
         compio::time::sleep(Duration::from_millis(200)).await;
         let mgr = RpcClient::connect(mgr_addr).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 95).await;
@@ -576,12 +630,15 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
         compio::time::sleep(Duration::from_millis(2000)).await;
 
         // Split into two children.
-        router.client_for(6001).await
+        router
+            .client_for(6001)
+            .await
             .call(
                 partition_rpc::MSG_SPLIT_PART,
                 partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 6001 }),
             )
-            .await.expect("split");
+            .await
+            .expect("split");
         let _ = poll_until_async(
             Duration::from_secs(10),
             Duration::from_millis(200),
@@ -589,13 +646,19 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
                 let r = get_regions(&mgr).await;
                 r.regions.len() == 2 && r.part_addrs.len() == 2
             },
-        ).await;
+        )
+        .await;
 
         let regions = get_regions(&mgr).await;
-        let mut s = 0u64; let mut v = 0u64;
+        let mut s = 0u64;
+        let mut v = 0u64;
         for (pid, r) in &regions.regions {
             if let Some(rg) = &r.rg {
-                if rg.start_key == b"a".to_vec() { s = *pid; } else { v = *pid; }
+                if rg.start_key == b"a".to_vec() {
+                    s = *pid;
+                } else {
+                    v = *pid;
+                }
             }
         }
         psr_compact(&router, s).await;
@@ -604,11 +667,17 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
 
         // ── KEY DIFFERENCE: drive the merge via force_auto_merge ──
         // This exercises auto_dispatch_merge's full flow.
-        manager.force_auto_merge(s, v).await
+        manager
+            .force_auto_merge(s, v)
+            .await
             .expect("force_auto_merge must succeed");
 
         compio::time::sleep(Duration::from_millis(2500)).await;
-        assert_eq!(get_regions(&mgr).await.regions.len(), 1, "merge must complete");
+        assert_eq!(
+            get_regions(&mgr).await.regions.len(),
+            1,
+            "merge must complete"
+        );
     });
 }
 
@@ -629,8 +698,8 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
 #[test]
 #[ignore]
 fn auto_merge_fires_via_policy_tick_loop_fast_mode() {
-    use autumn_manager::AutumnManager;
     use autumn_manager::policy::PolicyConfig;
+    use autumn_manager::AutumnManager;
 
     let mgr_addr = pick_addr();
 
@@ -658,7 +727,8 @@ fn auto_merge_fires_via_policy_tick_loop_fast_mode() {
         let mgr_for_serve = manager.clone();
         compio::runtime::spawn(async move {
             let _ = mgr_for_serve.serve(mgr_addr).await;
-        }).detach();
+        })
+        .detach();
         compio::time::sleep(Duration::from_millis(200)).await;
 
         let mgr = RpcClient::connect(mgr_addr).await.unwrap();
@@ -685,8 +755,10 @@ fn auto_merge_fires_via_policy_tick_loop_fast_mode() {
             p99_us: 0,
             ..Default::default()
         };
-        let mut p1 = load.clone(); p1.part_id = 8001;
-        let mut p2 = load; p2.part_id = 8002;
+        let mut p1 = load.clone();
+        p1.part_id = 8001;
+        let mut p2 = load;
+        p2.part_id = 8002;
         let report_req = rkyv_encode(&ReportPartitionLoadReq {
             ps_id: 97,
             partitions: vec![p1, p2],
@@ -703,7 +775,10 @@ fn auto_merge_fires_via_policy_tick_loop_fast_mode() {
             || async { get_regions(&mgr).await.regions.len() == 1 },
         )
         .await;
-        assert!(merged, "auto-merge via policy_tick_loop must reduce regions to 1");
+        assert!(
+            merged,
+            "auto-merge via policy_tick_loop must reduce regions to 1"
+        );
     });
 }
 
@@ -720,8 +795,8 @@ fn auto_merge_fires_via_policy_tick_loop_fast_mode() {
 #[test]
 #[ignore]
 fn auto_split_fires_via_policy_tick_loop_fast_mode() {
-    use autumn_manager::AutumnManager;
     use autumn_manager::policy::PolicyConfig;
+    use autumn_manager::AutumnManager;
 
     let mgr_addr = pick_addr();
 
@@ -749,7 +824,8 @@ fn auto_split_fires_via_policy_tick_loop_fast_mode() {
         let mgr_for_serve = manager.clone();
         compio::runtime::spawn(async move {
             let _ = mgr_for_serve.serve(mgr_addr).await;
-        }).detach();
+        })
+        .detach();
         compio::time::sleep(Duration::from_millis(200)).await;
 
         let mgr = RpcClient::connect(mgr_addr).await.unwrap();
@@ -795,7 +871,10 @@ fn auto_split_fires_via_policy_tick_loop_fast_mode() {
             || async { get_regions(&mgr).await.regions.len() == 2 },
         )
         .await;
-        assert!(split, "auto-split via policy_tick_loop must produce 2 regions");
+        assert!(
+            split,
+            "auto-split via policy_tick_loop must produce 2 regions"
+        );
     });
 }
 
@@ -820,7 +899,8 @@ fn auto_dispatch_split_dispatches_msg_split_part() {
         let mgr_for_serve = manager.clone();
         compio::runtime::spawn(async move {
             let _ = mgr_for_serve.serve(mgr_addr).await;
-        }).detach();
+        })
+        .detach();
         compio::time::sleep(Duration::from_millis(200)).await;
 
         let mgr = RpcClient::connect(mgr_addr).await.unwrap();
@@ -845,16 +925,24 @@ fn auto_dispatch_split_dispatches_msg_split_part() {
         // Auto-dispatch the split via force_auto_split. Manager looks up
         // owning PS from regions/part_addrs, sends MSG_SPLIT_PART via
         // its conn_pool, returns Ok on PS handler success.
-        manager.force_auto_split(7001).await.expect("force_auto_split must succeed");
+        manager
+            .force_auto_split(7001)
+            .await
+            .expect("force_auto_split must succeed");
 
         // Wait for region propagation.
         let _ = poll_until_async(
             Duration::from_secs(10),
             Duration::from_millis(200),
             || async { get_regions(&mgr).await.regions.len() == 2 },
-        ).await;
+        )
+        .await;
         let regions = get_regions(&mgr).await;
-        assert_eq!(regions.regions.len(), 2, "auto-split must produce 2 regions");
+        assert_eq!(
+            regions.regions.len(),
+            2,
+            "auto-split must produce 2 regions"
+        );
     });
 }
 
@@ -969,12 +1057,15 @@ fn split_merge_split_with_concurrent_writes() {
         compio::time::sleep(Duration::from_secs(2)).await;
 
         // SPLIT #1
-        let r = router.client_for(13001).await
+        let r = router
+            .client_for(13001)
+            .await
             .call(
                 partition_rpc::MSG_SPLIT_PART,
                 partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 13001 }),
             )
-            .await.expect("split #1");
+            .await
+            .expect("split #1");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&r).unwrap();
         assert_eq!(sr.code, partition_rpc::CODE_OK, "split #1: {}", sr.message);
 
@@ -985,12 +1076,18 @@ fn split_merge_split_with_concurrent_writes() {
                 let r = get_regions(&mgr).await;
                 r.regions.len() == 2 && r.part_addrs.len() == 2
             },
-        ).await;
+        )
+        .await;
         let regions = get_regions(&mgr).await;
-        let mut s1 = 0u64; let mut v1 = 0u64;
+        let mut s1 = 0u64;
+        let mut v1 = 0u64;
         for (pid, r) in &regions.regions {
             if let Some(rg) = &r.rg {
-                if rg.start_key == b"a".to_vec() { s1 = *pid; } else { v1 = *pid; }
+                if rg.start_key == b"a".to_vec() {
+                    s1 = *pid;
+                } else {
+                    v1 = *pid;
+                }
             }
         }
 
@@ -1019,19 +1116,23 @@ fn split_merge_split_with_concurrent_writes() {
         compio::time::sleep(Duration::from_millis(3000)).await;
 
         // SPLIT #2 on the merged partition.
-        let r = router.client_for(s1).await
+        let r = router
+            .client_for(s1)
+            .await
             .call(
                 partition_rpc::MSG_SPLIT_PART,
                 partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: s1 }),
             )
-            .await.expect("split #2");
+            .await
+            .expect("split #2");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&r).unwrap();
         assert_eq!(sr.code, partition_rpc::CODE_OK, "split #2: {}", sr.message);
         let _ = poll_until_async(
             Duration::from_secs(10),
             Duration::from_millis(200),
             || async { get_regions(&mgr).await.regions.len() == 2 },
-        ).await;
+        )
+        .await;
 
         compio::time::sleep(Duration::from_secs(1)).await;
 
@@ -1075,7 +1176,11 @@ fn split_merge_split_with_concurrent_writes() {
             "F184 concurrent writer: {} acked, {} read back successfully, \
              {} lost ({:.1}% — Stage 1 merge-window loss is expected), \
              {} transient routing-miss errors gracefully retried",
-            n, n - missing.len(), missing.len(), lost_pct, transient_errors.get()
+            n,
+            n - missing.len(),
+            missing.len(),
+            lost_pct,
+            transient_errors.get()
         );
         assert!(
             lost_pct <= 20.0,
@@ -1085,7 +1190,11 @@ fn split_merge_split_with_concurrent_writes() {
             lost_pct,
             missing.len(),
             n,
-            missing.iter().take(5).map(|k| String::from_utf8_lossy(k).to_string()).collect::<Vec<_>>()
+            missing
+                .iter()
+                .take(5)
+                .map(|k| String::from_utf8_lossy(k).to_string())
+                .collect::<Vec<_>>()
         );
         // Note: pre-fix this asserted `transient_errors.get() > 0` —
         // the spec said split/merge topology changes MUST surface as
@@ -1199,12 +1308,15 @@ fn f185_orchestrated_merge_zero_loss_concurrent_writes() {
         compio::time::sleep(Duration::from_secs(2)).await;
 
         // SPLIT
-        let r = router.client_for(14001).await
+        let r = router
+            .client_for(14001)
+            .await
             .call(
                 partition_rpc::MSG_SPLIT_PART,
                 partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 14001 }),
             )
-            .await.expect("split #1");
+            .await
+            .expect("split #1");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&r).unwrap();
         assert_eq!(sr.code, partition_rpc::CODE_OK, "split: {}", sr.message);
 
@@ -1215,12 +1327,18 @@ fn f185_orchestrated_merge_zero_loss_concurrent_writes() {
                 let r = get_regions(&mgr).await;
                 r.regions.len() == 2 && r.part_addrs.len() == 2
             },
-        ).await;
+        )
+        .await;
         let regions = get_regions(&mgr).await;
-        let mut s1 = 0u64; let mut v1 = 0u64;
+        let mut s1 = 0u64;
+        let mut v1 = 0u64;
         for (pid, r) in &regions.regions {
             if let Some(rg) = &r.rg {
-                if rg.start_key == b"a".to_vec() { s1 = *pid; } else { v1 = *pid; }
+                if rg.start_key == b"a".to_vec() {
+                    s1 = *pid;
+                } else {
+                    v1 = *pid;
+                }
             }
         }
 
@@ -1233,7 +1351,10 @@ fn f185_orchestrated_merge_zero_loss_concurrent_writes() {
         // MERGE via the orchestrated F185 path. ClusterClient.merge_partitions
         // now sends MSG_MERGE_PARTITIONS to the manager, which handles
         // freeze + capture + txn atomically.
-        cluster.merge_partitions(s1, v1).await.expect("merge_partitions OK");
+        cluster
+            .merge_partitions(s1, v1)
+            .await
+            .expect("merge_partitions OK");
         compio::time::sleep(Duration::from_millis(3000)).await;
         assert_eq!(get_regions(&mgr).await.regions.len(), 1, "after merge");
 
@@ -1262,8 +1383,12 @@ fn f185_orchestrated_merge_zero_loss_concurrent_writes() {
         eprintln!(
             "F185 orchestrated merge: {} acked, {} read back, {} lost ({:.2}%), \
              {} unavailable-retried (expected during freeze window), {} other-errors",
-            n, n - missing.len(), missing.len(), lost_pct,
-            unavailable_errors.get(), other_errors.get()
+            n,
+            n - missing.len(),
+            missing.len(),
+            lost_pct,
+            unavailable_errors.get(),
+            other_errors.get()
         );
 
         // F185 contract: 0 loss on the orchestrated path. The CLI
@@ -1272,13 +1397,16 @@ fn f185_orchestrated_merge_zero_loss_concurrent_writes() {
         // a write's PS reply was in flight when the connection got
         // dropped, but assert tightly otherwise.
         assert!(
-            missing.is_empty()
-                || (missing.len() as f64 / n as f64) < 0.001,
+            missing.is_empty() || (missing.len() as f64 / n as f64) < 0.001,
             "F185 expected 0 loss; got {} of {} ({:.3}%). First missing: {:?}",
             missing.len(),
             n,
             lost_pct,
-            missing.iter().take(5).map(|k| String::from_utf8_lossy(k).to_string()).collect::<Vec<_>>()
+            missing
+                .iter()
+                .take(5)
+                .map(|k| String::from_utf8_lossy(k).to_string())
+                .collect::<Vec<_>>()
         );
         // Some unavailability is expected during the freeze window —
         // assertion proves the writer actually hit the frozen state
@@ -1339,12 +1467,15 @@ fn split_merge_split_with_interleaved_writes() {
         compio::time::sleep(Duration::from_millis(2500)).await;
 
         // ── Phase 1: SPLIT #1 ─────────────────────────────────────────
-        let r = router.client_for(12001).await
+        let r = router
+            .client_for(12001)
+            .await
             .call(
                 partition_rpc::MSG_SPLIT_PART,
                 partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 12001 }),
             )
-            .await.expect("split #1");
+            .await
+            .expect("split #1");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&r).unwrap();
         assert_eq!(sr.code, partition_rpc::CODE_OK, "split #1: {}", sr.message);
 
@@ -1355,12 +1486,18 @@ fn split_merge_split_with_interleaved_writes() {
                 let r = get_regions(&mgr).await;
                 r.regions.len() == 2 && r.part_addrs.len() == 2
             },
-        ).await;
+        )
+        .await;
         let regions = get_regions(&mgr).await;
-        let mut s1 = 0u64; let mut v1 = 0u64;
+        let mut s1 = 0u64;
+        let mut v1 = 0u64;
         for (pid, r) in &regions.regions {
             if let Some(rg) = &r.rg {
-                if rg.start_key == b"a".to_vec() { s1 = *pid; } else { v1 = *pid; }
+                if rg.start_key == b"a".to_vec() {
+                    s1 = *pid;
+                } else {
+                    v1 = *pid;
+                }
             }
         }
 
@@ -1396,12 +1533,15 @@ fn split_merge_split_with_interleaved_writes() {
         compio::time::sleep(Duration::from_millis(3000)).await;
 
         // ── Phase 5: SPLIT #2 on merged partition ─────────────────────
-        let r = router.client_for(s1).await
+        let r = router
+            .client_for(s1)
+            .await
             .call(
                 partition_rpc::MSG_SPLIT_PART,
                 partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: s1 }),
             )
-            .await.expect("split #2");
+            .await
+            .expect("split #2");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&r).unwrap();
         assert_eq!(sr.code, partition_rpc::CODE_OK, "split #2: {}", sr.message);
 
@@ -1409,7 +1549,8 @@ fn split_merge_split_with_interleaved_writes() {
             Duration::from_secs(10),
             Duration::from_millis(200),
             || async { get_regions(&mgr).await.regions.len() == 2 },
-        ).await;
+        )
+        .await;
         compio::time::sleep(Duration::from_millis(800)).await;
 
         // ── Phase 6: writes against post-split-#2 topology ────────────
@@ -1417,7 +1558,8 @@ fn split_merge_split_with_interleaved_writes() {
             let key = format!("post-split2-{:02}", i).into_bytes();
             // Resolve to current part_id.
             let mgr_c = RpcClient::connect(mgr_addr).await.unwrap();
-            let pid = resolve_part_id_for_key(&mgr_c, &key).await
+            let pid = resolve_part_id_for_key(&mgr_c, &key)
+                .await
                 .expect("post-split2 key must route to a partition");
             psr_put(&router, pid, &key, b"v").await;
             all_keys.push(key);
@@ -1429,10 +1571,17 @@ fn split_merge_split_with_interleaved_writes() {
         for key in &all_keys {
             let pid = match resolve_part_id_for_key(&mgr_v, key).await {
                 Some(p) => p,
-                None => { missing.push(key.clone()); continue; }
+                None => {
+                    missing.push(key.clone());
+                    continue;
+                }
             };
             let r = psr_get(&router, pid, key).await;
-            let want = if key.starts_with(b"k") { b"v".to_vec() } else { b"v".to_vec() };
+            let want = if key.starts_with(b"k") {
+                b"v".to_vec()
+            } else {
+                b"v".to_vec()
+            };
             if r.code != partition_rpc::CODE_OK || r.value != want {
                 missing.push(key.clone());
             }
@@ -1441,7 +1590,11 @@ fn split_merge_split_with_interleaved_writes() {
             missing.is_empty(),
             "{} keys missing/wrong after full lifecycle: {:?}",
             missing.len(),
-            missing.iter().take(5).map(|k| String::from_utf8_lossy(k).to_string()).collect::<Vec<_>>()
+            missing
+                .iter()
+                .take(5)
+                .map(|k| String::from_utf8_lossy(k).to_string())
+                .collect::<Vec<_>>()
         );
     });
 }
@@ -1464,29 +1617,33 @@ async fn resolve_part_id_for_key(mgr: &RpcClient, key: &[u8]) -> Option<u64> {
 
 /// Try a Put; map all error variants to Err(()) so the writer can
 /// distinguish "no progress, retry" from a permanent-fault assertion.
-async fn try_psr_put(
-    router: &PsRouter,
-    part_id: u64,
-    key: &[u8],
-    value: &[u8],
-) -> Result<(), ()> {
+async fn try_psr_put(router: &PsRouter, part_id: u64, key: &[u8], value: &[u8]) -> Result<(), ()> {
     let c = router.client_for(part_id).await;
-    let resp = c.call(
-        partition_rpc::MSG_PUT,
-        partition_rpc::rkyv_encode(&partition_rpc::PutReq {
-            part_id,
-            key: key.to_vec(),
-            value: value.to_vec(),
-            expires_at: 0,
-            region_epoch: 0,
-        }),
-    ).await;
-    let resp_bytes = match resp { Ok(b) => b, Err(_) => return Err(()) };
+    let resp = c
+        .call(
+            partition_rpc::MSG_PUT,
+            partition_rpc::rkyv_encode(&partition_rpc::PutReq {
+                part_id,
+                key: key.to_vec(),
+                value: value.to_vec(),
+                expires_at: 0,
+                region_epoch: 0,
+            }),
+        )
+        .await;
+    let resp_bytes = match resp {
+        Ok(b) => b,
+        Err(_) => return Err(()),
+    };
     let r: partition_rpc::PutResp = match partition_rpc::rkyv_decode(&resp_bytes) {
         Ok(r) => r,
         Err(_) => return Err(()),
     };
-    if r.code != partition_rpc::CODE_OK { Err(()) } else { Ok(()) }
+    if r.code != partition_rpc::CODE_OK {
+        Err(())
+    } else {
+        Ok(())
+    }
 }
 
 /// Drive a SPLIT through transient retries. The CLI's `split` is a
@@ -1495,13 +1652,17 @@ async fn try_psr_put(
 async fn poll_split_succeeds(router: &std::rc::Rc<PsRouter>, part_id: u64) -> bool {
     for _ in 0..15 {
         let c = router.client_for(part_id).await;
-        let resp = c.call(
-            partition_rpc::MSG_SPLIT_PART,
-            partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id }),
-        ).await;
+        let resp = c
+            .call(
+                partition_rpc::MSG_SPLIT_PART,
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id }),
+            )
+            .await;
         if let Ok(bytes) = resp {
             if let Ok(r) = partition_rpc::rkyv_decode::<partition_rpc::SplitPartResp>(&bytes) {
-                if r.code == partition_rpc::CODE_OK { return true; }
+                if r.code == partition_rpc::CODE_OK {
+                    return true;
+                }
             }
         }
         compio::time::sleep(Duration::from_millis(500)).await;

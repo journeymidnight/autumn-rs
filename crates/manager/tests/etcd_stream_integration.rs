@@ -18,10 +18,7 @@ use autumn_stream::{ConnPool, ExtentNode, ExtentNodeConfig, StreamClient};
 use support::{pick_addr, start_etcd};
 
 /// Start manager with etcd on its own thread, return addr.
-fn start_etcd_manager(
-    mgr_addr: SocketAddr,
-    etcd_endpoint: String,
-) {
+fn start_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) {
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let manager = AutumnManager::new_with_etcd(vec![etcd_endpoint])
@@ -45,11 +42,16 @@ fn start_extent_node(addr: SocketAddr, dir: PathBuf, disk_id: u64) {
     std::thread::sleep(Duration::from_millis(200));
 }
 
-fn start_extent_node_with_manager(addr: SocketAddr, dir: PathBuf, disk_id: u64, mgr_addr: SocketAddr) {
+fn start_extent_node_with_manager(
+    addr: SocketAddr,
+    dir: PathBuf,
+    disk_id: u64,
+    mgr_addr: SocketAddr,
+) {
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let config = ExtentNodeConfig::new(dir, disk_id)
-                .with_manager_endpoint(mgr_addr.to_string());
+            let config =
+                ExtentNodeConfig::new(dir, disk_id).with_manager_endpoint(mgr_addr.to_string());
             let n = ExtentNode::new(config).await.expect("extent node");
             let _ = n.serve(addr).await;
         });
@@ -86,7 +88,11 @@ async fn create_stream(mgr: &RpcClient, replicates: u32) -> u64 {
         .await
         .expect("create stream");
     let created: CreateStreamResp = rkyv_decode(&resp).expect("decode CreateStreamResp");
-    assert_eq!(created.code, CODE_OK, "create stream failed: {}", created.message);
+    assert_eq!(
+        created.code, CODE_OK,
+        "create stream failed: {}",
+        created.message
+    );
     created.stream.expect("stream").stream_id
 }
 
@@ -109,10 +115,18 @@ fn stream_manager_with_real_etcd() {
         start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
         let reg1 = register_node(&mgr, &n1_addr.to_string(), "disk-e1").await;
-        assert_eq!(reg1.code, CODE_OK, "register node1 failed: {}", reg1.message);
+        assert_eq!(
+            reg1.code, CODE_OK,
+            "register node1 failed: {}",
+            reg1.message
+        );
 
         let reg2 = register_node(&mgr, &n2_addr.to_string(), "disk-e2").await;
-        assert_eq!(reg2.code, CODE_OK, "register node2 failed: {}", reg2.message);
+        assert_eq!(
+            reg2.code, CODE_OK,
+            "register node2 failed: {}",
+            reg2.message
+        );
 
         let stream_id = create_stream(&mgr, 1).await;
 
@@ -147,22 +161,13 @@ fn stream_manager_with_real_etcd() {
             .await
             .expect("connect etcd");
 
-        let nodes = etcd
-            .get_prefix("nodes/")
-            .await
-            .expect("get nodes");
+        let nodes = etcd.get_prefix("nodes/").await.expect("get nodes");
         assert_eq!(nodes.kvs.len(), 2);
 
-        let streams = etcd
-            .get_prefix("streams/")
-            .await
-            .expect("get streams");
+        let streams = etcd.get_prefix("streams/").await.expect("get streams");
         assert_eq!(streams.kvs.len(), 1);
 
-        let extents = etcd
-            .get_prefix("extents/")
-            .await
-            .expect("get extents");
+        let extents = etcd.get_prefix("extents/").await.expect("get extents");
         assert_eq!(extents.kvs.len(), 2);
 
         drop(etcd_guard);

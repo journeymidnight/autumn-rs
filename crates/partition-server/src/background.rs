@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use autumn_stream::StreamClient;
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::{StreamExt};
 use futures::channel::mpsc;
+use futures::StreamExt;
 
-use crate::*;
 use crate::sstable::{IterItem, MergeIterator, SstBuilder, SstReader, TableIterator};
+use crate::*;
 
 /// R4 4.4 — minimum pending size required to launch a *second or later*
 /// batch while another batch is already in flight. Below this threshold the
@@ -171,9 +171,10 @@ pub(crate) async fn background_compact_loop(
                 // cooldown gate engages even on no-op / failed ticks.
                 // See the matching gc_loop fix for full rationale.
                 let stamp_last_compact = || {
-                    metrics
-                        .last_compact_at
-                        .store(crate::now_secs() as i64, std::sync::atomic::Ordering::Relaxed);
+                    metrics.last_compact_at.store(
+                        crate::now_secs() as i64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 };
                 let clear_compact_inflight = || {
                     metrics
@@ -183,7 +184,9 @@ pub(crate) async fn background_compact_loop(
                 if tbls.len() < 2 && part.borrow().has_overlap.get() == 0 {
                     tracing::info!(
                         "compact part {}: skipped (major={}) — tables={}, has_overlap=0",
-                        _part_id, major, tbls.len()
+                        _part_id,
+                        major,
+                        tbls.len()
                     );
                     metrics.pending_compaction_bytes.store(
                         compute_pending_compaction_bytes(&part),
@@ -299,9 +302,9 @@ pub(crate) async fn background_compact_loop(
                 let has_expired = {
                     let p = part.borrow();
                     let now = crate::now_secs();
-                    p.sst_readers.iter().any(|r| {
-                        r.min_expires_at > 0 && r.min_expires_at <= now
-                    })
+                    p.sst_readers
+                        .iter()
+                        .any(|r| r.min_expires_at > 0 && r.min_expires_at <= now)
                 };
                 if has_expired {
                     let tbls = part.borrow().tables.clone();
@@ -324,7 +327,9 @@ pub(crate) async fn background_compact_loop(
                                         let p = part.borrow();
                                         (p.row_stream_id, p.stream_client.clone())
                                     };
-                                    if let Err(e) = part_sc.truncate(row_stream_id, last_extent).await {
+                                    if let Err(e) =
+                                        part_sc.truncate(row_stream_id, last_extent).await
+                                    {
                                         tracing::warn!("expiry major compaction truncate: {e}");
                                     }
                                 }
@@ -377,7 +382,10 @@ pub(crate) async fn background_compact_loop(
                 // external policy is absent or has fallen behind.
                 let sst_count = part.borrow().sst_readers.len();
                 if sst_count > MAX_SST_BEFORE_AUTO_COMPACT
-                    && metrics.compact_inflight.load(std::sync::atomic::Ordering::Relaxed) == 0
+                    && metrics
+                        .compact_inflight
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        == 0
                 {
                     let tbls = part.borrow().tables.clone();
                     let (compact_tbls, truncate_id) = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
@@ -400,7 +408,9 @@ pub(crate) async fn background_compact_loop(
                                         let p = part.borrow();
                                         (p.row_stream_id, p.stream_client.clone())
                                     };
-                                    if let Err(e) = part_sc.truncate(row_stream_id, truncate_id).await {
+                                    if let Err(e) =
+                                        part_sc.truncate(row_stream_id, truncate_id).await
+                                    {
                                         tracing::warn!("auto-trim truncate: {e}");
                                     }
                                 }
@@ -424,7 +434,6 @@ pub(crate) async fn background_compact_loop(
         }
     }
 }
-
 
 pub(crate) async fn background_gc_loop(
     part: Rc<RefCell<PartitionData>>,
@@ -540,7 +549,12 @@ pub(crate) async fn background_gc_loop(
                 let mut chosen = first;
                 while let Some(Some(more)) = gc_rx.next().now_or_never() {
                     chosen = match (chosen, more) {
-                        (GcTask::Force { mut extent_ids }, GcTask::Force { extent_ids: more_eids }) => {
+                        (
+                            GcTask::Force { mut extent_ids },
+                            GcTask::Force {
+                                extent_ids: more_eids,
+                            },
+                        ) => {
                             for e in more_eids {
                                 if !extent_ids.contains(&e) {
                                     extent_ids.push(e);
@@ -548,8 +562,12 @@ pub(crate) async fn background_gc_loop(
                             }
                             GcTask::Force { extent_ids }
                         }
-                        (GcTask::Force { extent_ids }, GcTask::Auto(_)) => GcTask::Force { extent_ids },
-                        (GcTask::Auto(_), GcTask::Force { extent_ids }) => GcTask::Force { extent_ids },
+                        (GcTask::Force { extent_ids }, GcTask::Auto(_)) => {
+                            GcTask::Force { extent_ids }
+                        }
+                        (GcTask::Auto(_), GcTask::Force { extent_ids }) => {
+                            GcTask::Force { extent_ids }
+                        }
                         // F201: when two Auto ticks coalesce, keep the
                         // most-recent params (the operator's latest
                         // intent supersedes anything queued behind it).
@@ -567,7 +585,11 @@ pub(crate) async fn background_gc_loop(
                 let metrics = part.borrow().metrics.clone();
                 let (log_stream_id, readers_snapshot, part_sc) = {
                     let p = part.borrow();
-                    (p.log_stream_id, p.sst_readers.clone(), p.stream_client.clone())
+                    (
+                        p.log_stream_id,
+                        p.sst_readers.clone(),
+                        p.stream_client.clone(),
+                    )
                 };
                 if let Ok(stream_info) = part_sc.get_stream_info(log_stream_id).await {
                     let extent_ids = stream_info.extent_ids;
@@ -575,10 +597,7 @@ pub(crate) async fn background_gc_loop(
                         let sealed = &extent_ids[..extent_ids.len() - 1];
                         let mut discards = get_discards(&readers_snapshot);
                         valid_discard(&mut discards, sealed);
-                        let gc_debt: u64 = discards
-                            .values()
-                            .map(|v| (*v).max(0) as u64)
-                            .sum();
+                        let gc_debt: u64 = discards.values().map(|v| (*v).max(0) as u64).sum();
                         metrics
                             .gc_debt_bytes
                             .store(gc_debt, std::sync::atomic::Ordering::Relaxed);
@@ -600,13 +619,16 @@ pub(crate) async fn background_gc_loop(
             .gc_inflight
             .store(1, std::sync::atomic::Ordering::Relaxed);
         let clear_inflight = |m: &PartitionMetrics| {
-            m.gc_inflight
-                .store(0, std::sync::atomic::Ordering::Relaxed);
+            m.gc_inflight.store(0, std::sync::atomic::Ordering::Relaxed);
         };
 
         let (log_stream_id, readers_snapshot, part_sc) = {
             let p = part.borrow();
-            (p.log_stream_id, p.sst_readers.clone(), p.stream_client.clone())
+            (
+                p.log_stream_id,
+                p.sst_readers.clone(),
+                p.stream_client.clone(),
+            )
         };
 
         // F189-fix-r2 MEDIUM: stamp last_gc_at on EVERY early-continue
@@ -618,9 +640,10 @@ pub(crate) async fn background_gc_loop(
         // (single-extent → no GC possible). Stamp BEFORE clearing
         // inflight so the scheduler's tuple-read sees both updates.
         let stamp_last_gc = || {
-            metrics
-                .last_gc_at
-                .store(crate::now_secs() as i64, std::sync::atomic::Ordering::Relaxed);
+            metrics.last_gc_at.store(
+                crate::now_secs() as i64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         };
 
         let stream_info = match part_sc.get_stream_info(log_stream_id).await {
@@ -677,7 +700,12 @@ pub(crate) async fn background_gc_loop(
         let mut holes: Vec<u64> = match gc_task {
             GcTask::Force { ref extent_ids } => {
                 let idx: HashSet<u64> = sealed_extents.iter().copied().collect();
-                extent_ids.iter().copied().filter(|e| idx.contains(e)).take(MAX_GC_ONCE).collect()
+                extent_ids
+                    .iter()
+                    .copied()
+                    .filter(|e| idx.contains(e))
+                    .take(MAX_GC_ONCE)
+                    .collect()
             }
             GcTask::Auto(ref params) => {
                 let discards = tick_discards;
@@ -693,8 +721,7 @@ pub(crate) async fn background_gc_loop(
                 // forever. We now iterate every sealed extent, sorted
                 // by reclaimable bytes desc (zero-discard extents land
                 // last but still reachable).
-                let mut candidates: Vec<u64> =
-                    sealed_extents.iter().copied().collect();
+                let mut candidates: Vec<u64> = sealed_extents.iter().copied().collect();
                 candidates.sort_by(|a, b| {
                     let da = discards.get(a).copied().unwrap_or(0);
                     let db = discards.get(b).copied().unwrap_or(0);
@@ -706,17 +733,17 @@ pub(crate) async fn background_gc_loop(
                 // filters. Else apply `ratio` (default 0.4) optionally
                 // halved when stream-level dead bytes cross
                 // `stream_debt`, plus `max_size` upper bound.
-                let stream_dead: u64 = discards.values()
-                    .map(|v| (*v).max(0) as u64)
-                    .sum();
-                let stream_debt_hit = params
-                    .stream_debt
-                    .map_or(false, |hw| stream_dead >= hw);
+                let stream_dead: u64 = discards.values().map(|v| (*v).max(0) as u64).sum();
+                let stream_debt_hit = params.stream_debt.map_or(false, |hw| stream_dead >= hw);
                 let effective_ratio = if params.empty_only {
                     f64::INFINITY // ratio gate unreachable
                 } else {
                     let r = params.ratio.unwrap_or(GC_DISCARD_RATIO);
-                    if stream_debt_hit { r * 0.5 } else { r }
+                    if stream_debt_hit {
+                        r * 0.5
+                    } else {
+                        r
+                    }
                 };
 
                 let mut holes = Vec::new();
@@ -773,8 +800,7 @@ pub(crate) async fn background_gc_loop(
         if !is_force {
             let now = Instant::now();
             // Evict stale entries (past their own cooldown window).
-            gc_failure_cooldown
-                .retain(|_, (t, dur)| now.duration_since(*t) < *dur);
+            gc_failure_cooldown.retain(|_, (t, dur)| now.duration_since(*t) < *dur);
             let initial_len = holes.len();
             holes.retain(|eid| {
                 gc_failure_cooldown
@@ -851,7 +877,6 @@ pub(crate) async fn background_gc_loop(
         drop(_gc_permit);
     }
 }
-
 
 /// F099-D: `background_write_loop` and its R1/LF dispatch helpers are gone —
 /// the write loop is now inlined into `partition_loop` on the main
@@ -972,9 +997,7 @@ pub(crate) async fn start_write_batch(
                     value,
                     expires_at,
                 } => (user_key, 1u8, value, expires_at),
-                WriteOp::Delete { user_key } => {
-                    (Bytes::from(user_key), 2u8, Bytes::new(), 0u64)
-                }
+                WriteOp::Delete { user_key } => (Bytes::from(user_key), 2u8, Bytes::new(), 0u64),
             };
             if !in_range(&p.rg, &user_key) {
                 req.resp.send_err("key is out of range".to_string());
@@ -1025,7 +1048,12 @@ pub(crate) async fn start_write_batch(
                 } else {
                     e.op
                 };
-                (wal_op, e.internal_key.clone(), e.value.clone(), e.expires_at)
+                (
+                    wal_op,
+                    e.internal_key.clone(),
+                    e.value.clone(),
+                    e.expires_at,
+                )
             })
             .collect();
         let result = compio::runtime::spawn_blocking(move || {
@@ -1034,12 +1062,7 @@ pub(crate) async fn start_write_batch(
             for (wal_op, internal_key, value, expires_at) in inputs {
                 let value_empty = value.is_empty();
                 let (hdr_seg, val_seg, crc_seg) =
-                    crate::wal_record::encode_v1_segments(
-                        wal_op,
-                        &internal_key,
-                        value,
-                        expires_at,
-                    );
+                    crate::wal_record::encode_v1_segments(wal_op, &internal_key, value, expires_at);
                 let total = hdr_seg.len() + val_seg.len() + crc_seg.len();
                 segments.push(hdr_seg);
                 if !value_empty {
@@ -1071,13 +1094,12 @@ pub(crate) async fn start_write_batch(
             // clone cost is irrelevant since we're below 4 MiB total).
             let value_for_encode = e.value.clone();
             let value_empty = value_for_encode.is_empty();
-            let (hdr_seg, val_seg, crc_seg) =
-                crate::wal_record::encode_v1_segments(
-                    wal_op,
-                    &e.internal_key,
-                    value_for_encode,
-                    e.expires_at,
-                );
+            let (hdr_seg, val_seg, crc_seg) = crate::wal_record::encode_v1_segments(
+                wal_op,
+                &e.internal_key,
+                value_for_encode,
+                e.expires_at,
+            );
             let total = hdr_seg.len() + val_seg.len() + crc_seg.len();
             segments.push(hdr_seg);
             if !value_empty {
@@ -1119,9 +1141,8 @@ pub(crate) async fn start_write_batch(
 
     // Launch Phase 2 as a future (not awaited yet).
     let phase2_started_at = Instant::now();
-    let phase2_fut = Box::pin(async move {
-        part_sc.append_segments(log_stream_id, segments).await
-    });
+    let phase2_fut =
+        Box::pin(async move { part_sc.append_segments(log_stream_id, segments).await });
 
     Ok(Some(InFlightBatch {
         data: BatchData {
@@ -1354,12 +1375,25 @@ pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<Tab
 
     let total_size: u64 = tables.iter().map(|t| t.estimated_size).sum();
     let head_extent = tables[0].extent_id;
-    let head_size: u64 = tables.iter().filter(|t| t.extent_id == head_extent).map(|t| t.estimated_size).sum();
+    let head_size: u64 = tables
+        .iter()
+        .filter(|t| t.extent_id == head_extent)
+        .map(|t| t.estimated_size)
+        .sum();
     let head_threshold = (HEAD_RATIO * total_size as f64).round() as u64;
 
     if head_size < head_threshold {
-        let chosen: Vec<TableMeta> = tables.iter().filter(|t| t.extent_id == head_extent).take(COMPACT_N).cloned().collect();
-        let truncate_id = tables.iter().find(|t| t.extent_id != head_extent).map(|t| t.extent_id).unwrap_or(0);
+        let chosen: Vec<TableMeta> = tables
+            .iter()
+            .filter(|t| t.extent_id == head_extent)
+            .take(COMPACT_N)
+            .cloned()
+            .collect();
+        let truncate_id = tables
+            .iter()
+            .find(|t| t.extent_id != head_extent)
+            .map(|t| t.extent_id)
+            .unwrap_or(0);
 
         let mut tbls_sorted = tables.to_vec();
         tbls_sorted.sort_by_key(|t| t.last_seq);
@@ -1401,8 +1435,14 @@ pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<Tab
     let mut compact_tbls: Vec<TableMeta> = Vec::new();
     let mut i = 0usize;
     while i < tbls_sorted.len() {
-        while i < tbls_sorted.len() && tbls_sorted[i].estimated_size < throttle && compact_tbls.len() < COMPACT_N {
-            if i > 0 && compact_tbls.is_empty() && tbls_sorted[i].estimated_size + tbls_sorted[i - 1].estimated_size < max_capacity {
+        while i < tbls_sorted.len()
+            && tbls_sorted[i].estimated_size < throttle
+            && compact_tbls.len() < COMPACT_N
+        {
+            if i > 0
+                && compact_tbls.is_empty()
+                && tbls_sorted[i].estimated_size + tbls_sorted[i - 1].estimated_size < max_capacity
+            {
                 compact_tbls.push(tbls_sorted[i - 1].clone());
             }
             compact_tbls.push(tbls_sorted[i].clone());
@@ -1410,7 +1450,9 @@ pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<Tab
         }
         if !compact_tbls.is_empty() {
             if compact_tbls.len() == 1 {
-                if i < tbls_sorted.len() && compact_tbls[0].estimated_size + tbls_sorted[i].estimated_size < max_capacity {
+                if i < tbls_sorted.len()
+                    && compact_tbls[0].estimated_size + tbls_sorted[i].estimated_size < max_capacity
+                {
                     compact_tbls.push(tbls_sorted[i].clone());
                 } else {
                     compact_tbls.clear();
@@ -1503,13 +1545,29 @@ pub(crate) async fn do_compact(
     major: bool,
 ) -> Result<CompactStats> {
     if tbls.is_empty() {
-        return Ok(CompactStats { input_tables: 0, output_tables: 0, entries_kept: 0, entries_discarded: 0, output_bytes: 0 });
+        return Ok(CompactStats {
+            input_tables: 0,
+            output_tables: 0,
+            entries_kept: 0,
+            entries_discarded: 0,
+            output_bytes: 0,
+        });
     }
 
     let input_tables = tbls.len();
     let compact_keys: HashSet<(u64, u32)> = tbls.iter().map(|t| t.loc()).collect();
 
-    let (readers, row_stream_id, meta_stream_id, compact_vp_eid, compact_vp_off, rg, part_sc, row_append_tx, rate_ctrl) = {
+    let (
+        readers,
+        row_stream_id,
+        meta_stream_id,
+        compact_vp_eid,
+        compact_vp_off,
+        rg,
+        part_sc,
+        row_append_tx,
+        rate_ctrl,
+    ) = {
         let p = part.borrow();
         let mut rds: Vec<Arc<SstReader>> = Vec::new();
         for t in &tbls {
@@ -1517,21 +1575,44 @@ pub(crate) async fn do_compact(
                 rds.push(p.sst_readers[idx].clone());
             }
         }
-        (rds, p.row_stream_id, p.meta_stream_id, p.vp_extent_id, p.vp_offset, p.rg.clone(), p.stream_client.clone(), p.row_append_tx.clone(), p.rate_ctrl.clone())
+        (
+            rds,
+            p.row_stream_id,
+            p.meta_stream_id,
+            p.vp_extent_id,
+            p.vp_offset,
+            p.rg.clone(),
+            p.stream_client.clone(),
+            p.row_append_tx.clone(),
+            p.rate_ctrl.clone(),
+        )
     };
 
     if readers.is_empty() {
-        return Ok(CompactStats { input_tables, output_tables: 0, entries_kept: 0, entries_discarded: 0, output_bytes: 0 });
+        return Ok(CompactStats {
+            input_tables,
+            output_tables: 0,
+            entries_kept: 0,
+            entries_discarded: 0,
+            output_bytes: 0,
+        });
     }
 
-    let mut readers_with_meta: Vec<(Arc<SstReader>, u64)> = readers.iter().zip(tbls.iter()).map(|(r, t)| (r.clone(), t.last_seq)).collect();
+    let mut readers_with_meta: Vec<(Arc<SstReader>, u64)> = readers
+        .iter()
+        .zip(tbls.iter())
+        .map(|(r, t)| (r.clone(), t.last_seq))
+        .collect();
     readers_with_meta.sort_by(|a, b| b.1.cmp(&a.1));
 
-    let iters: Vec<TableIterator> = readers_with_meta.iter().map(|(r, _)| {
-        let mut it = TableIterator::new(r.clone());
-        it.rewind();
-        it
-    }).collect();
+    let iters: Vec<TableIterator> = readers_with_meta
+        .iter()
+        .map(|(r, _)| {
+            let mut it = TableIterator::new(r.clone());
+            it.rewind();
+            it
+        })
+        .collect();
     let mut merge = MergeIterator::new(iters);
     merge.rewind();
 
@@ -1585,7 +1666,12 @@ pub(crate) async fn do_compact(
                 Some(i) => i,
                 None => break,
             };
-            (item.key.clone(), item.op, item.value.clone(), item.expires_at)
+            (
+                item.key.clone(),
+                item.op,
+                item.value.clone(),
+                item.expires_at,
+            )
         };
         merge.next();
         let raw_ts = parse_ts(&raw_key);
@@ -1651,7 +1737,9 @@ pub(crate) async fn do_compact(
             rate_ctrl.account_compact(chunk_bytes).await;
             // F135: route through P-bulk's StreamClient to preserve the
             // single-writer invariant on row_stream.
-            let result = compact_row_append(&row_append_tx, &part_sc, row_stream_id, sst_bytes.clone()).await?;
+            let result =
+                compact_row_append(&row_append_tx, &part_sc, row_stream_id, sst_bytes.clone())
+                    .await?;
             // F169: SstReader::from_bytes parses the MetaBlock + bloom +
             // verifies CRC; ~5-10 ms for a max-chunk SST. Off-loaded too.
             let reader = compio::runtime::spawn_blocking(move || SstReader::from_bytes(sst_bytes))
@@ -1712,7 +1800,8 @@ pub(crate) async fn do_compact(
         rate_ctrl.account_compact(chunk_bytes).await;
         // F135: route through P-bulk's StreamClient to preserve the
         // single-writer invariant on row_stream.
-        let result = compact_row_append(&row_append_tx, &part_sc, row_stream_id, sst_bytes.clone()).await?;
+        let result =
+            compact_row_append(&row_append_tx, &part_sc, row_stream_id, sst_bytes.clone()).await?;
         let reader = compio::runtime::spawn_blocking(move || SstReader::from_bytes(sst_bytes))
             .await
             .map_err(|_| anyhow!("compact final SstReader join failed"))??;
@@ -1771,11 +1860,24 @@ pub(crate) async fn do_compact(
         // produce a stale-snapshot meta_stream checkpoint: borrow_mut
         // order = mpsc-send order = meta_stream record order, so the
         // latest record always reflects the latest in-memory state.
-        save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, compact_vp_eid, compact_vp_off).await?;
+        save_table_locs_raw(
+            &part_sc,
+            meta_stream_id,
+            &tables_snapshot,
+            compact_vp_eid,
+            compact_vp_off,
+        )
+        .await?;
         // F210-C4: see commit_flush_outcome — checkpoint published; sync
         // failure marks dirty rather than failing compaction.
         crate::sync_partition_vp_refs_or_mark_dirty(part).await;
-        return Ok(CompactStats { input_tables, output_tables: 0, entries_kept: 0, entries_discarded, output_bytes: 0 });
+        return Ok(CompactStats {
+            input_tables,
+            output_tables: 0,
+            entries_kept: 0,
+            entries_discarded,
+            output_bytes: 0,
+        });
     }
 
     // Drop local input-reader Arc clones BEFORE the swap. The partition's
@@ -1802,14 +1904,30 @@ pub(crate) async fn do_compact(
     // F148-A invariant — see flush_one_imm in lib.rs for the full
     // statement. No `.await` may be introduced between the borrow_mut
     // drop and the mpsc send inside `save_table_locs_raw`.
-    save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, compact_vp_eid, compact_vp_off).await?;
+    save_table_locs_raw(
+        &part_sc,
+        meta_stream_id,
+        &tables_snapshot,
+        compact_vp_eid,
+        compact_vp_off,
+    )
+    .await?;
     // F210-C4: same as the head-extent path above; mark dirty on sync
     // failure rather than fail the compaction.
     crate::sync_partition_vp_refs_or_mark_dirty(part).await;
-    Ok(CompactStats { input_tables, output_tables, entries_kept, entries_discarded, output_bytes })
+    Ok(CompactStats {
+        input_tables,
+        output_tables,
+        entries_kept,
+        entries_discarded,
+        output_bytes,
+    })
 }
 
-pub(crate) fn remove_compacted_tables(part: &mut PartitionData, compact_keys: &HashSet<(u64, u32)>) {
+pub(crate) fn remove_compacted_tables(
+    part: &mut PartitionData,
+    compact_keys: &HashSet<(u64, u32)>,
+) {
     let mut i = 0;
     while i < part.tables.len() {
         if compact_keys.contains(&part.tables[i].loc()) {
@@ -2053,9 +2171,7 @@ async fn flush_gc_batch(
     let batch_bytes = std::mem::replace(&mut batch.bytes, 0);
     let n = pending.len();
 
-    let result = part_sc
-        .append_segments(log_stream_id, segments)
-        .await?;
+    let result = part_sc.append_segments(log_stream_id, segments).await?;
 
     let mut cur_offset = result.offset;
     let mut insert_items: Vec<(Vec<u8>, MemEntry, u64)> = Vec::with_capacity(n);
@@ -2111,11 +2227,7 @@ async fn flush_gc_batch(
 /// GC rewrite), every fragment of the shadowed mfvp is truly dead —
 /// the newer entry has its own fresh fragment list. So we can blindly
 /// bump discards for every frag.
-fn bump_discards_for_dropped_entry(
-    discards: &mut HashMap<u64, i64>,
-    op: u8,
-    raw_value: &[u8],
-) {
+fn bump_discards_for_dropped_entry(discards: &mut HashMap<u64, i64>, op: u8, raw_value: &[u8]) {
     if op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
         let vp = ValuePointer::decode(raw_value);
         *discards.entry(vp.extent_id).or_insert(0) += vp.len as i64;
@@ -2133,7 +2245,12 @@ pub(crate) async fn run_gc(
 ) -> Result<()> {
     let (log_stream_id, rg, part_sc, rate_ctrl) = {
         let p = part.borrow();
-        (p.log_stream_id, p.rg.clone(), p.stream_client.clone(), p.rate_ctrl.clone())
+        (
+            p.log_stream_id,
+            p.rg.clone(),
+            p.stream_client.clone(),
+            p.rate_ctrl.clone(),
+        )
     };
 
     // F106 streaming: read the sealed extent in `gc_read_chunk_bytes()`
@@ -2166,9 +2283,7 @@ pub(crate) async fn run_gc(
 
     while cur < sealed_length {
         let want = (sealed_length - cur).min(chunk_bytes);
-        let (chunk, _end) = part_sc
-            .read_bytes_from_extent(extent_id, cur, want)
-            .await?;
+        let (chunk, _end) = part_sc.read_bytes_from_extent(extent_id, cur, want).await?;
         if chunk.is_empty() {
             break;
         }
@@ -2285,30 +2400,31 @@ async fn process_gc_chunk(
     let mut cursor = 0usize;
     while cursor < buf.len() {
         let record_start = cursor;
-        let (op, key_owned, value_owned, expires_at) = match crate::wal_record::decode_one(&buf[cursor..]) {
-            crate::wal_record::DecodeOne::Ok(r) => {
-                let op = r.op;
-                let key = r.key.to_vec();
-                let value = r.value.to_vec();
-                let expires_at = r.expires_at;
-                cursor += r.total;
-                (op, key, value, expires_at)
-            }
-            crate::wal_record::DecodeOne::Incomplete => {
-                // Caller carries this partial record into the next chunk.
-                break;
-            }
-            crate::wal_record::DecodeOne::Corrupt { skip_bytes, reason } => {
-                tracing::warn!(
-                    record_start,
-                    skip_bytes,
-                    reason,
-                    "F158: GC encountered corrupted WAL record; skipping"
-                );
-                cursor += skip_bytes;
-                continue;
-            }
-        };
+        let (op, key_owned, value_owned, expires_at) =
+            match crate::wal_record::decode_one(&buf[cursor..]) {
+                crate::wal_record::DecodeOne::Ok(r) => {
+                    let op = r.op;
+                    let key = r.key.to_vec();
+                    let value = r.value.to_vec();
+                    let expires_at = r.expires_at;
+                    cursor += r.total;
+                    (op, key, value, expires_at)
+                }
+                crate::wal_record::DecodeOne::Incomplete => {
+                    // Caller carries this partial record into the next chunk.
+                    break;
+                }
+                crate::wal_record::DecodeOne::Corrupt { skip_bytes, reason } => {
+                    tracing::warn!(
+                        record_start,
+                        skip_bytes,
+                        reason,
+                        "F158: GC encountered corrupted WAL record; skipping"
+                    );
+                    cursor += skip_bytes;
+                    continue;
+                }
+            };
         let key = key_owned.as_slice();
         let value = value_owned.as_slice();
         let val_len = value.len();
@@ -2327,12 +2443,7 @@ async fn process_gc_chunk(
             let mem = p
                 .active
                 .seek_user_key(&user_key)
-                .or_else(|| {
-                    p.imm
-                        .iter()
-                        .rev()
-                        .find_map(|m| m.seek_user_key(&user_key))
-                })
+                .or_else(|| p.imm.iter().rev().find_map(|m| m.seek_user_key(&user_key)))
                 .map(|e| (e.op, Bytes::from(e.value), e.expires_at));
             if mem.is_some() {
                 mem
@@ -2490,8 +2601,12 @@ pub(crate) fn unique_user_keys(part: &PartitionData) -> Vec<Vec<u8>> {
 
     seen.into_iter()
         .filter_map(|(uk, (op, expires_at))| {
-            if op == 2 { return None; }
-            if expires_at > 0 && expires_at <= now { return None; }
+            if op == 2 {
+                return None;
+            }
+            if expires_at > 0 && expires_at <= now {
+                return None;
+            }
             Some(uk)
         })
         .collect()
@@ -2519,7 +2634,11 @@ pub(crate) async fn resolve_value(
             Ok(raw_value)
         } else {
             let start = (offset as usize).min(n);
-            let end = if length == 0 { n } else { (start + length as usize).min(n) };
+            let end = if length == 0 {
+                n
+            } else {
+                (start + length as usize).min(n)
+            };
             Ok(raw_value.slice(start..end))
         }
     }
@@ -2541,7 +2660,11 @@ pub(crate) async fn read_value_from_log(
         (vp.offset, vp.len)
     } else {
         let off = offset.min(vp.len);
-        let len = if length == 0 { vp.len - off } else { length.min(vp.len - off) };
+        let len = if length == 0 {
+            vp.len - off
+        } else {
+            length.min(vp.len - off)
+        };
         (vp.offset + off, len)
     };
     // F216-E R3/R4: zero-copy fast path — recv the value straight into a
@@ -2561,7 +2684,10 @@ pub(crate) async fn read_value_from_log(
     if (data.len() as u32) < read_len {
         return Err(anyhow!(
             "logStream value short: need {} bytes, got {}, extent={}, offset={}",
-            read_len, data.len(), vp.extent_id, read_off
+            read_len,
+            data.len(),
+            vp.extent_id,
+            read_off
         ));
     }
     Ok(Bytes::from(data))
@@ -2735,7 +2861,9 @@ mod sqcq_tests {
             });
 
             for i in 0..4u32 {
-                tx.send((i, Duration::from_millis(100), Ok(i as u64))).await.unwrap();
+                tx.send((i, Duration::from_millis(100), Ok(i as u64)))
+                    .await
+                    .unwrap();
             }
             drop(tx);
 
@@ -2783,13 +2911,9 @@ mod sqcq_tests {
             // order of submission.
             let delays = [250u64, 200, 150, 100, 50];
             for (i, d) in delays.iter().enumerate() {
-                tx.send((
-                    i as u32,
-                    Duration::from_millis(*d),
-                    Ok(i as u64),
-                ))
-                .await
-                .unwrap();
+                tx.send((i as u32, Duration::from_millis(*d), Ok(i as u64)))
+                    .await
+                    .unwrap();
             }
             drop(tx);
 
@@ -2800,7 +2924,11 @@ mod sqcq_tests {
 
             // Completion order should be the reverse of launch order.
             let order: Vec<u32> = got.iter().map(|(id, _)| *id).collect();
-            assert_eq!(order, vec![4, 3, 2, 1, 0], "CQ order should reflect latency, not launch order");
+            assert_eq!(
+                order,
+                vec![4, 3, 2, 1, 0],
+                "CQ order should reflect latency, not launch order"
+            );
 
             // Regardless of order, the aggregate set of "id × result" equals
             // everything we submitted (memtable-insert analogue: final set
@@ -2874,16 +3002,18 @@ mod sqcq_tests {
             });
 
             // Item 2 returns LockedByOther. Items 0, 1, 3 are Ok.
-            tx.send((0, Duration::from_millis(50), Ok(0))).await.unwrap();
-            tx.send((1, Duration::from_millis(50), Ok(1))).await.unwrap();
-            tx.send((
-                2,
-                Duration::from_millis(20),
-                Err("LockedByOther".into()),
-            ))
-            .await
-            .unwrap();
-            tx.send((3, Duration::from_millis(50), Ok(3))).await.unwrap();
+            tx.send((0, Duration::from_millis(50), Ok(0)))
+                .await
+                .unwrap();
+            tx.send((1, Duration::from_millis(50), Ok(1)))
+                .await
+                .unwrap();
+            tx.send((2, Duration::from_millis(20), Err("LockedByOther".into())))
+                .await
+                .unwrap();
+            tx.send((3, Duration::from_millis(50), Ok(3)))
+                .await
+                .unwrap();
             // Channel deliberately left open; loop exits on locked_by_other flag.
 
             let _ = handle.await;
@@ -2922,7 +3052,11 @@ mod sqcq_tests {
     #[test]
     fn ps_bulk_inflight_cap_default_and_bounds() {
         let v = crate::ps_bulk_inflight_cap();
-        assert!(v >= 1 && v <= 16, "ps_bulk_inflight_cap out of range: {}", v);
+        assert!(
+            v >= 1 && v <= 16,
+            "ps_bulk_inflight_cap out of range: {}",
+            v
+        );
     }
 
     #[test]
@@ -3103,10 +3237,7 @@ mod f201_classify_cooldown_tests {
     fn precondition_in_chain_uses_soft_cooldown() {
         let inner = anyhow!("precondition failed: ec_conversion_inflight contains 42");
         let outer = inner.context("punch_holes failed");
-        assert_eq!(
-            classify_gc_failure_cooldown(&outer, SOFT, HARD),
-            SOFT
-        );
+        assert_eq!(classify_gc_failure_cooldown(&outer, SOFT, HARD), SOFT);
     }
 
     /// Stream client returns `eversion mismatch (stale extent_info_cache)`
@@ -3117,10 +3248,7 @@ mod f201_classify_cooldown_tests {
     fn eversion_mismatch_uses_soft_cooldown() {
         let inner = anyhow!("eversion mismatch (stale extent_info_cache)");
         let wrapped = inner.context("run_gc extent 42 process_gc_chunk read failed");
-        assert_eq!(
-            classify_gc_failure_cooldown(&wrapped, SOFT, HARD),
-            SOFT
-        );
+        assert_eq!(classify_gc_failure_cooldown(&wrapped, SOFT, HARD), SOFT);
     }
 
     /// Network timeout / disk failure / decode error — anything not on
@@ -3129,10 +3257,7 @@ mod f201_classify_cooldown_tests {
     #[test]
     fn unrecognised_failure_uses_hard_cooldown() {
         let err = anyhow!("connection closed mid-read");
-        assert_eq!(
-            classify_gc_failure_cooldown(&err, SOFT, HARD),
-            HARD
-        );
+        assert_eq!(classify_gc_failure_cooldown(&err, SOFT, HARD), HARD);
     }
 
     /// Empty top-level message but recognisable substring deeper in
@@ -3144,9 +3269,6 @@ mod f201_classify_cooldown_tests {
         let bottom = anyhow!("precondition failed: locked by ec");
         let middle = bottom.context("manager rejected request");
         let top = middle.context("punch_holes failed");
-        assert_eq!(
-            classify_gc_failure_cooldown(&top, SOFT, HARD),
-            SOFT
-        );
+        assert_eq!(classify_gc_failure_cooldown(&top, SOFT, HARD), SOFT);
     }
 }

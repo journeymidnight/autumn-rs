@@ -95,12 +95,7 @@ async fn create_stream(mgr: &RpcClient, replicates: u32) -> u64 {
 }
 
 /// Helper: send a PutReq to a partition server via RpcClient.
-async fn ps_put(
-    ps: &RpcClient,
-    part_id: u64,
-    key: &[u8],
-    value: &[u8],
-) {
+async fn ps_put(ps: &RpcClient, part_id: u64, key: &[u8], value: &[u8]) {
     let resp = ps
         .call(
             partition_rpc::MSG_PUT,
@@ -154,7 +149,12 @@ async fn ps_flush(ps: &RpcClient, part_id: u64) {
         .expect("flush");
     let r: partition_rpc::MaintenanceResp =
         partition_rpc::rkyv_decode(&resp).expect("decode MaintenanceResp");
-    assert_eq!(r.code, partition_rpc::CODE_OK, "flush failed: {}", r.message);
+    assert_eq!(
+        r.code,
+        partition_rpc::CODE_OK,
+        "flush failed: {}",
+        r.message
+    );
 }
 
 /// Helper: trigger major compaction via the Maintenance RPC.
@@ -507,14 +507,10 @@ fn stream_append_commit_punchhole_truncate_flow() {
         let stream_id = create_stream(&mgr, 1).await;
 
         let pool = Rc::new(ConnPool::new());
-        let client = StreamClient::connect(
-            &mgr_addr.to_string(),
-            "owner/e2e/1".to_string(),
-            8,
-            pool,
-        )
-        .await
-        .expect("stream client");
+        let client =
+            StreamClient::connect(&mgr_addr.to_string(), "owner/e2e/1".to_string(), 8, pool)
+                .await
+                .expect("stream client");
 
         let first_batch = [b"hello".as_slice(), b"world!!!".as_slice()];
         let b1 = client
@@ -524,7 +520,10 @@ fn stream_append_commit_punchhole_truncate_flow() {
         assert_eq!(b1.offset, 0);
         let _a3 = client.append(stream_id, b"z").await.expect("append 3");
 
-        let committed = client.commit_length(stream_id).await.expect("commit length");
+        let committed = client
+            .commit_length(stream_id)
+            .await
+            .expect("commit length");
         assert!(committed > 0);
 
         let resp = mgr
@@ -637,7 +636,15 @@ fn stream_append_and_read_blocks_flow() {
 // ---------------------------------------------------------------------------
 
 /// Helper: spin up manager + 2 extent nodes.
-fn setup_infra_f030(node_id_base: u64) -> (SocketAddr, SocketAddr, SocketAddr, tempfile::TempDir, tempfile::TempDir) {
+fn setup_infra_f030(
+    node_id_base: u64,
+) -> (
+    SocketAddr,
+    SocketAddr,
+    SocketAddr,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -653,8 +660,18 @@ fn setup_infra_f030(node_id_base: u64) -> (SocketAddr, SocketAddr, SocketAddr, t
 }
 
 /// Register nodes after connect.
-async fn register_infra_nodes(mgr: &RpcClient, n1_addr: SocketAddr, n2_addr: SocketAddr, node_id_base: u64) {
-    register_node(mgr, &n1_addr.to_string(), &format!("disk-f030-{}", node_id_base)).await;
+async fn register_infra_nodes(
+    mgr: &RpcClient,
+    n1_addr: SocketAddr,
+    n2_addr: SocketAddr,
+    node_id_base: u64,
+) {
+    register_node(
+        mgr,
+        &n1_addr.to_string(),
+        &format!("disk-f030-{}", node_id_base),
+    )
+    .await;
     register_node(
         mgr,
         &n2_addr.to_string(),
@@ -706,7 +723,10 @@ fn f030_flush_writes_sst_to_row_stream() {
             .read_last_extent_data(row_stream)
             .await
             .expect("read_last_extent_data rowStream");
-        assert!(sst.is_some(), "rowStream must have SSTable data after flush");
+        assert!(
+            sst.is_some(),
+            "rowStream must have SSTable data after flush"
+        );
         assert!(!sst.unwrap().is_empty(), "SSTable data must not be empty");
 
         // metaStream: last extent has a TableLocations record.
@@ -764,7 +784,11 @@ fn f030_recovery_from_meta_and_row_streams() {
         let ps2 = RpcClient::connect(ps2_addr).await.expect("connect ps2");
 
         let v1 = ps_get(&ps2, 611, b"a-streamed").await;
-        assert_eq!(v1.value.len(), 4 * 1024, "stream-backed SST key survives restart");
+        assert_eq!(
+            v1.value.len(),
+            4 * 1024,
+            "stream-backed SST key survives restart"
+        );
 
         let v2 = ps_get(&ps2, 611, b"a-wal-only").await;
         assert_eq!(v2.value, b"small", "WAL-only key survives restart");
@@ -794,7 +818,7 @@ fn f029_compaction_merges_small_tables() {
                 &ps,
                 621,
                 format!("key-{:02}", i).as_bytes(),
-                &vec![b'A' + i; 4 * 1024]
+                &vec![b'A' + i; 4 * 1024],
             )
             .await;
             ps_flush(&ps, 621).await;
@@ -890,10 +914,16 @@ fn f031_large_value_stored_in_log_stream() {
         ps_put(&ps, 701, b"small-key", &small_val).await;
 
         let got_large = ps_get(&ps, 701, b"large-key").await;
-        assert_eq!(got_large.value, large_val, "large value must roundtrip via logStream");
+        assert_eq!(
+            got_large.value, large_val,
+            "large value must roundtrip via logStream"
+        );
 
         let got_small = ps_get(&ps, 701, b"small-key").await;
-        assert_eq!(got_small.value, small_val, "small value must roundtrip inline");
+        assert_eq!(
+            got_small.value, small_val,
+            "small value must roundtrip inline"
+        );
     });
 }
 
@@ -964,13 +994,7 @@ fn f031_compaction_preserves_value_pointers() {
 
         // Write 3 rounds of large values, each followed by explicit flush.
         for i in 0..3u8 {
-            ps_put(
-                &ps,
-                721,
-                format!("c-large-{}", i).as_bytes(),
-                &large_val
-            )
-            .await;
+            ps_put(&ps, 721, format!("c-large-{}", i).as_bytes(), &large_val).await;
             ps_flush(&ps, 721).await;
         }
 
@@ -1010,26 +1034,14 @@ fn f033_gc_reclaims_log_stream_extents() {
         // Round 1: write large values
         let val_v1: Vec<u8> = vec![b'A'; 8 * 1024];
         for i in 0u8..3 {
-            ps_put(
-                &ps,
-                801,
-                format!("gc-key-{}", i).as_bytes(),
-                &val_v1
-            )
-            .await;
+            ps_put(&ps, 801, format!("gc-key-{}", i).as_bytes(), &val_v1).await;
             ps_flush(&ps, 801).await;
         }
 
         // Round 2: overwrite same keys
         let val_v2: Vec<u8> = vec![b'B'; 8 * 1024];
         for i in 0u8..3 {
-            ps_put(
-                &ps,
-                801,
-                format!("gc-key-{}", i).as_bytes(),
-                &val_v2
-            )
-            .await;
+            ps_put(&ps, 801, format!("gc-key-{}", i).as_bytes(), &val_v2).await;
             ps_flush(&ps, 801).await;
         }
 
@@ -1080,7 +1092,7 @@ fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
                 &ps,
                 901,
                 format!("a-key-{:02}", i).as_bytes(),
-                format!("val-a-{}", i).as_bytes()
+                format!("val-a-{}", i).as_bytes(),
             )
             .await;
         }
@@ -1092,7 +1104,7 @@ fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
                 &ps,
                 901,
                 format!("y-key-{:02}", i).as_bytes(),
-                format!("val-y-{}", i).as_bytes()
+                format!("val-y-{}", i).as_bytes(),
             )
             .await;
         }
@@ -1118,7 +1130,11 @@ fn f037_overlap_detected_after_split_and_cleared_by_compaction() {
             .await
             .expect("get_regions");
         let regions: GetRegionsResp = rkyv_decode(&resp).expect("decode");
-        assert_eq!(regions.regions.len(), 2, "should have 2 partitions after split");
+        assert_eq!(
+            regions.regions.len(),
+            2,
+            "should have 2 partitions after split"
+        );
 
         // Find the right child's part_id
         let _right_id = regions

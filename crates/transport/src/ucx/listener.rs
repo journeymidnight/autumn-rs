@@ -40,55 +40,55 @@ impl UcxListener {
         let (tx, rx) = mpsc::unbounded::<ConnReqPtr>();
         let sender_box = Box::into_raw(Box::new(tx));
 
-        let (inner, local_addr) = with_thread_ctx(|ctx| -> io::Result<(*mut ucp_listener, SocketAddr)> {
-            let (mut sa, sa_len) = sockaddr::to_storage(&addr);
-            let mut params: ucp_listener_params_t = unsafe { std::mem::zeroed() };
-            params.field_mask = (ucp_listener_params_field::UCP_LISTENER_PARAM_FIELD_SOCK_ADDR
-                               | ucp_listener_params_field::UCP_LISTENER_PARAM_FIELD_CONN_HANDLER)
-                as u64;
-            params.sockaddr.addr = &sa as *const _ as *const _;
-            params.sockaddr.addrlen = sa_len;
-            params.conn_handler.cb = Some(on_conn);
-            params.conn_handler.arg = sender_box as *mut c_void;
+        let (inner, local_addr) =
+            with_thread_ctx(|ctx| -> io::Result<(*mut ucp_listener, SocketAddr)> {
+                let (mut sa, sa_len) = sockaddr::to_storage(&addr);
+                let mut params: ucp_listener_params_t = unsafe { std::mem::zeroed() };
+                params.field_mask = (ucp_listener_params_field::UCP_LISTENER_PARAM_FIELD_SOCK_ADDR
+                    | ucp_listener_params_field::UCP_LISTENER_PARAM_FIELD_CONN_HANDLER)
+                    as u64;
+                params.sockaddr.addr = &sa as *const _ as *const _;
+                params.sockaddr.addrlen = sa_len;
+                params.conn_handler.cb = Some(on_conn);
+                params.conn_handler.arg = sender_box as *mut c_void;
 
-            let mut l: *mut ucp_listener = ptr::null_mut();
-            let st = unsafe { ucp_listener_create(ctx.worker, &params, &mut l) };
-            if st != ucs_status_t::UCS_OK {
-                // Caller is responsible for freeing sender_box on error.
-                return Err(ucs_err(st, "ucp_listener_create"));
-            }
-            std::hint::black_box(&mut sa);
-
-            // For port=0 binds, query the actual bound sockaddr (UCX picks
-            // an ephemeral port). For explicit ports the query agrees with
-            // what we passed, so this is always safe.
-            let local = unsafe {
-                let mut q: ucp_listener_attr_t = std::mem::zeroed();
-                q.field_mask =
-                    ucp_listener_attr_field::UCP_LISTENER_ATTR_FIELD_SOCKADDR as u64;
-                let st = ucp_listener_query(l, &mut q);
+                let mut l: *mut ucp_listener = ptr::null_mut();
+                let st = unsafe { ucp_listener_create(ctx.worker, &params, &mut l) };
                 if st != ucs_status_t::UCS_OK {
-                    return Err(ucs_err(st, "ucp_listener_query"));
+                    // Caller is responsible for freeing sender_box on error.
+                    return Err(ucs_err(st, "ucp_listener_create"));
                 }
-                let bytes = std::slice::from_raw_parts(
-                    &q.sockaddr as *const _ as *const u8,
-                    std::mem::size_of::<libc::sockaddr_storage>(),
-                );
-                let mut storage: libc::sockaddr_storage = std::mem::zeroed();
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    &mut storage as *mut _ as *mut u8,
-                    bytes.len(),
-                );
-                sockaddr::from_storage(&storage)
-            };
-            Ok((l, local))
-        })
-        .map_err(|e| {
-            // On failure, drop the sender we leaked.
-            unsafe { drop(Box::from_raw(sender_box)) };
-            e
-        })?;
+                std::hint::black_box(&mut sa);
+
+                // For port=0 binds, query the actual bound sockaddr (UCX picks
+                // an ephemeral port). For explicit ports the query agrees with
+                // what we passed, so this is always safe.
+                let local = unsafe {
+                    let mut q: ucp_listener_attr_t = std::mem::zeroed();
+                    q.field_mask = ucp_listener_attr_field::UCP_LISTENER_ATTR_FIELD_SOCKADDR as u64;
+                    let st = ucp_listener_query(l, &mut q);
+                    if st != ucs_status_t::UCS_OK {
+                        return Err(ucs_err(st, "ucp_listener_query"));
+                    }
+                    let bytes = std::slice::from_raw_parts(
+                        &q.sockaddr as *const _ as *const u8,
+                        std::mem::size_of::<libc::sockaddr_storage>(),
+                    );
+                    let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        &mut storage as *mut _ as *mut u8,
+                        bytes.len(),
+                    );
+                    sockaddr::from_storage(&storage)
+                };
+                Ok((l, local))
+            })
+            .map_err(|e| {
+                // On failure, drop the sender we leaked.
+                unsafe { drop(Box::from_raw(sender_box)) };
+                e
+            })?;
 
         Ok(UcxListener {
             inner,
@@ -138,8 +138,7 @@ impl UcxListener {
 
         let ep = with_thread_ctx(|ctx| -> io::Result<*mut ucp_ep> {
             let mut params: ucp_ep_params_t = unsafe { std::mem::zeroed() };
-            params.field_mask =
-                ucp_ep_params_field::UCP_EP_PARAM_FIELD_CONN_REQUEST as u64;
+            params.field_mask = ucp_ep_params_field::UCP_EP_PARAM_FIELD_CONN_REQUEST as u64;
             params.conn_request = req;
             let mut ep: *mut ucp_ep = ptr::null_mut();
             let st = unsafe { ucp_ep_create(ctx.worker, &params, &mut ep) };

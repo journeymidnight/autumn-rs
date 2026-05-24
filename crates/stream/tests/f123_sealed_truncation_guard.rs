@@ -47,7 +47,10 @@ async fn batch_path_rejects_append_to_sealed_extent() {
     // succeed. With F123, if the manager says it's sealed, it would reject.
     // Without a manager, the truncation proceeds (correct for non-sealed).
     let w3 = conn.append(5001, 1, 3, 1, b"x".to_vec()).await;
-    assert_eq!(w3.code, CODE_OK, "non-sealed extent allows commit truncation");
+    assert_eq!(
+        w3.code, CODE_OK,
+        "non-sealed extent allows commit truncation"
+    );
 
     // Verify the file was truncated to commit=3 and new data appended.
     assert_eq!(w3.offset, 3);

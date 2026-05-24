@@ -125,7 +125,8 @@ pub(crate) async fn dispatch_partition_rpc(
         MSG_SPLIT_PART => Err((
             StatusCode::Internal,
             "MSG_SPLIT_PART must not be dispatched inline — F210-C2 requires spawned task; \
-             routed via handle_incoming_req's MSG_SPLIT_PART arm".to_string(),
+             routed via handle_incoming_req's MSG_SPLIT_PART arm"
+                .to_string(),
         )),
         MSG_MAINTENANCE => handle_maintenance(payload, part).await,
         // F210-C4: manager pull of current vp_refs snapshot.
@@ -137,7 +138,10 @@ pub(crate) async fn dispatch_partition_rpc(
             StatusCode::Internal,
             format!("write msg_type {msg_type} must be routed via partition_loop"),
         )),
-        _ => Err((StatusCode::InvalidArgument, format!("unknown msg_type {msg_type}"))),
+        _ => Err((
+            StatusCode::InvalidArgument,
+            format!("unknown msg_type {msg_type}"),
+        )),
     }
 }
 
@@ -226,7 +230,8 @@ async fn get_value(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
 ) -> Result<GetOutcome, (StatusCode, String)> {
-    let req: GetReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    let req: GetReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
     let lookup_t0 = Instant::now();
     let p = part.borrow();
@@ -235,28 +240,43 @@ async fn get_value(
     // FailedPrecondition frame error so the SDK's existing `Err`-arm
     // refresh+retry path in `call_ps_for_key` engages.
     if req.region_epoch != 0 && req.region_epoch != p.region_epoch {
-        return Err((StatusCode::FailedPrecondition, format!(
-            "region epoch stale: part_id={} have={} got={}",
-            p.part_id, p.region_epoch, req.region_epoch
-        )));
+        return Err((
+            StatusCode::FailedPrecondition,
+            format!(
+                "region epoch stale: part_id={} have={} got={}",
+                p.part_id, p.region_epoch, req.region_epoch
+            ),
+        ));
     }
     if !in_range(&p.rg, &req.key) {
-        return Err((StatusCode::InvalidArgument, "key is out of range".to_string()));
+        return Err((
+            StatusCode::InvalidArgument,
+            "key is out of range".to_string(),
+        ));
     }
 
     // Track where the key was found.
     let mut source = 0u8; // 0=miss, 1=mem, 2=imm, 3=sst
     let found: Option<(u8, Bytes, u64)> = lookup_in_memtable(&p.active, &req.key)
-        .map(|r| { source = 1; r })
+        .map(|r| {
+            source = 1;
+            r
+        })
         .or_else(|| {
             for imm in p.imm.iter().rev() {
-                if let Some(r) = lookup_in_memtable(imm, &req.key) { source = 2; return Some(r); }
+                if let Some(r) = lookup_in_memtable(imm, &req.key) {
+                    source = 2;
+                    return Some(r);
+                }
             }
             None
         })
         .or_else(|| {
             for reader in p.sst_readers.iter().rev() {
-                if let Some(r) = lookup_in_sst(reader, &req.key) { source = 3; return Some(r); }
+                if let Some(r) = lookup_in_sst(reader, &req.key) {
+                    source = 3;
+                    return Some(r);
+                }
             }
             None
         });
@@ -267,7 +287,9 @@ async fn get_value(
         None => {
             READ_METRICS.with(|m| {
                 let mut m = m.borrow_mut();
-                m.ops += 1; m.lookup_ns += lookup_ns; m.not_found += 1;
+                m.ops += 1;
+                m.lookup_ns += lookup_ns;
+                m.not_found += 1;
                 m.maybe_report();
             });
             return Ok(GetOutcome::NotFound);
@@ -276,7 +298,9 @@ async fn get_value(
     if op == 2 || (expires_at > 0 && expires_at <= now_secs()) {
         READ_METRICS.with(|m| {
             let mut m = m.borrow_mut();
-            m.ops += 1; m.lookup_ns += lookup_ns; m.not_found += 1;
+            m.ops += 1;
+            m.lookup_ns += lookup_ns;
+            m.not_found += 1;
             m.maybe_report();
         });
         return Ok(GetOutcome::NotFound);
@@ -302,7 +326,9 @@ async fn get_value(
                 // racing the punch_holes RPC.
                 READ_METRICS.with(|m| {
                     let mut m = m.borrow_mut();
-                    m.ops += 1; m.lookup_ns += lookup_ns; m.not_found += 1;
+                    m.ops += 1;
+                    m.lookup_ns += lookup_ns;
+                    m.not_found += 1;
                     m.maybe_report();
                 });
                 return Ok(GetOutcome::NotFound);
@@ -317,7 +343,11 @@ async fn get_value(
     let value = resolve_value(op, raw_value, &sc, req.offset, req.length)
         .await
         .map_err(|e| map_storage_error(&e))?;
-    let vp_resolve_ns = if is_vp { vp_t0.elapsed().as_nanos() as u64 } else { 0 };
+    let vp_resolve_ns = if is_vp {
+        vp_t0.elapsed().as_nanos() as u64
+    } else {
+        0
+    };
     // _vp_pin guard drops here, releasing the pin.
 
     READ_METRICS.with(|m| {
@@ -340,30 +370,66 @@ async fn get_value(
     Ok(GetOutcome::Value(value))
 }
 
-pub(crate) async fn handle_head(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
-    let req: HeadReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+pub(crate) async fn handle_head(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> HandlerResult {
+    let req: HeadReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
     let p = part.borrow();
     if req.region_epoch != 0 && req.region_epoch != p.region_epoch {
-        return Err((StatusCode::FailedPrecondition, format!(
-            "region epoch stale: part_id={} have={} got={}",
-            p.part_id, p.region_epoch, req.region_epoch
-        )));
+        return Err((
+            StatusCode::FailedPrecondition,
+            format!(
+                "region epoch stale: part_id={} have={} got={}",
+                p.part_id, p.region_epoch, req.region_epoch
+            ),
+        ));
     }
     if !in_range(&p.rg, &req.key) {
-        return Err((StatusCode::InvalidArgument, "key is out of range".to_string()));
+        return Err((
+            StatusCode::InvalidArgument,
+            "key is out of range".to_string(),
+        ));
     }
 
     let found = lookup_in_memtable(&p.active, &req.key)
-        .or_else(|| { for imm in p.imm.iter().rev() { if let Some(r) = lookup_in_memtable(imm, &req.key) { return Some(r); } } None })
-        .or_else(|| { for reader in p.sst_readers.iter().rev() { if let Some(r) = lookup_in_sst(reader, &req.key) { return Some(r); } } None });
+        .or_else(|| {
+            for imm in p.imm.iter().rev() {
+                if let Some(r) = lookup_in_memtable(imm, &req.key) {
+                    return Some(r);
+                }
+            }
+            None
+        })
+        .or_else(|| {
+            for reader in p.sst_readers.iter().rev() {
+                if let Some(r) = lookup_in_sst(reader, &req.key) {
+                    return Some(r);
+                }
+            }
+            None
+        });
 
     let (op, raw_value, expires_at) = match found {
         Some(v) => v,
-        None => return Ok(partition_rpc::rkyv_encode(&HeadResp { code: CODE_NOT_FOUND, message: "key not found".to_string(), found: false, value_length: 0 })),
+        None => {
+            return Ok(partition_rpc::rkyv_encode(&HeadResp {
+                code: CODE_NOT_FOUND,
+                message: "key not found".to_string(),
+                found: false,
+                value_length: 0,
+            }))
+        }
     };
     if op == 2 || (expires_at > 0 && expires_at <= now_secs()) {
-        return Ok(partition_rpc::rkyv_encode(&HeadResp { code: CODE_NOT_FOUND, message: "key not found".to_string(), found: false, value_length: 0 }));
+        return Ok(partition_rpc::rkyv_encode(&HeadResp {
+            code: CODE_NOT_FOUND,
+            message: "key not found".to_string(),
+            found: false,
+            value_length: 0,
+        }));
     }
 
     let value_len = if op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
@@ -372,11 +438,20 @@ pub(crate) async fn handle_head(payload: Bytes, part: &Rc<RefCell<PartitionData>
         raw_value.len() as u64
     };
 
-    Ok(partition_rpc::rkyv_encode(&HeadResp { code: CODE_OK, message: String::new(), found: true, value_length: value_len }))
+    Ok(partition_rpc::rkyv_encode(&HeadResp {
+        code: CODE_OK,
+        message: String::new(),
+        found: true,
+        value_length: value_len,
+    }))
 }
 
-pub(crate) async fn handle_range(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
-    let req: RangeReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+pub(crate) async fn handle_range(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> HandlerResult {
+    let req: RangeReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
     let p = part.borrow();
     // F-this: this is the load-bearing check for `range()` correctness
@@ -386,31 +461,49 @@ pub(crate) async fn handle_range(payload: Bytes, part: &Rc<RefCell<PartitionData
     // bug. Now any range with a stale snapshot's epoch is rejected
     // up-front; SDK refreshes + re-runs.
     if req.region_epoch != 0 && req.region_epoch != p.region_epoch {
-        return Err((StatusCode::FailedPrecondition, format!(
-            "region epoch stale: part_id={} have={} got={}",
-            p.part_id, p.region_epoch, req.region_epoch
-        )));
+        return Err((
+            StatusCode::FailedPrecondition,
+            format!(
+                "region epoch stale: part_id={} have={} got={}",
+                p.part_id, p.region_epoch, req.region_epoch
+            ),
+        ));
     }
     // F-this Phase 4: snapshot the PS's authoritative end_key so the
     // response can carry it as a resume cursor for the SDK. Empty =
     // unbounded right side (last partition in the keyspace).
     let cur_end_key = p.rg.end_key.clone();
     if req.limit == 0 {
-        return Ok(partition_rpc::rkyv_encode(&RangeResp { code: CODE_OK, message: String::new(), entries: vec![], has_more: true, cur_end_key }));
+        return Ok(partition_rpc::rkyv_encode(&RangeResp {
+            code: CODE_OK,
+            message: String::new(),
+            entries: vec![],
+            has_more: true,
+            cur_end_key,
+        }));
     }
 
-    let start_user_key = if req.start.is_empty() { req.prefix.clone() } else { req.start.clone() };
+    let start_user_key = if req.start.is_empty() {
+        req.prefix.clone()
+    } else {
+        req.start.clone()
+    };
     let seek_key = key_with_ts(&start_user_key, u64::MAX);
 
     let mem_items = collect_mem_items(&p);
     let mut mem_it = MemtableIterator::new(mem_items);
     mem_it.seek(&seek_key);
 
-    let sst_iters: Vec<TableIterator> = p.sst_readers.iter().rev().map(|r| {
-        let mut it = TableIterator::new(r.clone());
-        it.seek(&seek_key);
-        it
-    }).collect();
+    let sst_iters: Vec<TableIterator> = p
+        .sst_readers
+        .iter()
+        .rev()
+        .map(|r| {
+            let mut it = TableIterator::new(r.clone());
+            it.seek(&seek_key);
+            it
+        })
+        .collect();
     let mut merge = MergeIterator::new(sst_iters);
 
     let now = now_secs();
@@ -422,13 +515,29 @@ pub(crate) async fn handle_range(payload: Bytes, part: &Rc<RefCell<PartitionData
     let mut last_user_key: Option<Vec<u8>> = None;
 
     loop {
-        let mem_key = if mem_it.valid() { mem_it.item().map(|i| i.key.as_slice()) } else { None };
-        let sst_key = if merge.valid() { merge.item().map(|i| i.key.as_slice()) } else { None };
+        let mem_key = if mem_it.valid() {
+            mem_it.item().map(|i| i.key.as_slice())
+        } else {
+            None
+        };
+        let sst_key = if merge.valid() {
+            merge.item().map(|i| i.key.as_slice())
+        } else {
+            None
+        };
 
         let item = match (mem_key, sst_key) {
             (None, None) => break,
-            (Some(_), None) => { let item = mem_it.item().unwrap().clone(); mem_it.next(); item }
-            (None, Some(_)) => { let item = merge.item().unwrap().clone(); merge.next(); item }
+            (Some(_), None) => {
+                let item = mem_it.item().unwrap().clone();
+                mem_it.next();
+                item
+            }
+            (None, Some(_)) => {
+                let item = merge.item().unwrap().clone();
+                merge.next();
+                item
+            }
             (Some(mk), Some(sk)) => {
                 if mk <= sk {
                     let item = mem_it.item().unwrap().clone();
@@ -436,8 +545,14 @@ pub(crate) async fn handle_range(payload: Bytes, part: &Rc<RefCell<PartitionData
                     mem_it.next();
                     while merge.valid() {
                         if let Some(si) = merge.item() {
-                            if parse_key(&si.key) == uk_owned.as_slice() { merge.next(); } else { break; }
-                        } else { break; }
+                            if parse_key(&si.key) == uk_owned.as_slice() {
+                                merge.next();
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
                     }
                     item
                 } else {
@@ -446,8 +561,14 @@ pub(crate) async fn handle_range(payload: Bytes, part: &Rc<RefCell<PartitionData
                     merge.next();
                     while mem_it.valid() {
                         if let Some(mi) = mem_it.item() {
-                            if parse_key(&mi.key) == uk_owned.as_slice() { mem_it.next(); } else { break; }
-                        } else { break; }
+                            if parse_key(&mi.key) == uk_owned.as_slice() {
+                                mem_it.next();
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
                     }
                     item
                 }
@@ -455,20 +576,41 @@ pub(crate) async fn handle_range(payload: Bytes, part: &Rc<RefCell<PartitionData
         };
 
         let uk = parse_key(&item.key);
-        if check_overlap && !in_range(&part_rg, uk) { continue; }
-        if !req.prefix.is_empty() && !uk.starts_with(&req.prefix as &[u8]) { break; }
-        if last_user_key.as_deref() == Some(uk) { continue; }
+        if check_overlap && !in_range(&part_rg, uk) {
+            continue;
+        }
+        if !req.prefix.is_empty() && !uk.starts_with(&req.prefix as &[u8]) {
+            break;
+        }
+        if last_user_key.as_deref() == Some(uk) {
+            continue;
+        }
         last_user_key = Some(uk.to_vec());
 
-        if item.op == 2 { continue; }
-        if item.expires_at > 0 && item.expires_at <= now { continue; }
+        if item.op == 2 {
+            continue;
+        }
+        if item.expires_at > 0 && item.expires_at <= now {
+            continue;
+        }
 
-        out.push(RangeEntry { key: uk.to_vec(), value: vec![] });
-        if out.len() >= req.limit as usize { break; }
+        out.push(RangeEntry {
+            key: uk.to_vec(),
+            value: vec![],
+        });
+        if out.len() >= req.limit as usize {
+            break;
+        }
     }
 
     let has_more = out.len() == req.limit as usize;
-    Ok(partition_rpc::rkyv_encode(&RangeResp { code: CODE_OK, message: String::new(), entries: out, has_more, cur_end_key }))
+    Ok(partition_rpc::rkyv_encode(&RangeResp {
+        code: CODE_OK,
+        message: String::new(),
+        entries: out,
+        has_more,
+        cur_end_key,
+    }))
 }
 
 pub(crate) async fn handle_split_part(
@@ -480,10 +622,14 @@ pub(crate) async fn handle_split_part(
     _owner_key: &str,
     _revision: i64,
 ) -> HandlerResult {
-    let req: SplitPartReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    let req: SplitPartReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
     if part.borrow().has_overlap.get() != 0 {
-        return Err((StatusCode::FailedPrecondition, "cannot split: partition has overlapping keys".to_string()));
+        return Err((
+            StatusCode::FailedPrecondition,
+            "cannot split: partition has overlapping keys".to_string(),
+        ));
     }
 
     // F196: refuse split when this PS's static core budget can't host the
@@ -531,18 +677,32 @@ pub(crate) async fn handle_split_part(
         // for the F103 stale-rg fix. Bounded so split doesn't wedge
         // on a hung manager.
         let resp_bytes = pool
-            .call_timeout(manager_addr, manager_rpc::MSG_GET_REGIONS, Bytes::new(), Duration::from_secs(10))
+            .call_timeout(
+                manager_addr,
+                manager_rpc::MSG_GET_REGIONS,
+                Bytes::new(),
+                Duration::from_secs(10),
+            )
             .await
             .map_err(|e| (StatusCode::Internal, format!("get_regions: {e}")))?;
-        let resp: manager_rpc::GetRegionsResp = manager_rpc::rkyv_decode(&resp_bytes)
-            .map_err(|e| (StatusCode::Internal, e))?;
+        let resp: manager_rpc::GetRegionsResp =
+            manager_rpc::rkyv_decode(&resp_bytes).map_err(|e| (StatusCode::Internal, e))?;
         if resp.code != manager_rpc::CODE_OK {
-            return Err((StatusCode::Internal, format!("get_regions: {}", resp.message)));
+            return Err((
+                StatusCode::Internal,
+                format!("get_regions: {}", resp.message),
+            ));
         }
-        resp.regions.into_iter()
+        resp.regions
+            .into_iter()
             .find(|(pid, _)| *pid == req.part_id)
             .and_then(|(_, info)| info.rg)
-            .ok_or_else(|| (StatusCode::NotFound, format!("partition {} not in manager regions", req.part_id)))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NotFound,
+                    format!("partition {} not in manager regions", req.part_id),
+                )
+            })?
     };
 
     let user_keys = unique_user_keys(&part.borrow())
@@ -550,8 +710,13 @@ pub(crate) async fn handle_split_part(
         .filter(|k| in_range(&auth_rg, k))
         .collect::<Vec<_>>();
     if user_keys.len() < 2 {
-        return Err((StatusCode::FailedPrecondition,
-            format!("part has fewer than 2 in-range keys (have {}; run major compaction first)", user_keys.len())));
+        return Err((
+            StatusCode::FailedPrecondition,
+            format!(
+                "part has fewer than 2 in-range keys (have {}; run major compaction first)",
+                user_keys.len()
+            ),
+        ));
     }
 
     let mid = user_keys[user_keys.len() / 2].clone();
@@ -629,9 +794,21 @@ pub(crate) async fn handle_split_part(
     // commit_length on each stream — now stable, because no in-flight
     // Phase 2 can complete (drain emptied them) and no new writes can
     // launch (frozen_for_split halts handle_incoming_req).
-    let log_end = part_sc.commit_length(log_stream_id).await.unwrap_or(0).max(1);
-    let row_end = part_sc.commit_length(row_stream_id).await.unwrap_or(0).max(1);
-    let meta_end = part_sc.commit_length(meta_stream_id).await.unwrap_or(0).max(1);
+    let log_end = part_sc
+        .commit_length(log_stream_id)
+        .await
+        .unwrap_or(0)
+        .max(1);
+    let row_end = part_sc
+        .commit_length(row_stream_id)
+        .await
+        .unwrap_or(0)
+        .max(1);
+    let meta_end = part_sc
+        .commit_length(meta_stream_id)
+        .await
+        .unwrap_or(0)
+        .max(1);
 
     // Call multi_modify_split on manager via StreamClient.
     let mut split_ok = false;
@@ -639,7 +816,11 @@ pub(crate) async fn handle_split_part(
     let mut backoff = Duration::from_millis(100);
     for _ in 0..8 {
         match part_sc
-            .multi_modify_split(mid.clone(), req.part_id, [log_end as u64, row_end as u64, meta_end as u64])
+            .multi_modify_split(
+                mid.clone(),
+                req.part_id,
+                [log_end as u64, row_end as u64, meta_end as u64],
+            )
             .await
         {
             Ok(()) => {
@@ -693,7 +874,10 @@ pub(crate) async fn handle_split_part(
     // saw an empty list (HTTP 500 in gallery's `list_handler_inner`).
     {
         let mut p = part.borrow_mut();
-        let new_rg = Range { start_key: auth_rg.start_key.clone(), end_key: mid.clone() };
+        let new_rg = Range {
+            start_key: auth_rg.start_key.clone(),
+            end_key: mid.clone(),
+        };
         let mut overlap = false;
         for reader in &p.sst_readers {
             let sk = parse_key(reader.smallest_key());
@@ -739,15 +923,27 @@ pub(crate) async fn handle_split_part(
     // resume against the narrower range.
     part.borrow().frozen_for_split.set(None);
 
-    Ok(partition_rpc::rkyv_encode(&SplitPartResp { code: CODE_OK, message: String::new() }))
+    Ok(partition_rpc::rkyv_encode(&SplitPartResp {
+        code: CODE_OK,
+        message: String::new(),
+    }))
 }
 
-pub(crate) async fn handle_maintenance(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
-    let req: MaintenanceReq = partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+pub(crate) async fn handle_maintenance(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> HandlerResult {
+    let req: MaintenanceReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
     if req.op == MAINTENANCE_FLUSH {
         // Synchronous flush: rotate active memtable and flush all immutables.
-        flush_memtable_locked(part).await.map_err(|e| (StatusCode::Internal, e.to_string()))?;
-        return Ok(partition_rpc::rkyv_encode(&MaintenanceResp { code: CODE_OK, message: String::new() }));
+        flush_memtable_locked(part)
+            .await
+            .map_err(|e| (StatusCode::Internal, e.to_string()))?;
+        return Ok(partition_rpc::rkyv_encode(&MaintenanceResp {
+            code: CODE_OK,
+            message: String::new(),
+        }));
     }
     let mut p = part.borrow_mut();
     let result = match req.op {
@@ -766,13 +962,21 @@ pub(crate) async fn handle_maintenance(payload: Bytes, part: &Rc<RefCell<Partiti
         }
         MAINTENANCE_FORCE_GC => p
             .gc_tx
-            .try_send(GcTask::Force { extent_ids: req.extent_ids })
+            .try_send(GcTask::Force {
+                extent_ids: req.extent_ids,
+            })
             .map_err(|_| "gc busy"),
         _ => Err("unknown op"),
     };
     match result {
-        Ok(()) => Ok(partition_rpc::rkyv_encode(&MaintenanceResp { code: CODE_OK, message: String::new() })),
-        Err(e) => Ok(partition_rpc::rkyv_encode(&MaintenanceResp { code: CODE_ERROR, message: e.to_string() })),
+        Ok(()) => Ok(partition_rpc::rkyv_encode(&MaintenanceResp {
+            code: CODE_OK,
+            message: String::new(),
+        })),
+        Err(e) => Ok(partition_rpc::rkyv_encode(&MaintenanceResp {
+            code: CODE_ERROR,
+            message: e.to_string(),
+        })),
     }
 }
 
@@ -781,8 +985,8 @@ pub(crate) async fn handle_get_discards(
     part: &Rc<RefCell<PartitionData>>,
     part_sc: &Rc<StreamClient>,
 ) -> HandlerResult {
-    let _req: GetDiscardsReq = partition_rpc::rkyv_decode(&payload)
-        .map_err(|e| (StatusCode::InvalidArgument, e))?;
+    let _req: GetDiscardsReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
     let (log_stream_id, readers) = {
         let p = part.borrow();
@@ -815,8 +1019,8 @@ pub(crate) async fn handle_pull_vp_refs(
     part: &Rc<RefCell<PartitionData>>,
 ) -> HandlerResult {
     use autumn_rpc::partition_rpc::{PullVpRefsReq, PullVpRefsResp};
-    let req: PullVpRefsReq = partition_rpc::rkyv_decode(&payload)
-        .map_err(|e| (StatusCode::InvalidArgument, e))?;
+    let req: PullVpRefsReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
     // Single borrow — collect snapshot synchronously. Mirrors the
     // logic in `collect_partition_vp_refs` (lib.rs:5038).

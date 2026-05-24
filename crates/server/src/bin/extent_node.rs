@@ -154,8 +154,8 @@ fn parse_args() -> Args {
             }
             "--transport" => {
                 i += 1;
-                transport = autumn_transport::parse_transport_flag(&args[i])
-                    .unwrap_or_else(|bad| {
+                transport =
+                    autumn_transport::parse_transport_flag(&args[i]).unwrap_or_else(|bad| {
                         eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
                         std::process::exit(2);
                     });
@@ -178,13 +178,17 @@ fn parse_args() -> Args {
             "--ec-convert-parallelism" => {
                 i += 1;
                 ec_convert_parallelism = Some(
-                    args[i].parse().expect("--ec-convert-parallelism must be a number"),
+                    args[i]
+                        .parse()
+                        .expect("--ec-convert-parallelism must be a number"),
                 );
             }
             "--recovery-parallelism" => {
                 i += 1;
                 recovery_parallelism = Some(
-                    args[i].parse().expect("--recovery-parallelism must be a number"),
+                    args[i]
+                        .parse()
+                        .expect("--recovery-parallelism must be a number"),
                 );
             }
             "--inflight-cap" => {
@@ -349,7 +353,10 @@ fn main() -> Result<()> {
             rlim_max: libc::RLIM_INFINITY,
         };
         if libc::setrlimit(libc::RLIMIT_MEMLOCK, &inf) != 0 {
-            let mut ml = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            let mut ml = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
             if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut ml) == 0 && ml.rlim_cur < ml.rlim_max {
                 ml.rlim_cur = ml.rlim_max;
                 libc::setrlimit(libc::RLIMIT_MEMLOCK, &ml);
@@ -466,11 +473,9 @@ fn main() -> Result<()> {
                         .ok();
                     // F191: per-shard control listener — same SQ/CQ
                     // machinery, no API churn.
-                    let ctl_addr = autumn_transport::format_listen_addr(
-                        &bind_host,
-                        control_listen_port,
-                    )
-                    .context("parse control listen address")?;
+                    let ctl_addr =
+                        autumn_transport::format_listen_addr(&bind_host, control_listen_port)
+                            .context("parse control listen address")?;
 
                     // F214-D: only shard 0 runs the manager cross-check;
                     // it's the same check for every shard, so doing it
@@ -505,7 +510,8 @@ fn main() -> Result<()> {
                         "extent-node shard listening"
                     );
 
-                    let node = ExtentNode::new(cfg).await
+                    let node = ExtentNode::new(cfg)
+                        .await
                         .with_context(|| format!("create ExtentNode shard {shard_idx}"))?;
                     node.serve_with_control(addr, ctl_addr).await
                 })

@@ -207,8 +207,7 @@ impl FrameDecoder {
             return Ok(None);
         }
 
-        let payload_len =
-            u32::from_le_bytes(self.buf[6..10].try_into().unwrap());
+        let payload_len = u32::from_le_bytes(self.buf[6..10].try_into().unwrap());
 
         if payload_len > MAX_PAYLOAD_LEN {
             return Err(FrameError::PayloadTooLarge(payload_len));

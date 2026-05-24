@@ -39,7 +39,10 @@ pub enum AutumnError {
     /// F129/F186: value exceeds the inline `Put` cap. Caller should retry
     /// via `put_stream_begin` / `PutStreamHandle::send` / `commit`
     /// (client-side striped write, no server-side multipart RPC any more).
-    ValueTooLarge { size: u64, cap: u64 },
+    ValueTooLarge {
+        size: u64,
+        cap: u64,
+    },
 }
 
 impl std::fmt::Display for AutumnError {
@@ -53,7 +56,10 @@ impl std::fmt::Display for AutumnError {
             AutumnError::ConnectionError(msg) => write!(f, "connection error: {msg}"),
             AutumnError::ValueTooLarge { size, cap } => {
                 if *cap > 0 {
-                    write!(f, "value {size} bytes exceeds inline cap {cap} — use put_stream_begin")
+                    write!(
+                        f,
+                        "value {size} bytes exceeds inline cap {cap} — use put_stream_begin"
+                    )
                 } else {
                     write!(f, "value {size} bytes exceeds the partition server's inline cap — use put_stream_begin")
                 }
@@ -308,7 +314,12 @@ impl ClusterClient {
     }
 
     /// Call manager with retry and round-robin on NotLeader/connection error.
-    pub async fn mgr_call_retry(&self, msg_type: u8, payload: Bytes, max_retries: u32) -> Result<Bytes> {
+    pub async fn mgr_call_retry(
+        &self,
+        msg_type: u8,
+        payload: Bytes,
+        max_retries: u32,
+    ) -> Result<Bytes> {
         let mut attempt = 0u32;
         loop {
             match self.mgr_call(msg_type, payload.clone()).await {
@@ -335,10 +346,7 @@ impl ClusterClient {
 
     /// Connect to the cluster. Accepts comma-separated manager addresses.
     pub async fn connect(manager: &str) -> Result<Self> {
-        let manager_addrs: Vec<String> = manager
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .collect();
+        let manager_addrs: Vec<String> = manager.split(',').map(|s| s.trim().to_string()).collect();
 
         let client = Self {
             manager_addrs,
@@ -441,12 +449,7 @@ impl ClusterClient {
     /// Honors `rpc_timeout` (default `DEFAULT_RPC_TIMEOUT`); see the
     /// field docstring for the partition-handle-drop hang this guards
     /// against.
-    pub async fn ps_call(
-        &self,
-        ps_addr: &str,
-        msg_type: u8,
-        payload: Bytes,
-    ) -> Result<Bytes> {
+    pub async fn ps_call(&self, ps_addr: &str, msg_type: u8, payload: Bytes) -> Result<Bytes> {
         let client = self.get_ps_client(ps_addr).await?;
         let outcome = match self.rpc_timeout.get() {
             None => client.call(msg_type, payload).await,
@@ -584,9 +587,7 @@ impl ClusterClient {
     /// prefix like "pc_{tid}_{seq}" / "bench_{tid}_{seq}" which lexically
     /// always fell in ONE partition, making N>1 perf tests measure a single
     /// partition with (N-1) rejecting load.
-    pub async fn all_partitions_with_range(
-        &self,
-    ) -> Result<Vec<(u64, String, Vec<u8>, Vec<u8>)>> {
+    pub async fn all_partitions_with_range(&self) -> Result<Vec<(u64, String, Vec<u8>, Vec<u8>)>> {
         if self.regions.borrow().is_empty() {
             self.refresh_regions().await?;
         }
@@ -639,10 +640,15 @@ impl ClusterClient {
         let mut attempt: u32 = 0;
         let mut last_err: Option<String> = None;
         while attempt <= MAX_PS_REFRESHES {
-            let (part_id, ps_addr) = self.resolve_key(key).await
+            let (part_id, ps_addr) = self
+                .resolve_key(key)
+                .await
                 .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
             let region_epoch = self.lookup_epoch_for_part(part_id);
-            match self.ps_call(&ps_addr, msg_type, build_payload(part_id, region_epoch)).await {
+            match self
+                .ps_call(&ps_addr, msg_type, build_payload(part_id, region_epoch))
+                .await
+            {
                 Ok(b) => return Ok(b),
                 Err(e) => {
                     last_err = Some(e.to_string());
@@ -682,7 +688,9 @@ impl ClusterClient {
         let mut attempt: u32 = 0;
         let mut last_err: Option<String> = None;
         while attempt <= MAX_PS_REFRESHES {
-            let ps_addr = self.resolve_part_id(part_id).await
+            let ps_addr = self
+                .resolve_part_id(part_id)
+                .await
                 .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
             match self.ps_call(&ps_addr, msg_type, payload.clone()).await {
                 Ok(b) => return Ok(b),
@@ -697,9 +705,11 @@ impl ClusterClient {
                     // NotFound from a not-yet-registered post-split partition /
                     // connection) fall through to refresh + retry.
                     match e.downcast::<AutumnError>() {
-                        Ok(ae @ (AutumnError::PreconditionFailed(_)
+                        Ok(
+                            ae @ (AutumnError::PreconditionFailed(_)
                             | AutumnError::InvalidArgument(_)
-                            | AutumnError::ValueTooLarge { .. })) => {
+                            | AutumnError::ValueTooLarge { .. }),
+                        ) => {
                             return Err(ae);
                         }
                         Ok(ae) => last_err = Some(ae.to_string()),
@@ -773,9 +783,17 @@ impl ClusterClient {
         }
         let key = key.to_vec();
         let value = value.to_vec();
-        let resp_bytes = self.call_ps_for_key(&key, MSG_PUT, |part_id, region_epoch| {
-            rkyv_encode(&PutReq { part_id, key: key.clone(), value: value.clone(), expires_at, region_epoch })
-        }).await?;
+        let resp_bytes = self
+            .call_ps_for_key(&key, MSG_PUT, |part_id, region_epoch| {
+                rkyv_encode(&PutReq {
+                    part_id,
+                    key: key.clone(),
+                    value: value.clone(),
+                    expires_at,
+                    region_epoch,
+                })
+            })
+            .await?;
         let resp: PutResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code == partition_rpc::CODE_VALUE_TOO_LARGE {
             // PS-reported cap (lower than CLIENT_PUT_HARD_CAP). Surface the
@@ -802,11 +820,7 @@ impl ClusterClient {
     /// this copies 0. Same routing + epoch-stale refresh + RPC-retry shape as
     /// `call_ps_for_key`. Inline-cap rules are identical to `put` (PS rejects
     /// over the inline cap with `CODE_VALUE_TOO_LARGE`).
-    pub async fn put_zc(
-        &self,
-        key: &[u8],
-        value: Bytes,
-    ) -> std::result::Result<(), AutumnError> {
+    pub async fn put_zc(&self, key: &[u8], value: Bytes) -> std::result::Result<(), AutumnError> {
         self.put_zc_opts(key, value, 0).await
     }
 
@@ -831,8 +845,7 @@ impl ClusterClient {
                 .await
                 .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
             let region_epoch = self.lookup_epoch_for_part(part_id);
-            let meta =
-                partition_rpc::encode_put_zc_meta(part_id, region_epoch, expires_at, &key);
+            let meta = partition_rpc::encode_put_zc_meta(part_id, region_epoch, expires_at, &key);
             match self.get_ps_client(&ps_addr).await {
                 Ok(client) => {
                     // [meta, value] — value is a zero-copy iovec; no copy here.
@@ -841,8 +854,8 @@ impl ClusterClient {
                         .await
                     {
                         Ok(resp_bytes) => {
-                            let resp: PutResp = rkyv_decode(&resp_bytes)
-                                .map_err(AutumnError::ServerError)?;
+                            let resp: PutResp =
+                                rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
                             match resp.code {
                                 partition_rpc::CODE_OK => return Ok(()),
                                 partition_rpc::CODE_VALUE_TOO_LARGE => {
@@ -903,9 +916,17 @@ impl ClusterClient {
         length: u32,
     ) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
         let key = key.to_vec();
-        let resp_bytes = self.call_ps_for_key(&key, MSG_GET, |part_id, region_epoch| {
-            rkyv_encode(&GetReq { part_id, key: key.clone(), offset, length, region_epoch })
-        }).await?;
+        let resp_bytes = self
+            .call_ps_for_key(&key, MSG_GET, |part_id, region_epoch| {
+                rkyv_encode(&GetReq {
+                    part_id,
+                    key: key.clone(),
+                    offset,
+                    length,
+                    region_epoch,
+                })
+            })
+            .await?;
         let resp: GetResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code == partition_rpc::CODE_NOT_FOUND {
             return Ok(None);
@@ -996,9 +1017,15 @@ impl ClusterClient {
     /// Delete a key. Returns Ok(()) even if key didn't exist.
     pub async fn delete(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
         let key = key.to_vec();
-        let resp_bytes = self.call_ps_for_key(&key, MSG_DELETE, |part_id, region_epoch| {
-            rkyv_encode(&DeleteReq { part_id, key: key.clone(), region_epoch })
-        }).await?;
+        let resp_bytes = self
+            .call_ps_for_key(&key, MSG_DELETE, |part_id, region_epoch| {
+                rkyv_encode(&DeleteReq {
+                    part_id,
+                    key: key.clone(),
+                    region_epoch,
+                })
+            })
+            .await?;
         let resp: DeleteResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code != partition_rpc::CODE_OK && resp.code != partition_rpc::CODE_NOT_FOUND {
             return Err(code_to_error(resp.code, resp.message));
@@ -1009,11 +1036,20 @@ impl ClusterClient {
     /// Get key metadata (existence and value length).
     pub async fn head(&self, key: &[u8]) -> std::result::Result<KeyMeta, AutumnError> {
         let key = key.to_vec();
-        let resp_bytes = self.call_ps_for_key(&key, MSG_HEAD, |part_id, region_epoch| {
-            rkyv_encode(&HeadReq { part_id, key: key.clone(), region_epoch })
-        }).await?;
+        let resp_bytes = self
+            .call_ps_for_key(&key, MSG_HEAD, |part_id, region_epoch| {
+                rkyv_encode(&HeadReq {
+                    part_id,
+                    key: key.clone(),
+                    region_epoch,
+                })
+            })
+            .await?;
         let resp: HeadResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
-        Ok(KeyMeta { found: resp.found, value_length: resp.value_length })
+        Ok(KeyMeta {
+            found: resp.found,
+            value_length: resp.value_length,
+        })
     }
 
     /// Range scan with prefix filter. Scans across partitions like Go's Range().
@@ -1044,11 +1080,16 @@ impl ClusterClient {
         const MAX_RANGE_ITERATIONS: u32 = 10_000;
 
         if self.regions.borrow().is_empty() {
-            self.refresh_regions().await
+            self.refresh_regions()
+                .await
                 .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
         }
 
-        let mut cursor: Vec<u8> = if start.is_empty() { prefix.to_vec() } else { start.to_vec() };
+        let mut cursor: Vec<u8> = if start.is_empty() {
+            prefix.to_vec()
+        } else {
+            start.to_vec()
+        };
         let mut all_entries: Vec<RangeEntry> = Vec::new();
         let mut remaining = limit;
         let mut has_more = false;
@@ -1073,7 +1114,9 @@ impl ClusterClient {
                 let part_addrs = self.part_addrs.borrow();
                 let ps_details = self.ps_details.borrow();
                 let idx = regions.partition_point(|(_, region)| match region.rg.as_ref() {
-                    Some(rg) if !rg.end_key.is_empty() => rg.end_key.as_slice() <= cursor.as_slice(),
+                    Some(rg) if !rg.end_key.is_empty() => {
+                        rg.end_key.as_slice() <= cursor.as_slice()
+                    }
                     _ => false,
                 });
                 if idx >= regions.len() {
@@ -1098,7 +1141,12 @@ impl ClusterClient {
                     .as_ref()
                     .map(|r| r.start_key.clone())
                     .unwrap_or_default();
-                (region.part_id, ps_addr, region_start_key, region.region_epoch)
+                (
+                    region.part_id,
+                    ps_addr,
+                    region_start_key,
+                    region.region_epoch,
+                )
             };
 
             // Prefix-exit: only after we've made forward progress.
@@ -1147,8 +1195,8 @@ impl ClusterClient {
                     continue;
                 }
             };
-            let resp: RangeResp = rkyv_decode(&resp_bytes)
-                .map_err(|e| AutumnError::ServerError(e))?;
+            let resp: RangeResp =
+                rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
             if resp.code != partition_rpc::CODE_OK {
                 return Err(code_to_error(resp.code, resp.message));
             }
@@ -1215,9 +1263,17 @@ impl ClusterClient {
     ) -> std::result::Result<(), AutumnError> {
         let key = key.to_vec();
         let value = value.to_vec();
-        let resp_bytes = self.call_ps_for_key(&key, MSG_STREAM_PUT, |part_id, region_epoch| {
-            rkyv_encode(&StreamPutReq { part_id, key: key.clone(), value: value.clone(), expires_at: 0, region_epoch })
-        }).await?;
+        let resp_bytes = self
+            .call_ps_for_key(&key, MSG_STREAM_PUT, |part_id, region_epoch| {
+                rkyv_encode(&StreamPutReq {
+                    part_id,
+                    key: key.clone(),
+                    value: value.clone(),
+                    expires_at: 0,
+                    region_epoch,
+                })
+            })
+            .await?;
         let resp: PutResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code != partition_rpc::CODE_OK {
             return Err(code_to_error(resp.code, resp.message));
@@ -1249,11 +1305,7 @@ impl ClusterClient {
     ///
     /// `expires_at` is currently ignored — chunk-level TTL would
     /// require setting `expires_at` on each chunk's Put. Future work.
-    pub fn put_stream_begin(
-        &self,
-        key: &[u8],
-        _expires_at: u64,
-    ) -> PutStreamHandle<'_> {
+    pub fn put_stream_begin(&self, key: &[u8], _expires_at: u64) -> PutStreamHandle<'_> {
         PutStreamHandle {
             cluster: self,
             user_key: key.to_vec(),
@@ -1336,7 +1388,12 @@ impl ClusterClient {
 
     /// Trigger partition split.
     pub async fn split(&self, part_id: u64) -> std::result::Result<(), AutumnError> {
-        self.call_ps_for_part(part_id, MSG_SPLIT_PART, rkyv_encode(&SplitPartReq { part_id })).await?;
+        self.call_ps_for_part(
+            part_id,
+            MSG_SPLIT_PART,
+            rkyv_encode(&SplitPartReq { part_id }),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1372,8 +1429,7 @@ impl ClusterClient {
         let resp_bytes = self
             .call_ps_for_part(part_id, MSG_MAINTENANCE, rkyv_encode(&req))
             .await?;
-        let resp: MaintenanceResp =
-            rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
+        let resp: MaintenanceResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
         if resp.code != partition_rpc::CODE_OK {
             return Err(code_to_error(resp.code, resp.message));
         }
@@ -1381,8 +1437,13 @@ impl ClusterClient {
     }
 
     /// Force GC of specific extents on a partition.
-    pub async fn force_gc(&self, part_id: u64, extent_ids: Vec<u64>) -> std::result::Result<(), AutumnError> {
-        self.maintenance(part_id, MAINTENANCE_FORCE_GC, extent_ids).await
+    pub async fn force_gc(
+        &self,
+        part_id: u64,
+        extent_ids: Vec<u64>,
+    ) -> std::result::Result<(), AutumnError> {
+        self.maintenance(part_id, MAINTENANCE_FORCE_GC, extent_ids)
+            .await
     }
 
     /// Trigger flush on a partition.
@@ -1461,24 +1522,33 @@ impl ClusterClient {
         Ok(resp.candidates)
     }
 
-    async fn maintenance(&self, part_id: u64, op: u8, extent_ids: Vec<u64>) -> std::result::Result<(), AutumnError> {
-        let resp_bytes = self.call_ps_for_part(
-            part_id, MSG_MAINTENANCE,
-            rkyv_encode(&MaintenanceReq {
+    async fn maintenance(
+        &self,
+        part_id: u64,
+        op: u8,
+        extent_ids: Vec<u64>,
+    ) -> std::result::Result<(), AutumnError> {
+        let resp_bytes = self
+            .call_ps_for_part(
                 part_id,
-                op,
-                extent_ids,
-                // F201: legacy callers (compact / force_gc / flush)
-                // don't supply GC tier params — they're ignored when
-                // op != MAINTENANCE_AUTO_GC anyway. Defaults match
-                // pre-F201 wire shape semantically.
-                gc_ratio: None,
-                gc_max_size: None,
-                gc_stream_debt: None,
-                gc_empty_only: false,
-            }),
-        ).await?;
-        let resp: MaintenanceResp = rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
+                MSG_MAINTENANCE,
+                rkyv_encode(&MaintenanceReq {
+                    part_id,
+                    op,
+                    extent_ids,
+                    // F201: legacy callers (compact / force_gc / flush)
+                    // don't supply GC tier params — they're ignored when
+                    // op != MAINTENANCE_AUTO_GC anyway. Defaults match
+                    // pre-F201 wire shape semantically.
+                    gc_ratio: None,
+                    gc_max_size: None,
+                    gc_stream_debt: None,
+                    gc_empty_only: false,
+                }),
+            )
+            .await?;
+        let resp: MaintenanceResp =
+            rkyv_decode(&resp_bytes).map_err(|e| AutumnError::ServerError(e))?;
         if resp.code != partition_rpc::CODE_OK {
             return Err(code_to_error(resp.code, resp.message));
         }
@@ -1614,7 +1684,11 @@ mod stripe_meta_tests {
 
     #[test]
     fn meta_roundtrip() {
-        let m = StripeMeta { total_bytes: 12 * 1024 * 1024, chunk_count: 4, chunk_size: 3 * 1024 * 1024 };
+        let m = StripeMeta {
+            total_bytes: 12 * 1024 * 1024,
+            chunk_count: 4,
+            chunk_size: 3 * 1024 * 1024,
+        };
         let encoded = m.encode();
         assert_eq!(encoded.len(), META_ENCODED_LEN);
         let dec = StripeMeta::try_decode(&encoded).expect("decode");
@@ -1632,7 +1706,11 @@ mod stripe_meta_tests {
 
     #[test]
     fn meta_rejects_bad_magic() {
-        let m = StripeMeta { total_bytes: 100, chunk_count: 1, chunk_size: 100 };
+        let m = StripeMeta {
+            total_bytes: 100,
+            chunk_count: 1,
+            chunk_size: 100,
+        };
         let mut e = m.encode();
         e[0] ^= 0x01;
         assert!(StripeMeta::try_decode(&e).is_none());
@@ -1640,7 +1718,11 @@ mod stripe_meta_tests {
 
     #[test]
     fn meta_rejects_corrupted_crc() {
-        let m = StripeMeta { total_bytes: 100, chunk_count: 1, chunk_size: 100 };
+        let m = StripeMeta {
+            total_bytes: 100,
+            chunk_count: 1,
+            chunk_size: 100,
+        };
         let mut e = m.encode();
         // Flip a bit in the body — CRC will mismatch
         e[12] ^= 0x01;

@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Result, anyhow, Context};
+use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 
 use autumn_client::ClusterClient;
@@ -60,10 +60,13 @@ impl FsState {
         // ps_call honors ClusterClient.rpc_timeout (default 30 s) so a
         // paged-out / hung PS surfaces as ConnectionError instead of
         // wedging the FUSE callback thread forever.
-        let resp_bytes = self.client.ps_call(&addr, MSG_GET, Bytes::from(payload)).await
+        let resp_bytes = self
+            .client
+            .ps_call(&addr, MSG_GET, Bytes::from(payload))
+            .await
             .context("KV get RPC")?;
-        let resp: GetResp = rkyv_decode(&resp_bytes)
-            .map_err(|e| anyhow!("decode GetResp: {}", e))?;
+        let resp: GetResp =
+            rkyv_decode(&resp_bytes).map_err(|e| anyhow!("decode GetResp: {}", e))?;
         match resp.code {
             CODE_OK => Ok(resp.value),
             CODE_NOT_FOUND => Err(anyhow!("not found")),
@@ -91,10 +94,13 @@ impl FsState {
             region_epoch,
         };
         let payload = rkyv_encode(&req);
-        let resp_bytes = self.client.ps_call(&addr, MSG_PUT, Bytes::from(payload)).await
+        let resp_bytes = self
+            .client
+            .ps_call(&addr, MSG_PUT, Bytes::from(payload))
+            .await
             .context("KV put RPC")?;
-        let resp: PutResp = rkyv_decode(&resp_bytes)
-            .map_err(|e| anyhow!("decode PutResp: {}", e))?;
+        let resp: PutResp =
+            rkyv_decode(&resp_bytes).map_err(|e| anyhow!("decode PutResp: {}", e))?;
         if resp.code != CODE_OK {
             return Err(anyhow!("KV put error: {} {}", resp.code, resp.message));
         }
@@ -117,10 +123,13 @@ impl FsState {
             region_epoch,
         };
         let payload = rkyv_encode(&req);
-        let resp_bytes = self.client.ps_call(&addr, MSG_DELETE, Bytes::from(payload)).await
+        let resp_bytes = self
+            .client
+            .ps_call(&addr, MSG_DELETE, Bytes::from(payload))
+            .await
             .context("KV delete RPC")?;
-        let resp: DeleteResp = rkyv_decode(&resp_bytes)
-            .map_err(|e| anyhow!("decode DeleteResp: {}", e))?;
+        let resp: DeleteResp =
+            rkyv_decode(&resp_bytes).map_err(|e| anyhow!("decode DeleteResp: {}", e))?;
         if resp.code != CODE_OK {
             return Err(anyhow!("KV delete error: {} {}", resp.code, resp.message));
         }
@@ -131,7 +140,12 @@ impl FsState {
     ///
     /// Returns keys only — PS `handle_range` does not populate values on the wire.
     /// Callers that need values must issue a separate `kv_get` per key.
-    pub async fn kv_range_keys(&mut self, prefix: &[u8], start: &[u8], limit: u32) -> Result<Vec<Vec<u8>>> {
+    pub async fn kv_range_keys(
+        &mut self,
+        prefix: &[u8],
+        start: &[u8],
+        limit: u32,
+    ) -> Result<Vec<Vec<u8>>> {
         let (part_id, addr) = self.client.resolve_key(prefix).await?;
         let region_epoch = self.client.lookup_epoch_for_part(part_id);
         let req = RangeReq {
@@ -142,10 +156,13 @@ impl FsState {
             region_epoch,
         };
         let payload = rkyv_encode(&req);
-        let resp_bytes = self.client.ps_call(&addr, MSG_RANGE, Bytes::from(payload)).await
+        let resp_bytes = self
+            .client
+            .ps_call(&addr, MSG_RANGE, Bytes::from(payload))
+            .await
             .context("KV range RPC")?;
-        let resp: RangeResp = rkyv_decode(&resp_bytes)
-            .map_err(|e| anyhow!("decode RangeResp: {}", e))?;
+        let resp: RangeResp =
+            rkyv_decode(&resp_bytes).map_err(|e| anyhow!("decode RangeResp: {}", e))?;
         if resp.code != CODE_OK {
             return Err(anyhow!("KV range error: {} {}", resp.code, resp.message));
         }
@@ -162,10 +179,13 @@ impl FsState {
             region_epoch,
         };
         let payload = rkyv_encode(&req);
-        let resp_bytes = self.client.ps_call(&addr, MSG_HEAD, Bytes::from(payload)).await
+        let resp_bytes = self
+            .client
+            .ps_call(&addr, MSG_HEAD, Bytes::from(payload))
+            .await
             .context("KV head RPC")?;
-        let resp: HeadResp = rkyv_decode(&resp_bytes)
-            .map_err(|e| anyhow!("decode HeadResp: {}", e))?;
+        let resp: HeadResp =
+            rkyv_decode(&resp_bytes).map_err(|e| anyhow!("decode HeadResp: {}", e))?;
         Ok(resp.code == CODE_OK && resp.found)
     }
 }

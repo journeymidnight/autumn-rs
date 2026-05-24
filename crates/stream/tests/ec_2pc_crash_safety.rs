@@ -40,7 +40,10 @@ async fn prepare_preserves_original_data() {
 
     // Original data is still readable at the current eversion (1).
     let read = conn.read_bytes(extent_id, 1, 0, 2048).await;
-    assert_eq!(read.code, CODE_OK, "original data must still be readable after prepare");
+    assert_eq!(
+        read.code, CODE_OK,
+        "original data must still be readable after prepare"
+    );
     assert_eq!(read.payload.len(), 2048);
     assert_eq!(&read.payload[..], &original[..]);
 }
@@ -154,12 +157,18 @@ async fn crash_between_prepare_and_commit_preserves_data() {
     // Simulate "crash" state: both .ec.dat and .dat exist.
     // Original data is still intact and readable.
     let read = conn.read_bytes(extent_id, 1, 0, 4096).await;
-    assert_eq!(read.code, CODE_OK, "original data must survive a prepare-only crash");
+    assert_eq!(
+        read.code, CODE_OK,
+        "original data must survive a prepare-only crash"
+    );
     assert_eq!(&read.payload[..], &original[..]);
 
     // "Recovery" completes Phase 2 via retry.
     let cs = conn.commit_ec_shard(extent_id, 4096, 6).await;
-    assert_eq!(cs.code, CODE_OK, "commit after simulated crash must succeed");
+    assert_eq!(
+        cs.code, CODE_OK,
+        "commit after simulated crash must succeed"
+    );
 
     // After recovery-commit, shard data is live.
     let read2 = conn.read_bytes(extent_id, 6, 0, 2048).await;

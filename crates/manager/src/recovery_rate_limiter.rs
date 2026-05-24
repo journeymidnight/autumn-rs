@@ -189,11 +189,9 @@ impl RecoveryRateLimiter {
     }
 
     pub fn snapshot(&self) -> (Vec<(u64, u32)>, Vec<(u64, u32)>) {
-        let mut src: Vec<(u64, u32)> =
-            self.per_source.iter().map(|(k, v)| (*k, *v)).collect();
+        let mut src: Vec<(u64, u32)> = self.per_source.iter().map(|(k, v)| (*k, *v)).collect();
         src.sort_by_key(|(id, _)| *id);
-        let mut tgt: Vec<(u64, u32)> =
-            self.per_target.iter().map(|(k, v)| (*k, *v)).collect();
+        let mut tgt: Vec<(u64, u32)> = self.per_target.iter().map(|(k, v)| (*k, *v)).collect();
         tgt.sort_by_key(|(id, _)| *id);
         (src, tgt)
     }
@@ -286,7 +284,10 @@ mod tests {
         let snap = l.backoff_snapshot();
         assert_eq!(snap.len(), 1);
         let (eid, slot, fails, last_at, next_at, reason) = &snap[0];
-        assert_eq!((*eid, *slot, *fails, *last_at, *next_at), (7, 0, 3, 120, 128));
+        assert_eq!(
+            (*eid, *slot, *fails, *last_at, *next_at),
+            (7, 0, 3, 120, 128)
+        );
         assert_eq!(reason, "no candidates");
     }
 

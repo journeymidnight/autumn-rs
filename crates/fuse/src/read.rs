@@ -16,15 +16,13 @@
 
 use std::rc::Rc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use futures::future::join_all;
 
 use autumn_client::DEFAULT_RPC_TIMEOUT;
 use autumn_rpc::client::RpcClient;
-use autumn_rpc::partition_rpc::{
-    self, GetReq, GetResp, MSG_GET, rkyv_decode, rkyv_encode,
-};
+use autumn_rpc::partition_rpc::{self, rkyv_decode, rkyv_encode, GetReq, GetResp, MSG_GET};
 
 use crate::key;
 use crate::meta::get_inode;
@@ -50,12 +48,7 @@ pub struct ChunkRequest {
 
 /// Phase 1: dispatcher-side synchronous-ish prep. Holds `&mut state`
 /// briefly for routing lookups + inode cache. No long awaits here.
-pub async fn prepare(
-    state: &mut FsState,
-    ino: u64,
-    offset: i64,
-    size: u32,
-) -> Result<ReadPlan> {
+pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> Result<ReadPlan> {
     if offset < 0 {
         return Err(anyhow!("negative offset"));
     }
@@ -209,6 +202,11 @@ pub async fn read(state: &mut FsState, ino: u64, offset: i64, size: u32) -> Resu
 }
 
 #[allow(dead_code)]
-fn _read_typecheck_marker(state: &mut FsState, ino: u64, offset: i64, size: u32) -> impl std::future::Future<Output = Result<Vec<u8>>> + use<'_> {
+fn _read_typecheck_marker(
+    state: &mut FsState,
+    ino: u64,
+    offset: i64,
+    size: u32,
+) -> impl std::future::Future<Output = Result<Vec<u8>>> + use<'_> {
     read(state, ino, offset, size)
 }

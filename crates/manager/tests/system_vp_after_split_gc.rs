@@ -46,11 +46,7 @@ fn vp_resolvable_after_split_and_one_child_gc() {
 
         // Write 10 large-value keys (VP path), flush
         for i in 0u32..10 {
-            ps_put(
-                &ps, 901,
-                format!("key-{i:02}").as_bytes(),
-                &large_value(i)
-            ).await;
+            ps_put(&ps, 901, format!("key-{i:02}").as_bytes(), &large_value(i)).await;
         }
         ps_flush(&ps, 901).await;
 
@@ -63,12 +59,29 @@ fn vp_resolvable_after_split_and_one_child_gc() {
             .await
             .expect("split");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&resp).expect("decode");
-        assert_eq!(sr.code, partition_rpc::CODE_OK, "split failed: {}", sr.message);
+        assert_eq!(
+            sr.code,
+            partition_rpc::CODE_OK,
+            "split failed: {}",
+            sr.message
+        );
         compio::time::sleep(Duration::from_millis(1000)).await;
 
         let regions = get_regions(&mgr).await;
-        let left_rg = regions.regions.iter().find(|(_, r)| r.part_id == 901).unwrap().1.clone();
-        let right_id = regions.regions.iter().find(|(_, r)| r.part_id != 901).unwrap().1.part_id;
+        let left_rg = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id == 901)
+            .unwrap()
+            .1
+            .clone();
+        let right_id = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id != 901)
+            .unwrap()
+            .1
+            .part_id;
         let mid_key = left_rg.rg.as_ref().unwrap().end_key.clone();
         compio::time::sleep(Duration::from_millis(6000)).await;
 
@@ -85,7 +98,8 @@ fn vp_resolvable_after_split_and_one_child_gc() {
             if kb < mid_key.as_slice() {
                 let resp = ps_get(&ps, 901, kb).await;
                 assert!(
-                    resp.value.starts_with(format!("large-val-{i:03}-").as_bytes()),
+                    resp.value
+                        .starts_with(format!("large-val-{i:03}-").as_bytes()),
                     "{key} VP resolution failed on left child"
                 );
             }
@@ -98,7 +112,8 @@ fn vp_resolvable_after_split_and_one_child_gc() {
             if kb >= mid_key.as_slice() {
                 let resp = psr_get(&router, right_id, kb).await;
                 assert!(
-                    resp.value.starts_with(format!("large-val-{i:03}-").as_bytes()),
+                    resp.value
+                        .starts_with(format!("large-val-{i:03}-").as_bytes()),
                     "{key} VP resolution failed on right child"
                 );
             }
@@ -133,11 +148,7 @@ fn vp_freed_after_both_children_compact_and_gc() {
 
         // Write 10 large-value keys, flush
         for i in 0u32..10 {
-            ps_put(
-                &ps, 902,
-                format!("key-{i:02}").as_bytes(),
-                &large_value(i)
-            ).await;
+            ps_put(&ps, 902, format!("key-{i:02}").as_bytes(), &large_value(i)).await;
         }
         ps_flush(&ps, 902).await;
 
@@ -163,13 +174,36 @@ fn vp_freed_after_both_children_compact_and_gc() {
             .await
             .expect("split");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&resp).expect("decode");
-        assert_eq!(sr.code, partition_rpc::CODE_OK, "split failed: {}", sr.message);
+        assert_eq!(
+            sr.code,
+            partition_rpc::CODE_OK,
+            "split failed: {}",
+            sr.message
+        );
         compio::time::sleep(Duration::from_millis(1000)).await;
 
         let regions = get_regions(&mgr).await;
-        let left_rg = regions.regions.iter().find(|(_, r)| r.part_id == 902).unwrap().1.clone();
-        let right_id = regions.regions.iter().find(|(_, r)| r.part_id != 902).unwrap().1.part_id;
-        let right_rg = regions.regions.iter().find(|(_, r)| r.part_id != 902).unwrap().1.clone();
+        let left_rg = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id == 902)
+            .unwrap()
+            .1
+            .clone();
+        let right_id = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id != 902)
+            .unwrap()
+            .1
+            .part_id;
+        let right_rg = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id != 902)
+            .unwrap()
+            .1
+            .clone();
         let mid_key = left_rg.rg.as_ref().unwrap().end_key.clone();
         compio::time::sleep(Duration::from_millis(6000)).await;
 
@@ -179,8 +213,14 @@ fn vp_freed_after_both_children_compact_and_gc() {
         compio::time::sleep(Duration::from_millis(3000)).await;
 
         // Write a small key to each child and flush
-        let left_key = format!("{}small", String::from_utf8_lossy(&left_rg.rg.as_ref().unwrap().start_key));
-        let right_key = format!("{}small", String::from_utf8_lossy(&right_rg.rg.as_ref().unwrap().start_key));
+        let left_key = format!(
+            "{}small",
+            String::from_utf8_lossy(&left_rg.rg.as_ref().unwrap().start_key)
+        );
+        let right_key = format!(
+            "{}small",
+            String::from_utf8_lossy(&right_rg.rg.as_ref().unwrap().start_key)
+        );
         ps_put(&ps, 902, left_key.as_bytes(), b"v").await;
         ps_flush(&ps, 902).await;
         psr_put(&router, right_id, right_key.as_bytes(), b"v").await;
@@ -213,10 +253,15 @@ fn vp_freed_after_both_children_compact_and_gc() {
         for i in 0u32..10 {
             let key = format!("key-{i:02}");
             let kb = key.as_bytes();
-            let part_id = if kb < mid_key.as_slice() { 902 } else { right_id };
+            let part_id = if kb < mid_key.as_slice() {
+                902
+            } else {
+                right_id
+            };
             let resp = psr_get(&router, part_id, kb).await;
             assert!(
-                resp.value.starts_with(format!("large-val-{i:03}-").as_bytes()),
+                resp.value
+                    .starts_with(format!("large-val-{i:03}-").as_bytes()),
                 "{key} (part {part_id}) VP resolution failed after both GC"
             );
         }

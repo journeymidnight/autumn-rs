@@ -27,6 +27,7 @@ pub(crate) fn from_storage(storage: &libc::sockaddr_storage) -> SocketAddr {
             *storage,
             std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
         );
-        sa.as_socket().unwrap_or_else(|| "0.0.0.0:0".parse().unwrap())
+        sa.as_socket()
+            .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap())
     }
 }

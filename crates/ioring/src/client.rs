@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use crate::cqe::Cqe;
 use crate::handshake::{HelloRequest, HelloStatus};
-use crate::header::{HEADER_SIZE, RingHeader};
+use crate::header::{RingHeader, HEADER_SIZE};
 use crate::mmap::{prot, MmapRegion};
 use crate::ring::{CqConsumer, SqProducer};
 use crate::socket;
@@ -90,10 +90,7 @@ impl IoRingClient {
 
     /// Like `connect` but lets the caller customise the request
     /// (smaller ring, different buffer pool size, etc.).
-    pub fn connect_with(
-        socket_path: &Path,
-        req: HelloRequest,
-    ) -> Result<Self, ClientError> {
+    pub fn connect_with(socket_path: &Path, req: HelloRequest) -> Result<Self, ClientError> {
         // 1. Connect AF_UNIX socket via libc (avoids the std blocking
         //    socket layer; we want raw fd for sendmsg/recvmsg).
         let path_c = std::ffi::CString::new(socket_path.as_os_str().as_encoded_bytes())
@@ -211,8 +208,7 @@ impl IoRingClient {
     /// Borrow a slot's bytes for write access — used when seeding
     /// `OPEN` path bytes or staging a `WRITE` payload.
     pub fn write_buf(&mut self, offset: u64, src: &[u8]) {
-        let dst = &mut self.region.as_mut_slice()
-            [offset as usize..offset as usize + src.len()];
+        let dst = &mut self.region.as_mut_slice()[offset as usize..offset as usize + src.len()];
         dst.copy_from_slice(src);
     }
 

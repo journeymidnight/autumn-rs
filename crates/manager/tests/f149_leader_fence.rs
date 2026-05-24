@@ -132,10 +132,7 @@ fn f149_deposed_leader_etcd_writes_are_fenced() {
         // The first registered node is still in etcd — fence rejected
         // only the second register, the first one's mirror_register_node
         // committed before the fence broke.
-        let got = aux
-            .get_prefix("nodes/")
-            .await
-            .expect("get nodes prefix");
+        let got = aux.get_prefix("nodes/").await.expect("get nodes prefix");
         assert_eq!(
             got.kvs.len(),
             1,

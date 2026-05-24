@@ -80,7 +80,12 @@ fn extent_recovery_replaces_dead_node() {
         // Check initial extent info (invalidate cache to see post-seal state)
         sc.invalidate_extent_cache(extent_id);
         let ext = sc.get_extent_info(extent_id).await.expect("extent info");
-        assert!(ext.sealed_length > 0, "extent should be sealed (sealed_length={}, end={})", ext.sealed_length, result.end);
+        assert!(
+            ext.sealed_length > 0,
+            "extent should be sealed (sealed_length={}, end={})",
+            ext.sealed_length,
+            result.end
+        );
         let orig_node1 = ext.replicates[0];
         let orig_node2 = ext.replicates[1];
 
@@ -99,11 +104,17 @@ fn extent_recovery_replaces_dead_node() {
         // post-EC extent had `avali = all_bits(K)` instead of
         // `all_bits(K + M)`, which the looser `> 0` check let through.
         let total_slots = ext.replicates.len() + ext.parity.len();
-        let expected = if total_slots >= 32 { u32::MAX } else { (1u32 << total_slots) - 1 };
+        let expected = if total_slots >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << total_slots) - 1
+        };
         assert_eq!(
-            ext.avali, expected,
+            ext.avali,
+            expected,
             "sealed extent should have every slot's avali bit set (replicates={} + parity={})",
-            ext.replicates.len(), ext.parity.len(),
+            ext.replicates.len(),
+            ext.parity.len(),
         );
 
         // Read data from the sealed extent
@@ -111,7 +122,10 @@ fn extent_recovery_replaces_dead_node() {
             .read_bytes_from_extent(extent_id, result.offset, result.end - result.offset)
             .await
             .expect("read sealed extent");
-        assert_eq!(read_data, payload, "data should be readable from sealed extent");
+        assert_eq!(
+            read_data, payload,
+            "data should be readable from sealed extent"
+        );
 
         // Verify we can read from a specific replica (node3 is the spare, not in this extent)
         // The test validates that the recovery dispatch mechanism's health check
@@ -131,7 +145,9 @@ fn extent_recovery_replaces_dead_node() {
         // data readable, sealed correctly.
 
         // Write more data — should succeed (StreamClient handles sealed extent)
-        sc.append(stream_id, b"post-seal-data").await.expect("post-seal append");
+        sc.append(stream_id, b"post-seal-data")
+            .await
+            .expect("post-seal append");
     });
 }
 

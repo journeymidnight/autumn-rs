@@ -73,7 +73,10 @@ pub(crate) enum DecodeOne<'a> {
     /// A V1 record's CRC failed or its envelope length was inconsistent
     /// with the inner header — bit rot. Caller should log + advance by
     /// `skip_bytes` + continue scanning.
-    Corrupt { skip_bytes: usize, reason: &'static str },
+    Corrupt {
+        skip_bytes: usize,
+        reason: &'static str,
+    },
 }
 
 /// Decode the next WAL record at `bytes[cursor..]`. Dispatches on the first
@@ -88,24 +91,28 @@ pub(crate) fn decode_one(bytes: &[u8]) -> DecodeOne<'_> {
         if bytes.len() < 1 + 4 {
             return DecodeOne::Incomplete;
         }
-        let length =
-            u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
+        let length = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
         let total = 1 + 4 + length + 4;
         if bytes.len() < total {
             return DecodeOne::Incomplete;
         }
         let payload_start = 5;
         let crc_start = payload_start + length;
-        let stored_crc =
-            u32::from_le_bytes(bytes[crc_start..crc_start + 4].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(bytes[crc_start..crc_start + 4].try_into().unwrap());
         // CRC over [length_bytes || payload_bytes].
         let mut crc = crc32c::crc32c(&bytes[1..5]);
         crc = crc32c::crc32c_append(crc, &bytes[payload_start..payload_start + length]);
         if crc != stored_crc {
-            return DecodeOne::Corrupt { skip_bytes: total, reason: "V1 CRC mismatch" };
+            return DecodeOne::Corrupt {
+                skip_bytes: total,
+                reason: "V1 CRC mismatch",
+            };
         }
         if length < PAYLOAD_HEADER {
-            return DecodeOne::Corrupt { skip_bytes: total, reason: "V1 payload too short for header" };
+            return DecodeOne::Corrupt {
+                skip_bytes: total,
+                reason: "V1 payload too short for header",
+            };
         }
         let p = &bytes[payload_start..payload_start + length];
         let op = p[0];
@@ -120,7 +127,13 @@ pub(crate) fn decode_one(bytes: &[u8]) -> DecodeOne<'_> {
         }
         let key = &p[PAYLOAD_HEADER..PAYLOAD_HEADER + key_len];
         let value = &p[PAYLOAD_HEADER + key_len..PAYLOAD_HEADER + key_len + val_len];
-        DecodeOne::Ok(DecodedRecord { op, key, value, expires_at, total })
+        DecodeOne::Ok(DecodedRecord {
+            op,
+            key,
+            value,
+            expires_at,
+            total,
+        })
     } else {
         // V0 legacy: [op][key_len:4][val_len:4][expires_at:8][key][value]
         if bytes.len() < PAYLOAD_HEADER {
@@ -136,7 +149,13 @@ pub(crate) fn decode_one(bytes: &[u8]) -> DecodeOne<'_> {
         }
         let key = &bytes[PAYLOAD_HEADER..PAYLOAD_HEADER + key_len];
         let value = &bytes[PAYLOAD_HEADER + key_len..total];
-        DecodeOne::Ok(DecodedRecord { op, key, value, expires_at, total })
+        DecodeOne::Ok(DecodedRecord {
+            op,
+            key,
+            value,
+            expires_at,
+            total,
+        })
     }
 }
 

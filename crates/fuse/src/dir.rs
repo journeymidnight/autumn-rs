@@ -2,7 +2,7 @@
 
 use std::ffi::OsStr;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use fuser::FileAttr;
 
 use crate::bridge::ReaddirEntry;
@@ -94,7 +94,10 @@ pub async fn mkdir(state: &mut FsState, parent: u64, name: &OsStr, mode: u32) ->
     let meta = new_dir_meta(mode, unsafe { libc::getuid() }, unsafe { libc::getgid() });
     put_inode(state, ino, &meta).await?;
 
-    let dirent = DirentValue { child_inode: ino, file_type: DT_DIR };
+    let dirent = DirentValue {
+        child_inode: ino,
+        file_type: DT_DIR,
+    };
     let dv = schema::encode_dirent(&dirent);
     state.kv_put(&dk, &dv).await?;
 

@@ -111,7 +111,12 @@ async fn setup_ec_stream(
     let created: CreateStreamResp = rkyv_decode(&resp).expect("decode");
     let stream_id = created
         .stream
-        .unwrap_or_else(|| panic!("create_stream returned code={} msg={}", created.code, created.message))
+        .unwrap_or_else(|| {
+            panic!(
+                "create_stream returned code={} msg={}",
+                created.code, created.message
+            )
+        })
         .stream_id;
 
     let pool = Rc::new(ConnPool::new());
@@ -138,12 +143,12 @@ fn ec_policy_stream_write_read_roundtrip() {
         setup_cluster_3nodes(d1.path(), d2.path(), d3.path(), 2, 1);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let (stream_id, client) =
-            setup_ec_stream(mgr_addr, n1_addr, n2_addr, n3_addr, 2, 1).await;
+        let (stream_id, client) = setup_ec_stream(mgr_addr, n1_addr, n2_addr, n3_addr, 2, 1).await;
 
         let payload = b"hello seal-after-write EC! this is a test payload.";
         let result = client
-            .append(stream_id, payload.as_slice()).await
+            .append(stream_id, payload.as_slice())
+            .await
             .expect("append to EC-policy stream");
 
         let (read_back, _end) = client
@@ -166,8 +171,7 @@ fn ec_policy_stream_multiple_appends() {
         setup_cluster_3nodes(d1.path(), d2.path(), d3.path(), 2, 1);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let (stream_id, client) =
-            setup_ec_stream(mgr_addr, n1_addr, n2_addr, n3_addr, 2, 1).await;
+        let (stream_id, client) = setup_ec_stream(mgr_addr, n1_addr, n2_addr, n3_addr, 2, 1).await;
 
         let payloads: Vec<Vec<u8>> = vec![
             b"first payload".to_vec(),
@@ -179,7 +183,8 @@ fn ec_policy_stream_multiple_appends() {
         let mut results = Vec::new();
         for p in &payloads {
             let r = client
-                .append(stream_id, p.as_slice()).await
+                .append(stream_id, p.as_slice())
+                .await
                 .expect("append");
             results.push(r);
         }
@@ -205,8 +210,7 @@ fn ec_policy_stream_large_payload() {
         setup_cluster_3nodes(d1.path(), d2.path(), d3.path(), 2, 1);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let (stream_id, client) =
-            setup_ec_stream(mgr_addr, n1_addr, n2_addr, n3_addr, 2, 1).await;
+        let (stream_id, client) = setup_ec_stream(mgr_addr, n1_addr, n2_addr, n3_addr, 2, 1).await;
 
         let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
 
@@ -241,13 +245,10 @@ fn replication_stream_works() {
         setup_cluster_3nodes(d1.path(), d2.path(), d3.path(), 3, 0);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let (stream_id, client) =
-            setup_ec_stream(mgr_addr, n1_addr, n2_addr, n3_addr, 3, 0).await;
+        let (stream_id, client) = setup_ec_stream(mgr_addr, n1_addr, n2_addr, n3_addr, 3, 0).await;
 
         let payload = b"replicated data payload";
-        let r = client
-            .append(stream_id, payload.as_slice()).await
-            .unwrap();
+        let r = client.append(stream_id, payload.as_slice()).await.unwrap();
         let (read_back, _) = client
             .read_bytes_from_extent(r.extent_id, r.offset, r.end - r.offset)
             .await

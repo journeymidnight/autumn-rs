@@ -9,7 +9,7 @@
 use anyhow::Result;
 
 use crate::key;
-use crate::meta::{get_inode, put_inode, now_ts};
+use crate::meta::{get_inode, now_ts, put_inode};
 use crate::schema::*;
 use crate::state::FsState;
 
@@ -186,12 +186,15 @@ async fn ensure_inode_cached(state: &mut FsState, ino: u64) -> Result<()> {
         return Ok(());
     }
     let meta = get_inode(state, ino).await?;
-    state.inodes.insert(ino, InodeState {
-        meta,
-        write_buf: None,
-        dirty: false,
-        open_count: 0,
-    });
+    state.inodes.insert(
+        ino,
+        InodeState {
+            meta,
+            write_buf: None,
+            dirty: false,
+            open_count: 0,
+        },
+    );
     Ok(())
 }
 
@@ -212,9 +215,21 @@ pub async fn truncate(state: &mut FsState, ino: u64, new_size: u64) -> Result<()
 
     if new_size < old_size {
         // Shrink: delete chunks beyond new size
-        let last_valid_chunk = if new_size == 0 { 0 } else { (new_size - 1) / CHUNK_SIZE as u64 };
-        let last_old_chunk = if old_size == 0 { 0 } else { (old_size - 1) / CHUNK_SIZE as u64 };
-        let delete_from = if new_size == 0 { 0 } else { last_valid_chunk + 1 };
+        let last_valid_chunk = if new_size == 0 {
+            0
+        } else {
+            (new_size - 1) / CHUNK_SIZE as u64
+        };
+        let last_old_chunk = if old_size == 0 {
+            0
+        } else {
+            (old_size - 1) / CHUNK_SIZE as u64
+        };
+        let delete_from = if new_size == 0 {
+            0
+        } else {
+            last_valid_chunk + 1
+        };
 
         for chunk_idx in delete_from..=last_old_chunk {
             let ck = key::chunk_key(ino, chunk_idx);

@@ -105,9 +105,7 @@ impl BwResult {
         self.msgs as f64 / self.elapsed.as_secs_f64()
     }
     fn mb_per_s(&self) -> f64 {
-        (self.msgs as f64 * self.size as f64)
-            / self.elapsed.as_secs_f64()
-            / (1024.0 * 1024.0)
+        (self.msgs as f64 * self.size as f64) / self.elapsed.as_secs_f64() / (1024.0 * 1024.0)
     }
 }
 
@@ -129,14 +127,20 @@ async fn rtt_one<T: AutumnTransport + Clone>(
         let (mut r, mut w) = c.into_split();
         for _phase in 0..2 {
             let BufResult(res, b) = r.read_exact(vec![0u8; 8]).await;
-            if res.is_err() { return; }
+            if res.is_err() {
+                return;
+            }
             let n: u64 = u64::from_le_bytes(b[..8].try_into().unwrap());
             for _ in 0..n {
                 let buf = vec![0u8; size];
                 let BufResult(res, b) = r.read_exact(buf).await;
-                if res.is_err() { return; }
+                if res.is_err() {
+                    return;
+                }
                 let BufResult(res, _) = w.write_all(b).await;
-                if res.is_err() { return; }
+                if res.is_err() {
+                    return;
+                }
             }
         }
     });
@@ -150,7 +154,10 @@ async fn rtt_one<T: AutumnTransport + Clone>(
     // immutable; for RTT this is unavoidable on the receive path.
     let payload: Bytes = Bytes::from(vec![0xa5u8; size]);
     let warm_iters: u64 = 64;
-    w.write_all(warm_iters.to_le_bytes().to_vec()).await.0.expect("warm count");
+    w.write_all(warm_iters.to_le_bytes().to_vec())
+        .await
+        .0
+        .expect("warm count");
     let warm_t0 = Instant::now();
     for _ in 0..warm_iters {
         w.write_all(payload.clone()).await.0.expect("warm write");
@@ -161,7 +168,10 @@ async fn rtt_one<T: AutumnTransport + Clone>(
     let timed_iters: u64 = ((duration.as_secs_f64() / per_msg).max(64.0) as u64).min(iters_cap);
 
     // Phase 2 — timed.
-    w.write_all(timed_iters.to_le_bytes().to_vec()).await.0.expect("timed count");
+    w.write_all(timed_iters.to_le_bytes().to_vec())
+        .await
+        .0
+        .expect("timed count");
     let mut samples: Vec<u64> = Vec::with_capacity(timed_iters as usize);
     let global_t0 = Instant::now();
     for _ in 0..timed_iters {
@@ -245,7 +255,10 @@ async fn bw_one<T: AutumnTransport + Clone>(
 
     // Phase 1 — warmup.
     let warm_iters: u64 = 64;
-    w.write_all(warm_iters.to_le_bytes().to_vec()).await.0.expect("send warm count");
+    w.write_all(warm_iters.to_le_bytes().to_vec())
+        .await
+        .0
+        .expect("send warm count");
     let warm_t0 = Instant::now();
     for _ in 0..warm_iters {
         w.write_all(payload.clone()).await.0.expect("warm write");
@@ -255,7 +268,10 @@ async fn bw_one<T: AutumnTransport + Clone>(
     let timed_iters: u64 = ((duration.as_secs_f64() / per_msg).max(64.0) as u64).min(50_000_000);
 
     // Phase 2 — timed.
-    w.write_all(timed_iters.to_le_bytes().to_vec()).await.0.expect("send timed count");
+    w.write_all(timed_iters.to_le_bytes().to_vec())
+        .await
+        .0
+        .expect("send timed count");
     let t0 = Instant::now();
     for _ in 0..timed_iters {
         w.write_all(payload.clone()).await.0.expect("timed write");
@@ -265,7 +281,11 @@ async fn bw_one<T: AutumnTransport + Clone>(
     drop(_r);
     let _ = server.await;
 
-    BwResult { msgs: timed_iters, elapsed, size }
+    BwResult {
+        msgs: timed_iters,
+        elapsed,
+        size,
+    }
 }
 
 async fn bw_k<T: AutumnTransport + Clone + 'static>(
@@ -287,16 +307,24 @@ async fn bw_k<T: AutumnTransport + Clone + 'static>(
             handles.push(compio::runtime::spawn(async move {
                 let (mut r, _w) = c.into_split();
                 let BufResult(res, b) = r.read_exact(vec![0u8; 8]).await;
-                if res.is_err() { return; }
+                if res.is_err() {
+                    return;
+                }
                 let warm: u64 = u64::from_le_bytes(b[..8].try_into().unwrap());
                 for _ in 0..warm {
-                    if r.read_exact(vec![0u8; size]).await.0.is_err() { return; }
+                    if r.read_exact(vec![0u8; size]).await.0.is_err() {
+                        return;
+                    }
                 }
                 let BufResult(res, b) = r.read_exact(vec![0u8; 8]).await;
-                if res.is_err() { return; }
+                if res.is_err() {
+                    return;
+                }
                 let timed: u64 = u64::from_le_bytes(b[..8].try_into().unwrap());
                 for _ in 0..timed {
-                    if r.read_exact(vec![0u8; size]).await.0.is_err() { return; }
+                    if r.read_exact(vec![0u8; size]).await.0.is_err() {
+                        return;
+                    }
                 }
             }));
         }
@@ -318,7 +346,10 @@ async fn bw_k<T: AutumnTransport + Clone + 'static>(
             let payload: Bytes = Bytes::from(vec![0xa5u8; size]);
 
             let warm_iters: u64 = 64;
-            w.write_all(warm_iters.to_le_bytes().to_vec()).await.0.expect("warm count");
+            w.write_all(warm_iters.to_le_bytes().to_vec())
+                .await
+                .0
+                .expect("warm count");
             let warm_t0 = Instant::now();
             for _ in 0..warm_iters {
                 w.write_all(payload.clone()).await.0.expect("warm write");
@@ -327,7 +358,10 @@ async fn bw_k<T: AutumnTransport + Clone + 'static>(
             let per_msg = warm_elapsed.as_secs_f64() / warm_iters as f64;
             let timed_iters: u64 = ((dur.as_secs_f64() / per_msg).max(64.0) as u64).min(50_000_000);
 
-            w.write_all(timed_iters.to_le_bytes().to_vec()).await.0.expect("timed count");
+            w.write_all(timed_iters.to_le_bytes().to_vec())
+                .await
+                .0
+                .expect("timed count");
             let t0 = Instant::now();
             for _ in 0..timed_iters {
                 w.write_all(payload.clone()).await.0.expect("timed write");
@@ -344,12 +378,18 @@ async fn bw_k<T: AutumnTransport + Clone + 'static>(
     for h in handles {
         if let Ok((n, e)) = h.await {
             total_msgs += n;
-            if e > max_elapsed { max_elapsed = e; }
+            if e > max_elapsed {
+                max_elapsed = e;
+            }
         }
     }
     let _ = server.await;
 
-    BwResult { msgs: total_msgs, elapsed: max_elapsed, size }
+    BwResult {
+        msgs: total_msgs,
+        elapsed: max_elapsed,
+        size,
+    }
 }
 
 /// UCX zero-copy receive bandwidth: the receiver registers ONE dest buffer
@@ -373,14 +413,16 @@ async fn regbw_ucx(
         let (c, _) = listener.accept().await.expect("accept");
         let (mut r, _w) = c.into_split();
         let BufResult(res, b) = r.read_exact(vec![0u8; 8]).await;
-        if res.is_err() { return; }
+        if res.is_err() {
+            return;
+        }
         let warm = u64::from_le_bytes(b[..8].try_into().unwrap());
         // One registered dest buffer (ptr stable — never realloc). recv into it
         // with memh = zero-copy receive.
         let mut reuse = vec![0u8; size];
-        let reg = autumn_transport::register_memory(
-            reuse.as_mut_ptr() as *mut std::ffi::c_void, size,
-        ).expect("register recv buffer");
+        let reg =
+            autumn_transport::register_memory(reuse.as_mut_ptr() as *mut std::ffi::c_void, size)
+                .expect("register recv buffer");
         for _ in 0..warm {
             let mut filled = 0usize;
             while filled < size {
@@ -391,7 +433,9 @@ async fn regbw_ucx(
             }
         }
         let BufResult(res, b) = r.read_exact(vec![0u8; 8]).await;
-        if res.is_err() { return; }
+        if res.is_err() {
+            return;
+        }
         let timed = u64::from_le_bytes(b[..8].try_into().unwrap());
         for _ in 0..timed {
             let mut filled = 0usize;
@@ -409,14 +453,20 @@ async fn regbw_ucx(
     let (_r, mut w) = c.into_split();
     let payload: Bytes = Bytes::from(vec![0xa5u8; size]);
     let warm_iters: u64 = 64;
-    w.write_all(warm_iters.to_le_bytes().to_vec()).await.0.expect("send warm count");
+    w.write_all(warm_iters.to_le_bytes().to_vec())
+        .await
+        .0
+        .expect("send warm count");
     let warm_t0 = Instant::now();
     for _ in 0..warm_iters {
         w.write_all(payload.clone()).await.0.expect("warm write");
     }
     let per_msg = warm_t0.elapsed().as_secs_f64() / warm_iters as f64;
     let timed_iters: u64 = ((duration.as_secs_f64() / per_msg).max(64.0) as u64).min(50_000_000);
-    w.write_all(timed_iters.to_le_bytes().to_vec()).await.0.expect("send timed count");
+    w.write_all(timed_iters.to_le_bytes().to_vec())
+        .await
+        .0
+        .expect("send timed count");
     let t0 = Instant::now();
     for _ in 0..timed_iters {
         w.write_all(payload.clone()).await.0.expect("timed write");
@@ -425,7 +475,11 @@ async fn regbw_ucx(
     drop(w);
     drop(_r);
     let _ = server.await;
-    BwResult { msgs: timed_iters, elapsed, size }
+    BwResult {
+        msgs: timed_iters,
+        elapsed,
+        size,
+    }
 }
 
 fn fmt_size(b: usize) -> String {
@@ -462,9 +516,14 @@ async fn run_transport<T: AutumnTransport + Clone + 'static>(
     println!("{:-<width$}", "", width = label.len());
     println!(
         "{:>10} | {:>9} {:>11} {:>11} | {:>9} {:>11} | {:>9} {:>11}",
-        "size", "rtt msg/s", "p50 (us)", "p99 (us)",
-        "bw1 msg/s", "bw1 MB/s",
-        "bwK msg/s", "bwK MB/s"
+        "size",
+        "rtt msg/s",
+        "p50 (us)",
+        "p99 (us)",
+        "bw1 msg/s",
+        "bw1 MB/s",
+        "bwK msg/s",
+        "bwK MB/s"
     );
     for &s in sizes {
         let rtt = rtt_one(t.clone(), addr, s, duration, rtt_iters_cap).await;
@@ -474,9 +533,13 @@ async fn run_transport<T: AutumnTransport + Clone + 'static>(
         println!(
             "{:>10} | {} {:>11.2} {:>11.2} | {} {:>11.1} | {} {:>11.1}",
             fmt_size(s),
-            fmt_msg_rate(rtt_rate), rtt.p50_us, rtt.p99_us,
-            fmt_msg_rate(bw1.msg_per_s()), bw1.mb_per_s(),
-            fmt_msg_rate(bwk.msg_per_s()), bwk.mb_per_s(),
+            fmt_msg_rate(rtt_rate),
+            rtt.p50_us,
+            rtt.p99_us,
+            fmt_msg_rate(bw1.msg_per_s()),
+            bw1.mb_per_s(),
+            fmt_msg_rate(bwk.msg_per_s()),
+            bwk.mb_per_s(),
         );
     }
 }
@@ -545,7 +608,14 @@ async fn main() {
         println!("---------------------------------------");
         println!("{:>10} | {:>16}", "size", "zero-copy MB/s");
         for &s in &sizes {
-            let memh = regbw_ucx(autumn_transport::UcxTransport, ucx_addr, s, duration, "memh").await;
+            let memh = regbw_ucx(
+                autumn_transport::UcxTransport,
+                ucx_addr,
+                s,
+                duration,
+                "memh",
+            )
+            .await;
             println!("{:>10} | {:>16.1}", fmt_size(s), memh.mb_per_s());
         }
     }

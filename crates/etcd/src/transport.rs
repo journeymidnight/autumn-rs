@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use bytes::{Buf, Bytes, BytesMut};
 use cyper_core::{CompioExecutor, HyperStream};
 use http::{Request, Version};
@@ -46,12 +46,13 @@ impl GrpcChannel {
 
         let stream = HyperStream::new(tcp);
 
-        let (sender, conn) =
-            http2::handshake::<CompioExecutor, HyperStream<compio::net::TcpStream>, Full<Bytes>>(
-                CompioExecutor, stream,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("h2 handshake failed: {e}"))?;
+        let (sender, conn) = http2::handshake::<
+            CompioExecutor,
+            HyperStream<compio::net::TcpStream>,
+            Full<Bytes>,
+        >(CompioExecutor, stream)
+        .await
+        .map_err(|e| anyhow::anyhow!("h2 handshake failed: {e}"))?;
 
         // Spawn the connection driver — it runs in the background, processing
         // HTTP/2 frames. When all senders are dropped, it shuts down.
@@ -179,12 +180,9 @@ impl GrpcStreamReader {
             // Try to decode a complete gRPC frame from buffer.
             // Frame format: [compress:1][length:4 BE][message]
             if self.buf.len() >= 5 {
-                let msg_len = u32::from_be_bytes([
-                    self.buf[1],
-                    self.buf[2],
-                    self.buf[3],
-                    self.buf[4],
-                ]) as usize;
+                let msg_len =
+                    u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]])
+                        as usize;
                 if self.buf.len() >= 5 + msg_len {
                     self.buf.advance(5);
                     let msg_data = self.buf.split_to(msg_len);
@@ -228,13 +226,13 @@ pub async fn open_streaming_call(
     tcp.set_nodelay(true)?;
     let stream = HyperStream::new(tcp);
 
-    let (mut sender, conn) =
-        http2::handshake::<CompioExecutor, HyperStream<compio::net::TcpStream>, StreamingBody>(
-            CompioExecutor,
-            stream,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("h2 handshake failed: {e}"))?;
+    let (mut sender, conn) = http2::handshake::<
+        CompioExecutor,
+        HyperStream<compio::net::TcpStream>,
+        StreamingBody,
+    >(CompioExecutor, stream)
+    .await
+    .map_err(|e| anyhow::anyhow!("h2 handshake failed: {e}"))?;
 
     compio::runtime::spawn(async move {
         if let Err(e) = conn.await {

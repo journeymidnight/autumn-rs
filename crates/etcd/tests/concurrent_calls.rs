@@ -57,7 +57,8 @@ async fn concurrent_puts_no_borrow_panic() {
     for i in 0..8 {
         let c = client.clone();
         handles.push(compio::runtime::spawn(async move {
-            c.put(format!("__f108__/put/{i}"), format!("value-{i}")).await
+            c.put(format!("__f108__/put/{i}"), format!("value-{i}"))
+                .await
         }));
     }
 

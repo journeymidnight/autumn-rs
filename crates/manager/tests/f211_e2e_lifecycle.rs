@@ -42,8 +42,8 @@ fn start_extent_node_with_manager(
 ) {
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let cfg = ExtentNodeConfig::new(dir, disk_id)
-                .with_manager_endpoint(mgr_addr.to_string());
+            let cfg =
+                ExtentNodeConfig::new(dir, disk_id).with_manager_endpoint(mgr_addr.to_string());
             let n = ExtentNode::new(cfg).await.expect("extent node");
             let _ = n.serve(addr).await;
         });
@@ -168,7 +168,9 @@ fn f211_e2e_fence_persists_and_blocks_reregister() {
         // needing a real EN heartbeat).
         let n1_addr = pick_addr();
         let n2_addr = pick_addr();
-        let n1 = register_node(&mgr, &n1_addr.to_string(), "uuid-1").await.node_id;
+        let n1 = register_node(&mgr, &n1_addr.to_string(), "uuid-1")
+            .await
+            .node_id;
         let _ = register_node(&mgr, &n2_addr.to_string(), "uuid-2").await;
 
         // Fence n1 — force=true skips capacity precheck.
@@ -193,7 +195,11 @@ fn f211_e2e_fence_persists_and_blocks_reregister() {
             .await
             .expect("re-register");
         let resp: RegisterNodeResp = rkyv_decode(&bytes).expect("decode");
-        assert_eq!(resp.code, CODE_PRECONDITION, "re-register: {}", resp.message);
+        assert_eq!(
+            resp.code, CODE_PRECONDITION,
+            "re-register: {}",
+            resp.message
+        );
         assert!(resp.message.contains("Fenced"), "{}", resp.message);
 
         // Clearing the override should let it re-register.
@@ -201,7 +207,10 @@ fn f211_e2e_fence_persists_and_blocks_reregister() {
             node_id: n1,
             set_by: "e2e-test".to_string(),
         };
-        let bytes = mgr.call(MSG_CLEAR_NODE_OVERRIDE, rkyv_encode(&req)).await.unwrap();
+        let bytes = mgr
+            .call(MSG_CLEAR_NODE_OVERRIDE, rkyv_encode(&req))
+            .await
+            .unwrap();
         let resp: CodeResp = rkyv_decode(&bytes).unwrap();
         assert_eq!(resp.code, CODE_OK);
 
@@ -212,7 +221,10 @@ fn f211_e2e_fence_persists_and_blocks_reregister() {
             shard_ports: vec![],
             control_address: String::new(),
         };
-        let bytes = mgr.call(MSG_REGISTER_NODE, rkyv_encode(&req)).await.unwrap();
+        let bytes = mgr
+            .call(MSG_REGISTER_NODE, rkyv_encode(&req))
+            .await
+            .unwrap();
         let resp: RegisterNodeResp = rkyv_decode(&bytes).unwrap();
         assert_eq!(resp.code, CODE_OK, "{}", resp.message);
         assert_eq!(resp.node_id, n1, "same address must yield same node_id");
@@ -360,9 +372,15 @@ fn f211_e2e_remove_blocked_by_active_extents() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
 
-        let id1 = register_node(&mgr, &n1_addr.to_string(), "uuid-1").await.node_id;
-        let _id2 = register_node(&mgr, &n2_addr.to_string(), "uuid-2").await.node_id;
-        let _id3 = register_node(&mgr, &n3_addr.to_string(), "uuid-3").await.node_id;
+        let id1 = register_node(&mgr, &n1_addr.to_string(), "uuid-1")
+            .await
+            .node_id;
+        let _id2 = register_node(&mgr, &n2_addr.to_string(), "uuid-2")
+            .await
+            .node_id;
+        let _id3 = register_node(&mgr, &n3_addr.to_string(), "uuid-3")
+            .await
+            .node_id;
 
         // Create a 2-replica stream + write something so id1 holds an extent.
         let stream_id = create_stream(&mgr, 2).await;
@@ -379,9 +397,20 @@ fn f211_e2e_remove_blocked_by_active_extents() {
 
         // Figure out which node id1 corresponds to in the replica list.
         // We need to fence a node that actually holds an extent.
-        let resp = mgr.call(MSG_STREAM_INFO, rkyv_encode(&StreamInfoReq { stream_ids: vec![stream_id] })).await.unwrap();
+        let resp = mgr
+            .call(
+                MSG_STREAM_INFO,
+                rkyv_encode(&StreamInfoReq {
+                    stream_ids: vec![stream_id],
+                }),
+            )
+            .await
+            .unwrap();
         let si: StreamInfoResp = rkyv_decode(&resp).unwrap();
-        assert!(!si.extents.is_empty(), "stream must have at least one extent");
+        assert!(
+            !si.extents.is_empty(),
+            "stream must have at least one extent"
+        );
         let victim_id = si.extents[0].1.replicates[0];
 
         // Fence (force=true so capacity check doesn't reject when
@@ -415,12 +444,20 @@ fn f211_e2e_audit_log_captures_admin_ops() {
         let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
 
         let n1_addr = pick_addr();
-        let n1 = register_node(&mgr, &n1_addr.to_string(), "uuid-1").await.node_id;
+        let n1 = register_node(&mgr, &n1_addr.to_string(), "uuid-1")
+            .await
+            .node_id;
 
         // Fence + clear → 2 audit entries on n1.
         let _ = fence(&mgr, n1, "first fence", true).await;
-        let req = ClearNodeOverrideReq { node_id: n1, set_by: "e2e".to_string() };
-        let _ = mgr.call(MSG_CLEAR_NODE_OVERRIDE, rkyv_encode(&req)).await.unwrap();
+        let req = ClearNodeOverrideReq {
+            node_id: n1,
+            set_by: "e2e".to_string(),
+        };
+        let _ = mgr
+            .call(MSG_CLEAR_NODE_OVERRIDE, rkyv_encode(&req))
+            .await
+            .unwrap();
 
         // In-memory mode (no etcd) returns empty — audit is etcd-backed.
         // We still call the RPC and verify the wire works.
@@ -480,7 +517,9 @@ fn f211_e2e_extent_health_report_reflects_overrides() {
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
-        let id1 = register_node(&mgr, &n1_addr.to_string(), "uuid-1").await.node_id;
+        let id1 = register_node(&mgr, &n1_addr.to_string(), "uuid-1")
+            .await
+            .node_id;
         let _ = register_node(&mgr, &n2_addr.to_string(), "uuid-2").await;
 
         let stream_id = create_stream(&mgr, 2).await;
@@ -503,7 +542,10 @@ fn f211_e2e_extent_health_report_reflects_overrides() {
             set_by: "e2e".to_string(),
             expire_at: 0,
         };
-        let _ = mgr.call(MSG_SET_NODE_MAINTENANCE, rkyv_encode(&req)).await.unwrap();
+        let _ = mgr
+            .call(MSG_SET_NODE_MAINTENANCE, rkyv_encode(&req))
+            .await
+            .unwrap();
 
         // Ask for everything — must surface the extent (unhealthy
         // because Maintenance is a non-default override).
@@ -533,7 +575,10 @@ fn f211_e2e_extent_health_report_reflects_overrides() {
                 .iter()
                 .any(|s| s.node_id == id1 && s.override_kind == NODE_OVERRIDE_MAINTENANCE)
         });
-        assert!(any_maint, "expected at least one slot reporting Maintenance override");
+        assert!(
+            any_maint,
+            "expected at least one slot reporting Maintenance override"
+        );
     });
 }
 
@@ -555,7 +600,10 @@ fn f211_e2e_list_ec_inflight_markers_empty_baseline() {
             .expect("list ec markers");
         let resp: ListEcInflightMarkersResp = rkyv_decode(&bytes).expect("decode");
         assert_eq!(resp.code, CODE_OK);
-        assert!(resp.markers.is_empty(), "baseline cluster has no EC markers");
+        assert!(
+            resp.markers.is_empty(),
+            "baseline cluster has no EC markers"
+        );
     });
 }
 

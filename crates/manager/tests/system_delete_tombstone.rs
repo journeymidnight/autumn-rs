@@ -36,10 +36,12 @@ fn delete_survives_crash_and_recovery() {
         // Write 10 keys and flush
         for i in 0u32..10 {
             ps_put(
-                &ps1, 901,
+                &ps1,
+                901,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes()
-            ).await;
+                format!("val-{i}").as_bytes(),
+            )
+            .await;
         }
         ps_flush(&ps1, 901).await;
 
@@ -65,7 +67,11 @@ fn delete_survives_crash_and_recovery() {
         // Surviving keys should be intact
         for i in 5u32..10 {
             let resp = ps_get(&ps2, 901, format!("key-{i:02}").as_bytes()).await;
-            assert_eq!(resp.value, format!("val-{i}").as_bytes(), "key-{i:02} should survive");
+            assert_eq!(
+                resp.value,
+                format!("val-{i}").as_bytes(),
+                "key-{i:02} should survive"
+            );
         }
     });
 }
@@ -96,10 +102,12 @@ fn delete_compaction_removes_tombstones() {
         // Write 20 keys, flush
         for i in 0u32..20 {
             ps_put(
-                &ps1, 902,
+                &ps1,
+                902,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes()
-            ).await;
+                format!("val-{i}").as_bytes(),
+            )
+            .await;
         }
         ps_flush(&ps1, 902).await;
 
@@ -132,7 +140,11 @@ fn delete_compaction_removes_tombstones() {
         }
         // Range scan returns exactly 10 entries
         let range_resp = ps_range(&ps2, 902, b"", b"", 100).await;
-        assert_eq!(range_resp.entries.len(), 10, "range should return exactly 10 surviving keys");
+        assert_eq!(
+            range_resp.entries.len(),
+            10,
+            "range should return exactly 10 surviving keys"
+        );
     });
 }
 
@@ -164,10 +176,12 @@ fn delete_before_split_correct_in_both_children() {
         // Write 20 keys across the range, flush
         for i in 0u32..20 {
             ps_put(
-                &ps, 903,
+                &ps,
+                903,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes()
-            ).await;
+                format!("val-{i}").as_bytes(),
+            )
+            .await;
         }
         ps_flush(&ps, 903).await;
 
@@ -186,14 +200,35 @@ fn delete_before_split_correct_in_both_children() {
             .await
             .expect("split");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&resp).expect("decode");
-        assert_eq!(sr.code, partition_rpc::CODE_OK, "split failed: {}", sr.message);
+        assert_eq!(
+            sr.code,
+            partition_rpc::CODE_OK,
+            "split failed: {}",
+            sr.message
+        );
         compio::time::sleep(Duration::from_millis(1000)).await;
 
         // Get region info
         let regions = get_regions(&mgr).await;
-        assert_eq!(regions.regions.len(), 2, "should have 2 partitions after split");
-        let left_rg = regions.regions.iter().find(|(_, r)| r.part_id == 903).unwrap().1.clone();
-        let right_rg = regions.regions.iter().find(|(_, r)| r.part_id != 903).unwrap().1.clone();
+        assert_eq!(
+            regions.regions.len(),
+            2,
+            "should have 2 partitions after split"
+        );
+        let left_rg = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id == 903)
+            .unwrap()
+            .1
+            .clone();
+        let right_rg = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id != 903)
+            .unwrap()
+            .1
+            .clone();
         let right_id = right_rg.part_id;
         let mid_key = left_rg.rg.as_ref().unwrap().end_key.clone();
 
@@ -204,13 +239,21 @@ fn delete_before_split_correct_in_both_children() {
         for i in 0u32..20 {
             let key = format!("key-{i:02}");
             let kb = key.as_bytes();
-            let part_id = if kb < mid_key.as_slice() { 903 } else { right_id };
+            let part_id = if kb < mid_key.as_slice() {
+                903
+            } else {
+                right_id
+            };
             let head = psr_head(&router, part_id, kb).await;
             if i % 2 == 0 {
                 assert!(!head.found, "{key} (part {part_id}) should be deleted");
             } else {
                 let resp = psr_get(&router, part_id, kb).await;
-                assert_eq!(resp.value, format!("val-{i}").as_bytes(), "{key} (part {part_id}) wrong value");
+                assert_eq!(
+                    resp.value,
+                    format!("val-{i}").as_bytes(),
+                    "{key} (part {part_id}) wrong value"
+                );
             }
         }
 
@@ -222,7 +265,11 @@ fn delete_before_split_correct_in_both_children() {
         for i in 0u32..20 {
             let key = format!("key-{i:02}");
             let kb = key.as_bytes();
-            let part_id = if kb < mid_key.as_slice() { 903 } else { right_id };
+            let part_id = if kb < mid_key.as_slice() {
+                903
+            } else {
+                right_id
+            };
             let head = psr_head(&router, part_id, kb).await;
             if i % 2 == 0 {
                 assert!(!head.found, "{key} should still be deleted after compact");

@@ -232,7 +232,11 @@ impl RpcConn {
         result?;
 
         loop {
-            match self.decoder.try_decode().map_err(|e| anyhow::anyhow!("{e}"))? {
+            match self
+                .decoder
+                .try_decode()
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+            {
                 Some(resp) if resp.req_id == req_id => {
                     if resp.is_error() {
                         let (code, message) = autumn_rpc::RpcError::decode_status(&resp.payload);
@@ -299,11 +303,8 @@ impl ConnPool {
         let conn = self.get_or_connect(sock).await?;
         // SAFETY: single-threaded compio runtime — no concurrent borrow possible.
         let conn_ptr = conn.as_ptr();
-        let result = compio::time::timeout(
-            timeout,
-            unsafe { &mut *conn_ptr }.call(msg_type, payload),
-        )
-        .await;
+        let result =
+            compio::time::timeout(timeout, unsafe { &mut *conn_ptr }.call(msg_type, payload)).await;
         match result {
             Ok(Ok(bytes)) => Ok(bytes),
             Ok(Err(e)) => {
@@ -318,7 +319,6 @@ impl ConnPool {
             }
         }
     }
-
 
     async fn get_or_connect(&self, addr: SocketAddr) -> Result<Rc<RefCell<RpcConn>>> {
         if let Some(conn) = self.conns.borrow().get(&addr) {
@@ -379,9 +379,7 @@ pub struct AutumnManager {
     /// `crates/manager/src/extent_inflight.rs` for the API + invariants
     /// and `~/.claude/plans/stream-merge-split-ps-sorted-dijkstra.md` for
     /// the migration plan.
-    pub(crate) inflight: Rc<
-        RefCell<HashMap<u64, crate::extent_inflight::MgrExtentInflightRecord>>,
-    >,
+    pub(crate) inflight: Rc<RefCell<HashMap<u64, crate::extent_inflight::MgrExtentInflightRecord>>>,
     /// F207-C: in-memory live retry state for Delete ops. The ledger
     /// entry's `PersistedPendingDelete` payload is a snapshot of the
     /// original addrs (captured at enqueue time); the live "which
@@ -390,8 +388,7 @@ pub struct AutumnManager {
     /// a new leader's first attempt is its own "attempt 1"). Populated
     /// on `enqueue_pending_deletes` and on `replay_from_etcd` (from
     /// Delete-kind ledger entries with attempts=0).
-    pub(crate) delete_progress:
-        Rc<RefCell<HashMap<u64, crate::extent_delete::PendingDelete>>>,
+    pub(crate) delete_progress: Rc<RefCell<HashMap<u64, crate::extent_delete::PendingDelete>>>,
     /// F210-G2: persisted "tried 60 times in extent_delete_loop and still
     /// failed" queue. Hydrated from the `extentDeleteRetry/` etcd
     /// prefix at replay; updated by `persist_failed_delete` and
@@ -522,9 +519,7 @@ impl AutumnManager {
             report_disk_failure_window: Cell::new(Duration::from_secs(60)),
             report_disk_failure_quorum: Cell::new(3),
             // F211-A: env-controlled soft-timeout, default 10 s.
-            node_states: Rc::new(RefCell::new(
-                crate::node_state::NodeStateTracker::default(),
-            )),
+            node_states: Rc::new(RefCell::new(crate::node_state::NodeStateTracker::default())),
             // F211-C: starts empty; populated by replay / admin RPCs.
             node_overrides: Rc::new(RefCell::new(HashMap::new())),
             decommissioned: Rc::new(RefCell::new(HashMap::new())),
@@ -600,9 +595,8 @@ impl AutumnManager {
     pub async fn new_with_etcd(endpoints: Vec<String>) -> Result<Self> {
         let mut s = Self::new();
         s.leader.set(false);
-        s.etcd = Some(
-            EtcdMirror::connect(endpoints, s.instance_id.clone(), s.leader.clone()).await?,
-        );
+        s.etcd =
+            Some(EtcdMirror::connect(endpoints, s.instance_id.clone(), s.leader.clone()).await?);
         s.replay_from_etcd().await?;
         let _ = s.try_become_leader().await;
         s.start_runtime_tasks();
@@ -677,7 +671,9 @@ impl AutumnManager {
         // Leader election only needed with etcd (non-etcd is always leader).
         if self.etcd.is_some() {
             let mgr = self.clone();
-            Self::spawn_supervised("leader_election", move || mgr.clone().leader_election_loop());
+            Self::spawn_supervised("leader_election", move || {
+                mgr.clone().leader_election_loop()
+            });
         }
 
         let mgr = self.clone();
@@ -737,9 +733,8 @@ impl AutumnManager {
         loop {
             // Re-read tick interval each cycle so set_policy_config takes
             // effect immediately (matters in tests; production stays at 60s).
-            let interval = Duration::from_secs(
-                self.policy.borrow().config.tick_interval_sec.max(1) as u64,
-            );
+            let interval =
+                Duration::from_secs(self.policy.borrow().config.tick_interval_sec.max(1) as u64);
             compio::time::sleep(interval).await;
             if !self.leader.get() {
                 continue;
@@ -750,8 +745,7 @@ impl AutumnManager {
                 s.regions.iter().map(|(id, r)| (*id, r.ps_id)).collect()
             };
             let last_op = self.last_op_at.borrow().clone();
-            let state_snapshot: autumn_common::MetadataState =
-                (*self.store.inner.borrow()).clone();
+            let state_snapshot: autumn_common::MetadataState = (*self.store.inner.borrow()).clone();
             // F210-F3: prune metrics for partitions that no longer
             // exist (post-split / merge / PS-evict) and whose latest
             // bucket has aged past STALE_METRICS_AGE_SEC. Without
@@ -873,11 +867,10 @@ impl AutumnManager {
             .cloned()
             .or_else(|| state.ps_nodes.get(&region.ps_id).cloned())
             .ok_or_else(|| anyhow::anyhow!("no address for part {}", cand.primary_part_id))?;
-        let payload = autumn_rpc::partition_rpc::rkyv_encode(
-            &autumn_rpc::partition_rpc::SplitPartReq {
+        let payload =
+            autumn_rpc::partition_rpc::rkyv_encode(&autumn_rpc::partition_rpc::SplitPartReq {
                 part_id: cand.primary_part_id,
-            },
-        );
+            });
         // 60 s — split has to flush memtable + commit_length × 3 + a
         // manager round-trip. PS-side flush can take a few seconds
         // under contention, but anything > 60 s is a real wedge worth
@@ -918,16 +911,12 @@ impl AutumnManager {
         let victim_id = cand.secondary_part_id;
         // Resolve PS addresses (per-partition first).
         let resolve = |pid: u64| -> Option<String> {
-            state
-                .part_addrs
-                .get(&pid)
-                .cloned()
-                .or_else(|| {
-                    state
-                        .regions
-                        .get(&pid)
-                        .and_then(|r| state.ps_nodes.get(&r.ps_id).cloned())
-                })
+            state.part_addrs.get(&pid).cloned().or_else(|| {
+                state
+                    .regions
+                    .get(&pid)
+                    .and_then(|r| state.ps_nodes.get(&r.ps_id).cloned())
+            })
         };
         let s_addr = resolve(survivor_id)
             .ok_or_else(|| anyhow::anyhow!("no address for survivor {survivor_id}"))?;
@@ -1300,7 +1289,9 @@ impl AutumnManager {
         let last_op = c.get_prefix("partitionLastOp/").await?;
         // F207: unified extent in-flight ledger. Authoritative source of
         // truth for stream-layer ops in flight on each extent.
-        let extent_inflight_raw = c.get_prefix(crate::extent_inflight::EXTENT_INFLIGHT_PREFIX).await?;
+        let extent_inflight_raw = c
+            .get_prefix(crate::extent_inflight::EXTENT_INFLIGHT_PREFIX)
+            .await?;
         // F210-G2: persisted retry queue for extent deletes that
         // exhausted the primary in-memory loop's budget.
         let failed_delete_raw = c
@@ -1362,7 +1353,8 @@ impl AutumnManager {
         let mut decoded_partitions = HashMap::new();
         for kv in &partitions.kvs {
             let id = Self::parse_id_from_key("partitions/", &kv.key)?;
-            let part: MgrPartitionMeta = rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let part: MgrPartitionMeta =
+                rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             max_id = max_id.max(id);
             decoded_partitions.insert(id, part);
         }
@@ -1386,7 +1378,8 @@ impl AutumnManager {
         let mut decoded_regions = BTreeMap::new();
         for kv in &regions.kvs {
             let id = Self::parse_id_from_key("regions/", &kv.key)?;
-            let region: MgrRegionInfo = rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let region: MgrRegionInfo =
+                rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             decoded_regions.insert(id, region);
         }
 
@@ -1495,16 +1488,15 @@ impl AutumnManager {
         // inside `decode_extent_inflight_kvs`. The `extent_inflight/`
         // prefix is the single source of truth — no legacy fold-in.
         {
-            let decoded = Self::decode_extent_inflight_kvs(extent_inflight_raw.kvs.iter().map(
-                |kv| {
+            let decoded =
+                Self::decode_extent_inflight_kvs(extent_inflight_raw.kvs.iter().map(|kv| {
                     let id = Self::parse_id_from_key(
                         crate::extent_inflight::EXTENT_INFLIGHT_PREFIX,
                         &kv.key,
                     )
                     .unwrap_or(0);
                     (id, kv.value.as_slice())
-                },
-            ));
+                }));
             let mut map = self.inflight.borrow_mut();
             map.clear();
             for (id, rec) in decoded {
@@ -1522,8 +1514,7 @@ impl AutumnManager {
             let mut progress = self.delete_progress.borrow_mut();
             progress.clear();
             for (id, rec) in inflight.iter() {
-                if let Some((_, crate::extent_inflight::ExtentOpPayload::Delete(p))) =
-                    rec.unpack()
+                if let Some((_, crate::extent_inflight::ExtentOpPayload::Delete(p))) = rec.unpack()
                 {
                     progress.insert(
                         *id,
@@ -1955,7 +1946,9 @@ impl AutumnManager {
                         *cnt += 1;
                     }
                 }
-                load.into_iter().min_by_key(|&(_, cnt)| cnt).map(|(id, _)| id)
+                load.into_iter()
+                    .min_by_key(|&(_, cnt)| cnt)
+                    .map(|(id, _)| id)
             })
             .unwrap_or(0);
         let region_epoch = Self::next_region_epoch(state, part.part_id, &part.rg);
@@ -2329,7 +2322,9 @@ impl AutumnManager {
         for st in survivor_streams {
             state.streams.insert(st.stream_id, st.clone());
         }
-        state.partitions.insert(survivor_meta.part_id, survivor_meta);
+        state
+            .partitions
+            .insert(survivor_meta.part_id, survivor_meta);
         state
             .partition_vp_refs
             .insert(merged_vp_refs.part_id, merged_vp_refs);
@@ -2417,11 +2412,15 @@ impl AutumnManager {
         // shuffled-fallback walk picks another node.
         let resp = self
             .conn_pool
-            .call_timeout(&routed, EXT_MSG_ALLOC_EXTENT, payload, Duration::from_secs(10))
+            .call_timeout(
+                &routed,
+                EXT_MSG_ALLOC_EXTENT,
+                payload,
+                Duration::from_secs(10),
+            )
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
-        let r: ExtAllocExtentResp =
-            rkyv_decode(&resp).map_err(|e| AppError::Internal(e))?;
+        let r: ExtAllocExtentResp = rkyv_decode(&resp).map_err(|e| AppError::Internal(e))?;
         if r.code != CODE_OK {
             return Err(AppError::Internal(format!(
                 "alloc_extent failed: {}",
@@ -2462,11 +2461,15 @@ impl AutumnManager {
         // doesn't hang split / commit-len consensus paths.
         let resp = self
             .conn_pool
-            .call_timeout(&routed, EXT_MSG_COMMIT_LENGTH, req.encode(), Duration::from_secs(5))
+            .call_timeout(
+                &routed,
+                EXT_MSG_COMMIT_LENGTH,
+                req.encode(),
+                Duration::from_secs(5),
+            )
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
-        let r =
-            ExtCommitLengthResp::decode(resp).map_err(|e| AppError::Internal(e.to_string()))?;
+        let r = ExtCommitLengthResp::decode(resp).map_err(|e| AppError::Internal(e.to_string()))?;
         if r.code != CODE_OK {
             return Err(AppError::Internal(format!(
                 "commit_length failed on {routed}: code {}",
@@ -2504,8 +2507,7 @@ impl AutumnManager {
             )
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
-        let r =
-            ExtProbeExtentResp::decode(resp).map_err(|e| AppError::Internal(e.to_string()))?;
+        let r = ExtProbeExtentResp::decode(resp).map_err(|e| AppError::Internal(e.to_string()))?;
         if r.code != CODE_OK {
             return Err(AppError::Internal(format!(
                 "probe_extent on {routed}: code {}",
@@ -2567,7 +2569,6 @@ impl AutumnManager {
         self.persist_extent(&updated).await?;
         Ok(())
     }
-
 
     // ── Etcd mirror helpers ────────────────────────────────────────────
 
@@ -2689,16 +2690,10 @@ impl AutumnManager {
                 kvs.push((format!("psNodes/{ps_id}"), addr.into_bytes()));
             }
             for (part_id, part) in partitions {
-                kvs.push((
-                    format!("partitions/{part_id}"),
-                    rkyv_encode(&part).to_vec(),
-                ));
+                kvs.push((format!("partitions/{part_id}"), rkyv_encode(&part).to_vec()));
             }
             for (part_id, region) in regions {
-                kvs.push((
-                    format!("regions/{part_id}"),
-                    rkyv_encode(&region).to_vec(),
-                ));
+                kvs.push((format!("regions/{part_id}"), rkyv_encode(&region).to_vec()));
             }
             etcd.put_msgs_txn(kvs).await?;
         }
@@ -2780,12 +2775,7 @@ mod tests {
         );
     }
 
-    fn fire_report(
-        m: &AutumnManager,
-        node_id: u64,
-        reporter_part_id: u64,
-        ts_ms: i64,
-    ) -> CodeResp {
+    fn fire_report(m: &AutumnManager, node_id: u64, reporter_part_id: u64, ts_ms: i64) -> CodeResp {
         let req = rkyv_encode(&ReportDiskFailureReq {
             node_id,
             extent_id: 1,
@@ -2809,7 +2799,10 @@ mod tests {
 
         let s = m.store.inner.borrow();
         let disk = s.disks.get(&70).unwrap();
-        assert!(disk.online, "node 7's disk must still be online below quorum");
+        assert!(
+            disk.online,
+            "node 7's disk must still be online below quorum"
+        );
     }
 
     #[test]
@@ -2992,8 +2985,7 @@ mod tests {
                 m.handle_register_ps(req).await.unwrap();
             }
 
-            for (part_id, start, end) in
-                [(101u64, b"a" as &[u8], b"m" as &[u8]), (102, b"m", b"")]
+            for (part_id, start, end) in [(101u64, b"a" as &[u8], b"m" as &[u8]), (102, b"m", b"")]
             {
                 let req = rkyv_encode(&UpsertPartitionReq {
                     meta: MgrPartitionMeta {
@@ -3136,7 +3128,10 @@ mod tests {
         assert_eq!(e11.refs, 1);
 
         let e10 = modified.iter().find(|e| e.extent_id == 10);
-        assert!(e10.is_none(), "non-tail survivor extent unchanged → not in modified");
+        assert!(
+            e10.is_none(),
+            "non-tail survivor extent unchanged → not in modified"
+        );
 
         let e20 = modified.iter().find(|e| e.extent_id == 20).unwrap();
         assert_eq!(e20.refs, 2);
@@ -3289,7 +3284,14 @@ mod tests {
         assert!(!state.streams.contains_key(&202));
         assert!(!state.partition_vp_refs.contains_key(&2));
         assert_eq!(
-            state.partitions.get(&1).unwrap().rg.as_ref().unwrap().end_key,
+            state
+                .partitions
+                .get(&1)
+                .unwrap()
+                .rg
+                .as_ref()
+                .unwrap()
+                .end_key,
             b"z".to_vec()
         );
     }
@@ -3376,7 +3378,10 @@ mod tests {
         };
 
         let region = AutumnManager::compute_region_for_partition(&state, &left);
-        assert_eq!(region.ps_id, 10, "left partition should keep its existing PS");
+        assert_eq!(
+            region.ps_id, 10,
+            "left partition should keep its existing PS"
+        );
         assert_eq!(region.part_id, 101);
         assert_eq!(region.rg.as_ref().unwrap().end_key, b"m".to_vec());
     }
@@ -3458,7 +3463,11 @@ mod tests {
             let m = AutumnManager::new();
 
             // Register nodes (unreachable — no actual servers).
-            for (nid, addr) in [(1, "127.0.0.1:4001"), (2, "127.0.0.1:4002"), (3, "127.0.0.1:4003")] {
+            for (nid, addr) in [
+                (1, "127.0.0.1:4001"),
+                (2, "127.0.0.1:4002"),
+                (3, "127.0.0.1:4003"),
+            ] {
                 let req = rkyv_encode(&RegisterNodeReq {
                     addr: addr.to_string(),
                     disk_uuids: vec![format!("disk-{nid}")],
@@ -3490,31 +3499,51 @@ mod tests {
                 stream_id = sid;
                 let (eid, _) = s.alloc_ids(1);
                 tail_id = eid;
-                s.streams.insert(stream_id, MgrStreamInfo {
+                s.streams.insert(
                     stream_id,
-                    extent_ids: vec![tail_id],
-                    ec_data_shard: 0,
-                    ec_parity_shard: 0,
-                    replicates: 3,
-                });
-                s.extents.insert(tail_id, MgrExtentInfo {
-                    extent_id: tail_id,
-                    replicates: vec![1, 2, 3],
-                    parity: vec![],
-                    eversion: 1,
-                    refs: 1,
-                    vp_table_refs: 0,
-                    sealed_length: 0,
-                    avali: 0,
-                    replicate_disks: vec![1, 2, 3],
-                    parity_disks: vec![],
-                    ec_converted: false,
-                });
+                    MgrStreamInfo {
+                        stream_id,
+                        extent_ids: vec![tail_id],
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                        replicates: 3,
+                    },
+                );
+                s.extents.insert(
+                    tail_id,
+                    MgrExtentInfo {
+                        extent_id: tail_id,
+                        replicates: vec![1, 2, 3],
+                        parity: vec![],
+                        eversion: 1,
+                        refs: 1,
+                        vp_table_refs: 0,
+                        sealed_length: 0,
+                        avali: 0,
+                        replicate_disks: vec![1, 2, 3],
+                        parity_disks: vec![],
+                        ec_converted: false,
+                    },
+                );
             }
 
             // Snapshot before.
-            let tail_before = m.store.inner.borrow().extents.get(&tail_id).cloned().unwrap();
-            let stream_before = m.store.inner.borrow().streams.get(&stream_id).cloned().unwrap();
+            let tail_before = m
+                .store
+                .inner
+                .borrow()
+                .extents
+                .get(&tail_id)
+                .cloned()
+                .unwrap();
+            let stream_before = m
+                .store
+                .inner
+                .borrow()
+                .streams
+                .get(&stream_id)
+                .cloned()
+                .unwrap();
 
             // Call alloc_extent with end=100 — nodes unreachable, so the
             // handler returns a precondition error after failing to allocate.
@@ -3530,8 +3559,22 @@ mod tests {
             assert_ne!(r.code, CODE_OK, "should fail: no running extent nodes");
 
             // F125 invariant: store must be unchanged after failed alloc.
-            let tail_after = m.store.inner.borrow().extents.get(&tail_id).cloned().unwrap();
-            let stream_after = m.store.inner.borrow().streams.get(&stream_id).cloned().unwrap();
+            let tail_after = m
+                .store
+                .inner
+                .borrow()
+                .extents
+                .get(&tail_id)
+                .cloned()
+                .unwrap();
+            let stream_after = m
+                .store
+                .inner
+                .borrow()
+                .streams
+                .get(&stream_id)
+                .cloned()
+                .unwrap();
 
             assert_eq!(
                 tail_after.sealed_length, tail_before.sealed_length,
@@ -3542,7 +3585,8 @@ mod tests {
                 "tail eversion must not change on failed alloc"
             );
             assert_eq!(
-                stream_after.extent_ids.len(), stream_before.extent_ids.len(),
+                stream_after.extent_ids.len(),
+                stream_before.extent_ids.len(),
                 "stream extent_ids must not change on failed alloc"
             );
         })
@@ -3571,49 +3615,61 @@ mod tests {
             {
                 let mut s = m.store.inner.borrow_mut();
                 s.next_id = 100;
-                s.streams.insert(1, MgrStreamInfo {
-                    stream_id: 1,
-                    extent_ids: vec![10, 11, 12],
-                    ec_data_shard: 0,
-                    ec_parity_shard: 0,
-                    replicates: 3,
-                });
+                s.streams.insert(
+                    1,
+                    MgrStreamInfo {
+                        stream_id: 1,
+                        extent_ids: vec![10, 11, 12],
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                        replicates: 3,
+                    },
+                );
                 for eid in [10, 11, 12] {
-                    s.extents.insert(eid, MgrExtentInfo {
-                        extent_id: eid,
+                    s.extents.insert(
+                        eid,
+                        MgrExtentInfo {
+                            extent_id: eid,
+                            replicates: vec![],
+                            parity: vec![],
+                            eversion: 1,
+                            refs: 1,
+                            vp_table_refs: 0,
+                            sealed_length: 100,
+                            avali: 1,
+                            replicate_disks: vec![],
+                            parity_disks: vec![],
+                            ec_converted: false,
+                        },
+                    );
+                }
+
+                s.streams.insert(
+                    2,
+                    MgrStreamInfo {
+                        stream_id: 2,
+                        extent_ids: vec![20],
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                        replicates: 3,
+                    },
+                );
+                s.extents.insert(
+                    20,
+                    MgrExtentInfo {
+                        extent_id: 20,
                         replicates: vec![],
                         parity: vec![],
                         eversion: 1,
                         refs: 1,
                         vp_table_refs: 0,
-                        sealed_length: 100,
+                        sealed_length: 200,
                         avali: 1,
                         replicate_disks: vec![],
                         parity_disks: vec![],
                         ec_converted: false,
-                    });
-                }
-
-                s.streams.insert(2, MgrStreamInfo {
-                    stream_id: 2,
-                    extent_ids: vec![20],
-                    ec_data_shard: 0,
-                    ec_parity_shard: 0,
-                    replicates: 3,
-                });
-                s.extents.insert(20, MgrExtentInfo {
-                    extent_id: 20,
-                    replicates: vec![],
-                    parity: vec![],
-                    eversion: 1,
-                    refs: 1,
-                    vp_table_refs: 0,
-                    sealed_length: 200,
-                    avali: 1,
-                    replicate_disks: vec![],
-                    parity_disks: vec![],
-                    ec_converted: false,
-                });
+                    },
+                );
             }
 
             // Punch stream 1 with extent_ids [10, 20, 999].
@@ -3643,7 +3699,10 @@ mod tests {
             // Extent 10 was the only member punched.
             // With refs=1 and no vp_table_refs, it should have been deleted
             // from the extents map.
-            assert!(s.extents.get(&10).is_none(), "extent 10 should be removed (refs was 1)");
+            assert!(
+                s.extents.get(&10).is_none(),
+                "extent 10 should be removed (refs was 1)"
+            );
         })
     }
 
@@ -3673,7 +3732,11 @@ mod tests {
                 parity_disks: vec![13],
                 ec_converted: true,
             };
-            m.store.inner.borrow_mut().extents.insert(extent_id, ex.clone());
+            m.store
+                .inner
+                .borrow_mut()
+                .extents
+                .insert(extent_id, ex.clone());
 
             let task = MgrRecoveryTask {
                 extent_id,
@@ -3697,7 +3760,10 @@ mod tests {
             // can re-attempt (e.g., once the original failed node is back
             // online, re_avali can repair without going through dispatch).
             assert!(
-                !matches!(m.extent_inflight_op(extent_id), Some(crate::extent_inflight::ExtentOpKind::Recovery)),
+                !matches!(
+                    m.extent_inflight_op(extent_id),
+                    Some(crate::extent_inflight::ExtentOpKind::Recovery)
+                ),
                 "stale recovery task must be removed on duplicate-node rejection"
             );
             // Extent layout must be unchanged.
@@ -3705,7 +3771,10 @@ mod tests {
             let ex_after = s.extents.get(&extent_id).unwrap();
             assert_eq!(ex_after.replicates, vec![1, 3, 5]);
             assert_eq!(ex_after.parity, vec![7]);
-            assert_eq!(ex_after.eversion, 3, "eversion must not be bumped on rejection");
+            assert_eq!(
+                ex_after.eversion, 3,
+                "eversion must not be bumped on rejection"
+            );
         })
     }
 
@@ -3747,10 +3816,17 @@ mod tests {
             };
             let result = m.apply_recovery_done(done).await;
 
-            assert!(result.is_ok(), "normal recovery apply must succeed: {result:?}");
+            assert!(
+                result.is_ok(),
+                "normal recovery apply must succeed: {result:?}"
+            );
             let s = m.store.inner.borrow();
             let ex_after = s.extents.get(&extent_id).unwrap();
-            assert_eq!(ex_after.replicates, vec![9, 3, 5], "slot 0 should be replaced");
+            assert_eq!(
+                ex_after.replicates,
+                vec![9, 3, 5],
+                "slot 0 should be replaced"
+            );
             assert_eq!(ex_after.parity, vec![7]);
             assert_eq!(ex_after.eversion, 4, "eversion must be bumped on apply");
             assert_eq!(ex_after.avali, 0xF, "slot 0 avali bit should be set");
@@ -3818,7 +3894,11 @@ mod tests {
             );
             let s = m.store.inner.borrow();
             let ex = s.extents.get(&extent_id).unwrap();
-            assert_eq!(ex.replicates, vec![1, 3, 5], "replicates unchanged during deferral");
+            assert_eq!(
+                ex.replicates,
+                vec![1, 3, 5],
+                "replicates unchanged during deferral"
+            );
             assert_eq!(ex.eversion, 5, "eversion unchanged during deferral");
             drop(s);
 
@@ -3826,7 +3906,10 @@ mod tests {
             m._test_clear_inflight(extent_id);
             m._test_mark_recovery_inflight(extent_id, task);
             let result = m.apply_recovery_done(done).await;
-            assert!(result.is_ok(), "F138: recovery apply must succeed after EC clears");
+            assert!(
+                result.is_ok(),
+                "F138: recovery apply must succeed after EC clears"
+            );
             let s = m.store.inner.borrow();
             let ex = s.extents.get(&extent_id).unwrap();
             assert_eq!(ex.replicates, vec![9, 3, 5], "slot 0 replaced after retry");
@@ -3861,7 +3944,10 @@ mod tests {
             // After EC clears, retry succeeds.
             m._test_clear_inflight(extent_id);
             let result = m.mark_extent_available(extent_id, 0).await;
-            assert!(result.is_ok(), "F138: mark_extent_available must succeed after EC clears");
+            assert!(
+                result.is_ok(),
+                "F138: mark_extent_available must succeed after EC clears"
+            );
             let s = m.store.inner.borrow();
             let ex = s.extents.get(&extent_id).unwrap();
             assert_eq!(ex.eversion, 8, "eversion bumped after retry");
@@ -3927,13 +4013,17 @@ mod tests {
             // recovery_collect_loop's behaviour after the EC tick cleared).
             m._test_mark_recovery_inflight(extent_id, task);
             let r = m.apply_recovery_done(done).await;
-            assert!(r.is_ok(), "recovery apply must succeed after EC clears: {r:?}");
+            assert!(
+                r.is_ok(),
+                "recovery apply must succeed after EC clears: {r:?}"
+            );
 
             // Final state: both eversion bumps preserved; slot replacement survived.
             let s = m.store.inner.borrow();
             let ex = s.extents.get(&extent_id).unwrap();
             assert_eq!(
-                ex.replicates, vec![9, 3, 5],
+                ex.replicates,
+                vec![9, 3, 5],
                 "F138: recovery's slot replacement (node 1→9) must survive EC apply"
             );
             assert_eq!(ex.parity, vec![7], "parity node added by EC");
@@ -3987,19 +4077,22 @@ mod tests {
                             replicates: 3,
                         },
                     );
-                    s.extents.insert(eid, MgrExtentInfo {
-                        extent_id: eid,
-                        replicates: vec![1, 3, 5],
-                        parity: vec![],
-                        eversion: 1,
-                        refs: 1,
-                        vp_table_refs: 0,
-                        sealed_length: 1000,
-                        avali: 0x7,
-                        replicate_disks: vec![10, 30, 50],
-                        parity_disks: vec![],
-                        ec_converted: false,
-                    });
+                    s.extents.insert(
+                        eid,
+                        MgrExtentInfo {
+                            extent_id: eid,
+                            replicates: vec![1, 3, 5],
+                            parity: vec![],
+                            eversion: 1,
+                            refs: 1,
+                            vp_table_refs: 0,
+                            sealed_length: 1000,
+                            avali: 0x7,
+                            replicate_disks: vec![10, 30, 50],
+                            parity_disks: vec![],
+                            ec_converted: false,
+                        },
+                    );
                 }
 
                 s.partitions.insert(
@@ -4089,7 +4182,10 @@ mod tests {
                             log_stream: sids[0],
                             row_stream: sids[1],
                             meta_stream: sids[2],
-                            rg: Some(MgrRange { start_key: start, end_key: end }),
+                            rg: Some(MgrRange {
+                                start_key: start,
+                                end_key: end,
+                            }),
                         },
                     );
                 }
@@ -4159,8 +4255,20 @@ mod tests {
                 let mut s = m.store.inner.borrow_mut();
                 s.next_id = 200;
                 for (pid, sids, start, end, eids) in [
-                    (1u64, [10u64, 11, 12], b"a".to_vec(), b"m".to_vec(), [100u64, 101, 102]),
-                    (2u64, [20u64, 21, 22], b"m".to_vec(), b"z".to_vec(), [200u64, 201, 202]),
+                    (
+                        1u64,
+                        [10u64, 11, 12],
+                        b"a".to_vec(),
+                        b"m".to_vec(),
+                        [100u64, 101, 102],
+                    ),
+                    (
+                        2u64,
+                        [20u64, 21, 22],
+                        b"m".to_vec(),
+                        b"z".to_vec(),
+                        [200u64, 201, 202],
+                    ),
                 ] {
                     for (sid, eid) in sids.iter().copied().zip(eids.iter().copied()) {
                         s.streams.insert(
@@ -4197,7 +4305,10 @@ mod tests {
                             log_stream: sids[0],
                             row_stream: sids[1],
                             meta_stream: sids[2],
-                            rg: Some(MgrRange { start_key: start, end_key: end }),
+                            rg: Some(MgrRange {
+                                start_key: start,
+                                end_key: end,
+                            }),
                         },
                     );
                 }
@@ -4240,8 +4351,20 @@ mod tests {
                 let mut s = m.store.inner.borrow_mut();
                 s.next_id = 200;
                 for (pid, sids, start, end, eids) in [
-                    (1u64, [10u64, 11, 12], b"a".to_vec(), b"m".to_vec(), [100u64, 101, 102]),
-                    (2u64, [20u64, 21, 22], b"m".to_vec(), b"z".to_vec(), [200u64, 201, 202]),
+                    (
+                        1u64,
+                        [10u64, 11, 12],
+                        b"a".to_vec(),
+                        b"m".to_vec(),
+                        [100u64, 101, 102],
+                    ),
+                    (
+                        2u64,
+                        [20u64, 21, 22],
+                        b"m".to_vec(),
+                        b"z".to_vec(),
+                        [200u64, 201, 202],
+                    ),
                 ] {
                     for (sid, eid) in sids.iter().copied().zip(eids.iter().copied()) {
                         s.streams.insert(
@@ -4278,7 +4401,10 @@ mod tests {
                             log_stream: sids[0],
                             row_stream: sids[1],
                             meta_stream: sids[2],
-                            rg: Some(MgrRange { start_key: start, end_key: end }),
+                            rg: Some(MgrRange {
+                                start_key: start,
+                                end_key: end,
+                            }),
                         },
                     );
                 }
@@ -4329,8 +4455,20 @@ mod tests {
                 let mut s = m.store.inner.borrow_mut();
                 s.next_id = 200;
                 for (pid, sids, start, end, eids) in [
-                    (1u64, [10u64, 11, 12], b"a".to_vec(), b"m".to_vec(), [100u64, 101, 102]),
-                    (2u64, [20u64, 21, 22], b"m".to_vec(), b"z".to_vec(), [200u64, 201, 202]),
+                    (
+                        1u64,
+                        [10u64, 11, 12],
+                        b"a".to_vec(),
+                        b"m".to_vec(),
+                        [100u64, 101, 102],
+                    ),
+                    (
+                        2u64,
+                        [20u64, 21, 22],
+                        b"m".to_vec(),
+                        b"z".to_vec(),
+                        [200u64, 201, 202],
+                    ),
                 ] {
                     for (sid, eid) in sids.iter().copied().zip(eids.iter().copied()) {
                         s.streams.insert(
@@ -4367,7 +4505,10 @@ mod tests {
                             log_stream: sids[0],
                             row_stream: sids[1],
                             meta_stream: sids[2],
-                            rg: Some(MgrRange { start_key: start, end_key: end }),
+                            rg: Some(MgrRange {
+                                start_key: start,
+                                end_key: end,
+                            }),
                         },
                     );
                 }
@@ -4452,14 +4593,8 @@ mod tests {
         const ITERS: usize = 1000;
         let mut counts: HashMap<u64, usize> = HashMap::new();
         for _ in 0..ITERS {
-            let picked = AutumnManager::select_nodes(
-                &nodes,
-                &disks,
-                &online_node_ids,
-                3,
-                &[],
-            )
-            .unwrap();
+            let picked =
+                AutumnManager::select_nodes(&nodes, &disks, &online_node_ids, 3, &[]).unwrap();
             assert_eq!(picked.len(), 3);
             let mut ids: Vec<u64> = picked.iter().map(|n| n.node_id).collect();
             ids.sort();
@@ -4507,14 +4642,8 @@ mod tests {
         let online_node_ids: HashSet<u64> = nodes.keys().copied().collect();
         let mut first_node_seen: HashSet<u64> = HashSet::new();
         for _ in 0..200 {
-            let picked = AutumnManager::select_nodes(
-                &nodes,
-                &disks,
-                &online_node_ids,
-                1,
-                &[],
-            )
-            .unwrap();
+            let picked =
+                AutumnManager::select_nodes(&nodes, &disks, &online_node_ids, 1, &[]).unwrap();
             first_node_seen.insert(picked[0].node_id);
         }
         assert!(
@@ -4548,7 +4677,10 @@ mod tests {
                 "F139: dispatch_recovery_task must return Ok when delete queued: {result:?}"
             );
             assert!(
-                !matches!(m.extent_inflight_op(extent_id), Some(crate::extent_inflight::ExtentOpKind::Recovery)),
+                !matches!(
+                    m.extent_inflight_op(extent_id),
+                    Some(crate::extent_inflight::ExtentOpKind::Recovery)
+                ),
                 "F139: recovery_tasks must NOT be populated when delete is queued"
             );
         })
@@ -4763,7 +4895,10 @@ mod tests {
                 revision,
                 extent_ids: vec![extent_id],
             });
-            let resp = m.handle_stream_punch_holes(req_bytes.clone()).await.unwrap();
+            let resp = m
+                .handle_stream_punch_holes(req_bytes.clone())
+                .await
+                .unwrap();
             let r: PunchHolesResp = rkyv_decode(&resp).unwrap();
             assert_ne!(r.code, CODE_OK, "Phase 1: punch_holes must be rejected");
 
@@ -4773,7 +4908,11 @@ mod tests {
             // Phase 3: punch_holes must now succeed.
             let resp2 = m.handle_stream_punch_holes(req_bytes).await.unwrap();
             let r2: PunchHolesResp = rkyv_decode(&resp2).unwrap();
-            assert_eq!(r2.code, CODE_OK, "Phase 3: punch_holes must succeed after recovery clears: {}", r2.message);
+            assert_eq!(
+                r2.code, CODE_OK,
+                "Phase 3: punch_holes must succeed after recovery clears: {}",
+                r2.message
+            );
 
             // Extent must be removed from the stream.
             let s = m.store.inner.borrow();
@@ -4827,7 +4966,8 @@ mod tests {
                         replicates: 3,
                     },
                 );
-                s.extents.insert(extent_keep, make_ec_extent(extent_keep, 1));
+                s.extents
+                    .insert(extent_keep, make_ec_extent(extent_keep, 1));
                 let mut ex = make_ec_extent(extent_id, 1);
                 ex.refs = 1;
                 ex.vp_table_refs = 0;
@@ -4858,7 +4998,10 @@ mod tests {
             );
             // Eversion must not have been bumped.
             let s = m.store.inner.borrow();
-            let ex = s.extents.get(&extent_id).expect("F145: extent must not be removed");
+            let ex = s
+                .extents
+                .get(&extent_id)
+                .expect("F145: extent must not be removed");
             assert_eq!(
                 ex.eversion, eversion_before,
                 "F145: eversion must not be bumped during mid-EC punch_holes"
@@ -4879,7 +5022,11 @@ mod tests {
             });
             let resp2 = m.handle_stream_punch_holes(req2).await.unwrap();
             let r2: PunchHolesResp = rkyv_decode(&resp2).unwrap();
-            assert_eq!(r2.code, CODE_OK, "F145: punch_holes must succeed after EC completes: {}", r2.message);
+            assert_eq!(
+                r2.code, CODE_OK,
+                "F145: punch_holes must succeed after EC completes: {}",
+                r2.message
+            );
             let s2 = m.store.inner.borrow();
             assert!(
                 !s2.streams[&stream_id].extent_ids.contains(&extent_id),
@@ -4954,7 +5101,10 @@ mod tests {
                 stream.extent_ids.contains(&extent_a),
                 "F145: extent_a must not be removed from stream on rejection"
             );
-            let ex = s.extents.get(&extent_a).expect("F145: extent_a must still be in store");
+            let ex = s
+                .extents
+                .get(&extent_a)
+                .expect("F145: extent_a must still be in store");
             assert_eq!(
                 ex.eversion, eversion_before,
                 "F145: eversion must not be bumped during mid-EC truncate"
@@ -4991,19 +5141,22 @@ mod tests {
                         replicates: 0,
                     },
                 );
-                s.extents.insert(tail_id, MgrExtentInfo {
-                    extent_id: tail_id,
-                    replicates: vec![],
-                    parity: vec![],
-                    eversion: 5,
-                    refs: 1,
-                    vp_table_refs: 0,
-                    sealed_length: 0,
-                    avali: 0,
-                    replicate_disks: vec![],
-                    parity_disks: vec![],
-                    ec_converted: false,
-                });
+                s.extents.insert(
+                    tail_id,
+                    MgrExtentInfo {
+                        extent_id: tail_id,
+                        replicates: vec![],
+                        parity: vec![],
+                        eversion: 5,
+                        refs: 1,
+                        vp_table_refs: 0,
+                        sealed_length: 0,
+                        avali: 0,
+                        replicate_disks: vec![],
+                        parity_disks: vec![],
+                        ec_converted: false,
+                    },
+                );
             }
 
             // Tail is mid-EC: alloc_extent must refuse immediately.
@@ -5020,7 +5173,10 @@ mod tests {
             let resp = m.handle_stream_alloc_extent(req).await.unwrap();
             let r: StreamAllocExtentResp = rkyv_decode(&resp).unwrap();
 
-            assert_ne!(r.code, CODE_OK, "F146: alloc_extent must be rejected when tail is mid-EC");
+            assert_ne!(
+                r.code, CODE_OK,
+                "F146: alloc_extent must be rejected when tail is mid-EC"
+            );
             assert!(
                 r.message.contains("in-flight ConvertToEc"),
                 "error must mention in-flight ConvertToEc: {}",
@@ -5061,28 +5217,34 @@ mod tests {
                         replicates: 0,
                     },
                 );
-                s.extents.insert(tail_id, MgrExtentInfo {
-                    extent_id: tail_id,
-                    replicates: vec![],
-                    parity: vec![],
-                    eversion: 7,
-                    refs: 1,
-                    vp_table_refs: 0,
-                    sealed_length: 0,
-                    avali: 0,
-                    replicate_disks: vec![],
-                    parity_disks: vec![],
-                    ec_converted: false,
-                });
+                s.extents.insert(
+                    tail_id,
+                    MgrExtentInfo {
+                        extent_id: tail_id,
+                        replicates: vec![],
+                        parity: vec![],
+                        eversion: 7,
+                        refs: 1,
+                        vp_table_refs: 0,
+                        sealed_length: 0,
+                        avali: 0,
+                        replicate_disks: vec![],
+                        parity_disks: vec![],
+                        ec_converted: false,
+                    },
+                );
             }
 
             // Tail is under active recovery: alloc_extent must refuse.
-            m._test_mark_recovery_inflight(tail_id, MgrRecoveryTask {
-                extent_id: tail_id,
-                replace_id: 0,
-                node_id: 1,
-                start_time: 0,
-            });
+            m._test_mark_recovery_inflight(
+                tail_id,
+                MgrRecoveryTask {
+                    extent_id: tail_id,
+                    replace_id: 0,
+                    node_id: 1,
+                    start_time: 0,
+                },
+            );
             let eversion_before = m.store.inner.borrow().extents[&tail_id].eversion;
 
             let req = rkyv_encode(&StreamAllocExtentReq {
@@ -5095,7 +5257,10 @@ mod tests {
             let resp = m.handle_stream_alloc_extent(req).await.unwrap();
             let r: StreamAllocExtentResp = rkyv_decode(&resp).unwrap();
 
-            assert_ne!(r.code, CODE_OK, "F146: alloc_extent must be rejected when tail is mid-recovery");
+            assert_ne!(
+                r.code, CODE_OK,
+                "F146: alloc_extent must be rejected when tail is mid-recovery"
+            );
             assert!(
                 r.message.contains("in-flight Recovery"),
                 "error must mention in-flight Recovery: {}",
@@ -5139,46 +5304,58 @@ mod tests {
                     (row_stream_id, row_extent),
                     (meta_stream_id, meta_extent),
                 ] {
-                    s.streams.insert(sid, MgrStreamInfo {
-                        stream_id: sid,
-                        extent_ids: vec![eid],
-                        ec_data_shard: 0,
-                        ec_parity_shard: 0,
-                        replicates: 3,
-                    });
-                    s.extents.insert(eid, MgrExtentInfo {
-                        extent_id: eid,
-                        replicates: vec![1, 3, 5],
-                        parity: vec![],
-                        eversion: 1,
-                        refs: 1,
-                        vp_table_refs: 0,
-                        sealed_length: 1000,
-                        avali: 0x7,
-                        replicate_disks: vec![10, 30, 50],
-                        parity_disks: vec![],
-                        ec_converted: false,
-                    });
+                    s.streams.insert(
+                        sid,
+                        MgrStreamInfo {
+                            stream_id: sid,
+                            extent_ids: vec![eid],
+                            ec_data_shard: 0,
+                            ec_parity_shard: 0,
+                            replicates: 3,
+                        },
+                    );
+                    s.extents.insert(
+                        eid,
+                        MgrExtentInfo {
+                            extent_id: eid,
+                            replicates: vec![1, 3, 5],
+                            parity: vec![],
+                            eversion: 1,
+                            refs: 1,
+                            vp_table_refs: 0,
+                            sealed_length: 1000,
+                            avali: 0x7,
+                            replicate_disks: vec![10, 30, 50],
+                            parity_disks: vec![],
+                            ec_converted: false,
+                        },
+                    );
                 }
-                s.partitions.insert(part_id, MgrPartitionMeta {
+                s.partitions.insert(
                     part_id,
-                    log_stream: log_stream_id,
-                    row_stream: row_stream_id,
-                    meta_stream: meta_stream_id,
-                    rg: Some(MgrRange {
-                        start_key: b"a".to_vec(),
-                        end_key: b"z".to_vec(),
-                    }),
-                });
+                    MgrPartitionMeta {
+                        part_id,
+                        log_stream: log_stream_id,
+                        row_stream: row_stream_id,
+                        meta_stream: meta_stream_id,
+                        rg: Some(MgrRange {
+                            start_key: b"a".to_vec(),
+                            end_key: b"z".to_vec(),
+                        }),
+                    },
+                );
             }
 
             // Simulate recovery in flight on the log_stream's extent.
-            m._test_mark_recovery_inflight(log_extent, MgrRecoveryTask {
-                extent_id: log_extent,
-                replace_id: 0,
-                node_id: 2,
-                start_time: 0,
-            });
+            m._test_mark_recovery_inflight(
+                log_extent,
+                MgrRecoveryTask {
+                    extent_id: log_extent,
+                    replace_id: 0,
+                    node_id: 2,
+                    start_time: 0,
+                },
+            );
             let eversion_before = m.store.inner.borrow().extents[&log_extent].eversion;
 
             let req = rkyv_encode(&MultiModifySplitReq {
@@ -5193,7 +5370,10 @@ mod tests {
             let resp = m.handle_multi_modify_split(req).await.unwrap();
             let r: CodeResp = rkyv_decode(&resp).unwrap();
 
-            assert_ne!(r.code, CODE_OK, "F146: split must be rejected when source extent is mid-recovery");
+            assert_ne!(
+                r.code, CODE_OK,
+                "F146: split must be rejected when source extent is mid-recovery"
+            );
             assert!(
                 r.message.contains("recovery in flight"),
                 "error must mention recovery in flight: {}",
@@ -5246,26 +5426,32 @@ mod tests {
             // with eversion=3 into the store.
             {
                 let mut s = m.store.inner.borrow_mut();
-                s.streams.insert(stream_id, MgrStreamInfo {
+                s.streams.insert(
                     stream_id,
-                    extent_ids: vec![extent_id],
-                    ec_data_shard: 0,
-                    ec_parity_shard: 0,
-                    replicates: 0,
-                });
-                s.extents.insert(extent_id, MgrExtentInfo {
+                    MgrStreamInfo {
+                        stream_id,
+                        extent_ids: vec![extent_id],
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                        replicates: 0,
+                    },
+                );
+                s.extents.insert(
                     extent_id,
-                    replicates: vec![],
-                    parity: vec![],
-                    eversion: 3,
-                    refs: 1,
-                    vp_table_refs: 0,
-                    sealed_length: 100,
-                    avali: 1,
-                    replicate_disks: vec![],
-                    parity_disks: vec![],
-                    ec_converted: false,
-                });
+                    MgrExtentInfo {
+                        extent_id,
+                        replicates: vec![],
+                        parity: vec![],
+                        eversion: 3,
+                        refs: 1,
+                        vp_table_refs: 0,
+                        sealed_length: 100,
+                        avali: 1,
+                        replicate_disks: vec![],
+                        parity_disks: vec![],
+                        ec_converted: false,
+                    },
+                );
             }
 
             // Simulate a concurrent mutator (e.g. apply_recovery_done) bumping
@@ -5273,7 +5459,13 @@ mod tests {
             // no-op, so the verify-at-apply block inside the handler sees the
             // already-bumped eversion — exactly as if the bump happened during
             // the real etcd await window.
-            m.store.inner.borrow_mut().extents.get_mut(&extent_id).unwrap().eversion = 4;
+            m.store
+                .inner
+                .borrow_mut()
+                .extents
+                .get_mut(&extent_id)
+                .unwrap()
+                .eversion = 4;
 
             // Build a SyncPartitionVpRefsReq that references extent_id.
             // The handler will compute partition_vp_ref_deltas and see extent_id
@@ -5305,15 +5497,24 @@ mod tests {
             // CODE_PRECONDITION mentioning "in-flight recovery".
             //
             // Reset to eversion=3 for the refuse-at-start path test.
-            m.store.inner.borrow_mut().extents.get_mut(&extent_id).unwrap().eversion = 3;
+            m.store
+                .inner
+                .borrow_mut()
+                .extents
+                .get_mut(&extent_id)
+                .unwrap()
+                .eversion = 3;
 
             // Inject a recovery task on the extent so the refuse-at-start guard fires.
-            m._test_mark_recovery_inflight(extent_id, MgrRecoveryTask {
+            m._test_mark_recovery_inflight(
                 extent_id,
-                replace_id: 0,
-                node_id: 1,
-                start_time: 0,
-            });
+                MgrRecoveryTask {
+                    extent_id,
+                    replace_id: 0,
+                    node_id: 1,
+                    start_time: 0,
+                },
+            );
 
             // Build request: refs delta adds 1 reference on extent_id.
             let req = rkyv_encode(&SyncPartitionVpRefsReq {
@@ -5489,15 +5690,9 @@ mod tests {
 
             // EC convert with K=3, M=1; coordinator picked node 7 / disk 70
             // as the new parity holder.
-            m.apply_ec_conversion_done(
-                extent_id,
-                vec![1, 3, 5, 7],
-                vec![70],
-                3,
-                4,
-            )
-            .await
-            .expect("apply_ec_conversion_done");
+            m.apply_ec_conversion_done(extent_id, vec![1, 3, 5, 7], vec![70], 3, 4)
+                .await
+                .expect("apply_ec_conversion_done");
 
             let s = m.store.inner.borrow();
             let ex = s.extents.get(&extent_id).expect("extent present");

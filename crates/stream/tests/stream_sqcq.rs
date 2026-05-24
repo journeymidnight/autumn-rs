@@ -116,8 +116,7 @@ async fn setup_stream_3rep(mgr_addr: SocketAddr, n_addrs: [SocketAddr; 3]) -> u6
             )
             .await
             .expect("register node");
-        let _: RegisterNodeResp =
-            rkyv_decode(&resp).expect("decode RegisterNodeResp");
+        let _: RegisterNodeResp = rkyv_decode(&resp).expect("decode RegisterNodeResp");
     }
     let resp = mgr
         .call(
@@ -181,60 +180,59 @@ async fn setup_stream(mgr_addr: SocketAddr, n_addr: SocketAddr) -> u64 {
 fn concurrent_append_preserves_order_within_stream() {
     let (mgr_addr, n_addr) = spawn_stack();
 
-    compio::runtime::Runtime::new().unwrap().block_on(async move {
-        let stream_id = setup_stream(mgr_addr, n_addr).await;
-        let pool = Rc::new(ConnPool::new());
-        let client = StreamClient::connect(
-            &mgr_addr.to_string(),
-            "owner/sqcq/order".to_string(),
-            256 * 1024 * 1024,
-            pool,
-        )
-        .await
-        .expect("stream client");
-
-        const N: usize = 10;
-        const PAYLOAD: usize = 256;
-
-        let handles: Vec<_> = (0..N)
-            .map(|i| {
-                let client = client.clone();
-                let payload = vec![b'a' + (i as u8 % 26); PAYLOAD];
-                compio::runtime::spawn(async move {
-                    client
-                        .append(stream_id, &payload)
-                        .await
-                        .expect("append")
-                })
-            })
-            .collect();
-
-        let mut results: Vec<_> = Vec::with_capacity(N);
-        for h in handles {
-            results.push(h.await.expect("spawn task panicked"));
-        }
-
-        // Sort by offset — the assignment order is race-determined, but the
-        // union of all ranges must cover exactly [0, N * PAYLOAD).
-        results.sort_by_key(|r| r.offset);
-        assert_eq!(results[0].offset, 0, "first offset must be 0");
-        for w in results.windows(2) {
-            assert_eq!(
-                w[0].end, w[1].offset,
-                "offsets must be contiguous — gap between {} and {}",
-                w[0].end, w[1].offset
-            );
-        }
-        let last = results.last().unwrap();
-        let total = (N * PAYLOAD) as u32;
-        assert_eq!(last.end, total, "total bytes leased");
-
-        let cl = client
-            .commit_length(stream_id)
+    compio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async move {
+            let stream_id = setup_stream(mgr_addr, n_addr).await;
+            let pool = Rc::new(ConnPool::new());
+            let client = StreamClient::connect(
+                &mgr_addr.to_string(),
+                "owner/sqcq/order".to_string(),
+                256 * 1024 * 1024,
+                pool,
+            )
             .await
-            .expect("commit length");
-        assert_eq!(cl, total, "replica commit == total leased");
-    });
+            .expect("stream client");
+
+            const N: usize = 10;
+            const PAYLOAD: usize = 256;
+
+            let handles: Vec<_> = (0..N)
+                .map(|i| {
+                    let client = client.clone();
+                    let payload = vec![b'a' + (i as u8 % 26); PAYLOAD];
+                    compio::runtime::spawn(async move {
+                        client.append(stream_id, &payload).await.expect("append")
+                    })
+                })
+                .collect();
+
+            let mut results: Vec<_> = Vec::with_capacity(N);
+            for h in handles {
+                results.push(h.await.expect("spawn task panicked"));
+            }
+
+            // Sort by offset — the assignment order is race-determined, but the
+            // union of all ranges must cover exactly [0, N * PAYLOAD).
+            results.sort_by_key(|r| r.offset);
+            assert_eq!(results[0].offset, 0, "first offset must be 0");
+            for w in results.windows(2) {
+                assert_eq!(
+                    w[0].end, w[1].offset,
+                    "offsets must be contiguous — gap between {} and {}",
+                    w[0].end, w[1].offset
+                );
+            }
+            let last = results.last().unwrap();
+            let total = (N * PAYLOAD) as u32;
+            assert_eq!(last.end, total, "total bytes leased");
+
+            let cl = client
+                .commit_length(stream_id)
+                .await
+                .expect("commit length");
+            assert_eq!(cl, total, "replica commit == total leased");
+        });
 }
 
 /// Test 2: Back-pressure cap caps the worker's FuturesUnordered depth.
@@ -264,48 +262,47 @@ fn worker_handles_back_pressure() {
 
     let (mgr_addr, n_addr) = spawn_stack();
 
-    compio::runtime::Runtime::new().unwrap().block_on(async move {
-        let stream_id = setup_stream(mgr_addr, n_addr).await;
-        let pool = Rc::new(ConnPool::new());
-        let client = StreamClient::connect(
-            &mgr_addr.to_string(),
-            "owner/sqcq/backpressure".to_string(),
-            256 * 1024 * 1024,
-            pool,
-        )
-        .await
-        .expect("stream client");
-
-        const N: usize = 100;
-        const PAYLOAD: usize = 64;
-
-        let handles: Vec<_> = (0..N)
-            .map(|_| {
-                let client = client.clone();
-                let payload = vec![b'z'; PAYLOAD];
-                compio::runtime::spawn(async move {
-                    client
-                        .append(stream_id, &payload)
-                        .await
-                        .expect("append")
-                })
-            })
-            .collect();
-
-        let mut seen: u32 = 0;
-        for h in handles {
-            let r = h.await.expect("spawn task panicked");
-            seen += 1;
-            assert!(r.end > r.offset);
-        }
-        assert_eq!(seen as usize, N);
-
-        let cl = client
-            .commit_length(stream_id)
+    compio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async move {
+            let stream_id = setup_stream(mgr_addr, n_addr).await;
+            let pool = Rc::new(ConnPool::new());
+            let client = StreamClient::connect(
+                &mgr_addr.to_string(),
+                "owner/sqcq/backpressure".to_string(),
+                256 * 1024 * 1024,
+                pool,
+            )
             .await
-            .expect("commit length");
-        assert_eq!(cl, (N * PAYLOAD) as u32);
-    });
+            .expect("stream client");
+
+            const N: usize = 100;
+            const PAYLOAD: usize = 64;
+
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    let client = client.clone();
+                    let payload = vec![b'z'; PAYLOAD];
+                    compio::runtime::spawn(async move {
+                        client.append(stream_id, &payload).await.expect("append")
+                    })
+                })
+                .collect();
+
+            let mut seen: u32 = 0;
+            for h in handles {
+                let r = h.await.expect("spawn task panicked");
+                seen += 1;
+                assert!(r.end > r.offset);
+            }
+            assert_eq!(seen as usize, N);
+
+            let cl = client
+                .commit_length(stream_id)
+                .await
+                .expect("commit length");
+            assert_eq!(cl, (N * PAYLOAD) as u32);
+        });
 }
 
 /// Test 3: CQ advances commit on out-of-order completion.
@@ -324,44 +321,46 @@ fn worker_handles_back_pressure() {
 fn cq_advances_commit_on_out_of_order_completion() {
     let (mgr_addr, n_addr) = spawn_stack();
 
-    compio::runtime::Runtime::new().unwrap().block_on(async move {
-        let stream_id = setup_stream(mgr_addr, n_addr).await;
-        let pool = Rc::new(ConnPool::new());
-        let client = StreamClient::connect(
-            &mgr_addr.to_string(),
-            "owner/sqcq/ooo".to_string(),
-            256 * 1024 * 1024,
-            pool,
-        )
-        .await
-        .expect("stream client");
-
-        // 30 concurrent small appends — the worker will lease them all in
-        // stream-order (serialised inside the actor), but their 3-replica
-        // joins complete in whatever order the replicas return.  With only
-        // 1 replica here completion order matches submission order, but
-        // the BTreeMap code path still runs and must produce contiguous
-        // advance.
-        const N: usize = 30;
-        const PAYLOAD: usize = 100;
-        let futs: Vec<_> = (0..N)
-            .map(|_| {
-                let client = client.clone();
-                let payload = vec![b'q'; PAYLOAD];
-                async move { client.append(stream_id, &payload).await }
-            })
-            .collect();
-        let results = join_all(futs).await;
-        for r in &results {
-            let _ = r.as_ref().expect("append");
-        }
-        let total = (N * PAYLOAD) as u32;
-        let cl = client
-            .commit_length(stream_id)
+    compio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async move {
+            let stream_id = setup_stream(mgr_addr, n_addr).await;
+            let pool = Rc::new(ConnPool::new());
+            let client = StreamClient::connect(
+                &mgr_addr.to_string(),
+                "owner/sqcq/ooo".to_string(),
+                256 * 1024 * 1024,
+                pool,
+            )
             .await
-            .expect("commit length");
-        assert_eq!(cl, total, "commit advanced through entire prefix");
-    });
+            .expect("stream client");
+
+            // 30 concurrent small appends — the worker will lease them all in
+            // stream-order (serialised inside the actor), but their 3-replica
+            // joins complete in whatever order the replicas return.  With only
+            // 1 replica here completion order matches submission order, but
+            // the BTreeMap code path still runs and must produce contiguous
+            // advance.
+            const N: usize = 30;
+            const PAYLOAD: usize = 100;
+            let futs: Vec<_> = (0..N)
+                .map(|_| {
+                    let client = client.clone();
+                    let payload = vec![b'q'; PAYLOAD];
+                    async move { client.append(stream_id, &payload).await }
+                })
+                .collect();
+            let results = join_all(futs).await;
+            for r in &results {
+                let _ = r.as_ref().expect("append");
+            }
+            let total = (N * PAYLOAD) as u32;
+            let cl = client
+                .commit_length(stream_id)
+                .await
+                .expect("commit length");
+            assert_eq!(cl, total, "commit advanced through entire prefix");
+        });
 }
 
 /// Test 4: SQ continues submitting while CQ drains.
@@ -468,84 +467,86 @@ fn sq_continues_submitting_while_cq_drains() {
 fn parallel_fanout_fires_3_replicas_concurrently() {
     let (mgr_addr, n_addrs) = spawn_stack_3rep();
 
-    compio::runtime::Runtime::new().unwrap().block_on(async move {
-        let stream_id = setup_stream_3rep(mgr_addr, n_addrs).await;
-        let pool = Rc::new(ConnPool::new());
-        let client = StreamClient::connect(
-            &mgr_addr.to_string(),
-            "owner/sqcq/fanout".to_string(),
-            256 * 1024 * 1024,
-            pool,
-        )
-        .await
-        .expect("stream client");
-
-        const N: usize = 32;
-        const PAYLOAD: usize = 256;
-
-        // Fire N appends concurrently — each goes through launch_append's
-        // new parallel 3-replica send_vectored fanout.
-        let handles: Vec<_> = (0..N)
-            .map(|i| {
-                let client = client.clone();
-                let payload = vec![b'a' + (i as u8 % 26); PAYLOAD];
-                compio::runtime::spawn(async move {
-                    client
-                        .append(stream_id, &payload)
-                        .await
-                        .expect("append")
-                })
-            })
-            .collect();
-
-        let mut results: Vec<_> = Vec::with_capacity(N);
-        for h in handles {
-            results.push(h.await.expect("spawn task panicked"));
-        }
-
-        // All N leased ranges must tile [0, N*PAYLOAD) exactly once —
-        // the same invariant Test 1 checks, but with 3 replicas so the
-        // parallel-fanout fast path is exercised.
-        results.sort_by_key(|r| r.offset);
-        let total = (N * PAYLOAD) as u32;
-        assert_eq!(results[0].offset, 0, "first offset must be 0");
-        for w in results.windows(2) {
-            assert_eq!(
-                w[0].end, w[1].offset,
-                "contiguous ranges (gap between {} and {})",
-                w[0].end, w[1].offset
-            );
-        }
-        assert_eq!(results.last().unwrap().end, total, "total bytes leased");
-
-        // StreamClient::commit_length returns min over all replicas. If
-        // parallel fanout somehow delivered inconsistent data to the 3
-        // replicas (e.g. payload_parts misclone bug), one replica would
-        // lag and the min would be < total.
-        let cl = client
-            .commit_length(stream_id)
+    compio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async move {
+            let stream_id = setup_stream_3rep(mgr_addr, n_addrs).await;
+            let pool = Rc::new(ConnPool::new());
+            let client = StreamClient::connect(
+                &mgr_addr.to_string(),
+                "owner/sqcq/fanout".to_string(),
+                256 * 1024 * 1024,
+                pool,
+            )
             .await
-            .expect("commit length");
-        assert_eq!(
-            cl, total,
-            "min-replica commit_length must match total leased — all 3 replicas converged"
-        );
+            .expect("stream client");
 
-        // Concurrent-vs-sequential speedup proxy: if parallel fanout
-        // regressed to sequential submits, the 3-replica path adds
-        // ~3 × submit-channel hops per append. This is typically
-        // sub-µs on loopback so we can't reliably measure it, but the
-        // test still asserts liveness of 32 concurrent ops against 3
-        // replicas — the above commit_length match is the primary
-        // correctness proof.
-        let t = Instant::now();
-        for _ in 0..64 {
-            client
-                .append(stream_id, &vec![b'p'; PAYLOAD])
+            const N: usize = 32;
+            const PAYLOAD: usize = 256;
+
+            // Fire N appends concurrently — each goes through launch_append's
+            // new parallel 3-replica send_vectored fanout.
+            let handles: Vec<_> = (0..N)
+                .map(|i| {
+                    let client = client.clone();
+                    let payload = vec![b'a' + (i as u8 % 26); PAYLOAD];
+                    compio::runtime::spawn(async move {
+                        client.append(stream_id, &payload).await.expect("append")
+                    })
+                })
+                .collect();
+
+            let mut results: Vec<_> = Vec::with_capacity(N);
+            for h in handles {
+                results.push(h.await.expect("spawn task panicked"));
+            }
+
+            // All N leased ranges must tile [0, N*PAYLOAD) exactly once —
+            // the same invariant Test 1 checks, but with 3 replicas so the
+            // parallel-fanout fast path is exercised.
+            results.sort_by_key(|r| r.offset);
+            let total = (N * PAYLOAD) as u32;
+            assert_eq!(results[0].offset, 0, "first offset must be 0");
+            for w in results.windows(2) {
+                assert_eq!(
+                    w[0].end, w[1].offset,
+                    "contiguous ranges (gap between {} and {})",
+                    w[0].end, w[1].offset
+                );
+            }
+            assert_eq!(results.last().unwrap().end, total, "total bytes leased");
+
+            // StreamClient::commit_length returns min over all replicas. If
+            // parallel fanout somehow delivered inconsistent data to the 3
+            // replicas (e.g. payload_parts misclone bug), one replica would
+            // lag and the min would be < total.
+            let cl = client
+                .commit_length(stream_id)
                 .await
-                .expect("post append");
-        }
-        let elapsed = t.elapsed();
-        println!("F099-B: 64 sequential appends on 3-rep stream: {:?}", elapsed);
-    });
+                .expect("commit length");
+            assert_eq!(
+                cl, total,
+                "min-replica commit_length must match total leased — all 3 replicas converged"
+            );
+
+            // Concurrent-vs-sequential speedup proxy: if parallel fanout
+            // regressed to sequential submits, the 3-replica path adds
+            // ~3 × submit-channel hops per append. This is typically
+            // sub-µs on loopback so we can't reliably measure it, but the
+            // test still asserts liveness of 32 concurrent ops against 3
+            // replicas — the above commit_length match is the primary
+            // correctness proof.
+            let t = Instant::now();
+            for _ in 0..64 {
+                client
+                    .append(stream_id, &vec![b'p'; PAYLOAD])
+                    .await
+                    .expect("post append");
+            }
+            let elapsed = t.elapsed();
+            println!(
+                "F099-B: 64 sequential appends on 3-rep stream: {:?}",
+                elapsed
+            );
+        });
 }

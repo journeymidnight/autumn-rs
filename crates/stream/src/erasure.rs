@@ -22,11 +22,7 @@ pub fn shard_size(payload_len: usize, data_shards: usize) -> usize {
 ///   - Parity shards are computed by the Reed-Solomon encoder.
 ///
 /// All returned shards have length `shard_size(payload.len(), data_shards)`.
-pub fn ec_encode(
-    payload: &[u8],
-    data_shards: usize,
-    parity_shards: usize,
-) -> Result<Vec<Vec<u8>>> {
+pub fn ec_encode(payload: &[u8], data_shards: usize, parity_shards: usize) -> Result<Vec<Vec<u8>>> {
     if data_shards == 0 {
         return Err(anyhow!("data_shards must be > 0"));
     }
@@ -47,9 +43,7 @@ pub fn ec_encode(
     );
 
     // Allocate all shards zero-filled.
-    let mut shards: Vec<Vec<u8>> = (0..total_shards)
-        .map(|_| vec![0u8; per_shard])
-        .collect();
+    let mut shards: Vec<Vec<u8>> = (0..total_shards).map(|_| vec![0u8; per_shard]).collect();
 
     // Copy payload across data shards.
     let mut remaining = size;
@@ -114,7 +108,9 @@ pub fn ec_decode(
         .as_ref()
         .ok_or_else(|| anyhow!("last data shard still missing after reconstruct"))?;
     if last_data.len() < 4 {
-        return Err(anyhow!("last data shard too short to contain length trailer"));
+        return Err(anyhow!(
+            "last data shard too short to contain length trailer"
+        ));
     }
     let trailer_pos = per_shard - 4;
     let original_size =
@@ -192,8 +188,12 @@ mod tests {
         for s in &shards {
             assert_eq!(s.len(), shard_len);
         }
-        let decoded =
-            ec_decode(shards.into_iter().map(Some).collect(), data_shards, parity_shards).unwrap();
+        let decoded = ec_decode(
+            shards.into_iter().map(Some).collect(),
+            data_shards,
+            parity_shards,
+        )
+        .unwrap();
         assert_eq!(decoded, payload);
     }
 
@@ -315,14 +315,20 @@ mod tests {
         let per_shard = shards[0].len();
 
         // shard[0] should contain payload[0..per_shard] (minus trailer area)
-        assert_eq!(&shards[0][..per_shard.min(payload.len())], &payload[..per_shard.min(payload.len())]);
+        assert_eq!(
+            &shards[0][..per_shard.min(payload.len())],
+            &payload[..per_shard.min(payload.len())]
+        );
 
         // Reading a sub-range from shard[0] gives the original payload bytes
         assert_eq!(&shards[0][100..200], &payload[100..200]);
 
         // shard[1] starts at payload[per_shard..]
         let remaining = payload.len() - per_shard;
-        assert_eq!(&shards[1][..remaining], &payload[per_shard..per_shard + remaining]);
+        assert_eq!(
+            &shards[1][..remaining],
+            &payload[per_shard..per_shard + remaining]
+        );
     }
 
     /// Verify that partial shards cannot be decoded — this is the bug that
@@ -334,10 +340,8 @@ mod tests {
         let per_shard = shards[0].len();
 
         // Take a sub-range from each shard (simulating the old buggy behavior)
-        let partial: Vec<Option<Vec<u8>>> = shards
-            .iter()
-            .map(|s| Some(s[100..200].to_vec()))
-            .collect();
+        let partial: Vec<Option<Vec<u8>>> =
+            shards.iter().map(|s| Some(s[100..200].to_vec())).collect();
 
         // This should fail because partial shards have wrong length for RS decode
         let result = ec_decode(partial, 2, 1);
@@ -345,8 +349,11 @@ mod tests {
         // Either way, the output won't match the expected payload sub-range.
         if let Ok(decoded) = result {
             // If it somehow decodes, the result is garbage — not payload[100..200]
-            assert_ne!(decoded, payload[100..200].to_vec(),
-                "partial shard decode should NOT return correct payload sub-range");
+            assert_ne!(
+                decoded,
+                payload[100..200].to_vec(),
+                "partial shard decode should NOT return correct payload sub-range"
+            );
         }
         // If it errors, that's also correct — partial shards can't be decoded.
     }

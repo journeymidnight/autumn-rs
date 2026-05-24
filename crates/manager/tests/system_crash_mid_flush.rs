@@ -35,10 +35,12 @@ fn crash_during_flush_unflushed_data_recoverable() {
         // Write 50 keys (enough to potentially trigger rotation)
         for i in 0u32..50 {
             ps_put(
-                &ps1, 901,
+                &ps1,
+                901,
                 format!("key-{i:03}").as_bytes(),
-                format!("val-{i}").as_bytes()
-            ).await;
+                format!("val-{i}").as_bytes(),
+            )
+            .await;
         }
 
         // Immediately crash — do not wait for flush
@@ -90,20 +92,24 @@ fn crash_mid_flush_no_orphan_corruption() {
         // Write 30 keys and flush (completes fully)
         for i in 0u32..30 {
             ps_put(
-                &ps1, 902,
+                &ps1,
+                902,
                 format!("batch1-{i:03}").as_bytes(),
-                format!("val1-{i}").as_bytes()
-            ).await;
+                format!("val1-{i}").as_bytes(),
+            )
+            .await;
         }
         ps_flush(&ps1, 902).await;
 
         // Write 30 more keys, trigger flush, then crash quickly
         for i in 0u32..30 {
             ps_put(
-                &ps1, 902,
+                &ps1,
+                902,
                 format!("batch2-{i:03}").as_bytes(),
-                format!("val2-{i}").as_bytes()
-            ).await;
+                format!("val2-{i}").as_bytes(),
+            )
+            .await;
         }
         // Trigger flush and race with crash
         ps_flush(&ps1, 902).await;
@@ -120,12 +126,20 @@ fn crash_mid_flush_no_orphan_corruption() {
         for i in 0u32..30 {
             let key = format!("batch1-{i:03}");
             let resp = ps_get(&ps2, 902, key.as_bytes()).await;
-            assert_eq!(resp.value, format!("val1-{i}").as_bytes(), "{key} (batch1) missing");
+            assert_eq!(
+                resp.value,
+                format!("val1-{i}").as_bytes(),
+                "{key} (batch1) missing"
+            );
         }
         for i in 0u32..30 {
             let key = format!("batch2-{i:03}");
             let resp = ps_get(&ps2, 902, key.as_bytes()).await;
-            assert_eq!(resp.value, format!("val2-{i}").as_bytes(), "{key} (batch2) missing");
+            assert_eq!(
+                resp.value,
+                format!("val2-{i}").as_bytes(),
+                "{key} (batch2) missing"
+            );
         }
 
         // Compaction must not choke on any orphan row_stream data
@@ -136,12 +150,20 @@ fn crash_mid_flush_no_orphan_corruption() {
         for i in 0u32..30 {
             let key = format!("batch1-{i:03}");
             let resp = ps_get(&ps2, 902, key.as_bytes()).await;
-            assert_eq!(resp.value, format!("val1-{i}").as_bytes(), "{key} wrong after compact");
+            assert_eq!(
+                resp.value,
+                format!("val1-{i}").as_bytes(),
+                "{key} wrong after compact"
+            );
         }
         for i in 0u32..30 {
             let key = format!("batch2-{i:03}");
             let resp = ps_get(&ps2, 902, key.as_bytes()).await;
-            assert_eq!(resp.value, format!("val2-{i}").as_bytes(), "{key} wrong after compact");
+            assert_eq!(
+                resp.value,
+                format!("val2-{i}").as_bytes(),
+                "{key} wrong after compact"
+            );
         }
     });
 }

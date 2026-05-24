@@ -166,9 +166,7 @@ fn single_split_compact_preserves_gallery_originals_on_right_child() {
         let large_value = vec![b'V'; 8 * 1024];
         let thumb_value = vec![b'T'; 256];
         for i in 1..=301u16 {
-            let original = format!(
-                "Patreon--leeesovely-October-2024-MissKON.com-{i:03}.jpg"
-            );
+            let original = format!("Patreon--leeesovely-October-2024-MissKON.com-{i:03}.jpg");
             let thumb = format!(".thumb/320/{original}");
             ps_put(&ps, 902, thumb.as_bytes(), &thumb_value).await;
             if i == 3 || i >= 276 {
@@ -247,9 +245,7 @@ fn two_split_compact_preserves_gallery_originals_on_rightmost_descendant() {
         let large_value = vec![b'V'; 8 * 1024];
         let thumb_value = vec![b'T'; 256];
         for i in 1..=301u16 {
-            let original = format!(
-                "Patreon--leeesovely-October-2024-MissKON.com-{i:03}.jpg"
-            );
+            let original = format!("Patreon--leeesovely-October-2024-MissKON.com-{i:03}.jpg");
             let thumb = format!(".thumb/320/{original}");
             ps_put(&ps, 903, thumb.as_bytes(), &thumb_value).await;
             if i == 3 || i >= 276 {
@@ -267,7 +263,8 @@ fn two_split_compact_preserves_gallery_originals_on_rightmost_descendant() {
             } else {
                 router.client_for(current).await
             };
-            let split_req = partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: current });
+            let split_req =
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: current });
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
             let resp = loop {
                 match client

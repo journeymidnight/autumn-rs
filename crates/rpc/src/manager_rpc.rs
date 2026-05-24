@@ -966,9 +966,9 @@ pub const POLICY_KIND_EC: u8 = 6;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct PolicyCandidate {
-    pub kind: u8,                    // POLICY_KIND_SPLIT or POLICY_KIND_MERGE
-    pub primary_part_id: u64,        // split: target; merge: survivor
-    pub secondary_part_id: u64,      // split: 0; merge: victim
+    pub kind: u8,               // POLICY_KIND_SPLIT or POLICY_KIND_MERGE
+    pub primary_part_id: u64,   // split: target; merge: survivor
+    pub secondary_part_id: u64, // split: 0; merge: victim
     pub reason: String,
     pub size_bytes: u64,
     pub req_per_sec: u32,
@@ -1013,9 +1013,15 @@ pub fn policy_kind_names() -> Vec<(String, u8)> {
         ("POLICY_KIND_SPLIT".to_string(), POLICY_KIND_SPLIT),
         ("POLICY_KIND_MERGE".to_string(), POLICY_KIND_MERGE),
         ("POLICY_KIND_GC".to_string(), POLICY_KIND_GC),
-        ("POLICY_KIND_MAJOR_COMPACT".to_string(), POLICY_KIND_MAJOR_COMPACT),
+        (
+            "POLICY_KIND_MAJOR_COMPACT".to_string(),
+            POLICY_KIND_MAJOR_COMPACT,
+        ),
         ("POLICY_KIND_HOT_COLD".to_string(), POLICY_KIND_HOT_COLD),
-        ("POLICY_KIND_MINOR_COMPACT".to_string(), POLICY_KIND_MINOR_COMPACT),
+        (
+            "POLICY_KIND_MINOR_COMPACT".to_string(),
+            POLICY_KIND_MINOR_COMPACT,
+        ),
         ("POLICY_KIND_EC".to_string(), POLICY_KIND_EC),
     ]
 }

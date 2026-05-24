@@ -144,8 +144,8 @@ fn parse_args() -> Args {
             }
             "--transport" => {
                 i += 1;
-                transport = autumn_transport::parse_transport_flag(&args[i])
-                    .unwrap_or_else(|bad| {
+                transport =
+                    autumn_transport::parse_transport_flag(&args[i]).unwrap_or_else(|bad| {
                         eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
                         std::process::exit(2);
                     });
@@ -170,9 +170,7 @@ fn parse_args() -> Args {
             "--conn-threads" => {
                 i += 1;
                 let _ = args[i].clone();
-                tracing::warn!(
-                    "--conn-threads is a no-op post F099-J; worker pool removed"
-                );
+                tracing::warn!("--conn-threads is a no-op post F099-J; worker pool removed");
             }
             // F195 PS tunables. Each flag mirrors the pre-F195 env var
             // of the same suffix (lowercased + kebab-cased).
@@ -190,8 +188,7 @@ fn parse_args() -> Args {
             }
             "--flush-inflight-cap" => {
                 i += 1;
-                ps_flush_inflight_cap =
-                    Some(args[i].parse().expect("--flush-inflight-cap usize"));
+                ps_flush_inflight_cap = Some(args[i].parse().expect("--flush-inflight-cap usize"));
             }
             "--max-imm-depth" => {
                 i += 1;
@@ -207,9 +204,8 @@ fn parse_args() -> Args {
             }
             "--major-compact-parallelism" => {
                 i += 1;
-                major_compact_parallelism = Some(
-                    args[i].parse().expect("--major-compact-parallelism usize"),
-                );
+                major_compact_parallelism =
+                    Some(args[i].parse().expect("--major-compact-parallelism usize"));
             }
             "--gc-parallelism" => {
                 i += 1;
@@ -252,7 +248,8 @@ fn parse_args() -> Args {
             }
             "--fg-saturated-threshold" => {
                 i += 1;
-                fg_saturated_threshold = Some(args[i].parse().expect("--fg-saturated-threshold f64"));
+                fg_saturated_threshold =
+                    Some(args[i].parse().expect("--fg-saturated-threshold f64"));
             }
             "--fg-qps-quota" => {
                 i += 1;
@@ -264,9 +261,8 @@ fn parse_args() -> Args {
             }
             "--compact-pending-high-bytes" => {
                 i += 1;
-                compact_pending_high_bytes = Some(
-                    args[i].parse().expect("--compact-pending-high-bytes u64"),
-                );
+                compact_pending_high_bytes =
+                    Some(args[i].parse().expect("--compact-pending-high-bytes u64"));
             }
             "--gc-cooldown-secs" => {
                 i += 1;
@@ -323,13 +319,21 @@ fn parse_args() -> Args {
                 eprintln!("  --advertise <ADDR>   Advertise host for cluster discovery");
                 eprintln!("                       (F099-K: the `host:port` base — port comes from --port)");
                 eprintln!("  --transport <MODE>   Transport backend: tcp (default) or ucx");
-                eprintln!("  --cpu-start <N>      First core to pin partition threads to [default: 0]");
+                eprintln!(
+                    "  --cpu-start <N>      First core to pin partition threads to [default: 0]"
+                );
                 eprintln!("                       Multi-process clusters on one host need disjoint values");
-                eprintln!("                       so PS partitions don't share cores with extent-nodes.");
-                eprintln!("                       (F196: prefer --cpuset for explicit pre-allocation.)");
+                eprintln!(
+                    "                       so PS partitions don't share cores with extent-nodes."
+                );
+                eprintln!(
+                    "                       (F196: prefer --cpuset for explicit pre-allocation.)"
+                );
                 eprintln!("  --cpuset <SPEC>      F196: explicit core list, taskset syntax");
                 eprintln!("                       (e.g. 4-11, 0,2,4, 0-3,8-11). Overrides the");
-                eprintln!("                       auto-detected core list and disables --cpu-start.");
+                eprintln!(
+                    "                       auto-detected core list and disables --cpu-start."
+                );
                 eprintln!("                       PS uses cpuset_len/2 as max partition budget.");
                 eprintln!("  --conn-threads <N>   [DEPRECATED, F099-J] accepted but ignored");
                 std::process::exit(0);
@@ -519,12 +523,8 @@ async fn main() -> Result<()> {
                             use std::io::Write;
                             for (frames, count) in &report.data {
                                 if frames.thread_name.starts_with(&prefix) {
-                                    writeln!(
-                                        txt,
-                                        "thread={} count={}",
-                                        frames.thread_name, count
-                                    )
-                                    .ok();
+                                    writeln!(txt, "thread={} count={}", frames.thread_name, count)
+                                        .ok();
                                 }
                             }
                         }
@@ -551,7 +551,10 @@ async fn main() -> Result<()> {
 
     #[cfg(unix)]
     unsafe {
-        let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 && rl.rlim_cur < 65535 {
             rl.rlim_cur = rl.rlim_max.min(65535);
             libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
@@ -570,7 +573,10 @@ async fn main() -> Result<()> {
             rlim_max: libc::RLIM_INFINITY,
         };
         if libc::setrlimit(libc::RLIMIT_MEMLOCK, &inf) != 0 {
-            let mut ml = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            let mut ml = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
             if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut ml) == 0 && ml.rlim_cur < ml.rlim_max {
                 ml.rlim_cur = ml.rlim_max;
                 libc::setrlimit(libc::RLIMIT_MEMLOCK, &ml);

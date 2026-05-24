@@ -68,11 +68,10 @@ fn parse_args() -> Args {
             }
             "--transport" => {
                 i += 1;
-                transport = autumn_transport::parse_transport_flag(&raw[i])
-                    .unwrap_or_else(|bad| {
-                        eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
-                        std::process::exit(2);
-                    });
+                transport = autumn_transport::parse_transport_flag(&raw[i]).unwrap_or_else(|bad| {
+                    eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
+                    std::process::exit(2);
+                });
             }
             // F203: --auto-split / --auto-merge removed. Mechanism /
             // policy separation puts dispatch decisions in an external
@@ -132,8 +131,7 @@ async fn main() -> Result<()> {
     let _ = autumn_transport::init_with(args.transport);
     let addr = autumn_transport::format_listen_addr(&args.bind_host, args.port)
         .context("parse listen address")?;
-    autumn_transport::check_listen_addr(addr, autumn_transport::current().kind())
-        .ok();
+    autumn_transport::check_listen_addr(addr, autumn_transport::current().kind()).ok();
 
     let manager = if args.etcd.is_empty() {
         tracing::warn!(
@@ -152,12 +150,9 @@ async fn main() -> Result<()> {
     // operators / controllers act on it.
     // F195: F192 quorum debounce config — applied if either flag was
     // set. The library defaults (60 s / 3) match pre-F195 env defaults.
-    if args.report_disk_failure_window_secs.is_some()
-        || args.report_disk_failure_quorum.is_some()
-    {
-        let window = std::time::Duration::from_secs(
-            args.report_disk_failure_window_secs.unwrap_or(60),
-        );
+    if args.report_disk_failure_window_secs.is_some() || args.report_disk_failure_quorum.is_some() {
+        let window =
+            std::time::Duration::from_secs(args.report_disk_failure_window_secs.unwrap_or(60));
         let quorum = args.report_disk_failure_quorum.unwrap_or(3);
         manager.set_report_disk_failure_config(window, quorum);
         tracing::info!(

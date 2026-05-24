@@ -4,16 +4,16 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
-use autumn_common::metrics::{duration_to_ns, ns_to_ms, unix_time_ms};
-use autumn_rpc::manager_rpc::{self, *};
-use crate::ConnPool;
 use crate::extent_rpc::{
     AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, ProbeExtentReq,
     ProbeExtentResp, ReadBytesReq, ReadBytesResp, StreamInfo, SyncedLengthReq, SyncedLengthResp,
     CODE_EVERSION_MISMATCH, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK, MSG_APPEND,
     MSG_COMMIT_LENGTH, MSG_PROBE_EXTENT, MSG_READ_BYTES, MSG_READ_BYTES_ZC, MSG_SYNCED_LENGTH,
 };
+use crate::ConnPool;
+use anyhow::{anyhow, Result};
+use autumn_common::metrics::{duration_to_ns, ns_to_ms, unix_time_ms};
+use autumn_rpc::manager_rpc::{self, *};
 
 /// Sentinel error attached to `anyhow::Error` when a `MSG_READ_BYTES`
 /// reply carries `CODE_EVERSION_MISMATCH`. Top-level
@@ -66,10 +66,7 @@ impl std::fmt::Display for StaleVpOffset {
         write!(
             f,
             "stale_vp_offset_past_sealed_length: extent={} offset={} length={} sealed_length={}",
-            self.extent_id,
-            self.requested_offset,
-            self.requested_length,
-            self.sealed_length,
+            self.extent_id, self.requested_offset, self.requested_length, self.sealed_length,
         )
     }
 }
@@ -518,10 +515,7 @@ impl Drop for WorkerRemovalGuard {
 /// manager address; failures are logged at trace and otherwise
 /// ignored — F190's per-stream alloc route-around remains the primary
 /// defense.
-async fn failure_report_drain_loop(
-    sc: Weak<StreamClient>,
-    mut rx: mpsc::Receiver<FailureReport>,
-) {
+async fn failure_report_drain_loop(sc: Weak<StreamClient>, mut rx: mpsc::Receiver<FailureReport>) {
     use futures::StreamExt;
     while let Some(report) = rx.next().await {
         let Some(sc) = sc.upgrade() else {
@@ -550,7 +544,12 @@ async fn failure_report_drain_loop(
         // doesn't keep this background task alive past a coarse SLO.
         if let Err(e) = sc
             .pool
-            .call_timeout(&addr, manager_rpc::MSG_REPORT_DISK_FAILURE, req, Duration::from_secs(5))
+            .call_timeout(
+                &addr,
+                manager_rpc::MSG_REPORT_DISK_FAILURE,
+                req,
+                Duration::from_secs(5),
+            )
             .await
         {
             tracing::trace!(
@@ -749,9 +748,8 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
                     None => success_first = Some(resp),
                     Some(first) => {
                         if resp.offset != first.offset || resp.end != first.end {
-                            err_msg = Some(format!(
-                                "replica {i} offset mismatch on extent {extent_id}"
-                            ));
+                            err_msg =
+                                Some(format!("replica {i} offset mismatch on extent {extent_id}"));
                             bad_replica_idx = Some(i);
                             break;
                         }
@@ -852,12 +850,7 @@ async fn launch_append(
     // F190: node_ids parallel to replica_addrs, captured here so the
     // future moves a Vec<u64> rather than borrowing tail across await.
     let replica_node_ids: Vec<u64> = tail.replica_node_ids.clone();
-    let hdr = AppendReq::encode_header(
-        extent_id,
-        tail.extent.eversion,
-        header_commit,
-        revision,
-    );
+    let hdr = AppendReq::encode_header(extent_id, tail.extent.eversion, header_commit, revision);
 
     // Fire send_vectored to each replica IN PARALLEL (F099-B). Each
     // RpcClient's writer_task is single-writer (R4 step 4.1), so per-
@@ -911,11 +904,9 @@ async fn launch_append(
                         futures::future::Either::Left((Err(_), _)) => {
                             Err(anyhow!("{} connection closed", addr))
                         }
-                        futures::future::Either::Right(_) => Err(anyhow!(
-                            "{} append timeout after {:?}",
-                            addr,
-                            timeout
-                        )),
+                        futures::future::Either::Right(_) => {
+                            Err(anyhow!("{} append timeout after {:?}", addr, timeout))
+                        }
                     }
                 }
             }
@@ -1033,7 +1024,9 @@ impl StreamClient {
                 Err(e) => {
                     attempt += 1;
                     if attempt > max_retries {
-                        return Err(e.context(format!("{label} failed after {max_retries} retries")));
+                        return Err(
+                            e.context(format!("{label} failed after {max_retries} retries"))
+                        );
                     }
                     self.rotate_manager();
                     tracing::warn!(
@@ -1094,7 +1087,12 @@ impl StreamClient {
             // doesn't trap a fresh PS startup; the loop walks to the
             // next manager address on timeout.
             match pool
-                .call_timeout(addr, MSG_ACQUIRE_OWNER_LOCK, req.clone(), Duration::from_secs(10))
+                .call_timeout(
+                    addr,
+                    MSG_ACQUIRE_OWNER_LOCK,
+                    req.clone(),
+                    Duration::from_secs(10),
+                )
                 .await
             {
                 Ok(resp_data) => {
@@ -1195,8 +1193,7 @@ impl StreamClient {
         // F192: bounded channel — drop reports on overflow rather than
         // OOMing the writer. F190's per-stream alloc route-around is
         // the primary defense; reports are pure advisory.
-        let (failure_report_tx, failure_report_rx) =
-            mpsc::channel::<FailureReport>(1024);
+        let (failure_report_tx, failure_report_rx) = mpsc::channel::<FailureReport>(1024);
         let rc = Rc::new_cyclic(|weak| Self {
             self_weak: weak.clone(),
             manager_addrs,
@@ -1218,8 +1215,7 @@ impl StreamClient {
         // F192: spawn the drainer task on the current compio runtime.
         // The Weak<Self> exits the loop when StreamClient is dropped.
         let weak = Rc::downgrade(&rc);
-        compio::runtime::spawn(failure_report_drain_loop(weak, failure_report_rx))
-            .detach();
+        compio::runtime::spawn(failure_report_drain_loop(weak, failure_report_rx)).detach();
         rc
     }
 
@@ -1252,7 +1248,12 @@ impl StreamClient {
         // 5 s — read-only manager call, all in-memory state.
         let resp_data = self
             .pool
-            .call_timeout(self.manager_addr(), MSG_NODES_INFO, Bytes::new(), Duration::from_secs(5))
+            .call_timeout(
+                self.manager_addr(),
+                MSG_NODES_INFO,
+                Bytes::new(),
+                Duration::from_secs(5),
+            )
             .await?;
         let resp: NodesInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -1260,7 +1261,8 @@ impl StreamClient {
             return Err(anyhow!("nodes_info failed: {}", resp.message));
         }
         for (id, node) in resp.nodes {
-            self.nodes_cache.insert(id, (node.address, node.shard_ports));
+            self.nodes_cache
+                .insert(id, (node.address, node.shard_ports));
         }
         Ok(())
     }
@@ -1395,7 +1397,12 @@ impl StreamClient {
         // 5 s — read-only manager call, in-memory state.
         let resp_data = self
             .pool
-            .call_timeout(self.manager_addr(), MSG_STREAM_INFO, req, Duration::from_secs(5))
+            .call_timeout(
+                self.manager_addr(),
+                MSG_STREAM_INFO,
+                req,
+                Duration::from_secs(5),
+            )
             .await?;
         let resp: StreamInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -1420,7 +1427,8 @@ impl StreamClient {
             .ok_or_else(|| anyhow!("tail extent {} not in response", tail_eid))?;
 
         let extent = Self::mgr_to_extent_info(&mgr_extent);
-        self.extent_info_cache.insert(extent.extent_id, extent.clone());
+        self.extent_info_cache
+            .insert(extent.extent_id, extent.clone());
 
         self.refresh_nodes_map().await?;
         let addrs = self.replica_addrs_from_cache(&extent)?;
@@ -1454,7 +1462,12 @@ impl StreamClient {
         // call is itself bounded but the aggregate can take a few s.
         let resp_data = self
             .pool
-            .call_timeout(self.manager_addr(), MSG_CHECK_COMMIT_LENGTH, req, Duration::from_secs(15))
+            .call_timeout(
+                self.manager_addr(),
+                MSG_CHECK_COMMIT_LENGTH,
+                req,
+                Duration::from_secs(15),
+            )
             .await?;
         let resp: CheckCommitLengthResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -1472,7 +1485,11 @@ impl StreamClient {
         Ok((stream, extent, resp.end))
     }
 
-    async fn alloc_new_extent_once(&self, stream_id: u64, end: u32) -> Result<(StreamInfo, ExtentInfo)> {
+    async fn alloc_new_extent_once(
+        &self,
+        stream_id: u64,
+        end: u32,
+    ) -> Result<(StreamInfo, ExtentInfo)> {
         // F190: snapshot the per-stream `bad_nodes` set (lazily prunes
         // expired entries). The manager filters its candidate pool by
         // this set and only blocks allocation if doing so would empty
@@ -1490,7 +1507,12 @@ impl StreamClient {
         // replica node (alloc_extent_on_node bounded at 10 s each).
         let resp_data = self
             .pool
-            .call_timeout(self.manager_addr(), MSG_STREAM_ALLOC_EXTENT, req, Duration::from_secs(30))
+            .call_timeout(
+                self.manager_addr(),
+                MSG_STREAM_ALLOC_EXTENT,
+                req,
+                Duration::from_secs(30),
+            )
             .await?;
         let resp: StreamAllocExtentResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -1505,7 +1527,8 @@ impl StreamClient {
             .last_ex_info
             .map(|e| Self::mgr_to_extent_info(&e))
             .ok_or_else(|| anyhow!("alloc_new_extent: missing last_ex_info"))?;
-        self.extent_info_cache.insert(extent.extent_id, extent.clone());
+        self.extent_info_cache
+            .insert(extent.extent_id, extent.clone());
         Ok((stream, extent))
     }
 
@@ -1518,11 +1541,7 @@ impl StreamClient {
 
     /// Core append implementation.  Thin wrapper that wraps a single Bytes
     /// payload into the segments vec expected by the worker path.
-    async fn append_payload(
-        &self,
-        stream_id: u64,
-        payload: Bytes,
-    ) -> Result<AppendResult> {
+    async fn append_payload(&self, stream_id: u64, payload: Bytes) -> Result<AppendResult> {
         self.append_payload_segments(stream_id, vec![payload]).await
     }
 
@@ -1614,8 +1633,7 @@ impl StreamClient {
                                 if let Ok(replica_addrs) =
                                     self.replica_addrs_for_extent(&new_ext).await
                                 {
-                                    let replica_node_ids =
-                                        Self::replica_node_ids_for(&new_ext);
+                                    let replica_node_ids = Self::replica_node_ids_for(&new_ext);
                                     let new_tail = StreamTail {
                                         extent: new_ext,
                                         replica_addrs,
@@ -1710,10 +1728,13 @@ impl StreamClient {
                         ));
                     }
                     let (_, new_ext) =
-                        self.alloc_new_extent(stream_id, 0).await.map_err(|alloc_err| {
-                            alloc_err
-                                .context(format!("alloc_new_extent failed after append error: {e}"))
-                        })?;
+                        self.alloc_new_extent(stream_id, 0)
+                            .await
+                            .map_err(|alloc_err| {
+                                alloc_err.context(format!(
+                                    "alloc_new_extent failed after append error: {e}"
+                                ))
+                            })?;
                     let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
                     let replica_node_ids = Self::replica_node_ids_for(&new_ext);
                     let new_tail = StreamTail {
@@ -1779,9 +1800,7 @@ impl StreamClient {
             .map_err(|_| anyhow!("worker gone before init"))?;
         if commit_val > 0 {
             tx_clone
-                .send(StreamSubmitMsg::SeedCursor {
-                    cursor: commit_val,
-                })
+                .send(StreamSubmitMsg::SeedCursor { cursor: commit_val })
                 .await
                 .map_err(|_| anyhow!("worker gone before init"))?;
         }
@@ -1821,7 +1840,12 @@ impl StreamClient {
             // whole call.
             let result = self
                 .pool
-                .call_timeout(addr, MSG_COMMIT_LENGTH, req.encode(), Duration::from_secs(5))
+                .call_timeout(
+                    addr,
+                    MSG_COMMIT_LENGTH,
+                    req.encode(),
+                    Duration::from_secs(5),
+                )
                 .await;
             let Ok(resp_bytes) = result else {
                 continue;
@@ -1869,11 +1893,7 @@ impl StreamClient {
         self.append_payload(stream_id, payload.freeze()).await
     }
 
-    pub async fn append_batch(
-        &self,
-        stream_id: u64,
-        blocks: &[&[u8]],
-    ) -> Result<AppendResult> {
+    pub async fn append_batch(&self, stream_id: u64, blocks: &[&[u8]]) -> Result<AppendResult> {
         if blocks.is_empty() {
             return Err(anyhow!("append_batch requires at least one block"));
         }
@@ -1889,11 +1909,7 @@ impl StreamClient {
     }
 
     /// Append a pre-built Bytes payload directly (avoids an extra copy).
-    pub async fn append_bytes(
-        &self,
-        stream_id: u64,
-        payload: Bytes,
-    ) -> Result<AppendResult> {
+    pub async fn append_bytes(&self, stream_id: u64, payload: Bytes) -> Result<AppendResult> {
         self.append_payload(stream_id, payload).await
     }
 
@@ -1906,11 +1922,7 @@ impl StreamClient {
         self.append_payload_segments(stream_id, segments).await
     }
 
-    pub async fn append(
-        &self,
-        stream_id: u64,
-        payload: &[u8],
-    ) -> Result<AppendResult> {
+    pub async fn append(&self, stream_id: u64, payload: &[u8]) -> Result<AppendResult> {
         self.append_payload(stream_id, Bytes::copy_from_slice(payload))
             .await
     }
@@ -1924,18 +1936,19 @@ impl StreamClient {
     /// Returns `Ok(Some(synced))` on a success response, `Ok(None)` if the
     /// extent is unknown to that node (CODE_NOT_FOUND or any other non-OK
     /// code), and `Err` only on transport / decode failure.
-    async fn synced_length_on_replica(
-        &self,
-        addr: &str,
-        extent_id: u64,
-    ) -> Result<Option<u64>> {
+    async fn synced_length_on_replica(&self, addr: &str, extent_id: u64) -> Result<Option<u64>> {
         let req = SyncedLengthReq { extent_id };
         // 5 s — atomic load of `entry.coalescer.last_synced` on EN.
         // Quorum-aware caller (`await_log_synced_to`) tolerates per-
         // replica failure, so the bound is generous.
         let resp_bytes = self
             .pool
-            .call_timeout(addr, MSG_SYNCED_LENGTH, req.encode(), Duration::from_secs(5))
+            .call_timeout(
+                addr,
+                MSG_SYNCED_LENGTH,
+                req.encode(),
+                Duration::from_secs(5),
+            )
             .await?;
         let resp = SyncedLengthResp::decode(resp_bytes)
             .map_err(|e| anyhow!("synced_length decode: {e}"))?;
@@ -1970,11 +1983,7 @@ impl StreamClient {
     /// `min_offset == 0` is a no-op fast path; the caller can pass
     /// `imm.max_vp_offset` and we trivially return Ok if the imm carried
     /// no large values.
-    pub async fn await_extent_synced_to(
-        &self,
-        extent_id: u64,
-        min_offset: u64,
-    ) -> Result<()> {
+    pub async fn await_extent_synced_to(&self, extent_id: u64, min_offset: u64) -> Result<()> {
         if min_offset == 0 {
             return Ok(());
         }
@@ -2042,7 +2051,12 @@ impl StreamClient {
         // pending_extent_deletes; etcd mirror inside.
         let resp_data = self
             .pool
-            .call_timeout(self.manager_addr(), MSG_STREAM_PUNCH_HOLES, req, Duration::from_secs(30))
+            .call_timeout(
+                self.manager_addr(),
+                MSG_STREAM_PUNCH_HOLES,
+                req,
+                Duration::from_secs(30),
+            )
             .await?;
         let resp: PunchHolesResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -2064,7 +2078,12 @@ impl StreamClient {
         // 30 s — same shape as punch_holes; ref updates + etcd mirror.
         let resp_data = self
             .pool
-            .call_timeout(self.manager_addr(), MSG_TRUNCATE, req, Duration::from_secs(30))
+            .call_timeout(
+                self.manager_addr(),
+                MSG_TRUNCATE,
+                req,
+                Duration::from_secs(30),
+            )
             .await?;
         let resp: TruncateResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -2083,7 +2102,12 @@ impl StreamClient {
         // 5 s — read-only manager call.
         let resp_data = self
             .pool
-            .call_timeout(self.manager_addr(), MSG_STREAM_INFO, req, Duration::from_secs(5))
+            .call_timeout(
+                self.manager_addr(),
+                MSG_STREAM_INFO,
+                req,
+                Duration::from_secs(5),
+            )
             .await?;
         let resp: StreamInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -2111,7 +2135,12 @@ impl StreamClient {
         // refetch path; bounded so that path doesn't wedge.
         let resp_data = self
             .pool
-            .call_timeout(self.manager_addr(), MSG_EXTENT_INFO, req, Duration::from_secs(5))
+            .call_timeout(
+                self.manager_addr(),
+                MSG_EXTENT_INFO,
+                req,
+                Duration::from_secs(5),
+            )
             .await?;
         let resp: ExtentInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
@@ -2208,7 +2237,13 @@ impl StreamClient {
         }
         let addrs = self.replica_addrs_for_extent(&ex).await?;
         for addr in &addrs {
-            let req = ReadBytesReq { extent_id, eversion: ex.eversion, offset, length }.encode();
+            let req = ReadBytesReq {
+                extent_id,
+                eversion: ex.eversion,
+                offset,
+                length,
+            }
+            .encode();
             match self
                 .pool
                 .call_into_pooled(addr, MSG_READ_BYTES_ZC, req, Duration::from_secs(3))
@@ -2308,9 +2343,7 @@ impl StreamClient {
         let mut last_end: u32 = 0;
         while cur < stop {
             let want = (stop - cur).min(chunk);
-            let (piece, end) = self
-                .read_replicated_with_failover(ex, cur, want)
-                .await?;
+            let (piece, end) = self.read_replicated_with_failover(ex, cur, want).await?;
             if piece.is_empty() {
                 break;
             }
@@ -2557,7 +2590,9 @@ impl StreamClient {
         // shards alone — surface via the bounds-checked full-decode
         // path which returns Err with extent_id + sealed_length context.
         if start_shard >= data_shards || end_shard >= data_shards {
-            return self.ec_read_full_and_slice(extent_id, offset, length, ex).await;
+            return self
+                .ec_read_full_and_slice(extent_id, offset, length, ex)
+                .await;
         }
 
         let addrs = self.replica_addrs_for_extent(ex).await?;
@@ -2715,8 +2750,7 @@ impl StreamClient {
             ));
         }
 
-        let (tx, mut rx) =
-            futures::channel::mpsc::channel::<(usize, Result<Vec<u8>>)>(n);
+        let (tx, mut rx) = futures::channel::mpsc::channel::<(usize, Result<Vec<u8>>)>(n);
         let cached_eversion = ex.eversion;
         for (i, addr) in addrs.iter().enumerate() {
             if i == missing_shard_idx {
@@ -2776,9 +2810,8 @@ impl StreamClient {
 
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; n];
         let mut success: usize = 0;
-        let mut last_err = anyhow!(
-            "ec_reconstruct_shard_subrange: no shard responses for extent {extent_id}"
-        );
+        let mut last_err =
+            anyhow!("ec_reconstruct_shard_subrange: no shard responses for extent {extent_id}");
         while let Some((idx, result)) = futures::StreamExt::next(&mut rx).await {
             match result {
                 Ok(bytes) => {
@@ -2853,11 +2886,7 @@ impl StreamClient {
         Ok((bytes, end))
     }
 
-    async fn ec_read_full(
-        &self,
-        extent_id: u64,
-        ex: &ExtentInfo,
-    ) -> Result<(Vec<u8>, u32)> {
+    async fn ec_read_full(&self, extent_id: u64, ex: &ExtentInfo) -> Result<(Vec<u8>, u32)> {
         let data_shards = ex.replicates.len();
         let parity_shards = ex.parity.len();
         let n = data_shards + parity_shards;
@@ -2947,8 +2976,9 @@ impl StreamClient {
         }
 
         if success < data_shards {
-            return Err(last_err
-                .context(format!("only {success}/{data_shards} shards available for EC decode")));
+            return Err(last_err.context(format!(
+                "only {success}/{data_shards} shards available for EC decode"
+            )));
         }
 
         // F117: RS decode of a full extent (up to 128 MiB) is CPU-bound;
@@ -2997,10 +3027,14 @@ impl StreamClient {
         // caller already has its own retry loop on top.
         let resp_data = self
             .pool
-            .call_timeout(self.manager_addr(), MSG_MULTI_MODIFY_SPLIT, req, Duration::from_secs(30))
+            .call_timeout(
+                self.manager_addr(),
+                MSG_MULTI_MODIFY_SPLIT,
+                req,
+                Duration::from_secs(30),
+            )
             .await?;
-        let resp: CodeResp =
-            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        let resp: CodeResp = manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
         if resp.code != CODE_OK {
             return Err(anyhow!("multi_modify_split failed: {}", resp.message));
         }
@@ -3065,9 +3099,9 @@ mod pipeline_tests {
             mpsc::channel::<FailureReport>(1).0,
             Duration::from_secs(30),
         );
-        let (o0, e0) = state.lease(100);    // 0..100
-        let (o1, e1) = state.lease(100);    // 100..200
-        let (o2, e2) = state.lease(100);    // 200..300
+        let (o0, e0) = state.lease(100); // 0..100
+        let (o1, e1) = state.lease(100); // 100..200
+        let (o2, e2) = state.lease(100); // 200..300
 
         state.ack(o1, e1);
         assert_eq!(state.commit, 0);

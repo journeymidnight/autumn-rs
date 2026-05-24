@@ -32,11 +32,7 @@ pub async fn large_payload_at<T: AutumnTransport + Clone>(t: T, addr: SocketAddr
     let _ = server.await;
 }
 
-pub async fn many_concurrent_at<T: AutumnTransport + Clone>(
-    t: T,
-    addr: SocketAddr,
-    n: usize,
-) {
+pub async fn many_concurrent_at<T: AutumnTransport + Clone>(t: T, addr: SocketAddr, n: usize) {
     let mut listener = t.bind(addr).await.unwrap();
     let bound = listener.local_addr().unwrap();
     let server = compio::runtime::spawn(async move {

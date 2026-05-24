@@ -62,11 +62,7 @@ impl BufferPoolLayout {
     /// - offset is `slot_size`-aligned relative to `pool_offset`,
     /// - length ≤ slot_size,
     /// - offset + length ≤ pool_end.
-    pub fn validate_slice(
-        &self,
-        buf_offset: u64,
-        length: u32,
-    ) -> Result<(), BufferPoolError> {
+    pub fn validate_slice(&self, buf_offset: u64, length: u32) -> Result<(), BufferPoolError> {
         if buf_offset < self.pool_offset || buf_offset >= self.pool_end() {
             return Err(BufferPoolError::OutOfRange {
                 offset: buf_offset,

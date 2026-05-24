@@ -9,13 +9,11 @@ use autumn_rpc::{Frame, FrameDecoder, RpcError};
 use autumn_stream::extent_rpc::*;
 use autumn_stream::{ExtentNode, ExtentNodeConfig};
 use bytes::Bytes;
-use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWriteExt};
+use compio::BufResult;
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter("warn")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("warn").init();
 
     let rt = compio::runtime::Runtime::new().unwrap();
     rt.block_on(run_bench());
@@ -78,7 +76,6 @@ impl BenchConn {
             self.decoder.feed(&self.buf[..n]);
         }
     }
-
 }
 
 async fn run_bench() {
@@ -137,7 +134,9 @@ async fn run_bench() {
     let read_blocks = 1000u64;
     {
         let mut conn = BenchConn::connect(listen_addr).await;
-        let alloc_req = rkyv_encode(&AllocExtentReq { extent_id: read_extent_id });
+        let alloc_req = rkyv_encode(&AllocExtentReq {
+            extent_id: read_extent_id,
+        });
         let resp = conn.call(MSG_ALLOC_EXTENT, alloc_req).await;
         let r: AllocExtentResp = rkyv_decode(&resp).unwrap();
         assert_eq!(r.code, CODE_OK, "alloc read extent failed: {}", r.message);
@@ -146,8 +145,11 @@ async fn run_bench() {
         let mut commit = 0u32;
         for _ in 0..read_blocks {
             let req = AppendReq {
-                extent_id: read_extent_id, eversion: 1, commit, revision: 1,
- payload: payload.clone(),
+                extent_id: read_extent_id,
+                eversion: 1,
+                commit,
+                revision: 1,
+                payload: payload.clone(),
             };
             let resp = AppendResp::decode(conn.call(MSG_APPEND, req.encode()).await).unwrap();
             commit = resp.end;
@@ -156,7 +158,15 @@ async fn run_bench() {
 
     for (num_tasks, depth) in [(1, 1), (1, 16), (1, 64), (32, 1), (32, 16), (32, 64)] {
         println!("=== 4KB Read, {num_tasks} tasks, depth={depth} ===");
-        bench_read(listen_addr, read_extent_id, num_tasks, depth, ops, read_blocks).await;
+        bench_read(
+            listen_addr,
+            read_extent_id,
+            num_tasks,
+            depth,
+            ops,
+            read_blocks,
+        )
+        .await;
         println!();
     }
 
@@ -166,7 +176,9 @@ async fn run_bench() {
     let mixed_prefill = 1000u64;
     {
         let mut conn = BenchConn::connect(listen_addr).await;
-        let alloc_req = rkyv_encode(&AllocExtentReq { extent_id: mixed_extent_id });
+        let alloc_req = rkyv_encode(&AllocExtentReq {
+            extent_id: mixed_extent_id,
+        });
         let resp = conn.call(MSG_ALLOC_EXTENT, alloc_req).await;
         let r: AllocExtentResp = rkyv_decode(&resp).unwrap();
         assert_eq!(r.code, CODE_OK, "alloc mixed extent failed: {}", r.message);
@@ -175,8 +187,11 @@ async fn run_bench() {
         let mut commit = 0u32;
         for _ in 0..mixed_prefill {
             let req = AppendReq {
-                extent_id: mixed_extent_id, eversion: 1, commit, revision: 1,
- payload: payload.clone(),
+                extent_id: mixed_extent_id,
+                eversion: 1,
+                commit,
+                revision: 1,
+                payload: payload.clone(),
             };
             let resp = AppendResp::decode(conn.call(MSG_APPEND, req.encode()).await).unwrap();
             commit = resp.end;
@@ -185,7 +200,15 @@ async fn run_bench() {
 
     for num_readers in [1, 4, 16] {
         println!("=== Mixed: 1 writer(depth=32) + {num_readers} readers(depth=16) ===");
-        bench_mixed(listen_addr, mixed_extent_id, num_readers, 50_000, 50_000, mixed_prefill).await;
+        bench_mixed(
+            listen_addr,
+            mixed_extent_id,
+            num_readers,
+            50_000,
+            50_000,
+            mixed_prefill,
+        )
+        .await;
         println!();
     }
 }
@@ -200,10 +223,12 @@ async fn bench_append(addr: SocketAddr, extent_id: u64, depth: usize, total_ops:
     let mut conn = BenchConn::connect(addr).await;
 
     // Fetch current commit.
-    let cl_req = CommitLengthReq { extent_id, revision: 1 };
-    let resp = CommitLengthResp::decode(
-        conn.call(MSG_COMMIT_LENGTH, cl_req.encode()).await
-    ).unwrap();
+    let cl_req = CommitLengthReq {
+        extent_id,
+        revision: 1,
+    };
+    let resp =
+        CommitLengthResp::decode(conn.call(MSG_COMMIT_LENGTH, cl_req.encode()).await).unwrap();
     let commit = resp.length;
 
     let mut sent = 0u64;
@@ -215,8 +240,11 @@ async fn bench_append(addr: SocketAddr, extent_id: u64, depth: usize, total_ops:
     let prefill = (depth as u64).min(total_ops);
     for _ in 0..prefill {
         let req = AppendReq {
-            extent_id, eversion: 1, commit, revision: 1,
- payload: payload.clone(),
+            extent_id,
+            eversion: 1,
+            commit,
+            revision: 1,
+            payload: payload.clone(),
         };
         conn.send(MSG_APPEND, req.encode()).await;
         sent += 1;
@@ -231,8 +259,11 @@ async fn bench_append(addr: SocketAddr, extent_id: u64, depth: usize, total_ops:
 
         if sent < total_ops {
             let req = AppendReq {
-                extent_id, eversion: 1, commit: resp.end, revision: 1,
- payload: payload.clone(),
+                extent_id,
+                eversion: 1,
+                commit: resp.end,
+                revision: 1,
+                payload: payload.clone(),
             };
             conn.send(MSG_APPEND, req.encode()).await;
             sent += 1;
@@ -280,7 +311,10 @@ async fn bench_read(
             for k in 0..prefill {
                 let block = (t as u64 * ops_per_task + k) % num_blocks;
                 let req = ReadBytesReq {
-                    extent_id, eversion: 1, offset: (block * 4096) as u32, length: 4096,
+                    extent_id,
+                    eversion: 1,
+                    offset: (block * 4096) as u32,
+                    length: 4096,
                 };
                 conn.send(MSG_READ_BYTES, req.encode()).await;
                 sent += 1;
@@ -297,7 +331,10 @@ async fn bench_read(
                 if sent < ops_per_task {
                     let block = (t as u64 * ops_per_task + sent) % num_blocks;
                     let req = ReadBytesReq {
-                        extent_id, eversion: 1, offset: (block * 4096) as u32, length: 4096,
+                        extent_id,
+                        eversion: 1,
+                        offset: (block * 4096) as u32,
+                        length: 4096,
                     };
                     conn.send(MSG_READ_BYTES, req.encode()).await;
                     sent += 1;
@@ -355,10 +392,13 @@ async fn bench_mixed(
             let payload = Bytes::from(vec![0xABu8; 4096]);
             let depth = 32usize;
 
-            let cl_req = CommitLengthReq { extent_id, revision: 1 };
-            let resp = CommitLengthResp::decode(
-                conn.call(MSG_COMMIT_LENGTH, cl_req.encode()).await
-            ).unwrap();
+            let cl_req = CommitLengthReq {
+                extent_id,
+                revision: 1,
+            };
+            let resp =
+                CommitLengthResp::decode(conn.call(MSG_COMMIT_LENGTH, cl_req.encode()).await)
+                    .unwrap();
             let commit = resp.length;
 
             let mut sent = 0u64;
@@ -367,8 +407,11 @@ async fn bench_mixed(
             let prefill = (depth as u64).min(write_ops);
             for _ in 0..prefill {
                 let req = AppendReq {
-                    extent_id, eversion: 1, commit, revision: 1,
- payload: payload.clone(),
+                    extent_id,
+                    eversion: 1,
+                    commit,
+                    revision: 1,
+                    payload: payload.clone(),
                 };
                 conn.send(MSG_APPEND, req.encode()).await;
                 sent += 1;
@@ -382,8 +425,11 @@ async fn bench_mixed(
 
                 if sent < write_ops {
                     let req = AppendReq {
-                        extent_id, eversion: 1, commit: resp.end, revision: 1,
- payload: payload.clone(),
+                        extent_id,
+                        eversion: 1,
+                        commit: resp.end,
+                        revision: 1,
+                        payload: payload.clone(),
                     };
                     conn.send(MSG_APPEND, req.encode()).await;
                     sent += 1;
@@ -408,7 +454,10 @@ async fn bench_mixed(
             for k in 0..prefill {
                 let block = (t as u64 * read_ops_per_reader + k) % num_blocks;
                 let req = ReadBytesReq {
-                    extent_id, eversion: 1, offset: (block * 4096) as u32, length: 4096,
+                    extent_id,
+                    eversion: 1,
+                    offset: (block * 4096) as u32,
+                    length: 4096,
                 };
                 conn.send(MSG_READ_BYTES, req.encode()).await;
                 sent += 1;
@@ -417,14 +466,20 @@ async fn bench_mixed(
             while done < read_ops_per_reader {
                 let resp_bytes = conn.recv().await;
                 let resp = ReadBytesResp::decode(resp_bytes).unwrap();
-                assert_eq!(resp.code, CODE_OK, "mixed read task {t} failed at op {done}");
+                assert_eq!(
+                    resp.code, CODE_OK,
+                    "mixed read task {t} failed at op {done}"
+                );
                 bytes += resp.payload.len() as u64;
                 done += 1;
 
                 if sent < read_ops_per_reader {
                     let block = (t as u64 * read_ops_per_reader + sent) % num_blocks;
                     let req = ReadBytesReq {
-                        extent_id, eversion: 1, offset: (block * 4096) as u32, length: 4096,
+                        extent_id,
+                        eversion: 1,
+                        offset: (block * 4096) as u32,
+                        length: 4096,
                     };
                     conn.send(MSG_READ_BYTES, req.encode()).await;
                     sent += 1;

@@ -12,11 +12,11 @@ mod transport;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use prost::Message;
 
 use proto::*;
-use transport::{GrpcChannel, call_with_sender};
+use transport::{call_with_sender, GrpcChannel};
 
 /// Minimal etcd v3 client for compio runtime (single-threaded, Rc-based).
 ///
@@ -96,11 +96,7 @@ impl EtcdClient {
     // ── KV: Put ──────────────────────────────────────────────────────────
 
     /// Put a key-value pair.
-    pub async fn put(
-        &self,
-        key: impl AsRef<[u8]>,
-        value: impl AsRef<[u8]>,
-    ) -> Result<PutResponse> {
+    pub async fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<PutResponse> {
         let req = PutRequest {
             key: key.as_ref().to_vec(),
             value: value.as_ref().to_vec(),
@@ -231,9 +227,9 @@ impl EtcdClient {
         match compio::time::timeout(timeout, call_with_sender(&mut sender, path, body)).await {
             Ok(Ok(resp_bytes)) => grpc_decode::<Resp>(&resp_bytes),
             Ok(Err(e)) => Err(e),
-            Err(_elapsed) => {
-                Err(anyhow::anyhow!("etcd call '{path}' timed out after retry ({timeout:?})"))
-            }
+            Err(_elapsed) => Err(anyhow::anyhow!(
+                "etcd call '{path}' timed out after retry ({timeout:?})"
+            )),
         }
     }
 
@@ -430,11 +426,7 @@ impl Op {
     }
 
     /// Create a Put operation with a lease.
-    pub fn put_with_lease(
-        key: impl AsRef<[u8]>,
-        value: impl AsRef<[u8]>,
-        lease: i64,
-    ) -> RequestOp {
+    pub fn put_with_lease(key: impl AsRef<[u8]>, value: impl AsRef<[u8]>, lease: i64) -> RequestOp {
         RequestOp {
             request: Some(RequestOpInner::RequestPut(PutRequest {
                 key: key.as_ref().to_vec(),
@@ -509,8 +501,14 @@ mod tests {
 
     #[test]
     fn test_normalize_endpoint() {
-        assert_eq!(normalize_endpoint("http://127.0.0.1:2379"), "127.0.0.1:2379");
+        assert_eq!(
+            normalize_endpoint("http://127.0.0.1:2379"),
+            "127.0.0.1:2379"
+        );
         assert_eq!(normalize_endpoint("127.0.0.1:2379"), "127.0.0.1:2379");
-        assert_eq!(normalize_endpoint("https://etcd.local:2379"), "etcd.local:2379");
+        assert_eq!(
+            normalize_endpoint("https://etcd.local:2379"),
+            "etcd.local:2379"
+        );
     }
 }

@@ -8,10 +8,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use autumn_client::{ClusterClient, parse_addr};
+use autumn_client::{parse_addr, ClusterClient};
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
-use autumn_rpc::partition_rpc::{PutReq, GetReq, MSG_PUT, MSG_GET, MSG_PUT_ZC, MSG_GET_ZC, encode_put_zc_meta};
+use autumn_rpc::partition_rpc::{
+    encode_put_zc_meta, GetReq, PutReq, MSG_GET, MSG_GET_ZC, MSG_PUT, MSG_PUT_ZC,
+};
 use serde::{Deserialize, Serialize};
 
 // (F213: hex_split_ranges moved to autumn_op.rs along with `bootstrap`.)
@@ -138,7 +140,9 @@ fn usage() -> ! {
     eprintln!("Data-plane commands (KV + bench):");
     eprintln!("  put <KEY> <FILE>                  Put key with value from file");
     eprintln!("  put-stream [--chunk-size N] <KEY> <FILE-or->>");
-    eprintln!("                                    Chunked stream put (default 4 MiB chunks; F186)");
+    eprintln!(
+        "                                    Chunked stream put (default 4 MiB chunks; F186)"
+    );
     eprintln!("  get <KEY>                         Get value for key");
     eprintln!("  get-stream [--chunk-size N] [--out FILE] <KEY>");
     eprintln!("                                    Chunked stream get (default 4 MiB chunks)");
@@ -174,11 +178,10 @@ fn parse_args() -> Args {
             }
             "--transport" => {
                 i += 1;
-                transport = autumn_transport::parse_transport_flag(&raw[i])
-                    .unwrap_or_else(|bad| {
-                        eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
-                        std::process::exit(2);
-                    });
+                transport = autumn_transport::parse_transport_flag(&raw[i]).unwrap_or_else(|bad| {
+                    eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
+                    std::process::exit(2);
+                });
                 i += 1;
             }
             "--help" | "-h" => usage(),
@@ -197,8 +200,8 @@ fn parse_args() -> Args {
         // F213: op commands moved to autumn-op. Common typos and the
         // explicit `op` namespace prefix all route here.
         "op" | "bootstrap" | "set-stream-ec" | "force-ec-convert" | "split" | "merge"
-        | "policy-candidates" | "policy_candidates" | "policy" | "compact" | "gc"
-        | "forcegc" | "register-node" | "format" | "info" => {
+        | "policy-candidates" | "policy_candidates" | "policy" | "compact" | "gc" | "forcegc"
+        | "register-node" | "format" | "info" => {
             // Reconstruct the equivalent autumn-op invocation. For
             // bare `op`, the original args[i..] are the autumn-op
             // command + flags. For other typos (e.g. `autumn-client
@@ -253,7 +256,11 @@ fn parse_args() -> Args {
             }
             let key = raw[i].clone();
             let file = raw[i + 1].clone();
-            Command::PutStream { key, file, chunk_size }
+            Command::PutStream {
+                key,
+                file,
+                chunk_size,
+            }
         }
         "get-stream" | "getstream" => {
             // get-stream [--chunk-size N] [--out FILE] <KEY>
@@ -276,7 +283,11 @@ fn parse_args() -> Args {
                 eprintln!("get-stream requires <KEY>");
                 std::process::exit(1);
             }
-            Command::GetStream { key: raw[i].clone(), chunk_size, out }
+            Command::GetStream {
+                key: raw[i].clone(),
+                chunk_size,
+                out,
+            }
         }
         "get" => {
             if i >= raw.len() {
@@ -486,7 +497,9 @@ fn parse_args() -> Args {
                     }
                     "--partitions" => {
                         i += 1;
-                        partitions_meta_from_flag = raw[i].parse().expect("--partitions must be a positive integer");
+                        partitions_meta_from_flag = raw[i]
+                            .parse()
+                            .expect("--partitions must be a positive integer");
                         if partitions_meta_from_flag == 0 {
                             eprintln!("--partitions must be >= 1");
                             usage();
@@ -504,9 +517,8 @@ fn parse_args() -> Args {
                     }
                     "--group-commit-cap" => {
                         i += 1;
-                        group_commit_cap = Some(
-                            raw[i].parse().expect("--group-commit-cap must be a u64"),
-                        );
+                        group_commit_cap =
+                            Some(raw[i].parse().expect("--group-commit-cap must be a u64"));
                     }
                     other => {
                         eprintln!("unknown perf-check flag: {other}");
@@ -533,7 +545,11 @@ fn parse_args() -> Args {
         }
     };
 
-    Args { manager, command, transport }
+    Args {
+        manager,
+        command,
+        transport,
+    }
 }
 
 /// F178 Phase 3: `--nosync` was removed because writes are now ALWAYS
@@ -869,7 +885,9 @@ async fn main() -> Result<()> {
         Command::OpStub { .. } => unreachable!("handled before connect"),
         Command::Put { key, file } => {
             let value = std::fs::read(&file).with_context(|| format!("read file {file}"))?;
-            client.put(key.as_bytes(), &value).await
+            client
+                .put(key.as_bytes(), &value)
+                .await
                 .map_err(|e| anyhow!("put: {e}"))?;
             println!("ok");
         }
@@ -882,25 +900,34 @@ async fn main() -> Result<()> {
             // completes. On TCP / no-ucx this is a no-op.
             #[cfg(feature = "ucx")]
             let _reg = (!value.is_empty())
-                .then(|| autumn_transport::register_memory(
-                    value.as_ptr() as *mut std::ffi::c_void,
-                    value.len(),
-                ))
+                .then(|| {
+                    autumn_transport::register_memory(
+                        value.as_ptr() as *mut std::ffi::c_void,
+                        value.len(),
+                    )
+                })
                 .transpose()
                 .map_err(|e| anyhow!("put-zc register source: {e}"))?;
-            client.put_zc(key.as_bytes(), value).await
+            client
+                .put_zc(key.as_bytes(), value)
+                .await
                 .map_err(|e| anyhow!("put-zc: {e}"))?;
             println!("ok");
         }
 
-        Command::PutStream { key, file, chunk_size } => {
+        Command::PutStream {
+            key,
+            file,
+            chunk_size,
+        } => {
             // F129: read full payload (stdin if file = "-"), drive
             // PutBegin → N×Chunk → Commit. The handle owns the cached
             // RpcClient so all chunks land on the same PS connection.
             use std::io::Read;
             let payload: Vec<u8> = if file == "-" {
                 let mut buf = Vec::new();
-                std::io::stdin().read_to_end(&mut buf)
+                std::io::stdin()
+                    .read_to_end(&mut buf)
                     .with_context(|| "read stdin")?;
                 buf
             } else {
@@ -918,11 +945,21 @@ async fn main() -> Result<()> {
                 sent = n;
                 idx = end;
             }
-            handle.commit().await.map_err(|e| anyhow!("put-stream commit: {e}"))?;
-            println!("ok ({sent} bytes, {} chunks)", payload.len().div_ceil(chunk_size));
+            handle
+                .commit()
+                .await
+                .map_err(|e| anyhow!("put-stream commit: {e}"))?;
+            println!(
+                "ok ({sent} bytes, {} chunks)",
+                payload.len().div_ceil(chunk_size)
+            );
         }
 
-        Command::GetStream { key, chunk_size, out } => {
+        Command::GetStream {
+            key,
+            chunk_size,
+            out,
+        } => {
             use std::io::Write;
             let mut stream = match client
                 .get_stream(key.as_bytes(), chunk_size)
@@ -937,8 +974,9 @@ async fn main() -> Result<()> {
             };
             let total = stream.total_bytes();
             let mut writer: Box<dyn Write> = match out {
-                Some(p) => Box::new(std::fs::File::create(&p)
-                    .with_context(|| format!("create output {p}"))?),
+                Some(p) => Box::new(
+                    std::fs::File::create(&p).with_context(|| format!("create output {p}"))?,
+                ),
                 None => Box::new(std::io::stdout().lock()),
             };
             while let Some(chunk) = stream
@@ -951,24 +989,24 @@ async fn main() -> Result<()> {
             eprintln!("ok ({total} bytes)");
         }
 
-        Command::Get { key } => {
-            match client.get(key.as_bytes()).await {
-                Ok(Some(value)) => {
-                    use std::io::Write;
-                    std::io::stdout().write_all(&value)?;
-                }
-                Ok(None) => {
-                    eprintln!("key not found");
-                    std::process::exit(2);
-                }
-                Err(e) => bail!("get: {e}"),
+        Command::Get { key } => match client.get(key.as_bytes()).await {
+            Ok(Some(value)) => {
+                use std::io::Write;
+                std::io::stdout().write_all(&value)?;
             }
-        }
+            Ok(None) => {
+                eprintln!("key not found");
+                std::process::exit(2);
+            }
+            Err(e) => bail!("get: {e}"),
+        },
 
         Command::ZcGet { key } => {
             // Size the dest from head() (kvcache caller knows the size; the
             // CLI discovers it). Then read the value straight into dest.
-            let meta = client.head(key.as_bytes()).await
+            let meta = client
+                .head(key.as_bytes())
+                .await
                 .map_err(|e| anyhow!("zc-get head: {e}"))?;
             if !meta.found {
                 eprintln!("key not found");
@@ -978,15 +1016,20 @@ async fn main() -> Result<()> {
             // Register dest for true UCX zero-copy receive (ucx build only).
             #[cfg(feature = "ucx")]
             let reg = (!dest.is_empty())
-                .then(|| autumn_transport::register_memory(
-                    dest.as_mut_ptr() as *mut std::ffi::c_void,
-                    dest.len(),
-                ))
+                .then(|| {
+                    autumn_transport::register_memory(
+                        dest.as_mut_ptr() as *mut std::ffi::c_void,
+                        dest.len(),
+                    )
+                })
                 .transpose()
                 .map_err(|e| anyhow!("zc-get register dest: {e}"))?;
             #[cfg(not(feature = "ucx"))]
             let reg: Option<autumn_rpc::RegisteredMem> = None;
-            match client.get_into(key.as_bytes(), &mut dest, reg.as_ref()).await {
+            match client
+                .get_into(key.as_bytes(), &mut dest, reg.as_ref())
+                .await
+            {
                 Ok(Some(n)) => {
                     use std::io::Write;
                     std::io::stdout().write_all(&dest[..n])?;
@@ -1000,13 +1043,17 @@ async fn main() -> Result<()> {
         }
 
         Command::Del { key } => {
-            client.delete(key.as_bytes()).await
+            client
+                .delete(key.as_bytes())
+                .await
                 .map_err(|e| anyhow!("delete: {e}"))?;
             println!("ok");
         }
 
         Command::Head { key } => {
-            let meta = client.head(key.as_bytes()).await
+            let meta = client
+                .head(key.as_bytes())
+                .await
                 .map_err(|e| anyhow!("head: {e}"))?;
             if meta.found {
                 println!("key: {}, length: {}", key, meta.value_length);
@@ -1020,7 +1067,9 @@ async fn main() -> Result<()> {
             start,
             limit,
         } => {
-            let result = client.range(prefix.as_bytes(), start.as_bytes(), limit).await
+            let result = client
+                .range(prefix.as_bytes(), start.as_bytes(), limit)
+                .await
                 .map_err(|e| anyhow!("range: {e}"))?;
             for e in &result.entries {
                 println!("{}", String::from_utf8_lossy(&e.key));
@@ -1064,28 +1113,25 @@ async fn main() -> Result<()> {
             }
 
             // F099-N-c: partition ranges for range-aware key generation.
-            let partitions: Vec<(u64, String, Vec<u8>, Vec<u8>)> =
-                if let Some(part_id) = part_id {
-                    // Single-partition mode — fetch its range from the full list.
-                    let all = client.all_partitions_with_range().await?;
-                    let entry = all
-                        .into_iter()
-                        .find(|(pid, _, _, _)| *pid == part_id)
-                        .ok_or_else(|| anyhow!("partition {} not found", part_id))?;
-                    vec![entry]
-                } else {
-                    client.all_partitions_with_range().await?
-                };
+            let partitions: Vec<(u64, String, Vec<u8>, Vec<u8>)> = if let Some(part_id) = part_id {
+                // Single-partition mode — fetch its range from the full list.
+                let all = client.all_partitions_with_range().await?;
+                let entry = all
+                    .into_iter()
+                    .find(|(pid, _, _, _)| *pid == part_id)
+                    .ok_or_else(|| anyhow!("partition {} not found", part_id))?;
+                vec![entry]
+            } else {
+                client.all_partitions_with_range().await?
+            };
             if partitions.is_empty() {
                 bail!("no partitions found, run bootstrap first");
             }
 
             // Resolve PS addresses for each thread
-            let mut thread_targets: Vec<(u64, SocketAddr, Vec<u8>)> =
-                Vec::with_capacity(threads);
+            let mut thread_targets: Vec<(u64, SocketAddr, Vec<u8>)> = Vec::with_capacity(threads);
             for tid in 0..threads {
-                let (part_id, ps_addr, start_key, _end_key) =
-                    &partitions[tid % partitions.len()];
+                let (part_id, ps_addr, start_key, _end_key) = &partitions[tid % partitions.len()];
                 thread_targets.push((*part_id, parse_addr(ps_addr)?, start_key.clone()));
             }
 
@@ -1101,77 +1147,79 @@ async fn main() -> Result<()> {
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
                 let total_errors = Arc::clone(&total_errors);
-                let value_template = (0..value_size).map(|i| (i % 256) as u8).collect::<Vec<u8>>();
+                let value_template = (0..value_size)
+                    .map(|i| (i % 256) as u8)
+                    .collect::<Vec<u8>>();
 
                 let handle = std::thread::spawn(move || {
                     compio::runtime::RuntimeBuilder::new()
                         .build()
                         .unwrap()
                         .block_on(async {
-                        let ps = match RpcClient::connect(ps_addr).await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                eprintln!("thread {tid} connect error: {e}");
-                                return (Vec::new(), Vec::new());
-                            }
-                        };
-                        let mut seq: u64 = 0;
-                        let mut local_latencies: Vec<f64> = Vec::new();
-                        let mut local_results: Vec<BenchResult> = Vec::new();
-
-                        loop {
-                            if std::time::SystemTime::now() >= *deadline {
-                                break;
-                            }
-                            // F099-N-c: range-aware key (falls in this partition).
-                            let key = key_for_partition(&start_key, "bench", tid, seq);
-                            seq += 1;
-
-                            let t0 = Instant::now();
-                            let op_start = bench_start.elapsed().as_secs_f64();
-                            let value = if reuse_value {
-                                value_template.clone()
-                            } else {
-                                value_template.clone()
-                            };
-                            let res = ps
-                                .call(
-                                    MSG_PUT,
-                                    rkyv_encode(&PutReq {
-                                        part_id,
-                                        key: key.as_bytes().to_vec(),
-                                        value,
-                                        expires_at: 0,
-                                        // Bench captures topology up front and assumes
-                                        // a static cluster; stamp 0 to bypass the
-                                        // post-Phase-3 epoch check.
-                                        region_epoch: 0,
-                                    }),
-                                )
-                                .await;
-                            let elapsed = t0.elapsed();
-
-                            match res {
-                                Ok(_) => {
-                                    total_ops.fetch_add(1, Ordering::Relaxed);
-                                    local_latencies.push(elapsed.as_secs_f64() * 1000.0);
-                                    local_results.push(BenchResult {
-                                        key,
-                                        start_time: op_start,
-                                        elapsed: elapsed.as_secs_f64(),
-                                    });
-                                }
+                            let ps = match RpcClient::connect(ps_addr).await {
+                                Ok(c) => c,
                                 Err(e) => {
-                                    total_errors.fetch_add(1, Ordering::Relaxed);
-                                    if seq == 1 {
-                                        eprintln!("thread {tid} put error: {e}");
+                                    eprintln!("thread {tid} connect error: {e}");
+                                    return (Vec::new(), Vec::new());
+                                }
+                            };
+                            let mut seq: u64 = 0;
+                            let mut local_latencies: Vec<f64> = Vec::new();
+                            let mut local_results: Vec<BenchResult> = Vec::new();
+
+                            loop {
+                                if std::time::SystemTime::now() >= *deadline {
+                                    break;
+                                }
+                                // F099-N-c: range-aware key (falls in this partition).
+                                let key = key_for_partition(&start_key, "bench", tid, seq);
+                                seq += 1;
+
+                                let t0 = Instant::now();
+                                let op_start = bench_start.elapsed().as_secs_f64();
+                                let value = if reuse_value {
+                                    value_template.clone()
+                                } else {
+                                    value_template.clone()
+                                };
+                                let res = ps
+                                    .call(
+                                        MSG_PUT,
+                                        rkyv_encode(&PutReq {
+                                            part_id,
+                                            key: key.as_bytes().to_vec(),
+                                            value,
+                                            expires_at: 0,
+                                            // Bench captures topology up front and assumes
+                                            // a static cluster; stamp 0 to bypass the
+                                            // post-Phase-3 epoch check.
+                                            region_epoch: 0,
+                                        }),
+                                    )
+                                    .await;
+                                let elapsed = t0.elapsed();
+
+                                match res {
+                                    Ok(_) => {
+                                        total_ops.fetch_add(1, Ordering::Relaxed);
+                                        local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                                        local_results.push(BenchResult {
+                                            key,
+                                            start_time: op_start,
+                                            elapsed: elapsed.as_secs_f64(),
+                                        });
                                     }
-                                    std::thread::sleep(Duration::from_millis(1));
+                                    Err(e) => {
+                                        total_errors.fetch_add(1, Ordering::Relaxed);
+                                        if seq == 1 {
+                                            eprintln!("thread {tid} put error: {e}");
+                                        }
+                                        std::thread::sleep(Duration::from_millis(1));
+                                    }
                                 }
                             }
-                        }
-                        (local_latencies, local_results)
-                    })
+                            (local_latencies, local_results)
+                        })
                 });
                 handles.push(handle);
             }
@@ -1278,84 +1326,85 @@ async fn main() -> Result<()> {
                         .build()
                         .unwrap()
                         .block_on(async {
-                        let cc = match ClusterClient::connect(&manager_addr).await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                eprintln!("thread {tid} connect error: {e}");
+                            let cc = match ClusterClient::connect(&manager_addr).await {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    eprintln!("thread {tid} connect error: {e}");
+                                    return Vec::new();
+                                }
+                            };
+                            let start_idx = tid * keys_per_thread;
+                            let end_idx = (start_idx + keys_per_thread).min(keys.len());
+                            if start_idx >= end_idx {
                                 return Vec::new();
                             }
-                        };
-                        let start_idx = tid * keys_per_thread;
-                        let end_idx = (start_idx + keys_per_thread).min(keys.len());
-                        if start_idx >= end_idx {
-                            return Vec::new();
-                        }
-                        let my_keys = &keys[start_idx..end_idx];
-                        let mut ki = 0usize;
-                        let mut local_latencies: Vec<f64> = Vec::new();
-                        let mut logged_errors = 0u32;
+                            let my_keys = &keys[start_idx..end_idx];
+                            let mut ki = 0usize;
+                            let mut local_latencies: Vec<f64> = Vec::new();
+                            let mut logged_errors = 0u32;
 
-                        loop {
-                            if std::time::SystemTime::now() >= *deadline {
-                                break;
-                            }
-                            let key = &my_keys[ki % my_keys.len()];
-                            ki += 1;
+                            loop {
+                                if std::time::SystemTime::now() >= *deadline {
+                                    break;
+                                }
+                                let key = &my_keys[ki % my_keys.len()];
+                                ki += 1;
 
-                            let (part_id, ps_addr) = match cc.resolve_key(key.as_bytes()).await {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    total_errors.fetch_add(1, Ordering::Relaxed);
-                                    if logged_errors < 3 {
-                                        eprintln!("thread {tid} resolve_key error: {e}");
-                                        logged_errors += 1;
+                                let (part_id, ps_addr) = match cc.resolve_key(key.as_bytes()).await
+                                {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        total_errors.fetch_add(1, Ordering::Relaxed);
+                                        if logged_errors < 3 {
+                                            eprintln!("thread {tid} resolve_key error: {e}");
+                                            logged_errors += 1;
+                                        }
+                                        continue;
                                     }
-                                    continue;
-                                }
-                            };
-                            let ps = match cc.get_ps_client(&ps_addr).await {
-                                Ok(ps) => ps,
-                                Err(e) => {
-                                    total_errors.fetch_add(1, Ordering::Relaxed);
-                                    if logged_errors < 3 {
-                                        eprintln!("thread {tid} get_ps_client error: {e}");
-                                        logged_errors += 1;
+                                };
+                                let ps = match cc.get_ps_client(&ps_addr).await {
+                                    Ok(ps) => ps,
+                                    Err(e) => {
+                                        total_errors.fetch_add(1, Ordering::Relaxed);
+                                        if logged_errors < 3 {
+                                            eprintln!("thread {tid} get_ps_client error: {e}");
+                                            logged_errors += 1;
+                                        }
+                                        continue;
                                     }
-                                    continue;
-                                }
-                            };
-                            let t0 = Instant::now();
-                            let res = ps
-                                .call(
-                                    MSG_GET,
-                                    rkyv_encode(&GetReq {
-                                        part_id,
-                                        key: key.as_bytes().to_vec(),
-                                        offset: 0,
-                                        length: 0,
-                                        // Bench: static topology, skip epoch check.
-                                        region_epoch: 0,
-                                    }),
-                                )
-                                .await;
-                            let elapsed = t0.elapsed();
+                                };
+                                let t0 = Instant::now();
+                                let res = ps
+                                    .call(
+                                        MSG_GET,
+                                        rkyv_encode(&GetReq {
+                                            part_id,
+                                            key: key.as_bytes().to_vec(),
+                                            offset: 0,
+                                            length: 0,
+                                            // Bench: static topology, skip epoch check.
+                                            region_epoch: 0,
+                                        }),
+                                    )
+                                    .await;
+                                let elapsed = t0.elapsed();
 
-                            match res {
-                                Ok(_) => {
-                                    total_ops.fetch_add(1, Ordering::Relaxed);
-                                    local_latencies.push(elapsed.as_secs_f64() * 1000.0);
-                                }
-                                Err(e) => {
-                                    total_errors.fetch_add(1, Ordering::Relaxed);
-                                    if logged_errors < 3 {
-                                        eprintln!("thread {tid} get error: {e}");
-                                        logged_errors += 1;
+                                match res {
+                                    Ok(_) => {
+                                        total_ops.fetch_add(1, Ordering::Relaxed);
+                                        local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                                    }
+                                    Err(e) => {
+                                        total_errors.fetch_add(1, Ordering::Relaxed);
+                                        if logged_errors < 3 {
+                                            eprintln!("thread {tid} get error: {e}");
+                                            logged_errors += 1;
+                                        }
                                     }
                                 }
                             }
-                        }
-                        local_latencies
-                    })
+                            local_latencies
+                        })
                 });
                 handles.push(handle);
             }
@@ -1442,15 +1491,14 @@ async fn main() -> Result<()> {
             if partitions.len() != partitions_meta_from_flag {
                 eprintln!(
                     "warning: --partitions={} but cluster has {} partitions; using cluster value",
-                    partitions_meta_from_flag, partitions.len()
+                    partitions_meta_from_flag,
+                    partitions.len()
                 );
             }
 
-            let mut thread_targets: Vec<(u64, SocketAddr, Vec<u8>)> =
-                Vec::with_capacity(threads);
+            let mut thread_targets: Vec<(u64, SocketAddr, Vec<u8>)> = Vec::with_capacity(threads);
             for tid in 0..threads {
-                let (part_id, ps_addr, start_key, _end_key) =
-                    &partitions[tid % partitions.len()];
+                let (part_id, ps_addr, start_key, _end_key) = &partitions[tid % partitions.len()];
                 thread_targets.push((*part_id, parse_addr(ps_addr)?, start_key.clone()));
             }
 
@@ -1463,8 +1511,9 @@ async fn main() -> Result<()> {
             for (tid, (part_id, ps_addr, start_key)) in thread_targets.into_iter().enumerate() {
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
-                let value_bytes =
-                    (0..value_size).map(|i| (i % 256) as u8).collect::<Vec<u8>>();
+                let value_bytes = (0..value_size)
+                    .map(|i| (i % 256) as u8)
+                    .collect::<Vec<u8>>();
 
                 let max_depth = pipeline_depth;
                 let handle = std::thread::spawn(move || {
@@ -1472,75 +1521,79 @@ async fn main() -> Result<()> {
                         .build()
                         .unwrap()
                         .block_on(async {
-                        use futures::stream::{FuturesUnordered, StreamExt};
-                        let ps = match RpcClient::connect(ps_addr).await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                eprintln!("thread {tid} connect error: {e}");
-                                return (Vec::new(), Vec::new());
-                            }
-                        };
-                        let mut seq: u64 = 0;
-                        let mut local_latencies: Vec<f64> = Vec::new();
-                        let mut local_keyinfo: Vec<(String, u64, SocketAddr)> = Vec::new();
-                        let mut inflight = FuturesUnordered::new();
-                        // F216-E ZC: one reusable Bytes for the value, sent as
-                        // its own iovec each op — on UCX the rcache registers it
-                        // once (reused buffer) -> zero-copy send. No to_vec/rkyv.
-                        let value_zc: bytes::Bytes = bytes::Bytes::from(value_bytes.clone());
-                        loop {
-                            // Refill pipeline up to max_depth while deadline not expired.
-                            while inflight.len() < max_depth
-                                && std::time::SystemTime::now() < *deadline
-                            {
-                                // F099-N-c: key must fall in this thread's
-                                // partition range or PS will reject it with
-                                // "key out of range".
-                                let key = key_for_partition(&start_key, "pc", tid, seq);
-                                seq += 1;
-                                let ps_clone = ps.clone();
-                                let t0 = Instant::now();
-                                // ZC: send value as its own iovec (Arc bump, no copy).
-                                // Non-ZC: rkyv PutReq. Single async block so the FU
-                                // has one concrete future type (no boxing).
-                                let val = value_zc.clone();
-                                let value_vec = if zc_write { Vec::new() } else { value_bytes.clone() };
-                                inflight.push(async move {
-                                    let res = if zc_write {
-                                        let meta =
-                                            encode_put_zc_meta(part_id, 0, 0, key.as_bytes());
-                                        ps_clone
-                                            .call_vectored(MSG_PUT_ZC, vec![meta, val])
-                                            .await
-                                    } else {
-                                        let req_bytes = rkyv_encode(&PutReq {
-                                            part_id,
-                                            key: key.as_bytes().to_vec(),
-                                            value: value_vec,
-                                            expires_at: 0,
-                                            // Bench: static topology, skip epoch check.
-                                            region_epoch: 0,
-                                        });
-                                        ps_clone.call(MSG_PUT, req_bytes).await
-                                    };
-                                    (res, key, t0.elapsed())
-                                });
-                            }
-                            // Drain one completion. When deadline passes AND inflight is
-                            // empty, next() returns None and we exit.
-                            match inflight.next().await {
-                                Some((res, key, elapsed)) => {
-                                    if res.is_ok() {
-                                        total_ops.fetch_add(1, Ordering::Relaxed);
-                                        local_latencies.push(elapsed.as_secs_f64() * 1000.0);
-                                        local_keyinfo.push((key, part_id, ps_addr));
-                                    }
+                            use futures::stream::{FuturesUnordered, StreamExt};
+                            let ps = match RpcClient::connect(ps_addr).await {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    eprintln!("thread {tid} connect error: {e}");
+                                    return (Vec::new(), Vec::new());
                                 }
-                                None => break,
+                            };
+                            let mut seq: u64 = 0;
+                            let mut local_latencies: Vec<f64> = Vec::new();
+                            let mut local_keyinfo: Vec<(String, u64, SocketAddr)> = Vec::new();
+                            let mut inflight = FuturesUnordered::new();
+                            // F216-E ZC: one reusable Bytes for the value, sent as
+                            // its own iovec each op — on UCX the rcache registers it
+                            // once (reused buffer) -> zero-copy send. No to_vec/rkyv.
+                            let value_zc: bytes::Bytes = bytes::Bytes::from(value_bytes.clone());
+                            loop {
+                                // Refill pipeline up to max_depth while deadline not expired.
+                                while inflight.len() < max_depth
+                                    && std::time::SystemTime::now() < *deadline
+                                {
+                                    // F099-N-c: key must fall in this thread's
+                                    // partition range or PS will reject it with
+                                    // "key out of range".
+                                    let key = key_for_partition(&start_key, "pc", tid, seq);
+                                    seq += 1;
+                                    let ps_clone = ps.clone();
+                                    let t0 = Instant::now();
+                                    // ZC: send value as its own iovec (Arc bump, no copy).
+                                    // Non-ZC: rkyv PutReq. Single async block so the FU
+                                    // has one concrete future type (no boxing).
+                                    let val = value_zc.clone();
+                                    let value_vec = if zc_write {
+                                        Vec::new()
+                                    } else {
+                                        value_bytes.clone()
+                                    };
+                                    inflight.push(async move {
+                                        let res = if zc_write {
+                                            let meta =
+                                                encode_put_zc_meta(part_id, 0, 0, key.as_bytes());
+                                            ps_clone
+                                                .call_vectored(MSG_PUT_ZC, vec![meta, val])
+                                                .await
+                                        } else {
+                                            let req_bytes = rkyv_encode(&PutReq {
+                                                part_id,
+                                                key: key.as_bytes().to_vec(),
+                                                value: value_vec,
+                                                expires_at: 0,
+                                                // Bench: static topology, skip epoch check.
+                                                region_epoch: 0,
+                                            });
+                                            ps_clone.call(MSG_PUT, req_bytes).await
+                                        };
+                                        (res, key, t0.elapsed())
+                                    });
+                                }
+                                // Drain one completion. When deadline passes AND inflight is
+                                // empty, next() returns None and we exit.
+                                match inflight.next().await {
+                                    Some((res, key, elapsed)) => {
+                                        if res.is_ok() {
+                                            total_ops.fetch_add(1, Ordering::Relaxed);
+                                            local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                                            local_keyinfo.push((key, part_id, ps_addr));
+                                        }
+                                    }
+                                    None => break,
+                                }
                             }
-                        }
-                        (local_latencies, local_keyinfo)
-                    })
+                            (local_latencies, local_keyinfo)
+                        })
                 });
                 write_handles.push(handle);
             }
@@ -1615,98 +1668,100 @@ async fn main() -> Result<()> {
                         .build()
                         .unwrap()
                         .block_on(async {
-                        use futures::stream::{FuturesUnordered, StreamExt};
-                        // Per-thread RpcClient connection cache keyed by ps_addr.
-                        let mut conns: std::collections::HashMap<SocketAddr, Rc<RpcClient>> =
-                            std::collections::HashMap::new();
-                        let start_idx = tid * keys_per_thread;
-                        let end_idx = (start_idx + keys_per_thread).min(pc_keyinfo.len());
-                        if start_idx >= end_idx {
-                            return Vec::new();
-                        }
-                        let my_slice = &pc_keyinfo[start_idx..end_idx];
-                        let mut ki = 0usize;
-                        let mut local_latencies: Vec<f64> = Vec::new();
-                        let mut inflight = FuturesUnordered::new();
+                            use futures::stream::{FuturesUnordered, StreamExt};
+                            // Per-thread RpcClient connection cache keyed by ps_addr.
+                            let mut conns: std::collections::HashMap<SocketAddr, Rc<RpcClient>> =
+                                std::collections::HashMap::new();
+                            let start_idx = tid * keys_per_thread;
+                            let end_idx = (start_idx + keys_per_thread).min(pc_keyinfo.len());
+                            if start_idx >= end_idx {
+                                return Vec::new();
+                            }
+                            let my_slice = &pc_keyinfo[start_idx..end_idx];
+                            let mut ki = 0usize;
+                            let mut local_latencies: Vec<f64> = Vec::new();
+                            let mut inflight = FuturesUnordered::new();
 
-                        loop {
-                            // Refill pipeline up to max_depth while deadline not expired.
-                            while inflight.len() < max_depth
-                                && std::time::SystemTime::now() < *deadline
-                            {
-                                let (key, part_id, ps_addr) = &my_slice[ki % my_slice.len()];
-                                ki += 1;
-                                let ps = match conns.get(ps_addr) {
-                                    Some(c) => c.clone(),
-                                    None => match RpcClient::connect(*ps_addr).await {
-                                        Ok(c) => {
-                                            conns.insert(*ps_addr, c.clone());
-                                            c
-                                        }
-                                        Err(_) => continue,
-                                    },
-                                };
-                                let req_bytes = rkyv_encode(&GetReq {
-                                    part_id: *part_id,
-                                    key: key.as_bytes().to_vec(),
-                                    offset: 0,
-                                    length: 0,
-                                    // Bench: static topology, skip epoch check.
-                                    region_epoch: 0,
-                                });
-                                let t0 = Instant::now();
-                                // ZC read: recv the value straight into a registered
-                                // RegPool dest (UCX memh zero-copy; pool registers
-                                // once + reuses). DestMeta -> Bytes so both arms yield
-                                // the same Result type. Single async block = one FU type.
-                                inflight.push(async move {
-                                    let res = if zc_read {
-                                        #[cfg(feature = "ucx")]
-                                        {
-                                            let mut pb =
-                                                autumn_transport::regpool_acquire(value_size);
-                                            let (ptr, cap) = {
-                                                let d = pb.dest_mut();
-                                                (d.as_mut_ptr(), d.len())
-                                            };
-                                            let reg = pb.reg();
-                                            ps.call_into_dest(MSG_GET_ZC, req_bytes, ptr, cap, reg)
+                            loop {
+                                // Refill pipeline up to max_depth while deadline not expired.
+                                while inflight.len() < max_depth
+                                    && std::time::SystemTime::now() < *deadline
+                                {
+                                    let (key, part_id, ps_addr) = &my_slice[ki % my_slice.len()];
+                                    ki += 1;
+                                    let ps = match conns.get(ps_addr) {
+                                        Some(c) => c.clone(),
+                                        None => match RpcClient::connect(*ps_addr).await {
+                                            Ok(c) => {
+                                                conns.insert(*ps_addr, c.clone());
+                                                c
+                                            }
+                                            Err(_) => continue,
+                                        },
+                                    };
+                                    let req_bytes = rkyv_encode(&GetReq {
+                                        part_id: *part_id,
+                                        key: key.as_bytes().to_vec(),
+                                        offset: 0,
+                                        length: 0,
+                                        // Bench: static topology, skip epoch check.
+                                        region_epoch: 0,
+                                    });
+                                    let t0 = Instant::now();
+                                    // ZC read: recv the value straight into a registered
+                                    // RegPool dest (UCX memh zero-copy; pool registers
+                                    // once + reuses). DestMeta -> Bytes so both arms yield
+                                    // the same Result type. Single async block = one FU type.
+                                    inflight.push(async move {
+                                        let res = if zc_read {
+                                            #[cfg(feature = "ucx")]
+                                            {
+                                                let mut pb =
+                                                    autumn_transport::regpool_acquire(value_size);
+                                                let (ptr, cap) = {
+                                                    let d = pb.dest_mut();
+                                                    (d.as_mut_ptr(), d.len())
+                                                };
+                                                let reg = pb.reg();
+                                                ps.call_into_dest(
+                                                    MSG_GET_ZC, req_bytes, ptr, cap, reg,
+                                                )
                                                 .await
                                                 .map(|_| bytes::Bytes::new())
-                                        }
-                                        #[cfg(not(feature = "ucx"))]
-                                        {
-                                            let mut dest = vec![0u8; value_size];
-                                            ps.call_into_dest(
-                                                MSG_GET_ZC,
-                                                req_bytes,
-                                                dest.as_mut_ptr(),
-                                                dest.len(),
-                                                None,
-                                            )
-                                            .await
-                                            .map(|_| bytes::Bytes::new())
-                                        }
-                                    } else {
-                                        ps.call(MSG_GET, req_bytes).await
-                                    };
-                                    (res, t0.elapsed())
-                                });
-                            }
-                            // Drain one completion. When deadline passes AND inflight is
-                            // empty, next() returns None and we exit.
-                            match inflight.next().await {
-                                Some((res, elapsed)) => {
-                                    if res.is_ok() {
-                                        total_ops.fetch_add(1, Ordering::Relaxed);
-                                        local_latencies.push(elapsed.as_secs_f64() * 1000.0);
-                                    }
+                                            }
+                                            #[cfg(not(feature = "ucx"))]
+                                            {
+                                                let mut dest = vec![0u8; value_size];
+                                                ps.call_into_dest(
+                                                    MSG_GET_ZC,
+                                                    req_bytes,
+                                                    dest.as_mut_ptr(),
+                                                    dest.len(),
+                                                    None,
+                                                )
+                                                .await
+                                                .map(|_| bytes::Bytes::new())
+                                            }
+                                        } else {
+                                            ps.call(MSG_GET, req_bytes).await
+                                        };
+                                        (res, t0.elapsed())
+                                    });
                                 }
-                                None => break,
+                                // Drain one completion. When deadline passes AND inflight is
+                                // empty, next() returns None and we exit.
+                                match inflight.next().await {
+                                    Some((res, elapsed)) => {
+                                        if res.is_ok() {
+                                            total_ops.fetch_add(1, Ordering::Relaxed);
+                                            local_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                                        }
+                                    }
+                                    None => break,
+                                }
                             }
-                        }
-                        local_latencies
-                    })
+                            local_latencies
+                        })
                 });
                 read_handles.push(handle);
             }
@@ -1760,7 +1815,9 @@ async fn main() -> Result<()> {
                         if pct < threshold {
                             println!(
                                 "WARNING: {} ops/sec regressed: {:.0} vs baseline {:.0} ({:.0}%)",
-                                $label, $cur, $base,
+                                $label,
+                                $cur,
+                                $base,
                                 pct * 100.0
                             );
                             regressed = true;
@@ -1832,7 +1889,6 @@ async fn main() -> Result<()> {
                 std::process::exit(2);
             }
         }
-
     }
 
     Ok(())

@@ -30,11 +30,7 @@ impl AutumnManager {
     // compute `modified_extents` against that stale view —
     // potentially under-counting refs and approving deletion of
     // extents whose live VPs are in a newly-published SST.
-    async fn pull_and_apply_vp_refs(
-        &self,
-        part_id: u64,
-        part_addr: &str,
-    ) -> Result<(), AppError> {
+    async fn pull_and_apply_vp_refs(&self, part_id: u64, part_addr: &str) -> Result<(), AppError> {
         let req = autumn_rpc::partition_rpc::PullVpRefsReq { part_id };
         let payload = autumn_rpc::partition_rpc::rkyv_encode(&req);
         // 10 s — partition-side handler is a single `borrow()` over
@@ -49,12 +45,11 @@ impl AutumnManager {
                 Duration::from_secs(10),
             )
             .await
-            .map_err(|e| AppError::Internal(format!(
-                "F210-C4 pull_vp_refs RPC to {part_addr}: {e}"
-            )))?;
+            .map_err(|e| {
+                AppError::Internal(format!("F210-C4 pull_vp_refs RPC to {part_addr}: {e}"))
+            })?;
         let resp: autumn_rpc::partition_rpc::PullVpRefsResp =
-            autumn_rpc::partition_rpc::rkyv_decode(&resp_bytes)
-                .map_err(AppError::Internal)?;
+            autumn_rpc::partition_rpc::rkyv_decode(&resp_bytes).map_err(AppError::Internal)?;
         if resp.code != autumn_rpc::partition_rpc::CODE_OK {
             return Err(AppError::Precondition(format!(
                 "F210-C4 pull_vp_refs from {part_addr}: {}",
@@ -180,9 +175,7 @@ impl AutumnManager {
             // ── F211 operator-driven node lifecycle ──────────────────────
             MSG_LIST_NODE_STATES => self.handle_list_node_states(payload).await,
             MSG_EXTENT_HEALTH_REPORT => self.handle_extent_health_report(payload).await,
-            MSG_LIST_EC_INFLIGHT_MARKERS => {
-                self.handle_list_ec_inflight_markers(payload).await
-            }
+            MSG_LIST_EC_INFLIGHT_MARKERS => self.handle_list_ec_inflight_markers(payload).await,
             MSG_FENCE_NODE => self.handle_fence_node(payload).await,
             MSG_SET_NODE_MAINTENANCE => self.handle_set_node_maintenance(payload).await,
             MSG_CLEAR_NODE_OVERRIDE => self.handle_clear_node_override(payload).await,
@@ -263,7 +256,11 @@ impl AutumnManager {
         // `mgr_clear_node_override` before the node can come back.
         {
             let s = self.store.inner.borrow();
-            let prior = s.nodes.values().find(|n| n.address == req.addr).map(|n| n.node_id);
+            let prior = s
+                .nodes
+                .values()
+                .find(|n| n.address == req.addr)
+                .map(|n| n.node_id);
             if let Some(pid) = prior {
                 if self.decommissioned.borrow().contains_key(&pid) {
                     return Ok(rkyv_encode(&RegisterNodeResp {
@@ -297,10 +294,15 @@ impl AutumnManager {
         // to recover from a restart without requiring a full cluster wipe.
         let existing = {
             let s = self.store.inner.borrow();
-            s.nodes
-                .values()
-                .find(|n| n.address == req.addr)
-                .map(|n| (n.clone(), n.disks.iter().filter_map(|did| s.disks.get(did).cloned()).collect::<Vec<_>>()))
+            s.nodes.values().find(|n| n.address == req.addr).map(|n| {
+                (
+                    n.clone(),
+                    n.disks
+                        .iter()
+                        .filter_map(|did| s.disks.get(did).cloned())
+                        .collect::<Vec<_>>(),
+                )
+            })
         };
 
         if let Some((mut existing_node, existing_disks)) = existing {
@@ -483,7 +485,10 @@ impl AutumnManager {
         let err_msg: Option<String> = if total_replicas == 0 {
             Some("replicates must be >= 1".to_string())
         } else if ec_data == 0 {
-            Some("ec_data_shard must be >= 1 (use ec_data=N, ec_parity=0 for replica streams)".to_string())
+            Some(
+                "ec_data_shard must be >= 1 (use ec_data=N, ec_parity=0 for replica streams)"
+                    .to_string(),
+            )
         } else if ec_parity == 0 {
             // Replica path: ec_data must equal replicates exactly.
             if ec_data as usize != total_replicas {
@@ -519,23 +524,19 @@ impl AutumnManager {
         let online_node_ids = self.node_states.borrow().online_node_ids();
         let (stream_id, extent_id, selected) = {
             let mut s = self.store.inner.borrow_mut();
-            let selected = match Self::select_nodes(
-                &s.nodes,
-                &s.disks,
-                &online_node_ids,
-                total_replicas,
-                &[],
-            ) {
-                Ok(v) => v,
-                Err(err) => {
-                    return Ok(rkyv_encode(&CreateStreamResp {
-                        code: Self::err_to_code(&err),
-                        message: err.to_string(),
-                        stream: None,
-                        extent: None,
-                    }))
-                }
-            };
+            let selected =
+                match Self::select_nodes(&s.nodes, &s.disks, &online_node_ids, total_replicas, &[])
+                {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return Ok(rkyv_encode(&CreateStreamResp {
+                            code: Self::err_to_code(&err),
+                            message: err.to_string(),
+                            stream: None,
+                            extent: None,
+                        }))
+                    }
+                };
             let (start, _) = s.alloc_ids(2);
             (start, start + 1, selected)
         };
@@ -567,7 +568,10 @@ impl AutumnManager {
         for n in &selected {
             let mut candidate = n.clone();
             let (node_id, disk) = loop {
-                match self.alloc_extent_on_node(&candidate.address, extent_id).await {
+                match self
+                    .alloc_extent_on_node(&candidate.address, extent_id)
+                    .await
+                {
                     Ok(disk) => break (candidate.node_id, disk),
                     Err(_) => match fallback_iter.next() {
                         Some(alt) => candidate = alt,
@@ -771,16 +775,8 @@ impl AutumnManager {
 
     async fn handle_nodes_info(&self) -> HandlerResult {
         let s = self.store.inner.borrow();
-        let nodes = s
-            .nodes
-            .iter()
-            .map(|(&id, n)| (id, n.clone()))
-            .collect();
-        let disks_info = s
-            .disks
-            .iter()
-            .map(|(&id, d)| (id, d.clone()))
-            .collect();
+        let nodes = s.nodes.iter().map(|(&id, n)| (id, n.clone())).collect();
+        let disks_info = s.disks.iter().map(|(&id, d)| (id, d.clone())).collect();
         Ok(rkyv_encode(&NodesInfoResp {
             code: CODE_OK,
             message: String::new(),
@@ -1279,7 +1275,10 @@ impl AutumnManager {
         for n in &selected {
             let mut candidate = n.clone();
             let (node_id, disk) = loop {
-                match self.alloc_extent_on_node(&candidate.address, extent_id).await {
+                match self
+                    .alloc_extent_on_node(&candidate.address, extent_id)
+                    .await
+                {
                     Ok(disk) => break (candidate.node_id, disk),
                     Err(_) => match fallback_iter.next() {
                         Some(alt) => candidate = alt,
@@ -1359,10 +1358,7 @@ impl AutumnManager {
             let live_eversion = match s.extents.get(&tail.extent_id) {
                 Some(ex) => ex.eversion,
                 None => {
-                    let msg = format!(
-                        "extent {} was deleted during alloc_extent",
-                        tail.extent_id
-                    );
+                    let msg = format!("extent {} was deleted during alloc_extent", tail.extent_id);
                     return Ok(rkyv_encode(&StreamAllocExtentResp {
                         code: CODE_PRECONDITION,
                         message: msg,
@@ -1970,10 +1966,16 @@ impl AutumnManager {
                     let mut kvs =
                         Vec::with_capacity(new_streams.len() + modified_extents.len() + 5);
                     for st in &new_streams {
-                        kvs.push((format!("streams/{}", st.stream_id), rkyv_encode(st).to_vec()));
+                        kvs.push((
+                            format!("streams/{}", st.stream_id),
+                            rkyv_encode(st).to_vec(),
+                        ));
                     }
                     for ex in &modified_extents {
-                        kvs.push((format!("extents/{}", ex.extent_id), rkyv_encode(ex).to_vec()));
+                        kvs.push((
+                            format!("extents/{}", ex.extent_id),
+                            rkyv_encode(ex).to_vec(),
+                        ));
                     }
                     kvs.push((
                         format!("partitionVpRefs/{}", right_snapshot.part_id),
@@ -2027,7 +2029,11 @@ impl AutumnManager {
                     let left_id = left.part_id;
                     let right_id = right.part_id;
                     Self::apply_split_mutations(
-                        &mut s, &new_streams, &modified_extents, left, right,
+                        &mut s,
+                        &new_streams,
+                        &modified_extents,
+                        left,
+                        right,
                     );
                     s.partition_vp_refs
                         .insert(right_snapshot.part_id, right_snapshot);
@@ -2113,13 +2119,13 @@ impl AutumnManager {
                     .ok_or_else(|| {
                         AppError::NotFound(format!("partition {}", req.survivor_part_id))
                     })?;
-                let victim_meta = s
-                    .partitions
-                    .get(&req.victim_part_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        AppError::NotFound(format!("partition {}", req.victim_part_id))
-                    })?;
+                let victim_meta =
+                    s.partitions
+                        .get(&req.victim_part_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            AppError::NotFound(format!("partition {}", req.victim_part_id))
+                        })?;
                 let s_rg = survivor_meta
                     .rg
                     .clone()
@@ -2182,10 +2188,8 @@ impl AutumnManager {
                 let (new_tail_id, _) = s.alloc_ids(1);
                 // Pick K replica nodes for E_new (replication factor matches
                 // survivor's log_stream).
-                let log_stream_meta = s
-                    .streams
-                    .get(&survivor_meta.log_stream)
-                    .ok_or_else(|| {
+                let log_stream_meta =
+                    s.streams.get(&survivor_meta.log_stream).ok_or_else(|| {
                         AppError::Internal(format!("stream {}", survivor_meta.log_stream))
                     })?;
                 let target_replicas = if log_stream_meta.replicates > 0 {
@@ -2193,13 +2197,8 @@ impl AutumnManager {
                 } else {
                     3
                 };
-                let selected = Self::select_nodes(
-                    &s.nodes,
-                    &s.disks,
-                    &online_node_ids,
-                    target_replicas,
-                    &[],
-                )?;
+                let selected =
+                    Self::select_nodes(&s.nodes, &s.disks, &online_node_ids, target_replicas, &[])?;
                 let new_tail = MgrExtentInfo {
                     extent_id: new_tail_id,
                     replicates: selected.iter().map(|n| n.node_id).collect(),
@@ -2243,13 +2242,9 @@ impl AutumnManager {
                 all_extents.extend(row_exts);
                 all_extents.extend(meta_exts);
 
-                let merged_vp = Self::merged_partition_vp_refs(
-                    &s,
-                    req.survivor_part_id,
-                    req.victim_part_id,
-                );
-                let vp_extent_puts =
-                    Self::preview_partition_vp_refs_apply(&s, &merged_vp);
+                let merged_vp =
+                    Self::merged_partition_vp_refs(&s, req.survivor_part_id, req.victim_part_id);
+                let vp_extent_puts = Self::preview_partition_vp_refs_apply(&s, &merged_vp);
                 let all_extents = Self::merge_extent_updates(all_extents, vp_extent_puts);
 
                 let mut new_survivor_meta = survivor_meta.clone();
@@ -2289,8 +2284,7 @@ impl AutumnManager {
         // Phase 1.5: alloc_extent_on_node for E_new on each replica.
         // On per-node failure, fall back to other healthy nodes (mirrors
         // handle_stream_alloc_extent's fallback walk).
-        let p1_selected_ids: HashSet<u64> =
-            p1.selected_nodes.iter().map(|n| n.node_id).collect();
+        let p1_selected_ids: HashSet<u64> = p1.selected_nodes.iter().map(|n| n.node_id).collect();
         let mut fallback_nodes: Vec<MgrNodeInfo> = {
             let s = self.store.inner.borrow();
             s.nodes
@@ -2373,7 +2367,10 @@ impl AutumnManager {
             let now = Self::epoch_seconds();
             let mut kvs = Vec::with_capacity(p1.new_streams.len() + modified_extents.len() + 6);
             for st in &p1.new_streams {
-                kvs.push((format!("streams/{}", st.stream_id), rkyv_encode(st).to_vec()));
+                kvs.push((
+                    format!("streams/{}", st.stream_id),
+                    rkyv_encode(st).to_vec(),
+                ));
             }
             for ex in &modified_extents {
                 kvs.push((
@@ -2506,13 +2503,9 @@ impl AutumnManager {
                     .partitions
                     .get(&pid)
                     .ok_or_else(|| AppError::NotFound(format!("partition {pid}")))?;
-                let addr = s
-                    .part_addrs
-                    .get(&pid)
-                    .cloned()
-                    .ok_or_else(|| {
-                        AppError::Precondition(format!("partition {pid} has no PS addr"))
-                    })?;
+                let addr = s.part_addrs.get(&pid).cloned().ok_or_else(|| {
+                    AppError::Precondition(format!("partition {pid} has no PS addr"))
+                })?;
                 Ok(PartInfo {
                     part_addr: addr,
                     log_stream: pm.log_stream,
@@ -2585,8 +2578,10 @@ impl AutumnManager {
         let mut to_unfreeze: Vec<(String, u64)> = Vec::new();
         let rollback = |list: Vec<(String, u64)>, pool: Rc<ConnPool>| async move {
             for (addr, pid) in list.into_iter().rev() {
-                let unfreeze =
-                    autumn_rpc::partition_rpc::MergeFreezeReq { part_id: pid, freeze: false };
+                let unfreeze = autumn_rpc::partition_rpc::MergeFreezeReq {
+                    part_id: pid,
+                    freeze: false,
+                };
                 let payload = autumn_rpc::partition_rpc::rkyv_encode(&unfreeze);
                 // 10 s — best-effort rollback unfreeze; PS may already
                 // be torn down. Don't wedge the rollback path either.
@@ -2606,13 +2601,7 @@ impl AutumnManager {
         // deadlock-safe lock acquisition; here the freezes don't deadlock
         // each other but we keep the order for consistency with future
         // PS-side gate work).
-        if let Err(e) = send_freeze(
-            v_info.part_addr.clone(),
-            req.victim_part_id,
-            true,
-        )
-        .await
-        {
+        if let Err(e) = send_freeze(v_info.part_addr.clone(), req.victim_part_id, true).await {
             return Ok(rkyv_encode(&MergePartitionsResp {
                 code: Self::err_to_code(&e),
                 message: e.to_string(),
@@ -2621,13 +2610,7 @@ impl AutumnManager {
         }
         to_unfreeze.push((v_info.part_addr.clone(), req.victim_part_id));
 
-        if let Err(e) = send_freeze(
-            s_info.part_addr.clone(),
-            req.survivor_part_id,
-            true,
-        )
-        .await
-        {
+        if let Err(e) = send_freeze(s_info.part_addr.clone(), req.survivor_part_id, true).await {
             rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
             return Ok(rkyv_encode(&MergePartitionsResp {
                 code: Self::err_to_code(&e),
@@ -2731,8 +2714,7 @@ impl AutumnManager {
             row_sealed_lengths: row_lens,
             meta_sealed_lengths: meta_lens,
         };
-        let mmm_resp_bytes = match self.handle_multi_modify_merge(rkyv_encode(&mmm_req)).await
-        {
+        let mmm_resp_bytes = match self.handle_multi_modify_merge(rkyv_encode(&mmm_req)).await {
             Ok(b) => b,
             Err((code, msg)) => {
                 rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
@@ -2764,10 +2746,7 @@ impl AutumnManager {
 
     // ── F183: handle_get_policy_candidates / handle_report_partition_load ──
 
-    pub(crate) async fn handle_get_policy_candidates(
-        &self,
-        _payload: Bytes,
-    ) -> HandlerResult {
+    pub(crate) async fn handle_get_policy_candidates(&self, _payload: Bytes) -> HandlerResult {
         // F210-F6: leader gate. Pre-F210-F6 the handler returned
         // `advisory_cache` on any node, but only the leader's
         // `policy_tick_loop` populates the cache (follower's stays
@@ -2798,10 +2777,7 @@ impl AutumnManager {
     /// docs/code (the pre-F210-F1 off-by-one was caused by exactly
     /// that drift). No leader gate — the answer is a compile-time
     /// constant of THIS binary; any node can serve it.
-    pub(crate) async fn handle_get_policy_kind_names(
-        &self,
-        _payload: Bytes,
-    ) -> HandlerResult {
+    pub(crate) async fn handle_get_policy_kind_names(&self, _payload: Bytes) -> HandlerResult {
         Ok(rkyv_encode(&GetPolicyKindNamesResp {
             code: CODE_OK,
             message: String::new(),
@@ -2809,10 +2785,7 @@ impl AutumnManager {
         }))
     }
 
-    pub(crate) async fn handle_report_partition_load(
-        &self,
-        payload: Bytes,
-    ) -> HandlerResult {
+    pub(crate) async fn handle_report_partition_load(&self, payload: Bytes) -> HandlerResult {
         let req: ReportPartitionLoadReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         let now = Self::epoch_seconds();
@@ -2849,10 +2822,7 @@ impl AutumnManager {
     /// already-converted extent returns CODE_OK. Out-of-policy
     /// requests (non-EC stream, sealed_length=0, missing extent)
     /// return CODE_PRECONDITION with a descriptive message.
-    pub(crate) async fn handle_force_ec_convert(
-        &self,
-        payload: Bytes,
-    ) -> HandlerResult {
+    pub(crate) async fn handle_force_ec_convert(&self, payload: Bytes) -> HandlerResult {
         if !self.leader.get() {
             return Ok(rkyv_encode(&ForceEcConvertResp {
                 code: CODE_NOT_LEADER,
@@ -2912,9 +2882,10 @@ impl AutumnManager {
                     message: format!("extent {extent_id} already ec_converted"),
                 }));
             }
-            let stream = s.streams.values().find(|st| {
-                st.ec_parity_shard > 0 && st.extent_ids.contains(&extent_id)
-            });
+            let stream = s
+                .streams
+                .values()
+                .find(|st| st.ec_parity_shard > 0 && st.extent_ids.contains(&extent_id));
             let stream = match stream {
                 Some(s) => s.clone(),
                 None => {
@@ -3103,10 +3074,7 @@ impl AutumnManager {
     /// last bucket of `PolicyEngine.metrics`, populated by
     /// `MSG_REPORT_PARTITION_LOAD`. Lets `client info --detail`
     /// surface per-partition F202 metrics without a dedicated PS RPC.
-    pub(crate) async fn handle_get_partition_detail(
-        &self,
-        payload: Bytes,
-    ) -> HandlerResult {
+    pub(crate) async fn handle_get_partition_detail(&self, payload: Bytes) -> HandlerResult {
         // F209-A: followers' `policy.metrics` is empty (only the leader's
         // policy_tick_loop populates it from MSG_REPORT_PARTITION_LOAD).
         // Without this gate, querying a follower silently returned
@@ -3147,10 +3115,7 @@ impl AutumnManager {
     /// `require_recovery` from here — that's still owned by
     /// `recovery_dispatch_loop` (5 s tick) so a transient regional
     /// hiccup doesn't kick off a recovery storm.
-    pub(crate) async fn handle_report_disk_failure(
-        &self,
-        payload: Bytes,
-    ) -> HandlerResult {
+    pub(crate) async fn handle_report_disk_failure(&self, payload: Bytes) -> HandlerResult {
         let req: ReportDiskFailureReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         // Even on a follower (non-leader) we accept the report — the
@@ -3306,11 +3271,7 @@ impl AutumnManager {
 
     pub(crate) async fn handle_get_regions(&self) -> HandlerResult {
         let s = self.store.inner.borrow();
-        let regions = s
-            .regions
-            .iter()
-            .map(|(&id, r)| (id, r.clone()))
-            .collect();
+        let regions = s.regions.iter().map(|(&id, r)| (id, r.clone())).collect();
         let ps_details = s
             .ps_nodes
             .iter()
@@ -3576,9 +3537,7 @@ impl AutumnManager {
                     .unwrap_or((crate::node_state::NodeAutoState::Online, None));
                 let auto_state_byte = match auto_state {
                     crate::node_state::NodeAutoState::Online => NODE_AUTO_STATE_ONLINE,
-                    crate::node_state::NodeAutoState::Suspected { .. } => {
-                        NODE_AUTO_STATE_SUSPECTED
-                    }
+                    crate::node_state::NodeAutoState::Suspected { .. } => NODE_AUTO_STATE_SUSPECTED,
                     crate::node_state::NodeAutoState::Suspend => NODE_AUTO_STATE_SUSPEND,
                 };
                 let suspected_age = match auto_state {
@@ -3628,10 +3587,8 @@ impl AutumnManager {
             let snap = self.node_states.borrow().snapshot();
             (extents, overrides, snap)
         };
-        let snap_map: HashMap<u64, crate::node_state::NodeAutoState> = snapshot
-            .into_iter()
-            .map(|(id, st, _)| (id, st))
-            .collect();
+        let snap_map: HashMap<u64, crate::node_state::NodeAutoState> =
+            snapshot.into_iter().map(|(id, st, _)| (id, st)).collect();
         let mut out: Vec<ExtentHealth> = Vec::new();
         for ex in extents {
             let copies = Self::extent_nodes(&ex);
@@ -3650,17 +3607,14 @@ impl AutumnManager {
                     .unwrap_or(crate::node_state::NodeAutoState::Online);
                 let auto_byte = match auto {
                     crate::node_state::NodeAutoState::Online => NODE_AUTO_STATE_ONLINE,
-                    crate::node_state::NodeAutoState::Suspected { .. } => {
-                        NODE_AUTO_STATE_SUSPECTED
-                    }
+                    crate::node_state::NodeAutoState::Suspected { .. } => NODE_AUTO_STATE_SUSPECTED,
                     crate::node_state::NodeAutoState::Suspend => NODE_AUTO_STATE_SUSPEND,
                 };
                 let ovr = overrides
                     .get(&node_id)
                     .map(|o| o.kind)
                     .unwrap_or(NODE_OVERRIDE_NONE);
-                if !avali || auto_byte != NODE_AUTO_STATE_ONLINE || ovr != NODE_OVERRIDE_NONE
-                {
+                if !avali || auto_byte != NODE_AUTO_STATE_ONLINE || ovr != NODE_OVERRIDE_NONE {
                     any_unhealthy = true;
                 }
                 slots.push(ExtentSlotHealth {
@@ -3694,10 +3648,7 @@ impl AutumnManager {
         }))
     }
 
-    pub async fn handle_list_ec_inflight_markers(
-        &self,
-        _payload: Bytes,
-    ) -> HandlerResult {
+    pub async fn handle_list_ec_inflight_markers(&self, _payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&ListEcInflightMarkersResp {
                 code: Self::err_to_code(&err),
@@ -3712,7 +3663,9 @@ impl AutumnManager {
         let now_s = Self::epoch_seconds();
         let mut markers: Vec<InflightWithCoordState> = Vec::new();
         for (eid, rec) in self.inflight.borrow().iter() {
-            let Some((kind, payload)) = rec.unpack() else { continue };
+            let Some((kind, payload)) = rec.unpack() else {
+                continue;
+            };
             if kind != crate::extent_inflight::ExtentOpKind::ConvertToEc {
                 continue;
             }
@@ -3726,9 +3679,7 @@ impl AutumnManager {
                 .unwrap_or(crate::node_state::NodeAutoState::Online);
             let auto_byte = match auto {
                 crate::node_state::NodeAutoState::Online => NODE_AUTO_STATE_ONLINE,
-                crate::node_state::NodeAutoState::Suspected { .. } => {
-                    NODE_AUTO_STATE_SUSPECTED
-                }
+                crate::node_state::NodeAutoState::Suspected { .. } => NODE_AUTO_STATE_SUSPECTED,
                 crate::node_state::NodeAutoState::Suspend => NODE_AUTO_STATE_SUSPEND,
             };
             let ovr = overrides
@@ -3796,7 +3747,10 @@ impl AutumnManager {
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         // F211-C: zombie defense — refuse if node was decommissioned.
         if self.decommissioned.borrow().contains_key(&req.node_id) {
-            let msg = format!("node {} was previously decommissioned; cannot mark maintenance", req.node_id);
+            let msg = format!(
+                "node {} was previously decommissioned; cannot mark maintenance",
+                req.node_id
+            );
             self.append_audit(MgrAuditEntry {
                 op: AUDIT_OP_SET_NODE_MAINTENANCE,
                 node_id: req.node_id,
@@ -3970,9 +3924,7 @@ impl AutumnManager {
         if let Some(etcd) = &self.etcd {
             etcd.put_msgs_txn(vec![(key, value)]).await?;
         }
-        self.node_overrides
-            .borrow_mut()
-            .insert(req.node_id, ovr);
+        self.node_overrides.borrow_mut().insert(req.node_id, ovr);
         // F211-D: bump owner-lock revisions for every extent the
         // node holds (so any stale-cache writes by a revived ghost
         // are rejected). The bump is best-effort — owner revisions
@@ -3995,15 +3947,13 @@ impl AutumnManager {
         for ex in s.extents.values() {
             if Self::extent_nodes(ex).contains(&node_id) {
                 // Per-shard size for EC, full size for replication.
-                let shard_size = if ex.ec_converted
-                    && !ex.replicates.is_empty()
-                    && !ex.parity.is_empty()
-                {
-                    let k = ex.replicates.len() as u64;
-                    ex.sealed_length.div_ceil(k.max(1))
-                } else {
-                    ex.sealed_length
-                };
+                let shard_size =
+                    if ex.ec_converted && !ex.replicates.is_empty() && !ex.parity.is_empty() {
+                        let k = ex.replicates.len() as u64;
+                        ex.sealed_length.div_ceil(k.max(1))
+                    } else {
+                        ex.sealed_length
+                    };
                 data_to_migrate = data_to_migrate.saturating_add(shard_size);
             }
         }
@@ -4145,8 +4095,7 @@ impl AutumnManager {
             .get(&req.node_id)
             .map(|n| n.disks.clone())
             .unwrap_or_default();
-        let disk_keys: Vec<String> =
-            disk_ids.iter().map(|d| format!("disks/{}", d)).collect();
+        let disk_keys: Vec<String> = disk_ids.iter().map(|d| format!("disks/{}", d)).collect();
         if let Some(etcd) = &self.etcd {
             let mut deletes = vec![override_key.clone(), node_key.clone()];
             deletes.extend(disk_keys.iter().cloned());
@@ -4154,12 +4103,7 @@ impl AutumnManager {
                 .put_and_delete_txn(vec![(tomb_key, tomb_val)], deletes)
                 .await
             {
-                return Err((
-                    Self::err_to_code(&e),
-                    e.to_string(),
-                    vec![],
-                    vec![],
-                ));
+                return Err((Self::err_to_code(&e), e.to_string(), vec![], vec![]));
             }
         }
         // Apply to in-memory.
@@ -4172,9 +4116,7 @@ impl AutumnManager {
         }
         self.node_overrides.borrow_mut().remove(&req.node_id);
         self.node_states.borrow_mut().drop_node(req.node_id);
-        self.decommissioned
-            .borrow_mut()
-            .insert(req.node_id, tomb);
+        self.decommissioned.borrow_mut().insert(req.node_id, tomb);
         Ok(())
     }
 
@@ -4194,7 +4136,14 @@ impl AutumnManager {
             .backoff_snapshot()
             .into_iter()
             .map(
-                |(extent_id, slot, consecutive_failures, last_attempt_at, next_retry_at, reason)| {
+                |(
+                    extent_id,
+                    slot,
+                    consecutive_failures,
+                    last_attempt_at,
+                    next_retry_at,
+                    reason,
+                )| {
                     RecoveryBackoffEntry {
                         extent_id,
                         slot,

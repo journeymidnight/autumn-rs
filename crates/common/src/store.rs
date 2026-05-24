@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use autumn_rpc::manager_rpc::{
-    MgrDiskInfo, MgrExtentInfo, MgrNodeInfo, MgrPartitionMeta, MgrPartitionVpRefs,
-    MgrRegionInfo, MgrStreamInfo,
+    MgrDiskInfo, MgrExtentInfo, MgrNodeInfo, MgrPartitionMeta, MgrPartitionVpRefs, MgrRegionInfo,
+    MgrStreamInfo,
 };
 
 use crate::{AppError, AppResult};

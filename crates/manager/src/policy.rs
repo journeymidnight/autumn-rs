@@ -284,7 +284,8 @@ impl PolicyEngine {
                 None => false,
             }
         });
-        self.last_hot_cold_at.retain(|ps_id, _| known_pses.contains(ps_id));
+        self.last_hot_cold_at
+            .retain(|ps_id, _| known_pses.contains(ps_id));
         // last_advisory_at entries naturally age out as policy_tick_loop
         // overwrites the cache; not worth a targeted prune.
     }
@@ -378,9 +379,7 @@ impl PolicyEngine {
         for win in sorted_parts.windows(2) {
             let (left_id, left_meta) = win[0];
             let (right_id, right_meta) = win[1];
-            if left_meta.rg.as_ref().unwrap().end_key
-                != right_meta.rg.as_ref().unwrap().start_key
-            {
+            if left_meta.rg.as_ref().unwrap().end_key != right_meta.rg.as_ref().unwrap().start_key {
                 continue;
             }
             let lw = match self.metrics.get(&left_id) {
@@ -467,10 +466,7 @@ impl PolicyEngine {
     /// `same_ps = true` (not meaningful for maintenance), `last_op_at`
     /// carries the kind-specific last-run timestamp so the operator
     /// dashboard can render "since X minutes ago".
-    pub fn compute_maintenance_advisory(
-        &mut self,
-        now: i64,
-    ) -> Vec<PolicyCandidate> {
+    pub fn compute_maintenance_advisory(&mut self, now: i64) -> Vec<PolicyCandidate> {
         let mut out = Vec::new();
         let cfg = self.config.clone();
 
@@ -490,8 +486,7 @@ impl PolicyEngine {
             // Skip when an inflight GC is already chewing on this
             // partition; let that complete before re-advising.
             if recent.gc_inflight == 0
-                && (recent.last_gc_at == 0
-                    || now - recent.last_gc_at >= cfg.gc_cooldown_sec)
+                && (recent.last_gc_at == 0 || now - recent.last_gc_at >= cfg.gc_cooldown_sec)
                 && bs.iter().all(|(_, l)| l.gc_debt_bytes > cfg.gc_debt_high)
             {
                 out.push(PolicyCandidate {
@@ -516,9 +511,9 @@ impl PolicyEngine {
             if recent.compact_inflight == 0
                 && (recent.last_compact_at == 0
                     || now - recent.last_compact_at >= cfg.compact_cooldown_sec)
-                && bs.iter().all(|(_, l)| {
-                    l.pending_compaction_bytes > cfg.compact_pending_high
-                })
+                && bs
+                    .iter()
+                    .all(|(_, l)| l.pending_compaction_bytes > cfg.compact_pending_high)
             {
                 out.push(PolicyCandidate {
                     kind: POLICY_KIND_MAJOR_COMPACT,
@@ -549,9 +544,9 @@ impl PolicyEngine {
                 && recent.minor_compact_pending_bytes > 0
                 && (recent.last_compact_at == 0
                     || now - recent.last_compact_at >= cfg.minor_compact_cooldown_sec)
-                && bs.iter().all(|(_, l)| {
-                    l.minor_compact_pending_bytes > cfg.minor_compact_pending_high
-                })
+                && bs
+                    .iter()
+                    .all(|(_, l)| l.minor_compact_pending_bytes > cfg.minor_compact_pending_high)
             {
                 out.push(PolicyCandidate {
                     kind: POLICY_KIND_MINOR_COMPACT,
@@ -594,11 +589,7 @@ impl PolicyEngine {
     /// negative-EV operation. Operators who still want to convert
     /// such extents can use `client set-stream-ec --stream <ID>`
     /// which bypasses the advisory layer entirely.
-    pub fn compute_ec_advisory(
-        &self,
-        state: &MetadataState,
-        now: i64,
-    ) -> Vec<PolicyCandidate> {
+    pub fn compute_ec_advisory(&self, state: &MetadataState, now: i64) -> Vec<PolicyCandidate> {
         let mut out = Vec::new();
         let cfg = &self.config;
         for stream in state.streams.values() {
@@ -835,10 +826,14 @@ impl PolicyEngine {
             // Hottest part = first qps_hot if QPS triggered else first
             // size_hot; coldest = symmetric. Fall back to 0 when a
             // dimension didn't trigger or its hot/cold list is empty.
-            let primary = qps_hot.first().copied()
+            let primary = qps_hot
+                .first()
+                .copied()
                 .or_else(|| size_hot.first().copied())
                 .unwrap_or(0);
-            let secondary = qps_cold.first().copied()
+            let secondary = qps_cold
+                .first()
+                .copied()
                 .or_else(|| size_cold.first().copied())
                 .unwrap_or(0);
             let mut reason_parts: Vec<String> = Vec::new();

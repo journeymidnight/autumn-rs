@@ -53,38 +53,34 @@
 // remain pure-data; the unsafe surface is small and centralised.
 #![allow(unsafe_code)]
 
-pub mod opcode;
-pub mod sqe;
-pub mod cqe;
-pub mod header;
 pub mod buffer_pool;
-pub mod ring;
+pub mod cqe;
 pub mod handshake;
+pub mod header;
+pub mod opcode;
+pub mod ring;
+pub mod sqe;
 
 #[cfg(target_os = "linux")]
-pub mod socket;
+pub mod client;
 #[cfg(target_os = "linux")]
 pub mod mmap;
 #[cfg(target_os = "linux")]
-pub mod client;
+pub mod socket;
 
-pub use opcode::Opcode;
-pub use sqe::{Sqe, SqeDecodeError};
+pub use buffer_pool::{BufferPoolError, BufferPoolLayout};
 pub use cqe::{Cqe, CqeDecodeError};
-pub use header::{
-    RingHeader, RingHeaderDecodeError, RING_MAGIC, RING_VERSION,
-    DEFAULT_SQ_ENTRIES, DEFAULT_CQ_ENTRIES, DEFAULT_BUF_POOL_SIZE,
-    DEFAULT_BUF_SLOT_SIZE,
-};
-pub use buffer_pool::{BufferPoolLayout, BufferPoolError};
-pub use ring::{
-    SqProducer, SqConsumer, CqProducer, CqConsumer, allocate_test_region,
-};
 pub use handshake::{
-    HelloRequest, HelloResponse, HelloStatus, MsgType, DaemonLimits,
-    HandshakeDecodeError, negotiate, HANDSHAKE_MAGIC, HELLO_REQUEST_SIZE,
-    HELLO_RESPONSE_SIZE,
+    negotiate, DaemonLimits, HandshakeDecodeError, HelloRequest, HelloResponse, HelloStatus,
+    MsgType, HANDSHAKE_MAGIC, HELLO_REQUEST_SIZE, HELLO_RESPONSE_SIZE,
 };
+pub use header::{
+    RingHeader, RingHeaderDecodeError, DEFAULT_BUF_POOL_SIZE, DEFAULT_BUF_SLOT_SIZE,
+    DEFAULT_CQ_ENTRIES, DEFAULT_SQ_ENTRIES, RING_MAGIC, RING_VERSION,
+};
+pub use opcode::Opcode;
+pub use ring::{allocate_test_region, CqConsumer, CqProducer, SqConsumer, SqProducer};
+pub use sqe::{Sqe, SqeDecodeError};
 
 /// All decode errors produced by this crate share this surface so a
 /// daemon poll loop can match on a single error type.

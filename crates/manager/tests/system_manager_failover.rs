@@ -63,7 +63,13 @@ fn manager_failover_preserves_streams_and_partitions() {
         let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
 
         for i in 0..10 {
-            ps_put(&ps, 801, format!("k-{i:02}").as_bytes(), format!("v-{i}").as_bytes()).await;
+            ps_put(
+                &ps,
+                801,
+                format!("k-{i:02}").as_bytes(),
+                format!("v-{i}").as_bytes(),
+            )
+            .await;
         }
 
         // Start M2 (as follower while M1 is alive)
@@ -75,12 +81,21 @@ fn manager_failover_preserves_streams_and_partitions() {
 
         // M2 should have replayed the streams
         let resp = mgr2
-            .call(MSG_STREAM_INFO, rkyv_encode(&StreamInfoReq { stream_ids: vec![log, row, meta] }))
+            .call(
+                MSG_STREAM_INFO,
+                rkyv_encode(&StreamInfoReq {
+                    stream_ids: vec![log, row, meta],
+                }),
+            )
             .await
             .expect("m2 stream_info");
         let info: StreamInfoResp = rkyv_decode(&resp).expect("decode");
         assert_eq!(info.code, CODE_OK);
-        assert_eq!(info.streams.len(), 3, "M2 should have all 3 streams from replay");
+        assert_eq!(
+            info.streams.len(),
+            3,
+            "M2 should have all 3 streams from replay"
+        );
 
         // M2 should have the partition
         let regions = get_regions(&mgr2).await;
@@ -91,11 +106,21 @@ fn manager_failover_preserves_streams_and_partitions() {
 
         // M2 is a follower, so writes should be rejected
         let resp = mgr2
-            .call(MSG_CREATE_STREAM, rkyv_encode(&CreateStreamReq { replicates: 2, ec_data_shard: 2, ec_parity_shard: 0 }))
+            .call(
+                MSG_CREATE_STREAM,
+                rkyv_encode(&CreateStreamReq {
+                    replicates: 2,
+                    ec_data_shard: 2,
+                    ec_parity_shard: 0,
+                }),
+            )
             .await
             .expect("create on follower");
         let cr: CreateStreamResp = rkyv_decode(&resp).expect("decode");
-        assert_eq!(cr.code, CODE_NOT_LEADER, "writes on follower must be rejected");
+        assert_eq!(
+            cr.code, CODE_NOT_LEADER,
+            "writes on follower must be rejected"
+        );
     });
 }
 
@@ -130,7 +155,13 @@ fn manager_crash_during_split_state_consistent() {
         let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
 
         for i in 0..10 {
-            ps_put(&ps, 901, format!("d-{i:02}").as_bytes(), format!("v-{i}").as_bytes()).await;
+            ps_put(
+                &ps,
+                901,
+                format!("d-{i:02}").as_bytes(),
+                format!("v-{i}").as_bytes(),
+            )
+            .await;
         }
         ps_flush(&ps, 901).await;
 
@@ -143,12 +174,27 @@ fn manager_crash_during_split_state_consistent() {
             .await
             .expect("split");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&resp).expect("decode");
-        assert_eq!(sr.code, partition_rpc::CODE_OK, "split failed: {}", sr.message);
+        assert_eq!(
+            sr.code,
+            partition_rpc::CODE_OK,
+            "split failed: {}",
+            sr.message
+        );
 
         // Verify M1 has 2 partitions
         let regions = get_regions(&mgr1).await;
-        assert_eq!(regions.regions.len(), 2, "M1 should have 2 partitions after split");
-        let right_id = regions.regions.iter().find(|(_, r)| r.part_id != 901).unwrap().1.part_id;
+        assert_eq!(
+            regions.regions.len(),
+            2,
+            "M1 should have 2 partitions after split"
+        );
+        let right_id = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id != 901)
+            .unwrap()
+            .1
+            .part_id;
 
         // M2 starts and replays from etcd — should also see 2 partitions
         let mgr2_addr = pick_addr();
@@ -159,7 +205,8 @@ fn manager_crash_during_split_state_consistent() {
 
         let regions2 = get_regions(&mgr2).await;
         assert_eq!(
-            regions2.regions.len(), 2,
+            regions2.regions.len(),
+            2,
             "M2 should have 2 partitions from etcd replay after split"
         );
         assert!(
@@ -174,12 +221,21 @@ fn manager_crash_during_split_state_consistent() {
         // Verify stream structure is consistent: the new streams created by split
         // should exist in M2
         let resp = mgr2
-            .call(MSG_STREAM_INFO, rkyv_encode(&StreamInfoReq { stream_ids: vec![log, row, meta] }))
+            .call(
+                MSG_STREAM_INFO,
+                rkyv_encode(&StreamInfoReq {
+                    stream_ids: vec![log, row, meta],
+                }),
+            )
             .await
             .expect("m2 stream_info");
         let info: StreamInfoResp = rkyv_decode(&resp).expect("decode");
         assert_eq!(info.code, CODE_OK);
         // Original streams should still exist (left partition uses them)
-        assert_eq!(info.streams.len(), 3, "original streams should survive split replay");
+        assert_eq!(
+            info.streams.len(),
+            3,
+            "original streams should survive split replay"
+        );
     });
 }

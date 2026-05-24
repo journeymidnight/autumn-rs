@@ -52,15 +52,10 @@ fn pick_addr() -> SocketAddr {
 ///
 /// `data_dir` must exist. `disk_id` is passed via `ExtentNodeConfig::new`
 /// (single-disk mode, no disk_id file required).
-fn spawn_sharded_node(
-    data_dir: &std::path::Path,
-    disk_id: u64,
-    shards: u32,
-) -> Vec<SocketAddr> {
+fn spawn_sharded_node(data_dir: &std::path::Path, disk_id: u64, shards: u32) -> Vec<SocketAddr> {
     // Pick ports up-front so every shard knows the sibling list.
     let mut shard_addrs: Vec<SocketAddr> = (0..shards).map(|_| pick_addr()).collect();
-    let sibling_strings: Vec<String> =
-        shard_addrs.iter().map(|a| a.to_string()).collect();
+    let sibling_strings: Vec<String> = shard_addrs.iter().map(|a| a.to_string()).collect();
 
     for (idx, addr) in shard_addrs.iter_mut().enumerate() {
         let data = data_dir.to_path_buf();
@@ -130,47 +125,77 @@ fn f099m_shards_serve_disjoint_extents() {
     let addrs = spawn_sharded_node(tmp.path(), 1, 2);
     assert_eq!(addrs.len(), 2);
 
-    compio::runtime::Runtime::new().unwrap().block_on(async move {
-        // Alloc extent 100 (even → shard 0). Target shard 0's port.
-        let r100 = alloc_on(addrs[0], 100).await;
-        assert_eq!(r100.code, autumn_rpc::manager_rpc::CODE_OK, "alloc 100 on shard 0 should succeed");
+    compio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async move {
+            // Alloc extent 100 (even → shard 0). Target shard 0's port.
+            let r100 = alloc_on(addrs[0], 100).await;
+            assert_eq!(
+                r100.code,
+                autumn_rpc::manager_rpc::CODE_OK,
+                "alloc 100 on shard 0 should succeed"
+            );
 
-        // Alloc extent 101 (odd → shard 1). Target shard 1's port.
-        let r101 = alloc_on(addrs[1], 101).await;
-        assert_eq!(r101.code, autumn_rpc::manager_rpc::CODE_OK, "alloc 101 on shard 1 should succeed");
+            // Alloc extent 101 (odd → shard 1). Target shard 1's port.
+            let r101 = alloc_on(addrs[1], 101).await;
+            assert_eq!(
+                r101.code,
+                autumn_rpc::manager_rpc::CODE_OK,
+                "alloc 101 on shard 1 should succeed"
+            );
 
-        // commit_length for extent 100 on shard 0 → OK (len=0)
-        let cl = commit_length_on(addrs[0], 100).await.expect("rpc ok");
-        assert_eq!(cl.code, autumn_rpc::manager_rpc::CODE_OK, "commit_length 100 on owner shard 0");
-        assert_eq!(cl.length, 0);
+            // commit_length for extent 100 on shard 0 → OK (len=0)
+            let cl = commit_length_on(addrs[0], 100).await.expect("rpc ok");
+            assert_eq!(
+                cl.code,
+                autumn_rpc::manager_rpc::CODE_OK,
+                "commit_length 100 on owner shard 0"
+            );
+            assert_eq!(cl.length, 0);
 
-        // commit_length for extent 100 on shard 1 → wrong-shard rejection
-        //
-        // Hot-path RPCs (commit_length/append/read_bytes) don't forward;
-        // they return FailedPrecondition to surface client routing bugs.
-        match commit_length_on(addrs[1], 100).await {
-            Err(autumn_rpc::RpcError::Status { code, message }) => {
-                assert_eq!(code, StatusCode::FailedPrecondition,
-                    "wrong-shard commit_length should be FailedPrecondition, got {message}");
-                assert!(message.contains("shard"), "error msg should mention shard: {message}");
+            // commit_length for extent 100 on shard 1 → wrong-shard rejection
+            //
+            // Hot-path RPCs (commit_length/append/read_bytes) don't forward;
+            // they return FailedPrecondition to surface client routing bugs.
+            match commit_length_on(addrs[1], 100).await {
+                Err(autumn_rpc::RpcError::Status { code, message }) => {
+                    assert_eq!(
+                        code,
+                        StatusCode::FailedPrecondition,
+                        "wrong-shard commit_length should be FailedPrecondition, got {message}"
+                    );
+                    assert!(
+                        message.contains("shard"),
+                        "error msg should mention shard: {message}"
+                    );
+                }
+                Ok(v) => panic!(
+                    "expected wrong-shard rejection, got Ok(code={}, length={})",
+                    v.code, v.length
+                ),
+                Err(e) => panic!("expected wrong-shard rejection, got {e:?}"),
             }
-            Ok(v) => panic!("expected wrong-shard rejection, got Ok(code={}, length={})", v.code, v.length),
-            Err(e) => panic!("expected wrong-shard rejection, got {e:?}"),
-        }
 
-        // commit_length for extent 101 on shard 1 → OK
-        let cl = commit_length_on(addrs[1], 101).await.expect("rpc ok");
-        assert_eq!(cl.code, autumn_rpc::manager_rpc::CODE_OK, "commit_length 101 on owner shard 1");
+            // commit_length for extent 101 on shard 1 → OK
+            let cl = commit_length_on(addrs[1], 101).await.expect("rpc ok");
+            assert_eq!(
+                cl.code,
+                autumn_rpc::manager_rpc::CODE_OK,
+                "commit_length 101 on owner shard 1"
+            );
 
-        // commit_length for extent 101 on shard 0 → wrong-shard rejection
-        match commit_length_on(addrs[0], 101).await {
-            Err(autumn_rpc::RpcError::Status { code, .. }) => {
-                assert_eq!(code, StatusCode::FailedPrecondition);
+            // commit_length for extent 101 on shard 0 → wrong-shard rejection
+            match commit_length_on(addrs[0], 101).await {
+                Err(autumn_rpc::RpcError::Status { code, .. }) => {
+                    assert_eq!(code, StatusCode::FailedPrecondition);
+                }
+                Ok(v) => panic!(
+                    "expected wrong-shard rejection, got Ok(code={}, length={})",
+                    v.code, v.length
+                ),
+                Err(e) => panic!("expected wrong-shard rejection, got {e:?}"),
             }
-            Ok(v) => panic!("expected wrong-shard rejection, got Ok(code={}, length={})", v.code, v.length),
-            Err(e) => panic!("expected wrong-shard rejection, got {e:?}"),
-        }
-    });
+        });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -183,82 +208,90 @@ fn f099m_shards_serve_disjoint_extents() {
 fn f099m_register_node_reports_shard_ports() {
     let mgr_addr = pick_addr();
     std::thread::spawn(move || {
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            let mgr = AutumnManager::new();
-            let _ = mgr.serve(mgr_addr).await;
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                let mgr = AutumnManager::new();
+                let _ = mgr.serve(mgr_addr).await;
+            });
     });
     std::thread::sleep(Duration::from_millis(200));
 
-    compio::runtime::Runtime::new().unwrap().block_on(async move {
-        let client = RpcClient::connect(mgr_addr).await.expect("rpc connect");
+    compio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async move {
+            let client = RpcClient::connect(mgr_addr).await.expect("rpc connect");
 
-        // Register a node that claims to have 4 shards on ports 7001..7004.
-        let req = RegisterNodeReq {
-            addr: "127.0.0.1:7001".to_string(),
-            disk_uuids: vec!["disk-shardtest".to_string()],
-            shard_ports: vec![7001, 7011, 7021, 7031],
-            control_address: String::new(),
-        };
-        let resp = client
-            .call(MSG_REGISTER_NODE, rkyv_encode(&req))
-            .await
-            .expect("register_node");
-        let decoded: RegisterNodeResp = rkyv_decode(&resp).expect("decode");
-        assert_eq!(decoded.code, CODE_OK, "register_node should succeed: {}", decoded.message);
-        let node_id = decoded.node_id;
+            // Register a node that claims to have 4 shards on ports 7001..7004.
+            let req = RegisterNodeReq {
+                addr: "127.0.0.1:7001".to_string(),
+                disk_uuids: vec!["disk-shardtest".to_string()],
+                shard_ports: vec![7001, 7011, 7021, 7031],
+                control_address: String::new(),
+            };
+            let resp = client
+                .call(MSG_REGISTER_NODE, rkyv_encode(&req))
+                .await
+                .expect("register_node");
+            let decoded: RegisterNodeResp = rkyv_decode(&resp).expect("decode");
+            assert_eq!(
+                decoded.code, CODE_OK,
+                "register_node should succeed: {}",
+                decoded.message
+            );
+            let node_id = decoded.node_id;
 
-        // NodesInfo must surface shard_ports.
-        let resp = client
-            .call(MSG_NODES_INFO, Bytes::new())
-            .await
-            .expect("nodes_info");
-        let nodes: NodesInfoResp = rkyv_decode(&resp).expect("decode nodes info");
-        assert_eq!(nodes.code, CODE_OK);
-        let found = nodes
-            .nodes
-            .iter()
-            .find(|(id, _)| *id == node_id)
-            .map(|(_, n)| n.clone())
-            .expect("our node must appear in nodes_info");
-        assert_eq!(
-            found.shard_ports,
-            vec![7001, 7011, 7021, 7031],
-            "shard_ports must round-trip through manager"
-        );
+            // NodesInfo must surface shard_ports.
+            let resp = client
+                .call(MSG_NODES_INFO, Bytes::new())
+                .await
+                .expect("nodes_info");
+            let nodes: NodesInfoResp = rkyv_decode(&resp).expect("decode nodes info");
+            assert_eq!(nodes.code, CODE_OK);
+            let found = nodes
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == node_id)
+                .map(|(_, n)| n.clone())
+                .expect("our node must appear in nodes_info");
+            assert_eq!(
+                found.shard_ports,
+                vec![7001, 7011, 7021, 7031],
+                "shard_ports must round-trip through manager"
+            );
 
-        // Legacy-mode node: empty shard_ports (single-thread extent-node).
-        let req = RegisterNodeReq {
-            addr: "127.0.0.1:7101".to_string(),
-            disk_uuids: vec!["disk-legacy".to_string()],
-            shard_ports: vec![],
-            control_address: String::new(),
-        };
-        let resp = client
-            .call(MSG_REGISTER_NODE, rkyv_encode(&req))
-            .await
-            .expect("register_node legacy");
-        let decoded: RegisterNodeResp = rkyv_decode(&resp).expect("decode");
-        assert_eq!(decoded.code, CODE_OK);
-        let legacy_id = decoded.node_id;
+            // Legacy-mode node: empty shard_ports (single-thread extent-node).
+            let req = RegisterNodeReq {
+                addr: "127.0.0.1:7101".to_string(),
+                disk_uuids: vec!["disk-legacy".to_string()],
+                shard_ports: vec![],
+                control_address: String::new(),
+            };
+            let resp = client
+                .call(MSG_REGISTER_NODE, rkyv_encode(&req))
+                .await
+                .expect("register_node legacy");
+            let decoded: RegisterNodeResp = rkyv_decode(&resp).expect("decode");
+            assert_eq!(decoded.code, CODE_OK);
+            let legacy_id = decoded.node_id;
 
-        let resp = client
-            .call(MSG_NODES_INFO, Bytes::new())
-            .await
-            .expect("nodes_info");
-        let nodes: NodesInfoResp = rkyv_decode(&resp).expect("decode");
-        let legacy = nodes
-            .nodes
-            .iter()
-            .find(|(id, _)| *id == legacy_id)
-            .map(|(_, n)| n.clone())
-            .expect("legacy node");
-        assert!(
-            legacy.shard_ports.is_empty(),
-            "legacy node should have empty shard_ports, got {:?}",
-            legacy.shard_ports
-        );
-    });
+            let resp = client
+                .call(MSG_NODES_INFO, Bytes::new())
+                .await
+                .expect("nodes_info");
+            let nodes: NodesInfoResp = rkyv_decode(&resp).expect("decode");
+            let legacy = nodes
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == legacy_id)
+                .map(|(_, n)| n.clone())
+                .expect("legacy node");
+            assert!(
+                legacy.shard_ports.is_empty(),
+                "legacy node should have empty shard_ports, got {:?}",
+                legacy.shard_ports
+            );
+        });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -310,74 +343,76 @@ fn f099m_client_routes_by_extent_id_modulo() {
     let addrs = spawn_sharded_node(tmp.path(), 2, 2);
     let shard_ports: Vec<u16> = addrs.iter().map(|a| a.port()).collect();
 
-    compio::runtime::Runtime::new().unwrap().block_on(async move {
-        let base = format!("127.0.0.1:{}", shard_ports[0]);
-        let pool = ConnPool::new();
+    compio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async move {
+            let base = format!("127.0.0.1:{}", shard_ports[0]);
+            let pool = ConnPool::new();
 
-        // Even extent → shard 0.
-        let even_id = 200u64;
-        let routed = shard_addr_for_extent(&base, &shard_ports, even_id);
-        assert_eq!(routed, format!("127.0.0.1:{}", shard_ports[0]));
+            // Even extent → shard 0.
+            let even_id = 200u64;
+            let routed = shard_addr_for_extent(&base, &shard_ports, even_id);
+            assert_eq!(routed, format!("127.0.0.1:{}", shard_ports[0]));
 
-        let r = pool
-            .call(
-                &routed,
-                MSG_ALLOC_EXTENT,
-                rkyv_encode(&AllocExtentReq { extent_id: even_id }),
-            )
-            .await
-            .expect("alloc");
-        let _: AllocExtentResp = rkyv_decode(&r).expect("decode");
+            let r = pool
+                .call(
+                    &routed,
+                    MSG_ALLOC_EXTENT,
+                    rkyv_encode(&AllocExtentReq { extent_id: even_id }),
+                )
+                .await
+                .expect("alloc");
+            let _: AllocExtentResp = rkyv_decode(&r).expect("decode");
 
-        let append = AppendReq {
-            extent_id: even_id,
-            eversion: 1,
-            commit: 0,
-            revision: 1,
-            payload: Bytes::from_static(b"hello-f099m-even"),
-        };
-        let r = pool
-            .call(&routed, MSG_APPEND, append.encode())
-            .await
-            .expect("append");
-        let appended = AppendResp::decode(r).expect("decode");
-        assert_eq!(
-            appended.code,
-            autumn_rpc::manager_rpc::CODE_OK,
-            "append must land on owner shard"
-        );
-        assert_eq!(appended.end as usize, b"hello-f099m-even".len());
+            let append = AppendReq {
+                extent_id: even_id,
+                eversion: 1,
+                commit: 0,
+                revision: 1,
+                payload: Bytes::from_static(b"hello-f099m-even"),
+            };
+            let r = pool
+                .call(&routed, MSG_APPEND, append.encode())
+                .await
+                .expect("append");
+            let appended = AppendResp::decode(r).expect("decode");
+            assert_eq!(
+                appended.code,
+                autumn_rpc::manager_rpc::CODE_OK,
+                "append must land on owner shard"
+            );
+            assert_eq!(appended.end as usize, b"hello-f099m-even".len());
 
-        // Odd extent → shard 1.
-        let odd_id = 201u64;
-        let routed = shard_addr_for_extent(&base, &shard_ports, odd_id);
-        assert_eq!(routed, format!("127.0.0.1:{}", shard_ports[1]));
+            // Odd extent → shard 1.
+            let odd_id = 201u64;
+            let routed = shard_addr_for_extent(&base, &shard_ports, odd_id);
+            assert_eq!(routed, format!("127.0.0.1:{}", shard_ports[1]));
 
-        let r = pool
-            .call(
-                &routed,
-                MSG_ALLOC_EXTENT,
-                rkyv_encode(&AllocExtentReq { extent_id: odd_id }),
-            )
-            .await
-            .expect("alloc");
-        let _: AllocExtentResp = rkyv_decode(&r).expect("decode");
+            let r = pool
+                .call(
+                    &routed,
+                    MSG_ALLOC_EXTENT,
+                    rkyv_encode(&AllocExtentReq { extent_id: odd_id }),
+                )
+                .await
+                .expect("alloc");
+            let _: AllocExtentResp = rkyv_decode(&r).expect("decode");
 
-        let append = AppendReq {
-            extent_id: odd_id,
-            eversion: 1,
-            commit: 0,
-            revision: 1,
-            payload: Bytes::from_static(b"odd-f099m-world"),
-        };
-        let r = pool
-            .call(&routed, MSG_APPEND, append.encode())
-            .await
-            .expect("append");
-        let appended = AppendResp::decode(r).expect("decode");
-        assert_eq!(appended.code, autumn_rpc::manager_rpc::CODE_OK);
-        assert_eq!(appended.end as usize, b"odd-f099m-world".len());
-    });
+            let append = AppendReq {
+                extent_id: odd_id,
+                eversion: 1,
+                commit: 0,
+                revision: 1,
+                payload: Bytes::from_static(b"odd-f099m-world"),
+            };
+            let r = pool
+                .call(&routed, MSG_APPEND, append.encode())
+                .await
+                .expect("append");
+            let appended = AppendResp::decode(r).expect("decode");
+            assert_eq!(appended.code, autumn_rpc::manager_rpc::CODE_OK);
+            assert_eq!(appended.end as usize, b"odd-f099m-world".len());
+        });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -483,7 +518,10 @@ fn f099m_recovery_per_shard() {
                         "cross-shard must reject after restart"
                     );
                 }
-                Ok(v) => panic!("expected FailedPrecondition, got Ok(code={}, length={})", v.code, v.length),
+                Ok(v) => panic!(
+                    "expected FailedPrecondition, got Ok(code={}, length={})",
+                    v.code, v.length
+                ),
                 Err(e) => panic!("expected FailedPrecondition, got {e:?}"),
             }
         }

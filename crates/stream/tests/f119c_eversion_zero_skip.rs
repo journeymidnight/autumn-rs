@@ -44,9 +44,7 @@ async fn read_bytes_rejects_eversion_zero_after_post_seal_bump() {
     // to the shard payload (mimicking post-EC state where a value at
     // offset > shard_len no longer fits).
     let shard_payload = vec![0xABu8; 1024];
-    let ws = conn
-        .write_shard(extent_id, 0, 1024, 5, shard_payload)
-        .await;
+    let ws = conn.write_shard(extent_id, 0, 1024, 5, shard_payload).await;
     assert_eq!(ws.code, CODE_OK, "write_shard should succeed");
     let cs = conn.commit_ec_shard(extent_id, 1024, 5).await;
     assert_eq!(cs.code, CODE_OK, "commit_ec_shard should succeed");
@@ -57,13 +55,18 @@ async fn read_bytes_rejects_eversion_zero_after_post_seal_bump() {
     // `req.eversion=0` skipped the check. Post-fix it must return
     // CODE_EVERSION_MISMATCH so the client refreshes its cache.
     let resp = conn
-        .read_bytes(extent_id, /* eversion */ 0, /* offset */ 1000, /* length */ 200)
+        .read_bytes(
+            extent_id, /* eversion */ 0, /* offset */ 1000, /* length */ 200,
+        )
         .await;
     assert_eq!(
         resp.code, CODE_EVERSION_MISMATCH,
         "stale eversion=0 against ev>0 must reject (was silently truncated pre-fix)"
     );
-    assert!(resp.payload.is_empty(), "mismatch response carries no payload");
+    assert!(
+        resp.payload.is_empty(),
+        "mismatch response carries no payload"
+    );
 
     // Sanity: the matching eversion (or higher) still succeeds.
     let ok = conn.read_bytes(extent_id, 5, 0, 1024).await;

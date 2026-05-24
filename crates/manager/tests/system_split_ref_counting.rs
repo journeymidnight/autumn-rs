@@ -45,7 +45,7 @@ fn split_ref_counting_shared_extents_freed_after_both_gc() {
                 &ps,
                 901,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes()
+                format!("val-{i}").as_bytes(),
             )
             .await;
         }
@@ -66,7 +66,10 @@ fn split_ref_counting_shared_extents_freed_after_both_gc() {
         let shared_extent_id = row_info.extent_ids[0];
 
         // Check extent refs before split
-        let ext_info = sc.get_extent_info(shared_extent_id).await.expect("extent info");
+        let ext_info = sc
+            .get_extent_info(shared_extent_id)
+            .await
+            .expect("extent info");
         assert_eq!(ext_info.refs, 1, "extent should have refs=1 before split");
 
         // Split
@@ -78,7 +81,12 @@ fn split_ref_counting_shared_extents_freed_after_both_gc() {
             .await
             .expect("split");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&resp).expect("decode");
-        assert_eq!(sr.code, partition_rpc::CODE_OK, "split failed: {}", sr.message);
+        assert_eq!(
+            sr.code,
+            partition_rpc::CODE_OK,
+            "split failed: {}",
+            sr.message
+        );
 
         // Wait for split to propagate
         compio::time::sleep(Duration::from_millis(1000)).await;
@@ -86,7 +94,10 @@ fn split_ref_counting_shared_extents_freed_after_both_gc() {
         // Check extent refs after split — should be 2 (shared between left and right)
         // Need to invalidate cache to see the updated extent
         sc.invalidate_extent_cache(shared_extent_id);
-        let ext_info = sc.get_extent_info(shared_extent_id).await.expect("extent info after split");
+        let ext_info = sc
+            .get_extent_info(shared_extent_id)
+            .await
+            .expect("extent info after split");
         assert_eq!(
             ext_info.refs, 2,
             "shared extent should have refs=2 after split (left + right)"
@@ -113,10 +124,28 @@ fn split_ref_counting_shared_extents_freed_after_both_gc() {
         // After compaction, flush again to ensure new SSTables are on new extents
         // Write a small key to each child and flush
         // Use keys that are definitely within each child's range
-        let left_rg = regions.regions.iter().find(|(_, r)| r.part_id == 901).unwrap().1.clone();
-        let right_rg = regions.regions.iter().find(|(_, r)| r.part_id == right_id).unwrap().1.clone();
-        let left_key = format!("{}new", String::from_utf8_lossy(&left_rg.rg.as_ref().unwrap().start_key));
-        let right_key = format!("{}new", String::from_utf8_lossy(&right_rg.rg.as_ref().unwrap().start_key));
+        let left_rg = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id == 901)
+            .unwrap()
+            .1
+            .clone();
+        let right_rg = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id == right_id)
+            .unwrap()
+            .1
+            .clone();
+        let left_key = format!(
+            "{}new",
+            String::from_utf8_lossy(&left_rg.rg.as_ref().unwrap().start_key)
+        );
+        let right_key = format!(
+            "{}new",
+            String::from_utf8_lossy(&right_rg.rg.as_ref().unwrap().start_key)
+        );
 
         ps_put(&ps, 901, left_key.as_bytes(), b"v").await;
         ps_flush(&ps, 901).await;

@@ -307,11 +307,7 @@ impl Drop for InflightSlot {
 
 // ---- Send / recv callbacks ----
 
-unsafe extern "C" fn cb_send(
-    _request: *mut c_void,
-    status: ucs_status_t::Type,
-    user: *mut c_void,
-) {
+unsafe extern "C" fn cb_send(_request: *mut c_void, status: ucs_status_t::Type, user: *mut c_void) {
     let slot = &*(user as *const Slot);
     slot.complete_send(status);
 }
@@ -339,10 +335,9 @@ impl UcxConn {
             let (sa, sa_len) = sockaddr::to_storage(&addr);
             let mut params: ucp_ep_params_t = unsafe { std::mem::zeroed() };
             params.field_mask = (ucp_ep_params_field::UCP_EP_PARAM_FIELD_FLAGS
-                               | ucp_ep_params_field::UCP_EP_PARAM_FIELD_SOCK_ADDR)
+                | ucp_ep_params_field::UCP_EP_PARAM_FIELD_SOCK_ADDR)
                 as u64;
-            params.flags =
-                ucp_ep_params_flags_field::UCP_EP_PARAMS_FLAGS_CLIENT_SERVER as u32;
+            params.flags = ucp_ep_params_flags_field::UCP_EP_PARAMS_FLAGS_CLIENT_SERVER as u32;
             params.sockaddr.addr = &sa as *const _ as *const _;
             params.sockaddr.addrlen = sa_len;
             let mut ep: *mut ucp_ep = ptr::null_mut();
@@ -356,10 +351,7 @@ impl UcxConn {
         })?;
         let ep = UcxEp::new(ep);
         ucx_flush(ep.ptr()).await?;
-        Ok(Self {
-            ep,
-            peer: addr,
-        })
+        Ok(Self { ep, peer: addr })
     }
 
     /// Internal constructor used by `UcxListener::accept` after `ucp_ep_create`
@@ -492,7 +484,7 @@ async fn ucx_send<B: IoBuf>(ep: *mut ucp_ep, buf: B) -> BufResult<usize, B> {
 
     let mut params: ucp_request_param_t = unsafe { std::mem::zeroed() };
     params.op_attr_mask = (ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK
-                         | ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA) as u32;
+        | ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA) as u32;
     params.cb.send = Some(cb_send);
     params.user_data = slot as *mut c_void;
 
@@ -525,10 +517,15 @@ async fn ucx_send<B: IoBuf>(ep: *mut ucp_ep, buf: B) -> BufResult<usize, B> {
                 if unsafe { (*slot).is_done() } {
                     break;
                 }
-                unsafe { ucp_worker_progress(worker); }
+                unsafe {
+                    ucp_worker_progress(worker);
+                }
             }
             // Wait for completion (resolves immediately if spin caught it).
-            WaitSlot { slot: slot as *const Slot }.await;
+            WaitSlot {
+                slot: slot as *const Slot,
+            }
+            .await;
             let status = unsafe { (*slot).status.get() };
             // Drop guard NOW so the slot is back in the pool before the
             // caller chains another op (improves pool hit rate).
@@ -550,7 +547,7 @@ pub(crate) async fn ucx_flush(ep: *mut ucp_ep) -> io::Result<()> {
 
     let mut params: ucp_request_param_t = unsafe { std::mem::zeroed() };
     params.op_attr_mask = (ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK
-                         | ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA) as u32;
+        | ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA) as u32;
     params.cb.send = Some(cb_send);
     params.user_data = slot as *mut c_void;
 
@@ -572,7 +569,10 @@ pub(crate) async fn ucx_flush(ep: *mut ucp_ep) -> io::Result<()> {
                 slot,
                 cleaned_up: Cell::new(false),
             };
-            WaitSlot { slot: slot as *const Slot }.await;
+            WaitSlot {
+                slot: slot as *const Slot,
+            }
+            .await;
             let status = unsafe { (*slot).status.get() };
             drop(guard);
             if status == ucs_status_t::UCS_OK {
@@ -637,9 +637,14 @@ async fn ucx_recv_raw(
                 if unsafe { (*slot).is_done() } {
                     break;
                 }
-                unsafe { ucp_worker_progress(worker); }
+                unsafe {
+                    ucp_worker_progress(worker);
+                }
             }
-            WaitSlot { slot: slot as *const Slot }.await;
+            WaitSlot {
+                slot: slot as *const Slot,
+            }
+            .await;
             let status = unsafe { (*slot).status.get() };
             let n = unsafe { (*slot).length.get() };
             drop(guard);
@@ -664,8 +669,8 @@ async fn ucx_recv<B: IoBufMut>(ep: *mut ucp_ep, buf: B) -> BufResult<usize, B> {
 
     let mut params: ucp_request_param_t = unsafe { std::mem::zeroed() };
     params.op_attr_mask = (ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK
-                         | ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA
-                         | ucp_op_attr_t::UCP_OP_ATTR_FLAG_NO_IMM_CMPL) as u32;
+        | ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA
+        | ucp_op_attr_t::UCP_OP_ATTR_FLAG_NO_IMM_CMPL) as u32;
     params.cb.recv_stream = Some(cb_recv);
     params.user_data = slot as *mut c_void;
 
@@ -696,9 +701,14 @@ async fn ucx_recv<B: IoBufMut>(ep: *mut ucp_ep, buf: B) -> BufResult<usize, B> {
                 if unsafe { (*slot).is_done() } {
                     break;
                 }
-                unsafe { ucp_worker_progress(worker); }
+                unsafe {
+                    ucp_worker_progress(worker);
+                }
             }
-            WaitSlot { slot: slot as *const Slot }.await;
+            WaitSlot {
+                slot: slot as *const Slot,
+            }
+            .await;
             let status = unsafe { (*slot).status.get() };
             let n = unsafe { (*slot).length.get() };
             drop(guard);

@@ -24,8 +24,8 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use autumn_client::{decode_err, ClusterClient, DEFAULT_RPC_TIMEOUT};
 use autumn_rpc::manager_rpc::*;
-use autumn_transport::TransportKind;
 use autumn_rpc::partition_rpc::{GetDiscardsReq, GetDiscardsResp, MSG_GET_DISCARDS};
+use autumn_transport::TransportKind;
 use bytes::Bytes;
 use serde::Serialize;
 
@@ -41,7 +41,9 @@ fn usage() -> ! {
     eprintln!("  audit-log [--op N] [--node N] [--since S] [--until U] [--limit L]");
     eprintln!("                               query operator action history");
     eprintln!("  info [--part PID] [--detail] show cluster snapshot (F213; --detail = F203 partition load)");
-    eprintln!("  policy-candidates            advisory split/merge/gc/compact/ec candidates (F213)");
+    eprintln!(
+        "  policy-candidates            advisory split/merge/gc/compact/ec candidates (F213)"
+    );
     eprintln!();
     eprintln!("node-lifecycle admin commands:");
     eprintln!("  fence-node <id> --reason \"...\" --by alice [--force]");
@@ -189,11 +191,10 @@ fn parse() -> Args {
             "--transport" => {
                 i += 1;
                 let raw_t = raw.get(i).cloned().unwrap_or_else(|| usage());
-                transport = autumn_transport::parse_transport_flag(&raw_t)
-                    .unwrap_or_else(|bad| {
-                        eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
-                        usage()
-                    });
+                transport = autumn_transport::parse_transport_flag(&raw_t).unwrap_or_else(|bad| {
+                    eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
+                    usage()
+                });
                 i += 1;
             }
             "--help" | "-h" => usage(),
@@ -503,9 +504,7 @@ fn parse() -> Args {
             }
             Command::Merge {
                 survivor_part_id: raw[i].parse().expect("SURVIVOR_PART_ID must be a number"),
-                victim_part_id: raw[i + 1]
-                    .parse()
-                    .expect("VICTIM_PART_ID must be a number"),
+                victim_part_id: raw[i + 1].parse().expect("VICTIM_PART_ID must be a number"),
             }
         }
         "compact" => {
@@ -621,9 +620,7 @@ fn parse() -> Args {
                             if p.is_empty() {
                                 continue;
                             }
-                            let port: u16 = p
-                                .parse()
-                                .expect("--shard-ports entries must be u16");
+                            let port: u16 = p.parse().expect("--shard-ports entries must be u16");
                             shard_ports.push(port);
                         }
                     }
@@ -646,7 +643,12 @@ fn parse() -> Args {
         }
         _ => usage(),
     };
-    Args { manager, json, transport, cmd }
+    Args {
+        manager,
+        json,
+        transport,
+        cmd,
+    }
 }
 
 fn parse_admin_flags(raw: &[String], i: &mut usize) -> (String, String, bool) {
@@ -788,8 +790,7 @@ pub(crate) fn derive_control_address(advertise: &str) -> String {
 fn format_disk(dir: &str) -> Result<String> {
     for byte in 0u8..=255 {
         let subdir = format!("{}/{:02x}", dir, byte);
-        std::fs::create_dir_all(&subdir)
-            .with_context(|| format!("create hash subdir {subdir}"))?;
+        std::fs::create_dir_all(&subdir).with_context(|| format!("create hash subdir {subdir}"))?;
     }
     let disk_uuid = uuid::Uuid::new_v4().to_string();
     let marker_path = format!("{}/{}", dir, disk_uuid);
@@ -823,10 +824,7 @@ async fn fetch_cluster_id(client: &ClusterClient) -> Result<String> {
             compio::time::sleep(Duration::from_millis(500)).await;
             continue;
         }
-        bail!(
-            "get cluster_id failed: code={} {}",
-            resp.code, resp.message
-        );
+        bail!("get cluster_id failed: code={} {}", resp.code, resp.message);
     }
 }
 
@@ -1619,9 +1617,7 @@ async fn run(args: Args) -> Result<()> {
                     }))?
                 );
             } else {
-                println!(
-                    "merge ok: partition {victim_part_id} merged into {survivor_part_id}"
-                );
+                println!("merge ok: partition {victim_part_id} merged into {survivor_part_id}");
             }
         }
         Command::Compact { part_id } => {
@@ -1695,9 +1691,7 @@ async fn run(args: Args) -> Result<()> {
                     }))?
                 );
             } else {
-                println!(
-                    "forcegc triggered for partition {part_id}, extents={extent_ids:?}"
-                );
+                println!("forcegc triggered for partition {part_id}, extents={extent_ids:?}");
             }
         }
         Command::RegisterNode => {
@@ -1722,8 +1716,7 @@ async fn run(args: Args) -> Result<()> {
             let mut disk_uuids = Vec::new();
             let mut freshly_formatted: Vec<bool> = Vec::with_capacity(dirs.len());
             for dir in &dirs {
-                std::fs::create_dir_all(dir)
-                    .with_context(|| format!("create dir {dir}"))?;
+                std::fs::create_dir_all(dir).with_context(|| format!("create dir {dir}"))?;
                 match read_existing_format(dir)? {
                     Some((existing_cid, existing_did)) if existing_cid == cluster_id => {
                         // Idempotent path — already formatted for this
@@ -1894,12 +1887,16 @@ async fn run_bootstrap(
     //   - EC streams: replicates is the open-extent replica count (=
     //     meta_replicates), and (ec_data, ec_parity) describes the
     //     post-seal EC encoding (e.g. 4+1, 7+1). The two are independent.
-    let log_params = log_ec
-        .map(|(k, m)| (meta_replicates, k, m))
-        .unwrap_or((meta_replicates, meta_replicates, 0));
-    let row_params = row_ec
-        .map(|(k, m)| (meta_replicates, k, m))
-        .unwrap_or((meta_replicates, meta_replicates, 0));
+    let log_params = log_ec.map(|(k, m)| (meta_replicates, k, m)).unwrap_or((
+        meta_replicates,
+        meta_replicates,
+        0,
+    ));
+    let row_params = row_ec.map(|(k, m)| (meta_replicates, k, m)).unwrap_or((
+        meta_replicates,
+        meta_replicates,
+        0,
+    ));
     let meta_params = (meta_replicates, meta_replicates, 0u32);
 
     let ranges: Vec<(Vec<u8>, Vec<u8>)> = {
@@ -1912,11 +1909,8 @@ async fn run_bootstrap(
         }
     };
 
-    let create_stream_once = |label: &'static str,
-                              replicates: u32,
-                              ec_data: u32,
-                              ec_parity: u32| {
-        async move {
+    let create_stream_once =
+        |label: &'static str, replicates: u32, ec_data: u32, ec_parity: u32| async move {
             let req_bytes = rkyv_encode(&CreateStreamReq {
                 replicates,
                 ec_data_shard: ec_data,
@@ -1930,9 +1924,7 @@ async fn run_bootstrap(
                     .with_context(|| format!("create {label} stream"))?;
                 let resp: CreateStreamResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
                 if resp.code == CODE_OK {
-                    return Ok::<u64, anyhow::Error>(
-                        resp.stream.map(|s| s.stream_id).unwrap_or(0),
-                    );
+                    return Ok::<u64, anyhow::Error>(resp.stream.map(|s| s.stream_id).unwrap_or(0));
                 }
                 if resp.code == CODE_NOT_LEADER && attempt < 60 {
                     attempt += 1;
@@ -1945,8 +1937,7 @@ async fn run_bootstrap(
                     resp.message
                 );
             }
-        }
-    };
+        };
 
     let mut created: Vec<serde_json::Value> = Vec::new();
     for (idx, (start_key, end_key)) in ranges.iter().enumerate() {
@@ -1975,8 +1966,7 @@ async fn run_bootstrap(
                 .mgr_call(MSG_UPSERT_PARTITION, req_bytes.clone())
                 .await
                 .context("upsert partition")?;
-            let resp: UpsertPartitionResp =
-                rkyv_decode(&resp_bytes).map_err(decode_err)?;
+            let resp: UpsertPartitionResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
             if resp.code == CODE_OK {
                 break resp;
             }
@@ -2066,14 +2056,9 @@ async fn run_info(
             .mgr_call(MSG_GET_PARTITION_DETAIL, req)
             .await
             .context("get partition detail")?;
-        let resp: GetPartitionDetailResp =
-            rkyv_decode(&resp_bytes).map_err(decode_err)?;
+        let resp: GetPartitionDetailResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
         if resp.code != CODE_OK {
-            bail!(
-                "get_partition_detail: code={} {}",
-                resp.code,
-                resp.message
-            );
+            bail!("get_partition_detail: code={} {}", resp.code, resp.message);
         }
         let l = &resp.load;
         if json_out {
@@ -2161,12 +2146,10 @@ async fn run_info(
         .mgr_call(MSG_GET_REGIONS, Bytes::new())
         .await
         .context("get regions")?;
-    let regions_resp: GetRegionsResp =
-        rkyv_decode(&regions_resp_bytes).map_err(decode_err)?;
+    let regions_resp: GetRegionsResp = rkyv_decode(&regions_resp_bytes).map_err(decode_err)?;
 
     // === Build lookup maps ===
-    let mut extent_map: HashMap<u64, MgrExtentInfo> =
-        stream_resp.extents.into_iter().collect();
+    let mut extent_map: HashMap<u64, MgrExtentInfo> = stream_resp.extents.into_iter().collect();
     let disk_map: HashMap<u64, MgrDiskInfo> = nodes_resp.disks_info.into_iter().collect();
 
     let mut nodes_sorted: Vec<(u64, MgrNodeInfo)> = nodes_resp.nodes.into_iter().collect();
@@ -2176,16 +2159,13 @@ async fn run_info(
         .map(|(id, n)| (*id, n.address.clone()))
         .collect();
 
-    let mut streams_sorted: Vec<(u64, MgrStreamInfo)> =
-        stream_resp.streams.into_iter().collect();
+    let mut streams_sorted: Vec<(u64, MgrStreamInfo)> = stream_resp.streams.into_iter().collect();
     streams_sorted.sort_by_key(|(id, _)| *id);
     let stream_map: HashMap<u64, MgrStreamInfo> = streams_sorted.iter().cloned().collect();
 
     let regions: HashMap<u64, MgrRegionInfo> = regions_resp.regions.into_iter().collect();
-    let ps_details: HashMap<u64, MgrPsDetail> =
-        regions_resp.ps_details.into_iter().collect();
-    let part_addr_map: HashMap<u64, String> =
-        regions_resp.part_addrs.into_iter().collect();
+    let ps_details: HashMap<u64, MgrPsDetail> = regions_resp.ps_details.into_iter().collect();
+    let part_addr_map: HashMap<u64, String> = regions_resp.part_addrs.into_iter().collect();
 
     let mut part_ids: Vec<u64> = regions.keys().copied().collect();
     part_ids.sort();
@@ -2221,11 +2201,7 @@ async fn run_info(
                         // must NOT use the fence-gated commit_length RPC.
                         let req = ExtProbeExtentReq { extent_id: *eid };
                         if let Ok(resp_bytes) = en_client
-                            .call_timeout(
-                                EXT_MSG_PROBE_EXTENT,
-                                req.encode(),
-                                DEFAULT_RPC_TIMEOUT,
-                            )
+                            .call_timeout(EXT_MSG_PROBE_EXTENT, req.encode(), DEFAULT_RPC_TIMEOUT)
                             .await
                         {
                             if let Ok(resp) = ExtProbeExtentResp::decode(resp_bytes) {
@@ -2288,7 +2264,10 @@ async fn run_info(
                     .iter()
                     .map(|did| InfoDiskView {
                         disk_id: *did,
-                        uuid: disk_map.get(did).map(|d| d.uuid.clone()).unwrap_or_default(),
+                        uuid: disk_map
+                            .get(did)
+                            .map(|d| d.uuid.clone())
+                            .unwrap_or_default(),
                         online: disk_map.get(did).map(|d| d.online).unwrap_or(false),
                     })
                     .collect(),
@@ -2425,10 +2404,7 @@ async fn run_info(
                 }
                 for did in &n.disks {
                     if let Some(d) = disk_map.get(did) {
-                        println!(
-                            "    disk {}: uuid={}, online={}",
-                            did, d.uuid, d.online
-                        );
+                        println!("    disk {}: uuid={}, online={}", did, d.uuid, d.online);
                     } else {
                         println!("    disk {}: (no info)", did);
                     }
@@ -2570,7 +2546,11 @@ async fn run_info(
                     println!("{line}");
                 }
             }
-            println!("    total: {} extents, {}", part_extents, human_size(part_total));
+            println!(
+                "    total: {} extents, {}",
+                part_extents,
+                human_size(part_total)
+            );
         }
     }
     Ok(())
@@ -2617,7 +2597,10 @@ mod tests {
 
     #[test]
     fn parse_byte_size_accepts_plain_integer() {
-        assert_eq!(super::parse_byte_size("16777216").unwrap(), 16 * 1024 * 1024);
+        assert_eq!(
+            super::parse_byte_size("16777216").unwrap(),
+            16 * 1024 * 1024
+        );
         assert_eq!(super::parse_byte_size("0").unwrap(), 0);
     }
 

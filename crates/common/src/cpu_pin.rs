@@ -28,8 +28,8 @@
 //! when both are present the binary refuses to start.
 
 use std::collections::HashSet;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 static CPU_OFFSET: AtomicUsize = AtomicUsize::new(0);
 static CPU_SET_OVERRIDE: OnceLock<Vec<usize>> = OnceLock::new();

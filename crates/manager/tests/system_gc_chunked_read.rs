@@ -60,13 +60,7 @@ fn f105_gc_works_on_large_extent_via_chunked_reads() {
         // Round 1 — write 4 large keys (>4 KiB triggers VP path).
         let val_v1: Vec<u8> = vec![b'A'; 8 * 1024];
         for i in 0u8..4 {
-            ps_put(
-                &ps,
-                part_id,
-                format!("key-{}", i).as_bytes(),
-                &val_v1
-            )
-            .await;
+            ps_put(&ps, part_id, format!("key-{}", i).as_bytes(), &val_v1).await;
             ps_flush(&ps, part_id).await;
         }
 
@@ -74,13 +68,7 @@ fn f105_gc_works_on_large_extent_via_chunked_reads() {
         // log_stream extent).
         let val_v2: Vec<u8> = vec![b'B'; 8 * 1024];
         for i in 0u8..4 {
-            ps_put(
-                &ps,
-                part_id,
-                format!("key-{}", i).as_bytes(),
-                &val_v2
-            )
-            .await;
+            ps_put(&ps, part_id, format!("key-{}", i).as_bytes(), &val_v2).await;
             ps_flush(&ps, part_id).await;
         }
 

@@ -160,9 +160,7 @@ impl AutumnManager {
             return;
         }
         for chunk in to_delete.chunks(64) {
-            let _ = etcd
-                .put_and_delete_txn(Vec::new(), chunk.to_vec())
-                .await;
+            let _ = etcd.put_and_delete_txn(Vec::new(), chunk.to_vec()).await;
         }
     }
 }

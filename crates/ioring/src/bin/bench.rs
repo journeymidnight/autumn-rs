@@ -144,7 +144,11 @@ fn main() -> Result<()> {
     println!(
         "  current    : {:.0} ops/s — {}",
         ops_per_sec,
-        if ops_per_sec >= 200_000.0 { "PASS" } else { "below gate" }
+        if ops_per_sec >= 200_000.0 {
+            "PASS"
+        } else {
+            "below gate"
+        }
     );
 
     if had_err {

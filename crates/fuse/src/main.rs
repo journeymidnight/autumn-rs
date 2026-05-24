@@ -20,7 +20,10 @@ use autumn_fuse::state::FsState;
 use autumn_fuse::write;
 
 #[derive(Parser)]
-#[command(name = "autumn-fuse", about = "Mount autumn-rs KV store as a POSIX filesystem")]
+#[command(
+    name = "autumn-fuse",
+    about = "Mount autumn-rs KV store as a POSIX filesystem"
+)]
 struct Args {
     /// Manager address (host:port)
     #[arg(long, default_value = "127.0.0.1:9001")]

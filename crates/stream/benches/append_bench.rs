@@ -32,7 +32,9 @@ fn main() {
         });
 
         for _ in 0..100 {
-            if std::net::TcpStream::connect(bound).is_ok() { break; }
+            if std::net::TcpStream::connect(bound).is_ok() {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
 
@@ -49,7 +51,8 @@ fn main() {
         // Warmup
         for i in 0..500u32 {
             let req = AppendReq {
-                extent_id, eversion: 1,
+                extent_id,
+                eversion: 1,
                 commit: i * payload.len() as u32,
                 revision: 1,
                 payload: payload.clone(),
@@ -63,15 +66,18 @@ fn main() {
         for i in 0..ops {
             let commit = warmup_commit + (i as u32) * payload.len() as u32;
             let req = AppendReq {
-                extent_id, eversion: 1,
-                commit, revision: 1,
+                extent_id,
+                eversion: 1,
+                commit,
+                revision: 1,
                 payload: payload.clone(),
             };
             client.call(MSG_APPEND, req.encode()).await.unwrap();
         }
         let elapsed = start.elapsed();
         let ops_sec = ops as f64 / elapsed.as_secs_f64();
-        let mb_sec = (ops as f64 * payload.len() as f64) / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+        let mb_sec =
+            (ops as f64 * payload.len() as f64) / (1024.0 * 1024.0) / elapsed.as_secs_f64();
         let lat_us = elapsed.as_micros() as f64 / ops as f64;
         println!("=== autumn-rpc ExtentNode append (4KB, sequential) ===");
         println!("  ops:     {ops}");

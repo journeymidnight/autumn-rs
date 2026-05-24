@@ -26,9 +26,7 @@ use std::io::{self, IoSlice, IoSliceMut};
 use std::mem::{size_of, MaybeUninit};
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 
-use crate::handshake::{
-    HelloRequest, HelloResponse, HELLO_REQUEST_SIZE, HELLO_RESPONSE_SIZE,
-};
+use crate::handshake::{HelloRequest, HelloResponse, HELLO_REQUEST_SIZE, HELLO_RESPONSE_SIZE};
 
 /// Send a `HelloRequest` over `socket`. Bytes-only; client doesn't
 /// pass any fd.
@@ -50,11 +48,7 @@ pub fn recv_request(socket: RawFd) -> io::Result<HelloRequest> {
 /// The daemon's caller retains `shm_fd` after this call (it's
 /// duplicated in the kernel for transport). The daemon needs to keep
 /// using `shm_fd` to mmap the same region for its own ring poller.
-pub fn send_response_with_fd(
-    socket: RawFd,
-    resp: &HelloResponse,
-    shm_fd: RawFd,
-) -> io::Result<()> {
+pub fn send_response_with_fd(socket: RawFd, resp: &HelloResponse, shm_fd: RawFd) -> io::Result<()> {
     let mut payload = [0u8; HELLO_RESPONSE_SIZE];
     resp.encode(&mut payload);
 
@@ -260,9 +254,7 @@ fn read_exact(socket: RawFd, buf: &mut [u8]) -> io::Result<()> {
 /// equally usable.
 pub fn socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds: [RawFd; 2] = [-1, -1];
-    let rc = unsafe {
-        libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr())
-    };
+    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -274,8 +266,8 @@ pub fn socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
 /// Used by the daemon to allocate the SHM region before passing the fd
 /// over the handshake socket.
 pub fn create_memfd(name: &str, size: u64) -> io::Result<OwnedFd> {
-    let cname = std::ffi::CString::new(name)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let cname =
+        std::ffi::CString::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -294,7 +286,7 @@ pub fn create_memfd(name: &str, size: u64) -> io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handshake::{HelloStatus, DaemonLimits, negotiate};
+    use crate::handshake::{negotiate, DaemonLimits, HelloStatus};
     use std::os::unix::io::AsRawFd;
 
     #[test]
@@ -418,12 +410,7 @@ mod tests {
         // requires one — use the daemon socket itself (will be a
         // duplicate). Real daemon code would either send a sentinel
         // memfd or use a separate "no-fd" reject path.
-        send_response_with_fd(
-            daemon_sock.as_raw_fd(),
-            &resp,
-            daemon_sock.as_raw_fd(),
-        )
-        .unwrap();
+        send_response_with_fd(daemon_sock.as_raw_fd(), &resp, daemon_sock.as_raw_fd()).unwrap();
 
         let (received_resp, _placeholder_fd) =
             recv_response_with_fd(client_sock.as_raw_fd()).unwrap();

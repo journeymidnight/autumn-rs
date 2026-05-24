@@ -55,7 +55,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::cqe::{Cqe, CQE_SIZE};
-use crate::header::{CACHE_LINE, HEADER_SIZE, RingHeader};
+use crate::header::{RingHeader, CACHE_LINE, HEADER_SIZE};
 use crate::sqe::{Sqe, SQE_SIZE};
 
 /// Capacity of the SQ ring. Always a power of 2; slot index =
@@ -186,7 +186,8 @@ impl<'a> SqConsumer<'a> {
     /// Pop up to `max` SQEs into `dst`. Returns the number popped.
     /// Useful for batched daemon dispatch.
     pub fn try_pop_batch(&self, dst: &mut Vec<Sqe>, max: usize) -> usize {
-        let head_init = atomic_at(self.region, self.header.sq_head_offset()).load(Ordering::Relaxed);
+        let head_init =
+            atomic_at(self.region, self.header.sq_head_offset()).load(Ordering::Relaxed);
         let tail = atomic_at(self.region, self.header.sq_tail_offset()).load(Ordering::Acquire);
         let avail = tail.wrapping_sub(head_init).min(max as u64);
         let mut head = head_init;
@@ -273,7 +274,8 @@ impl<'a> CqConsumer<'a> {
     }
 
     pub fn try_pop_batch(&self, dst: &mut Vec<Cqe>, max: usize) -> usize {
-        let head_init = atomic_at(self.region, self.header.cq_head_offset()).load(Ordering::Relaxed);
+        let head_init =
+            atomic_at(self.region, self.header.cq_head_offset()).load(Ordering::Relaxed);
         let tail = atomic_at(self.region, self.header.cq_tail_offset()).load(Ordering::Acquire);
         let avail = tail.wrapping_sub(head_init).min(max as u64);
         let mut head = head_init;
@@ -310,8 +312,7 @@ mod tests {
         h.buf_pool_size = 64 * 1024;
         h.buf_slot_size = 4096;
         // Recompute buf_pool_offset for the smaller layout.
-        h.buf_pool_offset =
-            h.cq_array_offset() + (h.cq_entries as u64) * (CQE_SIZE as u64);
+        h.buf_pool_offset = h.cq_array_offset() + (h.cq_entries as u64) * (CQE_SIZE as u64);
         h
     }
 

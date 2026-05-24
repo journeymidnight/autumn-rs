@@ -2,11 +2,11 @@
 //! in spec §12 Q1: ≥478 B payloads pick `multi-frag stream zero-copy
 //! copy-out` = rndv get zcopy).
 
+pub(crate) mod endpoint;
 pub(crate) mod ffi;
+pub(crate) mod listener;
 pub(crate) mod sockaddr;
 pub(crate) mod worker;
-pub(crate) mod endpoint;
-pub(crate) mod listener;
 // regpool is now a top-level `mod regpool` in lib.rs (transport-agnostic).
 
 pub use endpoint::UcxConn;

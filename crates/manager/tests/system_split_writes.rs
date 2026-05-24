@@ -70,7 +70,11 @@ fn split_preserves_all_data() {
         compio::time::sleep(Duration::from_millis(6000)).await;
 
         let regions = get_regions(&mgr).await;
-        assert_eq!(regions.regions.len(), 2, "should have 2 partitions after split");
+        assert_eq!(
+            regions.regions.len(),
+            2,
+            "should have 2 partitions after split"
+        );
 
         // Find left and right partitions
         let left_rg = regions
@@ -88,12 +92,7 @@ fn split_preserves_all_data() {
             .1
             .clone();
 
-        let mid_key = left_rg
-            .rg
-            .as_ref()
-            .expect("left range")
-            .end_key
-            .clone();
+        let mid_key = left_rg.rg.as_ref().expect("left range").end_key.clone();
         assert!(
             !mid_key.is_empty(),
             "left partition should have a non-empty end_key after split"

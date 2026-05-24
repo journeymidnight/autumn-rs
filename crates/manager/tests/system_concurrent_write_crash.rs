@@ -107,10 +107,12 @@ fn concurrent_writers_during_split() {
         // Pre-populate 50 keys, flush
         for i in 0u32..50 {
             ps_put(
-                &ps, 902,
+                &ps,
+                902,
                 format!("pre-{i:02}").as_bytes(),
-                format!("pv-{i:02}").as_bytes()
-            ).await;
+                format!("pv-{i:02}").as_bytes(),
+            )
+            .await;
         }
         ps_flush(&ps, 902).await;
 
@@ -157,15 +159,32 @@ fn concurrent_writers_during_split() {
         let split_resp_bytes = split_handle.await.expect("split task panicked");
         let sr: partition_rpc::SplitPartResp =
             partition_rpc::rkyv_decode(&split_resp_bytes).expect("decode");
-        assert_eq!(sr.code, partition_rpc::CODE_OK, "split failed: {}", sr.message);
+        assert_eq!(
+            sr.code,
+            partition_rpc::CODE_OK,
+            "split failed: {}",
+            sr.message
+        );
 
         let concurrent_keys = write_handle.await.expect("writer task panicked");
         compio::time::sleep(Duration::from_millis(1000)).await;
 
         let regions = get_regions(&mgr).await;
         assert_eq!(regions.regions.len(), 2);
-        let left_rg = regions.regions.iter().find(|(_, r)| r.part_id == 902).unwrap().1.clone();
-        let right_id = regions.regions.iter().find(|(_, r)| r.part_id != 902).unwrap().1.part_id;
+        let left_rg = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id == 902)
+            .unwrap()
+            .1
+            .clone();
+        let right_id = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id != 902)
+            .unwrap()
+            .1
+            .part_id;
         let mid_key = left_rg.rg.as_ref().unwrap().end_key.clone();
         compio::time::sleep(Duration::from_millis(6000)).await;
 
@@ -173,7 +192,11 @@ fn concurrent_writers_during_split() {
         for i in 0u32..50 {
             let key = format!("pre-{i:02}");
             let kb = key.as_bytes();
-            let part_id = if kb < mid_key.as_slice() { 902 } else { right_id };
+            let part_id = if kb < mid_key.as_slice() {
+                902
+            } else {
+                right_id
+            };
             let resp = psr_get(&router, part_id, kb).await;
             assert_eq!(resp.value, format!("pv-{i:02}").as_bytes(), "{key} wrong");
         }
@@ -220,7 +243,11 @@ fn concurrent_writers_during_split() {
                 missing += 1;
             }
         }
-        let lost_pct = if total > 0 { (missing as f64 / total as f64) * 100.0 } else { 0.0 };
+        let lost_pct = if total > 0 {
+            (missing as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
         eprintln!(
             "split-during-writes: {} acked, {} lost ({:.1}%) — KNOWN BUG, see code comment",
             total, missing, lost_pct
@@ -234,9 +261,17 @@ fn concurrent_writers_during_split() {
         for i in 0u32..50 {
             let key = format!("pre-{i:02}");
             let kb = key.as_bytes();
-            let part_id = if kb < mid_key.as_slice() { 902 } else { right_id };
+            let part_id = if kb < mid_key.as_slice() {
+                902
+            } else {
+                right_id
+            };
             let resp = psr_get(&router, part_id, kb).await;
-            assert_eq!(resp.value, format!("pv-{i:02}").as_bytes(), "{key} wrong after compact");
+            assert_eq!(
+                resp.value,
+                format!("pv-{i:02}").as_bytes(),
+                "{key} wrong after compact"
+            );
         }
     });
 }

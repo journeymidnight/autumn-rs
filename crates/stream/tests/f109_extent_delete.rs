@@ -37,8 +37,16 @@ async fn delete_existing_extent_unlinks_files() {
     let hash_dir = tmp.path().join(format!("{:02x}", hash_byte));
     let dat = hash_dir.join(format!("extent-{extent_id}.dat"));
     let meta = hash_dir.join(format!("extent-{extent_id}.meta"));
-    assert!(dat.exists(), "dat must exist before delete: {}", dat.display());
-    assert!(meta.exists(), "meta must exist before delete: {}", meta.display());
+    assert!(
+        dat.exists(),
+        "dat must exist before delete: {}",
+        dat.display()
+    );
+    assert!(
+        meta.exists(),
+        "meta must exist before delete: {}",
+        meta.display()
+    );
 
     let resp = conn.delete_extent(extent_id).await;
     assert_eq!(resp.code, CODE_OK, "delete failed: {}", resp.message);
@@ -92,7 +100,11 @@ async fn delete_then_realloc_starts_fresh() {
 
     // Re-alloc the same id: should succeed (file gone, fresh entry).
     let alloc = conn.alloc_extent(extent_id).await;
-    assert_eq!(alloc.code, CODE_OK, "re-alloc after delete failed: {}", alloc.message);
+    assert_eq!(
+        alloc.code, CODE_OK,
+        "re-alloc after delete failed: {}",
+        alloc.message
+    );
 
     // Fresh append at offset 0 — we use `revision=20 >= 10` to satisfy
     // the fencing check (the .meta sidecar was unlinked, so

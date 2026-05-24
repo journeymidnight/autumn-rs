@@ -4,7 +4,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use fuser::FileAttr;
 
 use crate::key;
@@ -138,7 +138,9 @@ pub async fn alloc_inode(state: &mut FsState) -> Result<u64> {
     };
     let new_end = current + INODE_ALLOC_BATCH;
     let v = new_end.to_be_bytes();
-    state.kv_put(&k, &v).await
+    state
+        .kv_put(&k, &v)
+        .await
         .context("persist next_inode counter")?;
     state.next_inode = current;
     state.inode_batch_end = new_end;

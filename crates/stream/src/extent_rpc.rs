@@ -96,12 +96,7 @@ impl AppendReq {
     }
 
     /// Encode only the 28-byte header (for vectored writes — payload sent separately).
-    pub fn encode_header(
-        extent_id: u64,
-        eversion: u64,
-        commit: u32,
-        revision: i64,
-    ) -> Bytes {
+    pub fn encode_header(extent_id: u64, eversion: u64, commit: u32, revision: i64) -> Bytes {
         let mut buf = BytesMut::with_capacity(APPEND_HEADER_LEN);
         buf.put_u64_le(extent_id);
         buf.put_u64_le(eversion);
@@ -713,7 +708,14 @@ impl WriteShardReq {
         let eversion = data.get_u64_le();
         let revision = data.get_i64_le();
         let payload = data;
-        Ok(Self { extent_id, shard_index, sealed_length, eversion, revision, payload })
+        Ok(Self {
+            extent_id,
+            shard_index,
+            sealed_length,
+            eversion,
+            revision,
+            payload,
+        })
     }
 }
 
@@ -767,7 +769,12 @@ impl CommitEcShardReq {
         let sealed_length = data.get_u64_le();
         let eversion = data.get_u64_le();
         let revision = data.get_i64_le();
-        Ok(Self { extent_id, sealed_length, eversion, revision })
+        Ok(Self {
+            extent_id,
+            sealed_length,
+            eversion,
+            revision,
+        })
     }
 }
 
@@ -795,7 +802,9 @@ mod tests {
 
     #[test]
     fn delete_extent_req_round_trip() {
-        let req = DeleteExtentReq { extent_id: 0xdead_beef_cafe_0042 };
+        let req = DeleteExtentReq {
+            extent_id: 0xdead_beef_cafe_0042,
+        };
         let bytes = rkyv_encode(&req);
         let decoded: DeleteExtentReq = rkyv_decode(&bytes).expect("decode");
         assert_eq!(decoded.extent_id, req.extent_id);
@@ -803,7 +812,10 @@ mod tests {
 
     #[test]
     fn delete_extent_resp_uses_generic_code_resp() {
-        let resp = CodeResp { code: CODE_OK, message: String::new() };
+        let resp = CodeResp {
+            code: CODE_OK,
+            message: String::new(),
+        };
         let bytes = rkyv_encode(&resp);
         let decoded: CodeResp = rkyv_decode(&bytes).expect("decode");
         assert_eq!(decoded.code, CODE_OK);

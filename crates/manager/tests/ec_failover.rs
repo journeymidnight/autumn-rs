@@ -57,10 +57,7 @@ async fn register_node(mgr: &RpcClient, addr: &str, disk: &str) -> RegisterNodeR
 
 async fn get_extent_info(mgr: &RpcClient, extent_id: u64) -> MgrExtentInfo {
     let resp = mgr
-        .call(
-            MSG_EXTENT_INFO,
-            rkyv_encode(&ExtentInfoReq { extent_id }),
-        )
+        .call(MSG_EXTENT_INFO, rkyv_encode(&ExtentInfoReq { extent_id }))
         .await
         .expect("extent_info");
     let info: ExtentInfoResp = rkyv_decode(&resp).expect("decode ExtentInfoResp");
@@ -151,10 +148,7 @@ fn ec_2_1_failover_and_recovery() {
 
         // Write a recognizable payload.
         let payload: Vec<u8> = (0..8192u16).map(|i| (i % 251) as u8).collect();
-        let result = client
-            .append(stream_id, &payload)
-            .await
-            .expect("append");
+        let result = client.append(stream_id, &payload).await.expect("append");
         assert_eq!(result.extent_id, first_extent_id);
 
         // ── Step 1: Read back before EC (3-replica) ──
@@ -180,13 +174,14 @@ fn ec_2_1_failover_and_recovery() {
             .await
             .unwrap();
         let seal_info: StreamAllocExtentResp = rkyv_decode(&seal_resp).unwrap();
-        assert_eq!(seal_info.code, CODE_OK, "seal failed: {}", seal_info.message);
+        assert_eq!(
+            seal_info.code, CODE_OK,
+            "seal failed: {}",
+            seal_info.message
+        );
 
         let stream_info = get_stream_info(&mgr, stream_id).await;
-        eprintln!(
-            "stream {} extents: {:?}",
-            stream_id, stream_info.extent_ids
-        );
+        eprintln!("stream {} extents: {:?}", stream_id, stream_info.extent_ids);
 
         // F203: ec_conversion_dispatch_loop is drain-only — only
         // markers placed via `MSG_FORCE_EC_CONVERT` (or replayed from
@@ -217,11 +212,7 @@ fn ec_2_1_failover_and_recovery() {
             let ex = get_extent_info(&mgr, first_extent_id).await;
             eprintln!(
                 "extent {} sealed={} replicates={:?} parity={:?} ec_converted={}",
-                first_extent_id,
-                ex.sealed_length,
-                ex.replicates,
-                ex.parity,
-                ex.ec_converted
+                first_extent_id, ex.sealed_length, ex.replicates, ex.parity, ex.ec_converted
             );
             if ex.ec_converted {
                 ec_converted = true;

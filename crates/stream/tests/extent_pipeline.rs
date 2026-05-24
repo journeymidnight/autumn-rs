@@ -117,9 +117,7 @@ async fn seal_rejects_subsequent_appends() {
     assert_eq!(alloc.code, CODE_OK);
 
     // High-revision write: sets last_revision=100.
-    let r1 = conn
-        .append(2020, 1, 0, 100, b"first".to_vec())
-        .await;
+    let r1 = conn.append(2020, 1, 0, 100, b"first".to_vec()).await;
     assert_eq!(r1.code, CODE_OK);
 
     // Late-arriving low-revision: must be rejected with LOCKED_BY_OTHER.
@@ -131,9 +129,7 @@ async fn seal_rejects_subsequent_appends() {
     );
 
     // Subsequent high-revision still works, proving the connection is live.
-    let r3 = conn
-        .append(2020, 1, 5, 150, b"ok".to_vec())
-        .await;
+    let r3 = conn.append(2020, 1, 5, 150, b"ok".to_vec()).await;
     assert_eq!(r3.code, CODE_OK);
     assert_eq!(r3.offset, 5);
     assert_eq!(r3.end, 7);
@@ -231,13 +227,7 @@ async fn cq_flushes_fast_ops_while_slow_op_runs() {
     let conn_a = conn.clone();
     let append_handle = compio::runtime::spawn(async move {
         let r = conn_a
-            .append(
-                APPEND_EXTENT,
-                1,
-                append_offset,
-                10,
-                vec![0u8; BIG_PAYLOAD],
-            )
+            .append(APPEND_EXTENT, 1, append_offset, 10, vec![0u8; BIG_PAYLOAD])
             .await;
         (r, Instant::now())
     });

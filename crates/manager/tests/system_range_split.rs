@@ -37,10 +37,12 @@ fn range_scan_returns_correct_results_after_split() {
         // Write 30 keys and flush
         for i in 0u32..30 {
             ps_put(
-                &ps, 901,
+                &ps,
+                901,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes()
-            ).await;
+                format!("val-{i}").as_bytes(),
+            )
+            .await;
         }
         ps_flush(&ps, 901).await;
 
@@ -53,11 +55,22 @@ fn range_scan_returns_correct_results_after_split() {
             .await
             .expect("split");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&resp).expect("decode");
-        assert_eq!(sr.code, partition_rpc::CODE_OK, "split failed: {}", sr.message);
+        assert_eq!(
+            sr.code,
+            partition_rpc::CODE_OK,
+            "split failed: {}",
+            sr.message
+        );
         compio::time::sleep(Duration::from_millis(1000)).await;
 
         let regions = get_regions(&mgr).await;
-        let right_id = regions.regions.iter().find(|(_, r)| r.part_id != 901).unwrap().1.part_id;
+        let right_id = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id != 901)
+            .unwrap()
+            .1
+            .part_id;
         compio::time::sleep(Duration::from_millis(6000)).await;
 
         // Range scan both children
@@ -79,9 +92,17 @@ fn range_scan_returns_correct_results_after_split() {
         for entry in left_range.entries.iter().chain(right_range.entries.iter()) {
             let key_str = String::from_utf8_lossy(&entry.key);
             let i: u32 = key_str.strip_prefix("key-").unwrap().parse().unwrap();
-            let part_id = if left_range.entries.iter().any(|e| e.key == entry.key) { 901 } else { right_id };
+            let part_id = if left_range.entries.iter().any(|e| e.key == entry.key) {
+                901
+            } else {
+                right_id
+            };
             let resp = psr_get(&router, part_id, &entry.key).await;
-            assert_eq!(resp.value, format!("val-{i}").as_bytes(), "value mismatch for {key_str}");
+            assert_eq!(
+                resp.value,
+                format!("val-{i}").as_bytes(),
+                "value mismatch for {key_str}"
+            );
         }
     });
 }
@@ -113,10 +134,12 @@ fn range_scan_with_limit_and_pagination_after_split() {
         // Write 30 keys, flush, split
         for i in 0u32..30 {
             ps_put(
-                &ps, 902,
+                &ps,
+                902,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes()
-            ).await;
+                format!("val-{i}").as_bytes(),
+            )
+            .await;
         }
         ps_flush(&ps, 902).await;
 
@@ -128,11 +151,22 @@ fn range_scan_with_limit_and_pagination_after_split() {
             .await
             .expect("split");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&resp).expect("decode");
-        assert_eq!(sr.code, partition_rpc::CODE_OK, "split failed: {}", sr.message);
+        assert_eq!(
+            sr.code,
+            partition_rpc::CODE_OK,
+            "split failed: {}",
+            sr.message
+        );
         compio::time::sleep(Duration::from_millis(1000)).await;
 
         let regions = get_regions(&mgr).await;
-        let right_id = regions.regions.iter().find(|(_, r)| r.part_id != 902).unwrap().1.part_id;
+        let right_id = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id != 902)
+            .unwrap()
+            .1
+            .part_id;
         compio::time::sleep(Duration::from_millis(6000)).await;
 
         // Get the expected total for right child
@@ -155,7 +189,8 @@ fn range_scan_with_limit_and_pagination_after_split() {
         }
 
         assert_eq!(
-            collected.len(), expected_count,
+            collected.len(),
+            expected_count,
             "pagination should collect all {expected_count} right-child keys, got {}",
             collected.len()
         );
@@ -190,10 +225,12 @@ fn range_scan_consistent_after_split_compact_split() {
         // Write 50 keys, flush
         for i in 0u32..50 {
             ps_put(
-                &ps, 903,
+                &ps,
+                903,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes()
-            ).await;
+                format!("val-{i}").as_bytes(),
+            )
+            .await;
         }
         ps_flush(&ps, 903).await;
 
@@ -206,11 +243,22 @@ fn range_scan_consistent_after_split_compact_split() {
             .await
             .expect("split1");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&resp).expect("decode");
-        assert_eq!(sr.code, partition_rpc::CODE_OK, "split1 failed: {}", sr.message);
+        assert_eq!(
+            sr.code,
+            partition_rpc::CODE_OK,
+            "split1 failed: {}",
+            sr.message
+        );
         compio::time::sleep(Duration::from_millis(1000)).await;
 
         let regions = get_regions(&mgr).await;
-        let right1_id = regions.regions.iter().find(|(_, r)| r.part_id != 903).unwrap().1.part_id;
+        let right1_id = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id != 903)
+            .unwrap()
+            .1
+            .part_id;
         compio::time::sleep(Duration::from_millis(6000)).await;
 
         // Compact both children to clear overlap
@@ -227,7 +275,12 @@ fn range_scan_consistent_after_split_compact_split() {
             .await
             .expect("split2");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&resp).expect("decode");
-        assert_eq!(sr.code, partition_rpc::CODE_OK, "split2 failed: {}", sr.message);
+        assert_eq!(
+            sr.code,
+            partition_rpc::CODE_OK,
+            "split2 failed: {}",
+            sr.message
+        );
         compio::time::sleep(Duration::from_millis(1000)).await;
 
         let regions = get_regions(&mgr).await;
@@ -251,21 +304,34 @@ fn range_scan_consistent_after_split_compact_split() {
         let mut all_keys: Vec<Vec<u8>> = all_entries.iter().map(|e| e.key.clone()).collect();
         all_keys.sort();
         all_keys.dedup();
-        assert_eq!(all_keys.len(), 50, "should have exactly 50 unique keys, got {}", all_keys.len());
+        assert_eq!(
+            all_keys.len(),
+            50,
+            "should have exactly 50 unique keys, got {}",
+            all_keys.len()
+        );
 
         // Verify values via point get (range scan returns keys only)
         for entry in &all_entries {
             let key_str = String::from_utf8_lossy(&entry.key);
             let i: u32 = key_str.strip_prefix("key-").unwrap().parse().unwrap();
-            let part_id = regions.regions.iter()
+            let part_id = regions
+                .regions
+                .iter()
                 .find(|(_, r)| {
                     let rg = r.rg.as_ref().unwrap();
                     entry.key.as_slice() >= rg.start_key.as_slice()
                         && (rg.end_key.is_empty() || entry.key.as_slice() < rg.end_key.as_slice())
                 })
-                .unwrap().1.part_id;
+                .unwrap()
+                .1
+                .part_id;
             let resp = psr_get(&router, part_id, &entry.key).await;
-            assert_eq!(resp.value, format!("val-{i}").as_bytes(), "value mismatch for {key_str}");
+            assert_eq!(
+                resp.value,
+                format!("val-{i}").as_bytes(),
+                "value mismatch for {key_str}"
+            );
         }
     });
 }

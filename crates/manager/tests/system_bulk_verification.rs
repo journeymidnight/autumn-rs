@@ -74,7 +74,11 @@ fn bulk_write_crash_restart_all_data_intact() {
 
         // Range scan returns exactly 200
         let range_resp = ps_range(&ps2, 901, b"", b"", 1000).await;
-        assert_eq!(range_resp.entries.len(), 200, "range should return 200 entries");
+        assert_eq!(
+            range_resp.entries.len(),
+            200,
+            "range should return 200 entries"
+        );
     });
 }
 
@@ -138,13 +142,36 @@ fn bulk_mixed_ops_split_restart_verify() {
             .await
             .expect("split");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&resp).expect("decode");
-        assert_eq!(sr.code, partition_rpc::CODE_OK, "split failed: {}", sr.message);
+        assert_eq!(
+            sr.code,
+            partition_rpc::CODE_OK,
+            "split failed: {}",
+            sr.message
+        );
         compio::time::sleep(Duration::from_millis(1000)).await;
 
         let regions = get_regions(&mgr).await;
-        let left_rg = regions.regions.iter().find(|(_, r)| r.part_id == 902).unwrap().1.clone();
-        let right_id = regions.regions.iter().find(|(_, r)| r.part_id != 902).unwrap().1.part_id;
-        let right_rg = regions.regions.iter().find(|(_, r)| r.part_id != 902).unwrap().1.clone();
+        let left_rg = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id == 902)
+            .unwrap()
+            .1
+            .clone();
+        let right_id = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id != 902)
+            .unwrap()
+            .1
+            .part_id;
+        let right_rg = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id != 902)
+            .unwrap()
+            .1
+            .clone();
         let mid_key = left_rg.rg.as_ref().unwrap().end_key.clone();
         compio::time::sleep(Duration::from_millis(6000)).await;
 
@@ -177,7 +204,11 @@ fn bulk_mixed_ops_split_restart_verify() {
         for i in 0u32..20 {
             let key = format!("orig-{i:03}");
             let kb = key.as_bytes();
-            let part_id = if kb < mid_key.as_slice() { 902 } else { right_id };
+            let part_id = if kb < mid_key.as_slice() {
+                902
+            } else {
+                right_id
+            };
             let head = psr_head(&router2, part_id, kb).await;
             assert!(!head.found, "{key} should be deleted");
         }
@@ -186,12 +217,23 @@ fn bulk_mixed_ops_split_restart_verify() {
         for i in 20u32..100 {
             let key = format!("orig-{i:03}");
             let kb = key.as_bytes();
-            let part_id = if kb < mid_key.as_slice() { 902 } else { right_id };
+            let part_id = if kb < mid_key.as_slice() {
+                902
+            } else {
+                right_id
+            };
             let resp = psr_get(&router2, part_id, kb).await;
             if i % 2 == 0 {
-                assert_eq!(resp.value, format!("sv-{i:03}").as_bytes(), "{key} wrong (small)");
+                assert_eq!(
+                    resp.value,
+                    format!("sv-{i:03}").as_bytes(),
+                    "{key} wrong (small)"
+                );
             } else {
-                assert!(resp.value.starts_with(format!("lv-{i:03}-").as_bytes()), "{key} wrong (large)");
+                assert!(
+                    resp.value.starts_with(format!("lv-{i:03}-").as_bytes()),
+                    "{key} wrong (large)"
+                );
             }
         }
 

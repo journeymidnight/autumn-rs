@@ -45,16 +45,7 @@ impl MmapRegion {
     }
 
     fn map_raw(fd: RawFd, len: usize, prot: i32) -> io::Result<Self> {
-        let ptr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                len,
-                prot,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
+        let ptr = unsafe { libc::mmap(ptr::null_mut(), len, prot, libc::MAP_SHARED, fd, 0) };
         if ptr == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }

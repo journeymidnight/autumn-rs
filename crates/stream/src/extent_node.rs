@@ -1,11 +1,11 @@
+use crate::conn_pool::parse_addr;
+use crate::extent_rpc::*;
+use autumn_rpc::manager_rpc::{self, MgrExtentInfo};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use autumn_rpc::manager_rpc::{self, MgrExtentInfo};
-use crate::conn_pool::parse_addr;
-use crate::extent_rpc::*;
 
 /// Convert manager RPC ExtentInfo to local extent_rpc ExtentInfo.
 fn mgr_to_local_extent(e: &MgrExtentInfo) -> ExtentInfo {
@@ -23,13 +23,13 @@ fn mgr_to_local_extent(e: &MgrExtentInfo) -> ExtentInfo {
     }
 }
 use anyhow::Result;
-use bytes::Bytes;
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
-use compio::BufResult;
+use bytes::Bytes;
 use compio::fs::{File as CompioFile, OpenOptions};
+use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use compio::net::TcpListener;
-use compio::io::{AsyncRead, AsyncWriteExt};
+use compio::BufResult;
 use dashmap::DashMap;
 #[allow(unused_imports)]
 use libc;
@@ -47,7 +47,12 @@ pub(crate) struct ExtentAppendMetrics {
 
 impl ExtentAppendMetrics {
     fn new() -> Self {
-        Self { started_at: Instant::now(), req_count: 0, bytes: 0, total_ns: 0 }
+        Self {
+            started_at: Instant::now(),
+            req_count: 0,
+            bytes: 0,
+            total_ns: 0,
+        }
     }
     pub(crate) fn record(&mut self, reqs: u64, bytes: u64, elapsed_ns: u64) {
         self.req_count += reqs;
@@ -94,7 +99,8 @@ impl DiskFS {
     /// Reads `disk_id` from `{base_dir}/disk_id`.
     async fn open(base_dir: PathBuf) -> Result<Self> {
         let disk_id_path = base_dir.join("disk_id");
-        let data = compio::fs::read(&disk_id_path).await
+        let data = compio::fs::read(&disk_id_path)
+            .await
             .map_err(|e| anyhow::anyhow!("read disk_id in {}: {e}", base_dir.display()))?;
         let disk_id_str = String::from_utf8(data)
             .map_err(|e| anyhow::anyhow!("invalid utf8 disk_id in {}: {e}", base_dir.display()))?;
@@ -193,9 +199,7 @@ impl DiskFS {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            if let Ok(c_path) =
-                std::ffi::CString::new(self.base_dir.as_os_str().as_bytes())
-            {
+            if let Ok(c_path) = std::ffi::CString::new(self.base_dir.as_os_str().as_bytes()) {
                 unsafe {
                     let mut stat: libc::statvfs = std::mem::zeroed();
                     if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
@@ -287,7 +291,6 @@ impl DiskFS {
         }
         out
     }
-
 }
 
 // ─── ExtentNodeConfig ─────────────────────────────────────────────────────────
@@ -391,7 +394,12 @@ impl ExtentNodeConfig {
     /// F099-M: mark this config as a shard of a multi-shard extent-node.
     /// `shard_idx` must be < `shard_count`. `sibling_addrs[i]` is the
     /// local address of shard `i` (normally `127.0.0.1:<shard_ports[i]>`).
-    pub fn with_shard(mut self, shard_idx: u32, shard_count: u32, sibling_addrs: Vec<String>) -> Self {
+    pub fn with_shard(
+        mut self,
+        shard_idx: u32,
+        shard_count: u32,
+        sibling_addrs: Vec<String>,
+    ) -> Self {
         assert!(shard_count >= 1, "shard_count must be >= 1");
         assert!(shard_idx < shard_count, "shard_idx must be < shard_count");
         if shard_count > 1 {
@@ -522,7 +530,10 @@ pub(crate) fn register_sync_waiter(
     };
     if let Some(wrx) = new_wake_rx {
         let extent_clone = Rc::clone(extent);
-        en_spawn_failstop("en_coalescer".to_string(), coalescer_loop(extent_clone, wrx));
+        en_spawn_failstop(
+            "en_coalescer".to_string(),
+            coalescer_loop(extent_clone, wrx),
+        );
     }
     rx
 }
@@ -570,7 +581,11 @@ where
 {
     compio::runtime::spawn(async move {
         use futures::future::FutureExt;
-        if std::panic::AssertUnwindSafe(fut).catch_unwind().await.is_err() {
+        if std::panic::AssertUnwindSafe(fut)
+            .catch_unwind()
+            .await
+            .is_err()
+        {
             tracing::error!(
                 bg_loop = %name,
                 "extent-node background loop PANICKED on a moved-resource loop; \
@@ -651,7 +666,10 @@ async fn coalescer_loop(
             let f: &CompioFile = &*file_rc;
             match f.sync_data().await {
                 Ok(_) => {
-                    extent.coalescer.last_synced.store(snapshot, Ordering::SeqCst);
+                    extent
+                        .coalescer
+                        .last_synced
+                        .store(snapshot, Ordering::SeqCst);
                     let waiters = {
                         let mut inner = extent.coalescer.inner.borrow_mut();
                         std::mem::take(&mut inner.waiters)
@@ -1007,12 +1025,18 @@ fn set_tcp_buffer_sizes(stream: &compio::net::TcpStream, size: usize) {
     let size = size as libc::c_int;
     unsafe {
         libc::setsockopt(
-            fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
-            &size as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &size as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
         libc::setsockopt(
-            fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
-            &size as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &size as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
     }
 }
@@ -1059,11 +1083,7 @@ const FILE_IO_CHUNK_BYTES: usize = 256 * 1024 * 1024;
 
 /// Chunked pread for full-extent reads (recovery / EC convert / etc.).
 /// Single-shot reads <= FILE_IO_CHUNK_BYTES bypass the loop.
-async fn file_pread_chunked(
-    file: Rc<CompioFile>,
-    offset: u64,
-    len: usize,
-) -> Result<Vec<u8>> {
+async fn file_pread_chunked(file: Rc<CompioFile>, offset: u64, len: usize) -> Result<Vec<u8>> {
     if len <= FILE_IO_CHUNK_BYTES {
         return file_pread(file, offset, len).await;
     }
@@ -1090,11 +1110,7 @@ async fn file_pread_chunked(
 /// passed straight to `file_pwrite` which accepts `impl IoBuf`; F140 removed
 /// the per-chunk `chunk.to_vec()` round-trip that previously forced
 /// `O(extent)` event-loop memcpy on every full-extent write.
-async fn file_pwrite_chunked(
-    file: Rc<CompioFile>,
-    offset: u64,
-    data: Bytes,
-) -> Result<()> {
+async fn file_pwrite_chunked(file: Rc<CompioFile>, offset: u64, data: Bytes) -> Result<()> {
     if data.len() <= FILE_IO_CHUNK_BYTES {
         return file_pwrite(file, offset, data).await;
     }
@@ -1156,9 +1172,20 @@ fn spawn_read(
     async move {
         let BufResult(result, buf_back) = reader.read(buf).await;
         match result {
-            Ok(0) => ReadBurst::Eof { reader, buf: buf_back },
-            Ok(n) => ReadBurst::Data { buf: buf_back, n, reader },
-            Err(e) => ReadBurst::Err { e, reader, buf: buf_back },
+            Ok(0) => ReadBurst::Eof {
+                reader,
+                buf: buf_back,
+            },
+            Ok(n) => ReadBurst::Data {
+                buf: buf_back,
+                n,
+                reader,
+            },
+            Err(e) => ReadBurst::Err {
+                e,
+                reader,
+                buf: buf_back,
+            },
         }
     }
     .boxed_local()
@@ -1223,7 +1250,9 @@ async fn process_frames_backpressured(
                 Err(e) => {
                     let req_id = frames[i].req_id;
                     let p = autumn_rpc::RpcError::encode_status(
-                        StatusCode::InvalidArgument, &e.to_string());
+                        StatusCode::InvalidArgument,
+                        &e.to_string(),
+                    );
                     let bytes = Frame::error(req_id, MSG_APPEND, p).encode();
                     inflight.push(Box::pin(async move { vec![bytes] }));
                     i += 1;
@@ -1232,19 +1261,27 @@ async fn process_frames_backpressured(
             };
             let anchor_extent = first_req.extent_id;
             let mut slots: Vec<AppendSlot> = Vec::with_capacity(8);
-            slots.push(AppendSlot { req: first_req, req_id: frames[i].req_id });
+            slots.push(AppendSlot {
+                req: first_req,
+                req_id: frames[i].req_id,
+            });
             i += 1;
             while i < frames.len() && frames[i].msg_type == MSG_APPEND {
                 match AppendReq::decode(frames[i].payload.clone()) {
                     Ok(r) if r.extent_id == anchor_extent => {
-                        slots.push(AppendSlot { req: r, req_id: frames[i].req_id });
+                        slots.push(AppendSlot {
+                            req: r,
+                            req_id: frames[i].req_id,
+                        });
                         i += 1;
                     }
                     Ok(_) => break,
                     Err(e) => {
                         let req_id = frames[i].req_id;
                         let p = autumn_rpc::RpcError::encode_status(
-                            StatusCode::InvalidArgument, &e.to_string());
+                            StatusCode::InvalidArgument,
+                            &e.to_string(),
+                        );
                         let bytes = Frame::error(req_id, MSG_APPEND, p).encode();
                         inflight.push(Box::pin(async move { vec![bytes] }));
                         i += 1;
@@ -1280,7 +1317,9 @@ async fn process_frames_backpressured(
                 Err(e) => {
                     let req_id = frames[i].req_id;
                     let p = autumn_rpc::RpcError::encode_status(
-                        StatusCode::InvalidArgument, &e.to_string());
+                        StatusCode::InvalidArgument,
+                        &e.to_string(),
+                    );
                     let bytes = Frame::error(req_id, MSG_READ_BYTES, p).encode();
                     inflight.push(Box::pin(async move { vec![bytes] }));
                     i += 1;
@@ -1289,19 +1328,27 @@ async fn process_frames_backpressured(
             };
             let anchor_extent = first_req.extent_id;
             let mut slots: Vec<ReadSlot> = Vec::with_capacity(8);
-            slots.push(ReadSlot { req: first_req, req_id: frames[i].req_id });
+            slots.push(ReadSlot {
+                req: first_req,
+                req_id: frames[i].req_id,
+            });
             i += 1;
             while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES {
                 match ReadBytesReq::decode(frames[i].payload.clone()) {
                     Ok(r) if r.extent_id == anchor_extent => {
-                        slots.push(ReadSlot { req: r, req_id: frames[i].req_id });
+                        slots.push(ReadSlot {
+                            req: r,
+                            req_id: frames[i].req_id,
+                        });
                         i += 1;
                     }
                     Ok(_) => break,
                     Err(e) => {
                         let req_id = frames[i].req_id;
                         let p = autumn_rpc::RpcError::encode_status(
-                            StatusCode::InvalidArgument, &e.to_string());
+                            StatusCode::InvalidArgument,
+                            &e.to_string(),
+                        );
                         let bytes = Frame::error(req_id, MSG_READ_BYTES, p).encode();
                         inflight.push(Box::pin(async move { vec![bytes] }));
                         i += 1;
@@ -1338,12 +1385,18 @@ async fn process_frames_backpressured(
             };
             let anchor_extent = first_req.extent_id;
             let mut slots: Vec<ReadSlot> = Vec::with_capacity(8);
-            slots.push(ReadSlot { req: first_req, req_id: frames[i].req_id });
+            slots.push(ReadSlot {
+                req: first_req,
+                req_id: frames[i].req_id,
+            });
             i += 1;
             while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES_ZC {
                 match ReadBytesReq::decode(frames[i].payload.clone()) {
                     Ok(r) if r.extent_id == anchor_extent => {
-                        slots.push(ReadSlot { req: r, req_id: frames[i].req_id });
+                        slots.push(ReadSlot {
+                            req: r,
+                            req_id: frames[i].req_id,
+                        });
                         i += 1;
                     }
                     Ok(_) => break,
@@ -1403,9 +1456,12 @@ struct ReadSlot {
 
 /// Error-encode a single append slot.
 fn err_bytes(req_id: u32, msg_type: u8, code: StatusCode, msg: &str) -> Bytes {
-    Frame::error(req_id, msg_type,
+    Frame::error(
+        req_id,
+        msg_type,
         autumn_rpc::RpcError::encode_status(code, msg),
-    ).encode()
+    )
+    .encode()
 }
 
 /// Build the async future that performs ACL + pwritev for a same-extent
@@ -1443,7 +1499,9 @@ async fn build_append_future(
                 // F143: durable seal — fsync the data file when the
                 // refresh promotes 0 → sealed_length so the on-disk
                 // prefix matches the manager's view.
-                let _ = node.apply_extent_meta_durable(extent_id, &extent, &ex).await;
+                let _ = node
+                    .apply_extent_meta_durable(extent_id, &extent, &ex)
+                    .await;
             }
             Ok(None) | Err(_) => {
                 let msg = format!(
@@ -1461,10 +1519,15 @@ async fn build_append_future(
 
     // 2. Sealed / eversion check using CURRENT local atomics.
     let local_eversion = extent.eversion.load(Ordering::SeqCst);
-    let sealed = extent.sealed_length.load(Ordering::SeqCst) > 0
-        || extent.avali.load(Ordering::SeqCst) > 0;
+    let sealed =
+        extent.sealed_length.load(Ordering::SeqCst) > 0 || extent.avali.load(Ordering::SeqCst) > 0;
     if sealed || slots.iter().any(|s| local_eversion > s.req.eversion) {
-        let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
+        let resp_payload = AppendResp {
+            code: CODE_PRECONDITION,
+            offset: 0,
+            end: 0,
+        }
+        .encode();
         let out: Vec<Bytes> = slots
             .into_iter()
             .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
@@ -1476,7 +1539,12 @@ async fn build_append_future(
     let first = &slots[0].req;
     let last_revision = extent.last_revision.load(Ordering::SeqCst);
     if first.revision < last_revision {
-        let resp_payload = AppendResp { code: CODE_LOCKED_BY_OTHER, offset: 0, end: 0 }.encode();
+        let resp_payload = AppendResp {
+            code: CODE_LOCKED_BY_OTHER,
+            offset: 0,
+            end: 0,
+        }
+        .encode();
         let out: Vec<Bytes> = slots
             .into_iter()
             .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
@@ -1491,7 +1559,12 @@ async fn build_append_future(
     // 4. Commit reconciliation.
     let mut file_start = extent.len.load(Ordering::SeqCst);
     if file_start < first.commit as u64 {
-        let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
+        let resp_payload = AppendResp {
+            code: CODE_PRECONDITION,
+            offset: 0,
+            end: 0,
+        }
+        .encode();
         let out: Vec<Bytes> = slots
             .into_iter()
             .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
@@ -1510,7 +1583,12 @@ async fn build_append_future(
                 let _ = node
                     .apply_extent_meta_durable(extent_id, &extent, &mgr_info)
                     .await;
-                let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
+                let resp_payload = AppendResp {
+                    code: CODE_PRECONDITION,
+                    offset: 0,
+                    end: 0,
+                }
+                .encode();
                 let out: Vec<Bytes> = slots
                     .into_iter()
                     .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
@@ -1535,7 +1613,12 @@ async fn build_append_future(
         if extent.sealed_length.load(Ordering::SeqCst) > 0
             || extent.avali.load(Ordering::SeqCst) > 0
         {
-            let resp_payload = AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode();
+            let resp_payload = AppendResp {
+                code: CODE_PRECONDITION,
+                offset: 0,
+                end: 0,
+            }
+            .encode();
             let out: Vec<Bytes> = slots
                 .into_iter()
                 .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
@@ -1636,8 +1719,16 @@ async fn build_append_future(
             .into_iter()
             .enumerate()
             .map(|(k, req_id)| {
-                let end = if k + 1 < n { offsets[k + 1] } else { total_end as u32 };
-                let resp = AppendResp { code: CODE_OK, offset: offsets[k], end };
+                let end = if k + 1 < n {
+                    offsets[k + 1]
+                } else {
+                    total_end as u32
+                };
+                let resp = AppendResp {
+                    code: CODE_OK,
+                    offset: offsets[k],
+                    end,
+                };
                 Frame::response(req_id, MSG_APPEND, resp.encode()).encode()
             })
             .collect()
@@ -1756,8 +1847,12 @@ fn build_read_future(
                             Frame::response(
                                 slot.req_id,
                                 MSG_READ_BYTES,
-                                ReadBytesResp { code: CODE_OK, end, payload: Bytes::from(buf) }
-                                    .encode(),
+                                ReadBytesResp {
+                                    code: CODE_OK,
+                                    end,
+                                    payload: Bytes::from(buf),
+                                }
+                                .encode(),
                             )
                             .encode(),
                         );
@@ -1984,12 +2079,16 @@ impl ExtentNode {
         // hanging manager doesn't trap the periodic 5-min sweep.
         let resp_data = self
             .manager_pool
-            .call_timeout(&mgr, manager_rpc::MSG_RECONCILE_EXTENTS, req, Duration::from_secs(10))
+            .call_timeout(
+                &mgr,
+                manager_rpc::MSG_RECONCILE_EXTENTS,
+                req,
+                Duration::from_secs(10),
+            )
             .await
             .map_err(|e| anyhow::anyhow!("reconcile_extents rpc: {e}"))?;
-        let resp: manager_rpc::ReconcileExtentsResp =
-            manager_rpc::rkyv_decode(&resp_data)
-                .map_err(|e| anyhow::anyhow!("decode reconcile resp: {e}"))?;
+        let resp: manager_rpc::ReconcileExtentsResp = manager_rpc::rkyv_decode(&resp_data)
+            .map_err(|e| anyhow::anyhow!("decode reconcile resp: {e}"))?;
         if resp.code != manager_rpc::CODE_OK {
             return Err(anyhow::anyhow!(
                 "reconcile_extents non-OK: {}",
@@ -2076,7 +2175,12 @@ impl ExtentNode {
         self.manager_pool
             .call_timeout(sibling_addr, msg_type, payload, Duration::from_secs(60))
             .await
-            .map_err(|e| (StatusCode::Unavailable, format!("forward to shard {sibling_addr}: {e}")))
+            .map_err(|e| {
+                (
+                    StatusCode::Unavailable,
+                    format!("forward to shard {sibling_addr}: {e}"),
+                )
+            })
     }
 
     /// Return the first online disk, or None if all are offline.
@@ -2086,9 +2190,10 @@ impl ExtentNode {
 
     /// Resolve DiskFS for an extent by its disk_id. Returns error string if disk is unknown.
     fn disk_for(&self, disk_id: u64) -> Result<Rc<DiskFS>, String> {
-        self.disks.get(&disk_id).cloned().ok_or_else(|| {
-            format!("unknown disk_id {disk_id}")
-        })
+        self.disks
+            .get(&disk_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown disk_id {disk_id}"))
     }
 
     /// Mark the disk hosting an extent as offline after an I/O error.
@@ -2104,7 +2209,11 @@ impl ExtentNode {
         }
     }
 
-    pub(crate) async fn save_meta(&self, extent_id: u64, entry: &ExtentEntry) -> Result<(), String> {
+    pub(crate) async fn save_meta(
+        &self,
+        extent_id: u64,
+        entry: &ExtentEntry,
+    ) -> Result<(), String> {
         let sealed_length = entry.sealed_length.load(Ordering::SeqCst);
         let eversion = entry.eversion.load(Ordering::SeqCst);
         let last_revision = entry.last_revision.load(Ordering::SeqCst);
@@ -2248,7 +2357,7 @@ impl ExtentNode {
                     Rc::new(ExtentEntry {
                         file: RefCell::new(Rc::new(file)),
                         len: AtomicU64::new(len),
-                                eversion: AtomicU64::new(eversion),
+                        eversion: AtomicU64::new(eversion),
                         sealed_length: AtomicU64::new(sealed_length),
                         avali: AtomicU32::new(if sealed_length > 0 { 1 } else { 0 }),
                         last_revision: AtomicI64::new(last_revision),
@@ -2346,7 +2455,6 @@ impl ExtentNode {
         }
     }
 
-
     /// Handle one TCP connection (R4 step 4.2 v3 — **true SQ/CQ**).
     ///
     /// **One compio task per TCP connection, inline `FuturesUnordered`,
@@ -2396,13 +2504,10 @@ impl ExtentNode {
     /// The read buffer is moved INTO the read future and back OUT of it via
     /// `ReadBurst`. No per-iteration allocation — the same 512 KiB Vec is
     /// recycled.
-    pub async fn handle_connection(
-        conn: autumn_transport::Conn,
-        node: ExtentNode,
-    ) -> Result<()> {
+    pub async fn handle_connection(conn: autumn_transport::Conn, node: ExtentNode) -> Result<()> {
         use futures::future::{select, Either, LocalBoxFuture};
-        use futures::FutureExt;
         use futures::stream::{FuturesUnordered, StreamExt};
+        use futures::FutureExt;
 
         const READ_BUF_SIZE: usize = 512 * 1024;
 
@@ -2458,7 +2563,11 @@ impl ExtentNode {
                     ReadBurst::Data { buf, n, reader } => {
                         decoder.feed(&buf[..n]);
                         process_frames_backpressured(
-                            &node, &mut decoder, &mut inflight, &mut tx_bufs, cap,
+                            &node,
+                            &mut decoder,
+                            &mut inflight,
+                            &mut tx_bufs,
+                            cap,
                         )
                         .await?;
                         read_fut = Some(spawn_read(reader, buf));
@@ -2519,7 +2628,11 @@ impl ExtentNode {
                         ReadBurst::Data { buf, n, reader } => {
                             decoder.feed(&buf[..n]);
                             process_frames_backpressured(
-                                &node, &mut decoder, &mut inflight, &mut tx_bufs, cap,
+                                &node,
+                                &mut decoder,
+                                &mut inflight,
+                                &mut tx_bufs,
+                                cap,
                             )
                             .await?;
                             read_fut = Some(spawn_read(reader, buf));
@@ -2554,7 +2667,10 @@ impl ExtentNode {
             MSG_COMMIT_EC_SHARD => self.handle_commit_ec_shard(payload).await,
             MSG_SYNCED_LENGTH => self.handle_synced_length(payload).await,
             MSG_PROBE_EXTENT => self.handle_probe_extent(payload).await,
-            _ => Err((StatusCode::InvalidArgument, format!("unknown msg_type {msg_type}"))),
+            _ => Err((
+                StatusCode::InvalidArgument,
+                format!("unknown msg_type {msg_type}"),
+            )),
         }
     }
 
@@ -2578,7 +2694,12 @@ impl ExtentNode {
         self.extents
             .get(&extent_id)
             .map(|v| Rc::clone(v.value()))
-            .ok_or_else(|| (StatusCode::NotFound, format!("extent {} not found", extent_id)))
+            .ok_or_else(|| {
+                (
+                    StatusCode::NotFound,
+                    format!("extent {} not found", extent_id),
+                )
+            })
     }
 
     async fn ensure_extent(&self, extent_id: u64) -> Result<Rc<ExtentEntry>, String> {
@@ -2602,7 +2723,8 @@ impl ExtentNode {
             .ok_or_else(|| "no online disk available".to_string())?;
         let path = disk.extent_path(extent_id);
         if let Some(parent) = path.parent() {
-            compio::fs::create_dir_all(parent).await
+            compio::fs::create_dir_all(parent)
+                .await
                 .map_err(|e| e.to_string())?;
         }
         let file = OpenOptions::new()
@@ -2612,7 +2734,9 @@ impl ExtentNode {
             .open(&path)
             .await
             .map_err(|e| e.to_string())?;
-        let len = file.metadata().await
+        let len = file
+            .metadata()
+            .await
             .map(|m| m.len())
             .map_err(|e| e.to_string())?;
 
@@ -2620,7 +2744,7 @@ impl ExtentNode {
         self.extents.insert(
             extent_id,
             Rc::new(ExtentEntry {
-                        file: RefCell::new(Rc::new(file)),
+                file: RefCell::new(Rc::new(file)),
                 len: AtomicU64::new(len),
                 eversion: AtomicU64::new(1),
                 sealed_length: AtomicU64::new(0),
@@ -2706,7 +2830,6 @@ impl ExtentNode {
         sealed_changed
     }
 
-
     async fn truncate_to_commit(extent: &Rc<ExtentEntry>, commit: u32) -> Result<(), String> {
         let f = extent.file_rc();
         f.set_len(commit as u64).await.map_err(|e| e.to_string())?;
@@ -2731,8 +2854,14 @@ impl ExtentNode {
         // longer exists on disk. `pending_fsync` follows the same
         // shrink — the subsequent pwrite (if any) will store its own
         // larger end value via the regular F178 path.
-        extent.coalescer.last_synced.store(commit as u64, Ordering::SeqCst);
-        extent.coalescer.pending_fsync.store(commit as u64, Ordering::SeqCst);
+        extent
+            .coalescer
+            .last_synced
+            .store(commit as u64, Ordering::SeqCst);
+        extent
+            .coalescer
+            .pending_fsync
+            .store(commit as u64, Ordering::SeqCst);
         Ok(())
     }
 
@@ -2770,8 +2899,7 @@ impl ExtentNode {
         eversion: u64,
         total_len: u64,
     ) -> Result<Vec<u8>, String> {
-        let sock: std::net::SocketAddr = parse_addr(addr)
-            .map_err(|e| e.to_string())?;
+        let sock: std::net::SocketAddr = parse_addr(addr).map_err(|e| e.to_string())?;
         if total_len == 0 {
             return Self::read_bytes_chunk(sock, addr, extent_id, eversion, 0, 0).await;
         }
@@ -2783,9 +2911,8 @@ impl ExtentNode {
             let off_u32: u32 = offset.try_into().map_err(|_| {
                 format!("extent {extent_id} recovery offset {offset} exceeds u32 (>4 GiB)")
             })?;
-            let got =
-                Self::read_bytes_chunk(sock, addr, extent_id, eversion, off_u32, want as u32)
-                    .await?;
+            let got = Self::read_bytes_chunk(sock, addr, extent_id, eversion, off_u32, want as u32)
+                .await?;
             if got.is_empty() {
                 break;
             }
@@ -2819,8 +2946,7 @@ impl ExtentNode {
         let resp_bytes = rpc_oneshot(sock, MSG_READ_BYTES, req.encode())
             .await
             .map_err(|e| format!("read_bytes from {addr}: {e}"))?;
-        let resp = ReadBytesResp::decode(resp_bytes)
-            .map_err(|e| format!("decode: {e}"))?;
+        let resp = ReadBytesResp::decode(resp_bytes).map_err(|e| format!("decode: {e}"))?;
         if resp.code != CODE_OK {
             return Err(format!(
                 "read_bytes error from {addr}: code={}",
@@ -2836,7 +2962,9 @@ impl ExtentNode {
         exclude_node_ids: &[u64],
     ) -> Result<Vec<u8>, String> {
         // TODO(F044): nodes_map_from_manager() stubbed
-        let nodes = self.nodes_map_from_manager().await
+        let nodes = self
+            .nodes_map_from_manager()
+            .await
             .map_err(|e| format!("nodes_map: {e}"))?;
         for node_id in extent.replicates.iter().chain(extent.parity.iter()) {
             if exclude_node_ids.contains(node_id) {
@@ -2948,9 +3076,8 @@ impl ExtentNode {
             let off_u32: u32 = offset.try_into().map_err(|_| {
                 format!("extent {extent_id} stream offset {offset} exceeds u32 (>4 GiB)")
             })?;
-            let got =
-                Self::read_bytes_chunk(sock, addr, extent_id, eversion, off_u32, want as u32)
-                    .await?;
+            let got = Self::read_bytes_chunk(sock, addr, extent_id, eversion, off_u32, want as u32)
+                .await?;
             if got.is_empty() {
                 break;
             }
@@ -2968,7 +3095,10 @@ impl ExtentNode {
         Ok(offset)
     }
 
-    pub(crate) async fn extent_info_from_manager(&self, extent_id: u64) -> Result<Option<ExtentInfo>, String> {
+    pub(crate) async fn extent_info_from_manager(
+        &self,
+        extent_id: u64,
+    ) -> Result<Option<ExtentInfo>, String> {
         let mgr = match &self.manager_endpoint {
             Some(ep) => crate::conn_pool::normalize_endpoint(ep),
             None => return Ok(None),
@@ -2979,7 +3109,12 @@ impl ExtentNode {
         // manager) and the F147-C recovery verify-after-fetch path.
         let resp_data = self
             .manager_pool
-            .call_timeout(&mgr, autumn_rpc::manager_rpc::MSG_EXTENT_INFO, req, Duration::from_secs(5))
+            .call_timeout(
+                &mgr,
+                autumn_rpc::manager_rpc::MSG_EXTENT_INFO,
+                req,
+                Duration::from_secs(5),
+            )
             .await
             .map_err(|e| format!("extent_info rpc: {e}"))?;
         let resp: manager_rpc::ExtentInfoResp =
@@ -2998,7 +3133,12 @@ impl ExtentNode {
         // 5 s — read-only manager call.
         let resp_data = self
             .manager_pool
-            .call_timeout(&mgr, autumn_rpc::manager_rpc::MSG_NODES_INFO, Bytes::new(), Duration::from_secs(5))
+            .call_timeout(
+                &mgr,
+                autumn_rpc::manager_rpc::MSG_NODES_INFO,
+                Bytes::new(),
+                Duration::from_secs(5),
+            )
             .await
             .map_err(|e| format!("nodes_info rpc: {e}"))?;
         let resp: manager_rpc::NodesInfoResp =
@@ -3006,7 +3146,11 @@ impl ExtentNode {
         if resp.code != manager_rpc::CODE_OK {
             return Err(format!("nodes_info failed: {}", resp.message));
         }
-        Ok(resp.nodes.into_iter().map(|(id, n)| (id, n.address)).collect())
+        Ok(resp
+            .nodes
+            .into_iter()
+            .map(|(id, n)| (id, n.address))
+            .collect())
     }
 
     async fn resolve_recovery_extent(
@@ -3068,12 +3212,8 @@ impl ExtentNode {
             // FILE_IO_CHUNK_BYTES chunk), instead of materializing the whole
             // extent in a Vec then writing it back. stream_* truncates to 0 and
             // writes each chunk; succeeds only on a full sealed_length transfer.
-            self.stream_extent_from_sources(
-                &extent_info,
-                &[task.node_id, task.replace_id],
-                &extent,
-            )
-            .await?
+            self.stream_extent_from_sources(&extent_info, &[task.node_id, task.replace_id], &extent)
+                .await?
         } else {
             // EC recovery: read individual shards from healthy peers and
             // reconstruct the missing shard for this node's slot. Shard-sized
@@ -3081,13 +3221,20 @@ impl ExtentNode {
             // decode would be F193 Stage B.
             let payload = self.run_ec_recovery_payload(&task, &extent_info).await?;
             let len = payload.len() as u64;
-            extent.file_rc().set_len(0).await.map_err(|e| e.to_string())?;
+            extent
+                .file_rc()
+                .set_len(0)
+                .await
+                .map_err(|e| e.to_string())?;
             file_pwrite_chunked(extent.file_rc(), 0, Bytes::from(payload))
                 .await
                 .map_err(|e| e.to_string())?;
             len
         };
-        extent.file_rc().sync_data().await
+        extent
+            .file_rc()
+            .sync_data()
+            .await
             .map_err(|e| e.to_string())?;
 
         // F147-C: verify-after-sync — a concurrent apply_extent_meta_durable
@@ -3110,8 +3257,12 @@ impl ExtentNode {
         // that any concurrent atomic update that landed between the check and
         // these stores cannot be rolled back. Monotonic progress is guaranteed
         // even in the race window after the eversion check above.
-        let _ = extent.eversion.fetch_max(extent_info.eversion, Ordering::SeqCst);
-        let _ = extent.sealed_length.fetch_max(extent_info.sealed_length, Ordering::SeqCst);
+        let _ = extent
+            .eversion
+            .fetch_max(extent_info.eversion, Ordering::SeqCst);
+        let _ = extent
+            .sealed_length
+            .fetch_max(extent_info.sealed_length, Ordering::SeqCst);
         let _ = extent.avali.fetch_max(extent_info.avali, Ordering::SeqCst);
 
         let _ = self.save_meta(task.extent_id, &extent).await;
@@ -3176,7 +3327,8 @@ impl ExtentNode {
             // ~sealed_length/K (well under the chunking threshold), so
             // keep the legacy to-end single read (total_len=0). Only the
             // replicated full-extent fetch needed chunking.
-            match Self::copy_bytes_from_source(addr, task.extent_id, extent_info.eversion, 0).await {
+            match Self::copy_bytes_from_source(addr, task.extent_id, extent_info.eversion, 0).await
+            {
                 Ok(shard_bytes) => {
                     // Trim to sealed length if the extent is sealed.
                     let shard = if extent_info.sealed_length > 0
@@ -3237,10 +3389,13 @@ impl ExtentNode {
         _new_eversion: u64,
         shard_data: Bytes,
     ) -> Result<(), (StatusCode, String)> {
-        let entry = self.ensure_extent(extent_id).await
+        let entry = self
+            .ensure_extent(extent_id)
+            .await
             .map_err(|e| (StatusCode::Internal, e))?;
 
-        let disk = self.disk_for(entry.disk_id)
+        let disk = self
+            .disk_for(entry.disk_id)
             .map_err(|e| (StatusCode::Internal, e))?;
         let staging_path = disk.ec_staging_path(extent_id);
         let shard_len = shard_data.len();
@@ -3260,8 +3415,12 @@ impl ExtentNode {
         }
 
         if let Some(parent) = staging_path.parent() {
-            compio::fs::create_dir_all(parent).await
-                .map_err(|e| (StatusCode::Internal, format!("mkdir for staging {extent_id}: {e}")))?;
+            compio::fs::create_dir_all(parent).await.map_err(|e| {
+                (
+                    StatusCode::Internal,
+                    format!("mkdir for staging {extent_id}: {e}"),
+                )
+            })?;
         }
 
         let staging_file = OpenOptions::new()
@@ -3270,17 +3429,32 @@ impl ExtentNode {
             .truncate(true)
             .open(&staging_path)
             .await
-            .map_err(|e| (StatusCode::Internal, format!("create staging {extent_id}: {e}")))?;
+            .map_err(|e| {
+                (
+                    StatusCode::Internal,
+                    format!("create staging {extent_id}: {e}"),
+                )
+            })?;
 
         // F171: staging file is local to this function — never aliased
         // by other tasks (the path is unique per `extent_id`), so a
         // freshly-created `Rc` suffices. We share via clone for the
         // sync_data call below.
         let staging_rc = Rc::new(staging_file);
-        file_pwrite_chunked(staging_rc.clone(), 0, shard_data).await
-            .map_err(|e| (StatusCode::Internal, format!("write staging {extent_id}/{shard_index}: {e}")))?;
-        staging_rc.sync_data().await
-            .map_err(|e| (StatusCode::Internal, format!("sync staging {extent_id}: {e}")))?;
+        file_pwrite_chunked(staging_rc.clone(), 0, shard_data)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::Internal,
+                    format!("write staging {extent_id}/{shard_index}: {e}"),
+                )
+            })?;
+        staging_rc.sync_data().await.map_err(|e| {
+            (
+                StatusCode::Internal,
+                format!("sync staging {extent_id}: {e}"),
+            )
+        })?;
 
         tracing::info!(
             extent_id,
@@ -3308,10 +3482,13 @@ impl ExtentNode {
         sealed_length: u64,
         new_eversion: u64,
     ) -> Result<(), (StatusCode, String)> {
-        let entry = self.ensure_extent(extent_id).await
+        let entry = self
+            .ensure_extent(extent_id)
+            .await
             .map_err(|e| (StatusCode::Internal, e))?;
 
-        let disk = self.disk_for(entry.disk_id)
+        let disk = self
+            .disk_for(entry.disk_id)
             .map_err(|e| (StatusCode::Internal, e))?;
         let staging_path = disk.ec_staging_path(extent_id);
         let dat_path = disk.extent_path(extent_id);
@@ -3334,8 +3511,14 @@ impl ExtentNode {
             ));
         }
 
-        compio::fs::rename(&staging_path, &dat_path).await
-            .map_err(|e| (StatusCode::Internal, format!("rename staging {extent_id}: {e}")))?;
+        compio::fs::rename(&staging_path, &dat_path)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::Internal,
+                    format!("rename staging {extent_id}: {e}"),
+                )
+            })?;
 
         // Reopen the file at the .dat path so entry.file points to the
         // new (shard) data instead of the old (unlinked) inode.
@@ -3345,7 +3528,9 @@ impl ExtentNode {
             .open(&dat_path)
             .await
             .map_err(|e| (StatusCode::Internal, format!("reopen {extent_id}: {e}")))?;
-        let shard_len = new_file.metadata().await
+        let shard_len = new_file
+            .metadata()
+            .await
             .map(|m| m.len())
             .map_err(|e| (StatusCode::Internal, format!("metadata {extent_id}: {e}")))?;
 
@@ -3363,13 +3548,16 @@ impl ExtentNode {
         entry.len.store(shard_len, Ordering::SeqCst);
         // F119-E: sealed_length = original payload length (from manager),
         // not shard size.
-        entry.sealed_length.store(sealed_length.max(shard_len), Ordering::SeqCst);
+        entry
+            .sealed_length
+            .store(sealed_length.max(shard_len), Ordering::SeqCst);
         entry.avali.store(1, Ordering::SeqCst);
         if new_eversion > 0 {
             entry.eversion.store(new_eversion, Ordering::SeqCst);
         }
 
-        self.save_meta(extent_id, &entry).await
+        self.save_meta(extent_id, &entry)
+            .await
             .map_err(|e| (StatusCode::Internal, e))?;
 
         tracing::info!(
@@ -3385,8 +3573,8 @@ impl ExtentNode {
     // ─── RPC Handlers ────────────────────────────────────────────────────────
 
     async fn handle_append(&self, payload: Bytes) -> HandlerResult {
-        let req = AppendReq::decode(payload)
-            .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
+        let req =
+            AppendReq::decode(payload).map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
 
         let extent = self.get_extent(req.extent_id).await?;
 
@@ -3447,8 +3635,6 @@ impl ExtentNode {
             .encode());
         }
 
-
-
         let last_revision = extent.last_revision.load(Ordering::SeqCst);
         if req.revision < last_revision {
             return Ok(AppendResp {
@@ -3460,9 +3646,7 @@ impl ExtentNode {
         }
         let revision_changed = req.revision > last_revision;
         if revision_changed {
-            extent
-                .last_revision
-                .store(req.revision, Ordering::SeqCst);
+            extent.last_revision.store(req.revision, Ordering::SeqCst);
         }
 
         let mut start = extent.len.load(Ordering::SeqCst);
@@ -3520,7 +3704,12 @@ impl ExtentNode {
             if extent.sealed_length.load(Ordering::SeqCst) > 0
                 || extent.avali.load(Ordering::SeqCst) > 0
             {
-                return Ok(AppendResp { code: CODE_PRECONDITION, offset: 0, end: 0 }.encode());
+                return Ok(AppendResp {
+                    code: CODE_PRECONDITION,
+                    offset: 0,
+                    end: 0,
+                }
+                .encode());
             }
             start = extent.len.load(Ordering::SeqCst);
         }
@@ -3546,10 +3735,7 @@ impl ExtentNode {
             }
             Err(_canceled) => {
                 self.mark_disk_offline_for_extent(req.extent_id);
-                return Err((
-                    StatusCode::Internal,
-                    "fsync coalescer canceled".to_string(),
-                ));
+                return Err((StatusCode::Internal, "fsync coalescer canceled".to_string()));
             }
         }
 
@@ -3566,7 +3752,6 @@ impl ExtentNode {
         }
         .encode())
     }
-
 
     async fn handle_read_bytes(&self, payload: Bytes) -> HandlerResult {
         let req = ReadBytesReq::decode(payload)
@@ -3615,7 +3800,8 @@ impl ExtentNode {
         // 0x7ffff000 on Linux. Recovery (`copy_bytes_from_source`) sends
         // length=0 to slurp full sealed extents in one RPC, so the
         // per-syscall size on the server side can exceed 2 GiB.
-        let data = file_pread_chunked(extent.file_rc(), read_offset, read_size as usize).await
+        let data = file_pread_chunked(extent.file_rc(), read_offset, read_size as usize)
+            .await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
 
         Ok(ReadBytesResp {
@@ -3649,15 +3835,12 @@ impl ExtentNode {
             ));
         }
 
-        let entry = self
-            .extents
-            .get(&req.extent_id)
-            .ok_or_else(|| {
-                (
-                    StatusCode::NotFound,
-                    format!("extent {} not found", req.extent_id),
-                )
-            })?;
+        let entry = self.extents.get(&req.extent_id).ok_or_else(|| {
+            (
+                StatusCode::NotFound,
+                format!("extent {} not found", req.extent_id),
+            )
+        })?;
 
         // F210-H3 Tier 2 (post-2026-05-17): `req.revision <= 0` is a
         // protocol error, not a sentinel. The pre-F210-H2 "revision == 0
@@ -3851,8 +4034,8 @@ impl ExtentNode {
     }
 
     async fn handle_alloc_extent(&self, payload: Bytes) -> HandlerResult {
-        let req: AllocExtentReq = rkyv_decode(&payload)
-            .map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let req: AllocExtentReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
         // F099-M: forward to owner shard if we don't own this extent.
         if !self.owns_extent(req.extent_id) {
@@ -3863,14 +4046,18 @@ impl ExtentNode {
             }
         }
 
-        let disk = self
-            .choose_disk()
-            .ok_or_else(|| (StatusCode::Unavailable, "no online disk available".to_string()))?;
+        let disk = self.choose_disk().ok_or_else(|| {
+            (
+                StatusCode::Unavailable,
+                "no online disk available".to_string(),
+            )
+        })?;
         let disk_id = disk.disk_id;
 
         let path = disk.extent_path(req.extent_id);
         if let Some(parent) = path.parent() {
-            compio::fs::create_dir_all(parent).await
+            compio::fs::create_dir_all(parent)
+                .await
                 .map_err(|e| (StatusCode::Internal, e.to_string()))?;
         }
         let file = OpenOptions::new()
@@ -3880,14 +4067,16 @@ impl ExtentNode {
             .open(&path)
             .await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
-        let len = file.metadata().await
+        let len = file
+            .metadata()
+            .await
             .map(|m| m.len())
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
 
         self.extents.insert(
             req.extent_id,
             Rc::new(ExtentEntry {
-                        file: RefCell::new(Rc::new(file)),
+                file: RefCell::new(Rc::new(file)),
                 len: AtomicU64::new(len),
                 eversion: AtomicU64::new(1),
                 sealed_length: AtomicU64::new(0),
@@ -3899,7 +4088,8 @@ impl ExtentNode {
         );
 
         let entry = self.get_extent(req.extent_id).await?;
-        self.save_meta(req.extent_id, &entry).await
+        self.save_meta(req.extent_id, &entry)
+            .await
             .map_err(|e| (StatusCode::Internal, e))?;
 
         Ok(rkyv_encode(&AllocExtentResp {
@@ -3910,8 +4100,7 @@ impl ExtentNode {
     }
 
     async fn handle_df(&self, payload: Bytes) -> HandlerResult {
-        let req: DfReq = rkyv_decode(&payload)
-            .map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let req: DfReq = rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
         let mut disk_status: Vec<(u64, DiskStatus)> = Vec::new();
         if req.disk_ids.is_empty() {
@@ -3979,8 +4168,8 @@ impl ExtentNode {
     }
 
     async fn handle_require_recovery(&self, payload: Bytes) -> HandlerResult {
-        let req: RequireRecoveryReq = rkyv_decode(&payload)
-            .map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let req: RequireRecoveryReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
         // F099-M: forward to owner shard.
         if !self.owns_extent(req.task.extent_id) {
@@ -4067,8 +4256,8 @@ impl ExtentNode {
     /// inode is reaped when the last fd closes. The data is meaningless
     /// at this point because the extent's manager-side refs are 0.
     async fn handle_delete_extent(&self, payload: Bytes) -> HandlerResult {
-        let req: DeleteExtentReq = rkyv_decode(&payload)
-            .map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let req: DeleteExtentReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
         // F099-M: forward to owner shard so each shard only ever
         // touches the extents whose ids hash to it.
@@ -4174,8 +4363,8 @@ impl ExtentNode {
     }
 
     async fn handle_re_avali(&self, payload: Bytes) -> HandlerResult {
-        let req: ReAvaliReq = rkyv_decode(&payload)
-            .map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let req: ReAvaliReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
         // F099-M: forward to owner shard.
         if !self.owns_extent(req.extent_id) {
@@ -4298,7 +4487,10 @@ impl ExtentNode {
                 }));
             }
         };
-        extent.file_rc().sync_data().await
+        extent
+            .file_rc()
+            .sync_data()
+            .await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
         extent.len.store(payload_len, Ordering::SeqCst);
 
@@ -4364,10 +4556,7 @@ impl ExtentNode {
                 if req.eversion < ev {
                     return Err((
                         StatusCode::FailedPrecondition,
-                        format!(
-                            "eversion too low: got {}, expect >= {}",
-                            req.eversion, ev
-                        ),
+                        format!("eversion too low: got {}, expect >= {}", req.eversion, ev),
                     ));
                 }
             }
@@ -4377,10 +4566,7 @@ impl ExtentNode {
                 if req.eversion < ev {
                     return Err((
                         StatusCode::FailedPrecondition,
-                        format!(
-                            "eversion too low: got {}, expect >= {}",
-                            req.eversion, ev
-                        ),
+                        format!("eversion too low: got {}, expect >= {}", req.eversion, ev),
                     ));
                 }
             }
@@ -4412,7 +4598,8 @@ impl ExtentNode {
             req.size.min(logical_len.saturating_sub(offset))
         };
 
-        let data = file_pread_chunked(extent.file_rc(), offset, size as usize).await
+        let data = file_pread_chunked(extent.file_rc(), offset, size as usize)
+            .await
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
 
         Ok(CopyExtentResp {
@@ -4423,8 +4610,8 @@ impl ExtentNode {
     }
 
     async fn handle_convert_to_ec(&self, payload: Bytes) -> HandlerResult {
-        let req: ConvertToEcReq = rkyv_decode(&payload)
-            .map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let req: ConvertToEcReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
         // F099-M: forward to owner shard.
         if !self.owns_extent(req.extent_id) {
@@ -4483,7 +4670,10 @@ impl ExtentNode {
         // runs UNDER the per-extent lock, so a serialized second
         // dispatch reliably observes the post-bump state.
         let local_eversion = entry.eversion.load(Ordering::SeqCst);
-        if local_eversion >= req.eversion && sealed_length > 0 && entry.avali.load(Ordering::SeqCst) > 0 {
+        if local_eversion >= req.eversion
+            && sealed_length > 0
+            && entry.avali.load(Ordering::SeqCst) > 0
+        {
             tracing::info!(
                 extent_id,
                 local_eversion,
@@ -4516,7 +4706,8 @@ impl ExtentNode {
         // (coordinator prepares itself last). Skip RS-encode and jump
         // straight to Phase 2 (commit).
         let coordinator_prepared = {
-            let disk = self.disk_for(entry.disk_id)
+            let disk = self
+                .disk_for(entry.disk_id)
                 .map_err(|e| (StatusCode::Internal, e))?;
             let staging = disk.ec_staging_path(extent_id);
             if let Ok(meta) = compio::fs::metadata(&staging).await {
@@ -4524,7 +4715,8 @@ impl ExtentNode {
                 // is not yet known locally, we can't validate — fall through
                 // to the full path which syncs from manager first.
                 if sealed_length > 0 {
-                    let expected_shard_size = crate::erasure::shard_size(sealed_length as usize, data_shards);
+                    let expected_shard_size =
+                        crate::erasure::shard_size(sealed_length as usize, data_shards);
                     meta.len() == expected_shard_size as u64
                 } else {
                     false
@@ -4543,15 +4735,25 @@ impl ExtentNode {
             // ── Full prepare path: read, encode, distribute ──
 
             // F119-E: sync sealed_length / eversion from manager.
-            let mgr_info_opt = self.extent_info_from_manager(extent_id).await.ok().flatten();
+            let mgr_info_opt = self
+                .extent_info_from_manager(extent_id)
+                .await
+                .ok()
+                .flatten();
             if let Some(mgr_info) = mgr_info_opt.as_ref() {
                 if mgr_info.sealed_length > 0 {
-                    entry.sealed_length.store(mgr_info.sealed_length, Ordering::SeqCst);
+                    entry
+                        .sealed_length
+                        .store(mgr_info.sealed_length, Ordering::SeqCst);
                     entry.eversion.store(mgr_info.eversion, Ordering::SeqCst);
                     entry.avali.store(mgr_info.avali, Ordering::SeqCst);
                     let _ = self.save_meta(extent_id, &entry).await;
                     sealed_length = mgr_info.sealed_length;
-                    tracing::info!(extent_id, sealed_length, "applied seal from manager for EC convert");
+                    tracing::info!(
+                        extent_id,
+                        sealed_length,
+                        "applied seal from manager for EC convert"
+                    );
                 }
             }
 
@@ -4568,16 +4770,21 @@ impl ExtentNode {
             // save_meta in commit_shard_local. .dat is the shard file
             // (len = shard_size), .meta has old eversion, no staging
             // file exists. Fix meta and skip to Phase 2.
-            let expected_shard = crate::erasure::shard_size(sealed_length as usize, data_shards) as u64;
-            let f128_recovered = local_len < sealed_length
-                && local_len == expected_shard
-                && !coordinator_prepared;
+            let expected_shard =
+                crate::erasure::shard_size(sealed_length as usize, data_shards) as u64;
+            let f128_recovered =
+                local_len < sealed_length && local_len == expected_shard && !coordinator_prepared;
             if f128_recovered {
                 tracing::info!(
-                    extent_id, local_len, sealed_length, new_eversion,
+                    extent_id,
+                    local_len,
+                    sealed_length,
+                    new_eversion,
                     "F128: detected post-rename/pre-save_meta crash, recovering meta"
                 );
-                entry.sealed_length.store(sealed_length.max(local_len), Ordering::SeqCst);
+                entry
+                    .sealed_length
+                    .store(sealed_length.max(local_len), Ordering::SeqCst);
                 entry.avali.store(1, Ordering::SeqCst);
                 if new_eversion > 0 {
                     entry.eversion.store(new_eversion, Ordering::SeqCst);
@@ -4616,97 +4823,129 @@ impl ExtentNode {
                     ));
                 }
                 let truncated = Bytes::from(fetched[..sealed_length as usize].to_vec());
-                entry.file_rc()
+                entry
+                    .file_rc()
                     .set_len(0)
                     .await
                     .map_err(|e| (StatusCode::Internal, format!("truncate {extent_id}: {e}")))?;
                 file_pwrite_chunked(entry.file_rc(), 0, truncated)
                     .await
                     .map_err(|e| (StatusCode::Internal, format!("write {extent_id}: {e}")))?;
-                entry.file_rc()
+                entry
+                    .file_rc()
                     .sync_data()
                     .await
                     .map_err(|e| (StatusCode::Internal, format!("sync {extent_id}: {e}")))?;
                 entry.len.store(sealed_length, Ordering::SeqCst);
-                tracing::info!(extent_id, local_len, sealed_length, "peer-copied missing tail before EC convert");
+                tracing::info!(
+                    extent_id,
+                    local_len,
+                    sealed_length,
+                    "peer-copied missing tail before EC convert"
+                );
             }
 
             if !f128_recovered {
-            let data = file_pread_chunked(entry.file_rc(), 0, sealed_length as usize).await
-                .map_err(|e| (StatusCode::Internal, format!("read extent {extent_id}: {e}")))?;
+                let data = file_pread_chunked(entry.file_rc(), 0, sealed_length as usize)
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::Internal,
+                            format!("read extent {extent_id}: {e}"),
+                        )
+                    })?;
 
-            // F117: offload RS encode to blocking thread.
-            // F140: also do the `Vec<u8> -> Bytes` conversion inside the
-            // blocking closure (zero-copy via `Bytes::from`) so the per-shard
-            // ~shard_size memcpy that previously ran on the event loop as
-            // `Bytes::copy_from_slice(shard)` per remote target moves off
-            // the runtime. After this, the loop below uses
-            // `shards[i].clone()` which is an O(1) Arc inc.
-            let shards: Vec<Bytes> = compio::runtime::spawn_blocking(move || {
-                crate::erasure::ec_encode(&data, data_shards, parity_shards)
-                    .map(|vecs| vecs.into_iter().map(Bytes::from).collect())
-            })
-            .await
-            .map_err(|_| (StatusCode::Internal, "ec_encode task panicked".to_string()))?
-            .map_err(|e| (StatusCode::Internal, format!("ec_encode failed: {e}")))?;
+                // F117: offload RS encode to blocking thread.
+                // F140: also do the `Vec<u8> -> Bytes` conversion inside the
+                // blocking closure (zero-copy via `Bytes::from`) so the per-shard
+                // ~shard_size memcpy that previously ran on the event loop as
+                // `Bytes::copy_from_slice(shard)` per remote target moves off
+                // the runtime. After this, the loop below uses
+                // `shards[i].clone()` which is an O(1) Arc inc.
+                let shards: Vec<Bytes> = compio::runtime::spawn_blocking(move || {
+                    crate::erasure::ec_encode(&data, data_shards, parity_shards)
+                        .map(|vecs| vecs.into_iter().map(Bytes::from).collect())
+                })
+                .await
+                .map_err(|_| (StatusCode::Internal, "ec_encode task panicked".to_string()))?
+                .map_err(|e| (StatusCode::Internal, format!("ec_encode failed: {e}")))?;
 
-            // ── Phase 1 (prepare): write .ec.dat on all nodes ──
-            // Remote nodes first, coordinator (index 0) last.
-            for (i, target_addr) in req.target_addrs.iter().enumerate() {
-                if i == 0 { continue; }
-                let ws_req = WriteShardReq {
-                    extent_id,
-                    shard_index: i as u32,
-                    sealed_length,
-                    eversion: new_eversion,
-                    // F211-D: EC convert is manager-orchestrated; there
-                    // is no per-stream owner-lock to propagate today.
-                    // Passing 0 keeps the EN-side fence permissive on
-                    // this path. Future: thread the manager's epoch
-                    // through `ExtConvertToEcReq` so a fenced ex-coord
-                    // is rejected at write_shard time too.
-                    revision: 0,
-                    payload: shards[i].clone(),
-                };
-                let sock = parse_addr(target_addr)
-                    .map_err(|e| (StatusCode::Internal, format!("parse addr {target_addr}: {e}")))?;
-                match rpc_oneshot(sock, MSG_WRITE_SHARD, ws_req.encode()).await {
-                    Ok(resp_bytes) => {
-                        let resp = WriteShardResp::decode(resp_bytes)
-                            .map_err(|e| (StatusCode::Internal, format!("decode write_shard resp: {e}")))?;
-                        if resp.code != CODE_OK {
+                // ── Phase 1 (prepare): write .ec.dat on all nodes ──
+                // Remote nodes first, coordinator (index 0) last.
+                for (i, target_addr) in req.target_addrs.iter().enumerate() {
+                    if i == 0 {
+                        continue;
+                    }
+                    let ws_req = WriteShardReq {
+                        extent_id,
+                        shard_index: i as u32,
+                        sealed_length,
+                        eversion: new_eversion,
+                        // F211-D: EC convert is manager-orchestrated; there
+                        // is no per-stream owner-lock to propagate today.
+                        // Passing 0 keeps the EN-side fence permissive on
+                        // this path. Future: thread the manager's epoch
+                        // through `ExtConvertToEcReq` so a fenced ex-coord
+                        // is rejected at write_shard time too.
+                        revision: 0,
+                        payload: shards[i].clone(),
+                    };
+                    let sock = parse_addr(target_addr).map_err(|e| {
+                        (
+                            StatusCode::Internal,
+                            format!("parse addr {target_addr}: {e}"),
+                        )
+                    })?;
+                    match rpc_oneshot(sock, MSG_WRITE_SHARD, ws_req.encode()).await {
+                        Ok(resp_bytes) => {
+                            let resp = WriteShardResp::decode(resp_bytes).map_err(|e| {
+                                (
+                                    StatusCode::Internal,
+                                    format!("decode write_shard resp: {e}"),
+                                )
+                            })?;
+                            if resp.code != CODE_OK {
+                                return Err((
+                                    StatusCode::Internal,
+                                    format!(
+                                        "WriteShard to {target_addr} shard {i}: code={}",
+                                        code_description(resp.code)
+                                    ),
+                                ));
+                            }
+                        }
+                        Err(e) => {
                             return Err((
                                 StatusCode::Internal,
-                                format!(
-                                    "WriteShard to {target_addr} shard {i}: code={}",
-                                    code_description(resp.code)
-                                ),
+                                format!("WriteShard to {target_addr} shard {i}: {e}"),
                             ));
                         }
                     }
-                    Err(e) => {
-                        return Err((
-                            StatusCode::Internal,
-                            format!("WriteShard to {target_addr} shard {i}: {e}"),
-                        ));
-                    }
                 }
-            }
 
-            // Coordinator writes its own shard LAST. If we crash here,
-            // no .ec.dat on coordinator → next retry re-reads full
-            // data and re-distributes (remote nodes' prepare is
-            // idempotent).
-            self.write_shard_local(extent_id, 0, sealed_length, new_eversion, shards[0].clone()).await?;
+                // Coordinator writes its own shard LAST. If we crash here,
+                // no .ec.dat on coordinator → next retry re-reads full
+                // data and re-distributes (remote nodes' prepare is
+                // idempotent).
+                self.write_shard_local(
+                    extent_id,
+                    0,
+                    sealed_length,
+                    new_eversion,
+                    shards[0].clone(),
+                )
+                .await?;
 
-            tracing::info!(extent_id, "EC 2PC phase 1 (prepare) complete on all nodes");
+                tracing::info!(extent_id, "EC 2PC phase 1 (prepare) complete on all nodes");
             } // !f128_recovered
         }
 
         // ── Phase 2 (commit): rename .ec.dat → .dat on all nodes ──
         // Remote nodes first, coordinator last.
         for (i, target_addr) in req.target_addrs.iter().enumerate() {
-            if i == 0 { continue; }
+            if i == 0 {
+                continue;
+            }
             let commit_req = CommitEcShardReq {
                 extent_id,
                 sealed_length,
@@ -4714,12 +4953,17 @@ impl ExtentNode {
                 // F211-D: see WriteShardReq site above.
                 revision: 0,
             };
-            let sock = parse_addr(target_addr)
-                .map_err(|e| (StatusCode::Internal, format!("parse addr {target_addr}: {e}")))?;
+            let sock = parse_addr(target_addr).map_err(|e| {
+                (
+                    StatusCode::Internal,
+                    format!("parse addr {target_addr}: {e}"),
+                )
+            })?;
             match rpc_oneshot(sock, MSG_COMMIT_EC_SHARD, commit_req.encode()).await {
                 Ok(resp_bytes) => {
-                    let resp = CommitEcShardResp::decode(resp_bytes)
-                        .map_err(|e| (StatusCode::Internal, format!("decode commit_ec resp: {e}")))?;
+                    let resp = CommitEcShardResp::decode(resp_bytes).map_err(|e| {
+                        (StatusCode::Internal, format!("decode commit_ec resp: {e}"))
+                    })?;
                     if resp.code != CODE_OK {
                         return Err((
                             StatusCode::Internal,
@@ -4741,7 +4985,8 @@ impl ExtentNode {
 
         // Coordinator commits itself LAST. After this, the idempotency
         // guard (eversion bump) ensures future retries are a no-op.
-        self.commit_shard_local(extent_id, sealed_length, new_eversion).await?;
+        self.commit_shard_local(extent_id, sealed_length, new_eversion)
+            .await?;
 
         tracing::info!(extent_id, new_eversion, "EC 2PC phase 2 (commit) complete");
 
@@ -4774,7 +5019,10 @@ impl ExtentNode {
             if let Ok(entry) = self.ensure_extent(req.extent_id).await {
                 let last = entry.last_revision.load(Ordering::SeqCst);
                 if req.revision < last {
-                    return Ok(WriteShardResp { code: CODE_LOCKED_BY_OTHER }.encode());
+                    return Ok(WriteShardResp {
+                        code: CODE_LOCKED_BY_OTHER,
+                    }
+                    .encode());
                 }
             }
         }
@@ -4808,7 +5056,10 @@ impl ExtentNode {
             if let Ok(entry) = self.ensure_extent(req.extent_id).await {
                 let last = entry.last_revision.load(Ordering::SeqCst);
                 if req.revision < last {
-                    return Ok(CommitEcShardResp { code: CODE_LOCKED_BY_OTHER }.encode());
+                    return Ok(CommitEcShardResp {
+                        code: CODE_LOCKED_BY_OTHER,
+                    }
+                    .encode());
                 }
             }
         }
@@ -4901,7 +5152,10 @@ mod f147b_tests {
             payload: Bytes::from(b"x".to_vec()),
         };
         let stale_result = node.handle_append(stale_req.encode()).await;
-        assert!(stale_result.is_ok(), "handle_append should not error on sealed extent");
+        assert!(
+            stale_result.is_ok(),
+            "handle_append should not error on sealed extent"
+        );
         let stale_resp = AppendResp::decode(stale_result.unwrap()).expect("decode AppendResp");
         assert_eq!(
             stale_resp.code, CODE_PRECONDITION,
@@ -4969,7 +5223,8 @@ mod f147c_tests {
             assert!(
                 live_ev > stale_eversion,
                 "refuse-at-start guard should fire: live_ev={} > stale_eversion={}",
-                live_ev, stale_eversion
+                live_ev,
+                stale_eversion
             );
         }
 
@@ -4990,7 +5245,9 @@ mod f147c_tests {
 
             // fetch_max(stale_sealed_length=256) on a field holding 512 must
             // leave the field at 512.
-            let prev_sl = entry.sealed_length.fetch_max(stale_sealed_length, Ordering::SeqCst);
+            let prev_sl = entry
+                .sealed_length
+                .fetch_max(stale_sealed_length, Ordering::SeqCst);
             assert_eq!(prev_sl, 512, "fetch_max must return old sealed_length 512");
             assert_eq!(
                 entry.sealed_length.load(Ordering::SeqCst),
@@ -5345,7 +5602,9 @@ mod f160_copy_extent_eversion_tests {
         // F148-B unsealed-refusal doesn't fire first — we want to reach
         // the F160 eversion check).
         let alloc_payload = rkyv_encode(&AllocExtentReq { extent_id: 9001 });
-        node.handle_alloc_extent(alloc_payload).await.expect("alloc");
+        node.handle_alloc_extent(alloc_payload)
+            .await
+            .expect("alloc");
         // Append some bytes so the extent has content.
         let payload = vec![0xa5u8; 64];
         let write_req = AppendReq {
@@ -5355,7 +5614,9 @@ mod f160_copy_extent_eversion_tests {
             revision: 0,
             payload: Bytes::from(payload),
         };
-        node.handle_append(write_req.encode()).await.expect("append");
+        node.handle_append(write_req.encode())
+            .await
+            .expect("append");
         // Manually seal in-memory (no manager configured in this test).
         {
             let entry = node.extents.get(&9001).expect("exists");
@@ -5447,7 +5708,7 @@ mod f194_concurrency_gate_tests {
     async fn ec_convert_and_recovery_counters_are_independent() {
         let ctrl = ConcurrencyController::new(1, 1);
         let _ec = ctrl.acquire_ec_convert().await; // ec saturated
-        // recovery should still get a permit.
+                                                   // recovery should still get a permit.
         let race = futures::future::select(
             Box::pin(ctrl.acquire_recovery()),
             Box::pin(compio::time::sleep(Duration::from_millis(200))),

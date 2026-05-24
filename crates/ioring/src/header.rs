@@ -259,8 +259,7 @@ impl RingHeader {
     /// client-allocated SHM file is consistent.
     pub fn buf_pool_offset_consistent(&self) -> bool {
         self.buf_pool_offset
-            == self.cq_array_offset()
-                + (self.cq_entries as u64) * (crate::cqe::CQE_SIZE as u64)
+            == self.cq_array_offset() + (self.cq_entries as u64) * (crate::cqe::CQE_SIZE as u64)
     }
 }
 
@@ -301,7 +300,10 @@ mod tests {
         h.version = 99;
         h.encode(&mut buf);
         let err = RingHeader::decode(&buf).unwrap_err();
-        assert!(matches!(err, RingHeaderDecodeError::UnsupportedVersion { .. }));
+        assert!(matches!(
+            err,
+            RingHeaderDecodeError::UnsupportedVersion { .. }
+        ));
     }
 
     #[test]

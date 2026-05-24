@@ -64,9 +64,9 @@ pub fn init_with(kind: TransportKind) -> &'static dyn AutumnTransport {
         #[cfg(feature = "ucx")]
         TransportKind::Ucx => Box::new(UcxTransport) as Box<dyn AutumnTransport>,
         #[cfg(not(feature = "ucx"))]
-        TransportKind::Ucx => panic!(
-            "binary requested --transport ucx but was built without the `ucx` feature"
-        ),
+        TransportKind::Ucx => {
+            panic!("binary requested --transport ucx but was built without the `ucx` feature")
+        }
     });
     let t = &**GLOBAL.get().expect("init_with");
     tracing::info!("autumn-transport: init kind={:?}", t.kind());
@@ -136,9 +136,7 @@ pub fn check_listen_addr(addr: SocketAddr, kind: TransportKind) -> io::Result<()
     };
     let gid_dir = format!("/sys/class/net/{dev}/device/infiniband");
     if std::path::Path::new(&gid_dir).exists() {
-        tracing::info!(
-            "autumn-transport: UCX listen on {ip} via {dev} (RoCE-attached)"
-        );
+        tracing::info!("autumn-transport: UCX listen on {ip} via {dev} (RoCE-attached)");
     } else {
         let candidates = roce_candidates();
         tracing::warn!(
@@ -191,9 +189,7 @@ fn find_netdev_owning_ip(ip: &std::net::IpAddr) -> io::Result<String> {
             cur = ifa.ifa_next;
         };
         libc::freeifaddrs(head);
-        result.ok_or_else(|| {
-            io::Error::other(format!("ip {ip} not found on any local netdev"))
-        })
+        result.ok_or_else(|| io::Error::other(format!("ip {ip} not found on any local netdev")))
     }
 }
 
@@ -203,7 +199,9 @@ fn roce_candidates() -> Vec<(String, std::net::IpAddr)> {
         return out;
     };
     for entry in entries.flatten() {
-        let Ok(name) = entry.file_name().into_string() else { continue };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
         let ib = format!("/sys/class/net/{name}/device/infiniband");
         if !std::path::Path::new(&ib).exists() {
             continue;
@@ -333,10 +331,7 @@ impl Conn {
 }
 
 impl compio::io::AsyncRead for Conn {
-    async fn read<B: compio::buf::IoBufMut>(
-        &mut self,
-        buf: B,
-    ) -> compio::BufResult<usize, B> {
+    async fn read<B: compio::buf::IoBufMut>(&mut self, buf: B) -> compio::BufResult<usize, B> {
         match self {
             Conn::Tcp(s) => s.read(buf).await,
             #[cfg(feature = "ucx")]
@@ -346,10 +341,7 @@ impl compio::io::AsyncRead for Conn {
 }
 
 impl compio::io::AsyncWrite for Conn {
-    async fn write<B: compio::buf::IoBuf>(
-        &mut self,
-        buf: B,
-    ) -> compio::BufResult<usize, B> {
+    async fn write<B: compio::buf::IoBuf>(&mut self, buf: B) -> compio::BufResult<usize, B> {
         match self {
             Conn::Tcp(s) => s.write(buf).await,
             #[cfg(feature = "ucx")]
@@ -431,10 +423,7 @@ impl ReadHalf {
 }
 
 impl compio::io::AsyncRead for ReadHalf {
-    async fn read<B: compio::buf::IoBufMut>(
-        &mut self,
-        buf: B,
-    ) -> compio::BufResult<usize, B> {
+    async fn read<B: compio::buf::IoBufMut>(&mut self, buf: B) -> compio::BufResult<usize, B> {
         match self {
             ReadHalf::Tcp(r) => r.read(buf).await,
             #[cfg(feature = "ucx")]
@@ -469,10 +458,7 @@ impl compio::buf::IoBufMut for RawDest {
     fn as_uninit(&mut self) -> &mut [std::mem::MaybeUninit<u8>] {
         // SAFETY: same contract; u8 and MaybeUninit<u8> share layout.
         unsafe {
-            std::slice::from_raw_parts_mut(
-                self.ptr as *mut std::mem::MaybeUninit<u8>,
-                self.len,
-            )
+            std::slice::from_raw_parts_mut(self.ptr as *mut std::mem::MaybeUninit<u8>, self.len)
         }
     }
 }
@@ -610,10 +596,7 @@ impl ReadHalf {
 }
 
 impl compio::io::AsyncWrite for WriteHalf {
-    async fn write<B: compio::buf::IoBuf>(
-        &mut self,
-        buf: B,
-    ) -> compio::BufResult<usize, B> {
+    async fn write<B: compio::buf::IoBuf>(&mut self, buf: B) -> compio::BufResult<usize, B> {
         match self {
             WriteHalf::Tcp(w) => w.write(buf).await,
             #[cfg(feature = "ucx")]

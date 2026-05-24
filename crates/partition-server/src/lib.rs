@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use autumn_common::cpu_pin::{affinity_set, pick_cpu_for_ord};
 use autumn_common::metrics::{duration_to_ns, ns_to_ms};
-use autumn_rpc::manager_rpc::{self, MgrRange as Range, rkyv_encode, rkyv_decode};
-use autumn_rpc::partition_rpc::{self, *, TableLocations, SstLocation};
+use autumn_rpc::manager_rpc::{self, rkyv_decode, rkyv_encode, MgrRange as Range};
+use autumn_rpc::partition_rpc::{self, SstLocation, TableLocations, *};
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
 use autumn_stream::{ConnPool, StreamClient};
 use bytes::Bytes;
@@ -93,9 +93,7 @@ static PS_COMPACT_COOLDOWN_SECS_CELL: std::sync::OnceLock<i64> = std::sync::Once
 /// F195: setter for the group-commit request cap. First-call-wins.
 /// `[1, 1_000_000]` clamp matches pre-F195 env-default behavior.
 pub fn set_max_write_batch(n: usize) -> bool {
-    MAX_WRITE_BATCH_CELL
-        .set(n.clamp(1, 1_000_000))
-        .is_ok()
+    MAX_WRITE_BATCH_CELL.set(n.clamp(1, 1_000_000)).is_ok()
 }
 pub fn set_ps_inflight_cap(n: usize) -> bool {
     PS_INFLIGHT_CAP_CELL.set(n.clamp(1, 64)).is_ok()
@@ -118,10 +116,14 @@ pub fn set_max_wal_gap(n: u64) -> bool {
         .is_ok()
 }
 pub fn set_shutdown_timeout_ms(n: u64) -> bool {
-    SHUTDOWN_TIMEOUT_MS_CELL.set(n.clamp(1_000, 600_000)).is_ok()
+    SHUTDOWN_TIMEOUT_MS_CELL
+        .set(n.clamp(1_000, 600_000))
+        .is_ok()
 }
 pub fn set_ps_major_compact_parallelism(n: usize) -> bool {
-    PS_MAJOR_COMPACT_PARALLELISM_CELL.set(n.clamp(1, 64)).is_ok()
+    PS_MAJOR_COMPACT_PARALLELISM_CELL
+        .set(n.clamp(1, 64))
+        .is_ok()
 }
 pub fn set_ps_gc_parallelism(n: usize) -> bool {
     PS_GC_PARALLELISM_CELL.set(n.clamp(1, 64)).is_ok()
@@ -351,7 +353,9 @@ impl CompactionGate {
                     .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
-                return CompactionPermit { gate: std::sync::Arc::clone(self) };
+                return CompactionPermit {
+                    gate: std::sync::Arc::clone(self),
+                };
             }
             // Either at-cap or CAS lost the race; back off briefly and
             // retry. 50 ms is short relative to compaction wallclock
@@ -471,7 +475,6 @@ impl ValuePointer {
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Memtable entry
@@ -750,7 +753,9 @@ pub(crate) struct PartitionData {
     /// log_stream extent count per partition (typically a few thousand
     /// at most). Not worth GC'ing the map; deleted extents leave benign
     /// stale entries with count=0.
-    pub(crate) extent_pins: std::cell::RefCell<std::collections::HashMap<u64, std::rc::Rc<std::sync::atomic::AtomicI64>>>,
+    pub(crate) extent_pins: std::cell::RefCell<
+        std::collections::HashMap<u64, std::rc::Rc<std::sync::atomic::AtomicI64>>,
+    >,
     /// F185: PrepareMerge-style write halt. `Some(instant_set)` while the
     /// partition is in the merge-window write-halt; `None` otherwise.
     /// Set by `MSG_MERGE_FREEZE`; cleared by an explicit unfreeze RPC
@@ -790,8 +795,7 @@ pub(crate) struct PartitionData {
     /// commit_length is now safe to capture; `Err(msg)` = drain hit a
     /// flush failure (same shape as F210-C3 merge error path) and the
     /// split must abort.
-    pub(crate) split_drain_ack:
-        std::cell::RefCell<Option<oneshot::Sender<Result<(), String>>>>,
+    pub(crate) split_drain_ack: std::cell::RefCell<Option<oneshot::Sender<Result<(), String>>>>,
     /// F210-C4: set to `true` when `sync_partition_vp_refs` failed
     /// after a meta_stream checkpoint published a new SST set. While
     /// dirty, `background_gc_loop` skips calls into `punch_holes` /
@@ -816,8 +820,7 @@ pub(crate) struct PartitionData {
     /// drop+reopen. Without this, the next `region_sync_loop` tick
     /// tears down the source partition even though its in-memory
     /// state is already correct — a 5-60+ s outage per split.
-    pub(crate) opened_with_shared:
-        std::sync::Arc<parking_lot::Mutex<(Range, u64, u64, u64, u64)>>,
+    pub(crate) opened_with_shared: std::sync::Arc<parking_lot::Mutex<(Range, u64, u64, u64, u64)>>,
 }
 
 #[derive(Default)]
@@ -919,10 +922,7 @@ pub(crate) fn acquire_reader_pin(
         if cur < 0 {
             return None;
         }
-        if pin
-            .compare_exchange(cur, cur + 1, SeqCst, SeqCst)
-            .is_ok()
-        {
+        if pin.compare_exchange(cur, cur + 1, SeqCst, SeqCst).is_ok() {
             return Some(ReaderPin(pin));
         }
         // CAS lost a race with another reader/writer; re-try.
@@ -932,9 +932,7 @@ pub(crate) fn acquire_reader_pin(
 /// F162: try to acquire a writer (GC) pin on `eid`. Single CAS 0 → -1.
 /// Returns true on success (proceed with punch_holes); false on failure
 /// (readers active — defer this extent's GC to the next tick).
-pub(crate) fn try_acquire_writer_pin(
-    pin: &std::rc::Rc<std::sync::atomic::AtomicI64>,
-) -> bool {
+pub(crate) fn try_acquire_writer_pin(pin: &std::rc::Rc<std::sync::atomic::AtomicI64>) -> bool {
     use std::sync::atomic::Ordering::SeqCst;
     pin.compare_exchange(0, -1, SeqCst, SeqCst).is_ok()
 }
@@ -1028,7 +1026,9 @@ pub(crate) enum GcTask {
     /// pre-F201 single-tier behaviour) PLUS empty-sealed slots that
     /// the F201 candidate-set fix unblocked.
     Auto(GcAutoParams),
-    Force { extent_ids: Vec<u64> },
+    Force {
+        extent_ids: Vec<u64>,
+    },
 }
 
 /// F201: parameters passed by callers (CLI / external controller) to
@@ -1230,7 +1230,9 @@ impl WriteLoopMetrics {
         }
     }
     fn record(&mut self, stats: BatchStats) {
-        if stats.ops == 0 { return; }
+        if stats.ops == 0 {
+            return;
+        }
         self.ops += stats.ops;
         self.batches += 1;
         self.batch_size_total += stats.batch_size;
@@ -1240,10 +1242,14 @@ impl WriteLoopMetrics {
         self.end_to_end_ns += stats.end_to_end_ns;
     }
     fn maybe_report(&mut self, part_id: u64) {
-        if self.started_at.elapsed() >= Duration::from_secs(1) { self.report(part_id); }
+        if self.started_at.elapsed() >= Duration::from_secs(1) {
+            self.report(part_id);
+        }
     }
     fn flush(&mut self, part_id: u64) {
-        if self.ops > 0 { self.report(part_id); }
+        if self.ops > 0 {
+            self.report(part_id);
+        }
     }
     fn report(&mut self, part_id: u64) {
         let elapsed = self.started_at.elapsed();
@@ -1264,7 +1270,6 @@ impl WriteLoopMetrics {
         *self = Self::new();
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Inter-thread request routing (main thread ↔ partition thread)
@@ -1504,13 +1509,10 @@ impl RateController {
     ///   - gc 128 MiB/s   — handles 50% overwrite rate on 8M workloads
     ///                       (218 × 0.5 = 109 MB/s).
     pub fn from_env() -> Self {
-        let fg_rate = *PS_FG_RATE_BYTES_PER_SEC_CELL
-            .get_or_init(|| 1024 * 1024 * 1024);
+        let fg_rate = *PS_FG_RATE_BYTES_PER_SEC_CELL.get_or_init(|| 1024 * 1024 * 1024);
         let fg_iops = *PS_FG_IOPS_PER_SEC_CELL.get_or_init(|| 30_000);
-        let compact_rate = *PS_COMPACT_RATE_BYTES_PER_SEC_CELL
-            .get_or_init(|| 256 * 1024 * 1024);
-        let gc_rate = *PS_GC_RATE_BYTES_PER_SEC_CELL
-            .get_or_init(|| 128 * 1024 * 1024);
+        let compact_rate = *PS_COMPACT_RATE_BYTES_PER_SEC_CELL.get_or_init(|| 256 * 1024 * 1024);
+        let gc_rate = *PS_GC_RATE_BYTES_PER_SEC_CELL.get_or_init(|| 128 * 1024 * 1024);
         let saturated = *PS_FG_SATURATED_THRESHOLD_CELL.get_or_init(|| 0.8);
         Self::new(fg_rate, fg_iops, compact_rate, gc_rate, saturated)
     }
@@ -1559,18 +1561,23 @@ impl RateController {
             let bytes_sleep: Option<Duration> = if self.fg_rate_bytes_per_sec == 0 {
                 None
             } else {
-                let target = Duration::from_secs_f64(
-                    s.fg_bytes as f64 / self.fg_rate_bytes_per_sec as f64,
-                );
-                if target > elapsed { Some(target - elapsed) } else { None }
+                let target =
+                    Duration::from_secs_f64(s.fg_bytes as f64 / self.fg_rate_bytes_per_sec as f64);
+                if target > elapsed {
+                    Some(target - elapsed)
+                } else {
+                    None
+                }
             };
             let iops_sleep: Option<Duration> = if self.fg_iops_per_sec == 0 {
                 None
             } else {
-                let target = Duration::from_secs_f64(
-                    s.fg_ops as f64 / self.fg_iops_per_sec as f64,
-                );
-                if target > elapsed { Some(target - elapsed) } else { None }
+                let target = Duration::from_secs_f64(s.fg_ops as f64 / self.fg_iops_per_sec as f64);
+                if target > elapsed {
+                    Some(target - elapsed)
+                } else {
+                    None
+                }
             };
             match (bytes_sleep, iops_sleep) {
                 (Some(a), Some(b)) => Some(a.max(b)),
@@ -1598,12 +1605,20 @@ impl RateController {
                 let target = Duration::from_secs_f64(
                     s.compact_bytes as f64 / self.compact_rate_bytes_per_sec as f64,
                 );
-                if target > elapsed { Some(target - elapsed) } else { None }
+                if target > elapsed {
+                    Some(target - elapsed)
+                } else {
+                    None
+                }
             };
             let elapsed_secs = elapsed.as_secs_f64().max(0.001);
             let yield_sleep: Option<Duration> = if self.fg_saturated(&s, elapsed_secs) {
                 let remaining = Duration::from_secs(1).saturating_sub(elapsed);
-                if remaining > Duration::ZERO { Some(remaining) } else { None }
+                if remaining > Duration::ZERO {
+                    Some(remaining)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -1629,15 +1644,22 @@ impl RateController {
             let own_sleep: Option<Duration> = if self.gc_rate_bytes_per_sec == 0 {
                 None
             } else {
-                let target = Duration::from_secs_f64(
-                    s.gc_bytes as f64 / self.gc_rate_bytes_per_sec as f64,
-                );
-                if target > elapsed { Some(target - elapsed) } else { None }
+                let target =
+                    Duration::from_secs_f64(s.gc_bytes as f64 / self.gc_rate_bytes_per_sec as f64);
+                if target > elapsed {
+                    Some(target - elapsed)
+                } else {
+                    None
+                }
             };
             let elapsed_secs = elapsed.as_secs_f64().max(0.001);
             let yield_sleep: Option<Duration> = if self.fg_saturated(&s, elapsed_secs) {
                 let remaining = Duration::from_secs(1).saturating_sub(elapsed);
-                if remaining > Duration::ZERO { Some(remaining) } else { None }
+                if remaining > Duration::ZERO {
+                    Some(remaining)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -1732,7 +1754,9 @@ impl ConcurrencyController {
                     .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
-                return CompactPermit { ctrl: std::sync::Arc::clone(self) };
+                return CompactPermit {
+                    ctrl: std::sync::Arc::clone(self),
+                };
             }
             compio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -1748,7 +1772,9 @@ impl ConcurrencyController {
                     .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
-                return GcPermit { ctrl: std::sync::Arc::clone(self) };
+                return GcPermit {
+                    ctrl: std::sync::Arc::clone(self),
+                };
             }
             compio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -1788,8 +1814,7 @@ impl PartitionBudget {
             .current
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         if prev == 0 {
-            self.current
-                .store(0, std::sync::atomic::Ordering::Relaxed);
+            self.current.store(0, std::sync::atomic::Ordering::Relaxed);
             0
         } else {
             prev - 1
@@ -1906,8 +1931,7 @@ mod f189_admission_tests {
             rc.account_compact(5 * 1024 * 1024).await;
             let elapsed = t0.elapsed();
             assert!(
-                elapsed >= Duration::from_millis(800)
-                    && elapsed <= Duration::from_millis(1500),
+                elapsed >= Duration::from_millis(800) && elapsed <= Duration::from_millis(1500),
                 "compact should sleep ~1s on 10 MiB at 10 MiB/s, got {:?}",
                 elapsed
             );
@@ -1925,8 +1949,7 @@ mod f189_admission_tests {
             rc.account_gc(5 * 1024 * 1024).await;
             let elapsed = t0.elapsed();
             assert!(
-                elapsed >= Duration::from_millis(800)
-                    && elapsed <= Duration::from_millis(1500),
+                elapsed >= Duration::from_millis(800) && elapsed <= Duration::from_millis(1500),
                 "gc should sleep ~1s on 10 MiB at 10 MiB/s, got {:?}",
                 elapsed
             );
@@ -1963,13 +1986,7 @@ mod f189_admission_tests {
         rt.block_on(async {
             // fg_rate=100 MiB/s, ratio=0.5 → saturated at 50 MiB/s
             // observed; compact budget generous so own-rate doesn't fire.
-            let rc = RateController::new(
-                100 * 1024 * 1024,
-                0,
-                100 * 1024 * 1024,
-                0,
-                0.5,
-            );
+            let rc = RateController::new(100 * 1024 * 1024, 0, 100 * 1024 * 1024, 0, 0.5);
             rc.account_fg(60 * 1024 * 1024, 1).await;
             let t0 = Instant::now();
             rc.account_compact(1024).await;
@@ -1986,13 +2003,7 @@ mod f189_admission_tests {
     fn gc_yields_when_fg_saturated() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let rc = RateController::new(
-                100 * 1024 * 1024,
-                0,
-                0,
-                100 * 1024 * 1024,
-                0.5,
-            );
+            let rc = RateController::new(100 * 1024 * 1024, 0, 0, 100 * 1024 * 1024, 0.5);
             rc.account_fg(60 * 1024 * 1024, 1).await;
             let t0 = Instant::now();
             rc.account_gc(1024).await;
@@ -2056,8 +2067,7 @@ mod f189_admission_tests {
             rc.account_fg(800, 100).await;
             let elapsed = t0.elapsed();
             assert!(
-                elapsed >= Duration::from_millis(150)
-                    && elapsed <= Duration::from_millis(500),
+                elapsed >= Duration::from_millis(150) && elapsed <= Duration::from_millis(500),
                 "fg-iops cap should throttle 200 ops at 1k ops/s, got {:?}",
                 elapsed
             );
@@ -2071,8 +2081,8 @@ mod f189_admission_tests {
         rt.block_on(async {
             let rc = RateController::new(
                 10 * 1024 * 1024 * 1024, // bytes ~unlimited
-                1_000,                    // 1k ops/s
-                100 * 1024 * 1024,        // compact generous
+                1_000,                   // 1k ops/s
+                100 * 1024 * 1024,       // compact generous
                 0,
                 0.5, // bg yields at 500 ops/s observed
             );
@@ -2092,13 +2102,7 @@ mod f189_admission_tests {
     fn gc_yields_when_fg_iops_saturated() {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
-            let rc = RateController::new(
-                10 * 1024 * 1024 * 1024,
-                1_000,
-                0,
-                100 * 1024 * 1024,
-                0.5,
-            );
+            let rc = RateController::new(10 * 1024 * 1024 * 1024, 1_000, 0, 100 * 1024 * 1024, 0.5);
             rc.account_fg(0, 600).await;
             let t0 = Instant::now();
             rc.account_gc(1024).await;
@@ -2231,7 +2235,12 @@ impl PartitionServer {
             // manager. Bounded so a hanging manager doesn't block
             // PS startup; the loop walks to the next address.
             match pool
-                .call_timeout(addr, manager_rpc::MSG_ACQUIRE_OWNER_LOCK, req.clone(), Duration::from_secs(10))
+                .call_timeout(
+                    addr,
+                    manager_rpc::MSG_ACQUIRE_OWNER_LOCK,
+                    req.clone(),
+                    Duration::from_secs(10),
+                )
                 .await
             {
                 Ok(resp_data) => {
@@ -2253,15 +2262,11 @@ impl PartitionServer {
                             // `serve()` or `connect_with_advertise_and_port`).
                             base_port: Cell::new(0),
                             next_port_ord: Rc::new(Cell::new(0)),
-                            advertise_host: Rc::new(std::cell::RefCell::new(
-                                String::from("127.0.0.1"),
-                            )),
-                            listen_host: Rc::new(std::cell::RefCell::new(
-                                String::from("0.0.0.0"),
-                            )),
-                            concurrency_ctrl: std::sync::Arc::new(
-                                ConcurrencyController::from_env(),
-                            ),
+                            advertise_host: Rc::new(std::cell::RefCell::new(String::from(
+                                "127.0.0.1",
+                            ))),
+                            listen_host: Rc::new(std::cell::RefCell::new(String::from("0.0.0.0"))),
+                            concurrency_ctrl: std::sync::Arc::new(ConcurrencyController::from_env()),
                             partition_budget: std::sync::Arc::new(PartitionBudget::new(
                                 compute_partition_budget_cap(),
                             )),
@@ -2349,7 +2354,12 @@ impl PartitionServer {
         // hung manager.
         let resp_data = self
             .pool
-            .call_timeout(self.manager_addr(), manager_rpc::MSG_REGISTER_PS, req, Duration::from_secs(10))
+            .call_timeout(
+                self.manager_addr(),
+                manager_rpc::MSG_REGISTER_PS,
+                req,
+                Duration::from_secs(10),
+            )
             .await
             .context("register ps")?;
         let resp: manager_rpc::CodeResp =
@@ -2375,7 +2385,12 @@ impl PartitionServer {
             // as Err and feeds the failure counter.
             match self
                 .pool
-                .call_timeout(self.manager_addr(), manager_rpc::MSG_HEARTBEAT_PS, req, Duration::from_secs(5))
+                .call_timeout(
+                    self.manager_addr(),
+                    manager_rpc::MSG_HEARTBEAT_PS,
+                    req,
+                    Duration::from_secs(5),
+                )
                 .await
             {
                 Ok(resp_data) => {
@@ -2388,10 +2403,7 @@ impl PartitionServer {
                     // register and re-sync so the PS rejoins the cluster
                     // instead of staying invisible to clients (`ps=unknown`).
                     if code == manager_rpc::CODE_NOT_FOUND {
-                        tracing::warn!(
-                            "PS {} not in manager ps_nodes; re-registering",
-                            self.ps_id,
-                        );
+                        tracing::warn!("PS {} not in manager ps_nodes; re-registering", self.ps_id,);
                         if let Err(e) = self.register_ps().await {
                             tracing::warn!("PS {} re-register failed: {e}", self.ps_id);
                         } else if let Err(e) = self.sync_regions_once().await {
@@ -2407,7 +2419,9 @@ impl PartitionServer {
                     self.rotate_manager();
                     tracing::warn!(
                         "PS {} heartbeat failed ({}/{}): {e} (next mgr: {})",
-                        self.ps_id, consecutive_failures, MAX_CONSECUTIVE_FAILURES,
+                        self.ps_id,
+                        consecutive_failures,
+                        MAX_CONSECUTIVE_FAILURES,
                         self.manager_addr(),
                     );
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
@@ -2458,10 +2472,8 @@ impl PartitionServer {
                         let last_gc_at = handle.metrics.last_gc_at.load(Relaxed);
                         let last_compact_at = handle.metrics.last_compact_at.load(Relaxed);
                         // F202: dead-data + minor-compact debt + sealed-extent count.
-                        let sst_tombstone_bytes =
-                            handle.metrics.sst_tombstone_bytes.load(Relaxed);
-                        let sst_expired_bytes =
-                            handle.metrics.sst_expired_bytes.load(Relaxed);
+                        let sst_tombstone_bytes = handle.metrics.sst_tombstone_bytes.load(Relaxed);
+                        let sst_expired_bytes = handle.metrics.sst_expired_bytes.load(Relaxed);
                         let sst_out_of_range_bytes =
                             handle.metrics.sst_out_of_range_bytes.load(Relaxed);
                         let minor_compact_pending_bytes =
@@ -2502,14 +2514,18 @@ impl PartitionServer {
             // policy degrades gracefully on stale data).
             if let Err(e) = self
                 .pool
-                .call_timeout(self.manager_addr(), manager_rpc::MSG_REPORT_PARTITION_LOAD, req, Duration::from_secs(10))
+                .call_timeout(
+                    self.manager_addr(),
+                    manager_rpc::MSG_REPORT_PARTITION_LOAD,
+                    req,
+                    Duration::from_secs(10),
+                )
                 .await
             {
                 tracing::debug!("F183 report_load failed: {e}");
             }
         }
     }
-
 
     async fn region_sync_loop(&self) {
         let mut ticker = compio::time::interval(Duration::from_secs(2));
@@ -2528,7 +2544,12 @@ impl PartitionServer {
         // 2 s region_sync_loop doesn't pile up on a hung manager.
         let resp_data = self
             .pool
-            .call_timeout(self.manager_addr(), manager_rpc::MSG_GET_REGIONS, Bytes::new(), Duration::from_secs(10))
+            .call_timeout(
+                self.manager_addr(),
+                manager_rpc::MSG_GET_REGIONS,
+                Bytes::new(),
+                Duration::from_secs(10),
+            )
             .await
             .context("get regions")?;
         let resp: manager_rpc::GetRegionsResp =
@@ -2540,9 +2561,20 @@ impl PartitionServer {
         // Tuple shape mirrors `PartitionHandle.opened_with`:
         //   (rg, log_stream, row_stream, meta_stream, region_epoch)
         let mut wanted: BTreeMap<u64, (Range, u64, u64, u64, u64)> = BTreeMap::new();
-        tracing::debug!("PS {} sync: got {} regions, my ps_id={}", self.ps_id, resp.regions.len(), self.ps_id);
+        tracing::debug!(
+            "PS {} sync: got {} regions, my ps_id={}",
+            self.ps_id,
+            resp.regions.len(),
+            self.ps_id
+        );
         for (part_id, region) in resp.regions {
-            tracing::debug!("PS {} sync: region part_id={} ps_id={} epoch={}", self.ps_id, part_id, region.ps_id, region.region_epoch);
+            tracing::debug!(
+                "PS {} sync: region part_id={} ps_id={} epoch={}",
+                self.ps_id,
+                part_id,
+                region.ps_id,
+                region.region_epoch
+            );
             if region.ps_id == self.ps_id {
                 if let Some(rg) = region.rg {
                     wanted.insert(
@@ -2581,7 +2613,10 @@ impl PartitionServer {
                     // lock + clone the tuple, then compare. The lock is
                     // ~25 ns uncontended and is held only for the
                     // tuple clone (no I/O between borrow and lock).
-                    let opened = self.partitions.borrow().get(&part_id)
+                    let opened = self
+                        .partitions
+                        .borrow()
+                        .get(&part_id)
                         .map(|h| h.opened_with.lock().clone());
                     match opened {
                         Some(prev) => prev != *latest,
@@ -2626,7 +2661,14 @@ impl PartitionServer {
             }
             tracing::info!("PS {} opening partition {part_id}", self.ps_id);
             let handle = self
-                .open_partition(part_id, rg, region_epoch, log_stream_id, row_stream_id, meta_stream_id)
+                .open_partition(
+                    part_id,
+                    rg,
+                    region_epoch,
+                    log_stream_id,
+                    row_stream_id,
+                    meta_stream_id,
+                )
                 .await?;
             tracing::info!("PS {} partition {part_id} opened", self.ps_id);
             self.partitions.borrow_mut().insert(part_id, handle);
@@ -2688,9 +2730,11 @@ impl PartitionServer {
         // F099-K port allocation: reserve the next ordinal eagerly so a
         // later `open_partition` never collides with this one even if the
         // actual `bind` below is delayed by the worker thread startup.
-        let ord = self.next_port_ord.get().checked_add(1).ok_or_else(|| {
-            anyhow!("exhausted partition port ordinal space (u16 overflow)")
-        })?;
+        let ord = self
+            .next_port_ord
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("exhausted partition port ordinal space (u16 overflow)"))?;
         self.next_port_ord.set(ord);
         // ord is 1-based; cpu pool indexing is 0-based. F122-fix: P-log and
         // P-bulk now pin to different cores — at sustained 4 KB write loads
@@ -2704,7 +2748,8 @@ impl PartitionServer {
         let listen_port = base_port.checked_add(ord).ok_or_else(|| {
             anyhow!(
                 "base_port={} + ord={} overflows u16; pick a smaller base port",
-                base_port, ord,
+                base_port,
+                ord,
             )
         })?;
         let listen_host = self.listen_host.borrow().clone();
@@ -2859,8 +2904,12 @@ impl PartitionServer {
         {
             let mut parts = self.partitions.borrow_mut();
             for &pid in &part_ids {
-                let Some(handle) = parts.get_mut(&pid) else { continue };
-                let Some(drain_tx) = handle.drain_tx.as_ref() else { continue };
+                let Some(handle) = parts.get_mut(&pid) else {
+                    continue;
+                };
+                let Some(drain_tx) = handle.drain_tx.as_ref() else {
+                    continue;
+                };
                 let (ack_tx, ack_rx) = oneshot::channel::<()>();
                 if drain_tx.unbounded_send(ack_tx).is_ok() {
                     drain_rxs.push((pid, ack_rx));
@@ -2930,7 +2979,9 @@ impl PartitionServer {
                 break;
             }
             if join_start.elapsed() >= join_deadline {
-                tracing::warn!("graceful shutdown: thread join deadline reached, leaving threads detached");
+                tracing::warn!(
+                    "graceful shutdown: thread join deadline reached, leaving threads detached"
+                );
                 break;
             }
             compio::time::sleep(Duration::from_millis(50)).await;
@@ -2991,18 +3042,15 @@ impl PartitionServer {
         // Backwards-compatible: never-resolving shutdown_signal — caller
         // gets the pre-F120 forever-loop behavior. Production binaries
         // should use `serve_until_shutdown` with a SIGTERM-driven future.
-        self.serve_until_shutdown(addr, std::future::pending::<()>()).await
+        self.serve_until_shutdown(addr, std::future::pending::<()>())
+            .await
     }
 
     /// F120-C — like `serve()` but exits the main control-plane loop
     /// when `shutdown_signal` resolves, then runs `self.shutdown()` to
     /// drain partitions before returning. Production: pass a future
     /// driven by a SIGTERM/SIGINT handler.
-    pub async fn serve_until_shutdown<F>(
-        &self,
-        addr: SocketAddr,
-        shutdown_signal: F,
-    ) -> Result<()>
+    pub async fn serve_until_shutdown<F>(&self, addr: SocketAddr, shutdown_signal: F) -> Result<()>
     where
         F: std::future::Future<Output = ()>,
     {
@@ -3149,9 +3197,20 @@ fn spawn_ps_read(
     async move {
         let BufResult(result, buf_back) = reader.read(buf).await;
         match result {
-            Ok(0) => PsReadBurst::Eof { reader, buf: buf_back },
-            Ok(n) => PsReadBurst::Data { buf: buf_back, n, reader },
-            Err(e) => PsReadBurst::Err { e, reader, buf: buf_back },
+            Ok(0) => PsReadBurst::Eof {
+                reader,
+                buf: buf_back,
+            },
+            Ok(n) => PsReadBurst::Data {
+                buf: buf_back,
+                n,
+                reader,
+            },
+            Err(e) => PsReadBurst::Err {
+                e,
+                reader,
+                buf: buf_back,
+            },
         }
     }
     .boxed_local()
@@ -3201,7 +3260,9 @@ async fn drain_zc_writes(
     reader: &mut autumn_transport::ReadHalf,
     req_tx: &mpsc::Sender<PartitionRequest>,
     owner_part: u64,
-    inflight: &mut FuturesUnordered<futures::future::LocalBoxFuture<'static, (Bytes, Option<Bytes>)>>,
+    inflight: &mut FuturesUnordered<
+        futures::future::LocalBoxFuture<'static, (Bytes, Option<Bytes>)>,
+    >,
     tx_bufs: &mut Vec<Bytes>,
     cap: usize,
 ) -> Result<()> {
@@ -3339,7 +3400,10 @@ async fn drain_zc_writes(
         let tx = req_tx.clone();
         inflight.push(
             async move {
-                (delegate_round_trip(tx, req_id, MSG_PUT_ZC, meta_key, Some(value)).await, None)
+                (
+                    delegate_round_trip(tx, req_id, MSG_PUT_ZC, meta_key, Some(value)).await,
+                    None,
+                )
             }
             .boxed_local(),
         );
@@ -3378,9 +3442,11 @@ async fn serve_get_local(
     }
     let frame = match crate::rpc_handlers::handle_get(payload, part).await {
         Ok(p) => Frame::response(req_id, msg_type, p),
-        Err((code, message)) => {
-            Frame::error(req_id, msg_type, autumn_rpc::RpcError::encode_status(code, &message))
-        }
+        Err((code, message)) => Frame::error(
+            req_id,
+            msg_type,
+            autumn_rpc::RpcError::encode_status(code, &message),
+        ),
     }
     .encode();
     (frame, None)
@@ -3400,7 +3466,12 @@ async fn delegate_round_trip(
     zc_value: Option<Bytes>,
 ) -> Bytes {
     let (resp_tx, resp_rx) = oneshot::channel();
-    let req = PartitionRequest { msg_type, payload, resp_tx, zc_value };
+    let req = PartitionRequest {
+        msg_type,
+        payload,
+        resp_tx,
+        zc_value,
+    };
     let resp_frame = if tx.send(req).await.is_err() {
         Frame::error(
             req_id,
@@ -3410,9 +3481,11 @@ async fn delegate_round_trip(
     } else {
         match resp_rx.await {
             Ok(Ok(p)) => Frame::response(req_id, msg_type, p),
-            Ok(Err((code, message))) => {
-                Frame::error(req_id, msg_type, autumn_rpc::RpcError::encode_status(code, &message))
-            }
+            Ok(Err((code, message))) => Frame::error(
+                req_id,
+                msg_type,
+                autumn_rpc::RpcError::encode_status(code, &message),
+            ),
             Err(_) => Frame::error(
                 req_id,
                 msg_type,
@@ -3478,8 +3551,13 @@ fn push_one_frame_to_inflight(
 
     let tx = req_tx.clone();
     inflight.push(
-        async move { (delegate_round_trip(tx, req_id, msg_type, payload, None).await, None) }
-            .boxed_local(),
+        async move {
+            (
+                delegate_round_trip(tx, req_id, msg_type, payload, None).await,
+                None,
+            )
+        }
+        .boxed_local(),
     );
 }
 
@@ -3568,7 +3646,10 @@ async fn d1_fast_path_round_trip(
     }
 
     let tx = req_tx.clone();
-    (delegate_round_trip(tx, req_id, msg_type, payload, None).await, None)
+    (
+        delegate_round_trip(tx, req_id, msg_type, payload, None).await,
+        None,
+    )
 }
 
 /// Handle a single client connection on the P-log runtime.
@@ -3664,8 +3745,13 @@ async fn handle_ps_connection(
                     // replies onto `inflight`, which disables the d=1 fast path
                     // below (guarded by is_empty()).
                     drain_zc_writes(
-                        &mut decoder, &mut reader, &req_tx, owner_part,
-                        &mut inflight, &mut tx_bufs, cap,
+                        &mut decoder,
+                        &mut reader,
+                        &req_tx,
+                        owner_part,
+                        &mut inflight,
+                        &mut tx_bufs,
+                        cap,
                     )
                     .await?;
 
@@ -3688,12 +3774,9 @@ async fn handle_ps_connection(
                         // semantics. Fall through to the FU path in that case.
                         if more.is_none() && frame.req_id != 0 && inflight.is_empty() {
                             // Engage fast path.
-                            PS_FAST_PATH_HITS
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let (head, value) = d1_fast_path_round_trip(
-                                frame, &req_tx, &part, owner_part,
-                            )
-                            .await;
+                            PS_FAST_PATH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let (head, value) =
+                                d1_fast_path_round_trip(frame, &req_tx, &part, owner_part).await;
                             // F216 R4: MSG_GET_ZC returns a separate value iovec
                             // — write [head, value] vectored; everything else is
                             // a single frame via write_all (no regression).
@@ -3703,9 +3786,8 @@ async fn handle_ps_connection(
                                     wr?;
                                 }
                                 Some(value) => {
-                                    let BufResult(wr, _) = writer
-                                        .write_vectored_all(vec![head, value])
-                                        .await;
+                                    let BufResult(wr, _) =
+                                        writer.write_vectored_all(vec![head, value]).await;
                                     wr?;
                                 }
                             }
@@ -3717,13 +3799,21 @@ async fn handle_ps_connection(
                         // then drain whatever else is buffered.
                         if frame.req_id != 0 {
                             push_one_frame_to_inflight(
-                                frame, &req_tx, &part, owner_part, &mut inflight,
+                                frame,
+                                &req_tx,
+                                &part,
+                                owner_part,
+                                &mut inflight,
                             );
                         }
                         if let Some(second) = more {
                             if second.req_id != 0 {
                                 push_one_frame_to_inflight(
-                                    second, &req_tx, &part, owner_part, &mut inflight,
+                                    second,
+                                    &req_tx,
+                                    &part,
+                                    owner_part,
+                                    &mut inflight,
                                 );
                             }
                         }
@@ -3786,8 +3876,13 @@ async fn handle_ps_connection(
                         // F216-E W1 / F219: recv large MSG_PUT_ZC values into
                         // pooled buffers first (UCX registered / TCP owned read).
                         drain_zc_writes(
-                            &mut decoder, &mut reader, &req_tx, owner_part,
-                            &mut inflight, &mut tx_bufs, cap,
+                            &mut decoder,
+                            &mut reader,
+                            &req_tx,
+                            owner_part,
+                            &mut inflight,
+                            &mut tx_bufs,
+                            cap,
                         )
                         .await?;
                         push_frames_to_inflight(
@@ -3911,8 +4006,15 @@ async fn partition_thread_main(
 
     // Recovery: read metaStream → rowStream → logStream replay
     let (tables, sst_readers, max_seq, vp_eid, vp_off, detected_overlap, recovered_active) =
-        recover_partition(part_id, &rg, log_stream_id, row_stream_id, meta_stream_id, &part_sc)
-            .await?;
+        recover_partition(
+            part_id,
+            &rg,
+            log_stream_id,
+            row_stream_id,
+            meta_stream_id,
+            &part_sc,
+        )
+        .await?;
 
     let (flush_tx, flush_rx) = mpsc::unbounded::<()>();
     // F188: compact_tx/rx + gc_tx/rx are created on the main thread by
@@ -4102,26 +4204,30 @@ async fn partition_thread_main(
             // 10 s — manager updates `part_addrs` (in-memory + etcd
             // mirror). Bounded so partition open doesn't trap.
             match pool
-                .call_timeout(&mgr_norm, manager_rpc::MSG_REGISTER_PARTITION_ADDR, req.clone(), Duration::from_secs(10))
+                .call_timeout(
+                    &mgr_norm,
+                    manager_rpc::MSG_REGISTER_PARTITION_ADDR,
+                    req.clone(),
+                    Duration::from_secs(10),
+                )
                 .await
             {
-                Ok(bytes) => {
-                    match manager_rpc::rkyv_decode::<manager_rpc::CodeResp>(&bytes) {
-                        Ok(r) if r.code == manager_rpc::CODE_OK => {
-                            registered = true;
-                            break;
-                        }
-                        Ok(r) => {
-                            last_err = Some(anyhow!(
-                                "register_partition_addr rejected by {}: {}",
-                                mgr, r.message
-                            ));
-                        }
-                        Err(e) => {
-                            last_err = Some(anyhow!("decode register_partition_addr resp: {}", e));
-                        }
+                Ok(bytes) => match manager_rpc::rkyv_decode::<manager_rpc::CodeResp>(&bytes) {
+                    Ok(r) if r.code == manager_rpc::CODE_OK => {
+                        registered = true;
+                        break;
                     }
-                }
+                    Ok(r) => {
+                        last_err = Some(anyhow!(
+                            "register_partition_addr rejected by {}: {}",
+                            mgr,
+                            r.message
+                        ));
+                    }
+                    Err(e) => {
+                        last_err = Some(anyhow!("decode register_partition_addr resp: {}", e));
+                    }
+                },
                 Err(e) => {
                     last_err = Some(e);
                 }
@@ -4311,7 +4417,10 @@ async fn partition_loop(
 
     'outer: loop {
         if locked_by_other.get() {
-            tracing::error!(part_id, "partition poisoned by LockedByOther, shutting down");
+            tracing::error!(
+                part_id,
+                "partition poisoned by LockedByOther, shutting down"
+            );
             break;
         }
         if drain_ack.is_some() {
@@ -4384,7 +4493,10 @@ async fn partition_loop(
                     let data = flight.data;
                     inflight.push(Box::pin(async move {
                         let phase2_result = (&mut flight.phase2_fut).await;
-                        InflightCompletion { data, phase2_result }
+                        InflightCompletion {
+                            data,
+                            phase2_result,
+                        }
                     }));
                 }
                 Ok(None) => {}
@@ -4531,10 +4643,8 @@ async fn partition_loop(
                     None => {
                         // Channel closed: drain remaining inflight, then exit.
                         while let Some(c) = inflight.next().await {
-                            handle_completion(
-                                &part, &mut metrics, &locked_by_other, part_id, c,
-                            )
-                            .await;
+                            handle_completion(&part, &mut metrics, &locked_by_other, part_id, c)
+                                .await;
                             if locked_by_other.get() {
                                 break;
                             }
@@ -4544,10 +4654,7 @@ async fn partition_loop(
                 },
                 Either::Right((maybe_c, _req_dropped)) => {
                     if let Some(c) = maybe_c {
-                        handle_completion(
-                            &part, &mut metrics, &locked_by_other, part_id, c,
-                        )
-                        .await;
+                        handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
                         if locked_by_other.get() {
                             break;
                         }
@@ -4571,8 +4678,7 @@ async fn partition_loop(
         // back-pressure has already kicked in).
         {
             let mut p = part.borrow_mut();
-            let gap = p.active.mem_bytes()
-                + p.imm.iter().map(|m| m.mem_bytes()).sum::<u64>();
+            let gap = p.active.mem_bytes() + p.imm.iter().map(|m| m.mem_bytes()).sum::<u64>();
             if gap > wal_gap_cap && p.imm.len() < imm_cap && !p.active.is_empty() {
                 rotate_active(&mut p);
             }
@@ -4743,9 +4849,15 @@ async fn try_complete_freeze_drain(
         };
         let _ = ack.send(payload);
         if drain_err.is_none() {
-            tracing::info!(part_id, "split drain complete — proceeding to commit_length capture");
+            tracing::info!(
+                part_id,
+                "split drain complete — proceeding to commit_length capture"
+            );
         } else {
-            tracing::warn!(part_id, "split drain reported flush failure; split will abort");
+            tracing::warn!(
+                part_id,
+                "split drain reported flush failure; split will abort"
+            );
         }
     }
 }
@@ -4778,9 +4890,7 @@ fn check_freeze_ttls(part: &Rc<RefCell<PartitionData>>, part_id: u64) {
             let p = part.borrow();
             p.frozen_for_split.set(None);
             if let Some(ack) = p.split_drain_ack.borrow_mut().take() {
-                let _ = ack.send(Err(
-                    "split freeze TTL expired (handler wedged)".to_string()
-                ));
+                let _ = ack.send(Err("split freeze TTL expired (handler wedged)".to_string()));
             }
             tracing::warn!(
                 part_id,
@@ -4914,7 +5024,10 @@ async fn handle_incoming_req(
             };
             if !req_msg.freeze {
                 part.borrow().frozen_for_merge.set(None);
-                let resp = MergeFreezeResp { code: CODE_OK, message: String::new() };
+                let resp = MergeFreezeResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                };
                 let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                 return;
             }
@@ -4924,7 +5037,10 @@ async fn handle_incoming_req(
                 let p = part.borrow();
                 if p.frozen_for_merge.get().is_some() && p.freeze_drain_ack.borrow().is_none() {
                     // Already fully drained-frozen — reply OK immediately.
-                    let resp = MergeFreezeResp { code: CODE_OK, message: String::new() };
+                    let resp = MergeFreezeResp {
+                        code: CODE_OK,
+                        message: String::new(),
+                    };
                     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                     return;
                 }
@@ -5001,14 +5117,22 @@ async fn handle_incoming_req(
     }
 }
 
-fn enqueue_put(req: PartitionRequest, pending: &mut Vec<WriteRequest>, part_region_epoch: u64, part_id_for_err: u64) {
+fn enqueue_put(
+    req: PartitionRequest,
+    pending: &mut Vec<WriteRequest>,
+    part_region_epoch: u64,
+    part_id_for_err: u64,
+) {
     match partition_rpc::rkyv_decode::<PutReq>(&req.payload) {
         Ok(put_req) => {
             if put_req.region_epoch != 0 && put_req.region_epoch != part_region_epoch {
-                let _ = req.resp_tx.send(Err((StatusCode::FailedPrecondition, format!(
-                    "region epoch stale: part_id={} have={} got={}",
-                    part_id_for_err, part_region_epoch, put_req.region_epoch
-                ))));
+                let _ = req.resp_tx.send(Err((
+                    StatusCode::FailedPrecondition,
+                    format!(
+                        "region epoch stale: part_id={} have={} got={}",
+                        part_id_for_err, part_region_epoch, put_req.region_epoch
+                    ),
+                )));
                 return;
             }
             // F129: regular `Put` rejects values exceeding the inline
@@ -5051,7 +5175,12 @@ fn enqueue_put(req: PartitionRequest, pending: &mut Vec<WriteRequest>, part_regi
 /// and slices BOTH key and value as **zero-copy `Bytes`** out of `req.payload`
 /// (no per-field copy). Same region-epoch + inline-cap checks and the same
 /// rkyv `PutResp` response shape as `enqueue_put`.
-fn enqueue_put_zc(req: PartitionRequest, pending: &mut Vec<WriteRequest>, part_region_epoch: u64, part_id_for_err: u64) {
+fn enqueue_put_zc(
+    req: PartitionRequest,
+    pending: &mut Vec<WriteRequest>,
+    part_region_epoch: u64,
+    part_id_for_err: u64,
+) {
     let Some(meta) = partition_rpc::parse_put_zc_meta(&req.payload) else {
         let _ = req.resp_tx.send(Err((
             StatusCode::InvalidArgument,
@@ -5060,10 +5189,13 @@ fn enqueue_put_zc(req: PartitionRequest, pending: &mut Vec<WriteRequest>, part_r
         return;
     };
     if meta.region_epoch != 0 && meta.region_epoch != part_region_epoch {
-        let _ = req.resp_tx.send(Err((StatusCode::FailedPrecondition, format!(
-            "region epoch stale: part_id={} have={} got={}",
-            part_id_for_err, part_region_epoch, meta.region_epoch
-        ))));
+        let _ = req.resp_tx.send(Err((
+            StatusCode::FailedPrecondition,
+            format!(
+                "region epoch stale: part_id={} have={} got={}",
+                part_id_for_err, part_region_epoch, meta.region_epoch
+            ),
+        )));
         return;
     }
     // Zero-copy slices of the frame payload (Bytes refcount, no memcpy).
@@ -5103,19 +5235,29 @@ fn enqueue_put_zc(req: PartitionRequest, pending: &mut Vec<WriteRequest>, part_r
     });
 }
 
-fn enqueue_delete(req: PartitionRequest, pending: &mut Vec<WriteRequest>, part_region_epoch: u64, part_id_for_err: u64) {
+fn enqueue_delete(
+    req: PartitionRequest,
+    pending: &mut Vec<WriteRequest>,
+    part_region_epoch: u64,
+    part_id_for_err: u64,
+) {
     match partition_rpc::rkyv_decode::<DeleteReq>(&req.payload) {
         Ok(del_req) => {
             if del_req.region_epoch != 0 && del_req.region_epoch != part_region_epoch {
-                let _ = req.resp_tx.send(Err((StatusCode::FailedPrecondition, format!(
-                    "region epoch stale: part_id={} have={} got={}",
-                    part_id_for_err, part_region_epoch, del_req.region_epoch
-                ))));
+                let _ = req.resp_tx.send(Err((
+                    StatusCode::FailedPrecondition,
+                    format!(
+                        "region epoch stale: part_id={} have={} got={}",
+                        part_id_for_err, part_region_epoch, del_req.region_epoch
+                    ),
+                )));
                 return;
             }
             let key_vec = del_req.key.clone();
             pending.push(WriteRequest {
-                op: WriteOp::Delete { user_key: del_req.key },
+                op: WriteOp::Delete {
+                    user_key: del_req.key,
+                },
                 resp: WriteResponder::Delete {
                     outer: req.resp_tx,
                     key: key_vec,
@@ -5128,14 +5270,22 @@ fn enqueue_delete(req: PartitionRequest, pending: &mut Vec<WriteRequest>, part_r
     }
 }
 
-fn enqueue_stream_put(req: PartitionRequest, pending: &mut Vec<WriteRequest>, part_region_epoch: u64, part_id_for_err: u64) {
+fn enqueue_stream_put(
+    req: PartitionRequest,
+    pending: &mut Vec<WriteRequest>,
+    part_region_epoch: u64,
+    part_id_for_err: u64,
+) {
     match partition_rpc::rkyv_decode::<StreamPutReq>(&req.payload) {
         Ok(sp_req) => {
             if sp_req.region_epoch != 0 && sp_req.region_epoch != part_region_epoch {
-                let _ = req.resp_tx.send(Err((StatusCode::FailedPrecondition, format!(
-                    "region epoch stale: part_id={} have={} got={}",
-                    part_id_for_err, part_region_epoch, sp_req.region_epoch
-                ))));
+                let _ = req.resp_tx.send(Err((
+                    StatusCode::FailedPrecondition,
+                    format!(
+                        "region epoch stale: part_id={} have={} got={}",
+                        part_id_for_err, part_region_epoch, sp_req.region_epoch
+                    ),
+                )));
                 return;
             }
             let key_vec = sp_req.key.clone();
@@ -5168,7 +5318,15 @@ async fn recover_partition(
     _row_stream_id: u64,
     meta_stream_id: u64,
     part_sc: &Rc<StreamClient>,
-) -> Result<(Vec<TableMeta>, Vec<Arc<SstReader>>, u64, u64, u32, bool, Memtable)> {
+) -> Result<(
+    Vec<TableMeta>,
+    Vec<Arc<SstReader>>,
+    u64,
+    u64,
+    u32,
+    bool,
+    Memtable,
+)> {
     let mut tables: Vec<TableMeta> = Vec::new();
     let mut sst_readers: Vec<Arc<SstReader>> = Vec::new();
     let mut max_seq: u64 = 0;
@@ -5419,7 +5577,15 @@ async fn recover_partition(
         }
     }
 
-    Ok((tables, sst_readers, max_seq, recovered_vp_eid, recovered_vp_off, detected_overlap, active))
+    Ok((
+        tables,
+        sst_readers,
+        max_seq,
+        recovered_vp_eid,
+        recovered_vp_off,
+        detected_overlap,
+        active,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -5475,7 +5641,13 @@ pub(crate) fn decode_records_with_offsets(bytes: &[u8]) -> Vec<(usize, u8, Vec<u
         let record_start = cursor;
         match crate::wal_record::decode_one(&bytes[cursor..]) {
             crate::wal_record::DecodeOne::Ok(r) => {
-                out.push((record_start, r.op, r.key.to_vec(), r.value.to_vec(), r.expires_at));
+                out.push((
+                    record_start,
+                    r.op,
+                    r.key.to_vec(),
+                    r.value.to_vec(),
+                    r.expires_at,
+                ));
                 cursor += r.total;
             }
             crate::wal_record::DecodeOne::Incomplete => break,
@@ -5661,10 +5833,7 @@ pub(crate) async fn vp_refs_retry_loop(part: Rc<RefCell<PartitionData>>) {
         match sync_partition_vp_refs(&part).await {
             Ok(()) => {
                 part.borrow().vp_refs_dirty.set(false);
-                tracing::info!(
-                    part_id,
-                    "F210-C4: vp_refs sync recovered; GC gate released"
-                );
+                tracing::info!(part_id, "F210-C4: vp_refs sync recovered; GC gate released");
             }
             Err(e) => {
                 tracing::warn!(
@@ -5691,9 +5860,7 @@ pub(crate) async fn vp_refs_retry_loop(part: Rc<RefCell<PartitionData>>) {
 /// partition with broken manager link fails to open rather than
 /// silently coming up in a dirty state. open_partition uses the raw
 /// `sync_partition_vp_refs` directly.
-pub(crate) async fn sync_partition_vp_refs_or_mark_dirty(
-    part: &Rc<RefCell<PartitionData>>,
-) {
+pub(crate) async fn sync_partition_vp_refs_or_mark_dirty(part: &Rc<RefCell<PartitionData>>) {
     let part_id = part.borrow().part_id;
     match sync_partition_vp_refs(part).await {
         Ok(()) => {
@@ -5737,22 +5904,29 @@ pub(crate) async fn sync_partition_vp_refs(part: &Rc<RefCell<PartitionData>>) ->
         // with live SST count; bounded so a hung manager doesn't
         // block the flush/compact follow-up indefinitely.
         match pool
-            .call_timeout(&mgr_norm, manager_rpc::MSG_SYNC_PARTITION_VP_REFS, req.clone(), Duration::from_secs(30))
+            .call_timeout(
+                &mgr_norm,
+                manager_rpc::MSG_SYNC_PARTITION_VP_REFS,
+                req.clone(),
+                Duration::from_secs(30),
+            )
             .await
         {
-            Ok(bytes) => match manager_rpc::rkyv_decode::<manager_rpc::SyncPartitionVpRefsResp>(&bytes) {
-                Ok(resp) if resp.code == manager_rpc::CODE_OK => return Ok(()),
-                Ok(resp) => {
-                    last_err = Some(anyhow!(
-                        "sync_partition_vp_refs rejected by {}: {}",
-                        mgr,
-                        resp.message
-                    ));
+            Ok(bytes) => {
+                match manager_rpc::rkyv_decode::<manager_rpc::SyncPartitionVpRefsResp>(&bytes) {
+                    Ok(resp) if resp.code == manager_rpc::CODE_OK => return Ok(()),
+                    Ok(resp) => {
+                        last_err = Some(anyhow!(
+                            "sync_partition_vp_refs rejected by {}: {}",
+                            mgr,
+                            resp.message
+                        ));
+                    }
+                    Err(e) => {
+                        last_err = Some(anyhow!("decode sync_partition_vp_refs resp: {}", e));
+                    }
                 }
-                Err(e) => {
-                    last_err = Some(anyhow!("decode sync_partition_vp_refs resp: {}", e));
-                }
-            },
+            }
             Err(e) => {
                 last_err = Some(e);
             }
@@ -5823,7 +5997,15 @@ pub(crate) async fn run_flush_async_phase(
     part: Rc<RefCell<PartitionData>>,
     imm_mem: Arc<Memtable>,
 ) -> Result<FlushOutcome> {
-    let (row_stream_id, snap_vp_eid, snap_vp_off, req_tx_opt, part_sc, invalidate_row, meta_stream_id) = {
+    let (
+        row_stream_id,
+        snap_vp_eid,
+        snap_vp_off,
+        req_tx_opt,
+        part_sc,
+        invalidate_row,
+        meta_stream_id,
+    ) = {
         let p = part.borrow();
         // need_invalidate_row_stream is fetch-and-clear semantics: the
         // first concurrent flush takes it, later ones see false. That's
@@ -5891,7 +6073,12 @@ pub(crate) async fn run_flush_async_phase(
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err(anyhow!("bulk thread dropped flush response")),
     };
-    Ok(FlushOutcome { new_meta, reader, vp_eid: snap_vp_eid, vp_off: snap_vp_off })
+    Ok(FlushOutcome {
+        new_meta,
+        reader,
+        vp_eid: snap_vp_eid,
+        vp_off: snap_vp_off,
+    })
 }
 
 /// F197: commit phase. Must be called in strict launch order (i.e. the
@@ -5996,7 +6183,10 @@ pub(crate) async fn flush_memtable_locked(part: &Rc<RefCell<PartitionData>>) -> 
     let mut any = false;
     loop {
         match flush_one_imm(part).await {
-            Ok(true) => { any = true; continue; }
+            Ok(true) => {
+                any = true;
+                continue;
+            }
             Ok(false) => break,
             Err(e) => return Err(e),
         }
@@ -6074,7 +6264,11 @@ where
 {
     compio::runtime::spawn(async move {
         use futures::future::FutureExt;
-        if std::panic::AssertUnwindSafe(fut).catch_unwind().await.is_err() {
+        if std::panic::AssertUnwindSafe(fut)
+            .catch_unwind()
+            .await
+            .is_err()
+        {
             tracing::error!(
                 bg_loop = %name,
                 "PS background loop PANICKED on a moved-resource loop; \
@@ -6095,10 +6289,9 @@ async fn background_flush_loop(
     part: Rc<RefCell<PartitionData>>,
     mut flush_rx: mpsc::UnboundedReceiver<()>,
 ) {
-    use futures::stream::FuturesOrdered;
     use futures::future::FutureExt;
-    type FlushFuture =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Result<FlushOutcome>>>>;
+    use futures::stream::FuturesOrdered;
+    type FlushFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<FlushOutcome>>>>;
 
     let cap = ps_flush_inflight_cap();
 
@@ -6140,9 +6333,7 @@ async fn background_flush_loop(
                 match imm_at_idx {
                     Some(imm) => {
                         let part_c = part.clone();
-                        inflight.push_back(
-                            run_flush_async_phase(part_c, imm).boxed_local(),
-                        );
+                        inflight.push_back(run_flush_async_phase(part_c, imm).boxed_local());
                     }
                     None => break,
                 }
@@ -6271,8 +6462,12 @@ async fn flush_worker_loop(
     impl BulkCompletion {
         fn send(self) {
             match self {
-                BulkCompletion::Flush { resp_tx, result } => { let _ = resp_tx.send(result); }
-                BulkCompletion::RowAppend { resp_tx, result } => { let _ = resp_tx.send(result); }
+                BulkCompletion::Flush { resp_tx, result } => {
+                    let _ = resp_tx.send(result);
+                }
+                BulkCompletion::RowAppend { resp_tx, result } => {
+                    let _ = resp_tx.send(result);
+                }
             }
         }
     }
@@ -6293,21 +6488,35 @@ async fn flush_worker_loop(
     let launch = |msg: SqMsg, bulk_sc: &Rc<StreamClient>| -> BulkFut {
         match msg {
             SqMsg::Flush(req) => {
-                let FlushReq { imm, vp_eid, vp_off, row_stream_id, invalidate_row_stream, resp_tx } = req;
+                let FlushReq {
+                    imm,
+                    vp_eid,
+                    vp_off,
+                    row_stream_id,
+                    invalidate_row_stream,
+                    resp_tx,
+                } = req;
                 let bulk_sc = bulk_sc.clone();
                 Box::pin(async move {
                     if invalidate_row_stream {
                         bulk_sc.invalidate_stream(row_stream_id);
                     }
-                    let result = do_flush_on_bulk(&bulk_sc, imm, vp_eid, vp_off, row_stream_id).await;
+                    let result =
+                        do_flush_on_bulk(&bulk_sc, imm, vp_eid, vp_off, row_stream_id).await;
                     BulkCompletion::Flush { resp_tx, result }
                 })
             }
             SqMsg::RowAppend(req) => {
-                let RowAppendReq { sst_bytes, row_stream_id, resp_tx } = req;
+                let RowAppendReq {
+                    sst_bytes,
+                    row_stream_id,
+                    resp_tx,
+                } = req;
                 let bulk_sc = bulk_sc.clone();
                 Box::pin(async move {
-                    let result = bulk_sc.append_bytes(row_stream_id, sst_bytes).await
+                    let result = bulk_sc
+                        .append_bytes(row_stream_id, sst_bytes)
+                        .await
                         .map_err(Into::into);
                     BulkCompletion::RowAppend { resp_tx, result }
                 })
@@ -6372,11 +6581,10 @@ async fn do_flush_on_bulk(
     row_stream_id: u64,
 ) -> Result<(TableMeta, SstReader)> {
     let imm_clone = imm.clone();
-    let (sst_bytes, last_seq) = compio::runtime::spawn_blocking(move || {
-        build_sst_bytes(&imm_clone, vp_eid, vp_off)
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("SSTable build task failed"))?;
+    let (sst_bytes, last_seq) =
+        compio::runtime::spawn_blocking(move || build_sst_bytes(&imm_clone, vp_eid, vp_off))
+            .await
+            .map_err(|_| anyhow::anyhow!("SSTable build task failed"))?;
 
     let append_result = bulk_sc.append(row_stream_id, &sst_bytes).await?;
     let estimated_size = sst_bytes.len() as u64;
@@ -6488,7 +6696,10 @@ mod tests {
             compio::time::sleep(Duration::from_millis(500)).await;
         });
 
-        assert!(fired.load(Ordering::SeqCst), "spawned timer should have fired");
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "spawned timer should have fired"
+        );
     }
 
     /// F127: The recover_partition retry loop must propagate errors after
@@ -6511,11 +6722,7 @@ mod tests {
                 Err(e) => {
                     attempt += 1;
                     if attempt >= max_retries {
-                        break Err(anyhow::anyhow!(
-                            "failed after {} attempts: {}",
-                            attempt,
-                            e
-                        ));
+                        break Err(anyhow::anyhow!("failed after {} attempts: {}", attempt, e));
                     }
                 }
             }
@@ -6531,16 +6738,15 @@ mod tests {
                 Err(e) => {
                     attempt += 1;
                     if attempt >= max_retries {
-                        break Err(anyhow::anyhow!(
-                            "failed after {} attempts: {}",
-                            attempt,
-                            e
-                        ));
+                        break Err(anyhow::anyhow!("failed after {} attempts: {}", attempt, e));
                     }
                 }
             }
         };
-        assert!(result.is_err(), "should propagate error after exhausting retries");
+        assert!(
+            result.is_err(),
+            "should propagate error after exhausting retries"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("failed after 10 attempts"),
@@ -6658,11 +6864,23 @@ mod tests {
 
         // Simulate what the write path does:
         // small value → op=1, large value → op=1|OP_VALUE_POINTER
-        let small_op: u8 = if small_val.len() > VALUE_THROTTLE { 1 | OP_VALUE_POINTER } else { 1 };
-        let large_op: u8 = if large_val.len() > VALUE_THROTTLE { 1 | OP_VALUE_POINTER } else { 1 };
+        let small_op: u8 = if small_val.len() > VALUE_THROTTLE {
+            1 | OP_VALUE_POINTER
+        } else {
+            1
+        };
+        let large_op: u8 = if large_val.len() > VALUE_THROTTLE {
+            1 | OP_VALUE_POINTER
+        } else {
+            1
+        };
 
         assert_eq!(small_op, 1, "small value should NOT have VP flag");
-        assert_eq!(large_op, 1 | OP_VALUE_POINTER, "large value MUST have VP flag");
+        assert_eq!(
+            large_op,
+            1 | OP_VALUE_POINTER,
+            "large value MUST have VP flag"
+        );
 
         // Encode WAL records with the correct op
         let mut buf = Vec::new();
@@ -6675,8 +6893,15 @@ mod tests {
         // GC uses this check to identify VP entries:
         let (op0, _, _, _) = &records[0];
         let (op1, _, _, _) = &records[1];
-        assert_eq!(op0 & OP_VALUE_POINTER, 0, "small value WAL record should be skipped by GC");
-        assert!(op1 & OP_VALUE_POINTER != 0, "large value WAL record MUST be detected by GC");
+        assert_eq!(
+            op0 & OP_VALUE_POINTER,
+            0,
+            "small value WAL record should be skipped by GC"
+        );
+        assert!(
+            op1 & OP_VALUE_POINTER != 0,
+            "large value WAL record MUST be detected by GC"
+        );
     }
 
     #[test]
@@ -6698,7 +6923,10 @@ mod tests {
         // Truncate in the middle
         let truncated = &encoded[..10];
         let records = decode_records_full(truncated);
-        assert!(records.is_empty(), "truncated data should produce no records");
+        assert!(
+            records.is_empty(),
+            "truncated data should produce no records"
+        );
     }
 
     // ── Memtable tests ported from Go skiplist tests ─────────────────────────
@@ -6717,13 +6945,21 @@ mod tests {
         let k1 = key_with_ts(b"apple", 1);
         mt.insert(
             k1.clone(),
-            MemEntry { op: 1, value: b"red".to_vec(), expires_at: 0 },
+            MemEntry {
+                op: 1,
+                value: b"red".to_vec(),
+                expires_at: 0,
+            },
             100,
         );
         let k2 = key_with_ts(b"banana", 2);
         mt.insert(
             k2.clone(),
-            MemEntry { op: 1, value: b"yellow".to_vec(), expires_at: 0 },
+            MemEntry {
+                op: 1,
+                value: b"yellow".to_vec(),
+                expires_at: 0,
+            },
             100,
         );
 
@@ -6743,7 +6979,11 @@ mod tests {
             let val = format!("value{seq}");
             mt.insert(
                 k,
-                MemEntry { op: 1, value: val.into_bytes(), expires_at: 0 },
+                MemEntry {
+                    op: 1,
+                    value: val.into_bytes(),
+                    expires_at: 0,
+                },
                 50,
             );
         }
@@ -6760,7 +7000,11 @@ mod tests {
             let k = key_with_ts(uk.as_bytes(), i as u64);
             mt.insert(
                 k,
-                MemEntry { op: 1, value: format!("v{i}").into_bytes(), expires_at: 0 },
+                MemEntry {
+                    op: 1,
+                    value: format!("v{i}").into_bytes(),
+                    expires_at: 0,
+                },
                 50,
             );
         }
@@ -6780,13 +7024,21 @@ mod tests {
         let mt = Memtable::new();
         mt.insert(
             key_with_ts(b"k1", 1),
-            MemEntry { op: 1, value: b"v1".to_vec(), expires_at: 0 },
+            MemEntry {
+                op: 1,
+                value: b"v1".to_vec(),
+                expires_at: 0,
+            },
             100,
         );
         assert_eq!(mt.mem_bytes(), 100);
         mt.insert(
             key_with_ts(b"k2", 2),
-            MemEntry { op: 1, value: b"v2".to_vec(), expires_at: 0 },
+            MemEntry {
+                op: 1,
+                value: b"v2".to_vec(),
+                expires_at: 0,
+            },
             200,
         );
         assert_eq!(mt.mem_bytes(), 300);
@@ -6827,7 +7079,11 @@ mod tests {
                     let v = format!("v{}", seq).into_bytes();
                     mt.insert(
                         k,
-                        MemEntry { op: 1, value: v, expires_at: 0 },
+                        MemEntry {
+                            op: 1,
+                            value: v,
+                            expires_at: 0,
+                        },
                         64,
                     );
                     writer_ops.fetch_add(1, Ordering::Relaxed);
@@ -6858,7 +7114,9 @@ mod tests {
         let start_stop = StdInstant::now();
         stop.store(true, Ordering::Relaxed);
         writer.join().expect("writer thread panicked");
-        for r in readers { r.join().expect("reader thread panicked"); }
+        for r in readers {
+            r.join().expect("reader thread panicked");
+        }
 
         let w = writer_ops.load(Ordering::Relaxed);
         let r = reader_ops.load(Ordering::Relaxed);
@@ -6874,7 +7132,11 @@ mod tests {
         let k_final = key_with_ts(b"final", u64::MAX - 1);
         mt.insert(
             k_final,
-            MemEntry { op: 1, value: b"LAST".to_vec(), expires_at: 0 },
+            MemEntry {
+                op: 1,
+                value: b"LAST".to_vec(),
+                expires_at: 0,
+            },
             64,
         );
         let got = mt.seek_user_key(b"final").expect("final key visible");
@@ -6891,9 +7153,9 @@ mod tests {
             ..Default::default()
         };
         assert!(!in_range(&rg, b"a")); // before start
-        assert!(in_range(&rg, b"b"));  // exactly start
-        assert!(in_range(&rg, b"c"));  // in range
-        assert!(in_range(&rg, b"d"));  // in range
+        assert!(in_range(&rg, b"b")); // exactly start
+        assert!(in_range(&rg, b"c")); // in range
+        assert!(in_range(&rg, b"d")); // in range
         assert!(!in_range(&rg, b"e")); // exactly end (exclusive)
         assert!(!in_range(&rg, b"f")); // after end
     }
@@ -6917,8 +7179,16 @@ mod tests {
     fn decode_table_locations_roundtrip() {
         let locs = TableLocations {
             locs: vec![
-                SstLocation { extent_id: 1, offset: 0, len: 1000 },
-                SstLocation { extent_id: 2, offset: 100, len: 2000 },
+                SstLocation {
+                    extent_id: 1,
+                    offset: 0,
+                    len: 1000,
+                },
+                SstLocation {
+                    extent_id: 2,
+                    offset: 100,
+                    len: 2000,
+                },
             ],
             vp_extent_id: 42,
             vp_offset: 512,
@@ -6939,14 +7209,26 @@ mod tests {
     #[test]
     fn decode_table_locations_multiple_records_returns_last() {
         let locs1 = TableLocations {
-            locs: vec![SstLocation { extent_id: 1, offset: 0, len: 100 }],
+            locs: vec![SstLocation {
+                extent_id: 1,
+                offset: 0,
+                len: 100,
+            }],
             vp_extent_id: 10,
             vp_offset: 0,
         };
         let locs2 = TableLocations {
             locs: vec![
-                SstLocation { extent_id: 1, offset: 0, len: 100 },
-                SstLocation { extent_id: 2, offset: 0, len: 200 },
+                SstLocation {
+                    extent_id: 1,
+                    offset: 0,
+                    len: 100,
+                },
+                SstLocation {
+                    extent_id: 2,
+                    offset: 0,
+                    len: 200,
+                },
             ],
             vp_extent_id: 20,
             vp_offset: 50,
@@ -6980,15 +7262,31 @@ mod tests {
     #[test]
     fn f157_decode_table_locations_skips_mid_stream_corruption() {
         let locs1 = TableLocations {
-            locs: vec![SstLocation { extent_id: 1, offset: 0, len: 100 }],
+            locs: vec![SstLocation {
+                extent_id: 1,
+                offset: 0,
+                len: 100,
+            }],
             vp_extent_id: 10,
             vp_offset: 0,
         };
         let locs3 = TableLocations {
             locs: vec![
-                SstLocation { extent_id: 1, offset: 0, len: 100 },
-                SstLocation { extent_id: 2, offset: 0, len: 200 },
-                SstLocation { extent_id: 3, offset: 0, len: 300 },
+                SstLocation {
+                    extent_id: 1,
+                    offset: 0,
+                    len: 100,
+                },
+                SstLocation {
+                    extent_id: 2,
+                    offset: 0,
+                    len: 200,
+                },
+                SstLocation {
+                    extent_id: 3,
+                    offset: 0,
+                    len: 300,
+                },
             ],
             vp_extent_id: 30,
             vp_offset: 100,
@@ -7011,7 +7309,11 @@ mod tests {
 
         let decoded = decode_last_table_locations(&data).unwrap();
         // Must return record 3, NOT record 1.
-        assert_eq!(decoded.locs.len(), 3, "should return record 3, not record 1");
+        assert_eq!(
+            decoded.locs.len(),
+            3,
+            "should return record 3, not record 1"
+        );
         assert_eq!(decoded.vp_extent_id, 30);
         assert_eq!(decoded.vp_offset, 100);
     }
@@ -7026,7 +7328,11 @@ mod tests {
             let k = key_with_ts(uk.as_bytes(), i);
             mt.insert(
                 k,
-                MemEntry { op: 1, value: format!("val{i}").into_bytes(), expires_at: 0 },
+                MemEntry {
+                    op: 1,
+                    value: format!("val{i}").into_bytes(),
+                    expires_at: 0,
+                },
                 50,
             );
         }
@@ -7055,7 +7361,11 @@ mod tests {
             return v;
         }
         let start = (offset as usize).min(v.len());
-        let end = if length == 0 { v.len() } else { (start + length as usize).min(v.len()) };
+        let end = if length == 0 {
+            v.len()
+        } else {
+            (start + length as usize).min(v.len())
+        };
         v[start..end].to_vec()
     }
 
@@ -7124,7 +7434,10 @@ mod env_knob_tests {
 
     #[test]
     fn rejects_too_large() {
-        assert_eq!(parse_env(Some("999999999999")), super::DEFAULT_MAX_WRITE_BATCH);
+        assert_eq!(
+            parse_env(Some("999999999999")),
+            super::DEFAULT_MAX_WRITE_BATCH
+        );
     }
 
     #[test]
@@ -7239,7 +7552,10 @@ mod f120_knob_tests {
     #[test]
     fn live_shutdown_timeout_in_range() {
         let v = super::shutdown_timeout_ms();
-        assert!((1_000..=600_000).contains(&v), "shutdown_timeout_ms out of range: {v}");
+        assert!(
+            (1_000..=600_000).contains(&v),
+            "shutdown_timeout_ms out of range: {v}"
+        );
     }
 }
 
@@ -7344,14 +7660,21 @@ mod merged_loop_tests {
         assert_eq!(pending.len(), 1, "exactly one WriteRequest enqueued");
         let w = pending.pop().unwrap();
         match &w.op {
-            WriteOp::Put { user_key, value, expires_at } => {
+            WriteOp::Put {
+                user_key,
+                value,
+                expires_at,
+            } => {
                 assert_eq!(user_key.as_ref(), b"hello");
                 assert_eq!(value.as_ref(), b"world");
                 assert_eq!(*expires_at, 0);
             }
             _ => panic!("expected Put"),
         }
-        assert!(matches!(&w.resp, WriteResponder::Put { .. }), "direct Put responder");
+        assert!(
+            matches!(&w.resp, WriteResponder::Put { .. }),
+            "direct Put responder"
+        );
 
         // Simulate Phase-3 success reply.
         w.resp.send_ok();
@@ -7360,7 +7683,9 @@ mod merged_loop_tests {
         let frame = compio::runtime::Runtime::new()
             .unwrap()
             .block_on(async { resp_rx.await });
-        let bytes = frame.expect("outer oneshot dropped").expect("send_ok should send Ok");
+        let bytes = frame
+            .expect("outer oneshot dropped")
+            .expect("send_ok should send Ok");
         let decoded: PutResp = partition_rpc::rkyv_decode(&bytes).unwrap();
         assert_eq!(decoded.code, CODE_OK);
         assert_eq!(decoded.key.as_slice(), b"hello");
@@ -7373,8 +7698,7 @@ mod merged_loop_tests {
     #[test]
     fn enqueue_put_rejects_oversized_value() {
         let big_value = vec![0u8; AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize + 1];
-        let (req, resp_rx) =
-            build_put_partition_request(b"big-key", &big_value, 0);
+        let (req, resp_rx) = build_put_partition_request(b"big-key", &big_value, 0);
         let mut pending: Vec<WriteRequest> = Vec::new();
         enqueue_put(req, &mut pending, 0, 0);
 
@@ -7385,7 +7709,9 @@ mod merged_loop_tests {
         let frame = compio::runtime::Runtime::new()
             .unwrap()
             .block_on(async { resp_rx.await });
-        let bytes = frame.expect("outer oneshot dropped").expect("encoded PutResp");
+        let bytes = frame
+            .expect("outer oneshot dropped")
+            .expect("encoded PutResp");
         let decoded: PutResp = partition_rpc::rkyv_decode(&bytes).unwrap();
         assert_eq!(decoded.code, CODE_VALUE_TOO_LARGE);
         assert_eq!(decoded.key.as_slice(), b"big-key");
@@ -7396,8 +7722,7 @@ mod merged_loop_tests {
     #[test]
     fn enqueue_put_accepts_value_at_inline_cap() {
         let exact_cap_value = vec![0u8; AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize];
-        let (req, _resp_rx) =
-            build_put_partition_request(b"k", &exact_cap_value, 0);
+        let (req, _resp_rx) = build_put_partition_request(b"k", &exact_cap_value, 0);
         let mut pending: Vec<WriteRequest> = Vec::new();
         enqueue_put(req, &mut pending, 0, 0);
         assert_eq!(pending.len(), 1, "value at exact cap must enqueue normally");
@@ -7474,9 +7799,7 @@ mod merged_loop_tests {
         let err2 = got2.unwrap().err().unwrap();
         assert_eq!(err2.0, StatusCode::Internal);
     }
-
 }
-
 
 // ---------------------------------------------------------------------------
 // F099-J — ps-conn on P-log runtime (same-thread, no worker pool) tests.
@@ -7525,7 +7848,13 @@ mod f099j_tests {
 
             // Spawn the ps-conn task with the direct req_tx (no router).
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(autumn_transport::Conn::Tcp(server_stream), req_tx, None, /*owner_part=*/ 7).await
+                handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server_stream),
+                    req_tx,
+                    None,
+                    /*owner_part=*/ 7,
+                )
+                .await
             });
 
             // Spawn a simulated merged_loop that answers the single Put.
@@ -7533,8 +7862,7 @@ mod f099j_tests {
                 if let Some(req) = req_rx.next().await {
                     assert_eq!(req.msg_type, MSG_PUT);
                     // Simulate Phase-3 success: encode PutResp + send.
-                    let put: PutReq =
-                        partition_rpc::rkyv_decode(&req.payload).expect("decode");
+                    let put: PutReq = partition_rpc::rkyv_decode(&req.payload).expect("decode");
                     let resp = partition_rpc::rkyv_encode(&PutResp {
                         code: CODE_OK,
                         message: String::new(),
@@ -7607,7 +7935,9 @@ mod f099j_tests {
                 .await
                 .expect("bind");
             let addr = listener.local_addr().expect("local_addr");
-            let client = compio::net::TcpStream::connect(addr).await.expect("connect");
+            let client = compio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect");
             let (server, _) = listener.accept().await.expect("accept");
 
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(128);
@@ -7619,8 +7949,7 @@ mod f099j_tests {
             // Simulated merged_loop: echo every Put.
             let loop_handle = compio::runtime::spawn(async move {
                 while let Some(req) = req_rx.next().await {
-                    let put: PutReq =
-                        partition_rpc::rkyv_decode(&req.payload).expect("decode");
+                    let put: PutReq = partition_rpc::rkyv_decode(&req.payload).expect("decode");
                     let resp = partition_rpc::rkyv_encode(&PutResp {
                         code: CODE_OK,
                         message: String::new(),
@@ -7692,7 +8021,6 @@ mod f099j_tests {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // F099-K — per-partition listener tests.
 //
@@ -7720,7 +8048,11 @@ mod f099k_tests {
     ///   - exits when `shutdown_rx` resolves (drop of the sender)
     fn spawn_partition_listener(
         owner_part: u64,
-    ) -> (u16, std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    ) -> (
+        u16,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
         let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
         let (shutdown_tx, shutdown_rx_std) = std::sync::mpsc::channel::<()>();
 
@@ -7736,8 +8068,7 @@ mod f099k_tests {
                     let _ = port_tx.send(port);
 
                     // Same-thread ps-conn <-> merged_loop channel.
-                    let (req_tx, mut req_rx) =
-                        mpsc::channel::<PartitionRequest>(WRITE_CHANNEL_CAP);
+                    let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(WRITE_CHANNEL_CAP);
 
                     // Simulated merged_loop: echo every Put while req_rx is open.
                     let loop_handle = compio::runtime::spawn(async move {
@@ -7745,8 +8076,7 @@ mod f099k_tests {
                             // Accept both MSG_PUT and MSG_GET; echo on Put.
                             if req.msg_type == MSG_PUT {
                                 let put: PutReq =
-                                    partition_rpc::rkyv_decode(&req.payload)
-                                        .expect("decode put");
+                                    partition_rpc::rkyv_decode(&req.payload).expect("decode put");
                                 let resp = partition_rpc::rkyv_encode(&PutResp {
                                     code: CODE_OK,
                                     message: String::new(),
@@ -7777,8 +8107,7 @@ mod f099k_tests {
                             // Race accept against a short timer so the shutdown
                             // poll runs at least every 50 ms.
                             let accept_fut = listener.accept();
-                            let timer_fut =
-                                compio::time::sleep(Duration::from_millis(50));
+                            let timer_fut = compio::time::sleep(Duration::from_millis(50));
                             futures::pin_mut!(accept_fut);
                             futures::pin_mut!(timer_fut);
                             match futures::future::select(accept_fut, timer_fut).await {
@@ -7831,46 +8160,47 @@ mod f099k_tests {
         // Client: open a TCP connection and send one Put on a separate
         // compio runtime (matching what autumn-client does in perf-check).
         std::thread::spawn(move || {
-            compio::runtime::Runtime::new().unwrap().block_on(async move {
-                let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
-                    .parse()
-                    .expect("parse addr");
-                let stream = compio::net::TcpStream::connect(addr)
-                    .await
-                    .expect("connect");
-                let (mut rd, mut wr) = stream.into_split();
+            compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    let addr: std::net::SocketAddr =
+                        format!("127.0.0.1:{port}").parse().expect("parse addr");
+                    let stream = compio::net::TcpStream::connect(addr)
+                        .await
+                        .expect("connect");
+                    let (mut rd, mut wr) = stream.into_split();
 
-                let put = PutReq {
-                    part_id: owner_part,
-                    key: b"k_n1".to_vec(),
-                    value: b"v_n1".to_vec(),
-                    expires_at: 0,
-                    region_epoch: 0,
-                };
-                let payload = partition_rpc::rkyv_encode(&put);
-                let frame = Frame::request(1, MSG_PUT, Bytes::from(payload)).encode();
-                let BufResult(r, _) = wr.write_all(frame).await;
-                r.expect("write");
+                    let put = PutReq {
+                        part_id: owner_part,
+                        key: b"k_n1".to_vec(),
+                        value: b"v_n1".to_vec(),
+                        expires_at: 0,
+                        region_epoch: 0,
+                    };
+                    let payload = partition_rpc::rkyv_encode(&put);
+                    let frame = Frame::request(1, MSG_PUT, Bytes::from(payload)).encode();
+                    let BufResult(r, _) = wr.write_all(frame).await;
+                    r.expect("write");
 
-                let mut decoder = FrameDecoder::new();
-                let mut buf = vec![0u8; 4096];
-                let resp_frame = loop {
-                    let BufResult(n, back) = rd.read(buf).await;
-                    buf = back;
-                    let n = n.expect("read");
-                    assert!(n > 0, "EOF before response");
-                    decoder.feed(&buf[..n]);
-                    if let Some(f) = decoder.try_decode().expect("decode") {
-                        break f;
-                    }
-                };
-                assert_eq!(resp_frame.req_id, 1);
-                assert!(!resp_frame.is_error(), "unexpected error response");
-                let resp: PutResp =
-                    partition_rpc::rkyv_decode(&resp_frame.payload).expect("decode resp");
-                assert_eq!(resp.code, CODE_OK);
-                assert_eq!(resp.key, b"k_n1");
-            });
+                    let mut decoder = FrameDecoder::new();
+                    let mut buf = vec![0u8; 4096];
+                    let resp_frame = loop {
+                        let BufResult(n, back) = rd.read(buf).await;
+                        buf = back;
+                        let n = n.expect("read");
+                        assert!(n > 0, "EOF before response");
+                        decoder.feed(&buf[..n]);
+                        if let Some(f) = decoder.try_decode().expect("decode") {
+                            break f;
+                        }
+                    };
+                    assert_eq!(resp_frame.req_id, 1);
+                    assert!(!resp_frame.is_error(), "unexpected error response");
+                    let resp: PutResp =
+                        partition_rpc::rkyv_decode(&resp_frame.payload).expect("decode resp");
+                    assert_eq!(resp.code, CODE_OK);
+                    assert_eq!(resp.key, b"k_n1");
+                });
         })
         .join()
         .expect("client thread");
@@ -7901,88 +8231,95 @@ mod f099k_tests {
         let mut sorted = ports.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 4, "partition ports must be distinct: {:?}", ports);
+        assert_eq!(
+            sorted.len(),
+            4,
+            "partition ports must be distinct: {:?}",
+            ports
+        );
 
         // Drive a Put into each partition on its own port and verify
         // correct routing; also fire a mis-routed request that hits a
         // partition on the wrong port and expect `NotFound`.
         std::thread::spawn(move || {
-            compio::runtime::Runtime::new().unwrap().block_on(async move {
-                for (i, &o) in owners.iter().enumerate() {
-                    let port = ports[i];
-                    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
-                        .parse()
-                        .unwrap();
-                    let stream = compio::net::TcpStream::connect(addr)
-                        .await
-                        .expect("connect");
-                    let (mut rd, mut wr) = stream.into_split();
+            compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    for (i, &o) in owners.iter().enumerate() {
+                        let port = ports[i];
+                        let addr: std::net::SocketAddr =
+                            format!("127.0.0.1:{port}").parse().unwrap();
+                        let stream = compio::net::TcpStream::connect(addr)
+                            .await
+                            .expect("connect");
+                        let (mut rd, mut wr) = stream.into_split();
 
-                    // (a) correct part_id on owner's port → CODE_OK.
-                    let put = PutReq {
-                        part_id: o,
-                        key: format!("k-{o}").into_bytes(),
-                        value: format!("v-{o}").into_bytes(),
-                        expires_at: 0,
-                        region_epoch: 0,
-                    };
-                    let payload = partition_rpc::rkyv_encode(&put);
-                    let f =
-                        Frame::request(10, MSG_PUT, Bytes::from(payload)).encode();
-                    let BufResult(r, _) = wr.write_all(f).await;
-                    r.expect("write put");
+                        // (a) correct part_id on owner's port → CODE_OK.
+                        let put = PutReq {
+                            part_id: o,
+                            key: format!("k-{o}").into_bytes(),
+                            value: format!("v-{o}").into_bytes(),
+                            expires_at: 0,
+                            region_epoch: 0,
+                        };
+                        let payload = partition_rpc::rkyv_encode(&put);
+                        let f = Frame::request(10, MSG_PUT, Bytes::from(payload)).encode();
+                        let BufResult(r, _) = wr.write_all(f).await;
+                        r.expect("write put");
 
-                    let mut decoder = FrameDecoder::new();
-                    let mut buf = vec![0u8; 4096];
-                    let resp = loop {
-                        let BufResult(n, back) = rd.read(buf).await;
-                        buf = back;
-                        let n = n.expect("read");
-                        assert!(n > 0, "EOF before response for part {o}");
-                        decoder.feed(&buf[..n]);
-                        if let Some(fr) = decoder.try_decode().expect("decode") {
-                            break fr;
-                        }
-                    };
-                    assert!(!resp.is_error(), "part {o} on port {port} unexpectedly errored");
-                    let pr: PutResp =
-                        partition_rpc::rkyv_decode(&resp.payload).expect("decode");
-                    assert_eq!(pr.code, CODE_OK);
-                    assert_eq!(pr.key, format!("k-{o}").into_bytes());
+                        let mut decoder = FrameDecoder::new();
+                        let mut buf = vec![0u8; 4096];
+                        let resp = loop {
+                            let BufResult(n, back) = rd.read(buf).await;
+                            buf = back;
+                            let n = n.expect("read");
+                            assert!(n > 0, "EOF before response for part {o}");
+                            decoder.feed(&buf[..n]);
+                            if let Some(fr) = decoder.try_decode().expect("decode") {
+                                break fr;
+                            }
+                        };
+                        assert!(
+                            !resp.is_error(),
+                            "part {o} on port {port} unexpectedly errored"
+                        );
+                        let pr: PutResp =
+                            partition_rpc::rkyv_decode(&resp.payload).expect("decode");
+                        assert_eq!(pr.code, CODE_OK);
+                        assert_eq!(pr.key, format!("k-{o}").into_bytes());
 
-                    // (b) Mis-routed: send a request with WRONG part_id to
-                    // this listener. handle_ps_connection should answer with
-                    // NotFound (owner mismatch).
-                    let wrong = PutReq {
-                        part_id: o + 1000, // definitely not this listener's owner
-                        key: b"bogus".to_vec(),
-                        value: b"bogus".to_vec(),
-                        expires_at: 0,
-                        region_epoch: 0,
-                    };
-                    let payload = partition_rpc::rkyv_encode(&wrong);
-                    let f =
-                        Frame::request(11, MSG_PUT, Bytes::from(payload)).encode();
-                    let BufResult(r, _) = wr.write_all(f).await;
-                    r.expect("write mis-routed put");
+                        // (b) Mis-routed: send a request with WRONG part_id to
+                        // this listener. handle_ps_connection should answer with
+                        // NotFound (owner mismatch).
+                        let wrong = PutReq {
+                            part_id: o + 1000, // definitely not this listener's owner
+                            key: b"bogus".to_vec(),
+                            value: b"bogus".to_vec(),
+                            expires_at: 0,
+                            region_epoch: 0,
+                        };
+                        let payload = partition_rpc::rkyv_encode(&wrong);
+                        let f = Frame::request(11, MSG_PUT, Bytes::from(payload)).encode();
+                        let BufResult(r, _) = wr.write_all(f).await;
+                        r.expect("write mis-routed put");
 
-                    let mut buf = vec![0u8; 4096];
-                    let resp = loop {
-                        let BufResult(n, back) = rd.read(buf).await;
-                        buf = back;
-                        let n = n.expect("read");
-                        assert!(n > 0, "EOF before mis-route response for part {o}");
-                        decoder.feed(&buf[..n]);
-                        if let Some(fr) = decoder.try_decode().expect("decode") {
-                            break fr;
-                        }
-                    };
-                    assert!(
-                        resp.is_error(),
-                        "mis-routed request to part {o}'s port {port} should error"
-                    );
-                }
-            });
+                        let mut buf = vec![0u8; 4096];
+                        let resp = loop {
+                            let BufResult(n, back) = rd.read(buf).await;
+                            buf = back;
+                            let n = n.expect("read");
+                            assert!(n > 0, "EOF before mis-route response for part {o}");
+                            decoder.feed(&buf[..n]);
+                            if let Some(fr) = decoder.try_decode().expect("decode") {
+                                break fr;
+                            }
+                        };
+                        assert!(
+                            resp.is_error(),
+                            "mis-routed request to part {o}'s port {port} should error"
+                        );
+                    }
+                });
         })
         .join()
         .expect("client thread");
@@ -7995,7 +8332,6 @@ mod f099k_tests {
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // F099-I — per-conn reply batching tests.
@@ -8029,19 +8365,26 @@ mod f099i_tests {
                 .await
                 .expect("bind");
             let addr = listener.local_addr().expect("addr");
-            let client = compio::net::TcpStream::connect(addr).await.expect("connect");
+            let client = compio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect");
             let (server, _) = listener.accept().await.expect("accept");
 
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, /*owner_part=*/ 7).await
+                handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    req_tx,
+                    None,
+                    /*owner_part=*/ 7,
+                )
+                .await
             });
 
             let loop_handle = compio::runtime::spawn(async move {
                 while let Some(req) = req_rx.next().await {
-                    let put: PutReq =
-                        partition_rpc::rkyv_decode(&req.payload).expect("decode");
+                    let put: PutReq = partition_rpc::rkyv_decode(&req.payload).expect("decode");
                     let resp = partition_rpc::rkyv_encode(&PutResp {
                         code: CODE_OK,
                         message: String::new(),
@@ -8080,8 +8423,7 @@ mod f099i_tests {
             };
             assert_eq!(resp_frame.req_id, 77);
             assert!(!resp_frame.is_error());
-            let r: PutResp =
-                partition_rpc::rkyv_decode(&resp_frame.payload).expect("decode resp");
+            let r: PutResp = partition_rpc::rkyv_decode(&resp_frame.payload).expect("decode resp");
             assert_eq!(r.key, b"one-frame");
 
             drop(client_rd);
@@ -8113,7 +8455,9 @@ mod f099i_tests {
                 .await
                 .expect("bind");
             let addr = listener.local_addr().expect("addr");
-            let client = compio::net::TcpStream::connect(addr).await.expect("connect");
+            let client = compio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect");
             let (server, _) = listener.accept().await.expect("accept");
 
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(64);
@@ -8132,9 +8476,8 @@ mod f099i_tests {
                 // that multiple requests can pile up concurrently while
                 // waiting. But every req's reply IS eventually sent, so
                 // ps-conn's n_inflight==1 fast-path is never a deadlock.
-                let mut handlers: FuturesUnordered<
-                    futures::future::LocalBoxFuture<'static, ()>,
-                > = FuturesUnordered::new();
+                let mut handlers: FuturesUnordered<futures::future::LocalBoxFuture<'static, ()>> =
+                    FuturesUnordered::new();
                 loop {
                     futures::select! {
                         maybe_req = req_rx.next() => {
@@ -8202,15 +8545,14 @@ mod f099i_tests {
                 decoder.feed(&buf[..n]);
                 while let Some(frame) = decoder.try_decode().expect("decode") {
                     assert!(!frame.is_error());
-                    let r: PutResp =
-                        partition_rpc::rkyv_decode(&frame.payload).expect("decode");
-                    let expected_key = format!(
-                        "batch-{}",
-                        frame.req_id - 100
-                    )
-                    .into_bytes();
+                    let r: PutResp = partition_rpc::rkyv_decode(&frame.payload).expect("decode");
+                    let expected_key = format!("batch-{}", frame.req_id - 100).into_bytes();
                     assert_eq!(r.key, expected_key);
-                    assert!(seen.insert(frame.req_id), "duplicate req_id {}", frame.req_id);
+                    assert!(
+                        seen.insert(frame.req_id),
+                        "duplicate req_id {}",
+                        frame.req_id
+                    );
                 }
             }
             assert_eq!(seen.len(), 8);
@@ -8286,11 +8628,11 @@ mod f099i_tests {
                     let peak = Rc::new(Cell::new(0usize));
                     let cur = Rc::new(Cell::new(0usize));
 
-                    let (req_tx, mut req_rx) =
-                        mpsc::channel::<PartitionRequest>(4096);
+                    let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(4096);
 
                     let conn_handle = compio::runtime::spawn(async move {
-                        handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 5).await
+                        handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 5)
+                            .await
                     });
 
                     let peak_c = peak.clone();
@@ -8364,12 +8706,7 @@ mod f099i_tests {
                             region_epoch: 0,
                         };
                         let payload = partition_rpc::rkyv_encode(&put);
-                        let f = Frame::request(
-                            1000u32 + i,
-                            MSG_PUT,
-                            Bytes::from(payload),
-                        )
-                        .encode();
+                        let f = Frame::request(1000u32 + i, MSG_PUT, Bytes::from(payload)).encode();
                         big.extend_from_slice(&f[..]);
                     }
                     let BufResult(r, _) = client_wr.write_all(big).await;
@@ -8378,8 +8715,7 @@ mod f099i_tests {
                     // Read all 100 replies.
                     let mut decoder = FrameDecoder::new();
                     let mut buf = vec![0u8; 64 * 1024];
-                    let mut seen: std::collections::HashSet<u32> =
-                        std::collections::HashSet::new();
+                    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
                     while seen.len() < N_FRAMES as usize {
                         let BufResult(n, back) = client_rd.read(buf).await;
                         buf = back;
@@ -8454,28 +8790,34 @@ mod f099i_tests {
         rt.block_on(async move {
             // Snapshot the counter before we start — the lock ensures no
             // other fast-path-observing test is concurrently running.
-            let before = PS_FAST_PATH_HITS
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let before = PS_FAST_PATH_HITS.load(std::sync::atomic::Ordering::Relaxed);
 
             let listener = compio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind");
             let addr = listener.local_addr().expect("addr");
-            let client = compio::net::TcpStream::connect(addr).await.expect("connect");
+            let client = compio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect");
             let (server, _) = listener.accept().await.expect("accept");
 
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(8);
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, /*owner_part=*/ 11).await
+                handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    req_tx,
+                    None,
+                    /*owner_part=*/ 11,
+                )
+                .await
             });
 
             // Responder: answer each request immediately so the fast-path
             // round-trip completes without delay.
             let loop_handle = compio::runtime::spawn(async move {
                 while let Some(req) = req_rx.next().await {
-                    let put: PutReq =
-                        partition_rpc::rkyv_decode(&req.payload).expect("decode");
+                    let put: PutReq = partition_rpc::rkyv_decode(&req.payload).expect("decode");
                     let resp = partition_rpc::rkyv_encode(&PutResp {
                         code: CODE_OK,
                         message: String::new(),
@@ -8499,8 +8841,7 @@ mod f099i_tests {
                     region_epoch: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
-                let frame_bytes =
-                    Frame::request(5000 + i, MSG_PUT, Bytes::from(payload)).encode();
+                let frame_bytes = Frame::request(5000 + i, MSG_PUT, Bytes::from(payload)).encode();
                 let BufResult(r, _) = client_wr.write_all(frame_bytes).await;
                 r.expect("write");
 
@@ -8520,8 +8861,7 @@ mod f099i_tests {
                 assert!(!resp_frame.is_error());
             }
 
-            let after = PS_FAST_PATH_HITS
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let after = PS_FAST_PATH_HITS.load(std::sync::atomic::Ordering::Relaxed);
             let delta = after - before;
             assert_eq!(
                 delta, N as u64,
@@ -8549,14 +8889,15 @@ mod f099i_tests {
         let _guard = fast_path_counter_lock();
         let rt = compio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
-            let before = PS_FAST_PATH_HITS
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let before = PS_FAST_PATH_HITS.load(std::sync::atomic::Ordering::Relaxed);
 
             let listener = compio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind");
             let addr = listener.local_addr().expect("addr");
-            let client = compio::net::TcpStream::connect(addr).await.expect("connect");
+            let client = compio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect");
             let (server, _) = listener.accept().await.expect("accept");
 
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
@@ -8567,8 +8908,7 @@ mod f099i_tests {
 
             let loop_handle = compio::runtime::spawn(async move {
                 while let Some(req) = req_rx.next().await {
-                    let put: PutReq =
-                        partition_rpc::rkyv_decode(&req.payload).expect("decode");
+                    let put: PutReq = partition_rpc::rkyv_decode(&req.payload).expect("decode");
                     let resp = partition_rpc::rkyv_encode(&PutResp {
                         code: CODE_OK,
                         message: String::new(),
@@ -8614,8 +8954,7 @@ mod f099i_tests {
             }
             assert_eq!(seen, N);
 
-            let after = PS_FAST_PATH_HITS
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let after = PS_FAST_PATH_HITS.load(std::sync::atomic::Ordering::Relaxed);
             // The first read delivers all 8 frames at once (TCP on
             // loopback typically coalesces). So fast path must not
             // engage for any of them. Allow a small drift for the
@@ -8655,7 +8994,11 @@ mod f140_tests {
 
         // Simulate "compaction in progress": manually bump inflight.
         gate.inflight.fetch_add(1, Ordering::Release);
-        assert_eq!(gate.inflight.load(Ordering::Acquire), 1, "gate should show inflight=1");
+        assert_eq!(
+            gate.inflight.load(Ordering::Acquire),
+            1,
+            "gate should show inflight=1"
+        );
 
         // A split trying to acquire should fail CAS (at-cap).
         let cur = gate.inflight.load(Ordering::Acquire);
@@ -8663,11 +9006,18 @@ mod f140_tests {
 
         // Simulate compaction finishing.
         gate.inflight.fetch_sub(1, Ordering::Release);
-        assert_eq!(gate.inflight.load(Ordering::Acquire), 0, "gate should be free after compaction");
+        assert_eq!(
+            gate.inflight.load(Ordering::Acquire),
+            0,
+            "gate should be free after compaction"
+        );
 
         // Now split's CAS should succeed.
         let cur = gate.inflight.load(Ordering::Acquire);
-        assert!(cur < gate.max_parallel, "gate should be acquirable for split");
+        assert!(
+            cur < gate.max_parallel,
+            "gate should be acquirable for split"
+        );
     }
 
     // Verify that gc_gate (per-partition) has the same acquire/release semantics.
@@ -8677,14 +9027,22 @@ mod f140_tests {
 
         // Simulate GC holding the gate.
         gc_gate.inflight.fetch_add(1, Ordering::Release);
-        assert_eq!(gc_gate.inflight.load(Ordering::Acquire), 1, "gc_gate should show inflight=1 while GC runs");
+        assert_eq!(
+            gc_gate.inflight.load(Ordering::Acquire),
+            1,
+            "gc_gate should show inflight=1 while GC runs"
+        );
 
         // Split cannot acquire.
         assert!(gc_gate.inflight.load(Ordering::Acquire) >= gc_gate.max_parallel);
 
         // GC loop exits: drop permit.
         gc_gate.inflight.fetch_sub(1, Ordering::Release);
-        assert_eq!(gc_gate.inflight.load(Ordering::Acquire), 0, "gc_gate should be free after holes loop");
+        assert_eq!(
+            gc_gate.inflight.load(Ordering::Acquire),
+            0,
+            "gc_gate should be free after holes loop"
+        );
     }
 
     // F196 D-r6: gc_concurrency_gate folded into AdmissionController.
@@ -8814,8 +9172,7 @@ mod f148_publisher_invariant_tests {
 
             // Fake stream worker: drains messages in FIFO order, acks each,
             // records (publisher_id, snapshot) for assertion.
-            let received: Rc<RefCell<Vec<(u32, Vec<u32>)>>> =
-                Rc::new(RefCell::new(Vec::new()));
+            let received: Rc<RefCell<Vec<(u32, Vec<u32>)>>> = Rc::new(RefCell::new(Vec::new()));
             let received_clone = received.clone();
             let worker_task = compio::runtime::spawn(async move {
                 while let Some((id, snap, ack)) = worker_rx.next().await {

@@ -145,7 +145,12 @@ pub async fn create_stream(mgr: &RpcClient, replicates: u32) -> u64 {
     let created: CreateStreamResp = rkyv_decode(&resp).expect("decode CreateStreamResp");
     created
         .stream
-        .unwrap_or_else(|| panic!("create_stream code={} msg={}", created.code, created.message))
+        .unwrap_or_else(|| {
+            panic!(
+                "create_stream code={} msg={}",
+                created.code, created.message
+            )
+        })
         .stream_id
 }
 
@@ -201,12 +206,7 @@ pub async fn get_regions(mgr: &RpcClient) -> GetRegionsResp {
 // ── Partition Server RPC helpers ──────────────────────────────────────
 
 /// Put a key-value pair.
-pub async fn ps_put(
-    ps: &RpcClient,
-    part_id: u64,
-    key: &[u8],
-    value: &[u8],
-) {
+pub async fn ps_put(ps: &RpcClient, part_id: u64, key: &[u8], value: &[u8]) {
     // Bounded retry on transient errors. The first write on a stream
     // triggers tail-init `current_commit`, which under F227 requires ALL
     // replicas to answer `commit_length`; a momentary single-replica
@@ -279,7 +279,12 @@ pub async fn ps_flush(ps: &RpcClient, part_id: u64) {
         .expect("flush");
     let r: partition_rpc::MaintenanceResp =
         partition_rpc::rkyv_decode(&resp).expect("decode MaintenanceResp");
-    assert_eq!(r.code, partition_rpc::CODE_OK, "flush failed: {}", r.message);
+    assert_eq!(
+        r.code,
+        partition_rpc::CODE_OK,
+        "flush failed: {}",
+        r.message
+    );
 }
 
 /// Trigger major compaction.
@@ -301,7 +306,12 @@ pub async fn ps_compact(ps: &RpcClient, part_id: u64) {
         .expect("compact");
     let r: partition_rpc::MaintenanceResp =
         partition_rpc::rkyv_decode(&resp).expect("decode MaintenanceResp");
-    assert_eq!(r.code, partition_rpc::CODE_OK, "compact failed: {}", r.message);
+    assert_eq!(
+        r.code,
+        partition_rpc::CODE_OK,
+        "compact failed: {}",
+        r.message
+    );
 }
 
 /// Trigger GC.
@@ -339,8 +349,14 @@ pub async fn ps_delete(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rp
         )
         .await
         .expect("delete");
-    let r: partition_rpc::DeleteResp = partition_rpc::rkyv_decode(&resp).expect("decode DeleteResp");
-    assert_eq!(r.code, partition_rpc::CODE_OK, "delete failed: {}", r.message);
+    let r: partition_rpc::DeleteResp =
+        partition_rpc::rkyv_decode(&resp).expect("decode DeleteResp");
+    assert_eq!(
+        r.code,
+        partition_rpc::CODE_OK,
+        "delete failed: {}",
+        r.message
+    );
     r
 }
 
@@ -364,14 +380,12 @@ pub async fn ps_head(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rpc:
         .await
     {
         Ok(bytes) => partition_rpc::rkyv_decode(&bytes).expect("decode HeadResp"),
-        Err(e) if e.to_string().contains("key is out of range") => {
-            partition_rpc::HeadResp {
-                code: partition_rpc::CODE_OK,
-                message: String::new(),
-                found: false,
-                value_length: 0,
-            }
-        }
+        Err(e) if e.to_string().contains("key is out of range") => partition_rpc::HeadResp {
+            code: partition_rpc::CODE_OK,
+            message: String::new(),
+            found: false,
+            value_length: 0,
+        },
         Err(e) => panic!("head: {e}"),
     }
 }
@@ -398,7 +412,12 @@ pub async fn ps_range(
         .await
         .expect("range");
     let r: partition_rpc::RangeResp = partition_rpc::rkyv_decode(&resp).expect("decode RangeResp");
-    assert_eq!(r.code, partition_rpc::CODE_OK, "range failed: {}", r.message);
+    assert_eq!(
+        r.code,
+        partition_rpc::CODE_OK,
+        "range failed: {}",
+        r.message
+    );
     r
 }
 
@@ -430,7 +449,10 @@ pub struct PsRouter {
 
 impl PsRouter {
     pub fn new(mgr_addr: SocketAddr, fallback_addr: SocketAddr) -> Self {
-        Self { mgr_addr, fallback_addr }
+        Self {
+            mgr_addr,
+            fallback_addr,
+        }
     }
 
     /// Resolve `part_id` to a fresh RpcClient every call. We do NOT
@@ -480,12 +502,7 @@ impl PsRouter {
 }
 
 /// Routed `ps_put` — F099-K aware: dials the partition's own listener.
-pub async fn psr_put(
-    router: &PsRouter,
-    part_id: u64,
-    key: &[u8],
-    value: &[u8],
-) {
+pub async fn psr_put(router: &PsRouter, part_id: u64, key: &[u8], value: &[u8]) {
     let c = router.client_for(part_id).await;
     ps_put(&c, part_id, key, value).await;
 }
@@ -558,11 +575,7 @@ pub async fn write_sequential_keys(
 }
 
 /// Verify all keys exist with their deterministic values via `ps_get`.
-pub async fn verify_sequential_keys(
-    ps: &RpcClient,
-    part_id: u64,
-    keys: &[String],
-) -> usize {
+pub async fn verify_sequential_keys(ps: &RpcClient, part_id: u64, keys: &[String]) -> usize {
     for key in keys {
         let expected_val = format!("val-{key}");
         let resp = ps_get(ps, part_id, key.as_bytes()).await;
@@ -632,12 +645,7 @@ pub async fn register_two_nodes(
     base_id: u16,
 ) {
     register_node(mgr, &n1_addr.to_string(), &format!("uuid-{}", base_id)).await;
-    register_node(
-        mgr,
-        &n2_addr.to_string(),
-        &format!("uuid-{}", base_id + 1),
-    )
-    .await;
+    register_node(mgr, &n2_addr.to_string(), &format!("uuid-{}", base_id + 1)).await;
 }
 
 /// Full partition setup: manager + 2 extent nodes + 3 streams + partition.
@@ -762,22 +770,29 @@ pub async fn start_etcd() -> (EtcdGuard, String) {
     let data_path = data_dir.path().join("etcd-data");
 
     let mut cmd = std::process::Command::new(&etcd_bin);
-    cmd.arg("--name").arg("n1")
-        .arg("--data-dir").arg(&data_path)
-        .arg("--listen-client-urls").arg(&client_url)
-        .arg("--advertise-client-urls").arg(&client_url)
-        .arg("--listen-peer-urls").arg(&peer_url)
-        .arg("--initial-advertise-peer-urls").arg(&peer_url)
-        .arg("--initial-cluster").arg(format!("n1={peer_url}"))
-        .arg("--initial-cluster-state").arg("new")
-        .arg("--log-level").arg("error")
+    cmd.arg("--name")
+        .arg("n1")
+        .arg("--data-dir")
+        .arg(&data_path)
+        .arg("--listen-client-urls")
+        .arg(&client_url)
+        .arg("--advertise-client-urls")
+        .arg(&client_url)
+        .arg("--listen-peer-urls")
+        .arg(&peer_url)
+        .arg("--initial-advertise-peer-urls")
+        .arg(&peer_url)
+        .arg("--initial-cluster")
+        .arg(format!("n1={peer_url}"))
+        .arg("--initial-cluster-state")
+        .arg("new")
+        .arg("--log-level")
+        .arg("error")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
     let child = cmd.spawn().unwrap_or_else(|e| {
-        panic!(
-            "spawn etcd binary `{etcd_bin}`: {e} — install etcd or set AUTUMN_TEST_ETCD_BIN"
-        )
+        panic!("spawn etcd binary `{etcd_bin}`: {e} — install etcd or set AUTUMN_TEST_ETCD_BIN")
     });
     wait_for_etcd(&client_url, Duration::from_secs(30)).await;
 

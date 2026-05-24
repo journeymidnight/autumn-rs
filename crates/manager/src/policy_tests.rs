@@ -4,9 +4,9 @@ use std::collections::HashMap;
 
 use autumn_common::MetadataState;
 use autumn_rpc::manager_rpc::{
-    MgrExtentInfo, MgrPartitionMeta, MgrRange, MgrStreamInfo,
-    PartitionLoad, POLICY_KIND_EC, POLICY_KIND_GC, POLICY_KIND_MAJOR_COMPACT,
-    POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT, POLICY_KIND_SPLIT,
+    MgrExtentInfo, MgrPartitionMeta, MgrRange, MgrStreamInfo, PartitionLoad, POLICY_KIND_EC,
+    POLICY_KIND_GC, POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT,
+    POLICY_KIND_SPLIT,
 };
 
 use crate::policy::{
@@ -235,10 +235,7 @@ fn merge_adjacent_pair_qualifying_same_ps() {
         region_owners: &owners,
         now,
     });
-    let merge_cands: Vec<_> = out
-        .iter()
-        .filter(|c| c.kind == POLICY_KIND_MERGE)
-        .collect();
+    let merge_cands: Vec<_> = out.iter().filter(|c| c.kind == POLICY_KIND_MERGE).collect();
     assert_eq!(merge_cands.len(), 1);
     assert_eq!(merge_cands[0].primary_part_id, 1);
     assert_eq!(merge_cands[0].secondary_part_id, 2);
@@ -283,10 +280,7 @@ fn merge_cross_ps_marks_infeasible() {
         region_owners: &owners,
         now,
     });
-    let merge_cands: Vec<_> = out
-        .iter()
-        .filter(|c| c.kind == POLICY_KIND_MERGE)
-        .collect();
+    let merge_cands: Vec<_> = out.iter().filter(|c| c.kind == POLICY_KIND_MERGE).collect();
     assert_eq!(merge_cands.len(), 1);
     assert!(!merge_cands[0].same_ps);
 }
@@ -560,7 +554,10 @@ fn compact_advisory_fires_on_sustained_pending() {
         now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
     );
     let out = eng.compute_maintenance_advisory(now);
-    let cs: Vec<_> = out.iter().filter(|c| c.kind == POLICY_KIND_COMPACT).collect();
+    let cs: Vec<_> = out
+        .iter()
+        .filter(|c| c.kind == POLICY_KIND_COMPACT)
+        .collect();
     assert_eq!(cs.len(), 1);
     assert_eq!(cs[0].primary_part_id, 9);
     assert_eq!(cs[0].size_bytes, COMPACT_PENDING_HIGH + 1024);
@@ -821,8 +818,8 @@ fn hot_cold_advisory_size_below_floor_does_not_fire() {
 
 #[test]
 fn hot_cold_advisory_emits_policy_candidate_for_client_info() {
+    use crate::policy::HOT_COLD_MIN_HOT_QPS;
     use autumn_rpc::manager_rpc::POLICY_KIND_HOT_COLD;
-    use crate::policy::{HOT_COLD_MIN_HOT_QPS};
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;
     fill_window(
@@ -849,13 +846,25 @@ fn hot_cold_advisory_emits_policy_candidate_for_client_info() {
     );
     let owners: HashMap<u64, u64> = vec![(300u64, 77u64), (301, 77)].into_iter().collect();
     let cands = eng.compute_hot_cold_advisory(&owners, now);
-    assert_eq!(cands.len(), 1, "expected one HOT_COLD candidate, got {cands:?}");
+    assert_eq!(
+        cands.len(),
+        1,
+        "expected one HOT_COLD candidate, got {cands:?}"
+    );
     let c = &cands[0];
     assert_eq!(c.kind, POLICY_KIND_HOT_COLD);
     assert_eq!(c.primary_part_id, 300, "primary = hottest");
     assert_eq!(c.secondary_part_id, 301, "secondary = coldest");
-    assert!(c.reason.contains("ps_id=77"), "reason missing ps_id: {}", c.reason);
-    assert!(c.reason.contains("qps_ratio="), "reason missing qps_ratio: {}", c.reason);
+    assert!(
+        c.reason.contains("ps_id=77"),
+        "reason missing ps_id: {}",
+        c.reason
+    );
+    assert!(
+        c.reason.contains("qps_ratio="),
+        "reason missing qps_ratio: {}",
+        c.reason
+    );
     assert!(c.same_ps, "HOT_COLD candidates are by-construction same_ps");
 }
 
@@ -913,7 +922,11 @@ fn minor_compact_fires_when_sustained_above_threshold() {
         now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
     );
     let out = eng.compute_maintenance_advisory(now);
-    assert_eq!(out.len(), 1, "expected one MINOR_COMPACT candidate: {out:?}");
+    assert_eq!(
+        out.len(),
+        1,
+        "expected one MINOR_COMPACT candidate: {out:?}"
+    );
     assert_eq!(out[0].kind, POLICY_KIND_MINOR_COMPACT);
     assert_eq!(out[0].primary_part_id, 500);
     assert!(
@@ -1024,7 +1037,10 @@ fn ec_advisory_skips_converted() {
     mk_extent(&mut state, 1004, EC_MIN_EXTENT_BYTES * 4, true);
     let eng = PolicyEngine::default();
     let out = eng.compute_ec_advisory(&state, 0);
-    assert!(out.is_empty(), "ec_converted=true should be skipped: {out:?}");
+    assert!(
+        out.is_empty(),
+        "ec_converted=true should be skipped: {out:?}"
+    );
 }
 
 /// F202: EC advisory skips replication-only streams (no EC policy
@@ -1037,7 +1053,10 @@ fn ec_advisory_skips_non_ec_streams() {
     mk_extent(&mut state, 1005, EC_MIN_EXTENT_BYTES * 4, false);
     let eng = PolicyEngine::default();
     let out = eng.compute_ec_advisory(&state, 0);
-    assert!(out.is_empty(), "non-EC stream should not be advised: {out:?}");
+    assert!(
+        out.is_empty(),
+        "non-EC stream should not be advised: {out:?}"
+    );
 }
 
 /// F202: EC advisory skips sealed_length=0 extents (open OR

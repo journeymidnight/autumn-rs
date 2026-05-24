@@ -34,10 +34,7 @@ impl StatusCode {
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
     #[error("rpc status {code:?}: {message}")]
-    Status {
-        code: StatusCode,
-        message: String,
-    },
+    Status { code: StatusCode, message: String },
 
     #[error("connection closed")]
     ConnectionClosed,

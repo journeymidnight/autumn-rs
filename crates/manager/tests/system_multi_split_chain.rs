@@ -37,10 +37,12 @@ fn split_compact_split_preserves_all_data() {
         // Write 60 keys, flush
         for i in 0u32..60 {
             ps_put(
-                &ps, 901,
+                &ps,
+                901,
                 format!("key-{i:02}").as_bytes(),
-                format!("val-{i}").as_bytes()
-            ).await;
+                format!("val-{i}").as_bytes(),
+            )
+            .await;
         }
         ps_flush(&ps, 901).await;
 
@@ -53,11 +55,22 @@ fn split_compact_split_preserves_all_data() {
             .await
             .expect("split1");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&resp).expect("decode");
-        assert_eq!(sr.code, partition_rpc::CODE_OK, "split1 failed: {}", sr.message);
+        assert_eq!(
+            sr.code,
+            partition_rpc::CODE_OK,
+            "split1 failed: {}",
+            sr.message
+        );
         compio::time::sleep(Duration::from_millis(1000)).await;
 
         let regions = get_regions(&mgr).await;
-        let right1_id = regions.regions.iter().find(|(_, r)| r.part_id != 901).unwrap().1.part_id;
+        let right1_id = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id != 901)
+            .unwrap()
+            .1
+            .part_id;
         compio::time::sleep(Duration::from_millis(6000)).await;
 
         // Compact both to clear overlap
@@ -74,7 +87,12 @@ fn split_compact_split_preserves_all_data() {
             .await
             .expect("split2");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&resp).expect("decode");
-        assert_eq!(sr.code, partition_rpc::CODE_OK, "split2 failed: {}", sr.message);
+        assert_eq!(
+            sr.code,
+            partition_rpc::CODE_OK,
+            "split2 failed: {}",
+            sr.message
+        );
         compio::time::sleep(Duration::from_millis(1000)).await;
 
         let regions = get_regions(&mgr).await;
@@ -95,13 +113,21 @@ fn split_compact_split_preserves_all_data() {
                 let key_str = String::from_utf8_lossy(&entry.key);
                 let i: u32 = key_str.strip_prefix("key-").unwrap().parse().unwrap();
                 let resp = psr_get(&router, rg.part_id, &entry.key).await;
-                assert_eq!(resp.value, format!("val-{i}").as_bytes(), "{key_str} wrong value");
+                assert_eq!(
+                    resp.value,
+                    format!("val-{i}").as_bytes(),
+                    "{key_str} wrong value"
+                );
                 all_keys.push(entry.key.clone());
             }
         }
         all_keys.sort();
         all_keys.dedup();
-        assert_eq!(all_keys.len(), 60, "all 60 keys must be present across 3 partitions");
+        assert_eq!(
+            all_keys.len(),
+            60,
+            "all 60 keys must be present across 3 partitions"
+        );
     });
 }
 
@@ -143,13 +169,36 @@ fn split_chain_with_writes_between_splits() {
             .await
             .expect("split1");
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&resp).expect("decode");
-        assert_eq!(sr.code, partition_rpc::CODE_OK, "split1 failed: {}", sr.message);
+        assert_eq!(
+            sr.code,
+            partition_rpc::CODE_OK,
+            "split1 failed: {}",
+            sr.message
+        );
         compio::time::sleep(Duration::from_millis(1000)).await;
 
         let regions = get_regions(&mgr).await;
-        let left_rg = regions.regions.iter().find(|(_, r)| r.part_id == 902).unwrap().1.clone();
-        let right1_id = regions.regions.iter().find(|(_, r)| r.part_id != 902).unwrap().1.part_id;
-        let right1_rg = regions.regions.iter().find(|(_, r)| r.part_id != 902).unwrap().1.clone();
+        let left_rg = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id == 902)
+            .unwrap()
+            .1
+            .clone();
+        let right1_id = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id != 902)
+            .unwrap()
+            .1
+            .part_id;
+        let right1_rg = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id != 902)
+            .unwrap()
+            .1
+            .clone();
         compio::time::sleep(Duration::from_millis(6000)).await;
 
         // Write new keys to both children
@@ -177,8 +226,14 @@ fn split_chain_with_writes_between_splits() {
             )
             .await
             .expect("split2");
-        let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&split_resp).expect("decode");
-        assert_eq!(sr.code, partition_rpc::CODE_OK, "split2 failed: {}", sr.message);
+        let sr: partition_rpc::SplitPartResp =
+            partition_rpc::rkyv_decode(&split_resp).expect("decode");
+        assert_eq!(
+            sr.code,
+            partition_rpc::CODE_OK,
+            "split2 failed: {}",
+            sr.message
+        );
         compio::time::sleep(Duration::from_millis(1000)).await;
 
         let regions = get_regions(&mgr).await;
@@ -214,6 +269,9 @@ fn split_chain_with_writes_between_splits() {
                 }
             }
         }
-        assert_eq!(found_count, 20, "all 20 batch1 keys must be found, got {found_count}");
+        assert_eq!(
+            found_count, 20,
+            "all 20 batch1 keys must be found, got {found_count}"
+        );
     });
 }

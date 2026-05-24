@@ -207,8 +207,7 @@ fn extent_health_report_handles_empty_cluster() {
         node_id_filter: vec![],
         include_healthy: true,
     };
-    let resp_bytes =
-        run(m.handle_extent_health_report(rkyv_encode(&req))).expect("health");
+    let resp_bytes = run(m.handle_extent_health_report(rkyv_encode(&req))).expect("health");
     let resp: ExtentHealthResp = rkyv_decode(&resp_bytes).expect("decode");
     assert_eq!(resp.code, CODE_OK);
     assert!(resp.extents.is_empty());
@@ -217,8 +216,7 @@ fn extent_health_report_handles_empty_cluster() {
 #[test]
 fn list_ec_inflight_markers_empty_by_default() {
     let m = AutumnManager::new();
-    let resp_bytes =
-        run(m.handle_list_ec_inflight_markers(Bytes::new())).expect("list markers");
+    let resp_bytes = run(m.handle_list_ec_inflight_markers(Bytes::new())).expect("list markers");
     let resp: ListEcInflightMarkersResp = rkyv_decode(&resp_bytes).expect("decode");
     assert_eq!(resp.code, CODE_OK);
     assert!(resp.markers.is_empty());

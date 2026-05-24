@@ -249,10 +249,7 @@ impl AutumnManager {
     async fn release_delete_marker(&self, extent_id: u64) {
         if let Some(etcd) = &self.etcd {
             if let Err(e) = etcd
-                .put_and_delete_txn(
-                    Vec::new(),
-                    vec![Self::extent_inflight_key(extent_id)],
-                )
+                .put_and_delete_txn(Vec::new(), vec![Self::extent_inflight_key(extent_id)])
                 .await
             {
                 tracing::warn!(
@@ -315,9 +312,7 @@ impl AutumnManager {
             let value = autumn_rpc::manager_rpc::rkyv_encode(&entry).to_vec();
             etcd.put_msgs_txn(vec![(key, value)]).await?;
         }
-        self.failed_deletes
-            .borrow_mut()
-            .insert(extent_id, entry);
+        self.failed_deletes.borrow_mut().insert(extent_id, entry);
         Ok(())
     }
 
@@ -376,9 +371,7 @@ impl AutumnManager {
                     self.failed_deletes.borrow_mut().remove(&extent_id);
                     if let Some(etcd) = &self.etcd {
                         let key = extent_delete_retry_key(extent_id);
-                        if let Err(e) =
-                            etcd.put_and_delete_txn(Vec::new(), vec![key]).await
-                        {
+                        if let Err(e) = etcd.put_and_delete_txn(Vec::new(), vec![key]).await {
                             tracing::warn!(
                                 extent_id,
                                 error = %e,
@@ -412,9 +405,7 @@ impl AutumnManager {
                         );
                     }
                 }
-                self.failed_deletes
-                    .borrow_mut()
-                    .insert(extent_id, entry);
+                self.failed_deletes.borrow_mut().insert(extent_id, entry);
             }
         }
     }
@@ -427,7 +418,12 @@ impl AutumnManager {
         // the next sweep (already up to 60 retries).
         let resp = match self
             .conn_pool
-            .call_timeout(addr, EXT_MSG_DELETE_EXTENT, payload, Duration::from_secs(10))
+            .call_timeout(
+                addr,
+                EXT_MSG_DELETE_EXTENT,
+                payload,
+                Duration::from_secs(10),
+            )
             .await
         {
             Ok(v) => v,

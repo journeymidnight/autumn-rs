@@ -377,9 +377,8 @@ mod tests {
         }
 
         let data = b.finish();
-        let reader = std::sync::Arc::new(
-            SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader"),
-        );
+        let reader =
+            std::sync::Arc::new(SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader"));
         let mut it = TableIterator::new(reader);
         it.rewind();
 
@@ -397,18 +396,13 @@ mod tests {
         let mut b = SstBuilder::new(0, 0);
         let mut keys: Vec<Vec<u8>> = (241..=301)
             .map(|i| {
-                format!(
-                    ".thumb/320/Patreon--leeesovely-October-2024-MissKON.com-{i:03}.jpg"
-                )
-                .into_bytes()
+                format!(".thumb/320/Patreon--leeesovely-October-2024-MissKON.com-{i:03}.jpg")
+                    .into_bytes()
             })
             .collect();
         keys.push(b"Patreon--leeesovely-October-2024-MissKON.com-003.jpg".to_vec());
         keys.extend((276..=301).map(|i| {
-            format!(
-                "Patreon--leeesovely-October-2024-MissKON.com-{i:03}.jpg"
-            )
-            .into_bytes()
+            format!("Patreon--leeesovely-October-2024-MissKON.com-{i:03}.jpg").into_bytes()
         }));
 
         for (seq, key) in keys.iter().enumerate() {
@@ -416,9 +410,8 @@ mod tests {
         }
 
         let data = b.finish();
-        let reader = std::sync::Arc::new(
-            SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader"),
-        );
+        let reader =
+            std::sync::Arc::new(SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader"));
         let mut it = TableIterator::new(reader);
         it.rewind();
 

@@ -24,11 +24,7 @@ async fn f021_multi_disk_alloc() {
     format_disk(d2.path(), 20);
 
     let addr = pick_addr();
-    start_node_multi(
-        vec![d1.path().to_path_buf(), d2.path().to_path_buf()],
-        addr,
-    )
-    .await;
+    start_node_multi(vec![d1.path().to_path_buf(), d2.path().to_path_buf()], addr).await;
     let conn = TestConn::new(addr);
 
     // Alloc 4 extents.
@@ -77,11 +73,7 @@ async fn f021_multi_disk_load_extents() {
     std::fs::write(subdir_200.join("extent-200.dat"), b"world").expect("write extent-200.dat");
 
     let addr = pick_addr();
-    start_node_multi(
-        vec![d1.path().to_path_buf(), d2.path().to_path_buf()],
-        addr,
-    )
-    .await;
+    start_node_multi(vec![d1.path().to_path_buf(), d2.path().to_path_buf()], addr).await;
     let conn = TestConn::new(addr);
 
     // F210-H3 Tier 2: probe_extent — verifying multi-disk load, not fence.
@@ -101,11 +93,7 @@ async fn f021_df_reports_per_disk_stats() {
     format_disk(d2.path(), 20);
 
     let addr = pick_addr();
-    start_node_multi(
-        vec![d1.path().to_path_buf(), d2.path().to_path_buf()],
-        addr,
-    )
-    .await;
+    start_node_multi(vec![d1.path().to_path_buf(), d2.path().to_path_buf()], addr).await;
     let conn = TestConn::new(addr);
 
     let resp = conn.df(vec![], vec![]).await;

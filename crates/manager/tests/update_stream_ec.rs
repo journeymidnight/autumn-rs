@@ -75,7 +75,9 @@ async fn get_stream_info(mgr: &RpcClient, stream_id: u64) -> MgrStreamInfo {
     let resp = mgr
         .call(
             MSG_STREAM_INFO,
-            rkyv_encode(&StreamInfoReq { stream_ids: vec![stream_id] }),
+            rkyv_encode(&StreamInfoReq {
+                stream_ids: vec![stream_id],
+            }),
         )
         .await
         .expect("stream_info");
@@ -85,10 +87,7 @@ async fn get_stream_info(mgr: &RpcClient, stream_id: u64) -> MgrStreamInfo {
 
 async fn get_extent_info(mgr: &RpcClient, extent_id: u64) -> MgrExtentInfo {
     let resp = mgr
-        .call(
-            MSG_EXTENT_INFO,
-            rkyv_encode(&ExtentInfoReq { extent_id }),
-        )
+        .call(MSG_EXTENT_INFO, rkyv_encode(&ExtentInfoReq { extent_id }))
         .await
         .expect("extent_info");
     let r: ExtentInfoResp = rkyv_decode(&resp).expect("decode ExtentInfoResp");
@@ -216,8 +215,8 @@ fn update_stream_ec_triggers_conversion() {
     start_extent_node(n3_addr, d3.path().to_path_buf(), 3, &mgr_str);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        use std::rc::Rc;
         use autumn_stream::{ConnPool, StreamClient};
+        use std::rc::Rc;
 
         let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
         register_node(&mgr, &n1_addr.to_string(), "disk-1").await;
@@ -255,7 +254,11 @@ fn update_stream_ec_triggers_conversion() {
             .await
             .expect("stream_alloc_extent");
         let seal_info: StreamAllocExtentResp = rkyv_decode(&seal_resp).expect("decode seal");
-        assert_eq!(seal_info.code, CODE_OK, "seal failed: {}", seal_info.message);
+        assert_eq!(
+            seal_info.code, CODE_OK,
+            "seal failed: {}",
+            seal_info.message
+        );
 
         // Confirm extent is sealed.
         let ext_info = get_extent_info(&mgr, first_extent_id).await;
@@ -297,6 +300,9 @@ fn update_stream_ec_triggers_conversion() {
                 break;
             }
         }
-        assert!(converted, "extent should have been EC-converted within 30 s");
+        assert!(
+            converted,
+            "extent should have been EC-converted within 30 s"
+        );
     });
 }

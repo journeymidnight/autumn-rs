@@ -25,9 +25,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use compio::BufResult;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::runtime::spawn;
+use compio::BufResult;
 use futures::channel::{mpsc, oneshot};
 use futures::{SinkExt, StreamExt};
 
@@ -212,8 +212,7 @@ impl RpcClient {
         peer_addr: SocketAddr,
     ) -> Result<Rc<Self>, RpcError> {
         let (reader, writer) = conn.into_split();
-        let pending: Rc<RefCell<HashMap<u32, Pending>>> =
-            Rc::new(RefCell::new(HashMap::new()));
+        let pending: Rc<RefCell<HashMap<u32, Pending>>> = Rc::new(RefCell::new(HashMap::new()));
 
         let (submit_tx, submit_rx) = mpsc::channel::<SubmitMsg>(SUBMIT_CHANNEL_CAP);
         let closed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -313,7 +312,9 @@ impl RpcClient {
             meta_tx,
         };
         // Insert BEFORE submit — same ordering invariant as send_frame.
-        self.pending.borrow_mut().insert(req_id, Pending::IntoDest(into));
+        self.pending
+            .borrow_mut()
+            .insert(req_id, Pending::IntoDest(into));
         let bytes = frame.encode();
         if let Err(e) = self.submit(SubmitMsg::Single { bytes, req_id }).await {
             self.pending.borrow_mut().remove(&req_id);
@@ -364,10 +365,7 @@ impl RpcClient {
     /// On return, the frame has been queued for the writer_task (or is waiting
     /// for a slot when the submit channel is full — natural back-pressure).
     /// The caller awaits the receiver to get the response frame.
-    pub async fn send_frame(
-        &self,
-        frame: Frame,
-    ) -> Result<oneshot::Receiver<Frame>, RpcError> {
+    pub async fn send_frame(&self, frame: Frame) -> Result<oneshot::Receiver<Frame>, RpcError> {
         // F121: short-circuit if the reader/writer task has already
         // exited. The check + pending.insert below run in one sync block
         // (single-threaded compio, no awaits), so a concurrent close that
@@ -653,8 +651,7 @@ async fn read_loop(
                 {
                     if (payload_len as usize) < ZC_META_LEN {
                         // Malformed value frame — fail this request + close.
-                        if let Some(Pending::IntoDest(into)) =
-                            pending.borrow_mut().remove(&req_id)
+                        if let Some(Pending::IntoDest(into)) = pending.borrow_mut().remove(&req_id)
                         {
                             let _ = into.meta_tx.send(Err(RpcError::status(
                                 crate::error::StatusCode::Internal,
@@ -668,8 +665,7 @@ async fn read_loop(
                     }
                     break; // need more bytes for the meta prefix
                 }
-                let Some(Pending::IntoDest(into)) = pending.borrow_mut().remove(&req_id)
-                else {
+                let Some(Pending::IntoDest(into)) = pending.borrow_mut().remove(&req_id) else {
                     unreachable!("is_into checked above");
                 };
                 decoder.consume(crate::frame::HEADER_LEN);
@@ -690,8 +686,7 @@ async fn read_loop(
                 }
                 // SAFETY: caller holds the backing buffer alive until meta_tx
                 // fires (it awaits the receiver); same compio thread.
-                let dest =
-                    unsafe { std::slice::from_raw_parts_mut(into.dest, value_len) };
+                let dest = unsafe { std::slice::from_raw_parts_mut(into.dest, value_len) };
                 let reg = if into.reg.is_null() {
                     None
                 } else {
@@ -720,15 +715,13 @@ async fn read_loop(
             }
 
             // ── call_into_pooled: read_loop owns the dest (cancel-safe) ──
-            let is_pooled =
-                matches!(pending.borrow().get(&req_id), Some(Pending::IntoPooled(_)));
+            let is_pooled = matches!(pending.borrow().get(&req_id), Some(Pending::IntoPooled(_)));
             if is_pooled && reader.is_ucx() {
                 if (payload_len as usize) < ZC_META_LEN
                     || decoder.buffered_len() < crate::frame::HEADER_LEN + ZC_META_LEN
                 {
                     if (payload_len as usize) < ZC_META_LEN {
-                        if let Some(Pending::IntoPooled(tx)) =
-                            pending.borrow_mut().remove(&req_id)
+                        if let Some(Pending::IntoPooled(tx)) = pending.borrow_mut().remove(&req_id)
                         {
                             let _ = tx.send(Err(RpcError::status(
                                 crate::error::StatusCode::Internal,
@@ -742,8 +735,7 @@ async fn read_loop(
                     }
                     break; // need more bytes for the meta prefix
                 }
-                let Some(Pending::IntoPooled(tx)) = pending.borrow_mut().remove(&req_id)
-                else {
+                let Some(Pending::IntoPooled(tx)) = pending.borrow_mut().remove(&req_id) else {
                     unreachable!("is_pooled checked above");
                 };
                 decoder.consume(crate::frame::HEADER_LEN);
@@ -797,8 +789,7 @@ async fn read_loop(
                     if decoder.buffered_len() < crate::frame::HEADER_LEN + ZC_META_LEN {
                         break; // wait for the next read to accumulate the meta
                     }
-                    let Some(Pending::IntoPooled(tx)) = pending.borrow_mut().remove(&req_id)
-                    else {
+                    let Some(Pending::IntoPooled(tx)) = pending.borrow_mut().remove(&req_id) else {
                         unreachable!("is_pooled checked above");
                     };
                     decoder.consume(crate::frame::HEADER_LEN);
@@ -840,8 +831,7 @@ async fn read_loop(
                     if decoder.buffered_len() < crate::frame::HEADER_LEN + ZC_META_LEN {
                         break; // wait for the meta prefix
                     }
-                    let Some(Pending::IntoDest(into)) = pending.borrow_mut().remove(&req_id)
-                    else {
+                    let Some(Pending::IntoDest(into)) = pending.borrow_mut().remove(&req_id) else {
                         unreachable!("is_into checked above");
                     };
                     decoder.consume(crate::frame::HEADER_LEN);
@@ -860,12 +850,13 @@ async fn read_loop(
                     }
                     // SAFETY: caller holds `dest` alive until meta_tx fires (it
                     // awaits the receiver); same compio thread; no per-call timeout.
-                    let dest =
-                        unsafe { std::slice::from_raw_parts_mut(into.dest, value_len) };
+                    let dest = unsafe { std::slice::from_raw_parts_mut(into.dest, value_len) };
                     let filled = decoder.drain_into(dest);
                     // Recv the remainder straight into the caller dest (single copy).
                     match unsafe {
-                        reader.read_exact_into_raw(into.dest, filled, value_len).await
+                        reader
+                            .read_exact_into_raw(into.dest, filled, value_len)
+                            .await
                     } {
                         Ok(()) => {
                             let _ = into.meta_tx.send(Ok(DestMeta { code, value_len }));
@@ -935,7 +926,10 @@ fn finish_into_dest_from_frame(into: IntoDest, payload: &[u8]) {
     let dest = unsafe { std::slice::from_raw_parts_mut(into.dest, value.len()) };
     dest.copy_from_slice(value);
     // F219: ZC value crc removed (transport integrity covers it).
-    let _ = into.meta_tx.send(Ok(DestMeta { code, value_len: value.len() }));
+    let _ = into.meta_tx.send(Ok(DestMeta {
+        code,
+        value_len: value.len(),
+    }));
 }
 
 /// Complete a `call_into_pooled` from a fully-decoded value frame (TCP /
@@ -1012,12 +1006,12 @@ mod tests {
         );
 
         // Each public submit path must short-circuit, NOT hang.
-        let r = client
-            .send_frame(Frame::request(1, 1, Bytes::new()))
-            .await;
+        let r = client.send_frame(Frame::request(1, 1, Bytes::new())).await;
         assert!(matches!(r, Err(RpcError::ConnectionClosed)));
 
-        let r = client.send_vectored(2, vec![Bytes::from_static(b"x")]).await;
+        let r = client
+            .send_vectored(2, vec![Bytes::from_static(b"x")])
+            .await;
         assert!(matches!(r, Err(RpcError::ConnectionClosed)));
 
         let r = client.send_oneshot(3, Bytes::new()).await;
@@ -1066,7 +1060,13 @@ mod tests {
         let client = RpcClient::connect(server_addr).await.expect("connect");
         let mut dest = vec![0u8; 4096];
         let dm = client
-            .call_into_dest(7, Bytes::from_static(b"req"), dest.as_mut_ptr(), dest.len(), None)
+            .call_into_dest(
+                7,
+                Bytes::from_static(b"req"),
+                dest.as_mut_ptr(),
+                dest.len(),
+                None,
+            )
             .await
             .expect("call_into_dest");
         assert_eq!(dm.code, 0);
@@ -1112,7 +1112,11 @@ mod tests {
             .await
             .expect("call_into_pooled");
         assert_eq!(code, 0);
-        assert_eq!(pb.filled(), &value[..], "value bytes landed in the pool buffer");
+        assert_eq!(
+            pb.filled(),
+            &value[..],
+            "value bytes landed in the pool buffer"
+        );
         srv.join().expect("server thread");
     }
 
@@ -1158,7 +1162,11 @@ mod tests {
             .expect("call_into_pooled");
         assert_eq!(code, 0);
         assert_eq!(pb.len(), n, "full value length");
-        assert_eq!(pb.filled(), &value[..], "large value bytes landed in the pool buffer");
+        assert_eq!(
+            pb.filled(),
+            &value[..],
+            "large value bytes landed in the pool buffer"
+        );
         srv.join().expect("server thread");
     }
 }

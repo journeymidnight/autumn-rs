@@ -1,14 +1,16 @@
 //! Compio-thread dispatch loop: receives FsRequests from the bridge and
 //! executes them using the filesystem state.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
 use crate::bridge::*;
 use crate::dir;
 use crate::key;
 use crate::meta::*;
 use crate::read;
-use crate::schema::{self, DirentValue, InodeState, DT_DIR, DT_REG, ROOT_INO, INODE_ALLOC_BATCH, CHUNK_SIZE};
+use crate::schema::{
+    self, DirentValue, InodeState, CHUNK_SIZE, DT_DIR, DT_REG, INODE_ALLOC_BATCH, ROOT_INO,
+};
 use crate::state::FsState;
 use crate::write;
 
@@ -51,7 +53,11 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             }
             return false;
         }
-        FsRequest::Lookup { parent, name, reply } => {
+        FsRequest::Lookup {
+            parent,
+            name,
+            reply,
+        } => {
             let result = dir::lookup(state, parent, &name).await;
             let _ = reply.send(result);
         }
@@ -73,11 +79,19 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             let result = async {
                 let meta = get_inode(state, ino).await?;
                 Ok(inode_to_attr(ino, &meta))
-            }.await;
+            }
+            .await;
             let _ = reply.send(result);
         }
         FsRequest::SetAttr {
-            ino, mode, uid, gid, size, atime, mtime, reply,
+            ino,
+            mode,
+            uid,
+            gid,
+            size,
+            atime,
+            mtime,
+            reply,
         } => {
             let result = async {
                 let mut meta = get_inode(state, ino).await?;
@@ -128,14 +142,24 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                 meta.ctime_nsecs = ns;
                 put_inode(state, ino, &meta).await?;
                 Ok(inode_to_attr(ino, &meta))
-            }.await;
+            }
+            .await;
             let _ = reply.send(result);
         }
-        FsRequest::Mkdir { parent, name, mode, reply } => {
+        FsRequest::Mkdir {
+            parent,
+            name,
+            mode,
+            reply,
+        } => {
             let result = dir::mkdir(state, parent, &name, mode).await;
             let _ = reply.send(result);
         }
-        FsRequest::Rmdir { parent, name, reply } => {
+        FsRequest::Rmdir {
+            parent,
+            name,
+            reply,
+        } => {
             let result = dir::rmdir(state, parent, &name).await;
             let _ = reply.send(result);
         }
@@ -144,12 +168,22 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             let _ = reply.send(result);
         }
         FsRequest::Rename {
-            old_parent, old_name, new_parent, new_name, reply,
+            old_parent,
+            old_name,
+            new_parent,
+            new_name,
+            reply,
         } => {
             let result = dir::rename(state, old_parent, &old_name, new_parent, &new_name).await;
             let _ = reply.send(result);
         }
-        FsRequest::Create { parent, name, mode, flags: _, reply } => {
+        FsRequest::Create {
+            parent,
+            name,
+            mode,
+            flags: _,
+            reply,
+        } => {
             let result = async {
                 let name_bytes = name.as_encoded_bytes();
                 let dk = key::dirent_key(parent, name_bytes);
@@ -157,7 +191,8 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                     return Err(anyhow!("EEXIST"));
                 }
                 let ino = alloc_inode(state).await?;
-                let meta = new_file_meta(mode, unsafe { libc::getuid() }, unsafe { libc::getgid() });
+                let meta =
+                    new_file_meta(mode, unsafe { libc::getuid() }, unsafe { libc::getgid() });
                 put_inode(state, ino, &meta).await?;
                 let dirent = DirentValue {
                     child_inode: ino,
@@ -172,24 +207,33 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                 parent_meta.mtime_nsecs = ns;
                 put_inode(state, parent, &parent_meta).await?;
                 // Cache the inode
-                state.inodes.insert(ino, InodeState {
-                    meta: meta.clone(),
-                    write_buf: None,
-                    dirty: false,
-                    open_count: 1,
-                });
+                state.inodes.insert(
+                    ino,
+                    InodeState {
+                        meta: meta.clone(),
+                        write_buf: None,
+                        dirty: false,
+                        open_count: 1,
+                    },
+                );
                 *state.lookup_count.entry(ino).or_insert(0) += 1;
                 let attr = inode_to_attr(ino, &meta);
                 Ok((attr, ino)) // fh = ino for simplicity
-            }.await;
+            }
+            .await;
             let _ = reply.send(result);
         }
-        FsRequest::Unlink { parent, name, reply } => {
+        FsRequest::Unlink {
+            parent,
+            name,
+            reply,
+        } => {
             let result = async {
                 let name_bytes = name.as_encoded_bytes();
                 let dk = key::dirent_key(parent, name_bytes);
                 let v = state.kv_get(&dk).await.map_err(|_| anyhow!("ENOENT"))?;
-                let dirent: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
+                let dirent: DirentValue =
+                    schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
                 if dirent.file_type == DT_DIR {
                     return Err(anyhow!("EISDIR"));
                 }
@@ -220,10 +264,15 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                 parent_meta.mtime_nsecs = ns;
                 put_inode(state, parent, &parent_meta).await?;
                 Ok(())
-            }.await;
+            }
+            .await;
             let _ = reply.send(result);
         }
-        FsRequest::Open { ino, flags: _, reply } => {
+        FsRequest::Open {
+            ino,
+            flags: _,
+            reply,
+        } => {
             let result = async {
                 // Ensure inode exists
                 let _ = get_inode(state, ino).await?;
@@ -231,18 +280,27 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                     is.open_count += 1;
                 } else {
                     let meta = get_inode(state, ino).await?;
-                    state.inodes.insert(ino, InodeState {
-                        meta,
-                        write_buf: None,
-                        dirty: false,
-                        open_count: 1,
-                    });
+                    state.inodes.insert(
+                        ino,
+                        InodeState {
+                            meta,
+                            write_buf: None,
+                            dirty: false,
+                            open_count: 1,
+                        },
+                    );
                 }
                 Ok(ino) // use ino as file handle
-            }.await;
+            }
+            .await;
             let _ = reply.send(result);
         }
-        FsRequest::Read { ino, offset, size, fuse_reply } => {
+        FsRequest::Read {
+            ino,
+            offset,
+            size,
+            fuse_reply,
+        } => {
             // Async-reply two-phase read (autumn-fuse perf fix #1):
             // - prepare under dispatcher's `&mut state` (cheap routing
             //   lookups + inode cache hit, no real I/O);
@@ -275,7 +333,12 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                 }
             }
         }
-        FsRequest::Write { ino, offset, data, reply } => {
+        FsRequest::Write {
+            ino,
+            offset,
+            data,
+            reply,
+        } => {
             let result = write::write(state, ino, offset, &data).await;
             let _ = reply.send(result);
         }
@@ -299,10 +362,15 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                     }
                 }
                 Ok(())
-            }.await;
+            }
+            .await;
             let _ = reply.send(result);
         }
-        FsRequest::Fsync { ino, datasync: _, reply } => {
+        FsRequest::Fsync {
+            ino,
+            datasync: _,
+            reply,
+        } => {
             let result = write::flush_inode(state, ino).await;
             let _ = reply.send(result);
         }

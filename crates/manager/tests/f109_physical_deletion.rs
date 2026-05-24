@@ -90,10 +90,7 @@ fn f109_punched_extents_are_physically_unlinked() {
 
         // Read the stream layout from manager. Capture the extent_ids
         // that exist so we can pick a punch set safely.
-        let info = sc
-            .get_stream_info(stream_id)
-            .await
-            .expect("stream_info");
+        let info = sc.get_stream_info(stream_id).await.expect("stream_info");
         assert!(
             info.extent_ids.len() >= 5,
             "expected at least 5 extents, got {} (extent_ids={:?})",
@@ -158,4 +155,3 @@ fn f109_punched_extents_are_physically_unlinked() {
         }
     });
 }
-

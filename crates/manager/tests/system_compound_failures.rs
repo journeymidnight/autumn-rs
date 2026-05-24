@@ -54,16 +54,37 @@ fn split_then_ps_crash_data_survives() {
             .expect("split");
         let split_resp: partition_rpc::SplitPartResp =
             partition_rpc::rkyv_decode(&resp).expect("decode");
-        assert_eq!(split_resp.code, partition_rpc::CODE_OK, "split failed: {}", split_resp.message);
+        assert_eq!(
+            split_resp.code,
+            partition_rpc::CODE_OK,
+            "split failed: {}",
+            split_resp.message
+        );
 
         // Wait for split to propagate
         compio::time::sleep(Duration::from_millis(1000)).await;
 
         let regions = get_regions(&mgr).await;
-        assert_eq!(regions.regions.len(), 2, "should have 2 partitions after split");
+        assert_eq!(
+            regions.regions.len(),
+            2,
+            "should have 2 partitions after split"
+        );
 
-        let left_rg = regions.regions.iter().find(|(_, r)| r.part_id == 901).unwrap().1.clone();
-        let right_rg = regions.regions.iter().find(|(_, r)| r.part_id != 901).unwrap().1.clone();
+        let left_rg = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id == 901)
+            .unwrap()
+            .1
+            .clone();
+        let right_rg = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id != 901)
+            .unwrap()
+            .1
+            .clone();
         let mid_key = left_rg.rg.as_ref().unwrap().end_key.clone();
 
         // PS1 "crashes"
@@ -85,13 +106,22 @@ fn split_then_ps_crash_data_survives() {
         for c in b'b'..=b'x' {
             let key = format!("{}-data", c as char);
             let kb = key.as_bytes();
-            let part_id = if kb < mid_key.as_slice() { 901 } else { right_rg.part_id };
+            let part_id = if kb < mid_key.as_slice() {
+                901
+            } else {
+                right_rg.part_id
+            };
             let resp = psr_get(&router2, part_id, kb).await;
             assert_eq!(
-                resp.value.as_slice(), kb,
+                resp.value.as_slice(),
+                kb,
                 "key {key} (part_id={part_id}) must survive split+crash"
             );
-            if part_id == 901 { left_ok += 1; } else { right_ok += 1; }
+            if part_id == 901 {
+                left_ok += 1;
+            } else {
+                right_ok += 1;
+            }
         }
 
         assert!(left_ok > 0, "left partition should have keys");
@@ -106,7 +136,13 @@ fn split_then_ps_crash_data_survives() {
         let right_new_key = format!("{}new", String::from_utf8_lossy(right_start));
 
         psr_put(&router2, 901, left_new_key.as_bytes(), b"ok-left").await;
-        psr_put(&router2, right_rg.part_id, right_new_key.as_bytes(), b"ok-right").await;
+        psr_put(
+            &router2,
+            right_rg.part_id,
+            right_new_key.as_bytes(),
+            b"ok-right",
+        )
+        .await;
 
         let resp = psr_get(&router2, 901, left_new_key.as_bytes()).await;
         assert_eq!(resp.value, b"ok-left");

@@ -466,24 +466,48 @@ pub struct TableLocations {
 /// Decodes the full request type based on msg_type. Returns 0 if decoding fails.
 pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
     match msg_type {
-        MSG_PUT => rkyv_decode::<PutReq>(payload).map(|r| r.part_id).unwrap_or(0),
+        MSG_PUT => rkyv_decode::<PutReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
         // MSG_PUT_ZC meta is binary: part_id is the first u64 LE.
         MSG_PUT_ZC => payload
             .get(0..8)
             .and_then(|b| b.try_into().ok())
             .map(u64::from_le_bytes)
             .unwrap_or(0),
-        MSG_GET | MSG_GET_ZC => rkyv_decode::<GetReq>(payload).map(|r| r.part_id).unwrap_or(0),
-        MSG_DELETE => rkyv_decode::<DeleteReq>(payload).map(|r| r.part_id).unwrap_or(0),
-        MSG_HEAD => rkyv_decode::<HeadReq>(payload).map(|r| r.part_id).unwrap_or(0),
-        MSG_RANGE => rkyv_decode::<RangeReq>(payload).map(|r| r.part_id).unwrap_or(0),
-        MSG_SPLIT_PART => rkyv_decode::<SplitPartReq>(payload).map(|r| r.part_id).unwrap_or(0),
-        MSG_STREAM_PUT => rkyv_decode::<StreamPutReq>(payload).map(|r| r.part_id).unwrap_or(0),
-        MSG_MAINTENANCE => rkyv_decode::<MaintenanceReq>(payload).map(|r| r.part_id).unwrap_or(0),
-        MSG_GET_DISCARDS => rkyv_decode::<GetDiscardsReq>(payload).map(|r| r.part_id).unwrap_or(0),
-        MSG_MERGE_PART => rkyv_decode::<MergePartReq>(payload).map(|r| r.survivor_part_id).unwrap_or(0),
-        MSG_MERGE_FREEZE => rkyv_decode::<MergeFreezeReq>(payload).map(|r| r.part_id).unwrap_or(0),
-        MSG_PULL_VP_REFS => rkyv_decode::<PullVpRefsReq>(payload).map(|r| r.part_id).unwrap_or(0),
+        MSG_GET | MSG_GET_ZC => rkyv_decode::<GetReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_DELETE => rkyv_decode::<DeleteReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_HEAD => rkyv_decode::<HeadReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_RANGE => rkyv_decode::<RangeReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_SPLIT_PART => rkyv_decode::<SplitPartReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_STREAM_PUT => rkyv_decode::<StreamPutReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_MAINTENANCE => rkyv_decode::<MaintenanceReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_GET_DISCARDS => rkyv_decode::<GetDiscardsReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_MERGE_PART => rkyv_decode::<MergePartReq>(payload)
+            .map(|r| r.survivor_part_id)
+            .unwrap_or(0),
+        MSG_MERGE_FREEZE => rkyv_decode::<MergeFreezeReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_PULL_VP_REFS => rkyv_decode::<PullVpRefsReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
         _ => 0,
     }
 }
@@ -495,10 +519,19 @@ mod msg_type_tests {
     #[test]
     fn msg_type_constants_dont_collide() {
         let all = [
-            MSG_PUT, MSG_GET, MSG_DELETE, MSG_HEAD, MSG_RANGE,
-            MSG_SPLIT_PART, MSG_STREAM_PUT, MSG_MAINTENANCE,
-            MSG_GET_DISCARDS, MSG_MERGE_PART, MSG_MERGE_FREEZE,
-            MSG_PULL_VP_REFS, MSG_GET_ZC,
+            MSG_PUT,
+            MSG_GET,
+            MSG_DELETE,
+            MSG_HEAD,
+            MSG_RANGE,
+            MSG_SPLIT_PART,
+            MSG_STREAM_PUT,
+            MSG_MAINTENANCE,
+            MSG_GET_DISCARDS,
+            MSG_MERGE_PART,
+            MSG_MERGE_FREEZE,
+            MSG_PULL_VP_REFS,
+            MSG_GET_ZC,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {

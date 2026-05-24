@@ -19,11 +19,9 @@
 //! See `~/.claude/plans/stream-merge-split-ps-sorted-dijkstra.md` for the
 //! full plan and PS-layer ↔ stream-layer interaction model.
 
-use autumn_etcd::Cmp;
 use autumn_etcd::proto::RequestOp;
-use autumn_rpc::manager_rpc::{
-    MgrEcDispatchInflight, MgrRecoveryTask, rkyv_decode, rkyv_encode,
-};
+use autumn_etcd::Cmp;
+use autumn_rpc::manager_rpc::{rkyv_decode, rkyv_encode, MgrEcDispatchInflight, MgrRecoveryTask};
 use rkyv::{Archive, Deserialize, Serialize};
 
 use autumn_common::error::AppError;
@@ -274,7 +272,10 @@ impl AutumnManager {
     /// recovery_inflight = self.recovery_tasks.borrow())` pair.
     pub(crate) fn inflight_snapshot_ec_recovery(
         &self,
-    ) -> (std::collections::HashSet<u64>, std::collections::HashSet<u64>) {
+    ) -> (
+        std::collections::HashSet<u64>,
+        std::collections::HashSet<u64>,
+    ) {
         let mut ec = std::collections::HashSet::new();
         let mut rec = std::collections::HashSet::new();
         for (id, r) in self.inflight.borrow().iter() {
@@ -472,11 +473,7 @@ impl AutumnManager {
     /// F209-C: ConvertToEc markers are WARN-only and never auto-released —
     /// see the loop's docstring for the safety argument. Only Recovery
     /// and Delete are auto-released here.
-    pub(crate) async fn sweep_stale_inflight_once(
-        &self,
-        now: i64,
-        threshold_secs: i64,
-    ) -> usize {
+    pub(crate) async fn sweep_stale_inflight_once(&self, now: i64, threshold_secs: i64) -> usize {
         // Snapshot stale candidates under a single ledger borrow so we
         // don't hold the borrow across the await.
         let stale: Vec<(u64, ExtentOpKind, i64)> = self
@@ -627,7 +624,9 @@ mod tests {
     fn f207_acquire_extent_inflight_succeeds_when_empty() {
         run(async {
             let m = AutumnManager::new();
-            m.acquire_extent_inflight(42, ec_payload(42)).await.expect("acquire");
+            m.acquire_extent_inflight(42, ec_payload(42))
+                .await
+                .expect("acquire");
             assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::ConvertToEc));
         })
     }
@@ -639,7 +638,9 @@ mod tests {
     fn f207_acquire_extent_inflight_rejects_duplicate() {
         run(async {
             let m = AutumnManager::new();
-            m.acquire_extent_inflight(42, ec_payload(42)).await.expect("first acquire");
+            m.acquire_extent_inflight(42, ec_payload(42))
+                .await
+                .expect("first acquire");
             let err = m
                 .acquire_extent_inflight(42, recovery_payload(42))
                 .await
@@ -655,11 +656,15 @@ mod tests {
     fn f207_commit_extent_inflight_release_clears_probe() {
         run(async {
             let m = AutumnManager::new();
-            m.acquire_extent_inflight(42, ec_payload(42)).await.expect("acquire");
+            m.acquire_extent_inflight(42, ec_payload(42))
+                .await
+                .expect("acquire");
             m.commit_extent_inflight_release(42);
             assert_eq!(m.extent_inflight_op(42), None);
             // Re-acquire after release works.
-            m.acquire_extent_inflight(42, recovery_payload(42)).await.expect("re-acquire");
+            m.acquire_extent_inflight(42, recovery_payload(42))
+                .await
+                .expect("re-acquire");
             assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::Recovery));
         })
     }
@@ -700,7 +705,10 @@ mod tests {
             recovery_payload: Some(MgrRecoveryTask::default()),
             delete_payload: None,
         };
-        assert!(bad.unpack().is_none(), "mismatched op_kind/payload must not unpack");
+        assert!(
+            bad.unpack().is_none(),
+            "mismatched op_kind/payload must not unpack"
+        );
 
         // op_kind = Delete and both delete_payload AND ec_payload set.
         let bad = MgrExtentInflightRecord {
@@ -712,7 +720,10 @@ mod tests {
             recovery_payload: None,
             delete_payload: Some(PersistedPendingDelete::default()),
         };
-        assert!(bad.unpack().is_none(), "extra payload field set must not unpack");
+        assert!(
+            bad.unpack().is_none(),
+            "extra payload field set must not unpack"
+        );
 
         // Unknown op_kind byte.
         let bad = MgrExtentInflightRecord {
@@ -730,17 +741,10 @@ mod tests {
     /// F207 Phase 0: decode_extent_inflight_kvs filters malformed records.
     #[test]
     fn f207_decode_drops_malformed() {
-        let good = MgrExtentInflightRecord::new(
-            42,
-            ec_payload(42),
-            "leader-a".to_string(),
-        );
+        let good = MgrExtentInflightRecord::new(42, ec_payload(42), "leader-a".to_string());
         let good_bytes = rkyv_encode(&good).to_vec();
 
-        let kvs: Vec<(u64, Vec<u8>)> = vec![
-            (42, good_bytes),
-            (99, b"not rkyv at all".to_vec()),
-        ];
+        let kvs: Vec<(u64, Vec<u8>)> = vec![(42, good_bytes), (99, b"not rkyv at all".to_vec())];
         let decoded = AutumnManager::decode_extent_inflight_kvs(
             kvs.iter().map(|(id, b)| (*id, b.as_slice())),
         );
@@ -756,9 +760,15 @@ mod tests {
         run(async {
             let m = AutumnManager::new();
             // Three markers, one of each kind.
-            m.acquire_extent_inflight(10, ec_payload(10)).await.expect("ec");
-            m.acquire_extent_inflight(20, recovery_payload(20)).await.expect("recovery");
-            m.acquire_extent_inflight(30, delete_payload(30)).await.expect("delete");
+            m.acquire_extent_inflight(10, ec_payload(10))
+                .await
+                .expect("ec");
+            m.acquire_extent_inflight(20, recovery_payload(20))
+                .await
+                .expect("recovery");
+            m.acquire_extent_inflight(30, delete_payload(30))
+                .await
+                .expect("delete");
             // Mimic the populate-delete-progress step that enqueue_pending_deletes does.
             m.delete_progress.borrow_mut().insert(
                 30,
@@ -784,7 +794,10 @@ mod tests {
             let released = m.sweep_stale_inflight_once(now_future, 1).await;
             // F209-C: only Recovery (20) + Delete (30) are auto-released.
             // ConvertToEc (10) is WARN-only and survives.
-            assert_eq!(released, 2, "only Recovery + Delete are released; ConvertToEc is WARN-only");
+            assert_eq!(
+                released, 2,
+                "only Recovery + Delete are released; ConvertToEc is WARN-only"
+            );
             assert_eq!(
                 m.extent_inflight_op(10),
                 Some(ExtentOpKind::ConvertToEc),
@@ -807,7 +820,9 @@ mod tests {
     fn f209_c_sweep_excludes_convert_to_ec_from_auto_release() {
         run(async {
             let m = AutumnManager::new();
-            m.acquire_extent_inflight(77, ec_payload(77)).await.expect("acquire");
+            m.acquire_extent_inflight(77, ec_payload(77))
+                .await
+                .expect("acquire");
 
             let now_future = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -832,7 +847,9 @@ mod tests {
     fn f208_sweep_leaves_fresh_markers_alone() {
         run(async {
             let m = AutumnManager::new();
-            m.acquire_extent_inflight(42, ec_payload(42)).await.expect("acquire");
+            m.acquire_extent_inflight(42, ec_payload(42))
+                .await
+                .expect("acquire");
 
             // Sweep with `now` matching the marker's started_at — age = 0,
             // way below any sensible threshold.

@@ -73,11 +73,7 @@ impl AutumnManager {
             }
             let base = Self::normalize_endpoint(&candidate.address);
             // F099-M: recovery targets a specific extent_id → route to owner shard.
-            let addr = Self::shard_addr_for_extent(
-                &base,
-                &candidate.shard_ports,
-                extent_id,
-            );
+            let addr = Self::shard_addr_for_extent(&base, &candidate.shard_ports, extent_id);
 
             let task = MgrRecoveryTask {
                 extent_id,
@@ -121,7 +117,12 @@ impl AutumnManager {
             // this loop and starves recovery of all other extents.
             let resp = match self
                 .conn_pool
-                .call_timeout(&addr, EXT_MSG_REQUIRE_RECOVERY, payload, Duration::from_secs(30))
+                .call_timeout(
+                    &addr,
+                    EXT_MSG_REQUIRE_RECOVERY,
+                    payload,
+                    Duration::from_secs(30),
+                )
                 .await
             {
                 Ok(v) => v,
@@ -238,10 +239,7 @@ impl AutumnManager {
             // F207-C only).
             if let Some(etcd) = &self.etcd {
                 let _ = etcd
-                    .put_and_delete_txn(
-                        Vec::new(),
-                        vec![Self::extent_inflight_key(task.extent_id)],
-                    )
+                    .put_and_delete_txn(Vec::new(), vec![Self::extent_inflight_key(task.extent_id)])
                     .await;
             }
             self.commit_extent_inflight_release(task.extent_id);
@@ -264,10 +262,7 @@ impl AutumnManager {
         if layout_changed.is_none() {
             if let Some(etcd) = &self.etcd {
                 let _ = etcd
-                    .put_and_delete_txn(
-                        Vec::new(),
-                        vec![Self::extent_inflight_key(task.extent_id)],
-                    )
+                    .put_and_delete_txn(Vec::new(), vec![Self::extent_inflight_key(task.extent_id)])
                     .await;
             }
             self.commit_extent_inflight_release(task.extent_id);
@@ -345,10 +340,7 @@ impl AutumnManager {
             // legacy-key delete entry.
             if let Some(etcd) = &self.etcd {
                 let _ = etcd
-                    .put_and_delete_txn(
-                        Vec::new(),
-                        vec![Self::extent_inflight_key(task.extent_id)],
-                    )
+                    .put_and_delete_txn(Vec::new(), vec![Self::extent_inflight_key(task.extent_id)])
                     .await;
             }
             self.commit_extent_inflight_release(task.extent_id);
@@ -383,7 +375,8 @@ impl AutumnManager {
         // borrow_mut here is the sole in-memory write.)
         {
             let mut s = self.store.inner.borrow_mut();
-            s.extents.insert(updated_extent.extent_id, updated_extent.clone());
+            s.extents
+                .insert(updated_extent.extent_id, updated_extent.clone());
         }
         self.commit_extent_inflight_release(updated_extent.extent_id);
         Ok(())
@@ -529,15 +522,8 @@ impl AutumnManager {
                     // point of fence is to migrate data off). Skip the
                     // disk + probe shortcuts and dispatch immediately.
                     if is_fenced {
-                        let res = self
-                            .dispatch_recovery_task(ex.extent_id, node_id)
-                            .await;
-                        self.record_dispatch_outcome(
-                            ex.extent_id,
-                            slot as u32,
-                            now_s,
-                            &res,
-                        );
+                        let res = self.dispatch_recovery_task(ex.extent_id, node_id).await;
+                        self.record_dispatch_outcome(ex.extent_id, slot as u32, now_s, &res);
                         continue;
                     }
 
@@ -552,9 +538,7 @@ impl AutumnManager {
                     if let Some(did) = disk_id {
                         if let Some(disk) = disks.get(&did) {
                             if !disk.online {
-                                let res = self
-                                    .dispatch_recovery_task(ex.extent_id, node_id)
-                                    .await;
+                                let res = self.dispatch_recovery_task(ex.extent_id, node_id).await;
                                 self.record_dispatch_outcome(
                                     ex.extent_id,
                                     slot as u32,
@@ -570,11 +554,8 @@ impl AutumnManager {
                         if let Some(n) = node.clone() {
                             let base = Self::normalize_endpoint(&n.address);
                             // F099-M: re_avali on specific extent → owner shard.
-                            let addr = Self::shard_addr_for_extent(
-                                &base,
-                                &n.shard_ports,
-                                ex.extent_id,
-                            );
+                            let addr =
+                                Self::shard_addr_for_extent(&base, &n.shard_ports, ex.extent_id);
                             let payload = rkyv_encode(&ExtReAvaliReq {
                                 extent_id: ex.extent_id,
                                 eversion: ex.eversion,
@@ -585,7 +566,12 @@ impl AutumnManager {
                             // prevent paged-out-EN wedge.
                             if let Ok(resp) = self
                                 .conn_pool
-                                .call_timeout(&addr, EXT_MSG_RE_AVALI, payload, Duration::from_secs(30))
+                                .call_timeout(
+                                    &addr,
+                                    EXT_MSG_RE_AVALI,
+                                    payload,
+                                    Duration::from_secs(30),
+                                )
                                 .await
                             {
                                 if let Ok(r) = rkyv_decode::<ExtCodeResp>(&resp) {
@@ -598,12 +584,7 @@ impl AutumnManager {
                             }
                         }
                         let res = self.dispatch_recovery_task(ex.extent_id, node_id).await;
-                        self.record_dispatch_outcome(
-                            ex.extent_id,
-                            slot as u32,
-                            now_s,
-                            &res,
-                        );
+                        self.record_dispatch_outcome(ex.extent_id, slot as u32, now_s, &res);
                         continue;
                     }
 
@@ -625,12 +606,7 @@ impl AutumnManager {
                     };
                     if !healthy {
                         let res = self.dispatch_recovery_task(ex.extent_id, node_id).await;
-                        self.record_dispatch_outcome(
-                            ex.extent_id,
-                            slot as u32,
-                            now_s,
-                            &res,
-                        );
+                        self.record_dispatch_outcome(ex.extent_id, slot as u32, now_s, &res);
                     }
                 }
             }
@@ -686,10 +662,7 @@ impl AutumnManager {
             .borrow()
             .iter()
             .filter_map(|(id, o)| {
-                if o.kind == NODE_OVERRIDE_MAINTENANCE
-                    && o.expire_at > 0
-                    && o.expire_at <= now
-                {
+                if o.kind == NODE_OVERRIDE_MAINTENANCE && o.expire_at > 0 && o.expire_at <= now {
                     Some(*id)
                 } else {
                     None
@@ -717,7 +690,6 @@ pub(crate) enum RecoveryGateMode {
 }
 
 impl crate::AutumnManager {
-
     /// F222: unified node-health + recovery-collect loop. Merges the
     /// former `recovery_collect_loop` (2 s, recovery-target nodes only,
     /// non-empty `tasks`) and `disk_status_update_loop` (10 s, all nodes,
@@ -805,9 +777,7 @@ impl crate::AutumnManager {
                     .borrow_mut()
                     .remove(&node.node_id);
                 // F211-A: heartbeat OK → flip Suspected back to Online.
-                self.node_states
-                    .borrow_mut()
-                    .on_heartbeat_ok(node.node_id);
+                self.node_states.borrow_mut().on_heartbeat_ok(node.node_id);
                 // F222: apply EVERY completed recovery task — the step the
                 // old disk_status_update_loop omitted (it discarded them).
                 for done in df.done_tasks {
@@ -816,7 +786,6 @@ impl crate::AutumnManager {
             }
         }
     }
-
 
     /// F121 helper: flip `online=false` for every disk owned by `node`
     /// when its `df` RPC fails. In-memory only — the manager reseeds
@@ -980,10 +949,7 @@ impl crate::AutumnManager {
                         // and is picked up when the coord recovers or
                         // when the OP fences it (which triggers
                         // `auto_abandon_for_fenced_node`).
-                        if auto_st.is_suspected()
-                            || auto_st.is_suspend()
-                            || is_overridden
-                        {
+                        if auto_st.is_suspected() || auto_st.is_suspend() || is_overridden {
                             continue;
                         }
                     }
@@ -1019,9 +985,7 @@ impl crate::AutumnManager {
                     let stream = s
                         .streams
                         .values()
-                        .find(|st| {
-                            st.ec_parity_shard > 0 && st.extent_ids.contains(&eid)
-                        })
+                        .find(|st| st.ec_parity_shard > 0 && st.extent_ids.contains(&eid))
                         .cloned();
                     let stream = match stream {
                         Some(s) => s,
@@ -1232,11 +1196,8 @@ impl crate::AutumnManager {
             // fence applies. A `false` return from the underlying CAS is
             // impossible here (no extra_cmp); only NotLeader can happen and
             // bubbles up.
-            etcd.put_and_delete_txn(
-                Vec::new(),
-                vec![Self::extent_inflight_key(extent_id)],
-            )
-            .await?;
+            etcd.put_and_delete_txn(Vec::new(), vec![Self::extent_inflight_key(extent_id)])
+                .await?;
             let _ = del_op; // silence unused (kept for symmetry with apply path)
         }
         self.commit_extent_inflight_release(extent_id);
@@ -1293,11 +1254,8 @@ impl crate::AutumnManager {
             // the in-memory apply happen ONLY after this txn lands.
             let key = format!("extents/{}", extent_id);
             let val = rkyv_encode(&updated).to_vec();
-            etcd.put_and_delete_txn(
-                vec![(key, val)],
-                vec![Self::extent_inflight_key(extent_id)],
-            )
-            .await?;
+            etcd.put_and_delete_txn(vec![(key, val)], vec![Self::extent_inflight_key(extent_id)])
+                .await?;
         }
 
         // F210-A1: only after etcd success do we apply to in-memory.

@@ -38,7 +38,13 @@ fn ps_crash_partition_reassigned_to_new_ps() {
         let ps1 = RpcClient::connect(ps1_addr).await.expect("connect ps1");
 
         for i in 0..10 {
-            ps_put(&ps1, 901, format!("k-{i:02}").as_bytes(), format!("v-{i}").as_bytes()).await;
+            ps_put(
+                &ps1,
+                901,
+                format!("k-{i:02}").as_bytes(),
+                format!("v-{i}").as_bytes(),
+            )
+            .await;
         }
 
         // Verify PS1 is serving
@@ -47,7 +53,13 @@ fn ps_crash_partition_reassigned_to_new_ps() {
 
         // Check regions: partition should be assigned to PS1 (ps_id=41)
         let regions = get_regions(&mgr).await;
-        let region = regions.regions.iter().find(|(_, r)| r.part_id == 901).unwrap().1.clone();
+        let region = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id == 901)
+            .unwrap()
+            .1
+            .clone();
         assert_eq!(region.ps_id, 41, "partition should be on PS1");
 
         // "Kill" PS1 — drop the RPC client. PS1's thread is still running but
@@ -120,25 +132,43 @@ fn ps_heartbeat_timeout_triggers_reassignment() {
 
         // Register PS1 (ps_id=41) — but DON'T start a real partition server.
         // Just register to get the assignment, then let the heartbeat expire.
-        let req = rkyv_encode(&RegisterPsReq { ps_id: 41, address: "fake:9201".to_string() });
+        let req = rkyv_encode(&RegisterPsReq {
+            ps_id: 41,
+            address: "fake:9201".to_string(),
+        });
         let resp = mgr.call(MSG_REGISTER_PS, req).await.expect("register PS1");
         let r: CodeResp = rkyv_decode(&resp).expect("decode");
         assert_eq!(r.code, CODE_OK);
 
         // Verify partition assigned to PS1
         let regions = get_regions(&mgr).await;
-        let region = regions.regions.iter().find(|(_, r)| r.part_id == 901).unwrap().1.clone();
+        let region = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id == 901)
+            .unwrap()
+            .1
+            .clone();
         assert_eq!(region.ps_id, 41, "partition should be on PS1");
 
         // Register PS2 (ps_id=42)
-        let req = rkyv_encode(&RegisterPsReq { ps_id: 42, address: "fake:9202".to_string() });
+        let req = rkyv_encode(&RegisterPsReq {
+            ps_id: 42,
+            address: "fake:9202".to_string(),
+        });
         let resp = mgr.call(MSG_REGISTER_PS, req).await.expect("register PS2");
         let r: CodeResp = rkyv_decode(&resp).expect("decode");
         assert_eq!(r.code, CODE_OK);
 
         // Partition stays on PS1 (existing assignment preserved by rebalance)
         let regions = get_regions(&mgr).await;
-        let region = regions.regions.iter().find(|(_, r)| r.part_id == 901).unwrap().1.clone();
+        let region = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id == 901)
+            .unwrap()
+            .1
+            .clone();
         assert_eq!(region.ps_id, 41, "partition should still be on PS1");
 
         // PS2 also heartbeats — send a heartbeat for PS2 so it stays alive
@@ -151,7 +181,13 @@ fn ps_heartbeat_timeout_triggers_reassignment() {
 
         // After 24s, PS1 should be evicted (no heartbeat for 24s > 10s timeout)
         let regions = get_regions(&mgr).await;
-        let region = regions.regions.iter().find(|(_, r)| r.part_id == 901).unwrap().1.clone();
+        let region = regions
+            .regions
+            .iter()
+            .find(|(_, r)| r.part_id == 901)
+            .unwrap()
+            .1
+            .clone();
         assert_eq!(
             region.ps_id, 42,
             "partition should be reassigned to PS2 after PS1 heartbeat timeout (got ps_id={})",

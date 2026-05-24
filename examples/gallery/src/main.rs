@@ -167,10 +167,9 @@ impl TranscodeStatus {
 
     fn to_json(&self) -> String {
         match self {
-            TranscodeStatus::Failed(err) => format!(
-                r#"{{"status":"failed","error":{}}}"#,
-                json_string(err)
-            ),
+            TranscodeStatus::Failed(err) => {
+                format!(r#"{{"status":"failed","error":{}}}"#, json_string(err))
+            }
             other => format!(r#"{{"status":"{}"}}"#, other.as_status_str()),
         }
     }
@@ -200,7 +199,12 @@ enum HlsEncodeMode {
     Reencode,
 }
 
-fn run_hls_ffmpeg(input: &str, playlist: &std::path::Path, segments: &std::path::Path, mode: HlsEncodeMode) -> Result<()> {
+fn run_hls_ffmpeg(
+    input: &str,
+    playlist: &std::path::Path,
+    segments: &std::path::Path,
+    mode: HlsEncodeMode,
+) -> Result<()> {
     use std::process::{Command, Stdio};
 
     let mut cmd = Command::new("ffmpeg");
@@ -221,15 +225,7 @@ fn run_hls_ffmpeg(input: &str, playlist: &std::path::Path, segments: &std::path:
         }
         HlsEncodeMode::Reencode => {
             cmd.args([
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-c:a",
-                "aac",
-                "-b:a",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a",
                 "128k",
             ]);
         }
@@ -252,7 +248,12 @@ fn run_hls_ffmpeg(input: &str, playlist: &std::path::Path, segments: &std::path:
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .output()
-        .with_context(|| format!("spawn ffmpeg (hls {})", format!("{mode:?}").to_ascii_lowercase()))?;
+        .with_context(|| {
+            format!(
+                "spawn ffmpeg (hls {})",
+                format!("{mode:?}").to_ascii_lowercase()
+            )
+        })?;
     if !status.status.success() {
         let tail = String::from_utf8_lossy(&status.stderr);
         let tail = tail.lines().rev().take(8).collect::<Vec<_>>().join(" | ");
@@ -298,7 +299,10 @@ fn run_transcode_blocking(input_path: &std::path::Path) -> Result<Vec<(String, V
         run_hls_ffmpeg(input_str, &playlist, &segments, HlsEncodeMode::Reencode)
             .context("run ffmpeg hls reencode after copy fallback")?;
     }
-    tracing::info!(hls_ms = t1.elapsed().as_millis(), "transcode: ffmpeg hls done");
+    tracing::info!(
+        hls_ms = t1.elapsed().as_millis(),
+        "transcode: ffmpeg hls done"
+    );
 
     let t2 = Instant::now();
     let scale = format!("scale={THUMB_WIDTH}:-2");
@@ -332,7 +336,10 @@ fn run_transcode_blocking(input_path: &std::path::Path) -> Result<Vec<(String, V
         let tail = tail.lines().rev().take(4).collect::<Vec<_>>().join(" | ");
         tracing::warn!("ffmpeg thumb pass failed: {tail}");
     }
-    tracing::info!(thumb_ms = t2.elapsed().as_millis(), "transcode: ffmpeg thumb done");
+    tracing::info!(
+        thumb_ms = t2.elapsed().as_millis(),
+        "transcode: ffmpeg thumb done"
+    );
 
     // Remove the source file before collecting so it doesn't get re-uploaded.
     let _ = std::fs::remove_file(input_path);
@@ -363,21 +370,21 @@ fn run_transcode_blocking(input_path: &std::path::Path) -> Result<Vec<(String, V
 }
 
 /// Download a blob from KV to a local file, chunk by chunk.
-async fn download_to_file(
-    client: &Client,
-    key: &str,
-    dest: &std::path::Path,
-) -> Result<u64> {
+async fn download_to_file(client: &Client, key: &str, dest: &std::path::Path) -> Result<u64> {
     use std::io::Write;
 
-    let meta = client.lock().await.head(key.as_bytes()).await
+    let meta = client
+        .lock()
+        .await
+        .head(key.as_bytes())
+        .await
         .context("head for download")?;
     if !meta.found {
         return Err(anyhow!("key not found: {key}"));
     }
     let total = meta.value_length;
-    let mut file = std::fs::File::create(dest)
-        .with_context(|| format!("create {}", dest.display()))?;
+    let mut file =
+        std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
     let chunk_size = RANGE_CHUNK_BYTES;
     let mut offset: u64 = 0;
     while offset < total {
@@ -441,7 +448,10 @@ async fn transcode_video_task(name: String, client: Client, map: TranscodeMap) {
     let input_path = source_path.clone();
     let t_ffmpeg = std::time::Instant::now();
     let res = compio::runtime::spawn_blocking(move || run_transcode_blocking(&input_path)).await;
-    tracing::info!(ffmpeg_total_ms = t_ffmpeg.elapsed().as_millis(), "transcode: blocking work done");
+    tracing::info!(
+        ffmpeg_total_ms = t_ffmpeg.elapsed().as_millis(),
+        "transcode: blocking work done"
+    );
 
     let outputs = match res {
         Ok(Ok(v)) => v,
@@ -453,8 +463,10 @@ async fn transcode_video_task(name: String, client: Client, map: TranscodeMap) {
         }
         Err(_) => {
             tracing::warn!("transcode worker panicked for {name}");
-            map.borrow_mut()
-                .insert(name, TranscodeStatus::Failed("transcode worker panicked".into()));
+            map.borrow_mut().insert(
+                name,
+                TranscodeStatus::Failed("transcode worker panicked".into()),
+            );
             return;
         }
     };
@@ -490,8 +502,10 @@ async fn transcode_video_task(name: String, client: Client, map: TranscodeMap) {
         Ok(_) | Err(AutumnError::NotFound) => {}
         Err(e) => {
             tracing::warn!("delete original {name} failed: {e}");
-            map.borrow_mut()
-                .insert(name, TranscodeStatus::Failed(format!("delete original: {e}")));
+            map.borrow_mut().insert(
+                name,
+                TranscodeStatus::Failed(format!("delete original: {e}")),
+            );
             return;
         }
     }
@@ -797,11 +811,7 @@ async fn get_handler_inner(
 
 async fn cleanup_derived(client: &Client, name: &str) {
     // Best-effort; NotFound is fine.
-    let _ = client
-        .lock()
-        .await
-        .delete(thumb_key(name).as_bytes())
-        .await;
+    let _ = client.lock().await.delete(thumb_key(name).as_bytes()).await;
     let prefix = hls_dir_prefix(name);
     let scan = match client
         .lock()
@@ -969,7 +979,10 @@ async fn thumb_handler_inner(
 
     let is_video = is_video_ext(&ext);
     if !is_image_ext(&ext) && !is_video {
-        return error_response(StatusCode::NOT_FOUND, "no thumbnail for this file type".into());
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "no thumbnail for this file type".into(),
+        );
     }
 
     let key = thumb_key(&name);
@@ -991,7 +1004,9 @@ async fn thumb_handler_inner(
                 .unwrap();
         }
         Ok(None) => { /* fall through */ }
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("get thumb: {e}")),
+        Err(e) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("get thumb: {e}"))
+        }
     }
 
     if is_video {
@@ -1022,13 +1037,13 @@ async fn thumb_handler_inner(
                 v
             }
             Ok(None) => return error_response(StatusCode::NOT_FOUND, "not found".into()),
-            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("get: {e}")),
-        };
-        compio::runtime::spawn_blocking(move || {
-            match build_thumbnail(&original) {
-                Ok(b) => BuildOutcome::Ok(b),
-                Err(e) => BuildOutcome::ImageFallback(e, original),
+            Err(e) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("get: {e}"))
             }
+        };
+        compio::runtime::spawn_blocking(move || match build_thumbnail(&original) {
+            Ok(b) => BuildOutcome::Ok(b),
+            Err(e) => BuildOutcome::ImageFallback(e, original),
         })
         .await
     };
@@ -1064,11 +1079,7 @@ async fn thumb_handler_inner(
         let client = client.clone();
         let thumb = thumb.clone();
         compio::runtime::spawn(async move {
-            if let Err(e) = client
-                .lock()
-                .await
-                .put(key.as_bytes(), &thumb).await
-            {
+            if let Err(e) = client.lock().await.put(key.as_bytes(), &thumb).await {
                 tracing::warn!("cache thumbnail put failed for {name}: {e}");
             }
         })
@@ -1083,7 +1094,6 @@ async fn thumb_handler_inner(
         .unwrap()
 }
 
-
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -1092,8 +1102,7 @@ async fn thumb_handler_inner(
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -1101,9 +1110,7 @@ async fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:9001".to_string());
 
-    let client: Client = Rc::new(Mutex::new(
-        ClusterClient::connect(&manager).await?,
-    ));
+    let client: Client = Rc::new(Mutex::new(ClusterClient::connect(&manager).await?));
     let metrics: MetricsRef = Rc::new(RefCell::new(PerfMetrics::default()));
     let transcodes: TranscodeMap = Rc::new(RefCell::new(HashMap::new()));
 
@@ -1226,7 +1233,10 @@ mod tests {
     #[test]
     fn parse_suffix() {
         // Regression: previously parsed as bytes=0-2048.
-        assert_eq!(parse_byte_range("bytes=-2048", 539849), Some((537801, 539848)));
+        assert_eq!(
+            parse_byte_range("bytes=-2048", 539849),
+            Some((537801, 539848))
+        );
         // suffix larger than total clamps.
         assert_eq!(parse_byte_range("bytes=-9999", 1000), Some((0, 999)));
     }

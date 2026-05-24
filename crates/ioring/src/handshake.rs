@@ -30,8 +30,8 @@
 use bytes::{Buf, BufMut};
 
 use crate::header::{
-    DEFAULT_BUF_POOL_SIZE, DEFAULT_BUF_SLOT_SIZE, DEFAULT_CAPABILITIES,
-    DEFAULT_CQ_ENTRIES, DEFAULT_SQ_ENTRIES, RING_VERSION,
+    DEFAULT_BUF_POOL_SIZE, DEFAULT_BUF_SLOT_SIZE, DEFAULT_CAPABILITIES, DEFAULT_CQ_ENTRIES,
+    DEFAULT_SQ_ENTRIES, RING_VERSION,
 };
 
 /// Magic preamble on every handshake message — separate from the SHM
@@ -149,8 +149,8 @@ impl HelloRequest {
             return Err(HandshakeDecodeError::BadMagic { got: magic });
         }
         let msg_type = buf.get_u16_le();
-        let mt = MsgType::from_u16(msg_type)
-            .ok_or(HandshakeDecodeError::UnknownMsgType(msg_type))?;
+        let mt =
+            MsgType::from_u16(msg_type).ok_or(HandshakeDecodeError::UnknownMsgType(msg_type))?;
         if mt != MsgType::HelloRequest {
             return Err(HandshakeDecodeError::WrongMsgType {
                 got: mt,
@@ -248,8 +248,8 @@ impl HelloResponse {
             return Err(HandshakeDecodeError::BadMagic { got: magic });
         }
         let msg_type = buf.get_u16_le();
-        let mt = MsgType::from_u16(msg_type)
-            .ok_or(HandshakeDecodeError::UnknownMsgType(msg_type))?;
+        let mt =
+            MsgType::from_u16(msg_type).ok_or(HandshakeDecodeError::UnknownMsgType(msg_type))?;
         if mt != MsgType::HelloResponse {
             return Err(HandshakeDecodeError::WrongMsgType {
                 got: mt,
@@ -324,11 +324,7 @@ impl DaemonLimits {
 /// negotiated sizes (clamped to `limits`) and the assigned
 /// `session_id` on success, or a rejection response with the
 /// appropriate status on failure.
-pub fn negotiate(
-    req: &HelloRequest,
-    limits: &DaemonLimits,
-    session_id: u64,
-) -> HelloResponse {
+pub fn negotiate(req: &HelloRequest, limits: &DaemonLimits, session_id: u64) -> HelloResponse {
     if req.proto_version != RING_VERSION {
         return HelloResponse::reject(HelloStatus::UnsupportedVersion);
     }
@@ -479,7 +475,10 @@ mod tests {
         req.buf_pool_size = 1u64 << 40; // 1 TiB
         let resp = negotiate(&req, &DaemonLimits::defaults(), 1);
         assert_eq!(resp.status, HelloStatus::Ok);
-        assert_eq!(resp.buf_pool_size, DaemonLimits::defaults().max_buf_pool_size);
+        assert_eq!(
+            resp.buf_pool_size,
+            DaemonLimits::defaults().max_buf_pool_size
+        );
     }
 
     #[test]

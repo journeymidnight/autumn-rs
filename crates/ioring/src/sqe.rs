@@ -95,8 +95,7 @@ impl Sqe {
         let offset = buf.get_u64_le();
         let buf_offset = buf.get_u64_le();
         let user_data = buf.get_u64_le();
-        let opcode =
-            Opcode::from_u8(opcode_u8).ok_or(SqeDecodeError::UnknownOpcode(opcode_u8))?;
+        let opcode = Opcode::from_u8(opcode_u8).ok_or(SqeDecodeError::UnknownOpcode(opcode_u8))?;
         Ok(Self {
             opcode,
             ring_fd,

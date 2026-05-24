@@ -33,7 +33,9 @@ pub enum NodeAutoState {
     /// `Suspected` — Suspended requires a prior verified-alive baseline.
     Suspend,
     Online,
-    Suspected { since: Instant },
+    Suspected {
+        since: Instant,
+    },
 }
 
 impl NodeAutoState {
@@ -179,9 +181,7 @@ impl NodeStateTracker {
     /// Seconds since the most recent successful heartbeat, or `None`
     /// if the node has never produced one.
     pub fn last_heartbeat_secs_ago(&self, node_id: u64) -> Option<u64> {
-        self.last_ok
-            .get(&node_id)
-            .map(|t| t.elapsed().as_secs())
+        self.last_ok.get(&node_id).map(|t| t.elapsed().as_secs())
     }
 
     /// Suspected-window age in seconds, or `None` if not Suspected.
@@ -216,7 +216,11 @@ impl NodeStateTracker {
     pub fn snapshot(&self) -> Vec<(u64, NodeAutoState, Option<u64>)> {
         let mut out = Vec::with_capacity(self.states.len());
         for (id, st) in self.states.iter() {
-            out.push((*id, *st, self.last_ok.get(id).map(|t| t.elapsed().as_secs())));
+            out.push((
+                *id,
+                *st,
+                self.last_ok.get(id).map(|t| t.elapsed().as_secs()),
+            ));
         }
         // Stable order by id so test output / RPC responses are
         // deterministic.

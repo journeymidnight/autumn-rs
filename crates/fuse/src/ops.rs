@@ -7,8 +7,8 @@ use std::ffi::OsStr;
 use std::time::Duration;
 
 use fuser::{
-    Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 
 use crate::bridge::*;
@@ -291,7 +291,14 @@ impl Filesystem for AutumnFs {
         }
     }
 
-    fn flush(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+    fn flush(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
         match self.send(|r| FsRequest::Flush { ino, reply: r }) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(err_to_errno(&e)),
@@ -358,13 +365,22 @@ impl Filesystem for AutumnFs {
         }
     }
 
-    fn releasedir(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _flags: i32, reply: ReplyEmpty) {
+    fn releasedir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _flags: i32,
+        reply: ReplyEmpty,
+    ) {
         reply.ok();
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
         match self.send(|r| FsRequest::Statfs { reply: r }) {
-            Ok(s) => reply.statfs(s.blocks, s.bfree, s.bavail, s.files, s.ffree, s.bsize, s.namelen, 0),
+            Ok(s) => reply.statfs(
+                s.blocks, s.bfree, s.bavail, s.files, s.ffree, s.bsize, s.namelen, 0,
+            ),
             Err(_) => {
                 // Return reasonable defaults
                 reply.statfs(

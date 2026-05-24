@@ -503,7 +503,10 @@ mod tests {
             it.next();
         }
         assert_eq!(count, 20);
-        assert!(reader.block_count() > 1, "big values should span multiple blocks");
+        assert!(
+            reader.block_count() > 1,
+            "big values should span multiple blocks"
+        );
     }
 
     #[test]
@@ -549,11 +552,7 @@ mod tests {
 
     #[test]
     fn merge_iterator_single() {
-        let reader = build_sst(&[
-            (b"a", 1, b"v1"),
-            (b"b", 2, b"v2"),
-            (b"c", 3, b"v3"),
-        ]);
+        let reader = build_sst(&[(b"a", 1, b"v1"), (b"b", 2, b"v2"), (b"c", 3, b"v3")]);
         let mut it = MergeIterator::new(vec![TableIterator::new(reader)]);
         it.rewind();
 
@@ -573,15 +572,8 @@ mod tests {
             (b"c", 10, b"c-t1"),
             (b"e", 10, b"e-t1"),
         ]);
-        let t2 = build_sst(&[
-            (b"b", 5, b"b-t2"),
-            (b"d", 5, b"d-t2"),
-            (b"f", 5, b"f-t2"),
-        ]);
-        let mut it = MergeIterator::new(vec![
-            TableIterator::new(t1),
-            TableIterator::new(t2),
-        ]);
+        let t2 = build_sst(&[(b"b", 5, b"b-t2"), (b"d", 5, b"d-t2"), (b"f", 5, b"f-t2")]);
+        let mut it = MergeIterator::new(vec![TableIterator::new(t1), TableIterator::new(t2)]);
         it.rewind();
 
         let mut keys = Vec::new();
@@ -592,8 +584,12 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                b"a".to_vec(), b"b".to_vec(), b"c".to_vec(),
-                b"d".to_vec(), b"e".to_vec(), b"f".to_vec(),
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"d".to_vec(),
+                b"e".to_vec(),
+                b"f".to_vec(),
             ]
         );
     }
@@ -604,19 +600,13 @@ mod tests {
         // Same user key with different seq = different internal keys.
         // Higher seq → smaller inverted suffix → sorts first.
         // t1 has newer seq (10), t2 has older seq (5)
-        let t1 = build_sst(&[
-            (b"key1", 10, b"new"),
-            (b"key2", 10, b"new"),
-        ]);
+        let t1 = build_sst(&[(b"key1", 10, b"new"), (b"key2", 10, b"new")]);
         let t2 = build_sst(&[
             (b"key1", 5, b"old"),
             (b"key2", 5, b"old"),
             (b"key3", 5, b"only_old"),
         ]);
-        let mut it = MergeIterator::new(vec![
-            TableIterator::new(t1),
-            TableIterator::new(t2),
-        ]);
+        let mut it = MergeIterator::new(vec![TableIterator::new(t1), TableIterator::new(t2)]);
         it.rewind();
 
         let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -642,10 +632,7 @@ mod tests {
         // First iterator (index 0) wins.
         let t1 = build_sst(&[(b"x", 10, b"t1_wins")]);
         let t2 = build_sst(&[(b"x", 10, b"t2_loses")]);
-        let mut it = MergeIterator::new(vec![
-            TableIterator::new(t1),
-            TableIterator::new(t2),
-        ]);
+        let mut it = MergeIterator::new(vec![TableIterator::new(t1), TableIterator::new(t2)]);
         it.rewind();
 
         assert!(it.valid());
@@ -683,20 +670,9 @@ mod tests {
 
     #[test]
     fn merge_iterator_seek() {
-        let t1 = build_sst(&[
-            (b"a", 1, b"v1"),
-            (b"c", 2, b"v2"),
-            (b"e", 3, b"v3"),
-        ]);
-        let t2 = build_sst(&[
-            (b"b", 1, b"v4"),
-            (b"d", 2, b"v5"),
-            (b"f", 3, b"v6"),
-        ]);
-        let mut it = MergeIterator::new(vec![
-            TableIterator::new(t1),
-            TableIterator::new(t2),
-        ]);
+        let t1 = build_sst(&[(b"a", 1, b"v1"), (b"c", 2, b"v2"), (b"e", 3, b"v3")]);
+        let t2 = build_sst(&[(b"b", 1, b"v4"), (b"d", 2, b"v5"), (b"f", 3, b"v6")]);
+        let mut it = MergeIterator::new(vec![TableIterator::new(t1), TableIterator::new(t2)]);
 
         // Seek to "c" — should land on "c"
         it.seek(&ikey(b"c", u64::MAX));
@@ -739,8 +715,13 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec(),
-                b"e".to_vec(), b"f".to_vec(), b"g".to_vec(),
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"d".to_vec(),
+                b"e".to_vec(),
+                b"f".to_vec(),
+                b"g".to_vec(),
             ]
         );
     }
@@ -750,10 +731,7 @@ mod tests {
         // An empty SST still has valid structure but no entries
         let empty = build_sst(&[]);
         let full = build_sst(&[(b"a", 1, b"v1")]);
-        let mut it = MergeIterator::new(vec![
-            TableIterator::new(empty),
-            TableIterator::new(full),
-        ]);
+        let mut it = MergeIterator::new(vec![TableIterator::new(empty), TableIterator::new(full)]);
         it.rewind();
         assert!(it.valid());
         assert_eq!(crate::parse_key(&it.item().unwrap().key), b"a");
@@ -763,10 +741,7 @@ mod tests {
 
     #[test]
     fn merge_iterator_rewind() {
-        let t1 = build_sst(&[
-            (b"a", 1, b"v1"),
-            (b"b", 2, b"v2"),
-        ]);
+        let t1 = build_sst(&[(b"a", 1, b"v1"), (b"b", 2, b"v2")]);
         let mut it = MergeIterator::new(vec![TableIterator::new(t1)]);
         it.rewind();
         assert_eq!(crate::parse_key(&it.item().unwrap().key), b"a");
@@ -782,9 +757,24 @@ mod tests {
     #[test]
     fn memtable_iterator_basic() {
         let entries = vec![
-            IterItem { key: ikey(b"cherry", 1), op: 1, value: b"v3".to_vec(), expires_at: 0 },
-            IterItem { key: ikey(b"apple", 2), op: 1, value: b"v1".to_vec(), expires_at: 0 },
-            IterItem { key: ikey(b"banana", 3), op: 1, value: b"v2".to_vec(), expires_at: 0 },
+            IterItem {
+                key: ikey(b"cherry", 1),
+                op: 1,
+                value: b"v3".to_vec(),
+                expires_at: 0,
+            },
+            IterItem {
+                key: ikey(b"apple", 2),
+                op: 1,
+                value: b"v1".to_vec(),
+                expires_at: 0,
+            },
+            IterItem {
+                key: ikey(b"banana", 3),
+                op: 1,
+                value: b"v2".to_vec(),
+                expires_at: 0,
+            },
         ];
         let mut it = MemtableIterator::new(entries);
         // Should be sorted: apple, banana, cherry
@@ -801,9 +791,24 @@ mod tests {
     #[test]
     fn memtable_iterator_seek() {
         let entries = vec![
-            IterItem { key: ikey(b"a", 1), op: 1, value: b"v1".to_vec(), expires_at: 0 },
-            IterItem { key: ikey(b"c", 2), op: 1, value: b"v2".to_vec(), expires_at: 0 },
-            IterItem { key: ikey(b"e", 3), op: 1, value: b"v3".to_vec(), expires_at: 0 },
+            IterItem {
+                key: ikey(b"a", 1),
+                op: 1,
+                value: b"v1".to_vec(),
+                expires_at: 0,
+            },
+            IterItem {
+                key: ikey(b"c", 2),
+                op: 1,
+                value: b"v2".to_vec(),
+                expires_at: 0,
+            },
+            IterItem {
+                key: ikey(b"e", 3),
+                op: 1,
+                value: b"v3".to_vec(),
+                expires_at: 0,
+            },
         ];
         let mut it = MemtableIterator::new(entries);
         // Seek to "c" — should land on "c"
@@ -818,8 +823,18 @@ mod tests {
     #[test]
     fn memtable_iterator_rewind() {
         let entries = vec![
-            IterItem { key: ikey(b"x", 1), op: 1, value: b"v1".to_vec(), expires_at: 0 },
-            IterItem { key: ikey(b"y", 2), op: 1, value: b"v2".to_vec(), expires_at: 0 },
+            IterItem {
+                key: ikey(b"x", 1),
+                op: 1,
+                value: b"v1".to_vec(),
+                expires_at: 0,
+            },
+            IterItem {
+                key: ikey(b"y", 2),
+                op: 1,
+                value: b"v2".to_vec(),
+                expires_at: 0,
+            },
         ];
         let mut it = MemtableIterator::new(entries);
         it.next();

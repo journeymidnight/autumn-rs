@@ -22,14 +22,14 @@
 //!   --value-size <bytes> (default 4096)
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use autumn_rpc::client::RpcClient;
-use autumn_rpc::manager_rpc::{self, MSG_GET_REGIONS, GetRegionsResp, MgrPsDetail, MgrRegionInfo};
+use autumn_rpc::manager_rpc::{self, GetRegionsResp, MgrPsDetail, MgrRegionInfo, MSG_GET_REGIONS};
 use autumn_rpc::partition_rpc::{
-    self, GetReq, GetResp, MSG_GET, MSG_PUT, PutReq, PutResp, rkyv_decode, rkyv_encode,
+    self, rkyv_decode, rkyv_encode, GetReq, GetResp, PutReq, PutResp, MSG_GET, MSG_PUT,
 };
 use bytes::Bytes;
 
@@ -85,11 +85,10 @@ impl Config {
                 _ => {}
             }
         }
-        let kind = autumn_transport::parse_transport_flag(&c.transport)
-            .unwrap_or_else(|bad| {
-                eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
-                std::process::exit(2);
-            });
+        let kind = autumn_transport::parse_transport_flag(&c.transport).unwrap_or_else(|bad| {
+            eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
+            std::process::exit(2);
+        });
         let _ = autumn_transport::init_with(kind);
         c
     }
@@ -127,10 +126,7 @@ async fn resolve_target(manager_addr: &str) -> Target {
                     last_err = format!("{e}");
                     compio::time::sleep(Duration::from_millis(100)).await;
                     if attempt == 19 {
-                        panic!(
-                            "cannot connect to manager {}: {}",
-                            manager_addr, last_err
-                        );
+                        panic!("cannot connect to manager {}: {}", manager_addr, last_err);
                     }
                 }
             }
@@ -160,9 +156,9 @@ async fn resolve_target(manager_addr: &str) -> Target {
                 let ps_details: std::collections::HashMap<u64, MgrPsDetail> =
                     resp.ps_details.into_iter().collect();
                 let (_, region): &(u64, MgrRegionInfo) = &resp.regions[0];
-                let ps = ps_details.get(&region.ps_id).unwrap_or_else(|| {
-                    panic!("ps_id {} missing in ps_details", region.ps_id)
-                });
+                let ps = ps_details
+                    .get(&region.ps_id)
+                    .unwrap_or_else(|| panic!("ps_id {} missing in ps_details", region.ps_id));
                 let ps_addr: SocketAddr = ps
                     .address
                     .parse()
@@ -297,15 +293,12 @@ fn run_scenario(
                                 // counting failures as throughput.
                                 let ok = match op {
                                     Op::Put => rkyv_decode::<PutResp>(&resp_bytes)
-                                        .map(|r| {
-                                            r.code == partition_rpc::CODE_OK
-                                        })
+                                        .map(|r| r.code == partition_rpc::CODE_OK)
                                         .unwrap_or(false),
                                     Op::Get => rkyv_decode::<GetResp>(&resp_bytes)
                                         .map(|r| {
                                             r.code == partition_rpc::CODE_OK
-                                                || r.code
-                                                    == partition_rpc::CODE_NOT_FOUND
+                                                || r.code == partition_rpc::CODE_NOT_FOUND
                                         })
                                         .unwrap_or(false),
                                 };
@@ -599,12 +592,7 @@ fn main() {
     let seed_count = 20_000u64;
     seed_read_keys(&cfg, target.part_id, target.ps_addr, seed_count);
 
-    let read_scenarios: &[(usize, usize)] = &[
-        (1, 1),
-        (1, 16),
-        (1, 64),
-        (32, 16),
-    ];
+    let read_scenarios: &[(usize, usize)] = &[(1, 1), (1, 16), (1, 64), (32, 16)];
     for (tasks, depth) in read_scenarios.iter().copied() {
         run_read_scenario(
             "4KB Read",

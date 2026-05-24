@@ -26,8 +26,8 @@
 //! (multi-worker, or rendezvous tuning) is a separate perf task.
 
 use crate::ucx::ffi::*;
-use std::ffi::c_void;
 use std::cell::RefCell;
+use std::ffi::c_void;
 use std::io;
 use std::ptr;
 use std::sync::OnceLock;
@@ -63,15 +63,22 @@ pub(crate) fn process_context() -> *mut ucp_context {
                 rlim_max: libc::RLIM_INFINITY,
             };
             if libc::setrlimit(libc::RLIMIT_MEMLOCK, &inf) != 0 {
-                let mut ml = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-                if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut ml) == 0 && ml.rlim_cur < ml.rlim_max {
+                let mut ml = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut ml) == 0 && ml.rlim_cur < ml.rlim_max
+                {
                     ml.rlim_cur = ml.rlim_max;
                     libc::setrlimit(libc::RLIMIT_MEMLOCK, &ml);
                 }
             }
             // Surface the effective limit so a too-low cap (unprivileged launch,
             // hard limit pinned at 8 MiB) is diagnosable from the logs.
-            let mut now = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            let mut now = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
             if libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut now) == 0 {
                 tracing::info!(
                     memlock_cur = now.rlim_cur,
@@ -115,9 +122,7 @@ pub(crate) fn process_context() -> *mut ucp_context {
         assert_eq!(st, ucs_status_t::UCS_OK, "ucp_config_read");
 
         let mut ctx: ucp_context_h = ptr::null_mut();
-        let st = unsafe {
-            ucp_init_version(UCP_API_MAJOR, UCP_API_MINOR, &params, cfg, &mut ctx)
-        };
+        let st = unsafe { ucp_init_version(UCP_API_MAJOR, UCP_API_MINOR, &params, cfg, &mut ctx) };
         unsafe { ucp_config_release(cfg) };
         assert_eq!(st, ucs_status_t::UCS_OK, "ucp_init_version");
 
@@ -189,7 +194,12 @@ pub fn register_memory(ptr: *mut c_void, len: usize) -> io::Result<RegisteredMem
     if st != ucs_status_t::UCS_OK {
         return Err(ucs_err(st, "ucp_mem_map"));
     }
-    Ok(RegisteredMem { ctx, memh, ptr, len })
+    Ok(RegisteredMem {
+        ctx,
+        memh,
+        ptr,
+        len,
+    })
 }
 
 fn capture_context_info(ctx: *mut ucp_context) -> String {
