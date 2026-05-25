@@ -4154,3 +4154,14 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   - **两级 fan-out**:F244-C FuturesUnordered 跨并发 SQE + `get_many_into` 跨单次读的 extent。ZC-into-ring 仍留给 F243(需 ucp_mem_map);这里 `get_many_into` 读进本地 buf(TCP 大读仍省 rkyv wrap)再拷入 ring。
 - **Acceptance:** `cargo build -p autumn-ioring --features daemon` clean;clippy `-p autumn-ioring --features daemon --all-targets -D warnings` EXIT=0;workspace gate `--workspace --exclude autumn-fuse --all-targets -D warnings` EXIT=0;fmt clean;ioring 单测 69 passed(含 `fuse_read::tests` 4 个 plan_read 纯函数:full/cross-extent/EOF/sparse-gap);**e2e `system_ioring_fuse::f248_ioring_reads_fuse_file` PASS on a real cluster (3.12s)** — 经 fuse write 路径种 10 MiB 文件(dirent+inode+extent),再用 daemon 侧 `fuse_read::open`/`read` 验证:path-walk→2 变长 extent、前导斜杠路径、full/整-extent-ZC/4K-sub/跨-extent/EOF 全 byte-exact、缺失路径报错。
 - **passes:** true (2026-05-25).
+
+### F243 · io_uring daemon UCX ring registration + zero-copy reads INTO the ring (+ UCX/TCP perf compare)
+- **Trigger:** 原 F241 findings 拆出的"真读收益,UCX-env-gated";user "243 ucx,tcp测试性能对比". F248 daemon 把 extent 读进本地 buf 再 memcpy 进 ring slot;F243 去掉这次拷贝 + 上 UCX RDMA。
+- **关键环境发现:** 本机有 8× mlx5 RoCE 设备 + libucp,`--features ucx` 编译+链接干净 → UCX 路径在此真实可跑(对上 `project_ucx_intrahost_blocked`:UCX runs e2e, beats TCP)。**不是 TCP-only 沙箱。**
+- **F243-A+B (DONE 2026-05-25, commit e5566fb):**
+  - `fuse_read::read_into(cluster, opened, off, len, dest, reg)`: 直接读进 `dest`(ring slot)—— get_many_into 跨覆盖 extent,只对真稀疏空洞 memset(连续文件=0 memset=全 ZC)。`reg=Some`(ring 已 ucp_mem_map 注册,UCX)→ ≥64K extent RDMA 落 ring 零 CPU 拷贝;`reg=None`(TCP)→ transport recv 进 slot(一次内核拷贝,无 rkyv wrap,无额外 memcpy)。`read`(Vec 版,测试用)委托给 `read_into(reg=None)`。
+  - daemon: `--transport tcp|ucx` flag + init_with;poller_loop 抓 mmap 稳定 base ptr + `register_ring`(ucp_mem_map 整 region,cfg(ucx);TCP/非ucx/失败=None)。Read 用 base+buf_offset 造裸 `&mut` ring slot 片传给 read_into。**SAFETY**: validate_slice 保证 slot 在界内+对齐+len≤slot_size → 单 slot 独占;client 拥有 slot 分配不复用 in-flight slot → 跨 await 的 `&mut` 与其他 in-flight Read 及 SQ/CQ ring header 都不相交(镜像 kvcache from_raw_parts_mut 模式)。
+  - Cargo: ioring 加 autumn-transport dep + `ucx` feature(= daemon + autumn-client/ucx + autumn-transport/ucx)。
+  - Verified: build clean TCP + ucx;clippy daemon -D warnings EXIT=0,ucx 下无 ioring 诊断(autumn-transport ucx 旧 clippy 债务在标准 gate 外,不在本 feature 范围);workspace gate(exclude fuse)EXIT=0;fmt clean;ioring 单测 69;e2e f248(TCP,现走 read_into reg=None)PASS 3.12s 全 byte-exact。
+- **F243-C (pending):** UCX vs TCP 吞吐对比 —— 经 fuse mount 种大文件(≥8 MiB 多 extent,如 `dd of=/mnt/model.bin bs=1M count=64`),启 daemon `--transport tcp` 跑 ioring bench(--read-size 8M)记 ops/s+MB/s,再启 `--transport ucx`(UCX_TLS=^sysv,posix + RoCE 绑定 per project_ucx 记忆)记录对比。intra-host 预期 UCX 8M 读 ~2.3× per project_ucx_zerocopy_default。
+- **passes:** false (A+B done & verified; C — perf compare — pending next loop iteration).

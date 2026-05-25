@@ -1,4 +1,36 @@
 Date: 2026-05-25
+TaskStatus: not_completed
+Task scope: F243 — io_uring daemon UCX ring registration + ZC reads INTO ring +
+  UCX/TCP perf compare. Part 3 of the /loop series. A+B DONE+committed; C (the
+  perf comparison) PENDING -> TaskStatus not_completed until C lands.
+
+F243-A+B done (committed e5566fb this iteration):
+  ENV DISCOVERY: this host has 8x mlx5 RoCE + libucp; --features ucx compiles+
+    links clean -> UCX path is REAL here (not a TCP-only sandbox; matches
+    project_ucx_intrahost_blocked memory).
+  - fuse_read::read_into(dest, reg): read extents DIRECTLY into the ring slot
+    (dest); reg=Some(ucp_mem_map'd ring) -> ≥64K RDMA into ring, zero CPU copy;
+    reg=None (TCP) -> recv into slot, no extra memcpy. Only sparse holes memset.
+    read (Vec) delegates to read_into(reg=None).
+  - daemon: --transport tcp|ucx + init_with; poller_loop captures stable mmap
+    base ptr + register_ring (ucp_mem_map, cfg ucx, None on TCP); Read builds raw
+    &mut ring-slot dest (validate_slice => single-slot disjoint => sound across
+    await) + reg -> read_into.
+  - Cargo: ioring + autumn-transport dep + `ucx` feature.
+  Verified: build TCP+ucx clean; clippy daemon -D warnings EXIT=0 (no ioring
+    diagnostics under ucx; autumn-transport ucx clippy debt out of scope);
+    workspace gate EXIT=0; fmt clean; ioring 69 unit tests; e2e f248 (TCP, now via
+    read_into reg=None) PASS 3.12s byte-exact.
+
+F243-C (PENDING, next loop iteration): UCX vs TCP throughput compare.
+  Plan: boot cluster + fuse mount; seed big file (dd of=/mnt/model.bin bs=1M
+  count=64 -> 8 extents); daemon --transport tcp + ioring bench --read-size 8M
+  (ops/s+MB/s); then --transport ucx (UCX_TLS=^sysv,posix + RoCE bind per
+  project_ucx memories; raise RLIMIT_MEMLOCK); compare. Expect intra-host UCX 8M
+  read ~2.3x per project_ucx_zerocopy_default.
+
+--- prior iteration ---
+Date: 2026-05-25
 TaskStatus: completed
 Task scope: F248 — io_uring daemon reads autumn-fuse files (inode + F247 变长 extent).
   Part 2 of the /loop "完成 247, 248, 243 ucx,tcp 测试性能对比" series. F243 next.
