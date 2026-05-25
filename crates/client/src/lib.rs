@@ -155,6 +155,51 @@ pub const BATCH_GET_DEFAULT_CONCURRENCY: usize = 32;
 /// `BATCH_GET_DEFAULT_CONCURRENCY`).
 pub const BATCH_PUT_DEFAULT_CONCURRENCY: usize = 32;
 
+/// F245: the streaming fan-out primitive — the ONE concurrency base under every
+/// batch API. Drives `futs` with bounded `concurrency` (sliding window) and
+/// yields `(input_index, output)` as each future COMPLETES (completion order,
+/// NOT input order). This is the same SQ/CQ "fire N, reap as they land" shape the
+/// EN/PS server loops use, lifted to the client.
+///
+/// Two consumption modes on top of it:
+/// - **collect** ([`fan_out_collect`]): re-order into an index-aligned `Vec`
+///   (`get_many_into` / `put_many` / `delete_many` / `head_many`).
+/// - **streaming** (caller drives the stream): act on each completion as it lands
+///   — e.g. the io_uring daemon pushing one CQE per finished SQE, with no
+///   head-of-line wait on the rest of the batch.
+pub fn fan_out<Fut: std::future::Future>(
+    futs: impl IntoIterator<Item = Fut>,
+    concurrency: usize,
+) -> impl futures::Stream<Item = (usize, Fut::Output)> {
+    use futures::stream::StreamExt;
+    futures::stream::iter(
+        futs.into_iter()
+            .enumerate()
+            .map(|(i, f)| async move { (i, f.await) }),
+    )
+    .buffer_unordered(concurrency.max(1))
+}
+
+/// F245: collect convenience over [`fan_out`] — runs all `futs` with bounded
+/// `concurrency` and returns the outputs in INPUT order (result `i` ⇔ `futs[i]`).
+pub async fn fan_out_collect<Fut: std::future::Future>(
+    futs: impl IntoIterator<Item = Fut>,
+    concurrency: usize,
+) -> Vec<Fut::Output> {
+    use futures::stream::StreamExt;
+    let mut stream = fan_out(futs, concurrency);
+    let mut out: Vec<Option<Fut::Output>> = Vec::new();
+    while let Some((i, o)) = stream.next().await {
+        if out.len() <= i {
+            out.resize_with(i + 1, || None);
+        }
+        out[i] = Some(o);
+    }
+    out.into_iter()
+        .map(|o| o.expect("fan_out yields each input index exactly once"))
+        .collect()
+}
+
 // ── F212-fix-2 — TiKV-style retry/backoff for async-split-tolerant routing ─
 //
 // Split is async on this codebase (see `crates/partition-server/CLAUDE.md`
@@ -1089,42 +1134,37 @@ impl ClusterClient {
         items: &mut [GetManyItem<'_>],
         concurrency: usize,
     ) -> Vec<std::result::Result<Option<usize>, AutumnError>> {
-        use futures::stream::StreamExt;
-        let concurrency = concurrency.max(1);
-        futures::stream::iter(items.iter_mut())
-            .map(|it| {
-                let key: &[u8] = it.key;
-                let offset = it.offset;
-                let length = it.length;
-                let reg: Option<&autumn_rpc::RegisteredMem> = it.reg;
-                let dest: &mut [u8] = &mut *it.dest;
-                async move {
-                    // ZC eligibility keys off the bytes actually transferred:
-                    // a sub-range moves `length` bytes; a whole-value read moves
-                    // the value (caller sized `dest` to it).
-                    let read_len = if length > 0 {
-                        length as usize
-                    } else {
-                        dest.len()
-                    };
-                    if zc_worthwhile(read_len) {
-                        self.get_range_into(key, offset, length, dest, reg).await
-                    } else {
-                        match self.get_range(key, offset, length).await {
-                            Ok(Some(v)) => {
-                                let n = v.len().min(dest.len());
-                                dest[..n].copy_from_slice(&v[..n]);
-                                Ok(Some(v.len()))
-                            }
-                            Ok(None) => Ok(None),
-                            Err(e) => Err(e),
+        let futs = items.iter_mut().map(|it| {
+            let key: &[u8] = it.key;
+            let offset = it.offset;
+            let length = it.length;
+            let reg: Option<&autumn_rpc::RegisteredMem> = it.reg;
+            let dest: &mut [u8] = &mut *it.dest;
+            async move {
+                // ZC eligibility keys off the bytes actually transferred:
+                // a sub-range moves `length` bytes; a whole-value read moves
+                // the value (caller sized `dest` to it).
+                let read_len = if length > 0 {
+                    length as usize
+                } else {
+                    dest.len()
+                };
+                if zc_worthwhile(read_len) {
+                    self.get_range_into(key, offset, length, dest, reg).await
+                } else {
+                    match self.get_range(key, offset, length).await {
+                        Ok(Some(v)) => {
+                            let n = v.len().min(dest.len());
+                            dest[..n].copy_from_slice(&v[..n]);
+                            Ok(Some(v.len()))
                         }
+                        Ok(None) => Ok(None),
+                        Err(e) => Err(e),
                     }
                 }
-            })
-            .buffered(concurrency)
-            .collect()
-            .await
+            }
+        });
+        fan_out_collect(futs, concurrency).await
     }
 
     /// F236: batched zero-copy writes — the write mirror of `get_many_into`. Pure
@@ -1141,22 +1181,18 @@ impl ClusterClient {
         &self,
         items: &[(&[u8], bytes::Bytes)],
     ) -> Vec<std::result::Result<(), AutumnError>> {
-        use futures::stream::StreamExt;
-        futures::stream::iter(items.iter())
-            .map(|it| {
-                let key: &[u8] = it.0;
-                let value: &bytes::Bytes = &it.1;
-                async move {
-                    if zc_worthwhile(value.len()) {
-                        self.put_zc(key, value.clone()).await
-                    } else {
-                        self.put(key, value.as_ref()).await
-                    }
+        let futs = items.iter().map(|it| {
+            let key: &[u8] = it.0;
+            let value: &bytes::Bytes = &it.1;
+            async move {
+                if zc_worthwhile(value.len()) {
+                    self.put_zc(key, value.clone()).await
+                } else {
+                    self.put(key, value.as_ref()).await
                 }
-            })
-            .buffered(BATCH_PUT_DEFAULT_CONCURRENCY)
-            .collect()
-            .await
+            }
+        });
+        fan_out_collect(futs, BATCH_PUT_DEFAULT_CONCURRENCY).await
     }
 
     /// F237: batched deletes — pure client-side fan-out (no server `MSG_BATCH_*`),
@@ -1164,13 +1200,11 @@ impl ClusterClient {
     /// tiny). Result `i` matches `keys[i]` (`Ok(())` even if the key didn't exist,
     /// same as `delete`; `Err` = that item's RPC failed, others still ran).
     pub async fn delete_many(&self, keys: &[&[u8]]) -> Vec<std::result::Result<(), AutumnError>> {
-        use futures::stream::StreamExt;
         // delete is a mutation → reuse the write-side concurrency cap.
-        futures::stream::iter(keys.iter())
-            .map(|&key| async move { self.delete(key).await })
-            .buffered(BATCH_PUT_DEFAULT_CONCURRENCY)
-            .collect()
-            .await
+        let futs = keys
+            .iter()
+            .map(|&key| async move { self.delete(key).await });
+        fan_out_collect(futs, BATCH_PUT_DEFAULT_CONCURRENCY).await
     }
 
     /// F237: batched metadata lookups — pure client-side fan-out, `buffered` over
@@ -1182,13 +1216,9 @@ impl ClusterClient {
         &self,
         keys: &[&[u8]],
     ) -> Vec<std::result::Result<KeyMeta, AutumnError>> {
-        use futures::stream::StreamExt;
         // head is a read → reuse the read-side concurrency cap.
-        futures::stream::iter(keys.iter())
-            .map(|&key| async move { self.head(key).await })
-            .buffered(BATCH_GET_DEFAULT_CONCURRENCY)
-            .collect()
-            .await
+        let futs = keys.iter().map(|&key| async move { self.head(key).await });
+        fan_out_collect(futs, BATCH_GET_DEFAULT_CONCURRENCY).await
     }
 
     /// Delete a key. Returns Ok(()) even if key didn't exist.
@@ -1868,6 +1898,49 @@ mod zc_rule_tests {
         assert!(!zc_worthwhile(UCX_ZC_READ_MIN_BYTES - 1));
         assert!(zc_worthwhile(UCX_ZC_READ_MIN_BYTES));
         assert!(zc_worthwhile(8 * 1024 * 1024));
+    }
+}
+
+#[cfg(test)]
+mod fan_out_tests {
+    use super::*;
+    use futures::stream::StreamExt;
+    use std::time::Duration;
+
+    // F245: `fan_out_collect` returns INPUT order even when futures complete in
+    // reverse (index 0 sleeps longest). The reorder is deterministic regardless
+    // of timing, so this is not flaky.
+    #[test]
+    fn collect_returns_input_order_despite_reverse_completion() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let futs = (0..10usize).map(|i| async move {
+                compio::time::sleep(Duration::from_millis((10 - i as u64) * 3)).await;
+                i * 7
+            });
+            let out = fan_out_collect(futs, 4).await;
+            let expect: Vec<usize> = (0..10).map(|i| i * 7).collect();
+            assert_eq!(out, expect);
+        });
+    }
+
+    // F245: `fan_out` (the streaming base the io_uring daemon will use) yields
+    // every input index exactly once, paired with its own output.
+    #[test]
+    fn fan_out_yields_every_index_once() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let futs = (0..20usize).map(|i| async move { i });
+            let mut seen = [false; 20];
+            let mut count = 0;
+            let mut s = fan_out(futs, 5);
+            while let Some((i, v)) = s.next().await {
+                assert_eq!(v, i, "value paired with its index");
+                assert!(!seen[i], "index {i} yielded twice");
+                seen[i] = true;
+                count += 1;
+            }
+            assert_eq!(count, 20);
+            assert!(seen.iter().all(|&b| b), "every index yielded");
+        });
     }
 }
 

@@ -58,6 +58,24 @@ Main entry point. Connect via `ClusterClient::connect("addr1,addr2")`.
   `head_many` returns `found=false` for a missing key (not `Err`). delete reuses
   the write concurrency cap, head the read one.
 
+**Batch fan-out foundation (F245) — `fan_out` / `fan_out_collect`.** All four batch
+APIs above are thin wrappers over ONE streaming primitive (module-level, pub):
+- `fan_out(futs, concurrency) -> impl Stream<Item=(usize, Fut::Output)>` — drives
+  `futs` with a bounded sliding window (`buffer_unordered`) and yields
+  `(input_index, output)` as each future COMPLETES (completion order). This is the
+  same "fire N, reap as they land" SQ/CQ shape the EN/PS server loops use, lifted
+  to the client.
+- `fan_out_collect(futs, concurrency) -> Vec<Output>` — collects `fan_out` back
+  into INPUT order. `get_many_into` / `put_many` / `delete_many` / `head_many` each
+  build their per-item futures and call this; the per-item logic (ZC decision, copy
+  into dest, etc.) is all that differs.
+- **Streaming consumers** drive `fan_out` directly and act per completion — e.g.
+  the io_uring daemon would push one CQE per finished SQE with no head-of-line wait
+  on the rest of the batch (the reason a batch-COLLECT primitive like
+  `get_many_into` is the wrong fit there; see F244-C). This is the seam that lets
+  the daemon eventually share the client's fan-out without changing its streaming
+  completion model.
+
 **"ucx ⟹ zerocopy" + `UCX_ZC_READ_MIN_BYTES` + `zc_worthwhile` (F216-E/F219/F234/F235).**
 The SDK exposes both the regular (`get`/`put`) and zero-copy (`get_into`/`put_zc`)
 ops; the SELECTION is encapsulated in the single helper

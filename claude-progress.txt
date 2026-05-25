@@ -1,5 +1,24 @@
 Date: 2026-05-25
 TaskStatus: completed
+Task scope: F245 — streaming fan-out primitive (fan_out / fan_out_collect) as the
+  ClusterClient batch foundation. User: "抽一个流式 fan-out 原语…ClusterClient 的
+  底座也是这个逻辑,其他 API 都是这个之上的."
+
+F245 done:
+  - fan_out(futs, concurrency) -> Stream<(idx, output)> (buffer_unordered, completion
+    order); fan_out_collect -> Vec in input order. Module-level pub in autumn-client.
+  - Rebuilt get_many_into / put_many / delete_many / head_many on fan_out_collect
+    (per-item logic unchanged; no signature change; behaviour preserved).
+  - Streaming seam: io_uring daemon (F244-C) can drive fan_out + push CQE per
+    completion (no head-of-line) WITHOUT batch-collect — the correct io_uring model.
+  Verified: gate clippy --all-targets -D warnings EXIT=0; python check clean; fmt
+  clean; client unit (9, incl fan_out_tests); e2e f235/f236/f237/f244b all PASS.
+  F244-C now design-unblocked; still needs an ioring bench/test harness. NOT
+  committed yet.
+
+----- earlier this session (F244-B) -----
+Date: 2026-05-25
+TaskStatus: completed
 Task scope: F244-B — fuse read::execute -> get_many_into (env now allows FUSE
   testing; user: "现在环境可以测试fuse").
 
