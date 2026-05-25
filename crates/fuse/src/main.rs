@@ -112,11 +112,10 @@ fn main() -> Result<()> {
     let mut options = vec![
         fuser::MountOption::FSName("autumn-fuse".to_string()),
         fuser::MountOption::DefaultPermissions,
-        // max_read=1 MiB so a userspace pread(8 MiB) arrives as 8 × 1 MiB
-        // FUSE reads instead of 64 × 128 KiB (kernel default). Each
-        // 1 MiB FUSE read in autumn-fuse fans out 4 concurrent chunk
-        // RPCs (CHUNK_SIZE = 256 KiB) — gives the parallel chunk fix
-        // (autumn-fuse perf fix #2) something to actually parallelise.
+        // max_read=8 MiB so a userspace pread(8 MiB) arrives as one FUSE read
+        // instead of 64 × 128 KiB (kernel default). One large FUSE read fans
+        // out across the file's variable-length extents (F247, ≤ 8 MiB each)
+        // via `get_many_into` — each whole-extent get is ZC-eligible (≥ 64 KiB).
         fuser::MountOption::CUSTOM("max_read=8388608".to_string()),
     ];
     if args.allow_other {

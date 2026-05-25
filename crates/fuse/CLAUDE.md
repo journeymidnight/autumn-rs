@@ -149,10 +149,26 @@ fuser 回调线程 → crossbeam::channel::send(FsRequest) → compio 线程 rec
 |------|------|---------|-------|
 | `0x01` | Inode 元数据 | `[0x01][ino: u64 BE]` | InodeMeta (rkyv) |
 | `0x02` | 目录项 | `[0x02][parent: u64 BE][name]` | DirentValue (rkyv) |
-| `0x03` | 文件数据块 | `[0x03][ino: u64 BE][chunk_idx: u64 BE]` | raw bytes ≤256KB |
+| `0x03` | 文件数据 extent | `[0x03][ino: u64 BE][logical_off: u64 BE]` | raw bytes ≤ 8 MiB (`MAX_EXTENT`) |
 | `0x04` | FS 超级块 | `[0x04][field]` | varies |
 
-Big Endian 保证自然排序，同父目录项聚集、同文件 chunk 连续有序。
+Big Endian 保证自然排序，同父目录项聚集、同文件 extent 按逻辑偏移连续有序。
+
+> **F247 — 变长 extent（取代固定 256 KiB chunk）。** 文件数据不再是固定 256 KiB
+> 块，而是**按逻辑字节偏移寻址的变长 extent**（key = `[0x03][ino][logical_off BE]`，
+> value ≤ 8 MiB = `MAX_EXTENT`）。顺序写（write-once）合并成接近 8 MiB 的 extent，
+> 末尾/部分 extent 较短 → "像 Linux extent 一样变长"。动机：模型文件等大文件以前会
+> 散成几十万个 256 KiB chunk（LSM key 基数爆炸 + 每读散成大量小 RPC），现在变成数量级
+> 更少、每个 ≥ 64 KiB 的 extent —— **每个整 extent 读都走 `get_many_into` 的 ZC 路径
+> （`MSG_GET_ZC`）**，正是 F243 RDMA 零拷贝要利用的尺寸。
+>
+> - **持久真相 = extent KV key 本身**（隐式 key 设计，InodeMeta 里**不**存 extent 列表）。
+> - **运行时缓存**：`InodeState.extents: Option<Vec<(start, len)>>` —— 冷启动用
+>   range-scan `[0x03][ino]` 前缀拿到起始偏移 + 由相邻起始/文件大小推断长度；写时增量
+>   维护，truncate 时失效。
+> - **不变量：extent 互不重叠**。读按 `[start, start+len)` 请求每个重叠 extent 的精确
+>   子区间，PS get 会按真实 value 长度裁剪、dest 余下补零 —— 短 extent / 稀疏空洞都正确。
+> - 全部寻址/读/写/截断/删除逻辑在 `crate::extent`。
 
 ### KV 数据模型详解
 
@@ -354,13 +370,15 @@ autumn-fuse 不需要显式的 block 指针——chunk key `[0x03][ino][chunk_id
 实际性能差距主要在**网络 RTT**（每次 KV Get 是一次 RPC 到 PartitionServer），
 而非查找算法本身。FUSE 内核缓存（entry_timeout=30s）抵消了大部分重复 lookup 开销。
 
-### 数据存储
+### 数据存储 (F247 变长 extent)
 
-- **Chunk 大小**: 256KB
-  - 大于 4KB VALUE_THROTTLE → 自动走 ValuePointer（高效）
-  - 与 1MB 写缓冲对齐（4 chunks per flush）
-- **小文件优化**: ≤4KB inline 在 InodeMeta.inline_data 中
-- **部分 chunk 读**: 利用 `GetReq.offset + length` 做 sub-range 读
+- **Extent 上限**: 8 MiB (`MAX_EXTENT`)，变长（顺序写合并到上限，末尾较短）
+  - 远大于 4KB VALUE_THROTTLE → 走 ValuePointer（高效）
+  - 写缓冲也按 8 MiB 刷写（每满一个 extent 落一条 KV）
+  - ≥ 64 KiB → 整 extent 读走 ZC (`MSG_GET_ZC`)
+- **小文件优化**: ≤4KB inline 在 InodeMeta.inline_data 中（无 extent）
+- **部分 extent 读**: 利用 `GetReq.offset + length` 做 in-extent sub-range 读；读结果按
+  绝对 dest 偏移拼装，extent 间空洞补零（稀疏文件语义）
 
 ### 核心数据结构
 

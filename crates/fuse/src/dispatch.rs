@@ -8,9 +8,7 @@ use crate::dir;
 use crate::key;
 use crate::meta::*;
 use crate::read;
-use crate::schema::{
-    self, DirentValue, InodeState, CHUNK_SIZE, DT_DIR, DT_REG, INODE_ALLOC_BATCH, ROOT_INO,
-};
+use crate::schema::{self, DirentValue, InodeState, DT_DIR, DT_REG, INODE_ALLOC_BATCH, ROOT_INO};
 use crate::state::FsState;
 use crate::write;
 
@@ -214,6 +212,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                         write_buf: None,
                         dirty: false,
                         open_count: 1,
+                        extents: None,
                     },
                 );
                 *state.lookup_count.entry(ino).or_insert(0) += 1;
@@ -243,12 +242,9 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                 let mut meta = get_inode(state, dirent.child_inode).await?;
                 meta.nlink = meta.nlink.saturating_sub(1);
                 if meta.nlink == 0 {
-                    // Delete all chunks
-                    let num_chunks = meta.size.div_ceil(CHUNK_SIZE as u64);
-                    for i in 0..num_chunks {
-                        let ck = key::chunk_key(dirent.child_inode, i);
-                        let _ = state.kv_delete(&ck).await;
-                    }
+                    // Delete all data extents (F247 — variable-length, keyed by
+                    // logical offset; range-scan rather than arithmetic).
+                    crate::extent::delete_all_extents(state, dirent.child_inode).await?;
                     // Delete inode
                     let ik = key::inode_key(dirent.child_inode);
                     state.kv_delete(&ik).await?;
@@ -287,6 +283,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                             write_buf: None,
                             dirty: false,
                             open_count: 1,
+                            extents: None,
                         },
                     );
                 }

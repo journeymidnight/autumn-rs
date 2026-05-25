@@ -8,6 +8,8 @@ pub mod dir;
 #[cfg(feature = "fuse")]
 pub mod dispatch;
 #[cfg(feature = "fuse")]
+pub mod extent;
+#[cfg(feature = "fuse")]
 pub mod meta;
 #[cfg(feature = "fuse")]
 pub mod ops;

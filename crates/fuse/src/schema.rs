@@ -59,11 +59,16 @@ pub struct DirentValue {
     pub file_type: u8,
 }
 
-/// Chunk size for file data blocks: 256KB.
-pub const CHUNK_SIZE: usize = 256 * 1024;
-
-/// Write buffer capacity: 1MB (matches 3FS InodeWriteBuf).
-pub const WRITE_BUF_SIZE: usize = 1024 * 1024;
+/// Maximum extent (variable-length data block) size: 8 MiB (F247).
+///
+/// Files are stored as **variable-length extents** keyed by their logical byte
+/// offset (`[0x03][ino][logical_off BE]`), NOT fixed 256 KiB chunks. A
+/// sequential (write-once) stream coalesces into extents capped at `MAX_EXTENT`;
+/// the last/partial extent is shorter → "variable like Linux extents". 8 MiB
+/// matches the project's large-value bench size and the UCX large-read sweet
+/// spot, so the ≥64 KiB ZC path (and the future RDMA path, F243) is engaged for
+/// whole-extent reads. The write buffer also flushes at this granularity.
+pub const MAX_EXTENT: usize = 8 * 1024 * 1024;
 
 /// Small file inline threshold: 4KB (matches VALUE_THROTTLE).
 pub const INLINE_THRESHOLD: usize = 4096;
@@ -81,7 +86,7 @@ pub const DT_LNK: u8 = 10;
 
 /// Runtime write buffer state for a single inode (compio thread-local).
 pub struct WriteBuffer {
-    /// Buffer storage, capacity = WRITE_BUF_SIZE.
+    /// Buffer storage, capacity = MAX_EXTENT.
     pub buf: Vec<u8>,
     /// Starting file offset of buffered data.
     pub offset: i64,
@@ -98,7 +103,7 @@ impl Default for WriteBuffer {
 impl WriteBuffer {
     pub fn new() -> Self {
         Self {
-            buf: Vec::with_capacity(WRITE_BUF_SIZE),
+            buf: Vec::with_capacity(MAX_EXTENT),
             offset: 0,
             len: 0,
         }
@@ -115,4 +120,11 @@ pub struct InodeState {
     pub write_buf: Option<WriteBuffer>,
     pub dirty: bool,
     pub open_count: u32,
+    /// F247 runtime extent map: sorted `(logical_start, value_len)` of this
+    /// file's data extents. `None` = not yet loaded (rebuild via range-scan of
+    /// the `[0x03][ino]` prefix + neighbor/file-size length inference). This is a
+    /// *runtime cache only* — the persistent source of truth is the extent KV
+    /// keys themselves (the implicit-key design: no extent list in InodeMeta).
+    /// Invalidated (set `None`) on truncate; maintained incrementally on write.
+    pub extents: Option<Vec<(u64, u32)>>,
 }

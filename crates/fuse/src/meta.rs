@@ -8,7 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use fuser::FileAttr;
 
 use crate::key;
-use crate::schema::{self, InodeMeta, CHUNK_SIZE, INODE_ALLOC_BATCH, ROOT_INO};
+use crate::schema::{self, InodeMeta, INODE_ALLOC_BATCH, ROOT_INO};
 use crate::state::FsState;
 
 /// Convert InodeMeta to fuser::FileAttr.
@@ -28,7 +28,10 @@ pub fn inode_to_attr(ino: u64, meta: &InodeMeta) -> FileAttr {
         uid: meta.uid,
         gid: meta.gid,
         rdev: 0,
-        blksize: CHUNK_SIZE as u32,
+        // Optimal-IO hint reported via stat(2) st_blksize. Kept at 1 MiB (not
+        // the 8 MiB MAX_EXTENT) so stdio/cp size their buffers sensibly while
+        // still issuing large reads; FUSE readahead is configured separately.
+        blksize: 1024 * 1024,
         flags: 0,
     }
 }

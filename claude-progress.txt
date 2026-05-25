@@ -1,5 +1,30 @@
 Date: 2026-05-25
 TaskStatus: completed
+Task scope: F247 — autumn-fuse 变长 extent (取代固定 256 KiB chunk). Part 1 of the
+  /loop "完成 247, 248, 243 ucx,tcp 测试性能对比" series (F248 + F243 next iterations).
+
+F247 done (committed this iteration):
+  Decisions (user): 隐式 key=logical_offset (无 inode extent 列表, LSM range-scan 寻址)
+    + write-once append 合并 cap 8 MiB (MAX_EXTENT; 随机覆盖=慢路径 RMW).
+  - schema: CHUNK_SIZE+WRITE_BUF_SIZE -> MAX_EXTENT=8MiB; InodeState.extents 运行时缓存.
+  - key: chunk_key(idx) -> extent_key(logical_off) + extent_prefix + parse_extent_key.
+  - extent.rs (NEW 中枢): extents_snapshot(range-scan+长度推断+缓存) / write_region
+    (append=直接put, 覆盖=RMW, 维护非重叠) / truncate_extents / delete_all_extents.
+    不变量: extent 互不重叠 -> 读按 [start,start+len) 精确请求, PS get 裁剪 + dest 补零
+    -> 短extent/稀疏空洞都正确.
+  - read.rs: extent map -> 每 extent in-extent sub-range + 绝对 dest_offset; execute
+    预分配整 read span, 按 dest_offset 切不相交 &mut 片(空洞补零), 一次 get_many_into
+    (整 extent ≥64K 走 ZC). 修了旧的顺序拼接在稀疏/短 extent 下错位的 bug.
+  - write.rs/dispatch.rs(unlink)/meta.rs(blksize 1MiB hint) 路由到 extent::*.
+  Verified: build clean; clippy -p autumn-fuse --features fuse -D warnings EXIT=0;
+    fmt clean; fuse 单测 11 passed; e2e f247_variable_length_extents PASS on real
+    cluster 3.66s (10MiB 文件 -> 2 变长 extent off0+off8MiB; full/ZC/4K-sub/跨extent/
+    EOF/truncate/delete 全 byte-exact). fuse CLAUDE.md 同步更新.
+
+Next (this loop): F248 (daemon 接 extent 模型 + sub-range 透传 + 跨 extent fan_out),
+  then F243 (daemon ring mmap ucp_mem_map UCX 注册 -> ≥64K RDMA ZC) + UCX/TCP 性能对比.
+
+--- prior iteration ---
 Task scope: F244-C — io_uring daemon poller_loop -> bounded FuturesUnordered SQ/CQ
   loop (server-side form of streaming fan-out). User: "fix F244-C as well and test
   the perf".

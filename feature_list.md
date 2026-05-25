@@ -4131,3 +4131,21 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   - **Removed wbench/rbench**: `WBench`/`RBench` enum variants + arg-parse + exec blocks + `parse_write_results` + tests + `BenchResult`/`BenchSample`/`WriteBenchReport` + `parse_bool_flag` + `LatencyHist::new` + now-unused imports (`SocketAddr`/`Rc`/`Mutex`/`parse_addr`/`RpcClient`/`manager_rpc::*`/`partition_rpc::{...}`).
 - **Acceptance:** clippy `--workspace --exclude autumn-fuse --all-targets -- -D warnings` EXIT=0; fmt clean; **functional run on a live 1-node cluster — write 14.9K ops/s + read 14.7K ops/s (fan_out streaming), latency histograms + baseline written; the gate path fires + exits 2 on a p99 variance.** NOTE: sandbox numbers are NOT production-representative (loopback artifacts per the perf memory); real perf validation runs via `perf_check.sh` on prod hardware.
 - **passes:** true (2026-05-25).
+
+### F247 · autumn-fuse 变长 extent（取代固定 256 KiB chunk）
+- **Trigger:** User — "整个 fuse 的 chunk 大小分配不能是全 256k，而是应该类似 linux 的变长" + "封顶 8mb". Fuse/io_uring 的主要 workload 是读大模型文件;固定 256 KiB chunk 让 100 GB 模型散成 ~40 万 key（LSM key 基数爆炸 + 每读散成大量小 RPC），且 256 KiB 不是变长。
+- **Decisions (user, via AskUserQuestion):** (1) 寻址 = **隐式 key=logical_offset**（key `[0x03][ino][logical_off BE]`，value 变长，LSM range-scan 寻址,**InodeMeta 不存 extent 列表**)；(2) 写策略 = **write-once append 合并, cap 8 MiB**（随机覆盖 = 慢路径 RMW）。
+- **Scope:**
+  - `schema.rs`: `CHUNK_SIZE`(256K)+`WRITE_BUF_SIZE`(1M) → `MAX_EXTENT = 8 MiB`(extent 上限 + 刷写粒度 + 写缓冲 cap)。`InodeState` 加 `extents: Option<Vec<(start,len)>>` 运行时缓存。
+  - `key.rs`: `chunk_key(ino,idx)` → `extent_key(ino,logical_off)`；新增 `extent_prefix`/`parse_extent_key`。
+  - `extent.rs`(NEW, 中枢): `extents_snapshot`(冷启动 range-scan 起始偏移 + 相邻/文件大小推断长度,缓存)、`write_region`(按 floor/next 决定 append=直接 put / 覆盖=RMW,维护非重叠 + 缓存)、`truncate_extents`(删 EOF 后 extent + 截断跨界 extent)、`delete_all_extents`(range-scan 删,unlink 用)。不变量:**extent 互不重叠**。
+  - `read.rs`: 用 extent map 规划每个重叠 extent 的 in-extent sub-range + **绝对 dest_offset**;`execute` 预分配整 read span,按 dest_offset 切不相交 `&mut` 片(空洞补零),一次 `get_many_into`(整 extent ≥64K 走 ZC)。修了旧的"按 chunk 长度顺序拼接"在稀疏/短 extent 下会错位的问题。
+  - `write.rs`/`dispatch.rs`(unlink)/`meta.rs`(blksize→1 MiB hint): 路由到 `extent::*`。
+- **Acceptance:** `cargo build -p autumn-fuse --features fuse` clean; clippy `-p autumn-fuse --features fuse --all-targets -- -D warnings` EXIT=0; fmt clean; fuse 单测 11 passed(key roundtrip + extent infer/floor/upsert); **e2e `system_fuse_read::f247_variable_length_extents` PASS on a real cluster (3.66s)** — 走真实 write 路径建 10 MiB 文件 → 断言落成 2 个变长 extent(off 0 + off 8 MiB,不是 40×256K)、full/整-extent-ZC/4K-sub-range/跨-extent/EOF-clamp 全 byte-exact、truncate 删 8 MiB extent、delete_all_extents 清空。
+- **passes:** true (2026-05-25).
+
+### F248 · io_uring daemon 接 F247 extent 模型 + sub-range 透传 + 跨 extent fan_out — PROPOSAL
+- **Trigger:** User — "另外到 ioring,也应该用 F244-C 的". daemon 现在是裸 KV shim(一个 ring_fd=一个 key + `offset:0,length:0` 整值拉取),既不懂 fuse 文件的变长 extent,对大 extent 整值拉取也是 byte 放大灾难。
+- **Scope (planned):** daemon Read 透传 `sqe.offset/length` 子区间(取代整值拉取);Open(path)→解析 inode→Read 对覆盖窗口的 extents 跑 `get_many_into`/`fan_out`(复用已有 F244-C FuturesUnordered 机制,不是重做)。岔路(到时定):daemon path→inode 解析(自己走 fuse 元数据 vs 内核层把 ino 传进来)。
+- **Acceptance:** ioring bench 大读(8M)delta vs 整值路径;CQE 正确性;build+clippy。
+- **passes:** false (proposal — next loop iteration after F247).

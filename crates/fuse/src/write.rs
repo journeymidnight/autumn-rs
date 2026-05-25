@@ -1,14 +1,19 @@
-//! Write path: 1MB write buffering with flush logic.
+//! Write path: write buffering + flush into variable-length extents (F247).
 //!
-//! Mirrors 3FS InodeWriteBuf pattern:
-//! - Sequential writes accumulate in a 1MB buffer
-//! - Gap detection: non-sequential offset triggers immediate flush
-//! - Full buffer triggers flush
-//! - fsync/close triggers flush
+//! Mirrors the 3FS InodeWriteBuf pattern, but the flush unit is a variable-
+//! length extent (≤ `MAX_EXTENT` = 8 MiB) keyed by logical offset, not a fixed
+//! 256 KiB chunk:
+//! - Sequential writes accumulate in the buffer (cap `MAX_EXTENT`).
+//! - Gap detection: a non-sequential offset flushes the buffer first.
+//! - A full buffer flushes one whole `MAX_EXTENT` extent.
+//! - fsync/close flushes whatever remains as one (shorter) extent.
+//!
+//! All extent placement / read-modify-write / non-overlap maintenance lives in
+//! `crate::extent`; this module only manages the in-memory buffer + inode meta.
 
 use anyhow::Result;
 
-use crate::key;
+use crate::extent;
 use crate::meta::{get_inode, now_ts, put_inode};
 use crate::schema::*;
 use crate::state::FsState;
@@ -54,35 +59,36 @@ pub async fn write(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> R
         let (flush_needed, copied) = {
             let is = state.inodes.get_mut(&ino).unwrap();
             let wb = is.write_buf.as_mut().unwrap();
-            let space = WRITE_BUF_SIZE - wb.len;
+            let space = MAX_EXTENT - wb.len;
             let to_copy = std::cmp::min(space, remaining.len());
             if wb.buf.len() < wb.len + to_copy {
                 wb.buf.resize(wb.len + to_copy, 0);
             }
             wb.buf[wb.len..wb.len + to_copy].copy_from_slice(&remaining[..to_copy]);
             wb.len += to_copy;
-            (wb.len >= CHUNK_SIZE, to_copy)
+            (wb.len >= MAX_EXTENT, to_copy)
         };
         written += copied;
         remaining = &remaining[copied..];
 
         if flush_needed {
-            // Extract one chunk worth of data to flush
+            // Extract one full extent (MAX_EXTENT) worth of data to flush.
             let (flush_offset, flush_data) = {
                 let is = state.inodes.get_mut(&ino).unwrap();
                 let wb = is.write_buf.as_mut().unwrap();
                 let fo = wb.offset;
-                let fd: Vec<u8> = wb.buf[..CHUNK_SIZE].to_vec();
-                // Shift remaining data
-                let rem = wb.len - CHUNK_SIZE;
+                let fd: Vec<u8> = wb.buf[..MAX_EXTENT].to_vec();
+                // Shift any remaining data down to the front.
+                let rem = wb.len - MAX_EXTENT;
                 if rem > 0 {
-                    wb.buf.copy_within(CHUNK_SIZE..wb.len, 0);
+                    wb.buf.copy_within(MAX_EXTENT..wb.len, 0);
                 }
                 wb.len = rem;
-                wb.offset = fo + CHUNK_SIZE as i64;
+                wb.offset = fo + MAX_EXTENT as i64;
                 (fo, fd)
             };
-            write_chunk_data(state, ino, flush_offset, &flush_data).await?;
+            let file_size = state.inodes.get(&ino).map(|is| is.meta.size).unwrap_or(0);
+            extent::write_region(state, ino, flush_offset as u64, &flush_data, file_size).await?;
         }
     }
 
@@ -123,14 +129,18 @@ pub async fn flush_inode(state: &mut FsState, ino: u64) -> Result<()> {
         }
     };
 
-    // Write buffered data as chunks (no-op when buf_len == 0)
-    let mut pos = 0;
-    let mut file_offset = buf_offset;
-    while pos < buf_len {
-        let to_write = std::cmp::min(buf_len - pos, CHUNK_SIZE);
-        write_chunk_data(state, ino, file_offset, &buf_data[pos..pos + to_write]).await?;
-        pos += to_write;
-        file_offset += to_write as i64;
+    // Persist buffered data as variable-length extents (no-op when buf_len == 0).
+    // `write_region` splits into MAX_EXTENT-capped, non-overlapping extents.
+    if buf_len > 0 {
+        let file_size = state.inodes.get(&ino).map(|is| is.meta.size).unwrap_or(0);
+        extent::write_region(
+            state,
+            ino,
+            buf_offset as u64,
+            &buf_data[..buf_len],
+            file_size,
+        )
+        .await?;
     }
 
     // Persist the current InodeMeta if dirty — captures size/mtime updates from
@@ -152,34 +162,6 @@ pub async fn flush_inode(state: &mut FsState, ino: u64) -> Result<()> {
     Ok(())
 }
 
-/// Write chunk data to KV store. Handles partial chunk writes (read-modify-write).
-async fn write_chunk_data(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> Result<()> {
-    let offset = offset as u64;
-    let chunk_idx = offset / CHUNK_SIZE as u64;
-    let in_chunk_offset = (offset % CHUNK_SIZE as u64) as usize;
-
-    let ck = key::chunk_key(ino, chunk_idx);
-
-    if in_chunk_offset == 0 && data.len() == CHUNK_SIZE {
-        // Full chunk write
-        state.kv_put(&ck, data).await?;
-    } else {
-        // Partial chunk — read-modify-write
-        let mut chunk = match state.kv_get(&ck).await {
-            Ok(existing) => existing,
-            Err(_) => vec![0u8; CHUNK_SIZE],
-        };
-        let needed = in_chunk_offset + data.len();
-        if chunk.len() < needed {
-            chunk.resize(needed, 0);
-        }
-        chunk[in_chunk_offset..in_chunk_offset + data.len()].copy_from_slice(data);
-        state.kv_put(&ck, &chunk).await?;
-    }
-
-    Ok(())
-}
-
 /// Ensure the inode is loaded in the cache.
 async fn ensure_inode_cached(state: &mut FsState, ino: u64) -> Result<()> {
     if state.inodes.contains_key(&ino) {
@@ -193,6 +175,7 @@ async fn ensure_inode_cached(state: &mut FsState, ino: u64) -> Result<()> {
             write_buf: None,
             dirty: false,
             open_count: 0,
+            extents: None,
         },
     );
     Ok(())
@@ -214,39 +197,9 @@ pub async fn truncate(state: &mut FsState, ino: u64, new_size: u64) -> Result<()
     }
 
     if new_size < old_size {
-        // Shrink: delete chunks beyond new size
-        let last_valid_chunk = if new_size == 0 {
-            0
-        } else {
-            (new_size - 1) / CHUNK_SIZE as u64
-        };
-        let last_old_chunk = if old_size == 0 {
-            0
-        } else {
-            (old_size - 1) / CHUNK_SIZE as u64
-        };
-        let delete_from = if new_size == 0 {
-            0
-        } else {
-            last_valid_chunk + 1
-        };
-
-        for chunk_idx in delete_from..=last_old_chunk {
-            let ck = key::chunk_key(ino, chunk_idx);
-            let _ = state.kv_delete(&ck).await;
-        }
-
-        // Truncate partial chunk
-        if new_size > 0 {
-            let in_chunk_bytes = (new_size % CHUNK_SIZE as u64) as usize;
-            if in_chunk_bytes > 0 {
-                let ck = key::chunk_key(ino, last_valid_chunk);
-                if let Ok(mut chunk) = state.kv_get(&ck).await {
-                    chunk.truncate(in_chunk_bytes);
-                    state.kv_put(&ck, &chunk).await?;
-                }
-            }
-        }
+        // Shrink: delete extents past the new EOF + truncate the straddling one
+        // (F247 — variable-length extents keyed by logical offset).
+        extent::truncate_extents(state, ino, new_size, old_size).await?;
 
         // Handle inline data
         if has_inline {

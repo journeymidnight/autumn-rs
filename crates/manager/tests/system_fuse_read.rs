@@ -1,18 +1,20 @@
-//! F244-B — autumn-fuse read path now routes through the shared
-//! `ClusterClient::get_many_into` batch primitive (was a hand-rolled `join_all`).
+//! F247 — autumn-fuse variable-length extents (was fixed 256 KiB chunks).
 //!
-//! This exercises the real `read::prepare` + `read::execute` against a live
-//! cluster (manager + 2 EN + PS): seed a file's chunks + inode directly in the
-//! KV, then read it back via `read::read` and assert byte-exactness across the
-//! paths F244-B touches:
-//!   - multi-chunk full read (3 × 256 KiB-ish chunks → 3 `GetManyItem`s)
-//!   - whole 256 KiB chunk (>= 64 KiB → the ZC `MSG_GET_ZC` branch)
-//!   - small sub-range (< 64 KiB → the regular `MSG_GET` branch)
-//!   - cross-chunk sub-range (offset/length spanning two chunks)
+//! Exercises the REAL write + read paths against a live cluster (manager + 2 EN
+//! + PS): write a multi-extent file through `write::write` / `flush_inode` (so
+//! the extent KV keys are produced by the code under test), then assert:
+//!   - the persisted layout is variable-length extents keyed by LOGICAL OFFSET
+//!     (`[0x03][ino][off BE]`): a 10 MiB file → extents at off 0 and off 8 MiB
+//!     (`MAX_EXTENT` = 8 MiB), NOT 40 × 256 KiB chunks.
+//!   - full multi-extent read round-trips byte-exactly
+//!   - whole-extent read (8 MiB ≥ 64 KiB → ZC `MSG_GET_ZC` branch)
+//!   - small sub-range (< 64 KiB → regular `MSG_GET` branch)
+//!   - cross-extent sub-range (spans the 8 MiB boundary)
+//!   - EOF-clamped read
+//!   - truncate drops the past-EOF extent + shrinks the straddling one
+//!   - `delete_all_extents` (unlink path) range-scan-deletes every extent
 //!
-//! (The kernel FUSE mount layer is unchanged by F244-B; a mount probe confirmed
-//! the env can mount, but the read *logic* is what changed, so we drive it
-//! directly through `FsState`.)
+//! Driven directly through `FsState` (the kernel FUSE mount layer is unchanged).
 
 mod support;
 
@@ -21,8 +23,9 @@ use std::time::Duration;
 use autumn_client::ClusterClient;
 use autumn_rpc::client::RpcClient;
 
+use autumn_fuse::schema::MAX_EXTENT;
 use autumn_fuse::state::FsState;
-use autumn_fuse::{dispatch, key, meta, read};
+use autumn_fuse::{dispatch, extent, key, meta, read, write};
 
 use support::*;
 
@@ -57,13 +60,13 @@ async fn boot_cluster(
     let cluster = ClusterClient::connect(&mgr_addr.to_string())
         .await
         .expect("ClusterClient::connect");
-    cluster.set_rpc_timeout(Duration::from_secs(15));
+    cluster.set_rpc_timeout(Duration::from_secs(30));
     cluster
 }
 
 #[test]
 #[ignore]
-fn f244b_fuse_read_via_get_many_into() {
+fn f247_variable_length_extents() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -75,66 +78,75 @@ fn f244b_fuse_read_via_get_many_into() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        // Set up cluster + partition + PS (throwaway admin client).
-        let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 130, 13001).await;
+        let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 134, 13401).await;
 
-        // The fuse daemon connects fresh to the manager.
         let mut state = FsState::new(&mgr_addr.to_string())
             .await
             .expect("FsState::new");
         dispatch::init_root(&mut state).await.expect("init_root");
 
-        // A 600 KiB file = 3 chunks (256 KiB + 256 KiB + 88 KiB). CHUNK_SIZE is
-        // 256 KiB; the first two qualify for ZC (>= 64 KiB), as does the 88 KiB
-        // tail. The inode is NOT inline (> 4 KiB), so reads route to chunks.
-        let chunk = 256 * 1024usize;
-        let total = 2 * chunk + 88 * 1024;
+        // 10 MiB file → two variable-length extents: [0, 8 MiB) + [8 MiB, 10 MiB).
+        let total = 10 * 1024 * 1024usize;
         let data = pattern(total);
         let ino = 100u64;
 
-        for i in 0..3usize {
-            let start = i * chunk;
-            let end = (start + chunk).min(total);
-            state
-                .kv_put(&key::chunk_key(ino, i as u64), &data[start..end])
-                .await
-                .expect("put chunk");
-        }
-        let mut m = meta::new_file_meta(0o644, 0, 0);
-        m.size = total as u64;
-        m.inline_data = None;
+        // Create the inode (size 0), then write the whole file through the real
+        // buffered write path so the extent keys are produced by the code.
+        let m = meta::new_file_meta(0o644, 0, 0);
         meta::put_inode(&mut state, ino, &m)
             .await
             .expect("put_inode");
+        let n = write::write(&mut state, ino, 0, &data)
+            .await
+            .expect("write");
+        assert_eq!(n as usize, total, "write returned full length");
+        write::flush_inode(&mut state, ino).await.expect("flush");
 
-        // Full multi-chunk read.
+        // Layout: exactly 2 extents, keyed at logical offsets 0 and 8 MiB.
+        let prefix = key::extent_prefix(ino);
+        let keys = state
+            .kv_range_keys(&prefix, &prefix, 4096)
+            .await
+            .expect("range");
+        let mut offs: Vec<u64> = keys
+            .iter()
+            .filter_map(|k| key::parse_extent_key(k).map(|(_, o)| o))
+            .collect();
+        offs.sort_unstable();
+        assert_eq!(
+            offs,
+            vec![0, MAX_EXTENT as u64],
+            "10 MiB → extents at off 0 and 8 MiB (variable-length, not 256 KiB chunks)"
+        );
+
+        // Full multi-extent read.
         let full = read::read(&mut state, ino, 0, total as u32)
             .await
             .expect("full read");
         assert_eq!(full.len(), total, "full read length");
         assert!(full == data, "full read content mismatch");
 
-        // Whole first chunk (256 KiB → ZC MSG_GET_ZC branch).
-        let c0 = read::read(&mut state, ino, 0, chunk as u32)
+        // Whole first extent (8 MiB ≥ 64 KiB → ZC MSG_GET_ZC branch).
+        let e0 = read::read(&mut state, ino, 0, MAX_EXTENT as u32)
             .await
-            .expect("chunk0 read");
-        assert!(c0 == data[..chunk], "chunk0 mismatch");
+            .expect("extent0 read");
+        assert!(e0 == data[..MAX_EXTENT], "extent0 mismatch");
 
-        // Small sub-range within chunk 0 (4 KiB < 64 KiB → regular MSG_GET branch).
+        // Small sub-range (4 KiB < 64 KiB → regular MSG_GET branch).
         let sub = read::read(&mut state, ino, 1000, 4096)
             .await
             .expect("sub read");
         assert!(sub == data[1000..1000 + 4096], "sub-range mismatch");
 
-        // Cross-chunk sub-range: offset 200 KiB, len 100 KiB spans chunk 0 → 1.
-        let cross_off = 200 * 1024usize;
+        // Cross-extent sub-range: spans the 8 MiB boundary.
+        let cross_off = MAX_EXTENT - 50 * 1024;
         let cross_len = 100 * 1024usize;
         let cross = read::read(&mut state, ino, cross_off as i64, cross_len as u32)
             .await
             .expect("cross read");
         assert!(
             cross == data[cross_off..cross_off + cross_len],
-            "cross-chunk mismatch"
+            "cross-extent mismatch"
         );
 
         // Read past EOF returns just the tail.
@@ -143,5 +155,35 @@ fn f244b_fuse_read_via_get_many_into() {
             .expect("tail read");
         assert_eq!(tail.len(), 10, "EOF-clamped length");
         assert!(tail == data[total - 10..], "tail mismatch");
+
+        // Truncate to 5 MiB: drops the 8 MiB extent, shrinks extent 0's value.
+        let new_size = 5 * 1024 * 1024u64;
+        write::truncate(&mut state, ino, new_size)
+            .await
+            .expect("truncate");
+        let after = read::read(&mut state, ino, 0, total as u32)
+            .await
+            .expect("read after truncate");
+        assert_eq!(after.len(), new_size as usize, "truncated read length");
+        assert!(after == data[..new_size as usize], "truncated content");
+        let keys2 = state
+            .kv_range_keys(&prefix, &prefix, 4096)
+            .await
+            .expect("range2");
+        let offs2: Vec<u64> = keys2
+            .iter()
+            .filter_map(|k| key::parse_extent_key(k).map(|(_, o)| o))
+            .collect();
+        assert_eq!(offs2, vec![0], "8 MiB extent dropped by truncate");
+
+        // delete_all_extents (the unlink path) removes every extent key.
+        extent::delete_all_extents(&mut state, ino)
+            .await
+            .expect("delete_all_extents");
+        let keys3 = state
+            .kv_range_keys(&prefix, &prefix, 4096)
+            .await
+            .expect("range3");
+        assert!(keys3.is_empty(), "all extents deleted");
     });
 }

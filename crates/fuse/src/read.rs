@@ -1,26 +1,26 @@
-//! Read path: chunk-based read via the shared `ClusterClient::get_many_into`
-//! batch primitive (F244-B).
+//! Read path: variable-length-extent read via the shared
+//! `ClusterClient::get_many_into` batch primitive (F244-B + F247).
 //!
 //! Two-phase design (autumn-fuse perf fix #1):
-//! - `prepare`: under the dispatcher's `&mut FsState`, do cheap synchronous
-//!   work — flush an overlapping write buf, fetch inode meta, plan each chunk
-//!   (key + sub-range). Clones the `Rc<ClusterClient>` into the plan. NO route
-//!   pre-resolution: `get_many_into` routes per key (cached binary search), so
-//!   `execute` needs no `&FsState`.
+//! - `prepare`: under the dispatcher's `&mut FsState`, do cheap work — flush an
+//!   overlapping write buf, fetch inode meta, load the extent map (F247 runtime
+//!   cache; range-scan on cold), and plan each overlapping extent (key +
+//!   in-extent sub-range + absolute dest offset). Clones the `Rc<ClusterClient>`
+//!   into the plan. `get_many_into` routes per key, so `execute` needs no state.
 //! - `execute`: spawned task (see `dispatch.rs`). Pre-allocates the zero-filled
-//!   result, gives each chunk its own disjoint `&mut` slice, and issues ONE
-//!   `get_many_into` over all chunks (pipelined internally). Missing chunks
-//!   leave zeros (sparse-file semantics); a hard RPC/routing error surfaces as
-//!   `Err` (→ EIO), matching the pre-F244 prepare-time error.
+//!   result sized to the WHOLE read span, gives each extent its own disjoint
+//!   `&mut` slice at the right absolute position, and issues ONE `get_many_into`.
+//!   Sparse gaps between extents (and short/over-requested extents) stay zero; a
+//!   hard RPC/routing error surfaces as `Err` (→ EIO).
 //!
-//! F244-B consolidated the hand-rolled `join_all` fan-out onto the shared
-//! `get_many_into` (also used by the python kvcache `BatchClient`). Per-chunk ZC
-//! (`MSG_GET_ZC`) engages for chunks >= 64 KiB via `zc_worthwhile` (the 256 KiB
-//! `CHUNK_SIZE` qualifies); smaller chunks use the regular `MSG_GET` path
-//! (bounded by the client's 30 s `rpc_timeout`). **Tradeoff:** the ZC path has
-//! no per-call timeout (cancel-safety — the dest must outlive the recv), so a
-//! hung PS blocks a large-chunk read instead of erroring after 30 s. This is the
-//! F239/F216-E ZC tradeoff, accepted here for the copy elimination.
+//! F247: data is variable-length extents keyed by logical offset (was fixed
+//! 256 KiB chunks). The whole-extent reads are ≤ 8 MiB (`MAX_EXTENT`) so the
+//! `zc_worthwhile` (≥ 64 KiB) per-extent ZC path (`MSG_GET_ZC`) engages on every
+//! full-extent read — the win that motivated the move (model-file serving).
+//! Sub-64 KiB tail/sub-range reads use the regular `MSG_GET` path (bounded by
+//! the client's 30 s `rpc_timeout`). **Tradeoff:** the ZC path has no per-call
+//! timeout (cancel-safety — the dest must outlive the recv), so a hung PS blocks
+//! a large-extent read instead of erroring after 30 s (F239/F216-E tradeoff).
 
 use std::rc::Rc;
 
@@ -28,9 +28,9 @@ use anyhow::{anyhow, Result};
 
 use autumn_client::{ClusterClient, GetManyItem, BATCH_GET_DEFAULT_CONCURRENCY};
 
+use crate::extent;
 use crate::key;
 use crate::meta::get_inode;
-use crate::schema::*;
 use crate::state::FsState;
 use crate::write;
 
@@ -45,12 +45,15 @@ pub struct ReadPlan {
     pub chunks: Vec<ChunkSpec>,
 }
 
-/// One chunk to fetch: a KV key + the sub-range `[offset, offset+length)`
-/// wanted from its value.
+/// One extent slice to fetch: a KV key + the in-extent sub-range
+/// `[offset, offset+length)` wanted from its value + where it lands in the
+/// result buffer (`dest_offset`, absolute within the read span). `dest_offset`
+/// makes the result robust to sparse gaps between extents (the gap stays zero).
 pub struct ChunkSpec {
     pub key: Vec<u8>,
     pub offset: u32,
     pub length: u32,
+    pub dest_offset: usize,
 }
 
 /// Phase 1: dispatcher-side synchronous-ish prep. Holds `&mut state` briefly for
@@ -105,27 +108,23 @@ pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> R
         });
     }
 
-    // Chunked read: plan each chunk's key + sub-range. Routing happens later,
-    // inside `get_many_into` (cached binary search per key) — no `&state` needed
-    // in `execute`.
-    let first_chunk = offset / CHUNK_SIZE as u64;
-    let last_chunk = (read_end - 1) / CHUNK_SIZE as u64;
-    let mut chunks: Vec<ChunkSpec> = Vec::with_capacity((last_chunk - first_chunk + 1) as usize);
-    for chunk_idx in first_chunk..=last_chunk {
-        let chunk_start = chunk_idx * CHUNK_SIZE as u64;
-        let sub_offset = if offset > chunk_start {
-            (offset - chunk_start) as u32
-        } else {
-            0
-        };
-        let chunk_remaining = CHUNK_SIZE as u32 - sub_offset;
-        let bytes_left = (read_end - (chunk_start + sub_offset as u64)) as u32;
-        let sub_length = std::cmp::min(chunk_remaining, bytes_left);
-
+    // Variable-extent read: load the extent map (F247) and plan each extent that
+    // overlaps `[offset, read_end)`. Routing happens later inside `get_many_into`
+    // (cached binary search per key) — `execute` needs no `&state`.
+    let ext = extent::extents_snapshot(state, ino, file_size).await?;
+    let mut chunks: Vec<ChunkSpec> = Vec::new();
+    for &(start, len) in &ext {
+        let e_end = start + len as u64;
+        let ov_start = offset.max(start);
+        let ov_end = read_end.min(e_end);
+        if ov_start >= ov_end {
+            continue;
+        }
         chunks.push(ChunkSpec {
-            key: key::chunk_key(ino, chunk_idx),
-            offset: sub_offset,
-            length: sub_length,
+            key: key::extent_key(ino, start),
+            offset: (ov_start - start) as u32,
+            length: (ov_end - ov_start) as u32,
+            dest_offset: (ov_start - offset) as usize,
         });
     }
 
@@ -137,29 +136,36 @@ pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> R
     })
 }
 
-/// Phase 2: spawned task — one batched `get_many_into` over all chunks.
+/// Phase 2: spawned task — one batched `get_many_into` over all extent slices.
 ///
-/// Pre-allocates the zero-filled result and gives each chunk its OWN disjoint
-/// `&mut` sub-slice (sized to its `sub_length`). `get_many_into` writes each
-/// successful chunk straight into its slice (ZC into the slice for >= 64 KiB
-/// chunks); a missing chunk leaves zeros (sparse). A hard RPC/routing error on
-/// any chunk surfaces as `Err` so the dispatcher returns EIO.
+/// Pre-allocates the zero-filled result sized to the WHOLE read span and gives
+/// each extent slice its OWN disjoint `&mut` sub-slice at its absolute
+/// `dest_offset` (gaps between extents are skipped → stay zero, sparse-file
+/// semantics). `get_many_into` writes each successful extent straight into its
+/// slice (ZC for ≥ 64 KiB whole-extent reads); a missing/short extent leaves
+/// zeros. A hard RPC/routing error on any slice surfaces as `Err` → EIO.
 pub async fn execute(plan: ReadPlan) -> Result<Vec<u8>> {
     if let Some(inline) = plan.inline_result {
         return Ok(inline);
     }
     let actual_size = plan.actual_size;
     let client = plan.client;
-    let chunks = plan.chunks;
+    let mut chunks = plan.chunks;
+    // Sort by destination so the disjoint-slice carve walks forward.
+    chunks.sort_by_key(|c| c.dest_offset);
 
-    let total: usize = chunks.iter().map(|c| c.length as usize).sum();
-    let mut result = vec![0u8; total];
+    let mut result = vec![0u8; actual_size];
     let mut rest = result.as_mut_slice();
+    let mut consumed = 0usize;
     let mut dests: Vec<&mut [u8]> = Vec::with_capacity(chunks.len());
     for c in &chunks {
-        let (head, tail) = rest.split_at_mut(c.length as usize);
+        // Skip the gap before this extent (left zero-filled), then carve its slice.
+        let gap = c.dest_offset - consumed;
+        let (_, after_gap) = rest.split_at_mut(gap);
+        let (head, tail) = after_gap.split_at_mut(c.length as usize);
         dests.push(head);
         rest = tail;
+        consumed = c.dest_offset + c.length as usize;
     }
 
     let mut items: Vec<GetManyItem> = chunks
@@ -179,14 +185,13 @@ pub async fn execute(plan: ReadPlan) -> Result<Vec<u8>> {
     drop(items); // release the &mut borrows of `result`
 
     // Propagate a hard RPC/routing failure (pre-F244 surfaced this at
-    // prepare-time as EIO); `Ok(None)` (missing chunk) stays sparse-zero-filled.
+    // prepare-time as EIO); `Ok(None)` (missing extent) stays sparse-zero-filled.
     for r in &results {
         if let Err(e) = r {
-            return Err(anyhow!("chunk read failed: {e}"));
+            return Err(anyhow!("extent read failed: {e}"));
         }
     }
 
-    result.truncate(actual_size);
     Ok(result)
 }
 
