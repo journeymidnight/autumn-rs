@@ -76,6 +76,16 @@ struct Args {
     /// CQE wait idle backoff in microseconds.
     #[arg(long, default_value_t = 1)]
     idle_us: u64,
+
+    /// Per-slot buffer size (bytes). MUST be >= read_size. Default 1 MiB; bump
+    /// to e.g. 8388608 for whole-extent (8 MiB) reads (F243 perf compare).
+    #[arg(long, default_value_t = 1024 * 1024)]
+    slot_size: u32,
+
+    /// Per-client buffer-pool size (bytes). Holds num_slots = pool/slot buffers;
+    /// must fit depth+1 slots. Default 64 MiB.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    pool_size: u64,
 }
 
 fn main() -> Result<()> {
@@ -171,7 +181,12 @@ fn worker(
     } else {
         args.socket.clone()
     };
-    let mut client = match IoRingClient::connect(&socket_path) {
+    // F243: negotiate slot/pool sizes so whole-extent (8 MiB) reads fit a slot
+    // (validate_slice requires read_size <= slot_size).
+    let mut hello = autumn_ioring::handshake::HelloRequest::defaults();
+    hello.buf_slot_size = args.slot_size;
+    hello.buf_pool_size = args.pool_size;
+    let mut client = match IoRingClient::connect_with(&socket_path, hello) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(tid, socket = %socket_path.display(), error = %e, "client connect failed");

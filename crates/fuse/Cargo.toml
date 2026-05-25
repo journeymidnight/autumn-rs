@@ -12,10 +12,13 @@ required-features = ["fuse"]
 [features]
 default = ["fuse"]
 fuse = ["dep:fuser", "dep:libc", "dep:clap", "dep:crossbeam-channel", "dep:futures", "dep:compio", "dep:rand", "dep:tracing-subscriber"]
+# Build the mount binary with UCX so `--transport ucx` works against a UCX cluster.
+ucx = ["autumn-transport/ucx", "autumn-client/ucx"]
 
 [dependencies]
 autumn-rpc = { path = "../rpc" }
 autumn-client = { path = "../client" }
+autumn-transport = { path = "../transport" }
 
 anyhow.workspace = true
 bytes.workspace = true

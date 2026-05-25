@@ -36,6 +36,11 @@ struct Args {
     /// Allow other users to access the mount
     #[arg(long, default_value = "false")]
     allow_other: bool,
+
+    /// Transport backend: `tcp` (default) or `ucx`. Must match the cluster's
+    /// transport (the ClusterClient talks to the PS over it).
+    #[arg(long, default_value = "tcp")]
+    transport: String,
 }
 
 fn main() -> Result<()> {
@@ -46,6 +51,14 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // Select the transport process-wide before the compio thread connects.
+    let tk = autumn_transport::parse_transport_flag(&args.transport).unwrap_or_else(|bad| {
+        eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
+        std::process::exit(2);
+    });
+    autumn_transport::init_with(tk);
+
     let mountpoint = args.mountpoint.clone();
 
     tracing::info!(

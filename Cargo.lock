@@ -201,6 +201,7 @@ dependencies = [
  "anyhow",
  "autumn-client",
  "autumn-rpc",
+ "autumn-transport",
  "bytes",
  "clap",
  "compio",

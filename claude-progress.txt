@@ -1,8 +1,36 @@
 Date: 2026-05-25
+TaskStatus: completed
+Task scope: F243-C — UCX/TCP daemon perf comparison (final part of the /loop
+  "完成 247, 248, 243 ucx,tcp 测试性能对比" series). ALL THREE (247+248+243) DONE.
+
+F243-C done (this iteration):
+  Support changes: autumn-fuse +--transport flag + ucx feature (need a UCX writer
+    to seed files on a UCX cluster); ioring-bench +--slot-size/--pool-size (8 MiB
+    reads need slot>=8 MiB; default 1 MiB; via connect_with).
+  Method: host has 8x mlx5 RoCE; eth0=mlx5_1=[fdbd:dc62:3:302::14]. Env
+    UCX_TLS=^sysv,posix + UCX_NET_DEVICES=mlx5_1:1 (per project_ucx memories).
+    Brought up TCP cluster then UCX cluster (full stack each); seeded 64 MiB file
+    via fuse mount (dd bs=1M count=64 = 8x 8 MiB extents); daemon + ioring-bench
+    --read-size 8388608 --threads 8 --depth 2 --duration 5.
+  RESULT (8 MiB whole-extent reads, intra-host, 3 samples):
+    TCP 1147/1035/1384 -> avg ~1189 MB/s
+    UCX 2894/2608/2856 -> avg ~2786 MB/s
+    => UCX = 2.34x TCP (exactly matches project_ucx_zerocopy_default "8M 2.34x").
+  Daemon log: "ring region registered for UCX RDMA" fired per client (8x, 0 fail)
+    -> F243 ucp_mem_map ring registration + RDMA ZC reads INTO the ring are real.
+  Absolute throughput capped by single-partition PS single core (same as F244-C);
+  the TCP-vs-UCX RELATIVE delta is the transport/ZC effect being measured.
+  Verified: touched crates build+clippy(-D warnings)+fmt clean; cluster torn down.
+
+SERIES COMPLETE: F247 (fuse 变长 extent) + F248 (io_uring daemon reads fuse files)
+  + F243 (UCX ring ZC + 2.34x perf). All committed + pushed.
+
+--- prior iteration ---
+Date: 2026-05-25
 TaskStatus: not_completed
 Task scope: F243 — io_uring daemon UCX ring registration + ZC reads INTO ring +
   UCX/TCP perf compare. Part 3 of the /loop series. A+B DONE+committed; C (the
-  perf comparison) PENDING -> TaskStatus not_completed until C lands.
+  perf comparison) PENDING.
 
 F243-A+B done (committed e5566fb this iteration):
   ENV DISCOVERY: this host has 8x mlx5 RoCE + libucp; --features ucx compiles+
