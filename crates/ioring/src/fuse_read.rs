@@ -159,44 +159,59 @@ pub fn plan_read(opened: &OpenedExtents, off: u64, len: u32) -> (usize, Vec<Exte
     (actual, slices)
 }
 
-/// Read `[off, off+len)` of an opened fuse file into a freshly-allocated buffer,
-/// fanning out across the covering extents via `get_many_into`. Sparse gaps /
-/// short extents zero-fill. Returns the EOF-clamped bytes (may be shorter than
-/// `len`, empty at/after EOF).
-pub async fn read(
+/// F243 — read `[off, off+len)` of an opened fuse file DIRECTLY into `dest`,
+/// fanning out across the covering extents via `get_many_into`. Returns the
+/// EOF-clamped byte count `n` (`dest[..n]` filled; sparse gaps / short extents
+/// zero-filled). `dest.len()` MUST be ≥ the clamped length (the daemon passes a
+/// ring buffer-pool slot of `sqe.length`).
+///
+/// `reg`: when `Some` (the ring region is `ucp_mem_map`-registered, F243 on UCX),
+/// each ≥64 KiB extent lands in `dest` via RDMA with NO CPU copy — the read win
+/// for large model-file extents. `None` (TCP / unregistered) → `get_many_into`
+/// recvs into `dest` (one kernel copy, no rkyv wrap). Either way `dest` is the
+/// FINAL destination — there is no intermediate buffer + memcpy (the pre-F243
+/// daemon path); only true sparse holes are memset.
+pub async fn read_into(
     cluster: &ClusterClient,
     opened: &OpenedExtents,
     off: u64,
     len: u32,
-) -> Result<Vec<u8>> {
+    dest: &mut [u8],
+    reg: Option<&autumn_rpc::RegisteredMem>,
+) -> Result<usize> {
     let (actual, mut slices) = plan_read(opened, off, len);
     if actual == 0 {
-        return Ok(Vec::new());
+        return Ok(0);
     }
+    debug_assert!(dest.len() >= actual, "dest too small for clamped read");
     slices.sort_by_key(|s| s.dest_offset);
 
-    let mut buf = vec![0u8; actual];
-    let mut rest = buf.as_mut_slice();
+    // Carve `dest[..actual]` into disjoint sub-slices, one per overlapping
+    // extent, zeroing only the gaps BETWEEN extents (sparse holes — empty for a
+    // contiguous file, so the common path does no memset and stays full ZC).
+    let mut rest = &mut dest[..actual];
     let mut consumed = 0usize;
     let mut dests: Vec<&mut [u8]> = Vec::with_capacity(slices.len());
     for sl in &slices {
         let gap = sl.dest_offset - consumed;
-        let (_, after_gap) = rest.split_at_mut(gap);
+        let (gap_buf, after_gap) = rest.split_at_mut(gap);
+        gap_buf.fill(0); // sparse hole before this extent
         let (head, tail) = after_gap.split_at_mut(sl.length as usize);
         dests.push(head);
         rest = tail;
         consumed = sl.dest_offset + sl.length as usize;
     }
+    rest.fill(0); // trailing sparse hole (rest = dest[consumed..actual])
 
     let mut items: Vec<GetManyItem> = slices
         .iter()
         .zip(dests)
-        .map(|(sl, dest)| GetManyItem {
+        .map(|(sl, d)| GetManyItem {
             key: &sl.key,
             offset: sl.offset,
             length: sl.length,
-            dest,
-            reg: None,
+            dest: d,
+            reg,
         })
         .collect();
     let results = cluster
@@ -208,6 +223,24 @@ pub async fn read(
             return Err(anyhow!("extent read failed: {e}"));
         }
     }
+    Ok(actual)
+}
+
+/// Convenience: read into a freshly-allocated `Vec` (no UCX registration → the
+/// TCP recv-into-dest path). Delegates to [`read_into`]; used by tests and any
+/// non-ring caller.
+pub async fn read(
+    cluster: &ClusterClient,
+    opened: &OpenedExtents,
+    off: u64,
+    len: u32,
+) -> Result<Vec<u8>> {
+    let (actual, _) = plan_read(opened, off, len);
+    if actual == 0 {
+        return Ok(Vec::new());
+    }
+    let mut buf = vec![0u8; actual];
+    read_into(cluster, opened, off, len, &mut buf, None).await?;
     Ok(buf)
 }
 

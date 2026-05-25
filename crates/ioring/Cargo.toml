@@ -24,7 +24,12 @@ default = []
 # core protocol crate (`lib`) builds without these deps so it can be
 # linked into a Python pyo3 binding (F180-D) without the heavy
 # transitive compio chain.
-daemon = ["dep:autumn-client", "dep:autumn-rpc", "dep:autumn-fuse", "dep:compio", "dep:futures", "dep:anyhow", "dep:tracing-subscriber", "dep:clap"]
+daemon = ["dep:autumn-client", "dep:autumn-rpc", "dep:autumn-fuse", "dep:autumn-transport", "dep:compio", "dep:futures", "dep:anyhow", "dep:tracing-subscriber", "dep:clap"]
+# F243: build the daemon with UCX so it can `--transport ucx` AND `ucp_mem_map`-
+# register the ring region for RDMA zero-copy reads INTO the ring. Needs the ucx
+# feature all the way down (transport → rpc → client). On a non-UCX build the
+# daemon still runs (TCP, ring registration is a no-op / None).
+ucx = ["daemon", "autumn-client/ucx", "autumn-transport/ucx"]
 # `bench` is the read-throughput harness. Lighter dep set (no compio,
 # no autumn-client) — uses std threads + the IoRingClient API.
 bench = ["dep:clap", "dep:anyhow", "dep:tracing-subscriber"]
@@ -43,6 +48,9 @@ autumn-rpc = { path = "../rpc", optional = true }
 # excludes the heavy `fuse` feature (fuser/compio mount layer) — we only need
 # the key encoding + rkyv schema decoders.
 autumn-fuse = { path = "../fuse", optional = true, default-features = false }
+# F243: transport init (--transport tcp|ucx) + `register_memory` (ucp_mem_map of
+# the ring region). The `ucx` feature flows through to enable RDMA.
+autumn-transport = { path = "../transport", optional = true }
 compio = { version = "0.18", features = ["net", "io", "macros", "time", "fs"], optional = true }
 futures = { version = "0.3", optional = true }
 anyhow = { workspace = true, optional = true }

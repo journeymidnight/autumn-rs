@@ -20,8 +20,9 @@
 //!                                              cache on ring_fd; reply CQE(fd)
 //!   submit SQE_READ(ring_fd, off, len, buf)   dispatch (F248): fan out across
 //!     wait CQE                                  the covering F247 extents'
-//!                                                sub-ranges via get_many_into
-//!                                                → memcpy into ring → CQE(n)
+//!                                                sub-ranges via get_many_into,
+//!                                                recv/RDMA (F243) into the ring
+//!                                                slot directly → CQE(n)
 //! ```
 //!
 //! Multi-runtime mode (`--runtimes N` > 1):
@@ -53,6 +54,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use autumn_client::ClusterClient;
+use autumn_rpc::RegisteredMem;
 use clap::Parser;
 
 use autumn_ioring::cqe::Cqe;
@@ -91,6 +93,12 @@ struct Args {
     /// Microseconds. Default 100 µs.
     #[arg(long, default_value_t = 100)]
     idle_poll_us: u64,
+
+    /// Transport backend: `tcp` (default) or `ucx`. F243: with `ucx` the daemon
+    /// registers each ring region (`ucp_mem_map`) so ≥64 KiB extent reads land
+    /// in the ring via RDMA zero-copy. Requires a binary built `--features ucx`.
+    #[arg(long, default_value = "tcp")]
+    transport: String,
 }
 
 /// Compute the per-runtime socket path. With N=1 returns `base`
@@ -113,6 +121,14 @@ fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
+
+    // F243: select the transport once, process-wide, BEFORE spawning runtimes
+    // (the ClusterClient + ring registration use the process-global transport).
+    let tk = autumn_transport::parse_transport_flag(&args.transport).unwrap_or_else(|bad| {
+        eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
+        std::process::exit(2);
+    });
+    autumn_transport::init_with(tk);
 
     if let Some(parent) = args.socket.parent() {
         if !parent.as_os_str().is_empty() {
@@ -266,6 +282,32 @@ async fn handle_session(
 // extent map), resolved once at Open. Was a single flat KV key + cached PS.
 use autumn_ioring::fuse_read::{self, OpenedExtents};
 
+/// F243: register the ring region with the process-global UCX context so reads
+/// can RDMA-land directly into it. Returns `None` on a non-UCX build or if
+/// registration fails (e.g. RLIMIT_MEMLOCK) — the daemon then falls back to the
+/// transport's recv-into-dest (TCP) with no extra copy beyond the kernel one.
+#[cfg(feature = "ucx")]
+fn register_ring(base: *mut u8, len: usize) -> Option<RegisteredMem> {
+    match autumn_transport::register_memory(base as *mut std::ffi::c_void, len) {
+        Ok(r) => {
+            tracing::info!(
+                len,
+                "F243: ring region registered for UCX RDMA zero-copy reads"
+            );
+            Some(r)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "F243: ring UCX registration failed; falling back to copy-recv");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "ucx"))]
+fn register_ring(_base: *mut u8, _len: usize) -> Option<RegisteredMem> {
+    None
+}
+
 async fn poller_loop(
     region: MmapRegion,
     header: RingHeader,
@@ -275,6 +317,19 @@ async fn poller_loop(
     _memfd: std::os::unix::io::OwnedFd,
 ) -> Result<()> {
     let region: Rc<RefCell<MmapRegion>> = Rc::new(RefCell::new(region));
+    // F243: capture the mmap's STABLE base ptr + register the region for UCX. The
+    // base never moves (mmap is fixed for the region's life, kept alive by the
+    // `region` Rc), so Read can build a raw `&mut` into a buffer-pool slot — held
+    // across the get await — WITHOUT taking the RefCell (which serves only the
+    // SQ/CQ ring header). Slot disjointness is guaranteed by `validate_slice`
+    // (slot-aligned + length ≤ slot_size) + the client owning slot allocation.
+    let (data_base, region_len) = {
+        let mut r = region.borrow_mut();
+        let len = r.len();
+        (r.as_mut_slice().as_mut_ptr(), len)
+    };
+    let ring_reg = register_ring(data_base, region_len);
+    let reg_ref = ring_reg.as_ref();
     let ring_fds: Rc<RefCell<HashMap<u32, OpenedExtents>>> = Rc::new(RefCell::new(HashMap::new()));
     let next_fd: Rc<Cell<u32>> = Rc::new(Cell::new(1));
     let backoff = Duration::from_micros(idle_us);
@@ -301,8 +356,21 @@ async fn poller_loop(
             let cluster_c = cluster.clone();
             let ring_fds_c = ring_fds.clone();
             let next_fd_c = next_fd.clone();
+            // `data_base` (Copy raw ptr) + `reg_ref` (Copy ref into `ring_reg`,
+            // which outlives `inflight`) are captured by the future; the Read arm
+            // builds its dest slice from them.
             inflight.push(async move {
-                service_sqe(sqe, &region_c, &header, &cluster_c, &ring_fds_c, &next_fd_c).await
+                service_sqe(
+                    sqe,
+                    &region_c,
+                    &header,
+                    &cluster_c,
+                    &ring_fds_c,
+                    &next_fd_c,
+                    data_base,
+                    reg_ref,
+                )
+                .await
             });
         }
         // CQ side: idle → back off; else await ONE completion (this polls all
@@ -329,6 +397,7 @@ fn push_cqe(region: &Rc<RefCell<MmapRegion>>, header: RingHeader, cqe: Cqe) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn service_sqe(
     sqe: Sqe,
     region: &Rc<RefCell<MmapRegion>>,
@@ -336,6 +405,9 @@ async fn service_sqe(
     cluster: &ClusterClient,
     ring_fds: &Rc<RefCell<HashMap<u32, OpenedExtents>>>,
     next_fd: &Rc<Cell<u32>>,
+    // F243: stable mmap base + (optional) UCX registration for ZC-into-ring reads.
+    data_base: *mut u8,
+    reg: Option<&RegisteredMem>,
 ) -> Cqe {
     match sqe.opcode {
         Opcode::Nop => Cqe::ok(sqe.user_data, 0),
@@ -378,11 +450,10 @@ async fn service_sqe(
                 return Cqe::err(sqe.user_data, libc::EINVAL);
             }
             // F248: snapshot the opened file's extent map under a brief borrow,
-            // then fan out across the OVERLAPPING extents' exact sub-ranges via
-            // `get_many_into` (no whole-value amplification; passes
-            // `sqe.offset/length` through). `fuse_read::read` reads into its OWN
-            // buffer (no region borrow held across the await — concurrent SQEs
-            // keep working), which we then copy into the ring once.
+            // then (F243) fan out across the OVERLAPPING extents' exact sub-ranges
+            // DIRECTLY into the ring buffer slot — no whole-value amplification,
+            // no intermediate buffer + copy. On UCX (reg=Some) ≥64 KiB extents
+            // RDMA-land in the ring; on TCP the transport recvs into it.
             let opened = {
                 let fds = ring_fds.borrow();
                 match fds.get(&sqe.ring_fd) {
@@ -394,17 +465,25 @@ async fn service_sqe(
                     None => return Cqe::err(sqe.user_data, libc::EBADF),
                 }
             };
-            let buf = match fuse_read::read(cluster, &opened, sqe.offset, sqe.length).await {
-                Ok(b) => b,
+            // SAFETY: `validate_slice` (above) guarantees the slot is in-bounds,
+            // slot-aligned, and length ≤ slot_size → contained in ONE buffer-pool
+            // slot. The client owns slot allocation and never reuses a slot with a
+            // Read in flight, so this `&mut` is disjoint from every other in-flight
+            // Read's. `data_base` is the stable mmap base (kept alive by the
+            // `region` Rc); the SQ/CQ ring header is a disjoint area accessed only
+            // via the RefCell, so this raw write never aliases it.
+            let dest: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    data_base.add(sqe.buf_offset as usize),
+                    sqe.length as usize,
+                )
+            };
+            let n = match fuse_read::read_into(cluster, &opened, sqe.offset, sqe.length, dest, reg)
+                .await
+            {
+                Ok(n) => n,
                 Err(_) => return Cqe::err(sqe.user_data, libc::EIO),
             };
-            let n = buf.len();
-            if n > 0 {
-                let mut r = region.borrow_mut();
-                let dst =
-                    &mut r.as_mut_slice()[sqe.buf_offset as usize..sqe.buf_offset as usize + n];
-                dst.copy_from_slice(&buf);
-            }
             Cqe::ok(sqe.user_data, n as u64)
         }
 

@@ -222,6 +222,7 @@ dependencies = [
  "autumn-client",
  "autumn-fuse",
  "autumn-rpc",
+ "autumn-transport",
  "bytes",
  "clap",
  "compio",
