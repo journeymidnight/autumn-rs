@@ -4003,3 +4003,20 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   - `cargo test -p autumn-manager --lib recovery` green (18, incl. `backoff_increments_and_caps` extended to assert `backoff_snapshot` reason + `next_retry_at`).
   - `system_merge --ignored` full suite green + repeated `split_merge_split_with_concurrent_writes` runs green.
 - **passes:** true (2026-05-24).
+
+### F234 · Unify the ZC read/write selection rule across callers (size-thresholded, transport-independent reads)
+- **Trigger:** User, probing the proposed SDK-layer fuse `get_many` design — "在SDK层连接上流水线用 MSG_GET_ZC, 为什么不用MSG_GET呢?" then "不对啊,TCP确定没有MSG_GET_ZC吗?". The second is correct: I had quoted a STALE `client/CLAUDE.md` line ("on TCP both ops use the regular path") that predates F219. Investigation found the ZC selection was inconsistent across the two callers AND self-contradictory:
+  - `perf-check` (`autumn_client.rs:1471`): read = `is_ucx || size>=64K` → forces ZC on UCX **small** reads (the ~18% regression case), contradicting its own adjacent comment ("reads ZC on UCX only when big enough").
+  - `python BatchClient` (`lib.rs:815/852`): read = `is_ucx && size>=64K`, write = `if is_ucx` → **pre-F219** "UCX-only" convention; skips ZC for **TCP large** reads (misses recv-into-dest: drops owned-`Vec` alloc + the second memcpy) and **TCP large** writes (misses MSG_PUT_ZC).
+  - `client/CLAUDE.md`: documented "on TCP both ops use the regular path" — stale since F219 added TCP-large ZC.
+- **Decision (the one convention, reconciling F216-E + F219 + the −18% A/B):**
+  - **WRITE = `is_ucx || size >= UCX_ZC_READ_MIN_BYTES`** — UCX cheaper at every size (no small-size downside → no guard on UCX); TCP large via MSG_PUT_ZC (F219).
+  - **READ = `size >= UCX_ZC_READ_MIN_BYTES`, transport-independent** — UCX small regresses ~18% (registered-recv setup > copy saved); TCP small has no copy win + is QPS-critical; both large win (UCX RDMA-into-dest; TCP recv-into-dest drops the GetResp rkyv wrap + Vec alloc).
+  - The read/write asymmetry is intentional (UCX writes have no small-size downside; UCX reads do).
+- **Changes:**
+  - `autumn_client.rs` perf-check: `zc_read = is_ucx || ...` → `zc_read = value_size >= UCX_ZC_READ_MIN_BYTES` (write line unchanged — already correct). Comment rewritten.
+  - `python/src/lib.rs` BatchClient: read `is_ucx && it.len>=64K` → `it.len >= 64K`; write `if is_ucx` → `if is_ucx || it.len >= 64K`. `is_ucx` still used by the write arm, so no dead param. Comments rewritten.
+  - `client/CLAUDE.md`: replaced the stale "UCX-only / TCP regular" convention with the unified WRITE/READ rule + the asymmetry rationale + a "do not reintroduce the pre-F219 rule" note.
+- **Behaviour delta:** UCX neutral on both callers (large→ZC, small-read→regular both before/after on UCX, except perf-check UCX-small-read which was the bug). TCP gains: perf-check unchanged (`is_ucx||large`==`large` on TCP); python now ZCs TCP-large reads + writes (strict copy reduction). No wire/protocol change — pure caller-side selection.
+- **Acceptance:** `cargo build -p autumn-server` clean; `cargo check --manifest-path python/Cargo.toml` clean (python is workspace-excluded; not in CI); clippy `--all-targets -D warnings` (sans autumn-fuse) EXIT=0; fmt clean.
+- **passes:** true (2026-05-25).

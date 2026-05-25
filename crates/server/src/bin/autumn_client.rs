@@ -1456,19 +1456,21 @@ async fn main() -> Result<()> {
             group_commit_cap,
         } => {
             let pipeline_depth = pipeline_depth.max(1);
-            // F216-E "ucx ⟹ zerocopy": writes always ZC on UCX (cheaper at every
-            // size); reads ZC on UCX only when the value is big enough to repay
-            // the registered-recv overhead (small reads regress — see
-            // UCX_ZC_READ_MIN_BYTES).
-            // F219: on TCP, LARGE writes also go ZC (MSG_PUT_ZC) — the PS recvs
-            // the value straight into a pooled buffer (no decoder copy) and the
-            // client drops the rkyv encode. LARGE reads also go ZC (MSG_GET_ZC /
-            // get_into) — the client recvs the value straight into its dest
-            // (recv-into-dest), and the PS→EN hop already recv-into-pools. Small
-            // ops stay regular on TCP: at 4 KiB a vectored put_zc / registered
-            // recv has no copy win and the hot path is QPS-critical.
+            // ZC ("ucx ⟹ zerocopy", F216-E + F219 + F234) selection — ONE rule,
+            // shared with the python BatchClient. `UCX_ZC_READ_MIN_BYTES` is the
+            // single source of truth.
+            //   WRITE: is_ucx || size >= 64K. UCX writes are cheaper at EVERY size
+            //     (drop the to_vec/clone/rkyv copies — no small-size downside), so
+            //     no size guard on UCX; TCP writes go ZC only when large (F219:
+            //     MSG_PUT_ZC, the PS recvs into a pooled buffer, no decoder copy).
+            //   READ: size >= 64K, INDEPENDENT of transport. UCX small reads regress
+            //     ~18% (registered-recv setup > the copy saved); TCP small reads have
+            //     no copy win and the hot path is QPS-critical. Both large reads win
+            //     (UCX RDMA-into-dest; TCP recv-into-dest drops the GetResp rkyv wrap
+            //     + the owned-Vec alloc). F234: the old `is_ucx || large` here forced
+            //     ZC on UCX small reads against this rule — fixed to plain `large`.
             let zc_write = is_ucx || value_size >= autumn_client::UCX_ZC_READ_MIN_BYTES;
-            let zc_read = is_ucx || value_size >= autumn_client::UCX_ZC_READ_MIN_BYTES;
+            let zc_read = value_size >= autumn_client::UCX_ZC_READ_MIN_BYTES;
             let zc_tag = match (zc_write, zc_read) {
                 (true, true) => " [ZC: MSG_PUT_ZC + MSG_GET_ZC]",
                 (true, false) => " [ZC: MSG_PUT_ZC; read regular]",

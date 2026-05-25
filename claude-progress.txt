@@ -1,5 +1,29 @@
 Date: 2026-05-25
 TaskStatus: completed
+Task scope: F234 — unify the ZC read/write selection rule across callers
+  (perf-check + python BatchClient) + fix stale client/CLAUDE.md. Came out of a
+  Q&A on the SDK-layer fuse get_many design; user caught that I'd quoted a stale
+  "on TCP both ops use the regular path" doc line.
+
+Summary (F234):
+  - Found 3 divergent ZC-selection sites: perf-check read `is_ucx || large`
+    (forces ZC on UCX small → -18% regress, contradicts its own comment); python
+    read `is_ucx && large` + write `if is_ucx` (pre-F219 UCX-only → skips TCP
+    large); client/CLAUDE.md "on TCP both ops use the regular path" (stale).
+  - Unified rule (F216-E + F219 + the -18% A/B): WRITE = is_ucx || size>=64K
+    (UCX no small-size downside; TCP large via MSG_PUT_ZC); READ = size>=64K
+    transport-independent (UCX small regresses; TCP small no win; both large win).
+  - Edits: autumn_client.rs zc_read → size>=64K; python read → size>=64K, write
+    → is_ucx || size>=64K; client/CLAUDE.md convention rewritten + "don't
+    reintroduce pre-F219 rule" note. No wire change — pure caller-side selection.
+  Verified: cargo build -p autumn-server clean; cargo check python clean; clippy
+  --all-targets -D warnings (sans autumn-fuse) EXIT=0; workspace fmt clean (the
+  24 python fmt diffs are pre-existing + python is workspace-excluded). NOT
+  committed yet. feature_list F234 passes:true.
+
+----- previous task (completed 2026-05-25) -----
+Date: 2026-05-25
+TaskStatus: completed
 Task scope: FCI-02 — refresh the 3 stale perf benches to current APIs + restore
   --all-targets in the CI clippy gate. User: "FCI-02".
 

@@ -39,15 +39,29 @@ Main entry point. Connect via `ClusterClient::connect("addr1,addr2")`.
 **F216-E "ucx ⟹ zerocopy" default + `UCX_ZC_READ_MIN_BYTES`.** The SDK exposes
 both the regular (`get`/`put`) and zero-copy (`get_into`/`put_zc`) ops; choosing
 between them is the CALLER's job (perf-check, python `BatchClient`, the kvcache
-adapter). The convention — established by a perf_check A/B and enforced uniformly
-across those callers — is: **on the UCX transport use ZC for writes always**
-(MSG_PUT_ZC is cheaper at every size: it drops the `to_vec`+clone+rkyv encode the
-regular `put` does), **and for reads only when the value ≥ `UCX_ZC_READ_MIN_BYTES`
-(64 KiB)**. Below that, `get_into`'s registered-recv per-op overhead
-(`regpool_acquire` + `UCP_OP_ATTR_FIELD_MEMH` + 2-stage header/value recv)
-exceeds the small copy it saves, so a small read regresses (~18% at 4 KiB in the
-A/B); at/above it ZC is parity→2.3× (8 MiB, the R4 fully-zero-copy read path). On
-TCP both ops use the regular path. There is no longer a `--zc` / `zc=` flag —
+adapter). The convention — established by a perf_check A/B, **uniform across both
+transports and all callers** (F234) — is **size-thresholded on
+`UCX_ZC_READ_MIN_BYTES` (64 KiB)**, with one deliberate read/write asymmetry:
+
+- **WRITE: `is_ucx || size ≥ 64 KiB`.** UCX writes are cheaper at *every* size
+  (MSG_PUT_ZC drops the `to_vec`+clone+rkyv encode the regular `put` does), so
+  there is **no size guard on UCX**. On TCP, writes go ZC only when large (F219:
+  the PS recvs the value straight into a pooled buffer, no decoder copy).
+- **READ: `size ≥ 64 KiB`, independent of transport.** Below 64 KiB, `get_into`'s
+  registered-recv per-op overhead (`regpool_acquire` + `UCP_OP_ATTR_FIELD_MEMH` +
+  2-stage header/value recv) exceeds the small copy it saves, so a small UCX read
+  regresses (~18% at 4 KiB in the A/B); on TCP a small read has no copy win and
+  the path is QPS-critical. At/above 64 KiB ZC wins on **both** transports — UCX
+  RDMA-into-dest (parity→2.3× at 8 MiB, the R4 fully-zero-copy read path); TCP
+  recv-into-dest drops the GetResp rkyv wrap + the owned-`Vec` alloc (F219).
+
+The asymmetry (writes `is_ucx || large`, reads `large`) is intentional: UCX writes
+have **no** small-size downside, UCX reads **do** (the registered-recv setup).
+**Pre-F219 the stale rule was "UCX-only ZC; on TCP both ops use the regular path"
+— that no longer holds; do not reintroduce it.** F234 fixed two divergences that
+had crept in: perf-check forced ZC on UCX *small reads* (`is_ucx || large`), and
+the python `BatchClient` skipped ZC on TCP *large* reads/writes (`is_ucx && large`
+/ `if is_ucx`). There is no longer a `--zc` / `zc=` flag —
 callers derive the decision from the transport (`is_ucx`) + the value size. The
 const lives here so the CLI (`autumn-client`) and the python extension share one
 source of truth.
