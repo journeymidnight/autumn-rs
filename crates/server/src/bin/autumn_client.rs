@@ -876,11 +876,6 @@ async fn main() -> Result<()> {
     let _ = autumn_transport::init_with(args.transport);
     let client = ClusterClient::connect(&args.manager).await?;
 
-    // F216-E: "ucx ⟹ zerocopy" — perf-check defaults to the ZC data path on
-    // the UCX transport (no more --zc flag). Writes always; reads size-guarded
-    // (see UCX_ZC_READ_MIN_BYTES). On TCP the regular MSG_PUT/MSG_GET path runs.
-    let is_ucx = matches!(args.transport, autumn_transport::TransportKind::Ucx);
-
     match args.command {
         Command::OpStub { .. } => unreachable!("handled before connect"),
         Command::Put { key, file } => {
@@ -1456,21 +1451,18 @@ async fn main() -> Result<()> {
             group_commit_cap,
         } => {
             let pipeline_depth = pipeline_depth.max(1);
-            // ZC ("ucx ⟹ zerocopy", F216-E + F219 + F234) selection — ONE rule,
-            // shared with the python BatchClient. `UCX_ZC_READ_MIN_BYTES` is the
-            // single source of truth.
-            //   WRITE: is_ucx || size >= 64K. UCX writes are cheaper at EVERY size
-            //     (drop the to_vec/clone/rkyv copies — no small-size downside), so
-            //     no size guard on UCX; TCP writes go ZC only when large (F219:
-            //     MSG_PUT_ZC, the PS recvs into a pooled buffer, no decoder copy).
-            //   READ: size >= 64K, INDEPENDENT of transport. UCX small reads regress
-            //     ~18% (registered-recv setup > the copy saved); TCP small reads have
-            //     no copy win and the hot path is QPS-critical. Both large reads win
-            //     (UCX RDMA-into-dest; TCP recv-into-dest drops the GetResp rkyv wrap
-            //     + the owned-Vec alloc). F234: the old `is_ucx || large` here forced
-            //     ZC on UCX small reads against this rule — fixed to plain `large`.
-            let zc_write = is_ucx || value_size >= autumn_client::UCX_ZC_READ_MIN_BYTES;
-            let zc_read = value_size >= autumn_client::UCX_ZC_READ_MIN_BYTES;
+            // ZC ("ucx ⟹ zerocopy") selection — ONE symmetric rule (F235), shared
+            // with the python BatchClient + `get_many_into` via `zc_worthwhile`:
+            // engage ZC iff value >= 64 KiB, for BOTH reads and writes and BOTH
+            // transports. Mirrors the PS recv gates (client UCX_ZC_READ_MIN_BYTES +
+            // PS AUTUMN_PS_ZC_RECV_MIN_BYTES, both 64 KiB): below 64 KiB the per-op
+            // registered/pooled-recv machinery exceeds the copy saved (small UCX read
+            // -18%) and the PS recv doesn't ZC anyway. (F234 kept an asymmetric WRITE
+            // rule `is_ucx || large`; F235 dropped `is_ucx ||` — small UCX writes only
+            // saved client-side allocs while the PS still FrameDecoder-copied, i.e.
+            // not real end-to-end ZC.)
+            let zc_write = autumn_client::zc_worthwhile(value_size);
+            let zc_read = autumn_client::zc_worthwhile(value_size);
             let zc_tag = match (zc_write, zc_read) {
                 (true, true) => " [ZC: MSG_PUT_ZC + MSG_GET_ZC]",
                 (true, false) => " [ZC: MSG_PUT_ZC; read regular]",

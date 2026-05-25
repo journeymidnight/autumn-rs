@@ -275,3 +275,51 @@ fn f186_get_stream_inline_value_passthrough() {
         assert!(stream.next_chunk().await.unwrap().is_none());
     });
 }
+
+/// F235 — `get_many_into` batched zero-copy reads. Exercises BOTH branches of
+/// the per-item ZC decision (`zc_worthwhile(dest.len())`): a 4 KiB value (< 64 KiB
+/// → regular `MSG_GET` + copy) and a 256 KiB value (>= 64 KiB → `MSG_GET_ZC`
+/// recv-into-dest), plus a missing key (`Ok(None)`).
+#[test]
+#[ignore]
+fn f235_get_many_into_mixed_sizes() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let cluster = boot_cluster(mgr_addr, n1_addr, n2_addr, 120, 12001).await;
+
+        let small = pattern(4 * 1024); // < 64 KiB → regular MSG_GET branch
+        let large = pattern(256 * 1024); // >= 64 KiB → MSG_GET_ZC branch
+        cluster.put(b"k-small", &small).await.expect("put small");
+        cluster.put(b"k-large", &large).await.expect("put large");
+
+        let mut d_small = vec![0u8; small.len()];
+        let mut d_large = vec![0u8; large.len()];
+        {
+            let mut items: [(&[u8], &mut [u8], Option<&autumn_rpc::RegisteredMem>); 2] = [
+                (b"k-small", &mut d_small[..], None),
+                (b"k-large", &mut d_large[..], None),
+            ];
+            let results = cluster.get_many_into(&mut items).await;
+            assert_eq!(results[0].as_ref().unwrap(), &Some(small.len()));
+            assert_eq!(results[1].as_ref().unwrap(), &Some(large.len()));
+        }
+        assert_eq!(d_small, small);
+        assert_eq!(d_large, large);
+
+        // Missing key → Ok(None), no copy into dest.
+        let mut d_miss = [0u8; 16];
+        let mut miss: [(&[u8], &mut [u8], Option<&autumn_rpc::RegisteredMem>); 1] =
+            [(b"k-missing", &mut d_miss[..], None)];
+        let r = cluster.get_many_into(&mut miss).await;
+        assert_eq!(r[0].as_ref().unwrap(), &None);
+    });
+}

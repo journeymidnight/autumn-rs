@@ -131,6 +131,26 @@ pub const CLIENT_PUT_HARD_CAP: u64 = 256 * 1024 * 1024;
 /// conservative crossover (the mid-range is parity, large is a clear win).
 pub const UCX_ZC_READ_MIN_BYTES: usize = 64 * 1024;
 
+/// F235: the single zero-copy selection rule. Engage ZC (`get_into`/`MSG_GET_ZC`,
+/// `put_zc`/`MSG_PUT_ZC`) iff the value is at least `UCX_ZC_READ_MIN_BYTES`
+/// (64 KiB). SYMMETRIC across reads and writes AND across transports — it mirrors
+/// the PS-side recv gates (`UCX_ZC_READ_MIN_BYTES` here + `AUTUMN_PS_ZC_RECV_MIN_BYTES`
+/// on the PS, both 64 KiB). Below 64 KiB the per-op registered/pooled-recv machinery
+/// costs more than the copy it saves (small UCX read regresses ~18%) AND the PS recv
+/// side doesn't ZC anyway, so end-to-end ZC only engages at/above 64 KiB. This is the
+/// ONE source of truth — perf-check, the python `BatchClient`, and `get_many_into`
+/// all call it (F234 found 3 hand-rolled copies had drifted; F235 collapsed them and
+/// made the write rule symmetric — was `is_ucx || large`, which only saved
+/// client-side allocs on small UCX writes while the PS still FrameDecoder-copied).
+pub fn zc_worthwhile(value_size: usize) -> bool {
+    value_size >= UCX_ZC_READ_MIN_BYTES
+}
+
+/// F235: default in-flight concurrency for `get_many_into` (sliding-window pipeline
+/// over the per-partition multiplexed connections). Mirrors the stream worker's
+/// inflight cap; modest to dodge the UCX rendezvous cliff on large batches.
+pub const BATCH_GET_DEFAULT_CONCURRENCY: usize = 32;
+
 // ── F212-fix-2 — TiKV-style retry/backoff for async-split-tolerant routing ─
 //
 // Split is async on this codebase (see `crates/partition-server/CLAUDE.md`
@@ -1014,6 +1034,50 @@ impl ClusterClient {
         )))
     }
 
+    /// F235: batched zero-copy point reads — pure client-side fan-out (no server
+    /// `MSG_BATCH_GET`). Each `(key, dest, reg)` is read concurrently (sliding
+    /// window of `BATCH_GET_DEFAULT_CONCURRENCY`) over the per-partition multiplexed
+    /// PS connections, amortising per-call await latency + letting the writer_task
+    /// batch syscalls. Per item the ZC decision is `zc_worthwhile(dest.len())`
+    /// (caller sizes `dest` to the expected value): >= 64 KiB → `get_into`
+    /// (`MSG_GET_ZC`, recv straight into `dest`; RDMA on UCX with a registered
+    /// `reg`); else `get` (`MSG_GET`) + one copy into `dest`. Result `i` matches
+    /// `items[i]`: `Ok(Some(n))` = value len (`dest[..n.min(dest.len())]` filled;
+    /// `n > dest.len()` ⇒ truncated to fit), `Ok(None)` = not found, `Err` = that
+    /// item's RPC failed (others still ran). Each `dest` MUST outlive the call (same
+    /// cancel-safety contract as `get_into`).
+    #[allow(clippy::type_complexity)]
+    pub async fn get_many_into(
+        &self,
+        items: &mut [(&[u8], &mut [u8], Option<&autumn_rpc::RegisteredMem>)],
+    ) -> Vec<std::result::Result<Option<usize>, AutumnError>> {
+        use futures::stream::StreamExt;
+        futures::stream::iter(items.iter_mut())
+            .map(|it| {
+                let key: &[u8] = it.0;
+                let reg: Option<&autumn_rpc::RegisteredMem> = it.2;
+                let dest: &mut [u8] = &mut *it.1;
+                async move {
+                    if zc_worthwhile(dest.len()) {
+                        self.get_into(key, dest, reg).await
+                    } else {
+                        match self.get(key).await {
+                            Ok(Some(v)) => {
+                                let n = v.len().min(dest.len());
+                                dest[..n].copy_from_slice(&v[..n]);
+                                Ok(Some(v.len()))
+                            }
+                            Ok(None) => Ok(None),
+                            Err(e) => Err(e),
+                        }
+                    }
+                }
+            })
+            .buffered(BATCH_GET_DEFAULT_CONCURRENCY)
+            .collect()
+            .await
+    }
+
     /// Delete a key. Returns Ok(()) even if key didn't exist.
     pub async fn delete(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
         let key = key.to_vec();
@@ -1675,6 +1739,22 @@ impl StripeMeta {
             chunk_count: u32::from_le_bytes(blob[17..21].try_into().ok()?),
             chunk_size: u32::from_le_bytes(blob[21..25].try_into().ok()?),
         })
+    }
+}
+
+#[cfg(test)]
+mod zc_rule_tests {
+    use super::*;
+
+    // F235: ZC is engaged iff value >= 64 KiB — symmetric across read/write +
+    // transport. Guards against re-introducing an `is_ucx`-gated asymmetry.
+    #[test]
+    fn zc_worthwhile_is_symmetric_at_64k() {
+        assert!(!zc_worthwhile(0));
+        assert!(!zc_worthwhile(4 * 1024));
+        assert!(!zc_worthwhile(UCX_ZC_READ_MIN_BYTES - 1));
+        assert!(zc_worthwhile(UCX_ZC_READ_MIN_BYTES));
+        assert!(zc_worthwhile(8 * 1024 * 1024));
     }
 }
 

@@ -1,5 +1,31 @@
 Date: 2026-05-25
 TaskStatus: completed
+Task scope: F235 — SDK get_many_into (batched ZC reads, pure client-side) +
+  collapse the ZC selection to ONE symmetric helper (zc_worthwhile). User flagged
+  that <64K means no ZC on either transport for writes too (PS recv gate
+  AUTUMN_PS_ZC_RECV_MIN_BYTES is 64K both transports). Then "写sdk batchGET".
+
+Summary (F235):
+  - Symmetric rule: ZC iff size>=64K, BOTH read & write, BOTH transports.
+    Encapsulated in autumn_client::zc_worthwhile(size). Dropped F234's asymmetric
+    write `is_ucx || size>=64K` (small UCX put_zc only saved client allocs while
+    PS still FrameDecoder-copied; the "4K write 2.6x" was never in a committed
+    bench). Callers (perf-check, python run_job) now all call zc_worthwhile;
+    removed the now-dead is_ucx (perf-check var + python run_job param).
+  - get_many_into(items: &mut [(key, &mut dest, Option<reg>)]) -> Vec<Result<
+    Option<usize>>>: pure client-side fan-out (NO server MSG_BATCH_GET;
+    client-side-complexity-first), buffered(32) over per-partition conns, per-item
+    zc_worthwhile(dest.len()) picks get_into/MSG_GET_ZC (>=64K) vs get+copy.
+  - futures="0.3" dep added to client crate.
+  Verified: build client+server clean; python check clean; clippy --all-targets
+  -D warnings (sans fuse) EXIT=0; fmt clean; unit test zc_worthwhile passes; e2e
+  system_putstream::f235_get_many_into_mixed_sizes PASSES on a real cluster
+  (4K + 256K + miss). feature_list F235 passes:true + F234 write-rule marked
+  SUPERSEDED-IN-PART. NOT committed yet.
+
+----- previous task (completed 2026-05-25) -----
+Date: 2026-05-25
+TaskStatus: completed
 Task scope: F234 — unify the ZC read/write selection rule across callers
   (perf-check + python BatchClient) + fix stale client/CLAUDE.md. Came out of a
   Q&A on the SDK-layer fuse get_many design; user caught that I'd quoted a stale

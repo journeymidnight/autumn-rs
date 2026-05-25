@@ -159,6 +159,7 @@ dependencies = [
  "bytes",
  "compio",
  "crc32c",
+ "futures",
  "tracing",
 ]
 

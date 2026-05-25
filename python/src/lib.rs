@@ -801,22 +801,21 @@ struct BatchClient {
     is_ucx: bool,
 }
 
-async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, cap: usize, is_ucx: bool) -> Vec<bool> {
+async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, cap: usize) -> Vec<bool> {
     let cap = cap.max(1);
     match op {
         BatchOp::Get => {
             futures::stream::iter(items.into_iter())
                 .map(|it| async move {
-                    // ZC read (F216-E + F219 + F234): size-thresholded, INDEPENDENT
-                    // of transport — engage iff the page is >= UCX_ZC_READ_MIN_BYTES.
-                    // Small reads regress (registered-recv setup > the copy saved on
-                    // UCX; no copy win + QPS-critical on TCP); large reads win on both
-                    // (UCX RDMA-into-dest; TCP recv-into-dest drops the owned-Vec alloc
-                    // + the second memcpy in the else-branch below). F234: was
-                    // `is_ucx && large`, which skipped ZC for large reads on TCP — now
-                    // matches the perf-check rule (one convention, all callers).
-                    // KV-cache pages are large, so this engages for the real workload.
-                    let zc_read = it.len >= autumn_client::UCX_ZC_READ_MIN_BYTES;
+                    // ZC read (F235): one symmetric rule via the shared
+                    // `autumn_client::zc_worthwhile` — engage iff the page is
+                    // >= 64 KiB, independent of transport. Small reads regress
+                    // (registered-recv setup > copy saved on UCX; no win + QPS-critical
+                    // on TCP); large reads win on both (UCX RDMA-into-dest; TCP
+                    // recv-into-dest drops the owned-Vec alloc + the second memcpy in
+                    // the else-branch below). KV-cache pages are large → engages for
+                    // the real workload.
+                    let zc_read = autumn_client::zc_worthwhile(it.len);
                     if zc_read {
                         // recv the value straight into the pinned dest page
                         // (MSG_GET_ZC + call_into_dest). reg=None here (pinned page
@@ -850,12 +849,14 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, cap:
         BatchOp::Put => {
             futures::stream::iter(items.into_iter())
                 .map(|it| async move {
-                    // ZC write (F216-E + F219 + F234): is_ucx || large. UCX writes
-                    // are cheaper at every size (drop the to_vec/clone/rkyv copies),
-                    // so no size guard on UCX; TCP writes go ZC only when large
-                    // (F219 MSG_PUT_ZC). F234: was `if is_ucx`, which skipped ZC for
-                    // large writes on TCP — now matches the perf-check rule.
-                    if is_ucx || it.len >= autumn_client::UCX_ZC_READ_MIN_BYTES {
+                    // ZC write (F235): one symmetric rule via the shared
+                    // `autumn_client::zc_worthwhile` — engage iff the page is
+                    // >= 64 KiB, independent of transport (same as the read rule +
+                    // the PS recv gate). F235 dropped the old `is_ucx ||`: small UCX
+                    // writes only saved client-side allocs while the PS still
+                    // FrameDecoder-copied them (< AUTUMN_PS_ZC_RECV_MIN_BYTES), i.e.
+                    // not real end-to-end ZC.
+                    if autumn_client::zc_worthwhile(it.len) {
                         // send the value as its own iovec
                         // straight from the pinned source page (MSG_PUT_ZC) — no
                         // to_vec/clone/rkyv copy; on UCX the rcache makes the send
@@ -924,7 +925,7 @@ impl BatchClient {
                                 }
                             };
                             while let Some(job) = job_rx.next().await {
-                                let res = run_job(&client, job.op, job.items, per_worker_cap, is_ucx).await;
+                                let res = run_job(&client, job.op, job.items, per_worker_cap).await;
                                 let _ = job.done.send(res);
                             }
                         });
