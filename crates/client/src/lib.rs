@@ -218,6 +218,19 @@ pub struct KeyMeta {
     pub value_length: u64,
 }
 
+/// F244: one item for [`ClusterClient::get_many_into`]. `length == 0` reads the
+/// whole value; `offset`/`length` give a sub-range (fuse chunk reads, io_uring
+/// `sqe.offset`/`len`). `dest` is sized by the caller (e.g. from `head`, a fixed
+/// chunk size, or the ring-buffer slot) and MUST outlive the call. `reg = Some`
+/// (covering `dest`) → UCX RDMA into the registered dest.
+pub struct GetManyItem<'a> {
+    pub key: &'a [u8],
+    pub offset: u32,
+    pub length: u32,
+    pub dest: &'a mut [u8],
+    pub reg: Option<&'a autumn_rpc::RegisteredMem>,
+}
+
 // ── ClusterClient ───────────────────────────────────────────────────────────
 
 /// Client for interacting with an autumn-rs cluster.
@@ -975,6 +988,24 @@ impl ClusterClient {
         dest: &mut [u8],
         reg: Option<&autumn_rpc::RegisteredMem>,
     ) -> std::result::Result<Option<usize>, AutumnError> {
+        self.get_range_into(key, 0, 0, dest, reg).await
+    }
+
+    /// F244: sub-range variant of [`get_into`] — reads bytes `[offset, offset+length)`
+    /// (`length == 0` = whole value) straight into `dest` via `MSG_GET_ZC`.
+    /// `get_into(key, dest, reg)` is exactly `get_range_into(key, 0, 0, dest, reg)`.
+    /// Same routing + epoch-stale refresh + RPC retry shape as `call_ps_for_key`;
+    /// same cancel-safety contract (`dest` must outlive the call; no per-call
+    /// timeout). Used by `get_many_into` (and by sub-range callers — fuse / ioring
+    /// — that route per key).
+    pub async fn get_range_into(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+        dest: &mut [u8],
+        reg: Option<&autumn_rpc::RegisteredMem>,
+    ) -> std::result::Result<Option<usize>, AutumnError> {
         let key = key.to_vec();
         let mut attempt: u32 = 0;
         let mut last_err: Option<String> = None;
@@ -987,8 +1018,8 @@ impl ClusterClient {
             let payload = rkyv_encode(&GetReq {
                 part_id,
                 key: key.clone(),
-                offset: 0,
-                length: 0,
+                offset,
+                length,
                 region_epoch,
             });
             match self.get_ps_client(&ps_addr).await {
@@ -1033,39 +1064,50 @@ impl ClusterClient {
             let _ = self.refresh_regions().await;
         }
         Err(AutumnError::ConnectionError(format!(
-            "get_into after {attempt} refreshes: {}",
+            "get_range_into after {attempt} refreshes: {}",
             last_err.unwrap_or_else(|| "unknown".to_string())
         )))
     }
 
-    /// F235: batched zero-copy point reads — pure client-side fan-out (no server
-    /// `MSG_BATCH_GET`). Each `(key, dest, reg)` is read concurrently (sliding
-    /// window of `BATCH_GET_DEFAULT_CONCURRENCY`) over the per-partition multiplexed
-    /// PS connections, amortising per-call await latency + letting the writer_task
-    /// batch syscalls. Per item the ZC decision is `zc_worthwhile(dest.len())`
-    /// (caller sizes `dest` to the expected value): >= 64 KiB → `get_into`
-    /// (`MSG_GET_ZC`, recv straight into `dest`; RDMA on UCX with a registered
-    /// `reg`); else `get` (`MSG_GET`) + one copy into `dest`. Result `i` matches
-    /// `items[i]`: `Ok(Some(n))` = value len (`dest[..n.min(dest.len())]` filled;
-    /// `n > dest.len()` ⇒ truncated to fit), `Ok(None)` = not found, `Err` = that
-    /// item's RPC failed (others still ran). Each `dest` MUST outlive the call (same
-    /// cancel-safety contract as `get_into`).
-    #[allow(clippy::type_complexity)]
+    /// F235/F244: batched point reads — the ONE client-side fan-out primitive
+    /// (no server `MSG_BATCH_GET`). All batch-read callers route through this:
+    /// the python `BatchClient` (kvcache), fuse `read::execute`, and the io_uring
+    /// daemon. Each item is read concurrently (sliding window of
+    /// `BATCH_GET_DEFAULT_CONCURRENCY`) over the per-partition multiplexed PS
+    /// connections, amortising per-call await latency + letting the writer_task
+    /// batch syscalls. Per item the ZC decision is `zc_worthwhile(read_len)`
+    /// (read_len = `length` for a sub-range, else `dest.len()`): >= 64 KiB →
+    /// `get_range_into` (`MSG_GET_ZC`, recv straight into `dest`; RDMA on UCX with a
+    /// registered `reg`); else `get_range` (`MSG_GET`) + one copy into `dest`.
+    /// Result `i` matches `items[i]`: `Ok(Some(n))` = value len
+    /// (`dest[..n.min(dest.len())]` filled; `n > dest.len()` ⇒ truncated to fit),
+    /// `Ok(None)` = not found, `Err` = that item's RPC failed (others still ran).
+    /// Each `dest` MUST outlive the call (same cancel-safety contract as `get_into`).
     pub async fn get_many_into(
         &self,
-        items: &mut [(&[u8], &mut [u8], Option<&autumn_rpc::RegisteredMem>)],
+        items: &mut [GetManyItem<'_>],
     ) -> Vec<std::result::Result<Option<usize>, AutumnError>> {
         use futures::stream::StreamExt;
         futures::stream::iter(items.iter_mut())
             .map(|it| {
-                let key: &[u8] = it.0;
-                let reg: Option<&autumn_rpc::RegisteredMem> = it.2;
-                let dest: &mut [u8] = &mut *it.1;
+                let key: &[u8] = it.key;
+                let offset = it.offset;
+                let length = it.length;
+                let reg: Option<&autumn_rpc::RegisteredMem> = it.reg;
+                let dest: &mut [u8] = &mut *it.dest;
                 async move {
-                    if zc_worthwhile(dest.len()) {
-                        self.get_into(key, dest, reg).await
+                    // ZC eligibility keys off the bytes actually transferred:
+                    // a sub-range moves `length` bytes; a whole-value read moves
+                    // the value (caller sized `dest` to it).
+                    let read_len = if length > 0 {
+                        length as usize
                     } else {
-                        match self.get(key).await {
+                        dest.len()
+                    };
+                    if zc_worthwhile(read_len) {
+                        self.get_range_into(key, offset, length, dest, reg).await
+                    } else {
+                        match self.get_range(key, offset, length).await {
                             Ok(Some(v)) => {
                                 let n = v.len().min(dest.len());
                                 dest[..n].copy_from_slice(&v[..n]);

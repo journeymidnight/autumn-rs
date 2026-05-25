@@ -304,9 +304,22 @@ fn f235_get_many_into_mixed_sizes() {
         let mut d_small = vec![0u8; small.len()];
         let mut d_large = vec![0u8; large.len()];
         {
-            let mut items: [(&[u8], &mut [u8], Option<&autumn_rpc::RegisteredMem>); 2] = [
-                (b"k-small", &mut d_small[..], None),
-                (b"k-large", &mut d_large[..], None),
+            use autumn_client::GetManyItem;
+            let mut items = [
+                GetManyItem {
+                    key: b"k-small",
+                    offset: 0,
+                    length: 0,
+                    dest: &mut d_small[..],
+                    reg: None,
+                },
+                GetManyItem {
+                    key: b"k-large",
+                    offset: 0,
+                    length: 0,
+                    dest: &mut d_large[..],
+                    reg: None,
+                },
             ];
             let results = cluster.get_many_into(&mut items).await;
             assert_eq!(results[0].as_ref().unwrap(), &Some(small.len()));
@@ -315,12 +328,36 @@ fn f235_get_many_into_mixed_sizes() {
         assert_eq!(d_small, small);
         assert_eq!(d_large, large);
 
+        // Sub-range read of the large value: bytes [1024, 1024+4096) via offset/length.
+        {
+            use autumn_client::GetManyItem;
+            let mut d_sub = vec![0u8; 4096];
+            let mut sub = [GetManyItem {
+                key: b"k-large",
+                offset: 1024,
+                length: 4096,
+                dest: &mut d_sub[..],
+                reg: None,
+            }];
+            let r = cluster.get_many_into(&mut sub).await;
+            assert_eq!(r[0].as_ref().unwrap(), &Some(4096));
+            assert_eq!(&d_sub[..], &large[1024..1024 + 4096]);
+        }
+
         // Missing key → Ok(None), no copy into dest.
         let mut d_miss = [0u8; 16];
-        let mut miss: [(&[u8], &mut [u8], Option<&autumn_rpc::RegisteredMem>); 1] =
-            [(b"k-missing", &mut d_miss[..], None)];
-        let r = cluster.get_many_into(&mut miss).await;
-        assert_eq!(r[0].as_ref().unwrap(), &None);
+        {
+            use autumn_client::GetManyItem;
+            let mut miss = [GetManyItem {
+                key: b"k-missing",
+                offset: 0,
+                length: 0,
+                dest: &mut d_miss[..],
+                reg: None,
+            }];
+            let r = cluster.get_many_into(&mut miss).await;
+            assert_eq!(r[0].as_ref().unwrap(), &None);
+        }
     });
 }
 

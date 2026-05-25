@@ -4100,3 +4100,13 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   - **F243 (new):** register the io_uring mmap region for UCX (`ucp_mem_map`) + serve `>= 64 KiB` reads via `call_into_dest` ZC → the real read win, but UCX-env-gated.
   - The 4 KiB hot path needs neither (already concurrent + ZC-ineligible).
 - **passes:** false (proposal — REVISED: no quick win; gated on F242 (write) / F243 (region-reg + UCX). Await direction.)
+
+### F244 · Consolidate the batch-read fan-out onto ONE ClusterClient primitive (fuse / io_uring / kvcache all call it)
+- **Trigger:** User — "iouring 已经实现了类似 put many/get many 的功能,需要收紧实现,fuse uring 和 kvcache 都调用 clusterclient 的这个功能." Three hand-rolled concurrent fan-out loops (io_uring daemon per-SQE spawn; fuse `execute` join_all; python `BatchClient` buffered-over-get_into) will drift (the F234 ZC-rule drift is the precedent). Consolidate to `ClusterClient::get_many_into`.
+- **Sub-parts:**
+  - **F244-A (DONE 2026-05-25):** make `get_many_into` the canonical, **sub-range-capable** primitive. Extracted `get_range_into(key, offset, length, dest, reg)` (ZC sub-range; `get_into` = it with `0,0`); `get_range` (regular sub-range) already existed. `get_many_into` now takes `&mut [GetManyItem{ key, offset, length, dest, reg }]` and per item dispatches `get_range_into` (ZC, `zc_worthwhile(read_len)`, read_len=`length`||`dest.len()`) vs `get_range`+copy. Verified: clippy gate EXIT=0; client unit tests (7); `system_putstream::f235_get_many_into_mixed_sizes` PASSES incl. a NEW sub-range read assertion (`[1024,5120)` byte-exact); fmt clean.
+  - **F244-B (pending):** fuse `read::execute` → `get_many_into`. Needs `FsState.client` as `Rc<ClusterClient>` so the spawned `execute` can call it (drops the two-phase route pre-resolution; re-routes per key = cached binary search). F240 already slice-structured `execute`. build+clippy only (no FUSE-mount e2e here).
+  - **F244-C (pending):** io_uring daemon → `get_many_into` (drop per-`ring_fd` ps cache; build `GetManyItem` per popped SQE with `offset/length` + ring-buffer dest via raw ptr). 4 KiB hot path: ZC ineligible (<64 KiB) so this is DRY, not speed — **bench-verify no regression**.
+  - **F244-D (pending):** python `BatchClient` `run_job` Get arm → `get_many_into` (replace the buffered-over-`get_into` loop).
+  - **PUT side:** blocked — io_uring `Opcode::Write` is ENOSYS (F242 prerequisite); fuse/python put consolidation tracked separately.
+- **passes:** false (A done; B/C/D pending — being driven by `/loop 完成F244`).
