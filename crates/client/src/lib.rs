@@ -1167,10 +1167,11 @@ impl ClusterClient {
         fan_out_collect(futs, concurrency).await
     }
 
-    /// F236: batched zero-copy writes — the write mirror of `get_many_into`. Pure
-    /// client-side fan-out (no server `MSG_BATCH_PUT`): each `(key, value)` is
-    /// written concurrently (sliding window of `BATCH_PUT_DEFAULT_CONCURRENCY`)
-    /// over the per-partition multiplexed PS connections. Per item the ZC decision
+    /// F236/F245: batched zero-copy writes — the write mirror of `get_many_into`,
+    /// built on the shared `fan_out_collect`. Pure client-side fan-out (no server
+    /// `MSG_BATCH_PUT`): each `(key, value)` is written concurrently (sliding window
+    /// of `concurrency`) over the per-partition multiplexed PS connections. Per item
+    /// the ZC decision
     /// is `zc_worthwhile(value.len())`: >= 64 KiB → `put_zc` (`MSG_PUT_ZC`, value
     /// sent as its own iovec from the `Bytes` backing memory; RDMA on UCX when that
     /// memory is registered); else `put` (`MSG_PUT`). Values are `Bytes` so the ZC
@@ -1180,6 +1181,7 @@ impl ClusterClient {
     pub async fn put_many(
         &self,
         items: &[(&[u8], bytes::Bytes)],
+        concurrency: usize,
     ) -> Vec<std::result::Result<(), AutumnError>> {
         let futs = items.iter().map(|it| {
             let key: &[u8] = it.0;
@@ -1192,7 +1194,7 @@ impl ClusterClient {
                 }
             }
         });
-        fan_out_collect(futs, BATCH_PUT_DEFAULT_CONCURRENCY).await
+        fan_out_collect(futs, concurrency).await
     }
 
     /// F237: batched deletes — pure client-side fan-out (no server `MSG_BATCH_*`),

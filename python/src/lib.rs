@@ -835,38 +835,25 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, cap:
                 .collect()
         }
         BatchOp::Put => {
-            futures::stream::iter(items.into_iter())
-                .map(|it| async move {
-                    // ZC write (F235): one symmetric rule via the shared
-                    // `autumn_client::zc_worthwhile` — engage iff the page is
-                    // >= 64 KiB, independent of transport (same as the read rule +
-                    // the PS recv gate). F235 dropped the old `is_ucx ||`: small UCX
-                    // writes only saved client-side allocs while the PS still
-                    // FrameDecoder-copied them (< AUTUMN_PS_ZC_RECV_MIN_BYTES), i.e.
-                    // not real end-to-end ZC.
-                    if autumn_client::zc_worthwhile(it.len) {
-                        // send the value as its own iovec
-                        // straight from the pinned source page (MSG_PUT_ZC) — no
-                        // to_vec/clone/rkyv copy; on UCX the rcache makes the send
-                        // zero-copy. SAFETY: it.ptr/len address a pinned source page
-                        // kept alive by the caller for the whole batch (until
-                        // allow_threads returns); the `Bytes::from_static` view is
-                        // consumed by put_zc within this await and its Drop is a
-                        // no-op (never frees the page).
-                        let page: &'static [u8] = unsafe {
-                            std::slice::from_raw_parts(it.ptr as *const u8, it.len)
-                        };
-                        client.put_zc(&it.key, bytes::Bytes::from_static(page)).await.is_ok()
-                    } else {
-                        // SAFETY: it.ptr/len address a pinned source page held alive
-                        // by the caller for the whole batch.
-                        let val = unsafe { std::slice::from_raw_parts(it.ptr as *const u8, it.len) };
-                        client.put(&it.key, val).await.is_ok()
-                    }
+            // F246: consolidate onto `ClusterClient::put_many` (fan_out) — the write
+            // mirror of the Get arm. The ZC decision (`zc_worthwhile`) + per-item
+            // put_zc/put dispatch now live once inside `put_many`. The value is a
+            // `Bytes::from_static` view aliasing the pinned source page.
+            // SAFETY: each `it.ptr/len` addresses a pinned source page the caller
+            // keeps alive for the whole batch (until `allow_threads` returns); the
+            // `Bytes::from_static` view is consumed within the call and its Drop is a
+            // no-op (never frees the page).
+            let pitems: Vec<(&[u8], bytes::Bytes)> = items
+                .iter()
+                .map(|it| {
+                    let page: &'static [u8] =
+                        unsafe { std::slice::from_raw_parts(it.ptr as *const u8, it.len) };
+                    (it.key.as_slice(), bytes::Bytes::from_static(page))
                 })
-                .buffered(cap)
-                .collect::<Vec<bool>>()
-                .await
+                .collect();
+            let results = client.put_many(&pitems, cap).await;
+            drop(pitems);
+            results.iter().map(|r| r.is_ok()).collect()
         }
     }
 }

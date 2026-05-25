@@ -391,7 +391,9 @@ fn f236_put_many_mixed_sizes() {
         let large = bytes::Bytes::from(pattern(256 * 1024)); // >= 64 KiB → MSG_PUT_ZC
         let items: [(&[u8], bytes::Bytes); 2] =
             [(b"pm-small", small.clone()), (b"pm-large", large.clone())];
-        let results = cluster.put_many(&items).await;
+        let results = cluster
+            .put_many(&items, autumn_client::BATCH_PUT_DEFAULT_CONCURRENCY)
+            .await;
         assert!(results[0].is_ok(), "put small: {:?}", results[0]);
         assert!(results[1].is_ok(), "put large: {:?}", results[1]);
 
