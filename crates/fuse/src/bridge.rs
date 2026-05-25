@@ -163,6 +163,12 @@ pub struct FuseBridge {
     pub rx: futures::channel::mpsc::UnboundedReceiver<FsRequest>,
 }
 
+impl Default for FuseBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FuseBridge {
     pub fn new() -> Self {
         let (tx, rx) = futures::channel::mpsc::unbounded();

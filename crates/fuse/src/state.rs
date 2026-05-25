@@ -3,9 +3,9 @@
 //! Contains ClusterClient, inode cache, dirty tracking, and KV helper methods.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use anyhow::{anyhow, Context, Result};
-use bytes::Bytes;
 
 use autumn_client::ClusterClient;
 use autumn_rpc::partition_rpc::*;
@@ -14,7 +14,9 @@ use crate::schema::{InodeState, ROOT_INO};
 
 /// Central filesystem state, lives on the compio thread (single-threaded, no locks).
 pub struct FsState {
-    pub client: ClusterClient,
+    /// `Rc` so the spawned `read::execute` task can hold a clone and call
+    /// `get_many_into` without an `&FsState` reference (F244-B).
+    pub client: Rc<ClusterClient>,
     pub inodes: HashMap<u64, InodeState>,
     pub dirty_inodes: HashSet<u64>,
     pub next_inode: u64,
@@ -29,7 +31,7 @@ impl FsState {
             .await
             .context("connect to manager")?;
         Ok(Self {
-            client,
+            client: Rc::new(client),
             inodes: HashMap::new(),
             dirty_inodes: HashSet::new(),
             next_inode: ROOT_INO + 1,
@@ -62,7 +64,7 @@ impl FsState {
         // wedging the FUSE callback thread forever.
         let resp_bytes = self
             .client
-            .ps_call(&addr, MSG_GET, Bytes::from(payload))
+            .ps_call(&addr, MSG_GET, payload)
             .await
             .context("KV get RPC")?;
         let resp: GetResp =
@@ -96,7 +98,7 @@ impl FsState {
         let payload = rkyv_encode(&req);
         let resp_bytes = self
             .client
-            .ps_call(&addr, MSG_PUT, Bytes::from(payload))
+            .ps_call(&addr, MSG_PUT, payload)
             .await
             .context("KV put RPC")?;
         let resp: PutResp =
@@ -125,7 +127,7 @@ impl FsState {
         let payload = rkyv_encode(&req);
         let resp_bytes = self
             .client
-            .ps_call(&addr, MSG_DELETE, Bytes::from(payload))
+            .ps_call(&addr, MSG_DELETE, payload)
             .await
             .context("KV delete RPC")?;
         let resp: DeleteResp =
@@ -158,7 +160,7 @@ impl FsState {
         let payload = rkyv_encode(&req);
         let resp_bytes = self
             .client
-            .ps_call(&addr, MSG_RANGE, Bytes::from(payload))
+            .ps_call(&addr, MSG_RANGE, payload)
             .await
             .context("KV range RPC")?;
         let resp: RangeResp =
@@ -181,7 +183,7 @@ impl FsState {
         let payload = rkyv_encode(&req);
         let resp_bytes = self
             .client
-            .ps_call(&addr, MSG_HEAD, Bytes::from(payload))
+            .ps_call(&addr, MSG_HEAD, payload)
             .await
             .context("KV head RPC")?;
         let resp: HeadResp =

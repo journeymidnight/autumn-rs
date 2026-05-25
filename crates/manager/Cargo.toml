@@ -24,6 +24,9 @@ autumn-partition-server = { path = "../partition-server" }
 autumn-client = { path = "../client" }
 autumn-rpc = { path = "../rpc" }
 autumn-etcd = { path = "../etcd" }
+# F244-B: fuse read-path e2e (system_fuse_read.rs) — needs the fuse modules
+# (FsState / read / meta / dispatch), behind the `fuse` feature.
+autumn-fuse = { path = "../fuse", features = ["fuse"] }
 compio = { version = "0.18", features = ["net", "time", "macros"] }
 tempfile = "3"
 tracing-subscriber = "0.3"

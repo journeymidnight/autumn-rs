@@ -89,6 +89,12 @@ pub struct WriteBuffer {
     pub len: usize,
 }
 
+impl Default for WriteBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WriteBuffer {
     pub fn new() -> Self {
         Self {

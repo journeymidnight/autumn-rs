@@ -239,6 +239,7 @@ dependencies = [
  "autumn-client",
  "autumn-common",
  "autumn-etcd",
+ "autumn-fuse",
  "autumn-partition-server",
  "autumn-rpc",
  "autumn-stream",

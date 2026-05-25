@@ -195,30 +195,28 @@ pub async fn rename(
         pmeta.mtime_secs = s;
         pmeta.mtime_nsecs = ns;
         put_inode(state, old_parent, &pmeta).await?;
+    } else if old_dirent.file_type == DT_DIR {
+        let mut old_pmeta = get_inode(state, old_parent).await?;
+        old_pmeta.nlink = old_pmeta.nlink.saturating_sub(1);
+        old_pmeta.mtime_secs = s;
+        old_pmeta.mtime_nsecs = ns;
+        put_inode(state, old_parent, &old_pmeta).await?;
+
+        let mut new_pmeta = get_inode(state, new_parent).await?;
+        new_pmeta.nlink += 1;
+        new_pmeta.mtime_secs = s;
+        new_pmeta.mtime_nsecs = ns;
+        put_inode(state, new_parent, &new_pmeta).await?;
     } else {
-        if old_dirent.file_type == DT_DIR {
-            let mut old_pmeta = get_inode(state, old_parent).await?;
-            old_pmeta.nlink = old_pmeta.nlink.saturating_sub(1);
-            old_pmeta.mtime_secs = s;
-            old_pmeta.mtime_nsecs = ns;
-            put_inode(state, old_parent, &old_pmeta).await?;
+        let mut old_pmeta = get_inode(state, old_parent).await?;
+        old_pmeta.mtime_secs = s;
+        old_pmeta.mtime_nsecs = ns;
+        put_inode(state, old_parent, &old_pmeta).await?;
 
-            let mut new_pmeta = get_inode(state, new_parent).await?;
-            new_pmeta.nlink += 1;
-            new_pmeta.mtime_secs = s;
-            new_pmeta.mtime_nsecs = ns;
-            put_inode(state, new_parent, &new_pmeta).await?;
-        } else {
-            let mut old_pmeta = get_inode(state, old_parent).await?;
-            old_pmeta.mtime_secs = s;
-            old_pmeta.mtime_nsecs = ns;
-            put_inode(state, old_parent, &old_pmeta).await?;
-
-            let mut new_pmeta = get_inode(state, new_parent).await?;
-            new_pmeta.mtime_secs = s;
-            new_pmeta.mtime_nsecs = ns;
-            put_inode(state, new_parent, &new_pmeta).await?;
-        }
+        let mut new_pmeta = get_inode(state, new_parent).await?;
+        new_pmeta.mtime_secs = s;
+        new_pmeta.mtime_nsecs = ns;
+        put_inode(state, new_parent, &new_pmeta).await?;
     }
 
     Ok(())

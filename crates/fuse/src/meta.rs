@@ -17,7 +17,7 @@ pub fn inode_to_attr(ino: u64, meta: &InodeMeta) -> FileAttr {
     FileAttr {
         ino,
         size: meta.size,
-        blocks: (meta.size + 511) / 512,
+        blocks: meta.size.div_ceil(512),
         atime: system_time(meta.atime_secs, meta.atime_nsecs),
         mtime: system_time(meta.mtime_secs, meta.mtime_nsecs),
         ctime: system_time(meta.ctime_secs, meta.ctime_nsecs),
@@ -42,9 +42,9 @@ fn system_time(secs: i64, nsecs: u32) -> SystemTime {
 }
 
 fn mode_to_filetype(mode: u32) -> fuser::FileType {
-    match mode & libc::S_IFMT as u32 {
-        m if m == libc::S_IFDIR as u32 => fuser::FileType::Directory,
-        m if m == libc::S_IFLNK as u32 => fuser::FileType::Symlink,
+    match mode & libc::S_IFMT {
+        m if m == libc::S_IFDIR => fuser::FileType::Directory,
+        m if m == libc::S_IFLNK => fuser::FileType::Symlink,
         _ => fuser::FileType::RegularFile,
     }
 }
@@ -61,7 +61,7 @@ pub fn now_ts() -> (i64, u32) {
 pub fn new_file_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
     let (secs, nsecs) = now_ts();
     InodeMeta {
-        mode: libc::S_IFREG as u32 | (mode & 0o7777),
+        mode: libc::S_IFREG | (mode & 0o7777),
         uid,
         gid,
         size: 0,
@@ -81,7 +81,7 @@ pub fn new_file_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
 pub fn new_dir_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
     let (secs, nsecs) = now_ts();
     InodeMeta {
-        mode: libc::S_IFDIR as u32 | (mode & 0o7777),
+        mode: libc::S_IFDIR | (mode & 0o7777),
         uid,
         gid,
         size: 0,

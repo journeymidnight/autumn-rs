@@ -96,7 +96,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             let result = async {
                 let mut meta = get_inode(state, ino).await?;
                 if let Some(m) = mode {
-                    meta.mode = (meta.mode & libc::S_IFMT as u32) | (m & 0o7777);
+                    meta.mode = (meta.mode & libc::S_IFMT) | (m & 0o7777);
                 }
                 if let Some(u) = uid {
                     meta.uid = u;
@@ -244,7 +244,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                 meta.nlink = meta.nlink.saturating_sub(1);
                 if meta.nlink == 0 {
                     // Delete all chunks
-                    let num_chunks = (meta.size + CHUNK_SIZE as u64 - 1) / CHUNK_SIZE as u64;
+                    let num_chunks = meta.size.div_ceil(CHUNK_SIZE as u64);
                     for i in 0..num_chunks {
                         let ck = key::chunk_key(dirent.child_inode, i);
                         let _ = state.kv_delete(&ck).await;

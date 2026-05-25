@@ -1,6 +1,24 @@
 Date: 2026-05-25
 TaskStatus: completed
-Task scope: F244 — consolidate batch-read fan-out onto ClusterClient::get_many_into.
+Task scope: F244-B — fuse read::execute -> get_many_into (env now allows FUSE
+  testing; user: "现在环境可以测试fuse").
+
+F244-B done:
+  - FsState.client -> Rc<ClusterClient> (spawned execute holds a clone).
+  - read.rs: prepare builds ChunkSpec{key,offset,length} (no route pre-resolve);
+    execute pre-allocs result + disjoint per-chunk slices + ONE get_many_into.
+    256K chunks -> ZC MSG_GET_ZC; <64K sub-ranges -> regular MSG_GET. Missing ->
+    sparse zero; hard error -> EIO. Tradeoff: >=64K ZC has no per-call timeout.
+  - Brought autumn-fuse clippy-clean under --features fuse (18 trivial warnings via
+    clippy --fix) so the manager dev-dep (activates fuse feature) passes the gate.
+  Verified: FUSE mounts here (root -> direct mount(2), no fusermount); e2e
+  system_fuse_read::f244b_fuse_read_via_get_many_into PASSES on a real cluster
+  (multi-chunk + whole-256K ZC + small sub-range + cross-chunk + EOF, byte-exact);
+  full gate clippy --all-targets -D warnings EXIT=0; fmt clean; fuse unit tests (6).
+  F244 now: A+D+B done; only F244-C (io_uring daemon) deferred (no bench harness +
+  ZC ineligible at 4K). NOT committed yet.
+
+----- earlier this session (F244-A/D) -----
   /loop 完成F244. LANDED the verifiable parts; B/C deferred (environment-blocked).
 
 F244 outcome:
