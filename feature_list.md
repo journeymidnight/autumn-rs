@@ -4067,4 +4067,28 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
 - **Trigger:** F181 (batched chunk RPC) decided to live client-side; F235 shipped the SDK primitive (`get_many_into`). This wires the fuse read path onto it.
 - **Scope:** autumn-fuse `read::execute` groups the N per-chunk reads of one FUSE read into a single `get_many_into` call (grouped by `part_id` internally), reading straight into the FUSE reply / F180 io_uring shm dest buffers — replacing the hand-rolled N-parallel-get loop (F179) with the shared SDK primitive. Per-item ZC via `zc_worthwhile` (fuse chunks are large → `MSG_GET_ZC`).
 - **Acceptance:** fuse e2e read still byte-correct; perf delta measured (RPC-framing amortisation; F181 expected 30-50% on 8 MiB reads).
-- **passes:** false (pending).
+- **FINDINGS (2026-05-25) — ZC on the FUSE path deferred, reasons:**
+  1. `get_many_into` (the method) does NOT fit `read::execute`: execute is deliberately *stateless* (holds no `&ClusterClient` — the two-phase design keeps the dispatcher unblocked during fanout) and uses *pre-resolved* per-chunk routes + *sub-range* reads. `get_many_into` needs `&self` + re-routes; and the batching it would add is ALREADY present (`join_all` over the multiplexed conn). The only net-new win is ZC.
+  2. True ZC-into-result needs `call_into_dest` (`MSG_GET_ZC`), which is NOT cancel/timeout-safe ("dest must outlive; no per-call timeout"). The FUSE read deliberately uses `call_timeout` so a hung PS degrades to zero-bytes instead of pinning the app `read()`. ZC here = a robustness regression.
+  3. No FUSE-mount e2e in this env (`/dev/fuse` present but no `fusermount`, no mount tests) → a read-path change ships unverified.
+- **REDIRECTED:** the better home for batch ZC is the **io_uring daemon** (F241), not the FUSE path — see F241. F240 shipped the safe, verifiable part of this entry (pre-alloc + ZC-ready slice structure in `execute`).
+- **passes:** false (deferred — ZC-on-FUSE needs a FUSE-mount e2e env; superseded as a priority by F241).
+
+### F240 · autumn-fuse `read::execute`: pre-allocated result + disjoint per-chunk slices (safe part of F239)
+- **Trigger:** F239 investigation — ship the safe, verifiable subset now (ZC deferred). User: "暂缓 F239,现在做安全小改".
+- **Scope:** `execute` pre-allocates the zero-filled result and gives each chunk its OWN disjoint `&mut` sub-slice (sized to `sub_length`); each chunk writes into its slice. Missing/failed/short-read → leaves zeros in ITS region (sparse), no tail mis-alignment (pre-F240 `extend_from_slice`-in-order would shift the whole tail on any short chunk). Still `MSG_GET` + `call_timeout` — NO ZC, NO timeout change → no behaviour regression. Leaves `execute` ZC-ready (future swap: memcpy → `call_into_dest` into the same slice). Also dropped a stale `Bytes::from(payload)` (`rkyv_encode` already returns `Bytes`) + the now-unused import.
+- **Acceptance:** `cargo build -p autumn-fuse` clean; `cargo clippy -p autumn-fuse` shows 0 warnings in `read.rs` (other fuse files retain pre-existing debt — fuse is excluded from the CI gate); `cargo test -p autumn-fuse --lib` green (6); fmt clean; main workspace gate (`--exclude autumn-fuse --all-targets -D warnings`) unaffected (EXIT=0). NOTE: no FUSE-mount e2e in this env — change is logic-only + reasoning-verified (the user accepted build+clippy as the bar).
+- **passes:** true (2026-05-25).
+
+### F241 · io_uring daemon: batch read/write via get_many_into / put_many — PROPOSAL
+- **Trigger:** User — "fuse 有 2 种读写 API (FUSE + io_uring),能不能把 put_batch / read_batch 放到 io_uring 的". The io_uring daemon (`crates/ioring/src/bin/daemon.rs`) is a BETTER home for batch ZC than the FUSE read path (F239).
+- **Why it fits (better than FUSE):**
+  - The ring already delivers up to 32 INDEPENDENT I/O requests per submit (`SqConsumer::try_pop_batch(&mut sqes, 32)`); today each is serviced as a SEPARATE spawned `service_sqe` → its own `ps.call_timeout(MSG_GET)` (concurrent but ungrouped, per-op route/encode). A batch groups the popped SQEs by part_id → one `get_many_into` / `put_many`.
+  - **dest-based fit:** each Read SQE's dest is a ring-buffer slice (`region[buf_offset..]`) in shared memory — exactly `get_many_into`'s `(key, &mut dest, reg)` shape. The shm pool can be UCX-registered → full RDMA ZC into the ring (the F216-E kvcache/`BatchClient` pattern, but in Rust).
+  - **Testable HERE:** `crates/ioring` has a bench (`bin/bench.rs`) + ring-over-shm — NO FUSE mount needed (unlike F239). So the ZC win is actually verifiable in this env.
+- **Design decisions to settle BEFORE coding:**
+  - `get_many_into` re-routes per key; the daemon caches the route per `ring_fd` (resolved once at OPEN). Either accept the cached-binary-search re-route, OR add a lower-level batch primitive over pre-resolved `(ps, GetReq, &mut dest)` reused by BOTH the daemon and fuse `execute` (F240 already made `execute` slice-structured for this).
+  - `call_into_dest` has no per-call timeout (daemon currently does per-SQE `call_timeout` → EIO). The ring buffer dest is long-lived (satisfies "dest must outlive"), but a hung PS pins the batch. Decide: full ZC (`call_into_dest`, no timeout) vs timeout-safe (`call_into_pooled`, one copy).
+  - Read SQE uses offset=0/length=0 (whole value) then slices `[sqe.offset, +len)` locally; a batch must preserve per-SQE sub-range slicing.
+- **Acceptance:** `crates/ioring` bench perf delta on batched 4K + 8M (vs the current per-SQE spawn path); CQE correctness; build + clippy.
+- **passes:** false (proposal — pending go-ahead + the timeout/route decisions above).

@@ -17,7 +17,6 @@
 use std::rc::Rc;
 
 use anyhow::{anyhow, Result};
-use bytes::Bytes;
 use futures::future::join_all;
 
 use autumn_client::DEFAULT_RPC_TIMEOUT;
@@ -142,55 +141,70 @@ pub async fn prepare(state: &mut FsState, ino: u64, offset: i64, size: u32) -> R
 /// Phase 2: pure parallel RPC fanout. No state references — caller
 /// spawns this on the compio runtime so the dispatcher loop can move
 /// on to the next FsRequest immediately.
+///
+/// F240: the result buffer is pre-allocated zero-filled and each chunk writes
+/// straight into its OWN disjoint `&mut` sub-slice (sized to its `sub_length`).
+/// A missing / failed chunk — or a short read — leaves zeros in ITS region
+/// (sparse-file semantics) WITHOUT shifting later chunks. The pre-F240
+/// `extend_from_slice`-in-order stitch would mis-align the whole tail if any
+/// chunk returned fewer bytes than requested. This shape is also ZC-ready: a
+/// future F239 swaps the per-chunk `MSG_GET` + memcpy for `call_into_dest`
+/// (`MSG_GET_ZC`) writing straight into the same slice — see F239 in
+/// feature_list.md (deferred: ZC drops the per-call read timeout this path
+/// relies on, and needs a FUSE-mount e2e to verify).
 pub async fn execute(plan: ReadPlan) -> Result<Vec<u8>> {
     if let Some(inline) = plan.inline_result {
         return Ok(inline);
     }
+    let actual_size = plan.actual_size;
+    let requests = plan.requests;
 
-    // Fire every chunk's MSG_GET concurrently via join_all.
-    // autumn-rpc's RpcClient is multiplexed; N concurrent calls on the
-    // same TCP connection share one socket, processed as a pipelined
-    // batch by the server's read SQ/CQ pipeline.
-    let futs = plan.requests.into_iter().map(|cr| {
+    // One disjoint &mut slice per chunk, in chunk order. The per-chunk slot is
+    // `fallback_zero_len` (= the chunk's `sub_length`); their sum == actual_size.
+    let total: usize = requests
+        .iter()
+        .map(|cr| cr.fallback_zero_len as usize)
+        .sum();
+    let mut result = vec![0u8; total];
+    let mut rest = result.as_mut_slice();
+    let mut dests: Vec<&mut [u8]> = Vec::with_capacity(requests.len());
+    for cr in &requests {
+        let (head, tail) = rest.split_at_mut(cr.fallback_zero_len as usize);
+        dests.push(head);
+        rest = tail;
+    }
+
+    // Fire every chunk's MSG_GET concurrently via join_all. autumn-rpc's
+    // RpcClient is multiplexed; N concurrent calls on the same TCP connection
+    // share one socket, processed as a pipelined batch by the server's read
+    // SQ/CQ pipeline. Each future writes into its own slice — on miss / error /
+    // short read it simply leaves the pre-zeroed bytes (sparse semantics).
+    let futs = requests.into_iter().zip(dests).map(|(cr, dest)| {
         let ps = cr.ps;
         let req = cr.req;
-        let zero_len = cr.fallback_zero_len;
         async move {
             let payload = rkyv_encode(&req);
-            // Bounded so a paged-out / hung PS doesn't keep this
-            // chunk's future alive forever (would block the parent
-            // join_all and pin the FUSE callback). On error we degrade
-            // to zero bytes for this chunk, matching the existing
-            // fallback contract.
-            let resp_bytes = match ps
-                .call_timeout(MSG_GET, Bytes::from(payload), DEFAULT_RPC_TIMEOUT)
-                .await
-            {
+            // Bounded so a paged-out / hung PS doesn't keep this chunk's future
+            // alive forever (would block the parent join_all and pin the FUSE
+            // callback).
+            let resp_bytes = match ps.call_timeout(MSG_GET, payload, DEFAULT_RPC_TIMEOUT).await {
                 Ok(b) => b,
-                Err(_) => return Err(zero_len),
+                Err(_) => return,
             };
             let resp: GetResp = match rkyv_decode(&resp_bytes) {
                 Ok(r) => r,
-                Err(_) => return Err(zero_len),
+                Err(_) => return,
             };
             if resp.code != partition_rpc::CODE_OK {
-                return Err(zero_len);
+                return;
             }
-            Ok(resp.value)
+            let n = resp.value.len().min(dest.len());
+            dest[..n].copy_from_slice(&resp.value[..n]);
         }
     });
-    let chunk_results = join_all(futs).await;
+    join_all(futs).await;
 
-    // Stitch chunks in chunk order. Missing chunks (NotFound) are
-    // zero-filled (sparse file semantics).
-    let mut result = Vec::with_capacity(plan.actual_size);
-    for r in chunk_results {
-        match r {
-            Ok(data) => result.extend_from_slice(&data),
-            Err(zero_len) => result.extend(std::iter::repeat(0u8).take(zero_len as usize)),
-        }
-    }
-    result.truncate(plan.actual_size);
+    result.truncate(actual_size);
     Ok(result)
 }
 
