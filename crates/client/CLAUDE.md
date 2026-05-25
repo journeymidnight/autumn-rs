@@ -51,6 +51,12 @@ Main entry point. Connect via `ClusterClient::connect("addr1,addr2")`.
   ≥ 64 KiB → `put_zc` / `MSG_PUT_ZC` (value sent as its own iovec from the `Bytes`
   backing memory, no copy; RDMA on UCX when registered), else `put` / `MSG_PUT`.
   Result `i` matches `items[i]` (`Ok(())` = stored, `Err` = that item failed).
+- `delete_many(keys: &[&[u8]]) → Vec<Result<()>>` / `head_many(keys: &[&[u8]]) →
+  Vec<Result<KeyMeta>>` — **F237 batched delete / metadata.** Same client-side
+  fan-out as `get_many_into`/`put_many` (no server `MSG_BATCH_*`, `buffered` over
+  per-partition conns); NO ZC (delete/head are tiny — `MSG_DELETE`/`MSG_HEAD`).
+  `head_many` returns `found=false` for a missing key (not `Err`). delete reuses
+  the write concurrency cap, head the read one.
 
 **"ucx ⟹ zerocopy" + `UCX_ZC_READ_MIN_BYTES` + `zc_worthwhile` (F216-E/F219/F234/F235).**
 The SDK exposes both the regular (`get`/`put`) and zero-copy (`get_into`/`put_zc`)

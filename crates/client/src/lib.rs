@@ -1114,6 +1114,38 @@ impl ClusterClient {
             .await
     }
 
+    /// F237: batched deletes — pure client-side fan-out (no server `MSG_BATCH_*`),
+    /// `buffered` over the per-partition multiplexed connections. No ZC (delete is
+    /// tiny). Result `i` matches `keys[i]` (`Ok(())` even if the key didn't exist,
+    /// same as `delete`; `Err` = that item's RPC failed, others still ran).
+    pub async fn delete_many(&self, keys: &[&[u8]]) -> Vec<std::result::Result<(), AutumnError>> {
+        use futures::stream::StreamExt;
+        // delete is a mutation → reuse the write-side concurrency cap.
+        futures::stream::iter(keys.iter())
+            .map(|&key| async move { self.delete(key).await })
+            .buffered(BATCH_PUT_DEFAULT_CONCURRENCY)
+            .collect()
+            .await
+    }
+
+    /// F237: batched metadata lookups — pure client-side fan-out, `buffered` over
+    /// the per-partition multiplexed connections. No ZC (head carries no value).
+    /// Result `i` matches `keys[i]`: `Ok(KeyMeta{ found, value_length })`
+    /// (`found=false` for a missing key, NOT an `Err`); `Err` = that item's RPC
+    /// failed (others still ran).
+    pub async fn head_many(
+        &self,
+        keys: &[&[u8]],
+    ) -> Vec<std::result::Result<KeyMeta, AutumnError>> {
+        use futures::stream::StreamExt;
+        // head is a read → reuse the read-side concurrency cap.
+        futures::stream::iter(keys.iter())
+            .map(|&key| async move { self.head(key).await })
+            .buffered(BATCH_GET_DEFAULT_CONCURRENCY)
+            .collect()
+            .await
+    }
+
     /// Delete a key. Returns Ok(()) even if key didn't exist.
     pub async fn delete(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
         let key = key.to_vec();

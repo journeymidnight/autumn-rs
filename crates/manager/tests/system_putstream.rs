@@ -362,3 +362,49 @@ fn f236_put_many_mixed_sizes() {
         );
     });
 }
+
+/// F237 — `head_many` + `delete_many` batched fan-out. `head_many` over present +
+/// absent keys returns correct `found`/`value_length`; `delete_many` removes the
+/// present keys (verified gone via `get`).
+#[test]
+#[ignore]
+fn f237_delete_many_and_head_many() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let cluster = boot_cluster(mgr_addr, n1_addr, n2_addr, 122, 12201).await;
+
+        cluster.put(b"dm-a", b"aaaa").await.expect("put a");
+        cluster.put(b"dm-b", b"bbbbbb").await.expect("put b");
+
+        // head_many: 2 present + 1 absent.
+        let keys: [&[u8]; 3] = [b"dm-a", b"dm-b", b"dm-missing"];
+        let metas = cluster.head_many(&keys).await;
+        let m0 = metas[0].as_ref().unwrap();
+        assert!(m0.found && m0.value_length == 4);
+        let m1 = metas[1].as_ref().unwrap();
+        assert!(m1.found && m1.value_length == 6);
+        assert!(!metas[2].as_ref().unwrap().found);
+
+        // delete_many the two present keys.
+        let del_keys: [&[u8]; 2] = [b"dm-a", b"dm-b"];
+        let dels = cluster.delete_many(&del_keys).await;
+        assert!(dels[0].is_ok() && dels[1].is_ok());
+
+        // Confirm gone.
+        assert!(cluster.get(b"dm-a").await.unwrap().is_none());
+        assert!(cluster.get(b"dm-b").await.unwrap().is_none());
+        // head_many now reports both absent.
+        let after = cluster.head_many(&del_keys).await;
+        assert!(!after[0].as_ref().unwrap().found);
+        assert!(!after[1].as_ref().unwrap().found);
+    });
+}

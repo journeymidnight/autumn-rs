@@ -4051,7 +4051,8 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   - `ClusterClient::head_many(keys: &[&[u8]]) -> Vec<Result<KeyMeta>>`
   - Pure client-side fan-out (NO server `MSG_BATCH_*`; client-side-complexity-first), `buffered(32)` over the per-partition multiplexed connections — same shape as `get_many_into`/`put_many`. NO ZC (delete/head are tiny; `MSG_DELETE` / `MSG_HEAD`), so no `zc_worthwhile` branch. Result `i` matches `keys[i]`.
 - **Acceptance:** clippy `--all-targets -D warnings` clean; e2e (`delete_many` then `get`/`head_many` confirms gone; `head_many` over mixed present/absent keys returns correct `KeyMeta.found`/`value_length`).
-- **passes:** false (pending).
+- **Done (2026-05-25):** both methods on `ClusterClient`, `buffered` fan-out over per-partition conns (head reuses `BATCH_GET_DEFAULT_CONCURRENCY`, delete reuses `BATCH_PUT_DEFAULT_CONCURRENCY` — read-like vs mutation-like; no new const). No ZC. `head_many` returns `found=false` for a miss (not `Err`). e2e `system_putstream::f237_delete_many_and_head_many` PASSES on a real cluster (present+absent head, delete, confirm-gone; 2.44s). clippy `--all-targets -D warnings` EXIT=0; fmt clean.
+- **passes:** true (2026-05-25).
 
 ### F238 · Read-side range coalescing for sequential reads (HDFS `readVectored`-style) — PROPOSAL / needs-design
 - **Trigger:** F235 note — `get_many_into` amortises RPC framing but does NOT coalesce; HDFS `readVectored` + Parquet readers merge adjacent ranges into fewer/bigger reads, a larger win for sequential reads (the fuse model-weight load).
