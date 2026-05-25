@@ -27,6 +27,9 @@ autumn-etcd = { path = "../etcd" }
 # F244-B: fuse read-path e2e (system_fuse_read.rs) — needs the fuse modules
 # (FsState / read / meta / dispatch), behind the `fuse` feature.
 autumn-fuse = { path = "../fuse", features = ["fuse"] }
+# F248: io_uring daemon fuse-file read path e2e (system_ioring_fuse.rs) — needs
+# the daemon-side `fuse_read` module (path resolve + extent read), behind `daemon`.
+autumn-ioring = { path = "../ioring", features = ["daemon"] }
 compio = { version = "0.18", features = ["net", "time", "macros"] }
 tempfile = "3"
 tracing-subscriber = "0.3"

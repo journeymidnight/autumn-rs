@@ -15,13 +15,13 @@
 //!                                             loop: pop SQE → spawn task
 //!                                                       (OPEN/READ/CLOSE)
 //!                                                  → push CQE
-//!   submit SQE_OPEN("dataset/x.bin")          dispatch: register key →
-//!     wait CQE                                  resolve_key + cache PS
-//!                                              ring_fd; reply CQE(fd)
-//!   submit SQE_READ(ring_fd, off, len, buf)   dispatch: ps.call(MSG_GET,
-//!     wait CQE                                  GetReq{part_id, key, ...})
-//!                                                → memcpy resp.value
-//!                                                → CQE(bytes_read)
+//!   submit SQE_OPEN("dir/model.bin")          dispatch (F248): walk fuse path
+//!     wait CQE                                  → inode → load extent map;
+//!                                              cache on ring_fd; reply CQE(fd)
+//!   submit SQE_READ(ring_fd, off, len, buf)   dispatch (F248): fan out across
+//!     wait CQE                                  the covering F247 extents'
+//!                                                sub-ranges via get_many_into
+//!                                                → memcpy into ring → CQE(n)
 //! ```
 //!
 //! Multi-runtime mode (`--runtimes N` > 1):
@@ -32,14 +32,17 @@
 //!   thread state. Clients distribute load by picking their runtime
 //!   index (e.g. `tid % N`) when connecting.
 //!
-//! F180-B6 changes vs B5:
-//! - Multi-runtime mode breaks past the single-core ~150 k ceiling
-//!   that B5 hit on threads=1 d=32 / 16-thread aggregate.
-//! - At OPEN we now resolve_key + get_ps_client *once* and cache
-//!   `Rc<RpcClient>` + `part_id` on the ring_fd. READ skips
-//!   `ClusterClient::get` entirely, builds GetReq inline, calls the
-//!   cached PS directly. Saves ~3-4 RefCell borrows + 2 hashmap
-//!   lookups + the `call_ps_for_key` retry-closure shell per READ.
+//! Multi-runtime mode breaks past the single-core ~150 k ceiling that a single
+//! runtime hits on threads=1 d=32 / 16-thread aggregate.
+//!
+//! F248: a ring_fd maps to a FUSE FILE (inode + F247 variable-length extents),
+//! not a flat KV key. OPEN walks the fuse path → inode and loads the extent map
+//! (cached on the ring_fd); READ passes `sqe.offset/length` through and fans out
+//! across only the overlapping extents via `get_many_into` (= the client
+//! `fan_out`), so a large-model-file read moves only the bytes asked for instead
+//! of pulling the whole value per SQE. The F244-C `FuturesUnordered` SQ/CQ loop
+//! gives a second fan-out level across concurrent SQEs. (Pre-F248 cached one PS
+//! `RpcClient` per ring_fd for a flat-key whole-value fetch.)
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -49,11 +52,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use autumn_client::{AutumnError, ClusterClient, DEFAULT_RPC_TIMEOUT};
-use autumn_rpc::client::RpcClient;
-use autumn_rpc::partition_rpc::{
-    rkyv_decode, rkyv_encode, GetReq, GetResp, CODE_NOT_FOUND, CODE_OK, MSG_GET,
-};
+use autumn_client::ClusterClient;
 use clap::Parser;
 
 use autumn_ioring::cqe::Cqe;
@@ -263,11 +262,9 @@ async fn handle_session(
 /// lets READs skip the entire `ClusterClient::get_range` shell —
 /// `resolve_key` + `get_ps_client` already happened at OPEN, and the
 /// `call_ps_for_key` retry closure adds nothing for a stable cluster.
-struct OpenedFile {
-    key: Vec<u8>,
-    part_id: u64,
-    ps: Rc<RpcClient>,
-}
+// F248: a ring_fd maps to an opened FUSE FILE (inode + F247 variable-length
+// extent map), resolved once at Open. Was a single flat KV key + cached PS.
+use autumn_ioring::fuse_read::{self, OpenedExtents};
 
 async fn poller_loop(
     region: MmapRegion,
@@ -278,7 +275,7 @@ async fn poller_loop(
     _memfd: std::os::unix::io::OwnedFd,
 ) -> Result<()> {
     let region: Rc<RefCell<MmapRegion>> = Rc::new(RefCell::new(region));
-    let ring_fds: Rc<RefCell<HashMap<u32, OpenedFile>>> = Rc::new(RefCell::new(HashMap::new()));
+    let ring_fds: Rc<RefCell<HashMap<u32, OpenedExtents>>> = Rc::new(RefCell::new(HashMap::new()));
     let next_fd: Rc<Cell<u32>> = Rc::new(Cell::new(1));
     let backoff = Duration::from_micros(idle_us);
 
@@ -337,7 +334,7 @@ async fn service_sqe(
     region: &Rc<RefCell<MmapRegion>>,
     header: &RingHeader,
     cluster: &ClusterClient,
-    ring_fds: &Rc<RefCell<HashMap<u32, OpenedFile>>>,
+    ring_fds: &Rc<RefCell<HashMap<u32, OpenedExtents>>>,
     next_fd: &Rc<Cell<u32>>,
 ) -> Cqe {
     match sqe.opcode {
@@ -353,33 +350,25 @@ async fn service_sqe(
                 r.as_slice()[sqe.buf_offset as usize..sqe.buf_offset as usize + sqe.length as usize]
                     .to_vec()
             };
-            // Existence check — same semantics as before.
-            match cluster.head(&path).await {
-                Ok(meta) if meta.found => {}
-                Ok(_) => return Cqe::err(sqe.user_data, libc::ENOENT),
-                Err(AutumnError::NotFound) => return Cqe::err(sqe.user_data, libc::ENOENT),
-                Err(_) => return Cqe::err(sqe.user_data, libc::EIO),
-            }
-            // Resolve once — cache the PS RpcClient on the ring_fd so
-            // every READ skips routing and connection-pool lookups.
-            let (part_id, ps_addr) = match cluster.resolve_key(&path).await {
-                Ok(p) => p,
-                Err(_) => return Cqe::err(sqe.user_data, libc::EIO),
-            };
-            let ps = match cluster.get_ps_client(&ps_addr).await {
-                Ok(c) => c,
-                Err(_) => return Cqe::err(sqe.user_data, libc::EIO),
+            // F248: resolve the FUSE PATH → inode + variable-length extent map
+            // (was: treat `path` as a flat KV key + cache one PS). Reading the
+            // actual chunked file the fuse mount writes; per-extent routing now
+            // happens inside `get_many_into` on each Read.
+            let opened = match fuse_read::open(cluster, &path).await {
+                Ok(o) => o,
+                Err(e) => {
+                    let msg = e.to_string();
+                    let errno = if msg.contains("ENOENT") {
+                        libc::ENOENT
+                    } else {
+                        libc::EIO
+                    };
+                    return Cqe::err(sqe.user_data, errno);
+                }
             };
             let fd = next_fd.get();
             next_fd.set(fd.checked_add(1).unwrap_or(1));
-            ring_fds.borrow_mut().insert(
-                fd,
-                OpenedFile {
-                    key: path,
-                    part_id,
-                    ps,
-                },
-            );
+            ring_fds.borrow_mut().insert(fd, opened);
             Cqe::ok(sqe.user_data, fd as u64)
         }
 
@@ -388,63 +377,33 @@ async fn service_sqe(
             if layout.validate_slice(sqe.buf_offset, sqe.length).is_err() {
                 return Cqe::err(sqe.user_data, libc::EINVAL);
             }
-            // Snapshot key + part_id + ps under a brief borrow. The
-            // Rc<RpcClient> clone is the per-call cost we cared about
-            // amortising — one atomic increment vs the multi-RefCell
-            // borrows + hashmap lookup of the pre-F180-B6 path.
-            let (key, part_id, ps) = {
+            // F248: snapshot the opened file's extent map under a brief borrow,
+            // then fan out across the OVERLAPPING extents' exact sub-ranges via
+            // `get_many_into` (no whole-value amplification; passes
+            // `sqe.offset/length` through). `fuse_read::read` reads into its OWN
+            // buffer (no region borrow held across the await — concurrent SQEs
+            // keep working), which we then copy into the ring once.
+            let opened = {
                 let fds = ring_fds.borrow();
                 match fds.get(&sqe.ring_fd) {
-                    Some(o) => (o.key.clone(), o.part_id, o.ps.clone()),
+                    Some(o) => OpenedExtents {
+                        ino: o.ino,
+                        size: o.size,
+                        extents: o.extents.clone(),
+                    },
                     None => return Cqe::err(sqe.user_data, libc::EBADF),
                 }
             };
-            // Pass offset=0 length=0 ("whole value") to PS — this hits
-            // the cheap path in `resolve_value` (one to_vec instead of
-            // two). The daemon slices [sqe.offset, sqe.offset+sqe.length)
-            // from the response. For 4 KB hot reads this saves an
-            // extra 4 KB memcpy per op on the PS side, which under
-            // single-runtime daemon load was the difference between
-            // 137 k (length=0) and 103 k (length=4096) ops/s.
-            let region_epoch = cluster.lookup_epoch_for_part(part_id);
-            let req = GetReq {
-                part_id,
-                key,
-                offset: 0,
-                length: 0,
-                region_epoch,
-            };
-            let payload = rkyv_encode(&req);
-            // Bounded so a paged-out / hung PS surfaces as EIO to the
-            // ioring user instead of wedging this Read SQE forever.
-            let resp_bytes = match ps.call_timeout(MSG_GET, payload, DEFAULT_RPC_TIMEOUT).await {
+            let buf = match fuse_read::read(cluster, &opened, sqe.offset, sqe.length).await {
                 Ok(b) => b,
-                Err(_) => {
-                    let _ = cluster; // unused warning suppression
-                    return Cqe::err(sqe.user_data, libc::EIO);
-                }
-            };
-            let resp: GetResp = match rkyv_decode(&resp_bytes) {
-                Ok(r) => r,
                 Err(_) => return Cqe::err(sqe.user_data, libc::EIO),
             };
-            if resp.code == CODE_NOT_FOUND {
-                return Cqe::err(sqe.user_data, libc::ENOENT);
-            }
-            if resp.code != CODE_OK {
-                return Cqe::err(sqe.user_data, libc::EIO);
-            }
-            let start = sqe.offset as usize;
-            if start >= resp.value.len() {
-                return Cqe::ok(sqe.user_data, 0);
-            }
-            let end = (start + sqe.length as usize).min(resp.value.len());
-            let n = end - start;
-            {
+            let n = buf.len();
+            if n > 0 {
                 let mut r = region.borrow_mut();
                 let dst =
                     &mut r.as_mut_slice()[sqe.buf_offset as usize..sqe.buf_offset as usize + n];
-                dst.copy_from_slice(&resp.value[start..end]);
+                dst.copy_from_slice(&buf);
             }
             Cqe::ok(sqe.user_data, n as u64)
         }

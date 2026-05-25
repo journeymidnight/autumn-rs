@@ -63,6 +63,10 @@ pub mod sqe;
 
 #[cfg(target_os = "linux")]
 pub mod client;
+/// F248: daemon-side fuse-file resolution + variable-length-extent read planning.
+/// Gated on `daemon` (needs autumn-client + autumn-fuse key/schema).
+#[cfg(feature = "daemon")]
+pub mod fuse_read;
 #[cfg(target_os = "linux")]
 pub mod mmap;
 #[cfg(target_os = "linux")]

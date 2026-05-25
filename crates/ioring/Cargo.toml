@@ -24,7 +24,7 @@ default = []
 # core protocol crate (`lib`) builds without these deps so it can be
 # linked into a Python pyo3 binding (F180-D) without the heavy
 # transitive compio chain.
-daemon = ["dep:autumn-client", "dep:autumn-rpc", "dep:compio", "dep:futures", "dep:anyhow", "dep:tracing-subscriber", "dep:clap"]
+daemon = ["dep:autumn-client", "dep:autumn-rpc", "dep:autumn-fuse", "dep:compio", "dep:futures", "dep:anyhow", "dep:tracing-subscriber", "dep:clap"]
 # `bench` is the read-throughput harness. Lighter dep set (no compio,
 # no autumn-client) — uses std threads + the IoRingClient API.
 bench = ["dep:clap", "dep:anyhow", "dep:tracing-subscriber"]
@@ -38,6 +38,11 @@ libc = "0.2"
 # Optional — only pulled in when the `daemon` feature is on.
 autumn-client = { path = "../client", optional = true }
 autumn-rpc = { path = "../rpc", optional = true }
+# F248: the daemon resolves fuse files (inode + variable-length extents) using
+# autumn-fuse's UNGATED `key` + `schema` modules. `default-features = false`
+# excludes the heavy `fuse` feature (fuser/compio mount layer) — we only need
+# the key encoding + rkyv schema decoders.
+autumn-fuse = { path = "../fuse", optional = true, default-features = false }
 compio = { version = "0.18", features = ["net", "io", "macros", "time", "fs"], optional = true }
 futures = { version = "0.3", optional = true }
 anyhow = { workspace = true, optional = true }

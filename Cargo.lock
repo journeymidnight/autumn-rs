@@ -220,6 +220,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "autumn-client",
+ "autumn-fuse",
  "autumn-rpc",
  "bytes",
  "clap",
@@ -240,6 +241,7 @@ dependencies = [
  "autumn-common",
  "autumn-etcd",
  "autumn-fuse",
+ "autumn-ioring",
  "autumn-partition-server",
  "autumn-rpc",
  "autumn-stream",

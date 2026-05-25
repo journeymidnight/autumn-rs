@@ -1,5 +1,31 @@
 Date: 2026-05-25
 TaskStatus: completed
+Task scope: F248 — io_uring daemon reads autumn-fuse files (inode + F247 变长 extent).
+  Part 2 of the /loop "完成 247, 248, 243 ucx,tcp 测试性能对比" series. F243 next.
+
+F248 done (committed this iteration):
+  岔路决定: daemon 自己走 fuse 元数据解析 path→inode. 关键发现: autumn-fuse 的
+    key+schema 模块非 gated (不依赖 fuser) -> daemon 用它们 + ClusterClient 解析
+    fuse 文件, 无需拉 fuser/挂载层.
+  - crates/ioring/src/fuse_read.rs (NEW, feature daemon): resolve_path (root 走
+    dirent->inode) / load_extent_map (range-scan + 长度推断) / open / plan_read
+    (纯函数: 覆盖 [off,len) 的 extent 切片 + 绝对 dest_offset) / read (切不相交
+    &mut 片 -> 一次 get_many_into, 空洞补零).
+  - daemon.rs: OpenedFile{key,part_id,ps} -> OpenedExtents; Open=fuse_read::open;
+    Read 透传 sqe.offset/length=fuse_read::read (自有 buf 不持 region borrow 跨
+    await, 返回后一次拷入 ring). 删旧 cached-PS 整值快路径. 两级 fan-out: F244-C
+    FuturesUnordered 跨 SQE + get_many_into 跨 extent. ZC-into-ring 留给 F243.
+  - Cargo: ioring daemon feature 加 autumn-fuse(default-features=false, 只 key+schema);
+    manager dev-dep 加 autumn-ioring[daemon] 供 e2e.
+  Verified: build clean; clippy -p autumn-ioring --features daemon -D warnings +
+    workspace gate (exclude fuse) EXIT=0; fmt clean; ioring 单测 69 passed (含
+    fuse_read::tests 4); e2e f248_ioring_reads_fuse_file PASS on real cluster 3.12s.
+
+Next (this loop): F243 — daemon ring mmap ucp_mem_map UCX 注册 -> ≥64K RDMA ZC 读
+  into ring + UCX/TCP 性能对比. (UCX env-gated; 本沙箱无 UCX -> 编译+逻辑验证,
+  真实 perf 需 prod RoCE 硬件 via perf_check.sh.)
+
+--- prior iteration ---
 Task scope: F247 — autumn-fuse 变长 extent (取代固定 256 KiB chunk). Part 1 of the
   /loop "完成 247, 248, 243 ucx,tcp 测试性能对比" series (F248 + F243 next iterations).
 
