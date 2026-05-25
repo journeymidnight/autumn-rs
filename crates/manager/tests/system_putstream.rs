@@ -323,3 +323,42 @@ fn f235_get_many_into_mixed_sizes() {
         assert_eq!(r[0].as_ref().unwrap(), &None);
     });
 }
+
+/// F236 — `put_many` batched zero-copy writes. Exercises BOTH branches of the
+/// per-item ZC decision (`zc_worthwhile(value.len())`): a 4 KiB value (< 64 KiB →
+/// regular `MSG_PUT`) and a 256 KiB value (>= 64 KiB → `MSG_PUT_ZC`), then reads
+/// each back byte-for-byte.
+#[test]
+#[ignore]
+fn f236_put_many_mixed_sizes() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let cluster = boot_cluster(mgr_addr, n1_addr, n2_addr, 121, 12101).await;
+
+        let small = bytes::Bytes::from(pattern(4 * 1024)); // < 64 KiB → MSG_PUT
+        let large = bytes::Bytes::from(pattern(256 * 1024)); // >= 64 KiB → MSG_PUT_ZC
+        let items: [(&[u8], bytes::Bytes); 2] =
+            [(b"pm-small", small.clone()), (b"pm-large", large.clone())];
+        let results = cluster.put_many(&items).await;
+        assert!(results[0].is_ok(), "put small: {:?}", results[0]);
+        assert!(results[1].is_ok(), "put large: {:?}", results[1]);
+
+        assert_eq!(
+            cluster.get(b"pm-small").await.unwrap().as_deref(),
+            Some(small.as_ref())
+        );
+        assert_eq!(
+            cluster.get(b"pm-large").await.unwrap().as_deref(),
+            Some(large.as_ref())
+        );
+    });
+}

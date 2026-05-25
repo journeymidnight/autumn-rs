@@ -44,6 +44,13 @@ Main entry point. Connect via `ClusterClient::connect("addr1,addr2")`.
   `get_into` / `MSG_GET_ZC`, else `get` / `MSG_GET` + one copy into `dest`. Result
   `i` matches `items[i]` (`Ok(Some(n))` = value len, `Ok(None)` = miss, `Err` =
   that item failed; others still ran). Each `dest` MUST outlive the call.
+- `put_many(items: &[(key, Bytes)]) → Vec<Result<()>>` — **F236 batched zero-copy
+  writes** (write mirror of `get_many_into`). Pure client-side fan-out (no server
+  `MSG_BATCH_PUT`), `buffered(BATCH_PUT_DEFAULT_CONCURRENCY` = 32) over the
+  per-partition multiplexed connections. Per item `zc_worthwhile(value.len())`:
+  ≥ 64 KiB → `put_zc` / `MSG_PUT_ZC` (value sent as its own iovec from the `Bytes`
+  backing memory, no copy; RDMA on UCX when registered), else `put` / `MSG_PUT`.
+  Result `i` matches `items[i]` (`Ok(())` = stored, `Err` = that item failed).
 
 **"ucx ⟹ zerocopy" + `UCX_ZC_READ_MIN_BYTES` + `zc_worthwhile` (F216-E/F219/F234/F235).**
 The SDK exposes both the regular (`get`/`put`) and zero-copy (`get_into`/`put_zc`)

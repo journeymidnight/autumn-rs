@@ -4035,3 +4035,11 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
 - **Acceptance:** `cargo build -p autumn-client -p autumn-server` clean; `cargo check` python clean (no unused-`is_ucx`); clippy `--workspace --exclude autumn-fuse --all-targets -- -D warnings` EXIT=0; fmt clean; unit test passes; **e2e `system_putstream::f235_get_many_into_mixed_sizes` PASSES** against a real cluster (4 KiB regular + 256 KiB ZC + missing-key branches, 2.43s).
 - **Future (noted, not built):** range coalescing (HDFS `readVectored` style) for sequential reads; batchPUT.
 - **passes:** true (2026-05-25).
+
+### F236 · SDK `put_many` (batched ZC writes) — write mirror of F235 `get_many_into`
+- **Trigger:** Continuation of F235 (deferred "batchPUT" follow-up). User: "continue".
+- **Scope:** `ClusterClient::put_many(items: &[(&[u8], bytes::Bytes)]) -> Vec<Result<()>>`. Pure client-side fan-out (NO server `MSG_BATCH_PUT`; client-side-complexity-first), `buffered(BATCH_PUT_DEFAULT_CONCURRENCY = 32)` over the per-partition multiplexed connections. Per item `zc_worthwhile(value.len())` (the F235 single source of truth): ≥64 KiB → `put_zc`/`MSG_PUT_ZC` (value as its own iovec from the `Bytes`, no copy; RDMA on UCX when registered); else `put`/`MSG_PUT`. Values are `Bytes` so the ZC path needs no copy (clone = Arc bump).
+- **Symmetry with F235:** same shape as `get_many_into`, same helper, same concurrency model; `BATCH_PUT_DEFAULT_CONCURRENCY` sibling const. No new wire type.
+- **Acceptance:** clippy `--workspace --exclude autumn-fuse --all-targets -- -D warnings` EXIT=0; fmt clean; **e2e `system_putstream::f236_put_many_mixed_sizes` PASSES** on a real cluster (4 KiB `MSG_PUT` + 256 KiB `MSG_PUT_ZC` branches, read back byte-for-byte; 2.42s).
+- **Future (noted, not built):** batch delete/head; range coalescing for reads (F235 note).
+- **passes:** true (2026-05-25).

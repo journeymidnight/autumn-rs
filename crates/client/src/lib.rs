@@ -151,6 +151,10 @@ pub fn zc_worthwhile(value_size: usize) -> bool {
 /// inflight cap; modest to dodge the UCX rendezvous cliff on large batches.
 pub const BATCH_GET_DEFAULT_CONCURRENCY: usize = 32;
 
+/// F236: default in-flight concurrency for `put_many` (write sibling of
+/// `BATCH_GET_DEFAULT_CONCURRENCY`).
+pub const BATCH_PUT_DEFAULT_CONCURRENCY: usize = 32;
+
 // ── F212-fix-2 — TiKV-style retry/backoff for async-split-tolerant routing ─
 //
 // Split is async on this codebase (see `crates/partition-server/CLAUDE.md`
@@ -1074,6 +1078,38 @@ impl ClusterClient {
                 }
             })
             .buffered(BATCH_GET_DEFAULT_CONCURRENCY)
+            .collect()
+            .await
+    }
+
+    /// F236: batched zero-copy writes — the write mirror of `get_many_into`. Pure
+    /// client-side fan-out (no server `MSG_BATCH_PUT`): each `(key, value)` is
+    /// written concurrently (sliding window of `BATCH_PUT_DEFAULT_CONCURRENCY`)
+    /// over the per-partition multiplexed PS connections. Per item the ZC decision
+    /// is `zc_worthwhile(value.len())`: >= 64 KiB → `put_zc` (`MSG_PUT_ZC`, value
+    /// sent as its own iovec from the `Bytes` backing memory; RDMA on UCX when that
+    /// memory is registered); else `put` (`MSG_PUT`). Values are `Bytes` so the ZC
+    /// path needs no copy (`clone` = Arc bump). Result `i` matches `items[i]`:
+    /// `Ok(())` = stored, `Err` = that item's RPC failed (others still ran).
+    #[allow(clippy::type_complexity)]
+    pub async fn put_many(
+        &self,
+        items: &[(&[u8], bytes::Bytes)],
+    ) -> Vec<std::result::Result<(), AutumnError>> {
+        use futures::stream::StreamExt;
+        futures::stream::iter(items.iter())
+            .map(|it| {
+                let key: &[u8] = it.0;
+                let value: &bytes::Bytes = &it.1;
+                async move {
+                    if zc_worthwhile(value.len()) {
+                        self.put_zc(key, value.clone()).await
+                    } else {
+                        self.put(key, value.as_ref()).await
+                    }
+                }
+            })
+            .buffered(BATCH_PUT_DEFAULT_CONCURRENCY)
             .collect()
             .await
     }

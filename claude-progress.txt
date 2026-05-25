@@ -1,5 +1,21 @@
 Date: 2026-05-25
 TaskStatus: completed
+Task scope: F236 — SDK put_many (batched ZC writes), write mirror of F235's
+  get_many_into. User: "continue" (deferred batchPUT follow-up).
+
+Summary (F236):
+  - ClusterClient::put_many(items: &[(&[u8], Bytes)]) -> Vec<Result<()>>: pure
+    client-side fan-out (NO server MSG_BATCH_PUT), buffered(BATCH_PUT_DEFAULT_
+    CONCURRENCY=32) over per-partition conns; per item zc_worthwhile(value.len())
+    picks put_zc/MSG_PUT_ZC (>=64K, value as iovec from Bytes) vs put/MSG_PUT.
+    Same shape + same helper as get_many_into.
+  Verified: clippy --all-targets -D warnings (sans fuse) EXIT=0; fmt clean; e2e
+  system_putstream::f236_put_many_mixed_sizes PASSES on a real cluster (4K + 256K,
+  read-back byte-for-byte). feature_list F236 passes:true. NOT committed yet.
+
+----- previous task (completed 2026-05-25) -----
+Date: 2026-05-25
+TaskStatus: completed
 Task scope: F235 — SDK get_many_into (batched ZC reads, pure client-side) +
   collapse the ZC selection to ONE symmetric helper (zc_worthwhile). User flagged
   that <64K means no ZC on either transport for writes too (PS recv gate
