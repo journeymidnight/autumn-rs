@@ -321,7 +321,9 @@ fn f235_get_many_into_mixed_sizes() {
                     reg: None,
                 },
             ];
-            let results = cluster.get_many_into(&mut items).await;
+            let results = cluster
+                .get_many_into(&mut items, autumn_client::BATCH_GET_DEFAULT_CONCURRENCY)
+                .await;
             assert_eq!(results[0].as_ref().unwrap(), &Some(small.len()));
             assert_eq!(results[1].as_ref().unwrap(), &Some(large.len()));
         }
@@ -339,7 +341,9 @@ fn f235_get_many_into_mixed_sizes() {
                 dest: &mut d_sub[..],
                 reg: None,
             }];
-            let r = cluster.get_many_into(&mut sub).await;
+            let r = cluster
+                .get_many_into(&mut sub, autumn_client::BATCH_GET_DEFAULT_CONCURRENCY)
+                .await;
             assert_eq!(r[0].as_ref().unwrap(), &Some(4096));
             assert_eq!(&d_sub[..], &large[1024..1024 + 4096]);
         }
@@ -355,7 +359,9 @@ fn f235_get_many_into_mixed_sizes() {
                 dest: &mut d_miss[..],
                 reg: None,
             }];
-            let r = cluster.get_many_into(&mut miss).await;
+            let r = cluster
+                .get_many_into(&mut miss, autumn_client::BATCH_GET_DEFAULT_CONCURRENCY)
+                .await;
             assert_eq!(r[0].as_ref().unwrap(), &None);
         }
     });

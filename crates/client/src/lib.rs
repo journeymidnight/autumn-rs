@@ -1072,8 +1072,9 @@ impl ClusterClient {
     /// F235/F244: batched point reads — the ONE client-side fan-out primitive
     /// (no server `MSG_BATCH_GET`). All batch-read callers route through this:
     /// the python `BatchClient` (kvcache), fuse `read::execute`, and the io_uring
-    /// daemon. Each item is read concurrently (sliding window of
-    /// `BATCH_GET_DEFAULT_CONCURRENCY`) over the per-partition multiplexed PS
+    /// daemon. Each item is read concurrently (sliding window of `concurrency` —
+    /// callers pass `BATCH_GET_DEFAULT_CONCURRENCY` or their own tuned cap, e.g.
+    /// python's `per_worker_cap`) over the per-partition multiplexed PS
     /// connections, amortising per-call await latency + letting the writer_task
     /// batch syscalls. Per item the ZC decision is `zc_worthwhile(read_len)`
     /// (read_len = `length` for a sub-range, else `dest.len()`): >= 64 KiB →
@@ -1086,8 +1087,10 @@ impl ClusterClient {
     pub async fn get_many_into(
         &self,
         items: &mut [GetManyItem<'_>],
+        concurrency: usize,
     ) -> Vec<std::result::Result<Option<usize>, AutumnError>> {
         use futures::stream::StreamExt;
+        let concurrency = concurrency.max(1);
         futures::stream::iter(items.iter_mut())
             .map(|it| {
                 let key: &[u8] = it.key;
@@ -1119,7 +1122,7 @@ impl ClusterClient {
                     }
                 }
             })
-            .buffered(BATCH_GET_DEFAULT_CONCURRENCY)
+            .buffered(concurrency)
             .collect()
             .await
     }

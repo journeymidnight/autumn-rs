@@ -805,46 +805,34 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, cap:
     let cap = cap.max(1);
     match op {
         BatchOp::Get => {
-            futures::stream::iter(items.into_iter())
-                .map(|it| async move {
-                    // ZC read (F235): one symmetric rule via the shared
-                    // `autumn_client::zc_worthwhile` — engage iff the page is
-                    // >= 64 KiB, independent of transport. Small reads regress
-                    // (registered-recv setup > copy saved on UCX; no win + QPS-critical
-                    // on TCP); large reads win on both (UCX RDMA-into-dest; TCP
-                    // recv-into-dest drops the owned-Vec alloc + the second memcpy in
-                    // the else-branch below). KV-cache pages are large → engages for
-                    // the real workload.
-                    let zc_read = autumn_client::zc_worthwhile(it.len);
-                    if zc_read {
-                        // recv the value straight into the pinned dest page
-                        // (MSG_GET_ZC + call_into_dest). reg=None here (pinned page
-                        // not pre-registered via memh) → still one copy off the wire
-                        // on UCX but no Vec alloc + no second memcpy vs the regular
-                        // path's get()+copy_nonoverlapping.
-                        // SAFETY: it.ptr/len address a pinned dest page the caller
-                        // keeps alive for the whole batch; exclusive write here.
-                        let dest = unsafe {
-                            std::slice::from_raw_parts_mut(it.ptr as *mut u8, it.len)
-                        };
-                        matches!(client.get_into(&it.key, dest, None).await, Ok(Some(n)) if n == it.len)
-                    } else {
-                        match client.get(&it.key).await {
-                            Ok(Some(v)) if v.len() == it.len => {
-                                // SAFETY: it.ptr/len address a pinned dest page held
-                                // alive by the caller; exclusive write here.
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(v.as_ptr(), it.ptr as *mut u8, it.len);
-                                }
-                                true
-                            }
-                            _ => false,
-                        }
-                    }
+            // F244-D: consolidate onto `ClusterClient::get_many_into` — the ONE
+            // batch-read fan-out primitive (also driving the e2e-tested SDK path).
+            // Drops the hand-rolled `buffered` loop + the per-item `zc_worthwhile`
+            // decision (which used to drift across callers — see F234); the ZC rule
+            // now lives once, inside `get_many_into`. `cap` (per_worker_cap) is the
+            // concurrency window.
+            // SAFETY: each `it.ptr/len` addresses a pinned dest page the caller keeps
+            // alive for the whole batch; disjoint pages → disjoint `&mut` slices;
+            // single-threaded compio (no parallel aliasing).
+            let mut gitems: Vec<autumn_client::GetManyItem> = items
+                .iter()
+                .map(|it| autumn_client::GetManyItem {
+                    key: &it.key,
+                    offset: 0,
+                    length: 0,
+                    dest: unsafe { std::slice::from_raw_parts_mut(it.ptr as *mut u8, it.len) },
+                    reg: None,
                 })
-                .buffered(cap)
-                .collect::<Vec<bool>>()
-                .await
+                .collect();
+            let results = client.get_many_into(&mut gitems, cap).await;
+            drop(gitems);
+            // Success = the value was found AND its length matches the page size
+            // the caller reserved (same contract as the pre-F244 per-item path).
+            results
+                .iter()
+                .zip(items.iter())
+                .map(|(r, it)| matches!(r, Ok(Some(n)) if *n == it.len))
+                .collect()
         }
         BatchOp::Put => {
             futures::stream::iter(items.into_iter())

@@ -1,5 +1,43 @@
 Date: 2026-05-25
 TaskStatus: completed
+Task scope: F244 — consolidate batch-read fan-out onto ClusterClient::get_many_into.
+  /loop 完成F244. LANDED the verifiable parts; B/C deferred (environment-blocked).
+
+F244 outcome:
+  - F244-A DONE (734ac52): get_many_into = canonical sub-range-capable primitive
+    (get_range_into + GetManyItem). Later + concurrency param (F244-D need).
+  - F244-D DONE: python BatchClient run_job Get -> get_many_into(gitems, cap).
+    Removed hand-rolled buffered loop + per-item zc decision. clippy gate EXIT=0;
+    python check EXIT=0; f235 e2e PASSES; fmt clean.
+  - F244-B DEFERRED (env+tradeoff): fuse execute -> get_many_into makes 256K chunks
+    ZC (no timeout) = the F239 regression + no FUSE-mount e2e here. Looping can't fix.
+  - F244-C DEFERRED (env+low value): no ioring bench harness to verify the 4K hot
+    path; ZC ineligible there (<64K) = DRY-only with regression risk.
+  - PUT side blocked by F242 (io_uring Write = ENOSYS).
+  Loop STOPPED: B/C are environment-blocked (FUSE mount / ioring bench), not a
+  "more time" problem — looping further is pointless. Foundation + kvcache landed.
+
+----- earlier this session (F244-A) -----
+  (fuse / io_uring / kvcache all call it). Driven by `/loop 完成F244`.
+
+Progress (F244):
+  - F244-A DONE + committed (734ac52): get_many_into is now the canonical
+    sub-range-capable primitive. Extracted get_range_into (ZC sub-range);
+    get_into = get_range_into(.,0,0,.); GetManyItem{key,offset,length,dest,reg}.
+    Verified: clippy gate EXIT=0; client unit (7); f235 e2e PASSES + new
+    sub-range assertion; fmt clean.
+  - F244-B (NEXT): fuse read::execute -> get_many_into (FsState.client -> Rc<
+    ClusterClient> so spawned execute can call it; drop two-phase route pre-resolve;
+    F240 already slice-structured execute). build+clippy only (no FUSE mount e2e).
+  - F244-C: io_uring daemon -> get_many_into (drop per-ring_fd ps cache; GetManyItem
+    per SQE w/ offset/length + ring-buffer raw-ptr dest). bench-verify 4K no regress.
+  - F244-D: python BatchClient run_job Get arm -> get_many_into.
+  - PUT side blocked by F242 (io_uring Write = ENOSYS).
+Next step: F244-B (fuse). Loop continues via /loop 完成F244.
+
+----- previous task (completed 2026-05-25) -----
+Date: 2026-05-25
+TaskStatus: completed
 Task scope: F240 (done) + F239/F241 investigation. F240 = safe part of fuse
   read::execute (pre-alloc result + disjoint per-chunk slices, ZC-ready). F239
   ZC-on-FUSE deferred (get_many_into doesn't fit stateless execute; ZC drops the
