@@ -97,9 +97,9 @@ struct Args {
 /// Compute the per-runtime socket path. With N=1 returns `base`
 /// unchanged (legacy behaviour). With N>1 appends `.{idx}` so each
 /// runtime gets a distinct path.
-pub fn runtime_socket_path(base: &PathBuf, idx: usize, n: usize) -> PathBuf {
+pub fn runtime_socket_path(base: &std::path::Path, idx: usize, n: usize) -> PathBuf {
     if n <= 1 {
-        return base.clone();
+        return base.to_path_buf();
     }
     let mut s = base.as_os_str().to_owned();
     s.push(format!(".{idx}"));
@@ -282,34 +282,53 @@ async fn poller_loop(
     let next_fd: Rc<Cell<u32>> = Rc::new(Cell::new(1));
     let backoff = Duration::from_micros(idle_us);
 
+    // F244-C: bounded streaming SQ/CQ loop — mirrors the EN/PS
+    // `handle_connection` shape (FuturesUnordered + drain-as-they-land), the
+    // server-side form of the client's `fan_out` streaming primitive. A
+    // persistent `inflight` holds the in-flight `service_sqe` futures (bounded by
+    // the ring's SQ depth); each completion's CQE is pushed AS IT LANDS — no
+    // batch-boundary stall and no unbounded per-SQE `spawn`.
+    use futures::future::FutureExt;
+    use futures::stream::{FuturesUnordered, StreamExt};
+    let mut inflight = FuturesUnordered::new();
     loop {
+        // SQ side: pop whatever the ring offers, launch one service future each.
         let mut sqes: Vec<Sqe> = Vec::new();
         {
             let r = region.borrow();
             let cons = SqConsumer::new(r.as_slice(), header);
             cons.try_pop_batch(&mut sqes, 32);
         }
-        if sqes.is_empty() {
-            compio::time::sleep(backoff).await;
-            continue;
-        }
-
         for sqe in sqes {
             let region_c = region.clone();
             let cluster_c = cluster.clone();
             let ring_fds_c = ring_fds.clone();
             let next_fd_c = next_fd.clone();
-            compio::runtime::spawn(async move {
-                let cqe =
-                    service_sqe(sqe, &region_c, &header, &cluster_c, &ring_fds_c, &next_fd_c).await;
-                let mut r = region_c.borrow_mut();
-                let mut prod = CqProducer::new(r.as_mut_slice(), header);
-                if prod.try_push(cqe).is_err() {
-                    tracing::warn!("CQ full; dropping completion");
-                }
-            })
-            .detach();
+            inflight.push(async move {
+                service_sqe(sqe, &region_c, &header, &cluster_c, &ring_fds_c, &next_fd_c).await
+            });
         }
+        // CQ side: idle → back off; else await ONE completion (this polls all
+        // in-flight futures + yields the runtime) then drain any others ready.
+        if inflight.is_empty() {
+            compio::time::sleep(backoff).await;
+        } else {
+            if let Some(cqe) = inflight.next().await {
+                push_cqe(&region, header, cqe);
+            }
+            while let Some(cqe) = inflight.next().now_or_never().flatten() {
+                push_cqe(&region, header, cqe);
+            }
+        }
+    }
+}
+
+/// Push one completion onto the CQ ring (brief `borrow_mut`, no await held).
+fn push_cqe(region: &Rc<RefCell<MmapRegion>>, header: RingHeader, cqe: Cqe) {
+    let mut r = region.borrow_mut();
+    let mut prod = CqProducer::new(r.as_mut_slice(), header);
+    if prod.try_push(cqe).is_err() {
+        tracing::warn!("CQ full; dropping completion");
     }
 }
 

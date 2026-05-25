@@ -1,5 +1,26 @@
 Date: 2026-05-25
 TaskStatus: completed
+Task scope: F244-C — io_uring daemon poller_loop -> bounded FuturesUnordered SQ/CQ
+  loop (server-side form of streaming fan-out). User: "fix F244-C as well and test
+  the perf".
+
+F244-C done:
+  - daemon poller_loop: unbounded per-SQE spawn -> persistent FuturesUnordered
+    (await-one + drain-ready, push each CQE as it lands; bounded by ring SQ depth).
+    Mirrors EN/PS handle_connection. NOT the client fan_out fn (daemon's continuous
+    poll-loop needs the FuturesUnordered+await form, not finite-stream collect).
+    Fixed pre-existing ptr_arg (&PathBuf->&Path).
+  - PERF-NEUTRAL (ioring bench, release, live cluster, single hot key, 16t/d8/4K/5s):
+    OLD per-SQE-spawn 93,018 ops/s vs NEW FuturesUnordered 93,119 ops/s (identical).
+    Both below 200k F180 gate = 1-key/1-partition PS-single-core-bound (daemon loop
+    NOT the bottleneck, proven by old≈new). daemon clippy --features daemon -D
+    EXIT=0; daemon unit tests (2); fmt clean.
+  F244 now FULLY done (A+B+C+D). Consolidation covers EVERY data-plane caller: SDK,
+  kvcache r+w, fuse read, perf-check, io_uring daemon. NOT committed yet.
+
+----- earlier this session (F246) -----
+Date: 2026-05-25
+TaskStatus: completed
 Task scope: F246 — kvcache write -> put_many + perf-check rewritten on fan_out
   streaming + wbench/rbench removed. User: "都做, perf bench 也改为 fan_out, 原来
   的不要了, 然后重新 perf check" + "kv_put 本质也是以单独的 put_many".
