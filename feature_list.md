@@ -4043,3 +4043,27 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
 - **Acceptance:** clippy `--workspace --exclude autumn-fuse --all-targets -- -D warnings` EXIT=0; fmt clean; **e2e `system_putstream::f236_put_many_mixed_sizes` PASSES** on a real cluster (4 KiB `MSG_PUT` + 256 KiB `MSG_PUT_ZC` branches, read back byte-for-byte; 2.42s).
 - **Future (noted, not built):** batch delete/head; range coalescing for reads (F235 note).
 - **passes:** true (2026-05-25).
+
+### F237 · SDK batch delete + head (`delete_many` / `head_many`) — PENDING
+- **Trigger:** Continuation of the SDK batch data-plane series (F235 `get_many_into`, F236 `put_many`); deferred follow-up noted in both.
+- **Scope:**
+  - `ClusterClient::delete_many(keys: &[&[u8]]) -> Vec<Result<()>>`
+  - `ClusterClient::head_many(keys: &[&[u8]]) -> Vec<Result<KeyMeta>>`
+  - Pure client-side fan-out (NO server `MSG_BATCH_*`; client-side-complexity-first), `buffered(32)` over the per-partition multiplexed connections — same shape as `get_many_into`/`put_many`. NO ZC (delete/head are tiny; `MSG_DELETE` / `MSG_HEAD`), so no `zc_worthwhile` branch. Result `i` matches `keys[i]`.
+- **Acceptance:** clippy `--all-targets -D warnings` clean; e2e (`delete_many` then `get`/`head_many` confirms gone; `head_many` over mixed present/absent keys returns correct `KeyMeta.found`/`value_length`).
+- **passes:** false (pending).
+
+### F238 · Read-side range coalescing for sequential reads (HDFS `readVectored`-style) — PROPOSAL / needs-design
+- **Trigger:** F235 note — `get_many_into` amortises RPC framing but does NOT coalesce; HDFS `readVectored` + Parquet readers merge adjacent ranges into fewer/bigger reads, a larger win for sequential reads (the fuse model-weight load).
+- **Open design question (decide BEFORE coding):** autumn KV keys map to partition keys, NOT byte offsets of one blob, so strict "merge into one read" is not free. Two routes:
+  - **(a) fuse-side larger chunking** — fewer/bigger keys (a chunk-size policy change; simplest, pure client-side, no server change). Preferred starting point.
+  - **(b) server-side VP-contiguity read** — if consecutive chunks' VPs are contiguous in one log extent, the PS reads them in one extent pread. Crosses client-side-complexity-first; needs a server batch-VP-read RPC. Only if (a) is insufficient AND profiling justifies it.
+- **Scope:** evaluate (a) + `get_many_into` part_id grouping to reduce read count first; treat (b) as a separate gated proposal.
+- **Acceptance:** TBD at design time — perf delta on a sequential 8 MiB fuse read vs the F239 baseline.
+- **passes:** false (proposal — needs a design decision before any code).
+
+### F239 · autumn-fuse `read::execute` → `get_many_into` (land F181 on the fuse read path) — PENDING
+- **Trigger:** F181 (batched chunk RPC) decided to live client-side; F235 shipped the SDK primitive (`get_many_into`). This wires the fuse read path onto it.
+- **Scope:** autumn-fuse `read::execute` groups the N per-chunk reads of one FUSE read into a single `get_many_into` call (grouped by `part_id` internally), reading straight into the FUSE reply / F180 io_uring shm dest buffers — replacing the hand-rolled N-parallel-get loop (F179) with the shared SDK primitive. Per-item ZC via `zc_worthwhile` (fuse chunks are large → `MSG_GET_ZC`).
+- **Acceptance:** fuse e2e read still byte-correct; perf delta measured (RPC-framing amortisation; F181 expected 30-50% on 8 MiB reads).
+- **passes:** false (pending).
