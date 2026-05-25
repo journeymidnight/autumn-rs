@@ -4091,4 +4091,12 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   - `call_into_dest` has no per-call timeout (daemon currently does per-SQE `call_timeout` → EIO). The ring buffer dest is long-lived (satisfies "dest must outlive"), but a hung PS pins the batch. Decide: full ZC (`call_into_dest`, no timeout) vs timeout-safe (`call_into_pooled`, one copy).
   - Read SQE uses offset=0/length=0 (whole value) then slices `[sqe.offset, +len)` locally; a batch must preserve per-SQE sub-range slicing.
 - **Acceptance:** `crates/ioring` bench perf delta on batched 4K + 8M (vs the current per-SQE spawn path); CQE correctness; build + clippy.
-- **passes:** false (proposal — pending go-ahead + the timeout/route decisions above).
+- **FINDINGS (2026-05-25, after reading `daemon.rs` in full) — the win is smaller than it first looked; split into prerequisites:**
+  1. **`put_batch` is BLOCKED:** `Opcode::Write => ENOSYS` (daemon.rs:433). The io_uring daemon is **read-only**. A write batch needs `Opcode::Write` implemented first (its own feature, F242) — only then can `put_many` apply.
+  2. **The daemon ALREADY fans out concurrently:** it pops 32 SQEs (`try_pop_batch(.., 32)`) then `spawn`s one `service_sqe` per SQE → 32 concurrent `ps.call(MSG_GET)` over the multiplexed conn. That IS client-side pipelined fan-out (what `get_many_into` does). So a "batch primitive" adds ~nothing for throughput — only bounded concurrency vs unbounded 32-spawn (marginal).
+  3. **ZC doesn't help the hot path:** the daemon's gate workload is **4 KiB reads** (the 200 k ops/s gate), which are `< 64 KiB` → per the F235 symmetric rule, ZC regresses (or is a no-op). ZC only helps `>= 64 KiB` reads. AND the mmap region is **not UCX-registered** (no `RegisteredMem` in ioring) — so even a large-read `call_into_dest` on TCP only drops the `GetResp` rkyv decode, NOT a copy (`finish_into_dest_from_frame` still memcpy's). Real copy-elimination/RDMA needs (a) registering the shm region for UCX + (b) a UCX env to verify — neither present here.
+- **Revised plan (prerequisites, not a quick win):**
+  - **F242 (new):** implement `Opcode::Write` in the daemon → THEN `put_batch`/`put_many` is even possible.
+  - **F243 (new):** register the io_uring mmap region for UCX (`ucp_mem_map`) + serve `>= 64 KiB` reads via `call_into_dest` ZC → the real read win, but UCX-env-gated.
+  - The 4 KiB hot path needs neither (already concurrent + ZC-ineligible).
+- **passes:** false (proposal — REVISED: no quick win; gated on F242 (write) / F243 (region-reg + UCX). Await direction.)

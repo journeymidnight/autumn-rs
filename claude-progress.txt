@@ -1,5 +1,27 @@
 Date: 2026-05-25
 TaskStatus: completed
+Task scope: F240 (done) + F239/F241 investigation. F240 = safe part of fuse
+  read::execute (pre-alloc result + disjoint per-chunk slices, ZC-ready). F239
+  ZC-on-FUSE deferred (get_many_into doesn't fit stateless execute; ZC drops the
+  read timeout; no FUSE-mount e2e here). User then asked: put_batch/read_batch
+  into the io_uring path?
+
+Findings (io_uring daemon, recorded as F241 + F242/F243 in feature_list):
+  - put_batch BLOCKED: Opcode::Write = ENOSYS (daemon read-only). Needs Write
+    impl first (F242).
+  - daemon ALREADY fans out concurrently (pop 32 SQE -> 32 spawn over muxed
+    conn = pipelined fan-out, same as get_many_into). No batching win to add.
+  - ZC doesn't help the 4K hot path (<64K -> regress per F235 rule); only >=64K;
+    AND mmap region not UCX-registered -> TCP ZC only drops decode, not a copy.
+    Real win needs region ucp_mem_map + UCX env (F243).
+  Conclusion: no quick win in the daemon; revised into prerequisites F242 (write)
+  + F243 (region-reg + UCX large-read ZC). Awaiting direction. F240 committed
+  (8364f0a); F241 findings + this not committed yet.
+TaskStatus_note: F240 completed; F239/F241 = not_completed (deferred/blocked).
+
+----- previous task (completed 2026-05-25) -----
+Date: 2026-05-25
+TaskStatus: completed
 Task scope: F237 — SDK delete_many + head_many (batched fan-out). User: "start
   F236 and F237" (F236/put_many was already done → started F237; second feature
   to be confirmed: F238 coalescing vs F239 fuse).
