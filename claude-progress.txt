@@ -1,5 +1,31 @@
 Date: 2026-05-25
 TaskStatus: completed
+Task scope: F246 — kvcache write -> put_many + perf-check rewritten on fan_out
+  streaming + wbench/rbench removed. User: "都做, perf bench 也改为 fan_out, 原来
+  的不要了, 然后重新 perf check" + "kv_put 本质也是以单独的 put_many".
+
+F246 done:
+  - A: put_many + concurrency param; python run_job Put -> put_many (kvcache
+    read+write both on fan_out). commit 8eee73b.
+  - B: autumn-client perf-check rewritten on fan_out STREAMING (continuous
+    pipelining via lazy deadline-bounded from_fn of single put_zc/get_into futures;
+    NOT batch put_many which would head-of-line stall). per-thread ClusterClient;
+    read regenerates deterministic keys (seq 0..written). Removed wbench/rbench +
+    their helpers/structs/imports.
+  Verified: clippy --all-targets -D warnings EXIT=0; fmt clean; FUNCTIONAL run on
+  a live 1-node cluster — write 14.9K/read 14.7K ops/s (fan_out streaming), latency
+  histos + baseline written; gate path fires+exits 2 on p99 variance. Sandbox
+  numbers NOT prod-representative (perf_check.sh on prod hw for real numbers).
+  NOT committed yet (autumn_client.rs + feature_list + progress).
+
+Consolidation (F244/F245/F246) COMPLETE for: ClusterClient (fan_out base + 4 batch
+APIs), kvcache read+write (python), fuse read, perf-check. Only F244-C (io_uring
+daemon -> fan_out streaming) remains — design-unblocked, gated on an ioring bench
+harness.
+
+----- earlier this session (F245) -----
+Date: 2026-05-25
+TaskStatus: completed
 Task scope: F245 — streaming fan-out primitive (fan_out / fan_out_collect) as the
   ClusterClient batch foundation. User: "抽一个流式 fan-out 原语…ClusterClient 的
   底座也是这个逻辑,其他 API 都是这个之上的."
