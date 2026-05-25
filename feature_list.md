@@ -2752,13 +2752,18 @@ Cleared by audit (no fix needed):
     - Mechanical fixes: `clippy --fix` bulk + manual (`!contains_key`, `.clamp()`, `push_back`, deferred-init for dead defaults, redundant-binding/struct-update/empty-line-doc removal, `iter().enumerate()` for `needless_range_loop`, `let _ =` for unused `Result`s).
     - Dead code: `#[allow(dead_code)]` on test-only / future-API / feature-gated items (test toolboxes `tests/support/mod.rs` + `tests/test_helpers.rs` + benches, `audit_retention_gc`, `new_for_test`, sstable `seek`/`rewind`/`open_slice`, vestigial `compact_trigger`/`gc_trigger` senders, etc.).
   - **Phase 3 — CI gating:** removed `continue-on-error` from the fmt + clippy steps in `.github/workflows/ci.yml`; clippy step now runs `--lib --bins --tests --examples -- -D warnings`.
-- **Deviation from Target (`--all-targets`):** the 3 perf **benches** (`stream/append_bench`, `stream/extent_bench`, `rpc/ps_read_bench`) are excluded from the gate — they're **stale against current APIs** (reference removed `serve_rpc`, moved `autumn_rpc::RpcClient`, changed `handle_connection`/`OwnedReadHalf`) and don't compile (pre-existing; `cargo build --workspace` skips benches so it was masked). They got file-top `#![allow(...)]` for their lint noise but need an **API refresh** to compile — tracked as the follow-up below.
-- **passes:** true (2026-05-24 — fmt clean; clippy `-D warnings` clean on lib+bins+tests+examples; CI flipped to gating; 419 lib tests green. Benches excluded pending API refresh, see Deviation.)
+- **Deviation from Target (`--all-targets`) — RESOLVED by FCI-02 (2026-05-25):** at FCI-01 time the 3 perf benches were stale and excluded (gate ran `--lib --bins --tests --examples`). **FCI-02 refreshed them**, so the gate is now back to the full `--all-targets` (see FCI-02 below).
+- **passes:** true (2026-05-24 — fmt clean; clippy `-D warnings` clean; CI flipped to gating; 419 lib tests green. Initially `--lib --bins --tests --examples`; FCI-02 restored `--all-targets`.)
 
-### FCI-02 (deferred) · Refresh the 3 stale perf benches to current APIs
-- **Trigger:** `stream/benches/{append_bench,extent_bench}` + `rpc/benches/ps_read_bench` don't compile against current APIs (`ExtentNode::serve_rpc` removed, `autumn_rpc::RpcClient` → `autumn_rpc::client::RpcClient`, `handle_connection` now takes `Conn` not `TcpStream`, `OwnedReadHalf::read` gone). They were dropped from the FCI-01 clippy gate (`--all-targets` → `--lib --bins --tests --examples`).
-- **Scope:** update the three bench files to the current serve/connect/read APIs so `cargo bench` + `cargo clippy --all-targets` compile again, then restore `--all-targets` in the CI clippy step.
-- **passes:** false (deferred — benches are perf tooling, not run in CI; refresh when next doing perf work)
+### FCI-02 · Refresh the 3 stale perf benches to current APIs
+- **Trigger:** `stream/benches/{append_bench,extent_bench}` + `rpc/benches/ps_read_bench` didn't compile against current APIs (`ExtentNode::serve_rpc` removed, `autumn_rpc::RpcClient` → `autumn_rpc::client::RpcClient`, `handle_connection` now takes `Conn` not `TcpStream`). They were dropped from the FCI-01 clippy gate (`--all-targets` → `--lib --bins --tests --examples`).
+- **Done (2026-05-25):**
+  - `append_bench`: `serve_rpc` → `serve`; `autumn_rpc::RpcClient` → `autumn_rpc::client::RpcClient`; and — since `ExtentNode` is `!Send` — build the node INSIDE the server `std::thread` (move the Send `ExtentNodeConfig` in, not the node).
+  - `extent_bench`: replaced the hand-rolled accept loop + `handle_connection(stream, …)` with `node.serve(addr)` (canonical; sidesteps the `Conn` signature change); fixed a `single_match` → `if let`. Client side (`BenchConn`, raw split + `OwnedReadHalf::read`) was fine.
+  - `ps_read_bench`: no API drift — already compiled (only had lint noise, covered by its file-top `#![allow(...)]`).
+  - CI clippy step restored to `--all-targets` (was `--lib --bins --tests --examples`).
+- **Acceptance:** `cargo bench --no-run` compiles all three; `cargo clippy --workspace --exclude autumn-fuse --all-targets -- -D warnings` EXIT=0.
+- **passes:** true (2026-05-25 — benches compile + clippy `--all-targets -D warnings` clean; CI back to `--all-targets`).
 
 ### F196 · Static cpuset pre-allocation for EN/PS + PS reject-only split gate + EN shards-from-cpuset + hot/cold advisory (ScyllaDB-style)
 - **Trigger:** Conversation 2026-05-12 — operator wants ScyllaDB-style pre-allocation so capacity planning is explicit instead of relying on grow-on-demand `--cpu-start` + soft WARN on overflow. Without a hard cap, an oversubscribed PS quietly drops to kernel-floated threads and tail latency degrades silently. With a hard cap, split fails loudly and the operator can plan (grow `--cpuset`, migrate, or merge a cold pair).

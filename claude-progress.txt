@@ -1,3 +1,22 @@
+Date: 2026-05-25
+TaskStatus: completed
+Task scope: FCI-02 — refresh the 3 stale perf benches to current APIs + restore
+  --all-targets in the CI clippy gate. User: "FCI-02".
+
+Summary (FCI-02):
+  - append_bench: serve_rpc->serve; autumn_rpc::RpcClient->client::RpcClient;
+    ExtentNode is !Send so build it INSIDE the server std::thread (move the Send
+    ExtentNodeConfig in, not the node).
+  - extent_bench: replaced hand-rolled accept + handle_connection(stream,..) with
+    node.serve(addr) (sidesteps the Conn signature change); single_match->if let.
+  - ps_read_bench: no drift, already compiled (lint noise covered by file allow).
+  - CI clippy: --lib --bins --tests --examples  ->  --all-targets (FCI-01
+    deviation resolved).
+  Verified: cargo bench --no-run compiles all 3; clippy --all-targets -D warnings
+  EXIT=0; fmt --check clean. feature_list FCI-02 passes:true + FCI-01 deviation
+  marked RESOLVED. NOT committed yet.
+
+----- previous task (completed 2026-05-24) -----
 Date: 2026-05-24
 TaskStatus: completed
 Task scope: FCI-01 — mass fmt + clippy cleanup + flip CI to gating. User: "FCI-01

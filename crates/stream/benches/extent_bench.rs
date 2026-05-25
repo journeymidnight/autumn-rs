@@ -66,15 +66,12 @@ impl BenchConn {
     /// Receive the next response in order (for sequential protocols like append).
     async fn recv(&mut self) -> Bytes {
         loop {
-            match self.decoder.try_decode().unwrap() {
-                Some(resp) => {
-                    if resp.is_error() {
-                        let (code, msg) = RpcError::decode_status(&resp.payload);
-                        panic!("rpc error ({:?}): {}", code, msg);
-                    }
-                    return resp.payload;
+            if let Some(resp) = self.decoder.try_decode().unwrap() {
+                if resp.is_error() {
+                    let (code, msg) = RpcError::decode_status(&resp.payload);
+                    panic!("rpc error ({:?}): {}", code, msg);
                 }
-                None => {}
+                return resp.payload;
             }
             let BufResult(result, buf_back) = self.reader.read(std::mem::take(&mut self.buf)).await;
             self.buf = buf_back;
@@ -92,28 +89,22 @@ async fn run_bench() {
     let config = ExtentNodeConfig::new(data_dir, 1);
     let node = ExtentNode::new(config).await.unwrap();
 
-    let listener = compio::net::TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
-        .await
-        .unwrap();
-    let listen_addr = listener.local_addr().unwrap();
-
-    // Spawn server accept loop.
+    // Pick a free port, then let `ExtentNode::serve` bind + run the accept loop.
+    // (Replaces the bench's old hand-rolled accept + `handle_connection`, whose
+    // signature changed to take an `autumn_transport::Conn` rather than a raw
+    // `TcpStream`.)
+    let listen_addr = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = l.local_addr().unwrap();
+        drop(l);
+        a
+    };
     compio::runtime::spawn(async move {
-        loop {
-            let (stream, peer) = listener.accept().await.unwrap();
-            let _ = stream.set_nodelay(true);
-            let node = node.clone();
-            compio::runtime::spawn(async move {
-                if let Err(e) = ExtentNode::handle_connection(stream, node).await {
-                    tracing::debug!(peer = %peer, error = %e, "connection ended");
-                }
-            })
-            .detach();
-        }
+        let _ = node.serve(listen_addr).await;
     })
     .detach();
 
-    compio::time::sleep(Duration::from_millis(10)).await;
+    compio::time::sleep(Duration::from_millis(120)).await;
 
     // Allocate one extent for all tests.
     let extent_id = 1u64;

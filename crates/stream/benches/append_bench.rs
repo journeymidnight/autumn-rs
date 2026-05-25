@@ -25,16 +25,19 @@ fn main() {
         std::fs::write(data_dir.join("disk_id"), "1").unwrap();
 
         let config = autumn_stream::ExtentNodeConfig::new(data_dir, 1);
-        let node = autumn_stream::ExtentNode::new(config).await.unwrap();
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let listener = std::net::TcpListener::bind(addr).unwrap();
         let bound = listener.local_addr().unwrap();
         drop(listener);
 
+        // `ExtentNode` is `!Send` (Rc fields), so build it INSIDE the server
+        // thread's runtime rather than moving it across the OS-thread boundary;
+        // only the (Send) config + addr cross over.
         std::thread::spawn(move || {
             compio::runtime::Runtime::new().unwrap().block_on(async {
-                node.serve_rpc(bound).await.unwrap();
+                let node = autumn_stream::ExtentNode::new(config).await.unwrap();
+                node.serve(bound).await.unwrap();
             });
         });
 
@@ -45,7 +48,7 @@ fn main() {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        let client = autumn_rpc::RpcClient::connect(bound).await.unwrap();
+        let client = autumn_rpc::client::RpcClient::connect(bound).await.unwrap();
 
         // Alloc extent
         use autumn_stream::extent_rpc::*;
