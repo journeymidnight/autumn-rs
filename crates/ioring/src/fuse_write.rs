@@ -33,7 +33,7 @@
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 
-use autumn_client::{zc_worthwhile, ClusterClient};
+use autumn_client::{fan_out_collect, zc_worthwhile, ClusterClient, BATCH_PUT_DEFAULT_CONCURRENCY};
 use autumn_fuse::key;
 use autumn_fuse::schema::{self, MAX_EXTENT};
 
@@ -132,17 +132,122 @@ fn upsert(ext: &mut Vec<(u64, u32)>, start: u64, len: u32) {
     }
 }
 
-/// F242 — write `src` at `[off, off + src.len())` into an opened fuse file.
-/// Returns the byte count written (= `src.len()` unless empty).
+/// Execute one planned step against the cluster. Returns the resulting
+/// `(extent_start, new_value_len)` so the caller can apply the upsert under
+/// its single-writer cache update. Pure I/O; no state mutation.
+async fn execute_step(
+    cluster: &ClusterClient,
+    ino: u64,
+    src: &[u8],
+    step: &WriteStep,
+) -> Result<(u64, u32)> {
+    match *step {
+        WriteStep::Append {
+            start,
+            src_off,
+            len,
+        } => {
+            let k = key::extent_key(ino, start);
+            if zc_worthwhile(len) {
+                let value = Bytes::copy_from_slice(&src[src_off..src_off + len]);
+                cluster
+                    .put_zc(&k, value)
+                    .await
+                    .map_err(|e| anyhow!("put_zc: {e}"))?;
+            } else {
+                cluster
+                    .put(&k, &src[src_off..src_off + len])
+                    .await
+                    .map_err(|e| anyhow!("put: {e}"))?;
+            }
+            Ok((start, len as u32))
+        }
+        WriteStep::Rmw {
+            extent_start,
+            in_extent_off,
+            src_off,
+            len,
+            new_value_len,
+        } => {
+            let k = key::extent_key(ino, extent_start);
+            let mut val = cluster
+                .get(&k)
+                .await
+                .map_err(|e| anyhow!("rmw get: {e}"))?
+                .unwrap_or_default();
+            if val.len() < new_value_len {
+                val.resize(new_value_len, 0);
+            }
+            val[in_extent_off..in_extent_off + len].copy_from_slice(&src[src_off..src_off + len]);
+            let put_len = val.len();
+            if zc_worthwhile(put_len) {
+                cluster
+                    .put_zc(&k, Bytes::from(val))
+                    .await
+                    .map_err(|e| anyhow!("rmw put_zc: {e}"))?;
+            } else {
+                cluster
+                    .put(&k, &val)
+                    .await
+                    .map_err(|e| anyhow!("rmw put: {e}"))?;
+            }
+            Ok((extent_start, put_len as u32))
+        }
+    }
+}
+
+/// Update `opened.size` + the persistent `InodeMeta.size` if `new_eof` is past
+/// the current EOF. Shared by the parallel + sequential write entry points.
+async fn maybe_persist_size_growth(
+    cluster: &ClusterClient,
+    opened: &mut OpenedExtents,
+    new_eof: u64,
+) -> Result<()> {
+    if new_eof <= opened.size {
+        return Ok(());
+    }
+    opened.size = new_eof;
+    let ik = key::inode_key(opened.ino);
+    let mv = cluster
+        .get(&ik)
+        .await
+        .map_err(|e| anyhow!("inode get: {e}"))?
+        .ok_or_else(|| anyhow!("ENOENT inode {} during write", opened.ino))?;
+    let mut meta = schema::decode_inode_meta(&mv).map_err(|e| anyhow!("decode inode: {e}"))?;
+    meta.size = new_eof;
+    let new_mv = schema::encode_inode_meta(&meta);
+    cluster
+        .put(&ik, &new_mv)
+        .await
+        .map_err(|e| anyhow!("inode put: {e}"))?;
+    Ok(())
+}
+
+/// F242 + F241-A — write `src` at `[off, off + src.len())` into an opened fuse
+/// file. Returns the byte count written (= `src.len()` unless empty).
 ///
-/// The caller (the daemon's `service_sqe`) ensures `src` is the ring buffer
-/// slot the client wrote into for this SQE. `src` is copied into a heap `Bytes`
-/// before the put — the client may reuse the slot the moment the CQE lands.
+/// **F241-A step concurrency.** `plan_write` splits the write into ≤ 8 MiB
+/// extent-aligned steps, each targeting a DISTINCT extent. Steps now run
+/// concurrently via `fan_out_collect(BATCH_PUT_DEFAULT_CONCURRENCY)` — the
+/// pre-F241-A path serial-`await`d each step, so an N-extent SQE write paid
+/// ≈ N × per-extent latency. With fan-out, N extents on different partitions
+/// issue in parallel (the per-partition-conn writer task multiplexes); same-
+/// partition extents still serialise at the PS (single-core per partition),
+/// but cross-partition gets full parallelism.
 ///
-/// `opened` is updated in place: the extent map is upserted after each step;
-/// if EOF moved forward, `opened.size` and the persistent `InodeMeta.size`
-/// are both updated (one extra `inode_key` round-trip — acceptable for the
-/// model-file write-once workload where bytes-per-write dominates).
+/// All steps touch distinct extent keys, so the puts are independent (no
+/// in-batch RMW conflict). Source bytes are copied out of the ring slot into
+/// a heap `Bytes` INSIDE each step (the client may reuse the slot the moment
+/// the CQE lands). The wire transfer from the heap `Bytes` is zero-copy
+/// (`put_zc` keeps the value as its own iovec; UCX RDMA's it ≥ 64 KiB).
+///
+/// `opened` is updated in place: after all steps land, the extent map is
+/// upserted for each; if EOF moved forward, `opened.size` and the persistent
+/// `InodeMeta.size` are both updated.
+///
+/// **Single-writer-per-fd assumption (POSIX-style).** Two concurrent
+/// `write_into` calls against the same `OpenedExtents` would race the cache
+/// updates. The model-file workload is single-writer.
 pub async fn write_into(
     cluster: &ClusterClient,
     opened: &mut OpenedExtents,
@@ -153,83 +258,49 @@ pub async fn write_into(
         return Ok(0);
     }
     let steps = plan_write(&opened.extents, off, src.len());
+    let ino = opened.ino;
 
-    for step in &steps {
-        match *step {
-            WriteStep::Append {
-                start,
-                src_off,
-                len,
-            } => {
-                let k = key::extent_key(opened.ino, start);
-                if zc_worthwhile(len) {
-                    let value = Bytes::copy_from_slice(&src[src_off..src_off + len]);
-                    cluster
-                        .put_zc(&k, value)
-                        .await
-                        .map_err(|e| anyhow!("put_zc: {e}"))?;
-                } else {
-                    cluster
-                        .put(&k, &src[src_off..src_off + len])
-                        .await
-                        .map_err(|e| anyhow!("put: {e}"))?;
-                }
-                upsert(&mut opened.extents, start, len as u32);
-            }
-            WriteStep::Rmw {
-                extent_start,
-                in_extent_off,
-                src_off,
-                len,
-                new_value_len,
-            } => {
-                let k = key::extent_key(opened.ino, extent_start);
-                let mut val = cluster
-                    .get(&k)
-                    .await
-                    .map_err(|e| anyhow!("rmw get: {e}"))?
-                    .unwrap_or_default();
-                if val.len() < new_value_len {
-                    val.resize(new_value_len, 0);
-                }
-                val[in_extent_off..in_extent_off + len]
-                    .copy_from_slice(&src[src_off..src_off + len]);
-                let put_len = val.len();
-                if zc_worthwhile(put_len) {
-                    cluster
-                        .put_zc(&k, Bytes::from(val))
-                        .await
-                        .map_err(|e| anyhow!("rmw put_zc: {e}"))?;
-                } else {
-                    cluster
-                        .put(&k, &val)
-                        .await
-                        .map_err(|e| anyhow!("rmw put: {e}"))?;
-                }
-                upsert(&mut opened.extents, extent_start, put_len as u32);
-            }
+    let futs = steps
+        .iter()
+        .map(|step| execute_step(cluster, ino, src, step));
+    let results = fan_out_collect(futs, BATCH_PUT_DEFAULT_CONCURRENCY).await;
+
+    for r in &results {
+        if let Err(e) = r {
+            return Err(anyhow!("write step failed: {e}"));
         }
     }
-
-    let new_eof = off + src.len() as u64;
-    if new_eof > opened.size {
-        opened.size = new_eof;
-        // Persist InodeMeta so a later Open's load_extent_map sees the new EOF.
-        let ik = key::inode_key(opened.ino);
-        let mv = cluster
-            .get(&ik)
-            .await
-            .map_err(|e| anyhow!("inode get: {e}"))?
-            .ok_or_else(|| anyhow!("ENOENT inode {} during write", opened.ino))?;
-        let mut meta = schema::decode_inode_meta(&mv).map_err(|e| anyhow!("decode inode: {e}"))?;
-        meta.size = new_eof;
-        let new_mv = schema::encode_inode_meta(&meta);
-        cluster
-            .put(&ik, &new_mv)
-            .await
-            .map_err(|e| anyhow!("inode put: {e}"))?;
+    for r in results {
+        let (start, new_len) = r.expect("checked above");
+        upsert(&mut opened.extents, start, new_len);
     }
 
+    maybe_persist_size_growth(cluster, opened, off + src.len() as u64).await?;
+    Ok(src.len())
+}
+
+/// Sequential reference implementation of [`write_into`] — applies each
+/// planned step serially. Kept for the F241-A perf comparison so the
+/// parallel-vs-sequential delta can be measured in one process. Production
+/// callers should use [`write_into`].
+pub async fn write_into_sequential(
+    cluster: &ClusterClient,
+    opened: &mut OpenedExtents,
+    off: u64,
+    src: &[u8],
+) -> Result<usize> {
+    if src.is_empty() {
+        return Ok(0);
+    }
+    let steps = plan_write(&opened.extents, off, src.len());
+    let ino = opened.ino;
+
+    for step in &steps {
+        let (start, new_len) = execute_step(cluster, ino, src, step).await?;
+        upsert(&mut opened.extents, start, new_len);
+    }
+
+    maybe_persist_size_growth(cluster, opened, off + src.len() as u64).await?;
     Ok(src.len())
 }
 

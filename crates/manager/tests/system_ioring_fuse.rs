@@ -336,3 +336,291 @@ fn f242_ioring_writes_fuse_file() {
         );
     });
 }
+
+/// Boot an N-partition cluster sliced on `[0x03][ino BE][logical_off BE]`
+/// boundaries for `ino`: extent at offset `i * 8 MiB` lands on partition `i`.
+/// Used by the F241-A perf test so a multi-extent write to `ino` distributes
+/// across N PS cores instead of serialising on one. (Splits are ino-specific —
+/// other inos' extent keys all land on a single end-partition; this fixture
+/// targets perf measurement for one inode.)
+async fn boot_multi_partition_cluster_for_ino(
+    mgr_addr: std::net::SocketAddr,
+    n1_addr: std::net::SocketAddr,
+    n2_addr: std::net::SocketAddr,
+    base: u16,
+    ino: u64,
+    n_parts: u64,
+) -> ClusterClient {
+    let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+    register_two_nodes(&mgr, n1_addr, n2_addr, base).await;
+
+    for i in 0..n_parts {
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        let start_key: Vec<u8> = if i == 0 {
+            Vec::new()
+        } else {
+            key::extent_key(ino, i * MAX_EXTENT as u64)
+        };
+        let end_key: Vec<u8> = if i == n_parts - 1 {
+            vec![0xff, 0xff, 0xff, 0xff]
+        } else {
+            key::extent_key(ino, (i + 1) * MAX_EXTENT as u64)
+        };
+        let part_id = (base as u64) * 100 + i + 1;
+        upsert_partition(&mgr, part_id, log, row, meta, &start_key, &end_key).await;
+    }
+
+    let ps_addr = pick_addr();
+    start_partition_server(base as u64, mgr_addr, ps_addr);
+    // Multi-partition opens take longer than single — give P-log/P-bulk threads
+    // time to spin up + region_sync time to assign all parts.
+    compio::time::sleep(Duration::from_millis(3000)).await;
+    let _ = RpcClient::connect(ps_addr).await.unwrap();
+    let cluster = ClusterClient::connect(&mgr_addr.to_string())
+        .await
+        .expect("ClusterClient::connect");
+    cluster.set_rpc_timeout(Duration::from_secs(120));
+    cluster
+}
+
+/// F241-A — measure `write_into` (parallel, fan_out) vs `write_into_sequential`
+/// (the pre-F241-A serial reference) on multi-extent writes. Single-partition
+/// cluster (matches the other system tests); per the PS partition QPS ceiling,
+/// same-partition extents serialise on the PS's single core — so the speedup
+/// you see here is the CLIENT-side pipelining win (in-flight RPC overlap), not
+/// the multi-partition parallel-PS win that production cross-partition
+/// workloads land on. Numbers logged via println!; run with `--nocapture`.
+#[test]
+#[ignore]
+fn f241a_parallel_write_into_perf() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 138, 13801).await;
+
+        let mut state = FsState::new(&mgr_addr.to_string())
+            .await
+            .expect("FsState::new");
+        dispatch::init_root(&mut state).await.expect("init_root");
+
+        let dclient = ClusterClient::connect(&mgr_addr.to_string())
+            .await
+            .expect("daemon client");
+        dclient.set_rpc_timeout(Duration::from_secs(120));
+
+        async fn make_empty_file(state: &mut FsState, name: &[u8], ino: u64) {
+            let m = meta::new_file_meta(0o644, 0, 0);
+            meta::put_inode(state, ino, &m).await.expect("put_inode");
+            let dk = key::dirent_key(ROOT_INO, name);
+            let dv = schema::encode_dirent(&DirentValue {
+                child_inode: ino,
+                file_type: DT_REG,
+            });
+            state.kv_put(&dk, &dv).await.expect("put dirent");
+        }
+
+        // Sizes covering 1 / 8 / 16 extents per write.
+        let cases: &[(&str, usize)] = &[
+            ("8 MiB  (1 extent)", MAX_EXTENT),
+            ("64 MiB (8 extents)", 8 * MAX_EXTENT),
+            ("128 MiB (16 extents)", 16 * MAX_EXTENT),
+        ];
+        let iters = 3;
+        let mut next_ino: u64 = 300;
+
+        println!();
+        println!("=== F241-A write_into perf ===");
+        println!("(single-partition cluster — same-partition extents serialise at PS;");
+        println!(" the speedup here is the client-side in-flight RPC pipelining win)");
+        println!();
+        println!(
+            "{:24}  {:>10}  {:>12}  {:>12}  {:>10}  {:>6}",
+            "size", "iters", "seq ms/op", "par ms/op", "par MB/s", "ratio"
+        );
+
+        for (label, size) in cases {
+            let data = pattern(*size);
+
+            // Sequential samples (fresh inode per iter — pure appends, no RMW).
+            let mut seq_total = std::time::Duration::ZERO;
+            for i in 0..iters {
+                let ino = next_ino;
+                next_ino += 1;
+                let name = format!("seq-{label}-{i}-{ino}.bin");
+                make_empty_file(&mut state, name.as_bytes(), ino).await;
+                let mut opened = fuse_read::open(&dclient, name.as_bytes())
+                    .await
+                    .expect("open");
+                let t0 = std::time::Instant::now();
+                let n = fuse_write::write_into_sequential(&dclient, &mut opened, 0, &data)
+                    .await
+                    .expect("seq write");
+                let dt = t0.elapsed();
+                assert_eq!(n, *size);
+                seq_total += dt;
+            }
+
+            // Parallel samples (fresh inode per iter).
+            let mut par_total = std::time::Duration::ZERO;
+            for i in 0..iters {
+                let ino = next_ino;
+                next_ino += 1;
+                let name = format!("par-{label}-{i}-{ino}.bin");
+                make_empty_file(&mut state, name.as_bytes(), ino).await;
+                let mut opened = fuse_read::open(&dclient, name.as_bytes())
+                    .await
+                    .expect("open");
+                let t0 = std::time::Instant::now();
+                let n = fuse_write::write_into(&dclient, &mut opened, 0, &data)
+                    .await
+                    .expect("par write");
+                let dt = t0.elapsed();
+                assert_eq!(n, *size);
+                par_total += dt;
+            }
+
+            let seq_ms = seq_total.as_secs_f64() * 1000.0 / iters as f64;
+            let par_ms = par_total.as_secs_f64() * 1000.0 / iters as f64;
+            let par_mbs =
+                (*size as f64) / (par_total.as_secs_f64() / iters as f64) / (1024.0 * 1024.0);
+            let ratio = if par_ms > 0.0 { seq_ms / par_ms } else { 0.0 };
+            println!(
+                "{:24}  {:>10}  {:>12.2}  {:>12.2}  {:>10.1}  {:>5.2}x",
+                label, iters, seq_ms, par_ms, par_mbs, ratio
+            );
+        }
+        println!();
+    });
+}
+
+/// F241-A multi-partition perf — same comparison as `f241a_parallel_write_into_perf`,
+/// but the cluster is sliced into 4 partitions for a fixed `ino`, so the 4-extent
+/// (32 MiB) and 8-extent (64 MiB) writes land each extent on a different PS core.
+/// This is where the parallel write_into is supposed to win: cross-partition fan
+/// out, not same-partition serialisation.
+#[test]
+#[ignore]
+fn f241a_parallel_write_into_perf_multi_partition() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        // The "fixed inode" the partition layout targets — all extents in the
+        // perf test go to this inode so they hit the planned per-extent splits.
+        let target_ino: u64 = 600;
+        let n_parts: u64 = 4;
+        let _admin = boot_multi_partition_cluster_for_ino(
+            mgr_addr, n1_addr, n2_addr, 139, target_ino, n_parts,
+        )
+        .await;
+
+        let mut state = FsState::new(&mgr_addr.to_string())
+            .await
+            .expect("FsState::new");
+        dispatch::init_root(&mut state).await.expect("init_root");
+
+        let dclient = ClusterClient::connect(&mgr_addr.to_string())
+            .await
+            .expect("daemon client");
+        dclient.set_rpc_timeout(Duration::from_secs(120));
+
+        // Sizes: 1 / 2 / 4 / 8 extents — at 8 extents we wrap around the 4
+        // partitions twice (2 per partition), so each partition still gets
+        // some parallelism but the wall-clock = max(per-partition serial chain).
+        let cases: &[(&str, usize)] = &[
+            ("8 MiB  (1 extent  → 1 part)", MAX_EXTENT),
+            ("16 MiB (2 extents → 2 parts)", 2 * MAX_EXTENT),
+            ("32 MiB (4 extents → 4 parts)", 4 * MAX_EXTENT),
+            ("64 MiB (8 extents → 4 parts ×2)", 8 * MAX_EXTENT),
+        ];
+
+        // To avoid RMW across iters, each measurement uses the SAME `target_ino`
+        // but writes are non-overlapping ranges within it (offset moves forward
+        // by `size` each iter). After all sequential cases, all parallel cases
+        // continue from the next offset. Because the partition splits are at
+        // every 8 MiB boundary for ino=600, this still hits all partitions.
+        //
+        // We measure 1 iter per (case, mode) — multi-partition wall-clock is
+        // already representative; averaging would just need an EOF that exceeds
+        // partition 4's range (4 × 8 MiB = 32 MiB), beyond which extents wrap
+        // back to partition 4. The seq/par offsets below stay within reach.
+        // Reuse target_ino exclusively; pre-create its dirent + meta once.
+        let name = b"perf.bin";
+        let m = meta::new_file_meta(0o644, 0, 0);
+        meta::put_inode(&mut state, target_ino, &m)
+            .await
+            .expect("put_inode target");
+        let dk = key::dirent_key(ROOT_INO, name);
+        let dv = schema::encode_dirent(&DirentValue {
+            child_inode: target_ino,
+            file_type: DT_REG,
+        });
+        state.kv_put(&dk, &dv).await.expect("put dirent");
+
+        println!();
+        println!("=== F241-A multi-partition write_into perf ===");
+        println!(
+            "{} partitions, splits every 8 MiB for ino={}",
+            n_parts, target_ino
+        );
+        println!(
+            "{:36}  {:>12}  {:>12}  {:>10}  {:>6}",
+            "size", "seq ms/op", "par ms/op", "par MB/s", "ratio"
+        );
+
+        // Use offset > 0 to avoid first-extent special-casing; write each
+        // (mode,size) at a distinct offset (sequential first, then parallel).
+        let mut cursor: u64 = 0;
+
+        for (label, size) in cases {
+            let data = pattern(*size);
+
+            // Sequential pass: open + write at `cursor`, fresh extents.
+            let mut opened = fuse_read::open(&dclient, name).await.expect("open seq");
+            let t0 = std::time::Instant::now();
+            let n = fuse_write::write_into_sequential(&dclient, &mut opened, cursor, &data)
+                .await
+                .expect("seq write");
+            let seq = t0.elapsed();
+            assert_eq!(n, *size);
+            cursor += *size as u64;
+
+            // Parallel pass: open + write at the new cursor (still fresh
+            // extents — they're past the prior sequential write, so it's Append
+            // semantics, not RMW).
+            let mut opened = fuse_read::open(&dclient, name).await.expect("open par");
+            let t0 = std::time::Instant::now();
+            let n = fuse_write::write_into(&dclient, &mut opened, cursor, &data)
+                .await
+                .expect("par write");
+            let par = t0.elapsed();
+            assert_eq!(n, *size);
+            cursor += *size as u64;
+
+            let seq_ms = seq.as_secs_f64() * 1000.0;
+            let par_ms = par.as_secs_f64() * 1000.0;
+            let par_mbs = (*size as f64) / par.as_secs_f64() / (1024.0 * 1024.0);
+            let ratio = if par_ms > 0.0 { seq_ms / par_ms } else { 0.0 };
+            println!(
+                "{:36}  {:>12.2}  {:>12.2}  {:>10.1}  {:>5.2}x",
+                label, seq_ms, par_ms, par_mbs, ratio
+            );
+        }
+        println!();
+    });
+}

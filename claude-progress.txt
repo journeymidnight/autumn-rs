@@ -1,5 +1,73 @@
 Date: 2026-05-26
 TaskStatus: completed
+Task scope: F241-A — parallelize write_into's per-step puts via fan_out
+  (the user-prompted follow-up: "也不是一定4k,不是变长的吗?" caught the
+  pre-F241-A "4 KiB hot path = ZC-ineligible" framing as the bench-gate spec,
+  not the actual workload — F247 made writes variable-length up to 8 MiB so
+  multi-extent SQE writes ARE in the ZC + batch zone). Plus a perf test
+  comparing parallel vs the retained write_into_sequential reference.
+
+F241-A done (this iteration):
+  - fuse_write.rs refactor: extracted execute_step(cluster, ino, src, step)
+    -> Result<(start, new_len)> (pure I/O, no state mutation) +
+    maybe_persist_size_growth(cluster, opened, new_eof) so the two
+    entry points (parallel + sequential) share both halves.
+  - write_into now drives fan_out_collect(per-step futures,
+    BATCH_PUT_DEFAULT_CONCURRENCY) — same primitive put_many uses. The
+    pre-F241-A `for step in steps { put.await }` paid N × per-extent
+    latency for an N-extent write; parallel issues all steps concurrently
+    (plan_write splits at extent boundaries → distinct extent keys, no
+    in-batch RMW conflict).
+  - write_into_sequential kept as the perf-baseline reference (pub fn,
+    referenced by the perf test). Single-writer-per-fd assumption
+    documented (POSIX-style; multiple writes against same OpenedExtents
+    would race the cache update — the model-file workload is single-writer).
+  - 7 unit tests (plan_write) unchanged; e2e correctness
+    f242_ioring_writes_fuse_file PASS 2.56s release (parallel path).
+
+  Perf measured (real cluster, release):
+    Single-partition (f241a_parallel_write_into_perf, 3 iters/case):
+      8 MiB  (1 extent)    seq 36.95 ms vs par 31.06 ms  → 1.19x
+      64 MiB (8 extents)   seq 241.51   vs par 258.92    → 0.93x
+      128 MiB (16 extents) seq 489.17   vs par 524.39    → 0.93x
+      → Same-partition extents serialise on the PS single core + per-stream
+        StreamAppendState mutex; client-side fan-out adds overhead with no
+        underlying parallelism. Expected.
+
+    Multi-partition 4-way (f241a_parallel_write_into_perf_multi_partition,
+      splits every 8 MiB for ino=600 so per-extent goes to its own partition):
+      8 MiB  (1 extent  → 1 part)        seq 43.97  vs par 49.80  → 0.88x
+      16 MiB (2 extents → 2 parts)       seq 84.37  vs par 68.57  → 1.23x
+      32 MiB (4 extents → 4 parts)       seq 127.62 vs par 142.16 → 0.90x
+      64 MiB (8 extents → 4 parts ×2)    seq 283.11 vs par 266.24 → 1.06x
+      → 2-extent case is the clean win (cross-PS parallelism); 4-extent
+        regression likely the 2 ENs shared across all 4 partitions
+        bottleneck (intra-host loopback TCP).
+
+  Honest verdict: structural change is correct (matches put_many fan-out
+    pattern, opens cross-host UCX-RDMA win, no regression), measured
+    intra-host speedup is modest (1.0–1.2x). The 4×–8× win this would land
+    on is multi-host UCX cross-PS (project_ucx_crosshost_wins: 4.6× on
+    8 MiB read cross-host; write side should mirror). Needs a multi-host
+    bench rig to verify — deferred.
+
+  Verified: workspace clippy --workspace --exclude autumn-fuse
+    --all-targets -- -D warnings EXIT=0; fmt clean.
+
+Still pending in F241:
+  - F241-B: cross-SQE fan-out grouping in daemon poller (multiple Write
+    SQEs from one ring batch grouped by target → one put_many). Lower
+    priority — F244-C's per-SQE FuturesUnordered already pipelines across
+    SQEs; framing-amortisation win is small vs the per-SQE win F241-A
+    unlocked.
+  - F241 cross-host perf: needs multi-host UCX rig, NOT runnable on the
+    current intra-host loopback box.
+
+Committed + pushed this iteration.
+
+--- prior iteration ---
+Date: 2026-05-26
+TaskStatus: completed
 Task scope: F242 — io_uring daemon Opcode::Write (write into autumn-fuse files
   via the same F247 variable-length-extent KV layout the fuse mount uses).
   User: "从 F242 开始" — the daemon-write half that F241 findings flagged as
