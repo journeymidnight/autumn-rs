@@ -25,7 +25,7 @@ use autumn_fuse::schema::{self, DirentValue, DT_REG, MAX_EXTENT, ROOT_INO};
 use autumn_fuse::state::FsState;
 use autumn_fuse::{dispatch, key, meta, write};
 
-use autumn_ioring::fuse_read;
+use autumn_ioring::{fuse_read, fuse_write};
 
 use support::*;
 
@@ -171,6 +171,168 @@ fn f248_ioring_reads_fuse_file() {
         assert!(
             fuse_read::open(&dclient, b"nope.bin").await.is_err(),
             "missing path errors"
+        );
+    });
+}
+
+#[test]
+#[ignore]
+fn f242_ioring_writes_fuse_file() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 137, 13701).await;
+
+        // ── Seed a fuse INODE (no data extents) via the fuse meta path: dirent
+        // for the daemon's path walk + empty InodeMeta. The daemon's Write
+        // (F242) is what populates the file extents.
+        let mut state = FsState::new(&mgr_addr.to_string())
+            .await
+            .expect("FsState::new");
+        dispatch::init_root(&mut state).await.expect("init_root");
+        let ino = 200u64;
+        let m = meta::new_file_meta(0o644, 0, 0);
+        meta::put_inode(&mut state, ino, &m)
+            .await
+            .expect("put_inode");
+        let dk = key::dirent_key(ROOT_INO, b"daemon-write.bin");
+        let dv = schema::encode_dirent(&DirentValue {
+            child_inode: ino,
+            file_type: DT_REG,
+        });
+        state.kv_put(&dk, &dv).await.expect("put dirent");
+
+        // ── Drive the daemon-side WRITE path directly (mirrors how the daemon
+        // services an Opcode::Write SQE: open → write_into → mutate
+        // OpenedExtents). 10 MiB written in 3 chunks: 8 MiB append + 2 MiB
+        // append (crosses extent boundary, so plan_write should split into
+        // two steps + create extents at 0 and 8 MiB) + a small overwrite.
+        let dclient = ClusterClient::connect(&mgr_addr.to_string())
+            .await
+            .expect("daemon client");
+        dclient.set_rpc_timeout(Duration::from_secs(30));
+
+        let mut opened = fuse_read::open(&dclient, b"daemon-write.bin")
+            .await
+            .expect("open empty");
+        assert_eq!(opened.size, 0);
+        assert!(opened.extents.is_empty());
+
+        let total = 10 * 1024 * 1024usize;
+        let data = pattern(total);
+
+        // Two writes: first 8 MiB (single Append, ZC path), then 2 MiB
+        // continuation (Append in the new extent at off=8 MiB).
+        let n1 = fuse_write::write_into(&dclient, &mut opened, 0, &data[..MAX_EXTENT])
+            .await
+            .expect("write extent 0");
+        assert_eq!(n1, MAX_EXTENT);
+        assert_eq!(opened.size, MAX_EXTENT as u64);
+        assert_eq!(opened.extents, vec![(0, MAX_EXTENT as u32)]);
+
+        let n2 = fuse_write::write_into(
+            &dclient,
+            &mut opened,
+            MAX_EXTENT as u64,
+            &data[MAX_EXTENT..],
+        )
+        .await
+        .expect("write extent 1");
+        assert_eq!(n2, 2 * 1024 * 1024);
+        assert_eq!(opened.size, total as u64);
+        assert_eq!(
+            opened.extents,
+            vec![(0, MAX_EXTENT as u32), (MAX_EXTENT as u64, 2 * 1024 * 1024)],
+            "two variable-length extents (off 0 + off 8 MiB)"
+        );
+
+        // ── Verify: daemon Read sees what daemon Write wrote.
+        let full = fuse_read::read(&dclient, &opened, 0, total as u32)
+            .await
+            .expect("daemon-side full read");
+        assert_eq!(full.len(), total);
+        assert!(full == data, "daemon read mismatch after daemon write");
+
+        // Small sub-range (<64K → regular MSG_GET) inside extent 0.
+        let sub = fuse_read::read(&dclient, &opened, 1000, 4096)
+            .await
+            .expect("daemon-side sub-range");
+        assert!(sub == data[1000..1000 + 4096], "sub-range mismatch");
+
+        // Cross-extent read spanning the 8 MiB boundary.
+        let coff = (MAX_EXTENT - 32 * 1024) as u64;
+        let clen = 64 * 1024u32;
+        let cross = fuse_read::read(&dclient, &opened, coff, clen)
+            .await
+            .expect("cross-extent");
+        assert!(
+            cross == data[coff as usize..coff as usize + clen as usize],
+            "cross-extent mismatch"
+        );
+
+        // ── Cross-verify: an INDEPENDENT Open sees the persisted size + map
+        // (the InodeMeta.size write in fuse_write::write_into is what makes
+        // load_extent_map infer the right length for the trailing 2 MiB extent).
+        let opened2 = fuse_read::open(&dclient, b"daemon-write.bin")
+            .await
+            .expect("re-open after daemon write");
+        assert_eq!(opened2.size, total as u64, "InodeMeta.size persisted");
+        assert_eq!(
+            opened2.extents,
+            vec![(0, MAX_EXTENT as u32), (MAX_EXTENT as u64, 2 * 1024 * 1024)],
+            "extent map reloaded from KV"
+        );
+
+        // ── Overwrite (RMW) inside extent 0: rewrite [1000, 1100) with a
+        // distinctive byte pattern, then read it back from the SAME extent.
+        let patch = vec![0xAAu8; 100];
+        let n3 = fuse_write::write_into(&dclient, &mut opened, 1000, &patch)
+            .await
+            .expect("overwrite RMW");
+        assert_eq!(n3, 100);
+        // Size unchanged (RMW inside existing extent, end stays within).
+        assert_eq!(opened.size, total as u64);
+        // Extent map unchanged in shape.
+        assert_eq!(opened.extents.len(), 2);
+        assert_eq!(opened.extents[0], (0, MAX_EXTENT as u32));
+        let after = fuse_read::read(&dclient, &opened, 1000, 100)
+            .await
+            .expect("read patched bytes");
+        assert!(after == patch, "RMW round-trip mismatch");
+        // Bytes immediately before and after the patch are unchanged.
+        let before = fuse_read::read(&dclient, &opened, 0, 1000)
+            .await
+            .expect("read prefix");
+        assert!(before == data[..1000], "prefix unchanged by RMW");
+        let tail = fuse_read::read(&dclient, &opened, 1100, 8192)
+            .await
+            .expect("read after RMW");
+        assert!(tail == data[1100..1100 + 8192], "tail unchanged by RMW");
+
+        // ── Verify the FUSE-mount write path can still read what the daemon
+        // wrote: open via FsState (the kernel-fuse-side reader path uses the
+        // same KV layout) and read the file via the fuse read::execute path.
+        let mut state2 = FsState::new(&mgr_addr.to_string())
+            .await
+            .expect("FsState::new 2");
+        let read_full = autumn_fuse::read::read(&mut state2, ino, 0, total as u32)
+            .await
+            .expect("fuse-side read");
+        assert_eq!(read_full.len(), total);
+        // Reconstruct the expected file content after the RMW.
+        let mut expected = data.clone();
+        expected[1000..1100].copy_from_slice(&patch);
+        assert!(
+            read_full == expected,
+            "fuse-side read mismatch — daemon write not visible to mount path"
         );
     });
 }

@@ -1,3 +1,66 @@
+Date: 2026-05-26
+TaskStatus: completed
+Task scope: F242 — io_uring daemon Opcode::Write (write into autumn-fuse files
+  via the same F247 variable-length-extent KV layout the fuse mount uses).
+  User: "从 F242 开始" — the daemon-write half that F241 findings flagged as
+  the prerequisite to unlock io_uring put_many.
+
+F242 done (this iteration):
+  Module shape mirrors F248 fuse_read (daemon-side, ungated key+schema, no
+  fuser/FsState):
+  - crates/ioring/src/fuse_write.rs (NEW, feature daemon):
+    plan_write(extents, off, src_len) -> Vec<WriteStep{Append|Rmw}> pure fn
+    (cap per step = min(MAX_EXTENT=8MiB, next_start) → F247 non-overlap);
+    write_into(cluster, opened, off, src) serial-applies steps. Append =
+    fresh put / put_zc (zc_worthwhile ≥64KiB, F235 single source); RMW =
+    get → splice → put_zc/put. EOF-grow → rewrite InodeMeta.size (one
+    extra inode_key put so the next Open's load_extent_map infers the
+    right last-extent length).
+  - Ring slot → heap Bytes ONE memcpy before put (slot gets reused on CQE
+    landing, can't borrow across await). Wire transfer still ZC iovec on
+    put_zc; on UCX the iovec RDMAs.
+  - crates/ioring/src/lib.rs: gated `pub mod fuse_write` (cfg daemon).
+  - crates/ioring/src/bin/daemon.rs: Opcode::Write Cqe::err(ENOSYS) →
+    real handler. validate_slice + clone OpenedExtents + write_into +
+    brief borrow_mut to commit size/extents back to ring_fds cache.
+    Single-writer per fd (POSIX-like, documented).
+  Deferred (not blocking F242):
+    - True ZC-write-from-ring (slot registration + cross-await borrow +
+      cancel-safety) — bigger change; current is "1 memcpy local, ZC
+      wire" which is what F216-E gives the read side too.
+    - InodeMeta size batched on Close instead of per-grow — Close today
+      only releases ring_fd; would need Close-time flush path.
+    - Multi-writer-per-fd locking — not needed for model-file workload.
+  Verified:
+    cargo build -p autumn-ioring --features daemon clean;
+    cargo test -p autumn-ioring --features daemon --lib → 76 passed
+      (incl. 7 new fuse_write plan_write unit tests: append-empty,
+       split-by-cap, cap-at-next-extent, RMW-inside, RMW-end-grows,
+       empty-write, upsert);
+    cargo clippy -p autumn-ioring --features daemon --all-targets
+      -- -D warnings EXIT=0;
+    workspace clippy --workspace --exclude autumn-fuse --all-targets
+      -- -D warnings EXIT=0;
+    fmt clean;
+    e2e: NEW system_ioring_fuse::f242_ioring_writes_fuse_file PASS on
+      a real cluster (2.87s alone, 3.17s with the f248 read e2e); seed
+      empty inode+dirent only, daemon-side fuse_write::write_into
+      writes 10 MiB (8M append + 2M append + 100B RMW). Asserts:
+      daemon read sees byte-exact written data; independent Open
+      reloads correct size + 2-extent map from KV (InodeMeta.size
+      persistence works); fuse-mount-side autumn_fuse::read::read sees
+      the daemon-written bytes (cross-interface byte parity — F242 and
+      the fuse mount path share the same KV layout). F248 e2e not
+      regressed (both pass in one run).
+
+Outstanding (the rest of the F241 follow-up, still pending after F242):
+  - F241 itself: daemon put_many fan-out batch (now unblocked by F242,
+    but the 4 KiB hot path is ZC-ineligible + already concurrent → no
+    quick win; revisit only with a write bench or workload that needs it).
+
+Code committed + pushed this iteration.
+
+--- prior iteration ---
 Date: 2026-05-25
 TaskStatus: completed
 Task scope: F243-C — UCX/TCP daemon perf comparison (final part of the /loop

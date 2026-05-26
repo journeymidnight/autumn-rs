@@ -280,7 +280,10 @@ async fn handle_session(
 /// `call_ps_for_key` retry closure adds nothing for a stable cluster.
 // F248: a ring_fd maps to an opened FUSE FILE (inode + F247 variable-length
 // extent map), resolved once at Open. Was a single flat KV key + cached PS.
+// F242 adds the write side (`fuse_write`) — same module for daemon-only,
+// ungated key+schema code path.
 use autumn_ioring::fuse_read::{self, OpenedExtents};
+use autumn_ioring::fuse_write;
 
 /// F243: register the ring region with the process-global UCX context so reads
 /// can RDMA-land directly into it. Returns `None` on a non-UCX build or if
@@ -487,7 +490,56 @@ async fn service_sqe(
             Cqe::ok(sqe.user_data, n as u64)
         }
 
-        Opcode::Write => Cqe::err(sqe.user_data, libc::ENOSYS),
+        Opcode::Write => {
+            // F242 — write SQE: ring slot at `buf_offset[..length]` is the
+            // source, `sqe.offset` is the file offset. Same layout/safety
+            // story as Read (validate_slice + single-slot disjointness +
+            // stable mmap base + client-owned slot allocation).
+            let layout = autumn_ioring::buffer_pool::BufferPoolLayout::from_header(header);
+            if layout.validate_slice(sqe.buf_offset, sqe.length).is_err() {
+                return Cqe::err(sqe.user_data, libc::EINVAL);
+            }
+            // Snapshot the opened file's mutable state (extents + size) under a
+            // brief borrow; apply updates back under another brief borrow after
+            // the writes finish. Concurrent writes on the same ring_fd would
+            // race here (POSIX-style: no per-fd concurrency guarantee); the
+            // model-file write-once workload is single-writer per fd.
+            let mut opened = {
+                let fds = ring_fds.borrow();
+                match fds.get(&sqe.ring_fd) {
+                    Some(o) => OpenedExtents {
+                        ino: o.ino,
+                        size: o.size,
+                        extents: o.extents.clone(),
+                    },
+                    None => return Cqe::err(sqe.user_data, libc::EBADF),
+                }
+            };
+            // SAFETY: same argument as Read. validate_slice keeps the slice
+            // inside one buffer-pool slot; the client owns slot allocation and
+            // doesn't reuse an in-flight slot's region, so this `&[u8]` is
+            // disjoint from every other in-flight SQE's slot AND from the SQ/CQ
+            // ring header (a separate area accessed only via the RefCell).
+            // We copy out of the slot inside `write_into` (one memcpy into a
+            // heap `Bytes`) before any await that could see the client free the
+            // slot, so the borrow doesn't have to outlive the await chain.
+            let src: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    data_base.add(sqe.buf_offset as usize),
+                    sqe.length as usize,
+                )
+            };
+            let n = match fuse_write::write_into(cluster, &mut opened, sqe.offset, src).await {
+                Ok(n) => n,
+                Err(_) => return Cqe::err(sqe.user_data, libc::EIO),
+            };
+            // Commit the updated extent map + size back to the cached state.
+            if let Some(o) = ring_fds.borrow_mut().get_mut(&sqe.ring_fd) {
+                o.size = opened.size;
+                o.extents = opened.extents;
+            }
+            Cqe::ok(sqe.user_data, n as u64)
+        }
 
         Opcode::Close => {
             if ring_fds.borrow_mut().remove(&sqe.ring_fd).is_some() {

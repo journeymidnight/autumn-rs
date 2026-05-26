@@ -4168,3 +4168,20 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   - 跑法:本机 8× mlx5 RoCE,eth0=mlx5_1=`[fdbd:dc62:3:302::14]`(对上 project_ucx_crosshost ::14 子网)。`UCX_TLS=^sysv,posix UCX_NET_DEVICES=mlx5_1:1`(per project_ucx 记忆,防 10-device auto-select hang)。两次全栈:TCP 集群 + UCX 集群(`AUTUMN_TRANSPORT=ucx AUTUMN_BIND_HOST=[..::14]`),各经 fuse mount `dd bs=1M count=64`(64 MiB=8×8 MiB extent),daemon + ioring-bench `--read-size 8388608 --slot-size 8388608 --threads 8 --depth 2 --duration 5`。
   - **结果(8 MiB 整 extent 读,intra-host,单 extent/单 partition,3 次取样):TCP 1147/1035/1384 → avg ~1189 MB/s;UCX 2894/2608/2856 → avg ~2786 MB/s → UCX = 2.34× TCP**(精确吻合 project_ucx_zerocopy_default "8M 2.34×")。daemon 日志确认 `ring region registered for UCX RDMA` 每 client 连接触发(8 次,0 失败)→ F243 `ucp_mem_map` ring 注册 + RDMA ZC 读 into ring 真实生效。绝对值受单 partition PS 单核限制(F244-C 同因),但 TCP-vs-UCX 相对差正是传输/ZC 效果。
 - **passes:** true (2026-05-25 — A + B + C all done & verified; UCX 2.34× TCP measured on real RoCE hardware).
+
+### F242 · io_uring daemon `Opcode::Write` — write into autumn-fuse files (variable-length extents)
+- **Trigger:** F241 findings 拆出的"写侧前置条件"(daemon read-only,write 返 `ENOSYS`)。User: "从 F242 开始"。
+- **位置:** F248 daemon path→inode + 变长 extent map(读)是 F242 的对照镜像;F243 完成读侧 RDMA-into-ring ZC 后,写侧仍卡在 daemon 拒收写 SQE。F242 把 write SQE 从 ring slot 写进 autumn-fuse 同一份 KV layout(`[0x03][ino][logical_off]` + InodeMeta.size),让 fuse mount 侧的 read::execute 与 daemon 侧的 read 都能看到 daemon 写的字节。
+- **Scope:**
+  - `crates/ioring/src/fuse_write.rs`(NEW, feature `daemon`):
+    - `WriteStep`{Append, Rmw} + `plan_write(extents, off, src_len)` 纯函数 —— 按 floor/next 把 src 切成多段:`pos` 在已有 extent 内 → RMW;在空洞/EOF 之外 → 新 extent;每段 cap = `min(MAX_EXTENT, next_start)` 保证 F247 不重叠不变量。
+    - `write_into(cluster, opened: &mut OpenedExtents, off, src)` —— 串行应用每步;`zc_worthwhile(len)`(F235 单源)选 `put_zc`(≥64 KiB,UCX 走 iovec RDMA)vs `put`;RMW 路径先 `get` 再 splice 再 `put_zc/put`;EOF 增长时同步刷新 `InodeMeta.size`(`load_extent_map` 用 meta.size 推断末尾 extent 长度,不刷会让下一次 Open 看到旧 size)。
+    - 源字节从 ring slot **memcpy 一次**进 heap `Bytes` 再下发 —— ring slot 在 CQE 落地后可能被 client 重用,不能借走跨 await。`put_zc` 之后的传输仍 ZC(iovec)。
+  - `crates/ioring/src/lib.rs`: gated `pub mod fuse_write`(对照已有 `fuse_read` 的 `#[cfg(feature = "daemon")]`)。
+  - `crates/ioring/src/bin/daemon.rs`: `Opcode::Write` 由 `ENOSYS` → 真实处理。`validate_slice` 同 Read;克隆 OpenedExtents → `write_into` → 成功后 brief `borrow_mut` 回写 size+extents 到 `ring_fds` 缓存。单 ring_fd 单 writer(POSIX-like,文档化);Read/Write 并发安全靠 brief borrow + clone-snapshot。
+- **没做(故意):**
+  - **ZC-write-from-ring 全免拷贝**:需要 ring slot 注册 + 跨 await 借出 + cancel-safety,与 F216-E read-side ZC 的写侧镜像是更大改造。当前 1 次 memcpy(ring → Bytes)+ 网络 ZC iovec 已够用;真省的是网络 wire 上的拷贝。
+  - **InodeMeta size 批量持久化**:每次扩 EOF 多 1 个 inode put RPC。模型文件 write-once、每写字节数大,RPC 占比小;真要省可加 Close-时刷一次(目前 `Opcode::Close` 仅释 ring_fd,不刷)。
+  - **多 SQE 并发写同一 fd**:文档化为 POSIX-style 单写。多写共用 `ring_fds` HashMap 的并发会让 extent map 缓存 lost-update;真要支持需加 per-fd 锁。
+- **Acceptance:** `cargo build -p autumn-ioring --features daemon` clean;clippy `-p autumn-ioring --features daemon --all-targets -- -D warnings` EXIT=0;workspace gate `--workspace --exclude autumn-fuse --all-targets -- -D warnings` EXIT=0;fmt clean;ioring 单测 76 passed(含 `fuse_write::tests` 7 个 plan_write 纯函数:append-empty/split-by-cap/cap-at-next-extent/RMW-inside/RMW-end-grows/empty-write/upsert);**e2e `system_ioring_fuse::f242_ioring_writes_fuse_file` PASS on a real cluster (2.87s)** —— 仅 seed 空 inode+dirent,daemon 侧 `fuse_write::write_into` 写 10 MiB(8M 整 extent ZC + 2M 续段)+ 100B RMW;断言 daemon read 全字节命中、独立 Open 重新 load_extent_map 看到正确 size+2 extent、fuse-mount 侧 `autumn_fuse::read::read` 看到 daemon 写的字节(跨接口字节一致,F242 与 fuse mount path 共享同一份 KV layout)。同跑 f248 read e2e 不退化(2 个 e2e 一起 3.17s PASS)。
+- **passes:** true (2026-05-26).

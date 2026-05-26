@@ -67,6 +67,10 @@ pub mod client;
 /// Gated on `daemon` (needs autumn-client + autumn-fuse key/schema).
 #[cfg(feature = "daemon")]
 pub mod fuse_read;
+/// F242: daemon-side variable-length-extent WRITE planning (mirror of fuse_read).
+/// Gated on `daemon` (needs autumn-client + autumn-fuse key/schema).
+#[cfg(feature = "daemon")]
+pub mod fuse_write;
 #[cfg(target_os = "linux")]
 pub mod mmap;
 #[cfg(target_os = "linux")]
