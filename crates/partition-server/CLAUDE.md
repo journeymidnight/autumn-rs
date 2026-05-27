@@ -1425,3 +1425,23 @@ post-restart.
       `region_sync`'s `open_partition`. Per-conn `handle_ps_connection` spawns
       are intentionally NOT wrapped — a panic there drops one client connection
       (request-scoped), not a background loop.
+
+    **Why explicit `catch_unwind` when `compio::runtime::spawn` already wraps
+    in catch_unwind** (`compio-runtime-0.11.0/src/runtime/mod.rs:202`:
+    `spawn_impl(AssertUnwindSafe(future).catch_unwind())`; `JoinHandle<T> =
+    Task<Result<T, Box<dyn Any + Send>>>`). compio's wrap keeps the *runtime
+    thread* alive on task panic — that's exactly what made pre-F229 "silent
+    death" possible: `spawn(loop_fn).detach()` had the panic caught by
+    compio, then the `JoinHandle` was dropped via `detach`, dropping the
+    captured panic with it. The thread survived; the loop didn't; no log
+    surfaced. F229's explicit `catch_unwind` is for **observability +
+    decisioning** (log, restart, exit), NOT for runtime survival —
+    runtime survival is already compio's job. Equivalent designs that read
+    compio's caught panic via `JoinHandle.await -> Result<T, Box<dyn Any>>`
+    require an extra outer `spawn` to preserve the spawn-and-forget API and
+    aren't simpler; the explicit form here matches the inline comment intent
+    ("catch_unwind + 1 s restart" reads at the call site without indirection).
+    The two catch_unwind layers are not bug-redundant — compio's catches a
+    panic that our inner has already turned into `Result::Err`, so it sees
+    nothing. Don't try to "remove the duplicate"; you'd lose the log + the
+    restart/exit semantic.

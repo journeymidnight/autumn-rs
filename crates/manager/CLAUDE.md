@@ -1379,6 +1379,21 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       `&self` → `self` so its future owns the per-restart handle (the other
       8 were already `self`).
 
+      **Note on layered `catch_unwind`.** `compio::runtime::spawn` itself
+      wraps the future in `AssertUnwindSafe(future).catch_unwind()`
+      (`compio-runtime-0.11.0/src/runtime/mod.rs:202`); its `JoinHandle<T>`
+      is a `Task<Result<T, Box<dyn Any + Send>>>`. That's what made
+      "silent death" possible pre-F228: compio caught the panic, the
+      `.detach()`'d JoinHandle dropped the captured `Err`, the thread
+      survived, no log surfaced. F228's explicit inner `catch_unwind` is
+      for **observability + restart decisioning** — we read the `Result`
+      to log + sleep + restart, instead of letting compio swallow it.
+      Compio's outer wrap then sees a future that never panics (we already
+      caught it), so the two layers are not bug-redundant; "removing the
+      duplicate" would silently break the restart loop. Same shape mirrored
+      on the PS side as `spawn_supervised` + `spawn_failstop` (see
+      partition-server CLAUDE.md note 13).
+
     **Why both, not either:** `catch_unwind` cannot rescue a *hung* await (a
     stuck future never returns, so the supervisor waits forever too) — 1A
     prevents the hang. 1A cannot catch a *panic* — 1C does. **Invariant:

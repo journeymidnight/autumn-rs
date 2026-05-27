@@ -633,6 +633,17 @@ impl AutumnManager {
     /// Hangs are prevented separately by F228 (1A): every await a loop can
     /// reach is now bounded (etcd `unary_call` timeout, ConnPool connect +
     /// request timeouts). The two together close both failure modes.
+    ///
+    /// NOTE on layered `catch_unwind`: `compio::runtime::spawn` already
+    /// wraps the future in `AssertUnwindSafe(future).catch_unwind()`
+    /// internally (compio-runtime-0.11.0/src/runtime/mod.rs:202); its
+    /// `JoinHandle<T>` is `Task<Result<T, Box<dyn Any + Send>>>`. That's
+    /// why pre-F228 `spawn(loop).detach()` was "silently dead" — compio
+    /// caught the panic, then `.detach()` dropped the captured `Err`. Our
+    /// inner `catch_unwind` here is for OBSERVABILITY + RESTART decisioning
+    /// (read the Result to log + sleep + reschedule), NOT to keep the
+    /// runtime alive (which is compio's job). Don't try to "remove the
+    /// duplicate" — you'd silently break the restart loop.
     fn spawn_supervised<F, Fut>(name: &'static str, make: F)
     where
         F: Fn() -> Fut + 'static,

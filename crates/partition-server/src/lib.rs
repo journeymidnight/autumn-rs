@@ -6229,6 +6229,16 @@ pub(crate) async fn flush_memtable_locked(part: &Rc<RefCell<PartitionData>>) -> 
 /// `spawn_supervised`. Pre-F229 these were bare `spawn(..).detach()`, so a
 /// panic killed the loop silently (e.g. heartbeats stop → manager evicts with
 /// no log on the PS side explaining why).
+///
+/// NOTE on layered `catch_unwind`: `compio::runtime::spawn` already wraps
+/// the future in `AssertUnwindSafe(future).catch_unwind()` internally
+/// (compio-runtime-0.11.0/src/runtime/mod.rs:202); `JoinHandle<T> =
+/// Task<Result<T, Box<dyn Any + Send>>>`. That's exactly what made the
+/// pre-F229 silent-death possible: compio catches the panic, then
+/// `.detach()` drops the captured `Err`. The inner `catch_unwind` here is
+/// for OBSERVABILITY + RESTART decisioning (read the Result to log + sleep
+/// + restart), NOT for runtime survival. Don't "remove the duplicate" —
+/// you'd silently break the restart loop.
 pub(crate) fn spawn_supervised<F, Fut>(name: &'static str, make: F)
 where
     F: Fn() -> Fut + 'static,
@@ -6266,6 +6276,14 @@ where
 /// F069/F111 and every partition is reopened from its durable streams (the
 /// log_stream WAL is the source of truth → no committed data lost). Smaller-
 /// blast-radius per-partition self-eviction is a future refinement — see F229.
+///
+/// NOTE on layered `catch_unwind`: `compio::runtime::spawn` already wraps in
+/// `catch_unwind` (see `spawn_supervised` above for the citation). Without
+/// our inner `catch_unwind`, compio would catch the panic and the
+/// `.detach()`'d JoinHandle would silently drop it — process keeps running,
+/// no log, no exit. The inner catch_unwind here is what turns "panic" into
+/// "ERROR-log + `process::exit(1)`"; compio's outer wrap then sees a future
+/// that never panics. Don't "remove the duplicate".
 pub(crate) fn spawn_failstop<Fut>(name: String, fut: Fut)
 where
     Fut: std::future::Future<Output = ()> + 'static,
