@@ -1,3 +1,29 @@
+Date: 2026-05-27
+TaskStatus: completed
+Task scope: ledger-only — close F241-B as WON'T-DO (physically equivalent
+  to F241-A, not "deferred"). User: "put_many 和 get_many_into 底层也是 SQ,
+  CQ 这套逻辑" caught my prior "framing amortisation" justification as
+  hand-wavy; put_many internally IS fan_out_collect = buffer_unordered =
+  the same FuturesUnordered shape the daemon's F244-C poller already uses
+  one layer up. So F241-B vs F241-A is the same primitive at different
+  scopes, not a separate optimisation.
+
+Recorded consequences (feature_list F241 entry, F241-B sub-bullet):
+  - Wire-level identical (same N puts, same N frames).
+  - F241-B's single-fan_out cap (32) would REGRESS F241-A's two-layer
+    cap (32 × 32 = 1024 in-flight puts) unless re-tuned, in which case
+    it's trivially equivalent.
+  - F241-B adds CQE-tracker complexity (N SQE → M puts mapping) with
+    zero offsetting wire benefit.
+
+Status flip: F241 passes: true (was: A done; B deferred). Cross-host
+  UCX perf measurement of F241-A is the only remaining open question
+  and belongs under a separate "multi-host UCX bench rig" feature,
+  not F241.
+
+No code change this iteration.
+
+--- prior iteration ---
 Date: 2026-05-26
 TaskStatus: completed
 Task scope: F241-A — parallelize write_into's per-step puts via fan_out
