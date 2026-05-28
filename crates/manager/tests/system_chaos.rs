@@ -465,9 +465,20 @@ async fn writer_loop(
         let client = router.client_for(part_id).await;
         match client.call(partition_rpc::MSG_PUT, payload).await {
             Ok(resp) => match partition_rpc::rkyv_decode::<partition_rpc::PutResp>(&resp) {
-                Ok(_) => {
+                // Only record `expected[]` when the PS actually accepted
+                // the put — `CODE_OK`. A successful wire decode with
+                // (e.g.) `CODE_INVALID_ARGUMENT` ("key out of range"
+                // when topo is stale post-split, or
+                // `CODE_FAILED_PRECONDITION` region_epoch mismatch) is
+                // a REJECTED write, not an acked one. Pre-fix this was
+                // unconditional and produced false "data loss"
+                // mismatches at verify time on b*/q* boundary keys.
+                Ok(r) if r.code == partition_rpc::CODE_OK => {
                     expected.borrow_mut().insert(key, value);
                     writes_acked.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(_) => {
+                    writes_failed.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(_) => {
                     writes_failed.fetch_add(1, Ordering::Relaxed);
