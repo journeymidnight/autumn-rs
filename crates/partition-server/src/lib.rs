@@ -5352,14 +5352,42 @@ async fn recover_partition(
         .context("union TableLocations from metaStream extents")?;
 
     if !meta_records.is_empty() {
-        // Take the max vp_head across all source partitions (both were
-        // drained pre-merge so neither has stale records past its vp_head).
+        // F184-fix: take the **MIN** vp_head across all source partitions'
+        // checkpoints so log_stream replay starts at the EARLIEST stream
+        // position any source still cared about. The MAX choice (pre-fix)
+        // was unsafe post-merge: the spliced log_stream is
+        // [survivor.extents] + [victim.extents] + [new_tail], and victim's
+        // extents have higher IDs than survivor's (allocated later, post-
+        // split). With recovered_vp_eid = MAX = victim's last extent, the
+        // replay filter `if eid < recovered_vp_eid → skip` drops every
+        // SURVIVOR extent — including survivor's tail log_stream extent
+        // that may hold WAL records for writes the survivor freeze-flushed
+        // into SSTs AFTER survivor's last meta_stream checkpoint was
+        // written. (Survivor's drain rotates active → imm → flushes; the
+        // flush bumps vp_head in memory but the CHECKPOINT publishing
+        // that new vp_head is the LAST step. If the merge captures
+        // commit_length between the flush completing and the checkpoint
+        // landing, survivor's last meta record has a stale vp_head.)
+        //
+        // The MIN choice covers the worst case: replay starts at the
+        // older vp_head, re-walks all extents from there, and the
+        // `if ts <= sst_max_seq { continue; }` dedup at the bottom of
+        // this function naturally skips records already in the SSTs.
+        // Pure cost: extra disk reads on survivor's tail extents.
+        // Surfaced reliably by `AUTUMN_CHAOS_ACTIONS=split,merge` in
+        // system_chaos (8/10 seeds fail without this fix).
+        let mut min_initialized = false;
         for r in &meta_records {
-            if r.vp_extent_id > recovered_vp_eid
-                || (r.vp_extent_id == recovered_vp_eid && r.vp_offset > recovered_vp_off)
+            if r.vp_extent_id == 0 {
+                continue; // empty / not-yet-flushed checkpoint; ignore
+            }
+            if !min_initialized
+                || r.vp_extent_id < recovered_vp_eid
+                || (r.vp_extent_id == recovered_vp_eid && r.vp_offset < recovered_vp_off)
             {
                 recovered_vp_eid = r.vp_extent_id;
                 recovered_vp_off = r.vp_offset;
+                min_initialized = true;
             }
         }
         // Dedup SstLocation by (extent_id, offset, len) — CoW-shared SSTs
