@@ -798,3 +798,61 @@ Verified: the test passes ~17s (was ∞). No regression (lib + reopen integratio
 
 Next (optional): F229 (PS/EN loop supervision/timeouts — F230 fixed one concrete
   PS-loop spin but the broader 1A/1C-for-PS/EN audit-fix is still deferred).
+
+----- session 2026-05-28 — chaos split+merge replay-dedup fix (commit f0ecf64) -----
+Date: 2026-05-28
+TaskStatus: completed
+Task scope: Per-source replay dedup for post-merge spliced log_stream. Old
+  union-max dedup in recover_partition silently skipped one source's
+  post-vp_head tail records whose ts is ≤ the OTHER source's max (since
+  PS-seq counters are INDEPENDENT pre-merge). PLUS dedup CoW-shared
+  extents that appear multiple times in the spliced extent_ids.
+
+Approach:
+  - Added TableLocations.log_extent_count: u32 (source partition's
+    log_stream extent count at flush time).
+  - save_table_locs_raw now takes log_extent_count parameter; callers
+    (commit_flush_outcome + 2 sites in do_compact) fetch via
+    get_stream_info BEFORE borrow_mut to preserve F148-A.
+  - recover_partition sorts meta_records by vp_pos ASC, computes
+    cumulative source regions [Σcount_{j<i}, Σcount_{j≤i}), uses each
+    region's own src_max for dedup.
+  - replay_extents dedups by extent_id — each CoW-shared extent replayed
+    only at its FIRST occurrence (in first source's region) with the
+    correct source-region dedup. Later duplicate occurrences are skipped.
+
+Validation (chaos test split+merge × 10 deterministic seeds):
+  - Per-failure mismatch count drops from baseline 1-3 to fix 0-1.
+  - Pass rate roughly equivalent to baseline due to a separate
+    non-merge bug (see remaining issues below).
+  - Diag-verified regions correctly computed post-merge:
+    seed=99 post-merge2: regions=[end=6,max=9043;end=12,max=8294].
+
+Validation (full chaos action set):
+  - Seeds 100-1000 step 100: 10/10 PASS.
+  - Seeds 1-9 + 1001-1005: 6/10 PASS (4 failures with 0-3 mismatches OR
+    1 not_found).
+
+Known remaining bugs (SEPARATE from this fix):
+  - Seed=3 reliably fails even without kill action (with split,merge,ec,
+    fence,flush,compact,gc,partition,latency). 1 not_found after
+    fence+unfence + network partition sequence. Suggests fence/recovery
+    race or compact-vs-fence ordering issue.
+  - Some seeds with only split+merge produce 1 not_found — likely a
+    freeze-drain race (drain breaks on Ok(false) when bg flush has
+    claimed imm[0]; previous wait-for-imm-empty attempt regressed).
+
+Next steps (future sessions):
+  1. Reproduce seed=3 with --nocapture + targeted PS/EN logging to
+     trace q000185's lifecycle (write → flush/compact → fence → lookup).
+  2. Add same-thread tracing in partition_loop to confirm whether the
+     freeze-drain race is the not_found root cause.
+  3. Expand chaos test to longer durations (60s+) to surface more.
+
+Code locations (this fix):
+  - crates/rpc/src/partition_rpc.rs:457 (TableLocations + log_extent_count)
+  - crates/partition-server/src/lib.rs:~5944 (save_table_locs_raw signature)
+  - crates/partition-server/src/lib.rs:~6263 (commit_flush_outcome)
+  - crates/partition-server/src/background.rs:1866,1910 (do_compact)
+  - crates/partition-server/src/lib.rs:~5562 (recover_partition per-source dedup)
+  - crates/partition-server/src/lib.rs:~5599 (replay_extents CoW dedup)
