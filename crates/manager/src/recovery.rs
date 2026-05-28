@@ -1108,6 +1108,12 @@ impl crate::AutumnManager {
                     parity_shards: parity_shards as u32,
                     target_addrs: ec_target_addrs,
                     eversion: new_eversion,
+                    // F211-D Tier 2: thread the captured owner revision so
+                    // the coord can stamp WriteShard / CommitEcShard with
+                    // it, enabling EN-side fence rejection of a ghost
+                    // ex-coord after `auto_abandon_for_fenced_node` pushes
+                    // the bumped revision to remote targets.
+                    revision: params.revision,
                 });
 
                 // 60 s ceiling so a paged-out / silently dead EN doesn't

@@ -2444,7 +2444,7 @@ impl AutumnManager {
     /// context (recovery liveness, autumn-client info display) MUST use
     /// `probe_extent_on_node` instead — that helper hits `MSG_PROBE_EXTENT`,
     /// which skips the fence entirely.
-    async fn commit_length_on_node(
+    pub(crate) async fn commit_length_on_node(
         &self,
         addr: &str,
         extent_id: u64,
@@ -5610,6 +5610,7 @@ mod tests {
             extra_disk_ids: vec![19],
             data_shards: 3,
             new_eversion: 9,
+            revision: 17,
         };
         let bytes = rkyv_encode(&original).to_vec();
         let decoded: MgrEcDispatchInflight = rkyv_decode(&bytes).expect("decode");
@@ -5618,6 +5619,7 @@ mod tests {
         assert_eq!(decoded.extra_disk_ids, original.extra_disk_ids);
         assert_eq!(decoded.data_shards, original.data_shards);
         assert_eq!(decoded.new_eversion, original.new_eversion);
+        assert_eq!(decoded.revision, original.revision);
     }
 
     /// F198 / F207-B: the unified inflight ledger (the post-F207-B
@@ -5637,6 +5639,7 @@ mod tests {
             extra_disk_ids: vec![19],
             data_shards: 3,
             new_eversion: 4,
+            revision: 0,
         };
         run(async {
             m.acquire_extent_inflight(

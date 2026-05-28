@@ -50,6 +50,7 @@ fn make_dispatch_record(extent_id: u64) -> MgrEcDispatchInflight {
         extra_disk_ids: vec![70],
         data_shards: 3,
         new_eversion: 4,
+        revision: 0,
     }
 }
 

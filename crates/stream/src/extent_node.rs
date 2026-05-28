@@ -4869,13 +4869,18 @@ impl ExtentNode {
                         shard_index: i as u32,
                         sealed_length,
                         eversion: new_eversion,
-                        // F211-D: EC convert is manager-orchestrated; there
-                        // is no per-stream owner-lock to propagate today.
-                        // Passing 0 keeps the EN-side fence permissive on
-                        // this path. Future: thread the manager's epoch
-                        // through `ExtConvertToEcReq` so a fenced ex-coord
-                        // is rejected at write_shard time too.
-                        revision: 0,
+                        // F211-D Tier 2: revision threaded from the
+                        // manager (`MgrEcDispatchInflight.revision` ->
+                        // `ExtConvertToEcReq.revision`). A fenced ex-coord
+                        // whose 2PC keeps running sends WriteShard with
+                        // the now-stale revision; remote EN rejects with
+                        // `CODE_LOCKED_BY_OTHER` because
+                        // `auto_abandon_for_fenced_node` has pushed the
+                        // bumped revision via `MSG_CHECK_COMMIT_LENGTH`
+                        // fence-handover. `req.revision == 0` keeps the
+                        // pre-Tier-2 no-fence semantics for tests /
+                        // memory-only.
+                        revision: req.revision,
                         payload: shards[i].clone(),
                     };
                     let sock = parse_addr(target_addr).map_err(|e| {
@@ -4938,8 +4943,8 @@ impl ExtentNode {
                 extent_id,
                 sealed_length,
                 eversion: new_eversion,
-                // F211-D: see WriteShardReq site above.
-                revision: 0,
+                // F211-D Tier 2: see WriteShardReq site above.
+                revision: req.revision,
             };
             let sock = parse_addr(target_addr).map_err(|e| {
                 (

@@ -592,6 +592,12 @@ pub struct ConvertToEcReq {
     /// k+m target node addresses (data shard nodes first, then parity).
     pub target_addrs: Vec<String>,
     pub eversion: u64,
+    /// F211-D Tier 2: owner-lock revision propagated from manager.
+    /// Coord puts this into every `WriteShardReq.revision` and
+    /// `CommitEcShardReq.revision` so a fenced ex-coord whose in-flight
+    /// 2PC continues against bumped revisions on remote ENs is
+    /// rejected with `CODE_LOCKED_BY_OTHER`. `0` = legacy no-fence.
+    pub revision: i64,
 }
 
 // ── CopyExtent (binary — large payload) ─────────────────────────────────────

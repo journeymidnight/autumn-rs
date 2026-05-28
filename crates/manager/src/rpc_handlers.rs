@@ -3031,12 +3031,45 @@ impl AutumnManager {
         }
 
         let new_eversion = live_eversion + 1;
+
+        // F211-D Tier 2: capture the current owner_lock revision for the
+        // partition that owns this extent. Threaded through dispatch ->
+        // coord -> WriteShard/CommitEcShard so a fenced ex-coord's
+        // in-flight 2PC is rejected by remote ENs once
+        // `auto_abandon_for_fenced_node` bumps their `entry.last_revision`
+        // via fence-handover. CoW-shared extents (refs >= 2) appear in
+        // multiple partitions' streams; any of them works because all
+        // sharing partitions hold the same owner_lock revision at any
+        // moment (revisions are bumped uniformly by F211-D).
+        let dispatch_revision: i64 = {
+            let s = self.store.inner.borrow();
+            let mut found: i64 = 0;
+            'outer: for part in s.partitions.values() {
+                let streams = [part.log_stream, part.row_stream, part.meta_stream];
+                for sid in streams {
+                    if s.streams
+                        .get(&sid)
+                        .map(|st| st.extent_ids.contains(&extent_id))
+                        .unwrap_or(false)
+                    {
+                        let key = format!("partition/{}", part.part_id);
+                        if let Some(&rev) = s.owner_revisions.get(&key) {
+                            found = rev;
+                        }
+                        break 'outer;
+                    }
+                }
+            }
+            found
+        };
+
         let dispatch_record = MgrEcDispatchInflight {
             extent_id,
             target_nodes,
             extra_disk_ids,
             data_shards: data_shards as u32,
             new_eversion,
+            revision: dispatch_revision,
         };
 
         // F207-B: acquire the unified inflight marker. CAS via

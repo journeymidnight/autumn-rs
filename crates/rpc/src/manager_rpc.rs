@@ -229,6 +229,19 @@ pub struct MgrEcDispatchInflight {
     pub extra_disk_ids: Vec<u64>,
     pub data_shards: u32,
     pub new_eversion: u64,
+    /// F211-D Tier 2: owner-lock revision the manager held when this
+    /// dispatch was authorised. Threaded into `ExtConvertToEcReq.revision`
+    /// → `WriteShardReq.revision` / `CommitEcShardReq.revision` so a
+    /// fenced ex-coord whose in-flight 2PC continues with the OLD revision
+    /// is rejected by remote ENs via the existing `req.revision <
+    /// entry.last_revision → CODE_LOCKED_BY_OTHER` check. A bumped
+    /// revision is pushed to live targets by
+    /// `auto_abandon_for_fenced_node` (fence-handover via
+    /// `MSG_CHECK_COMMIT_LENGTH`) so the EN-side check fires.
+    ///
+    /// `0` keeps the pre-F211-D-Tier-2 no-fence behaviour for tests /
+    /// memory-only mode where no owner_lock has been acquired.
+    pub revision: i64,
 }
 
 /// Extent metadata — mirrors proto ExtentInfo.
@@ -739,6 +752,11 @@ pub struct ExtConvertToEcReq {
     pub parity_shards: u32,
     pub target_addrs: Vec<String>,
     pub eversion: u64,
+    /// F211-D Tier 2: owner-lock revision threaded from the manager's
+    /// `MgrEcDispatchInflight.revision`. Coord forwards into each
+    /// `WriteShardReq.revision` / `CommitEcShardReq.revision`. `0` =
+    /// no-fence (legacy / memory-only mode).
+    pub revision: i64,
 }
 
 // ── CommitLength binary codec (hot path, duplicated from extent_rpc) ───────
