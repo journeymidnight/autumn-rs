@@ -1869,6 +1869,7 @@ pub(crate) async fn do_compact(
             &tables_snapshot,
             compact_vp_eid,
             compact_vp_off,
+            log_extent_ids.len() as u32,
         )
         .await?;
         // F210-C4: see commit_flush_outcome — checkpoint published; sync
@@ -1913,6 +1914,7 @@ pub(crate) async fn do_compact(
         &tables_snapshot,
         compact_vp_eid,
         compact_vp_off,
+        log_extent_ids.len() as u32,
     )
     .await?;
     // F210-C4: same as the head-extent path above; mark dirty on sync

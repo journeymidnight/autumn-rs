@@ -5369,6 +5369,9 @@ async fn recover_partition(
 
     // Selected start position into log_extent_ids; usize::MAX = not chosen.
     let mut chosen_pos: usize = usize::MAX;
+    // F243-merge: declared at outer scope so the replay loop can compute
+    // per-meta_record source_max_seq below.
+    let mut loc_to_last_seq: HashMap<(u64, u32, u32), u64> = HashMap::new();
 
     if !meta_records.is_empty() {
         // Each meta_record carries a (vp_extent_id, vp_offset) saying
@@ -5418,14 +5421,22 @@ async fn recover_partition(
         // same physical bytes; we keep one entry.
         let mut seen: HashSet<(u64, u32, u32)> = HashSet::new();
         let mut all_locs: Vec<SstLocation> = Vec::new();
-        for r in meta_records {
-            for loc in r.locs {
+        for r in &meta_records {
+            for loc in &r.locs {
                 let key = (loc.extent_id, loc.offset, loc.len);
                 if seen.insert(key) {
-                    all_locs.push(loc);
+                    all_locs.push(loc.clone());
                 }
             }
         }
+        // F243-merge: populate the per-loc last_seq cache used post-loop
+        // to compute each meta_record's source_max_seq independently.
+        // Post-merge the spliced meta_stream carries TWO source records
+        // (survivor's + victim's), whose PS-seq counters were INDEPENDENT
+        // pre-merge. A single union max_seq for replay-dedup would
+        // silently skip survivor's post-vp_head tail records whose ts is
+        // ≤ victim's max but > survivor's max — the failure mode that
+        // the chaos test surfaced as q-key data loss on split+merge.
         for loc in all_locs {
             // F198: bounded retry on eversion-mismatch during open. A
             // post-restart manager whose `apply_ec_conversion_done` did
@@ -5485,6 +5496,7 @@ async fn recover_partition(
             if tbl_last_seq > max_seq {
                 max_seq = tbl_last_seq;
             }
+            loc_to_last_seq.insert((loc.extent_id, loc.offset, loc.len), tbl_last_seq);
 
             if !detected_overlap {
                 let sk = parse_key(reader.smallest_key());
@@ -5538,44 +5550,151 @@ async fn recover_partition(
     // strictly in launch order = strictly in seq order; a rotated
     // active contains a contiguous seq range [start, max_seq], and the
     // SST flushed from it has the invariant "every seq <= last_seq is
-    // in this SST or an earlier SST". `sst_max_seq` is then a sound
-    // upper bound for "seqs already in some SST".
+    // in this SST or an earlier SST".
     //
-    // Pre-F210-C1 this used `FuturesUnordered`, which yielded Phase 2
-    // completions in completion order, not launch order. Phase 3
-    // therefore ran out-of-order: batch B (seq 101-200) could insert
-    // into active and trigger rotation before batch A (seq 1-100)
-    // completed Phase 2. The flushed SST then had `last_seq = 200` but
-    // was MISSING seqs 1-100. Replay's `ts <= 200 → skip` predicate
-    // then silently dropped batch A on crash recovery — see F210-C1 in
-    // feature_list.md.
+    // F243-merge (THIS FIX): a SINGLE `sst_max_seq` is only sound for a
+    // single-partition timeline. Post-merge the spliced log_stream
+    // carries records from TWO source partitions whose PS-seq counters
+    // were independent; `sst_max_seq` taken as the union max wrongly
+    // skips survivor's post-vp_head tail records whose ts is ≤ victim's
+    // max but > survivor's max. Fix: compute each meta_record's own
+    // source_max_seq and dedup PER EXTENT against the source whose
+    // vp_pos is the largest ≤ this extent's stream position.
+    //
+    // Pre-F210-C1 this used `FuturesUnordered`; see git history /
+    // feature_list F210-C1 for the FU→FO migration rationale.
     let sst_max_seq = max_seq;
+    let _ = sst_max_seq; // retained for parity; replay now uses per-region dedup
+    // F243-merge per-source region table.
+    //
+    // Each meta_record carries its source partition's log_stream extent
+    // count at flush time (`log_extent_count`). Sorted by vp_pos, the
+    // sources' regions in the spliced log_stream are cumulative:
+    //   record[i].region = [Σ_{j<i} count[j], Σ_{j≤i} count[j])
+    // Records whose vp_extent_id is no longer in the stream (GC'd /
+    // truncated) are skipped. A record with `log_extent_count == 0` is
+    // legacy / unset — fall back to a single global dedup (= pre-fix
+    // behavior) by treating it as covering the whole stream.
+    //
+    // For each region, dedup = MAX seq across the source's SSTs (i.e.,
+    // the F210-C1 invariant: every seq ≤ src_max for THIS source is in
+    // one of this source's SSTs). Records at pos with ts > src_max
+    // are unflushed-by-this-source and need re-insert; ts ≤ src_max
+    // are already covered.
+    //
+    // E_new (post-merge new tail) sits past Σ counts → no region maps
+    // to it → dedup = 0 → replay everything (= post-merge survivor
+    // writes, all unflushed by definition).
+    struct SourceRegion {
+        end_excl: usize, // region = [prev_end, end_excl)
+        src_max: u64,
+    }
+    let mut records_meta: Vec<(usize, u32, u64)> = Vec::new(); // (vp_pos, log_extent_count, src_max)
+    let mut any_zero_count = false;
+    for r in &meta_records {
+        if r.vp_extent_id == 0 {
+            continue;
+        }
+        let pos = match first_pos_by_eid.get(&r.vp_extent_id) {
+            Some(&p) => p,
+            None => continue,
+        };
+        if r.log_extent_count == 0 {
+            any_zero_count = true;
+        }
+        let src_max = r
+            .locs
+            .iter()
+            .filter_map(|loc| {
+                loc_to_last_seq
+                    .get(&(loc.extent_id, loc.offset, loc.len))
+                    .copied()
+            })
+            .max()
+            .unwrap_or(0);
+        records_meta.push((pos, r.log_extent_count, src_max));
+    }
+    records_meta.sort_by_key(|(p, _, _)| *p);
+    let mut source_regions: Vec<SourceRegion> = Vec::new();
+    if any_zero_count || records_meta.is_empty() {
+        // Legacy / partial state: one virtual region covering the whole
+        // stream with dedup = global max_seq (pre-fix behavior).
+        source_regions.push(SourceRegion {
+            end_excl: log_extent_ids.len(),
+            src_max: max_seq,
+        });
+    } else {
+        let mut cum: usize = 0;
+        for (_pos, count, src_max) in &records_meta {
+            cum += *count as usize;
+            source_regions.push(SourceRegion {
+                end_excl: cum,
+                src_max: *src_max,
+            });
+        }
+    }
+    // dedup_at: find the source region whose [prev_end, end_excl)
+    // contains `pos`. Past all regions (E_new / post-final-source)
+    // → 0 (replay everything).
+    let dedup_at = |pos: usize| -> u64 {
+        for r in &source_regions {
+            if pos < r.end_excl {
+                return r.src_max;
+            }
+        }
+        0
+    };
     let active = Memtable::new();
 
     // Position-based replay-extent selection. Pre-this-fix used
     // `eid < recovered_vp_eid → skip`, which is wrong post-merge because
     // the spliced extent_ids list is non-monotonic in extent_id. See
-    // the chosen_pos selection above.
-    let replay_extents: Option<Vec<(u64, u32)>> = if chosen_pos == usize::MAX && tables.is_empty()
+    // the chosen_pos selection above. Each entry carries its stream
+    // position so the per-extent `dedup_at(pos)` lookup can find the
+    // owning source's max_seq.
+    // F243-merge: dedup by extent_id — CoW-shared log extents (e.g.,
+    // extent 12 shared by survivor + victim post-split) appear MULTIPLE
+    // times in the spliced extent_ids. Replaying them twice doubles
+    // each record's insertion AND attributes the duplicate occurrence
+    // to the WRONG source region. We replay each extent only at its
+    // FIRST occurrence (which has the correct source-region dedup).
+    let replay_extents: Option<Vec<(usize, u64, u32)>> = if chosen_pos == usize::MAX
+        && tables.is_empty()
     {
         // No checkpoint and no SSTs: replay everything from offset 0 of
-        // every extent (matches pre-fix `recovered_vp_eid == 0 &&
-        // tables.is_empty()` branch).
-        Some(log_extent_ids.iter().map(|&eid| (eid, 0u32)).collect())
+        // every extent — dedup by first occurrence.
+        let mut seen: HashSet<u64> = HashSet::new();
+        Some(
+            log_extent_ids
+                .iter()
+                .enumerate()
+                .filter_map(|(pos, &eid)| {
+                    if seen.insert(eid) {
+                        Some((pos, eid, 0u32))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        )
     } else if chosen_pos != usize::MAX {
-        // Replay from `chosen_pos` onward. The chosen extent starts at
-        // `recovered_vp_off`; every subsequent extent starts at offset 0.
+        // Replay from `chosen_pos` onward, but only the FIRST occurrence
+        // of each extent_id (CoW-dup later occurrences are skipped).
+        let mut seen: HashSet<u64> = HashSet::new();
         Some(
             log_extent_ids
                 .iter()
                 .enumerate()
                 .filter_map(|(pos, &eid)| {
                     if pos < chosen_pos {
+                        seen.insert(eid);
+                        None
+                    } else if !seen.insert(eid) {
                         None
                     } else if pos == chosen_pos {
-                        Some((eid, recovered_vp_off))
+                        Some((pos, eid, recovered_vp_off))
                     } else {
-                        Some((eid, 0u32))
+                        Some((pos, eid, 0u32))
                     }
                 })
                 .collect(),
@@ -5585,7 +5704,8 @@ async fn recover_partition(
     };
 
     if let Some(extents) = replay_extents {
-        for (eid, start_off) in extents {
+        for (extent_pos, eid, start_off) in extents {
+            let extent_dedup = dedup_at(extent_pos);
             // F127: retry extent reads during recovery instead of silently
             // skipping. A transient node failure should not cause permanent
             // data loss for un-checkpointed writes.
@@ -5616,7 +5736,7 @@ async fn recover_partition(
                 if ts > max_seq {
                     max_seq = ts;
                 }
-                if ts <= sst_max_seq {
+                if ts <= extent_dedup {
                     continue;
                 }
 
@@ -5857,6 +5977,7 @@ pub(crate) async fn save_table_locs_raw(
     tables: &[TableMeta],
     vp_extent_id: u64,
     vp_offset: u32,
+    log_extent_count: u32,
 ) -> Result<()> {
     let locs = TableLocations {
         locs: tables
@@ -5869,6 +5990,7 @@ pub(crate) async fn save_table_locs_raw(
             .collect(),
         vp_extent_id,
         vp_offset,
+        log_extent_count,
     };
     let payload = rkyv_encode(&locs);
     let mut data = Vec::with_capacity(4 + payload.len());
@@ -6172,6 +6294,21 @@ pub(crate) async fn commit_flush_outcome(
     part: &Rc<RefCell<PartitionData>>,
     outcome: FlushOutcome,
 ) -> Result<()> {
+    // F243-merge: fetch log_stream extent count BEFORE the borrow_mut
+    // below. The count is persisted in the meta_record so post-merge
+    // recovery can compute each source's region [cumsum, cumsum +
+    // count) in the spliced log_stream. The get_stream_info await
+    // must happen OUTSIDE the borrow_mut → no F148-A violation
+    // (borrow_mut order remains the linearization point).
+    let (part_sc_pre, log_stream_id) = {
+        let p = part.borrow();
+        (p.stream_client.clone(), p.log_stream_id)
+    };
+    let log_extent_count = part_sc_pre
+        .get_stream_info(log_stream_id)
+        .await?
+        .extent_ids
+        .len() as u32;
     let (tables_snapshot, vp_eid, vp_off, part_sc, meta_stream_id) = {
         let mut p = part.borrow_mut();
         p.tables.push(outcome.new_meta);
@@ -6197,7 +6334,15 @@ pub(crate) async fn commit_flush_outcome(
     };
     // F148-A: no `.await` between the borrow_mut drop above and the
     // stream_client.append mpsc-send inside save_table_locs_raw.
-    save_table_locs_raw(&part_sc, meta_stream_id, &tables_snapshot, vp_eid, vp_off).await?;
+    save_table_locs_raw(
+        &part_sc,
+        meta_stream_id,
+        &tables_snapshot,
+        vp_eid,
+        vp_off,
+        log_extent_count,
+    )
+    .await?;
     // F210-C4: meta_stream checkpoint published; SST is durable. If the
     // vp_refs sync fails (manager unreachable / NotLeader / transient),
     // mark dirty + return Ok rather than fail the flush — the SST is
@@ -7284,6 +7429,7 @@ mod tests {
             ],
             vp_extent_id: 42,
             vp_offset: 512,
+            log_extent_count: 0,
         };
         let payload = rkyv_encode(&locs);
         let mut data = Vec::new();
@@ -7308,6 +7454,7 @@ mod tests {
             }],
             vp_extent_id: 10,
             vp_offset: 0,
+            log_extent_count: 0,
         };
         let locs2 = TableLocations {
             locs: vec![
@@ -7324,6 +7471,7 @@ mod tests {
             ],
             vp_extent_id: 20,
             vp_offset: 50,
+            log_extent_count: 0,
         };
 
         let mut data = Vec::new();
@@ -7361,6 +7509,7 @@ mod tests {
             }],
             vp_extent_id: 10,
             vp_offset: 0,
+            log_extent_count: 0,
         };
         let locs3 = TableLocations {
             locs: vec![
@@ -7382,6 +7531,7 @@ mod tests {
             ],
             vp_extent_id: 30,
             vp_offset: 100,
+            log_extent_count: 0,
         };
 
         let mut data = Vec::new();

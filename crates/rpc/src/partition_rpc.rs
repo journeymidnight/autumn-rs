@@ -458,6 +458,15 @@ pub struct TableLocations {
     pub locs: Vec<SstLocation>,
     pub vp_extent_id: u64,
     pub vp_offset: u32,
+    /// F243-merge: source partition's log_stream extent count at flush
+    /// time. Used post-merge by `recover_partition` to derive each
+    /// source's region (positions [cumsum, cumsum + count)) in the
+    /// spliced log_stream, so replay dedup uses each source's OWN
+    /// `sst_max_seq` (not the union max, which silently skips one
+    /// source's post-vp_head tail records ≤ the OTHER source's max).
+    /// 0 in legacy / fresh-state checkpoints — treated as "no boundary
+    /// info; fall back to single-source replay" (= pre-fix behavior).
+    pub log_extent_count: u32,
 }
 
 // ── Helper: extract part_id from any partition RPC payload ─────────────────
