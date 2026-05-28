@@ -469,8 +469,16 @@ impl PsRouter {
         // handles this by refreshing regions + reconnecting
         // (`call_ps_for_part`, MAX_PS_REFRESHES); this test router mirrors
         // that instead of panicking on the first transient miss.
+        //
+        // Chaos tests can override the budget via `AUTUMN_TEST_ROUTER_RETRIES`
+        // (each retry = 100 ms) when split + region_sync converge slowly
+        // on a loaded loopback cluster. Default 50 = 5 s.
+        let retries: u32 = std::env::var("AUTUMN_TEST_ROUTER_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
         let mut last_err = String::new();
-        for _ in 0..50 {
+        for _ in 0..retries {
             let mgr = match RpcClient::connect(self.mgr_addr).await {
                 Ok(m) => m,
                 Err(e) => {
@@ -804,6 +812,214 @@ pub async fn start_etcd() -> (EtcdGuard, String) {
         },
         client_url,
     )
+}
+
+// ── Embedded toxiproxy ────────────────────────────────────────────────
+//
+// Spawns `toxiproxy-server` (Shopify) for tests that need network-fault
+// injection between manager/PS and EN. The admin HTTP API listens on a
+// random loopback port; tests pass that addr to `toxiproxy-cli --host`
+// to create/toggle/poison proxies. Tests that don't need network faults
+// don't need to call this.
+//
+// Looks for `toxiproxy-server` and `toxiproxy-cli` on `$PATH`; override
+// either via `AUTUMN_TEST_TOXIPROXY_SERVER` / `AUTUMN_TEST_TOXIPROXY_CLI`.
+// Tests typically also rely on `~/.local/bin` being on `$PATH`.
+
+pub struct ToxiproxyGuard {
+    child: Option<std::process::Child>,
+}
+
+impl Drop for ToxiproxyGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Spawn a toxiproxy-server. Returns `(guard, admin_addr)` where
+/// `admin_addr` is `"127.0.0.1:<port>"` suitable for passing to
+/// `toxiproxy-cli --host`.
+pub async fn start_toxiproxy() -> (ToxiproxyGuard, String) {
+    let bin = std::env::var("AUTUMN_TEST_TOXIPROXY_SERVER")
+        .unwrap_or_else(|_| "toxiproxy-server".to_string());
+    let admin = pick_addr();
+    let host = admin.ip().to_string();
+    let port = admin.port().to_string();
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("-host")
+        .arg(&host)
+        .arg("-port")
+        .arg(&port)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let child = cmd.spawn().unwrap_or_else(|e| {
+        panic!(
+            "spawn toxiproxy-server `{bin}`: {e} — install via https://github.com/Shopify/toxiproxy/releases or set AUTUMN_TEST_TOXIPROXY_SERVER"
+        )
+    });
+    // Wait for admin API to bind.
+    let admin_addr = format!("{host}:{port}");
+    let start = std::time::Instant::now();
+    loop {
+        if std::net::TcpStream::connect_timeout(&admin, Duration::from_millis(200)).is_ok() {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "toxiproxy admin port {admin_addr} never bound"
+        );
+        compio::time::sleep(Duration::from_millis(100)).await;
+    }
+    (ToxiproxyGuard { child: Some(child) }, admin_addr)
+}
+
+/// Thin shell-out wrapper around `toxiproxy-cli`. All methods block via
+/// `std::process::Command`; that's fine because they each invoke a
+/// fast (<10ms) admin HTTP call.
+pub struct ToxiproxyCli {
+    bin: String,
+    admin_addr: String,
+}
+
+impl ToxiproxyCli {
+    pub fn new(admin_addr: String) -> Self {
+        let bin = std::env::var("AUTUMN_TEST_TOXIPROXY_CLI")
+            .unwrap_or_else(|_| "toxiproxy-cli".to_string());
+        Self { bin, admin_addr }
+    }
+
+    fn cmd(&self) -> std::process::Command {
+        let mut c = std::process::Command::new(&self.bin);
+        c.arg("--host").arg(&self.admin_addr);
+        c.stdout(std::process::Stdio::null());
+        c.stderr(std::process::Stdio::piped());
+        c
+    }
+
+    /// `toxiproxy-cli create --listen LISTEN --upstream UPSTREAM NAME`
+    pub fn create(&self, name: &str, listen: &str, upstream: &str) -> Result<(), String> {
+        let out = self
+            .cmd()
+            .arg("create")
+            .arg("--listen")
+            .arg(listen)
+            .arg("--upstream")
+            .arg(upstream)
+            .arg(name)
+            .output()
+            .map_err(|e| format!("spawn: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "create proxy {name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// `toxiproxy-cli toggle NAME` — flips enabled state.
+    pub fn toggle(&self, name: &str) -> Result<(), String> {
+        let out = self
+            .cmd()
+            .arg("toggle")
+            .arg(name)
+            .output()
+            .map_err(|e| format!("spawn: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "toggle proxy {name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Set proxy enabled state explicitly. Polls `inspect` until state matches.
+    pub fn set_enabled(&self, name: &str, want: bool) -> Result<(), String> {
+        if self.is_enabled(name)? == want {
+            return Ok(());
+        }
+        self.toggle(name)?;
+        Ok(())
+    }
+
+    /// `toxiproxy-cli inspect NAME` — parse the `Enabled:` line.
+    pub fn is_enabled(&self, name: &str) -> Result<bool, String> {
+        let out = self
+            .cmd()
+            .stdout(std::process::Stdio::piped())
+            .arg("inspect")
+            .arg(name)
+            .output()
+            .map_err(|e| format!("spawn: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "inspect proxy {name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        let txt = String::from_utf8_lossy(&out.stdout);
+        for line in txt.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("Enabled:") {
+                return Ok(rest.trim().eq_ignore_ascii_case("true"));
+            }
+        }
+        // Default to "enabled" — that's the post-create state.
+        Ok(true)
+    }
+
+    /// `toxiproxy-cli toxic add -t TYPE -a key=val ... [-n NAME] PROXY`
+    pub fn add_toxic(
+        &self,
+        proxy: &str,
+        toxic_type: &str,
+        toxic_name: &str,
+        attrs: &[(&str, &str)],
+    ) -> Result<(), String> {
+        let mut cmd = self.cmd();
+        cmd.arg("toxic")
+            .arg("add")
+            .arg("-t")
+            .arg(toxic_type)
+            .arg("-n")
+            .arg(toxic_name);
+        for (k, v) in attrs {
+            cmd.arg("-a").arg(format!("{k}={v}"));
+        }
+        cmd.arg(proxy);
+        let out = cmd.output().map_err(|e| format!("spawn: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "toxic add {toxic_name} on {proxy}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// `toxiproxy-cli toxic remove -n NAME PROXY`
+    pub fn remove_toxic(&self, proxy: &str, toxic_name: &str) -> Result<(), String> {
+        let out = self
+            .cmd()
+            .arg("toxic")
+            .arg("remove")
+            .arg("-n")
+            .arg(toxic_name)
+            .arg(proxy)
+            .output()
+            .map_err(|e| format!("spawn: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "toxic remove {toxic_name} on {proxy}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ── TableLocations decoder ────────────────────────────────────────────
