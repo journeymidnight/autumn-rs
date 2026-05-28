@@ -4809,10 +4809,42 @@ async fn try_complete_freeze_drain(
         rotate_active(&mut p);
     }
     let mut drain_err: Option<String> = None;
+    // F250-drain: wait until `imm` is truly empty, not just until
+    // flush_one_imm returns Ok(false). flush_one_imm returns Ok(false)
+    // when imm[0] is already claimed by `background_flush_loop` (via
+    // `flushing_imm_ptrs`) — the bg flush's commit_flush_outcome will
+    // pop imm[0] eventually, but the drain MUST wait for that pop so
+    // its meta_stream checkpoint is included before the manager's
+    // commit_length capture seals the post-freeze view.
+    //
+    // Pre-fix, the drain broke on Ok(false), the bg flush's
+    // save_table_locs_raw landed past the seal, and the SST + its
+    // records were ORPHANED — surfaced in chaos as "not_found" on
+    // split+merge cycles where freeze raced an in-flight bg flush.
+    //
+    // Bounded by the FREEZE_TTL backstop in check_freeze_ttls: any
+    // genuine bg-flush hang past 30 s auto-unfreezes and fails the
+    // ack with PRECONDITION; merge is rolled back.
+    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
+        if part.borrow().imm.is_empty() {
+            break;
+        }
+        if std::time::Instant::now() >= drain_deadline {
+            drain_err = Some("freeze drain timeout: imm not empty after 20 s".to_string());
+            tracing::warn!(part_id, "{}", drain_err.as_ref().unwrap());
+            break;
+        }
         match flush_one_imm(part).await {
             Ok(true) => continue,
-            Ok(false) => break,
+            Ok(false) => {
+                // imm[0] is claimed by background_flush_loop's in-flight
+                // run_flush_async_phase. Yield to let it advance; its
+                // commit_flush_outcome will pop imm[0]; our next
+                // iteration sees the shorter queue.
+                compio::time::sleep(std::time::Duration::from_millis(5)).await;
+                continue;
+            }
             Err(e) => {
                 let msg = format!("{e:#}");
                 tracing::error!(part_id, "freeze drain flush_one_imm: {msg}");
