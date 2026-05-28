@@ -856,3 +856,22 @@ Code locations (this fix):
   - crates/partition-server/src/background.rs:1866,1910 (do_compact)
   - crates/partition-server/src/lib.rs:~5562 (recover_partition per-source dedup)
   - crates/partition-server/src/lib.rs:~5599 (replay_extents CoW dedup)
+
+----- 2026-05-28 update — drain-wait fix REVERTED (caused hang) -----
+Date: 2026-05-28
+TaskStatus: completed
+Task: Attempted drain-wait-for-imm-empty fix on top of f0ecf64; pushed
+  as 1ee0966 after 7/10 PASS on initial split+merge run. Subsequent
+  full-action test hung on seed=8 for 29+ minutes despite the 20 s
+  deadline + 30 s FREEZE_TTL backstop. Reverted in 36bcd38.
+
+Hypothesis: drain-wait introduced a wedge under some action combination
+  (split+merge+other). Possible cause: bg flush future never completes
+  (manager unreachable mid-RPC, or sealed-stream truncation issue);
+  the 20 s deadline only fires on the drain's compio task, not on the
+  hung bg flush. After deadline, drain ack fails (CODE_UNAVAILABLE),
+  but the partition keeps trying to write meta_stream / log_stream
+  somewhere, potentially blocking other progress. Need deeper
+  investigation with timeouts on the bg flush futures themselves.
+
+Final state: only f0ecf64 (replay-dedup + CoW-extent dedup) committed.
