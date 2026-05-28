@@ -875,3 +875,38 @@ Hypothesis: drain-wait introduced a wedge under some action combination
   investigation with timeouts on the bg flush futures themselves.
 
 Final state: only f0ecf64 (replay-dedup + CoW-extent dedup) committed.
+
+----- 2026-05-28 update — fence+flush bug localized but unfixed -----
+Date: 2026-05-28
+TaskStatus: not_completed
+Task: Investigate fence+flush bug (seed=3 with AUTUMN_CHAOS_ACTIONS=fence,flush
+  reproduces 2 mismatches reliably, e.g., q000112 expected=4497 got=3985).
+
+Bisect results on seed=3:
+  - Single actions (fence|partition|compact|gc|flush|ec): all PASS.
+  - Pair fence,partition: PASS.
+  - Pair compact,flush: PASS.
+  - Pair fence,flush: FAIL with 2 mismatches.
+  - Other pairs PASS.
+
+Heisenbug: adding RUST_LOG=warn,autumn_partition_server=info changes
+  timing and the test PASSES. Hard to instrument.
+
+Hypothesis (unverified): a race between (a) MAINTENANCE_FLUSH triggering
+  flush_memtable_locked which awaits row_stream.append + meta_stream.append,
+  and (b) handle_fence_node bumping owner_revisions while the flush's
+  append is mid-flight. The flush's PS-cached owner-lock revision and
+  the manager-bumped revision diverge for a brief window. ENs do NOT
+  see the new revision until a writer with the new revision appends.
+  PS's writes with OLD revision should still succeed (EN check is
+  header.revision < EN.last_revision; both at R = OK). So this path
+  shouldn't lose data either.
+
+Net: fence+flush race has a real failure mode I cannot pin down without
+  a controllable timing harness. Replay-dedup fix (f0ecf64) is the only
+  committed fix this session.
+
+Next steps (future):
+  1. Add OFFLINE deterministic reproducer (single-threaded, no
+     subprocesses, controllable event scheduling) for fence+flush.
+  2. Once root cause is pinned, design fix.
