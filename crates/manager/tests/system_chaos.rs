@@ -462,7 +462,17 @@ async fn writer_loop(
             region_epoch: 0,
         });
 
-        let client = router.client_for(part_id).await;
+        // try_client_for: if partition is transiently unreachable
+        // (mid-split, mid-merge, region_sync lag), skip this put
+        // rather than panic the writer task.
+        let client = match router.try_client_for(part_id).await {
+            Ok(c) => c,
+            Err(_) => {
+                writes_failed.fetch_add(1, Ordering::Relaxed);
+                compio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         match client.call(partition_rpc::MSG_PUT, payload).await {
             Ok(resp) => match partition_rpc::rkyv_decode::<partition_rpc::PutResp>(&resp) {
                 // Only record `expected[]` when the PS actually accepted
@@ -524,7 +534,14 @@ async fn reader_loop(
         };
 
         let part_id = topo.route(&key);
-        let client = router.client_for(part_id).await;
+        let client = match router.try_client_for(part_id).await {
+            Ok(c) => c,
+            Err(_) => {
+                reads_miss.fetch_add(1, Ordering::Relaxed);
+                compio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         let payload = partition_rpc::rkyv_encode(&partition_rpc::GetReq {
             part_id,
             key: key.clone(),
@@ -1141,10 +1158,20 @@ async fn verify_per_key(
     let mut not_found: Vec<String> = Vec::new();
     let total = expected.len();
     for (key, want) in expected {
-        let part_id = topo.route(key);
         let mut got: Option<Vec<u8>> = None;
-        for _ in 0..10 {
-            let client = router.client_for(part_id).await;
+        for _attempt in 0..10 {
+            // try_client_for never panics (vs `client_for` which does
+            // after AUTUMN_TEST_ROUTER_RETRIES exhausted). If routing
+            // still fails after that, log + skip — the verify path
+            // will record the key as not_found.
+            let part_id = topo.route(key);
+            let client = match router.try_client_for(part_id).await {
+                Ok(c) => c,
+                Err(_) => {
+                    compio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+            };
             let payload = partition_rpc::rkyv_encode(&partition_rpc::GetReq {
                 part_id,
                 key: key.clone(),

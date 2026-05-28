@@ -461,6 +461,51 @@ impl PsRouter {
     /// being evicted and re-opened) would leave the cached client
     /// pointing at a dead FD. Test-scale cost of a reconnect per call
     /// is negligible.
+    /// Non-panicking variant — returns `Err(message)` after the retry
+    /// budget is exhausted. Use from chaos tests / verify paths where
+    /// a stuck partition (e.g., merged away mid-flight, or still
+    /// reopening post-split) should propagate as an error rather than
+    /// killing the workload task.
+    pub async fn try_client_for(
+        &self,
+        part_id: u64,
+    ) -> Result<Rc<autumn_rpc::client::RpcClient>, String> {
+        let retries: u32 = std::env::var("AUTUMN_TEST_ROUTER_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let mut last_err = String::new();
+        for _ in 0..retries {
+            let mgr = match RpcClient::connect(self.mgr_addr).await {
+                Ok(m) => m,
+                Err(e) => {
+                    last_err = format!("connect mgr: {e}");
+                    compio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let regions = get_regions(&mgr).await;
+            let mut addr: Option<SocketAddr> = None;
+            for (pid, part_addr) in regions.part_addrs {
+                if pid == part_id {
+                    if let Ok(sa) = part_addr.parse::<SocketAddr>() {
+                        addr = Some(sa);
+                    }
+                    break;
+                }
+            }
+            match addr {
+                Some(target) => match RpcClient::connect(target).await {
+                    Ok(c) => return Ok(c),
+                    Err(e) => last_err = format!("connect part {part_id} @ {target}: {e}"),
+                },
+                None => last_err = format!("part {part_id} not in regions yet"),
+            }
+            compio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(format!("connect partition {part_id} after retries: {last_err}"))
+    }
+
     pub async fn client_for(&self, part_id: u64) -> Rc<autumn_rpc::client::RpcClient> {
         // Retry with region re-resolution: a partition can be mid-reopen
         // (split / merge widen its rg → region_sync drops + reopens it on a
