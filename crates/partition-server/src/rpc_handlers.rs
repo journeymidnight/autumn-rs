@@ -797,20 +797,44 @@ pub(crate) async fn handle_split_part(
     // commit_length on each stream — now stable, because no in-flight
     // Phase 2 can complete (drain emptied them) and no new writes can
     // launch (frozen_for_split halts handle_incoming_req).
+    //
+    // **F227 — failure MUST abort the split, NOT default to 1.** Pre-fix
+    // this swallowed errors with `unwrap_or(0).max(1)`. When one replica
+    // is unreachable (e.g. concurrent F211 fence + recovery dispatch),
+    // F227's all-replica `commit_length` rightly returns `Err`. The old
+    // `unwrap_or(0).max(1)` masked that as "sealed at byte 1", so the
+    // manager sealed the tail extent at byte 1; the right-child opened
+    // post-split with a 1-byte-sealed tail and lost every log_stream
+    // write past byte 1 of that extent (chaos test split+fence repro
+    // surfaced this as ~5–13 q* keys reverting to seq numbers from
+    // hundreds of writes ago — the exact bytes that were in the tail
+    // extent at fence time).
+    //
+    // Returning `FailedPrecondition` lets the client retry the split
+    // once the cluster is healthy enough that all-replica commit_length
+    // succeeds. F210-C2 already unfreezes on the error return below, so
+    // the partition resumes serving writes during the retry gap.
+    let unfreeze_on_err = |e: anyhow::Error, what: &str| {
+        part.borrow().frozen_for_split.set(None);
+        (
+            StatusCode::FailedPrecondition,
+            format!("split aborted: {what} commit_length failed: {e}"),
+        )
+    };
     let log_end = part_sc
         .commit_length(log_stream_id)
         .await
-        .unwrap_or(0)
+        .map_err(|e| unfreeze_on_err(e, "log_stream"))?
         .max(1);
     let row_end = part_sc
         .commit_length(row_stream_id)
         .await
-        .unwrap_or(0)
+        .map_err(|e| unfreeze_on_err(e, "row_stream"))?
         .max(1);
     let meta_end = part_sc
         .commit_length(meta_stream_id)
         .await
-        .unwrap_or(0)
+        .map_err(|e| unfreeze_on_err(e, "meta_stream"))?
         .max(1);
 
     // Call multi_modify_split on manager via StreamClient.
