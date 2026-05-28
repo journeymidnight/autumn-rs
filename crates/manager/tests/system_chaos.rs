@@ -629,13 +629,28 @@ struct NemesisCtx {
 }
 
 impl NemesisCtx {
-    /// Count nodes currently alive AND not fenced.
+    /// Count nodes that are currently reachable from manager + PS:
+    /// alive process AND not fenced AND not SIGKILL'd AND not toxiproxy-
+    /// partitioned. Pre-fix this didn't subtract `partitioned`, so two
+    /// concurrent failure injections (e.g. partition + fence) could
+    /// drop the cluster below K+M quorum without the nemesis budget
+    /// guard catching it — F227 then refuses commit_length, the writer
+    /// retries land in a hard-to-recover state, and a rare key
+    /// reverts to an older value. The guard is the test's only
+    /// safeguard against pushing the cluster off the cliff, so it must
+    /// reflect EVERY failure dimension we inject.
     fn healthy_count(&self) -> usize {
         let ens = self.ens.borrow();
         let fenced = self.fenced.borrow();
         let dead = self.dead.borrow();
+        let partitioned = self.partitioned.borrow();
         ens.iter()
-            .filter(|e| e.is_alive() && !fenced.contains(&e.node_id) && !dead.contains(&e.node_id))
+            .filter(|e| {
+                e.is_alive()
+                    && !fenced.contains(&e.node_id)
+                    && !dead.contains(&e.node_id)
+                    && !partitioned.contains(&e.proxy_name)
+            })
             .count()
     }
 }
