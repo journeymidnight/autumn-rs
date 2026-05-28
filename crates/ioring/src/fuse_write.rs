@@ -223,27 +223,18 @@ async fn maybe_persist_size_growth(
     Ok(())
 }
 
-/// F242 + F241-A — write `src` at `[off, off + src.len())` into an opened fuse
-/// file. Returns the byte count written (= `src.len()` unless empty).
+/// Write `src` at `[off, off + src.len())` into an opened fuse file. Returns
+/// the byte count written (= `src.len()` unless empty).
 ///
-/// **F241-A step concurrency.** `plan_write` splits the write into ≤ 8 MiB
-/// extent-aligned steps, each targeting a DISTINCT extent. Steps now run
-/// concurrently via `fan_out_collect(BATCH_PUT_DEFAULT_CONCURRENCY)` — the
-/// pre-F241-A path serial-`await`d each step, so an N-extent SQE write paid
-/// ≈ N × per-extent latency. With fan-out, N extents on different partitions
-/// issue in parallel (the per-partition-conn writer task multiplexes); same-
-/// partition extents still serialise at the PS (single-core per partition),
-/// but cross-partition gets full parallelism.
+/// `plan_write` splits the write into ≤ 8 MiB extent-aligned steps, each
+/// targeting a DISTINCT extent — so the per-step puts are independent (no
+/// in-batch RMW conflict) and can fan out concurrently. Source bytes are
+/// copied out of the ring slot into a heap `Bytes` INSIDE each step: the ring
+/// slot is reused by the client the moment the CQE lands, so we can't borrow
+/// it across the async put.
 ///
-/// All steps touch distinct extent keys, so the puts are independent (no
-/// in-batch RMW conflict). Source bytes are copied out of the ring slot into
-/// a heap `Bytes` INSIDE each step (the client may reuse the slot the moment
-/// the CQE lands). The wire transfer from the heap `Bytes` is zero-copy
-/// (`put_zc` keeps the value as its own iovec; UCX RDMA's it ≥ 64 KiB).
-///
-/// `opened` is updated in place: after all steps land, the extent map is
-/// upserted for each; if EOF moved forward, `opened.size` and the persistent
-/// `InodeMeta.size` are both updated.
+/// `opened` is updated in place after all steps land. If EOF moved forward,
+/// both `opened.size` and the persistent `InodeMeta.size` are rewritten.
 ///
 /// **Single-writer-per-fd assumption (POSIX-style).** Two concurrent
 /// `write_into` calls against the same `OpenedExtents` would race the cache
@@ -263,15 +254,13 @@ pub async fn write_into(
     let futs = steps
         .iter()
         .map(|step| execute_step(cluster, ino, src, step));
-    let results = fan_out_collect(futs, BATCH_PUT_DEFAULT_CONCURRENCY).await;
+    let landed: Vec<(u64, u32)> = fan_out_collect(futs, BATCH_PUT_DEFAULT_CONCURRENCY)
+        .await
+        .into_iter()
+        .collect::<Result<_>>()
+        .map_err(|e| anyhow!("write step failed: {e}"))?;
 
-    for r in &results {
-        if let Err(e) = r {
-            return Err(anyhow!("write step failed: {e}"));
-        }
-    }
-    for r in results {
-        let (start, new_len) = r.expect("checked above");
+    for (start, new_len) in landed {
         upsert(&mut opened.extents, start, new_len);
     }
 
@@ -280,9 +269,8 @@ pub async fn write_into(
 }
 
 /// Sequential reference implementation of [`write_into`] — applies each
-/// planned step serially. Kept for the F241-A perf comparison so the
-/// parallel-vs-sequential delta can be measured in one process. Production
-/// callers should use [`write_into`].
+/// planned step serially. Kept so the parallel-vs-sequential delta can be
+/// measured in one process. Production callers should use [`write_into`].
 pub async fn write_into_sequential(
     cluster: &ClusterClient,
     opened: &mut OpenedExtents,

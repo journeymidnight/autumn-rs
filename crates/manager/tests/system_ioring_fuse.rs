@@ -338,11 +338,10 @@ fn f242_ioring_writes_fuse_file() {
 }
 
 /// Boot an N-partition cluster sliced on `[0x03][ino BE][logical_off BE]`
-/// boundaries for `ino`: extent at offset `i * 8 MiB` lands on partition `i`.
-/// Used by the F241-A perf test so a multi-extent write to `ino` distributes
-/// across N PS cores instead of serialising on one. (Splits are ino-specific —
-/// other inos' extent keys all land on a single end-partition; this fixture
-/// targets perf measurement for one inode.)
+/// boundaries for `ino`: extent at offset `i * 8 MiB` lands on partition `i`,
+/// so a multi-extent write to `ino` distributes across N PS cores. Splits are
+/// ino-specific — other inos' extent keys all land on a single end-partition;
+/// this fixture targets one inode for perf measurement.
 async fn boot_multi_partition_cluster_for_ino(
     mgr_addr: std::net::SocketAddr,
     n1_addr: std::net::SocketAddr,
@@ -383,13 +382,12 @@ async fn boot_multi_partition_cluster_for_ino(
     cluster
 }
 
-/// F241-A — measure `write_into` (parallel, fan_out) vs `write_into_sequential`
-/// (the pre-F241-A serial reference) on multi-extent writes. Single-partition
-/// cluster (matches the other system tests); per the PS partition QPS ceiling,
-/// same-partition extents serialise on the PS's single core — so the speedup
-/// you see here is the CLIENT-side pipelining win (in-flight RPC overlap), not
-/// the multi-partition parallel-PS win that production cross-partition
-/// workloads land on. Numbers logged via println!; run with `--nocapture`.
+/// Measure `write_into` (parallel, fan_out) vs `write_into_sequential` on
+/// multi-extent writes. Single-partition cluster — same-partition extents
+/// serialise on the PS's single core, so the speedup here is the client-side
+/// in-flight RPC pipelining win. The cross-partition parallel-PS win is
+/// covered by `f241a_parallel_write_into_perf_multi_partition`. Numbers
+/// logged via println!; run with `--nocapture`.
 #[test]
 #[ignore]
 fn f241a_parallel_write_into_perf() {
@@ -437,9 +435,7 @@ fn f241a_parallel_write_into_perf() {
         let mut next_ino: u64 = 300;
 
         println!();
-        println!("=== F241-A write_into perf ===");
-        println!("(single-partition cluster — same-partition extents serialise at PS;");
-        println!(" the speedup here is the client-side in-flight RPC pipelining win)");
+        println!("=== write_into perf (single-partition) ===");
         println!();
         println!(
             "{:24}  {:>10}  {:>12}  {:>12}  {:>10}  {:>6}",
@@ -501,11 +497,11 @@ fn f241a_parallel_write_into_perf() {
     });
 }
 
-/// F241-A multi-partition perf — same comparison as `f241a_parallel_write_into_perf`,
-/// but the cluster is sliced into 4 partitions for a fixed `ino`, so the 4-extent
-/// (32 MiB) and 8-extent (64 MiB) writes land each extent on a different PS core.
-/// This is where the parallel write_into is supposed to win: cross-partition fan
-/// out, not same-partition serialisation.
+/// Multi-partition counterpart of `f241a_parallel_write_into_perf` — the
+/// cluster is sliced into 4 partitions for a fixed `ino`, so the 4-extent
+/// (32 MiB) and 8-extent (64 MiB) writes land each extent on a different PS
+/// core. This is where parallel `write_into` is supposed to win: cross-
+/// partition fan-out, not same-partition serialisation.
 #[test]
 #[ignore]
 fn f241a_parallel_write_into_perf_multi_partition() {
@@ -539,9 +535,7 @@ fn f241a_parallel_write_into_perf_multi_partition() {
             .expect("daemon client");
         dclient.set_rpc_timeout(Duration::from_secs(120));
 
-        // Sizes: 1 / 2 / 4 / 8 extents — at 8 extents we wrap around the 4
-        // partitions twice (2 per partition), so each partition still gets
-        // some parallelism but the wall-clock = max(per-partition serial chain).
+        // At 8 extents we wrap around the 4 partitions twice (2 per partition).
         let cases: &[(&str, usize)] = &[
             ("8 MiB  (1 extent  → 1 part)", MAX_EXTENT),
             ("16 MiB (2 extents → 2 parts)", 2 * MAX_EXTENT),
@@ -549,17 +543,10 @@ fn f241a_parallel_write_into_perf_multi_partition() {
             ("64 MiB (8 extents → 4 parts ×2)", 8 * MAX_EXTENT),
         ];
 
-        // To avoid RMW across iters, each measurement uses the SAME `target_ino`
-        // but writes are non-overlapping ranges within it (offset moves forward
-        // by `size` each iter). After all sequential cases, all parallel cases
-        // continue from the next offset. Because the partition splits are at
-        // every 8 MiB boundary for ino=600, this still hits all partitions.
-        //
-        // We measure 1 iter per (case, mode) — multi-partition wall-clock is
-        // already representative; averaging would just need an EOF that exceeds
-        // partition 4's range (4 × 8 MiB = 32 MiB), beyond which extents wrap
-        // back to partition 4. The seq/par offsets below stay within reach.
-        // Reuse target_ino exclusively; pre-create its dirent + meta once.
+        // Reuse target_ino exclusively across cases; non-overlapping offset
+        // ranges per write avoid RMW. One iter per (case, mode) — partition
+        // splits are at every 8 MiB boundary, so all cases still hit every
+        // partition.
         let name = b"perf.bin";
         let m = meta::new_file_meta(0o644, 0, 0);
         meta::put_inode(&mut state, target_ino, &m)
@@ -573,7 +560,7 @@ fn f241a_parallel_write_into_perf_multi_partition() {
         state.kv_put(&dk, &dv).await.expect("put dirent");
 
         println!();
-        println!("=== F241-A multi-partition write_into perf ===");
+        println!("=== write_into perf (multi-partition) ===");
         println!(
             "{} partitions, splits every 8 MiB for ino={}",
             n_parts, target_ino
@@ -583,14 +570,11 @@ fn f241a_parallel_write_into_perf_multi_partition() {
             "size", "seq ms/op", "par ms/op", "par MB/s", "ratio"
         );
 
-        // Use offset > 0 to avoid first-extent special-casing; write each
-        // (mode,size) at a distinct offset (sequential first, then parallel).
         let mut cursor: u64 = 0;
 
         for (label, size) in cases {
             let data = pattern(*size);
 
-            // Sequential pass: open + write at `cursor`, fresh extents.
             let mut opened = fuse_read::open(&dclient, name).await.expect("open seq");
             let t0 = std::time::Instant::now();
             let n = fuse_write::write_into_sequential(&dclient, &mut opened, cursor, &data)
@@ -600,9 +584,6 @@ fn f241a_parallel_write_into_perf_multi_partition() {
             assert_eq!(n, *size);
             cursor += *size as u64;
 
-            // Parallel pass: open + write at the new cursor (still fresh
-            // extents — they're past the prior sequential write, so it's Append
-            // semantics, not RMW).
             let mut opened = fuse_read::open(&dclient, name).await.expect("open par");
             let t0 = std::time::Instant::now();
             let n = fuse_write::write_into(&dclient, &mut opened, cursor, &data)
