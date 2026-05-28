@@ -5351,43 +5351,66 @@ async fn recover_partition(
         .await
         .context("union TableLocations from metaStream extents")?;
 
+    // We need log_stream.extent_ids early to map each vp_head to its
+    // stream position. Post-merge the spliced extent_ids list is
+    // non-monotonic in extent_id: victim's extents (which were CoW from
+    // pre-split) have LOWER extent_ids than survivor's new extents, but
+    // appear AFTER survivor's in stream order. So `min(extent_id)` does
+    // NOT give the earliest stream position — we have to scan the list.
+    let log_stream_info = part_sc.get_stream_info(log_stream_id).await?;
+    let log_extent_ids: Vec<u64> = log_stream_info.extent_ids.clone();
+    // Pre-build first-occurrence index. CoW-shared extents can appear
+    // twice in the spliced extent_ids; the FIRST occurrence is the
+    // canonical position used for replay-start selection.
+    let mut first_pos_by_eid: HashMap<u64, usize> = HashMap::new();
+    for (pos, &eid) in log_extent_ids.iter().enumerate() {
+        first_pos_by_eid.entry(eid).or_insert(pos);
+    }
+
+    // Selected start position into log_extent_ids; usize::MAX = not chosen.
+    let mut chosen_pos: usize = usize::MAX;
+
     if !meta_records.is_empty() {
-        // F184-fix: take the **MIN** vp_head across all source partitions'
-        // checkpoints so log_stream replay starts at the EARLIEST stream
-        // position any source still cared about. The MAX choice (pre-fix)
-        // was unsafe post-merge: the spliced log_stream is
-        // [survivor.extents] + [victim.extents] + [new_tail], and victim's
-        // extents have higher IDs than survivor's (allocated later, post-
-        // split). With recovered_vp_eid = MAX = victim's last extent, the
-        // replay filter `if eid < recovered_vp_eid → skip` drops every
-        // SURVIVOR extent — including survivor's tail log_stream extent
-        // that may hold WAL records for writes the survivor freeze-flushed
-        // into SSTs AFTER survivor's last meta_stream checkpoint was
-        // written. (Survivor's drain rotates active → imm → flushes; the
-        // flush bumps vp_head in memory but the CHECKPOINT publishing
-        // that new vp_head is the LAST step. If the merge captures
-        // commit_length between the flush completing and the checkpoint
-        // landing, survivor's last meta record has a stale vp_head.)
+        // Each meta_record carries a (vp_extent_id, vp_offset) saying
+        // "log_stream replay must include records from this position
+        // onward to recover everything the SST set doesn't already
+        // cover." Post-merge there are multiple checkpoints (one per
+        // pre-merge source partition), and we must take the EARLIEST
+        // stream position so survivor's older log_stream extents aren't
+        // skipped just because some OTHER checkpoint's vp_head sits at
+        // a later position with a NUMERICALLY SMALLER extent_id.
         //
-        // The MIN choice covers the worst case: replay starts at the
-        // older vp_head, re-walks all extents from there, and the
-        // `if ts <= sst_max_seq { continue; }` dedup at the bottom of
-        // this function naturally skips records already in the SSTs.
-        // Pure cost: extra disk reads on survivor's tail extents.
-        // Surfaced reliably by `AUTUMN_CHAOS_ACTIONS=split,merge` in
-        // system_chaos (8/10 seeds fail without this fix).
-        let mut min_initialized = false;
+        // Pre-this fix:
+        //   - F184 took max(vp_extent_id) — wrong for non-monotonic
+        //     splice; lost most data.
+        //   - Then min(vp_extent_id) — wrong for the OPPOSITE reason
+        //     (CoW victim extents have lower IDs but later stream
+        //     position); still lost data on 4/10 seeds.
+        // The correct ordering is by stream POSITION (index into
+        // extent_ids), not by extent_id value.
         for r in &meta_records {
             if r.vp_extent_id == 0 {
-                continue; // empty / not-yet-flushed checkpoint; ignore
+                continue; // empty / not-yet-flushed checkpoint
             }
-            if !min_initialized
-                || r.vp_extent_id < recovered_vp_eid
-                || (r.vp_extent_id == recovered_vp_eid && r.vp_offset < recovered_vp_off)
-            {
+            let pos = match first_pos_by_eid.get(&r.vp_extent_id) {
+                Some(&p) => p,
+                None => {
+                    // vp_head references an extent no longer in the
+                    // stream (post-merge GC or out-of-band truncate).
+                    // Skip — there's nothing to walk from there.
+                    continue;
+                }
+            };
+            // Prefer earlier position; tie-break with smaller offset.
+            let cur_off = if chosen_pos == usize::MAX {
+                u32::MAX
+            } else {
+                recovered_vp_off
+            };
+            if pos < chosen_pos || (pos == chosen_pos && r.vp_offset < cur_off) {
+                chosen_pos = pos;
                 recovered_vp_eid = r.vp_extent_id;
                 recovered_vp_off = r.vp_offset;
-                min_initialized = true;
             }
         }
         // Dedup SstLocation by (extent_id, offset, len) — CoW-shared SSTs
@@ -5471,11 +5494,28 @@ async fn recover_partition(
                 }
             }
 
-            if reader.vp_extent_id > recovered_vp_eid
-                || (reader.vp_extent_id == recovered_vp_eid && reader.vp_offset > recovered_vp_off)
-            {
-                recovered_vp_eid = reader.vp_extent_id;
-                recovered_vp_off = reader.vp_offset;
+            // Per-SST vp_head bookkeeping: each SstReader's
+            // vp_extent_id/vp_offset records "where in log_stream this
+            // SST's VPs were written" — used post-recovery to seed
+            // the partition's vp_head for future flushes (the position
+            // past which the next flush will reference). We want the
+            // EARLIEST stream position across all loaded SSTs so the
+            // partition's running vp_head doesn't accidentally advance
+            // past WAL records that some SST referenced. Same
+            // position-vs-extent_id correctness consideration as above.
+            if let Some(&reader_pos) = first_pos_by_eid.get(&reader.vp_extent_id) {
+                let cur_pos = first_pos_by_eid
+                    .get(&recovered_vp_eid)
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                if chosen_pos == usize::MAX
+                    || reader_pos < cur_pos
+                    || (reader_pos == cur_pos && reader.vp_offset < recovered_vp_off)
+                {
+                    chosen_pos = reader_pos;
+                    recovered_vp_eid = reader.vp_extent_id;
+                    recovered_vp_off = reader.vp_offset;
+                }
             }
 
             let estimated_size = reader.estimated_size();
@@ -5512,31 +5552,30 @@ async fn recover_partition(
     let sst_max_seq = max_seq;
     let active = Memtable::new();
 
-    let replay_extents: Option<Vec<(u64, u32)>> = if recovered_vp_eid == 0 && tables.is_empty() {
-        let stream_info = part_sc.get_stream_info(log_stream_id).await?;
+    // Position-based replay-extent selection. Pre-this-fix used
+    // `eid < recovered_vp_eid → skip`, which is wrong post-merge because
+    // the spliced extent_ids list is non-monotonic in extent_id. See
+    // the chosen_pos selection above.
+    let replay_extents: Option<Vec<(u64, u32)>> = if chosen_pos == usize::MAX && tables.is_empty()
+    {
+        // No checkpoint and no SSTs: replay everything from offset 0 of
+        // every extent (matches pre-fix `recovered_vp_eid == 0 &&
+        // tables.is_empty()` branch).
+        Some(log_extent_ids.iter().map(|&eid| (eid, 0u32)).collect())
+    } else if chosen_pos != usize::MAX {
+        // Replay from `chosen_pos` onward. The chosen extent starts at
+        // `recovered_vp_off`; every subsequent extent starts at offset 0.
         Some(
-            stream_info
-                .extent_ids
-                .into_iter()
-                .map(|eid| (eid, 0u32))
-                .collect(),
-        )
-    } else if recovered_vp_eid > 0 {
-        let stream_info = part_sc.get_stream_info(log_stream_id).await?;
-        Some(
-            stream_info
-                .extent_ids
-                .into_iter()
-                .filter_map(|eid| {
-                    if eid < recovered_vp_eid {
+            log_extent_ids
+                .iter()
+                .enumerate()
+                .filter_map(|(pos, &eid)| {
+                    if pos < chosen_pos {
                         None
+                    } else if pos == chosen_pos {
+                        Some((eid, recovered_vp_off))
                     } else {
-                        let off = if eid == recovered_vp_eid {
-                            recovered_vp_off
-                        } else {
-                            0
-                        };
-                        Some((eid, off))
+                        Some((eid, 0u32))
                     }
                 })
                 .collect(),
