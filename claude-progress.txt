@@ -80,13 +80,30 @@ Task scope: bug #3 (kill+restart wedge under K4/M2 chaos) — three-concepts
   rolled back) + write path + range all wedge. This is the F207-recovery-vs-alloc
   interaction (the memory's hypothesized "PRIMARY F227 layer"): a stuck recovery
   on the TAIL extent blocks new-extent allocation.
-  NEXT: traced repro at seed=13 (RUST_LOG=info, recovery+manager) to pin WHY
-  extent 20's recovery never completes (target keeps failing? rate-limiter
-  backoff? node 1 flapping kill+restart confuses dispatch? source replicas
-  partitioned?). Then decide fix: e.g. alloc on a DIFFERENT/fresh extent set
-  when the tail's recovery is stuck, or time-bound the alloc-defer, or let
-  recovery reconfigure the dead member out faster. Repro:
-    AUTUMN_CHAOS_SEED=13 ... (same K4/M2 cmd as bug #3). ~1/10 hit rate.
+  DEEPER ROOT (traced 2026-05-29, RUST_LOG=info): the EN recovery task fails
+  `recovery task failed... extent_id=20... no source replica available for
+  streaming copy`, retrying every 10s for 60s+. extent 20 is SEALED and
+  REPLICATED (NOT EC — run_recovery_task:3197 branches on ec_converted and
+  took the replicated stream_extent_from_sources path; recovery_dispatch_loop:461
+  already skips open extents, so extent 20 was sealed at dispatch). So ~4
+  full-copy replicas (6 replicas minus target + failed node 1) ALL fail/short
+  for 60s. WHY every source fails is NOT yet pinned (need per-source
+  stream_one_source failure-reason trace).
+  ATTEMPTED FIX (REVERTED): lifted the alloc refuse-at-start for in-flight
+  Recovery (rpc_handlers.rs:1091). seed=13 0/5->2/5 + alloc_give_up=0, BUT
+  coco /findbugs (GPT-5.5) found a P1 RACE: handle_stream_alloc_extent clones
+  `tail` early then writes the WHOLE MgrExtentInfo back (etcd mirror_stream_
+  alloc_extent + in-mem s.extents.insert(tail.clone()) at :1449); a recovery
+  completing during the mirror RTT (after verify-before-mirror at :1417) gets
+  its replicates/disk/eversion CLOBBERED by the stale clone. My "doesn't touch
+  replicates" comment was WRONG. Reverted; working tree clean.
+  CLEAN FIX (not the guard-lift): EITHER (a) fix recovery to actually find a
+  source for the sealed replicated extent [need per-source trace first], OR
+  (b) properly-synchronized alloc — exclusive ledger marker for alloc_extent
+  (F210-A1-followup) so recovery can't interleave the writeback, OR re-read
+  live extent + merge ONLY seal fields (don't overwrite replicates) before
+  mirror+writeback. seed=6 + 8 other seeds clean; only seed=13 (~1/10) hits.
+  Repro: AUTUMN_CHAOS_SEED=13 ... (same K4/M2 cmd as bug #3).
   Memory: project_recovery_stuck_blocks_alloc.
 
 --- prior task (block-boundary lookup, commit 8e0ecad) kept below as history ---
