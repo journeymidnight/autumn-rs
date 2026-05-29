@@ -969,3 +969,59 @@ Next steps:
 The deterministic reproducer is COMMITTED so that future work has
 a stable starting point — chaos test seed=3 is the only existing
 trigger and is slower + noisier.
+
+----- 2026-05-29 — fence+flush bug ROOT CAUSE FIXED (commit 30e9051) -----
+Date: 2026-05-29
+TaskStatus: completed
+Task: Find and fix the fence+flush race causing data-loss mismatches.
+
+ROOT CAUSE (finally pinned):
+  do_compact pushed its output SST at the END of sst_readers via Vec::push.
+  During the long-running compaction (row_stream.append + spawn_blocking
+  build_sst_bytes await), background_flush_loop can complete + push its
+  own SSTs to sst_readers via commit_flush_outcome. Those concurrent-flush
+  SSTs sit at LOWER indices than the eventual compaction output.
+
+  Lookup walks sst_readers.iter().rev() — by VEC ORDER, not by last_seq.
+  After compaction the layout becomes:
+    [<remaining>, <concurrent_flush_SSTs>, <compact_output>]
+                                            ↑ walked first
+
+  But the compaction output's last_seq is bounded by the input set's
+  last_seq (captured BEFORE compaction's awaits). Any key updated by a
+  flush that completed during the compaction has its newer version in
+  <concurrent_flush_SSTs> at smaller indices — UNREACHABLE because the
+  compaction output already returns the stale value.
+
+  Surfaced as: chaos seed=3 fence+flush mismatches (q000071 expected=4202
+  got=3730); the in-process f250 reproducer 4-5/10 failure rate.
+
+FIX: in do_compact's final swap, locate the OLDEST input's position via
+  tables.iter().position(|tm| compact_keys.contains(&tm.loc())) BEFORE
+  removing the inputs. Insert compaction output at that SAME position
+  via Vec::insert. Preserves age order; concurrent-flush SSTs end up at
+  higher (newer) indices and lookup correctly walks them first.
+
+INSTRUMENTATION (used + then removed):
+  - Per-PS atomic counters (F250_*) for phase3_inserts/acks, rotates,
+    commit_flushes, compaction inputs/outputs/kept/discarded.
+  - file-based diag at open_partition + rotate_active.
+  - Counter-equality between phase3_inserts and phase3_acks across
+    20 runs (incl. failing ones) PROVED that every ack went with an
+    insert — eliminating Phase 2/3 race theories and pointing to
+    post-insert state corruption.
+  - That was the breakthrough: data WAS inserted, but the lookup
+    returned wrong value → bug must be in the SST ordering, not the
+    write path.
+
+VALIDATION:
+  - f250 reproducer: 20/20 PASS (was 4-5/10 FAIL).
+  - Chaos seed=3 fence,flush: 4/5 PASS (was 0/3 reliable).
+  - Chaos split,merge 15 runs: 12/15 PASS (similar to baseline pre-fix;
+    not regressed).
+  - 147 partition-server lib tests pass.
+
+This is the same compaction bug that has been latently present in the
+codebase since the streaming-compaction F104 refactor — F104 introduced
+the multi-iteration "push" pattern. Pre-F104 there was no compaction
+loop at all in this style, so the bug couldn't manifest until F104.
