@@ -4194,11 +4194,45 @@ async fn partition_thread_main(
     // back to the caller via `ready_tx`. If EITHER step fails, we report
     // the error and exit the partition thread so the main loop can
     // reclaim the partition slot and, on the next sync cycle, retry.
-    let mut listener = match autumn_transport::current_or_init().bind(listen_addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            let _ = ready_tx.send(Err(anyhow!("bind {}: {}", listen_addr, e)));
-            return Ok(());
+    // Bounded bind-retry on "address already in use". On a region_sync
+    // drop+reopen (split/merge range change), the just-dropped instance of
+    // THIS partition can still hold its per-partition port (F099-K
+    // base_port+ord) for a brief window while its old thread drains and the
+    // listener socket closes. Without a retry the reopen races that teardown
+    // and fails the bind, leaving the partition unserved until the next sync
+    // tick (BUG #3 — observed as `bind: Address already in use (os error
+    // 98)`). Retry ~5s so a normal reopen succeeds once the old socket frees.
+    // NOTE: this does NOT fix the case where the old thread is PERMANENTLY
+    // wedged (drain stalled on an F227 all-replica op against a killed node)
+    // and never releases the port — that still exhausts the budget and
+    // reports the error; see claude-progress.txt BUG #3 for the deeper fix.
+    let mut listener = {
+        let mut bind_attempt = 0u32;
+        loop {
+            match autumn_transport::current_or_init().bind(listen_addr).await {
+                Ok(l) => break l,
+                Err(e) => {
+                    // ~2s budget (10 × 200ms): enough for a normal old-thread
+                    // teardown to release the socket, but bounded so a
+                    // PERMANENTLY-wedged old listener doesn't stall this
+                    // region_sync open for long before reporting the failure.
+                    let in_use = e.to_string().to_lowercase().contains("in use");
+                    if in_use && bind_attempt < 10 {
+                        bind_attempt += 1;
+                        if bind_attempt == 1 {
+                            tracing::info!(
+                                part_id,
+                                addr = %listen_addr,
+                                "partition listener port busy (reopen race); retrying bind"
+                            );
+                        }
+                        compio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                    let _ = ready_tx.send(Err(anyhow!("bind {}: {}", listen_addr, e)));
+                    return Ok(());
+                }
+            }
         }
     };
     match listener.local_addr() {
