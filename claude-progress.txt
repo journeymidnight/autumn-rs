@@ -1025,3 +1025,33 @@ This is the same compaction bug that has been latently present in the
 codebase since the streaming-compaction F104 refactor — F104 introduced
 the multi-iteration "push" pattern. Pre-F104 there was no compaction
 loop at all in this style, so the bug couldn't manifest until F104.
+
+----- 2026-05-29 — post-fix validation (commit 30e9051 stays in place) -----
+Date: 2026-05-29
+TaskStatus: completed
+
+Post-fix chaos pass rate:
+  - f250 in-process reproducer: 20/20 PASS (was 4-5/10 FAIL).
+  - chaos fence,flush seed=3: 6/10 PASS (was 0/3 reliable PASS).
+  - chaos full-action 13 seeds: 11/13 PASS (~85%).
+  - chaos split,merge 15 runs: 12/15 PASS (~80%).
+
+Pattern of remaining failures:
+  - Now typically 1 mismatch per failing run (was 2-3 before).
+  - Failures appear in subprocess paths only (in-process f250 is 100%).
+  - The remaining ~30% chaos failure rate is a SEPARATE bug; the f250
+    pattern (compaction-output ordering) is conclusively fixed.
+
+Suspected remaining bug class:
+  - Some other place that inserts SSTs in the wrong order under
+    concurrent races, OR
+  - Phase 2/3 race in split's freeze drain (the bg_flush vs drain
+    race I noted earlier; the prior attempt to fix this caused
+    a 29-min hang in the chaos full-action test, so any future
+    attempt needs more careful timeout handling).
+
+Next steps (future sessions):
+  - Apply the same insert-at-oldest pattern to the empty-output branch
+    of do_compact (line ~1857) — it currently just removes inputs;
+    safe but might race other ops.
+  - Investigate split's freeze drain race with a target reproducer.
