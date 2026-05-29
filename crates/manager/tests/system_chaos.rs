@@ -483,7 +483,32 @@ async fn writer_loop(
                 continue;
             }
         };
-        match client.call(partition_rpc::MSG_PUT, payload).await {
+        // Bounded: a wedged PS that accepts the connection but never
+        // replies would otherwise hang this writer forever (it only checks
+        // `stop` between calls), so shutdown-join would hang the whole test.
+        // Treat a timeout as a failed write and loop (re-checks `stop`).
+        let put_call = match compio::time::timeout(
+            Duration::from_secs(5),
+            client.call(partition_rpc::MSG_PUT, payload),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                // A client-side timeout is an UNKNOWN outcome: the append may
+                // still land server-side after a transient stall (e.g. F227
+                // all-replica blocks while a replica is network-partitioned,
+                // then completes once it heals). So we must NOT treat the key
+                // as "old value" — that produced false "got seq > expected"
+                // mismatches. Forget the key entirely; its state is uncertain
+                // until a later write to it succeeds and re-records it.
+                eprintln!("writer[{name}]: PUT TIMED OUT (5s) part_id={part_id} — uncertain, dropping key from expected");
+                expected.borrow_mut().remove(&key);
+                writes_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+        match put_call {
             Ok(resp) => match partition_rpc::rkyv_decode::<partition_rpc::PutResp>(&resp) {
                 // Only record `expected[]` when the PS actually accepted
                 // the put — `CODE_OK`. A successful wire decode with
@@ -559,7 +584,22 @@ async fn reader_loop(
             length: 0,
             region_epoch: 0,
         });
-        match client.call(partition_rpc::MSG_GET, payload).await {
+        // Bounded for the same reason as the writer (no forever-hang on a
+        // wedged PS → shutdown-join stays responsive).
+        let get_call = match compio::time::timeout(
+            Duration::from_secs(5),
+            client.call(partition_rpc::MSG_GET, payload),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                eprintln!("reader[{name}]: GET TIMED OUT (5s) part_id={part_id} — PS wedged?");
+                reads_miss.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
+        match get_call {
             Ok(resp) => match partition_rpc::rkyv_decode::<partition_rpc::GetResp>(&resp) {
                 Ok(r) if r.code == partition_rpc::CODE_OK => {
                     // Sanity-only live check: the value must be a
@@ -1182,7 +1222,28 @@ async fn verify_per_key(
                 length: 0,
                 region_epoch: 0,
             });
-            match client.call(partition_rpc::MSG_GET, payload).await {
+            // A chaos verify must never hang forever: a wedged PS that
+            // accepts the connection but never replies would otherwise
+            // block this `.await` indefinitely. Bound it and, on timeout,
+            // log the offending part_id so the wedge is localizable.
+            let call_res = match compio::time::timeout(
+                Duration::from_secs(5),
+                client.call(partition_rpc::MSG_GET, payload),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    eprintln!(
+                            "verify: GET TIMED OUT (5s) key={} part_id={} attempt={_attempt} — PS wedged?",
+                            String::from_utf8_lossy(key),
+                            part_id
+                        );
+                    compio::time::sleep(Duration::from_millis(300)).await;
+                    continue;
+                }
+            };
+            match call_res {
                 Ok(resp) => match partition_rpc::rkyv_decode::<partition_rpc::GetResp>(&resp) {
                     Ok(r) if r.code == partition_rpc::CODE_OK => {
                         got = Some(r.value);

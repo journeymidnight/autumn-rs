@@ -54,6 +54,57 @@ SUPPORTING (committed alongside): MSG_DIAG_TRACE_KEY diagnostic RPC +
   flush-pop-alignment debug_assert in commit_flush_outcome (proved the
   flush-commit pop is correctly aligned — ruled out a dropped-imm theory).
 
+--- same session: /loop chaos bug-hunt after the block-boundary fix ---
+Date: 2026-05-29
+TaskStatus: completed
+Task scope: ran chaos (system_chaos.rs) across growing action sets + seeds to
+  find any remaining bug, per /loop. Outcome: block-boundary fix validated at
+  the subprocess level; chaos test hardened against forever-hangs; a rare
+  "45-min hang" reassessed as a test-env resource artifact (not a product bug).
+
+Chaos pass rates AFTER the block-boundary fix (commit 8e0ecad):
+  - fence,flush seeds 1-10: 10/10 (was 6/10; seed=3 reliably failed before).
+  - split,merge,ec,fence,flush,compact,gc seeds 1-12: 12/12 (was ~11/13).
+  - split,merge seeds 1-15: 15/15 (the documented freeze-drain race did NOT
+    reproduce).
+  - seed=8 (full harsh set incl kill,partition,latency) ×10 + seeds 1,5,12:
+    all PASS, 0 mismatch, 0 not_found.
+
+The "45-min verify hang" (found in the first 12-seed harsh sweep at seed=8):
+  - Localized to a client RPC (writer PUT / verify GET) that never returned
+    because a PS partition stopped responding. gdb thread stacks were
+    USELESS (async: every thread just parks in io_uring poll; the stuck
+    future's logical position is on the heap, not the stack).
+  - Correlated initially with "Split OK + force_ec", but in 10 CLEAN
+    instrumented seed=8 runs it did NOT recur (split is usually SKIPPED under
+    network-partition because F227 commit_length needs all replicas).
+  - It only appeared when MANY orphan clusters had accumulated (my own
+    imperfect process-group cleanup left 5+ stale test clusters + 12h-old
+    orphans). Under that resource pressure, toxiproxy / all-replica ops can
+    stall ~indefinitely. Verdict: most likely a TEST-ENVIRONMENT resource
+    artifact, NOT a product deadlock. Left as "watch", not a claimed bug.
+
+Chaos test hardening (committed — the durable deliverable here):
+  - writer PUT, reader GET, and verify GET now wrapped in a 5 s
+    compio::time::timeout so a stalled/wedged PS can never hang the whole
+    test forever (CI-hostile). On timeout the offending part_id is logged.
+  - CRITICAL correctness fix in the writer: a client-side PUT timeout is an
+    UNKNOWN outcome — the append may STILL land server-side once a transient
+    F227 all-replica stall (replica network-partitioned) heals. Marking it a
+    plain "failed" write produced FALSE "got seq > expected seq" mismatches
+    (the server had a newer value than the test's `expected`). Fix: on PUT
+    timeout, REMOVE the key from `expected` (uncertain → don't verify it).
+    A later successful write re-records it. Validated: 10/10 seed=8 clean,
+    transient timeouts (4-12/run during the 3 s partition) all handled,
+    0 false mismatches, 0 not_found.
+  - This does NOT mask real loss: a permanent wedge would surface as verify
+    not_found (timeout × 10 attempts → None), which stayed 0 across all runs.
+
+Lesson (test design): never equate "client RPC timed out" with "write did
+  not happen" in a durability checker — under all-replica commit a slow
+  append can still commit. Treat timeout as uncertain and drop coverage of
+  that key, or the checker invents data-loss false-positives.
+
 --- prior iteration ---
 Date: 2026-05-27
 TaskStatus: completed
