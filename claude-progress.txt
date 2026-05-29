@@ -99,10 +99,29 @@ BUG #3 (reproducible ~2/3 on seed=6, K=4/M=2/8-ENs/90s, harsh actions):
   revisions on extents that node touches → the legitimate PS owner (holding
   its acquire-time revision) gets CODE_LOCKED_BY_OTHER on its next append →
   partition_loop self-poisons (locked_by_other=true) + exits → partition dead
-  → reopened → repeat. This is a separate F211-fence / owner-revision
-  interaction: fencing a DATA node should not fence out the PARTITION owner
-  of streams that merely have a replica on that node. NEXT LAYER to
-  investigate for bug #3 (deferred — F211 fence + owner-revision semantics).
+  → reopened → repeat.
+
+  *** LAYER B FIXED (commit 34c9eb5): removed the EN-fence owner-revision bump
+  (`bump_owner_revisions_for_node`). It bumped the PARTITION owner's (PS)
+  split-brain token on a DATA-node fence — fencing out the legitimate PS.
+  Redundant (fenced EN handled by append-fail → Layer-A seal-over-reachable →
+  realloc + eversion topology refresh) and harmful. Real split-brain = the new
+  PS's acquire_owner_lock (untouched; system_locked_by_other test passes).
+  VALIDATED: K4/M2 seed=6 x8 — fence-sourced poison 0/8, MISMATCH 0/8, WEDGE
+  6/8 → 2/8.
+
+  *** LAYER C (residual ~2/8, NEXT — deferred): the remaining wedge STILL hits
+  `LockedByOther detected, poisoning partition` but from a DIFFERENT source
+  than the fence bump. Traced sequence: Split 9001→26, KillEn node1, Merge
+  9001<-26, Split 9001→39, **EcConvert OK force_ec extent 18**, then within
+  ~1s `LockedByOther` poison on BOTH part 39 + 9001. So the residual
+  LockedByOther correlates with EC-conversion during split/merge churn — an
+  EC convert (or the split/merge owner_key/revision rotation) bumps a
+  revision the PS then trips on. Distinct, deeper investigation: trace which
+  op bumps the EN `last_revision` / partition owner revision above the PS's
+  cached revision for the EC'd extent's partition during churn. (The verify
+  fast-fail + RPC timeouts mean the test now reports this as a clean FAILED
+  ~130s, not a hang.)
 
   *** SYNTHESIS (earlier, after the reopen-backoff fix + GET-timeout evidence):
   bug #3 has TWO layers. PRIMARY = F227 all-replica WRITE-BLOCK: after a node
