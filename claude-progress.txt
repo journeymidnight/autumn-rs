@@ -123,6 +123,38 @@ BUG #3 (reproducible ~2/3 on seed=6, K=4/M=2/8-ENs/90s, harsh actions):
   fast-fail + RPC timeouts mean the test now reports this as a clean FAILED
   ~130s, not a hang.)
 
+  *** LAYER C — investigation update (2026-05-29), NOT fixed: ***
+  CONFIRMED mechanism via EN instrumentation (poisoning run):
+    LAYERC append rejected LockedByOther: extent_id=42 req_rev=16 last_rev=73
+    LAYERC append rejected LockedByOther: extent_id=43 req_rev=16 last_rev=73
+  PS appends to the split-child's stream extents (42/43) with its acquire-time
+  owner revision (16), but the EN last_revision is 73 → fenced → poison. Owner
+  revisions are a SINGLE GLOBAL monotonic counter every control-plane op
+  increments (recovery — LEGITIMATELY, to fence stale/in-flight writes during
+  re-replication — merge admin-lock, fence); the PS holds a fixed acquire-time
+  value and falls behind, and the EN's purely-NUMERIC fence can't tell
+  "73 = admin/recovery op" from "73 = new owner". The bump to 73 was NOT via
+  commit_length fence-handover (no bump log) — from an append/alloc/recovery
+  carrying 73; EXACT SET source UNPINNED (Bash classifier flaky that run).
+
+  TRIED + REVERTED — Fix 1(b)-minimal (open_partition re-acquires a fresh
+  revision on every open): made the wedge WORSE (K4/M2 seed=6 2/8 → 7/8;
+  mismatch still 0, split-brain test still passed). KEY NEGATIVE RESULT:
+  re-acquiring MORE accelerates the global counter's climb and INTENSIFIES the
+  fencing churn — the problem IS the revision churn, so the fix must
+  REDUCE/CONVERGE bumps or be SURGICAL, never blanket re-acquire.
+
+  CORRECT-FIX DIRECTION (pin the SET source first):
+  - converge-able op (e.g. merge admin-lock commit_length fence-handover) →
+    use fence-free MSG_PROBE_EXTENT (Fix 1(a)-SELECTIVE, keeps recovery's bump);
+  - recovery (legit bump) → PS TARGETED re-acquire ONLY on LockedByOther AND
+    still-assigned-owner per GetRegions (NOT every open); needs cross-thread
+    poison→refresh plumbing + ownership gate (acquire_owner_lock does NOT gate
+    on assignment);
+  - deeper: per-owner-key revision space vs one global numeric fence.
+  Validate with chaos (mismatch MUST stay 0). A+B remain the shipped,
+  validated win (6/8 → 2/8, 0 data loss, split-brain intact).
+
   *** SYNTHESIS (earlier, after the reopen-backoff fix + GET-timeout evidence):
   bug #3 has TWO layers. PRIMARY = F227 all-replica WRITE-BLOCK: after a node
   kill+restart its replica is behind and recovery is fence-gated (F211), so
