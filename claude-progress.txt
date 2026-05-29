@@ -76,7 +76,35 @@ BUG #3 (reproducible ~2/3 on seed=6, K=4/M=2/8-ENs/90s, harsh actions):
   test originally hung forever joining the nemesis (its split/merge RPC to
   the wedged PS never returned).
 
-  *** SYNTHESIS (final, after the reopen-backoff fix + GET-timeout evidence):
+  *** SEAL-OVER-REACHABLE LANDED (建议1, WAS "kill 1 of 3 → seal + alloc new
+  extent"): manager `compute_commit_seal` relaxed from require-ALL-committed-
+  respond to require-`floor`-reachable, sealing at min over the REACHABLE
+  committed members. F227 had made this all-replica, so a kill+restarted
+  laggard (not in `recovering`, since recovery is fence-gated) BLOCKED the
+  failover-seal ("alloc_new_extent failed ... seal extent N: 2/3 committed
+  members reachable (need all)") → the StreamClient's seal+alloc-new-extent
+  retry never completed → write path wedged. SAFE: under all-replica-ACK every
+  committed member holds >= acked, so min-over-reachable >= acked (never drops
+  acked data); catching-up members stay excluded via `recovering`; the
+  unreachable member's avali bit stays unset → reconciled out of band.
+  VALIDATED: K4/M2 seed=6 x8 = 0/8 MISMATCH (no acked-data loss), 6 F227 unit
+  tests, 114 manager lib tests, clippy clean.
+
+  *** BUT bug #3 is MULTI-LAYERED — seal-over-reachable did NOT clear the
+  wedge (still ~6/8 not_found on K4/M2). Trace after the seal fix shows the
+  seal errors GONE but the dominant wedge is now:
+    ERROR autumn_partition_server::background: LockedByOther detected,
+    poisoning partition part_id=N
+  i.e. the nemesis fences EN node 1 → `mgr_fence_node` bumps owner-lock
+  revisions on extents that node touches → the legitimate PS owner (holding
+  its acquire-time revision) gets CODE_LOCKED_BY_OTHER on its next append →
+  partition_loop self-poisons (locked_by_other=true) + exits → partition dead
+  → reopened → repeat. This is a separate F211-fence / owner-revision
+  interaction: fencing a DATA node should not fence out the PARTITION owner
+  of streams that merely have a replica on that node. NEXT LAYER to
+  investigate for bug #3 (deferred — F211 fence + owner-revision semantics).
+
+  *** SYNTHESIS (earlier, after the reopen-backoff fix + GET-timeout evidence):
   bug #3 has TWO layers. PRIMARY = F227 all-replica WRITE-BLOCK: after a node
   kill+restart its replica is behind and recovery is fence-gated (F211), so
   appends to the partition block on commit_length/all-replica forever; the

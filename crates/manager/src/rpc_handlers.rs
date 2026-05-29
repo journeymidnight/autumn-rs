@@ -827,12 +827,34 @@ impl AutumnManager {
     /// members that answered the probe.
     ///
     /// Returns `(commit_len, avali_bits)` where `commit_len` is the `min`
-    /// over the committed (non-catching-up) members — which under
-    /// all-replica-ACK is always ≥ the acked length, so it never drops acked
-    /// data. Returns `Err` when fewer than `floor` committed members exist OR
-    /// not every committed member responded: we refuse rather than seal at a
-    /// quorum subset min (which could sit below the acked length by including
-    /// a short replica, or above it by excluding a member).
+    /// over the **reachable** committed (non-catching-up) members.
+    ///
+    /// **WAS seal-over-reachable (the bug-#3 fix).** Earlier F227 required
+    /// EVERY committed member to respond (`reachable == committed`), else
+    /// `Err` — consistency-over-availability. But a node kill+restart leaves
+    /// a committed member unreachable/behind that is NOT in `recovering`
+    /// (recovery is fence-gated, F211), so the seal blocked forever → the
+    /// write path wedged → reads starved (bug #3). WAS does NOT block on a
+    /// slow/dead replica: the Stream Manager seals at the committed length
+    /// over the REACHABLE members and re-replicates the laggard out of band.
+    /// We now require only `floor` committed members to be reachable.
+    ///
+    /// **Why this never drops acked data:** the append path is
+    /// all-replica-ACK, so the acked length is present on EVERY committed
+    /// member (reachable or not). Each reachable committed member therefore
+    /// holds ≥ the acked length, so `min` over the reachable ones is ALSO ≥
+    /// the acked length. The ONLY member that can sit BELOW acked is a
+    /// catching-up replica — and those are excluded via `recovering`. So
+    /// `min`-over-reachable-committed ≥ acked, always. (`floor` ≥ 1
+    /// guarantees at least one such member exists + responds, i.e. at least
+    /// one full acked prefix survives the seal.) An unreachable committed
+    /// member gets its `avali` bit left UNSET → the recovery/re_avali path
+    /// reconciles it to `sealed_length` later (the laggard may hold MORE —
+    /// un-acked speculation — which is then truncated; or LESS — which is
+    /// re-replicated up). Either way acked data is safe.
+    ///
+    /// `Err` only when fewer than `floor` committed members exist OR fewer
+    /// than `floor` of them responded (can't establish a durable seal point).
     pub(crate) fn compute_commit_seal(
         members: &[(usize, u64)],
         recovering: &std::collections::HashSet<u64>,
@@ -854,9 +876,13 @@ impl AutumnManager {
                 min_len = Some(min_len.map_or(v, |c| c.min(v)));
             }
         }
-        if committed < floor || reachable < committed {
+        // WAS seal-over-reachable: require `floor` committed members to exist
+        // AND `floor` of them to respond — NOT all (which blocked on a
+        // kill+restarted laggard, bug #3). Safe because min-over-reachable ≥
+        // acked under all-replica-ACK (see doc).
+        if committed < floor || reachable < floor {
             return Err(format!(
-                "{reachable}/{committed} committed members reachable (need all; floor {floor})"
+                "{reachable}/{committed} committed members reachable (need >= floor {floor})"
             ));
         }
         Ok((min_len.unwrap_or(0), avali))
@@ -1192,8 +1218,10 @@ impl AutumnManager {
                 }
             }
             // Shared pure decision: no quorum, exclude catching-up members,
-            // require all committed members to respond. apply_recovery_done
-            // sets a catching-up slot's avali bit when its rebuild completes.
+            // seal at min over the REACHABLE committed members (>= floor;
+            // WAS seal-over-reachable — a kill+restarted laggard no longer
+            // blocks). apply_recovery_done / re_avali set an unset slot's
+            // avali bit when its reconcile to sealed_length completes.
             match Self::compute_commit_seal(
                 &members,
                 &recovering,
@@ -4274,16 +4302,41 @@ mod f227_commit_seal_tests {
     }
 
     #[test]
-    fn refuses_when_a_committed_member_did_not_respond() {
-        // No quorum: every committed member must answer, else refuse (the
-        // caller retries; fence/recovery reconfigures a dead member out).
+    fn seals_over_reachable_when_a_committed_member_is_silent() {
+        // WAS seal-over-reachable (bug #3 fix): a committed member that is
+        // unreachable (e.g. a kill+restarted laggard not yet in `recovering`)
+        // no longer blocks the seal. With floor 1 and {1,3} reachable, seal at
+        // min(1,3) = 20 MB (which is >= acked under all-replica-ACK), and
+        // node 5's avali bit stays UNSET so it is reconciled out of band.
         let m = members3();
         let rec = HashSet::new();
         let mut resp = HashMap::new();
         resp.insert(1u64, 20_000_000u32);
         resp.insert(3u64, 20_000_000u32);
-        // node 5 committed but silent.
-        assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 1).is_err());
+        // node 5 committed but silent (unreachable).
+        let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp, 1).unwrap();
+        assert_eq!(
+            len, 20_000_000,
+            "seal = min over the REACHABLE committed members"
+        );
+        assert_eq!(
+            avali, 0b011,
+            "silent node 5's avali bit stays unset → reconcile later"
+        );
+    }
+
+    #[test]
+    fn refuses_when_fewer_than_floor_members_reachable() {
+        // The floor still gates: with floor 2 but only node 1 reachable
+        // (node 3 also silent), we cannot establish a durable-enough seal.
+        let m = members3();
+        let rec = HashSet::new();
+        let mut resp = HashMap::new();
+        resp.insert(1u64, 20_000_000u32);
+        // nodes 3 and 5 silent → only 1 reachable < floor 2.
+        assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 2).is_err());
+        // floor 1 is satisfied by the single reachable member.
+        assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 1).is_ok());
     }
 
     #[test]
