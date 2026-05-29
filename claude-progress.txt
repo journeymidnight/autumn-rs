@@ -1,7 +1,56 @@
 Date: 2026-05-29
+TaskStatus: not_completed
+Task scope: bug #3 (kill+restart wedge under K4/M2 chaos) — three-concepts
+  cleanup of owner_revision/eversion/sealed_length.
+
+=== LAYER C (poison-wedge) — FIXED + VALIDATED 2026-05-29 ===
+  Renamed EN fencing field `last_revision` -> `owner_revision` (confusing
+  name; collided with etcd/append `revision` + `eversion`). 12 files +
+  both CLAUDE.md. On-disk .meta byte layout unchanged (positional).
+
+  ROOT CAUSE (pinned via EN LAYERC instrumentation, K4/M2 seed=6):
+  `handle_merge_partitions` acquires an `admin-merge:<v>:<s>` owner-lock
+  whose revision = the GLOBAL monotonic owner-revision counter (e.g. 71),
+  then probes commit_length with it on the 6 streams. The EN's
+  `handle_commit_length` did a fence-HANDOVER (`req.revision > owner_revision
+  -> bump + persist .meta`), so the admin-merge control-plane revision (71)
+  STOLE the write-fence from the LIVE PS (which holds its acquire-time
+  revision 16 and never re-reads the climbing counter). PS's next append:
+  16 < 71 -> CODE_LOCKED_BY_OTHER -> partition self-poison -> not_found wedge.
+
+  FIX (clean deletion): commit_length is now CHECK-ONLY — fence-CHECK stale
+  owners (reject req.revision < owner_revision) but NEVER handover. Write-
+  ownership is established EXCLUSIVELY by the APPEND path (handle_append*
+  bumps owner_revision). New-owner takeover unaffected: the new owner's
+  first append advances the fence (system_locked_by_other fences via append,
+  not probe — verified).
+
+  VALIDATION: K4/M2 seed=6 x8 (split,merge,ec,fence,flush,compact,gc,kill,
+  killfence,partition,latency): totalpoison=0 (was 2/8), mismatches=0 in
+  ALL 8 (zero data loss). Stream unit tests 56+ pass; f227 seal tests 6 pass.
+
+=== RESIDUAL (NOT poison) — separate availability wedge, 1/8 ===
+  it=6 FAILED with `ROUTE FAILED key=q000143 part_id=26 — no part_addr,
+  marking partition wedged` / `part 26 not in regions yet` -> not_found=200.
+  A split-child partition exists but never got a part_addr in the manager's
+  regions (assignment/region-population gap), so it's unroutable. mismatches=0
+  (NOT data loss). Distinct root cause from Layer C poison. NEXT to investigate.
+
+=== LAYER A (phantom-commit, review P1) — SCOPED, NOT STARTED ===
+  Revert compute_commit_seal to strict (reachable == committed) to kill the
+  seal-over-reachable phantom-commit; restore the F227 unit test. To avoid
+  re-wedging the writer's error-path seal, add StreamSubmitMsg::QueryCommit
+  (worker reports state.commit = acked watermark; never rewound, verified)
+  and have client.rs error-path allocs (1673/1700/1730) pass it as req.end
+  -> safe req.end>0 seal branch (no probe). Validate mismatches=0 + wedge
+  not worse. client-side complexity, no new manager probe behavior.
+
+--- prior task (block-boundary lookup, commit 8e0ecad) kept below as history ---
+
+Date: 2026-05-29
 TaskStatus: completed
-Task scope: ROOT-CAUSE + FIX the remaining fence+flush chaos data-loss bug
-  (the ~30% subprocess failure left after commit 30e9051). It is NOT data
+Prior task scope: ROOT-CAUSE + FIX the remaining fence+flush chaos data-loss
+  bug (the ~30% subprocess failure left after commit 30e9051). It is NOT data
   loss — it is a point-lookup SST BLOCK-BOUNDARY bug.
 
 ROOT CAUSE (pinned via the expanded f250 in-process reproducer +

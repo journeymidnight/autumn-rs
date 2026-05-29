@@ -234,7 +234,7 @@ pub struct MgrEcDispatchInflight {
     /// → `WriteShardReq.revision` / `CommitEcShardReq.revision` so a
     /// fenced ex-coord whose in-flight 2PC continues with the OLD revision
     /// is rejected by remote ENs via the existing `req.revision <
-    /// entry.last_revision → CODE_LOCKED_BY_OTHER` check. A bumped
+    /// entry.owner_revision → CODE_LOCKED_BY_OTHER` check. A bumped
     /// revision is pushed to live targets by
     /// `auto_abandon_for_fenced_node` (fence-handover via
     /// `MSG_CHECK_COMMIT_LENGTH`) so the EN-side check fires.

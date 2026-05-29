@@ -3064,7 +3064,7 @@ impl AutumnManager {
         // partition that owns this extent. Threaded through dispatch ->
         // coord -> WriteShard/CommitEcShard so a fenced ex-coord's
         // in-flight 2PC is rejected by remote ENs once
-        // `auto_abandon_for_fenced_node` bumps their `entry.last_revision`
+        // `auto_abandon_for_fenced_node` bumps their `entry.owner_revision`
         // via fence-handover. CoW-shared extents (refs >= 2) appear in
         // multiple partitions' streams; any of them works because all
         // sharing partitions hold the same owner_lock revision at any

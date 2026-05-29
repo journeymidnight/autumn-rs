@@ -60,13 +60,13 @@ fn owner_lock_fencing_rejects_stale_revision() {
         .await
         .expect("connect sc2");
 
-        // sc2 writes — this updates last_revision on the extent node
+        // sc2 writes — this updates owner_revision on the extent node
         sc2.append(stream_id, b"sc2-data-0")
             .await
             .expect("sc2 append should succeed");
 
         // sc1's next write should fail with LockedByOther because
-        // the extent node's last_revision was updated by sc2
+        // the extent node's owner_revision was updated by sc2
         let result = sc1.append(stream_id, b"stale-write").await;
         assert!(
             result.is_err(),

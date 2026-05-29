@@ -106,7 +106,7 @@ async fn appends_to_different_extents_run_concurrently() {
 #[compio::test]
 async fn seal_rejects_subsequent_appends() {
     // Revision fencing (ACL that runs on every append batch future): once
-    // last_revision is bumped, late-arriving lower-revision appends must be
+    // owner_revision is bumped, late-arriving lower-revision appends must be
     // rejected. Proves the per-submit ACL path is still firing.
     let node_dir = tempfile::tempdir().expect("node tempdir");
     let addr = pick_addr();
@@ -116,7 +116,7 @@ async fn seal_rejects_subsequent_appends() {
     let alloc = conn.alloc_extent(2020).await;
     assert_eq!(alloc.code, CODE_OK);
 
-    // High-revision write: sets last_revision=100.
+    // High-revision write: sets owner_revision=100.
     let r1 = conn.append(2020, 1, 0, 100, b"first".to_vec()).await;
     assert_eq!(r1.code, CODE_OK);
 

@@ -186,7 +186,7 @@ The stream layer uses **revision-based fencing** to prevent split-brain:
 
 1. A `StreamClient` calls `acquire_owner_lock(owner_key)` on the manager, receiving a monotonic `revision`.
 2. Every append and `commit_length` call passes this revision.
-3. `ExtentNode` rejects operations where `header.revision < last_revision`.
+3. `ExtentNode` rejects operations where `header.revision < owner_revision`.
 4. If a new owner takes over (higher revision), old owners' writes are refused.
 
 ## Commit Protocol (No Traditional WAL)

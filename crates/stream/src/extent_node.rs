@@ -756,7 +756,7 @@ pub(crate) struct ExtentEntry {
     pub(crate) eversion: AtomicU64,
     pub(crate) sealed_length: AtomicU64,
     pub(crate) avali: AtomicU32,
-    pub(crate) last_revision: AtomicI64,
+    pub(crate) owner_revision: AtomicI64,
     /// Which disk this extent lives on. Used to resolve file paths.
     pub(crate) disk_id: u64,
     /// F178 Phase 1: per-extent fsync coalescer state.
@@ -1524,8 +1524,8 @@ async fn build_append_future(
 
     // 3. Revision fencing: the first request's revision governs the batch.
     let first = &slots[0].req;
-    let last_revision = extent.last_revision.load(Ordering::SeqCst);
-    if first.revision < last_revision {
+    let owner_revision = extent.owner_revision.load(Ordering::SeqCst);
+    if first.revision < owner_revision {
         let resp_payload = AppendResp {
             code: CODE_LOCKED_BY_OTHER,
             offset: 0,
@@ -1538,9 +1538,9 @@ async fn build_append_future(
             .collect();
         return Box::pin(async move { out });
     }
-    let revision_changed = first.revision > last_revision;
+    let revision_changed = first.revision > owner_revision;
     if revision_changed {
-        extent.last_revision.store(first.revision, Ordering::SeqCst);
+        extent.owner_revision.store(first.revision, Ordering::SeqCst);
     }
 
     // 4. Commit reconciliation.
@@ -1863,10 +1863,10 @@ impl ExtentNode {
     /// F157: extent .meta sidecar layout versioning.
     ///
     /// V0 (legacy, pre-F157): 40 bytes, no CRC.
-    ///   [magic[8]=b"EXTMETA\0"][extent_id[8]][sealed_length[8]][eversion[8]][last_revision[8]]
+    ///   [magic[8]=b"EXTMETA\0"][extent_id[8]][sealed_length[8]][eversion[8]][owner_revision[8]]
     ///
     /// V1 (post-F157): 44 bytes, CRC32C trailer over the first 40 bytes.
-    ///   [magic[8]=b"EXTMETA\x01"][extent_id[8]][sealed_length[8]][eversion[8]][last_revision[8]][crc32c[4]]
+    ///   [magic[8]=b"EXTMETA\x01"][extent_id[8]][sealed_length[8]][eversion[8]][owner_revision[8]][crc32c[4]]
     ///
     /// Pre-F157 a flipped bit anywhere in the 40-byte payload (bit rot, undetected
     /// disk error, partial overwrite during a torn write) silently changed the
@@ -2204,7 +2204,7 @@ impl ExtentNode {
     ) -> Result<(), String> {
         let sealed_length = entry.sealed_length.load(Ordering::SeqCst);
         let eversion = entry.eversion.load(Ordering::SeqCst);
-        let last_revision = entry.last_revision.load(Ordering::SeqCst);
+        let owner_revision = entry.owner_revision.load(Ordering::SeqCst);
 
         // F157: always write V1 (44 bytes with CRC32C trailer).
         let mut buf = [0u8; Self::META_SIZE_V1];
@@ -2212,7 +2212,7 @@ impl ExtentNode {
         buf[8..16].copy_from_slice(&extent_id.to_le_bytes());
         buf[16..24].copy_from_slice(&sealed_length.to_le_bytes());
         buf[24..32].copy_from_slice(&eversion.to_le_bytes());
-        buf[32..40].copy_from_slice(&last_revision.to_le_bytes());
+        buf[32..40].copy_from_slice(&owner_revision.to_le_bytes());
         let crc = crc32c::crc32c(&buf[0..Self::META_SIZE_V0]);
         buf[40..44].copy_from_slice(&crc.to_le_bytes());
 
@@ -2283,8 +2283,8 @@ impl ExtentNode {
         }
         let sealed_length = u64::from_le_bytes(buf[16..24].try_into().ok()?);
         let eversion = u64::from_le_bytes(buf[24..32].try_into().ok()?);
-        let last_revision = i64::from_le_bytes(buf[32..40].try_into().ok()?);
-        Some((sealed_length, eversion, last_revision))
+        let owner_revision = i64::from_le_bytes(buf[32..40].try_into().ok()?);
+        Some((sealed_length, eversion, owner_revision))
     }
 
     pub async fn load_extents(&self) -> Result<()> {
@@ -2334,7 +2334,7 @@ impl ExtentNode {
                 };
                 let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
 
-                let (sealed_length, eversion, last_revision) =
+                let (sealed_length, eversion, owner_revision) =
                     match compio::fs::read(disk.meta_path(extent_id)).await {
                         Ok(buf) => Self::parse_meta(&buf, extent_id).unwrap_or((0, 1, 0)),
                         Err(_) => (0, 1, 0),
@@ -2348,7 +2348,7 @@ impl ExtentNode {
                         eversion: AtomicU64::new(eversion),
                         sealed_length: AtomicU64::new(sealed_length),
                         avali: AtomicU32::new(if sealed_length > 0 { 1 } else { 0 }),
-                        last_revision: AtomicI64::new(last_revision),
+                        owner_revision: AtomicI64::new(owner_revision),
                         disk_id: disk.disk_id,
                         coalescer: Coalescer::new(len),
                     }),
@@ -2737,7 +2737,7 @@ impl ExtentNode {
                 eversion: AtomicU64::new(1),
                 sealed_length: AtomicU64::new(0),
                 avali: AtomicU32::new(0),
-                last_revision: AtomicI64::new(0),
+                owner_revision: AtomicI64::new(0),
                 disk_id,
                 coalescer: Coalescer::new(len),
             }),
@@ -3623,8 +3623,8 @@ impl ExtentNode {
             .encode());
         }
 
-        let last_revision = extent.last_revision.load(Ordering::SeqCst);
-        if req.revision < last_revision {
+        let owner_revision = extent.owner_revision.load(Ordering::SeqCst);
+        if req.revision < owner_revision {
             return Ok(AppendResp {
                 code: CODE_LOCKED_BY_OTHER,
                 offset: 0,
@@ -3632,9 +3632,9 @@ impl ExtentNode {
             }
             .encode());
         }
-        let revision_changed = req.revision > last_revision;
+        let revision_changed = req.revision > owner_revision;
         if revision_changed {
-            extent.last_revision.store(req.revision, Ordering::SeqCst);
+            extent.owner_revision.store(req.revision, Ordering::SeqCst);
         }
 
         let mut start = extent.len.load(Ordering::SeqCst);
@@ -3841,16 +3841,25 @@ impl ExtentNode {
         // legitimately don't have an owner (manager recovery liveness,
         // `autumn-client info` display) now use `handle_probe_extent`.
         //
-        // Fence handover semantics on the surviving (revision > 0) path:
-        //   revision < last_revision → CODE_LOCKED_BY_OTHER (stale owner)
-        //   revision = last_revision → no-op, return length
-        //   revision > last_revision → bump + persist .meta (handover)
-        // The handover-on-bump is load-bearing: when a new owner first
-        // contacts an EN with a higher revision (via manager's
-        // `handle_check_commit_length` per-replica probe carrying the
-        // PS's validated revision), this is what advances the fence
-        // BEFORE the new owner's first append. Old owners get
-        // CODE_LOCKED_BY_OTHER on their next append.
+        // Fence semantics on the surviving (revision > 0) path — CHECK ONLY,
+        // NEVER handover (the three-concepts rule, 2026-05-29):
+        //   revision < owner_revision → CODE_LOCKED_BY_OTHER (stale owner)
+        //   revision >= owner_revision → no-op, return length
+        //
+        // commit_length is a length PROBE; write-ownership is established
+        // EXCLUSIVELY by the APPEND path (`handle_append*` bumps owner_revision
+        // when a higher-revision owner writes). A probe must NOT steal the
+        // write-fence. The old "revision > owner_revision → bump + persist
+        // .meta handover" was the Layer-C poison bug: the manager's
+        // control-plane probes (the `admin-merge:<v>:<s>` owner-lock in
+        // `handle_merge_partitions`, the seal in `handle_stream_alloc_extent`)
+        // carry a high global owner-revision counter that does NOT represent a
+        // new PS write-owner. Bumping owner_revision on such a probe fenced out
+        // the LIVE PS (which holds its acquire-time revision and never re-reads
+        // the climbing counter) → CODE_LOCKED_BY_OTHER on its next append →
+        // partition self-poison. New-owner takeover is unaffected: the new
+        // owner's first APPEND advances the fence and fences the old owner
+        // (see `system_locked_by_other` — sc2 fences sc1 via append, not probe).
         if req.revision <= 0 {
             return Err((
                 StatusCode::InvalidArgument,
@@ -3861,17 +3870,13 @@ impl ExtentNode {
                 ),
             ));
         }
-        let last = entry.last_revision.load(Ordering::SeqCst);
-        if req.revision < last {
+        let owner_revision = entry.owner_revision.load(Ordering::SeqCst);
+        if req.revision < owner_revision {
             return Ok(CommitLengthResp {
                 code: CODE_LOCKED_BY_OTHER,
                 length: 0,
             }
             .encode());
-        }
-        if req.revision > last {
-            entry.last_revision.store(req.revision, Ordering::SeqCst);
-            let _ = self.save_meta(req.extent_id, &entry).await;
         }
         // F119-E: for sealed extents, return the LOGICAL sealed length
         // (the original payload length, agreed with the manager). For
@@ -3926,7 +3931,7 @@ impl ExtentNode {
     /// Differs from `handle_commit_length` in exactly two ways:
     ///   (a) takes no revision — request is 8 bytes, not 16.
     ///   (b) does NOT touch the owner-lock fence — never returns
-    ///       LOCKED_BY_OTHER, never mutates `last_revision`, never
+    ///       LOCKED_BY_OTHER, never mutates `owner_revision`, never
     ///       writes `.meta`.
     /// Length-source semantics are identical to commit_length so the
     /// `info` CLI display matches what a real owner would see.
@@ -4069,7 +4074,7 @@ impl ExtentNode {
                 eversion: AtomicU64::new(1),
                 sealed_length: AtomicU64::new(0),
                 avali: AtomicU32::new(0),
-                last_revision: AtomicI64::new(0),
+                owner_revision: AtomicI64::new(0),
                 disk_id,
                 coalescer: Coalescer::new(len),
             }),
@@ -5004,13 +5009,13 @@ impl ExtentNode {
 
         // F211-D: owner-lock revision fence. `revision == 0` keeps the
         // pre-F211-D no-fence behaviour; non-zero is rejected when the
-        // local last_revision has moved ahead (e.g., a fence on the
+        // local owner_revision has moved ahead (e.g., a fence on the
         // coord node bumped owner-lock revisions on every extent the
         // coord touched, so a revived ghost coord's WriteShard with the
         // old revision is refused).
         if req.revision > 0 {
             if let Ok(entry) = self.ensure_extent(req.extent_id).await {
-                let last = entry.last_revision.load(Ordering::SeqCst);
+                let last = entry.owner_revision.load(Ordering::SeqCst);
                 if req.revision < last {
                     return Ok(WriteShardResp {
                         code: CODE_LOCKED_BY_OTHER,
@@ -5047,7 +5052,7 @@ impl ExtentNode {
         // F211-D: owner-lock revision fence (see handle_write_shard).
         if req.revision > 0 {
             if let Ok(entry) = self.ensure_extent(req.extent_id).await {
-                let last = entry.last_revision.load(Ordering::SeqCst);
+                let last = entry.owner_revision.load(Ordering::SeqCst);
                 if req.revision < last {
                     return Ok(CommitEcShardResp {
                         code: CODE_LOCKED_BY_OTHER,
@@ -5476,7 +5481,7 @@ mod f157_meta_crc_tests {
         buf[8..16].copy_from_slice(&extent_id.to_le_bytes());
         buf[16..24].copy_from_slice(&12345u64.to_le_bytes()); // sealed_length
         buf[24..32].copy_from_slice(&7u64.to_le_bytes()); // eversion
-        buf[32..40].copy_from_slice(&42i64.to_le_bytes()); // last_revision
+        buf[32..40].copy_from_slice(&42i64.to_le_bytes()); // owner_revision
         let crc = crc32c::crc32c(&buf[0..ExtentNode::META_SIZE_V0]);
         buf[40..44].copy_from_slice(&crc.to_le_bytes());
 

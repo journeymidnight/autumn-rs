@@ -31,7 +31,7 @@ Each extent file pair:
 | 8–15 | `extent_id` (le u64) |
 | 16–23 | `sealed_length` (le u64) |
 | 24–31 | `eversion` (le u64) |
-| 32–39 | `last_revision` (le i64) |
+| 32–39 | `owner_revision` (le i64) |
 | 40–43 | **F157**: CRC32C of bytes 0–39 (V1 only; V0 lacks this trailer) |
 
 `ExtentEntry` stores `disk_id` for path resolution. `choose_disk()` returns the first online disk (matches Go's strategy). `df()` returns real `statvfs` stats per disk.
@@ -59,7 +59,7 @@ struct ExtentEntry {
     eversion: AtomicU64,           // bumped on seal or eversion change
     sealed_length: AtomicU64,      // 0 = active; >0 = sealed at this length
     avali: AtomicU32,              // availability flag (non-zero = sealed)
-    last_revision: AtomicI64,      // most recent owner revision seen
+    owner_revision: AtomicI64,      // most recent owner revision seen
     disk_id: u64,                  // immutable after creation
 }
 ```
@@ -185,8 +185,8 @@ Append(AppendReq via autumn-rpc binary frame):
        - If client eversion < local: reject (PRECONDITION_FAILED)
   3. Sealed check: reject if sealed_length > 0 or avali > 0
   4. Revision fencing:
-       - If header.revision < last_revision: reject (CODE_LOCKED_BY_OTHER — stale owner)
-       - If header.revision > last_revision: update last_revision, persist meta
+       - If header.revision < owner_revision: reject (CODE_LOCKED_BY_OTHER — stale owner)
+       - If header.revision > owner_revision: update owner_revision, persist meta
   5. Commit reconciliation:
        - If local file len < header.commit: reject (data loss on our side)
        - If local file len > header.commit:

@@ -35,7 +35,7 @@ pub const MSG_COMMIT_EC_SHARD: u8 = 12;
 pub const MSG_SYNCED_LENGTH: u8 = 13;
 /// Manager-only probe RPC. Returns CommitLengthResp-shaped
 /// `(code, length)` without touching the owner-lock fence — no
-/// revision check, no mutation of `last_revision`, no `.meta`
+/// revision check, no mutation of `owner_revision`, no `.meta`
 /// rewrite. Two call sites today:
 ///   - `manager/src/recovery.rs`'s `recovery_dispatch_loop`
 ///     liveness probe (uses `code == CODE_OK` to decide whether
@@ -230,20 +230,29 @@ impl ReadBytesResp {
 ///   - returns `CODE_INVALID_ARGUMENT` if `revision <= 0` (no
 ///     "probe sentinel" path — that escape hatch existed pre-F210-H2
 ///     and broke fence semantics; see `MSG_PROBE_EXTENT` instead);
-///   - returns `CODE_LOCKED_BY_OTHER` if `revision < entry.last_revision`
+///   - returns `CODE_LOCKED_BY_OTHER` if `revision < entry.owner_revision`
 ///     (caller is a stale owner; reject);
-///   - if `revision > entry.last_revision`, performs **fence handover**:
-///     bumps `last_revision` and persists `.meta` so subsequent writes
-///     from older owners are rejected by `handle_append` immediately.
+///   - if `revision >= entry.owner_revision`, returns the length WITHOUT
+///     mutating `owner_revision` (CHECK-ONLY; the three-concepts rule).
 ///
-/// This RPC is the canonical seal-consensus + ownership-acquisition
-/// primitive. Manager's `commit_length_on_node(addr, eid, revision)`
-/// helper forwards the caller's validated `req.revision` through
-/// `handle_check_commit_length` and `handle_stream_alloc_extent`.
-/// Manager probes WITHOUT an owner context (recovery liveness,
-/// `autumn-client info` display) use `MSG_PROBE_EXTENT` instead —
-/// that RPC returns the same `(code, length)` shape but skips the
-/// fence interaction entirely.
+/// commit_length is a length PROBE + stale-owner fence CHECK. It does NOT
+/// perform fence handover — write-ownership is established EXCLUSIVELY by
+/// the APPEND path (`handle_append*` bumps `owner_revision` when a
+/// higher-revision owner writes). The old "revision > owner_revision →
+/// bump + persist .meta" handover was removed 2026-05-29: the manager's
+/// control-plane probes (`admin-merge:<v>:<s>` lock in
+/// `handle_merge_partitions`, the seal in `handle_stream_alloc_extent`)
+/// carry a high global owner-revision counter that does NOT represent a
+/// new PS write-owner; bumping `owner_revision` on such a probe fenced out
+/// the LIVE PS (which never re-reads the climbing counter) → poison.
+///
+/// This RPC is the canonical seal-consensus primitive. Manager's
+/// `commit_length_on_node(addr, eid, revision)` helper forwards the
+/// caller's validated `req.revision` through `handle_check_commit_length`
+/// and `handle_stream_alloc_extent`. Manager probes WITHOUT an owner
+/// context (recovery liveness, `autumn-client info` display) use
+/// `MSG_PROBE_EXTENT` instead — that RPC returns the same `(code, length)`
+/// shape but skips the fence CHECK entirely.
 pub struct CommitLengthReq {
     pub extent_id: u64,
     pub revision: i64,
@@ -431,7 +440,7 @@ pub const CODE_OK: u8 = 0;
 pub const CODE_NOT_FOUND: u8 = 1;
 pub const CODE_PRECONDITION: u8 = 3;
 pub const CODE_ERROR: u8 = 4;
-/// Returned when `header.revision < last_revision` — a newer owner has taken the lock.
+/// Returned when `header.revision < owner_revision` — a newer owner has taken the lock.
 pub const CODE_LOCKED_BY_OTHER: u8 = 5;
 /// Returned by ReadBytes when the client's `eversion` is older than the
 /// server's local view (e.g. the extent has been EC-converted under a
@@ -678,7 +687,7 @@ impl CopyExtentResp {
 ///
 /// `revision` (F211-D) carries the owner-lock revision the caller
 /// claims. When `revision > 0` the extent-node refuses with
-/// `CODE_LOCKED_BY_OTHER` if `revision < entry.last_revision` — same
+/// `CODE_LOCKED_BY_OTHER` if `revision < entry.owner_revision` — same
 /// fence model as the append path. `revision = 0` means "no fence
 /// requested" (pre-F211-D wire-compat).
 pub const WRITE_SHARD_HEADER_LEN: usize = 36;

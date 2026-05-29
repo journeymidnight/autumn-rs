@@ -2407,7 +2407,7 @@ impl StreamClient {
     /// **Fence-free**: uses `MSG_PROBE_EXTENT` rather than
     /// `MSG_COMMIT_LENGTH`. Pre-fix this called `MSG_COMMIT_LENGTH`
     /// with the StreamClient's owner revision, which causes the EN to
-    /// run fence handover (bumps `last_revision` if our revision is
+    /// run fence handover (bumps `owner_revision` if our revision is
     /// higher). Two harmful side-effects in production:
     ///   1. A reader StreamClient created with a NEW owner_key
     ///      (higher revision) silently fences the original writer's
@@ -2416,7 +2416,7 @@ impl StreamClient {
     ///      revision=1; test creates external StreamClient
     ///      (revision=2) for read-only `read_last_extent_data`; that
     ///      call falls through to this helper which bumps EN's
-    ///      last_revision to 2; PS's 4th append (compact's checkpoint)
+    ///      owner_revision to 2; PS's 4th append (compact's checkpoint)
     ///      fails with LockedByOther.
     ///   2. The same shape can hit production whenever an external
     ///      reader (e.g. autumn-stream-cli read, or any consumer that

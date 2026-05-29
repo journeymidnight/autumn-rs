@@ -119,11 +119,11 @@ impl AutumnManager {
             // F211-D Tier 2: push the post-fence owner-lock revision to
             // each live (non-fenced) target EN via `commit_length_on_node`.
             // The EN's `handle_check_commit_length` does fence-handover
-            // when `req.revision > entry.last_revision` — bumps and
+            // when `req.revision > entry.owner_revision` — bumps and
             // persists `.meta`. After this, a ghost ex-coord whose
             // in-flight 2PC continues with the OLD revision will be
             // rejected by `handle_write_shard` / `handle_commit_ec_shard`
-            // (`req.revision < entry.last_revision → CODE_LOCKED_BY_OTHER`),
+            // (`req.revision < entry.owner_revision → CODE_LOCKED_BY_OTHER`),
             // preventing it from overwriting `.dat` on remotes after the
             // marker has been abandoned.
             //
@@ -139,7 +139,7 @@ impl AutumnManager {
     /// F211-D Tier 2: push the post-fence owner-lock revision to each
     /// live (non-fenced) target EN of an abandoned ConvertToEc marker.
     /// Uses `commit_length_on_node` (which the EN turns into a
-    /// fence-handover bump of `entry.last_revision`). Best-effort.
+    /// fence-handover bump of `entry.owner_revision`). Best-effort.
     async fn push_fence_handover_to_targets(
         &self,
         extent_id: u64,

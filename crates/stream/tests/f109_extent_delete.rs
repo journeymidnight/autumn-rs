@@ -108,7 +108,7 @@ async fn delete_then_realloc_starts_fresh() {
 
     // Fresh append at offset 0 — we use `revision=20 >= 10` to satisfy
     // the fencing check (the .meta sidecar was unlinked, so
-    // last_revision is reset to 0; any positive revision is fine).
+    // owner_revision is reset to 0; any positive revision is fine).
     let resp = conn.append(extent_id, 1, 0, 20, vec![0x22; 512]).await;
     assert_eq!(resp.code, CODE_OK, "append after re-alloc failed");
     assert_eq!(resp.offset, 0, "fresh extent must start at offset 0");

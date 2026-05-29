@@ -2490,7 +2490,7 @@ impl AutumnManager {
     ///     `dispatch_recovery_task`).
     ///   - Future: any manager-internal "is this extent on this EN +
     ///     what's its current length" query without an owner context.
-    /// Does NOT touch the EN's `last_revision`. NotFound (extent missing
+    /// Does NOT touch the EN's `owner_revision`. NotFound (extent missing
     /// locally) and RPC error are both surfaced as `Err(Internal(...))`
     /// so callers can treat both as "dispatch recovery" without branching.
     pub(crate) async fn probe_extent_on_node(
