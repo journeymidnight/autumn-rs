@@ -1897,10 +1897,29 @@ pub(crate) async fn do_compact(
 
     let tables_snapshot = {
         let mut p = part.borrow_mut();
+        // F252: locate the position of the OLDEST input table BEFORE
+        // removing the compaction inputs. The compaction output
+        // logically replaces those inputs in age order (its newest
+        // contained seq is bounded by the input set's last_seq), so it
+        // must be inserted at the SAME position — NOT appended at the
+        // newest end. Appending breaks the
+        // `sst_readers.iter().rev() = newest first` lookup contract
+        // when a flush completed during the compaction await window:
+        // that newer SST sits at a lower index than the compaction
+        // output, and a Get for a key updated by that newer flush
+        // walks the compaction output first (stale value) and never
+        // reaches the newer flush. Surfaced as the chaos test's
+        // fence+flush data-loss bug and the in-process f250 reproducer.
+        let insert_at = p
+            .tables
+            .iter()
+            .position(|tm| compact_keys.contains(&tm.loc()))
+            .unwrap_or(p.tables.len());
         remove_compacted_tables(&mut p, &compact_keys);
-        for (tbl_meta, reader) in new_readers {
-            p.sst_readers.push(reader);
-            p.tables.push(tbl_meta);
+        for (offset, (tbl_meta, reader)) in new_readers.into_iter().enumerate() {
+            let idx = insert_at + offset;
+            p.sst_readers.insert(idx, reader);
+            p.tables.insert(idx, tbl_meta);
         }
         p.tables.clone()
     };
