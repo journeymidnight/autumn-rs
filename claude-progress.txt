@@ -64,6 +64,31 @@ Task scope: bug #3 (kill+restart wedge under K4/M2 chaos) — three-concepts
   CLAUDE, inline doc) + memory feedback_seal_must_be_lenient. F227 unit test
   seals_over_reachable_when_a_committed_member_is_silent KEPT.
 
+=== NEW BUG FOUND (seed=13 sweep, 2026-05-29) — NOT data loss, NOT yet fixed ===
+  After bug #3 closed (poison + routing fixed, pushed f27d8ae), a K4/M2
+  multi-seed sweep was 9/10 clean; seed=13 FAILED with a RANGE-path wedge
+  (mismatches=0, not_found=0 — point-gets all fine, so NO data loss):
+    range_errors=2: "range rpc on part 9001: TIMED OUT (5s) — PS wedged" +
+    "part 9001: range missing 192 expected keys (first: b000000)".
+  Proximate cause (from warn-level log, line 81 of sweep_13.log):
+    `alloc_new_extent failed after 20 retries: stream_alloc_extent failed:
+     extent 20 has in-flight Recovery; defer alloc_extent until it completes`.
+  Chain: nemesis kill+fence+network-partition node 1 (repeated) -> extent 20's
+  Recovery never completes in the window -> F207 ledger makes stream_alloc_extent
+  REFUSE (Precondition, Class A refuse-at-start) while extent 20 has in-flight
+  Recovery -> writer can't roll a new tail -> freeze-drain flush fails (merge
+  rolled back) + write path + range all wedge. This is the F207-recovery-vs-alloc
+  interaction (the memory's hypothesized "PRIMARY F227 layer"): a stuck recovery
+  on the TAIL extent blocks new-extent allocation.
+  NEXT: traced repro at seed=13 (RUST_LOG=info, recovery+manager) to pin WHY
+  extent 20's recovery never completes (target keeps failing? rate-limiter
+  backoff? node 1 flapping kill+restart confuses dispatch? source replicas
+  partitioned?). Then decide fix: e.g. alloc on a DIFFERENT/fresh extent set
+  when the tail's recovery is stuck, or time-bound the alloc-defer, or let
+  recovery reconfigure the dead member out faster. Repro:
+    AUTUMN_CHAOS_SEED=13 ... (same K4/M2 cmd as bug #3). ~1/10 hit rate.
+  Memory: project_recovery_stuck_blocks_alloc.
+
 --- prior task (block-boundary lookup, commit 8e0ecad) kept below as history ---
 
 Date: 2026-05-29
