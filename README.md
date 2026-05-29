@@ -1959,6 +1959,65 @@ AUTUMN_MGR_AUDIT_RETENTION_DAYS=90           # audit log GC
 
 ---
 
+## F227 — the seal must be lenient (an EN can be unreachable at seal time) (2026-05-29)
+
+**Design principle (load-bearing — do NOT make the seal strict):** when the
+manager seals/commits a stream extent, **it is entirely possible that some
+extent-node cannot be reached** — in fact you usually seal *because* a node
+just went down. The manager seal therefore **must NOT require every committed
+replica to respond.** It seals at the `min` over the *reachable* committed
+members (≥ a small durability `floor`), and leaves an unreachable member's
+`avali` bit unset to be reconciled later by recovery / `re_avali`.
+
+This is safe because **the guarantee comes from the append path, not from a
+strict seal**: appends are all-replica-ACK (`apply_completion` acks only when
+every replica wrote), so the acked prefix is present on *every* committed
+member. Hence `min` over the reachable members is always ≥ the acked length and
+**never drops acked data**, no matter which nodes are down. Requiring all
+committed members to respond would block the seal forever whenever a node is
+down — that was the bug #3 seal-wedge.
+
+The flip side — seal-over-reachable can promote an un-acked-but-replicated tail
+byte to committed (data *gain*, never *loss*) — is **acceptable and
+intentional**: it matches the system's existing uncertain-write semantics (a
+PUT that timed out on the client may still land; treat such keys as uncertain).
+Do **not** add a strict mode or acked-watermark threading to remove it — that
+would trade a benign data-gain for a real data-*loss* risk. See
+`crates/manager/CLAUDE.md` note 28 and `crates/stream/CLAUDE.md` (F227).
+
+### Bug #3 — kill+restart partition wedge (RESOLVED 2026-05-29)
+
+Two independent layers, both fixed:
+
+1. **Poison-wedge** — `commit_length` on the extent-node is now **check-only**
+   (rejects a stale owner, but never performs the old fence-*handover* bump).
+   Write-ownership is established **exclusively by the append path**. Before the
+   fix, the manager's merge orchestration acquired an `admin-merge:<v>:<s>`
+   owner-lock whose revision is the global monotonic owner-revision counter,
+   then probed `commit_length` with it — the handover bumped the EN fence and
+   stole write-ownership from the live partition server (which holds its lower
+   acquire-time revision), poisoning the partition on its next append.
+2. **Routing-wedge** — per-partition listeners now fall back to an OS-assigned
+   port (`bind :0`) when the deterministic `base_port + ord` port hits
+   `EADDRINUSE`, and register the **actual** bound port. The deterministic port
+   can collide with an OS *ephemeral* local port held by an outbound socket when
+   `base_port` falls inside `ip_local_port_range`; the split-child then never
+   binds a listener → no `part_addr` → unroutable. Clients route via the
+   registered address, so the port need not be deterministic.
+
+**Manual verification (chaos):**
+```bash
+# Harsh regime that reproduced bug #3 (4-data/2-parity EC, 90s, kill+fence+split+merge).
+AUTUMN_CHAOS_SEED=6 AUTUMN_CHAOS_DURATION_SECS=90 \
+AUTUMN_CHAOS_EC_K=4 AUTUMN_CHAOS_EC_M=2 AUTUMN_CHAOS_NUM_ENS=8 \
+AUTUMN_CHAOS_ACTIONS=split,merge,ec,fence,flush,compact,gc,kill,killfence,partition,latency \
+  cargo test -p autumn-manager --test system_chaos -- --ignored --nocapture
+# Expect: "per-key verify: total=N mismatches=0 not_found=0" and "test result: ok".
+# Before the fixes this failed ~3/8 runs (poison wedge) then ~1/8 (routing wedge);
+# after, seed=6 passes 10/10. The PS log shows "bound OS-assigned fallback port"
+# 2-3x per run — the ephemeral-collision fallback engaging as designed.
+```
+
 ## Notes
 
 - `IoMode::IoUring` is not yet implemented; extent nodes use `IoMode::Standard`.
