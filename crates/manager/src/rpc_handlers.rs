@@ -3987,12 +3987,23 @@ impl AutumnManager {
             etcd.put_msgs_txn(vec![(key, value)]).await?;
         }
         self.node_overrides.borrow_mut().insert(req.node_id, ovr);
-        // F211-D: bump owner-lock revisions for every extent the
-        // node holds (so any stale-cache writes by a revived ghost
-        // are rejected). The bump is best-effort — owner revisions
-        // are CAS-based and concurrent acquirers will simply land
-        // ahead of us.
-        let _ = self.bump_owner_revisions_for_node(req.node_id).await;
+        // BUG #3 Layer B fix: do NOT bump partition owner-lock revisions when
+        // fencing an EN data node. The owner-lock revision is the PARTITION
+        // OWNER's (PS) token for split-brain prevention; an EN data node is
+        // never a partition owner. The old F211-D bump
+        // (`bump_owner_revisions_for_node`) walked every partition whose
+        // log/row/meta stream merely had a REPLICA on the fenced node and
+        // bumped THAT partition's owner revision — fencing out the legitimate
+        // PS owner (which holds its acquire-time revision and never
+        // re-acquires), so the PS's next append got CODE_LOCKED_BY_OTHER and
+        // `partition_loop` self-poisoned + reopen-thrashed (the chaos seed=6
+        // wedge after the Layer-A seal fix). It was also redundant: a fenced
+        // EN is handled by the normal append-fail → seal-over-reachable (Layer
+        // A) → alloc-new-extent path, and post-recovery topology changes are
+        // picked up via EVERSION refresh, not owner-revision. Real split-brain
+        // protection is the NEW PS's `acquire_owner_lock` on takeover (higher
+        // revision), unaffected by this removal — see
+        // `system_locked_by_other.rs::owner_lock_fencing_rejects_stale_revision`.
         // F211-F: auto-abandon EC convert markers whose coord matches
         // the freshly-fenced node.
         let _ = self.auto_abandon_for_fenced_node(req.node_id).await;
@@ -4039,48 +4050,14 @@ impl AutumnManager {
         Ok(())
     }
 
-    /// F211-D: bump owner-lock revision for every extent the node owns.
-    /// The store's `owner_revisions` map is keyed by owner_key, not by
-    /// extent_id; we increment the revision counter so any pending
-    /// op still carrying the old revision is rejected by the
-    /// extent-node revision fence.
-    async fn bump_owner_revisions_for_node(&self, node_id: u64) -> Result<(), AppError> {
-        // Find every owner_key whose associated partition / extent
-        // references the node. Without a reverse index this is a
-        // worst-case scan — fine, fence is a rare op.
-        let to_bump: Vec<String> = {
-            let s = self.store.inner.borrow();
-            let mut keys: HashSet<String> = HashSet::new();
-            for ex in s.extents.values() {
-                if !Self::extent_nodes(ex).contains(&node_id) {
-                    continue;
-                }
-                // Find the partitions whose log/row/meta stream contains
-                // this extent_id and add their owner_keys.
-                for (pid, part) in s.partitions.iter() {
-                    let owns = [part.log_stream, part.row_stream, part.meta_stream]
-                        .iter()
-                        .any(|sid| {
-                            s.streams
-                                .get(sid)
-                                .map(|st| st.extent_ids.contains(&ex.extent_id))
-                                .unwrap_or(false)
-                        });
-                    if owns {
-                        keys.insert(format!("partition/{}", pid));
-                    }
-                }
-            }
-            keys.into_iter().collect()
-        };
-        for owner_key in to_bump {
-            // Re-acquiring increments the revision; the etcd helper
-            // returns the new revision and a different one will land
-            // for any concurrent caller. Best-effort.
-            let _ = self.acquire_owner_revision(&owner_key).await;
-        }
-        Ok(())
-    }
+    // BUG #3 Layer B: `bump_owner_revisions_for_node` (F211-D) was removed.
+    // It bumped the PARTITION owner-lock revision of every partition whose
+    // streams merely had a REPLICA on a fenced EN data node, fencing out the
+    // legitimate PS owner (→ CODE_LOCKED_BY_OTHER → partition self-poison +
+    // reopen-thrash). It was redundant (fenced-EN handling = append-fail →
+    // seal-over-reachable → realloc + eversion topology refresh) and harmful.
+    // Real split-brain protection is the new PS's acquire_owner_lock on
+    // takeover, not an EN fence. See the removal note in `fence_node_impl`.
 
     async fn remove_node_impl(
         &self,
