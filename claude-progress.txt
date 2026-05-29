@@ -910,3 +910,62 @@ Next steps (future):
   1. Add OFFLINE deterministic reproducer (single-threaded, no
      subprocesses, controllable event scheduling) for fence+flush.
   2. Once root cause is pinned, design fix.
+
+----- 2026-05-29 — deterministic in-process reproducer for fence+flush bug -----
+Date: 2026-05-29
+TaskStatus: not_completed
+Task scope: Build a deterministic single-thread reproducer for the
+  fence+flush race (chaos test seed=3 with AUTUMN_CHAOS_ACTIONS=fence,
+  flush reproduces ~50% of runs but Heisenbug-y).
+
+Approach: a NEW ignored test crates/manager/tests/f250_fence_flush_invariant.rs:
+  - In-process manager (memory-only, no etcd).
+  - 4 in-process extent nodes (no subprocess, no toxiproxy).
+  - 1 in-process partition server, 1 partition with 3 replicas.
+  - 1 writer task → 1 partition with 64 small keys, ~50k writes/10s.
+  - 1 nemesis task → alternating MAINTENANCE_FLUSH and fence+unfence on
+    EN node 1 at 50 ms cadence (60× faster than chaos test).
+  - Invariant under test: every key for which the writer received CODE_OK
+    must return that value on a later Get.
+
+Validation:
+  - Without diag: 4-5 out of 10 runs FAIL with 2-43 mismatches.
+  - Pattern: failing keys return values clustered around the SAME seq
+    (e.g., ~7000-8000 when ~70k writes have ack'd), suggesting writes
+    after some point stopped persisting for ~10-30 specific keys.
+
+Code-trace analysis (in-process bug, NOT a recovery/replay bug):
+  - open_partition fires only ONCE (verified via file diag).
+  - rotate_active fires N times = nemesis flush count (no auto-rotate;
+    F120-B WAL gap is 2 GiB, far above test's ~10 MB total).
+  - commit_flush_outcome correctly pushes to tables + sst_readers
+    before pop_front from imm; only one imm pop call site.
+  - WriteResponder::send_ok is called ONLY in Phase 3
+    finish_write_batch, AFTER active.insert_batch. So ack ⇒ insert.
+  - SST lookup walks .iter().rev() = newest first; bloom filter
+    has no false negatives (test passes).
+  - Memtable's seek_user_key returns newest seq for the user_key.
+
+Open question — the contradiction:
+  Phase 3 inserts into p.active before sending ack. The writer
+  recorded expected[K] = (latest_seq, value). So p.active had K@latest
+  at some point. Then later, GET returns K@early. For this, K's
+  newer entries must have been REMOVED from memtable (impossible per
+  the code) OR p.active is not the same object across Phase 3 and GET
+  (single PartitionData, can't be) OR something else.
+
+Heisenbug behavior: ANY diag in WRITE-path or even read-path hides
+  the bug (file I/O changes timing enough). Stand-alone /tmp/f250.log
+  file write WAS visible during 1 run but disturbed timing for
+  subsequent runs.
+
+Next steps:
+  1. Try a non-blocking diag: AtomicU64 counters bumped cheaply,
+     dumped at test end. No I/O during hot path.
+  2. Capture a CORE DUMP at the moment of mismatch detection;
+     inspect memtable state for failing keys via gdb / lldb.
+  3. Try a strict-ordering Loom-style test wrapper for partition_loop.
+
+The deterministic reproducer is COMMITTED so that future work has
+a stable starting point — chaos test seed=3 is the only existing
+trigger and is slower + noisier.
