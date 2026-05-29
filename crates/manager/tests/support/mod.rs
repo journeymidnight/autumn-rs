@@ -503,7 +503,9 @@ impl PsRouter {
             }
             compio::time::sleep(Duration::from_millis(100)).await;
         }
-        Err(format!("connect partition {part_id} after retries: {last_err}"))
+        Err(format!(
+            "connect partition {part_id} after retries: {last_err}"
+        ))
     }
 
     pub async fn client_for(&self, part_id: u64) -> Rc<autumn_rpc::client::RpcClient> {

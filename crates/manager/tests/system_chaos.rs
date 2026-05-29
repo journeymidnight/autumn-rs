@@ -77,10 +77,16 @@ fn start_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) {
 // ── Config ─────────────────────────────────────────────────────────────
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 struct ChaosConfig {
@@ -137,7 +143,10 @@ impl ChaosConfig {
                 })
                 .collect(),
         };
-        assert!(!actions.is_empty(), "AUTUMN_CHAOS_ACTIONS must have at least one action");
+        assert!(
+            !actions.is_empty(),
+            "AUTUMN_CHAOS_ACTIONS must have at least one action"
+        );
         Self {
             duration_secs: env_u64("AUTUMN_CHAOS_DURATION_SECS", 30),
             nemesis_interval_ms: env_u64("AUTUMN_CHAOS_NEMESIS_INTERVAL_MS", 3000),
@@ -353,8 +362,7 @@ fn bootstrap_en(
     // 3. Read `node_id` from the sentinel file. Path:
     //    <data_dir>/node_id  (raw u64 decimal text).
     let nid_path = data_dir.join("node_id");
-    let nid_str =
-        std::fs::read_to_string(&nid_path).expect("read node_id sentinel after format");
+    let nid_str = std::fs::read_to_string(&nid_path).expect("read node_id sentinel after format");
     let node_id: u64 = nid_str.trim().parse().expect("parse node_id");
 
     // 4. Spawn the EN subprocess on its real port (upstream of the proxy).
@@ -382,7 +390,9 @@ struct Topology {
 
 impl Topology {
     fn new() -> Self {
-        Self { parts: RefCell::new(Vec::new()) }
+        Self {
+            parts: RefCell::new(Vec::new()),
+        }
     }
 
     fn route(&self, key: &[u8]) -> u64 {
@@ -755,7 +765,9 @@ async fn do_ec_convert(ctx: &NemesisCtx) -> Result<String, String> {
         .mgr
         .call(
             MSG_STREAM_INFO,
-            rkyv_encode(&StreamInfoReq { stream_ids: vec![region.log_stream] }),
+            rkyv_encode(&StreamInfoReq {
+                stream_ids: vec![region.log_stream],
+            }),
         )
         .await
         .map_err(|e| format!("stream_info: {e}"))?;
@@ -772,7 +784,10 @@ async fn do_ec_convert(ctx: &NemesisCtx) -> Result<String, String> {
 
     let force_resp = ctx
         .mgr
-        .call(MSG_FORCE_EC_CONVERT, rkyv_encode(&ForceEcConvertReq { extent_id }))
+        .call(
+            MSG_FORCE_EC_CONVERT,
+            rkyv_encode(&ForceEcConvertReq { extent_id }),
+        )
         .await
         .map_err(|e| format!("force_ec rpc: {e}"))?;
     let r: ForceEcConvertResp =
@@ -797,9 +812,7 @@ async fn do_fence_unfence(ctx: &NemesisCtx) -> Result<String, String> {
         let fenced = ctx.fenced.borrow();
         let dead = ctx.dead.borrow();
         ens.iter()
-            .find(|e| {
-                e.is_alive() && !fenced.contains(&e.node_id) && !dead.contains(&e.node_id)
-            })
+            .find(|e| e.is_alive() && !fenced.contains(&e.node_id) && !dead.contains(&e.node_id))
             .map(|e| e.node_id)
     };
     let victim = candidate.ok_or("no candidate")?;
@@ -1020,9 +1033,7 @@ async fn do_network_partition(ctx: &NemesisCtx) -> Result<String, String> {
     ctx.toxi
         .set_enabled(&victim_proxy, true)
         .map_err(|e| format!("toxiproxy enable: {e}"))?;
-    ctx.partitioned
-        .borrow_mut()
-        .retain(|p| p != &victim_proxy);
+    ctx.partitioned.borrow_mut().retain(|p| p != &victim_proxy);
     Ok(format!("network partition node {victim_node_id} (3s)"))
 }
 
@@ -1038,9 +1049,7 @@ async fn do_latency_spike(ctx: &NemesisCtx) -> Result<String, String> {
         let pick = ens
             .iter()
             .find(|e| {
-                e.is_alive()
-                    && !dead.contains(&e.node_id)
-                    && !partitioned.contains(&e.proxy_name)
+                e.is_alive() && !dead.contains(&e.node_id) && !partitioned.contains(&e.proxy_name)
             })
             .map(|e| (e.proxy_name.clone(), e.node_id));
         match pick {
@@ -1057,9 +1066,7 @@ async fn do_latency_spike(ctx: &NemesisCtx) -> Result<String, String> {
             &[("latency", "500"), ("jitter", "100")],
         )
         .map_err(|e| format!("toxic add: {e}"))?;
-    eprintln!(
-        "nemesis: LatencySpike {victim_proxy} (node {victim_node_id}) — +500ms±100"
-    );
+    eprintln!("nemesis: LatencySpike {victim_proxy} (node {victim_node_id}) — +500ms±100");
 
     compio::time::sleep(Duration::from_millis(4000)).await;
 
@@ -1069,11 +1076,7 @@ async fn do_latency_spike(ctx: &NemesisCtx) -> Result<String, String> {
     Ok(format!("latency spike node {victim_node_id} (4s)"))
 }
 
-async fn do_maintenance(
-    ctx: &NemesisCtx,
-    op: u8,
-    label: &str,
-) -> Result<String, String> {
+async fn do_maintenance(ctx: &NemesisCtx, op: u8, label: &str) -> Result<String, String> {
     let parts = ctx.topo.snapshot();
     for (_, _, pid) in &parts {
         let client = ctx.router.client_for(*pid).await;
@@ -1269,7 +1272,10 @@ async fn verify_per_partition_range(
                 }
             };
             if r.code != partition_rpc::CODE_OK {
-                errors.push(format!("range code={} on part {pid}: {}", r.code, r.message));
+                errors.push(format!(
+                    "range code={} on part {pid}: {}",
+                    r.code, r.message
+                ));
                 break;
             }
             if r.entries.is_empty() {
@@ -1324,7 +1330,10 @@ async fn create_stream_kp(mgr: &RpcClient, k: u32, m: u32) -> u64 {
     created
         .stream
         .unwrap_or_else(|| {
-            panic!("create_stream code={} msg={}", created.code, created.message)
+            panic!(
+                "create_stream code={} msg={}",
+                created.code, created.message
+            )
         })
         .stream_id
 }

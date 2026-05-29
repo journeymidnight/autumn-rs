@@ -101,6 +101,41 @@ pub const MSG_GET_ZC: u8 = 0x50;
 // response is a normal rkyv `PutResp` (tiny — no ZC framing needed back).
 pub const MSG_PUT_ZC: u8 = 0x51;
 
+/// F250 diagnostic: trace where a user_key's MVCC entries live across
+/// memtable / imm / sst — used by the f250 reproducer to localise
+/// data-loss bugs without guessing.
+pub const MSG_DIAG_TRACE_KEY: u8 = 0x52;
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct DiagTraceKeyReq {
+    pub part_id: u64,
+    pub user_key: Vec<u8>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct DiagTraceKeyResp {
+    pub code: u8,
+    pub message: String,
+    /// Newest seq found in the active memtable, or 0 if absent.
+    pub memtable_seq: u64,
+    /// Per-imm (front..back) newest seq found, 0 = absent.
+    pub imm_seqs: Vec<u64>,
+    /// Per-SST (oldest..newest by vec order) newest seq found, 0 = absent.
+    /// Bloom-gated (mirrors the real GET path).
+    pub sst_seqs: Vec<u64>,
+    /// Same scan but bypassing the bloom filter. A divergence from
+    /// `sst_seqs` (nobloom finds it, bloom-gated returns 0) is a bloom
+    /// FALSE NEGATIVE — the read path silently skips this SST.
+    pub sst_seqs_nobloom: Vec<u64>,
+    /// Per-SST full linear scan over ALL blocks (ignores bloom AND
+    /// find_block_for_key). A divergence from `sst_seqs_nobloom`
+    /// (fullscan finds it, single-block scan returns 0) is a block-
+    /// SELECTION bug in the read path, not data loss.
+    pub sst_seqs_fullscan: Vec<u64>,
+    /// Per-SST table.last_seq (for diagnostic context).
+    pub sst_last_seqs: Vec<u64>,
+}
+
 /// Fixed prefix of the MSG_PUT_ZC meta: part_id(8)+region_epoch(8)+
 /// expires_at(8)+key_len(4).
 pub const PUT_ZC_HEADER_LEN: usize = 28;
@@ -515,6 +550,9 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
             .map(|r| r.part_id)
             .unwrap_or(0),
         MSG_PULL_VP_REFS => rkyv_decode::<PullVpRefsReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_DIAG_TRACE_KEY => rkyv_decode::<DiagTraceKeyReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
         _ => 0,

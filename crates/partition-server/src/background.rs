@@ -2559,6 +2559,77 @@ pub(crate) fn lookup_in_memtable(mem: &Memtable, user_key: &[u8]) -> Option<(u8,
         .map(|e| (e.op, Bytes::from(e.value), e.expires_at))
 }
 
+/// F250 diag: return the newest seq for `user_key` in this SST (or 0).
+/// Re-walks `lookup_in_sst`'s logic but returns the parsed seq instead
+/// of the value. Used only by `MSG_DIAG_TRACE_KEY`.
+///
+/// `use_bloom`: when true, mirror the real GET path (return 0 if the
+/// bloom says no). When false, skip the bloom and scan anyway — so a
+/// bloom FALSE NEGATIVE (key present but bloom says absent) shows up as
+/// a divergence between the two.
+pub(crate) fn lookup_in_sst_seq_opt(reader: &SstReader, user_key: &[u8], use_bloom: bool) -> u64 {
+    if use_bloom && !reader.bloom_may_contain(user_key) {
+        return 0;
+    }
+    let target = key_with_ts(user_key, u64::MAX);
+    let block_idx = reader.find_block_for_key(&target);
+    let Ok(block) = reader.read_block(block_idx) else {
+        return 0;
+    };
+    let n = block.num_entries();
+    if n == 0 {
+        return 0;
+    }
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let Ok(key) = block.get_key(mid) else {
+            return 0;
+        };
+        if key.as_slice() < target.as_slice() {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo < n {
+        let Ok(key) = block.get_key(lo) else {
+            return 0;
+        };
+        if parse_key(key.as_slice()) == user_key {
+            return parse_ts(key.as_slice());
+        }
+    }
+    0
+}
+
+/// F250 diag: FULL linear scan of every block/entry for `user_key`,
+/// ignoring bloom AND `find_block_for_key`. Returns the newest (max)
+/// seq found, or 0. If this finds the key where `lookup_in_sst_seq`
+/// (binary-search-in-one-block) returns 0, the bug is in block
+/// SELECTION / lookup, not data presence.
+pub(crate) fn lookup_in_sst_seq_fullscan(reader: &SstReader, user_key: &[u8]) -> u64 {
+    let mut best = 0u64;
+    for bi in 0..reader.block_count() {
+        let Ok(block) = reader.read_block(bi) else {
+            continue;
+        };
+        for ei in 0..block.num_entries() {
+            let Ok(key) = block.get_key(ei) else {
+                continue;
+            };
+            if parse_key(key.as_slice()) == user_key {
+                let ts = parse_ts(key.as_slice());
+                if ts > best {
+                    best = ts;
+                }
+            }
+        }
+    }
+    best
+}
+
 pub(crate) fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, Bytes, u64)> {
     if !reader.bloom_may_contain(user_key) {
         return None;
@@ -2584,12 +2655,32 @@ pub(crate) fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, 
         }
     }
 
-    // Check the entry at `lo` — it's the first with key >= target (the newest version for user_key).
-    if lo < n {
-        let (key, op, value, expires_at) = block.get_entry(lo).ok()?;
-        if parse_key(&key) == user_key {
-            return Some((op, value, expires_at));
+    // The first entry whose key >= target is the newest version for
+    // user_key. It is at `lo` in THIS block when `lo < n`. But when
+    // `lo == n` (every key in `block_idx` sorts < target), the answer is
+    // the FIRST entry of the NEXT block: `find_block_for_key` returns the
+    // last block whose base_key <= target, so `base_key[block_idx+1]` is
+    // the smallest key > target. Without this next-block hop a user_key
+    // whose newest entry happens to be the base (first entry) of a block
+    // is missed entirely — the binary search runs off the end of the
+    // preceding block and we return None, the read then falls through to
+    // an older SST and returns a STALE value. This was the F250
+    // fence+flush "data loss" — actually a point-lookup block-boundary
+    // bug, invisible until SSTs grew past one block per table.
+    let (blk, pos) = if lo < n {
+        (block, lo)
+    } else if block_idx + 1 < reader.block_count() {
+        let nb = reader.read_block(block_idx + 1).ok()?;
+        if nb.num_entries() == 0 {
+            return None;
         }
+        (nb, 0usize)
+    } else {
+        return None;
+    };
+    let (key, op, value, expires_at) = blk.get_entry(pos).ok()?;
+    if parse_key(&key) == user_key {
+        return Some((op, value, expires_at));
     }
     None
 }
@@ -3294,5 +3385,63 @@ mod f201_classify_cooldown_tests {
         let middle = bottom.context("manager rejected request");
         let top = middle.context("punch_holes failed");
         assert_eq!(classify_gc_failure_cooldown(&top, SOFT, HARD), SOFT);
+    }
+}
+
+#[cfg(test)]
+mod lookup_block_boundary_tests {
+    use super::*;
+    use crate::key_with_ts;
+    use crate::sstable::builder::SstBuilder;
+    use crate::sstable::reader::SstReader;
+
+    /// Regression for the F250 fence+flush "data loss" — actually a
+    /// point-lookup block-boundary bug. When a user_key's newest entry is
+    /// the FIRST entry (base_key) of an SST block, `find_block_for_key`
+    /// (last block with base <= target) selected the PRECEDING block (whose
+    /// base <= target = `user_key++0x00++BE(0)`), and the single-block
+    /// binary search ran off the end → `lookup_in_sst` returned None →
+    /// the read fell through to an older SST and returned a STALE value.
+    /// `lookup_in_sst` must hop to the next block's first entry in that
+    /// case. Invisible until SSTs grew past one block per table (>64 KiB),
+    /// which is why the 64-key reproducer passed but the 1024-key one failed.
+    #[test]
+    fn lookup_in_sst_finds_keys_at_block_boundaries() {
+        // ~2 KiB values × 300 keys ≈ 600 KiB → many 64 KiB blocks, so
+        // several keys necessarily become block base_keys.
+        let val = vec![b'x'; 2048];
+        let n: u32 = 300;
+        let mut b = SstBuilder::new(0, 0);
+        for i in 0..n {
+            let uk = format!("k{i:06}").into_bytes();
+            // distinct seq per key so the stored ts is checkable
+            let seq = (i as u64) + 1;
+            b.add(&key_with_ts(&uk, seq), 1, &val, 0);
+        }
+        let reader = SstReader::from_bytes(bytes::Bytes::from(b.finish())).expect("reader");
+
+        // The bug only exists with >1 block; assert we actually exercise it.
+        assert!(
+            reader.block_count() > 1,
+            "test must span multiple blocks (got {})",
+            reader.block_count()
+        );
+
+        // EVERY key — including the ones sitting at block boundaries — must
+        // be found via the bloom-gated point lookup the GET path uses.
+        for i in 0..n {
+            let uk = format!("k{i:06}").into_bytes();
+            let got = lookup_in_sst(&reader, &uk);
+            assert!(
+                got.is_some(),
+                "lookup_in_sst missed k{i:06} (block-boundary regression)"
+            );
+            let (op, value, _) = got.unwrap();
+            assert_eq!(op, 1);
+            assert_eq!(value.len(), val.len(), "wrong value for k{i:06}");
+        }
+
+        // A key that does not exist must still return None.
+        assert!(lookup_in_sst(&reader, b"zzzzzz").is_none());
     }
 }

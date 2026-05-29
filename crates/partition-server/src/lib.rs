@@ -570,6 +570,21 @@ impl Memtable {
         (parse_key(k) == user_key).then(|| v.clone())
     }
 
+    /// F250 diag: return the newest seq for `user_key` (or 0 if absent).
+    /// Used by `MSG_DIAG_TRACE_KEY` only — not on any hot path.
+    pub(crate) fn seek_user_key_seq(&self, user_key: &[u8]) -> u64 {
+        let seek = key_with_ts(user_key, u64::MAX);
+        let guard = self.data.read();
+        let Some((k, _)) = guard.range(seek..).next() else {
+            return 0;
+        };
+        if parse_key(k) == user_key {
+            parse_ts(k)
+        } else {
+            0
+        }
+    }
+
     fn snapshot_sorted(&self) -> Vec<IterItem> {
         let guard = self.data.read();
         guard
@@ -5565,26 +5580,26 @@ async fn recover_partition(
     // feature_list F210-C1 for the FU→FO migration rationale.
     let sst_max_seq = max_seq;
     let _ = sst_max_seq; // retained for parity; replay now uses per-region dedup
-    // F243-merge per-source region table.
-    //
-    // Each meta_record carries its source partition's log_stream extent
-    // count at flush time (`log_extent_count`). Sorted by vp_pos, the
-    // sources' regions in the spliced log_stream are cumulative:
-    //   record[i].region = [Σ_{j<i} count[j], Σ_{j≤i} count[j])
-    // Records whose vp_extent_id is no longer in the stream (GC'd /
-    // truncated) are skipped. A record with `log_extent_count == 0` is
-    // legacy / unset — fall back to a single global dedup (= pre-fix
-    // behavior) by treating it as covering the whole stream.
-    //
-    // For each region, dedup = MAX seq across the source's SSTs (i.e.,
-    // the F210-C1 invariant: every seq ≤ src_max for THIS source is in
-    // one of this source's SSTs). Records at pos with ts > src_max
-    // are unflushed-by-this-source and need re-insert; ts ≤ src_max
-    // are already covered.
-    //
-    // E_new (post-merge new tail) sits past Σ counts → no region maps
-    // to it → dedup = 0 → replay everything (= post-merge survivor
-    // writes, all unflushed by definition).
+                         // F243-merge per-source region table.
+                         //
+                         // Each meta_record carries its source partition's log_stream extent
+                         // count at flush time (`log_extent_count`). Sorted by vp_pos, the
+                         // sources' regions in the spliced log_stream are cumulative:
+                         //   record[i].region = [Σ_{j<i} count[j], Σ_{j≤i} count[j])
+                         // Records whose vp_extent_id is no longer in the stream (GC'd /
+                         // truncated) are skipped. A record with `log_extent_count == 0` is
+                         // legacy / unset — fall back to a single global dedup (= pre-fix
+                         // behavior) by treating it as covering the whole stream.
+                         //
+                         // For each region, dedup = MAX seq across the source's SSTs (i.e.,
+                         // the F210-C1 invariant: every seq ≤ src_max for THIS source is in
+                         // one of this source's SSTs). Records at pos with ts > src_max
+                         // are unflushed-by-this-source and need re-insert; ts ≤ src_max
+                         // are already covered.
+                         //
+                         // E_new (post-merge new tail) sits past Σ counts → no region maps
+                         // to it → dedup = 0 → replay everything (= post-merge survivor
+                         // writes, all unflushed by definition).
     struct SourceRegion {
         end_excl: usize, // region = [prev_end, end_excl)
         src_max: u64,
@@ -5658,50 +5673,49 @@ async fn recover_partition(
     // each record's insertion AND attributes the duplicate occurrence
     // to the WRONG source region. We replay each extent only at its
     // FIRST occurrence (which has the correct source-region dedup).
-    let replay_extents: Option<Vec<(usize, u64, u32)>> = if chosen_pos == usize::MAX
-        && tables.is_empty()
-    {
-        // No checkpoint and no SSTs: replay everything from offset 0 of
-        // every extent — dedup by first occurrence.
-        let mut seen: HashSet<u64> = HashSet::new();
-        Some(
-            log_extent_ids
-                .iter()
-                .enumerate()
-                .filter_map(|(pos, &eid)| {
-                    if seen.insert(eid) {
-                        Some((pos, eid, 0u32))
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-        )
-    } else if chosen_pos != usize::MAX {
-        // Replay from `chosen_pos` onward, but only the FIRST occurrence
-        // of each extent_id (CoW-dup later occurrences are skipped).
-        let mut seen: HashSet<u64> = HashSet::new();
-        Some(
-            log_extent_ids
-                .iter()
-                .enumerate()
-                .filter_map(|(pos, &eid)| {
-                    if pos < chosen_pos {
-                        seen.insert(eid);
-                        None
-                    } else if !seen.insert(eid) {
-                        None
-                    } else if pos == chosen_pos {
-                        Some((pos, eid, recovered_vp_off))
-                    } else {
-                        Some((pos, eid, 0u32))
-                    }
-                })
-                .collect(),
-        )
-    } else {
-        None
-    };
+    let replay_extents: Option<Vec<(usize, u64, u32)>> =
+        if chosen_pos == usize::MAX && tables.is_empty() {
+            // No checkpoint and no SSTs: replay everything from offset 0 of
+            // every extent — dedup by first occurrence.
+            let mut seen: HashSet<u64> = HashSet::new();
+            Some(
+                log_extent_ids
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(pos, &eid)| {
+                        if seen.insert(eid) {
+                            Some((pos, eid, 0u32))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            )
+        } else if chosen_pos != usize::MAX {
+            // Replay from `chosen_pos` onward, but only the FIRST occurrence
+            // of each extent_id (CoW-dup later occurrences are skipped).
+            let mut seen: HashSet<u64> = HashSet::new();
+            Some(
+                log_extent_ids
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(pos, &eid)| {
+                        if pos < chosen_pos {
+                            seen.insert(eid);
+                            None
+                        } else if !seen.insert(eid) {
+                            None
+                        } else if pos == chosen_pos {
+                            Some((pos, eid, recovered_vp_off))
+                        } else {
+                            Some((pos, eid, 0u32))
+                        }
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
 
     if let Some(extents) = replay_extents {
         for (extent_pos, eid, start_off) in extents {
@@ -6182,6 +6196,10 @@ pub(crate) struct FlushOutcome {
     pub reader: SstReader,
     pub vp_eid: u64,
     pub vp_off: u32,
+    /// F250 diag: `Arc::as_ptr` of the imm this outcome was built from.
+    /// `commit_flush_outcome` asserts the popped `front()` matches — a
+    /// mismatch means a commit dropped an unflushed imm (data loss).
+    pub src_imm_ptr: usize,
 }
 
 /// F197: async / heavy phase of one imm flush. Safe to run concurrently
@@ -6194,6 +6212,7 @@ pub(crate) async fn run_flush_async_phase(
     part: Rc<RefCell<PartitionData>>,
     imm_mem: Arc<Memtable>,
 ) -> Result<FlushOutcome> {
+    let src_imm_ptr = Arc::as_ptr(&imm_mem) as usize;
     let (
         row_stream_id,
         snap_vp_eid,
@@ -6250,6 +6269,7 @@ pub(crate) async fn run_flush_async_phase(
             reader,
             vp_eid: snap_vp_eid,
             vp_off: snap_vp_off,
+            src_imm_ptr,
         });
     };
 
@@ -6275,6 +6295,7 @@ pub(crate) async fn run_flush_async_phase(
         reader,
         vp_eid: snap_vp_eid,
         vp_off: snap_vp_off,
+        src_imm_ptr,
     })
 }
 
@@ -6309,6 +6330,8 @@ pub(crate) async fn commit_flush_outcome(
         .await?
         .extent_ids
         .len() as u32;
+    let outcome_last_seq = outcome.new_meta.last_seq;
+    let outcome_src_imm_ptr = outcome.src_imm_ptr;
     let (tables_snapshot, vp_eid, vp_off, part_sc, meta_stream_id) = {
         let mut p = part.borrow_mut();
         p.tables.push(outcome.new_meta);
@@ -6320,6 +6343,22 @@ pub(crate) async fn commit_flush_outcome(
         // FIFO commit order.
         if let Some(popped) = p.imm.pop_front() {
             let ptr = Arc::as_ptr(&popped) as usize;
+            // F250 diag: the popped front MUST be the imm this outcome was
+            // built from. A mismatch means we dropped an unflushed imm
+            // (its newest writes vanish → the fence+flush data-loss bug).
+            if ptr != outcome_src_imm_ptr {
+                tracing::error!(
+                    popped_ptr = ptr,
+                    src_imm_ptr = outcome_src_imm_ptr,
+                    last_seq = outcome_last_seq,
+                    "flush pop misalign: committing SST built from one imm \
+                     but popped a DIFFERENT front — unflushed imm dropped"
+                );
+                debug_assert_eq!(
+                    ptr, outcome_src_imm_ptr,
+                    "flush commit popped an imm it did not build the SST from"
+                );
+            }
             p.flushing_imm_ptrs.borrow_mut().remove(&ptr);
         }
         // F120-A: wake partition_loop on imm-full back-pressure.

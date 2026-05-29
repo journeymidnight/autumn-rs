@@ -1,3 +1,60 @@
+Date: 2026-05-29
+TaskStatus: completed
+Task scope: ROOT-CAUSE + FIX the remaining fence+flush chaos data-loss bug
+  (the ~30% subprocess failure left after commit 30e9051). It is NOT data
+  loss — it is a point-lookup SST BLOCK-BOUNDARY bug.
+
+ROOT CAUSE (pinned via the expanded f250 in-process reproducer +
+  3-stage diag: bloom-gated / no-bloom / fullscan per SST):
+  `lookup_in_sst` (background.rs, the GET point-lookup) selects a block
+  via `find_block_for_key(target)` where target = user_key++0x00++BE(0)
+  — SMALLER than every real entry for the key (entries carry
+  BE(MAX-seq) > 0). `find_block_for_key` returns the LAST block whose
+  base_key <= target. When a user_key's NEWEST entry is the FIRST entry
+  (base_key) of some block B, then base_key[B] > target, so the search
+  picks block B-1, whose binary search runs off the end (no key >=
+  target in B-1) and returns None. GET then falls through to an OLDER
+  SST and returns a STALE value. The data was ALWAYS present and
+  correct on disk — only point reads at a block boundary returned stale.
+
+  Why invisible until now: with 64 keys each SST was 1 block (block 0
+  always correct). The expanded reproducer (1024 keys × ~150k writes →
+  multi-block SSTs) exercises block boundaries → the bug fires. Fence
+  just widens append latency, shifting flush/rotate timing so more keys
+  land as block bases.
+
+  TableIterator::seek (compaction + range) was NEVER affected — it
+  already hops to the next block on !bi.valid() (iterator.rs:165). So
+  NO on-disk corruption, NO compaction loss; the bug was read-only and
+  localized to lookup_in_sst.
+
+FIX (background.rs lookup_in_sst): when the in-block binary search
+  yields lo == n (every key in the selected block sorts < target), hop
+  to the FIRST entry of block_idx+1 (its base_key, the smallest key >
+  target) before concluding absent. One-block change, mirrors the
+  iterator's existing next-block hop.
+
+VALIDATION:
+  - f250 in-process reproducer (4 writers, 1024 keys, 30s, 250ms
+    nemesis): 8/8 PASS (was ~50% FAIL pre-fix).
+  - chaos subprocess fence,flush seeds 1-10: 10/10 PASS (was 6/10;
+    seed=3 reliably failed before).
+  - New direct unit test
+    background::lookup_block_boundary_tests::
+    lookup_in_sst_finds_keys_at_block_boundaries (multi-block SST,
+    asserts every key incl. block-base keys is found) — would have
+    caught this at landing time. 148 PS lib tests pass (was 147).
+  - clippy -p autumn-partition-server -p autumn-rpc --all-targets clean.
+
+SUPPORTING (committed alongside): MSG_DIAG_TRACE_KEY diagnostic RPC +
+  handler returning per-SST newest-seq under 3 scan modes (bloom-gated /
+  no-bloom / fullscan) — the localization tool that distinguished
+  "bloom false negative" vs "block-selection miss" vs "true loss". Kept
+  as the f250 reproducer's permanent localization aid. Also a cheap
+  flush-pop-alignment debug_assert in commit_flush_outcome (proved the
+  flush-commit pop is correctly aligned — ruled out a dropped-imm theory).
+
+--- prior iteration ---
 Date: 2026-05-27
 TaskStatus: completed
 Task scope: ledger-only — close F241-B as WON'T-DO (physically equivalent

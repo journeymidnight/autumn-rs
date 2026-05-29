@@ -39,9 +39,10 @@ use support::*;
 
 // ─── Tunables ─────────────────────────────────────────────────────────
 
-const DURATION_S: u64 = 10;
-const NEMESIS_INTERVAL_MS: u64 = 50;
-const KEY_COUNT: u32 = 64;
+const DURATION_S: u64 = 30;
+const NEMESIS_INTERVAL_MS: u64 = 250;
+const KEY_COUNT: u32 = 1024; // mimic chaos test 4×256 keys
+const WRITER_COUNT: u32 = 4;
 const VICTIM_NODE: u64 = 1; // EN[0] gets fenced repeatedly
 const PART_ID: u64 = 9001;
 
@@ -137,6 +138,7 @@ async fn flush_partition(ps: &RpcClient) -> Result<(), String> {
 // ─── Writer loop ──────────────────────────────────────────────────────
 
 async fn writer_loop(
+    writer_id: u32,
     ps: Rc<RpcClient>,
     expected: Rc<RefCell<HashMap<Vec<u8>, (u64, Vec<u8>)>>>,
     stop: Arc<AtomicBool>,
@@ -144,12 +146,20 @@ async fn writer_loop(
     failed: Arc<AtomicU64>,
 ) {
     let mut seq: u64 = 0;
-    let mut lcg: u64 = 0x9E3779B97F4A7C15;
+    // Per-writer LCG seed so the 4 writers don't all hit the same keys.
+    let mut lcg: u64 =
+        0x9E3779B97F4A7C15u64.wrapping_add((writer_id as u64).wrapping_mul(0xBF58476D1CE4E5B9));
+    // Each writer gets a disjoint key slice of KEY_COUNT/WRITER_COUNT keys
+    // so writers don't fight over the same expected[] entry — mirrors
+    // chaos test's per-prefix workload.
+    let slice = KEY_COUNT / WRITER_COUNT;
+    let key_start = writer_id * slice;
     while !stop.load(Ordering::Relaxed) {
         seq += 1;
-        // tiny LCG so writes hit a small key space → many same-key updates
-        lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let kid = (lcg >> 32) as u32 % KEY_COUNT;
+        lcg = lcg
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let kid = key_start + ((lcg >> 32) as u32 % slice);
         let key = format!("k{:06}", kid).into_bytes();
         let value = make_value(&key, seq);
         let resp = ps
@@ -271,7 +281,10 @@ fn f250_fence_flush_invariant() {
         });
     let _ = (log_stream, row_stream, meta_stream); // streams reachable via manager
 
-    eprintln!("f250: setup complete; ENs={:?} victim_node={}", en_node_ids, VICTIM_NODE);
+    eprintln!(
+        "f250: setup complete; ENs={:?} victim_node={}",
+        en_node_ids, VICTIM_NODE
+    );
 
     // ── Stress phase ──
     let expected: Rc<RefCell<HashMap<Vec<u8>, (u64, Vec<u8>)>>> =
@@ -295,13 +308,18 @@ fn f250_fence_flush_invariant() {
         let ps: Rc<RpcClient> = RpcClient::connect(ps_addr).await.expect("connect ps");
         let mgr_c: Rc<RpcClient> = RpcClient::connect(mgr_addr).await.expect("connect mgr2");
 
-        let w = compio::runtime::spawn(writer_loop(
-            ps.clone(),
-            expected.clone(),
-            stop_c.clone(),
-            acked_c,
-            failed_c,
-        ));
+        // Spawn WRITER_COUNT writers (mirrors chaos test).
+        let mut writers = Vec::new();
+        for wid in 0..WRITER_COUNT {
+            writers.push(compio::runtime::spawn(writer_loop(
+                wid,
+                ps.clone(),
+                expected.clone(),
+                stop_c.clone(),
+                acked_c.clone(),
+                failed_c.clone(),
+            )));
+        }
         let n = compio::runtime::spawn(nemesis_loop(
             mgr_c.clone(),
             ps.clone(),
@@ -313,7 +331,9 @@ fn f250_fence_flush_invariant() {
         // Run for DURATION_S then stop.
         compio::time::sleep(Duration::from_secs(DURATION_S)).await;
         stop_c.store(true, Ordering::Relaxed);
-        let _ = w.await;
+        for w in writers {
+            let _ = w.await;
+        }
         let _ = n.await;
 
         // settle: let any in-flight flushes complete
@@ -365,14 +385,79 @@ fn f250_fence_flush_invariant() {
     });
 
     let n = mismatches.len();
-    for (key, exp, got) in mismatches.iter().take(20) {
-        eprintln!(
-            "  mismatch: {} expected={} got={:?}",
-            String::from_utf8_lossy(key),
-            exp,
-            got
-        );
-    }
+    // F250 diagnostic: trace where each failing key's MVCC entries live
+    // across memtable / imm / SSTs to localise the data-loss root cause.
+    let trace_rt = compio::runtime::Runtime::new().unwrap();
+    trace_rt.block_on(async {
+        let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
+        for (key, exp, got) in mismatches.iter().take(20) {
+            let resp = ps
+                .call(
+                    partition_rpc::MSG_DIAG_TRACE_KEY,
+                    partition_rpc::rkyv_encode(&partition_rpc::DiagTraceKeyReq {
+                        part_id: PART_ID,
+                        user_key: key.clone(),
+                    }),
+                )
+                .await;
+            eprintln!(
+                "  mismatch: {} expected_value_seq={} got_value_seq={:?}",
+                String::from_utf8_lossy(key), exp, got
+            );
+            match resp {
+                Ok(r) => match partition_rpc::rkyv_decode::<partition_rpc::DiagTraceKeyResp>(&r) {
+                    Ok(t) => {
+                        eprintln!(
+                            "    PS state: memtable_ps_seq={} imm_ps_seqs={:?} sst_ps_seqs={:?} sst_last_seqs={:?}",
+                            t.memtable_seq, t.imm_seqs, t.sst_seqs, t.sst_last_seqs
+                        );
+                        // Bloom false-negative detector: any SST where the
+                        // no-bloom scan finds the key but the bloom-gated
+                        // scan returned 0.
+                        let fn_idx: Vec<(usize, u64)> = t
+                            .sst_seqs
+                            .iter()
+                            .zip(t.sst_seqs_nobloom.iter())
+                            .enumerate()
+                            .filter(|(_, (b, nb))| **b == 0 && **nb != 0)
+                            .map(|(i, (_, nb))| (i, *nb))
+                            .collect();
+                        if !fn_idx.is_empty() {
+                            eprintln!(
+                                "    *** BLOOM FALSE NEGATIVE at SST idx (idx,seq)={:?}  nobloom={:?}",
+                                fn_idx, t.sst_seqs_nobloom
+                            );
+                        }
+                        // Block-selection bug detector: fullscan finds the
+                        // key but the single-block (find_block_for_key)
+                        // scan returned 0.
+                        let bs_idx: Vec<(usize, u64)> = t
+                            .sst_seqs_nobloom
+                            .iter()
+                            .zip(t.sst_seqs_fullscan.iter())
+                            .enumerate()
+                            .filter(|(_, (nb, fs))| **nb == 0 && **fs != 0)
+                            .map(|(i, (_, fs))| (i, *fs))
+                            .collect();
+                        if !bs_idx.is_empty() {
+                            eprintln!(
+                                "    *** BLOCK-SELECTION MISS at SST idx (idx,seq)={:?}  fullscan={:?}",
+                                bs_idx, t.sst_seqs_fullscan
+                            );
+                        } else {
+                            // Fullscan agrees with single-block scan → the
+                            // key is genuinely ABSENT where 0. Report the
+                            // global max seq found by fullscan for context.
+                            let maxfs = t.sst_seqs_fullscan.iter().copied().max().unwrap_or(0);
+                            eprintln!("    fullscan max seq across all SSTs = {maxfs}");
+                        }
+                    }
+                    Err(e) => eprintln!("    PS state: decode err: {}", e),
+                },
+                Err(e) => eprintln!("    PS state: rpc err: {}", e),
+            }
+        }
+    });
     assert_eq!(
         n, 0,
         "{} mismatches — fence+flush race lost ack'd writes",

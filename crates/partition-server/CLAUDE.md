@@ -1445,3 +1445,31 @@ post-restart.
     panic that our inner has already turned into `Result::Err`, so it sees
     nothing. Don't try to "remove the duplicate"; you'd lose the log + the
     restart/exit semantic.
+
+14. **`lookup_in_sst` MUST hop to the next block when the in-block binary
+    search runs off the end (block-boundary point-lookup).** The GET point
+    lookup seeks `target = user_key ++ 0x00 ++ BE(0)` — SMALLER than every
+    real entry for that key (entries carry `BE(u64::MAX - seq)`, always > 0).
+    `SstReader::find_block_for_key` returns the LAST block whose base_key <=
+    target. When a user_key's NEWEST entry happens to be the FIRST entry
+    (base_key) of block B, `base_key[B] > target`, so the lookup lands on
+    block B-1; the binary search there finds no key >= target (returns
+    `lo == n`). Pre-fix `lookup_in_sst` returned `None` → GET fell through to
+    an OLDER SST and returned a STALE value (the data was present and correct
+    in block B all along). Fix: on `lo == n`, read block `block_idx + 1` and
+    check its first entry (entry 0 = its base_key = the smallest key >
+    target). **Invisible until SSTs exceed one block (>64 KiB / table)** — a
+    64-key partition has a single block (block 0 always correct), so this hid
+    until the 1024-key f250 reproducer built multi-block SSTs. This was the
+    "fence+flush data loss" — actually a read-only block-boundary bug, no
+    on-disk corruption. `TableIterator::seek` (compaction / range, iterator.rs)
+    already does this next-block hop (`!bi.valid()` → `block_idx += 1`), so
+    those paths were never affected. **Invariant: any point lookup over the
+    block-indexed SST must treat "no key >= target in the selected block" as
+    "check the next block's first entry," never as "absent."** Regression
+    test: `background::lookup_block_boundary_tests::
+    lookup_in_sst_finds_keys_at_block_boundaries`. Localization aid:
+    `MSG_DIAG_TRACE_KEY` (per-SST newest-seq under bloom-gated / no-bloom /
+    fullscan scans) distinguishes a bloom false-negative vs a block-selection
+    miss vs true data loss; used by `crates/manager/tests/
+    f250_fence_flush_invariant.rs`.

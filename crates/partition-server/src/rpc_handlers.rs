@@ -129,6 +129,7 @@ pub(crate) async fn dispatch_partition_rpc(
                 .to_string(),
         )),
         MSG_MAINTENANCE => handle_maintenance(payload, part).await,
+        MSG_DIAG_TRACE_KEY => handle_diag_trace_key(payload, part).await,
         // F210-C4: manager pull of current vp_refs snapshot.
         MSG_PULL_VP_REFS => handle_pull_vp_refs(payload, part).await,
         // F129 server-side multipart (MSG_PUT_BEGIN/CHUNK/COMMIT/ABORT)
@@ -1005,6 +1006,54 @@ pub(crate) async fn handle_maintenance(
             message: e.to_string(),
         })),
     }
+}
+
+pub(crate) async fn handle_diag_trace_key(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> HandlerResult {
+    let req: partition_rpc::DiagTraceKeyReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    let p = part.borrow();
+    let memtable_seq = p.active.seek_user_key_seq(&req.user_key);
+    let imm_seqs: Vec<u64> = p
+        .imm
+        .iter()
+        .map(|imm| imm.seek_user_key_seq(&req.user_key))
+        .collect();
+    let mut sst_seqs: Vec<u64> = Vec::with_capacity(p.sst_readers.len());
+    let mut sst_seqs_nobloom: Vec<u64> = Vec::with_capacity(p.sst_readers.len());
+    let mut sst_seqs_fullscan: Vec<u64> = Vec::with_capacity(p.sst_readers.len());
+    let mut sst_last_seqs: Vec<u64> = Vec::with_capacity(p.tables.len());
+    for (i, reader) in p.sst_readers.iter().enumerate() {
+        sst_seqs.push(crate::background::lookup_in_sst_seq_opt(
+            reader,
+            &req.user_key,
+            true,
+        ));
+        sst_seqs_nobloom.push(crate::background::lookup_in_sst_seq_opt(
+            reader,
+            &req.user_key,
+            false,
+        ));
+        sst_seqs_fullscan.push(crate::background::lookup_in_sst_seq_fullscan(
+            reader,
+            &req.user_key,
+        ));
+        sst_last_seqs.push(p.tables.get(i).map(|t| t.last_seq).unwrap_or(0));
+    }
+    Ok(partition_rpc::rkyv_encode(
+        &partition_rpc::DiagTraceKeyResp {
+            code: partition_rpc::CODE_OK,
+            message: String::new(),
+            memtable_seq,
+            imm_seqs,
+            sst_seqs,
+            sst_seqs_nobloom,
+            sst_seqs_fullscan,
+            sst_last_seqs,
+        },
+    ))
 }
 
 pub(crate) async fn handle_get_discards(
