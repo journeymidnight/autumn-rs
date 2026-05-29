@@ -54,6 +54,63 @@ SUPPORTING (committed alongside): MSG_DIAG_TRACE_KEY diagnostic RPC +
   flush-pop-alignment debug_assert in commit_flush_outcome (proved the
   flush-commit pop is correctly aligned — ruled out a dropped-imm theory).
 
+--- same session: /loop continued — BUG #3 found (wider-EC regime) ---
+Date: 2026-05-29
+TaskStatus: not_completed
+Task scope: continued chaos /loop into an unexplored regime (duration=90s,
+  EC K=4 M=2, NUM_ENS=8, full harsh action set). Found a REPRODUCIBLE
+  partition-wedge bug. Root-cause hypothesis formed; FULL FIX DEFERRED
+  (deep F227/recovery design — prior fixes in this area were reverted).
+
+BUG #3 (reproducible ~2/3 on seed=6, K=4/M=2/8-ENs/90s, harsh actions):
+  After `KillEn` (real kill+restart of node 1) interleaved with
+  split/merge/EcConvert, a partition (e.g. the split child part 46, or the
+  source 9001) becomes PERSISTENTLY WEDGED: every client PUT/GET to it times
+  out CONTINUOUSLY — during the workload AND at verify (10s+ after the
+  workload stops, with ALL nodes alive and reachable again). The merge-freeze
+  orchestration also blocks on it. So acked data on that partition becomes
+  permanently UNREADABLE/UNWRITABLE — an availability/correctness bug.
+
+  Evidence: verify logs hundreds of `GET TIMED OUT part_id=46` (every
+  attempt), workload logs continuous PUT/GET timeouts on 9001+46, and the
+  test originally hung forever joining the nemesis (its split/merge RPC to
+  the wedged PS never returned).
+
+  Hypothesis (UNVERIFIED — needs PS-side tracing to confirm):
+  F227 made commit_length / flush-barrier ALL-REPLICA. After a node
+  kill+restart the node comes back ALIVE but its replica for the partition's
+  stream is BEHIND (missed writes during the down window). Recovery is gated
+  `fenced_only` (F211) — a kill+restart is NOT a fence — so the behind
+  replica is never reconciled. Every all-replica op (append commit_length,
+  await_log_synced_to) then blocks forever waiting on a replica that never
+  catches up, even though it's reachable. Net: F227's intended
+  consistency-over-availability tradeoff degenerates into a PERMANENT wedge
+  because the recovery trigger doesn't fire for kill+restart.
+
+  Why this is distinct from the earlier "45-min hang" (which was a test-env
+  orphan-resource artifact): this reproduces 2/3 in CLEAN sequential runs
+  with proper cleanup, and the wedge persists with all nodes alive.
+
+  NEXT STEPS (future session, deep work):
+  1. Add PS-side tracing to confirm the wedged partition_loop / stream
+     worker is parked in commit_length / await_log_synced_to on the behind
+     replica.
+  2. Confirm the killed+restarted node's replica is behind and that no
+     recovery is dispatched (recovery_dispatch_loop gate = fenced_only).
+  3. Fix direction (needs design): trigger re-replication/recovery when a
+     restarted node's replica is detected behind (re_avali path), OR have
+     the stream client/commit path detect a behind-but-reachable replica
+     and exclude+recover it rather than block forever. Treat carefully —
+     F185/F227/F210 freeze-drain fixes here were reverted before (see the
+     2026-05-28 drain-wait revert).
+
+Chaos test hardening landed this iteration (committed): bound the NEMESIS
+  action dispatch (30s) + verify fast-fail on a proven-wedged partition
+  (HashSet, record not_found instead of 10×5s/key). With the earlier
+  writer/reader/verify RPC timeouts, the test now ALWAYS terminates and
+  reports the wedge as a clean FAILED (verify not_found on the wedged
+  part_id) instead of hanging CI forever.
+
 --- same session: /loop chaos bug-hunt after the block-boundary fix ---
 Date: 2026-05-29
 TaskStatus: completed

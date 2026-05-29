@@ -1151,20 +1151,38 @@ async fn nemesis_loop(
             break;
         }
         let action = lcg.pick(&actions);
-        let result = match action {
-            Action::Split => do_split(&ctx).await,
-            Action::Merge => do_merge(&ctx).await,
-            Action::EcConvert => do_ec_convert(&ctx).await,
-            Action::FenceUnfence => do_fence_unfence(&ctx).await,
-            Action::Flush => do_maintenance(&ctx, partition_rpc::MAINTENANCE_FLUSH, "flush").await,
-            Action::Compact => {
-                do_maintenance(&ctx, partition_rpc::MAINTENANCE_COMPACT, "compact").await
+        // Bound every nemesis action: split/merge/EC orchestration RPCs are
+        // unbounded, so if a PS partition is wedged (e.g. stuck on an F227
+        // all-replica op after a node kill+restart whose behind replica was
+        // never recovered), the in-flight op never returns and the test
+        // hangs forever at shutdown-join. 30s is generous (split retries up
+        // to ~10s); a longer stall means a real wedge → log + keep looping
+        // so the loop still exits on `stop`. Surfaces the wedge as a
+        // bounded failure (verify not_found) instead of a CI hang.
+        let dispatch = async {
+            match action {
+                Action::Split => do_split(&ctx).await,
+                Action::Merge => do_merge(&ctx).await,
+                Action::EcConvert => do_ec_convert(&ctx).await,
+                Action::FenceUnfence => do_fence_unfence(&ctx).await,
+                Action::Flush => {
+                    do_maintenance(&ctx, partition_rpc::MAINTENANCE_FLUSH, "flush").await
+                }
+                Action::Compact => {
+                    do_maintenance(&ctx, partition_rpc::MAINTENANCE_COMPACT, "compact").await
+                }
+                Action::Gc => do_maintenance(&ctx, partition_rpc::MAINTENANCE_AUTO_GC, "gc").await,
+                Action::KillEn => do_kill_en(&ctx).await,
+                Action::KillThenFence => do_kill_then_fence(&ctx).await,
+                Action::NetworkPartition => do_network_partition(&ctx).await,
+                Action::LatencySpike => do_latency_spike(&ctx).await,
             }
-            Action::Gc => do_maintenance(&ctx, partition_rpc::MAINTENANCE_AUTO_GC, "gc").await,
-            Action::KillEn => do_kill_en(&ctx).await,
-            Action::KillThenFence => do_kill_then_fence(&ctx).await,
-            Action::NetworkPartition => do_network_partition(&ctx).await,
-            Action::LatencySpike => do_latency_spike(&ctx).await,
+        };
+        let result = match compio::time::timeout(Duration::from_secs(30), dispatch).await {
+            Ok(r) => r,
+            Err(_) => Err(format!(
+                "{action:?} TIMED OUT (30s) — PS/orchestration wedged?"
+            )),
         };
         ctx.nemesis_events.fetch_add(1, Ordering::Relaxed);
         match result {
@@ -1199,15 +1217,24 @@ async fn verify_per_key(
 ) -> (usize, Vec<String>, Vec<String>) {
     let mut mismatches: Vec<String> = Vec::new();
     let mut not_found: Vec<String> = Vec::new();
+    // Partitions that have proven wedged (a GET timed out post-settle). Once
+    // known wedged, remaining keys routing there are recorded not_found
+    // immediately instead of paying 10×5s each — the wedge is the finding;
+    // grinding every key just delays the FAILED report by minutes.
+    let mut wedged_parts: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let total = expected.len();
     for (key, want) in expected {
+        let part_id = topo.route(key);
+        if wedged_parts.contains(&part_id) {
+            not_found.push(String::from_utf8_lossy(key).into_owned());
+            continue;
+        }
         let mut got: Option<Vec<u8>> = None;
         for _attempt in 0..10 {
             // try_client_for never panics (vs `client_for` which does
             // after AUTUMN_TEST_ROUTER_RETRIES exhausted). If routing
             // still fails after that, log + skip — the verify path
             // will record the key as not_found.
-            let part_id = topo.route(key);
             let client = match router.try_client_for(part_id).await {
                 Ok(c) => c,
                 Err(_) => {
@@ -1235,12 +1262,12 @@ async fn verify_per_key(
                 Ok(r) => r,
                 Err(_) => {
                     eprintln!(
-                            "verify: GET TIMED OUT (5s) key={} part_id={} attempt={_attempt} — PS wedged?",
-                            String::from_utf8_lossy(key),
-                            part_id
-                        );
-                    compio::time::sleep(Duration::from_millis(300)).await;
-                    continue;
+                        "verify: GET TIMED OUT (5s) key={} part_id={} attempt={_attempt} — PS wedged, marking partition wedged",
+                        String::from_utf8_lossy(key),
+                        part_id
+                    );
+                    wedged_parts.insert(part_id);
+                    break;
                 }
             };
             match call_res {
@@ -1315,13 +1342,25 @@ async fn verify_per_partition_range(
                 limit: page_limit,
                 region_epoch: 0,
             };
-            let resp = match client
-                .call(partition_rpc::MSG_RANGE, partition_rpc::rkyv_encode(&req))
-                .await
+            // Bounded like the per-key GET: a wedged PS would otherwise hang
+            // the range scan forever (this runs AFTER per-key verify, so a
+            // wedged partition is already a recorded failure; don't also hang
+            // here). Timeout → record error + stop paging this partition.
+            let resp = match compio::time::timeout(
+                Duration::from_secs(5),
+                client.call(partition_rpc::MSG_RANGE, partition_rpc::rkyv_encode(&req)),
+            )
+            .await
             {
-                Ok(r) => r,
-                Err(e) => {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
                     errors.push(format!("range rpc on part {pid}: {e}"));
+                    break;
+                }
+                Err(_) => {
+                    errors.push(format!(
+                        "range rpc on part {pid}: TIMED OUT (5s) — PS wedged"
+                    ));
                     break;
                 }
             };
