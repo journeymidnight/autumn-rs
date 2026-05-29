@@ -36,14 +36,18 @@ Task scope: bug #3 (kill+restart wedge under K4/M2 chaos) — three-concepts
   regions (assignment/region-population gap), so it's unroutable. mismatches=0
   (NOT data loss). Distinct root cause from Layer C poison. NEXT to investigate.
 
-=== LAYER A (phantom-commit, review P1) — SCOPED, NOT STARTED ===
-  Revert compute_commit_seal to strict (reachable == committed) to kill the
-  seal-over-reachable phantom-commit; restore the F227 unit test. To avoid
-  re-wedging the writer's error-path seal, add StreamSubmitMsg::QueryCommit
-  (worker reports state.commit = acked watermark; never rewound, verified)
-  and have client.rs error-path allocs (1673/1700/1730) pass it as req.end
-  -> safe req.end>0 seal branch (no probe). Validate mismatches=0 + wedge
-  not worse. client-side complexity, no new manager probe behavior.
+=== LAYER A (phantom-commit, review P1) — REJECTED 2026-05-29 (keep lenient) ===
+  Decision: do NOT revert compute_commit_seal to strict. User: "seal 的时候
+  完全有可能访问不到 EN，不能要求严格模式；只要 append 保证 full replicate，
+  seal 就不用这么严格." The all-replica APPEND is the guarantee (acked prefix
+  on every member -> min-over-reachable >= acked, never loses acked data).
+  seal-over-reachable's phantom-commit (un-acked-but-replicated byte promoted
+  = data GAIN, never loss) is ACCEPTABLE — aligns with uncertain-write
+  semantics (a timed-out PUT may land). Strict-mode/QueryCommit would trade
+  that benign gain for a real data-LOSS risk. compute_commit_seal LEFT AS-IS
+  (already lenient, commit 0567961). Docs reconciled (manager note 28, stream
+  CLAUDE, inline doc) + memory feedback_seal_must_be_lenient. F227 unit test
+  seals_over_reachable_when_a_committed_member_is_silent KEPT.
 
 --- prior task (block-boundary lookup, commit 8e0ecad) kept below as history ---
 

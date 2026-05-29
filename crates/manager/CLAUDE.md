@@ -1301,57 +1301,68 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     limiter (no byte-rate dimension) — closest in spirit to the
     `ConcurrencyController`s, not to `RateController`.
 
-28. **F227 commit/seal length is all-replica, NOT quorum (supersedes the
-    F156 / F210-B2 majority-quorum on the manager seal path).** This is a
-    WAS stream layer: the append path is all-replica-ACK
+28. **F227 commit/seal: append is all-replica-ACK; the manager seal is
+    LENIENT (seal-over-reachable), NOT quorum and NOT strict-all-committed
+    (supersedes the F156 / F210-B2 majority-quorum).** This is a WAS stream
+    layer. The GUARANTEE comes from the APPEND path being all-replica-ACK
     (`client.rs::apply_completion` acks only when every replica wrote), so
-    the committed length = `min` over the COMMITTED members is always
-    ≥ the acked length and never drops acked data. The pre-F227
-    majority-quorum + min-over-responders was the bug: a subset `min` can
-    sit BELOW the acked length (include a short / catching-up replica →
-    the next append's `header.commit` truncates acked data on the
-    up-to-date replicas → silent loss) or ABOVE it (exclude a member →
-    keep un-acked data). Surfaced in production as
-    `stale_vp_offset_past_sealed_length` on a **non-EC** extent (data not
-    lost — intact on the fenced node — distinct from the F204 EC-residue
-    case where it is).
+    the acked prefix is present on EVERY committed member. Therefore `min`
+    over the REACHABLE committed members is always ≥ the acked length and
+    never drops acked data — no matter which members are down at seal time.
+
+    **The seal MUST stay lenient — do NOT revert it to strict
+    (user decision 2026-05-29; see `feedback_seal_must_be_lenient`).** You
+    seal precisely BECAUSE a node went down; requiring every committed
+    member to respond would block the seal forever (that was bug #3's
+    seal-wedge). The pre-F227 majority-quorum + min-over-responders was a
+    DIFFERENT bug: a quorum subset `min` could sit BELOW the acked length
+    (include a short / catching-up replica → next append's `header.commit`
+    truncates acked data → silent loss). seal-over-reachable avoids BOTH:
+    it excludes catching-up members AND never blocks on an unreachable one.
 
     The two seal/commit sites — `handle_stream_alloc_extent` failover seal
     (`req.end == 0` branch only; `req.end > 0` trusts the writer's own
-    all-acked commit and is unchanged) and `handle_check_commit_length` —
-    now both:
+    all-acked commit, the ideal exact seal with no probe) and
+    `handle_check_commit_length` — both:
     - **exclude catching-up members** via `recovering_nodes_for_extent`
-      (nodes with an in-flight Recovery in the F207 ledger; a
-      re-replication target holds a partial replica and must never lower
-      the `min`),
-    - probe only committed members and feed the results to the shared pure
+      (in-flight Recovery in the F207 ledger; a re-replication target holds
+      a partial replica and must never lower the `min`),
+    - probe committed members and feed results to the shared pure
       `compute_commit_seal(members, recovering, responses, floor)`,
-    - **require ALL committed members to respond** (no quorum vote). A
-      dead committed member is reconfigured out of the set by the operator
-      fence → recovery lifecycle (its slot then becomes catching-up and is
-      excluded next attempt); until then the seal/commit refuses
-      (`Precondition`) and the caller retries.
-    - `AUTUMN_MGR_SEAL_DURABILITY_FLOOR` (default 1) is a **durability
-      gate** (min committed members that must exist + respond), NOT a
-      quorum vote on the commit *position* — the position is always `min`
-      over the responding committed members.
+    - seal at `min` over the **REACHABLE** committed members, requiring
+      only `floor` of them to respond (NOT all). An unreachable committed
+      member gets its `avali` bit left UNSET → reconciled by recovery /
+      re_avali later; it does NOT block the seal.
+    - `AUTUMN_MGR_SEAL_DURABILITY_FLOOR` (default 1) is the min number of
+      committed members that must exist + respond — a durability floor, not
+      a quorum vote on the commit *position* (position is always `min` over
+      the responders).
 
-    **Truncation is correct and must stay** — bytes beyond the committed
-    length are un-acked speculation and SHOULD be truncated; do NOT add a
-    floor that retains them (an earlier proposal of mine, retracted).
+    **Phantom-commit is ACCEPTABLE, not a bug to fix.** seal-over-reachable
+    can promote an un-acked-but-replicated tail byte to committed (data
+    *gain*, never *loss*) — e.g. an append reached the two reachable
+    members but not the unreachable one. This aligns with the system's
+    existing uncertain-write semantics (`feedback_chaos_timeout_uncertain`:
+    a timed-out PUT may still land). Do NOT add strict-mode / watermark
+    threading to kill it — that trades a benign data-gain for a real
+    data-LOSS risk if the watermark is ever imperfect.
 
-    **Backward-incompat (behavioral, no wire change):** seals/commits now
-    block (retry) when a committed replica is unreachable instead of
-    proceeding on a majority — the intended WAS consistency-over-
-    availability tradeoff. Companion stream-side changes: `current_commit`
-    (all-replica), `await_extent_synced_to` flush barrier (all-replica),
-    and `ensure_tail_initialised` (`current_commit` failure now propagates
-    instead of seeding cursor 0 — the old `unwrap_or(0)` made the next
-    append's `header.commit=0` truncate every replica to 0). See
+    **Truncation of beyond-commit bytes stays correct** — they are un-acked
+    speculation; do NOT add a floor that retains them.
+
+    **Backward-incompat (behavioral, no wire change):** the manager seal
+    proceeds over the reachable members instead of a majority vote (WAS
+    seal-over-reachable). Companion stream-side WRITE-path changes (NOT the
+    seal): `current_commit` (all-replica — append tail init) and
+    `await_extent_synced_to` flush barrier (all-replica), and
+    `ensure_tail_initialised` propagates a `current_commit` failure instead
+    of seeding cursor 0 (the old `unwrap_or(0)` made the next append's
+    `header.commit=0` truncate every replica to 0). See
     `crates/stream/CLAUDE.md`. Pure-fn tests:
     `rpc_handlers::f227_commit_seal_tests`. Cross-ref: notes 21 (F207
     ledger = the catching-up signal), 23/24 (F211/F214 fence → recovery
-    lifecycle that reconfigures dead members out).
+    lifecycle that reconfigures dead members out);
+    `feedback_seal_must_be_lenient`, `project_bug3_kill_restart_wedge`.
 
 29. **F228 background-loop resilience — bound every await (1A) + supervise
     every loop (1C).** The node_health_loop production freeze (note 25 / the
