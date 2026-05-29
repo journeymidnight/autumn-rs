@@ -1238,8 +1238,20 @@ async fn verify_per_key(
             let client = match router.try_client_for(part_id).await {
                 Ok(c) => c,
                 Err(_) => {
-                    compio::time::sleep(Duration::from_millis(500)).await;
-                    continue;
+                    // Routing failure (no registered addr) is itself a
+                    // wedge signal: a partition that never (re)opened has no
+                    // part_addr. `try_client_for` already retried internally,
+                    // so mark the partition wedged and fast-fail remaining
+                    // keys instead of paying 10×500ms PER key (which made
+                    // verify grind for minutes when a partition stayed
+                    // unbound — BUG #3 persistent-EADDRINUSE case).
+                    eprintln!(
+                        "verify: ROUTE FAILED key={} part_id={} attempt={_attempt} — no part_addr, marking partition wedged",
+                        String::from_utf8_lossy(key),
+                        part_id
+                    );
+                    wedged_parts.insert(part_id);
+                    break;
                 }
             };
             let payload = partition_rpc::rkyv_encode(&partition_rpc::GetReq {

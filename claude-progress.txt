@@ -76,8 +76,23 @@ BUG #3 (reproducible ~2/3 on seed=6, K=4/M=2/8-ENs/90s, harsh actions):
   test originally hung forever joining the nemesis (its split/merge RPC to
   the wedged PS never returned).
 
-  *** ROOT CAUSE (CORRECTED after full tracing, supersedes the two earlier
-  hypotheses below) — REOPEN-THRASH from listener-bind EADDRINUSE: ***
+  *** SYNTHESIS (final, after the reopen-backoff fix + GET-timeout evidence):
+  bug #3 has TWO layers. PRIMARY = F227 all-replica WRITE-BLOCK: after a node
+  kill+restart its replica is behind and recovery is fence-gated (F211), so
+  appends to the partition block on commit_length/all-replica forever; the
+  blocked Phase-2 futures saturate the ps-conn inflight FU, which starves
+  READS (GET) on the same connection → verify sees GET TIMED OUT on a
+  partition that IS bound (parts 39/9001 in ff2_1) → not_found. SECONDARY =
+  the reopen-thrash/bind-EADDRINUSE churn below (a split child failing to
+  bind for a while). The reopen-backoff fix (this iteration) addresses the
+  SECONDARY layer (less thrash, isolates open failures) but NOT the primary
+  F227 write-block — so K4/M2 seed=6 still fails (now FAIL-FAST ~130s, 0
+  timeout-kills, clean not_found, instead of a 300s grind). The real fix for
+  the PRIMARY layer is the deferred F227/recovery change: reconcile a
+  kill+restarted behind replica (re_avali) OR exclude+recover it from the
+  all-replica commit instead of blocking. ***
+
+  *** ROOT CAUSE (reopen-thrash layer, SECONDARY) — listener-bind EADDRINUSE: ***
   Trace of a wedged run (RUST_LOG=...autumn_partition_server=info on the
   in-process chaos PS) shows the wedged split-child partition 46 (and 9001)
   being OPENED every single 2 s region_sync tick (11:46:32/:34/:36/:38...),

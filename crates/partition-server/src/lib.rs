@@ -1446,7 +1446,32 @@ pub struct PartitionServer {
     /// when `--cpuset` was explicitly supplied; otherwise `max =
     /// usize::MAX` and `would_exceed` always returns false.
     pub(crate) partition_budget: std::sync::Arc<PartitionBudget>,
+    /// BUG #3 reopen-thrash hardening: per-partition open-failure backoff.
+    /// When `open_partition` fails (e.g. a transient listener-bind
+    /// EADDRINUSE during split/merge region churn), retrying it every
+    /// `region_sync` tick (~2 s) thrashes — the partition flaps
+    /// unavailable, spams logs, and burns a fresh port ordinal each time.
+    /// We record consecutive failures per `part_id` and skip reopening
+    /// until `retry_after` (exponential backoff, capped); cleared on a
+    /// successful open and pruned for partitions no longer assigned.
+    open_backoff: Rc<RefCell<HashMap<u64, OpenBackoff>>>,
 }
+
+/// Per-partition reopen-backoff state (BUG #3 hardening). See
+/// `PartitionServer.open_backoff`.
+struct OpenBackoff {
+    consecutive_failures: u32,
+    retry_after: Instant,
+}
+
+/// First open-failure backoff = `OPEN_BACKOFF_BASE_SECS` (≈ "retry next
+/// region_sync tick"); each further consecutive failure doubles it up to
+/// `2^OPEN_BACKOFF_MAX_SHIFT`, capped at `OPEN_BACKOFF_CAP_SECS`. Small
+/// at first so a transient port conflict recovers fast; throttles a
+/// persistently-failing open so it doesn't spin.
+const OPEN_BACKOFF_BASE_SECS: u64 = 1;
+const OPEN_BACKOFF_MAX_SHIFT: u32 = 5;
+const OPEN_BACKOFF_CAP_SECS: u64 = 30;
 
 /// F196 D-r7: per-partition rate controller. Tracks FOUR independent
 /// rate dimensions in one 1-second sliding window:
@@ -2294,6 +2319,7 @@ impl PartitionServer {
                             partition_budget: std::sync::Arc::new(PartitionBudget::new(
                                 compute_partition_budget_cap(),
                             )),
+                            open_backoff: Rc::new(RefCell::new(HashMap::new())),
                         };
                         return Ok(server);
                     } else if resp.code == manager_rpc::CODE_NOT_LEADER {
@@ -2661,10 +2687,24 @@ impl PartitionServer {
             }
         }
 
+        // BUG #3 hardening: snapshot the wanted set so we can prune stale
+        // backoff entries after the open loop consumes `wanted`.
+        let wanted_ids: std::collections::HashSet<u64> = wanted.keys().copied().collect();
+        let now = Instant::now();
+
         // Open new partitions.
         for (part_id, (rg, log_stream_id, row_stream_id, meta_stream_id, region_epoch)) in wanted {
             if self.partitions.borrow().contains_key(&part_id) {
                 continue;
+            }
+            // BUG #3 hardening: a partition whose open keeps failing (e.g.
+            // transient listener-bind EADDRINUSE during region churn) is in
+            // a backoff window — skip reopening it this tick instead of
+            // thrashing every ~2 s. The window expires and we retry.
+            if let Some(bo) = self.open_backoff.borrow().get(&part_id) {
+                if now < bo.retry_after {
+                    continue;
+                }
             }
             // F196: refuse to open a NEW partition when the static budget
             // is exhausted. Manager assigned more partitions than the
@@ -2684,7 +2724,11 @@ impl PartitionServer {
                 continue;
             }
             tracing::info!("PS {} opening partition {part_id}", self.ps_id);
-            let handle = self
+            // BUG #3 hardening: do NOT `?`-propagate an open failure — that
+            // aborted the whole sync pass (skipping every other wanted
+            // partition) and retried the failing one every tick. Catch it,
+            // record per-partition backoff, and continue opening the rest.
+            match self
                 .open_partition(
                     part_id,
                     rg,
@@ -2693,12 +2737,42 @@ impl PartitionServer {
                     row_stream_id,
                     meta_stream_id,
                 )
-                .await?;
-            tracing::info!("PS {} partition {part_id} opened", self.ps_id);
-            self.partitions.borrow_mut().insert(part_id, handle);
-            // F196: bump budget counter only after a successful insert.
-            self.partition_budget.inc();
+                .await
+            {
+                Ok(handle) => {
+                    tracing::info!("PS {} partition {part_id} opened", self.ps_id);
+                    self.partitions.borrow_mut().insert(part_id, handle);
+                    // F196: bump budget counter only after a successful insert.
+                    self.partition_budget.inc();
+                    // Open succeeded — clear any backoff state.
+                    self.open_backoff.borrow_mut().remove(&part_id);
+                }
+                Err(e) => {
+                    let mut bk = self.open_backoff.borrow_mut();
+                    let entry = bk.entry(part_id).or_insert(OpenBackoff {
+                        consecutive_failures: 0,
+                        retry_after: now,
+                    });
+                    entry.consecutive_failures += 1;
+                    let shift = (entry.consecutive_failures - 1).min(OPEN_BACKOFF_MAX_SHIFT);
+                    let secs = OPEN_BACKOFF_BASE_SECS
+                        .saturating_mul(1u64 << shift)
+                        .min(OPEN_BACKOFF_CAP_SECS);
+                    entry.retry_after = now + Duration::from_secs(secs);
+                    tracing::warn!(
+                        "PS {} open partition {part_id} failed (attempt {}); backing off {secs}s: {e:#}",
+                        self.ps_id,
+                        entry.consecutive_failures,
+                    );
+                }
+            }
         }
+        // BUG #3 hardening: prune backoff entries for partitions no longer
+        // assigned to this PS so the map can't grow unbounded across many
+        // split/merge cycles.
+        self.open_backoff
+            .borrow_mut()
+            .retain(|pid, _| wanted_ids.contains(pid));
         Ok(())
     }
 
