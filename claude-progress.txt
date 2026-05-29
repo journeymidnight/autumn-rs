@@ -94,18 +94,28 @@ BUG #3 (reproducible ~2/3 on seed=6, K=4/M=2/8-ENs/90s, harsh actions):
   TIME_WAIT / lingering client-connection sockets on the just-dropped
   partition's port (a closing LISTEN with established conns leaves those in
   TIME_WAIT → a fresh bind on that port is refused without SO_REUSEADDR).
-  FIX CANDIDATES (deliberate, not done — touch transport crate / port mgmt):
-    (a) set SO_REUSEADDR on the partition TCP listener bind
-        (crates/transport/src/tcp.rs bind → build via socket2, set
-        reuse_address, then bind). FIRST verify whether compio's
-        TcpListener::bind already sets it; if it does, look elsewhere.
-        Mirror for the UCX listener.
-    (b) recycle freed port ordinals / pick a verified-free port, OR insert
-        the partition into the map on "ready" and let bind retry in the
-        background instead of failing the whole open (avoids the reopen
-        loop even if a port is transiently busy).
-    (c) the committed bounded bind-retry (037f7a4) only partially helps —
-        TIME_WAIT lasts ~60 s, far longer than the 2 s retry budget.
+  UPDATE (verified): compio-net 0.11.1 `TcpListener::bind` ALREADY enables
+  SO_REUSEADDR by default (src/tcp.rs:60 → SocketOpts::reuse_address(true)).
+  So this is NOT a TIME_WAIT/missing-SO_REUSEADDR issue (SO_REUSEADDR permits
+  binding a TIME_WAIT port). The EADDRINUSE is therefore an ACTIVE-port
+  conflict. Ports are monotonic-unique (`base_port + next_port_ord`), and the
+  failing ports (27386-88 in the trace) were NOT held by any logged component
+  (ENs/mgr/toxiproxy/etcd were all outside the range) nor by a successfully-
+  bound partition. So the exact source is still unpinned — candidates: an
+  intra-PS concurrent-open race (region_sync opens several partitions per
+  pass), io_uring socket-teardown timing on the just-closed reopen socket, or
+  a transient bind that isn't logged. Pinning it needs socket-level debugging
+  (ss/netstat sampled at the moment of failure) — beyond safe autonomous loop
+  scope.
+  PRODUCT-RELEVANT FIX (clear regardless of the exact EADDRINUSE source):
+  a failed listener bind must NOT cause INFINITE reopen-thrash. region_sync
+  should back off / not retry-storm a partition whose open keeps failing
+  (e.g. exponential backoff per part_id on consecutive open failures, or
+  insert-on-"ready" + background bind so a transient port conflict degrades
+  gracefully instead of flapping the partition unavailable every 2s). This
+  is the actionable hardening; it lives in the delicate region_sync path
+  (cf. F212-fix-2), deferred to deliberate work.
+  The committed bounded bind-retry (037f7a4) helps the sub-2s window only.
   NOTE: the earlier "listener leak (old thread not joined)" framing was
   PARTLY wrong — the accept task DOES exit promptly ("accept task exiting")
   and old listeners are released; the EADDRINUSE is on a FRESH monotonic
