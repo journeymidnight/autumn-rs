@@ -29,12 +29,27 @@ Task scope: bug #3 (kill+restart wedge under K4/M2 chaos) — three-concepts
   killfence,partition,latency): totalpoison=0 (was 2/8), mismatches=0 in
   ALL 8 (zero data loss). Stream unit tests 56+ pass; f227 seal tests 6 pass.
 
-=== RESIDUAL (NOT poison) — separate availability wedge, 1/8 ===
-  it=6 FAILED with `ROUTE FAILED key=q000143 part_id=26 — no part_addr,
-  marking partition wedged` / `part 26 not in regions yet` -> not_found=200.
-  A split-child partition exists but never got a part_addr in the manager's
-  regions (assignment/region-population gap), so it's unroutable. mismatches=0
-  (NOT data loss). Distinct root cause from Layer C poison. NEXT to investigate.
+=== ROUTING WEDGE (NOT poison, NOT data loss) — PINNED + FIXED + VALIDATED ===
+  Residual ~1/8 chaos failure after Layer C: a split-child (e.g. part 26)
+  never got a part_addr -> unroutable -> not_found=200. mismatches=0.
+  PINNED via traced repro (RUST_LOG=info): recovery SUCCEEDS every reopen
+  (open_partition: ready tables=2) but the per-partition listener bind fails
+  EADDRINUSE on every monotonic port (11752..11758). Root cause:
+  ip_local_port_range=10000-65535, base_port=11750 INSIDE it -> the PS's
+  DETERMINISTIC base_port+ord listener ports collide with OS EPHEMERAL local
+  ports held by outbound sockets (StreamClient->EN, recovery, mgr RPCs,
+  P-bulk). The "old wedged listener holds the port" guess in the bind-retry
+  comment was wrong (a single leak = 1 port; here 7 distinct ports failed).
+  FIX (lib.rs partition_thread_main): on EADDRINUSE after the same-port
+  reopen-race retries, bind :0 (OS-assigned, guaranteed not an in-use
+  ephemeral) and register the ACTUAL bound port. advertise_addr rebuilt from
+  actual port; normal path unchanged (actual==computed). Clients route via
+  the registered part_addr, so determinism bought nothing.
+  VALIDATION: K4/M2 seed=6 x10: pass 10/10 (was ~7/8), wedge_events=0,
+  mismatches=0 all 10, :0 fallback engaged 2-3x/run (collision is real +
+  frequent). partition-server unit tests 148 pass.
+  Memory: project_bug3_routing_wedge_pinned. Latent in prod only if base_port
+  set inside ip_local_port_range (default :9201 is below 32768 -> safe).
 
 === LAYER A (phantom-commit, review P1) — REJECTED 2026-05-29 (keep lenient) ===
   Decision: do NOT revert compute_commit_seal to strict. User: "seal 的时候

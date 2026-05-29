@@ -2878,7 +2878,7 @@ impl PartitionServer {
 
         let manager_addr_for_thread = manager_addr.clone();
         let owner_key_for_thread = owner_key.clone();
-        let advertise_addr_for_thread = advertise_addr.clone();
+        let advertise_host_for_thread = advertise_host.clone();
         // F196 D-r7: hand the partition thread the PS-wide concurrency
         // Arc (shared) + a fresh RateController per partition (built
         // inside the thread from process-global setters).
@@ -2919,7 +2919,7 @@ impl PartitionServer {
                         revision,
                         ps_id,
                         listen_addr,
-                        advertise_addr_for_thread,
+                        advertise_host_for_thread,
                         ready_tx,
                         shutdown_rx,
                         drain_rx,
@@ -4024,7 +4024,7 @@ async fn partition_thread_main(
     revision: i64,
     ps_id: u64,
     listen_addr: SocketAddr,
-    advertise_addr: String,
+    advertise_host: String,
     ready_tx: oneshot::Sender<Result<()>>,
     shutdown_rx: oneshot::Receiver<()>,
     drain_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
@@ -4303,15 +4303,63 @@ async fn partition_thread_main(
                         compio::time::sleep(Duration::from_millis(200)).await;
                         continue;
                     }
+                    // The deterministic base_port+ord port is stuck. Pinned
+                    // root cause (2026-05-29): a collision with an OS
+                    // EPHEMERAL local port — outbound sockets (StreamClient
+                    // -> EN, recovery reads, manager RPCs, P-bulk) draw their
+                    // local port from ip_local_port_range, and when base_port
+                    // falls INSIDE that range one of them already holds
+                    // base_port+ord, so the listener bind fails EADDRINUSE on
+                    // every monotonic port (the bug #3 routing wedge: the
+                    // split-child never serves -> no part_addr -> unroutable).
+                    // Fall back to an OS-assigned port (:0): clients route via
+                    // the REGISTERED part_addr, never a computed port, so the
+                    // deterministic scheme buys nothing here and :0 is
+                    // guaranteed not to be an in-use ephemeral.
+                    if in_use {
+                        let fallback = SocketAddr::new(listen_addr.ip(), 0);
+                        match autumn_transport::current_or_init().bind(fallback).await {
+                            Ok(l) => {
+                                tracing::warn!(
+                                    part_id,
+                                    computed = %listen_addr,
+                                    "deterministic listener port busy (ephemeral collision); \
+                                     bound OS-assigned fallback port"
+                                );
+                                break l;
+                            }
+                            Err(e2) => {
+                                let _ = ready_tx.send(Err(anyhow!(
+                                    "bind {} then :0 fallback: {}",
+                                    listen_addr,
+                                    e2
+                                )));
+                                return Ok(());
+                            }
+                        }
+                    }
                     let _ = ready_tx.send(Err(anyhow!("bind {}: {}", listen_addr, e)));
                     return Ok(());
                 }
             }
         }
     };
+    // Build the advertise address from the ACTUAL bound port (may differ from
+    // the computed base_port+ord port if the :0 fallback above engaged). In
+    // the normal case actual == listen_addr.port(), so this is identical to
+    // the pre-fix computed advertise_addr.
+    let actual_port = listener
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or_else(|_| listen_addr.port());
+    let advertise_addr = format!("{advertise_host}:{actual_port}");
     match listener.local_addr() {
-        Ok(actual) => tracing::info!(part_id, addr = %actual, "partition listener bound"),
-        Err(_) => tracing::info!(part_id, addr = %listen_addr, "partition listener bound"),
+        Ok(actual) => {
+            tracing::info!(part_id, addr = %actual, advertise = %advertise_addr, "partition listener bound")
+        }
+        Err(_) => {
+            tracing::info!(part_id, addr = %listen_addr, advertise = %advertise_addr, "partition listener bound")
+        }
     }
 
     // Register this partition's address with the manager. Do it on this
