@@ -2558,7 +2558,7 @@ impl PartitionServer {
             ticker.tick().await;
             tracing::debug!("PS {} region_sync_loop: syncing", self.ps_id);
             if let Err(e) = self.sync_regions_once().await {
-                tracing::warn!("PS {} region sync failed: {e}", self.ps_id);
+                tracing::warn!("PS {} region sync failed: {e:#}", self.ps_id);
             }
         }
     }

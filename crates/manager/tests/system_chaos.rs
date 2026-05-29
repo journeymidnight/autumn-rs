@@ -1441,6 +1441,15 @@ async fn create_stream_kp(mgr: &RpcClient, k: u32, m: u32) -> u64 {
 #[test]
 #[ignore]
 fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
+    // Opt-in tracing: silent unless RUST_LOG is set (EnvFilter then applies
+    // it). Lets a chaos run surface in-process PS / stream-layer internals
+    // (e.g. RUST_LOG=warn,autumn_stream=info,autumn_partition_server=info) so
+    // a wedged partition's parked operation is observable. `try_init` so a
+    // second test in the same process doesn't panic on a double-install.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
     let cfg = ChaosConfig::from_env();
     eprintln!(
         "chaos: duration={}s nemesis_iv={}ms K={} M={} ENs={} seed={}",

@@ -32,7 +32,7 @@ autumn-fuse = { path = "../fuse", features = ["fuse"] }
 autumn-ioring = { path = "../ioring", features = ["daemon"] }
 compio = { version = "0.18", features = ["net", "time", "macros"] }
 tempfile = "3"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 crc32c = "0.6"
 

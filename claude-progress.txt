@@ -76,7 +76,37 @@ BUG #3 (reproducible ~2/3 on seed=6, K=4/M=2/8-ENs/90s, harsh actions):
   test originally hung forever joining the nemesis (its split/merge RPC to
   the wedged PS never returned).
 
-  Hypothesis (UNVERIFIED — needs PS-side tracing to confirm):
+  ROOT CAUSE CONFIRMED (tracing, 2026-05-29): the wedge is NOT (primarily)
+  the F227 hypothesis below — it is an EADDRINUSE listener leak on partition
+  REOPEN. Trace of a wedged run shows, for the wedged parts (9001 + split
+  child 46):
+    PS 91 region sync failed: partition 9001 failed to bind listener on
+    127.0.0.1:33032 ... : bind 127.0.0.1:33032: Address already in use
+    (os error 98)   [ports increment 33032..33036 across retries, ALL in-use]
+  followed (later) by:
+    ERROR LockedByOther detected, poisoning partition part_id=9001 / 46
+  Mechanism:
+    1. node kill+restart + split/merge churn changes regions → region_sync
+       drops+reopens the affected partitions.
+    2. Reopen calls partition_thread_main → autumn_transport bind(listen_addr)
+       on the per-partition port (base_port+ord, F099-K). The OLD partition
+       instance's listener (and/or its port) is NOT released before the new
+       one binds → EADDRINUSE. Retries pick incrementing ports but the whole
+       local range is occupied by leaked listeners from prior reopen churn →
+       every bind fails.
+    3. Reopen fails → the partition has no healthy serving loop. Clients
+       connect to the stale/old listener whose partition_loop is gone or
+       LockedByOther-poisoned → RPCs never get a response → 5s client
+       timeouts forever → verify not_found.
+  So bug #3 is a PARTITION-REOPEN listener/port leak (delicate region_sync
+  drop+reopen path, cf. F212-fix-2), compounded by LockedByOther poisoning
+  and F227 all-replica blocking during the kill window. FIX DIRECTION:
+  guarantee the old partition's listener + thread are fully torn down
+  (joined / socket dropped, or SO_REUSEADDR + same fixed port) BEFORE the
+  reopen rebinds; do not leak the listener on drop. Verify the old
+  partition_loop has exited before rebinding the port.
+
+  Secondary/contributing hypothesis (still plausible, needs its own trace):
   F227 made commit_length / flush-barrier ALL-REPLICA. After a node
   kill+restart the node comes back ALIVE but its replica for the partition's
   stream is BEHIND (missed writes during the down window). Recovery is gated
