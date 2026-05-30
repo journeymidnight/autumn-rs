@@ -499,6 +499,19 @@ pub struct StreamAllocExtentReq {
     pub owner_key: String,
     pub revision: i64,
     pub end: u32,
+    /// `true` when `end` is the WRITER's own all-replica-acked commit
+    /// (`state.commit`) on the tail being sealed, captured at a QUIESCED point
+    /// via the `SealCommit` worker handshake (in-flight drained first). The
+    /// manager then seals at EXACTLY `end` and does NOT probe replicas — even
+    /// when `end == 0` (a tail where nothing was ever all-acked). This prevents
+    /// the F227 phantom seal: a probe over reachable members can capture a
+    /// speculative/un-acked byte that only one (soon-dead) member holds,
+    /// sealing at a length no replica durably retains (the seed=13 stuck-
+    /// recovery bug). `false` (new-owner takeover / sealed-tail init / legacy
+    /// callers) keeps the probe + seal-over-reachable behaviour. Moot when
+    /// `end > 0` (already authoritative) and when the tail is already sealed
+    /// (the seal is preserved untouched).
+    pub authoritative_commit: bool,
     /// F190: per-stream "recently failed" node ids the writer wants the
     /// manager to skip when picking nodes for the new extent. Empty Vec
     /// means "no exclusions" (legacy / cold-start clients). The manager

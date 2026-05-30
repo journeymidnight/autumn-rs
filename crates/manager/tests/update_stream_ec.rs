@@ -248,6 +248,7 @@ fn update_stream_ec_triggers_conversion() {
                     owner_key: sc.owner_key().to_string(),
                     revision: sc.revision(),
                     end: result.end,
+                    authoritative_commit: false,
                     exclude_node_ids: vec![],
                 }),
             )

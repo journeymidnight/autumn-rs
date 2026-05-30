@@ -121,6 +121,13 @@ struct StreamAppendState {
     pending_acks: std::collections::BTreeMap<u32, u32>,
     in_flight: u32,
     poisoned: bool,
+    /// Set true by `SealCommit` after it drains + reports `commit`; while true,
+    /// new `Append`s on the about-to-be-sealed tail are REJECTED (soft error →
+    /// caller retries onto the fresh tail). Cleared by `ResetTail`
+    /// (`reset_for_new_extent`). Closes the seal→ResetTail window where a
+    /// concurrent append could write past the new `sealed_length` and have its
+    /// acked data become unreadable (coco P1).
+    sealing: bool,
     /// F190: per-stream "recently failed" node ids (`node_id → expires_at`).
     /// Shared with the public API via `Rc<RefCell<_>>` so
     /// `alloc_new_extent_once` can snapshot non-expired entries to pass via
@@ -156,6 +163,7 @@ impl StreamAppendState {
             pending_acks: std::collections::BTreeMap::new(),
             in_flight: 0,
             poisoned: false,
+            sealing: false,
             bad_nodes,
             failure_report_tx,
             bad_nodes_ttl,
@@ -188,6 +196,9 @@ impl StreamAppendState {
         self.pending_acks.clear();
         self.in_flight = 0;
         self.poisoned = false;
+        // ResetTail moves to a fresh tail → un-freeze: the seal→reset window
+        // (during which appends were rejected) is over.
+        self.sealing = false;
     }
 
     fn lease(&mut self, size: u32) -> (u32, u32) {
@@ -464,6 +475,15 @@ enum StreamSubmitMsg {
     /// already has data (`current_commit > 0`); without this the next
     /// append would try to overwrite pre-existing bytes.
     SeedCursor { cursor: u32 },
+    /// Failover seal handshake: the worker DRAINS every in-flight append
+    /// (awaits all completions, applying each so `state.commit` reaches its
+    /// final contiguous all-replica-acked prefix), then replies with that
+    /// `state.commit`. The public API uses the returned watermark as the
+    /// authoritative seal length for `alloc_new_extent`. This is the ONLY
+    /// safe source — a public-API-tracked value always lags the worker and
+    /// races concurrent out-of-order appends + rolls. The drain is bounded by
+    /// each append's `append_fanout_timeout`, so it cannot hang.
+    SealCommit { resp: oneshot::Sender<u32> },
     /// Explicit shutdown.  Dropping the last Sender also exits the worker
     /// via channel close — this variant is kept for symmetry / tests.
     #[allow(dead_code)]
@@ -562,6 +582,24 @@ async fn failure_report_drain_loop(sc: Weak<StreamClient>, mut rx: mpsc::Receive
     }
 }
 
+/// SealCommit drain: await EVERY in-flight append and apply its completion so
+/// `state.commit` reaches its final contiguous all-replica-acked prefix before
+/// the worker reports the seal watermark. Bounded by each append's
+/// `append_fanout_timeout` (every `InflightFut` resolves within it — success,
+/// error, or timeout), so it cannot hang even if a replica is dead. After this
+/// returns, `inflight` is empty and `state.commit` is the exact length to seal
+/// the current tail at: every all-replica-acked byte is included, every
+/// un-acked (failed/timed-out) byte is excluded (those callers retry onto the
+/// fresh tail). No phantom, no truncation.
+async fn drain_inflight_for_seal(
+    state: &mut StreamAppendState,
+    inflight: &mut FuturesUnordered<InflightFut>,
+) {
+    while let Some(result) = inflight.next().await {
+        apply_completion(state, result);
+    }
+}
+
 async fn stream_worker_loop(
     stream_id: u64,
     mut submit_rx: mpsc::Receiver<StreamSubmitMsg>,
@@ -601,6 +639,13 @@ async fn stream_worker_loop(
                 Some(StreamSubmitMsg::SeedCursor { cursor }) => {
                     state.commit = cursor;
                     state.lease_cursor = cursor;
+                }
+                Some(StreamSubmitMsg::SealCommit { resp }) => {
+                    drain_inflight_for_seal(&mut state, &mut inflight).await;
+                    let _ = resp.send(state.commit);
+                    // Freeze the tail until ResetTail so no append lands past
+                    // the just-reported seal point (coco P1).
+                    state.sealing = true;
                 }
                 Some(StreamSubmitMsg::Append {
                     payload_parts,
@@ -656,6 +701,13 @@ async fn stream_worker_loop(
                 Some(StreamSubmitMsg::SeedCursor { cursor }) => {
                     state.commit = cursor;
                     state.lease_cursor = cursor;
+                }
+                Some(StreamSubmitMsg::SealCommit { resp }) => {
+                    drain_inflight_for_seal(&mut state, &mut inflight).await;
+                    let _ = resp.send(state.commit);
+                    // Freeze the tail until ResetTail so no append lands past
+                    // the just-reported seal point (coco P1).
+                    state.sealing = true;
                 }
                 Some(StreamSubmitMsg::Append {
                     payload_parts,
@@ -837,6 +889,17 @@ async fn launch_append(
     if state.poisoned {
         let _ = ack_tx.send(Err(anyhow!(
             "stream poisoned by prior failure; caller should alloc a new extent"
+        )));
+        return;
+    }
+
+    if state.sealing {
+        // A failover SealCommit has captured this tail's final commit and the
+        // manager is sealing it; appending more here would write past the new
+        // sealed_length. Reject as a soft error so the caller retries — by then
+        // ResetTail has switched to the fresh tail (sealing cleared).
+        let _ = ack_tx.send(Err(anyhow!(
+            "stream tail sealing for failover; retry on fresh tail"
         )));
         return;
     }
@@ -1488,6 +1551,7 @@ impl StreamClient {
         &self,
         stream_id: u64,
         end: u32,
+        authoritative_commit: bool,
     ) -> Result<(StreamInfo, ExtentInfo)> {
         // F190: snapshot the per-stream `bad_nodes` set (lazily prunes
         // expired entries). The manager filters its candidate pool by
@@ -1499,6 +1563,7 @@ impl StreamClient {
             owner_key: self.owner_key.clone(),
             revision: self.revision,
             end,
+            authoritative_commit,
             exclude_node_ids,
         });
         // 30 s — manager seals current tail (3-replica commit_length
@@ -1531,11 +1596,43 @@ impl StreamClient {
         Ok((stream, extent))
     }
 
-    async fn alloc_new_extent(&self, stream_id: u64, end: u32) -> Result<(StreamInfo, ExtentInfo)> {
+    async fn alloc_new_extent(
+        &self,
+        stream_id: u64,
+        end: u32,
+        authoritative_commit: bool,
+    ) -> Result<(StreamInfo, ExtentInfo)> {
         self.retry_manager_call("alloc_new_extent", 20, || {
-            self.alloc_new_extent_once(stream_id, end)
+            self.alloc_new_extent_once(stream_id, end, authoritative_commit)
         })
         .await
+    }
+
+    /// SealCommit handshake — ask the per-stream worker for its TRUE
+    /// all-replica-acked commit on the current tail, captured at a QUIESCED
+    /// point (the worker drains every in-flight append first). This is the
+    /// ONLY safe source for the failover seal length: a value tracked in the
+    /// public API always lags the worker's `state.commit` and races concurrent
+    /// out-of-order appends + tail rolls (→ phantom seal or acked-data
+    /// truncation). The drain is bounded by each append's
+    /// `append_fanout_timeout`, so it cannot hang. Returns the commit (may be
+    /// 0 for a tail where nothing was ever all-acked); the caller passes it to
+    /// `alloc_new_extent(.., authoritative_commit = true)` so the manager seals
+    /// at EXACTLY this value without probing.
+    async fn seal_commit_watermark(
+        &self,
+        stream_id: u64,
+        tx: &mpsc::Sender<StreamSubmitMsg>,
+    ) -> Result<u32> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let mut tx_clone = tx.clone();
+        tx_clone
+            .send(StreamSubmitMsg::SealCommit { resp: resp_tx })
+            .await
+            .map_err(|_| anyhow!("stream {stream_id} worker gone before SealCommit"))?;
+        resp_rx
+            .await
+            .map_err(|_| anyhow!("stream {stream_id} worker dropped SealCommit resp"))
     }
 
     /// Core append implementation.  Thin wrapper that wraps a single Bytes
@@ -1626,8 +1723,13 @@ impl StreamClient {
                     if result.end >= self.max_extent_size {
                         alloc_count += 1;
                         if alloc_count <= MAX_ALLOC_PER_APPEND {
+                            // Preemptive roll on a SUCCESSFUL cap-hitting append:
+                            // `result.end` is this append's acked end and the
+                            // clean seal boundary (later-leased appends are
+                            // beyond it → re-driven onto the new tail). end > 0
+                            // ⇒ the manager trusts it without probing.
                             if let Ok((_, new_ext)) =
-                                self.alloc_new_extent(stream_id, result.end).await
+                                self.alloc_new_extent(stream_id, result.end, true).await
                             {
                                 if let Ok(replica_addrs) =
                                     self.replica_addrs_for_extent(&new_ext).await
@@ -1670,7 +1772,11 @@ impl StreamClient {
                                 "too many extent allocations ({alloc_count}) for single append, giving up"
                             ));
                         }
-                        let (_, new_ext) = self.alloc_new_extent(stream_id, 0).await?;
+                        // SealCommit handshake: seal the failed tail at the
+                        // worker's TRUE drained commit (no probe → no phantom).
+                        let seal_commit = self.seal_commit_watermark(stream_id, &tx).await?;
+                        let (_, new_ext) =
+                            self.alloc_new_extent(stream_id, seal_commit, true).await?;
                         let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
                         let replica_node_ids = Self::replica_node_ids_for(&new_ext);
                         let new_tail = StreamTail {
@@ -1697,7 +1803,9 @@ impl StreamClient {
                                     "too many extent allocations ({alloc_count}) for single append, giving up"
                                 ));
                             }
-                            let (_, new_ext) = self.alloc_new_extent(stream_id, 0).await?;
+                            let seal_commit = self.seal_commit_watermark(stream_id, &tx).await?;
+                            let (_, new_ext) =
+                                self.alloc_new_extent(stream_id, seal_commit, true).await?;
                             let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
                             let replica_node_ids = Self::replica_node_ids_for(&new_ext);
                             let new_tail = StreamTail {
@@ -1726,14 +1834,14 @@ impl StreamClient {
                             "too many extent allocations ({alloc_count}) for single append, giving up: {e}"
                         ));
                     }
-                    let (_, new_ext) =
-                        self.alloc_new_extent(stream_id, 0)
-                            .await
-                            .map_err(|alloc_err| {
-                                alloc_err.context(format!(
-                                    "alloc_new_extent failed after append error: {e}"
-                                ))
-                            })?;
+                    let seal_commit = self.seal_commit_watermark(stream_id, &tx).await?;
+                    let (_, new_ext) = self
+                        .alloc_new_extent(stream_id, seal_commit, true)
+                        .await
+                        .map_err(|alloc_err| {
+                            alloc_err
+                                .context(format!("alloc_new_extent failed after append error: {e}"))
+                        })?;
                     let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
                     let replica_node_ids = Self::replica_node_ids_for(&new_ext);
                     let new_tail = StreamTail {
@@ -1770,7 +1878,11 @@ impl StreamClient {
         }
         let tail = self.load_stream_tail(stream_id).await?;
         let (tail, commit_val) = if tail.extent.sealed_length > 0 {
-            let (_, new_ext) = self.alloc_new_extent(stream_id, 0).await?;
+            // First-use / new-owner init: the inherited tail is already sealed,
+            // so this is NOT a failover seal — we just roll past it. The
+            // manager's `already_sealed` short-circuit preserves the existing
+            // seal; `authoritative_commit=false` (no worker commit to claim).
+            let (_, new_ext) = self.alloc_new_extent(stream_id, 0, false).await?;
             let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
             let replica_node_ids = Self::replica_node_ids_for(&new_ext);
             (
@@ -3238,6 +3350,7 @@ mod f190_wire_compat_tests {
             owner_key: "ps/0/partition/3".to_string(),
             revision: 7,
             end: 0,
+            authoritative_commit: false,
             exclude_node_ids: Vec::new(),
         };
         let bytes = rkyv_encode(&req);
@@ -3256,6 +3369,7 @@ mod f190_wire_compat_tests {
             owner_key: String::new(),
             revision: 0,
             end: 1024,
+            authoritative_commit: false,
             exclude_node_ids: vec![3, 5, 9101],
         };
         let bytes = rkyv_encode(&req);

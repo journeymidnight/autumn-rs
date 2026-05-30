@@ -65,6 +65,7 @@ fn seal_during_active_writes_client_retries() {
                     owner_key: "test-seal-writer".to_string(),
                     revision: sc.revision(),
                     end: 0,
+                    authoritative_commit: false,
                     exclude_node_ids: vec![],
                 }),
             )

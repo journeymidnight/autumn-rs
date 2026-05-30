@@ -3568,6 +3568,7 @@ mod tests {
                 owner_key,
                 revision: rev,
                 end: 100,
+                authoritative_commit: false,
                 exclude_node_ids: vec![],
             });
             let resp = m.handle_stream_alloc_extent(req).await.unwrap();
@@ -5184,6 +5185,7 @@ mod tests {
                 owner_key: owner_key.clone(),
                 revision,
                 end: 100,
+                authoritative_commit: false,
                 exclude_node_ids: vec![],
             });
             let resp = m.handle_stream_alloc_extent(req).await.unwrap();
@@ -5268,6 +5270,7 @@ mod tests {
                 owner_key: owner_key.clone(),
                 revision,
                 end: 100,
+                authoritative_commit: false,
                 exclude_node_ids: vec![],
             });
             let resp = m.handle_stream_alloc_extent(req).await.unwrap();

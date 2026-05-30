@@ -1,3 +1,53 @@
+Date: 2026-05-30 (later)
+TaskStatus: not_completed
+Task scope: ROOT-fix Mode A phantom seal at the SEAL (prevent it) instead of
+  only reconciling it after the fact — via a worker SealCommit handshake. The
+  user steered the design: (1) prevent the phantom by sealing the failover tail
+  at the WRITER's true all-replica-acked commit (not a manager probe that can
+  capture a speculative byte); (2) the commit must come from the worker's
+  serialized `state.commit` at a QUIESCED point, because any public-API-tracked
+  value lags + races concurrent out-of-order appends (coco confirmed a real
+  data-loss race in the `result.end` shortcut).
+
+=== LANDED: SealCommit handshake (stream) + authoritative_commit (manager) ===
+  - New `StreamSubmitMsg::SealCommit { resp }`: the per-stream worker DRAINS
+    every in-flight append (`drain_inflight_for_seal`, bounded by each append's
+    `append_fanout_timeout` so it cannot hang), then replies with its final
+    contiguous `state.commit`. This is the ONLY safe commit source.
+  - After draining + replying, the worker sets `sealing = true`: new Appends on
+    the about-to-be-sealed tail are REJECTED (soft error → retry onto the fresh
+    tail), cleared by ResetTail. Closes the seal→ResetTail window where a
+    concurrent append could write past the new sealed_length (coco P1).
+  - Public-API failover (3 sites in `append_payload_segments`): SealCommit →
+    `alloc_new_extent(commit, authoritative_commit=true)`. Preemptive roll keeps
+    `result.end` (clean boundary). ensure_tail_initialised: authoritative=false
+    (new-owner → probe). NO public-API last_acked_end tracking (the racy
+    approach coco rejected twice).
+  - Manager `StreamAllocExtentReq.authoritative_commit: bool` + branch
+    `req.authoritative_commit || req.end > 0`: seal at EXACTLY req.end (even 0,
+    no probe). Prevents the phantom for the alloc-failover path. Other seal
+    sites (check_commit_length / split / merge) still probe → residual phantoms
+    are caught safely by the committed reconcile fix (defense-in-depth).
+  VALIDATION: f250 invariant + seed=6 x2 + seed=13 x4 + seed=1 + seed=8 =
+    mismatches=0 in ALL 9 (data-safe); 2 seed=13 fails are Mode B (range wedge,
+    deferred). seed=13 phantom now from OTHER seal sites (reconcile catches,
+    short>0 reconcile>0, 0 loss). manager 114 + stream 56 + rpc 16 lib tests;
+    clippy clean. coco /findbugs (rule 12) iterated: sealing-freeze + the
+    re-stream/unverified/init-seed data-loss bugs all fixed.
+
+=== NEXT (in progress, user-steered cleanup) ===
+  Refactor the request API to remove the "weird" `authoritative_commit` bool:
+  `StreamAllocExtentReq.end + authoritative_commit` → `seal_commit: Option<u32>`
+  (Some(c)=authoritative seal at exactly c incl 0; None=probe). AND add an
+  explicit `MgrExtentInfo.sealed: bool` so `sealed=true, sealed_length=0`
+  (authoritative empty seal) is unambiguous (coco flagged the seal-at-0 model
+  ambiguity — empirically inert since such extents are never re-examined as
+  tails, but the explicit bool is the correct model). `already_sealed` +
+  manager-side "is sealed" checks switch to `.sealed`; length-checks (GC empty /
+  EC min-size) stay on sealed_length. Then re-validate + coco + commit.
+
+--- prior (same day): reconcile + alloc fix, committed eaf2e25 ---
+
 Date: 2026-05-30
 TaskStatus: not_completed
 Task scope: continue the seed=13 stuck-recovery / range-wedge bug

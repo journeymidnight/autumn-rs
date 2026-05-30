@@ -1190,7 +1190,19 @@ impl AutumnManager {
             // eversion, or avali. The new-tail allocation below proceeds.
             min_len = Some(tail.sealed_length as u32);
             avali = tail.avali;
-        } else if req.end > 0 {
+        } else if req.authoritative_commit || req.end > 0 {
+            // The writer supplied its OWN all-replica-acked commit on this tail
+            // (`authoritative_commit`, captured at a quiesced point via the
+            // SealCommit handshake), or a non-zero exact commit (legacy
+            // `end > 0`). Seal at EXACTLY `req.end` and do NOT probe — even when
+            // `req.end == 0` (a tail where nothing was ever all-acked). Under
+            // all-replica-ACK every committed member holds >= the writer's
+            // commit, so sealing there never drops acked data; and because we
+            // do not probe, a speculative/un-acked byte that only one
+            // (soon-dead) reachable member holds is NEVER promoted into
+            // sealed_length — the root fix for the F227 phantom seal (seed=13
+            // Mode A). The probe path below is reserved for genuine new-owner
+            // takeover, where the writer has no commit cursor of its own.
             min_len = Some(req.end);
             avali = Self::all_bits(tail.replicates.len() + tail.parity.len());
         } else {

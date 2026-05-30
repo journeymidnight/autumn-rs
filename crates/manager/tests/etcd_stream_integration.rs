@@ -149,6 +149,7 @@ fn stream_manager_with_real_etcd() {
                     owner_key: "owner/etcd/stream/1".to_string(),
                     revision: lock.revision,
                     end: 64,
+                    authoritative_commit: false,
                     exclude_node_ids: vec![],
                 }),
             )

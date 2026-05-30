@@ -161,6 +161,7 @@ fn alloc_extent_falls_back_on_dead_node() {
                     owner_key: "test-fallback".to_string(),
                     revision: sc.revision(),
                     end: 0,
+                    authoritative_commit: false,
                     exclude_node_ids: vec![],
                 }),
             )
