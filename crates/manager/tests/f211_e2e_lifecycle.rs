@@ -287,8 +287,7 @@ fn f211_e2e_fence_triggers_recovery_dispatch() {
                     stream_id,
                     owner_key: sc.owner_key().to_string(),
                     revision: sc.revision(),
-                    end: result.end,
-                    authoritative_commit: false,
+                    seal_commit: Some(result.end),
                     exclude_node_ids: vec![],
                 }),
             )

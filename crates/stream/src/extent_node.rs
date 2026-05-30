@@ -16,6 +16,7 @@ fn mgr_to_local_extent(e: &MgrExtentInfo) -> ExtentInfo {
         eversion: e.eversion,
         refs: e.refs,
         sealed_length: e.sealed_length,
+        sealed: e.sealed,
         avali: e.avali,
         replicate_disks: e.replicate_disks.clone(),
         parity_disks: e.parity_disks.clone(),

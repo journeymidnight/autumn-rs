@@ -247,8 +247,7 @@ fn update_stream_ec_triggers_conversion() {
                     stream_id,
                     owner_key: sc.owner_key().to_string(),
                     revision: sc.revision(),
-                    end: result.end,
-                    authoritative_commit: false,
+                    seal_commit: Some(result.end),
                     exclude_node_ids: vec![],
                 }),
             )

@@ -482,6 +482,13 @@ pub struct ExtentInfo {
     pub eversion: u64,
     pub refs: u64,
     pub sealed_length: u64,
+    /// Mirror of `MgrExtentInfo.sealed`: the authoritative "is this extent
+    /// sealed (immutable)" flag. NOT `sealed_length > 0`, because an
+    /// authoritative empty seal is `sealed = true, sealed_length = 0` (e.g. a
+    /// CoW-shared empty tail frozen by split/merge). `ensure_tail_initialised`
+    /// allocs a fresh tail when this is set, so a child never appends to a
+    /// shared sealed tail. `sealed_length` stays the read-bound.
+    pub sealed: bool,
     pub avali: u32,
     pub replicate_disks: Vec<u64>,
     pub parity_disks: Vec<u64>,

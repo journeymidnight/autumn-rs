@@ -64,8 +64,7 @@ fn seal_during_active_writes_client_retries() {
                     stream_id,
                     owner_key: "test-seal-writer".to_string(),
                     revision: sc.revision(),
-                    end: 0,
-                    authoritative_commit: false,
+                    seal_commit: None,
                     exclude_node_ids: vec![],
                 }),
             )

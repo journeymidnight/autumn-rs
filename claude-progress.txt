@@ -1,3 +1,58 @@
+Date: 2026-05-30 (latest)
+TaskStatus: not_completed
+Task scope: user-steered API/model cleanup of the SealCommit work (commit
+  621c934). Two changes, both validated data-safe: (1) replace the "weird"
+  `StreamAllocExtentReq.end: u32 + authoritative_commit: bool` with a single
+  `seal_commit: Option<u32>` (Some(c)=authoritative seal at exactly c incl 0;
+  None=probe). (2) add an explicit `MgrExtentInfo.sealed: bool` (mirrored to
+  the client `ExtentInfo`) so `sealed=true, sealed_length=0` (authoritative
+  empty seal) is UNAMBIGUOUS — removing the seal-at-0 model ambiguity coco
+  flagged. `sealed` = the STATE ("is sealed"); `sealed_length` = the LENGTH
+  ("how much / is empty"). Invariant: sealed_length > 0 ⇒ sealed.
+
+  CHANGES:
+  - rpc: StreamAllocExtentReq.seal_commit: Option<u32>; MgrExtentInfo.sealed +
+    client ExtentInfo.sealed (mapped in mgr_to_extent_info / mgr_to_local_extent).
+  - manager: `already_sealed = tail.sealed` (was sealed_length>0); seal branch
+    matches req.seal_commit (Some→authoritative, None→probe); sets tail.sealed
+    = true on seal (incl Some(0)). check_commit_length uses ex.sealed. All 6
+    sealed_length= mutations also set sealed=true.
+  - manager COW FIX (coco P1): split/merge seal the shared tail EVEN at commit
+    0 (drop the `&& X > 0` guard) → an empty CoW-shared tail is now frozen
+    (sealed=true, avali set) so both child streams alloc a fresh tail instead
+    of both appending to the same open extent (CoW isolation). 5 sites
+    (compute_duplicate_stream + compute_merge_streams + splice_streams).
+  - client: ensure_tail_initialised + soft-error reload check `.sealed` (alloc
+    fresh on a sealed-empty inherited tail); read_with_layout uses `ex.sealed`
+    for the to-end bound + stale-VP check (sealed-empty reads as empty, no
+    probe). failover passes Some(commit); preemptive roll Some(result.end);
+    init None.
+  - "is-empty/open" checks (recovery dispatch skip, EC advisory skip) correctly
+    KEPT on sealed_length (they mean "no data", not "is sealed").
+
+  coco /findbugs (rule 12) iterated to clean on the actionable items:
+  - FIXED: empty-tail CoW seal; client read-path uses ex.sealed.
+  - OVERRIDDEN w/ repo knowledge: rkyv schema change (MgrExtentInfo +
+    StreamAllocExtentReq) — SAME-COMMIT deploy is this repo's convention
+    (cluster.sh reset wipes etcd + restarts whole cluster; checked decode
+    fails cleanly not UB). Documented, not a rolling-upgrade system.
+  - DEFERRED (pre-existing, not this refactor): EN `.meta` doesn't persist
+    `sealed` — but that's a pre-existing property of manager-metadata-only
+    seal + lazy EN propagation (true for ALL seals); stale appends are
+    eversion-fenced (eversion IS in .meta). Threading `sealed` into the EN
+    `.meta` sidecar is separate future work.
+
+  VALIDATION: f250 invariant + seed=6 x2 + seed=13 x4 + seed=1 + seed=8 =
+    mismatches=0 in ALL 9 (data-safe); seed=13 4/4 PASS this batch (no Mode B
+    hit — variance; Mode B row_stream-append wedge still deferred, NOT data
+    loss). manager 114 + stream 56 + rpc 16 lib tests; clippy clean; fmt clean.
+
+  STILL OPEN: Mode B (P-bulk row_stream all-replica-append stuck on a dead
+  replica → imm-full → partition_loop park → RANGE wedge) — deep F227
+  append-failover work, deferred. NOT data loss.
+
+--- prior (621c934): SealCommit handshake + authoritative_commit ---
+
 Date: 2026-05-30 (later)
 TaskStatus: not_completed
 Task scope: ROOT-fix Mode A phantom seal at the SEAL (prevent it) instead of

@@ -68,8 +68,7 @@ fn extent_recovery_replaces_dead_node() {
                     stream_id,
                     owner_key: sc.owner_key().to_string(),
                     revision: sc.revision(),
-                    end: result.end,
-                    authoritative_commit: false,
+                    seal_commit: Some(result.end),
                     exclude_node_ids: vec![],
                 }),
             )
@@ -194,8 +193,7 @@ fn recovery_dispatch_skips_healthy_sealed_extents() {
                     stream_id,
                     owner_key: sc.owner_key().to_string(),
                     revision: sc.revision(),
-                    end: r.end,
-                    authoritative_commit: false,
+                    seal_commit: Some(r.end),
                     exclude_node_ids: vec![],
                 }),
             )

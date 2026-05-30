@@ -1999,7 +1999,14 @@ impl AutumnManager {
             let mut ex = extent.clone();
             ex.refs += 1;
             ex.eversion += 1;
-            if idx == src.extent_ids.len() - 1 && ex.sealed_length == 0 && sealed_length > 0 {
+            // Seal the shared tail at the split-time commit — EVEN at 0 (an
+            // empty tail): both parent + child CoW-share this extent, so it
+            // MUST be frozen (sealed=true, avali set) or both writers could
+            // append to the same open extent (coco P1 — CoW isolation). A
+            // sealed-empty tail (sealed=true, sealed_length=0) makes each
+            // stream alloc a fresh tail on init instead of sharing this one.
+            if idx == src.extent_ids.len() - 1 && !ex.sealed {
+                ex.sealed = true;
                 ex.sealed_length = sealed_length as u64;
                 ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
             }
@@ -2054,7 +2061,12 @@ impl AutumnManager {
                 .get(&tail_id)
                 .ok_or_else(|| AppError::NotFound(format!("extent {tail_id}")))?;
             let mut ex = extent.clone();
-            if ex.sealed_length == 0 && survivor_sealed > 0 {
+            // Seal the survivor's old tail even at 0 (empty) — it is no longer
+            // the active tail (new_tail follows) + CoW-shared, so it must be
+            // frozen (coco P1, CoW isolation). Push the modified record either
+            // way so the seal persists.
+            if !ex.sealed {
+                ex.sealed = true;
                 ex.sealed_length = survivor_sealed as u64;
                 ex.eversion += 1;
                 ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
@@ -2071,7 +2083,11 @@ impl AutumnManager {
             let mut ex = extent.clone();
             ex.refs += 1;
             ex.eversion += 1;
-            if idx == victim.extent_ids.len() - 1 && ex.sealed_length == 0 && victim_sealed > 0 {
+            // Seal the victim's old tail even at 0 (empty) — CoW-shared after
+            // the merge splices it onto the survivor, so it must be frozen
+            // (coco P1, CoW isolation).
+            if idx == victim.extent_ids.len() - 1 && !ex.sealed {
+                ex.sealed = true;
                 ex.sealed_length = victim_sealed as u64;
                 ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
             }
@@ -2125,7 +2141,12 @@ impl AutumnManager {
                 .get(&tail_id)
                 .ok_or_else(|| AppError::NotFound(format!("extent {tail_id}")))?;
             let mut ex = extent.clone();
-            if ex.sealed_length == 0 && survivor_sealed > 0 {
+            // Seal the survivor's old tail even at 0 (empty) — it is no longer
+            // the active tail (new_tail follows) + CoW-shared, so it must be
+            // frozen (coco P1, CoW isolation). Push the modified record either
+            // way so the seal persists.
+            if !ex.sealed {
+                ex.sealed = true;
                 ex.sealed_length = survivor_sealed as u64;
                 ex.eversion += 1;
                 ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
@@ -2140,7 +2161,11 @@ impl AutumnManager {
             let mut ex = extent.clone();
             ex.refs += 1;
             ex.eversion += 1;
-            if idx == victim.extent_ids.len() - 1 && ex.sealed_length == 0 && victim_sealed > 0 {
+            // Seal the victim's old tail even at 0 (empty) — CoW-shared after
+            // the merge splices it onto the survivor, so it must be frozen
+            // (coco P1, CoW isolation).
+            if idx == victim.extent_ids.len() - 1 && !ex.sealed {
+                ex.sealed = true;
                 ex.sealed_length = victim_sealed as u64;
                 ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
             }
@@ -2754,6 +2779,7 @@ mod tests {
             refs,
             vp_table_refs,
             sealed_length: 0,
+            sealed: false,
             avali: 0,
             replicate_disks: vec![],
             parity_disks: vec![],
@@ -3100,6 +3126,7 @@ mod tests {
             replicate_disks: vec![1],
             parity_disks: vec![],
             sealed_length: sealed,
+            sealed: sealed > 0,
             avali: 1,
             eversion: 0,
             refs,
@@ -3172,6 +3199,7 @@ mod tests {
             replicate_disks: vec![1],
             parity_disks: vec![],
             sealed_length: 0,
+            sealed: false,
             avali: 1,
             eversion: 0,
             refs,
@@ -3535,6 +3563,7 @@ mod tests {
                         refs: 1,
                         vp_table_refs: 0,
                         sealed_length: 0,
+                        sealed: false,
                         avali: 0,
                         replicate_disks: vec![1, 2, 3],
                         parity_disks: vec![],
@@ -3567,8 +3596,7 @@ mod tests {
                 stream_id,
                 owner_key,
                 revision: rev,
-                end: 100,
-                authoritative_commit: false,
+                seal_commit: Some(100),
                 exclude_node_ids: vec![],
             });
             let resp = m.handle_stream_alloc_extent(req).await.unwrap();
@@ -3653,6 +3681,7 @@ mod tests {
                             refs: 1,
                             vp_table_refs: 0,
                             sealed_length: 100,
+                            sealed: true,
                             avali: 1,
                             replicate_disks: vec![],
                             parity_disks: vec![],
@@ -3681,6 +3710,7 @@ mod tests {
                         refs: 1,
                         vp_table_refs: 0,
                         sealed_length: 200,
+                        sealed: true,
                         avali: 1,
                         replicate_disks: vec![],
                         parity_disks: vec![],
@@ -3744,6 +3774,7 @@ mod tests {
                 refs: 1,
                 vp_table_refs: 0,
                 sealed_length: 100_000,
+                sealed: true,
                 avali: 0xF, // all 4 slots available before
                 replicate_disks: vec![10, 11, 12],
                 parity_disks: vec![13],
@@ -3812,6 +3843,7 @@ mod tests {
                 refs: 1,
                 vp_table_refs: 0,
                 sealed_length: 100_000,
+                sealed: true,
                 avali: 0xE, // slot 0 marked unavailable
                 replicate_disks: vec![10, 11, 12],
                 parity_disks: vec![13],
@@ -3861,6 +3893,7 @@ mod tests {
             refs: 1,
             vp_table_refs: 0,
             sealed_length: 100_000,
+            sealed: true,
             avali: 0x7,
             replicate_disks: vec![10, 30, 50],
             parity_disks: vec![],
@@ -4104,6 +4137,7 @@ mod tests {
                             refs: 1,
                             vp_table_refs: 0,
                             sealed_length: 1000,
+                            sealed: true,
                             avali: 0x7,
                             replicate_disks: vec![10, 30, 50],
                             parity_disks: vec![],
@@ -4308,6 +4342,7 @@ mod tests {
                                 refs: 1,
                                 vp_table_refs: 0,
                                 sealed_length: 1000,
+                                sealed: true,
                                 avali: 1,
                                 replicate_disks: vec![10],
                                 parity_disks: vec![],
@@ -4404,6 +4439,7 @@ mod tests {
                                 refs: 1,
                                 vp_table_refs: 0,
                                 sealed_length: 1000,
+                                sealed: true,
                                 avali: 1,
                                 replicate_disks: vec![10],
                                 parity_disks: vec![],
@@ -4508,6 +4544,7 @@ mod tests {
                                 refs: 1,
                                 vp_table_refs: 0,
                                 sealed_length: 1000,
+                                sealed: true,
                                 avali: 1,
                                 replicate_disks: vec![10],
                                 parity_disks: vec![],
@@ -5168,6 +5205,7 @@ mod tests {
                         refs: 1,
                         vp_table_refs: 0,
                         sealed_length: 0,
+                        sealed: false,
                         avali: 0,
                         replicate_disks: vec![],
                         parity_disks: vec![],
@@ -5184,8 +5222,7 @@ mod tests {
                 stream_id,
                 owner_key: owner_key.clone(),
                 revision,
-                end: 100,
-                authoritative_commit: false,
+                seal_commit: Some(100),
                 exclude_node_ids: vec![],
             });
             let resp = m.handle_stream_alloc_extent(req).await.unwrap();
@@ -5245,6 +5282,7 @@ mod tests {
                         refs: 1,
                         vp_table_refs: 0,
                         sealed_length: 0,
+                        sealed: false,
                         avali: 0,
                         replicate_disks: vec![],
                         parity_disks: vec![],
@@ -5269,8 +5307,7 @@ mod tests {
                 stream_id,
                 owner_key: owner_key.clone(),
                 revision,
-                end: 100,
-                authoritative_commit: false,
+                seal_commit: Some(100),
                 exclude_node_ids: vec![],
             });
             let resp = m.handle_stream_alloc_extent(req).await.unwrap();
@@ -5343,6 +5380,7 @@ mod tests {
                             refs: 1,
                             vp_table_refs: 0,
                             sealed_length: 1000,
+                            sealed: true,
                             avali: 0x7,
                             replicate_disks: vec![10, 30, 50],
                             parity_disks: vec![],
@@ -5465,6 +5503,7 @@ mod tests {
                         refs: 1,
                         vp_table_refs: 0,
                         sealed_length: 100,
+                        sealed: true,
                         avali: 1,
                         replicate_disks: vec![],
                         parity_disks: vec![],
@@ -5703,6 +5742,7 @@ mod tests {
                 refs: 1,
                 vp_table_refs: 0,
                 sealed_length: 2_961_566_856,
+                sealed: true,
                 avali: 0x7,
                 replicate_disks: vec![10, 30, 50],
                 parity_disks: vec![],

@@ -160,8 +160,7 @@ fn alloc_extent_falls_back_on_dead_node() {
                     stream_id,
                     owner_key: "test-fallback".to_string(),
                     revision: sc.revision(),
-                    end: 0,
-                    authoritative_commit: false,
+                    seal_commit: None,
                     exclude_node_ids: vec![],
                 }),
             )

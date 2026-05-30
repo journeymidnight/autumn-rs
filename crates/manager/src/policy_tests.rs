@@ -896,6 +896,7 @@ fn mk_extent(state: &mut MetadataState, eid: u64, sealed_length: u64, ec_convert
             refs: 1,
             vp_table_refs: 0,
             sealed_length,
+            sealed: sealed_length > 0,
             avali: if sealed_length > 0 { 1 } else { 0 },
             replicate_disks: vec![2, 4, 6],
             parity_disks: vec![],

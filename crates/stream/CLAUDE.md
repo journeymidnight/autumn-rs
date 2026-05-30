@@ -980,6 +980,41 @@ sufficient (and cheaper than DashMap).
     chunk — never issue a single `length: 0` read against a sealed
     multi-GB extent.**
 
+20. **Failover seal uses the SealCommit handshake — never a public-API-tracked
+    commit (seed=13 Mode A root fix).** On a same-owner failover the writer
+    must seal the failed tail at its OWN all-replica-acked commit, NOT let the
+    manager probe `commit_length` (a probe over reachable members can capture a
+    speculative/un-acked byte that only one soon-dead member holds → seals at a
+    length no replica durably retains → recovery stuck forever = the phantom
+    seal). The only SAFE commit source is the worker's serialized `state.commit`
+    read at a QUIESCED point — a value tracked in the public API lags the worker
+    and races concurrent out-of-order appends (FuturesUnordered) + tail rolls
+    (coco confirmed a real data-loss race in the `result.end` shortcut, twice).
+    Mechanism: `StreamSubmitMsg::SealCommit { resp }` → the worker
+    `drain_inflight_for_seal` (awaits every in-flight append, bounded by each
+    one's `append_fanout_timeout` so it cannot hang) → replies with the final
+    contiguous `state.commit` → sets `sealing = true` (new appends on the
+    about-to-be-sealed tail are rejected with a soft error so they retry onto
+    the fresh tail; cleared by ResetTail). The 3 failover sites call
+    `seal_commit_watermark` then `alloc_new_extent(stream, Some(commit))`;
+    preemptive roll passes `Some(result.end)`; new-owner/sealed-tail init passes
+    `None` (→ manager probes). `StreamAllocExtentReq.seal_commit: Option<u32>`
+    (Some = authoritative seal at exactly c incl 0; None = probe) — NOT a `(u32,
+    bool)` pair. **Invariant: never reintroduce a public-API commit-watermark
+    cache; the seal length must come from the worker via SealCommit.**
+
+21. **`ExtentInfo.sealed` is the authoritative "is sealed" flag — NOT
+    `sealed_length > 0`.** Mirrors `MgrExtentInfo.sealed`. An authoritative
+    empty seal is `sealed = true, sealed_length = 0` (e.g. a CoW-shared empty
+    tail frozen by split/merge so children alloc a fresh tail). `sealed` = the
+    STATE; `sealed_length` = the LENGTH (read-bound / is-empty). `ensure_tail_
+    initialised` + the soft-error reload check `.sealed` (alloc fresh on a
+    sealed-empty inherited tail); `read_with_layout` uses `.sealed` for the
+    to-end bound + stale-VP check (a sealed-empty extent reads as empty, no
+    commit_length probe). The stale-VP read-BOUND checks that compare an offset
+    against `sealed_length` keep using `sealed_length` (it is the length).
+    Invariant: `sealed_length > 0 ⇒ sealed`.
+
 ---
 
 ## RPC Wire Protocol (extent_rpc.rs)

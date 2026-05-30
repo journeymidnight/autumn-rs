@@ -317,8 +317,7 @@ fn stream_manager_alloc_and_truncate_flow() {
                     stream_id,
                     owner_key: "owner/stream/1".to_string(),
                     revision: lock.revision,
-                    end: 128,
-                    authoritative_commit: false,
+                    seal_commit: Some(128),
                     exclude_node_ids: vec![],
                 }),
             )

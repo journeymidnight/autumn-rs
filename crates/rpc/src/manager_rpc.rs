@@ -257,6 +257,15 @@ pub struct MgrExtentInfo {
     /// direct stream membership via `stream.extent_ids`.
     pub vp_table_refs: u64,
     pub sealed_length: u64,
+    /// True once this extent has been SEALED (immutable; no more appends).
+    /// The explicit flag — NOT `sealed_length > 0` — is the authoritative
+    /// "is sealed" signal, because an authoritative failover seal can seal an
+    /// EMPTY tail (`sealed = true, sealed_length = 0`: nothing was ever
+    /// all-replica-acked, so the writer's commit is 0). `sealed_length` remains
+    /// the LENGTH (used for "is empty" / EC-min-size / read-bound checks);
+    /// `sealed` is the STATE. Invariant: `sealed_length > 0 ⇒ sealed`. A fresh
+    /// open extent is `sealed = false`.
+    pub sealed: bool,
     pub avali: u32,
     pub replicate_disks: Vec<u64>,
     pub parity_disks: Vec<u64>,
@@ -498,20 +507,22 @@ pub struct StreamAllocExtentReq {
     pub stream_id: u64,
     pub owner_key: String,
     pub revision: i64,
-    pub end: u32,
-    /// `true` when `end` is the WRITER's own all-replica-acked commit
-    /// (`state.commit`) on the tail being sealed, captured at a QUIESCED point
-    /// via the `SealCommit` worker handshake (in-flight drained first). The
-    /// manager then seals at EXACTLY `end` and does NOT probe replicas — even
-    /// when `end == 0` (a tail where nothing was ever all-acked). This prevents
-    /// the F227 phantom seal: a probe over reachable members can capture a
-    /// speculative/un-acked byte that only one (soon-dead) member holds,
-    /// sealing at a length no replica durably retains (the seed=13 stuck-
-    /// recovery bug). `false` (new-owner takeover / sealed-tail init / legacy
-    /// callers) keeps the probe + seal-over-reachable behaviour. Moot when
-    /// `end > 0` (already authoritative) and when the tail is already sealed
-    /// (the seal is preserved untouched).
-    pub authoritative_commit: bool,
+    /// How to seal the CURRENT tail before allocating the new extent:
+    /// - `Some(c)` — AUTHORITATIVE: seal at EXACTLY `c`, do NOT probe. `c` is
+    ///   the writer's own all-replica-acked commit (`state.commit`) captured at
+    ///   a QUIESCED point via the `SealCommit` worker handshake (in-flight
+    ///   drained first), or a known exact end (preemptive roll). Honoured even
+    ///   for `Some(0)` (an empty tail where nothing was ever all-acked → sealed
+    ///   empty, `sealed = true, sealed_length = 0`). This prevents the F227
+    ///   phantom seal: a probe over reachable members can capture a
+    ///   speculative/un-acked byte that only one (soon-dead) member holds,
+    ///   sealing at a length no replica durably retains (the seed=13 stuck-
+    ///   recovery bug).
+    /// - `None` — PROBE: the writer has no commit cursor of its own (new-owner
+    ///   takeover / sealed-tail init); the manager derives the seal via
+    ///   `compute_commit_seal` (seal-over-reachable). Moot when the tail is
+    ///   already sealed (the existing seal is preserved untouched).
+    pub seal_commit: Option<u32>,
     /// F190: per-stream "recently failed" node ids the writer wants the
     /// manager to skip when picking nodes for the new extent. Empty Vec
     /// means "no exclusions" (legacy / cold-start clients). The manager

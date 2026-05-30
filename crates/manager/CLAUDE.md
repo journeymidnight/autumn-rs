@@ -1478,3 +1478,40 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     Cross-ref: notes 13 (F146 verify-at-apply), 21 (F207 ledger Class A
     refuse-at-start), 28 (F227 lenient seal — the source of the phantom
     `sealed_length` that stalled the recovery).
+
+32. **`MgrExtentInfo.sealed: bool` is the authoritative seal STATE; the failover
+    seal is `StreamAllocExtentReq.seal_commit: Option<u32>` (seed=13 Mode A
+    prevention).** Two coupled cleanups:
+    - **`sealed` bool.** `already_sealed = tail.sealed` (NOT `sealed_length >
+      0`), so an authoritative EMPTY seal (`sealed = true, sealed_length = 0` —
+      a tail where nothing was ever all-acked, or a CoW-shared empty tail) is
+      UNAMBIGUOUS. `sealed` = STATE ("is sealed"); `sealed_length` = LENGTH
+      ("how much / is empty"). Invariant `sealed_length > 0 ⇒ sealed`. EVERY
+      `sealed_length =` mutation also sets `sealed = true` (the alloc seal +
+      all 5 split/merge tail seals). "Is-sealed" reads use `.sealed`
+      (`already_sealed`, `handle_check_commit_length`); "is-empty/no-data"
+      reads (recovery-dispatch skip, EC advisory min-size) KEEP `sealed_length`
+      — they mean "nothing to recover/EC", not "is sealed".
+    - **`seal_commit: Option<u32>`** replaces the `end: u32 + authoritative_
+      commit: bool` pair. `Some(c)` ⇒ AUTHORITATIVE: seal at EXACTLY `c` (even
+      0, no probe) — `c` is the writer's quiesced `state.commit` from the
+      stream-side SealCommit handshake (see `crates/stream/CLAUDE.md` note 20),
+      so a probe never promotes a speculative byte into `sealed_length` (the
+      phantom). `None` ⇒ PROBE via `compute_commit_seal` (genuine new-owner
+      takeover only).
+    - **CoW empty-tail seal (coco P1).** `compute_duplicate_stream` (split) +
+      `compute_merge_streams` / `splice_streams_without_new_tail` (merge) seal
+      the shared old tail EVEN when its captured commit_length is 0 (the
+      `&& *_sealed > 0` guard was DROPPED — now just `!ex.sealed`). An empty
+      CoW-shared tail must be frozen (`sealed = true`, `avali` set) or BOTH
+      child streams' writers would append to the same open extent (CoW
+      isolation break). Sealed-empty ⇒ each child's `ensure_tail_initialised`
+      allocs a fresh tail instead of sharing it.
+    Wire change (`MgrExtentInfo` + `StreamAllocExtentReq`) is SAME-COMMIT deploy
+    (repo convention — `cluster.sh reset` wipes etcd + restarts the whole
+    cluster; no rolling upgrade). Known gap (pre-existing, deferred): the EN
+    `.meta` sidecar does NOT persist `sealed` — but stale appends to a
+    sealed-empty extent are eversion-fenced (eversion IS in `.meta`), same as
+    any seal the EN hasn't been pushed yet. Cross-ref: note 28 (F227 lenient
+    PROBE seal — still used for the `None`/new-owner path), 31 (alloc
+    already-sealed no-tail-rewrite).

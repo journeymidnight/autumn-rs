@@ -1550,8 +1550,7 @@ impl StreamClient {
     async fn alloc_new_extent_once(
         &self,
         stream_id: u64,
-        end: u32,
-        authoritative_commit: bool,
+        seal_commit: Option<u32>,
     ) -> Result<(StreamInfo, ExtentInfo)> {
         // F190: snapshot the per-stream `bad_nodes` set (lazily prunes
         // expired entries). The manager filters its candidate pool by
@@ -1562,8 +1561,7 @@ impl StreamClient {
             stream_id,
             owner_key: self.owner_key.clone(),
             revision: self.revision,
-            end,
-            authoritative_commit,
+            seal_commit,
             exclude_node_ids,
         });
         // 30 s — manager seals current tail (3-replica commit_length
@@ -1599,11 +1597,10 @@ impl StreamClient {
     async fn alloc_new_extent(
         &self,
         stream_id: u64,
-        end: u32,
-        authoritative_commit: bool,
+        seal_commit: Option<u32>,
     ) -> Result<(StreamInfo, ExtentInfo)> {
         self.retry_manager_call("alloc_new_extent", 20, || {
-            self.alloc_new_extent_once(stream_id, end, authoritative_commit)
+            self.alloc_new_extent_once(stream_id, seal_commit)
         })
         .await
     }
@@ -1617,7 +1614,7 @@ impl StreamClient {
     /// truncation). The drain is bounded by each append's
     /// `append_fanout_timeout`, so it cannot hang. Returns the commit (may be
     /// 0 for a tail where nothing was ever all-acked); the caller passes it to
-    /// `alloc_new_extent(.., authoritative_commit = true)` so the manager seals
+    /// `alloc_new_extent(.., Some(commit))` so the manager seals
     /// at EXACTLY this value without probing.
     async fn seal_commit_watermark(
         &self,
@@ -1729,7 +1726,7 @@ impl StreamClient {
                             // beyond it → re-driven onto the new tail). end > 0
                             // ⇒ the manager trusts it without probing.
                             if let Ok((_, new_ext)) =
-                                self.alloc_new_extent(stream_id, result.end, true).await
+                                self.alloc_new_extent(stream_id, Some(result.end)).await
                             {
                                 if let Ok(replica_addrs) =
                                     self.replica_addrs_for_extent(&new_ext).await
@@ -1776,7 +1773,7 @@ impl StreamClient {
                         // worker's TRUE drained commit (no probe → no phantom).
                         let seal_commit = self.seal_commit_watermark(stream_id, &tx).await?;
                         let (_, new_ext) =
-                            self.alloc_new_extent(stream_id, seal_commit, true).await?;
+                            self.alloc_new_extent(stream_id, Some(seal_commit)).await?;
                         let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
                         let replica_node_ids = Self::replica_node_ids_for(&new_ext);
                         let new_tail = StreamTail {
@@ -1796,7 +1793,7 @@ impl StreamClient {
                         tracing::warn!(stream_id, retry, error = %e, "append soft-error, retrying");
                         compio::time::sleep(Duration::from_millis(100)).await;
                         let fresh = self.load_stream_tail(stream_id).await?;
-                        if fresh.extent.sealed_length > 0 {
+                        if fresh.extent.sealed {
                             alloc_count += 1;
                             if alloc_count > MAX_ALLOC_PER_APPEND {
                                 return Err(anyhow!(
@@ -1805,7 +1802,7 @@ impl StreamClient {
                             }
                             let seal_commit = self.seal_commit_watermark(stream_id, &tx).await?;
                             let (_, new_ext) =
-                                self.alloc_new_extent(stream_id, seal_commit, true).await?;
+                                self.alloc_new_extent(stream_id, Some(seal_commit)).await?;
                             let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
                             let replica_node_ids = Self::replica_node_ids_for(&new_ext);
                             let new_tail = StreamTail {
@@ -1836,7 +1833,7 @@ impl StreamClient {
                     }
                     let seal_commit = self.seal_commit_watermark(stream_id, &tx).await?;
                     let (_, new_ext) = self
-                        .alloc_new_extent(stream_id, seal_commit, true)
+                        .alloc_new_extent(stream_id, Some(seal_commit))
                         .await
                         .map_err(|alloc_err| {
                             alloc_err
@@ -1877,12 +1874,12 @@ impl StreamClient {
             return Ok(());
         }
         let tail = self.load_stream_tail(stream_id).await?;
-        let (tail, commit_val) = if tail.extent.sealed_length > 0 {
+        let (tail, commit_val) = if tail.extent.sealed {
             // First-use / new-owner init: the inherited tail is already sealed,
             // so this is NOT a failover seal — we just roll past it. The
             // manager's `already_sealed` short-circuit preserves the existing
-            // seal; `authoritative_commit=false` (no worker commit to claim).
-            let (_, new_ext) = self.alloc_new_extent(stream_id, 0, false).await?;
+            // seal; `seal_commit = None` (no worker commit to claim → probe).
+            let (_, new_ext) = self.alloc_new_extent(stream_id, None).await?;
             let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
             let replica_node_ids = Self::replica_node_ids_for(&new_ext);
             (
@@ -2342,7 +2339,7 @@ impl StreamClient {
         // EC / chunked / stale-VP-offset → let the copy path handle it.
         if ex.ec_converted
             || length > self.config.read_chunk_bytes
-            || (ex.sealed_length > 0 && offset as u64 > ex.sealed_length)
+            || (ex.sealed && offset as u64 > ex.sealed_length)
         {
             return Ok(None);
         }
@@ -2415,7 +2412,7 @@ impl StreamClient {
         // `if start > full_payload.len()` semantics — only fires when
         // the extent has a recorded `sealed_length`, since pre-seal
         // there's no authoritative bound to check against.
-        if ex.sealed_length > 0 && offset as u64 > ex.sealed_length {
+        if ex.sealed && offset as u64 > ex.sealed_length {
             return Err(anyhow::Error::new(StaleVpOffset {
                 extent_id,
                 requested_offset: offset,
@@ -2431,7 +2428,10 @@ impl StreamClient {
         // length=0 ("to end") needs an explicit size: sealed_length for
         // sealed extents, commit_length min-replica for open extents.
         let resolved = if length == 0 {
-            let total_end = if ex.sealed_length > 0 {
+            // A SEALED extent has an authoritative bound = sealed_length (even
+            // 0 — a sealed-empty extent reads to-end as empty, no probe). Only
+            // an OPEN extent needs the min-replica commit_length probe.
+            let total_end = if ex.sealed {
                 ex.sealed_length as u32
             } else {
                 self.commit_length_for_extent(ex).await?
@@ -3171,6 +3171,7 @@ impl StreamClient {
             eversion: e.eversion,
             refs: e.refs,
             sealed_length: e.sealed_length,
+            sealed: e.sealed,
             avali: e.avali,
             replicate_disks: e.replicate_disks.clone(),
             parity_disks: e.parity_disks.clone(),
@@ -3349,8 +3350,7 @@ mod f190_wire_compat_tests {
             stream_id: 42,
             owner_key: "ps/0/partition/3".to_string(),
             revision: 7,
-            end: 0,
-            authoritative_commit: false,
+            seal_commit: None,
             exclude_node_ids: Vec::new(),
         };
         let bytes = rkyv_encode(&req);
@@ -3358,7 +3358,7 @@ mod f190_wire_compat_tests {
         assert_eq!(back.stream_id, 42);
         assert_eq!(back.owner_key, "ps/0/partition/3");
         assert_eq!(back.revision, 7);
-        assert_eq!(back.end, 0);
+        assert_eq!(back.seal_commit, None);
         assert!(back.exclude_node_ids.is_empty());
     }
 
@@ -3368,12 +3368,12 @@ mod f190_wire_compat_tests {
             stream_id: 1,
             owner_key: String::new(),
             revision: 0,
-            end: 1024,
-            authoritative_commit: false,
+            seal_commit: Some(1024),
             exclude_node_ids: vec![3, 5, 9101],
         };
         let bytes = rkyv_encode(&req);
         let back: StreamAllocExtentReq = rkyv_decode(&bytes).expect("decode");
+        assert_eq!(back.seal_commit, Some(1024));
         assert_eq!(back.exclude_node_ids, vec![3, 5, 9101]);
     }
 }

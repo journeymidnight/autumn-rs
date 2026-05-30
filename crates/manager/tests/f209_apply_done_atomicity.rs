@@ -36,6 +36,7 @@ fn make_pre_ec_extent(extent_id: u64) -> MgrExtentInfo {
         refs: 1,
         vp_table_refs: 0,
         sealed_length: 4096,
+        sealed: true,
         avali: 0x7,
         replicate_disks: vec![10, 30, 50],
         parity_disks: vec![],

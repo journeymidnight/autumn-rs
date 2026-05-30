@@ -607,6 +607,7 @@ impl AutumnManager {
             refs: 1,
             vp_table_refs: 0,
             sealed_length: 0,
+            sealed: false,
             avali: 0,
             replicate_disks: disk_ids,
             parity_disks: vec![],
@@ -943,7 +944,9 @@ impl AutumnManager {
             (stream, ex, s.nodes.clone())
         };
 
-        if ex.sealed_length > 0 {
+        if ex.sealed {
+            // Sealed extent (possibly empty: sealed_length may be 0) → its
+            // committed length is fixed at sealed_length, no probe needed.
             return Ok(rkyv_encode(&CheckCommitLengthResp {
                 code: CODE_OK,
                 message: String::new(),
@@ -1102,7 +1105,7 @@ impl AutumnManager {
             // 60s+) blocked new-extent allocation indefinitely, freezing the
             // write / flush / range paths even though the new extent lands on
             // entirely different, healthy nodes.
-            if tail.sealed_length == 0 {
+            if !tail.sealed {
                 if let Some(op) = self.extent_inflight_op(tail_id) {
                     let msg = format!(
                         "extent {tail_id} has in-flight {op:?}; \
@@ -1179,7 +1182,7 @@ impl AutumnManager {
         // `alloc_new_extent(stream_id, 0)` to obtain a fresh tail. We
         // honor the "allocate a new tail" intent while preserving the
         // existing seal point.
-        let already_sealed = tail.sealed_length > 0;
+        let already_sealed = tail.sealed;
 
         // Assigned exactly once on every branch below (deferred init — no dead
         // default, no `mut` needed).
@@ -1190,24 +1193,24 @@ impl AutumnManager {
             // eversion, or avali. The new-tail allocation below proceeds.
             min_len = Some(tail.sealed_length as u32);
             avali = tail.avali;
-        } else if req.authoritative_commit || req.end > 0 {
-            // The writer supplied its OWN all-replica-acked commit on this tail
-            // (`authoritative_commit`, captured at a quiesced point via the
-            // SealCommit handshake), or a non-zero exact commit (legacy
-            // `end > 0`). Seal at EXACTLY `req.end` and do NOT probe — even when
-            // `req.end == 0` (a tail where nothing was ever all-acked). Under
+        } else if let Some(c) = req.seal_commit {
+            // AUTHORITATIVE: the writer supplied its OWN all-replica-acked
+            // commit on this tail (captured at a quiesced point via the
+            // SealCommit handshake), or a known exact end (preemptive roll).
+            // Seal at EXACTLY `c` and do NOT probe — even when `c == 0` (a tail
+            // where nothing was ever all-acked → sealed empty). Under
             // all-replica-ACK every committed member holds >= the writer's
             // commit, so sealing there never drops acked data; and because we
             // do not probe, a speculative/un-acked byte that only one
             // (soon-dead) reachable member holds is NEVER promoted into
             // sealed_length — the root fix for the F227 phantom seal (seed=13
-            // Mode A). The probe path below is reserved for genuine new-owner
-            // takeover, where the writer has no commit cursor of its own.
-            min_len = Some(req.end);
+            // Mode A). The probe path below (`None`) is reserved for genuine
+            // new-owner takeover, where the writer has no commit cursor.
+            min_len = Some(c);
             avali = Self::all_bits(tail.replicates.len() + tail.parity.len());
         } else {
-            // F227: WAS-faithful failover seal (the writer did not supply a
-            // known commit via `req.end`, so this owner must derive it).
+            // PROBE (`req.seal_commit == None`): WAS-faithful failover seal (the
+            // writer did not supply a known commit, so this owner must derive it).
             // commit length = `min` over COMMITTED members only. The append
             // path is all-replica-ACK, so every committed member holds >=
             // the acked length; min over them is therefore >= acked and
@@ -1291,6 +1294,7 @@ impl AutumnManager {
             }
         };
         if !already_sealed {
+            tail.sealed = true;
             tail.sealed_length = sealed_len as u64;
             tail.eversion += 1;
             tail.avali = avali;
@@ -1365,6 +1369,7 @@ impl AutumnManager {
             refs: 1,
             vp_table_refs: 0,
             sealed_length: 0,
+            sealed: false,
             avali: 0,
             replicate_disks: disk_ids[..data].to_vec(),
             parity_disks: disk_ids[data..].to_vec(),
@@ -2327,6 +2332,7 @@ impl AutumnManager {
                     replicate_disks: vec![0u64; selected.len()],
                     parity_disks: vec![],
                     sealed_length: 0,
+                    sealed: false,
                     avali: 0,
                     eversion: 1,
                     refs: 1,

@@ -167,8 +167,7 @@ fn ec_2_1_failover_and_recovery() {
                     stream_id,
                     owner_key: client.owner_key().to_string(),
                     revision: client.revision(),
-                    end: result.end,
-                    authoritative_commit: false,
+                    seal_commit: Some(result.end),
                     exclude_node_ids: vec![],
                 }),
             )
