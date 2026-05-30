@@ -36,20 +36,28 @@ Task scope: Start the FIX session for the chaos-found F227-area bugs, with coco
   open-tail branch retries current_commit 3×300ms then SEAL-AND-ROLLs via
   alloc_new_extent(None). coco clean; chaos seed=15 x4 PASS, seal-roll escape
   FIRED on 2 (recovered, mismatches=0), does NOT introduce bug#2.
-  STEP 5 (BUG#2) = ROOT-CAUSE HYPOTHESIS PINNED (by code read), fix is
-  F227-SENSITIVE → awaiting user decision. The failing extent is SEALED-EMPTY
-  (sealed=true, sealed_length=0) with SST data. compute_commit_seal
-  (rpc_handlers.rs:859) seals at MIN over reachable committed members; F227
-  assumes min ≥ acked, but a REACHABLE-BUT-SHORT member (kill+restart, or a
-  member regressed below acked) drags min DOWN to its short length (possibly 0)
-  → under-seals a data-bearing extent → bug#2. EC-convert + split CoW + apply_
-  ec_conversion_done all PRESERVE sealed_length (verified, ruled out). Candidate
-  fix: compute_commit_seal MIN→MAX over reachable (never under-seals: max ≥
-  acked, max-holder is reachable so recoverable; over-seal = F227-acceptable
-  phantom/data-gain, aligns with uncertain-write semantics). This ALSO makes
-  BUG#1's seal-and-roll safe. CHANGES F227 seal semantics (user owns
-  seal-over-reachable) → presenting for decision + offering trace-verify first.
-  not_completed.
+  STEP 5 (BUG#2) = ROOT CAUSE CORRECTED by coco arch (my under-seal hypothesis
+  was WRONG; user pushed back + asked for coco arch). It is NOT under-seal —
+  compute_commit_seal min→MAX would be HARMFUL (promotes un-acked speculative
+  bytes to committed; Kafka ISR HW = min, never max). REAL CAUSE = GHOST-WRITE-
+  AFTER-SEAL: an extent is LEGITIMATELY sealed-empty (normal roll/failover seal
+  of an empty tail), then a STALE writer keeps appending into it because the
+  seal/fence isn't propagated to the EN + the old StreamClient isn't
+  invalidated. EN append checks only LOCAL atomics (extent_node.rs 1505/1544/
+  1567); req.eversion==local + commit==0 + file_start==0 bypasses the sealed-
+  check AND the file_start>commit manager-query defense → ghost bytes at
+  offset>0 → published as TableMeta/VP → split child opens → stale_vp_offset.
+  CONCRETE row_stream path (seed=31): P-bulk's RowAppend branch (lib.rs:7093)
+  does NOT consume the split need_invalidate_row_stream flag (only the Flush
+  branch does, 7085) → a compaction row-append after split writes ghost SST to
+  the stale sealed-empty row extent. CONFIRMED by code read. log_stream path
+  (seed=8): old P-log/PS appends VP before learning the seal. P0-C/A/B do NOT
+  close this (they fix restart-ghost, not runtime ghost-write-after-seal).
+  FIX DIRECTION (coco, NOT compute_commit_seal): (a) P-bulk RowAppend consumes
+  the split invalidation; (b) seal/fence propagation to EN OR epoch-in-append
+  the EN enforces; (c) validate referenced extent epoch/seal before meta
+  checkpoint. coco recommends a trace to confirm first. AWAITING user direction
+  on the fix. not_completed.
 
 === STEP 1 — P0-C: persist sealed-empty extent state in EN .meta (DONE) ===
   Bug: EN .meta only stored sealed_length, so a manager sealed-EMPTY extent
