@@ -1,3 +1,59 @@
+Date: 2026-05-30 (DEFERRED MUST-FIX BATCH — coco-prioritized; Item 1 of 4 DONE)
+TaskStatus: completed
+Task scope: User: "和 coco 合作挑选必修的,然后逐一修复". coco arch ranked the 5
+  deferred F227-area items → 4 MUST-FIX (Item 4 Mode-B fail-fast = P3 skip):
+    1. owner_revision durable fence (P0)        ← THIS ENTRY (done)
+    2. partition reopen-overlap double-write (P0, low-exposure)
+    3. alloc metadata not-etcd-CAS (P1)
+    4. flush barrier all-replica wedge (P1)
+  Fixing one-by-one. Items 2/3/4 still TODO.
+
+=== ITEM 1 — owner_revision durable fence (P0-B-followup) — DONE ===
+  ROOT CAUSE: EN bumped owner_revision in memory, wrote data, then best-effort
+  save_meta AFTER the write + ACKed even on persist failure (the prior "safe
+  form"). Crash/failure in that window → fence non-durable → restart reads
+  old/0 revision from .meta → stale lower owner re-passes the fence →
+  split-brain / acked-data overwrite. owner_revision (.meta bytes 32-40, the
+  write fence, raised ONLY by the append path, monotonic, value from manager
+  owner-lock) is INDEPENDENT of eversion (bytes 24-32, seal/EC version) — kept
+  separate (user-confirmed).
+  FIX (crates/stream/src/extent_node.rs, BOTH append paths):
+   - in-memory bar raised SYNCHRONOUSLY (owner_revision.fetch_max(R), before any
+     await) → stale lower owner rejected immediately even while persisting.
+   - NEW ExtentEntry.durable_owner_revision = revision known durable in .meta;
+     ensure_fence_durable(id,entry,R) gates the ACK (Ok iff durable>=R, else
+     persist under meta_write_lock + advance durable). Fail-closed: persist
+     failure → reject CODE_PRECONDITION + mark disk offline. Fast path = 1
+     atomic load (only revision-change pays the lock+fsync — rare, not hot).
+   - after the durable await, RE-CHECK owner_revision (higher owner took over →
+     LockedByOther) AND sealed/sealed_length/avali (concurrent seal during the
+     await → CODE_PRECONDITION, mirrors F147-B).
+   - .meta durability: NEW per-extent meta_write_lock (DISTINCT from the EC
+     op-lock — EC/re_avali hold op-lock + call save_meta, reuse would
+     self-deadlock). ALL .meta writers go through it + read LIVE atomics under
+     it (no stale-snapshot clobber of a concurrent seal). write_meta_locked
+     writes ATOMICALLY: temp .meta.tmp → fsync → rename → fsync parent dir.
+  coco /findbugs (rule 12, GPT-5.5): 4 rounds. R1 bar-timing (widened the stale
+  window) → fixed (durable high-water + sync bar). R2 .meta stale-snapshot
+  clobber → fixed (meta_write_lock + live read). R3 post-await no owner re-check
+  + rename no dir-fsync → fixed. R3' post-await no sealed re-check → fixed. R4
+  "breaks extent.len reservation invariant" → REJECTED as FALSE POSITIVE: the
+  final file_start load → reservation store (extent_node.rs:1789) span has NO
+  await; my fence await is BEFORE the load (same as the pre-existing
+  eversion-fetch/commit-reconcile awaits); per-conn prologues are awaited
+  sequentially. Empirically confirmed by chaos mismatches=0 under heavy
+  concurrent append.
+  VALIDATION: chaos 8/8 PASS (seed 2,8x3,6,31,13) — mismatches=0 not_found=0
+  stale_vp=0 range_err=0 fence_persist_fail=0 part_thread_failed=0. seed=2
+  proves the dir-fsync works at runtime (compio opens+fsyncs a dir). autumn-
+  stream 65 lib tests; clippy clean. Memory: project_coco_p0_durability_batch
+  (P0-B-followup now DONE).
+  RESIDUAL (none material): CRC-mismatch-on-load still defaults owner_revision=0
+  (fail-open), but atomic temp+rename means a torn .meta no longer occurs, so
+  only real bit-rot triggers it — separate hardening if ever needed.
+
+--- prior (same session) ---
+
 Date: 2026-05-30 (BUG#2 ROOT-CAUSED + FIXED via writer-side trace)
 TaskStatus: completed
 Task scope: STEP 5 (BUG#2) — split child un-openable / stale_vp_offset_past_

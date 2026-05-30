@@ -770,7 +770,20 @@ pub(crate) struct ExtentEntry {
     /// the V2 `.meta` sidecar. Invariant: `sealed_length > 0 ⇒ sealed`.
     pub(crate) sealed: AtomicBool,
     pub(crate) avali: AtomicU32,
+    /// In-memory fencing bar: appends with `revision < owner_revision` are
+    /// rejected (CODE_LOCKED_BY_OTHER). Raised SYNCHRONOUSLY (monotonic
+    /// `fetch_max`) the instant a higher revision arrives, so a stale lower
+    /// owner is locked out immediately — even while the new fence is still
+    /// being persisted.
     pub(crate) owner_revision: AtomicI64,
+    /// P0-B: the owner_revision value KNOWN TO BE DURABLE in the `.meta`
+    /// sidecar. `owner_revision` (the in-memory bar) may be ahead of this while
+    /// a persist is in flight. An append at revision R may be ACKed only once
+    /// `durable_owner_revision >= R` — otherwise a crash after the ACK but
+    /// before the persist would let a stale lower owner re-pass the on-disk
+    /// fence on restart (split-brain). Kept ≤ `owner_revision`; advanced only
+    /// inside the per-extent meta-write critical section AFTER `.meta` fsync.
+    pub(crate) durable_owner_revision: AtomicI64,
     /// Which disk this extent lives on. Used to resolve file paths.
     pub(crate) disk_id: u64,
     /// F178 Phase 1: per-extent fsync coalescer state.
@@ -979,6 +992,15 @@ pub struct ExtentNode {
     /// extents that ever ran a mutating op on this shard. Use
     /// `get_or_create_extent_op_lock` to look up / create.
     ec_conversion_locks: Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>>,
+    /// P0-B: per-extent `.meta`-write critical section. EVERY `.meta` writer
+    /// (save_meta from seal / EC commit / recovery / re_avali, and the
+    /// owner_revision fence persist) acquires this so writers serialise and
+    /// each reads the LIVE atomics just before writing — closing the
+    /// last-writer-wins clobber where a fence persist with a stale snapshot
+    /// would overwrite a concurrent seal's `.meta`. DISTINCT from
+    /// `ec_conversion_locks` (the op-lock): EC commit / re_avali hold the
+    /// op-lock and call `save_meta`, so reusing it would self-deadlock.
+    meta_locks: Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>>,
     /// F194 → F196 D-r7: per-shard `ConcurrencyController` hosting both
     /// the EC-convert and recovery concurrency caps. Renamed from the
     /// two separate `ExtentNodeGate` fields (`ec_convert_gate` +
@@ -1004,6 +1026,7 @@ impl Clone for ExtentNode {
             shard_count: self.shard_count,
             sibling_addrs: self.sibling_addrs.clone(),
             ec_conversion_locks: self.ec_conversion_locks.clone(),
+            meta_locks: self.meta_locks.clone(),
             concurrency_ctrl: self.concurrency_ctrl.clone(),
             inflight_cap: self.inflight_cap,
         }
@@ -1580,11 +1603,84 @@ async fn build_append_future(
             .collect();
         return Box::pin(async move { out });
     }
-    let revision_changed = first.revision > owner_revision;
-    if revision_changed {
+    // 3b. P0-B durable fence. Two coupled guarantees:
+    //   (i) raise the in-memory bar SYNCHRONOUSLY (monotonic fetch_max) so a
+    //       stale lower owner is rejected immediately — even while the new
+    //       fence is still being persisted (closes the window where the old
+    //       owner could slip a write through during the persist await);
+    //   (ii) the fence must be DURABLE on disk (durable_owner_revision >= R)
+    //        BEFORE we ACK any data under it — else a crash after the ACK but
+    //        before the persist lets the stale lower owner re-pass the on-disk
+    //        fence on restart (split-brain / acked-data overwrite).
+    // `ensure_fence_durable` fast-paths to one atomic load when already durable
+    // (the steady state), and only locks+persists when a higher revision first
+    // arrives. Fail-closed: a persist failure rejects this append (the writer
+    // re-fences); we never ACK a write whose fence isn't durable.
+    let fence_extent_id = first.extent_id;
+    let first_revision = first.revision;
+    if first_revision > owner_revision {
         extent
             .owner_revision
-            .store(first.revision, Ordering::SeqCst);
+            .fetch_max(first_revision, Ordering::SeqCst);
+    }
+    if let Err(e) = node
+        .ensure_fence_durable(fence_extent_id, &extent, first_revision)
+        .await
+    {
+        node.mark_disk_offline_for_extent(fence_extent_id);
+        tracing::error!(
+            extent_id = fence_extent_id,
+            error = %e,
+            "P0-B: durable fence persist failed — rejecting append (fail-closed)"
+        );
+        let resp_payload = AppendResp {
+            code: CODE_PRECONDITION,
+            offset: 0,
+            end: 0,
+        }
+        .encode();
+        let out: Vec<Bytes> = slots
+            .into_iter()
+            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
+            .collect();
+        return Box::pin(async move { out });
+    }
+    // P0-B: re-check fencing AFTER the (possibly awaiting) durable step. The
+    // `ensure_fence_durable` await is a new yield point; during it a concurrent
+    // task may have (a) taken over with a HIGHER owner_revision, or (b) SEALED
+    // this extent (seal/EC/re_avali bumps eversion + sets sealed). Owner
+    // takeover → LockedByOther; a fresh seal → CODE_PRECONDITION (mirrors the
+    // F147-B post-truncate seal recheck) so we never ghost-write past a seal
+    // landed during our await. (owner_revision and sealed are CHECKED
+    // SEPARATELY — they are independent concerns: fencing vs seal state.)
+    if first_revision < extent.owner_revision.load(Ordering::SeqCst) {
+        let resp_payload = AppendResp {
+            code: CODE_LOCKED_BY_OTHER,
+            offset: 0,
+            end: 0,
+        }
+        .encode();
+        let out: Vec<Bytes> = slots
+            .into_iter()
+            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
+            .collect();
+        return Box::pin(async move { out });
+    }
+    if extent.sealed.load(Ordering::SeqCst)
+        || extent.sealed_length.load(Ordering::SeqCst) > 0
+        || extent.avali.load(Ordering::SeqCst) > 0
+    {
+        let resp_payload = AppendResp {
+            code: CODE_PRECONDITION,
+            offset: 0,
+            end: 0,
+        }
+        .encode();
+        let out: Vec<Bytes> = slots
+            .into_iter()
+            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
+            .collect();
+        return Box::pin(async move { out });
     }
 
     // 4. Commit reconciliation.
@@ -1754,27 +1850,10 @@ async fn build_append_future(
                 .record(n as u64, total_payload as u64, write_elapsed_ns);
         });
 
-        if revision_changed {
-            // P0-B (safe form): persist the bumped owner_revision (fencing
-            // token). On failure, mark the disk offline so the manager
-            // re-replicates this extent with the correct metadata — a strict
-            // improvement over the prior silent `let _ =` swallow, which left a
-            // non-durable fence with NO recovery signal. We still ACK here: the
-            // DATA is already durable, and triggering recovery covers the
-            // fence-durability gap. NOTE: the fully-fenced "refuse ACK until the
-            // fence is durable" version needs a per-extent durability lock to be
-            // concurrency-correct (a naive eager-persist races a concurrent
-            // same-revision append + a rollback-on-failure) — deferred to a
-            // focused follow-up (see claude-progress.txt P0-B-followup).
-            if let Err(e) = node.save_meta(extent_id, &extent_for_io).await {
-                tracing::error!(
-                    extent_id,
-                    error = %e,
-                    "P0-B: save_meta of bumped owner_revision failed — disk OFFLINE (recovery will re-replicate)",
-                );
-                node.mark_disk_offline_for_extent(extent_id);
-            }
-        }
+        // P0-B: the owner_revision fence is now persisted durably in the
+        // prologue (under the per-extent op lock) BEFORE this write future runs,
+        // so there is no post-write save_meta here. The data write above is
+        // durable via the coalescer; the fence was durable before we got here.
 
         req_ids
             .into_iter()
@@ -2021,6 +2100,7 @@ impl ExtentNode {
             shard_count: config.shard_count,
             sibling_addrs: Rc::new(config.sibling_addrs),
             ec_conversion_locks: Rc::new(RefCell::new(HashMap::new())),
+            meta_locks: Rc::new(RefCell::new(HashMap::new())),
             // F195: parallelism comes from `ExtentNodeConfig`. CLI flag
             // → builder → here. No env read.
             concurrency_ctrl: ConcurrencyController::new(
@@ -2299,7 +2379,38 @@ impl ExtentNode {
         }
     }
 
+    /// P0-B: per-extent `.meta`-write critical section. Every `.meta` writer
+    /// acquires this so writes serialise AND each reads the live atomics just
+    /// before writing — see the `meta_locks` field doc.
+    fn meta_write_lock(&self, extent_id: u64) -> Rc<futures::lock::Mutex<()>> {
+        self.meta_locks
+            .borrow_mut()
+            .entry(extent_id)
+            .or_insert_with(|| Rc::new(futures::lock::Mutex::new(())))
+            .clone()
+    }
+
     pub(crate) async fn save_meta(
+        &self,
+        extent_id: u64,
+        entry: &ExtentEntry,
+    ) -> Result<(), String> {
+        let lock = self.meta_write_lock(extent_id);
+        let _g = lock.lock().await;
+        self.write_meta_locked(extent_id, entry).await
+    }
+
+    /// Persist the V2 `.meta` sidecar from the entry's LIVE atomics, then
+    /// advance `durable_owner_revision` to the persisted `owner_revision`.
+    ///
+    /// **The caller MUST hold this extent's `meta_write_lock`.** Reading the
+    /// atomics + writing the file as ONE critical section is load-bearing: it
+    /// stops a stale-snapshot writer (e.g. an owner_revision fence persist)
+    /// from clobbering a concurrent seal's `.meta`, and serialises the temp
+    /// rename. The write is atomic (temp + fsync + rename) so a crash leaves
+    /// EITHER the old valid record OR the new one — never a torn `.meta` that
+    /// `parse_meta` would discard back to `owner_revision = 0` (fail-open).
+    async fn write_meta_locked(
         &self,
         extent_id: u64,
         entry: &ExtentEntry,
@@ -2308,9 +2419,7 @@ impl ExtentNode {
         let eversion = entry.eversion.load(Ordering::SeqCst);
         let owner_revision = entry.owner_revision.load(Ordering::SeqCst);
         // P0-C: persist the explicit sealed flag + runtime avali mask. Enforce
-        // the invariant `sealed_length > 0 ⇒ sealed` at write time so a torn
-        // caller that set a length without the flag can't persist an
-        // inconsistent "long but unsealed" record.
+        // `sealed_length > 0 ⇒ sealed` at write time.
         let sealed = entry.sealed.load(Ordering::SeqCst) || sealed_length > 0;
         let avali = entry.avali.load(Ordering::SeqCst);
 
@@ -2327,33 +2436,80 @@ impl ExtentNode {
         let crc = crc32c::crc32c(&buf[0..Self::META_SIZE_V2 - 4]);
         buf[48..52].copy_from_slice(&crc.to_le_bytes());
 
-        // F159: open + write + fsync. Pre-F159 the helper used
-        // `compio::fs::write` which buffers via the page cache without
-        // calling fsync; the .meta could remain in cache for an
-        // unbounded time and be lost on a host crash. The most acute
-        // failure mode was `apply_extent_meta_durable` writing the new
-        // sealed_length to .meta before fsync'ing .dat — the .meta then
-        // landed on disk via OS background flush, but the must_sync=false
-        // bytes still in .dat's page cache were lost. On restart,
-        // parse_meta returned the new sealed_length while file size of
-        // .dat was shorter, so reads past the durable extent.len returned
-        // EOF or zero-padded bytes. F159 makes save_meta itself durable
-        // and reorders apply_extent_meta_durable to fsync .dat first.
+        // F159: the .meta must be durable, not just in the page cache.
+        // `apply_extent_meta_durable` fsyncs .dat FIRST so a crash can't leave a
+        // persisted sealed_length longer than the durable .dat. P0-B: write
+        // atomically (temp + fsync + rename) — a fixed `.tmp` name is safe
+        // because the caller holds this extent's `meta_write_lock`.
         let disk = self.disk_for(entry.disk_id)?;
         let path = disk.meta_path(extent_id);
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp_path = std::path::PathBuf::from(tmp);
         let mut f = compio::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
-            .open(&path)
+            .open(&tmp_path)
             .await
-            .map_err(|e| format!("open meta for extent {extent_id}: {e}"))?;
+            .map_err(|e| format!("open meta tmp for extent {extent_id}: {e}"))?;
         let BufResult(result, _) = f.write_all_at(buf.to_vec(), 0).await;
-        result.map_err(|e| format!("save meta for extent {extent_id}: {e}"))?;
+        result.map_err(|e| format!("write meta tmp for extent {extent_id}: {e}"))?;
         f.sync_data()
             .await
-            .map_err(|e| format!("sync meta for extent {extent_id}: {e}"))?;
+            .map_err(|e| format!("sync meta tmp for extent {extent_id}: {e}"))?;
+        drop(f);
+        compio::fs::rename(&tmp_path, &path)
+            .await
+            .map_err(|e| format!("rename meta for extent {extent_id}: {e}"))?;
+
+        // P0-B: fsync the PARENT DIRECTORY so the rename (the directory-entry
+        // update that swaps tmp → .meta) is itself durable. fsync of the tmp
+        // file only makes its CONTENT durable; without the dir fsync a host
+        // crash could lose the rename and leave the OLD `.meta` on disk — the
+        // ACKed fence would then silently regress on restart, re-opening the
+        // exact split-brain window this guarantee closes.
+        if let Some(dir) = path.parent() {
+            let d = compio::fs::File::open(dir)
+                .await
+                .map_err(|e| format!("open meta dir for extent {extent_id}: {e}"))?;
+            d.sync_all()
+                .await
+                .map_err(|e| format!("fsync meta dir for extent {extent_id}: {e}"))?;
+        }
+
+        // The on-disk fence is now durable at `owner_revision`; advance the
+        // durable high-water so appends gated on it (P0-B) can proceed.
+        entry
+            .durable_owner_revision
+            .fetch_max(owner_revision, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// P0-B: ensure the owner_revision fence is DURABLE at `>= required` before
+    /// the caller ACKs an append at that revision. The caller has already
+    /// raised the in-memory bar (`owner_revision.fetch_max(required)`) so a
+    /// stale lower owner is rejected immediately; this makes the bar durable.
+    /// Fast path = one atomic load (already durable). Else acquire the
+    /// meta-write lock, re-check (a concurrent writer may have persisted it
+    /// while we waited), and persist the live state. Fail-closed: a persist
+    /// failure returns Err so the caller rejects the append (never ACK a write
+    /// whose fence isn't durable).
+    async fn ensure_fence_durable(
+        &self,
+        extent_id: u64,
+        entry: &ExtentEntry,
+        required: i64,
+    ) -> Result<(), String> {
+        if entry.durable_owner_revision.load(Ordering::SeqCst) >= required {
+            return Ok(());
+        }
+        let lock = self.meta_write_lock(extent_id);
+        let _g = lock.lock().await;
+        if entry.durable_owner_revision.load(Ordering::SeqCst) >= required {
+            return Ok(());
+        }
+        self.write_meta_locked(extent_id, entry).await
     }
 
     fn parse_meta(buf: &[u8], extent_id: u64) -> Option<LocalExtentMeta> {
@@ -2513,6 +2669,10 @@ impl ExtentNode {
                         sealed: AtomicBool::new(meta.sealed),
                         avali: AtomicU32::new(meta.avali),
                         owner_revision: AtomicI64::new(meta.owner_revision),
+                        // P0-B: the persisted fence IS durable on load (it came
+                        // from the `.meta` we just parsed), so the in-memory bar
+                        // and the durable high-water start equal.
+                        durable_owner_revision: AtomicI64::new(meta.owner_revision),
                         disk_id: disk.disk_id,
                         coalescer: Coalescer::new(len),
                     }),
@@ -2904,6 +3064,7 @@ impl ExtentNode {
                 sealed: AtomicBool::new(false),
                 avali: AtomicU32::new(0),
                 owner_revision: AtomicI64::new(0),
+                durable_owner_revision: AtomicI64::new(0),
                 disk_id,
                 coalescer: Coalescer::new(len),
             }),
@@ -4052,9 +4213,53 @@ impl ExtentNode {
             }
             .encode());
         }
-        let revision_changed = req.revision > owner_revision;
-        if revision_changed {
-            extent.owner_revision.store(req.revision, Ordering::SeqCst);
+        // P0-B durable fence (same as build_append_future): raise the in-memory
+        // bar synchronously, then require the fence to be DURABLE before we ACK.
+        // Fail-closed on persist error. See build_append_future / ensure_fence_durable.
+        if req.revision > owner_revision {
+            extent
+                .owner_revision
+                .fetch_max(req.revision, Ordering::SeqCst);
+        }
+        if let Err(e) = self
+            .ensure_fence_durable(req.extent_id, &extent, req.revision)
+            .await
+        {
+            self.mark_disk_offline_for_extent(req.extent_id);
+            tracing::error!(
+                extent_id = req.extent_id,
+                error = %e,
+                "P0-B: durable fence persist failed — rejecting append (fail-closed)"
+            );
+            return Ok(AppendResp {
+                code: CODE_PRECONDITION,
+                offset: 0,
+                end: 0,
+            }
+            .encode());
+        }
+        // P0-B: re-check fencing after the (possibly awaiting) durable step —
+        // a higher revision may have taken over (LockedByOther), or a concurrent
+        // seal/EC may have SEALED the extent during the await (CODE_PRECONDITION,
+        // mirrors F147-B). owner_revision and sealed are checked SEPARATELY.
+        if req.revision < extent.owner_revision.load(Ordering::SeqCst) {
+            return Ok(AppendResp {
+                code: CODE_LOCKED_BY_OTHER,
+                offset: 0,
+                end: 0,
+            }
+            .encode());
+        }
+        if extent.sealed.load(Ordering::SeqCst)
+            || extent.sealed_length.load(Ordering::SeqCst) > 0
+            || extent.avali.load(Ordering::SeqCst) > 0
+        {
+            return Ok(AppendResp {
+                code: CODE_PRECONDITION,
+                offset: 0,
+                end: 0,
+            }
+            .encode());
         }
 
         let mut start = extent.len.load(Ordering::SeqCst);
@@ -4158,20 +4363,9 @@ impl ExtentNode {
 
         extent.len.store(end, Ordering::SeqCst);
 
-        if revision_changed {
-            // P0-B (safe form): persist the bumped owner_revision; on failure
-            // mark the disk offline for recovery (strict improvement over the
-            // prior silent swallow). Fully-fenced-before-ACK is deferred to the
-            // per-extent-lock follow-up — see build_append_future.
-            if let Err(e) = self.save_meta(req.extent_id, &extent).await {
-                tracing::error!(
-                    extent_id = req.extent_id,
-                    error = %e,
-                    "P0-B: save_meta of bumped owner_revision failed — disk OFFLINE (recovery will re-replicate)",
-                );
-                self.mark_disk_offline_for_extent(req.extent_id);
-            }
-        }
+        // P0-B: the owner_revision fence was persisted durably in the prologue
+        // (under the per-extent op lock) before this write — no post-write
+        // save_meta. Data is durable via the coalescer above.
 
         Ok(AppendResp {
             code: CODE_OK,
@@ -4549,6 +4743,7 @@ impl ExtentNode {
                 sealed: AtomicBool::new(false),
                 avali: AtomicU32::new(0),
                 owner_revision: AtomicI64::new(0),
+                durable_owner_revision: AtomicI64::new(0),
                 disk_id,
                 coalescer: Coalescer::new(len),
             }),

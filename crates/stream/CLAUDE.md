@@ -1053,6 +1053,50 @@ sufficient (and cheaper than DashMap).
     Cross-ref: notes 20 (SealCommit handshake — `commit` is the seal source),
     21 (`sealed` state), 9 (commit tracking is local).
 
+23. **`owner_revision` fence is made DURABLE before any append is ACKed under it
+    (P0-B).** `owner_revision` (EN `.meta` bytes 32–40) is the per-extent write
+    fence: an append with `revision < owner_revision` is rejected
+    (`CODE_LOCKED_BY_OTHER`). It is RAISED ONLY by the APPEND path (commit_length
+    is check-only — bug#3 Layer C), monotonically, to the request's revision; the
+    value originates from the manager owner-lock (`acquire_owner_revision`). It is
+    NOT `eversion` (bytes 24–32, the seal/EC metadata version) — the two are
+    independent and checked separately.
+    Pre-P0-B the EN bumped `owner_revision` in memory, wrote data, then did a
+    best-effort `save_meta` AFTER the write and ACKed even on persist failure
+    ("safe form"). A crash (or swallowed failure) in that window left the fence
+    non-durable → on restart `.meta` held the old/0 revision → a stale lower
+    owner re-passed the fence → split-brain / acked-data overwrite. The fix has
+    two coupled pieces, on BOTH append paths (`build_append_future` +
+    `handle_append`):
+    - **In-memory bar raised SYNCHRONOUSLY** (`owner_revision.fetch_max(R)`,
+      before any await) so a stale lower owner is rejected immediately, even
+      while the new fence is still being persisted. `fetch_max` (not `store`)
+      keeps it monotonic under two concurrent higher-revision appends.
+    - **Durable high-water gates the ACK.** New `ExtentEntry.durable_owner_
+      revision` = the revision known durable in `.meta`. `ensure_fence_durable
+      (id, entry, R)` returns Ok iff `durable >= R`; else it persists under the
+      per-extent `meta_write_lock` and advances `durable`. An append ACKs only
+      after `durable >= R`. Fail-closed: a persist failure rejects the append
+      (`CODE_PRECONDITION`) + marks the disk offline — never ACK on a
+      non-durable fence. Fast path = one atomic load (steady state); the
+      lock+persist only fires on a revision change (rare).
+    - After the (possibly awaiting) durable step, **re-check** both
+      `owner_revision` (a higher owner may have taken over → LockedByOther) AND
+      `sealed/sealed_length/avali` (a concurrent seal/EC may have sealed the
+      extent during the await → CODE_PRECONDITION; mirrors F147-B).
+    `.meta` durability hardening (load-bearing for the above): ALL `.meta`
+    writers go through `meta_write_lock` (per-extent, DISTINCT from the EC
+    op-lock to avoid self-deadlock — EC commit / re_avali hold the op-lock and
+    call `save_meta`). `write_meta_locked` reads the LIVE atomics under that lock
+    (so a stale-snapshot fence persist can't clobber a concurrent seal's `.meta`)
+    and writes ATOMICALLY: temp `.meta.tmp` → fsync → `rename` → **fsync parent
+    dir** (the rename's directory-entry update must be durable, else the ACKed
+    fence can regress on a host crash). **Invariants: (1) never ACK an append
+    whose `owner_revision` fence isn't durable; (2) raise the in-memory bar
+    synchronously, persist before publishing `durable`; (3) every `.meta` write
+    holds `meta_write_lock` and reads live atomics.** Cross-ref: notes 21
+    (`sealed`), 20 (SealCommit), bug#3 Layer C (commit_length check-only).
+
 ---
 
 ## RPC Wire Protocol (extent_rpc.rs)
