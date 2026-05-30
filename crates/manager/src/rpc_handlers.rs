@@ -1088,17 +1088,33 @@ impl AutumnManager {
             // overwritten by our verify-at-apply block below.
             // F207-C: collapse F138 (EC) + F139 (Recovery) refuse-at-start
             // checks into one ledger probe.
-            if let Some(op) = self.extent_inflight_op(tail_id) {
-                let msg = format!(
-                    "extent {tail_id} has in-flight {op:?}; \
-                     defer alloc_extent until it completes"
-                );
-                return Ok(rkyv_encode(&StreamAllocExtentResp {
-                    code: CODE_PRECONDITION,
-                    message: msg,
-                    stream_info: None,
-                    last_ex_info: None,
-                }));
+            //
+            // SEED13-FIX (2026-05-29): only refuse when this alloc will
+            // actually re-seal + re-write the tail — i.e. when the tail is
+            // still OPEN (`sealed_length == 0`). When the tail is ALREADY
+            // sealed, the seal block below is skipped and the apply path
+            // (below) no longer writes the tail back to etcd / memory at all,
+            // so a concurrent stream-layer op cannot be clobbered and the
+            // guard is unnecessary. Every ledger op (Recovery / ConvertToEc /
+            // Delete) acts ONLY on a sealed extent, so an in-flight op
+            // implies the tail is sealed; gating here is what lifts the wedge
+            // where a stuck Recovery on the sealed tail (no source replica for
+            // 60s+) blocked new-extent allocation indefinitely, freezing the
+            // write / flush / range paths even though the new extent lands on
+            // entirely different, healthy nodes.
+            if tail.sealed_length == 0 {
+                if let Some(op) = self.extent_inflight_op(tail_id) {
+                    let msg = format!(
+                        "extent {tail_id} has in-flight {op:?}; \
+                         defer alloc_extent until it completes"
+                    );
+                    return Ok(rkyv_encode(&StreamAllocExtentResp {
+                        code: CODE_PRECONDITION,
+                        message: msg,
+                        stream_info: None,
+                        last_ex_info: None,
+                    }));
+                }
             }
 
             // The new extent is allocated as an OPEN, REPLICATED extent
@@ -1382,7 +1398,59 @@ impl AutumnManager {
         // requires acquiring an exclusive ledger marker for the
         // alloc_extent op, which is filed as F210-A1-followup (PS-layer
         // ops currently don't enroll in the F207 ledger by design).
+        //
+        // coco P1 — stream-membership baseline verify (runs for BOTH paths).
+        // The etcd mirror + in-memory apply below write `stream_after`
+        // (= the live stream's `extent_ids` captured at build time, plus our
+        // new extent). If a concurrent `punch_holes` / `truncate` / `split`
+        // changed this stream's `extent_ids` during our alloc / mirror await
+        // window, overwriting with `stream_after` would resurrect a removed
+        // extent or roll back the membership change. Refuse (Precondition) when
+        // the live stream no longer matches the baseline we built from — the
+        // client retries with a fresh snapshot. Membership is independent of
+        // the tail seal, so this guard applies whether or not `already_sealed`.
+        // (A narrow residual remains for a mutation landing during the etcd
+        // mirror RTT itself — the same F210-A1-followup window the eversion
+        // verify below documents.)
         {
+            let s = self.store.inner.borrow();
+            match s.streams.get(&req.stream_id) {
+                Some(live) => {
+                    let baseline = &stream_after.extent_ids[..stream_after.extent_ids.len() - 1];
+                    if live.extent_ids.as_slice() != baseline {
+                        let msg = format!(
+                            "stream {} membership changed during alloc_extent; \
+                             retry with fresh snapshot",
+                            req.stream_id
+                        );
+                        return Ok(rkyv_encode(&StreamAllocExtentResp {
+                            code: CODE_PRECONDITION,
+                            message: msg,
+                            stream_info: None,
+                            last_ex_info: None,
+                        }));
+                    }
+                }
+                None => {
+                    return Ok(rkyv_encode(&StreamAllocExtentResp {
+                        code: CODE_NOT_FOUND,
+                        message: format!("stream {}", req.stream_id),
+                        stream_info: None,
+                        last_ex_info: None,
+                    }));
+                }
+            }
+        }
+
+        // SEED13-FIX: the eversion verify (and the tail writeback below) are
+        // ONLY relevant when this alloc re-seals + re-writes the tail
+        // (`!already_sealed`). When the tail is already sealed we do not
+        // touch the tail at all — the sealer already persisted it and a
+        // concurrent Recovery / ConvertToEc owns its own writeback — so a
+        // tail-eversion bump during our await window is none of our business
+        // and must not abort the new-extent allocation (that abort, paired
+        // with a stuck recovery holding the inflight marker, was the wedge).
+        if !already_sealed {
             let s = self.store.inner.borrow();
             let live_eversion = match s.extents.get(&tail.extent_id) {
                 Some(ex) => ex.eversion,
@@ -1411,8 +1479,14 @@ impl AutumnManager {
             }
         }
 
+        // SEED13-FIX: pass the tail to the etcd mirror ONLY when we actually
+        // changed it (`!already_sealed`). An already-sealed tail is left
+        // untouched so a concurrent Recovery's `replicates` / `eversion`
+        // writeback (which can land during the mirror RTT) is never
+        // clobbered by our stale early snapshot.
+        let sealed_old = if already_sealed { None } else { Some(&tail) };
         if let Err(err) = self
-            .mirror_stream_alloc_extent(&stream_after, &tail, &new_extent)
+            .mirror_stream_alloc_extent(&stream_after, sealed_old, &new_extent)
             .await
         {
             return Ok(rkyv_encode(&StreamAllocExtentResp {
@@ -1428,7 +1502,13 @@ impl AutumnManager {
             if let Some(st) = s.streams.get_mut(&req.stream_id) {
                 *st = stream_after.clone();
             }
-            s.extents.insert(tail.extent_id, tail.clone());
+            // Mirror the etcd decision: only re-insert the tail when we
+            // re-sealed it. An already-sealed tail's in-memory entry may have
+            // been advanced by a concurrent Recovery — leave it as the live
+            // store has it.
+            if !already_sealed {
+                s.extents.insert(tail.extent_id, tail.clone());
+            }
             s.extents.insert(extent_id, new_extent.clone());
         }
 

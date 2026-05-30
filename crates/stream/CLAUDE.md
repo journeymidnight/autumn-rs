@@ -1078,3 +1078,40 @@ EC-convert OOM signal.
 **Invariant:** any new full-extent peer-copy-then-writeback path must stream via
 `stream_extent_from_sources` (or an equivalent read-chunk→write-chunk→drop loop),
 never `fetch_full_extent_from_sources` + buffer, unless it is shard-sized.
+
+### Recovery over-promised-seal reconciliation (2026-05-30, seed=13 Mode A)
+
+`stream_extent_from_sources` does NOT retry forever when the manager's
+`sealed_length` is an unrecoverable over-promise. F227's lenient FAILOVER seal
+(the `end==0` path in `handle_stream_alloc_extent` — `min` over reachable
+committed members) can seal an extent at a length that NO replica durably
+retains: e.g. one reachable replica reported a single speculative/un-acked byte
+at seal time (sealed_length=1), but that byte rolled back on the next
+min-commit truncation, so every replica now holds 0 bytes. Recovery streaming
+`[0, sealed_length)` then sees every source return fewer bytes → SHORT → and
+pre-2026-05-30 returned `Err("no source replica available")` and retried every
+10 s for 60 s+, holding the F207 inflight Recovery marker → blocking
+`punch_holes` / `split` (refuse-at-start) and freezing forward progress.
+
+Now: track per-source outcome — `best` (longest copy any source delivered),
+`err_count` (sources that errored mid-stream), `unverified` (non-excluded
+sources that could not even be attempted: absent from `nodes_map` / unparseable
+addr / `dest.set_len(0)` failed). If a source delivers the full `sealed_length`
+→ return it (unchanged happy path). Otherwise, **only when EVERY non-excluded
+source was REACHED and is consistently SHORT** (`err_count == 0 && unverified ==
+0`), reconcile to the replica consensus: re-stream the longest available copy
+and return it. This is SAFE under all-replica-ACK — the acked prefix is on every
+committed replica, so the best reachable copy is ≥ the acked length; only phantom
+(un-acked) tail bytes are dropped, which F227 already deems acceptable (manager
+note 28). `run_recovery_task` still applies `sealed_length` via `fetch_max`, so
+the recovered replica reports `synced_length = max(0, sealed_length)` and the
+all-replica flush barrier still clears.
+
+**Two guards are load-bearing (coco-reviewed):** (1) re-stream errors are
+propagated (`stream_one_source(...).await?` then `got < best_len → Err`), NEVER
+swallowed to `Ok(0)` — else an incomplete file would be marked recovered. (2)
+`unverified == 0` (not just `err_count == 0`) — an un-attempted source might
+still hold the full `sealed_length`, so reconciling to a short consensus while
+ANY source is unverified could drop data that exists out of reach. **Invariant:
+never reconcile a sealed extent DOWN while any non-excluded source was
+unreachable or unattempted — that source may hold the only full copy.**

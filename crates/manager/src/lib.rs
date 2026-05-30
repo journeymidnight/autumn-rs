@@ -2631,27 +2631,33 @@ impl AutumnManager {
         Ok(())
     }
 
+    /// `sealed_old` is `Some` only when this alloc actually re-sealed the old
+    /// tail (the `!already_sealed` path). When the tail was already sealed it
+    /// is `None`: re-persisting the early-snapshotted tail would clobber a
+    /// concurrent Recovery's `replicates` / `eversion` writeback that lands
+    /// during this txn's RTT (the seed=13 wedge fix). The sealer already
+    /// durably persisted the tail, so skipping it loses nothing.
     async fn mirror_stream_alloc_extent(
         &self,
         stream: &MgrStreamInfo,
-        sealed_old: &MgrExtentInfo,
+        sealed_old: Option<&MgrExtentInfo>,
         new_extent: &MgrExtentInfo,
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
-            let kvs = vec![
-                (
-                    format!("streams/{}", stream.stream_id),
-                    rkyv_encode(stream).to_vec(),
-                ),
-                (
+            let mut kvs = vec![(
+                format!("streams/{}", stream.stream_id),
+                rkyv_encode(stream).to_vec(),
+            )];
+            if let Some(sealed_old) = sealed_old {
+                kvs.push((
                     format!("extents/{}", sealed_old.extent_id),
                     rkyv_encode(sealed_old).to_vec(),
-                ),
-                (
-                    format!("extents/{}", new_extent.extent_id),
-                    rkyv_encode(new_extent).to_vec(),
-                ),
-            ];
+                ));
+            }
+            kvs.push((
+                format!("extents/{}", new_extent.extent_id),
+                rkyv_encode(new_extent).to_vec(),
+            ));
             etcd.put_msgs_txn(kvs).await?;
         }
         Ok(())

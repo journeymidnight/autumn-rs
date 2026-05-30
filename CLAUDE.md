@@ -35,6 +35,8 @@
     - 更新 `autumn-rs/README.md`（手动测试或使用说明）
     - 提交 git commit，作为该 feature 的完成点
 11. `autumn-rs/README.md` 必须持续维护，确保人工手动验证步骤始终可执行。
+12. 每个feature和BUG都用coco findbug做review
+
 
 ### claude-progress.txt 约定
 1. 文件位置：仓库根目录 `claude-progress.txt`。

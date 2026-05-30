@@ -1444,3 +1444,37 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       **Invariant: keep `record_dispatch_outcome` taking the `Result` (not
       a bool) so the reason is never silently dropped again.** Cross-ref:
       notes 21 (F207 marker lifecycle), 24 (F224 limiter reseed), 26.
+
+31. **`handle_stream_alloc_extent` on an ALREADY-SEALED tail must NOT
+    re-write the tail (seed=13, 2026-05-30).** Two coupled facts: (a) every
+    F207 ledger op (Recovery / ConvertToEc / Delete) acts ONLY on a SEALED
+    extent, so an in-flight op on the tail ⇒ the tail is already sealed;
+    (b) when the tail is already sealed, alloc does NOT change any tail field
+    (`already_sealed` skips the seal block). So the early-snapshot
+    `tail.clone()` writeback (etcd `mirror_stream_alloc_extent` + in-mem
+    `s.extents.insert`) was BOTH pointless (rewrites an identical snapshot)
+    AND a clobber hazard — a concurrent Recovery completing during the mirror
+    RTT bumps `tail.replicates`/`eversion`, which the stale clone overwrites
+    (the coco-found P1 that reverted the first naive guard-lift). Fix:
+    - The refuse-at-start `extent_inflight_op(tail_id)` probe is gated on
+      `tail.sealed_length == 0` (it only ever fired on already-sealed tails,
+      so this lifts the wedge where a stuck Recovery on the sealed tail
+      blocked new-extent allocation — see `crates/stream/CLAUDE.md` recovery
+      reconciliation for WHY the recovery was stuck).
+    - `mirror_stream_alloc_extent`'s `sealed_old` param is now
+      `Option<&MgrExtentInfo>` — `None` on the already-sealed path (skip the
+      tail etcd write); the in-mem `s.extents.insert(tail_id, …)` is likewise
+      skipped. The sealer already durably persisted the tail, so skipping
+      loses nothing and the concurrent Recovery's writeback is never clobbered.
+    - The eversion verify-before-mirror (F210-A2) runs only for
+      `!already_sealed` (it guards the tail re-seal, irrelevant when we don't
+      touch the tail). A NEW **stream-membership baseline verify runs for BOTH
+      paths** (coco P1): re-read the live stream before mirror+apply and refuse
+      (Precondition) if its `extent_ids` no longer match the baseline
+      `stream_after` was built from — else a concurrent `punch_holes` /
+      `truncate` / `split` could be clobbered by the `stream_after` writeback
+      (extent resurrection / membership rollback). The narrow etcd-mirror-RTT
+      residual is the same F210-A1-followup window the eversion verify documents.
+    Cross-ref: notes 13 (F146 verify-at-apply), 21 (F207 ledger Class A
+    refuse-at-start), 28 (F227 lenient seal — the source of the phantom
+    `sealed_length` that stalled the recovery).

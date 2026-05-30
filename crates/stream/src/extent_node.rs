@@ -1540,7 +1540,9 @@ async fn build_append_future(
     }
     let revision_changed = first.revision > owner_revision;
     if revision_changed {
-        extent.owner_revision.store(first.revision, Ordering::SeqCst);
+        extent
+            .owner_revision
+            .store(first.revision, Ordering::SeqCst);
     }
 
     // 4. Commit reconciliation.
@@ -3000,21 +3002,59 @@ impl ExtentNode {
             .await
             .map_err(|e| format!("nodes_map: {e}"))?;
         let total = extent.sealed_length;
+        // SEED13: per-source failure-reason trace + over-promised-seal
+        // reconciliation. Pre-this, every source's error/short was swallowed
+        // (`Err(_e) => continue`) so a stuck recovery surfaced only as the
+        // opaque "no source replica available" summary, with no way to tell
+        // unreachable-source from short-read. Logged at warn (recovery is rare
+        // + the happy path returns on the first full Ok).
+        //
+        // `best` = the longest copy any REACHABLE source delivered. `err_count`
+        // = sources that errored mid-stream. `unverified` = non-excluded
+        // sources we could NOT even attempt (absent from nodes_map / unparseable
+        // addr / dest reset failed). BOTH must be zero before we reconcile down
+        // (coco P1): an unattempted source might still hold the full
+        // `sealed_length`, so reconciling to a short consensus while any source
+        // is unverified risks dropping data that exists out of reach.
+        let mut attempted = 0usize;
+        let mut err_count = 0usize;
+        let mut unverified = 0usize;
+        let mut best: Option<(std::net::SocketAddr, String, u64)> = None;
         for node_id in extent.replicates.iter().chain(extent.parity.iter()) {
             if exclude_node_ids.contains(node_id) {
                 continue;
             }
             let Some(addr) = nodes.get(node_id) else {
+                unverified += 1;
+                tracing::warn!(
+                    extent_id = extent.extent_id,
+                    node_id,
+                    "recovery source skipped: node_id absent from nodes_map (stale map?)"
+                );
                 continue;
             };
             let Ok(sock) = parse_addr(addr) else {
+                unverified += 1;
+                tracing::warn!(
+                    extent_id = extent.extent_id,
+                    node_id,
+                    addr = %addr,
+                    "recovery source skipped: unparseable addr"
+                );
                 continue;
             };
             // Reset before each attempt — a previous source's partial stream
             // must not bleed into this one.
             if dest.file_rc().set_len(0).await.is_err() {
+                unverified += 1;
+                tracing::warn!(
+                    extent_id = extent.extent_id,
+                    node_id,
+                    "recovery source skipped: dest set_len(0) failed"
+                );
                 continue;
             }
+            attempted += 1;
             match Self::stream_one_source(
                 sock,
                 addr,
@@ -3026,10 +3066,111 @@ impl ExtentNode {
             .await
             {
                 Ok(written) if total == 0 || written >= total => return Ok(written),
-                Ok(_short) => continue, // source had < sealed_length — try next
-                Err(_e) => continue,    // source failed mid-stream — next restarts from 0
+                Ok(short) => {
+                    // source had < sealed_length — remember the longest, try next
+                    if best.as_ref().is_none_or(|(_, _, w)| short > *w) {
+                        best = Some((sock, addr.clone(), short));
+                    }
+                    tracing::warn!(
+                        extent_id = extent.extent_id,
+                        node_id,
+                        addr = %addr,
+                        got = short,
+                        want = total,
+                        eversion = extent.eversion,
+                        "recovery source SHORT: replica has fewer bytes than sealed_length"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    // source failed mid-stream — next restarts from 0
+                    err_count += 1;
+                    tracing::warn!(
+                        extent_id = extent.extent_id,
+                        node_id,
+                        addr = %addr,
+                        want = total,
+                        eversion = extent.eversion,
+                        err = %e,
+                        "recovery source FAILED"
+                    );
+                    continue;
+                }
             }
         }
+
+        // SEED13 over-promised-seal reconciliation. No source held the full
+        // `sealed_length`. If EVERY source we could reach responded
+        // (`err_count == 0`) yet all are short, the manager's `sealed_length`
+        // is an over-promise — F227's lenient failover-seal (the `end == 0`
+        // path in `handle_stream_alloc_extent`) sealed at `min` over the
+        // reachable members at seal time, promoting a speculative/un-acked
+        // tail byte that NO replica durably retained (it rolled back on the
+        // next min-commit truncation). Retrying forever for bytes that exist
+        // nowhere wedges the manager's refuse-at-start guards for
+        // alloc_extent / punch_holes against this extent, freezing the
+        // partition's write / flush / range paths.
+        //
+        // Reconcile to the replica consensus: copy the longest available copy
+        // and succeed. SAFE under all-replica-ACK — the acked prefix is on
+        // EVERY replica, so the best reachable copy is >= the acked length;
+        // only phantom (un-acked) tail bytes are dropped, which F227 already
+        // treats as acceptable (see manager note 28 / `feedback`-seal-lenient).
+        // The guard `err_count == 0 && unverified == 0` ensures we NEVER
+        // reconcile down while any source was unreachable OR unattempted — such
+        // a source might still hold the full data, so we Err and let the
+        // manager re-dispatch until every source is reachable + confirmed short
+        // (coco P1). run_recovery_task still applies `sealed_length` via
+        // `fetch_max`, so the recovered replica reports
+        // `synced_length = max(0, sealed_length)` and the flush barrier clears.
+        if err_count == 0 && unverified == 0 {
+            if let Some((sock, addr, best_len)) = best {
+                // Re-stream the longest copy cleanly — a trailing shorter
+                // attempt above may have left `dest` at a different length.
+                let _ = dest.file_rc().set_len(0).await;
+                // coco P0: do NOT swallow a re-stream failure as success. If the
+                // best source fails or short-reads on the re-stream, the recovered
+                // file would be incomplete yet marked recovered — propagate the
+                // error / refuse so the manager re-dispatches instead.
+                let got = Self::stream_one_source(
+                    sock,
+                    &addr,
+                    extent.extent_id,
+                    extent.eversion,
+                    best_len,
+                    &dest.file_rc(),
+                )
+                .await?;
+                if got < best_len {
+                    return Err(format!(
+                        "recovery reconcile re-stream short for extent {}: got {got} < best {best_len}",
+                        extent.extent_id
+                    ));
+                }
+                tracing::warn!(
+                    extent_id = extent.extent_id,
+                    sealed_length = total,
+                    reconciled_to = got,
+                    eversion = extent.eversion,
+                    attempted,
+                    "recovery: sealed_length over-promised (phantom seal); reconciled to replica consensus"
+                );
+                return Ok(got);
+            }
+        }
+
+        tracing::warn!(
+            extent_id = extent.extent_id,
+            sealed_length = total,
+            eversion = extent.eversion,
+            replicates = ?extent.replicates,
+            parity = ?extent.parity,
+            exclude = ?exclude_node_ids,
+            attempted,
+            err_count,
+            unverified,
+            "recovery: no source replica available for streaming copy"
+        );
         Err("no source replica available for streaming copy".to_string())
     }
 

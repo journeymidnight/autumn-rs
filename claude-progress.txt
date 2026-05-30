@@ -1,3 +1,115 @@
+Date: 2026-05-30
+TaskStatus: not_completed
+Task scope: continue the seed=13 stuck-recovery / range-wedge bug
+  (project_recovery_stuck_blocks_alloc). DEEP root-cause pinned to THREE
+  distinct modes; 2 fixed (no data loss), the dominant one root-caused +
+  deferred (deep F227 append-failover work). seed=13 8x: 5 pass / 3 fail
+  (was ~2/5); mismatches=0 not_found=0 in EVERY run (NO acked-data loss).
+
+=== ROOT CAUSE — the range-wedge is GET-local vs RANGE-via-partition_loop ===
+  Confirmed via SEED13DIAG instrumentation (temporary, removed before commit):
+  GET (MSG_GET/_ZC) is served LOCALLY on the ps-conn task (serve_get_local,
+  lib.rs:3638) by borrowing PartitionData directly — it NEVER touches
+  partition_loop. RANGE goes through req_tx -> partition_loop (inline dispatch).
+  So whenever partition_loop PARKS, RANGE wedges but point-gets keep working —
+  exactly the symptom (mismatches=0 not_found=0, range_errors=2 "TIMED OUT —
+  PS wedged" + "missing N keys"). partition_loop parks via F120-A imm-full
+  back-pressure: when part.imm.len() >= MAX_IMM_DEPTH (4) it stops servicing
+  req_rx. imm fills because FLUSH is stuck.
+
+  --- MODE A (phantom seal -> stuck recovery) — FIXED ---
+  Pinned via NEW per-source recovery trace (extent_node.rs stream_extent_from_
+  sources): "recovery source SHORT extent_id=20 got=0 want=1 sealed_length=1".
+  An extent was sealed at sealed_length=1 by F227 lenient FAILOVER seal (the
+  `end==0` path: compute_commit_seal = min over REACHABLE committed members; a
+  single reachable replica had 1 speculative/un-acked byte -> sealed at 1), but
+  NO replica durably retains it (all 0 bytes — the speculative byte rolled back
+  on the next min-commit truncation). Recovery streams [0,1) from every source,
+  gets 0 -> treats as SHORT -> rejects all -> "no source replica available" ->
+  retries every 10s for 60s+ -> holds the F207 inflight Recovery marker ->
+  blocks punch_holes (GC) + split (refuse-at-start) + (pre-fix) alloc_extent.
+  FIX (stream extent_node.rs): when EVERY non-excluded source was REACHED and
+  is consistently SHORT (err_count==0 AND unverified==0), the manager
+  sealed_length is an unrecoverable over-promise (phantom) -> reconcile to the
+  replica consensus: re-stream the LONGEST available copy and succeed (run_
+  recovery_task applies sealed_length via fetch_max, so synced_length reports
+  max(0,sealed_length) and the flush barrier still clears). SAFE under all-
+  replica-ACK (acked prefix is on every replica, so best reachable >= acked;
+  only phantom un-acked tail bytes drop — F227 already deems this acceptable).
+  coco-fixed: P0 (re-stream error no longer swallowed via unwrap_or(0); require
+  got>=best_len else Err), P1 (unverified sources counted; never reconcile if
+  any source was unattempted — it might hold full data).
+
+  --- MODE B (DOMINANT) — row_stream all-replica APPEND stuck — DEFERRED ---
+  SEED13DIAG trace on the wedged partition 9001:
+    flush: barrier WAIT vp_eid=23 -> barrier OK   (the flush barrier is NOT it)
+    flush: bulk WAIT  ...26s, NO "bulk OK"...      (P-bulk flush stuck)
+    partition_loop PARKED on imm_full depth=4      (-> RANGE wedges)
+  i.e. P-bulk's `row_stream.append` (the SST upload) never returns. Cause:
+  "append soft-error stream_id=17 (row_stream) replica 1 connection closed"
+  (node 1 killed). The all-replica append + failover-alloc retry loop does not
+  converge while replicas are dead/partitioned (df marked ALL 8 nodes offline
+  during the network partition). imm fills -> partition_loop parks -> RANGE
+  wedge. This is the long-hypothesised "PRIMARY F227 layer": all-replica
+  append blocks on a dead replica and the failover (seal-over-reachable + alloc
+  new tail on healthy nodes) doesn't complete fast enough post-heal. FIX is a
+  DEEP F227 append-failover change (revert-prone area — prior freeze-drain/
+  F185/F210 fixes here were reverted); NOT attempted in this autonomous loop.
+  NO data loss (point-gets fine; mismatches=0).
+
+=== FIXES LANDED (this session) ===
+  1. ALLOC clobber-race fix (manager rpc_handlers.rs + lib.rs). The F207
+     refuse-at-start for an in-flight stream-layer op on the tail is now gated
+     on `tail.sealed_length == 0`; an ALREADY-SEALED alloc no longer re-writes
+     the tail to etcd/mem at all (mirror_stream_alloc_extent takes
+     Option<&MgrExtentInfo>; in-mem insert skipped). This closes the coco-found
+     P1 clobber race (early-snapshot tail.clone() overwriting a concurrent
+     Recovery's replicates writeback during the mirror RTT) AND removes the
+     alloc-refuse wedge vector for a stuck-recovery sealed tail — because the
+     guard was only ever protecting that now-deleted tail writeback. Every
+     ledger op acts only on a SEALED extent, so an in-flight op implies sealed
+     -> the guard was pure overhead on the wedge path. coco-fixed P1#3: added a
+     stream-membership baseline verify (both paths) so a concurrent punch_holes/
+     truncate/split during the await/mirror window can't be clobbered by the
+     stream_after writeback.
+  2. Recovery per-source DIAGNOSTIC (stream extent_node.rs, warn-level): logs
+     each source's SHORT/FAILED/skipped reason + a no-source summary. Pinned
+     Mode A; kept as the permanent localization aid (pre-this every source
+     error was swallowed `Err(_e) => continue`).
+  3. Recovery over-promised-seal RECONCILE (Mode A fix above).
+
+=== REVERTED (this session) ===
+  Flush-barrier "sealed VP extent trust the seal, skip all-replica poll"
+  (client.rs await_extent_synced_to). DISCONFIRMED by the SEED13DIAG trace —
+  the barrier passes (barrier OK); the wedge is the row_stream APPEND, not the
+  synced-barrier. It weakened the deliberately-STRICT F227 flush barrier
+  (manager note 28 / "no fsync-quorum") without a confirmed benefit; reverted
+  to respect the F227 boundary. (If a sealed-VP-extent dead-member barrier
+  wedge is ever confirmed, fix it deliberately alongside the Mode B work.)
+
+=== VALIDATION ===
+  - seed=13 8x (all 3 fixes): 5 pass / 3 fail; mismatches=0 not_found=0 in ALL
+    8 (no acked-data loss). reconcile path fires + helps (Mode A); the 3 fails
+    are Mode B (row_stream append). Before this session seed=13 was ~2/5.
+  - No-regression: f250 fence/flush invariant PASS; seed=6 (bug #3) x2 PASS;
+    seed=1 PASS; seed=13 (one more) PASS — all mismatches=0 not_found=0.
+  - Unit: autumn-manager 114 + autumn-stream 56 lib tests pass.
+  - clippy -p autumn-stream -p autumn-manager --lib -D warnings clean.
+  - coco /findbugs (GPT-5.5, per CLAUDE.md rule 12): 3 issues found, ALL fixed
+    (P0 swallowed re-stream err; P1 unverified-source consensus; P1 alloc
+    stream-membership clobber). Re-built + re-tested after fixes.
+
+=== NEXT (deferred, deliberate work) ===
+  Mode B = the F227 all-replica row_stream/log_stream append + failover not
+  converging during multi-node kill+partition chaos. Direction: bound/repair
+  the P-bulk flush append so a dead replica triggers a prompt failover-seal +
+  alloc-new-tail on healthy nodes (or surface a flush error so imm can't wedge
+  partition_loop indefinitely). Treat carefully — deep F227 area.
+  Repro: AUTUMN_CHAOS_SEED=13 ... (same K4/M2 cmd); ~3/8 runs hit Mode B.
+  Memory: project_recovery_stuck_blocks_alloc (updated).
+
+--- prior task (bug #3) below as history ---
+
 Date: 2026-05-29
 TaskStatus: not_completed
 Task scope: bug #3 (kill+restart wedge under K4/M2 chaos) — three-concepts
