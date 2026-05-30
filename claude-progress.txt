@@ -36,6 +36,16 @@ Task scope: /loop "coco arch review chaos test, add new scenarios, run new
   Sweep 3 (hunt, seeds 6,8,18,20,22,23,24,25,26,27,28,30) = 11/12 clean;
   SEED=8 FAILED — a SECOND, DISTINCT (more severe) new bug, see below.
 
+=== SWEEP OPS NOTE + seed=32 POSSIBLE TEST-HANG ===
+  The hunt2 background sweep (seeds 8,8,31,32..38) WEDGED at seed=32: its
+  `cargo test` hung ~2h with NO outer timeout, bypassing the test's own internal
+  5s RPC timeouts, leaving orphan etcd/toxiproxy procs (cleaned). seed=32 may be
+  a 3rd signal — a chaos interleaving that DEADLOCKS the test PROCESS itself
+  (not just a partition wedge the test detects + reports). Unrecoverable now
+  (state gone). PROCESS FIX going forward: wrap each chaos run in `timeout 280`
+  so a hang is killed, not left to wedge a multi-hour sweep. Combined tally this
+  session: ~27 seeds clean; bug#1 (open-tail wedge) seed=15; bug#2 seed=8+31.
+
 === NEW BUG #2 (seed=8) — split child can NEVER open: VP past sealed_length=0 ===
   DISTINCT from seed=15 (and arguably DATA-LOSS class, not just liveness).
   not_found=200 mismatches=0 (one split-child partition's keys all unreachable).
