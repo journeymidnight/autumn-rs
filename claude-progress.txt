@@ -1,3 +1,84 @@
+Date: 2026-05-30 (BUG#2 ROOT-CAUSED + FIXED via writer-side trace)
+TaskStatus: completed
+Task scope: STEP 5 (BUG#2) — split child un-openable / stale_vp_offset_past_
+  sealed_length (data-loss class). Followed the prior session's defined NEXT
+  step EXACTLY: WRITER-SIDE TRACE FIRST, do not fix on an unconfirmed
+  hypothesis. ROOT CAUSE CONFIRMED (not a hypothesis), FIXED, coco-reviewed
+  (2 rounds → clean), validated 10/10. completed.
+
+=== ROOT CAUSE (confirmed by writer-side trace, seed=8, NOT a split bug) ===
+  Added opt-in `bug2_trace` instrumentation (silent in prod; enable with
+  RUST_LOG=...,bug2_trace=info) at the decisive points: manager
+  handle_stream_alloc_extent seal (seal_path + seal_commit + sealed_len +
+  eversion), manager probe commit_length responses, manager split CoW seal,
+  StreamClient SealCommit worker reply (reported_commit + tail_extent +
+  in_flight) + alloc_new_extent request, EN apply_extent_meta UNDER-SEAL warn.
+  Sweep: seed=8 HIT on run 1. The trace pinned the exact sequence (extent 18,
+  VP offset 8657884, part_id 27), 23s BEFORE the split:
+    18:59:46.104 append soft-error retry=1 stream_id=17 (replica 2 conn refused
+                 — node 1 killed)
+    18:59:46.216 append soft-error retry=2 stream_id=17
+    18:59:46.320 SealCommit reply stream_id=17 reported_commit=0
+                 tail_extent=Some(18) in_flight=0
+    18:59:46.320 alloc-seal applied extent_id=18 seal_commit=Some(0)
+                 seal_path="authoritative_seal_commit" sealed_len=0
+                 eversion_old=1 eversion_new=2
+  MECHANISM: in append_payload_segments, a TRANSIENT soft error (killed replica
+  → connection refused) triggers a tail reload; when the reloaded tail was
+  still OPEN (same extent 18), the code sent ResetTail{fresh}. ResetTail ran
+  reset_for_new_extent which ZEROED the worker's state.commit — the
+  authoritative all-replica-acked prefix — even though extent 18 already held
+  8.6MB of acked, VP-referenced data. The next retry escalated to the hard
+  path, whose seal_commit_watermark read the now-zeroed commit=0 and
+  alloc_new_extent(Some(0)) sealed the LIVE tail at sealed_length=0 via the
+  AUTHORITATIVE path. The split 23s later merely CoW-propagated the
+  already-poisoned extent 18 (sealed at 0, VP at 8.6MB) to child part 27 → the
+  child can never open (StaleVpOffset). So BUG#2 is NOT split-time, NOT
+  under-seal-at-split, NOT reopen-overlap (all prior REFUTED hypotheses) — it
+  is a SOFT-ERROR-RELOAD commit-zeroing in the writer. The EN UNDER-SEAL trace
+  fired 0x (orphaning is the MANAGER sealing at 0 via Some(0), not an EN
+  apply-below-local-len).
+
+=== FIX (crates/stream/src/client.rs) — coco-reviewed, 2 rounds ===
+  StreamAppendState::apply_reset_tail (NEW, single decision point; both worker
+  ResetTail arms call it): reset append-progress state ONLY when ResetTail
+  targets a DIFFERENT extent (genuine roll to a fresh empty tail → commit=0
+  correct). SAME extent (soft-error reload that did not change the tail) →
+  PRESERVE all state (commit/lease_cursor/pending_acks/in_flight/poisoned/
+  sealing), refresh only replica metadata. state.commit advances only on a full
+  all-replica ACK so it is ground truth for the extent.
+  coco round 1 (P1): my first cut put the skip in the public API (open branch),
+  but that checked `fresh` (the NEW manager tail) not the worker's CACHED tail
+  → a genuine roll to a DIFFERENT open extent would not move the worker. Moved
+  the same-vs-different decision into the WORKER (only it knows its cached tail
+  extent_id). coco round 2 (P1): clearing `poisoned`/`sealing` on same-extent
+  is unsafe under concurrent same-stream appends — a non-tail-lease failure
+  marks a HOLE (rewind_or_poison); clearing it would resume past the hole.
+  Fix: preserve EVERYTHING on same-extent → a poisoned worker rejects the next
+  Append → caller escalates to seal-and-roll, sealing at the contiguous commit
+  (hole excluded). coco round 3: CLEAN (only a P3 stale doc comment, fixed).
+  Kept the bug2_trace instrumentation as a permanent opt-in localization aid
+  (matches the kept Recovery per-source diagnostic). Updated stream CLAUDE.md
+  (programming note 22) + README chaos repro note.
+
+=== VALIDATION ===
+  - Pre-fix: seed=8 reproduced on run 1 (stale_vp=24, not_found=200,
+    part_thread_failed=2).
+  - Post-fix sweep 10/10 PASS: seed=8 x5, seed=31 x3, seed=2, seed=5 — ALL
+    stale_vp=0 under_seal=0 not_found=0 mismatches=0 part_thread_failed=0
+    auth_seal0=0 (no authoritative seal of a live tail at 0).
+  - Unit: autumn-stream 65 lib tests (was 64; new
+    reset_tail_same_extent_preserves_commit_and_poison). clippy clean.
+  - coco /findbugs (rule 12, GPT-5.5): 2 real findings fixed, final clean.
+  Memory: project_split_underseal_vp_past_sealed (now RESOLVED).
+
+=== REMAINING OPEN (deferred, unchanged) ===
+  BUG#1 seed=15 open-tail write-wedge FIXED earlier (ac6c9a7). P0-B-followup
+  (per-extent durability lock). Mode B fail-fast flush. reopen-overlap
+  hardening. All previously deferred; not touched this session.
+
+--- prior session below as history ---
+
 Date: 2026-05-30 (FIX SESSION — Step 1: P0-C sealed-empty persistence)
 TaskStatus: not_completed
 Task scope: Start the FIX session for the chaos-found F227-area bugs, with coco

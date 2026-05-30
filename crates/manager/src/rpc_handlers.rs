@@ -1248,6 +1248,18 @@ impl AutumnManager {
                     }
                 }
             }
+            // BUG2 trace (opt-in): the per-member commit_length probe results
+            // that feed the seal min. A `responses` map of all-zero (or empty)
+            // while the extent holds acked data pins the under-seal to the
+            // probe path (vs the authoritative SealCommit path).
+            tracing::info!(
+                target: "bug2_trace",
+                extent_id = tail.extent_id,
+                stream_id = req.stream_id,
+                ?responses,
+                recovering = ?recovering,
+                "BUG2 probe commit_length responses"
+            );
             // Shared pure decision: no quorum, exclude catching-up members,
             // seal at min over the REACHABLE committed members (>= floor;
             // WAS seal-over-reachable — a kill+restarted laggard no longer
@@ -1299,6 +1311,34 @@ impl AutumnManager {
             tail.eversion += 1;
             tail.avali = avali;
         }
+        // BUG2 trace (opt-in, target `bug2_trace`): the decisive event. A
+        // `sealed_len == 0` here on a tail that physically held VP/SST-acked
+        // data at offset > 0 is the under-seal that makes a split child
+        // un-openable (`stale_vp_offset_past_sealed_length`). `seal_path`
+        // distinguishes the three causes: an `authoritative_seal_commit` of 0
+        // means the writer's SealCommit handshake returned a stale/reset
+        // worker's `state.commit=0`; a `probe`-path 0 means every reachable
+        // committed member reported commit_length 0 at seal time.
+        let seal_path = if already_sealed {
+            "already_sealed"
+        } else if req.seal_commit.is_some() {
+            "authoritative_seal_commit"
+        } else {
+            "probe"
+        };
+        tracing::info!(
+            target: "bug2_trace",
+            extent_id = tail.extent_id,
+            stream_id = req.stream_id,
+            seal_commit = ?req.seal_commit,
+            seal_path,
+            sealed_len,
+            eversion_old = expected_eversion,
+            eversion_new = tail.eversion,
+            revision = req.revision,
+            owner = %req.owner_key,
+            "BUG2 alloc-seal applied"
+        );
         // Suppress unused warning when `already_sealed` skips the real seal.
         let _ = sealed_len;
 

@@ -201,6 +201,33 @@ impl StreamAppendState {
         self.sealing = false;
     }
 
+    /// Apply a `ResetTail`. A DIFFERENT extent is a genuine roll to a fresh,
+    /// empty tail → reset ALL append-progress state (commit=0 etc.). The SAME
+    /// extent is a soft-error tail reload that did NOT change the tail (a
+    /// transient replica failure) → PRESERVE every byte of append-progress
+    /// state (commit / lease_cursor / pending_acks / in_flight / poisoned /
+    /// sealing) and only refresh the cached tail metadata (replica addrs).
+    ///
+    /// BUG#2 (seed=8): zeroing `commit` on a same-extent reload let a later
+    /// `seal_commit_watermark` report commit=0 and `alloc_new_extent(Some(0))`
+    /// seal the live extent at sealed_length=0 — orphaning every acked VP/SST
+    /// byte past 0 (a split child inheriting this CoW tail then can never open:
+    /// `stale_vp_offset_past_sealed_length`). `commit` only ever advances on a
+    /// full all-replica ACK, so it is ground truth for THIS extent. `poisoned`
+    /// is preserved too: under concurrent same-stream appends a non-tail-lease
+    /// failure marks a HOLE (`rewind_or_poison`); kept poisoned, the next
+    /// Append is rejected so the caller escalates to seal-and-roll, sealing at
+    /// the contiguous `commit` (hole + everything after correctly excluded).
+    /// (coco review, 2026-05-30.)
+    fn apply_reset_tail(&mut self, tail: StreamTail) {
+        let same_extent =
+            self.tail.as_ref().map(|t| t.extent.extent_id) == Some(tail.extent.extent_id);
+        if !same_extent {
+            self.reset_for_new_extent();
+        }
+        self.tail = Some(tail);
+    }
+
     fn lease(&mut self, size: u32) -> (u32, u32) {
         let offset = self.lease_cursor;
         let end = offset + size;
@@ -475,8 +502,15 @@ enum StreamSubmitMsg {
         revision: i64,
         ack_tx: oneshot::Sender<Result<AppendResult>>,
     },
-    /// Replace the cached tail (used after alloc_new_extent or on a fresh
-    /// stream's first init).  Resets lease_cursor/commit/pending/in_flight.
+    /// Replace the cached tail (used after alloc_new_extent, on a fresh
+    /// stream's first init, or a soft-error tail reload). When `tail` is a
+    /// DIFFERENT extent than the one the worker is on, this resets all
+    /// append-progress state (lease_cursor/commit/pending/in_flight/poisoned/
+    /// sealing) for the new extent. When it is the SAME extent (a transient-
+    /// failure reload that did not change the tail), it only refreshes the
+    /// cached tail metadata (replica addrs) and PRESERVES the worker's
+    /// append-progress state — see the handler for why (BUG#2 + hole/poison
+    /// safety).
     ResetTail { tail: StreamTail },
     /// Seed the lease_cursor/commit to a non-zero starting value.  Sent by
     /// the public API's tail-init path when the manager-tracked extent
@@ -641,8 +675,10 @@ async fn stream_worker_loop(
                 None => break,
                 Some(StreamSubmitMsg::Shutdown) => break,
                 Some(StreamSubmitMsg::ResetTail { tail }) => {
-                    state.reset_for_new_extent();
-                    state.tail = Some(tail);
+                    // Same-extent reload preserves the worker's append-progress
+                    // state; different-extent roll resets it. See
+                    // `StreamAppendState::apply_reset_tail` (BUG#2, seed=8).
+                    state.apply_reset_tail(tail);
                 }
                 Some(StreamSubmitMsg::SeedCursor { cursor }) => {
                     state.commit = cursor;
@@ -650,6 +686,20 @@ async fn stream_worker_loop(
                 }
                 Some(StreamSubmitMsg::SealCommit { resp }) => {
                     drain_inflight_for_seal(&mut state, &mut inflight).await;
+                    // BUG2 trace (opt-in, target `bug2_trace`): the worker's
+                    // post-drain `state.commit` IS the authoritative seal length
+                    // it reports. A `reported_commit=0` for a `tail_extent` that
+                    // physically holds acked data means THIS worker did not own
+                    // the writes (reset/fresh worker after invalidate_stream /
+                    // ResetTail) — the dual-writer under-seal.
+                    tracing::info!(
+                        target: "bug2_trace",
+                        stream_id,
+                        reported_commit = state.commit,
+                        tail_extent = ?state.tail.as_ref().map(|t| t.extent.extent_id),
+                        in_flight = state.in_flight,
+                        "BUG2 SealCommit reply"
+                    );
                     let _ = resp.send(state.commit);
                     // Freeze the tail until ResetTail so no append lands past
                     // the just-reported seal point (coco P1).
@@ -703,8 +753,10 @@ async fn stream_worker_loop(
                     break;
                 }
                 Some(StreamSubmitMsg::ResetTail { tail }) => {
-                    state.reset_for_new_extent();
-                    state.tail = Some(tail);
+                    // Same-extent reload preserves the worker's append-progress
+                    // state; different-extent roll resets it. See
+                    // `StreamAppendState::apply_reset_tail` (BUG#2, seed=8).
+                    state.apply_reset_tail(tail);
                 }
                 Some(StreamSubmitMsg::SeedCursor { cursor }) => {
                     state.commit = cursor;
@@ -712,6 +764,20 @@ async fn stream_worker_loop(
                 }
                 Some(StreamSubmitMsg::SealCommit { resp }) => {
                     drain_inflight_for_seal(&mut state, &mut inflight).await;
+                    // BUG2 trace (opt-in, target `bug2_trace`): the worker's
+                    // post-drain `state.commit` IS the authoritative seal length
+                    // it reports. A `reported_commit=0` for a `tail_extent` that
+                    // physically holds acked data means THIS worker did not own
+                    // the writes (reset/fresh worker after invalidate_stream /
+                    // ResetTail) — the dual-writer under-seal.
+                    tracing::info!(
+                        target: "bug2_trace",
+                        stream_id,
+                        reported_commit = state.commit,
+                        tail_extent = ?state.tail.as_ref().map(|t| t.extent.extent_id),
+                        in_flight = state.in_flight,
+                        "BUG2 SealCommit reply"
+                    );
                     let _ = resp.send(state.commit);
                     // Freeze the tail until ResetTail so no append lands past
                     // the just-reported seal point (coco P1).
@@ -1565,6 +1631,17 @@ impl StreamClient {
         // this set and only blocks allocation if doing so would empty
         // the pool — see `select_nodes` + `handle_stream_alloc_extent`.
         let exclude_node_ids = self.snapshot_bad_nodes(stream_id);
+        // BUG2 trace (opt-in, target `bug2_trace`): which writer asks the
+        // manager to seal-and-roll, and at what commit. `seal_commit=Some(0)`
+        // here is the writer-side origin of an under-seal (the SealCommit
+        // handshake returned a reset/stale worker's `state.commit=0`).
+        tracing::info!(
+            target: "bug2_trace",
+            stream_id,
+            seal_commit = ?seal_commit,
+            owner = %self.owner_key,
+            "BUG2 alloc_new_extent request"
+        );
         let req = manager_rpc::rkyv_encode(&StreamAllocExtentReq {
             stream_id,
             owner_key: self.owner_key.clone(),
@@ -1824,6 +1901,27 @@ impl StreamClient {
                                 .await
                                 .map_err(|_| anyhow!("worker gone mid-retry"))?;
                         } else {
+                            // Open tail reload. Hand the freshly-loaded tail to
+                            // the worker; the worker's `ResetTail` handler
+                            // decides whether to ZERO `state.commit`:
+                            //   - SAME extent (the common soft-error case — a
+                            //     transient replica failure that did NOT change
+                            //     the tail) → PRESERVE the worker's commit (the
+                            //     authoritative all-replica-acked prefix), only
+                            //     refresh replica addrs. BUG#2 (seed=8): zeroing
+                            //     it here let a later `seal_commit_watermark`
+                            //     report commit=0 and seal the live tail at
+                            //     sealed_length=0, orphaning acked VP/SST data
+                            //     (split child then can't open:
+                            //     stale_vp_offset_past_sealed_length).
+                            //   - DIFFERENT extent (a genuine roll to a fresh,
+                            //     empty open extent) → reset to 0 (correct).
+                            // Putting the same-vs-different decision in the
+                            // worker is load-bearing: only the worker knows its
+                            // current cached tail extent_id (the public API does
+                            // not), so it is the one place that can tell a
+                            // transient failure on the same tail apart from a
+                            // real tail change (coco review, 2026-05-30).
                             let mut tx_clone = tx.clone();
                             tx_clone
                                 .send(StreamSubmitMsg::ResetTail { tail: fresh })
@@ -3321,6 +3419,55 @@ mod pipeline_tests {
         assert!(state.poisoned);
         assert_eq!(state.lease_cursor, 300);
         assert_eq!(state.in_flight, 1);
+    }
+
+    /// BUG#2 (seed=8) regression: a soft-error tail reload onto the SAME open
+    /// extent must preserve the worker's append-progress state; only a roll to
+    /// a DIFFERENT extent resets it. Zeroing `commit` on a same-extent reload
+    /// let a later `seal_commit_watermark` report commit=0 and seal the live
+    /// tail at sealed_length=0, orphaning acked VP/SST data (split child then
+    /// un-openable: stale_vp_offset_past_sealed_length).
+    #[test]
+    fn reset_tail_same_extent_preserves_commit_and_poison() {
+        let mut state = StreamAppendState::new(
+            Rc::new(RefCell::new(HashMap::new())),
+            mpsc::channel::<FailureReport>(1).0,
+            Duration::from_secs(30),
+        );
+        let tail = |eid: u64| StreamTail {
+            extent: ExtentInfo {
+                extent_id: eid,
+                ..Default::default()
+            },
+            replica_addrs: vec!["a".to_string()],
+            replica_node_ids: vec![1],
+        };
+
+        // Worker on extent 18 with acked data + a marked hole + sealing freeze.
+        state.apply_reset_tail(tail(18));
+        state.commit = 8_657_884;
+        state.lease_cursor = 8_657_884;
+        state.poisoned = true;
+        state.sealing = true;
+
+        // Same-extent reload (transient replica failure) → preserve everything.
+        state.apply_reset_tail(tail(18));
+        assert_eq!(
+            state.commit, 8_657_884,
+            "same-extent reload must preserve commit (the all-replica-acked prefix)"
+        );
+        assert_eq!(state.lease_cursor, 8_657_884);
+        assert!(state.poisoned, "same-extent reload must preserve the hole marker");
+        assert!(state.sealing, "same-extent reload must preserve the sealing freeze");
+        assert_eq!(state.tail.as_ref().unwrap().extent.extent_id, 18);
+
+        // Genuine roll to a DIFFERENT (fresh, empty) extent → full reset.
+        state.apply_reset_tail(tail(30));
+        assert_eq!(state.commit, 0, "new extent must reset commit to 0");
+        assert_eq!(state.lease_cursor, 0);
+        assert!(!state.poisoned);
+        assert!(!state.sealing);
+        assert_eq!(state.tail.as_ref().unwrap().extent.extent_id, 30);
     }
 }
 

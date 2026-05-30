@@ -2009,6 +2009,16 @@ impl AutumnManager {
                 ex.sealed = true;
                 ex.sealed_length = sealed_length as u64;
                 ex.avali = Self::all_bits(ex.replicates.len() + ex.parity.len());
+                // BUG2 trace (opt-in): split CoW-tail seal. A `sealed_length=0`
+                // here freezes a shared tail that may hold VP/SST-acked data →
+                // child opens fail with stale_vp_offset_past_sealed_length.
+                tracing::info!(
+                    target: "bug2_trace",
+                    extent_id = *extent_id,
+                    dst_stream = dst_stream_id,
+                    sealed_length,
+                    "BUG2 split duplicate CoW-tail seal"
+                );
             }
             modified_extents.push(ex);
             dst.extent_ids.push(*extent_id);

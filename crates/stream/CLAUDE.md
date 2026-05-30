@@ -1015,6 +1015,44 @@ sufficient (and cheaper than DashMap).
     against `sealed_length` keep using `sealed_length` (it is the length).
     Invariant: `sealed_length > 0 ⇒ sealed`.
 
+22. **`ResetTail` zeroes the worker's commit ONLY when it moves to a DIFFERENT
+    extent (BUG#2, seed=8).** `StreamAppendState::apply_reset_tail` is the
+    single decision point. `state.commit` is the worker's contiguous
+    all-replica-acked prefix for its current tail — it advances ONLY on a full
+    all-replica ACK (`apply_completion`/`ack`), never speculatively ahead, so it
+    is ground truth for that extent and is the value the failover
+    `seal_commit_watermark` reports as the seal length. Two `ResetTail` shapes:
+    - **DIFFERENT extent** (a genuine roll to a fresh, empty tail, after
+      `alloc_new_extent`): `reset_for_new_extent` (commit/lease_cursor=0,
+      pending cleared, poisoned/sealing cleared) — commit=0 is correct for an
+      empty extent.
+    - **SAME extent** (a public-API SOFT-ERROR tail RELOAD that did NOT change
+      the tail — the common case is a transient replica failure, e.g. a
+      killed/restarting node refusing the connection): PRESERVE all
+      append-progress state, refresh only the cached replica metadata.
+    The BUG#2 data-loss path (confirmed by writer-side trace): the soft-error
+    open-tail reload used to `ResetTail` to the re-loaded SAME extent, running
+    `reset_for_new_extent` and ZEROING `commit`. The next retry escalated to the
+    hard path, whose `seal_commit_watermark` then reported `commit=0`, and
+    `alloc_new_extent(Some(0))` sealed the LIVE tail at `sealed_length=0` —
+    orphaning every acked VP/SST byte past 0. A partition split CoW-propagated
+    that poisoned extent to the child, which could then NEVER open
+    (`stale_vp_offset_past_sealed_length: ... sealed_length=0`). `poisoned`
+    (and `sealing`) MUST also be preserved on a same-extent reload: under
+    concurrent same-stream appends a non-tail-lease failure sets `poisoned` to
+    mark a HOLE (`rewind_or_poison`); kept poisoned, the next Append is rejected
+    so the caller escalates to seal-and-roll, which seals at the contiguous
+    `commit` (hole + everything after correctly excluded) rather than resuming
+    past the hole. **Invariant: never reset the worker's `commit`/`poisoned`
+    when staying on the same tail extent.** Opt-in localization aid: the
+    `bug2_trace` tracing target (silent unless `RUST_LOG=…,bug2_trace=info`)
+    logs every alloc-seal (`seal_path` + `seal_commit`), SealCommit reply,
+    probe responses, and EN under-seal — it pinned this root cause and is kept
+    for the under-seal class. Test:
+    `client::pipeline_tests::reset_tail_same_extent_preserves_commit_and_poison`.
+    Cross-ref: notes 20 (SealCommit handshake — `commit` is the seal source),
+    21 (`sealed` state), 9 (commit tracking is local).
+
 ---
 
 ## RPC Wire Protocol (extent_rpc.rs)

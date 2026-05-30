@@ -2928,6 +2928,23 @@ impl ExtentNode {
             .sealed_length
             .store(ex.sealed_length, Ordering::SeqCst);
         extent.avali.store(ex.avali, Ordering::SeqCst);
+        // BUG2 trace (opt-in, target `bug2_trace`): a manager seal that lands
+        // BELOW this replica's local file length orphans the acked bytes in
+        // `[sealed_length, local_len)` — the exact shape of
+        // `stale_vp_offset_past_sealed_length` (a VP at offset O > sealed_length
+        // is now unreadable). Silent in production (RUST_LOG unset); enabled in
+        // the chaos repro via `RUST_LOG=…,bug2_trace=info`.
+        let local_len = extent.len.load(Ordering::SeqCst);
+        if (ex.sealed || ex.sealed_length > 0) && (ex.sealed_length) < local_len {
+            tracing::warn!(
+                target: "bug2_trace",
+                extent_id = ex.extent_id,
+                new_sealed_length = ex.sealed_length,
+                local_len,
+                eversion = ex.eversion,
+                "BUG2 UNDER-SEAL: manager seal below local file length — orphans bytes [sealed_length, local_len)"
+            );
+        }
         // P0-C: the seal must be made durable when EITHER the extent newly
         // became sealed (incl. the sealed-EMPTY case `sealed_length` stays 0)
         // OR its sealed_length newly grew from 0 (the original F143 trigger —

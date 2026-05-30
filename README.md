@@ -2016,6 +2016,19 @@ AUTUMN_CHAOS_ACTIONS=split,merge,ec,fence,flush,compact,gc,kill,killfence,partit
 # Before the fixes this failed ~3/8 runs (poison wedge) then ~1/8 (routing wedge);
 # after, seed=6 passes 10/10. The PS log shows "bound OS-assigned fallback port"
 # 2-3x per run — the ephemeral-collision fallback engaging as designed.
+
+# BUG#2 (split child un-openable, stale_vp_offset_past_sealed_length): seed=8
+# reproduced it on run 1. Add the writer/seal trace to localize an under-seal:
+AUTUMN_CHAOS_SEED=8 AUTUMN_CHAOS_DURATION_SECS=60 \
+AUTUMN_CHAOS_EC_K=4 AUTUMN_CHAOS_EC_M=2 AUTUMN_CHAOS_NUM_ENS=8 \
+AUTUMN_CHAOS_ACTIONS=split,merge,ec,fence,flush,compact,gc,kill,killfence,partition,latency \
+RUST_LOG=warn,bug2_trace=info NO_COLOR=1 \
+  cargo test -p autumn-manager --test system_chaos -- --ignored --nocapture 2>&1 | grep BUG2
+# Pre-fix the trace showed: "SealCommit reply ... reported_commit=0 tail_extent=Some(18)"
+# then "alloc-seal applied extent_id=18 seal_commit=Some(0) ... sealed_len=0" — a live
+# tail sealed at 0 while it held an 8.6MB VP. After the fix (apply_reset_tail preserves
+# the worker commit on a same-extent soft-error reload) seed=8 passes 10/10, with NO
+# "seal_commit=Some(0) ... sealed_len=0" authoritative seal of a live tail.
 ```
 
 ## Notes
