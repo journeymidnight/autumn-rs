@@ -3549,6 +3549,44 @@ async fn serve_get_local(
     (frame, None)
 }
 
+/// Mode B fix (read decoupling): serve RANGE / HEAD LOCALLY on the ps-conn task,
+/// exactly like `serve_get_local` does for GET — instead of delegating through
+/// `req_tx → partition_loop`. When a flush wedges on a dead replica during a
+/// degraded window the imm queue fills and `partition_loop` parks in F120-A
+/// imm-full back-pressure (it stops reading `req_rx`), which is CORRECT
+/// back-pressure for WRITES but must not take READS down with it. `handle_range`
+/// / `handle_head` already do a brief `part.borrow()` to snapshot
+/// (mem_items + sst_reader Arcs / VP) and DROP it before any iteration / I/O —
+/// same single-thread RefCell + memtable-RwLock discipline that makes GET-local
+/// safe — so they run correctly off the write loop. region_epoch / has_overlap /
+/// TTL / tombstone semantics stay inside the unchanged handlers. NOTE: like the
+/// existing GET-local, this relaxes per-connection read-your-writes for a read
+/// pipelined behind an in-flight delegated write on the SAME connection; a
+/// connection-level prior-write barrier covering ALL local reads (get/range/head)
+/// is a coherent follow-up.
+async fn serve_read_local(
+    req_id: u32,
+    msg_type: u8,
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> (Bytes, Option<Bytes>) {
+    let result = if msg_type == MSG_RANGE {
+        crate::rpc_handlers::handle_range(payload, part).await
+    } else {
+        crate::rpc_handlers::handle_head(payload, part).await
+    };
+    let frame = match result {
+        Ok(p) => Frame::response(req_id, msg_type, p),
+        Err((code, message)) => Frame::error(
+            req_id,
+            msg_type,
+            autumn_rpc::RpcError::encode_status(code, &message),
+        ),
+    }
+    .encode();
+    (frame, None)
+}
+
 /// Delegate a request to `partition_loop` over the same-thread mpsc and await its
 /// response, returning the encoded response frame. Single-sources the
 /// "partition thread closed" / "partition response dropped" wording shared by the
@@ -3640,6 +3678,19 @@ fn push_one_frame_to_inflight(
             let part_c = part.clone();
             inflight.push(
                 async move { serve_get_local(req_id, msg_type, payload, &part_c).await }
+                    .boxed_local(),
+            );
+            return;
+        }
+    }
+
+    // Mode B fix: RANGE / HEAD are reads — serve them locally too so a flush-
+    // wedged partition_loop (imm-full back-pressure) can't take reads down.
+    if msg_type == MSG_RANGE || msg_type == MSG_HEAD {
+        if let Some(part) = part {
+            let part_c = part.clone();
+            inflight.push(
+                async move { serve_read_local(req_id, msg_type, payload, &part_c).await }
                     .boxed_local(),
             );
             return;
@@ -3739,6 +3790,12 @@ async fn d1_fast_path_round_trip(
     if msg_type == MSG_GET || msg_type == MSG_GET_ZC {
         if let Some(part) = part {
             return serve_get_local(req_id, msg_type, payload, part).await;
+        }
+    }
+    // Mode B fix: d=1 RANGE / HEAD served locally too (see push_one_frame_to_inflight).
+    if msg_type == MSG_RANGE || msg_type == MSG_HEAD {
+        if let Some(part) = part {
+            return serve_read_local(req_id, msg_type, payload, part).await;
         }
     }
 
@@ -6364,7 +6421,37 @@ pub(crate) struct FlushOutcome {
 /// snapshot, so multiple concurrent calls are race-free against each
 /// other. NEVER `pop_front`s the imm queue — that's `commit_flush_outcome`'s
 /// job.
+///
+/// **Claim release on error (Mode B fix).** The caller (`flush_one_imm` /
+/// `background_flush_loop`) inserts this imm's ptr into `flushing_imm_ptrs`
+/// BEFORE calling us — a latch that makes the OTHER flush path defer ("someone
+/// else owns this imm; its commit will pop it"). On SUCCESS the ptr is removed
+/// by `commit_flush_outcome` when it pops the imm. On ERROR (e.g. a `row_stream`
+/// append wedged on a dead replica during a degraded window) we MUST release
+/// the latch here — otherwise the imm is orphaned: claimed-but-no-one-flushing,
+/// so every later flush attempt defers to a phantom flusher → the imm never
+/// drains → `partition_loop` stays imm-full parked FOREVER → range/write wedge
+/// (Mode B's "permanent" symptom). This wrapper releases on every error path;
+/// the background loop's backoff-retry then re-claims + retries until the
+/// cluster recovers (self-heal).
 pub(crate) async fn run_flush_async_phase(
+    part: Rc<RefCell<PartitionData>>,
+    imm_mem: Arc<Memtable>,
+) -> Result<FlushOutcome> {
+    let src_imm_ptr = Arc::as_ptr(&imm_mem) as usize;
+    let part_release = part.clone();
+    let result = run_flush_async_phase_inner(part, imm_mem).await;
+    if result.is_err() {
+        part_release
+            .borrow()
+            .flushing_imm_ptrs
+            .borrow_mut()
+            .remove(&src_imm_ptr);
+    }
+    result
+}
+
+async fn run_flush_async_phase_inner(
     part: Rc<RefCell<PartitionData>>,
     imm_mem: Arc<Memtable>,
 ) -> Result<FlushOutcome> {
@@ -6468,6 +6555,28 @@ pub(crate) async fn run_flush_async_phase(
 /// threaded P-log granularity — meta_stream record order = borrow_mut
 /// order, as before.
 pub(crate) async fn commit_flush_outcome(
+    part: &Rc<RefCell<PartitionData>>,
+    outcome: FlushOutcome,
+) -> Result<()> {
+    // Mode B fix (coco P1): release the claim-by-ptr on ANY error. The inner
+    // function can error BEFORE it pops the imm + removes the ptr (the
+    // `get_stream_info` pre-step), which would orphan the imm: still claimed,
+    // still in the queue → the backoff-retry sees it "already claimed" and
+    // skips it forever → permanent wedge. Removing here is idempotent: if the
+    // inner already popped + removed (a later meta-append error), this is a
+    // no-op. Mirrors `run_flush_async_phase`'s release-on-error wrapper.
+    let src_imm_ptr = outcome.src_imm_ptr;
+    let result = commit_flush_outcome_inner(part, outcome).await;
+    if result.is_err() {
+        part.borrow()
+            .flushing_imm_ptrs
+            .borrow_mut()
+            .remove(&src_imm_ptr);
+    }
+    result
+}
+
+async fn commit_flush_outcome_inner(
     part: &Rc<RefCell<PartitionData>>,
     outcome: FlushOutcome,
 ) -> Result<()> {
@@ -6718,17 +6827,46 @@ where
 /// commit returns Err, drain the remaining inflight (so they don't
 /// dangle) and break. The next `flush_rx` signal restarts the loop
 /// — same retry behaviour as pre-F197.
+/// Mode B fix: how often `background_flush_loop` re-attempts a still-pending imm
+/// after a flush error (e.g. row_stream append wedged on a dead replica), so the
+/// flush self-heals once the cluster recovers without needing a new-write signal.
+/// 2 s is well below the chaos settle window and far above a tight error spin.
+const FLUSH_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
 async fn background_flush_loop(
     part: Rc<RefCell<PartitionData>>,
     mut flush_rx: mpsc::UnboundedReceiver<()>,
 ) {
-    use futures::future::FutureExt;
+    use futures::future::{select, Either, FutureExt};
     use futures::stream::FuturesOrdered;
     type FlushFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<FlushOutcome>>>>;
 
     let cap = ps_flush_inflight_cap();
 
-    while flush_rx.next().await.is_some() {
+    loop {
+        // Wait for a flush signal. Mode B fix: if imm is STILL pending (a prior
+        // flush failed — e.g. row_stream append wedged on a dead replica — and
+        // released its claim, or back-pressure), ALSO wake on a retry timer so
+        // the failed flush is re-attempted and SELF-HEALS once the cluster
+        // recovers, even though no new write arrives to signal us (partition_loop
+        // is parked imm-full, so no rotate → no flush_tx). Without this retry the
+        // released imm would just sit unclaimed forever and the wedge persists.
+        let pending = !part.borrow().imm.is_empty();
+        if pending {
+            let signal = flush_rx.next();
+            let timer = compio::time::sleep(FLUSH_RETRY_BACKOFF);
+            futures::pin_mut!(signal, timer);
+            match select(signal, timer).await {
+                Either::Left((s, _)) => {
+                    if s.is_none() {
+                        break;
+                    }
+                }
+                Either::Right(((), _)) => {} // retry tick — re-attempt pending imm
+            }
+        } else if flush_rx.next().await.is_none() {
+            break;
+        }
         let mut inflight: FuturesOrdered<FlushFuture> = FuturesOrdered::new();
         let mut failed = false;
         loop {
@@ -6779,7 +6917,16 @@ async fn background_flush_loop(
             match inflight.next().await {
                 Some(Ok(outcome)) => {
                     if failed {
-                        // Drop the outcome (already partway through drain).
+                        // A prior imm in this FIFO batch failed, so we cannot
+                        // commit this (later) one (commit pops front-in-order).
+                        // Release its claim-by-ptr so the next backoff round
+                        // re-claims + re-flushes it — Mode B fix; without this,
+                        // a successful-but-dropped flush leaks its claim and
+                        // orphans the imm forever (same wedge as the error path).
+                        part.borrow()
+                            .flushing_imm_ptrs
+                            .borrow_mut()
+                            .remove(&outcome.src_imm_ptr);
                         continue;
                     }
                     if let Err(e) = commit_flush_outcome(&part, outcome).await {

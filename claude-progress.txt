@@ -1,3 +1,72 @@
+Date: 2026-05-30 (Mode B)
+TaskStatus: completed
+Task scope: FIX Mode B — the P-bulk row_stream flush-append wedge that made
+  RANGE unavailable (range TIMED OUT + "missing keys", but GET fine,
+  mismatches=0 = NOT data loss). Planned with coco (arch mode), implemented +
+  validated. seed=13 6/6 PASS (was ~2/4 failing on the range wedge).
+
+=== ROOT CAUSE (pinned + coco-confirmed) ===
+  1. P-bulk flush's `row_stream.append` wedges on a dead/saturated replica during
+     a multi-node degraded window (network partition marks disks offline →
+     select_nodes rejects them → alloc_new_extent "no healthy node" → the
+     20×30s retry GRINDS). The flush doesn't complete.
+  2. Stuck flush → imm fills to MAX_IMM_DEPTH=4 → partition_loop parks in F120-A
+     imm-full back-pressure (stops reading req_rx).
+  3. GET is served LOCALLY on ps-conn (serve_get_local); RANGE/HEAD go through
+     req_tx → partition_loop. So a parked loop wedges RANGE/HEAD while GET works.
+  4. THE PERMANENT-WEDGE AMPLIFIER (coco P1, real bug): `flushing_imm_ptrs` is a
+     per-imm "who's flushing this" latch (mutex between background_flush_loop +
+     inline flush_one_imm from split/merge/drain, both on the P-log runtime — so
+     the same imm isn't double-flushed). Its CONTRACT is "the claimer always
+     reaches commit_flush_outcome (pops imm + removes ptr)". On flush ERROR
+     (run_flush_async_phase Err, or commit_flush_outcome's get_stream_info
+     pre-step Err, or a dropped-Ok when a FIFO-earlier imm failed) the ptr was
+     NOT removed → the imm is ORPHANED (claimed but no-one flushing) → every
+     later flush defers to a phantom flusher → imm NEVER drains → partition_loop
+     stays parked FOREVER → RANGE permanently wedged. This turned a transient
+     degraded window into a permanent wedge.
+
+=== FIXES (partition-server/src/lib.rs) ===
+  #1 (root, self-heal): release the `flushing_imm_ptrs` claim on EVERY flush
+     error path, so the imm is re-claimable + retried:
+     - `run_flush_async_phase` wrapped → removes its src_imm_ptr on Err.
+     - `commit_flush_outcome` wrapped → removes src_imm_ptr on Err (idempotent;
+       covers the get_stream_info pre-step error before the pop) (coco P1).
+     - background_flush_loop: when a FIFO-earlier imm failed, the dropped
+       successful Ok outcomes also release their ptr.
+     - background_flush_loop OUTER loop: retry pending imm after FLUSH_RETRY_
+       BACKOFF (2s) — so a failed flush self-heals once the cluster recovers
+       even with NO new write (partition_loop is parked → no rotate → no
+       flush_tx signal).
+  #3 (decouple reads): serve RANGE + HEAD LOCALLY on ps-conn (new
+     `serve_read_local`, routed in both the pipelined + d=1 dispatch points),
+     mirroring serve_get_local. handle_range/handle_head already brief-borrow +
+     drop before iterating (same single-thread RefCell + memtable-RwLock safety
+     as GET-local). So a flush-wedged partition_loop back-pressures WRITES
+     (correct) but reads (get/range/head) stay available.
+  #1 ALONE was insufficient (validated): the dominant Mode B is the flush stuck
+  IN-PROGRESS (alloc grinding, not yet errored) → no error for #1 to release on
+  → range still wedged. #3 keeps range available regardless; #1 makes the write
+  side self-heal once the flush errors out.
+
+=== DEFERRED (coco arch P2/P3, NOT Mode B core) ===
+  #2 fail-fast the flush append (shorter alloc retry budget for the background
+  flush path so it errors fast → #1 retries faster) — refinement, makes self-
+  heal quicker but #1+#3 already pass. Plus: per-connection prior-write barrier
+  for ALL local reads (get/range/head) (read-your-writes — same gap GET-local
+  already has; not hit by the reads-only verify); drain-ack should carry flush
+  failure; flush manifest-publish ordering vs RocksDB MANIFEST; explicit
+  ReadSnapshot. All filed, separate work.
+
+=== VALIDATION ===
+  seed=13 x6 = 6/6 PASS (range errors=0, mismatches=0) — was ~2/4 failing on the
+  range wedge. + seed=6 (bug #3) + seed=1 + f250 invariant PASS, all mismatches=0.
+  partition-server 148 lib tests; clippy clean. coco /findbugs (rule 12) +
+  /arch in planning: arch found the claim-leak + retry-budget root bugs; findbugs
+  found the commit_flush_outcome pre-step leak — all fixed.
+
+--- prior (d006505): seal_commit Option + MgrExtentInfo.sealed ---
+
 Date: 2026-05-30 (latest)
 TaskStatus: not_completed
 Task scope: user-steered API/model cleanup of the SealCommit work (commit

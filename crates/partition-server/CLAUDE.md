@@ -1473,3 +1473,40 @@ post-restart.
     fullscan scans) distinguishes a bloom false-negative vs a block-selection
     miss vs true data loss; used by `crates/manager/tests/
     f250_fence_flush_invariant.rs`.
+
+15. **The `flushing_imm_ptrs` claim MUST be released on EVERY flush error path,
+    and reads (RANGE/HEAD) MUST be served off `partition_loop` (Mode B fix).**
+    `flushing_imm_ptrs` is a per-imm "who is flushing this" latch shared by the
+    two flush drivers on the P-log runtime — `background_flush_loop` (lazy) and
+    `flush_one_imm` (eager, called inline by split / merge / graceful+freeze
+    drain) — so the same imm is never double-flushed. Its load-bearing CONTRACT:
+    *the claimer always reaches `commit_flush_outcome`, which pops the imm +
+    removes the ptr.* If a flush ERRORS without removing the ptr, the imm is
+    orphaned (claimed but no-one flushing) → every later flush attempt sees it
+    "already claimed" and defers to a phantom flusher → the imm NEVER drains →
+    `partition_loop` stays imm-full parked (F120-A) FOREVER → since RANGE/HEAD
+    were delegated through the parked loop, they wedge permanently (GET kept
+    working because it is served locally on ps-conn). Root cause = a
+    `row_stream` flush append wedged on a dead replica during a degraded window.
+    **Two-part fix, both load-bearing:**
+    - **Release on every error.** `run_flush_async_phase` AND
+      `commit_flush_outcome` are thin wrappers that `flushing_imm_ptrs.remove`
+      their `src_imm_ptr` on any Err (idempotent — no-op if the inner already
+      popped + removed). `background_flush_loop` also releases the ptr of a
+      *successful* outcome it must DROP because a FIFO-earlier imm in the same
+      batch failed. The loop then retries pending imm every `FLUSH_RETRY_BACKOFF`
+      (2 s) so a failed flush self-heals once the cluster recovers — even with no
+      new write to signal it (a parked loop produces no rotate → no `flush_tx`).
+      **Invariant: any new flush error path must release the claim (or the imm
+      orphans + the partition permanently wedges).**
+    - **Reads off the write loop.** RANGE + HEAD are served LOCALLY on the
+      ps-conn task (`serve_read_local`, both dispatch points), mirroring
+      `serve_get_local` for GET. `handle_range`/`handle_head` brief-`borrow()` to
+      snapshot then `drop` before iterating — same single-thread RefCell +
+      memtable-`RwLock` discipline that makes GET-local safe — so a flush-wedged
+      (back-pressured) `partition_loop` halts WRITES (correct) without taking
+      READS down. Relaxes per-connection read-your-writes for a read pipelined
+      behind an in-flight delegated write on the same connection (same gap
+      GET-local already has); a connection-level prior-write barrier over all
+      local reads is a noted follow-up. **Invariant: read handlers served locally
+      must never hold a `RefCell` borrow across an `.await`.**
