@@ -430,13 +430,48 @@ async fn refresh_topology(mgr: &RpcClient, topo: &Topology) {
     *topo.parts.borrow_mut() = new_parts;
 }
 
+/// Number of distinct keys per writer prefix. Both the writers and the
+/// no-phantom range checker use this so the "valid key space" is one source of
+/// truth: keys are exactly `{b|q}{kid:06}` for `kid in [0, CHAOS_KEY_COUNT)`.
+const CHAOS_KEY_COUNT: u32 = 200;
+
+/// Parse a chaos key `{b|q}{6 ASCII digits}` → its `kid`, or None if it is not a
+/// well-formed key any writer could have produced. Used by the no-phantom range
+/// check: a range MUST NOT return a key outside this space (a malformed key, a
+/// kid the writers never use, or a sibling key leaked across a split/merge
+/// boundary would all be data-corruption signals).
+fn chaos_kid(key: &[u8]) -> Option<u32> {
+    if key.len() == 7
+        && (key[0] == b'b' || key[0] == b'q')
+        && key[1..].iter().all(u8::is_ascii_digit)
+    {
+        std::str::from_utf8(&key[1..]).ok()?.parse::<u32>().ok()
+    } else {
+        None
+    }
+}
+
+/// True iff `key` is a key a writer could legitimately have written.
+fn is_valid_chaos_key(key: &[u8]) -> bool {
+    matches!(chaos_kid(key), Some(kid) if kid < CHAOS_KEY_COUNT)
+}
+
 fn make_value(key: &[u8], seq: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64);
+    // VP/large-value coverage (coco arch gap #5/#9): ~1/8 of keys carry a value
+    // ABOVE the 4 KiB VALUE_THROTTLE so they take the ValuePointer path
+    // (value stored in log_stream, VP in the SSTable) and get exercised by the
+    // GC punch_holes / dangling-VP-read path on overwrite. The size is a
+    // deterministic function of the key, so a given key is ALWAYS the same
+    // length (VP-path consistency), and `seq` + `key` are encoded at the front
+    // so any byte corruption — small OR large — is caught by `verify_per_key`.
+    let big = matches!(chaos_kid(key), Some(kid) if kid.is_multiple_of(8));
+    let target = if big { 8192 } else { 256 };
+    let mut out = Vec::with_capacity(target);
     out.extend_from_slice(b"chaos-");
     out.extend_from_slice(&seq.to_le_bytes());
     out.extend_from_slice(b":");
     out.extend_from_slice(key);
-    while out.len() < 256 {
+    while out.len() < target {
         out.extend_from_slice(b"x");
     }
     out
@@ -1343,6 +1378,9 @@ async fn verify_per_partition_range(
 
         // Scan partition via repeated MSG_RANGE pages.
         let mut got: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        // Last key seen (across pages) for the strictly-ascending / no-duplicate
+        // check. Resets per partition.
+        let mut prev_key: Option<Vec<u8>> = None;
         let mut cursor: Vec<u8> = start.clone();
         let page_limit: u32 = 256;
         for _ in 0..200 {
@@ -1395,11 +1433,56 @@ async fn verify_per_partition_range(
             }
             let last = r.entries.last().unwrap().key.clone();
             for kv in r.entries {
-                got.insert(kv.key);
+                let k = kv.key;
+                // (a) ORDER: range must return keys in strictly ascending order.
+                // A non-increasing key = duplicate or out-of-order = a real
+                // iterator/merge bug (coco arch gap #5/#6). `prev_key` is the
+                // last key seen across ALL pages for this partition.
+                if let Some(p) = &prev_key {
+                    if k <= *p {
+                        errors.push(format!(
+                            "part {pid}: range NOT ascending — {:?} after {:?}",
+                            String::from_utf8_lossy(&k),
+                            String::from_utf8_lossy(p)
+                        ));
+                    }
+                }
+                // (b) NO PHANTOM (malformed / never-written key). Any key outside
+                // the writers' `{b|q}{kid<COUNT}` space is corruption.
+                if !is_valid_chaos_key(&k) {
+                    errors.push(format!(
+                        "part {pid}: range returned PHANTOM/malformed key {:?}",
+                        String::from_utf8_lossy(&k)
+                    ));
+                }
+                // (c) IN-RANGE: a key outside this partition's [start, end) is a
+                // CoW split/merge sibling leak (a key that belongs to another
+                // partition's range showing up here).
+                let in_range = k.as_slice() >= start.as_slice()
+                    && (end.is_empty() || k.as_slice() < end.as_slice());
+                if !in_range {
+                    errors.push(format!(
+                        "part {pid}: range returned OUT-OF-RANGE key {:?} (range [{:?},{:?}))",
+                        String::from_utf8_lossy(&k),
+                        String::from_utf8_lossy(start),
+                        String::from_utf8_lossy(end)
+                    ));
+                }
+                prev_key = Some(k.clone());
+                got.insert(k);
             }
-            // Advance cursor past `last`.
+            // Advance cursor STRICTLY PAST every MVCC version of `last`. The
+            // internal key is `user_key ++ 0x00 ++ BE(u64::MAX - seq)`, so
+            // `last`'s versions span `last\x00\x00…` (newest) … `last\x00\xff…`
+            // (oldest). Appending 0x00 (the old `push(0)`) makes the PS seek
+            // `key_with_ts(last\x00, MAX) = last\x00\x00…`, which lands BEFORE
+            // `last`'s older versions → the page re-returns `last` forever
+            // (the old HashSet-dedup hid this; the no-duplicate/order check
+            // above surfaces it). Appending 0x01 makes the seek
+            // `last\x01\x00…` > `last\x00\xff…`, clearing all of `last`'s
+            // versions while staying below the next user key.
             let mut next = last;
-            next.push(0);
+            next.push(1);
             cursor = next;
             // Hit cur_end_key (partition end)?
             if !r.cur_end_key.is_empty() && cursor >= r.cur_end_key {
@@ -1590,7 +1673,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             let lcg = Lcg::new(cfg.seed.wrapping_add(101));
             async move {
                 writer_loop(
-                    "w1", router, topo, expected, b'b', 200, stop, writes_acked, writes_failed, lcg,
+                    "w1", router, topo, expected, b'b', CHAOS_KEY_COUNT, stop, writes_acked, writes_failed, lcg,
                 )
                 .await;
             }
@@ -1605,7 +1688,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             let lcg = Lcg::new(cfg.seed.wrapping_add(202));
             async move {
                 writer_loop(
-                    "w2", router, topo, expected, b'q', 200, stop, writes_acked, writes_failed, lcg,
+                    "w2", router, topo, expected, b'q', CHAOS_KEY_COUNT, stop, writes_acked, writes_failed, lcg,
                 )
                 .await;
             }
