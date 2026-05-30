@@ -53,11 +53,51 @@ Task scope: Start the FIX session for the chaos-found F227-area bugs, with coco
   the stale sealed-empty row extent. CONFIRMED by code read. log_stream path
   (seed=8): old P-log/PS appends VP before learning the seal. P0-C/A/B do NOT
   close this (they fix restart-ghost, not runtime ghost-write-after-seal).
-  FIX DIRECTION (coco, NOT compute_commit_seal): (a) P-bulk RowAppend consumes
-  the split invalidation; (b) seal/fence propagation to EN OR epoch-in-append
-  the EN enforces; (c) validate referenced extent epoch/seal before meta
-  checkpoint. coco recommends a trace to confirm first. AWAITING user direction
-  on the fix. not_completed.
+  INSTRUMENT-VERIFIED (4/4 reproductions): failing extent sealed-EMPTY via
+  alloc_extent at eversion=2 [manager trace fired]; compaction RowAppend ghost
+  =0 [REFUTED coco's first sub-path]; BUG#1 seal-roll =0 [REFUTED]. So the ghost
+  write is NOT compaction + NOT BUG#1.
+  REFINED ROOT CAUSE (2nd coco arch + code-confirmed, user-guided): PARTITION
+  REOPEN OVERLAP breaks single-writer. sync_regions_once (lib.rs) drops the old
+  PartitionHandle (fire-and-forget; the old partition_loop even KEEPS serving
+  req_rx after drain_rx EOF) + IMMEDIATELY opens the new instance — old+new
+  overlap-write the same streams. New instance B's SealCommit seals at B's OWN
+  local state.commit=0 (B didn't write the data; old A did), orphaning A's
+  all-replica-acked data → sealed_length=0 with a VP/SST at offset>0. SealCommit
+  freeze is PER-WORKER, can't drain the orphaned old instance.
+  FIX = (a) drain-before-reopen ONLY (user chose A; (c) seal-via-probe REJECTED
+  because probe has phantom [seed=13 Mode A] + block [bug#3] — SealCommit Some
+  exists precisely to avoid the probe; once single-writer is restored Some is
+  exact/safe). (b) epoch fencing = long-term, deferred.
+  *** REOPEN-OVERLAP HYPOTHESIS REFUTED BY DATA — fix REVERTED. ***
+  Implemented drain-before-reopen (drain_and_stop_partition + stopping map +
+  reap_stopping in sync_regions_once); coco found 2 issues (P1 budget early-dec,
+  P2 serial block). BUT chaos validation: bug#2 STILL reproduced (seed=8 bug2=40,
+  seed=31 bug2=6) with **reloads=0 AND drainfix_logs=0 in EVERY run** — the
+  chaos test handles region changes IN-PLACE (handle_split_part F212-fix-2
+  updates rg without drop+reopen), so the partition is NEVER reloaded, so the
+  fix never engages. Reverted lib.rs (unvalidated, not the bug#2 path). The
+  reopen-overlap IS a real code-confirmed P0 (fire-and-forget drop+reopen) but
+  is LOW-EXPOSURE (reloads ~never happen) and NOT the bug#2 cause. Recorded as a
+  deferred hardening.
+  *** CORRECTED: bug#2 is SPLIT-TIME, worker/StreamClient-level, NOT reopen. ***
+  Timeline (seed=31): the split CHILD (part 28) fails to open reading a rowStream
+  SST/log VP in an extent the manager sealed-EMPTY EARLY (eversion=2, before the
+  split). The dual-writer that orphans the data is NOT two partition instances —
+  it's at the per-stream WORKER level (split calls part_sc.invalidate_stream +
+  sets need_invalidate_row_stream → old worker discarded, new worker spawned with
+  commit=0) AND/OR a failover roll. invalidate_stream discards the cached worker
+  fire-and-forget; if the OLD worker had acked data (VP created) but the NEW
+  worker inits/seals before that's reflected, OR an early failover seals the
+  empty tail while a stale worker keeps writing, the data gets orphaned.
+  NEXT (definitive): WRITER-SIDE trace — log every log_stream/row_stream append's
+  target extent_id + offset + which worker/StreamClient + the seal events, run
+  seed=8/31 until it fires, pin exactly which writer puts 8.6MB/2.6MB into the
+  sealed-empty extent and when relative to the seal. Then fix the actual path
+  (likely: invalidate_stream must DRAIN the old worker before the new inits, or
+  the split-time seal must account for the in-flight writer). LESSON: trace the
+  WRITER first; don't implement a fix on an unconfirmed hypothesis (cost a full
+  reopen-fix cycle). not_completed.
 
 === STEP 1 — P0-C: persist sealed-empty extent state in EN .meta (DONE) ===
   Bug: EN .meta only stored sealed_length, so a manager sealed-EMPTY extent
