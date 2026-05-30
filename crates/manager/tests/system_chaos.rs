@@ -1351,6 +1351,125 @@ async fn verify_per_key(
     (total, mismatches, not_found)
 }
 
+/// Post-settle WRITE-LIVENESS / convergence check (coco arch gap #1: "does the
+/// cluster CONVERGE post-settle — no stuck inflight?").
+///
+/// `verify_per_key` + `verify_per_partition_range` are both READ-ONLY. The
+/// nastiest failure class in this stream+partition layer — a never-completing
+/// Recovery on a tail extent that makes `stream_alloc_extent` refuse, wedging
+/// flush + (eventually) writes — is INVISIBLE to reads: point-gets and ranges
+/// keep serving the already-flushed data fine while every WRITE hangs. So we
+/// must prove the cluster can still take writes after the chaos stops.
+///
+/// For each partition we fire a burst of fresh in-range PUTs carrying 8 KiB
+/// values (above the 4 KiB VALUE_THROTTLE) so the burst applies real memtable
+/// pressure → rotation → flush → `row_stream.append` → `alloc_extent` — i.e. it
+/// exercises the exact path the recovery-stuck bug wedges, not just a memtable
+/// insert. Each PUT is bounded by a 5 s timeout.
+///
+/// A partition FAILS liveness only on an UNAMBIGUOUS wedge — either a 5 s PUT
+/// timeout (PS accepted the connection but never replied), or zero acks across
+/// the whole retry window. A partition that acks even one write is alive; this
+/// keeps false positives near zero (a mid-reopen blip surfaces as a transient
+/// connection error and is retried, not failed). These writes run AFTER both
+/// read verifies, so they never pollute the data-correctness checks.
+async fn verify_write_liveness(router: &PsRouter, topo: &Topology) -> Vec<String> {
+    const LIVENESS_WRITES: u64 = 50;
+    let mut errors: Vec<String> = Vec::new();
+    let parts = topo.snapshot();
+    for (start, end, part_id) in parts {
+        // Build an in-range, well-formed chaos key that routes to THIS
+        // partition: walk the valid key space and take the first key whose
+        // range contains it. (A partition created mid-split may own a sub-range
+        // that no single literal key prefix covers, so we must search.)
+        let probe_key: Option<Vec<u8>> = (0..CHAOS_KEY_COUNT)
+            .flat_map(|kid| {
+                [
+                    format!("b{kid:06}").into_bytes(),
+                    format!("q{kid:06}").into_bytes(),
+                ]
+            })
+            .find(|k| {
+                k.as_slice() >= start.as_slice()
+                    && (end.is_empty() || k.as_slice() < end.as_slice())
+            });
+        let Some(probe_key) = probe_key else {
+            // No representable key in this partition's range — nothing we can
+            // legitimately write here; skip (not a wedge).
+            continue;
+        };
+
+        let mut acked: u64 = 0;
+        let mut timed_out = false;
+        'burst: for i in 0..LIVENESS_WRITES {
+            // Distinct large value per write so the burst can't be coalesced
+            // into a no-op; `seq` carried at the front (verify-compatible
+            // encoding) though we don't re-read these.
+            let value = make_value(&probe_key, 1_000_000 + i);
+            let payload = partition_rpc::rkyv_encode(&partition_rpc::PutReq {
+                part_id,
+                key: probe_key.clone(),
+                value,
+                expires_at: 0,
+                region_epoch: 0,
+            });
+            // Up to 3 attempts per write to ride out a transient reopen blip.
+            for _attempt in 0..3 {
+                let client = match router.try_client_for(part_id).await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        compio::time::sleep(Duration::from_millis(300)).await;
+                        continue;
+                    }
+                };
+                match compio::time::timeout(
+                    Duration::from_secs(5),
+                    client.call(partition_rpc::MSG_PUT, payload.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(resp)) => {
+                        match partition_rpc::rkyv_decode::<partition_rpc::PutResp>(&resp) {
+                            Ok(r) if r.code == partition_rpc::CODE_OK => {
+                                acked += 1;
+                                continue 'burst;
+                            }
+                            // Rejected (epoch / range) — retry; topology should
+                            // be stable post-settle, but tolerate a late blip.
+                            _ => {
+                                compio::time::sleep(Duration::from_millis(300)).await;
+                            }
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        compio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                    Err(_) => {
+                        // 5 s timeout = the PS took the connection but never
+                        // replied = the wedge we are hunting. Record + stop.
+                        eprintln!(
+                            "liveness: PUT TIMED OUT (5s) part_id={part_id} write={i}/{LIVENESS_WRITES} — partition wedged for writes"
+                        );
+                        timed_out = true;
+                        break 'burst;
+                    }
+                }
+            }
+        }
+
+        if timed_out {
+            errors.push(format!(
+                "part {part_id}: WRITE WEDGE — PUT timed out (5s) after {acked}/{LIVENESS_WRITES} acked post-settle"
+            ));
+        } else if acked == 0 {
+            errors.push(format!(
+                "part {part_id}: WRITE WEDGE — 0/{LIVENESS_WRITES} writes acked post-settle (partition cannot take writes)"
+            ));
+        }
+    }
+    errors
+}
+
 /// Range invariant: for each partition, walk it with `MSG_RANGE` and
 /// confirm every expected key in `[start, end)` is returned. Detects
 /// silent loss for keys that `verify_per_key` would still find via
@@ -1816,15 +1935,28 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         let range_errors = verify_per_partition_range(&router, &topo, &expected_snapshot).await;
         eprintln!("chaos: range verify: errors={}", range_errors.len());
 
-        if !mismatches.is_empty() || !not_found.is_empty() || !range_errors.is_empty() {
+        // Post-settle convergence: every partition must still take writes
+        // (catches the recovery-stuck → alloc_extent wedge that read-only
+        // verification can't see — point-gets keep working while writes hang).
+        eprintln!("chaos: verifying write-liveness per partition");
+        let liveness_errors = verify_write_liveness(&router, &topo).await;
+        eprintln!("chaos: write-liveness verify: errors={}", liveness_errors.len());
+
+        if !mismatches.is_empty()
+            || !not_found.is_empty()
+            || !range_errors.is_empty()
+            || !liveness_errors.is_empty()
+        {
             panic!(
-                "chaos verify FAILED — mismatches={} not_found={} range_errors={}\nmismatches: {}\nnot_found: {}\nrange_errors: {}",
+                "chaos verify FAILED — mismatches={} not_found={} range_errors={} liveness_errors={}\nmismatches: {}\nnot_found: {}\nrange_errors: {}\nliveness_errors: {}",
                 mismatches.len(),
                 not_found.len(),
                 range_errors.len(),
+                liveness_errors.len(),
                 mismatches.iter().take(10).cloned().collect::<Vec<_>>().join(", "),
                 not_found.iter().take(10).cloned().collect::<Vec<_>>().join(", "),
                 range_errors.iter().take(10).cloned().collect::<Vec<_>>().join("; "),
+                liveness_errors.iter().take(10).cloned().collect::<Vec<_>>().join("; "),
             );
         }
         eprintln!("chaos: all invariants OK ({total} keys)");
