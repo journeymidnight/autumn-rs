@@ -58,17 +58,55 @@ Task scope: /loop "coco arch review chaos test, add new scenarios, run new
      connect and never refreshed → node 1 may reject commit_length with the
      stale revision (counted as "not responded") even once reachable → makes
      the transient 3/4 PERMANENT.
-  STATUS: coco arch review (rule 12) running for an independent root-cause read.
-  FIX TOUCHES F227 + fence semantics (user-owned per memory + README) — will
-  surface findings + a fix proposal to the user rather than change unilaterally
-  in the autonomous loop. Candidate directions (to validate against data-loss
-  safety): (a) open-tail seal-and-roll escape in ensure_tail_initialised when
-  current_commit is persistently unsatisfiable (lenient seal-over-reachable +
-  fresh tail on healthy nodes); (b) PS refresh/re-acquire StreamClient revision
-  on LockedByOther/eversion-stale instead of hard-fail; (c) reconsider whether
-  the flush commit_length needs strict all-replica given append is already
-  all-replica-ACK. Repro: AUTUMN_CHAOS_SEED=15 (same K4/M2 harsh cmd).
-  Memory: project_recovery_stuck_blocks_alloc (same family; update pending).
+  STATUS: coco arch review (rule 12, GPT-5.5) DONE. USER DECISION 2026-05-30:
+  "defer all — keep hunting" → NO F227/durability fix now; findings recorded for
+  a future batched fix WITH the user; continue the chaos loop for more bugs.
+  coco CONFIRMED the open-tail root cause + CORRECTED my fence hypothesis:
+   - SAFE fix for the wedge = ensure_tail_initialised open-tail branch falls
+     back to `alloc_new_extent(stream_id, None)` on persistent current_commit
+     failure (manager seal-over-reachable probe picks the durable min). MUST be
+     None, NOT Some(0) (Some(0) asserts commit=0 → reintroduces F227 silent
+     truncation).
+   - The EN-node-fence owner_revision bump was ALREADY REMOVED (Layer-B
+     34c9eb5), so "FenceUnfence locks out the PS" is NOT the current mechanism;
+     open-tail no-escape alone explains the permanent wedge. coco WARNS the
+     candidate "PS refresh revision on LockedByOther" is DANGEROUS (old leader
+     resurrecting past a fence — PS must self-isolate + re-validate ownership).
+
+  === coco ALSO FOUND 3 NEW P0 DATA-CORRUPTION BUGS (deferred, batch later) ===
+  All are swallowed-error / non-persistable-state bugs in the EN durability +
+  fencing path (revert-prone F227 area). Recorded for the future fix:
+   P0-A apply_extent_meta_durable (extent_node.rs ~2787): `.dat` sync_data
+     failure only WARNs, then still `let _ = save_meta(sealed_length=L)`. A
+     non-durable .dat shorter than L + a persisted sealed_length=L → post-crash
+     the read/EC/recovery path believes a sealed prefix exists → EOF / zero-pad
+     / short-read / wrong data. Fix dir: apply_extent_meta_durable → Result;
+     on .dat fsync fail, mark disk offline + do NOT save_meta + propagate.
+   P0-B append owner_revision bump not durably bound (extent_node.rs ~1544 mem
+     bump, ~1705 `let _ = save_meta`): EN ACKs a new owner's write CODE_OK but
+     the fencing-token persist failed silently → restart reads the OLD lower
+     owner_revision from .meta → a stale/ghost writer's lower revision passes
+     the fence again → split-brain / double-write / header.commit truncation.
+     Fix dir: revision_changed ⇒ save_meta failure must fail the append.
+   P0-C sealed-empty extent state not persistable (.meta has no sealed flag;
+     load restores avali only when sealed_length>0; apply_extent_meta_durable
+     skips sealed_length==0). manager sealed-empty tail (empty roll / CoW-shared
+     split-merge tail / SealCommit commit=0) → EN restart sees sealed_length=0,
+     avali=0 → append sealed-check false → a ghost writer with the old tail can
+     write a manager-sealed/CoW-shared extent → CoW isolation break / double
+     write. (= the "known gap, deferred" in manager note 32 — coco rates P0.)
+     Fix dir: .meta V2 explicit `sealed: bool` (or persist avali); sealed-empty
+     must persist + be enforced on append/truncate.
+   P1-D await_extent_synced_to flush VP barrier (client.rs ~2094) is also
+     all-replica → one unreachable replica → permanent flush wedge (same
+     open-tail family as the seed=15 init wedge). Could relax to reachable-min/
+     floor since append already all-replica-ACKs the bytes — but NOT for the
+     unknown-commit open-tail init (different safety boundary; that needs
+     seal-and-roll, not a quorum seed).
+   P1-E alloc verify-before-mirror is not an etcd CAS (rpc_handlers.rs ~1399) —
+     residual stale-overwrite window (already-documented F210-A1-followup).
+  Repro: AUTUMN_CHAOS_SEED=15 (same K4/M2 harsh cmd).
+  Memory: project_recovery_stuck_blocks_alloc + project_coco_p0_durability_batch.
 
 --- prior (Mode B): P-bulk row_stream flush-append wedge ---
 
