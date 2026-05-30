@@ -325,6 +325,14 @@ impl StreamAppendMetrics {
 /// on `send().await` — natural upstream back-pressure.
 const STREAM_SUBMIT_CAP: usize = 256;
 
+/// BUG#1 (seed=15): `ensure_tail_initialised` retries the open-tail all-replica
+/// `current_commit` probe this many times (with `OPEN_TAIL_COMMIT_BACKOFF_MS`
+/// between) before giving up and sealing+rolling to a fresh tail. Small —
+/// enough to ride out a brief blip, but the seal-and-roll escape is itself safe
+/// (lenient seal-over-reachable ≥ acked), so a few attempts suffice.
+const OPEN_TAIL_COMMIT_RETRIES: u32 = 3;
+const OPEN_TAIL_COMMIT_BACKOFF_MS: u64 = 300;
+
 // F195: env-reading helpers `stream_inflight_cap()`,
 // `append_fanout_timeout()`, `read_chunk_bytes()` removed. Values live
 // on `StreamClientConfig` (defined below) — set once at construction,
@@ -1891,15 +1899,59 @@ impl StreamClient {
                 0,
             )
         } else {
-            // F227: propagate a commit_length failure instead of seeding 0.
-            // Pre-F227 `unwrap_or(0)` turned an inability to determine the
-            // committed length (e.g. a replica down) into cursor=0 — the
-            // next append then sent `header.commit=0` and the EN truncated
-            // EVERY replica back to 0, destroying all pre-existing acked
-            // data. A failure here must refuse init so the caller retries
-            // (Ok(0) is still a legitimate "fresh empty extent").
-            let commit_val = self.current_commit(&tail).await?;
-            (tail, commit_val)
+            // Open tail. Determine its committed length to seed the worker
+            // cursor. F227: a failure here must NEVER seed 0 — pre-F227
+            // `unwrap_or(0)` turned "can't determine the committed length (a
+            // replica down)" into cursor=0, and the next append's
+            // `header.commit=0` truncated EVERY replica to 0, destroying all
+            // acked data. So we retry the all-replica probe a few times first.
+            //
+            // BUG#1 (seed=15) — open-tail write-wedge: but a PERSISTENT failure
+            // (a replica on the OPEN active tail permanently unreachable/short)
+            // would otherwise wedge flush + writes FOREVER. Recovery only
+            // reconfigures SEALED extents, so the open tail's bad replica never
+            // heals, and `current_commit(&tail).await?` just propagated the
+            // error on every retry → the flush's first-use init looped forever.
+            // Escape: SEAL-AND-ROLL to a fresh tail on healthy nodes via
+            // `alloc_new_extent(stream_id, None)`. This is SAFE under
+            // all-replica-ACK: the manager's None path runs the LENIENT
+            // seal-over-reachable probe (`compute_commit_seal`), sealing the old
+            // tail at `min` over the reachable COMMITTED members, which is ≥ the
+            // acked length (every acked record is on every replica) — no acked
+            // data is dropped; only un-acked speculation past the seal is. MUST
+            // pass `None` (let the manager probe), NEVER `Some(0)` (that asserts
+            // commit=0 — the exact silent truncation the propagate above guards
+            // against; we have no trusted worker commit here).
+            let mut commit_result = self.current_commit(&tail).await;
+            for _ in 0..OPEN_TAIL_COMMIT_RETRIES {
+                if commit_result.is_ok() {
+                    break;
+                }
+                compio::time::sleep(Duration::from_millis(OPEN_TAIL_COMMIT_BACKOFF_MS)).await;
+                commit_result = self.current_commit(&tail).await;
+            }
+            match commit_result {
+                Ok(commit_val) => (tail, commit_val),
+                Err(e) => {
+                    tracing::warn!(
+                        stream_id,
+                        extent_id = tail.extent.extent_id,
+                        error = %e,
+                        "BUG#1: open-tail current_commit persistently failed — sealing + rolling to a fresh tail (seal-over-reachable)"
+                    );
+                    let (_, new_ext) = self.alloc_new_extent(stream_id, None).await?;
+                    let replica_addrs = self.replica_addrs_for_extent(&new_ext).await?;
+                    let replica_node_ids = Self::replica_node_ids_for(&new_ext);
+                    (
+                        StreamTail {
+                            extent: new_ext,
+                            replica_addrs,
+                            replica_node_ids,
+                        },
+                        0,
+                    )
+                }
+            }
         };
         let mut tx_clone = tx.clone();
         tx_clone
