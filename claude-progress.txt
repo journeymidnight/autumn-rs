@@ -33,6 +33,36 @@ Task scope: /loop "coco arch review chaos test, add new scenarios, run new
   11,13,14,16) = 9/9 clean. Sweep 2 with write-liveness (seeds 3,5,7,10,12,13,
   15,17,19,21) = 9/10 clean; SEED=15 FAILED on write-liveness (the new check
   did its job). seed=13 (prior bug) now passes — the Mode A/B fixes hold.
+  Sweep 3 (hunt, seeds 6,8,18,20,22,23,24,25,26,27,28,30) = 11/12 clean;
+  SEED=8 FAILED — a SECOND, DISTINCT (more severe) new bug, see below.
+
+=== NEW BUG #2 (seed=8) — split child can NEVER open: VP past sealed_length=0 ===
+  DISTINCT from seed=15 (and arguably DATA-LOSS class, not just liveness).
+  not_found=200 mismatches=0 (one split-child partition's keys all unreachable).
+  Signal (repeats 10 attempts then partition thread dies, reopened forever):
+    ERROR partition thread failed: recover_partition: failed to read extent 18
+      after 10 attempts: stale_vp_offset_past_sealed_length: extent=18
+      offset=8556174 length=0 sealed_length=0  part_id=27
+  → a ValuePointer points 8.5 MB into extent 18, but extent 18 reports
+  sealed_length=0 → F204 StaleVpOffset sentinel → recover_partition fails →
+  part 27 never reports listener readiness → unroutable → not_found=200.
+  CRITICAL: this is a FRESH cluster (cluster.sh reset per test), so it is NOT
+  the F204 "historical pre-2026-04-27 EC residue" — it is generated LIVE.
+  NO EcConvert in seed=8. Nemesis sequence: FenceUnfence n1 → Flush →
+  NetworkPartition n1 → KillThenFence n1 → SPLIT part 9001 (→child 27) →
+  FenceUnfence n1 → KillEn n1 → NetworkPartition n1. So part 27 is the split
+  child; extent 18 is CoW-shared from 9001. HYPOTHESIS: the split sealed the
+  CoW-shared tail extent 18 at sealed_length=0 (the empty-tail seal — manager
+  note 32, the dropped `&& X>0` guard, OR a seal_commit probe that returned 0
+  because node 1 was killed/fenced at split time → reachable members reported
+  short → min=0) EVEN THOUGH the extent held all-replica-acked data that a VP
+  references. = the seal-UNDER-promise MIRROR of seed=15's over-promise: under-
+  sealing at a split during kill/fence makes VP-referenced data unreadable →
+  child partition permanently un-openable. Likely related to coco P0-C
+  (sealed-empty handling). Re-run for determinism + classifier in flight.
+  Repro: AUTUMN_CHAOS_SEED=8 (same K4/M2 harsh cmd). DEFERRED per user (batch
+  with the other F227 findings) but flagged as the more severe of the two.
+  Memory: project_split_underseal_vp_past_sealed (new).
 
 === NEW BUG (seed=15) — post-settle WRITE WEDGE on the OPEN active row tail ===
   NOT data loss (per-key mismatches=0 not_found=0, range errors=0); reads +
