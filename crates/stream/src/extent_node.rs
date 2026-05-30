@@ -1512,9 +1512,20 @@ async fn build_append_future(
                 // F143: durable seal — fsync the data file when the
                 // refresh promotes 0 → sealed_length so the on-disk
                 // prefix matches the manager's view.
-                let _ = node
+                // P0-A: if the seal can't be made durable, do NOT proceed with
+                // the append — surface Unavailable so the client retries (the
+                // disk is now offline → recovery re-replicates this extent).
+                if let Err(e) = node
                     .apply_extent_meta_durable(extent_id, &extent, &ex)
-                    .await;
+                    .await
+                {
+                    let msg = format!("seal not durable for extent {extent_id}: {e}");
+                    let out: Vec<Bytes> = slots
+                        .into_iter()
+                        .map(|s| err_bytes(s.req_id, MSG_APPEND, StatusCode::Unavailable, &msg))
+                        .collect();
+                    return Box::pin(async move { out });
+                }
             }
             Ok(None) | Err(_) => {
                 let msg = format!(
@@ -1604,9 +1615,16 @@ async fn build_append_future(
             if mgr_info.sealed || mgr_info.sealed_length > 0 {
                 // F143: durable seal — fsync the data file as part
                 // of accepting the manager's seal point.
-                let _ = node
+                // P0-A: a seal-persist failure here marks the disk offline (for
+                // recovery) inside apply_extent_meta_durable; the stale append
+                // is still correctly rejected as CODE_PRECONDITION below, so we
+                // log + proceed to the rejection rather than change the response.
+                if let Err(e) = node
                     .apply_extent_meta_durable(extent_id, &extent, &mgr_info)
-                    .await;
+                    .await
+                {
+                    tracing::error!(extent_id, error = %e, "P0-A: seal not durable during commit-reconcile reject (disk offline)");
+                }
                 let resp_payload = AppendResp {
                     code: CODE_PRECONDITION,
                     offset: 0,
@@ -1737,7 +1755,25 @@ async fn build_append_future(
         });
 
         if revision_changed {
-            let _ = node.save_meta(extent_id, &extent_for_io).await;
+            // P0-B (safe form): persist the bumped owner_revision (fencing
+            // token). On failure, mark the disk offline so the manager
+            // re-replicates this extent with the correct metadata — a strict
+            // improvement over the prior silent `let _ =` swallow, which left a
+            // non-durable fence with NO recovery signal. We still ACK here: the
+            // DATA is already durable, and triggering recovery covers the
+            // fence-durability gap. NOTE: the fully-fenced "refuse ACK until the
+            // fence is durable" version needs a per-extent durability lock to be
+            // concurrency-correct (a naive eager-persist races a concurrent
+            // same-revision append + a rollback-on-failure) — deferred to a
+            // focused follow-up (see claude-progress.txt P0-B-followup).
+            if let Err(e) = node.save_meta(extent_id, &extent_for_io).await {
+                tracing::error!(
+                    extent_id,
+                    error = %e,
+                    "P0-B: save_meta of bumped owner_revision failed — disk OFFLINE (recovery will re-replicate)",
+                );
+                node.mark_disk_offline_for_extent(extent_id);
+            }
         }
 
         req_ids
@@ -2929,9 +2965,20 @@ impl ExtentNode {
         extent_id: u64,
         extent: &Rc<ExtentEntry>,
         ex: &ExtentInfo,
-    ) -> bool {
+    ) -> Result<bool, String> {
         let sealed_changed = Self::apply_extent_meta(extent, ex);
-        if sealed_changed {
+        // P0-A (coco issue 2): persist whenever the resulting state is SEALED —
+        // NOT only on the 0→sealed transition (`sealed_changed`). apply_extent_meta
+        // mutates the in-memory seal up-front; if a prior call's fsync/save_meta
+        // failed, memory is already sealed so the retry's `sealed_changed` is
+        // false and the old gate would SKIP the durable step forever (leaving
+        // re_avali/copy to report CODE_OK for a never-durably-sealed replica).
+        // Gating on the live `sealed` flag makes the durable step idempotent +
+        // retry-safe; the seal is monotonic so this is concurrency-safe (a
+        // concurrent call just re-persists the same state). Open extents
+        // (sealed=false) still skip it. `sealed_changed` is still returned for
+        // callers that branch on the transition.
+        if extent.sealed.load(Ordering::SeqCst) {
             // F159: fsync .dat FIRST (data durable), THEN write+fsync .meta
             // (sealed_length / eversion durable). Pre-F159 the order was
             // reversed: .meta written first then .dat fsync'd. If the
@@ -2948,17 +2995,71 @@ impl ExtentNode {
             // (manager re-applies the seal on next contact). Save_meta
             // itself was also made durable in F159 (open + write + fsync,
             // not bare `compio::fs::write`).
+            // P0-A (coco final): do NOT persist a seal the local data does not
+            // yet back. For a NON-EC extent whose `.dat` is shorter than the
+            // manager's `sealed_length` — the re_avali / recovery "short
+            // replica being repaired" case (handle_re_avali calls this BEFORE
+            // its peer-copy) — persisting `.meta` with the longer sealed_length
+            // would, on a crash before the peer-copy completes, leave exactly
+            // the "short `.dat` + sealed `.meta`" corruption this fix targets.
+            // Skip the durable step (memory stays sealed → appends rejected);
+            // the seal is persisted later, once the peer-copy fills the data and
+            // re-runs save_meta with `local_len >= sealed_length`. EC is
+            // EXCLUDED: an EC shard `.dat` is legitimately `sealed_length / K`,
+            // so its length never covers the logical `sealed_length`. Not an
+            // error — the caller's repair flow continues.
+            if !ex.ec_converted && extent.len.load(Ordering::SeqCst) < ex.sealed_length {
+                tracing::debug!(
+                    extent_id,
+                    local_len = extent.len.load(Ordering::SeqCst),
+                    sealed_length = ex.sealed_length,
+                    "P0-A: skip seal-meta persist — local .dat does not yet cover sealed_length (short replica, will persist after repair)",
+                );
+                return Ok(sealed_changed);
+            }
+            // P0-A: FAIL-CLOSED on .dat fsync failure. Pre-P0-A this only
+            // WARNed and then still wrote the sealed `.meta` — persisting a
+            // sealed_length the `.dat` does not durably back. After a crash the
+            // short `.dat` + the sealed `.meta` make `parse_meta` report a
+            // sealed prefix that EOFs / zero-pads on read (silent corruption /
+            // recovery failure). Instead: do NOT save_meta, and mark the disk
+            // offline so the manager re-replicates this replica from a healthy
+            // peer. The in-memory seal stays set (this process keeps rejecting
+            // appends); nothing false is persisted, and on restart the OLD
+            // (unsealed) `.meta` is the safe state — the manager re-applies the
+            // seal on next contact (the F159 ordering invariant).
             if let Err(e) = extent.file_rc().sync_data().await {
-                tracing::warn!(
+                tracing::error!(
                     extent_id,
                     sealed_length = ex.sealed_length,
                     error = %e,
-                    "F159/F143: fsync of .dat failed before meta save — sealed prefix may not be durable",
+                    "P0-A: .dat fsync failed before seal meta — disk OFFLINE, NOT persisting sealed meta",
                 );
+                self.mark_disk_offline_for_extent(extent_id);
+                // P0-A (coco): PROPAGATE the failure (was `-> bool`, swallowed)
+                // so callers (handle_re_avali / append meta-refresh / copy)
+                // map it to an error instead of reporting CODE_OK for a replica
+                // whose seal is not durable + whose disk is now offline.
+                return Err(format!(
+                    ".dat fsync failed before seal meta for extent {extent_id}: {e}"
+                ));
             }
-            let _ = self.save_meta(extent_id, extent).await;
+            // P0-A: a save_meta failure must likewise not be swallowed — the
+            // seal is not durable, so flag the disk for recovery + propagate.
+            if let Err(e) = self.save_meta(extent_id, extent).await {
+                tracing::error!(
+                    extent_id,
+                    sealed_length = ex.sealed_length,
+                    error = %e,
+                    "P0-A: save_meta of sealed extent failed — disk OFFLINE (seal not durable)",
+                );
+                self.mark_disk_offline_for_extent(extent_id);
+                return Err(format!(
+                    "save_meta of sealed extent {extent_id} failed: {e}"
+                ));
+            }
         }
-        sealed_changed
+        Ok(sealed_changed)
     }
 
     async fn truncate_to_commit(extent: &Rc<ExtentEntry>, commit: u32) -> Result<(), String> {
@@ -3870,9 +3971,16 @@ impl ExtentNode {
                     // F143: fsync on 0→sealed transition so the
                     // sealed prefix is durable on this node before we
                     // surface the seal upstream.
-                    let _ = self
-                        .apply_extent_meta_durable(req.extent_id, &extent, &ex)
-                        .await;
+                    // P0-A: propagate a seal-persist failure (disk now offline)
+                    // instead of proceeding with the append.
+                    self.apply_extent_meta_durable(req.extent_id, &extent, &ex)
+                        .await
+                        .map_err(|e| {
+                            (
+                                StatusCode::Unavailable,
+                                format!("seal not durable for extent {}: {e}", req.extent_id),
+                            )
+                        })?;
                 }
                 Ok(None) => {
                     // Manager unreachable but we know local state is stale -- reject.
@@ -3964,9 +4072,15 @@ impl ExtentNode {
                 if mgr_info.sealed || mgr_info.sealed_length > 0 {
                     // F143: fsync as part of accepting the seal —
                     // see apply_extent_meta_durable for why.
-                    let _ = self
+                    // P0-A: a persist failure marks the disk offline (recovery)
+                    // inside; the stale append is still rejected as
+                    // CODE_PRECONDITION, so log + proceed to the rejection.
+                    if let Err(e) = self
                         .apply_extent_meta_durable(req.extent_id, &extent, &mgr_info)
-                        .await;
+                        .await
+                    {
+                        tracing::error!(extent_id = req.extent_id, error = %e, "P0-A: seal not durable during commit-reconcile reject (disk offline)");
+                    }
                     return Ok(AppendResp {
                         code: CODE_PRECONDITION,
                         offset: 0,
@@ -4028,7 +4142,18 @@ impl ExtentNode {
         extent.len.store(end, Ordering::SeqCst);
 
         if revision_changed {
-            let _ = self.save_meta(req.extent_id, &extent).await;
+            // P0-B (safe form): persist the bumped owner_revision; on failure
+            // mark the disk offline for recovery (strict improvement over the
+            // prior silent swallow). Fully-fenced-before-ACK is deferred to the
+            // per-extent-lock follow-up — see build_append_future.
+            if let Err(e) = self.save_meta(req.extent_id, &extent).await {
+                tracing::error!(
+                    extent_id = req.extent_id,
+                    error = %e,
+                    "P0-B: save_meta of bumped owner_revision failed — disk OFFLINE (recovery will re-replicate)",
+                );
+                self.mark_disk_offline_for_extent(req.extent_id);
+            }
         }
 
         Ok(AppendResp {
@@ -4739,9 +4864,19 @@ impl ExtentNode {
             }
         };
         // F143: fsync on 0→sealed transition.
-        let _ = self
+        // P0-A (coco): if the seal can't be made durable, return CODE_ERROR
+        // (disk is now offline) — do NOT fall through to the CODE_OK
+        // "already up to date" path, which would let the manager treat this
+        // non-durable replica as healthy.
+        if let Err(e) = self
             .apply_extent_meta_durable(req.extent_id, &extent, &extent_info)
-            .await;
+            .await
+        {
+            return Ok(rkyv_encode(&CodeResp {
+                code: CODE_ERROR,
+                message: format!("re_avali: seal not durable for extent {}: {e}", req.extent_id),
+            }));
+        }
 
         if req.eversion < extent_info.eversion {
             return Ok(rkyv_encode(&CodeResp {
@@ -4819,7 +4954,24 @@ impl ExtentNode {
             .map_err(|e| (StatusCode::Internal, e.to_string()))?;
         extent.len.store(payload_len, Ordering::SeqCst);
 
-        let _ = self.save_meta(req.extent_id, &extent).await;
+        // P0-A (coco): the post-repair seal `.meta` must be durable before we
+        // report success — the data is now filled + fsync'd, but if this
+        // save_meta fails and we returned CODE_OK, the manager's
+        // `mark_extent_available` (recovery.rs) would mark this replica healthy
+        // while its sealed `.meta` is non-durable. Fail-closed: mark the disk
+        // offline + return CODE_ERROR so the manager re-dispatches recovery.
+        if let Err(e) = self.save_meta(req.extent_id, &extent).await {
+            tracing::error!(
+                extent_id = req.extent_id,
+                error = %e,
+                "P0-A: re_avali post-repair save_meta failed — disk OFFLINE, returning CODE_ERROR",
+            );
+            self.mark_disk_offline_for_extent(req.extent_id);
+            return Ok(rkyv_encode(&CodeResp {
+                code: CODE_ERROR,
+                message: format!("re_avali: seal meta not durable for extent {}: {e}", req.extent_id),
+            }));
+        }
 
         Ok(rkyv_encode(&CodeResp {
             code: CODE_OK,
@@ -4847,9 +4999,16 @@ impl ExtentNode {
         match self.extent_info_from_manager(req.extent_id).await {
             Ok(Some(ex)) => {
                 // F143: fsync on 0→sealed transition.
-                let _ = self
-                    .apply_extent_meta_durable(req.extent_id, &extent, &ex)
-                    .await;
+                // P0-A: propagate a seal-persist failure (disk now offline)
+                // rather than serving a copy from a non-durably-sealed replica.
+                self.apply_extent_meta_durable(req.extent_id, &extent, &ex)
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::Internal,
+                            format!("copy_extent: seal not durable for extent {}: {e}", req.extent_id),
+                        )
+                    })?;
                 if req.eversion < ex.eversion {
                     return Err((
                         StatusCode::FailedPrecondition,
@@ -5561,7 +5720,10 @@ mod f147b_tests {
                 ..Default::default()
             };
             let entry = node.extents.get(&7001).expect("entry").clone();
-            let changed = node.apply_extent_meta_durable(7001, &entry, &ex).await;
+            let changed = node
+                .apply_extent_meta_durable(7001, &entry, &ex)
+                .await
+                .expect("apply_extent_meta_durable should succeed");
             assert!(changed, "sealed-empty must register as a durable seal");
 
             let resp =

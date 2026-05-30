@@ -4,9 +4,31 @@ Task scope: Start the FIX session for the chaos-found F227-area bugs, with coco
   planning + reviewing each (user: "always let coco help you plan and review").
   coco arch produced the fix order: P0-C (sealed-empty persist) → P0-A (.dat
   fsync fail-closed) → P0-B (owner_revision durable fence) → BUG#1 (open-tail
-  seal-and-roll) → BUG#2 (traced repro). Step 1 (P0-C) IMPLEMENTED + unit-
-  validated + coco-reviewed (2 rounds, 4 findings fixed). bug#2 NOT fixed by
-  P0-C (confirmed by chaos) — needs Step 5. not_completed (more steps remain).
+  seal-and-roll) → BUG#2 (traced repro).
+  STEP 1 (P0-C) = DONE: committed+pushed 906302f. 4 findbugs rounds (7 fixed, 1
+  deferred to Step 5, final CLEAN). 64 stream tests, chaos REGRESSION-FREE.
+  STEP 2 (P0-A) = DONE (pending commit): apply_extent_meta_durable → Result<bool,
+  String>; on .dat fsync OR save_meta failure → mark disk offline + PROPAGATE
+  Err (was -> bool, swallowed). All 6 callers handle it (append-refresh →
+  Unavailable, re_avali → CODE_ERROR, copy → Internal, commit-reconcile → log +
+  CODE_PRECONDITION). coco issue-2 FIX: persist-when-SEALED (live flag), not
+  only on the 0→sealed transition — so a retry after a persist failure (memory
+  already sealed) STILL re-runs fsync+save until durable (idempotent, monotonic,
+  concurrency-safe).
+  STEP 3 (P0-B) = SAFE FORM (pending commit): owner_revision save_meta failure
+  on the append path now marks the disk OFFLINE (recovery re-replicates) instead
+  of the silent `let _ =` swallow — strict improvement, NO concurrency change.
+  *** P0-B-FOLLOWUP (deferred): the FULLY-FENCED "refuse ACK until the fence is
+  durable" version is NOT shipped. coco found 2 rounds of concurrency holes in
+  the naive eager-persist/CAS-rollback (a concurrent same-revision append reads
+  the eagerly-published owner_revision → skips persist → ACKs; a rollback then
+  un-fences an accepted write; concurrent DIFFERENT-revision appends race the
+  .meta write). Doing it correctly needs a PER-EXTENT durability lock (F153
+  ec_conversion_locks pattern) serialising the revision/seal persist — a
+  focused, well-tested follow-up, not a rushed hot-path change. The safe form
+  (mark-offline) is the shipped interim; recovery covers the fence-durability
+  gap. ***
+  NEXT: Step 4 (BUG#1 open-tail escape) + Step 5 (BUG#2 traced repro). not_completed.
 
 === STEP 1 — P0-C: persist sealed-empty extent state in EN .meta (DONE) ===
   Bug: EN .meta only stored sealed_length, so a manager sealed-EMPTY extent
