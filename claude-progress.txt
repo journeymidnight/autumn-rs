@@ -59,9 +59,14 @@ Task scope: /loop "coco arch review chaos test, add new scenarios, run new
   references. = the seal-UNDER-promise MIRROR of seed=15's over-promise: under-
   sealing at a split during kill/fence makes VP-referenced data unreadable →
   child partition permanently un-openable. Likely related to coco P0-C
-  (sealed-empty handling). Re-run for determinism + classifier in flight.
-  Repro: AUTUMN_CHAOS_SEED=8 (same K4/M2 harsh cmd). DEFERRED per user (batch
-  with the other F227 findings) but flagged as the more severe of the two.
+  (sealed-empty handling).
+  *** FLAKY, NOT seed-deterministic: seed=8 re-run x2 BOTH PASSED. The LCG seed
+  fixes the nemesis ACTION sequence but NOT the wall-clock interleaving with the
+  real PS/EN subprocess I/O (kill/partition/split timing races), so the bug
+  fires probabilistically (~1/3 or less). Same caveat applies to seed=15. Repro
+  = run seed=8 (or the harsh set across many seeds) REPEATEDLY until it trips;
+  not a single deterministic command. DEFERRED per user (batch with the other
+  F227 findings) but flagged as the more severe of the two.
   Memory: project_split_underseal_vp_past_sealed (new).
 
 === NEW BUG (seed=15) — post-settle WRITE WEDGE on the OPEN active row tail ===
