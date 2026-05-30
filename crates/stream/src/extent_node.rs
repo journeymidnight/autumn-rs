@@ -756,6 +756,19 @@ pub(crate) struct ExtentEntry {
     pub(crate) len: AtomicU64,
     pub(crate) eversion: AtomicU64,
     pub(crate) sealed_length: AtomicU64,
+    /// P0-C: authoritative "is this extent sealed" flag, mirroring
+    /// `ExtentInfo.sealed` / `MgrExtentInfo.sealed`. This is the STATE
+    /// ("is sealed"); `sealed_length` is the LENGTH ("how much / is empty").
+    /// An authoritative EMPTY seal is `sealed = true, sealed_length = 0`
+    /// (e.g. a CoW-shared empty tail frozen by split/merge so children
+    /// alloc a fresh tail). Pre-P0-C the EN derived "is sealed" from
+    /// `sealed_length > 0`, so a sealed-empty extent looked OPEN after a
+    /// restart — a stale/ghost writer could then append to a
+    /// manager-sealed / CoW-shared extent (CoW isolation break), and a
+    /// later VP/SST referencing offset>0 surfaced as
+    /// `stale_vp_offset_past_sealed_length sealed_length=0`. Persisted in
+    /// the V2 `.meta` sidecar. Invariant: `sealed_length > 0 ⇒ sealed`.
+    pub(crate) sealed: AtomicBool,
     pub(crate) avali: AtomicU32,
     pub(crate) owner_revision: AtomicI64,
     /// Which disk this extent lives on. Used to resolve file paths.
@@ -789,6 +802,18 @@ impl ExtentEntry {
     pub(crate) fn file_rc(&self) -> Rc<CompioFile> {
         self.file.borrow().clone()
     }
+}
+
+/// P0-C: parsed `.meta` sidecar contents. Replaces the prior
+/// `(sealed_length, eversion, owner_revision)` tuple so the `sealed` /
+/// `avali` fields can't be silently dropped at a call site.
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct LocalExtentMeta {
+    sealed_length: u64,
+    eversion: u64,
+    owner_revision: i64,
+    sealed: bool,
+    avali: u32,
 }
 
 // ─── F194 → F196 D-r7 ConcurrencyController ──────────────────────────────────
@@ -1507,8 +1532,13 @@ async fn build_append_future(
 
     // 2. Sealed / eversion check using CURRENT local atomics.
     let local_eversion = extent.eversion.load(Ordering::SeqCst);
-    let sealed =
-        extent.sealed_length.load(Ordering::SeqCst) > 0 || extent.avali.load(Ordering::SeqCst) > 0;
+    // P0-C: the explicit `sealed` flag is the authoritative signal — it catches
+    // a sealed-EMPTY extent (sealed=true, sealed_length=0, avali possibly 0)
+    // that the length/avali derivation would have treated as open. The
+    // length/avali clauses stay as defence-in-depth.
+    let sealed = extent.sealed.load(Ordering::SeqCst)
+        || extent.sealed_length.load(Ordering::SeqCst) > 0
+        || extent.avali.load(Ordering::SeqCst) > 0;
     if sealed || slots.iter().any(|s| local_eversion > s.req.eversion) {
         let resp_payload = AppendResp {
             code: CODE_PRECONDITION,
@@ -1567,7 +1597,11 @@ async fn build_append_future(
         // otherwise silently shrink a sealed extent.
         let extent_id = slots[0].req.extent_id;
         if let Ok(Some(mgr_info)) = node.extent_info_from_manager(extent_id).await {
-            if mgr_info.sealed_length > 0 {
+            // P0-C: use the explicit `sealed` flag, not `sealed_length > 0`, so a
+            // sealed-EMPTY extent (sealed=true, sealed_length=0 — a CoW-shared
+            // tail) also refuses the stale writer's truncate+append instead of
+            // shrinking + ghost-writing a manager-sealed extent.
+            if mgr_info.sealed || mgr_info.sealed_length > 0 {
                 // F143: durable seal — fsync the data file as part
                 // of accepting the manager's seal point.
                 let _ = node
@@ -1600,7 +1634,8 @@ async fn build_append_future(
         // bytes past the new sealed_length — a data-corruption path
         // surfacing as "logStream value short" or out-of-bounds slice
         // panics on EC reads after the sealed extent is re-read.
-        if extent.sealed_length.load(Ordering::SeqCst) > 0
+        if extent.sealed.load(Ordering::SeqCst)
+            || extent.sealed_length.load(Ordering::SeqCst) > 0
             || extent.avali.load(Ordering::SeqCst) > 0
         {
             let resp_payload = AppendResp {
@@ -1793,7 +1828,21 @@ fn build_read_future(
                 continue;
             }
 
-            let total_len = extent.len.load(Ordering::SeqCst);
+            // P0-C (coco review #3 issue 1): a sealed-EMPTY extent
+            // (sealed=true, sealed_length=0) has logical length 0 — never serve
+            // residual / ghost `.dat` bytes past its (0) seal point (also stops
+            // recovery's `length=0` read from copying ghost bytes to a fresh
+            // replica). Normal sealed / EC extents keep `extent.len`: a
+            // replicated sealed extent has len==sealed_length, and EC shard
+            // reads carry explicit per-shard lengths, so clamping to the logical
+            // `sealed_length` there would be wrong.
+            let total_len = if extent.sealed.load(Ordering::SeqCst)
+                && extent.sealed_length.load(Ordering::SeqCst) == 0
+            {
+                0
+            } else {
+                extent.len.load(Ordering::SeqCst)
+            };
             let end = total_len as u32;
             let read_offset = req.offset as u64;
             let read_size = if req.length == 0 {
@@ -1880,22 +1929,36 @@ impl ExtentNode {
     /// "no meta file" → defaults applied + warning logged), so a corrupted
     /// meta cannot silently drive the extent into an inconsistent state.
     ///
-    /// **Migration:** save_meta always writes V1. parse_meta dispatches on
+    /// V2 (post-P0-C): 52 bytes. Adds an explicit `sealed` flag + the runtime
+    /// `avali` mask so a sealed-EMPTY extent (`sealed = true, sealed_length =
+    /// 0`) survives a restart. Pre-V2 the EN derived "is sealed" from
+    /// `sealed_length > 0`, so a manager-sealed / CoW-shared empty tail looked
+    /// OPEN after a restart and could accept ghost writes (CoW isolation break;
+    /// later surfaces as `stale_vp_offset_past_sealed_length sealed_length=0`).
+    ///   [magic[8]=b"EXTMETA\x02"][extent_id[8]][sealed_length[8]][eversion[8]]
+    ///   [owner_revision[8]][sealed[1]][pad[3]][avali[4]][crc32c[4]]
+    /// CRC32C is computed over the first 48 bytes (everything but the trailer).
+    ///
+    /// **Migration:** save_meta always writes V2. parse_meta dispatches on
     /// `magic[7]`:
-    ///   - 0x00 (V0): legacy 40-byte read, no CRC verification, WARN logged.
-    ///                Next save_meta upgrades to V1.
-    ///   - 0x01 (V1): 44-byte read with CRC verification.
+    ///   - 0x00 (V0): legacy 40-byte read, no CRC. `sealed`/`avali` DERIVED
+    ///                from `sealed_length > 0`. Next save_meta upgrades to V2.
+    ///   - 0x01 (V1): 44-byte read with CRC. `sealed`/`avali` likewise derived.
+    ///   - 0x02 (V2): 52-byte read with CRC; `sealed`/`avali` read from disk.
     ///   - other: None (treated as missing/corrupt meta).
-    /// V0-binary on V1-file: magic mismatch → None → broken on rollback.
-    /// Acceptable since rollback is operator-driven and rare.
+    /// Downgrade (V2-file read by a pre-V2 binary): magic mismatch → None →
+    /// extent loads as unsealed. Acceptable since rollback is operator-driven
+    /// and rare, and the manager re-applies the seal on next contact.
     const META_MAGIC_V0: &'static [u8; 8] = b"EXTMETA\0";
     const META_MAGIC_V1: &'static [u8; 8] = b"EXTMETA\x01";
+    const META_MAGIC_V2: &'static [u8; 8] = b"EXTMETA\x02";
     const META_SIZE_V0: usize = 40;
     const META_SIZE_V1: usize = 44;
+    const META_SIZE_V2: usize = 52;
     /// Backwards-compat alias for any external code reading the constant.
-    /// Equal to V1 size (the size save_meta writes).
+    /// Equal to the size save_meta currently writes (V2).
     #[allow(dead_code)]
-    const META_SIZE: usize = Self::META_SIZE_V1;
+    const META_SIZE: usize = Self::META_SIZE_V2;
 
     pub async fn new(config: ExtentNodeConfig) -> Result<Self> {
         // Build DiskFS instances for all configured disks.
@@ -2208,16 +2271,25 @@ impl ExtentNode {
         let sealed_length = entry.sealed_length.load(Ordering::SeqCst);
         let eversion = entry.eversion.load(Ordering::SeqCst);
         let owner_revision = entry.owner_revision.load(Ordering::SeqCst);
+        // P0-C: persist the explicit sealed flag + runtime avali mask. Enforce
+        // the invariant `sealed_length > 0 ⇒ sealed` at write time so a torn
+        // caller that set a length without the flag can't persist an
+        // inconsistent "long but unsealed" record.
+        let sealed = entry.sealed.load(Ordering::SeqCst) || sealed_length > 0;
+        let avali = entry.avali.load(Ordering::SeqCst);
 
-        // F157: always write V1 (44 bytes with CRC32C trailer).
-        let mut buf = [0u8; Self::META_SIZE_V1];
-        buf[0..8].copy_from_slice(Self::META_MAGIC_V1);
+        // P0-C: always write V2 (52 bytes with CRC32C trailer over [0..48]).
+        let mut buf = [0u8; Self::META_SIZE_V2];
+        buf[0..8].copy_from_slice(Self::META_MAGIC_V2);
         buf[8..16].copy_from_slice(&extent_id.to_le_bytes());
         buf[16..24].copy_from_slice(&sealed_length.to_le_bytes());
         buf[24..32].copy_from_slice(&eversion.to_le_bytes());
         buf[32..40].copy_from_slice(&owner_revision.to_le_bytes());
-        let crc = crc32c::crc32c(&buf[0..Self::META_SIZE_V0]);
-        buf[40..44].copy_from_slice(&crc.to_le_bytes());
+        buf[40] = u8::from(sealed);
+        // buf[41..44] reserved padding (left zero).
+        buf[44..48].copy_from_slice(&avali.to_le_bytes());
+        let crc = crc32c::crc32c(&buf[0..Self::META_SIZE_V2 - 4]);
+        buf[48..52].copy_from_slice(&crc.to_le_bytes());
 
         // F159: open + write + fsync. Pre-F159 the helper used
         // `compio::fs::write` which buffers via the page cache without
@@ -2248,24 +2320,40 @@ impl ExtentNode {
         Ok(())
     }
 
-    fn parse_meta(buf: &[u8], extent_id: u64) -> Option<(u64, u64, i64)> {
+    fn parse_meta(buf: &[u8], extent_id: u64) -> Option<LocalExtentMeta> {
         if buf.len() < Self::META_SIZE_V0 {
             return None;
         }
-        // F157: dispatch on magic[7] for V0/V1 layout.
+        // Dispatch on magic[7] for V0/V1/V2 layout.
+        let v2 = &buf[0..8] == Self::META_MAGIC_V2;
         let v1 = &buf[0..8] == Self::META_MAGIC_V1;
         let v0 = &buf[0..8] == Self::META_MAGIC_V0;
-        if !v0 && !v1 {
+        if !v0 && !v1 && !v2 {
             return None;
         }
         if v1 && buf.len() < Self::META_SIZE_V1 {
+            return None;
+        }
+        if v2 && buf.len() < Self::META_SIZE_V2 {
             return None;
         }
         let eid = u64::from_le_bytes(buf[8..16].try_into().ok()?);
         if eid != extent_id {
             return None;
         }
-        if v1 {
+        if v2 {
+            let stored_crc = u32::from_le_bytes(buf[48..52].try_into().ok()?);
+            let computed_crc = crc32c::crc32c(&buf[0..Self::META_SIZE_V2 - 4]);
+            if stored_crc != computed_crc {
+                tracing::warn!(
+                    extent_id,
+                    stored_crc,
+                    computed_crc,
+                    "P0-C: V2 meta sidecar CRC mismatch — bit rot or torn write; treating as missing"
+                );
+                return None;
+            }
+        } else if v1 {
             let stored_crc = u32::from_le_bytes(buf[40..44].try_into().ok()?);
             let computed_crc = crc32c::crc32c(&buf[0..Self::META_SIZE_V0]);
             if stored_crc != computed_crc {
@@ -2281,13 +2369,32 @@ impl ExtentNode {
             // V0 legacy: no checksum. Warn once per load so operators see the upgrade signal.
             tracing::warn!(
                 extent_id,
-                "F157: legacy V0 meta sidecar (no CRC) — will upgrade to V1 on next save_meta"
+                "F157: legacy V0 meta sidecar (no CRC) — will upgrade to V2 on next save_meta"
             );
         }
         let sealed_length = u64::from_le_bytes(buf[16..24].try_into().ok()?);
         let eversion = u64::from_le_bytes(buf[24..32].try_into().ok()?);
         let owner_revision = i64::from_le_bytes(buf[32..40].try_into().ok()?);
-        Some((sealed_length, eversion, owner_revision))
+        // P0-C: V2 carries the explicit sealed flag + avali; V0/V1 derive both
+        // from `sealed_length > 0` (the pre-P0-C behaviour, so an old open
+        // extent stays open and an old sealed extent stays sealed). The
+        // invariant `sealed_length > 0 ⇒ sealed` is enforced on the V2 path
+        // too (a corrupt-but-CRC-valid record claiming long-but-unsealed is
+        // upgraded to sealed, fail-closed).
+        let (sealed, avali) = if v2 {
+            let sealed = buf[40] != 0 || sealed_length > 0;
+            let avali = u32::from_le_bytes(buf[44..48].try_into().ok()?);
+            (sealed, avali)
+        } else {
+            (sealed_length > 0, if sealed_length > 0 { 1 } else { 0 })
+        };
+        Some(LocalExtentMeta {
+            sealed_length,
+            eversion,
+            owner_revision,
+            sealed,
+            avali,
+        })
     }
 
     pub async fn load_extents(&self) -> Result<()> {
@@ -2337,21 +2444,39 @@ impl ExtentNode {
                 };
                 let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
 
-                let (sealed_length, eversion, owner_revision) =
-                    match compio::fs::read(disk.meta_path(extent_id)).await {
-                        Ok(buf) => Self::parse_meta(&buf, extent_id).unwrap_or((0, 1, 0)),
-                        Err(_) => (0, 1, 0),
-                    };
+                let meta = match compio::fs::read(disk.meta_path(extent_id)).await {
+                    Ok(buf) => Self::parse_meta(&buf, extent_id).unwrap_or(LocalExtentMeta {
+                        sealed_length: 0,
+                        eversion: 1,
+                        owner_revision: 0,
+                        sealed: false,
+                        avali: 0,
+                    }),
+                    Err(_) => LocalExtentMeta {
+                        sealed_length: 0,
+                        eversion: 1,
+                        owner_revision: 0,
+                        sealed: false,
+                        avali: 0,
+                    },
+                };
+                let sealed_length = meta.sealed_length;
+                let eversion = meta.eversion;
 
                 extents.insert(
                     extent_id,
                     Rc::new(ExtentEntry {
                         file: RefCell::new(Rc::new(file)),
                         len: AtomicU64::new(len),
-                        eversion: AtomicU64::new(eversion),
-                        sealed_length: AtomicU64::new(sealed_length),
-                        avali: AtomicU32::new(if sealed_length > 0 { 1 } else { 0 }),
-                        owner_revision: AtomicI64::new(owner_revision),
+                        eversion: AtomicU64::new(meta.eversion),
+                        sealed_length: AtomicU64::new(meta.sealed_length),
+                        // P0-C: restore the explicit sealed flag (V2) or the
+                        // length-derived value (V0/V1). A sealed-empty extent
+                        // (sealed=true, sealed_length=0) now correctly stays
+                        // sealed across the restart and rejects ghost writes.
+                        sealed: AtomicBool::new(meta.sealed),
+                        avali: AtomicU32::new(meta.avali),
+                        owner_revision: AtomicI64::new(meta.owner_revision),
                         disk_id: disk.disk_id,
                         coalescer: Coalescer::new(len),
                     }),
@@ -2739,6 +2864,8 @@ impl ExtentNode {
                 len: AtomicU64::new(len),
                 eversion: AtomicU64::new(1),
                 sealed_length: AtomicU64::new(0),
+                // P0-C: a freshly-created/allocated extent is open.
+                sealed: AtomicBool::new(false),
                 avali: AtomicU32::new(0),
                 owner_revision: AtomicI64::new(0),
                 disk_id,
@@ -2753,13 +2880,26 @@ impl ExtentNode {
 
     /// Apply extent metadata from manager. Returns true if sealed_length changed from 0 to nonzero.
     fn apply_extent_meta(extent: &ExtentEntry, ex: &ExtentInfo) -> bool {
-        let old_sealed = extent.sealed_length.load(Ordering::SeqCst);
+        let old_sealed = extent.sealed.load(Ordering::SeqCst);
+        let old_len = extent.sealed_length.load(Ordering::SeqCst);
         extent.eversion.store(ex.eversion, Ordering::SeqCst);
+        // P0-C: `sealed_length > 0 ⇒ sealed` (a manager that sends a length
+        // implies the seal even if the bool lagged on an old wire path).
+        extent
+            .sealed
+            .store(ex.sealed || ex.sealed_length > 0, Ordering::SeqCst);
         extent
             .sealed_length
             .store(ex.sealed_length, Ordering::SeqCst);
         extent.avali.store(ex.avali, Ordering::SeqCst);
-        old_sealed == 0 && ex.sealed_length > 0
+        // P0-C: the seal must be made durable when EITHER the extent newly
+        // became sealed (incl. the sealed-EMPTY case `sealed_length` stays 0)
+        // OR its sealed_length newly grew from 0 (the original F143 trigger —
+        // covers a sealed-empty tail that later receives a length). Both must
+        // hit disk so a restart doesn't forget the seal.
+        let became_sealed = !old_sealed && (ex.sealed || ex.sealed_length > 0);
+        let len_grew = old_len == 0 && ex.sealed_length > 0;
+        became_sealed || len_grew
     }
 
     /// F143: apply extent metadata from manager AND make the seal
@@ -3394,6 +3534,15 @@ impl ExtentNode {
             .sealed_length
             .fetch_max(extent_info.sealed_length, Ordering::SeqCst);
         let _ = extent.avali.fetch_max(extent_info.avali, Ordering::SeqCst);
+        // P0-C (coco review #3 issue 2): also sync the explicit `sealed` flag
+        // MONOTONICALLY (true wins). A recovered sealed-EMPTY extent
+        // (sealed=true, sealed_length=0) would otherwise keep the fresh
+        // ExtentEntry's sealed=false, and the save_meta below — which writes
+        // `entry.sealed || sealed_length>0` — would persist it as OPEN, letting
+        // a restart accept ghost writes to a manager-sealed / CoW-shared tail.
+        if extent_info.sealed || extent_info.sealed_length > 0 {
+            extent.sealed.store(true, Ordering::SeqCst);
+        }
 
         let _ = self.save_meta(task.extent_id, &extent).await;
 
@@ -3681,6 +3830,9 @@ impl ExtentNode {
         entry
             .sealed_length
             .store(sealed_length.max(shard_len), Ordering::SeqCst);
+        // P0-C: EC-converted extents are sealed (sealed_length > 0). Keep the
+        // sealed flag in lock-step with sealed_length so save_meta persists it.
+        entry.sealed.store(true, Ordering::SeqCst);
         entry.avali.store(1, Ordering::SeqCst);
         if new_eversion > 0 {
             entry.eversion.store(new_eversion, Ordering::SeqCst);
@@ -3754,7 +3906,8 @@ impl ExtentNode {
             }
             .encode());
         }
-        if extent.sealed_length.load(Ordering::SeqCst) > 0
+        if extent.sealed.load(Ordering::SeqCst)
+            || extent.sealed_length.load(Ordering::SeqCst) > 0
             || extent.avali.load(Ordering::SeqCst) > 0
         {
             return Ok(AppendResp {
@@ -3806,7 +3959,9 @@ impl ExtentNode {
             // truncation is rare in normal operation (only fires when
             // this replica got ahead of the consensus min).
             if let Ok(Some(mgr_info)) = self.extent_info_from_manager(req.extent_id).await {
-                if mgr_info.sealed_length > 0 {
+                // P0-C: explicit `sealed` flag (catches sealed-empty), not
+                // `sealed_length > 0`.
+                if mgr_info.sealed || mgr_info.sealed_length > 0 {
                     // F143: fsync as part of accepting the seal —
                     // see apply_extent_meta_durable for why.
                     let _ = self
@@ -3831,7 +3986,8 @@ impl ExtentNode {
             // subsequent file_pwrite would write bytes past sealed_length —
             // corrupting subsequent reads as "logStream value short" or
             // out-of-bounds slice panics on EC reads.
-            if extent.sealed_length.load(Ordering::SeqCst) > 0
+            if extent.sealed.load(Ordering::SeqCst)
+                || extent.sealed_length.load(Ordering::SeqCst) > 0
                 || extent.avali.load(Ordering::SeqCst) > 0
             {
                 return Ok(AppendResp {
@@ -3917,7 +4073,17 @@ impl ExtentNode {
             .encode());
         }
 
-        let total_len = extent.len.load(Ordering::SeqCst);
+        // P0-C (coco review #3 issue 1): sealed-EMPTY extent ⇒ logical length 0
+        // (never serve residual/ghost bytes; also stops a `length=0` recovery
+        // read from copying them). Mirror of build_read_future. Normal sealed /
+        // EC reads keep extent.len (see that fn for why).
+        let total_len = if extent.sealed.load(Ordering::SeqCst)
+            && extent.sealed_length.load(Ordering::SeqCst) == 0
+        {
+            0
+        } else {
+            extent.len.load(Ordering::SeqCst)
+        };
         let end = total_len as u32;
         let read_offset = req.offset as u64;
         let read_size = if req.length == 0 {
@@ -4046,9 +4212,16 @@ impl ExtentNode {
         // `sealed_length` for sealed extents (set in
         // `apply_extent_meta_durable`), so the EC-shard-size confusion
         // doesn't recur.
-        let sealed = entry.sealed_length.load(Ordering::SeqCst);
-        let length = if sealed > 0 {
-            sealed
+        // P0-C (coco review #3 issue 3): a sealed extent's authoritative length
+        // is `sealed_length` — INCLUDING 0 for a sealed-EMPTY extent. Decide
+        // "is sealed" via the explicit flag OR a positive length, not
+        // `sealed_length > 0` (which fell through to `last_synced`, and after a
+        // restart `Coalescer::new(len)` seeds last_synced from the file size, so
+        // residual/ghost `.dat` bytes would be reported as a non-zero commit
+        // boundary for a sealed-empty extent).
+        let sealed_len = entry.sealed_length.load(Ordering::SeqCst);
+        let length = if entry.sealed.load(Ordering::SeqCst) || sealed_len > 0 {
+            sealed_len
         } else {
             entry.coalescer.last_synced.load(Ordering::SeqCst)
         };
@@ -4105,9 +4278,16 @@ impl ExtentNode {
             }
         };
 
-        let sealed = entry.sealed_length.load(Ordering::SeqCst);
-        let length = if sealed > 0 {
-            sealed
+        // P0-C (coco review #3 issue 3): a sealed extent's authoritative length
+        // is `sealed_length` — INCLUDING 0 for a sealed-EMPTY extent. Decide
+        // "is sealed" via the explicit flag OR a positive length, not
+        // `sealed_length > 0` (which fell through to `last_synced`, and after a
+        // restart `Coalescer::new(len)` seeds last_synced from the file size, so
+        // residual/ghost `.dat` bytes would be reported as a non-zero commit
+        // boundary for a sealed-empty extent).
+        let sealed_len = entry.sealed_length.load(Ordering::SeqCst);
+        let length = if entry.sealed.load(Ordering::SeqCst) || sealed_len > 0 {
+            sealed_len
         } else {
             entry.coalescer.last_synced.load(Ordering::SeqCst)
         };
@@ -4160,7 +4340,15 @@ impl ExtentNode {
 
         let synced = entry.coalescer.last_synced.load(Ordering::SeqCst);
         let sealed = entry.sealed_length.load(Ordering::SeqCst);
-        let length = synced.max(sealed);
+        // P0-C (coco review #3 issue 3): a SEALED extent's durable length is its
+        // authoritative `sealed_length` (incl. 0 for sealed-empty) — never the
+        // residual file-derived `last_synced`. For an open extent keep the
+        // max(synced, sealed) behaviour.
+        let length = if entry.sealed.load(Ordering::SeqCst) {
+            sealed
+        } else {
+            synced.max(sealed)
+        };
         Ok(SyncedLengthResp {
             code: CODE_OK,
             length,
@@ -4215,6 +4403,8 @@ impl ExtentNode {
                 len: AtomicU64::new(len),
                 eversion: AtomicU64::new(1),
                 sealed_length: AtomicU64::new(0),
+                // P0-C: a freshly-created/allocated extent is open.
+                sealed: AtomicBool::new(false),
                 avali: AtomicU32::new(0),
                 owner_revision: AtomicI64::new(0),
                 disk_id,
@@ -4669,7 +4859,11 @@ impl ExtentNode {
                         ),
                     ));
                 }
-                if ex.sealed_length > 0 {
+                // P0-C: clamp to the manager's authoritative length whenever the
+                // extent is SEALED (incl. sealed-empty → clamp to 0), not only
+                // when sealed_length > 0 — otherwise a sealed-empty extent would
+                // return stale local-residue bytes past its (0) seal point.
+                if ex.sealed {
                     logical_len = logical_len.min(ex.sealed_length);
                 }
             }
@@ -4716,14 +4910,35 @@ impl ExtentNode {
         // post-truncate bytes via file_pread_chunked below. On a sealed
         // extent the append protocol step 3 rejects concurrent appends, so
         // the race only exists for unsealed extents. Belt-and-braces.
-        if extent.sealed_length.load(Ordering::SeqCst) == 0 {
+        // P0-C: "is sealed" is the explicit flag OR a positive length (the same
+        // disjunction used by the append-reject path), NOT `sealed_length == 0`.
+        // This ACCEPTS a legitimate sealed-EMPTY extent (sealed=true,
+        // sealed_length=0 → copies 0 bytes, logical_len clamped to 0 above)
+        // while still refusing a genuinely-open extent.
+        let is_sealed = extent.sealed.load(Ordering::SeqCst)
+            || extent.sealed_length.load(Ordering::SeqCst) > 0;
+        if !is_sealed {
             return Err((
                 StatusCode::FailedPrecondition,
                 format!(
-                    "copy_extent on unsealed extent {} refused (sealed_length=0)",
+                    "copy_extent on unsealed extent {} refused (not sealed)",
                     req.extent_id
                 ),
             ));
+        }
+
+        // P0-C (coco re-review #2): clamp to the local seal point even on the
+        // manager-unavailable fallback (Ok(None)/Err above only ran the eversion
+        // check, leaving logical_len at the local file length). A sealed-EMPTY
+        // extent (sealed=true, sealed_length=0) with any residual/ghost bytes in
+        // its `.dat` must copy 0 bytes — never data past the seal point. The
+        // Ok(Some(ex)) branch already clamped to the manager's authoritative
+        // length; this guarantees the "sealed-empty → copies 0 bytes" invariant
+        // holds regardless of manager reachability. Safe for sealed-with-length
+        // too (local_len == sealed_length there, so the min is a no-op; a
+        // not-yet-fully-recovered replica keeps returning what it has).
+        if extent.sealed.load(Ordering::SeqCst) {
+            logical_len = logical_len.min(extent.sealed_length.load(Ordering::SeqCst));
         }
 
         let offset = req.offset.min(logical_len);
@@ -4876,10 +5091,15 @@ impl ExtentNode {
                 .ok()
                 .flatten();
             if let Some(mgr_info) = mgr_info_opt.as_ref() {
-                if mgr_info.sealed_length > 0 {
+                // P0-C: include the explicit `sealed` flag so a sealed-EMPTY
+                // extent also has its seal persisted here (consistency with the
+                // commit-reconcile + recovery paths).
+                if mgr_info.sealed || mgr_info.sealed_length > 0 {
                     entry
                         .sealed_length
                         .store(mgr_info.sealed_length, Ordering::SeqCst);
+                    // P0-C: sealed (incl. sealed-empty) ⇒ set the flag.
+                    entry.sealed.store(true, Ordering::SeqCst);
                     entry.eversion.store(mgr_info.eversion, Ordering::SeqCst);
                     entry.avali.store(mgr_info.avali, Ordering::SeqCst);
                     let _ = self.save_meta(extent_id, &entry).await;
@@ -4920,6 +5140,8 @@ impl ExtentNode {
                 entry
                     .sealed_length
                     .store(sealed_length.max(local_len), Ordering::SeqCst);
+                // P0-C: sealed_length > 0 ⇒ sealed.
+                entry.sealed.store(true, Ordering::SeqCst);
                 entry.avali.store(1, Ordering::SeqCst);
                 if new_eversion > 0 {
                     entry.eversion.store(new_eversion, Ordering::SeqCst);
@@ -5302,6 +5524,151 @@ mod f147b_tests {
             "handle_append on sealed extent must return CODE_PRECONDITION"
         );
     }
+
+    /// P0-C: a sealed-EMPTY extent (sealed=true, sealed_length=0 — e.g. a
+    /// CoW-shared empty tail frozen by split/merge) must REJECT appends both
+    /// immediately AND after an extent-node restart. Pre-P0-C the `.meta`
+    /// sidecar only stored `sealed_length`, so on reload the extent looked open
+    /// (sealed_length=0 → avali=0) and a stale/ghost writer could append to it
+    /// — later surfacing as `stale_vp_offset_past_sealed_length sealed_length=0`
+    /// when a child partition's SST/VP referenced offset>0.
+    #[compio::test]
+    async fn p0c_sealed_empty_survives_restart_and_rejects_append() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        let ghost = || AppendReq {
+            extent_id: 7001,
+            eversion: 2,
+            commit: 0,
+            revision: 0,
+            payload: Bytes::from(b"ghost".to_vec()),
+        };
+
+        // ---- node #1: alloc an open extent, then apply a sealed-EMPTY seal ----
+        {
+            let config = ExtentNodeConfig::new(path.clone(), 1);
+            let node = ExtentNode::new(config).await.expect("node1");
+            node.handle_alloc_extent(rkyv_encode(&AllocExtentReq { extent_id: 7001 }))
+                .await
+                .expect("alloc");
+
+            let ex = ExtentInfo {
+                extent_id: 7001,
+                sealed: true,
+                sealed_length: 0,
+                avali: 1,
+                eversion: 2,
+                ..Default::default()
+            };
+            let entry = node.extents.get(&7001).expect("entry").clone();
+            let changed = node.apply_extent_meta_durable(7001, &entry, &ex).await;
+            assert!(changed, "sealed-empty must register as a durable seal");
+
+            let resp =
+                AppendResp::decode(node.handle_append(ghost().encode()).await.unwrap()).unwrap();
+            assert_eq!(
+                resp.code, CODE_PRECONDITION,
+                "sealed-empty must reject appends pre-restart"
+            );
+        }
+
+        // ---- node #2: reload the SAME dir; the seal must persist ----
+        {
+            let config = ExtentNodeConfig::new(path.clone(), 1);
+            let node = ExtentNode::new(config).await.expect("node2 reload");
+            let entry = node.extents.get(&7001).expect("extent 7001 must reload");
+            assert!(
+                entry.sealed.load(Ordering::SeqCst),
+                "P0-C: sealed flag must survive the restart"
+            );
+            assert_eq!(
+                entry.sealed_length.load(Ordering::SeqCst),
+                0,
+                "still sealed-empty after reload"
+            );
+            drop(entry);
+
+            let resp =
+                AppendResp::decode(node.handle_append(ghost().encode()).await.unwrap()).unwrap();
+            assert_eq!(
+                resp.code, CODE_PRECONDITION,
+                "P0-C: sealed-empty must reject a ghost append AFTER restart"
+            );
+        }
+    }
+
+    /// P0-C (coco review #3): a sealed-EMPTY extent that has residual/ghost
+    /// `.dat` bytes must report logical length 0 via commit_length AND return 0
+    /// bytes on a `length=0` read — never the residual length / bytes past its
+    /// (0) seal point. (Guards the commit-protocol boundary + the recovery
+    /// `length=0` copy from propagating ghost bytes.)
+    #[compio::test]
+    async fn p0c_sealed_empty_reports_zero_length_and_reads_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
+        let node = ExtentNode::new(config).await.expect("node");
+        node.handle_alloc_extent(rkyv_encode(&AllocExtentReq { extent_id: 7100 }))
+            .await
+            .expect("alloc");
+
+        // Write 100 residual bytes, then forcibly mark the extent sealed-EMPTY
+        // (sealed=true, sealed_length=0) — simulating a manager sealed-empty
+        // seal landing on a replica that holds leftover/ghost bytes.
+        let w = AppendReq {
+            extent_id: 7100,
+            eversion: 1,
+            commit: 0,
+            revision: 0,
+            payload: Bytes::from(vec![7u8; 100]),
+        };
+        let wr = AppendResp::decode(node.handle_append(w.encode()).await.unwrap()).unwrap();
+        assert_eq!(wr.code, CODE_OK);
+        assert_eq!(wr.end, 100);
+        {
+            let e = node.extents.get(&7100).expect("entry");
+            e.sealed.store(true, Ordering::SeqCst);
+            e.sealed_length.store(0, Ordering::SeqCst);
+        }
+
+        // commit_length must report 0, NOT the residual 100.
+        let cl = CommitLengthResp::decode(
+            node.handle_commit_length(
+                CommitLengthReq {
+                    extent_id: 7100,
+                    revision: 1,
+                }
+                .encode(),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cl.length, 0,
+            "sealed-empty commit_length must be 0, not the residual file length"
+        );
+
+        // A length=0 (read-to-end) read must return 0 bytes.
+        let rd = ReadBytesResp::decode(
+            node.handle_read_bytes(
+                ReadBytesReq {
+                    extent_id: 7100,
+                    eversion: 1,
+                    offset: 0,
+                    length: 0,
+                }
+                .encode(),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rd.payload.len(),
+            0,
+            "sealed-empty read-to-end must return 0 bytes, not residual ghost bytes"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5628,7 +5995,12 @@ mod f157_meta_crc_tests {
         buf[40..44].copy_from_slice(&crc.to_le_bytes());
 
         let parsed = ExtentNode::parse_meta(&buf, extent_id).expect("V1 parse");
-        assert_eq!(parsed, (12345, 7, 42));
+        assert_eq!(parsed.sealed_length, 12345);
+        assert_eq!(parsed.eversion, 7);
+        assert_eq!(parsed.owner_revision, 42);
+        // P0-C: V1 has no sealed flag → derived from sealed_length > 0.
+        assert!(parsed.sealed);
+        assert_eq!(parsed.avali, 1);
     }
 
     /// F157: V0 legacy 40-byte buffer must parse (back-compat).
@@ -5643,7 +6015,12 @@ mod f157_meta_crc_tests {
         buf[32..40].copy_from_slice(&100i64.to_le_bytes());
 
         let parsed = ExtentNode::parse_meta(&buf, extent_id).expect("V0 parse");
-        assert_eq!(parsed, (999, 3, 100));
+        assert_eq!(parsed.sealed_length, 999);
+        assert_eq!(parsed.eversion, 3);
+        assert_eq!(parsed.owner_revision, 100);
+        // P0-C: V0 has no sealed flag → derived from sealed_length > 0.
+        assert!(parsed.sealed);
+        assert_eq!(parsed.avali, 1);
     }
 
     /// F157: a V1 buffer with a flipped payload byte must be rejected (CRC mismatch).
@@ -5714,6 +6091,100 @@ mod f157_meta_crc_tests {
         let mut buf = [0u8; ExtentNode::META_SIZE_V1];
         buf[0..8].copy_from_slice(b"NOT_META");
         assert!(ExtentNode::parse_meta(&buf, 1).is_none());
+    }
+
+    // ─── P0-C: V2 sidecar (explicit sealed + avali) ──────────────────────────
+
+    fn build_v2(extent_id: u64, sealed_length: u64, sealed: bool, avali: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; ExtentNode::META_SIZE_V2];
+        buf[0..8].copy_from_slice(ExtentNode::META_MAGIC_V2);
+        buf[8..16].copy_from_slice(&extent_id.to_le_bytes());
+        buf[16..24].copy_from_slice(&sealed_length.to_le_bytes());
+        buf[24..32].copy_from_slice(&3u64.to_le_bytes()); // eversion
+        buf[32..40].copy_from_slice(&0i64.to_le_bytes()); // owner_revision
+        buf[40] = u8::from(sealed);
+        buf[44..48].copy_from_slice(&avali.to_le_bytes());
+        let crc = crc32c::crc32c(&buf[0..ExtentNode::META_SIZE_V2 - 4]);
+        buf[48..52].copy_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// P0-C: the load-bearing case — a sealed-EMPTY extent
+    /// (sealed=true, sealed_length=0) round-trips with sealed=true so a restart
+    /// does NOT treat it as open.
+    #[test]
+    fn p0c_v2_sealed_empty_round_trip() {
+        let eid = 0xfeed_0001u64;
+        let buf = build_v2(eid, 0, true, 7);
+        let parsed = ExtentNode::parse_meta(&buf, eid).expect("V2 parse");
+        assert_eq!(parsed.sealed_length, 0);
+        assert!(parsed.sealed, "sealed-empty must round-trip as sealed");
+        assert_eq!(parsed.avali, 7);
+    }
+
+    /// P0-C: a genuinely open extent (sealed=false, len=0) stays open.
+    #[test]
+    fn p0c_v2_open_extent_round_trip() {
+        let eid = 0xfeed_0002u64;
+        let buf = build_v2(eid, 0, false, 0);
+        let parsed = ExtentNode::parse_meta(&buf, eid).expect("V2 parse");
+        assert!(!parsed.sealed);
+        assert_eq!(parsed.sealed_length, 0);
+        assert_eq!(parsed.avali, 0);
+    }
+
+    /// P0-C: a sealed-with-length extent round-trips and stays sealed.
+    #[test]
+    fn p0c_v2_sealed_with_length_round_trip() {
+        let eid = 0xfeed_0003u64;
+        let buf = build_v2(eid, 4096, true, 1);
+        let parsed = ExtentNode::parse_meta(&buf, eid).expect("V2 parse");
+        assert!(parsed.sealed);
+        assert_eq!(parsed.sealed_length, 4096);
+    }
+
+    /// P0-C: invariant `sealed_length > 0 ⇒ sealed` is enforced even if the
+    /// on-disk flag byte is (corruptly) 0 — fail-closed to sealed.
+    #[test]
+    fn p0c_v2_length_implies_sealed_even_if_flag_zero() {
+        let eid = 0xfeed_0004u64;
+        // sealed flag byte = false but sealed_length > 0.
+        let buf = build_v2(eid, 1234, false, 0);
+        let parsed = ExtentNode::parse_meta(&buf, eid).expect("V2 parse");
+        assert!(
+            parsed.sealed,
+            "sealed_length > 0 must force sealed=true (fail-closed)"
+        );
+    }
+
+    /// P0-C: V2 CRC now covers the sealed/avali bytes — flipping the sealed
+    /// flag without recomputing CRC must be rejected.
+    #[test]
+    fn p0c_v2_bit_rot_in_sealed_flag_rejected() {
+        let eid = 0xfeed_0005u64;
+        let mut buf = build_v2(eid, 0, true, 1);
+        buf[40] ^= 0x01; // flip sealed flag, leave CRC stale
+        assert!(
+            ExtentNode::parse_meta(&buf, eid).is_none(),
+            "bit rot in the sealed flag must trip the V2 CRC"
+        );
+    }
+
+    /// P0-C: a V1 buffer with sealed_length=0 derives sealed=false (an old open
+    /// extent stays open after the upgrade).
+    #[test]
+    fn p0c_v1_zero_length_derives_unsealed() {
+        let eid = 0xfeed_0006u64;
+        let mut buf = [0u8; ExtentNode::META_SIZE_V1];
+        buf[0..8].copy_from_slice(ExtentNode::META_MAGIC_V1);
+        buf[8..16].copy_from_slice(&eid.to_le_bytes());
+        // sealed_length=0, eversion=1, owner_revision=0
+        buf[24..32].copy_from_slice(&1u64.to_le_bytes());
+        let crc = crc32c::crc32c(&buf[0..ExtentNode::META_SIZE_V0]);
+        buf[40..44].copy_from_slice(&crc.to_le_bytes());
+        let parsed = ExtentNode::parse_meta(&buf, eid).expect("V1 parse");
+        assert!(!parsed.sealed);
+        assert_eq!(parsed.avali, 0);
     }
 }
 

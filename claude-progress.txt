@@ -1,3 +1,57 @@
+Date: 2026-05-30 (FIX SESSION — Step 1: P0-C sealed-empty persistence)
+TaskStatus: not_completed
+Task scope: Start the FIX session for the chaos-found F227-area bugs, with coco
+  planning + reviewing each (user: "always let coco help you plan and review").
+  coco arch produced the fix order: P0-C (sealed-empty persist) → P0-A (.dat
+  fsync fail-closed) → P0-B (owner_revision durable fence) → BUG#1 (open-tail
+  seal-and-roll) → BUG#2 (traced repro). Step 1 (P0-C) IMPLEMENTED + unit-
+  validated + coco-reviewed (2 rounds, 4 findings fixed). bug#2 NOT fixed by
+  P0-C (confirmed by chaos) — needs Step 5. not_completed (more steps remain).
+
+=== STEP 1 — P0-C: persist sealed-empty extent state in EN .meta (DONE) ===
+  Bug: EN .meta only stored sealed_length, so a manager sealed-EMPTY extent
+  (sealed=true, sealed_length=0 — a CoW-shared tail) looked OPEN after an EN
+  restart → ghost writes → later stale_vp_offset_past_sealed_length. Fix
+  (crates/stream/src/extent_node.rs):
+   - ExtentEntry gains `sealed: AtomicBool`. .meta upgraded to V2 (52B: adds
+     sealed flag + avali, CRC over [0..48]). parse_meta → LocalExtentMeta
+     struct; V0/V1 derive sealed from sealed_length>0, V2 reads it (with
+     sealed_length>0 ⇒ sealed fail-closed). load_extents restores sealed/avali.
+   - apply_extent_meta stores ex.sealed; sealed_changed now also fires on the
+     sealed-EMPTY transition (so it's persisted). 4 append-reject sites + 3
+     EC/recovery seal sites keep the `sealed` invariant.
+   - coco round-1 (2 findings, FIXED): commit-reconcile paths (build_append_
+     future + handle_append) used `mgr_info.sealed_length>0` → missed sealed-
+     empty; now `mgr_info.sealed || sealed_length>0`. handle_copy_extent
+     refused sealed-empty (`sealed_length==0`) + didn't clamp; now gates on
+     `sealed||sealed_length>0` + clamps logical_len to the seal point.
+   - coco round-2 (2 findings): #2 FIXED (copy_extent clamps logical_len from
+     LOCAL sealed state even on manager-unavailable fallback, so sealed-empty
+     copies 0 bytes regardless of manager reachability). #1 DEFERRED→Step 5:
+     the runtime eversion-lag ghost-write window (manager sealed-empty + bumped
+     eversion, EN not synced, stale writer with req.eversion<=local) is NOT
+     closed by P0-C's restart-persistence; its proper fix is manager-side
+     owner-revision fencing on the CoW-tail seal (P0-B + bug#2 manager-side),
+     NOT a perf-killing per-append manager round-trip. P0-C strictly improves
+     (restart half) + is a dependency for BUG#1's escape.
+   - Tests: 7 new (V2 parse: sealed-empty/open/length/fail-closed/CRC-bit-rot,
+     V1-derive + a NODE-RESTART integration test proving a sealed-empty extent
+     rejects ghost appends after reload). autumn-stream 63 lib tests pass,
+     clippy clean.
+
+=== BUG#2 STILL OPEN after P0-C (needs Step 5 traced repro) ===
+  Chaos with P0-C: seed=8 STILL reproduces stale_vp_offset_past_sealed_length
+  (not_found=200). So bug#2 is NOT the sealed-empty-persistence class alone.
+  This seed=8 run's sequence: KillThenFence n1 → Split 9001 → KillEn n1 →
+  EcConvert force_ec extent 18 → KillThenFence n1 — i.e. EC-convert-after-split
+  + kill is involved, pointing at a manager/EC-side sealed_length→0 clobber
+  (cf. historical 2026-04-27 EC re-seal, stream note 6) AND/OR coco's runtime
+  ghost-write (Issue 1). Step 5 = instrument every manager sealed_length=
+  mutation + EN .meta write (extent_id+caller) + run the harsh set until a
+  child fails to open, to pin the exact clobber. project_split_underseal_vp_past_sealed.
+
+--- prior (/loop): new chaos scenarios + bugs found ---
+
 Date: 2026-05-30 (chaos /loop — new scenarios + new bug found)
 TaskStatus: not_completed
 Task scope: /loop "coco arch review chaos test, add new scenarios, run new
