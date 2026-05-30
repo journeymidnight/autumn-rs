@@ -32,10 +32,24 @@ Task scope: Start the FIX session for the chaos-found F227-area bugs, with coco
   when-sealed + re_avali short-replica + post-repair guards; P0-B safe-form
   mark-offline). 4 coco rounds each fixed; 64 stream tests; chaos sanity 5/5
   clean. P0-B-followup (per-extent durability lock) deferred + documented.
-  NEXT (fresh turn): Step 4 (BUG#1 open-tail seal-and-roll escape via
-  ensure_tail_initialised alloc_new_extent(None)) + Step 5 (BUG#2 traced repro —
-  the headline data-loss bug; instrument manager sealed_length= mutations + EN
-  .meta writes, run harsh set until a child fails to open). not_completed.
+  STEP 4 (BUG#1) = DONE: committed+pushed ac6c9a7. ensure_tail_initialised
+  open-tail branch retries current_commit 3×300ms then SEAL-AND-ROLLs via
+  alloc_new_extent(None). coco clean; chaos seed=15 x4 PASS, seal-roll escape
+  FIRED on 2 (recovered, mismatches=0), does NOT introduce bug#2.
+  STEP 5 (BUG#2) = ROOT-CAUSE HYPOTHESIS PINNED (by code read), fix is
+  F227-SENSITIVE → awaiting user decision. The failing extent is SEALED-EMPTY
+  (sealed=true, sealed_length=0) with SST data. compute_commit_seal
+  (rpc_handlers.rs:859) seals at MIN over reachable committed members; F227
+  assumes min ≥ acked, but a REACHABLE-BUT-SHORT member (kill+restart, or a
+  member regressed below acked) drags min DOWN to its short length (possibly 0)
+  → under-seals a data-bearing extent → bug#2. EC-convert + split CoW + apply_
+  ec_conversion_done all PRESERVE sealed_length (verified, ruled out). Candidate
+  fix: compute_commit_seal MIN→MAX over reachable (never under-seals: max ≥
+  acked, max-holder is reachable so recoverable; over-seal = F227-acceptable
+  phantom/data-gain, aligns with uncertain-write semantics). This ALSO makes
+  BUG#1's seal-and-roll safe. CHANGES F227 seal semantics (user owns
+  seal-over-reachable) → presenting for decision + offering trace-verify first.
+  not_completed.
 
 === STEP 1 — P0-C: persist sealed-empty extent state in EN .meta (DONE) ===
   Bug: EN .meta only stored sealed_length, so a manager sealed-EMPTY extent
