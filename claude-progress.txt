@@ -1,3 +1,77 @@
+Date: 2026-05-30 (chaos /loop — new scenarios + new bug found)
+TaskStatus: not_completed
+Task scope: /loop "coco arch review chaos test, add new scenarios, run new
+  seeds, find new bugs". DELIVERED 3 new chaos invariants (committed) + a
+  multi-seed sweep that FOUND A NEW (auto-detectable) WRITE-WEDGE on seed=15.
+  Harness work = DONE; the surfaced bug = OPEN (deferred, F227 area, awaiting
+  user direction). Hence not_completed.
+
+=== NEW CHAOS SCENARIOS (committed 738f127, 3d18399) ===
+  Per coco arch review of system_chaos.rs (data-corruption coverage gaps):
+  1. RANGE invariants (was presence-only): every returned key checked for
+     (a) strictly-ascending ORDER across pages, (b) NO PHANTOM/malformed key
+     (must be a well-formed {b|q}{kid<COUNT} a writer could produce),
+     (c) IN-RANGE [start,end) (CoW split/merge sibling-leak detector).
+  2. LARGE-VALUE/VP coverage: ~1/8 of keys now carry 8 KiB values (>4 KiB
+     VALUE_THROTTLE) → exercises the ValuePointer path + GC punch_holes /
+     dangling-VP-read on overwrite. Size is a deterministic fn of the key.
+  3. POST-SETTLE WRITE-LIVENESS / convergence check (verify_write_liveness):
+     the prior per-key + per-partition-range verifies are BOTH READ-ONLY, so a
+     write-wedged-but-read-fine partition was INVISIBLE. New check fires a
+     burst of 50 in-range 8 KiB PUTs per partition (drives memtable rotation →
+     flush → row_stream.append → alloc_extent — the exact path the wedge hits);
+     fails only on an unambiguous wedge (5 s PUT timeout, or 0 acks). Near-zero
+     false positives (a partition that acks even one write passes).
+  Also fixed a pre-existing TEST cursor-pagination bug the new order-check
+  surfaced: cursor advance appended 0x00 → under MVCC encoding (uk++0x00++
+  BE(MAX-seq)) re-seeks BEFORE last's older versions → re-returns last every
+  page (old HashSet-dedup masked it). Now appends 0x01. Test-only; the real
+  SDK paginates via cur_end_key, not per-key, so it was never affected.
+
+=== SWEEP RESULTS ===
+  seed=2 calibration clean (all 3 checks errors=0). Sweep 1 (seeds 3,4,5,7,9,
+  11,13,14,16) = 9/9 clean. Sweep 2 with write-liveness (seeds 3,5,7,10,12,13,
+  15,17,19,21) = 9/10 clean; SEED=15 FAILED on write-liveness (the new check
+  did its job). seed=13 (prior bug) now passes — the Mode A/B fixes hold.
+
+=== NEW BUG (seed=15) — post-settle WRITE WEDGE on the OPEN active row tail ===
+  NOT data loss (per-key mismatches=0 not_found=0, range errors=0); reads +
+  range fully correct. ONLY writes wedge. Signal repeats every 2 s forever:
+    ERROR background flush async-phase error: commit_length on extent 20:
+      only 3/4 replicas responded (need all)
+  (+ identical on freeze-drain flush_one_imm and split-drain.) extent 20 = the
+  partition's OPEN active row_stream tail. This is the SAME F227 family as the
+  deferred Mode B / bug-#3 PRIMARY layer — but now AUTO-DETECTED by check #3.
+  MECHANISM (pinned from the seed=15 log + stream/manager CLAUDE.md):
+   - StreamClient::current_commit (client.rs ~1935) requires ALL replicas (F227
+     all-replica, no quorum — by design for the WRITE/seal path).
+   - The OPEN active tail has NO liveness escape when one replica is
+     permanently unsatisfiable: recovery only reconfigures SEALED extents, so
+     the open tail's bad replica is never healed; AND ensure_tail_initialised's
+     open-tail branch (client.rs ~1893 else) does `current_commit(&tail).await?`
+     and PROPAGATES the error — whereas the SEALED-tail branch right above
+     (~1877) has a seal-and-roll escape (alloc_new_extent). So flush first-use
+     init retries current_commit forever instead of sealing+rolling onto
+     healthy nodes.
+   - COMPOUNDING: nemesis FenceUnfence node 1 bumps the per-extent owner
+     revision (manager note 23); the PS StreamClient.revision is fixed at
+     connect and never refreshed → node 1 may reject commit_length with the
+     stale revision (counted as "not responded") even once reachable → makes
+     the transient 3/4 PERMANENT.
+  STATUS: coco arch review (rule 12) running for an independent root-cause read.
+  FIX TOUCHES F227 + fence semantics (user-owned per memory + README) — will
+  surface findings + a fix proposal to the user rather than change unilaterally
+  in the autonomous loop. Candidate directions (to validate against data-loss
+  safety): (a) open-tail seal-and-roll escape in ensure_tail_initialised when
+  current_commit is persistently unsatisfiable (lenient seal-over-reachable +
+  fresh tail on healthy nodes); (b) PS refresh/re-acquire StreamClient revision
+  on LockedByOther/eversion-stale instead of hard-fail; (c) reconsider whether
+  the flush commit_length needs strict all-replica given append is already
+  all-replica-ACK. Repro: AUTUMN_CHAOS_SEED=15 (same K4/M2 harsh cmd).
+  Memory: project_recovery_stuck_blocks_alloc (same family; update pending).
+
+--- prior (Mode B): P-bulk row_stream flush-append wedge ---
+
 Date: 2026-05-30 (Mode B)
 TaskStatus: completed
 Task scope: FIX Mode B — the P-bulk row_stream flush-append wedge that made
