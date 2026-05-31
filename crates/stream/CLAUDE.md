@@ -1097,6 +1097,33 @@ sufficient (and cheaper than DashMap).
     holds `meta_write_lock` and reads live atomics.** Cross-ref: notes 21
     (`sealed`), 20 (SealCommit), bug#3 Layer C (commit_length check-only).
 
+24. **KNOWN BUG (deferred, reproduced 2026-05-31): the F178 fsync coalescer can
+    ACK an append whose bytes were written AFTER the covering fsync, under
+    out-of-order same-extent completion.** `build_append_future` / `handle_append`
+    do `pending_fsync.store(total_end)` as a PLAIN store AFTER the pwrite await.
+    Two same-extent append futures can coexist in the inflight `FuturesUnordered`
+    (frames straddling read-burst boundaries; `extent.len` is reserved
+    synchronously at build so their offsets are ascending+non-overlapping), and
+    their pwrite CQEs can complete OUT OF ORDER. If the high-offset write
+    completes first it sets `last_synced` via a real fsync; the low-offset write
+    then completes late, `store`s a SMALLER `pending_fsync` (regresses it — plain
+    store, not `fetch_max`), and its waiter is satisfied by the `pending <=
+    synced` no-fsync branch (`coalescer_loop` ~624) — crediting durability to
+    bytes the only fsync did not cover. **Severity: near-precluded in practice**
+    — (a) loss is observable ONLY under power-loss / kernel-panic (a process kill
+    does NOT drop un-fsynced page-cache writes, so no process-kill chaos can
+    surface it — harness-invisible); (b) F227 all-replica-ACK + recovery
+    re-replicate a single-replica loss. **NOT FIXED** (the only correct fix —
+    contiguous completed-prefix tracking so `last_synced` advances only over a
+    fully-written prefix — touches the hot-path coalescer, the most revert-prone
+    area). Reproduced deterministically by `#[cfg(test)] mod
+    p0_fsync_highwater_tests` in extent_node.rs (models the out-of-order
+    completion; asserts the no-fsync ACK). **Invariant for a future fix:
+    `last_synced` must never advance past the largest offset X such that ALL
+    `[0,X)` pwrites have completed; land the fix WITH those tests as guard +
+    coco /findbugs.** Cross-ref: note 4 (`must_sync` cost), F178 in the Commit
+    Protocol section.
+
 ---
 
 ## RPC Wire Protocol (extent_rpc.rs)
