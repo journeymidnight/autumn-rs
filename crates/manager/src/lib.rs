@@ -189,6 +189,49 @@ impl EtcdMirror {
             )),
         }
     }
+
+    /// Item 3: put+delete txn with an optional single-key value-CAS. `cas =
+    /// Some((key, baseline))` prepends `Cmp::value(key) == baseline` to the
+    /// fenced compare. The fenced txn returning `Ok(false)` means the
+    /// value-compare failed — `key` changed concurrently since the caller
+    /// captured `baseline` (a `punch_holes`/`alloc`/`truncate` committed on the
+    /// same stream during our etcd RTT) — so we surface `Precondition`; the
+    /// handler maps it to `CODE_PRECONDITION` and the client retries with a
+    /// fresh snapshot. Unlike a serialization lock this never BLOCKS the write
+    /// path: conflicting ops proceed concurrently and only a genuine conflict
+    /// retries (the per-stream-lock attempt blocked alloc behind slow GC/split
+    /// under kill and lost writes — see claude-progress.txt Item 3).
+    async fn put_delete_txn_cas(
+        &self,
+        puts: Vec<(String, Vec<u8>)>,
+        deletes: Vec<String>,
+        cas: Option<(String, Vec<u8>)>,
+    ) -> Result<(), AppError> {
+        if puts.is_empty() && deletes.is_empty() {
+            return Ok(());
+        }
+        let extra_cmp = match &cas {
+            Some((k, v)) => vec![autumn_etcd::Cmp::value(k.as_bytes(), v.as_slice())],
+            None => vec![],
+        };
+        let mut ops = Vec::with_capacity(puts.len() + deletes.len());
+        ops.extend(
+            puts.into_iter()
+                .map(|(k, v)| autumn_etcd::Op::put(k.as_bytes(), &v)),
+        );
+        ops.extend(
+            deletes
+                .into_iter()
+                .map(|k| autumn_etcd::Op::delete(k.as_bytes())),
+        );
+        match self.txn_fenced(extra_cmp, ops, vec![]).await? {
+            true => Ok(()),
+            false => Err(AppError::Precondition(
+                "stream changed concurrently (CAS conflict); retry with a fresh snapshot"
+                    .to_string(),
+            )),
+        }
+    }
 }
 
 // ── ConnPool (single-threaded compio, Rc-based) ────────────────────────────
@@ -2677,6 +2720,12 @@ impl AutumnManager {
         stream: &MgrStreamInfo,
         sealed_old: Option<&MgrExtentInfo>,
         new_extent: &MgrExtentInfo,
+        // Item 3: `Some(bytes)` = value-CAS the `streams/<id>` write against the
+        // membership baseline the handler read. If a concurrent punch_holes /
+        // truncate / another alloc changed the stream during our etcd RTT, the
+        // CAS fails → `Precondition` → client retries (instead of overwriting
+        // the concurrent change and resurrecting a removed extent).
+        stream_cas: Option<Vec<u8>>,
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             let mut kvs = vec![(
@@ -2693,7 +2742,8 @@ impl AutumnManager {
                 format!("extents/{}", new_extent.extent_id),
                 rkyv_encode(new_extent).to_vec(),
             ));
-            etcd.put_msgs_txn(kvs).await?;
+            let cas = stream_cas.map(|v| (format!("streams/{}", stream.stream_id), v));
+            etcd.put_delete_txn_cas(kvs, vec![], cas).await?;
         }
         Ok(())
     }
@@ -2703,6 +2753,9 @@ impl AutumnManager {
         stream: &MgrStreamInfo,
         extent_puts: &[MgrExtentInfo],
         extent_deletes: &[u64],
+        // Item 3: value-CAS baseline for the `streams/<id>` membership write
+        // (see `mirror_stream_alloc_extent`).
+        stream_cas: Option<Vec<u8>>,
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             let mut puts = Vec::with_capacity(1 + extent_puts.len());
@@ -2720,7 +2773,8 @@ impl AutumnManager {
                 .iter()
                 .map(|id| format!("extents/{id}"))
                 .collect::<Vec<_>>();
-            etcd.put_and_delete_txn(puts, deletes).await?;
+            let cas = stream_cas.map(|v| (format!("streams/{}", stream.stream_id), v));
+            etcd.put_delete_txn_cas(puts, deletes, cas).await?;
         }
         Ok(())
     }

@@ -1418,7 +1418,7 @@ impl AutumnManager {
 
         // F125: compute stream_after without modifying store, mirror to
         // etcd FIRST, then apply to in-memory state on success.
-        let stream_after = {
+        let (stream_after, alloc_stream_baseline) = {
             let s = self.store.inner.borrow();
             let st = match s.streams.get(&req.stream_id) {
                 Some(v) => v,
@@ -1431,9 +1431,15 @@ impl AutumnManager {
                     }))
                 }
             };
+            // Item 3: CAS baseline = the stream's current value (etcd holds
+            // exactly this until a concurrent op commits). The mirror txn below
+            // value-CAS's `streams/<id>` against it, so a punch_holes/truncate
+            // committing during our RTT makes our write fail → retry, instead of
+            // resurrecting the removed extent.
+            let baseline = rkyv_encode(st).to_vec();
             let mut stream_after = st.clone();
             stream_after.extent_ids.push(extent_id);
-            stream_after
+            (stream_after, baseline)
         };
 
         // F210-A2 verify-BEFORE-mirror (replaces the pre-F210-A2 F146
@@ -1543,7 +1549,12 @@ impl AutumnManager {
         // clobbered by our stale early snapshot.
         let sealed_old = if already_sealed { None } else { Some(&tail) };
         if let Err(err) = self
-            .mirror_stream_alloc_extent(&stream_after, sealed_old, &new_extent)
+            .mirror_stream_alloc_extent(
+                &stream_after,
+                sealed_old,
+                &new_extent,
+                Some(alloc_stream_baseline),
+            )
             .await
         {
             return Ok(rkyv_encode(&StreamAllocExtentResp {
@@ -1611,6 +1622,10 @@ impl AutumnManager {
                     Vec<MgrExtentInfo>,
                     Vec<u64>,
                     Vec<PendingDelete>,
+                    // Item 3: CAS baseline = the stream's value BEFORE this
+                    // punch (etcd currently holds it). The mirror value-CAS's
+                    // `streams/<id>` against it.
+                    Vec<u8>,
                 ),
                 AppError,
             > {
@@ -1621,6 +1636,7 @@ impl AutumnManager {
                     .get(&req.stream_id)
                     .ok_or_else(|| AppError::NotFound(format!("stream {}", req.stream_id)))?
                     .clone();
+                let stream_baseline = rkyv_encode(&stream).to_vec();
 
                 // F126: only operate on extents that actually belong to this
                 // stream. Without this, a malformed request could decrement
@@ -1705,16 +1721,27 @@ impl AutumnManager {
                         }
                     }
                 }
-                Ok((updated, extent_puts, extent_deletes, pending_deletes))
+                Ok((
+                    updated,
+                    extent_puts,
+                    extent_deletes,
+                    pending_deletes,
+                    stream_baseline,
+                ))
             })()
         };
 
         match out {
-            Ok((stream, extent_puts, extent_deletes, pending_deletes)) => {
+            Ok((stream, extent_puts, extent_deletes, pending_deletes, stream_baseline)) => {
                 // Step 2: persist to etcd FIRST. Failure → in-memory zero
                 // changes (the closure above produced clones only).
                 if let Err(err) = self
-                    .mirror_stream_extent_mutation(&stream, &extent_puts, &extent_deletes)
+                    .mirror_stream_extent_mutation(
+                        &stream,
+                        &extent_puts,
+                        &extent_deletes,
+                        Some(stream_baseline),
+                    )
                     .await
                 {
                     return Ok(rkyv_encode(&PunchHolesResp {
@@ -1781,6 +1808,8 @@ impl AutumnManager {
                     Vec<MgrExtentInfo>,
                     Vec<u64>,
                     Vec<PendingDelete>,
+                    // Item 3: CAS baseline (stream value before this truncate).
+                    Vec<u8>,
                 ),
                 AppError,
             > {
@@ -1790,6 +1819,7 @@ impl AutumnManager {
                     .get(&req.stream_id)
                     .cloned()
                     .ok_or_else(|| AppError::NotFound(format!("stream {}", req.stream_id)))?;
+                let stream_baseline = rkyv_encode(&stream).to_vec();
 
                 let pos = stream
                     .extent_ids
@@ -1875,14 +1905,25 @@ impl AutumnManager {
                         }
                     }
                 }
-                Ok((updated, extent_puts, extent_deletes, pending_deletes))
+                Ok((
+                    updated,
+                    extent_puts,
+                    extent_deletes,
+                    pending_deletes,
+                    stream_baseline,
+                ))
             })()
         };
 
         match out {
-            Ok((stream, extent_puts, extent_deletes, pending_deletes)) => {
+            Ok((stream, extent_puts, extent_deletes, pending_deletes, stream_baseline)) => {
                 if let Err(err) = self
-                    .mirror_stream_extent_mutation(&stream, &extent_puts, &extent_deletes)
+                    .mirror_stream_extent_mutation(
+                        &stream,
+                        &extent_puts,
+                        &extent_deletes,
+                        Some(stream_baseline),
+                    )
                     .await
                 {
                     return Ok(rkyv_encode(&TruncateResp {

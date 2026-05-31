@@ -1515,3 +1515,44 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     any seal the EN hasn't been pushed yet. Cross-ref: note 28 (F227 lenient
     PROBE seal — still used for the `None`/new-owner path), 31 (alloc
     already-sealed no-tail-rewrite).
+
+33. **Stream-membership etcd writes value-CAS on `streams/<id>` (Item 3 —
+    resurrect-deleted-extent fix).** The manager is single-threaded but handlers
+    interleave at every `.await`. `handle_stream_alloc_extent` (adds an extent),
+    `handle_stream_punch_holes` / `handle_truncate` (remove extents) all do
+    read-baseline → `.await`(EN-alloc + etcd-mirror) → write-baseline-back. The
+    `.await` is the gap: a `punch_holes` committing DURING an `alloc`'s
+    etcd-mirror RTT was overwritten by alloc's stale baseline → the removed
+    extent RESURRECTED in both etcd and memory (lost GC / dangling stream ref).
+    `verify-before-mirror` (F146/F210-A2) only catches mutations BEFORE the
+    await — the real linearization point is the etcd commit, which was a CAS-less
+    last-writer-wins put.
+    Fix: the mirror txn now value-CAS's `streams/<id>` against the membership
+    BASELINE the handler read (`mirror_stream_alloc_extent` /
+    `mirror_stream_extent_mutation` take `stream_cas: Option<Vec<u8>>` =
+    `rkyv_encode(stream_as_read)`; `EtcdMirror::put_delete_txn_cas` prepends
+    `Cmp::value(streams/<id>) == baseline` to the F149 fenced txn). On conflict
+    the fenced txn returns `Ok(false)` → `AppError::Precondition` → the client
+    retries with a fresh snapshot. The CAS baseline byte-matches etcd because
+    etcd-first keeps `streams/<id>` == `rkyv_encode(in-memory stream)` and rkyv
+    is deterministic (verified: 0 spurious CAS conflicts across chaos).
+    **Why CAS, not a per-stream serialization lock:** a lock held across the
+    handler BLOCKS the write-path `alloc_new_extent` behind a slow concurrent
+    GC/split/merge under kill → A/B-measured 2/6 lost writes (`not_found`). CAS
+    never blocks — conflicting ops proceed; only a genuine conflict retries
+    (A/B: 0/8 with CAS). **Invariant: any read-modify-write of a `streams/<id>`
+    membership MUST value-CAS the write against the read baseline — never a bare
+    last-writer-wins put.** Two accepted residuals (pre-existing, not worsened):
+    a CAS-failed alloc orphans the just-created extent files (same as the
+    F146/F210-A2 verify-precondition path; reaped by F109 reconcile; CAS
+    conflicts ~0), and GC/compaction callers don't client-retry but their
+    background loops re-attempt (`classify_gc_failure_cooldown` maps
+    `precondition failed` → 30 s soft cooldown). **FOLLOW-UP (tracked):** extend
+    the same value-CAS to the OTHER read-modify-write stream mutators —
+    `handle_multi_modify_split` / `handle_multi_modify_merge` (merge splices
+    survivor membership) / `handle_sync_partition_vp_refs` / `apply_ec_conversion_done`
+    / `apply_recovery_done` — so ALL membership/extent-state etcd writes are CAS
+    (the verify-at-apply becomes redundant on the etcd side). Deliberately
+    deferred as a separate, well-tested effort (revert-prone area). Cross-ref:
+    notes 13 (F146 verify-at-apply — the weaker before-await form), 15 (F149
+    leader fence — the txn already carries it), 32 (sealed state).

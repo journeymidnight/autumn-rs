@@ -1,3 +1,67 @@
+Date: 2026-05-31 (MUST-FIX BATCH — Item 3 DONE via etcd value-CAS; Item 2 deferred)
+TaskStatus: completed
+Task scope: Continue the coco-prioritized must-fix batch. Item 1 (durable fence)
+  DONE earlier (db5d708). Item 5/reopen-overlap (now "Item 2", user: do it LAST)
+  — drain-before-reopen ATTEMPTED + DEADLOCKS (chicken-and-egg with client
+  migration: old instance can't exit until clients move to the new port, which
+  needs the new instance open first → 120s TTL stall, worse than status quo);
+  REVERTED. Empirically the reopen-overlap corruption is NOT reproducible — every
+  observed reload (seed=6, 2x via merge) coincides with the F185 merge-FREEZE
+  (old instance frozen, not writing), + split is in-place (F212-fix-2), so the
+  reachable paths are already covered. Deferred (user A: do Item 2 last).
+
+=== ITEM 3 — alloc/stream-membership metadata etcd-CAS (P1) — DONE ===
+  ROOT CAUSE: manager single-threaded but handlers interleave at .await.
+  handle_stream_alloc_extent (adds extent) + handle_stream_punch_holes /
+  handle_truncate (remove extents) do read-baseline → await(EN-alloc + etcd
+  mirror) → writeback. A punch_holes committing DURING an alloc's etcd-mirror RTT
+  was overwritten by alloc's stale baseline → removed extent RESURRECTED in etcd
+  AND memory (lost GC / dangling stream ref). verify-before-mirror (F146/F210-A2)
+  only catches BEFORE-await changes; the real linearization point is the etcd
+  commit, which was CAS-less last-writer-wins.
+  ATTEMPT 1 (per-stream serialization lock) — REVERTED, A/B-PROVEN REGRESSION.
+  Held a per-stream futures::Mutex across the whole handler. coco findbugs: 2
+  rounds clean (P1 split/merge coverage + P2 unbounded map both fixed). BUT chaos
+  A/B: WITH lock seed=8 = 2/6 not_found (lost writes); WITHOUT = 0/6. Mechanism:
+  the lock BLOCKED the write-path alloc_new_extent behind a slow concurrent
+  GC/split/merge under kill → write stall → key loss. The fix was worse than the
+  (never-reproduced, theoretical) bug. Reverted.
+  ATTEMPT 2 (etcd value-CAS) — SHIPPED (user chose this; "写入etcd都应该是CAS").
+  mirror_stream_alloc_extent / mirror_stream_extent_mutation take stream_cas:
+  Option<Vec<u8>> = rkyv_encode(stream_as_read); new EtcdMirror::put_delete_txn_cas
+  prepends Cmp::value(streams/<id>) == baseline to the F149 fenced txn. Conflict
+  → Ok(false) → AppError::Precondition → client retries fresh. NEVER blocks the
+  write path (conflict→retry, like an existing soft error) → no regression. CAS
+  baseline byte-matches etcd (etcd-first keeps streams/<id> == rkyv_encode(memory
+  stream); rkyv deterministic) — verified 0 spurious CAS conflicts in chaos.
+  coco findbugs (rule 12): 2 findings, BOTH OVERRIDDEN with repo knowledge (no
+  code change — changing risks regressions):
+   - P1 orphan extent on CAS-fail: PRE-EXISTING (the F146/F210-A2 verify-
+     precondition path ALREADY orphans the just-alloc'd extent after
+     alloc_extent_on_node); reaped by F109 handle_reconcile_extents
+     (loaded-but-not-in-manager → unlink); CAS conflicts ~0 → negligible rate.
+   - P2 punch/truncate clients don't retry: their BACKGROUND loops do —
+     classify_gc_failure_cooldown maps "precondition failed" → 30s SOFT cooldown;
+     compaction truncate warns+continues+retries next cycle. Blanket client-retry
+     would STORM the legitimate defer-preconditions (recovery/EC inflight), so the
+     soft-cooldown is the correct handling.
+  VALIDATION: seed=2 calib PASS (0 CAS conflicts = baseline matches etcd). Sweep
+  8/8 (seed 2,6x3,8x2,13,31). seed=8 confirm 5/5 (vs lock 2/6) → 0/8 total on the
+  regression canary. autumn-manager 114 lib tests; clippy clean.
+  FOLLOW-UP (tracked, user-approved option A): extend value-CAS to the OTHER
+  read-modify-write stream mutators (split / merge / sync_partition_vp_refs /
+  ec_conversion_done / recovery_done) so ALL membership/extent-state etcd writes
+  are CAS (uniform; verify-at-apply then redundant on the etcd side). Deferred as
+  a separate well-tested effort (revert-prone area). manager CLAUDE.md note 33.
+
+=== REMAINING (this batch) ===
+  Item 2 (reopen-overlap, P0-low-exposure) — LAST per user. drain-before-reopen
+  refuted (deadlock); reachable paths covered by F185 freeze + split-in-place;
+  the correct general fix = freeze-old-writes-before-open-new (generalize F185),
+  a larger mechanism. To revisit.
+
+--- prior (same session) ---
+
 Date: 2026-05-30 (DEFERRED MUST-FIX BATCH — coco-prioritized; Item 1 of 4 DONE)
 TaskStatus: completed
 Task scope: User: "和 coco 合作挑选必修的,然后逐一修复". coco arch ranked the 5
