@@ -1,12 +1,13 @@
-Date: 2026-05-31 (F261 migration feature logged + coco arch verdicts verified)
+Date: 2026-05-31 (F249 migration feature logged + coco arch verdicts verified)
 TaskStatus: completed
 Task scope: User: 处理 1/2/3 after the coco arch review of "主动跨-PS partition
   迁移". Done:
-  (1) Logged F261 (proactive cross-PS partition migration / owner-transfer) in
-      feature_list.md as passes:false / NOT BUILT, with the minimal owner-
-      transfer form + coco's 4 pre-req fencing conditions. Verdict: 可选/不建议
-      (failover + auto-split/merge already cover correctness; F261 only fills
-      operability gaps: planned decommission, partition回流到新PS, 长期倾斜).
+  (1) Logged F249 (proactive cross-PS partition migration / owner-transfer) in
+      feature_list.md (Open/Deferred section) as passes:false / NOT BUILT, with
+      the minimal owner-transfer form + coco's 4 pre-req fencing conditions.
+      Verdict: 可选/不建议 (failover + auto-split/merge already cover
+      correctness; F249 only fills operability gaps: planned decommission,
+      partition回流到新PS, 长期倾斜). F249 = next free ledger number (max was F248).
   (2) Verified coco /arch (GPT-5.5) 4 既有-code findings against current HEAD —
       verdicts below. coco ran isolated-worktree (skill), 2 prior attempts
       OOM-killed (exit137) under load; 3rd run clean.

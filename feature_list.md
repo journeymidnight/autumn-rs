@@ -358,6 +358,23 @@
 
 ## Open / Deferred designs
 
+### F249 · Proactive cross-PS partition migration (owner-transfer) — 可选/不建议, NOT BUILT
+- **Trigger:** Move a partition from a HEALTHY PS X to PS Y without killing X — for (a) planned PS decommission/maintenance, (b) existing partitions回流到新扩容的 PS, (c) PS 间长期负载倾斜 split 抹不平。Today NOT supported: `rebalance_regions` is reactive-only (fires on register / upsert / split / PS-evict) and PRESERVES a live PS's ownership. The only rebalance lever is auto-split (relief valve, before merge) + merge (boundary change). Failover (PS_DEAD_TIMEOUT=10s → rebalance → new PS open_partition replays log_stream → owner-lock revision fence) covers PS DEATH but not a graceful move of a live PS.
+- **Assessment (me + coco /arch GPT-5.5, 2026-05-31):** 可选,非必修. Failover + auto-split/merge already cover correctness + hot-partition relief + crash. The gaps F249 fills are operability/efficiency, NOT data safety. Current workaround for decommission = kill the PS → failover moves its partitions (~10s window + WAL replay storm). Per-scenario: hot single partition >30K → split (migration can't raise the single-owner single-thread ceiling, only place it elsewhere); per-PS skew → split hot ranges + rebalance spreads children (indirect); planned decommission / 存量回流 → NOT covered, this is the real gap.
+- **Minimal form if ever built (do NOT data-copy / dual-write):** control-plane OWNER-TRANSFER reusing the failover mechanism:
+  1. freeze + drain source (reuse split/merge freeze-drain: reject Put/Del, drain inflight, flush imm, stabilize log/row/meta commit_length)
+  2. single manager etcd txn (CAS expected old owner/epoch): set `regions[part].ps_id = target`, BUMP a per-partition owner epoch + region_epoch, version/clear `part_addrs[part]`
+  3. target opens the SAME 3 streams with the new epoch/fence, replays log_stream
+  4. source drops the partition (epoch/fence makes its stale listener unable to write even before it notices)
+  5. clients reroute by region_epoch (stale epoch → Unavailable → refresh)
+- **Pre-requisites (coco P0 — MUST land before any migration; without them a naive MovePartition creates a dual-owner write window):**
+  - per-partition owner epoch (e.g. `partition-owner:{part_id}`), bumped on transfer, threaded PS → stream client → EN append (today owner-lock is PS-level, not per-partition)
+  - `RegisterPartitionAddr` must validate `regions[part].ps_id == req.ps_id` (today it does NOT — `rpc_handlers.rs` ~3651)
+  - `GetRegions` must validate the returned `part_addr` belongs to the current owner
+  - bump `region_epoch` on OWNER change (today only on rg/range change)
+- **Risk if done wrong:** the reopen-overlap / dual-writer family (BUG#2 lineage, resolved via client.rs apply_reset_tail) — must route through the durable owner_revision fence (db5d708). NEVER copy/dual-write the 3 streams (would explode the CoW/GC/recovery race surface beyond split/merge).
+- **passes:** false (NOT built — revisit only on a concrete operational need: planned decommission, or measured long-term skew that split can't smooth).
+
 ### F195 · Eliminate env::var reads from production rs code; route all config via CLI args
 
 - **Trigger:** Project rule ("No env reads in rs code — production rs code takes config via CLI args; env→flag translation lives in cluster.sh, not Rust") violated by **38 distinct `AUTUMN_*` env vars** read from **42 `std::env::var` call sites** across **9 production source files**. The drift accumulated across F099/F104/F120/F141/F178/F184/F187/F189/F190-F194 — each feature added a knob, defaulting to "read env at the call site." Effect: a single binary's actual config surface is invisible to `--help` or `binary --print-config`; cluster.sh leaks AUTUMN_* via the process environment (see `cluster.sh` line ~335 `env | grep AUTUMN_`); test fixtures use `std::env::set_var` (mutating process-global state, hostile to parallel test runs).
