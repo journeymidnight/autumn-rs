@@ -6822,3 +6822,136 @@ mod f211d_wire_fence_tests {
         assert_eq!(decoded.revision, 5);
     }
 }
+
+#[cfg(test)]
+mod p0_fsync_highwater_tests {
+    //! P0 #1 (coco arch finding, 2026-05-31) — deterministic MECHANISM
+    //! reproduction of the F178 fsync-coalescer high-water accounting bug.
+    //!
+    //! THE BUG: `build_append_future` (and `handle_append`) do
+    //! `pending_fsync.store(total_end)` — a PLAIN store, AFTER the pwrite
+    //! `.await`. Two appends to the SAME extent can be in the inflight
+    //! `FuturesUnordered` at once (frames that straddle read-burst boundaries),
+    //! and io_uring may complete their writes OUT OF ORDER. When the
+    //! higher-offset write completes first, its `store(150)` + fsync set
+    //! `last_synced = 150`; then the lower-offset write completes LATE, does
+    //! `store(100)` (REGRESSING `pending_fsync` 150->100, because it is a plain
+    //! store not a `fetch_max`), and registers a waiter at 100. The coalescer's
+    //! `pending <= synced` branch (extent_node.rs ~624) then satisfies that
+    //! waiter WITHOUT a fresh `sync_data` — so the append of `[0,100)` is ACKed
+    //! durable even though the only fsync ran BEFORE those bytes were written.
+    //!
+    //! WHY THIS IS A *MECHANISM* TEST, NOT AN END-TO-END LOSS TEST: actual
+    //! byte loss is only observable under power-loss / kernel-panic (a process
+    //! kill does NOT drop un-fsynced page-cache writes — the kernel still
+    //! writes them back). So no process-kill chaos can ever surface this. What
+    //! this proves DETERMINISTICALLY is the coalescer's *accounting* bug: a
+    //! waiter is resolved Ok() crediting durability to bytes whose write
+    //! completed after the covering fsync. The out-of-order completion is
+    //! modeled by performing the writes + `pending_fsync.store`s in the
+    //! high-then-low order (= the CQE order io_uring is free to choose).
+    //!
+    //! Status: demonstration + regression guard only. Per the project
+    //! reproduce-first discipline the hot-path coalescer is NOT changed here;
+    //! a fix (contiguous completed-prefix tracking so `last_synced` only
+    //! advances over a fully-written prefix) must come with this test as guard.
+
+    use super::*;
+
+    async fn alloc_entry(node: &ExtentNode, eid: u64) -> Rc<ExtentEntry> {
+        node.handle_alloc_extent(rkyv_encode(&AllocExtentReq { extent_id: eid }))
+            .await
+            .expect("alloc");
+        node.extents.get(&eid).expect("entry").clone()
+    }
+
+    async fn pwrite(entry: &Rc<ExtentEntry>, bytes: Vec<u8>, off: u64) {
+        let file_rc = entry.file_rc();
+        let mut f: &CompioFile = &file_rc;
+        let BufResult(wr, _) = f.write_all_at(bytes, off).await;
+        wr.expect("pwrite");
+    }
+
+    /// Reproduce: out-of-order same-extent completion makes the coalescer ACK a
+    /// write that landed AFTER the covering fsync.
+    #[compio::test]
+    async fn p0_coalescer_acks_write_that_completed_after_fsync() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
+        let node = ExtentNode::new(config).await.expect("ExtentNode::new");
+        let entry = alloc_entry(&node, 5001).await;
+
+        // ── Model F2 = [100,150) completing FIRST (higher offset). ──
+        // Write the real bytes, then advance the high-water + register, exactly
+        // as build_append_future does (write .await THEN pending_fsync.store).
+        pwrite(&entry, vec![0xBBu8; 50], 100).await;
+        entry.coalescer.pending_fsync.store(150, Ordering::SeqCst);
+        register_sync_waiter(&entry, 150)
+            .await
+            .expect("waiter chan")
+            .expect("fsync ok");
+        assert_eq!(
+            entry.coalescer.last_synced.load(Ordering::SeqCst),
+            150,
+            "the [100,150) fsync advanced last_synced to 150"
+        );
+
+        // ── Model F1 = [0,100) completing LATE (lower offset). ──
+        // Its bytes are written to the page cache NOW — i.e. AFTER the fsync
+        // above already ran. In production a power-loss here loses [0,100).
+        pwrite(&entry, vec![0xAAu8; 100], 0).await;
+        // Plain store — REGRESSES pending_fsync 150 -> 100 (the bug; a fetch_max
+        // would keep 150, but even that wouldn't make [0,100) durable).
+        entry.coalescer.pending_fsync.store(100, Ordering::SeqCst);
+        let acked = register_sync_waiter(&entry, 100).await.expect("waiter chan");
+
+        // THE BUG, made deterministic:
+        assert!(
+            acked.is_ok(),
+            "coalescer ACKed the [0,100) append (durability claimed)"
+        );
+        assert_eq!(
+            entry.coalescer.last_synced.load(Ordering::SeqCst),
+            150,
+            "last_synced is UNCHANGED at 150 — proving the waiter(100) was \
+             satisfied by the `pending <= synced` NO-FSYNC branch. The [0,100) \
+             write that completed AFTER the 150 fsync was ACKed durable with no \
+             fsync covering it. This is the P0 #1 accounting bug."
+        );
+    }
+
+    /// Control: IN-ORDER completion (the common single-burst coalesced path) is
+    /// correct — each waiter is covered by a fsync issued after its write. This
+    /// isolates the bug to OUT-OF-ORDER completion, confirming the narrow
+    /// reachability (only same-extent appends straddling read bursts + io_uring
+    /// reordering trigger it).
+    #[compio::test]
+    async fn p0_in_order_completion_is_correctly_durable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
+        let node = ExtentNode::new(config).await.expect("ExtentNode::new");
+        let entry = alloc_entry(&node, 5002).await;
+
+        pwrite(&entry, vec![0xAAu8; 100], 0).await;
+        entry.coalescer.pending_fsync.store(100, Ordering::SeqCst);
+        register_sync_waiter(&entry, 100)
+            .await
+            .expect("chan")
+            .expect("ok");
+        assert_eq!(entry.coalescer.last_synced.load(Ordering::SeqCst), 100);
+
+        pwrite(&entry, vec![0xBBu8; 50], 100).await;
+        entry.coalescer.pending_fsync.store(150, Ordering::SeqCst);
+        register_sync_waiter(&entry, 150)
+            .await
+            .expect("chan")
+            .expect("ok");
+        // In-order: the [100,150) write completed BEFORE its fsync, so
+        // last_synced legitimately advances to 150 with a covering fsync.
+        assert_eq!(
+            entry.coalescer.last_synced.load(Ordering::SeqCst),
+            150,
+            "in-order completion advances last_synced via a real covering fsync"
+        );
+    }
+}

@@ -1,3 +1,72 @@
+Date: 2026-05-31 (P0 #1 fsync-coalescer high-water — REPRODUCED deterministically)
+TaskStatus: completed
+Task scope: User: 研究复现 P0 #1 (coco's append fsync high-water finding).
+  Applied reproduce-first discipline. OUTCOME: mechanism REPRODUCED with a
+  deterministic in-crate test (no power-loss rig needed — it's an ACCOUNTING
+  bug in the coalescer state machine). NO production code changed (per
+  discipline: do not fix the revert-prone hot-path coalescer on a code-read;
+  the repro test is the guard for a future fix).
+
+=== THE BUG (confirmed by code + now by test) ===
+  F178 per-extent fsync coalescer credits an ACK to bytes written AFTER the
+  covering fsync, under OUT-OF-ORDER same-extent append completion.
+  - build_append_future / handle_append do `pending_fsync.store(total_end)` —
+    a PLAIN store, AFTER the pwrite .await (extent_node.rs ~1824 / ~4350).
+  - extent.len is reserved synchronously at build (step 7 ~1789) so two
+    same-extent futures in the inflight FU get ascending non-overlapping
+    file_starts — BUT their pwrite CQEs can complete out of order.
+  - RACE: F1=[0,100) F2=[100,150). F2 completes first → store(150) → coalescer
+    fsync → last_synced=150 → F2 ACKs. F1 completes LATE → store(100)
+    (REGRESSES pending, plain store not fetch_max) → register waiter(100) →
+    coalescer `pending(100) <= synced(150)` branch (~624) satisfies it WITH NO
+    FRESH FSYNC → F1 ACKs. But [0,100) was written AFTER the only fsync.
+  - fetch_max ALONE does NOT fix it: even keeping pending=150, last_synced=150
+    was set by a fsync that ran before [0,100) was written. Correct fix =
+    CONTIGUOUS COMPLETED-PREFIX tracking (last_synced may only advance over a
+    fully-written prefix). NOT applied (hot-path, revert-prone).
+
+=== REPRODUCTION (committed, test-only) ===
+  crates/stream/src/extent_node.rs new `#[cfg(test)] mod p0_fsync_highwater_tests`
+  (had to be IN-CRATE — Coalescer / register_sync_waiter are pub(crate), the
+  out-of-crate tests/ dir can't see them):
+  - p0_coalescer_acks_write_that_completed_after_fsync: drives the high-then-low
+    completion order on a real tmpfile ExtentEntry, asserts waiter(100) resolves
+    Ok WITH last_synced UNCHANGED at 150 → proves the no-fsync ACK (the bug).
+  - p0_in_order_completion_is_correctly_durable: control — in-order completion
+    advances last_synced via a real covering fsync (isolates the bug to
+    out-of-order completion → confirms narrow reachability).
+  Both pass. autumn-stream lib 65→67 tests; clippy clean.
+
+=== REACHABILITY / SEVERITY (why it's a repro, not an incident) ===
+  - Needs 2+ concurrent SAME-extent append futures: the hot path COALESCES
+    consecutive same-extent frames in one read burst into ONE pwritev; two
+    futures only coexist when same-extent appends straddle read-burst
+    boundaries → MINORITY case. Plus io_uring must complete them out of order.
+  - ACK-before-fsync loss is observable ONLY under POWER LOSS / kernel panic /
+    block-layer flush-fault injection. A PROCESS KILL does NOT drop un-fsynced
+    page-cache writes (kernel writes them back after the process dies) → NO
+    process-kill chaos can EVER surface this. Same harness-invisible class as
+    the deferred extent-state CAS. This is why it has never been observed.
+  - F227 all-replica-ACK + recovery: a user PUT ACKs only when ALL 3 replicas
+    ACK; single-replica power loss in the µs window re-replicates from the 2
+    healthy peers. User-visible loss needs the race + correlated multi-replica
+    power loss in the same µs window → structurally near-precluded.
+
+=== VERDICT ===
+  Mechanism REAL and now DETERMINISTICALLY REPRODUCED (code-read elevated to a
+  demonstrated test). Severity in practice: near-precluded (harness-invisible +
+  all-replica-ACK + recovery). FIX DEFERRED on purpose: the only correct fix
+  touches the F178 hot-path coalescer (contiguous completed-prefix watermark) —
+  the most revert-prone area (Items 2/4 lesson). The repro tests are the guard
+  to land WITH that fix when a demonstrated need or a quiet window arrives.
+  coco /findbugs on this change: not run (test-only addition, no prod logic);
+  run it before any actual coalescer fix.
+
+NOTE: claude-progress.txt got binary-corrupted mid-session (87 garbage lines);
+  restored from HEAD (commit c5b8aa4) and this entry re-added cleanly.
+
+--- prior (same day) ---
+
 Date: 2026-05-31 (F249 migration feature logged + coco arch verdicts verified)
 TaskStatus: completed
 Task scope: User: 处理 1/2/3 after the coco arch review of "主动跨-PS partition
