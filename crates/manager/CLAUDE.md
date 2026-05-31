@@ -1562,13 +1562,25 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     **Validated:** merge-heavy chaos 8/8, merges succeed with 0 spurious CAS
     conflicts (rkyv baseline byte-matches etcd).
 
-    **FOLLOW-UP (tracked, lower priority):** the EXTENT-STATE read-modify-write
-    writes (`extents/<id>`: eversion / replicates / avali / vp_table_refs) are
-    NOT yet value-CAS'd — `handle_multi_modify_split`'s source-tail seal,
-    `handle_sync_partition_vp_refs`, `apply_ec_conversion_done`,
-    `apply_recovery_done`. These already carry the F146/F147/F207/F149
-    verify-at-apply + ledger + fence guards, so CAS there is defense-in-depth
-    (replacing verify-at-apply on the etcd side), in the most revert-prone
-    recovery/EC area — deferred as a separate, demonstrated-need effort.
-    Cross-ref: notes 13 (F146 verify-at-apply — the weaker before-await form),
-    15 (F149 leader fence — the txn already carries it), 32 (sealed state).
+    **FOLLOW-UP (DEFERRED, demonstrated-need only — reproduce-first):** the
+    EXTENT-STATE read-modify-write writes (`extents/<id>`: eversion / replicates
+    / avali / vp_table_refs) are NOT value-CAS'd — `handle_multi_modify_split`'s
+    source-tail seal, `handle_sync_partition_vp_refs`, `apply_ec_conversion_done`,
+    `apply_recovery_done`. A reproduce-first reachability investigation (2026-05-31)
+    found the extent-state clobber is NOT reproducible and structurally
+    near-precluded, so it is NOT worth fixing speculatively in this revert-prone
+    area: (a) `apply_recovery_done` reads the extent and writes etcd
+    AWAIT-ADJACENTLY (no `.await` between) so the only window is the write's own
+    RTT; (b) the F207 ledger serialises recovery/EC per extent and note 31 stops
+    alloc rewriting a sealed extent, so a concurrent same-extent writer is
+    near-precluded; (c) split-seal / sync_vp_refs / ec_done have an await gap but
+    are covered before-await by F146 / F147-A / F207+F138 verify-at-apply +
+    ledger; (d) EMPIRICALLY, Item 3's membership CAS measured `cas_conflict=0`
+    across all chaos — the etcd-RTT-clobber MECHANISM never fires in the harness,
+    so even the shipped membership CAS is a precautionary safety net. The worked
+    CAS example (`apply_recovery_done`: capture `rkyv_encode(extent_as_read)` →
+    `put_delete_txn_cas([extents/<id>=new], [inflight_key], [extents/<id>=baseline])`)
+    + the generalized multi-key `put_delete_txn_cas` are kept ready; apply them
+    ONLY if an extent-state clobber is ever actually reproduced. Cross-ref:
+    notes 13 (F146 verify-at-apply — the weaker before-await form), 15 (F149
+    leader fence — the txn already carries it), 32 (sealed state).

@@ -1,3 +1,33 @@
+Date: 2026-05-31 (uniform etcd CAS — extent-state class: reproduce-first → DEFER)
+TaskStatus: completed
+Task scope: User reinforced the discipline: "机制 BUG 都是先复现,然后找 root
+  cause,最后修复和 review". Applied it to the extent-state RMW class (the
+  remaining uniform-CAS work: extents/<id> writes in apply_recovery_done /
+  apply_ec_conversion_done / sync_partition_vp_refs / split source-tail seal).
+  REPRODUCE-FIRST INVESTIGATION (reachability, not code-guessing):
+   - apply_recovery_done: the extent read (borrow) → etcd write is await-ADJACENT
+     (NO `.await` between read and the put_and_delete_txn) → the clobber window
+     is only the write's own RTT; AND F207 ledger serialises recovery/EC per
+     extent; AND note 31 stops alloc rewriting a sealed extent. → structurally
+     near-precluded.
+   - EMPIRICAL: Item 3's membership CAS measured cas_conflict=0 across ALL chaos
+     runs → the etcd-RTT-clobber MECHANISM never fires in the harness; the
+     extent-state variant is the same RTT race + more-guarded → also non-firing.
+   - split-seal / sync_vp_refs / ec_done have an await gap but are covered
+     before-await by F146 / F147-A / F207+F138 verify-at-apply + ledger; residual
+     is the same microsecond RTT window.
+  CONCLUSION (per the discipline): extent-state clobber is NOT reproducible +
+  structurally near-precluded, and it lives in the most revert-prone recovery/EC
+  area → DEFER (do not fix on a code-read hypothesis). The membership class
+  (Item 3 alloc/punch/truncate + merge) is the one coco explicitly flagged and is
+  shipped (its own 0-conflict measurement shows even it is a precautionary safety
+  net on a proven, validated pattern). The worked CAS example (apply_recovery_done)
+  + the generalized multi-key put_delete_txn_cas helper are kept ready for a
+  future DEMONSTRATED-NEED fix (manager CLAUDE.md note 33).
+  No code change this step (investigation + docs only).
+
+--- prior (same session) ---
+
 Date: 2026-05-31 (Item 3 follow-up — uniform etcd CAS for the MEMBERSHIP class)
 TaskStatus: completed
 Task scope: User chose "统一 etcd CAS" then scoped to (1) merge only (complete the
