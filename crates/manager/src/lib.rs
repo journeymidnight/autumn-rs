@@ -205,15 +205,19 @@ impl EtcdMirror {
         &self,
         puts: Vec<(String, Vec<u8>)>,
         deletes: Vec<String>,
-        cas: Option<(String, Vec<u8>)>,
+        // Item 3: one `(key, baseline)` value-compare per existing key this txn
+        // read-modify-writes. ALL must still match for the txn to apply (etcd
+        // ANDs the compares); any mismatch = a concurrent change → Ok(false) →
+        // Precondition → caller retries. Empty = no CAS (plain fenced put).
+        cas: Vec<(String, Vec<u8>)>,
     ) -> Result<(), AppError> {
         if puts.is_empty() && deletes.is_empty() {
             return Ok(());
         }
-        let extra_cmp = match &cas {
-            Some((k, v)) => vec![autumn_etcd::Cmp::value(k.as_bytes(), v.as_slice())],
-            None => vec![],
-        };
+        let extra_cmp: Vec<_> = cas
+            .iter()
+            .map(|(k, v)| autumn_etcd::Cmp::value(k.as_bytes(), v.as_slice()))
+            .collect();
         let mut ops = Vec::with_capacity(puts.len() + deletes.len());
         ops.extend(
             puts.into_iter()
@@ -2742,7 +2746,10 @@ impl AutumnManager {
                 format!("extents/{}", new_extent.extent_id),
                 rkyv_encode(new_extent).to_vec(),
             ));
-            let cas = stream_cas.map(|v| (format!("streams/{}", stream.stream_id), v));
+            let cas: Vec<(String, Vec<u8>)> = stream_cas
+                .map(|v| (format!("streams/{}", stream.stream_id), v))
+                .into_iter()
+                .collect();
             etcd.put_delete_txn_cas(kvs, vec![], cas).await?;
         }
         Ok(())
@@ -2773,7 +2780,10 @@ impl AutumnManager {
                 .iter()
                 .map(|id| format!("extents/{id}"))
                 .collect::<Vec<_>>();
-            let cas = stream_cas.map(|v| (format!("streams/{}", stream.stream_id), v));
+            let cas: Vec<(String, Vec<u8>)> = stream_cas
+                .map(|v| (format!("streams/{}", stream.stream_id), v))
+                .into_iter()
+                .collect();
             etcd.put_delete_txn_cas(puts, deletes, cas).await?;
         }
         Ok(())

@@ -1547,12 +1547,28 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     F146/F210-A2 verify-precondition path; reaped by F109 reconcile; CAS
     conflicts ~0), and GC/compaction callers don't client-retry but their
     background loops re-attempt (`classify_gc_failure_cooldown` maps
-    `precondition failed` → 30 s soft cooldown). **FOLLOW-UP (tracked):** extend
-    the same value-CAS to the OTHER read-modify-write stream mutators —
-    `handle_multi_modify_split` / `handle_multi_modify_merge` (merge splices
-    survivor membership) / `handle_sync_partition_vp_refs` / `apply_ec_conversion_done`
-    / `apply_recovery_done` — so ALL membership/extent-state etcd writes are CAS
-    (the verify-at-apply becomes redundant on the etcd side). Deliberately
-    deferred as a separate, well-tested effort (revert-prone area). Cross-ref:
-    notes 13 (F146 verify-at-apply — the weaker before-await form), 15 (F149
-    leader fence — the txn already carries it), 32 (sealed state).
+    `precondition failed` → 30 s soft cooldown).
+
+    **Uniform-CAS coverage — the MEMBERSHIP (stream `extent_ids`) class is now
+    COMPLETE.** `put_delete_txn_cas` takes a `Vec` of `(key, baseline)` pairs
+    (etcd ANDs the value-compares). The stream-membership read-modify-write
+    mutators all CAS the touched `streams/<id>` against the pre-mutation
+    baseline: `handle_stream_alloc_extent` / `handle_stream_punch_holes` /
+    `handle_truncate` (single stream) + `handle_multi_modify_merge` (the splice
+    of victim extents into the survivor's `extent_ids` — CAS's all 3 survivor
+    streams' pre-splice baselines). `handle_multi_modify_split` does NOT mutate
+    an existing stream's membership (it CREATES new child streams + seals the
+    source tail), so the membership-resurrect race does not apply to it.
+    **Validated:** merge-heavy chaos 8/8, merges succeed with 0 spurious CAS
+    conflicts (rkyv baseline byte-matches etcd).
+
+    **FOLLOW-UP (tracked, lower priority):** the EXTENT-STATE read-modify-write
+    writes (`extents/<id>`: eversion / replicates / avali / vp_table_refs) are
+    NOT yet value-CAS'd — `handle_multi_modify_split`'s source-tail seal,
+    `handle_sync_partition_vp_refs`, `apply_ec_conversion_done`,
+    `apply_recovery_done`. These already carry the F146/F147/F207/F149
+    verify-at-apply + ledger + fence guards, so CAS there is defense-in-depth
+    (replacing verify-at-apply on the etcd side), in the most revert-prone
+    recovery/EC area — deferred as a separate, demonstrated-need effort.
+    Cross-ref: notes 13 (F146 verify-at-apply — the weaker before-await form),
+    15 (F149 leader fence — the txn already carries it), 32 (sealed state).

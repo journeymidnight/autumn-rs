@@ -1,3 +1,29 @@
+Date: 2026-05-31 (Item 3 follow-up — uniform etcd CAS for the MEMBERSHIP class)
+TaskStatus: completed
+Task scope: User chose "统一 etcd CAS" then scoped to (1) merge only (complete the
+  membership-resurrect class; leave the extent-state class to verify-at-apply).
+  DONE: generalized EtcdMirror::put_delete_txn_cas to a multi-key value-CAS Vec;
+  handle_multi_modify_merge now captures the 3 survivor streams' PRE-splice
+  baselines (Phase 1) and value-CAS's them in the Phase-2 fenced txn — so a
+  concurrent alloc/punch/truncate committing on a survivor stream during merge's
+  etcd RTT makes the merge fail+retry (Precondition) instead of resurrecting a
+  removed extent via the stale spliced membership. split does NOT mutate existing
+  stream membership (creates new child streams + seals source tail), so the
+  membership class is now COMPLETE: alloc/punch/truncate (Item 3) + merge.
+  coco /findbugs (rule 12): round 1 CLEAN (no findings). Validation: merge-heavy
+  chaos 8/8 (seed 6x4,8,2,13,31) — mismatches=0 not_found=0 stale_vp=0,
+  cas_conflict=0 (rkyv baseline byte-matches etcd → no spurious failures),
+  merge_ok=1 in 5 runs (merges still succeed WITH the CAS). 114 manager lib
+  tests; clippy clean. manager CLAUDE.md note 33 updated.
+  REMAINING (deferred, lower priority): the EXTENT-STATE RMW class (split
+  source-tail seal / sync_partition_vp_refs / apply_ec_conversion_done /
+  apply_recovery_done writing extents/<id>) is NOT yet CAS'd — it already has
+  F146/F147/F207/F149 verify-at-apply + ledger + fence; CAS there is
+  defense-in-depth in the most revert-prone recovery/EC area, deferred as a
+  demonstrated-need effort.
+
+--- prior (same session) ---
+
 Date: 2026-05-31 (MUST-FIX BATCH CLOSED — 2 shipped, 2 deferred as non-reproduced)
 TaskStatus: completed
 Task scope: Close the coco-prioritized must-fix batch. OUTCOME:

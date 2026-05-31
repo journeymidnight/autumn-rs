@@ -2307,6 +2307,13 @@ impl AutumnManager {
             selected_nodes: Vec<MgrNodeInfo>,
             new_tail_replicas: u32,
             pre_bump_eversion: HashMap<u64, u64>,
+            // Item 3 (uniform CAS): value-CAS baseline for each survivor stream
+            // (log/row/meta) that the splice rewrites — `(streams/<id>,
+            // pre-splice rkyv bytes)`. The Phase-2 txn CAS's these so a
+            // concurrent alloc/punch/truncate committing on a survivor stream
+            // during merge's etcd RTT makes the merge fail+retry instead of
+            // resurrecting the concurrently-removed extent.
+            survivor_stream_baselines: Vec<(String, Vec<u8>)>,
         }
 
         let phase1: Result<Phase1Result, AppError> = {
@@ -2444,6 +2451,23 @@ impl AutumnManager {
                     req.meta_sealed_lengths[1] as u32,
                 )?;
 
+                // Item 3 (uniform CAS): capture each survivor stream's
+                // PRE-splice value (what etcd currently holds) as the CAS
+                // baseline. `compute_*` returned clones, so `s.streams` still
+                // holds the pre-splice survivor streams here.
+                let survivor_stream_baselines: Vec<(String, Vec<u8>)> = [
+                    survivor_meta.log_stream,
+                    survivor_meta.row_stream,
+                    survivor_meta.meta_stream,
+                ]
+                .into_iter()
+                .filter_map(|sid| {
+                    s.streams
+                        .get(&sid)
+                        .map(|st| (format!("streams/{sid}"), rkyv_encode(st).to_vec()))
+                })
+                .collect();
+
                 let new_streams = vec![log_dup, row_dup, meta_dup];
                 let mut all_extents = Vec::new();
                 all_extents.extend(log_exts);
@@ -2474,6 +2498,7 @@ impl AutumnManager {
                     selected_nodes: selected,
                     new_tail_replicas: target_replicas as u32,
                     pre_bump_eversion,
+                    survivor_stream_baselines,
                 })
             })()
         };
@@ -2616,7 +2641,12 @@ impl AutumnManager {
                 format!("regions/{}", p1.victim_part_id),
                 format!("partitionLastOp/{}", p1.victim_part_id),
             ];
-            etcd.put_and_delete_txn(kvs, deletes)
+            // Item 3 (uniform CAS): value-CAS each survivor stream against its
+            // pre-splice baseline so a concurrent alloc/punch/truncate that
+            // committed on a survivor stream during this RTT makes the merge
+            // fail+retry (CODE_PRECONDITION) instead of overwriting it with the
+            // stale spliced membership (resurrecting a removed extent).
+            etcd.put_delete_txn_cas(kvs, deletes, p1.survivor_stream_baselines.clone())
                 .await
                 .map_err(|e| Self::err_to_status(&e))?;
         }
