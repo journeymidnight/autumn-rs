@@ -30,8 +30,8 @@ Task scope: User: 处理 1/2/3 after the coco arch review of "主动跨-PS parti
   P1 #3 — drain_and_shutdown ACKs even when flush_one_imm errors
     (lib.rs ~4985-4995). VERDICT: AS DESCRIBED, but NOT current data loss —
     log_stream IS the WAL, so an un-checkpointed imm is replayed on reopen.
-    It only becomes unsafe IF F261 migration reuses drain-ack as "safe to drop
-    log_stream". Tracked as an F261 pre-req (drain ack must carry Result).
+    It only becomes unsafe IF F249 migration reuses drain-ack as "safe to drop
+    log_stream". Tracked as an F249 pre-req (drain ack must carry Result).
   P1 #4 — WAL recovery skips CRC-corrupt records and continues (F158,
     lib.rs decode_records* ~6076-6085). VERDICT: DELIBERATE (F158), debatable.
     log_stream is 3x-replicated + read-failover masks single-replica rot; a
