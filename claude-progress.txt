@@ -1,3 +1,40 @@
+Date: 2026-05-31 (MUST-FIX BATCH CLOSED — 2 shipped, 2 deferred as non-reproduced)
+TaskStatus: completed
+Task scope: Close the coco-prioritized must-fix batch. OUTCOME:
+  - Item 1 (owner_revision durable fence, P0) — SHIPPED db5d708. Reproducible
+    class (BUG#2 family); real fix.
+  - Item 3 (alloc/stream-membership etcd value-CAS, P1) — SHIPPED f37630a.
+    Reproducible-class resurrect race; CAS fix (after a per-stream-lock first
+    attempt A/B-proved a regression and was reverted). Follow-up tracked: extend
+    CAS to split/merge/sync_vp_refs/ec_done/recovery_done (manager note 33).
+  - Item 2 (reopen-overlap, P0-low-exposure) — DEFERRED. drain-before-reopen
+    DEADLOCKS (chicken-and-egg with client port migration). Empirically NOT
+    reproducible: every chaos reload coincides with F185 merge-FREEZE (old
+    instance not writing); split is in-place. Reachable paths already covered.
+  - Item 4 (flush-barrier all-replica wedge, P1) — DEFERRED. PROVENANCE: a coco
+    arch CODE-READ hypothesis (P1-D) by analogy to BUG#1's init wedge — NEVER
+    reproduced as a permanent wedge. Empirically the await_extent_synced_to
+    barrier timeout DOES occur in chaos (network partition, all-replica 0/3) but
+    manifests as TRANSIENT op failures (split skipped / flush retry) that
+    SELF-HEAL on partition heal / recovery reconfig — i.e. the current
+    fail-closed behavior is acceptable (timeout → error → retry, not corruption).
+    The "fix" (seal-and-roll-from-flush) repeatedly (3 coco rounds) introduced
+    REAL data-corruption races in the delicate stream-worker area (Some(0)
+    under-seal; ghost-write-after-seal; concurrent ensure_tail_initialised
+    clearing the freeze) — worse than the non-issue. Reverted.
+
+  LESSON (reinforced): Items 2 & 4 were coco-ARCH CODE-READ hypotheses, never
+  reproduced; their fixes destabilized a revert-prone area. Item 1 & 3 were
+  reproducible-class and fixed cleanly. RULE: do not "fix" a non-reproduced
+  theoretical finding in the stream/manager concurrency area unless it can be
+  demonstrated — the fix risk outweighs a non-manifesting bug. Validate
+  reproducibility BEFORE designing a fix (user steered this both times).
+  The deferred items keep their coco safe-design sketches (Item 2:
+  freeze-old-writes-before-open-new; Item 4: sealed-fast-path +
+  init-lock-coordinated seal-and-roll) for a future demonstrated-need fix.
+
+--- prior (same session) ---
+
 Date: 2026-05-31 (MUST-FIX BATCH — Item 3 DONE via etcd value-CAS; Item 2 deferred)
 TaskStatus: completed
 Task scope: Continue the coco-prioritized must-fix batch. Item 1 (durable fence)
