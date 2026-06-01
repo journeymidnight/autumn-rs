@@ -1123,6 +1123,24 @@ sufficient (and cheaper than DashMap).
     `[0,X)` pwrites have completed; land the fix WITH those tests as guard +
     coco /findbugs.** Cross-ref: note 4 (`must_sync` cost), F178 in the Commit
     Protocol section.
+    **ATTEMPTED + REVERTED 2026-06-01 — do not re-walk this without a new plan.**
+    The contiguous-prefix watermark (`record_completed` + a `completed` stash +
+    `poisoned` flag + `epoch` counter) was built and run through 6 coco rounds.
+    The data-safety CORE (the prefix watermark) was right, but the surrounding
+    WAITER-LIFECYCLE state machine self-produced 6 reachable bugs in this
+    io_uring hot path (busy-loop; failed-low-write hang; parked-loop leak;
+    single-loop-invariant break that was a regression from its OWN leak fix;
+    reset-orphans-high-waiters). Reverted whole: a power-loss-only,
+    all-replica-masked, never-manifested bug does not justify a self-bug-
+    producing hand-rolled state machine in the hottest concurrency path (Items
+    2/4 discipline). io_uring CQE order is genuinely unordered (no IOSQE_IO_LINK/
+    DRAIN in this code), so the accounting hole is real — but the 2 kept unit
+    tests demonstrate it by HAND-ORDERING completions, NOT by real io_uring
+    reordering, and real loss additionally needs power-loss in the µs window on
+    enough replicas. **If production ever demands power-loss single-replica
+    durability here, do it as a SEPARATE feature: per-extent SERIAL fsync
+    accounting (RocksDB single-sequential-WAL-writer model — gap-free prefix by
+    construction), NOT state bolted onto the concurrent coalescer.**
 
 ---
 

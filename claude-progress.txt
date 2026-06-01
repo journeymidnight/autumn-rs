@@ -1,3 +1,66 @@
+Date: 2026-06-01 (P0 #1 fsync-coalescer fix ATTEMPTED then REVERTED — not worth it)
+TaskStatus: completed
+Task scope: User asked to implement the "keep concurrent pwrite + add a
+  completed-prefix watermark" fix for P0 #1 (the F178 coalescer crediting an ACK
+  to bytes written AFTER the covering fsync, under out-of-order same-extent
+  pwrite completion). Implemented it, ran 6 coco /findbugs rounds, then — with
+  the user — DECIDED TO REVERT THE WHOLE FIX. Working tree is back at HEAD
+  (180b52f): the honest "reproduced-as-accounting-bug, deferred" state with only
+  the 2 repro-only unit tests. NO production code change ships from this.
+
+=== WHAT WAS BUILT (and reverted) ===
+  `Coalescer::record_completed` (contiguous gap-free prefix watermark via a
+  `completed: Vec<(u64,u64)>` stash) replacing the plain `pending_fsync.store`,
+  + `reset_to` + a `poisoned` flag + an `epoch` generation counter. The
+  DATA-SAFETY CORE (the prefix watermark) was correct from round 1.
+
+=== WHY REVERTED — the fix was worse than the bug ===
+  coco found 6 REACHABLE bugs, all in the NEW waiter-lifecycle state machine the
+  fix introduced (NOT the original P0), in the most revert-prone io_uring hot
+  path:
+   R1 coalescer busy-loop on gap-only waiters (no .await) — HUNG my own test.
+   R2 failed low-offset write -> high waiter hangs forever.
+   R3 poison() leaks the parked coalescer task + Rc<ExtentEntry>.
+   R4 poison not cleared by recovery/re_avali (consistency; not append-reachable
+      — those paths are sealed-only).
+   R5 R3's "drop wake_tx" BROKE the single-loop invariant -> a 2nd racing loop
+      could store a stale snapshot over a rewound last_synced (REGRESSION FROM
+      MY OWN R3 FIX).
+   R6 reset_to orphans `end > len` waiters -> park forever.
+  6 rounds, each a reachable lifecycle bug, R5 a self-inflicted regression =
+  the hand-written concurrency state machine was self-producing its own bug
+  surface. Per project discipline (Items 2/4 lesson): do NOT maintain a
+  low-severity fix that destabilizes the revert-prone stream concurrency area.
+
+=== ACCURATE SEVERITY OF P0 #1 (why the bug itself doesn't justify the fix) ===
+  - The bug IS real at the accounting layer: io_uring CQE completion order is
+    UNORDERED by kernel design (man io_uring(7); code uses no IOSQE_IO_LINK /
+    IO_DRAIN), so two same-extent pwrites (same stream worker, FuturesUnordered
+    cap 32, ascending non-overlapping offsets via lease()) that straddle a
+    read-burst boundary on the EN can complete out of order -> the coalescer can
+    publish/regress the fsync high-water across a hole. The 2 kept unit tests
+    DEMONSTRATE this accounting hole (by HAND-ORDERING the completions — they do
+    NOT exercise real io_uring reordering).
+  - But real DATA LOSS additionally needs: (a) the low-offset physical write to
+    land AFTER the fsync that covered it, (b) a power-loss / kernel-panic in that
+    µs window (a process kill does NOT drop un-fsynced page-cache — kernel writes
+    it back, so NO process-kill chaos can ever surface it), AND (c) the same
+    window to hit ENOUGH replicas (F227 all-replica-ACK + recovery re-replicate a
+    single-replica loss). Never observed; structurally near-precluded.
+  CONCLUSION: a never-manifested, power-loss-only, all-replica-masked bug does
+  NOT justify a self-bug-producing hand-rolled state machine in the io_uring hot
+  path. If we ever must defend against production power-loss single-replica loss,
+  open a SEPARATE feature: per-extent SERIAL fsync accounting (RocksDB single-
+  sequential-WAL-writer model — gap-free prefix by construction), a clean design,
+  NOT state bolted onto the concurrent coalescer.
+
+=== STATE ===
+  Reverted to HEAD 180b52f. autumn-stream baseline green (2 repro tests pass;
+  these stay as the honest accounting-hole record). P0 #1 remains DEFERRED with
+  this accurate severity write-up. coco worktrees + temp cleaned.
+
+--- prior ---
+
 Date: 2026-05-31 (P0 #1 fsync-coalescer high-water — REPRODUCED deterministically)
 TaskStatus: completed
 Task scope: User: 研究复现 P0 #1 (coco's append fsync high-water finding).
