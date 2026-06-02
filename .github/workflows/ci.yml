@@ -43,8 +43,23 @@ jobs:
           set +e
           cargo clippy --workspace --exclude autumn-fuse --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.log
           rc=${PIPESTATUS[0]}
-          echo "=================== clippy errors only ==================="
-          grep -E '^(error|warning)' /tmp/clippy.log | head -50 || true
+          # Publish a digest to the publicly-visible step summary so external
+          # tooling (e.g. unauth'd API check-run output) can see the failure
+          # mode without log auth.
+          {
+            echo "## Rust toolchain"
+            rustc --version --verbose
+            echo
+            echo "## Clippy first 80 lines"
+            echo '```'
+            head -80 /tmp/clippy.log
+            echo '```'
+            echo
+            echo "## Clippy errors / warnings only"
+            echo '```'
+            grep -E '^(error|warning)' /tmp/clippy.log | head -50 || echo "(none)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           exit $rc
       - name: Upload clippy log (always)
         if: always()
