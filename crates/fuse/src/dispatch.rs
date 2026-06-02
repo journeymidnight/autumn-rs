@@ -94,7 +94,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             let result = async {
                 let mut meta = get_inode(state, ino).await?;
                 if let Some(m) = mode {
-                    meta.mode = (meta.mode & libc::S_IFMT) | (m & 0o7777);
+                    meta.mode = (meta.mode & S_IFMT) | (m & 0o7777);
                 }
                 if let Some(u) = uid {
                     meta.uid = u;

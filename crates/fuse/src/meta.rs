@@ -11,6 +11,20 @@ use crate::key;
 use crate::schema::{self, InodeMeta, INODE_ALLOC_BATCH, ROOT_INO};
 use crate::state::FsState;
 
+// `libc::S_IF*` widths differ across libc targets — `u16` on some (e.g.
+// CI's ubuntu-latest libc bindings), `u32` on others (glibc x86_64). Our
+// `InodeMeta.mode` is `u32` everywhere, so normalise the libc constants
+// once here and use these `u32` aliases from every call site (meta.rs +
+// dispatch.rs). `#[allow]` covers the host where the cast is a no-op.
+#[allow(clippy::unnecessary_cast)]
+pub(crate) const S_IFMT: u32 = libc::S_IFMT as u32;
+#[allow(clippy::unnecessary_cast)]
+pub(crate) const S_IFDIR: u32 = libc::S_IFDIR as u32;
+#[allow(clippy::unnecessary_cast)]
+pub(crate) const S_IFLNK: u32 = libc::S_IFLNK as u32;
+#[allow(clippy::unnecessary_cast)]
+pub(crate) const S_IFREG: u32 = libc::S_IFREG as u32;
+
 /// Convert InodeMeta to fuser::FileAttr.
 pub fn inode_to_attr(ino: u64, meta: &InodeMeta) -> FileAttr {
     let kind = mode_to_filetype(meta.mode);
@@ -45,9 +59,9 @@ fn system_time(secs: i64, nsecs: u32) -> SystemTime {
 }
 
 fn mode_to_filetype(mode: u32) -> fuser::FileType {
-    match mode & libc::S_IFMT {
-        m if m == libc::S_IFDIR => fuser::FileType::Directory,
-        m if m == libc::S_IFLNK => fuser::FileType::Symlink,
+    match mode & S_IFMT {
+        m if m == S_IFDIR => fuser::FileType::Directory,
+        m if m == S_IFLNK => fuser::FileType::Symlink,
         _ => fuser::FileType::RegularFile,
     }
 }
@@ -64,7 +78,7 @@ pub fn now_ts() -> (i64, u32) {
 pub fn new_file_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
     let (secs, nsecs) = now_ts();
     InodeMeta {
-        mode: libc::S_IFREG | (mode & 0o7777),
+        mode: S_IFREG | (mode & 0o7777),
         uid,
         gid,
         size: 0,
@@ -84,7 +98,7 @@ pub fn new_file_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
 pub fn new_dir_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
     let (secs, nsecs) = now_ts();
     InodeMeta {
-        mode: libc::S_IFDIR | (mode & 0o7777),
+        mode: S_IFDIR | (mode & 0o7777),
         uid,
         gid,
         size: 0,
