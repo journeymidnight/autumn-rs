@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
@@ -208,7 +208,7 @@ async fn nemesis_loop(
             break;
         }
         tick += 1;
-        if tick % 2 == 0 {
+        if tick.is_multiple_of(2) {
             // Even ticks: flush.
             let _ = flush_partition(&ps).await;
             flush_count.fetch_add(1, Ordering::Relaxed);
@@ -247,7 +247,7 @@ fn f250_fence_flush_invariant() {
 
     // ── Register ENs with the manager ──
     let outer_rt = compio::runtime::Runtime::new().unwrap();
-    let (en_node_ids, mgr, log_stream, row_stream, meta_stream, ps_addr) =
+    let (en_node_ids, _mgr, log_stream, row_stream, meta_stream, ps_addr) =
         outer_rt.block_on(async {
             let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
             // wait for leader

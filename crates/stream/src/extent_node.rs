@@ -203,8 +203,19 @@ impl DiskFS {
                 unsafe {
                     let mut stat: libc::statvfs = std::mem::zeroed();
                     if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
-                        let total = stat.f_blocks * stat.f_frsize;
-                        let free = stat.f_bavail * stat.f_frsize;
+                        // statvfs field widths differ across libc targets
+                        // (glibc x86_64 = c_ulong/u64; CI's ubuntu-latest
+                        // libc bindings have f_blocks/f_bavail as u32).
+                        // Cast both operands to u64 — portable AND prevents
+                        // the silent u32*u32 overflow on any disk >4 TiB.
+                        // `#[allow]` is required because on the host where
+                        // the fields are already u64 the cast is a no-op.
+                        #[allow(clippy::unnecessary_cast)]
+                        let frsize = stat.f_frsize as u64;
+                        #[allow(clippy::unnecessary_cast)]
+                        let total = (stat.f_blocks as u64) * frsize;
+                        #[allow(clippy::unnecessary_cast)]
+                        let free = (stat.f_bavail as u64) * frsize;
                         return (total, free);
                     }
                 }
@@ -2410,11 +2421,7 @@ impl ExtentNode {
     /// rename. The write is atomic (temp + fsync + rename) so a crash leaves
     /// EITHER the old valid record OR the new one — never a torn `.meta` that
     /// `parse_meta` would discard back to `owner_revision = 0` (fail-open).
-    async fn write_meta_locked(
-        &self,
-        extent_id: u64,
-        entry: &ExtentEntry,
-    ) -> Result<(), String> {
+    async fn write_meta_locked(&self, extent_id: u64, entry: &ExtentEntry) -> Result<(), String> {
         let sealed_length = entry.sealed_length.load(Ordering::SeqCst);
         let eversion = entry.eversion.load(Ordering::SeqCst);
         let owner_revision = entry.owner_revision.load(Ordering::SeqCst);
@@ -5086,7 +5093,10 @@ impl ExtentNode {
         {
             return Ok(rkyv_encode(&CodeResp {
                 code: CODE_ERROR,
-                message: format!("re_avali: seal not durable for extent {}: {e}", req.extent_id),
+                message: format!(
+                    "re_avali: seal not durable for extent {}: {e}",
+                    req.extent_id
+                ),
             }));
         }
 
@@ -5181,7 +5191,10 @@ impl ExtentNode {
             self.mark_disk_offline_for_extent(req.extent_id);
             return Ok(rkyv_encode(&CodeResp {
                 code: CODE_ERROR,
-                message: format!("re_avali: seal meta not durable for extent {}: {e}", req.extent_id),
+                message: format!(
+                    "re_avali: seal meta not durable for extent {}: {e}",
+                    req.extent_id
+                ),
             }));
         }
 
@@ -5218,7 +5231,10 @@ impl ExtentNode {
                     .map_err(|e| {
                         (
                             StatusCode::Internal,
-                            format!("copy_extent: seal not durable for extent {}: {e}", req.extent_id),
+                            format!(
+                                "copy_extent: seal not durable for extent {}: {e}",
+                                req.extent_id
+                            ),
                         )
                     })?;
                 if req.eversion < ex.eversion {
@@ -5286,8 +5302,8 @@ impl ExtentNode {
         // This ACCEPTS a legitimate sealed-EMPTY extent (sealed=true,
         // sealed_length=0 → copies 0 bytes, logical_len clamped to 0 above)
         // while still refusing a genuinely-open extent.
-        let is_sealed = extent.sealed.load(Ordering::SeqCst)
-            || extent.sealed_length.load(Ordering::SeqCst) > 0;
+        let is_sealed =
+            extent.sealed.load(Ordering::SeqCst) || extent.sealed_length.load(Ordering::SeqCst) > 0;
         if !is_sealed {
             return Err((
                 StatusCode::FailedPrecondition,
@@ -6903,7 +6919,9 @@ mod p0_fsync_highwater_tests {
         // Plain store — REGRESSES pending_fsync 150 -> 100 (the bug; a fetch_max
         // would keep 150, but even that wouldn't make [0,100) durable).
         entry.coalescer.pending_fsync.store(100, Ordering::SeqCst);
-        let acked = register_sync_waiter(&entry, 100).await.expect("waiter chan");
+        let acked = register_sync_waiter(&entry, 100)
+            .await
+            .expect("waiter chan");
 
         // THE BUG, made deterministic:
         assert!(

@@ -3457,8 +3457,14 @@ mod pipeline_tests {
             "same-extent reload must preserve commit (the all-replica-acked prefix)"
         );
         assert_eq!(state.lease_cursor, 8_657_884);
-        assert!(state.poisoned, "same-extent reload must preserve the hole marker");
-        assert!(state.sealing, "same-extent reload must preserve the sealing freeze");
+        assert!(
+            state.poisoned,
+            "same-extent reload must preserve the hole marker"
+        );
+        assert!(
+            state.sealing,
+            "same-extent reload must preserve the sealing freeze"
+        );
         assert_eq!(state.tail.as_ref().unwrap().extent.extent_id, 18);
 
         // Genuine roll to a DIFFERENT (fresh, empty) extent → full reset.
