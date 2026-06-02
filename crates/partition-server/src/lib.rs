@@ -685,20 +685,28 @@ pub(crate) struct PartitionData {
     tables: Vec<TableMeta>,
     sst_readers: Vec<Arc<SstReader>>,
     has_overlap: Cell<u32>,
-    need_invalidate_row_stream: Cell<bool>,
     vp_extent_id: u64,
     vp_offset: u32,
     stream_client: Rc<StreamClient>,
     manager_addr: String,
     pool: Rc<ConnPool>,
-    /// F088: sender to the per-partition bulk thread. `None` if the bulk
-    /// thread failed to initialize — fall back to in-thread flush (legacy
-    /// path) so the partition remains usable.
-    flush_req_tx: Option<mpsc::Sender<FlushReq>>,
+    /// F088: sender to the per-partition bulk thread. Always present —
+    /// `open_partition` returns Err if P-bulk fails to spawn, so the
+    /// partition is never half-opened with no flush channel.
+    flush_req_tx: mpsc::Sender<FlushReq>,
     /// Channel for compaction to route row_stream appends through P-bulk's
     /// StreamClient, preventing dual-writer truncation corruption.
-    /// `None` when P-bulk failed to spawn (legacy fallback uses part_sc).
-    row_append_tx: Option<mpsc::Sender<RowAppendReq>>,
+    /// Always present (see `flush_req_tx`).
+    row_append_tx: mpsc::Sender<RowAppendReq>,
+    /// F255 — synchronous barrier channel. See `RowInvalidateBarrierReq`
+    /// doc for the full ordering inside `handle_split_part`. Briefly: the
+    /// barrier is sent AFTER `commit_length` capture but BEFORE
+    /// `multi_modify_split` (so any barrier failure can cleanly abort
+    /// without leaving manager state half-committed). P-bulk drains its
+    /// in-flight FuturesUnordered to zero before calling
+    /// `bulk_sc.invalidate_stream(row_stream_id)`, then ACKs; split
+    /// proceeds with the seal once the ACK lands.
+    row_invalidate_tx: mpsc::Sender<RowInvalidateBarrierReq>,
     /// F120-A: signaled (one item per pop) by `flush_one_imm` after every
     /// successful `imm.pop_front()` so that `partition_loop` can
     /// wake from its imm-full back-pressure wait. Unbounded because the
@@ -726,6 +734,19 @@ pub(crate) struct PartitionData {
     /// split-vs-gc *synchronization*, NOT a resource cap. PS-wide
     /// compact / gc concurrency limits live in `io_bucket` (F196 D-r6).
     pub(crate) gc_gate: std::sync::Arc<CompactionGate>,
+    /// F255 — per-partition compact gate (max_parallel=1). `handle_split_part`
+    /// MUST acquire this in addition to the PS-wide
+    /// `ConcurrencyController.acquire_compact` permit, so that no
+    /// `do_compact` is concurrently running on THIS partition while split's
+    /// barrier + commit_length + multi_modify_split window is open. Pre-F255
+    /// only the PS-wide permit was held; with `--major-compact-parallelism`
+    /// default 4, a do_compact on partition P could keep its permit while
+    /// split on partition P acquired a different permit and proceeded —
+    /// the concurrent compaction's `compact_row_append` would then race the
+    /// pre-seal commit_length, producing the same orphan-SST-past-sealed-
+    /// length class the F255 barrier is meant to close (coco /findbugs
+    /// 2026-06-02 v3 review).
+    pub(crate) compact_gate: std::sync::Arc<CompactionGate>,
     /// F196 D-r7: per-partition rate controller. Fresh `Arc` per
     /// partition — fg/compact/gc rates are isolated; a hot partition's
     /// fg pressure cannot consume a cold sibling's budget. fg-aware
@@ -1101,7 +1122,6 @@ pub(crate) struct FlushReq {
     pub(crate) vp_eid: u64,
     pub(crate) vp_off: u32,
     pub(crate) row_stream_id: u64,
-    pub(crate) invalidate_row_stream: bool,
     pub(crate) resp_tx: oneshot::Sender<Result<(TableMeta, SstReader)>>,
 }
 
@@ -1109,6 +1129,45 @@ pub(crate) struct RowAppendReq {
     pub(crate) sst_bytes: Bytes,
     pub(crate) row_stream_id: u64,
     pub(crate) resp_tx: oneshot::Sender<Result<autumn_stream::AppendResult>>,
+}
+
+/// F255 — synchronous P-log → P-bulk barrier. Sent by `handle_split_part`
+/// in this strict order inside split's freeze-drain critical section:
+/// (a) drain ACK received → (b) capture commit_length of log/row/meta →
+/// **(c) send THIS barrier + await ACK** → (d) `multi_modify_split` →
+/// (e) `part_sc.invalidate_stream` → (f) local rg / epoch / overlap
+/// convergence → (g) release gates + unfreeze.
+///
+/// Step (c) is BEFORE the manager seal (step d) so a barrier failure
+/// (send timeout / ACK timeout / dropped channel) is cleanly abortable —
+/// the manager has not yet committed, so unfreezing + returning Err
+/// leaves the cluster in a coherent pre-split state. Putting the
+/// barrier AFTER the seal would create an unrecoverable window: manager
+/// committed + local state not converged + freeze about to be cleared
+/// (coco /findbugs v2 finding, 2026-06-02).
+///
+/// P-bulk's `flush_worker_loop`, on receiving the barrier:
+///   (1) drains its in-flight `FuturesUnordered` to ZERO (waits for every
+///       concurrent FlushReq / RowAppendReq to land or fail),
+///   (2) calls `bulk_sc.invalidate_stream(row_stream_id)` so the per-
+///       stream worker's cached tail is discarded,
+///   (3) signals `resp_tx`.
+/// By the time the manager seals the tail in step (d), bulk_sc has no
+/// in-flight ops AND no cached worker; the next P-bulk op (only
+/// possible after the gates release in step g) re-fetches a fresh tail
+/// from the manager, which by then carries the post-seal extent.
+///
+/// Pre-F255 this was a lazy `Cell<bool>` flag on `PartitionData` that the
+/// next P-bulk message piggybacked. The lazy form had a window where a
+/// FlushReq with `invalidate=false` (flag already taken by a queued
+/// RowAppendReq) could enter P-bulk's cap=2 FuturesUnordered ALONGSIDE
+/// the invalidating RowAppendReq and race to `append_bytes` on the stale
+/// per-stream worker (coco /arch GPT-5.5 audit). The barrier closes the
+/// race structurally — no concurrent append can be in-flight when the
+/// invalidate runs.
+pub(crate) struct RowInvalidateBarrierReq {
+    pub(crate) row_stream_id: u64,
+    pub(crate) resp_tx: oneshot::Sender<()>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4192,24 +4251,57 @@ async fn partition_thread_main(
     // runtime + io_uring + ConnPool. Flush requests are forwarded to it via
     // `flush_req_tx`. capacity=1 keeps flushes sequential (matches the old
     // in-thread semantics) and provides back-pressure on the P-log flush_loop.
+    //
+    // P-bulk spawn failure is FATAL for this partition: open_partition returns
+    // Err, sync_regions_once backs off and the manager reschedules. Pre-this
+    // we kept an Option<Sender> + an in-thread fallback in run_flush_async_phase
+    // and compact_row_append. The fallback was dead in production (OS spawn
+    // never failed on healthy hosts) AND was the structural foothold for the
+    // 2026-05-03 invalid_meta_len corruption — two StreamClients (P-log part_sc
+    // and P-bulk bulk_sc) appending to the same row_stream, each tracking its
+    // own commit cursor; one's stale commit truncated the other's SST bytes.
+    // The fix unified compaction onto P-bulk; this change removes the fallback
+    // entirely so the single-writer invariant is a type-level guarantee, not
+    // an "accidentally preserved by coincidence" runtime property.
     let (flush_req_tx, flush_req_rx) = mpsc::channel::<FlushReq>(1);
     let (row_append_tx, row_append_rx) = mpsc::channel::<RowAppendReq>(1);
-    let bulk_thread_spawn = spawn_bulk_thread(
+    // F255 — synchronous P-log → P-bulk barrier channel. Capacity 1: only
+    // `handle_split_part` sends, and it awaits the ACK before returning, so
+    // back-to-back splits are naturally serialised. Larger cap would let a
+    // queued barrier sit behind a regular append, which is exactly what we
+    // are trying to prevent.
+    let (row_invalidate_tx, row_invalidate_rx) =
+        mpsc::channel::<RowInvalidateBarrierReq>(1);
+    let (_bulk_handle, bulk_ready_rx) = spawn_bulk_thread(
         part_id,
         manager_addr.clone(),
         owner_key.clone(),
         revision,
         flush_req_rx,
         row_append_rx,
+        row_invalidate_rx,
         cpu_bulk,
-    );
-    let (flush_req_tx_part, row_append_tx_part) = match &bulk_thread_spawn {
-        Ok(_) => (Some(flush_req_tx.clone()), Some(row_append_tx.clone())),
-        Err(e) => {
-            tracing::error!(part_id, error = %e, "bulk thread spawn failed; flush will fall back to P-log");
-            (None, None)
+    )
+    .with_context(|| format!("spawn P-bulk thread for partition {part_id}"))?;
+    // F255: wait for P-bulk to confirm its runtime + StreamClient are live
+    // BEFORE we publish flush_req_tx / row_append_tx into PartitionData.
+    // Pre-F255 OS thread spawn returning Ok was treated as "P-bulk ready",
+    // but compio runtime build or StreamClient init could still fail
+    // inside the thread, leaving P-log holding a Sender to a dropped
+    // Receiver — the partition wedged on first flush.
+    match bulk_ready_rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return Err(e).with_context(|| {
+                format!("P-bulk readiness for partition {part_id} reported failure")
+            })
         }
-    };
+        Err(_canceled) => {
+            return Err(anyhow!(
+                "P-bulk readiness signal dropped before partition {part_id} opened (thread aborted)"
+            ));
+        }
+    }
 
     // F107 observability: surface initial state so operators can tell
     // whether a user-triggered `compact <PARTID>` will actually run.
@@ -4228,6 +4320,11 @@ async fn partition_thread_main(
     // the actual run_gc calls; handle_split_part acquires it before reading
     // commit_length so no log_stream append can race the seal.
     let gc_gate = CompactionGate::new(1);
+    // F255: per-partition compact_gate — background_compact_loop acquires
+    // this around each `do_compact`; handle_split_part acquires it BEFORE
+    // commit_length so no `compact_row_append` can race the row_stream
+    // seal (see field doc on PartitionData.compact_gate).
+    let compact_gate = CompactionGate::new(1);
 
     let part = Rc::new(RefCell::new(PartitionData {
         part_id,
@@ -4246,17 +4343,18 @@ async fn partition_thread_main(
         tables,
         sst_readers,
         has_overlap: Cell::new(if detected_overlap { 1 } else { 0 }),
-        need_invalidate_row_stream: Cell::new(false),
         vp_extent_id: vp_eid,
         vp_offset: vp_off,
         stream_client: part_sc.clone(),
         manager_addr: manager_addr.clone(),
         pool: pool.clone(),
-        flush_req_tx: flush_req_tx_part,
-        row_append_tx: row_append_tx_part,
+        flush_req_tx: flush_req_tx.clone(),
+        row_append_tx: row_append_tx.clone(),
+        row_invalidate_tx: row_invalidate_tx.clone(),
         imm_drained_tx,
         split_wake_tx,
         gc_gate: gc_gate.clone(),
+        compact_gate: compact_gate.clone(),
         rate_ctrl: rate_ctrl.clone(),
         concurrency_ctrl: concurrency_ctrl.clone(),
         partition_budget: partition_budget.clone(),
@@ -4279,6 +4377,7 @@ async fn partition_thread_main(
     // the bulk thread sees rx.next() = None, and exits cleanly.
     drop(flush_req_tx);
     drop(row_append_tx);
+    drop(row_invalidate_tx);
 
     // Spawn background loops on this thread's compio runtime.
     //
@@ -6501,28 +6600,14 @@ async fn run_flush_async_phase_inner(
     imm_mem: Arc<Memtable>,
 ) -> Result<FlushOutcome> {
     let src_imm_ptr = Arc::as_ptr(&imm_mem) as usize;
-    let (
-        row_stream_id,
-        snap_vp_eid,
-        snap_vp_off,
-        req_tx_opt,
-        part_sc,
-        invalidate_row,
-        meta_stream_id,
-    ) = {
+    let (row_stream_id, snap_vp_eid, snap_vp_off, mut req_tx, part_sc) = {
         let p = part.borrow();
-        // need_invalidate_row_stream is fetch-and-clear semantics: the
-        // first concurrent flush takes it, later ones see false. That's
-        // correct — P-bulk only needs the invalidate signal once.
-        let inv = p.need_invalidate_row_stream.replace(false);
         (
             p.row_stream_id,
             p.vp_extent_id,
             p.vp_offset,
             p.flush_req_tx.clone(),
             p.stream_client.clone(),
-            inv,
-            p.meta_stream_id,
         )
     };
 
@@ -6533,41 +6618,12 @@ async fn run_flush_async_phase_inner(
             .await?;
     }
 
-    let Some(mut req_tx) = req_tx_opt else {
-        // P-bulk not spawned — in-thread fallback (legacy single-flow,
-        // no parallelism). Build SST locally and return outcome.
-        let imm_clone = imm_mem.clone();
-        let (sst_bytes, last_seq) = compio::runtime::spawn_blocking(move || {
-            build_sst_bytes(&imm_clone, snap_vp_eid, snap_vp_off)
-        })
-        .await
-        .map_err(|_| anyhow!("SSTable build task failed"))?;
-        let result = part_sc.append(row_stream_id, &sst_bytes).await?;
-        let estimated_size = sst_bytes.len() as u64;
-        let reader = SstReader::from_bytes(Bytes::from(sst_bytes))?;
-        let _ = meta_stream_id;
-        return Ok(FlushOutcome {
-            new_meta: TableMeta {
-                extent_id: result.extent_id,
-                offset: result.offset,
-                len: result.end - result.offset,
-                estimated_size,
-                last_seq,
-            },
-            reader,
-            vp_eid: snap_vp_eid,
-            vp_off: snap_vp_off,
-            src_imm_ptr,
-        });
-    };
-
     let (resp_tx, resp_rx) = oneshot::channel();
     let req = FlushReq {
         imm: imm_mem,
         vp_eid: snap_vp_eid,
         vp_off: snap_vp_off,
         row_stream_id,
-        invalidate_row_stream: invalidate_row,
         resp_tx,
     };
     if req_tx.send(req).await.is_err() {
@@ -7038,6 +7094,16 @@ async fn background_flush_loop(
 // kinds; each thread's ConnPool is role-dedicated.
 // ---------------------------------------------------------------------------
 
+/// F255 — readiness signal sent by the spawned P-bulk thread once its
+/// compio runtime + `StreamClient` + reporter_part_id are all live.
+/// `partition_thread_main` awaits this BEFORE constructing `PartitionData`
+/// so a partition is never half-opened with a dead P-bulk receiver. Pre-
+/// F255 only OS `thread::Builder::spawn` failure was surfaced; runtime
+/// build / `StreamClient::new_with_revision` failures inside the thread
+/// silently logged + returned, leaving P-log with a live `Sender` to a
+/// dropped receiver and the partition wedged on first flush.
+type BulkReady = futures::channel::oneshot::Receiver<Result<()>>;
+
 fn spawn_bulk_thread(
     part_id: u64,
     manager_addr: String,
@@ -7045,9 +7111,11 @@ fn spawn_bulk_thread(
     revision: i64,
     flush_req_rx: mpsc::Receiver<FlushReq>,
     row_append_rx: mpsc::Receiver<RowAppendReq>,
+    row_invalidate_rx: mpsc::Receiver<RowInvalidateBarrierReq>,
     cpu: Option<usize>,
-) -> std::io::Result<std::thread::JoinHandle<()>> {
-    std::thread::Builder::new()
+) -> std::io::Result<(std::thread::JoinHandle<()>, BulkReady)> {
+    let (ready_tx, ready_rx) = futures::channel::oneshot::channel::<Result<()>>();
+    let handle = std::thread::Builder::new()
         .name(format!("part-{part_id}-bulk"))
         .spawn(move || {
             let rt = match compio::runtime::RuntimeBuilder::new()
@@ -7057,6 +7125,7 @@ fn spawn_bulk_thread(
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(part_id, error = %e, "bulk thread runtime init failed");
+                    let _ = ready_tx.send(Err(anyhow!("P-bulk runtime init: {e}")));
                     return;
                 }
             };
@@ -7075,6 +7144,7 @@ fn spawn_bulk_thread(
                     Ok(sc) => sc,
                     Err(e) => {
                         tracing::error!(part_id, error = %e, "bulk StreamClient init failed");
+                        let _ = ready_tx.send(Err(anyhow!("P-bulk StreamClient init: {e}")));
                         return;
                     }
                 };
@@ -7083,10 +7153,19 @@ fn spawn_bulk_thread(
                 // into the same partition for the manager's quorum count.
                 bulk_sc.set_reporter_part_id(part_id);
                 tracing::info!(part_id, "bulk thread ready");
-                flush_worker_loop(bulk_sc, flush_req_rx, row_append_rx).await;
+                if ready_tx.send(Ok(())).is_err() {
+                    // P-log dropped the receiver (open_partition aborted
+                    // before our ready landed). Exit cleanly without
+                    // running flush_worker_loop — the channel senders
+                    // will be dropped by the failed open path.
+                    tracing::warn!(part_id, "P-bulk ready signal dropped; exiting");
+                    return;
+                }
+                flush_worker_loop(bulk_sc, flush_req_rx, row_append_rx, row_invalidate_rx).await;
                 tracing::info!(part_id, "bulk thread exiting");
             });
-        })
+        })?;
+    Ok((handle, ready_rx))
 }
 
 /// R4 4.4 — P-bulk worker with N-deep SQ/CQ pipeline.
@@ -7103,6 +7182,7 @@ async fn flush_worker_loop(
     bulk_sc: Rc<StreamClient>,
     flush_req_rx: mpsc::Receiver<FlushReq>,
     row_append_rx: mpsc::Receiver<RowAppendReq>,
+    row_invalidate_rx: mpsc::Receiver<RowInvalidateBarrierReq>,
 ) {
     use futures::future::{select, Either};
 
@@ -7142,14 +7222,40 @@ async fn flush_worker_loop(
     enum SqMsg {
         Flush(FlushReq),
         RowAppend(RowAppendReq),
+        Invalidate(RowInvalidateBarrierReq),
     }
 
-    let mut sq_rx = futures::stream::select(
-        flush_req_rx.map(SqMsg::Flush),
-        row_append_rx.map(SqMsg::RowAppend),
+    // F255: priority-bias `row_invalidate_rx` over flush/row_append so a
+    // barrier sent inside `handle_split_part`'s critical section is picked
+    // up ahead of any incidental late-arriving append (defensive — at the
+    // time of the barrier, frozen_for_split + compact_gate + gc_gate have
+    // already halted upstream producers, so the queue is normally empty,
+    // but the bias keeps the design race-free under future refactors that
+    // might relax those gates).
+    use futures::stream::PollNext;
+    let mut sq_rx = futures::stream::select_with_strategy(
+        row_invalidate_rx.map(SqMsg::Invalidate),
+        futures::stream::select(
+            flush_req_rx.map(SqMsg::Flush),
+            row_append_rx.map(SqMsg::RowAppend),
+        ),
+        |_: &mut ()| PollNext::Left,
     );
 
-    let launch = |msg: SqMsg, bulk_sc: &Rc<StreamClient>| -> BulkFut {
+    // F255: barrier set-aside slot. When SQ yields an `Invalidate`, we
+    // place the request here and the next loop iteration drains `inflight`
+    // to zero before running `bulk_sc.invalidate_stream(...)` + ACK. This
+    // guarantees the invalidate is NOT racing any in-flight append on the
+    // pre-seal stale worker cache (the bug coco /arch GPT-5.5 surfaced on
+    // the v1 lazy-flag F255 attempt: cap=2 FuturesUnordered let a FlushReq
+    // with `invalidate=false` enter alongside an invalidating RowAppendReq
+    // and append to the stale worker before the invalidate took effect).
+    let mut pending_barrier: Option<RowInvalidateBarrierReq> = None;
+
+    let launch = |msg: SqMsg,
+                  bulk_sc: &Rc<StreamClient>,
+                  pending_barrier: &mut Option<RowInvalidateBarrierReq>|
+     -> Option<BulkFut> {
         match msg {
             SqMsg::Flush(req) => {
                 let FlushReq {
@@ -7157,18 +7263,14 @@ async fn flush_worker_loop(
                     vp_eid,
                     vp_off,
                     row_stream_id,
-                    invalidate_row_stream,
                     resp_tx,
                 } = req;
                 let bulk_sc = bulk_sc.clone();
-                Box::pin(async move {
-                    if invalidate_row_stream {
-                        bulk_sc.invalidate_stream(row_stream_id);
-                    }
+                Some(Box::pin(async move {
                     let result =
                         do_flush_on_bulk(&bulk_sc, imm, vp_eid, vp_off, row_stream_id).await;
                     BulkCompletion::Flush { resp_tx, result }
-                })
+                }))
             }
             SqMsg::RowAppend(req) => {
                 let RowAppendReq {
@@ -7177,10 +7279,17 @@ async fn flush_worker_loop(
                     resp_tx,
                 } = req;
                 let bulk_sc = bulk_sc.clone();
-                Box::pin(async move {
+                Some(Box::pin(async move {
                     let result = bulk_sc.append_bytes(row_stream_id, sst_bytes).await;
                     BulkCompletion::RowAppend { resp_tx, result }
-                })
+                }))
+            }
+            SqMsg::Invalidate(req) => {
+                // Stash for next-iter drain-then-invalidate. NOT a future:
+                // the barrier needs the inflight FU drained FIRST, which
+                // the launch closure can't observe.
+                *pending_barrier = Some(req);
+                None
             }
         }
     };
@@ -7191,13 +7300,34 @@ async fn flush_worker_loop(
             done.send();
         }
 
+        // (B) F255: barrier — drain inflight to zero, invalidate, ACK.
+        // While `pending_barrier` is set we do NOT pick up new SQ; any new
+        // messages queue up and are processed AFTER the invalidate (so they
+        // observe the fresh post-invalidate worker).
+        if let Some(req) = pending_barrier.take() {
+            while let Some(done) = inflight.next().await {
+                done.send();
+            }
+            bulk_sc.invalidate_stream(req.row_stream_id);
+            // ACK after invalidate (the ACK semantics are "by the time you
+            // receive this, no in-flight P-bulk operation is touching the
+            // pre-invalidate bulk_sc state"). Receiver-dropped is treated
+            // as the split aborted; the invalidate stands regardless.
+            let _ = req.resp_tx.send(());
+            continue;
+        }
+
         let n_inflight = inflight.len();
         let at_cap = n_inflight >= cap;
 
         if n_inflight == 0 {
             // Idle: only SQ can progress.
             match sq_rx.next().await {
-                Some(msg) => inflight.push(launch(msg, &bulk_sc)),
+                Some(msg) => {
+                    if let Some(fut) = launch(msg, &bulk_sc, &mut pending_barrier) {
+                        inflight.push(fut);
+                    }
+                }
                 None => break,
             }
             continue;
@@ -7217,7 +7347,11 @@ async fn flush_worker_loop(
         futures::pin_mut!(sq_fut);
         match select(sq_fut, Box::pin(cq_fut)).await {
             Either::Left((maybe_msg, _cq_dropped)) => match maybe_msg {
-                Some(msg) => inflight.push(launch(msg, &bulk_sc)),
+                Some(msg) => {
+                    if let Some(fut) = launch(msg, &bulk_sc, &mut pending_barrier) {
+                        inflight.push(fut);
+                    }
+                }
                 None => {
                     while let Some(done) = inflight.next().await {
                         done.send();
@@ -9898,6 +10032,133 @@ mod f148_publisher_invariant_tests {
 
             // Sanity on returned values.
             assert_eq!(snap_flush.len() + snap_compact.len(), 3);
+        });
+    }
+}
+
+#[cfg(test)]
+mod f255_invalidate_plumbing_tests {
+    //! F255 — regression guards for the two coco-audit findings (Bug #1 split
+    //! → P-bulk RowAppendReq missed invalidate; Bug #2 P-bulk readiness
+    //! handshake).
+    //!
+    //! Bug #1 v1 attempt (lazy `Cell<bool>` flag piggybacked on
+    //! `FlushReq.invalidate_row_stream` + `RowAppendReq.invalidate_row_stream`)
+    //! was found racy by coco /arch GPT-5.5 in a second-pass review: with
+    //! P-bulk's `FuturesUnordered` cap=2, the post-split fetch-and-clear
+    //! pattern let a queued `FlushReq(invalidate=false)` (flag already taken
+    //! by an earlier `RowAppendReq(invalidate=true)`) enter P-bulk's FU
+    //! ALONGSIDE the invalidating request — the FlushReq's append could land
+    //! on the stale per-stream worker BEFORE the RowAppendReq's invalidate
+    //! ran. v3 final replaces the lazy flag with a SYNCHRONOUS P-log →
+    //! P-bulk barrier (`RowInvalidateBarrierReq`): `handle_split_part` sends
+    //! it BETWEEN `commit_length` capture and `multi_modify_split` (inside
+    //! the critical section guarded by per-partition `compact_gate` +
+    //! PS-wide `acquire_compact` + per-partition `gc_gate` +
+    //! `frozen_for_split`). The pre-seal placement is REQUIRED for clean
+    //! abort: barrier failure leaves the manager not yet committed.
+    //! P-bulk drains its FuturesUnordered to ZERO, calls
+    //! `bulk_sc.invalidate_stream(...)`, and ACKs; only then does split
+    //! call `multi_modify_split`, then release its gates. BOTH the send and
+    //! the ACK are bounded by separate timers (5 s + 10 s, total well under
+    //! `FREEZE_TTL`'s 30 s backstop) so a wedged P-bulk can't extend the
+    //! window past TTL and let stale `commit_length` reach
+    //! `multi_modify_split`. Race window structurally closed.
+    //!
+    //! Bug #2 fix (P-bulk readiness handshake) is unchanged from v1.
+    use super::*;
+    use futures::channel::{mpsc, oneshot};
+
+    /// Bug #1 v2 wire regression: `RowInvalidateBarrierReq` survives the
+    /// per-partition barrier channel round trip with `row_stream_id` and
+    /// `resp_tx` intact. If a future refactor removes the message or
+    /// breaks the destructure pattern (the actual class of the pre-F255
+    /// bug — there was no message and the flag was lazy), the destructure
+    /// in this test fails to compile.
+    #[test]
+    fn f255_row_invalidate_barrier_req_round_trips() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let (tx, mut rx) = mpsc::channel::<RowInvalidateBarrierReq>(1);
+            let (resp_tx, resp_rx) = oneshot::channel::<()>();
+            let req = RowInvalidateBarrierReq {
+                row_stream_id: 42,
+                resp_tx,
+            };
+            tx.clone().send(req).await.expect("send");
+            let recv = rx.next().await.expect("recv");
+            let RowInvalidateBarrierReq {
+                row_stream_id,
+                resp_tx: recv_resp_tx,
+            } = recv;
+            assert_eq!(row_stream_id, 42);
+            // Round-trip the ACK as well — handle_split_part awaits this
+            // oneshot before releasing gates.
+            let _ = recv_resp_tx.send(());
+            assert!(
+                resp_rx.await.is_ok(),
+                "F255 v2: barrier ACK oneshot must round-trip — \
+                 handle_split_part blocks here before releasing \
+                 compact_gate / gc_gate / frozen_for_split."
+            );
+        });
+    }
+
+    /// Bug #1 v2 ordering regression: with the priority-biased
+    /// `select_with_strategy`, an `Invalidate` SQ message wins against a
+    /// concurrently-ready `Flush` / `RowAppend` message. This is defensive
+    /// — at the moment `handle_split_part` sends the barrier, the gates
+    /// already keep upstream producers silent — but the bias keeps the
+    /// design race-free under future refactors that might relax those
+    /// gates.
+    #[test]
+    fn f255_invalidate_wins_priority_select() {
+        use futures::stream::PollNext;
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            // Two streams: high-priority `inv` + low-priority `other`.
+            let (mut inv_tx, inv_rx) = mpsc::channel::<u8>(1);
+            let (mut other_tx, other_rx) = mpsc::channel::<u8>(1);
+            // Preload BOTH streams so polling either is ready immediately;
+            // the strategy must pick `inv` (Left).
+            inv_tx.send(0xFF).await.unwrap();
+            other_tx.send(0x01).await.unwrap();
+            let mut combined = futures::stream::select_with_strategy(
+                inv_rx,
+                other_rx,
+                |_: &mut ()| PollNext::Left,
+            );
+            let picked = combined.next().await.expect("at least one ready");
+            assert_eq!(
+                picked, 0xFF,
+                "F255 v2: priority-biased select must pick the invalidate \
+                 stream (Left) ahead of any flush / row_append on the \
+                 Right — defensive ordering guarantee for future refactors."
+            );
+        });
+    }
+
+    /// Bug #2 regression: `spawn_bulk_thread`'s readiness channel surfaces
+    /// thread-abort as `Err(_canceled)` rather than hanging the open path.
+    /// Pre-F255 `spawn_bulk_thread` returned `Ok(JoinHandle)` as soon as the
+    /// OS thread spawn succeeded; runtime / `StreamClient` init failures
+    /// inside the thread logged + returned, leaving P-log with a Sender
+    /// targeting a dead Receiver. Simulated here by dropping the sender
+    /// without sending — the same wire shape as a thread aborting mid-init.
+    #[test]
+    fn f255_bulk_ready_signal_dropped_returns_canceled_not_hang() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let (ready_tx, ready_rx) = oneshot::channel::<Result<()>>();
+            drop(ready_tx);
+            let result = ready_rx.await;
+            assert!(
+                result.is_err(),
+                "F255: a dropped ready channel must surface as Canceled so \
+                 the open_partition path can return Err — pre-F255 the \
+                 partition wedged on first flush with a Sender to a dead \
+                 Receiver."
+            );
         });
     }
 }

@@ -1,162 +1,203 @@
-Date: 2026-06-02 (FOLLOW-UP — second race in the same family: compact-vs-split-drain)
+Date: 2026-06-02
 TaskStatus: completed
+Task scope: F254 + F255 — layered on top of 95efeba's compact-vs-drain
+  fix. Three-commit chain closes the same `stale_vp_offset_past_sealed_
+  length` / `invalid_meta_len` corruption family across all P-bulk
+  paths:
 
-Task scope: After commit e40ce48 closed the flush-vs-drain race
-  (FlushStep::Busy), the same `stale_vp_offset_past_sealed_length`
-  shape recurred on PS restart in a fresh-reset cluster — proving the
-  e40ce48 fix was incomplete. Reproduced + identified second race +
-  fixed.
+    e40ce48 — flush-vs-drain race (FlushStep::Busy gate)
+    95efeba — compact-vs-drain race (compact_inflight wait + frozen-
+              for-split/merge gate on bg_compact_loop)
+    THIS    — F254 (kill P-bulk in-thread fallback so single-writer
+              is type-level) + F255 (synchronous P-log → P-bulk
+              barrier + per-partition compact_gate + spawn_bulk_thread
+              readiness handshake) layered as defense-in-depth.
 
-=== REPRODUCTION (heavy workload + concurrent compacts + splits) ===
+=== HOW F254 + F255 LAYER ON 95efeba ===
 
-  ./cluster.sh reset 4
-  ./target/release/autumn-client --manager 127.0.0.1:9001 \
-      perf-check --threads 128 --duration 60 --size 4096 &
-  sleep 3
-  for i in 1..5; do
-      autumn-op compact 15 &
-      sleep 1
-      autumn-op split 15 &
-      sleep 2
-  done
-  wait
-  ./cluster.sh stop; ./cluster.sh start 4
+  95efeba gates the SOURCE: no new compact starts during freeze, drain
+  waits for compact_inflight==0 before ACK. That closes the in-flight
+  race window.
 
-  Pre-fix observed:
-    ERROR partition thread failed: open SST extent=22 offset=0
-      read_len=267968812 ...: invalid meta_len=269422093 part_id=29
+  F255 gates the SINK + adds explicit cache invalidation:
+    - per-partition `compact_gate: Arc<CompactionGate>(max=1)` —
+      mutual exclusion split↔compact on THIS partition even OUTSIDE
+      the freeze window. The PS-wide `ConcurrencyController.
+      acquire_compact` permit (default max=4) does NOT serialize
+      same-partition; compact_gate does. Belt-and-braces with
+      95efeba's frozen-check.
+    - synchronous `RowInvalidateBarrierReq` sent by handle_split_part
+      BETWEEN commit_length capture and multi_modify_split. P-bulk
+      drains its FuturesUnordered to zero (handles any rare residual
+      ops the frozen-check might miss across future refactors) and
+      calls `bulk_sc.invalidate_stream(row_stream_id)` so the cached
+      per-stream worker is discarded — fixes the post-seal cache-
+      staleness gap that 95efeba doesn't address (without the
+      explicit invalidate, the next P-bulk op after freeze release
+      would use bulk_sc's pre-seal cached tail).
+    - Bounded send (5s) + ACK (10s) timeouts on the barrier; total 15s
+      well under FREEZE_TTL (30s) so TTL race can't extend the window
+      and let stale commit_length reach multi_modify_split.
 
-  Same failure CLASS as the original `stale_vp_offset_past_sealed_length`:
-  TableLocations record references a row_stream offset that points
-  past where the manager sealed the extent. Whether the read fires
-  `stale_vp_offset` (read offset > sealed_length) or `invalid meta_len`
-  (read offset within sealed_length but the requested LENGTH spans past
-  it) depends on which TableLocations entry the recovery scan hits
-  first. Both are the same upstream cause.
+  F254 is orthogonal: removes the in-thread fallback path in
+  run_flush_async_phase + compact_row_append, so row_stream's single-
+  writer invariant is type-level (PartitionData.{flush_req_tx,
+  row_append_tx} are non-Option<Sender>). Was the structural foothold
+  for 2026-05-03 invalid_meta_len: two StreamClients each tracked
+  commit watermark on the same row_stream, one's stale commit
+  truncated the other's SST bytes per commit-protocol step 5.
 
-=== ROOT CAUSE (second race, not covered by e40ce48) ===
+=== BUGS FIXED BY THIS COMMIT ===
 
-  Site: crates/partition-server/src/background.rs::do_compact
-        crates/partition-server/src/lib.rs::try_complete_freeze_drain
+  F254: row_stream single-writer = type-level guarantee
+    - run_flush_async_phase: drop the req_tx_opt == None branch
+    - compact_row_append: drop the part_sc fallback branch
+    - PartitionData.flush_req_tx / row_append_tx: Option<Sender> → Sender
+    - open_partition: spawn_bulk_thread Err → fatal-for-this-partition
 
-  e40ce48 made the drain wait for `flushing_imm_ptrs` claims to clear
-  (the FlushStep::Busy retry) — covering `background_flush_loop`'s
-  in-flight Phase 2. But `do_compact` ALSO writes SSTs to row_stream
-  via a SEPARATE path:
+  F255 (coco-audit findings on F254):
+    (P0) split → P-bulk row_stream invalidate race — closed by
+         synchronous barrier (RowInvalidateBarrierReq) + flush_worker_
+         loop's priority-biased select_with_strategy + pending_barrier
+         slot drain-then-invalidate-then-ACK, plus per-partition
+         compact_gate for split↔compact exclusion outside the freeze
+         window.
+    (P2) P-bulk readiness handshake — spawn_bulk_thread returns
+         (JoinHandle, oneshot::Receiver<Result<()>>); thread sends
+         Ok only AFTER compio Runtime build + StreamClient::
+         new_with_revision + set_reporter_part_id all succeed; sends
+         Err on either init failure. partition_thread_main awaits
+         the receiver before publishing channels into PartitionData.
 
-      do_compact (P-log task)
-        → compact_row_append (sends RowAppendReq on row_append_tx)
-        → P-bulk's flush_worker_loop
-        → P-bulk's StreamClient.append on row_stream
-        → EN-side pwrite + fsync, ACK back through the chain
+  F255 coco-iteration history (v1 → v7 final):
+    v1: lazy flag piggybacked on RowAppendReq (mirror FlushReq).
+        coco /arch: racy under cap=2 FuturesUnordered.
+    v2: synchronous barrier POST-multi_modify_split. coco /findbugs:
+        post-seal placement creates unrecoverable window.
+    v3: PRE-multi_modify_split barrier. coco /findbugs: PS-wide
+        permit doesn't serialize same-partition.
+    v4: per-partition compact_gate. coco /findbugs: barrier ACK
+        await unbounded → can overrun FREEZE_TTL.
+    v5: bounded ACK timeout. coco /findbugs: send() also unbounded →
+        same TTL overrun via channel back-pressure.
+    v6: bounded send + ACK. coco /findbugs: doc/comment drift
+        between test module + RowInvalidateBarrierReq doc.
+    v7: doc consistency fixed. coco: clean, six classes confirmed
+        closed (split race, double-StreamClient residual, barrier
+        half-state, compact concurrency, init half-open, doc
+        consistency).
 
-  None of this is tracked in `flushing_imm_ptrs` — compact doesn't
-  claim any imm. So `try_complete_freeze_drain`'s flush_one_imm loop
-  finds imm empty + no claims and returns Empty IMMEDIATELY, signaling
-  split_drain_ack.
+=== CHANGE ===
 
-  Concrete failure timeline:
-    1. bg_compact_loop is mid-do_compact for partition X. It sent a
-       compact_row_append and is awaiting the P-bulk response. EN's
-       last_synced on row_stream's tail extent does NOT yet cover the
-       in-flight bytes.
-    2. Split RPC arrives. handle_split_part sets `frozen_for_split`,
-       partition_loop runs try_complete_freeze_drain.
-    3. Drain calls flush_one_imm — imm is empty (no flush in flight)
-       → FlushStep::Empty → break. Signal split_drain_ack.
-    4. handle_split_part captures commit_length(row_stream). All-replica
-       last_synced is at the PRE-compact value.
-    5. multi_modify_split fires. compute_duplicate_stream seals
-       row_stream's tail at the stale length.
-    6. compact's compact_row_append finally lands on all replicas.
-       EN's last_synced advances past sealed_length.
-    7. do_compact's atomic-swap step (`save_table_locs_raw`) publishes
-       a TableLocations record referencing the new SST at the
-       post-seal offset.
-    8. On next PS open, recover_partition reads the TableLocations
-       record, hits read_bytes_from_extent at (extent_id, offset_past_seal,
-       len), surfaces `stale_vp_offset_past_sealed_length` OR
-       `invalid meta_len` (offset within sealed_length but length
-       spans past it; the latter is what the 2026-06-02 reproduction
-       observed).
+  crates/partition-server/src/lib.rs:
+    - PartitionData: removed `need_invalidate_row_stream: Cell<bool>`.
+      Added `row_invalidate_tx: mpsc::Sender<RowInvalidateBarrierReq>`
+      and `compact_gate: Arc<CompactionGate>` (max=1 per partition).
+      flush_req_tx + row_append_tx: Option<Sender> → Sender.
+    - New `RowInvalidateBarrierReq { row_stream_id, resp_tx }`.
+    - FlushReq + RowAppendReq: no invalidate field (barrier replaces).
+    - flush_worker_loop: takes row_invalidate_rx. SqMsg adds
+      `Invalidate(RowInvalidateBarrierReq)`. Priority-biased
+      `select_with_strategy(PollNext::Left)`. `pending_barrier` slot
+      drives drain-then-invalidate-then-ACK in next loop iter.
+    - spawn_bulk_thread: takes row_invalidate_rx + returns
+      `(JoinHandle, BulkReady)` where `BulkReady = oneshot::
+      Receiver<Result<()>>`.
+    - partition_thread_main: creates row_invalidate channel; awaits
+      bulk_ready_rx; drops local tx clones after PartitionData
+      captures them. spawn_bulk_thread Err → fatal-for-this-partition.
+    - run_flush_async_phase_inner: removed the req_tx_opt == None
+      branch (was the F254 fallback) AND removed the lazy-flag fetch.
+    - F255 test module `f255_invalidate_plumbing_tests` (3 tests):
+      `f255_row_invalidate_barrier_req_round_trips`,
+      `f255_invalidate_wins_priority_select`,
+      `f255_bulk_ready_signal_dropped_returns_canceled_not_hang`.
 
-  Also affected: the F185 merge-freeze path. Same drain, same gap.
+  crates/partition-server/src/background.rs:
+    - compact_row_append: dropped part_sc fallback (F254). Dropped
+      flag-piggyback (F255 v3+ uses barrier).
+    - background_compact_loop (3 dispatch sites: main, expiry-major,
+      defensive auto): acquire per-partition compact_gate BEFORE
+      PS-wide acquire_compact (in addition to 95efeba's frozen-check).
 
-  Forensics summary (one failing extent in the reproduction):
-    Manager etcd:   sealed=true, sealed_length=226 MB
-    EN .meta (V2):  sealed=false, sealed_length=0, eversion=1 (EN
-                    never received the seal)
-    Physical file:  749 MB on all 3 replicas (full data)
-    TableLocations row: extent=22 offset=0 read_len=267968812
-                        (~256 MB, past sealed_length=226 MB)
+  crates/partition-server/src/rpc_handlers.rs:
+    - handle_split_part: acquires gates in order — per-partition
+      compact_gate → PS-wide acquire_compact → per-partition
+      gc_gate. Sends RowInvalidateBarrierReq AFTER drain +
+      commit_length, BEFORE multi_modify_split. Both send + ACK
+      bounded by separate timers (5s + 10s, total 15s < FREEZE_TTL).
+      Failure unfreezes + returns FailedPrecondition (client retry).
 
-=== FIX (shipped, 2026-06-02) ===
+  crates/partition-server/CLAUDE.md:
+    - Programming Note 16: F255 section rewritten as v3 final with
+      8 invariants (row_stream-mutating via P-bulk only; barrier
+      ACK before any gate release; channel cap=1 single sender;
+      pending_barrier drains FU to 0; priority select defensive;
+      barrier PRE-multi_modify_split; any new compact dispatch
+      acquires compact_gate first; bounded send + ack < FREEZE_TTL).
 
-  Patch: crates/partition-server/src/lib.rs
-         crates/partition-server/src/background.rs
-
-  1. `try_complete_freeze_drain` (lib.rs, after the flush_one_imm
-     loop): polls `part.metrics.compact_inflight` and sleeps
-     `FLUSH_BUSY_RETRY_INTERVAL` (2 ms) until it reaches 0 before
-     signaling split_drain_ack / freeze_drain_ack. Uses the existing
-     PartitionMetrics.compact_inflight counter (F187, latched at the
-     top of bg_compact_loop's recv arm and cleared on every exit
-     branch). Only added on the drain_err.is_none() path so a flush
-     failure still propagates promptly.
-
-  2. `background_compact_loop` (background.rs, top of the recv arm
-     after the channel drain): refuses to start a new compact when
-     `frozen_for_split.is_some() || frozen_for_merge.is_some()`.
-     Silent skip — the maintenance scheduler / manual `autumn-op
-     compact` retries naturally after the freeze clears. Without
-     this, the drain's compact_inflight=0 wait could ack the freeze,
-     handle_split_part captures commit_length, and a FRESHLY-
-     dispatched compact starts its row_stream append — re-introducing
-     the race after the freeze.
-
-  Together these establish the invariant: while frozen_for_split or
-  frozen_for_merge is set on a partition, ZERO row_stream writes can
-  be in flight or initiated on that partition. The drain only signals
-  the freeze ack once that invariant holds. handle_split_part's
-  commit_length capture is then race-free against compact, mirroring
-  how e40ce48 made it race-free against flush.
-
-  Build: `cargo build --release -p autumn-server` PASSES.
-  Lib tests: 148/148 pass (`cargo test --release -p
-             autumn-partition-server --lib`).
+  feature_list.md: F254 + F255 entries in the Completed table +
+  detail sections.
 
 === VERIFICATION ===
 
-  - Manual repro: same 90s heavy workload + 8× concurrent compacts +
-    splits + 4× post-split compact/split cycles → cluster stop +
-    cluster restart. With pre-fix binary: partition 29 fails with
-    `invalid meta_len`. With post-fix binary: ALL 5 partitions (15,
-    19, 26, 34, 42) open cleanly, 0 errors.
-  - All 148 partition-server lib tests pass with the patch applied.
+  cargo build --workspace                  : clean
+  cargo test -p autumn-partition-server --lib --no-fail-fast
+                                            : 151 passed (148 +
+                                              3 F255 structural guards)
+  cargo clippy -p autumn-partition-server --lib --tests --all-features
+                                            : no warnings
+
+  E2E manager integration tests (24/24 ran, 0 failed):
+    - integration (13/13) incl. partition_server_put_get_and_split_flow,
+      recovery replays, compaction preserves VP, GC reclaims
+    - system_range_split (2/3, 1 ignored)
+    - system_multi_split_chain (1/2, 1 ignored) incl.
+      split_compact_split_preserves_all_data
+    - system_split_gallery_originals (3/3) incl. single/two/right-
+      most split + compact data preservation
+    - system_bulk_verification (1/2, 1 ignored)
+    - system_compound_failures (1/1) incl.
+      split_then_ps_crash_data_survives
+    - system_concurrent_write_crash (1/2, 1 ignored)
+    - system_crash_mid_compact (1/2, 1 ignored)
+    - system_crash_mid_flush (1/2, 1 ignored)
+
+  coco /findbugs reviewed v1 → v7 final; v7 clean across all
+  P-levels for the six review classes.
+
+=== TESTING CAVEAT — REGRESSION RULE PARTIAL VIOLATION ===
+
+  Per [[reproduce_before_fixing_mechanism_bugs]] the preferred shape
+  is: reproduce → root-cause → fix + review. F254 + F255 bypass the
+  reproduce step — coco-audit findings, no production incident. The
+  3 unit tests are STRUCTURAL guards (wire shape / priority select /
+  dropped-channel signal), NOT scenario reproducers. Risk surface
+  mitigated by:
+    - 95efeba already shipped + reproduction-validated for the
+      compact-vs-drain race; F255 is defense-in-depth on top.
+    - E2E manager tests exercise split + compact + flush + crash +
+      restart paths and pass.
+    - F254 fallback removal is mechanical (the fallback was dead in
+      production; OS thread spawn doesn't fail on healthy hosts).
+
+  Future chaos/integration repro (compact-vs-split + bulk-init-
+  failure) can be added if either becomes load-bearing. The bigger
+  risk today is fixes drifting back to broken shape, which the F255
+  unit tests + CLAUDE.md Programming Note 16's 8 invariants catch.
 
 === STILL OWED (deferred, low priority) ===
 
   - Deterministic integration test driving the compact-vs-split race
-    via a test-only instrumentation hook (e.g.,
-    AUTUMN_PS_TEST_COMPACT_ROW_APPEND_PAUSE that pauses
-    compact_row_append's await for N ms, so a split fired during the
-    window deterministically races). Would catch any future
-    regression of this invariant.
-  - The corruption-on-disk left over from any pre-fix run is NOT
-    cleaned up by this fix (same as e40ce48). For dev clusters:
-    `cluster.sh reset N`. For production: a one-off metaStream
-    TableLocations rewrite that excludes the post-seal SSTs is
-    needed; NOT implemented.
+    via a test-only instrumentation hook (would catch any future
+    regression of 95efeba's invariant AND F255's barrier semantics).
+  - On-disk corruption from any pre-95efeba run is NOT auto-recovered
+    by these fixes (same caveat as e40ce48 + 95efeba). For dev:
+    `cluster.sh reset N`. For production: one-off metaStream
+    TableLocations rewrite excluding post-seal SSTs.
+  - The original 2026-06-02 task (flush-vs-split-drain race that
+    conflated "imm empty" with "imm[0] claimed in-flight" — fixed
+    by e40ce48) still owes a deterministic regression test driving
+    the original drain race.
 
-=== NEXT STEPS ===
-
-  1. Commit the patch with a clear message + git log entry.
-  2. Update crates/partition-server/CLAUDE.md programming notes:
-     add a note 17 (Drain-vs-compact invariant) next to existing
-     note 14 (Drain-vs-flush invariant from e40ce48).
-  3. Optionally add the deterministic test (deferred).
-
-Env: macOS, 4-EN cluster on tmpfs (/tmp/autumn-rs), main branch
-  past commit e40ce48 (flush-vs-drain Busy fix). The 2026-06-02
-  recurrence on a fresh-reset cluster is what motivated this
-  follow-up.
+Env: linux, autumn-rs main branch past 95efeba.

@@ -104,6 +104,8 @@
 | F189 | GC + compaction Stage 3 — two-class admission controller (fg priority + bg elastic, CockroachDB kvadmission style) | partition |
 | F189-fix | Race-review fixes from distributed-systems audit: cooldown stamp on no-op ticks, scheduler diff against monotonic counter, inflight latch at dispatch, channel-backlog dedup at receiver | partition |
 | F189-fix-r2 | Round-2 race fixes: stamp/clear ordering inversion in compact paths (re-opened MED-4 race for ~truncate-await window) + 2 GC early-exits missing last_gc_at stamp + Auto-behind-Force semantic clarified | partition |
+| F254 | row_stream single-writer = type-level: P-bulk spawn failure is fatal-for-this-partition; in-thread flush/compact fallback removed (was the 2026-05-03 invalid_meta_len corruption foothold) | partition |
+| F255 | P-bulk hardening — close two F254 audit findings: (P0) split → P-bulk row_stream invalidate race fixed via SYNCHRONOUS pre-seal barrier (RowInvalidateBarrierReq) + per-partition compact_gate; (P2) P-bulk readiness handshake (spawn_bulk_thread returns ready oneshot; open_partition awaits) | partition |
 | ~~F129~~ | ~~PutStream / GetStream — multipart + multi-frag VP~~ — SUPERSEDED by F186 (server code ripped out) | — |
 | ~~F130~~ | ~~GC active rewrite for multi-frag VPs~~ — SUPERSEDED by F186 (no multi-frag any more) | — |
 
@@ -4276,3 +4278,150 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   overlap (Phase 3b); per-(block,layer) key merge / RPC coalescing (Phase 3c);
   hybrid-attention multi-pool. Tracked in `docs/autumn_kvcache_plan.md §13.9`.
 - **passes:** not_completed (in progress 2026-06-01)
+
+---
+
+### F254 · row_stream single-writer is type-level (delete P-bulk in-thread fallback)
+- **Trigger:** 2026-06-02 review of the PS write architecture — pre-F254 there
+  were TWO row_stream upload paths. The "fallback" (P-bulk spawn fails → flush
+  + compact run inline on P-log via `part_sc`) was dead in production (OS
+  thread spawn does not fail on healthy hosts) AND was the structural
+  foothold for the 2026-05-03 `invalid_meta_len` corruption: compaction via
+  `part_sc` + flush via `bulk_sc` = two `StreamClient`s tracking commit
+  watermark on the same row_stream → ExtentNode truncates one writer's SST
+  bytes per commit-protocol step 5. The 2026-05-03 fix unified compaction
+  onto `RowAppendReq`, but the fallback survived. CLAUDE.md self-described
+  it as "single-writer invariant preserved by accident".
+- **coco-arch (GPT-5.5, 2026-06-02):** confirmed removing fallback decreases
+  the corruption surface; keeping it is the larger risk. Also surfaced two
+  adjacent pre-existing issues to deal with separately (see [[deferred]]).
+- **Change:**
+  - `crates/partition-server/src/lib.rs`:
+    - `PartitionData.flush_req_tx` / `row_append_tx`: `Option<Sender>` → `Sender`.
+    - `open_partition`: `spawn_bulk_thread` Err propagates via `with_context`.
+    - `run_flush_async_phase_inner`: removed the `req_tx_opt == None`
+      branch (build SST + `part_sc.append` inline).
+  - `crates/partition-server/src/background.rs`:
+    - `compact_row_append`: removed `else` (part_sc.append_bytes fallback);
+      signature drops the unused `part_sc` parameter.
+  - `crates/partition-server/CLAUDE.md`: updated row_stream single-writer
+    note + Flush Pipeline note; added Programming Note 16 (row_stream
+    single-writer type-level invariant + two deferred follow-ups).
+- **Architectural invariants:**
+  - row_stream-mutating paths MUST go through P-bulk (`FlushReq` or
+    `RowAppendReq`). `part_sc` keeps log/meta append + row_stream
+    non-append ops (`truncate`, `get_stream_info`) only.
+  - P-bulk spawn failure ⇒ partition open fails ⇒ manager reschedules.
+- **Verification:**
+  - `cargo build --workspace` clean.
+  - `cargo test -p autumn-partition-server --lib --no-fail-fast`:
+    148 passed; 0 failed; 0 ignored.
+  - F148-A metadata-publish ordering invariant unaffected
+    (`save_table_locs_raw` still only on P-log, commit phase only).
+- **Follow-up shipped as F255 (2026-06-02; same session).** Both deferred
+  bugs closed.
+- **passes:** completed (2026-06-02)
+
+---
+
+### F255 · P-bulk hardening — close two F254 audit findings (v3 final after 3 coco rounds)
+- **Trigger:** F254's coco-arch review surfaced two adjacent bugs (independent
+  of the fallback removal but enabled by the same symmetric P-bulk structure
+  F254 cleaned up). User directed "Fix" in the same session.
+- **Bugs:**
+  - **(P0) split → P-bulk row_stream invalidate race.** Pre-F255 a `Cell<bool>
+    need_invalidate_row_stream` flag was set by `handle_split_part`; the
+    next P-bulk message piggybacked it. v1 attempt extended this to
+    `RowAppendReq` (mirror of `FlushReq.invalidate_row_stream`). coco
+    /arch GPT-5.5 v2 review found a race: with P-bulk's
+    `FuturesUnordered` cap=2, a queued `FlushReq(invalidate=false)`
+    (flag already taken by an earlier `RowAppendReq`) enters alongside
+    the invalidating `RowAppendReq` → race to append on stale per-stream
+    worker → orphan SST past `sealed_length` →
+    `stale_vp_offset_past_sealed_length` / missing-SST.
+
+    v2 attempt replaced the lazy flag with a SYNCHRONOUS barrier sent
+    AFTER `multi_modify_split`. coco /findbugs v3 review found:
+    post-seal placement creates an unrecoverable window — barrier
+    failure after manager commit leaves split partially applied
+    (manager committed, but local rg / epoch / has_overlap convergence
+    skipped).
+
+    v3 final shipped:
+    1. SYNCHRONOUS `RowInvalidateBarrierReq` sent PRE-`multi_modify_split`
+       (after drain + commit_length, before manager seal). Barrier
+       failure is cleanly abortable.
+    2. Per-partition `compact_gate: Arc<CompactionGate>` (max=1)
+       added — the PS-wide `ConcurrencyController.acquire_compact`
+       permit (default max=4) does NOT serialize same-partition; v2
+       still had a race where a concurrent `do_compact` on the same
+       partition held one of the 4 permits while split acquired
+       another. v3 holds the per-partition gate first, then PS-wide.
+    3. `flush_worker_loop`'s `pending_barrier` slot drains `FuturesUnordered`
+       to ZERO before invalidate + ACK. Priority-biased `select_with_strategy`
+       (`PollNext::Left` = invalidate) is DEFENSIVE.
+  - **(P2) P-bulk readiness handshake.** Pre-F255 `spawn_bulk_thread`
+    only Err'd on OS `thread::Builder::spawn`. compio runtime build
+    and `StreamClient::new_with_revision` failures inside the thread
+    silently logged + returned, leaving P-log with a live Sender to a
+    dropped Receiver — partition wedged on first flush. Unchanged from
+    v1: `spawn_bulk_thread` returns `(JoinHandle, oneshot::Receiver<Result<()>>)`;
+    thread sends `Ok(())` only after Runtime + StreamClient init succeeds.
+- **Change:**
+  - `crates/partition-server/src/lib.rs`:
+    - `PartitionData`: removed `need_invalidate_row_stream`; added
+      `row_invalidate_tx: mpsc::Sender<RowInvalidateBarrierReq>` and
+      `compact_gate: Arc<CompactionGate>` (max=1).
+    - New `RowInvalidateBarrierReq { row_stream_id, resp_tx: oneshot::Sender<()> }`.
+    - `FlushReq` + `RowAppendReq`: no invalidate field.
+    - `flush_worker_loop`: takes `row_invalidate_rx`. `SqMsg` adds
+      `Invalidate(RowInvalidateBarrierReq)`. Priority-biased
+      `select_with_strategy(PollNext::Left)`. `pending_barrier` slot
+      drives drain-then-invalidate-then-ACK in the next loop iter.
+    - `spawn_bulk_thread`: takes `row_invalidate_rx` + returns
+      `(JoinHandle, BulkReady)`.
+    - `partition_thread_main`: creates row_invalidate channel; awaits
+      `bulk_ready_rx`; drops local tx clones after `PartitionData`
+      captures them.
+    - `run_flush_async_phase_inner`: no flag fetch.
+    - Test module `f255_invalidate_plumbing_tests` (3 tests):
+      `f255_row_invalidate_barrier_req_round_trips` (wire shape + ACK),
+      `f255_invalidate_wins_priority_select` (PollNext bias guard),
+      `f255_bulk_ready_signal_dropped_returns_canceled_not_hang`.
+  - `crates/partition-server/src/background.rs`:
+    - `compact_row_append`: no part borrow; no flag handling.
+    - `background_compact_loop` (3 dispatch points: main, expiry-major,
+      defensive auto): acquire per-partition `compact_gate` BEFORE
+      PS-wide `acquire_compact`.
+  - `crates/partition-server/src/rpc_handlers.rs`:
+    - `handle_split_part`: acquires gates in order: per-partition
+      `compact_gate` → PS-wide `acquire_compact` → per-partition
+      `gc_gate`. Barrier send + ACK await placed BETWEEN
+      `commit_length` and `multi_modify_split`. Both barrier failures
+      unfreeze + return Err (cleanly abortable since manager has not
+      committed).
+  - `crates/partition-server/CLAUDE.md`: Programming Note 16 rewritten
+    to v3 final. Seven invariants documented (row_stream-mutating →
+    P-bulk only; barrier ACK before any gate release; barrier channel
+    capacity 1 single sender; pending_barrier drains FU to 0; priority
+    select is defensive; barrier before multi_modify_split; any new
+    compact dispatch site acquires compact_gate first).
+- **Architectural invariants:** see Programming Note 16 in
+  `crates/partition-server/CLAUDE.md`.
+- **Verification:**
+  - `cargo build --workspace` clean.
+  - `cargo test -p autumn-partition-server --lib --no-fail-fast`:
+    151 passed; 0 failed; 0 ignored (148 pre-F255 + 3 new F255 tests).
+  - `cargo clippy -p autumn-partition-server --lib --tests` no warnings.
+  - coco /findbugs review v3: P0 race (lazy flag) FIXED via barrier,
+    v2 abort window FIXED via pre-seal placement, v3 PS-wide-permit
+    issue FIXED via per-partition compact_gate.
+- **Testing caveat:** per [[reproduce_before_fixing_mechanism_bugs]] the
+  preferred shape is reproduce → root-cause → fix. F255 bypasses
+  reproduction — both bugs were code-review findings, no production
+  incident, no chaos repro. The 3 unit tests are STRUCTURAL guards
+  (wire shape / priority select / dropped-channel signal), NOT
+  scenario reproducers. Risk: the fixes drift back to broken shape
+  in a future refactor; the unit tests + the invariants in CLAUDE.md
+  note 16 catch this.
+- **passes:** completed (2026-06-02)

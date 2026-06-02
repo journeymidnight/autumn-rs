@@ -357,9 +357,13 @@ stale commit was sent in an append header, ExtentNode truncated data
 written by the other, destroying SST data and causing `invalid meta_len`
 corruption on PS restart.
 
-Legacy fallback: if P-bulk failed to spawn, `row_append_tx` is `None`
-and compaction falls back to `part_sc` — acceptable because in that case
-flush also uses `part_sc` (single writer).
+Single-writer invariant is now type-level (post-F254): `open_partition`
+returns Err when P-bulk fails to spawn (the manager reschedules the
+partition), so `PartitionData.flush_req_tx` / `row_append_tx` are
+non-`Option<Sender>`. The in-thread fallback that previously coincidentally
+preserved single-writer when P-bulk spawn failed is gone (both
+`run_flush_async_phase`'s `req_tx_opt == None` branch and
+`compact_row_append`'s `else`).
 
 **Record format**: `[op:1][key_len:4 LE][val_len:4 LE][expires_at:8 LE][key][value]` (17-byte header)
 
@@ -490,8 +494,11 @@ P-log: continuation
   9. save_table_locs_raw(part_sc, meta_stream_id, part.tables.clone(), vp)
 ```
 
-The in-thread legacy path (`flush_one_imm_local`) is retained as a fallback for
-when bulk-thread spawn fails.
+P-bulk spawn failure is fatal-for-this-partition (post-F254): `open_partition`
+returns Err and the manager reschedules. There is no in-thread fallback. The
+historic fallback (and `flush_one_imm_local`, removed earlier by F197) only
+preserved single-writer by coincidence — see the row_stream invariant note
+above.
 
 After flush, `save_table_locs_raw` writes `TableLocations` to `meta_stream` and
 **truncates meta_stream to 1 extent** — only the latest checkpoint is kept.
@@ -1510,3 +1517,158 @@ post-restart.
       GET-local already has); a connection-level prior-write barrier over all
       local reads is a noted follow-up. **Invariant: read handlers served locally
       must never hold a `RefCell` borrow across an `.await`.**
+
+16. **row_stream single-writer is now a type-level invariant; P-bulk spawn
+    failure is fatal-for-this-partition (F254).** All `row_stream.append` MUST go
+    through P-bulk's `bulk_sc` — flush via `FlushReq`, compaction via
+    `RowAppendReq`. Pre-F254 we kept a coincidence-based fallback: when
+    `spawn_bulk_thread` failed, `flush_req_tx`/`row_append_tx` were `None` and
+    both flush + compact ran inline on P-log against `part_sc`. That accidentally
+    preserved single-writer because BOTH writers degraded to the same client; if
+    only one degraded (or someone added a third row_stream-writing edge), the
+    `invalid_meta_len` corruption mode (two `StreamClient`s racing per-stream
+    commit watermarks on the same row_stream → ExtentNode truncates one
+    writer's SST bytes per commit protocol step 5) would recur. **Mitigation:**
+    `open_partition` propagates `spawn_bulk_thread` Err; the manager reschedules.
+    `PartitionData.flush_req_tx` and `row_append_tx` are non-`Option<Sender>`.
+    **Invariant: any new row_stream-mutating path MUST go through P-bulk
+    (`FlushReq` or `RowAppendReq`). `part_sc` is for log/meta append and
+    row_stream non-append ops (`truncate`, `get_stream_info`) only.**
+
+    **Follow-up fixes shipped as F255 (closes the two coco-audit findings the
+    F254 review surfaced; both predated F254 and are independent of the
+    fallback removal):**
+    - **(P0) split → P-bulk row_stream invalidate race — FIXED via SYNC
+      BARRIER.** Pre-F255 (and the v1 F255 attempt) the partition carried
+      a `Cell<bool> need_invalidate_row_stream` flag that
+      `handle_split_part` set; each P-bulk message (FlushReq /
+      RowAppendReq) piggybacked the flag via a `fetch-and-clear` at send
+      time. coco /arch GPT-5.5 surfaced (2026-06-02, second pass) that
+      the lazy form is racy with P-bulk's `FuturesUnordered` cap=2: a
+      post-split FlushReq with `invalidate=false` (flag already taken by
+      an earlier RowAppendReq) could enter the FU CONCURRENTLY with the
+      invalidating RowAppendReq and append to the stale per-stream worker
+      BEFORE the invalidate took effect → SST past sealed_length → orphan
+      SST on recovery (`stale_vp_offset_past_sealed_length` / missing-SST).
+
+      The v2 fix replaces the lazy flag with a SYNCHRONOUS P-log → P-bulk
+      barrier:
+      1. New `RowInvalidateBarrierReq { row_stream_id, resp_tx }` message
+         + `mpsc::Sender<RowInvalidateBarrierReq>` channel
+         (`PartitionData.row_invalidate_tx`, capacity 1).
+      2. `flush_worker_loop` consumes the barrier on a priority-biased
+         `select_with_strategy` (PollNext::Left = invalidate stream).
+         When picked, it sets a `pending_barrier` slot.
+      3. The next loop iteration drains `inflight` `FuturesUnordered` to
+         ZERO via `while inflight.next().await`, then calls
+         `bulk_sc.invalidate_stream(row_stream_id)`, then signals the
+         barrier's `resp_tx`. No new SQ message is picked up until the
+         barrier completes.
+      4. `handle_split_part` sends the barrier INSIDE the critical section
+         **BEFORE `multi_modify_split`** (after the drain + commit_length,
+         before the manager seal) and AWAITS the ACK. Pre-seal placement
+         is REQUIRED so the failure path is cleanly abortable: if the
+         barrier send / ACK fails, the manager has not yet committed the
+         seal, so unfreezing + returning Err leaves the cluster in a
+         coherent pre-split state. Post-seal placement (the v2 first
+         draft) would create an unrecoverable window — manager-committed
+         seal + local state not converged + freeze cleared (coco
+         /findbugs 2026-06-02 v2 review). At the moment of the send,
+         gates are still held + `frozen_for_split` halts writes, so
+         P-bulk's queue is normally empty; by the time gates release,
+         bulk_sc is invalidated and subsequent compact / flush re-fetch
+         a fresh tail from the manager — which by then carries the
+         post-seal extent.
+
+      The `need_invalidate_row_stream` / `invalidate_row_stream` field
+      machinery is GONE — `FlushReq` and `RowAppendReq` carry no
+      invalidate flag, `compact_row_append` doesn't borrow `part`, and
+      `run_flush_async_phase_inner` doesn't fetch any flag. The barrier
+      is the single source of truth.
+
+      **Per-partition compact_gate is load-bearing.** v3 of the F255 review
+      (coco /findbugs 2026-06-02) caught that the PS-wide
+      `ConcurrencyController.acquire_compact()` permit (default max=4)
+      does NOT serialize same-partition: split on partition P could acquire
+      one permit while a concurrent `do_compact` on partition P held
+      another and emit `compact_row_append` RowAppendReqs that raced the
+      seal. Fix: `PartitionData.compact_gate: Arc<CompactionGate>` (max=1
+      per partition). Acquired by `background_compact_loop`'s three
+      do_compact dispatch points (main / expiry-major / defensive auto)
+      and by `handle_split_part`. Acquisition order at the split site is
+      strictly outer→inner: per-partition `compact_gate` → PS-wide
+      `acquire_compact` → per-partition `gc_gate`. Same-partition
+      compact-vs-split is now serialised; cross-partition concurrency
+      preserved.
+
+      **Invariants:**
+      1. Any new control message that mutates row_stream from P-log MUST
+         travel through P-bulk's channel set — never write row_stream
+         directly via `part_sc` (note 16 above).
+      2. `handle_split_part` MUST await the barrier ACK BEFORE releasing
+         `compact_gate`, `gc_gate`, or clearing `frozen_for_split`. If a
+         future refactor moves any of those releases earlier, the race
+         re-opens — a freshly-resumed background_compact_loop /
+         background_flush_loop can send a P-bulk request before
+         bulk_sc is invalidated.
+      3. The barrier channel is capacity 1; `handle_split_part` is the
+         sole sender. If another sender is added later, prove the
+         barrier sender count stays bounded (1) or convert to an
+         unbounded channel.
+      4. `flush_worker_loop`'s `pending_barrier` slot MUST drain
+         `inflight` to ZERO before invalidating + ACKing. Skipping the
+         drain reintroduces the race coco surfaced (in-flight append on
+         stale worker landing after the invalidate ACKed).
+      5. The priority-biased select (PollNext::Left) is DEFENSIVE — under
+         today's gate discipline the SQ queue is empty when the barrier
+         arrives, but the bias keeps the design race-free if a future
+         refactor relaxes the gates.
+      6. `handle_split_part` sends the barrier BEFORE `multi_modify_split`.
+         Failure of the barrier send / ACK must abort split with the
+         manager not yet committed; post-seal placement (the v2 first
+         draft) would leak an unrecoverable window where manager-
+         committed seal + local state not converged.
+      7. ANY new do_compact dispatch site (future code paths that bypass
+         `background_compact_loop`) MUST acquire `compact_gate` first,
+         then `acquire_compact`. Same goes for split-shaped operations.
+      8. BOTH the barrier `send().await` AND the ACK `recv().await`
+         MUST be bounded by separate timers (5 s send + 10 s ACK
+         today). The total budget (15 s) MUST stay well under
+         `FREEZE_TTL` (30 s, lib.rs). Pre-bound (or only-ACK-bounded),
+         a wedged P-bulk could block the await past `FREEZE_TTL`,
+         `check_freeze_ttls` would unfreeze, new writes would extend
+         the row_stream tail past the already-captured
+         `commit_length`, and the eventual continuation would call
+         `multi_modify_split` with the STALE `row_end` → post-TTL
+         writes above sealed_length, invisible on recovery (coco
+         /findbugs v4 + v5 findings). The send is independently
+         bound-able because `row_invalidate_tx` is capacity 1: a prior
+         split's barrier sitting un-consumed in the channel (P-bulk
+         wedged on a stuck flush) back-pressures the next split's
+         send BEFORE the ACK timer arms. Both timeouts unfreeze +
+         return `FailedPrecondition` so the partition resumes serving
+         and the client can retry. If future tuning changes either
+         timeout, the relation `send + ack < FREEZE_TTL` MUST hold.
+
+      Regression guards (lib.rs):
+      `f255_row_invalidate_barrier_req_round_trips` (wire shape +
+      ACK round-trip) + `f255_invalidate_wins_priority_select` (PollNext
+      bias).
+
+    - **(P2) P-bulk readiness handshake — FIXED.** `spawn_bulk_thread`
+      now returns `(JoinHandle, oneshot::Receiver<Result<()>>)`. The
+      spawned thread sends `Ok(())` only AFTER compio `RuntimeBuilder::
+      build` succeeds AND `StreamClient::new_with_revision` succeeds AND
+      `set_reporter_part_id` runs; runtime / StreamClient init failure
+      sends `Err(_)` so P-log surfaces the real failure cause.
+      `partition_thread_main` awaits the receiver before publishing
+      `flush_req_tx` / `row_append_tx` / `row_invalidate_tx` into
+      `PartitionData` — a partition is never half-opened with a live
+      Sender to a dropped Receiver. Thread abort (drop without send)
+      surfaces as `Err(Canceled)` so the open path returns instead of
+      hanging. **Invariant: any future change to `spawn_bulk_thread`'s
+      in-thread init order MUST send the ready signal only after ALL
+      preconditions for `flush_worker_loop` are met — a premature
+      `Ok(())` regresses to the pre-F255 wedge.**
+      Regression guard:
+      `f255_bulk_ready_signal_dropped_returns_canceled_not_hang`.

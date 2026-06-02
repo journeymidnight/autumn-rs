@@ -658,15 +658,31 @@ pub(crate) async fn handle_split_part(
         }
     }
 
-    // F140 + F196 D-r7: drain in-flight compact + GC before commit_length.
-    // compact's PS-wide concurrency permit lives on
-    // `ConcurrencyController.acquire_compact`. gc_gate stays a
-    // per-partition CompactionGate for split-vs-gc synchronization within
-    // this partition. Both held through multi_modify_split via RAII.
-    let (concurrency, gc_gate) = {
+    // F140 + F196 D-r7 + F255: drain in-flight compact + GC before
+    // commit_length. Three gates, acquired outer→inner:
+    //   1. **Per-partition `compact_gate`** (F255) — serializes vs
+    //      `background_compact_loop`'s `do_compact` on THIS partition.
+    //      The PS-wide `ConcurrencyController.acquire_compact` permit
+    //      (default max=4) does NOT serialize same-partition: pre-F255
+    //      split could acquire one permit while a concurrent do_compact
+    //      on the same partition held another and emit `compact_row_append`
+    //      RowAppendReqs that raced the seal (coco /findbugs v3, 2026-06-02).
+    //   2. **PS-wide `concurrency.acquire_compact`** (F196 D-r7) — caps
+    //      cross-partition peak RAM. Inner to the per-partition gate so
+    //      same-partition exclusion happens first.
+    //   3. **Per-partition `gc_gate`** (F140) — serializes vs `run_gc`'s
+    //      log_stream append on THIS partition.
+    // All three RAII-held through `multi_modify_split` AND the F255
+    // P-bulk barrier ACK below.
+    let (compact_gate, concurrency, gc_gate) = {
         let p = part.borrow();
-        (p.concurrency_ctrl.clone(), p.gc_gate.clone())
+        (
+            p.compact_gate.clone(),
+            p.concurrency_ctrl.clone(),
+            p.gc_gate.clone(),
+        )
     };
+    let _local_compact_gate = compact_gate.acquire().await;
     let _compact_permit = concurrency.acquire_compact().await;
     let _gc_permit = gc_gate.acquire().await;
 
@@ -838,6 +854,106 @@ pub(crate) async fn handle_split_part(
         .map_err(|e| unfreeze_on_err(e, "meta_stream"))?
         .max(1);
 
+    // F255 — synchronous P-log → P-bulk barrier. Sent BEFORE
+    // `multi_modify_split` so that any failure here is cleanly abortable:
+    // the manager has not yet sealed the row_stream tail, so unfreezing
+    // and returning Err leaves the cluster in a coherent pre-split state.
+    // Putting the barrier AFTER `multi_modify_split` would create an
+    // unrecoverable window — manager-committed seal + local state not
+    // converged + freeze cleared (per coco /findbugs 2026-06-02 v2 review).
+    //
+    // The barrier itself: P-bulk drains its in-flight FuturesUnordered to
+    // zero and calls `bulk_sc.invalidate_stream(row_stream_id)` so the
+    // cached per-stream worker is discarded. Any future P-bulk op (after
+    // gates release) re-fetches a fresh tail — by then `multi_modify_split`
+    // will have sealed the old tail and the manager will return the
+    // post-seal extent. At the moment of THIS send, gates are still held +
+    // `frozen_for_split` halts new writes, so P-bulk's queue is normally
+    // empty (the priority-biased select in `flush_worker_loop` keeps the
+    // ordering race-free defensively).
+    //
+    // Pre-F255 v2 (and the F255 v1 lazy-flag attempt) this was a
+    // `Cell<bool> need_invalidate_row_stream` flag piggybacked on each
+    // P-bulk message — racy under P-bulk's cap=2 FuturesUnordered (see
+    // F255 fix history in `partition-server/CLAUDE.md` programming note 16).
+    let (inv_resp_tx, inv_resp_rx) = futures::channel::oneshot::channel::<()>();
+    let mut inv_tx = part.borrow().row_invalidate_tx.clone();
+    let inv_req = crate::RowInvalidateBarrierReq {
+        row_stream_id,
+        resp_tx: inv_resp_tx,
+    };
+    // F255 — BOTH the send and the ACK await are bounded. `FREEZE_TTL`
+    // (30 s, lib.rs) is the partition's unconditional "the handler is
+    // wedged, unfreeze and resume writes" backstop (see
+    // `check_freeze_ttls`). If EITHER step were unbounded, a wedged
+    // P-bulk could block the await past the TTL; `check_freeze_ttls`
+    // would unfreeze, new writes would resume + extend the row_stream
+    // tail past the already-captured `commit_length`, and the eventual
+    // continuation would call `multi_modify_split` with the STALE
+    // `row_end` — manager seals at the pre-TTL length, post-TTL writes
+    // end up above sealed_length, invisible on recovery (coco /findbugs
+    // v4/v5, 2026-06-02). The SEND can block independently of the ACK:
+    // `row_invalidate_tx` is capacity 1 (only `handle_split_part`
+    // sends), so a still-queued prior-split barrier whose P-bulk
+    // processing never completed (e.g. permanently-down replica on
+    // flush) would back-pressure us here BEFORE the ACK timeout could
+    // even arm. Two separate timers (5 s + 10 s) keep the total budget
+    // (15 s) safely under FREEZE_TTL while still leaving ample
+    // happy-path headroom (when nothing's wedged the send is
+    // microseconds and the ACK lands on the next P-bulk poll).
+    let send_timeout = std::time::Duration::from_secs(5);
+    let ack_timeout = std::time::Duration::from_secs(10);
+    {
+        let send_fut = inv_tx.send(inv_req);
+        let send_timer = compio::time::sleep(send_timeout);
+        futures::pin_mut!(send_fut);
+        futures::pin_mut!(send_timer);
+        match futures::future::select(send_fut, send_timer).await {
+            futures::future::Either::Left((Ok(()), _)) => {}
+            futures::future::Either::Left((Err(_), _)) => {
+                part.borrow().frozen_for_split.set(None);
+                return Err((
+                    StatusCode::Internal,
+                    "split: P-bulk row_invalidate channel closed".to_string(),
+                ));
+            }
+            futures::future::Either::Right(_elapsed) => {
+                part.borrow().frozen_for_split.set(None);
+                return Err((
+                    StatusCode::FailedPrecondition,
+                    format!(
+                        "split: P-bulk row_invalidate send timed out after {}s (channel full \
+                         from prior wedged split); client may retry",
+                        send_timeout.as_secs()
+                    ),
+                ));
+            }
+        }
+    }
+    let ack_timer = compio::time::sleep(ack_timeout);
+    futures::pin_mut!(ack_timer);
+    match futures::future::select(inv_resp_rx, ack_timer).await {
+        futures::future::Either::Left((Ok(()), _)) => {}
+        futures::future::Either::Left((Err(_canceled), _)) => {
+            part.borrow().frozen_for_split.set(None);
+            return Err((
+                StatusCode::Internal,
+                "split: P-bulk row_invalidate ACK dropped (bulk thread aborted)".to_string(),
+            ));
+        }
+        futures::future::Either::Right(_elapsed) => {
+            part.borrow().frozen_for_split.set(None);
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "split: P-bulk row_invalidate barrier ACK timeout after {}s (bulk thread \
+                     wedged); client may retry",
+                    ack_timeout.as_secs()
+                ),
+            ));
+        }
+    }
+
     // Call multi_modify_split on manager via StreamClient.
     let mut split_ok = false;
     let mut split_err = String::new();
@@ -880,9 +996,8 @@ pub(crate) async fn handle_split_part(
     part_sc.invalidate_stream(log_stream_id);
     part_sc.invalidate_stream(row_stream_id);
     part_sc.invalidate_stream(meta_stream_id);
-    // P-bulk owns a separate StreamClient on another OS thread; signal
-    // it to invalidate its row_stream worker on the next FlushReq.
-    part.borrow().need_invalidate_row_stream.set(true);
+    // (F255 — P-bulk row_invalidate barrier was already done BEFORE
+    // multi_modify_split above; see commentary at the barrier send site.)
 
     // Narrow PS-local rg to match the manager's new left range and
     // re-evaluate has_overlap against the SSTables. Without this,

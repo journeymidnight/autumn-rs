@@ -253,8 +253,16 @@ pub(crate) async fn background_compact_loop(
                     continue;
                 }
 
-                // F104: serialize across partitions per
-                // AUTUMN_PS_MAJOR_COMPACT_PARALLELISM (default 1).
+                // F255: per-partition compact_gate FIRST — serializes vs
+                // `handle_split_part` on this partition (split holds this
+                // gate from before commit_length through multi_modify_split
+                // so no `compact_row_append` from us can race the seal).
+                let _local_gate = {
+                    let g = part.borrow().compact_gate.clone();
+                    g.acquire().await
+                };
+                // F104: PS-wide concurrency permit — limits cross-partition
+                // peak RAM (each do_compact holds ~2x SST bytes).
                 let _permit = concurrency_ctrl.acquire_compact().await;
                 // compact_inflight already latched at top of recv arm.
                 let result = do_compact(&part, compact_tbls, major).await;
@@ -335,6 +343,11 @@ pub(crate) async fn background_compact_loop(
                     let tbls = part.borrow().tables.clone();
                     if !tbls.is_empty() {
                         let last_extent = tbls.last().map(|t| t.extent_id).unwrap_or(0);
+                        // F255: per-partition compact_gate (see main arm above).
+                        let _local_gate = {
+                            let g = part.borrow().compact_gate.clone();
+                            g.acquire().await
+                        };
                         let _permit = concurrency_ctrl.acquire_compact().await;
                         metrics
                             .compact_inflight
@@ -415,6 +428,11 @@ pub(crate) async fn background_compact_loop(
                     let tbls = part.borrow().tables.clone();
                     let (compact_tbls, truncate_id) = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
                     if compact_tbls.len() >= 2 {
+                        // F255: per-partition compact_gate (see main arm above).
+                        let _local_gate = {
+                            let g = part.borrow().compact_gate.clone();
+                            g.acquire().await
+                        };
                         let _permit = concurrency_ctrl.acquire_compact().await;
                         metrics
                             .compact_inflight
@@ -1517,9 +1535,7 @@ pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<Tab
 // the single atomic commit point. Any chunks appended to row_stream
 // before that commit are orphan bytes if we crash, recoverable via the
 // pre-existing meta_stream-authoritative recovery path.
-/// F135 — route a single row_stream append through P-bulk's StreamClient if
-/// available, falling back to P-log's `part_sc` only when the bulk thread
-/// failed to spawn (legacy single-writer scenario).
+/// F135 — route a single row_stream append through P-bulk's StreamClient.
 ///
 /// **Why this matters:** flush is owned by P-bulk, which holds its own
 /// `StreamClient` with its own per-stream commit-tracking state. If
@@ -1528,37 +1544,51 @@ pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<Tab
 /// stale `commit` field hits the ExtentNode replicas, the server truncates
 /// data written by the other client (commit-protocol step 5). Result: SST
 /// bytes from one writer are silently destroyed mid-flight, surfacing later
-/// as `invalid meta_len` on PS restart.
+/// as `invalid meta_len` on PS restart (witnessed 2026-05-03).
 ///
 /// The fix is to funnel ALL row_stream appends through P-bulk's single
-/// StreamClient. Flush already does so via `FlushReq`; compaction now does
-/// so via `RowAppendReq`. P-log → P-bulk hand-off is a oneshot per request,
-/// so callers see the same `AppendResult` shape as a direct append.
+/// StreamClient. Flush does so via `FlushReq`; compaction does so via
+/// `RowAppendReq`. P-log → P-bulk hand-off is a oneshot per request, so
+/// callers see the same `AppendResult` shape as a direct append.
+///
+/// Pre-this we also kept an in-thread fallback when P-bulk failed to spawn
+/// (`row_append_tx == None`, append via P-log's `part_sc`). That kept the
+/// single-writer property by accident — flush had a matching fallback, so
+/// in the spawn-failed case both writers happened to be `part_sc`. The
+/// fallback is gone: `open_partition` returns Err on P-bulk spawn failure,
+/// so this function's contract is now type-level — `row_append_tx` is
+/// always live.
+///
+/// **F255** — `RowAppendReq` carries no invalidate flag; the invalidate is
+/// performed as a synchronous P-log → P-bulk BARRIER by `handle_split_part`
+/// before the manager seals the row_stream tail (see `RowInvalidateBarrierReq`
+/// in lib.rs). By the time `do_compact` runs, any prior split's barrier
+/// has already drained P-bulk's inflight FU to zero and invalidated
+/// `bulk_sc`'s stale per-stream worker cache, so `compact_row_append`'s
+/// append is guaranteed to land on a fresh, post-seal worker. No per-chunk
+/// flag-checking — the structural barrier replaces the lazy fetch-and-
+/// clear approach (the lazy form had a window where a FlushReq with
+/// `invalidate=false` could race a RowAppendReq with `invalidate=true`
+/// inside P-bulk's cap=2 FuturesUnordered; coco /arch found this 2026-06-02).
 async fn compact_row_append(
-    row_append_tx: &Option<futures::channel::mpsc::Sender<crate::RowAppendReq>>,
-    part_sc: &Rc<StreamClient>,
+    row_append_tx: &futures::channel::mpsc::Sender<crate::RowAppendReq>,
     row_stream_id: u64,
     sst_bytes: Bytes,
 ) -> Result<autumn_stream::AppendResult> {
-    if let Some(tx) = row_append_tx {
-        let (resp_tx, resp_rx) = futures::channel::oneshot::channel();
-        let req = crate::RowAppendReq {
-            sst_bytes,
-            row_stream_id,
-            resp_tx,
-        };
-        tx.clone()
-            .send(req)
-            .await
-            .map_err(|_| anyhow::anyhow!("P-bulk row_append channel closed"))?;
-        resp_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("P-bulk row_append response dropped"))?
-    } else {
-        // Fallback: P-bulk failed to spawn → flush also runs on P-log,
-        // so single-writer invariant is preserved by accident.
-        part_sc.append_bytes(row_stream_id, sst_bytes).await
-    }
+    let (resp_tx, resp_rx) = futures::channel::oneshot::channel();
+    let req = crate::RowAppendReq {
+        sst_bytes,
+        row_stream_id,
+        resp_tx,
+    };
+    row_append_tx
+        .clone()
+        .send(req)
+        .await
+        .map_err(|_| anyhow::anyhow!("P-bulk row_append channel closed"))?;
+    resp_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("P-bulk row_append response dropped"))?
 }
 
 // clippy false-positive: every `part.borrow_mut()` here is `drop(p)`-ed before
@@ -1765,8 +1795,7 @@ pub(crate) async fn do_compact(
             // F135: route through P-bulk's StreamClient to preserve the
             // single-writer invariant on row_stream.
             let result =
-                compact_row_append(&row_append_tx, &part_sc, row_stream_id, sst_bytes.clone())
-                    .await?;
+                compact_row_append(&row_append_tx, row_stream_id, sst_bytes.clone()).await?;
             // F169: SstReader::from_bytes parses the MetaBlock + bloom +
             // verifies CRC; ~5-10 ms for a max-chunk SST. Off-loaded too.
             let reader = compio::runtime::spawn_blocking(move || SstReader::from_bytes(sst_bytes))
@@ -1828,7 +1857,7 @@ pub(crate) async fn do_compact(
         // F135: route through P-bulk's StreamClient to preserve the
         // single-writer invariant on row_stream.
         let result =
-            compact_row_append(&row_append_tx, &part_sc, row_stream_id, sst_bytes.clone()).await?;
+            compact_row_append(&row_append_tx, row_stream_id, sst_bytes.clone()).await?;
         let reader = compio::runtime::spawn_blocking(move || SstReader::from_bytes(sst_bytes))
             .await
             .map_err(|_| anyhow!("compact final SstReader join failed"))??;
