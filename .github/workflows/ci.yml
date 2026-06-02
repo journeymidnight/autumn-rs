@@ -47,4 +47,16 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace --lib --exclude autumn-fuse
       - name: Integration tests
-        run: cargo test --workspace --tests --exclude autumn-fuse -- --test-threads=1
+        # Bump RLIMIT_MEMLOCK and nofile: integration tests spawn manager + EN
+        # threads each creating a compio io_uring runtime; rings accumulate
+        # across test boundaries (--test-threads=1 doesn't help since the
+        # spawn'd manager/EN worker threads are detached — they keep their
+        # rings until process exit). On GitHub's ubuntu-latest runner the
+        # default `ulimit -l` is 64 KB, so after ~9 tests' worth of rings,
+        # io_uring_setup returns ENOMEM → `compio::Runtime::new().unwrap()`
+        # panics with "Cannot allocate memory". Bumping memlock fixes it
+        # without rewriting the tests' setup-teardown shape.
+        run: |
+          ulimit -l unlimited || true
+          ulimit -n 65536 || true
+          cargo test --workspace --tests --exclude autumn-fuse -- --test-threads=1
