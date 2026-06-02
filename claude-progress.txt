@@ -1,74 +1,124 @@
-Date: 2026-06-01 (F250 — autumn-kvcache vLLM KVConnectorV1 adapter, Phase 3a)
+Date: 2026-06-02 (CRITICAL — flush-vs-split-drain race produced unopenable partitions)
 TaskStatus: not_completed
-Task scope: User said "开始实现" the vLLM connector (route A, native
-  KVConnectorBase_V1, daemon-less, reuse autumn-client). Design = docs/
-  autumn_kvcache_plan.md §13. Feature registered as F250 in feature_list.md.
+Task scope: Root-cause + reproduce + fix the post-restart open failure
+  surfacing as `stale_vp_offset_past_sealed_length: extent=12 offset=N
+  length=L sealed_length=19678` on partitions 15 / 29 / 34 of the
+  current cluster (4 EN, 5 presplit partitions). Cluster state was
+  produced by a fresh `cluster.sh reset 4`, so this is NEW
+  corruption, NOT historical residue.
 
-=== WHAT IS DONE (verified) ===
-  F250-A · Shared util `python/autumn_kvcache/autumn_kvcache/_keys.py`
-    (build_tenant_suffix / full_key / tenant_prefix). sglang_backend.py
-    refactored to import it (no behavior change). ALSO broadened the
-    defensive sglang import from `except ImportError` -> `except Exception`
-    (a present-but-broken sglang stack — flashinfer version-check
-    RuntimeError in this env — must not crash adapter import).
-  F250-B · `vllm_connector.py`:
-    - `AutumnKVConnector(KVConnectorBase_V1)` + `AutumnConnectorMetadata`,
-      mirrors vLLM's reference SharedStorageConnector (per-request-prefix,
-      per-layer). Defensive vLLM import (_VLLM_AVAILABLE=False fallback;
-      module imports WITHOUT vLLM installed — verified).
-    - scheduler: get_num_new_matched_tokens / update_state_after_alloc /
-      build_connector_meta / request_finished.
-    - worker: register_kv_caches / start_load_kv (sync, Phase 3a) /
-      wait_for_layer_load (noop) / save_kv_layer / wait_for_save / get_finished.
-    - `_AutumnKVStore` helper = the autumn-facing data plane (key fmt +
-      batched put_from/get_into + head existence) — vLLM/torch-free, unit-
-      testable. Key = kvc/{tenant}/vllm/{prefix_hash}/{layer_name}.
-    - torch helpers (_slot_mapping_for_blocks / _extract_layer / _inject_layer
-      / _byte_view) — run only under a real vLLM worker.
-  F250-C · `tests/test_vllm_dataplane.py` — PASSES against a real 1-node
-    cluster: align/prefix_hash purity, key format, 64KiB x 4-layer ZC
-    save/load byte-exact round-trip, exists() semantics, graceful miss.
-  Regression check: existing sglang `tests/test_smoke.py` STILL PASSES
-    (sglang=False fallback) — F250-A refactor caused no regression.
-  coco /findbugs review (deep, GPT-5.5): 4 findings, ALL FIXED + re-verified:
-    P1 #1 prefix_hash ignored LoRA/mm context -> added extra_keys
-      (_request_extra_keys folds lora+mm into the hash).
-    P1 #2 scheduler probed hardcoded "layer.0" (worker saves real layer
-      names) -> would always-miss. Fixed: layer-name-INDEPENDENT completion
-      marker (_AutumnKVStore.mark_present written in wait_for_save /
-      is_present probed by scheduler). THIS was the bug that would have
-      broken cross-instance hit entirely.
-    P1 #3 empty block_ids silently saved/loaded empty KV -> record alloc
-      blocks in update_state_after_alloc (_blocks_to_ids) + empty-slot guard
-      in build_connector_meta/start_load_kv (skip + warn, never persist zeros).
-    P2 #4 sglang clear() wiped whole tenant prefix incl vllm pool -> now
-      pool-scoped (pool_prefix(tenant,"kv")); verified in smoke log.
-    Re-ran both tests after fixes: vLLM data-plane PASS (now incl marker),
-    sglang smoke PASS (clear scoped to .../kv/).
+=== ROOT CAUSE (proved by code inspection + on-disk forensics) ===
 
-=== WHAT IS NOT DONE (why not_completed) ===
-  F250-D · vLLM e2e (the real verification of the vLLM-facing half):
-    - The connector lifecycle (scheduler/worker split, slot_mapping math,
-      extract/inject tensor ops) is WRITTEN but NOT e2e-tested — there is no
-      vLLM-running verification yet. Mirrors SharedStorageConnector but the
-      details (block_ids shape, scheduled_new_reqs fields, tensor layout) need
-      validation against a real vLLM.
-    - Blocker/decision: vLLM is NOT installed; installing into the system env
-      would likely downgrade torch 2.9.1 and BREAK the installed sglang
-      0.5.10. Plan: isolated venv. NOT yet done (awaiting user go-ahead on the
-      heavy install + a model run on the 2xH200).
-    - README "Using autumn-kvcache as vLLM L3" section: not yet written.
+  Site: crates/partition-server/src/lib.rs::flush_one_imm
+
+  `flush_one_imm` returns Ok(false) in TWO different cases:
+    (a) `imm` queue is empty — drain genuinely done.
+    (b) `imm[0]` is already claimed by background_flush_loop
+        (its ptr lives in `flushing_imm_ptrs`) — flush still in
+        progress; row_stream.append has NOT yet ACKed.
+
+  Three callers loop `flush_one_imm` and break on the first
+  Ok(false), conflating (a) and (b):
+    - flush_memtable_locked     (lib.rs:6702)  → maintenance FLUSH
+    - try_complete_freeze_drain (lib.rs:5024)  → split / merge freeze
+    - graceful-shutdown drain    (lib.rs:4980)
+
+  Concrete failure mode (matched by the on-disk state):
+    1. Memtable rotates to imm. background_flush_loop claims imm[0],
+       fires P-bulk row_stream.append. ptr inserted into
+       flushing_imm_ptrs.
+    2. Split RPC arrives. handle_split_part sets `frozen_for_split`,
+       partition_loop runs try_complete_freeze_drain.
+    3. Drain calls flush_one_imm → sees imm[0] already claimed by
+       bg flush → returns Ok(false) → drain loop breaks. drain_ack
+       sent.
+    4. handle_split_part calls part_sc.commit_length(row_stream).
+       row_stream's `last_synced` on EN replicas does NOT yet cover
+       the in-flight SST upload. commit_length returns the
+       pre-flush durable length (19678).
+    5. multi_modify_split fires with row_sealed_len=19678.
+       compute_duplicate_stream seals extent 12 at sealed_length=19678
+       in manager etcd, bumps eversion.
+    6. Background flush completes its row_stream.append: SST bytes
+       up to 28258 land all-replica-acked. P-log atomically pushes
+       new TableMeta + save_table_locs_raw writes TableLocations to
+       meta_stream referencing offsets 23838 + 26438 (past 19678).
+    7. Stream worker's invalidate_stream landed at split, but the
+       in-flight worker's cached eversion=1 is what wrote those
+       bytes — EN-side eversion stays 1, .meta sealed=0, file=28258
+       bytes (verified from /tmp/autumn-rs/d{2,3,4}/3d/extent-12.{dat,meta}).
+    8. On next PS open, recover_partition reads metaStream
+       TableLocations, hits read_bytes_from_extent at (12, 26438, 1820),
+       StreamClient sees ExtentInfo.sealed_length=19678 < 26438+1820,
+       returns the structured StaleVpOffset sentinel. Partition is
+       permanently unopenable.
+
+  Forensics summary (extent 12):
+    Manager etcd:      sealed=true, sealed_length=19678, eversion=5
+    EN .meta (V2):     sealed=false, sealed_length=0,  eversion=1
+    Physical file:     28258 bytes on all 3 replicas
+    Affected parts:    15 (rowStream 11=[12,37]), 29 (rs=27=[12]),
+                       34 (rs=32=[12])
+    Partition 24 (rs=22=[12]) opens fine because its commit_length
+    matches sealed_length exactly.
+
+=== FIX (shipped) ===
+
+  Patch: crates/partition-server/src/lib.rs
+
+  1. New helper `await_imm_fully_drained(part)` polls every 2 ms
+     until `imm.is_empty() && flushing_imm_ptrs.is_empty()`. Caller
+     contract is that the caller holds the freeze/shutdown flag so
+     no new imm can appear during the wait — drain is monotonic.
+
+  2. `flush_memtable_locked` / `try_complete_freeze_drain` /
+     graceful-drain on Ok(false): re-check
+     `imm.is_empty() && flushing_imm_ptrs.is_empty()`. If truly
+     done, break. Otherwise sleep 2 ms and continue. Defensive
+     `await_imm_fully_drained` at the very end as a sentinel
+     against future regressions.
+
+  Build: `cargo build -p autumn-partition-server` PASSES.
+
+=== VERIFICATION STILL OWED (this is why TaskStatus=not_completed) ===
+
+  - Did NOT write a deterministic integration test that drives the
+    race (would need a way to pause background_flush_loop's
+    row_stream.append mid-flight + then fire SPLIT — current PS
+    infra has no such instrumentation). The fix is high-confidence
+    by code inspection + matches the on-disk evidence exactly, but
+    a regression-guard test should be added.
+  - Did NOT run the full test suite — needs `cargo test --workspace`
+    to confirm no other test breaks under the new drain semantics
+    (the helper polls 2 ms; existing tests don't depend on
+    "Ok(false) means done").
+  - The CORRUPTED ON-DISK STATE is NOT cleaned up by this fix. The
+    fix prevents NEW occurrences. Recovery for the 3 broken
+    partitions requires a one-off metaStream TableLocations rewrite
+    that excludes the SSTs past sealed_length. NOT IMPLEMENTED —
+    document for ops + run `cluster.sh reset 4` for the test cluster.
+  - Bug2-trace warn-log `BUG2 UNDER-SEAL` (extent_node.rs:3107)
+    catches the SHAPE on apply, but apply never happened in this
+    failure (EN never received the seal). Consider extending the
+    trace to fire when commit_length is queried while
+    flushing_imm_ptrs is non-empty.
 
 === NEXT STEPS ===
-  1. Address any coco /findbugs P0/P1 in vllm_connector.py.
-  2. Isolated venv: pip install a vLLM version compatible with the GPU; read
-     the INSTALLED KVConnectorBase_V1 to reconcile any signature drift vs the
-     v0.11.0 API this was coded against.
-  3. e2e: two `vllm serve` instances + --kv-transfer-config AutumnKVConnector;
-     assert 2nd instance gets cross-instance prefix-cache hit from autumn.
-  4. README + flip F250 passes -> completed.
 
-Env: 2xH200, torch 2.9.1+cu129, sglang 0.5.10 installed, vLLM NOT installed.
-Data plane reused: autumn.BatchClient.get_into/put_from + Client.batch_head +
-  _bridge (run/run_on/new_loop). Persistence only via partition
-  (feedback_no_parallel_data_plane). Host clean, no leftover daemons.
+  1. cargo test --workspace — confirm no regression.
+  2. Add an integration test using a test-only instrumentation
+     hook (e.g. AUTUMN_PS_TEST_FLUSH_PAUSE env that pauses
+     background_flush_loop's row_stream.append for N ms) so the
+     race is deterministic. Without instrumentation, repro is
+     timing-dependent.
+  3. Document the new invariant in
+     crates/partition-server/CLAUDE.md (programming notes 10
+     F148-A is the closest existing — add a note 16: drain-vs-flush
+     ordering invariant).
+  4. Document a one-off recovery procedure for the 3 broken
+     partitions (or just nuke the cluster — it's a dev env).
+  5. Flip TaskStatus=completed after #1 + #3.
+
+Env: macOS, 4-EN cluster on tmpfs (/tmp/autumn-rs), main branch
+  past commit 846c410 (CI clippy cleanup), CLAUDE.md F250 work
+  was the previous task — unrelated to this bug.

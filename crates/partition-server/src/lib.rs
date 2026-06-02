@@ -668,8 +668,12 @@ pub(crate) struct PartitionData {
     /// - REMOVE at the bottom of `commit_flush_outcome` (synchronous,
     ///   inside the same `borrow_mut` block that pops imm.front).
     /// - A duplicate claim attempt sees the ptr already present and
-    ///   returns Ok(false) — the caller treats it as "nothing to flush"
-    ///   and moves on. The other path's commit will eventually clear it.
+    ///   returns `FlushStep::Busy` — the caller MUST wait + retry, never
+    ///   treat it as "drained". (Pre-2026-06-02 fix this returned
+    ///   `Ok(false)` indistinguishable from "imm empty" and the split
+    ///   freeze-drain ack'd before the in-flight row_stream.append landed
+    ///   — see `FlushStep` docstring for the resulting
+    ///   `stale_vp_offset_past_sealed_length` failure mode.)
     flushing_imm_ptrs: RefCell<HashSet<usize>>,
     flush_tx: mpsc::UnboundedSender<()>,
     compact_tx: mpsc::Sender<bool>,
@@ -4984,8 +4988,12 @@ async fn drain_and_shutdown(
         }
         loop {
             match flush_one_imm(part).await {
-                Ok(true) => continue,
-                Ok(false) => break,
+                Ok(FlushStep::Flushed) => continue,
+                Ok(FlushStep::Empty) => break,
+                Ok(FlushStep::Busy) => {
+                    compio::time::sleep(FLUSH_BUSY_RETRY_INTERVAL).await;
+                    continue;
+                }
                 Err(e) => {
                     tracing::error!(part_id, "graceful drain flush_one_imm: {e:#}");
                     break;
@@ -5039,8 +5047,18 @@ async fn try_complete_freeze_drain(
     let mut drain_err: Option<String> = None;
     loop {
         match flush_one_imm(part).await {
-            Ok(true) => continue,
-            Ok(false) => break,
+            Ok(FlushStep::Flushed) => continue,
+            Ok(FlushStep::Empty) => break,
+            Ok(FlushStep::Busy) => {
+                // Another path (typically background_flush_loop) is mid-
+                // flush of imm[0] — its row_stream.append has NOT yet ACKed.
+                // Acking the drain here would let handle_split_part capture
+                // commit_length below the in-flight SST end, producing the
+                // stale_vp_offset_past_sealed_length partition-open failure.
+                // Wait for the claim to release + re-check.
+                compio::time::sleep(FLUSH_BUSY_RETRY_INTERVAL).await;
+                continue;
+            }
             Err(e) => {
                 let msg = format!("{e:#}");
                 tracing::error!(part_id, "freeze drain flush_one_imm: {msg}");
@@ -6660,6 +6678,39 @@ async fn commit_flush_outcome_inner(
     Ok(())
 }
 
+/// Outcome of one `flush_one_imm` call. Replaces the historical
+/// `Result<bool>` whose `Ok(false)` was AMBIGUOUS: it meant "imm queue
+/// is empty" (drain done) AND "imm[0] is already being flushed by
+/// another path" (drain NOT done — a row_stream.append is in flight).
+///
+/// The ambiguity caused the freeze-drain in `try_complete_freeze_drain`
+/// to ack split's `frozen_for_split` BEFORE `background_flush_loop`'s
+/// in-flight row_stream.append had landed. `handle_split_part` then
+/// captured `commit_length(row_stream)` below the about-to-ack SST end;
+/// the manager sealed the row_stream tail at that stale length, the
+/// flush completed and published a `TableLocations` checkpoint pointing
+/// past `sealed_length`, and the next PS open failed with
+/// `stale_vp_offset_past_sealed_length` — partition permanently
+/// un-openable. The fix replaces the `bool` with this explicit
+/// three-way enum so callers must handle the "Busy" case by waiting,
+/// not by treating it as "done".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlushStep {
+    /// One imm was flushed (Phase 2 ran + checkpoint published). Caller
+    /// should re-call to attempt the next imm.
+    Flushed,
+    /// `imm` queue is empty. The drain loop is genuinely done. Because
+    /// `commit_flush_outcome` removes the `flushing_imm_ptrs` claim in
+    /// the same `borrow_mut` block that pops `imm.front()`, an empty
+    /// queue also implies no outstanding claim on any *queued* imm.
+    Empty,
+    /// `imm[0]` is currently being flushed by another path (typically
+    /// `background_flush_loop`). We did NOT run a flush this call;
+    /// caller MUST wait briefly and re-call rather than break — the
+    /// row_stream.append behind this claim has not yet ACKed.
+    Busy,
+}
+
 /// Single-imm flush (legacy back-compat for `flush_memtable_locked`,
 /// `handle_split_part`, and test helpers). After F197, this is just
 /// `run_flush_async_phase` + `commit_flush_outcome` composed; the
@@ -6667,37 +6718,38 @@ async fn commit_flush_outcome_inner(
 ///
 /// **Claim-by-ptr invariant**: before running Phase 2 we record the
 /// imm's `Arc::as_ptr()` in `flushing_imm_ptrs`. If the front imm is
-/// already being flushed by `background_flush_loop`, return Ok(false)
-/// so the caller (`flush_memtable_locked`'s drain loop) moves on
-/// instead of building a duplicate SST. `commit_flush_outcome` is the
-/// pair that REMOVES the ptr.
-pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
+/// already being flushed by `background_flush_loop`, return
+/// `FlushStep::Busy` so the caller waits + retries. `commit_flush_outcome`
+/// is the pair that REMOVES the ptr (atomic with `imm.pop_front()`).
+pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<FlushStep> {
     let imm_mem = {
         let p = part.borrow();
         let imm = match p.imm.front().cloned() {
             Some(m) => m,
-            None => return Ok(false),
+            None => return Ok(FlushStep::Empty),
         };
         let ptr = Arc::as_ptr(&imm) as usize;
         let mut inflight = p.flushing_imm_ptrs.borrow_mut();
         if inflight.contains(&ptr) {
-            // Already being flushed by another path (typically
-            // background_flush_loop reached imm[0] first). The other
-            // path's commit will publish the SST; we treat this as
-            // "no-op" and let the caller proceed.
-            return Ok(false);
+            return Ok(FlushStep::Busy);
         }
         inflight.insert(ptr);
         imm
     };
     let outcome = run_flush_async_phase(part.clone(), imm_mem).await?;
     commit_flush_outcome(part, outcome).await?;
-    Ok(true)
+    Ok(FlushStep::Flushed)
 }
 
 // F197 removed `flush_one_imm_local` — the in-thread fallback now
 // lives inline in `run_flush_async_phase` (the `req_tx_opt == None`
 // branch).
+
+/// How long to sleep before retrying after `FlushStep::Busy`. Matches
+/// the F178 coalescer's 2 ms cadence so on the happy path we re-poll at
+/// most ~1–2 times before either claiming a freshly-released imm
+/// ourselves or observing `Empty`.
+const FLUSH_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(2);
 
 pub(crate) async fn flush_memtable_locked(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
     {
@@ -6706,13 +6758,14 @@ pub(crate) async fn flush_memtable_locked(part: &Rc<RefCell<PartitionData>>) -> 
     }
     let mut any = false;
     loop {
-        match flush_one_imm(part).await {
-            Ok(true) => {
+        match flush_one_imm(part).await? {
+            FlushStep::Flushed => {
                 any = true;
-                continue;
             }
-            Ok(false) => break,
-            Err(e) => return Err(e),
+            FlushStep::Empty => break,
+            FlushStep::Busy => {
+                compio::time::sleep(FLUSH_BUSY_RETRY_INTERVAL).await;
+            }
         }
     }
     Ok(any)
