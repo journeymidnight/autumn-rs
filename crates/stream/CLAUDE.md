@@ -1133,14 +1133,84 @@ sufficient (and cheaper than DashMap).
     reset-orphans-high-waiters). Reverted whole: a power-loss-only,
     all-replica-masked, never-manifested bug does not justify a self-bug-
     producing hand-rolled state machine in the hottest concurrency path (Items
-    2/4 discipline). io_uring CQE order is genuinely unordered (no IOSQE_IO_LINK/
-    DRAIN in this code), so the accounting hole is real — but the 2 kept unit
-    tests demonstrate it by HAND-ORDERING completions, NOT by real io_uring
-    reordering, and real loss additionally needs power-loss in the µs window on
-    enough replicas. **If production ever demands power-loss single-replica
-    durability here, do it as a SEPARATE feature: per-extent SERIAL fsync
-    accounting (RocksDB single-sequential-WAL-writer model — gap-free prefix by
-    construction), NOT state bolted onto the concurrent coalescer.**
+    2/4 discipline). io_uring CQE order is genuinely unordered per spec (no
+    IOSQE_IO_LINK / DRAIN in this code), so the accounting hole is real on
+    paper — but the 2 kept unit tests demonstrate it by HAND-ORDERING
+    completions, NOT by real io_uring reordering, and real loss additionally
+    needs power-loss in the µs window on enough replicas. **If production ever
+    demands power-loss single-replica durability here, do it as a SEPARATE
+    feature: per-extent SERIAL fsync accounting (RocksDB single-sequential-WAL-
+    writer model — gap-free prefix by construction), NOT state bolted onto the
+    concurrent coalescer.**
+
+    **ARCHITECTURAL REACHABILITY ANALYSIS (2026-06-02 — strengthens the defer
+    decision from "rare" to "structurally near-unreachable under current
+    invariants").** The "CQEs can complete OUT OF ORDER" assumption above is
+    formally correct per the io_uring spec but does not hold for autumn-rs's
+    actual append path. Three layers stack to make same-extent page-cache
+    ordering structurally enforced rather than statistically likely:
+
+    1. **io_uring inline-FIFO for buffered writes.** `vfs_write_iter` →
+       `generic_file_write_iter` for buffered writes only touches page cache —
+       non-blocking in the common case, so io_uring's `io_uring_enter` syscall
+       processes the SQE INLINE in the submitter thread's kernel context
+       rather than punting to an io_wq worker. Inline processing is strictly
+       FIFO over the SQ: A and B are run to completion (page-cache memcpy +
+       CQE emission) one after the other in the same kernel-mode thread.
+    2. **i_rwsem serialises same-inode writes** even when punted. If A
+       does get punted to io_wq (memory pressure / contention), B's inline
+       path still has to take `inode_lock` in write mode, which serialises
+       against A's worker. Whichever wins the lock runs to completion first;
+       the loser waits. Race window narrows to "which kthread grabs i_rwsem
+       first" — not "both run truly concurrently".
+    3. **Single-writer SQE submission per extent.** compio is one
+       io_uring per OS thread. Both log_stream (P-log task) and row_stream
+       (P-bulk thread) are single-writer per extent by design — no two tasks
+       on the same thread submit pwrite SQEs to the same extent concurrently.
+       SQ submission order = single-thread `await`-sequenced order = strictly
+       in-order. The `FuturesUnordered` of inflight batches the note
+       worries about (`frames straddling read-burst boundaries`) lives in
+       handle_connection's CQ-side, NOT in the SQ-side — SQ submission for
+       same extent is always serial.
+
+    Combining: SQ FIFO submission + kernel inline FIFO processing + i_rwsem
+    serial fallback ⇒ **A's bytes are in page cache strictly before B's bytes
+    are written, for every same-extent A-then-B pair on this code path**. The
+    CQE-reorder assumption is voided by construction. The "plain store
+    regresses pending_fsync" hazard the original note 24 identified is then a
+    formal code-review finding that has no concrete trigger.
+
+    **Architectural assumptions this analysis depends on (any future change
+    that violates these MUST re-validate the race + likely needs the
+    deferred RocksDB-leaderless fix):**
+
+    - **Buffered writes via `vfs_write_iter`.** Switching any extent to
+      `O_DIRECT` removes inline processing — DIO writes always punt to io_wq.
+    - **`IORING_SETUP_DEFAULT` (NOT SQPOLL).** SQPOLL mode replaces inline
+      processing with a dedicated kernel poller thread that has its own
+      scheduling — same-thread FIFO no longer applies.
+    - **Single OS thread per io_uring** (compio thread-per-core invariant).
+      A multi-thread runtime sharing one ring would lose the SQ-side FIFO
+      property.
+    - **Single-writer per extent within a thread.** Today: P-log owns
+      log_stream, P-bulk owns row_stream; no thread submits two
+      concurrent pwrites on the same extent. Any future change that
+      multiplexes writers onto the same extent on the same thread
+      (e.g., a fan-out append API for parallel SST builders) reintroduces
+      the `FuturesUnordered` same-extent contention this note 24 originally
+      modelled.
+    - **Append-only writes** (no partial-page RMW). Append-only into reserved
+      extent.len means each pwrite is into freshly-allocated pages — no
+      `IOCB_NOWAIT` fail-and-punt for missing page reads.
+
+    The original "near-precluded in practice" wording understated the case:
+    on the current code path the race is **structurally voided**, not just
+    statistically rare. The defer is correct because the bug is unreachable
+    under current invariants, not because the probability is low enough to
+    tolerate. If any of the five assumptions above is broken in a future
+    refactor, **the deferred RocksDB-leaderless-style coalescer redesign
+    (Issue #14627 ping-pong + LSN watermark) becomes load-bearing** —
+    re-validate the race on the new architecture before shipping.
 
 ---
 
