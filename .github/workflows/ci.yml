@@ -25,7 +25,15 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y etcd-server protobuf-compiler
+          # libfuse3-dev: needed by `fuser` (transitively pulled via
+          # autumn-ioring → autumn-fuse{default-features=false}). cargo's
+          # feature unification still resolves `fuser` even though we
+          # `--exclude autumn-fuse` from build/clippy/test — the build
+          # script panics without fuse3.pc on PKG_CONFIG_PATH. THIS was
+          # the source of the "Clippy failed" misnomer across 120+ runs:
+          # the panic happened during dependency compilation in the
+          # clippy step, masquerading as a clippy failure.
+          sudo apt-get install -y etcd-server protobuf-compiler libfuse3-dev
       - name: Format (gating, FCI-01)
         run: cargo fmt --all -- --check
       # FCI-01 + FCI-02: gating on all targets (lib + bins + tests + examples +
