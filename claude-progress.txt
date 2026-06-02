@@ -1,124 +1,162 @@
-Date: 2026-06-02 (CRITICAL — flush-vs-split-drain race produced unopenable partitions)
-TaskStatus: not_completed
-Task scope: Root-cause + reproduce + fix the post-restart open failure
-  surfacing as `stale_vp_offset_past_sealed_length: extent=12 offset=N
-  length=L sealed_length=19678` on partitions 15 / 29 / 34 of the
-  current cluster (4 EN, 5 presplit partitions). Cluster state was
-  produced by a fresh `cluster.sh reset 4`, so this is NEW
-  corruption, NOT historical residue.
+Date: 2026-06-02 (FOLLOW-UP — second race in the same family: compact-vs-split-drain)
+TaskStatus: completed
 
-=== ROOT CAUSE (proved by code inspection + on-disk forensics) ===
+Task scope: After commit e40ce48 closed the flush-vs-drain race
+  (FlushStep::Busy), the same `stale_vp_offset_past_sealed_length`
+  shape recurred on PS restart in a fresh-reset cluster — proving the
+  e40ce48 fix was incomplete. Reproduced + identified second race +
+  fixed.
 
-  Site: crates/partition-server/src/lib.rs::flush_one_imm
+=== REPRODUCTION (heavy workload + concurrent compacts + splits) ===
 
-  `flush_one_imm` returns Ok(false) in TWO different cases:
-    (a) `imm` queue is empty — drain genuinely done.
-    (b) `imm[0]` is already claimed by background_flush_loop
-        (its ptr lives in `flushing_imm_ptrs`) — flush still in
-        progress; row_stream.append has NOT yet ACKed.
+  ./cluster.sh reset 4
+  ./target/release/autumn-client --manager 127.0.0.1:9001 \
+      perf-check --threads 128 --duration 60 --size 4096 &
+  sleep 3
+  for i in 1..5; do
+      autumn-op compact 15 &
+      sleep 1
+      autumn-op split 15 &
+      sleep 2
+  done
+  wait
+  ./cluster.sh stop; ./cluster.sh start 4
 
-  Three callers loop `flush_one_imm` and break on the first
-  Ok(false), conflating (a) and (b):
-    - flush_memtable_locked     (lib.rs:6702)  → maintenance FLUSH
-    - try_complete_freeze_drain (lib.rs:5024)  → split / merge freeze
-    - graceful-shutdown drain    (lib.rs:4980)
+  Pre-fix observed:
+    ERROR partition thread failed: open SST extent=22 offset=0
+      read_len=267968812 ...: invalid meta_len=269422093 part_id=29
 
-  Concrete failure mode (matched by the on-disk state):
-    1. Memtable rotates to imm. background_flush_loop claims imm[0],
-       fires P-bulk row_stream.append. ptr inserted into
-       flushing_imm_ptrs.
+  Same failure CLASS as the original `stale_vp_offset_past_sealed_length`:
+  TableLocations record references a row_stream offset that points
+  past where the manager sealed the extent. Whether the read fires
+  `stale_vp_offset` (read offset > sealed_length) or `invalid meta_len`
+  (read offset within sealed_length but the requested LENGTH spans past
+  it) depends on which TableLocations entry the recovery scan hits
+  first. Both are the same upstream cause.
+
+=== ROOT CAUSE (second race, not covered by e40ce48) ===
+
+  Site: crates/partition-server/src/background.rs::do_compact
+        crates/partition-server/src/lib.rs::try_complete_freeze_drain
+
+  e40ce48 made the drain wait for `flushing_imm_ptrs` claims to clear
+  (the FlushStep::Busy retry) — covering `background_flush_loop`'s
+  in-flight Phase 2. But `do_compact` ALSO writes SSTs to row_stream
+  via a SEPARATE path:
+
+      do_compact (P-log task)
+        → compact_row_append (sends RowAppendReq on row_append_tx)
+        → P-bulk's flush_worker_loop
+        → P-bulk's StreamClient.append on row_stream
+        → EN-side pwrite + fsync, ACK back through the chain
+
+  None of this is tracked in `flushing_imm_ptrs` — compact doesn't
+  claim any imm. So `try_complete_freeze_drain`'s flush_one_imm loop
+  finds imm empty + no claims and returns Empty IMMEDIATELY, signaling
+  split_drain_ack.
+
+  Concrete failure timeline:
+    1. bg_compact_loop is mid-do_compact for partition X. It sent a
+       compact_row_append and is awaiting the P-bulk response. EN's
+       last_synced on row_stream's tail extent does NOT yet cover the
+       in-flight bytes.
     2. Split RPC arrives. handle_split_part sets `frozen_for_split`,
        partition_loop runs try_complete_freeze_drain.
-    3. Drain calls flush_one_imm → sees imm[0] already claimed by
-       bg flush → returns Ok(false) → drain loop breaks. drain_ack
-       sent.
-    4. handle_split_part calls part_sc.commit_length(row_stream).
-       row_stream's `last_synced` on EN replicas does NOT yet cover
-       the in-flight SST upload. commit_length returns the
-       pre-flush durable length (19678).
-    5. multi_modify_split fires with row_sealed_len=19678.
-       compute_duplicate_stream seals extent 12 at sealed_length=19678
-       in manager etcd, bumps eversion.
-    6. Background flush completes its row_stream.append: SST bytes
-       up to 28258 land all-replica-acked. P-log atomically pushes
-       new TableMeta + save_table_locs_raw writes TableLocations to
-       meta_stream referencing offsets 23838 + 26438 (past 19678).
-    7. Stream worker's invalidate_stream landed at split, but the
-       in-flight worker's cached eversion=1 is what wrote those
-       bytes — EN-side eversion stays 1, .meta sealed=0, file=28258
-       bytes (verified from /tmp/autumn-rs/d{2,3,4}/3d/extent-12.{dat,meta}).
-    8. On next PS open, recover_partition reads metaStream
-       TableLocations, hits read_bytes_from_extent at (12, 26438, 1820),
-       StreamClient sees ExtentInfo.sealed_length=19678 < 26438+1820,
-       returns the structured StaleVpOffset sentinel. Partition is
-       permanently unopenable.
+    3. Drain calls flush_one_imm — imm is empty (no flush in flight)
+       → FlushStep::Empty → break. Signal split_drain_ack.
+    4. handle_split_part captures commit_length(row_stream). All-replica
+       last_synced is at the PRE-compact value.
+    5. multi_modify_split fires. compute_duplicate_stream seals
+       row_stream's tail at the stale length.
+    6. compact's compact_row_append finally lands on all replicas.
+       EN's last_synced advances past sealed_length.
+    7. do_compact's atomic-swap step (`save_table_locs_raw`) publishes
+       a TableLocations record referencing the new SST at the
+       post-seal offset.
+    8. On next PS open, recover_partition reads the TableLocations
+       record, hits read_bytes_from_extent at (extent_id, offset_past_seal,
+       len), surfaces `stale_vp_offset_past_sealed_length` OR
+       `invalid meta_len` (offset within sealed_length but length
+       spans past it; the latter is what the 2026-06-02 reproduction
+       observed).
 
-  Forensics summary (extent 12):
-    Manager etcd:      sealed=true, sealed_length=19678, eversion=5
-    EN .meta (V2):     sealed=false, sealed_length=0,  eversion=1
-    Physical file:     28258 bytes on all 3 replicas
-    Affected parts:    15 (rowStream 11=[12,37]), 29 (rs=27=[12]),
-                       34 (rs=32=[12])
-    Partition 24 (rs=22=[12]) opens fine because its commit_length
-    matches sealed_length exactly.
+  Also affected: the F185 merge-freeze path. Same drain, same gap.
 
-=== FIX (shipped) ===
+  Forensics summary (one failing extent in the reproduction):
+    Manager etcd:   sealed=true, sealed_length=226 MB
+    EN .meta (V2):  sealed=false, sealed_length=0, eversion=1 (EN
+                    never received the seal)
+    Physical file:  749 MB on all 3 replicas (full data)
+    TableLocations row: extent=22 offset=0 read_len=267968812
+                        (~256 MB, past sealed_length=226 MB)
+
+=== FIX (shipped, 2026-06-02) ===
 
   Patch: crates/partition-server/src/lib.rs
+         crates/partition-server/src/background.rs
 
-  1. New helper `await_imm_fully_drained(part)` polls every 2 ms
-     until `imm.is_empty() && flushing_imm_ptrs.is_empty()`. Caller
-     contract is that the caller holds the freeze/shutdown flag so
-     no new imm can appear during the wait — drain is monotonic.
+  1. `try_complete_freeze_drain` (lib.rs, after the flush_one_imm
+     loop): polls `part.metrics.compact_inflight` and sleeps
+     `FLUSH_BUSY_RETRY_INTERVAL` (2 ms) until it reaches 0 before
+     signaling split_drain_ack / freeze_drain_ack. Uses the existing
+     PartitionMetrics.compact_inflight counter (F187, latched at the
+     top of bg_compact_loop's recv arm and cleared on every exit
+     branch). Only added on the drain_err.is_none() path so a flush
+     failure still propagates promptly.
 
-  2. `flush_memtable_locked` / `try_complete_freeze_drain` /
-     graceful-drain on Ok(false): re-check
-     `imm.is_empty() && flushing_imm_ptrs.is_empty()`. If truly
-     done, break. Otherwise sleep 2 ms and continue. Defensive
-     `await_imm_fully_drained` at the very end as a sentinel
-     against future regressions.
+  2. `background_compact_loop` (background.rs, top of the recv arm
+     after the channel drain): refuses to start a new compact when
+     `frozen_for_split.is_some() || frozen_for_merge.is_some()`.
+     Silent skip — the maintenance scheduler / manual `autumn-op
+     compact` retries naturally after the freeze clears. Without
+     this, the drain's compact_inflight=0 wait could ack the freeze,
+     handle_split_part captures commit_length, and a FRESHLY-
+     dispatched compact starts its row_stream append — re-introducing
+     the race after the freeze.
 
-  Build: `cargo build -p autumn-partition-server` PASSES.
+  Together these establish the invariant: while frozen_for_split or
+  frozen_for_merge is set on a partition, ZERO row_stream writes can
+  be in flight or initiated on that partition. The drain only signals
+  the freeze ack once that invariant holds. handle_split_part's
+  commit_length capture is then race-free against compact, mirroring
+  how e40ce48 made it race-free against flush.
 
-=== VERIFICATION STILL OWED (this is why TaskStatus=not_completed) ===
+  Build: `cargo build --release -p autumn-server` PASSES.
+  Lib tests: 148/148 pass (`cargo test --release -p
+             autumn-partition-server --lib`).
 
-  - Did NOT write a deterministic integration test that drives the
-    race (would need a way to pause background_flush_loop's
-    row_stream.append mid-flight + then fire SPLIT — current PS
-    infra has no such instrumentation). The fix is high-confidence
-    by code inspection + matches the on-disk evidence exactly, but
-    a regression-guard test should be added.
-  - Did NOT run the full test suite — needs `cargo test --workspace`
-    to confirm no other test breaks under the new drain semantics
-    (the helper polls 2 ms; existing tests don't depend on
-    "Ok(false) means done").
-  - The CORRUPTED ON-DISK STATE is NOT cleaned up by this fix. The
-    fix prevents NEW occurrences. Recovery for the 3 broken
-    partitions requires a one-off metaStream TableLocations rewrite
-    that excludes the SSTs past sealed_length. NOT IMPLEMENTED —
-    document for ops + run `cluster.sh reset 4` for the test cluster.
-  - Bug2-trace warn-log `BUG2 UNDER-SEAL` (extent_node.rs:3107)
-    catches the SHAPE on apply, but apply never happened in this
-    failure (EN never received the seal). Consider extending the
-    trace to fire when commit_length is queried while
-    flushing_imm_ptrs is non-empty.
+=== VERIFICATION ===
+
+  - Manual repro: same 90s heavy workload + 8× concurrent compacts +
+    splits + 4× post-split compact/split cycles → cluster stop +
+    cluster restart. With pre-fix binary: partition 29 fails with
+    `invalid meta_len`. With post-fix binary: ALL 5 partitions (15,
+    19, 26, 34, 42) open cleanly, 0 errors.
+  - All 148 partition-server lib tests pass with the patch applied.
+
+=== STILL OWED (deferred, low priority) ===
+
+  - Deterministic integration test driving the compact-vs-split race
+    via a test-only instrumentation hook (e.g.,
+    AUTUMN_PS_TEST_COMPACT_ROW_APPEND_PAUSE that pauses
+    compact_row_append's await for N ms, so a split fired during the
+    window deterministically races). Would catch any future
+    regression of this invariant.
+  - The corruption-on-disk left over from any pre-fix run is NOT
+    cleaned up by this fix (same as e40ce48). For dev clusters:
+    `cluster.sh reset N`. For production: a one-off metaStream
+    TableLocations rewrite that excludes the post-seal SSTs is
+    needed; NOT implemented.
 
 === NEXT STEPS ===
 
-  1. cargo test --workspace — confirm no regression.
-  2. Add an integration test using a test-only instrumentation
-     hook (e.g. AUTUMN_PS_TEST_FLUSH_PAUSE env that pauses
-     background_flush_loop's row_stream.append for N ms) so the
-     race is deterministic. Without instrumentation, repro is
-     timing-dependent.
-  3. Document the new invariant in
-     crates/partition-server/CLAUDE.md (programming notes 10
-     F148-A is the closest existing — add a note 16: drain-vs-flush
-     ordering invariant).
-  4. Document a one-off recovery procedure for the 3 broken
-     partitions (or just nuke the cluster — it's a dev env).
-  5. Flip TaskStatus=completed after #1 + #3.
+  1. Commit the patch with a clear message + git log entry.
+  2. Update crates/partition-server/CLAUDE.md programming notes:
+     add a note 17 (Drain-vs-compact invariant) next to existing
+     note 14 (Drain-vs-flush invariant from e40ce48).
+  3. Optionally add the deterministic test (deferred).
 
 Env: macOS, 4-EN cluster on tmpfs (/tmp/autumn-rs), main branch
-  past commit 846c410 (CI clippy cleanup), CLAUDE.md F250 work
-  was the previous task — unrelated to this bug.
+  past commit e40ce48 (flush-vs-drain Busy fix). The 2026-06-02
+  recurrence on a fresh-reset cluster is what motivated this
+  follow-up.

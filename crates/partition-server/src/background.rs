@@ -157,6 +157,30 @@ pub(crate) async fn background_compact_loop(
                         major = true;
                     }
                 }
+                // 2026-06-02 fix — refuse to start a new compact while a
+                // split / merge freeze is in flight. `try_complete_freeze_drain`
+                // waits for `compact_inflight == 0` before acking the freeze,
+                // and `do_compact` writes SSTs to row_stream after the
+                // wait-window would have started. Without this gate the
+                // sequence is: freeze set → drain waits on existing compact
+                // (correct) → existing compact finishes, inflight=0 → drain
+                // acks → split captures commit_length → a freshly-dispatched
+                // compact starts a row_stream append → seal captures stale
+                // length, compact's later TableLocations record points past
+                // it (`stale_vp_offset_past_sealed_length` / `invalid
+                // meta_len` on next PS open). The skip is silent; the
+                // compact dispatcher (maintenance scheduler / manual
+                // `autumn-op compact`) retries after the freeze clears.
+                {
+                    let p = part.borrow();
+                    if p.frozen_for_split.get().is_some() || p.frozen_for_merge.get().is_some() {
+                        // Defer; the dispatcher will retry once the freeze
+                        // clears (region_sync_loop drops + reopens the
+                        // partition on split-survivor / merge-victim, or
+                        // partition_loop clears the flag on rollback).
+                        continue;
+                    }
+                }
                 let tbls = part.borrow().tables.clone();
                 let metrics = part.borrow().metrics.clone();
                 // F189-fix MED-4: latch compact_inflight=1 at dequeue,

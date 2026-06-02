@@ -5067,6 +5067,33 @@ async fn try_complete_freeze_drain(
             }
         }
     }
+    // 2026-06-02 fix — wait for in-flight `do_compact` to finish before acking
+    // the freeze. `do_compact` writes new SSTs to row_stream via
+    // `compact_row_append → P-bulk` and `row_append_tx` is not tracked by the
+    // flush_one_imm / flushing_imm_ptrs mechanism above. Without this wait,
+    // handle_split_part captures `commit_length(row_stream)` while compact's
+    // RowAppendReq is still in flight: EN's `last_synced` doesn't yet cover
+    // the in-flight bytes, the manager seals at the stale length, compact
+    // later finishes and publishes a TableLocations record referencing the
+    // SST past sealed_length. Next PS open hits the
+    // `stale_vp_offset_past_sealed_length` / `invalid meta_len` shape and the
+    // partition is permanently un-openable. (e40ce48 closed the same shape
+    // for flushes via FlushStep::Busy; this closes the compact arm. Compact
+    // dispatch is itself gated on `frozen_for_split` / `frozen_for_merge` in
+    // `background_compact_loop` so no NEW compact can start during the wait.)
+    if drain_err.is_none() {
+        loop {
+            let inflight = part
+                .borrow()
+                .metrics
+                .compact_inflight
+                .load(std::sync::atomic::Ordering::Acquire);
+            if inflight == 0 {
+                break;
+            }
+            compio::time::sleep(FLUSH_BUSY_RETRY_INTERVAL).await;
+        }
+    }
     // Merge ack: external RPC resp.
     let merge_ack = part.borrow().freeze_drain_ack.borrow_mut().take();
     if let Some(ack) = merge_ack {
