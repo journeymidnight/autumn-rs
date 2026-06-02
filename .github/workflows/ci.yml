@@ -13,6 +13,15 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Invalidate the cache one-shot: 120+ failed runs in a row likely
+          # poisoned the cached `target/` with stale clippy fingerprints (a
+          # known footgun — clippy can short-circuit on incremental rmeta
+          # matches and skip re-checking lints, so a one-time bad cache
+          # masks fixed source). Bump this string to invalidate again.
+          prefix-key: "v2-clippy-1.96-clean"
+          # Don't keep storing the broken state forward.
+          cache-on-failure: false
       - name: Install system deps
         run: |
           sudo apt-get update
