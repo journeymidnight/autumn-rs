@@ -4211,3 +4211,68 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   - **多 SQE 并发写同一 fd**:文档化为 POSIX-style 单写。多写共用 `ring_fds` HashMap 的并发会让 extent map 缓存 lost-update;真要支持需加 per-fd 锁。
 - **Acceptance:** `cargo build -p autumn-ioring --features daemon` clean;clippy `-p autumn-ioring --features daemon --all-targets -- -D warnings` EXIT=0;workspace gate `--workspace --exclude autumn-fuse --all-targets -- -D warnings` EXIT=0;fmt clean;ioring 单测 76 passed(含 `fuse_write::tests` 7 个 plan_write 纯函数:append-empty/split-by-cap/cap-at-next-extent/RMW-inside/RMW-end-grows/empty-write/upsert);**e2e `system_ioring_fuse::f242_ioring_writes_fuse_file` PASS on a real cluster (2.87s)** —— 仅 seed 空 inode+dirent,daemon 侧 `fuse_write::write_into` 写 10 MiB(8M 整 extent ZC + 2M 续段)+ 100B RMW;断言 daemon read 全字节命中、独立 Open 重新 load_extent_map 看到正确 size+2 extent、fuse-mount 侧 `autumn_fuse::read::read` 看到 daemon 写的字节(跨接口字节一致,F242 与 fuse mount path 共享同一份 KV layout)。同跑 f248 read e2e 不退化(2 个 e2e 一起 3.17s PASS)。
 - **passes:** true (2026-05-26).
+
+---
+
+## P12 — autumn-kvcache vLLM connector (F250)
+
+### F250 · autumn-kvcache vLLM `KVConnectorV1` adapter (Phase 3a — CPU-offload path)
+- **Trigger:** F216 shipped the sglang HiCache L3 backend; the same partition data
+  plane (`autumn.BatchClient` + `_bridge`) can serve vLLM, but vLLM's offload
+  contract is `KVConnectorBase_V1` (scheduler/worker split, per-layer load/save),
+  not a synchronous storage backend. Design route A selected + detailed in
+  `docs/autumn_kvcache_plan.md §13` (2026-06-01). User: "开始实现".
+- **Goal:** A native `AutumnKVConnector(KVConnectorBase_V1)` in
+  `python/autumn_kvcache/autumn_kvcache/vllm_connector.py`, daemon-less, reusing
+  the F216 data plane. Phase 3a target = CPU-offload KV path (no GPU staging) +
+  connector lifecycle correct + cross-instance prefix-cache hit. Pattern mirrors
+  vLLM's `SharedStorageConnector` (per-request-prefix, per-layer entries), swapping
+  safetensors files for autumn keys.
+  Sub-features:
+
+  **F250-A · Shared util extraction**
+  - Factor `_build_tenant_suffix` + key-namespace (`kvc/{tenant}/{pool}/...`) out of
+    `sglang_backend.py` into `_keys.py`; both adapters import it. No behavior change
+    to the sglang path (its existing smoke test must still pass).
+
+  **F250-B · `AutumnKVConnector(KVConnectorBase_V1)` + `AutumnConnectorMetadata`**
+  - Defensive vLLM import (module importable without vLLM, like `sglang_backend`).
+  - Scheduler role: `get_num_new_matched_tokens` (block-aligned prefix hash →
+    `batch_head` existence → matched token count), `update_state_after_alloc`,
+    `build_connector_meta` (per-req load/save `ReqMeta{token_ids, slot_mapping,
+    is_store}`), `request_finished`.
+  - Worker role: `register_kv_caches`, `start_load_kv` (per load-req, per layer:
+    `get_into` autumn → inject into layer via slot_mapping), `wait_for_layer_load`,
+    `save_kv_layer` (extract per slot_mapping → `put_from`), `wait_for_save`,
+    `get_finished`.
+  - Key: `kvc/{tenant}/vllm/{prefix_hash}/{layer_name}`; pool segment `vllm` (separate
+    keyspace from sglang's `kv`). tenant suffix from vllm_config TP/PP + model.
+  - Reuse `autumn.BatchClient`/`Client.batch_head`/`_bridge`. No daemon, no local LRU,
+    persistence only via partition ([[feedback_no_parallel_data_plane]]).
+
+  **F250-C · Data-plane smoke test (NO vLLM dependency)**
+  - `tests/test_vllm_dataplane.py`: against a real 1-node cluster, exercise the
+    autumn-facing core the connector relies on — key format, byte-buffer store/load
+    round-trip via the connector's `_AutumnKVStore` helper (`put_from`/`get_into`),
+    and `batch_head` prefix existence. Validates the half that doesn't need a model.
+
+  **F250-D · vLLM e2e (isolated venv) + README**
+  - Isolated venv (do NOT disturb system torch 2.9.1 / sglang 0.5.10): install a
+    vLLM version, run two `vllm serve` instances with
+    `--kv-transfer-config '{"kv_connector":"AutumnKVConnector",...}'`, verify the 2nd
+    instance gets a cross-instance prefix-cache hit (cached tokens > 0) served from
+    autumn. README "Using autumn-kvcache as vLLM L3" section.
+
+- **Architectural invariants:** same as F216 — stateless adapter, content-addressed
+  keys (no invalidation), partition is the only persistence path, return fast / never
+  block past the engine's budget.
+- **Acceptance:**
+  - `pip install -e python/autumn_kvcache` still imports; `python -c "from
+    autumn_kvcache.vllm_connector import AutumnKVConnector"` works WITHOUT vLLM installed.
+  - F250-A: existing sglang smoke test (`test_smoke.py`) still passes (no regression).
+  - F250-C data-plane smoke test passes against a real 1-node autumn cluster.
+  - F250-D: vLLM e2e cross-instance prefix hit demonstrated in the isolated venv.
+- **Out of scope (Phase 3b+):** GPU-resident KV staging buffers + `cudaMemcpyAsync`
+  overlap (Phase 3b); per-(block,layer) key merge / RPC coalescing (Phase 3c);
+  hybrid-attention multi-pool. Tracked in `docs/autumn_kvcache_plan.md §13.9`.
+- **passes:** not_completed (in progress 2026-06-01)

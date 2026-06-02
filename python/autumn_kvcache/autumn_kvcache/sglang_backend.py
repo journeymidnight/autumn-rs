@@ -24,6 +24,7 @@ from typing import List, Optional
 import autumn
 
 from ._bridge import run, run_on, new_loop
+from ._keys import build_tenant_suffix, full_key, pool_prefix
 
 try:
     from sglang.srt.mem_cache.hicache_storage import (
@@ -32,50 +33,22 @@ try:
     )
 
     _SGLANG_AVAILABLE = True
-except ImportError:
+except Exception:  # noqa: BLE001
     # Fall back to `object` so the module is importable without sglang
-    # installed (smoke tests + standalone usage).
+    # installed (smoke tests + standalone usage). Catch broad Exception, not
+    # just ImportError: a present-but-broken sglang stack can raise at import
+    # (e.g. flashinfer version-check RuntimeError) and must not crash the
+    # adapter — the data-plane smoke test imports this without a model stack.
     HiCacheStorage = object  # type: ignore[misc,assignment]
     HiCacheStorageConfig = None  # type: ignore[assignment]
     _SGLANG_AVAILABLE = False
 
 log = logging.getLogger(__name__)
 
-# Reserved namespace prefix. Distinguishes kvcache keys from other autumn
-# clients (autumn-fuse, autumn-client) sharing the same partition cluster.
-KEY_NAMESPACE = "kvc"
-
 # Reserved pool name. MVP only supports the "kv" pool; the slot is in the
 # key format so future v2 multi-pool (mamba / swa) doesn't require a key
-# migration.
+# migration. (The shared `kvc/` namespace + tenant suffix live in `_keys`.)
 DEFAULT_POOL_NAME = "kv"
-
-
-def _build_tenant_suffix(cfg) -> str:
-    """Mirror HiCacheFile._get_suffixed_key (docs/hicache_l3_interface.md:207-209).
-
-    Format: f"{model_name}" then optionally "_{tp_rank}_{tp_size}" (skipped
-    for MLA models) then "_pp{pp_rank}_{pp_size}" (if pp enabled).
-    """
-    if cfg is None:
-        return "default"
-    model = getattr(cfg, "model_name", None) or "unknown"
-    # sglang passes the raw `--model-path` value here, which is commonly a
-    # filesystem path like `/data/models/Qwen3-VL-32B-Instruct`. Slashes
-    # work in autumn keys but produce noisy `kvc//data/...` strings; strip
-    # leading slashes and replace inner ones to keep keys readable.
-    model = str(model).strip("/").replace("/", "_")
-    is_mla = bool(getattr(cfg, "is_mla_model", False))
-    tp_rank = getattr(cfg, "tp_rank", 0)
-    tp_size = getattr(cfg, "tp_size", 1)
-    pp_rank = getattr(cfg, "pp_rank", 0)
-    pp_size = getattr(cfg, "pp_size", 1)
-    parts = [str(model)]
-    if not is_mla:
-        parts.append(f"{tp_rank}_{tp_size}")
-    if pp_size and pp_size > 1:
-        parts.append(f"pp{pp_rank}_{pp_size}")
-    return "_".join(parts)
 
 
 def _normalize_indices(host_indices) -> List[int]:
@@ -135,7 +108,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
             )
 
         self.storage_config = storage_config
-        self._tenant_suffix = _build_tenant_suffix(storage_config)
+        self._tenant_suffix = build_tenant_suffix(storage_config)
         # Optional transport selection ("tcp" default, or "ucx" for RDMA).
         # Must be set before the first connect; idempotent process-global.
         transport = (extra_config.get("transport") or "tcp").lower()
@@ -198,7 +171,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         self._mem_pool_host = mem_pool_host
 
     def _full_key(self, hash_str: str, pool_name: str = DEFAULT_POOL_NAME) -> bytes:
-        return f"{KEY_NAMESPACE}/{self._tenant_suffix}/{pool_name}/{hash_str}".encode("utf-8")
+        return full_key(self._tenant_suffix, hash_str, pool_name)
 
     def _page_view(self, idx: int):
         """Resolve a host_index to a buffer-protocol view of the pinned page.
@@ -328,7 +301,8 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
     # ── optional ───────────────────────────────────────────────────────────
 
     def clear(self) -> None:
-        prefix = f"{KEY_NAMESPACE}/{self._tenant_suffix}/".encode("utf-8")
+        # Pool-scoped: must NOT cross into a co-tenant's vLLM (`vllm`) pool.
+        prefix = pool_prefix(self._tenant_suffix, DEFAULT_POOL_NAME)
         try:
             n = run(lambda: self._client.batch_delete(prefix))
             log.info("AutumnKVCacheStorage.clear deleted %d keys under %r", n, prefix)
