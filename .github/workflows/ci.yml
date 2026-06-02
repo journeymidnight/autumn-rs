@@ -32,42 +32,8 @@ jobs:
       # benches). FCI-02 refreshed the 3 perf benches to current APIs so they
       # compile again; the whole workspace (sans autumn-fuse) is clippy-clean
       # under -D warnings.
-      - name: Print rust toolchain info (diagnostic)
-        run: |
-          rustc --version --verbose
-          cargo --version
-          cargo clippy --version
       - name: Clippy (gating, FCI-01)
-        id: clippy
-        run: |
-          set +e
-          cargo clippy --workspace --exclude autumn-fuse --all-targets -- -D warnings 2>&1 | tee /tmp/clippy.log
-          rc=${PIPESTATUS[0]}
-          # Publish a digest to the publicly-visible step summary so external
-          # tooling (e.g. unauth'd API check-run output) can see the failure
-          # mode without log auth.
-          {
-            echo "## Rust toolchain"
-            rustc --version --verbose
-            echo
-            echo "## Clippy first 80 lines"
-            echo '```'
-            head -80 /tmp/clippy.log
-            echo '```'
-            echo
-            echo "## Clippy errors / warnings only"
-            echo '```'
-            grep -E '^(error|warning)' /tmp/clippy.log | head -50 || echo "(none)"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          exit $rc
-      - name: Upload clippy log (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: clippy-log
-          path: /tmp/clippy.log
-          retention-days: 7
+        run: cargo clippy --workspace --exclude autumn-fuse --all-targets -- -D warnings
       - name: Build
         run: cargo build --workspace --exclude autumn-fuse
       - name: Unit tests
