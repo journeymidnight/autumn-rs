@@ -47,16 +47,24 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace --lib --exclude autumn-fuse
       - name: Integration tests
-        # Bump RLIMIT_MEMLOCK and nofile: integration tests spawn manager + EN
+        # Bump RLIMIT_MEMLOCK + nofile on this shell's PID so the cargo test
+        # subprocess inherits the bump. Integration tests spawn manager + EN
         # threads each creating a compio io_uring runtime; rings accumulate
-        # across test boundaries (--test-threads=1 doesn't help since the
-        # spawn'd manager/EN worker threads are detached — they keep their
-        # rings until process exit). On GitHub's ubuntu-latest runner the
-        # default `ulimit -l` is 64 KB, so after ~9 tests' worth of rings,
-        # io_uring_setup returns ENOMEM → `compio::Runtime::new().unwrap()`
-        # panics with "Cannot allocate memory". Bumping memlock fixes it
-        # without rewriting the tests' setup-teardown shape.
+        # across test boundaries (the worker threads are `std::thread::spawn`'d
+        # without joining — they keep their rings until process exit, so
+        # --test-threads=1 doesn't help). Ubuntu-latest's default `ulimit -l`
+        # is 64 KB; after ~9 tests' worth of rings, io_uring_setup returns
+        # ENOMEM and Runtime::new().unwrap() panics with "Cannot allocate
+        # memory".
+        #
+        # `ulimit -l unlimited` directly in the shell hits "Operation not
+        # permitted" (RLIMIT_MEMLOCK is privileged on the runner). Use sudo
+        # prlimit on $$ (this shell's PID) instead — GitHub runners have
+        # passwordless sudo; the prlimit-modified shell then execs cargo
+        # test which inherits the higher limit.
         run: |
-          ulimit -l unlimited || true
-          ulimit -n 65536 || true
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited || true
+          sudo prlimit --pid $$ --nofile=65536:65536 || true
+          # diagnostic — confirm the new limits actually took
+          cat /proc/$$/limits | grep -E 'locked|files'
           cargo test --workspace --tests --exclude autumn-fuse -- --test-threads=1
