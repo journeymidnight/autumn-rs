@@ -4289,35 +4289,16 @@ async fn partition_thread_main(
     // but compio runtime build or StreamClient init could still fail
     // inside the thread, leaving P-log holding a Sender to a dropped
     // Receiver — the partition wedged on first flush.
-    //
-    // F255-fix (coco /findbugs bb8bf52 follow-up): bounded await. Today
-    // `StreamClient::new_with_revision` is pure construction (no network)
-    // so the only awaits inside the spawned thread are the runtime build
-    // + Rc::new wiring — happy path is microseconds, the timeout is huge
-    // headroom. If a future refactor adds a network step to StreamClient
-    // init (e.g. pre-fetching manager metadata), the bound is what keeps
-    // `open_partition` from wedging `sync_regions_once` on a hung peer.
-    // 30 s mirrors `FREEZE_TTL` budgeting — comfortably below any
-    // manager-side reschedule deadline.
-    let ready_timeout = std::time::Duration::from_secs(30);
-    let ready_timer = compio::time::sleep(ready_timeout);
-    futures::pin_mut!(ready_timer);
-    match futures::future::select(bulk_ready_rx, ready_timer).await {
-        futures::future::Either::Left((Ok(Ok(())), _)) => {}
-        futures::future::Either::Left((Ok(Err(e)), _)) => {
+    match bulk_ready_rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
             return Err(e).with_context(|| {
                 format!("P-bulk readiness for partition {part_id} reported failure")
             })
         }
-        futures::future::Either::Left((Err(_canceled), _)) => {
+        Err(_canceled) => {
             return Err(anyhow!(
                 "P-bulk readiness signal dropped before partition {part_id} opened (thread aborted)"
-            ));
-        }
-        futures::future::Either::Right(_elapsed) => {
-            return Err(anyhow!(
-                "P-bulk readiness for partition {part_id} timed out after {}s (init wedged); sync_regions_once will retry",
-                ready_timeout.as_secs()
             ));
         }
     }
