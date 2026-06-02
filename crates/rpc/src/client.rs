@@ -633,13 +633,11 @@ async fn read_loop(
 
         decoder.feed(&buf[..n]);
 
-        loop {
-            // Peek so a `call_into_dest` value-response can be recv'd straight
-            // into the caller's registered dest (UCX) before try_decode would
-            // buffer the whole payload.
-            let Some((req_id, _mt, _flags, payload_len)) = decoder.peek_header() else {
-                break;
-            };
+        // Peek so a `call_into_dest` value-response can be recv'd straight
+        // into the caller's registered dest (UCX) before try_decode would
+        // buffer the whole payload. (Inner `break`s for "wait for more
+        // bytes" / try_decode None still exit this loop, same as for `loop`.)
+        while let Some((req_id, _mt, _flags, payload_len)) = decoder.peek_header() {
             let is_into = matches!(pending.borrow().get(&req_id), Some(Pending::IntoDest(_)));
 
             if is_into && reader.is_ucx() {

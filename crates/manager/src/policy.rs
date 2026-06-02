@@ -653,7 +653,7 @@ impl PolicyEngine {
         // extents stay sealed-not-converted until the controller
         // dispatches `MSG_FORCE_EC_CONVERT`.
         if out.len() > MAX_EC_ADVISORY_CANDIDATES {
-            out.sort_unstable_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+            out.sort_unstable_by_key(|c| std::cmp::Reverse(c.size_bytes));
             out.truncate(MAX_EC_ADVISORY_CANDIDATES);
         }
         out

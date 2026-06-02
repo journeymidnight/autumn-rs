@@ -2367,7 +2367,7 @@ async fn run_info(
             .collect();
 
         // F205: keep sort_by live_size desc for consistent ordering.
-        partitions_view.sort_by(|a, b| b.live_size.cmp(&a.live_size));
+        partitions_view.sort_by_key(|p| std::cmp::Reverse(p.live_size));
 
         if let Some(pid) = part {
             match partitions_view.into_iter().find(|p| p.part_id == pid) {

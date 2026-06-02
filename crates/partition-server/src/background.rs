@@ -1606,7 +1606,7 @@ pub(crate) async fn do_compact(
         .zip(tbls.iter())
         .map(|(r, t)| (r.clone(), t.last_seq))
         .collect();
-    readers_with_meta.sort_by(|a, b| b.1.cmp(&a.1));
+    readers_with_meta.sort_by_key(|r| std::cmp::Reverse(r.1));
 
     let iters: Vec<TableIterator> = readers_with_meta
         .iter()
