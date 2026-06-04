@@ -23,7 +23,7 @@ fn mgr_to_local_extent(e: &MgrExtentInfo) -> ExtentInfo {
         ec_converted: e.ec_converted,
     }
 }
-use anyhow::Result;
+use anyhow::{Context, Result};
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
 use bytes::Bytes;
 use compio::fs::{File as CompioFile, OpenOptions};
@@ -2708,11 +2708,14 @@ impl ExtentNode {
     /// `MSG_REPORT_DISK_FAILURE`, future heartbeat) so its `tx_bufs`
     /// flush and `FuturesUnordered` cap stay minimal in practice.
     ///
-    /// We spawn the control listener as a detached compio task and run
-    /// the data accept loop inline. If the control listener fails to
-    /// bind, log + WARN and continue with data only (legacy behaviour
-    /// preserved) — the manager's `control_address` fallback also
-    /// covers a node whose control bind failed for an operator reason.
+    /// Both listeners are bound synchronously up front before either accept
+    /// loop starts. A bind failure on EITHER listener (e.g. `EADDRINUSE`
+    /// because an operator misconfig left port+1000 occupied) is propagated
+    /// as `Err` and the binary exits non-zero via the caller's `?`. The
+    /// control listener is no longer best-effort: a half-bound EN
+    /// (data online, control silently dead) used to flip `online=true`
+    /// at the manager while every control RPC (ALLOC / RECOVERY / DELETE /
+    /// RE_AVALI) blackholed — fail-stop is safer than a degraded node.
     pub async fn serve_with_control(
         &self,
         data_addr: SocketAddr,
@@ -2733,10 +2736,24 @@ impl ExtentNode {
             );
             return self.accept_loop(data_addr, "data").await;
         }
+        // Bind BOTH listeners up front. Either bind failing is fatal:
+        // the caller's `?` propagates the io error and the process exits.
+        let transport = autumn_transport::current_or_init();
+        let data_listener = transport
+            .bind(data_addr)
+            .await
+            .with_context(|| format!("bind data listener {data_addr}"))?;
+        let control_listener = transport
+            .bind(control_addr)
+            .await
+            .with_context(|| format!("bind control listener {control_addr}"))?;
+        tracing::info!(addr = %control_addr, "extent node CONTROL listener");
         let ctl_node = self.clone();
         compio::runtime::spawn(async move {
-            tracing::info!(addr = %control_addr, "extent node CONTROL listener");
-            if let Err(e) = ctl_node.accept_loop(control_addr, "control").await {
+            if let Err(e) = ctl_node
+                .accept_loop_on(control_listener, control_addr, "control")
+                .await
+            {
                 tracing::warn!(
                     addr = %control_addr,
                     error = %e,
@@ -2745,7 +2762,7 @@ impl ExtentNode {
             }
         })
         .detach();
-        self.accept_loop(data_addr, "data").await
+        self.accept_loop_on(data_listener, data_addr, "data").await
     }
 
     /// Shared accept loop used by both `serve` and `serve_with_control`.
@@ -2753,7 +2770,20 @@ impl ExtentNode {
     /// the listening log line for operator triage.
     async fn accept_loop(&self, addr: SocketAddr, role: &'static str) -> Result<()> {
         let transport = autumn_transport::current_or_init();
-        let mut listener = transport.bind(addr).await?;
+        let listener = transport.bind(addr).await?;
+        self.accept_loop_on(listener, addr, role).await
+    }
+
+    /// Run the accept loop on an already-bound listener. Used by
+    /// `serve_with_control` to surface bind errors synchronously before
+    /// either listener starts servicing connections.
+    async fn accept_loop_on(
+        &self,
+        mut listener: autumn_transport::Listener,
+        addr: SocketAddr,
+        role: &'static str,
+    ) -> Result<()> {
+        let transport = autumn_transport::current_or_init();
         tracing::info!(addr = %addr, role, kind = ?transport.kind(), "extent node listening");
         loop {
             let (conn, peer) = listener.accept().await?;

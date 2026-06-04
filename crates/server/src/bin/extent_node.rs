@@ -458,76 +458,121 @@ fn main() -> Result<()> {
         let ec_par = args.ec_convert_parallelism;
         let rec_par = args.recovery_parallelism;
         let inflight = args.inflight_cap;
+        // Fail-stop: any shard exit (Err / panic / unexpected clean return)
+        // calls `std::process::exit(1)` directly. The join loop below is
+        // therefore unreachable in steady state — its only role is to park
+        // the main thread alive so the OS keeps the shard threads scheduled.
+        // Rationale: a half-online EN (one shard's bind failed → its port
+        // silently doesn't serve) is hard to spot from the manager — df
+        // succeeds on the surviving shards and the node still looks
+        // "Online". Better to die loudly so the operator notices.
         let join = std::thread::Builder::new()
             .name(format!("extent-shard-{shard_idx}"))
-            .spawn(move || -> Result<()> {
-                let rt = compio::runtime::RuntimeBuilder::new()
-                    .thread_affinity(autumn_common::affinity_set(cpu))
-                    .build()
-                    .context("create compio runtime")?;
-                tracing::info!(shard_idx, ?cpu, "extent-shard runtime ready");
-                rt.block_on(async move {
-                    let addr = autumn_transport::format_listen_addr(&bind_host, listen_port)
-                        .context("parse listen address")?;
-                    autumn_transport::check_listen_addr(addr, autumn_transport::current().kind())
+            .spawn(move || {
+                let shard_main = std::panic::AssertUnwindSafe(move || -> Result<()> {
+                    let rt = compio::runtime::RuntimeBuilder::new()
+                        .thread_affinity(autumn_common::affinity_set(cpu))
+                        .build()
+                        .context("create compio runtime")?;
+                    tracing::info!(shard_idx, ?cpu, "extent-shard runtime ready");
+                    rt.block_on(async move {
+                        let addr = autumn_transport::format_listen_addr(&bind_host, listen_port)
+                            .context("parse listen address")?;
+                        autumn_transport::check_listen_addr(
+                            addr,
+                            autumn_transport::current().kind(),
+                        )
                         .ok();
-                    // F191: per-shard control listener — same SQ/CQ
-                    // machinery, no API churn.
-                    let ctl_addr =
-                        autumn_transport::format_listen_addr(&bind_host, control_listen_port)
-                            .context("parse control listen address")?;
+                        // F191: per-shard control listener — same SQ/CQ
+                        // machinery, no API churn.
+                        let ctl_addr = autumn_transport::format_listen_addr(
+                            &bind_host,
+                            control_listen_port,
+                        )
+                        .context("parse control listen address")?;
 
-                    // F214-D: only shard 0 runs the manager cross-check;
-                    // it's the same check for every shard, so doing it
-                    // once is sufficient. Skipped when no manager is
-                    // configured (test deployments).
-                    if shard_idx == 0 {
-                        if let Some(mgr) = manager.as_ref() {
-                            verify_manager_cluster_id(mgr, &stamped_cluster_id).await?;
+                        // F214-D: only shard 0 runs the manager cross-check;
+                        // it's the same check for every shard, so doing it
+                        // once is sufficient. Skipped when no manager is
+                        // configured (test deployments).
+                        if shard_idx == 0 {
+                            if let Some(mgr) = manager.as_ref() {
+                                verify_manager_cluster_id(mgr, &stamped_cluster_id).await?;
+                            }
                         }
-                    }
 
-                    let mut cfg = ExtentNodeConfig::new_multi(data_dirs);
-                    if let Some(mgr) = manager {
-                        cfg = cfg.with_manager_endpoint(mgr);
-                    }
-                    cfg = cfg.with_shard(shard_idx, shards_for_thread, siblings);
-                    // F195: per-shard tunables.
-                    if let Some(n) = ec_par {
-                        cfg = cfg.with_ec_convert_parallelism(n);
-                    }
-                    if let Some(n) = rec_par {
-                        cfg = cfg.with_recovery_parallelism(n);
-                    }
-                    if let Some(n) = inflight {
-                        cfg = cfg.with_inflight_cap(n);
-                    }
+                        let mut cfg = ExtentNodeConfig::new_multi(data_dirs);
+                        if let Some(mgr) = manager {
+                            cfg = cfg.with_manager_endpoint(mgr);
+                        }
+                        cfg = cfg.with_shard(shard_idx, shards_for_thread, siblings);
+                        // F195: per-shard tunables.
+                        if let Some(n) = ec_par {
+                            cfg = cfg.with_ec_convert_parallelism(n);
+                        }
+                        if let Some(n) = rec_par {
+                            cfg = cfg.with_recovery_parallelism(n);
+                        }
+                        if let Some(n) = inflight {
+                            cfg = cfg.with_inflight_cap(n);
+                        }
 
-                    tracing::info!(
-                        shard_idx,
-                        addr = %addr,
-                        ctl_addr = %ctl_addr,
-                        "extent-node shard listening"
-                    );
+                        tracing::info!(
+                            shard_idx,
+                            addr = %addr,
+                            ctl_addr = %ctl_addr,
+                            "extent-node shard listening"
+                        );
 
-                    let node = ExtentNode::new(cfg)
-                        .await
-                        .with_context(|| format!("create ExtentNode shard {shard_idx}"))?;
-                    node.serve_with_control(addr, ctl_addr).await
-                })
+                        let node = ExtentNode::new(cfg)
+                            .await
+                            .with_context(|| format!("create ExtentNode shard {shard_idx}"))?;
+                        node.serve_with_control(addr, ctl_addr).await
+                    })
+                });
+                match std::panic::catch_unwind(shard_main) {
+                    Ok(Ok(())) => {
+                        tracing::error!(
+                            shard_idx,
+                            "extent-node shard exited cleanly — fail-stop \
+                             (accept_loop should never return Ok)"
+                        );
+                        std::process::exit(1);
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(
+                            shard_idx,
+                            error = ?e,
+                            "extent-node shard error — fail-stop"
+                        );
+                        std::process::exit(1);
+                    }
+                    Err(panic) => {
+                        tracing::error!(
+                            shard_idx,
+                            ?panic,
+                            "extent-node shard panicked — fail-stop"
+                        );
+                        std::process::exit(1);
+                    }
+                }
             })
             .with_context(|| format!("spawn extent-shard-{shard_idx}"))?;
         joins.push(join);
     }
 
-    // Wait forever (or until one thread exits). If any shard thread exits
-    // with an error, bubble it up.
+    // Park forever. Any shard failure has already called process::exit(1)
+    // from inside the shard thread; reaching the end of this loop would
+    // mean every shard returned Ok cleanly (impossible in steady state —
+    // accept_loop runs an infinite loop).
     for (idx, j) in joins.into_iter().enumerate() {
-        match j.join() {
-            Ok(Ok(())) => tracing::info!(shard_idx = idx, "extent-node shard exited cleanly"),
-            Ok(Err(e)) => tracing::error!(shard_idx = idx, error = ?e, "extent-node shard error"),
-            Err(panic) => tracing::error!(shard_idx = idx, ?panic, "extent-node shard panicked"),
-        }
+        let _ = j.join();
+        tracing::error!(
+            shard_idx = idx,
+            "extent-node shard join returned — fail-stop \
+             (shard should have called process::exit on its own)"
+        );
+        std::process::exit(1);
     }
     Ok(())
 }
