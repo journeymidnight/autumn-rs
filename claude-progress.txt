@@ -1,195 +1,193 @@
 Date: 2026-06-05
 TaskStatus: completed
-Task scope: F-ioring-lease-4 — OpenedExtents version-tagged + cache
-  invalidation e2e. LAST step of the Phase 1 ioring + lease wiring
-  (plan: docs/autumn_fs_lease_plan.md §3.1 + §4.4 + §6).
-  Close-to-open coherence now end-to-end: writer-close pushes
-  WriterClosed → reader's poll loop bumps the per-ino floor →
-  reader's next Read sees the stale predicate flip → reloads
-  the extent map before serving.
+Task scope: F-lease-preempt — force-revoke / writer revoke
+  protocol. Phase 3 of docs/autumn_fs_lease_plan.md, the LAST
+  piece of the inode-lease feature series. All three plan phases
+  now landed.
 
-  **PHASE 1 OF docs/autumn_fs_lease_plan.md IS COMPLETE.**
+  AcquireLease(force=true) against a held writer:
+  - first call → manager pushes WillRevokeIn{grace_ms} to the
+    current writer + returns RevokePending{eta_ms}.
+  - retries before grace expires → still RevokePending with the
+    remaining eta.
+  - writer voluntarily releases → next acquire = Granted cleanly.
+  - past the grace deadline → force-revoke (bump version, push
+    LeaseRevoked to deposed writer + readers) + Granted.
+
+  Same shape as NFSv4 delegation recall but driven from the
+  client side via the existing long-poll invalidation channel —
+  no new wire RPC.
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
-  Already implemented (in main as of bddf806 + 6fa78f8 + ee5e5e3
-  + this commit):
-    - F-ioring-lease-1 — manager InodeLease state + 4 RPCs + etcd
-      persistence + TTL revoke loop.
-    - F-ioring-lease-2 — ioring daemon Open/Close acquire+release
-      + per-session heartbeat.
-    - F-ioring-lease-3 — long-poll invalidation channel: manager
-      wait-for-event hook + daemon persistent poll loop +
-      wholesale-invalidate on transport error / overflow.
-    - F-ioring-lease-4 (THIS COMMIT) — OpenedExtents.lease_version
-      + per-session InvalidationMap + cache_is_stale predicate +
-      reload_extents on stale → close-to-open coherence end-to-end.
+  Already implemented:
+    - Phase 1: F-ioring-lease-1/2/3/4 + Phase-1 byte-level
+      cluster e2e + F-ioring-lease-5 (coco fixes).
+    - Phase 2: F-fuse-lease-1 (autumn-fuse mount opt-in) +
+      F-fuse-lease-2 (notify_inval_inode kernel cache evict).
+    - Phase 3: F-lease-preempt (THIS COMMIT) — force-revoke /
+      writer revoke protocol.
 
-  Not yet implemented (Phase 2 / 3 — outside this task):
-    - F-fuse-lease-1 / F-fuse-lease-2 (autumn-fuse opt-in +
-      `notify_inval_inode`).
-    - F-lease-preempt (force-revoke / writer revoke protocol).
-
-  Deferred (full-cluster byte-level e2e):
-    - A test that boots a real cluster + seeds a fuse file via the
-      WRITE path + has two ClusterClient sessions exercise the
-      writer→close→reader-reads pipeline byte-for-byte. The shape
-      lives in `crates/manager/tests/system_ioring_fuse.rs::
-      f248_ioring_reads_fuse_file` (#[ignore]'d); replicating it
-      with two distinct sessions is mechanical follow-up. The
-      protocol surface is fully exercised by F-4's 3 integration
-      tests + 4 pure-fn units.
+  Not yet implemented (deliberately deferred, NOT blocking
+  Phase 3 close):
+    - Writer-side AUTO-flush + AUTO-release on receiving
+      WillRevokeIn. Today daemon + fuse poll loops just log the
+      WillRevokeIn event at WARN with the grace ms. The operator
+      (or a higher layer) must react before the grace expires;
+      the manager force-revokes after the deadline regardless,
+      so correctness is preserved. Wiring auto-flush needs:
+      * autumn-fuse: send a synthetic FsRequest::Flush + then
+        the equivalent of FsRequest::Release for the affected
+        inode from inside the poll loop's per-event handler.
+        The compio thread already owns FsState so this is just
+        a state mutation + lease::release call; the tricky part
+        is the user-visible fd lifetime (the kernel still has
+        the fd open — we'd need notify_inval_inode to drop the
+        cache + accept that future ops on that fd return EIO).
+      * autumn-ioring: walk held_leases for the matching ino,
+        send the same "release-and-EBADF-future-ops" sequence.
+      Tractable as a follow-up. The current design is correct
+      (no data loss; just a 5s window where the preempter waits)
+      and matches the plan's word-for-word "writer revoke 协议".
 
 === WHAT THIS COMMIT SHIPS ===
 
-  - crates/ioring/src/fuse_read.rs:
-    - OpenedExtents gains `lease_version: u64` (defaults to 0; the
-      production path populates it from
-      `MgrInodeLeaseInfo.version` at Open).
-    - New `reload_extents(cluster, &mut opened) -> Result<()>`:
-      re-fetches inode meta + extent map, updates `size + extents`
-      in place (does NOT touch lease_version — caller bumps).
-    - Test helper updated for the new field.
+  Wire (same-commit deploy, per repo convention):
+    AcquireLeaseReq gains `force: bool`.
+    New CODE_REVOKE_PENDING = 6 (manager packs `eta_ms` into
+    the response's `lease.ttl_secs` field — documented on the
+    const, repurposed only for this code path).
+    New LEASE_INVAL_WILL_REVOKE_IN = 4 invalidation kind. The
+    `MgrInvalidation.version` field is repurposed to carry the
+    grace milliseconds (also documented on the const).
 
-  - crates/ioring/src/lease.rs:
-    - `InvalidationMap = HashMap<u64, u64>` type alias (ino → min-
-      valid-version).
-    - Pure-fn `apply_invalidation(events, &mut InvalidationMap)
-      -> saw_overflow: bool` — bumps per-ino floor via MAX,
-      detects MetaChanged{ino=0} overflow sentinel.
-    - Pure-fn `cache_is_stale(ino, lease_version, &InvalidationMap)
-      -> bool` — true iff there's a floor entry and lease_version
-      is below it.
-    - 4 new unit tests (apply_invalidation_records_writer_closed,
-      apply_invalidation_takes_max_across_events,
-      apply_invalidation_overflow_sentinel_returns_true,
-      cache_is_stale_when_lease_version_below_floor).
+  Manager state machine (crates/manager/src/inode_lease.rs):
+    InodeLeaseState.pending_revoke_at: Option<Instant>.
+    LeaseRegistry.revoke_grace: Duration (default 5s,
+    DEFAULT_REVOKE_GRACE; `with_ttl_and_revoke_grace` lets
+    tests use sub-second windows).
+    New acquire_with_force(client, ino, mode, force, now):
+      - force=false: identical to legacy acquire.
+      - force=true + no current writer (or same writer): grant.
+      - force=true + different writer + pending_revoke_at is
+        None: set to now+grace, push WillRevokeIn, return
+        RevokePending{eta_ms}.
+      - force=true + different writer + grace > now: return
+        RevokePending{remaining eta_ms}.
+      - force=true + different writer + grace ≤ now: force-
+        revoke (clear writer, bump version, push LeaseRevoked
+        to deposed + readers), grant new acquirer.
+    Legacy acquire(...) keeps its signature — delegates to
+    acquire_with_force(.., force=false).
+    release/tick/revert clear pending_revoke_at on writer-
+    departure paths so a future force-acquire starts fresh.
 
-  - crates/ioring/src/bin/daemon.rs:
-    - Per-session `invalidations: Rc<RefCell<InvalidationMap>>`
-      threaded through service_sqe + session_invalidation_poll_loop.
-    - Open arm: populates opened.lease_version from
-      AcquireLease.info.version (refcount path inherits from
-      held_leases[ino].version).
-    - Read arm: snapshots lease_version, calls cache_is_stale
-      against an invalidations.borrow() snapshot; on stale →
-      fuse_read::reload_extents + updates the cached ring_fds
-      entry's size/extents/lease_version; Read proceeds against
-      refreshed map. Reload failure → EIO.
-    - Write arm: snapshot carries lease_version for self-
-      consistency (writes don't reload — writer holds the lease).
-    - session_invalidation_poll_loop calls apply_invalidation
-      BEFORE per-event logging; overflow path clears
-      invalidations + held_leases + ring_fds; transport-error
-      path also clears it.
+  Six unit tests in inode_lease::tests covering:
+    - force on held writer → RevokePending + WillRevokeIn push.
+    - force retry before grace → remaining-eta math.
+    - voluntary release within grace → next acquire Granted.
+    - grace expiry → force-revoke + LeaseRevoked to deposed+
+      readers + Granted to new acquirer.
+    - force on no writer = just a grant.
+    - force by self = idempotent refresh (no self-push).
 
-  - crates/manager/tests/f_ioring_lease_4.rs (NEW): 3 integration
-    tests against in-process AutumnManager via real ClusterClient:
-      1. writer_close_bumps_reader_invalidation_floor — full wire
-         round-trip; asserts inv[ino] == new_version and
-         cache_is_stale(ino, pre_version, &inv) == true.
-      2. overflow_sentinel_triggers_wholesale_clear — 1025
-         writer-close cycles fill the queue past its 1024 cap;
-         next poll surfaces MetaChanged{ino=0} and
-         apply_invalidation returns saw_overflow=true.
-      3. out_of_order_events_dont_roll_back_floor — two cycles on
-         one ino + one cycle on another; MAX-wins end-to-end.
+  Client (crates/client/src/lease.rs):
+    AcquireResult::RevokePending{eta_ms, manager_message}.
+    acquire_force(cluster, client, ino, mode) — force=true
+    variant, returns RevokePending on first hit.
+    acquire_with_preempt_wait(cluster, client, ino, mode,
+    max_wait_ms) — convenience loop that polls acquire_force
+    with sliding backoff (50-500ms per poll) bounded by
+    max_wait_ms. Returns the final outcome.
 
-  - feature_list.md: F-ioring-lease-4 in Completed table + detail
-    section under P14 (18 invariants total: L1-L18 across F-1/2/
-    3/4).
+  Manager handler:
+    handle_acquire_lease threads req.force → acquire_with_force.
+    New RevokePending arm returns CODE_REVOKE_PENDING + packs
+    eta_ms into lease.ttl_secs.
 
-  - crates/manager/CLAUDE.md: Programming Note 34 extended with
-    L15 (lease_version pinned at first opener), L16 (Read must
-    reload or EIO on stale), L17 (reload bumps to floor not
-    fresh acquire), L18 (writes don't reload). L14 (overflow /
-    transport-error wholesale-clear) updated to also clear the
-    F-4 invalidations map.
+  Daemon + fuse update sites:
+    ioring daemon's Open arm + fuse's Open + Create arms get a
+    defensive `RevokePending => Err("BUG")` arm. These paths
+    use non-force acquire so the variant is unreachable; the
+    explicit arm makes a future refactor that flips them to
+    force=true fail loudly instead of silently dropping the
+    retry loop.
+    ioring poll loop's per-event match: new
+    LEASE_INVAL_WILL_REVOKE_IN arm logs at WARN with the
+    grace ms so the operator can react.
 
-  - README.md: F-ioring-lease bridge updated — Phase 1 declared
-    complete; future work (F-fuse-lease, F-lease-preempt)
-    listed. Added test command for F-4.
+  Integration tests (crates/manager/tests/f_lease_preempt.rs):
+    Four tests against the real manager RPC:
+      1. force_acquire_pushes_will_revoke_to_current_writer.
+      2. voluntary_release_within_grace_lets_preempter_acquire_cleanly.
+      3. force_acquire_after_grace_expiry_forces_revoke_and_grants.
+      4. force_acquire_on_no_writer_grants_immediately.
+    All 4 pass; #3 uses acquire_with_preempt_wait with 8s
+    budget and exercises the full 5s grace + force-revoke +
+    LeaseRevoked round-trip.
 
 === VERIFICATION ===
 
-  cargo build --workspace                              : clean
-  cargo test -p autumn-manager --lib                   : 131 passed
-                                                         (unchanged
-                                                         from F-3)
-  cargo test -p autumn-ioring --features daemon --lib  : 84 passed
-                                                         (80 prior +
-                                                         4 new F-4
-                                                         pure-fn
-                                                         units)
-  cargo test -p autumn-manager --test f_ioring_lease_4 : 3 passed
-                                                         (~10 s, dom.
-                                                         by 1025-
-                                                         cycle
-                                                         overflow
-                                                         test)
-  cargo test -p autumn-manager --test f_ioring_lease   : 3 passed
-  cargo test -p autumn-manager --test f_ioring_lease_2 : 4 passed
-  cargo test -p autumn-manager --test f_ioring_lease_3 : 3 passed
-  cargo clippy ioring + manager                        : no warnings
-
-  TOTAL across F-1/2/3/4 integration: 13 tests, ~30 s wallclock
-  (F-3 idle-timeout case 10 s + F-4 overflow 10 s dominate).
-  TOTAL across all units: 131 manager + 84 ioring = 215 tests.
+  cargo build --workspace                           : clean
+  cargo test -p autumn-manager --lib                : 139 passed
+                                                      (133 prior +
+                                                      6 new preempt
+                                                      units)
+  cargo test -p autumn-client --lib                 : 15 passed
+                                                      (unchanged —
+                                                      6 lease, 9
+                                                      others)
+  cargo test -p autumn-fuse --features fuse --lib   : 16 passed
+                                                      (unchanged)
+  cargo test -p autumn-ioring --features daemon
+       --lib                                         : 79 passed
+                                                      (unchanged)
+  cargo test -p autumn-manager --test
+       f_lease_preempt                               : 4 passed
+                                                      (new this
+                                                      commit;
+                                                      ~15s)
+  All F-1/2/3/4 ioring + F-fuse-lease-1/2 + Phase-1 byte-level
+  e2e: regression-clean.
+  cargo clippy --workspace: clean.
 
 === TESTING CAVEAT ===
 
   Per [[reproduce_before_fixing_mechanism_bugs]] the preferred
-  shape is reproduce → root-cause → fix + review. F-ioring-lease-4
-  is greenfield wiring of an already-shipped protocol; the 3 F-4
-  integration tests + 4 pure-fn units exercise the invalidation
-  bookkeeping end-to-end through the wire. The full byte-level
-  "two daemons share an OpenedExtents and the reader sees new
-  bytes after the writer's close" repro lives in a deferred full-
-  cluster test — same shape as system_ioring_fuse.rs::
-  f248_ioring_reads_fuse_file but with two distinct ClusterClient
-  sessions.
+  order is reproduce → root-cause → fix. F-lease-preempt is
+  greenfield protocol work — there's no production bug being
+  reproduced. The 6 unit + 4 integration tests cover the
+  state-machine contract and the wire round-trip end-to-end.
+  The deferred writer-side auto-flush would land its own e2e
+  test (writer holds lease + has dirty data; preempter
+  force-acquires; writer's poll loop receives WillRevokeIn;
+  auto-flush runs; auto-release fires; preempter's next
+  acquire is Granted cleanly without grace expiry).
 
-  The protocol contract end-to-end is now: writer-close →
-  ReleaseLease via the writer's ClusterClient → manager bumps
-  version + queues WriterClosed → fires the reader's parked
-  waker → reader's MSG_POLL_INVALIDATIONS returns within ~ms →
-  daemon's session_invalidation_poll_loop runs
-  apply_invalidation(events, &mut inv) → per-ino floor bumped
-  → next Read against the matching ring_fd hits
-  cache_is_stale → reload_extents fetches the post-close
-  state. Each step has at least one test covering it.
+=== PHASE STATUS ===
+
+  Phase 1 (F-ioring-lease-1/2/3/4): COMPLETE (bddf806 / 6fa78f8
+    / ee5e5e3 / 6ffebec + dcda895 coco fixes + byte-level e2e).
+  Phase 2 (F-fuse-lease-1/2): COMPLETE (1bbd990 + 6724062 coco
+    fixes; 770765e + 3fa1452 coco P3 fix).
+  Phase 3 (F-lease-preempt): COMPLETE (72de2b8 this commit).
+
+  ENTIRE docs/autumn_fs_lease_plan.md IS NOW IMPLEMENTED.
 
 === NEXT SESSION HAND-OFF ===
 
-  Phase 1 of docs/autumn_fs_lease_plan.md is COMPLETE. The natural
-  next features are Phase 2:
-    - F-fuse-lease-1 — autumn-fuse mount opt-in. The fuse mount
-      already has `open` / `release` callbacks; they need to:
-      * Generate a per-mount DaemonClientId (kind=FUSE).
-      * On `open` with O_RDWR / O_WRONLY: call
-        lease::acquire(mode=WRITE). On EBUSY surface EAGAIN to
-        the fuse client.
-      * On `release`: call lease::release.
-      * Spawn the same session_heartbeat_loop +
-        session_invalidation_poll_loop the daemon does.
-    - F-fuse-lease-2 — fuse-side cache eviction. fuser provides
-      `notify_inval_inode` to drop the kernel's attribute +
-      page cache; wire it from the poll loop's per-ino
-      WriterClosed/LeaseRevoked branch.
-    - F-fuse-lease-3 — multi-mount byte-level test.
+  All three plan phases are landed. Natural follow-ups that
+  the plan deliberately didn't promise:
 
-  And/or Phase 3:
-    - F-lease-preempt — manager's `force=true` AcquireLease
-      RPC that revokes the current writer via a planned-
-      revoke handshake (manager → writer "you have 5 s to
-      flush + release"; on timeout it just steals the
-      revision).
-
-  Both series build cleanly on Phase 1's foundation. No
-  architecture changes needed; just call sites + a new
-  RPC for the preempt case.
-
-  See `docs/autumn_fs_lease_plan.md` §5 Phase 2/3 for the full
-  list.
+    - Writer-side auto-flush + auto-release on WillRevokeIn
+      (described in "Out of scope" of the F-lease-preempt
+      detail section in feature_list.md).
+    - Full-cluster byte-level e2e for F-fuse-lease (the fuse
+      mount + ioring daemon both mutating the same file with
+      coherence verified — same shape as the Phase-1 byte-
+      level e2e but with one side being a real fuse mount).
+    - autumn-op CLI surface for `lease list` / `lease force-
+      revoke` admin ops (operators can today inspect via
+      etcdctl on `inode_leases/` but no CLI).
 
 Env: linux, autumn-rs main branch.

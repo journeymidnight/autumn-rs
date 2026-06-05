@@ -4849,3 +4849,107 @@ subscribe to invalidation pushes.
   `system_ioring_fuse.rs::f248_ioring_reads_fuse_file` but
   driven from two distinct ClusterClient sessions.
 - **passes:** completed (2026-06-05)
+
+### F-fuse-lease-1 · autumn-fuse mount opt-in to inode lease
+
+- **Trigger:** plan §5 Phase 2 — wire autumn-fuse into the same
+  lease protocol the ioring daemon uses, so fuse + ioring on the
+  same host coordinate writer-vs-reader semantics.
+- **Range of change:**
+  - Moved `crates/ioring/src/lease.rs` → `crates/client/src/lease.rs`
+    so both autumn-fuse and autumn-ioring depend only on
+    autumn-client; `autumn_ioring::lease` is now a thin
+    re-export.
+  - `DaemonClientId::new_fuse(host)` constructor (kind=FUSE).
+  - `FsState` gains `client_id`, `held_leases`, `invalidations`
+    (mirroring ioring's per-session state).
+  - `FsRequest::Open` runs AcquireLease (mode derived from POSIX
+    flags via `lease_mode_for_open`); refcount per-mount;
+    mode-mismatch returns Err.
+  - `FsRequest::Release` decrements + fires ReleaseLease on
+    1→0; release runs AFTER `flush_inode` (plan §6.2).
+  - `dispatch::spawn_lease_background_tasks` — per-mount
+    heartbeat (5s) + invalidation poll loops; transport-error
+    / overflow → wholesale-clear + best-effort
+    `lease::release` per drained ino.
+  - `err_to_errno`: EBUSY mapping for lease conflicts + mode
+    mismatch.
+- **Verification:** `cargo test -p autumn-manager --test
+  f_fuse_lease_1 -- --ignored`: 6 passed (two-mount conflict,
+  read coexistence, refcount, mode mismatch, fuse-kind
+  identity, Create+lease). 133 manager lib + 15 client lib +
+  16 fuse lib all green. clippy clean.
+- **Coco fixes (commit 6724062):** P1 Create bypass, P1
+  Release flush ordering, P1 wholesale-clear + best-effort
+  release, P2 EBUSY mapping.
+- **passes:** completed (2026-06-05)
+
+### F-fuse-lease-2 · kernel cache eviction via fuser::notify_inval_inode
+
+- **Trigger:** plan §5 Phase 2 step 2. Without this the fuse
+  user-space lease state was correct but the kernel attribute
+  + page cache stayed populated → reader app continued to
+  serve stale bytes after another mount's writer closed.
+- **Range of change:**
+  - `crates/fuse/src/dispatch.rs::InodeInvalidator =
+    Rc<dyn Fn(u64)>` swappable callback; production fills it
+    with `fuser::Notifier::inval_inode(ino, 0, 0)`, tests fill
+    it with a counting closure.
+  - `spawn_lease_background_tasks(state, invalidator:
+    Option<…>)` — per-ino events call the invalidator;
+    overflow + transport-error wholesale branches also
+    invalidate every held ino.
+  - main.rs switched from `fuser::mount2` (blocking, no
+    Notifier access) to `Session::new` + `session.notifier()` +
+    `session.run()`. fuser feature `abi-7-12` enabled.
+  - Pure-fn `invalidate_kernel_cache_for_events(events, &inv)`
+    extracted from the poll loop so default CI catches
+    regressions; 5 unit tests cover the contract.
+- **Verification:**
+  - 3 cluster e2e tests (`#[ignore]`'d):
+    per_ino_writer_close_triggers_invalidator,
+    multiple_distinct_inos_each_get_invalidated,
+    no_invalidator_supplied_does_not_panic.
+  - 5 default-CI units in `dispatch.rs::f_fuse_lease_2_unit_tests`.
+  - All prior tests still green.
+- **Coco fix (commit 3fa1452):** P3 default-CI coverage via the
+  pure-fn extract + 5 units.
+- **passes:** completed (2026-06-05)
+
+### F-lease-preempt · force-revoke / writer revoke protocol (Phase 3)
+
+- **Trigger:** plan §5 Phase 3 — "another daemon needs to write
+  NOW" can't always wait for the current writer to close.
+  Adds explicit preemption with a 5s grace window where the
+  current writer is asked to flush + voluntarily release;
+  past the grace, force-revoke.
+- **Range of change:**
+  - Wire: `AcquireLeaseReq.force: bool`,
+    `CODE_REVOKE_PENDING = 6`,
+    `LEASE_INVAL_WILL_REVOKE_IN = 4`.
+  - `InodeLeaseState.pending_revoke_at: Option<Instant>` +
+    `LeaseRegistry.revoke_grace` (default 5s,
+    `DEFAULT_REVOKE_GRACE`).
+  - `acquire_with_force(client, ino, mode, force, now)` —
+    legacy `acquire` delegates with `force=false`. Six unit
+    tests cover the state machine.
+  - `AcquireOutcome::RevokePending { eta_ms, held_by_kind,
+    held_by_host }`. `InvalidationReason::WillRevokeIn`.
+  - Client: `acquire_force` + `acquire_with_preempt_wait`
+    (polls every 50-500ms within the user's budget).
+  - Daemon + fuse Open/Create arms gain a defensive
+    `RevokePending => Err("BUG")` arm — these paths use
+    non-force acquire; the explicit arm fails loudly if a
+    future refactor flips them.
+- **Verification:** 25 lease unit tests (19 prior + 6 new
+  preempt). 4 F-lease-preempt integration tests on real
+  cluster (~15s including the 5s grace wait). All other
+  lease tests pass unchanged. `cargo build --workspace` +
+  clippy: clean.
+- **Out of scope (deferred):** writer-side auto-flush + auto-
+  release on receiving `WillRevokeIn`. The daemon currently
+  logs at WARN; the operator (or a higher-layer handler)
+  must react before the grace expires. Wiring this needs
+  per-session held_leases.release interplay with in-flight
+  writes; tractable but its own commit.
+- **passes:** completed (2026-06-05)
