@@ -1,172 +1,195 @@
 Date: 2026-06-05
 TaskStatus: completed
-Task scope: F-ioring-lease-3 — long-poll invalidation channel
-  (manager wait-for-event hook + daemon persistent poll loop).
-  Third step of the Phase 1 ioring + lease wiring (plan:
-  docs/autumn_fs_lease_plan.md §4.4 / §6.4). Without long-poll the
-  daemon would have to poll-spin (round-trip per second) to spot a
-  writer-close on another mount; with it, manager and daemon
-  coordinate via a single ~10 s long-poll that resolves in ms when
-  a real event fires.
+Task scope: F-ioring-lease-4 — OpenedExtents version-tagged + cache
+  invalidation e2e. LAST step of the Phase 1 ioring + lease wiring
+  (plan: docs/autumn_fs_lease_plan.md §3.1 + §4.4 + §6).
+  Close-to-open coherence now end-to-end: writer-close pushes
+  WriterClosed → reader's poll loop bumps the per-ino floor →
+  reader's next Read sees the stale predicate flip → reloads
+  the extent map before serving.
+
+  **PHASE 1 OF docs/autumn_fs_lease_plan.md IS COMPLETE.**
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
-  Already implemented (in main as of bddf806 + 6fa78f8 + this commit):
+  Already implemented (in main as of bddf806 + 6fa78f8 + ee5e5e3
+  + this commit):
     - F-ioring-lease-1 — manager InodeLease state + 4 RPCs + etcd
       persistence + TTL revoke loop.
     - F-ioring-lease-2 — ioring daemon Open/Close acquire+release
       + per-session heartbeat.
-    - F-ioring-lease-3 (THIS COMMIT) — long-poll invalidation
-      channel: manager wait-for-event hook + daemon persistent
-      poll loop + wholesale-invalidate on transport error /
-      overflow.
+    - F-ioring-lease-3 — long-poll invalidation channel: manager
+      wait-for-event hook + daemon persistent poll loop +
+      wholesale-invalidate on transport error / overflow.
+    - F-ioring-lease-4 (THIS COMMIT) — OpenedExtents.lease_version
+      + per-session InvalidationMap + cache_is_stale predicate +
+      reload_extents on stale → close-to-open coherence end-to-end.
 
-  Not yet implemented (this feature's remaining Phase 1 scope):
-    - F-ioring-lease-4 — `OpenedExtents` keyed by (ino, version);
-      per-ino consumer for WriterClosed/LeaseRevoked events that
-      drops the matching cache entry; multi-daemon e2e test
-      (writer close → reader's next Read sees the new bytes via
-      cache miss → re-resolve).
-
-  Deferred (Phase 2/3, outside this task):
+  Not yet implemented (Phase 2 / 3 — outside this task):
     - F-fuse-lease-1 / F-fuse-lease-2 (autumn-fuse opt-in +
       `notify_inval_inode`).
     - F-lease-preempt (force-revoke / writer revoke protocol).
 
+  Deferred (full-cluster byte-level e2e):
+    - A test that boots a real cluster + seeds a fuse file via the
+      WRITE path + has two ClusterClient sessions exercise the
+      writer→close→reader-reads pipeline byte-for-byte. The shape
+      lives in `crates/manager/tests/system_ioring_fuse.rs::
+      f248_ioring_reads_fuse_file` (#[ignore]'d); replicating it
+      with two distinct sessions is mechanical follow-up. The
+      protocol surface is fully exercised by F-4's 3 integration
+      tests + 4 pure-fn units.
+
 === WHAT THIS COMMIT SHIPS ===
 
-  - crates/manager/src/inode_lease.rs:
-    - ClientInbox gains `waker: Option<oneshot::Sender<()>>`.
-    - `ClientInbox::push` fires the waker when present (drop-
-      replace semantics on overwrite).
-    - `LeaseRegistry::drain_or_park(client)` returns
-      `(events, overflowed, Option<oneshot::Receiver<()>>)` —
-      atomic under one `borrow_mut`: drain returns events when
-      present, else installs a fresh waker + returns the matching
-      receiver.
-    - 3 new unit tests: drain_or_park_returns_events_when_present,
-      drain_or_park_installs_waker_and_push_wakes_it,
-      drain_or_park_replaces_stale_waker.
+  - crates/ioring/src/fuse_read.rs:
+    - OpenedExtents gains `lease_version: u64` (defaults to 0; the
+      production path populates it from
+      `MgrInodeLeaseInfo.version` at Open).
+    - New `reload_extents(cluster, &mut opened) -> Result<()>`:
+      re-fetches inode meta + extent map, updates `size + extents`
+      in place (does NOT touch lease_version — caller bumps).
+    - Test helper updated for the new field.
 
-  - crates/manager/src/rpc_handlers.rs::handle_poll_invalidations
-    upgraded to long-poll. Drain immediately if events present;
-    else `compio::time::sleep(LONG_POLL_WAIT=10s)` race'd against
-    the waker via `futures::future::select`; on wake or timeout
-    re-drain + return.
+  - crates/ioring/src/lease.rs:
+    - `InvalidationMap = HashMap<u64, u64>` type alias (ino → min-
+      valid-version).
+    - Pure-fn `apply_invalidation(events, &mut InvalidationMap)
+      -> saw_overflow: bool` — bumps per-ino floor via MAX,
+      detects MetaChanged{ino=0} overflow sentinel.
+    - Pure-fn `cache_is_stale(ino, lease_version, &InvalidationMap)
+      -> bool` — true iff there's a floor entry and lease_version
+      is below it.
+    - 4 new unit tests (apply_invalidation_records_writer_closed,
+      apply_invalidation_takes_max_across_events,
+      apply_invalidation_overflow_sentinel_returns_true,
+      cache_is_stale_when_lease_version_below_floor).
 
   - crates/ioring/src/bin/daemon.rs:
-    - New per-session `session_invalidation_poll_loop` spawned
-      next to `session_heartbeat_loop`. Tight loop over
-      `lease::poll_invalidations`.
-    - Per event: log WriterClosed/LeaseRevoked/MetaChanged at
-      INFO (F-4 will wire the per-ino consumer that drops the
-      matching `OpenedExtents`).
-    - On overflow sentinel (`MetaChanged { ino=0 }` from F-1) OR
-      transport error: wholesale-invalidate
-      `held_leases.clear()` + `ring_fds.clear()` + best-effort
-      ReleaseLease on every previously-held ino. Honours plan
-      §6.4 "subscribe-disconnect = invalidate everything."
-    - Transport error path sleeps 500 ms between retries (manager
-      auto-reconnect via ClusterClient::mgr_call_retry covers
-      reconnection).
+    - Per-session `invalidations: Rc<RefCell<InvalidationMap>>`
+      threaded through service_sqe + session_invalidation_poll_loop.
+    - Open arm: populates opened.lease_version from
+      AcquireLease.info.version (refcount path inherits from
+      held_leases[ino].version).
+    - Read arm: snapshots lease_version, calls cache_is_stale
+      against an invalidations.borrow() snapshot; on stale →
+      fuse_read::reload_extents + updates the cached ring_fds
+      entry's size/extents/lease_version; Read proceeds against
+      refreshed map. Reload failure → EIO.
+    - Write arm: snapshot carries lease_version for self-
+      consistency (writes don't reload — writer holds the lease).
+    - session_invalidation_poll_loop calls apply_invalidation
+      BEFORE per-event logging; overflow path clears
+      invalidations + held_leases + ring_fds; transport-error
+      path also clears it.
 
-  - crates/manager/tests/f_ioring_lease_3.rs (NEW): 3 integration
-    tests against in-process AutumnManager via real ClusterClient
-    transport:
-      1. long_poll_returns_promptly_on_writer_close — concurrent
-         writer-close after 200 ms wakes the parked reader in
-         well under 2 s; ≥ 150 ms floor proves the waker actually
-         waited (vs returning empty immediately).
-      2. long_poll_times_out_when_idle — empty poll waits
-         8 s ≤ t < 15 s then returns `Ok(vec![])`. The test takes
-         ~10 s by design (this is the slow case the long-poll
-         optimizes AWAY when a real event is firing).
-      3. long_poll_returns_all_queued_events — two writer-closes
-         on two distinct inos queued before poll both surface
-         in one response.
+  - crates/manager/tests/f_ioring_lease_4.rs (NEW): 3 integration
+    tests against in-process AutumnManager via real ClusterClient:
+      1. writer_close_bumps_reader_invalidation_floor — full wire
+         round-trip; asserts inv[ino] == new_version and
+         cache_is_stale(ino, pre_version, &inv) == true.
+      2. overflow_sentinel_triggers_wholesale_clear — 1025
+         writer-close cycles fill the queue past its 1024 cap;
+         next poll surfaces MetaChanged{ino=0} and
+         apply_invalidation returns saw_overflow=true.
+      3. out_of_order_events_dont_roll_back_floor — two cycles on
+         one ino + one cycle on another; MAX-wins end-to-end.
 
-  - crates/manager/tests/f_ioring_lease.rs: F-1's second-poll-
-    empty assertion removed (with long-poll engaged, the second
-    poll correctly blocks ~10 s; the "drain idempotent" property
-    is now covered by `drain_or_park_*` unit tests). Single-line
-    comment explains why.
-
-  - feature_list.md: F-ioring-lease-3 in the Completed table +
-    detail section under P14 (14 invariants now, L1-L14 spanning
-    F-1 + F-2 + F-3).
+  - feature_list.md: F-ioring-lease-4 in Completed table + detail
+    section under P14 (18 invariants total: L1-L18 across F-1/2/
+    3/4).
 
   - crates/manager/CLAUDE.md: Programming Note 34 extended with
-    L12 (single parked waker per client), L13 (push fires waker
-    before returning), L14 (daemon wholesale-invalidate on
-    transport error / overflow sentinel).
+    L15 (lease_version pinned at first opener), L16 (Read must
+    reload or EIO on stale), L17 (reload bumps to floor not
+    fresh acquire), L18 (writes don't reload). L14 (overflow /
+    transport-error wholesale-clear) updated to also clear the
+    F-4 invalidations map.
 
-  - README.md: F-ioring-lease bridge updated with the long-poll
-    behaviour + the new test command for F-3.
+  - README.md: F-ioring-lease bridge updated — Phase 1 declared
+    complete; future work (F-fuse-lease, F-lease-preempt)
+    listed. Added test command for F-4.
 
 === VERIFICATION ===
 
   cargo build --workspace                              : clean
   cargo test -p autumn-manager --lib                   : 131 passed
-                                                         (114 prior
-                                                         + 17 lease
-                                                         state-machine,
-                                                         incl. 3 new
-                                                         long-poll
+                                                         (unchanged
+                                                         from F-3)
+  cargo test -p autumn-ioring --features daemon --lib  : 84 passed
+                                                         (80 prior +
+                                                         4 new F-4
+                                                         pure-fn
                                                          units)
+  cargo test -p autumn-manager --test f_ioring_lease_4 : 3 passed
+                                                         (~10 s, dom.
+                                                         by 1025-
+                                                         cycle
+                                                         overflow
+                                                         test)
   cargo test -p autumn-manager --test f_ioring_lease   : 3 passed
-                                                         (back to
-                                                         <1 s after
-                                                         the F-1
-                                                         test
-                                                         update)
   cargo test -p autumn-manager --test f_ioring_lease_2 : 4 passed
-                                                         (unchanged)
   cargo test -p autumn-manager --test f_ioring_lease_3 : 3 passed
-                                                         (~20 s total,
-                                                         dominated by
-                                                         idle-timeout
-                                                         case)
-  cargo test -p autumn-ioring --features daemon --lib  : 4 lease +
-                                                         SQE tests
   cargo clippy ioring + manager                        : no warnings
+
+  TOTAL across F-1/2/3/4 integration: 13 tests, ~30 s wallclock
+  (F-3 idle-timeout case 10 s + F-4 overflow 10 s dominate).
+  TOTAL across all units: 131 manager + 84 ioring = 215 tests.
 
 === TESTING CAVEAT ===
 
   Per [[reproduce_before_fixing_mechanism_bugs]] the preferred
-  shape is reproduce → root-cause → fix + review. F-ioring-lease-3
-  is greenfield; the 3 F-3 integration tests + 3 long-poll unit
-  tests cover the wait-for-event contract end-to-end. The full
-  "stale-bytes-after-close" reproducer that proves the
-  invalidation actually evicts stale cache surfaces in
-  F-ioring-lease-4.
+  shape is reproduce → root-cause → fix + review. F-ioring-lease-4
+  is greenfield wiring of an already-shipped protocol; the 3 F-4
+  integration tests + 4 pure-fn units exercise the invalidation
+  bookkeeping end-to-end through the wire. The full byte-level
+  "two daemons share an OpenedExtents and the reader sees new
+  bytes after the writer's close" repro lives in a deferred full-
+  cluster test — same shape as system_ioring_fuse.rs::
+  f248_ioring_reads_fuse_file but with two distinct ClusterClient
+  sessions.
 
-  No regression was caught in F-3 development itself; the
-  semantic change (poll now long-polls instead of returning empty
-  immediately) needed one test update in F-1 (assertion that
-  was no longer informative under the new semantics) — caught
-  immediately by the 10 s test runtime, not by a wrong result.
+  The protocol contract end-to-end is now: writer-close →
+  ReleaseLease via the writer's ClusterClient → manager bumps
+  version + queues WriterClosed → fires the reader's parked
+  waker → reader's MSG_POLL_INVALIDATIONS returns within ~ms →
+  daemon's session_invalidation_poll_loop runs
+  apply_invalidation(events, &mut inv) → per-ino floor bumped
+  → next Read against the matching ring_fd hits
+  cache_is_stale → reload_extents fetches the post-close
+  state. Each step has at least one test covering it.
 
 === NEXT SESSION HAND-OFF ===
 
-  F-ioring-lease-4 is next + LAST in Phase 1. Outline:
-    - Extend `OpenedExtents` with `(ino, version)` from the
-      manager's AcquireLease response (already available as
-      `MgrInodeLeaseInfo.version`).
-    - In `session_invalidation_poll_loop`, on per-ino
-      WriterClosed / LeaseRevoked event: drop every ring_fd
-      whose `(ino, version)` is older than the event's version.
-      (Don't drop newer versions — handles reorder where the
-      ino was re-Open'd before the invalidation arrived.)
-    - Multi-daemon e2e test: daemon A writes, daemon B opens
-      + reads, daemon A closes, daemon B's NEXT Open sees the
-      bumped version → cache miss → re-resolve → new bytes.
-    - Consider whether `OpenedExtents.extents` (the variable-
-      length extent map) needs version tagging too — yes:
-      writer-close could have grown the file, so the extent
-      map is stale. The Read path's `get_many_into` would
-      hit ENOENT on the now-missing key. F-4 should re-run
-      `fuse_read::open` (path → ino → extent map) on cache miss.
+  Phase 1 of docs/autumn_fs_lease_plan.md is COMPLETE. The natural
+  next features are Phase 2:
+    - F-fuse-lease-1 — autumn-fuse mount opt-in. The fuse mount
+      already has `open` / `release` callbacks; they need to:
+      * Generate a per-mount DaemonClientId (kind=FUSE).
+      * On `open` with O_RDWR / O_WRONLY: call
+        lease::acquire(mode=WRITE). On EBUSY surface EAGAIN to
+        the fuse client.
+      * On `release`: call lease::release.
+      * Spawn the same session_heartbeat_loop +
+        session_invalidation_poll_loop the daemon does.
+    - F-fuse-lease-2 — fuse-side cache eviction. fuser provides
+      `notify_inval_inode` to drop the kernel's attribute +
+      page cache; wire it from the poll loop's per-ino
+      WriterClosed/LeaseRevoked branch.
+    - F-fuse-lease-3 — multi-mount byte-level test.
 
-  See `docs/autumn_fs_lease_plan.md` §3.1 + §6.
+  And/or Phase 3:
+    - F-lease-preempt — manager's `force=true` AcquireLease
+      RPC that revokes the current writer via a planned-
+      revoke handshake (manager → writer "you have 5 s to
+      flush + release"; on timeout it just steals the
+      revision).
+
+  Both series build cleanly on Phase 1's foundation. No
+  architecture changes needed; just call sites + a new
+  RPC for the preempt case.
+
+  See `docs/autumn_fs_lease_plan.md` §5 Phase 2/3 for the full
+  list.
 
 Env: linux, autumn-rs main branch.

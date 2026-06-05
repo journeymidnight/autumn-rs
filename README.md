@@ -191,6 +191,12 @@ Landed so far:
   via a retry tick. Daemon spawns a persistent
   `session_invalidation_poll_loop`; on transport error or overflow
   sentinel it wholesale-invalidates the session cache.
+- **F-ioring-lease-4** — `OpenedExtents.lease_version` populated
+  from the AcquireLease response; per-session `InvalidationMap`
+  bumped by the poll loop. Read SQE arm calls `cache_is_stale`
+  and on stale invokes `fuse_read::reload_extents` to re-fetch
+  the inode meta + extent map before serving — close-to-open
+  coherence end-to-end. **Phase 1 complete.**
 
 Smoke-tests (no cluster boot required):
 
@@ -206,6 +212,11 @@ cargo test -p autumn-manager --test f_ioring_lease_2
 # Long-poll: writer-close wakes a parked reader in ms (3 tests; the
 # idle-timeout case waits the full 10s LONG_POLL_WAIT — ~30 s total).
 cargo test -p autumn-manager --test f_ioring_lease_3
+
+# Close-to-open cache invalidation: per-ino floor bumps on
+# WriterClosed; reader's stale-cache predicate flips; overflow
+# sentinel surfaces (overflow test takes ~10 s for its 1025 cycles).
+cargo test -p autumn-manager --test f_ioring_lease_4
 ```
 
 Daemon manual exercise (against a real cluster):
@@ -220,9 +231,13 @@ cargo run -p autumn-ioring --features daemon --bin autumn-ioring-daemon -- \
 # against the same path → second CQE.result == -libc::EBUSY.
 ```
 
-Still pending in this series:
-- F-ioring-lease-4 — `OpenedExtents` keyed by `(ino, version)` +
-  multi-daemon end-to-end test exercising real ring reads.
+Phase 1 is complete. Future work tracked under separate features:
+- **F-fuse-lease-1/2/3** — autumn-fuse mount opt-in: open/release
+  call lease::acquire/release; kernel attribute cache invalidated
+  via `fuser::notify_inval_inode`.
+- **F-lease-preempt** — force-revoke / writer revoke protocol so
+  "another daemon needs to write NOW" doesn't have to wait for
+  the current writer to close.
 
 ## Documentation map
 

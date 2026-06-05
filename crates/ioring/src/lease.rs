@@ -218,10 +218,117 @@ pub async fn poll_invalidations(
     }
 }
 
+// ──────────────────── F-ioring-lease-4 ─────────────────────────────────
+//
+// Per-session "minimum valid version" map. The
+// `session_invalidation_poll_loop` updates this on every per-ino
+// invalidation event; the Read SQE arm consults it to decide whether
+// to reload the cached extent map.
+
+use std::collections::HashMap;
+
+/// Per-inode minimum version a cached `OpenedExtents.lease_version`
+/// must match to be considered fresh. An inode absent from the map
+/// has never been invalidated → cache is always fresh (within the
+/// lease TTL — see the heartbeat path for the orthogonal staleness
+/// mode).
+pub type InvalidationMap = HashMap<u64, u64>;
+
+/// Update the invalidation map from a batch of incoming events.
+/// Returns `true` iff any event was the overflow sentinel
+/// (`MetaChanged { ino == 0 }`); the caller then wholesale-
+/// invalidates the session's ring_fds + held_leases per plan §6.4.
+///
+/// Pure-fn: tested in `apply_invalidation_*` below.
+pub fn apply_invalidation(
+    events: &[autumn_rpc::manager_rpc::MgrInvalidation],
+    inv: &mut InvalidationMap,
+) -> bool {
+    let mut saw_overflow = false;
+    for ev in events {
+        if ev.kind == autumn_rpc::manager_rpc::LEASE_INVAL_META_CHANGED && ev.ino == 0 {
+            saw_overflow = true;
+            continue;
+        }
+        // Take the max: out-of-order pushes shouldn't roll back the
+        // valid-version floor.
+        let slot = inv.entry(ev.ino).or_insert(0);
+        if ev.version > *slot {
+            *slot = ev.version;
+        }
+    }
+    saw_overflow
+}
+
+/// True when the cached `(ino, lease_version)` has been overtaken by
+/// a known invalidation. Pure-fn — the caller passes a snapshot of
+/// the session's `InvalidationMap` taken under a brief borrow.
+pub fn cache_is_stale(ino: u64, lease_version: u64, inv: &InvalidationMap) -> bool {
+    match inv.get(&ino) {
+        Some(min_valid) => lease_version < *min_valid,
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autumn_rpc::manager_rpc::LEASE_CLIENT_KIND_FUSE;
+    use autumn_rpc::manager_rpc::{
+        LEASE_CLIENT_KIND_FUSE, LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_META_CHANGED,
+        LEASE_INVAL_WRITER_CLOSED,
+    };
+
+    fn ev(ino: u64, version: u64, kind: u8) -> autumn_rpc::manager_rpc::MgrInvalidation {
+        autumn_rpc::manager_rpc::MgrInvalidation { ino, version, kind }
+    }
+
+    #[test]
+    fn apply_invalidation_records_writer_closed() {
+        let mut m = InvalidationMap::new();
+        let overflow = apply_invalidation(&[ev(7, 5, LEASE_INVAL_WRITER_CLOSED)], &mut m);
+        assert!(!overflow);
+        assert_eq!(m.get(&7).copied(), Some(5));
+    }
+
+    #[test]
+    fn apply_invalidation_takes_max_across_events() {
+        let mut m = InvalidationMap::new();
+        apply_invalidation(
+            &[
+                ev(7, 3, LEASE_INVAL_LEASE_REVOKED),
+                ev(7, 8, LEASE_INVAL_WRITER_CLOSED),
+                ev(7, 5, LEASE_INVAL_WRITER_CLOSED), // out of order
+            ],
+            &mut m,
+        );
+        assert_eq!(m.get(&7).copied(), Some(8), "must NOT roll back the floor");
+    }
+
+    #[test]
+    fn apply_invalidation_overflow_sentinel_returns_true() {
+        let mut m = InvalidationMap::new();
+        let overflow = apply_invalidation(
+            &[
+                ev(0, 0, LEASE_INVAL_META_CHANGED),
+                ev(9, 4, LEASE_INVAL_WRITER_CLOSED),
+            ],
+            &mut m,
+        );
+        assert!(overflow, "ino=0 + MetaChanged means overflow");
+        assert_eq!(m.get(&9).copied(), Some(4), "non-sentinel events still apply");
+    }
+
+    #[test]
+    fn cache_is_stale_when_lease_version_below_floor() {
+        let mut m = InvalidationMap::new();
+        m.insert(7, 5);
+        assert!(cache_is_stale(7, 3, &m));
+        assert!(cache_is_stale(7, 4, &m));
+        assert!(!cache_is_stale(7, 5, &m));
+        assert!(!cache_is_stale(7, 6, &m));
+        // No invalidation entry → always fresh.
+        assert!(!cache_is_stale(8, 0, &m));
+    }
 
     #[test]
     fn fresh_identity_has_iouring_kind() {

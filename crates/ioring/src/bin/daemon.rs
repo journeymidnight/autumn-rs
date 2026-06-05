@@ -60,7 +60,10 @@ use clap::Parser;
 use autumn_ioring::cqe::Cqe;
 use autumn_ioring::handshake::{self, DaemonLimits, HelloStatus};
 use autumn_ioring::header::{RingHeader, HEADER_SIZE};
-use autumn_ioring::lease::{self, AcquireResult, DaemonClientId, HeartbeatResult};
+use autumn_ioring::lease::{
+    self, apply_invalidation, cache_is_stale, AcquireResult, DaemonClientId, HeartbeatResult,
+    InvalidationMap,
+};
 use autumn_ioring::mmap::{prot, MmapRegion};
 use autumn_ioring::opcode::Opcode;
 use autumn_ioring::ring::{CqProducer, SqConsumer};
@@ -369,6 +372,14 @@ async fn poller_loop(
     let held_leases: Rc<RefCell<HashMap<u64, SessionLease>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
+    // F-ioring-lease-4: per-session "minimum valid version" map. The
+    // poll-loop bumps an entry on every per-ino invalidation event;
+    // the Read SQE arm calls `cache_is_stale` against a snapshot and
+    // triggers `fuse_read::reload_extents` on staleness so the next
+    // read fetches the post-close bytes (close-to-open coherence).
+    let invalidations: Rc<RefCell<InvalidationMap>> =
+        Rc::new(RefCell::new(InvalidationMap::new()));
+
     // Spawn a per-session heartbeat task — keeps held leases alive
     // past their TTL (30 s default; we tick at TTL/6 = 5 s). On
     // HeartbeatResult::NotHeld we drop the held entry + every
@@ -395,13 +406,17 @@ async fn poller_loop(
     // sentinel we drop every cached ring_fd + held lease
     // (plan §6.4 "subscribe disconnect = invalidate everything")
     // so a connection blip never leaves us serving stale state.
+    // F-ioring-lease-4: per-ino events update the shared
+    // `invalidations` map; the Read SQE arm checks it and reloads
+    // the extent map on staleness.
     {
         let cluster_i = cluster.clone();
         let client_i = client_id.clone();
         let held_i = held_leases.clone();
         let ring_fds_i = ring_fds.clone();
+        let inv_i = invalidations.clone();
         compio::runtime::spawn(async move {
-            session_invalidation_poll_loop(cluster_i, client_i, held_i, ring_fds_i).await
+            session_invalidation_poll_loop(cluster_i, client_i, held_i, ring_fds_i, inv_i).await
         })
         .detach();
     }
@@ -430,6 +445,7 @@ async fn poller_loop(
             let next_fd_c = next_fd.clone();
             let client_c = client_id.clone();
             let held_c = held_leases.clone();
+            let inv_c = invalidations.clone();
             // `data_base` (Copy raw ptr) + `reg_ref` (Copy ref into `ring_reg`,
             // which outlives `inflight`) are captured by the future; the Read arm
             // builds its dest slice from them.
@@ -445,6 +461,7 @@ async fn poller_loop(
                     reg_ref,
                     &client_c,
                     &held_c,
+                    &inv_c,
                 )
                 .await
             });
@@ -487,6 +504,9 @@ async fn service_sqe(
     // F-ioring-lease-2: per-session daemon identity + per-inode lease refcount.
     client_id: &Rc<DaemonClientId>,
     held_leases: &Rc<RefCell<HashMap<u64, SessionLease>>>,
+    // F-ioring-lease-4: per-session "minimum valid version" map updated by
+    // session_invalidation_poll_loop; the Read arm consults it.
+    invalidations: &Rc<RefCell<InvalidationMap>>,
 ) -> Cqe {
     match sqe.opcode {
         Opcode::Nop => Cqe::ok(sqe.user_data, 0),
@@ -505,7 +525,7 @@ async fn service_sqe(
             // (was: treat `path` as a flat KV key + cache one PS). Reading the
             // actual chunked file the fuse mount writes; per-extent routing now
             // happens inside `get_many_into` on each Read.
-            let opened = match fuse_read::open(cluster, &path).await {
+            let mut opened = match fuse_read::open(cluster, &path).await {
                 Ok(o) => o,
                 Err(e) => {
                     let msg = e.to_string();
@@ -578,6 +598,10 @@ async fn service_sqe(
                         if let Some(slot) = held_leases.borrow_mut().get_mut(&ino) {
                             slot.version = info.version;
                         }
+                        // F-ioring-lease-4: tag the cache entry so the
+                        // Read arm can compare against the per-session
+                        // `invalidations` floor.
+                        opened.lease_version = info.version;
                     }
                     Ok(AcquireResult::Conflict { manager_message }) => {
                         held_leases.borrow_mut().remove(&ino);
@@ -593,6 +617,13 @@ async fn service_sqe(
                         tracing::warn!(ino, error = %e, "AcquireLease failed; EIO");
                         return Cqe::err(sqe.user_data, libc::EIO);
                     }
+                }
+            } else {
+                // Refcount path: inherit the version pinned by the
+                // first opener (held_leases.version is already the
+                // server-side value).
+                if let Some(slot) = held_leases.borrow().get(&ino) {
+                    opened.lease_version = slot.version;
                 }
             }
             let fd = next_fd.get();
@@ -611,17 +642,51 @@ async fn service_sqe(
             // DIRECTLY into the ring buffer slot — no whole-value amplification,
             // no intermediate buffer + copy. On UCX (reg=Some) ≥64 KiB extents
             // RDMA-land in the ring; on TCP the transport recvs into it.
-            let opened = {
+            let mut opened = {
                 let fds = ring_fds.borrow();
                 match fds.get(&sqe.ring_fd) {
                     Some(o) => OpenedExtents {
                         ino: o.ino,
                         size: o.size,
                         extents: o.extents.clone(),
+                        lease_version: o.lease_version,
                     },
                     None => return Cqe::err(sqe.user_data, libc::EBADF),
                 }
             };
+            // F-ioring-lease-4: close-to-open coherence. If another
+            // daemon's writer closed since we Open'd, the manager
+            // pushed an invalidation event which the poll loop turned
+            // into a bumped `invalidations[ino]`. We reload the
+            // extent map + size via the inode key + extent range
+            // scan. The next Read after a reload sees the new bytes.
+            let target_version = invalidations
+                .borrow()
+                .get(&opened.ino)
+                .copied()
+                .unwrap_or(0);
+            if cache_is_stale(opened.ino, opened.lease_version, &invalidations.borrow()) {
+                match fuse_read::reload_extents(cluster, &mut opened).await {
+                    Ok(()) => {
+                        opened.lease_version = target_version;
+                        // Update the cached entry so future Reads
+                        // skip the reload.
+                        if let Some(o) = ring_fds.borrow_mut().get_mut(&sqe.ring_fd) {
+                            o.size = opened.size;
+                            o.extents = opened.extents.clone();
+                            o.lease_version = opened.lease_version;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            ino = opened.ino,
+                            error = %e,
+                            "F-ioring-lease-4: reload_extents failed; surfacing EIO"
+                        );
+                        return Cqe::err(sqe.user_data, libc::EIO);
+                    }
+                }
+            }
             // SAFETY: `validate_slice` (above) guarantees the slot is in-bounds,
             // slot-aligned, and length ≤ slot_size → contained in ONE buffer-pool
             // slot. The client owns slot allocation and never reuses a slot with a
@@ -665,6 +730,7 @@ async fn service_sqe(
                         ino: o.ino,
                         size: o.size,
                         extents: o.extents.clone(),
+                        lease_version: o.lease_version,
                     },
                     None => return Cqe::err(sqe.user_data, libc::EBADF),
                 }
@@ -786,15 +852,22 @@ async fn session_invalidation_poll_loop(
     client_id: Rc<DaemonClientId>,
     held_leases: Rc<RefCell<HashMap<u64, SessionLease>>>,
     ring_fds: Rc<RefCell<HashMap<u32, OpenedExtents>>>,
+    invalidations: Rc<RefCell<InvalidationMap>>,
 ) {
     loop {
         match lease::poll_invalidations(&cluster, &client_id).await {
             Ok(events) => {
-                let mut wholesale = false;
+                // F-ioring-lease-4: bump the per-ino floor for every
+                // event in the batch. The pure-fn return signals an
+                // overflow sentinel was seen — wholesale-invalidate
+                // below.
+                let wholesale = {
+                    let mut inv = invalidations.borrow_mut();
+                    apply_invalidation(&events, &mut inv)
+                };
                 for ev in &events {
                     match ev.kind {
                         LEASE_INVAL_META_CHANGED if ev.ino == 0 => {
-                            wholesale = true;
                             tracing::warn!(
                                 "F-ioring-lease-3: overflow sentinel; invalidating session cache"
                             );
@@ -803,7 +876,7 @@ async fn session_invalidation_poll_loop(
                             tracing::info!(
                                 ino = ev.ino,
                                 version = ev.version,
-                                "invalidation: writer closed (F-4 will drop the cached entry)"
+                                "invalidation: writer closed (cache will reload on next Read)"
                             );
                         }
                         LEASE_INVAL_LEASE_REVOKED => {
@@ -830,6 +903,7 @@ async fn session_invalidation_poll_loop(
                         held_leases.borrow().keys().copied().collect();
                     held_leases.borrow_mut().clear();
                     ring_fds.borrow_mut().clear();
+                    invalidations.borrow_mut().clear();
                     // Best-effort: tell the manager we're letting go
                     // of every held lease so its TTL revoke loop
                     // doesn't sit on them until expiry. Errors here
@@ -852,6 +926,7 @@ async fn session_invalidation_poll_loop(
                 );
                 held_leases.borrow_mut().clear();
                 ring_fds.borrow_mut().clear();
+                invalidations.borrow_mut().clear();
                 compio::time::sleep(Duration::from_millis(500)).await;
             }
         }

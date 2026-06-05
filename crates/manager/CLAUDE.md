@@ -1669,7 +1669,30 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       while clearing `ring_fds` would refuse subsequent Opens with
       stale EBUSY. This is the only place the daemon's cache can
       ever be wholesale-dropped — the heartbeat loop's NotHeld
-      branch only drops the single affected ino.
+      branch only drops the single affected ino. The wholesale-
+      clear path also clears the F-ioring-lease-4
+      `invalidations` map (otherwise a freshly re-Open'd ino
+      would compare against a stale per-ino floor).
+    - **L15** (F-ioring-lease-4) `OpenedExtents.lease_version`
+      MUST be the `MgrInodeLeaseInfo.version` the manager
+      returned at the AcquireLease that opened (or refcounted-
+      into) this ring_fd. Refcount-shared ring_fds inherit the
+      FIRST opener's version so the per-ino staleness check
+      stays single-valued.
+    - **L16** (F-ioring-lease-4, daemon Read arm) cache-stale ⇒
+      `fuse_read::reload_extents` BEFORE the `read_into`, OR
+      EIO. Never serve bytes from a confirmed-stale
+      `OpenedExtents` — even a partial read of pre-close bytes
+      breaks close-to-open coherence.
+    - **L17** (F-ioring-lease-4) reload bumps `lease_version`
+      to the per-ino floor (the just-applied invalidation's max
+      version), NOT to a fresh AcquireLease's response. The
+      next Open of the same path takes its own server-side
+      version on the new AcquireLease.
+    - **L18** (F-ioring-lease-4) writes do NOT trigger reload.
+      The writer holds the writer lease; no other writer can
+      have raced this session's cache. Lease preemption
+      (F-lease-preempt) would change this; deferred.
 
     **Out of scope this commit:** daemon Open/Close wiring
     (F-ioring-lease-2), long-poll loop + reconnect-invalidates-all
