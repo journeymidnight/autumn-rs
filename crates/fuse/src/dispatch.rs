@@ -30,9 +30,25 @@ fn lease_mode_for_open(flags: i32) -> u8 {
     }
 }
 
-/// F-fuse-lease-1: per-mount background tasks. Spawn ONCE on the
-/// compio runtime right after `FsState::new` (before the dispatch
-/// loop). Mirrors `autumn-ioring`'s
+/// F-fuse-lease-2: callback the per-mount invalidation poll loop
+/// runs for every per-ino `WriterClosed` / `LeaseRevoked` event.
+/// In production this is `notifier.inval_inode(ino, 0, 0)` against
+/// the live `fuser::Session`'s `Notifier`, which drops the kernel's
+/// attribute + page cache for the ino so the next syscall reaches
+/// our dispatcher.
+///
+/// Boxed as a trait object on `Rc` because the compio runtime is
+/// single-threaded — `Rc` is enough; no `Send` needed — and the
+/// callback is invoked many times per event batch (so we don't
+/// move-out).
+///
+/// `None` in tests + headless contexts skips kernel-side eviction
+/// (the user-space lease bookkeeping still updates correctly).
+pub type InodeInvalidator = std::rc::Rc<dyn Fn(u64)>;
+
+/// F-fuse-lease-1 + F-fuse-lease-2: per-mount background tasks.
+/// Spawn ONCE on the compio runtime right after `FsState::new`
+/// (before the dispatch loop). Mirrors `autumn-ioring`'s
 /// `session_heartbeat_loop` + `session_invalidation_poll_loop`:
 ///
 /// - heartbeat: TTL/6 = 5s tick; renews every held lease;
@@ -40,16 +56,15 @@ fn lease_mode_for_open(flags: i32) -> u8 {
 ///   fds will surface EIO on their next op — explicit failure
 ///   beats silently serving stale state).
 /// - invalidation poll: persistent long-poll; per-event update
-///   `invalidations[ino]` via `apply_invalidation`; overflow
-///   sentinel or transport error → wholesale invalidate.
-///
-/// The fuse mount doesn't track per-fd cached extent maps the way
-/// the ioring daemon does — fuse reads round-trip via the FUSE
-/// kernel layer, which has its own attribute/data cache. So this
-/// loop's per-ino consumer is intentionally a no-op in F-fuse-lease-1
-/// beyond logging; F-fuse-lease-2 will call `fuser::notify_inval_inode`
-/// from here to flush the kernel cache.
-pub fn spawn_lease_background_tasks(state: &FsState) {
+///   `invalidations[ino]` via `apply_invalidation`; **F-fuse-lease-2:**
+///   per-ino call `invalidator(ino)` (when supplied) so the kernel's
+///   attribute + page cache is dropped — without this, a fuse
+///   reader on host B may continue to serve from the kernel page
+///   cache after host A's writer closes, breaking close-to-open
+///   coherence at the kernel boundary even though the user-space
+///   lease state is correct. Overflow sentinel or transport error
+///   → wholesale invalidate + best-effort `ReleaseLease`.
+pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeInvalidator>) {
     use std::time::Duration;
     let cluster_h = state.client.clone();
     let id_h = state.client_id.clone();
@@ -88,6 +103,7 @@ pub fn spawn_lease_background_tasks(state: &FsState) {
     let id_p = state.client_id.clone();
     let held_p = state.held_leases.clone();
     let inv_p = state.invalidations.clone();
+    let invalidator_p = invalidator;
     compio::runtime::spawn(async move {
         loop {
             match autumn_client::lease::poll_invalidations(&cluster_p, &id_p).await {
@@ -101,8 +117,21 @@ pub fn spawn_lease_background_tasks(state: &FsState) {
                             ino = ev.ino,
                             version = ev.version,
                             kind = ev.kind,
-                            "F-fuse-lease-1: invalidation (kernel-cache evict wires in F-fuse-lease-2)"
+                            "F-fuse-lease-2: invalidation"
                         );
+                        // F-fuse-lease-2: drop the kernel's
+                        // attribute + page cache for this ino so
+                        // the next syscall reaches our dispatcher
+                        // and re-reads the post-close bytes.
+                        // ino=0 sentinel + non-positive inos are
+                        // skipped (overflow path handles the
+                        // wholesale case below; ino=0 isn't a real
+                        // FUSE ino).
+                        if ev.ino != 0 {
+                            if let Some(inv) = &invalidator_p {
+                                inv(ev.ino);
+                            }
+                        }
                     }
                     if wholesale {
                         tracing::warn!(
@@ -120,6 +149,15 @@ pub fn spawn_lease_background_tasks(state: &FsState) {
                         let drained: Vec<u64> = held_p.borrow().keys().copied().collect();
                         held_p.borrow_mut().clear();
                         inv_p.borrow_mut().clear();
+                        // F-fuse-lease-2: kernel-side wholesale
+                        // eviction too — otherwise a reader app
+                        // keeps serving from page cache after we
+                        // dropped the lease bookkeeping.
+                        if let Some(inv) = &invalidator_p {
+                            for ino in &drained {
+                                inv(*ino);
+                            }
+                        }
                         for ino in drained {
                             if let Err(e) =
                                 autumn_client::lease::release(&cluster_p, &id_p, ino).await
@@ -143,6 +181,11 @@ pub fn spawn_lease_background_tasks(state: &FsState) {
                     let drained: Vec<u64> = held_p.borrow().keys().copied().collect();
                     held_p.borrow_mut().clear();
                     inv_p.borrow_mut().clear();
+                    if let Some(inv) = &invalidator_p {
+                        for ino in &drained {
+                            inv(*ino);
+                        }
+                    }
                     for ino in drained {
                         let _ = autumn_client::lease::release(&cluster_p, &id_p, ino).await;
                     }

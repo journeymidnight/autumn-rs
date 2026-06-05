@@ -72,11 +72,45 @@ fn main() -> Result<()> {
     let tx = bridge.tx.clone();
     let mut rx = bridge.rx;
 
+    // F-fuse-lease-2: build the fuse Session UP FRONT so we can
+    // grab a `Notifier` BEFORE the compio thread starts. The
+    // notifier is `Clone + Send`; we ship one clone to the compio
+    // thread (wrapped in the `InodeInvalidator` Rc-Fn closure) so
+    // the invalidation poll loop can drop the kernel's attribute
+    // + page cache on per-ino `WriterClosed` / `LeaseRevoked`
+    // events. Without this, a reader app on host B continues to
+    // serve from the kernel page cache after host A's writer
+    // closes — close-to-open coherence breaks at the kernel
+    // boundary even though the user-space lease state is correct.
+    let mut options = vec![
+        fuser::MountOption::FSName("autumn-fuse".to_string()),
+        fuser::MountOption::DefaultPermissions,
+        // max_read=8 MiB so a userspace pread(8 MiB) arrives as one FUSE read
+        // instead of 64 × 128 KiB (kernel default). One large FUSE read fans
+        // out across the file's variable-length extents (F247, ≤ 8 MiB each)
+        // via `get_many_into` — each whole-extent get is ZC-eligible (≥ 64 KiB).
+        fuser::MountOption::CUSTOM("max_read=8388608".to_string()),
+    ];
+    if args.allow_other {
+        options.push(fuser::MountOption::AllowOther);
+    }
+
+    let fs = AutumnFs::new(tx);
+    tracing::info!(mountpoint = %mountpoint.display(), "mounting filesystem");
+    let mut session = fuser::Session::new(fs, &mountpoint, &options)?;
+    let notifier = session.notifier();
+
     // Start the compio thread
     let manager_addr = args.manager.clone();
     let compio_handle = std::thread::Builder::new()
         .name("autumn-fuse-compio".to_string())
         .spawn(move || {
+            // Move `notifier` into this thread; the
+            // `InodeInvalidator` Rc-Fn closure constructed below
+            // wraps it inside the compio runtime (which is
+            // single-threaded so the Rc trait object never
+            // crosses threads after this point).
+            let notifier = notifier;
             compio::runtime::Runtime::new().unwrap().block_on(async {
                 // Connect to cluster
                 let mut state = match FsState::new(&manager_addr).await {
@@ -88,11 +122,27 @@ fn main() -> Result<()> {
                 };
                 tracing::info!("connected to cluster");
 
+                // F-fuse-lease-2: build the invalidator that the
+                // poll loop calls per WriterClosed/LeaseRevoked
+                // event. `inval_inode(ino, 0, 0)` drops both
+                // attribute and the full data range — kernel
+                // re-fetches via our dispatcher on the next read.
+                let invalidator: dispatch::InodeInvalidator =
+                    std::rc::Rc::new(move |ino: u64| {
+                        if let Err(e) = notifier.inval_inode(ino, 0, 0) {
+                            tracing::warn!(
+                                ino,
+                                error = %e,
+                                "F-fuse-lease-2: notify_inval_inode failed (kernel may have already dropped)"
+                            );
+                        }
+                    });
+
                 // F-fuse-lease-1: spawn per-mount lease heartbeat +
                 // invalidation poll loops. They share the compio
                 // runtime and reference state.held_leases /
                 // state.invalidations via Rc<RefCell<…>>.
-                dispatch::spawn_lease_background_tasks(&state);
+                dispatch::spawn_lease_background_tasks(&state, Some(invalidator));
 
                 let sync_interval = Duration::from_secs(30);
                 let mut last_sync = std::time::Instant::now();
@@ -127,24 +177,9 @@ fn main() -> Result<()> {
         })
         .context("spawn compio thread")?;
 
-    // Build FUSE mount options
-    let mut options = vec![
-        fuser::MountOption::FSName("autumn-fuse".to_string()),
-        fuser::MountOption::DefaultPermissions,
-        // max_read=8 MiB so a userspace pread(8 MiB) arrives as one FUSE read
-        // instead of 64 × 128 KiB (kernel default). One large FUSE read fans
-        // out across the file's variable-length extents (F247, ≤ 8 MiB each)
-        // via `get_many_into` — each whole-extent get is ZC-eligible (≥ 64 KiB).
-        fuser::MountOption::CUSTOM("max_read=8388608".to_string()),
-    ];
-    if args.allow_other {
-        options.push(fuser::MountOption::AllowOther);
-    }
-
-    // Mount and run FUSE (blocks until unmounted)
-    let fs = AutumnFs::new(tx);
-    tracing::info!(mountpoint = %mountpoint.display(), "mounting filesystem");
-    fuser::mount2(fs, &mountpoint, &options)?;
+    // Run the fuse session loop on the main thread. Blocks until
+    // unmount.
+    session.run()?;
 
     tracing::info!("filesystem unmounted");
 

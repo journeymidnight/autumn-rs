@@ -26,7 +26,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 rkyv = { version = "0.8", features = ["alloc"] }
-fuser = { version = "0.15", optional = true }
+# F-fuse-lease-2: `abi-7-12` unlocks `Notifier::inval_inode` /
+# `inval_entry` — required so the per-mount invalidation poll loop
+# can drop the kernel's attribute + page cache on per-ino
+# `WriterClosed` events. Brings the close-to-open coherence
+# guarantee all the way through to the kernel boundary.
+fuser = { version = "0.15", optional = true, features = ["abi-7-12"] }
 libc = { version = "0.2", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 crossbeam-channel = { version = "0.5", optional = true }
