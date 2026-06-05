@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+# start.sh — single-host autumn-rs cluster launcher
+#
+# Brings up: etcd + manager + N extent-nodes (one per /dataK NVMe) + 1 PS,
+# then bootstraps an empty cluster.
+#
+# Edit DATA_DIRS to match your local NVMe layout. Each present dir = one EN.
+# Use ./stop.sh (or `pkill -f autumn-` + `pkill etcd`) to tear down.
+
+set -euo pipefail
+
+# ============================================================
+# Config
+# ============================================================
+
+# Per-EN data dirs. Each present dir → one EN. Missing dirs are skipped.
+DATA_DIRS=(
+    /data03/autumn-rs
+    /data05/autumn-rs
+    /data06/autumn-rs
+    /data07/autumn-rs
+    /data08/autumn-rs
+)
+
+REPO="${REPO:-$(cd "$(dirname "$0")" && pwd)}"
+BIN="${BIN:-$REPO/target/release}"
+WORK="${WORK:-/var/lib/autumn-rs}"            # etcd data + PS local state + logs
+LOG_DIR="${LOG_DIR:-$WORK/logs}"
+BIND_HOST="${BIND_HOST:-127.0.0.1}"
+MANAGER_ADDR="$BIND_HOST:9001"
+PS_PORT="${PS_PORT:-9301}"
+EN_BASE_PORT="${EN_BASE_PORT:-18101}"          # EN i listens on EN_BASE_PORT+i-1
+# autumn-op format hardcodes control_addr = data_port + 1000, so the EN
+# data and control ports MUST stay 1000 apart. Pick a base whose +1000
+# range is also free. On this host Ray's IDLE workers claim 10101-10110,
+# which is autumn's historical default (9101+1000). Moved both ranges
+# above that to 18101-18105 (data) + 19101-19105 (control). Bump
+# EN_BASE_PORT if 18101+ is also in use on your host.
+EN_CPU_BASE="${EN_CPU_BASE:-0}"                # EN i pinned to cpu (EN_CPU_BASE+i-1)
+TRANSPORT="${TRANSPORT:-tcp}"                  # tcp | ucx
+
+MANAGER="$BIN/autumn-manager-server"
+NODE="$BIN/autumn-extent-node"
+PS="$BIN/autumn-ps"
+AO="$BIN/autumn-op"
+
+# ============================================================
+# Helpers
+# ============================================================
+
+log()  { printf '[start] %s\n' "$*" >&2; }
+die()  { printf '[start] error: %s\n' "$*" >&2; exit 1; }
+
+wait_port() {
+    local port="$1" name="$2" tries="${3:-30}"
+    local i  # CRITICAL: must be local, else clobbers the outer for-loop's $i
+    for ((i=0; i<tries; i++)); do
+        if (exec 3<>"/dev/tcp/$BIND_HOST/$port") 2>/dev/null; then
+            exec 3>&- 3<&-
+            return 0
+        fi
+        sleep 0.5
+    done
+    die "$name did not open port $port within $((tries/2))s"
+}
+
+start_proc() {
+    # start_proc <name> <cmd...>  — daemonize via setsid + nohup, log to LOG_DIR
+    local name="$1"; shift
+    local log="$LOG_DIR/$name.log"
+    log "starting $name → $log"
+    nohup setsid "$@" >"$log" 2>&1 &
+    sleep 0.1
+}
+
+# ============================================================
+# Preflight
+# ============================================================
+
+[[ -x "$MANAGER" ]] || die "manager binary missing: $MANAGER (run: cargo build --release -p autumn-server)"
+[[ -x "$NODE"    ]] || die "extent-node binary missing: $NODE"
+[[ -x "$PS"      ]] || die "ps binary missing: $PS"
+[[ -x "$AO"      ]] || die "autumn-op binary missing: $AO"
+command -v etcd >/dev/null || die "etcd not in PATH — install from github.com/etcd-io/etcd/releases"
+
+# Filter to present disks
+present_disks=()
+for d in "${DATA_DIRS[@]}"; do
+    parent="$(dirname "$d")"
+    if [[ -d "$parent" ]]; then
+        mkdir -p "$d"
+        present_disks+=("$d")
+    else
+        log "skip $d — parent $parent does not exist"
+    fi
+done
+(( ${#present_disks[@]} >= 3 )) || die "need at least 3 present data dirs (RF=3); have ${#present_disks[@]}"
+N_EN=${#present_disks[@]}
+
+mkdir -p "$WORK" "$LOG_DIR" "$WORK/ps"
+
+# ----- etcd state: interactive wipe-vs-preserve -----
+#
+# bootstrap accumulates partition/extent IDs in etcd; a stale leftover from
+# a wedged stop / SIGKILL'd etcd / surviving bind-mount can make the next
+# bootstrap mint new ids on top of dangling references → PS opens the
+# partition, commit_length finds 0/3 EN replicas have the extent, retries
+# forever (witnessed: `part_id=17 stream_id=11 extent 12 0/3 committed
+# members reachable`).
+#
+# But the OPPOSITE failure mode is what just bit us: wiping etcd while the
+# data dirs still hold the previous cluster's `cluster_id` sentinel makes
+# `autumn-op format` bail with "already formatted for cluster X". So we
+# don't auto-wipe anymore — the operator decides per-run. Default = preserve.
+#
+# Stdin not a tty (CI / piped) → read returns empty → default N → preserve.
+# To wipe non-interactively: `echo y | ./start.sh`.
+
+etcd_is_fresh=1
+if [[ -d "$WORK/etcd" ]] && [[ -n "$(ls -A "$WORK/etcd" 2>/dev/null)" ]]; then
+    echo "[start] found existing etcd data at $WORK/etcd"
+    echo "[start]   preserve → reuse cluster_id; existing data dirs keep working"
+    echo "[start]   wipe     → fresh cluster (use after a wedged stop / SIGKILL'd etcd)"
+    read -r -p "[start] wipe etcd? [y/N]: " ans
+    case "${ans,,}" in
+        y|yes)
+            log "wiping $WORK/etcd"
+            rm -rf "$WORK/etcd"
+            ;;
+        *)
+            log "preserving etcd data"
+            etcd_is_fresh=0
+            ;;
+    esac
+fi
+mkdir -p "$WORK/etcd"
+
+# ----- data-dir state: prompt only when etcd is fresh and dirs are stale -----
+#
+# If etcd is fresh (just wiped or never existed) AND any data dir has a
+# `cluster_id` sentinel from a previous cluster, autumn-op format will
+# refuse on cluster_id mismatch. Surface that BEFORE format runs so the
+# operator isn't left staring at a generic "format node1 failed".
+if (( etcd_is_fresh == 1 )); then
+    stale_dirs=()
+    for d in "${present_disks[@]}"; do
+        [[ -f "$d/cluster_id" ]] && stale_dirs+=("$d")
+    done
+    if (( ${#stale_dirs[@]} > 0 )); then
+        echo "[start] etcd is empty but these data dirs carry sentinels from a previous cluster:"
+        for d in "${stale_dirs[@]}"; do
+            echo "[start]   $d (cluster_id=$(cat "$d/cluster_id"))"
+        done
+        echo "[start] autumn-op format will refuse on cluster_id mismatch."
+        read -r -p "[start] wipe these data dirs to start fresh? THIS DESTROYS DATA. [y/N]: " ans
+        case "${ans,,}" in
+            y|yes)
+                for d in "${stale_dirs[@]}"; do
+                    log "wiping $d"
+                    rm -rf "$d"
+                    mkdir -p "$d"
+                done
+                ;;
+            *)
+                die "data dirs hold a stale cluster_id; format will fail. \
+re-run and choose wipe, or 'preserve' etcd instead so cluster_id stays stable."
+                ;;
+        esac
+    fi
+fi
+
+# ----- bootstrap presplit: how many partitions, which shape -----
+#
+# `autumn-op bootstrap --presplit N:<shape>` creates N partitions up
+# front. Each partition gets its own PS thread (P-log + P-bulk), so
+# more partitions = more parallel write/read capacity without waiting
+# for auto-split's QPS threshold (~15K, see project_partition_qps_ceiling).
+#
+# Two shapes:
+#   hexstring — N equal slices of the ASCII hex u32 keyspace
+#               ([\"40000000\", \"80000000\", ...]). Good for raw KV /
+#               kvcache / mixed workloads — splits bytes 0x30-0x66.
+#   fuse      — splits on BOTTOM byte of `ino` in the [0x03][ino BE]
+#               file-extent keyspace, so sequential fuse inodes
+#               (1, 2, 3, ...) round-robin across N partitions from
+#               the very first file. Pick this when fuse is the
+#               dominant workload.
+#
+# Only ask when bootstrap is about to run (etcd was just wiped OR
+# never existed); on a preserved-etcd restart there's nothing to
+# bootstrap and the presplit choice is already baked in.
+
+PRESPLIT_COUNT=1
+PRESPLIT_SHAPE=""
+if (( etcd_is_fresh == 1 )); then
+    echo "[start] partition presplit:"
+    echo "[start]   1 → single partition; auto-split kicks in when QPS > ~15K"
+    echo "[start]   N → pre-split N ways (each partition = its own PS thread)"
+    read -r -p "[start] partition count [default 1, max 256]: " ans
+    ans="${ans:-1}"
+    if ! [[ "$ans" =~ ^[0-9]+$ ]] || (( ans < 1 || ans > 256 )); then
+        die "invalid partition count '$ans' — must be an integer in [1, 256]"
+    fi
+    PRESPLIT_COUNT=$ans
+
+    if (( PRESPLIT_COUNT > 1 )); then
+        echo "[start] presplit shape:"
+        echo "[start]   hexstring → general workloads (raw KV / kvcache / mixed)"
+        echo "[start]   fuse      → fuse-dominant (round-robin by inode bottom byte)"
+        read -r -p "[start] use fuse-aware split? [y/N]: " ans
+        case "${ans,,}" in
+            y|yes)
+                PRESPLIT_SHAPE="fuse"
+                ;;
+            *)
+                PRESPLIT_SHAPE="hexstring"
+                ;;
+        esac
+    fi
+fi
+
+# ============================================================
+# 1. etcd
+# ============================================================
+
+log "1/5  etcd"
+start_proc etcd etcd \
+    --data-dir "$WORK/etcd" \
+    --listen-client-urls "http://127.0.0.1:2379" \
+    --advertise-client-urls "http://127.0.0.1:2379" \
+    --listen-peer-urls "http://127.0.0.1:2380" \
+    --initial-advertise-peer-urls "http://127.0.0.1:2380" \
+    --initial-cluster "default=http://127.0.0.1:2380"
+wait_port 2379 etcd
+
+# ============================================================
+# 2. manager
+# ============================================================
+
+log "2/5  manager on $MANAGER_ADDR"
+start_proc manager "$MANAGER" \
+    --port 9001 \
+    --etcd 127.0.0.1:2379 \
+    --listen "$BIND_HOST"
+wait_port 9001 manager
+
+# ============================================================
+# 3. extent-nodes (format + launch)
+# ============================================================
+
+log "3/5  $N_EN extent-nodes"
+for ((i=0; i<N_EN; i++)); do
+    idx=$((i + 1))
+    port=$((EN_BASE_PORT + i))
+    disk="${present_disks[$i]}"
+    log "  node$idx port=$port disk=$disk — format"
+    "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" format \
+        --listen ":$port" --advertise "$BIND_HOST:$port" "$disk" \
+        >"$LOG_DIR/node$idx-format.log" 2>&1 \
+        || die "format node$idx failed — see $LOG_DIR/node$idx-format.log"
+    # autumn-op format briefly binds $port and $(port+1000) to register with
+    # the manager. The sockets may sit in TIME_WAIT for up to ~60s after
+    # format exits — without a wait, the EN binary's listener bind raises
+    # "Address already in use" on the control port. 2s is enough on Linux
+    # with default tcp_tw_recycle behavior; tune if your kernel is stricter.
+    sleep 2
+    log "  node$idx — launch"
+    # CRITICAL: --cpuset limits the shard count (F196: shards == cpuset_len).
+    # Without it the EN auto-detects all CPU cores and tries to bind one
+    # control port per shard at `port+1000 + shard_idx*shard_stride`. With 5
+    # ENs × 192 shards each, the per-EN port ranges overlap massively and
+    # most control listeners die with `Address already in use` → manager's
+    # df probe can't reach them → all disks show `online=false`. One shard
+    # per EN (cpuset of size 1) is plenty for dev. Use a distinct core per
+    # EN so the kernel scheduler doesn't pile them on the same core.
+    en_cpu=$((EN_CPU_BASE + i))
+    start_proc "node$idx" "$NODE" \
+        --port "$port" --data "$disk" \
+        --manager "$MANAGER_ADDR" \
+        --listen "$BIND_HOST" \
+        --transport "$TRANSPORT" \
+        --cpuset "$en_cpu"
+    wait_port "$port" "node$idx"
+done
+
+# ============================================================
+# 4. partition-server
+# ============================================================
+
+# Wait for manager to see all ENs as healthy (df health check fires ~1Hz).
+# Without this, bootstrap can pick a "registered but no df yet" EN and
+# allocate extents on it before it's truly serving — PS later opens the
+# partition, commit_length probes the assigned EN, gets `0/3 committed
+# members reachable`, and retries forever.
+log "  waiting for $N_EN EN(s) to be online in manager (10s)..."
+sleep 10
+
+log "4/5  partition-server on $BIND_HOST:$PS_PORT"
+start_proc ps "$PS" \
+    --psid 1 \
+    --port "$PS_PORT" \
+    --manager "$MANAGER_ADDR" \
+    --listen "$BIND_HOST" \
+    --advertise "$BIND_HOST:$PS_PORT" \
+    --transport "$TRANSPORT"
+sleep 3  # let PS register before bootstrap
+
+# ============================================================
+# 5. bootstrap
+# ============================================================
+
+if (( PRESPLIT_COUNT > 1 )); then
+    log "5/5  bootstrap (empty cluster, presplit ${PRESPLIT_COUNT}:${PRESPLIT_SHAPE})"
+    "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" bootstrap \
+        --presplit "${PRESPLIT_COUNT}:${PRESPLIT_SHAPE}" \
+        >"$LOG_DIR/bootstrap.log" 2>&1 \
+        || die "bootstrap failed — see $LOG_DIR/bootstrap.log"
+else
+    log "5/5  bootstrap (empty cluster, single partition)"
+    "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" bootstrap \
+        >"$LOG_DIR/bootstrap.log" 2>&1 \
+        || die "bootstrap failed — see $LOG_DIR/bootstrap.log"
+fi
+
+# ============================================================
+# Summary
+# ============================================================
+
+cat <<EOF
+
+[start] ✓ cluster ready
+  manager  : $MANAGER_ADDR
+  ps       : $BIND_HOST:$PS_PORT
+  ens      : ${N_EN} nodes  ($(IFS=,; echo "${present_disks[*]}"))
+  etcd     : 127.0.0.1:2379  (data: $WORK/etcd)
+  logs     : $LOG_DIR
+
+Use:
+  AC="$BIN/autumn-client --manager $MANAGER_ADDR"
+  AO="$BIN/autumn-op --manager $MANAGER_ADDR"
+  \$AO info
+  echo hello | \$AC put mykey /dev/stdin
+  \$AC get mykey
+
+Stop: pkill -f autumn-  ;  pkill etcd
+EOF

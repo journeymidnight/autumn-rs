@@ -52,7 +52,7 @@ fn usage() -> ! {
     eprintln!("  remove <id> --by alice");
     eprintln!();
     eprintln!("cluster / partition admin commands (F213, moved from autumn-client):");
-    eprintln!("  bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal|N:hexstring]");
+    eprintln!("  bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal|N:hexstring|N:fuse]");
     eprintln!("  set-stream-ec --stream <ID> --ec K+M");
     eprintln!("  force-ec-convert --extent <EXTID>");
     eprintln!("  split <PARTID>");
@@ -697,6 +697,58 @@ fn hex_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
     }
 
     let mut ranges = Vec::new();
+    for i in 0..n {
+        let start_key = if i == 0 {
+            vec![]
+        } else {
+            split_points[i - 1].clone()
+        };
+        let end_key = if i == n - 1 {
+            vec![]
+        } else {
+            split_points[i].clone()
+        };
+        ranges.push((start_key, end_key));
+    }
+    ranges
+}
+
+/// Split keys aimed at the autumn-fuse keyspace
+/// (`crates/fuse/src/key.rs` — `[0x01]inode_meta`, `[0x02]dirent`,
+/// `[0x03]file_extent`, `[0x04]super`). The bulk of fuse data is
+/// the `[0x03][ino BE][logical_off BE]` file extents — they outsize
+/// the other prefixes by orders of magnitude on real model-serving
+/// workloads (sglang / vllm checkpoints).
+///
+/// We split on the BOTTOM byte of `ino` (byte index 8 of the key —
+/// `[0x03][7 high zero bytes][low byte]`). Rationale:
+/// - Sequential inode allocation steps through low bytes
+///   `0x00, 0x01, ..., 0xFF, 0x00, ...` → uniform round-robin
+///   across N partitions for any cluster size.
+/// - High bytes only change once inode count exceeds 256 / 65k /
+///   16M — they're effectively zero for the lifetime of a
+///   practical fuse fileset, so splitting on them puts everything
+///   in partition 0.
+/// - A single file's extents all share one inode → land in one
+///   partition; concurrent reads of DIFFERENT files distribute,
+///   which is the read-scatter shape sglang wants.
+///
+/// Partition 0 also absorbs `[0x01]` inode-meta + `[0x02]` dirent
+/// (both prefix-sort before `[0x03]`); partition N-1 absorbs
+/// `[0x04]` superblock (sorts after every `[0x03]` key) and any
+/// non-fuse prefix ≥ 0x05. These are tiny next to file data.
+fn fuse_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    if n <= 1 {
+        return vec![(vec![], vec![])];
+    }
+    let n = n.min(256); // 1 byte → at most 256 buckets
+    let stride = 256usize / n;
+    let mut split_points: Vec<Vec<u8>> = Vec::with_capacity(n - 1);
+    for i in 1..n {
+        let byte = (i * stride) as u8; // 0x20, 0x40, ... for N=8
+        split_points.push(vec![0x03, 0, 0, 0, 0, 0, 0, 0, byte]);
+    }
+    let mut ranges = Vec::with_capacity(n);
     for i in 0..n {
         let start_key = if i == 0 {
             vec![]
@@ -1905,6 +1957,7 @@ async fn run_bootstrap(
         let kind = parts.get(1).copied().unwrap_or("normal");
         match kind {
             "hexstring" => hex_split_ranges(n),
+            "fuse" => fuse_split_ranges(n),
             _ => vec![(vec![], vec![])],
         }
     };
@@ -2646,5 +2699,79 @@ mod tests {
         for i in 0..3 {
             assert_eq!(ranges[i].1, ranges[i + 1].0);
         }
+    }
+
+    #[test]
+    fn fuse_split_ranges_single_partition_is_full_space() {
+        let ranges = super::fuse_split_ranges(1);
+        assert_eq!(ranges.len(), 1);
+        assert!(ranges[0].0.is_empty() && ranges[0].1.is_empty());
+    }
+
+    #[test]
+    fn fuse_split_ranges_n8_keys_are_inode_bottom_byte_boundaries() {
+        let ranges = super::fuse_split_ranges(8);
+        assert_eq!(ranges.len(), 8);
+        // First range starts at empty, last range ends at empty.
+        assert!(ranges[0].0.is_empty());
+        assert!(ranges[7].1.is_empty());
+        // Contiguous: each range's end == next range's start.
+        for i in 0..7 {
+            assert_eq!(ranges[i].1, ranges[i + 1].0);
+        }
+        // Each split key is [0x03, 0,0,0,0,0,0,0, byte_i] with byte_i
+        // stepping 0x20 → 0x40 → ... → 0xE0.
+        for i in 0..7 {
+            let split_key = &ranges[i].1;
+            assert_eq!(split_key.len(), 9);
+            assert_eq!(split_key[0], 0x03);
+            for b in &split_key[1..8] {
+                assert_eq!(*b, 0u8);
+            }
+            assert_eq!(split_key[8], ((i + 1) * 32) as u8);
+        }
+    }
+
+    #[test]
+    fn fuse_split_ranges_distributes_sequential_inodes_round_robin() {
+        use std::collections::HashMap;
+        let n = 8;
+        let ranges = super::fuse_split_ranges(n);
+        let mut hits: HashMap<usize, usize> = HashMap::new();
+        // Walk 256 sequential inodes (ino=0..=255 — all bottom-byte
+        // values exactly once) and check the bottom-byte split places
+        // them uniformly across 8 partitions.
+        for ino in 0u64..256 {
+            let mut key = vec![0x03];
+            key.extend_from_slice(&ino.to_be_bytes());
+            key.extend_from_slice(&0u64.to_be_bytes()); // logical_off = 0
+            // Find the partition whose range contains `key`.
+            let mut found = None;
+            for (idx, (start, end)) in ranges.iter().enumerate() {
+                let after_start = start.is_empty() || key.as_slice() >= start.as_slice();
+                let before_end = end.is_empty() || key.as_slice() < end.as_slice();
+                if after_start && before_end {
+                    found = Some(idx);
+                    break;
+                }
+            }
+            *hits.entry(found.unwrap()).or_insert(0) += 1;
+        }
+        // Each of the 8 partitions should get exactly 32 inodes.
+        for p in 0..n {
+            assert_eq!(*hits.get(&p).unwrap_or(&0), 32, "partition {p}");
+        }
+    }
+
+    #[test]
+    fn fuse_split_ranges_inode_meta_and_dirent_live_in_partition_zero() {
+        let ranges = super::fuse_split_ranges(8);
+        // [0x01]inode_meta + [0x02]dirent both prefix-sort before
+        // [0x03]extents, so they MUST land in partition 0.
+        let inode_meta_key = vec![0x01, 0, 0, 0, 0, 0, 0, 0, 0x42];
+        let dirent_key = vec![0x02, 0, 0, 0, 0, 0, 0, 0, 0x01, b'x'];
+        assert!(ranges[0].0.is_empty());
+        assert!(inode_meta_key.as_slice() < ranges[0].1.as_slice());
+        assert!(dirent_key.as_slice() < ranges[0].1.as_slice());
     }
 }
