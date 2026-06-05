@@ -1,203 +1,135 @@
-Date: 2026-06-02
+Date: 2026-06-05
 TaskStatus: completed
-Task scope: F254 + F255 — layered on top of 95efeba's compact-vs-drain
-  fix. Three-commit chain closes the same `stale_vp_offset_past_sealed_
-  length` / `invalid_meta_len` corruption family across all P-bulk
-  paths:
+Task scope: F-ioring-lease-1 — Phase 1 ground floor for the
+  JuiceFS-style inode-level lease + close-to-open coherence work
+  (plan: docs/autumn_fs_lease_plan.md). Manager carries the state
+  machine and serves 4 new RPCs; daemons (autumn-ioring-daemon +
+  autumn-fuse) consume them in follow-up sub-features
+  (F-ioring-lease-2/3/4 + F-fuse-lease-*).
 
-    e40ce48 — flush-vs-drain race (FlushStep::Busy gate)
-    95efeba — compact-vs-drain race (compact_inflight wait + frozen-
-              for-split/merge gate on bg_compact_loop)
-    THIS    — F254 (kill P-bulk in-thread fallback so single-writer
-              is type-level) + F255 (synchronous P-log → P-bulk
-              barrier + per-partition compact_gate + spawn_bulk_thread
-              readiness handshake) layered as defense-in-depth.
+=== TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
-=== HOW F254 + F255 LAYER ON 95efeba ===
+  Already implemented (foundation the lease layer sits on):
+    - F003 etcd owner-lock revision model (same pattern InodeLease
+      reuses for writer leases — F149-fenced put_msgs_txn /
+      put_and_delete_txn).
+    - F019 PartitionManager + rkyv-encoded etcd persistence under
+      `regions/` / `node_override/` etc.
+    - F061 autumn-fuse — open/release callbacks exist but no lease.
+    - F247 / F248 / F242 — fuse 变长 extent + ioring daemon
+      Open/Close/Read/Write paths and `OpenedExtents` cache.
+    - F244-F246 fan_out — lease invalidation only needs to push an
+      event, no new data-plane primitive.
 
-  95efeba gates the SOURCE: no new compact starts during freeze, drain
-  waits for compact_inflight==0 before ACK. That closes the in-flight
-  race window.
+  Not yet implemented (this feature's full Phase 1 scope):
+    - F-ioring-lease-1 (THIS COMMIT) — manager InodeLease state +
+      4 RPCs + etcd persistence + TTL revoke loop.
+    - F-ioring-lease-2 — autumn-ioring-daemon Opcode::Open adds
+      mode flag (RING_VERSION bump); Open path calls AcquireLease;
+      Close path calls ReleaseLease.
+    - F-ioring-lease-3 — long-poll invalidation channel: manager
+      buffers per-client queue; client opens a persistent
+      MSG_POLL_INVALIDATIONS loop; reconnect invalidates all cache.
+    - F-ioring-lease-4 — `OpenedExtents` cache keyed by
+      `(ino, version)`; invalidation re-resolves extents from KV;
+      multi-daemon e2e test (writer close → reader sees new bytes).
 
-  F255 gates the SINK + adds explicit cache invalidation:
-    - per-partition `compact_gate: Arc<CompactionGate>(max=1)` —
-      mutual exclusion split↔compact on THIS partition even OUTSIDE
-      the freeze window. The PS-wide `ConcurrencyController.
-      acquire_compact` permit (default max=4) does NOT serialize
-      same-partition; compact_gate does. Belt-and-braces with
-      95efeba's frozen-check.
-    - synchronous `RowInvalidateBarrierReq` sent by handle_split_part
-      BETWEEN commit_length capture and multi_modify_split. P-bulk
-      drains its FuturesUnordered to zero (handles any rare residual
-      ops the frozen-check might miss across future refactors) and
-      calls `bulk_sc.invalidate_stream(row_stream_id)` so the cached
-      per-stream worker is discarded — fixes the post-seal cache-
-      staleness gap that 95efeba doesn't address (without the
-      explicit invalidate, the next P-bulk op after freeze release
-      would use bulk_sc's pre-seal cached tail).
-    - Bounded send (5s) + ACK (10s) timeouts on the barrier; total 15s
-      well under FREEZE_TTL (30s) so TTL race can't extend the window
-      and let stale commit_length reach multi_modify_split.
+  Deferred (Phase 2 / 3, outside this task):
+    - F-fuse-lease-1 / F-fuse-lease-2 (autumn-fuse opt-in +
+      `notify_inval_inode`).
+    - F-lease-preempt (force-revoke / writer revoke protocol).
 
-  F254 is orthogonal: removes the in-thread fallback path in
-  run_flush_async_phase + compact_row_append, so row_stream's single-
-  writer invariant is type-level (PartitionData.{flush_req_tx,
-  row_append_tx} are non-Option<Sender>). Was the structural foothold
-  for 2026-05-03 invalid_meta_len: two StreamClients each tracked
-  commit watermark on the same row_stream, one's stale commit
-  truncated the other's SST bytes per commit-protocol step 5.
+=== WHAT THIS COMMIT SHIPS ===
 
-=== BUGS FIXED BY THIS COMMIT ===
+  - `crates/rpc/src/manager_rpc.rs`:
+    - MSG ids 0x46–0x49 (ACQUIRE / RELEASE / HEARTBEAT_LEASE /
+      POLL_INVALIDATIONS).
+    - Wire-stable u8 enum constants `LEASE_CLIENT_KIND_*`,
+      `LEASE_MODE_*`, `LEASE_INVAL_*` (append-only).
+    - rkyv types: `MgrClientId`, `MgrInodeLeaseInfo`,
+      `MgrInodeLeaseRecord`, `MgrInvalidation` + 4 Req/Resp pairs.
 
-  F254: row_stream single-writer = type-level guarantee
-    - run_flush_async_phase: drop the req_tx_opt == None branch
-    - compact_row_append: drop the part_sc fallback branch
-    - PartitionData.flush_req_tx / row_append_tx: Option<Sender> → Sender
-    - open_partition: spawn_bulk_thread Err → fatal-for-this-partition
+  - `crates/manager/src/inode_lease.rs` (NEW): `LeaseRegistry`
+    state machine + 13 unit tests. `tick(now)` revoke pass captures
+    the reader set BEFORE evicting expired readers so a reader that
+    expires on the same boundary as the writer's TTL still gets
+    the invalidation push (its inbox lives independently of its
+    lease entry). Also defines the per-second background loop
+    `AutumnManager::inode_lease_revoke_loop` (F228-compliant —
+    bounded awaits + spawn_supervised).
 
-  F255 (coco-audit findings on F254):
-    (P0) split → P-bulk row_stream invalidate race — closed by
-         synchronous barrier (RowInvalidateBarrierReq) + flush_worker_
-         loop's priority-biased select_with_strategy + pending_barrier
-         slot drain-then-invalidate-then-ACK, plus per-partition
-         compact_gate for split↔compact exclusion outside the freeze
-         window.
-    (P2) P-bulk readiness handshake — spawn_bulk_thread returns
-         (JoinHandle, oneshot::Receiver<Result<()>>); thread sends
-         Ok only AFTER compio Runtime build + StreamClient::
-         new_with_revision + set_reporter_part_id all succeed; sends
-         Err on either init failure. partition_thread_main awaits
-         the receiver before publishing channels into PartitionData.
+  - `crates/manager/src/lib.rs`:
+    - mod declaration + `INODE_LEASES_PREFIX = "inode_leases/"`.
+    - `AutumnManager.inode_leases: SharedRegistry`.
+    - `new()` initializes with `DEFAULT_LEASE_TTL_SECS = 30`.
+    - `replay_from_etcd` decodes the prefix and rehydrates writer
+      leases via `install_persisted_writer` (deadline clamped to
+      configured TTL so a long-future `expires_at` from clock skew
+      doesn't pin a dead writer).
+    - `start_runtime_tasks` spawns the supervised revoke loop.
 
-  F255 coco-iteration history (v1 → v7 final):
-    v1: lazy flag piggybacked on RowAppendReq (mirror FlushReq).
-        coco /arch: racy under cap=2 FuturesUnordered.
-    v2: synchronous barrier POST-multi_modify_split. coco /findbugs:
-        post-seal placement creates unrecoverable window.
-    v3: PRE-multi_modify_split barrier. coco /findbugs: PS-wide
-        permit doesn't serialize same-partition.
-    v4: per-partition compact_gate. coco /findbugs: barrier ACK
-        await unbounded → can overrun FREEZE_TTL.
-    v5: bounded ACK timeout. coco /findbugs: send() also unbounded →
-        same TTL overrun via channel back-pressure.
-    v6: bounded send + ACK. coco /findbugs: doc/comment drift
-        between test module + RowInvalidateBarrierReq doc.
-    v7: doc consistency fixed. coco: clean, six classes confirmed
-        closed (split race, double-StreamClient residual, barrier
-        half-state, compact concurrency, init half-open, doc
-        consistency).
+  - `crates/manager/src/rpc_handlers.rs`: 4 handlers + dispatch
+    entries. Writer-acquire persists `inode_leases/<ino>` via
+    `EtcdMirror::put_msgs_txn` (F149 fence); writer-release deletes
+    via `put_and_delete_txn`; reader leases bypass etcd. NOT_LEADER
+    short-circuit on every handler (matches F210-F6 / F209-A
+    leader-gate pattern).
 
-=== CHANGE ===
+  - `crates/manager/tests/f_ioring_lease.rs` (NEW): 3 integration
+    tests that hit the handlers via a real RpcClient against an
+    in-process AutumnManager (memory-only, no etcd) — write/write
+    conflict returns Precondition, writer-close→reader-poll
+    close-to-open coherence, heartbeat→release round trip
+    surfaces NotFound after release.
 
-  crates/partition-server/src/lib.rs:
-    - PartitionData: removed `need_invalidate_row_stream: Cell<bool>`.
-      Added `row_invalidate_tx: mpsc::Sender<RowInvalidateBarrierReq>`
-      and `compact_gate: Arc<CompactionGate>` (max=1 per partition).
-      flush_req_tx + row_append_tx: Option<Sender> → Sender.
-    - New `RowInvalidateBarrierReq { row_stream_id, resp_tx }`.
-    - FlushReq + RowAppendReq: no invalidate field (barrier replaces).
-    - flush_worker_loop: takes row_invalidate_rx. SqMsg adds
-      `Invalidate(RowInvalidateBarrierReq)`. Priority-biased
-      `select_with_strategy(PollNext::Left)`. `pending_barrier` slot
-      drives drain-then-invalidate-then-ACK in next loop iter.
-    - spawn_bulk_thread: takes row_invalidate_rx + returns
-      `(JoinHandle, BulkReady)` where `BulkReady = oneshot::
-      Receiver<Result<()>>`.
-    - partition_thread_main: creates row_invalidate channel; awaits
-      bulk_ready_rx; drops local tx clones after PartitionData
-      captures them. spawn_bulk_thread Err → fatal-for-this-partition.
-    - run_flush_async_phase_inner: removed the req_tx_opt == None
-      branch (was the F254 fallback) AND removed the lazy-flag fetch.
-    - F255 test module `f255_invalidate_plumbing_tests` (3 tests):
-      `f255_row_invalidate_barrier_req_round_trips`,
-      `f255_invalidate_wins_priority_select`,
-      `f255_bulk_ready_signal_dropped_returns_canceled_not_hang`.
+  - `feature_list.md`: F-ioring-lease-1 entry in the Completed
+    table + full detail section under new `P14` header.
 
-  crates/partition-server/src/background.rs:
-    - compact_row_append: dropped part_sc fallback (F254). Dropped
-      flag-piggyback (F255 v3+ uses barrier).
-    - background_compact_loop (3 dispatch sites: main, expiry-major,
-      defensive auto): acquire per-partition compact_gate BEFORE
-      PS-wide acquire_compact (in addition to 95efeba's frozen-check).
+  - `crates/manager/CLAUDE.md`: Programming Note 34 with the 6
+    invariants (L1–L6).
 
-  crates/partition-server/src/rpc_handlers.rs:
-    - handle_split_part: acquires gates in order — per-partition
-      compact_gate → PS-wide acquire_compact → per-partition
-      gc_gate. Sends RowInvalidateBarrierReq AFTER drain +
-      commit_length, BEFORE multi_modify_split. Both send + ACK
-      bounded by separate timers (5s + 10s, total 15s < FREEZE_TTL).
-      Failure unfreezes + returns FailedPrecondition (client retry).
-
-  crates/partition-server/CLAUDE.md:
-    - Programming Note 16: F255 section rewritten as v3 final with
-      8 invariants (row_stream-mutating via P-bulk only; barrier
-      ACK before any gate release; channel cap=1 single sender;
-      pending_barrier drains FU to 0; priority select defensive;
-      barrier PRE-multi_modify_split; any new compact dispatch
-      acquires compact_gate first; bounded send + ack < FREEZE_TTL).
-
-  feature_list.md: F254 + F255 entries in the Completed table +
-  detail sections.
+  - `README.md`: F-ioring-lease bridge section pointing at the
+    plan + manager smoke-test commands.
 
 === VERIFICATION ===
 
-  cargo build --workspace                  : clean
-  cargo test -p autumn-partition-server --lib --no-fail-fast
-                                            : 151 passed (148 +
-                                              3 F255 structural guards)
-  cargo clippy -p autumn-partition-server --lib --tests --all-features
-                                            : no warnings
+  cargo build --workspace                              : clean
+  cargo test -p autumn-manager --lib                   : 127 passed
+                                                         (114 prior
+                                                         + 13 new
+                                                         inode_lease)
+  cargo test -p autumn-manager --test f_ioring_lease   : 3 passed
+  cargo clippy -p autumn-manager --lib --tests
+                              --all-features            : no warnings
 
-  E2E manager integration tests (24/24 ran, 0 failed):
-    - integration (13/13) incl. partition_server_put_get_and_split_flow,
-      recovery replays, compaction preserves VP, GC reclaims
-    - system_range_split (2/3, 1 ignored)
-    - system_multi_split_chain (1/2, 1 ignored) incl.
-      split_compact_split_preserves_all_data
-    - system_split_gallery_originals (3/3) incl. single/two/right-
-      most split + compact data preservation
-    - system_bulk_verification (1/2, 1 ignored)
-    - system_compound_failures (1/1) incl.
-      split_then_ps_crash_data_survives
-    - system_concurrent_write_crash (1/2, 1 ignored)
-    - system_crash_mid_compact (1/2, 1 ignored)
-    - system_crash_mid_flush (1/2, 1 ignored)
+=== TESTING CAVEAT ===
 
-  coco /findbugs reviewed v1 → v7 final; v7 clean across all
-  P-levels for the six review classes.
+  Per [[reproduce_before_fixing_mechanism_bugs]] the preferred
+  shape is reproduce → root-cause → fix + review. F-ioring-lease-1
+  is GREENFIELD (no production bug being reproduced; the plan is
+  fresh, the daemons don't share data with each other yet). The
+  16 tests (13 unit + 3 integration) are STRUCTURAL guards on the
+  state machine + RPC contract, NOT failure repros. The actual
+  multi-daemon coherence guarantee surfaces in F-ioring-lease-4's
+  e2e test (two daemons sharing one inode); this commit only ships
+  the manager-side primitives those tests will exercise.
 
-=== TESTING CAVEAT — REGRESSION RULE PARTIAL VIOLATION ===
+=== NEXT SESSION HAND-OFF ===
 
-  Per [[reproduce_before_fixing_mechanism_bugs]] the preferred shape
-  is: reproduce → root-cause → fix + review. F254 + F255 bypass the
-  reproduce step — coco-audit findings, no production incident. The
-  3 unit tests are STRUCTURAL guards (wire shape / priority select /
-  dropped-channel signal), NOT scenario reproducers. Risk surface
-  mitigated by:
-    - 95efeba already shipped + reproduction-validated for the
-      compact-vs-drain race; F255 is defense-in-depth on top.
-    - E2E manager tests exercise split + compact + flush + crash +
-      restart paths and pass.
-    - F254 fallback removal is mechanical (the fallback was dead in
-      production; OS thread spawn doesn't fail on healthy hosts).
+  F-ioring-lease-2 is next. Outline:
+    - Bump RING_VERSION in `crates/ioring/src/header.rs`.
+    - Extend `OpenReq` to carry a `mode: u8` (LEASE_MODE_READ /
+      LEASE_MODE_WRITE; derive from O_RDONLY / O_RDWR).
+    - In `crates/ioring/src/bin/daemon.rs::Opcode::Open` arm, call
+      `MSG_ACQUIRE_LEASE` against the manager BEFORE opening the
+      `OpenedExtents`; on `CODE_PRECONDITION` surface as the SQE
+      result code.
+    - In `Opcode::Close` arm, call `MSG_RELEASE_LEASE`.
+    - The daemon's `MgrClientId` should be generated at startup
+      (`uuid::Uuid::new_v4()`) and reused for every RPC.
+    - End-to-end test: two daemons writing same ino, second
+      acquire returns Conflict.
 
-  Future chaos/integration repro (compact-vs-split + bulk-init-
-  failure) can be added if either becomes load-bearing. The bigger
-  risk today is fixes drifting back to broken shape, which the F255
-  unit tests + CLAUDE.md Programming Note 16's 8 invariants catch.
+  See `docs/autumn_fs_lease_plan.md` §5 Phase 1 verification list.
 
-=== STILL OWED (deferred, low priority) ===
-
-  - Deterministic integration test driving the compact-vs-split race
-    via a test-only instrumentation hook (would catch any future
-    regression of 95efeba's invariant AND F255's barrier semantics).
-  - On-disk corruption from any pre-95efeba run is NOT auto-recovered
-    by these fixes (same caveat as e40ce48 + 95efeba). For dev:
-    `cluster.sh reset N`. For production: one-off metaStream
-    TableLocations rewrite excluding post-seal SSTs.
-  - The original 2026-06-02 task (flush-vs-split-drain race that
-    conflated "imm empty" with "imm[0] claimed in-flight" — fixed
-    by e40ce48) still owes a deterministic regression test driving
-    the original drain race.
-
-Env: linux, autumn-rs main branch past 95efeba.
+Env: linux, autumn-rs main branch.

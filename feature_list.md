@@ -106,6 +106,7 @@
 | F189-fix-r2 | Round-2 race fixes: stamp/clear ordering inversion in compact paths (re-opened MED-4 race for ~truncate-await window) + 2 GC early-exits missing last_gc_at stamp + Auto-behind-Force semantic clarified | partition |
 | F254 | row_stream single-writer = type-level: P-bulk spawn failure is fatal-for-this-partition; in-thread flush/compact fallback removed (was the 2026-05-03 invalid_meta_len corruption foothold) | partition |
 | F255 | P-bulk hardening — close two F254 audit findings: (P0) split → P-bulk row_stream invalidate race fixed via SYNCHRONOUS pre-seal barrier (RowInvalidateBarrierReq) + per-partition compact_gate; (P2) P-bulk readiness handshake (spawn_bulk_thread returns ready oneshot; open_partition awaits) | partition |
+| F-ioring-lease-1 | JuiceFS-style inode-level lease + close-to-open coherence — manager state machine (`crates/manager/src/inode_lease.rs`), 4 RPCs (MSG_ACQUIRE_LEASE / RELEASE_LEASE / HEARTBEAT_LEASE / POLL_INVALIDATIONS, 0x46–0x49), writer-lease etcd persistence under `inode_leases/<ino>` (F149-fenced), TTL revoke loop (`inode_lease_revoke_loop`), invalidation push queue per client. **Phase 1 ground floor** for ioring-daemon + autumn-fuse cross-mount coherence (plan: `docs/autumn_fs_lease_plan.md`). Daemons not yet wired — F-ioring-lease-2 next. | manager |
 | ~~F129~~ | ~~PutStream / GetStream — multipart + multi-frag VP~~ — SUPERSEDED by F186 (server code ripped out) | — |
 | ~~F130~~ | ~~GC active rewrite for multi-frag VPs~~ — SUPERSEDED by F186 (no multi-frag any more) | — |
 
@@ -4425,3 +4426,92 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   in a future refactor; the unit tests + the invariants in CLAUDE.md
   note 16 catch this.
 - **passes:** completed (2026-06-02)
+
+---
+
+## P14 — Inode-level lease + close-to-open coherence (F-ioring-lease series)
+
+Plan: `docs/autumn_fs_lease_plan.md` (2026-06-05). Goal: make
+autumn-fuse and autumn-ioring-daemon safe to run side-by-side and
+across hosts on the same partition layer, without spinning up a
+second metadata system. Manager + etcd is the lease decision-maker
+(JuiceFS analogue: their metasrv role); daemons are clients that
+subscribe to invalidation pushes.
+
+### F-ioring-lease-1 · manager InodeLease state + 4 RPCs + etcd persistence (Phase 1 ground floor)
+
+- **Trigger:** plan §5 Phase 1 — the prerequisite for every later
+  daemon-wiring step (F-ioring-lease-2/3/4 and F-fuse-lease-1/2/3).
+  Manager carries the state machine and serves the RPCs; daemons
+  consume them.
+- **Range of change:**
+  - `crates/rpc/src/manager_rpc.rs`: 4 new wire constants
+    `MSG_ACQUIRE_LEASE/RELEASE_LEASE/HEARTBEAT_LEASE/POLL_INVALIDATIONS`
+    (0x46–0x49) + rkyv types `MgrClientId`, `MgrInodeLeaseInfo`,
+    `MgrInodeLeaseRecord`, `MgrInvalidation`, the four `*Req`/`*Resp`
+    pairs, and the wire-stable enum constants
+    `LEASE_CLIENT_KIND_*`, `LEASE_MODE_*`, `LEASE_INVAL_*`.
+  - `crates/manager/src/inode_lease.rs` (new): `LeaseRegistry` with
+    `acquire/release/heartbeat/tick/drain_invalidations/writer_record/
+    install_persisted_writer`. The `tick(now)` revoke pass captures
+    the reader set BEFORE evicting expired readers so a reader whose
+    lease expires in the same tick as a writer-revoke still sees the
+    invalidation (its inbox lives independently of its lease entry).
+  - `crates/manager/src/lib.rs`:
+    `pub const INODE_LEASES_PREFIX = "inode_leases/"`; new
+    `AutumnManager.inode_leases: SharedRegistry`; replay arm in
+    `replay_from_etcd` decodes writer leases under the prefix and
+    rehydrates via `install_persisted_writer` (in-memory deadline
+    derived from `expires_at` epoch seconds, clamped to TTL); new
+    `inode_lease_revoke_loop` (1 s tick, F228-compliant: bounded
+    awaits + supervised) etcd-deletes revoked writer records and
+    logs INFO per revoke.
+  - `crates/manager/src/rpc_handlers.rs`: 4 handlers
+    (`handle_acquire_lease`, `handle_release_lease`,
+    `handle_heartbeat_lease`, `handle_poll_invalidations`) + dispatch
+    entries. Writer-acquire persists `inode_leases/<ino>` via
+    `put_msgs_txn` (F149 fence); writer-release deletes via
+    `put_and_delete_txn`; reader leases bypass etcd. NOT_LEADER
+    short-circuit on every handler matches the F210-F6 / F209-A
+    leader-gate pattern.
+- **Architectural invariants (plan §6, enforced by the module):**
+  1. Manager is the single lease decision-maker — handlers never
+     return Granted for a writer slot another client holds.
+  2. Writer release bumps `version` BEFORE the push, so the reader
+     sees the new generation paired with the invalidation event.
+  3. Reader caches MUST be tagged with `(ino, version)` by the
+     daemon (wired in F-ioring-lease-4).
+  4. Long-poll disconnect ⇒ daemon invalidates ALL cache on
+     reconnect (wired in F-ioring-lease-3).
+  5. Writer-lease etcd persistence carries `expires_at` so a new
+     leader's TTL revoke loop fires on the correct schedule.
+- **Verification:**
+  - `cargo build --workspace`: clean.
+  - `cargo test -p autumn-manager --lib`: 127 passed, 0 failed
+    (114 prior + 13 new lease state-machine unit tests). The 13
+    new tests cover write/write conflict, reader/writer
+    concurrency, TTL revoke with push, heartbeat extend, post-
+    expiry not-held, host-field-not-id, multi-reader fan-out,
+    writer-record persistence round-trip, inbox overflow.
+  - `cargo test -p autumn-manager --test f_ioring_lease`: 3 passed
+    (RPC-level write conflict, writer-close→reader-poll close-to-
+    open coherence, heartbeat then release round trip).
+  - `cargo clippy -p autumn-manager --lib --tests --all-features`:
+    no warnings.
+- **Manual smoke-test:** N/A this commit — the lease RPCs are not
+  yet exposed in `autumn-client`. F-ioring-lease-2 adds the daemon-
+  side wiring; manual coverage will land there.
+- **Out of scope (carried to next sub-features):**
+  - daemon Open/Close wiring (F-ioring-lease-2)
+  - long-poll loop + reconnect-invalidates-all (F-ioring-lease-3)
+  - `OpenedExtents` version tagging + e2e multi-daemon test
+    (F-ioring-lease-4)
+  - autumn-fuse opt-in (F-fuse-lease-*)
+  - force-revoke / writer revoke protocol (F-lease-preempt)
+- **Testing caveat:** per [[reproduce_before_fixing_mechanism_bugs]]
+  the preferred order is reproduce → root-cause → fix. F-ioring-
+  lease-1 is greenfield (no production bug being reproduced), so the
+  tests are STRUCTURAL guards on the state machine + RPC contract,
+  not failure repros. The actual coherence guarantee surfaces in
+  F-ioring-lease-4's e2e test (two daemons sharing one inode).
+- **passes:** completed (2026-06-05)

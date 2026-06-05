@@ -166,6 +166,24 @@ Manager integration tests under `crates/manager/tests/` cover split / merge / ch
 recovery. Some are gated with `#[ignore]` because they take minutes; use
 `cargo test --release -- --ignored` to run the slow set.
 
+## Inode-lease + close-to-open coherence (F-ioring-lease, in flight)
+
+Multi-mount / multi-daemon coherence for `autumn-fuse` and
+`autumn-ioring-daemon` runs through a JuiceFS-style inode lease served
+by the manager. Plan + invariants live in
+[`docs/autumn_fs_lease_plan.md`](docs/autumn_fs_lease_plan.md);
+F-ioring-lease-1 (manager state + 4 RPCs, MSG types 0x46–0x49) is
+landed but daemons are not yet wired. Smoke-test (manager-only) is the
+integration test:
+
+```bash
+cargo test -p autumn-manager --test f_ioring_lease
+cargo test -p autumn-manager --lib inode_lease
+```
+
+End-to-end daemon coherence will surface in F-ioring-lease-2/3/4 and
+the README will get a daemon-side smoke-test then.
+
 ## Documentation map
 
 For anything deeper than the surface here, the source-of-truth lives in:

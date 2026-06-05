@@ -1584,3 +1584,64 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     ONLY if an extent-state clobber is ever actually reproduced. Cross-ref:
     notes 13 (F146 verify-at-apply — the weaker before-await form), 15 (F149
     leader fence — the txn already carries it), 32 (sealed state).
+
+34. **F-ioring-lease-1 InodeLease registry (Phase 1 ground floor for
+    autumn-fuse + autumn-ioring-daemon coherence).** JuiceFS-style
+    inode-level lease served by the manager; same etcd backing as
+    `acquire_owner_lock`. Daemons appear as `MgrClientId { kind, uuid,
+    host }` — `host` is diagnostic only, identity is `(kind, uuid)`.
+    Single writer XOR many readers per inode; writers and readers
+    can coexist (reads through an open file remain legal — the
+    writer's flush-before-close ordering in plan §6.2 keeps coherence
+    intact). Pure state machine in
+    `crates/manager/src/inode_lease.rs::LeaseRegistry`; 4 RPCs in
+    `rpc_handlers.rs` (`handle_acquire_lease` /
+    `handle_release_lease` / `handle_heartbeat_lease` /
+    `handle_poll_invalidations`, MSG types `0x46`–`0x49`).
+
+    **Invariants (plan §6, enforced by code structure):**
+    - **L1** Manager is the single decision-maker. `acquire` returns
+      `WriteConflict` synchronously when another client holds the
+      writer slot. No client may "decide locally that I'll write
+      first" (plan §6 invariant 1).
+    - **L2** Writer release bumps `version` BEFORE pushing the
+      invalidation so a reader sees the new generation paired with
+      the event (close-to-open coherence).
+    - **L3** Writer leases are PERSISTED to etcd
+      (`inode_leases/<ino>`, F149-fenced via `put_msgs_txn` /
+      `put_and_delete_txn`); reader leases are MEMORY-ONLY. Failover
+      replay rehydrates writer leases via
+      `install_persisted_writer`, clamping the in-memory deadline to
+      the configured TTL so a long-future `expires_at` (clock skew)
+      doesn't pin a dead writer. Reader-set loss is benign — plan
+      §6.4 mandates daemons invalidate all cached versions on
+      subscribe reconnect (wired in F-ioring-lease-3).
+    - **L4** `LeaseRegistry::tick(now)` captures the reader set
+      BEFORE evicting expired readers in the same pass. A reader
+      whose lease expires on the same boundary as the writer's TTL
+      must still get the invalidation push — its inbox lives
+      independently of its lease entry. Order: writer revoke → reader
+      expiry → drop-empty-inode → push invalidations.
+    - **L5** `inode_lease_revoke_loop` runs under `spawn_supervised`
+      (F228 1C) with one bounded `sleep` per iteration + the bounded
+      etcd `put_and_delete_txn` call (no unbounded awaits, F228 1A).
+      Etcd failure during revoke logs WARN and retries next tick —
+      the in-memory revoke already fired, so the worst case is a
+      stale persisted record that gets cleaned up later (a new
+      leader's TTL pass expires it).
+    - **L6** `MgrClientId.host` is diagnostic only — two processes
+      that report different hostnames for the same `(kind, uuid)`
+      hash to the same `ClientKey`. Tested by
+      `host_field_does_not_affect_identity`.
+
+    **Out of scope this commit:** daemon Open/Close wiring
+    (F-ioring-lease-2), long-poll loop + reconnect-invalidates-all
+    (F-ioring-lease-3), `OpenedExtents` version tagging + e2e
+    multi-daemon test (F-ioring-lease-4), autumn-fuse opt-in
+    (F-fuse-lease-*), force-revoke / writer revoke protocol
+    (F-lease-preempt). See `docs/autumn_fs_lease_plan.md` for the
+    full plan. Cross-ref: 15 (F149 fence — all `inode_leases/` etcd
+    writes route through `put_msgs_txn` /
+    `put_and_delete_txn` and carry the fence), 29 (F228 bg-loop
+    resilience — `inode_lease_revoke_loop` follows the same
+    pattern).

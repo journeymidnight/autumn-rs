@@ -182,6 +182,11 @@ impl AutumnManager {
             MSG_RECOVERY_STATS => self.handle_recovery_stats(payload).await,
             MSG_QUERY_AUDIT_LOG => self.handle_query_audit_log(payload).await,
             MSG_GET_CLUSTER_ID => self.handle_get_cluster_id().await,
+            // ── F-ioring-lease-1: inode-level lease + close-to-open ─────
+            MSG_ACQUIRE_LEASE => self.handle_acquire_lease(payload).await,
+            MSG_RELEASE_LEASE => self.handle_release_lease(payload).await,
+            MSG_HEARTBEAT_LEASE => self.handle_heartbeat_lease(payload).await,
+            MSG_POLL_INVALIDATIONS => self.handle_poll_invalidations(payload).await,
             _ => Err((
                 StatusCode::InvalidArgument,
                 format!("unknown msg_type {msg_type}"),
@@ -4442,6 +4447,237 @@ impl AutumnManager {
             code: CODE_OK,
             message: String::new(),
             entries,
+        }))
+    }
+
+    // ── F-ioring-lease-1: inode lease handlers ─────────────────────────────
+    //
+    // Plan reference: `docs/autumn_fs_lease_plan.md`. Manager is the
+    // single decision-maker (§6 invariant 1); writer leases are
+    // persisted to etcd (§3.1) while reader leases stay in-memory only
+    // (§7 "lease 数量爆炸"). Every etcd write routes through
+    // `put_msgs_txn` / `put_and_delete_txn` so the F149 leader fence
+    // travels with it.
+
+    pub async fn handle_acquire_lease(&self, payload: Bytes) -> HandlerResult {
+        let req: AcquireLeaseReq = rkyv_decode(&payload)
+            .map_err(|e| (StatusCode::InvalidArgument, format!("decode: {e}")))?;
+        // Etcd write needs leader status; non-leader rejects with
+        // NOT_LEADER so the client retries against the new leader
+        // (matches MSG_GET_REGIONS / MSG_ACQUIRE_OWNER_LOCK pattern).
+        if self.etcd.is_some() && !self.leader.get() {
+            return Ok(rkyv_encode(&AcquireLeaseResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                lease: None,
+            }));
+        }
+
+        let now = Instant::now();
+        let outcome = {
+            let mut reg = self.inode_leases.borrow_mut();
+            reg.acquire(&req.client, req.ino, req.mode, now)
+        };
+
+        match outcome {
+            crate::inode_lease::AcquireOutcome::Granted {
+                version,
+                writer_present,
+                ttl_secs,
+            } => {
+                // Etcd-first: writer leases persist; reader leases don't.
+                if req.mode == LEASE_MODE_WRITE {
+                    let record = self
+                        .inode_leases
+                        .borrow()
+                        .writer_record(req.ino)
+                        .expect("writer just acquired");
+                    let key = format!("{}{}", crate::INODE_LEASES_PREFIX, req.ino);
+                    let value = rkyv_encode(&record).to_vec();
+                    if let Some(etcd) = &self.etcd {
+                        if let Err(e) = etcd.put_msgs_txn(vec![(key, value)]).await {
+                            // Roll back the in-memory grant — the
+                            // client never saw the OK, and the next
+                            // tick must not see a phantom writer.
+                            let _ = self
+                                .inode_leases
+                                .borrow_mut()
+                                .release(&req.client, req.ino);
+                            return Ok(rkyv_encode(&AcquireLeaseResp {
+                                code: Self::err_to_code(&e),
+                                message: e.to_string(),
+                                lease: None,
+                            }));
+                        }
+                    }
+                }
+                Ok(rkyv_encode(&AcquireLeaseResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    lease: Some(MgrInodeLeaseInfo {
+                        ino: req.ino,
+                        version,
+                        writer_present,
+                        ttl_secs,
+                    }),
+                }))
+            }
+            crate::inode_lease::AcquireOutcome::WriteConflict {
+                held_by_kind,
+                held_by_host,
+            } => Ok(rkyv_encode(&AcquireLeaseResp {
+                code: CODE_PRECONDITION,
+                message: format!(
+                    "writer lease held by kind={held_by_kind} host={held_by_host}"
+                ),
+                lease: None,
+            })),
+            crate::inode_lease::AcquireOutcome::InvalidMode => Ok(rkyv_encode(&AcquireLeaseResp {
+                code: CODE_INVALID_ARGUMENT,
+                message: format!("invalid lease mode {}", req.mode),
+                lease: None,
+            })),
+        }
+    }
+
+    pub async fn handle_release_lease(&self, payload: Bytes) -> HandlerResult {
+        let req: ReleaseLeaseReq = rkyv_decode(&payload)
+            .map_err(|e| (StatusCode::InvalidArgument, format!("decode: {e}")))?;
+        if self.etcd.is_some() && !self.leader.get() {
+            return Ok(rkyv_encode(&ReleaseLeaseResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                new_version: None,
+            }));
+        }
+
+        let outcome = {
+            let mut reg = self.inode_leases.borrow_mut();
+            reg.release(&req.client, req.ino)
+        };
+
+        match outcome {
+            crate::inode_lease::ReleaseOutcome::WriterClosed { new_version } => {
+                // Writer-close → delete the persisted record so
+                // failover replay doesn't resurrect a stale writer.
+                let key = format!("{}{}", crate::INODE_LEASES_PREFIX, req.ino);
+                if let Some(etcd) = &self.etcd {
+                    if let Err(e) = etcd.put_and_delete_txn(vec![], vec![key]).await {
+                        // The in-memory release already fired (version
+                        // bumped, readers notified). The persisted
+                        // record is stale until the next revoke tick.
+                        // Acceptable: the new leader's `tick(now)` will
+                        // expire it within `lease_ttl` even if it
+                        // never sees the delete.
+                        tracing::warn!(
+                            ino = req.ino,
+                            error = %e,
+                            "F-ioring-lease-1: writer-close etcd delete failed; TTL revoke will clean up"
+                        );
+                    }
+                }
+                Ok(rkyv_encode(&ReleaseLeaseResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    new_version: Some(new_version),
+                }))
+            }
+            crate::inode_lease::ReleaseOutcome::ReaderReleased => {
+                Ok(rkyv_encode(&ReleaseLeaseResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    new_version: None,
+                }))
+            }
+            crate::inode_lease::ReleaseOutcome::NotHeld => Ok(rkyv_encode(&ReleaseLeaseResp {
+                code: CODE_OK,
+                message: "not held (idempotent)".to_string(),
+                new_version: None,
+            })),
+        }
+    }
+
+    pub async fn handle_heartbeat_lease(&self, payload: Bytes) -> HandlerResult {
+        let req: HeartbeatLeaseReq = rkyv_decode(&payload)
+            .map_err(|e| (StatusCode::InvalidArgument, format!("decode: {e}")))?;
+        // Heartbeats don't write etcd directly — the writer's
+        // `expires_at` in the persisted record is refreshed lazily,
+        // i.e. on the next AcquireLease or by the next failover
+        // (writer must re-acquire after a failover regardless).
+        // Heartbeat is therefore safe to serve on a follower IF we
+        // ever decide to; current design is leader-only to avoid
+        // serving stale state.
+        if self.etcd.is_some() && !self.leader.get() {
+            return Ok(rkyv_encode(&HeartbeatLeaseResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                lease: None,
+            }));
+        }
+
+        let now = Instant::now();
+        let outcome = {
+            let mut reg = self.inode_leases.borrow_mut();
+            reg.heartbeat(&req.client, req.ino, now)
+        };
+        match outcome {
+            crate::inode_lease::HeartbeatOutcome::Renewed {
+                version,
+                writer_present,
+                ttl_secs,
+            } => Ok(rkyv_encode(&HeartbeatLeaseResp {
+                code: CODE_OK,
+                message: String::new(),
+                lease: Some(MgrInodeLeaseInfo {
+                    ino: req.ino,
+                    version,
+                    writer_present,
+                    ttl_secs,
+                }),
+            })),
+            crate::inode_lease::HeartbeatOutcome::NotHeld => {
+                Ok(rkyv_encode(&HeartbeatLeaseResp {
+                    code: CODE_NOT_FOUND,
+                    message: "lease not held".to_string(),
+                    lease: None,
+                }))
+            }
+        }
+    }
+
+    pub async fn handle_poll_invalidations(&self, payload: Bytes) -> HandlerResult {
+        let req: PollInvalidationsReq = rkyv_decode(&payload)
+            .map_err(|e| (StatusCode::InvalidArgument, format!("decode: {e}")))?;
+        // Followers carry no state; surface as NOT_LEADER so the
+        // client reconnects to the new leader (and per plan §6.4
+        // invalidates all cache on reconnect).
+        if self.etcd.is_some() && !self.leader.get() {
+            return Ok(rkyv_encode(&PollInvalidationsResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                events: Vec::new(),
+            }));
+        }
+
+        let (events, overflowed) = {
+            let mut reg = self.inode_leases.borrow_mut();
+            reg.drain_invalidations(&req.client)
+        };
+        // Overflow ⇒ tell the client to wholesale-invalidate via a
+        // sentinel MetaChanged event with ino=0. F-ioring-lease-3
+        // refines this with explicit reconnect-handshake semantics.
+        let mut out_events = events;
+        if overflowed {
+            out_events.push(MgrInvalidation {
+                ino: 0,
+                version: 0,
+                kind: LEASE_INVAL_META_CHANGED,
+            });
+        }
+        Ok(rkyv_encode(&PollInvalidationsResp {
+            code: CODE_OK,
+            message: String::new(),
+            events: out_events,
         }))
     }
 }

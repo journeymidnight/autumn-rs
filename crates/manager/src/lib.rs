@@ -2,6 +2,7 @@ pub mod audit;
 pub mod ec_abandon;
 mod extent_delete;
 pub mod extent_inflight;
+pub mod inode_lease;
 pub mod node_state;
 pub mod policy;
 #[cfg(test)]
@@ -49,6 +50,12 @@ pub const DECOMMISSIONED_PREFIX: &str = "decommissioned/";
 /// by `MSG_GET_CLUSTER_ID` so `autumn-op format` can stamp each
 /// formatted disk and `autumn-extent-node` can verify on startup.
 pub const CLUSTER_ID_KEY: &str = "autumn-rs/cluster_id";
+
+/// F-ioring-lease-1: writer-lease etcd prefix. One key per inode that
+/// currently has a writer (reader leases are NOT persisted — they're
+/// ephemeral, and a manager failover invalidates every reader's cache
+/// per plan §6.4).
+pub const INODE_LEASES_PREFIX: &str = "inode_leases/";
 
 #[derive(Clone)]
 pub(crate) struct EtcdMirror {
@@ -535,6 +542,14 @@ pub struct AutumnManager {
     /// `Self::new()` so dev/test workflows still work end-to-end. Read
     /// by `handle_get_cluster_id`.
     pub(crate) cluster_id: Rc<RefCell<String>>,
+    /// F-ioring-lease-1: inode-level lease registry shared between the
+    /// AcquireLease / ReleaseLease / HeartbeatLease / PollInvalidations
+    /// handlers and the `inode_lease_revoke_loop` background task.
+    /// Writer leases are persisted under the `inode_leases/` etcd
+    /// prefix; reader leases live in memory only. See
+    /// `crates/manager/src/inode_lease.rs` and
+    /// `docs/autumn_fs_lease_plan.md`.
+    pub(crate) inode_leases: crate::inode_lease::SharedRegistry,
 }
 
 impl Default for AutumnManager {
@@ -577,6 +592,13 @@ impl AutumnManager {
             // identity. Overwritten by `try_become_leader` /
             // `replay_from_etcd` when etcd is configured.
             cluster_id: Rc::new(RefCell::new(uuid::Uuid::new_v4().to_string())),
+            // F-ioring-lease-1: empty registry; populated on
+            // AcquireLease and on `replay_from_etcd`.
+            inode_leases: Rc::new(RefCell::new(crate::inode_lease::LeaseRegistry::with_ttl(
+                std::time::Duration::from_secs(
+                    crate::inode_lease::DEFAULT_LEASE_TTL_SECS as u64,
+                ),
+            ))),
         }
     }
 
@@ -779,6 +801,15 @@ impl AutumnManager {
         let mgr = self.clone();
         Self::spawn_supervised("extent_inflight_stale_sweep", move || {
             mgr.clone().extent_inflight_stale_sweep_loop()
+        });
+
+        // F-ioring-lease-1: TTL revoke pass — once per second, sweep
+        // expired writer leases (queues `LEASE_REVOKED` invalidations
+        // for readers; etcd-deletes the persisted record) and silently
+        // drops expired reader leases.
+        let mgr = self.clone();
+        Self::spawn_supervised("inode_lease_revoke", move || {
+            mgr.clone().inode_lease_revoke_loop()
         });
     }
 
@@ -1355,6 +1386,8 @@ impl AutumnManager {
         let decommissioned_raw = c.get_prefix(DECOMMISSIONED_PREFIX).await?;
         // F214-A: cluster identity (single key, not a prefix).
         let cluster_id_kv = c.get(CLUSTER_ID_KEY.as_bytes()).await?;
+        // F-ioring-lease-1: persisted writer leases.
+        let inode_leases_raw = c.get_prefix(INODE_LEASES_PREFIX).await?;
         drop(c);
 
         let mut max_id = 0u64;
@@ -1625,6 +1658,39 @@ impl AutumnManager {
                         }
                     };
                 map.insert(id, entry);
+            }
+        }
+
+        // F-ioring-lease-1: install persisted writer leases. Reader
+        // leases are NOT persisted (plan §6.4 — reader subscribe-
+        // reconnect drops every cached version, so losing the reader
+        // set across failover is benign).
+        {
+            let mut reg = self.inode_leases.borrow_mut();
+            let now = Instant::now();
+            for kv in &inode_leases_raw.kvs {
+                let _id = match Self::parse_id_from_key(INODE_LEASES_PREFIX, &kv.key) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "F-ioring-lease-1: replay skipped malformed inode_leases key"
+                        );
+                        continue;
+                    }
+                };
+                let rec: autumn_rpc::manager_rpc::MgrInodeLeaseRecord =
+                    match autumn_rpc::manager_rpc::rkyv_decode(&kv.value) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "F-ioring-lease-1: replay skipped malformed inode_leases payload"
+                            );
+                            continue;
+                        }
+                    };
+                reg.install_persisted_writer(rec, now);
             }
         }
 
