@@ -372,6 +372,23 @@ async fn poller_loop(
     let held_leases: Rc<RefCell<HashMap<u64, SessionLease>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
+    // F-ioring-lease-5 (coco P1 #2): per-inode async lock that
+    // serialises concurrent same-inode `Open` SQEs within ONE
+    // session. Without it, two Opens on the same ino race at the
+    // first `borrow_mut`: A inserts placeholder + starts
+    // `lease::acquire().await`; B sees `refcount > 0`, joins as
+    // refcount+1, publishes a ring_fd with `lease_version = 0`,
+    // and if A's acquire then fails A removes `held_leases[ino]`
+    // — B's published ring_fd survives with no backing lease.
+    // Holding the per-ino `futures::lock::Mutex` across the whole
+    // Open critical section (path-resolve → acquire → load extents
+    // → publish) makes the sequence linearisable. Entries are
+    // garbage-collected by the Close arm on the 1→0 refcount
+    // transition so a daemon that opens many distinct inodes
+    // doesn't grow the map without bound.
+    let inode_open_locks: Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+
     // F-ioring-lease-4: per-session "minimum valid version" map. The
     // poll-loop bumps an entry on every per-ino invalidation event;
     // the Read SQE arm calls `cache_is_stale` against a snapshot and
@@ -446,6 +463,7 @@ async fn poller_loop(
             let client_c = client_id.clone();
             let held_c = held_leases.clone();
             let inv_c = invalidations.clone();
+            let locks_c = inode_open_locks.clone();
             // `data_base` (Copy raw ptr) + `reg_ref` (Copy ref into `ring_reg`,
             // which outlives `inflight`) are captured by the future; the Read arm
             // builds its dest slice from them.
@@ -462,6 +480,7 @@ async fn poller_loop(
                     &client_c,
                     &held_c,
                     &inv_c,
+                    &locks_c,
                 )
                 .await
             });
@@ -507,6 +526,9 @@ async fn service_sqe(
     // F-ioring-lease-4: per-session "minimum valid version" map updated by
     // session_invalidation_poll_loop; the Read arm consults it.
     invalidations: &Rc<RefCell<InvalidationMap>>,
+    // F-ioring-lease-5: per-inode async lock that serialises concurrent
+    // same-inode `Open`s within the session (coco P1 #2).
+    inode_open_locks: &Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>>,
 ) -> Cqe {
     match sqe.opcode {
         Opcode::Nop => Cqe::ok(sqe.user_data, 0),
@@ -521,12 +543,29 @@ async fn service_sqe(
                 r.as_slice()[sqe.buf_offset as usize..sqe.buf_offset as usize + sqe.length as usize]
                     .to_vec()
             };
-            // F248: resolve the FUSE PATH → inode + variable-length extent map
-            // (was: treat `path` as a flat KV key + cache one PS). Reading the
-            // actual chunked file the fuse mount writes; per-extent routing now
-            // happens inside `get_many_into` on each Read.
-            let mut opened = match fuse_read::open(cluster, &path).await {
-                Ok(o) => o,
+            // F-ioring-lease-2: validate lease mode UP FRONT, before any
+            // network IO. SQE_LEASE_MODE_UNSET (legacy v1 client) ⇒
+            // WRITE, the safe upper bound that never silently downgrades
+            // a writer.
+            let req_mode = match sqe.lease_mode {
+                SQE_LEASE_MODE_READ => LEASE_MODE_READ,
+                SQE_LEASE_MODE_WRITE | SQE_LEASE_MODE_UNSET => LEASE_MODE_WRITE,
+                other => {
+                    tracing::warn!(other, "unknown SQE lease_mode; rejecting Open");
+                    return Cqe::err(sqe.user_data, libc::EINVAL);
+                }
+            };
+            // F-ioring-lease-5 (coco P1 #1 ordering fix): resolve PATH
+            // → inode FIRST (cheap, only reads inode + dirent KV).
+            // Then take the per-inode async lock + AcquireLease BEFORE
+            // we touch the heavy extent-map load. Pre-fix the order
+            // was load_extent_map → acquire, so a concurrent
+            // writer-close in the window between load and acquire left
+            // a stale extent map tagged with the post-close version —
+            // `cache_is_stale` would then return `false` forever and
+            // the reader would silently serve pre-close bytes.
+            let (ino, inode_meta) = match fuse_read::resolve_path(cluster, &path).await {
+                Ok(v) => v,
                 Err(e) => {
                     let msg = e.to_string();
                     let errno = if msg.contains("ENOENT") {
@@ -537,74 +576,58 @@ async fn service_sqe(
                     return Cqe::err(sqe.user_data, errno);
                 }
             };
-            // F-ioring-lease-2: AcquireLease BEFORE publishing the
-            // ring_fd. The lease mode is encoded in the SQE flags
-            // byte; `SQE_LEASE_MODE_UNSET` (legacy v1 clients)
-            // defaults to WRITE — the safe upper bound that never
-            // silently downgrades a writer to a read-only session.
-            let req_mode = match sqe.lease_mode {
-                SQE_LEASE_MODE_READ => LEASE_MODE_READ,
-                SQE_LEASE_MODE_WRITE | SQE_LEASE_MODE_UNSET => LEASE_MODE_WRITE,
-                other => {
-                    tracing::warn!(other, "unknown SQE lease_mode; rejecting Open");
-                    return Cqe::err(sqe.user_data, libc::EINVAL);
-                }
+
+            // F-ioring-lease-5 (coco P1 #2): take the per-inode async
+            // lock so a concurrent same-ino Open within this session
+            // serialises on us. Without this, two same-ino Opens race
+            // at the refcount path: the second can publish a ring_fd
+            // before the first's AcquireLease returns; if the first
+            // then fails, the second's fd is left backed by no lease.
+            let open_lock = {
+                let mut m = inode_open_locks.borrow_mut();
+                m.entry(ino)
+                    .or_insert_with(|| Rc::new(futures::lock::Mutex::new(())))
+                    .clone()
             };
-            let ino = opened.ino;
+            let _guard = open_lock.lock().await;
+
             // Refcount path: if we already hold this inode's lease
-            // in this session, just bump the count. The mode is
-            // pinned to the FIRST opener's choice (a READ-then-
-            // WRITE within the same session would otherwise
-            // require us to upgrade by re-Acquiring as WRITE, which
-            // we deliberately do NOT support — second Open returns
-            // EBUSY so the client sees a clear mismatch instead of
-            // silently sharing a read-only lease).
-            let needs_acquire = {
+            // in this session, just bump the count. Mode is pinned
+            // to the FIRST opener's choice; mismatched 2nd Open ⇒
+            // EBUSY (no silent upgrade/downgrade).
+            let (needs_acquire, prior_version) = {
                 let mut m = held_leases.borrow_mut();
-                if let Some(slot) = m.get_mut(&ino) {
-                    if slot.mode != req_mode {
-                        tracing::warn!(
-                            ino,
-                            existing_mode = slot.mode,
-                            new_mode = req_mode,
-                            "Open mode mismatch against existing per-session lease"
-                        );
-                        return Cqe::err(sqe.user_data, libc::EBUSY);
+                match m.get_mut(&ino) {
+                    Some(slot) => {
+                        if slot.mode != req_mode {
+                            tracing::warn!(
+                                ino,
+                                existing_mode = slot.mode,
+                                new_mode = req_mode,
+                                "Open mode mismatch against existing per-session lease"
+                            );
+                            return Cqe::err(sqe.user_data, libc::EBUSY);
+                        }
+                        slot.refcount = slot.refcount.saturating_add(1);
+                        (false, slot.version)
                     }
-                    slot.refcount = slot.refcount.saturating_add(1);
-                    false
-                } else {
-                    // Insert a placeholder so a concurrent Open on
-                    // the same ino in this session blocks behind us
-                    // — service_sqe futures run on the same compio
-                    // runtime, so the next Open's `borrow_mut` here
-                    // sees `refcount > 0` and joins us. (compio
-                    // tasks are cooperatively single-threaded; no
-                    // cross-thread race.)
-                    m.insert(
-                        ino,
-                        SessionLease {
-                            mode: req_mode,
-                            refcount: 1,
-                            version: 0,
-                        },
-                    );
-                    true
+                    None => (true, 0),
                 }
             };
-            if needs_acquire {
+            let lease_version = if needs_acquire {
                 match lease::acquire(cluster, client_id, ino, req_mode).await {
                     Ok(AcquireResult::Granted(info)) => {
-                        if let Some(slot) = held_leases.borrow_mut().get_mut(&ino) {
-                            slot.version = info.version;
-                        }
-                        // F-ioring-lease-4: tag the cache entry so the
-                        // Read arm can compare against the per-session
-                        // `invalidations` floor.
-                        opened.lease_version = info.version;
+                        held_leases.borrow_mut().insert(
+                            ino,
+                            SessionLease {
+                                mode: req_mode,
+                                refcount: 1,
+                                version: info.version,
+                            },
+                        );
+                        info.version
                     }
                     Ok(AcquireResult::Conflict { manager_message }) => {
-                        held_leases.borrow_mut().remove(&ino);
                         tracing::info!(
                             ino,
                             mgr = %manager_message,
@@ -613,19 +636,56 @@ async fn service_sqe(
                         return Cqe::err(sqe.user_data, libc::EBUSY);
                     }
                     Err(e) => {
-                        held_leases.borrow_mut().remove(&ino);
                         tracing::warn!(ino, error = %e, "AcquireLease failed; EIO");
                         return Cqe::err(sqe.user_data, libc::EIO);
                     }
                 }
             } else {
-                // Refcount path: inherit the version pinned by the
-                // first opener (held_leases.version is already the
-                // server-side value).
-                if let Some(slot) = held_leases.borrow().get(&ino) {
-                    opened.lease_version = slot.version;
-                }
-            }
+                prior_version
+            };
+
+            // Lease is held; now load the extent map. Any concurrent
+            // writer-close from another daemon AT OR BEFORE
+            // `lease_version` has already been applied (we hold the
+            // lease so subsequent close pushes a strictly later
+            // version, which the invalidation poll loop turns into a
+            // floor bump). Concurrent close-DURING-extent-load is
+            // safe: the new version > `lease_version` ⇒
+            // `cache_is_stale` will fire on the next Read.
+            let extents =
+                match fuse_read::load_extent_map(cluster, ino, inode_meta.size).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Roll back: if this was a fresh acquire,
+                        // release it; if a refcount bump, dec back.
+                        let release = {
+                            let mut m = held_leases.borrow_mut();
+                            match m.get_mut(&ino) {
+                                Some(slot) => {
+                                    slot.refcount = slot.refcount.saturating_sub(1);
+                                    if slot.refcount == 0 {
+                                        m.remove(&ino);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                None => false,
+                            }
+                        };
+                        if release {
+                            let _ = lease::release(cluster, client_id, ino).await;
+                        }
+                        tracing::warn!(ino, error = %e, "load_extent_map failed after acquire; EIO");
+                        return Cqe::err(sqe.user_data, libc::EIO);
+                    }
+                };
+            let opened = OpenedExtents {
+                ino,
+                size: inode_meta.size,
+                extents,
+                lease_version,
+            };
             let fd = next_fd.get();
             next_fd.set(fd.checked_add(1).unwrap_or(1));
             ring_fds.borrow_mut().insert(fd, opened);
@@ -735,6 +795,24 @@ async fn service_sqe(
                     None => return Cqe::err(sqe.user_data, libc::EBADF),
                 }
             };
+            // F-ioring-lease-5 (coco P1 #3): Write requires a WRITE
+            // lease on this inode. Pre-fix a Read-leased fd could
+            // submit a Write SQE; the daemon would happily call
+            // `fuse_write::write_into`, and at Close time the manager
+            // would see only a reader release → no `WriterClosed`
+            // push → other readers cache pre-write bytes forever.
+            let mode_ok = held_leases
+                .borrow()
+                .get(&opened.ino)
+                .map(|s| s.mode == LEASE_MODE_WRITE)
+                .unwrap_or(false);
+            if !mode_ok {
+                tracing::warn!(
+                    ino = opened.ino,
+                    "Write SQE against a fd not backed by a WRITE lease; rejecting EACCES"
+                );
+                return Cqe::err(sqe.user_data, libc::EACCES);
+            }
             // SAFETY: same argument as Read. validate_slice keeps the slice
             // inside one buffer-pool slot; the client owns slot allocation and
             // doesn't reuse an in-flight slot's region, so this `&[u8]` is
@@ -800,6 +878,15 @@ async fn service_sqe(
                         "ReleaseLease failed; manager TTL will revoke"
                     );
                 }
+                // F-ioring-lease-5: drop the per-inode open lock
+                // entry now that no one in this session holds the
+                // lease. Safe: any concurrent same-ino Open would
+                // already be holding the Rc clone (see the Open
+                // arm's `open_lock = locks.entry(ino).or_insert`),
+                // so removing the HashMap entry does not free the
+                // Mutex while another task is awaiting it. New
+                // Opens after this point allocate a fresh Mutex.
+                inode_open_locks.borrow_mut().remove(&opened.ino);
             }
             Cqe::ok(sqe.user_data, 0)
         }

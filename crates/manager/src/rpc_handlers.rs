@@ -4474,9 +4474,20 @@ impl AutumnManager {
         }
 
         let now = Instant::now();
-        let outcome = {
+        // F-ioring-lease-5 (coco P1 #6): snapshot the pre-acquire
+        // InodeLeaseState BEFORE mutating so an etcd-write failure
+        // can ROLL BACK precisely — restoring just the writer slot
+        // without touching readers that subscribed during the etcd
+        // await. The pre-fix rollback abused `release()`, which
+        // bumps version + pushes a phantom WriterClosed to every
+        // reader. Single-threaded compio runtime guarantees the
+        // snapshot reflects the state acquire() will mutate (no
+        // await between).
+        let (pre_snapshot, outcome) = {
             let mut reg = self.inode_leases.borrow_mut();
-            reg.acquire(&req.client, req.ino, req.mode, now)
+            let snap = reg.inodes.get(&req.ino).cloned();
+            let out = reg.acquire(&req.client, req.ino, req.mode, now);
+            (snap, out)
         };
 
         match outcome {
@@ -4496,13 +4507,14 @@ impl AutumnManager {
                     let value = rkyv_encode(&record).to_vec();
                     if let Some(etcd) = &self.etcd {
                         if let Err(e) = etcd.put_msgs_txn(vec![(key, value)]).await {
-                            // Roll back the in-memory grant — the
-                            // client never saw the OK, and the next
-                            // tick must not see a phantom writer.
-                            let _ = self
-                                .inode_leases
+                            // F-ioring-lease-5: precise revert.
+                            // Restore writer slot to the pre-acquire
+                            // shape; do NOT bump version, do NOT
+                            // push phantom WriterClosed (which
+                            // pre-fix `release()` rollback did).
+                            self.inode_leases
                                 .borrow_mut()
-                                .release(&req.client, req.ino);
+                                .revert_writer_acquire(req.ino, pre_snapshot);
                             return Ok(rkyv_encode(&AcquireLeaseResp {
                                 code: Self::err_to_code(&e),
                                 message: e.to_string(),
@@ -4551,6 +4563,43 @@ impl AutumnManager {
             }));
         }
 
+        // F-ioring-lease-5 (coco P2 #7): etcd-first ordering for the
+        // writer-close case. Pre-fix the in-memory release ran first
+        // (bumping version + pushing WriterClosed to readers); if
+        // the subsequent etcd delete failed the client saw CODE_OK
+        // but the persisted record stayed alive — a leader failover
+        // would re-install the released writer, blocking new
+        // acquires until the TTL revoke fires (≤ 30s). And the
+        // released-then-re-revoked sequence would push a SECOND
+        // WriterClosed at a higher version, forcing readers to
+        // reload again. The reordered shape: preview the release →
+        // delete etcd if it's a writer-close → only then commit the
+        // memory mutate.
+        let preview = self
+            .inode_leases
+            .borrow()
+            .preview_release(&req.client, req.ino);
+
+        if let crate::inode_lease::ReleaseOutcome::WriterClosed { .. } = preview {
+            let key = format!("{}{}", crate::INODE_LEASES_PREFIX, req.ino);
+            if let Some(etcd) = &self.etcd {
+                if let Err(e) = etcd.put_and_delete_txn(vec![], vec![key]).await {
+                    // Etcd failed; leave the in-memory writer in
+                    // place + surface the error so the client
+                    // retries. The TTL revoke loop is the eventual
+                    // backstop if the client gives up.
+                    return Ok(rkyv_encode(&ReleaseLeaseResp {
+                        code: Self::err_to_code(&e),
+                        message: e.to_string(),
+                        new_version: None,
+                    }));
+                }
+            }
+        }
+
+        // Either reader release / not-held (no etcd write), or
+        // writer-close whose etcd delete just succeeded. Commit the
+        // memory mutate now.
         let outcome = {
             let mut reg = self.inode_leases.borrow_mut();
             reg.release(&req.client, req.ino)
@@ -4558,24 +4607,6 @@ impl AutumnManager {
 
         match outcome {
             crate::inode_lease::ReleaseOutcome::WriterClosed { new_version } => {
-                // Writer-close → delete the persisted record so
-                // failover replay doesn't resurrect a stale writer.
-                let key = format!("{}{}", crate::INODE_LEASES_PREFIX, req.ino);
-                if let Some(etcd) = &self.etcd {
-                    if let Err(e) = etcd.put_and_delete_txn(vec![], vec![key]).await {
-                        // The in-memory release already fired (version
-                        // bumped, readers notified). The persisted
-                        // record is stale until the next revoke tick.
-                        // Acceptable: the new leader's `tick(now)` will
-                        // expire it within `lease_ttl` even if it
-                        // never sees the delete.
-                        tracing::warn!(
-                            ino = req.ino,
-                            error = %e,
-                            "F-ioring-lease-1: writer-close etcd delete failed; TTL revoke will clean up"
-                        );
-                    }
-                }
                 Ok(rkyv_encode(&ReleaseLeaseResp {
                     code: CODE_OK,
                     message: String::new(),

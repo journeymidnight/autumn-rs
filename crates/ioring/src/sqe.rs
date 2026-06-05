@@ -81,7 +81,15 @@ impl Sqe {
         let mut buf = &mut dst[..];
         buf.put_u8(self.opcode.as_u8());
         // F-ioring-lease-2: flags byte = lease_mode for Open, 0 otherwise.
-        buf.put_u8(self.lease_mode);
+        // Encoder MUST zero out `lease_mode` for non-Open so a caller
+        // that accidentally constructs a non-Open SQE with a non-zero
+        // `lease_mode` doesn't produce a frame the decoder will reject
+        // with `ReservedBitsSet` (the symmetric invariant on decode).
+        let flags = match self.opcode {
+            crate::opcode::Opcode::Open => self.lease_mode,
+            _ => 0,
+        };
+        buf.put_u8(flags);
         buf.put_u8(0);
         buf.put_u8(0);
         buf.put_u32_le(self.ring_fd);
@@ -201,6 +209,26 @@ mod tests {
         buf[1] = 0x99;
         let err = Sqe::decode(&buf).unwrap_err();
         assert!(matches!(err, SqeDecodeError::ReservedBitsSet(0x99)));
+    }
+
+    #[test]
+    fn encode_zeroes_lease_mode_for_non_open_opcodes() {
+        // Regression for coco P2 #8: pre-fix `encode()` unconditionally
+        // wrote `self.lease_mode` into the flags byte, so a caller
+        // who accidentally set `lease_mode` on a Read/Write SQE
+        // produced a frame the decoder rejects with `ReservedBitsSet`.
+        // The encoder is now opcode-aware: non-Open ⇒ flags=0.
+        for op in [Opcode::Nop, Opcode::Read, Opcode::Write, Opcode::Close] {
+            let mut s = sample(op);
+            s.lease_mode = SQE_LEASE_MODE_WRITE;
+            let mut buf = [0u8; SQE_SIZE];
+            s.encode(&mut buf);
+            assert_eq!(buf[1], 0, "{op:?} encode must zero the flags byte");
+            // Round-trips: decoded `lease_mode` is the encoder's
+            // zero, NOT the caller's mis-set value.
+            let decoded = Sqe::decode(&buf).expect("decode");
+            assert_eq!(decoded.lease_mode, SQE_LEASE_MODE_UNSET);
+        }
     }
 
     #[test]

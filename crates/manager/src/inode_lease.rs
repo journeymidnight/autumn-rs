@@ -315,6 +315,33 @@ impl LeaseRegistry {
         }
     }
 
+    /// F-ioring-lease-5 (coco P2 #7): read-only "what would `release`
+    /// do" predicate. Lets the handler order the etcd delete BEFORE
+    /// the in-memory mutate so a failed etcd-delete doesn't leave a
+    /// stale `inode_leases/<ino>` record (which would re-install
+    /// the released writer on the next leader failover).
+    ///
+    /// Note: the returned `new_version` is the predicted post-release
+    /// generation; the actual `release()` call may produce a
+    /// different `ReleaseOutcome` if state mutated between the
+    /// preview and the commit (e.g. TTL revoke). Handler treats a
+    /// post-etcd `NotHeld` as benign (idempotent release).
+    pub fn preview_release(&self, client: &MgrClientId, ino: u64) -> ReleaseOutcome {
+        let me = ClientKey::from_wire(client);
+        let Some(state) = self.inodes.get(&ino) else {
+            return ReleaseOutcome::NotHeld;
+        };
+        if state.writer.as_ref() == Some(&me) {
+            return ReleaseOutcome::WriterClosed {
+                new_version: state.version.wrapping_add(1),
+            };
+        }
+        if state.readers.contains_key(&me) {
+            return ReleaseOutcome::ReaderReleased;
+        }
+        ReleaseOutcome::NotHeld
+    }
+
     /// `release` returns whether a writer-close fired so the caller
     /// can persist the etcd delete + push invalidations.
     pub fn release(&mut self, client: &MgrClientId, ino: u64) -> ReleaseOutcome {
@@ -540,6 +567,44 @@ impl LeaseRegistry {
             version: s.version,
             expires_at,
         })
+    }
+
+    /// F-ioring-lease-5 (coco P1 #6): precise rollback for a writer
+    /// AcquireLease whose etcd persistence failed AFTER the in-memory
+    /// grant landed. Restores ONLY the writer slot to `snapshot`'s
+    /// shape; readers that subscribed during the etcd await are
+    /// preserved (release() — the pre-fix rollback — wrongly bumped
+    /// version + pushed a phantom WriterClosed to them).
+    ///
+    /// `snapshot = None` means "no entry existed pre-acquire" → clear
+    /// the writer fields; if no readers joined, drop the empty entry.
+    /// `snapshot = Some(state)` means "writer was already me, this
+    /// was a refresh" → restore writer/host/deadline to the
+    /// pre-acquire values exactly.
+    ///
+    /// Does NOT touch `version` because `acquire()` itself does not
+    /// bump it; the only paths that bump version are `release()` and
+    /// `tick()`'s revoke. (If a future refactor changes that, this
+    /// helper MUST be updated to also revert `version`.)
+    pub fn revert_writer_acquire(&mut self, ino: u64, snapshot: Option<InodeLeaseState>) {
+        let Some(entry) = self.inodes.get_mut(&ino) else {
+            return;
+        };
+        match snapshot {
+            Some(s) => {
+                entry.writer = s.writer;
+                entry.writer_diag_host = s.writer_diag_host;
+                entry.writer_expires_at = s.writer_expires_at;
+            }
+            None => {
+                entry.writer = None;
+                entry.writer_diag_host.clear();
+                entry.writer_expires_at = None;
+                if entry.readers.is_empty() {
+                    self.inodes.remove(&ino);
+                }
+            }
+        }
     }
 
     /// On leader-promotion replay, install a writer lease from etcd.
@@ -839,6 +904,56 @@ mod tests {
             r2.acquire(&other, 77, LEASE_MODE_WRITE, Instant::now()),
             AcquireOutcome::WriteConflict { .. }
         ));
+    }
+
+    #[test]
+    fn revert_writer_acquire_restores_pre_state_without_bumping_version() {
+        // Regression for coco P1 #6: pre-fix the etcd-write-failure
+        // rollback called `release()` which bumps version + pushes
+        // phantom WriterClosed to readers. Now `revert_writer_acquire`
+        // restores the writer slot precisely without touching version.
+        let mut r = reg();
+        let now = Instant::now();
+        let w = cid(1, 1, "writer-X");
+        let rd = cid(2, 2, "reader-Y");
+
+        // Reader subscribed first; writer acquires.
+        let _ = r.acquire(&rd, 99, LEASE_MODE_READ, now);
+        let snap = r.inodes.get(&99).cloned();
+        let _ = r.acquire(&w, 99, LEASE_MODE_WRITE, now);
+        let post_version = r.inodes.get(&99).unwrap().version;
+
+        // Revert as if etcd-put-failed.
+        r.revert_writer_acquire(99, snap);
+
+        let entry = r.inodes.get(&99).expect("reader keeps the entry alive");
+        assert!(entry.writer.is_none(), "writer slot cleared");
+        assert_eq!(entry.version, post_version, "version untouched by revert");
+        assert!(entry.readers.contains_key(&ClientKey::from_wire(&rd)));
+
+        // No invalidation should have been pushed to the reader —
+        // they didn't see any version change.
+        let (events, _) = r.drain_invalidations(&rd);
+        assert!(
+            events.is_empty(),
+            "revert MUST NOT push phantom WriterClosed; events={events:?}"
+        );
+    }
+
+    #[test]
+    fn revert_writer_acquire_drops_empty_entry_when_no_pre_state() {
+        // Fresh inode (no readers), writer acquires, etcd fails →
+        // revert with `snapshot = None` should leave the registry
+        // exactly empty.
+        let mut r = reg();
+        let w = cid(1, 7, "w");
+        assert!(!r.inodes.contains_key(&55));
+        let _ = r.acquire(&w, 55, LEASE_MODE_WRITE, Instant::now());
+        r.revert_writer_acquire(55, None);
+        assert!(
+            !r.inodes.contains_key(&55),
+            "no readers ⇒ empty entry must be dropped"
+        );
     }
 
     #[test]
