@@ -31,39 +31,124 @@ fn lease_mode_for_open(flags: i32) -> u8 {
 }
 
 /// BUG-LEASE-3 (coco P0 #3, 2026-06-05) — same shape as ioring's
-/// `evict_revoked_leases`: per-event immediate eviction of held
-/// leases on `LEASE_INVAL_LEASE_REVOKED`. Pre-fix the fuse mount's
+/// `evict_revoked_leases`: per-event MARK of held leases on
+/// `LEASE_INVAL_LEASE_REVOKED`. Pre-fix the fuse mount's
 /// invalidation poll loop just logged the event; `held_leases[ino]`
 /// stayed populated until the next `session_heartbeat_loop` tick
 /// returned `NotHeld` (up to 5 s later). Inside that window a Write
 /// request via `FsRequest::Write` continued to flow through because
-/// the dispatcher doesn't (yet) consult held_leases on the write
-/// path — but the manager-state-vs-mount-state divergence still
-/// means a subsequent Close fires a phantom `ReleaseLease` against
-/// a lease the manager has already revoked, which the manager turns
-/// into `NotHeld` (benign) but tells the operator we lost
-/// bookkeeping coherence.
+/// the dispatcher doesn't consult held_leases on the write path.
 ///
-/// Post-fix: `LeaseRevoked` for any non-zero ino immediately
-/// removes `held_leases[ino]`. Returns the evicted inos so the
-/// caller can do a best-effort `lease::release` (idempotent on
-/// the manager side).
+/// **R2-P0 #2/#3 (2026-06-06, this commit) — marker, not remove.**
+/// Original BUG-LEASE-3 fix REMOVED the entry; coco R2 round
+/// surfaced that this BREAKS Release's flush-decision (no entry ⇒
+/// `release_now_pred` is false ⇒ dirty buffer dropped on a kernel
+/// `flush=false` close) AND Write's lease check (no entry ⇒ "no
+/// lease held" which is indistinguishable from a Write before
+/// Open). The new shape preserves the entry but sets the
+/// `revoked: bool` sticky flag, so:
+///   - Write checks the flag and fails with EIO (R2-P0 #3).
+///   - Release sees the flag and flushes before evicting (R2-P0 #2).
+///   - Open's re-acquire path observes the flag, drops the entry,
+///     and treats the inode as fresh (gets a new lease epoch).
+/// Returns the inos newly-transitioned to revoked so the caller can
+/// do a best-effort `lease::release` (idempotent on the manager
+/// side; same telemetry as the pre-R2 fix).
 ///
 /// `WriterClosed` / `WillRevokeIn` / overflow sentinel do NOT
-/// evict — same semantics as the ioring fn.
+/// mark — same semantics as the ioring fn.
 pub fn evict_revoked_held_leases(
     events: &[autumn_rpc::manager_rpc::MgrInvalidation],
     held_leases: &mut std::collections::HashMap<u64, crate::state::FuseLease>,
 ) -> Vec<u64> {
-    let mut evicted: Vec<u64> = Vec::new();
+    let mut newly_revoked: Vec<u64> = Vec::new();
     for ev in events {
         if ev.kind == autumn_rpc::manager_rpc::LEASE_INVAL_LEASE_REVOKED && ev.ino != 0 {
-            if held_leases.remove(&ev.ino).is_some() {
-                evicted.push(ev.ino);
+            if let Some(slot) = held_leases.get_mut(&ev.ino) {
+                if !slot.revoked {
+                    slot.revoked = true;
+                    newly_revoked.push(ev.ino);
+                }
             }
         }
     }
-    evicted
+    newly_revoked
+}
+
+/// R2-P0 #3 (2026-06-06) — pure-fn lease check used by the Write
+/// arm of `FsRequest`. Three states:
+///
+/// - `Ok(())`: held WRITE-mode lease, not revoked.
+/// - `Err("revoked")`: held entry but server-side revoked (R2-P0 #3
+///   data-leak window — the stale writer's bytes must NOT land).
+/// - `Err("wrong mode")`: held but mode != WRITE (READ lease, etc).
+/// - `Err("no lease")`: no entry at all — caller dropped through
+///   Open without acquiring, or a wholesale invalidate dropped the
+///   map. Either way, refuse the write.
+///
+/// Returning `&'static str` keeps the helper allocation-free in the
+/// hot path; the dispatcher wraps it in an `anyhow!` for the
+/// `FsRequest::Write` reply.
+pub fn check_write_allowed(
+    held_leases: &std::collections::HashMap<u64, crate::state::FuseLease>,
+    ino: u64,
+) -> Result<(), &'static str> {
+    match held_leases.get(&ino) {
+        None => Err("no lease"),
+        Some(slot) if slot.revoked => Err("revoked"),
+        Some(slot) if slot.mode != autumn_rpc::manager_rpc::LEASE_MODE_WRITE => {
+            Err("wrong mode")
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// R2-P0 #2 (2026-06-06) — pure-fn decision helper for the Release
+/// path. Mirrors the BUG-LEASE-3 / R2-P0 #2 invariant: a
+/// server-side revoked lease MUST flush before dropping the
+/// in-memory entry, even when the kernel passed `flush=false` and
+/// `refcount > 1`. Returns:
+///
+/// - `must_flush`: the dispatcher's `write::flush_inode` must run.
+///   True iff: kernel `flush=true`, OR last refcount (1→0
+///   transition), OR `slot.revoked` is set.
+/// - `must_drop_entry`: the held_leases entry should be removed
+///   after the flush attempt. True iff: refcount-after-decrement
+///   reaches 0, OR `slot.revoked` is set (revoked entries are not
+///   recoverable — the manager already gave the lease to someone
+///   else; keeping the entry around just confuses the next Open).
+/// - `propagate_flush_err`: the dispatcher should bubble the flush
+///   error to the kernel as EIO. True iff NOT revoked (a revoked
+///   flush is best-effort; the bytes will fence at the PS anyway
+///   via BUG-LEASE-2 once Phase 2 wires that up — surfacing it as
+///   EIO would mask the legitimate next Open + retry path).
+pub fn compute_release_action(
+    held_leases: &std::collections::HashMap<u64, crate::state::FuseLease>,
+    ino: u64,
+    kernel_flush: bool,
+) -> ReleaseAction {
+    match held_leases.get(&ino) {
+        None => ReleaseAction {
+            must_flush: kernel_flush,
+            must_drop_entry: false,
+            propagate_flush_err: true,
+        },
+        Some(slot) => {
+            let last = slot.refcount <= 1;
+            ReleaseAction {
+                must_flush: kernel_flush || last || slot.revoked,
+                must_drop_entry: last || slot.revoked,
+                propagate_flush_err: !slot.revoked,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseAction {
+    pub must_flush: bool,
+    pub must_drop_entry: bool,
+    pub propagate_flush_err: bool,
 }
 
 /// F-fuse-lease-2: callback the per-mount invalidation poll loop
@@ -484,6 +569,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                                 mode: req_mode,
                                 refcount: 1,
                                 version: info.version,
+                                revoked: false,
                             },
                         );
                     }
@@ -585,6 +671,16 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                 {
                     let mut m = state.held_leases.borrow_mut();
                     match m.get_mut(&ino) {
+                        Some(slot) if slot.revoked => {
+                            // R2-P0 #3 — the prior lease was revoked
+                            // server-side; drop the stale entry and
+                            // re-acquire. The client picks up a
+                            // fresh `version` (and a fresh server-
+                            // side epoch once BUG-LEASE-2 Phase 2
+                            // exposes lease_epoch to the SDK).
+                            m.remove(&ino);
+                            needs_acquire = true;
+                        }
                         Some(slot) => {
                             if slot.mode != req_mode {
                                 return Err(anyhow!(
@@ -611,6 +707,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                                     mode: req_mode,
                                     refcount: 1,
                                     version: info.version,
+                                    revoked: false,
                                 },
                             );
                         }
@@ -695,7 +792,29 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             data,
             reply,
         } => {
-            let result = write::write(state, ino, offset, &data).await;
+            // R2-P0 #3 (2026-06-06) — refuse writes whose lease the
+            // manager has already revoked (sticky `revoked` flag on
+            // `FuseLease`, set by the per-mount invalidation poll
+            // loop at the moment the LeaseRevoked event was
+            // observed — see `evict_revoked_held_leases`). Pre-fix
+            // the Write arm dropped through unconditionally, so the
+            // stale fd's bytes raced past the manager's revoke and
+            // co-mingled with the new writer's view. Phase 2 of
+            // BUG-LEASE-2 (PUT_ZC + fuse epoch-stamping) is what
+            // makes the same guard hold on the PS side; this is
+            // the client-side fail-fast.
+            let lease_check = {
+                let held = state.held_leases.borrow();
+                check_write_allowed(&held, ino)
+            };
+            let result = match lease_check {
+                Ok(()) => write::write(state, ino, offset, &data).await,
+                Err(reason) => Err(anyhow!(
+                    "EIO: write refused on ino {}: lease {}",
+                    ino,
+                    reason
+                )),
+            };
             let _ = reply.send(result);
         }
         FsRequest::Flush { ino, reply } => {
@@ -709,23 +828,41 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                 // §6.2). The kernel's `flush: bool` argument is
                 // unreliable — close-with-error paths and some
                 // app patterns pass false even when buffers are
-                // dirty. So we ALWAYS flush before checking
-                // whether this Release fires `ReleaseLease`, and
-                // we ONLY proceed to ReleaseLease (refcount→0
-                // transition) if the flush succeeded. A flush
-                // failure keeps the writer lease alive so the
-                // client / a retry / the TTL backstop preserves
-                // the "writer-flush-before-release" invariant.
-                let release_now_pred = {
-                    state
-                        .held_leases
-                        .borrow()
-                        .get(&ino)
-                        .map(|s| s.refcount == 1)
-                        .unwrap_or(false)
+                // dirty.
+                //
+                // R2-P0 #2 (2026-06-06): when the lease was
+                // server-side revoked (sticky `revoked` flag),
+                // we ALSO must flush even with kernel `flush=false`
+                // AND refcount > 1, because the entry is going
+                // away regardless (we drop revoked entries
+                // unconditionally so a subsequent Open re-acquires
+                // a fresh lease). Dropping the entry without
+                // flushing silently loses the dirty buffer.
+                // `compute_release_action` is the pure-fn that
+                // captures all three signals (kernel_flush /
+                // refcount-1 / revoked) into one decision tuple;
+                // see its doc for the `propagate_flush_err` nuance.
+                let action = {
+                    let held = state.held_leases.borrow();
+                    compute_release_action(&held, ino, flush)
                 };
-                if flush || release_now_pred {
-                    write::flush_inode(state, ino).await?;
+                if action.must_flush {
+                    if let Err(e) = write::flush_inode(state, ino).await {
+                        if action.propagate_flush_err {
+                            return Err(e);
+                        }
+                        // Revoked-flush is best-effort: log and
+                        // continue so we still drop the held_lease
+                        // entry. The bytes will fence at the PS
+                        // once BUG-LEASE-2 Phase 2 wires epoch
+                        // stamping; surfacing EIO here would
+                        // confuse a legit next-Open + retry.
+                        tracing::warn!(
+                            ino,
+                            error = %e,
+                            "R2-P0 #2: revoked-flush failed; continuing to drop entry"
+                        );
+                    }
                 }
                 if let Some(is) = state.inodes.get_mut(&ino) {
                     is.open_count = is.open_count.saturating_sub(1);
@@ -738,15 +875,19 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                     }
                 }
                 // Refcount the lease; only the 1→0 transition
-                // fires ReleaseLease. Best-effort — a failed
-                // release is recovered by the manager's TTL revoke
-                // loop (≤ 30s window).
+                // OR a revoked entry fires ReleaseLease.
+                // Best-effort — a failed release is recovered by
+                // the manager's TTL revoke loop (≤ 30s window).
                 let release_now = {
                     let mut m = state.held_leases.borrow_mut();
                     match m.get_mut(&ino) {
                         Some(slot) => {
                             slot.refcount = slot.refcount.saturating_sub(1);
-                            if slot.refcount == 0 {
+                            // Drop the entry on 1→0 OR if revoked
+                            // (revoked entries are not recoverable
+                            // — the manager already gave the lease
+                            // to someone else).
+                            if action.must_drop_entry {
                                 m.remove(&ino);
                                 true
                             } else {
@@ -910,66 +1051,217 @@ mod bug_lease_3_fuse_tests {
             mode,
             refcount: 1,
             version: 1,
+            revoked: false,
         }
     }
 
     #[test]
-    fn lease_revoked_evicts_held_lease() {
+    fn lease_revoked_marks_held_lease() {
+        // R2-P0 #2/#3: evict NO LONGER removes — it sets the
+        // sticky `revoked: bool` so Write/Release can act on it.
         let mut held = HashMap::new();
         held.insert(42, lease(LEASE_MODE_WRITE));
         held.insert(99, lease(LEASE_MODE_READ));
-        let evicted = evict_revoked_held_leases(
+        let newly_revoked = evict_revoked_held_leases(
             &[ev(42, 6, LEASE_INVAL_LEASE_REVOKED)],
             &mut held,
         );
-        assert_eq!(evicted, vec![42]);
-        assert!(!held.contains_key(&42));
+        assert_eq!(newly_revoked, vec![42]);
+        assert!(held.contains_key(&42), "entry must stay in map for Write/Release to see");
+        assert!(held.get(&42).unwrap().revoked, "entry must be marked revoked");
         assert!(held.contains_key(&99));
+        assert!(!held.get(&99).unwrap().revoked, "untouched entry must stay unrevoked");
     }
 
     #[test]
-    fn writer_closed_does_not_evict() {
+    fn double_revoke_is_idempotent_after_r2() {
+        // Second LeaseRevoked for the same ino must NOT re-emit
+        // a newly_revoked entry — otherwise the dispatch caller's
+        // best-effort `lease::release` runs twice for one event.
+        let mut held = HashMap::new();
+        held.insert(42, lease(LEASE_MODE_WRITE));
+        let _ = evict_revoked_held_leases(
+            &[ev(42, 6, LEASE_INVAL_LEASE_REVOKED)],
+            &mut held,
+        );
+        let newly = evict_revoked_held_leases(
+            &[ev(42, 7, LEASE_INVAL_LEASE_REVOKED)],
+            &mut held,
+        );
+        assert!(newly.is_empty(), "second revoke must not re-emit; got {:?}", newly);
+        assert!(held.get(&42).unwrap().revoked);
+    }
+
+    #[test]
+    fn writer_closed_does_not_mark() {
         let mut held = HashMap::new();
         held.insert(42, lease(LEASE_MODE_READ));
-        let evicted = evict_revoked_held_leases(
+        let newly = evict_revoked_held_leases(
             &[ev(42, 6, LEASE_INVAL_WRITER_CLOSED)],
             &mut held,
         );
-        assert!(evicted.is_empty());
-        assert!(held.contains_key(&42));
+        assert!(newly.is_empty());
+        assert!(!held.get(&42).unwrap().revoked);
     }
 
     #[test]
-    fn will_revoke_in_does_not_evict() {
+    fn will_revoke_in_does_not_mark() {
         let mut held = HashMap::new();
         held.insert(42, lease(LEASE_MODE_WRITE));
-        let evicted = evict_revoked_held_leases(
+        let newly = evict_revoked_held_leases(
             &[ev(42, 5000, LEASE_INVAL_WILL_REVOKE_IN)],
             &mut held,
         );
-        assert!(evicted.is_empty());
-        assert!(held.contains_key(&42));
+        assert!(newly.is_empty());
+        assert!(!held.get(&42).unwrap().revoked);
     }
 
     #[test]
-    fn ino_zero_overflow_sentinel_does_not_evict() {
+    fn ino_zero_overflow_sentinel_does_not_mark() {
         let mut held = HashMap::new();
         held.insert(42, lease(LEASE_MODE_WRITE));
-        let evicted = evict_revoked_held_leases(
+        let newly = evict_revoked_held_leases(
             &[ev(0, 0, LEASE_INVAL_META_CHANGED)],
             &mut held,
         );
-        assert!(evicted.is_empty());
-        assert!(held.contains_key(&42));
+        assert!(newly.is_empty());
+        assert!(!held.get(&42).unwrap().revoked);
     }
 
     #[test]
     fn revoked_for_ino_we_dont_hold_is_a_noop() {
         let mut held = HashMap::new();
-        let evicted = evict_revoked_held_leases(
+        let newly = evict_revoked_held_leases(
             &[ev(999, 1, LEASE_INVAL_LEASE_REVOKED)],
             &mut held,
         );
-        assert!(evicted.is_empty());
+        assert!(newly.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod r2_p0_2_3_lease_check_tests {
+    //! R2-P0 #2/#3 (2026-06-06) — pure-fn reproductions for the
+    //! Write/Release lease-revoke checks. Default-CI; mirrors the
+    //! ioring `inode_open_locks` style.
+
+    use super::{check_write_allowed, compute_release_action, ReleaseAction};
+    use crate::state::FuseLease;
+    use autumn_rpc::manager_rpc::{LEASE_MODE_READ, LEASE_MODE_WRITE};
+    use std::collections::HashMap;
+
+    fn lease(mode: u8, refcount: u32, revoked: bool) -> FuseLease {
+        FuseLease { mode, refcount, version: 1, revoked }
+    }
+
+    // ── check_write_allowed ────────────────────────────────────
+
+    #[test]
+    fn write_with_active_writer_lease_is_allowed() {
+        let mut held = HashMap::new();
+        held.insert(7, lease(LEASE_MODE_WRITE, 1, false));
+        assert_eq!(check_write_allowed(&held, 7), Ok(()));
+    }
+
+    #[test]
+    fn write_with_revoked_lease_is_refused() {
+        // R2-P0 #3 KEY ASSERTION: a held entry whose lease was
+        // revoked server-side must NOT let writes through.
+        let mut held = HashMap::new();
+        held.insert(7, lease(LEASE_MODE_WRITE, 1, true));
+        assert_eq!(check_write_allowed(&held, 7), Err("revoked"));
+    }
+
+    #[test]
+    fn write_with_read_only_lease_is_refused() {
+        let mut held = HashMap::new();
+        held.insert(7, lease(LEASE_MODE_READ, 1, false));
+        assert_eq!(check_write_allowed(&held, 7), Err("wrong mode"));
+    }
+
+    #[test]
+    fn write_without_any_lease_is_refused() {
+        let held = HashMap::new();
+        assert_eq!(check_write_allowed(&held, 7), Err("no lease"));
+    }
+
+    // ── compute_release_action ─────────────────────────────────
+
+    #[test]
+    fn release_normal_last_refcount_flushes_and_drops() {
+        let mut held = HashMap::new();
+        held.insert(7, lease(LEASE_MODE_WRITE, 1, false));
+        let action = compute_release_action(&held, 7, false);
+        assert_eq!(action, ReleaseAction {
+            must_flush: true,
+            must_drop_entry: true,
+            propagate_flush_err: true,
+        });
+    }
+
+    #[test]
+    fn release_normal_non_last_refcount_no_flush() {
+        let mut held = HashMap::new();
+        held.insert(7, lease(LEASE_MODE_WRITE, 3, false));
+        let action = compute_release_action(&held, 7, false);
+        assert_eq!(action, ReleaseAction {
+            must_flush: false,
+            must_drop_entry: false,
+            propagate_flush_err: true,
+        });
+    }
+
+    #[test]
+    fn release_kernel_flush_true_always_flushes() {
+        let mut held = HashMap::new();
+        held.insert(7, lease(LEASE_MODE_WRITE, 3, false));
+        let action = compute_release_action(&held, 7, true);
+        assert!(action.must_flush);
+        assert!(!action.must_drop_entry, "kernel-flush alone doesn't drop the entry");
+    }
+
+    #[test]
+    fn release_revoked_entry_flushes_and_drops_even_at_high_refcount() {
+        // R2-P0 #2 KEY ASSERTION: a revoked entry MUST flush
+        // before drop even when refcount > 1 and kernel flush=false.
+        // Pre-fix the original "release_now_pred = refcount==1"
+        // would skip the flush and the dirty buffer would be lost
+        // on the eventual drop.
+        let mut held = HashMap::new();
+        held.insert(7, lease(LEASE_MODE_WRITE, 3, true));
+        let action = compute_release_action(&held, 7, false);
+        assert_eq!(action, ReleaseAction {
+            must_flush: true,
+            must_drop_entry: true,
+            propagate_flush_err: false,
+        });
+    }
+
+    #[test]
+    fn release_revoked_flush_err_does_not_propagate() {
+        // A revoked entry's flush is best-effort: the bytes will
+        // fence at the PS once BUG-LEASE-2 Phase 2 wires epoch
+        // stamping. Surfacing the err to the kernel would mask
+        // the legit next-Open-after-revoke retry path.
+        let mut held = HashMap::new();
+        held.insert(7, lease(LEASE_MODE_WRITE, 1, true));
+        let action = compute_release_action(&held, 7, false);
+        assert!(!action.propagate_flush_err);
+    }
+
+    #[test]
+    fn release_no_entry_honors_kernel_flush_only() {
+        // Pre-Open Release (rare but possible on some kernel
+        // close-with-error paths) — no entry to drop, no lease
+        // bookkeeping; just honor kernel flush as before.
+        let held = HashMap::new();
+        let action = compute_release_action(&held, 7, true);
+        assert_eq!(action, ReleaseAction {
+            must_flush: true,
+            must_drop_entry: false,
+            propagate_flush_err: true,
+        });
+        let action2 = compute_release_action(&held, 7, false);
+        assert!(!action2.must_flush);
     }
 }

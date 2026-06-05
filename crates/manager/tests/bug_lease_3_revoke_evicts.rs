@@ -90,6 +90,7 @@ fn force_revoke_event_is_lease_revoked_kind_and_evict_fn_clears_held_lease() {
                 mode: LEASE_MODE_WRITE,
                 refcount: 1,
                 version: info.version,
+                revoked: false,
             },
         );
 
@@ -125,11 +126,18 @@ fn force_revoke_event_is_lease_revoked_kind_and_evict_fn_clears_held_lease() {
 
         // Apply the eviction helper (the BUG-LEASE-3 fix). Pre-fix
         // the loop did NOT call this; post-fix it does.
-        let evicted = evict_revoked_held_leases(&events, &mut held);
-        assert_eq!(evicted, vec![ino]);
+        // R2-P0 #2/#3 (2026-06-06): the helper now MARKS the entry
+        // as revoked rather than removing it — so Release can still
+        // flush before drop, and Write can fast-fail with EIO.
+        let newly_revoked = evict_revoked_held_leases(&events, &mut held);
+        assert_eq!(newly_revoked, vec![ino]);
         assert!(
-            !held.contains_key(&ino),
-            "BUG-LEASE-3 post-fix: held_leases must be empty after the eviction helper runs"
+            held.contains_key(&ino),
+            "R2-P0 #2/#3: held_leases entry must STAY (marker-not-remove)"
+        );
+        assert!(
+            held.get(&ino).unwrap().revoked,
+            "R2-P0 #2/#3: held_leases[ino].revoked must be true after the helper runs"
         );
     });
 }

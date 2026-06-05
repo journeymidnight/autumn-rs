@@ -27,6 +27,21 @@ pub struct FuseLease {
     /// Server-side version handed back at AcquireLease. Used by the
     /// (future, F-fuse-lease-4-equivalent) cache invalidation path.
     pub version: u64,
+    /// R2-P0 #2/#3 (2026-06-06) — sticky flag set when the manager's
+    /// invalidation poll observes `LEASE_INVAL_LEASE_REVOKED` for
+    /// this ino. The entry is intentionally KEPT in the map (not
+    /// removed) so:
+    ///   - `Write` can fast-fail with EIO on a revoked lease (the
+    ///     stale fd's bytes must not reach the new writer's view —
+    ///     this is the client-side half of BUG-LEASE-2's fencing).
+    ///   - `Release` can recognise that a flush is required even
+    ///     when the kernel passed `flush=false` AND `refcount > 1`,
+    ///     because the lease is gone server-side and the dirty
+    ///     buffer would otherwise be silently dropped on the next
+    ///     refcount→0 (no entry, no `release_now_pred`, no flush).
+    /// Cleared on the next successful `AcquireLease` for the same
+    /// ino (Open path drops the revoked entry and re-acquires).
+    pub revoked: bool,
 }
 
 /// Central filesystem state, lives on the compio thread (single-threaded, no locks).

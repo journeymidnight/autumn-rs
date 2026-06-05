@@ -142,6 +142,7 @@ fn per_ino_writer_close_triggers_invalidator() {
                 mode: LEASE_MODE_READ,
                 refcount: 1,
                 version: info.version,
+                revoked: false,
             },
         );
 
@@ -229,6 +230,7 @@ fn multiple_distinct_inos_each_get_invalidated() {
                     mode: LEASE_MODE_READ,
                     refcount: 1,
                     version: info.version,
+                    revoked: false,
                 },
             );
         }
