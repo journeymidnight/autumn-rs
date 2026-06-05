@@ -46,6 +46,28 @@ fn lease_mode_for_open(flags: i32) -> u8 {
 /// (the user-space lease bookkeeping still updates correctly).
 pub type InodeInvalidator = std::rc::Rc<dyn Fn(u64)>;
 
+/// F-fuse-lease-2 — pure-fn extracted from the invalidation poll
+/// loop so the "per-event ⇒ per-ino invalidator call" contract
+/// can be unit-tested without booting a real cluster (coco P3
+/// review feedback: cluster-bound e2e tests are `#[ignore]`'d
+/// and default CI doesn't catch regressions in this loop).
+///
+/// For every event in the batch, runs the kernel-cache eviction
+/// callback iff the event has a non-zero ino. `ino == 0` is the
+/// manager-side overflow sentinel and is filtered here — the
+/// wholesale-clear branch in `spawn_lease_background_tasks`
+/// handles it separately.
+pub fn invalidate_kernel_cache_for_events(
+    events: &[autumn_rpc::manager_rpc::MgrInvalidation],
+    invalidator: &InodeInvalidator,
+) {
+    for ev in events {
+        if ev.ino != 0 {
+            invalidator(ev.ino);
+        }
+    }
+}
+
 /// F-fuse-lease-1 + F-fuse-lease-2: per-mount background tasks.
 /// Spawn ONCE on the compio runtime right after `FsState::new`
 /// (before the dispatch loop). Mirrors `autumn-ioring`'s
@@ -119,19 +141,16 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
                             kind = ev.kind,
                             "F-fuse-lease-2: invalidation"
                         );
-                        // F-fuse-lease-2: drop the kernel's
-                        // attribute + page cache for this ino so
-                        // the next syscall reaches our dispatcher
-                        // and re-reads the post-close bytes.
-                        // ino=0 sentinel + non-positive inos are
-                        // skipped (overflow path handles the
-                        // wholesale case below; ino=0 isn't a real
-                        // FUSE ino).
-                        if ev.ino != 0 {
-                            if let Some(inv) = &invalidator_p {
-                                inv(ev.ino);
-                            }
-                        }
+                    }
+                    // F-fuse-lease-2: drop the kernel's attribute
+                    // + page cache for each non-zero ino in the
+                    // batch (ino=0 is the manager-side overflow
+                    // sentinel and is handled by the wholesale
+                    // branch below — not a real FUSE ino).
+                    // Extracted to a pure-fn so the contract is
+                    // unit-testable without booting a cluster.
+                    if let Some(inv) = &invalidator_p {
+                        invalidate_kernel_cache_for_events(&events, inv);
                     }
                     if wholesale {
                         tracing::warn!(
@@ -703,4 +722,96 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
         }
     }
     true // continue processing
+}
+
+#[cfg(test)]
+mod f_fuse_lease_2_unit_tests {
+    //! F-fuse-lease-2 (coco P3 review feedback): unit-test the
+    //! per-event ⇒ invalidator-call contract so default `cargo test`
+    //! catches regressions. The `f_fuse_lease_2.rs` integration
+    //! suite is `#[ignore]`'d (cluster-boot, slow); these guard
+    //! the same shape with no cluster.
+
+    use super::invalidate_kernel_cache_for_events;
+    use autumn_rpc::manager_rpc::{
+        MgrInvalidation, LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_META_CHANGED,
+        LEASE_INVAL_WRITER_CLOSED,
+    };
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn ev(ino: u64, version: u64, kind: u8) -> MgrInvalidation {
+        MgrInvalidation { ino, version, kind }
+    }
+
+    fn counting_inv() -> (super::InodeInvalidator, Rc<RefCell<Vec<u64>>>) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let log_c = log.clone();
+        let inv: super::InodeInvalidator = Rc::new(move |ino: u64| {
+            log_c.borrow_mut().push(ino);
+        });
+        (inv, log)
+    }
+
+    #[test]
+    fn per_ino_writer_closed_calls_invalidator() {
+        let (inv, log) = counting_inv();
+        invalidate_kernel_cache_for_events(
+            &[ev(7, 5, LEASE_INVAL_WRITER_CLOSED)],
+            &inv,
+        );
+        assert_eq!(*log.borrow(), vec![7]);
+    }
+
+    #[test]
+    fn ino_zero_overflow_sentinel_is_filtered() {
+        // Manager's overflow signalling sends MetaChanged{ino=0};
+        // the per-ino invalidator path MUST skip it (wholesale
+        // branch in spawn_lease_background_tasks handles overflow).
+        let (inv, log) = counting_inv();
+        invalidate_kernel_cache_for_events(
+            &[
+                ev(0, 0, LEASE_INVAL_META_CHANGED),
+                ev(42, 3, LEASE_INVAL_WRITER_CLOSED),
+            ],
+            &inv,
+        );
+        assert_eq!(*log.borrow(), vec![42], "ino=0 sentinel must NOT reach invalidator");
+    }
+
+    #[test]
+    fn multi_ino_batch_invalidates_each() {
+        // The production case: a poll batch carries events for
+        // several distinct inos. Every non-zero ino must trigger
+        // the kernel-cache evict.
+        let (inv, log) = counting_inv();
+        invalidate_kernel_cache_for_events(
+            &[
+                ev(100, 1, LEASE_INVAL_WRITER_CLOSED),
+                ev(200, 2, LEASE_INVAL_LEASE_REVOKED),
+                ev(300, 3, LEASE_INVAL_WRITER_CLOSED),
+            ],
+            &inv,
+        );
+        assert_eq!(*log.borrow(), vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn empty_events_is_a_noop() {
+        let (inv, log) = counting_inv();
+        invalidate_kernel_cache_for_events(&[], &inv);
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn lease_revoked_also_triggers_invalidation() {
+        // LeaseRevoked = manager TTL-expired the writer. Reader's
+        // cached attrs/data are stale just like WriterClosed.
+        let (inv, log) = counting_inv();
+        invalidate_kernel_cache_for_events(
+            &[ev(55, 7, LEASE_INVAL_LEASE_REVOKED)],
+            &inv,
+        );
+        assert_eq!(*log.borrow(), vec![55]);
+    }
 }
