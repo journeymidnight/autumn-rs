@@ -274,6 +274,25 @@ impl DeferredPushes {
     }
 }
 
+/// BUG-LEASE-5 (P1 #5, 2026-06-06) — plan returned by
+/// `tick_plan` for the 2PC TTL-revoke loop.
+///
+/// `ino`: the writer-held inode whose TTL has elapsed.
+/// `new_version`: the version the in-memory state WILL bump to in
+///   `tick_commit_revokes`. The caller does NOT use this for any
+///   etcd key (etcd delete is keyed by `ino` alone); it's exposed
+///   for diagnostics + the manager log.
+/// `readers`: snapshot of reader ClientKeys captured BEFORE the
+///   commit phase's reader expiry sweep. Each reader gets a
+///   `LeaseRevoked` push on commit even if their own lease expired
+///   in the same tick — the L4 ordering invariant.
+#[derive(Debug, Clone)]
+pub struct RevokePlan {
+    pub ino: u64,
+    pub new_version: u64,
+    pub readers: Vec<ClientKey>,
+}
+
 /// Manager-side lease registry. Single-threaded; wrap in
 /// `Rc<RefCell<…>>` for AutumnManager.
 #[derive(Default)]
@@ -782,60 +801,119 @@ impl LeaseRegistry {
         self.inboxes.remove(&me);
     }
 
-    /// TTL revoke pass. Returns the list of inodes whose writer was
-    /// revoked + the new `(ino, version)` so the caller (manager) can
-    /// etcd-delete the persisted record; invalidation pushes are
-    /// queued before this returns. Also drops expired reader leases
-    /// silently.
+    /// TTL revoke pass — BACKWARD-COMPATIBLE wrapper. Mutates state
+    /// + queues invalidations + returns the (ino, new_version) pairs
+    /// the caller etcd-deletes. Used by unit tests + memory-only
+    /// (no-etcd) callers where etcd-failure is structurally
+    /// impossible.
     ///
-    /// Ordering matters: a writer-revoke captures the reader set
+    /// **Production callers (`inode_lease_revoke_loop`) MUST use the
+    /// 2PC pair `tick_plan` + `tick_commit_revokes` / `tick_reader_expiry`**
+    /// so an etcd-delete failure rolls back without leaving phantom
+    /// LeaseRevoked events in reader inboxes or a version bump
+    /// without a corresponding etcd-record-delete. See BUG-LEASE-5.
+    ///
+    /// Ordering invariant: a writer-revoke captures the reader set
     /// BEFORE expired readers are evicted in the same tick. A reader
     /// whose lease expired on the same boundary as the writer's TTL
     /// must still be notified — its inbox lives independently of its
     /// lease entry, so the notification survives until the reader
-    /// reconnects (or until the inbox is dropped by `forget_client`).
+    /// reconnects.
     pub fn tick(&mut self, now: Instant) -> Vec<(u64, u64)> {
-        let mut writer_revokes: Vec<(u64, u64, Vec<ClientKey>)> = Vec::new();
-        let mut to_drop_inodes: Vec<u64> = Vec::new();
+        let plans = self.tick_plan(now);
+        let revoked = self.tick_commit_revokes(&plans, now);
+        self.tick_reader_expiry(now);
+        revoked
+    }
 
-        for (&ino, state) in self.inodes.iter_mut() {
-            // Writer expiry — capture pre-eviction reader set, then
-            // bump version.
+    /// BUG-LEASE-5 (P1 #5, 2026-06-06) — 2PC plan phase. Pure (does
+    /// not mutate); enumerates writers whose TTL has expired. The
+    /// caller (`inode_lease_revoke_loop`) etcd-deletes the matching
+    /// `inode_leases/<ino>` records BEFORE applying the in-memory
+    /// mutation via `tick_commit_revokes`. On etcd-delete failure,
+    /// the in-memory state stays untouched and the next 1s tick
+    /// re-discovers the same expired writers — i.e. the existing
+    /// 1s revoke loop IS the natural retry, no persisted retry
+    /// queue needed.
+    ///
+    /// Pre-fix `tick()` mutated state THEN attempted the etcd
+    /// delete; on etcd-fail the in-memory writer was gone + the
+    /// version was bumped + readers got LeaseRevoked events, but
+    /// the etcd record stayed. Leader failover then replayed the
+    /// stale record and "resurrected" the revoked writer.
+    pub fn tick_plan(&self, now: Instant) -> Vec<RevokePlan> {
+        let mut plans = Vec::new();
+        for (&ino, state) in &self.inodes {
             if let Some(deadline) = state.writer_expires_at {
                 if deadline <= now {
-                    state.writer = None;
-                    state.writer_diag_host.clear();
-                    state.writer_expires_at = None;
-                    // F-lease-preempt: TTL revoke also clears any
-                    // pending preempt window — no point keeping a
-                    // grace deadline after the writer is gone.
-                    state.pending_revoke_at = None;
-                    state.version = state.version.wrapping_add(1);
+                    let new_version = state.version.wrapping_add(1);
                     let readers: Vec<ClientKey> = state.readers.keys().cloned().collect();
-                    writer_revokes.push((ino, state.version, readers));
+                    plans.push(RevokePlan { ino, new_version, readers });
                 }
             }
-            // Reader expiry — silent drop, no invalidation push.
+        }
+        plans
+    }
+
+    /// BUG-LEASE-5 (P1 #5) — 2PC commit phase for writer revokes.
+    /// Applies the in-memory mutation (clear writer / bump version /
+    /// queue invalidations) for each plan. **Re-validates** that
+    /// each plan's writer is still expired — a concurrent heartbeat
+    /// during the etcd-delete await may have refreshed the writer
+    /// (rare but possible if the loop's leader check + etcd RTT
+    /// overlap with a writer heartbeat). On race-skip: the etcd
+    /// record was unnecessarily deleted; the next heartbeat will
+    /// CAS-fail on read-not-found and the next AcquireLease
+    /// re-persists. Documented but accepted residual.
+    ///
+    /// Returns `(ino, new_version)` pairs that ACTUALLY committed
+    /// (i.e. excludes race-skipped plans).
+    pub fn tick_commit_revokes(&mut self, plans: &[RevokePlan], now: Instant) -> Vec<(u64, u64)> {
+        let mut committed: Vec<(u64, u64)> = Vec::new();
+        let mut pending_pushes: Vec<(ClientKey, u64, u64)> = Vec::new(); // (target, ino, new_version)
+        for plan in plans {
+            let Some(state) = self.inodes.get_mut(&plan.ino) else {
+                continue;
+            };
+            // Idempotency / race-skip guard.
+            match state.writer_expires_at {
+                Some(deadline) if deadline <= now => {}
+                _ => continue,
+            }
+            state.writer = None;
+            state.writer_diag_host.clear();
+            state.writer_expires_at = None;
+            state.pending_revoke_at = None;
+            state.version = state.version.wrapping_add(1);
+            committed.push((plan.ino, state.version));
+            for r in &plan.readers {
+                pending_pushes.push((r.clone(), plan.ino, state.version));
+            }
+        }
+        for (target, ino, ver) in pending_pushes {
+            self.remember_version(ino, ver);
+            self.push_invalidation(&target, ino, ver, InvalidationReason::LeaseRevoked);
+        }
+        committed
+    }
+
+    /// BUG-LEASE-5 (P1 #5) — reader expiry sweep, SEPARATE from
+    /// writer revokes. Reader expiry has no etcd write (reader
+    /// leases aren't persisted), so it runs unconditionally each
+    /// tick whether or not the 2PC writer-revoke loop saw etcd
+    /// failures. Mirrors the original `tick()` semantics: silent
+    /// drop of expired reader entries; drop empty inode entries.
+    pub fn tick_reader_expiry(&mut self, now: Instant) {
+        let mut to_drop_inodes: Vec<u64> = Vec::new();
+        for (&ino, state) in self.inodes.iter_mut() {
             state.readers.retain(|_, deadline| *deadline > now);
             if state.writer.is_none() && state.readers.is_empty() {
                 to_drop_inodes.push(ino);
             }
         }
-
         for ino in to_drop_inodes {
             self.inodes.remove(&ino);
         }
-        let revoked_pairs: Vec<(u64, u64)> = writer_revokes
-            .iter()
-            .map(|(ino, ver, _)| (*ino, *ver))
-            .collect();
-        for (ino, ver, readers) in writer_revokes {
-            self.remember_version(ino, ver);
-            for r in readers {
-                self.push_invalidation(&r, ino, ver, InvalidationReason::LeaseRevoked);
-            }
-        }
-        revoked_pairs
     }
 
     fn push_invalidation(
@@ -1004,32 +1082,59 @@ impl AutumnManager {
                 continue;
             }
             let now = Instant::now();
-            let revoked: Vec<(u64, u64)> = {
-                let mut reg = self.inode_leases.borrow_mut();
-                reg.tick(now)
+            // BUG-LEASE-5 (P1 #5, 2026-06-06) — 2PC TTL revoke.
+            // PLAN phase: peek expired writers WITHOUT mutating.
+            let plans = {
+                let reg = self.inode_leases.borrow();
+                reg.tick_plan(now)
             };
-            if revoked.is_empty() {
+
+            if plans.is_empty() {
+                // No writer-revokes this tick; still need to sweep
+                // expired READER leases (no etcd write — readers
+                // aren't persisted, so this never fails).
+                self.inode_leases.borrow_mut().tick_reader_expiry(now);
                 continue;
             }
-            let keys: Vec<String> = revoked
+
+            // ETCD phase: delete the matching writer records FIRST.
+            // On failure, leave in-memory state untouched — the next
+            // 1s tick re-discovers the same expired writers and
+            // retries. Pre-fix the in-memory mutation happened first
+            // and was UNROLLABLE on etcd-fail; leader failover then
+            // replayed the stale etcd record and "resurrected" the
+            // revoked writer.
+            let keys: Vec<String> = plans
                 .iter()
-                .map(|(ino, _)| format!("{}{ino}", crate::INODE_LEASES_PREFIX))
+                .map(|p| format!("{}{ino}", crate::INODE_LEASES_PREFIX, ino = p.ino))
                 .collect();
             if let Some(etcd) = &self.etcd {
                 if let Err(e) = etcd.put_and_delete_txn(vec![], keys).await {
                     tracing::warn!(
                         error = %e,
-                        revoked = revoked.len(),
-                        "F-ioring-lease-1: revoke-loop etcd delete failed; retry next tick"
+                        planned = plans.len(),
+                        "BUG-LEASE-5: revoke-loop etcd delete failed; in-memory state preserved, retry next tick"
                     );
+                    // Reader expiry still runs (no etcd write).
+                    self.inode_leases.borrow_mut().tick_reader_expiry(now);
                     continue;
                 }
             }
+
+            // COMMIT phase: apply the in-memory mutations + push
+            // invalidations + run reader expiry. Single borrow so
+            // there's no interleaving between commit + reader expiry.
+            let revoked: Vec<(u64, u64)> = {
+                let mut reg = self.inode_leases.borrow_mut();
+                let committed = reg.tick_commit_revokes(&plans, now);
+                reg.tick_reader_expiry(now);
+                committed
+            };
             for (ino, ver) in revoked {
                 tracing::info!(
                     ino,
                     new_version = ver,
-                    "F-ioring-lease-1: writer lease revoked by TTL"
+                    "BUG-LEASE-5: writer lease revoked by TTL (2PC commit)"
                 );
             }
         }
@@ -1733,6 +1838,191 @@ mod tests {
         let _ = r.acquire(&w, 85, LEASE_MODE_WRITE, Instant::now());
         r.revert_writer_acquire(85, None);
         assert!(!r.inodes.contains_key(&85));
+    }
+
+    // ─────────────── BUG-LEASE-5 (P1 #5) ────────────────────
+
+    #[test]
+    fn bug_lease_5_tick_plan_does_not_mutate_state() {
+        // BUG-LEASE-5 KEY ASSERTION: `tick_plan` is a pure read,
+        // so an etcd-delete failure between plan and commit
+        // doesn't leave the in-memory state in a half-revoked
+        // shape.
+        let mut r = LeaseRegistry::with_ttl(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let w = cid(1, 1, "writer");
+        let rd = cid(2, 2, "reader");
+        let _ = r.acquire(&w, 1, LEASE_MODE_WRITE, t0);
+        let _ = r.acquire(&rd, 1, LEASE_MODE_READ, t0);
+
+        let t_past = t0 + Duration::from_millis(200);
+        let pre_version = r.inodes.get(&1).unwrap().version;
+        let pre_writer = r.inodes.get(&1).unwrap().writer.clone();
+
+        let plans = r.tick_plan(t_past);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].ino, 1);
+        assert_eq!(plans[0].new_version, pre_version + 1);
+        assert_eq!(plans[0].readers.len(), 1);
+
+        // tick_plan must NOT mutate.
+        let post_version = r.inodes.get(&1).unwrap().version;
+        let post_writer = r.inodes.get(&1).unwrap().writer.clone();
+        assert_eq!(post_version, pre_version);
+        assert_eq!(post_writer, pre_writer);
+        // Reader inbox MUST NOT contain a LeaseRevoked event yet.
+        let (events, _) = r.drain_invalidations(&rd);
+        assert!(
+            events.iter().all(|e| e.kind != LEASE_INVAL_LEASE_REVOKED),
+            "tick_plan must NOT push events: {events:?}"
+        );
+    }
+
+    #[test]
+    fn bug_lease_5_tick_commit_applies_writer_revoke_and_pushes_lease_revoked() {
+        let mut r = LeaseRegistry::with_ttl(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let w = cid(1, 1, "writer");
+        let rd1 = cid(2, 10, "reader-1");
+        let rd2 = cid(2, 11, "reader-2");
+        let _ = r.acquire(&w, 2, LEASE_MODE_WRITE, t0);
+        let _ = r.acquire(&rd1, 2, LEASE_MODE_READ, t0);
+        let _ = r.acquire(&rd2, 2, LEASE_MODE_READ, t0);
+
+        let t_past = t0 + Duration::from_millis(200);
+        let plans = r.tick_plan(t_past);
+        let committed = r.tick_commit_revokes(&plans, t_past);
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].0, 2);
+
+        // Both readers see LeaseRevoked.
+        let (e1, _) = r.drain_invalidations(&rd1);
+        let (e2, _) = r.drain_invalidations(&rd2);
+        for events in [&e1, &e2] {
+            let lr: Vec<_> = events
+                .iter()
+                .filter(|e| e.kind == LEASE_INVAL_LEASE_REVOKED && e.ino == 2)
+                .collect();
+            assert_eq!(lr.len(), 1, "must push exactly one LeaseRevoked: {events:?}");
+        }
+    }
+
+    #[test]
+    fn bug_lease_5_tick_commit_skips_writer_who_heartbeated_during_etcd_await() {
+        // Race-skip path: between tick_plan and tick_commit_revokes,
+        // the writer's deadline was refreshed by a heartbeat. The
+        // commit phase MUST NOT revoke (the writer is no longer
+        // expired); the corresponding etcd record would have been
+        // unnecessarily deleted, and the next heartbeat's CAS-fail
+        // pattern recovers eventually (heartbeat re-persists are
+        // currently disabled — see comments — but the in-memory
+        // state stays consistent).
+        let mut r = LeaseRegistry::with_ttl(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let w = cid(1, 1, "writer");
+        let _ = r.acquire(&w, 3, LEASE_MODE_WRITE, t0);
+
+        let t_past = t0 + Duration::from_millis(200);
+        let plans = r.tick_plan(t_past);
+        assert_eq!(plans.len(), 1);
+
+        // Simulate: while etcd-delete was in flight, the writer
+        // heartbeated and refreshed the deadline.
+        let _ = r.heartbeat(&w, 3, t_past);
+        // Now the writer's deadline > t_past, so commit must skip.
+
+        let committed = r.tick_commit_revokes(&plans, t_past);
+        assert!(
+            committed.is_empty(),
+            "BUG-LEASE-5 race-skip: refreshed writer MUST NOT be revoked on commit; got {committed:?}"
+        );
+        // The writer slot is still set + version untouched.
+        let entry = r.inodes.get(&3).unwrap();
+        assert!(entry.writer.is_some());
+        assert_eq!(entry.version, 1);
+    }
+
+    #[test]
+    fn bug_lease_5_tick_reader_expiry_independent_of_writer_revokes() {
+        // Reader expiry runs unconditionally each tick (no etcd
+        // write). Verify it correctly drops expired readers + the
+        // empty inode entry, independently of any writer-revoke
+        // plan.
+        let mut r = LeaseRegistry::with_ttl(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let rd = cid(2, 1, "reader-only");
+        let _ = r.acquire(&rd, 4, LEASE_MODE_READ, t0);
+        assert!(r.inodes.contains_key(&4));
+
+        let t_past = t0 + Duration::from_millis(200);
+        let plans = r.tick_plan(t_past);
+        assert!(plans.is_empty(), "no writer to revoke");
+        r.tick_reader_expiry(t_past);
+
+        // Reader was the only entry holder → inode dropped.
+        assert!(!r.inodes.contains_key(&4));
+    }
+
+    #[test]
+    fn bug_lease_5_simulated_etcd_fail_preserves_in_memory_state() {
+        // The behavioral guarantee: if the loop's etcd-delete call
+        // were to fail, the loop calls `tick_reader_expiry` but
+        // SKIPS `tick_commit_revokes`. The expired writer stays in
+        // the registry; the next tick re-discovers it.
+        let mut r = LeaseRegistry::with_ttl(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let w = cid(1, 1, "writer");
+        let rd = cid(2, 2, "reader");
+        let _ = r.acquire(&w, 5, LEASE_MODE_WRITE, t0);
+        let _ = r.acquire(&rd, 5, LEASE_MODE_READ, t0);
+
+        let t_past = t0 + Duration::from_millis(200);
+        let plans = r.tick_plan(t_past);
+        assert_eq!(plans.len(), 1);
+
+        // Simulate etcd-delete fail by SKIPPING `tick_commit_revokes`.
+        // Only reader expiry runs.
+        r.tick_reader_expiry(t_past);
+
+        // Reader expiry dropped the reader, but the writer entry
+        // is still alive: writer slot present, version unchanged.
+        let entry = r.inodes.get(&5).unwrap();
+        assert!(
+            entry.writer.is_some(),
+            "BUG-LEASE-5: etcd-fail leaves writer slot intact"
+        );
+        assert_eq!(entry.version, 1, "no spurious version bump");
+
+        // Next tick re-discovers it (idempotent rediscovery).
+        let t_next = t_past + Duration::from_millis(1);
+        let plans_next = r.tick_plan(t_next);
+        assert_eq!(plans_next.len(), 1, "re-discovered next tick");
+
+        // Now the etcd delete succeeds → commit.
+        let committed = r.tick_commit_revokes(&plans_next, t_next);
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].0, 5);
+        assert_eq!(committed[0].1, 2, "post-commit version bumped exactly once");
+    }
+
+    #[test]
+    fn bug_lease_5_tick_wrapper_remains_backward_compatible() {
+        // The `tick()` wrapper still applies in one call (used by
+        // memory-only tests + the in-process test helpers). The 2PC
+        // refactor MUST NOT have broken its semantics.
+        let mut r = LeaseRegistry::with_ttl(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let w = cid(1, 1, "writer");
+        let rd = cid(2, 2, "reader");
+        let _ = r.acquire(&w, 6, LEASE_MODE_WRITE, t0);
+        let _ = r.acquire(&rd, 6, LEASE_MODE_READ, t0);
+
+        let t_past = t0 + Duration::from_millis(200);
+        let revoked = r.tick(t_past);
+        assert_eq!(revoked.len(), 1);
+        assert_eq!(revoked[0].0, 6);
+        let (e, _) = r.drain_invalidations(&rd);
+        assert!(e.iter().any(|ev| ev.kind == LEASE_INVAL_LEASE_REVOKED));
     }
 
     #[test]

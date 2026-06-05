@@ -5154,11 +5154,21 @@ gaps in the lease protocol's correctness story.
   (its writer is gone from memory → not in `revoked_writers`).
   Failover replay sees the stale etcd record → resurrects the
   revoked writer.
-- **Status:** PENDING. Fix: pattern after F210-G2 — on
-  etcd-delete failure, persist `inode_lease_revoke_retry/<ino>`
-  marker + drain it in a dedicated 1-minute loop with
-  exponential backoff. Reproduce-first.
-- **passes:** not_completed
+- **Status:** COMPLETED (2026-06-06). Fix shape: **2PC TTL
+  revoke** (simpler than F210-G2's persisted retry queue). The
+  revoke loop now:
+  1. `tick_plan(now)` — IMMUTABLE peek of expired writers.
+  2. Etcd delete of the matching `inode_leases/<ino>` records.
+     On failure: leave in-memory state untouched + run
+     `tick_reader_expiry`; the next 1s tick re-discovers the
+     same expired writers (the loop IS the retry).
+  3. `tick_commit_revokes` — applies in-memory mutation +
+     pushes `LeaseRevoked` to readers. Re-validates each plan's
+     writer is STILL expired (race-skip on concurrent
+     heartbeat refresh).
+  4. `tick_reader_expiry` — separate reader sweep that runs
+     unconditionally (no etcd write — readers aren't persisted).
+- **passes:** completed
 
 ### BUG-LEASE-6 (P2 #7) — `notify_inval_inode` failure isn't fail-closed
 
