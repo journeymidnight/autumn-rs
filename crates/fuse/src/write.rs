@@ -3,10 +3,18 @@
 //! Mirrors the 3FS InodeWriteBuf pattern, but the flush unit is a variable-
 //! length extent (≤ `MAX_EXTENT` = 8 MiB) keyed by logical offset, not a fixed
 //! 256 KiB chunk:
-//! - Sequential writes accumulate in the buffer (cap `MAX_EXTENT`).
+//! - Sequential writes accumulate in the buffer (cap [`WRITE_BUF_CAP`] =
+//!   `WRITE_BUF_EXTENTS * MAX_EXTENT` = 64 MiB).
 //! - Gap detection: a non-sequential offset flushes the buffer first.
-//! - A full buffer flushes one whole `MAX_EXTENT` extent.
-//! - fsync/close flushes whatever remains as one (shorter) extent.
+//! - A full buffer flushes the WHOLE buffer at once via `extent::write_region`,
+//!   which splits it into `WRITE_BUF_EXTENTS` ≤ `MAX_EXTENT` extents and
+//!   dispatches the puts concurrently (`put_many` at depth
+//!   `APPEND_PIPELINE_DEPTH`). Pre-pipelining the buffer was exactly
+//!   `MAX_EXTENT` and the flush was a single serial `put` — the cp ceiling
+//!   was `MAX_EXTENT / RPC_RTT` (~270 MB/s). Now `flush ≈ WRITE_BUF_EXTENTS *
+//!   MAX_EXTENT / RPC_RTT` until disk + replica fanout saturates.
+//! - fsync/close flushes whatever remains (≤ WRITE_BUF_CAP) as the same
+//!   pipelined batch (1 to `WRITE_BUF_EXTENTS` extents, last may be shorter).
 //!
 //! All extent placement / read-modify-write / non-overlap maintenance lives in
 //! `crate::extent`; this module only manages the in-memory buffer + inode meta.
@@ -55,36 +63,35 @@ pub async fn write(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> R
     let mut remaining = data;
 
     while !remaining.is_empty() {
-        // Copy as much as fits into the buffer
+        // Copy as much as fits into the buffer.
         let (flush_needed, copied) = {
             let is = state.inodes.get_mut(&ino).unwrap();
             let wb = is.write_buf.as_mut().unwrap();
-            let space = MAX_EXTENT - wb.len;
+            let space = WRITE_BUF_CAP - wb.len;
             let to_copy = std::cmp::min(space, remaining.len());
             if wb.buf.len() < wb.len + to_copy {
                 wb.buf.resize(wb.len + to_copy, 0);
             }
             wb.buf[wb.len..wb.len + to_copy].copy_from_slice(&remaining[..to_copy]);
             wb.len += to_copy;
-            (wb.len >= MAX_EXTENT, to_copy)
+            (wb.len >= WRITE_BUF_CAP, to_copy)
         };
         written += copied;
         remaining = &remaining[copied..];
 
         if flush_needed {
-            // Extract one full extent (MAX_EXTENT) worth of data to flush.
+            // Drain the WHOLE buffer (≤ WRITE_BUF_CAP) in one shot —
+            // `write_region` splits into `≤ WRITE_BUF_EXTENTS` extents and
+            // pipelines the puts via `put_many` at `APPEND_PIPELINE_DEPTH`.
+            // Pre-pipelining we drained one MAX_EXTENT at a time → single
+            // serial put → `cp` ceiling was `MAX_EXTENT / RPC_RTT`.
             let (flush_offset, flush_data) = {
                 let is = state.inodes.get_mut(&ino).unwrap();
                 let wb = is.write_buf.as_mut().unwrap();
                 let fo = wb.offset;
-                let fd: Vec<u8> = wb.buf[..MAX_EXTENT].to_vec();
-                // Shift any remaining data down to the front.
-                let rem = wb.len - MAX_EXTENT;
-                if rem > 0 {
-                    wb.buf.copy_within(MAX_EXTENT..wb.len, 0);
-                }
-                wb.len = rem;
-                wb.offset = fo + MAX_EXTENT as i64;
+                let fd: Vec<u8> = wb.buf[..wb.len].to_vec();
+                wb.offset = fo + wb.len as i64;
+                wb.len = 0;
                 (fo, fd)
             };
             let file_size = state.inodes.get(&ino).map(|is| is.meta.size).unwrap_or(0);

@@ -20,11 +20,24 @@
 //! is zero-filled, so short/last extents AND sparse holes both read correctly
 //! even if a cached `len` over-estimates (cold inference of a sparse file).
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
 
 use crate::key;
 use crate::schema::MAX_EXTENT;
 use crate::state::FsState;
+
+/// Pipeline depth for the append-write hot path. cp / dd / model-checkpoint
+/// streamers send sequential 8 MiB extents — pre-F178 every put was awaited
+/// serially (in_flight=1) and a single-stream cp ceiling was `8 MiB / RPC_RTT`
+/// ≈ 100 MB/s. With this many in-flight puts the ceiling becomes
+/// `N × 8 MiB / RPC_RTT`, bounded by the per-PS partition's pwritev throughput.
+/// 8 is conservative — `autumn_client::BATCH_PUT_DEFAULT_CONCURRENCY` is 32 —
+/// but a single fuse mount writing one file streams to ONE partition (one
+/// inode → one partition), and the PS's `partition_loop` group-commit is
+/// already amortising at the head; going wider mostly adds memory pressure
+/// (each in-flight = one 8 MiB Bytes alloc).
+const APPEND_PIPELINE_DEPTH: usize = 8;
 
 /// Range-scan page size when rebuilding the extent map of a large file.
 const RANGE_PAGE: u32 = 8192;
@@ -139,8 +152,25 @@ pub async fn write_region(
     }
     let mut ext = extents_snapshot(state, ino, file_size).await?;
 
+    // Plan + batch the append steps so the append-only hot path (cp / dd /
+    // model checkpoint streamer — `pos` strictly past every existing extent)
+    // dispatches one put per ≤ 8 MiB chunk with `APPEND_PIPELINE_DEPTH` in
+    // flight. RMW falls back to inline read-modify-write (rare; in-place
+    // overwrite of a previously-written extent).
+    //
+    // Pre-pipelining this loop awaited every `state.kv_put` serially
+    // (in_flight=1), making single-stream cp throughput `~8 MiB / RPC_RTT`.
+    // We accumulate consecutive Append plans into `append_keys` /
+    // `append_values`; an RMW interrupts → flush the pending batch
+    // (preserving correctness: the RMW reads the same KV namespace and
+    // could race a pending put on a nearby key) → do the RMW serial → keep
+    // going. After the loop the trailing batch flushes.
     let mut pos = offset;
     let mut rest = data;
+    let mut append_keys: Vec<Vec<u8>> = Vec::new();
+    let mut append_values: Vec<Bytes> = Vec::new();
+    let mut append_upserts: Vec<(u64, u32)> = Vec::new();
+
     while !rest.is_empty() {
         let (floor, next) = floor_and_next(&ext, pos);
         let next_start = next.unwrap_or(u64::MAX);
@@ -148,6 +178,15 @@ pub async fn write_region(
         match floor {
             // `pos` is inside an existing extent → read-modify-write it.
             Some((fs, fl)) if pos < fs + fl as u64 => {
+                // Drain pending appends before any serial KV op on `state`.
+                flush_appends(
+                    state,
+                    &mut append_keys,
+                    &mut append_values,
+                    &mut append_upserts,
+                    &mut ext,
+                )
+                .await?;
                 let cap = (fs + MAX_EXTENT as u64).min(next_start);
                 let end = (pos + rest.len() as u64).min(cap);
                 let n = (end - pos) as usize;
@@ -169,17 +208,68 @@ pub async fn write_region(
                 let cap = (pos + MAX_EXTENT as u64).min(next_start);
                 let end = (pos + rest.len() as u64).min(cap);
                 let n = (end - pos) as usize;
-                let ck = key::extent_key(ino, pos);
-                state.kv_put(&ck, &rest[..n]).await?;
-                upsert(&mut ext, pos, n as u32);
+                append_keys.push(key::extent_key(ino, pos));
+                // One alloc per chunk (same cost the pre-pipelined path paid
+                // via the SDK's internal `value.to_vec()` in `put_opts`).
+                append_values.push(Bytes::copy_from_slice(&rest[..n]));
+                append_upserts.push((pos, n as u32));
                 pos += n as u64;
                 rest = &rest[n..];
             }
         }
     }
+    // Trailing batch — the pure-append hot path lands here.
+    flush_appends(
+        state,
+        &mut append_keys,
+        &mut append_values,
+        &mut append_upserts,
+        &mut ext,
+    )
+    .await?;
 
     if let Some(is) = state.inodes.get_mut(&ino) {
         is.extents = Some(ext);
+    }
+    Ok(())
+}
+
+/// Dispatch a batch of append puts concurrently via `ClusterClient::put_many`
+/// (sliding window depth = [`APPEND_PIPELINE_DEPTH`]), then apply the
+/// corresponding `(start, len)` upserts to the in-memory extent map in input
+/// order. Empties the input vecs.
+///
+/// Each item's value is a `Bytes` so ZC engages for ≥ 64 KiB (see
+/// `autumn_client::zc_worthwhile`). On any item failure the whole batch is
+/// reported as an error and the in-memory extent map is left UN-upserted for
+/// every item past the first failure — callers treat this as a "this fuse
+/// write failed, retry the whole flush" outcome (matches the pre-pipelined
+/// fail-on-first-Err semantics).
+async fn flush_appends(
+    state: &FsState,
+    keys: &mut Vec<Vec<u8>>,
+    values: &mut Vec<Bytes>,
+    upserts: &mut Vec<(u64, u32)>,
+    ext: &mut Vec<(u64, u32)>,
+) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    debug_assert_eq!(keys.len(), values.len());
+    debug_assert_eq!(keys.len(), upserts.len());
+    let drained_keys = std::mem::take(keys);
+    let drained_values = std::mem::take(values);
+    let drained_upserts = std::mem::take(upserts);
+    let items: Vec<(&[u8], Bytes)> = drained_keys
+        .iter()
+        .zip(drained_values.iter())
+        .map(|(k, v)| (k.as_slice(), v.clone()))
+        .collect();
+    let results = state.client.put_many(&items, APPEND_PIPELINE_DEPTH).await;
+    for (i, r) in results.into_iter().enumerate() {
+        r.map_err(|e| anyhow!("KV put: {e}"))?;
+        let (start, len) = drained_upserts[i];
+        upsert(ext, start, len);
     }
     Ok(())
 }

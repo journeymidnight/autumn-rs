@@ -76,6 +76,26 @@ pub const INLINE_THRESHOLD: usize = 4096;
 /// Inode allocation batch size.
 pub const INODE_ALLOC_BATCH: u64 = 1000;
 
+/// Per-inode write buffer capacity in extents. Buffer = WRITE_BUF_EXTENTS *
+/// [`MAX_EXTENT`] bytes (8 × 8 MiB = 64 MiB). The buffer fills with sequential
+/// fuse `write` syscalls and flushes one whole buffer's worth at a time via
+/// `extent::write_region`. With WRITE_BUF_EXTENTS == 1 the flush is a single
+/// `put` and the cp throughput ceiling is `MAX_EXTENT / RPC_RTT` (~270 MB/s
+/// on local NVMe + TCP loopback + 3 replicas). With > 1, write_region splits
+/// into multiple extents and `put_many` pipelines them at `APPEND_PIPELINE_
+/// DEPTH` concurrency, so the ceiling scales to `WRITE_BUF_EXTENTS *
+/// MAX_EXTENT / RPC_RTT` until the EN-side disk + replica fanout saturates.
+///
+/// Cost: up to `WRITE_BUF_EXTENTS * MAX_EXTENT` (64 MiB) of pre-flush RAM per
+/// actively-writing inode. For sglang-style model checkpoint cp (a handful
+/// of concurrent multi-GB files) this is negligible; for a workload with
+/// thousands of concurrently-open dirty inodes a smaller value may be
+/// appropriate.
+pub const WRITE_BUF_EXTENTS: usize = 8;
+
+/// Per-inode write buffer capacity in bytes. See [`WRITE_BUF_EXTENTS`].
+pub const WRITE_BUF_CAP: usize = WRITE_BUF_EXTENTS * MAX_EXTENT;
+
 /// Root inode number (FUSE_ROOT_ID).
 pub const ROOT_INO: u64 = 1;
 
@@ -86,7 +106,7 @@ pub const DT_LNK: u8 = 10;
 
 /// Runtime write buffer state for a single inode (compio thread-local).
 pub struct WriteBuffer {
-    /// Buffer storage, capacity = MAX_EXTENT.
+    /// Buffer storage, capacity = [`WRITE_BUF_CAP`].
     pub buf: Vec<u8>,
     /// Starting file offset of buffered data.
     pub offset: i64,
@@ -103,7 +123,7 @@ impl Default for WriteBuffer {
 impl WriteBuffer {
     pub fn new() -> Self {
         Self {
-            buf: Vec::with_capacity(MAX_EXTENT),
+            buf: Vec::with_capacity(WRITE_BUF_CAP),
             offset: 0,
             len: 0,
         }
