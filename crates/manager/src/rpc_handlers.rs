@@ -4659,13 +4659,37 @@ impl AutumnManager {
             }));
         }
 
-        let (events, overflowed) = {
+        // F-ioring-lease-3: long-poll. Atomic drain-or-park: returns
+        // queued events immediately if any; else installs a waker
+        // and returns the matching receiver. We await it with a
+        // bounded timeout so an idle client still round-trips at
+        // most once per `LONG_POLL_WAIT` (keeps heartbeats alive
+        // even on connections that prefer to coalesce traffic).
+        let (events, overflowed, parked) = {
+            let mut reg = self.inode_leases.borrow_mut();
+            reg.drain_or_park(&req.client)
+        };
+        let (events, overflowed) = if let Some(rx) = parked {
+            // No events — wait up to LONG_POLL_WAIT for one to arrive
+            // or for the waker to fire.
+            const LONG_POLL_WAIT: Duration = Duration::from_secs(10);
+            let timer = compio::time::sleep(LONG_POLL_WAIT);
+            futures::pin_mut!(timer);
+            let _ = futures::future::select(rx, timer).await;
+            // Re-drain. Either branch is acceptable: the waker fires
+            // → events are queued; the timer fires → still empty (the
+            // poll-loop on the client side reissues immediately, no
+            // round-trip cost beyond the connection's keep-alive).
             let mut reg = self.inode_leases.borrow_mut();
             reg.drain_invalidations(&req.client)
+        } else {
+            (events, overflowed)
         };
+
         // Overflow ⇒ tell the client to wholesale-invalidate via a
-        // sentinel MetaChanged event with ino=0. F-ioring-lease-3
-        // refines this with explicit reconnect-handshake semantics.
+        // sentinel MetaChanged event with ino=0. The F-ioring-lease-3
+        // daemon poll-loop turns this into a session-wide cache drop
+        // (plan §6.4 "subscribe disconnect = invalidate everything").
         let mut out_events = events;
         if overflowed {
             out_events.push(MgrInvalidation {

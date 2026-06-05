@@ -184,17 +184,28 @@ Landed so far:
   WRITE — the safe default. Two concurrent writers on the same
   inode (different daemons OR different sessions of the same
   daemon) get `libc::EBUSY` on the second Open.
+- **F-ioring-lease-3** — long-poll invalidation channel.
+  `MSG_POLL_INVALIDATIONS` blocks up to 10 s when the inbox is
+  empty (manager parks a waker); a writer-close pushed by ANOTHER
+  daemon fires the waker so the reader sees the event in ms, not
+  via a retry tick. Daemon spawns a persistent
+  `session_invalidation_poll_loop`; on transport error or overflow
+  sentinel it wholesale-invalidates the session cache.
 
 Smoke-tests (no cluster boot required):
 
 ```bash
-# Manager-side state machine + RPC contract (16 tests).
+# Manager-side state machine + RPC contract.
 cargo test -p autumn-manager --lib inode_lease
 cargo test -p autumn-manager --test f_ioring_lease
 
 # Daemon-side lease helpers + two-daemon conflict / read-coexistence /
-# version monotonicity / heartbeat round-trip (4 tests).
+# version monotonicity / heartbeat round-trip.
 cargo test -p autumn-manager --test f_ioring_lease_2
+
+# Long-poll: writer-close wakes a parked reader in ms (3 tests; the
+# idle-timeout case waits the full 10s LONG_POLL_WAIT — ~30 s total).
+cargo test -p autumn-manager --test f_ioring_lease_3
 ```
 
 Daemon manual exercise (against a real cluster):
@@ -210,9 +221,6 @@ cargo run -p autumn-ioring --features daemon --bin autumn-ioring-daemon -- \
 ```
 
 Still pending in this series:
-- F-ioring-lease-3 — long-poll invalidation channel
-  (`PollInvalidations` with manager-side wait-for-event) +
-  reconnect-invalidates-all-cache.
 - F-ioring-lease-4 — `OpenedExtents` keyed by `(ino, version)` +
   multi-daemon end-to-end test exercising real ring reads.
 

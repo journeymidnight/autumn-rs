@@ -68,7 +68,10 @@ use autumn_ioring::socket;
 use autumn_ioring::sqe::{
     Sqe, SQE_LEASE_MODE_READ, SQE_LEASE_MODE_UNSET, SQE_LEASE_MODE_WRITE,
 };
-use autumn_rpc::manager_rpc::{LEASE_MODE_READ, LEASE_MODE_WRITE};
+use autumn_rpc::manager_rpc::{
+    LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_META_CHANGED, LEASE_INVAL_WRITER_CLOSED,
+    LEASE_MODE_READ, LEASE_MODE_WRITE,
+};
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -379,6 +382,26 @@ async fn poller_loop(
         let ring_fds_h = ring_fds.clone();
         compio::runtime::spawn(async move {
             session_heartbeat_loop(cluster_h, client_h, held_h, ring_fds_h).await
+        })
+        .detach();
+    }
+
+    // F-ioring-lease-3: spawn a per-session invalidation poll loop.
+    // Drains MgrInvalidation events the manager pushes when other
+    // daemons' writers close or have their leases revoked. The loop
+    // is a tight call/await because the manager-side handler
+    // long-polls (LONG_POLL_WAIT = 10 s) — we burn at most one
+    // round-trip per 10 s when idle. On transport error or overflow
+    // sentinel we drop every cached ring_fd + held lease
+    // (plan §6.4 "subscribe disconnect = invalidate everything")
+    // so a connection blip never leaves us serving stale state.
+    {
+        let cluster_i = cluster.clone();
+        let client_i = client_id.clone();
+        let held_i = held_leases.clone();
+        let ring_fds_i = ring_fds.clone();
+        compio::runtime::spawn(async move {
+            session_invalidation_poll_loop(cluster_i, client_i, held_i, ring_fds_i).await
         })
         .detach();
     }
@@ -740,6 +763,101 @@ struct SessionLease {
 /// surface as EBADF so the client knows to reopen — F-ioring-lease-3
 /// will surface the same state via PollInvalidations).
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// F-ioring-lease-3: per-session invalidation poll loop. Persistent
+/// long-poll consumer of `MSG_POLL_INVALIDATIONS`. The manager-side
+/// handler waits up to `LONG_POLL_WAIT` (10 s) for an event before
+/// returning empty, so this loop's effective round-trip rate when
+/// idle is ~1/10s.
+///
+/// Event handling (F-3 scope — per-ino cache eviction lands in F-4):
+/// - `LEASE_INVAL_META_CHANGED { ino: 0 }`: manager's overflow
+///   sentinel — wholesale invalidate (per plan §6.4).
+/// - `LEASE_INVAL_WRITER_CLOSED` / `LEASE_INVAL_LEASE_REVOKED` for a
+///   specific ino: log only; F-ioring-lease-4 will drop the
+///   matching `OpenedExtents` so the next Read re-resolves the
+///   extent map.
+///
+/// On transport error (manager unreachable, connection dropped): also
+/// wholesale invalidate before retrying. This honours plan §6.4 —
+/// "subscribe disconnect = invalidate everything" — so a poll-loop
+/// blip never leaves the session serving stale cache.
+async fn session_invalidation_poll_loop(
+    cluster: Rc<ClusterClient>,
+    client_id: Rc<DaemonClientId>,
+    held_leases: Rc<RefCell<HashMap<u64, SessionLease>>>,
+    ring_fds: Rc<RefCell<HashMap<u32, OpenedExtents>>>,
+) {
+    loop {
+        match lease::poll_invalidations(&cluster, &client_id).await {
+            Ok(events) => {
+                let mut wholesale = false;
+                for ev in &events {
+                    match ev.kind {
+                        LEASE_INVAL_META_CHANGED if ev.ino == 0 => {
+                            wholesale = true;
+                            tracing::warn!(
+                                "F-ioring-lease-3: overflow sentinel; invalidating session cache"
+                            );
+                        }
+                        LEASE_INVAL_WRITER_CLOSED => {
+                            tracing::info!(
+                                ino = ev.ino,
+                                version = ev.version,
+                                "invalidation: writer closed (F-4 will drop the cached entry)"
+                            );
+                        }
+                        LEASE_INVAL_LEASE_REVOKED => {
+                            tracing::info!(
+                                ino = ev.ino,
+                                version = ev.version,
+                                "invalidation: lease revoked"
+                            );
+                        }
+                        LEASE_INVAL_META_CHANGED => {
+                            tracing::info!(
+                                ino = ev.ino,
+                                version = ev.version,
+                                "invalidation: meta changed"
+                            );
+                        }
+                        other => {
+                            tracing::warn!(kind = other, ino = ev.ino, "unknown invalidation kind");
+                        }
+                    }
+                }
+                if wholesale {
+                    let drained: Vec<u64> =
+                        held_leases.borrow().keys().copied().collect();
+                    held_leases.borrow_mut().clear();
+                    ring_fds.borrow_mut().clear();
+                    // Best-effort: tell the manager we're letting go
+                    // of every held lease so its TTL revoke loop
+                    // doesn't sit on them until expiry. Errors here
+                    // are non-fatal (TTL backstop covers it).
+                    for ino in drained {
+                        if let Err(e) = lease::release(&cluster, &client_id, ino).await {
+                            tracing::warn!(ino, error = %e, "best-effort release after overflow");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                // Plan §6.4: subscribe-disconnect = invalidate every
+                // cached inode. Drop everything, sleep briefly, and
+                // re-issue the poll (manager auto-reconnect via
+                // ClusterClient::mgr_call_retry covers reconnection).
+                tracing::warn!(
+                    error = %e,
+                    "F-ioring-lease-3: poll failed; invalidating session cache + retrying"
+                );
+                held_leases.borrow_mut().clear();
+                ring_fds.borrow_mut().clear();
+                compio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
 async fn session_heartbeat_loop(
     cluster: Rc<ClusterClient>,
     client_id: Rc<DaemonClientId>,

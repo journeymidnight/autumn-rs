@@ -1647,6 +1647,29 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       `remember_version(ino, version)`, and `inode_or_create`
       seeds new entries from the shadow. Tested by
       `version_is_monotonic_across_remove_and_reacquire`.
+    - **L12** (F-ioring-lease-3 long-poll) at most ONE parked waker
+      per `ClientInbox` at any time. `drain_or_park` REPLACES the
+      previous waker transparently; the displaced sender drops →
+      the prior handler's `recv` resolves `Err(Canceled)` → it
+      treats it as "no events, retry." Correct because a single
+      `client_id` is owned by a single in-flight long-poll task
+      (per-session in the daemon).
+    - **L13** `ClientInbox::push` MUST fire the parked waker before
+      returning. Skipping it lets a long-poll wait up to
+      `LONG_POLL_WAIT` (10 s) before noticing the event, breaking
+      the "writer close → reader sees new bytes within ~ms" close-
+      to-open guarantee. Tested by
+      `drain_or_park_installs_waker_and_push_wakes_it`.
+    - **L14** (daemon-side, in `bin/daemon.rs`) ANY failure of
+      `lease::poll_invalidations` OR a `MetaChanged { ino=0 }`
+      overflow sentinel MUST drop EVERY held lease AND every
+      cached ring_fd in the session before retrying (plan §6.4 —
+      "subscribe disconnect = invalidate everything"). Partial
+      invalidation is a footgun: a daemon that kept `held_leases`
+      while clearing `ring_fds` would refuse subsequent Opens with
+      stale EBUSY. This is the only place the daemon's cache can
+      ever be wholesale-dropped — the heartbeat loop's NotHeld
+      branch only drops the single affected ino.
 
     **Out of scope this commit:** daemon Open/Close wiring
     (F-ioring-lease-2), long-poll loop + reconnect-invalidates-all

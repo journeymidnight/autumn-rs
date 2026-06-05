@@ -158,10 +158,24 @@ impl InvalidationReason {
 }
 
 /// Per-client inbox.
+///
+/// F-ioring-lease-3: extended with a parked `waker` so the
+/// `MSG_POLL_INVALIDATIONS` handler can register a long-poll. A
+/// subsequent `push_invalidation` fires the waker → the handler's
+/// `recv` resolves → it returns the queued events without burning a
+/// round-trip per second.
 #[derive(Default, Debug)]
 pub struct ClientInbox {
     pub events: VecDeque<MgrInvalidation>,
     pub overflowed: bool,
+    /// Most recent long-poll waker. `None` when no client is parked
+    /// (events are queued normally and the next poll drains them).
+    /// At most one parked waker per client — the per-session client_id
+    /// is single-threaded (one ps-conn long-poll task), so a stale
+    /// parked waker would mean the previous poll's task was cancelled
+    /// or its RPC connection dropped. The push path drops + replaces
+    /// transparently in either case.
+    pub waker: Option<futures::channel::oneshot::Sender<()>>,
 }
 
 impl ClientInbox {
@@ -172,6 +186,13 @@ impl ClientInbox {
             self.overflowed = true;
         }
         self.events.push_back(ev);
+        // F-ioring-lease-3: wake any parked long-poll. `send` on a
+        // dropped receiver is a no-op — happens when the client's
+        // RPC connection closed before the push; the next poll's
+        // reconnect refreshes the waker.
+        if let Some(w) = self.waker.take() {
+            let _ = w.send(());
+        }
     }
 }
 
@@ -383,6 +404,43 @@ impl LeaseRegistry {
         let overflowed = inbox.overflowed;
         inbox.overflowed = false;
         (events, overflowed)
+    }
+
+    /// F-ioring-lease-3: atomic drain-or-install-waker for the
+    /// long-poll path. Returns the drained events PLUS, when the
+    /// queue was empty, a fresh receiver the caller awaits with a
+    /// timeout. A subsequent `push_invalidation` on this client
+    /// fires the matching sender.
+    ///
+    /// At most one parked waker per client at any time — installing
+    /// a new one drops the previous (its caller had to have died,
+    /// since a single client_id is owned by a single in-flight
+    /// long-poll task by design). The dropped sender's matching
+    /// `recv` resolves to `Err(Canceled)` which the caller handles
+    /// the same as a timeout (return empty events).
+    pub fn drain_or_park(
+        &mut self,
+        client: &MgrClientId,
+    ) -> (
+        Vec<MgrInvalidation>,
+        bool,
+        Option<futures::channel::oneshot::Receiver<()>>,
+    ) {
+        let me = ClientKey::from_wire(client);
+        let inbox = self.inboxes.entry(me).or_default();
+        let events: Vec<MgrInvalidation> = inbox.events.drain(..).collect();
+        let overflowed = inbox.overflowed;
+        inbox.overflowed = false;
+        if events.is_empty() && !overflowed {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            // Drop any prior parked waker. `tx` drops on overwrite →
+            // the older `rx.await` resolves Err(Canceled), which the
+            // handler treats as "no events, retry."
+            inbox.waker = Some(tx);
+            (Vec::new(), false, Some(rx))
+        } else {
+            (events, overflowed, None)
+        }
     }
 
     /// Drop a client entirely (long-poll disconnect, manager shutdown).
@@ -781,6 +839,61 @@ mod tests {
             r2.acquire(&other, 77, LEASE_MODE_WRITE, Instant::now()),
             AcquireOutcome::WriteConflict { .. }
         ));
+    }
+
+    #[test]
+    fn drain_or_park_returns_events_when_present() {
+        let mut r = reg();
+        let rd = cid(2, 1, "rd");
+        // Pre-queue an event by walking through a writer-release.
+        let w = cid(1, 1, "w");
+        let _ = r.acquire(&rd, 1, LEASE_MODE_READ, Instant::now());
+        let _ = r.acquire(&w, 1, LEASE_MODE_WRITE, Instant::now());
+        let _ = r.release(&w, 1);
+        let (events, overflowed, parked) = r.drain_or_park(&rd);
+        assert_eq!(events.len(), 1);
+        assert!(!overflowed);
+        assert!(parked.is_none(), "non-empty events ⇒ no waker installed");
+    }
+
+    #[test]
+    fn drain_or_park_installs_waker_and_push_wakes_it() {
+        let mut r = reg();
+        let rd = cid(2, 5, "rd");
+        let (events, _, parked) = r.drain_or_park(&rd);
+        assert!(events.is_empty());
+        let mut rx = parked.expect("waker installed when queue empty");
+        // Receiver pending before push.
+        assert!(rx.try_recv().unwrap().is_none());
+        // Push an event → waker fires synchronously.
+        r.push_invalidation(
+            &ClientKey::from_wire(&rd),
+            7,
+            42,
+            InvalidationReason::WriterClosed,
+        );
+        assert!(matches!(rx.try_recv().unwrap(), Some(())));
+        // Now drain finds the event.
+        let (events, _) = r.drain_invalidations(&rd);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].ino, 7);
+        assert_eq!(events[0].version, 42);
+    }
+
+    #[test]
+    fn drain_or_park_replaces_stale_waker() {
+        let mut r = reg();
+        let rd = cid(2, 9, "rd");
+        let (_, _, parked1) = r.drain_or_park(&rd);
+        let mut rx1 = parked1.unwrap();
+        // Second call installs a fresh waker; the first one is dropped
+        // → its receiver resolves to Canceled (treated as "no events").
+        let (_, _, parked2) = r.drain_or_park(&rd);
+        let _rx2 = parked2.unwrap();
+        let err = rx1.try_recv();
+        // try_recv returns Ok(None) until the sender resolves; once
+        // dropped it returns Err(Canceled).
+        assert!(err.is_err(), "stale waker should be cancelled");
     }
 
     #[test]

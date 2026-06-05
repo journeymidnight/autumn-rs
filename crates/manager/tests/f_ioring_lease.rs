@@ -168,6 +168,10 @@ fn ioring_lease_writer_close_bumps_version_and_reader_polls_event() {
         );
 
         // Reader polls — exactly one WriterClosed event for ino=7.
+        // (Drain returns immediately because the writer-close push
+        // already queued the event; F-ioring-lease-3's long-poll
+        // engages only when the inbox is empty at the time of the
+        // call.)
         let r = poll(
             &mgr,
             &PollInvalidationsReq {
@@ -182,16 +186,12 @@ fn ioring_lease_writer_close_bumps_version_and_reader_polls_event() {
         assert_eq!(ev.version, v_before + 1);
         assert_eq!(ev.kind, LEASE_INVAL_WRITER_CLOSED);
 
-        // Second poll on the same reader returns empty.
-        let r = poll(
-            &mgr,
-            &PollInvalidationsReq {
-                client: reader.clone(),
-            },
-        )
-        .await;
-        assert_eq!(r.code, CODE_OK);
-        assert!(r.events.is_empty(), "drain must be idempotent");
+        // The "drain is idempotent" property — that a second poll on
+        // the same reader sees no events — is now covered by the
+        // F-ioring-lease unit test suite (`drain_or_park_*`). Calling
+        // a second `MSG_POLL_INVALIDATIONS` here would correctly
+        // long-poll for 10 s, but adding 10 s to this test buys no
+        // additional coverage over the unit tests.
     });
 }
 
