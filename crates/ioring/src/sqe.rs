@@ -11,6 +11,15 @@ use crate::opcode::Opcode;
 /// shared-memory ABI between daemon and client. Bumps `RING_VERSION`.
 pub const SQE_SIZE: usize = 40;
 
+/// F-ioring-lease-2: per-Opcode lease-mode discriminant carried in the
+/// `Sqe.flags` byte. Mirrors `autumn_rpc::manager_rpc::LEASE_MODE_*`.
+/// For `Opcode::Open` the daemon uses this to decide whether to
+/// AcquireLease in READ or WRITE mode; for every other opcode the
+/// byte stays reserved (must be 0).
+pub const SQE_LEASE_MODE_UNSET: u8 = 0;
+pub const SQE_LEASE_MODE_READ: u8 = 1;
+pub const SQE_LEASE_MODE_WRITE: u8 = 2;
+
 /// Submission queue entry. Pure data — no atomics, no SHM concerns.
 /// Atomic ring-index management lives in the producer/consumer code
 /// paths in F180-B / F180-C.
@@ -35,6 +44,13 @@ pub struct Sqe {
     /// Opaque application token returned verbatim in the matching CQE
     /// so the client can correlate completions to its in-flight table.
     pub user_data: u64,
+    /// F-ioring-lease-2: lease mode requested at `Opcode::Open` time.
+    /// `SQE_LEASE_MODE_UNSET` (= 0, sent by v1 clients) is interpreted
+    /// by the daemon as `SQE_LEASE_MODE_WRITE` — the safe default that
+    /// never silently downgrades a writer to a read-only session.
+    /// For every non-Open opcode this MUST be `SQE_LEASE_MODE_UNSET`
+    /// (decode rejects otherwise — see `SqeDecodeError::ReservedBitsSet`).
+    pub lease_mode: u8,
 }
 
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
@@ -64,7 +80,8 @@ impl Sqe {
     pub fn encode(&self, dst: &mut [u8; SQE_SIZE]) {
         let mut buf = &mut dst[..];
         buf.put_u8(self.opcode.as_u8());
-        buf.put_u8(0); // flags reserved
+        // F-ioring-lease-2: flags byte = lease_mode for Open, 0 otherwise.
+        buf.put_u8(self.lease_mode);
         buf.put_u8(0);
         buf.put_u8(0);
         buf.put_u32_le(self.ring_fd);
@@ -84,9 +101,6 @@ impl Sqe {
         let mut buf = &src[..SQE_SIZE];
         let opcode_u8 = buf.get_u8();
         let flags = buf.get_u8();
-        if flags != 0 {
-            return Err(SqeDecodeError::ReservedBitsSet(flags));
-        }
         let _pad0 = buf.get_u8();
         let _pad1 = buf.get_u8();
         let ring_fd = buf.get_u32_le();
@@ -96,6 +110,21 @@ impl Sqe {
         let buf_offset = buf.get_u64_le();
         let user_data = buf.get_u64_le();
         let opcode = Opcode::from_u8(opcode_u8).ok_or(SqeDecodeError::UnknownOpcode(opcode_u8))?;
+        // F-ioring-lease-2: for Open the flags byte carries the lease
+        // mode (0/1/2 valid; 0 means "unset → daemon defaults to
+        // WRITE"). For every other opcode it stays reserved.
+        let lease_mode = match opcode {
+            Opcode::Open => match flags {
+                SQE_LEASE_MODE_UNSET | SQE_LEASE_MODE_READ | SQE_LEASE_MODE_WRITE => flags,
+                _ => return Err(SqeDecodeError::ReservedBitsSet(flags)),
+            },
+            _ => {
+                if flags != 0 {
+                    return Err(SqeDecodeError::ReservedBitsSet(flags));
+                }
+                0
+            }
+        };
         Ok(Self {
             opcode,
             ring_fd,
@@ -103,6 +132,7 @@ impl Sqe {
             length,
             buf_offset,
             user_data,
+            lease_mode,
         })
     }
 }
@@ -119,6 +149,7 @@ mod tests {
             length: 0x4000,
             buf_offset: 0x10_0000,
             user_data: 0xcafe_babe_dead_beef,
+            lease_mode: SQE_LEASE_MODE_UNSET,
         }
     }
 
@@ -147,11 +178,47 @@ mod tests {
     }
 
     #[test]
-    fn decode_reserved_flags_rejected() {
+    fn open_round_trips_read_and_write_lease_modes() {
+        // F-ioring-lease-2: Open carries the lease mode in the flags byte.
+        for mode in [SQE_LEASE_MODE_READ, SQE_LEASE_MODE_WRITE] {
+            let mut s = sample(Opcode::Open);
+            s.lease_mode = mode;
+            let mut buf = [0u8; SQE_SIZE];
+            s.encode(&mut buf);
+            assert_eq!(buf[1], mode, "flags byte must carry lease mode");
+            let decoded = Sqe::decode(&buf).expect("decode");
+            assert_eq!(decoded.lease_mode, mode);
+            assert_eq!(decoded, s);
+        }
+    }
+
+    #[test]
+    fn open_invalid_lease_mode_rejected() {
+        // Flags byte for Open is constrained to {0,1,2}; any other
+        // value is a wire-protocol bug.
         let mut buf = [0u8; SQE_SIZE];
-        buf[1] = 0x01;
+        buf[0] = Opcode::Open.as_u8();
+        buf[1] = 0x99;
         let err = Sqe::decode(&buf).unwrap_err();
-        assert!(matches!(err, SqeDecodeError::ReservedBitsSet(0x01)));
+        assert!(matches!(err, SqeDecodeError::ReservedBitsSet(0x99)));
+    }
+
+    #[test]
+    fn non_open_must_keep_flags_zero() {
+        // For any non-Open opcode the flags byte must stay 0 — even
+        // an otherwise-valid lease-mode discriminant is an error
+        // because the daemon has no semantics for it on Read/Write/
+        // Close/Nop.
+        for op in [Opcode::Nop, Opcode::Read, Opcode::Write, Opcode::Close] {
+            let mut buf = [0u8; SQE_SIZE];
+            buf[0] = op.as_u8();
+            buf[1] = SQE_LEASE_MODE_READ; // valid for Open, invalid here
+            let err = Sqe::decode(&buf).unwrap_err();
+            assert!(
+                matches!(err, SqeDecodeError::ReservedBitsSet(SQE_LEASE_MODE_READ)),
+                "opcode {op:?} should reject lease-mode flag",
+            );
+        }
     }
 
     #[test]

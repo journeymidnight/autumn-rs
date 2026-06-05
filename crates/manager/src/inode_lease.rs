@@ -181,6 +181,15 @@ impl ClientInbox {
 pub struct LeaseRegistry {
     pub inodes: HashMap<u64, InodeLeaseState>,
     pub inboxes: HashMap<ClientKey, ClientInbox>,
+    /// MONOTONIC version shadow for inodes that have ever held a
+    /// writer. Persists across the (writer-release → empty → re-
+    /// created) cycle so a future Open never sees an `(ino, version)`
+    /// pair that an earlier reader's cache had already tagged. Without
+    /// this, removing the empty inode + re-creating on the next
+    /// acquire would reset `version` to 1 and break close-to-open
+    /// coherence for any client whose cache still carried version=1
+    /// from a different generation.
+    pub last_version: HashMap<u64, u64>,
     pub lease_ttl: Duration,
 }
 
@@ -189,6 +198,7 @@ impl LeaseRegistry {
         LeaseRegistry {
             inodes: HashMap::new(),
             inboxes: HashMap::new(),
+            last_version: HashMap::new(),
             lease_ttl: ttl,
         }
     }
@@ -198,9 +208,26 @@ impl LeaseRegistry {
     }
 
     fn inode_or_create(&mut self, ino: u64) -> &mut InodeLeaseState {
-        self.inodes
-            .entry(ino)
-            .or_insert_with(|| InodeLeaseState::new(ino))
+        let seed = self.last_version.get(&ino).copied().unwrap_or(0);
+        self.inodes.entry(ino).or_insert_with(|| {
+            let mut s = InodeLeaseState::new(ino);
+            // If the inode has ever been seen, resume from the highest
+            // version we ever handed out — never go backwards.
+            if seed >= s.version {
+                s.version = seed;
+            }
+            s
+        })
+    }
+
+    /// Record `version` as the high-water mark for `ino` so a future
+    /// re-creation resumes monotonically. Call after every place we
+    /// bump `state.version` or remove an inode entry.
+    fn remember_version(&mut self, ino: u64, version: u64) {
+        let slot = self.last_version.entry(ino).or_insert(0);
+        if version > *slot {
+            *slot = version;
+        }
     }
 
     fn snapshot(&self, ino: u64) -> Option<MgrInodeLeaseInfo> {
@@ -253,10 +280,16 @@ impl LeaseRegistry {
         }
         // Ensure an inbox exists so subsequent push targets find it.
         self.inboxes.entry(ClientKey::from_wire(client)).or_default();
-        let s = self.inodes.get(&ino).expect("just inserted");
+        let (s_version, s_writer_present) = {
+            let s = self.inodes.get(&ino).expect("just inserted");
+            (s.version, s.writer.is_some())
+        };
+        // Seed the shadow on every acquire so a future release/revoke
+        // that drops the entry resumes from this version, not 1.
+        self.remember_version(ino, s_version);
         AcquireOutcome::Granted {
-            version: s.version,
-            writer_present: s.writer.is_some(),
+            version: s_version,
+            writer_present: s_writer_present,
             ttl_secs,
         }
     }
@@ -284,6 +317,9 @@ impl LeaseRegistry {
             if inode_clean {
                 self.inodes.remove(&ino);
             }
+            // Always record the high-water mark so a future re-
+            // creation resumes from `new_version + 1` rather than 1.
+            self.remember_version(ino_copy, new_version);
             for r in readers {
                 self.push_invalidation(&r, ino_copy, new_version, InvalidationReason::WriterClosed);
             }
@@ -401,6 +437,7 @@ impl LeaseRegistry {
             .map(|(ino, ver, _)| (*ino, *ver))
             .collect();
         for (ino, ver, readers) in writer_revokes {
+            self.remember_version(ino, ver);
             for r in readers {
                 self.push_invalidation(&r, ino, ver, InvalidationReason::LeaseRevoked);
             }
@@ -457,11 +494,16 @@ impl LeaseRegistry {
         // pin a dead writer until wall-clock catches up.
         let remaining = Duration::from_secs(remaining_secs).min(self.lease_ttl);
         let key = ClientKey::from_wire(&rec.writer);
-        let s = self.inode_or_create(rec.ino);
-        s.version = s.version.max(rec.version);
+        let ino = rec.ino;
+        let recorded = rec.version;
+        let s = self.inode_or_create(ino);
+        s.version = s.version.max(recorded);
         s.writer = Some(key);
         s.writer_diag_host = rec.writer.host.clone();
         s.writer_expires_at = Some(now + remaining);
+        // Seed the shadow so any subsequent release/revoke that drops
+        // the entry preserves monotonicity across failover.
+        self.remember_version(ino, recorded);
     }
 }
 
@@ -739,6 +781,32 @@ mod tests {
             r2.acquire(&other, 77, LEASE_MODE_WRITE, Instant::now()),
             AcquireOutcome::WriteConflict { .. }
         ));
+    }
+
+    #[test]
+    fn version_is_monotonic_across_remove_and_reacquire() {
+        // Regression: pre-F-ioring-lease-2 the auto-remove of an empty
+        // inode entry on release reset `version` to 1, breaking close-
+        // to-open coherence for any client whose cache still carried
+        // the older generation's `(ino, version)` pair.
+        let mut r = reg();
+        let now = Instant::now();
+        let wa = cid(1, 1, "wa");
+        let wb = cid(1, 2, "wb");
+        let _ = r.acquire(&wa, 100, LEASE_MODE_WRITE, now);
+        let out = r.release(&wa, 100);
+        assert_eq!(out, ReleaseOutcome::WriterClosed { new_version: 2 });
+        // Inode entry removed (no readers), so the next acquire would
+        // recreate the entry. Verify it resumes from 2, not 1.
+        match r.acquire(&wb, 100, LEASE_MODE_WRITE, now) {
+            AcquireOutcome::Granted { version, .. } => assert_eq!(version, 2),
+            other => panic!("expected Granted, got {other:?}"),
+        }
+        // Another close → 3, not 1.
+        assert_eq!(
+            r.release(&wb, 100),
+            ReleaseOutcome::WriterClosed { new_version: 3 }
+        );
     }
 
     #[test]

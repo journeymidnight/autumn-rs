@@ -328,6 +328,7 @@ mod tests {
             length: 4096,
             buf_offset: 0,
             user_data,
+            lease_mode: crate::sqe::SQE_LEASE_MODE_UNSET,
         }
     }
 

@@ -71,6 +71,12 @@ pub mod fuse_read;
 /// Gated on `daemon` (needs autumn-client + autumn-fuse key/schema).
 #[cfg(feature = "daemon")]
 pub mod fuse_write;
+/// F-ioring-lease-2: daemon-side inode-lease client helpers (acquire /
+/// release / heartbeat). Wraps the four `MSG_*_LEASE` RPCs into typed
+/// methods. Gated on `daemon` (depends on `autumn-client` to reach
+/// the manager via `ClusterClient::mgr_call`).
+#[cfg(feature = "daemon")]
+pub mod lease;
 #[cfg(target_os = "linux")]
 pub mod mmap;
 #[cfg(target_os = "linux")]

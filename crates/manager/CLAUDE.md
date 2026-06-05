@@ -1633,6 +1633,20 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
       that report different hostnames for the same `(kind, uuid)`
       hash to the same `ClientKey`. Tested by
       `host_field_does_not_affect_identity`.
+    - **L11** (F-ioring-lease-2 regression fix) **`version` MUST be
+      monotonic across the inode entry's full lifetime — not just
+      within a single live entry.** Pre-this commit, the auto-
+      remove of an empty inode entry on release reset `version` to
+      1; a fresh acquire would then hand out `(ino, version=1)`
+      which collides with a pre-existing reader cache tagged
+      `(ino, version=1)` from the prior generation — close-to-
+      open coherence silently broken. Fix:
+      `LeaseRegistry.last_version: HashMap<u64, u64>` shadow
+      preserves the high-water mark across remove/re-create; every
+      `release / tick / acquire / install_persisted_writer` calls
+      `remember_version(ino, version)`, and `inode_or_create`
+      seeds new entries from the shadow. Tested by
+      `version_is_monotonic_across_remove_and_reacquire`.
 
     **Out of scope this commit:** daemon Open/Close wiring
     (F-ioring-lease-2), long-poll loop + reconnect-invalidates-all

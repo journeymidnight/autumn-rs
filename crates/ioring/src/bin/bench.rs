@@ -218,6 +218,9 @@ fn worker(
         length: path_bytes.len() as u32,
         buf_offset: path_slot,
         user_data: u64::MAX, // sentinel for OPEN
+        // bench reads, never writes — request a read-only lease so
+        // multiple bench instances can share the same file.
+        lease_mode: autumn_ioring::sqe::SQE_LEASE_MODE_READ,
     });
     let cqe = client.wait_completion(args.idle_us);
     if cqe.result < 0 {
@@ -248,6 +251,7 @@ fn worker(
             length: args.read_size,
             buf_offset: slot,
             user_data: i as u64,
+            lease_mode: autumn_ioring::sqe::SQE_LEASE_MODE_UNSET,
         });
     }
 
@@ -291,6 +295,7 @@ fn worker(
                     length: args.read_size,
                     buf_offset: slot,
                     user_data: slot_idx as u64,
+                    lease_mode: autumn_ioring::sqe::SQE_LEASE_MODE_UNSET,
                 });
             }
         }

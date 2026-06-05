@@ -171,18 +171,50 @@ recovery. Some are gated with `#[ignore]` because they take minutes; use
 Multi-mount / multi-daemon coherence for `autumn-fuse` and
 `autumn-ioring-daemon` runs through a JuiceFS-style inode lease served
 by the manager. Plan + invariants live in
-[`docs/autumn_fs_lease_plan.md`](docs/autumn_fs_lease_plan.md);
-F-ioring-lease-1 (manager state + 4 RPCs, MSG types 0x46–0x49) is
-landed but daemons are not yet wired. Smoke-test (manager-only) is the
-integration test:
+[`docs/autumn_fs_lease_plan.md`](docs/autumn_fs_lease_plan.md).
+
+Landed so far:
+- **F-ioring-lease-1** — manager state + 4 RPCs (`MSG_*_LEASE` /
+  `MSG_POLL_INVALIDATIONS` = `0x46`–`0x49`), writer-lease etcd
+  persistence under `inode_leases/<ino>`, TTL revoke loop.
+- **F-ioring-lease-2** — autumn-ioring-daemon Open acquires (and
+  Close releases) a write/read lease per inode. `RING_VERSION 1→2`:
+  the Open SQE's flags byte now carries `LEASE_MODE_READ` (1) /
+  `LEASE_MODE_WRITE` (2). A v1 client (flags=0) is interpreted as
+  WRITE — the safe default. Two concurrent writers on the same
+  inode (different daemons OR different sessions of the same
+  daemon) get `libc::EBUSY` on the second Open.
+
+Smoke-tests (no cluster boot required):
 
 ```bash
-cargo test -p autumn-manager --test f_ioring_lease
+# Manager-side state machine + RPC contract (16 tests).
 cargo test -p autumn-manager --lib inode_lease
+cargo test -p autumn-manager --test f_ioring_lease
+
+# Daemon-side lease helpers + two-daemon conflict / read-coexistence /
+# version monotonicity / heartbeat round-trip (4 tests).
+cargo test -p autumn-manager --test f_ioring_lease_2
 ```
 
-End-to-end daemon coherence will surface in F-ioring-lease-2/3/4 and
-the README will get a daemon-side smoke-test then.
+Daemon manual exercise (against a real cluster):
+
+```bash
+# Start a one-node cluster (cluster.sh reset 1) then a daemon:
+cargo run -p autumn-ioring --features daemon --bin autumn-ioring-daemon -- \
+  --manager 127.0.0.1:9001 --socket /tmp/ring.sock --runtimes 1
+
+# Two test apps each call IoRingClient::submit with
+#   Sqe { opcode: Opcode::Open, lease_mode: SQE_LEASE_MODE_WRITE, ... }
+# against the same path → second CQE.result == -libc::EBUSY.
+```
+
+Still pending in this series:
+- F-ioring-lease-3 — long-poll invalidation channel
+  (`PollInvalidations` with manager-side wait-for-event) +
+  reconnect-invalidates-all-cache.
+- F-ioring-lease-4 — `OpenedExtents` keyed by `(ino, version)` +
+  multi-daemon end-to-end test exercising real ring reads.
 
 ## Documentation map
 

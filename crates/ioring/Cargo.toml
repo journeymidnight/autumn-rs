@@ -24,7 +24,7 @@ default = []
 # core protocol crate (`lib`) builds without these deps so it can be
 # linked into a Python pyo3 binding (F180-D) without the heavy
 # transitive compio chain.
-daemon = ["dep:autumn-client", "dep:autumn-rpc", "dep:autumn-fuse", "dep:autumn-transport", "dep:compio", "dep:futures", "dep:anyhow", "dep:tracing-subscriber", "dep:clap"]
+daemon = ["dep:autumn-client", "dep:autumn-rpc", "dep:autumn-fuse", "dep:autumn-transport", "dep:compio", "dep:futures", "dep:anyhow", "dep:tracing-subscriber", "dep:clap", "dep:uuid"]
 # F243: build the daemon with UCX so it can `--transport ucx` AND `ucp_mem_map`-
 # register the ring region for RDMA zero-copy reads INTO the ring. Needs the ucx
 # feature all the way down (transport → rpc → client). On a non-UCX build the
@@ -56,6 +56,8 @@ futures = { version = "0.3", optional = true }
 anyhow = { workspace = true, optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
+# F-ioring-lease-2: ClientId UUID for the inode-lease handshake.
+uuid = { workspace = true, optional = true }
 
 [lints]
 workspace = true

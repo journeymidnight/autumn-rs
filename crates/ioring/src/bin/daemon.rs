@@ -60,11 +60,15 @@ use clap::Parser;
 use autumn_ioring::cqe::Cqe;
 use autumn_ioring::handshake::{self, DaemonLimits, HelloStatus};
 use autumn_ioring::header::{RingHeader, HEADER_SIZE};
+use autumn_ioring::lease::{self, AcquireResult, DaemonClientId, HeartbeatResult};
 use autumn_ioring::mmap::{prot, MmapRegion};
 use autumn_ioring::opcode::Opcode;
 use autumn_ioring::ring::{CqProducer, SqConsumer};
 use autumn_ioring::socket;
-use autumn_ioring::sqe::Sqe;
+use autumn_ioring::sqe::{
+    Sqe, SQE_LEASE_MODE_READ, SQE_LEASE_MODE_UNSET, SQE_LEASE_MODE_WRITE,
+};
+use autumn_rpc::manager_rpc::{LEASE_MODE_READ, LEASE_MODE_WRITE};
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -263,6 +267,18 @@ async fn handle_session(
 
     socket::send_response_with_fd(fd, &resp, memfd.as_raw_fd())
         .context("send HelloResponse + fd")?;
+
+    // F-ioring-lease-2: per-session daemon client identity. Each
+    // session gets a fresh UUID so multiple sessions on the same
+    // runtime cannot share a lease (a "second writer in the same
+    // session" must still conflict). `host` is diagnostic only.
+    let host = format!(
+        "{}#{:016x}",
+        std::env::var("HOSTNAME").unwrap_or_else(|_| "ioring".to_string()),
+        session_id,
+    );
+    let client_id = Rc::new(DaemonClientId::new(host));
+
     tracing::info!(
         session_id = session_id,
         sq = resp.sq_entries,
@@ -271,7 +287,7 @@ async fn handle_session(
         "session established"
     );
 
-    poller_loop(region, header, cluster, idle_us, stream, memfd).await
+    poller_loop(region, header, cluster, idle_us, stream, memfd, client_id).await
 }
 
 /// Per ring_fd, cached state set up at OPEN. The cached PS RpcClient
@@ -318,6 +334,7 @@ async fn poller_loop(
     idle_us: u64,
     _stream: compio::net::UnixStream,
     _memfd: std::os::unix::io::OwnedFd,
+    client_id: Rc<DaemonClientId>,
 ) -> Result<()> {
     let region: Rc<RefCell<MmapRegion>> = Rc::new(RefCell::new(region));
     // F243: capture the mmap's STABLE base ptr + register the region for UCX. The
@@ -336,6 +353,35 @@ async fn poller_loop(
     let ring_fds: Rc<RefCell<HashMap<u32, OpenedExtents>>> = Rc::new(RefCell::new(HashMap::new()));
     let next_fd: Rc<Cell<u32>> = Rc::new(Cell::new(1));
     let backoff = Duration::from_micros(idle_us);
+
+    // F-ioring-lease-2: per-session lease bookkeeping. `held_leases`
+    // is INODE-keyed (one entry per ino currently leased by this
+    // session, with the mode + refcount of open ring_fds backing it).
+    // Multiple Open calls in the same session targeting the same
+    // inode are refcounted so we don't AcquireLease again (the
+    // manager would grant idempotently to the same client, but then
+    // a single Close would bump version while the other ring_fd is
+    // still in use — corruption). Release fires only on the 1→0
+    // transition.
+    let held_leases: Rc<RefCell<HashMap<u64, SessionLease>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+
+    // Spawn a per-session heartbeat task — keeps held leases alive
+    // past their TTL (30 s default; we tick at TTL/6 = 5 s). On
+    // HeartbeatResult::NotHeld we drop the held entry + every
+    // ring_fd that backed it (subsequent reads/writes get EBADF —
+    // the cache was invalidated externally, e.g. the writer was
+    // revoked by the manager).
+    {
+        let cluster_h = cluster.clone();
+        let client_h = client_id.clone();
+        let held_h = held_leases.clone();
+        let ring_fds_h = ring_fds.clone();
+        compio::runtime::spawn(async move {
+            session_heartbeat_loop(cluster_h, client_h, held_h, ring_fds_h).await
+        })
+        .detach();
+    }
 
     // F244-C: bounded streaming SQ/CQ loop — mirrors the EN/PS
     // `handle_connection` shape (FuturesUnordered + drain-as-they-land), the
@@ -359,6 +405,8 @@ async fn poller_loop(
             let cluster_c = cluster.clone();
             let ring_fds_c = ring_fds.clone();
             let next_fd_c = next_fd.clone();
+            let client_c = client_id.clone();
+            let held_c = held_leases.clone();
             // `data_base` (Copy raw ptr) + `reg_ref` (Copy ref into `ring_reg`,
             // which outlives `inflight`) are captured by the future; the Read arm
             // builds its dest slice from them.
@@ -372,6 +420,8 @@ async fn poller_loop(
                     &next_fd_c,
                     data_base,
                     reg_ref,
+                    &client_c,
+                    &held_c,
                 )
                 .await
             });
@@ -411,6 +461,9 @@ async fn service_sqe(
     // F243: stable mmap base + (optional) UCX registration for ZC-into-ring reads.
     data_base: *mut u8,
     reg: Option<&RegisteredMem>,
+    // F-ioring-lease-2: per-session daemon identity + per-inode lease refcount.
+    client_id: &Rc<DaemonClientId>,
+    held_leases: &Rc<RefCell<HashMap<u64, SessionLease>>>,
 ) -> Cqe {
     match sqe.opcode {
         Opcode::Nop => Cqe::ok(sqe.user_data, 0),
@@ -441,6 +494,84 @@ async fn service_sqe(
                     return Cqe::err(sqe.user_data, errno);
                 }
             };
+            // F-ioring-lease-2: AcquireLease BEFORE publishing the
+            // ring_fd. The lease mode is encoded in the SQE flags
+            // byte; `SQE_LEASE_MODE_UNSET` (legacy v1 clients)
+            // defaults to WRITE — the safe upper bound that never
+            // silently downgrades a writer to a read-only session.
+            let req_mode = match sqe.lease_mode {
+                SQE_LEASE_MODE_READ => LEASE_MODE_READ,
+                SQE_LEASE_MODE_WRITE | SQE_LEASE_MODE_UNSET => LEASE_MODE_WRITE,
+                other => {
+                    tracing::warn!(other, "unknown SQE lease_mode; rejecting Open");
+                    return Cqe::err(sqe.user_data, libc::EINVAL);
+                }
+            };
+            let ino = opened.ino;
+            // Refcount path: if we already hold this inode's lease
+            // in this session, just bump the count. The mode is
+            // pinned to the FIRST opener's choice (a READ-then-
+            // WRITE within the same session would otherwise
+            // require us to upgrade by re-Acquiring as WRITE, which
+            // we deliberately do NOT support — second Open returns
+            // EBUSY so the client sees a clear mismatch instead of
+            // silently sharing a read-only lease).
+            let needs_acquire = {
+                let mut m = held_leases.borrow_mut();
+                if let Some(slot) = m.get_mut(&ino) {
+                    if slot.mode != req_mode {
+                        tracing::warn!(
+                            ino,
+                            existing_mode = slot.mode,
+                            new_mode = req_mode,
+                            "Open mode mismatch against existing per-session lease"
+                        );
+                        return Cqe::err(sqe.user_data, libc::EBUSY);
+                    }
+                    slot.refcount = slot.refcount.saturating_add(1);
+                    false
+                } else {
+                    // Insert a placeholder so a concurrent Open on
+                    // the same ino in this session blocks behind us
+                    // — service_sqe futures run on the same compio
+                    // runtime, so the next Open's `borrow_mut` here
+                    // sees `refcount > 0` and joins us. (compio
+                    // tasks are cooperatively single-threaded; no
+                    // cross-thread race.)
+                    m.insert(
+                        ino,
+                        SessionLease {
+                            mode: req_mode,
+                            refcount: 1,
+                            version: 0,
+                        },
+                    );
+                    true
+                }
+            };
+            if needs_acquire {
+                match lease::acquire(cluster, client_id, ino, req_mode).await {
+                    Ok(AcquireResult::Granted(info)) => {
+                        if let Some(slot) = held_leases.borrow_mut().get_mut(&ino) {
+                            slot.version = info.version;
+                        }
+                    }
+                    Ok(AcquireResult::Conflict { manager_message }) => {
+                        held_leases.borrow_mut().remove(&ino);
+                        tracing::info!(
+                            ino,
+                            mgr = %manager_message,
+                            "lease conflict; returning EBUSY"
+                        );
+                        return Cqe::err(sqe.user_data, libc::EBUSY);
+                    }
+                    Err(e) => {
+                        held_leases.borrow_mut().remove(&ino);
+                        tracing::warn!(ino, error = %e, "AcquireLease failed; EIO");
+                        return Cqe::err(sqe.user_data, libc::EIO);
+                    }
+                }
+            }
             let fd = next_fd.get();
             next_fd.set(fd.checked_add(1).unwrap_or(1));
             ring_fds.borrow_mut().insert(fd, opened);
@@ -542,10 +673,110 @@ async fn service_sqe(
         }
 
         Opcode::Close => {
-            if ring_fds.borrow_mut().remove(&sqe.ring_fd).is_some() {
-                Cqe::ok(sqe.user_data, 0)
-            } else {
-                Cqe::err(sqe.user_data, libc::EBADF)
+            let opened = match ring_fds.borrow_mut().remove(&sqe.ring_fd) {
+                Some(o) => o,
+                None => return Cqe::err(sqe.user_data, libc::EBADF),
+            };
+            // F-ioring-lease-2: refcount the per-session lease;
+            // ReleaseLease fires only when the LAST ring_fd backing
+            // this inode closes (so a second Open in the same
+            // session keeps the lease alive).
+            let release_now = {
+                let mut m = held_leases.borrow_mut();
+                match m.get_mut(&opened.ino) {
+                    Some(slot) => {
+                        slot.refcount = slot.refcount.saturating_sub(1);
+                        if slot.refcount == 0 {
+                            m.remove(&opened.ino);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    None => false,
+                }
+            };
+            if release_now {
+                if let Err(e) = lease::release(cluster, client_id, opened.ino).await {
+                    // Per plan §4.3: writer's release happens AFTER
+                    // flush — by this point the cluster has the new
+                    // bytes. A failed release means the manager's
+                    // TTL revoke loop will eventually reclaim the
+                    // lease, so the worst case is a 30s "writer
+                    // present" window for new readers; no data
+                    // corruption.
+                    tracing::warn!(
+                        ino = opened.ino,
+                        error = %e,
+                        "ReleaseLease failed; manager TTL will revoke"
+                    );
+                }
+            }
+            Cqe::ok(sqe.user_data, 0)
+        }
+    }
+}
+
+/// Per-inode state inside a session's `held_leases` map.
+#[derive(Clone, Debug)]
+struct SessionLease {
+    /// `LEASE_MODE_READ` or `LEASE_MODE_WRITE` — pinned at first Open.
+    mode: u8,
+    /// Number of currently-open ring_fds backing this inode in this
+    /// session. ReleaseLease fires on the 1→0 transition.
+    refcount: u32,
+    /// Latest `version` the manager handed back on Acquire / Heartbeat.
+    /// F-ioring-lease-4 will use this to tag the per-fd OpenedExtents
+    /// cache so an externally-pushed invalidation can drop stale
+    /// entries.
+    #[allow(dead_code)]
+    version: u64,
+}
+
+/// Per-session heartbeat task. Walks every held lease every
+/// `HEARTBEAT_INTERVAL` (~5s under the 30s default TTL — 6× safety
+/// factor) and renews. On `HeartbeatResult::NotHeld` the entry +
+/// every ring_fd backing it is dropped (subsequent reads/writes
+/// surface as EBADF so the client knows to reopen — F-ioring-lease-3
+/// will surface the same state via PollInvalidations).
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+async fn session_heartbeat_loop(
+    cluster: Rc<ClusterClient>,
+    client_id: Rc<DaemonClientId>,
+    held_leases: Rc<RefCell<HashMap<u64, SessionLease>>>,
+    ring_fds: Rc<RefCell<HashMap<u32, OpenedExtents>>>,
+) {
+    loop {
+        compio::time::sleep(HEARTBEAT_INTERVAL).await;
+        // Snapshot the inode set under a brief borrow so we don't
+        // hold the RefCell across the await.
+        let inos: Vec<u64> = held_leases.borrow().keys().copied().collect();
+        if inos.is_empty() {
+            continue;
+        }
+        for ino in inos {
+            match lease::heartbeat(&cluster, &client_id, ino).await {
+                Ok(HeartbeatResult::Renewed(info)) => {
+                    if let Some(slot) = held_leases.borrow_mut().get_mut(&ino) {
+                        slot.version = info.version;
+                    }
+                }
+                Ok(HeartbeatResult::NotHeld) => {
+                    tracing::warn!(
+                        ino,
+                        "heartbeat: lease was revoked externally; invalidating session ring_fds"
+                    );
+                    held_leases.borrow_mut().remove(&ino);
+                    // Evict every ring_fd backed by this inode so
+                    // subsequent ops fail clearly (EBADF) instead of
+                    // silently reading stale state.
+                    ring_fds.borrow_mut().retain(|_, o| o.ino != ino);
+                }
+                Err(e) => {
+                    // Transport / NotLeader is transient — leave the
+                    // entry in place and try again on the next tick.
+                    tracing::warn!(ino, error = %e, "heartbeat transient failure");
+                }
             }
         }
     }

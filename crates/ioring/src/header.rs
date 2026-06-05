@@ -31,7 +31,14 @@ use bytes::{Buf, BufMut};
 pub const RING_MAGIC: u32 = u32::from_le_bytes(*b"AUIR");
 
 /// Wire format version. Bump on any layout change.
-pub const RING_VERSION: u16 = 1;
+///
+/// v2 (F-ioring-lease-2): the `Sqe.flags` byte is now LOAD-BEARING for
+/// `Opcode::Open` — it carries the lease mode (`LEASE_MODE_READ` /
+/// `LEASE_MODE_WRITE`, with `0` interpreted as the safe default
+/// WRITE so that a daemon connected by a v1 client never silently
+/// upgrades a read-only intent to a write lease). For every other
+/// opcode the flags byte stays reserved (must be 0).
+pub const RING_VERSION: u16 = 2;
 
 /// Bytes occupied by the on-disk header struct itself.
 pub const HEADER_SIZE: u16 = 64;
@@ -66,9 +73,14 @@ pub const CAP_OPEN_CLOSE: u32 = 1 << 2;
 /// Capability flag: futex-based wait/wake on empty queue (vs pure
 /// busy-poll). Optional; reserved for F180-B.
 pub const CAP_FUTEX_WAIT: u32 = 1 << 3;
+/// Capability flag: client and daemon understand the `Sqe.flags` lease
+/// mode for `Opcode::Open` (`LEASE_MODE_READ` / `LEASE_MODE_WRITE`)
+/// and the daemon will acquire / release inode leases on the client's
+/// behalf (F-ioring-lease-2). Always set in v2.
+pub const CAP_INODE_LEASE: u32 = 1 << 4;
 
-/// Default capabilities advertised by a v1 daemon.
-pub const DEFAULT_CAPABILITIES: u32 = CAP_READ | CAP_WRITE | CAP_OPEN_CLOSE;
+/// Default capabilities advertised by a v2 daemon.
+pub const DEFAULT_CAPABILITIES: u32 = CAP_READ | CAP_WRITE | CAP_OPEN_CLOSE | CAP_INODE_LEASE;
 
 /// Pure-data ring header. Atomic indices are NOT modeled here — they
 /// are independent u64 cells laid out after this header in the SHM

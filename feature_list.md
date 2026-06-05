@@ -107,6 +107,7 @@
 | F254 | row_stream single-writer = type-level: P-bulk spawn failure is fatal-for-this-partition; in-thread flush/compact fallback removed (was the 2026-05-03 invalid_meta_len corruption foothold) | partition |
 | F255 | P-bulk hardening — close two F254 audit findings: (P0) split → P-bulk row_stream invalidate race fixed via SYNCHRONOUS pre-seal barrier (RowInvalidateBarrierReq) + per-partition compact_gate; (P2) P-bulk readiness handshake (spawn_bulk_thread returns ready oneshot; open_partition awaits) | partition |
 | F-ioring-lease-1 | JuiceFS-style inode-level lease + close-to-open coherence — manager state machine (`crates/manager/src/inode_lease.rs`), 4 RPCs (MSG_ACQUIRE_LEASE / RELEASE_LEASE / HEARTBEAT_LEASE / POLL_INVALIDATIONS, 0x46–0x49), writer-lease etcd persistence under `inode_leases/<ino>` (F149-fenced), TTL revoke loop (`inode_lease_revoke_loop`), invalidation push queue per client. **Phase 1 ground floor** for ioring-daemon + autumn-fuse cross-mount coherence (plan: `docs/autumn_fs_lease_plan.md`). Daemons not yet wired — F-ioring-lease-2 next. | manager |
+| F-ioring-lease-2 | autumn-ioring-daemon Open/Close acquire+release lease — RING_VERSION 1→2 (Open's SQE flags byte now carries `LEASE_MODE_READ/WRITE`, 0 = safe default WRITE); per-session `DaemonClientId` (UUID); per-inode refcounted `held_leases` so a 2nd Open within a session shares the lease, only the LAST Close releases; per-session 5 s `session_heartbeat_loop` renews held leases (NotHeld → invalidate session ring_fds with EBADF). New `autumn-ioring::lease` module wraps the 4 RPCs into typed `acquire/release/heartbeat/poll_invalidations`. **Phase 1, step 2 of 4** — F-ioring-lease-3/4 still pending. | ioring/manager |
 | ~~F129~~ | ~~PutStream / GetStream — multipart + multi-frag VP~~ — SUPERSEDED by F186 (server code ripped out) | — |
 | ~~F130~~ | ~~GC active rewrite for multi-frag VPs~~ — SUPERSEDED by F186 (no multi-frag any more) | — |
 
@@ -4514,4 +4515,121 @@ subscribe to invalidation pushes.
   tests are STRUCTURAL guards on the state machine + RPC contract,
   not failure repros. The actual coherence guarantee surfaces in
   F-ioring-lease-4's e2e test (two daemons sharing one inode).
+- **passes:** completed (2026-06-05)
+
+### F-ioring-lease-2 · autumn-ioring-daemon Open/Close acquire+release lease
+
+- **Trigger:** plan §5 Phase 1 — the first daemon-side wiring of
+  F-ioring-lease-1's manager primitives. Brings the ioring daemon
+  in line with the cross-mount coherence guarantee for write
+  sessions; reads coexist concurrently as designed.
+- **Range of change:**
+  - `crates/ioring/src/header.rs`: `RING_VERSION 1 → 2`; new
+    capability flag `CAP_INODE_LEASE = 1 << 4`; updated
+    `DEFAULT_CAPABILITIES`.
+  - `crates/ioring/src/sqe.rs`: `Sqe` gains `lease_mode: u8`
+    encoded into the flags byte for `Opcode::Open`. Decode
+    accepts `{0, SQE_LEASE_MODE_READ=1, SQE_LEASE_MODE_WRITE=2}`
+    for Open; rejects any non-zero value for other opcodes (the
+    pre-v2 invariant). Backward note: `0` is interpreted by the
+    daemon as WRITE — the safe default that never silently
+    downgrades a v1 client's write intent.
+  - `crates/ioring/src/lease.rs` (new): `DaemonClientId` (UUID-
+    backed `MgrClientId` wrapper) + typed `acquire / release /
+    heartbeat / poll_invalidations` helpers over
+    `ClusterClient::mgr_call_retry`. Errors classified as
+    `Conflict / NotLeader / Manager / Transport`.
+  - `crates/ioring/src/bin/daemon.rs`: per-session
+    `Rc<DaemonClientId>` + `held_leases: HashMap<u64,
+    SessionLease>` (per-inode refcount, mode-pinned at first
+    Open). Open arm: refcount++ → if 1, call `lease::acquire`;
+    `AcquireResult::Conflict` → `libc::EBUSY`; transport error
+    → `libc::EIO`. A second Open in the same session with a
+    mismatched mode (R vs W) also returns EBUSY (no silent
+    downgrade). Close arm: refcount-- → if 0, call
+    `lease::release` (warn-on-error: manager TTL revoke is the
+    backstop, so a network blip on release leaks the lease for
+    ≤ TTL but never corrupts). New per-session
+    `session_heartbeat_loop` (5 s tick, `HEARTBEAT_INTERVAL` =
+    TTL/6) renews held leases; `HeartbeatResult::NotHeld` →
+    drop the entry + every ring_fd backing it (subsequent ops
+    surface as `EBADF` — explicit failure beats silently
+    serving stale state).
+  - `crates/ioring/src/bin/bench.rs`: bench is read-only,
+    so the Open SQE sets `lease_mode = SQE_LEASE_MODE_READ` —
+    multiple bench instances can share the same file.
+  - `crates/manager/src/inode_lease.rs`: REGRESSION fix discovered
+    by F-ioring-lease-2 integration test
+    `writer_release_unblocks_second_daemon_and_bumps_version`.
+    Pre-this commit, the auto-remove of an empty inode entry on
+    release reset `version` to 1; a new writer would then hand out
+    `(ino, version=1)` which collides with a pre-existing reader's
+    cached `(ino, version=1)` from a different generation. Fix:
+    `LeaseRegistry.last_version: HashMap<u64, u64>` shadow
+    persists the high-water mark across remove/re-create. Every
+    `release / tick / acquire / install_persisted_writer` calls
+    `remember_version(ino, version)`; `inode_or_create` reads the
+    shadow as the seed so version is MONOTONIC across the inode
+    entry's full lifetime. Covered by new unit test
+    `version_is_monotonic_across_remove_and_reacquire`.
+- **Architectural invariants (additions on top of plan §6):**
+  - **L7** Per-session `DaemonClientId`: each daemon session gets
+    a fresh UUID so two sessions on the same runtime cannot
+    silently share a lease. (A single runtime can host many
+    client apps; each must see independent lease semantics.)
+  - **L8** Per-inode refcount inside a session: a 2nd Open on
+    the same ino does NOT re-AcquireLease — it bumps the
+    refcount instead. Release fires only on 1→0. (The manager
+    grants idempotently to the same client identity, but a
+    naïve double-release would bump version while another
+    ring_fd is still in use.)
+  - **L9** Mode is pinned at first Open. A subsequent Open
+    with a different mode → `EBUSY` (no silent upgrade /
+    downgrade). The daemon does not implement lease upgrades.
+  - **L10** Heartbeat ticks at TTL/6 — 6× safety factor under
+    the 30 s default. `NotHeld` ⇒ external revocation ⇒ evict
+    every ring_fd backed by that inode. Subsequent ops fail
+    EBADF; the client retries Open which surfaces the new
+    lease state.
+- **Verification:**
+  - `cargo build --workspace`: clean.
+  - `cargo test -p autumn-manager --lib`: 128 passed (114 prior
+    + 14 lease state-machine, includes the new monotonicity
+    regression test).
+  - `cargo test -p autumn-manager --test f_ioring_lease_2`:
+    4 passed (write conflict, read coexistence, writer-release
+    unblocks 2nd daemon + version monotonic, heartbeat NotHeld
+    after release).
+  - `cargo test -p autumn-manager --test f_ioring_lease`:
+    3 passed (unchanged from F-1).
+  - `cargo test -p autumn-ioring --features daemon --lib`:
+    SQE encode/decode + lease helpers all pass (including the
+    new `open_round_trips_read_and_write_lease_modes`,
+    `open_invalid_lease_mode_rejected`,
+    `non_open_must_keep_flags_zero`).
+  - `cargo clippy -p autumn-ioring --features daemon --bin
+    autumn-ioring-daemon --tests` + `-p autumn-manager --lib
+    --tests --all-features`: no warnings.
+- **Manual smoke-test:** see README "Inode-lease + close-to-
+  open coherence" — drive the daemon from a test app via
+  `IoRingClient::submit(Sqe{ opcode: Open, lease_mode:
+  SQE_LEASE_MODE_WRITE, ... })` from two different sessions
+  against the same path; the second should fail with
+  `libc::EBUSY` in the matching CQE.
+- **Out of scope (carried to next sub-features):**
+  - long-poll invalidation channel + reconnect-invalidates-all-
+    cache (F-ioring-lease-3) — current daemon polls only on its
+    heartbeat tick to detect revoke, not for `WriterClosed`
+    cross-daemon push.
+  - `OpenedExtents` keyed by `(ino, version)` + multi-daemon
+    end-to-end test exercising a real ring (F-ioring-lease-4).
+  - autumn-fuse opt-in (F-fuse-lease-*).
+  - lease upgrade (R → W in same session) and force-revoke
+    (F-lease-preempt).
+- **Testing caveat:** per [[reproduce_before_fixing_mechanism_bugs]]
+  the preferred shape is reproduce → root-cause → fix. F-ioring-
+  lease-2 is greenfield wiring; the 4 integration tests + new
+  monotonicity regression test cover the contract surface but
+  the real failure mode (two daemons with stale caches) only
+  surfaces in F-ioring-lease-4's full e2e.
 - **passes:** completed (2026-06-05)
