@@ -183,6 +183,7 @@ async fn ensure_inode_cached(state: &mut FsState, ino: u64) -> Result<()> {
             dirty: false,
             open_count: 0,
             extents: None,
+            cached_version: 0,
         },
     );
     Ok(())

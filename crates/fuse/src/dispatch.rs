@@ -151,6 +151,28 @@ pub struct ReleaseAction {
     pub propagate_flush_err: bool,
 }
 
+/// BUG-LEASE-7 (P2 #8, 2026-06-06) — pure-fn predicate used by the
+/// Open arm to decide whether the cached `InodeState.meta` /
+/// `extents` are stale relative to a freshly-acquired lease
+/// version. Mirrors the ioring daemon's F-ioring-lease-4 +
+/// F-ioring-lease-5 #1 staleness check.
+///
+/// `acquired_version`: the version returned by the just-completed
+///   AcquireLease (or read back from `held_leases[ino].version` on
+///   a same-mount Open that didn't re-acquire). `0` is the
+///   "couldn't observe a fresh version this Open" sentinel — the
+///   helper returns `false` so the existing cached entry stays
+///   untouched (matches pre-fix behavior; never makes things
+///   WORSE than pre-fix).
+/// `cached_version`: the version stored on the per-mount
+///   `InodeState.cached_version` at the time it was rebuilt.
+/// Returns `true` iff `cached < acquired && acquired > 0`. The
+/// strict `<` matters: an equal-version Open is the common case
+/// (refcount+1) and must NOT trigger a reload.
+pub fn inode_cache_needs_reload(cached_version: u64, acquired_version: u64) -> bool {
+    acquired_version > 0 && cached_version < acquired_version
+}
+
 /// BUG-LEASE-6 (P2 #7, 2026-06-06) — pure-fn predicate used by the
 /// Open / Read arms to detect that the per-mount kernel
 /// `notify_inval_inode` call FAILED for this ino during the most
@@ -600,7 +622,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                 use lease::AcquireResult;
                 let cluster = state.client.clone();
                 let id = state.client_id.clone();
-                match lease::acquire(&cluster, &id, ino, req_mode).await {
+                let acquired_version = match lease::acquire(&cluster, &id, ino, req_mode).await {
                     Ok(AcquireResult::Granted(info)) => {
                         state.held_leases.borrow_mut().insert(
                             ino,
@@ -611,6 +633,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                                 revoked: false,
                             },
                         );
+                        info.version
                     }
                     Ok(AcquireResult::Conflict { manager_message }) => {
                         // Should not happen for a freshly-allocated
@@ -634,8 +657,11 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                         ));
                     }
                     Err(e) => return Err(anyhow!("AcquireLease ino {}: {}", ino, e)),
-                }
-                // Cache the inode
+                };
+                // Cache the inode. BUG-LEASE-7: seed `cached_version`
+                // with the just-acquired lease version so the next
+                // Open(ino) on this mount's restart can detect a
+                // cross-mount version bump.
                 state.inodes.insert(
                     ino,
                     InodeState {
@@ -644,6 +670,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                         dirty: false,
                         open_count: 1,
                         extents: None,
+                        cached_version: acquired_version,
                     },
                 );
                 *state.lookup_count.entry(ino).or_insert(0) += 1;
@@ -776,7 +803,16 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                         }
                     }
                 }
-                if needs_acquire {
+                // BUG-LEASE-7 (P2 #8): capture the post-acquire lease
+                // version so the per-inode-cache branch below can
+                // compare it against `InodeState.cached_version` and
+                // force a reload on mismatch. `0` is the "no fresh
+                // acquire happened this Open" sentinel — we keep the
+                // cached InodeState untouched in that case (matching
+                // pre-fix behavior; the version-mismatch check needs
+                // a known-current version, which only the acquire
+                // round-trip can produce).
+                let acquired_version: u64 = if needs_acquire {
                     use lease::AcquireResult;
                     let cluster = state.client.clone();
                     let id = state.client_id.clone();
@@ -791,6 +827,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                                     revoked: false,
                                 },
                             );
+                            info.version
                         }
                         Ok(AcquireResult::Conflict { manager_message }) => {
                             return Err(anyhow!(
@@ -806,11 +843,64 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                         }
                         Err(e) => return Err(anyhow!("AcquireLease ino {}: {}", ino, e)),
                     }
-                }
+                } else {
+                    // Same mount, same fd-family reopen: we kept the
+                    // refcount and the lease version is still in
+                    // `held_leases[ino]`. Read it back so the
+                    // BUG-LEASE-7 cache check below works on EVERY
+                    // Open, not just the AcquireLease path. Stale
+                    // entries are revoked-checked above, so this
+                    // version reflects the current grant.
+                    state
+                        .held_leases
+                        .borrow()
+                        .get(&ino)
+                        .map(|s| s.version)
+                        .unwrap_or(0)
+                };
 
-                // Now publish to the per-inode cache.
+                // BUG-LEASE-7: now publish to the per-inode cache.
+                // If a cached entry exists AND its `cached_version`
+                // is older than the freshly-acquired lease version,
+                // a different writer (likely a different mount) has
+                // closed since this mount last cached the inode —
+                // the cached `meta` / `extents` are stale; rebuild
+                // them. `acquired_version == 0` means no fresh
+                // acquire was issued this call (refcount > 1, no
+                // revoke); keep the cached entry as-is in that
+                // case (matches pre-fix behavior).
+                let needs_reload = if acquired_version > 0 {
+                    state
+                        .inodes
+                        .get(&ino)
+                        .map(|is| is.cached_version < acquired_version)
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                if needs_reload {
+                    tracing::info!(
+                        ino,
+                        cached = state.inodes.get(&ino).map(|is| is.cached_version).unwrap_or(0),
+                        acquired = acquired_version,
+                        "BUG-LEASE-7: stale cached InodeState; reloading"
+                    );
+                    state.inodes.remove(&ino);
+                }
                 if let Some(is) = state.inodes.get_mut(&ino) {
                     is.open_count += 1;
+                    // Bump cached_version forward — if we entered
+                    // this branch with `is.cached_version <
+                    // acquired_version`, `needs_reload` would have
+                    // dropped the entry. The remaining case is
+                    // `cached_version >= acquired_version` (same
+                    // mount, same generation, or transient acquire-
+                    // skip path). Either way, take the max so a
+                    // future Open's cached version is at least the
+                    // version we've now committed to.
+                    if acquired_version > is.cached_version {
+                        is.cached_version = acquired_version;
+                    }
                 } else {
                     let meta = get_inode(state, ino).await?;
                     state.inodes.insert(
@@ -821,6 +911,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                             dirty: false,
                             open_count: 1,
                             extents: None,
+                            cached_version: acquired_version,
                         },
                     );
                 }
@@ -1482,5 +1573,66 @@ mod bug_lease_6_notify_fail_closed_tests {
             notify_inval_inode_failed_for(&notify_failed.borrow(), 42),
             "persistent failure: sticky entry MUST stay set for the next Open"
         );
+    }
+}
+
+#[cfg(test)]
+mod bug_lease_7_open_cache_version_tests {
+    //! BUG-LEASE-7 (P2 #8, 2026-06-06) — pure-fn / driving tests
+    //! for `inode_cache_needs_reload`. The Open arm wires this
+    //! against (cached_version, acquired_version) on every Open;
+    //! a `true` return drops the cached InodeState and forces
+    //! `get_inode` to repopulate. Mirror of ioring's
+    //! F-ioring-lease-4 + F-ioring-lease-5 #1 staleness check.
+
+    use super::inode_cache_needs_reload;
+
+    #[test]
+    fn equal_version_does_not_reload() {
+        // Common Open path: same mount, same fd-family reopen,
+        // version unchanged → keep the cached state.
+        assert!(!inode_cache_needs_reload(7, 7));
+    }
+
+    #[test]
+    fn higher_cache_does_not_reload() {
+        // Shouldn't happen in practice (acquired is monotonic),
+        // but be defensive: a cached version GREATER than the
+        // acquired version is NOT stale (no version regression
+        // implied — could be a stale read of held_leases on a
+        // multi-step race). The strict `<` rule keeps the
+        // helper from spuriously reloading.
+        assert!(!inode_cache_needs_reload(10, 7));
+    }
+
+    #[test]
+    fn lower_cache_with_nonzero_acquired_reloads() {
+        // KEY ASSERTION: another mount wrote + closed, manager
+        // bumped version 7 → 8, this mount's Open acquires
+        // version 8 but its cached InodeState was last refetched
+        // when version was 7. MUST reload.
+        assert!(inode_cache_needs_reload(7, 8));
+    }
+
+    #[test]
+    fn zero_acquired_does_not_reload() {
+        // The Open arm's "I didn't observe a fresh version this
+        // call" sentinel — same-mount Open without re-acquire
+        // AND `held_leases[ino]` was absent. The helper returns
+        // `false` so the existing cached entry stays untouched
+        // (matches pre-fix behavior; never makes things worse).
+        assert!(!inode_cache_needs_reload(5, 0));
+        assert!(!inode_cache_needs_reload(0, 0));
+    }
+
+    #[test]
+    fn zero_cache_with_nonzero_acquired_reloads() {
+        // Fresh-mount initial Open path used to be no-op (no
+        // cached entry); but if a cached entry got installed
+        // BEFORE the first lease (e.g. via a Lookup that
+        // populated `inodes[ino]` with cached_version=0), the
+        // first Open's lease version IS the legit cross-mount
+        // delta — reload to pick up any cross-mount writes.
+        assert!(inode_cache_needs_reload(0, 5));
     }
 }

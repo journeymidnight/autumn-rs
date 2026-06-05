@@ -5204,13 +5204,25 @@ gaps in the lease protocol's correctness story.
   `open_count += 1` — does NOT compare the cached `InodeState`
   version against the freshly-acquired lease version. Read
   path then serves from the stale cached meta/extents.
-- **Status:** PENDING. Fix: store `cached_version` on
-  `InodeState`; Open compares against `info.version` from the
-  acquire response; on mismatch clear cache + reload via
-  `get_inode`. Mirror of the ioring F-ioring-lease-5 #1 fix.
-  Read path also consults `invalidations` floor.
-  Reproduce-first.
-- **passes:** not_completed
+- **Status:** COMPLETED (2026-06-06). Fix shape:
+  - `InodeState.cached_version: u64` — the manager lease
+    version current at the time `meta`/`extents` were last
+    refetched.
+  - `inode_cache_needs_reload(cached, acquired)` pure-fn —
+    `acquired > 0 && cached < acquired`. Strict `<` keeps
+    equal-version reopens from spuriously reloading.
+  - Open arm: captures `acquired_version` from the
+    AcquireLease response (or reads back from
+    `held_leases[ino].version` on the same-mount no-acquire
+    path); compares against `inodes[ino].cached_version`; on
+    mismatch drops the entry, lets the existing `get_inode`
+    reload run, installs fresh state with
+    `cached_version = acquired_version`.
+  - Create arm: seeds `cached_version` with the just-acquired
+    lease version so a future Open on this mount can detect
+    cross-mount bumps post-restart.
+  - 5 default-CI pure-fn unit tests cover the helper.
+- **passes:** completed
 
 ### BUG-LEASE-8 (P2 #9) — multi-key write has no atomic commit boundary
 

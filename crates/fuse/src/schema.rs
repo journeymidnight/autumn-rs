@@ -147,4 +147,20 @@ pub struct InodeState {
     /// keys themselves (the implicit-key design: no extent list in InodeMeta).
     /// Invalidated (set `None`) on truncate; maintained incrementally on write.
     pub extents: Option<Vec<(u64, u32)>>,
+    /// BUG-LEASE-7 (P2 #8, 2026-06-06) — the manager-side lease
+    /// version that was current when `meta` / `extents` were
+    /// LAST refetched from KV. On Open the dispatcher compares
+    /// this against the version returned by AcquireLease; on
+    /// mismatch the cached InodeState is dropped and rebuilt
+    /// from `get_inode` (and a fresh extent rescan on next
+    /// `ensure_extents_loaded`). Without this a second mount
+    /// that re-Opens the inode after the first mount wrote +
+    /// closed would happily serve from its stale cached `meta`
+    /// (correct user-space lease state notwithstanding) — the
+    /// close-to-open bytes invariant breaks at the FUSE layer
+    /// even when the manager + kernel-cache layers are correct.
+    ///
+    /// `0` means "no lease seen yet" — only seeded by Open and
+    /// preserved across `forget` for as long as the entry lives.
+    pub cached_version: u64,
 }
