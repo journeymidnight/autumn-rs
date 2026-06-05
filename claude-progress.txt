@@ -1,193 +1,90 @@
-Date: 2026-06-05
+Date: 2026-06-06
 TaskStatus: completed
-Task scope: F-lease-preempt — force-revoke / writer revoke
-  protocol. Phase 3 of docs/autumn_fs_lease_plan.md, the LAST
-  piece of the inode-lease feature series. All three plan phases
-  now landed.
+Task scope: BUG-LEASE-1 .. BUG-LEASE-7 (the 7 fixable bugs from
+  the two-round coco arch review across the lease subsystem +
+  Phase 1/2/3 implementation). Plus the R2 follow-ups (R2-P0
+  #1/#2/#3 + R2-P1 #4/#5).
 
-  AcquireLease(force=true) against a held writer:
-  - first call → manager pushes WillRevokeIn{grace_ms} to the
-    current writer + returns RevokePending{eta_ms}.
-  - retries before grace expires → still RevokePending with the
-    remaining eta.
-  - writer voluntarily releases → next acquire = Granted cleanly.
-  - past the grace deadline → force-revoke (bump version, push
-    LeaseRevoked to deposed writer + readers) + Granted.
+  Round 1 (coco arch review 2026-06-05) surfaced 8 bugs:
+    P0 #1 BUG-LEASE-1 — heartbeat doesn't refresh etcd expires_at.
+    P0 #2 BUG-LEASE-2 — storage-layer fencing token (Phase 1).
+    P0 #3 BUG-LEASE-3 — LeaseRevoked event doesn't immediately
+                        clear held_leases.
+    P1 #4 BUG-LEASE-4 — force-revoke etcd-persist fail → phantom
+                        revoke (deposed writer + readers saw
+                        events for a preemption that didn't land).
+    P1 #5 BUG-LEASE-5 — TTL revoke etcd-delete fail has no retry
+                        queue.
+    P2 #7 BUG-LEASE-6 — notify_inval_inode failure isn't
+                        fail-closed.
+    P2 #8 BUG-LEASE-7 — FUSE Open doesn't bind cached state to
+                        lease version.
+    P2 #9 BUG-LEASE-8 — multi-key write has no atomic commit
+                        boundary. ARCHITECTURAL, DEFERRED.
 
-  Same shape as NFSv4 delegation recall but driven from the
-  client side via the existing long-poll invalidation channel —
-  no new wire RPC.
+  Round 2 (coco re-review 2026-06-06) surfaced 7 follow-ups:
+    R2-P0 #1 — heartbeat etcd put is BLIND (no CAS).
+    R2-P0 #2 — fuse Release flush-decision broken by BUG-LEASE-3's
+                eviction.
+    R2-P0 #3 — fuse Write doesn't check held_leases.
+    R2-P1 #4 — partition-server panic risk (borrow scope across
+                match arms).
+    R2-P1 #5 — fence floor poisoned by oversized writes.
+    R2-P1 #6 — MSG_PUT_ZC bypasses fencing (tracked as
+                BUG-LEASE-2 Phase 2; deferred).
+    R2-P2 #7 — SDK-side CODE_FENCED typed mapping (deferred).
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
-  Already implemented:
-    - Phase 1: F-ioring-lease-1/2/3/4 + Phase-1 byte-level
-      cluster e2e + F-ioring-lease-5 (coco fixes).
-    - Phase 2: F-fuse-lease-1 (autumn-fuse mount opt-in) +
-      F-fuse-lease-2 (notify_inval_inode kernel cache evict).
-    - Phase 3: F-lease-preempt (THIS COMMIT) — force-revoke /
-      writer revoke protocol.
+  Already implemented (this session):
+    - BUG-LEASE-1 (commit a51bbfc) — etcd refresh on heartbeat.
+    - BUG-LEASE-2 Phase 1 (commit cdc1ad6) — per-PS fence floor.
+    - BUG-LEASE-3 (commit cdc1ad6) — held_leases per-event evict.
+    - R2 batch 1 (commit 88d93a0) — heartbeat CAS + fence-order
+        + borrow-scope.
+    - R2-P0 #2/#3 (commit 78dbfaf) — sticky lease_revoked +
+        Write/Release fail-closed.
+    - BUG-LEASE-4 (commit 0fa57e3) — deferred-push 2PC for
+        force-revoke + version rewind on revert.
+    - BUG-LEASE-5 (commit 3ac5ed7) — 2PC TTL revoke loop.
+    - BUG-LEASE-6 (commit efcd893) — sticky-set fail-closed for
+        notify_inval_inode.
+    - BUG-LEASE-7 (commit c46762b) — InodeState.cached_version
+        binding + Open arm reload-on-mismatch.
 
-  Not yet implemented (deliberately deferred, NOT blocking
-  Phase 3 close):
-    - Writer-side AUTO-flush + AUTO-release on receiving
-      WillRevokeIn. Today daemon + fuse poll loops just log the
-      WillRevokeIn event at WARN with the grace ms. The operator
-      (or a higher layer) must react before the grace expires;
-      the manager force-revokes after the deadline regardless,
-      so correctness is preserved. Wiring auto-flush needs:
-      * autumn-fuse: send a synthetic FsRequest::Flush + then
-        the equivalent of FsRequest::Release for the affected
-        inode from inside the poll loop's per-event handler.
-        The compio thread already owns FsState so this is just
-        a state mutation + lease::release call; the tricky part
-        is the user-visible fd lifetime (the kernel still has
-        the fd open — we'd need notify_inval_inode to drop the
-        cache + accept that future ops on that fd return EIO).
-      * autumn-ioring: walk held_leases for the matching ino,
-        send the same "release-and-EBADF-future-ops" sequence.
-      Tractable as a follow-up. The current design is correct
-      (no data loss; just a 5s window where the preempter waits)
-      and matches the plan's word-for-word "writer revoke 协议".
+  Not implemented (intentionally deferred):
+    - BUG-LEASE-2 Phase 2 — PUT_ZC fencing + fuse/ioring epoch
+      stamping. Requires wire change + value-copy/registration
+      path rework; tracked.
+    - BUG-LEASE-8 — multi-key write atomic commit boundary.
+      Pre-existing fuse-layer limitation (predates the lease
+      work); requires per-inode generation manifest + orphan
+      GC on uncommitted generations.
+    - R2-P2 #7 — SDK-side CODE_FENCED typed error mapping. UX
+      polish; not load-bearing.
 
-=== WHAT THIS COMMIT SHIPS ===
+Current summary:
+  All 7 fixable BUG-LEASE bugs landed across 7 commits, each
+  with default-CI pure-fn tests + (where the test harness
+  permits) cluster e2e. Aggregate: 159 partition-server +
+  149 manager + 43 fuse + 68 ioring unit tests pass; 20
+  lease cluster integration tests pass (f_ioring_lease[_2/_3/_4],
+  f_lease_preempt, bug_lease_3_revoke_evicts,
+  bug_lease_4_force_revoke_2pc).
 
-  Wire (same-commit deploy, per repo convention):
-    AcquireLeaseReq gains `force: bool`.
-    New CODE_REVOKE_PENDING = 6 (manager packs `eta_ms` into
-    the response's `lease.ttl_secs` field — documented on the
-    const, repurposed only for this code path).
-    New LEASE_INVAL_WILL_REVOKE_IN = 4 invalidation kind. The
-    `MgrInvalidation.version` field is repurposed to carry the
-    grace milliseconds (also documented on the const).
+Main gaps:
+  - BUG-LEASE-2 Phase 2 (PUT_ZC fencing): a writer holding a
+    revoked lease can still bypass the per-inode fence floor
+    via the zero-copy write path. Currently the fuse Write
+    arm fail-closes client-side (R2-P0 #3), so the bytes
+    don't leave the daemon, but a programmatic client that
+    skips the SDK lease check could still race. Tracked.
+  - BUG-LEASE-8 (multi-key write atomicity): deferred per
+    spec; needs design + commit-record + recovery GC.
 
-  Manager state machine (crates/manager/src/inode_lease.rs):
-    InodeLeaseState.pending_revoke_at: Option<Instant>.
-    LeaseRegistry.revoke_grace: Duration (default 5s,
-    DEFAULT_REVOKE_GRACE; `with_ttl_and_revoke_grace` lets
-    tests use sub-second windows).
-    New acquire_with_force(client, ino, mode, force, now):
-      - force=false: identical to legacy acquire.
-      - force=true + no current writer (or same writer): grant.
-      - force=true + different writer + pending_revoke_at is
-        None: set to now+grace, push WillRevokeIn, return
-        RevokePending{eta_ms}.
-      - force=true + different writer + grace > now: return
-        RevokePending{remaining eta_ms}.
-      - force=true + different writer + grace ≤ now: force-
-        revoke (clear writer, bump version, push LeaseRevoked
-        to deposed + readers), grant new acquirer.
-    Legacy acquire(...) keeps its signature — delegates to
-    acquire_with_force(.., force=false).
-    release/tick/revert clear pending_revoke_at on writer-
-    departure paths so a future force-acquire starts fresh.
-
-  Six unit tests in inode_lease::tests covering:
-    - force on held writer → RevokePending + WillRevokeIn push.
-    - force retry before grace → remaining-eta math.
-    - voluntary release within grace → next acquire Granted.
-    - grace expiry → force-revoke + LeaseRevoked to deposed+
-      readers + Granted to new acquirer.
-    - force on no writer = just a grant.
-    - force by self = idempotent refresh (no self-push).
-
-  Client (crates/client/src/lease.rs):
-    AcquireResult::RevokePending{eta_ms, manager_message}.
-    acquire_force(cluster, client, ino, mode) — force=true
-    variant, returns RevokePending on first hit.
-    acquire_with_preempt_wait(cluster, client, ino, mode,
-    max_wait_ms) — convenience loop that polls acquire_force
-    with sliding backoff (50-500ms per poll) bounded by
-    max_wait_ms. Returns the final outcome.
-
-  Manager handler:
-    handle_acquire_lease threads req.force → acquire_with_force.
-    New RevokePending arm returns CODE_REVOKE_PENDING + packs
-    eta_ms into lease.ttl_secs.
-
-  Daemon + fuse update sites:
-    ioring daemon's Open arm + fuse's Open + Create arms get a
-    defensive `RevokePending => Err("BUG")` arm. These paths
-    use non-force acquire so the variant is unreachable; the
-    explicit arm makes a future refactor that flips them to
-    force=true fail loudly instead of silently dropping the
-    retry loop.
-    ioring poll loop's per-event match: new
-    LEASE_INVAL_WILL_REVOKE_IN arm logs at WARN with the
-    grace ms so the operator can react.
-
-  Integration tests (crates/manager/tests/f_lease_preempt.rs):
-    Four tests against the real manager RPC:
-      1. force_acquire_pushes_will_revoke_to_current_writer.
-      2. voluntary_release_within_grace_lets_preempter_acquire_cleanly.
-      3. force_acquire_after_grace_expiry_forces_revoke_and_grants.
-      4. force_acquire_on_no_writer_grants_immediately.
-    All 4 pass; #3 uses acquire_with_preempt_wait with 8s
-    budget and exercises the full 5s grace + force-revoke +
-    LeaseRevoked round-trip.
-
-=== VERIFICATION ===
-
-  cargo build --workspace                           : clean
-  cargo test -p autumn-manager --lib                : 139 passed
-                                                      (133 prior +
-                                                      6 new preempt
-                                                      units)
-  cargo test -p autumn-client --lib                 : 15 passed
-                                                      (unchanged —
-                                                      6 lease, 9
-                                                      others)
-  cargo test -p autumn-fuse --features fuse --lib   : 16 passed
-                                                      (unchanged)
-  cargo test -p autumn-ioring --features daemon
-       --lib                                         : 79 passed
-                                                      (unchanged)
-  cargo test -p autumn-manager --test
-       f_lease_preempt                               : 4 passed
-                                                      (new this
-                                                      commit;
-                                                      ~15s)
-  All F-1/2/3/4 ioring + F-fuse-lease-1/2 + Phase-1 byte-level
-  e2e: regression-clean.
-  cargo clippy --workspace: clean.
-
-=== TESTING CAVEAT ===
-
-  Per [[reproduce_before_fixing_mechanism_bugs]] the preferred
-  order is reproduce → root-cause → fix. F-lease-preempt is
-  greenfield protocol work — there's no production bug being
-  reproduced. The 6 unit + 4 integration tests cover the
-  state-machine contract and the wire round-trip end-to-end.
-  The deferred writer-side auto-flush would land its own e2e
-  test (writer holds lease + has dirty data; preempter
-  force-acquires; writer's poll loop receives WillRevokeIn;
-  auto-flush runs; auto-release fires; preempter's next
-  acquire is Granted cleanly without grace expiry).
-
-=== PHASE STATUS ===
-
-  Phase 1 (F-ioring-lease-1/2/3/4): COMPLETE (bddf806 / 6fa78f8
-    / ee5e5e3 / 6ffebec + dcda895 coco fixes + byte-level e2e).
-  Phase 2 (F-fuse-lease-1/2): COMPLETE (1bbd990 + 6724062 coco
-    fixes; 770765e + 3fa1452 coco P3 fix).
-  Phase 3 (F-lease-preempt): COMPLETE (72de2b8 this commit).
-
-  ENTIRE docs/autumn_fs_lease_plan.md IS NOW IMPLEMENTED.
-
-=== NEXT SESSION HAND-OFF ===
-
-  All three plan phases are landed. Natural follow-ups that
-  the plan deliberately didn't promise:
-
-    - Writer-side auto-flush + auto-release on WillRevokeIn
-      (described in "Out of scope" of the F-lease-preempt
-      detail section in feature_list.md).
-    - Full-cluster byte-level e2e for F-fuse-lease (the fuse
-      mount + ioring daemon both mutating the same file with
-      coherence verified — same shape as the Phase-1 byte-
-      level e2e but with one side being a real fuse mount).
-    - autumn-op CLI surface for `lease list` / `lease force-
-      revoke` admin ops (operators can today inspect via
-      etcdctl on `inode_leases/` but no CLI).
-
-Env: linux, autumn-rs main branch.
+Next steps:
+  None for this task. The session-closure invariant (CLAUDE.md
+  rule 9) is satisfied: commits landed, progress + feature_list
+  updated, work area clean (no half-applied edits). Future
+  follow-ups will be opened separately if/when the deferred
+  items are picked up.
