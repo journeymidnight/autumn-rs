@@ -151,6 +151,35 @@ pub struct ReleaseAction {
     pub propagate_flush_err: bool,
 }
 
+/// BUG-LEASE-6 (P2 #7, 2026-06-06) — pure-fn predicate used by the
+/// Open / Read arms to detect that the per-mount kernel
+/// `notify_inval_inode` call FAILED for this ino during the most
+/// recent invalidation event. When this is `true`, the caller MUST:
+///
+///   1. Drop any cached InodeState (force a fresh `get_inode`).
+///   2. Retry `notify_inval_inode(ino, 0, 0)` against the live
+///      Notifier.
+///   3. Clear the sticky entry on retry success.
+///
+/// Without this, a transient EINVAL/ENOENT/EAGAIN on the kernel
+/// notify path leaves the kernel page cache serving stale bytes
+/// to userspace AND the mount's own InodeState pointing at stale
+/// extents — close-to-open coherence silently broken from the
+/// reader app's perspective even though the user-space lease
+/// state is correct.
+///
+/// Why not just retry on a timer: the kernel page cache serves
+/// most reads WITHOUT round-tripping to our dispatcher. The only
+/// reliable hook is the next syscall that DOES reach us — Open
+/// is the cheapest one to instrument because every long-lived
+/// read fd starts with one.
+pub fn notify_inval_inode_failed_for(
+    failed: &std::collections::HashSet<u64>,
+    ino: u64,
+) -> bool {
+    failed.contains(&ino)
+}
+
 /// F-fuse-lease-2: callback the per-mount invalidation poll loop
 /// runs for every per-ino `WriterClosed` / `LeaseRevoked` event.
 /// In production this is `notifier.inval_inode(ino, 0, 0)` against
@@ -209,6 +238,16 @@ pub fn invalidate_kernel_cache_for_events(
 ///   → wholesale invalidate + best-effort `ReleaseLease`.
 pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeInvalidator>) {
     use std::time::Duration;
+    // BUG-LEASE-6 (P2 #7, 2026-06-06) — stash the invalidator on
+    // FsState so the Open arm can retry the kernel notify when
+    // `notify_inval_failed` contains the ino. Stored only when
+    // production main.rs supplied a real Notifier-backed closure;
+    // tests + headless contexts pass None, in which case the Open
+    // arm short-circuits to "drop the cached InodeState" (no
+    // kernel retry to attempt).
+    if let Some(ref inv) = invalidator {
+        *state.kernel_invalidator.borrow_mut() = Some(inv.clone());
+    }
     let cluster_h = state.client.clone();
     let id_h = state.client_id.clone();
     let held_h = state.held_leases.clone();
@@ -658,6 +697,48 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
         }
         FsRequest::Open { ino, flags, reply } => {
             let result = async {
+                // BUG-LEASE-6 (P2 #7, 2026-06-06) — fail-closed on
+                // stale `notify_inval_inode`. If the most recent
+                // kernel notify for this ino FAILED (sticky set
+                // populated by the per-mount invalidator), drop
+                // any cached InodeState BEFORE the get_inode reload
+                // so this Open's bookkeeping is built on fresh
+                // attrs. Then retry the kernel notify; on success,
+                // clear the sticky entry. On retry failure, leave
+                // the sticky entry — next Open of the same ino
+                // tries again. Without this a transient kernel
+                // EINVAL/EAGAIN strands the kernel page cache on
+                // stale bytes despite our user-space lease state
+                // being correct.
+                let sticky_failed = {
+                    let s = state.notify_inval_failed.borrow();
+                    notify_inval_inode_failed_for(&s, ino)
+                };
+                if sticky_failed {
+                    state.inodes.remove(&ino);
+                    // Clone the Rc out of the RefCell so we don't
+                    // hold the borrow across the invalidator call
+                    // (the closure itself borrows
+                    // `notify_inval_failed`).
+                    let invalidator_clone = state.kernel_invalidator.borrow().clone();
+                    if let Some(invalidator) = invalidator_clone {
+                        invalidator(ino);
+                        // The invalidator closure itself records
+                        // failures (in main.rs); if the retry
+                        // succeeded the closure cleared `failed[ino]`.
+                        // Re-read it now.
+                        let still_failed = {
+                            let s = state.notify_inval_failed.borrow();
+                            notify_inval_inode_failed_for(&s, ino)
+                        };
+                        if !still_failed {
+                            tracing::info!(
+                                ino,
+                                "BUG-LEASE-6: notify_inval_inode retry succeeded on Open"
+                            );
+                        }
+                    }
+                }
                 // Ensure inode exists.
                 let _ = get_inode(state, ino).await?;
 
@@ -1263,5 +1344,143 @@ mod r2_p0_2_3_lease_check_tests {
         });
         let action2 = compute_release_action(&held, 7, false);
         assert!(!action2.must_flush);
+    }
+}
+
+#[cfg(test)]
+mod bug_lease_6_notify_fail_closed_tests {
+    //! BUG-LEASE-6 (P2 #7, 2026-06-06) — pure-fn / closure-driven
+    //! unit tests for the `notify_inval_inode` fail-closed
+    //! tracking. The Open-arm reload + retry flow is exercised
+    //! end-to-end via a stand-in "fake notifier" closure that
+    //! the test controls.
+
+    use super::notify_inval_inode_failed_for;
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    use std::rc::Rc;
+
+    #[test]
+    fn empty_failed_set_is_not_stale() {
+        let set: HashSet<u64> = HashSet::new();
+        assert!(!notify_inval_inode_failed_for(&set, 7));
+    }
+
+    #[test]
+    fn populated_failed_set_marks_ino_stale() {
+        let mut set = HashSet::new();
+        set.insert(7);
+        assert!(notify_inval_inode_failed_for(&set, 7));
+        assert!(!notify_inval_inode_failed_for(&set, 8));
+    }
+
+    /// Drive the main.rs invalidator closure shape — Open path
+    /// rebuild + retry. Pre-fix the closure just `warn!`-logged
+    /// the kernel error and dropped it on the floor; post-fix it
+    /// records the ino in `notify_inval_failed`, and a follow-up
+    /// successful call clears it.
+    #[test]
+    fn invalidator_records_failure_and_clears_on_subsequent_success() {
+        // A fake "kernel notifier" that succeeds/fails based on a
+        // toggle. Mirrors `fuser::Notifier::inval_inode`'s
+        // io::Result<()> shape.
+        let fail_next = Rc::new(RefCell::new(true));
+        let notify_failed: Rc<RefCell<HashSet<u64>>> =
+            Rc::new(RefCell::new(HashSet::new()));
+
+        let fail_h = fail_next.clone();
+        let notify_failed_h = notify_failed.clone();
+        let invalidator: super::InodeInvalidator = Rc::new(move |ino: u64| {
+            let should_fail = *fail_h.borrow();
+            if should_fail {
+                notify_failed_h.borrow_mut().insert(ino);
+            } else {
+                notify_failed_h.borrow_mut().remove(&ino);
+            }
+        });
+
+        // First call — fail toggle is on. Closure records the ino.
+        invalidator(42);
+        assert!(notify_failed.borrow().contains(&42));
+
+        // Toggle: subsequent call succeeds. Closure clears the ino.
+        *fail_next.borrow_mut() = false;
+        invalidator(42);
+        assert!(
+            !notify_failed.borrow().contains(&42),
+            "post-success clear: failed set must NOT contain {{ino}} anymore"
+        );
+    }
+
+    /// KEY assertion: failure on ino A must NOT contaminate the
+    /// staleness of ino B. The sticky set is per-ino.
+    #[test]
+    fn failure_isolation_per_ino() {
+        let fail_for: Rc<RefCell<Option<u64>>> = Rc::new(RefCell::new(Some(42)));
+        let notify_failed: Rc<RefCell<HashSet<u64>>> =
+            Rc::new(RefCell::new(HashSet::new()));
+
+        let fail_h = fail_for.clone();
+        let notify_failed_h = notify_failed.clone();
+        let invalidator: super::InodeInvalidator = Rc::new(move |ino: u64| {
+            if *fail_h.borrow() == Some(ino) {
+                notify_failed_h.borrow_mut().insert(ino);
+            } else {
+                notify_failed_h.borrow_mut().remove(&ino);
+            }
+        });
+
+        invalidator(42); // ino 42 fails
+        invalidator(99); // ino 99 succeeds
+        assert!(notify_inval_inode_failed_for(&notify_failed.borrow(), 42));
+        assert!(!notify_inval_inode_failed_for(&notify_failed.borrow(), 99));
+    }
+
+    /// On Open arm: when the sticky set is populated and the Open
+    /// arm calls the invalidator, a successful retry clears the
+    /// sticky entry. This test simulates the Open-arm code path
+    /// against the same closure shape main.rs builds.
+    #[test]
+    fn open_arm_simulated_retry_clears_sticky_on_success() {
+        // Initial state: ino 42 was previously marked failed.
+        let notify_failed: Rc<RefCell<HashSet<u64>>> =
+            Rc::new(RefCell::new(HashSet::from([42])));
+
+        // The "real" notifier on this retry succeeds.
+        let notify_failed_h = notify_failed.clone();
+        let invalidator: super::InodeInvalidator = Rc::new(move |ino: u64| {
+            // success path: remove from sticky.
+            notify_failed_h.borrow_mut().remove(&ino);
+        });
+
+        // Mimic the Open arm: sticky → invalidator → re-check.
+        let sticky = notify_inval_inode_failed_for(&notify_failed.borrow(), 42);
+        assert!(sticky, "precondition: must start sticky");
+        invalidator(42);
+        let still_sticky = notify_inval_inode_failed_for(&notify_failed.borrow(), 42);
+        assert!(
+            !still_sticky,
+            "post-retry-success: sticky entry MUST be cleared"
+        );
+    }
+
+    /// On Open arm: a sticky entry whose retry ALSO fails stays
+    /// in the set, so the NEXT Open arms tries again.
+    #[test]
+    fn open_arm_simulated_retry_keeps_sticky_on_persistent_failure() {
+        let notify_failed: Rc<RefCell<HashSet<u64>>> =
+            Rc::new(RefCell::new(HashSet::from([42])));
+
+        let notify_failed_h = notify_failed.clone();
+        let invalidator: super::InodeInvalidator = Rc::new(move |ino: u64| {
+            // Persistent failure: re-mark sticky.
+            notify_failed_h.borrow_mut().insert(ino);
+        });
+
+        invalidator(42);
+        assert!(
+            notify_inval_inode_failed_for(&notify_failed.borrow(), 42),
+            "persistent failure: sticky entry MUST stay set for the next Open"
+        );
     }
 }

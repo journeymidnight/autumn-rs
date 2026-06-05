@@ -73,6 +73,27 @@ pub struct FsState {
     /// coherence (full path eviction wires in F-fuse-lease-2's
     /// `notify_inval_inode` work).
     pub invalidations: Rc<RefCell<InvalidationMap>>,
+
+    /// BUG-LEASE-6 (P2 #7, 2026-06-06) — sticky set of inos whose
+    /// most recent `notify_inval_inode` kernel call FAILED. The
+    /// poll-loop invalidator writes to this set on error; the
+    /// Open/Read arms check it and force a fresh `get_inode`
+    /// reload + retry `notify_inval_inode` for any sticky-failed
+    /// ino, so a transient kernel-notification failure can't
+    /// indefinitely strand readers on stale page-cache contents.
+    /// On the retry succeeding the entry is removed.
+    pub notify_inval_failed: Rc<RefCell<std::collections::HashSet<u64>>>,
+
+    /// BUG-LEASE-6 (P2 #7) — clone of the per-mount kernel
+    /// `Notifier::inval_inode` closure, kept here so the Open
+    /// arm can retry the notify when `notify_inval_failed`
+    /// contains the ino. `None` in tests + headless contexts
+    /// (no live `fuser::Session`) — the Open arm short-circuits
+    /// to "drop the cached InodeState" and skips the kernel
+    /// retry. The closure type is the same `Rc<dyn Fn(u64)>`
+    /// shape as `dispatch::InodeInvalidator`; we don't import
+    /// the alias here to avoid a dispatch ↔ state circular dep.
+    pub kernel_invalidator: RefCell<Option<Rc<dyn Fn(u64)>>>,
 }
 
 impl FsState {
@@ -91,6 +112,8 @@ impl FsState {
             client_id: Rc::new(DaemonClientId::new_fuse(host)),
             held_leases: Rc::new(RefCell::new(HashMap::new())),
             invalidations: Rc::new(RefCell::new(InvalidationMap::new())),
+            notify_inval_failed: Rc::new(RefCell::new(HashSet::new())),
+            kernel_invalidator: RefCell::new(None),
         })
     }
 

@@ -127,14 +127,30 @@ fn main() -> Result<()> {
                 // event. `inval_inode(ino, 0, 0)` drops both
                 // attribute and the full data range — kernel
                 // re-fetches via our dispatcher on the next read.
+                //
+                // BUG-LEASE-6 (P2 #7, 2026-06-06) — fail-closed
+                // tracking. On `inval_inode` error, record the ino
+                // in `state.notify_inval_failed` so the Open/Read
+                // arms can force a fresh `get_inode` reload + retry
+                // the kernel notify on the next syscall. On
+                // success, REMOVE the entry — every Open-triggered
+                // retry runs this closure too, so a successful
+                // retry naturally clears the sticky flag.
+                let notify_failed_h = state.notify_inval_failed.clone();
                 let invalidator: dispatch::InodeInvalidator =
                     std::rc::Rc::new(move |ino: u64| {
-                        if let Err(e) = notifier.inval_inode(ino, 0, 0) {
-                            tracing::warn!(
-                                ino,
-                                error = %e,
-                                "F-fuse-lease-2: notify_inval_inode failed (kernel may have already dropped)"
-                            );
+                        match notifier.inval_inode(ino, 0, 0) {
+                            Ok(()) => {
+                                notify_failed_h.borrow_mut().remove(&ino);
+                            }
+                            Err(e) => {
+                                notify_failed_h.borrow_mut().insert(ino);
+                                tracing::warn!(
+                                    ino,
+                                    error = %e,
+                                    "BUG-LEASE-6: notify_inval_inode failed; marked sticky for retry on next Open"
+                                );
+                            }
                         }
                     });
 

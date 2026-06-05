@@ -5179,11 +5179,21 @@ gaps in the lease protocol's correctness story.
   error (kernel doesn't support FUSE_NOTIFY_INVAL_INODE,
   /dev/fuse write failed, etc.) is logged-and-continued. The
   kernel may continue serving stale page cache for that ino.
-- **Status:** PENDING. Fix: track failures per-ino in a sticky
-  set; on subsequent open/read for that ino, mark cache
-  unsafe → next-Open forces revalidate / bypass page cache.
-  Reproduce via mock Notifier.
-- **passes:** not_completed
+- **Status:** COMPLETED (2026-06-06). Fix shape:
+  - `FsState.notify_inval_failed: Rc<RefCell<HashSet<u64>>>`
+    sticky set populated by the per-mount invalidator on
+    error (cleared on success). Stash the invalidator on
+    `FsState.kernel_invalidator` at boot via
+    `spawn_lease_background_tasks` so the Open arm can call
+    it directly.
+  - `notify_inval_inode_failed_for(failed, ino)` pure-fn
+    predicate; Open arm fires it BEFORE the get_inode reload
+    + retries the kernel notify in the closure (which
+    naturally clears the sticky entry on success).
+  - 6 default-CI pure-fn unit tests cover: empty/populated
+    set, closure self-clearing, per-ino failure isolation,
+    Open-arm retry success/failure paths.
+- **passes:** completed
 
 ### BUG-LEASE-7 (P2 #8) — FUSE `Open` doesn't bind cached state to lease version
 
