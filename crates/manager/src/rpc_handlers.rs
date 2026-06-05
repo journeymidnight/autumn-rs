@@ -4691,6 +4691,21 @@ impl AutumnManager {
                 // record so failover replay sees the updated
                 // deadline. Other shapes (reader heartbeat,
                 // writer-not-me cases) leave etcd alone.
+                //
+                // coco R2-P0 #1 (round 2, 2026-06-06): the original
+                // BUG-LEASE-1 fix used a BLIND `put_msgs_txn` —
+                // between our in-memory `heartbeat()` mutation and
+                // the etcd put, a concurrent `ReleaseLease` could
+                // have deleted the etcd record, or a force-revoke +
+                // new acquire could have overwritten it with a
+                // DIFFERENT writer's record. The blind put would
+                // then resurrect (release case) or overwrite (new
+                // writer case) that change. The fix is
+                // `EtcdMirror::read_then_cas_put`: read the current
+                // record, CAS-put against it. If CAS fails (record
+                // changed since our read) — silently skip; the
+                // in-memory deadline is still good and the next
+                // heartbeat reads the fresh state.
                 if writer_present {
                     let is_writer = {
                         let reg = self.inode_leases.borrow();
@@ -4709,25 +4724,41 @@ impl AutumnManager {
                         let key = format!("{}{}", crate::INODE_LEASES_PREFIX, req.ino);
                         let value = rkyv_encode(&record).to_vec();
                         if let Some(etcd) = &self.etcd {
-                            // Best-effort: if the write fails the
-                            // in-memory deadline is still good
-                            // until the next heartbeat retries.
-                            // We do NOT bubble the error up
-                            // because heartbeat success is a
-                            // liveness signal — the writer
-                            // shouldn't lose its lease just
-                            // because of a transient etcd hiccup.
-                            // Failover-window risk is bounded by
-                            // the 5s heartbeat cadence × 6 = 30s
-                            // TTL — same as the pre-fix worst case,
-                            // and the next successful heartbeat
-                            // closes the gap.
-                            if let Err(e) = etcd.put_msgs_txn(vec![(key, value)]).await {
-                                tracing::warn!(
-                                    ino = req.ino,
-                                    error = %e,
-                                    "BUG-LEASE-1: heartbeat etcd refresh failed; retry on next heartbeat"
-                                );
+                            match etcd.read_then_cas_put(&key, value).await {
+                                Ok(true) => {
+                                    // Refresh landed; failover-safe.
+                                }
+                                Ok(false) => {
+                                    // CAS conflict OR record deleted.
+                                    // Concurrent Release / new-writer
+                                    // Acquire raced us. In-memory
+                                    // state already reflects this via
+                                    // the writer-still-me check above
+                                    // → if the writer slot is empty
+                                    // or no longer ours, our
+                                    // `is_writer` check would have
+                                    // returned false. So this path is
+                                    // "etcd diverged from our memory
+                                    // momentarily" — next heartbeat
+                                    // will reconcile.
+                                    tracing::debug!(
+                                        ino = req.ino,
+                                        "BUG-LEASE-1 R2-P0 #1: heartbeat etcd CAS skipped (concurrent change); next heartbeat will retry"
+                                    );
+                                }
+                                Err(e) => {
+                                    // Genuine etcd error. In-memory
+                                    // deadline is still good; the
+                                    // worst-case failover window is
+                                    // bounded by lease_ttl -
+                                    // heartbeat_interval = 25s, same
+                                    // as pre-R2 fix.
+                                    tracing::warn!(
+                                        ino = req.ino,
+                                        error = %e,
+                                        "BUG-LEASE-1: heartbeat etcd refresh failed; retry on next heartbeat"
+                                    );
+                                }
                             }
                         }
                     }

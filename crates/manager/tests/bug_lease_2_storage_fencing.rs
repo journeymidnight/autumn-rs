@@ -113,3 +113,70 @@ fn p0_2_storage_fencing_phase1() {
         assert_eq!(r7.code, CODE_OK, "equal-epoch must pass: {r7:?}");
     });
 }
+
+/// coco R2-P1 #5 regression — an oversized write at HIGH epoch was
+/// rejected with CODE_VALUE_TOO_LARGE but pre-fix it ALSO bumped
+/// the floor before the size check ran, so subsequent legitimate
+/// smaller writes from the original writer at the original epoch
+/// got erroneously fenced. Post-fix: the value-too-large check
+/// runs FIRST, so the floor stays at the legitimate writer's
+/// epoch and their next write passes.
+#[test]
+#[ignore]
+fn p0_2_oversized_rejected_write_must_not_poison_floor() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 160).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        let part_id = 16001u64;
+        upsert_partition(&mgr, part_id, log, row, meta, b"", b"\xff\xff\xff\xff").await;
+        let ps_addr = pick_addr();
+        start_partition_server(160, mgr_addr, ps_addr);
+        compio::time::sleep(Duration::from_millis(1500)).await;
+        let ps = RpcClient::connect(ps_addr).await.expect("connect PS");
+
+        // Seed the legitimate writer's floor at epoch 5.
+        let r1 = put_with_fence(&ps, part_id, b"legit", 77, 5).await;
+        assert_eq!(r1.code, CODE_OK);
+
+        // Send an OVERSIZED write at epoch 10. PS-side inline cap =
+        // `AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT` (64 MiB). Use 80 MiB
+        // to definitely exceed it.
+        let oversized = vec![0u8; 80 * 1024 * 1024];
+        let payload = rkyv_encode(&PutReq {
+            part_id,
+            key: b"oversized".to_vec(),
+            value: oversized,
+            expires_at: 0,
+            region_epoch: 0,
+            inode_hint: 77,
+            lease_epoch: 10,
+        });
+        let bytes = ps.call(MSG_PUT, payload).await.expect("oversized put RPC");
+        let resp: PutResp = rkyv_decode(&bytes).expect("decode PutResp");
+        assert_eq!(
+            resp.code,
+            partition_rpc::CODE_VALUE_TOO_LARGE,
+            "oversized write must be rejected: {resp:?}"
+        );
+
+        // Now the legitimate writer at epoch 5 retries. POST-FIX:
+        // floor is still 5 (oversized never bumped it). PRE-FIX:
+        // floor would have been bumped to 10 → this write FENCED.
+        let r3 = put_with_fence(&ps, part_id, b"legit-2", 77, 5).await;
+        assert_eq!(
+            r3.code, CODE_OK,
+            "R2-P1 #5: legitimate writer at original epoch MUST NOT be fenced after a rejected oversized write at higher epoch: {r3:?}"
+        );
+    });
+}

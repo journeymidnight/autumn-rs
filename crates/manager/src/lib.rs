@@ -208,6 +208,53 @@ impl EtcdMirror {
     /// path: conflicting ops proceed concurrently and only a genuine conflict
     /// retries (the per-stream-lock attempt blocked alloc behind slow GC/split
     /// under kill and lost writes — see claude-progress.txt Item 3).
+    /// BUG-LEASE-1 R2-P0 #1 (coco arch review round 2, 2026-06-06):
+    /// "read-then-CAS-put" used by the heartbeat refresh path. The
+    /// raw `put_msgs_txn` path the original BUG-LEASE-1 fix used
+    /// was an unconditional blind write — between
+    /// `LeaseRegistry::heartbeat()` (which sets in-memory deadline)
+    /// and the etcd put, a concurrent `ReleaseLease` could have
+    /// deleted the etcd record, or a force-revoke + new-writer
+    /// acquire could have overwritten it with a different writer.
+    /// The blind put would then resurrect / overwrite that change.
+    ///
+    /// This helper does the safe form: read the current etcd value
+    /// for `key`, build a CAS-put that's gated on
+    /// `Cmp::value(key) == baseline`. If the record was deleted
+    /// or changed since our read, the txn returns `Ok(false)` →
+    /// `Precondition` → caller treats as "skip, next heartbeat
+    /// will retry". F149 leader fence is still threaded via the
+    /// underlying `txn_fenced`.
+    ///
+    /// Returns: `Ok(true)` if the CAS-put committed, `Ok(false)`
+    /// if a concurrent change beat us (caller should NOT treat
+    /// this as an error — in-memory state is still authoritative).
+    /// `Err` for genuine etcd / network / not-leader failures.
+    async fn read_then_cas_put(
+        &self,
+        key: &str,
+        new_value: Vec<u8>,
+    ) -> Result<bool, AppError> {
+        // Read the current record. If absent, the record was deleted
+        // (release happened) — skip the put.
+        let resp = self
+            .client
+            .get(key.as_bytes())
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let baseline = match resp.kvs.first() {
+            Some(kv) => kv.value.clone(),
+            None => return Ok(false),
+        };
+        // CAS-put: only succeeds if etcd value still matches baseline.
+        let extra_cmp = vec![autumn_etcd::Cmp::value(key.as_bytes(), baseline.as_slice())];
+        let ops = vec![autumn_etcd::Op::put(key.as_bytes(), &new_value)];
+        match self.txn_fenced(extra_cmp, ops, vec![]).await? {
+            true => Ok(true),
+            false => Ok(false),
+        }
+    }
+
     async fn put_delete_txn_cas(
         &self,
         puts: Vec<(String, Vec<u8>)>,

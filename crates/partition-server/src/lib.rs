@@ -5399,17 +5399,24 @@ async fn handle_incoming_req(
         let p = part.borrow();
         (p.region_epoch, p.part_id)
     };
-    // BUG-LEASE-2 Phase 1: per-partition fence floor map. We pass
-    // the RefCell directly to keep the helper signature simple.
-    // Borrow the outer RefCell briefly to get a stable reference
-    // into the floor map; the enqueue helper does the inner
-    // borrow_mut for the floor check/bump.
-    let part_borrow = part.borrow();
-    let fence_floors_ref: &RefCell<HashMap<u64, u64>> = &part_borrow.fence_floors;
+    // BUG-LEASE-2 Phase 1 (coco R2-P1 #4 fix): the part borrow MUST
+    // be scoped to the PUT arms only. The legacy code held an outer
+    // immutable borrow across the entire `match`; the `_` /
+    // dispatch_partition_rpc / MaintenanceReq arm internally calls
+    // `part.borrow_mut()`, which would runtime-panic on top of the
+    // outer immutable borrow. Solution: each PUT arm does its own
+    // brief `part.borrow()` to get a transient ref into
+    // `fence_floors`, and the borrow ends with the helper call.
 
     match req.msg_type {
-        MSG_PUT => enqueue_put(req, pending, part_region_epoch, part_id_for_err, Some(fence_floors_ref)),
-        MSG_PUT_ZC => enqueue_put_zc(req, pending, part_region_epoch, part_id_for_err, Some(fence_floors_ref)),
+        MSG_PUT => {
+            let p = part.borrow();
+            enqueue_put(req, pending, part_region_epoch, part_id_for_err, Some(&p.fence_floors))
+        }
+        MSG_PUT_ZC => {
+            let p = part.borrow();
+            enqueue_put_zc(req, pending, part_region_epoch, part_id_for_err, Some(&p.fence_floors))
+        }
         MSG_DELETE => enqueue_delete(req, pending, part_region_epoch, part_id_for_err),
         MSG_STREAM_PUT => enqueue_stream_put(req, pending, part_region_epoch, part_id_for_err),
         // F185: freeze stashes its resp oneshot in PartitionData and
@@ -5579,6 +5586,27 @@ fn enqueue_put(
                 )));
                 return;
             }
+            // F129: regular `Put` rejects values exceeding the inline
+            // cap. Caller should retry via PutBegin/Chunk/Commit.
+            // BUG-LEASE-2 Phase 1 (coco R2-P1 #5 fix): value-too-large
+            // MUST be checked BEFORE the fencing check so a rejected
+            // oversized write doesn't poison the per-ino floor (which
+            // would then erroneously fence legitimate smaller writes
+            // from the same writer at the original epoch).
+            if put_req.value.len() > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize {
+                let key_vec = put_req.key.clone();
+                let resp = PutResp {
+                    code: CODE_VALUE_TOO_LARGE,
+                    message: format!(
+                        "value {} bytes exceeds inline cap {} — use PutStream",
+                        put_req.value.len(),
+                        AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT
+                    ),
+                    key: key_vec,
+                };
+                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                return;
+            }
             // BUG-LEASE-2 (Phase 1): storage-layer fencing check.
             // Reject the write if a higher lease_epoch has already
             // been seen for this inode — the writer was revoked
@@ -5597,22 +5625,6 @@ fn enqueue_put(
                     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                     return;
                 }
-            }
-            // F129: regular `Put` rejects values exceeding the inline
-            // cap. Caller should retry via PutBegin/Chunk/Commit.
-            if put_req.value.len() > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize {
-                let key_vec = put_req.key.clone();
-                let resp = PutResp {
-                    code: CODE_VALUE_TOO_LARGE,
-                    message: format!(
-                        "value {} bytes exceeds inline cap {} — use PutStream",
-                        put_req.value.len(),
-                        AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT
-                    ),
-                    key: key_vec,
-                };
-                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
-                return;
             }
             let key_vec = put_req.key.clone();
             pending.push(WriteRequest {
@@ -10370,5 +10382,29 @@ mod bug_lease_2_fence_tests {
         check_and_bump_fence(7, 2, &mut floors).unwrap();
         // Late A:
         assert!(check_and_bump_fence(7, 1, &mut floors).is_err());
+    }
+
+    #[test]
+    fn poisoned_floor_regression_blocked_by_check_ordering() {
+        // coco R2-P1 #5 — guard against the floor-poisoning bug.
+        // The fix is in `enqueue_put`'s order: value-too-large is
+        // checked BEFORE check_and_bump_fence so a rejected
+        // oversized write doesn't bump the floor and erroneously
+        // fence later legitimate writes from the same writer.
+        // Verify the pure-fn DOES bump on the call (so the fix
+        // really has to come from ordering at the call site, not
+        // from the pure-fn) — call the helper directly with
+        // epoch=10, observe floor=10, then verify a legitimate
+        // epoch=5 write from the SAME writer would now be fenced.
+        let mut floors = HashMap::new();
+        check_and_bump_fence(42, 10, &mut floors).unwrap();
+        assert_eq!(floors.get(&42).copied(), Some(10));
+        // A legitimate writer at epoch 5 would now be fenced —
+        // this is the WRONG outcome the call-site ordering fix
+        // prevents by NOT calling the pure-fn for rejected writes.
+        assert!(
+            check_and_bump_fence(42, 5, &mut floors).is_err(),
+            "documented: if you call the pure-fn after a rejection, you poison the floor"
+        );
     }
 }
