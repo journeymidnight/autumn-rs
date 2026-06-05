@@ -333,6 +333,84 @@ fn fuse_mode_mismatch_in_same_mount_rejects() {
     });
 }
 
+async fn dispatch_create(
+    state: &mut FsState,
+    parent: u64,
+    name: &str,
+    flags: i32,
+) -> anyhow::Result<(autumn_fuse::fuser::FileAttr, u64)> {
+    let (tx, rx) = bridge::reply_channel::<(autumn_fuse::fuser::FileAttr, u64)>();
+    let req = bridge::FsRequest::Create {
+        parent,
+        name: name.into(),
+        mode: 0o644,
+        flags,
+        reply: tx,
+    };
+    dispatch::handle_request(state, req).await;
+    rx.recv_timeout(Duration::from_secs(10))
+        .map_err(|_| anyhow::anyhow!("reply timeout"))?
+}
+
+#[test]
+#[ignore]
+fn fuse_create_acquires_writer_lease() {
+    // Regression for coco P1 #1: `FsRequest::Create` used to
+    // bypass the lease layer entirely, so a freshly-created
+    // writeable fd had no manager-side lease — a concurrent
+    // mount could acquire the writer lease on the same ino.
+    // Post-fix: Create runs the same AcquireLease path as Open.
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 143, 14301).await;
+
+        let mut mount_a = FsState::new(&mgr_addr.to_string())
+            .await
+            .expect("mount A");
+        let mut mount_b = FsState::new(&mgr_addr.to_string())
+            .await
+            .expect("mount B");
+        dispatch::init_root(&mut mount_a).await.expect("init A");
+        dispatch::init_root(&mut mount_b).await.expect("init B");
+
+        // Mount A creates the file. Create with O_WRONLY → WRITE
+        // lease. After Create returns, A's held_leases MUST
+        // contain the new ino with WRITE mode.
+        let (attr, fh) = dispatch_create(&mut mount_a, ROOT_INO, "fresh.bin", /* O_WRONLY */ 1)
+            .await
+            .expect("A create");
+        assert_eq!(fh, attr.ino);
+        let ino = attr.ino;
+        assert_eq!(
+            mount_a.held_leases.borrow().get(&ino).map(|s| s.mode),
+            Some(LEASE_MODE_WRITE),
+            "Create with O_WRONLY MUST acquire WRITE lease"
+        );
+
+        // Mount B tries to open the new file WRITE → conflict.
+        // (B has to lookup the name first via Open — but our
+        // simplified test uses ino directly; manager-side the
+        // lease state is what matters.)
+        let err = dispatch_open(&mut mount_b, ino, /* O_RDWR = */ 2)
+            .await
+            .err()
+            .expect("B open WRITE must conflict with A's Create-acquired lease");
+        assert!(
+            err.to_string().contains("EBUSY"),
+            "expected EBUSY, got: {err}"
+        );
+    });
+}
+
 #[test]
 #[ignore]
 fn fuse_uses_fuse_kind_identity() {

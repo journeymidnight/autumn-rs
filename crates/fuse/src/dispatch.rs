@@ -108,8 +108,25 @@ pub fn spawn_lease_background_tasks(state: &FsState) {
                         tracing::warn!(
                             "F-fuse-lease-1: overflow sentinel; wholesale invalidating mount"
                         );
+                        // Best-effort release of every held lease
+                        // BEFORE we drop the local bookkeeping —
+                        // mirrors autumn-ioring's pattern. Without
+                        // this the manager would keep those writer
+                        // leases until TTL (~30s) and block other
+                        // clients. Partial recovery from coco P1
+                        // #3 — a full "revoked-state-aware
+                        // read/write" rework is a separate
+                        // follow-up.
+                        let drained: Vec<u64> = held_p.borrow().keys().copied().collect();
                         held_p.borrow_mut().clear();
                         inv_p.borrow_mut().clear();
+                        for ino in drained {
+                            if let Err(e) =
+                                autumn_client::lease::release(&cluster_p, &id_p, ino).await
+                            {
+                                tracing::warn!(ino, error = %e, "best-effort release after overflow");
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -117,8 +134,18 @@ pub fn spawn_lease_background_tasks(state: &FsState) {
                         error = %e,
                         "F-fuse-lease-1: poll failed; invalidating mount cache + retry"
                     );
+                    // Same best-effort release as the overflow
+                    // path. A transport error means the manager
+                    // may already have dropped our session's lease
+                    // bookkeeping (it didn't see our heartbeats),
+                    // so the release calls may be no-ops — but we
+                    // still try.
+                    let drained: Vec<u64> = held_p.borrow().keys().copied().collect();
                     held_p.borrow_mut().clear();
                     inv_p.borrow_mut().clear();
+                    for ino in drained {
+                        let _ = autumn_client::lease::release(&cluster_p, &id_p, ino).await;
+                    }
                     compio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
@@ -294,7 +321,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             parent,
             name,
             mode,
-            flags: _,
+            flags,
             reply,
         } => {
             let result = async {
@@ -319,6 +346,43 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                 parent_meta.mtime_secs = s;
                 parent_meta.mtime_nsecs = ns;
                 put_inode(state, parent, &parent_meta).await?;
+                // F-fuse-lease-1 (coco P1 #1 fix): Create produces a
+                // writable fd just like Open. AcquireLease BEFORE
+                // publishing the inode cache so a concurrent Open
+                // from another mount can't get a writer-lease on
+                // the same inode. Brand-new inode → no contention
+                // is possible at the manager (new ino), but the
+                // bookkeeping keeps held_leases consistent so the
+                // matching Release fires ReleaseLease and other
+                // mounts can then take over.
+                let req_mode = lease_mode_for_open(flags);
+                use lease::AcquireResult;
+                let cluster = state.client.clone();
+                let id = state.client_id.clone();
+                match lease::acquire(&cluster, &id, ino, req_mode).await {
+                    Ok(AcquireResult::Granted(info)) => {
+                        state.held_leases.borrow_mut().insert(
+                            ino,
+                            FuseLease {
+                                mode: req_mode,
+                                refcount: 1,
+                                version: info.version,
+                            },
+                        );
+                    }
+                    Ok(AcquireResult::Conflict { manager_message }) => {
+                        // Should not happen for a freshly-allocated
+                        // ino, but if it does (UUID collision in
+                        // another mount's last_version shadow, say)
+                        // surface as EBUSY rather than silently
+                        // owning a leaseless fd.
+                        return Err(anyhow!(
+                            "EBUSY: lease conflict on fresh ino {}: {}",
+                            ino, manager_message
+                        ));
+                    }
+                    Err(e) => return Err(anyhow!("AcquireLease ino {}: {}", ino, e)),
+                }
                 // Cache the inode
                 state.inodes.insert(
                     ino,
@@ -507,7 +571,27 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
         }
         FsRequest::Release { ino, flush, reply } => {
             let result = async {
-                if flush {
+                // F-fuse-lease-1 (coco P1 #2 fix): writer-release
+                // MUST happen AFTER dirty data is flushed (plan
+                // §6.2). The kernel's `flush: bool` argument is
+                // unreliable — close-with-error paths and some
+                // app patterns pass false even when buffers are
+                // dirty. So we ALWAYS flush before checking
+                // whether this Release fires `ReleaseLease`, and
+                // we ONLY proceed to ReleaseLease (refcount→0
+                // transition) if the flush succeeded. A flush
+                // failure keeps the writer lease alive so the
+                // client / a retry / the TTL backstop preserves
+                // the "writer-flush-before-release" invariant.
+                let release_now_pred = {
+                    state
+                        .held_leases
+                        .borrow()
+                        .get(&ino)
+                        .map(|s| s.refcount == 1)
+                        .unwrap_or(false)
+                };
+                if flush || release_now_pred {
                     write::flush_inode(state, ino).await?;
                 }
                 if let Some(is) = state.inodes.get_mut(&ino) {
@@ -520,16 +604,10 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                         state.inodes.remove(&ino);
                     }
                 }
-                // F-fuse-lease-1: refcount the lease; only the 1→0
-                // transition fires ReleaseLease. Best-effort — a
-                // failed release is recovered by the manager's TTL
-                // revoke loop (≤ 30s window).
-                //
-                // Plan §6.2 invariant: writer-release MUST happen
-                // AFTER any dirty data is flushed. The `flush`
-                // branch above already drains the per-inode write
-                // buffer; we only proceed to ReleaseLease after it
-                // returns Ok.
+                // Refcount the lease; only the 1→0 transition
+                // fires ReleaseLease. Best-effort — a failed
+                // release is recovered by the manager's TTL revoke
+                // loop (≤ 30s window).
                 let release_now = {
                     let mut m = state.held_leases.borrow_mut();
                     match m.get_mut(&ino) {

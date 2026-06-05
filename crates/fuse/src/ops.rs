@@ -413,6 +413,14 @@ fn err_to_errno(e: &anyhow::Error) -> i32 {
         libc::ENOTEMPTY
     } else if msg.contains("EISDIR") {
         libc::EISDIR
+    } else if msg.contains("EBUSY") || msg.contains("lease mode mismatch") {
+        // F-fuse-lease-1 (coco P2 #4): writer-lease conflicts and
+        // in-mount mode mismatches now surface as EBUSY so apps
+        // can distinguish "someone else holds the file" from real
+        // I/O failure. Without this mapping the lease conflict
+        // looked like an EIO and was indistinguishable from a
+        // storage outage.
+        libc::EBUSY
     } else {
         libc::EIO
     }
