@@ -30,6 +30,42 @@ fn lease_mode_for_open(flags: i32) -> u8 {
     }
 }
 
+/// BUG-LEASE-3 (coco P0 #3, 2026-06-05) — same shape as ioring's
+/// `evict_revoked_leases`: per-event immediate eviction of held
+/// leases on `LEASE_INVAL_LEASE_REVOKED`. Pre-fix the fuse mount's
+/// invalidation poll loop just logged the event; `held_leases[ino]`
+/// stayed populated until the next `session_heartbeat_loop` tick
+/// returned `NotHeld` (up to 5 s later). Inside that window a Write
+/// request via `FsRequest::Write` continued to flow through because
+/// the dispatcher doesn't (yet) consult held_leases on the write
+/// path — but the manager-state-vs-mount-state divergence still
+/// means a subsequent Close fires a phantom `ReleaseLease` against
+/// a lease the manager has already revoked, which the manager turns
+/// into `NotHeld` (benign) but tells the operator we lost
+/// bookkeeping coherence.
+///
+/// Post-fix: `LeaseRevoked` for any non-zero ino immediately
+/// removes `held_leases[ino]`. Returns the evicted inos so the
+/// caller can do a best-effort `lease::release` (idempotent on
+/// the manager side).
+///
+/// `WriterClosed` / `WillRevokeIn` / overflow sentinel do NOT
+/// evict — same semantics as the ioring fn.
+pub fn evict_revoked_held_leases(
+    events: &[autumn_rpc::manager_rpc::MgrInvalidation],
+    held_leases: &mut std::collections::HashMap<u64, crate::state::FuseLease>,
+) -> Vec<u64> {
+    let mut evicted: Vec<u64> = Vec::new();
+    for ev in events {
+        if ev.kind == autumn_rpc::manager_rpc::LEASE_INVAL_LEASE_REVOKED && ev.ino != 0 {
+            if held_leases.remove(&ev.ino).is_some() {
+                evicted.push(ev.ino);
+            }
+        }
+    }
+    evicted
+}
+
 /// F-fuse-lease-2: callback the per-mount invalidation poll loop
 /// runs for every per-ino `WriterClosed` / `LeaseRevoked` event.
 /// In production this is `notifier.inval_inode(ino, 0, 0)` against
@@ -151,6 +187,25 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
                     // unit-testable without booting a cluster.
                     if let Some(inv) = &invalidator_p {
                         invalidate_kernel_cache_for_events(&events, inv);
+                    }
+                    // BUG-LEASE-3 (coco P0 #3, 2026-06-05): per-event
+                    // immediate eviction on LeaseRevoked. Matches the
+                    // ioring fix; same window of unauthorized writes
+                    // existed here pre-fix.
+                    let evicted_inos = {
+                        let mut held_mut = held_p.borrow_mut();
+                        evict_revoked_held_leases(&events, &mut held_mut)
+                    };
+                    for ino in &evicted_inos {
+                        if let Err(e) =
+                            autumn_client::lease::release(&cluster_p, &id_p, *ino).await
+                        {
+                            tracing::warn!(
+                                ino = *ino,
+                                error = %e,
+                                "BUG-LEASE-3: best-effort release after fuse-side eviction"
+                            );
+                        }
                     }
                     if wholesale {
                         tracing::warn!(
@@ -829,5 +884,92 @@ mod f_fuse_lease_2_unit_tests {
             &inv,
         );
         assert_eq!(*log.borrow(), vec![55]);
+    }
+}
+
+#[cfg(test)]
+mod bug_lease_3_fuse_tests {
+    //! BUG-LEASE-3 (coco P0 #3, 2026-06-05) — fuse-side unit tests
+    //! for the per-event eviction contract. Mirrors the ioring
+    //! daemon's `bug_lease_3_tests`. Default-CI.
+
+    use super::evict_revoked_held_leases;
+    use crate::state::FuseLease;
+    use autumn_rpc::manager_rpc::{
+        MgrInvalidation, LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_META_CHANGED,
+        LEASE_INVAL_WILL_REVOKE_IN, LEASE_INVAL_WRITER_CLOSED, LEASE_MODE_READ, LEASE_MODE_WRITE,
+    };
+    use std::collections::HashMap;
+
+    fn ev(ino: u64, version: u64, kind: u8) -> MgrInvalidation {
+        MgrInvalidation { ino, version, kind }
+    }
+
+    fn lease(mode: u8) -> FuseLease {
+        FuseLease {
+            mode,
+            refcount: 1,
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn lease_revoked_evicts_held_lease() {
+        let mut held = HashMap::new();
+        held.insert(42, lease(LEASE_MODE_WRITE));
+        held.insert(99, lease(LEASE_MODE_READ));
+        let evicted = evict_revoked_held_leases(
+            &[ev(42, 6, LEASE_INVAL_LEASE_REVOKED)],
+            &mut held,
+        );
+        assert_eq!(evicted, vec![42]);
+        assert!(!held.contains_key(&42));
+        assert!(held.contains_key(&99));
+    }
+
+    #[test]
+    fn writer_closed_does_not_evict() {
+        let mut held = HashMap::new();
+        held.insert(42, lease(LEASE_MODE_READ));
+        let evicted = evict_revoked_held_leases(
+            &[ev(42, 6, LEASE_INVAL_WRITER_CLOSED)],
+            &mut held,
+        );
+        assert!(evicted.is_empty());
+        assert!(held.contains_key(&42));
+    }
+
+    #[test]
+    fn will_revoke_in_does_not_evict() {
+        let mut held = HashMap::new();
+        held.insert(42, lease(LEASE_MODE_WRITE));
+        let evicted = evict_revoked_held_leases(
+            &[ev(42, 5000, LEASE_INVAL_WILL_REVOKE_IN)],
+            &mut held,
+        );
+        assert!(evicted.is_empty());
+        assert!(held.contains_key(&42));
+    }
+
+    #[test]
+    fn ino_zero_overflow_sentinel_does_not_evict() {
+        let mut held = HashMap::new();
+        held.insert(42, lease(LEASE_MODE_WRITE));
+        let evicted = evict_revoked_held_leases(
+            &[ev(0, 0, LEASE_INVAL_META_CHANGED)],
+            &mut held,
+        );
+        assert!(evicted.is_empty());
+        assert!(held.contains_key(&42));
+    }
+
+    #[test]
+    fn revoked_for_ino_we_dont_hold_is_a_noop() {
+        let mut held = HashMap::new();
+        let evicted = evict_revoked_held_leases(
+            &[ev(999, 1, LEASE_INVAL_LEASE_REVOKED)],
+            &mut held,
+        );
+        assert!(evicted.is_empty());
     }
 }

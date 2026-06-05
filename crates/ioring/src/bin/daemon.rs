@@ -917,6 +917,244 @@ struct SessionLease {
     version: u64,
 }
 
+/// BUG-LEASE-3 (coco P0 #3, 2026-06-05) — pure-fn extracted from
+/// `session_invalidation_poll_loop` so the "per-event ⇒ immediate
+/// `held_leases` + `ring_fds` eviction on `LEASE_INVAL_LEASE_REVOKED`"
+/// contract is unit-testable and the regression can be caught in
+/// default CI without booting the daemon binary.
+///
+/// Pre-fix behaviour: the poll loop only logged the event and
+/// updated `invalidations[ino]` floor; `held_leases[ino]` stayed
+/// populated until the next `session_heartbeat_loop` tick returned
+/// `NotHeld` (up to 5s later). Inside that window every Write SQE
+/// passed the local `mode_ok` check and called `fuse_write::write_into`
+/// — unauthorized writes from a session whose lease the manager had
+/// already revoked.
+///
+/// Post-fix: `LEASE_INVAL_LEASE_REVOKED` for any non-zero `ino`
+/// immediately removes `held_leases[ino]` AND every `ring_fds`
+/// entry whose `OpenedExtents.ino == ino`. Subsequent Write SQEs
+/// on those fds fail `EBADF` at the `ring_fds.get(&sqe.ring_fd)`
+/// lookup; Read SQEs likewise. Returns the list of inos that were
+/// evicted so the caller can do a best-effort `lease::release`
+/// (eviction without manager-side notification keeps a phantom
+/// claim alive until TTL).
+///
+/// `LEASE_INVAL_WRITER_CLOSED` does NOT evict — that event means
+/// "another writer closed; your read-lease is still valid but your
+/// cached extent map is stale." F-ioring-lease-4's `invalidations`
+/// floor handles cache staleness; the held read lease stays.
+///
+/// `LEASE_INVAL_WILL_REVOKE_IN` likewise does NOT evict — peer
+/// gave us a grace window to flush + voluntarily release. Auto-
+/// flush + release is a separate follow-up (deferred from
+/// F-lease-preempt).
+///
+/// `LEASE_INVAL_META_CHANGED` with `ino == 0` is the overflow
+/// sentinel handled by the wholesale-clear branch above, not here.
+fn evict_revoked_leases(
+    events: &[autumn_rpc::manager_rpc::MgrInvalidation],
+    held_leases: &mut HashMap<u64, SessionLease>,
+    ring_fds: &mut HashMap<u32, OpenedExtents>,
+) -> Vec<u64> {
+    let mut evicted: Vec<u64> = Vec::new();
+    for ev in events {
+        if ev.kind == LEASE_INVAL_LEASE_REVOKED && ev.ino != 0 {
+            if held_leases.remove(&ev.ino).is_some() {
+                evicted.push(ev.ino);
+            }
+            // Even if held_leases didn't contain ev.ino (e.g. the
+            // refcount already dropped to 0 between revoke push
+            // and poll arrival), still drop any stale ring_fds.
+            ring_fds.retain(|_, o| o.ino != ev.ino);
+        }
+    }
+    evicted
+}
+
+#[cfg(test)]
+mod bug_lease_3_tests {
+    //! BUG-LEASE-3 (coco P0 #3, 2026-06-05) — unit tests for the
+    //! per-event eviction contract. Runs in default `cargo test`.
+
+    use super::*;
+    use autumn_rpc::manager_rpc::{
+        MgrInvalidation, LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_META_CHANGED,
+        LEASE_INVAL_WILL_REVOKE_IN, LEASE_INVAL_WRITER_CLOSED, LEASE_MODE_WRITE,
+    };
+
+    fn ev(ino: u64, version: u64, kind: u8) -> MgrInvalidation {
+        MgrInvalidation { ino, version, kind }
+    }
+
+    fn lease(mode: u8) -> SessionLease {
+        SessionLease {
+            mode,
+            refcount: 1,
+            version: 1,
+        }
+    }
+
+    fn fd(ino: u64) -> OpenedExtents {
+        OpenedExtents {
+            ino,
+            size: 0,
+            extents: vec![],
+            lease_version: 0,
+        }
+    }
+
+    #[test]
+    fn lease_revoked_evicts_held_leases_and_matching_ring_fds() {
+        let mut held = HashMap::new();
+        held.insert(42, lease(LEASE_MODE_WRITE));
+        let mut ring_fds = HashMap::new();
+        ring_fds.insert(7, fd(42));
+        ring_fds.insert(8, fd(99)); // different ino — must survive
+
+        let evicted = evict_revoked_leases(
+            &[ev(42, 6, LEASE_INVAL_LEASE_REVOKED)],
+            &mut held,
+            &mut ring_fds,
+        );
+
+        assert_eq!(evicted, vec![42]);
+        assert!(
+            !held.contains_key(&42),
+            "BUG-LEASE-3: held_leases must be cleared on LeaseRevoked"
+        );
+        assert!(
+            !ring_fds.contains_key(&7),
+            "BUG-LEASE-3: ring_fd for evicted ino must be cleared (subsequent ops EBADF)"
+        );
+        assert!(
+            ring_fds.contains_key(&8),
+            "ring_fd for OTHER inos must NOT be touched"
+        );
+    }
+
+    #[test]
+    fn writer_closed_does_not_evict_held_lease_or_ring_fd() {
+        // WriterClosed = "another writer closed". Our READ lease is
+        // still valid; cache staleness is handled by the
+        // `invalidations` floor + F-ioring-lease-4 reload_extents.
+        let mut held = HashMap::new();
+        held.insert(42, lease(LEASE_MODE_READ));
+        let mut ring_fds = HashMap::new();
+        ring_fds.insert(7, fd(42));
+
+        let evicted = evict_revoked_leases(
+            &[ev(42, 6, LEASE_INVAL_WRITER_CLOSED)],
+            &mut held,
+            &mut ring_fds,
+        );
+
+        assert!(evicted.is_empty(), "WriterClosed must NOT evict");
+        assert!(held.contains_key(&42));
+        assert!(ring_fds.contains_key(&7));
+    }
+
+    #[test]
+    fn will_revoke_in_does_not_evict() {
+        // Grace window in progress; eviction-or-flush is the caller's
+        // policy (today: log + WARN; auto-flush deferred).
+        let mut held = HashMap::new();
+        held.insert(42, lease(LEASE_MODE_WRITE));
+        let mut ring_fds = HashMap::new();
+        ring_fds.insert(7, fd(42));
+
+        let evicted = evict_revoked_leases(
+            &[ev(42, 5000, LEASE_INVAL_WILL_REVOKE_IN)],
+            &mut held,
+            &mut ring_fds,
+        );
+        assert!(evicted.is_empty());
+        assert!(held.contains_key(&42));
+        assert!(ring_fds.contains_key(&7));
+    }
+
+    #[test]
+    fn ino_zero_overflow_sentinel_does_not_evict() {
+        // ino=0 is the wholesale-overflow sentinel; the wholesale
+        // branch in spawn_lease_background_tasks handles it
+        // separately. Per-ino evict MUST NOT touch held_leases on
+        // ino=0 or it'd race with the wholesale path's drained list.
+        let mut held = HashMap::new();
+        held.insert(42, lease(LEASE_MODE_WRITE));
+        let mut ring_fds = HashMap::new();
+        ring_fds.insert(7, fd(42));
+
+        let evicted = evict_revoked_leases(
+            &[ev(0, 0, LEASE_INVAL_META_CHANGED)],
+            &mut held,
+            &mut ring_fds,
+        );
+        assert!(evicted.is_empty());
+        assert!(held.contains_key(&42));
+        assert!(ring_fds.contains_key(&7));
+    }
+
+    #[test]
+    fn multiple_revoked_events_evict_each_distinct_ino() {
+        let mut held = HashMap::new();
+        held.insert(42, lease(LEASE_MODE_WRITE));
+        held.insert(43, lease(LEASE_MODE_READ));
+        held.insert(44, lease(LEASE_MODE_WRITE));
+        let mut ring_fds = HashMap::new();
+        ring_fds.insert(7, fd(42));
+        ring_fds.insert(8, fd(43));
+        ring_fds.insert(9, fd(44));
+
+        let evicted = evict_revoked_leases(
+            &[
+                ev(42, 6, LEASE_INVAL_LEASE_REVOKED),
+                ev(44, 8, LEASE_INVAL_LEASE_REVOKED),
+            ],
+            &mut held,
+            &mut ring_fds,
+        );
+
+        let evicted_set: std::collections::BTreeSet<u64> = evicted.into_iter().collect();
+        assert_eq!(evicted_set, [42u64, 44].into());
+        assert!(!held.contains_key(&42));
+        assert!(held.contains_key(&43), "ino 43 not in events: must stay");
+        assert!(!held.contains_key(&44));
+        assert!(!ring_fds.contains_key(&7));
+        assert!(ring_fds.contains_key(&8));
+        assert!(!ring_fds.contains_key(&9));
+    }
+
+    #[test]
+    fn revoked_event_for_ino_we_dont_hold_is_a_noop() {
+        let mut held = HashMap::new();
+        let mut ring_fds = HashMap::new();
+        let evicted = evict_revoked_leases(
+            &[ev(999, 1, LEASE_INVAL_LEASE_REVOKED)],
+            &mut held,
+            &mut ring_fds,
+        );
+        assert!(evicted.is_empty());
+    }
+
+    #[test]
+    fn revoked_for_held_lease_with_stale_ring_fds_still_clears_ring_fds() {
+        // Defensive: held_leases entry already dropped (refcount→0
+        // between revoke push and poll arrival) but ring_fds is
+        // stale; we still want the ring_fds eviction.
+        let mut held = HashMap::new();
+        let mut ring_fds = HashMap::new();
+        ring_fds.insert(7, fd(42));
+        let evicted = evict_revoked_leases(
+            &[ev(42, 5, LEASE_INVAL_LEASE_REVOKED)],
+            &mut held,
+            &mut ring_fds,
+        );
+        // No held entry to remove, but ring_fds still cleaned.
+        assert!(evicted.is_empty());
+        assert!(!ring_fds.contains_key(&7));
+    }
+}
+
 /// Per-session heartbeat task. Walks every held lease every
 /// `HEARTBEAT_INTERVAL` (~5s under the 30s default TTL — 6× safety
 /// factor) and renews. On `HeartbeatResult::NotHeld` the entry +
@@ -960,6 +1198,37 @@ async fn session_invalidation_poll_loop(
                     let mut inv = invalidations.borrow_mut();
                     apply_invalidation(&events, &mut inv)
                 };
+                // BUG-LEASE-3 (coco P0 #3, 2026-06-05): per-event
+                // immediate eviction of held leases on LeaseRevoked.
+                // Without this, an in-flight Write SQE submitted
+                // between the manager's revoke push and the next
+                // heartbeat tick (up to 5 s later) passes mode_ok and
+                // calls fuse_write::write_into despite the lease
+                // being revoked.
+                let evicted_inos = {
+                    let mut held_mut = held_leases.borrow_mut();
+                    let mut fds_mut = ring_fds.borrow_mut();
+                    evict_revoked_leases(&events, &mut held_mut, &mut fds_mut)
+                };
+                // Best-effort release for evicted inos so the
+                // manager's lease-state doesn't carry a phantom
+                // claim until TTL. (We DID hold these leases before
+                // the revoke push reached us; the manager's
+                // bookkeeping already cleared its writer slot when
+                // the revoke fired, so this is mostly idempotent —
+                // but we send it anyway for symmetry with the
+                // wholesale-clear path.)
+                for ino in &evicted_inos {
+                    if let Err(e) =
+                        lease::release(&cluster, &client_id, *ino).await
+                    {
+                        tracing::warn!(
+                            ino = *ino,
+                            error = %e,
+                            "BUG-LEASE-3: best-effort release after eviction"
+                        );
+                    }
+                }
                 for ev in &events {
                     match ev.kind {
                         LEASE_INVAL_META_CHANGED if ev.ino == 0 => {
@@ -975,10 +1244,10 @@ async fn session_invalidation_poll_loop(
                             );
                         }
                         LEASE_INVAL_LEASE_REVOKED => {
-                            tracing::info!(
+                            tracing::warn!(
                                 ino = ev.ino,
                                 version = ev.version,
-                                "invalidation: lease revoked"
+                                "invalidation: lease revoked (held_leases + ring_fds evicted)"
                             );
                         }
                         LEASE_INVAL_WILL_REVOKE_IN => {

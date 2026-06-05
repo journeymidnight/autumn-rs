@@ -5030,16 +5030,45 @@ gaps in the lease protocol's correctness story.
   updates `invalidations[ino]` floor + logs the event;
   `held_leases[ino]` stays populated. Next `Write` SQE passes
   the local `mode_ok` check and calls `fuse_write::write_into`.
-  Eviction is deferred to the next `session_heartbeat_loop`
+  Eviction was deferred to the next `session_heartbeat_loop`
   tick (5s) returning `NotHeld`. **Window: up to 5s of
   unauthorized writes from a session whose lease the manager
-  has already revoked.**
-- **Status:** PENDING. Fix: on `LEASE_INVAL_LEASE_REVOKED`
-  (and force-revoke = same kind code), the poll loop should
-  immediately `held_leases.borrow_mut().remove(&ev.ino)` AND
-  walk `ring_fds.retain(|_, o| o.ino != ev.ino)` so subsequent
-  ops surface EBADF. Reproduce-first.
-- **passes:** not_completed (next)
+  has already revoked.** Same gap existed in the fuse mount's
+  invalidation poll loop.
+- **Reproduction:**
+  - Unit (pure-fn, default CI):
+    `crates/ioring/src/bin/daemon.rs::bug_lease_3_tests`
+    (7 tests) + `crates/fuse/src/dispatch.rs::bug_lease_3_fuse_tests`
+    (5 tests) cover the eviction contract — `LeaseRevoked`
+    evicts; `WriterClosed` / `WillRevokeIn` / overflow sentinel
+    do NOT; ino=0 sentinel is filtered.
+  - Wire e2e: `crates/manager/tests/bug_lease_3_revoke_evicts.rs`
+    drives a writer + preempter through a real `acquire_with_preempt_wait`
+    cycle, asserts the LeaseRevoked event actually carries the
+    expected kind+ino, and verifies the eviction helper clears
+    the writer's `held_leases` entry on the very next poll
+    response.
+- **Fix:** new pure-fns
+  `daemon.rs::evict_revoked_leases(events, &mut held_leases, &mut ring_fds) -> Vec<u64>`
+  (ioring) and
+  `dispatch.rs::evict_revoked_held_leases(events, &mut held_leases) -> Vec<u64>`
+  (fuse). Each session's invalidation poll loop calls the
+  matching helper IMMEDIATELY after `apply_invalidation`, then
+  fires best-effort `lease::release` for each evicted ino. Side
+  effects: subsequent Read/Write SQEs against revoked inos in
+  ioring fail `libc::EBADF` at the `ring_fds.get` lookup; same
+  for fuse since the cached `InodeState` Open path will see
+  no held_leases entry and re-AcquireLease (which now correctly
+  reflects the manager's post-revoke state).
+- **Why `WriterClosed` does NOT evict:** a reader holding a
+  READ lease whose target was just closed by another writer
+  retains its valid READ lease. F-ioring-lease-4's `invalidations`
+  floor handles cache staleness (extent reload on next Read);
+  the lease itself remains.
+- **Why `WillRevokeIn` does NOT evict:** the manager gave us a
+  grace window to flush + voluntarily release. Auto-flush + auto-
+  release is a separate follow-up deferred from F-lease-preempt.
+- **passes:** completed (2026-06-06)
 
 ### BUG-LEASE-4 (P1 #4) — force-revoke persistence-failed phantom revoke
 
