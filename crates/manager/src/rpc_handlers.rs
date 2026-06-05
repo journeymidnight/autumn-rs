@@ -4655,13 +4655,17 @@ impl AutumnManager {
     pub async fn handle_heartbeat_lease(&self, payload: Bytes) -> HandlerResult {
         let req: HeartbeatLeaseReq = rkyv_decode(&payload)
             .map_err(|e| (StatusCode::InvalidArgument, format!("decode: {e}")))?;
-        // Heartbeats don't write etcd directly — the writer's
-        // `expires_at` in the persisted record is refreshed lazily,
-        // i.e. on the next AcquireLease or by the next failover
-        // (writer must re-acquire after a failover regardless).
-        // Heartbeat is therefore safe to serve on a follower IF we
-        // ever decide to; current design is leader-only to avoid
-        // serving stale state.
+        // BUG-LEASE-1 (coco P0 #1, 2026-06-05): heartbeat MUST
+        // refresh the persisted `MgrInodeLeaseRecord.expires_at`
+        // for WRITER leases. Pre-fix the in-memory `writer_expires_at`
+        // moved forward but etcd's record stayed at the original
+        // acquire-time deadline — a manager failover would then
+        // replay the stale deadline and a writer that had been
+        // heartbeating happily for minutes could be erroneously
+        // revoked the moment the new leader came up. Reader leases
+        // aren't persisted (plan §6.4: subscribe-disconnect =
+        // invalidate everything), so reader heartbeats don't write
+        // etcd.
         if self.etcd.is_some() && !self.leader.get() {
             return Ok(rkyv_encode(&HeartbeatLeaseResp {
                 code: CODE_NOT_LEADER,
@@ -4680,16 +4684,65 @@ impl AutumnManager {
                 version,
                 writer_present,
                 ttl_secs,
-            } => Ok(rkyv_encode(&HeartbeatLeaseResp {
-                code: CODE_OK,
-                message: String::new(),
-                lease: Some(MgrInodeLeaseInfo {
-                    ino: req.ino,
-                    version,
-                    writer_present,
-                    ttl_secs,
-                }),
-            })),
+            } => {
+                // BUG-LEASE-1 fix: if THIS client is the writer
+                // (we are — heartbeat succeeded AND a writer holds
+                // the slot AND it's us), refresh the persisted
+                // record so failover replay sees the updated
+                // deadline. Other shapes (reader heartbeat,
+                // writer-not-me cases) leave etcd alone.
+                if writer_present {
+                    let is_writer = {
+                        let reg = self.inode_leases.borrow();
+                        let me = crate::inode_lease::ClientKey::from_wire(&req.client);
+                        reg.inodes
+                            .get(&req.ino)
+                            .and_then(|s| s.writer.as_ref().map(|w| w == &me))
+                            .unwrap_or(false)
+                    };
+                    if is_writer {
+                        let record = self
+                            .inode_leases
+                            .borrow()
+                            .writer_record(req.ino)
+                            .expect("writer just heartbeated successfully");
+                        let key = format!("{}{}", crate::INODE_LEASES_PREFIX, req.ino);
+                        let value = rkyv_encode(&record).to_vec();
+                        if let Some(etcd) = &self.etcd {
+                            // Best-effort: if the write fails the
+                            // in-memory deadline is still good
+                            // until the next heartbeat retries.
+                            // We do NOT bubble the error up
+                            // because heartbeat success is a
+                            // liveness signal — the writer
+                            // shouldn't lose its lease just
+                            // because of a transient etcd hiccup.
+                            // Failover-window risk is bounded by
+                            // the 5s heartbeat cadence × 6 = 30s
+                            // TTL — same as the pre-fix worst case,
+                            // and the next successful heartbeat
+                            // closes the gap.
+                            if let Err(e) = etcd.put_msgs_txn(vec![(key, value)]).await {
+                                tracing::warn!(
+                                    ino = req.ino,
+                                    error = %e,
+                                    "BUG-LEASE-1: heartbeat etcd refresh failed; retry on next heartbeat"
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(rkyv_encode(&HeartbeatLeaseResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    lease: Some(MgrInodeLeaseInfo {
+                        ino: req.ino,
+                        version,
+                        writer_present,
+                        ttl_secs,
+                    }),
+                }))
+            }
             crate::inode_lease::HeartbeatOutcome::NotHeld => {
                 Ok(rkyv_encode(&HeartbeatLeaseResp {
                     code: CODE_NOT_FOUND,

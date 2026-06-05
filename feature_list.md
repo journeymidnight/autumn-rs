@@ -4953,3 +4953,173 @@ subscribe to invalidation pushes.
   per-session held_leases.release interplay with in-flight
   writes; tractable but its own commit.
 - **passes:** completed (2026-06-05)
+
+---
+
+## P15 — Lease subsystem audit (coco arch review 2026-06-05)
+
+coco GPT-5.5 arch review surfaced 8 findings (3 P0, 2 P1, 3 P2)
+across the full lease subsystem (manager + client + fuse + ioring).
+Each is tracked as a BUG-LEASE-N entry, reproduce-first, with the
+fix gated on a failing test. Cluster chaos run with seed=42 / 60s
+showed 0 data loss + 0 wedged partitions on the pre-fix tree, so
+none of these is a flaming-house emergency, but they're all real
+gaps in the lease protocol's correctness story.
+
+### BUG-LEASE-1 (P0 #1) — heartbeat doesn't refresh etcd `expires_at`
+
+- **Source:** coco arch review 2026-06-05, P0 #1.
+- **Symptom:** writer A heartbeats every 5s; in-memory deadline
+  moves forward as expected, but the persisted
+  `MgrInodeLeaseRecord.expires_at` in etcd stays at the
+  acquire-time value. Manager leader failover → new leader's
+  `replay_from_etcd` reads the stale deadline; if wall-clock has
+  moved past it, the next `inode_lease_revoke_loop` tick (1s)
+  revokes a still-active writer → fans `LeaseRevoked` to readers
+  → in the absence of storage-layer fencing (BUG-LEASE-2),
+  another client can now write into the same inode while the
+  original writer is mid-flight.
+- **Reproduction:** `crates/manager/tests/bug_lease_1_heartbeat_etcd_refresh.rs::p0_1_heartbeat_persists_etcd_expires_at`
+  (`#[ignore]`'d, requires embedded etcd). Acquires a writer
+  lease, sleeps 3s, heartbeats 3×, reads the etcd record back
+  directly. Pre-fix: `expires_at` delta = 0s. Post-fix:
+  `expires_at` delta ≥ 3s.
+- **Fix:** `handle_heartbeat_lease` (`rpc_handlers.rs`) now
+  detects "this client IS the writer" (writer_present + ClientKey
+  match) and writes the refreshed `MgrInodeLeaseRecord` to etcd
+  via `put_msgs_txn` (F149-fenced). Reader heartbeats and
+  writer-not-me cases leave etcd alone. Etcd-write failure is
+  best-effort logged: the in-memory deadline is good until the
+  next heartbeat retries, and the worst-case failover window is
+  bounded by `lease_ttl - heartbeat_interval = 30s - 5s = 25s` —
+  same as the pre-fix worst case.
+- **Why best-effort on etcd-write:** heartbeat success is a
+  liveness signal. Bubbling an etcd error would cause the writer
+  client to think it lost its lease (NotHeld semantics) and
+  prematurely release, which is strictly worse than a stale etcd
+  record that the next successful heartbeat closes.
+- **passes:** completed (2026-06-06)
+
+### BUG-LEASE-2 (P0 #2) — storage-layer fencing token
+
+- **Source:** coco arch review 2026-06-05, P0 #2 +
+  recommendation #1.
+- **Symptom:** PS write requests (`PutReq` / `PutZcReq`) don't
+  carry the lease epoch; partition-server has no way to reject
+  a write that comes from a writer the manager has already
+  revoked. So during a `LeaseRevoked` push window — or after
+  any TTL-revoke / force-revoke — the previous writer's
+  in-flight RPCs can still land at the PS, mingling with the
+  new writer's first writes.
+- **Status:** ARCHITECTURAL, deferred to its own commit.
+  Requires (a) wire change to `PutReq` / `PutZcReq` / `GetReq`
+  adding `lease_epoch: u64` (same-commit deploy per project
+  convention), (b) PS-side persistence of the per-inode epoch
+  floor under a system key prefix (`[0x05][ino BE] → epoch
+  u64`) so it survives PS restart, (c) AcquireLease response
+  already carries `MgrInodeLeaseInfo.version` which can double
+  as the epoch (single monotonic counter, single source of
+  truth = manager). Estimated ~300 lines + e2e test.
+- **passes:** not_completed (deferred — design recorded; pick up
+  separately)
+
+### BUG-LEASE-3 (P0 #3) — `LeaseRevoked` doesn't immediately clear `held_leases`
+
+- **Source:** coco arch review 2026-06-05, P0 #3.
+- **Symptom:** ioring's `session_invalidation_poll_loop` only
+  updates `invalidations[ino]` floor + logs the event;
+  `held_leases[ino]` stays populated. Next `Write` SQE passes
+  the local `mode_ok` check and calls `fuse_write::write_into`.
+  Eviction is deferred to the next `session_heartbeat_loop`
+  tick (5s) returning `NotHeld`. **Window: up to 5s of
+  unauthorized writes from a session whose lease the manager
+  has already revoked.**
+- **Status:** PENDING. Fix: on `LEASE_INVAL_LEASE_REVOKED`
+  (and force-revoke = same kind code), the poll loop should
+  immediately `held_leases.borrow_mut().remove(&ev.ino)` AND
+  walk `ring_fds.retain(|_, o| o.ino != ev.ino)` so subsequent
+  ops surface EBADF. Reproduce-first.
+- **passes:** not_completed (next)
+
+### BUG-LEASE-4 (P1 #4) — force-revoke persistence-failed phantom revoke
+
+- **Source:** coco arch review 2026-06-05, P1 #4.
+- **Symptom:** `acquire_with_force`'s grace-expired branch
+  bumps version + clears writer slot + pushes `LeaseRevoked`
+  to deposed writer + readers IN MEMORY, then the handler
+  writes the new writer record to etcd. If the etcd write
+  fails, `revert_writer_acquire` restores writer/host/deadline
+  but **does NOT** rewind the version bump or the queued
+  `LeaseRevoked` events. Result: phantom version bump + ghost
+  invalidations against a writer who was never actually
+  preempted.
+- **Status:** PENDING. Fix options: (a) two-phase commit
+  (prepare decision → persist → commit memory + push), (b)
+  full snapshot rollback that also rewinds version +
+  `last_version` + inbox tail pointer. Reproduce-first.
+- **passes:** not_completed
+
+### BUG-LEASE-5 (P1 #5) — TTL revoke etcd-delete failure has no retry queue
+
+- **Source:** coco arch review 2026-06-05, P1 #5.
+- **Symptom:** `inode_lease_revoke_loop` clears the writer in
+  memory + bumps version + pushes `LeaseRevoked` FIRST, then
+  attempts to delete `inode_leases/<ino>` from etcd. If the
+  etcd delete fails it logs `warn!` and continues. Comment says
+  "retry next tick" but **the next tick won't include this ino**
+  (its writer is gone from memory → not in `revoked_writers`).
+  Failover replay sees the stale etcd record → resurrects the
+  revoked writer.
+- **Status:** PENDING. Fix: pattern after F210-G2 — on
+  etcd-delete failure, persist `inode_lease_revoke_retry/<ino>`
+  marker + drain it in a dedicated 1-minute loop with
+  exponential backoff. Reproduce-first.
+- **passes:** not_completed
+
+### BUG-LEASE-6 (P2 #7) — `notify_inval_inode` failure isn't fail-closed
+
+- **Source:** coco arch review 2026-06-05, P2 #7.
+  Re-surfaced from F-fuse-lease-2 coco P2 review (was
+  deferred).
+- **Symptom:** `Notifier::inval_inode` returning a non-benign
+  error (kernel doesn't support FUSE_NOTIFY_INVAL_INODE,
+  /dev/fuse write failed, etc.) is logged-and-continued. The
+  kernel may continue serving stale page cache for that ino.
+- **Status:** PENDING. Fix: track failures per-ino in a sticky
+  set; on subsequent open/read for that ino, mark cache
+  unsafe → next-Open forces revalidate / bypass page cache.
+  Reproduce via mock Notifier.
+- **passes:** not_completed
+
+### BUG-LEASE-7 (P2 #8) — FUSE `Open` doesn't bind cached state to lease version
+
+- **Source:** coco arch review 2026-06-05, P2 #8.
+- **Symptom:** Mount A writes + closes → manager bumps
+  version. Mount B re-opens the same inode; if
+  `state.inodes[ino]` already exists, the Open handler ONLY
+  `open_count += 1` — does NOT compare the cached `InodeState`
+  version against the freshly-acquired lease version. Read
+  path then serves from the stale cached meta/extents.
+- **Status:** PENDING. Fix: store `cached_version` on
+  `InodeState`; Open compares against `info.version` from the
+  acquire response; on mismatch clear cache + reload via
+  `get_inode`. Mirror of the ioring F-ioring-lease-5 #1 fix.
+  Read path also consults `invalidations` floor.
+  Reproduce-first.
+- **passes:** not_completed
+
+### BUG-LEASE-8 (P2 #9) — multi-key write has no atomic commit boundary
+
+- **Source:** coco arch review 2026-06-05, P2 #9.
+- **Symptom:** fuse `write::write` writes multiple extent KVs
+  then updates inode meta size/mtime. Crash between extent
+  writes and the inode-meta update leaves: extents written but
+  size unchanged; or partial extents present; or size advanced
+  but missing extents (read as sparse zeros). Lease only
+  handles inter-client coherence; this is INTRA-client crash
+  consistency.
+- **Status:** ARCHITECTURAL, deferred. Pre-existing fuse-layer
+  limitation (predates the lease work). Requires per-inode
+  generation manifest / commit record; recovery needs to GC
+  orphan extents under uncommitted generations.
+- **passes:** not_completed (deferred — design recorded)
