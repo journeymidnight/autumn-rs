@@ -505,6 +505,8 @@ async fn writer_loop(
             value: value.clone(),
             expires_at: 0,
             region_epoch: 0,
+        inode_hint: 0,
+        lease_epoch: 0,
         });
 
         // try_client_for: if partition is transiently unreachable
@@ -1412,6 +1414,8 @@ async fn verify_write_liveness(router: &PsRouter, topo: &Topology) -> Vec<String
                 value,
                 expires_at: 0,
                 region_epoch: 0,
+            inode_hint: 0,
+            lease_epoch: 0,
             });
             // Up to 3 attempts per write to ride out a transient reopen blip.
             for _attempt in 0..3 {

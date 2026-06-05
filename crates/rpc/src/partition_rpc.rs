@@ -225,6 +225,17 @@ pub const CODE_UNAVAILABLE: u8 = 7;
 /// `StatusCode::FailedPrecondition` frame error which routes through
 /// the same SDK refresh path.
 pub const CODE_REGION_EPOCH_STALE: u8 = 8;
+/// BUG-LEASE-2 (coco P0 #2, 2026-06-05) — storage-layer fencing
+/// token: the PS rejects a write whose stamped `lease_epoch` is
+/// strictly LESS than the per-inode floor the PS has already
+/// observed. A client that has been force-revoked or TTL-revoked
+/// by the manager carries an old `lease_epoch`; without this
+/// fence, the ~5s window between revoke push and the client's
+/// `held_leases` eviction (BUG-LEASE-3 closes the user-space
+/// half) could still let a stale writer's RPC land at the PS.
+/// SDK maps this to a typed error so apps can re-AcquireLease
+/// and retry.
+pub const CODE_FENCED: u8 = 9;
 
 // ── Request/Response types ─────────────────────────────────────────────────
 
@@ -242,6 +253,20 @@ pub struct PutReq {
     /// epoch differs (split / merge has happened). `0` = skip check
     /// (bootstrap, tests, legacy paths).
     pub region_epoch: u64,
+    /// BUG-LEASE-2 (coco P0 #2, 2026-06-05) — storage-layer fencing.
+    /// `inode_hint = 0` (the default) means "no fencing for this
+    /// write" (KV CLI, non-lease-aware paths, bootstrap, tests).
+    /// `inode_hint != 0` means "this write logically belongs to
+    /// inode N; please apply per-inode fencing using `lease_epoch`."
+    pub inode_hint: u64,
+    /// BUG-LEASE-2 — monotonic per-inode epoch from the manager
+    /// (`MgrInodeLeaseInfo.version` from the last successful
+    /// AcquireLease). PS rejects with `CODE_FENCED` when
+    /// `inode_hint != 0` AND `lease_epoch < current_floor`. The
+    /// PS also bumps its in-memory floor to
+    /// `max(floor, lease_epoch)` on every accepted write so a
+    /// new writer's first stamped write learns the higher floor.
+    pub lease_epoch: u64,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]

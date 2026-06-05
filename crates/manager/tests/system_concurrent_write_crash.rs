@@ -145,6 +145,8 @@ fn concurrent_writers_during_split() {
 
                             expires_at: 0,
                             region_epoch: 0,
+                        inode_hint: 0,
+                        lease_epoch: 0,
                         }),
                     )
                     .await

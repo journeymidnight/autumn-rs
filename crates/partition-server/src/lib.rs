@@ -862,6 +862,23 @@ pub(crate) struct PartitionData {
     /// tears down the source partition even though its in-memory
     /// state is already correct — a 5-60+ s outage per split.
     pub(crate) opened_with_shared: std::sync::Arc<parking_lot::Mutex<(Range, u64, u64, u64, u64)>>,
+    /// BUG-LEASE-2 (coco P0 #2, 2026-06-05) — Phase 1 storage-layer
+    /// fencing token. Per-inode floor of the highest `lease_epoch`
+    /// this PS has ever accepted a write under. A write whose
+    /// stamped `inode_hint != 0` AND `lease_epoch < floor` is
+    /// rejected with `CODE_FENCED`; on acceptance the floor is
+    /// bumped to `max(floor, lease_epoch)`.
+    ///
+    /// **Phase 1 scope:** IN-MEMORY ONLY. A PS restart wipes the
+    /// floors and the next write per ino warms them from zero.
+    /// During the window between restart and the first write of a
+    /// post-restart writer, an old stale-epoch RPC from a
+    /// previously-revoked writer would slip through. Phase 2
+    /// extends this with WAL persistence (each accepted write
+    /// records the floor alongside the value, replay rebuilds
+    /// the map) — tracked separately, see feature_list.md
+    /// BUG-LEASE-2.
+    pub(crate) fence_floors: RefCell<HashMap<u64, u64>>,
 }
 
 #[derive(Default)]
@@ -4366,6 +4383,8 @@ async fn partition_thread_main(
         vp_refs_dirty: Cell::new(false),
         metrics: metrics_arc.clone(),
         opened_with_shared: opened_with_shared.clone(),
+        // BUG-LEASE-2 Phase 1: in-memory fence floors per ino; restart wipes.
+        fence_floors: RefCell::new(HashMap::new()),
     }));
 
     sync_partition_vp_refs(&part)
@@ -5380,10 +5399,17 @@ async fn handle_incoming_req(
         let p = part.borrow();
         (p.region_epoch, p.part_id)
     };
+    // BUG-LEASE-2 Phase 1: per-partition fence floor map. We pass
+    // the RefCell directly to keep the helper signature simple.
+    // Borrow the outer RefCell briefly to get a stable reference
+    // into the floor map; the enqueue helper does the inner
+    // borrow_mut for the floor check/bump.
+    let part_borrow = part.borrow();
+    let fence_floors_ref: &RefCell<HashMap<u64, u64>> = &part_borrow.fence_floors;
 
     match req.msg_type {
-        MSG_PUT => enqueue_put(req, pending, part_region_epoch, part_id_for_err),
-        MSG_PUT_ZC => enqueue_put_zc(req, pending, part_region_epoch, part_id_for_err),
+        MSG_PUT => enqueue_put(req, pending, part_region_epoch, part_id_for_err, Some(fence_floors_ref)),
+        MSG_PUT_ZC => enqueue_put_zc(req, pending, part_region_epoch, part_id_for_err, Some(fence_floors_ref)),
         MSG_DELETE => enqueue_delete(req, pending, part_region_epoch, part_id_for_err),
         MSG_STREAM_PUT => enqueue_stream_put(req, pending, part_region_epoch, part_id_for_err),
         // F185: freeze stashes its resp oneshot in PartitionData and
@@ -5495,11 +5521,51 @@ async fn handle_incoming_req(
     }
 }
 
+/// BUG-LEASE-2 (coco P0 #2, 2026-06-05) Phase 1 — pure-fn fencing
+/// check + floor bump. Pure so it's unit-testable without booting
+/// the partition server. Mirrors the same shape as the region_epoch
+/// check: `inode_hint == 0` (the default) ⇒ skip fencing entirely
+/// (KV CLI, anonymous writes, bootstrap, tests). Otherwise: floor =
+/// `fence_floors.get(&inode_hint).copied().unwrap_or(0)`, reject if
+/// `stamped_epoch < floor`, else bump floor to
+/// `max(floor, stamped_epoch)` and return Ok.
+///
+/// **Phase 1 limitation:** in-memory only. A PS restart wipes the
+/// floors → a stale-epoch RPC from a previously-revoked writer
+/// would slip through during the post-restart warm-up window.
+/// Phase 2 will persist via WAL.
+pub(crate) fn check_and_bump_fence(
+    inode_hint: u64,
+    stamped_epoch: u64,
+    fence_floors: &mut HashMap<u64, u64>,
+) -> Result<(), String> {
+    if inode_hint == 0 {
+        return Ok(());
+    }
+    let floor = fence_floors.get(&inode_hint).copied().unwrap_or(0);
+    if stamped_epoch < floor {
+        return Err(format!(
+            "BUG-LEASE-2: fenced write ino={} stamped_epoch={} < floor={}",
+            inode_hint, stamped_epoch, floor
+        ));
+    }
+    if stamped_epoch > floor {
+        fence_floors.insert(inode_hint, stamped_epoch);
+    }
+    Ok(())
+}
+
 fn enqueue_put(
     req: PartitionRequest,
     pending: &mut Vec<WriteRequest>,
     part_region_epoch: u64,
     part_id_for_err: u64,
+    // BUG-LEASE-2 Phase 1: per-partition fence floors. `None` =
+    // skip fencing entirely; used by the internal partition-server
+    // unit tests that exercise the enqueue path without a full
+    // PartitionData. Production dispatcher always passes
+    // `Some(&part.borrow().fence_floors)`.
+    fence_floors: Option<&RefCell<HashMap<u64, u64>>>,
 ) {
     match partition_rpc::rkyv_decode::<PutReq>(&req.payload) {
         Ok(put_req) => {
@@ -5512,6 +5578,25 @@ fn enqueue_put(
                     ),
                 )));
                 return;
+            }
+            // BUG-LEASE-2 (Phase 1): storage-layer fencing check.
+            // Reject the write if a higher lease_epoch has already
+            // been seen for this inode — the writer was revoked
+            // and shouldn't be writing anymore. Anonymous writes
+            // (inode_hint == 0) skip the check entirely.
+            if let Some(floors_cell) = fence_floors {
+                if let Err(msg) = {
+                    let mut floors = floors_cell.borrow_mut();
+                    check_and_bump_fence(put_req.inode_hint, put_req.lease_epoch, &mut floors)
+                } {
+                    let resp = PutResp {
+                        code: CODE_FENCED,
+                        message: msg,
+                        key: put_req.key.clone(),
+                    };
+                    let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                    return;
+                }
             }
             // F129: regular `Put` rejects values exceeding the inline
             // cap. Caller should retry via PutBegin/Chunk/Commit.
@@ -5558,6 +5643,13 @@ fn enqueue_put_zc(
     pending: &mut Vec<WriteRequest>,
     part_region_epoch: u64,
     part_id_for_err: u64,
+    // BUG-LEASE-2 Phase 1 placeholder: the ZC framing
+    // (`parse_put_zc_meta`) doesn't yet carry `inode_hint` /
+    // `lease_epoch`. ZC writes are anonymous w.r.t. fencing for now.
+    // Phase 2 will extend `[meta]` to include both fields + a
+    // matching check here. Param threaded so the dispatch call site
+    // is uniform with enqueue_put.
+    _fence_floors: Option<&RefCell<HashMap<u64, u64>>>,
 ) {
     let Some(meta) = partition_rpc::parse_put_zc_meta(&req.payload) else {
         let _ = req.resp_tx.send(Err((
@@ -8409,6 +8501,8 @@ mod merged_loop_tests {
             value: value.to_vec(),
             expires_at,
             region_epoch: 0,
+        inode_hint: 0,
+        lease_epoch: 0,
         };
         let payload = partition_rpc::rkyv_encode(&req);
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -8453,7 +8547,7 @@ mod merged_loop_tests {
         let (req, resp_rx) = build_put_partition_request(b"hello", b"world", 0);
         let mut pending: Vec<WriteRequest> = Vec::new();
         // Test sends epoch=0 on the wire, so 0 here matches and bypasses the check.
-        enqueue_put(req, &mut pending, 0, 0);
+        enqueue_put(req, &mut pending, 0, 0, None);
 
         assert_eq!(pending.len(), 1, "exactly one WriteRequest enqueued");
         let w = pending.pop().unwrap();
@@ -8496,7 +8590,7 @@ mod merged_loop_tests {
         let big_value = vec![0u8; AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize + 1];
         let (req, resp_rx) = build_put_partition_request(b"big-key", &big_value, 0);
         let mut pending: Vec<WriteRequest> = Vec::new();
-        enqueue_put(req, &mut pending, 0, 0);
+        enqueue_put(req, &mut pending, 0, 0, None);
 
         // No WriteRequest queued — the cap fires before pipeline insert.
         assert_eq!(pending.len(), 0, "oversized Put must not enter pipeline");
@@ -8518,7 +8612,7 @@ mod merged_loop_tests {
         let exact_cap_value = vec![0u8; AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize];
         let (req, _resp_rx) = build_put_partition_request(b"k", &exact_cap_value, 0);
         let mut pending: Vec<WriteRequest> = Vec::new();
-        enqueue_put(req, &mut pending, 0, 0);
+        enqueue_put(req, &mut pending, 0, 0, None);
         assert_eq!(pending.len(), 1, "value at exact cap must enqueue normally");
     }
 
@@ -8533,8 +8627,8 @@ mod merged_loop_tests {
         let (d1, rx3) = build_delete_partition_request(b"k3");
 
         let mut pending: Vec<WriteRequest> = Vec::new();
-        enqueue_put(p1, &mut pending, 0, 0);
-        enqueue_put(p2, &mut pending, 0, 0);
+        enqueue_put(p1, &mut pending, 0, 0, None);
+        enqueue_put(p2, &mut pending, 0, 0, None);
         enqueue_delete(d1, &mut pending, 0, 0);
 
         assert_eq!(pending.len(), 3);
@@ -8671,6 +8765,8 @@ mod f099j_tests {
                 value: b"world".to_vec(),
                 expires_at: 0,
                 region_epoch: 0,
+            inode_hint: 0,
+            lease_epoch: 0,
             };
             let payload = partition_rpc::rkyv_encode(&put);
             let frame = Frame::request(42, MSG_PUT, payload);
@@ -8765,6 +8861,8 @@ mod f099j_tests {
                     value,
                     expires_at: 0,
                     region_epoch: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
                 let f = Frame::request(i + 1, MSG_PUT, payload);
@@ -8966,6 +9064,8 @@ mod f099k_tests {
                         value: b"v_n1".to_vec(),
                         expires_at: 0,
                         region_epoch: 0,
+                    inode_hint: 0,
+                    lease_epoch: 0,
                     };
                     let payload = partition_rpc::rkyv_encode(&put);
                     let frame = Frame::request(1, MSG_PUT, payload).encode();
@@ -9051,6 +9151,8 @@ mod f099k_tests {
                             value: format!("v-{o}").into_bytes(),
                             expires_at: 0,
                             region_epoch: 0,
+                        inode_hint: 0,
+                        lease_epoch: 0,
                         };
                         let payload = partition_rpc::rkyv_encode(&put);
                         let f = Frame::request(10, MSG_PUT, payload).encode();
@@ -9087,6 +9189,8 @@ mod f099k_tests {
                             value: b"bogus".to_vec(),
                             expires_at: 0,
                             region_epoch: 0,
+                        inode_hint: 0,
+                        lease_epoch: 0,
                         };
                         let payload = partition_rpc::rkyv_encode(&wrong);
                         let f = Frame::request(11, MSG_PUT, payload).encode();
@@ -9193,6 +9297,8 @@ mod f099i_tests {
                 value: b"v".to_vec(),
                 expires_at: 0,
                 region_epoch: 0,
+            inode_hint: 0,
+            lease_epoch: 0,
             };
             let payload = partition_rpc::rkyv_encode(&put);
             let frame_bytes = Frame::request(77, MSG_PUT, payload).encode();
@@ -9312,6 +9418,8 @@ mod f099i_tests {
                     value: b"v".to_vec(),
                     expires_at: 0,
                     region_epoch: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
                 let f = Frame::request(100 + i, MSG_PUT, payload).encode();
@@ -9494,6 +9602,8 @@ mod f099i_tests {
                             value: b"v".to_vec(),
                             expires_at: 0,
                             region_epoch: 0,
+                        inode_hint: 0,
+                        lease_epoch: 0,
                         };
                         let payload = partition_rpc::rkyv_encode(&put);
                         let f = Frame::request(1000u32 + i, MSG_PUT, payload).encode();
@@ -9629,6 +9739,8 @@ mod f099i_tests {
                     value: b"v".to_vec(),
                     expires_at: 0,
                     region_epoch: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
                 let frame_bytes = Frame::request(5000 + i, MSG_PUT, payload).encode();
@@ -9719,6 +9831,8 @@ mod f099i_tests {
                     value: b"v".to_vec(),
                     expires_at: 0,
                     region_epoch: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
                 };
                 let payload = partition_rpc::rkyv_encode(&put);
                 let f = Frame::request(6000 + i, MSG_PUT, payload).encode();
@@ -10160,5 +10274,101 @@ mod f255_invalidate_plumbing_tests {
                  Receiver."
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod bug_lease_2_fence_tests {
+    //! BUG-LEASE-2 (coco P0 #2, 2026-06-05) Phase 1 — pure-fn unit
+    //! tests for `check_and_bump_fence`. Verifies the floor semantics
+    //! WITHOUT booting a partition server: in-memory map mutation
+    //! against synthetic inputs.
+
+    use super::check_and_bump_fence;
+    use std::collections::HashMap;
+
+    #[test]
+    fn inode_hint_zero_skips_fencing_entirely() {
+        // Anonymous KV CLI / non-lease-aware writes pass through
+        // even with insanely high lease_epoch values. The
+        // fence_floors map MUST not be mutated.
+        let mut floors = HashMap::new();
+        floors.insert(99u64, 1000u64);
+        let r = check_and_bump_fence(0, 999_999, &mut floors);
+        assert!(r.is_ok());
+        assert_eq!(floors.get(&99).copied(), Some(1000), "untouched ino preserved");
+        assert!(!floors.contains_key(&0), "ino=0 MUST NOT be inserted");
+    }
+
+    #[test]
+    fn first_write_for_new_inode_seeds_floor() {
+        let mut floors = HashMap::new();
+        let r = check_and_bump_fence(42, 5, &mut floors);
+        assert!(r.is_ok());
+        assert_eq!(floors.get(&42).copied(), Some(5));
+    }
+
+    #[test]
+    fn higher_epoch_bumps_floor() {
+        let mut floors = HashMap::new();
+        floors.insert(42, 5);
+        let r = check_and_bump_fence(42, 8, &mut floors);
+        assert!(r.is_ok());
+        assert_eq!(floors.get(&42).copied(), Some(8));
+    }
+
+    #[test]
+    fn equal_epoch_passes_without_bumping() {
+        let mut floors = HashMap::new();
+        floors.insert(42, 5);
+        let r = check_and_bump_fence(42, 5, &mut floors);
+        assert!(r.is_ok());
+        assert_eq!(floors.get(&42).copied(), Some(5));
+    }
+
+    #[test]
+    fn lower_epoch_is_fenced() {
+        // The stale-writer scenario: a writer was force-revoked
+        // and a new writer's epoch was higher. The old writer's
+        // late RPC stamped with the old epoch MUST be rejected.
+        let mut floors = HashMap::new();
+        floors.insert(42, 10);
+        let r = check_and_bump_fence(42, 8, &mut floors);
+        match r {
+            Err(msg) => {
+                assert!(msg.contains("fenced"), "msg={msg}");
+                assert!(msg.contains("ino=42"));
+                assert!(msg.contains("stamped_epoch=8"));
+                assert!(msg.contains("floor=10"));
+            }
+            Ok(_) => panic!("BUG-LEASE-2: stamped_epoch < floor MUST fence"),
+        }
+        // Floor MUST NOT be bumped on a rejected write.
+        assert_eq!(floors.get(&42).copied(), Some(10));
+    }
+
+    #[test]
+    fn multiple_inos_have_independent_floors() {
+        let mut floors = HashMap::new();
+        check_and_bump_fence(42, 5, &mut floors).unwrap();
+        check_and_bump_fence(43, 100, &mut floors).unwrap();
+        check_and_bump_fence(44, 1, &mut floors).unwrap();
+        // ino 42 + 44 still low; ino 43 high. Fencing on ino 43
+        // doesn't leak across.
+        assert!(check_and_bump_fence(42, 3, &mut floors).is_err());
+        assert!(check_and_bump_fence(43, 50, &mut floors).is_err());
+        assert!(check_and_bump_fence(44, 1, &mut floors).is_ok());
+    }
+
+    #[test]
+    fn floor_is_monotonic_under_interleaved_acceptances() {
+        // A common reorder under concurrency: writer A's RPC
+        // arrives, writer B's higher-epoch RPC arrives next, then
+        // A's late RPC arrives. The late A MUST be fenced.
+        let mut floors = HashMap::new();
+        check_and_bump_fence(7, 1, &mut floors).unwrap();
+        check_and_bump_fence(7, 2, &mut floors).unwrap();
+        // Late A:
+        assert!(check_and_bump_fence(7, 1, &mut floors).is_err());
     }
 }

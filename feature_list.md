@@ -5004,24 +5004,71 @@ gaps in the lease protocol's correctness story.
 
 - **Source:** coco arch review 2026-06-05, P0 #2 +
   recommendation #1.
-- **Symptom:** PS write requests (`PutReq` / `PutZcReq`) don't
-  carry the lease epoch; partition-server has no way to reject
-  a write that comes from a writer the manager has already
-  revoked. So during a `LeaseRevoked` push window — or after
-  any TTL-revoke / force-revoke — the previous writer's
-  in-flight RPCs can still land at the PS, mingling with the
-  new writer's first writes.
-- **Status:** ARCHITECTURAL, deferred to its own commit.
-  Requires (a) wire change to `PutReq` / `PutZcReq` / `GetReq`
-  adding `lease_epoch: u64` (same-commit deploy per project
-  convention), (b) PS-side persistence of the per-inode epoch
-  floor under a system key prefix (`[0x05][ino BE] → epoch
-  u64`) so it survives PS restart, (c) AcquireLease response
-  already carries `MgrInodeLeaseInfo.version` which can double
-  as the epoch (single monotonic counter, single source of
-  truth = manager). Estimated ~300 lines + e2e test.
-- **passes:** not_completed (deferred — design recorded; pick up
-  separately)
+- **Symptom:** PS write requests didn't carry the lease epoch;
+  partition-server had no way to reject a write from a writer
+  the manager had already revoked. So during the
+  `LeaseRevoked` push window — or after any TTL-revoke /
+  force-revoke — the previous writer's in-flight RPCs could
+  still land at the PS, mingling with the new writer's first
+  writes.
+
+#### Phase 1 (completed 2026-06-06): wire + in-memory fence floor
+
+- **Wire change** (`crates/rpc/src/partition_rpc.rs`):
+  `PutReq` gains `inode_hint: u64` and `lease_epoch: u64`.
+  New response code `CODE_FENCED = 9`. Defaults are `0/0` so
+  every existing caller compiles after a mechanical field
+  addition; `inode_hint == 0` is the explicit
+  "anonymous write — skip fencing" opt-out for KV CLI and
+  non-lease-aware paths.
+- **PS state** (`crates/partition-server/src/lib.rs`):
+  `PartitionData.fence_floors: RefCell<HashMap<u64, u64>>`
+  per partition. Floor = the highest `lease_epoch` accepted
+  for that ino on this PS instance.
+- **Pure-fn** `check_and_bump_fence(inode_hint, stamped_epoch,
+  &mut floors) -> Result<(), String>` — unit-testable; PS
+  invokes via `enqueue_put` before the value-too-large check.
+- **Semantics:** `inode_hint == 0` ⇒ pass-through (no
+  mutation). Else: `floor = floors[ino].unwrap_or(0)`;
+  `stamped < floor` ⇒ `CODE_FENCED`; else accept + bump floor
+  to `max(floor, stamped)`.
+- **Phase 1 known gap (deliberate):** IN-MEMORY ONLY. A PS
+  restart wipes the floors → during the post-restart warm-up
+  window, an old stale-epoch RPC from a previously-revoked
+  writer would slip through. Phase 2 will persist via WAL.
+  Also: `MSG_PUT_ZC` ignores fencing (the ZC framing
+  `parse_put_zc_meta` doesn't yet carry the new fields);
+  Phase 2 extends the meta header.
+- **Reproduction:**
+  - Unit (default CI):
+    `crates/partition-server/src/lib.rs::bug_lease_2_fence_tests`
+    7 tests covering the floor semantics (anonymous bypass,
+    seed/bump/reject, multi-ino independence, monotonic-
+    under-reorder).
+  - Wire e2e (`#[ignore]`):
+    `crates/manager/tests/bug_lease_2_storage_fencing.rs`
+    boots manager + 2 EN + 1 PS, sends seq of Puts with
+    epoch 1 → 5 → 1 (stale) → asserts the stale write is
+    rejected with `CODE_FENCED`. Also covers `inode_hint=0`
+    bypass and per-ino independence.
+- **passes:** completed (2026-06-06, Phase 1 only)
+
+#### Phase 2 (PENDING) — WAL persistence + ZC framing
+
+- WAL persistence: each accepted write records the new floor
+  alongside the value via an existing WAL record path; replay
+  reconstructs the in-memory map on PS restart.
+- ZC framing extension: `parse_put_zc_meta` adds
+  `inode_hint` + `lease_epoch`; `enqueue_put_zc` does the
+  fencing check too.
+- Wire epoch into write paths from autumn-fuse + autumn-ioring:
+  `FuseLease.version` / `SessionLease.version` is stamped on
+  every Put the lease covers. (`inode_hint = ino, lease_epoch =
+  version`.)
+- Reproduction for Phase 2: PS crash-restart during a force-
+  revoke window; old writer's late RPC must still be fenced
+  after restart.
+- **passes:** not_completed (Phase 2 — separate commit)
 
 ### BUG-LEASE-3 (P0 #3) — `LeaseRevoked` doesn't immediately clear `held_leases`
 

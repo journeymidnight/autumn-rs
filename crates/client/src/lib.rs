@@ -878,6 +878,8 @@ impl ClusterClient {
                     value: value.clone(),
                     expires_at,
                     region_epoch,
+                    inode_hint: 0,
+                    lease_epoch: 0,
                 })
             })
             .await?;

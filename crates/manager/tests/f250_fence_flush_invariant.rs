@@ -171,6 +171,8 @@ async fn writer_loop(
                     value: value.clone(),
                     expires_at: 0,
                     region_epoch: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
                 }),
             )
             .await;

@@ -225,6 +225,8 @@ pub async fn ps_put(ps: &RpcClient, part_id: u64, key: &[u8], value: &[u8]) {
         value: value.to_vec(),
         expires_at: 0,
         region_epoch: 0, // test helper: skip epoch check
+        inode_hint: 0,
+        lease_epoch: 0,
     });
     let mut last_err = String::new();
     for _ in 0..30u32 {

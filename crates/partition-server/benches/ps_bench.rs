@@ -260,6 +260,8 @@ fn run_scenario(
 
                                     expires_at: 0,
                                     region_epoch: 0,
+                                inode_hint: 0,
+                                lease_epoch: 0,
                                 };
                                 (MSG_PUT, rkyv_encode(&req))
                             }
@@ -376,6 +378,8 @@ fn warmup(cfg: &Config, target_part: u64, ps_addr: SocketAddr) {
 
                 expires_at: 0,
                 region_epoch: 0,
+            inode_hint: 0,
+            lease_epoch: 0,
             };
             let _ = ps.call(MSG_PUT, rkyv_encode(&req)).await;
         }
@@ -407,6 +411,8 @@ fn seed_read_keys(cfg: &Config, target_part: u64, ps_addr: SocketAddr, count: u6
 
                     expires_at: 0,
                     region_epoch: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
                 };
                 let bytes = rkyv_encode(&req);
                 let ps_clone = ps.clone();
