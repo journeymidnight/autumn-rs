@@ -72,8 +72,8 @@ use autumn_ioring::sqe::{
     Sqe, SQE_LEASE_MODE_READ, SQE_LEASE_MODE_UNSET, SQE_LEASE_MODE_WRITE,
 };
 use autumn_rpc::manager_rpc::{
-    LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_META_CHANGED, LEASE_INVAL_WRITER_CLOSED,
-    LEASE_MODE_READ, LEASE_MODE_WRITE,
+    LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_META_CHANGED, LEASE_INVAL_WILL_REVOKE_IN,
+    LEASE_INVAL_WRITER_CLOSED, LEASE_MODE_READ, LEASE_MODE_WRITE,
 };
 
 #[derive(Parser, Debug, Clone)]
@@ -635,6 +635,14 @@ async fn service_sqe(
                         );
                         return Cqe::err(sqe.user_data, libc::EBUSY);
                     }
+                    Ok(AcquireResult::RevokePending { .. }) => {
+                        // Unreachable for non-force acquire.
+                        // Defensive: surface as EIO so a future
+                        // refactor flipping to acquire_force
+                        // fails loudly.
+                        tracing::error!(ino, "BUG: non-force acquire returned RevokePending");
+                        return Cqe::err(sqe.user_data, libc::EIO);
+                    }
                     Err(e) => {
                         tracing::warn!(ino, error = %e, "AcquireLease failed; EIO");
                         return Cqe::err(sqe.user_data, libc::EIO);
@@ -971,6 +979,19 @@ async fn session_invalidation_poll_loop(
                                 ino = ev.ino,
                                 version = ev.version,
                                 "invalidation: lease revoked"
+                            );
+                        }
+                        LEASE_INVAL_WILL_REVOKE_IN => {
+                            // F-lease-preempt: peer is asking us
+                            // to release. `version` carries the
+                            // grace milliseconds. Writer-side
+                            // auto-flush + voluntary release is a
+                            // follow-up; for now log loud so the
+                            // operator can react manually.
+                            tracing::warn!(
+                                ino = ev.ino,
+                                grace_ms = ev.version,
+                                "F-lease-preempt: WillRevokeIn — flush + release within the grace window or be force-revoked"
                             );
                         }
                         LEASE_INVAL_META_CHANGED => {

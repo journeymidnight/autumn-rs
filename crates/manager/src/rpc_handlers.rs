@@ -4486,7 +4486,7 @@ impl AutumnManager {
         let (pre_snapshot, outcome) = {
             let mut reg = self.inode_leases.borrow_mut();
             let snap = reg.inodes.get(&req.ino).cloned();
-            let out = reg.acquire(&req.client, req.ino, req.mode, now);
+            let out = reg.acquire_with_force(&req.client, req.ino, req.mode, req.force, now);
             (snap, out)
         };
 
@@ -4548,6 +4548,30 @@ impl AutumnManager {
                 code: CODE_INVALID_ARGUMENT,
                 message: format!("invalid lease mode {}", req.mode),
                 lease: None,
+            })),
+            // F-lease-preempt: pre-revocation grace window in
+            // progress. Surface as `CODE_REVOKE_PENDING` with the
+            // remaining milliseconds in `lease.ttl_secs` (we
+            // repurpose this u32 field to carry the eta_ms so the
+            // SDK can sleep precisely; documented on the wire
+            // const). The lease itself is not yet granted —
+            // `writer_present` is true because someone ELSE
+            // holds it.
+            crate::inode_lease::AcquireOutcome::RevokePending {
+                eta_ms,
+                held_by_kind,
+                held_by_host,
+            } => Ok(rkyv_encode(&AcquireLeaseResp {
+                code: CODE_REVOKE_PENDING,
+                message: format!(
+                    "revoke pending: writer held by kind={held_by_kind} host={held_by_host}; retry in {eta_ms}ms"
+                ),
+                lease: Some(MgrInodeLeaseInfo {
+                    ino: req.ino,
+                    version: 0,
+                    writer_present: true,
+                    ttl_secs: eta_ms,
+                }),
             })),
         }
     }

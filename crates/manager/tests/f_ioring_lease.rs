@@ -92,6 +92,7 @@ fn ioring_lease_write_conflict_returns_precondition() {
                 client: w1.clone(),
                 ino: 42,
                 mode: LEASE_MODE_WRITE,
+                force: false,
             },
         )
         .await;
@@ -107,6 +108,7 @@ fn ioring_lease_write_conflict_returns_precondition() {
                 client: w2.clone(),
                 ino: 42,
                 mode: LEASE_MODE_WRITE,
+                force: false,
             },
         )
         .await;
@@ -134,6 +136,7 @@ fn ioring_lease_writer_close_bumps_version_and_reader_polls_event() {
                 client: reader.clone(),
                 ino: 7,
                 mode: LEASE_MODE_READ,
+                force: false,
             },
         )
         .await;
@@ -147,6 +150,7 @@ fn ioring_lease_writer_close_bumps_version_and_reader_polls_event() {
                 client: writer.clone(),
                 ino: 7,
                 mode: LEASE_MODE_WRITE,
+                force: false,
             },
         )
         .await;
@@ -210,6 +214,7 @@ fn ioring_lease_heartbeat_then_release_round_trip() {
                 client: w.clone(),
                 ino: 100,
                 mode: LEASE_MODE_WRITE,
+                force: false,
             },
         )
         .await;

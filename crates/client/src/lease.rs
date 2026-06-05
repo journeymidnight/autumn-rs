@@ -27,8 +27,9 @@ use autumn_rpc::manager_rpc::{
     rkyv_decode, rkyv_encode, AcquireLeaseReq, AcquireLeaseResp, HeartbeatLeaseReq,
     HeartbeatLeaseResp, MgrClientId, MgrInodeLeaseInfo, MgrInvalidation, PollInvalidationsReq,
     PollInvalidationsResp, ReleaseLeaseReq, ReleaseLeaseResp, CODE_NOT_FOUND, CODE_NOT_LEADER,
-    CODE_OK, CODE_PRECONDITION, LEASE_CLIENT_KIND_IORING, LEASE_MODE_READ, LEASE_MODE_WRITE,
-    MSG_ACQUIRE_LEASE, MSG_HEARTBEAT_LEASE, MSG_POLL_INVALIDATIONS, MSG_RELEASE_LEASE,
+    CODE_OK, CODE_PRECONDITION, CODE_REVOKE_PENDING, LEASE_CLIENT_KIND_IORING, LEASE_MODE_READ,
+    LEASE_MODE_WRITE, MSG_ACQUIRE_LEASE, MSG_HEARTBEAT_LEASE, MSG_POLL_INVALIDATIONS,
+    MSG_RELEASE_LEASE,
 };
 
 /// Stable per-runtime daemon identity. Generated once at runtime
@@ -84,6 +85,12 @@ pub enum AcquireResult {
     Granted(MgrInodeLeaseInfo),
     /// Another client holds the writer lease for this inode.
     Conflict { manager_message: String },
+    /// F-lease-preempt: `acquire_force` started (or re-observed) a
+    /// pre-revocation grace window for the held writer. Caller
+    /// should sleep ~`eta_ms` and retry; on retry the writer may
+    /// have voluntarily released (→ `Granted`) or the grace
+    /// may have expired (→ force-revoke + `Granted`).
+    RevokePending { eta_ms: u32, manager_message: String },
 }
 
 /// Result of `heartbeat`. `NotHeld` means the manager has revoked /
@@ -120,6 +127,38 @@ pub async fn acquire(
     ino: u64,
     mode: u8,
 ) -> Result<AcquireResult, LeaseError> {
+    acquire_inner(cluster, client, ino, mode, false).await
+}
+
+/// F-lease-preempt: acquire with the `force` flag. Identical to
+/// `acquire` except: when a different writer is currently held,
+/// the manager pushes `WillRevokeIn` to that writer and returns
+/// `RevokePending { eta_ms }`. Caller sleeps `eta_ms` and retries
+/// (typically via `acquire_with_preempt_wait` which wraps the
+/// retry loop). On retry within the grace window: same
+/// `RevokePending` (or `Granted` if the writer released
+/// voluntarily). After the grace window expires: force-revoke +
+/// `Granted`.
+///
+/// Use `force=true` ONLY when a user-level signal demands
+/// preemption (admin tool, NFSv4-style delegation recall) — the
+/// non-preempt `acquire` is the default for routine open/close.
+pub async fn acquire_force(
+    cluster: &ClusterClient,
+    client: &DaemonClientId,
+    ino: u64,
+    mode: u8,
+) -> Result<AcquireResult, LeaseError> {
+    acquire_inner(cluster, client, ino, mode, true).await
+}
+
+async fn acquire_inner(
+    cluster: &ClusterClient,
+    client: &DaemonClientId,
+    ino: u64,
+    mode: u8,
+    force: bool,
+) -> Result<AcquireResult, LeaseError> {
     debug_assert!(
         mode == LEASE_MODE_READ || mode == LEASE_MODE_WRITE,
         "lease mode must be READ or WRITE"
@@ -128,6 +167,7 @@ pub async fn acquire(
         client: client.as_wire().clone(),
         ino,
         mode,
+        force,
     };
     let bytes = cluster
         .mgr_call_retry(MSG_ACQUIRE_LEASE, rkyv_encode(&req), RETRY)
@@ -142,11 +182,60 @@ pub async fn acquire(
         CODE_PRECONDITION => Ok(AcquireResult::Conflict {
             manager_message: resp.message,
         }),
+        CODE_REVOKE_PENDING => {
+            // The manager packs `eta_ms` into the response's
+            // `lease.ttl_secs` field (repurposed; see the
+            // `LEASE_INVAL_WILL_REVOKE_IN` constant on the wire).
+            let eta_ms = resp
+                .lease
+                .as_ref()
+                .map(|l| l.ttl_secs)
+                .unwrap_or(0);
+            Ok(AcquireResult::RevokePending {
+                eta_ms,
+                manager_message: resp.message,
+            })
+        }
         CODE_NOT_LEADER => Err(LeaseError::NotLeader),
         c => Err(LeaseError::Manager {
             code: c,
             message: resp.message,
         }),
+    }
+}
+
+/// F-lease-preempt: convenience wrapper that wraps `acquire_force`
+/// with the retry loop the protocol expects. Polls `acquire_force`
+/// until the manager returns `Granted` or `Conflict`, or until
+/// `max_wait_ms` has elapsed (in which case the last
+/// `RevokePending` is propagated). Between polls it sleeps
+/// `eta_ms` (capped at 500ms to keep retry-rate sane).
+pub async fn acquire_with_preempt_wait(
+    cluster: &ClusterClient,
+    client: &DaemonClientId,
+    ino: u64,
+    mode: u8,
+    max_wait_ms: u32,
+) -> Result<AcquireResult, LeaseError> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_millis(max_wait_ms as u64);
+    loop {
+        match acquire_force(cluster, client, ino, mode).await? {
+            r @ AcquireResult::Granted(_) | r @ AcquireResult::Conflict { .. } => {
+                return Ok(r);
+            }
+            r @ AcquireResult::RevokePending { eta_ms, .. } => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok(r);
+                }
+                let sleep_ms = eta_ms.clamp(50, 500);
+                let remaining_u128 = deadline.saturating_duration_since(now).as_millis();
+                let remaining = u32::try_from(remaining_u128).unwrap_or(u32::MAX);
+                let actual = sleep_ms.min(remaining);
+                compio::time::sleep(Duration::from_millis(u64::from(actual))).await;
+            }
+        }
     }
 }
 

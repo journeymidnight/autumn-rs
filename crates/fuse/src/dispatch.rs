@@ -443,6 +443,16 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                             ino, manager_message
                         ));
                     }
+                    Ok(AcquireResult::RevokePending { .. }) => {
+                        // Unreachable: this call uses `acquire`
+                        // (force=false). Defensive return so a
+                        // future refactor that flips it to
+                        // `acquire_force` fails loudly instead
+                        // of silently dropping the grace window.
+                        return Err(anyhow!(
+                            "BUG: Create with non-force acquire returned RevokePending"
+                        ));
+                    }
                     Err(e) => return Err(anyhow!("AcquireLease ino {}: {}", ino, e)),
                 }
                 // Cache the inode
@@ -553,6 +563,12 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                             return Err(anyhow!(
                                 "EBUSY: writer lease conflict on ino {}: {}",
                                 ino, manager_message
+                            ));
+                        }
+                        Ok(AcquireResult::RevokePending { .. }) => {
+                            // Unreachable for non-force acquire.
+                            return Err(anyhow!(
+                                "BUG: Open with non-force acquire returned RevokePending"
                             ));
                         }
                         Err(e) => return Err(anyhow!("AcquireLease ino {}: {}", ino, e)),

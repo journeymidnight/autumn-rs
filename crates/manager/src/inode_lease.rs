@@ -31,13 +31,21 @@ use std::time::{Duration, Instant};
 
 use autumn_rpc::manager_rpc::{
     MgrClientId, MgrInodeLeaseInfo, MgrInodeLeaseRecord, MgrInvalidation,
-    LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_WRITER_CLOSED, LEASE_MODE_READ, LEASE_MODE_WRITE,
+    LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_WILL_REVOKE_IN, LEASE_INVAL_WRITER_CLOSED,
+    LEASE_MODE_READ, LEASE_MODE_WRITE,
 };
 
 /// Default writer-lease TTL (seconds). Same magnitude as
 /// `acquire_owner_lock`'s etcd lease (plan §3.1). Clients must
 /// heartbeat at <= TTL / 6 (`5s` for the 30s default) to stay alive.
 pub const DEFAULT_LEASE_TTL_SECS: u32 = 30;
+
+/// F-lease-preempt: default grace window the manager gives a writer
+/// to flush + voluntarily release after a peer's
+/// `AcquireLease(force=true)`. Matches plan §5 Phase 3 "writer
+/// revoke 协议: WillRevokeIn { 5s }". Tunable per-registry via
+/// `LeaseRegistry::with_ttl_and_revoke_grace`.
+pub const DEFAULT_REVOKE_GRACE: Duration = Duration::from_secs(5);
 
 /// How often the revoke loop ticks. Picked under the default TTL so a
 /// revoke fires within ~1 s of the deadline.
@@ -80,6 +88,13 @@ pub struct InodeLeaseState {
     pub writer_expires_at: Option<Instant>,
     pub readers: BTreeMap<ClientKey, Instant>,
     pub version: u64,
+    /// F-lease-preempt: deadline after which a force-acquire that's
+    /// already pushed `WillRevokeIn` to the current writer will be
+    /// allowed to force-revoke. `Some(t)` means "grace period
+    /// running until t"; `None` means "no preempt in flight."
+    /// Cleared on release / writer-revoke / TTL expiry so a future
+    /// force-acquire starts a fresh grace window.
+    pub pending_revoke_at: Option<Instant>,
 }
 
 impl InodeLeaseState {
@@ -91,6 +106,7 @@ impl InodeLeaseState {
             writer_expires_at: None,
             readers: BTreeMap::new(),
             version: 1,
+            pending_revoke_at: None,
         }
     }
 }
@@ -107,6 +123,16 @@ pub enum AcquireOutcome {
     },
     /// Rejected because another client holds the writer lease.
     WriteConflict {
+        held_by_kind: u8,
+        held_by_host: String,
+    },
+    /// F-lease-preempt: `force=true` against a held writer; manager
+    /// started the grace window. Client should retry after
+    /// `eta_ms`; on retry it either gets `Granted` (writer
+    /// released voluntarily) or — past the deadline — the manager
+    /// force-revokes the writer and grants.
+    RevokePending {
+        eta_ms: u32,
         held_by_kind: u8,
         held_by_host: String,
     },
@@ -146,6 +172,11 @@ pub enum InvalidationReason {
     WriterClosed,
     /// Manager TTL revoked the writer (or admin took it away).
     LeaseRevoked,
+    /// F-lease-preempt: pushed to the CURRENT writer when another
+    /// client force-acquires. Writer should flush + voluntarily
+    /// `ReleaseLease` within the grace window or the manager
+    /// will force-revoke (which then pushes `LeaseRevoked`).
+    WillRevokeIn,
 }
 
 impl InvalidationReason {
@@ -153,6 +184,7 @@ impl InvalidationReason {
         match self {
             InvalidationReason::WriterClosed => LEASE_INVAL_WRITER_CLOSED,
             InvalidationReason::LeaseRevoked => LEASE_INVAL_LEASE_REVOKED,
+            InvalidationReason::WillRevokeIn => LEASE_INVAL_WILL_REVOKE_IN,
         }
     }
 }
@@ -212,6 +244,10 @@ pub struct LeaseRegistry {
     /// from a different generation.
     pub last_version: HashMap<u64, u64>,
     pub lease_ttl: Duration,
+    /// F-lease-preempt: how long the manager waits between pushing
+    /// `WillRevokeIn` to a writer and force-revoking on a subsequent
+    /// `AcquireLease(force=true)` retry.
+    pub revoke_grace: Duration,
 }
 
 impl LeaseRegistry {
@@ -221,6 +257,20 @@ impl LeaseRegistry {
             inboxes: HashMap::new(),
             last_version: HashMap::new(),
             lease_ttl: ttl,
+            revoke_grace: DEFAULT_REVOKE_GRACE,
+        }
+    }
+
+    /// F-lease-preempt: registry constructor with both TTL and
+    /// revoke-grace overrides. Used by tests that want a sub-second
+    /// grace window to keep wall-clock test runtime low.
+    pub fn with_ttl_and_revoke_grace(ttl: Duration, revoke_grace: Duration) -> Self {
+        LeaseRegistry {
+            inodes: HashMap::new(),
+            inboxes: HashMap::new(),
+            last_version: HashMap::new(),
+            lease_ttl: ttl,
+            revoke_grace,
         }
     }
 
@@ -263,7 +313,9 @@ impl LeaseRegistry {
 
     /// `mode = LEASE_MODE_READ` or `LEASE_MODE_WRITE`. `now` is the
     /// monotonic clock the manager owns; tests pass a synthetic
-    /// `Instant`.
+    /// `Instant`. `force = false` (this method) is the non-preempt
+    /// path — see `acquire_with_force` for the F-lease-preempt
+    /// variant.
     pub fn acquire(
         &mut self,
         client: &MgrClientId,
@@ -271,48 +323,185 @@ impl LeaseRegistry {
         mode: u8,
         now: Instant,
     ) -> AcquireOutcome {
+        self.acquire_with_force(client, ino, mode, false, now)
+    }
+
+    /// F-lease-preempt: `acquire` with the `force` flag.
+    ///
+    /// - `force = false`: identical to the legacy `acquire`.
+    /// - `force = true` AND no current writer (or writer is the
+    ///   requester): same as `force=false` (no-op preempt).
+    /// - `force = true` AND a DIFFERENT writer is currently held:
+    ///   - first call: pushes `WillRevokeIn` to the current
+    ///     writer, sets `pending_revoke_at = now + revoke_grace`,
+    ///     returns `RevokePending { eta_ms }`.
+    ///   - subsequent call BEFORE `pending_revoke_at`: returns
+    ///     `RevokePending { eta_ms = remaining }`. The writer
+    ///     may release voluntarily before the deadline — the
+    ///     next non-force OR force acquire is then granted
+    ///     normally.
+    ///   - subsequent call AT/AFTER `pending_revoke_at`:
+    ///     force-revokes (clears writer, bumps version, pushes
+    ///     `LeaseRevoked` to readers + the deposed writer),
+    ///     then grants the requester.
+    pub fn acquire_with_force(
+        &mut self,
+        client: &MgrClientId,
+        ino: u64,
+        mode: u8,
+        force: bool,
+        now: Instant,
+    ) -> AcquireOutcome {
         if mode != LEASE_MODE_READ && mode != LEASE_MODE_WRITE {
             return AcquireOutcome::InvalidMode;
         }
         let ttl = self.lease_ttl;
         let ttl_secs = self.ttl_secs();
+        let revoke_grace = self.revoke_grace;
         let me = ClientKey::from_wire(client);
 
-        let state = self.inode_or_create(ino);
-        match mode {
-            LEASE_MODE_WRITE => {
-                if let Some(existing) = &state.writer {
-                    if existing != &me {
-                        return AcquireOutcome::WriteConflict {
-                            held_by_kind: existing.kind,
-                            held_by_host: state.writer_diag_host.clone(),
+        // Preempt-handling state captured before mutating so we can
+        // push invalidations after releasing the &mut borrow.
+        let mut deposed_writer: Option<(ClientKey, u64)> = None;
+        let mut will_revoke_push: Option<(ClientKey, u64, u32)> = None;
+        // Whether to grant after the borrow ends.
+        let grant_outcome: AcquireOutcome;
+
+        {
+            let state = self.inode_or_create(ino);
+            match mode {
+                LEASE_MODE_WRITE => {
+                    let other_writer = match &state.writer {
+                        Some(existing) if existing != &me => Some(existing.clone()),
+                        _ => None,
+                    };
+                    if let Some(other) = other_writer {
+                        // Another writer holds the slot.
+                        if !force {
+                            return AcquireOutcome::WriteConflict {
+                                held_by_kind: other.kind,
+                                held_by_host: state.writer_diag_host.clone(),
+                            };
+                        }
+                        // F-lease-preempt: force-acquire path.
+                        match state.pending_revoke_at {
+                            None => {
+                                // Start the grace window. Push
+                                // WillRevokeIn to the current
+                                // writer; return RevokePending.
+                                let deadline = now + revoke_grace;
+                                state.pending_revoke_at = Some(deadline);
+                                let grace_ms = revoke_grace.as_millis() as u32;
+                                will_revoke_push =
+                                    Some((other.clone(), ino, grace_ms));
+                                grant_outcome = AcquireOutcome::RevokePending {
+                                    eta_ms: grace_ms,
+                                    held_by_kind: other.kind,
+                                    held_by_host: state.writer_diag_host.clone(),
+                                };
+                            }
+                            Some(deadline) if deadline > now => {
+                                // Still waiting; tell the caller
+                                // how long.
+                                let remaining = deadline
+                                    .saturating_duration_since(now)
+                                    .as_millis() as u32;
+                                grant_outcome = AcquireOutcome::RevokePending {
+                                    eta_ms: remaining,
+                                    held_by_kind: other.kind,
+                                    held_by_host: state.writer_diag_host.clone(),
+                                };
+                            }
+                            Some(_) => {
+                                // Grace expired → force-revoke.
+                                state.writer = None;
+                                state.writer_diag_host.clear();
+                                state.writer_expires_at = None;
+                                state.pending_revoke_at = None;
+                                state.version = state.version.wrapping_add(1);
+                                deposed_writer = Some((other, state.version));
+                                // Now grant the WRITE to the new client.
+                                state.writer = Some(me.clone());
+                                state.writer_diag_host = client.host.clone();
+                                state.writer_expires_at = Some(now + ttl);
+                                grant_outcome = AcquireOutcome::Granted {
+                                    version: state.version,
+                                    writer_present: true,
+                                    ttl_secs,
+                                };
+                            }
+                        }
+                    } else {
+                        // Same writer re-acquiring OR no writer:
+                        // grant (idempotent for same writer).
+                        state.writer = Some(me.clone());
+                        state.writer_diag_host = client.host.clone();
+                        state.writer_expires_at = Some(now + ttl);
+                        // A successful WRITE acquire clears any
+                        // half-progressed preempt for this ino.
+                        state.pending_revoke_at = None;
+                        grant_outcome = AcquireOutcome::Granted {
+                            version: state.version,
+                            writer_present: true,
+                            ttl_secs,
                         };
                     }
-                    // Same writer re-acquiring: refresh the deadline.
                 }
-                state.writer = Some(me);
-                state.writer_diag_host = client.host.clone();
-                state.writer_expires_at = Some(now + ttl);
+                LEASE_MODE_READ => {
+                    state.readers.insert(me.clone(), now + ttl);
+                    grant_outcome = AcquireOutcome::Granted {
+                        version: state.version,
+                        writer_present: state.writer.is_some(),
+                        ttl_secs,
+                    };
+                }
+                _ => unreachable!(),
             }
-            LEASE_MODE_READ => {
-                state.readers.insert(me, now + ttl);
-            }
-            _ => unreachable!(),
         }
-        // Ensure an inbox exists so subsequent push targets find it.
+
+        // After the &mut borrow ends, push the F-lease-preempt
+        // invalidations + remember version.
         self.inboxes.entry(ClientKey::from_wire(client)).or_default();
-        let (s_version, s_writer_present) = {
-            let s = self.inodes.get(&ino).expect("just inserted");
-            (s.version, s.writer.is_some())
-        };
-        // Seed the shadow on every acquire so a future release/revoke
-        // that drops the entry resumes from this version, not 1.
-        self.remember_version(ino, s_version);
-        AcquireOutcome::Granted {
-            version: s_version,
-            writer_present: s_writer_present,
-            ttl_secs,
+        if let Some((target, ino_for_push, grace_ms)) = will_revoke_push {
+            // The `version` field of the MgrInvalidation carries
+            // the grace milliseconds — clients interpret per the
+            // `LEASE_INVAL_WILL_REVOKE_IN` contract documented on
+            // the constant.
+            self.push_invalidation(
+                &target,
+                ino_for_push,
+                grace_ms as u64,
+                InvalidationReason::WillRevokeIn,
+            );
         }
+        if let Some((deposed, new_version)) = deposed_writer {
+            // Forcibly-revoked writer + every current reader gets
+            // a `LeaseRevoked` push so their caches re-validate.
+            let readers: Vec<ClientKey> = self
+                .inodes
+                .get(&ino)
+                .map(|s| s.readers.keys().cloned().collect())
+                .unwrap_or_default();
+            self.push_invalidation(
+                &deposed,
+                ino,
+                new_version,
+                InvalidationReason::LeaseRevoked,
+            );
+            for r in readers {
+                self.push_invalidation(
+                    &r,
+                    ino,
+                    new_version,
+                    InvalidationReason::LeaseRevoked,
+                );
+            }
+            self.remember_version(ino, new_version);
+        }
+        if let AcquireOutcome::Granted { version, .. } = grant_outcome {
+            self.remember_version(ino, version);
+        }
+        grant_outcome
     }
 
     /// F-ioring-lease-5 (coco P2 #7): read-only "what would `release`
@@ -354,6 +543,11 @@ impl LeaseRegistry {
             state.writer = None;
             state.writer_diag_host.clear();
             state.writer_expires_at = None;
+            // F-lease-preempt: voluntary release clears any
+            // pending revoke window — the next force-acquire
+            // will start a fresh one if it lands on a future
+            // writer.
+            state.pending_revoke_at = None;
             state.version = state.version.wrapping_add(1);
             let new_version = state.version;
             // Snapshot reader set so we can push invalidations after
@@ -502,6 +696,10 @@ impl LeaseRegistry {
                     state.writer = None;
                     state.writer_diag_host.clear();
                     state.writer_expires_at = None;
+                    // F-lease-preempt: TTL revoke also clears any
+                    // pending preempt window — no point keeping a
+                    // grace deadline after the writer is gone.
+                    state.pending_revoke_at = None;
                     state.version = state.version.wrapping_add(1);
                     let readers: Vec<ClientKey> = state.readers.keys().cloned().collect();
                     writer_revokes.push((ino, state.version, readers));
@@ -595,11 +793,16 @@ impl LeaseRegistry {
                 entry.writer = s.writer;
                 entry.writer_diag_host = s.writer_diag_host;
                 entry.writer_expires_at = s.writer_expires_at;
+                // F-lease-preempt: restore the preempt window too
+                // so an etcd-failed force-acquire doesn't leak the
+                // half-progressed grace state into the next call.
+                entry.pending_revoke_at = s.pending_revoke_at;
             }
             None => {
                 entry.writer = None;
                 entry.writer_diag_host.clear();
                 entry.writer_expires_at = None;
+                entry.pending_revoke_at = None;
                 if entry.readers.is_empty() {
                     self.inodes.remove(&ino);
                 }
@@ -954,6 +1157,172 @@ mod tests {
             !r.inodes.contains_key(&55),
             "no readers ⇒ empty entry must be dropped"
         );
+    }
+
+    // ───────────── F-lease-preempt ─────────────────────────
+
+    fn reg_with_grace(grace_ms: u64) -> LeaseRegistry {
+        LeaseRegistry::with_ttl_and_revoke_grace(
+            Duration::from_secs(30),
+            Duration::from_millis(grace_ms),
+        )
+    }
+
+    #[test]
+    fn force_acquire_on_held_writer_returns_revoke_pending_and_pushes_will_revoke() {
+        let mut r = reg_with_grace(5000);
+        let t0 = Instant::now();
+        let w1 = cid(1, 1, "first-writer");
+        let w2 = cid(1, 2, "preempter");
+
+        // Writer 1 holds.
+        let _ = r.acquire(&w1, 100, LEASE_MODE_WRITE, t0);
+        // Writer 2 tries force-acquire → RevokePending.
+        match r.acquire_with_force(&w2, 100, LEASE_MODE_WRITE, true, t0) {
+            AcquireOutcome::RevokePending { eta_ms, held_by_kind, held_by_host } => {
+                assert!(eta_ms > 0 && eta_ms <= 5000);
+                assert_eq!(held_by_kind, 1);
+                assert_eq!(held_by_host, "first-writer");
+            }
+            other => panic!("expected RevokePending, got {other:?}"),
+        }
+        // Writer 1's inbox MUST have a WillRevokeIn push.
+        let (events, _) = r.drain_invalidations(&w1);
+        assert_eq!(events.len(), 1, "WillRevokeIn must be queued");
+        assert_eq!(events[0].kind, LEASE_INVAL_WILL_REVOKE_IN);
+        assert_eq!(events[0].ino, 100);
+        // The `version` field carries the grace ms.
+        assert!(events[0].version > 0 && events[0].version <= 5000);
+    }
+
+    #[test]
+    fn force_acquire_retried_before_grace_expires_returns_remaining_eta() {
+        let mut r = reg_with_grace(5000);
+        let t0 = Instant::now();
+        let w1 = cid(1, 1, "w1");
+        let w2 = cid(1, 2, "w2");
+
+        let _ = r.acquire(&w1, 1, LEASE_MODE_WRITE, t0);
+        let _ = r.acquire_with_force(&w2, 1, LEASE_MODE_WRITE, true, t0);
+        // 1s in → ~4s remaining.
+        let t1 = t0 + Duration::from_secs(1);
+        let out = r.acquire_with_force(&w2, 1, LEASE_MODE_WRITE, true, t1);
+        match out {
+            AcquireOutcome::RevokePending { eta_ms, .. } => {
+                assert!(
+                    (3500..=4500).contains(&eta_ms),
+                    "second call before grace: eta_ms should be near 4000ms, got {eta_ms}"
+                );
+            }
+            other => panic!("expected RevokePending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn voluntary_release_within_grace_clears_pending_and_lets_next_acquire_succeed_cleanly() {
+        let mut r = reg_with_grace(5000);
+        let t0 = Instant::now();
+        let w1 = cid(1, 1, "w1");
+        let w2 = cid(1, 2, "w2");
+
+        let v_before = match r.acquire(&w1, 7, LEASE_MODE_WRITE, t0) {
+            AcquireOutcome::Granted { version, .. } => version,
+            other => panic!("acquire: {other:?}"),
+        };
+        // Start the grace window.
+        let _ = r.acquire_with_force(&w2, 7, LEASE_MODE_WRITE, true, t0);
+        // w1 releases voluntarily.
+        match r.release(&w1, 7) {
+            ReleaseOutcome::WriterClosed { new_version } => {
+                assert_eq!(new_version, v_before + 1);
+            }
+            other => panic!("release: {other:?}"),
+        }
+        // The pending_revoke_at was cleared by release (the inode
+        // entry may have been dropped if no readers — recreated on
+        // next acquire).
+        let t1 = t0 + Duration::from_millis(100);
+        match r.acquire_with_force(&w2, 7, LEASE_MODE_WRITE, true, t1) {
+            AcquireOutcome::Granted { version, writer_present, .. } => {
+                assert_eq!(version, v_before + 1, "version inherits the close-bump");
+                assert!(writer_present);
+            }
+            other => panic!("expected Granted after voluntary release, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn force_acquire_after_grace_expires_force_revokes_and_grants() {
+        let mut r = reg_with_grace(100); // short grace for the test
+        let t0 = Instant::now();
+        let w1 = cid(1, 1, "w1");
+        let w2 = cid(1, 2, "w2");
+        let rd = cid(2, 3, "reader");
+
+        // Reader subscribes so the LeaseRevoked push has a target.
+        let _ = r.acquire(&rd, 11, LEASE_MODE_READ, t0);
+        let v_before = match r.acquire(&w1, 11, LEASE_MODE_WRITE, t0) {
+            AcquireOutcome::Granted { version, .. } => version,
+            other => panic!("{other:?}"),
+        };
+
+        // Start grace + immediately retry past the deadline.
+        let _ = r.acquire_with_force(&w2, 11, LEASE_MODE_WRITE, true, t0);
+        let t_past = t0 + Duration::from_millis(200); // > 100ms grace
+        match r.acquire_with_force(&w2, 11, LEASE_MODE_WRITE, true, t_past) {
+            AcquireOutcome::Granted { version, writer_present, .. } => {
+                assert_eq!(
+                    version,
+                    v_before + 1,
+                    "force-revoke bumps version"
+                );
+                assert!(writer_present);
+            }
+            other => panic!("expected Granted after grace expiry, got {other:?}"),
+        }
+
+        // The deposed w1 + the reader BOTH get LeaseRevoked.
+        let (w1_events, _) = r.drain_invalidations(&w1);
+        assert!(
+            w1_events.iter().any(|e| e.kind == LEASE_INVAL_LEASE_REVOKED),
+            "deposed writer must get LeaseRevoked: {w1_events:?}"
+        );
+        let (rd_events, _) = r.drain_invalidations(&rd);
+        assert!(
+            rd_events.iter().any(|e| e.kind == LEASE_INVAL_LEASE_REVOKED),
+            "reader must get LeaseRevoked: {rd_events:?}"
+        );
+    }
+
+    #[test]
+    fn force_acquire_on_no_writer_is_just_a_grant() {
+        let mut r = reg_with_grace(5000);
+        let w = cid(1, 1, "w");
+        match r.acquire_with_force(&w, 99, LEASE_MODE_WRITE, true, Instant::now()) {
+            AcquireOutcome::Granted { writer_present, .. } => {
+                assert!(writer_present);
+            }
+            other => panic!("expected Granted for fresh ino, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn force_acquire_by_same_writer_is_idempotent_refresh() {
+        // The writer re-acquiring with force on their own ino must
+        // not trigger a self-revoke. Same shape as the regular
+        // refresh path.
+        let mut r = reg_with_grace(5000);
+        let t0 = Instant::now();
+        let w = cid(1, 1, "w");
+        let _ = r.acquire(&w, 1, LEASE_MODE_WRITE, t0);
+        let out = r.acquire_with_force(&w, 1, LEASE_MODE_WRITE, true, t0);
+        assert!(matches!(
+            out,
+            AcquireOutcome::Granted { writer_present: true, .. }
+        ));
+        // No push to self.
+        let (events, _) = r.drain_invalidations(&w);
+        assert!(events.is_empty(), "self-acquire MUST NOT push WillRevokeIn");
     }
 
     #[test]
