@@ -5129,11 +5129,19 @@ gaps in the lease protocol's correctness story.
   `LeaseRevoked` events. Result: phantom version bump + ghost
   invalidations against a writer who was never actually
   preempted.
-- **Status:** PENDING. Fix options: (a) two-phase commit
-  (prepare decision → persist → commit memory + push), (b)
-  full snapshot rollback that also rewinds version +
-  `last_version` + inbox tail pointer. Reproduce-first.
-- **passes:** not_completed
+- **Status:** COMPLETED (2026-06-06). Fix shape: option (a) —
+  deferred-push 2PC. `acquire_with_force_deferred` STAGES the
+  LeaseRevoked / WillRevokeIn events into a `DeferredPushes`
+  bundle (does NOT mutate inboxes). The `handle_acquire_lease`
+  caller flushes the bundle AFTER etcd commit; on etcd-fail it
+  drops the bundle (clients never see the phantom events) AND
+  calls `revert_writer_acquire`. The revert was extended to
+  rewind the force-revoke's version bump too (pre-fix it only
+  restored writer/host/deadline). `last_version` shadow stays
+  at the bumped high-water (monotonicity invariant — rewinding
+  it would let a future re-creation pick a lower version than
+  this revert ever observed).
+- **passes:** completed
 
 ### BUG-LEASE-5 (P1 #5) — TTL revoke etcd-delete failure has no retry queue
 

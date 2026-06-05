@@ -4474,20 +4474,30 @@ impl AutumnManager {
         }
 
         let now = Instant::now();
-        // F-ioring-lease-5 (coco P1 #6): snapshot the pre-acquire
-        // InodeLeaseState BEFORE mutating so an etcd-write failure
-        // can ROLL BACK precisely — restoring just the writer slot
-        // without touching readers that subscribed during the etcd
-        // await. The pre-fix rollback abused `release()`, which
-        // bumps version + pushes a phantom WriterClosed to every
-        // reader. Single-threaded compio runtime guarantees the
-        // snapshot reflects the state acquire() will mutate (no
-        // await between).
-        let (pre_snapshot, outcome) = {
+        // F-ioring-lease-5 (coco P1 #6) + BUG-LEASE-4 (P1 #4): snapshot
+        // the pre-acquire InodeLeaseState BEFORE mutating so an
+        // etcd-write failure can ROLL BACK precisely — restoring
+        // writer slot + version (the latter, BUG-LEASE-4 fix) without
+        // touching readers that subscribed during the etcd await.
+        // **BUG-LEASE-4:** ALSO collect the invalidation pushes the
+        // force-revoke arm of `acquire_with_force` would have queued,
+        // into a DeferredPushes bundle. The pushes are then flushed
+        // only AFTER etcd commit — so an etcd-fail leaves clients
+        // with NO phantom LeaseRevoked / WillRevokeIn events from a
+        // preemption that didn't actually persist.
+        let (pre_snapshot, outcome, mut deferred_pushes) = {
             let mut reg = self.inode_leases.borrow_mut();
             let snap = reg.inodes.get(&req.ino).cloned();
-            let out = reg.acquire_with_force(&req.client, req.ino, req.mode, req.force, now);
-            (snap, out)
+            let mut pushes = crate::inode_lease::DeferredPushes::default();
+            let out = reg.acquire_with_force_deferred(
+                &req.client,
+                req.ino,
+                req.mode,
+                req.force,
+                now,
+                &mut pushes,
+            );
+            (snap, out, pushes)
         };
 
         match outcome {
@@ -4507,14 +4517,15 @@ impl AutumnManager {
                     let value = rkyv_encode(&record).to_vec();
                     if let Some(etcd) = &self.etcd {
                         if let Err(e) = etcd.put_msgs_txn(vec![(key, value)]).await {
-                            // F-ioring-lease-5: precise revert.
-                            // Restore writer slot to the pre-acquire
-                            // shape; do NOT bump version, do NOT
-                            // push phantom WriterClosed (which
-                            // pre-fix `release()` rollback did).
+                            // BUG-LEASE-4: precise revert that
+                            // also rewinds the force-revoke
+                            // version bump + DROPS the deferred
+                            // pushes (clients never see the
+                            // phantom revoke).
                             self.inode_leases
                                 .borrow_mut()
                                 .revert_writer_acquire(req.ino, pre_snapshot);
+                            std::mem::take(&mut deferred_pushes); // drop without flush
                             return Ok(rkyv_encode(&AcquireLeaseResp {
                                 code: Self::err_to_code(&e),
                                 message: e.to_string(),
@@ -4523,6 +4534,12 @@ impl AutumnManager {
                         }
                     }
                 }
+                // BUG-LEASE-4: etcd committed (or no etcd) → flush
+                // the staged LeaseRevoked / WillRevokeIn pushes so
+                // deposed writer + current readers see the revoke.
+                self.inode_leases
+                    .borrow_mut()
+                    .flush_deferred_pushes(deferred_pushes);
                 Ok(rkyv_encode(&AcquireLeaseResp {
                     code: CODE_OK,
                     message: String::new(),
@@ -4537,18 +4554,27 @@ impl AutumnManager {
             crate::inode_lease::AcquireOutcome::WriteConflict {
                 held_by_kind,
                 held_by_host,
-            } => Ok(rkyv_encode(&AcquireLeaseResp {
-                code: CODE_PRECONDITION,
-                message: format!(
-                    "writer lease held by kind={held_by_kind} host={held_by_host}"
-                ),
-                lease: None,
-            })),
-            crate::inode_lease::AcquireOutcome::InvalidMode => Ok(rkyv_encode(&AcquireLeaseResp {
-                code: CODE_INVALID_ARGUMENT,
-                message: format!("invalid lease mode {}", req.mode),
-                lease: None,
-            })),
+            } => {
+                // No pushes were staged for WriteConflict; the
+                // borrow is dropped + bundle is empty. Belt-and-
+                // braces explicit drop documents intent.
+                drop(deferred_pushes);
+                Ok(rkyv_encode(&AcquireLeaseResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "writer lease held by kind={held_by_kind} host={held_by_host}"
+                    ),
+                    lease: None,
+                }))
+            }
+            crate::inode_lease::AcquireOutcome::InvalidMode => {
+                drop(deferred_pushes);
+                Ok(rkyv_encode(&AcquireLeaseResp {
+                    code: CODE_INVALID_ARGUMENT,
+                    message: format!("invalid lease mode {}", req.mode),
+                    lease: None,
+                }))
+            }
             // F-lease-preempt: pre-revocation grace window in
             // progress. Surface as `CODE_REVOKE_PENDING` with the
             // remaining milliseconds in `lease.ttl_secs` (we
@@ -4557,22 +4583,35 @@ impl AutumnManager {
             // const). The lease itself is not yet granted —
             // `writer_present` is true because someone ELSE
             // holds it.
+            //
+            // BUG-LEASE-4: this arm produced the WillRevokeIn push
+            // (the deferred bundle has 0 or 1 item). There is no
+            // etcd persist for this arm — `pending_revoke_at`
+            // lives in memory only — so we flush directly. (If
+            // we EVER persist `pending_revoke_at`, the flush
+            // moves below an etcd-write block and gets the same
+            // commit/revert treatment as Granted.)
             crate::inode_lease::AcquireOutcome::RevokePending {
                 eta_ms,
                 held_by_kind,
                 held_by_host,
-            } => Ok(rkyv_encode(&AcquireLeaseResp {
-                code: CODE_REVOKE_PENDING,
-                message: format!(
-                    "revoke pending: writer held by kind={held_by_kind} host={held_by_host}; retry in {eta_ms}ms"
-                ),
-                lease: Some(MgrInodeLeaseInfo {
-                    ino: req.ino,
-                    version: 0,
-                    writer_present: true,
-                    ttl_secs: eta_ms,
-                }),
-            })),
+            } => {
+                self.inode_leases
+                    .borrow_mut()
+                    .flush_deferred_pushes(deferred_pushes);
+                Ok(rkyv_encode(&AcquireLeaseResp {
+                    code: CODE_REVOKE_PENDING,
+                    message: format!(
+                        "revoke pending: writer held by kind={held_by_kind} host={held_by_host}; retry in {eta_ms}ms"
+                    ),
+                    lease: Some(MgrInodeLeaseInfo {
+                        ino: req.ino,
+                        version: 0,
+                        writer_present: true,
+                        ttl_secs: eta_ms,
+                    }),
+                }))
+            }
         }
     }
 

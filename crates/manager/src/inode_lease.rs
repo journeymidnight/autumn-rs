@@ -228,6 +228,52 @@ impl ClientInbox {
     }
 }
 
+/// BUG-LEASE-4 (P1 #4, 2026-06-06) — staging area for
+/// `acquire_with_force_deferred`'s invalidation pushes. The
+/// production handler (`handle_acquire_lease`) does:
+///
+///   1. `let pushes = DeferredPushes::default();`
+///   2. `let out = reg.acquire_with_force_deferred(.., &mut pushes);`
+///      — applies in-memory mutation (writer slot, version bump,
+///      pending_revoke_at), STAGES invalidation events in `pushes`.
+///   3. Etcd persist.
+///   4a. On etcd OK: `reg.flush_deferred_pushes(pushes)` — fans out
+///      to client inboxes, wakes parked long-polls.
+///   4b. On etcd FAIL: drop `pushes` (clients never see the events),
+///      then `reg.revert_writer_acquire(ino, snapshot)` to rewind
+///      the in-memory mutation INCLUDING the force-revoke's
+///      version bump (BUG-LEASE-4 — the pre-fix revert restored
+///      writer/host/deadline but left version bumped, so a future
+///      Open got a lease_version that didn't correspond to any
+///      persisted state).
+///
+/// Items are pre-rendered as (target, MgrInvalidation) tuples so the
+/// flush phase doesn't need to re-walk the inode entry's readers
+/// (which may have changed between stage and flush).
+#[derive(Default, Debug)]
+pub struct DeferredPushes {
+    items: Vec<(ClientKey, MgrInvalidation)>,
+}
+
+impl DeferredPushes {
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+    fn stage(&mut self, target: ClientKey, ino: u64, version: u64, reason: InvalidationReason) {
+        self.items.push((
+            target,
+            MgrInvalidation {
+                ino,
+                version,
+                kind: reason.wire_kind(),
+            },
+        ));
+    }
+}
+
 /// Manager-side lease registry. Single-threaded; wrap in
 /// `Rc<RefCell<…>>` for AutumnManager.
 #[derive(Default)]
@@ -344,6 +390,16 @@ impl LeaseRegistry {
     ///     force-revokes (clears writer, bumps version, pushes
     ///     `LeaseRevoked` to readers + the deposed writer),
     ///     then grants the requester.
+    /// BUG-LEASE-4 (P1 #4, coco arch review 2026-06-05) — non-deferred
+    /// wrapper kept for unit tests + callers that don't need 2PC. Pushes
+    /// invalidations directly into client inboxes; equivalent to
+    /// `acquire_with_force_deferred` + immediate `flush_deferred_pushes`.
+    ///
+    /// **Production handlers (`handle_acquire_lease`) MUST use the
+    /// deferred form** so an etcd-persist failure can roll back without
+    /// leaving phantom LeaseRevoked / WillRevokeIn events in client
+    /// inboxes that no longer correspond to a force-revoke that actually
+    /// happened. See `DeferredPushes` doc.
     pub fn acquire_with_force(
         &mut self,
         client: &MgrClientId,
@@ -351,6 +407,40 @@ impl LeaseRegistry {
         mode: u8,
         force: bool,
         now: Instant,
+    ) -> AcquireOutcome {
+        let mut pushes = DeferredPushes::default();
+        let out = self.acquire_with_force_deferred(client, ino, mode, force, now, &mut pushes);
+        self.flush_deferred_pushes(pushes);
+        out
+    }
+
+    /// BUG-LEASE-4 (P1 #4, 2026-06-06) — two-phase form of
+    /// `acquire_with_force`. The in-memory mutation (writer slot,
+    /// version bump, pending_revoke_at) is applied immediately, but
+    /// the LeaseRevoked / WillRevokeIn pushes are STAGED in
+    /// `pushes` rather than landing in client inboxes. The caller
+    /// then:
+    ///   - on etcd commit success: `flush_deferred_pushes(pushes)`
+    ///     fans the staged events into the inboxes;
+    ///   - on etcd persist failure: drops `pushes` (so clients
+    ///     never see the events) AND calls `revert_writer_acquire`
+    ///     to rewind the in-memory state — including the
+    ///     force-revoke's version bump, courtesy of BUG-LEASE-4's
+    ///     extended snapshot restore.
+    /// This is the only correct shape for the "force-revoke +
+    /// persist failure" race: pre-BUG-LEASE-4 the deposed writer
+    /// and current readers saw `LeaseRevoked` events for a
+    /// preemption that never actually persisted, and a subsequent
+    /// leader failover replayed the OLD writer's etcd record →
+    /// "phantom revoke."
+    pub fn acquire_with_force_deferred(
+        &mut self,
+        client: &MgrClientId,
+        ino: u64,
+        mode: u8,
+        force: bool,
+        now: Instant,
+        pushes: &mut DeferredPushes,
     ) -> AcquireOutcome {
         if mode != LEASE_MODE_READ && mode != LEASE_MODE_WRITE {
             return AcquireOutcome::InvalidMode;
@@ -459,16 +549,18 @@ impl LeaseRegistry {
             }
         }
 
-        // After the &mut borrow ends, push the F-lease-preempt
-        // invalidations + remember version.
+        // After the &mut borrow ends, STAGE the F-lease-preempt
+        // invalidations into `pushes` (BUG-LEASE-4: not into
+        // self.inboxes — the caller flushes after etcd commit, or
+        // drops on etcd-fail).
         self.inboxes.entry(ClientKey::from_wire(client)).or_default();
         if let Some((target, ino_for_push, grace_ms)) = will_revoke_push {
             // The `version` field of the MgrInvalidation carries
             // the grace milliseconds — clients interpret per the
             // `LEASE_INVAL_WILL_REVOKE_IN` contract documented on
             // the constant.
-            self.push_invalidation(
-                &target,
+            pushes.stage(
+                target,
                 ino_for_push,
                 grace_ms as u64,
                 InvalidationReason::WillRevokeIn,
@@ -482,15 +574,15 @@ impl LeaseRegistry {
                 .get(&ino)
                 .map(|s| s.readers.keys().cloned().collect())
                 .unwrap_or_default();
-            self.push_invalidation(
-                &deposed,
+            pushes.stage(
+                deposed,
                 ino,
                 new_version,
                 InvalidationReason::LeaseRevoked,
             );
             for r in readers {
-                self.push_invalidation(
-                    &r,
+                pushes.stage(
+                    r,
                     ino,
                     new_version,
                     InvalidationReason::LeaseRevoked,
@@ -502,6 +594,16 @@ impl LeaseRegistry {
             self.remember_version(ino, version);
         }
         grant_outcome
+    }
+
+    /// BUG-LEASE-4 (P1 #4, 2026-06-06) — caller-side commit of the
+    /// staged invalidations from `acquire_with_force_deferred`.
+    /// Idempotent: calling with an empty bundle is a noop.
+    pub fn flush_deferred_pushes(&mut self, pushes: DeferredPushes) {
+        for (target, ev) in pushes.items {
+            let inbox = self.inboxes.entry(target).or_default();
+            inbox.push(ev);
+        }
     }
 
     /// F-ioring-lease-5 (coco P2 #7): read-only "what would `release`
@@ -616,6 +718,14 @@ impl LeaseRegistry {
     /// to overflow since the last poll — F-ioring-lease-3's poller
     /// will then surface the loss to the client which invalidates
     /// every cached inode (plan §6.4).
+    // ── BUG-LEASE-4 (P1 #4, 2026-06-06) — deferred-push 2PC ────
+
+    // (see `DeferredPushes` below for the public type;
+    //  `acquire_with_force_deferred` / `flush_deferred_pushes` /
+    //  `revert_writer_acquire` cooperate to ensure no phantom
+    //  LeaseRevoked / WillRevokeIn events land in client inboxes
+    //  when the manager's etcd persist fails.)
+
     pub fn drain_invalidations(&mut self, client: &MgrClientId) -> (Vec<MgrInvalidation>, bool) {
         let me = ClientKey::from_wire(client);
         let Some(inbox) = self.inboxes.get_mut(&me) else {
@@ -767,23 +877,43 @@ impl LeaseRegistry {
         })
     }
 
-    /// F-ioring-lease-5 (coco P1 #6): precise rollback for a writer
-    /// AcquireLease whose etcd persistence failed AFTER the in-memory
-    /// grant landed. Restores ONLY the writer slot to `snapshot`'s
+    /// F-ioring-lease-5 (coco P1 #6) + BUG-LEASE-4 (P1 #4): precise
+    /// rollback for a writer AcquireLease whose etcd persistence
+    /// failed AFTER the in-memory grant landed. Restores the writer
+    /// slot AND (BUG-LEASE-4) the `version` field to `snapshot`'s
     /// shape; readers that subscribed during the etcd await are
-    /// preserved (release() — the pre-fix rollback — wrongly bumped
-    /// version + pushed a phantom WriterClosed to them).
+    /// preserved (the pre-F-ioring-lease-5 rollback abused
+    /// `release()`, which bumps version + pushes a phantom
+    /// WriterClosed).
     ///
     /// `snapshot = None` means "no entry existed pre-acquire" → clear
     /// the writer fields; if no readers joined, drop the empty entry.
-    /// `snapshot = Some(state)` means "writer was already me, this
-    /// was a refresh" → restore writer/host/deadline to the
-    /// pre-acquire values exactly.
+    /// `snapshot = Some(state)` means "an entry existed pre-acquire"
+    /// → restore writer/host/deadline/version exactly.
     ///
-    /// Does NOT touch `version` because `acquire()` itself does not
-    /// bump it; the only paths that bump version are `release()` and
-    /// `tick()`'s revoke. (If a future refactor changes that, this
-    /// helper MUST be updated to also revert `version`.)
+    /// **BUG-LEASE-4 (2026-06-06) — version rewind.** Pre-fix this
+    /// helper did NOT restore `version`, on the rationale that
+    /// `acquire()` itself never bumps version. But
+    /// `acquire_with_force` DOES bump on the force-revoke arm. With
+    /// the 2PC refactor (`acquire_with_force_deferred`), the caller
+    /// drops the staged pushes on etcd-fail so no client SEES the
+    /// version bump as `LeaseRevoked.version`, but the in-memory
+    /// `state.version` was still set. A future Granted-after-real-
+    /// commit would return that already-bumped version to the new
+    /// writer, leaving a gap with the persisted record (which still
+    /// points at the OLD writer's record). Net: when the next
+    /// successful Acquire bumps from N → N+2 in memory while etcd
+    /// only has the old N, leader failover replays a record that
+    /// claims a lower version than the live one, and any in-flight
+    /// invalidation event with the live version would dangle.
+    ///
+    /// `last_version` shadow is INTENTIONALLY NOT REWOUND — it is a
+    /// monotonic high-water mark; rewinding it would let a future
+    /// re-creation pick a lower version than this revert ever
+    /// observed, which breaks the L11 monotonicity invariant.
+    /// Keeping `last_version` at the bumped value just means a
+    /// future re-creation starts at the higher number, which is
+    /// correct.
     pub fn revert_writer_acquire(&mut self, ino: u64, snapshot: Option<InodeLeaseState>) {
         let Some(entry) = self.inodes.get_mut(&ino) else {
             return;
@@ -797,6 +927,14 @@ impl LeaseRegistry {
                 // so an etcd-failed force-acquire doesn't leak the
                 // half-progressed grace state into the next call.
                 entry.pending_revoke_at = s.pending_revoke_at;
+                // BUG-LEASE-4: rewind the version bump that
+                // `acquire_with_force`'s force-revoke arm would
+                // have applied. The `if` ensures we never lower an
+                // unbumped version (paranoid no-op for non-force
+                // paths).
+                if entry.version > s.version {
+                    entry.version = s.version;
+                }
             }
             None => {
                 entry.writer = None;
@@ -1404,6 +1542,197 @@ mod tests {
             r.release(&wb, 100),
             ReleaseOutcome::WriterClosed { new_version: 3 }
         );
+    }
+
+    // ─────────────── BUG-LEASE-4 (P1 #4) ────────────────────
+
+    #[test]
+    fn bug_lease_4_deferred_pushes_hold_lease_revoked_until_commit() {
+        // BUG-LEASE-4 KEY ASSERTION: the force-revoke arm of
+        // `acquire_with_force_deferred` STAGES LeaseRevoked events
+        // in the DeferredPushes bundle — they do NOT land in client
+        // inboxes until `flush_deferred_pushes` is called. This
+        // lets the production handler do (1) plan + memory mutate,
+        // (2) etcd persist, (3) on commit → flush, on fail → drop
+        // pushes + revert memory.
+        let mut r = reg_with_grace(0); // grace=0 → immediate force-revoke
+        let t0 = Instant::now();
+        let w_old = cid(1, 1, "deposed");
+        let w_new = cid(1, 2, "preempter");
+        let rd = cid(2, 3, "reader");
+
+        // Reader subscribes; writer 1 acquires.
+        let _ = r.acquire(&rd, 50, LEASE_MODE_READ, t0);
+        let _ = r.acquire(&w_old, 50, LEASE_MODE_WRITE, t0);
+        // Drain inboxes so the test sees only the BUG-LEASE-4 pushes.
+        let _ = r.drain_invalidations(&w_old);
+        let _ = r.drain_invalidations(&rd);
+
+        // First force call: starts the grace window (grace=0 so the
+        // SAME call at this Instant won't yet revoke — second call
+        // crosses the deadline). Stage WillRevokeIn.
+        let mut pushes1 = DeferredPushes::default();
+        let _ =
+            r.acquire_with_force_deferred(&w_new, 50, LEASE_MODE_WRITE, true, t0, &mut pushes1);
+        // The WillRevokeIn push is STAGED; w_old's inbox empty.
+        let (w_old_events_pre, _) = r.drain_invalidations(&w_old);
+        assert!(
+            w_old_events_pre.is_empty(),
+            "WillRevokeIn must NOT be in inbox before flush; got {w_old_events_pre:?}"
+        );
+        // (Simulate etcd OK for the RevokePending arm — flush.)
+        r.flush_deferred_pushes(pushes1);
+
+        // Second force call AFTER grace=0: force-revokes + grants.
+        let t1 = t0 + Duration::from_millis(1);
+        let mut pushes2 = DeferredPushes::default();
+        let out2 = r.acquire_with_force_deferred(
+            &w_new, 50, LEASE_MODE_WRITE, true, t1, &mut pushes2,
+        );
+        assert!(matches!(out2, AcquireOutcome::Granted { .. }));
+        // Two LeaseRevoked events staged (deposed + reader).
+        assert_eq!(
+            pushes2.len(),
+            2,
+            "BUG-LEASE-4: deposed writer + 1 reader → 2 LeaseRevoked pushes staged"
+        );
+
+        // BEFORE flush: NEITHER inbox has the LeaseRevoked.
+        // (w_old already saw the WillRevokeIn from pushes1; drain it
+        // first so we measure only the new staging.)
+        let (w_old_after_will, _) = r.drain_invalidations(&w_old);
+        assert!(
+            w_old_after_will.iter().all(|e| e.kind != LEASE_INVAL_LEASE_REVOKED),
+            "BUG-LEASE-4: w_old inbox must NOT contain LeaseRevoked before commit-flush; got {w_old_after_will:?}"
+        );
+        let (rd_pre, _) = r.drain_invalidations(&rd);
+        assert!(
+            rd_pre.iter().all(|e| e.kind != LEASE_INVAL_LEASE_REVOKED),
+            "BUG-LEASE-4: reader inbox must NOT contain LeaseRevoked before commit-flush; got {rd_pre:?}"
+        );
+
+        // Now flush (simulating etcd commit success).
+        r.flush_deferred_pushes(pushes2);
+        let (w_old_post, _) = r.drain_invalidations(&w_old);
+        let (rd_post, _) = r.drain_invalidations(&rd);
+        assert!(
+            w_old_post.iter().any(|e| e.kind == LEASE_INVAL_LEASE_REVOKED),
+            "after flush w_old must see LeaseRevoked: {w_old_post:?}"
+        );
+        assert!(
+            rd_post.iter().any(|e| e.kind == LEASE_INVAL_LEASE_REVOKED),
+            "after flush reader must see LeaseRevoked: {rd_post:?}"
+        );
+    }
+
+    #[test]
+    fn bug_lease_4_revert_rewinds_version_after_force_revoke() {
+        // BUG-LEASE-4 KEY ASSERTION: `revert_writer_acquire` rewinds
+        // the force-revoke's version bump when the snapshot's
+        // version is lower than the in-memory version. Pre-fix the
+        // revert ONLY restored writer/host/deadline/pending_revoke_at
+        // and left version bumped — so a future Open would get a
+        // lease_version that didn't correspond to any persisted
+        // record.
+        let mut r = reg_with_grace(0);
+        let t0 = Instant::now();
+        let w_old = cid(1, 1, "old");
+        let w_new = cid(1, 2, "new");
+
+        // w_old acquires (version=1).
+        let _ = r.acquire(&w_old, 60, LEASE_MODE_WRITE, t0);
+        let snap = r.inodes.get(&60).cloned();
+        assert_eq!(snap.as_ref().unwrap().version, 1);
+
+        // First force → RevokePending (starts grace). Drop pushes.
+        let mut p1 = DeferredPushes::default();
+        let _ = r.acquire_with_force_deferred(&w_new, 60, LEASE_MODE_WRITE, true, t0, &mut p1);
+        drop(p1);
+
+        // Second force past grace → Granted, force-revoke bumps to 2.
+        let t1 = t0 + Duration::from_millis(1);
+        let mut p2 = DeferredPushes::default();
+        let _ = r.acquire_with_force_deferred(&w_new, 60, LEASE_MODE_WRITE, true, t1, &mut p2);
+        let post = r.inodes.get(&60).unwrap().version;
+        assert_eq!(post, 2, "force-revoke bumped version 1→2");
+
+        // Simulate etcd-fail: drop pushes + revert.
+        drop(p2);
+        r.revert_writer_acquire(60, snap);
+        let reverted = r.inodes.get(&60).unwrap().version;
+        assert_eq!(
+            reverted, 1,
+            "BUG-LEASE-4: revert MUST rewind force-revoke's version bump"
+        );
+
+        // ALSO: w_old still holds the writer slot (snapshot restored).
+        let entry = r.inodes.get(&60).unwrap();
+        assert!(entry.writer.is_some(), "writer slot restored");
+        assert_eq!(
+            entry.writer.as_ref().unwrap().uuid,
+            [1u8; 16],
+            "snap's writer restored, NOT the preempter's"
+        );
+    }
+
+    #[test]
+    fn bug_lease_4_last_version_shadow_not_rewound_on_revert() {
+        // The shadow is monotonic HIGH-WATER. Even on revert, the
+        // shadow keeps the bumped value because:
+        //   (a) clients that observed an inbox draining of the
+        //       staged-but-then-flushed pushes need monotonic
+        //       reasoning when they re-Open the inode later, and
+        //   (b) the next Granted on this inode SHOULD start at
+        //       least at `shadow + 1` so a fresh writer doesn't
+        //       hand out the same version twice.
+        // (a) is moot in the revert-on-fail path — by definition no
+        // flush happened, so no client saw a version. But (b) still
+        // matters because the bump was in-memory at some point;
+        // future correctness of the shadow doesn't depend on
+        // "transactions" being externally visible.
+        let mut r = reg_with_grace(0);
+        let t0 = Instant::now();
+        let w_old = cid(1, 1, "old");
+        let w_new = cid(1, 2, "new");
+
+        let _ = r.acquire(&w_old, 70, LEASE_MODE_WRITE, t0);
+        let snap = r.inodes.get(&70).cloned();
+
+        // Trigger force-revoke (bumps shadow to 2).
+        let mut p1 = DeferredPushes::default();
+        let _ = r.acquire_with_force_deferred(&w_new, 70, LEASE_MODE_WRITE, true, t0, &mut p1);
+        drop(p1);
+        let t1 = t0 + Duration::from_millis(1);
+        let mut p2 = DeferredPushes::default();
+        let _ = r.acquire_with_force_deferred(&w_new, 70, LEASE_MODE_WRITE, true, t1, &mut p2);
+        drop(p2);
+        assert_eq!(r.last_version.get(&70).copied().unwrap_or(0), 2);
+
+        // Revert: in-memory state.version goes back to 1; shadow
+        // STAYS at 2 (high-water invariant).
+        r.revert_writer_acquire(70, snap);
+        assert_eq!(r.inodes.get(&70).unwrap().version, 1);
+        assert_eq!(
+            r.last_version.get(&70).copied().unwrap_or(0),
+            2,
+            "shadow MUST stay at the bumped value (high-water)"
+        );
+    }
+
+    #[test]
+    fn bug_lease_4_revert_handles_empty_pre_snapshot_no_panic() {
+        // The case where the pre-acquire snapshot is None (no entry
+        // existed). Reverting should drop the entry if no readers
+        // subscribed during the etcd await. This is the existing
+        // F-ioring-lease-5 behavior; BUG-LEASE-4 doesn't change it,
+        // but a regression test guards the helper's None arm
+        // against an accidental edit.
+        let mut r = reg_with_grace(0);
+        let w = cid(1, 7, "w");
+        assert!(!r.inodes.contains_key(&85));
+        let _ = r.acquire(&w, 85, LEASE_MODE_WRITE, Instant::now());
+        r.revert_writer_acquire(85, None);
+        assert!(!r.inodes.contains_key(&85));
     }
 
     #[test]
