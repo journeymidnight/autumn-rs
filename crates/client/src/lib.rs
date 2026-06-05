@@ -11,6 +11,11 @@ use autumn_rpc::partition_rpc::{self, *};
 use autumn_rpc::{RpcError, StatusCode};
 use bytes::Bytes;
 
+/// F-fuse-lease-1: inode-lease client helpers. Used by autumn-fuse
+/// `open`/`release` callbacks and re-exported by `autumn-ioring::lease`
+/// so the ioring daemon keeps its existing import path.
+pub mod lease;
+
 // ── Re-exports for SDK consumers ────────────────────────────────────────────
 
 pub use autumn_rpc::partition_rpc::RangeEntry;

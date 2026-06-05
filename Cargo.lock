@@ -160,7 +160,9 @@ dependencies = [
  "compio",
  "crc32c",
  "futures",
+ "thiserror 2.0.18",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -232,7 +234,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

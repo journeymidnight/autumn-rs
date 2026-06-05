@@ -88,6 +88,12 @@ fn main() -> Result<()> {
                 };
                 tracing::info!("connected to cluster");
 
+                // F-fuse-lease-1: spawn per-mount lease heartbeat +
+                // invalidation poll loops. They share the compio
+                // runtime and reference state.held_leases /
+                // state.invalidations via Rc<RefCell<…>>.
+                dispatch::spawn_lease_background_tasks(&state);
+
                 let sync_interval = Duration::from_secs(30);
                 let mut last_sync = std::time::Instant::now();
 

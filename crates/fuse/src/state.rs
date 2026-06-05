@@ -2,14 +2,32 @@
 //!
 //! Contains ClusterClient, inode cache, dirty tracking, and KV helper methods.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use anyhow::{anyhow, Context, Result};
 
+use autumn_client::lease::{DaemonClientId, InvalidationMap};
 use autumn_client::ClusterClient;
 
 use crate::schema::{InodeState, ROOT_INO};
+
+/// F-fuse-lease-1: per-inode lease bookkeeping on the fuse mount side.
+/// Mirrors `autumn-ioring`'s `SessionLease` shape so the same
+/// `apply_invalidation` / `cache_is_stale` helpers work both sides.
+#[derive(Clone, Debug)]
+pub struct FuseLease {
+    /// `LEASE_MODE_READ` or `LEASE_MODE_WRITE`, pinned at first Open.
+    pub mode: u8,
+    /// Refcount across this mount's `Open` calls for the same inode.
+    /// `Release` decrements; the 1→0 transition fires `ReleaseLease`
+    /// to the manager.
+    pub refcount: u32,
+    /// Server-side version handed back at AcquireLease. Used by the
+    /// (future, F-fuse-lease-4-equivalent) cache invalidation path.
+    pub version: u64,
+}
 
 /// Central filesystem state, lives on the compio thread (single-threaded, no locks).
 pub struct FsState {
@@ -22,6 +40,24 @@ pub struct FsState {
     pub inode_batch_end: u64,
     /// FUSE lookup refcounts (separate from open_count).
     pub lookup_count: HashMap<u64, u64>,
+
+    // ── F-fuse-lease-1 ────────────────────────────────────────────────
+    /// Per-mount daemon identity (kind = `LEASE_CLIENT_KIND_FUSE`,
+    /// fresh UUID at mount). Reused for every lease RPC so the
+    /// manager's lease-registry state stays stable for this mount.
+    /// `Rc` so the per-mount heartbeat / invalidation poll tasks can
+    /// hold clones without borrowing `FsState`.
+    pub client_id: Rc<DaemonClientId>,
+    /// Per-inode lease refcount + mode + version. Open allocates;
+    /// Release decrements; 1→0 fires `ReleaseLease`.
+    pub held_leases: Rc<RefCell<HashMap<u64, FuseLease>>>,
+    /// Per-inode minimum-valid-version. Updated by the per-mount
+    /// `session_invalidation_poll_loop` from the manager's
+    /// `WriterClosed` / `LeaseRevoked` push events; the read path
+    /// will use `cache_is_stale` against it for close-to-open
+    /// coherence (full path eviction wires in F-fuse-lease-2's
+    /// `notify_inval_inode` work).
+    pub invalidations: Rc<RefCell<InvalidationMap>>,
 }
 
 impl FsState {
@@ -29,6 +65,7 @@ impl FsState {
         let client = ClusterClient::connect(manager_addr)
             .await
             .context("connect to manager")?;
+        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "fuse".to_string());
         Ok(Self {
             client: Rc::new(client),
             inodes: HashMap::new(),
@@ -36,6 +73,9 @@ impl FsState {
             next_inode: ROOT_INO + 1,
             inode_batch_end: ROOT_INO + 1, // will trigger batch alloc on first use
             lookup_count: HashMap::new(),
+            client_id: Rc::new(DaemonClientId::new_fuse(host)),
+            held_leases: Rc::new(RefCell::new(HashMap::new())),
+            invalidations: Rc::new(RefCell::new(InvalidationMap::new())),
         })
     }
 
