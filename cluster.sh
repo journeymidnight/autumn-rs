@@ -280,7 +280,7 @@ compute_affinity_decision() {
 # port before returning.
 launch_extent_node() {
     local i="$1"
-    local port=$(( 9100 + i ))
+    local port=$(( ${AUTUMN_EXTENT_BASE_PORT:-9100} + i ))
     local disk_arg
     disk_arg=$(disk_args_for_node "$i")
     # F196: EN has no --shards flag — shard count == cpuset_len. Each
@@ -332,7 +332,7 @@ launch_extent_node() {
 # and multi-disk uniformly.
 format_extent_node() {
     local i="$1"
-    local port=$(( 9100 + i ))
+    local port=$(( ${AUTUMN_EXTENT_BASE_PORT:-9100} + i ))
     local disk_arg
     disk_arg=$(disk_args_for_node "$i")
     # Ensure each dir exists before format touches it. `format` would

@@ -36,6 +36,24 @@ use libc;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+// ─── Per-extent fallocate prealloc (opt-in) ──────────────────────────────────
+
+/// Read `AUTUMN_EN_PREALLOC_BYTES`: when set to a positive integer N, every
+/// freshly-created extent calls `fallocate(KEEP_SIZE, 0, N)` so the underlying
+/// disk blocks are pre-reserved (saves ext4 extent-tree updates + per-grow
+/// journal entries on subsequent appends). Default 0 = disabled, matching
+/// pre-change behaviour. Cached via OnceLock to avoid env-read overhead in
+/// the hot extent-creation path.
+fn en_prealloc_bytes() -> u64 {
+    static CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| {
+        std::env::var("AUTUMN_EN_PREALLOC_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
 // ─── Per-node append metrics ─────────────────────────────────────────────────
 
 pub(crate) struct ExtentAppendMetrics {
@@ -3083,6 +3101,59 @@ impl ExtentNode {
             .open(&path)
             .await
             .map_err(|e| e.to_string())?;
+
+        // Optional ext4 block preallocation via `fallocate(FALLOC_FL_KEEP_SIZE)`.
+        // Triggered ONLY when `AUTUMN_EN_PREALLOC_BYTES` is set to a positive
+        // size (default 0 = disabled). Preallocates the extent file's disk
+        // blocks up front so subsequent appends don't pay the ext4 extent-tree
+        // update + block-allocation journal cost on each grow. `KEEP_SIZE`
+        // preserves the inode size at 0 so `file.metadata().len()`-based
+        // `len` recovery (load_extents) keeps working.
+        //
+        // SAFE for write-through cache + nobarrier (the same conditions under
+        // which fdatasync is a no-op). On crash mid-append the unwritten
+        // preallocated blocks may contain stale (zero / garbage) data, but
+        // autumn's commit protocol (min-replica truncate-on-mismatch) and
+        // the in-memory `len` watermark fence reads against any byte past
+        // the acked commit length. So preallocated-but-unwritten blocks are
+        // inert.
+        let prealloc = en_prealloc_bytes();
+        if prealloc > 0 {
+            use std::os::fd::AsRawFd;
+            let fd = file.as_raw_fd();
+            let len_arg = prealloc as i64;
+            let join = compio::runtime::spawn_blocking(move || -> std::io::Result<()> {
+                // SAFETY: fd is owned by `file`, kept alive by this scope.
+                let rc = unsafe {
+                    libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, len_arg)
+                };
+                if rc == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            })
+            .await;
+            match join {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    // ENOSPC / EOPNOTSUPP / etc. — log but don't fail extent open.
+                    // The extent still serves writes; just no prealloc benefit.
+                    tracing::warn!(
+                        extent_id,
+                        error = %e,
+                        "fallocate(KEEP_SIZE) failed; continuing without prealloc"
+                    );
+                }
+                Err(_panic) => {
+                    tracing::warn!(
+                        extent_id,
+                        "fallocate spawn_blocking panicked; continuing without prealloc"
+                    );
+                }
+            }
+        }
+
         let len = file
             .metadata()
             .await
