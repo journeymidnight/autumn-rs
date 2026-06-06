@@ -338,6 +338,11 @@ pub struct ClusterClient {
     /// surfaces as `ConnectionError`; the existing `mgr_call_retry`
     /// path's `rotate_manager` then walks to the next manager address.
     rpc_timeout: Cell<Option<Duration>>,
+    /// Bug #2 fix (2026-06-06) — first-attempt timeout for
+    /// `call_ps_for_key` / `call_ps_for_part`. See
+    /// `DEFAULT_FIRST_ATTEMPT_TIMEOUT` for the rationale. `None`
+    /// disables fast-fail (every attempt uses the full `rpc_timeout`).
+    first_attempt_timeout: Cell<Option<Duration>>,
 }
 
 /// Default per-call timeout for cluster RPCs. Generous enough to cover
@@ -345,6 +350,35 @@ pub struct ClusterClient {
 /// the server, tight enough to prevent open-ended hangs from a
 /// paged-out / dead peer.
 pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bug #2 fix (2026-06-06) — short timeout used ONLY for the first
+/// attempt of `call_ps_for_key` / `call_ps_for_part`. Subsequent
+/// retries fall back to the full `DEFAULT_RPC_TIMEOUT`.
+///
+/// **Why this exists:** when a PS process is killed and restarted
+/// (or the manager evicts + reassigns a partition between PS instances),
+/// the SDK's cached `ps_conns[ps_addr]` points at the dead listener.
+/// The next call against that conn hangs until TCP RST (which can take
+/// minutes on a `kill -9` of the listener) OR the 30 s
+/// `DEFAULT_RPC_TIMEOUT` — whichever wins. Either way, every key
+/// touching that PS pays a 30 s penalty before the retry loop can
+/// drop the conn + reconnect.
+///
+/// With this 5 s first-attempt cap:
+///   - Healthy steady-state calls return well under 5 s → no change.
+///   - Stale-conn calls fail at 5 s → `ps_conns.remove(ps_addr)` →
+///     `refresh_regions()` + retry uses the FULL 30 s timeout against
+///     a freshly-resolved listener. Total worst case: ~5 s + a healthy
+///     RTT, vs. ~30 s pre-fix.
+///   - Legit long calls (rare, e.g. bulk stream_put of multi-GiB) fail
+///     fast on attempt 0 then succeed on attempt 1. Costs ~5 s of
+///     extra latency for callers that can run > 5 s — acceptable
+///     trade-off and avoidable via `set_rpc_timeout` for callers that
+///     know they need it.
+///
+/// Tunable via `set_first_attempt_timeout`; `None` disables the
+/// fast-fail (every attempt uses the full `rpc_timeout`).
+pub const DEFAULT_FIRST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl ClusterClient {
     /// Current manager address.
@@ -444,6 +478,7 @@ impl ClusterClient {
             ps_details: RefCell::new(HashMap::new()),
             part_addrs: RefCell::new(HashMap::new()),
             rpc_timeout: Cell::new(Some(DEFAULT_RPC_TIMEOUT)),
+            first_attempt_timeout: Cell::new(Some(DEFAULT_FIRST_ATTEMPT_TIMEOUT)),
         };
 
         // Try connecting to each manager until one responds
@@ -637,8 +672,25 @@ impl ClusterClient {
     /// field docstring for the partition-handle-drop hang this guards
     /// against.
     pub async fn ps_call(&self, ps_addr: &str, msg_type: u8, payload: Bytes) -> Result<Bytes> {
+        self.ps_call_with_timeout(ps_addr, msg_type, payload, self.rpc_timeout.get())
+            .await
+    }
+
+    /// Bug #2 fix (2026-06-06) — `ps_call` variant that takes an
+    /// explicit per-call timeout override. `call_ps_for_key` /
+    /// `call_ps_for_part` use this on attempt 0 to fast-fail a stale
+    /// PS connection (the post-`kill -9`-then-restart window) without
+    /// waiting the full 30 s `rpc_timeout`. See
+    /// `first_attempt_effective_timeout`.
+    pub async fn ps_call_with_timeout(
+        &self,
+        ps_addr: &str,
+        msg_type: u8,
+        payload: Bytes,
+        timeout: Option<Duration>,
+    ) -> Result<Bytes> {
         let client = self.get_ps_client(ps_addr).await?;
-        let outcome = match self.rpc_timeout.get() {
+        let outcome = match timeout {
             None => client.call(msg_type, payload).await,
             Some(t) => client.call_timeout(msg_type, payload, t).await,
         };
@@ -675,6 +727,43 @@ impl ClusterClient {
     /// has explicitly opted out (discouraged).
     pub fn rpc_timeout(&self) -> Option<Duration> {
         self.rpc_timeout.get()
+    }
+
+    /// Bug #2 fix (2026-06-06) — override the first-attempt timeout
+    /// for `call_ps_for_key` / `call_ps_for_part`. See
+    /// `DEFAULT_FIRST_ATTEMPT_TIMEOUT` for the rationale.
+    pub fn set_first_attempt_timeout(&self, t: Option<Duration>) {
+        self.first_attempt_timeout.set(t);
+    }
+
+    /// Read the current first-attempt timeout.
+    pub fn first_attempt_timeout(&self) -> Option<Duration> {
+        self.first_attempt_timeout.get()
+    }
+
+    /// Resolve the effective timeout for the Nth attempt of a key /
+    /// part-bound RPC. Pure-fn so the policy is unit-testable.
+    ///   - `attempt == 0`: `min(rpc_timeout, first_attempt_timeout)`
+    ///     if both are Some — fast-fail a stale conn within the
+    ///     first-attempt budget so the retry path engages quickly.
+    ///     If `first_attempt_timeout` is None: use `rpc_timeout`.
+    ///   - `attempt > 0`: `rpc_timeout` — the cached conn is freshly
+    ///     dropped, the refresh has run, give the new connection the
+    ///     full budget.
+    ///
+    /// Both `None` ⇒ `None` (wait forever — discouraged but supported
+    /// for callers that explicitly opted out).
+    fn first_attempt_effective_timeout(&self, attempt: u32) -> Option<Duration> {
+        let rpc_t = self.rpc_timeout.get();
+        if attempt > 0 {
+            return rpc_t;
+        }
+        match (rpc_t, self.first_attempt_timeout.get()) {
+            (Some(r), Some(f)) => Some(r.min(f)),
+            (Some(r), None) => Some(r),
+            (None, Some(f)) => Some(f),
+            (None, None) => None,
+        }
     }
 
     /// Look up the cached `region_epoch` for a partition. Returns 0 when
@@ -832,8 +921,13 @@ impl ClusterClient {
                 .await
                 .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
             let region_epoch = self.lookup_epoch_for_part(part_id);
+            // Bug #2 fix: fast-fail a stale conn within
+            // `first_attempt_effective_timeout(0)` instead of the full
+            // 30 s `rpc_timeout`. Subsequent attempts use the full
+            // budget against the freshly-reconnected listener.
+            let t = self.first_attempt_effective_timeout(attempt);
             match self
-                .ps_call(&ps_addr, msg_type, build_payload(part_id, region_epoch))
+                .ps_call_with_timeout(&ps_addr, msg_type, build_payload(part_id, region_epoch), t)
                 .await
             {
                 Ok(b) => return Ok(b),
@@ -879,7 +973,12 @@ impl ClusterClient {
                 .resolve_part_id(part_id)
                 .await
                 .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
-            match self.ps_call(&ps_addr, msg_type, payload.clone()).await {
+            // Bug #2 fix: same fast-fail-on-attempt-0 as call_ps_for_key.
+            let t = self.first_attempt_effective_timeout(attempt);
+            match self
+                .ps_call_with_timeout(&ps_addr, msg_type, payload.clone(), t)
+                .await
+            {
                 Ok(b) => return Ok(b),
                 Err(e) => {
                     // F225: short-circuit DETERMINISTIC failures. Admin ops
@@ -2157,6 +2256,101 @@ mod cluster_ready_tests {
         let ps_details: HashMap<u64, String> = HashMap::new();
         let s = cluster_ready_summary(&regions, &part_addrs, &ps_details);
         assert_eq!(s.missing_addrs, vec![13, 50, 99]);
+    }
+}
+
+#[cfg(test)]
+mod first_attempt_timeout_tests {
+    //! Bug #2 fix (2026-06-06) — `first_attempt_effective_timeout` is
+    //! the policy that fast-fails a stale PS conn within 5 s on the
+    //! first attempt of `call_ps_for_key` / `call_ps_for_part`,
+    //! falling back to the full 30 s `rpc_timeout` on retries against
+    //! the freshly-reconnected listener.
+
+    use super::*;
+
+    fn client_with(rpc: Option<Duration>, first: Option<Duration>) -> ClusterClient {
+        // We can't actually `connect` in unit tests, so build a fake
+        // shell. The internal fields are private but the public
+        // setters cover what the test needs.
+        let cluster = compio::runtime::Runtime::new().unwrap().block_on(async {
+            // Touch nothing on the wire; just exercise the policy.
+            // We construct a fake ClusterClient via the visible API:
+            // there isn't one, so we use a real address that won't
+            // be dialled (the policy fn doesn't dial).
+            ClusterClient {
+                manager_addrs: vec!["127.0.0.1:1".to_string()],
+                current_mgr: Cell::new(0),
+                mgr_conn: Rc::new(RefCell::new(None)),
+                ps_conns: RefCell::new(HashMap::new()),
+                regions: RefCell::new(Vec::new()),
+                ps_details: RefCell::new(HashMap::new()),
+                part_addrs: RefCell::new(HashMap::new()),
+                rpc_timeout: Cell::new(rpc),
+                first_attempt_timeout: Cell::new(first),
+            }
+        });
+        cluster
+    }
+
+    #[test]
+    fn attempt_0_uses_min_of_rpc_and_first_attempt() {
+        let c = client_with(
+            Some(Duration::from_secs(30)),
+            Some(Duration::from_secs(5)),
+        );
+        assert_eq!(
+            c.first_attempt_effective_timeout(0),
+            Some(Duration::from_secs(5)),
+            "attempt 0 → fast-fail at 5 s (min)"
+        );
+    }
+
+    #[test]
+    fn attempt_1_falls_back_to_full_rpc_timeout() {
+        let c = client_with(
+            Some(Duration::from_secs(30)),
+            Some(Duration::from_secs(5)),
+        );
+        assert_eq!(
+            c.first_attempt_effective_timeout(1),
+            Some(Duration::from_secs(30)),
+            "attempt 1 → freshly reconnected, give it the full 30 s"
+        );
+    }
+
+    #[test]
+    fn no_first_attempt_timeout_uses_rpc_timeout() {
+        let c = client_with(Some(Duration::from_secs(30)), None);
+        assert_eq!(c.first_attempt_effective_timeout(0), Some(Duration::from_secs(30)));
+        assert_eq!(c.first_attempt_effective_timeout(1), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn no_rpc_timeout_uses_first_attempt_on_first() {
+        // Discouraged but supported.
+        let c = client_with(None, Some(Duration::from_secs(5)));
+        assert_eq!(c.first_attempt_effective_timeout(0), Some(Duration::from_secs(5)));
+        assert_eq!(c.first_attempt_effective_timeout(1), None);
+    }
+
+    #[test]
+    fn both_none_means_wait_forever() {
+        let c = client_with(None, None);
+        assert_eq!(c.first_attempt_effective_timeout(0), None);
+        assert_eq!(c.first_attempt_effective_timeout(1), None);
+    }
+
+    #[test]
+    fn first_attempt_longer_than_rpc_clamps_to_rpc() {
+        // Edge case: an operator sets `set_first_attempt_timeout`
+        // to a value LARGER than `rpc_timeout`. The min ensures we
+        // never go above `rpc_timeout` (it's a hard ceiling).
+        let c = client_with(
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_secs(10)),
+        );
+        assert_eq!(c.first_attempt_effective_timeout(0), Some(Duration::from_secs(2)));
     }
 }
 
