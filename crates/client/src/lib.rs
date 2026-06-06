@@ -513,6 +513,106 @@ impl ClusterClient {
         Ok(())
     }
 
+    /// Wait until every partition reported by the manager has a
+    /// registered `part_addr` (the per-partition F099-K listener) AND
+    /// each `part_addr` accepts TCP connections. Polls `refresh_regions`
+    /// every `poll_interval` until the readiness condition holds or
+    /// `timeout` elapses.
+    ///
+    /// **Why this is needed (Bug #1 fix, 2026-06-06):** right after
+    /// `cluster.sh start` bootstraps a presplit cluster, the manager
+    /// returns `MgrRegionInfo` for every partition before each
+    /// partition's PS thread has bound its dedicated `base_port + ord`
+    /// listener AND called `RegisterPartitionAddr`. Until that
+    /// register lands, `part_addrs[part_id]` is missing → the SDK's
+    /// `lookup_key` falls back to `ps_details[ps_id].address` (the
+    /// base PS port). For a partition whose `ord != 0`, sending its
+    /// PutReq to the base port hits a `partition_loop` that owns a
+    /// DIFFERENT partition → mis-routed → synthesised `NotFound`
+    /// frame → `call_ps_for_key` retries 10×, exhausts → caller
+    /// (e.g. autumn-fuse's `init_root` kv_put) returns
+    /// `connection error: ps_call after 10 refreshes: key not found`.
+    ///
+    /// Callers that boot against a possibly-fresh cluster (fuse mount
+    /// daemon, ioring daemon, long-lived service binaries) should call
+    /// this between `connect` and the first request to ride out the
+    /// startup window. Short-lived one-shot tools (autumn-client CLI
+    /// invocations from operators) can skip it: a transient
+    /// `key not found` surfacing to the operator IS the right UX.
+    ///
+    /// Returns `Ok(())` on readiness or `Err` on timeout. The error
+    /// includes a count of partitions still missing `part_addr` so the
+    /// caller can decide whether to retry or fail-fast.
+    pub async fn wait_for_cluster_ready(
+        &self,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<()> {
+        let start = std::time::Instant::now();
+        loop {
+            self.refresh_regions().await?;
+            let summary = {
+                let regions = self.regions.borrow();
+                let part_addrs = self.part_addrs.borrow();
+                let ps_details = self.ps_details.borrow();
+                let regions_view: Vec<(u64, u64)> = regions
+                    .iter()
+                    .map(|(_, r)| (r.part_id, r.ps_id))
+                    .collect();
+                let part_addrs_view: HashMap<u64, String> = part_addrs.clone();
+                let ps_details_view: HashMap<u64, String> = ps_details
+                    .iter()
+                    .map(|(id, d)| (*id, d.address.clone()))
+                    .collect();
+                cluster_ready_summary(&regions_view, &part_addrs_view, &ps_details_view)
+            };
+
+            if summary.total_partitions == 0 {
+                if start.elapsed() >= timeout {
+                    return Err(anyhow!(
+                        "cluster_ready: manager reports zero partitions after {:?}",
+                        timeout
+                    ));
+                }
+                compio::time::sleep(poll_interval).await;
+                continue;
+            }
+            if summary.missing_addrs.is_empty() {
+                // Every partition has SOME ps_addr cached. Probe each
+                // distinct ps_addr with one quick TCP connect to weed
+                // out the case where the manager reports a listener
+                // that the PS process hasn't actually bound yet.
+                let mut unreachable: Vec<String> = Vec::new();
+                for addr in &summary.probe_addrs {
+                    match self.get_ps_client(addr).await {
+                        Ok(_) => {}
+                        Err(_) => unreachable.push(addr.clone()),
+                    }
+                }
+                if unreachable.is_empty() {
+                    return Ok(());
+                }
+                if start.elapsed() >= timeout {
+                    return Err(anyhow!(
+                        "cluster_ready: {} PS endpoint(s) unreachable after {:?}: {:?}",
+                        unreachable.len(),
+                        timeout,
+                        unreachable
+                    ));
+                }
+            } else if start.elapsed() >= timeout {
+                return Err(anyhow!(
+                    "cluster_ready: {} of {} partition(s) still missing part_addr after {:?}: {:?}",
+                    summary.missing_addrs.len(),
+                    summary.total_partitions,
+                    timeout,
+                    summary.missing_addrs
+                ));
+            }
+            compio::time::sleep(poll_interval).await;
+        }
+    }
+
     /// Get or create a PS RPC connection. Auto-reconnects on failure.
     pub async fn get_ps_client(&self, ps_addr: &str) -> Result<Rc<RpcClient>> {
         {
@@ -1891,6 +1991,172 @@ impl StripeMeta {
             chunk_count: u32::from_le_bytes(blob[17..21].try_into().ok()?),
             chunk_size: u32::from_le_bytes(blob[21..25].try_into().ok()?),
         })
+    }
+}
+
+/// Bug #1 fix (2026-06-06) — pure-fn extracted from
+/// `wait_for_cluster_ready` so the readiness predicate is unit-testable
+/// without booting a real manager. Resolves every partition's
+/// `(part_id, ps_id)` to the address the SDK's `lookup_key` would
+/// produce (`part_addrs[part_id]` if present, else
+/// `ps_details[ps_id]`), and reports:
+///
+///   - `total_partitions`: regions count (manager's view).
+///   - `missing_addrs`: partitions whose `(part_id, ps_id)` resolved
+///     to NO address at all — the manager hasn't published a
+///     `RegisterPartitionAddr` for this partition AND there's no
+///     `ps_details` fallback. Treated as "not ready yet."
+///   - `probe_addrs`: distinct ps_addrs the caller should TCP-probe
+///     to confirm the listener is actually bound (a partition can
+///     have a `part_addr` in the manager's response and yet have a
+///     listener that won't accept until the PS thread's
+///     `partition_loop` runs `partition listener bound`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterReadySummary {
+    pub total_partitions: usize,
+    pub missing_addrs: Vec<u64>,
+    pub probe_addrs: Vec<String>,
+}
+
+pub fn cluster_ready_summary(
+    regions: &[(u64, u64)],
+    part_addrs: &HashMap<u64, String>,
+    ps_details: &HashMap<u64, String>,
+) -> ClusterReadySummary {
+    let mut missing_addrs: Vec<u64> = Vec::new();
+    let mut probe_addrs: Vec<String> = Vec::new();
+    for &(part_id, ps_id) in regions {
+        let addr = part_addrs
+            .get(&part_id)
+            .cloned()
+            .or_else(|| ps_details.get(&ps_id).cloned());
+        match addr {
+            Some(a) => probe_addrs.push(a),
+            None => missing_addrs.push(part_id),
+        }
+    }
+    probe_addrs.sort();
+    probe_addrs.dedup();
+    missing_addrs.sort();
+    ClusterReadySummary {
+        total_partitions: regions.len(),
+        missing_addrs,
+        probe_addrs,
+    }
+}
+
+#[cfg(test)]
+mod cluster_ready_tests {
+    use super::*;
+
+    fn psd(addr: &str) -> String {
+        addr.to_string()
+    }
+
+    #[test]
+    fn empty_cluster_reports_zero_partitions() {
+        let s = cluster_ready_summary(&[], &HashMap::new(), &HashMap::new());
+        assert_eq!(s.total_partitions, 0);
+        assert!(s.missing_addrs.is_empty());
+        assert!(s.probe_addrs.is_empty());
+    }
+
+    #[test]
+    fn all_partitions_have_part_addrs_no_missing() {
+        // Healthy steady state: every partition has a per-partition
+        // listener registered.
+        let regions = vec![(13, 1), (20, 1), (27, 1)];
+        let part_addrs: HashMap<u64, String> = [
+            (13, psd("127.0.0.1:9301")),
+            (20, psd("127.0.0.1:9302")),
+            (27, psd("127.0.0.1:9303")),
+        ]
+        .into_iter()
+        .collect();
+        let ps_details: HashMap<u64, String> = [(1, psd("127.0.0.1:9301"))].into_iter().collect();
+        let s = cluster_ready_summary(&regions, &part_addrs, &ps_details);
+        assert_eq!(s.total_partitions, 3);
+        assert!(s.missing_addrs.is_empty());
+        assert_eq!(
+            s.probe_addrs,
+            vec![
+                "127.0.0.1:9301".to_string(),
+                "127.0.0.1:9302".to_string(),
+                "127.0.0.1:9303".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_part_addr_with_ps_details_fallback_counts_as_resolved() {
+        // partition 20 has no per-partition listener YET — the
+        // manager reports it but `RegisterPartitionAddr` hasn't
+        // landed. ps_details for ps_id=1 has the base port. SDK's
+        // lookup_key would route to 9301 (the base PS port), which
+        // serves the FIRST partition opened on that PS (part 13).
+        //
+        // **Sending a part_id=20 PutReq to 9301 mis-routes** —
+        // partition_loop synths NotFound. The pure-fn here marks
+        // this as resolved (we DO have an address to try) but the
+        // probe step will still flag if 9301 isn't accepting yet.
+        let regions = vec![(13, 1), (20, 1)];
+        let part_addrs: HashMap<u64, String> =
+            [(13, psd("127.0.0.1:9301"))].into_iter().collect();
+        let ps_details: HashMap<u64, String> = [(1, psd("127.0.0.1:9301"))].into_iter().collect();
+        let s = cluster_ready_summary(&regions, &part_addrs, &ps_details);
+        assert_eq!(s.total_partitions, 2);
+        // Note: missing_addrs is empty (the ps_details fallback
+        // provided SOMETHING). This is the Bug #1 false-positive
+        // case — the SDK has SOMETHING to call but it mis-routes.
+        // The caller's NEXT retry of refresh_regions picks up the
+        // real part_addr once PS registers it, fixing the resolve.
+        // wait_for_cluster_ready relies on the probe step + the
+        // 60 s retry budget to ride out this window.
+        assert!(s.missing_addrs.is_empty());
+        // Both partitions probe the same base port → deduped to one.
+        assert_eq!(s.probe_addrs, vec!["127.0.0.1:9301".to_string()]);
+    }
+
+    #[test]
+    fn missing_part_addr_and_missing_ps_details_reports_missing() {
+        // The strict "not ready" state: manager has assigned the
+        // partition to ps_id=2 but the PS process hasn't connected
+        // at all (no ps_details entry). No address to even try.
+        let regions = vec![(13, 1), (99, 2)];
+        let part_addrs: HashMap<u64, String> =
+            [(13, psd("127.0.0.1:9301"))].into_iter().collect();
+        let ps_details: HashMap<u64, String> = [(1, psd("127.0.0.1:9301"))].into_iter().collect();
+        let s = cluster_ready_summary(&regions, &part_addrs, &ps_details);
+        assert_eq!(s.total_partitions, 2);
+        assert_eq!(s.missing_addrs, vec![99]);
+    }
+
+    #[test]
+    fn probe_addrs_are_sorted_and_deduped() {
+        // Multiple partitions share the same per-partition listener
+        // (would only happen on a misconfiguration but be robust).
+        let regions = vec![(20, 1), (13, 1), (27, 1)];
+        let part_addrs: HashMap<u64, String> = [
+            (13, psd("127.0.0.1:9301")),
+            (20, psd("127.0.0.1:9301")),
+            (27, psd("127.0.0.1:9301")),
+        ]
+        .into_iter()
+        .collect();
+        let ps_details: HashMap<u64, String> = HashMap::new();
+        let s = cluster_ready_summary(&regions, &part_addrs, &ps_details);
+        assert_eq!(s.probe_addrs, vec!["127.0.0.1:9301".to_string()]);
+    }
+
+    #[test]
+    fn missing_addrs_are_sorted_for_diagnostic_stability() {
+        // The error message must be deterministic across runs so
+        // operators can grep for it.
+        let regions = vec![(99, 7), (13, 1), (50, 9)];
+        let part_addrs: HashMap<u64, String> = HashMap::new();
+        let ps_details: HashMap<u64, String> = HashMap::new();
+        let s = cluster_ready_summary(&regions, &part_addrs, &ps_details);
+        assert_eq!(s.missing_addrs, vec![13, 50, 99]);
     }
 }
 

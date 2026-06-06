@@ -202,6 +202,26 @@ async fn run_runtime(idx: usize, socket: PathBuf, args: Args) -> Result<()> {
     let cluster = ClusterClient::connect(&args.manager)
         .await
         .with_context(|| format!("runtime {idx}: connect ClusterClient"))?;
+
+    // Bug #1 fix (2026-06-06) — same fresh-bootstrap window the fuse
+    // mount rides out via `wait_for_cluster_ready`. The daemon's
+    // session_handler does its own SDK kv_gets for `resolve_path`
+    // (look up inode + dirent by name) AND AcquireLease — both hit
+    // the same mis-route window if a partition's `RegisterPartitionAddr`
+    // hasn't landed yet. Waiting here keeps the first session's Open
+    // SQE from spinning forever in `wait_completion` against an
+    // EIO-on-startup daemon.
+    if let Err(e) = cluster
+        .wait_for_cluster_ready(
+            Duration::from_secs(60),
+            Duration::from_millis(250),
+        )
+        .await
+    {
+        tracing::error!(idx, error = %e, "cluster not ready in 60s");
+        anyhow::bail!("runtime {idx}: cluster not ready: {e}");
+    }
+    tracing::info!(idx, "cluster ready (all partition listeners reachable)");
     let cluster = Rc::new(cluster);
 
     let listener = compio::net::UnixListener::bind(&socket)

@@ -122,6 +122,28 @@ fn main() -> Result<()> {
                 };
                 tracing::info!("connected to cluster");
 
+                // Bug #1 fix (2026-06-06) — ride out the fresh-bootstrap
+                // window where manager has assigned partitions but the
+                // PS process hasn't yet bound each F099-K listener +
+                // called `RegisterPartitionAddr`. Without this, fuse's
+                // init_root kv_put hits 10× mis-route → `ps_call after
+                // 10 refreshes: key not found`. 60 s budget is generous
+                // enough for a hot-restart-on-loaded-cluster (a few
+                // hundred MiB of WAL replay per partition); 250 ms poll
+                // is cheap.
+                if let Err(e) = state
+                    .client
+                    .wait_for_cluster_ready(
+                        std::time::Duration::from_secs(60),
+                        std::time::Duration::from_millis(250),
+                    )
+                    .await
+                {
+                    tracing::error!(error = %e, "cluster did not become ready in 60s");
+                    return;
+                }
+                tracing::info!("cluster ready (all partition listeners reachable)");
+
                 // F-fuse-lease-2: build the invalidator that the
                 // poll loop calls per WriterClosed/LeaseRevoked
                 // event. `inval_inode(ino, 0, 0)` drops both
