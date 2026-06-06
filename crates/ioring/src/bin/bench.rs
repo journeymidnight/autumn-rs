@@ -86,6 +86,12 @@ struct Args {
     /// must fit depth+1 slots. Default 64 MiB.
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     pool_size: u64,
+
+    /// Mode: "read" (default) or "write". Write mode opens `key` with a
+    /// WRITE lease and submits Write SQEs into the same per-slot buffer
+    /// (pre-filled once with a deterministic payload).
+    #[arg(long, default_value = "read")]
+    mode: String,
 }
 
 fn main() -> Result<()> {
@@ -211,6 +217,12 @@ fn worker(
         }
     };
     client.write_buf(path_slot, path_bytes);
+    let is_write_mode = args.mode == "write";
+    let open_lease_mode = if is_write_mode {
+        autumn_ioring::sqe::SQE_LEASE_MODE_WRITE
+    } else {
+        autumn_ioring::sqe::SQE_LEASE_MODE_READ
+    };
     let _ = client.submit(Sqe {
         opcode: Opcode::Open,
         ring_fd: 0,
@@ -218,9 +230,7 @@ fn worker(
         length: path_bytes.len() as u32,
         buf_offset: path_slot,
         user_data: u64::MAX, // sentinel for OPEN
-        // bench reads, never writes — request a read-only lease so
-        // multiple bench instances can share the same file.
-        lease_mode: autumn_ioring::sqe::SQE_LEASE_MODE_READ,
+        lease_mode: open_lease_mode,
     });
     let cqe = client.wait_completion(args.idle_us);
     if cqe.result < 0 {
@@ -242,12 +252,24 @@ fn worker(
         }
     }
 
-    // Prime: submit `depth` reads.
+    // Pick opcode + pre-fill write payload once (so each thread reuses
+    // its slot's bytes for every Write SQE — measures wire/store path
+    // not /dev/urandom).
+    let op = if is_write_mode { Opcode::Write } else { Opcode::Read };
+    if is_write_mode {
+        let payload: Vec<u8> =
+            (0..args.read_size as usize).map(|i| (i % 251) as u8).collect();
+        for &slot in &slots {
+            client.write_buf(slot, &payload);
+        }
+    }
+
+    // Prime: submit `depth` ops.
     for (i, &slot) in slots.iter().enumerate() {
         let _ = client.submit(Sqe {
-            opcode: Opcode::Read,
+            opcode: op,
             ring_fd,
-            offset: 0, // hot key, same data
+            offset: 0, // hot offset, same data
             length: args.read_size,
             buf_offset: slot,
             user_data: i as u64,
@@ -279,7 +301,7 @@ fn worker(
         }
         for cqe in completions.drain(..) {
             if cqe.result < 0 {
-                tracing::warn!(tid, errno = -cqe.result, "read errno");
+                tracing::warn!(tid, errno = -cqe.result, "I/O errno");
                 continue;
             }
             local_ops += 1;
@@ -287,9 +309,9 @@ fn worker(
             let slot_idx = cqe.user_data as usize;
             if slot_idx < slots.len() {
                 let slot = slots[slot_idx];
-                // Re-issue.
+                // Re-issue same opcode.
                 let _ = client.submit(Sqe {
-                    opcode: Opcode::Read,
+                    opcode: op,
                     ring_fd,
                     offset: 0,
                     length: args.read_size,
