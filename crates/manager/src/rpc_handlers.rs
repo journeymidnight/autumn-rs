@@ -102,43 +102,113 @@ impl AutumnManager {
         }
     }
 
+    /// Bug #3 fix (2026-06-06) — pipeline frame dispatch.
+    ///
+    /// **Pre-fix** this loop was sequential: `read frame → await
+    /// dispatch → write response → read next frame`. The await on
+    /// dispatch held off the next read. With long-poll handlers
+    /// (`handle_poll_invalidations` parks for `LONG_POLL_WAIT = 10 s`),
+    /// **every subsequent request on the same TCP conn waited for the
+    /// parked poll to return** — head-of-line blocking.
+    ///
+    /// The ioring daemon multiplexes all 8 sessions' lease RPCs
+    /// (8 × poll_invalidations + 8 × heartbeats) onto the single
+    /// `ClusterClient.mgr_conn`. The first poll parked for 10 s; the
+    /// 7 follow-up polls + every AcquireLease behind them stalled.
+    /// Daemon's 30 s `DEFAULT_RPC_TIMEOUT` fired, evicted the conn,
+    /// reconnected — but the 16 in-flight `mgr_call` futures still
+    /// each held an `Rc<RpcClient>` for their own 30 s wait. Daemon
+    /// accumulated **stale RpcClient instances (TCP fds) at ~0.15 conn/s**
+    /// (487 ESTABLISHED to manager observed after 90 min).
+    ///
+    /// **Post-fix**: every frame's dispatch runs in a detached task;
+    /// completed responses are funneled through an unbounded
+    /// `futures::channel::mpsc` to a dedicated writer task. Reader,
+    /// writer, and dispatchers all run concurrently on the same
+    /// compio runtime (thread-per-core, !Send is fine — no atomics
+    /// needed). Mirrors `partition-server::handle_ps_connection`
+    /// (Section 13.1) and `stream::extent_node::handle_connection`.
+    /// Response order is best-effort completion order (not request
+    /// order), which is correct: every frame carries its own
+    /// `req_id` and the client's `pending` map dispatches by id.
+    ///
+    /// Drop semantics: dropping `resp_tx` after the reader loop
+    /// exits signals the writer task to flush + exit. Detached
+    /// dispatch tasks for in-flight requests will silently fail
+    /// when they try to `unbounded_send` into the closed channel —
+    /// that's correct (client already gave up).
     async fn handle_connection(conn: autumn_transport::Conn, mgr: AutumnManager) -> Result<()> {
+        use futures::StreamExt;
         let (mut reader, mut writer) = conn.into_split();
         let mut decoder = FrameDecoder::new();
         let mut buf = vec![0u8; 64 * 1024];
 
-        loop {
-            let BufResult(result, buf_back) = reader.read(buf).await;
-            buf = buf_back;
-            let n = result?;
-            if n == 0 {
-                return Ok(());
+        let (resp_tx, mut resp_rx) =
+            futures::channel::mpsc::unbounded::<Bytes>();
+
+        // Writer task: drain encoded responses, write to socket
+        // in completion order. Single writer = no concurrent
+        // `write_all` interleaving.
+        let writer_task = compio::runtime::spawn(async move {
+            while let Some(data) = resp_rx.next().await {
+                let BufResult(result, _) = writer.write_all(data).await;
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, "manager writer task exit");
+                    break;
+                }
             }
+        });
 
-            decoder.feed(&buf[..n]);
-
+        let reader_result: Result<()> = async {
             loop {
-                match decoder.try_decode().map_err(|e| anyhow::anyhow!(e))? {
-                    Some(frame) if frame.req_id != 0 => {
-                        let req_id = frame.req_id;
-                        let msg_type = frame.msg_type;
-                        let payload = frame.payload;
-                        let resp_frame = match mgr.dispatch(msg_type, payload).await {
-                            Ok(p) => Frame::response(req_id, msg_type, p),
-                            Err((code, message)) => {
-                                let p = autumn_rpc::RpcError::encode_status(code, &message);
-                                Frame::error(req_id, msg_type, p)
-                            }
-                        };
-                        let data = resp_frame.encode();
-                        let BufResult(result, _) = writer.write_all(data).await;
-                        result?;
+                let BufResult(result, buf_back) = reader.read(buf).await;
+                buf = buf_back;
+                let n = result?;
+                if n == 0 {
+                    return Ok(());
+                }
+
+                decoder.feed(&buf[..n]);
+
+                loop {
+                    match decoder.try_decode().map_err(|e| anyhow::anyhow!(e))? {
+                        Some(frame) if frame.req_id != 0 => {
+                            let req_id = frame.req_id;
+                            let msg_type = frame.msg_type;
+                            let payload = frame.payload;
+                            let mgr_c = mgr.clone();
+                            let tx = resp_tx.clone();
+                            compio::runtime::spawn(async move {
+                                let resp_frame = match mgr_c.dispatch(msg_type, payload).await {
+                                    Ok(p) => Frame::response(req_id, msg_type, p),
+                                    Err((code, message)) => {
+                                        let p = autumn_rpc::RpcError::encode_status(
+                                            code, &message,
+                                        );
+                                        Frame::error(req_id, msg_type, p)
+                                    }
+                                };
+                                // best-effort send: if resp_rx already
+                                // dropped (conn closed), the dispatch's
+                                // work is wasted but no error to
+                                // propagate.
+                                let _ = tx.unbounded_send(resp_frame.encode());
+                            })
+                            .detach();
+                        }
+                        Some(_) => continue,
+                        None => break,
                     }
-                    Some(_) => continue,
-                    None => break,
                 }
             }
         }
+        .await;
+
+        // Reader exited (EOF or err) → close resp_tx so writer drains
+        // remaining responses and exits.
+        drop(resp_tx);
+        let _ = writer_task.await;
+        reader_result
     }
 
     async fn dispatch(&self, msg_type: u8, payload: Bytes) -> HandlerResult {
