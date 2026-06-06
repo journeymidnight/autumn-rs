@@ -318,6 +318,21 @@ Used to bring a **sealed, replicated** extent's lagging replica up to date (e.g.
 - `heartbeat`: streams a "beat" payload every second (keep-alive for the manager).
 - `df`: returns disk space info (currently hardcoded placeholder) + drains `recovery_done` to report completed recovery tasks. This is the mechanism by which the manager learns recovery finished.
 
+### `serve_with_control` is fail-stop on bind conflict — DO NOT add dynamic port fallback
+
+Pre-existing fail-stop behaviour (commit `63f5fea`) is intentional. PS has Ceph-style monotonic-next port fallback (`crates/partition-server/src/lib.rs`, partition `bind`) because PS ports are FUNDAMENTALLY dynamic — one port per partition (F099-K `base_port + ord`), partitions can split/merge/relocate, port density is high (8–32+ per PS), and the bound port is broadcast every open via `MSG_REGISTER_PARTITION_ADDR` so clients route to the actual port. Fallback engages without manager wire churn.
+
+EN ports are FUNDAMENTALLY static. The address (`addr` + `shard_ports[]`) is stamped into etcd once by `autumn-op format` and held there for the node's lifetime. EN startup just opens the configured port; there is no per-session re-register. A dynamic fallback at EN startup would silently change the bound port while the manager still routes to the old one — every PS / sibling / manager RPC black-holes until the operator runs `autumn-op format` again.
+
+To make EN fallback ACTUALLY useful would need: `bind_with_fallback` + per-shard actual-port channel back to main + `disk_uuid` sentinel read at startup + a fresh `MSG_REGISTER_NODE` carrying the actual ports + a manager-side `handle_register_node` extension that matches by `disk_uuid` (since the address string has changed) + a sibling-list recomputation broadcast back to every shard so cross-shard control-RPC forwarding doesn't misroute. ~300 lines spanning EN library, EN binary, and manager handler — and a new wire-level semantic for re-register matching.
+
+EN port conflicts are an OPERATIONAL HYGIENE problem, not a runtime mechanism bug:
+- Another tenant squatting → operator picks a different `--port`.
+- Own old process not yet released → the existing 10 × 200 ms retry budget in `accept_loop_on` already covers it.
+- Port falls inside `/proc/sys/net/ipv4/ip_local_port_range` → operator picks a port below 32768 (the typical lower bound) — well-known Linux network admin practice, not a fallback problem.
+
+Fail-stop with the existing error message (`bind data listener <addr>: <io error>`) is the correct failure mode. The operator fixes the config and restarts. **Do not add port fallback here.**
+
 ### F109: Delete Extent (`MSG_DELETE_EXTENT = 11`)
 
 Idempotent unlink for the physical `extent-{id}.dat` + `.meta` files
