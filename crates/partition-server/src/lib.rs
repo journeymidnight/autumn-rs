@@ -4491,26 +4491,96 @@ async fn partition_thread_main(
                     // base_port+ord, so the listener bind fails EADDRINUSE on
                     // every monotonic port (the bug #3 routing wedge: the
                     // split-child never serves -> no part_addr -> unroutable).
-                    // Fall back to an OS-assigned port (:0): clients route via
-                    // the REGISTERED part_addr, never a computed port, so the
-                    // deterministic scheme buys nothing here and :0 is
-                    // guaranteed not to be an in-use ephemeral.
+                    // Ceph-style fallback: first try a predictable range of
+                    // monotonic-next ports (so the post-bind advertise_addr is
+                    // still in a stable, operator-recognisable band), then
+                    // fall back to an OS-assigned :0 port if every slot is
+                    // busy.
+                    //
+                    // Window layout (per partition `ord`):
+                    //   base_port + PARTITION_FALLBACK_OFFSET + ord *
+                    //     PARTITION_FALLBACK_STRIDE_PER_ORD
+                    //   .. + PARTITION_FALLBACK_ATTEMPTS
+                    //
+                    // Stride per ord (64) >= attempts per ord (32), so the
+                    // fallback windows for neighbouring ords NEVER overlap —
+                    // a slot conflict on one partition can't accidentally
+                    // steal another partition's reserved fallback slot. The
+                    // base offset (1024) keeps the entire fallback band clear
+                    // of the deterministic `base_port+ord` band for any
+                    // realistic per-PS partition count.
+                    //
+                    // :0 stays as the final fallback (kernel-picked ephemeral)
+                    // because clients route via the REGISTERED part_addr —
+                    // the deterministic / monotonic scheme is only for
+                    // operator predictability, not for correctness.
                     if in_use {
+                        // Fixed offset from the deterministic port — this
+                        // gives every partition the SAME +1024 fallback band
+                        // so neighbouring ords' scans can collide on the
+                        // first few slots; that's intentional and benign,
+                        // because the bind call itself is the conflict
+                        // detector (we just take the next slot). The 32-attempt
+                        // span and the kernel's :0 final fallback guarantee
+                        // forward progress even if every partition on the PS
+                        // hits the same fallback path simultaneously.
+                        const PARTITION_FALLBACK_OFFSET: u32 = 1024;
+                        const PARTITION_FALLBACK_ATTEMPTS: u32 = 32;
+
+                        let scan_base =
+                            listen_addr.port() as u32 + PARTITION_FALLBACK_OFFSET;
+
+                        let mut bound: Option<_> = None;
+                        let mut last_err: Option<String> = None;
+                        for i in 0..PARTITION_FALLBACK_ATTEMPTS {
+                            let port_u32 = scan_base + i;
+                            if port_u32 > u16::MAX as u32 {
+                                break;
+                            }
+                            let port = port_u32 as u16;
+                            let try_addr = SocketAddr::new(listen_addr.ip(), port);
+                            match autumn_transport::current_or_init().bind(try_addr).await {
+                                Ok(l) => {
+                                    tracing::warn!(
+                                        part_id,
+                                        computed = %listen_addr,
+                                        bound = %try_addr,
+                                        attempt = i,
+                                        "deterministic listener port busy; \
+                                         bound monotonic-next fallback port"
+                                    );
+                                    bound = Some(l);
+                                    break;
+                                }
+                                Err(e2) => {
+                                    last_err = Some(e2.to_string());
+                                }
+                            }
+                        }
+
+                        if let Some(l) = bound {
+                            break l;
+                        }
+
                         let fallback = SocketAddr::new(listen_addr.ip(), 0);
                         match autumn_transport::current_or_init().bind(fallback).await {
                             Ok(l) => {
                                 tracing::warn!(
                                     part_id,
                                     computed = %listen_addr,
-                                    "deterministic listener port busy (ephemeral collision); \
-                                     bound OS-assigned fallback port"
+                                    scan_base,
+                                    attempts = PARTITION_FALLBACK_ATTEMPTS,
+                                    last_scan_err = ?last_err,
+                                    "deterministic + monotonic-next fallback all busy; \
+                                     bound OS-assigned :0 port"
                                 );
                                 break l;
                             }
                             Err(e2) => {
                                 let _ = ready_tx.send(Err(anyhow!(
-                                    "bind {} then :0 fallback: {}",
+                                    "bind {} then {} fallback attempts then :0: {}",
                                     listen_addr,
+                                    PARTITION_FALLBACK_ATTEMPTS,
                                     e2
                                 )));
                                 return Ok(());
