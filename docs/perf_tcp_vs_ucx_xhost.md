@@ -88,25 +88,29 @@ Three classes of failure stopped the cross-host UCX leg on this attempt:
    SKILL "UCX caveats" section). Mitigation: a sleep + retry around
    the bootstrap call.
 
-3. **UCX same-host PS ↔ manager loopback is unreachable when
-   `UCX_NET_DEVICES=mlx5_1:1` is pinned.** Once the cluster is bootstrapped,
-   PS heartbeat fails:
-   ```
-   PS 1 heartbeat failed: connect [fdbd:dc62:3:302::14]:9001:
-       I/O error: ucp_ep_flush cb: Destination is unreachable
-   ```
-   With `mlx5_1:1` pinned both ends, UCX has no usable TL for same-host
-   communication: the RoCE port can't loopback through itself, and
-   `UCX_TLS=^sysv,posix` (or even the unset default if the kernel doesn't
-   expose shm via cma in this container) leaves only RDMA, which fails.
-   This means a single-host cluster bound to its RoCE IP **cannot run
-   UCX** — same-host PS ↔ manager hops break. The cross-host bench client
-   would talk to the cluster fine over RoCE, but the cluster's internal
-   hops collapse first.
+3. **UCX same-host hops are unreachable when the cluster binds to its
+   RoCE-attached IPv6.** Two cascading failures:
+   - **PS ↔ manager heartbeat:** `ucp_ep_flush cb: Destination is
+     unreachable`. Even with `UCX_TLS` unset (defaults) the EP setup
+     fails — same-port RDMA loopback (mlx5_1 → mlx5_1 on the same host)
+     doesn't route.
+   - **PS ↔ EN commit_length:** even with the heartbeat moved to
+     `UCX_TLS=tcp,self,rc_mlx5` (so PS↔manager succeeds via the tcp TL),
+     PS still loops on `commit-length extent 8: 0/3 committed members
+     reachable` indefinitely — StreamClient can't reach any of the 3
+     same-host EN replicas. The EN listener was created with the default
+     UCX device pool (10× mlx5_*); when PS's StreamClient connects, UCX
+     picks `rc_mlx5` and `ucp_ep_flush` fails for the loopback case.
+
+   A working same-host UCX cluster on this dev box would need either a
+   non-RDMA TL forced on every cluster-internal EP (which makes "UCX"
+   meaningless — the data path is just kernel TCP again), or per-peer
+   TL selection that prefers cma/shm for loopback. The standard fix is
+   not to have same-host hops at all — see below.
 
    The supported topologies for cross-host UCX bench are therefore:
-   - **Manager + PS on host A, EN + clients on host B** — every internal
-     hop is cross-host. (Not what cluster.sh produces today.)
+   - **Manager + PS on host A, EN on host B, clients on host C** — every
+     internal hop is cross-host. (Not what cluster.sh produces today.)
    - **Split EN across hosts** — same problem if PS and any one EN are
      co-located on the cluster's RoCE-bound side.
    - **Bind cluster to lo (`127.0.0.1`) AND mlx5_1 simultaneously** — UCX
@@ -114,7 +118,30 @@ Three classes of failure stopped the cross-host UCX leg on this attempt:
      two-address listener which the current binary doesn't expose.
 
    The clean way to validate cross-host UCX is a true two-machine cluster
-   (cluster on A, client on B), which this dev box doesn't have.
+   (cluster on A, client on B), which this dev box doesn't have (only
+   `::14` has /data03 + /data05 + /data08; `::15` is missing /data05).
+
+### Workarounds attempted
+
+To get the local cluster up under UCX on `[::14]`, I patched cluster.sh
+to (a) shift `AUTUMN_EXTENT_BASE_PORT=21000` (avoids Ray's `*:10101+`
+and avoids prior-run TIME_WAITs in the 9100/11100 bands), (b) wait
+for `replicas` (=3) Online nodes before bootstrap. With those + plus
+`AUTUMN_PS_PARTS_HINT=2000` (to force `AFFINITY_ENABLED=0`,
+per [[feedback_ucx_cpuset_bootstrap_fail]]) + `AUTUMN_EXTENT_SHARDS=4` +
+`UCX_TLS=tcp,self,rc_mlx5`:
+
+- `bootstrap succeeded: 8 partition(s)` ✓
+- 3 nodes Online ✓ manager↔EN df-health works
+- PS ↔ manager heartbeat works (the tcp TL covers loopback) ✓
+- PS ↔ EN `commit_length` loops forever ✗ (the same-host EP picks
+  `rc_mlx5` from the EN-side device pool regardless of client-side
+  TLS hint — the listener was created with the default UCX device
+  pool, not the same hint as the connector)
+
+The cluster.sh patches in this attempt are not committed — they're
+reproduced inline in the "How to reproduce" section below for anyone
+wanting to retry. The session reverted cluster.sh before commit.
 
 ## What's actually believable from this run
 
@@ -163,4 +190,22 @@ $S 'target/release/autumn-client --manager "[fdbd:dc62:3:302::14]:9001" --transp
 ```
 
 For UCX cross-host, all three blockers above need addressing; see the
-"UCX cross-host blocker" section.
+"UCX cross-host blocker" section. The closest I got with the dev-box
+single-machine setup was:
+
+```bash
+# Patch cluster.sh: replace `sleep 2  # give PS a moment to register with manager`
+# with a loop that waits for `replicas` (=3 here) nodes Online before bootstrap.
+# Then:
+env UCX_TLS=tcp,self,rc_mlx5 \
+    UCX_NET_DEVICES=mlx5_1:1 \
+    AUTUMN_BIND_HOST="[fdbd:dc62:3:302::14]" \
+    AUTUMN_TRANSPORT=ucx \
+    AUTUMN_BOOTSTRAP_PRESPLIT="8:hexstring" \
+    AUTUMN_EXTENT_SHARDS=4 \
+    AUTUMN_EXTENT_BASE_PORT=21000 \
+    AUTUMN_PS_PARTS_HINT=2000 \
+    AUTUMN_DATA_ROOT=/data05/autumn-rs \
+    bash cluster.sh start 3 --3disk
+```
+The bootstrap + PS-ready states pass; PS↔EN commit_length blocks.
