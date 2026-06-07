@@ -294,6 +294,27 @@ launch_extent_node() {
     local en_cpuset_var="AUTUMN_EN${i}_CPUSET"
     if [[ -n "${!en_cpuset_var:-}" ]]; then
         cpu_args=(--cpuset "${!en_cpuset_var}")
+        # If the operator-supplied cpuset has a different cardinality from
+        # the global SHARDS variable, the manager would format with the
+        # wrong shard_ports list — every commit_length probe would land
+        # on shard 0 and the EN would refuse with "extent N belongs to
+        # shard M not shard 0". Fail loudly here instead of letting the
+        # cluster come up in a wedged state. (Trivial taskset arithmetic;
+        # exact pattern doesn't matter — count the comma + range-expanded
+        # entries.)
+        local _spec="${!en_cpuset_var}"
+        local _count=0
+        local _seg
+        for _seg in ${_spec//,/ }; do
+            if [[ "$_seg" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                _count=$(( _count + ${BASH_REMATCH[2]} - ${BASH_REMATCH[1]} + 1 ))
+            elif [[ "$_seg" =~ ^[0-9]+$ ]]; then
+                _count=$(( _count + 1 ))
+            fi
+        done
+        if (( _count != SHARDS )); then
+            die "$en_cpuset_var='$_spec' has $_count cores but AUTUMN_EXTENT_SHARDS=$SHARDS — they MUST match (EN shards = cpuset_len)"
+        fi
     elif (( ${AFFINITY_ENABLED:-0} == 1 )); then
         cpu_args=(--cpuset "${cpu_start}-${cpu_end}")
     fi

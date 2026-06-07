@@ -1059,11 +1059,28 @@ impl AutumnManager {
             if let Some(n) = nodes.get(&node_id) {
                 // F210-H3 Tier 2: pass `req.revision` (validated above) so
                 // the EN's fence-handover side-effect fires on first probe.
-                if let Ok(v) = self
+                // Errors are surfaced at WARN so a silently-routed-to-wrong-
+                // shard misconfiguration (e.g. cluster.sh AUTUMN_EXTENT_SHARDS
+                // mismatching cpuset_len → empty shard_ports list → every
+                // probe lands on shard 0) shows up in the manager log
+                // instead of being swallowed and surfacing only as
+                // "0/N committed members reachable".
+                match self
                     .commit_length_on_node(&n.address, ex.extent_id, req.revision)
                     .await
                 {
-                    responses.insert(node_id, v);
+                    Ok(v) => {
+                        responses.insert(node_id, v);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            extent_id = ex.extent_id,
+                            node_id,
+                            addr = %n.address,
+                            error = %e,
+                            "check_commit_length: commit_length_on_node failed"
+                        );
+                    }
                 }
             }
         }
