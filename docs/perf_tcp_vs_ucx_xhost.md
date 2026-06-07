@@ -153,6 +153,42 @@ Three classes of failure stopped the cross-host UCX leg on this attempt:
    (cluster on A, client on B), which this dev box doesn't have (only
    `::14` has /data03 + /data05 + /data08; `::15` is missing /data05).
 
+### Update 2026-06-07 (third attempt — rc_mlx5 enabled)
+
+After the regpool observability work landed (commit `4fb17b1`), retried
+cross-host UCX RDMA bench with `UCX_TLS=tcp,self,rc_mlx5` + bracketed
+`[fdbd:dc62:3:302::14]` bind + `AUTUMN_EN[1-3]_CPUSET="0-3"/"4-7"/"8-11"`
+(bounded shard count to dodge port collisions) + the retry-for-Online
+loop now committed to cluster.sh.
+
+Result:
+- ✓ All 3 EN nodes Online after warmup (~10–15 s)
+- ✓ Bootstrap succeeded — 8 partitions, log_stream / row_stream / meta_stream extents allocated
+- ✓ PS heartbeat works (TCP TL covers the same-host PS↔manager hop)
+- ✓ PS `logStream commit_length OK` for partition 13's extent 8
+- ✗ PS `rowStream commit_length failed` permanently for extent 10:
+  `0/3 committed members reachable (need >= floor 1)` — retries every
+  ~5 s for >2 min, never recovers
+- ✗ PS partition listener never binds → cluster.sh times out waiting for
+  `:9301` → remote bench client has nothing to connect to
+
+Same-host PS↔EN UCX for the log_stream extent works (extent 8 →
+`commit_length OK`), but the row_stream extent (extent 10, same 3
+replica EN nodes, same UCX config) does not. The deterministic
+extent-specific failure rules out a generic UCX warmup race; the
+control-plane RPC (`check_commit_length`) is hitting an extent that
+either doesn't physically exist on the EN yet (fresh row_stream is
+never written before PS opens) or whose response shape the same-host
+RDMA-eligible UCX path mishandles.
+
+This is the next wall after the PS↔manager heartbeat wall from the
+prior attempt. Same conclusion: cross-host UCX RDMA bench in this
+single-host topology is blocked on multiple consecutive same-host
+UCX hops being incompatible with `UCX_NET_DEVICES=mlx5_1:1`. A
+two-machine cluster (different EN replicas on different hosts)
+would side-step every layer of this — but the dev box can't host
+that today (`::15` is missing /data05).
+
 ### Workarounds attempted
 
 To get the local cluster up under UCX on `[::14]`, I patched cluster.sh

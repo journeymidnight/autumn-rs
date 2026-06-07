@@ -708,7 +708,20 @@ do_start() {
         [[ -n "$log_ec" ]] && bootstrap_args+=( --log-ec "$log_ec" )
         [[ -n "$row_ec" ]] && bootstrap_args+=( --row-ec "$row_ec" )
 
-        sleep 2  # give PS a moment to register with manager
+        # UCX warmup race: wait for `replicas` EN df-health Online states
+        # before bootstrap (otherwise allocate_extent → "no healthy node").
+        # Same as the cross-host UCX bring-up path documented in
+        # docs/perf_tcp_vs_ucx_xhost.md.
+        for _i in $(seq 1 24); do
+            sleep 5
+            local _n
+            _n=$("$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" list-nodes 2>/dev/null | grep -c Online || true)
+            if [[ "${_n:-0}" -ge "${replicas}" ]]; then
+                echo "[cluster] ${_n} node(s) Online after ${_i}×5s"
+                break
+            fi
+            echo "[cluster] waiting for Online nodes (round ${_i})..."
+        done
         # AUTUMN_BOOTSTRAP_PRESPLIT: e.g. "4:3fffffff,7ffffffe,bffffffd"
         # The literal split points in the env var are documentation only;
         # autumn-client's `--presplit N:hexstring` calls hex_split_ranges(N)
