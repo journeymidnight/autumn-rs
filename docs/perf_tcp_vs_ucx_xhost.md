@@ -190,6 +190,54 @@ intra-host RoCE loopback transparently). PS log shows the regpool
 warming as expected: 99% hit rate after warmup, 960 MB
 `registered_bytes` across 16 PS threads, 0 over_cap / register_failed.
 
+### Multi-rail UCX (2026-06-07, same code)
+
+Both hosts have 10 mlx5 NICs each. Two pairs are cross-host reachable
+(matched 1:1 IPs on the same /64): mlx5_1 (`fdbd:302::14↔15`) and
+mlx5_2 (`fdbd:300::14↔15`). The other 8 NICs sit on `fdbb::` subnets
+where ::14's NICs have GIDs `::16/::17` and ::15's are `::18/::19` —
+asymmetric IDs across the fabric, not cross-host reachable for RDMA
+(confirmed: a 4-rail UCX config that included those NICs failed to
+connect from the remote).
+
+2-rail at 16p × 16shards × t=16 d=8 (`UCX_NET_DEVICES=mlx5_1:1,mlx5_2:1
+UCX_MAX_RNDV_RAILS=2 UCX_MAX_EAGER_RAILS=2`):
+
+| size | metric           | 1-rail        | 2-rail        | Δ        |
+|------|------------------|---------------|---------------|----------|
+| 4K   | write ops/s      | 15,710        | 8,288         | **-47%** |
+| 4K   | read ops/s       | 854,721       | 308,609       | **-64%** |
+| 8M   | write MB/s       | 1,576         | 1,616         | +3%      |
+| 8M   | read MB/s        | **10,756**    | **17,830**    | **+66%** |
+
+8M-read 17.83 GB/s is roughly 71% of dual-100GbE line rate (12.5 × 2 =
+25 GB/s theoretical), so the wire isn't fully saturated — but a big
+single-config win for kvcache-style page-block reads.
+
+**Multi-rail HURTS small messages.** Each 4K op pays per-rail
+endpoint negotiation overhead; on 2 rails × 3 replicas × 16 threads =
+96 EPs the coordination cost dominates the actual transfer. The
+hybrid (`UCX_MAX_EAGER_RAILS=1, UCX_MAX_RNDV_RAILS=2`) doesn't recover
+small-msg perf because the cluster-side socket has to match — once a
+connection negotiates eager=1, rndv on it inherits the same single-rail
+shape.
+
+**Production guidance.** Multi-rail is a workload-specific knob:
+* kvcache page reads (≥ 64 KiB) — enable
+  `UCX_NET_DEVICES=mlx5_1:1,mlx5_2:1` for the kvcache python adapter
+  process, no shared cluster-wide setting needed.
+* metadata / control plane / 4 KiB IO — keep single rail (the default
+  `UCX_NET_DEVICES=mlx5_1:1`).
+* Don't enable 2-rail process-wide on the cluster — the 4K
+  regression is bigger than the 8M gain unless your workload is
+  read-only large blocks.
+
+**Why write doesn't scale with rails.** 8M write +3% vs read +66%
+because writes are 3-replica fanout (sender pushes ÷ 3 EN replicas);
+each replica's NIC ingress is the bottleneck and dual-rail at the
+sender doesn't help that — only reads (single EN → client) get the
+full rail aggregation.
+
 ### Update 2026-06-07 (third attempt — rc_mlx5 enabled)
 
 After the regpool observability work landed (commit `4fb17b1`), retried
