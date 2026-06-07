@@ -483,6 +483,12 @@ launch_ps() {
     if [[ -n "${AUTUMN_PS_GC_RATE_BYTES_PER_SEC:-}" ]]; then
         tunable_args+=(--gc-rate-bytes-per-sec "$AUTUMN_PS_GC_RATE_BYTES_PER_SEC")
     fi
+    if [[ -n "${AUTUMN_UCX_REGPOOL_CAP_BYTES:-}" ]]; then
+        tunable_args+=(--ucx-regpool-cap-bytes "$AUTUMN_UCX_REGPOOL_CAP_BYTES")
+    fi
+    if [[ -n "${AUTUMN_REGPOOL_LOG_INTERVAL_SECS:-}" ]]; then
+        tunable_args+=(--regpool-log-interval-secs "$AUTUMN_REGPOOL_LOG_INTERVAL_SECS")
+    fi
     start_proc ps \
         "$PS" \
         --psid 1 --port "$PS_BASE_PORT" \

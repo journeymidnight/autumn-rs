@@ -73,6 +73,12 @@ struct Args {
     /// constrained host or growing when many in-flight 8 MiB ZC writes
     /// pin the pool above the default.
     ucx_regpool_cap_bytes: Option<usize>,
+    /// Period (seconds) for emitting a `regpool` snapshot via
+    /// `tracing::info!`. `None` or `Some(0)` = disabled. The counters are
+    /// process-global (cross-thread aggregate), so one task per PS is
+    /// enough to surface every thread's pool activity. Useful for
+    /// confirming the registered-buffer hit rate during a perf run.
+    regpool_log_interval_secs: Option<u64>,
     // F195: pprof CLI flags (replaces AUTUMN_PPROF_* env reads).
     #[cfg(feature = "profiling")]
     pprof_secs: Option<u64>,
@@ -118,6 +124,7 @@ fn parse_args() -> Args {
     let mut gc_batch_bytes: Option<usize> = None;
     let mut gc_rate_bytes_per_sec: Option<u64> = None;
     let mut ucx_regpool_cap_bytes: Option<usize> = None;
+    let mut regpool_log_interval_secs: Option<u64> = None;
     #[cfg(feature = "profiling")]
     let mut pprof_secs: Option<u64> = None;
     #[cfg(feature = "profiling")]
@@ -307,6 +314,14 @@ fn parse_args() -> Args {
                         .expect("--ucx-regpool-cap-bytes usize"),
                 );
             }
+            "--regpool-log-interval-secs" => {
+                i += 1;
+                regpool_log_interval_secs = Some(
+                    args[i]
+                        .parse()
+                        .expect("--regpool-log-interval-secs u64"),
+                );
+            }
             #[cfg(feature = "profiling")]
             "--pprof-secs" => {
                 i += 1;
@@ -406,6 +421,7 @@ fn parse_args() -> Args {
         gc_batch_bytes,
         gc_rate_bytes_per_sec,
         ucx_regpool_cap_bytes,
+        regpool_log_interval_secs,
         #[cfg(feature = "profiling")]
         pprof_secs,
         #[cfg(feature = "profiling")]
@@ -649,6 +665,38 @@ async fn main() -> Result<()> {
     .context("connect partition server")?;
 
     tracing::info!("autumn-ps ready (F099-K: per-partition listeners; first partition on {addr})");
+
+    // Periodic regpool snapshot. Single per-process task on the PS main
+    // compio runtime — `regpool_snapshot()` aggregates atomic counters
+    // across every thread's TLS pool, so one logger is sufficient.
+    // Detach (not supervised) because this is observability-only; a panic
+    // here loses the counters, not data — and compio's runtime already
+    // catches the panic so the main thread stays alive.
+    if let Some(secs) = args.regpool_log_interval_secs {
+        if secs > 0 {
+            let period = std::time::Duration::from_secs(secs);
+            compio::runtime::spawn(async move {
+                let mut ticker = compio::time::interval(period);
+                ticker.tick().await; // first tick immediate; skip
+                loop {
+                    ticker.tick().await;
+                    let s = autumn_transport::regpool_snapshot();
+                    tracing::info!(
+                        acquire = s.acquire_total,
+                        hit = s.hit_total,
+                        hit_rate_pct = (s.hit_rate() * 100.0) as u32,
+                        out_of_pool = s.out_of_pool_total,
+                        over_cap = s.over_cap_total,
+                        register_failed = s.register_failed_total,
+                        registered_bytes = s.registered_bytes,
+                        "regpool"
+                    );
+                }
+            })
+            .detach();
+            tracing::info!(period_secs = secs, "regpool periodic log armed");
+        }
+    }
 
     // F120-C — install a SIGTERM/SIGINT handler. The handler sets an
     // atomic flag (only async-signal-safe ops allowed); a sidecar future

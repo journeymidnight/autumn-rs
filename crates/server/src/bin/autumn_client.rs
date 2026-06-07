@@ -1123,6 +1123,22 @@ async fn main() -> Result<()> {
                 &mut read_hist,
             );
 
+            // Regpool utilization (post-bench). Counters are process-global
+            // — they include the warmup-write phase, this read phase, and
+            // any earlier perf-check legs in the same process.
+            let pool = autumn_transport::regpool_snapshot();
+            println!(
+                "regpool: acquire={} hit={} ({:.1}% hit), out_of_pool={}, \
+                 over_cap={}, register_failed={}, registered_bytes={}",
+                pool.acquire_total,
+                pool.hit_total,
+                pool.hit_rate() * 100.0,
+                pool.out_of_pool_total,
+                pool.over_cap_total,
+                pool.register_failed_total,
+                pool.registered_bytes,
+            );
+
             // ---- Regression check ----
             let mut regressed = false;
             let baseline_opt: Option<PerfBaseline> = std::fs::read_to_string(&baseline_file)
