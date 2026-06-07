@@ -40,6 +40,75 @@
 // `PooledBuf` with no `cfg`.
 use crate::RegisteredMem;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// ---------------------------------------------------------------------------
+// Process-global counters (cross-thread aggregate). All `Relaxed`: these are
+// observability counters, not synchronisation. A snapshot may interleave
+// updates from other threads — that's fine for surfacing pool health
+// (hit rate, register-failure rate, over-cap fallbacks). The hot-path cost
+// is one atomic increment, ~3 ns on x86.
+// ---------------------------------------------------------------------------
+static ACQUIRE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ucx")]
+static REGISTER_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ucx")]
+static OVER_CAP_TOTAL: AtomicU64 = AtomicU64::new(0);
+static OUT_OF_POOL_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Sum (over all threads' TLS pools) of `registered_bytes`. Approximate:
+/// updated only at acquire-success and at eviction-decrement; a snapshot
+/// taken concurrently with allocs may read a stale value. Useful as a
+/// trend gauge, not a precise instantaneous measure.
+#[cfg(feature = "ucx")]
+static REGISTERED_BYTES_GAUGE: AtomicU64 = AtomicU64::new(0);
+
+/// Counter snapshot for ops surfacing pool health to logs / a future metrics
+/// endpoint. Read with `snapshot()`; do not rely on the counters being
+/// monotonic within a single snapshot (they're each atomic but the read is
+/// non-atomic across counters).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RegpoolStats {
+    pub acquire_total: u64,
+    pub hit_total: u64,
+    pub register_failed_total: u64,
+    pub over_cap_total: u64,
+    pub out_of_pool_total: u64,
+    pub registered_bytes: u64,
+}
+
+impl RegpoolStats {
+    /// Pool hit rate (0.0..=1.0); 0 if no acquires yet.
+    pub fn hit_rate(&self) -> f64 {
+        if self.acquire_total == 0 {
+            0.0
+        } else {
+            self.hit_total as f64 / self.acquire_total as f64
+        }
+    }
+}
+
+/// Snapshot the regpool counters. Aggregates cross-thread (process-global
+/// atomics). The `registered_bytes` field is across-all-threads.
+pub fn snapshot() -> RegpoolStats {
+    RegpoolStats {
+        acquire_total: ACQUIRE_TOTAL.load(Ordering::Relaxed),
+        hit_total: HIT_TOTAL.load(Ordering::Relaxed),
+        #[cfg(feature = "ucx")]
+        register_failed_total: REGISTER_FAILED_TOTAL.load(Ordering::Relaxed),
+        #[cfg(not(feature = "ucx"))]
+        register_failed_total: 0,
+        #[cfg(feature = "ucx")]
+        over_cap_total: OVER_CAP_TOTAL.load(Ordering::Relaxed),
+        #[cfg(not(feature = "ucx"))]
+        over_cap_total: 0,
+        out_of_pool_total: OUT_OF_POOL_TOTAL.load(Ordering::Relaxed),
+        #[cfg(feature = "ucx")]
+        registered_bytes: REGISTERED_BYTES_GAUGE.load(Ordering::Relaxed),
+        #[cfg(not(feature = "ucx"))]
+        registered_bytes: 0,
+    }
+}
 
 /// Smallest size class. Values below this still round up to it.
 const MIN_CLASS: usize = 4096;
@@ -350,6 +419,8 @@ impl Drop for PooledBuf {
                     #[cfg(feature = "ucx")]
                     if slab.reg.is_some() {
                         p.registered_bytes = p.registered_bytes.saturating_sub(class);
+                        REGISTERED_BYTES_GAUGE
+                            .fetch_sub(class as u64, Ordering::Relaxed);
                     }
                     Some(slab)
                 }
@@ -370,10 +441,12 @@ impl Drop for PooledBuf {
 /// total while making "absurdly large" allocations cheap-and-non-pinning
 /// instead of OOM-aborting via `next_power_of_two` panic.
 pub fn acquire(need: usize) -> PooledBuf {
+    ACQUIRE_TOTAL.fetch_add(1, Ordering::Relaxed);
     let Some(class) = size_class(need) else {
         // Out-of-pool: allocate exact size, never register, never pool.
         // Marked by `class > MAX_CLASS` so `Drop` skips the re-pool path
         // even on non-ucx builds (where `reg.is_none()` is normal).
+        OUT_OF_POOL_TOTAL.fetch_add(1, Ordering::Relaxed);
         let buf = vec![0u8; need];
         return PooledBuf {
             slab: Some(Slab { reg: None, buf }),
@@ -393,6 +466,7 @@ pub fn acquire(need: usize) -> PooledBuf {
     });
 
     if let Some(slab) = slab {
+        HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
         return PooledBuf {
             slab: Some(slab),
             class,
@@ -416,6 +490,7 @@ pub fn acquire(need: usize) -> PooledBuf {
             p.registered_bytes.saturating_add(class) <= cap_bytes()
         });
         if !cap_ok {
+            OVER_CAP_TOTAL.fetch_add(1, Ordering::Relaxed);
             POOL.with(|p| {
                 let mut p = p.borrow_mut();
                 if !p.warned_over_cap {
@@ -437,9 +512,11 @@ pub fn acquire(need: usize) -> PooledBuf {
                         let mut p = p.borrow_mut();
                         p.registered_bytes = p.registered_bytes.saturating_add(class);
                     });
+                    REGISTERED_BYTES_GAUGE.fetch_add(class as u64, Ordering::Relaxed);
                     Some(r)
                 }
                 Err(e) => {
+                    REGISTER_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     POOL.with(|p| {
                         let mut p = p.borrow_mut();
                         if !p.warned_over_cap {
@@ -522,6 +599,40 @@ mod tests {
         for pb in held.drain(..) {
             drop(pb);
         }
+    }
+
+    /// Counters: every acquire bumps `acquire_total`; a hit (pooled-slab
+    /// reuse) bumps `hit_total`; out-of-pool path bumps `out_of_pool_total`.
+    /// Use the snapshot delta within the test to be robust to other tests
+    /// running in parallel.
+    #[test]
+    fn snapshot_increments_on_acquire() {
+        let before = snapshot();
+        let pb1 = acquire(64 * 1024);
+        let pb2_huge = acquire(MAX_CLASS + 1); // out-of-pool
+        let after_alloc = snapshot();
+        assert!(
+            after_alloc.acquire_total >= before.acquire_total + 2,
+            "acquire_total monotonic +2"
+        );
+        assert!(
+            after_alloc.out_of_pool_total >= before.out_of_pool_total + 1,
+            "out_of_pool bumped"
+        );
+        drop(pb1);
+        drop(pb2_huge);
+        // Reacquire same class → must be a hit (slab returned to free-list).
+        let _pb3 = acquire(64 * 1024);
+        let after_hit = snapshot();
+        assert!(
+            after_hit.hit_total >= after_alloc.hit_total + 1,
+            "hit_total bumped on reuse, before={} after={}",
+            after_alloc.hit_total,
+            after_hit.hit_total
+        );
+        let s = snapshot();
+        // hit_rate is bounded.
+        assert!((0.0..=1.0).contains(&s.hit_rate()));
     }
 
     /// Partial-recv narrowing: after `set_len(n)`, `filled()` / `AsRef` /

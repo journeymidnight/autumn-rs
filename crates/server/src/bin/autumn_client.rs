@@ -113,6 +113,12 @@ struct Args {
     manager: String,
     command: Command,
     transport: autumn_transport::TransportKind,
+    /// Per-thread regpool cap (pinned/registered bytes). `None` = library
+    /// default (512 MiB/thread). Useful for perf-check tuning — large
+    /// `--threads --pipeline-depth` 8 MiB workloads can pin many slabs
+    /// in-flight and benefit from a higher cap; constrained hosts can
+    /// shrink to fit. Clamped to [16 MiB, 64 GiB].
+    ucx_regpool_cap_bytes: Option<usize>,
 }
 
 fn usage() -> ! {
@@ -144,6 +150,7 @@ fn parse_args() -> Args {
     let raw: Vec<String> = std::env::args().collect();
     let mut manager = String::from("127.0.0.1:9001");
     let mut transport = autumn_transport::TransportKind::Tcp;
+    let mut ucx_regpool_cap_bytes: Option<usize> = None;
     let mut i = 1;
 
     while i < raw.len() {
@@ -159,6 +166,15 @@ fn parse_args() -> Args {
                     eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
                     std::process::exit(2);
                 });
+                i += 1;
+            }
+            "--ucx-regpool-cap-bytes" => {
+                i += 1;
+                ucx_regpool_cap_bytes = Some(
+                    raw[i]
+                        .parse()
+                        .expect("--ucx-regpool-cap-bytes usize"),
+                );
                 i += 1;
             }
             "--help" | "-h" => usage(),
@@ -445,6 +461,7 @@ fn parse_args() -> Args {
         manager,
         command,
         transport,
+        ucx_regpool_cap_bytes,
     }
 }
 
@@ -594,6 +611,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args();
+    if let Some(cap) = args.ucx_regpool_cap_bytes {
+        if !autumn_transport::set_regpool_cap_bytes(cap) {
+            tracing::warn!(cap, "regpool cap already set (ignored — first-call-wins)");
+        }
+    }
 
     // F213: handle the `op` stub BEFORE attempting to connect to the
     // manager — the user is trying to run an op command via the wrong

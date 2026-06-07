@@ -37,7 +37,10 @@ mod ucx;
 mod regpool;
 
 pub use probe::parse_transport_flag;
-pub use regpool::{acquire as regpool_acquire, set_regpool_cap_bytes, PooledBuf};
+pub use regpool::{
+    acquire as regpool_acquire, set_regpool_cap_bytes,
+    snapshot as regpool_snapshot, PooledBuf, RegpoolStats,
+};
 pub use tcp::TcpTransport;
 #[cfg(feature = "ucx")]
 pub use ucx::UcxTransport;

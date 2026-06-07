@@ -77,6 +77,9 @@ struct Args {
     recovery_parallelism: Option<usize>,
     /// F195 (was env `AUTUMN_EXTENT_INFLIGHT_CAP`, F099-I). Default 64.
     inflight_cap: Option<usize>,
+    /// Per-thread regpool cap (pinned/registered bytes). `None` = library
+    /// default (512 MiB/thread). Clamped to [16 MiB, 64 GiB].
+    ucx_regpool_cap_bytes: Option<usize>,
 }
 
 fn parse_args() -> Args {
@@ -97,6 +100,7 @@ fn parse_args() -> Args {
     let mut ec_convert_parallelism: Option<usize> = None;
     let mut recovery_parallelism: Option<usize> = None;
     let mut inflight_cap: Option<usize> = None;
+    let mut ucx_regpool_cap_bytes: Option<usize> = None;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -195,6 +199,14 @@ fn parse_args() -> Args {
                 i += 1;
                 inflight_cap = Some(args[i].parse().expect("--inflight-cap must be a number"));
             }
+            "--ucx-regpool-cap-bytes" => {
+                i += 1;
+                ucx_regpool_cap_bytes = Some(
+                    args[i]
+                        .parse()
+                        .expect("--ucx-regpool-cap-bytes usize"),
+                );
+            }
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
@@ -225,6 +237,7 @@ fn parse_args() -> Args {
         ec_convert_parallelism,
         recovery_parallelism,
         inflight_cap,
+        ucx_regpool_cap_bytes,
     }
 }
 
@@ -340,6 +353,13 @@ fn main() -> Result<()> {
         .init();
 
     let args = parse_args();
+    // Apply regpool cap BEFORE init_with so the first transport-touch (and
+    // thus first TLS pool init) reads the operator's setting.
+    if let Some(cap) = args.ucx_regpool_cap_bytes {
+        if !autumn_transport::set_regpool_cap_bytes(cap) {
+            tracing::warn!(cap, "regpool cap already set (ignored — first-call-wins)");
+        }
+    }
     let _ = autumn_transport::init_with(args.transport);
 
     // F216-E: RDMA (UCX rc_mlx5) pins every registered send/recv buffer against

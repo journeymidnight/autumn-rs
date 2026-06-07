@@ -67,6 +67,12 @@ struct Args {
     gc_batch_records: Option<usize>,
     gc_batch_bytes: Option<usize>,
     gc_rate_bytes_per_sec: Option<u64>,
+    /// Per-thread regpool cap (pinned/registered bytes). `None` = library
+    /// default (512 MiB/thread). Clamped to [16 MiB, 64 GiB] by
+    /// `set_regpool_cap_bytes`. Mostly useful when shrinking on a memlock-
+    /// constrained host or growing when many in-flight 8 MiB ZC writes
+    /// pin the pool above the default.
+    ucx_regpool_cap_bytes: Option<usize>,
     // F195: pprof CLI flags (replaces AUTUMN_PPROF_* env reads).
     #[cfg(feature = "profiling")]
     pprof_secs: Option<u64>,
@@ -111,6 +117,7 @@ fn parse_args() -> Args {
     let mut gc_batch_records: Option<usize> = None;
     let mut gc_batch_bytes: Option<usize> = None;
     let mut gc_rate_bytes_per_sec: Option<u64> = None;
+    let mut ucx_regpool_cap_bytes: Option<usize> = None;
     #[cfg(feature = "profiling")]
     let mut pprof_secs: Option<u64> = None;
     #[cfg(feature = "profiling")]
@@ -292,6 +299,14 @@ fn parse_args() -> Args {
                 i += 1;
                 gc_rate_bytes_per_sec = Some(args[i].parse().expect("--gc-rate-bytes-per-sec u64"));
             }
+            "--ucx-regpool-cap-bytes" => {
+                i += 1;
+                ucx_regpool_cap_bytes = Some(
+                    args[i]
+                        .parse()
+                        .expect("--ucx-regpool-cap-bytes usize"),
+                );
+            }
             #[cfg(feature = "profiling")]
             "--pprof-secs" => {
                 i += 1;
@@ -390,6 +405,7 @@ fn parse_args() -> Args {
         gc_batch_records,
         gc_batch_bytes,
         gc_rate_bytes_per_sec,
+        ucx_regpool_cap_bytes,
         #[cfg(feature = "profiling")]
         pprof_secs,
         #[cfg(feature = "profiling")]
@@ -496,6 +512,20 @@ async fn main() -> Result<()> {
     // own use) are no longer the source of truth for binary config.
 
     let args = parse_args();
+
+    // Apply the regpool cap BEFORE any compio runtime / TLS pool init, so
+    // the first thread's `POOL` reads the operator-supplied value. The
+    // setter is `OnceLock::set`, first-call-wins; subsequent attempts are
+    // no-ops, so unrelated paths that later try to set a different value
+    // won't corrupt it.
+    if let Some(cap) = args.ucx_regpool_cap_bytes {
+        if !autumn_transport::set_regpool_cap_bytes(cap) {
+            tracing::warn!(
+                cap,
+                "regpool cap already set (ignored — first-call-wins)"
+            );
+        }
+    }
 
     // ---- F195: pprof CLI flags (replaces AUTUMN_PPROF_* env reads) ----
     #[cfg(feature = "profiling")]
