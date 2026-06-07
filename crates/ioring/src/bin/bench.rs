@@ -92,6 +92,13 @@ struct Args {
     /// (pre-filled once with a deterministic payload).
     #[arg(long, default_value = "read")]
     mode: String,
+
+    /// Per-thread write offset strategy. "zero" (default) writes every SQE at
+    /// offset 0 — hot RMW workload. "append" advances per-thread offset by
+    /// `read_size` for each completion so each SQE extends EOF — the workload
+    /// F244-D Phase 2 (deferred meta put) is designed for.
+    #[arg(long, default_value = "zero")]
+    offset_mode: String,
 }
 
 fn main() -> Result<()> {
@@ -264,12 +271,27 @@ fn worker(
         }
     }
 
+    // `offset_mode = "append"` advances per-thread offset by `read_size` for
+    // each completion so each Write SQE extends EOF — exercises the F244-D
+    // Phase 2 deferred-meta-put fast path. `"zero"` (default) keeps the
+    // hot-key shape that pre-Phase-2 benches used.
+    let append_mode = args.offset_mode == "append";
+    let mut next_offset: u64 = 0;
+    let step: u64 = args.read_size as u64;
+
     // Prime: submit `depth` ops.
     for (i, &slot) in slots.iter().enumerate() {
+        let off = if append_mode {
+            let o = next_offset;
+            next_offset += step;
+            o
+        } else {
+            0
+        };
         let _ = client.submit(Sqe {
             opcode: op,
             ring_fd,
-            offset: 0, // hot offset, same data
+            offset: off,
             length: args.read_size,
             buf_offset: slot,
             user_data: i as u64,
@@ -309,11 +331,18 @@ fn worker(
             let slot_idx = cqe.user_data as usize;
             if slot_idx < slots.len() {
                 let slot = slots[slot_idx];
+                let off = if append_mode {
+                    let o = next_offset;
+                    next_offset += step;
+                    o
+                } else {
+                    0
+                };
                 // Re-issue same opcode.
                 let _ = client.submit(Sqe {
                     opcode: op,
                     ring_fd,
-                    offset: 0,
+                    offset: off,
                     length: args.read_size,
                     buf_offset: slot,
                     user_data: slot_idx as u64,

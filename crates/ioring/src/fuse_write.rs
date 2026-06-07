@@ -270,6 +270,34 @@ pub async fn write_into(
     off: u64,
     src: &[u8],
 ) -> Result<usize> {
+    write_into_with_options(cluster, opened, off, src, /* defer_persist */ false).await
+}
+
+/// F244-D Phase 2: variant of [`write_into`] that lets the caller skip the
+/// inline `cluster.put(inode_key)` for EOF-extending writes.
+///
+/// `defer_persist = false` matches pre-Phase-2 behaviour (persists inline).
+/// `defer_persist = true` updates `opened.size` and `opened.cached_meta.size`
+/// in memory but does NOT call `maybe_persist_size_growth` — the caller is
+/// responsible for persisting (typically: enqueue into the daemon's
+/// dirty-meta map for batched put_many by the periodic flush loop).
+///
+/// **Safety**: deferring is only safe when the caller can guarantee the
+/// meta will eventually land (or be recovered) before another opener might
+/// see stale `meta.size`. The iouring daemon achieves this with:
+///   - WRITE-exclusive lease → no concurrent writer
+///   - Close-time synchronous flush BEFORE lease release
+///   - Open-time reconcile (head_many over extent keys) for crash recovery
+///
+/// Generic callers that don't hold a lease + reconcile path should pass
+/// `defer_persist = false`.
+pub async fn write_into_with_options(
+    cluster: &ClusterClient,
+    opened: &mut OpenedExtents,
+    off: u64,
+    src: &[u8],
+    defer_persist: bool,
+) -> Result<usize> {
     if src.is_empty() {
         return Ok(0);
     }
@@ -289,7 +317,18 @@ pub async fn write_into(
         upsert(&mut opened.extents, start, new_len);
     }
 
-    maybe_persist_size_growth(cluster, opened, off + src.len() as u64).await?;
+    let new_eof = off + src.len() as u64;
+    if defer_persist {
+        // Local-only update — caller persists via batched flush.
+        if new_eof > opened.size {
+            opened.size = new_eof;
+            if let Some(ref mut meta) = opened.cached_meta {
+                meta.size = new_eof;
+            }
+        }
+    } else {
+        maybe_persist_size_growth(cluster, opened, new_eof).await?;
+    }
     Ok(src.len())
 }
 

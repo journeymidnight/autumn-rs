@@ -138,17 +138,78 @@ fn infer_lengths(starts: &[u64], size: u64) -> Vec<(u64, u32)> {
 }
 
 /// Resolve + load a fuse file for a daemon Open.
+///
+/// F244-D Phase 2: after loading the extent map, reconcile `meta.size`
+/// against the on-disk extent data. The F244-D deferred-meta-put model
+/// means a daemon crash mid-batch can leave `meta.size` lagging behind
+/// the actual extent contents — `meta.size = 4 KiB` while extent
+/// `(start=0, value_length=4 KiB)` is durable, plus extent
+/// `(start=4 KiB, value_length=4 KiB)` is also durable but not yet
+/// reflected in the meta.
+///
+/// `load_extent_map` already returns lengths INFERRED from key positions
+/// and the passed `size`. For the last extent it clamps to `size` — so
+/// when `meta.size` is stale, the last extent's inferred length is
+/// truncated. The reconcile: probe the last extent's REAL value_length
+/// via `head`, take `actual_size = max(meta.size, last_start + last_real_len)`.
+///
+/// In the common case (no crash, meta is up to date) the head is one
+/// extra RTT per Open. Open is cold-path, so this is acceptable.
+///
+/// Returns an `OpenedExtents` whose `size` / `extents` reflect the real
+/// state. The caller (daemon Open SQE arm) should detect `size > meta.size`
+/// and enqueue the corrected meta into the dirty map so it gets persisted
+/// on the next flush.
 pub async fn open(cluster: &ClusterClient, path: &[u8]) -> Result<OpenedExtents> {
-    let (ino, meta) = resolve_path(cluster, path).await?;
-    let extents = load_extent_map(cluster, ino, meta.size).await?;
+    let (ino, mut meta) = resolve_path(cluster, path).await?;
+    let mut extents = load_extent_map(cluster, ino, meta.size).await?;
+
+    // F244-D Phase 2: reconcile from extent head. Only fires when the file
+    // has extents AND the last extent looks suspiciously short (its inferred
+    // length came from the meta.size clamp).
+    if let Some(&(last_start, _last_len)) = extents.last() {
+        let last_key = key::extent_key(ino, last_start);
+        match cluster.head(&last_key).await {
+            Ok(km) if km.found => {
+                let real_end = last_start + km.value_length;
+                if real_end > meta.size {
+                    // Stale meta — bump in memory + amend the last extent's
+                    // inferred length to the real one (clamp to u32; per
+                    // schema MAX_EXTENT ≤ 8 MiB so the cast is safe).
+                    meta.size = real_end;
+                    if let Some(last) = extents.last_mut() {
+                        last.1 = km.value_length.min(u32::MAX as u64) as u32;
+                    }
+                }
+            }
+            Ok(_) => {
+                // head reported found=false — the extent key showed up in
+                // the range scan but not in head. Could be a race with a
+                // concurrent delete. Leave inferred values alone; the next
+                // Read against this extent will surface the error cleanly.
+            }
+            Err(e) => {
+                // Transport / NotLeader: skip reconcile, return what we have.
+                // The cached meta will say its pre-crash size; readers see
+                // a slightly stale view until the writer reopens + the
+                // periodic flush catches up.
+                tracing::warn!(
+                    ino,
+                    error = %e,
+                    "Open-time size reconcile head failed; using inferred size"
+                );
+            }
+        }
+    }
+
     let size = meta.size;
     Ok(OpenedExtents {
         ino,
         size,
         extents,
         lease_version: 0,
-        // F244-D Phase 1: cache the just-fetched meta so per-write
-        // EOF-extending writes don't need to re-fetch it.
+        // F244-D Phase 1: cache the just-fetched (and possibly reconciled) meta
+        // so per-write EOF-extending writes don't need to re-fetch it.
         cached_meta: Some(meta),
     })
 }

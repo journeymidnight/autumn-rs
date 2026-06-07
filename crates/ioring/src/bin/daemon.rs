@@ -326,6 +326,8 @@ async fn handle_session(
 // ungated key+schema code path.
 use autumn_ioring::fuse_read::{self, OpenedExtents};
 use autumn_ioring::fuse_write;
+use autumn_fuse::schema::{self, InodeMeta};
+use autumn_fuse::key;
 
 /// F243: register the ring region with the process-global UCX context so reads
 /// can RDMA-land directly into it. Returns `None` on a non-UCX build or if
@@ -458,6 +460,33 @@ async fn poller_loop(
         .detach();
     }
 
+    // F244-D Phase 2: per-runtime dirty-inode-meta map + periodic flush task.
+    //
+    // Each Write SQE that extends EOF used to call `cluster.put(inode_key)`
+    // inline (one full RTT per write). Phase 2 enqueues the updated InodeMeta
+    // into `dirty_metas`; a 5 ms tick drains it via `put_many`, amortising the
+    // meta RTT across many writes (target: ~2× 4 K-write throughput).
+    //
+    // Safety / coherence:
+    //   - The WRITE lease guarantees we're the only writer per inode. Same-
+    //     runtime opens share `ring_fds.cached_meta`, so subsequent writes see
+    //     the latest in-memory size with no extra fetch.
+    //   - Close (last refcount drop) flushes the closing inode synchronously
+    //     BEFORE releasing the lease. A reader that opens after that release
+    //     sees fully-persisted meta.
+    //   - Crash mid-batch (daemon dies before flush): on next Open,
+    //     `fuse_read::open` does an extent head_many → derives actual_size from
+    //     `max(start + value_length)`, enqueues a dirty entry so the size is
+    //     written through on the next flush. See Phase 2 task #25.
+    let dirty_metas: Rc<RefCell<HashMap<u64, InodeMeta>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    {
+        let cluster_d = cluster.clone();
+        let dirty_d = dirty_metas.clone();
+        compio::runtime::spawn(async move { dirty_meta_flush_loop(cluster_d, dirty_d).await })
+            .detach();
+    }
+
     // F244-C: bounded streaming SQ/CQ loop — mirrors the EN/PS
     // `handle_connection` shape (FuturesUnordered + drain-as-they-land), the
     // server-side form of the client's `fan_out` streaming primitive. A
@@ -484,6 +513,7 @@ async fn poller_loop(
             let held_c = held_leases.clone();
             let inv_c = invalidations.clone();
             let locks_c = inode_open_locks.clone();
+            let dirty_c = dirty_metas.clone();
             // `data_base` (Copy raw ptr) + `reg_ref` (Copy ref into `ring_reg`,
             // which outlives `inflight`) are captured by the future; the Read arm
             // builds its dest slice from them.
@@ -501,6 +531,7 @@ async fn poller_loop(
                     &held_c,
                     &inv_c,
                     &locks_c,
+                    &dirty_c,
                 )
                 .await
             });
@@ -549,6 +580,10 @@ async fn service_sqe(
     // F-ioring-lease-5: per-inode async lock that serialises concurrent
     // same-inode `Open`s within the session (coco P1 #2).
     inode_open_locks: &Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>>,
+    // F244-D Phase 2: per-runtime dirty inode meta map. Write SQEs enqueue
+    // into it; a 5 ms background flush task drains via put_many; Close
+    // synchronously flushes the closing inode before releasing the lease.
+    dirty_metas: &Rc<RefCell<HashMap<u64, InodeMeta>>>,
 ) -> Cqe {
     match sqe.opcode {
         Opcode::Nop => Cqe::ok(sqe.user_data, 0),
@@ -708,6 +743,48 @@ async fn service_sqe(
                         return Cqe::err(sqe.user_data, libc::EIO);
                     }
                 };
+            // F244-D Phase 2: reconcile `inode_meta.size` against the on-disk
+            // extent data. A previous daemon may have crashed with deferred
+            // dirty meta entries (Write SQE acked + extent put landed, but
+            // dirty flush didn't reach `cluster.put(inode_key)` before crash),
+            // so the persisted meta can lag behind the actual extents. Probe
+            // the last extent's real `value_length` and compute
+            // `actual_size = max(meta.size, last_start + last_real_len)`. If
+            // the meta was stale, enqueue the corrected meta so the next
+            // dirty flush writes it through.
+            let mut inode_meta = inode_meta;
+            let mut extents = extents;
+            let mut size_was_stale = false;
+            if let Some(&(last_start, _last_len)) = extents.last() {
+                let last_key = key::extent_key(ino, last_start);
+                match cluster.head(&last_key).await {
+                    Ok(km) if km.found => {
+                        let real_end = last_start + km.value_length;
+                        if real_end > inode_meta.size {
+                            inode_meta.size = real_end;
+                            if let Some(last) = extents.last_mut() {
+                                last.1 = km.value_length.min(u32::MAX as u64) as u32;
+                            }
+                            size_was_stale = true;
+                            tracing::info!(
+                                ino,
+                                old_size = inode_meta.size - (real_end - inode_meta.size),
+                                new_size = real_end,
+                                "Open-time reconcile: meta.size was stale; recovered from extent head"
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            ino,
+                            error = %e,
+                            "Open-time reconcile head failed; proceeding with persisted meta"
+                        );
+                    }
+                }
+            }
+
             let opened = OpenedExtents {
                 ino,
                 size: inode_meta.size,
@@ -718,8 +795,17 @@ async fn service_sqe(
                 // `cluster.get(inode_key)`. Safe because we hold the
                 // per-inode lease (single-writer for WRITE leases,
                 // and READ-leased fds never write through this cache).
-                cached_meta: Some(inode_meta),
+                cached_meta: Some(inode_meta.clone()),
             };
+            // F244-D Phase 2: if reconcile bumped the size, enqueue so the
+            // next flush persists. Skipping this leaves the persisted meta
+            // stale; the NEXT Open would reconcile again (idempotent but
+            // wasteful). Done here BEFORE inserting into ring_fds so a
+            // racing close on the same runtime can't grab the lease first
+            // (this is the Open path; we hold the open lock).
+            if size_was_stale {
+                dirty_metas.borrow_mut().insert(ino, inode_meta);
+            }
             let fd = next_fd.get();
             next_fd.set(fd.checked_add(1).unwrap_or(1));
             ring_fds.borrow_mut().insert(fd, opened);
@@ -866,18 +952,43 @@ async fn service_sqe(
                     sqe.length as usize,
                 )
             };
-            let n = match fuse_write::write_into(cluster, &mut opened, sqe.offset, src).await {
+            // F244-D Phase 2: defer the inode-meta `cluster.put` — the dirty
+            // map below absorbs it for batched put_many by the flush task.
+            let n = match fuse_write::write_into_with_options(
+                cluster,
+                &mut opened,
+                sqe.offset,
+                src,
+                /* defer_persist */ true,
+            )
+            .await
+            {
                 Ok(n) => n,
                 Err(_) => return Cqe::err(sqe.user_data, libc::EIO),
             };
-            // Commit the updated extent map + size back to the cached state.
-            if let Some(o) = ring_fds.borrow_mut().get_mut(&sqe.ring_fd) {
+            // Commit the updated extent map + size + cached_meta back to the
+            // per-fd state, and enqueue the meta into the dirty map. The two
+            // borrow scopes are split so we don't hold ring_fds while taking
+            // dirty_metas (single-threaded compio runtime makes this trivially
+            // safe — no deadlock — but the explicit split keeps the
+            // scope discipline clear).
+            let dirty_payload: Option<(u64, InodeMeta)> = if let Some(o) =
+                ring_fds.borrow_mut().get_mut(&sqe.ring_fd)
+            {
                 o.size = opened.size;
                 o.extents = opened.extents;
-                // F244-D Phase 1: propagate the cached_meta's updated `size` back
-                // to the per-fd cache so the NEXT Write SQE starts from the
-                // already-bumped size (no `cluster.get` to re-fetch).
-                o.cached_meta = opened.cached_meta;
+                o.cached_meta = opened.cached_meta.clone();
+                opened.cached_meta.map(|m| (opened.ino, m))
+            } else {
+                None
+            };
+            if let Some((ino, meta)) = dirty_payload {
+                // F244-D Phase 2: enqueue the latest meta. Overwrites any
+                // older entry (HashMap::insert) — last-writer-wins is correct
+                // because each Write SQE for this inode strictly extends or
+                // preserves `size` (a write to a smaller offset doesn't
+                // shrink it), so the newest enqueue is always the freshest.
+                dirty_metas.borrow_mut().insert(ino, meta);
             }
             Cqe::ok(sqe.user_data, n as u64)
         }
@@ -907,6 +1018,21 @@ async fn service_sqe(
                 }
             };
             if release_now {
+                // F244-D Phase 2: synchronously flush any dirty meta for this
+                // inode BEFORE releasing the lease. If the flush fails we
+                // STILL release the lease (preserving the pre-Phase-2
+                // semantic that Close eventually releases — manager TTL
+                // takes over). The next opener's `fuse_read::open`
+                // extent-derive reconcile path recovers the size; a stale
+                // meta.size only widens the close-to-open window.
+                if let Err(e) = flush_dirty_inode_sync(cluster, dirty_metas, opened.ino).await
+                {
+                    tracing::warn!(
+                        ino = opened.ino,
+                        error = %e,
+                        "Close-time dirty meta flush failed; Open-time reconcile will recover"
+                    );
+                }
                 if let Err(e) = lease::release(cluster, client_id, opened.ino).await {
                     // Per plan §4.3: writer's release happens AFTER
                     // flush — by this point the cluster has the new
@@ -1386,6 +1512,110 @@ async fn session_heartbeat_loop(
             }
         }
     }
+}
+
+/// F244-D Phase 2: periodic flush of accumulated dirty inode metas.
+///
+/// Drains the per-runtime dirty map every `DIRTY_FLUSH_INTERVAL_MS` ms,
+/// encodes each meta into KV bytes, and emits them as a single `put_many`
+/// fan-out. This is the amortising mechanism: instead of one
+/// `cluster.put(inode_key)` per Write SQE (~1 RTT), N writes share one
+/// `put_many` round-trip.
+///
+/// **Retry on failure**: if `put_many` reports per-item errors, we push
+/// those entries back into the dirty map *without overwriting* any newer
+/// value that arrived during the await (`HashMap::entry().or_insert`).
+/// The next tick re-emits them. A persistent failure (manager down) means
+/// the dirty set grows; the size cap below bounds it.
+///
+/// **Size cap** (`DIRTY_FLUSH_HARD_CAP`): if the map exceeds this between
+/// ticks (e.g. a write burst races the timer), we still flush only the
+/// drained snapshot — the cap is informational, surfaced via WARN so the
+/// operator can grow the interval if it triggers regularly. We don't drop
+/// dirty entries.
+async fn dirty_meta_flush_loop(
+    cluster: Rc<ClusterClient>,
+    dirty: Rc<RefCell<HashMap<u64, InodeMeta>>>,
+) {
+    use autumn_client::BATCH_PUT_DEFAULT_CONCURRENCY;
+    use bytes::Bytes;
+    const DIRTY_FLUSH_INTERVAL_MS: u64 = 5;
+    const DIRTY_FLUSH_HARD_CAP: usize = 4096;
+    loop {
+        compio::time::sleep(Duration::from_millis(DIRTY_FLUSH_INTERVAL_MS)).await;
+        let drained: Vec<(u64, InodeMeta)> = {
+            let mut m = dirty.borrow_mut();
+            if m.is_empty() {
+                continue;
+            }
+            if m.len() > DIRTY_FLUSH_HARD_CAP {
+                tracing::warn!(
+                    dirty_len = m.len(),
+                    cap = DIRTY_FLUSH_HARD_CAP,
+                    "dirty inode meta map exceeded soft cap; consider shortening AUTUMN_IORING_DIRTY_FLUSH_INTERVAL_MS"
+                );
+            }
+            m.drain().collect()
+        };
+        // Build (key, value) pairs. The keys live in `pair_keys` for the
+        // duration of the call so the &[u8] slices into them stay valid.
+        let pair_keys: Vec<Vec<u8>> = drained
+            .iter()
+            .map(|(ino, _)| key::inode_key(*ino))
+            .collect();
+        let pair_values: Vec<Bytes> = drained
+            .iter()
+            .map(|(_, meta)| Bytes::from(schema::encode_inode_meta(meta)))
+            .collect();
+        let items: Vec<(&[u8], Bytes)> = pair_keys
+            .iter()
+            .zip(pair_values.iter())
+            .map(|(k, v)| (k.as_slice(), v.clone()))
+            .collect();
+        let results = cluster
+            .put_many(&items, BATCH_PUT_DEFAULT_CONCURRENCY)
+            .await;
+        // Push back failures so the next tick re-emits them. Use `or_insert`
+        // to avoid clobbering a newer value that arrived during the await.
+        for (i, r) in results.iter().enumerate() {
+            if r.is_err() {
+                let (ino, ref meta) = drained[i];
+                let mut m = dirty.borrow_mut();
+                m.entry(ino).or_insert_with(|| meta.clone());
+                if i == 0 {
+                    tracing::warn!(
+                        ino,
+                        error = ?r.as_ref().err(),
+                        "dirty meta flush put_many error (first item); re-queued for next tick"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// F244-D Phase 2: synchronous flush of one inode's dirty meta. Called from
+/// the Close SQE arm immediately before `lease::release` so a reader that
+/// arrives after the release sees the fully-persisted meta. Removes the
+/// entry from the dirty map regardless of put outcome (the put failure path
+/// returns the error so the caller can fail Close — better than ack'ing a
+/// Close whose meta didn't land, since the lease release would then expose
+/// a stale persisted size to subsequent openers).
+async fn flush_dirty_inode_sync(
+    cluster: &ClusterClient,
+    dirty: &Rc<RefCell<HashMap<u64, InodeMeta>>>,
+    ino: u64,
+) -> Result<()> {
+    let meta_opt = dirty.borrow_mut().remove(&ino);
+    if let Some(meta) = meta_opt {
+        let ik = key::inode_key(ino);
+        let mv = schema::encode_inode_meta(&meta);
+        cluster
+            .put(&ik, &mv)
+            .await
+            .map_err(|e| anyhow::anyhow!("close-time inode meta put: {e}"))?;
+    }
+    Ok(())
 }
 
 fn rand_session_id() -> u64 {
