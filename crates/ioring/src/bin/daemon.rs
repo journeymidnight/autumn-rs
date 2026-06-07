@@ -1577,14 +1577,24 @@ async fn dirty_meta_flush_loop(
     dirty: Rc<RefCell<HashMap<u64, InodeMeta>>>,
     flush_locks: Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>>,
 ) {
+    use autumn_client::BATCH_PUT_DEFAULT_CONCURRENCY;
     use bytes::Bytes;
-    use futures::stream::FuturesUnordered;
+    use futures::stream::StreamExt;
     const DIRTY_FLUSH_INTERVAL_MS: u64 = 5;
     const DIRTY_FLUSH_HARD_CAP: usize = 4096;
     loop {
         compio::time::sleep(Duration::from_millis(DIRTY_FLUSH_INTERVAL_MS)).await;
-        let drained: Vec<(u64, InodeMeta)> = {
-            let mut m = dirty.borrow_mut();
+
+        // coco round-2 P1 fix: snapshot KEYS only — never values. Each
+        // per-key future drains the *current* value AFTER acquiring the
+        // per-inode lock, so a Write that lands between this snapshot and
+        // the lock acquire ends up writing through the FRESH value rather
+        // than letting a stale snapshot overwrite. The pre-round-2 code
+        // drained values out of the shared map at snapshot time which made
+        // the lock useless against this exact race (`m.drain()` before
+        // `lock(ino).await`).
+        let inos: Vec<u64> = {
+            let m = dirty.borrow();
             if m.is_empty() {
                 continue;
             }
@@ -1595,23 +1605,20 @@ async fn dirty_meta_flush_loop(
                     "dirty inode meta map exceeded soft cap; consider shortening AUTUMN_IORING_DIRTY_FLUSH_INTERVAL_MS"
                 );
             }
-            m.drain().collect()
+            m.keys().copied().collect()
         };
-        // coco P1 #1 fix: each per-key put goes through a per-inode async
-        // lock so Close-time `flush_dirty_inode_sync` for the SAME ino can't
-        // race this bg path. We can no longer use `put_many` directly because
-        // each future must `lock().await` first AND map per-future to per-key
-        // — so we hand-roll the same fan-out shape (FuturesUnordered, drain
-        // as they land) at BATCH_PUT_DEFAULT_CONCURRENCY width. Each future
-        // also implements the coco P1 #2 fix at the bg flush layer: on
-        // failure the meta is pushed back via `entry().or_insert` so it
-        // doesn't clobber a newer enqueue.
+
+        // coco round-2 P2 fix: bound concurrency to BATCH_PUT_DEFAULT_CONCURRENCY
+        // (matches what put_many was doing pre-round-1). Without this an
+        // operator could enqueue thousands of dirty inodes between ticks and
+        // we'd fire that many concurrent puts at the ClusterClient — would
+        // saturate transport / PS partition queues and undo the
+        // amortisation Phase 2 is supposed to deliver.
         let cluster_p = cluster.clone();
         let dirty_p = dirty.clone();
         let locks_p = flush_locks.clone();
-        let futs: FuturesUnordered<_> = drained
-            .into_iter()
-            .map(|(ino, meta)| {
+        futures::stream::iter(inos)
+            .for_each_concurrent(BATCH_PUT_DEFAULT_CONCURRENCY, |ino| {
                 let cluster_i = cluster_p.clone();
                 let dirty_i = dirty_p.clone();
                 let locks_i = locks_p.clone();
@@ -1622,27 +1629,28 @@ async fn dirty_meta_flush_loop(
                         .or_insert_with(|| Rc::new(futures::lock::Mutex::new(())))
                         .clone();
                     let _guard = lock.lock().await;
-                    let ik = key::inode_key(ino);
-                    let mv = Bytes::from(schema::encode_inode_meta(&meta));
-                    let result = cluster_i.put(&ik, mv.as_ref()).await;
-                    if let Err(ref e) = result {
-                        // Don't clobber a newer enqueue from a concurrent Write.
-                        dirty_i.borrow_mut().entry(ino).or_insert(meta);
-                        tracing::warn!(
-                            ino,
-                            error = %e,
-                            "dirty meta flush put error; re-queued for next tick"
-                        );
+                    // coco round-2: drain INSIDE the lock so a Write that
+                    // happened between snapshot+lock-acquire wins.
+                    let meta_opt = dirty_i.borrow_mut().remove(&ino);
+                    if let Some(meta) = meta_opt {
+                        let ik = key::inode_key(ino);
+                        let mv = Bytes::from(schema::encode_inode_meta(&meta));
+                        if let Err(e) = cluster_i.put(&ik, mv.as_ref()).await {
+                            // coco P1 #2: don't lose a deferred meta on
+                            // put failure. Push back via entry().or_insert
+                            // so a Write that enqueued a NEWER value during
+                            // our await isn't clobbered.
+                            dirty_i.borrow_mut().entry(ino).or_insert(meta);
+                            tracing::warn!(
+                                ino,
+                                error = %e,
+                                "dirty meta flush put error; re-queued for next tick"
+                            );
+                        }
                     }
-                    result
                 }
             })
-            .collect();
-        // Drain the per-inode futures concurrently. FuturesUnordered already
-        // bounds the in-flight by its push order; with up to 4096 entries per
-        // tick this is fine on a single compio runtime.
-        use futures::stream::StreamExt as _;
-        let _ = futs.collect::<Vec<_>>().await;
+            .await;
     }
 }
 
