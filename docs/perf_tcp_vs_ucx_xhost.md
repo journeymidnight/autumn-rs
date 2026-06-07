@@ -46,7 +46,8 @@ Bench shape: `perf-check --threads 16 --duration 10 --partitions 8
 | TCP | loopback | **39,570** (p99 17 ms) | **1,370,164** (p99 0.15 ms) | **1658** (207) p99 749 ms | **8837** (1105) p99 159 ms |
 | UCX | loopback | 22,152 (p99 23 ms) | 1,058,886 (p99 0.13 ms) | 62 (7.78) ⚠ p99 37 s | 274 (34) ⚠ p99 12 s |
 | TCP | **cross-host (::15 → ::14)** | **9,678** (p99 79 ms) | **15,575** (p99 241 ms) | **281** (35) p99 5.9 s | **193** (24) p99 10.7 s |
-| UCX | cross-host (::15 → ::14) | — not collected (see "UCX cross-host blocker" below) | — | — | — |
+| UCX(rc_mlx5) | **cross-host (::15 → ::14)** | **15,710** (p99 22 ms) | **854,721** (p99 0.19 ms) | **1,576** (197) p99 919 ms | **10,756** (1,344) p99 149 ms |
+| | **UCX/TCP ratio** | **1.6×** | **55×** | **5.6×** | **56×** |
 
 ### Loopback — TCP wins all four cells
 
@@ -152,6 +153,42 @@ Three classes of failure stopped the cross-host UCX leg on this attempt:
    The clean way to validate cross-host UCX is a true two-machine cluster
    (cluster on A, client on B), which this dev box doesn't have (only
    `::14` has /data03 + /data05 + /data08; `::15` is missing /data05).
+
+### Update 2026-06-07 (FOURTH attempt — IT WORKS, commit `03c8fe5`)
+
+The third attempt failed permanently on `rowStream commit_length: 0/3
+committed members reachable`. After adding a WARN to surface the
+silently-swallowed per-replica error in `handle_check_commit_length`,
+the real cause showed up: **the manager was routing every probe to
+shard 0**, because `cluster.sh` was using `AUTUMN_EN${i}_CPUSET` to
+pin per-EN cpusets WITHOUT setting `AUTUMN_EXTENT_SHARDS` to the
+matching width. With SHARDS=1 the format call passed an empty
+`--shard-ports` list; `shard_addr_for_extent` then fell back to "addr
+unchanged" so every probe hit the main port (shard 0). For any extent
+where `extent_id % shard_count != 0` the EN correctly refused with
+`FailedPrecondition: extent N belongs to shard M not shard 0`, and
+the silent `if let Ok(v) =` swallowed it.
+
+`log_stream` happened to land on extent 8 (8 % 4 = 0 → shard 0 →
+worked); `row_stream` on extent 10 (10 % 4 = 2 → shard 2 → wrong)
+which is why the symptom looked extent-specific. Fix
+landed in `03c8fe5`: `cluster.sh` now `die`s on the
+cpuset-width / SHARDS mismatch; `handle_check_commit_length` surfaces
+the per-probe error at WARN.
+
+With `AUTUMN_EXTENT_SHARDS=4` properly matched to
+`AUTUMN_EN[1-3]_CPUSET="0-3"/"4-7"/"8-11"`, the cluster opens all 8
+partitions cleanly under `UCX_TLS=tcp,self,rc_mlx5 UCX_NET_DEVICES=
+mlx5_1:1 AUTUMN_BIND_HOST=[fdbd:dc62:3:302::14]`. Remote bench client
+on ::15 successfully drives the bench over UCX RDMA. **The numbers
+above are real cross-host RDMA — see the matrix at the top.**
+
+The "PS↔EN same-host UCX hop is broken" diagnosis from the first
+three attempts was wrong. With proper shard routing, same-host
+PS↔EN UCX over rc_mlx5 works fine (the kernel/NIC handle the
+intra-host RoCE loopback transparently). PS log shows the regpool
+warming as expected: 99% hit rate after warmup, 960 MB
+`registered_bytes` across 16 PS threads, 0 over_cap / register_failed.
 
 ### Update 2026-06-07 (third attempt — rc_mlx5 enabled)
 
