@@ -530,7 +530,7 @@ impl ReadHalf {
         filled: usize,
         target: usize,
     ) -> io::Result<crate::PooledBuf> {
-        debug_assert!(filled <= target && target <= pb.len());
+        debug_assert!(filled <= target && target <= pb.cap());
         if self.is_ucx() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,

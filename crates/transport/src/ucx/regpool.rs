@@ -40,10 +40,12 @@
 // `PooledBuf` with no `cfg`.
 use crate::RegisteredMem;
 use std::cell::RefCell;
-use std::collections::HashMap;
 
 /// Smallest size class. Values below this still round up to it.
 const MIN_CLASS: usize = 4096;
+/// Power-of-two exponent for `MIN_CLASS` — used as the bucket-index offset
+/// so `class.trailing_zeros() - MIN_CLASS_SHIFT` is the bucket array index.
+const MIN_CLASS_SHIFT: u32 = MIN_CLASS.trailing_zeros(); // = 12
 
 /// Largest size class. Caller-requested `need` above this is rejected (the
 /// pool returns an unregistered, in-place `Vec` of exactly `need` bytes, NOT
@@ -52,6 +54,24 @@ const MIN_CLASS: usize = 4096;
 /// would panic on `need > usize::MAX/2` anyway). 256 MiB matches autumn's
 /// largest single value (8 MiB extent) × 32 — generous headroom.
 const MAX_CLASS: usize = 256 * 1024 * 1024;
+const MAX_CLASS_SHIFT: u32 = MAX_CLASS.trailing_zeros(); // = 28
+
+/// One bucket per power-of-two size class from `MIN_CLASS` (2^12 = 4 KiB) to
+/// `MAX_CLASS` (2^28 = 256 MiB), inclusive. Indexed by
+/// `class.trailing_zeros() - MIN_CLASS_SHIFT`. Sized as a `const` so the
+/// fixed-array allocation lives on the stack (or in TLS — see `POOL`) with
+/// no heap indirection per acquire/drop hot-path lookup.
+const NUM_CLASSES: usize = (MAX_CLASS_SHIFT - MIN_CLASS_SHIFT + 1) as usize; // = 17
+
+/// Map a power-of-two `class` byte-count to its bucket index.
+/// Panics in debug if `class` isn't a valid in-pool size; the public
+/// callers (`acquire` / `PooledBuf::Drop` after the `class > MAX_CLASS`
+/// guard) always pass a valid class.
+#[inline]
+fn class_index(class: usize) -> usize {
+    debug_assert!(class >= MIN_CLASS && class <= MAX_CLASS && class.is_power_of_two());
+    (class.trailing_zeros() - MIN_CLASS_SHIFT) as usize
+}
 
 /// Per-thread cap on total registered (pinned) bytes held by the pool's
 /// free-list. Operators must keep `cap × threads < RLIMIT_MEMLOCK`. Default
@@ -88,8 +108,14 @@ struct Slab {
 }
 
 struct PoolState {
-    /// size class (bytes) -> free slabs of exactly that capacity.
-    buckets: HashMap<usize, Vec<Slab>>,
+    /// Free slabs grouped by power-of-two size class. Bucket index =
+    /// `class.trailing_zeros() - MIN_CLASS_SHIFT`, so 4 KiB → 0, 8 KiB → 1,
+    /// …, 256 MiB → 16. Replaces the prior `HashMap<usize, Vec<Slab>>` —
+    /// the hot path was `buckets.get_mut(&class)` (hash + bucket walk) and
+    /// `entry(class).or_default()` (hash + maybe alloc) on every Drop;
+    /// `[Vec<Slab>; 17]` is a single index, and the Vecs amortise their
+    /// own allocations.
+    buckets: [Vec<Slab>; NUM_CLASSES],
     /// Registered bytes sitting on the free-list (subset of `registered_bytes`).
     pooled_bytes: usize,
     /// Total registered (pinned) bytes for this thread — free-list AND
@@ -114,7 +140,10 @@ struct PoolState {
 impl PoolState {
     fn new() -> Self {
         Self {
-            buckets: HashMap::new(),
+            // [const { Vec::new() }; N] needs the inline-const stabilised in
+            // 1.79 — autumn-rs's MSRV is well past that. `Vec::new()` doesn't
+            // allocate, so this is one stack-array init, no heap.
+            buckets: [const { Vec::new() }; NUM_CLASSES],
             pooled_bytes: 0,
             registered_bytes: 0,
             warned_over_cap: false,
@@ -146,8 +175,21 @@ pub struct PooledBuf {
     slab: Option<Slab>,
     /// size class of the slab (its `buf.capacity()`).
     class: usize,
-    /// logical length the caller asked for (`<= class`).
+    /// logical length the caller asked for (`<= class`). This is the
+    /// WRITABLE area cap returned by `dest_mut` / `dest_and_reg` /
+    /// `IoBufMut::as_uninit` — the "I want a `used`-byte recv target".
     used: usize,
+    /// Bytes actually initialized / filled by the most recent I/O.
+    /// Defaults to `used` on acquire (the legacy assumption was "the recv
+    /// will fully fill the requested area" — every current dest_and_reg
+    /// caller's recv loop does exactly that, and breaks early on error
+    /// before exposing `pb`). The UCX recv path (`endpoint.rs:recv_into`)
+    /// and compio's owned-read path both call `SetLen::set_len(got)` with
+    /// the actual recv count; that now narrows `filled_len` so `filled()`
+    /// / `AsRef<[u8]>` / `IoBuf::as_init` only expose the valid portion
+    /// of the slab — closing coco P2's "stale pool bytes leak on partial
+    /// recv" concern without breaking the all-fill loop callers.
+    filled_len: usize,
 }
 
 impl PooledBuf {
@@ -178,17 +220,30 @@ impl PooledBuf {
     }
 
     /// Read-only view of the filled region (for sending the value onward).
+    /// Narrowed by `SetLen::set_len` if the most recent recv returned
+    /// fewer bytes than the writable area; defaults to the requested
+    /// length (`used`) before any I/O happens.
     pub fn filled(&self) -> &[u8] {
-        let used = self.used;
-        &self.slab.as_ref().expect("slab present").buf[..used]
+        let filled = self.filled_len;
+        &self.slab.as_ref().expect("slab present").buf[..filled]
     }
 
+    /// Filled-bytes count — Vec-like semantics (initialized data length).
+    /// Defaults to the requested capacity (`used`); narrows to actual recv
+    /// count after `SetLen::set_len`.
     pub fn len(&self) -> usize {
-        self.used
+        self.filled_len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.used == 0
+        self.filled_len == 0
+    }
+
+    /// Writable-area cap — the `used` value passed to `acquire`. Used by
+    /// callers (`crate::lib::read_exact_into_pooled`'s `debug_assert`) to
+    /// bound a target offset inside the buffer.
+    pub fn cap(&self) -> usize {
+        self.used
     }
 }
 
@@ -221,7 +276,17 @@ impl compio::buf::IoBuf for PooledBuf {
 }
 
 impl compio::buf::SetLen for PooledBuf {
-    unsafe fn set_len(&mut self, _len: usize) {}
+    /// Mark `len` bytes of the writable area as initialized. compio calls
+    /// this internally after `read_exact_at` / `read_at` fills the slab;
+    /// the UCX recv path (`endpoint.rs::recv_into`) calls it explicitly
+    /// with the recv'd `got` count. Clamps to `used` to guarantee
+    /// `filled_len <= cap()` even if a buggy caller passes a wild value.
+    /// (The contract is "I just read `len` bytes into `as_uninit`" — `len`
+    /// SHOULD always be `<= as_uninit().len() == used`. The clamp is
+    /// defensive belt-and-braces.)
+    unsafe fn set_len(&mut self, len: usize) {
+        self.filled_len = len.min(self.used);
+    }
 }
 
 impl compio::buf::IoBufMut for PooledBuf {
@@ -276,7 +341,7 @@ impl Drop for PooledBuf {
                 let mut p = p.borrow_mut();
                 if p.pooled_bytes + class <= cap_bytes() {
                     p.pooled_bytes += class;
-                    p.buckets.entry(class).or_default().push(slab);
+                    p.buckets[class_index(class)].push(slab);
                     None
                 } else {
                     // Eviction: keep `registered_bytes` in lockstep with what's
@@ -314,11 +379,13 @@ pub fn acquire(need: usize) -> PooledBuf {
             slab: Some(Slab { reg: None, buf }),
             class: need,
             used: need,
+            filled_len: need,
         };
     };
     let slab = POOL.with(|p| {
         let mut p = p.borrow_mut();
-        if let Some(slab) = p.buckets.get_mut(&class).and_then(|v| v.pop()) {
+        let idx = class_index(class);
+        if let Some(slab) = p.buckets[idx].pop() {
             p.pooled_bytes -= class;
             return Some(slab);
         }
@@ -330,6 +397,7 @@ pub fn acquire(need: usize) -> PooledBuf {
             slab: Some(slab),
             class,
             used: need,
+            filled_len: need,
         };
     }
 
@@ -395,12 +463,25 @@ pub fn acquire(need: usize) -> PooledBuf {
         slab: Some(Slab { buf, reg }),
         class,
         used: need,
+        filled_len: need,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn class_index_covers_all_buckets() {
+        assert_eq!(class_index(MIN_CLASS), 0);
+        assert_eq!(class_index(8 * 1024), 1);
+        assert_eq!(class_index(1 << 20), 8); // 1 MiB
+        assert_eq!(class_index(8 * 1024 * 1024), 11);
+        assert_eq!(class_index(MAX_CLASS), NUM_CLASSES - 1);
+        // NUM_CLASSES sized exactly = exponent range + 1, covers every
+        // valid in-pool class. Bucket index never escapes the array.
+        assert!(class_index(MAX_CLASS) < NUM_CLASSES);
+    }
 
     #[test]
     fn size_class_rounds_to_pow2_min_4k() {
@@ -441,6 +522,28 @@ mod tests {
         for pb in held.drain(..) {
             drop(pb);
         }
+    }
+
+    /// Partial-recv narrowing: after `set_len(n)`, `filled()` / `AsRef` /
+    /// `IoBuf::as_init()` must only expose `[..n]`, never the stale
+    /// pool bytes between `[n..used]`. This is what coco P2 #4 was about.
+    #[test]
+    fn set_len_narrows_filled_view() {
+        use compio::buf::{IoBuf, SetLen};
+        let mut pb = acquire(8000); // class=8192
+        assert_eq!(pb.cap(), 8000, "cap = requested capacity");
+        assert_eq!(pb.len(), 8000, "default filled_len = used (legacy contract)");
+        // Simulate the UCX recv_into path receiving fewer bytes than asked.
+        unsafe { pb.set_len(3000) };
+        assert_eq!(pb.len(), 3000, "set_len narrows filled_len");
+        assert_eq!(pb.filled().len(), 3000, "filled() narrows");
+        assert_eq!(pb.as_init().len(), 3000, "IoBuf::as_init narrows");
+        assert_eq!(pb.cap(), 8000, "cap unchanged by set_len");
+        // dest_mut still exposes the FULL writable area (unchanged).
+        assert_eq!(pb.dest_mut().len(), 8000, "dest_mut returns writable cap");
+        // Defensive clamp: set_len(> used) is clamped, never out-of-bounds.
+        unsafe { pb.set_len(usize::MAX) };
+        assert_eq!(pb.len(), 8000, "set_len clamps to used");
     }
 
     /// Out-of-pool acquire: any `need > MAX_CLASS` returns an unregistered
