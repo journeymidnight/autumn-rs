@@ -198,6 +198,18 @@ async fn execute_step(
 
 /// Update `opened.size` + the persistent `InodeMeta.size` if `new_eof` is past
 /// the current EOF. Shared by the parallel + sequential write entry points.
+///
+/// F244-D Phase 1 — fast path: when the caller already cached the inode meta in
+/// `opened.cached_meta` (the daemon's Open populates this and the WRITE lease
+/// guarantees we're the only writer), skip the per-write `cluster.get(inode_key)`
+/// and just mutate the cached copy. Saves ~half the per-write RTTs for
+/// EOF-extending workloads (was: data put + meta get + meta put; now: data put +
+/// meta put). The cached meta is updated in place and propagated back to the
+/// daemon's per-fd cache by the caller so the NEXT Write SQE starts from the
+/// already-bumped size.
+///
+/// Slow path: `cached_meta = None` falls through to the pre-F244-D get-then-put
+/// — preserved for compat (tests, future paths that hand-roll OpenedExtents).
 async fn maybe_persist_size_growth(
     cluster: &ClusterClient,
     opened: &mut OpenedExtents,
@@ -208,6 +220,19 @@ async fn maybe_persist_size_growth(
     }
     opened.size = new_eof;
     let ik = key::inode_key(opened.ino);
+
+    if let Some(ref mut meta) = opened.cached_meta {
+        // F244-D Phase 1 fast path: cached meta exists; mutate + put.
+        meta.size = new_eof;
+        let new_mv = schema::encode_inode_meta(meta);
+        cluster
+            .put(&ik, &new_mv)
+            .await
+            .map_err(|e| anyhow!("inode put: {e}"))?;
+        return Ok(());
+    }
+
+    // Pre-F244-D slow path: no cached meta (test / compat). Get-modify-put.
     let mv = cluster
         .get(&ik)
         .await

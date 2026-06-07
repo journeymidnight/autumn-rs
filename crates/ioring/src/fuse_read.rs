@@ -47,6 +47,19 @@ pub struct OpenedExtents {
     /// "always fresh" otherwise. Production paths populate from the
     /// AcquireLease response.
     pub lease_version: u64,
+    /// F244-D Phase 1: cached `InodeMeta` captured at `open()` time so the
+    /// hot Write SQE path can skip a `cluster.get(inode_key)` per EOF-
+    /// extending write. The cache stays valid because the iouring daemon
+    /// holds a WRITE-exclusive lease per inode (single writer, no
+    /// cross-daemon meta-change while this fd is open). Read-only fds
+    /// also keep a snapshot but never write through it; readers tolerate
+    /// staler meta because the per-session invalidation map drives
+    /// `reload_extents` independently.
+    ///
+    /// `None` for compat paths (tests, raw `OpenedExtents` constructors).
+    /// The Write SQE handler treats `None` as "fall back to cluster.get"
+    /// so the optimisation is purely additive.
+    pub cached_meta: Option<InodeMeta>,
 }
 
 /// Resolve a fuse path (`"/a/b/file"` or `"a/b/file"`) to its inode + metadata by
@@ -128,11 +141,15 @@ fn infer_lengths(starts: &[u64], size: u64) -> Vec<(u64, u32)> {
 pub async fn open(cluster: &ClusterClient, path: &[u8]) -> Result<OpenedExtents> {
     let (ino, meta) = resolve_path(cluster, path).await?;
     let extents = load_extent_map(cluster, ino, meta.size).await?;
+    let size = meta.size;
     Ok(OpenedExtents {
         ino,
-        size: meta.size,
+        size,
         extents,
         lease_version: 0,
+        // F244-D Phase 1: cache the just-fetched meta so per-write
+        // EOF-extending writes don't need to re-fetch it.
+        cached_meta: Some(meta),
     })
 }
 
@@ -155,6 +172,9 @@ pub async fn reload_extents(cluster: &ClusterClient, opened: &mut OpenedExtents)
         .ok_or_else(|| anyhow!("ENOENT inode {}", opened.ino))?;
     let meta = schema::decode_inode_meta(&iv).map_err(|e| anyhow!("decode inode: {e}"))?;
     opened.size = meta.size;
+    // F244-D Phase 1: refresh the cached meta on reload so subsequent writes
+    // start from the fresh server-side copy.
+    opened.cached_meta = Some(meta);
     opened.extents = load_extent_map(cluster, opened.ino, opened.size).await?;
     Ok(())
 }
@@ -291,6 +311,7 @@ mod tests {
             size,
             extents,
             lease_version: 0,
+            cached_meta: None,
         }
     }
 

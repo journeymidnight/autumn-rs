@@ -713,6 +713,12 @@ async fn service_sqe(
                 size: inode_meta.size,
                 extents,
                 lease_version,
+                // F244-D Phase 1: cache the inode meta so per-write
+                // EOF-extending Write SQEs can skip the per-write
+                // `cluster.get(inode_key)`. Safe because we hold the
+                // per-inode lease (single-writer for WRITE leases,
+                // and READ-leased fds never write through this cache).
+                cached_meta: Some(inode_meta),
             };
             let fd = next_fd.get();
             next_fd.set(fd.checked_add(1).unwrap_or(1));
@@ -738,6 +744,7 @@ async fn service_sqe(
                         size: o.size,
                         extents: o.extents.clone(),
                         lease_version: o.lease_version,
+                        cached_meta: o.cached_meta.clone(),
                     },
                     None => return Cqe::err(sqe.user_data, libc::EBADF),
                 }
@@ -819,6 +826,10 @@ async fn service_sqe(
                         size: o.size,
                         extents: o.extents.clone(),
                         lease_version: o.lease_version,
+                        // F244-D Phase 1: propagate the cached meta into the
+                        // per-call working copy so `maybe_persist_size_growth`
+                        // can skip the per-write `cluster.get(inode_key)`.
+                        cached_meta: o.cached_meta.clone(),
                     },
                     None => return Cqe::err(sqe.user_data, libc::EBADF),
                 }
@@ -863,6 +874,10 @@ async fn service_sqe(
             if let Some(o) = ring_fds.borrow_mut().get_mut(&sqe.ring_fd) {
                 o.size = opened.size;
                 o.extents = opened.extents;
+                // F244-D Phase 1: propagate the cached_meta's updated `size` back
+                // to the per-fd cache so the NEXT Write SQE starts from the
+                // already-bumped size (no `cluster.get` to re-fetch).
+                o.cached_meta = opened.cached_meta;
             }
             Cqe::ok(sqe.user_data, n as u64)
         }
@@ -1021,6 +1036,7 @@ mod bug_lease_3_tests {
             size: 0,
             extents: vec![],
             lease_version: 0,
+            cached_meta: None,
         }
     }
 
