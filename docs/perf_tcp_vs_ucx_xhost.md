@@ -1,5 +1,37 @@
 # TCP vs UCX, loopback vs cross-host (2026-06-07)
 
+## Loopback-only summary (the clean comparison)
+
+Per follow-up — measured loopback UCX with `UCX_TLS=tcp,self` against
+loopback TCP at the same bench shape (`--partitions 8 --pipeline-depth 8
+--threads 16 --duration 10`, --3disk r=3). This is **UCX-over-TCP**:
+UCX's tcp TL on top of kernel sockets, no RDMA — measures the UCX
+wrapper's pure overhead vs raw kernel TCP.
+
+| size | metric | TCP loopback | UCX(tls=tcp) loopback | UCX/TCP |
+|---|---|---|---|---|
+| 4 KiB | write ops/s | 39,570 | 28,523 | 72 % |
+| 4 KiB | write p99 | 17 ms | 18 ms | 1.06× |
+| 4 KiB | read ops/s | 1,370,164 | 485,356 | 35 % |
+| 4 KiB | read p99 | 0.15 ms | 0.53 ms | 3.5× |
+| 8 MiB | write MB/s | 1658 | 1544 | 93 % |
+| 8 MiB | write p99 | 749 ms | 805 ms | 1.07× |
+| 8 MiB | read MB/s | 8837 | 7087 | 80 % |
+| 8 MiB | read p99 | 159 ms | 224 ms | 1.41× |
+
+UCX-over-TCP costs 7–20 % at 8 MiB (read worse than write because the
+read path makes more EP transitions per RPC) and the overhead is much
+worse at 4 KiB — reads in particular pay 3.5× p99 because per-RPC EP
+setup/probing dominates when the payload is tiny. **This is the
+"floor" of how much worse UCX could be vs raw TCP when you force it
+off RDMA.** Real UCX cross-host with RDMA on goes the other way (memory
+on file: 4.6× *better* for 8 MiB read), but only when the wire is
+actually doing RDMA — see the cross-host section below.
+
+---
+
+## Original cross-host attempt
+
 Reference: 3-NVMe r=3 cluster on `dc62-p3-t302-n014`. Remote client on
 `dc62-p3-t302-n015`. Both hosts on the `fdbd:dc62:3:302::/64` subnet
 (eth0 ↔ mlx5_1 RoCE), code at `ccc315e` after `git push origin main`.
