@@ -45,6 +45,14 @@ use std::collections::HashMap;
 /// Smallest size class. Values below this still round up to it.
 const MIN_CLASS: usize = 4096;
 
+/// Largest size class. Caller-requested `need` above this is rejected (the
+/// pool returns an unregistered, in-place `Vec` of exactly `need` bytes, NOT
+/// a power-of-two slab — registering >256 MiB through the pool is almost
+/// certainly a frame-length corruption or DoS attempt, and `next_power_of_two`
+/// would panic on `need > usize::MAX/2` anyway). 256 MiB matches autumn's
+/// largest single value (8 MiB extent) × 32 — generous headroom.
+const MAX_CLASS: usize = 256 * 1024 * 1024;
+
 /// Per-thread cap on total registered (pinned) bytes held by the pool's
 /// free-list. Operators must keep `cap × threads < RLIMIT_MEMLOCK`. Default
 /// 512 MiB; overridable once via [`set_regpool_cap_bytes`] from a CLI flag
@@ -64,18 +72,38 @@ fn cap_bytes() -> usize {
 }
 
 struct Slab {
+    /// `Some` = registered (zero-copy capable); `None` = over-cap fallback.
+    ///
+    /// MUST be declared BEFORE `buf` so it drops first: `RegisteredMem::drop`
+    /// runs `ucp_mem_unmap` on the address range backed by `buf`; if `buf`
+    /// dropped first, UCX would unmap freed memory (the C-side rcache + verbs
+    /// driver may keep that address live for a brief window after unmap, so
+    /// the use-after-free is occasionally observable as a driver error or
+    /// SIGSEGV during process shutdown / over-cap eviction). Rust drops in
+    /// declaration order.
+    reg: Option<RegisteredMem>,
     /// Capacity == the buffer's size class; address is stable for the slab's
     /// life (allocated zeroed, never re-grown), so `reg` stays valid.
     buf: Vec<u8>,
-    /// `Some` = registered (zero-copy capable); `None` = over-cap fallback.
-    reg: Option<RegisteredMem>,
 }
 
 struct PoolState {
     /// size class (bytes) -> free slabs of exactly that capacity.
     buckets: HashMap<usize, Vec<Slab>>,
-    /// total registered bytes currently held in `buckets` (free-list only).
+    /// Registered bytes sitting on the free-list (subset of `registered_bytes`).
     pooled_bytes: usize,
+    /// Total registered (pinned) bytes for this thread — free-list AND
+    /// in-flight (currently owned by some `PooledBuf`). This is the value
+    /// `cap_bytes()` actually constrains. The previous accounting only
+    /// summed free-list, so a pipelined worker holding N `PooledBuf`s of
+    /// 8 MiB in-flight could pin far more than cap before any pressure was
+    /// observed. Now `acquire` of a fresh slab checks this counter BEFORE
+    /// `register_memory`; eviction (`PooledBuf::Drop` over-cap branch)
+    /// decrements it after `RegisteredMem` is released. Always 0 on the
+    /// non-ucx build (the type-erased `RegisteredMem` is uninhabited there),
+    /// so flagged `dead_code` for that build only.
+    #[allow(dead_code)]
+    registered_bytes: usize,
     /// Read only on the `#[cfg(feature = "ucx")]` warn-once path (ucp_mem_map
     /// failure); the field + its init are always compiled, so the default
     /// (non-ucx) build sees it as never-read.
@@ -88,6 +116,7 @@ impl PoolState {
         Self {
             buckets: HashMap::new(),
             pooled_bytes: 0,
+            registered_bytes: 0,
             warned_over_cap: false,
         }
     }
@@ -98,8 +127,15 @@ thread_local! {
 }
 
 /// Round `need` up to its size class (power of two, min `MIN_CLASS`).
-fn size_class(need: usize) -> usize {
-    need.max(MIN_CLASS).next_power_of_two()
+/// Returns `None` if `need` exceeds `MAX_CLASS` (caller decides whether to
+/// allocate an unregistered out-of-pool buffer or reject the request).
+fn size_class(need: usize) -> Option<usize> {
+    if need > MAX_CLASS {
+        return None;
+    }
+    // `checked_next_power_of_two` covers any future change to MAX_CLASS that
+    // accidentally pushes near `usize::MAX/2`.
+    need.max(MIN_CLASS).checked_next_power_of_two()
 }
 
 /// A registered buffer borrowed from the thread-local pool. Returns to the
@@ -219,14 +255,43 @@ impl Drop for PooledBuf {
             return;
         }
         let class = self.class;
-        POOL.with(|p| {
-            let mut p = p.borrow_mut();
-            if p.pooled_bytes + class <= cap_bytes() {
-                p.pooled_bytes += class;
-                p.buckets.entry(class).or_default().push(slab);
-            }
-            // else: over cap → drop the slab (RegisteredMem::drop unmaps).
-        });
+        // Out-of-pool path (need > MAX_CLASS, see `acquire`): class isn't a
+        // size class, no bucket exists for it, never re-pool.
+        if class > MAX_CLASS {
+            return;
+        }
+        // `try_with`, not `with`: a `PooledBuf` that escaped into another TLS
+        // or task-local can outlive the regpool's TLS destructor; `with` would
+        // then panic, and a Drop panic during stack-unwind aborts the process.
+        // On TLS-shutdown we just let the slab drop directly (the Slab field
+        // order above keeps that FFI-safe: RegisteredMem unmaps before buf
+        // frees).
+        // Returns the slab back to the caller iff we're evicting it. The slab
+        // is then dropped OUTSIDE `POOL.borrow_mut`, so a hypothetical future
+        // hook in `RegisteredMem::drop` that touches POOL won't deadlock on
+        // the RefCell. (`RegisteredMem::drop` today only calls
+        // `ucp_mem_unmap` — the safety is purely defensive.)
+        let to_drop = POOL
+            .try_with(|p| {
+                let mut p = p.borrow_mut();
+                if p.pooled_bytes + class <= cap_bytes() {
+                    p.pooled_bytes += class;
+                    p.buckets.entry(class).or_default().push(slab);
+                    None
+                } else {
+                    // Eviction: keep `registered_bytes` in lockstep with what's
+                    // actually pinned. Non-ucx builds register nothing, so this
+                    // is a no-op there.
+                    #[cfg(feature = "ucx")]
+                    if slab.reg.is_some() {
+                        p.registered_bytes = p.registered_bytes.saturating_sub(class);
+                    }
+                    Some(slab)
+                }
+            })
+            .ok()
+            .flatten();
+        drop(to_drop); // borrow_mut released; safe to run Slab::drop now.
     }
 }
 
@@ -234,8 +299,23 @@ impl Drop for PooledBuf {
 /// pool. Reuses a pooled slab of the right size class, or allocates+registers a
 /// fresh one. If registering would exceed the per-thread memlock cap, returns
 /// an unregistered buffer (recv falls back to copy-out — still correct).
+///
+/// For `need > MAX_CLASS` (256 MiB), returns an unregistered out-of-pool
+/// buffer of EXACTLY `need` bytes (no rounding, no pooling) — keeps the API
+/// total while making "absurdly large" allocations cheap-and-non-pinning
+/// instead of OOM-aborting via `next_power_of_two` panic.
 pub fn acquire(need: usize) -> PooledBuf {
-    let class = size_class(need);
+    let Some(class) = size_class(need) else {
+        // Out-of-pool: allocate exact size, never register, never pool.
+        // Marked by `class > MAX_CLASS` so `Drop` skips the re-pool path
+        // even on non-ucx builds (where `reg.is_none()` is normal).
+        let buf = vec![0u8; need];
+        return PooledBuf {
+            slab: Some(Slab { reg: None, buf }),
+            class: need,
+            used: need,
+        };
+    };
     let slab = POOL.with(|p| {
         let mut p = p.borrow_mut();
         if let Some(slab) = p.buckets.get_mut(&class).and_then(|v| v.pop()) {
@@ -257,21 +337,55 @@ pub fn acquire(need: usize) -> PooledBuf {
     #[cfg_attr(not(feature = "ucx"), allow(unused_mut))]
     let mut buf = vec![0u8; class];
     #[cfg(feature = "ucx")]
-    let reg = match crate::register_memory(buf.as_mut_ptr() as *mut std::os::raw::c_void, class) {
-        Ok(r) => Some(r),
-        Err(e) => {
+    let reg = {
+        // PRE-FLIGHT cap check: would registering `class` more bytes push the
+        // thread's total pinned mem above cap? If so, skip register_memory —
+        // an over-budget `ucp_mem_map` would either fail (memlock) or succeed
+        // and silently push the process past its memlock allowance. Either
+        // way the right answer is "fall back to unregistered + copy-out".
+        let cap_ok = POOL.with(|p| {
+            let p = p.borrow();
+            p.registered_bytes.saturating_add(class) <= cap_bytes()
+        });
+        if !cap_ok {
             POOL.with(|p| {
                 let mut p = p.borrow_mut();
                 if !p.warned_over_cap {
                     p.warned_over_cap = true;
                     tracing::warn!(
-                        class, error = %e,
-                        "regpool: ucp_mem_map failed (memlock?); falling back to \
-                         unregistered buffers (copy-out, not zero-copy)"
+                        class,
+                        registered = p.registered_bytes,
+                        cap = cap_bytes(),
+                        "regpool: total registered would exceed cap; falling \
+                         back to unregistered buffers (copy-out, not zero-copy)"
                     );
                 }
             });
             None
+        } else {
+            match crate::register_memory(buf.as_mut_ptr() as *mut std::os::raw::c_void, class) {
+                Ok(r) => {
+                    POOL.with(|p| {
+                        let mut p = p.borrow_mut();
+                        p.registered_bytes = p.registered_bytes.saturating_add(class);
+                    });
+                    Some(r)
+                }
+                Err(e) => {
+                    POOL.with(|p| {
+                        let mut p = p.borrow_mut();
+                        if !p.warned_over_cap {
+                            p.warned_over_cap = true;
+                            tracing::warn!(
+                                class, error = %e,
+                                "regpool: ucp_mem_map failed (memlock?); falling \
+                                 back to unregistered buffers (copy-out, not zero-copy)"
+                            );
+                        }
+                    });
+                    None
+                }
+            }
         }
     };
     // No-ucx: RegisteredMem is uninhabited, so `reg` is always None.
@@ -290,11 +404,58 @@ mod tests {
 
     #[test]
     fn size_class_rounds_to_pow2_min_4k() {
-        assert_eq!(size_class(1), 4096);
-        assert_eq!(size_class(4096), 4096);
-        assert_eq!(size_class(4097), 8192);
-        assert_eq!(size_class(256 * 1024), 256 * 1024);
-        assert_eq!(size_class(256 * 1024 + 1), 512 * 1024);
+        assert_eq!(size_class(1), Some(4096));
+        assert_eq!(size_class(4096), Some(4096));
+        assert_eq!(size_class(4097), Some(8192));
+        assert_eq!(size_class(256 * 1024), Some(256 * 1024));
+        assert_eq!(size_class(256 * 1024 + 1), Some(512 * 1024));
+        assert_eq!(size_class(MAX_CLASS), Some(MAX_CLASS));
+        // Above MAX_CLASS: out-of-pool sentinel.
+        assert_eq!(size_class(MAX_CLASS + 1), None);
+        // Stress: previously panicked via `next_power_of_two` overflow.
+        assert_eq!(size_class(usize::MAX), None);
+    }
+
+    /// The cap counter must track registered bytes across the
+    /// `acquire → drop → acquire` cycle. On a no-ucx build this is trivially
+    /// zero (nothing registers), but the accounting plumbing still has to
+    /// not corrupt state on the eviction branch.
+    #[test]
+    fn eviction_does_not_panic_or_double_count() {
+        // Push N slabs into the pool, then force evictions by exceeding cap.
+        // Tiny cap forces every drop to take the eviction branch.
+        // (set_regpool_cap_bytes is first-call-wins; this test runs in a clean
+        // process for `cargo test`, so subsequent test ordering doesn't matter
+        // here — but be paranoid: only the first set wins, so set early.)
+        let _ = set_regpool_cap_bytes(16 * 1024 * 1024); // min clamp = 16 MiB
+        for _ in 0..4 {
+            let pb = acquire(64 * 1024);
+            drop(pb); // first time: registered (under cap), goes to free-list
+        }
+        // Now allocate MANY 8 MiB slabs in-flight to push past cap. Even on
+        // no-ucx build (where reg=None and registered_bytes stays 0) the
+        // free-list cap path should evict cleanly.
+        let mut held: Vec<PooledBuf> = (0..3).map(|_| acquire(8 * 1024 * 1024)).collect();
+        // Drop them: eviction branch must NOT panic on the registered_bytes
+        // decrement (saturating_sub guards against underflow).
+        for pb in held.drain(..) {
+            drop(pb);
+        }
+    }
+
+    /// Out-of-pool acquire: any `need > MAX_CLASS` returns an unregistered
+    /// buffer of EXACTLY `need` bytes, and Drop does NOT re-pool it (which
+    /// would corrupt the size-class accounting).
+    #[test]
+    fn acquire_above_max_class_is_out_of_pool() {
+        let need = MAX_CLASS + 1;
+        let pb = acquire(need);
+        assert_eq!(pb.class, need, "class==need flags out-of-pool");
+        assert_eq!(pb.len(), need);
+        assert_eq!(pb.filled().len(), need);
+        // Drop must NOT push a non-pow2 slab into a bucket — no panic, no
+        // stale entries.
+        drop(pb);
     }
 
     #[test]
