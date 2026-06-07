@@ -24,7 +24,16 @@ path = "src/bin/autumn_client.rs"
 name = "autumn-op"
 path = "src/bin/autumn_op.rs"
 
+[[bin]]
+name = "autumnfs"
+path = "src/bin/autumnfs.rs"
+
 [dependencies]
+# autumnfs reuses the ungated `key` + `schema` modules. `default-features = false`
+# skips the fuser/libc/clap fuse-mount deps; we only need the bookkeeping
+# structs + KV-key encoders, no kernel-side FUSE plumbing.
+autumn-fuse = { path = "../fuse", default-features = false }
+clap = { version = "4", features = ["derive"] }
 anyhow.workspace = true
 bytes.workspace = true
 tracing.workspace = true

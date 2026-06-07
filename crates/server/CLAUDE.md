@@ -98,6 +98,45 @@ All commands accept `--json` for Python policy consumption. The JSON schema for 
 
 **Why two binaries (HDFS-style sibling pattern, not umbrella):** data-plane CLI churn shouldn't drag operator tooling along; rkyv schema stays in exactly one place (`crates/rpc/src/manager_rpc.rs`); Python automation has a stable wire format to depend on.
 
+### `autumnfs` (`src/bin/autumnfs.rs`)
+
+Offline POSIX-ish CLI over the fuse on-disk schema, **without** mounting the
+filesystem. The fuse mount is convenient for apps that already speak POSIX
+but it's a kernel client — `autumnfs` lets you `ls / mkdir / cp` from any
+shell against a running cluster, useful for inspection, scripted setup,
+and CI seeding.
+
+```
+autumnfs [--manager 127.0.0.1:9001] [--shards N] <SUBCMD>
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `ls <PATH> [--long]` | List directory entries |
+| `stat <PATH>` | Show inode metadata (size, ino, type, parent) |
+| `mkdir [-p] <PATH>` | Create directory |
+| `touch <PATH>` | Create empty file (no-op if exists) |
+| `cat <PATH>` | Read file to stdout |
+| `put <LOCAL> <REMOTE>` | Upload local file |
+| `get <REMOTE> <LOCAL>` | Download to local file |
+| `rm [-r] <PATH>` | Remove file (or directory tree with `-r`) |
+
+**Wire layer**: uses `autumn-client::ClusterClient` directly + `autumn-fuse`'s
+ungated `key` + `schema` modules (the `default-features = false` import skips
+the fuser/libc kernel-side deps). Inode allocation uses non-CAS get-then-put
+on a `super_key("next_inode")` counter — fine for one-shot CLI but not safe
+under concurrent mutators; for that use the mounted fuse path.
+
+**ls / cat caveat**: PS `handle_range` returns key-only entries (`value: vec![]`
+in `crates/partition-server/src/rpc_handlers.rs::handle_range`). Both
+subcommands compensate by doing a per-key `cluster.get` after the range scan;
+for one-shot CLI use this is fine, but a future hot caller would batch via
+`get_many_into`.
+
+**Files >4 KiB** go through the extent path (8 MiB chunks via
+`extent_key([0x03][ino BE][off BE])`); files ≤4 KiB live inline in the
+`InodeMeta`. Round-trip verified against a fuse mount in both directions.
+
 ### `autumn-stream-cli` (`src/bin/stream_cli.rs`)
 
 Low-level stream layer CLI for debugging and manual testing. Bypasses the partition layer entirely.
