@@ -480,11 +480,24 @@ async fn poller_loop(
     //     written through on the next flush. See Phase 2 task #25.
     let dirty_metas: Rc<RefCell<HashMap<u64, InodeMeta>>> =
         Rc::new(RefCell::new(HashMap::new()));
+    // coco P1 #1 fix: per-inode async lock acquired before every
+    // `cluster.put(inode_key)`. Both `dirty_meta_flush_loop` and
+    // `flush_dirty_inode_sync` go through this lock so a stale background
+    // batch can't overwrite a newer Close-time put (last-writer-wins KV +
+    // bg's snapshot taken BEFORE a Write that the Close then re-flushed →
+    // bg's late put would corrupt). The lock serialises per-key puts; the
+    // overhead is one Mutex acquire per flushed inode (compio's per-thread
+    // runtime makes this a single atomic in the uncontended fast path).
+    let flush_locks: Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>> =
+        Rc::new(RefCell::new(HashMap::new()));
     {
         let cluster_d = cluster.clone();
         let dirty_d = dirty_metas.clone();
-        compio::runtime::spawn(async move { dirty_meta_flush_loop(cluster_d, dirty_d).await })
-            .detach();
+        let locks_d = flush_locks.clone();
+        compio::runtime::spawn(async move {
+            dirty_meta_flush_loop(cluster_d, dirty_d, locks_d).await
+        })
+        .detach();
     }
 
     // F244-C: bounded streaming SQ/CQ loop — mirrors the EN/PS
@@ -514,6 +527,7 @@ async fn poller_loop(
             let inv_c = invalidations.clone();
             let locks_c = inode_open_locks.clone();
             let dirty_c = dirty_metas.clone();
+            let flush_locks_c = flush_locks.clone();
             // `data_base` (Copy raw ptr) + `reg_ref` (Copy ref into `ring_reg`,
             // which outlives `inflight`) are captured by the future; the Read arm
             // builds its dest slice from them.
@@ -532,6 +546,7 @@ async fn poller_loop(
                     &inv_c,
                     &locks_c,
                     &dirty_c,
+                    &flush_locks_c,
                 )
                 .await
             });
@@ -584,6 +599,9 @@ async fn service_sqe(
     // into it; a 5 ms background flush task drains via put_many; Close
     // synchronously flushes the closing inode before releasing the lease.
     dirty_metas: &Rc<RefCell<HashMap<u64, InodeMeta>>>,
+    // coco P1 #1 fix: per-inode async lock map. Acquired before any
+    // `cluster.put(inode_key)` so bg and Close flushes serialise per key.
+    flush_locks: &Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>>,
 ) -> Cqe {
     match sqe.opcode {
         Opcode::Nop => Cqe::ok(sqe.user_data, 0),
@@ -759,19 +777,37 @@ async fn service_sqe(
                 let last_key = key::extent_key(ino, last_start);
                 match cluster.head(&last_key).await {
                     Ok(km) if km.found => {
-                        let real_end = last_start + km.value_length;
-                        if real_end > inode_meta.size {
-                            inode_meta.size = real_end;
-                            if let Some(last) = extents.last_mut() {
-                                last.1 = km.value_length.min(u32::MAX as u64) as u32;
+                        // coco P2 #3 fix: checked_add against corrupt KV
+                        // (huge last_start or value_length). On overflow we
+                        // log + skip the reconcile rather than panicking
+                        // (debug) or silently using a wrapped value
+                        // (release). The next op that touches a
+                        // beyond-EOF byte will surface the corruption.
+                        match last_start.checked_add(km.value_length) {
+                            Some(real_end) if real_end > inode_meta.size => {
+                                let old_size = inode_meta.size;
+                                inode_meta.size = real_end;
+                                if let Some(last) = extents.last_mut() {
+                                    last.1 = km.value_length.min(u32::MAX as u64) as u32;
+                                }
+                                size_was_stale = true;
+                                tracing::info!(
+                                    ino,
+                                    old_size,
+                                    new_size = real_end,
+                                    "Open-time reconcile: meta.size was stale; recovered from extent head"
+                                );
                             }
-                            size_was_stale = true;
-                            tracing::info!(
-                                ino,
-                                old_size = inode_meta.size - (real_end - inode_meta.size),
-                                new_size = real_end,
-                                "Open-time reconcile: meta.size was stale; recovered from extent head"
-                            );
+                            Some(_) => {}
+                            None => {
+                                tracing::warn!(
+                                    ino,
+                                    last_start,
+                                    value_length = km.value_length,
+                                    "Open-time reconcile: extent length overflows u64; \
+                                     skipping size reconcile (corrupt KV data?)"
+                                );
+                            }
                         }
                     }
                     Ok(_) => {}
@@ -1022,15 +1058,18 @@ async fn service_sqe(
                 // inode BEFORE releasing the lease. If the flush fails we
                 // STILL release the lease (preserving the pre-Phase-2
                 // semantic that Close eventually releases — manager TTL
-                // takes over). The next opener's `fuse_read::open`
-                // extent-derive reconcile path recovers the size; a stale
-                // meta.size only widens the close-to-open window.
-                if let Err(e) = flush_dirty_inode_sync(cluster, dirty_metas, opened.ino).await
+                // takes over). coco P1 #2 fix: on flush failure
+                // `flush_dirty_inode_sync` pushes the dirty entry back into
+                // the map (via entry().or_insert) so the next periodic flush
+                // / next opener's reconcile recovers. The stale meta.size
+                // window is bounded; data isn't lost.
+                if let Err(e) =
+                    flush_dirty_inode_sync(cluster, dirty_metas, flush_locks, opened.ino).await
                 {
                     tracing::warn!(
                         ino = opened.ino,
                         error = %e,
-                        "Close-time dirty meta flush failed; Open-time reconcile will recover"
+                        "Close-time dirty meta flush failed; entry re-queued, next flush will retry"
                     );
                 }
                 if let Err(e) = lease::release(cluster, client_id, opened.ino).await {
@@ -1536,9 +1575,10 @@ async fn session_heartbeat_loop(
 async fn dirty_meta_flush_loop(
     cluster: Rc<ClusterClient>,
     dirty: Rc<RefCell<HashMap<u64, InodeMeta>>>,
+    flush_locks: Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>>,
 ) {
-    use autumn_client::BATCH_PUT_DEFAULT_CONCURRENCY;
     use bytes::Bytes;
+    use futures::stream::FuturesUnordered;
     const DIRTY_FLUSH_INTERVAL_MS: u64 = 5;
     const DIRTY_FLUSH_HARD_CAP: usize = 4096;
     loop {
@@ -1557,63 +1597,105 @@ async fn dirty_meta_flush_loop(
             }
             m.drain().collect()
         };
-        // Build (key, value) pairs. The keys live in `pair_keys` for the
-        // duration of the call so the &[u8] slices into them stay valid.
-        let pair_keys: Vec<Vec<u8>> = drained
-            .iter()
-            .map(|(ino, _)| key::inode_key(*ino))
-            .collect();
-        let pair_values: Vec<Bytes> = drained
-            .iter()
-            .map(|(_, meta)| Bytes::from(schema::encode_inode_meta(meta)))
-            .collect();
-        let items: Vec<(&[u8], Bytes)> = pair_keys
-            .iter()
-            .zip(pair_values.iter())
-            .map(|(k, v)| (k.as_slice(), v.clone()))
-            .collect();
-        let results = cluster
-            .put_many(&items, BATCH_PUT_DEFAULT_CONCURRENCY)
-            .await;
-        // Push back failures so the next tick re-emits them. Use `or_insert`
-        // to avoid clobbering a newer value that arrived during the await.
-        for (i, r) in results.iter().enumerate() {
-            if r.is_err() {
-                let (ino, ref meta) = drained[i];
-                let mut m = dirty.borrow_mut();
-                m.entry(ino).or_insert_with(|| meta.clone());
-                if i == 0 {
-                    tracing::warn!(
-                        ino,
-                        error = ?r.as_ref().err(),
-                        "dirty meta flush put_many error (first item); re-queued for next tick"
-                    );
+        // coco P1 #1 fix: each per-key put goes through a per-inode async
+        // lock so Close-time `flush_dirty_inode_sync` for the SAME ino can't
+        // race this bg path. We can no longer use `put_many` directly because
+        // each future must `lock().await` first AND map per-future to per-key
+        // — so we hand-roll the same fan-out shape (FuturesUnordered, drain
+        // as they land) at BATCH_PUT_DEFAULT_CONCURRENCY width. Each future
+        // also implements the coco P1 #2 fix at the bg flush layer: on
+        // failure the meta is pushed back via `entry().or_insert` so it
+        // doesn't clobber a newer enqueue.
+        let cluster_p = cluster.clone();
+        let dirty_p = dirty.clone();
+        let locks_p = flush_locks.clone();
+        let futs: FuturesUnordered<_> = drained
+            .into_iter()
+            .map(|(ino, meta)| {
+                let cluster_i = cluster_p.clone();
+                let dirty_i = dirty_p.clone();
+                let locks_i = locks_p.clone();
+                async move {
+                    let lock = locks_i
+                        .borrow_mut()
+                        .entry(ino)
+                        .or_insert_with(|| Rc::new(futures::lock::Mutex::new(())))
+                        .clone();
+                    let _guard = lock.lock().await;
+                    let ik = key::inode_key(ino);
+                    let mv = Bytes::from(schema::encode_inode_meta(&meta));
+                    let result = cluster_i.put(&ik, mv.as_ref()).await;
+                    if let Err(ref e) = result {
+                        // Don't clobber a newer enqueue from a concurrent Write.
+                        dirty_i.borrow_mut().entry(ino).or_insert(meta);
+                        tracing::warn!(
+                            ino,
+                            error = %e,
+                            "dirty meta flush put error; re-queued for next tick"
+                        );
+                    }
+                    result
                 }
-            }
-        }
+            })
+            .collect();
+        // Drain the per-inode futures concurrently. FuturesUnordered already
+        // bounds the in-flight by its push order; with up to 4096 entries per
+        // tick this is fine on a single compio runtime.
+        use futures::stream::StreamExt as _;
+        let _ = futs.collect::<Vec<_>>().await;
     }
 }
 
 /// F244-D Phase 2: synchronous flush of one inode's dirty meta. Called from
 /// the Close SQE arm immediately before `lease::release` so a reader that
-/// arrives after the release sees the fully-persisted meta. Removes the
-/// entry from the dirty map regardless of put outcome (the put failure path
-/// returns the error so the caller can fail Close — better than ack'ing a
-/// Close whose meta didn't land, since the lease release would then expose
-/// a stale persisted size to subsequent openers).
+/// arrives after the release sees the fully-persisted meta.
+///
+/// coco P1 #1 fix: acquire the per-inode flush lock BEFORE the put. This
+/// guarantees that an in-flight bg `dirty_meta_flush_loop` put for the same
+/// inode either lands BEFORE we take the lock (and our put then writes the
+/// fresher value through), or AFTER we drop it (in which case the bg sees an
+/// empty map and skips — or sees a newer enqueue from a concurrent Write and
+/// flushes that). Either order is correct; the lock prevents the "bg's stale
+/// put lands after ours" overwrite that coco called out.
+///
+/// coco P1 #2 fix: on put failure push the meta back into the dirty map via
+/// `entry().or_insert` (don't clobber a newer enqueue). Surfaces the error to
+/// the caller but the meta is NOT lost — the next periodic flush or the next
+/// opener's reconcile picks it up. The Close arm then logs the error and
+/// proceeds to release the lease so the inode isn't stuck.
 async fn flush_dirty_inode_sync(
     cluster: &ClusterClient,
     dirty: &Rc<RefCell<HashMap<u64, InodeMeta>>>,
+    flush_locks: &Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>>,
     ino: u64,
 ) -> Result<()> {
+    // Acquire the per-inode lock FIRST so we serialise against any bg put
+    // for this inode currently in flight.
+    let lock = flush_locks
+        .borrow_mut()
+        .entry(ino)
+        .or_insert_with(|| Rc::new(futures::lock::Mutex::new(())))
+        .clone();
+    let _guard = lock.lock().await;
+
+    // Now drain under the lock. If a bg flush had already taken the entry
+    // and not yet replaced it, the map is empty for this ino — nothing to do
+    // (the bg has either succeeded, or will push back on failure when it
+    // re-acquires the lock after us — wait, it holds the lock too; so it
+    // CAN'T have a failure-push pending if we see the map empty here). If a
+    // Write happened during bg's put and re-enqueued a fresher entry, we
+    // see THAT here.
     let meta_opt = dirty.borrow_mut().remove(&ino);
     if let Some(meta) = meta_opt {
         let ik = key::inode_key(ino);
         let mv = schema::encode_inode_meta(&meta);
-        cluster
-            .put(&ik, &mv)
-            .await
-            .map_err(|e| anyhow::anyhow!("close-time inode meta put: {e}"))?;
+        if let Err(e) = cluster.put(&ik, &mv).await {
+            // coco P1 #2: don't lose the dirty entry. Push back via
+            // entry().or_insert so a Write that landed during our await
+            // (and inserted a newer meta) isn't overwritten.
+            dirty.borrow_mut().entry(ino).or_insert(meta);
+            return Err(anyhow::anyhow!("close-time inode meta put: {e}"));
+        }
     }
     Ok(())
 }

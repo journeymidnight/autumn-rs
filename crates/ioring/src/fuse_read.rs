@@ -171,14 +171,31 @@ pub async fn open(cluster: &ClusterClient, path: &[u8]) -> Result<OpenedExtents>
         let last_key = key::extent_key(ino, last_start);
         match cluster.head(&last_key).await {
             Ok(km) if km.found => {
-                let real_end = last_start + km.value_length;
-                if real_end > meta.size {
-                    // Stale meta — bump in memory + amend the last extent's
-                    // inferred length to the real one (clamp to u32; per
-                    // schema MAX_EXTENT ≤ 8 MiB so the cast is safe).
-                    meta.size = real_end;
-                    if let Some(last) = extents.last_mut() {
-                        last.1 = km.value_length.min(u32::MAX as u64) as u32;
+                // coco P2 #3 fix: checked_add so corrupt KV data (huge
+                // last_start or value_length) doesn't panic in debug / wrap
+                // in release. On overflow we log + skip reconcile; the
+                // persisted size is whatever was in meta, and the next op
+                // that touches a beyond-EOF byte will surface the corruption
+                // cleanly (instead of silently working off a wrapped size).
+                match last_start.checked_add(km.value_length) {
+                    Some(real_end) if real_end > meta.size => {
+                        // Stale meta — bump in memory + amend the last extent's
+                        // inferred length to the real one (clamp to u32; per
+                        // schema MAX_EXTENT ≤ 8 MiB so the cast is safe).
+                        meta.size = real_end;
+                        if let Some(last) = extents.last_mut() {
+                            last.1 = km.value_length.min(u32::MAX as u64) as u32;
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        tracing::warn!(
+                            ino,
+                            last_start,
+                            value_length = km.value_length,
+                            "Open-time reconcile: extent length overflows u64; \
+                             skipping size reconcile (corrupt KV data?)"
+                        );
                     }
                 }
             }
