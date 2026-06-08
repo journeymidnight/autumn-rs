@@ -238,6 +238,89 @@ each replica's NIC ingress is the bottleneck and dual-rail at the
 sender doesn't help that — only reads (single EN → client) get the
 full rail aggregation.
 
+### 2-host 2-replica split — when PS↔EN actually crosses the wire
+
+The prior cross-host setups all had every EN on the **same** host as
+PS, so the PS↔EN data path was NIC-internal loopback (fast but not
+realistic). To measure the real-world topology where at least some
+extent traffic crosses the wire, brought up:
+
+```
+::14: manager + PS + EN1 (cpuset 0-3, /data03)
+::15: EN2 (cpuset 0-3, /data03)
+replication=2, presplit=8, p=8, shards=4 each EN
+UCX_TLS=tcp,self,rc_mlx5 UCX_NET_DEVICES=mlx5_1:1 (single rail)
+```
+
+Every extent has `replicas=[1, 3]` (EN1 + EN2), so **every write
+fans out one same-host append + one cross-host append**, and reads
+hit one of the two replicas (random — roughly half cross-host).
+Bench from ::15 at the canonical `t=16 d=8 p=8`:
+
+| size | metric         | 3-rep same-host (single-rail) | 2-rep split (1 cross-host) | Δ        |
+|------|----------------|-------------------------------|----------------------------|----------|
+| 4K   | write ops/s    | 15,710                        | 12,043                     | **-23%** |
+| 4K   | read ops/s     | 854,721                       | 589,517                    | **-31%** |
+| 8M   | write MB/s     | 1,576                         | **2,081**                  | **+32%** |
+| 8M   | read MB/s      | 10,756                        | 10,590                     | -2%      |
+
+Four observations, in order of how-interesting:
+
+1. **8M write +32% on the split-host setup.** Counterintuitive but
+   makes sense: the 3-replica same-host bench was fsync-bound (3
+   disk fsyncs all serialised through the host's io_uring + writes
+   to 3 separate NVMes on the same host). The 2-replica split bench
+   has only 2 fsyncs, on 2 separate hosts in parallel — wall-clock
+   per write drops because the slowest fsync's tail latency wins on
+   2 disks vs 3. The cross-host RDMA append latency (~50-200 µs for
+   8 MB) is well below the disk fsync time (~5-15 ms on real NVMe),
+   so the wire is not the bottleneck. **The takeaway is the
+   3-replica same-host setup was unfairly slow at 8M write because
+   3 disks compete for the same machine's PCIe / kernel io_uring.**
+
+2. **4K write -23% on the split-host setup.** Here the cross-host
+   hop's RTT (~50-100 µs) IS a noticeable fraction of per-op time.
+   3-replica same-host: per op ≈ 64 µs (15.7 K ops/s). 2-replica
+   split: per op ≈ 83 µs (12.0 K ops/s). The +20 µs delta is the
+   cross-host append wire RTT showing up on every write — exactly
+   what the per-op latency analysis predicts.
+
+3. **4K read -31%.** Reads only hit ONE replica, but the choice
+   is randomly distributed (PS routes per-key by hash). On average
+   half of reads now go cross-host. Per-op time roughly doubles
+   for those reads → average per-op time goes from 1.2 µs to
+   1.7 µs. (4K reads are stupidly fast because they hit a warm
+   memtable; the cross-host hop's RTT contributes the entire
+   slowdown.)
+
+4. **8M read -2% (basically unchanged).** Read fetches one extent
+   from one replica — wire bandwidth of the cross-host RDMA link
+   (~10 GB/s) is the same whether the EN is local or remote. The
+   only difference is the random replica-selection: about half the
+   time the read is "cheap" (same-host loopback at 30+ GB/s), the
+   other half it's "expensive" (cross-host wire at 10.76 GB/s). The
+   net is dominated by the slower path → ~10.6 GB/s. **This number
+   is the realistic ceiling for cross-host 8M read on a single
+   100 GbE link.**
+
+### Implication for production deployments
+
+* **Write workload at 8 MB**: do NOT co-locate all replicas on one
+  host — host's disk subsystem becomes the bottleneck. Spread
+  3 replicas across 3 hosts → wall-clock per write drops because
+  fsync waits are parallel-on-different-machines, not parallel-on-
+  same-machine.
+* **Read workload at 8 MB**: deployment topology barely matters;
+  the wire bandwidth of one RDMA link is the ceiling either way.
+  Multi-rail (note above) is the only way past 10.76 GB/s.
+* **Latency-sensitive 4K**: every cross-host hop on the write path
+  adds ~20-30 µs RTT. For workloads that need <100 µs p50 write,
+  same-host fanout is materially faster, but you trade durability
+  (correlated disk failure on one host).
+* **Latency-sensitive 4K read**: same effect smaller (single hop,
+  not fanout). On real workloads the page cache hit rate
+  dominates anyway.
+
 ### Update 2026-06-07 (third attempt — rc_mlx5 enabled)
 
 After the regpool observability work landed (commit `4fb17b1`), retried
