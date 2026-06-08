@@ -215,3 +215,81 @@ it's `buffer_unordered` over single-op `put` calls (no server
 server-side batch RPC (~200 lines) is the only mechanical fix that
 would let one frame carry N ops and feed `partition_loop`'s pending
 queue in one go.
+
+## Profiling (2026-06-08) — root cause located
+
+Added per-second `partition write summary` logging (already present —
+`crates/partition-server/src/lib.rs:1366`). Ran cross-host TCP bench
+at t=128, captured stats per partition:
+
+```
+part_id=55 ops=454 batches=33 ops_per_sec=445 avg_batch_size=13.8 \
+  avg_phase1_ms=0.015 avg_phase2_ms=21.85 avg_phase3_ms=0.018 \
+  fill_ratio=0.0045
+part_id=76 ops=433 batches=31 ops_per_sec=431 avg_batch_size=14.0 \
+  avg_phase2_ms=29.83
+part_id=118 ops=562 batches=42 avg_batch_size=13.4 avg_phase2_ms=23.43
+...
+```
+
+**The bottleneck is now precisely identified.** Per partition:
+* Each batch carries only **13-15 ops** (`fill_ratio = 0.45 %` of the
+  256-op max).
+* `phase2_ms` (the 3-replica fanout + fsync wait) is **22-35 ms** —
+  this is the per-batch cost the loopback case ALSO pays.
+* Per-partition throughput = 14 / 25 ms ≈ **560 ops/s/partition** ×
+  16 partitions ≈ 9 K ops/s. Matches the measured 5.8 K within bench
+  variance.
+
+By contrast loopback at t=128 = 50 K ops/s, ÷ 16 partitions ≈ 3.1 K
+ops/s/partition. With the same ~25 ms `phase2`, that implies
+loopback batch_size ≈ 78 ops — about **5.5× larger than cross-host's 14**.
+
+The 5.5× larger batch on loopback is the entire throughput gap. Server-
+side work per batch (phase2) is identical between the two; client
+arrival shape is the only variable.
+
+At t=512 cross-host, batch size DOES grow to 30-60 ops, but `phase2_ms`
+ALSO grows to 45-114 ms (EN-side contention from more concurrent
+batches), so net throughput barely scales.
+
+### Why MIN_PIPELINE_BATCH adjustment backfired
+
+The 256 gate only blocks the SECOND concurrent batch from launching
+when `n_inflight > 0`. With cross-host's thin arrival, `n_inflight`
+already hits 0 BETWEEN batches (one batch drains entirely before the
+next pile of arrivals materialises). So the gate doesn't fire — the
+partition is already in "one-batch-at-a-time" mode by force.
+
+Lowering MIN_BATCH=16 makes things worse because it fires the SECOND
+batch sooner when arrivals are JUST barely keeping `n_inflight > 0` —
+the resulting tiny second batch costs a full `phase2_ms` for ~16 ops.
+You get more batches with worse amortization, not better concurrency.
+
+### The fix shape: server-side batch delay ("Nagle for batches")
+
+The correct intervention is the OPPOSITE of lowering MIN_BATCH: WAIT
+up to T ms (configurable, e.g. 1-5 ms) for `pending` to grow before
+firing the FIRST batch. This is exactly Nagle's algorithm but at the
+batch-fire layer instead of the TCP segment layer:
+* Loopback arrivals fill quickly → wait expires immediately → no
+  regression.
+* Cross-host arrivals accumulate during the wait → batch_size grows
+  → fsync amortizes over more ops → throughput rises.
+
+Trade-off: adds up to T ms tail latency on the FIRST batch. For 4K
+writes where p50 is already 20-200 ms (the fsync itself), adding
+1-5 ms is invisible.
+
+A 1 ms wait at cross-host arrival rate of 5.8K ops/s / 16 partitions
+= 365 ops/s/partition would let ~0.365 ops accumulate per ms — meaning
+2-3 ms of wait gets you 1 extra op. Diminishing returns past ~5 ms;
+sweet spot probably 2-3 ms. To match loopback's 78-op batches the
+wait would need to be ~200 ms per batch — clearly unacceptable. The
+realistic gain is partial: maybe 2× the throughput, not the full 5.5×.
+
+The TRUE full fix is client-side bulk put RPC (`MSG_BATCH_PUT` server
+side, lets one frame carry N ops). With that, even at 1-op-per-second
+arrival from each client thread, the server sees N×t arrivals per
+frame → full batch amortization with zero added latency. This is the
+~200-line implementation hinted at above.
