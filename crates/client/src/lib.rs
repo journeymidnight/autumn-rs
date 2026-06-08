@@ -1114,7 +1114,7 @@ impl ClusterClient {
         self.put_zc_opts(key, value, 0).await
     }
 
-    async fn put_zc_opts(
+    pub(crate) async fn put_zc_opts(
         &self,
         key: &[u8],
         value: Bytes,
@@ -1493,6 +1493,16 @@ impl ClusterClient {
                 .await
             {
                 Ok(b) => b,
+                Err(AutumnError::PreconditionFailed(_)) => {
+                    // Same stale-epoch handling as batch_put — see comment
+                    // there. Fall back to per-key `get` (call_ps_for_key
+                    // refreshes natively + handles post-split re-routing).
+                    let _ = self.refresh_regions().await;
+                    for (idx, k) in group.iter() {
+                        results[*idx] = self.get(k).await;
+                    }
+                    continue;
+                }
                 Err(e) => {
                     let s = e.to_string();
                     for (idx, _) in group.iter() {
@@ -1612,6 +1622,24 @@ impl ClusterClient {
                 .await
             {
                 Ok(b) => b,
+                Err(AutumnError::PreconditionFailed(_)) => {
+                    // Stale region_epoch: server returns FailedPrecondition
+                    // (`MSG_BATCH_PUT` enforces epoch on the data path, see
+                    // partition-server lib.rs:5830). `call_ps_for_part`
+                    // short-circuits PreconditionFailed under F225 admin-op
+                    // semantics — correct for split/compact/gc/flush, WRONG
+                    // for the data path where the SDK's job is to refresh
+                    // routing and retry. Fall back to per-op `put_opts` for
+                    // this group; the single-key path routes via
+                    // `call_ps_for_key` which refreshes natively and handles
+                    // post-split re-routing (keys may no longer all belong to
+                    // `part_id` after the topology change).
+                    let _ = self.refresh_regions().await;
+                    for (idx, k, v, ttl) in group.iter() {
+                        results[*idx] = self.put_opts(k, v.as_ref(), *ttl).await;
+                    }
+                    continue;
+                }
                 Err(e) => {
                     let s = e.to_string();
                     for (idx, _, _, _) in group.iter() {
@@ -1656,12 +1684,11 @@ impl ClusterClient {
                 }
             }
         }
-        // ZC-only entries: per-op put_zc. TTL is currently not threaded through
-        // put_zc (the single-key ZC path predates put_many's ttl); large-value
-        // TTL is a deferred follow-up — add an expires_at field to PutZcMeta
-        // when a caller needs it. Today no such caller exists.
-        for (idx, k, v, _ttl) in zc_only {
-            results[idx] = self.put_zc(k, v).await;
+        // ZC-only entries: per-op put_zc_opts so the TTL from put_many's
+        // 3-tuple is preserved end-to-end (PutZcMeta carries expires_at
+        // on the wire; the single-key `put_zc` convenience hardcodes 0).
+        for (idx, k, v, ttl) in zc_only {
+            results[idx] = self.put_zc_opts(k, v, ttl).await;
         }
         results
     }
