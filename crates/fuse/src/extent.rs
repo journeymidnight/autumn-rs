@@ -33,11 +33,12 @@ use crate::state::FsState;
 /// ≈ 100 MB/s. With this many in-flight puts the ceiling becomes
 /// `N × 8 MiB / RPC_RTT`, bounded by the per-PS partition's pwritev throughput.
 /// 8 is conservative — `autumn_client::BATCH_PUT_DEFAULT_CONCURRENCY` is 32 —
-/// but a single fuse mount writing one file streams to ONE partition (one
-/// inode → one partition), and the PS's `partition_loop` group-commit is
-/// already amortising at the head; going wider mostly adds memory pressure
-/// (each in-flight = one 8 MiB Bytes alloc).
-const APPEND_PIPELINE_DEPTH: usize = 8;
+// APPEND_PIPELINE_DEPTH removed: `put_many` no longer takes a `concurrency`
+// argument. The SDK groups items by owning partition and issues one
+// MSG_BATCH_PUT (or per-op MSG_PUT_ZC for >=64 KiB values) per partition;
+// each partition's RPCs ride the multiplexed PS connection. Fuse-side
+// pipelining now happens naturally via the per-partition pipeline at the
+// PS partition_loop level.
 
 /// Range-scan page size when rebuilding the extent map of a large file.
 const RANGE_PAGE: u32 = 8192;
@@ -154,8 +155,8 @@ pub async fn write_region(
 
     // Plan + batch the append steps so the append-only hot path (cp / dd /
     // model checkpoint streamer — `pos` strictly past every existing extent)
-    // dispatches one put per ≤ 8 MiB chunk with `APPEND_PIPELINE_DEPTH` in
-    // flight. RMW falls back to inline read-modify-write (rare; in-place
+    // dispatches one put per ≤ 8 MiB chunk via `put_many` (SDK groups by
+    // partition + server-batches). RMW falls back to inline read-modify-write (rare; in-place
     // overwrite of a previously-written extent).
     //
     // Pre-pipelining this loop awaited every `state.kv_put` serially
@@ -234,8 +235,9 @@ pub async fn write_region(
     Ok(())
 }
 
-/// Dispatch a batch of append puts concurrently via `ClusterClient::put_many`
-/// (sliding window depth = [`APPEND_PIPELINE_DEPTH`]), then apply the
+/// Dispatch a batch of append puts via `ClusterClient::put_many` (SDK
+/// groups by partition and issues server-batched MSG_BATCH_PUT for small
+/// values, per-op MSG_PUT_ZC for ≥ 64 KiB), then apply the
 /// corresponding `(start, len)` upserts to the in-memory extent map in input
 /// order. Empties the input vecs.
 ///
@@ -260,12 +262,12 @@ async fn flush_appends(
     let drained_keys = std::mem::take(keys);
     let drained_values = std::mem::take(values);
     let drained_upserts = std::mem::take(upserts);
-    let items: Vec<(&[u8], Bytes)> = drained_keys
+    let items: Vec<(&[u8], Bytes, u64)> = drained_keys
         .iter()
         .zip(drained_values.iter())
-        .map(|(k, v)| (k.as_slice(), v.clone()))
+        .map(|(k, v)| (k.as_slice(), v.clone(), 0u64))
         .collect();
-    let results = state.client.put_many(&items, APPEND_PIPELINE_DEPTH).await;
+    let results = state.client.put_many(&items).await;
     for (i, r) in results.into_iter().enumerate() {
         r.map_err(|e| anyhow!("KV put: {e}"))?;
         let (start, len) = drained_upserts[i];

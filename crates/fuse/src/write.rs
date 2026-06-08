@@ -8,8 +8,8 @@
 //! - Gap detection: a non-sequential offset flushes the buffer first.
 //! - A full buffer flushes the WHOLE buffer at once via `extent::write_region`,
 //!   which splits it into `WRITE_BUF_EXTENTS` ≤ `MAX_EXTENT` extents and
-//!   dispatches the puts concurrently (`put_many` at depth
-//!   `APPEND_PIPELINE_DEPTH`). Pre-pipelining the buffer was exactly
+//!   dispatches the puts via `put_many` (SDK groups by partition + one
+//!   MSG_BATCH_PUT/MSG_PUT_ZC per group). Pre-pipelining the buffer was exactly
 //!   `MAX_EXTENT` and the flush was a single serial `put` — the cp ceiling
 //!   was `MAX_EXTENT / RPC_RTT` (~270 MB/s). Now `flush ≈ WRITE_BUF_EXTENTS *
 //!   MAX_EXTENT / RPC_RTT` until disk + replica fanout saturates.
@@ -82,7 +82,7 @@ pub async fn write(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> R
         if flush_needed {
             // Drain the WHOLE buffer (≤ WRITE_BUF_CAP) in one shot —
             // `write_region` splits into `≤ WRITE_BUF_EXTENTS` extents and
-            // pipelines the puts via `put_many` at `APPEND_PIPELINE_DEPTH`.
+            // pipelines the puts via `put_many` (server-batched per partition).
             // Pre-pipelining we drained one MAX_EXTENT at a time → single
             // serial put → `cp` ceiling was `MAX_EXTENT / RPC_RTT`.
             let (flush_offset, flush_data) = {

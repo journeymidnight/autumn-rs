@@ -26,7 +26,7 @@ use std::rc::Rc;
 
 use anyhow::{anyhow, Result};
 
-use autumn_client::{ClusterClient, GetManyItem, BATCH_GET_DEFAULT_CONCURRENCY};
+use autumn_client::{ClusterClient, GetManyItem};
 
 use crate::extent;
 use crate::key;
@@ -179,9 +179,7 @@ pub async fn execute(plan: ReadPlan) -> Result<Vec<u8>> {
             reg: None,
         })
         .collect();
-    let results = client
-        .get_many_into(&mut items, BATCH_GET_DEFAULT_CONCURRENCY)
-        .await;
+    let results = client.get_many_into(&mut items).await;
     drop(items); // release the &mut borrows of `result`
 
     // Propagate a hard RPC/routing failure (pre-F244 surfaced this at

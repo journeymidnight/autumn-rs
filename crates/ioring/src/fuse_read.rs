@@ -20,7 +20,7 @@
 
 use anyhow::{anyhow, Result};
 
-use autumn_client::{ClusterClient, GetManyItem, BATCH_GET_DEFAULT_CONCURRENCY};
+use autumn_client::{ClusterClient, GetManyItem};
 use autumn_fuse::key;
 use autumn_fuse::schema::{self, InodeMeta, MAX_EXTENT, ROOT_INO};
 
@@ -349,9 +349,7 @@ pub async fn read_into(
             reg,
         })
         .collect();
-    let results = cluster
-        .get_many_into(&mut items, BATCH_GET_DEFAULT_CONCURRENCY)
-        .await;
+    let results = cluster.get_many_into(&mut items).await;
     drop(items);
     for r in &results {
         if let Err(e) = r {

@@ -824,7 +824,8 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, cap:
                     reg: None,
                 })
                 .collect();
-            let results = client.get_many_into(&mut gitems, cap).await;
+            let _ = cap; // unused — SDK manages internal concurrency
+            let results = client.get_many_into(&mut gitems).await;
             drop(gitems);
             // Success = the value was found AND its length matches the page size
             // the caller reserved (same contract as the pre-F244 per-item path).
@@ -843,15 +844,16 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, cap:
             // keeps alive for the whole batch (until `allow_threads` returns); the
             // `Bytes::from_static` view is consumed within the call and its Drop is a
             // no-op (never frees the page).
-            let pitems: Vec<(&[u8], bytes::Bytes)> = items
+            let pitems: Vec<(&[u8], bytes::Bytes, u64)> = items
                 .iter()
                 .map(|it| {
                     let page: &'static [u8] =
                         unsafe { std::slice::from_raw_parts(it.ptr as *const u8, it.len) };
-                    (it.key.as_slice(), bytes::Bytes::from_static(page))
+                    (it.key.as_slice(), bytes::Bytes::from_static(page), 0u64)
                 })
                 .collect();
-            let results = client.put_many(&pitems, cap).await;
+            let _ = cap; // unused — put_many no longer takes a concurrency arg
+            let results = client.put_many(&pitems).await;
             drop(pitems);
             results.iter().map(|r| r.is_ok()).collect()
         }

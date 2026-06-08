@@ -106,25 +106,14 @@ enum Command {
         pipeline_depth: usize,
         /// F195: was env `AUTUMN_GROUP_COMMIT_CAP`; recorded in baseline.
         group_commit_cap: Option<usize>,
-        /// Experimental: when > 0, write loop uses `put_many` with this
-        /// batch size instead of `kv_put` per iteration. Tests whether
-        /// writer_task tcp_sendmsg coalescing + read_loop bulk decode
-        /// gives partition_loop the "fat arrival" needed to grow batch_size.
-        batch_put: usize,
-        /// Read-side counterpart: when > 0, read loop issues
-        /// `batch_get(N)` (one MSG_BATCH_GET per partition) instead of
-        /// per-key `get` / `get_into`. Validates the BATCH_GET wire +
-        /// server inline-loop path end-to-end and surfaces the read
-        /// equivalent of batch_put's 6.9× write win when small values
-        /// are dominated by per-op routing + ps-conn dispatch overhead.
-        batch_get: usize,
-        /// Validation harness for the `put_many → batch_put`
-        /// delegation: when > 0, the write loop calls `put_many` with
-        /// this batch size (identical shape to `--batch-put N`, just
-        /// going through the wrapper). Side-by-side with `--batch-put`
-        /// should match within noise; any gap = the delegation
-        /// regressed.
-        put_many: usize,
+        /// Unified bulk size for both write + read phases. When > 0:
+        /// write loop calls `put_many(N items)`; read loop calls
+        /// `get_many_into(N items)`. Each `put_many` group becomes one
+        /// MSG_BATCH_PUT frame per partition; `get_many_into` does
+        /// client-side fan-out internally. Replaces the three earlier
+        /// flags (`--batch-put` / `--batch-get` / `--put-many`) — all
+        /// three drove the same code paths after the SDK consolidation.
+        bulk: usize,
     },
 }
 
@@ -390,9 +379,7 @@ fn parse_args() -> Args {
             // tcp_sendmsg coalescing + read_loop bulk decode gives the
             // server-side "fat arrival" partition_loop needs to grow
             // batch_size. 0 = legacy per-op fan_out.
-            let mut batch_put: usize = 0;
-            let mut batch_get: usize = 0;
-            let mut put_many: usize = 0;
+            let mut bulk: usize = 0;
             // F195: was `AUTUMN_GROUP_COMMIT_CAP` env read at baseline-
             // write time. Now an explicit CLI flag — operators pass the
             // same value to autumn-ps (`--group-commit-cap N`) AND to
@@ -455,23 +442,20 @@ fn parse_args() -> Args {
                             usage();
                         }
                     }
-                    "--batch-put" => {
+                    "--bulk" => {
                         i += 1;
-                        batch_put = raw[i]
+                        bulk = raw[i]
                             .parse()
-                            .expect("--batch-put must be a non-negative integer");
+                            .expect("--bulk must be a non-negative integer");
                     }
-                    "--batch-get" => {
-                        i += 1;
-                        batch_get = raw[i]
-                            .parse()
-                            .expect("--batch-get must be a non-negative integer");
-                    }
-                    "--put-many" => {
-                        i += 1;
-                        put_many = raw[i]
-                            .parse()
-                            .expect("--put-many must be a non-negative integer");
+                    // Migration: print + abort. The three pre-consolidation
+                    // flags drove the same path post-SDK-merge.
+                    "--batch-put" | "--batch-get" | "--put-many" => {
+                        eprintln!(
+                            "{}: removed — use --bulk N (one knob driving both phases)",
+                            raw[i]
+                        );
+                        usage();
                     }
                     "--group-commit-cap" => {
                         i += 1;
@@ -495,9 +479,7 @@ fn parse_args() -> Args {
                 partitions: partitions_meta_from_flag,
                 pipeline_depth,
                 group_commit_cap,
-                batch_put,
-                batch_get,
-                put_many,
+                bulk,
             }
         }
         other => {
@@ -896,9 +878,7 @@ async fn main() -> Result<()> {
             partitions: partitions_meta_from_flag,
             pipeline_depth,
             group_commit_cap,
-            batch_put,
-            batch_get,
-            put_many,
+            bulk,
         } => {
             let pipeline_depth = pipeline_depth.max(1);
             // ZC ("ucx ⟹ zerocopy") selection — ONE symmetric rule (F235), shared
@@ -968,8 +948,7 @@ async fn main() -> Result<()> {
                     .map(|i| (i % 256) as u8)
                     .collect::<Vec<u8>>();
                 let depth = pipeline_depth;
-                let batch_put = batch_put;
-                let put_many = put_many;
+                let bulk = bulk;
                 let handle = std::thread::spawn(move || {
                     compio::runtime::RuntimeBuilder::new()
                         .build()
@@ -991,41 +970,25 @@ async fn main() -> Result<()> {
                             let vz = &value_zc;
                             let sk = start_key.as_slice();
                             let mut seq = 0u64;
-                            // batch_put and put_many take the SAME loop
-                            // shape and the SAME wire bytes — put_many is
-                            // a one-line delegate to batch_put — so we
-                            // share the loop and pick the entry point per
-                            // call. Validates the delegation at perf
-                            // level: any side-by-side gap between
-                            // `--batch-put N` and `--put-many N` means
-                            // the wrapper regressed.
-                            let n_per_round = if batch_put > 0 {
-                                batch_put
-                            } else if put_many > 0 {
-                                put_many
-                            } else {
-                                0
-                            };
-                            let use_put_many = put_many > 0 && batch_put == 0;
-                            if n_per_round > 0 {
+                            // --bulk N → one put_many per round of N items.
+                            // SDK groups by partition, emits one
+                            // MSG_BATCH_PUT per group for small values,
+                            // per-op MSG_PUT_ZC for ≥ 64 KiB.
+                            if bulk > 0 {
                                 while std::time::SystemTime::now() < *dl {
-                                    let keys: Vec<String> = (0..n_per_round)
+                                    let keys: Vec<String> = (0..bulk)
                                         .map(|_| {
                                             let k = key_for_partition(sk, "pc", tid, seq);
                                             seq += 1;
                                             k
                                         })
                                         .collect();
-                                    let items: Vec<(&[u8], bytes::Bytes)> = keys
+                                    let items: Vec<(&[u8], bytes::Bytes, u64)> = keys
                                         .iter()
-                                        .map(|k| (k.as_bytes(), vz.clone()))
+                                        .map(|k| (k.as_bytes(), vz.clone(), 0u64))
                                         .collect();
                                     let t0 = Instant::now();
-                                    let res = if use_put_many {
-                                        cref.put_many(&items, depth).await
-                                    } else {
-                                        cref.batch_put(&items).await
-                                    };
+                                    let res = cref.put_many(&items).await;
                                     let el = t0.elapsed();
                                     let n_ok = res.iter().filter(|r| r.is_ok()).count();
                                     if n_ok > 0 {
@@ -1143,7 +1106,8 @@ async fn main() -> Result<()> {
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
                 let depth = pipeline_depth;
-                let batch_get = batch_get;
+                let bulk = bulk;
+                let value_size = value_size;
                 let handle = std::thread::spawn(move || {
                     compio::runtime::RuntimeBuilder::new()
                         .build()
@@ -1161,43 +1125,41 @@ async fn main() -> Result<()> {
                             let cref = &client;
                             let dl = deadline.as_ref();
                             let sk = start_key.as_slice();
-                            if batch_get > 0 {
-                                // Server-side BATCH_GET path: mirrors the
-                                // write phase's `batch_put`. Per round we
-                                // build N keys and submit via
-                                // `cref.batch_get(&keys)`; the SDK groups by
-                                // owning partition and emits ONE
-                                // MSG_BATCH_GET frame per partition.
-                                // Server decodes once, runs the per-key
-                                // get inline on the ps-conn task (no mpsc
-                                // hop), packs the responses into a single
-                                // BatchGetResp frame. Validates the
-                                // BATCH_GET wire end-to-end + measures
-                                // the read equivalent of the write-side
-                                // 6.9× per-frame amortisation win.
+                            if bulk > 0 {
+                                // --bulk N → one `get_many_into(N items)`
+                                // per round. SDK does client-side
+                                // fan-out (ZC `get_into` for ≥ 64 KiB
+                                // dest, else `get` with a copy into the
+                                // dest). One unified knob; same wire
+                                // semantics as the prior --batch-get.
                                 let mut ki = 0u64;
+                                // One pre-allocated dest buf per item, reused
+                                // across rounds. Avoids per-round Vec churn at
+                                // the 4 K hot path.
+                                let mut bufs: Vec<Vec<u8>> =
+                                    (0..bulk).map(|_| vec![0u8; value_size]).collect();
                                 while std::time::SystemTime::now() < *dl {
-                                    let keys: Vec<String> = (0..batch_get)
+                                    let keys: Vec<String> = (0..bulk)
                                         .map(|_| {
                                             let seq = ki % written;
                                             ki += 1;
                                             key_for_partition(sk, "pc", tid, seq)
                                         })
                                         .collect();
-                                    let key_refs: Vec<&[u8]> =
-                                        keys.iter().map(|k| k.as_bytes()).collect();
+                                    let mut items: Vec<autumn_client::GetManyItem<'_>> = keys
+                                        .iter()
+                                        .zip(bufs.iter_mut())
+                                        .map(|(k, b)| autumn_client::GetManyItem {
+                                            key: k.as_bytes(),
+                                            offset: 0,
+                                            length: 0,
+                                            dest: b.as_mut_slice(),
+                                            reg: None,
+                                        })
+                                        .collect();
                                     let t0 = Instant::now();
-                                    let res = cref.batch_get(&key_refs).await;
+                                    let res = cref.get_many_into(&mut items).await;
                                     let el = t0.elapsed();
-                                    // We treat both `Ok(Some(_))` and
-                                    // `Ok(None)` as "served by the
-                                    // server" — perf-check sample
-                                    // signal is wire RTT + decode, not
-                                    // a presence assertion (the write
-                                    // phase guarantees presence by
-                                    // construction modulo a tiny tail
-                                    // of in-flight writes never landed
-                                    // on the read deadline).
                                     let n_ok = res.iter().filter(|r| r.is_ok()).count();
                                     if n_ok > 0 {
                                         total_ops.fetch_add(n_ok as u64, Ordering::Relaxed);

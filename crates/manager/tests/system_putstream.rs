@@ -321,9 +321,7 @@ fn f235_get_many_into_mixed_sizes() {
                     reg: None,
                 },
             ];
-            let results = cluster
-                .get_many_into(&mut items, autumn_client::BATCH_GET_DEFAULT_CONCURRENCY)
-                .await;
+            let results = cluster.get_many_into(&mut items).await;
             assert_eq!(results[0].as_ref().unwrap(), &Some(small.len()));
             assert_eq!(results[1].as_ref().unwrap(), &Some(large.len()));
         }
@@ -341,9 +339,7 @@ fn f235_get_many_into_mixed_sizes() {
                 dest: &mut d_sub[..],
                 reg: None,
             }];
-            let r = cluster
-                .get_many_into(&mut sub, autumn_client::BATCH_GET_DEFAULT_CONCURRENCY)
-                .await;
+            let r = cluster.get_many_into(&mut sub).await;
             assert_eq!(r[0].as_ref().unwrap(), &Some(4096));
             assert_eq!(&d_sub[..], &large[1024..1024 + 4096]);
         }
@@ -359,9 +355,7 @@ fn f235_get_many_into_mixed_sizes() {
                 dest: &mut d_miss[..],
                 reg: None,
             }];
-            let r = cluster
-                .get_many_into(&mut miss, autumn_client::BATCH_GET_DEFAULT_CONCURRENCY)
-                .await;
+            let r = cluster.get_many_into(&mut miss).await;
             assert_eq!(r[0].as_ref().unwrap(), &None);
         }
     });
@@ -389,11 +383,11 @@ fn f236_put_many_mixed_sizes() {
 
         let small = bytes::Bytes::from(pattern(4 * 1024)); // < 64 KiB → MSG_PUT
         let large = bytes::Bytes::from(pattern(256 * 1024)); // >= 64 KiB → MSG_PUT_ZC
-        let items: [(&[u8], bytes::Bytes); 2] =
-            [(b"pm-small", small.clone()), (b"pm-large", large.clone())];
-        let results = cluster
-            .put_many(&items, autumn_client::BATCH_PUT_DEFAULT_CONCURRENCY)
-            .await;
+        let items: [(&[u8], bytes::Bytes, u64); 2] = [
+            (b"pm-small", small.clone(), 0u64),
+            (b"pm-large", large.clone(), 0u64),
+        ];
+        let results = cluster.put_many(&items).await;
         assert!(results[0].is_ok(), "put small: {:?}", results[0]);
         assert!(results[1].is_ok(), "put large: {:?}", results[1]);
 
