@@ -959,14 +959,20 @@ async fn main() -> Result<()> {
                             let sk = start_key.as_slice();
                             let mut seq = 0u64;
                             if batch_put > 0 {
-                                // Experimental put_many path: build a batch of N
-                                // (key, value) per round, submit via put_many.
-                                // Each round's put_many spawns N futures in one
-                                // shot via `buffer_unordered` — writer_task
-                                // coalesces them into one tcp_sendmsg; server
-                                // read_loop decodes N frames in one go and
-                                // injects N pending ops into partition_loop ⇒
-                                // batch_size grows server-side.
+                                // Server-side BATCH_PUT path: build a group
+                                // of N (key, value) per round, submit via
+                                // `batch_put`. One MSG_BATCH_PUT frame per
+                                // partition → server decodes once, injects
+                                // all per-partition ops into partition_loop
+                                // pending as ONE mpsc message → wide batch
+                                // fires + multiple concurrent batches.
+                                // Compared with the old put_many path
+                                // (which also sent the same wire data
+                                // but as N separate frames), this saves
+                                // server-side per-frame decode overhead +
+                                // gives the partition_loop atomic pending
+                                // injection (the actual perf-improving
+                                // primitive).
                                 while std::time::SystemTime::now() < *dl {
                                     let keys: Vec<String> = (0..batch_put)
                                         .map(|_| {
@@ -980,17 +986,12 @@ async fn main() -> Result<()> {
                                         .map(|k| (k.as_bytes(), vz.clone()))
                                         .collect();
                                     let t0 = Instant::now();
-                                    let res = cref.put_many(&items, batch_put).await;
+                                    let res = cref.batch_put(&items).await;
                                     let el = t0.elapsed();
                                     let n_ok = res.iter().filter(|r| r.is_ok()).count();
                                     if n_ok > 0 {
                                         total_ops.fetch_add(n_ok as u64, Ordering::Relaxed);
                                         written += n_ok as u64;
-                                        // Per-op latency = batch wall time /
-                                        // batch size (mean) — what users observe
-                                        // for in-batch ops; not p50 of individual
-                                        // op end-to-end, but the right metric for
-                                        // comparing batched vs per-op submission.
                                         let per_op_ms =
                                             el.as_secs_f64() * 1000.0 / n_ok as f64;
                                         for _ in 0..n_ok {

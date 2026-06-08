@@ -101,6 +101,87 @@ pub const MSG_GET_ZC: u8 = 0x50;
 // response is a normal rkyv `PutResp` (tiny — no ZC framing needed back).
 pub const MSG_PUT_ZC: u8 = 0x51;
 
+/// Batched PUT: N operations on the SAME partition in ONE frame. The PS
+/// decodes the frame once and injects all N ops into `partition_loop`'s
+/// `pending` as a single mpsc message via the `BatchPut` variant —
+/// `partition_loop` then sees `pending += N` atomically and can fire
+/// a full-size batch immediately, exercising both `INFLIGHT_CAP` (8)
+/// AND a wide `batch_size` (up to `MAX_WRITE_BATCH = 256`).
+///
+/// Non-ZC ONLY (values < 64 KiB). Large values keep per-op `MSG_PUT_ZC`
+/// — for them the wire payload IS the bottleneck and per-op overhead
+/// is negligible; bundling them into one frame would force a 256 MB
+/// frame for a 32-op batch of 8 MiB values which the wire framing
+/// reject. See `docs/perf_4k_loopback_vs_xhost_scaling.md` for the
+/// motivating cross-host write cliff this closes.
+///
+/// Client side: routes by part_id (every op must hash to the SAME
+/// partition — the client groups by partition before issuing this RPC).
+/// `region_epoch` is the cached `MgrRegionInfo.region_epoch` for the
+/// partition; PS rejects with `FailedPrecondition` on mismatch (same
+/// shape as `MSG_PUT`).
+pub const MSG_BATCH_PUT: u8 = 0x53;
+
+/// Batched GET: N keys on the SAME partition in ONE frame. Symmetric to
+/// `MSG_BATCH_PUT` — values are returned inline in the response (a
+/// rkyv `BatchGetResp { code, statuses, values }`). NotFound is a
+/// per-key status, not a per-batch error.
+pub const MSG_BATCH_GET: u8 = 0x54;
+
+/// One op inside a `BatchPutReq` / `BatchGetReq`. All ops in a batch
+/// share the parent's `part_id` + `region_epoch`. `expires_at = 0`
+/// means no TTL (matches `PutReq`).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchPutOp {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub expires_at: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchPutReq {
+    pub part_id: u64,
+    pub region_epoch: u64,
+    pub must_sync: bool,
+    pub ops: Vec<BatchPutOp>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchPutResp {
+    /// `CODE_OK` on full success; otherwise statuses[i] carries the
+    /// per-op result.
+    pub code: u8,
+    pub message: String,
+    /// Per-op status code. Empty iff `code != CODE_OK` AND the failure
+    /// was batch-level (e.g. wrong part_id / stale epoch). Otherwise
+    /// has `req.ops.len()` entries.
+    pub statuses: Vec<u8>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchGetReq {
+    pub part_id: u64,
+    pub region_epoch: u64,
+    pub keys: Vec<Vec<u8>>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchGetItem {
+    /// 0 = OK (value present), 1 = NotFound, other = error.
+    pub status: u8,
+    pub value: Vec<u8>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchGetResp {
+    /// Batch-level code: `CODE_OK` if the request was acceptable;
+    /// per-key statuses live in `items`. Stale-epoch and wrong-partition
+    /// surface here.
+    pub code: u8,
+    pub message: String,
+    pub items: Vec<BatchGetItem>,
+}
+
 /// F250 diagnostic: trace where a user_key's MVCC entries live across
 /// memtable / imm / sst — used by the f250 reproducer to localise
 /// data-loss bugs without guessing.
@@ -578,6 +659,12 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
             .map(|r| r.part_id)
             .unwrap_or(0),
         MSG_DIAG_TRACE_KEY => rkyv_decode::<DiagTraceKeyReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_BATCH_PUT => rkyv_decode::<BatchPutReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_BATCH_GET => rkyv_decode::<BatchGetReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
         _ => 0,

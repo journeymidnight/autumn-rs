@@ -115,6 +115,7 @@ pub(crate) async fn dispatch_partition_rpc(
         MSG_GET => handle_get(payload, part).await,
         MSG_HEAD => handle_head(payload, part).await,
         MSG_RANGE => handle_range(payload, part).await,
+        partition_rpc::MSG_BATCH_GET => handle_batch_get(payload, part).await,
         MSG_GET_DISCARDS => handle_get_discards(payload, part, part_sc).await,
         // F210-C2: SPLIT_PART must NOT be invoked inline through
         // dispatch_partition_rpc — handle_split_part awaits an internal
@@ -153,6 +154,73 @@ pub(crate) async fn dispatch_partition_rpc(
 pub(crate) enum GetOutcome {
     NotFound,
     Value(Bytes),
+}
+
+/// MSG_BATCH_GET: N keys on the SAME partition in ONE frame, all
+/// resolved in this single handler invocation. The handler runs INLINE
+/// on the ps-conn task (reads never go through `partition_loop`'s
+/// mpsc), so the only "batching" benefit here is amortising the wire-
+/// frame overhead: one decode of `BatchGetReq`, one encode of
+/// `BatchGetResp` carrying all values, vs N independent GET round
+/// trips. Per-key value lookup reuses the existing `get_value`
+/// internal so VP resolution + read-pin semantics are unchanged.
+pub(crate) async fn handle_batch_get(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> HandlerResult {
+    let req: partition_rpc::BatchGetReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    // Quick epoch check up front so a stale-routed batch fails fast
+    // (without re-decoding for each key).
+    {
+        let p = part.borrow();
+        if req.region_epoch != 0 && req.region_epoch != p.region_epoch {
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "region epoch stale: part_id={} have={} got={}",
+                    p.part_id, p.region_epoch, req.region_epoch
+                ),
+            ));
+        }
+    }
+    let mut items: Vec<partition_rpc::BatchGetItem> = Vec::with_capacity(req.keys.len());
+    for key in req.keys.into_iter() {
+        // Re-encode each per-key GetReq and route through `get_value`
+        // so VP resolution / read-pin / not-found / out-of-range
+        // semantics are IDENTICAL to a per-key MSG_GET. Per-call
+        // borrow of `part` is brief (lookup_in_memtable + clone of
+        // stream_client, see `get_value`); cheaper than fan-out
+        // overhead on N separate frames.
+        let inner = partition_rpc::rkyv_encode(&GetReq {
+            part_id: 0, // not used inside get_value — routing already done
+            region_epoch: req.region_epoch,
+            key,
+            offset: 0,
+            length: 0,
+        });
+        match get_value(Bytes::from(inner), part).await {
+            Ok(GetOutcome::Value(v)) => items.push(partition_rpc::BatchGetItem {
+                status: 0,
+                value: v.to_vec(),
+            }),
+            Ok(GetOutcome::NotFound) => items.push(partition_rpc::BatchGetItem {
+                status: 1,
+                value: Vec::new(),
+            }),
+            Err(_) => items.push(partition_rpc::BatchGetItem {
+                status: 2,
+                value: Vec::new(),
+            }),
+        }
+    }
+    Ok(partition_rpc::rkyv_encode(
+        &partition_rpc::BatchGetResp {
+            code: CODE_OK,
+            message: String::new(),
+            items,
+        },
+    ))
 }
 
 /// rkyv-framed GET (generic SDK path).

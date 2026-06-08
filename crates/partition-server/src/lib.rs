@@ -1202,6 +1202,57 @@ pub(crate) enum WriteOp {
     },
 }
 
+/// Shared accumulator for `MSG_BATCH_PUT`. The dispatcher creates ONE
+/// of these per batch frame, then pushes N `WriteResponder::BatchPut`
+/// entries (one per op) into `pending`. Each `WriteResponder::send_ok`
+/// / `send_err` calls `record` with its index; when the last one
+/// records, the accumulated `BatchPutResp` is encoded and sent on the
+/// single outer oneshot. Single-threaded on the partition runtime, so
+/// `Rc<RefCell>` / `Cell` is sufficient.
+pub(crate) struct BatchPutAccumulator {
+    /// Taken when the last op completes — None after the response fires.
+    outer: RefCell<Option<oneshot::Sender<HandlerResult>>>,
+    /// One byte per op: 0 = OK, non-zero = error code.
+    statuses: RefCell<Vec<u8>>,
+    /// Count-down: starts at N, decrements per `record`. The op that
+    /// transitions it to 0 ALSO encodes + sends the BatchPutResp.
+    remaining: Cell<usize>,
+}
+
+impl BatchPutAccumulator {
+    pub(crate) fn new(outer: oneshot::Sender<HandlerResult>, n: usize) -> Rc<Self> {
+        Rc::new(Self {
+            outer: RefCell::new(Some(outer)),
+            // Sentinel 0xff means "not yet recorded" — defensively
+            // catches a bug where one op's slot is overwritten / missed.
+            statuses: RefCell::new(vec![0xff; n]),
+            remaining: Cell::new(n),
+        })
+    }
+    pub(crate) fn record(&self, idx: usize, status: u8) {
+        {
+            let mut s = self.statuses.borrow_mut();
+            if let Some(slot) = s.get_mut(idx) {
+                *slot = status;
+            }
+        }
+        let r = self.remaining.get().saturating_sub(1);
+        self.remaining.set(r);
+        if r == 0 {
+            if let Some(outer) = self.outer.borrow_mut().take() {
+                let statuses = self.statuses.borrow().clone();
+                let resp = partition_rpc::BatchPutResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    statuses,
+                };
+                let bytes = partition_rpc::rkyv_encode(&resp);
+                let _ = outer.send(Ok(bytes));
+            }
+        }
+    }
+}
+
 /// F099-D: Direct responder into the outer `req.resp_tx` (encoded RPC frame
 /// bytes). Replaces the R3/R4 inner `oneshot<Result<Vec<u8>, String>>` that
 /// carried the raw key back to `handle_put`/`handle_delete` for re-encoding.
@@ -1216,6 +1267,13 @@ pub(crate) enum WriteResponder {
     Delete {
         outer: oneshot::Sender<HandlerResult>,
         key: Vec<u8>,
+    },
+    /// One op inside a `MSG_BATCH_PUT`. All N ops in the batch share
+    /// one `BatchPutAccumulator`; `idx` is this op's slot in the
+    /// statuses Vec.
+    BatchPut {
+        accum: Rc<BatchPutAccumulator>,
+        idx: usize,
     },
 }
 
@@ -1240,12 +1298,24 @@ impl WriteResponder {
                 });
                 let _ = outer.send(Ok(bytes));
             }
+            WriteResponder::BatchPut { accum, idx } => {
+                accum.record(idx, 0);
+            }
         }
     }
 
     /// Reply failure — propagate the error string as Internal to the outer
     /// resp_tx. "key is out of range" is InvalidArgument per existing semantics.
     pub(crate) fn send_err(self, msg: String) {
+        if let WriteResponder::BatchPut { accum, idx } = self {
+            // Batch entries don't carry their own status code wire — a
+            // single byte. Use 1 for "internal err" / 2 for "out of range";
+            // callers branch on >0 to mean "not OK", the exact value is
+            // informational.
+            let status = if msg == "key is out of range" { 2 } else { 1 };
+            accum.record(idx, status);
+            return;
+        }
         let code = if msg == "key is out of range" {
             StatusCode::InvalidArgument
         } else {
@@ -1254,6 +1324,7 @@ impl WriteResponder {
         let outer = match self {
             WriteResponder::Put { outer, .. } => outer,
             WriteResponder::Delete { outer, .. } => outer,
+            WriteResponder::BatchPut { .. } => unreachable!("handled above"),
         };
         let _ = outer.send(Err((code, msg)));
     }
@@ -5455,6 +5526,19 @@ async fn handle_incoming_req(
                 let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                 return;
             }
+            partition_rpc::MSG_BATCH_PUT => {
+                // Reject the whole batch with CODE_UNAVAILABLE — client
+                // refreshes routing + retries each per-op (or the whole
+                // batch).
+                let resp = partition_rpc::BatchPutResp {
+                    code: CODE_UNAVAILABLE,
+                    message: "partition frozen for merge — refresh routing and retry"
+                        .to_string(),
+                    statuses: Vec::new(),
+                };
+                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                return;
+            }
             _ => {} // reads + SPLIT/MAINTENANCE/MERGE_FREEZE flow through
         }
     }
@@ -5489,6 +5573,9 @@ async fn handle_incoming_req(
         }
         MSG_DELETE => enqueue_delete(req, pending, part_region_epoch, part_id_for_err),
         MSG_STREAM_PUT => enqueue_stream_put(req, pending, part_region_epoch, part_id_for_err),
+        partition_rpc::MSG_BATCH_PUT => {
+            enqueue_batch_put(req, pending, part_region_epoch, part_id_for_err)
+        }
         // F185: freeze stashes its resp oneshot in PartitionData and
         // returns without replying — the loop body sends OK once
         // pending+inflight drain and every imm flushes (Phase 1.5
@@ -5712,6 +5799,83 @@ fn enqueue_put(
         Err(e) => {
             let _ = req.resp_tx.send(Err((StatusCode::InvalidArgument, e)));
         }
+    }
+}
+
+/// MSG_BATCH_PUT enqueue — decodes a `BatchPutReq` carrying N ops on the
+/// SAME partition and pushes ALL N `WriteRequest`s into `pending` in a
+/// single dispatcher call. The next `partition_loop` iter sees
+/// `pending.len() += N` atomically and can fire a wide batch immediately,
+/// AND with `n_inflight < INFLIGHT_CAP` it can fire MULTIPLE concurrent
+/// batches against this N rather than the per-op trickle that limited
+/// cross-host throughput in `enqueue_put` (see
+/// `docs/perf_4k_loopback_vs_xhost_scaling.md`).
+///
+/// Shared one-shot reply via `BatchPutAccumulator`: each per-op
+/// `WriteResponder::BatchPut::send_ok` records its slot; the LAST
+/// recorder encodes the `BatchPutResp` and sends on the outer oneshot.
+fn enqueue_batch_put(
+    req: PartitionRequest,
+    pending: &mut Vec<WriteRequest>,
+    part_region_epoch: u64,
+    part_id_for_err: u64,
+) {
+    let batch = match partition_rpc::rkyv_decode::<partition_rpc::BatchPutReq>(&req.payload) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = req.resp_tx.send(Err((StatusCode::InvalidArgument, e)));
+            return;
+        }
+    };
+    if batch.region_epoch != 0 && batch.region_epoch != part_region_epoch {
+        let _ = req.resp_tx.send(Err((
+            StatusCode::FailedPrecondition,
+            format!(
+                "region epoch stale: part_id={} have={} got={}",
+                part_id_for_err, part_region_epoch, batch.region_epoch
+            ),
+        )));
+        return;
+    }
+    // Reject the whole batch if ANY op is oversized — client should retry
+    // each via PutStream individually. Mixing inline + stream writes in one
+    // batch is rejected for simplicity.
+    for op in &batch.ops {
+        if op.value.len() > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize {
+            let _ = req.resp_tx.send(Err((
+                StatusCode::InvalidArgument,
+                format!(
+                    "batch op value {} bytes exceeds inline cap {} — use per-op PutStream",
+                    op.value.len(),
+                    AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT
+                ),
+            )));
+            return;
+        }
+    }
+    let n = batch.ops.len();
+    if n == 0 {
+        let resp = partition_rpc::BatchPutResp {
+            code: CODE_OK,
+            message: String::new(),
+            statuses: Vec::new(),
+        };
+        let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+        return;
+    }
+    let accum = BatchPutAccumulator::new(req.resp_tx, n);
+    for (i, op) in batch.ops.into_iter().enumerate() {
+        pending.push(WriteRequest {
+            op: WriteOp::Put {
+                user_key: Bytes::from(op.key),
+                value: Bytes::from(op.value),
+                expires_at: op.expires_at,
+            },
+            resp: WriteResponder::BatchPut {
+                accum: Rc::clone(&accum),
+                idx: i,
+            },
+        });
     }
 }
 

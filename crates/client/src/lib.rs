@@ -1403,6 +1403,138 @@ impl ClusterClient {
         fan_out_collect(futs, concurrency).await
     }
 
+    /// **Server-side batched PUT** (`MSG_BATCH_PUT`): N ops on the SAME
+    /// partition packed into ONE frame. The PS decodes once, injects
+    /// all N ops into `partition_loop::pending` as ONE mpsc message,
+    /// fires a wide batch immediately + can run multiple concurrent
+    /// batches (exercises `INFLIGHT_CAP`). This is the
+    /// fix for the cross-host 4K-write small-batch cliff documented in
+    /// `docs/perf_4k_loopback_vs_xhost_scaling.md`.
+    ///
+    /// Constraints (vs the client-side `put_many` fan-out):
+    /// * **Non-ZC only** — values >= 64 KiB skip this path (the wire
+    ///   bandwidth dominates per-op overhead; bundling them gives no
+    ///   win and bloats the frame). The caller may still pass large
+    ///   values; they're routed to per-op `put_zc` individually here.
+    /// * **One frame per partition** — the client groups `items` by
+    ///   owning partition first, then issues one BATCH RPC per
+    ///   partition. A 32-key batch spread across 16 partitions becomes
+    ///   16 RPCs of ~2 ops each — still one server-side mpsc message
+    ///   per group, but the wire fan-out is per-partition not per-key.
+    /// * **Per-op result preserved**: returns `Vec<Result<()>>` with
+    ///   one entry per input item in input order.
+    pub async fn batch_put(
+        &self,
+        items: &[(&[u8], bytes::Bytes)],
+    ) -> Vec<std::result::Result<(), AutumnError>> {
+        // Result slots aligned to input order. Filled in as each
+        // per-partition group completes.
+        let mut results: Vec<std::result::Result<(), AutumnError>> =
+            (0..items.len()).map(|_| Ok(())).collect();
+        // Group by partition. Resolve each key's owning part once.
+        let mut groups: std::collections::HashMap<u64, Vec<(usize, &[u8], bytes::Bytes)>> =
+            std::collections::HashMap::new();
+        // Items that didn't qualify for batching (ZC-worthy) go straight
+        // to per-op put_zc.
+        let mut zc_only: Vec<(usize, &[u8], bytes::Bytes)> = Vec::new();
+        for (i, (k, v)) in items.iter().enumerate() {
+            if zc_worthwhile(v.len()) {
+                zc_only.push((i, *k, v.clone()));
+                continue;
+            }
+            // Resolve part_id. If routing fails, mark error in the slot
+            // and skip — the batch RPC can't fix routing errors.
+            let part_id = match self.resolve_key(k).await {
+                Ok((pid, _addr)) => pid,
+                Err(e) => {
+                    results[i] = Err(AutumnError::RoutingError(e.to_string()));
+                    continue;
+                }
+            };
+            groups.entry(part_id).or_default().push((i, *k, v.clone()));
+        }
+        // Issue one BATCH_PUT per partition, sequentially. Sequential
+        // here is fine because each partition's group goes to ONE PS
+        // multiplexed conn anyway; concurrent groups would just queue
+        // on the writer_task. (A future iteration could `join_all` the
+        // groups; for now sequential keeps the implementation simple
+        // and matches put_many's `concurrency=N` default behavior.)
+        for (part_id, group) in groups {
+            let region_epoch = self.lookup_epoch_for_part(part_id);
+            let ops: Vec<partition_rpc::BatchPutOp> = group
+                .iter()
+                .map(|(_, k, v)| partition_rpc::BatchPutOp {
+                    key: k.to_vec(),
+                    value: v.to_vec(),
+                    expires_at: 0,
+                })
+                .collect();
+            let payload = rkyv_encode(&partition_rpc::BatchPutReq {
+                part_id,
+                region_epoch,
+                must_sync: true,
+                ops,
+            });
+            let resp_bytes = match self
+                .call_ps_for_part(part_id, partition_rpc::MSG_BATCH_PUT, payload.into())
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    // Batch-level failure — propagate to every member of
+                    // this group. Borrow-iterate (not move) so subsequent
+                    // arms can also touch `group`.
+                    let s = e.to_string();
+                    for (idx, _, _) in group.iter() {
+                        results[*idx] = Err(AutumnError::ConnectionError(s.clone()));
+                    }
+                    continue;
+                }
+            };
+            let resp: partition_rpc::BatchPutResp = match rkyv_decode(&resp_bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    for (idx, _, _) in group.iter() {
+                        results[*idx] = Err(AutumnError::ServerError(e.clone()));
+                    }
+                    continue;
+                }
+            };
+            if resp.code != partition_rpc::CODE_OK {
+                let code = resp.code;
+                let msg = resp.message;
+                for (idx, _, _) in group.iter() {
+                    results[*idx] = Err(code_to_error(code, msg.clone()));
+                }
+                continue;
+            }
+            if resp.statuses.len() != group.len() {
+                let mismatch = format!(
+                    "batch_put: statuses len {} != group len {}",
+                    resp.statuses.len(),
+                    group.len()
+                );
+                for (idx, _, _) in group.iter() {
+                    results[*idx] = Err(AutumnError::ServerError(mismatch.clone()));
+                }
+                continue;
+            }
+            for ((idx, _, _), status) in group.iter().zip(resp.statuses.iter()) {
+                if *status != 0 {
+                    results[*idx] = Err(AutumnError::ServerError(format!(
+                        "batch_put op status={status}"
+                    )));
+                }
+            }
+        }
+        // Now handle the ZC-only entries (large values that skip batching).
+        // Per-op put_zc — these never benefited from batching anyway.
+        for (idx, k, v) in zc_only {
+            results[idx] = self.put_zc(k, v).await;
+        }
+        results
+    }
+
     /// F237: batched deletes — pure client-side fan-out (no server `MSG_BATCH_*`),
     /// `buffered` over the per-partition multiplexed connections. No ZC (delete is
     /// tiny). Result `i` matches `keys[i]` (`Ok(())` even if the key didn't exist,
