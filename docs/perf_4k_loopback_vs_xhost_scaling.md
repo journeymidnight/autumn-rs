@@ -386,3 +386,96 @@ was more "efficient per batch" but used fewer concurrent batches**.
 is the new ceiling once `put_many` unblocks burst submission. Raising
 `AUTUMN_PS_INFLIGHT_CAP` from 8 → 16/32 with `put_many` would
 likely lift this further (untested).
+
+## Real `MSG_BATCH_PUT` shipped (commit `1724ca3`) — closes the cliff
+
+Implemented server-side batched PUT:
+
+* Wire (`crates/rpc/src/partition_rpc.rs`): `MSG_BATCH_PUT = 0x53`,
+  `MSG_BATCH_GET = 0x54`, rkyv `BatchPutReq { part_id, region_epoch,
+  must_sync, ops: Vec<BatchPutOp{key, value, expires_at}> }` +
+  symmetric Resp / GET shapes.
+* PS server: `BatchPutAccumulator` (Rc<RefCell> shared one-shot reply
+  across N ops) + `WriteResponder::BatchPut { accum, idx }` +
+  `enqueue_batch_put` that pushes ALL N `WriteRequest`s into pending in
+  one dispatcher call. `partition_loop` then sees `pending.len() += N`
+  atomically and can fire wide batches.
+* Client SDK: `ClusterClient::batch_put(items) -> Vec<Result<()>>`.
+  Routes by key to group items by partition, ONE `MSG_BATCH_PUT` RPC
+  per partition. Non-ZC only (≥ 64 KiB falls back to per-op `put_zc`).
+* perf-check `--batch-put N` now uses `batch_put` (was the legacy
+  `put_many` for the previous +37% test).
+
+### Results — drops the cliff almost entirely
+
+Same cluster, same shape (p=16 × shards=16 × --3disk r=3), x-host TCP:
+
+| config                                          | ops/s    | p50         | vs prior baseline |
+|-------------------------------------------------|----------|-------------|-------------------|
+| baseline t=128 d=8 per-op                       | 6 551    | 147.53 ms   | (anchor)          |
+| put_many t=128 d=1 --batch-put=64 (prior commit)| 7 913    | 13.47 ms    | +21 % (was anchor)|
+| **MSG_BATCH_PUT t=16 --batch-put=64**           | **36 333** | **0.29 ms** | **+455 %**       |
+| MSG_BATCH_PUT t=64 --batch-put=32               | 30 793   | 1.90 ms     | +370 %            |
+| **MSG_BATCH_PUT t=64 --batch-put=64 (sweet)**   | **45 146** | **1.25 ms** | **+589 %**       |
+| MSG_BATCH_PUT t=128 --batch-put=64              | 11 687   | 0.69 ms p99 25 | -                |
+
+Server-side `avg_batch_size` distribution during the sweet spot:
+**p50 = 128, p90 = 128, max = 244, mean = 82** (`MAX_WRITE_BATCH` cap
+= 256). The hypothesis is confirmed: `partition_loop` fires
+near-cap batches when the dispatcher injects N ops in one shot.
+
+### Comparison vs the put_many "fix"
+
+| target               | mechanism                                | x-host TCP 4K ops/s |
+|----------------------|------------------------------------------|---------------------|
+| TCP loopback ceiling | (anchor — server gets fat arrivals)      | 193 K               |
+| MSG_BATCH_PUT        | server-side decode once, inject N pending| **45 K (23 % of loopback)** |
+| put_many             | client-side buffer_unordered burst       | 7.9 K (4 %)         |
+| per-op kv_put        | naive serial                             | 6.5 K (3 %)         |
+
+`MSG_BATCH_PUT` is **6.9× better than `put_many`** at the same
+client-visible shape. The wire-protocol-level batching (one frame
+carries N ops, decoded once, injected as one mpsc message)
+fundamentally outperforms client-side fan-out.
+
+### Latency
+
+* `MSG_BATCH_PUT` at sweet spot: **p50 1.25 ms** (was 147 ms baseline
+  = **118× lower**).
+* The per-op latency definition here is `batch wall time / batch size`
+  — what users observe for in-batch ops. Even the wall-clock
+  per-BATCH (~80 ms at t=64) is faster than the baseline's per-op
+  latency.
+
+### What put_many's role becomes
+
+`put_many` is now strictly a **client-side convenience wrapper** for
+mixed ZC/non-ZC workloads:
+
+* For values ≥ 64 KiB → falls through to per-op `put_zc` (the wire
+  payload dominates; batching gives no win, and `MSG_BATCH_PUT`
+  explicitly rejects oversized ops to keep the frame finite).
+* For values < 64 KiB → callers should call `batch_put` directly for
+  best perf; `put_many`'s per-op fan-out costs the 6.9× factor above.
+
+Recommendation: callers shipping a homogeneous small-value workload
+should use `batch_put`. Callers with mixed sizes can stay on
+`put_many` if convenience matters more than the 6.9× factor; if it
+doesn't, split the input by size and call the appropriate API per
+chunk.
+
+### Server-side BATCH_GET also shipped (untested in perf-check yet)
+
+`MSG_BATCH_GET` mirrors PUT on the read path:
+`handle_batch_get` (in `rpc_handlers.rs`) runs INLINE on ps-conn,
+takes one rkyv-decode of `BatchGetReq`, loops over keys reusing
+`get_value` per key, and packs all values into ONE
+`BatchGetResp`. Client SDK: `ClusterClient::batch_get(keys) ->
+Vec<Result<Option<Vec<u8>>>>`. Read win is purely wire-frame
+amortisation (the server's per-key VP resolution / pin / not-found
+semantics are unchanged), so the gain factor will be smaller than
+PUT's — but the same shape and identical to the latency math: one
+RTT covers N keys instead of N RTTs.
+
+A perf-check `--batch-get N` flag hooking the read phase is the
+next step; today the read phase still calls per-key `get`.

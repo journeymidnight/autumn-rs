@@ -1403,6 +1403,103 @@ impl ClusterClient {
         fan_out_collect(futs, concurrency).await
     }
 
+    /// **Server-side batched GET** (`MSG_BATCH_GET`): N keys on the
+    /// SAME partition packed into ONE frame. Mirror of
+    /// [`Self::batch_put`]; the PS handler runs INLINE on the ps-conn
+    /// task (reads never go through `partition_loop`), so the win
+    /// here is purely amortising one wire frame + one rkyv decode/
+    /// encode over N keys instead of N independent GET round-trips.
+    ///
+    /// The client groups input keys by owning partition and issues
+    /// ONE batch RPC per partition. Per-key result: `Ok(Some(value))`
+    /// = present, `Ok(None)` = not found, `Err` = per-key error.
+    /// Result `i` matches `keys[i]` in input order.
+    ///
+    /// For VP-resolved values the server still pays per-key
+    /// `read_value_from_log` cost — `batch_get` doesn't (yet) coalesce
+    /// the log-stream reads. For inline values (the common cross-host
+    /// 4 KiB case) the entire batch resolves under one partition
+    /// borrow.
+    pub async fn batch_get(
+        &self,
+        keys: &[&[u8]],
+    ) -> Vec<std::result::Result<Option<Vec<u8>>, AutumnError>> {
+        let mut results: Vec<std::result::Result<Option<Vec<u8>>, AutumnError>> =
+            (0..keys.len()).map(|_| Ok(None)).collect();
+        let mut groups: std::collections::HashMap<u64, Vec<(usize, &[u8])>> =
+            std::collections::HashMap::new();
+        for (i, &k) in keys.iter().enumerate() {
+            let part_id = match self.resolve_key(k).await {
+                Ok((pid, _addr)) => pid,
+                Err(e) => {
+                    results[i] = Err(AutumnError::RoutingError(e.to_string()));
+                    continue;
+                }
+            };
+            groups.entry(part_id).or_default().push((i, k));
+        }
+        for (part_id, group) in groups {
+            let region_epoch = self.lookup_epoch_for_part(part_id);
+            let keys_payload: Vec<Vec<u8>> = group.iter().map(|(_, k)| k.to_vec()).collect();
+            let payload = rkyv_encode(&partition_rpc::BatchGetReq {
+                part_id,
+                region_epoch,
+                keys: keys_payload,
+            });
+            let resp_bytes = match self
+                .call_ps_for_part(part_id, partition_rpc::MSG_BATCH_GET, payload.into())
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    let s = e.to_string();
+                    for (idx, _) in group.iter() {
+                        results[*idx] = Err(AutumnError::ConnectionError(s.clone()));
+                    }
+                    continue;
+                }
+            };
+            let resp: partition_rpc::BatchGetResp = match rkyv_decode(&resp_bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    for (idx, _) in group.iter() {
+                        results[*idx] = Err(AutumnError::ServerError(e.clone()));
+                    }
+                    continue;
+                }
+            };
+            if resp.code != partition_rpc::CODE_OK {
+                let code = resp.code;
+                let msg = resp.message;
+                for (idx, _) in group.iter() {
+                    results[*idx] = Err(code_to_error(code, msg.clone()));
+                }
+                continue;
+            }
+            if resp.items.len() != group.len() {
+                let mismatch = format!(
+                    "batch_get: items len {} != group len {}",
+                    resp.items.len(),
+                    group.len()
+                );
+                for (idx, _) in group.iter() {
+                    results[*idx] = Err(AutumnError::ServerError(mismatch.clone()));
+                }
+                continue;
+            }
+            for ((idx, _), item) in group.iter().zip(resp.items.into_iter()) {
+                results[*idx] = match item.status {
+                    0 => Ok(Some(item.value)),
+                    1 => Ok(None),
+                    s => Err(AutumnError::ServerError(format!(
+                        "batch_get op status={s}"
+                    ))),
+                };
+            }
+        }
+        results
+    }
+
     /// **Server-side batched PUT** (`MSG_BATCH_PUT`): N ops on the SAME
     /// partition packed into ONE frame. The PS decodes once, injects
     /// all N ops into `partition_loop::pending` as ONE mpsc message,
