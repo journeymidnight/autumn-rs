@@ -369,6 +369,70 @@ preserved single-writer when P-bulk spawn failed is gone (both
 
 **No local WAL file**: logStream is the sole write-ahead log. Recovery replays logStream from the VP head recorded in the last metaStream checkpoint.
 
+### `MSG_BATCH_PUT` (0x53) — server-batched Put (commit 1724ca3 / 09b2a39)
+
+A second write entry point alongside `MSG_PUT` / `MSG_PUT_ZC`. One
+frame from the SDK carries `BatchPutReq { part_id, region_epoch,
+must_sync, ops: Vec<BatchPutOp{key, value, expires_at}> }`. The
+SDK (`ClusterClient::batch_put`) groups items by owning partition
+and emits one frame per partition.
+
+Server side (`enqueue_batch_put` in `lib.rs`):
+1. Decode the frame ONCE on the ps-conn task (vs. per-op decode
+   for the N-frame `put_many` path it replaced).
+2. Allocate one `Rc<BatchPutAccumulator>` carrying the outer
+   `resp_tx`, a `RefCell<Vec<u8>>` statuses (one per op), and a
+   `Cell<usize>` remaining counter.
+3. For each op: push a `WriteRequest` whose `WriteResponder` is
+   the new `BatchPut { accum, idx }` variant into
+   `partition_loop.pending`. This is an ATOMIC injection of N
+   ops as a single mpsc message — the same wide batch all
+   landing in pending at once, where the F099-D group-commit
+   loop picks them up. Compared with the pre-batch path (N
+   independent mpsc messages), this saves N-1 wake/dispatch
+   cycles and gives the group-commit loop the "fat arrival" it
+   needs to fill MAX_WRITE_BATCH=256.
+4. Each op's Phase 3 completion calls `accum.record(idx,
+   status)` instead of sending its own outer oneshot. The LAST
+   recorder (remaining==0) encodes the `BatchPutResp` and fires
+   the single outer oneshot back to ps-conn.
+
+Frozen-for-merge rejection path also handles MSG_BATCH_PUT —
+returns `CODE_UNAVAILABLE` per-op uniformly via the same
+accumulator path.
+
+Measured win (cross-host TCP, 4 K values, 8 partitions × 64
+threads × pipeline-depth 8): 6,531 ops/s baseline → 45,146 ops/s
+with `--batch-put 64` (6.9×). Per-partition tracing showed
+batch_size hitting cap=256 consistently, vs. ~8-16 on baseline.
+Single-host loopback shows a smaller 1.7× win because per-frame
+routing/decode overhead is already low over localhost.
+
+### `MSG_BATCH_GET` (0x54) — server-batched Get
+
+Read mirror. `BatchGetReq { part_id, region_epoch, keys: Vec<Vec<u8>> }`,
+response `BatchGetResp { items: Vec<BatchGetItem{ status, value }> }`.
+
+Server side (`handle_batch_get` in `rpc_handlers.rs`):
+1. Runs INLINE on the ps-conn task (no `partition_loop` mpsc
+   hop — same as `handle_get`).
+2. Decode the frame once, brief `borrow()` to snapshot
+   readers/state, then loop calling `get_value` per key in the
+   batch.
+3. Pack the per-key responses into a single `BatchGetResp` frame.
+
+NO zero-copy for the response — `BatchGetResp` is rkyv-encoded
+with each value embedded inline. For ≥ 64 KiB reads, callers
+should use the client `get_many_into` (per-key `MSG_GET_ZC` into
+caller-owned dests, fan-out via `fan_out_collect`) — that's the
+right primitive when each value needs its own dest.
+
+Measured win (single-host loopback, 4 K values, 8 threads ×
+pipeline-depth 4, --batch-get 32): 158 K read ops/s baseline →
+234 K (1.47×), p99 0.28 ms → 0.07 ms (4×). The bigger win is in
+p99, not throughput — batching collapses the per-frame
+write_vectored response coalescing.
+
 ## Read Path: Get
 
 ```

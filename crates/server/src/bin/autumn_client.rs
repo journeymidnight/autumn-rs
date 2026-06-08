@@ -111,6 +111,13 @@ enum Command {
         /// writer_task tcp_sendmsg coalescing + read_loop bulk decode
         /// gives partition_loop the "fat arrival" needed to grow batch_size.
         batch_put: usize,
+        /// Read-side counterpart: when > 0, read loop issues
+        /// `batch_get(N)` (one MSG_BATCH_GET per partition) instead of
+        /// per-key `get` / `get_into`. Validates the BATCH_GET wire +
+        /// server inline-loop path end-to-end and surfaces the read
+        /// equivalent of batch_put's 6.9× write win when small values
+        /// are dominated by per-op routing + ps-conn dispatch overhead.
+        batch_get: usize,
     },
 }
 
@@ -377,6 +384,7 @@ fn parse_args() -> Args {
             // server-side "fat arrival" partition_loop needs to grow
             // batch_size. 0 = legacy per-op fan_out.
             let mut batch_put: usize = 0;
+            let mut batch_get: usize = 0;
             // F195: was `AUTUMN_GROUP_COMMIT_CAP` env read at baseline-
             // write time. Now an explicit CLI flag — operators pass the
             // same value to autumn-ps (`--group-commit-cap N`) AND to
@@ -445,6 +453,12 @@ fn parse_args() -> Args {
                             .parse()
                             .expect("--batch-put must be a non-negative integer");
                     }
+                    "--batch-get" => {
+                        i += 1;
+                        batch_get = raw[i]
+                            .parse()
+                            .expect("--batch-get must be a non-negative integer");
+                    }
                     "--group-commit-cap" => {
                         i += 1;
                         group_commit_cap =
@@ -468,6 +482,7 @@ fn parse_args() -> Args {
                 pipeline_depth,
                 group_commit_cap,
                 batch_put,
+                batch_get,
             }
         }
         other => {
@@ -867,6 +882,7 @@ async fn main() -> Result<()> {
             pipeline_depth,
             group_commit_cap,
             batch_put,
+            batch_get,
         } => {
             let pipeline_depth = pipeline_depth.max(1);
             // ZC ("ucx ⟹ zerocopy") selection — ONE symmetric rule (F235), shared
@@ -1104,6 +1120,7 @@ async fn main() -> Result<()> {
                 let deadline = Arc::clone(&deadline);
                 let total_ops = Arc::clone(&total_ops);
                 let depth = pipeline_depth;
+                let batch_get = batch_get;
                 let handle = std::thread::spawn(move || {
                     compio::runtime::RuntimeBuilder::new()
                         .build()
@@ -1121,6 +1138,55 @@ async fn main() -> Result<()> {
                             let cref = &client;
                             let dl = deadline.as_ref();
                             let sk = start_key.as_slice();
+                            if batch_get > 0 {
+                                // Server-side BATCH_GET path: mirrors the
+                                // write phase's `batch_put`. Per round we
+                                // build N keys and submit via
+                                // `cref.batch_get(&keys)`; the SDK groups by
+                                // owning partition and emits ONE
+                                // MSG_BATCH_GET frame per partition.
+                                // Server decodes once, runs the per-key
+                                // get inline on the ps-conn task (no mpsc
+                                // hop), packs the responses into a single
+                                // BatchGetResp frame. Validates the
+                                // BATCH_GET wire end-to-end + measures
+                                // the read equivalent of the write-side
+                                // 6.9× per-frame amortisation win.
+                                let mut ki = 0u64;
+                                while std::time::SystemTime::now() < *dl {
+                                    let keys: Vec<String> = (0..batch_get)
+                                        .map(|_| {
+                                            let seq = ki % written;
+                                            ki += 1;
+                                            key_for_partition(sk, "pc", tid, seq)
+                                        })
+                                        .collect();
+                                    let key_refs: Vec<&[u8]> =
+                                        keys.iter().map(|k| k.as_bytes()).collect();
+                                    let t0 = Instant::now();
+                                    let res = cref.batch_get(&key_refs).await;
+                                    let el = t0.elapsed();
+                                    // We treat both `Ok(Some(_))` and
+                                    // `Ok(None)` as "served by the
+                                    // server" — perf-check sample
+                                    // signal is wire RTT + decode, not
+                                    // a presence assertion (the write
+                                    // phase guarantees presence by
+                                    // construction modulo a tiny tail
+                                    // of in-flight writes never landed
+                                    // on the read deadline).
+                                    let n_ok = res.iter().filter(|r| r.is_ok()).count();
+                                    if n_ok > 0 {
+                                        total_ops.fetch_add(n_ok as u64, Ordering::Relaxed);
+                                        let per_op_ms =
+                                            el.as_secs_f64() * 1000.0 / n_ok as f64;
+                                        for _ in 0..n_ok {
+                                            lats.push(per_op_ms);
+                                        }
+                                    }
+                                }
+                                return lats;
+                            }
                             let mut ki = 0u64;
                             let futs = std::iter::from_fn(move || {
                                 if std::time::SystemTime::now() >= *dl {

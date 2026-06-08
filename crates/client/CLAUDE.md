@@ -44,13 +44,37 @@ Main entry point. Connect via `ClusterClient::connect("addr1,addr2")`.
   `get_into` / `MSG_GET_ZC`, else `get` / `MSG_GET` + one copy into `dest`. Result
   `i` matches `items[i]` (`Ok(Some(n))` = value len, `Ok(None)` = miss, `Err` =
   that item failed; others still ran). Each `dest` MUST outlive the call.
-- `put_many(items: &[(key, Bytes)]) → Vec<Result<()>>` — **F236 batched zero-copy
-  writes** (write mirror of `get_many_into`). Pure client-side fan-out (no server
-  `MSG_BATCH_PUT`), `buffered(BATCH_PUT_DEFAULT_CONCURRENCY` = 32) over the
-  per-partition multiplexed connections. Per item `zc_worthwhile(value.len())`:
-  ≥ 64 KiB → `put_zc` / `MSG_PUT_ZC` (value sent as its own iovec from the `Bytes`
-  backing memory, no copy; RDMA on UCX when registered), else `put` / `MSG_PUT`.
-  Result `i` matches `items[i]` (`Ok(())` = stored, `Err` = that item failed).
+- `put_many(items: &[(key, Bytes)], _concurrency: usize) → Vec<Result<()>>` —
+  thin pass-through to `batch_put` (preserves signature for callers that
+  still pass a concurrency hint; the hint is IGNORED — see below). The
+  pre-F236 client-side `fan_out_collect` over per-op `put`/`put_zc` is
+  GONE — that path measured 6.9× worse than `batch_put` on cross-host
+  TCP 4 K at the sweet spot (one MSG_PUT frame per op × per-frame
+  decode + ps-conn dispatch cost). Callers wanting fine-grained
+  per-partition concurrency control should call `batch_put` directly
+  and let the SDK group by partition.
+- `batch_put(items: &[(key, Bytes)]) → Vec<Result<()>>` —
+  **server-batched writes (commit 1724ca3 / 09b2a39).** Groups items
+  by owning partition via `resolve_key` + `lookup_epoch_for_part`, and
+  issues ONE `MSG_BATCH_PUT` frame per partition carrying every op in
+  that group. The PS decodes the frame once on its ps-conn task and
+  atomically pushes ALL ops into `partition_loop.pending` as a single
+  enqueue (via `BatchPutAccumulator` — last-recorder-encodes-and-sends
+  the BatchPutResp). Items where `zc_worthwhile(value.len()) == true`
+  (≥ 64 KiB) fall through to per-op `put_zc` (`MSG_PUT_ZC`) — at that
+  size the per-frame amortisation is dwarfed by the value memcpy/RDMA
+  cost, and squeezing a 64 KiB+ value into BatchPutOp would bloat the
+  frame past sane limits. Result `i` matches `items[i]` (`Ok(())` =
+  stored, `Err` = that op failed; others in the same batch can still
+  succeed). Routing miss / epoch-stale on a group → refresh + retry
+  the whole group (admin-op-style, not per-op).
+- `batch_get(keys: &[&[u8]]) → Vec<Result<Option<Vec<u8>>>>` — read
+  mirror of `batch_put`. One `MSG_BATCH_GET` frame per partition; the
+  PS runs the per-key `get_value` inline on the ps-conn task and
+  packs the responses into a single `BatchGetResp` frame. No ZC for
+  the response payload — for ≥ 64 KiB reads, `get_many_into` (client
+  fan-out over `get_into`) is the right primitive because each value
+  needs its own caller-owned dest.
 - `delete_many(keys: &[&[u8]]) → Vec<Result<()>>` / `head_many(keys: &[&[u8]]) →
   Vec<Result<KeyMeta>>` — **F237 batched delete / metadata.** Same client-side
   fan-out as `get_many_into`/`put_many` (no server `MSG_BATCH_*`, `buffered` over

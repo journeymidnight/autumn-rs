@@ -479,3 +479,42 @@ RTT covers N keys instead of N RTTs.
 
 A perf-check `--batch-get N` flag hooking the read phase is the
 next step; today the read phase still calls per-key `get`.
+
+### Update (2026-06-08): `--batch-get N` + `put_many → batch_put` shipped
+
+Two follow-up tasks landed together:
+
+1. **perf-check `--batch-get N`.** Read phase mirrors the write
+   phase: when `--batch-get N > 0`, the per-thread loop builds N
+   keys per round and calls `cref.batch_get(&key_refs)` instead of
+   the per-key `get` / `get_into` futures stream. Validates the
+   `MSG_BATCH_GET` wire end-to-end and surfaces a per-frame
+   amortisation number for reads.
+2. **`put_many` delegates to `batch_put`.** The legacy
+   `fan_out_collect` over per-op `put`/`put_zc` is gone — `put_many`
+   is now a one-line pass-through to `batch_put` (the `concurrency`
+   param is ignored, kept for back-compat with existing callers).
+   Every existing `put_many` site gets the 6.9× factor transparently
+   for small values; large values still fall through to `put_zc`
+   inside `batch_put`.
+
+**Loopback validation** (single-host TCP, 1 partition, 8 threads ×
+pipeline-depth 4, 4 K values, 6-second runs over the new build):
+
+| Mode               | Write ops/s | Read ops/s | Read p99 |
+|--------------------|------------:|-----------:|---------:|
+| baseline           | 15,358      | 158,517    | 0.28 ms  |
+| `--batch-put 32`   | **26,186**  | 158,879    | 0.39 ms  |
+| `--batch-get 32`   | 14,166      | **233,572**| **0.07 ms** |
+
+- `--batch-put 32` → write **1.71×** (the cross-host 6.9× is much
+  bigger because the per-frame routing/decode overhead dominates
+  there; on loopback most of that cost is below the noise floor).
+- `--batch-get 32` → read **1.47×** throughput, **4× lower p99**.
+  The p99 improvement is the headline: read-side per-frame
+  `tcp_sendmsg` coalescing of `BatchGetResp` collapses the response
+  scheduling jitter to a single send.
+
+The cross-host scaling matrix is unchanged in shape; the
+implementation is now fully in place to repeat the cross-host bench
+once the prior test harness is back up.

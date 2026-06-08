@@ -1387,20 +1387,26 @@ impl ClusterClient {
     pub async fn put_many(
         &self,
         items: &[(&[u8], bytes::Bytes)],
-        concurrency: usize,
+        _concurrency: usize,
     ) -> Vec<std::result::Result<(), AutumnError>> {
-        let futs = items.iter().map(|it| {
-            let key: &[u8] = it.0;
-            let value: &bytes::Bytes = &it.1;
-            async move {
-                if zc_worthwhile(value.len()) {
-                    self.put_zc(key, value.clone()).await
-                } else {
-                    self.put(key, value.as_ref()).await
-                }
-            }
-        });
-        fan_out_collect(futs, concurrency).await
+        // Post-MSG_BATCH_PUT (commit 1724ca3 / 09b2a39): the previous
+        // implementation was a client-side `fan_out_collect` over per-op
+        // `put` / `put_zc`. That's now strictly worse for the small-value
+        // case — MSG_BATCH_PUT (one frame per partition carrying N ops,
+        // atomic injection into partition_loop's pending) measured 6.9×
+        // higher x-host TCP 4K throughput at the same client shape. So
+        // put_many now delegates to `batch_put`, which:
+        //   * groups items by owning partition,
+        //   * issues ONE `MSG_BATCH_PUT` per partition for values <
+        //     `UCX_ZC_READ_MIN_BYTES` (64 KiB),
+        //   * falls through to per-op `put_zc` for ≥ 64 KiB values
+        //     (wire-bandwidth-bound; batching gives no win and would
+        //     bloat the frame past sane limits).
+        // The `concurrency` parameter is now a no-op — batch_put's
+        // partition-by-partition issuance is the natural pacing.
+        // Callers wanting fine-grained control over per-partition
+        // concurrency should call `batch_put` directly.
+        self.batch_put(items).await
     }
 
     /// **Server-side batched GET** (`MSG_BATCH_GET`): N keys on the
