@@ -106,6 +106,11 @@ enum Command {
         pipeline_depth: usize,
         /// F195: was env `AUTUMN_GROUP_COMMIT_CAP`; recorded in baseline.
         group_commit_cap: Option<usize>,
+        /// Experimental: when > 0, write loop uses `put_many` with this
+        /// batch size instead of `kv_put` per iteration. Tests whether
+        /// writer_task tcp_sendmsg coalescing + read_loop bulk decode
+        /// gives partition_loop the "fat arrival" needed to grow batch_size.
+        batch_put: usize,
     },
 }
 
@@ -365,6 +370,13 @@ fn parse_args() -> Args {
             let mut update_baseline = false;
             let mut partitions_meta_from_flag: usize = 1;
             let mut pipeline_depth: usize = 1;
+            // Experimental: when > 0, the write loop bundles N keys per
+            // `put_many` call (client-side fan-out) instead of issuing one
+            // `kv_put` per iteration. Tests whether writer_task's
+            // tcp_sendmsg coalescing + read_loop bulk decode gives the
+            // server-side "fat arrival" partition_loop needs to grow
+            // batch_size. 0 = legacy per-op fan_out.
+            let mut batch_put: usize = 0;
             // F195: was `AUTUMN_GROUP_COMMIT_CAP` env read at baseline-
             // write time. Now an explicit CLI flag — operators pass the
             // same value to autumn-ps (`--group-commit-cap N`) AND to
@@ -427,6 +439,12 @@ fn parse_args() -> Args {
                             usage();
                         }
                     }
+                    "--batch-put" => {
+                        i += 1;
+                        batch_put = raw[i]
+                            .parse()
+                            .expect("--batch-put must be a non-negative integer");
+                    }
                     "--group-commit-cap" => {
                         i += 1;
                         group_commit_cap =
@@ -449,6 +467,7 @@ fn parse_args() -> Args {
                 partitions: partitions_meta_from_flag,
                 pipeline_depth,
                 group_commit_cap,
+                batch_put,
             }
         }
         other => {
@@ -847,6 +866,7 @@ async fn main() -> Result<()> {
             partitions: partitions_meta_from_flag,
             pipeline_depth,
             group_commit_cap,
+            batch_put,
         } => {
             let pipeline_depth = pipeline_depth.max(1);
             // ZC ("ucx ⟹ zerocopy") selection — ONE symmetric rule (F235), shared
@@ -916,6 +936,7 @@ async fn main() -> Result<()> {
                     .map(|i| (i % 256) as u8)
                     .collect::<Vec<u8>>();
                 let depth = pipeline_depth;
+                let batch_put = batch_put;
                 let handle = std::thread::spawn(move || {
                     compio::runtime::RuntimeBuilder::new()
                         .build()
@@ -937,6 +958,48 @@ async fn main() -> Result<()> {
                             let vz = &value_zc;
                             let sk = start_key.as_slice();
                             let mut seq = 0u64;
+                            if batch_put > 0 {
+                                // Experimental put_many path: build a batch of N
+                                // (key, value) per round, submit via put_many.
+                                // Each round's put_many spawns N futures in one
+                                // shot via `buffer_unordered` — writer_task
+                                // coalesces them into one tcp_sendmsg; server
+                                // read_loop decodes N frames in one go and
+                                // injects N pending ops into partition_loop ⇒
+                                // batch_size grows server-side.
+                                while std::time::SystemTime::now() < *dl {
+                                    let keys: Vec<String> = (0..batch_put)
+                                        .map(|_| {
+                                            let k = key_for_partition(sk, "pc", tid, seq);
+                                            seq += 1;
+                                            k
+                                        })
+                                        .collect();
+                                    let items: Vec<(&[u8], bytes::Bytes)> = keys
+                                        .iter()
+                                        .map(|k| (k.as_bytes(), vz.clone()))
+                                        .collect();
+                                    let t0 = Instant::now();
+                                    let res = cref.put_many(&items, batch_put).await;
+                                    let el = t0.elapsed();
+                                    let n_ok = res.iter().filter(|r| r.is_ok()).count();
+                                    if n_ok > 0 {
+                                        total_ops.fetch_add(n_ok as u64, Ordering::Relaxed);
+                                        written += n_ok as u64;
+                                        // Per-op latency = batch wall time /
+                                        // batch size (mean) — what users observe
+                                        // for in-batch ops; not p50 of individual
+                                        // op end-to-end, but the right metric for
+                                        // comparing batched vs per-op submission.
+                                        let per_op_ms =
+                                            el.as_secs_f64() * 1000.0 / n_ok as f64;
+                                        for _ in 0..n_ok {
+                                            lats.push(per_op_ms);
+                                        }
+                                    }
+                                }
+                                return (lats, written);
+                            }
                             // Deadline-bounded lazy source of single put futures.
                             let futs = std::iter::from_fn(move || {
                                 if std::time::SystemTime::now() >= *dl {
