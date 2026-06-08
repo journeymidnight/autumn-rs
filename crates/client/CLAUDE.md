@@ -46,14 +46,23 @@ Main entry point. Connect via `ClusterClient::connect("addr1,addr2")`.
   (value as its own iovec; RDMA when caller-registered). Result `i`
   matches `items[i]`. NO `concurrency` arg — partition-by-partition
   issuance is the natural pacing.
+- `get_many(keys: &[&[u8]]) → Vec<Result<Option<Vec<u8>>>>` —
+  **the simpler batched-read API.** SDK allocates a `Vec<u8>` per
+  returned value; one `MSG_BATCH_GET` per owning partition. Use this
+  when you don't know value sizes ahead of time, don't want to
+  pre-alloc dest buffers, or values are small (< 64 KiB) so ZC
+  wouldn't engage anyway. For < 64 KiB this has identical perf to
+  `get_many_into`'s small path (both pay one rkyv decode-copy).
 - `get_many_into(items: &mut [GetManyItem]) → Vec<Result<Option<usize>>>` —
-  **the public batched-read API.** Each `GetManyItem` carries
-  `{key, offset, length, dest, reg}`. SDK auto-routes:
+  **the ZC batched-read API.** Use when values are ≥ 64 KiB AND you
+  have caller-owned dest buffers (especially `RegisteredMem` for UCX
+  RDMA into sglang pages / torch tensors — true end-to-end zero-copy).
+  Each `GetManyItem` carries `{key, offset, length, dest, reg}`. SDK
+  auto-routes:
   - HOMOGENEOUS small whole-value batch (every item: `offset == 0`,
-    `length == 0`, `dest.len() < 64 KiB`) → `MSG_BATCH_GET` per
-    partition. Server packs all values into one `BatchGetResp` →
-    SDK memcpys each into its `dest`. Measured 4× lower read p99
-    on loopback.
+    `length == 0`, `dest.len() < 64 KiB`) → delegates to `get_many`
+    + memcpys each result into its `dest` (read p99 4× lower than
+    per-op fan-out on loopback).
   - MIXED / range / large-ZC → per-op fan-out: `MSG_GET_ZC` into
     `dest` (with optional `RegisteredMem` → RDMA on UCX) for
     `read_len ≥ 64 KiB`; else `MSG_GET` + memcpy. NO `concurrency`
@@ -67,10 +76,10 @@ Main entry point. Connect via `ClusterClient::connect("addr1,addr2")`.
   `head_many` returns `found=false` for a missing key (not `Err`).
 
 **Internal-only (pub(crate)):**
-- `batch_put` / `batch_get` — the server-batched RPC layer. Reached
-  through `put_many` / `get_many_into`'s auto-routing; callers should
-  not invoke directly. Kept as `pub(crate)` so unit tests + the
-  delegation layer share one implementation.
+- `batch_put` — the server-batched RPC layer for writes. Reached
+  through `put_many`'s auto-routing; callers should not invoke
+  directly. Kept as `pub(crate)` so unit tests + the delegation
+  layer share one implementation.
 
 **Removed in the API consolidation (2026-06-08):**
 - `put_with_ttl` — TTL is now a tuple field on `put_many`. For a

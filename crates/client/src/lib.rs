@@ -1347,7 +1347,7 @@ impl ClusterClient {
             });
         if homogeneous_small {
             let keys: Vec<&[u8]> = items.iter().map(|it| it.key).collect();
-            let resp = self.batch_get(&keys).await;
+            let resp = self.get_many(&keys).await;
             // Copy each response into its dest in input order; the
             // dest mutable borrow is taken per-iteration so each
             // dest gets its own `&mut` slice.
@@ -1429,24 +1429,29 @@ impl ClusterClient {
         self.batch_put(items).await
     }
 
-    /// **Server-side batched GET** (`MSG_BATCH_GET`): N keys on the
-    /// SAME partition packed into ONE frame. Mirror of
-    /// [`Self::batch_put`]; the PS handler runs INLINE on the ps-conn
-    /// task (reads never go through `partition_loop`), so the win
-    /// here is purely amortising one wire frame + one rkyv decode/
-    /// encode over N keys instead of N independent GET round-trips.
+    /// **The batched-read API that does not require caller-owned
+    /// dest buffers.** Mirror of `put_many`. SDK allocates a
+    /// `Vec<u8>` per returned value; result `i` matches `keys[i]`.
     ///
-    /// The client groups input keys by owning partition and issues
-    /// ONE batch RPC per partition. Per-key result: `Ok(Some(value))`
-    /// = present, `Ok(None)` = not found, `Err` = per-key error.
-    /// Result `i` matches `keys[i]` in input order.
+    /// Wire: one `MSG_BATCH_GET` per owning partition. The PS handler
+    /// runs INLINE on the ps-conn task (reads never go through
+    /// `partition_loop`), so the win is amortising one wire frame +
+    /// one rkyv decode over N keys.
     ///
-    /// For VP-resolved values the server still pays per-key
-    /// `read_value_from_log` cost — `batch_get` doesn't (yet) coalesce
-    /// the log-stream reads. For inline values (the common cross-host
-    /// 4 KiB case) the entire batch resolves under one partition
-    /// borrow.
-    pub(crate) async fn batch_get(
+    /// When to use `get_many` vs `get_many_into`:
+    /// - **`get_many`** — when you don't know the value sizes (or
+    ///   don't care to alloc dests), or values are small (< 64 KiB)
+    ///   so ZC wouldn't engage anyway. SDK allocates each `Vec<u8>`.
+    /// - **`get_many_into`** — when values are ≥ 64 KiB AND you have
+    ///   caller-owned dest buffers (especially `RegisteredMem` for
+    ///   UCX RDMA into pinned memory like sglang pages / torch
+    ///   tensors). True end-to-end zero-copy.
+    /// Below 64 KiB both APIs do one rkyv decode-copy regardless;
+    /// `get_many` saves you the dest-sizing footwork.
+    ///
+    /// Per-key result: `Ok(Some(value))` = present, `Ok(None)` = not
+    /// found, `Err` = per-key error.
+    pub async fn get_many(
         &self,
         keys: &[&[u8]],
     ) -> Vec<std::result::Result<Option<Vec<u8>>, AutumnError>> {
@@ -1504,7 +1509,7 @@ impl ClusterClient {
             }
             if resp.items.len() != group.len() {
                 let mismatch = format!(
-                    "batch_get: items len {} != group len {}",
+                    "get_many: items len {} != group len {}",
                     resp.items.len(),
                     group.len()
                 );
@@ -1518,7 +1523,7 @@ impl ClusterClient {
                     0 => Ok(Some(item.value)),
                     1 => Ok(None),
                     s => Err(AutumnError::ServerError(format!(
-                        "batch_get op status={s}"
+                        "get_many op status={s}"
                     ))),
                 };
             }
