@@ -163,3 +163,55 @@ ratio, which determines per-op effective cost.
 The fix isn't network-tuning; it's letting clients batch puts into
 larger atomic requests so the server gets a "fat arrival" pattern even
 over a slow wire.
+
+## Followup test (2026-06-08): MIN_PIPELINE_BATCH tuning DIDN'T help
+
+The fix-proposal above predicted that reducing `MIN_PIPELINE_BATCH`
+from 256 to 16 would help cross-host by letting `partition_loop`
+fire small batches without waiting. Tested on the same cluster
+(p=16 × shards=16 × --3disk r=3 cross-host) by setting
+`AUTUMN_PS_MIN_BATCH=16`:
+
+| t   | MIN_BATCH=256 (baseline) | MIN_BATCH=16 | Δ        |
+|-----|-------------------------|--------------|----------|
+| 16  | 3,786 ops/s, p50 22 ms  | 2,927        | **-23%** |
+| 64  | 4,802 ops/s, p50 106 ms | 4,151        | **-14%** |
+| 128 | 5,796 ops/s, p50 174 ms | 4,548        | **-22%** |
+
+**MIN_BATCH=16 made cross-host WORSE, not better.** Lower threshold
+fires smaller batches sooner → more fsync overhead per op without
+unlocking any new concurrency.
+
+So my "server is waiting for 256 to pile up" theory was wrong. Looking
+at the code more carefully: the 256 gate only applies to the SECOND
+concurrent batch when `n_inflight > 0`. With cross-host's slow
+arrival, `n_inflight` reaches 0 between batches (one batch fully
+drains before the next pile arrives), so the gate never fires —
+`partition_loop` already runs in the "single-batch mode" the gate
+was meant to avoid. Lowering MIN_BATCH just adds friction.
+
+The REAL bottleneck is somewhere I haven't found yet — possible:
+* `fan_out(depth=8)` per client thread is bounded by `buffer_unordered`
+  semantics that may yield to scheduler frequently on cross-host's
+  longer per-op time → effective per-thread inflight is less than 8.
+* The `autumn-rpc` per-conn `writer_task` flushes one frame at a time
+  on submit; on loopback the submit→write→ack cycle is microseconds so
+  many frames batch into one `tcp_sendmsg` via the writer_task's
+  pipelined drain. Cross-host's RTT means the queue empties between
+  submits — small `tcp_sendmsg` per frame.
+* Per-conn `FuturesUnordered` cap on the SERVER side
+  (`AUTUMN_PS_CONN_INFLIGHT_CAP=64`) — at t=128 d=8 = 1024 client
+  inflight, 16 conns × 64 = 1024 server-side cap. Exactly at the
+  saturation point.
+
+**Decision**: don't speculate further — would need profile data to
+nail the real cause (server-side flamegraph at t=128 cross-host vs
+loopback). Documented the cliff as an operator gotcha; production
+workloads should use batched RPCs or accept the wire-bound ceiling.
+
+The `put_many` client-side fan-out, by the way, would NOT fix this —
+it's `buffer_unordered` over single-op `put` calls (no server
+`MSG_BATCH_PUT`), so each op still hits the wire individually. A real
+server-side batch RPC (~200 lines) is the only mechanical fix that
+would let one frame carry N ops and feed `partition_loop`'s pending
+queue in one go.
