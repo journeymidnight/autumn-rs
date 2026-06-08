@@ -118,6 +118,13 @@ enum Command {
         /// equivalent of batch_put's 6.9× write win when small values
         /// are dominated by per-op routing + ps-conn dispatch overhead.
         batch_get: usize,
+        /// Validation harness for the `put_many → batch_put`
+        /// delegation: when > 0, the write loop calls `put_many` with
+        /// this batch size (identical shape to `--batch-put N`, just
+        /// going through the wrapper). Side-by-side with `--batch-put`
+        /// should match within noise; any gap = the delegation
+        /// regressed.
+        put_many: usize,
     },
 }
 
@@ -385,6 +392,7 @@ fn parse_args() -> Args {
             // batch_size. 0 = legacy per-op fan_out.
             let mut batch_put: usize = 0;
             let mut batch_get: usize = 0;
+            let mut put_many: usize = 0;
             // F195: was `AUTUMN_GROUP_COMMIT_CAP` env read at baseline-
             // write time. Now an explicit CLI flag — operators pass the
             // same value to autumn-ps (`--group-commit-cap N`) AND to
@@ -459,6 +467,12 @@ fn parse_args() -> Args {
                             .parse()
                             .expect("--batch-get must be a non-negative integer");
                     }
+                    "--put-many" => {
+                        i += 1;
+                        put_many = raw[i]
+                            .parse()
+                            .expect("--put-many must be a non-negative integer");
+                    }
                     "--group-commit-cap" => {
                         i += 1;
                         group_commit_cap =
@@ -483,6 +497,7 @@ fn parse_args() -> Args {
                 group_commit_cap,
                 batch_put,
                 batch_get,
+                put_many,
             }
         }
         other => {
@@ -883,6 +898,7 @@ async fn main() -> Result<()> {
             group_commit_cap,
             batch_put,
             batch_get,
+            put_many,
         } => {
             let pipeline_depth = pipeline_depth.max(1);
             // ZC ("ucx ⟹ zerocopy") selection — ONE symmetric rule (F235), shared
@@ -953,6 +969,7 @@ async fn main() -> Result<()> {
                     .collect::<Vec<u8>>();
                 let depth = pipeline_depth;
                 let batch_put = batch_put;
+                let put_many = put_many;
                 let handle = std::thread::spawn(move || {
                     compio::runtime::RuntimeBuilder::new()
                         .build()
@@ -974,23 +991,25 @@ async fn main() -> Result<()> {
                             let vz = &value_zc;
                             let sk = start_key.as_slice();
                             let mut seq = 0u64;
-                            if batch_put > 0 {
-                                // Server-side BATCH_PUT path: build a group
-                                // of N (key, value) per round, submit via
-                                // `batch_put`. One MSG_BATCH_PUT frame per
-                                // partition → server decodes once, injects
-                                // all per-partition ops into partition_loop
-                                // pending as ONE mpsc message → wide batch
-                                // fires + multiple concurrent batches.
-                                // Compared with the old put_many path
-                                // (which also sent the same wire data
-                                // but as N separate frames), this saves
-                                // server-side per-frame decode overhead +
-                                // gives the partition_loop atomic pending
-                                // injection (the actual perf-improving
-                                // primitive).
+                            // batch_put and put_many take the SAME loop
+                            // shape and the SAME wire bytes — put_many is
+                            // a one-line delegate to batch_put — so we
+                            // share the loop and pick the entry point per
+                            // call. Validates the delegation at perf
+                            // level: any side-by-side gap between
+                            // `--batch-put N` and `--put-many N` means
+                            // the wrapper regressed.
+                            let n_per_round = if batch_put > 0 {
+                                batch_put
+                            } else if put_many > 0 {
+                                put_many
+                            } else {
+                                0
+                            };
+                            let use_put_many = put_many > 0 && batch_put == 0;
+                            if n_per_round > 0 {
                                 while std::time::SystemTime::now() < *dl {
-                                    let keys: Vec<String> = (0..batch_put)
+                                    let keys: Vec<String> = (0..n_per_round)
                                         .map(|_| {
                                             let k = key_for_partition(sk, "pc", tid, seq);
                                             seq += 1;
@@ -1002,7 +1021,11 @@ async fn main() -> Result<()> {
                                         .map(|k| (k.as_bytes(), vz.clone()))
                                         .collect();
                                     let t0 = Instant::now();
-                                    let res = cref.batch_put(&items).await;
+                                    let res = if use_put_many {
+                                        cref.put_many(&items, depth).await
+                                    } else {
+                                        cref.batch_put(&items).await
+                                    };
                                     let el = t0.elapsed();
                                     let n_ok = res.iter().filter(|r| r.is_ok()).count();
                                     if n_ok > 0 {
