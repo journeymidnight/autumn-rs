@@ -191,6 +191,71 @@ Option 3 is what production kvcache adapters already do
 it only bites `perf-check --threads 1024` which is a synthetic
 "max threads on one client" shape.
 
+## Empirical test of Options 1 / 2: would they actually help?
+
+Decided not to build Options 1 or 2 yet — instead used the existing
+`--threads` × `--pipeline-depth` knobs as a proxy. Fewer threads at
+constant total inflight ≈ "what Option 1 would let you do without
+hitting the worker cliff." Same cluster (UCX, single-rail, p=16 ×
+shards=16, --3disk r=3), same warm-state, varying (t, d):
+
+| t    | d   | total inflight | workers | 4K write ops/s | 4K read ops/s |
+|------|-----|----------------|---------|----------------|---------------|
+| 1024 | 8   | 8 192          | 1 024   | **0**          | **0**         |
+| 128  | 8   | 1 024          | 128     | 1 509          | 286 099       |
+| 32   | 32  | 1 024          | 32      | 1 998          | 104 448       |
+| 16   | 64  | 1 024          | 16      | 2 387          | 224 031       |
+| 8    | 128 | 1 024          | 8       | **6 142**      | 56 120        |
+| 64   | 8   | 512            | 64      | 3 163          | 513 025       |
+| **16** | **8** | **128**    | **16**  | **4 984**      | **313 606**   |
+
+Two findings:
+
+1. **The t=1024 cliff is REAL.** 8 of those rows have ≈ 1 K active inflight
+   ops; the only one that goes to 0 is the one with 1 024 workers. Confirms
+   the architectural prediction — at ~65 K active QPs (1 024 workers × ~65
+   EPs) the NIC's active set saturates and `ucp_ep_create` hard-fails.
+
+2. **But the cluster's intrinsic 4K write ceiling sits BELOW where Options
+   1/2 would unlock workers.** At total inflight = 1 024 with N workers,
+   the row that gives the BEST write throughput (6 K, 8 workers / 128
+   pipeline) is still **65 % lower than the t=16 d=8 row (5 K) at only
+   128 total inflight**. Increasing inflight past the cluster's natural
+   batching limit (256-512 inflight ≈ partitions × batch cap) costs more
+   in queue / partition_loop contention than it gains in concurrency.
+
+The cluster's intrinsic 4K-write bottleneck is the **3-replica fanout +
+fsync coalescer + cross-host RTT serialisation**, NOT the UCX worker
+count. The "sweet spot" config (t=16 d=8) already saturates that
+bottleneck without paying the worker cost.
+
+### What Options 1 / 2 would actually buy
+
+* **Remove the t=1024 hard-fail** — turn 0 ops/s into ~5-6 K ops/s.
+  Useful for benchmarks that want to demonstrate a system can survive
+  large `--threads`, NOT for actually maximising throughput.
+* **Don't move the peak.** The peak at t=16 d=8 (~5 K write / 313 K read
+  in this session, ~15 K write / 854 K read in the earlier warmer
+  session) is set by the cluster, not by UCX worker count.
+* **Let one process replace many.** If a deployment can't or won't spawn
+  N processes (e.g. a single ML training driver with t=1024 inference
+  workers), Options 1 / 2 let one process scale to that t without
+  hitting the QP cliff.
+
+### Decision (2026-06-08)
+
+**Don't build Options 1 / 2.** The work cost (~200 lines + cancel-safety
+proof + cross-thread Waker plumbing for MODE_MULTI workers) doesn't pay
+off when the peak isn't moved. Document the cliff as a "use t ≤ 64
+shape" operator gotcha instead. Production kvcache adapters spawn
+per-tenant processes (sglang model — one sglang per node, multiple
+tenants → multiple processes), so this never bites them.
+
+Revisit only if a real workload needs single-process t ≥ 256
+concurrency AND can't be sharded into multiple processes — at which
+point Option 1 (shared `MODE_MULTI` worker pool of N=8-16, modulo
+across threads) is the targeted fix.
+
 ## Summary
 
 * **TCP 4K cross-host cliff** = adding a wire RTT on top of a
