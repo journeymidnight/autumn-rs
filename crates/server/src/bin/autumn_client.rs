@@ -684,19 +684,8 @@ async fn main() -> Result<()> {
         Command::PutZc { key, file } => {
             let value = std::fs::read(&file).with_context(|| format!("read file {file}"))?;
             let value = bytes::Bytes::from(value);
-            // Register the value's backing memory so the UCX send is zero-copy
-            // via rcache (ucx build). Hold the RegisteredMem until put_zc
-            // completes. On TCP / no-ucx this is a no-op.
-            #[cfg(feature = "ucx")]
-            let _reg = (!value.is_empty())
-                .then(|| {
-                    autumn_transport::register_memory(
-                        value.as_ptr() as *mut std::ffi::c_void,
-                        value.len(),
-                    )
-                })
-                .transpose()
-                .map_err(|e| anyhow!("put-zc register source: {e}"))?;
+            // UCX rcache auto-registers the value's backing memory on first
+            // send (one-time ~100 µs ibv_reg_mr); no SDK-level reg hook needed.
             client
                 .put_zc(key.as_bytes(), value)
                 .await
@@ -802,23 +791,9 @@ async fn main() -> Result<()> {
                 std::process::exit(2);
             }
             let mut dest = vec![0u8; meta.value_length as usize];
-            // Register dest for true UCX zero-copy receive (ucx build only).
-            #[cfg(feature = "ucx")]
-            let reg = (!dest.is_empty())
-                .then(|| {
-                    autumn_transport::register_memory(
-                        dest.as_mut_ptr() as *mut std::ffi::c_void,
-                        dest.len(),
-                    )
-                })
-                .transpose()
-                .map_err(|e| anyhow!("zc-get register dest: {e}"))?;
-            #[cfg(not(feature = "ucx"))]
-            let reg: Option<autumn_rpc::RegisteredMem> = None;
-            match client
-                .get_into(key.as_bytes(), &mut dest, reg.as_ref())
-                .await
-            {
+            // UCX rcache auto-registers `dest` on first recv (one-time
+            // ~100 µs ibv_reg_mr); no SDK-level reg hook needed.
+            match client.get_into(key.as_bytes(), &mut dest).await {
                 Ok(Some(n)) => {
                     use std::io::Write;
                     std::io::stdout().write_all(&dest[..n])?;
@@ -1154,7 +1129,6 @@ async fn main() -> Result<()> {
                                             offset: 0,
                                             length: 0,
                                             dest: b.as_mut_slice(),
-                                            reg: None,
                                         })
                                         .collect();
                                     let t0 = Instant::now();
@@ -1184,7 +1158,7 @@ async fn main() -> Result<()> {
                                     let t0 = Instant::now();
                                     let ok = if zc_read {
                                         let mut dest = vec![0u8; value_size];
-                                        cref.get_into(key.as_bytes(), &mut dest, None).await.is_ok()
+                                        cref.get_into(key.as_bytes(), &mut dest).await.is_ok()
                                     } else {
                                         cref.get(key.as_bytes()).await.is_ok()
                                     };

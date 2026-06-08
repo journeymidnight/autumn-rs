@@ -176,7 +176,6 @@ pub async fn execute(plan: ReadPlan) -> Result<Vec<u8>> {
             offset: c.offset,
             length: c.length,
             dest,
-            reg: None,
         })
         .collect();
     let results = client.get_many_into(&mut items).await;

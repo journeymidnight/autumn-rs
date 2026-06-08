@@ -821,7 +821,6 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, cap:
                     offset: 0,
                     length: 0,
                     dest: unsafe { std::slice::from_raw_parts_mut(it.ptr as *mut u8, it.len) },
-                    reg: None,
                 })
                 .collect();
             let _ = cap; // unused — SDK manages internal concurrency

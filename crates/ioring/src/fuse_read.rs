@@ -312,7 +312,6 @@ pub async fn read_into(
     off: u64,
     len: u32,
     dest: &mut [u8],
-    reg: Option<&autumn_rpc::RegisteredMem>,
 ) -> Result<usize> {
     let (actual, mut slices) = plan_read(opened, off, len);
     if actual == 0 {
@@ -346,7 +345,6 @@ pub async fn read_into(
             offset: sl.offset,
             length: sl.length,
             dest: d,
-            reg,
         })
         .collect();
     let results = cluster.get_many_into(&mut items).await;
@@ -373,7 +371,7 @@ pub async fn read(
         return Ok(Vec::new());
     }
     let mut buf = vec![0u8; actual];
-    read_into(cluster, opened, off, len, &mut buf, None).await?;
+    read_into(cluster, opened, off, len, &mut buf).await?;
     Ok(buf)
 }
 

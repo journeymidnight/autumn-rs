@@ -268,17 +268,23 @@ pub struct KeyMeta {
     pub value_length: u64,
 }
 
-/// F244: one item for [`ClusterClient::get_many_into`]. `length == 0` reads the
+/// One item for [`ClusterClient::get_many_into`]. `length == 0` reads the
 /// whole value; `offset`/`length` give a sub-range (fuse chunk reads, io_uring
 /// `sqe.offset`/`len`). `dest` is sized by the caller (e.g. from `head`, a fixed
-/// chunk size, or the ring-buffer slot) and MUST outlive the call. `reg = Some`
-/// (covering `dest`) → UCX RDMA into the registered dest.
+/// chunk size, or the ring-buffer slot) and MUST outlive the call.
+///
+/// UCX RDMA into `dest` is automatic: the first read into a fresh address
+/// pays a one-time UCX rcache miss (~100 µs `ibv_reg_mr`); subsequent reads
+/// into the SAME address hit the rcache for free. Power users who want to
+/// pre-warm the rcache (skip the first-call cost on a hot path) can call
+/// `autumn_transport::register_memory` directly — the registration lands in
+/// the same rcache and the SDK finds it transparently. No SDK-API hook
+/// needed.
 pub struct GetManyItem<'a> {
     pub key: &'a [u8],
     pub offset: u32,
     pub length: u32,
     pub dest: &'a mut [u8],
-    pub reg: Option<&'a autumn_rpc::RegisteredMem>,
 }
 
 // ── ClusterClient ───────────────────────────────────────────────────────────
@@ -1221,37 +1227,43 @@ impl ClusterClient {
         Ok(Some(resp.value))
     }
 
-    /// F216 zero-copy GET: read a key's value straight into `dest` (no
+    /// Zero-copy GET: read a key's value straight into `dest` (no
     /// intermediate Vec). Returns `Some(value_len)` (value written to
     /// `dest[..value_len]`) or `None` if not found. `dest` must be at least the
-    /// value size; pass `reg = Some(&RegisteredMem)` covering `dest` for UCX
-    /// zero-copy receive (RDMA into the registered dest), or `None` (TCP /
-    /// unregistered → one copy off the wire). Uses MSG_GET_ZC +
-    /// `RpcClient::call_into_dest`; same routing + epoch-stale refresh + RPC
-    /// retry shape as `call_ps_for_key`.
+    /// value size.
+    ///
+    /// On UCX, the first call into a fresh `dest` address pays a one-time
+    /// rcache miss (`~100 µs ibv_reg_mr`); subsequent calls into the SAME
+    /// address hit the rcache for free — so any pool / long-lived buffer is
+    /// effectively zero-copy from the second call onward. Power users who
+    /// want to skip the first-call cost on a hot path can call
+    /// `autumn_transport::register_memory` directly to pre-populate the
+    /// rcache; the SDK finds the registration transparently. On TCP the
+    /// kernel copy off the wire is the lower bound regardless.
+    ///
+    /// Uses `MSG_GET_ZC` + `RpcClient::call_into_dest`; same routing +
+    /// epoch-stale refresh + RPC retry shape as `call_ps_for_key`.
     pub async fn get_into(
         &self,
         key: &[u8],
         dest: &mut [u8],
-        reg: Option<&autumn_rpc::RegisteredMem>,
     ) -> std::result::Result<Option<usize>, AutumnError> {
-        self.get_range_into(key, 0, 0, dest, reg).await
+        self.get_range_into(key, 0, 0, dest).await
     }
 
-    /// F244: sub-range variant of [`get_into`] — reads bytes `[offset, offset+length)`
+    /// Sub-range variant of [`get_into`] — reads bytes `[offset, offset+length)`
     /// (`length == 0` = whole value) straight into `dest` via `MSG_GET_ZC`.
-    /// `get_into(key, dest, reg)` is exactly `get_range_into(key, 0, 0, dest, reg)`.
+    /// `get_into(key, dest)` is exactly `get_range_into(key, 0, 0, dest)`.
     /// Same routing + epoch-stale refresh + RPC retry shape as `call_ps_for_key`;
     /// same cancel-safety contract (`dest` must outlive the call; no per-call
-    /// timeout). Used by `get_many_into` (and by sub-range callers — fuse / ioring
-    /// — that route per key).
+    /// timeout). Used by `get_many_into` and by sub-range callers (fuse /
+    /// ioring) that route per key.
     pub async fn get_range_into(
         &self,
         key: &[u8],
         offset: u32,
         length: u32,
         dest: &mut [u8],
-        reg: Option<&autumn_rpc::RegisteredMem>,
     ) -> std::result::Result<Option<usize>, AutumnError> {
         let key = key.to_vec();
         let mut attempt: u32 = 0;
@@ -1277,7 +1289,7 @@ impl ClusterClient {
                             payload,
                             dest.as_mut_ptr(),
                             dest.len(),
-                            reg,
+                            None,
                         )
                         .await
                     {
@@ -1371,12 +1383,11 @@ impl ClusterClient {
             let key: &[u8] = it.key;
             let offset = it.offset;
             let length = it.length;
-            let reg: Option<&autumn_rpc::RegisteredMem> = it.reg;
             let dest: &mut [u8] = &mut *it.dest;
             async move {
                 let read_len = if length > 0 { length as usize } else { dest.len() };
                 if zc_worthwhile(read_len) {
-                    self.get_range_into(key, offset, length, dest, reg).await
+                    self.get_range_into(key, offset, length, dest).await
                 } else {
                     match self.get_range(key, offset, length).await {
                         Ok(Some(v)) => {

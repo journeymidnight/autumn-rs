@@ -917,8 +917,10 @@ async fn service_sqe(
                     sqe.length as usize,
                 )
             };
-            let n = match fuse_read::read_into(cluster, &opened, sqe.offset, sqe.length, dest, reg)
-                .await
+            // UCX rcache finds the daemon-side pre-registered ring buffer
+            // via `register_ring`; no need to thread `reg` through.
+            let _ = reg;
+            let n = match fuse_read::read_into(cluster, &opened, sqe.offset, sqe.length, dest).await
             {
                 Ok(n) => n,
                 Err(_) => return Cqe::err(sqe.user_data, libc::EIO),

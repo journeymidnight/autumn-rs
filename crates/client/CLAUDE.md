@@ -14,15 +14,22 @@ Main entry point. Connect via `ClusterClient::connect("addr1,addr2")`.
 - `put(key, value, must_sync)` — write a key-value pair
 - `put_with_ttl(key, value, must_sync, ttl_secs)` — write with TTL (seconds)
 - `get(key) → Option<Vec<u8>>` — read, returns None if not found
-- `get_into(key, dest: &mut [u8], reg: Option<&autumn_rpc::RegisteredMem>) → Option<usize>` —
-  **F216-E zero-copy read.** Reads the value straight into `dest` (no Vec) via
+- `get_into(key, dest: &mut [u8]) → Option<usize>` —
+  **zero-copy read.** Reads the value straight into `dest` (no Vec) via
   `MSG_GET_ZC` + `RpcClient::call_into_dest`; returns `Some(value_len)`
-  (`dest[..value_len]` filled) or `None` if not found. `reg=Some(&RegisteredMem)`
-  covering `dest` → UCX RDMA into the registered dest (zero-copy); `None` → one
-  copy off the wire (TCP / unregistered). Same routing + epoch-stale refresh +
-  RPC-retry shape as `call_ps_for_key`. Caller sizes `dest` (e.g. from `head`).
-  No per-call timeout — `dest` MUST outlive the call (cancel-safety, see
-  autumn-rpc CLAUDE `call_into_dest`).
+  (`dest[..value_len]` filled) or `None` if not found. Caller sizes `dest`
+  (e.g. from `head`). Same routing + epoch-stale refresh + RPC-retry shape
+  as `call_ps_for_key`. No per-call timeout — `dest` MUST outlive the call
+  (cancel-safety, see autumn-rpc CLAUDE `call_into_dest`).
+  On UCX, the first call into a fresh `dest` address pays a one-time
+  rcache miss (`~100 µs ibv_reg_mr`); subsequent calls into the SAME
+  address hit the rcache for free, so any pool / long-lived buffer is
+  effectively zero-copy from the second call onward. There is no
+  `reg: Option<&RegisteredMem>` argument — the UCX rcache handles
+  registration transparently. Power users who want to skip the first-call
+  cost on a hot path can call `autumn_transport::register_memory` directly
+  to pre-populate the rcache; the SDK finds the registration without any
+  SDK-API hook.
 - `put_zc(key, value: Bytes)` — **F216-E zero-copy write.** Writes the value with
   NO client-side copy via `MSG_PUT_ZC` + `RpcClient::call_vectored` (value sent as
   its own iovec straight from `value`'s backing memory; on UCX zero-copy via
@@ -55,16 +62,18 @@ Main entry point. Connect via `ClusterClient::connect("addr1,addr2")`.
   `get_many_into`'s small path (both pay one rkyv decode-copy).
 - `get_many_into(items: &mut [GetManyItem]) → Vec<Result<Option<usize>>>` —
   **the ZC batched-read API.** Use when values are ≥ 64 KiB AND you
-  have caller-owned dest buffers (especially `RegisteredMem` for UCX
-  RDMA into sglang pages / torch tensors — true end-to-end zero-copy).
-  Each `GetManyItem` carries `{key, offset, length, dest, reg}`. SDK
-  auto-routes:
+  have caller-owned dest buffers (e.g. sglang pages / torch tensors —
+  UCX RDMA into the dest is true end-to-end zero-copy from the
+  second call onward; the first call into a fresh address pays the
+  one-time rcache miss). Each `GetManyItem` carries
+  `{key, offset, length, dest}` — no `reg` field; UCX rcache handles
+  registration. SDK auto-routes:
   - HOMOGENEOUS small whole-value batch (every item: `offset == 0`,
     `length == 0`, `dest.len() < 64 KiB`) → delegates to `get_many`
     + memcpys each result into its `dest` (read p99 4× lower than
     per-op fan-out on loopback).
   - MIXED / range / large-ZC → per-op fan-out: `MSG_GET_ZC` into
-    `dest` (with optional `RegisteredMem` → RDMA on UCX) for
+    `dest` (UCX RDMA when the dest is in the rcache) for
     `read_len ≥ 64 KiB`; else `MSG_GET` + memcpy. NO `concurrency`
     arg — sensible internal default applied.
   Result `i` matches `items[i]`. Each `dest` MUST outlive the call.

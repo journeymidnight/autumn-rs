@@ -311,14 +311,12 @@ fn f235_get_many_into_mixed_sizes() {
                     offset: 0,
                     length: 0,
                     dest: &mut d_small[..],
-                    reg: None,
                 },
                 GetManyItem {
                     key: b"k-large",
                     offset: 0,
                     length: 0,
                     dest: &mut d_large[..],
-                    reg: None,
                 },
             ];
             let results = cluster.get_many_into(&mut items).await;
@@ -337,7 +335,6 @@ fn f235_get_many_into_mixed_sizes() {
                 offset: 1024,
                 length: 4096,
                 dest: &mut d_sub[..],
-                reg: None,
             }];
             let r = cluster.get_many_into(&mut sub).await;
             assert_eq!(r[0].as_ref().unwrap(), &Some(4096));
@@ -353,7 +350,6 @@ fn f235_get_many_into_mixed_sizes() {
                 offset: 0,
                 length: 0,
                 dest: &mut d_miss[..],
-                reg: None,
             }];
             let r = cluster.get_many_into(&mut miss).await;
             assert_eq!(r[0].as_ref().unwrap(), &None);
