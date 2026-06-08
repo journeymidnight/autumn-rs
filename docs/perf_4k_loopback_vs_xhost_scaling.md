@@ -293,3 +293,96 @@ side, lets one frame carry N ops). With that, even at 1-op-per-second
 arrival from each client thread, the server sees N×t arrivals per
 frame → full batch amortization with zero added latency. This is the
 ~200-line implementation hinted at above.
+
+## Tested put_many in perf-check (2026-06-08, commit `151e3f7`)
+
+Added `--batch-put N` flag to perf-check. When `N > 0`, the write loop
+builds batches of N (key, value) per round and submits via
+`put_many(items, concurrency=N)` instead of per-op `kv_put`. The
+hypothesis was: even though `put_many` is client-side fan-out (no
+server `MSG_BATCH_PUT`), the autumn-rpc `writer_task`'s tcp_sendmsg
+coalescing should let one TCP segment carry N frames →
+PS-conn `read_loop` decodes N → injects N pending into
+`partition_loop` → server batch_size grows.
+
+x-host TCP, p=16 × shards=16, 4K writes:
+
+| config                          | ops/s | p50      | server avg batch_size |
+|---------------------------------|-------|----------|-----------------------|
+| t=16 d=8 baseline               | 3 270 | 31.93 ms | ~14                   |
+| t=16 d=1 --batch-put=32         | 4 821 |  3.30 ms | ~2.2                  |
+| t=16 d=1 --batch-put=64         | 5 209 |  2.98 ms | ~2.2                  |
+| t=16 d=1 --batch-put=128        | 5 263 |  2.93 ms | ~2.2                  |
+| t=64 d=1 --batch-put=32         | 7 130 |  8.79 ms | ~6.5                  |
+| t=64 d=1 --batch-put=64         | 7 050 |  8.28 ms | ~6.5                  |
+| t=128 d=1 --batch-put=32        | 6 507 | 18.66 ms | ~6.5                  |
+| **t=128 d=1 --batch-put=64**    | **7 913** | **13.47 ms** | **~6.5**          |
+| t=64 d=8 --batch-put=8 (combo)  | 3 444 | 17 ms    | (worse — no win)      |
+
+Best: **t=128 d=1 --batch-put=64 → 7 913 ops/s** vs baseline t=128 d=8
+→ 5 796 ops/s. **+37 % throughput, p50 13 ms vs 174 ms (13× lower)**.
+
+Best latency: **t=16 d=1 --batch-put=128 → p50 2.93 ms** vs baseline
+31.93 ms. **11× lower per-op latency.**
+
+### The result is surprising
+
+`avg_batch_size` actually SHRANK from 14 (baseline) to 2-6 (with
+`put_many`). Yet throughput went UP. So my "batch_size is the
+bottleneck" diagnosis was incomplete — the actual mechanism is more
+subtle.
+
+Hypothesis: with `put_many`, the client thread submits N futures
+through `buffer_unordered` in ONE shot. The autumn-rpc `writer_task`
+coalesces them into ONE `write_vectored`. Server read_loop decodes
+them in a tight burst and forwards to partition_loop's mpsc. BUT —
+partition_loop processes its mpsc message-by-message and may fire a
+new batch on each message (when `n_inflight < cap=8` and `pending > 0`).
+So instead of accumulating N pending → ONE big batch, we get N small
+batches IN PARALLEL up to the inflight cap.
+
+That parallelism is the win: pre-`put_many`, `n_inflight` stayed at
+1 most of the time (single-batch mode, sparse arrival). Post-
+`put_many`, `n_inflight` actually USES the 8-batch cap because
+arrival is bursty enough to fill it before the first batch finishes.
+
+So the fix isn't "make each batch bigger", it's "make ENOUGH batches
+fire concurrently to actually exercise INFLIGHT_CAP". `put_many`
+accidentally achieves that via burst submission.
+
+Why keys spreading across partitions doesn't kill it: even though a
+32-key `put_many` from one thread distributes ~2 keys per partition,
+ALL 16 partitions get hit in the same burst, so each partition_loop
+sees 2 ops simultaneously instead of 1 — enough to bump `n_inflight`
+up by one per partition per round.
+
+### Why the per-batch summary still says ~6.5 (smaller than baseline's 14)
+
+When 8 concurrent batches fire each with ~6.5 ops, throughput per
+partition = 8 × 6.5 / phase2_ms = 52 / 25ms = 2080 ops/s/partition.
+Times 16 = 33 K ops/s theoretical. We see 7.9 K = 24 % of theoretical —
+some EN-side serialization eating the rest.
+
+Pre-`put_many`: 1 batch × 14 ops / 25ms = 560 ops/s/partition × 16 =
+9 K theoretical, 5.8 K observed = 64 % of theoretical. **The baseline
+was more "efficient per batch" but used fewer concurrent batches**.
+`put_many` uses MORE batches at LOWER per-batch efficiency for a net
++37 % win.
+
+### Verdict and recommendation
+
+* `--batch-put 32-64` is a real cross-host win at moderate cost
+  (slightly higher tail latency at high t, but much lower p50 at any t).
+* Doesn't reach loopback's 50 K ops/s — server-side concurrency cap
+  is still the wall. To go higher needs real `MSG_BATCH_PUT`
+  (server-side decode of N ops in one frame → ONE big batch fires
+  immediately) which would let partition_loop hit full 256-cap
+  batches.
+* Production kvcache workloads already issue many keys per call, so
+  they're getting `put_many`-equivalent behavior already. The 5.8 K
+  ceiling was a perf-check synthetic artifact.
+
+**Engineering takeaway**: the `partition_loop` `n_inflight` cap of 8
+is the new ceiling once `put_many` unblocks burst submission. Raising
+`AUTUMN_PS_INFLIGHT_CAP` from 8 → 16/32 with `put_many` would
+likely lift this further (untested).
