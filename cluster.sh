@@ -492,6 +492,9 @@ launch_ps() {
     if [[ -n "${AUTUMN_PS_MIN_BATCH:-}" ]]; then
         tunable_args+=(--min-pipeline-batch "$AUTUMN_PS_MIN_BATCH")
     fi
+    if [[ -n "${AUTUMN_READ_HEDGE_MS:-}" ]]; then
+        tunable_args+=(--read-hedge-ms "$AUTUMN_READ_HEDGE_MS")
+    fi
     if [[ -n "${AUTUMN_PS_GC_READ_CHUNK_BYTES:-}" ]]; then
         tunable_args+=(--gc-read-chunk-bytes "$AUTUMN_PS_GC_READ_CHUNK_BYTES")
     fi

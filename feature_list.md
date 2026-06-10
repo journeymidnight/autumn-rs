@@ -4556,7 +4556,23 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   p95 量级固定值或禁用 hedge 仅轮转）。
 - **验收**：单测覆盖轮转选择与 hedge 取最快/取消慢者；perf-check 8M 读不回归
   且多副本盘 IO 分布可观测（iostat 或读计数）；4K 读不回归；chaos 读路径过。
-- **passes:** not_completed (planned)
+- **实现（2026-06-10）**：`rotated_replica_start`（SplitMix64 finalizer，纯函数
+  +3 单测）+ `read_replicated_with_failover` 轮转起点（仅 `ex.sealed`；失败
+  failover 沿轮转序走完）+ `read_hedged_pair`（select 计时器→并发第二副本取
+  最快，eversion-stale 各臂 fail-fast，输家 future drop 取消安全）。配置：
+  `autumn_stream::set_read_hedge_ms`，`autumn-ps --read-hedge-ms`，cluster.sh
+  `AUTUMN_READ_HEDGE_MS`，默认 0=仅轮转。
+- **验证**：stream 70 单测过；TCP 3disk p8：默认腿 8M 读 433.8 ops/s（committed
+  基线 384 的 113%）、4K 写 64.8K（103% 基线）读 1.18M——无回归；hedge=50ms 腿
+  （AUTUMN_READ_HEDGE_MS=50，旗标在 PS 命令行确认生效）：首版实现实测
+  8M 读 570.2（比仅轮转 +31%，p50 353→151ms，当时盘噪较大）；coco P1 后
+  改为 detach 任务实现复跑 446.3 ops/s、p99 829ms（三轮最低）——收益随
+  盘噪波动，无回归（committed 基线 384 的 116%）。coco P1（裸 drop 输家
+  future 会在 RpcClient.pending 留 req_id、绕过 timeout-evict，病态 EN 下
+  无限累积）已实修：两路读均为 detach 任务跑到完成，oneshot 赛结果；
+  P3（--help 缺文案）已补。chaos 读路径（系统级）
+  留待下次全量 chaos 周期覆盖。
+- **passes:** completed (2026-06-10)
 
 ### F259 · VP 大值 client 直读 EN（3FS/Crail 元数据-数据分离）
 - **目标**：kvcache get 已定性 data-movement bound；大值（VP）读现状是

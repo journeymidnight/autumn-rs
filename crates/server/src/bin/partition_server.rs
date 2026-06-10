@@ -63,6 +63,8 @@ struct Args {
     gc_cooldown_secs: Option<i64>,
     compact_cooldown_secs: Option<i64>,
     min_pipeline_batch: Option<usize>,
+    /// F258: hedge delay (ms) for replicated sealed-extent reads. None/0 = off.
+    read_hedge_ms: Option<u64>,
     gc_read_chunk_bytes: Option<u32>,
     gc_batch_records: Option<usize>,
     gc_batch_bytes: Option<usize>,
@@ -119,6 +121,7 @@ fn parse_args() -> Args {
     let mut gc_cooldown_secs: Option<i64> = None;
     let mut compact_cooldown_secs: Option<i64> = None;
     let mut min_pipeline_batch: Option<usize> = None;
+    let mut read_hedge_ms: Option<u64> = None;
     let mut gc_read_chunk_bytes: Option<u32> = None;
     let mut gc_batch_records: Option<usize> = None;
     let mut gc_batch_bytes: Option<usize> = None;
@@ -294,6 +297,12 @@ fn parse_args() -> Args {
                 i += 1;
                 min_pipeline_batch = Some(args[i].parse().expect("--min-pipeline-batch usize"));
             }
+            "--read-hedge-ms" => {
+                // F258: hedge delay for replicated sealed-extent reads.
+                // 0 (default) = hedging off; replica rotation always on.
+                i += 1;
+                read_hedge_ms = Some(args[i].parse().expect("--read-hedge-ms u64"));
+            }
             "--gc-read-chunk-bytes" => {
                 i += 1;
                 gc_read_chunk_bytes = Some(args[i].parse().expect("--gc-read-chunk-bytes u32"));
@@ -353,6 +362,9 @@ fn parse_args() -> Args {
                 eprintln!("  --advertise <ADDR>   Advertise host for cluster discovery");
                 eprintln!("                       (F099-K: the `host:port` base — port comes from --port)");
                 eprintln!("  --transport <MODE>   Transport backend: tcp (default) or ucx");
+                eprintln!("  --read-hedge-ms <MS> F258: hedge delay for replicated sealed-extent");
+                eprintln!("                       reads; 0/default = hedging off (replica");
+                eprintln!("                       rotation is always on)");
                 eprintln!(
                     "  --cpu-start <N>      First core to pin partition threads to [default: 0]"
                 );
@@ -420,6 +432,7 @@ fn parse_args() -> Args {
         gc_cooldown_secs,
         compact_cooldown_secs,
         min_pipeline_batch,
+        read_hedge_ms,
         gc_read_chunk_bytes,
         gc_batch_records,
         gc_batch_bytes,
@@ -499,6 +512,9 @@ fn apply_ps_tunables(args: &Args) {
     }
     if let Some(n) = args.compact_cooldown_secs {
         ps::set_compact_cooldown_secs(n);
+    }
+    if let Some(n) = args.read_hedge_ms {
+        autumn_stream::set_read_hedge_ms(n);
     }
     if let Some(n) = args.min_pipeline_batch {
         eprintln!(

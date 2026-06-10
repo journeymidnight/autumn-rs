@@ -76,6 +76,40 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::channel::{mpsc, oneshot};
 use futures::future::join_all;
+
+// ── F258: replicated-read spreading + hedging ──────────────────────────
+
+/// F258 (b): hedge delay (ms) for replicated sealed-extent reads. 0
+/// (default) = hedging disabled; rotation (F258 (a)) still applies. Set
+/// once at process start from a CLI flag (`autumn-ps --read-hedge-ms`,
+/// translated from `AUTUMN_READ_HEDGE_MS` by cluster.sh) — no env reads
+/// in library code per the F195 discipline.
+static READ_HEDGE_MS_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+pub fn set_read_hedge_ms(ms: u64) -> bool {
+    READ_HEDGE_MS_CELL.set(ms).is_ok()
+}
+
+pub(crate) fn read_hedge_ms() -> u64 {
+    *READ_HEDGE_MS_CELL.get_or_init(|| 0)
+}
+
+/// F258 (a): deterministic start-replica rotation for sealed-extent reads.
+/// SplitMix64 finalizer over `(extent_id, offset)` — no extra deps, cheap,
+/// and well-mixed so consecutive chunk offsets of one large read stripe
+/// across replicas instead of clustering.
+pub(crate) fn rotated_replica_start(extent_id: u64, offset: u32, n: usize) -> usize {
+    if n <= 1 {
+        return 0;
+    }
+    let mut x = extent_id ^ ((offset as u64) << 32) ^ 0x9e37_79b9_7f4a_7c15;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    (x % n as u64) as usize
+}
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, SinkExt, StreamExt};
 
@@ -2630,6 +2664,22 @@ impl StreamClient {
     /// once for the whole extent during EC conversion), so iterating
     /// the remaining addresses just burns 3s timeouts each. Top-level
     /// `read_bytes_from_extent` catches this and refetches.
+    ///
+    /// F258 (a) — rotated start replica. Pre-F258 every read walked
+    /// `addrs` from index 0, so ALL replicated read IO landed on
+    /// replica[0] while the other two replicas' disks + NICs idled.
+    /// For SEALED extents (immutable; all-replica-ACK means every
+    /// committed byte is on every replica) the start index is rotated
+    /// by `(extent_id, offset)` hash — consecutive chunks of the
+    /// chunked large-read path naturally stripe across replicas.
+    /// Open-tail reads keep the legacy replica[0]-first order.
+    ///
+    /// F258 (b) — optional hedged read (off by default;
+    /// `set_read_hedge_ms`). When enabled and the rotated-first replica
+    /// hasn't answered within the hedge window, the SECOND replica is
+    /// raced concurrently and the first Ok wins — classic "Tail at
+    /// Scale" tail-latency repair. Both-fail falls back to the
+    /// remaining replicas in rotated order (same failover semantics).
     async fn read_replicated_with_failover(
         &self,
         ex: &ExtentInfo,
@@ -2637,8 +2687,31 @@ impl StreamClient {
         length: u32,
     ) -> Result<(Vec<u8>, u32)> {
         let addrs = self.replica_addrs_for_extent(ex).await?;
+        let n = addrs.len();
         let mut last_err = anyhow!("no replicas for extent {}", ex.extent_id);
-        for addr in &addrs {
+        let start = if ex.sealed {
+            rotated_replica_start(ex.extent_id, offset, n)
+        } else {
+            0
+        };
+
+        let mut from = 0usize;
+        if read_hedge_ms() > 0 && ex.sealed && n > 1 {
+            match self.read_hedged_pair(&addrs, start, ex, offset, length).await {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    if is_eversion_stale(&e) {
+                        return Err(e);
+                    }
+                    last_err = e;
+                    self.extent_info_cache.remove(&ex.extent_id);
+                }
+            }
+            from = 2; // hedge already consumed rotated replicas 0 and 1
+        }
+
+        for i in from..n {
+            let addr = &addrs[(start + i) % n];
             match self
                 .read_shard_from_addr(addr, ex.extent_id, ex.eversion, offset, length)
                 .await
@@ -2654,6 +2727,102 @@ impl StreamClient {
             }
         }
         Err(last_err)
+    }
+
+    /// F258 (b): hedged read over the first two rotated replicas. Fires the
+    /// read to `addrs[start]`; if no answer within `read_hedge_ms()`, races
+    /// a second read to `addrs[start+1]` and returns whichever succeeds
+    /// first.
+    ///
+    /// Both reads run as DETACHED tasks that always run to completion (coco
+    /// P1 on the first draft): dropping an in-flight `call_timeout` future
+    /// would strand its req_id in `RpcClient.pending` — there is no
+    /// drop-guard removal, and the bare drop also skips the timeout-evict
+    /// path — so a connected-but-unresponsive EN would accumulate pending
+    /// entries forever. Detached tasks let the LOSER finish on its own
+    /// (bounded by its rpc timeout, which evicts on expiry); results come
+    /// back over oneshots, and a dropped oneshot receiver is harmless.
+    /// Eversion-stale fails fast on every arm (same rationale as failover).
+    async fn read_hedged_pair(
+        &self,
+        addrs: &[String],
+        start: usize,
+        ex: &ExtentInfo,
+        offset: u32,
+        length: u32,
+    ) -> Result<(Vec<u8>, u32)> {
+        use futures::future::{select, Either};
+        let n = addrs.len();
+        let a0 = addrs[start % n].clone();
+        let a1 = addrs[(start + 1) % n].clone();
+        let Some(sc) = self.self_weak.upgrade() else {
+            // Client is shutting down — plain single read, no hedge.
+            return self
+                .read_shard_from_addr(&a0, ex.extent_id, ex.eversion, offset, length)
+                .await;
+        };
+        let (eid, ev) = (ex.extent_id, ex.eversion);
+        let spawn_read = |sc: Rc<StreamClient>, addr: String| {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            compio::runtime::spawn(async move {
+                let _ = tx.send(
+                    sc.read_shard_from_addr(&addr, eid, ev, offset, length)
+                        .await,
+                );
+            })
+            .detach();
+            rx
+        };
+
+        let rx0 = spawn_read(sc.clone(), a0);
+        futures::pin_mut!(rx0);
+        let timer = compio::time::sleep(Duration::from_millis(read_hedge_ms()));
+        futures::pin_mut!(timer);
+
+        let rx0 = match select(rx0, timer).await {
+            Either::Left((res, _timer)) => {
+                return match flatten_hedge(res) {
+                    Ok(r) => Ok(r),
+                    Err(e) => {
+                        if is_eversion_stale(&e) {
+                            return Err(e);
+                        }
+                        self.extent_info_cache.remove(&ex.extent_id);
+                        // First failed before the hedge window: sequential
+                        // second read (no point hedging a known failure).
+                        flatten_hedge(spawn_read(sc, a1).await)
+                    }
+                };
+            }
+            Either::Right(((), rx0)) => rx0,
+        };
+
+        // Hedge window elapsed: race first vs second, first Ok wins. The
+        // loser keeps running detached and cleans up via its own timeout.
+        let rx1 = spawn_read(sc, a1);
+        futures::pin_mut!(rx1);
+        match select(rx0, rx1).await {
+            Either::Left((res0, rx1_pending)) => match flatten_hedge(res0) {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    if is_eversion_stale(&e) {
+                        return Err(e);
+                    }
+                    self.extent_info_cache.remove(&ex.extent_id);
+                    flatten_hedge(rx1_pending.await)
+                }
+            },
+            Either::Right((res1, rx0_pending)) => match flatten_hedge(res1) {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    if is_eversion_stale(&e) {
+                        return Err(e);
+                    }
+                    self.extent_info_cache.remove(&ex.extent_id);
+                    flatten_hedge(rx0_pending.await)
+                }
+            },
+        }
     }
 
     /// Query commit_length on each replica, return the minimum (the
@@ -3681,5 +3850,64 @@ mod ec_slice_tests {
         let out = ec_slice_decoded(payload, 0, 0, TEST_EXTENT, 200).expect("full read");
         assert_eq!(out.as_ptr(), in_ptr, "full-read must NOT memcpy");
         assert_eq!(out.capacity(), in_cap, "capacity preserved → no realloc");
+    }
+}
+
+#[cfg(test)]
+mod f258_rotation_tests {
+    use super::rotated_replica_start;
+
+    #[test]
+    fn deterministic_and_in_range() {
+        for eid in [1u64, 42, 7_000_000] {
+            for off in [0u32, 4096, 64 << 20] {
+                for n in [1usize, 2, 3, 5] {
+                    let a = rotated_replica_start(eid, off, n);
+                    let b = rotated_replica_start(eid, off, n);
+                    assert_eq!(a, b, "deterministic");
+                    assert!(a < n, "in range: {a} < {n}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn n1_always_zero() {
+        assert_eq!(rotated_replica_start(99, 12345, 1), 0);
+        assert_eq!(rotated_replica_start(99, 12345, 0), 0);
+    }
+
+    #[test]
+    fn spreads_across_replicas() {
+        // Consecutive 64 MiB chunk offsets of one large extent must not all
+        // land on the same start replica, and across many extents the
+        // distribution must cover every replica.
+        let n = 3usize;
+        let mut seen = [0usize; 3];
+        for eid in 0..32u64 {
+            for chunk in 0..8u32 {
+                seen[rotated_replica_start(eid, chunk * (64 << 20), n)] += 1;
+            }
+        }
+        let total: usize = seen.iter().sum();
+        assert_eq!(total, 32 * 8);
+        for (i, &c) in seen.iter().enumerate() {
+            assert!(
+                c > total / 6,
+                "replica {i} underused: {c}/{total} (want roughly even spread)"
+            );
+        }
+    }
+}
+
+/// F258: unwrap a hedged-read oneshot result. `Canceled` means the spawned
+/// read task was dropped before sending (runtime teardown) — surfaced as a
+/// plain error so the failover loop continues.
+fn flatten_hedge(
+    res: std::result::Result<Result<(Vec<u8>, u32)>, futures::channel::oneshot::Canceled>,
+) -> Result<(Vec<u8>, u32)> {
+    match res {
+        Ok(r) => r,
+        Err(_) => Err(anyhow!("hedged read task canceled before completion")),
     }
 }
