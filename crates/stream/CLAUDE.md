@@ -673,6 +673,8 @@ sufficient (and cheaper than DashMap).
 | `append_batch(stream_id, blocks[], must_sync)` | Concatenate multiple blocks, single append |
 | `append_batch_repeated(stream_id, block, count, must_sync)` | Repeat one block N times |
 | `read_bytes_from_extent(extent_id, offset, length)` | Read from extent; replication (F258): SEALED extents rotate the start replica by `(extent_id, offset)` hash so read IO spreads across all replicas (pre-F258 everything hit replica[0]); open-tail keeps replica[0]-first; failover walks the remaining replicas in rotated order. Optional hedged read (`set_read_hedge_ms`, default 0=off, `autumn-ps --read-hedge-ms` / cluster.sh `AUTUMN_READ_HEDGE_MS`): if the first replica hasn't answered within the window, race the second and take the first Ok (eversion-stale still fails fast; loser future drop is cancel-safe). **chunked at `AUTUMN_STREAM_READ_CHUNK_BYTES` (default 256 MiB)** so reads >2 GiB don't trip the per-syscall pread ceiling on macOS (INT_MAX) / Linux (0x7ffff000); EC: parallel shard reads with decode (per-shard size already bounded). `length=0` resolves to-end via `sealed_length` (sealed extents) or `commit_length_for_extent` (open extents) before chunking. |
+| `extent_read_descriptor(extent_id)` | F259: `(eversion, replica addrs)` for a client direct read; REFUSES EC-converted extents (shard bytes ≠ value) |
+| `read_extent_value_direct(pool, addr, …)` (free fn) | F259: one-shot ZC EN read for MSG_GET_REDIRECT holders (MSG_READ_BYTES_ZC + call_into_pooled; short read = Err) |
 | `read_last_extent_data(stream_id)` | Read last non-empty extent of a stream |
 | `punch_holes(stream_id, extent_ids[])` | GC: remove extents from stream |
 | `truncate(stream_id, extent_id)` | Remove all extents before extent_id |

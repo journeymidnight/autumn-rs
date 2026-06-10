@@ -465,6 +465,31 @@ Get(key, part_id):
        else → return raw value
 ```
 
+### F259 — large-VP client direct-read (MSG_GET_REDIRECT)
+
+`handle_get_redirect` (rpc_handlers.rs): a FULL-value read of a VP whose
+`vp.len >= 64 KiB` answers with a descriptor — `GetRedirectResp { extent_id,
+value_offset, value_len, eversion, replica_addrs }` — instead of resolving
+the bytes through this PS; the client (`ClusterClient::get_direct`) reads
+the range straight from an EN (`autumn_stream::read_extent_value_direct`,
+MSG_READ_BYTES_ZC zero-copy) and falls back to the proxy `get` on ANY
+failure. Invariants:
+- The GC writer-pin check (F162) runs BEFORE the redirect decision — an
+  extent being punched surfaces NotFound exactly like the proxy path. The
+  client's read window is deliberately unprotected: a GC punch in the gap
+  is a failed EN read → proxy fallback (extents unlink whole + eversion
+  fence ⇒ never a torn read).
+- EC-converted extents NEVER get a descriptor
+  (`StreamClient::extent_read_descriptor` refuses; shard bytes ≠ value) —
+  handle_get_redirect falls back to `handle_get`.
+- Short reads under CODE_OK are FAILURES in `read_extent_value_direct`
+  (same "got < need" rule as `read_value_from_log`).
+- Sub-range reads, inline values, small VPs: inline in the response
+  (`extent_id == 0`); `get_value` (non-redirect callers) never yields
+  `GetOutcome::Redirect`.
+Loopback perf: latency win only (TCP 8M read p50 145→46ms, UCX 137→15ms);
+the throughput win is cross-host where PS NIC egress leaves the data path.
+
 ### F216-E — UCX end-to-end zero-copy read (MSG_GET_ZC)
 
 The kvcache SDK's `get_into` issues `MSG_GET_ZC` so the value lands in its
