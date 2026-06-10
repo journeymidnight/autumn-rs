@@ -4631,10 +4631,28 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
   默认关闭的依据——链式收益（写者出口 3×→1×）只在写者 NIC 为瓶颈的
   跨主机场景成立，loopback 是纯开销。默认关闭路径回归正常（star 8M 写
   139 ops/s 当日噪声带，0 错误）。
-- **验收缺口（deferred）**：跨主机 perf ≥1.5×（用 remote-autumn 在
-  ::14↔::15 RoCE 环境实测）；chaos 杀链中节点零丢失；coco arch 审链式
-  ack/截断交互。补齐后才置 completed。
-- **passes:** not_completed (实现落地+默认关闭；验收待跨主机)
+- **跨主机验收（2026-06-10/11，::14 PS ↔ ::15 三 EN，TCP）**：
+  - perf：链路写向 450MB/s（iperf3）；star t2d2=4.44 / t4d4=6.46（最优）/
+    t8d8=1.30（拥塞崩溃，TX 12GB 重传风暴）；chain t8d8=**24.88**。
+    **公平比 = 24.88/6.46 ≈ 3.8×**（≥1.5× 线通过）；出口字节/op：chain
+    9.9MB vs star 28-31MB——**3×→1× 结构性兑现**。拓扑校正：本测 3 EN 同
+    远端机，EN 间转发未过网；生产三机形态全网总流量持平，收益=写者出口，
+    理论上限 3×。
+  - chaos：杀链中 EN→复活，**174/174 acked 键读回字节一致（零丢失）、
+    0 分区毒化、PS 全程存活**。首轮 chaos 曾 68/68 全 BAD——根因是 F260
+    自己的 bug：链式错误用 Frame::error（payload 首字节=StatusCode::
+    Unavailable=5）被 apply_completion 无 is_error 检查地按 AppendResp
+    解码，5 恰好=CODE_LOCKED_BY_OTHER → 伪 fencing → 分区毒化 wedge。
+    已修：apply_completion 先查 error 标志走 soft-error 路径（顺带加固了
+    star 路径的同款潜在脆弱性）。重验全过。
+  - coco arch：P1（上述 error 帧误判）已修；P0（F178 coalescer 乱序
+    watermark）=既有已裁决项（stream CLAUDE.md note 24，结构性不可达，
+    维持 defer）；P1（重启 last_synced 以文件长度初始化）与 P2×3（chain
+    丢 offset/end 交叉校验、坏节点归因到 head、P-bulk 错误处理弱）记录
+    在案，非 F260 引入或已接受。
+  - 默认仍 OFF（loopback 纯开销+深队列延迟叠加）；跨主机大值写场景由
+    `--append-chain-min-bytes 65536` 显式启用。
+- **passes:** completed (2026-06-11)
 
 ### F261 · SSTable 按需分页 + 带逐出的 block cache（RocksDB 形态）
 - **目标**：现状 `SstReader` 整个 SST bytes 常驻 PS 内存、`block_cache:

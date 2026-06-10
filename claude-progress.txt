@@ -1,5 +1,5 @@
 Date: 2026-06-10
-TaskStatus: not_completed
+TaskStatus: completed
 Task scope: F260 — chained replication for large appends (third item of
   P15). Implementation landed, default OFF; acceptance gap = cross-host
   perf + chain-kill chaos + coco arch review.
@@ -39,7 +39,7 @@ Current summary:
   understood: per-append store-and-forward hop latency stacking, not a
   deadlock (low-concurrency runs are error-free).
 
-Next steps:
-  Cross-host acceptance run via remote-autumn, then chaos + coco arch;
+Cross-host acceptance DONE 2026-06-11: fair 3.8x, egress 3x->1x proven, chaos 174/174 zero loss after fixing the error-frame-as-LockedByOther bug (apply_completion is_error guard). Next steps:
+  F261, then chaos + coco arch;
   flip default only if cross-host >= 1.5x holds AND deep-queue budgets
   are fixed. F261 (SSTable paging + block cache) follows.

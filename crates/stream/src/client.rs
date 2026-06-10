@@ -944,6 +944,22 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
                 break;
             }
             Ok(frame) => {
+                // F260 chaos root-cause (coco arch P1): NEVER decode an
+                // ERROR frame's payload as AppendResp — error payloads are
+                // [status_code][message], and StatusCode::Unavailable (5)
+                // collides with CODE_LOCKED_BY_OTHER (5), so a generic
+                // chain/transport error frame masqueraded as a fencing
+                // event and POISONED the partition (the observed PS wedge
+                // when a mid-chain EN died). Route error frames through
+                // the soft-error path instead.
+                if frame.is_error() {
+                    err_msg = Some(format!(
+                        "replica {i} error frame: {}",
+                        String::from_utf8_lossy(&frame.payload[1.min(frame.payload.len())..])
+                    ));
+                    bad_replica_idx = Some(i);
+                    break;
+                }
                 let payload = frame.payload;
                 let resp = match AppendResp::decode(payload) {
                     Ok(r) => r,
