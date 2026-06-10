@@ -89,10 +89,24 @@ ulimit -l unlimited 2>/dev/null || true
 # bulk + `tcp` for control. Respects caller-provided UCX_TLS.
 # UCX_TLS: POSITIVE transport list only (no ^ negation — leading ^ negates
 # the WHOLE list and a non-leading ^x is silently ignored as a literal name;
-# both bit us on 2026-06-10). posix shm is the 6.6x loopback write-throughput
-# carrier (PS->EN appends); measured 69K write / 969K read 4K t16 vs 8.3K
-# write with shm disabled. Cross-host RoCE runs override with
-# UCX_TLS=rc_mlx5,ud_mlx5,tcp,self + UCX_NET_DEVICES pinning.
+# both bit us on 2026-06-10). UCX_TLS is a CAPABILITY SET, not a priority
+# list: ucp_worker_create eagerly opens an iface (CQ/SRQ/QP machinery via
+# DEVX ioctls) for EVERY allowed transport x device at creation time —
+# transport selection per peer happens later, at ep wireup. So listing
+# rc_mlx5 costs 10-IB-device iface creation per worker even if all traffic
+# ends up on posix shm (the 2026-06-10 t256 creation-storm collapse was
+# exactly this cost under a spinlock). Pick by scenario:
+#
+#   loopback bench (this script's default): posix,cma,tcp,self
+#     - posix shm carries PS->EN appends: 69K write / 969K read 4K t16,
+#       vs 8.3K write with shm disabled.
+#     - no IB transports -> worker creation skips all 10 RoCE devices
+#       (cheap creation; high client thread counts stay viable).
+#   cross-host RoCE: posix,cma,rc_mlx5,ud_mlx5,tcp,self
+#     - UCX auto-picks shm intra-host / RDMA cross-host per peer.
+#     - MUST also pin UCX_NET_DEVICES=mlx5_1:1 on both ends (10-device
+#       auto-select hangs) — and that pin breaks loopback (kills
+#       tcp-over-lo), which is why one universal config does not exist.
 : "${UCX_TLS:=posix,cma,tcp,self}"
 export UCX_TLS
 
