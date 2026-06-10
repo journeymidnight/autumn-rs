@@ -114,6 +114,9 @@ enum Command {
         /// flags (`--batch-put` / `--batch-get` / `--put-many`) — all
         /// three drove the same code paths after the SDK consolidation.
         bulk: usize,
+        /// F258-bench: per-thread start stagger (tid*ramp_ms) + connect
+        /// warmup + barrier-aligned timed window. 0 = legacy behavior.
+        ramp_ms: u64,
     },
 }
 
@@ -379,6 +382,7 @@ fn parse_args() -> Args {
             // tcp_sendmsg coalescing + read_loop bulk decode gives the
             // server-side "fat arrival" partition_loop needs to grow
             // batch_size. 0 = legacy per-op fan_out.
+            let mut ramp_ms: u64 = 0;
             let mut bulk: usize = 0;
             // F195: was `AUTUMN_GROUP_COMMIT_CAP` env read at baseline-
             // write time. Now an explicit CLI flag — operators pass the
@@ -448,6 +452,14 @@ fn parse_args() -> Args {
                             .parse()
                             .expect("--bulk must be a non-negative integer");
                     }
+                    "--ramp-ms" => {
+                        // F258-bench: stagger thread start by tid*ramp_ms so
+                        // UCX worker creation doesn't storm (host-level devx
+                        // serialization); threads then warm up (connect) and
+                        // align on a barrier before the timed window starts.
+                        i += 1;
+                        ramp_ms = raw[i].parse().expect("--ramp-ms must be u64");
+                    }
                     // Migration: print + abort. The three pre-consolidation
                     // flags drove the same path post-SDK-merge.
                     "--batch-put" | "--batch-get" | "--put-many" => {
@@ -480,6 +492,7 @@ fn parse_args() -> Args {
                 pipeline_depth,
                 group_commit_cap,
                 bulk,
+                ramp_ms,
             }
         }
         other => {
@@ -854,6 +867,7 @@ async fn main() -> Result<()> {
             pipeline_depth,
             group_commit_cap,
             bulk,
+            ramp_ms,
         } => {
             let pipeline_depth = pipeline_depth.max(1);
             // ZC ("ucx ⟹ zerocopy") selection — ONE symmetric rule (F235), shared
@@ -914,6 +928,7 @@ async fn main() -> Result<()> {
             let total_ops = Arc::new(AtomicU64::new(0));
             let bench_start = Instant::now();
 
+            let barrier = Arc::new(std::sync::Barrier::new(start_keys.len()));
             let mut write_handles = Vec::new();
             for (tid, start_key) in start_keys.iter().cloned().enumerate() {
                 let mgr = Arc::clone(&mgr);
@@ -924,7 +939,11 @@ async fn main() -> Result<()> {
                     .collect::<Vec<u8>>();
                 let depth = pipeline_depth;
                 let bulk = bulk;
+                let barrier = Arc::clone(&barrier);
                 let handle = std::thread::spawn(move || {
+                    if ramp_ms > 0 {
+                        std::thread::sleep(Duration::from_millis(tid as u64 * ramp_ms));
+                    }
                     compio::runtime::RuntimeBuilder::new()
                         .build()
                         .unwrap()
@@ -941,7 +960,17 @@ async fn main() -> Result<()> {
                             let mut lats: Vec<f64> = Vec::new();
                             let mut written = 0u64;
                             let cref = &client;
-                            let dl = deadline.as_ref();
+                            // F258-bench: with --ramp-ms the timed window
+                            // starts only after EVERY thread has connected
+                            // (worker created) — measure steady state, not
+                            // the creation ramp.
+                            let mut local_dl = *deadline.as_ref();
+                            if ramp_ms > 0 {
+                                barrier.wait();
+                                local_dl = std::time::SystemTime::now()
+                                    + Duration::from_secs(duration_secs);
+                            }
+                            let dl = &local_dl;
                             let vz = &value_zc;
                             let sk = start_key.as_slice();
                             let mut seq = 0u64;
@@ -1071,6 +1100,8 @@ async fn main() -> Result<()> {
             let total_ops = Arc::new(AtomicU64::new(0));
             let bench_start = Instant::now();
 
+            let read_participants = written_per_thread.iter().filter(|w| **w > 0).count();
+            let barrier = Arc::new(std::sync::Barrier::new(read_participants.max(1)));
             let mut read_handles = Vec::new();
             for (tid, start_key) in start_keys.iter().cloned().enumerate() {
                 let written = written_per_thread[tid];
@@ -1083,7 +1114,11 @@ async fn main() -> Result<()> {
                 let depth = pipeline_depth;
                 let bulk = bulk;
                 let value_size = value_size;
+                let barrier = Arc::clone(&barrier);
                 let handle = std::thread::spawn(move || {
+                    if ramp_ms > 0 {
+                        std::thread::sleep(Duration::from_millis(tid as u64 * ramp_ms));
+                    }
                     compio::runtime::RuntimeBuilder::new()
                         .build()
                         .unwrap()
@@ -1098,7 +1133,13 @@ async fn main() -> Result<()> {
                             };
                             let mut lats: Vec<f64> = Vec::new();
                             let cref = &client;
-                            let dl = deadline.as_ref();
+                            let mut local_dl = *deadline.as_ref();
+                            if ramp_ms > 0 {
+                                barrier.wait();
+                                local_dl = std::time::SystemTime::now()
+                                    + Duration::from_secs(duration_secs);
+                            }
+                            let dl = &local_dl;
                             let sk = start_key.as_slice();
                             if bulk > 0 {
                                 // --bulk N → one `get_many_into(N items)`
