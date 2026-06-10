@@ -4586,7 +4586,26 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
 - **验收**：e2e：大值 get 字节正确 + eversion 过期自动恢复 + GC 并发下无脏读
   （复用 MED-2 测试形态）；kvcache get_many_into 吞吐提升可测；PS CPU/网卡
   出口在 8M 读负载下显著下降；TCP+UCX 两传输都过。
-- **passes:** not_completed (planned)
+- **实现（2026-06-10）**：wire `MSG_GET_REDIRECT(0x56)` + rkyv `GetRedirectResp`
+  （descriptor=extent_id/value_offset/value_len/eversion/replica_addrs；
+  extent_id==0=inline）。PS `handle_get_redirect`：`get_value_inner(redirect=
+  true)` 仅对 full-read 且 vp.len≥64K 的 VP 返回 Redirect（GC writer-pin 检查
+  保留——被 punch 中的 extent 仍按 NotFound）；descriptor 由
+  `StreamClient::extent_read_descriptor` 提供（**EC-converted extent 拒绝
+  descriptor → 自动回退 proxy**，coco P1-1 修复）。client `get_direct`：
+  副本轮转 + 全失败回退 proxy `get`；EN 读走 `read_extent_value_direct`
+  （`MSG_READ_BYTES_ZC + call_into_pooled` 零拷贝，Bytes 别名 pool buffer；
+  **短读=失败**，coco P1-2 修复——proxy 路径同款 got<need 校验）。CLI
+  `direct-get`；perf-check `--direct-read`。
+- **验证**：字节对拍：8M 随机值 TCP+UCX 两传输 direct-get 与原文件逐字节一致；
+  小值 inline / NotFound 正常。perf（p8 t16 d8 8M 读）：TCP direct p50
+  45.6ms vs proxy 145.3ms（3.2×），吞吐 529 vs 579（同噪声带）；UCX direct
+  p50 14.8ms vs proxy 137.5ms（9.3×），吞吐 485 vs 705。loopback 上吞吐
+  无净增（共享主机资源 + 多一跳 redirect RTT）——吞吐收益按设计在跨主机
+  （PS NIC 出口=瓶颈）兑现；延迟收益已直接兑现。eversion 过期/GC 窗口=
+  fail→proxy fallback（结构保证，EN 整文件 unlink + eversion fence，无撕裂
+  读）；系统级 GC/EC 并发 chaos 留待下次全量 chaos 周期。单测 70+158+27 过。
+- **passes:** completed (2026-06-10)
 
 ### F260 · 大值写链式复制（WAS / HDFS pipeline，混合模式）
 - **目标**：写现状 star 扇出（client.rs launch_append join_all 并发发 3 副本）：

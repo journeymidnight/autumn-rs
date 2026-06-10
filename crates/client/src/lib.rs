@@ -309,6 +309,8 @@ pub struct ClusterClient {
     mgr_conn: Rc<RefCell<Option<Rc<RpcClient>>>>,
     /// Cached PS RPC connections. Dropped on error, recreated on next use.
     ps_conns: RefCell<HashMap<String, Rc<RpcClient>>>,
+    /// F259: extent-node connections for redirect direct reads.
+    en_pool: autumn_stream::ConnPool,
     /// Routing cache. Populated on `connect`, refreshed on `refresh_regions`.
     /// `RefCell` so concurrent tasks holding `Rc<ClusterClient>` can do
     /// brief lookup-and-clone borrows without blocking each other.
@@ -480,6 +482,7 @@ impl ClusterClient {
             current_mgr: Cell::new(0),
             mgr_conn: Rc::new(RefCell::new(None)),
             ps_conns: RefCell::new(HashMap::new()),
+            en_pool: autumn_stream::ConnPool::new(),
             regions: RefCell::new(Vec::new()),
             ps_details: RefCell::new(HashMap::new()),
             part_addrs: RefCell::new(HashMap::new()),
@@ -1225,6 +1228,74 @@ impl ClusterClient {
             return Err(code_to_error(resp.code, resp.message));
         }
         Ok(Some(resp.value))
+    }
+
+    /// F259: GET with PS-bypass for large VP values. Issues
+    /// `MSG_GET_REDIRECT`; when the PS answers with a descriptor (>= 64 KiB
+    /// ValuePointer value), the value bytes are read STRAIGHT from an
+    /// extent-node replica — the PS never touches the data. Replica choice
+    /// rotates by (extent, offset); failover walks the rest. ANY direct-read
+    /// failure (eversion bumped, extent GC'd in the window, replica down)
+    /// falls back to the plain proxy `get` — the redirect is an
+    /// optimization, never a correctness dependency.
+    pub async fn get_direct(
+        &self,
+        key: &[u8],
+    ) -> std::result::Result<Option<bytes::Bytes>, AutumnError> {
+        let key_v = key.to_vec();
+        let resp_bytes = self
+            .call_ps_for_key(&key_v, MSG_GET_REDIRECT, |part_id, region_epoch| {
+                rkyv_encode(&GetReq {
+                    part_id,
+                    key: key_v.clone(),
+                    offset: 0,
+                    length: 0,
+                    region_epoch,
+                })
+            })
+            .await?;
+        let resp: GetRedirectResp =
+            rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
+        if resp.code == partition_rpc::CODE_NOT_FOUND {
+            return Ok(None);
+        }
+        if resp.code != partition_rpc::CODE_OK {
+            return Err(code_to_error(resp.code, resp.message));
+        }
+        if resp.extent_id == 0 {
+            return Ok(Some(bytes::Bytes::from(resp.value)));
+        }
+        let n = resp.replica_addrs.len();
+        if n > 0 {
+            let start =
+                (resp.extent_id ^ (resp.value_offset as u64) << 32) as usize % n;
+            for i in 0..n {
+                let addr = &resp.replica_addrs[(start + i) % n];
+                match autumn_stream::read_extent_value_direct(
+                    &self.en_pool,
+                    addr,
+                    resp.extent_id,
+                    resp.eversion,
+                    resp.value_offset,
+                    resp.value_len,
+                )
+                .await
+                {
+                    Ok(v) => return Ok(Some(v)),
+                    Err(e) => {
+                        tracing::debug!(
+                            extent_id = resp.extent_id,
+                            addr = %addr,
+                            error = %e,
+                            "F259 direct read failed; trying next replica"
+                        );
+                    }
+                }
+            }
+        }
+        // All replicas failed → proxy fallback re-resolves through the PS
+        // (fresh VP after GC rewrite / fresh eversion after EC conversion).
+        Ok(self.get(key).await?.map(bytes::Bytes::from))
     }
 
     /// Zero-copy GET: read a key's value straight into `dest` (no
@@ -2573,6 +2644,7 @@ mod first_attempt_timeout_tests {
                 current_mgr: Cell::new(0),
                 mgr_conn: Rc::new(RefCell::new(None)),
                 ps_conns: RefCell::new(HashMap::new()),
+            en_pool: autumn_stream::ConnPool::new(),
                 regions: RefCell::new(Vec::new()),
                 ps_details: RefCell::new(HashMap::new()),
                 part_addrs: RefCell::new(HashMap::new()),

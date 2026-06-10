@@ -113,6 +113,7 @@ pub(crate) async fn dispatch_partition_rpc(
 ) -> HandlerResult {
     match msg_type {
         MSG_GET => handle_get(payload, part).await,
+        MSG_GET_REDIRECT => handle_get_redirect(payload, part).await,
         MSG_HEAD => handle_head(payload, part).await,
         MSG_RANGE => handle_range(payload, part).await,
         partition_rpc::MSG_BATCH_GET => handle_batch_get(payload, part).await,
@@ -154,6 +155,9 @@ pub(crate) async fn dispatch_partition_rpc(
 pub(crate) enum GetOutcome {
     NotFound,
     Value(Bytes),
+    /// F259: large full-value VP — the caller (handle_get_redirect) sends
+    /// a descriptor instead of resolving the bytes through this PS.
+    Redirect { extent_id: u64, value_offset: u32, value_len: u32 },
 }
 
 /// MSG_BATCH_GET: N keys on the SAME partition in ONE frame, all
@@ -208,6 +212,8 @@ pub(crate) async fn handle_batch_get(
                 status: 1,
                 value: Vec::new(),
             }),
+            // get_value (redirect=false) never yields Redirect.
+            Ok(GetOutcome::Redirect { .. }) => unreachable!("get_value never redirects"),
             Err(_) => items.push(partition_rpc::BatchGetItem {
                 status: 2,
                 value: Vec::new(),
@@ -244,6 +250,63 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
             message: String::new(),
             value: value.into(),
         })),
+        GetOutcome::Redirect { .. } => unreachable!("get_value never redirects"),
+    }
+}
+
+/// F259 (MSG_GET_REDIRECT): like `handle_get`, but a large full-value VP
+/// answers with a descriptor (extent + value byte range + eversion +
+/// replica addrs) so the client reads the bytes straight from an EN.
+pub(crate) async fn handle_get_redirect(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> HandlerResult {
+    match get_value_inner(payload.clone(), part, true).await? {
+        GetOutcome::NotFound => Ok(partition_rpc::rkyv_encode(&GetRedirectResp {
+            code: CODE_NOT_FOUND,
+            message: "key not found".to_string(),
+            value: vec![],
+            extent_id: 0,
+            value_offset: 0,
+            value_len: 0,
+            eversion: 0,
+            replica_addrs: vec![],
+        })),
+        GetOutcome::Value(value) => Ok(partition_rpc::rkyv_encode(&GetRedirectResp {
+            code: CODE_OK,
+            message: String::new(),
+            value: value.into(),
+            extent_id: 0,
+            value_offset: 0,
+            value_len: 0,
+            eversion: 0,
+            replica_addrs: vec![],
+        })),
+        GetOutcome::Redirect {
+            extent_id,
+            value_offset,
+            value_len,
+        } => {
+            let sc = part.borrow().stream_client.clone();
+            match sc.extent_read_descriptor(extent_id).await {
+                Ok((eversion, replica_addrs)) => {
+                    Ok(partition_rpc::rkyv_encode(&GetRedirectResp {
+                        code: CODE_OK,
+                        message: String::new(),
+                        value: vec![],
+                        extent_id,
+                        value_offset,
+                        value_len,
+                        eversion,
+                        replica_addrs,
+                    }))
+                }
+                // Descriptor lookup failed (manager blip / cache miss):
+                // resolve through the proxy path instead — redirect is an
+                // optimization, never a correctness dependency.
+                Err(_) => handle_get(payload, part).await,
+            }
+        }
     }
 }
 
@@ -268,6 +331,8 @@ pub(crate) async fn handle_get_zc(
     let (code, value): (u8, Bytes) = match get_value(payload, part).await {
         Ok(GetOutcome::Value(v)) => (CODE_OK, v),
         Ok(GetOutcome::NotFound) => (CODE_NOT_FOUND, Bytes::new()),
+        // get_value (redirect=false) never yields Redirect.
+        Ok(GetOutcome::Redirect { .. }) => unreachable!("get_value never redirects"),
         Err((status, _msg)) => (status as u8, Bytes::new()),
     };
     (ps_zc_head(req_id, code, &value), value)
@@ -302,6 +367,23 @@ pub(crate) fn ps_zc_head(req_id: u32, code: u8, value: &[u8]) -> Bytes {
 async fn get_value(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
+) -> Result<GetOutcome, (StatusCode, String)> {
+    get_value_inner(payload, part, false).await
+}
+
+/// F259: `redirect_large_vp` — when true, a FULL-value read of a VP whose
+/// value length >= AUTUMN_PS_ZC_RECV_MIN (64 KiB, the zc_worthwhile
+/// threshold) returns `GetOutcome::Redirect` (extent + exact value byte
+/// range) instead of resolving through this PS. Sub-range reads, inline
+/// values and small VPs resolve as before. The GC writer-pin check still
+/// runs first — an extent being punched surfaces NotFound exactly like
+/// the proxy path (the client falls back / retries and sees the
+/// rewritten VP).
+#[allow(clippy::await_holding_refcell_ref)]
+async fn get_value_inner(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+    redirect_large_vp: bool,
 ) -> Result<GetOutcome, (StatusCode, String)> {
     let req: GetReq =
         partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
@@ -409,6 +491,37 @@ async fn get_value(
     } else {
         None
     };
+    if redirect_large_vp
+        && is_vp
+        && req.offset == 0
+        && req.length == 0
+        && raw_value.len() >= crate::VALUE_POINTER_SIZE
+    {
+        let vp = crate::ValuePointer::decode(&raw_value[..crate::VALUE_POINTER_SIZE]);
+        if vp.len as usize >= 64 * 1024 {
+            READ_METRICS.with(|m| {
+                let mut m = m.borrow_mut();
+                m.ops += 1;
+                m.lookup_ns += lookup_ns;
+                match source {
+                    1 => m.found_in_mem += 1,
+                    2 => m.found_in_imm += 1,
+                    3 => m.found_in_sst += 1,
+                    _ => m.not_found += 1,
+                }
+                m.maybe_report();
+            });
+            // _vp_pin drops at return — the client's direct read is
+            // deliberately unprotected: a GC punch in the window turns
+            // into a failed EN read -> client proxy fallback (never a
+            // torn read; extents are unlinked whole and eversion-fenced).
+            return Ok(GetOutcome::Redirect {
+                extent_id: vp.extent_id,
+                value_offset: vp.offset,
+                value_len: vp.len,
+            });
+        }
+    }
     drop(p);
 
     let vp_t0 = Instant::now();

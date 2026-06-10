@@ -1,50 +1,48 @@
 Date: 2026-06-10
 TaskStatus: completed
-Task scope: F258 — replicated-read replica rotation + optional hedged
-  read (first of the P15 ledger F258→F259→F260→F261, user-ordered
-  3-2-1-4). Earlier same-day: F256 (48cdf3c), F257 (0653af3), P15
-  ledger (f703d95), UCX livelock investigation (memory + ledger).
+Task scope: F259 — VP large-value client direct-read from EN
+  (MSG_GET_REDIRECT). Second item of the P15 ledger (order
+  F258->F259->F260->F261). Same day: F256/F257/F258/--ramp-ms shipped.
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
   Already implemented (this commit):
-    - rotated_replica_start (SplitMix64, pure fn, 3 unit tests) in
-      crates/stream/src/client.rs.
-    - read_replicated_with_failover: sealed extents start at the
-      rotated replica; failover walks remaining replicas in rotated
-      order; open-tail keeps replica[0]-first.
-    - read_hedged_pair: timer-raced hedge to the second replica,
-      first Ok wins; eversion-stale fails fast on every arm; loser
-      future drop is cancel-safe (rpc layer owns buffers).
-    - Config: autumn_stream::set_read_hedge_ms (OnceLock, default 0 =
-      hedge off, rotation always on), autumn-ps --read-hedge-ms,
-      cluster.sh AUTUMN_READ_HEDGE_MS passthrough.
-    - Docs: stream CLAUDE.md read_bytes_from_extent row updated;
-      feature_list F258 entry -> completed with measured numbers.
-
-  Not implemented (next in P15 order):
-    - F259 VP large-value client direct-read from EN (next up).
-    - F260 chained replication for >=64K writes.
-    - F261 SSTable on-demand paging + bounded block cache.
-    - F258 chaos coverage rides the next full chaos cycle (read path
-      unchanged semantically: same RPC, same failover, same eversion
-      fail-fast).
+    - Wire: MSG_GET_REDIRECT(0x56) + GetRedirectResp (descriptor or
+      inline; extent_id==0 = inline).
+    - PS: handle_get_redirect / get_value_inner(redirect_large_vp) —
+      redirect only for full-read VP >= 64 KiB; GC writer-pin check
+      kept; EC-converted extents refused by
+      StreamClient::extent_read_descriptor -> proxy fallback (coco
+      P1-1); descriptor-lookup failure -> proxy fallback.
+    - stream: read_extent_value_direct (MSG_READ_BYTES_ZC +
+      call_into_pooled, Bytes aliases pool buffer; SHORT READ = Err,
+      coco P1-2) + extent_read_descriptor.
+    - client: get_direct (replica rotation, per-replica failover,
+      all-fail -> proxy get), en_pool ConnPool field; CLI direct-get;
+      perf-check --direct-read.
+  Not implemented (P15 remaining):
+    - F260 chained replication (>=64K writes) — next.
+    - F261 SSTable paging + bounded block cache.
+    - kvcache python adapter switch to get_direct (follow-up; SDK
+      surface ready).
+    - GC/EC concurrency chaos coverage rides next full chaos cycle.
 
 Current summary:
-  Verification (TCP 3disk p8 t16 d8, EN base port 20000):
-    default (rotation only): 8M read 433.8 ops/s (113% of committed
-      384 baseline), 4K write 64.8K (103%), 4K read 1.18M — no
-      regression.
-    hedge=50ms: 8M read 570.2 ops/s (+31% vs rotation-only, p50
-      353ms -> 151ms) — hedge repairs the slow-replica tail under
-      shared-tenant disk pressure, exactly its design target.
-  stream lib tests 70 passed (3 new), partition-server 158 passed.
+  Byte-for-byte verified on BOTH transports (8M random value; small
+  inline; NotFound). Perf (p8 t16 d8, 8M read): TCP direct p50 45.6ms
+  vs proxy 145.3ms (3.2x), throughput 529 vs 579 (noise band); UCX
+  direct p50 14.8ms vs proxy 137.5ms (9.3x), throughput 485 vs 705.
+  Loopback shows the latency win only — throughput win lands
+  cross-host where PS NIC egress is the constraint (design intent).
+  Tests: stream 70 + partition-server 158 + client 27.
 
 Main gaps:
-  - Hedge default-off; enabling in production is an operator call
-    (cluster.sh AUTUMN_READ_HEDGE_MS).
-  - EC reads and open-tail reads intentionally unchanged.
+  - UCX t256 4K-write collapse (448 ops/s even with --ramp-ms) is
+    UNDIAGNOSED: p95 10.6s smells like PS->EN append timeouts (5s)
+    under uct_tcp single-worker inbound starvation; today's UCX
+    loopback baseline itself degraded 6-7x all day (t16 8K vs 51K
+    committed, code-independent). Confirmation experiment pending:
+    run t256 write + grep PS/stream logs for append timeout/retry.
 
 Next steps:
-  F259 per the P15 ledger (PS returns VP descriptor for >=64K reads;
-  client pulls straight from EN; eversion/GC-pin semantics must hold).
+  F260 per the P15 ledger.

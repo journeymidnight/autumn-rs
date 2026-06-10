@@ -156,6 +156,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "autumn-rpc",
+ "autumn-stream",
  "bytes",
  "compio",
  "crc32c",

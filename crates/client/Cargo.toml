@@ -10,6 +10,7 @@ ucx = ["autumn-rpc/ucx"]
 
 [dependencies]
 autumn-rpc = { path = "../rpc" }
+autumn-stream = { path = "../stream" }
 anyhow.workspace = true
 bytes.workspace = true
 compio = { version = "0.18", features = ["time"] }

@@ -78,6 +78,11 @@ enum Command {
     Get {
         key: String,
     },
+    /// F259: GET via MSG_GET_REDIRECT + EN direct read (byte-for-byte
+    /// comparable against plain `get` for verification).
+    DirectGet {
+        key: String,
+    },
     /// F216 verification: zero-copy GET via ClusterClient::get_into. heads
     /// the key, allocates a dest buffer, registers it for UCX zero-copy
     /// (ucx build only), reads the value straight into dest, writes to stdout.
@@ -117,6 +122,9 @@ enum Command {
         /// F258-bench: per-thread start stagger (tid*ramp_ms) + connect
         /// warmup + barrier-aligned timed window. 0 = legacy behavior.
         ramp_ms: u64,
+        /// F259: read phase uses get_direct (MSG_GET_REDIRECT + EN direct
+        /// read) instead of get/get_into.
+        direct_read: bool,
     },
 }
 
@@ -302,6 +310,16 @@ fn parse_args() -> Args {
                 key: raw[i].clone(),
             }
         }
+        // (DirectGet parsed above in "direct-get".)
+        "direct-get" => {
+            if i >= raw.len() {
+                eprintln!("direct-get requires <KEY>");
+                std::process::exit(1);
+            }
+            Command::DirectGet {
+                key: raw[i].clone(),
+            }
+        }
         "zc-get" => {
             if i >= raw.len() {
                 eprintln!("zc-get requires <KEY>");
@@ -383,6 +401,7 @@ fn parse_args() -> Args {
             // server-side "fat arrival" partition_loop needs to grow
             // batch_size. 0 = legacy per-op fan_out.
             let mut ramp_ms: u64 = 0;
+            let mut direct_read = false;
             let mut bulk: usize = 0;
             // F195: was `AUTUMN_GROUP_COMMIT_CAP` env read at baseline-
             // write time. Now an explicit CLI flag — operators pass the
@@ -452,6 +471,9 @@ fn parse_args() -> Args {
                             .parse()
                             .expect("--bulk must be a non-negative integer");
                     }
+                    "--direct-read" => {
+                        direct_read = true;
+                    }
                     "--ramp-ms" => {
                         // F258-bench: stagger thread start by tid*ramp_ms so
                         // UCX worker creation doesn't storm (host-level devx
@@ -493,6 +515,7 @@ fn parse_args() -> Args {
                 group_commit_cap,
                 bulk,
                 ramp_ms,
+                direct_read,
             }
         }
         other => {
@@ -792,6 +815,17 @@ async fn main() -> Result<()> {
             Err(e) => bail!("get: {e}"),
         },
 
+        Command::DirectGet { key } => match client.get_direct(key.as_bytes()).await {
+            Ok(Some(value)) => {
+                use std::io::Write;
+                std::io::stdout().write_all(&value)?;
+            }
+            Ok(None) => {
+                eprintln!("key not found");
+                std::process::exit(2);
+            }
+            Err(e) => bail!("direct-get: {e}"),
+        },
         Command::ZcGet { key } => {
             // Size the dest from head() (kvcache caller knows the size; the
             // CLI discovers it). Then read the value straight into dest.
@@ -868,6 +902,7 @@ async fn main() -> Result<()> {
             group_commit_cap,
             bulk,
             ramp_ms,
+            direct_read,
         } => {
             let pipeline_depth = pipeline_depth.max(1);
             // ZC ("ucx ⟹ zerocopy") selection — ONE symmetric rule (F235), shared
@@ -1197,7 +1232,9 @@ async fn main() -> Result<()> {
                                 let key = key_for_partition(sk, "pc", tid, seq);
                                 Some(async move {
                                     let t0 = Instant::now();
-                                    let ok = if zc_read {
+                                    let ok = if direct_read {
+                                        cref.get_direct(key.as_bytes()).await.is_ok()
+                                    } else if zc_read {
                                         let mut dest = vec![0u8; value_size];
                                         cref.get_into(key.as_bytes(), &mut dest).await.is_ok()
                                     } else {

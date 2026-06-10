@@ -77,6 +77,53 @@ use dashmap::DashMap;
 use futures::channel::{mpsc, oneshot};
 use futures::future::join_all;
 
+/// F259: one-shot direct EN read of a value byte range, for clients holding
+/// a MSG_GET_REDIRECT descriptor. No StreamClient (no owner lock, no manager)
+/// — the zero-copy wire read the PS itself uses (MSG_READ_BYTES_ZC +
+/// call_into_pooled: UCX registered recv / TCP owned read, no FrameDecoder
+/// accumulation). Returns a `Bytes` ALIASING the pool buffer (returns to the
+/// pool on drop). Errors (eversion mismatch, extent gone, replica down)
+/// surface for the caller's proxy fallback.
+pub async fn read_extent_value_direct(
+    pool: &crate::ConnPool,
+    addr: &str,
+    extent_id: u64,
+    eversion: u64,
+    offset: u32,
+    length: u32,
+) -> Result<bytes::Bytes> {
+    let req = ReadBytesReq {
+        extent_id,
+        eversion,
+        offset,
+        length,
+    };
+    let (pb, code) = pool
+        .call_into_pooled(addr, MSG_READ_BYTES_ZC, req.encode(), Duration::from_secs(3))
+        .await?;
+    if code != CODE_OK {
+        return Err(anyhow!(
+            "direct read from {addr} extent={extent_id}: code={}",
+            crate::extent_rpc::code_description(code)
+        ));
+    }
+    let mut value = bytes::Bytes::from_owner(pb);
+    if value.len() > length as usize {
+        value.truncate(length as usize);
+    }
+    // coco P1 (F259): a short payload under CODE_OK (sealed_length clamp,
+    // stale VP, EN-side truncation) must be a FAILURE — the proxy path's
+    // read_value_from_log enforces the same "got < need" check. Returning
+    // short bytes as Ok would hand the caller silently corrupt data.
+    if value.len() < length as usize {
+        return Err(anyhow!(
+            "direct read short from {addr} extent={extent_id}: need {length} got {}",
+            value.len()
+        ));
+    }
+    Ok(value)
+}
+
 // ── F258: replicated-read spreading + hedging ──────────────────────────
 
 /// F258 (b): hedge delay (ms) for replicated sealed-extent reads. 0
@@ -2653,6 +2700,27 @@ impl StreamClient {
             }
         }
         Ok((data, last_end))
+    }
+
+    /// F259: descriptor for a CLIENT-side direct extent read — the cached
+    /// `(eversion, replica addresses)` for an extent, fetched/refreshed via
+    /// the manager on cache miss. The PS embeds these in a MSG_GET_REDIRECT
+    /// response so the client can read value bytes straight from an EN
+    /// without a manager round-trip of its own.
+    pub async fn extent_read_descriptor(&self, extent_id: u64) -> Result<(u64, Vec<String>)> {
+        let ex = self.fetch_extent_info(extent_id).await?;
+        // coco P1 (F259): an EC-converted extent holds RS shards, not the
+        // full payload — a single-EN raw read would hand the client shard
+        // bytes as if they were the value (data corruption). EC reads must
+        // go through ec_subrange_read; refuse the descriptor so the PS
+        // falls back to the proxy path.
+        if ex.ec_converted {
+            return Err(anyhow!(
+                "extent {extent_id} is EC-converted; direct read not supported"
+            ));
+        }
+        let addrs = self.replica_addrs_for_extent(&ex).await?;
+        Ok((ex.eversion, addrs))
     }
 
     /// Replicated-mode read with per-replica failover. Used both for the

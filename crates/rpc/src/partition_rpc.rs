@@ -128,6 +128,41 @@ pub const MSG_BATCH_PUT: u8 = 0x53;
 /// per-key status, not a per-batch error.
 pub const MSG_BATCH_GET: u8 = 0x54;
 
+/// F259 — redirect GET. Same request shape as MSG_GET (`GetReq`). For a
+/// large (>= 64 KiB) full-value ValuePointer read the PS answers with a
+/// DESCRIPTOR (extent + the value's exact byte range inside the extent +
+/// replica addresses + eversion) instead of proxying the bytes; the
+/// client then reads that range straight from an EN, taking the PS out
+/// of the large-value data path. Inline / small / sub-range / non-VP
+/// values come back inline (`extent_id == 0`). The descriptor is an
+/// OPTIMIZATION, never a correctness dependency: any client-side
+/// direct-read failure (eversion bumped by EC conversion, extent GC'd
+/// between redirect and read, replica down) falls back to the plain
+/// MSG_GET / MSG_GET_ZC proxy path, which re-resolves through the PS.
+pub const MSG_GET_REDIRECT: u8 = 0x56;
+
+/// F259 response for `MSG_GET_REDIRECT` (rkyv).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetRedirectResp {
+    pub code: u8,
+    pub message: String,
+    /// Inline value when no redirect applies (`extent_id == 0`).
+    pub value: Vec<u8>,
+    /// 0 = no redirect (value is inline above).
+    pub extent_id: u64,
+    /// Byte offset of the VALUE bytes inside the extent (the PS already
+    /// skipped the WAL record framing + key, so the client reads value
+    /// bytes directly and needs no WAL format knowledge).
+    pub value_offset: u32,
+    pub value_len: u32,
+    /// EN-side eversion fence for the read.
+    pub eversion: u64,
+    /// Replica addresses (shard-routed) so the client needs no manager
+    /// round-trip. Read any replica — VP extents referenced by live
+    /// reads are sealed or all-replica-acked at the VP offset.
+    pub replica_addrs: Vec<String>,
+}
+
 /// One op inside a `BatchPutReq` / `BatchGetReq`. All ops in a batch
 /// share the parent's `part_id` + `region_epoch`. `expires_at = 0`
 /// means no TTL (matches `PutReq`).
@@ -625,7 +660,7 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
             .and_then(|b| b.try_into().ok())
             .map(u64::from_le_bytes)
             .unwrap_or(0),
-        MSG_GET | MSG_GET_ZC => rkyv_decode::<GetReq>(payload)
+        MSG_GET | MSG_GET_ZC | MSG_GET_REDIRECT => rkyv_decode::<GetReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
         MSG_DELETE => rkyv_decode::<DeleteReq>(payload)
@@ -691,6 +726,9 @@ mod msg_type_tests {
             MSG_MERGE_FREEZE,
             MSG_PULL_VP_REFS,
             MSG_GET_ZC,
+            MSG_BATCH_PUT,
+            MSG_BATCH_GET,
+            MSG_GET_REDIRECT,
         ];
         for i in 0..all.len() {
             for j in i + 1..all.len() {
