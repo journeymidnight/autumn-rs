@@ -87,7 +87,13 @@ ulimit -l unlimited 2>/dev/null || true
 # to wedge for tens of seconds. Excluding both lets UCX fall back to
 # `cma` (zero-copy syscall, 17+ GB/s in ucx_perftest) for intra-host
 # bulk + `tcp` for control. Respects caller-provided UCX_TLS.
-: "${UCX_TLS:=^sysv,^posix}"
+# UCX_TLS: POSITIVE transport list only (no ^ negation — leading ^ negates
+# the WHOLE list and a non-leading ^x is silently ignored as a literal name;
+# both bit us on 2026-06-10). posix shm is the 6.6x loopback write-throughput
+# carrier (PS->EN appends); measured 69K write / 969K read 4K t16 vs 8.3K
+# write with shm disabled. Cross-host RoCE runs override with
+# UCX_TLS=rc_mlx5,ud_mlx5,tcp,self + UCX_NET_DEVICES pinning.
+: "${UCX_TLS:=posix,cma,tcp,self}"
 export UCX_TLS
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
