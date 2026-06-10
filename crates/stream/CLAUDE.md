@@ -175,6 +175,21 @@ every iteration. Correctness proof: `cq_flushes_fast_ops_while_slow_op_runs`
 measures that the first read response arrives in < 0.5 × the time it
 takes the slow 64 MB must_sync append to complete (typically ~0.4×).
 
+### F260 — chained append (MSG_APPEND_CHAIN, default OFF)
+
+Large appends (>= `set_append_chain_min_bytes`, 0=off=default) can ship ONE
+wire copy to replica[0] which pipelines down the chain; the single ack means
+every hop wrote (all-replica-ACK preserved; per-hop fencing/commit-truncation
+unchanged). EN keeps a per-downstream-addr forwarder task — the conn loop
+enqueues forwards UNBOUNDED in arrival order (a blocking submit there stalls
+the whole handle_connection under backlog — the v1 bug), the forwarder
+submits sequentially (per-extent order ⊆ per-addr order) and hands the
+response receiver back so downstream RTTs overlap. KNOWN LIMITATION: per-
+append store-and-forward stacks hop latencies — deep 8M queues (128 in
+flight) blow the timeout budget on loopback; the win (writer egress 3x->1x)
+only exists where the writer NIC is the bottleneck (cross-host). Keep OFF on
+loopback; cross-host acceptance pending.
+
 ### Append Protocol (eversion check → seal check → fencing → commit truncation → write)
 
 ```

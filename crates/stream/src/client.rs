@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use crate::extent_rpc::{
     AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, ProbeExtentReq,
     ProbeExtentResp, ReadBytesReq, ReadBytesResp, StreamInfo, SyncedLengthReq, SyncedLengthResp,
-    CODE_EVERSION_MISMATCH, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK, MSG_APPEND,
+    encode_chain_prefix, CODE_EVERSION_MISMATCH, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK,
+    MSG_APPEND, MSG_APPEND_CHAIN,
     MSG_COMMIT_LENGTH, MSG_PROBE_EXTENT, MSG_READ_BYTES, MSG_READ_BYTES_ZC, MSG_SYNCED_LENGTH,
 };
 use crate::ConnPool;
@@ -139,6 +140,25 @@ pub fn set_read_hedge_ms(ms: u64) -> bool {
 
 pub(crate) fn read_hedge_ms() -> u64 {
     *READ_HEDGE_MS_CELL.get_or_init(|| 0)
+}
+
+/// F260: minimum total append payload (bytes) for CHAINED replication —
+/// the writer sends ONE copy to replica[0] which pipelines to the rest
+/// (PS egress 3x -> 1x for large writes). 0 = chaining disabled (always
+/// star fanout). Default 64 KiB (the zc_worthwhile threshold). Set once
+/// at process start (`autumn-ps --append-chain-min-bytes`).
+static APPEND_CHAIN_MIN_CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+pub fn set_append_chain_min_bytes(n: u32) -> bool {
+    APPEND_CHAIN_MIN_CELL.set(n).is_ok()
+}
+
+pub(crate) fn append_chain_min_bytes() -> u32 {
+    // Default OFF (0): chaining trades per-append latency (store-and-
+    // forward hops stack) for writer-egress bandwidth — a win only where
+    // the writer NIC is the bottleneck (cross-host). Opt in via
+    // `autumn-ps --append-chain-min-bytes 65536`.
+    *APPEND_CHAIN_MIN_CELL.get_or_init(|| 0)
 }
 
 /// F258 (a): deterministic start-replica rotation for sealed-extent reads.
@@ -1068,6 +1088,62 @@ async fn launch_append(
     // future moves a Vec<u64> rather than borrowing tail across await.
     let replica_node_ids: Vec<u64> = tail.replica_node_ids.clone();
     let hdr = AppendReq::encode_header(extent_id, tail.extent.eversion, header_commit, revision);
+
+    // F260 — chained replication for large appends: ONE wire copy to
+    // replica[0], which forwards down the chain (extent_node.rs
+    // MSG_APPEND_CHAIN). The single ack means EVERY hop wrote (the tail
+    // acks first, aggregated hop by hop) — all-replica-ACK semantics
+    // unchanged, so `state.commit` stays ground truth. Submit happens
+    // HERE, synchronously, so per-extent submit order = lease order on
+    // the head replica's socket (the head preserves it down the chain).
+    // Any hop failure surfaces as one error frame -> apply_completion's
+    // existing soft-error / seal-and-roll path. Timeout scales by chain
+    // depth (the ack traverses every hop).
+    let chain_min = append_chain_min_bytes();
+    if chain_min > 0 && size >= chain_min && tail.replica_addrs.len() >= 2 {
+        let head_addr = tail.replica_addrs[0].clone();
+        let chain: Vec<String> = tail.replica_addrs[1..].to_vec();
+        let mut parts = Vec::with_capacity(2 + payload_parts.len());
+        parts.push(encode_chain_prefix(&chain));
+        parts.push(hdr);
+        for seg in &payload_parts {
+            parts.push(seg.clone());
+        }
+        let rx_res = pool.send_vectored(&head_addr, MSG_APPEND_CHAIN, parts).await;
+        // Chained acks traverse every hop with store-and-forward latency —
+        // budget generously (validated: deep 8M queues stack hop latencies).
+        let chain_timeout = append_timeout * (tail.replica_addrs.len() as u32) * 3;
+        let fut = async move {
+            let res = match rx_res {
+                Err(e) => Err(anyhow!("{} chain submit error: {}", head_addr, e)),
+                Ok(rx) => {
+                    let timer = compio::time::sleep(chain_timeout);
+                    futures::pin_mut!(rx, timer);
+                    match futures::future::select(rx, timer).await {
+                        futures::future::Either::Left((Ok(frame), _)) => Ok(frame),
+                        futures::future::Either::Left((Err(_), _)) => {
+                            Err(anyhow!("{} connection closed", head_addr))
+                        }
+                        futures::future::Either::Right(_) => Err(anyhow!(
+                            "{} chain append timeout after {:?}",
+                            head_addr,
+                            chain_timeout
+                        )),
+                    }
+                }
+            };
+            InflightResult {
+                offset,
+                end,
+                extent_id,
+                frames: vec![res],
+                replica_node_ids,
+                ack_tx,
+            }
+        };
+        inflight.push(Box::pin(fut));
+        return;
+    }
 
     // Fire send_vectored to each replica IN PARALLEL (F099-B). Each
     // RpcClient's writer_task is single-writer (R4 step 4.1), so per-

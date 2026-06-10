@@ -4618,7 +4618,23 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
 - **验收**：8M 写吞吐显著提升（理论 ≤3×，验收 ≥1.5×@3disk 单机或跨主机实测）；
   4K 写（star 路径）零回归；chaos kill 链中间节点 → 写失败可重试、零数据丢失；
   coco arch 评审链式 ack/截断交互。
-- **passes:** not_completed (planned)
+- **实现进展（2026-06-10）**：wire `MSG_APPEND_CHAIN(16)`（前缀=下游地址表+
+  AppendReq 原文，codec 2 单测）；EN：per-下游地址转发器任务（无界队列保
+  per-extent 序、conn 循环非阻塞入队——v1 同步 submit 会在 8M 洪峰下卡死整个
+  handle_connection，已修）+ 本地写复用 build_append_future + 链 ack 聚合
+  （CHAIN_FORWARD_TIMEOUT=30s）；client：`launch_append` ≥阈值单发链头、
+  单 ack=全副本（apply_completion 兼容 1 帧）、超时 ×3×副本数；旋钮
+  `--append-chain-min-bytes`/`AUTUMN_APPEND_CHAIN_MIN_BYTES`，**默认 0=关闭**。
+  实测：链式写→读回 8M 随机值字节对拍 OK；低并发（t4×d4）65.2 ops/s、
+  p99 667ms、0 错误 0 超时；**已知局限：深队列（t16×d8=128×8M）下逐跳
+  store-and-forward 延迟叠加顶穿超时预算 → 超时风暴 → 分区毒化**，这是
+  默认关闭的依据——链式收益（写者出口 3×→1×）只在写者 NIC 为瓶颈的
+  跨主机场景成立，loopback 是纯开销。默认关闭路径回归正常（star 8M 写
+  139 ops/s 当日噪声带，0 错误）。
+- **验收缺口（deferred）**：跨主机 perf ≥1.5×（用 remote-autumn 在
+  ::14↔::15 RoCE 环境实测）；chaos 杀链中节点零丢失；coco arch 审链式
+  ack/截断交互。补齐后才置 completed。
+- **passes:** not_completed (实现落地+默认关闭；验收待跨主机)
 
 ### F261 · SSTable 按需分页 + 带逐出的 block cache（RocksDB 形态）
 - **目标**：现状 `SstReader` 整个 SST bytes 常驻 PS 内存、`block_cache:

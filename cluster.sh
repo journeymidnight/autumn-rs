@@ -495,6 +495,9 @@ launch_ps() {
     if [[ -n "${AUTUMN_READ_HEDGE_MS:-}" ]]; then
         tunable_args+=(--read-hedge-ms "$AUTUMN_READ_HEDGE_MS")
     fi
+    if [[ -n "${AUTUMN_APPEND_CHAIN_MIN_BYTES:-}" ]]; then
+        tunable_args+=(--append-chain-min-bytes "$AUTUMN_APPEND_CHAIN_MIN_BYTES")
+    fi
     if [[ -n "${AUTUMN_PS_GC_READ_CHUNK_BYTES:-}" ]]; then
         tunable_args+=(--gc-read-chunk-bytes "$AUTUMN_PS_GC_READ_CHUNK_BYTES")
     fi

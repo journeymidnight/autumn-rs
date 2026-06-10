@@ -65,6 +65,8 @@ struct Args {
     min_pipeline_batch: Option<usize>,
     /// F258: hedge delay (ms) for replicated sealed-extent reads. None/0 = off.
     read_hedge_ms: Option<u64>,
+    /// F260: min append payload for chained replication. None = default 64K; 0 = off.
+    append_chain_min_bytes: Option<u32>,
     gc_read_chunk_bytes: Option<u32>,
     gc_batch_records: Option<usize>,
     gc_batch_bytes: Option<usize>,
@@ -122,6 +124,7 @@ fn parse_args() -> Args {
     let mut compact_cooldown_secs: Option<i64> = None;
     let mut min_pipeline_batch: Option<usize> = None;
     let mut read_hedge_ms: Option<u64> = None;
+    let mut append_chain_min_bytes: Option<u32> = None;
     let mut gc_read_chunk_bytes: Option<u32> = None;
     let mut gc_batch_records: Option<usize> = None;
     let mut gc_batch_bytes: Option<usize> = None;
@@ -297,6 +300,12 @@ fn parse_args() -> Args {
                 i += 1;
                 min_pipeline_batch = Some(args[i].parse().expect("--min-pipeline-batch usize"));
             }
+            "--append-chain-min-bytes" => {
+                // F260: 0 disables chained replication (star fanout always).
+                i += 1;
+                append_chain_min_bytes =
+                    Some(args[i].parse().expect("--append-chain-min-bytes u32"));
+            }
             "--read-hedge-ms" => {
                 // F258: hedge delay for replicated sealed-extent reads.
                 // 0 (default) = hedging off; replica rotation always on.
@@ -433,6 +442,7 @@ fn parse_args() -> Args {
         compact_cooldown_secs,
         min_pipeline_batch,
         read_hedge_ms,
+        append_chain_min_bytes,
         gc_read_chunk_bytes,
         gc_batch_records,
         gc_batch_bytes,
@@ -515,6 +525,9 @@ fn apply_ps_tunables(args: &Args) {
     }
     if let Some(n) = args.read_hedge_ms {
         autumn_stream::set_read_hedge_ms(n);
+    }
+    if let Some(n) = args.append_chain_min_bytes {
+        autumn_stream::set_append_chain_min_bytes(n);
     }
     if let Some(n) = args.min_pipeline_batch {
         eprintln!(

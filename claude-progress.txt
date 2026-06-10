@@ -1,48 +1,45 @@
 Date: 2026-06-10
-TaskStatus: completed
-Task scope: F259 — VP large-value client direct-read from EN
-  (MSG_GET_REDIRECT). Second item of the P15 ledger (order
-  F258->F259->F260->F261). Same day: F256/F257/F258/--ramp-ms shipped.
+TaskStatus: not_completed
+Task scope: F260 — chained replication for large appends (third item of
+  P15). Implementation landed, default OFF; acceptance gap = cross-host
+  perf + chain-kill chaos + coco arch review.
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
-  Already implemented (this commit):
-    - Wire: MSG_GET_REDIRECT(0x56) + GetRedirectResp (descriptor or
-      inline; extent_id==0 = inline).
-    - PS: handle_get_redirect / get_value_inner(redirect_large_vp) —
-      redirect only for full-read VP >= 64 KiB; GC writer-pin check
-      kept; EC-converted extents refused by
-      StreamClient::extent_read_descriptor -> proxy fallback (coco
-      P1-1); descriptor-lookup failure -> proxy fallback.
-    - stream: read_extent_value_direct (MSG_READ_BYTES_ZC +
-      call_into_pooled, Bytes aliases pool buffer; SHORT READ = Err,
-      coco P1-2) + extent_read_descriptor.
-    - client: get_direct (replica rotation, per-replica failover,
-      all-fail -> proxy get), en_pool ConnPool field; CLI direct-get;
-      perf-check --direct-read.
-  Not implemented (P15 remaining):
-    - F260 chained replication (>=64K writes) — next.
-    - F261 SSTable paging + bounded block cache.
-    - kvcache python adapter switch to get_direct (follow-up; SDK
-      surface ready).
-    - GC/EC concurrency chaos coverage rides next full chaos cycle.
+  Already implemented:
+    - MSG_APPEND_CHAIN(16) wire codec (+2 unit tests).
+    - EN: per-downstream-addr forwarder tasks (unbounded ordered enqueue;
+      v1 synchronous submit stalled handle_connection under 8M backlog —
+      fixed), local write via build_append_future, ack aggregation,
+      CHAIN_FORWARD_TIMEOUT=30s.
+    - client: launch_append chain branch (single send to head, 1 ack =
+      all replicas, timeout x3), --append-chain-min-bytes /
+      AUTUMN_APPEND_CHAIN_MIN_BYTES (cluster.sh passthrough), DEFAULT 0
+      = disabled.
+    - Verified: 8M random value chain write -> readback byte-identical;
+      chain ON t4xd4: 65.2 ops/s p99 667ms, 0 errors 0 timeouts;
+      default-OFF regression: star 8M write 139 ops/s, 0 errors.
+    - Same day: UCX_TLS positive-list rule (bc08aef) + scenario comment;
+      TLS shm root-cause closed (54.9K/69K vs 8.3K).
+
+  Not implemented (the acceptance gap — F260 stays not_completed):
+    - Cross-host perf >= 1.5x via remote-autumn (::14 <-> ::15 RoCE);
+      loopback shows no gain by design (store-and-forward overhead, no
+      NIC bottleneck to relieve).
+    - Chaos: kill mid-chain EN under sustained chained writes -> retry,
+      zero loss.
+    - coco arch review of chain ack / commit-truncation interaction.
+    - Deep-queue latency stacking: chain currently UNSUITABLE at high
+      in-flight depth even cross-host until per-hop budgets are
+      re-derived (client x3 may need queue-aware scaling).
 
 Current summary:
-  Byte-for-byte verified on BOTH transports (8M random value; small
-  inline; NotFound). Perf (p8 t16 d8, 8M read): TCP direct p50 45.6ms
-  vs proxy 145.3ms (3.2x), throughput 529 vs 579 (noise band); UCX
-  direct p50 14.8ms vs proxy 137.5ms (9.3x), throughput 485 vs 705.
-  Loopback shows the latency win only — throughput win lands
-  cross-host where PS NIC egress is the constraint (design intent).
-  Tests: stream 70 + partition-server 158 + client 27.
-
-Main gaps:
-  - UCX t256 4K-write collapse (448 ops/s even with --ramp-ms) is
-    UNDIAGNOSED: p95 10.6s smells like PS->EN append timeouts (5s)
-    under uct_tcp single-worker inbound starvation; today's UCX
-    loopback baseline itself degraded 6-7x all day (t16 8K vs 51K
-    committed, code-independent). Confirmation experiment pending:
-    run t256 write + grep PS/stream logs for append timeout/retry.
+  Chain is in the tree but OFF; default paths regression-clean. The
+  loopback wedge (timeout storm -> partition poisoning at t16xd8x8M) is
+  understood: per-append store-and-forward hop latency stacking, not a
+  deadlock (low-concurrency runs are error-free).
 
 Next steps:
-  F260 per the P15 ledger.
+  Cross-host acceptance run via remote-autumn, then chaos + coco arch;
+  flip default only if cross-host >= 1.5x holds AND deep-queue budgets
+  are fixed. F261 (SSTable paging + block cache) follows.
