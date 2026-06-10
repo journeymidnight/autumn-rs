@@ -1,60 +1,60 @@
 Date: 2026-06-10
 TaskStatus: completed
-Task scope: F256 — partition_loop natural batching (remove the
-  MIN_PIPELINE_BATCH launch gate that lock-stepped the 4K write
-  pipeline whenever per-partition concurrency < 256).
+Task scope: (a) F256 natural batching (landed earlier today, commit
+  48cdf3c); (b) UCX "threads block" root-cause investigation (user
+  question: autumn bug or UCX bug?); (c) F257 — accept errors must not
+  kill manager/EN (the real autumn bug the investigation surfaced).
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
   Already implemented (this session):
-    - F256 (lib.rs partition_loop (B) + background.rs knob removal +
-      partition_server.rs --min-pipeline-batch deprecated no-op +
-      CLAUDE.md x2 + README.md + feature_list.md entry).
-    - Verified (no change needed): append hot path does NO per-append
-      commit_length RPC (stream CLAUDE.md note 9 — current_commit()
-      is tail-init only), so the gate was the only lock-step source.
+    - F256 (commit 48cdf3c): partition_loop natural batching; TCP 4K
+      write +24-31% A/B-verified.
+    - F257 (this commit): manager serve() + EN accept_loop_on accept
+      errors -> warn + backoff + continue (was `?` -> process death).
+      Reproducer-verified: t1024 UCX storm + kill -9 leaves
+      MGR/EN/PS alive + serving (pre-F257: manager died, PS fleet
+      heartbeat-suicided).
+    - UCX livelock investigation (no code change; findings below).
 
-  Not implemented (out of scope, candidate follow-ups from the same
-  4K-write investigation, NOT started):
-    - put_many/MSG_BATCH_PUT adoption audit for kvcache writers
-      (server batch path already exists).
-    - client-side put() double-copy removal (key.to_vec +
-      rkyv value.to_vec).
-    - chain replication for >=64K writes / VP direct-read from EN /
-      hedged+rotated replica reads (architecture discussion recorded
-      in session, no design doc yet).
+  Not implemented (deferred, by evidence):
+    - UCX worker-creation throttle in autumn: NOT justified — the
+      collapse is HOST-level (128 separate processes x 2 threads
+      collapse identically to 1 process x 256 threads), so an
+      in-process semaphore can't fix the general case; production
+      shape (1 process, few workers, UCX_NET_DEVICES pinned) doesn't
+      hit it.
+    - UCX upstream fix: 1.20.1 self-compiled and tested — does NOT
+      fix it. Would need an upstream patch to the libuct_ib
+      DEVX-create spinlock path; out of scope.
+    - coco P1 residual: failed-accept ep leak (no working close path
+      under MODE_NONE) — accepted + documented, see F257 entry.
 
-Current summary:
-  F256 landed. Controlled same-environment A/B (fresh 3-replica
-  3disk cluster per side, p8 x t16 x d8, EN base port 20000):
-    TCP 4K write: F256 61,457 / 58,504 (two runs) vs baseline-code
-      46,997 ops/s = +24-31%; p50 1.07ms vs 1.68ms.
-    TCP 8M write: 165.12 vs 175.08 = -5.7% (single-run noise on the
-      disk-bound leg; both sides tripped the same p99 warning from
-      shared-tenant disk pressure). 8M read 623 vs 585 (+6.5%).
-    UCX 4K write: 7,794 vs 6,994 = +11% (both ~7x below the 51K
-      committed baseline — environment-wide UCX loopback write
-      degradation that day; reads 99% of baseline on both sides).
-  Tests: cargo test --workspace --exclude autumn-manager all pass
-  (158 partition-server). coco /findbugs deep (GPT-5.5): no P0/P1;
-  P2 (pub setter removal breaks out-of-repo callers) rejected as
-  solo-workspace-theoretical; P3 (.skillopt-sleep) followed.
+Current summary (UCX "thread 多 block" final verdict):
+  - Mechanism: threads stuck INSIDE ucp_worker_create
+    (uct_iface_open -> rc_mlx5/ib iface init -> devx_create_cq/qp),
+    70% of sampled stacks on pthread_spin_lock (libuct_ib, UCX
+    1.16.0). 10 mlx5 devices x N workers; spinlock wraps ioctl-slow
+    paths. t16=8K ops/s, t64=462, t256=0, t1024=no output in 180s
+    (709/1023 threads R-state burning ~190 cores, 0 ops; PS idle).
+  - NOT autumn's progress loop / wireup / data path: UCX_TLS=tcp,self
+    (no IB ifaces) t256 fully recovers (6.6K write / 149K read).
+  - NOT process-local: 128 procs x 2 threads = same total-zero ->
+    kernel/driver-level serialization on this 10-NIC host.
+  - UCX 1.20.1 (self-built, client-side LD_LIBRARY_PATH swap): still
+    0.00 at t256 — upstream has not fixed it.
+  - UCX_NET_DEVICES=lo,mlx5_1:1 partial mitigation (t256 write 793
+    vs 0; read 988K). Production cross-host config already pins one
+    device (required anyway — auto-select hangs with 10 RoCE devs).
+  - Practical guidance: UCX client OS threads <=16 per host for
+    bench storms; scale via pipeline-depth/partitions; SDK
+    single-runtime + fan_out shape is correct and unaffected.
 
 Main gaps:
-  - Committed perf baselines (perf_baseline_*.json) were recorded on
-    healthier disks: on 2026-06-10 even UNCHANGED code reached only
-    74% (tcp 4k) of its own baseline. Baselines NOT re-recorded (the
-    day's environment would bake transient tenant pressure into them).
-  - Bench-environment traps hit during verification (no code change):
-    (a) a Ray tenant now squats *:10101-10103 = EN ctl ports
-        (data 9101 + 1000) -> TCP EN fail-stop on bind -> cluster
-        start TIMEOUT. Workaround: AUTUMN_EXTENT_BASE_PORT=20000.
-    (b) perf_check.sh:90 defaults UCX_TLS=^sysv,^posix (known-buggy
-        spelling; '^posix' parses as a literal TL). Export
-        UCX_TLS='^sysv,posix' when invoking.
-    (c) UCX manager 9001 needs a few seconds of linger after kill
-        before rebind (ucp_listener has no SO_REUSEADDR path).
+  - Failed-accept UCX ep leak (bounded; documented; no close path
+    under MODE_NONE).
+  - UCX worker-create host-level collapse is an upstream limitation;
+    recorded in memory + feature_list, no autumn code can fix it.
 
 Next steps:
-  None for this task. Session-closure invariant satisfied: commit
-  landed, progress + feature_list updated, workspace clean.
+  None for this task. Session-closure invariant satisfied.

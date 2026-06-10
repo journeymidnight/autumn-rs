@@ -4504,6 +4504,45 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
 
 ---
 
+### F257 · accept errors are connection-scoped — manager/EN accept loop must not die on one failed handshake
+- **Trigger:** 2026-06-10 UCX livelock investigation side-finding. A t1024
+  UCX client storm killed mid-flight (timeout/kill -9 → ~1024 conns RST at
+  once) took down the WHOLE manager process: `serve()`'s accept loop was
+  `listener.accept().await?`, and on UCX the accept path flushes the
+  just-created server-side ep — a peer dying mid-handshake surfaced
+  `ucp_ep_flush cb: Connection reset by remote peer` as an accept Err,
+  which the `?` propagated to main. Observed death chain: manager exits →
+  PS heartbeat fails 5/5 → PS self-evicts ("exiting to prevent stale
+  serving") → whole cluster down from ONE client's connection storm.
+  The EN `accept_loop_on` had the identical `?`. The PS per-partition
+  accept task already did it right (warn + 100ms backoff + continue).
+- **Change:** `crates/manager/src/rpc_handlers.rs::serve` +
+  `crates/stream/src/extent_node.rs::accept_loop_on`: accept errors are
+  logged (WARN) + 100 ms backoff + continue — never propagate to the
+  process. Mirrors the PS accept task.
+- **Known residual (coco P1, ACCEPTED + documented in code):** on UCX a
+  failed accept leaves the half-created server ep allocated until worker
+  destroy. There is NO working close path under
+  `UCP_ERR_HANDLING_MODE_NONE` (FORCE close rejected with INVALID_PARAM,
+  FLUSH close deadlocks on loopback 30s+, MODE_PEER tears down live EPs
+  under load — transport endpoint.rs "EP lifetime" doc). One ep leaked
+  per FAILED handshake, bounded by storm size, strictly better than the
+  pre-F257 whole-process death on the same event.
+- **Verification:**
+  - `cargo test -p autumn-stream --lib` 67 passed;
+    `-p autumn-partition-server --lib` 158 passed.
+  - Reproducer rerun on fixed binary: fresh UCX cluster (8 partitions),
+    t1024 storm, `kill -9` mid-flight → **MGR-SURVIVED, EN×3 alive,
+    PS-SURVIVED**, post-storm control write 10,976 ops/s (pre-F257 the
+    same event killed the manager within seconds — 05:19 manager.log
+    `Error: ucp_ep_flush cb: Connection reset by remote peer`).
+  - coco /findbugs deep (GPT-5.5): P1 = the residual ep leak above
+    (accepted, no working close path; documented at both fix sites);
+    P3 = don't commit .skillopt-sleep (followed).
+- **passes:** completed (2026-06-10)
+
+---
+
 ## P14 — Inode-level lease + close-to-open coherence (F-ioring-lease series)
 
 Plan: `docs/autumn_fs_lease_plan.md` (2026-06-05). Goal: make

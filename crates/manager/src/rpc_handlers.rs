@@ -85,7 +85,35 @@ impl AutumnManager {
         let mut listener = autumn_transport::current_or_init().bind(addr).await?;
         tracing::info!(addr = %addr, "manager listening");
         loop {
-            let (conn, peer) = listener.accept().await?;
+            // F257: accept errors are CONNECTION-scoped, not process-scoped.
+            // Pre-F257 this was `listener.accept().await?` — on UCX the
+            // accept path flushes the just-created ep, so a peer that dies
+            // mid-handshake (e.g. a mass client kill: 1024 conns RST at
+            // once) surfaced `ucp_ep_flush cb: Connection reset by remote
+            // peer` here, and the `?` took down the WHOLE manager process
+            // (observed 2026-06-10; the PS fleet then heartbeat-suicided).
+            // One bad handshake must never kill the control plane: log +
+            // brief backoff (avoid a busy error loop on a persistent
+            // failure like EMFILE) + keep accepting. Mirrors the
+            // partition-server per-partition accept task.
+            //
+            // Known residual (coco P1, accepted): on UCX a failed accept
+            // leaves the half-created server-side ep allocated until
+            // worker destroy — there is NO working close path under
+            // UCP_ERR_HANDLING_MODE_NONE (FORCE close is rejected, FLUSH
+            // close deadlocks on loopback, MODE_PEER tears down live EPs
+            // under load — see crates/transport/src/ucx/endpoint.rs "EP
+            // lifetime" doc). The leak is one ep per FAILED handshake,
+            // bounded by the storm size, and strictly better than the
+            // pre-F257 behavior (whole-process death on the same event).
+            let (conn, peer) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "manager accept failed; continuing");
+                    compio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             if let Some(s) = conn.as_tcp() {
                 if let Err(e) = s.set_nodelay(true) {
                     tracing::warn!(peer = %peer, error = %e, "set_nodelay failed");

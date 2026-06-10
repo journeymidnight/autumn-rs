@@ -2804,7 +2804,25 @@ impl ExtentNode {
         let transport = autumn_transport::current_or_init();
         tracing::info!(addr = %addr, role, kind = ?transport.kind(), "extent node listening");
         loop {
-            let (conn, peer) = listener.accept().await?;
+            // F257: accept errors are connection-scoped — log + backoff +
+            // continue. Pre-F257 the `?` here killed the whole EN shard on
+            // a single failed handshake (on UCX, accept flushes the new ep,
+            // so a peer dying mid-handshake surfaced as an accept Err).
+            // Same fix shape as the manager serve loop + the PS
+            // per-partition accept task. Known residual (coco P1,
+            // accepted): the half-created UCX ep from a failed accept
+            // stays allocated until worker destroy — no working close
+            // path under MODE_NONE (see transport endpoint.rs "EP
+            // lifetime"); one ep per failed handshake, bounded, strictly
+            // better than process death.
+            let (conn, peer) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(addr = %addr, role, error = %e, "accept failed; continuing");
+                    compio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             if let Some(s) = conn.as_tcp() {
                 if let Err(e) = s.set_nodelay(true) {
                     tracing::warn!(peer = %peer, error = %e, "set_nodelay failed");
