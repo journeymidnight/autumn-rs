@@ -287,6 +287,10 @@ fn parse_args() -> Args {
                 compact_cooldown_secs = Some(args[i].parse().expect("--compact-cooldown-secs i64"));
             }
             "--min-pipeline-batch" => {
+                // F256: deprecated no-op. The launch gate this tuned is gone —
+                // partition_loop natural-batches (launches whatever is pending
+                // whenever a pipeline slot is free). Parsed for back-compat so
+                // existing cluster.sh invocations don't break.
                 i += 1;
                 min_pipeline_batch = Some(args[i].parse().expect("--min-pipeline-batch usize"));
             }
@@ -497,7 +501,10 @@ fn apply_ps_tunables(args: &Args) {
         ps::set_compact_cooldown_secs(n);
     }
     if let Some(n) = args.min_pipeline_batch {
-        ps::background::set_min_pipeline_batch(n);
+        eprintln!(
+            "warning: --min-pipeline-batch {n} is deprecated and ignored \
+             (F256: partition_loop natural batching removed the launch gate)"
+        );
     }
     if let Some(n) = args.gc_read_chunk_bytes {
         ps::background::set_gc_read_chunk_bytes(n);

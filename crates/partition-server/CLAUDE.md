@@ -213,14 +213,15 @@ partition_loop (per partition, F099-D fold-in of the old
                        background_write_loop_r1):
   OWNS:   FuturesUnordered<Pin<Box<dyn Future<Output = InflightCompletion>>>>
   CAP:    AUTUMN_PS_INFLIGHT_CAP (default 8, range [1, 64])
-  GATE:   MIN_PIPELINE_BATCH = 256  (2nd+ batch requires pending >= 256)
+  GATE:   none (F256 natural batching — launch whatever is pending as
+          soon as a pipeline slot is free; see "Natural batching" below)
   RECV:   req_rx: mpsc<PartitionRequest> (WRITE_CHANNEL_CAP = 1024)
           — the SAME channel that carries reads + writes from ps-conn
 
   Loop (per iteration):
     (A) drain ready completions via `inflight.next().now_or_never()`
         → run Phase 3 (memtable insert + direct WriteResponder::send_ok) each
-    (B) if pending.non_empty && !at_cap && (n_inflight==0 || pending >= 256):
+    (B) if pending.non_empty && !at_cap && !imm_full (F256):
           launch_new_batch:
             Phase 1: validate, seq-assign, encode WAL records
             Launch Phase 2: stream_client.append_batch future (NOT awaited)
@@ -261,16 +262,31 @@ concurrently — `maybe_rotate_locked` remains correct.
 
 `Delete` sends `WriteOp::Delete{user_key}`, writes `op = 2` (tombstone).
 
-### Why a `MIN_PIPELINE_BATCH` gate?
+### Natural batching (F256 — replaced the `MIN_PIPELINE_BATCH` gate)
 
-R3 Task 5b found that greedily splitting a naturally-full 256-op burst
-into multiple small batches regressed throughput because per-batch
-overhead (encode, 3-replica `send_vectored`, lease/ack state machine
-cycle) outweighs the concurrency gain of running two small batches in
-parallel. The gate says: a *second or later* batch launches only when
-pending has grown to the full burst size (256 — matches the
-`--threads 256` perf_check workload). The first batch after an idle
-period always launches (avoiding starvation on low-load streams).
+History: R3 Task 5b found that greedily splitting a naturally-full
+256-op burst into multiple small batches regressed throughput, so a
+gate was added: a *second or later* batch launched only when pending
+reached 256. But whenever per-partition concurrency was below 256 —
+the common case at N>1 partitions (perf baseline: 16 in-flight per
+partition) — pending could NEVER reach 256, so after the first launch
+the loop waited for the WHOLE pipeline to drain (`n_inflight == 0`)
+before launching again. Effective pipeline depth = 1 regardless of
+`ps_inflight_cap()`; 4K writes ran lock-step at one batch per
+(append RTT + fsync window). The background.rs F099-K/M/N comment
+documented this and deferred it to an `AUTUMN_PS_MIN_BATCH` knob that
+baselines never set.
+
+F256 removes the gate: launch whatever `pending` holds as soon as a
+pipeline slot is free (`!at_cap && !imm_full`). Batch size adapts to
+arrival-rate × in-flight latency (group-commit style). The R3 Task 5b
+fragmentation concern is prevented STRUCTURALLY, not by a gate:
+ps-conn tasks share the P-log thread and enqueue a whole TCP burst
+into req_rx before partition_loop is polled, and the (E) drain pulls
+the entire channel into `pending` (up to MAX_WRITE_BATCH) each
+iteration — so a naturally-full burst still launches as ONE batch.
+The `--min-pipeline-batch` CLI flag is parsed but deprecated (no-op +
+warning).
 
 ### In-order Phase 3 commit (F210-C1, post-2026-05-15)
 

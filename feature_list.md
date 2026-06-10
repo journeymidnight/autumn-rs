@@ -4432,6 +4432,78 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
 
 ---
 
+### F256 · partition_loop natural batching — remove the MIN_PIPELINE_BATCH launch gate
+- **Trigger:** 2026-06-10 "4K 写很慢" investigation. The R4 4.4 launch gate
+  (`n_inflight == 0 || pending >= MIN_PIPELINE_BATCH(256)`) degraded the
+  write pipeline to lock-step whenever per-partition concurrency < 256 —
+  the perf-baseline config (16 threads × d8 ÷ 8 partitions = 16 in-flight
+  per partition) could NEVER reach 256 pending, so after the first launch
+  the loop waited for the WHOLE pipeline to drain before launching again.
+  Effective depth = 1 regardless of `ps_inflight_cap()` (default 8); 4K
+  writes ran one batch per (append RTT + fsync window). The background.rs
+  F099-K/M/N comment had documented exactly this and deferred it to an
+  `AUTUMN_PS_MIN_BATCH` knob that baselines never set.
+- **Change:**
+  - `crates/partition-server/src/lib.rs` `partition_loop` (B):
+    `ready_to_launch = !pending.is_empty() && !at_cap && !imm_full` —
+    launch whatever `pending` holds as soon as a pipeline slot is free.
+    Batch size adapts to arrival-rate × in-flight latency (group-commit
+    natural batching). The R3 Task 5b fragmentation concern (splitting a
+    naturally-full burst into tiny batches) is prevented STRUCTURALLY:
+    ps-conn tasks share the P-log thread and enqueue a whole TCP burst
+    into req_rx before partition_loop is polled, and the (E) drain pulls
+    the entire channel into `pending` (≤ MAX_WRITE_BATCH) each iteration,
+    so a full burst still launches as ONE batch.
+  - `crates/partition-server/src/background.rs`: removed
+    `MIN_PIPELINE_BATCH_CELL` / `set_min_pipeline_batch` /
+    `min_pipeline_batch()` / `DEFAULT_MIN_PIPELINE_BATCH` + the
+    gate-pinning unit test.
+  - `crates/server/src/bin/partition_server.rs`: `--min-pipeline-batch`
+    parsed but deprecated (warning + no-op) so existing cluster.sh
+    invocations don't break.
+  - CLAUDE.md (root + partition-server) + README.md updated.
+- **Also verified (not changed):** the append hot path does NO per-append
+  commit_length RPC — `current_commit()` runs only at tail init
+  (stream CLAUDE.md Programming Note 9), so the gate was the only
+  lock-step source.
+- **Verification:**
+  - `cargo test --workspace --exclude autumn-manager`: all pass
+    (158 partition-server, 0 failed).
+  - Controlled same-environment A/B (TCP, 3disk r=3, p8 × t16 × d8,
+    fresh cluster each side, EN base port 20000):
+    - 4K write: **F256 61,457 / 58,504 ops/s (two runs) vs baseline-code
+      46,997 ops/s = +24–31%**; p50 1.07ms vs 1.68ms. Committed baseline
+    JSON = 63,196 (recorded on healthier disks; the baseline-code side
+      itself only reached 74% of it on this day — environment, not code).
+    - 8M write: 165.12 (F256) vs 175.08 (baseline code) — −5.7%, within
+      single-run noise for the disk-bound 8M leg (both sides tripped the
+      same p99-vs-baseline warning from shared-tenant disk pressure);
+      8M read 623 vs 585 (+6.5%).
+    - UCX 4K write (loopback, same A/B protocol): **F256 7,794 vs
+      baseline-code 6,994 ops/s = +11%**. Both sides sit ~7× below the
+      committed 51,123 baseline — an environment-wide UCX-loopback
+      write degradation on this day (reads were 99% of baseline on BOTH
+      sides), NOT an F256 effect. UCX 8M with F256: 217 (first matrix
+      run, PASS vs 165.6) / 88.8 (later run) — UCX loopback legs are
+      high-variance and documented non-representative; cross-host RoCE
+      is the meaningful UCX config.
+  - coco /findbugs deep (GPT-5.5): P0/P1 none. P2 "removing pub
+    `set_min_pipeline_batch` breaks out-of-repo callers" — REJECTED:
+    solo-flow workspace, the autumn-ps binary was the only caller and
+    is updated in the same commit; CLI back-compat is preserved at the
+    flag level. P3 "don't commit .skillopt-sleep/" — followed (left
+    untracked).
+- **Bench-environment traps fixed/recorded during verification (not code):**
+  - Ray tenant squats `*:10101-10103` = EN ctl ports (data 9101+1000) →
+    TCP EN fail-stop "bind control listener: Address already in use" →
+    cluster start TIMEOUT. Workaround: `AUTUMN_EXTENT_BASE_PORT=20000`.
+  - `perf_check.sh:90` defaults `UCX_TLS=^sysv,^posix` — the known-buggy
+    spelling (second element parses as a literal TL name); export
+    `UCX_TLS='^sysv,posix'` when invoking.
+- **passes:** completed (2026-06-10)
+
+---
+
 ## P14 — Inode-level lease + close-to-open coherence (F-ioring-lease series)
 
 Plan: `docs/autumn_fs_lease_plan.md` (2026-06-05). Goal: make

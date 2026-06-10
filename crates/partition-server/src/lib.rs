@@ -1,6 +1,6 @@
 // F195: `background` module made public so the autumn-ps binary can
-// reach its `set_*` setters (`set_min_pipeline_batch`,
-// `set_gc_*`). The module's internal symbols stay `pub(crate)`/private.
+// reach its `set_*` setters (`set_gc_*`; `set_min_pipeline_batch` was
+// removed by F256). The module's internal symbols stay `pub(crate)`/private.
 pub mod background;
 mod rpc_handlers;
 mod sstable;
@@ -4846,8 +4846,9 @@ async fn partition_thread_main(
 ///
 /// Preserves:
 ///   - R4 4.4 SQ/CQ pattern — Phase-2 futures execute concurrently up
-///     to `ps_inflight_cap()`, MIN_PIPELINE_BATCH=256 gate for
-///     non-first batches.
+///     to `ps_inflight_cap()`. (F256 removed the MIN_PIPELINE_BATCH=256
+///     gate for non-first batches — launch is now natural-batching,
+///     see the `(B)` block comment.)
 ///   - **F210-C1: `FuturesOrdered` (was `FuturesUnordered`) — Phase 3
 ///     runs in launch order = seq order**, guaranteeing that a rotated
 ///     active memtable contains a contiguous seq range. This is what
@@ -4883,7 +4884,6 @@ async fn partition_loop(
     use futures::future::{select, Either};
 
     let cap = ps_inflight_cap();
-    let batch_target = crate::background::min_pipeline_batch().min(max_write_batch());
     let imm_cap = max_imm_depth();
     let wal_gap_cap = max_wal_gap();
     let mut metrics = WriteLoopMetrics::new();
@@ -4967,16 +4967,28 @@ async fn partition_loop(
         let n_inflight = inflight.len();
         let at_cap = n_inflight >= cap;
 
-        // (B) Launch a new batch when conditions are right. Same gate as
-        // the legacy `background_write_loop_r1`: first batch always
-        // launches; subsequent batches wait for pending >= batch_target
-        // to avoid the R3 Task 5b regression. F120-A: when imm is full,
-        // do not launch — the next batch's Phase 3 maybe_rotate would
-        // exceed the cap.
-        let ready_to_launch = !pending.is_empty()
-            && !at_cap
-            && !imm_full
-            && (n_inflight == 0 || pending.len() >= batch_target);
+        // (B) Launch a new batch whenever the pipeline has room (F256
+        // natural batching). `pending` holds everything the SQ had
+        // delivered as of the last (E) drain, so this ships the largest
+        // batch currently available; requests arriving while it is in
+        // flight accumulate into the next batch — batch size adapts to
+        // the arrival rate times the in-flight latency, group-commit
+        // style. The legacy gate (`n_inflight == 0 || pending >=
+        // MIN_PIPELINE_BATCH(256)`) made the pipeline lock-step whenever
+        // per-partition concurrency < 256: after the first launch,
+        // pending could never reach 256, so the loop waited for the
+        // WHOLE pipeline to drain before launching again — effective
+        // depth=1 (the background.rs F099-K/M/N comment documented this
+        // and pushed it onto an `AUTUMN_PS_MIN_BATCH` knob nobody set).
+        // The R3 Task 5b fragmentation concern (splitting a naturally
+        // full burst into tiny batches) is prevented structurally, not
+        // by the gate: ps-conn bursts enqueue every frame into req_rx
+        // before this same-thread task is polled, and (E) drains the
+        // whole channel into `pending` each iteration, so a full burst
+        // still launches as ONE batch. F120-A: when imm is full, do not
+        // launch — the next batch's Phase 3 maybe_rotate would exceed
+        // the cap.
+        let ready_to_launch = !pending.is_empty() && !at_cap && !imm_full;
         if ready_to_launch {
             let batch = std::mem::take(&mut pending);
             // F177: start_write_batch is now async — small batches stay

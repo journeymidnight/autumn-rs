@@ -15,17 +15,16 @@ use futures::StreamExt;
 use crate::sstable::{IterItem, MergeIterator, SstBuilder, SstReader, TableIterator};
 use crate::*;
 
-/// R4 4.4 — minimum pending size required to launch a *second or later*
-/// batch while another batch is already in flight. Below this threshold the
-/// per-batch overhead (encode + 3-replica send_vectored + lease/ack state
-/// machine) outweighs the concurrency gain from running two small batches
-/// in parallel. 256 matches the client-count at perf_check N=1 × 256 threads.
-///
-/// F099-K/M/N — env-configurable so N>1 partitions (with fewer clients per
-/// partition) can lower the gate. At N=8 × 256 clients, clients/partition = 32,
-/// and pending typically can't reach 256 → second batch never launches →
-/// effective depth=1 per partition. Use `AUTUMN_PS_MIN_BATCH=32` or similar.
-const DEFAULT_MIN_PIPELINE_BATCH: usize = 256;
+// F256: the R4 4.4 MIN_PIPELINE_BATCH launch gate (and its
+// `--min-pipeline-batch` knob) is GONE. The gate required `n_inflight == 0
+// || pending >= 256` before launching a batch; whenever per-partition
+// concurrency was below 256 (the common case at N>1 partitions) pending
+// could never reach 256, so the pipeline degraded to lock-step — effective
+// depth=1 regardless of `ps_inflight_cap()`. partition_loop now launches
+// whatever `pending` holds as soon as a pipeline slot is free (natural
+// batching): batch size adapts to arrival-rate × in-flight latency, and a
+// naturally-full burst still lands as ONE batch because the (E) drain pulls
+// the whole req channel into `pending` before the launch check runs.
 
 /// F210-E2: per-partition SST count threshold above which the compact
 /// loop's timer arm auto-triggers a minor compaction. Set high enough
@@ -36,22 +35,15 @@ const DEFAULT_MIN_PIPELINE_BATCH: usize = 256;
 /// on workloads where external policy hasn't kept up. Not tunable
 /// because it's a mechanism-level defensive bound, not a policy knob.
 const MAX_SST_BEFORE_AUTO_COMPACT: usize = 32;
-// F195: process-global setter cells for the 5 background.rs knobs.
+// F195: process-global setter cells for the background.rs knobs.
 // Pre-F195 each was an inner static OnceLock+env read; now lifted to
 // module scope with paired pub setters that the autumn-ps binary calls
-// from main() based on CLI args.
-pub(crate) static MIN_PIPELINE_BATCH_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+// from main() based on CLI args. (F256 removed MIN_PIPELINE_BATCH_CELL.)
 pub(crate) static GC_READ_CHUNK_BYTES_CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 pub(crate) static GC_BATCH_RECORDS_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 pub(crate) static GC_BATCH_BYTES_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 pub(crate) static GC_RATE_BYTES_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
-pub fn set_min_pipeline_batch(n: usize) -> bool {
-    if n == 0 {
-        return false;
-    }
-    MIN_PIPELINE_BATCH_CELL.set(n).is_ok()
-}
 pub fn set_gc_read_chunk_bytes(n: u32) -> bool {
     if n == 0 {
         return false;
@@ -73,12 +65,6 @@ pub fn set_gc_batch_bytes(n: usize) -> bool {
 pub fn set_gc_rate_bytes_per_sec(n: u64) -> bool {
     GC_RATE_BYTES_PER_SEC_CELL.set(n).is_ok()
 }
-
-pub(crate) fn min_pipeline_batch() -> usize {
-    *MIN_PIPELINE_BATCH_CELL.get_or_init(|| DEFAULT_MIN_PIPELINE_BATCH)
-}
-#[allow(dead_code)]
-pub(crate) const MIN_PIPELINE_BATCH: usize = DEFAULT_MIN_PIPELINE_BATCH;
 
 pub(crate) struct CompactStats {
     pub input_tables: usize,
@@ -3225,13 +3211,6 @@ mod sqcq_tests {
             "ps_bulk_inflight_cap out of range: {}",
             v
         );
-    }
-
-    #[test]
-    fn min_pipeline_batch_matches_client_count() {
-        // Guard: regressing this to < 256 risks the R3 5b regression where
-        // small batches stole from large bursts.
-        assert_eq!(super::MIN_PIPELINE_BATCH, 256);
     }
 
     /// Silence unused-warning for AtomicUsize import if other tests change.

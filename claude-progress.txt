@@ -1,90 +1,60 @@
-Date: 2026-06-06
+Date: 2026-06-10
 TaskStatus: completed
-Task scope: BUG-LEASE-1 .. BUG-LEASE-7 (the 7 fixable bugs from
-  the two-round coco arch review across the lease subsystem +
-  Phase 1/2/3 implementation). Plus the R2 follow-ups (R2-P0
-  #1/#2/#3 + R2-P1 #4/#5).
-
-  Round 1 (coco arch review 2026-06-05) surfaced 8 bugs:
-    P0 #1 BUG-LEASE-1 — heartbeat doesn't refresh etcd expires_at.
-    P0 #2 BUG-LEASE-2 — storage-layer fencing token (Phase 1).
-    P0 #3 BUG-LEASE-3 — LeaseRevoked event doesn't immediately
-                        clear held_leases.
-    P1 #4 BUG-LEASE-4 — force-revoke etcd-persist fail → phantom
-                        revoke (deposed writer + readers saw
-                        events for a preemption that didn't land).
-    P1 #5 BUG-LEASE-5 — TTL revoke etcd-delete fail has no retry
-                        queue.
-    P2 #7 BUG-LEASE-6 — notify_inval_inode failure isn't
-                        fail-closed.
-    P2 #8 BUG-LEASE-7 — FUSE Open doesn't bind cached state to
-                        lease version.
-    P2 #9 BUG-LEASE-8 — multi-key write has no atomic commit
-                        boundary. ARCHITECTURAL, DEFERRED.
-
-  Round 2 (coco re-review 2026-06-06) surfaced 7 follow-ups:
-    R2-P0 #1 — heartbeat etcd put is BLIND (no CAS).
-    R2-P0 #2 — fuse Release flush-decision broken by BUG-LEASE-3's
-                eviction.
-    R2-P0 #3 — fuse Write doesn't check held_leases.
-    R2-P1 #4 — partition-server panic risk (borrow scope across
-                match arms).
-    R2-P1 #5 — fence floor poisoned by oversized writes.
-    R2-P1 #6 — MSG_PUT_ZC bypasses fencing (tracked as
-                BUG-LEASE-2 Phase 2; deferred).
-    R2-P2 #7 — SDK-side CODE_FENCED typed mapping (deferred).
+Task scope: F256 — partition_loop natural batching (remove the
+  MIN_PIPELINE_BATCH launch gate that lock-stepped the 4K write
+  pipeline whenever per-partition concurrency < 256).
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
   Already implemented (this session):
-    - BUG-LEASE-1 (commit a51bbfc) — etcd refresh on heartbeat.
-    - BUG-LEASE-2 Phase 1 (commit cdc1ad6) — per-PS fence floor.
-    - BUG-LEASE-3 (commit cdc1ad6) — held_leases per-event evict.
-    - R2 batch 1 (commit 88d93a0) — heartbeat CAS + fence-order
-        + borrow-scope.
-    - R2-P0 #2/#3 (commit 78dbfaf) — sticky lease_revoked +
-        Write/Release fail-closed.
-    - BUG-LEASE-4 (commit 0fa57e3) — deferred-push 2PC for
-        force-revoke + version rewind on revert.
-    - BUG-LEASE-5 (commit 3ac5ed7) — 2PC TTL revoke loop.
-    - BUG-LEASE-6 (commit efcd893) — sticky-set fail-closed for
-        notify_inval_inode.
-    - BUG-LEASE-7 (commit c46762b) — InodeState.cached_version
-        binding + Open arm reload-on-mismatch.
+    - F256 (lib.rs partition_loop (B) + background.rs knob removal +
+      partition_server.rs --min-pipeline-batch deprecated no-op +
+      CLAUDE.md x2 + README.md + feature_list.md entry).
+    - Verified (no change needed): append hot path does NO per-append
+      commit_length RPC (stream CLAUDE.md note 9 — current_commit()
+      is tail-init only), so the gate was the only lock-step source.
 
-  Not implemented (intentionally deferred):
-    - BUG-LEASE-2 Phase 2 — PUT_ZC fencing + fuse/ioring epoch
-      stamping. Requires wire change + value-copy/registration
-      path rework; tracked.
-    - BUG-LEASE-8 — multi-key write atomic commit boundary.
-      Pre-existing fuse-layer limitation (predates the lease
-      work); requires per-inode generation manifest + orphan
-      GC on uncommitted generations.
-    - R2-P2 #7 — SDK-side CODE_FENCED typed error mapping. UX
-      polish; not load-bearing.
+  Not implemented (out of scope, candidate follow-ups from the same
+  4K-write investigation, NOT started):
+    - put_many/MSG_BATCH_PUT adoption audit for kvcache writers
+      (server batch path already exists).
+    - client-side put() double-copy removal (key.to_vec +
+      rkyv value.to_vec).
+    - chain replication for >=64K writes / VP direct-read from EN /
+      hedged+rotated replica reads (architecture discussion recorded
+      in session, no design doc yet).
 
 Current summary:
-  All 7 fixable BUG-LEASE bugs landed across 7 commits, each
-  with default-CI pure-fn tests + (where the test harness
-  permits) cluster e2e. Aggregate: 159 partition-server +
-  149 manager + 43 fuse + 68 ioring unit tests pass; 20
-  lease cluster integration tests pass (f_ioring_lease[_2/_3/_4],
-  f_lease_preempt, bug_lease_3_revoke_evicts,
-  bug_lease_4_force_revoke_2pc).
+  F256 landed. Controlled same-environment A/B (fresh 3-replica
+  3disk cluster per side, p8 x t16 x d8, EN base port 20000):
+    TCP 4K write: F256 61,457 / 58,504 (two runs) vs baseline-code
+      46,997 ops/s = +24-31%; p50 1.07ms vs 1.68ms.
+    TCP 8M write: 165.12 vs 175.08 = -5.7% (single-run noise on the
+      disk-bound leg; both sides tripped the same p99 warning from
+      shared-tenant disk pressure). 8M read 623 vs 585 (+6.5%).
+    UCX 4K write: 7,794 vs 6,994 = +11% (both ~7x below the 51K
+      committed baseline — environment-wide UCX loopback write
+      degradation that day; reads 99% of baseline on both sides).
+  Tests: cargo test --workspace --exclude autumn-manager all pass
+  (158 partition-server). coco /findbugs deep (GPT-5.5): no P0/P1;
+  P2 (pub setter removal breaks out-of-repo callers) rejected as
+  solo-workspace-theoretical; P3 (.skillopt-sleep) followed.
 
 Main gaps:
-  - BUG-LEASE-2 Phase 2 (PUT_ZC fencing): a writer holding a
-    revoked lease can still bypass the per-inode fence floor
-    via the zero-copy write path. Currently the fuse Write
-    arm fail-closes client-side (R2-P0 #3), so the bytes
-    don't leave the daemon, but a programmatic client that
-    skips the SDK lease check could still race. Tracked.
-  - BUG-LEASE-8 (multi-key write atomicity): deferred per
-    spec; needs design + commit-record + recovery GC.
+  - Committed perf baselines (perf_baseline_*.json) were recorded on
+    healthier disks: on 2026-06-10 even UNCHANGED code reached only
+    74% (tcp 4k) of its own baseline. Baselines NOT re-recorded (the
+    day's environment would bake transient tenant pressure into them).
+  - Bench-environment traps hit during verification (no code change):
+    (a) a Ray tenant now squats *:10101-10103 = EN ctl ports
+        (data 9101 + 1000) -> TCP EN fail-stop on bind -> cluster
+        start TIMEOUT. Workaround: AUTUMN_EXTENT_BASE_PORT=20000.
+    (b) perf_check.sh:90 defaults UCX_TLS=^sysv,^posix (known-buggy
+        spelling; '^posix' parses as a literal TL). Export
+        UCX_TLS='^sysv,posix' when invoking.
+    (c) UCX manager 9001 needs a few seconds of linger after kill
+        before rebind (ucp_listener has no SO_REUSEADDR path).
 
 Next steps:
-  None for this task. The session-closure invariant (CLAUDE.md
-  rule 9) is satisfied: commits landed, progress + feature_list
-  updated, work area clean (no half-applied edits). Future
-  follow-ups will be opened separately if/when the deferred
-  items are picked up.
+  None for this task. Session-closure invariant satisfied: commit
+  landed, progress + feature_list updated, workspace clean.

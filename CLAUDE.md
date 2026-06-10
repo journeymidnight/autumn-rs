@@ -121,7 +121,8 @@ Put(key, value, must_sync)
             ├─ Decode PutReq inline (no spawn, no inner oneshot)
             ├─ Push WriteRequest with direct WriteResponder::Put{outer=resp_tx, key}
             │    into `pending` Vec
-            ├─ When pending >= MIN_PIPELINE_BATCH (256) OR pipeline empty:
+            ├─ When pending non-empty AND inflight < cap (F256 natural
+            │    batching; batch = everything arrived since last launch):
             │    Phase 1: assign seq, build WAL records
             │    [op:1][key_len:4][val_len:4][expires_at:8][key][value]
             │    Launch Phase 2 future into FuturesUnordered (cap = AUTUMN_PS_INFLIGHT_CAP)
