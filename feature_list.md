@@ -4543,6 +4543,64 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
 
 ---
 
+## P15 — 数据通路四项优化（2026-06-10 架构评审产出；用户排序 3→2→1→4 = F258→F259→F260→F261，逐一实现）
+
+### F258 · 读副本打散 + hedged read（Dynamo / "The Tail at Scale"）
+- **目标**：`read_replicated_with_failover`（stream client.rs ~2633）现状永远从
+  replica[0] 顺序试——3 副本的读 IO 全压第一副本，其余盘/网卡闲置。
+  改为：(a) 按 `(extent_id, offset)` hash 轮转起始副本（读带宽摊到 3 副本）；
+  (b) hedge：首副本超过 hedge 阈值未返回时并发发第二副本，取最快者（治尾延迟）。
+- **边界**：只动 sealed-extent 读路径（不可变，读任何副本无一致性代价）；
+  open-tail 读、EC 读（`ec_subrange_read`）不动；hedge 不得放大失败重试风暴
+  （第二发也失败才走原 failover 链）；hedge 阈值可配（CLI flag，默认保守如
+  p95 量级固定值或禁用 hedge 仅轮转）。
+- **验收**：单测覆盖轮转选择与 hedge 取最快/取消慢者；perf-check 8M 读不回归
+  且多副本盘 IO 分布可观测（iostat 或读计数）；4K 读不回归；chaos 读路径过。
+- **passes:** not_completed (planned)
+
+### F259 · VP 大值 client 直读 EN（3FS/Crail 元数据-数据分离）
+- **目标**：kvcache get 已定性 data-movement bound；大值（VP）读现状是
+  PS 拿 VP 后经自己的 stream_client 读 EN 再中转给 client，8M 白白过手一次。
+  改为：PS 对 ≥64K 的 VP 返回 VP 描述（extent_id/offset/len/eversion/revision），
+  client 直连 EN 拉取（复用 client 侧已有的 EN 直读能力——fuse/ioring 已走通）。
+- **边界**：新增响应形态（MSG_GET_REDIRECT 或 GetResp 扩展），inline 小值路径
+  不动；client 需缓存 extent→replica 路由 + eversion 失效时回 PS/manager 重试
+  （复用 F116/F119-C eversion 重试模式）；GC pin（F162 per-extent CAS pin）语义
+  要在直读下保持——读期间 extent 被 punch 的窗口需要 fail-and-retry 而非错读。
+- **验收**：e2e：大值 get 字节正确 + eversion 过期自动恢复 + GC 并发下无脏读
+  （复用 MED-2 测试形态）；kvcache get_many_into 吞吐提升可测；PS CPU/网卡
+  出口在 8M 读负载下显著下降；TCP+UCX 两传输都过。
+- **passes:** not_completed (planned)
+
+### F260 · 大值写链式复制（WAS / HDFS pipeline，混合模式）
+- **目标**：写现状 star 扇出（client.rs launch_append join_all 并发发 3 副本）：
+  8M 写 PS 出口烧 3× 带宽，吞吐天花板 = NIC/3。改为混合：payload ≥64K
+  （复用 `zc_worthwhile` 阈值）走链式 PS→EN1→EN2→EN3，小写保留 star。
+- **边界**：EN 增加转发路径（收到链式 append 后 pipeline 给下游并聚合 ack）；
+  all-replica-ACK 语义不变（链尾 ack 链回，等价全副本确认）；commit/truncate
+  协议、fencing（revision/eversion 检查每跳都做）不变；失败语义=任一跳失败
+  整条 append 失败走现有 soft-error 重试/seal-and-roll，不引入部分成功状态。
+- **验收**：8M 写吞吐显著提升（理论 ≤3×，验收 ≥1.5×@3disk 单机或跨主机实测）；
+  4K 写（star 路径）零回归；chaos kill 链中间节点 → 写失败可重试、零数据丢失；
+  coco arch 评审链式 ack/截断交互。
+- **passes:** not_completed (planned)
+
+### F261 · SSTable 按需分页 + 带逐出的 block cache（RocksDB 形态）
+- **目标**：现状 `SstReader` 整个 SST bytes 常驻 PS 内存、`block_cache:
+  Vec<Option<Arc<DecodedBlock>>>` 只增不逐出——数据集规模被 PS RAM 封顶，
+  128MB SST 挤占 memtable。改为：常驻 index+bloom+meta，data block 按需从
+  row_stream 读 + 全局（per-PS）LRU/Clock cache 有界逐出。
+- **边界**：读路径语义不变（点查/range/compaction 迭代器都走同一 block 读取
+  抽象）；compaction/recovery 的全量扫描不应污染热 cache（scan-resistant 或
+  bypass）；P-bulk/P-log 线程模型不变（block 读经由所属分区的 stream_client）；
+  cache 容量 CLI 可配，默认保守。
+- **验收**：冷数据集 >PS RAM 场景可服务（现状 OOM/不可装载）；热工作集读
+  性能不回归（perf-check 读两尺寸）；compaction 后 cache 失效正确（无脏块）；
+  内存峰值有界可观测。
+- **passes:** not_completed (planned)
+
+---
+
 ## P14 — Inode-level lease + close-to-open coherence (F-ioring-lease series)
 
 Plan: `docs/autumn_fs_lease_plan.md` (2026-06-05). Goal: make
