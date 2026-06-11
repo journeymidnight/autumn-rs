@@ -181,9 +181,9 @@ recovery. Some are gated with `#[ignore]` because they take minutes; use
 `cargo test --release -- --ignored` to run the slow set.
 
 **Write-pipeline changes (e.g. F256 natural batching) are verified with the perf matrix**
-(`./perf_check.sh --3disk --partitions 8` — builds release, starts a fresh 3-replica
+(`./perf/perf_check.sh --3disk --partitions 8` — builds release, starts a fresh 3-replica
 cluster, runs tcp/ucx × 4K/8M and compares each leg against
-`perf_baseline_<transport>_p8_d8_s<size>.json`; a leg passes when ops/s ≥ 80% of
+`perf/perf_baseline_<transport>_p8_d8_s<size>.json`; a leg passes when ops/s ≥ 80% of
 baseline and p99 ≤ 2×). The `--min-pipeline-batch` PS flag is deprecated since F256
 (parsed, warns, no effect) — batch sizing is adaptive and needs no tuning knob.
 

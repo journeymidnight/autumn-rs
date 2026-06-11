@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+# perf_check.sh — build release, start fresh 3-replica cluster, run perf-check
+#
+# Default: runs the 2×2×1×2 = 8-run matrix
+#   transports     = {tcp, ucx}
+#   partitions     = {1, 8}
+#   pipeline-depth = {8}          (client-side only; d=8 is the throughput point)
+#   value size     = {4K, 8M}
+# → 4 cluster restarts (size is client-side only; inner-loop).
+#
+# Client concurrency: `--threads 16` by default (override with --threads N).
+# Total in-flight = threads × pipeline-depth. Keep threads low (≤ ~32) and
+# scale via pipeline-depth — this is thread-per-core-correct on the client
+# side AND keeps each partition's single-threaded UCX worker on the PS
+# in its supported region (see "UCX cliff" note below).
+# At 16t × d=8 = 128 in-flight the 2×2×2×2 matrix reaches:
+#   TCP p=8 × 16t × d=8 × 4 KB → 142 k write / 1.11 M read
+#   UCX p=8 × 16t × d=8 × 4 KB → 129 k write / 764 k read
+# 8 MB payload is where UCX rc_mlx5 zero-copy starts beating TCP loopback
+# memcpy — the rndv-get-zcopy handshake gets amortized over a much larger
+# DMA; at 4 KB it's pure overhead (see F100-UCX §12).
+#
+# UCX cliff (post fix(ucx): drop UcxEp close-on-Drop, 2026-04-29). Each
+# PS partition runs a single-threaded UCX worker. The cliff is set by
+# *EPs per partition's worker*, not by aggregate in-flight ops:
+#   - perf-check read keeps a per-thread HashMap<ps_addr, RpcClient> →
+#     each thread eventually opens one EP to every partition →
+#     EPs / partition = client_threads.
+#   - perf-check write pins each thread to one partition (tid % parts) →
+#     EPs / partition = client_threads ÷ partitions.
+# In-flight is symmetric (FuturesUnordered cap is per-thread =
+# pipeline_depth) and = client_threads × pipeline_depth ÷ partitions for
+# both phases. The reason read collapses before write at the same thread
+# count is the EP-count axis (8× more EPs/partition for read at p=8).
+# Empirical at p=8 d=16 4 KB:
+#   --threads 16  → 16 EPs/p → write 104 k · read 970 k · p99 0.46 ms ✓
+#   --threads 32  → 32 EPs/p → write  80 k · read 610 k · p99 1.16 ms (degrading)
+#   --threads 64  → 64 EPs/p → write 14 k  · read 105 k · p99 18 ms ✗ cliff
+#   --threads 256 → 256 EPs/p → write ~0   · read   0   · ✗ hard fail
+# Rule of thumb: keep client_threads ÷ partitions ≲ 32 (read EPs per
+# partition's worker). Need more total client concurrency? Add
+# partitions, not threads — see README "UCX scaling and limits" for
+# the full discussion. Numbers above `--threads 32` at
+# `--pipeline-depth 16 --partitions 8` are outside the UCX supported
+# region and should not be used as performance signal.
+#
+# Usage:
+#   ./perf_check.sh                       # default 2×2×2×2 matrix on disk
+#   ./perf_check.sh --shm                 # matrix on RAM tmpfs
+#   ./perf_check.sh --tcp                 # tcp only (still all inner axes)
+#   ./perf_check.sh --ucx                 # ucx only
+#   ./perf_check.sh --partitions 8        # both transports, partitions=8 only
+#   ./perf_check.sh --pipeline-depth 8    # pipeline-depth=8 only
+#   ./perf_check.sh --size 8m             # 8 MB only (or e.g. --size 4k, --size 1048576)
+#   ./perf_check.sh --threads 32          # override client thread count
+#   ./perf_check.sh --tcp --partitions 1 --pipeline-depth 1 --size 4k  # one combo
+#   ./perf_check.sh --update-baseline     # create / overwrite per-combo baselines
+#   ./perf_check.sh --3disk               # spread 3 replicas across /data03,
+#                                         #   /data05, /data08 (3 independent
+#                                         #   NVMes) — fsync parallelises across
+#                                         #   hardware instead of all 3 replicas
+#                                         #   queueing on a single disk
+#
+# --shm is useful for isolating the RPC / partition / stream layers from the
+# underlying filesystem (extent storage lives in RAM, fsync is a no-op).
+# Separate baseline files per (transport, partitions, storage) combination.
+
+set -uo pipefail   # NOTE: no -e — we want the matrix to keep going past a failure
+
+# macOS default is 256 open files — far too few for 256-thread benchmarks
+ulimit -n 65536 2>/dev/null || true
+
+# RDMA pins memory via ibv_reg_mr. Default RLIMIT_MEMLOCK (often 8 MB) is
+# too small for the 8 MB payload matrix (16 threads × 8 MB = 128 MB
+# concurrent pinned). Child processes (cluster.sh → manager/node/ps
+# daemons) inherit this limit, so set it here to cover everything.
+ulimit -l unlimited 2>/dev/null || true
+
+# UCX workaround: this environment blocks BOTH the SysV and POSIX
+# shared-memory transports on the > eager-threshold path:
+#   sysv:  `mm_sysv.c:59  shmat(shmid=...) failed: Invalid argument`
+#          (IPC namespace denies shmat)
+#   posix: `mm_posix.c:233 open(file_name=/proc/<peer_pid>/fd/<N>) failed:
+#           No such file or directory`
+#          (peer-fd visibility through /proc restricted)
+# Either one being chosen by UCX for an 8 MB rendezvous causes the send
+# to wedge for tens of seconds. Excluding both lets UCX fall back to
+# `cma` (zero-copy syscall, 17+ GB/s in ucx_perftest) for intra-host
+# bulk + `tcp` for control. Respects caller-provided UCX_TLS.
+# UCX_TLS: POSITIVE transport list only (no ^ negation — leading ^ negates
+# the WHOLE list and a non-leading ^x is silently ignored as a literal name;
+# both bit us on 2026-06-10). UCX_TLS is a CAPABILITY SET, not a priority
+# list: ucp_worker_create eagerly opens an iface (CQ/SRQ/QP machinery via
+# DEVX ioctls) for EVERY allowed transport x device at creation time —
+# transport selection per peer happens later, at ep wireup. So listing
+# rc_mlx5 costs 10-IB-device iface creation per worker even if all traffic
+# ends up on posix shm (the 2026-06-10 t256 creation-storm collapse was
+# exactly this cost under a spinlock). Pick by scenario:
+#
+#   loopback bench (this script's default): posix,cma,tcp,self
+#     - posix shm carries PS->EN appends: 69K write / 969K read 4K t16,
+#       vs 8.3K write with shm disabled.
+#     - no IB transports -> worker creation skips all 10 RoCE devices
+#       (cheap creation; high client thread counts stay viable).
+#   cross-host RoCE: posix,cma,rc_mlx5,ud_mlx5,tcp,self
+#     - UCX auto-picks shm intra-host / RDMA cross-host per peer.
+#     - MUST also pin UCX_NET_DEVICES=mlx5_1:1 on both ends (10-device
+#       auto-select hangs) — and that pin breaks loopback (kills
+#       tcp-over-lo), which is why one universal config does not exist.
+: "${UCX_TLS:=posix,cma,tcp,self}"
+export UCX_TLS
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# perf/ layout: baselines live beside this script (SCRIPT_DIR); the repo
+# root (cluster.sh, target/) is one level up.
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+AC="$ROOT_DIR/target/release/autumn-client"
+
+# AC_PREFIX is a hook for ad-hoc client wrapping (numactl, taskset, perf
+# stat, strace ...). Empty by default — the benchmark should reflect the
+# production network path where client runs on a separate host and the
+# NIC's NUMA locality (not the client thread's) is what matters. Pinning
+# the local bench client via `numactl --cpunodebind=0 --membind=0` does
+# improve loopback read throughput ~20% by removing cross-NUMA sk_buff
+# memcpy, but that win does not exist over real NICs and would inflate
+# the baseline above any production system can reach. Keep the hook so
+# experiments that explicitly want to isolate the bench harness can
+# still set `AC_PREFIX="numactl ..." ./perf_check.sh ...`.
+: "${AC_PREFIX:=}"
+if [[ -n "$AC_PREFIX" ]]; then
+    echo "[perf-check] AC_PREFIX (override): $AC_PREFIX"
+fi
+
+USE_SHM=0
+USE_3DISK=0
+UPDATE_BASELINE=""
+SKIP_CLUSTER=0
+TRANSPORT_LIST="tcp ucx"          # default: both transports
+PARTITIONS_LIST="1 8"             # default: both partition counts
+PIPELINE_DEPTH_LIST="8"           # depth is client-side only; d=8 is the representative throughput point
+SIZES_LIST="4096 8388608"         # default: 4 KB (small-msg) + 8 MB (rndv-zcopy)
+THREADS=16                        # default: 16 client OS threads (see header)
+DURATION=10                       # default: 10 s (baseline window). Use --duration 120
+                                  # to exercise compact/gc paths (F196 D-r7-recal).
+
+# Map a byte size to a short label used in baseline filenames:
+# 4096 → "4k", 8388608 → "8m", other → "<N>b" / "<N>k" / "<N>m".
+fmt_size_label() {
+    local n="$1"
+    if (( n >= 1048576 )) && (( n % 1048576 == 0 )); then
+        echo "$(( n / 1048576 ))m"
+    elif (( n >= 1024 )) && (( n % 1024 == 0 )); then
+        echo "$(( n / 1024 ))k"
+    else
+        echo "${n}b"
+    fi
+}
+# Parse a user-facing size arg: accepts "4096", "4k", "8m", etc.
+parse_size() {
+    local s="$1"
+    case "$s" in
+        *[mM])    echo $(( ${s%[mM]} * 1048576 )) ;;
+        *[kK])    echo $(( ${s%[kK]} * 1024 )) ;;
+        *[0-9])   echo "$s" ;;
+        *) echo "__ERR__" ;;
+    esac
+}
+while (( $# > 0 )); do
+    case "$1" in
+        --shm)              USE_SHM=1 ;;
+        --3disk)            USE_3DISK=1 ;;
+        --update-baseline)  UPDATE_BASELINE="--update-baseline" ;;
+        --skip-cluster)     SKIP_CLUSTER=1 ;;
+        --ucx)              TRANSPORT_LIST="ucx" ;;
+        --tcp)              TRANSPORT_LIST="tcp" ;;
+        --transport-both)   TRANSPORT_LIST="tcp ucx" ;;   # back-compat no-op (already default)
+        --partitions)
+            shift
+            v="${1:-}"
+            [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 )) \
+                || { echo "--partitions must be a positive integer" >&2; exit 1; }
+            PARTITIONS_LIST="$v"
+            ;;
+        --pipeline-depth)
+            shift
+            v="${1:-}"
+            [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 256 )) \
+                || { echo "--pipeline-depth must be an integer in [1, 256]" >&2; exit 1; }
+            PIPELINE_DEPTH_LIST="$v"
+            ;;
+        --size)
+            shift
+            bytes="$(parse_size "${1:-}")"
+            [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes >= 1 )) \
+                || { echo "--size must be bytes, or Nk / Nm (e.g. 4096, 4k, 8m)" >&2; exit 1; }
+            SIZES_LIST="$bytes"
+            ;;
+        --threads)
+            shift
+            v="${1:-}"
+            [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 )) \
+                || { echo "--threads must be a positive integer" >&2; exit 1; }
+            THREADS="$v"
+            ;;
+        --duration)
+            shift
+            v="${1:-}"
+            [[ "$v" =~ ^[0-9]+$ ]] || { echo "--duration needs a positive integer" >&2; exit 1; }
+            DURATION="$v"
+            ;;
+        -h|--help)
+            sed -n '2,30p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+if (( USE_SHM )); then
+    export AUTUMN_DATA_ROOT="/dev/shm/autumn-rs"
+    STORAGE_LABEL="RAM tmpfs (/dev/shm)"
+    STORAGE_SUFFIX="_shm"
+else
+    # Honor a pre-set AUTUMN_DATA_ROOT so callers can target a specific
+    # disk (e.g. AUTUMN_DATA_ROOT=/data03/autumn-rs to escape overlayfs
+    # in containerized environments where /tmp may not be a real ext4
+    # mount). Default stays /tmp/autumn-rs to match historical baselines.
+    export AUTUMN_DATA_ROOT="${AUTUMN_DATA_ROOT:-/tmp/autumn-rs}"
+    STORAGE_LABEL="disk ($AUTUMN_DATA_ROOT)"
+    STORAGE_SUFFIX=""
+fi
+
+# F100-UCX: build with the ucx feature when any UCX run is requested.
+NEED_UCX_FEATURE=0
+for t in $TRANSPORT_LIST; do
+    [[ "$t" == "ucx" ]] && NEED_UCX_FEATURE=1
+done
+echo "[perf-check] building release binaries$([ $NEED_UCX_FEATURE -eq 1 ] && echo " (with --features autumn-server/ucx)")..."
+cd "$ROOT_DIR"
+if (( NEED_UCX_FEATURE )); then
+    cargo build --workspace --release --exclude autumn-fuse \
+        --features autumn-server/ucx 2>&1 \
+        | grep -E "^(Compiling|Finished|error)" || true
+else
+    cargo build --workspace --release --exclude autumn-fuse 2>&1 \
+        | grep -E "^(Compiling|Finished|error)" || true
+fi
+
+# Wait until extent-node ports (9101..9103) have no lingering sockets in
+# either direction (server-side LISTEN/TIME_WAIT *or* client-side TIME_WAIT
+# with peer=:910x). UCX's ucp_listener_create empirically refuses to bind
+# while client-side TIME_WAITs targeting the same port still exist, so we
+# must wait for both columns to clear. Bounded so a stuck socket can't
+# stall the matrix forever.
+await_ports_clear() {
+    # 180s cap — TCP runs can pile up many client-side TIME_WAITs that need
+    # to age out before UCX's ucp_listener_create (no SO_REUSEADDR) succeeds.
+    local deadline=$((SECONDS + 180))
+    while (( SECONDS < deadline )); do
+        if ! ss -tan 2>/dev/null \
+                | awk 'NR>1 {print $4; print $5}' \
+                | grep -qE ':(9101|9102|9103)$'; then
+            return 0
+        fi
+        sleep 5
+    done
+    echo "[perf-check] WARN: 9101..9103 still have lingering sockets after 180s"
+}
+
+# Inner runner: starts cluster under given AUTUMN_TRANSPORT + presplit, runs
+# perf-check at the requested pipeline-depth and value size. The cluster is
+# restarted per (mode, parts) but reused across pipeline-depth and size
+# values for that pair — both are purely client-side knobs. Saves many
+# cluster restarts (~25 s each) when the full matrix runs.
+run_perf() {
+    local mode="$1"
+    local parts="$2"
+    local depth="$3"
+    local size="$4"
+    local size_label
+    size_label="$(fmt_size_label "$size")"
+    local baseline="$SCRIPT_DIR/perf_baseline_${mode}_p${parts}_d${depth}_s${size_label}${STORAGE_SUFFIX}.json"
+
+    echo
+    echo "============================================================"
+    echo "[perf-check] mode=$mode partitions=$parts pipeline-depth=$depth size=$size_label ($size B) storage=$STORAGE_LABEL"
+    echo "[perf-check] baseline=$(basename "$baseline")"
+    echo "============================================================"
+    ${AC_PREFIX:-} "$AC" --manager "${AUTUMN_BIND_HOST:-127.0.0.1}:9001" --transport "$mode" \
+        perf-check \
+        --threads "$THREADS" \
+        --duration "$DURATION" \
+        --size "$size" \
+        --partitions "$parts" \
+        --pipeline-depth "$depth" \
+        --baseline "$baseline" \
+        $UPDATE_BASELINE \
+        || echo "[perf-check] perf-check exited non-zero (mode=$mode parts=$parts depth=$depth size=$size_label)"
+}
+
+start_cluster_for() {
+    local mode="$1"
+    local parts="$2"
+    if (( parts > 1 )); then
+        export AUTUMN_BOOTSTRAP_PRESPLIT="${parts}:hexstring"
+    else
+        unset AUTUMN_BOOTSTRAP_PRESPLIT
+    fi
+    if (( SKIP_CLUSTER == 0 )); then
+        bash "$ROOT_DIR/cluster.sh" clean
+        await_ports_clear
+        # F122-fix: default to AUTUMN_EXTENT_SHARDS=4 so each EN process has 4
+        # cores serving extent traffic (single-shard mode put all 3-replica
+        # writes through 3 cores total — EN became the wall at >100k ops/s).
+        # Caller can override via env. With our current cpu-start formula
+        # (EN_i: (i-1)*SHARDS, PS: REPLICAS*SHARDS) 4 shards × 3 replicas = 12
+        # EN cores then PS partitions take 2N cores after — fits any
+        # reasonably-sized host's cpuset.
+        # --3disk: spread the 3 replicas across /data03, /data05, /data08
+        # (three independent NVMes) instead of one disk → fsync work
+        # parallelises across hardware. Without this flag, all 3 replicas
+        # land on whatever single disk AUTUMN_DATA_ROOT points at.
+        local cluster_3disk=()
+        if (( USE_3DISK )); then
+            cluster_3disk=(--3disk)
+        fi
+        # F196: cluster.sh default PS cpuset budget = PS_PARTS_HINT (8).
+        # If this bench asks for more partitions, the PS would silently
+        # skip openings past the budget. Bump the hint to match the
+        # bench's partition count so all partitions actually open.
+        local ps_parts_hint_for_bench="${AUTUMN_PS_PARTS_HINT:-}"
+        if [[ -z "$ps_parts_hint_for_bench" ]] && (( parts > 8 )); then
+            ps_parts_hint_for_bench="$parts"
+        fi
+        # F197-followup (2026-05-13): bumped 4 → 8 after 120 s test
+        # showed SHARDS=8 gives read +9 % / read-p99 −11 % at no
+        # write cost (write is fsync-bound, the row_stream tail extent
+        # serialises on its single shard regardless of total shard count).
+        AUTUMN_EXTENT_SHARDS="${AUTUMN_EXTENT_SHARDS:-8}" \
+        AUTUMN_PS_PARTS_HINT="${ps_parts_hint_for_bench:-8}" \
+        AUTUMN_TRANSPORT="$mode" bash "$ROOT_DIR/cluster.sh" start 3 \
+            "${cluster_3disk[@]}" \
+            || { echo "[perf-check] FAILED to start cluster (mode=$mode parts=$parts)"; return 1; }
+    else
+        echo "[perf-check] --skip-cluster: assuming cluster is already running in $mode mode"
+    fi
+}
+
+OVERALL_RC=0
+for mode in $TRANSPORT_LIST; do
+    for parts in $PARTITIONS_LIST; do
+        if ! start_cluster_for "$mode" "$parts"; then
+            OVERALL_RC=1
+            continue
+        fi
+        for depth in $PIPELINE_DEPTH_LIST; do
+            for size in $SIZES_LIST; do
+                run_perf "$mode" "$parts" "$depth" "$size" || OVERALL_RC=1
+            done
+        done
+    done
+done
+
+# Final cluster cleanup so the matrix leaves no dangling processes.
+bash "$ROOT_DIR/cluster.sh" clean >/dev/null 2>&1 || true
+
+exit $OVERALL_RC
