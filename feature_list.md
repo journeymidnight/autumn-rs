@@ -372,3 +372,20 @@ gaps in the lease protocol's correctness story.
 - **验收:** 全 8 crate 549 单测绿；BUG-LEASE-2 Phase 2 e2e（全集群
   启动含 owner-lock 流程）重跑 2/2 PASS。
 - **passes:** completed (2026-06-11)
+
+---
+
+### F264 · chaos 补充：PS-failover + transport 层（用户 /loop 指令 2026-06-11）
+- **目标:** ① 2 PS 集群 kill 一个 → partition 必须迁移到幸存者且零数据
+  丢失（system_chaos 只杀 EN、单 PS 永不死——PS 驱逐→rebalance→
+  survivor open_partition 全恢复路径无 chaos 覆盖）；② transport 层
+  （tcp/ucx）chaos；发现 bug 修复 bug。
+- **已实现 (迭代 1):** `system_ps_failover_chaos.rs` ×2（子进程 PS 可
+  kill -9）：`ps_kill_migrates_partitions`（预置 100 键含 VP 大值 →
+  kill 持有者 → 45s 内重指派 → 全键字节校验 + 双分区写活性 → 原 psid
+  重启后一致性复查）；`ps_kill_during_write_storm`（40s 连续写中途
+  kill；ACK 集合必须全存活，超时写按 uncertain 规则剔除）。
+- **迭代 1 结果:** 2/2 PASS 首跑——110,799 ACK 写 0 丢失，kill 后两
+  partition 均迁移（211→212），SDK 重试完整扛过驱逐窗口（10s 驱逐 +
+  region_sync + survivor 恢复）。未发现 bug。
+- **passes:** not_completed (迭代进行中——transport ucx/tcp chaos 待做)
