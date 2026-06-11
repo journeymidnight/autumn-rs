@@ -1,6 +1,6 @@
 Date: 2026-06-11
 TaskStatus: completed
-Task scope: F267+F268+F269+F270 全部 completed — /loop chaos 迭代 5：multi-manager HA chaos
+Task scope: F267+F268+F269+F270+F271 全部 completed — /loop chaos 迭代 5：multi-manager HA chaos
   （manager_ha_chaos.sh H1 leader kill / H2 仅新 leader 时 PS kill /
   H3 老 leader 回归 follower），发现并修复 4 个真实 bug。
 
@@ -61,5 +61,7 @@ F270 残留窄尾已破并闭合：PartitionHandle.part_addr 存计算地址，
   BUG#3 端口 fallback 触发时 F265 自愈把正确注册覆写回死端口；ready
   通道回传实际 advertise 修复。seed=13 x15 = 15/15；全 gauntlet 回归
   4 轮 PASS 0 丢失。F270 completed。
+F271 (迭代 11): 20-seed K4/M2 严酷扫描 20/20 全 PASS（含历史 seed
+  8/13/15）。本机 chaos 面饱和。
 Next steps:
-  - 无（chaos /loop 全部已知项闭环）。
+  - 候选: 跨主机 chaos（远端集群, 真实 RoCE）。

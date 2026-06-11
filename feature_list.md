@@ -641,3 +641,16 @@ gaps in the lease protocol's correctness story.
   gauntlet 回归（transport E1-E7 tcp/ucx + HA tcp/ucx）全 PASS，
   1925/710/469/290 ACK 0 丢失。
 - **passes:** completed (2026-06-11)
+
+---
+
+### F271 · chaos 迭代 11：20-seed 严酷扫描认证（/loop 2026-06-11）
+- **目标:** F270 闭合后猎取新 seed 的 bug：历史挖出 seed=8/13/15 的严
+  酷配置（K4/M2、8 EN、60s、全 action 集）扫 seeds 1-20。
+- **结果:** **20/20 全 PASS**——wedge=0、modeY=0、not_found=0 全 seed
+  清零（含历史问题 seed 8/13/15）。F264-F270 修复栈在全 seed 空间成
+  立。未发现新 bug。
+- **结论:** 本机 in-process + 脚本级 chaos 面已饱和（E1-E7 + E6 soak
+  + HA + 20-seed 严酷扫描，tcp/ucx 双轨全绿）。下一个真正的新面是跨主
+  机 chaos（真实 RoCE 网络、rc_mlx5），需远端集群配合。
+- **passes:** completed (2026-06-11)
