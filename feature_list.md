@@ -252,22 +252,78 @@ gaps in the lease protocol's correctness story.
     bypass and per-ino independence.
 - **passes:** completed (2026-06-06, Phase 1 only)
 
-#### Phase 2 (PENDING) — WAL persistence + ZC framing
+#### Phase 2 (completed 2026-06-11) — WAL/checkpoint persistence + ZC framing + fuse/ioring stamping
 
-- WAL persistence: each accepted write records the new floor
-  alongside the value via an existing WAL record path; replay
-  reconstructs the in-memory map on PS restart.
-- ZC framing extension: `parse_put_zc_meta` adds
-  `inode_hint` + `lease_epoch`; `enqueue_put_zc` does the
-  fencing check too.
-- Wire epoch into write paths from autumn-fuse + autumn-ioring:
-  `FuseLease.version` / `SessionLease.version` is stamped on
-  every Put the lease covers. (`inode_hint = ino, lease_epoch =
-  version`.)
-- Reproduction for Phase 2: PS crash-restart during a force-
-  revoke window; old writer's late RPC must still be fenced
-  after restart.
-- **passes:** not_completed (Phase 2 — separate commit)
+- **WAL persistence**: new WAL op `OP_FENCE_BUMP` (0x08; key = ino
+  BE8, value = epoch LE8). `check_and_bump_fence` 返回 bumped 标志；
+  floor 真正抬升时 enqueue_put / enqueue_put_zc / enqueue_batch_put
+  把一条 `WriteOp::FenceBump`（`WriteResponder::Fence` 无客户端应答）
+  排在被接受写**之前**进同一 group-commit —— floor 持久化先于/同于该
+  写的 ACK。Phase 3 与重放都不入 memtable；重放 max-merge（幂等，
+  绕过 ts-dedup）；GC 的 VP 扫描天然跳过（无 VP 位）。
+- **Checkpoint 快照**: `TableLocations.fence_floors: Vec<(u64,u64)>`，
+  三个发布点（flush / compact×2）在同一 borrow 下
+  `snapshot_fence_floors`（F148-A 保持）。恢复时从所有 meta 记录
+  max-merge 种子（merge 后两来源 floors 并集）+ 重放补增量 ——
+  重放窗口之前的旧 floor 也存活。
+- **ZC framing**: `PUT_ZC_HEADER_LEN` 28 → 44（inode_hint+lease_epoch
+  追加在 key_len 之后、key 前移位）；`enqueue_put_zc` 与 enqueue_put
+  同语义检查（value-too-large 先于 fence，coco R2-P1 #5 顺序保持）；
+  `drain_zc_writes` 的 part_id/key_len 偏移不变仅 const 更新。
+  `BatchPutOp` 增 per-op 字段；被 fence 的 op 在 statuses 记
+  CODE_FENCED 不拖累整批。
+- **客户端**: `WriteLease{inode_hint, lease_epoch}` + `AutumnError::
+  Fenced` + `put_fenced / put_zc_fenced / put_many_fenced`；匿名路径
+  （put/put_many/kvcache/perf）全部 `WriteLease::ANON` 零行为变化。
+- **fuse**: `FsState::write_lease_for(ino)`（held_leases 的 WRITE
+  lease version；revoked 条目仍 stamp 旧 version → PS 拒绝 = 协议
+  的存储侧半边）；write_region 数据 extent（append 批 + RMW）、
+  truncate 跨界 put、put_inode 全部 fence-stamp。
+- **ioring**: `write_lease_of(OpenedExtents)`（lease_version==0 =
+  pre-lease 兼容 → ANON）；execute_step 数据 put/put_zc、
+  maybe_persist_size_growth、daemon 的 dirty-meta 延迟 flush
+  （map 值改 `(InodeMeta, lease_version)`）+ close 同步 flush 全部
+  fence-stamp。
+- **验证**: e2e `bug_lease_2_phase2_persistence.rs` ×2 PASS —
+  ① kill -9 重启（无 flush）→ stale epoch 仍 CODE_FENCED（WAL 重放
+  路径）+ ZC stale 重启前后均被 fence + live epoch 正常；
+  ② Maintenance FLUSH 后重启（vp 越过 bump 记录）→ floor 来自
+  checkpoint 快照。Phase 1 e2e ×2 回归 PASS。单测 162+72+27+68+19
+  全绿（rpc 新增 ZC meta roundtrip ×3）。4K 写 A/B 对照：A 52.5-56.4K
+  vs B(改前) 49.5-62.8K 完全重叠 = 环境噪声，无回归（匿名写仅多一次
+  RefCell borrow + 早退分支）。
+- **残留（记录不阻塞）**: StreamPut 未 fence（非 fuse/ioring 路径）；
+  归 BUG-LEASE-8 原子性家族一并考虑。
+- **coco review（GPT-5.5; 1 P1 修 + 1 P1 论证接受 + 1 P1 升级修掉 +
+  1 P1 按仓库惯例 + 1 P2 修 + 1 P3 修）**：
+  ① P1 #1 修——fence 检查曾在 in_range 之前：误路由写会抬升（Phase 2
+  后还持久化）floor。修为三个 enqueue（put/zc/batch per-op）+ delete
+  都先 range admission 再 fence（value-too-large 同序），
+  start_write_batch 的 range 检查保留为纵深。
+  ② P1 #2 论证后接受（snapshot_fence_floors 文档化）——checkpoint 可能
+  含 WAL 尚未落盘的 bump，但 floor=E 只编码"见过 epoch E 的请求"，
+  manager 单调发号下这一事实已证明 <E 的 writer 全部被撤销，fence 它们
+  永远正确；危险方向（floor 丢失）才是 WAL-before-ACK 防的。双态
+  pending/durable 机制对正确客户端零收益，不建。
+  ③ P1 #3 修（从"残留"升级）——DeleteReq 增 inode_hint/lease_epoch，
+  enqueue_delete 同 fencing（range→fence 序）；客户端 delete_fenced；
+  fuse truncate 整 extent 删除 + unlink delete_all_extents 全部
+  fence-stamp。撤销 writer 的迟到 truncate/unlink 不再能删新 writer
+  的数据。
+  ④ P1 #4 按仓库惯例——TableLocations 为持久化 rkyv 结构，旧 meta
+  checkpoint 不可解码：与 F207-E 同例，旧数据集群需 `cluster.sh
+  reset`（本仓库无滚动升级/数据保留升级承诺）。
+  ⑤ P2 #5 修——daemon dirty-meta flush 对 `Fenced` 终止性错误不再
+  requeue（旧 lease 永远不可能成功），丢弃 + WARN；close 同步 flush
+  同理且不再阻塞 close。
+  ⑥ P3 #6 修——e2e 重启等待循环加 60s 超时。
+- **命名收敛（用户指示）**：fencing epoch 在客户端侧统一为
+  `lease_epoch`——`FuseLease.version` → `lease_epoch`、
+  `OpenedExtents.lease_version` → `lease_epoch`（与
+  `WriteLease.lease_epoch` 一致）；manager 线协议字段
+  `MgrInodeLeaseInfo.version` 保留原名（发号方自身的状态机字段），
+  等价关系记录在 FuseLease 字段文档。
+- **passes:** completed (2026-06-11)
 
 ### BUG-LEASE-8 (P2 #9) — multi-key write has no atomic commit boundary
 

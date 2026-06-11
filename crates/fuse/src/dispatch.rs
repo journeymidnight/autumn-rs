@@ -284,7 +284,7 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
                 match autumn_client::lease::heartbeat(&cluster_h, &id_h, ino).await {
                     Ok(autumn_client::lease::HeartbeatResult::Renewed(info)) => {
                         if let Some(slot) = held_h.borrow_mut().get_mut(&ino) {
-                            slot.version = info.version;
+                            slot.lease_epoch = info.version;
                         }
                     }
                     Ok(autumn_client::lease::HeartbeatResult::NotHeld) => {
@@ -629,7 +629,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                             FuseLease {
                                 mode: req_mode,
                                 refcount: 1,
-                                version: info.version,
+                                lease_epoch: info.version,
                                 revoked: false,
                             },
                         );
@@ -823,7 +823,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                                 FuseLease {
                                     mode: req_mode,
                                     refcount: 1,
-                                    version: info.version,
+                                    lease_epoch: info.version,
                                     revoked: false,
                                 },
                             );
@@ -855,7 +855,7 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                         .held_leases
                         .borrow()
                         .get(&ino)
-                        .map(|s| s.version)
+                        .map(|s| s.lease_epoch)
                         .unwrap_or(0)
                 };
 
@@ -1222,7 +1222,7 @@ mod bug_lease_3_fuse_tests {
         FuseLease {
             mode,
             refcount: 1,
-            version: 1,
+            lease_epoch: 1,
             revoked: false,
         }
     }
@@ -1323,7 +1323,7 @@ mod r2_p0_2_3_lease_check_tests {
     use std::collections::HashMap;
 
     fn lease(mode: u8, refcount: u32, revoked: bool) -> FuseLease {
-        FuseLease { mode, refcount, version: 1, revoked }
+        FuseLease { mode, refcount, lease_epoch: 1, revoked }
     }
 
     // ── check_write_allowed ────────────────────────────────────

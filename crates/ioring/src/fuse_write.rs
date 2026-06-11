@@ -115,6 +115,21 @@ pub fn plan_write(extents: &[(u64, u32)], off: u64, src_len: usize) -> Vec<Write
     out
 }
 
+/// BUG-LEASE-2 Phase 2: fencing identity for an opened fd. `lease_epoch
+/// == 0` = pre-lease code path / test fixture — stays ANONYMOUS (no
+/// behavior change there); production opens populate `lease_epoch` from
+/// AcquireLease and every data/meta put under the fd is fence-stamped.
+fn write_lease_of(opened: &OpenedExtents) -> autumn_client::WriteLease {
+    if opened.lease_epoch == 0 {
+        autumn_client::WriteLease::ANON
+    } else {
+        autumn_client::WriteLease {
+            inode_hint: opened.ino,
+            lease_epoch: opened.lease_epoch,
+        }
+    }
+}
+
 /// `(floor, next)` for `pos` over a sorted extent map.
 fn floor_and_next(ext: &[(u64, u32)], pos: u64) -> (Option<(u64, u32)>, Option<u64>) {
     let idx = ext.partition_point(|&(s, _)| s <= pos);
@@ -140,6 +155,7 @@ async fn execute_step(
     ino: u64,
     src: &[u8],
     step: &WriteStep,
+    lease: autumn_client::WriteLease,
 ) -> Result<(u64, u32)> {
     match *step {
         WriteStep::Append {
@@ -151,12 +167,12 @@ async fn execute_step(
             if zc_worthwhile(len) {
                 let value = Bytes::copy_from_slice(&src[src_off..src_off + len]);
                 cluster
-                    .put_zc(&k, value)
+                    .put_zc_fenced(&k, value, lease)
                     .await
                     .map_err(|e| anyhow!("put_zc: {e}"))?;
             } else {
                 cluster
-                    .put(&k, &src[src_off..src_off + len])
+                    .put_fenced(&k, &src[src_off..src_off + len], lease)
                     .await
                     .map_err(|e| anyhow!("put: {e}"))?;
             }
@@ -182,12 +198,12 @@ async fn execute_step(
             let put_len = val.len();
             if zc_worthwhile(put_len) {
                 cluster
-                    .put_zc(&k, Bytes::from(val))
+                    .put_zc_fenced(&k, Bytes::from(val), lease)
                     .await
                     .map_err(|e| anyhow!("rmw put_zc: {e}"))?;
             } else {
                 cluster
-                    .put(&k, &val)
+                    .put_fenced(&k, &val, lease)
                     .await
                     .map_err(|e| anyhow!("rmw put: {e}"))?;
             }
@@ -219,6 +235,7 @@ async fn maybe_persist_size_growth(
         return Ok(());
     }
     opened.size = new_eof;
+    let lease = write_lease_of(opened);
     let ik = key::inode_key(opened.ino);
 
     if let Some(ref mut meta) = opened.cached_meta {
@@ -226,7 +243,7 @@ async fn maybe_persist_size_growth(
         meta.size = new_eof;
         let new_mv = schema::encode_inode_meta(meta);
         cluster
-            .put(&ik, &new_mv)
+            .put_fenced(&ik, &new_mv, lease)
             .await
             .map_err(|e| anyhow!("inode put: {e}"))?;
         return Ok(());
@@ -242,7 +259,7 @@ async fn maybe_persist_size_growth(
     meta.size = new_eof;
     let new_mv = schema::encode_inode_meta(&meta);
     cluster
-        .put(&ik, &new_mv)
+        .put_fenced(&ik, &new_mv, lease)
         .await
         .map_err(|e| anyhow!("inode put: {e}"))?;
     Ok(())
@@ -303,10 +320,11 @@ pub async fn write_into_with_options(
     }
     let steps = plan_write(&opened.extents, off, src.len());
     let ino = opened.ino;
+    let lease = write_lease_of(opened);
 
     let futs = steps
         .iter()
-        .map(|step| execute_step(cluster, ino, src, step));
+        .map(|step| execute_step(cluster, ino, src, step, lease));
     let landed: Vec<(u64, u32)> = fan_out_collect(futs, BATCH_PUT_DEFAULT_CONCURRENCY)
         .await
         .into_iter()
@@ -346,9 +364,10 @@ pub async fn write_into_sequential(
     }
     let steps = plan_write(&opened.extents, off, src.len());
     let ino = opened.ino;
+    let lease = write_lease_of(opened);
 
     for step in &steps {
-        let (start, new_len) = execute_step(cluster, ino, src, step).await?;
+        let (start, new_len) = execute_step(cluster, ino, src, step, lease).await?;
         upsert(&mut opened.extents, start, new_len);
     }
 

@@ -48,12 +48,18 @@ pub enum AutumnError {
         size: u64,
         cap: u64,
     },
+    /// BUG-LEASE-2: the PS fence floor rejected this write — a HIGHER
+    /// lease epoch has been seen for this inode, i.e. this writer's
+    /// lease was revoked. The caller must stop writing under this lease
+    /// and re-acquire.
+    Fenced(String),
 }
 
 impl std::fmt::Display for AutumnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AutumnError::NotFound => write!(f, "key not found"),
+            AutumnError::Fenced(msg) => write!(f, "write fenced (lease revoked): {msg}"),
             AutumnError::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             AutumnError::PreconditionFailed(msg) => write!(f, "precondition failed: {msg}"),
             AutumnError::ServerError(msg) => write!(f, "server error: {msg}"),
@@ -75,11 +81,27 @@ impl std::fmt::Display for AutumnError {
 
 impl std::error::Error for AutumnError {}
 
+/// BUG-LEASE-2 Phase 2: write-fencing identity stamped on lease-covered
+/// puts. `ANON` (all-zero) = anonymous write, PS skips fencing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriteLease {
+    /// Inode this write belongs to (fuse ino). 0 = anonymous.
+    pub inode_hint: u64,
+    /// Manager lease version (`MgrInodeLeaseRecord.version`) the writer
+    /// holds for that inode.
+    pub lease_epoch: u64,
+}
+
+impl WriteLease {
+    pub const ANON: WriteLease = WriteLease { inode_hint: 0, lease_epoch: 0 };
+}
+
 fn code_to_error(code: u8, message: String) -> AutumnError {
     match code {
         partition_rpc::CODE_NOT_FOUND => AutumnError::NotFound,
         partition_rpc::CODE_INVALID_ARGUMENT => AutumnError::InvalidArgument(message),
         partition_rpc::CODE_PRECONDITION => AutumnError::PreconditionFailed(message),
+        partition_rpc::CODE_FENCED => AutumnError::Fenced(message),
         partition_rpc::CODE_VALUE_TOO_LARGE => {
             // The cap is in the message; we don't try to parse it. Surface the
             // raw size if the caller doesn't already know.
@@ -1037,7 +1059,21 @@ impl ClusterClient {
     /// append goes through the extent-node fsync coalescer (RocksDB-style
     /// group commit). Callers no longer have a "fast but unsafe" mode.
     pub async fn put(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), AutumnError> {
-        self.put_opts(key, value, 0).await
+        self.put_opts(key, value, 0, WriteLease::ANON).await
+    }
+
+    /// BUG-LEASE-2 Phase 2: lease-fenced put. Stamps `(inode_hint,
+    /// lease_epoch)` so the PS fence floor rejects this write with
+    /// `AutumnError::Fenced` once a newer writer's epoch has been seen
+    /// for the inode. Lease-holding writers (autumn-fuse, the ioring
+    /// daemon) MUST use this; anonymous KV callers keep plain `put`.
+    pub async fn put_fenced(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        lease: WriteLease,
+    ) -> std::result::Result<(), AutumnError> {
+        self.put_opts(key, value, 0, lease).await
     }
 
     /// Helper: convert a relative TTL (seconds from now) to an
@@ -1060,6 +1096,7 @@ impl ClusterClient {
         key: &[u8],
         value: &[u8],
         expires_at: u64,
+        lease: WriteLease,
     ) -> std::result::Result<(), AutumnError> {
         // F129: client-side pre-check against the hard cap. Avoids sending
         // a 256 MB+ payload over the wire only to be rejected post-decode.
@@ -1082,8 +1119,8 @@ impl ClusterClient {
                     value: value.clone(),
                     expires_at,
                     region_epoch,
-                    inode_hint: 0,
-                    lease_epoch: 0,
+                    inode_hint: lease.inode_hint,
+                    lease_epoch: lease.lease_epoch,
                 })
             })
             .await?;
@@ -1114,7 +1151,17 @@ impl ClusterClient {
     /// `call_ps_for_key`. Inline-cap rules are identical to `put` (PS rejects
     /// over the inline cap with `CODE_VALUE_TOO_LARGE`).
     pub async fn put_zc(&self, key: &[u8], value: Bytes) -> std::result::Result<(), AutumnError> {
-        self.put_zc_opts(key, value, 0).await
+        self.put_zc_opts(key, value, 0, WriteLease::ANON).await
+    }
+
+    /// BUG-LEASE-2 Phase 2: lease-fenced zero-copy put (see `put_fenced`).
+    pub async fn put_zc_fenced(
+        &self,
+        key: &[u8],
+        value: Bytes,
+        lease: WriteLease,
+    ) -> std::result::Result<(), AutumnError> {
+        self.put_zc_opts(key, value, 0, lease).await
     }
 
     pub(crate) async fn put_zc_opts(
@@ -1122,6 +1169,7 @@ impl ClusterClient {
         key: &[u8],
         value: Bytes,
         expires_at: u64,
+        lease: WriteLease,
     ) -> std::result::Result<(), AutumnError> {
         if value.len() as u64 > CLIENT_PUT_HARD_CAP {
             return Err(AutumnError::ValueTooLarge {
@@ -1138,7 +1186,14 @@ impl ClusterClient {
                 .await
                 .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
             let region_epoch = self.lookup_epoch_for_part(part_id);
-            let meta = partition_rpc::encode_put_zc_meta(part_id, region_epoch, expires_at, &key);
+            let meta = partition_rpc::encode_put_zc_meta(
+                part_id,
+                region_epoch,
+                expires_at,
+                &key,
+                lease.inode_hint,
+                lease.lease_epoch,
+            );
             match self.get_ps_client(&ps_addr).await {
                 Ok(client) => {
                     // [meta, value] — value is a zero-copy iovec; no copy here.
@@ -1508,7 +1563,19 @@ impl ClusterClient {
         // owning partition and the underlying multiplexed PS connection
         // does the rest. Callers needing finer pacing should call
         // `batch_put` directly (pub(crate)).
-        self.batch_put(items).await
+        self.batch_put(items, WriteLease::ANON).await
+    }
+
+    /// BUG-LEASE-2 Phase 2: lease-fenced `put_many` — every item is
+    /// stamped with the SAME `(inode_hint, lease_epoch)` (the batch
+    /// belongs to one inode's flush, e.g. autumn-fuse `flush_inode`).
+    /// A fenced item returns `AutumnError::Fenced` in its result slot.
+    pub async fn put_many_fenced(
+        &self,
+        items: &[(&[u8], bytes::Bytes, u64)],
+        lease: WriteLease,
+    ) -> Vec<std::result::Result<(), AutumnError>> {
+        self.batch_put(items, lease).await
     }
 
     /// **The batched-read API that does not require caller-owned
@@ -1646,6 +1713,7 @@ impl ClusterClient {
     pub(crate) async fn batch_put(
         &self,
         items: &[(&[u8], bytes::Bytes, u64)],
+        lease: WriteLease,
     ) -> Vec<std::result::Result<(), AutumnError>> {
         let mut results: Vec<std::result::Result<(), AutumnError>> =
             (0..items.len()).map(|_| Ok(())).collect();
@@ -1677,6 +1745,8 @@ impl ClusterClient {
             let ops: Vec<partition_rpc::BatchPutOp> = group
                 .iter()
                 .map(|(_, k, v, ttl)| partition_rpc::BatchPutOp {
+                    inode_hint: lease.inode_hint,
+                    lease_epoch: lease.lease_epoch,
                     key: k.to_vec(),
                     value: v.to_vec(),
                     expires_at: *ttl,
@@ -1707,7 +1777,7 @@ impl ClusterClient {
                     // `part_id` after the topology change).
                     let _ = self.refresh_regions().await;
                     for (idx, k, v, ttl) in group.iter() {
-                        results[*idx] = self.put_opts(k, v.as_ref(), *ttl).await;
+                        results[*idx] = self.put_opts(k, v.as_ref(), *ttl, lease).await;
                     }
                     continue;
                 }
@@ -1748,7 +1818,12 @@ impl ClusterClient {
                 continue;
             }
             for ((idx, _, _, _), status) in group.iter().zip(resp.statuses.iter()) {
-                if *status != 0 {
+                if *status == partition_rpc::CODE_FENCED {
+                    results[*idx] = Err(AutumnError::Fenced(format!(
+                        "batch_put op fenced (ino={}, epoch={})",
+                        lease.inode_hint, lease.lease_epoch
+                    )));
+                } else if *status != 0 {
                     results[*idx] = Err(AutumnError::ServerError(format!(
                         "batch_put op status={status}"
                     )));
@@ -1759,7 +1834,7 @@ impl ClusterClient {
         // 3-tuple is preserved end-to-end (PutZcMeta carries expires_at
         // on the wire; the single-key `put_zc` convenience hardcodes 0).
         for (idx, k, v, ttl) in zc_only {
-            results[idx] = self.put_zc_opts(k, v, ttl).await;
+            results[idx] = self.put_zc_opts(k, v, ttl, lease).await;
         }
         results
     }
@@ -1792,6 +1867,25 @@ impl ClusterClient {
 
     /// Delete a key. Returns Ok(()) even if key didn't exist.
     pub async fn delete(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
+        self.delete_opts(key, WriteLease::ANON).await
+    }
+
+    /// BUG-LEASE-2 Phase 2: lease-fenced delete — a revoked writer's late
+    /// truncate/unlink must not remove the new writer's data (same fence
+    /// floor as puts; `AutumnError::Fenced` on rejection).
+    pub async fn delete_fenced(
+        &self,
+        key: &[u8],
+        lease: WriteLease,
+    ) -> std::result::Result<(), AutumnError> {
+        self.delete_opts(key, lease).await
+    }
+
+    async fn delete_opts(
+        &self,
+        key: &[u8],
+        lease: WriteLease,
+    ) -> std::result::Result<(), AutumnError> {
         let key = key.to_vec();
         let resp_bytes = self
             .call_ps_for_key(&key, MSG_DELETE, |part_id, region_epoch| {
@@ -1799,6 +1893,8 @@ impl ClusterClient {
                     part_id,
                     key: key.clone(),
                     region_epoch,
+                    inode_hint: lease.inode_hint,
+                    lease_epoch: lease.lease_epoch,
                 })
             })
             .await?;

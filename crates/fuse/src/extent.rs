@@ -152,6 +152,9 @@ pub async fn write_region(
         return Ok(());
     }
     let mut ext = extents_snapshot(state, ino, file_size).await?;
+    // BUG-LEASE-2 Phase 2: stamp every data-extent put with the held WRITE
+    // lease's version so a revoked writer's late RPCs are fenced at the PS.
+    let lease = state.write_lease_for(ino);
 
     // Plan + batch the append steps so the append-only hot path (cp / dd /
     // model checkpoint streamer — `pos` strictly past every existing extent)
@@ -186,6 +189,7 @@ pub async fn write_region(
                     &mut append_values,
                     &mut append_upserts,
                     &mut ext,
+                    lease,
                 )
                 .await?;
                 let cap = (fs + MAX_EXTENT as u64).min(next_start);
@@ -199,7 +203,7 @@ pub async fn write_region(
                 }
                 val[in_off..in_off + n].copy_from_slice(&rest[..n]);
                 let new_len = val.len() as u32;
-                state.kv_put(&ck, &val).await?;
+                state.kv_put_fenced(&ck, &val, lease).await?;
                 upsert(&mut ext, fs, new_len);
                 pos += n as u64;
                 rest = &rest[n..];
@@ -226,6 +230,7 @@ pub async fn write_region(
         &mut append_values,
         &mut append_upserts,
         &mut ext,
+        lease,
     )
     .await?;
 
@@ -253,6 +258,7 @@ async fn flush_appends(
     values: &mut Vec<Bytes>,
     upserts: &mut Vec<(u64, u32)>,
     ext: &mut Vec<(u64, u32)>,
+    lease: autumn_client::WriteLease,
 ) -> Result<()> {
     if keys.is_empty() {
         return Ok(());
@@ -267,7 +273,7 @@ async fn flush_appends(
         .zip(drained_values.iter())
         .map(|(k, v)| (k.as_slice(), v.clone(), 0u64))
         .collect();
-    let results = state.client.put_many(&items).await;
+    let results = state.client.put_many_fenced(&items, lease).await;
     for (i, r) in results.into_iter().enumerate() {
         r.map_err(|e| anyhow!("KV put: {e}"))?;
         let (start, len) = drained_upserts[i];
@@ -282,6 +288,10 @@ async fn flush_appends(
 pub async fn delete_all_extents(state: &mut FsState, ino: u64) -> Result<()> {
     let prefix = key::extent_prefix(ino);
     let mut start_key = prefix.clone();
+    // BUG-LEASE-2 Phase 2 (coco P1 #3): unlink's extent deletes are
+    // fenced under the held WRITE lease (anonymous when none is held —
+    // unlink without an open writer is a metadata-path operation).
+    let lease = state.write_lease_for(ino);
     loop {
         let keys = state.kv_range_keys(&prefix, &start_key, RANGE_PAGE).await?;
         let got = keys.len();
@@ -289,7 +299,7 @@ pub async fn delete_all_extents(state: &mut FsState, ino: u64) -> Result<()> {
         for k in &keys {
             if let Some((_, off)) = key::parse_extent_key(k) {
                 last_off = off;
-                let _ = state.kv_delete(k).await;
+                let _ = state.kv_delete_fenced(k, lease).await;
             }
         }
         if got < RANGE_PAGE as usize {
@@ -314,10 +324,14 @@ pub async fn truncate_extents(
         return Ok(());
     }
     let ext = extents_snapshot(state, ino, old_size).await?;
+    // BUG-LEASE-2 Phase 2 (coco P1 #3): truncate's whole-extent deletes
+    // are fenced too — a revoked writer's late shrink must not delete
+    // extents the new writer kept or rewrote.
+    let lease = state.write_lease_for(ino);
     for &(s, len) in &ext {
         if s >= new_size {
             // Extent begins beyond the new EOF → drop it entirely.
-            let _ = state.kv_delete(&key::extent_key(ino, s)).await;
+            let _ = state.kv_delete_fenced(&key::extent_key(ino, s), lease).await;
         } else if s + len as u64 > new_size {
             // Extent straddles the new EOF → truncate its value.
             let keep = (new_size - s) as usize;
@@ -325,7 +339,7 @@ pub async fn truncate_extents(
             if let Ok(mut val) = state.kv_get(&ck).await {
                 if val.len() > keep {
                     val.truncate(keep);
-                    state.kv_put(&ck, &val).await?;
+                    state.kv_put_fenced(&ck, &val, lease).await?;
                 }
             }
         }

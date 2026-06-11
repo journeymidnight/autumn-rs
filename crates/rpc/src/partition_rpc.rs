@@ -171,6 +171,11 @@ pub struct BatchPutOp {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
     pub expires_at: u64,
+    /// BUG-LEASE-2 Phase 2: per-op fencing identity. 0 = anonymous
+    /// (skip fencing). A fenced op gets `CODE_FENCED` in its
+    /// `BatchPutResp.statuses` slot without failing the whole batch.
+    pub inode_hint: u64,
+    pub lease_epoch: u64,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -253,16 +258,23 @@ pub struct DiagTraceKeyResp {
 }
 
 /// Fixed prefix of the MSG_PUT_ZC meta: part_id(8)+region_epoch(8)+
-/// expires_at(8)+key_len(4).
-pub const PUT_ZC_HEADER_LEN: usize = 28;
+/// expires_at(8)+key_len(4)+inode_hint(8)+lease_epoch(8).
+/// BUG-LEASE-2 Phase 2 extended this 28 → 44 (the two fence fields);
+/// no version byte — same-commit cluster upgrade, like every other
+/// wire-shape change in this repo.
+pub const PUT_ZC_HEADER_LEN: usize = 44;
 
 /// Build the MSG_PUT_ZC meta block `[part_id][region_epoch][expires_at]
-/// [key_len][key]` (value is appended by the caller as a separate iovec).
+/// [key_len][inode_hint][lease_epoch][key]` (value is appended by the
+/// caller as a separate iovec).
+#[allow(clippy::too_many_arguments)]
 pub fn encode_put_zc_meta(
     part_id: u64,
     region_epoch: u64,
     expires_at: u64,
     key: &[u8],
+    inode_hint: u64,
+    lease_epoch: u64,
 ) -> bytes::Bytes {
     use bytes::BufMut;
     let mut b = bytes::BytesMut::with_capacity(PUT_ZC_HEADER_LEN + key.len());
@@ -270,6 +282,8 @@ pub fn encode_put_zc_meta(
     b.put_u64_le(region_epoch);
     b.put_u64_le(expires_at);
     b.put_u32_le(key.len() as u32);
+    b.put_u64_le(inode_hint);
+    b.put_u64_le(lease_epoch);
     b.put_slice(key);
     b.freeze()
 }
@@ -280,6 +294,9 @@ pub struct PutZcMeta {
     pub region_epoch: u64,
     pub expires_at: u64,
     pub key_len: usize,
+    /// BUG-LEASE-2: 0 = anonymous write, skip fencing.
+    pub inode_hint: u64,
+    pub lease_epoch: u64,
     /// Byte offset of the value within the original payload.
     pub value_offset: usize,
 }
@@ -296,6 +313,8 @@ pub fn parse_put_zc_meta(payload: &[u8]) -> Option<PutZcMeta> {
     let region_epoch = u64::from_le_bytes(payload[8..16].try_into().ok()?);
     let expires_at = u64::from_le_bytes(payload[16..24].try_into().ok()?);
     let key_len = u32::from_le_bytes(payload[24..28].try_into().ok()?) as usize;
+    let inode_hint = u64::from_le_bytes(payload[28..36].try_into().ok()?);
+    let lease_epoch = u64::from_le_bytes(payload[36..44].try_into().ok()?);
     let value_offset = PUT_ZC_HEADER_LEN.checked_add(key_len)?;
     if payload.len() < value_offset {
         return None;
@@ -305,6 +324,8 @@ pub fn parse_put_zc_meta(payload: &[u8]) -> Option<PutZcMeta> {
         region_epoch,
         expires_at,
         key_len,
+        inode_hint,
+        lease_epoch,
         value_offset,
     })
 }
@@ -417,6 +438,11 @@ pub struct DeleteReq {
     pub key: Vec<u8>,
     /// See `PutReq.region_epoch`.
     pub region_epoch: u64,
+    /// BUG-LEASE-2 Phase 2 (coco P1 #3): deletes are fenced like puts —
+    /// a revoked writer's late truncate/unlink must not remove the new
+    /// writer's extents. 0 = anonymous (skip fencing).
+    pub inode_hint: u64,
+    pub lease_epoch: u64,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -643,6 +669,14 @@ pub struct TableLocations {
     /// 0 in legacy / fresh-state checkpoints — treated as "no boundary
     /// info; fall back to single-source replay" (= pre-fix behavior).
     pub log_extent_count: u32,
+    /// BUG-LEASE-2 Phase 2: snapshot of the partition's per-ino fence
+    /// floors `(ino, lease_epoch)` at checkpoint time. Recovery seeds
+    /// `PartitionData.fence_floors` from this, then WAL replay max-merges
+    /// any later `OP_FENCE_BUMP` records — floors raised before the
+    /// replay window survive PS restarts. Floors change only on lease
+    /// epoch bumps (rare), so this stays small. Empty in legacy
+    /// checkpoints. rkyv struct change ⇒ same-commit cluster upgrade.
+    pub fence_floors: Vec<(u64, u64)>,
 }
 
 // ── Helper: extract part_id from any partition RPC payload ─────────────────
@@ -735,5 +769,44 @@ mod msg_type_tests {
                 assert_ne!(all[i], all[j], "msg_type collision at index {} vs {}", i, j);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bug_lease_2_phase2_zc_meta_tests {
+    use super::*;
+
+    #[test]
+    fn put_zc_meta_round_trips_fence_fields() {
+        let key = b"some/extent/key";
+        let meta = encode_put_zc_meta(7, 3, 99, key, 42, 5);
+        assert_eq!(meta.len(), PUT_ZC_HEADER_LEN + key.len());
+        // [meta][value] is the wire payload; parse over meta+key+value.
+        let mut payload = meta.to_vec();
+        payload.extend_from_slice(b"VALUE");
+        let parsed = parse_put_zc_meta(&payload).expect("parse");
+        assert_eq!(parsed.part_id, 7);
+        assert_eq!(parsed.region_epoch, 3);
+        assert_eq!(parsed.expires_at, 99);
+        assert_eq!(parsed.key_len, key.len());
+        assert_eq!(parsed.inode_hint, 42);
+        assert_eq!(parsed.lease_epoch, 5);
+        assert_eq!(&payload[PUT_ZC_HEADER_LEN..parsed.value_offset], key);
+        assert_eq!(&payload[parsed.value_offset..], b"VALUE");
+    }
+
+    #[test]
+    fn put_zc_meta_anonymous_zeroes() {
+        let meta = encode_put_zc_meta(1, 0, 0, b"k", 0, 0);
+        let parsed = parse_put_zc_meta(&meta).expect("parse");
+        assert_eq!(parsed.inode_hint, 0);
+        assert_eq!(parsed.lease_epoch, 0);
+    }
+
+    #[test]
+    fn put_zc_meta_short_payload_rejected() {
+        // One byte short of the fixed header.
+        let meta = encode_put_zc_meta(1, 0, 0, b"", 9, 9);
+        assert!(parse_put_zc_meta(&meta[..PUT_ZC_HEADER_LEN - 1]).is_none());
     }
 }

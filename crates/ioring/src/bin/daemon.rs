@@ -399,7 +399,7 @@ async fn poller_loop(
     // session. Without it, two Opens on the same ino race at the
     // first `borrow_mut`: A inserts placeholder + starts
     // `lease::acquire().await`; B sees `refcount > 0`, joins as
-    // refcount+1, publishes a ring_fd with `lease_version = 0`,
+    // refcount+1, publishes a ring_fd with `lease_epoch = 0`,
     // and if A's acquire then fails A removes `held_leases[ino]`
     // — B's published ring_fd survives with no backing lease.
     // Holding the per-ino `futures::lock::Mutex` across the whole
@@ -478,7 +478,10 @@ async fn poller_loop(
     //     `fuse_read::open` does an extent head_many → derives actual_size from
     //     `max(start + value_length)`, enqueues a dirty entry so the size is
     //     written through on the next flush. See Phase 2 task #25.
-    let dirty_metas: Rc<RefCell<HashMap<u64, InodeMeta>>> =
+    // BUG-LEASE-2 Phase 2: value = (meta, lease_epoch at enqueue) so the
+    // deferred flush put is fence-stamped — a revoked writer's late dirty
+    // flush must not slip past the PS floor.
+    let dirty_metas: Rc<RefCell<HashMap<u64, (InodeMeta, u64)>>> =
         Rc::new(RefCell::new(HashMap::new()));
     // coco P1 #1 fix: per-inode async lock acquired before every
     // `cluster.put(inode_key)`. Both `dirty_meta_flush_loop` and
@@ -598,7 +601,7 @@ async fn service_sqe(
     // F244-D Phase 2: per-runtime dirty inode meta map. Write SQEs enqueue
     // into it; a 5 ms background flush task drains via put_many; Close
     // synchronously flushes the closing inode before releasing the lease.
-    dirty_metas: &Rc<RefCell<HashMap<u64, InodeMeta>>>,
+    dirty_metas: &Rc<RefCell<HashMap<u64, (InodeMeta, u64)>>>,
     // coco P1 #1 fix: per-inode async lock map. Acquired before any
     // `cluster.put(inode_key)` so bg and Close flushes serialise per key.
     flush_locks: &Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>>,
@@ -687,7 +690,7 @@ async fn service_sqe(
                     None => (true, 0),
                 }
             };
-            let lease_version = if needs_acquire {
+            let lease_epoch = if needs_acquire {
                 match lease::acquire(cluster, client_id, ino, req_mode).await {
                     Ok(AcquireResult::Granted(info)) => {
                         held_leases.borrow_mut().insert(
@@ -727,11 +730,11 @@ async fn service_sqe(
 
             // Lease is held; now load the extent map. Any concurrent
             // writer-close from another daemon AT OR BEFORE
-            // `lease_version` has already been applied (we hold the
+            // `lease_epoch` has already been applied (we hold the
             // lease so subsequent close pushes a strictly later
             // version, which the invalidation poll loop turns into a
             // floor bump). Concurrent close-DURING-extent-load is
-            // safe: the new version > `lease_version` ⇒
+            // safe: the new version > `lease_epoch` ⇒
             // `cache_is_stale` will fire on the next Read.
             let extents =
                 match fuse_read::load_extent_map(cluster, ino, inode_meta.size).await {
@@ -825,7 +828,7 @@ async fn service_sqe(
                 ino,
                 size: inode_meta.size,
                 extents,
-                lease_version,
+                lease_epoch,
                 // F244-D Phase 1: cache the inode meta so per-write
                 // EOF-extending Write SQEs can skip the per-write
                 // `cluster.get(inode_key)`. Safe because we hold the
@@ -840,7 +843,9 @@ async fn service_sqe(
             // racing close on the same runtime can't grab the lease first
             // (this is the Open path; we hold the open lock).
             if size_was_stale {
-                dirty_metas.borrow_mut().insert(ino, inode_meta);
+                dirty_metas
+                    .borrow_mut()
+                    .insert(ino, (inode_meta, lease_epoch));
             }
             let fd = next_fd.get();
             next_fd.set(fd.checked_add(1).unwrap_or(1));
@@ -865,7 +870,7 @@ async fn service_sqe(
                         ino: o.ino,
                         size: o.size,
                         extents: o.extents.clone(),
-                        lease_version: o.lease_version,
+                        lease_epoch: o.lease_epoch,
                         cached_meta: o.cached_meta.clone(),
                     },
                     None => return Cqe::err(sqe.user_data, libc::EBADF),
@@ -882,16 +887,16 @@ async fn service_sqe(
                 .get(&opened.ino)
                 .copied()
                 .unwrap_or(0);
-            if cache_is_stale(opened.ino, opened.lease_version, &invalidations.borrow()) {
+            if cache_is_stale(opened.ino, opened.lease_epoch, &invalidations.borrow()) {
                 match fuse_read::reload_extents(cluster, &mut opened).await {
                     Ok(()) => {
-                        opened.lease_version = target_version;
+                        opened.lease_epoch = target_version;
                         // Update the cached entry so future Reads
                         // skip the reload.
                         if let Some(o) = ring_fds.borrow_mut().get_mut(&sqe.ring_fd) {
                             o.size = opened.size;
                             o.extents = opened.extents.clone();
-                            o.lease_version = opened.lease_version;
+                            o.lease_epoch = opened.lease_epoch;
                         }
                     }
                     Err(e) => {
@@ -949,7 +954,7 @@ async fn service_sqe(
                         ino: o.ino,
                         size: o.size,
                         extents: o.extents.clone(),
-                        lease_version: o.lease_version,
+                        lease_epoch: o.lease_epoch,
                         // F244-D Phase 1: propagate the cached meta into the
                         // per-call working copy so `maybe_persist_size_growth`
                         // can skip the per-write `cluster.get(inode_key)`.
@@ -1010,23 +1015,24 @@ async fn service_sqe(
             // dirty_metas (single-threaded compio runtime makes this trivially
             // safe — no deadlock — but the explicit split keeps the
             // scope discipline clear).
-            let dirty_payload: Option<(u64, InodeMeta)> = if let Some(o) =
+            let dirty_payload: Option<(u64, InodeMeta, u64)> = if let Some(o) =
                 ring_fds.borrow_mut().get_mut(&sqe.ring_fd)
             {
                 o.size = opened.size;
                 o.extents = opened.extents;
                 o.cached_meta = opened.cached_meta.clone();
-                opened.cached_meta.map(|m| (opened.ino, m))
+                let lv = opened.lease_epoch;
+                opened.cached_meta.map(|m| (opened.ino, m, lv))
             } else {
                 None
             };
-            if let Some((ino, meta)) = dirty_payload {
+            if let Some((ino, meta, lv)) = dirty_payload {
                 // F244-D Phase 2: enqueue the latest meta. Overwrites any
                 // older entry (HashMap::insert) — last-writer-wins is correct
                 // because each Write SQE for this inode strictly extends or
                 // preserves `size` (a write to a smaller offset doesn't
                 // shrink it), so the newest enqueue is always the freshest.
-                dirty_metas.borrow_mut().insert(ino, meta);
+                dirty_metas.borrow_mut().insert(ino, (meta, lv));
             }
             Cqe::ok(sqe.user_data, n as u64)
         }
@@ -1202,7 +1208,7 @@ mod bug_lease_3_tests {
             ino,
             size: 0,
             extents: vec![],
-            lease_version: 0,
+            lease_epoch: 0,
             cached_meta: None,
         }
     }
@@ -1576,7 +1582,7 @@ async fn session_heartbeat_loop(
 /// dirty entries.
 async fn dirty_meta_flush_loop(
     cluster: Rc<ClusterClient>,
-    dirty: Rc<RefCell<HashMap<u64, InodeMeta>>>,
+    dirty: Rc<RefCell<HashMap<u64, (InodeMeta, u64)>>>,
     flush_locks: Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>>,
 ) {
     use autumn_client::BATCH_PUT_DEFAULT_CONCURRENCY;
@@ -1634,15 +1640,33 @@ async fn dirty_meta_flush_loop(
                     // coco round-2: drain INSIDE the lock so a Write that
                     // happened between snapshot+lock-acquire wins.
                     let meta_opt = dirty_i.borrow_mut().remove(&ino);
-                    if let Some(meta) = meta_opt {
+                    if let Some((meta, lv)) = meta_opt {
                         let ik = key::inode_key(ino);
                         let mv = Bytes::from(schema::encode_inode_meta(&meta));
-                        if let Err(e) = cluster_i.put(&ik, mv.as_ref()).await {
+                        let lease = if lv == 0 {
+                            autumn_client::WriteLease::ANON
+                        } else {
+                            autumn_client::WriteLease { inode_hint: ino, lease_epoch: lv }
+                        };
+                        if let Err(e) = cluster_i.put_fenced(&ik, mv.as_ref(), lease).await {
+                            // BUG-LEASE-2 Phase 2 (coco P2 #5): Fenced is
+                            // TERMINAL — this lease_epoch was revoked and
+                            // can never succeed; requeueing would retry
+                            // forever. Drop the stale meta (the new lease
+                            // holder owns the inode's meta now).
+                            if matches!(e, autumn_client::AutumnError::Fenced(_)) {
+                                tracing::warn!(
+                                    ino,
+                                    lease_epoch = lv,
+                                    "dirty meta flush FENCED (lease revoked); dropping stale meta"
+                                );
+                                return;
+                            }
                             // coco P1 #2: don't lose a deferred meta on
                             // put failure. Push back via entry().or_insert
                             // so a Write that enqueued a NEWER value during
                             // our await isn't clobbered.
-                            dirty_i.borrow_mut().entry(ino).or_insert(meta);
+                            dirty_i.borrow_mut().entry(ino).or_insert((meta, lv));
                             tracing::warn!(
                                 ino,
                                 error = %e,
@@ -1675,7 +1699,7 @@ async fn dirty_meta_flush_loop(
 /// proceeds to release the lease so the inode isn't stuck.
 async fn flush_dirty_inode_sync(
     cluster: &ClusterClient,
-    dirty: &Rc<RefCell<HashMap<u64, InodeMeta>>>,
+    dirty: &Rc<RefCell<HashMap<u64, (InodeMeta, u64)>>>,
     flush_locks: &Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>>,
     ino: u64,
 ) -> Result<()> {
@@ -1696,14 +1720,29 @@ async fn flush_dirty_inode_sync(
     // Write happened during bg's put and re-enqueued a fresher entry, we
     // see THAT here.
     let meta_opt = dirty.borrow_mut().remove(&ino);
-    if let Some(meta) = meta_opt {
+    if let Some((meta, lv)) = meta_opt {
         let ik = key::inode_key(ino);
         let mv = schema::encode_inode_meta(&meta);
-        if let Err(e) = cluster.put(&ik, &mv).await {
+        let lease = if lv == 0 {
+            autumn_client::WriteLease::ANON
+        } else {
+            autumn_client::WriteLease { inode_hint: ino, lease_epoch: lv }
+        };
+        if let Err(e) = cluster.put_fenced(&ik, &mv, lease).await {
+            // coco P2 #5: Fenced is terminal — drop the stale meta and let
+            // the close proceed (the new lease holder owns the meta now).
+            if matches!(e, autumn_client::AutumnError::Fenced(_)) {
+                tracing::warn!(
+                    ino,
+                    lease_epoch = lv,
+                    "close-time meta flush FENCED (lease revoked); dropping stale meta"
+                );
+                return Ok(());
+            }
             // coco P1 #2: don't lose the dirty entry. Push back via
             // entry().or_insert so a Write that landed during our await
             // (and inserted a newer meta) isn't overwritten.
-            dirty.borrow_mut().entry(ino).or_insert(meta);
+            dirty.borrow_mut().entry(ino).or_insert((meta, lv));
             return Err(anyhow::anyhow!("close-time inode meta put: {e}"));
         }
     }

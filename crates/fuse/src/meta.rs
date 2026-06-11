@@ -132,7 +132,10 @@ pub async fn get_inode(state: &mut FsState, ino: u64) -> Result<InodeMeta> {
 pub async fn put_inode(state: &mut FsState, ino: u64, meta: &InodeMeta) -> Result<()> {
     let k = key::inode_key(ino);
     let v = schema::encode_inode_meta(meta);
-    state.kv_put(&k, &v).await?;
+    // BUG-LEASE-2 Phase 2: inode-meta updates under a held WRITE lease are
+    // fence-stamped too (size bumps from a revoked writer must not land).
+    let lease = state.write_lease_for(ino);
+    state.kv_put_fenced(&k, &v, lease).await?;
     // Update cache
     if let Some(is) = state.inodes.get_mut(&ino) {
         is.meta = meta.clone();

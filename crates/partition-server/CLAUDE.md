@@ -385,6 +385,45 @@ preserved single-writer when P-bulk spawn failed is gone (both
 
 **No local WAL file**: logStream is the sole write-ahead log. Recovery replays logStream from the VP head recorded in the last metaStream checkpoint.
 
+### BUG-LEASE-2 — per-ino fence floors (Phase 1 in-memory, Phase 2 persisted)
+
+Write requests stamped with `(inode_hint != 0, lease_epoch)` are checked
+against `PartitionData.fence_floors` (per-partition `HashMap<ino, max
+epoch seen>`): `stamped < floor` ⇒ `CODE_FENCED` (a revoked writer's
+late RPC), else admit + raise the floor. All three write entry points
+run it — `enqueue_put`, `enqueue_put_zc` (meta carries the two fields,
+`PUT_ZC_HEADER_LEN = 44`), `enqueue_batch_put` (per-op; a fenced op gets
+CODE_FENCED in its statuses slot without failing the batch). Ordering
+invariant (coco R2-P1 #5): the value-too-large check runs BEFORE the
+fence check so a rejected oversized write can't poison the floor.
+
+Phase 2 persistence — floors survive PS restart / partition reschedule:
+- **WAL**: when `check_and_bump_fence` returns `Ok(true)` (raised), the
+  dispatcher queues `WriteOp::FenceBump { ino, epoch }`
+  (`WriteResponder::Fence`, no client reply) BEFORE the admitted write —
+  same group-commit pipeline ⇒ the floor is durable no later than the
+  write's ACK. The WAL record is op `OP_FENCE_BUMP` (0x08), key = ino
+  BE8 (skips in_range), value = epoch LE8. It NEVER enters the memtable
+  (Phase 3 filter) or SSTs; GC's VP scan skips it (no VP bit).
+- **Checkpoint**: `TableLocations.fence_floors` snapshot, captured via
+  `snapshot_fence_floors(&p)` under the SAME borrow as the tables
+  snapshot at all three publish sites (F148-A intact). Covers floors
+  raised before the replay window.
+- **Recovery**: seeds floors by max-merge over ALL meta records (post-
+  merge union of both sources), then replay max-merges every
+  OP_FENCE_BUMP it sees (idempotent — deliberately BYPASSES ts-dedup,
+  re-applying a checkpoint-covered bump is a no-op).
+
+Client surface: `WriteLease` + `put_fenced`/`put_zc_fenced`/
+`put_many_fenced` (`AutumnError::Fenced`); fuse stamps from
+`held_leases[ino].version` (`FsState::write_lease_for`), the ioring
+daemon from `OpenedExtents.lease_version` (`write_lease_of`) including
+its deferred dirty-meta flush. DELETE is fenced too (enqueue_delete,
+same range→fence admission order; fuse truncate/unlink stamp it). NOT
+fenced (recorded residual, BUG-LEASE-8 family): StreamPut. Admission
+ordering invariant (coco): region_epoch → in_range → value-too-large →
+fence — a rejected request must NEVER raise (or persist) the floor.
+
 ### `MSG_BATCH_PUT` (0x53) — server-batched Put (commit 1724ca3 / 09b2a39)
 
 A second write entry point alongside `MSG_PUT` / `MSG_PUT_ZC`. One

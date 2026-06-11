@@ -1037,8 +1037,18 @@ pub(crate) async fn start_write_batch(
                     expires_at,
                 } => (user_key, 1u8, value, expires_at),
                 WriteOp::Delete { user_key } => (Bytes::from(user_key), 2u8, Bytes::new(), 0u64),
+                // BUG-LEASE-2 Phase 2: fence-floor bump record. key = raw
+                // ino bytes (NOT a user key — skips in_range below), value
+                // = epoch. Never inserted into the memtable (Phase 3 skips
+                // OP_FENCE_BUMP); replay max-merges it into fence_floors.
+                WriteOp::FenceBump { ino, epoch } => (
+                    Bytes::copy_from_slice(&ino.to_be_bytes()),
+                    crate::OP_FENCE_BUMP,
+                    Bytes::copy_from_slice(&epoch.to_le_bytes()),
+                    0u64,
+                ),
             };
-            if !in_range(&p.rg, &user_key) {
+            if op != crate::OP_FENCE_BUMP && !in_range(&p.rg, &user_key) {
                 req.resp.send_err("key is out of range".to_string());
                 continue;
             }
@@ -1246,10 +1256,19 @@ pub(crate) async fn finish_write_batch(
         let mut cumulative: u32 = 0;
         let mut idx: usize = 0;
         let responders_ref = &mut responders;
-        let iter = valid.into_iter().map(move |entry| {
+        let iter = valid.into_iter().filter_map(move |entry| {
             let record_offset = base_offset + cumulative;
             cumulative += record_sizes[idx];
             idx += 1;
+
+            // BUG-LEASE-2 Phase 2: fence-bump records are WAL-only — the
+            // floor was already raised in fence_floors at enqueue time;
+            // nothing enters the memtable. (Offset accounting above must
+            // still advance: record_sizes is aligned over ALL entries.)
+            if entry.op == crate::OP_FENCE_BUMP {
+                responders_ref.push(entry.resp);
+                return None;
+            }
 
             let mem_entry = if entry.value.len() > VALUE_THROTTLE {
                 // V1 record layout (post-F165 default-on):
@@ -1289,7 +1308,7 @@ pub(crate) async fn finish_write_batch(
 
             let write_size = (entry.user_key.len() + mem_entry.value.len() + 32) as u64;
             responders_ref.push(entry.resp);
-            (entry.internal_key, mem_entry, write_size)
+            Some((entry.internal_key, mem_entry, write_size))
         });
 
         p.active.insert_batch(iter);
@@ -1913,6 +1932,7 @@ pub(crate) async fn do_compact(
         let mut p = part.borrow_mut();
         remove_compacted_tables(&mut p, &compact_keys);
         let tables_snapshot = p.tables.clone();
+        let floors_snapshot = crate::snapshot_fence_floors(&p);
         drop(p);
         // F148-A invariant — DO NOT introduce an `.await` between the
         // borrow_mut drop above and the mpsc send inside
@@ -1930,6 +1950,7 @@ pub(crate) async fn do_compact(
             compact_vp_eid,
             compact_vp_off,
             log_extent_ids.len() as u32,
+            floors_snapshot,
         )
         .await?;
         // F210-C4: see commit_flush_outcome — checkpoint published; sync
@@ -1955,7 +1976,7 @@ pub(crate) async fn do_compact(
     drop(readers);
     drop(readers_with_meta);
 
-    let tables_snapshot = {
+    let (tables_snapshot, floors_snapshot) = {
         let mut p = part.borrow_mut();
         // F252: locate the position of the OLDEST input table BEFORE
         // removing the compaction inputs. The compaction output
@@ -1981,7 +2002,7 @@ pub(crate) async fn do_compact(
             p.sst_readers.insert(idx, reader);
             p.tables.insert(idx, tbl_meta);
         }
-        p.tables.clone()
+        (p.tables.clone(), crate::snapshot_fence_floors(&p))
     };
 
     // F148-A invariant — see flush_one_imm in lib.rs for the full
@@ -1994,6 +2015,7 @@ pub(crate) async fn do_compact(
         compact_vp_eid,
         compact_vp_off,
         log_extent_ids.len() as u32,
+        floors_snapshot,
     )
     .await?;
     // F210-C4: same as the head-extent path above; mark dirty on sync

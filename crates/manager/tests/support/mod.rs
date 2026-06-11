@@ -345,6 +345,8 @@ pub async fn ps_delete(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rp
         .call(
             partition_rpc::MSG_DELETE,
             partition_rpc::rkyv_encode(&partition_rpc::DeleteReq {
+                inode_hint: 0,
+                lease_epoch: 0,
                 part_id,
                 key: key.to_vec(),
                 region_epoch: 0,

@@ -24,9 +24,11 @@ pub struct FuseLease {
     /// `Release` decrements; the 1→0 transition fires `ReleaseLease`
     /// to the manager.
     pub refcount: u32,
-    /// Server-side version handed back at AcquireLease. Used by the
-    /// (future, F-fuse-lease-4-equivalent) cache invalidation path.
-    pub version: u64,
+    /// The lease's fencing epoch — `MgrInodeLeaseInfo.version` handed
+    /// back at AcquireLease (the manager wire keeps the name `version`;
+    /// every client-side cache + stamp uses `lease_epoch` uniformly:
+    /// here, `OpenedExtents.lease_epoch`, `WriteLease.lease_epoch`).
+    pub lease_epoch: u64,
     /// R2-P0 #2/#3 (2026-06-06) — sticky flag set when the manager's
     /// invalidation poll observes `LEASE_INVAL_LEASE_REVOKED` for
     /// this ino. The entry is intentionally KEPT in the map (not
@@ -171,6 +173,40 @@ impl FsState {
             .map_err(|e| anyhow!("KV put: {e}"))
     }
 
+    /// BUG-LEASE-2 Phase 2: lease-fenced put for writes covered by a held
+    /// WRITE lease (data extents + inode meta). Anonymous when no live
+    /// write lease is held for `ino` (e.g. internal bookkeeping).
+    pub async fn kv_put_fenced(
+        &mut self,
+        k: &[u8],
+        v: &[u8],
+        lease: autumn_client::WriteLease,
+    ) -> Result<()> {
+        self.client
+            .put_fenced(k, v, lease)
+            .await
+            .map_err(|e| anyhow!("KV put: {e}"))
+    }
+
+    /// BUG-LEASE-2 Phase 2: the fencing identity to stamp on writes for
+    /// `ino` — the held WRITE lease's version, or ANON when this mount
+    /// holds no live write lease (legacy paths, internal counters).
+    /// A REVOKED entry still stamps its (now-stale) version: the PS floor
+    /// then rejects the write with `Fenced`, which is exactly the
+    /// storage-side half of the revoke protocol (the client-side half is
+    /// dispatch's EIO fast-fail).
+    pub fn write_lease_for(&self, ino: u64) -> autumn_client::WriteLease {
+        match self.held_leases.borrow().get(&ino) {
+            Some(l) if l.mode == autumn_rpc::manager_rpc::LEASE_MODE_WRITE && l.lease_epoch != 0 => {
+                autumn_client::WriteLease {
+                    inode_hint: ino,
+                    lease_epoch: l.lease_epoch,
+                }
+            }
+            _ => autumn_client::WriteLease::ANON,
+        }
+    }
+
     /// F178: alias for `kv_put`. See `kv_put` doc — no semantic difference
     /// post-F178 since every write is durable.
     pub async fn kv_put_sync(&mut self, k: &[u8], v: &[u8]) -> Result<()> {
@@ -181,6 +217,20 @@ impl FsState {
     pub async fn kv_delete(&mut self, k: &[u8]) -> Result<()> {
         self.client
             .delete(k)
+            .await
+            .map_err(|e| anyhow!("KV delete: {e}"))
+    }
+
+    /// BUG-LEASE-2 Phase 2 (coco P1 #3): lease-fenced delete for
+    /// truncate/unlink under a held WRITE lease — a revoked writer's
+    /// late delete must not remove the new writer's extents.
+    pub async fn kv_delete_fenced(
+        &mut self,
+        k: &[u8],
+        lease: autumn_client::WriteLease,
+    ) -> Result<()> {
+        self.client
+            .delete_fenced(k, lease)
             .await
             .map_err(|e| anyhow!("KV delete: {e}"))
     }

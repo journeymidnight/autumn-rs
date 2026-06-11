@@ -443,6 +443,17 @@ const VALUE_THROTTLE: usize = 4 * 1024;
 const VALUE_POINTER_SIZE: usize = 16;
 const OP_VALUE_POINTER: u8 = 0x80;
 
+/// BUG-LEASE-2 Phase 2: WAL record op for a fence-floor bump. Emitted into
+/// the SAME group-commit batch as (and BEFORE) the write whose
+/// `check_and_bump_fence` raised the per-ino floor, so the floor is durable
+/// no later than the write it admitted. Record shape: key = internal key
+/// over `ino.to_be_bytes()` (8 bytes), value = `epoch.to_le_bytes()`
+/// (8 bytes). NEVER enters the memtable / SSTs; recovery replay max-merges
+/// it into `PartitionData.fence_floors` (idempotent, so no ts-dedup needed).
+/// 0x08 is free: 1=put, 2=tombstone, 0x80=VP flag, 0x40/0x10 reserved
+/// (F129/F186), and GC's VP scan skips it (`op & OP_VALUE_POINTER == 0`).
+const OP_FENCE_BUMP: u8 = 0x08;
+
 /// F185: backstop TTL for `PartitionData.frozen_for_merge`. The manager's
 /// merge orchestrator (`handle_merge_partitions`) commits in <1 s on the
 /// happy path and explicitly unfreezes on rollback. This TTL fires only
@@ -1223,6 +1234,13 @@ pub(crate) enum WriteOp {
     Delete {
         user_key: Vec<u8>,
     },
+    /// BUG-LEASE-2 Phase 2: persist a fence-floor bump (`floors[ino] =
+    /// max(floors[ino], epoch)`). Queued by the enqueue_* dispatchers
+    /// immediately BEFORE the write that raised the floor, so it lands in
+    /// the same (or an earlier) group-commit batch — durable no later than
+    /// the admitted write's ACK. Skips the in_range check (its key is the
+    /// raw ino, not a user key) and the memtable insert.
+    FenceBump { ino: u64, epoch: u64 },
 }
 
 /// Shared accumulator for `MSG_BATCH_PUT`. The dispatcher creates ONE
@@ -1298,6 +1316,12 @@ pub(crate) enum WriteResponder {
         accum: Rc<BatchPutAccumulator>,
         idx: usize,
     },
+    /// BUG-LEASE-2 Phase 2: responder for a `WriteOp::FenceBump` record.
+    /// No client is waiting on it — the client's reply rides the admitted
+    /// write's own responder. send_ok is a no-op; send_err only logs (the
+    /// admitted write in the same/later batch fails identically and DOES
+    /// surface the error to the client).
+    Fence,
 }
 
 impl WriteResponder {
@@ -1324,12 +1348,20 @@ impl WriteResponder {
             WriteResponder::BatchPut { accum, idx } => {
                 accum.record(idx, 0);
             }
+            WriteResponder::Fence => {}
         }
     }
 
     /// Reply failure — propagate the error string as Internal to the outer
     /// resp_tx. "key is out of range" is InvalidArgument per existing semantics.
     pub(crate) fn send_err(self, msg: String) {
+        if let WriteResponder::Fence = self {
+            // The admitted write that rode behind this record fails the
+            // same way and surfaces the error to its client; the floor
+            // stays raised in memory (fail-closed direction).
+            tracing::warn!("fence-bump WAL record failed: {msg}");
+            return;
+        }
         if let WriteResponder::BatchPut { accum, idx } = self {
             // Batch entries don't carry their own status code wire — a
             // single byte. Use 1 for "internal err" / 2 for "out of range";
@@ -1347,7 +1379,9 @@ impl WriteResponder {
         let outer = match self {
             WriteResponder::Put { outer, .. } => outer,
             WriteResponder::Delete { outer, .. } => outer,
-            WriteResponder::BatchPut { .. } => unreachable!("handled above"),
+            WriteResponder::BatchPut { .. } | WriteResponder::Fence => {
+                unreachable!("handled above")
+            }
         };
         let _ = outer.send(Err((code, msg)));
     }
@@ -1366,6 +1400,7 @@ impl WriteRequest {
                 user_key, value, ..
             } => 17 + user_key.len() + value.len(),
             WriteOp::Delete { user_key } => 17 + user_key.len(),
+            WriteOp::FenceBump { .. } => 17 + 8 + 8,
         }
     }
 
@@ -1378,10 +1413,12 @@ impl WriteRequest {
         let key = match &op {
             WriteOp::Put { user_key, .. } => user_key.to_vec(),
             WriteOp::Delete { user_key } => user_key.clone(),
+            WriteOp::FenceBump { ino, .. } => ino.to_be_bytes().to_vec(),
         };
         let resp = match &op {
             WriteOp::Put { .. } => WriteResponder::Put { outer, key },
             WriteOp::Delete { .. } => WriteResponder::Delete { outer, key },
+            WriteOp::FenceBump { .. } => WriteResponder::Fence,
         };
         Self { op, resp }
     }
@@ -4333,7 +4370,7 @@ async fn partition_thread_main(
     }
 
     // Recovery: read metaStream → rowStream → logStream replay
-    let (tables, sst_readers, max_seq, vp_eid, vp_off, detected_overlap, recovered_active) =
+    let (tables, sst_readers, max_seq, vp_eid, vp_off, detected_overlap, recovered_active, recovered_floors) =
         recover_partition(
             part_id,
             &rg,
@@ -4478,7 +4515,9 @@ async fn partition_thread_main(
         metrics: metrics_arc.clone(),
         opened_with_shared: opened_with_shared.clone(),
         // BUG-LEASE-2 Phase 1: in-memory fence floors per ino; restart wipes.
-        fence_floors: RefCell::new(HashMap::new()),
+        // BUG-LEASE-2 Phase 2: recovered from the meta checkpoint snapshot
+        // + replayed OP_FENCE_BUMP records — floors survive PS restarts.
+        fence_floors: RefCell::new(recovered_floors),
     }));
 
     sync_partition_vp_refs(&part)
@@ -5600,16 +5639,48 @@ async fn handle_incoming_req(
     match req.msg_type {
         MSG_PUT => {
             let p = part.borrow();
-            enqueue_put(req, pending, part_region_epoch, part_id_for_err, Some(&p.fence_floors))
+            enqueue_put(
+                req,
+                pending,
+                part_region_epoch,
+                part_id_for_err,
+                Some(&p.fence_floors),
+                Some(&p.rg),
+            )
         }
         MSG_PUT_ZC => {
             let p = part.borrow();
-            enqueue_put_zc(req, pending, part_region_epoch, part_id_for_err, Some(&p.fence_floors))
+            enqueue_put_zc(
+                req,
+                pending,
+                part_region_epoch,
+                part_id_for_err,
+                Some(&p.fence_floors),
+                Some(&p.rg),
+            )
         }
-        MSG_DELETE => enqueue_delete(req, pending, part_region_epoch, part_id_for_err),
+        MSG_DELETE => {
+            let p = part.borrow();
+            enqueue_delete(
+                req,
+                pending,
+                part_region_epoch,
+                part_id_for_err,
+                Some(&p.fence_floors),
+                Some(&p.rg),
+            )
+        }
         MSG_STREAM_PUT => enqueue_stream_put(req, pending, part_region_epoch, part_id_for_err),
         partition_rpc::MSG_BATCH_PUT => {
-            enqueue_batch_put(req, pending, part_region_epoch, part_id_for_err)
+            let p = part.borrow();
+            enqueue_batch_put(
+                req,
+                pending,
+                part_region_epoch,
+                part_id_for_err,
+                Some(&p.fence_floors),
+                Some(&p.rg),
+            )
         }
         // F185: freeze stashes its resp oneshot in PartitionData and
         // returns without replying — the loop body sends OK once
@@ -5733,13 +5804,17 @@ async fn handle_incoming_req(
 /// floors → a stale-epoch RPC from a previously-revoked writer
 /// would slip through during the post-restart warm-up window.
 /// Phase 2 will persist via WAL.
+/// Returns `Ok(true)` when the call RAISED the floor (Phase 2: the caller
+/// must then queue a `WriteOp::FenceBump` record ahead of the admitted
+/// write so the new floor is durable no later than the write's ACK).
+/// `Ok(false)` = admitted without raising (stamped == floor, or anonymous).
 pub(crate) fn check_and_bump_fence(
     inode_hint: u64,
     stamped_epoch: u64,
     fence_floors: &mut HashMap<u64, u64>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if inode_hint == 0 {
-        return Ok(());
+        return Ok(false);
     }
     let floor = fence_floors.get(&inode_hint).copied().unwrap_or(0);
     if stamped_epoch < floor {
@@ -5750,8 +5825,9 @@ pub(crate) fn check_and_bump_fence(
     }
     if stamped_epoch > floor {
         fence_floors.insert(inode_hint, stamped_epoch);
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn enqueue_put(
@@ -5765,6 +5841,12 @@ fn enqueue_put(
     // PartitionData. Production dispatcher always passes
     // `Some(&part.borrow().fence_floors)`.
     fence_floors: Option<&RefCell<HashMap<u64, u64>>>,
+    // BUG-LEASE-2 Phase 2 (coco P1 #1): partition range for the
+    // in_range admission check, which must run BEFORE the fence check
+    // so a mis-routed write can never raise (and now PERSIST) the
+    // floor. `None` (unit tests) skips — start_write_batch still
+    // enforces range as defense in depth.
+    part_rg: Option<&Range>,
 ) {
     match partition_rpc::rkyv_decode::<PutReq>(&req.payload) {
         Ok(put_req) => {
@@ -5777,6 +5859,18 @@ fn enqueue_put(
                     ),
                 )));
                 return;
+            }
+            // BUG-LEASE-2 Phase 2 (coco P1 #1): range admission BEFORE
+            // the fence check — a mis-routed key must be rejected
+            // without raising (and durably persisting) the floor.
+            if let Some(rg) = part_rg {
+                if !in_range(rg, &put_req.key) {
+                    let _ = req.resp_tx.send(Err((
+                        StatusCode::InvalidArgument,
+                        "key is out of range".to_string(),
+                    )));
+                    return;
+                }
             }
             // F129: regular `Put` rejects values exceeding the inline
             // cap. Caller should retry via PutBegin/Chunk/Commit.
@@ -5805,17 +5899,33 @@ fn enqueue_put(
             // and shouldn't be writing anymore. Anonymous writes
             // (inode_hint == 0) skip the check entirely.
             if let Some(floors_cell) = fence_floors {
-                if let Err(msg) = {
+                let bump = {
                     let mut floors = floors_cell.borrow_mut();
                     check_and_bump_fence(put_req.inode_hint, put_req.lease_epoch, &mut floors)
-                } {
-                    let resp = PutResp {
-                        code: CODE_FENCED,
-                        message: msg,
-                        key: put_req.key.clone(),
-                    };
-                    let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
-                    return;
+                };
+                match bump {
+                    Err(msg) => {
+                        let resp = PutResp {
+                            code: CODE_FENCED,
+                            message: msg,
+                            key: put_req.key.clone(),
+                        };
+                        let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                        return;
+                    }
+                    Ok(true) => {
+                        // Phase 2: persist the raised floor — fence record
+                        // rides ahead of the admitted write in the same
+                        // group-commit pipeline (durable ≤ the write's ACK).
+                        pending.push(WriteRequest {
+                            op: WriteOp::FenceBump {
+                                ino: put_req.inode_hint,
+                                epoch: put_req.lease_epoch,
+                            },
+                            resp: WriteResponder::Fence,
+                        });
+                    }
+                    Ok(false) => {}
                 }
             }
             let key_vec = put_req.key.clone();
@@ -5854,6 +5964,9 @@ fn enqueue_batch_put(
     pending: &mut Vec<WriteRequest>,
     part_region_epoch: u64,
     part_id_for_err: u64,
+    // BUG-LEASE-2 Phase 2: per-op fencing (None only in unit tests).
+    fence_floors: Option<&RefCell<HashMap<u64, u64>>>,
+    part_rg: Option<&Range>,
 ) {
     let batch = match partition_rpc::rkyv_decode::<partition_rpc::BatchPutReq>(&req.payload) {
         Ok(b) => b,
@@ -5900,6 +6013,43 @@ fn enqueue_batch_put(
     }
     let accum = BatchPutAccumulator::new(req.resp_tx, n);
     for (i, op) in batch.ops.into_iter().enumerate() {
+        // BUG-LEASE-2 Phase 2 (coco P1 #1): per-op range admission BEFORE
+        // the fence check — an out-of-range op records status 2 (the same
+        // out-of-range status start_write_batch would produce) and must
+        // not raise the floor.
+        if let Some(rg) = part_rg {
+            if !in_range(rg, &op.key) {
+                accum.record(i, 2);
+                continue;
+            }
+        }
+        // BUG-LEASE-2 Phase 2: per-op fencing. A fenced op records
+        // CODE_FENCED in its statuses slot and is NOT enqueued; the rest
+        // of the batch proceeds. (Oversized ops were rejected above for
+        // the whole batch BEFORE any fence bump — same poison-ordering
+        // rule as enqueue_put.)
+        if let Some(floors_cell) = fence_floors {
+            let bump = {
+                let mut floors = floors_cell.borrow_mut();
+                check_and_bump_fence(op.inode_hint, op.lease_epoch, &mut floors)
+            };
+            match bump {
+                Err(_msg) => {
+                    accum.record(i, CODE_FENCED);
+                    continue;
+                }
+                Ok(true) => {
+                    pending.push(WriteRequest {
+                        op: WriteOp::FenceBump {
+                            ino: op.inode_hint,
+                            epoch: op.lease_epoch,
+                        },
+                        resp: WriteResponder::Fence,
+                    });
+                }
+                Ok(false) => {}
+            }
+        }
         pending.push(WriteRequest {
             op: WriteOp::Put {
                 user_key: Bytes::from(op.key),
@@ -5924,13 +6074,11 @@ fn enqueue_put_zc(
     pending: &mut Vec<WriteRequest>,
     part_region_epoch: u64,
     part_id_for_err: u64,
-    // BUG-LEASE-2 Phase 1 placeholder: the ZC framing
-    // (`parse_put_zc_meta`) doesn't yet carry `inode_hint` /
-    // `lease_epoch`. ZC writes are anonymous w.r.t. fencing for now.
-    // Phase 2 will extend `[meta]` to include both fields + a
-    // matching check here. Param threaded so the dispatch call site
-    // is uniform with enqueue_put.
-    _fence_floors: Option<&RefCell<HashMap<u64, u64>>>,
+    // BUG-LEASE-2 Phase 2: the ZC meta now carries `inode_hint` /
+    // `lease_epoch` (PUT_ZC_HEADER_LEN 28 -> 44); same fencing semantics
+    // as enqueue_put, same admission ordering (range -> size -> fence).
+    fence_floors: Option<&RefCell<HashMap<u64, u64>>>,
+    part_rg: Option<&Range>,
 ) {
     let Some(meta) = partition_rpc::parse_put_zc_meta(&req.payload) else {
         let _ = req.resp_tx.send(Err((
@@ -5951,6 +6099,17 @@ fn enqueue_put_zc(
     }
     // Zero-copy slices of the frame payload (Bytes refcount, no memcpy).
     let key = req.payload.slice(PUT_ZC_HEADER_LEN..meta.value_offset);
+    // BUG-LEASE-2 Phase 2 (coco P1 #1): range admission BEFORE the fence
+    // check — mirrors enqueue_put.
+    if let Some(rg) = part_rg {
+        if !in_range(rg, &key) {
+            let _ = req.resp_tx.send(Err((
+                StatusCode::InvalidArgument,
+                "key is out of range".to_string(),
+            )));
+            return;
+        }
+    }
     // F216-E W1: a LARGE value was recv'd straight into a registered PooledBuf
     // by the ps-conn (zc_value = a Bytes aliasing it, no off-wire copy); use it
     // directly. Otherwise (small / TCP) slice the value out of `payload` as
@@ -5972,6 +6131,36 @@ fn enqueue_put_zc(
         let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
         return;
     }
+    // BUG-LEASE-2 Phase 2: fencing check AFTER value-too-large (coco
+    // R2-P1 #5 ordering: a rejected oversized write must not poison the
+    // floor) — mirrors enqueue_put exactly.
+    if let Some(floors_cell) = fence_floors {
+        let bump = {
+            let mut floors = floors_cell.borrow_mut();
+            check_and_bump_fence(meta.inode_hint, meta.lease_epoch, &mut floors)
+        };
+        match bump {
+            Err(msg) => {
+                let resp = PutResp {
+                    code: CODE_FENCED,
+                    message: msg,
+                    key: key.to_vec(),
+                };
+                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                return;
+            }
+            Ok(true) => {
+                pending.push(WriteRequest {
+                    op: WriteOp::FenceBump {
+                        ino: meta.inode_hint,
+                        epoch: meta.lease_epoch,
+                    },
+                    resp: WriteResponder::Fence,
+                });
+            }
+            Ok(false) => {}
+        }
+    }
     let key_vec = key.to_vec();
     pending.push(WriteRequest {
         op: WriteOp::Put {
@@ -5991,6 +6180,9 @@ fn enqueue_delete(
     pending: &mut Vec<WriteRequest>,
     part_region_epoch: u64,
     part_id_for_err: u64,
+    // BUG-LEASE-2 Phase 2 (coco P1 #3): deletes are fenced like puts.
+    fence_floors: Option<&RefCell<HashMap<u64, u64>>>,
+    part_rg: Option<&Range>,
 ) {
     match partition_rpc::rkyv_decode::<DeleteReq>(&req.payload) {
         Ok(del_req) => {
@@ -6003,6 +6195,43 @@ fn enqueue_delete(
                     ),
                 )));
                 return;
+            }
+            // Range admission BEFORE the fence check (coco P1 #1 rule).
+            if let Some(rg) = part_rg {
+                if !in_range(rg, &del_req.key) {
+                    let _ = req.resp_tx.send(Err((
+                        StatusCode::InvalidArgument,
+                        "key is out of range".to_string(),
+                    )));
+                    return;
+                }
+            }
+            if let Some(floors_cell) = fence_floors {
+                let bump = {
+                    let mut floors = floors_cell.borrow_mut();
+                    check_and_bump_fence(del_req.inode_hint, del_req.lease_epoch, &mut floors)
+                };
+                match bump {
+                    Err(msg) => {
+                        let resp = DeleteResp {
+                            code: CODE_FENCED,
+                            message: msg,
+                            key: del_req.key.clone(),
+                        };
+                        let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                        return;
+                    }
+                    Ok(true) => {
+                        pending.push(WriteRequest {
+                            op: WriteOp::FenceBump {
+                                ino: del_req.inode_hint,
+                                epoch: del_req.lease_epoch,
+                            },
+                            resp: WriteResponder::Fence,
+                        });
+                    }
+                    Ok(false) => {}
+                }
             }
             let key_vec = del_req.key.clone();
             pending.push(WriteRequest {
@@ -6077,6 +6306,7 @@ async fn recover_partition(
     u32,
     bool,
     Memtable,
+    HashMap<u64, u64>,
 )> {
     let mut tables: Vec<TableMeta> = Vec::new();
     let mut sst_readers: Vec<Arc<SstReader>> = Vec::new();
@@ -6084,6 +6314,11 @@ async fn recover_partition(
     let mut recovered_vp_eid: u64 = 0;
     let mut recovered_vp_off: u32 = 0;
     let mut detected_overlap = false;
+    // BUG-LEASE-2 Phase 2: per-ino fence floors. Seeded from EVERY
+    // checkpoint record (max-merge — post-merge both sources' floors
+    // must survive; max-merge is the correct union), then the WAL
+    // replay below max-merges any later OP_FENCE_BUMP records.
+    let mut fence_floors: HashMap<u64, u64> = HashMap::new();
 
     // F184: union the LAST TableLocations record from EACH meta_stream
     // extent (instead of just the last extent's last record). Pre-merge
@@ -6095,6 +6330,12 @@ async fn recover_partition(
     let meta_records: Vec<TableLocations> = read_all_table_locations(meta_stream_id, part_sc)
         .await
         .context("union TableLocations from metaStream extents")?;
+    for r in &meta_records {
+        for &(ino, epoch) in &r.fence_floors {
+            let f = fence_floors.entry(ino).or_insert(0);
+            *f = (*f).max(epoch);
+        }
+    }
 
     // We need log_stream.extent_ids early to map each vp_head to its
     // stream position. Post-merge the spliced extent_ids list is
@@ -6556,6 +6797,26 @@ async fn recover_partition(
                 if ts > max_seq {
                     max_seq = ts;
                 }
+                // BUG-LEASE-2 Phase 2: fence-bump records bypass the
+                // ts-dedup (max-merge is idempotent — re-applying a bump
+                // already covered by the checkpoint snapshot is a no-op)
+                // and never enter the memtable.
+                if op == OP_FENCE_BUMP {
+                    let uk = parse_key(&key);
+                    if uk.len() == 8 && value.len() == 8 {
+                        let ino = u64::from_be_bytes(uk.try_into().unwrap());
+                        let epoch = u64::from_le_bytes(value.as_slice().try_into().unwrap());
+                        let f = fence_floors.entry(ino).or_insert(0);
+                        *f = (*f).max(epoch);
+                    } else {
+                        tracing::warn!(
+                            key_len = uk.len(),
+                            val_len = value.len(),
+                            "replay: malformed OP_FENCE_BUMP record skipped"
+                        );
+                    }
+                    continue;
+                }
                 if ts <= extent_dedup {
                     continue;
                 }
@@ -6614,6 +6875,7 @@ async fn recover_partition(
         recovered_vp_off,
         detected_overlap,
         active,
+        fence_floors,
     ))
 }
 
@@ -6838,6 +7100,30 @@ pub(crate) fn in_range(rg: &Range, key: &[u8]) -> bool {
 // MetaStream persistence
 // ---------------------------------------------------------------------------
 
+/// BUG-LEASE-2 Phase 2: snapshot the per-ino fence floors for a checkpoint,
+/// under the caller's existing `PartitionData` borrow.
+///
+/// ACCEPTED SEMANTICS (coco P1 #2, deliberately not "fixed"): this snapshots
+/// the IN-MEMORY floors, which may include a bump whose OP_FENCE_BUMP WAL
+/// record is still in flight (or whose admitted write later fails). That is
+/// safe: a floor of E only ever encodes the fact "a request stamped epoch E
+/// reached this PS", and under the manager's monotonic lease grants that
+/// fact alone proves every writer with epoch < E is already revoked —
+/// fencing them is correct whether or not E's write committed. The
+/// fail-direction is closed (over-fencing of provably-revoked writers
+/// only); the dangerous direction (floor LOSS) is what the WAL-before-ACK
+/// pairing prevents. Tracking a separate "durable floor" would add a
+/// pending/committed dual state for zero correctness gain against correct
+/// clients (bogus epochs from buggy clients are excluded by the coco P1 #1
+/// admission ordering + frame CRC).
+pub(crate) fn snapshot_fence_floors(p: &PartitionData) -> Vec<(u64, u64)> {
+    p.fence_floors
+        .borrow()
+        .iter()
+        .map(|(&ino, &epoch)| (ino, epoch))
+        .collect()
+}
+
 pub(crate) async fn save_table_locs_raw(
     stream_client: &Rc<StreamClient>,
     meta_stream_id: u64,
@@ -6845,6 +7131,10 @@ pub(crate) async fn save_table_locs_raw(
     vp_extent_id: u64,
     vp_offset: u32,
     log_extent_count: u32,
+    // BUG-LEASE-2 Phase 2: fence-floor snapshot, captured by the caller
+    // under the SAME borrow as `tables` (F148-A: snapshot order = publish
+    // order, no await in between).
+    fence_floors: Vec<(u64, u64)>,
 ) -> Result<()> {
     let locs = TableLocations {
         locs: tables
@@ -6858,6 +7148,7 @@ pub(crate) async fn save_table_locs_raw(
         vp_extent_id,
         vp_offset,
         log_extent_count,
+        fence_floors,
     };
     let payload = rkyv_encode(&locs);
     let mut data = Vec::with_capacity(4 + payload.len());
@@ -7194,7 +7485,7 @@ async fn commit_flush_outcome_inner(
         .len() as u32;
     let outcome_last_seq = outcome.new_meta.last_seq;
     let outcome_src_imm_ptr = outcome.src_imm_ptr;
-    let (tables_snapshot, vp_eid, vp_off, part_sc, meta_stream_id) = {
+    let (tables_snapshot, vp_eid, vp_off, part_sc, meta_stream_id, floors_snapshot) = {
         let mut p = part.borrow_mut();
         p.tables.push(outcome.new_meta);
         p.sst_readers.push(Arc::new(outcome.reader));
@@ -7231,6 +7522,7 @@ async fn commit_flush_outcome_inner(
             outcome.vp_off,
             p.stream_client.clone(),
             p.meta_stream_id,
+            snapshot_fence_floors(&p),
         )
     };
     // F148-A: no `.await` between the borrow_mut drop above and the
@@ -7242,6 +7534,7 @@ async fn commit_flush_outcome_inner(
         vp_eid,
         vp_off,
         log_extent_count,
+        floors_snapshot,
     )
     .await?;
     // F210-C4: meta_stream checkpoint published; SST is durable. If the
@@ -8476,6 +8769,7 @@ mod tests {
     #[test]
     fn decode_table_locations_roundtrip() {
         let locs = TableLocations {
+            fence_floors: vec![],
             locs: vec![
                 SstLocation {
                     extent_id: 1,
@@ -8508,6 +8802,7 @@ mod tests {
     #[test]
     fn decode_table_locations_multiple_records_returns_last() {
         let locs1 = TableLocations {
+            fence_floors: vec![],
             locs: vec![SstLocation {
                 extent_id: 1,
                 offset: 0,
@@ -8518,6 +8813,7 @@ mod tests {
             log_extent_count: 0,
         };
         let locs2 = TableLocations {
+            fence_floors: vec![],
             locs: vec![
                 SstLocation {
                     extent_id: 1,
@@ -8563,6 +8859,7 @@ mod tests {
     #[test]
     fn f157_decode_table_locations_skips_mid_stream_corruption() {
         let locs1 = TableLocations {
+            fence_floors: vec![],
             locs: vec![SstLocation {
                 extent_id: 1,
                 offset: 0,
@@ -8573,6 +8870,7 @@ mod tests {
             log_extent_count: 0,
         };
         let locs3 = TableLocations {
+            fence_floors: vec![],
             locs: vec![
                 SstLocation {
                     extent_id: 1,
@@ -8934,6 +9232,8 @@ mod merged_loop_tests {
         key: &[u8],
     ) -> (PartitionRequest, oneshot::Receiver<HandlerResult>) {
         let req = DeleteReq {
+            inode_hint: 0,
+            lease_epoch: 0,
             part_id: 0,
             key: key.to_vec(),
             region_epoch: 0,
@@ -8960,7 +9260,7 @@ mod merged_loop_tests {
         let (req, resp_rx) = build_put_partition_request(b"hello", b"world", 0);
         let mut pending: Vec<WriteRequest> = Vec::new();
         // Test sends epoch=0 on the wire, so 0 here matches and bypasses the check.
-        enqueue_put(req, &mut pending, 0, 0, None);
+        enqueue_put(req, &mut pending, 0, 0, None, None);
 
         assert_eq!(pending.len(), 1, "exactly one WriteRequest enqueued");
         let w = pending.pop().unwrap();
@@ -9003,7 +9303,7 @@ mod merged_loop_tests {
         let big_value = vec![0u8; AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize + 1];
         let (req, resp_rx) = build_put_partition_request(b"big-key", &big_value, 0);
         let mut pending: Vec<WriteRequest> = Vec::new();
-        enqueue_put(req, &mut pending, 0, 0, None);
+        enqueue_put(req, &mut pending, 0, 0, None, None);
 
         // No WriteRequest queued — the cap fires before pipeline insert.
         assert_eq!(pending.len(), 0, "oversized Put must not enter pipeline");
@@ -9025,7 +9325,7 @@ mod merged_loop_tests {
         let exact_cap_value = vec![0u8; AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize];
         let (req, _resp_rx) = build_put_partition_request(b"k", &exact_cap_value, 0);
         let mut pending: Vec<WriteRequest> = Vec::new();
-        enqueue_put(req, &mut pending, 0, 0, None);
+        enqueue_put(req, &mut pending, 0, 0, None, None);
         assert_eq!(pending.len(), 1, "value at exact cap must enqueue normally");
     }
 
@@ -9040,9 +9340,9 @@ mod merged_loop_tests {
         let (d1, rx3) = build_delete_partition_request(b"k3");
 
         let mut pending: Vec<WriteRequest> = Vec::new();
-        enqueue_put(p1, &mut pending, 0, 0, None);
-        enqueue_put(p2, &mut pending, 0, 0, None);
-        enqueue_delete(d1, &mut pending, 0, 0);
+        enqueue_put(p1, &mut pending, 0, 0, None, None);
+        enqueue_put(p2, &mut pending, 0, 0, None, None);
+        enqueue_delete(d1, &mut pending, 0, 0, None, None);
 
         assert_eq!(pending.len(), 3);
         // Order preserved (FIFO).

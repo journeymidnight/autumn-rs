@@ -31,7 +31,7 @@ const RANGE_PAGE: u32 = 8192;
 /// (`(logical_start, value_len)`, sorted by start) resolved at Open time and
 /// cached on the daemon's `ring_fd` so each Read avoids re-resolving.
 ///
-/// F-ioring-lease-4: `lease_version` is the `MgrInodeLeaseInfo.version` the
+/// F-ioring-lease-4: `lease_epoch` is the `MgrInodeLeaseInfo.version` the
 /// manager returned at AcquireLease time. The daemon's per-session
 /// invalidation map (`inode_min_valid_version`) tracks the lowest version
 /// each ino can keep serving without re-resolution; the Read SQE arm
@@ -46,7 +46,7 @@ pub struct OpenedExtents {
     /// `0` as "always stale" if the inode has ANY invalidation entry,
     /// "always fresh" otherwise. Production paths populate from the
     /// AcquireLease response.
-    pub lease_version: u64,
+    pub lease_epoch: u64,
     /// F244-D Phase 1: cached `InodeMeta` captured at `open()` time so the
     /// hot Write SQE path can skip a `cluster.get(inode_key)` per EOF-
     /// extending write. The cache stays valid because the iouring daemon
@@ -224,7 +224,7 @@ pub async fn open(cluster: &ClusterClient, path: &[u8]) -> Result<OpenedExtents>
         ino,
         size,
         extents,
-        lease_version: 0,
+        lease_epoch: 0,
         // F244-D Phase 1: cache the just-fetched (and possibly reconciled) meta
         // so per-write EOF-extending writes don't need to re-fetch it.
         cached_meta: Some(meta),
@@ -235,10 +235,10 @@ pub async fn open(cluster: &ClusterClient, path: &[u8]) -> Result<OpenedExtents>
 /// re-fetching the inode meta + reloading the extent map. Used by the
 /// daemon's Read SQE arm when the per-session
 /// `inode_min_valid_version[opened.ino]` has overtaken
-/// `opened.lease_version` — i.e. another daemon's writer closed and
+/// `opened.lease_epoch` — i.e. another daemon's writer closed and
 /// the cached extent map is stale.
 ///
-/// Does NOT touch `lease_version` — the caller bumps it after a
+/// Does NOT touch `lease_epoch` — the caller bumps it after a
 /// successful reload (typically to the new server-side version
 /// surfaced by the invalidation event). Errors propagate; on ENOENT
 /// the caller should EBADF the ring_fd.
@@ -384,7 +384,7 @@ mod tests {
             ino: 7,
             size,
             extents,
-            lease_version: 0,
+            lease_epoch: 0,
             cached_meta: None,
         }
     }

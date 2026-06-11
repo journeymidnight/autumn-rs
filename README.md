@@ -238,6 +238,17 @@ cargo test -p autumn-manager --test f_ioring_lease_3
 # WriterClosed; reader's stale-cache predicate flips; overflow
 # sentinel surfaces (overflow test takes ~10 s for its 1025 cycles).
 cargo test -p autumn-manager --test f_ioring_lease_4
+
+# BUG-LEASE-2 storage fencing (needs built binaries; boots a cluster):
+# Phase 1 — stale-epoch MSG_PUT rejected with CODE_FENCED; anonymous
+# (inode_hint=0) writes bypass.
+cargo test -p autumn-manager --test bug_lease_2_storage_fencing -- --ignored
+# Phase 2 — the floor SURVIVES a PS kill -9 + restart, on both recovery
+# paths (WAL OP_FENCE_BUMP replay; TableLocations.fence_floors checkpoint
+# after a flush), and MSG_PUT_ZC (the fuse/ioring large-write path) is
+# fenced too. Manual check: write at epoch 1 then 5 for one ino, kill
+# the PS, restart, retry epoch 1 → must get CODE_FENCED.
+cargo test -p autumn-manager --test bug_lease_2_phase2_persistence -- --ignored
 ```
 
 Daemon manual exercise (against a real cluster):
