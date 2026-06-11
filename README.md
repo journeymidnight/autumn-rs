@@ -172,12 +172,18 @@ $AO policy-candidates                    # advisory engine output (split/merge/g
 ```bash
 # PS-failover chaos (2 PSes, kill one -> partitions must migrate, zero loss):
 cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
-# Transport-layer chaos (real cluster.sh cluster; EN kill+respawn, PS kill ->
-# migrate, PS respawn; every ACKed write verified afterwards):
+# Transport-layer chaos (real cluster.sh cluster; E1 EN kill+respawn, E2 PS
+# kill -> migrate, E3 PS respawn, E4 manager kill+respawn (F265), E5 PS +
+# manager double-kill inside the eviction window -> the interrupted eviction
+# must converge and partitions FAIL BACK to the survivor (F265); every ACKed
+# write verified afterwards):
 AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/transport_chaos.sh tcp
 AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/transport_chaos.sh ucx   # needs --features autumn-server/ucx binaries
 # (ucx note: a node killed -9 leaves its port in TIME_WAIT ~60s; the UCX
 #  listener now retries bind through that window instead of exiting.)
+# (F265 notes: manager restart used to black-hole client routing — part_addrs
+#  is in-memory; the PS now re-reports it every ~2s sync tick. Ownership
+#  failback used to wedge forever — owner_epoch now bumps on every acquire.)
 ```
 
 ## Tests

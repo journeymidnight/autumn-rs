@@ -84,6 +84,12 @@ impl AutumnManager {
         self.start_runtime_tasks();
         let mut listener = autumn_transport::current_or_init().bind(addr).await?;
         tracing::info!(addr = %addr, "manager listening");
+        // F265: the bind above may have retried through a killed
+        // predecessor's TIME_WAIT window (~60 s on ucx, F264). No PS
+        // heartbeat could arrive before this point, so restart every
+        // PS's liveness clock and only now allow the eviction sweep
+        // (`ps_liveness_check_loop` gates on `serving`).
+        self.mark_serving();
         loop {
             // F257: accept errors are CONNECTION-scoped, not process-scoped.
             // Pre-F257 this was `listener.accept().await?` — on UCX the
@@ -3760,12 +3766,13 @@ impl AutumnManager {
     }
 
     async fn handle_register_partition_addr(&self, payload: Bytes) -> HandlerResult {
-        if let Err(err) = self.ensure_leader() {
-            return Ok(rkyv_encode(&CodeResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-            }));
-        }
+        // F265: deliberately NOT leader-gated. `part_addrs` is an
+        // in-memory, etcd-less routing hint that is LOST on manager
+        // restart; the PS self-heal in `sync_regions_once` re-reports it
+        // every ~2 s when missing. Gating on leadership stretched the
+        // post-restart outage by the whole election wait, and a follower
+        // accepting the registration is harmless (idempotent overwrite,
+        // refreshed continuously by the same PS tick after any failover).
         let req: RegisterPartitionAddrReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         // F099-K — record the per-partition listener address. We do NOT

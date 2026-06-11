@@ -6,6 +6,13 @@
 #   E1: kill -9 one extent-node, respawn it with its exact original cmdline
 #   E2: kill -9 PS 1 → partitions must MIGRATE to PS 2 (manager eviction)
 #   E3: respawn PS 1 (same psid) → cluster must stay consistent
+#   E4: kill -9 the MANAGER mid-writes, respawn with exact cmdline →
+#       control plane must come back (ucx: TIME_WAIT rebind path) and
+#       writes must resume on both keyspace halves
+#   E5: kill -9 the partition-holding PS, then 3s later (inside the
+#       eviction window) kill -9 the manager too → after the manager
+#       respawns, the interrupted eviction/rebalance must still converge:
+#       all partitions migrate to the survivor PS with zero data loss
 #
 # Invariants checked (exit nonzero on any violation):
 #   - every pre-seeded key (small / 8 KiB VP / 12 MiB put-stream) stays
@@ -33,8 +40,8 @@ MGR="127.0.0.1:9001"
 WORK="$(mktemp -d /tmp/transport_chaos.XXXXXX)"
 FAIL=0
 
-say()  { echo "[chaos-$T] $*"; }
-fail() { echo "[chaos-$T] FAIL: $*"; FAIL=1; }
+say()  { echo "[chaos-$T $(date +%H:%M:%S)] $*"; }
+fail() { echo "[chaos-$T $(date +%H:%M:%S)] FAIL: $*"; FAIL=1; }
 
 # ── boot ────────────────────────────────────────────────────────────────────
 if [ "$T" = ucx ]; then
@@ -45,19 +52,20 @@ export AUTUMN_DATA_ROOT="${AUTUMN_DATA_ROOT:-/data05/autumn-rs}"
 say "cleaning + starting cluster (transport=$T, data=$AUTUMN_DATA_ROOT)"
 for pid in $(ps -eo pid,comm | awk '$2 ~ /^(autumn-|etcd)/ {print $1}'); do kill -9 "$pid" 2>/dev/null; done
 sleep 2
-if [ "$T" = ucx ]; then
-    # UCX listeners carry no SO_REUSEADDR: TIME_WAIT sockets from a
-    # previous incarnation block rebinding for up to ~60s. Drain before
-    # starting (the in-binary bind retry covers mid-run restarts; this
-    # covers the cluster-boot path whose readiness probe would time out
-    # first).
-    say "ucx: draining TIME_WAIT on cluster ports"
-    for i in $(seq 1 35); do
-        tw=$(ss -tan state time-wait 2>/dev/null | grep -cE ':(9001|9301|9351|2000[0-9]) ') || true
-        [ "${tw:-0}" = "0" ] && break
-        sleep 2
-    done
-fi
+# Drain cluster ports for BOTH transports before boot. ucx: its listener
+# carries no SO_REUSEADDR, so predecessor TIME_WAIT blocks rebinding up
+# to ~60s (the in-binary bind retry covers mid-run restarts; this covers
+# cluster boot, whose readiness probe can't wait that long). tcp: a just
+# kill -9'd ucx manager's kernel-side socket/RDMA teardown can lag a few
+# seconds, leaving 9001 actively held — a back-to-back tcp boot then
+# fails EADDRINUSE despite REUSEADDR (observed running ucx->tcp rounds
+# 8s apart). Wait until the ports carry NO socket in any state.
+say "draining cluster ports"
+for i in $(seq 1 35); do
+    busy=$(ss -tan 2>/dev/null | grep -cE ':(9001|9301|9351|2000[0-9]) ') || true
+    [ "${busy:-0}" = "0" ] && break
+    sleep 2
+done
 rm -rf "$AUTUMN_DATA_ROOT" /tmp/autumn-rs
 env AUTUMN_EXTENT_BASE_PORT=20000 \
     AUTUMN_BOOTSTRAP_PRESPLIT="4:hexstring" \
@@ -74,7 +82,15 @@ setsid nohup "$PSBIN" --psid 2 --port 9351 --manager "$MGR" \
     > "$WORK/ps2.log" 2>&1 < /dev/null &
 sleep 3
 
-CLI=("$AC" --manager "$MGR" --transport "$T")
+# Every CLI call is timeout-bounded: an un-answered TCP connection
+# otherwise hangs ~28 min in kernel retransmit (observed in the F265
+# round), freezing the harness and hiding the event timeline.
+CLI=(timeout 20 "$AC" --manager "$MGR" --transport "$T")
+CLIS=(timeout 90 "$AC" --manager "$MGR" --transport "$T") # stream ops (12 MiB)
+# --transport is REQUIRED: autumn-op defaults to tcp and a tcp autumn-op
+# cannot reach a ucx manager — every ucx-round probe returned empty
+# output before this, making E2's old migration check pass vacuously.
+AOC=(timeout 20 "$AO" --manager "$MGR" --transport "$T")  # control-plane probes
 
 # ── seed + manifest ─────────────────────────────────────────────────────────
 say "seeding keys"
@@ -91,7 +107,7 @@ for i in $(seq 0 39); do
     seed_keys+=("$k")
 done
 head -c $((12*1024*1024)) /dev/urandom > "$WORK/seed/bigstripe"
-"${CLI[@]}" put-stream bigstripe "$WORK/seed/bigstripe" >/dev/null 2>&1 || fail "seed put-stream"
+"${CLIS[@]}" put-stream bigstripe "$WORK/seed/bigstripe" >/dev/null 2>&1 || fail "seed put-stream"
 
 verify_seeds() {
     local tag="$1" bad=0
@@ -100,8 +116,14 @@ verify_seeds() {
             fail "[$tag] seed key $k mismatch/missing"; bad=1
         fi
     done
-    "${CLI[@]}" get-stream --out "$WORK/big.out" bigstripe >/dev/null 2>&1
-    cmp -s "$WORK/big.out" "$WORK/seed/bigstripe" || { fail "[$tag] bigstripe mismatch"; bad=1; }
+    # rm first: a leftover big.out from the previous verify would make a
+    # failed/timed-out get-stream look like a pass (coco P2).
+    rm -f "$WORK/big.out"
+    if ! "${CLIS[@]}" get-stream --out "$WORK/big.out" bigstripe >/dev/null 2>&1; then
+        fail "[$tag] bigstripe get-stream failed/timeout"; bad=1
+    elif ! cmp -s "$WORK/big.out" "$WORK/seed/bigstripe"; then
+        fail "[$tag] bigstripe mismatch"; bad=1
+    fi
     [ $bad -eq 0 ] && say "[$tag] seed verify OK (${#seed_keys[@]} keys + 12MiB stripe)"
 }
 
@@ -139,14 +161,14 @@ say "E2: kill -9 PS1 pid=$PS1_PID"
 kill -9 "$PS1_PID"
 deadline=$((SECONDS + 60))
 while [ $SECONDS -lt $deadline ]; do
-    left=$("$AO" --manager "$MGR" info 2>/dev/null | grep -c "ps=127.0.0.1:9301") || true
+    left=$("${AOC[@]}" info 2>/dev/null | grep -c "ps=127.0.0.1:9301") || true
     if [ "${left:-1}" = "0" ]; then break; fi
     sleep 2
 done
-left=$("$AO" --manager "$MGR" info 2>/dev/null | grep -c "ps=127.0.0.1:9301") || true
+left=$("${AOC[@]}" info 2>/dev/null | grep -c "ps=127.0.0.1:9301") || true
 if [ "${left:-1}" != "0" ]; then
     fail "E2: partitions did NOT migrate off PS1 within 60s"
-    "$AO" --manager "$MGR" info 2>/dev/null | grep "^  part" | head -8
+    "${AOC[@]}" info 2>/dev/null | grep "^  part" | head -8
 else
     say "E2: all partitions migrated to PS2"
 fi
@@ -170,6 +192,116 @@ setsid nohup "$PSBIN" --psid 1 --port 9301 --manager "$MGR" \
     > "$WORK/ps1_respawn.log" 2>&1 < /dev/null &
 sleep 8
 verify_seeds "after-PS1-respawn"
+
+# ── helpers for control-plane chaos ─────────────────────────────────────────
+wait_mgr_ready() {
+    # 150s: the respawned manager must wait out the predecessor's etcd
+    # leader lease AND (ucx) the listener bind retry through TIME_WAIT —
+    # ~65-90s total (F264 budget is 3s x 30). Readiness = info PRODUCED
+    # OUTPUT: autumn-op's exit code is not a health signal (it exits
+    # non-zero on benign per-partition discard-fetch warnings, e.g. when
+    # probing ucx partition listeners over tcp).
+    local tag="$1" deadline=$((SECONDS + 150))
+    while [ $SECONDS -lt $deadline ]; do
+        if [ -n "$("${AOC[@]}" info 2>/dev/null)" ]; then
+            say "[$tag] manager ready"; return 0
+        fi
+        sleep 2
+    done
+    fail "[$tag] manager did not become ready within 150s"
+    return 1
+}
+
+write_liveness() {
+    local tag="$1" k ok try
+    for k in "a-live-$tag" "z-live-$tag"; do
+        ok=0
+        for try in $(seq 1 45); do
+            if "${CLI[@]}" put "$k" <(echo live) >/dev/null 2>&1; then ok=1; break; fi
+            sleep 2
+        done
+        [ $ok -eq 1 ] || fail "[$tag] write liveness wedged on $k"
+    done
+    [ $FAIL -eq 0 ] && say "[$tag] write liveness OK"
+}
+
+parts_on() {
+    # Distinguish "probe failed" (return 1, no output) from a genuine 0
+    # count — folding failures into 0 could pick the wrong E5 victim or
+    # fake convergence (coco P2). Probe success = info produced output;
+    # do NOT trust the exit code (non-zero on benign discard-fetch
+    # warnings against ucx partition listeners).
+    local out
+    out=$("${AOC[@]}" info 2>/dev/null)
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out" | grep -c "ps=127.0.0.1:$1" || true
+}
+
+# ── E4: kill + respawn the manager mid-writes ───────────────────────────────
+MGR_PID=$(pgrep -f autumn-manager-server | head -1)
+MGR_CMD=$(tr '\0' ' ' < "/proc/$MGR_PID/cmdline")
+say "E4: kill -9 manager pid=$MGR_PID"
+kill -9 "$MGR_PID"
+sleep 6
+say "E4: respawn manager: $MGR_CMD"
+setsid nohup $MGR_CMD > "$WORK/mgr_respawn.log" 2>&1 < /dev/null &
+wait_mgr_ready "E4"
+verify_seeds "after-mgr-kill-restart"
+write_liveness "e4"
+
+# ── E5: kill holder PS, then kill manager INSIDE the eviction window ────────
+# Holder pick must come from a SUCCESSFUL probe with a non-zero total —
+# a failed/empty probe folded into 0/0 would default to the wrong victim
+# and fake the convergence check (coco P2).
+P1_CNT=""; P2_CNT=""
+for try in $(seq 1 15); do
+    P1_CNT=$(parts_on 9301) && P2_CNT=$(parts_on 9351) \
+        && [ $((${P1_CNT:-0} + ${P2_CNT:-0})) -gt 0 ] && break
+    P1_CNT=""; P2_CNT=""
+    sleep 2
+done
+if [ -z "$P1_CNT" ]; then
+    fail "E5: could not determine partition holder (probe failed or 0/0)"
+    P1_CNT=0; P2_CNT=0
+fi
+if [ "${P1_CNT:-0}" -ge "${P2_CNT:-0}" ]; then
+    HOLDER_PSID=1; HOLDER_PORT=9301; SURV_PORT=9351
+else
+    HOLDER_PSID=2; HOLDER_PORT=9351; SURV_PORT=9301
+fi
+HOLDER_PID=$(pgrep -f -- "--psid $HOLDER_PSID .*--transport $T" | head -1)
+say "E5: holder=PS$HOLDER_PSID ($P1_CNT/$P2_CNT parts on 9301/9351); kill -9 PS pid=$HOLDER_PID"
+kill -9 "$HOLDER_PID"
+sleep 3
+MGR_PID=$(pgrep -f autumn-manager-server | head -1)
+say "E5: kill -9 manager pid=$MGR_PID (mid-eviction)"
+kill -9 "$MGR_PID"
+sleep 4
+say "E5: respawn manager"
+setsid nohup $MGR_CMD > "$WORK/mgr_respawn2.log" 2>&1 < /dev/null &
+wait_mgr_ready "E5"
+deadline=$((SECONDS + 90))
+while [ $SECONDS -lt $deadline ]; do
+    left=$(parts_on "$HOLDER_PORT")
+    [ "${left:-1}" = "0" ] && break
+    sleep 2
+done
+left=$(parts_on "$HOLDER_PORT")
+if [ "${left:-1}" != "0" ]; then
+    fail "E5: eviction did not converge after manager restart ($left parts still on :$HOLDER_PORT)"
+    "${AOC[@]}" info 2>/dev/null | grep "^  part" | head -8
+else
+    say "E5: interrupted eviction converged — all partitions on :$SURV_PORT"
+fi
+sleep 5
+verify_seeds "after-E5-double-kill"
+write_liveness "e5"
+say "E5: respawn PS$HOLDER_PSID"
+setsid nohup "$PSBIN" --psid "$HOLDER_PSID" --port "$HOLDER_PORT" --manager "$MGR" \
+    --listen 127.0.0.1 --advertise "127.0.0.1:$HOLDER_PORT" --transport "$T" \
+    > "$WORK/ps${HOLDER_PSID}_respawn2.log" 2>&1 < /dev/null &
+sleep 8
+verify_seeds "after-E5-ps-respawn"
 
 # ── stop loop + verify every ACKed write ────────────────────────────────────
 touch "$WORK/stop"

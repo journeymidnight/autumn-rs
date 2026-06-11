@@ -37,10 +37,12 @@ impl MetadataState {
         (start, end)
     }
 
+    /// F265: the epoch BUMPS on every acquire (mirrors the etcd-backed
+    /// `acquire_owner_epoch`, which rewrites the key and uses the fresh
+    /// mod_revision). Re-acquiring an existing key returns a strictly
+    /// higher epoch so the previous holder is fenced — required for
+    /// ownership failback (A→B→A) and same-key split-brain fencing.
     pub fn acquire_owner_lock(&mut self, key: &str) -> i64 {
-        if let Some(v) = self.owner_epochs.get(key) {
-            return *v;
-        }
         self.next_revision += 1;
         let rev = self.next_revision;
         self.owner_epochs.insert(key.to_string(), rev);
@@ -97,5 +99,24 @@ mod tests {
         assert!(s.ensure_owner_epoch("lock/a", rev).is_ok());
         assert!(s.ensure_owner_epoch("lock/a", rev + 1).is_err());
         assert!(s.ensure_owner_epoch("lock/b", 1).is_err());
+    }
+
+    /// F265: re-acquiring the same owner_key must FENCE the previous
+    /// holder — the epoch bumps on every acquire (failback A→B→A and
+    /// same-key split-brain both depend on this), and epochs stay
+    /// globally monotonic across different keys.
+    #[test]
+    fn owner_lock_reacquire_bumps_and_fences_previous_holder() {
+        let mut s = MetadataState::default();
+        let a1 = s.acquire_owner_lock("lock/a");
+        let b1 = s.acquire_owner_lock("lock/b");
+        assert!(b1 > a1, "epochs are globally monotonic across keys");
+        let a2 = s.acquire_owner_lock("lock/a");
+        assert!(a2 > b1, "re-acquire returns a strictly higher epoch");
+        assert!(
+            s.ensure_owner_epoch("lock/a", a1).is_err(),
+            "previous holder's epoch is fenced after re-acquire"
+        );
+        assert!(s.ensure_owner_epoch("lock/a", a2).is_ok());
     }
 }

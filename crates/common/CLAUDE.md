@@ -60,7 +60,7 @@ Holds all cluster state in memory:
 Returns `count` sequential IDs starting from `next_id`. IDs are globally unique across streams, extents, nodes, disks, and partitions — they share one counter.
 
 **`acquire_owner_lock(key: &str) -> i64`**
-Returns the existing revision for this key, or allocates a new ID as the revision. **Idempotent**: calling twice with the same key returns the same revision. This means reconnecting `StreamClient`s get the same token and don't fence out the previous connection if the key hasn't changed.
+Allocates a strictly higher revision on **every** call (F265). Re-acquiring an existing key FENCES the previous holder: the old epoch fails `ensure_owner_epoch`'s equality check at the manager and sits below the new floor at the extent-node. Mirrors the etcd-backed `acquire_owner_epoch` (unconditional fenced PUT; epoch = the fresh `mod_revision`). Pre-F265 this was idempotent (stable per key), which made ownership failback A→B→A impossible (B's higher epoch permanently fenced A) and let two live same-key processes share one epoch (split-brain).
 
 **`ensure_owner_epoch(key: &str, revision: i64) -> Result<()>`**
 Validates that the caller's revision matches the stored one. Returns `Precondition` error if not. This is the core fencing check — called on every stream-mutating operation.
@@ -72,5 +72,5 @@ Validates that the caller's revision matches the stored one. Returns `Preconditi
 ## Important Invariants
 
 1. **ID uniqueness**: all IDs (stream, extent, node, disk, partition) come from the same monotonic counter — never generate IDs outside `alloc_ids`.
-2. **Owner lock idempotency**: `acquire_owner_lock` with the same key always returns the same revision. The revision only changes if the key is explicitly evicted and re-acquired. Never generate owner revisions outside this method.
+2. **Owner lock bumps on every acquire (F265)**: `acquire_owner_lock` returns a strictly higher revision each call, fencing the previous holder of the same key. The newest acquirer always wins; a process must acquire once per incarnation and keep the epoch for its lifetime. Never generate owner revisions outside this method.
 3. **Epoch fencing**: any operation that mutates stream or extent state must call `ensure_owner_epoch` first. Skipping this allows split-brain writes.

@@ -404,3 +404,65 @@ gaps in the lease protocol's correctness story.
 - **结果:** tcp 轮 PASS（10,949 ACK 写 0 丢失）；ucx 轮修复后 PASS
   （E1/E2/E3 全过，1264 ACK 写 0 丢失，EN 在 TIME_WAIT 窗口内重启成功）。
 - **passes:** completed (2026-06-11)
+
+---
+
+### F265 · chaos 迭代 3：manager 控制面 chaos（E4/E5）——发现并修复 3 个 bug（/loop 2026-06-11）
+- **目标:** transport_chaos.sh 增加控制面事件：E4 kill -9 manager 原
+  cmdline 重生（写流中）；E5 kill -9 持有全部 partition 的 PS + 3s 后
+  kill -9 manager（驱逐窗口内双杀）→ manager 重启后被打断的驱逐必须收
+  敛、partition 迁回幸存者、零丢失。发现 bug 修复 bug。
+- **BUG 1（part_addrs 路由黑洞，tcp 首轮 E4 复现——30 分钟全集群读写
+  中断）:** manager 的 `part_addrs`（per-partition listener 地址，
+  GetRegions 路由的来源）只存内存；重启即丢，而已开 partition 只在
+  `open_partition` 注册一次、永不补报 → 双 PS 全健康时 manager 重启 =
+  客户端无法路由任何分区，直到偶然的 PS failover 触发 reopen。
+  **修复**: `sync_regions_once` 每 ~2s tick 对比 GetRegionsResp 里
+  manager 的 part_addrs 视图，缺失/陈旧即补发
+  MSG_REGISTER_PARTITION_ADDR（稳态零开销）；
+  `handle_register_partition_addr` 去掉 leader gate（内存级幂等路由
+  hint，gate 只会把中断拉长一个选举期）。
+- **BUG 2（owner_epoch failback 永久 wedge，tcp 首轮 E5 复现）:**
+  `acquire_owner_epoch` 用稳定 key 的 create_revision 当 epoch ——
+  每个 owner_key 的 epoch 终生不变。PS2（后建 key、revision 高）接管
+  后，EN 的 per-extent fence floor 升到 PS2 的 epoch；PS2 死、分区迁
+  回 PS1 时，PS1 的旧 epoch 永远低于 floor → commit_length 探测全副本
+  CODE_LOCKED_BY_OTHER → partition 27 永久打不开（partition 34 排队
+  在后）。同时两个同 key 进程共享同一 epoch = 互不 fence（split-brain
+  口子）。**修复**: 每次 acquire 无条件 leader-fenced PUT 重写
+  `ownerLocks/<key>`，epoch = 本次 txn 的 commit revision（etcd 全局
+  单调；从同一 txn 响应原子读出——coco P1 指出 PUT 后独立 GET 会让并发
+  同 key acquire 共享 epoch，已改为 txn header revision）；
+  `replay_from_etcd` 同步改读 mod_revision；内存模式
+  `acquire_owner_lock` 同语义（每次递增并 fence 前任，单测覆盖）。
+- **BUG 3（PS 集体自杀 + 假驱逐，ucx 轮 E4 复现）:** ucx manager
+  kill -9 重生要在 TIME_WAIT 里 bind 重试 ~54s（F264 设计内），但
+  ① manager ~4s 就赢得选举，~10s 驱逐了全部健康 PS（listener 未 bind，
+  心跳根本进不来）；② PS 心跳连续 5 次失败（10s）就
+  `std::process::exit(1)` ——任何 >10s 的 manager 中断 = 整个数据面
+  自杀，manager 回来后无人可注册。**修复**: ① manager 新增 `serving`
+  门（listener bind 成功后 `mark_serving()` 重置全部心跳时钟并放行驱
+  逐扫描；之前一律 skip）；② PS 心跳自杀阈值 10s→90s（盖过最坏
+  manager 重启；manager 不在期间不可能发生重指派，照常服务是安全的；
+  exit 保留为 stale-serving 兜底）。
+- **harness 加固（coco P2 全采纳 + 验证轮再挖出 2 个旧 harness bug）:**
+  ① 所有 autumn-client/autumn-op 调用 timeout 包裹（半开 TCP 否则挂
+  ~28 分钟）；② verify 前 rm big.out + 检查 get-stream 退出码（防旧
+  文件假阳性）；③ parts_on/wait_mgr_ready 以「有输出」判探测成功（
+  autumn-op 对 ucx partition listener 的 discard 警告会非零退出，不可
+  信 exit code）、E5 选 holder 前要求探测成功且总数 >0；④ **旧 bug**:
+  AOC 从未传 --transport（tcp 默认连不上 ucx manager → ucx 轮所有
+  autumn-op 探测一直输出为空，旧 E2 迁移检查靠 grep -c 空输出=0 假阳
+  性通过）；⑤ **旧 bug**: 端口 drain 只在 ucx 模式跑——ucx→tcp 背靠背
+  时被 kill 的 ucx manager 内核侧资源释放滞后数秒，tcp boot EADDRINUSE
+  → drain 改为双 transport 且覆盖全部 socket 状态；⑥ wait_mgr_ready
+  60s→150s（盖过 ucx ~90s bind 重试预算）；say/fail 带时间戳。
+  coco P2「多 manager part_addrs 视图」按窄场景 defer（单 manager 部
+  署；failover 后下一 tick 自愈新 leader）。
+- **验收（最终二进制双轮全 PASS）:** tcp 轮 E1-E5 全 PASS（1000 ACK
+  写 0 丢失，E4 2s 恢复，E5 驱逐收敛 10s + failback PS2→PS1）；ucx 轮
+  E1-E5 全 PASS（326 ACK 写 0 丢失，E4 manager 重启 59s bind 重试期间
+  无假驱逐/无 PS 自杀，E5 双杀后收敛 + failback）；修复中间轮（部分
+  fix 生效）ucx 4152 ACK 写同样 0 丢失。autumn-common 新增
+  reacquire-fences 单测；全 workspace --lib 493 单测绿。
+- **passes:** completed (2026-06-11)

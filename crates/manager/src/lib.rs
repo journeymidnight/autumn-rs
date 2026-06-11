@@ -152,6 +152,66 @@ impl EtcdMirror {
         Ok(false)
     }
 
+    /// F265: fenced txn whose success value is the txn's COMMIT REVISION
+    /// (`ResponseHeader.revision`). For a txn containing exactly one PUT
+    /// on a key, that revision IS the PUT's `mod_revision` — read
+    /// atomically from the same txn response, with no separate GET that
+    /// a concurrent same-key writer could interleave (coco P1: a
+    /// PUT-then-GET pair let two concurrent acquires both observe the
+    /// later writer's mod_revision and share one fencing epoch).
+    /// `succeeded == false` with no extra_cmp is a server-side anomaly
+    /// and surfaces as an error — never a silently-reused epoch.
+    async fn txn_fenced_put_revision(
+        &self,
+        success: Vec<autumn_etcd::proto::RequestOp>,
+    ) -> Result<i64, AppError> {
+        let compare = vec![autumn_etcd::Cmp::value(
+            LEADER_KEY.as_bytes(),
+            self.instance_id.as_bytes(),
+        )];
+        let txn = autumn_etcd::proto::TxnRequest {
+            compare,
+            success,
+            failure: vec![],
+        };
+        let resp = {
+            self.client
+                .txn(txn)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?
+        };
+        if resp.succeeded {
+            let rev = resp
+                .header
+                .as_ref()
+                .map(|h| h.revision)
+                .filter(|r| *r > 0)
+                .ok_or_else(|| {
+                    AppError::Internal("etcd txn response missing header revision".to_string())
+                })?;
+            return Ok(rev);
+        }
+        // Same fence-vs-anomaly diagnosis as `txn_fenced`.
+        let got = {
+            self.client
+                .get(LEADER_KEY.as_bytes())
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?
+        };
+        let still_leader = got
+            .kvs
+            .first()
+            .map(|kv| kv.value.as_slice() == self.instance_id.as_bytes())
+            .unwrap_or(false);
+        if !still_leader {
+            self.leader.set(false);
+            return Err(AppError::NotLeader);
+        }
+        Err(AppError::Internal(
+            "etcd txn rejected with empty extra_cmp".to_string(),
+        ))
+    }
+
     async fn put_msgs_txn(&self, kvs: Vec<(String, Vec<u8>)>) -> Result<(), AppError> {
         if kvs.is_empty() {
             return Ok(());
@@ -500,6 +560,15 @@ pub struct AutumnManager {
     pub(crate) failed_deletes:
         Rc<RefCell<HashMap<u64, crate::extent_delete::MgrExtentDeleteRetry>>>,
     runtime_started: Rc<Cell<bool>>,
+    /// F265: true once `serve()`'s listener is actually BOUND and
+    /// accepting. The UCX listener bind can retry through a killed
+    /// predecessor's TIME_WAIT window for ~60 s (F264) — far past
+    /// `PS_DEAD_TIMEOUT` — during which no PS heartbeat can possibly
+    /// arrive. `ps_liveness_check_loop` must not evict before this is
+    /// set (observed: a respawned ucx manager won the election at ~4 s,
+    /// evicted the ENTIRE healthy PS fleet at ~10 s, and only bound its
+    /// listener at ~54 s).
+    serving: Rc<Cell<bool>>,
     ps_last_heartbeat: Rc<RefCell<HashMap<u64, Instant>>>,
     conn_pool: Rc<ConnPool>,
     /// F191: dedicated pool for control-plane RPCs to extent nodes
@@ -616,6 +685,7 @@ impl AutumnManager {
             delete_progress: Rc::new(RefCell::new(HashMap::new())),
             failed_deletes: Rc::new(RefCell::new(HashMap::new())),
             runtime_started: Rc::new(Cell::new(false)),
+            serving: Rc::new(Cell::new(false)),
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),
             conn_pool: Rc::new(ConnPool::new()),
             control_pool: Rc::new(ConnPool::new()),
@@ -1478,7 +1548,11 @@ impl AutumnManager {
                 .strip_prefix("ownerLocks/")
                 .ok_or_else(|| anyhow::anyhow!("invalid owner lock key: {raw}"))?
                 .to_string();
-            let rev = kv.create_revision;
+            // F265: epoch = mod_revision (bumped on every acquire), NOT
+            // create_revision. Must match `acquire_owner_epoch` or the
+            // post-failover `ensure_owner_epoch` equality check rejects
+            // every live owner.
+            let rev = kv.mod_revision;
             max_revision = max_revision.max(rev);
             decoded_owner_revs.insert(owner_key, rev);
         }
@@ -1891,26 +1965,29 @@ impl AutumnManager {
 
         if let Some(etcd) = &self.etcd {
             let key = format!("ownerLocks/{owner_key}");
-            // F149: route through the leader-fenced txn helper. The
-            // create_revision==0 CAS becomes `extra_cmp`; if the owner-key
-            // already exists the txn returns `Ok(false)` (we still proceed
-            // to the GET to read the existing owner_epoch). If the leader
-            // fence itself fails, `Err(AppError::NotLeader)` propagates.
-            let extra_cmp = vec![autumn_etcd::Cmp::create_revision(key.as_bytes(), 0)];
+            // F265: the epoch BUMPS on every acquire. Pre-F265 this was a
+            // create_revision==0 CAS that reused the key's stable
+            // create_revision forever — so an owner_key's epoch NEVER rose
+            // again after first creation. Consequences (both observed in
+            // the F265 transport chaos run): (a) failback wedge — once a
+            // later-created owner (higher revision) touched an extent, the
+            // EN floor stayed above the earlier owner's frozen epoch and
+            // ownership could never transfer BACK (PS1 → PS2 → PS1 left
+            // every probe rejected with CODE_LOCKED_BY_OTHER); (b) two live
+            // processes acquiring the same owner_key SHARED one epoch — no
+            // mutual fencing at all (split-brain). An unconditional
+            // leader-fenced PUT makes every acquire rewrite the key; the
+            // resulting mod_revision is a fresh GLOBAL etcd revision, so it
+            // is monotonic across acquires AND across different owner_keys
+            // — exactly what the EN's `header.owner_epoch < floor` check
+            // and the manager's exact-equality `ensure_owner_epoch` need.
+            // The epoch is the COMMIT REVISION of this very txn (==
+            // the PUT's mod_revision), read atomically from the txn
+            // response. A separate post-commit GET would race a
+            // concurrent same-key acquire (both observing the later
+            // mod_revision and sharing one epoch — coco P1).
             let put_op = autumn_etcd::Op::put(key.as_bytes(), self.instance_id.as_bytes());
-            let _ = etcd.txn_fenced(extra_cmp, vec![put_op], vec![]).await?;
-
-            let got = {
-                etcd.client
-                    .get(key.as_bytes())
-                    .await
-                    .map_err(|e| AppError::Internal(e.to_string()))?
-            };
-            let kv = got
-                .kvs
-                .first()
-                .ok_or_else(|| AppError::Internal("owner lock key missing".to_string()))?;
-            let rev = kv.create_revision;
+            let rev = etcd.txn_fenced_put_revision(vec![put_op]).await?;
 
             let mut s = self.store.inner.borrow_mut();
             s.owner_epochs.insert(owner_key.to_string(), rev);
@@ -1920,6 +1997,18 @@ impl AutumnManager {
 
         let mut s = self.store.inner.borrow_mut();
         Ok(s.acquire_owner_lock(owner_key))
+    }
+
+    /// F265: called by `serve()` once the RPC listener is BOUND. Restarts
+    /// every PS's liveness clock (heartbeats physically could not arrive
+    /// earlier) and unblocks the eviction sweep. See the `serving` field
+    /// doc for the ucx TIME_WAIT motivation.
+    pub fn mark_serving(&self) {
+        let now = Instant::now();
+        for t in self.ps_last_heartbeat.borrow_mut().values_mut() {
+            *t = now;
+        }
+        self.serving.set(true);
     }
 
     // ── Background loops ───────────────────────────────────────────────
@@ -1933,7 +2022,13 @@ impl AutumnManager {
 
         loop {
             compio::time::sleep(CHECK_INTERVAL).await;
-            if !self.leader.get() {
+            // F265: never evict while our OWN listener isn't accepting —
+            // a PS cannot heartbeat into an unbound socket. The ucx bind
+            // retry (F264 TIME_WAIT) holds `serve()` for up to ~60 s
+            // after a kill+respawn; evicting during that window
+            // de-assigns the entire healthy fleet. `serve()` re-seeds
+            // the heartbeat clocks when the listener comes up.
+            if !self.leader.get() || !self.serving.get() {
                 continue;
             }
 

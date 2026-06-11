@@ -1568,8 +1568,10 @@ struct PartitionHandle {
     /// `mpsc::Receiver` end inside the partition thread observes EOF.
     drain_tx: Option<mpsc::UnboundedSender<oneshot::Sender<()>>>,
     /// Address (`host:port`) the partition is listening on. Reported to
-    /// the manager via `MSG_REGISTER_PARTITION_ADDR` on open.
-    #[allow(dead_code)]
+    /// the manager via `MSG_REGISTER_PARTITION_ADDR` on open, and
+    /// re-reported by the F265 self-heal in `sync_regions_once` whenever
+    /// the manager's `part_addrs` view (in-memory only — lost on manager
+    /// restart) goes missing or stale.
     part_addr: String,
     /// F183: cross-thread metrics handle. Bumped by the partition thread,
     /// read by the main thread's `report_load_loop`. Arc is Send so this
@@ -2633,7 +2635,18 @@ impl PartitionServer {
 
     async fn heartbeat_loop(&self) {
         const HEARTBEAT_INTERVAL_SECS: u64 = 2;
-        const MAX_CONSECUTIVE_FAILURES: u32 = 5; // 5 × 2s = 10s
+        // F265: 45 × 2 s = 90 s (was 5 × 2 s = 10 s). The exit below is a
+        // stale-serving last resort, NOT the primary fencing (owner_epoch
+        // fences writes at the ENs; region_epoch fences routing). At 10 s,
+        // ANY manager outage longer than 10 s — every ucx manager
+        // kill+respawn pays a ~60 s TIME_WAIT bind retry (F264) — made the
+        // whole PS fleet exit(1) simultaneously: a self-inflicted total
+        // data-plane outage with nothing left to re-register when the
+        // manager returned. While the manager is down no reassignment can
+        // happen, so serving through its outage is safe; 90 s comfortably
+        // outlasts the worst observed manager restart while still bounding
+        // the partitioned-from-manager-only stale-serving window.
+        const MAX_CONSECUTIVE_FAILURES: u32 = 45; // 45 × 2s = 90s
         let mut consecutive_failures: u32 = 0;
         let mut ticker = compio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
         ticker.tick().await; // first tick is immediate
@@ -2984,6 +2997,59 @@ impl PartitionServer {
         self.open_backoff
             .borrow_mut()
             .retain(|pid, _| wanted_ids.contains(pid));
+
+        // F265 part_addr self-heal: the manager's `part_addrs` map is
+        // in-memory only — a manager restart loses it, and an
+        // already-open partition never re-registers (registration only
+        // happens inside `open_partition`). Clients then cannot resolve
+        // the partition's listener and every read/write fails until the
+        // partition is reopened somewhere (observed as a 30-minute total
+        // outage in the F265 transport chaos run: manager kill+respawn
+        // with both PSes healthy). Heal it here: the GetRegions response
+        // we just fetched carries the manager's current `part_addrs`
+        // view; for any partition this PS serves whose entry is missing
+        // or stale, re-send MSG_REGISTER_PARTITION_ADDR. Zero cost in
+        // steady state (view matches); one small RPC per missing
+        // partition per 2 s tick after a manager restart.
+        let mgr_view: std::collections::HashMap<u64, &str> = resp
+            .part_addrs
+            .iter()
+            .map(|(pid, a)| (*pid, a.as_str()))
+            .collect();
+        let to_heal: Vec<(u64, String)> = self
+            .partitions
+            .borrow()
+            .iter()
+            .filter(|(pid, h)| mgr_view.get(pid) != Some(&h.part_addr.as_str()))
+            .map(|(pid, h)| (*pid, h.part_addr.clone()))
+            .collect();
+        for (part_id, address) in to_heal {
+            let req = manager_rpc::rkyv_encode(&manager_rpc::RegisterPartitionAddrReq {
+                ps_id: self.ps_id,
+                part_id,
+                address: address.clone(),
+            });
+            // 5 s — same bound rationale as the heartbeat call above.
+            match self
+                .pool
+                .call_timeout(
+                    self.manager_addr(),
+                    manager_rpc::MSG_REGISTER_PARTITION_ADDR,
+                    req,
+                    Duration::from_secs(5),
+                )
+                .await
+            {
+                Ok(_) => tracing::info!(
+                    "PS {} F265 re-registered part_addr {address} for partition {part_id}",
+                    self.ps_id
+                ),
+                Err(e) => tracing::warn!(
+                    "PS {} F265 part_addr re-register failed for partition {part_id}: {e}",
+                    self.ps_id
+                ),
+            }
+        }
         Ok(())
     }
 
@@ -4762,8 +4828,10 @@ async fn partition_thread_main(
                 continue;
             }
             let mgr_norm = autumn_stream::conn_pool::normalize_endpoint(mgr);
-            // 10 s — manager updates `part_addrs` (in-memory + etcd
-            // mirror). Bounded so partition open doesn't trap.
+            // 10 s — manager updates `part_addrs` (in-memory ONLY, no
+            // etcd mirror — a restarted manager loses it; the F265
+            // self-heal in `sync_regions_once` re-reports it).
+            // Bounded so partition open doesn't trap.
             match pool
                 .call_timeout(
                     &mgr_norm,

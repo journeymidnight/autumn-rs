@@ -1858,3 +1858,40 @@ post-restart.
       `Ok(())` regresses to the pre-F255 wedge.**
       Regression guard:
       `f255_bulk_ready_signal_dropped_returns_canceled_not_hang`.
+
+17. **F265 `part_addr` self-heal in `sync_regions_once`.** The manager's
+    `part_addrs` (per-partition listener addresses, the thing
+    `GetRegionsResp.part_addrs` serves to clients for routing) is
+    in-memory only and is LOST on manager restart. Registration used to
+    happen exactly once, inside `open_partition` — an already-open
+    partition never re-reported, so a manager kill+respawn under a
+    fully healthy cluster left clients unable to resolve any partition
+    listener (every get/put failed; observed as a 30-minute total
+    outage in the F265 transport chaos run, ending only when an
+    unrelated PS failover forced reopens). `sync_regions_once` now
+    compares the just-fetched `resp.part_addrs` against the open
+    partitions' `PartitionHandle.part_addr` and re-sends
+    `MSG_REGISTER_PARTITION_ADDR` for any missing/stale entry. Zero
+    steady-state cost (view matches → no RPC); convergence after a
+    manager restart is one ~2 s sync tick. The manager handler is no
+    longer leader-gated (in-memory idempotent hint; see manager
+    CLAUDE.md note 35). **Invariant: any new code path that binds or
+    re-binds a partition listener must keep `PartitionHandle.part_addr`
+    equal to the ACTUALLY advertised address — the self-heal trusts it
+    as the source of truth.**
+
+18. **F265 heartbeat-loss exit is a 90 s last resort, not a 10 s tripwire.**
+    `heartbeat_loop`'s `MAX_CONSECUTIVE_FAILURES` is 45 (× 2 s = 90 s; was
+    5 = 10 s). The `std::process::exit(1)` on sustained heartbeat failure
+    guards the narrow "partitioned from the manager but not from clients"
+    stale-serving case — it is NOT the primary fencing (owner_epoch fences
+    writes at the ENs; region_epoch fences client routing). At 10 s, any
+    manager outage > 10 s — and EVERY ucx manager kill+respawn pays a
+    ~60 s TIME_WAIT bind retry (F264) — made the entire PS fleet exit
+    simultaneously: a self-inflicted, unrecoverable data-plane outage
+    (nothing left to re-register when the manager returned; observed in
+    the F265 ucx chaos round). While the manager is down NO reassignment
+    can happen (the manager performs it), so serving through its outage
+    is safe. Companion manager-side guard: the eviction sweep is gated on
+    `serving` (listener actually bound) and heartbeat clocks are re-seeded
+    at listener-ready (manager CLAUDE.md note 35).

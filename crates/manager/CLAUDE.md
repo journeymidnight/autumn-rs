@@ -1705,3 +1705,54 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     `put_and_delete_txn` and carry the fence), 29 (F228 bg-loop
     resilience — `inode_lease_revoke_loop` follows the same
     pattern).
+
+35. **F265 owner_epoch bumps on EVERY acquire; `part_addrs` is in-memory
+    and PS-self-healed (both found by manager-kill chaos, 2026-06-11).**
+    Two independent fixes from `transport_chaos.sh` E4/E5:
+    - **`acquire_owner_epoch` rewrites `ownerLocks/<key>` with an
+      unconditional leader-fenced PUT and returns the fresh
+      `mod_revision`** (was: create_revision==0 CAS + reuse the stable
+      `create_revision` forever). `replay_from_etcd` reads
+      `mod_revision` to match — replay MUST stay in lock-step with the
+      acquire path or post-failover `ensure_owner_epoch` equality
+      rejects every live owner. Why: a stable per-key epoch can never
+      support ownership failback A→B→A (B's later-created key had a
+      higher revision; once B touched an extent, the EN floor sat above
+      A's frozen epoch forever — observed as partition open wedged on
+      `commit_length ... CODE_LOCKED_BY_OTHER` from all 3 ENs after
+      PS2-died-partitions-return-to-PS1). It also let two live
+      processes acquiring the SAME owner_key share one epoch — no
+      mutual fencing (split-brain). Bump-on-acquire gives newest-
+      acquirer-wins: each PS incarnation acquires once at startup and
+      keeps the epoch for its lifetime; per-partition StreamClients
+      inherit it via `new_with_owner_epoch`. etcd revisions are
+      globally monotonic, so cross-key comparisons at the EN floor
+      stay correct. Memory-mode `MetadataState::acquire_owner_lock`
+      mirrors this (common crate invariant 2).
+    - **`handle_register_partition_addr` is NOT leader-gated** and
+      `part_addrs` is deliberately NOT mirrored to etcd. It is a
+      routing hint lost on manager restart; the PS re-reports it from
+      `sync_regions_once` (~2 s tick) whenever the GetRegions response
+      shows the manager's view missing/stale for a partition the PS
+      serves. Pre-F265 nothing re-reported it (registration only
+      happened inside `open_partition`), so a manager restart under a
+      healthy cluster black-holed ALL client routing until partitions
+      were reopened somewhere — a 30-minute outage in the chaos run,
+      self-healing only by accident at the next PS failover. Gating on
+      leadership would just stretch the outage by the election wait;
+      a follower accepting the in-memory hint is harmless (idempotent,
+      continuously refreshed).
+    Cross-ref: note 3 (ensure_owner_epoch before stream mutations),
+    15 (F149 fence — the acquire PUT carries it), 28 (F227 commit
+    probe — the path the failback wedge blocked).
+
+    **F265 addendum — `serving` gate on the eviction sweep.** `serve()`
+    calls `mark_serving()` AFTER the listener bind returns: it re-seeds
+    every `ps_last_heartbeat` clock and flips `serving=true`;
+    `ps_liveness_check_loop` skips while `!serving`. Rationale: the ucx
+    listener bind retries through a killed predecessor's TIME_WAIT for up
+    to ~60 s (F264), and the respawned manager wins the election within
+    seconds — pre-F265 it then evicted the ENTIRE healthy PS fleet at
+    +10 s, while no PS could possibly heartbeat into the unbound socket.
+    Companion PS-side change: heartbeat-loss exit threshold 10 s → 90 s
+    (partition-server CLAUDE.md note 18).
