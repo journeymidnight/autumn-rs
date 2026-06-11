@@ -2632,6 +2632,64 @@ impl StreamClient {
         unreachable!("read_bytes_from_extent: 2-attempt loop must terminate")
     }
 
+    /// F261: replay-oriented chunked read — like `read_bytes_from_extent`,
+    /// but the requested window is CLAMPED to the extent's COMMITTED end
+    /// before the read is issued: `sealed_length` for sealed extents, the
+    /// min-replica commit probe for the open tail. An EN's data file can
+    /// legitimately hold speculative bytes PAST the committed end (a replica
+    /// that was ahead at seal time is never truncated back — commit-protocol
+    /// truncation only happens on the next append, which never comes once
+    /// sealed; open-tail replicas diverge the same way until the next
+    /// append's `header.commit`). A plain explicit-length read is clamped
+    /// only by the SERVING replica's local file length, so a chunked scanner
+    /// stopping on `got < want` walks straight through the committed end and
+    /// ingests un-committed — possibly replica-divergent, possibly
+    /// about-to-be-truncated — bytes as if they were WAL content.
+    ///
+    /// Returns `(data, end)`; `data` is empty once `offset` reaches the
+    /// committed end (clean end-of-scan). A SEALED extent with
+    /// `offset > sealed_length` still surfaces the `StaleVpOffset` sentinel:
+    /// a checkpoint pointing past the seal is corruption and must fail the
+    /// partition open loudly, never be masked as a clean end-of-replay.
+    pub async fn read_committed_bytes_from_extent(
+        &self,
+        extent_id: u64,
+        offset: u32,
+        length: u32,
+    ) -> Result<(Vec<u8>, u32)> {
+        for attempt in 0..2 {
+            let ex = self.fetch_extent_info(extent_id).await?;
+            let committed_end: u32 = if ex.sealed {
+                if offset as u64 > ex.sealed_length {
+                    return Err(anyhow::Error::new(StaleVpOffset {
+                        extent_id,
+                        requested_offset: offset,
+                        requested_length: length,
+                        sealed_length: ex.sealed_length,
+                    }));
+                }
+                ex.sealed_length.min(u32::MAX as u64) as u32
+            } else {
+                // Open tail: one min-replica probe per call. Replay-only
+                // cadence (one probe per 64 MiB chunk) — not a hot path.
+                self.commit_length_for_extent(&ex).await?
+            };
+            let want = length.min(committed_end.saturating_sub(offset));
+            if want == 0 {
+                return Ok((Vec::new(), committed_end));
+            }
+            match self.read_with_layout(extent_id, offset, want, &ex).await {
+                Ok(r) => return Ok(r),
+                Err(e) if attempt == 0 && is_eversion_stale(&e) => {
+                    self.invalidate_extent_cache(extent_id);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("read_committed_bytes_from_extent: 2-attempt loop must terminate")
+    }
+
     /// F216-E (UCX) / F219 (TCP) recv-side copy-elimination fast path: recv the
     /// value straight into a read_loop-owned `PooledBuf` (MSG_READ_BYTES_ZC +
     /// call_into_pooled). UCX → registered RDMA recv (zero-copy); TCP → compio

@@ -1,45 +1,59 @@
-Date: 2026-06-10
+Date: 2026-06-11
 TaskStatus: completed
-Task scope: F260 — chained replication for large appends (third item of
-  P15). Implementation landed, default OFF; acceptance gap = cross-host
-  perf + chain-kill chaos + coco arch review.
+Task scope: F261 Stage-1 — SST on-demand paging + bounded global block
+  cache + streamed WAL replay. LAST item of the P15 ledger
+  (F258/F259/F260 all completed earlier).
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
-  Already implemented:
-    - MSG_APPEND_CHAIN(16) wire codec (+2 unit tests).
-    - EN: per-downstream-addr forwarder tasks (unbounded ordered enqueue;
-      v1 synchronous submit stalled handle_connection under 8M backlog —
-      fixed), local write via build_append_future, ack aggregation,
-      CHAIN_FORWARD_TIMEOUT=30s.
-    - client: launch_append chain branch (single send to head, 1 ack =
-      all replicas, timeout x3), --append-chain-min-bytes /
-      AUTUMN_APPEND_CHAIN_MIN_BYTES (cluster.sh passthrough), DEFAULT 0
-      = disabled.
-    - Verified: 8M random value chain write -> readback byte-identical;
-      chain ON t4xd4: 65.2 ops/s p99 667ms, 0 errors 0 timeouts;
-      default-OFF regression: star 8M write 139 ops/s, 0 errors.
-    - Same day: UCX_TLS positive-list rule (bc08aef) + scenario comment;
-      TLS shm root-cause closed (54.9K/69K vs 8.3K).
-
-  Not implemented (the acceptance gap — F260 stays not_completed):
-    - Cross-host perf >= 1.5x via remote-autumn (::14 <-> ::15 RoCE);
-      loopback shows no gain by design (store-and-forward overhead, no
-      NIC bottleneck to relieve).
-    - Chaos: kill mid-chain EN under sustained chained writes -> retry,
-      zero loss.
-    - coco arch review of chain ack / commit-truncation interaction.
-    - Deep-queue latency stacking: chain currently UNSUITABLE at high
-      in-flight depth even cross-host until per-hop budgets are
-      re-derived (client x3 may need queue-aware scaling).
+  Already implemented (this commit):
+    - SstSource::{Resident,Paged}, into_paged, read_block_via (global
+      bounded BlockCache; miss -> row_stream read w/ F258 rotation),
+      open_paged_from_meta (meta-tail-only recovery open), materialize.
+    - BlockCache: sampled-LRU, (extent_id, abs_off) keys,
+      --sst-block-cache-bytes (default 512MB), hit/miss stats. No
+      compaction invalidation NEEDED: extent ids never reused.
+    - Async read paths: get/head/GC-liveness via lookup_in_sst_via
+      (snapshot readers -> drop borrow -> await; F250 hop mirrored).
+    - Sync iterator paths (range/do_compact/unique_user_keys):
+      materialized_for_iteration (transient resident copies).
+    - All 3 producer sites (flush/compact/recovery) emit Paged readers.
+    - WAL replay STREAMED in 64MB chunked-carry (decode_records_chunk)
+      — pre-existing whole-extent read was the real O(dataset) RSS
+      source at restart. Chunks read via NEW
+      StreamClient::read_committed_bytes_from_extent (committed-clamp:
+      sealed_length / min-commit probe) — plain explicit-length reads
+      walk past the seal into replica-local speculative bytes and trip
+      StaleVpOffset, wedging partition open (e2e-hit, fixed, re-verified
+      on the same dataset: 8/8 open, byte-compare pass).
+    - coco fixes (2 rounds; 3 P0 + 2 P2 + 1 P3): lookup_in_sst_via
+      error propagation (read error != miss; GC must not punch live
+      VPs); GC paged-liveness await-window race — post-await snapshot
+      VALIDATION loop (active/imm appearance or sst_readers ptr change
+      -> redo lookup; no await between validation/verdict/seq-alloc).
+      NOTE the first-cut "skip if key in active/imm at seq-alloc" was
+      itself a data-loss P0 (mem branch IS the normal live-VP rewrite
+      path) — replaced. Paged read_block_via bounds checks; get/head
+      retry-once on readers-changed (compaction-truncate TOCTOU);
+      range SST key-range pre-filter before materialize; CLI rejects
+      invalid --sst-block-cache-bytes loudly.
+  Not implemented (recorded for Stage-2):
+    - Async TableIterator/MergeIterator (removes range/compact
+      materialization cost).
+    - Diag seq_opt/fullscan report miss on paged readers.
+    - perf-check read-only mode for cleaner cache-bound measurements.
 
 Current summary:
-  Chain is in the tree but OFF; default paths regression-clean. The
-  loopback wedge (timeout storm -> partition poisoning at t16xd8x8M) is
-  understood: per-append store-and-forward hop latency stacking, not a
-  deadlock (low-concurrency runs are error-free).
+  ~14GB dataset, 8 partitions: idle post-recovery RSS 2,380MB
+  (replay-window bound, dataset-size-INDEPENDENT; 18-28GB before).
+  Byte-correct across multiple restarts (small/8M/range), 0 errors;
+  cache delta under read storm +240MB < 512MB cap; perf in-band
+  (4K w 27-64K / r 0.5-1.2M; 8M w 103.6 / r 500.4). After the 8M bench
+  grew the set to ~22GB: post-fix restart 8/8 partitions open, idle RSS
+  3,877MB, 4K w 64.1K (baseline 63.2K). 160+72 lib tests.
 
-Cross-host acceptance DONE 2026-06-11: fair 3.8x, egress 3x->1x proven, chaos 174/174 zero loss after fixing the error-frame-as-LockedByOther bug (apply_completion is_error guard). Next steps:
-  F261, then chaos + coco arch;
-  flip default only if cross-host >= 1.5x holds AND deep-queue budgets
-  are fixed. F261 (SSTable paging + block cache) follows.
+Main gaps:
+  - Stage-2 items above; range over huge paged SST sets pays transient
+    materialization (documented).
+Next steps:
+  P15 ledger complete. coco verdict folded before commit.

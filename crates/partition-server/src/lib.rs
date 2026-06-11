@@ -193,6 +193,25 @@ fn max_write_batch() -> usize {
 ///
 /// Default = 8 → up to 8 × 30 MB = 240 MB worst-case memory per partition.
 /// Range clamped to [1, 64]. F195: overridable via `set_ps_inflight_cap`.
+/// F261: process-wide bounded SST block cache (paged readers only).
+static SST_BLOCK_CACHE_BYTES_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static SST_BLOCK_CACHE: std::sync::OnceLock<std::sync::Arc<crate::sstable::BlockCache>> =
+    std::sync::OnceLock::new();
+
+pub fn set_sst_block_cache_bytes(n: usize) -> bool {
+    if !(16 * 1024 * 1024..=256 * 1024 * 1024 * 1024).contains(&n) {
+        return false;
+    }
+    SST_BLOCK_CACHE_BYTES_CELL.set(n).is_ok()
+}
+
+pub(crate) fn global_block_cache() -> &'static std::sync::Arc<crate::sstable::BlockCache> {
+    SST_BLOCK_CACHE.get_or_init(|| {
+        let cap = *SST_BLOCK_CACHE_BYTES_CELL.get_or_init(|| 512 * 1024 * 1024);
+        std::sync::Arc::new(crate::sstable::BlockCache::new(cap))
+    })
+}
+
 pub(crate) fn ps_inflight_cap() -> usize {
     *PS_INFLIGHT_CAP_CELL.get_or_init(|| 8)
 }
@@ -6171,10 +6190,18 @@ async fn recover_partition(
             // until convergence so the operator doesn't have to manually
             // restart the PS a second time. Cap at ~30 s — past that we
             // surface the error so it doesn't hide a non-EC fault.
+            // F261: read ONLY the meta tail (two small reads) — full-SST
+            // materialization at recovery kept RSS at O(dataset) (9.4 GB
+            // of SSTs faulted ~25 GB transient pre-fix). Blocks are paged
+            // on demand afterwards.
             let mut attempt: u32 = 0;
-            let (sst_bytes, _end) = loop {
+            let (tail4, _end) = loop {
                 match part_sc
-                    .read_bytes_from_extent(loc.extent_id, loc.offset, loc.len)
+                    .read_bytes_from_extent(
+                        loc.extent_id,
+                        loc.offset + loc.len.saturating_sub(4),
+                        4,
+                    )
                     .await
                 {
                     Ok(v) => break v,
@@ -6202,15 +6229,44 @@ async fn recover_partition(
                 }
             };
 
-            let sst_bytes = Bytes::from(sst_bytes);
-            let reader = SstReader::from_bytes(sst_bytes.clone()).with_context(|| {
-                let preview_len = sst_bytes.len().min(32);
-                format!(
-                    "open SST extent={} offset={} read_len={} preview={:02x?}",
+            if tail4.len() < 4 || loc.len < 8 {
+                return Err(anyhow::anyhow!(
+                    "SST tail short: extent={} offset={} len={} got={}",
                     loc.extent_id,
                     loc.offset,
-                    sst_bytes.len(),
-                    &sst_bytes[..preview_len]
+                    loc.len,
+                    tail4.len()
+                ));
+            }
+            let meta_len = u32::from_le_bytes(tail4[..4].try_into().unwrap());
+            if meta_len == 0 || meta_len + 4 > loc.len {
+                return Err(anyhow::anyhow!(
+                    "invalid meta_len={meta_len} for SST extent={} offset={} len={}",
+                    loc.extent_id,
+                    loc.offset,
+                    loc.len
+                ));
+            }
+            let meta_off = loc.offset + loc.len - 4 - meta_len;
+            let (meta_bytes, _e2) = part_sc
+                .read_bytes_from_extent(loc.extent_id, meta_off, meta_len)
+                .await
+                .with_context(|| {
+                    format!(
+                        "read SST meta extent={} offset={meta_off} len={meta_len}",
+                        loc.extent_id
+                    )
+                })?;
+            let reader = SstReader::open_paged_from_meta(
+                &meta_bytes,
+                loc.extent_id,
+                loc.offset,
+                loc.len,
+            )
+            .with_context(|| {
+                format!(
+                    "open SST meta extent={} offset={} len={}",
+                    loc.extent_id, loc.offset, loc.len
                 )
             })?;
 
@@ -6430,10 +6486,36 @@ async fn recover_partition(
             // F127: retry extent reads during recovery instead of silently
             // skipping. A transient node failure should not cause permanent
             // data loss for un-checkpointed writes.
+            // F261: stream the replay in bounded chunks (F106 carry
+            // pattern) — the pre-F261 whole-extent read `(eid, start, 0)`
+            // materialized up to 2 GB per partition at restart, keeping
+            // recovery RSS at O(dataset).
+            //
+            // MUST be the COMMITTED-clamped read, not the plain one: a
+            // replica's data file legitimately holds speculative bytes past
+            // `sealed_length` / min-commit (an ahead replica is never
+            // truncated back once the extent seals). The plain explicit-
+            // length read clamps only at the SERVING replica's local file
+            // length, so this loop's short-read stop condition never fires
+            // at the committed end — the scan ingests un-committed bytes
+            // and the next chunk request trips `StaleVpOffset`
+            // (offset > sealed_length), permanently wedging the partition
+            // open (observed 2026-06-11: 4/8 partitions in an open-fail
+            // loop after a kill+restart on a ~22 GB dataset). The len=0
+            // whole-read this replaced resolved its end from
+            // sealed_length / the commit probe, which is exactly what
+            // `read_committed_bytes_from_extent` restores per chunk.
+            const REPLAY_CHUNK_BYTES: u32 = 64 * 1024 * 1024;
+            let mut cur_off: u32 = start_off;
+            let mut carry: Vec<u8> = Vec::new();
+            loop {
             let data = {
                 let mut attempt = 0u32;
                 loop {
-                    match part_sc.read_bytes_from_extent(eid, start_off, 0).await {
+                    match part_sc
+                        .read_committed_bytes_from_extent(eid, cur_off, REPLAY_CHUNK_BYTES)
+                        .await
+                    {
                         Ok((d, _)) => break d,
                         Err(e) => {
                             attempt += 1;
@@ -6452,7 +6534,20 @@ async fn recover_partition(
                     }
                 }
             };
-            for (buf_off, op, key, value, expires_at) in decode_records_with_offsets(&data) {
+            let got = data.len();
+            if got == 0 && carry.is_empty() {
+                break;
+            }
+            let buf_base = cur_off as usize - carry.len();
+            let buf: Vec<u8> = if carry.is_empty() {
+                data
+            } else {
+                let mut c = std::mem::take(&mut carry);
+                c.extend_from_slice(&data);
+                c
+            };
+            let (records, consumed) = decode_records_chunk(&buf);
+            for (buf_off, op, key, value, expires_at) in records {
                 let ts = parse_ts(&key);
                 if ts > max_seq {
                     max_seq = ts;
@@ -6461,7 +6556,7 @@ async fn recover_partition(
                     continue;
                 }
 
-                let record_extent_off = start_off + buf_off as u32;
+                let record_extent_off = (buf_base + buf_off) as u32;
                 let mem_entry = if op & OP_VALUE_POINTER != 0 || value.len() > VALUE_THROTTLE {
                     // VP detection: new WAL has VP flag in op; old WAL uses
                     // value size as fallback. F186 fix: V1 envelope adds
@@ -6488,6 +6583,22 @@ async fn recover_partition(
                 let size = key.len() as u64 + mem_entry.value.len() as u64 + 32;
                 active.insert(key, mem_entry, size);
             }
+            carry = buf[consumed..].to_vec();
+            cur_off += got as u32;
+            if (got as u32) < REPLAY_CHUNK_BYTES {
+                // Reached the commit end. A trailing partial record is the
+                // expected crash-tail shape (same tolerance as the old
+                // whole-extent decode, which simply stopped at Incomplete).
+                if !carry.is_empty() {
+                    tracing::debug!(
+                        eid,
+                        tail_bytes = carry.len(),
+                        "replay: discarding partial trailing WAL record"
+                    );
+                }
+                break;
+            }
+            } // chunk loop
         }
     }
 
@@ -6545,6 +6656,37 @@ pub(crate) fn decode_records_full(bytes: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>, u6
         tracing::warn!(skipped, "F158: skipped {skipped} corrupted WAL record(s)");
     }
     out
+}
+
+/// F261: chunked-replay variant — also returns CONSUMED bytes (offset just
+/// past the last complete record) so the caller can carry the partial tail
+/// into the next chunk (F106 GC streaming pattern).
+pub(crate) fn decode_records_chunk(
+    bytes: &[u8],
+) -> (Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)>, usize) {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let record_start = cursor;
+        match crate::wal_record::decode_one(&bytes[cursor..]) {
+            crate::wal_record::DecodeOne::Ok(r) => {
+                out.push((
+                    record_start,
+                    r.op,
+                    r.key.to_vec(),
+                    r.value.to_vec(),
+                    r.expires_at,
+                ));
+                cursor += r.total;
+            }
+            crate::wal_record::DecodeOne::Incomplete => break,
+            crate::wal_record::DecodeOne::Corrupt { skip_bytes, reason } => {
+                tracing::warn!(record_start, skip_bytes, reason, "WAL record corrupted; skipping");
+                cursor += skip_bytes;
+            }
+        }
+    }
+    (out, cursor)
 }
 
 pub(crate) fn decode_records_with_offsets(bytes: &[u8]) -> Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)> {
@@ -7733,7 +7875,16 @@ async fn do_flush_on_bulk(
 
     let append_result = bulk_sc.append(row_stream_id, &sst_bytes).await?;
     let estimated_size = sst_bytes.len() as u64;
-    let reader = SstReader::from_bytes(Bytes::from(sst_bytes))?;
+    let sst_len = sst_bytes.len() as u32;
+    // F261: parse the meta then DROP the resident bytes — blocks are
+    // served on demand from row_stream through the bounded global cache.
+    // (No cache invalidation needed on later GC: extent ids are never
+    // reused, stale entries simply age out of the LRU.)
+    let reader = SstReader::from_bytes(Bytes::from(sst_bytes))?.into_paged(
+        append_result.extent_id,
+        append_result.offset,
+        sst_len,
+    );
     let new_meta = TableMeta {
         extent_id: append_result.extent_id,
         offset: append_result.offset,

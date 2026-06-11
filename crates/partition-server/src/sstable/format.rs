@@ -230,6 +230,16 @@ pub struct DecodedBlock {
 }
 
 impl DecodedBlock {
+    /// F261 test helper — fabricate a minimal block for cache unit tests.
+    #[cfg(test)]
+    pub fn test_dummy(data: Bytes) -> Self {
+        Self {
+            data,
+            entry_offsets: vec![0],
+            base_key: vec![],
+        }
+    }
+
     /// Decode a raw block (bytes from SSTable, including the entry_offsets footer and CRC).
     /// `base_key_hint` is the key from BlockOffset (= first key in block, from MetaBlock index).
     /// `raw` is a `Bytes` slice from the SSTable data — the decoded block keeps a zero-copy

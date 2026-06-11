@@ -1641,6 +1641,11 @@ pub(crate) async fn do_compact(
         });
     }
 
+    // F261: sync MergeIterator needs resident bytes — materialize paged
+    // inputs (transient; peak = input SST bytes, identical to pre-F261
+    // where inputs were always resident; bounded by ConcurrencyController).
+    let readers = materialized_for_iteration(&readers, &part_sc).await?;
+
     let mut readers_with_meta: Vec<(Arc<SstReader>, u64)> = readers
         .iter()
         .zip(tbls.iter())
@@ -1786,7 +1791,8 @@ pub(crate) async fn do_compact(
             // verifies CRC; ~5-10 ms for a max-chunk SST. Off-loaded too.
             let reader = compio::runtime::spawn_blocking(move || SstReader::from_bytes(sst_bytes))
                 .await
-                .map_err(|_| anyhow!("compact SstReader join failed"))??;
+                .map_err(|_| anyhow!("compact SstReader join failed"))??
+                .into_paged(result.extent_id, result.offset, result.end - result.offset);
             let reader = Arc::new(reader);
             new_readers.push((
                 TableMeta {
@@ -1846,7 +1852,8 @@ pub(crate) async fn do_compact(
             compact_row_append(&row_append_tx, row_stream_id, sst_bytes.clone()).await?;
         let reader = compio::runtime::spawn_blocking(move || SstReader::from_bytes(sst_bytes))
             .await
-            .map_err(|_| anyhow!("compact final SstReader join failed"))??;
+            .map_err(|_| anyhow!("compact final SstReader join failed"))??
+            .into_paged(result.extent_id, result.offset, result.end - result.offset);
         let reader = Arc::new(reader);
         new_readers.push((
             TableMeta {
@@ -2501,7 +2508,31 @@ async fn process_gc_chunk(
             continue;
         }
 
-        let current: Option<(u8, Bytes, u64)> = {
+        // coco P0 #3 (F261): the paged-SST liveness lookup AWAITS, so the
+        // sst_readers snapshot it ran against can go STALE mid-lookup — a
+        // concurrent Put for this key can land in active AND be flushed all
+        // the way into a NEW SST within the await window, where neither the
+        // snapshot lookup nor an active/imm re-check sees it. Acting on the
+        // stale verdict would rewrite the OLD value at a fresh (higher) seq
+        // — resurrecting it over the new write. The dual hazard makes
+        // "just skip on any change" wrong too: if the old value WAS still
+        // live, skipping its rewrite and then punching the extent destroys
+        // it. So: VALIDATE the snapshot after the await (P-log is single-
+        // threaded — interleaving happens only at awaits, and there is no
+        // await between this validation, the verdict use, and the seq
+        // allocation below). If sst_readers changed, REDO the lookup
+        // against a fresh snapshot; on repeated churn, abort this extent's
+        // round (no punch — safe, retried next tick).
+        let mut lookup_attempts = 0u32;
+        let current: Option<(u8, Bytes, u64)> = loop {
+            lookup_attempts += 1;
+            if lookup_attempts > 4 {
+                return Err(anyhow::anyhow!(
+                    "gc liveness lookup: sst_readers changed on {} consecutive \
+                     attempts (heavy flush/compact churn); aborting extent round",
+                    lookup_attempts - 1
+                ));
+            }
             let p = part.borrow();
             let mem = p
                 .active
@@ -2509,17 +2540,55 @@ async fn process_gc_chunk(
                 .or_else(|| p.imm.iter().rev().find_map(|m| m.seek_user_key(&user_key)))
                 .map(|e| (e.op, Bytes::from(e.value), e.expires_at));
             if mem.is_some() {
-                mem
-            } else {
-                let mut found = None;
-                for r in p.sst_readers.iter().rev() {
-                    if let Some(e) = lookup_in_sst(r, &user_key) {
+                break mem;
+            }
+            // F261: paged SST lookup awaits — snapshot + drop borrow.
+            let readers: Vec<Arc<SstReader>> = p.sst_readers.to_vec();
+            let sc = p.stream_client.clone();
+            drop(p);
+            let cache = crate::global_block_cache().clone();
+            let mut found = None;
+            for r in readers.iter().rev() {
+                // coco P0: a read ERROR must abort this extent's GC
+                // round (no punch) — folding it into "miss" deleted
+                // still-referenced VP data.
+                match lookup_in_sst_via(r, &user_key, &sc, &cache).await {
+                    Ok(Some(e)) => {
                         found = Some(e);
                         break;
                     }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(e.context("gc liveness lookup (paged sst)"));
+                    }
                 }
-                found
             }
+            // Post-await validation under one borrow:
+            // (a) did the key appear in active/imm during the await (a
+            //     concurrent Put)? → the SST verdict is superseded; loop —
+            //     the next iteration takes the mem branch and judges
+            //     against the NEW version.
+            // (b) did sst_readers change (flush push / compact swap)? →
+            //     the snapshot lookup may have missed a newer flushed
+            //     version; loop with a fresh snapshot.
+            // There is NO await between this validation, the verdict use,
+            // and the seq allocation below (single-threaded P-log), so a
+            // verdict that passes here cannot go stale before the rewrite
+            // is staged.
+            let p = part.borrow();
+            let appeared_in_mem = p.active.seek_user_key(&user_key).is_some()
+                || p.imm.iter().rev().any(|m| m.seek_user_key(&user_key).is_some());
+            let snapshot_stale = p.sst_readers.len() != readers.len()
+                || p
+                    .sst_readers
+                    .iter()
+                    .zip(readers.iter())
+                    .any(|(a, b)| !Arc::ptr_eq(a, b));
+            drop(p);
+            if appeared_in_mem || snapshot_stale {
+                continue;
+            }
+            break found;
         };
 
         let Some((cur_op, cur_val, _)) = current else {
@@ -2536,6 +2605,12 @@ async fn process_gc_chunk(
         // Stage the WAL record into the batch under a brief borrow_mut
         // (seq assignment + internal_key encode). No await happens
         // inside the borrow.
+        // Stale-verdict protection lives in the validation loop ABOVE (the
+        // post-await active/imm + sst_readers re-check) — NOT here. A naive
+        // "skip if key present in active/imm" check at this point would be
+        // WRONG: the mem branch finds the live VP in the memtable (the
+        // normal recently-written case), and skipping its rewrite before
+        // the punch would destroy live data.
         let internal_key = {
             let mut p = part.borrow_mut();
             p.seq_number += 1;
@@ -2669,6 +2744,86 @@ pub(crate) fn lookup_in_sst_seq_fullscan(reader: &SstReader, user_key: &[u8]) ->
     best
 }
 
+/// F261: async point lookup that works for paged AND resident readers —
+/// exact mirror of `lookup_in_sst` (incl. the F250 next-block hop), with
+/// block reads going through `read_block_via` (bounded global cache; miss
+/// fetched from row_stream). MUST be called with NO RefCell borrow held
+/// (note 15) — callers snapshot Arc<SstReader>s first.
+/// Errors are PROPAGATED, never folded into "miss" (coco P0): a paged
+/// block read is a fallible network read — treating a transient failure
+/// as "key absent" let GC punch extents whose VPs were still live, and
+/// let GET return a false NotFound. `Ok(None)` strictly means "definitely
+/// not in this SST".
+pub(crate) async fn lookup_in_sst_via(
+    reader: &SstReader,
+    user_key: &[u8],
+    sc: &Rc<StreamClient>,
+    cache: &crate::sstable::BlockCache,
+) -> Result<Option<(u8, Bytes, u64)>> {
+    if !reader.bloom_may_contain(user_key) {
+        return Ok(None);
+    }
+    let target = key_with_ts(user_key, u64::MAX);
+    let block_idx = reader.find_block_for_key(&target);
+    let block = reader.read_block_via(block_idx, sc, cache).await?;
+    let n = block.num_entries();
+    if n == 0 {
+        return Ok(None);
+    }
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let key = block
+            .get_key(mid)
+            .map_err(|e| anyhow!("sst block entry decode: {e}"))?;
+        if key.as_slice() < target.as_slice() {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    // F250 next-block hop — see lookup_in_sst for the full rationale.
+    let (blk, pos) = if lo < n {
+        (block, lo)
+    } else if block_idx + 1 < reader.block_count() {
+        let nb = reader.read_block_via(block_idx + 1, sc, cache).await?;
+        if nb.num_entries() == 0 {
+            return Ok(None);
+        }
+        (nb, 0usize)
+    } else {
+        return Ok(None);
+    };
+    let (key, op, value, expires_at) = blk
+        .get_entry(pos)
+        .map_err(|e| anyhow!("sst block entry decode: {e}"))?;
+    if parse_key(&key) == user_key {
+        return Ok(Some((op, value, expires_at)));
+    }
+    Ok(None)
+}
+
+/// F261: sync iteration (TableIterator/MergeIterator) requires resident
+/// bytes — materialize any PAGED reader into a transient resident copy
+/// (whole-SST read off row_stream). Call sites are bounded: do_compact via
+/// ConcurrencyController, split via compact_gate, range per-request
+/// (documented Stage-1 cost; Stage-2 = async iterators).
+pub(crate) async fn materialized_for_iteration(
+    readers: &[Arc<SstReader>],
+    sc: &Rc<StreamClient>,
+) -> Result<Vec<Arc<SstReader>>> {
+    let mut out = Vec::with_capacity(readers.len());
+    for r in readers {
+        if r.is_paged() {
+            out.push(Arc::new(r.materialize(sc).await?));
+        } else {
+            out.push(r.clone());
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, Bytes, u64)> {
     if !reader.bloom_may_contain(user_key) {
         return None;
@@ -2732,7 +2887,10 @@ pub(crate) fn collect_mem_items(part: &PartitionData) -> Vec<IterItem> {
     items
 }
 
-pub(crate) fn unique_user_keys(part: &PartitionData) -> Vec<Vec<u8>> {
+/// F261: `readers` = pre-materialized resident readers (caller snapshots
+/// `part.sst_readers`, drops the borrow, awaits `materialized_for_iteration`,
+/// re-borrows). The split path holds `compact_gate`, so the set is stable.
+pub(crate) fn unique_user_keys(part: &PartitionData, readers: &[Arc<SstReader>]) -> Vec<Vec<u8>> {
     let now = now_secs();
     let mut seen: BTreeMap<Vec<u8>, (u8, u64)> = BTreeMap::new();
 
@@ -2742,7 +2900,7 @@ pub(crate) fn unique_user_keys(part: &PartitionData) -> Vec<Vec<u8>> {
         seen.entry(uk).or_insert((item.op, item.expires_at));
     }
 
-    for reader in part.sst_readers.iter().rev() {
+    for reader in readers.iter().rev() {
         let mut it = TableIterator::new(reader.clone());
         it.rewind();
         while it.valid() {

@@ -67,6 +67,8 @@ struct Args {
     read_hedge_ms: Option<u64>,
     /// F260: min append payload for chained replication. None = default 64K; 0 = off.
     append_chain_min_bytes: Option<u32>,
+    /// F261: bounded SST block cache capacity (bytes). None = 512 MiB.
+    sst_block_cache_bytes: Option<usize>,
     gc_read_chunk_bytes: Option<u32>,
     gc_batch_records: Option<usize>,
     gc_batch_bytes: Option<usize>,
@@ -125,6 +127,7 @@ fn parse_args() -> Args {
     let mut min_pipeline_batch: Option<usize> = None;
     let mut read_hedge_ms: Option<u64> = None;
     let mut append_chain_min_bytes: Option<u32> = None;
+    let mut sst_block_cache_bytes: Option<usize> = None;
     let mut gc_read_chunk_bytes: Option<u32> = None;
     let mut gc_batch_records: Option<usize> = None;
     let mut gc_batch_bytes: Option<usize> = None;
@@ -306,6 +309,11 @@ fn parse_args() -> Args {
                 append_chain_min_bytes =
                     Some(args[i].parse().expect("--append-chain-min-bytes u32"));
             }
+            "--sst-block-cache-bytes" => {
+                i += 1;
+                sst_block_cache_bytes =
+                    Some(args[i].parse().expect("--sst-block-cache-bytes usize"));
+            }
             "--read-hedge-ms" => {
                 // F258: hedge delay for replicated sealed-extent reads.
                 // 0 (default) = hedging off; replica rotation always on.
@@ -443,6 +451,7 @@ fn parse_args() -> Args {
         min_pipeline_batch,
         read_hedge_ms,
         append_chain_min_bytes,
+        sst_block_cache_bytes,
         gc_read_chunk_bytes,
         gc_batch_records,
         gc_batch_bytes,
@@ -528,6 +537,18 @@ fn apply_ps_tunables(args: &Args) {
     }
     if let Some(n) = args.append_chain_min_bytes {
         autumn_stream::set_append_chain_min_bytes(n);
+    }
+    if let Some(n) = args.sst_block_cache_bytes {
+        // coco P3: the setter rejects out-of-range values ([16MiB, 256GiB])
+        // or a too-late call — fail loudly instead of silently running with
+        // the 512MiB default.
+        if !autumn_partition_server::set_sst_block_cache_bytes(n) {
+            eprintln!(
+                "error: --sst-block-cache-bytes {n} rejected \
+                 (valid range [16MiB, 256GiB], must be set before first use)"
+            );
+            std::process::exit(2);
+        }
     }
     if let Some(n) = args.min_pipeline_batch {
         eprintln!(

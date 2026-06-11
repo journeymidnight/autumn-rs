@@ -4666,7 +4666,63 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
 - **验收**：冷数据集 >PS RAM 场景可服务（现状 OOM/不可装载）；热工作集读
   性能不回归（perf-check 读两尺寸）；compaction 后 cache 失效正确（无脏块）；
   内存峰值有界可观测。
-- **passes:** not_completed (planned)
+- **实现（2026-06-11, Stage-1）**：
+  - reader.rs `SstSource::{Resident,Paged}` + `into_paged`/`read_block_via`
+    （块经全 PS 有界 `BlockCache`，miss 走 row_stream 读，吃 F258 轮转）+
+    `open_paged_from_meta`（**只读 meta 尾**：末 4 字节定 meta_len → 读 meta
+    区，recovery 不再整 SST 物化）+ `materialize`（同步迭代器用的临时
+    Resident 副本）。
+  - `BlockCache`（block_cache.rs）：(extent_id, 绝对偏移) 键、采样 LRU 逐出、
+    `--sst-block-cache-bytes`/`AUTUMN_SST_BLOCK_CACHE_BYTES`（默认 512MB）、
+    命中统计。**无需 compaction 失效**：extent_id 永不复用，旧条目无正确性
+    风险、由 LRU 老化（验收第三条以此口径满足）。
+  - 读路径异步化：get/head/GC 活性查找改"borrow 内快照 readers+sc → drop →
+    `lookup_in_sst_via` await →重 borrow"（note 15 合规，batch_get 先例）；
+    `lookup_in_sst_via` 完整镜像 F250 next-block hop。
+  - 同步迭代器路径（range/do_compact/unique_user_keys）：paged reader 先
+    `materialized_for_iteration`（整 SST 临时驻留，分别受 per-请求/
+    ConcurrencyController/compact_gate 约束）——Stage-1 成本，Stage-2=异步
+    迭代器。诊断 seq_opt/fullscan 对 paged 返回 miss（仅诊断面）。
+  - 3 个生产构造点（flush/compact/recovery）全部产出 Paged reader。
+  - **WAL 重放流式化**（顺带修的 pre-existing 大头）：lib.rs 重放原本
+    `(eid, start, 0)` 整段读（2GB/分区）——改 64MB chunked-carry
+    （`decode_records_chunk` 返回 consumed，F106 GC 同款），恢复期不再
+    O(dataset) 物化。**chunked 读必须 committed-clamp**（首版 bug，e2e
+    重启复现后修复）：副本本地文件可合法持有 sealed_length/min-commit 之后
+    的 speculative 字节（ahead 副本 seal 后永不回截），显式长度读只被服务
+    副本本地长度截断 → 短读停止条件在 committed 末尾永不触发 → 扫过界、
+    下一 chunk 触发 `StaleVpOffset`，4/8 分区 open 永久失败循环。新增
+    `StreamClient::read_committed_bytes_from_extent`（sealed 用
+    sealed_length、open tail 每 chunk 一次 min-replica commit 探测做
+    clamp；offset 真正越过 sealed_length 仍响亮报 StaleVpOffset 不掩盖）。
+  - **coco review 两轮（3 P0 + 2 P2 + 1 P3 已修）**：
+    ① `lookup_in_sst_via` 曾把块读错误折叠成 miss——GC 活性误判会 punch 活
+    VP（数据丢失）；改 `Result<Option<…>>` 错误传播，GC 该 extent 轮中止、
+    get/head 返回 Internal。
+    ② GC paged 活性查找的 await 窗口竞态（终版）：同 key 新写可在 await 期
+    间一路 flush 进新 SST，旧 snapshot 验出"仍 live"→ 用更高 seq 重写旧值
+    = 复活覆盖新写。修法 = await 后同一 borrow 下验证 snapshot（active/imm
+    出现该 key 或 sst_readers ptr-identity 变化 → 重做 lookup，4 次仍变 →
+    中止该 extent 轮不 punch）；验证→verdict→seq 分配间无 await（P-log 单
+    线程）故 airtight。⚠️ 首版"seq 分配时查到 active/imm 有该 key 就 skip"
+    是自产 P0：mem 分支本来就是"活 VP 在 memtable、必须 rewrite 再 punch"
+    的正常路径，skip+punch = 数据丢失——已撤换为上述验证环。
+    ③ paged `read_block_via` 越界防护：checked arithmetic + block 窗口必须
+    落在 `[base, base+len_in_extent)`，损坏 meta 不再能读到同 extent 相邻
+    SST 的字节。
+    ④ get/head 块读失败时若 sst_readers 已变（compaction 截断旧 row
+    extent 的 TOCTOU）→ 拿新 snapshot 重试一次，再失败才 Internal。
+    ⑤ handle_range 物化前先按 SST key 范围预过滤（biggest<seek 或
+    prefix 之外的整表跳过），小 range 不再整分区物化。
+    ⑥ `--sst-block-cache-bytes` 非法值此前被静默忽略 → 现在 fail loudly
+    退出。
+- **实测（~14GB 数据集, 8 分区, TCP 3disk）**：恢复后空闲 RSS **2,380MB**
+  （= 重放窗口 ≤ 每分区最后一个 memtable 的既有设计界 + 元数据，**与数据集
+  体量无关**；修前等效场景 18-28GB）。多轮重启字节对拍（小键/8M/range）全过、
+  0 错误；读风暴后 cache 增量 +240MB < 512MB 上限；perf 回归：4K 写 27-61K/
+  读 0.5-1.2M、8M 写 103.6/读 500.4（均在当日硬件区间）。160 单测全绿
+  （含 BlockCache 2 项）。
+- **passes:** completed (2026-06-11, Stage-1；Stage-2=异步迭代器+range 免物化 备案)
 
 ---
 

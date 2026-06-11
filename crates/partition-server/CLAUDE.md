@@ -465,6 +465,38 @@ Get(key, part_id):
        else → return raw value
 ```
 
+### F261 — SST on-demand paging + bounded block cache (Stage-1)
+
+`SstReader` no longer keeps SST bytes resident: production readers
+(flush / compact / recovery) are PAGED — only MetaBlock state stays in
+memory; data blocks are fetched on demand from row_stream through the
+process-wide bounded `BlockCache` (`--sst-block-cache-bytes`, default
+512 MB, sampled-LRU; keys = `(extent_id, abs_off)`; NO compaction
+invalidation needed — extent ids are never reused, stale entries age
+out). Recovery opens SSTs from the META TAIL ONLY (last-4-bytes →
+meta region) and the WAL replay streams in 64 MB chunked-carry
+(`decode_records_chunk`) — both pre-F261 whole-reads kept restart RSS
+at O(dataset) (measured 18-28 GB on a 14 GB set; now 2,380 MB =
+replay-window bound, dataset-independent). The replay chunks MUST use
+`StreamClient::read_committed_bytes_from_extent` (committed-clamped),
+never the plain explicit-length read: a replica's file legitimately
+holds speculative bytes past `sealed_length`/min-commit, so the plain
+read's short-read stop never fires at the committed end — the scan
+ingests un-committed bytes and the next chunk trips `StaleVpOffset`,
+permanently wedging the partition open (hit 2026-06-11 on 4/8
+partitions after kill+restart).
+
+Invariants:
+- Point lookups go through `lookup_in_sst_via` (async): callers
+  SNAPSHOT `Arc<SstReader>`s + stream_client under the borrow, DROP it,
+  await, re-borrow (note 15). `lookup_in_sst` (sync) serves resident
+  readers only and ERRORS on paged ones — never silently misses.
+- Sync iteration (TableIterator/MergeIterator: range, do_compact,
+  unique_user_keys) must `materialized_for_iteration` first (transient
+  resident copy; bounded by per-request / ConcurrencyController /
+  compact_gate). Stage-2 = async iterators to remove this cost.
+- Diag seq_opt/fullscan report miss on paged readers (diagnostic-only).
+
 ### F259 — large-VP client direct-read (MSG_GET_REDIRECT)
 
 `handle_get_redirect` (rpc_handlers.rs): a FULL-value read of a VP whose

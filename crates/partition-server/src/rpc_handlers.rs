@@ -425,15 +425,59 @@ async fn get_value_inner(
             }
             None
         })
-        .or_else(|| {
-            for reader in p.sst_readers.iter().rev() {
-                if let Some(r) = lookup_in_sst(reader, &req.key) {
-                    source = 3;
-                    return Some(r);
+        ;
+    // F261: the SST lookup may FETCH blocks from row_stream (paged
+    // readers) — snapshot the reader set + stream client, DROP the
+    // borrow, then await (note 15: never hold a RefCell borrow across an
+    // await). Mirrors handle_batch_get's snapshot-then-serve pattern.
+    // The re-borrow below may observe post-split state for the pin /
+    // redirect section — same relaxation batch_get already accepts.
+    let mut p = p;
+    let mut found = found;
+    if found.is_none() {
+        // coco P2 (F261): a snapshot reader's backing row extent can be
+        // TRUNCATED by a compaction that completes during our block read
+        // (paged readers hold metadata only, not bytes). On a read error,
+        // if the live sst_readers set changed since the snapshot, retry
+        // ONCE against the fresh set — the key (if it exists) is in the
+        // compaction's output SSTs. Unchanged set or second failure =
+        // a real read error, surfaced as Internal (never false NotFound).
+        let mut attempt = 0u32;
+        'sst_lookup: loop {
+            attempt += 1;
+            let readers: Vec<std::sync::Arc<SstReader>> = p.sst_readers.to_vec();
+            let sc = p.stream_client.clone();
+            drop(p);
+            let cache = crate::global_block_cache().clone();
+            for reader in readers.iter().rev() {
+                match lookup_in_sst_via(reader, &req.key, &sc, &cache).await {
+                    Ok(Some(r)) => {
+                        source = 3;
+                        found = Some(r);
+                        break;
+                    }
+                    Ok(None) => {}
+                    // coco P0: surface block-read failures as a retryable
+                    // error — NEVER a false NotFound.
+                    Err(e) => {
+                        p = part.borrow();
+                        let readers_changed = p.sst_readers.len() != readers.len()
+                            || p
+                                .sst_readers
+                                .iter()
+                                .zip(readers.iter())
+                                .any(|(a, b)| !std::sync::Arc::ptr_eq(a, b));
+                        if attempt == 1 && readers_changed {
+                            continue 'sst_lookup;
+                        }
+                        return Err((StatusCode::Internal, format!("sst block read: {e}")));
+                    }
                 }
             }
-            None
-        });
+            p = part.borrow();
+            break;
+        }
+    }
     let lookup_ns = lookup_t0.elapsed().as_nanos() as u64;
 
     let (op, raw_value, expires_at) = match found {
@@ -588,14 +632,48 @@ pub(crate) async fn handle_head(
             }
             None
         })
-        .or_else(|| {
-            for reader in p.sst_readers.iter().rev() {
-                if let Some(r) = lookup_in_sst(reader, &req.key) {
-                    return Some(r);
+        ;
+    // F261: paged SST lookup awaits — snapshot + drop borrow (note 15).
+    let mut found = found;
+    if found.is_none() {
+        // coco P2 (F261): same compaction-truncate retry as get_value_inner
+        // — readers-changed → retry once against the fresh set.
+        let mut p = p;
+        let mut attempt = 0u32;
+        'sst_lookup: loop {
+            attempt += 1;
+            let readers: Vec<std::sync::Arc<SstReader>> = p.sst_readers.to_vec();
+            let sc = p.stream_client.clone();
+            drop(p);
+            let cache = crate::global_block_cache().clone();
+            for reader in readers.iter().rev() {
+                match lookup_in_sst_via(reader, &req.key, &sc, &cache).await {
+                    Ok(Some(r)) => {
+                        found = Some(r);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        let q = part.borrow();
+                        let readers_changed = q.sst_readers.len() != readers.len()
+                            || q
+                                .sst_readers
+                                .iter()
+                                .zip(readers.iter())
+                                .any(|(a, b)| !std::sync::Arc::ptr_eq(a, b));
+                        if attempt == 1 && readers_changed {
+                            p = q;
+                            continue 'sst_lookup;
+                        }
+                        return Err((StatusCode::Internal, format!("sst block read: {e}")));
+                    }
                 }
             }
-            None
-        });
+            break;
+        }
+    } else {
+        drop(p);
+    }
 
     let (op, raw_value, expires_at) = match found {
         Some(v) => v,
@@ -679,8 +757,43 @@ pub(crate) async fn handle_range(
     let mut mem_it = MemtableIterator::new(mem_items);
     mem_it.seek(&seek_key);
 
-    let sst_iters: Vec<TableIterator> = p
+    // F261: paged readers need resident bytes for the sync TableIterator —
+    // snapshot + drop the borrow + materialize (await), then iterate.
+    // Stage-1 cost: a range over paged SSTs fetches whole SSTs transiently;
+    // Stage-2 (async iterators) removes this.
+    //
+    // coco P2: pre-filter by SST key range BEFORE materializing — a small
+    // prefix/limit scan must not transiently fetch the partition's entire
+    // SST set. Skip SSTs entirely before the scan start (biggest < seek)
+    // and, when a prefix bounds the scan, SSTs entirely after it
+    // (smallest's user part > prefix, and not a prefix-extension).
+    // smallest/biggest are INTERNAL keys (user ++ 0x00 ++ inv-seq);
+    // seek_key sorts before every real entry of start_user_key, so
+    // `biggest < seek_key` is exact, not approximate.
+    let readers_snap: Vec<std::sync::Arc<SstReader>> = p
         .sst_readers
+        .iter()
+        .filter(|r| {
+            if r.biggest_key() < seek_key.as_slice() {
+                return false;
+            }
+            if !req.prefix.is_empty() {
+                let s_user = parse_key(r.smallest_key());
+                if s_user > req.prefix.as_slice() && !s_user.starts_with(&req.prefix) {
+                    return false;
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect();
+    let sc_snap = p.stream_client.clone();
+    drop(p);
+    let readers_mat = materialized_for_iteration(&readers_snap, &sc_snap)
+        .await
+        .map_err(|e| (StatusCode::Internal, format!("range materialize: {e}")))?;
+    let p = part.borrow();
+    let sst_iters: Vec<TableIterator> = readers_mat
         .iter()
         .rev()
         .map(|r| {
@@ -906,7 +1019,16 @@ pub(crate) async fn handle_split_part(
             })?
     };
 
-    let user_keys = unique_user_keys(&part.borrow())
+    // F261: materialize paged SSTs for the sync key scan (under
+    // compact_gate; transient resident copies).
+    let (uuk_readers, uuk_sc) = {
+        let p = part.borrow();
+        (p.sst_readers.to_vec(), p.stream_client.clone())
+    };
+    let uuk_readers = materialized_for_iteration(&uuk_readers, &uuk_sc)
+        .await
+        .map_err(|e| (StatusCode::Internal, format!("split materialize: {e}")))?;
+    let user_keys = unique_user_keys(&part.borrow(), &uuk_readers)
         .into_iter()
         .filter(|k| in_range(&auth_rg, k))
         .collect::<Vec<_>>();

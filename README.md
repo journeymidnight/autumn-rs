@@ -138,6 +138,13 @@ $AC ls --prefix p/ --limit 100           # scan
 $AC put-stream KEY /path/to/big.bin      # chunked striperados for large values
 $AC perf-check --threads 16 --size 4096 --duration 10 --partitions 8
 
+# F261 — SST block cache (paged SSTs; SST data blocks no longer RAM-resident)
+# PS flag: autumn-ps --sst-block-cache-bytes N   (cluster.sh: AUTUMN_SST_BLOCK_CACHE_BYTES, default 512MB)
+# Manual check: write >> RAM dataset, kill -TERM the PS, restart, then
+#   `$AC get KEY` must byte-match and idle PS RSS stays at the replay-window
+#   bound (GBs), not O(dataset). Recovery must log `open_partition: ready`
+#   for every partition with no `stale_vp_offset_past_sealed_length` retries.
+
 # Admin / observability
 $AO info                                 # nodes / extents / streams / partitions
 $AO bootstrap --replication 3+0 --presplit 8:hexstring
