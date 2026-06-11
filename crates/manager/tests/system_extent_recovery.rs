@@ -67,7 +67,7 @@ fn extent_recovery_replaces_dead_node() {
                 rkyv_encode(&StreamAllocExtentReq {
                     stream_id,
                     owner_key: sc.owner_key().to_string(),
-                    revision: sc.revision(),
+                    owner_epoch: sc.owner_epoch(),
                     seal_commit: Some(result.end),
                     exclude_node_ids: vec![],
                 }),
@@ -192,7 +192,7 @@ fn recovery_dispatch_skips_healthy_sealed_extents() {
                 rkyv_encode(&StreamAllocExtentReq {
                     stream_id,
                     owner_key: sc.owner_key().to_string(),
-                    revision: sc.revision(),
+                    owner_epoch: sc.owner_epoch(),
                     seal_commit: Some(r.end),
                     exclude_node_ids: vec![],
                 }),

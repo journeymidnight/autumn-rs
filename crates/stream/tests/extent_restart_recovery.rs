@@ -49,12 +49,12 @@ async fn restart_preserves_meta_fields() {
         let alloc = conn.alloc_extent(2002).await;
         assert_eq!(alloc.code, CODE_OK);
 
-        // Establish revision 42
+        // Establish owner_epoch 42
         let resp = conn.append(2002, 1, 0, 42, b"data".to_vec()).await;
         assert_eq!(resp.code, CODE_OK);
     }
 
-    // After restart: revision 42 should be persisted; lower revision rejected
+    // After restart: owner_epoch 42 should be persisted; lower owner_epoch rejected
     let addr2 = pick_addr();
     start_node(dir.path(), addr2).await;
     let conn2 = TestConn::new(addr2);
@@ -62,7 +62,7 @@ async fn restart_preserves_meta_fields() {
     let stale = conn2.append(2002, 1, 4, 10, b"x".to_vec()).await;
     assert_eq!(
         stale.code, CODE_LOCKED_BY_OTHER,
-        "stale revision should be rejected after restart"
+        "stale owner_epoch should be rejected after restart"
     );
 }
 

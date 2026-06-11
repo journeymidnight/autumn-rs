@@ -24,7 +24,7 @@ pub const FLAG_STREAM_END: u8 = 0x04;
 /// Flag bit marking a frame that carries a per-frame CRC32C trailer over its
 /// payload. Every frame produced by `Frame::encode` sets it — the CRC is the
 /// standard frame protection (closes 7 audited hot-path corruption surfaces: a
-/// flipped extent_id / eversion / commit / revision over a TCP link whose
+/// flipped extent_id / eversion / commit / owner_epoch over a TCP link whose
 /// 16-bit checksum + NIC offload bugs can pass such bit-flips through; see
 /// feature_list.md F161 → F165). HW CRC32C (SSE4.2) keeps the cost negligible
 /// for the small control frames it now covers.

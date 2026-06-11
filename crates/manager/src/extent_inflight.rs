@@ -334,7 +334,7 @@ impl AutumnManager {
             extra_disk_ids: vec![],
             data_shards: 0,
             new_eversion: 0,
-            revision: 0,
+            owner_epoch: 0,
         });
         let record = MgrExtentInflightRecord::new(extent_id, payload, "test".to_string());
         self.inflight.borrow_mut().insert(extent_id, record);
@@ -596,7 +596,7 @@ mod tests {
             extra_disk_ids: vec![70],
             data_shards: 3,
             new_eversion: 4,
-            revision: 0,
+            owner_epoch: 0,
         })
     }
 

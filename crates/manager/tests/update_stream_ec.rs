@@ -246,7 +246,7 @@ fn update_stream_ec_triggers_conversion() {
                 rkyv_encode(&StreamAllocExtentReq {
                     stream_id,
                     owner_key: sc.owner_key().to_string(),
-                    revision: sc.revision(),
+                    owner_epoch: sc.owner_epoch(),
                     seal_commit: Some(result.end),
                     exclude_node_ids: vec![],
                 }),

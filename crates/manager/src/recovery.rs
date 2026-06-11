@@ -585,12 +585,12 @@ impl AutumnManager {
                     }
 
                     // F210-H3 Tier 2: switched from `commit_length_on_node`
-                    // (fence-gated, requires PS-owner revision) to the
+                    // (fence-gated, requires PS-owner owner_epoch) to the
                     // dedicated fence-free `probe_extent_on_node`. The
                     // recovery loop has no owner context and only uses
                     // `.is_ok()` for liveness — gating it on the
                     // owner-lock fence was always wrong (pre-Tier 2 we
-                    // worked around it by hardcoding `revision: 0` + a
+                    // worked around it by hardcoding `owner_epoch: 0` + a
                     // server-side escape hatch; that escape silently
                     // broke under F210-H2 and forced this same fix).
                     let healthy = match node {
@@ -1108,12 +1108,12 @@ impl crate::AutumnManager {
                     parity_shards: parity_shards as u32,
                     target_addrs: ec_target_addrs,
                     eversion: new_eversion,
-                    // F211-D Tier 2: thread the captured owner revision so
+                    // F211-D Tier 2: thread the captured owner owner_epoch so
                     // the coord can stamp WriteShard / CommitEcShard with
                     // it, enabling EN-side fence rejection of a ghost
                     // ex-coord after `auto_abandon_for_fenced_node` pushes
-                    // the bumped revision to remote targets.
-                    revision: params.revision,
+                    // the bumped owner_epoch to remote targets.
+                    owner_epoch: params.owner_epoch,
                 });
 
                 // 60 s ceiling so a paged-out / silently dead EN doesn't

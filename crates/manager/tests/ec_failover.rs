@@ -166,7 +166,7 @@ fn ec_2_1_failover_and_recovery() {
                 rkyv_encode(&StreamAllocExtentReq {
                     stream_id,
                     owner_key: client.owner_key().to_string(),
-                    revision: client.revision(),
+                    owner_epoch: client.owner_epoch(),
                     seal_commit: Some(result.end),
                     exclude_node_ids: vec![],
                 }),

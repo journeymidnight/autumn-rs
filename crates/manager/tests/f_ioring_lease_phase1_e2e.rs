@@ -102,7 +102,7 @@ async fn boot_cluster(
 ///    `pattern_v2` via `fuse_write::write_into`, Releases.
 /// 5. Reader B's poll surfaces the `WriterClosed` event.
 /// 6. `apply_invalidation` bumps `inv[ino]` past B's cached
-///    `lease_version` → `cache_is_stale == true`.
+///    `lease_epoch` → `cache_is_stale == true`.
 /// 7. `fuse_read::reload_extents` refreshes B's cache.
 /// 8. B reads again → MUST be v2. (This is the close-to-open
 ///    coherence guarantee.)
@@ -172,7 +172,7 @@ fn phase1_close_to_open_coherence_e2e() {
             .expect("B open");
         // Tag the cache with the lease version (as the daemon's
         // Open arm does in production).
-        opened_b.lease_version = b_acquire.version;
+        opened_b.lease_epoch = b_acquire.version;
         assert_eq!(opened_b.ino, ino);
         assert_eq!(opened_b.size, total as u64);
 
@@ -249,7 +249,7 @@ fn phase1_close_to_open_coherence_e2e() {
         assert!(!overflow);
         assert_eq!(inv.get(&ino).copied(), Some(new_version));
         assert!(
-            cache_is_stale(opened_b.ino, opened_b.lease_version, &inv),
+            cache_is_stale(opened_b.ino, opened_b.lease_epoch, &inv),
             "B's cache must be flagged stale post-invalidation"
         );
 
@@ -257,9 +257,9 @@ fn phase1_close_to_open_coherence_e2e() {
         fuse_read::reload_extents(&cluster_b, &mut opened_b)
             .await
             .expect("B reload_extents");
-        opened_b.lease_version = new_version;
+        opened_b.lease_epoch = new_version;
         assert!(
-            !cache_is_stale(opened_b.ino, opened_b.lease_version, &inv),
+            !cache_is_stale(opened_b.ino, opened_b.lease_epoch, &inv),
             "post-reload cache must be fresh"
         );
 

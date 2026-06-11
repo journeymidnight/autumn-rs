@@ -72,14 +72,14 @@ impl TestConn {
         extent_id: u64,
         eversion: u64,
         commit: u32,
-        revision: i64,
+        owner_epoch: i64,
         payload: Vec<u8>,
     ) -> AppendResp {
         let req = AppendReq {
             extent_id,
             eversion,
             commit,
-            revision,
+            owner_epoch,
             payload: Bytes::from(payload),
         };
         let resp = self
@@ -90,10 +90,10 @@ impl TestConn {
         AppendResp::decode(resp).expect("decode AppendResp")
     }
 
-    pub async fn commit_length(&self, extent_id: u64, revision: i64) -> CommitLengthResp {
+    pub async fn commit_length(&self, extent_id: u64, owner_epoch: i64) -> CommitLengthResp {
         let req = CommitLengthReq {
             extent_id,
-            revision,
+            owner_epoch,
         };
         let resp = self
             .pool
@@ -166,14 +166,14 @@ impl TestConn {
         eversion: u64,
         payload: Vec<u8>,
     ) -> WriteShardResp {
-        // F211-D added `revision`; tests use 0 (the documented
+        // F211-D added `owner_epoch`; tests use 0 (the documented
         // "no fence requested" wire-compat sentinel).
         let req = WriteShardReq {
             extent_id,
             shard_index,
             sealed_length,
             eversion,
-            revision: 0,
+            owner_epoch: 0,
             payload: Bytes::from(payload),
         };
         let resp = self
@@ -195,7 +195,7 @@ impl TestConn {
             sealed_length,
             eversion,
             // F211-D: tests pass 0 (no-fence sentinel).
-            revision: 0,
+            owner_epoch: 0,
         };
         let resp = self
             .pool

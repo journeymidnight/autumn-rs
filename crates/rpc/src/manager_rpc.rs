@@ -241,19 +241,19 @@ pub struct MgrEcDispatchInflight {
     pub extra_disk_ids: Vec<u64>,
     pub data_shards: u32,
     pub new_eversion: u64,
-    /// F211-D Tier 2: owner-lock revision the manager held when this
-    /// dispatch was authorised. Threaded into `ExtConvertToEcReq.revision`
-    /// → `WriteShardReq.revision` / `CommitEcShardReq.revision` so a
-    /// fenced ex-coord whose in-flight 2PC continues with the OLD revision
-    /// is rejected by remote ENs via the existing `req.revision <
-    /// entry.owner_revision → CODE_LOCKED_BY_OTHER` check. A bumped
-    /// revision is pushed to live targets by
+    /// F211-D Tier 2: owner-lock owner_epoch the manager held when this
+    /// dispatch was authorised. Threaded into `ExtConvertToEcReq.owner_epoch`
+    /// → `WriteShardReq.owner_epoch` / `CommitEcShardReq.owner_epoch` so a
+    /// fenced ex-coord whose in-flight 2PC continues with the OLD owner_epoch
+    /// is rejected by remote ENs via the existing `req.owner_epoch <
+    /// entry.owner_epoch → CODE_LOCKED_BY_OTHER` check. A bumped
+    /// owner_epoch is pushed to live targets by
     /// `auto_abandon_for_fenced_node` (fence-handover via
     /// `MSG_CHECK_COMMIT_LENGTH`) so the EN-side check fires.
     ///
     /// `0` keeps the pre-F211-D-Tier-2 no-fence behaviour for tests /
     /// memory-only mode where no owner_lock has been acquired.
-    pub revision: i64,
+    pub owner_epoch: i64,
 }
 
 /// Extent metadata — mirrors proto ExtentInfo.
@@ -419,7 +419,7 @@ pub struct AcquireOwnerLockReq {
 pub struct AcquireOwnerLockResp {
     pub code: u8,
     pub message: String,
-    pub revision: i64,
+    pub owner_epoch: i64,
 }
 
 // --- RegisterNode ---
@@ -507,7 +507,7 @@ pub struct NodesInfoResp {
 pub struct CheckCommitLengthReq {
     pub stream_id: u64,
     pub owner_key: String,
-    pub revision: i64,
+    pub owner_epoch: i64,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -524,7 +524,7 @@ pub struct CheckCommitLengthResp {
 pub struct StreamAllocExtentReq {
     pub stream_id: u64,
     pub owner_key: String,
-    pub revision: i64,
+    pub owner_epoch: i64,
     /// How to seal the CURRENT tail before allocating the new extent:
     /// - `Some(c)` — AUTHORITATIVE: seal at EXACTLY `c`, do NOT probe. `c` is
     ///   the writer's own all-replica-acked commit (`state.commit`) captured at
@@ -563,7 +563,7 @@ pub struct StreamAllocExtentResp {
 pub struct PunchHolesReq {
     pub stream_id: u64,
     pub owner_key: String,
-    pub revision: i64,
+    pub owner_epoch: i64,
     pub extent_ids: Vec<u64>,
 }
 
@@ -579,7 +579,7 @@ pub struct PunchHolesResp {
 pub struct TruncateReq {
     pub stream_id: u64,
     pub owner_key: String,
-    pub revision: i64,
+    pub owner_epoch: i64,
     pub extent_id: u64,
 }
 
@@ -595,7 +595,7 @@ pub struct TruncateResp {
 pub struct MultiModifySplitReq {
     pub part_id: u64,
     pub owner_key: String,
-    pub revision: i64,
+    pub owner_epoch: i64,
     pub mid_key: Vec<u8>,
     pub log_stream_sealed_length: u32,
     pub row_stream_sealed_length: u32,
@@ -794,31 +794,31 @@ pub struct ExtConvertToEcReq {
     pub parity_shards: u32,
     pub target_addrs: Vec<String>,
     pub eversion: u64,
-    /// F211-D Tier 2: owner-lock revision threaded from the manager's
-    /// `MgrEcDispatchInflight.revision`. Coord forwards into each
-    /// `WriteShardReq.revision` / `CommitEcShardReq.revision`. `0` =
+    /// F211-D Tier 2: owner-lock owner_epoch threaded from the manager's
+    /// `MgrEcDispatchInflight.owner_epoch`. Coord forwards into each
+    /// `WriteShardReq.owner_epoch` / `CommitEcShardReq.owner_epoch`. `0` =
     /// no-fence (legacy / memory-only mode).
-    pub revision: i64,
+    pub owner_epoch: i64,
 }
 
 // ── CommitLength binary codec (hot path, duplicated from extent_rpc) ───────
 
-/// CommitLengthRequest: 16 bytes. [extent_id: u64 LE][revision: i64 LE]
+/// CommitLengthRequest: 16 bytes. [extent_id: u64 LE][owner_epoch: i64 LE]
 ///
-/// Wire contract on `revision`: see `extent_rpc::CommitLengthReq` docstring.
-/// Manager-side construction MUST pass a strictly-positive revision
+/// Wire contract on `owner_epoch`: see `extent_rpc::CommitLengthReq` docstring.
+/// Manager-side construction MUST pass a strictly-positive owner_epoch
 /// (the caller's validated owner-lock claim). For fence-free probes
 /// without an owner context, use `ExtProbeExtentReq` instead.
 pub struct ExtCommitLengthReq {
     pub extent_id: u64,
-    pub revision: i64,
+    pub owner_epoch: i64,
 }
 
 impl ExtCommitLengthReq {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(16);
         buf.put_u64_le(self.extent_id);
-        buf.put_i64_le(self.revision);
+        buf.put_i64_le(self.owner_epoch);
         buf.freeze()
     }
 }
@@ -873,7 +873,7 @@ pub struct MultiModifyMergeReq {
     pub survivor_part_id: u64,
     pub victim_part_id: u64,
     pub owner_key: String,
-    pub revision: i64,
+    pub owner_epoch: i64,
     /// commit_length per stream type, indexed [0]=survivor, [1]=victim
     pub log_sealed_lengths: [u64; 2],
     pub row_sealed_lengths: [u64; 2],

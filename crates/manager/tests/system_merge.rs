@@ -55,7 +55,7 @@ async fn merge_partitions(
         "acquire_owner_lock: {}",
         lock_resp.message
     );
-    let revision = lock_resp.revision;
+    let owner_epoch = lock_resp.owner_epoch;
 
     // Resolve stream IDs via GetRegions.
     let regions = get_regions(mgr).await;
@@ -85,7 +85,7 @@ async fn merge_partitions(
             let req = rkyv_encode(&CheckCommitLengthReq {
                 stream_id: sid,
                 owner_key: owner,
-                revision,
+                owner_epoch,
             });
             let bytes = mgr.call(MSG_CHECK_COMMIT_LENGTH, req).await.unwrap();
             let resp: CheckCommitLengthResp = rkyv_decode(&bytes).unwrap();
@@ -106,7 +106,7 @@ async fn merge_partitions(
         survivor_part_id: survivor,
         victim_part_id: victim,
         owner_key,
-        revision,
+        owner_epoch,
         log_sealed_lengths: log_lens,
         row_sealed_lengths: row_lens,
         meta_sealed_lengths: meta_lens,

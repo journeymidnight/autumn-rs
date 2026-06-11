@@ -1091,10 +1091,10 @@ impl AutumnManager {
         flush(v_addr.clone(), victim_id).await?;
 
         // Acquire an admin owner-lock. The manager is `self` so we call
-        // through `acquire_owner_revision` directly — same revision the
+        // through `acquire_owner_epoch` directly — same owner_epoch the
         // CLI obtains via MSG_ACQUIRE_OWNER_LOCK.
         let owner_key = format!("auto-merge:{survivor_id}:{victim_id}");
-        let revision = self.acquire_owner_revision(&owner_key).await?;
+        let owner_epoch = self.acquire_owner_epoch(&owner_key).await?;
 
         // commit_length per stream type for both partitions.
         let s_region = state
@@ -1106,26 +1106,26 @@ impl AutumnManager {
             .get(&victim_id)
             .ok_or_else(|| anyhow::anyhow!("no region for victim {victim_id}"))?;
         let log_lens = [
-            self.commit_length_for_stream(s_region.log_stream, &owner_key, revision)
+            self.commit_length_for_stream(s_region.log_stream, &owner_key, owner_epoch)
                 .await?
                 .max(1),
-            self.commit_length_for_stream(v_region.log_stream, &owner_key, revision)
+            self.commit_length_for_stream(v_region.log_stream, &owner_key, owner_epoch)
                 .await?
                 .max(1),
         ];
         let row_lens = [
-            self.commit_length_for_stream(s_region.row_stream, &owner_key, revision)
+            self.commit_length_for_stream(s_region.row_stream, &owner_key, owner_epoch)
                 .await?
                 .max(1),
-            self.commit_length_for_stream(v_region.row_stream, &owner_key, revision)
+            self.commit_length_for_stream(v_region.row_stream, &owner_key, owner_epoch)
                 .await?
                 .max(1),
         ];
         let meta_lens = [
-            self.commit_length_for_stream(s_region.meta_stream, &owner_key, revision)
+            self.commit_length_for_stream(s_region.meta_stream, &owner_key, owner_epoch)
                 .await?
                 .max(1),
-            self.commit_length_for_stream(v_region.meta_stream, &owner_key, revision)
+            self.commit_length_for_stream(v_region.meta_stream, &owner_key, owner_epoch)
                 .await?
                 .max(1),
         ];
@@ -1135,7 +1135,7 @@ impl AutumnManager {
             survivor_part_id: survivor_id,
             victim_part_id: victim_id,
             owner_key,
-            revision,
+            owner_epoch,
             log_sealed_lengths: log_lens,
             row_sealed_lengths: row_lens,
             meta_sealed_lengths: meta_lens,
@@ -1163,12 +1163,12 @@ impl AutumnManager {
         &self,
         stream_id: u64,
         owner_key: &str,
-        revision: i64,
+        owner_epoch: i64,
     ) -> Result<u64> {
         let req = rkyv_encode(&CheckCommitLengthReq {
             stream_id,
             owner_key: owner_key.to_string(),
-            revision,
+            owner_epoch,
         });
         let resp_bytes = self
             .handle_check_commit_length(req)
@@ -1532,7 +1532,7 @@ impl AutumnManager {
             s.disks = decoded_disks;
             s.streams = decoded_streams;
             s.extents = decoded_extents;
-            s.owner_revisions = decoded_owner_revs;
+            s.owner_epochs = decoded_owner_revs;
             s.next_revision = s.next_revision.max(max_revision);
             s.partitions = decoded_partitions;
             s.partition_vp_refs = decoded_partition_vp_refs;
@@ -1873,18 +1873,18 @@ impl AutumnManager {
         }
     }
 
-    fn ensure_owner_revision(
+    fn ensure_owner_epoch(
         owner_key: &str,
-        revision: i64,
+        owner_epoch: i64,
         state: &autumn_common::MetadataState,
     ) -> Result<(), AppError> {
         if owner_key.is_empty() {
             return Ok(());
         }
-        state.ensure_owner_revision(owner_key, revision)
+        state.ensure_owner_epoch(owner_key, owner_epoch)
     }
 
-    async fn acquire_owner_revision(&self, owner_key: &str) -> Result<i64, AppError> {
+    async fn acquire_owner_epoch(&self, owner_key: &str) -> Result<i64, AppError> {
         if owner_key.is_empty() {
             return Ok(0);
         }
@@ -1894,7 +1894,7 @@ impl AutumnManager {
             // F149: route through the leader-fenced txn helper. The
             // create_revision==0 CAS becomes `extra_cmp`; if the owner-key
             // already exists the txn returns `Ok(false)` (we still proceed
-            // to the GET to read the existing revision). If the leader
+            // to the GET to read the existing owner_epoch). If the leader
             // fence itself fails, `Err(AppError::NotLeader)` propagates.
             let extra_cmp = vec![autumn_etcd::Cmp::create_revision(key.as_bytes(), 0)];
             let put_op = autumn_etcd::Op::put(key.as_bytes(), self.instance_id.as_bytes());
@@ -1913,7 +1913,7 @@ impl AutumnManager {
             let rev = kv.create_revision;
 
             let mut s = self.store.inner.borrow_mut();
-            s.owner_revisions.insert(owner_key.to_string(), rev);
+            s.owner_epochs.insert(owner_key.to_string(), rev);
             s.next_revision = s.next_revision.max(rev);
             return Ok(rev);
         }
@@ -2631,10 +2631,10 @@ impl AutumnManager {
     }
 
     /// Seal-consensus probe: query an EN's `commit_length` for one extent
-    /// under the caller's validated owner-lock revision. F210-H3 Tier 2
-    /// (2026-05-17) plumbs the PS-validated revision through (was: hardcoded
+    /// under the caller's validated owner-lock owner_epoch. F210-H3 Tier 2
+    /// (2026-05-17) plumbs the PS-validated owner_epoch through (was: hardcoded
     /// `0` + EN-side escape hatch) so the EN's fence-handover side-effect
-    /// (`if req.revision > last { bump + persist .meta }`) actually fires
+    /// (`if req.owner_epoch > last { bump + persist .meta }`) actually fires
     /// when a new owner first contacts an EN. Callers without an owner
     /// context (recovery liveness, autumn-client info display) MUST use
     /// `probe_extent_on_node` instead — that helper hits `MSG_PROBE_EXTENT`,
@@ -2643,18 +2643,18 @@ impl AutumnManager {
         &self,
         addr: &str,
         extent_id: u64,
-        revision: i64,
+        owner_epoch: i64,
     ) -> Result<u32, AppError> {
         debug_assert!(
-            revision > 0,
-            "commit_length_on_node requires revision > 0; use probe_extent_on_node for fence-free probes"
+            owner_epoch > 0,
+            "commit_length_on_node requires owner_epoch > 0; use probe_extent_on_node for fence-free probes"
         );
         let base = Self::normalize_endpoint(addr);
         let shard_ports = self.shard_ports_for_addr(&base);
         let routed = Self::shard_addr_for_extent(&base, &shard_ports, extent_id);
         let req = ExtCommitLengthReq {
             extent_id,
-            revision,
+            owner_epoch,
         };
         // 5 s — commit_length is a tiny in-memory read on EN (atomic
         // load of `entry.len`). Generous bound so a hiccupping EN
@@ -2685,7 +2685,7 @@ impl AutumnManager {
     ///     `dispatch_recovery_task`).
     ///   - Future: any manager-internal "is this extent on this EN +
     ///     what's its current length" query without an owner context.
-    /// Does NOT touch the EN's `owner_revision`. NotFound (extent missing
+    /// Does NOT touch the EN's `owner_epoch`. NotFound (extent missing
     /// locally) and RPC error are both surfaced as `Err(Internal(...))`
     /// so callers can treat both as "dispatch recovery" without branching.
     pub(crate) async fn probe_extent_on_node(
@@ -3718,7 +3718,7 @@ mod tests {
                 let resp = m.handle_acquire_owner_lock(req).await.unwrap();
                 let r: AcquireOwnerLockResp = rkyv_decode(&resp).unwrap();
                 assert_eq!(r.code, CODE_OK);
-                r.revision
+                r.owner_epoch
             };
 
             // Seed stream + tail in store (nodes not actually running).
@@ -3782,7 +3782,7 @@ mod tests {
             let req = rkyv_encode(&StreamAllocExtentReq {
                 stream_id,
                 owner_key,
-                revision: rev,
+                owner_epoch: rev,
                 seal_commit: Some(100),
                 exclude_node_ids: vec![],
             });
@@ -3839,7 +3839,7 @@ mod tests {
                 });
                 let resp = m.handle_acquire_owner_lock(req).await.unwrap();
                 let r: AcquireOwnerLockResp = rkyv_decode(&resp).unwrap();
-                r.revision
+                r.owner_epoch
             };
 
             // Seed two streams: stream A owns extents [10, 11, 12],
@@ -3913,7 +3913,7 @@ mod tests {
             let req = rkyv_encode(&PunchHolesReq {
                 stream_id: 1,
                 owner_key,
-                revision: rev,
+                owner_epoch: rev,
                 extent_ids: vec![10, 20, 999],
             });
             let resp = m.handle_stream_punch_holes(req).await.unwrap();
@@ -4279,10 +4279,10 @@ mod tests {
         run(async {
             let m = AutumnManager::new();
 
-            // Minimal cluster state: one owner revision, one partition with
+            // Minimal cluster state: one owner owner_epoch, one partition with
             // three streams (log=10, row=11, meta=12), each having one extent.
             let owner_key = "owner-test".to_string();
-            let revision = {
+            let owner_epoch = {
                 let mut s = m.store.inner.borrow_mut();
                 s.acquire_owner_lock(&owner_key)
             };
@@ -4354,7 +4354,7 @@ mod tests {
             let req = rkyv_encode(&MultiModifySplitReq {
                 part_id,
                 owner_key: owner_key.clone(),
-                revision,
+                owner_epoch,
                 mid_key: b"m".to_vec(),
                 log_stream_sealed_length: 500,
                 row_stream_sealed_length: 500,
@@ -4389,7 +4389,7 @@ mod tests {
         run(async {
             let m = AutumnManager::new();
             let owner_key = "owner-test".to_string();
-            let revision = {
+            let owner_epoch = {
                 let mut s = m.store.inner.borrow_mut();
                 s.acquire_owner_lock(&owner_key)
             };
@@ -4432,7 +4432,7 @@ mod tests {
                 survivor_part_id: 1,
                 victim_part_id: 2,
                 owner_key,
-                revision,
+                owner_epoch,
                 log_sealed_lengths: [0, 0],
                 row_sealed_lengths: [0, 0],
                 meta_sealed_lengths: [0, 0],
@@ -4454,7 +4454,7 @@ mod tests {
         run(async {
             let m = AutumnManager::new();
             let owner_key = "owner-test".to_string();
-            let revision = {
+            let owner_epoch = {
                 let mut s = m.store.inner.borrow_mut();
                 s.acquire_owner_lock(&owner_key)
             };
@@ -4462,7 +4462,7 @@ mod tests {
                 survivor_part_id: 5,
                 victim_part_id: 5,
                 owner_key,
-                revision,
+                owner_epoch,
                 log_sealed_lengths: [0, 0],
                 row_sealed_lengths: [0, 0],
                 meta_sealed_lengths: [0, 0],
@@ -4485,7 +4485,7 @@ mod tests {
         run(async {
             let m = AutumnManager::new();
             let owner_key = "owner-test".to_string();
-            let revision = {
+            let owner_epoch = {
                 let mut s = m.store.inner.borrow_mut();
                 s.acquire_owner_lock(&owner_key)
             };
@@ -4559,7 +4559,7 @@ mod tests {
                 survivor_part_id: 1,
                 victim_part_id: 2,
                 owner_key,
-                revision,
+                owner_epoch,
                 log_sealed_lengths: [0, 0],
                 row_sealed_lengths: [0, 0],
                 meta_sealed_lengths: [0, 0],
@@ -4582,7 +4582,7 @@ mod tests {
         run(async {
             let m = AutumnManager::new();
             let owner_key = "owner-test".to_string();
-            let revision = {
+            let owner_epoch = {
                 let mut s = m.store.inner.borrow_mut();
                 s.acquire_owner_lock(&owner_key)
             };
@@ -4664,7 +4664,7 @@ mod tests {
                 survivor_part_id: 1,
                 victim_part_id: 2,
                 owner_key,
-                revision,
+                owner_epoch,
                 log_sealed_lengths: [0, 0],
                 row_sealed_lengths: [0, 0],
                 meta_sealed_lengths: [0, 0],
@@ -4687,7 +4687,7 @@ mod tests {
         run(async {
             let m = AutumnManager::new();
             let owner_key = "owner-test".to_string();
-            let revision = {
+            let owner_epoch = {
                 let mut s = m.store.inner.borrow_mut();
                 s.acquire_owner_lock(&owner_key)
             };
@@ -4761,7 +4761,7 @@ mod tests {
                 survivor_part_id: 1,
                 victim_part_id: 2,
                 owner_key,
-                revision,
+                owner_epoch,
                 log_sealed_lengths: [0, 0],
                 row_sealed_lengths: [0, 0],
                 meta_sealed_lengths: [0, 0],
@@ -4935,7 +4935,7 @@ mod tests {
             let m = AutumnManager::new();
 
             let owner_key = "owner-f139-ph".to_string();
-            let revision = {
+            let owner_epoch = {
                 let mut s = m.store.inner.borrow_mut();
                 s.acquire_owner_lock(&owner_key)
             };
@@ -4976,7 +4976,7 @@ mod tests {
             let req = rkyv_encode(&PunchHolesReq {
                 stream_id,
                 owner_key: owner_key.clone(),
-                revision,
+                owner_epoch,
                 extent_ids: vec![extent_id],
             });
             let resp = m.handle_stream_punch_holes(req).await.unwrap();
@@ -5014,7 +5014,7 @@ mod tests {
             let m = AutumnManager::new();
 
             let owner_key = "owner-f139-tr".to_string();
-            let revision = {
+            let owner_epoch = {
                 let mut s = m.store.inner.borrow_mut();
                 s.acquire_owner_lock(&owner_key)
             };
@@ -5057,7 +5057,7 @@ mod tests {
             let req = rkyv_encode(&TruncateReq {
                 stream_id,
                 owner_key: owner_key.clone(),
-                revision,
+                owner_epoch,
                 extent_id: extent_b, // truncate everything before extent_b
             });
             let resp = m.handle_truncate(req).await.unwrap();
@@ -5091,7 +5091,7 @@ mod tests {
             let m = AutumnManager::new();
 
             let owner_key = "owner-f139-full".to_string();
-            let revision = {
+            let owner_epoch = {
                 let mut s = m.store.inner.borrow_mut();
                 s.acquire_owner_lock(&owner_key)
             };
@@ -5133,7 +5133,7 @@ mod tests {
             let req_bytes = rkyv_encode(&PunchHolesReq {
                 stream_id,
                 owner_key: owner_key.clone(),
-                revision,
+                owner_epoch,
                 extent_ids: vec![extent_id],
             });
             let resp = m
@@ -5187,7 +5187,7 @@ mod tests {
             let m = AutumnManager::new();
 
             let owner_key = "owner-f145-ph".to_string();
-            let revision = {
+            let owner_epoch = {
                 let mut s = m.store.inner.borrow_mut();
                 s.acquire_owner_lock(&owner_key)
             };
@@ -5222,7 +5222,7 @@ mod tests {
             let req = rkyv_encode(&PunchHolesReq {
                 stream_id,
                 owner_key: owner_key.clone(),
-                revision,
+                owner_epoch,
                 extent_ids: vec![extent_id],
             });
             let resp = m.handle_stream_punch_holes(req).await.unwrap();
@@ -5258,7 +5258,7 @@ mod tests {
             let req2 = rkyv_encode(&PunchHolesReq {
                 stream_id,
                 owner_key: owner_key.clone(),
-                revision,
+                owner_epoch,
                 extent_ids: vec![extent_id],
             });
             let resp2 = m.handle_stream_punch_holes(req2).await.unwrap();
@@ -5284,7 +5284,7 @@ mod tests {
             let m = AutumnManager::new();
 
             let owner_key = "owner-f145-tr".to_string();
-            let revision = {
+            let owner_epoch = {
                 let mut s = m.store.inner.borrow_mut();
                 s.acquire_owner_lock(&owner_key)
             };
@@ -5320,7 +5320,7 @@ mod tests {
             let req = rkyv_encode(&TruncateReq {
                 stream_id,
                 owner_key: owner_key.clone(),
-                revision,
+                owner_epoch,
                 extent_id: extent_b, // truncate everything before extent_b
             });
             let resp = m.handle_truncate(req).await.unwrap();
@@ -5363,7 +5363,7 @@ mod tests {
             let m = AutumnManager::new();
 
             let owner_key = "owner-f146-ae-ec".to_string();
-            let revision = {
+            let owner_epoch = {
                 let mut s = m.store.inner.borrow_mut();
                 s.acquire_owner_lock(&owner_key)
             };
@@ -5408,7 +5408,7 @@ mod tests {
             let req = rkyv_encode(&StreamAllocExtentReq {
                 stream_id,
                 owner_key: owner_key.clone(),
-                revision,
+                owner_epoch,
                 seal_commit: Some(100),
                 exclude_node_ids: vec![],
             });
@@ -5440,7 +5440,7 @@ mod tests {
             let m = AutumnManager::new();
 
             let owner_key = "owner-f146-ae-rec".to_string();
-            let revision = {
+            let owner_epoch = {
                 let mut s = m.store.inner.borrow_mut();
                 s.acquire_owner_lock(&owner_key)
             };
@@ -5493,7 +5493,7 @@ mod tests {
             let req = rkyv_encode(&StreamAllocExtentReq {
                 stream_id,
                 owner_key: owner_key.clone(),
-                revision,
+                owner_epoch,
                 seal_commit: Some(100),
                 exclude_node_ids: vec![],
             });
@@ -5526,7 +5526,7 @@ mod tests {
             let m = AutumnManager::new();
 
             let owner_key = "owner-f146-split".to_string();
-            let revision = {
+            let owner_epoch = {
                 let mut s = m.store.inner.borrow_mut();
                 s.acquire_owner_lock(&owner_key)
             };
@@ -5605,7 +5605,7 @@ mod tests {
             let req = rkyv_encode(&MultiModifySplitReq {
                 part_id,
                 owner_key: owner_key.clone(),
-                revision,
+                owner_epoch,
                 mid_key: b"m".to_vec(),
                 log_stream_sealed_length: 500,
                 row_stream_sealed_length: 500,
@@ -5845,7 +5845,7 @@ mod tests {
             extra_disk_ids: vec![19],
             data_shards: 3,
             new_eversion: 9,
-            revision: 17,
+            owner_epoch: 17,
         };
         let bytes = rkyv_encode(&original).to_vec();
         let decoded: MgrEcDispatchInflight = rkyv_decode(&bytes).expect("decode");
@@ -5854,7 +5854,7 @@ mod tests {
         assert_eq!(decoded.extra_disk_ids, original.extra_disk_ids);
         assert_eq!(decoded.data_shards, original.data_shards);
         assert_eq!(decoded.new_eversion, original.new_eversion);
-        assert_eq!(decoded.revision, original.revision);
+        assert_eq!(decoded.owner_epoch, original.owner_epoch);
     }
 
     /// F198 / F207-B: the unified inflight ledger (the post-F207-B
@@ -5874,7 +5874,7 @@ mod tests {
             extra_disk_ids: vec![19],
             data_shards: 3,
             new_eversion: 4,
-            revision: 0,
+            owner_epoch: 0,
         };
         run(async {
             m.acquire_extent_inflight(

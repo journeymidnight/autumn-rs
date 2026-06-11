@@ -244,7 +244,7 @@ impl ClientInbox {
 ///      the in-memory mutation INCLUDING the force-revoke's
 ///      version bump (BUG-LEASE-4 — the pre-fix revert restored
 ///      writer/host/deadline but left version bumped, so a future
-///      Open got a lease_version that didn't correspond to any
+///      Open got a lease_epoch that didn't correspond to any
 ///      persisted state).
 ///
 /// Items are pre-rendered as (target, MgrInvalidation) tuples so the
@@ -1737,7 +1737,7 @@ mod tests {
         // version is lower than the in-memory version. Pre-fix the
         // revert ONLY restored writer/host/deadline/pending_revoke_at
         // and left version bumped — so a future Open would get a
-        // lease_version that didn't correspond to any persisted
+        // lease_epoch that didn't correspond to any persisted
         // record.
         let mut r = reg_with_grace(0);
         let t0 = Instant::now();

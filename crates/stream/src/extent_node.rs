@@ -799,20 +799,20 @@ pub(crate) struct ExtentEntry {
     /// the V2 `.meta` sidecar. Invariant: `sealed_length > 0 ⇒ sealed`.
     pub(crate) sealed: AtomicBool,
     pub(crate) avali: AtomicU32,
-    /// In-memory fencing bar: appends with `revision < owner_revision` are
+    /// In-memory fencing bar: appends with `owner_epoch < owner_epoch` are
     /// rejected (CODE_LOCKED_BY_OTHER). Raised SYNCHRONOUSLY (monotonic
-    /// `fetch_max`) the instant a higher revision arrives, so a stale lower
+    /// `fetch_max`) the instant a higher owner_epoch arrives, so a stale lower
     /// owner is locked out immediately — even while the new fence is still
     /// being persisted.
-    pub(crate) owner_revision: AtomicI64,
-    /// P0-B: the owner_revision value KNOWN TO BE DURABLE in the `.meta`
-    /// sidecar. `owner_revision` (the in-memory bar) may be ahead of this while
-    /// a persist is in flight. An append at revision R may be ACKed only once
-    /// `durable_owner_revision >= R` — otherwise a crash after the ACK but
+    pub(crate) owner_epoch: AtomicI64,
+    /// P0-B: the owner_epoch value KNOWN TO BE DURABLE in the `.meta`
+    /// sidecar. `owner_epoch` (the in-memory bar) may be ahead of this while
+    /// a persist is in flight. An append at owner_epoch R may be ACKed only once
+    /// `durable_owner_epoch >= R` — otherwise a crash after the ACK but
     /// before the persist would let a stale lower owner re-pass the on-disk
-    /// fence on restart (split-brain). Kept ≤ `owner_revision`; advanced only
+    /// fence on restart (split-brain). Kept ≤ `owner_epoch`; advanced only
     /// inside the per-extent meta-write critical section AFTER `.meta` fsync.
-    pub(crate) durable_owner_revision: AtomicI64,
+    pub(crate) durable_owner_epoch: AtomicI64,
     /// Which disk this extent lives on. Used to resolve file paths.
     pub(crate) disk_id: u64,
     /// F178 Phase 1: per-extent fsync coalescer state.
@@ -847,13 +847,13 @@ impl ExtentEntry {
 }
 
 /// P0-C: parsed `.meta` sidecar contents. Replaces the prior
-/// `(sealed_length, eversion, owner_revision)` tuple so the `sealed` /
+/// `(sealed_length, eversion, owner_epoch)` tuple so the `sealed` /
 /// `avali` fields can't be silently dropped at a call site.
 #[derive(Debug, PartialEq, Eq, Clone)]
 struct LocalExtentMeta {
     sealed_length: u64,
     eversion: u64,
-    owner_revision: i64,
+    owner_epoch: i64,
     sealed: bool,
     avali: u32,
 }
@@ -1031,7 +1031,7 @@ pub struct ExtentNode {
     ec_conversion_locks: Rc<RefCell<HashMap<u64, Rc<futures::lock::Mutex<()>>>>>,
     /// P0-B: per-extent `.meta`-write critical section. EVERY `.meta` writer
     /// (save_meta from seal / EC commit / recovery / re_avali, and the
-    /// owner_revision fence persist) acquires this so writers serialise and
+    /// owner_epoch fence persist) acquires this so writers serialise and
     /// each reads the LIVE atomics just before writing — closing the
     /// last-writer-wins clobber where a fence persist with a stale snapshot
     /// would overwrite a concurrent seal's `.meta`. DISTINCT from
@@ -1804,10 +1804,10 @@ async fn build_append_future(
         return Box::pin(async move { out });
     }
 
-    // 3. Revision fencing: the first request's revision governs the batch.
+    // 3. OwnerEpoch fencing: the first request's owner_epoch governs the batch.
     let first = &slots[0].req;
-    let owner_revision = extent.owner_revision.load(Ordering::SeqCst);
-    if first.revision < owner_revision {
+    let owner_epoch = extent.owner_epoch.load(Ordering::SeqCst);
+    if first.owner_epoch < owner_epoch {
         let resp_payload = AppendResp {
             code: CODE_LOCKED_BY_OTHER,
             offset: 0,
@@ -1825,19 +1825,19 @@ async fn build_append_future(
     //       stale lower owner is rejected immediately — even while the new
     //       fence is still being persisted (closes the window where the old
     //       owner could slip a write through during the persist await);
-    //   (ii) the fence must be DURABLE on disk (durable_owner_revision >= R)
+    //   (ii) the fence must be DURABLE on disk (durable_owner_epoch >= R)
     //        BEFORE we ACK any data under it — else a crash after the ACK but
     //        before the persist lets the stale lower owner re-pass the on-disk
     //        fence on restart (split-brain / acked-data overwrite).
     // `ensure_fence_durable` fast-paths to one atomic load when already durable
-    // (the steady state), and only locks+persists when a higher revision first
+    // (the steady state), and only locks+persists when a higher owner_epoch first
     // arrives. Fail-closed: a persist failure rejects this append (the writer
     // re-fences); we never ACK a write whose fence isn't durable.
     let fence_extent_id = first.extent_id;
-    let first_revision = first.revision;
-    if first_revision > owner_revision {
+    let first_revision = first.owner_epoch;
+    if first_revision > owner_epoch {
         extent
-            .owner_revision
+            .owner_epoch
             .fetch_max(first_revision, Ordering::SeqCst);
     }
     if let Err(e) = node
@@ -1864,13 +1864,13 @@ async fn build_append_future(
     }
     // P0-B: re-check fencing AFTER the (possibly awaiting) durable step. The
     // `ensure_fence_durable` await is a new yield point; during it a concurrent
-    // task may have (a) taken over with a HIGHER owner_revision, or (b) SEALED
+    // task may have (a) taken over with a HIGHER owner_epoch, or (b) SEALED
     // this extent (seal/EC/re_avali bumps eversion + sets sealed). Owner
     // takeover → LockedByOther; a fresh seal → CODE_PRECONDITION (mirrors the
     // F147-B post-truncate seal recheck) so we never ghost-write past a seal
-    // landed during our await. (owner_revision and sealed are CHECKED
+    // landed during our await. (owner_epoch and sealed are CHECKED
     // SEPARATELY — they are independent concerns: fencing vs seal state.)
-    if first_revision < extent.owner_revision.load(Ordering::SeqCst) {
+    if first_revision < extent.owner_epoch.load(Ordering::SeqCst) {
         let resp_payload = AppendResp {
             code: CODE_LOCKED_BY_OTHER,
             offset: 0,
@@ -2067,7 +2067,7 @@ async fn build_append_future(
                 .record(n as u64, total_payload as u64, write_elapsed_ns);
         });
 
-        // P0-B: the owner_revision fence is now persisted durably in the
+        // P0-B: the owner_epoch fence is now persisted durably in the
         // prologue (under the per-extent op lock) BEFORE this write future runs,
         // so there is no post-write save_meta here. The data write above is
         // durable via the coalescer; the fence was durable before we got here.
@@ -2247,10 +2247,10 @@ impl ExtentNode {
     /// F157: extent .meta sidecar layout versioning.
     ///
     /// V0 (legacy, pre-F157): 40 bytes, no CRC.
-    ///   [magic[8]=b"EXTMETA\0"][extent_id[8]][sealed_length[8]][eversion[8]][owner_revision[8]]
+    ///   [magic[8]=b"EXTMETA\0"][extent_id[8]][sealed_length[8]][eversion[8]][owner_epoch[8]]
     ///
     /// V1 (post-F157): 44 bytes, CRC32C trailer over the first 40 bytes.
-    ///   [magic[8]=b"EXTMETA\x01"][extent_id[8]][sealed_length[8]][eversion[8]][owner_revision[8]][crc32c[4]]
+    ///   [magic[8]=b"EXTMETA\x01"][extent_id[8]][sealed_length[8]][eversion[8]][owner_epoch[8]][crc32c[4]]
     ///
     /// Pre-F157 a flipped bit anywhere in the 40-byte payload (bit rot, undetected
     /// disk error, partial overwrite during a torn write) silently changed the
@@ -2268,7 +2268,7 @@ impl ExtentNode {
     /// OPEN after a restart and could accept ghost writes (CoW isolation break;
     /// later surfaces as `stale_vp_offset_past_sealed_length sealed_length=0`).
     ///   [magic[8]=b"EXTMETA\x02"][extent_id[8]][sealed_length[8]][eversion[8]]
-    ///   [owner_revision[8]][sealed[1]][pad[3]][avali[4]][crc32c[4]]
+    ///   [owner_epoch[8]][sealed[1]][pad[3]][avali[4]][crc32c[4]]
     /// CRC32C is computed over the first 48 bytes (everything but the trailer).
     ///
     /// **Migration:** save_meta always writes V2. parse_meta dispatches on
@@ -2619,19 +2619,19 @@ impl ExtentNode {
     }
 
     /// Persist the V2 `.meta` sidecar from the entry's LIVE atomics, then
-    /// advance `durable_owner_revision` to the persisted `owner_revision`.
+    /// advance `durable_owner_epoch` to the persisted `owner_epoch`.
     ///
     /// **The caller MUST hold this extent's `meta_write_lock`.** Reading the
     /// atomics + writing the file as ONE critical section is load-bearing: it
-    /// stops a stale-snapshot writer (e.g. an owner_revision fence persist)
+    /// stops a stale-snapshot writer (e.g. an owner_epoch fence persist)
     /// from clobbering a concurrent seal's `.meta`, and serialises the temp
     /// rename. The write is atomic (temp + fsync + rename) so a crash leaves
     /// EITHER the old valid record OR the new one — never a torn `.meta` that
-    /// `parse_meta` would discard back to `owner_revision = 0` (fail-open).
+    /// `parse_meta` would discard back to `owner_epoch = 0` (fail-open).
     async fn write_meta_locked(&self, extent_id: u64, entry: &ExtentEntry) -> Result<(), String> {
         let sealed_length = entry.sealed_length.load(Ordering::SeqCst);
         let eversion = entry.eversion.load(Ordering::SeqCst);
-        let owner_revision = entry.owner_revision.load(Ordering::SeqCst);
+        let owner_epoch = entry.owner_epoch.load(Ordering::SeqCst);
         // P0-C: persist the explicit sealed flag + runtime avali mask. Enforce
         // `sealed_length > 0 ⇒ sealed` at write time.
         let sealed = entry.sealed.load(Ordering::SeqCst) || sealed_length > 0;
@@ -2643,7 +2643,7 @@ impl ExtentNode {
         buf[8..16].copy_from_slice(&extent_id.to_le_bytes());
         buf[16..24].copy_from_slice(&sealed_length.to_le_bytes());
         buf[24..32].copy_from_slice(&eversion.to_le_bytes());
-        buf[32..40].copy_from_slice(&owner_revision.to_le_bytes());
+        buf[32..40].copy_from_slice(&owner_epoch.to_le_bytes());
         buf[40] = u8::from(sealed);
         // buf[41..44] reserved padding (left zero).
         buf[44..48].copy_from_slice(&avali.to_le_bytes());
@@ -2692,17 +2692,17 @@ impl ExtentNode {
                 .map_err(|e| format!("fsync meta dir for extent {extent_id}: {e}"))?;
         }
 
-        // The on-disk fence is now durable at `owner_revision`; advance the
+        // The on-disk fence is now durable at `owner_epoch`; advance the
         // durable high-water so appends gated on it (P0-B) can proceed.
         entry
-            .durable_owner_revision
-            .fetch_max(owner_revision, Ordering::SeqCst);
+            .durable_owner_epoch
+            .fetch_max(owner_epoch, Ordering::SeqCst);
         Ok(())
     }
 
-    /// P0-B: ensure the owner_revision fence is DURABLE at `>= required` before
-    /// the caller ACKs an append at that revision. The caller has already
-    /// raised the in-memory bar (`owner_revision.fetch_max(required)`) so a
+    /// P0-B: ensure the owner_epoch fence is DURABLE at `>= required` before
+    /// the caller ACKs an append at that owner_epoch. The caller has already
+    /// raised the in-memory bar (`owner_epoch.fetch_max(required)`) so a
     /// stale lower owner is rejected immediately; this makes the bar durable.
     /// Fast path = one atomic load (already durable). Else acquire the
     /// meta-write lock, re-check (a concurrent writer may have persisted it
@@ -2715,12 +2715,12 @@ impl ExtentNode {
         entry: &ExtentEntry,
         required: i64,
     ) -> Result<(), String> {
-        if entry.durable_owner_revision.load(Ordering::SeqCst) >= required {
+        if entry.durable_owner_epoch.load(Ordering::SeqCst) >= required {
             return Ok(());
         }
         let lock = self.meta_write_lock(extent_id);
         let _g = lock.lock().await;
-        if entry.durable_owner_revision.load(Ordering::SeqCst) >= required {
+        if entry.durable_owner_epoch.load(Ordering::SeqCst) >= required {
             return Ok(());
         }
         self.write_meta_locked(extent_id, entry).await
@@ -2780,7 +2780,7 @@ impl ExtentNode {
         }
         let sealed_length = u64::from_le_bytes(buf[16..24].try_into().ok()?);
         let eversion = u64::from_le_bytes(buf[24..32].try_into().ok()?);
-        let owner_revision = i64::from_le_bytes(buf[32..40].try_into().ok()?);
+        let owner_epoch = i64::from_le_bytes(buf[32..40].try_into().ok()?);
         // P0-C: V2 carries the explicit sealed flag + avali; V0/V1 derive both
         // from `sealed_length > 0` (the pre-P0-C behaviour, so an old open
         // extent stays open and an old sealed extent stays sealed). The
@@ -2797,7 +2797,7 @@ impl ExtentNode {
         Some(LocalExtentMeta {
             sealed_length,
             eversion,
-            owner_revision,
+            owner_epoch,
             sealed,
             avali,
         })
@@ -2854,14 +2854,14 @@ impl ExtentNode {
                     Ok(buf) => Self::parse_meta(&buf, extent_id).unwrap_or(LocalExtentMeta {
                         sealed_length: 0,
                         eversion: 1,
-                        owner_revision: 0,
+                        owner_epoch: 0,
                         sealed: false,
                         avali: 0,
                     }),
                     Err(_) => LocalExtentMeta {
                         sealed_length: 0,
                         eversion: 1,
-                        owner_revision: 0,
+                        owner_epoch: 0,
                         sealed: false,
                         avali: 0,
                     },
@@ -2882,11 +2882,11 @@ impl ExtentNode {
                         // sealed across the restart and rejects ghost writes.
                         sealed: AtomicBool::new(meta.sealed),
                         avali: AtomicU32::new(meta.avali),
-                        owner_revision: AtomicI64::new(meta.owner_revision),
+                        owner_epoch: AtomicI64::new(meta.owner_epoch),
                         // P0-B: the persisted fence IS durable on load (it came
                         // from the `.meta` we just parsed), so the in-memory bar
                         // and the durable high-water start equal.
-                        durable_owner_revision: AtomicI64::new(meta.owner_revision),
+                        durable_owner_epoch: AtomicI64::new(meta.owner_epoch),
                         disk_id: disk.disk_id,
                         coalescer: Coalescer::new(len),
                     }),
@@ -3378,8 +3378,8 @@ impl ExtentNode {
                 // P0-C: a freshly-created/allocated extent is open.
                 sealed: AtomicBool::new(false),
                 avali: AtomicU32::new(0),
-                owner_revision: AtomicI64::new(0),
-                durable_owner_revision: AtomicI64::new(0),
+                owner_epoch: AtomicI64::new(0),
+                durable_owner_epoch: AtomicI64::new(0),
                 disk_id,
                 coalescer: Coalescer::new(len),
             }),
@@ -4519,8 +4519,8 @@ impl ExtentNode {
             .encode());
         }
 
-        let owner_revision = extent.owner_revision.load(Ordering::SeqCst);
-        if req.revision < owner_revision {
+        let owner_epoch = extent.owner_epoch.load(Ordering::SeqCst);
+        if req.owner_epoch < owner_epoch {
             return Ok(AppendResp {
                 code: CODE_LOCKED_BY_OTHER,
                 offset: 0,
@@ -4531,13 +4531,13 @@ impl ExtentNode {
         // P0-B durable fence (same as build_append_future): raise the in-memory
         // bar synchronously, then require the fence to be DURABLE before we ACK.
         // Fail-closed on persist error. See build_append_future / ensure_fence_durable.
-        if req.revision > owner_revision {
+        if req.owner_epoch > owner_epoch {
             extent
-                .owner_revision
-                .fetch_max(req.revision, Ordering::SeqCst);
+                .owner_epoch
+                .fetch_max(req.owner_epoch, Ordering::SeqCst);
         }
         if let Err(e) = self
-            .ensure_fence_durable(req.extent_id, &extent, req.revision)
+            .ensure_fence_durable(req.extent_id, &extent, req.owner_epoch)
             .await
         {
             self.mark_disk_offline_for_extent(req.extent_id);
@@ -4554,10 +4554,10 @@ impl ExtentNode {
             .encode());
         }
         // P0-B: re-check fencing after the (possibly awaiting) durable step —
-        // a higher revision may have taken over (LockedByOther), or a concurrent
+        // a higher owner_epoch may have taken over (LockedByOther), or a concurrent
         // seal/EC may have SEALED the extent during the await (CODE_PRECONDITION,
-        // mirrors F147-B). owner_revision and sealed are checked SEPARATELY.
-        if req.revision < extent.owner_revision.load(Ordering::SeqCst) {
+        // mirrors F147-B). owner_epoch and sealed are checked SEPARATELY.
+        if req.owner_epoch < extent.owner_epoch.load(Ordering::SeqCst) {
             return Ok(AppendResp {
                 code: CODE_LOCKED_BY_OTHER,
                 offset: 0,
@@ -4678,7 +4678,7 @@ impl ExtentNode {
 
         extent.len.store(end, Ordering::SeqCst);
 
-        // P0-B: the owner_revision fence was persisted durably in the prologue
+        // P0-B: the owner_epoch fence was persisted durably in the prologue
         // (under the per-extent op lock) before this write — no post-write
         // save_meta. Data is durable via the coalescer above.
 
@@ -4789,8 +4789,8 @@ impl ExtentNode {
             )
         })?;
 
-        // F210-H3 Tier 2 (post-2026-05-17): `req.revision <= 0` is a
-        // protocol error, not a sentinel. The pre-F210-H2 "revision == 0
+        // F210-H3 Tier 2 (post-2026-05-17): `req.owner_epoch <= 0` is a
+        // protocol error, not a sentinel. The pre-F210-H2 "owner_epoch == 0
         // bypasses the fence" escape hatch tangled three call sites
         // (seal probe, recovery liveness, autumn-client info) onto one
         // RPC and forced ad-hoc fence skipping; F210-H2 closed it and
@@ -4800,37 +4800,37 @@ impl ExtentNode {
         // legitimately don't have an owner (manager recovery liveness,
         // `autumn-client info` display) now use `handle_probe_extent`.
         //
-        // Fence semantics on the surviving (revision > 0) path — CHECK ONLY,
+        // Fence semantics on the surviving (owner_epoch > 0) path — CHECK ONLY,
         // NEVER handover (the three-concepts rule, 2026-05-29):
-        //   revision < owner_revision → CODE_LOCKED_BY_OTHER (stale owner)
-        //   revision >= owner_revision → no-op, return length
+        //   owner_epoch < owner_epoch → CODE_LOCKED_BY_OTHER (stale owner)
+        //   owner_epoch >= owner_epoch → no-op, return length
         //
         // commit_length is a length PROBE; write-ownership is established
-        // EXCLUSIVELY by the APPEND path (`handle_append*` bumps owner_revision
-        // when a higher-revision owner writes). A probe must NOT steal the
-        // write-fence. The old "revision > owner_revision → bump + persist
+        // EXCLUSIVELY by the APPEND path (`handle_append*` bumps owner_epoch
+        // when a higher-owner_epoch owner writes). A probe must NOT steal the
+        // write-fence. The old "owner_epoch > owner_epoch → bump + persist
         // .meta handover" was the Layer-C poison bug: the manager's
         // control-plane probes (the `admin-merge:<v>:<s>` owner-lock in
         // `handle_merge_partitions`, the seal in `handle_stream_alloc_extent`)
-        // carry a high global owner-revision counter that does NOT represent a
-        // new PS write-owner. Bumping owner_revision on such a probe fenced out
-        // the LIVE PS (which holds its acquire-time revision and never re-reads
+        // carry a high global owner-owner_epoch counter that does NOT represent a
+        // new PS write-owner. Bumping owner_epoch on such a probe fenced out
+        // the LIVE PS (which holds its acquire-time owner_epoch and never re-reads
         // the climbing counter) → CODE_LOCKED_BY_OTHER on its next append →
         // partition self-poison. New-owner takeover is unaffected: the new
         // owner's first APPEND advances the fence and fences the old owner
         // (see `system_locked_by_other` — sc2 fences sc1 via append, not probe).
-        if req.revision <= 0 {
+        if req.owner_epoch <= 0 {
             return Err((
                 StatusCode::InvalidArgument,
                 format!(
-                    "commit_length requires revision > 0 (got {}); use \
+                    "commit_length requires owner_epoch > 0 (got {}); use \
                      MSG_PROBE_EXTENT for fence-free probes",
-                    req.revision
+                    req.owner_epoch
                 ),
             ));
         }
-        let owner_revision = entry.owner_revision.load(Ordering::SeqCst);
-        if req.revision < owner_revision {
+        let owner_epoch = entry.owner_epoch.load(Ordering::SeqCst);
+        if req.owner_epoch < owner_epoch {
             return Ok(CommitLengthResp {
                 code: CODE_LOCKED_BY_OTHER,
                 length: 0,
@@ -4895,9 +4895,9 @@ impl ExtentNode {
     ///     an owner lock).
     ///
     /// Differs from `handle_commit_length` in exactly two ways:
-    ///   (a) takes no revision — request is 8 bytes, not 16.
+    ///   (a) takes no owner_epoch — request is 8 bytes, not 16.
     ///   (b) does NOT touch the owner-lock fence — never returns
-    ///       LOCKED_BY_OTHER, never mutates `owner_revision`, never
+    ///       LOCKED_BY_OTHER, never mutates `owner_epoch`, never
     ///       writes `.meta`.
     /// Length-source semantics are identical to commit_length so the
     /// `info` CLI display matches what a real owner would see.
@@ -5057,8 +5057,8 @@ impl ExtentNode {
                 // P0-C: a freshly-created/allocated extent is open.
                 sealed: AtomicBool::new(false),
                 avali: AtomicU32::new(0),
-                owner_revision: AtomicI64::new(0),
-                durable_owner_revision: AtomicI64::new(0),
+                owner_epoch: AtomicI64::new(0),
+                durable_owner_epoch: AtomicI64::new(0),
                 disk_id,
                 coalescer: Coalescer::new(len),
             }),
@@ -5933,18 +5933,18 @@ impl ExtentNode {
                         shard_index: i as u32,
                         sealed_length,
                         eversion: new_eversion,
-                        // F211-D Tier 2: revision threaded from the
-                        // manager (`MgrEcDispatchInflight.revision` ->
-                        // `ExtConvertToEcReq.revision`). A fenced ex-coord
+                        // F211-D Tier 2: owner_epoch threaded from the
+                        // manager (`MgrEcDispatchInflight.owner_epoch` ->
+                        // `ExtConvertToEcReq.owner_epoch`). A fenced ex-coord
                         // whose 2PC keeps running sends WriteShard with
-                        // the now-stale revision; remote EN rejects with
+                        // the now-stale owner_epoch; remote EN rejects with
                         // `CODE_LOCKED_BY_OTHER` because
                         // `auto_abandon_for_fenced_node` has pushed the
-                        // bumped revision via `MSG_CHECK_COMMIT_LENGTH`
-                        // fence-handover. `req.revision == 0` keeps the
+                        // bumped owner_epoch via `MSG_CHECK_COMMIT_LENGTH`
+                        // fence-handover. `req.owner_epoch == 0` keeps the
                         // pre-Tier-2 no-fence semantics for tests /
                         // memory-only.
-                        revision: req.revision,
+                        owner_epoch: req.owner_epoch,
                         payload: shards[i].clone(),
                     };
                     let sock = parse_addr(target_addr).map_err(|e| {
@@ -6008,7 +6008,7 @@ impl ExtentNode {
                 sealed_length,
                 eversion: new_eversion,
                 // F211-D Tier 2: see WriteShardReq site above.
-                revision: req.revision,
+                owner_epoch: req.owner_epoch,
             };
             let sock = parse_addr(target_addr).map_err(|e| {
                 (
@@ -6066,16 +6066,16 @@ impl ExtentNode {
             }
         }
 
-        // F211-D: owner-lock revision fence. `revision == 0` keeps the
+        // F211-D: owner-lock owner_epoch fence. `owner_epoch == 0` keeps the
         // pre-F211-D no-fence behaviour; non-zero is rejected when the
-        // local owner_revision has moved ahead (e.g., a fence on the
+        // local owner_epoch has moved ahead (e.g., a fence on the
         // coord node bumped owner-lock revisions on every extent the
         // coord touched, so a revived ghost coord's WriteShard with the
-        // old revision is refused).
-        if req.revision > 0 {
+        // old owner_epoch is refused).
+        if req.owner_epoch > 0 {
             if let Ok(entry) = self.ensure_extent(req.extent_id).await {
-                let last = entry.owner_revision.load(Ordering::SeqCst);
-                if req.revision < last {
+                let last = entry.owner_epoch.load(Ordering::SeqCst);
+                if req.owner_epoch < last {
                     return Ok(WriteShardResp {
                         code: CODE_LOCKED_BY_OTHER,
                     }
@@ -6108,11 +6108,11 @@ impl ExtentNode {
             }
         }
 
-        // F211-D: owner-lock revision fence (see handle_write_shard).
-        if req.revision > 0 {
+        // F211-D: owner-lock owner_epoch fence (see handle_write_shard).
+        if req.owner_epoch > 0 {
             if let Ok(entry) = self.ensure_extent(req.extent_id).await {
-                let last = entry.owner_revision.load(Ordering::SeqCst);
-                if req.revision < last {
+                let last = entry.owner_epoch.load(Ordering::SeqCst);
+                if req.owner_epoch < last {
                     return Ok(CommitEcShardResp {
                         code: CODE_LOCKED_BY_OTHER,
                     }
@@ -6173,12 +6173,12 @@ mod f147b_tests {
         let alloc_result = node.handle_alloc_extent(alloc_payload).await;
         assert!(alloc_result.is_ok(), "alloc_extent should succeed");
 
-        // Write 100 bytes at eversion=1, revision=0, commit=0 (no truncation).
+        // Write 100 bytes at eversion=1, owner_epoch=0, commit=0 (no truncation).
         let write_req = AppendReq {
             extent_id: 9001,
             eversion: 1,
             commit: 0,
-            revision: 0,
+            owner_epoch: 0,
             payload: Bytes::from(vec![0u8; 100]),
         };
         let write_result = node.handle_append(write_req.encode()).await;
@@ -6205,7 +6205,7 @@ mod f147b_tests {
             extent_id: 9001,
             eversion: 1,
             commit: 50,
-            revision: 0,
+            owner_epoch: 0,
             payload: Bytes::from(b"x".to_vec()),
         };
         let stale_result = node.handle_append(stale_req.encode()).await;
@@ -6235,7 +6235,7 @@ mod f147b_tests {
             extent_id: 7001,
             eversion: 2,
             commit: 0,
-            revision: 0,
+            owner_epoch: 0,
             payload: Bytes::from(b"ghost".to_vec()),
         };
 
@@ -6316,7 +6316,7 @@ mod f147b_tests {
             extent_id: 7100,
             eversion: 1,
             commit: 0,
-            revision: 0,
+            owner_epoch: 0,
             payload: Bytes::from(vec![7u8; 100]),
         };
         let wr = AppendResp::decode(node.handle_append(w.encode()).await.unwrap()).unwrap();
@@ -6333,7 +6333,7 @@ mod f147b_tests {
             node.handle_commit_length(
                 CommitLengthReq {
                     extent_id: 7100,
-                    revision: 1,
+                    owner_epoch: 1,
                 }
                 .encode(),
             )
@@ -6509,7 +6509,7 @@ mod f148_copy_extent_tests {
             extent_id: 8001,
             eversion: 1,
             commit: 0,
-            revision: 0,
+            owner_epoch: 0,
             payload: Bytes::from(vec![0u8; 256]),
         };
         let write_result = node.handle_append(write_req.encode()).await;
@@ -6573,7 +6573,7 @@ mod f148_copy_extent_tests {
             extent_id: 8002,
             eversion: 1,
             commit: 0,
-            revision: 0,
+            owner_epoch: 0,
             payload: Bytes::from(payload_bytes.clone()),
         };
         let write_result = node.handle_append(write_req.encode()).await;
@@ -6688,14 +6688,14 @@ mod f157_meta_crc_tests {
         buf[8..16].copy_from_slice(&extent_id.to_le_bytes());
         buf[16..24].copy_from_slice(&12345u64.to_le_bytes()); // sealed_length
         buf[24..32].copy_from_slice(&7u64.to_le_bytes()); // eversion
-        buf[32..40].copy_from_slice(&42i64.to_le_bytes()); // owner_revision
+        buf[32..40].copy_from_slice(&42i64.to_le_bytes()); // owner_epoch
         let crc = crc32c::crc32c(&buf[0..ExtentNode::META_SIZE_V0]);
         buf[40..44].copy_from_slice(&crc.to_le_bytes());
 
         let parsed = ExtentNode::parse_meta(&buf, extent_id).expect("V1 parse");
         assert_eq!(parsed.sealed_length, 12345);
         assert_eq!(parsed.eversion, 7);
-        assert_eq!(parsed.owner_revision, 42);
+        assert_eq!(parsed.owner_epoch, 42);
         // P0-C: V1 has no sealed flag → derived from sealed_length > 0.
         assert!(parsed.sealed);
         assert_eq!(parsed.avali, 1);
@@ -6715,7 +6715,7 @@ mod f157_meta_crc_tests {
         let parsed = ExtentNode::parse_meta(&buf, extent_id).expect("V0 parse");
         assert_eq!(parsed.sealed_length, 999);
         assert_eq!(parsed.eversion, 3);
-        assert_eq!(parsed.owner_revision, 100);
+        assert_eq!(parsed.owner_epoch, 100);
         // P0-C: V0 has no sealed flag → derived from sealed_length > 0.
         assert!(parsed.sealed);
         assert_eq!(parsed.avali, 1);
@@ -6799,7 +6799,7 @@ mod f157_meta_crc_tests {
         buf[8..16].copy_from_slice(&extent_id.to_le_bytes());
         buf[16..24].copy_from_slice(&sealed_length.to_le_bytes());
         buf[24..32].copy_from_slice(&3u64.to_le_bytes()); // eversion
-        buf[32..40].copy_from_slice(&0i64.to_le_bytes()); // owner_revision
+        buf[32..40].copy_from_slice(&0i64.to_le_bytes()); // owner_epoch
         buf[40] = u8::from(sealed);
         buf[44..48].copy_from_slice(&avali.to_le_bytes());
         let crc = crc32c::crc32c(&buf[0..ExtentNode::META_SIZE_V2 - 4]);
@@ -6876,7 +6876,7 @@ mod f157_meta_crc_tests {
         let mut buf = [0u8; ExtentNode::META_SIZE_V1];
         buf[0..8].copy_from_slice(ExtentNode::META_MAGIC_V1);
         buf[8..16].copy_from_slice(&eid.to_le_bytes());
-        // sealed_length=0, eversion=1, owner_revision=0
+        // sealed_length=0, eversion=1, owner_epoch=0
         buf[24..32].copy_from_slice(&1u64.to_le_bytes());
         let crc = crc32c::crc32c(&buf[0..ExtentNode::META_SIZE_V0]);
         buf[40..44].copy_from_slice(&crc.to_le_bytes());
@@ -6920,7 +6920,7 @@ mod f160_copy_extent_eversion_tests {
             extent_id: 9001,
             eversion: 1,
             commit: 0,
-            revision: 0,
+            owner_epoch: 0,
             payload: Bytes::from(payload),
         };
         node.handle_append(write_req.encode())
@@ -7089,7 +7089,7 @@ mod f194_concurrency_gate_tests {
 
 /// F211-D: shard wire-fence on `WriteShardReq` / `CommitEcShardReq`.
 /// Round-trip the encoded bytes through `decode` and assert the
-/// `revision` field survives so future callers cannot accidentally
+/// `owner_epoch` field survives so future callers cannot accidentally
 /// drop it. The handler-level fence behaviour is covered by the
 /// integration tests in `crates/manager/tests/f211_node_lifecycle.rs`.
 #[cfg(test)]
@@ -7104,7 +7104,7 @@ mod f211d_wire_fence_tests {
             shard_index: 3,
             sealed_length: 12345,
             eversion: 7,
-            revision: 99,
+            owner_epoch: 99,
             payload: Bytes::from_static(b"shard-bytes"),
         };
         let encoded = original.encode();
@@ -7113,7 +7113,7 @@ mod f211d_wire_fence_tests {
         assert_eq!(decoded.shard_index, 3);
         assert_eq!(decoded.sealed_length, 12345);
         assert_eq!(decoded.eversion, 7);
-        assert_eq!(decoded.revision, 99);
+        assert_eq!(decoded.owner_epoch, 99);
         assert_eq!(decoded.payload.as_ref(), b"shard-bytes");
     }
 
@@ -7124,11 +7124,11 @@ mod f211d_wire_fence_tests {
             shard_index: 0,
             sealed_length: 0,
             eversion: 1,
-            revision: 0,
+            owner_epoch: 0,
             payload: Bytes::new(),
         };
         let decoded = WriteShardReq::decode(original.encode()).unwrap();
-        assert_eq!(decoded.revision, 0, "zero revision marker preserved");
+        assert_eq!(decoded.owner_epoch, 0, "zero owner_epoch marker preserved");
     }
 
     #[test]
@@ -7137,13 +7137,13 @@ mod f211d_wire_fence_tests {
             extent_id: 7,
             sealed_length: 100,
             eversion: 4,
-            revision: 5,
+            owner_epoch: 5,
         };
         let decoded = CommitEcShardReq::decode(original.encode()).unwrap();
         assert_eq!(decoded.extent_id, 7);
         assert_eq!(decoded.sealed_length, 100);
         assert_eq!(decoded.eversion, 4);
-        assert_eq!(decoded.revision, 5);
+        assert_eq!(decoded.owner_epoch, 5);
     }
 }
 

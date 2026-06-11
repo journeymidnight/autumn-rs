@@ -16,7 +16,7 @@ pub struct MetadataState {
     pub extents: HashMap<u64, MgrExtentInfo>,
     pub nodes: HashMap<u64, MgrNodeInfo>,
     pub disks: HashMap<u64, MgrDiskInfo>,
-    pub owner_revisions: HashMap<String, i64>,
+    pub owner_epochs: HashMap<String, i64>,
     pub next_revision: i64,
     pub partitions: HashMap<u64, MgrPartitionMeta>,
     /// Persistent partition-scoped snapshot of live SST VP dependencies.
@@ -38,20 +38,20 @@ impl MetadataState {
     }
 
     pub fn acquire_owner_lock(&mut self, key: &str) -> i64 {
-        if let Some(v) = self.owner_revisions.get(key) {
+        if let Some(v) = self.owner_epochs.get(key) {
             return *v;
         }
         self.next_revision += 1;
         let rev = self.next_revision;
-        self.owner_revisions.insert(key.to_string(), rev);
+        self.owner_epochs.insert(key.to_string(), rev);
         rev
     }
 
-    pub fn ensure_owner_revision(&self, key: &str, revision: i64) -> AppResult<()> {
-        match self.owner_revisions.get(key) {
-            Some(v) if *v == revision => Ok(()),
+    pub fn ensure_owner_epoch(&self, key: &str, owner_epoch: i64) -> AppResult<()> {
+        match self.owner_epochs.get(key) {
+            Some(v) if *v == owner_epoch => Ok(()),
             Some(v) => Err(AppError::Precondition(format!(
-                "owner_key={key} revision mismatch, expected {v}, got {revision}"
+                "owner_key={key} owner_epoch mismatch, expected {v}, got {owner_epoch}"
             ))),
             None => Err(AppError::Precondition(format!(
                 "owner_key={key} does not exist"
@@ -94,8 +94,8 @@ mod tests {
     fn owner_lock_revision_validation() {
         let mut s = MetadataState::default();
         let rev = s.acquire_owner_lock("lock/a");
-        assert!(s.ensure_owner_revision("lock/a", rev).is_ok());
-        assert!(s.ensure_owner_revision("lock/a", rev + 1).is_err());
-        assert!(s.ensure_owner_revision("lock/b", 1).is_err());
+        assert!(s.ensure_owner_epoch("lock/a", rev).is_ok());
+        assert!(s.ensure_owner_epoch("lock/a", rev + 1).is_err());
+        assert!(s.ensure_owner_epoch("lock/b", 1).is_err());
     }
 }

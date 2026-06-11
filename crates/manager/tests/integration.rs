@@ -318,7 +318,7 @@ fn stream_manager_alloc_and_truncate_flow() {
                 rkyv_encode(&StreamAllocExtentReq {
                     stream_id,
                     owner_key: "owner/stream/1".to_string(),
-                    revision: lock.revision,
+                    owner_epoch: lock.owner_epoch,
                     seal_commit: Some(128),
                     exclude_node_ids: vec![],
                 }),
@@ -337,7 +337,7 @@ fn stream_manager_alloc_and_truncate_flow() {
                     stream_id,
                     extent_id: tail_extent,
                     owner_key: "owner/stream/1".to_string(),
-                    revision: lock.revision,
+                    owner_epoch: lock.owner_epoch,
                 }),
             )
             .await

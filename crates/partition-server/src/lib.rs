@@ -1629,7 +1629,7 @@ pub struct PartitionServer {
     /// Current manager index.
     current_mgr: Cell<usize>,
     pool: Rc<ConnPool>,
-    /// Server-level owner key and revision for split coordination.
+    /// Server-level owner key and owner_epoch for split coordination.
     server_owner_key: String,
     server_revision: Rc<Cell<i64>>,
     /// F099-K — base TCP port. The first partition opened binds
@@ -2516,7 +2516,7 @@ impl PartitionServer {
                             current_mgr: Cell::new(connected_idx),
                             pool,
                             server_owner_key: owner_key,
-                            server_revision: Rc::new(Cell::new(resp.revision)),
+                            server_revision: Rc::new(Cell::new(resp.owner_epoch)),
                             // F099-K — placeholders; populated by
                             // `bind_listen_addr` (called from
                             // `serve()` or `connect_with_advertise_and_port`).
@@ -3012,7 +3012,7 @@ impl PartitionServer {
     ) -> Result<PartitionHandle> {
         let manager_addr = self.manager_addrs.join(",");
         let owner_key = self.server_owner_key.clone();
-        let revision = self.server_revision.get();
+        let owner_epoch = self.server_revision.get();
         let ps_id = self.ps_id;
         // F184: snapshot the open-time params for sync_regions_once
         // change-detection (post-merge widening, post-split narrowing,
@@ -3127,7 +3127,7 @@ impl PartitionServer {
                         meta_stream_id,
                         manager_addr_for_thread,
                         owner_key_for_thread,
-                        revision,
+                        owner_epoch,
                         ps_id,
                         listen_addr,
                         advertise_host_for_thread,
@@ -4289,7 +4289,7 @@ async fn partition_thread_main(
     meta_stream_id: u64,
     manager_addr: String,
     owner_key: String,
-    revision: i64,
+    owner_epoch: i64,
     ps_id: u64,
     listen_addr: SocketAddr,
     advertise_host: String,
@@ -4324,12 +4324,12 @@ async fn partition_thread_main(
     let (req_tx, req_rx) = mpsc::channel::<PartitionRequest>(WRITE_CHANNEL_CAP);
 
     let pool = Rc::new(ConnPool::new());
-    // StreamClient::new_with_revision now returns `Rc<StreamClient>` directly
+    // StreamClient::new_with_owner_epoch now returns `Rc<StreamClient>` directly
     // (R4 step 4.3: Rc::new_cyclic for Weak-self worker removal guard).
-    let part_sc = StreamClient::new_with_revision(
+    let part_sc = StreamClient::new_with_owner_epoch(
         &manager_addr,
         owner_key.clone(),
-        revision,
+        owner_epoch,
         3 * 1024 * 1024 * 1024,
         pool.clone(),
     )
@@ -4424,7 +4424,7 @@ async fn partition_thread_main(
         part_id,
         manager_addr.clone(),
         owner_key.clone(),
-        revision,
+        owner_epoch,
         flush_req_rx,
         row_append_rx,
         row_invalidate_rx,
@@ -4881,7 +4881,7 @@ async fn partition_thread_main(
             pool: pool.clone(),
             manager_addr: manager_addr.clone(),
             owner_key: owner_key.clone(),
-            revision,
+            owner_epoch,
         },
     )
     .await;
@@ -5353,7 +5353,7 @@ struct Routing {
     pool: Rc<ConnPool>,
     manager_addr: String,
     owner_key: String,
-    revision: i64,
+    owner_epoch: i64,
 }
 
 /// F185 + F210-C2 freeze-drain completion (extracted from `partition_loop`).
@@ -5734,7 +5734,7 @@ async fn handle_incoming_req(
             let pool_c = routing.pool.clone();
             let manager_addr_c = routing.manager_addr.clone();
             let owner_key_c = routing.owner_key.clone();
-            let revision_c = routing.revision;
+            let revision_c = routing.owner_epoch;
             let payload = req.payload;
             let resp_tx = req.resp_tx;
             compio::runtime::spawn(async move {
@@ -5769,7 +5769,7 @@ async fn handle_incoming_req(
                 &routing.pool,
                 &routing.manager_addr,
                 &routing.owner_key,
-                routing.revision,
+                routing.owner_epoch,
             )
             .await;
             let _ = req.resp_tx.send(result);
@@ -7826,8 +7826,8 @@ async fn background_flush_loop(
 // uploads from head-of-line-blocking the 4KB log_stream WAL batches sharing
 // the P-log runtime.
 //
-// The StreamClient uses `new_with_revision` to inherit the server-level
-// owner-lock revision — no second `acquire_owner_lock` call, so both clients
+// The StreamClient uses `new_with_owner_epoch` to inherit the server-level
+// owner-lock owner_epoch — no second `acquire_owner_lock` call, so both clients
 // use the same fencing token. Post-F093 the pool no longer uses Hot/Bulk
 // kinds; each thread's ConnPool is role-dedicated.
 // ---------------------------------------------------------------------------
@@ -7837,7 +7837,7 @@ async fn background_flush_loop(
 /// `partition_thread_main` awaits this BEFORE constructing `PartitionData`
 /// so a partition is never half-opened with a dead P-bulk receiver. Pre-
 /// F255 only OS `thread::Builder::spawn` failure was surfaced; runtime
-/// build / `StreamClient::new_with_revision` failures inside the thread
+/// build / `StreamClient::new_with_owner_epoch` failures inside the thread
 /// silently logged + returned, leaving P-log with a live `Sender` to a
 /// dropped receiver and the partition wedged on first flush.
 type BulkReady = futures::channel::oneshot::Receiver<Result<()>>;
@@ -7846,7 +7846,7 @@ fn spawn_bulk_thread(
     part_id: u64,
     manager_addr: String,
     owner_key: String,
-    revision: i64,
+    owner_epoch: i64,
     flush_req_rx: mpsc::Receiver<FlushReq>,
     row_append_rx: mpsc::Receiver<RowAppendReq>,
     row_invalidate_rx: mpsc::Receiver<RowInvalidateBarrierReq>,
@@ -7870,10 +7870,10 @@ fn spawn_bulk_thread(
             tracing::info!(part_id, ?cpu, "P-bulk thread runtime ready");
             rt.block_on(async move {
                 let pool = Rc::new(ConnPool::new());
-                let bulk_sc = match StreamClient::new_with_revision(
+                let bulk_sc = match StreamClient::new_with_owner_epoch(
                     &manager_addr,
                     owner_key,
-                    revision,
+                    owner_epoch,
                     3 * 1024 * 1024 * 1024,
                     pool,
                 )

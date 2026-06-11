@@ -325,16 +325,16 @@ impl AutumnManager {
     pub(crate) async fn handle_acquire_owner_lock(&self, payload: Bytes) -> HandlerResult {
         let req: AcquireOwnerLockReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-        match self.acquire_owner_revision(&req.owner_key).await {
+        match self.acquire_owner_epoch(&req.owner_key).await {
             Ok(rev) => Ok(rkyv_encode(&AcquireOwnerLockResp {
                 code: CODE_OK,
                 message: String::new(),
-                revision: rev,
+                owner_epoch: rev,
             })),
             Err(err) => Ok(rkyv_encode(&AcquireOwnerLockResp {
                 code: Self::err_to_code(&err),
                 message: err.to_string(),
-                revision: 0,
+                owner_epoch: 0,
             })),
         }
     }
@@ -998,7 +998,7 @@ impl AutumnManager {
 
         let (stream, ex, nodes) = {
             let s = self.store.inner.borrow();
-            if let Err(err) = Self::ensure_owner_revision(&req.owner_key, req.revision, &s) {
+            if let Err(err) = Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s) {
                 return Ok(rkyv_encode(&CheckCommitLengthResp {
                     code: Self::err_to_code(&err),
                     message: err.to_string(),
@@ -1085,7 +1085,7 @@ impl AutumnManager {
                 continue;
             }
             if let Some(n) = nodes.get(&node_id) {
-                // F210-H3 Tier 2: pass `req.revision` (validated above) so
+                // F210-H3 Tier 2: pass `req.owner_epoch` (validated above) so
                 // the EN's fence-handover side-effect fires on first probe.
                 // Errors are surfaced at WARN so a silently-routed-to-wrong-
                 // shard misconfiguration (e.g. cluster.sh AUTUMN_EXTENT_SHARDS
@@ -1094,7 +1094,7 @@ impl AutumnManager {
                 // instead of being swallowed and surfacing only as
                 // "0/N committed members reachable".
                 match self
-                    .commit_length_on_node(&n.address, ex.extent_id, req.revision)
+                    .commit_length_on_node(&n.address, ex.extent_id, req.owner_epoch)
                     .await
                 {
                     Ok(v) => {
@@ -1160,7 +1160,7 @@ impl AutumnManager {
         let online_node_ids = self.node_states.borrow().online_node_ids();
         let (mut tail, selected, extent_id, data, nodes_map) = {
             let mut s = self.store.inner.borrow_mut();
-            if let Err(err) = Self::ensure_owner_revision(&req.owner_key, req.revision, &s) {
+            if let Err(err) = Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s) {
                 return Ok(rkyv_encode(&StreamAllocExtentResp {
                     code: Self::err_to_code(&err),
                     message: err.to_string(),
@@ -1358,10 +1358,10 @@ impl AutumnManager {
                     continue;
                 }
                 if let Some(node) = nodes_map.get(&node_id) {
-                    // F210-H3 Tier 2: pass req.revision (validated above)
+                    // F210-H3 Tier 2: pass req.owner_epoch (validated above)
                     // so the EN's fence-handover side-effect fires.
                     if let Ok(v) = self
-                        .commit_length_on_node(&node.address, tail.extent_id, req.revision)
+                        .commit_length_on_node(&node.address, tail.extent_id, req.owner_epoch)
                         .await
                     {
                         responses.insert(node_id, v);
@@ -1455,7 +1455,7 @@ impl AutumnManager {
             sealed_len,
             eversion_old = expected_eversion,
             eversion_new = tail.eversion,
-            revision = req.revision,
+            owner_epoch = req.owner_epoch,
             owner = %req.owner_key,
             "BUG2 alloc-seal applied"
         );
@@ -1749,7 +1749,7 @@ impl AutumnManager {
                 ),
                 AppError,
             > {
-                Self::ensure_owner_revision(&req.owner_key, req.revision, s)?;
+                Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, s)?;
                 let requested: HashSet<u64> = req.extent_ids.into_iter().collect();
                 let stream = s
                     .streams
@@ -1933,7 +1933,7 @@ impl AutumnManager {
                 ),
                 AppError,
             > {
-                Self::ensure_owner_revision(&req.owner_key, req.revision, s)?;
+                Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, s)?;
                 let stream = s
                     .streams
                     .get(&req.stream_id)
@@ -2131,7 +2131,7 @@ impl AutumnManager {
                 MgrPartitionVpRefs,
                 HashMap<u64, u64>,
             ), AppError> {
-                Self::ensure_owner_revision(&req.owner_key, req.revision, &s)?;
+                Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s)?;
 
                 let src_meta = s
                     .partitions
@@ -2439,7 +2439,7 @@ impl AutumnManager {
         let phase1: Result<Phase1Result, AppError> = {
             let mut s = self.store.inner.borrow_mut();
             (|| -> Result<Phase1Result, AppError> {
-                Self::ensure_owner_revision(&req.owner_key, req.revision, &s)?;
+                Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s)?;
 
                 if req.survivor_part_id == req.victim_part_id {
                     return Err(AppError::Precondition(
@@ -2809,7 +2809,7 @@ impl AutumnManager {
     //   1. ensure_leader (manager state belongs to one instance only)
     //   2. resolve survivor + victim part_addr / stream ids in one borrow
     //   3. acquire admin owner-lock (so the embedded MultiModifyMerge txn
-    //      has a fresh revision F149 can fence on)
+    //      has a fresh owner_epoch F149 can fence on)
     //   4. send MSG_MERGE_FREEZE to victim's PS, await OK
     //      (drains pending+inflight + flushes imm; no new writes accepted)
     //   5. send MSG_MERGE_FREEZE to survivor's PS, await OK
@@ -2889,7 +2889,7 @@ impl AutumnManager {
             "admin-merge:{}:{}",
             req.survivor_part_id, req.victim_part_id
         );
-        let revision = match self.acquire_owner_revision(&owner_key).await {
+        let owner_epoch = match self.acquire_owner_epoch(&owner_key).await {
             Ok(r) => r,
             Err(e) => {
                 return Ok(rkyv_encode(&MergePartitionsResp {
@@ -3010,7 +3010,7 @@ impl AutumnManager {
                 let req = CheckCommitLengthReq {
                     stream_id,
                     owner_key,
-                    revision,
+                    owner_epoch,
                 };
                 let resp_bytes = self.handle_check_commit_length(rkyv_encode(&req)).await?;
                 let resp: CheckCommitLengthResp =
@@ -3067,7 +3067,7 @@ impl AutumnManager {
             survivor_part_id: req.survivor_part_id,
             victim_part_id: req.victim_part_id,
             owner_key: owner_key.clone(),
-            revision,
+            owner_epoch,
             log_sealed_lengths: log_lens,
             row_sealed_lengths: row_lens,
             meta_sealed_lengths: meta_lens,
@@ -3389,14 +3389,14 @@ impl AutumnManager {
 
         let new_eversion = live_eversion + 1;
 
-        // F211-D Tier 2: capture the current owner_lock revision for the
+        // F211-D Tier 2: capture the current owner_lock owner_epoch for the
         // partition that owns this extent. Threaded through dispatch ->
         // coord -> WriteShard/CommitEcShard so a fenced ex-coord's
         // in-flight 2PC is rejected by remote ENs once
-        // `auto_abandon_for_fenced_node` bumps their `entry.owner_revision`
+        // `auto_abandon_for_fenced_node` bumps their `entry.owner_epoch`
         // via fence-handover. CoW-shared extents (refs >= 2) appear in
         // multiple partitions' streams; any of them works because all
-        // sharing partitions hold the same owner_lock revision at any
+        // sharing partitions hold the same owner_lock owner_epoch at any
         // moment (revisions are bumped uniformly by F211-D).
         let dispatch_revision: i64 = {
             let s = self.store.inner.borrow();
@@ -3410,7 +3410,7 @@ impl AutumnManager {
                         .unwrap_or(false)
                     {
                         let key = format!("partition/{}", part.part_id);
-                        if let Some(&rev) = s.owner_revisions.get(&key) {
+                        if let Some(&rev) = s.owner_epochs.get(&key) {
                             found = rev;
                         }
                         break 'outer;
@@ -3426,7 +3426,7 @@ impl AutumnManager {
             extra_disk_ids,
             data_shards: data_shards as u32,
             new_eversion,
-            revision: dispatch_revision,
+            owner_epoch: dispatch_revision,
         };
 
         // F207-B: acquire the unified inflight marker. CAS via
@@ -4317,21 +4317,21 @@ impl AutumnManager {
         }
         self.node_overrides.borrow_mut().insert(req.node_id, ovr);
         // BUG #3 Layer B fix: do NOT bump partition owner-lock revisions when
-        // fencing an EN data node. The owner-lock revision is the PARTITION
+        // fencing an EN data node. The owner-lock owner_epoch is the PARTITION
         // OWNER's (PS) token for split-brain prevention; an EN data node is
         // never a partition owner. The old F211-D bump
-        // (`bump_owner_revisions_for_node`) walked every partition whose
+        // (`bump_owner_epochs_for_node`) walked every partition whose
         // log/row/meta stream merely had a REPLICA on the fenced node and
-        // bumped THAT partition's owner revision — fencing out the legitimate
-        // PS owner (which holds its acquire-time revision and never
+        // bumped THAT partition's owner owner_epoch — fencing out the legitimate
+        // PS owner (which holds its acquire-time owner_epoch and never
         // re-acquires), so the PS's next append got CODE_LOCKED_BY_OTHER and
         // `partition_loop` self-poisoned + reopen-thrashed (the chaos seed=6
         // wedge after the Layer-A seal fix). It was also redundant: a fenced
         // EN is handled by the normal append-fail → seal-over-reachable (Layer
         // A) → alloc-new-extent path, and post-recovery topology changes are
-        // picked up via EVERSION refresh, not owner-revision. Real split-brain
+        // picked up via EVERSION refresh, not owner-owner_epoch. Real split-brain
         // protection is the NEW PS's `acquire_owner_lock` on takeover (higher
-        // revision), unaffected by this removal — see
+        // owner_epoch), unaffected by this removal — see
         // `system_locked_by_other.rs::owner_lock_fencing_rejects_stale_revision`.
         // F211-F: auto-abandon EC convert markers whose coord matches
         // the freshly-fenced node.
@@ -4379,8 +4379,8 @@ impl AutumnManager {
         Ok(())
     }
 
-    // BUG #3 Layer B: `bump_owner_revisions_for_node` (F211-D) was removed.
-    // It bumped the PARTITION owner-lock revision of every partition whose
+    // BUG #3 Layer B: `bump_owner_epochs_for_node` (F211-D) was removed.
+    // It bumped the PARTITION owner-lock owner_epoch of every partition whose
     // streams merely had a REPLICA on a fenced EN data node, fencing out the
     // legitimate PS owner (→ CODE_LOCKED_BY_OTHER → partition self-poison +
     // reopen-thrash). It was redundant (fenced-EN handling = append-fail →

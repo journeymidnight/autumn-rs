@@ -1424,7 +1424,7 @@ post-restart.
    - **Flush barrier**: `flush_one_imm` (and `flush_one_imm_local`) call `part_sc.await_log_synced_to(vp_extent_id, vp_offset)` BEFORE uploading the SST. **F227: ALL log_stream replicas** (was quorum-min) must report `last_synced >= vp_offset` first. This guarantees that every byte the imm's ValuePointers reference is durable on every replica BEFORE the SST that names them is checkpointed — a fsync-quorum could publish an SST whose VP bytes are durable on only a subset, so a later min-commit truncation on the un-synced replica could orphan the VP (the `stale_vp_offset_past_sealed_length` class). On a healthy cluster this is satisfied immediately because the append already acked all-replicas. On the happy path this waits ≈ 0 because the coalescer fires every 2 ms in parallel with SST build; on the worst case it waits one coalesce window.
    Why this is better than F150 Phase B: the rotation-triggering writer no longer pays a 5-15 ms (real SSD) fsync cost as a tail-latency spike — every Put pays the same 1-5 ms coalesce floor. The fsync work moves entirely to background flush, latency-invisible to clients. F178 Phase 3 removed `--nosync` from CLI surfaces; the `must_sync` field on PutReq/AppendReq is kept for wire back-compat but always true in practice.
 
-7. **Per-partition StreamClient** — each `PartitionData` holds its own `stream_client: Arc<StreamClient>` (no Mutex) created via `StreamClient::new_with_revision`. StreamClient is internally concurrent via per-stream locking (`DashMap<stream_id, Arc<Mutex<StreamAppendState>>>`). Different streams (log/row/meta) are fully concurrent; the same stream is serialized. The server-level `PartitionServer.stream_client` is used only in `split_part` for coordination RPCs.
+7. **Per-partition StreamClient** — each `PartitionData` holds its own `stream_client: Arc<StreamClient>` (no Mutex) created via `StreamClient::new_with_owner_epoch`. StreamClient is internally concurrent via per-stream locking (`DashMap<stream_id, Arc<Mutex<StreamAppendState>>>`). Different streams (log/row/meta) are fully concurrent; the same stream is serialized. The server-level `PartitionServer.stream_client` is used only in `split_part` for coordination RPCs.
 
 8. **`start_write_batch` / `finish_write_batch` lock scope** — the write lock is held only for seq number assignment and block encoding (Phase 1), then released before the `append_batch` network RPC (Phase 2), then re-acquired for memtable insert and VP head update (Phase 3). This prevents the partition write lock from blocking reads/flushes/compaction during network I/O.
 
@@ -1844,7 +1844,7 @@ post-restart.
     - **(P2) P-bulk readiness handshake — FIXED.** `spawn_bulk_thread`
       now returns `(JoinHandle, oneshot::Receiver<Result<()>>)`. The
       spawned thread sends `Ok(())` only AFTER compio `RuntimeBuilder::
-      build` succeeds AND `StreamClient::new_with_revision` succeeds AND
+      build` succeeds AND `StreamClient::new_with_owner_epoch` succeeds AND
       `set_reporter_part_id` runs; runtime / StreamClient init failure
       sends `Err(_)` so P-log surfaces the real failure cause.
       `partition_thread_main` awaits the receiver before publishing

@@ -19,7 +19,7 @@ async fn batch_path_rejects_append_to_sealed_extent() {
     let alloc = conn.alloc_extent(5001).await;
     assert_eq!(alloc.code, CODE_OK);
 
-    // Write some data at revision 1.
+    // Write some data at owner_epoch 1.
     let w1 = conn.append(5001, 1, 0, 1, b"hello".to_vec()).await;
     assert_eq!(w1.code, CODE_OK);
     assert_eq!(w1.end, 5);

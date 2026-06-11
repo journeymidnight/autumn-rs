@@ -4,13 +4,13 @@
 //! helpers + the pure-fn `apply_invalidation` / `cache_is_stale`)
 //! to assert:
 //!
-//! 1. A reader caches `(ino, lease_version=N)`. Writer (different
+//! 1. A reader caches `(ino, lease_epoch=N)`. Writer (different
 //!    daemon) acquires, closes → manager pushes
 //!    `WriterClosed { ino, version=N+1 }`. The reader's
 //!    `session_invalidation_poll_loop` (simulated here by calling
 //!    `lease::poll_invalidations + apply_invalidation` directly)
 //!    bumps `invalidations[ino] = N+1`. `cache_is_stale(ino, N,
-//!    &map) == true` while a fresh cache at `lease_version=N+1`
+//!    &map) == true` while a fresh cache at `lease_epoch=N+1`
 //!    is fresh again.
 //!
 //! 2. The "subscribe disconnect = invalidate everything" sentinel

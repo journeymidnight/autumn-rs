@@ -146,7 +146,7 @@ async fn run_bench() {
                 extent_id: read_extent_id,
                 eversion: 1,
                 commit,
-                revision: 1,
+                owner_epoch: 1,
                 payload: payload.clone(),
             };
             let resp = AppendResp::decode(conn.call(MSG_APPEND, req.encode()).await).unwrap();
@@ -188,7 +188,7 @@ async fn run_bench() {
                 extent_id: mixed_extent_id,
                 eversion: 1,
                 commit,
-                revision: 1,
+                owner_epoch: 1,
                 payload: payload.clone(),
             };
             let resp = AppendResp::decode(conn.call(MSG_APPEND, req.encode()).await).unwrap();
@@ -223,7 +223,7 @@ async fn bench_append(addr: SocketAddr, extent_id: u64, depth: usize, total_ops:
     // Fetch current commit.
     let cl_req = CommitLengthReq {
         extent_id,
-        revision: 1,
+        owner_epoch: 1,
     };
     let resp =
         CommitLengthResp::decode(conn.call(MSG_COMMIT_LENGTH, cl_req.encode()).await).unwrap();
@@ -241,7 +241,7 @@ async fn bench_append(addr: SocketAddr, extent_id: u64, depth: usize, total_ops:
             extent_id,
             eversion: 1,
             commit,
-            revision: 1,
+            owner_epoch: 1,
             payload: payload.clone(),
         };
         conn.send(MSG_APPEND, req.encode()).await;
@@ -260,7 +260,7 @@ async fn bench_append(addr: SocketAddr, extent_id: u64, depth: usize, total_ops:
                 extent_id,
                 eversion: 1,
                 commit: resp.end,
-                revision: 1,
+                owner_epoch: 1,
                 payload: payload.clone(),
             };
             conn.send(MSG_APPEND, req.encode()).await;
@@ -392,7 +392,7 @@ async fn bench_mixed(
 
             let cl_req = CommitLengthReq {
                 extent_id,
-                revision: 1,
+                owner_epoch: 1,
             };
             let resp =
                 CommitLengthResp::decode(conn.call(MSG_COMMIT_LENGTH, cl_req.encode()).await)
@@ -408,7 +408,7 @@ async fn bench_mixed(
                     extent_id,
                     eversion: 1,
                     commit,
-                    revision: 1,
+                    owner_epoch: 1,
                     payload: payload.clone(),
                 };
                 conn.send(MSG_APPEND, req.encode()).await;
@@ -426,7 +426,7 @@ async fn bench_mixed(
                         extent_id,
                         eversion: 1,
                         commit: resp.end,
-                        revision: 1,
+                        owner_epoch: 1,
                         payload: payload.clone(),
                     };
                     conn.send(MSG_APPEND, req.encode()).await;

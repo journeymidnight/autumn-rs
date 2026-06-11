@@ -48,7 +48,7 @@ Holds all cluster state in memory:
 | `extents` | `HashMap<u64, ExtentInfo>` | All extents |
 | `nodes` | `HashMap<u64, NodeInfo>` | Registered extent nodes |
 | `disks` | `HashMap<u64, DiskInfo>` | Registered disks |
-| `owner_revisions` | `HashMap<String, i64>` | Owner lock fencing tokens |
+| `owner_epochs` | `HashMap<String, i64>` | Owner lock fencing tokens |
 | `partitions` | `HashMap<u64, PartitionMeta>` | All partition metadata |
 | `ps_nodes` | `HashMap<u64, PsDetail>` | Partition server addresses |
 | `regions` | `HashMap<u64, RegionInfo>` | Partition → PS assignments |
@@ -62,7 +62,7 @@ Returns `count` sequential IDs starting from `next_id`. IDs are globally unique 
 **`acquire_owner_lock(key: &str) -> i64`**
 Returns the existing revision for this key, or allocates a new ID as the revision. **Idempotent**: calling twice with the same key returns the same revision. This means reconnecting `StreamClient`s get the same token and don't fence out the previous connection if the key hasn't changed.
 
-**`ensure_owner_revision(key: &str, revision: i64) -> Result<()>`**
+**`ensure_owner_epoch(key: &str, revision: i64) -> Result<()>`**
 Validates that the caller's revision matches the stored one. Returns `Precondition` error if not. This is the core fencing check — called on every stream-mutating operation.
 
 #### `MetadataStore` (outer wrapper)
@@ -73,4 +73,4 @@ Validates that the caller's revision matches the stored one. Returns `Preconditi
 
 1. **ID uniqueness**: all IDs (stream, extent, node, disk, partition) come from the same monotonic counter — never generate IDs outside `alloc_ids`.
 2. **Owner lock idempotency**: `acquire_owner_lock` with the same key always returns the same revision. The revision only changes if the key is explicitly evicted and re-acquired. Never generate owner revisions outside this method.
-3. **Revision fencing**: any operation that mutates stream or extent state must call `ensure_owner_revision` first. Skipping this allows split-brain writes.
+3. **Epoch fencing**: any operation that mutates stream or extent state must call `ensure_owner_epoch` first. Skipping this allows split-brain writes.

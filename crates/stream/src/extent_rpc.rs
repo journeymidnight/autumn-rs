@@ -35,7 +35,7 @@ pub const MSG_COMMIT_EC_SHARD: u8 = 12;
 pub const MSG_SYNCED_LENGTH: u8 = 13;
 /// Manager-only probe RPC. Returns CommitLengthResp-shaped
 /// `(code, length)` without touching the owner-lock fence — no
-/// revision check, no mutation of `owner_revision`, no `.meta`
+/// owner_epoch check, no mutation of `owner_epoch`, no `.meta`
 /// rewrite. Two call sites today:
 ///   - `manager/src/recovery.rs`'s `recovery_dispatch_loop`
 ///     liveness probe (uses `code == CODE_OK` to decide whether
@@ -45,7 +45,7 @@ pub const MSG_SYNCED_LENGTH: u8 = 13;
 ///     where no PS-owner context is available).
 /// External (non-manager) callers MUST NOT use this RPC for
 /// seal/consensus reads — those go through `MSG_COMMIT_LENGTH`
-/// with a real revision so the EN's fence handover side-effect
+/// with a real owner_epoch so the EN's fence handover side-effect
 /// fires (see `extent_node.rs::handle_commit_length`).
 pub const MSG_PROBE_EXTENT: u8 = 14;
 /// F216-E zero-copy read (EN -> PS). Same request shape as MSG_READ_BYTES
@@ -71,7 +71,7 @@ pub const MSG_READ_BYTES_ZC: u8 = 15;
 /// the writer's lease order, and the forward submit inherits it), (3) runs
 /// the local append, (4) acks only when BOTH the local write and the
 /// downstream ack succeed. `n_chain == 0` behaves exactly like MSG_APPEND.
-/// Every hop validates its own owner_revision / eversion / commit as usual —
+/// Every hop validates its own owner_epoch / eversion / commit as usual —
 /// fencing and commit-truncation are per-replica invariants, unchanged.
 pub const MSG_APPEND_CHAIN: u8 = 16;
 
@@ -120,7 +120,7 @@ pub fn decode_chain_prefix(mut data: Bytes) -> Result<(Vec<String>, Bytes), &'st
 
 /// Fixed binary header for AppendRequest: 28 bytes + raw payload.
 /// ```text
-/// [extent_id: u64 LE][eversion: u64 LE][commit: u32 LE][revision: i64 LE]
+/// [extent_id: u64 LE][eversion: u64 LE][commit: u32 LE][owner_epoch: i64 LE]
 /// [payload bytes...]
 /// ```
 ///
@@ -136,7 +136,7 @@ pub struct AppendReq {
     pub extent_id: u64,
     pub eversion: u64,
     pub commit: u32,
-    pub revision: i64,
+    pub owner_epoch: i64,
     pub payload: Bytes,
 }
 
@@ -146,18 +146,18 @@ impl AppendReq {
         buf.put_u64_le(self.extent_id);
         buf.put_u64_le(self.eversion);
         buf.put_u32_le(self.commit);
-        buf.put_i64_le(self.revision);
+        buf.put_i64_le(self.owner_epoch);
         buf.extend_from_slice(&self.payload);
         buf.freeze()
     }
 
     /// Encode only the 28-byte header (for vectored writes — payload sent separately).
-    pub fn encode_header(extent_id: u64, eversion: u64, commit: u32, revision: i64) -> Bytes {
+    pub fn encode_header(extent_id: u64, eversion: u64, commit: u32, owner_epoch: i64) -> Bytes {
         let mut buf = BytesMut::with_capacity(APPEND_HEADER_LEN);
         buf.put_u64_le(extent_id);
         buf.put_u64_le(eversion);
         buf.put_u32_le(commit);
-        buf.put_i64_le(revision);
+        buf.put_i64_le(owner_epoch);
         buf.freeze()
     }
 
@@ -168,13 +168,13 @@ impl AppendReq {
         let extent_id = data.get_u64_le();
         let eversion = data.get_u64_le();
         let commit = data.get_u32_le();
-        let revision = data.get_i64_le();
+        let owner_epoch = data.get_i64_le();
         let payload = data;
         Ok(Self {
             extent_id,
             eversion,
             commit,
-            revision,
+            owner_epoch,
             payload,
         })
     }
@@ -277,48 +277,48 @@ impl ReadBytesResp {
 // ── CommitLength (hot path) ──────────────────────────────────────────────────
 
 /// CommitLengthRequest: 16 bytes.
-/// [extent_id: u64 LE][revision: i64 LE]
+/// [extent_id: u64 LE][owner_epoch: i64 LE]
 ///
-/// **Wire contract on `revision` (post-F210-H3 Tier 2, 2026-05-17):**
+/// **Wire contract on `owner_epoch` (post-F210-H3 Tier 2, 2026-05-17):**
 ///
-/// `revision` is an i64 but MUST be `> 0` on the wire — it carries the
+/// `owner_epoch` is an i64 but MUST be `> 0` on the wire — it carries the
 /// caller's owner-lock claim. The EN's `handle_commit_length`:
-///   - returns `CODE_INVALID_ARGUMENT` if `revision <= 0` (no
+///   - returns `CODE_INVALID_ARGUMENT` if `owner_epoch <= 0` (no
 ///     "probe sentinel" path — that escape hatch existed pre-F210-H2
 ///     and broke fence semantics; see `MSG_PROBE_EXTENT` instead);
-///   - returns `CODE_LOCKED_BY_OTHER` if `revision < entry.owner_revision`
+///   - returns `CODE_LOCKED_BY_OTHER` if `owner_epoch < entry.owner_epoch`
 ///     (caller is a stale owner; reject);
-///   - if `revision >= entry.owner_revision`, returns the length WITHOUT
-///     mutating `owner_revision` (CHECK-ONLY; the three-concepts rule).
+///   - if `owner_epoch >= entry.owner_epoch`, returns the length WITHOUT
+///     mutating `owner_epoch` (CHECK-ONLY; the three-concepts rule).
 ///
 /// commit_length is a length PROBE + stale-owner fence CHECK. It does NOT
 /// perform fence handover — write-ownership is established EXCLUSIVELY by
-/// the APPEND path (`handle_append*` bumps `owner_revision` when a
-/// higher-revision owner writes). The old "revision > owner_revision →
+/// the APPEND path (`handle_append*` bumps `owner_epoch` when a
+/// higher-owner_epoch owner writes). The old "owner_epoch > owner_epoch →
 /// bump + persist .meta" handover was removed 2026-05-29: the manager's
 /// control-plane probes (`admin-merge:<v>:<s>` lock in
 /// `handle_merge_partitions`, the seal in `handle_stream_alloc_extent`)
-/// carry a high global owner-revision counter that does NOT represent a
-/// new PS write-owner; bumping `owner_revision` on such a probe fenced out
+/// carry a high global owner-owner_epoch counter that does NOT represent a
+/// new PS write-owner; bumping `owner_epoch` on such a probe fenced out
 /// the LIVE PS (which never re-reads the climbing counter) → poison.
 ///
 /// This RPC is the canonical seal-consensus primitive. Manager's
-/// `commit_length_on_node(addr, eid, revision)` helper forwards the
-/// caller's validated `req.revision` through `handle_check_commit_length`
+/// `commit_length_on_node(addr, eid, owner_epoch)` helper forwards the
+/// caller's validated `req.owner_epoch` through `handle_check_commit_length`
 /// and `handle_stream_alloc_extent`. Manager probes WITHOUT an owner
 /// context (recovery liveness, `autumn-client info` display) use
 /// `MSG_PROBE_EXTENT` instead — that RPC returns the same `(code, length)`
 /// shape but skips the fence CHECK entirely.
 pub struct CommitLengthReq {
     pub extent_id: u64,
-    pub revision: i64,
+    pub owner_epoch: i64,
 }
 
 impl CommitLengthReq {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(16);
         buf.put_u64_le(self.extent_id);
-        buf.put_i64_le(self.revision);
+        buf.put_i64_le(self.owner_epoch);
         buf.freeze()
     }
 
@@ -328,7 +328,7 @@ impl CommitLengthReq {
         }
         Ok(Self {
             extent_id: data.get_u64_le(),
-            revision: data.get_i64_le(),
+            owner_epoch: data.get_i64_le(),
         })
     }
 }
@@ -496,7 +496,7 @@ pub const CODE_OK: u8 = 0;
 pub const CODE_NOT_FOUND: u8 = 1;
 pub const CODE_PRECONDITION: u8 = 3;
 pub const CODE_ERROR: u8 = 4;
-/// Returned when `header.revision < owner_revision` — a newer owner has taken the lock.
+/// Returned when `header.owner_epoch < owner_epoch` — a newer owner has taken the lock.
 pub const CODE_LOCKED_BY_OTHER: u8 = 5;
 /// Returned by ReadBytes when the client's `eversion` is older than the
 /// server's local view (e.g. the extent has been EC-converted under a
@@ -664,12 +664,12 @@ pub struct ConvertToEcReq {
     /// k+m target node addresses (data shard nodes first, then parity).
     pub target_addrs: Vec<String>,
     pub eversion: u64,
-    /// F211-D Tier 2: owner-lock revision propagated from manager.
-    /// Coord puts this into every `WriteShardReq.revision` and
-    /// `CommitEcShardReq.revision` so a fenced ex-coord whose in-flight
+    /// F211-D Tier 2: owner-lock owner_epoch propagated from manager.
+    /// Coord puts this into every `WriteShardReq.owner_epoch` and
+    /// `CommitEcShardReq.owner_epoch` so a fenced ex-coord whose in-flight
     /// 2PC continues against bumped revisions on remote ENs is
     /// rejected with `CODE_LOCKED_BY_OTHER`. `0` = legacy no-fence.
-    pub revision: i64,
+    pub owner_epoch: i64,
 }
 
 // ── CopyExtent (binary — large payload) ─────────────────────────────────────
@@ -741,17 +741,17 @@ impl CopyExtentResp {
 
 // ── WriteShard (binary — large payload) ─────────────────────────────────────
 
-/// WriteShardRequest: [extent_id: u64 LE][shard_index: u32 LE][sealed_length: u64 LE][eversion: u64 LE][revision: i64 LE][payload...]
+/// WriteShardRequest: [extent_id: u64 LE][shard_index: u32 LE][sealed_length: u64 LE][eversion: u64 LE][owner_epoch: i64 LE][payload...]
 ///
 /// `eversion` is the post-EC eversion the manager has decided on. The
 /// receiving extent node bumps `entry.eversion` to this value when it
 /// installs the shard, so subsequent ReadBytes requests with a stale
 /// (pre-EC) eversion are rejected with `CODE_EVERSION_MISMATCH`.
 ///
-/// `revision` (F211-D) carries the owner-lock revision the caller
-/// claims. When `revision > 0` the extent-node refuses with
-/// `CODE_LOCKED_BY_OTHER` if `revision < entry.owner_revision` — same
-/// fence model as the append path. `revision = 0` means "no fence
+/// `owner_epoch` (F211-D) carries the owner-lock owner_epoch the caller
+/// claims. When `owner_epoch > 0` the extent-node refuses with
+/// `CODE_LOCKED_BY_OTHER` if `owner_epoch < entry.owner_epoch` — same
+/// fence model as the append path. `owner_epoch = 0` means "no fence
 /// requested" (pre-F211-D wire-compat).
 pub const WRITE_SHARD_HEADER_LEN: usize = 36;
 
@@ -760,7 +760,7 @@ pub struct WriteShardReq {
     pub shard_index: u32,
     pub sealed_length: u64,
     pub eversion: u64,
-    pub revision: i64,
+    pub owner_epoch: i64,
     pub payload: Bytes,
 }
 
@@ -771,7 +771,7 @@ impl WriteShardReq {
         buf.put_u32_le(self.shard_index);
         buf.put_u64_le(self.sealed_length);
         buf.put_u64_le(self.eversion);
-        buf.put_i64_le(self.revision);
+        buf.put_i64_le(self.owner_epoch);
         buf.extend_from_slice(&self.payload);
         buf.freeze()
     }
@@ -784,14 +784,14 @@ impl WriteShardReq {
         let shard_index = data.get_u32_le();
         let sealed_length = data.get_u64_le();
         let eversion = data.get_u64_le();
-        let revision = data.get_i64_le();
+        let owner_epoch = data.get_i64_le();
         let payload = data;
         Ok(Self {
             extent_id,
             shard_index,
             sealed_length,
             eversion,
-            revision,
+            owner_epoch,
             payload,
         })
     }
@@ -817,16 +817,16 @@ impl WriteShardResp {
 
 // ── CommitEcShard (binary — phase-2 of 2PC EC conversion) ────────────────────
 
-/// CommitEcShardRequest: [extent_id: u64 LE][sealed_length: u64 LE][eversion: u64 LE][revision: i64 LE]
+/// CommitEcShardRequest: [extent_id: u64 LE][sealed_length: u64 LE][eversion: u64 LE][owner_epoch: i64 LE]
 ///
-/// F211-D: `revision` fence — see `WriteShardReq` for semantics.
+/// F211-D: `owner_epoch` fence — see `WriteShardReq` for semantics.
 pub const COMMIT_EC_SHARD_HEADER_LEN: usize = 32;
 
 pub struct CommitEcShardReq {
     pub extent_id: u64,
     pub sealed_length: u64,
     pub eversion: u64,
-    pub revision: i64,
+    pub owner_epoch: i64,
 }
 
 impl CommitEcShardReq {
@@ -835,7 +835,7 @@ impl CommitEcShardReq {
         buf.put_u64_le(self.extent_id);
         buf.put_u64_le(self.sealed_length);
         buf.put_u64_le(self.eversion);
-        buf.put_i64_le(self.revision);
+        buf.put_i64_le(self.owner_epoch);
         buf.freeze()
     }
 
@@ -846,12 +846,12 @@ impl CommitEcShardReq {
         let extent_id = data.get_u64_le();
         let sealed_length = data.get_u64_le();
         let eversion = data.get_u64_le();
-        let revision = data.get_i64_le();
+        let owner_epoch = data.get_i64_le();
         Ok(Self {
             extent_id,
             sealed_length,
             eversion,
-            revision,
+            owner_epoch,
         })
     }
 }
@@ -961,7 +961,7 @@ mod f260_chain_codec_tests {
             extent_id: 7,
             eversion: 3,
             commit: 4096,
-            revision: 9,
+            owner_epoch: 9,
             payload: Bytes::from_static(b"hello-world"),
         };
         let mut full = BytesMut::new();
@@ -981,7 +981,7 @@ mod f260_chain_codec_tests {
             extent_id: 1,
             eversion: 1,
             commit: 0,
-            revision: 1,
+            owner_epoch: 1,
             payload: Bytes::from_static(b"x"),
         };
         let mut full = BytesMut::new();

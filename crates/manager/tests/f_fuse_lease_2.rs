@@ -141,7 +141,7 @@ fn per_ino_writer_close_triggers_invalidator() {
             FuseLease {
                 mode: LEASE_MODE_READ,
                 refcount: 1,
-                version: info.version,
+                lease_epoch: info.version,
                 revoked: false,
             },
         );
@@ -229,7 +229,7 @@ fn multiple_distinct_inos_each_get_invalidated() {
                 FuseLease {
                     mode: LEASE_MODE_READ,
                     refcount: 1,
-                    version: info.version,
+                    lease_epoch: info.version,
                     revoked: false,
                 },
             );

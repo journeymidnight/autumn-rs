@@ -246,7 +246,7 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
 
 2. **`compute_duplicate_stream` increments extent `refs`** — this is only the direct stream-membership refcount for CoW. If shared SSTs can retain old log extents via `ValuePointer`, update `partition_vp_refs` / `vp_table_refs` too. Physical extent deletion requires BOTH counters to reach zero.
 
-3. **Owner revision must be validated before any stream mutation** — call `ensure_owner_revision` at the start of `stream_alloc_extent`, `stream_punch_holes`, `truncate`, `multi_modify_split`. Missing this allows split-brain.
+3. **Owner revision must be validated before any stream mutation** — call `ensure_owner_epoch` at the start of `stream_alloc_extent`, `stream_punch_holes`, `truncate`, `multi_modify_split`. Missing this allows split-brain.
 
 4. **Leader check** — some RPCs should only execute when `self.leader.load()` is true. Writes to etcd from a non-leader will fail (etcd lease is expired), which will surface as an error.
 
@@ -495,7 +495,7 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     Five call paths route through this:
       1. all 9 `mirror_*` helpers (lib.rs ~1218–1431);
       2. `persist_extent` (lib.rs ~1217);
-      3. `acquire_owner_revision` (lib.rs ~665) — extra_cmp is
+      3. `acquire_owner_epoch` (lib.rs ~665) — extra_cmp is
          create_revision==0 for the owner-lock CAS;
       4. `dispatch_recovery_task` (recovery.rs ~107) — extra_cmp is
          create_revision==0 for the recoveryTasks/$id CAS;

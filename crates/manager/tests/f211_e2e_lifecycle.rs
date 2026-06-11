@@ -286,7 +286,7 @@ fn f211_e2e_fence_triggers_recovery_dispatch() {
                 rkyv_encode(&StreamAllocExtentReq {
                     stream_id,
                     owner_key: sc.owner_key().to_string(),
-                    revision: sc.revision(),
+                    owner_epoch: sc.owner_epoch(),
                     seal_commit: Some(result.end),
                     exclude_node_ids: vec![],
                 }),

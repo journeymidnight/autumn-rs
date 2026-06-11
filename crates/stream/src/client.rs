@@ -600,7 +600,7 @@ enum StreamSubmitMsg {
     /// dropped.
     Append {
         payload_parts: Vec<Bytes>,
-        revision: i64,
+        owner_epoch: i64,
         ack_tx: oneshot::Sender<Result<AppendResult>>,
     },
     /// Replace the cached tail (used after alloc_new_extent, on a fresh
@@ -808,7 +808,7 @@ async fn stream_worker_loop(
                 }
                 Some(StreamSubmitMsg::Append {
                     payload_parts,
-                    revision,
+                    owner_epoch,
                     ack_tx,
                 }) => {
                     launch_append(
@@ -816,7 +816,7 @@ async fn stream_worker_loop(
                         &pool,
                         &mut inflight,
                         payload_parts,
-                        revision,
+                        owner_epoch,
                         ack_tx,
                         append_timeout,
                     )
@@ -886,7 +886,7 @@ async fn stream_worker_loop(
                 }
                 Some(StreamSubmitMsg::Append {
                     payload_parts,
-                    revision,
+                    owner_epoch,
                     ack_tx,
                 }) => {
                     launch_append(
@@ -894,7 +894,7 @@ async fn stream_worker_loop(
                         &pool,
                         &mut inflight,
                         payload_parts,
-                        revision,
+                        owner_epoch,
                         ack_tx,
                         append_timeout,
                     )
@@ -1061,7 +1061,7 @@ async fn launch_append(
     pool: &Rc<ConnPool>,
     inflight: &mut FuturesUnordered<InflightFut>,
     payload_parts: Vec<Bytes>,
-    revision: i64,
+    owner_epoch: i64,
     ack_tx: oneshot::Sender<Result<AppendResult>>,
     // F195: F121 per-replica deadline. Passed by the worker loop from
     // its `config.append_fanout_timeout` snapshot.
@@ -1103,7 +1103,7 @@ async fn launch_append(
     // F190: node_ids parallel to replica_addrs, captured here so the
     // future moves a Vec<u64> rather than borrowing tail across await.
     let replica_node_ids: Vec<u64> = tail.replica_node_ids.clone();
-    let hdr = AppendReq::encode_header(extent_id, tail.extent.eversion, header_commit, revision);
+    let hdr = AppendReq::encode_header(extent_id, tail.extent.eversion, header_commit, owner_epoch);
 
     // F260 — chained replication for large appends: ONE wire copy to
     // replica[0], which forwards down the chain (extent_node.rs
@@ -1250,7 +1250,7 @@ pub struct StreamClient {
     /// Current manager index (round-robin on NotLeader).
     current_mgr: Cell<usize>,
     owner_key: String,
-    revision: i64,
+    owner_epoch: i64,
     max_extent_size: u32,
     /// Shared connection pool — one RpcClient per remote address, with
     /// heartbeat health checks for extent nodes.
@@ -1289,7 +1289,7 @@ pub struct StreamClient {
     failure_report_tx: mpsc::Sender<FailureReport>,
     /// F192: identifier the manager dedups by inside its quorum
     /// debounce window. Each `PartitionData` sets this to its own
-    /// `part_id` after `StreamClient::new_with_revision`. Default 0
+    /// `part_id` after `StreamClient::new_with_owner_epoch`. Default 0
     /// means "no reporter id configured" — drainer skips sending to
     /// avoid polluting the manager's quorum count with a sentinel.
     reporter_part_id: Cell<u64>,
@@ -1388,7 +1388,7 @@ impl StreamClient {
         });
         let mut last_err = None;
         let mut connected_idx = 0usize;
-        let mut revision = 0i64;
+        let mut owner_epoch = 0i64;
         let mut ok = false;
         for (idx, addr) in mgr_addrs.iter().enumerate() {
             // 10 s — owner-lock acquisition is one etcd CAS on the
@@ -1409,7 +1409,7 @@ impl StreamClient {
                         manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
                     if resp.code == CODE_OK {
                         connected_idx = idx;
-                        revision = resp.revision;
+                        owner_epoch = resp.owner_epoch;
                         ok = true;
                         break;
                     } else if resp.code == CODE_NOT_LEADER {
@@ -1432,27 +1432,27 @@ impl StreamClient {
             mgr_addrs,
             connected_idx,
             owner_key,
-            revision,
+            owner_epoch,
             max_extent_size,
             pool,
             config,
         ))
     }
 
-    /// Create a StreamClient that reuses an existing owner-lock revision
+    /// Create a StreamClient that reuses an existing owner-lock owner_epoch
     /// without calling `acquire_owner_lock` again. Accepts comma-separated
     /// manager endpoints. Uses `StreamClientConfig::default()`.
-    pub async fn new_with_revision(
+    pub async fn new_with_owner_epoch(
         manager_endpoint: &str,
         owner_key: String,
-        revision: i64,
+        owner_epoch: i64,
         max_extent_size: u32,
         pool: Rc<ConnPool>,
     ) -> Result<Rc<Self>> {
-        Self::new_with_revision_and_config(
+        Self::new_with_owner_epoch_and_config(
             manager_endpoint,
             owner_key,
-            revision,
+            owner_epoch,
             max_extent_size,
             pool,
             StreamClientConfig::default(),
@@ -1460,11 +1460,11 @@ impl StreamClient {
         .await
     }
 
-    /// F195: as `new_with_revision` but with explicit tunables.
-    pub async fn new_with_revision_and_config(
+    /// F195: as `new_with_owner_epoch` but with explicit tunables.
+    pub async fn new_with_owner_epoch_and_config(
         manager_endpoint: &str,
         owner_key: String,
-        revision: i64,
+        owner_epoch: i64,
         max_extent_size: u32,
         pool: Rc<ConnPool>,
         config: StreamClientConfig,
@@ -1477,7 +1477,7 @@ impl StreamClient {
             mgr_addrs,
             0,
             owner_key,
-            revision,
+            owner_epoch,
             max_extent_size,
             pool,
             config,
@@ -1493,7 +1493,7 @@ impl StreamClient {
         manager_addrs: Vec<String>,
         current_mgr: usize,
         owner_key: String,
-        revision: i64,
+        owner_epoch: i64,
         max_extent_size: u32,
         pool: Rc<ConnPool>,
         config: StreamClientConfig,
@@ -1508,7 +1508,7 @@ impl StreamClient {
             manager_addrs,
             current_mgr: Cell::new(current_mgr),
             owner_key,
-            revision,
+            owner_epoch,
             max_extent_size,
             pool,
             nodes_cache: DashMap::new(),
@@ -1530,7 +1530,7 @@ impl StreamClient {
 
     /// F192: set the partition id that the manager-side quorum debounce
     /// dedups by. Each `PartitionData` calls this once after
-    /// `new_with_revision`. Leaving it at 0 disables the F192 send path
+    /// `new_with_owner_epoch`. Leaving it at 0 disables the F192 send path
     /// (the drainer skips events with reporter=0) — safe for tests and
     /// for the rare server-level `StreamClient` that doesn't belong to
     /// a partition.
@@ -1538,8 +1538,8 @@ impl StreamClient {
         self.reporter_part_id.set(part_id);
     }
 
-    pub fn revision(&self) -> i64 {
-        self.revision
+    pub fn owner_epoch(&self) -> i64 {
+        self.owner_epoch
     }
     pub fn owner_key(&self) -> &str {
         &self.owner_key
@@ -1764,7 +1764,7 @@ impl StreamClient {
         let req = manager_rpc::rkyv_encode(&CheckCommitLengthReq {
             stream_id,
             owner_key: self.owner_key.clone(),
-            revision: self.revision,
+            owner_epoch: self.owner_epoch,
         });
         // 15 s — manager fans out commit_length probes to every
         // replica of the tail extent before responding; each replica
@@ -1818,7 +1818,7 @@ impl StreamClient {
         let req = manager_rpc::rkyv_encode(&StreamAllocExtentReq {
             stream_id,
             owner_key: self.owner_key.clone(),
-            revision: self.revision,
+            owner_epoch: self.owner_epoch,
             seal_commit,
             exclude_node_ids,
         });
@@ -1938,7 +1938,7 @@ impl StreamClient {
             let (ack_tx, ack_rx) = oneshot::channel();
             let msg = StreamSubmitMsg::Append {
                 payload_parts: segments.clone(),
-                revision: self.revision,
+                owner_epoch: self.owner_epoch,
                 ack_tx,
             };
 
@@ -2259,11 +2259,11 @@ impl StreamClient {
         let mut min_len: Option<u32> = None;
         let mut success: usize = 0;
         let total = tail.replica_addrs.len();
-        let revision = self.revision;
+        let owner_epoch = self.owner_epoch;
         for addr in &tail.replica_addrs {
             let req = CommitLengthReq {
                 extent_id: tail.extent.extent_id,
-                revision,
+                owner_epoch,
             };
             // 5 s — commit_length is a tiny in-memory probe on EN.
             // Per-replica timeout: a paged-out replica counts as a
@@ -2475,7 +2475,7 @@ impl StreamClient {
         let req = manager_rpc::rkyv_encode(&PunchHolesReq {
             stream_id,
             owner_key: self.owner_key.clone(),
-            revision: self.revision,
+            owner_epoch: self.owner_epoch,
             extent_ids,
         });
         // 30 s — manager updates extent refs + may schedule
@@ -2503,7 +2503,7 @@ impl StreamClient {
         let req = manager_rpc::rkyv_encode(&TruncateReq {
             stream_id,
             owner_key: self.owner_key.clone(),
-            revision: self.revision,
+            owner_epoch: self.owner_epoch,
             extent_id,
         });
         // 30 s — same shape as punch_holes; ref updates + etcd mirror.
@@ -3055,17 +3055,17 @@ impl StreamClient {
     ///
     /// **Fence-free**: uses `MSG_PROBE_EXTENT` rather than
     /// `MSG_COMMIT_LENGTH`. Pre-fix this called `MSG_COMMIT_LENGTH`
-    /// with the StreamClient's owner revision, which causes the EN to
-    /// run fence handover (bumps `owner_revision` if our revision is
+    /// with the StreamClient's owner owner_epoch, which causes the EN to
+    /// run fence handover (bumps `owner_epoch` if our owner_epoch is
     /// higher). Two harmful side-effects in production:
     ///   1. A reader StreamClient created with a NEW owner_key
-    ///      (higher revision) silently fences the original writer's
+    ///      (higher owner_epoch) silently fences the original writer's
     ///      next append → CODE_LOCKED_BY_OTHER. Reproducible via the
     ///      f029 integration test: PS appends meta_stream 3× with
-    ///      revision=1; test creates external StreamClient
-    ///      (revision=2) for read-only `read_last_extent_data`; that
+    ///      owner_epoch=1; test creates external StreamClient
+    ///      (owner_epoch=2) for read-only `read_last_extent_data`; that
     ///      call falls through to this helper which bumps EN's
-    ///      owner_revision to 2; PS's 4th append (compact's checkpoint)
+    ///      owner_epoch to 2; PS's 4th append (compact's checkpoint)
     ///      fails with LockedByOther.
     ///   2. The same shape can hit production whenever an external
     ///      reader (e.g. autumn-stream-cli read, or any consumer that
@@ -3663,7 +3663,7 @@ impl StreamClient {
         let req = manager_rpc::rkyv_encode(&MultiModifySplitReq {
             part_id,
             owner_key: self.owner_key.clone(),
-            revision: self.revision,
+            owner_epoch: self.owner_epoch,
             mid_key,
             log_stream_sealed_length: sealed_lengths[0] as u32,
             row_stream_sealed_length: sealed_lengths[1] as u32,
@@ -3941,7 +3941,7 @@ mod f190_wire_compat_tests {
         let req = StreamAllocExtentReq {
             stream_id: 42,
             owner_key: "ps/0/partition/3".to_string(),
-            revision: 7,
+            owner_epoch: 7,
             seal_commit: None,
             exclude_node_ids: Vec::new(),
         };
@@ -3949,7 +3949,7 @@ mod f190_wire_compat_tests {
         let back: StreamAllocExtentReq = rkyv_decode(&bytes).expect("decode");
         assert_eq!(back.stream_id, 42);
         assert_eq!(back.owner_key, "ps/0/partition/3");
-        assert_eq!(back.revision, 7);
+        assert_eq!(back.owner_epoch, 7);
         assert_eq!(back.seal_commit, None);
         assert!(back.exclude_node_ids.is_empty());
     }
@@ -3959,7 +3959,7 @@ mod f190_wire_compat_tests {
         let req = StreamAllocExtentReq {
             stream_id: 1,
             owner_key: String::new(),
-            revision: 0,
+            owner_epoch: 0,
             seal_commit: Some(1024),
             exclude_node_ids: vec![3, 5, 9101],
         };

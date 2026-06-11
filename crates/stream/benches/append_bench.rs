@@ -64,7 +64,7 @@ fn main() {
                 extent_id,
                 eversion: 1,
                 commit: i * payload.len() as u32,
-                revision: 1,
+                owner_epoch: 1,
                 payload: payload.clone(),
             };
             client.call(MSG_APPEND, req.encode()).await.unwrap();
@@ -79,7 +79,7 @@ fn main() {
                 extent_id,
                 eversion: 1,
                 commit,
-                revision: 1,
+                owner_epoch: 1,
                 payload: payload.clone(),
             };
             client.call(MSG_APPEND, req.encode()).await.unwrap();

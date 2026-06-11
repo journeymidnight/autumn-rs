@@ -31,7 +31,7 @@ Each extent file pair:
 | 8–15 | `extent_id` (le u64) |
 | 16–23 | `sealed_length` (le u64) |
 | 24–31 | `eversion` (le u64) |
-| 32–39 | `owner_revision` (le i64) |
+| 32–39 | `owner_epoch` (le i64) |
 | 40–43 | **F157**: CRC32C of bytes 0–39 (V1 only; V0 lacks this trailer) |
 
 `ExtentEntry` stores `disk_id` for path resolution. `choose_disk()` returns the first online disk (matches Go's strategy). `df()` returns real `statvfs` stats per disk.
@@ -59,7 +59,7 @@ struct ExtentEntry {
     eversion: AtomicU64,           // bumped on seal or eversion change
     sealed_length: AtomicU64,      // 0 = active; >0 = sealed at this length
     avali: AtomicU32,              // availability flag (non-zero = sealed)
-    owner_revision: AtomicI64,      // most recent owner revision seen
+    owner_epoch: AtomicI64,      // most recent owner revision seen
     disk_id: u64,                  // immutable after creation
 }
 ```
@@ -200,8 +200,8 @@ Append(AppendReq via autumn-rpc binary frame):
        - If client eversion < local: reject (PRECONDITION_FAILED)
   3. Sealed check: reject if sealed_length > 0 or avali > 0
   4. Revision fencing:
-       - If header.revision < owner_revision: reject (CODE_LOCKED_BY_OTHER — stale owner)
-       - If header.revision > owner_revision: update owner_revision, persist meta
+       - If header.revision < owner_epoch: reject (CODE_LOCKED_BY_OTHER — stale owner)
+       - If header.revision > owner_epoch: update owner_epoch, persist meta
   5. Commit reconciliation:
        - If local file len < header.commit: reject (data loss on our side)
        - If local file len > header.commit:
@@ -552,7 +552,7 @@ StreamClient::connect(manager_endpoint, owner_key, max_extent_size, pool)
 - All subsequent manager RPCs use `self.manager_addr()` which returns the current leader.
 - On any manager RPC failure, `rotate_manager()` switches to the next address (round-robin).
 - `owner_key` should be unique per logical writer (e.g., `"ps/{ps_id}/partition/{part_id}"`).
-- **Return type change (4.3)**: `connect` / `new_with_revision` now return `Rc<StreamClient>`.
+- **Return type change (4.3)**: `connect` / `new_with_owner_epoch` now return `Rc<StreamClient>`.
   The `Rc` is needed so the internal per-stream worker tasks can hold a
   `Weak<StreamClient>` for the exit-removal guard without creating an Rc cycle
   that would prevent shutdown. Public API methods still take `&self`, so
@@ -1086,22 +1086,22 @@ sufficient (and cheaper than DashMap).
     Cross-ref: notes 20 (SealCommit handshake — `commit` is the seal source),
     21 (`sealed` state), 9 (commit tracking is local).
 
-23. **`owner_revision` fence is made DURABLE before any append is ACKed under it
-    (P0-B).** `owner_revision` (EN `.meta` bytes 32–40) is the per-extent write
-    fence: an append with `revision < owner_revision` is rejected
+23. **`owner_epoch` fence is made DURABLE before any append is ACKed under it
+    (P0-B).** `owner_epoch` (EN `.meta` bytes 32–40) is the per-extent write
+    fence: an append with `revision < owner_epoch` is rejected
     (`CODE_LOCKED_BY_OTHER`). It is RAISED ONLY by the APPEND path (commit_length
     is check-only — bug#3 Layer C), monotonically, to the request's revision; the
-    value originates from the manager owner-lock (`acquire_owner_revision`). It is
+    value originates from the manager owner-lock (`acquire_owner_epoch`). It is
     NOT `eversion` (bytes 24–32, the seal/EC metadata version) — the two are
     independent and checked separately.
-    Pre-P0-B the EN bumped `owner_revision` in memory, wrote data, then did a
+    Pre-P0-B the EN bumped `owner_epoch` in memory, wrote data, then did a
     best-effort `save_meta` AFTER the write and ACKed even on persist failure
     ("safe form"). A crash (or swallowed failure) in that window left the fence
     non-durable → on restart `.meta` held the old/0 revision → a stale lower
     owner re-passed the fence → split-brain / acked-data overwrite. The fix has
     two coupled pieces, on BOTH append paths (`build_append_future` +
     `handle_append`):
-    - **In-memory bar raised SYNCHRONOUSLY** (`owner_revision.fetch_max(R)`,
+    - **In-memory bar raised SYNCHRONOUSLY** (`owner_epoch.fetch_max(R)`,
       before any await) so a stale lower owner is rejected immediately, even
       while the new fence is still being persisted. `fetch_max` (not `store`)
       keeps it monotonic under two concurrent higher-revision appends.
@@ -1114,7 +1114,7 @@ sufficient (and cheaper than DashMap).
       non-durable fence. Fast path = one atomic load (steady state); the
       lock+persist only fires on a revision change (rare).
     - After the (possibly awaiting) durable step, **re-check** both
-      `owner_revision` (a higher owner may have taken over → LockedByOther) AND
+      `owner_epoch` (a higher owner may have taken over → LockedByOther) AND
       `sealed/sealed_length/avali` (a concurrent seal/EC may have sealed the
       extent during the await → CODE_PRECONDITION; mirrors F147-B).
     `.meta` durability hardening (load-bearing for the above): ALL `.meta`
@@ -1125,7 +1125,7 @@ sufficient (and cheaper than DashMap).
     and writes ATOMICALLY: temp `.meta.tmp` → fsync → `rename` → **fsync parent
     dir** (the rename's directory-entry update must be durable, else the ACKed
     fence can regress on a host crash). **Invariants: (1) never ACK an append
-    whose `owner_revision` fence isn't durable; (2) raise the in-memory bar
+    whose `owner_epoch` fence isn't durable; (2) raise the in-memory bar
     synchronously, persist before publishing `durable`; (3) every `.meta` write
     holds `meta_write_lock` and reads live atomics.** Cross-ref: notes 21
     (`sealed`), 20 (SealCommit), bug#3 Layer C (commit_length check-only).

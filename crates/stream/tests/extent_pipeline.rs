@@ -105,8 +105,8 @@ async fn appends_to_different_extents_run_concurrently() {
 
 #[compio::test]
 async fn seal_rejects_subsequent_appends() {
-    // Revision fencing (ACL that runs on every append batch future): once
-    // owner_revision is bumped, late-arriving lower-revision appends must be
+    // OwnerEpoch fencing (ACL that runs on every append batch future): once
+    // owner_epoch is bumped, late-arriving lower-owner_epoch appends must be
     // rejected. Proves the per-submit ACL path is still firing.
     let node_dir = tempfile::tempdir().expect("node tempdir");
     let addr = pick_addr();
@@ -116,19 +116,19 @@ async fn seal_rejects_subsequent_appends() {
     let alloc = conn.alloc_extent(2020).await;
     assert_eq!(alloc.code, CODE_OK);
 
-    // High-revision write: sets owner_revision=100.
+    // High-owner_epoch write: sets owner_epoch=100.
     let r1 = conn.append(2020, 1, 0, 100, b"first".to_vec()).await;
     assert_eq!(r1.code, CODE_OK);
 
-    // Late-arriving low-revision: must be rejected with LOCKED_BY_OTHER.
+    // Late-arriving low-owner_epoch: must be rejected with LOCKED_BY_OTHER.
     let r2 = conn.append(2020, 1, 5, 50, b"late".to_vec()).await;
     assert_eq!(
         r2.code,
         autumn_stream::extent_rpc::CODE_LOCKED_BY_OTHER,
-        "late revision must be rejected by ACL"
+        "late owner_epoch must be rejected by ACL"
     );
 
-    // Subsequent high-revision still works, proving the connection is live.
+    // Subsequent high-owner_epoch still works, proving the connection is live.
     let r3 = conn.append(2020, 1, 5, 150, b"ok".to_vec()).await;
     assert_eq!(r3.code, CODE_OK);
     assert_eq!(r3.offset, 5);

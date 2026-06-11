@@ -63,7 +63,7 @@ fn seal_during_active_writes_client_retries() {
                 rkyv_encode(&StreamAllocExtentReq {
                     stream_id,
                     owner_key: "test-seal-writer".to_string(),
-                    revision: sc.revision(),
+                    owner_epoch: sc.owner_epoch(),
                     seal_commit: None,
                     exclude_node_ids: vec![],
                 }),

@@ -1,6 +1,6 @@
 Date: 2026-06-11
 TaskStatus: completed
-Task scope: BUG-LEASE-2 Phase 2 — fence-floor persistence (WAL +
+Task scope: BUG-LEASE-2 Phase 2 + F263 fencing naming convergence — fence-floor persistence (WAL +
   checkpoint), MSG_PUT_ZC fencing, fuse/ioring lease-epoch stamping.
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===

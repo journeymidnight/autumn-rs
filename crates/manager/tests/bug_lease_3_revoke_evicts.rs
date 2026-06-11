@@ -89,7 +89,7 @@ fn force_revoke_event_is_lease_revoked_kind_and_evict_fn_clears_held_lease() {
             FuseLease {
                 mode: LEASE_MODE_WRITE,
                 refcount: 1,
-                version: info.version,
+                lease_epoch: info.version,
                 revoked: false,
             },
         );

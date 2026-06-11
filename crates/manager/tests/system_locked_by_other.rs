@@ -1,7 +1,7 @@
-//! F063: System test — owner lock revision fencing (LockedByOther).
+//! F063: System test — owner lock owner_epoch fencing (LockedByOther).
 //!
 //! Two StreamClients acquire owner locks with different keys on the same stream.
-//! The second client's higher revision fences out the first client's writes.
+//! The second client's higher owner_epoch fences out the first client's writes.
 
 mod support;
 
@@ -50,7 +50,7 @@ fn owner_lock_fencing_rejects_stale_revision() {
         }
 
         // Client 2 acquires owner lock with a DIFFERENT key "owner-B"
-        // This gets a higher revision, which will fence out sc1.
+        // This gets a higher owner_epoch, which will fence out sc1.
         let sc2 = StreamClient::connect(
             &mgr_addr.to_string(),
             "owner-B".to_string(),
@@ -60,13 +60,13 @@ fn owner_lock_fencing_rejects_stale_revision() {
         .await
         .expect("connect sc2");
 
-        // sc2 writes — this updates owner_revision on the extent node
+        // sc2 writes — this updates owner_epoch on the extent node
         sc2.append(stream_id, b"sc2-data-0")
             .await
             .expect("sc2 append should succeed");
 
         // sc1's next write should fail with LockedByOther because
-        // the extent node's owner_revision was updated by sc2
+        // the extent node's owner_epoch was updated by sc2
         let result = sc1.append(stream_id, b"stale-write").await;
         assert!(
             result.is_err(),

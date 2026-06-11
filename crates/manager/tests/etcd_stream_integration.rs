@@ -147,7 +147,7 @@ fn stream_manager_with_real_etcd() {
                 rkyv_encode(&StreamAllocExtentReq {
                     stream_id,
                     owner_key: "owner/etcd/stream/1".to_string(),
-                    revision: lock.revision,
+                    owner_epoch: lock.owner_epoch,
                     seal_commit: Some(64),
                     exclude_node_ids: vec![],
                 }),
@@ -207,7 +207,7 @@ fn etcd_replay_owner_lock_allows_check_commit_length_without_reacquire() {
             .expect("acquire owner lock");
         let lock: AcquireOwnerLockResp = rkyv_decode(&resp).expect("decode");
         assert_eq!(lock.code, CODE_OK, "{}", lock.message);
-        let owner_revision = lock.revision;
+        let owner_epoch = lock.owner_epoch;
 
         let resp = mgr1
             .call(
@@ -215,7 +215,7 @@ fn etcd_replay_owner_lock_allows_check_commit_length_without_reacquire() {
                 rkyv_encode(&CheckCommitLengthReq {
                     stream_id,
                     owner_key: owner_key.clone(),
-                    revision: owner_revision,
+                    owner_epoch: owner_epoch,
                 }),
             )
             .await
@@ -240,7 +240,7 @@ fn etcd_replay_owner_lock_allows_check_commit_length_without_reacquire() {
                 rkyv_encode(&CheckCommitLengthReq {
                     stream_id,
                     owner_key,
-                    revision: owner_revision,
+                    owner_epoch: owner_epoch,
                 }),
             )
             .await

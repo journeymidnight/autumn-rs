@@ -335,7 +335,7 @@ pub async fn poll_invalidations(
 
 use std::collections::HashMap;
 
-/// Per-inode minimum version a cached `OpenedExtents.lease_version`
+/// Per-inode minimum version a cached `OpenedExtents.lease_epoch`
 /// must match to be considered fresh. An inode absent from the map
 /// has never been invalidated → cache is always fresh (within the
 /// lease TTL — see the heartbeat path for the orthogonal staleness
@@ -368,12 +368,12 @@ pub fn apply_invalidation(
     saw_overflow
 }
 
-/// True when the cached `(ino, lease_version)` has been overtaken by
+/// True when the cached `(ino, lease_epoch)` has been overtaken by
 /// a known invalidation. Pure-fn — the caller passes a snapshot of
 /// the session's `InvalidationMap` taken under a brief borrow.
-pub fn cache_is_stale(ino: u64, lease_version: u64, inv: &InvalidationMap) -> bool {
+pub fn cache_is_stale(ino: u64, lease_epoch: u64, inv: &InvalidationMap) -> bool {
     match inv.get(&ino) {
-        Some(min_valid) => lease_version < *min_valid,
+        Some(min_valid) => lease_epoch < *min_valid,
         None => false,
     }
 }
@@ -427,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_is_stale_when_lease_version_below_floor() {
+    fn cache_is_stale_when_lease_epoch_below_floor() {
         let mut m = InvalidationMap::new();
         m.insert(7, 5);
         assert!(cache_is_stale(7, 3, &m));

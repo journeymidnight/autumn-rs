@@ -145,7 +145,7 @@ background_flush_loop (when signaled):
 No local WAL file. logStream is the sole WAL.
 
 Each partition uses its **own `Rc<StreamClient>`** (`PartitionData.stream_client`), created via
-`StreamClient::new_with_revision` which reuses the server-level owner-lock revision without
+`StreamClient::new_with_owner_epoch` which reuses the server-level owner-lock epoch (owner_epoch) without
 calling `acquire_owner_lock` again. `StreamClient` is internally concurrent via per-stream
 locking (`DashMap<stream_id, Arc<Mutex<StreamAppendState>>>`), so no external Mutex is needed.
 The server-level `PartitionServer.stream_client` is reserved for split coordination RPCs only.
@@ -154,7 +154,7 @@ The server-level `PartitionServer.stream_client` is reserved for split coordinat
 hosts the ps-conn tasks for its partition — ps-conn ↔ partition_loop
 runs on the same compio runtime (no cross-thread wake). Each partition
 additionally owns a **P-bulk** thread
-running its own compio runtime + ConnPool + StreamClient (also via `new_with_revision` to
+running its own compio runtime + ConnPool + StreamClient (also via `new_with_owner_epoch` to
 inherit owner-lock fencing). `background_flush_loop` on P-log ships `FlushReq` over a
 bounded-1 channel to P-bulk, which runs the 128 MB `row_stream.append` + meta checkpoint
 without competing for P-log's io_uring. The response carries the `TableMeta` + `SstReader`
@@ -183,14 +183,32 @@ The `0x00` byte is a **separator** between the user key and the inverted sequenc
 
 The **inverted** sequence ensures that for the same user key, newer writes (higher seq) sort **before** older writes in byte order. This is critical for correctness in the merge iterator and memtable lookup — the first encountered entry for a user key is always the newest.
 
-## Owner Lock Fencing
+## Fencing Epochs (three layers, unified `*_epoch` naming — 2026-06-11)
 
-The stream layer uses **revision-based fencing** to prevent split-brain:
+Three independent monotonic fencing tokens, one per layer. Each is
+"grantor hands out a monotonic number; the checker rejects anything
+lower" (Chubby/HDFS-genstamp/Kafka-leader-epoch pattern):
 
-1. A `StreamClient` calls `acquire_owner_lock(owner_key)` on the manager, receiving a monotonic `revision`.
-2. Every append and `commit_length` call passes this revision.
-3. `ExtentNode` rejects operations where `header.revision < owner_revision`.
-4. If a new owner takes over (higher revision), old owners' writes are refused.
+| token | grantor → checker | fences | reject code |
+|---|---|---|---|
+| `owner_epoch` (stream) | manager owner-lock → ExtentNode | which PS owns this stream (PS split-brain) | `CODE_LOCKED_BY_OTHER` |
+| `region_epoch` (routing) | manager region rewrite → PS | client routing-cache freshness across split/merge | `FailedPrecondition` |
+| `lease_epoch` (application) | manager inode lease → PS fence floor | which mount/daemon owns this inode (BUG-LEASE-2) | `CODE_FENCED` |
+
+Stream-layer flow (formerly named "owner revision"; renamed
+`owner_epoch` everywhere in code — etcd's own `mod_revision` /
+`create_revision` keep their etcd names):
+
+1. A `StreamClient` calls `acquire_owner_lock(owner_key)` on the manager, receiving a monotonic `owner_epoch`.
+2. Every append and `commit_length` call passes this epoch.
+3. `ExtentNode` rejects operations where `header.owner_epoch < owner_epoch`.
+4. If a new owner takes over (higher epoch), old owners' writes are refused.
+
+Application-layer flow: the client-side cache/stamp field is
+`lease_epoch` uniformly (`FuseLease.lease_epoch`,
+`OpenedExtents.lease_epoch`, `WriteLease.lease_epoch`); only the
+manager's grantor-side state keeps its own `version` field
+(`MgrInodeLeaseInfo.version`).
 
 ## Commit Protocol (No Traditional WAL)
 

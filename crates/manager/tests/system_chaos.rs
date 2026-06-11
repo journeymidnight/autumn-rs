@@ -24,7 +24,7 @@
 //!     --workspace` first.
 //!   - The `etcd` binary on `$PATH` (or `AUTUMN_TEST_ETCD_BIN` set).
 //!     The manager runs in etcd-persistent mode so F149 leader fence,
-//!     F207 inflight ledger, F211-D revision bumps, and F198 rich EC
+//!     F207 inflight ledger, F211-D owner_epoch bumps, and F198 rich EC
 //!     markers all exercise the real durable code paths (memory-only
 //!     mode disables most of these).
 //!

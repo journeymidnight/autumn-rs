@@ -92,9 +92,9 @@ async fn alloc_on(addr: SocketAddr, extent_id: u64) -> AllocExtentResp {
 
 /// Fence-free length probe — uses `MSG_PROBE_EXTENT` (F210-H3 Tier 2).
 ///
-/// Pre-F210-H3 this called `MSG_COMMIT_LENGTH` with `revision: 0` as
+/// Pre-F210-H3 this called `MSG_COMMIT_LENGTH` with `owner_epoch: 0` as
 /// a "skip fence" sentinel. F210-H3 Tier 2 tightened the
-/// `MSG_COMMIT_LENGTH` wire contract: `revision <= 0` now returns
+/// `MSG_COMMIT_LENGTH` wire contract: `owner_epoch <= 0` now returns
 /// `CODE_INVALID_ARGUMENT` (the probe sentinel escape hatch was
 /// removed; see `MSG_PROBE_EXTENT` instead). The tests are pure
 /// length probes with no owner context — exactly what
@@ -368,7 +368,7 @@ fn f099m_client_routes_by_extent_id_modulo() {
                 extent_id: even_id,
                 eversion: 1,
                 commit: 0,
-                revision: 1,
+                owner_epoch: 1,
                 payload: Bytes::from_static(b"hello-f099m-even"),
             };
             let r = pool
@@ -402,7 +402,7 @@ fn f099m_client_routes_by_extent_id_modulo() {
                 extent_id: odd_id,
                 eversion: 1,
                 commit: 0,
-                revision: 1,
+                owner_epoch: 1,
                 payload: Bytes::from_static(b"odd-f099m-world"),
             };
             let r = pool
@@ -461,7 +461,7 @@ fn f099m_recovery_per_shard() {
                 extent_id: eid,
                 eversion: 1,
                 commit: 0,
-                revision: 1,
+                owner_epoch: 1,
                 payload: Bytes::from(payload),
             };
             let r = pool

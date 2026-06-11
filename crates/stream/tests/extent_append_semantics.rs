@@ -19,7 +19,7 @@ async fn append_rejects_stale_revision() {
     let stale = conn.append(1001, 1, 3, 10, b"x".to_vec()).await;
     assert_eq!(
         stale.code, CODE_LOCKED_BY_OTHER,
-        "stale revision should be rejected"
+        "stale owner_epoch should be rejected"
     );
 }
 

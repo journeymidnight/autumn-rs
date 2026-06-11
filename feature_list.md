@@ -346,3 +346,29 @@ gaps in the lease protocol's correctness story.
   generation manifest / commit record; recovery needs to GC
   orphan extents under uncommitted generations.
 - **passes:** not_completed (deferred — design recorded)
+
+---
+
+### F263 · fencing 三层命名收敛（`*_epoch` 词族）
+- **Trigger:** 用户指示（2026-06-11）。三层 fencing token 命名各异
+  （owner_revision / region_epoch / lease_epoch + 客户端侧
+  FuseLease.version / OpenedExtents.lease_version），同概念五个名字，
+  且 stream 层 "revision" 与 etcd 自身的 mod_revision/create_revision
+  撞词。
+- **改动（纯改名，rkyv 字段改名不改 wire 字节序——positional 编码）：**
+  - `owner_revision`/裸 `revision`（owner-lock 语义）→ `owner_epoch`，
+    覆盖 stream/manager/rpc/partition-server/common + 测试 + bench：
+    `ExtentEntry.owner_epoch`、`durable_owner_epoch`、
+    `StreamClient::new_with_owner_epoch[_and_config]`、
+    `acquire_owner_epoch`/`ensure_owner_epoch`、extent 头
+    `[owner_epoch: i64 LE]`、manager_rpc 10 个 req/resp 字段。
+    etcd 术语（mod_revision/create_revision/EtcdMirror 内部）保留。
+  - `lease_version`（ioring/fuse 客户端缓存）→ `lease_epoch`（上一
+    commit 已做主体，本次补测试 fixtures）。
+  - root CLAUDE.md "Owner Lock Fencing" 重写为三层 fencing 表
+    （owner_epoch / region_epoch / lease_epoch：grantor→checker、
+    fence 对象、拒绝码）；各 crate CLAUDE.md 同步。
+    feature_list 归档文件按不可改写规则保留历史命名。
+- **验收:** 全 8 crate 549 单测绿；BUG-LEASE-2 Phase 2 e2e（全集群
+  启动含 owner-lock 流程）重跑 2/2 PASS。
+- **passes:** completed (2026-06-11)
