@@ -466,3 +466,19 @@ gaps in the lease protocol's correctness story.
   fix 生效）ucx 4152 ACK 写同样 0 丢失。autumn-common 新增
   reacquire-fences 单测；全 workspace --lib 493 单测绿。
 - **passes:** completed (2026-06-11)
+
+---
+
+### F266 · chaos 迭代 4：E6 随机化重复 kill 轮（/loop 2026-06-11）
+- **目标:** E1-E5 都是单发事件；累积态（重复 failback 下 owner_epoch
+  持续递增、part_addrs 多轮 churn、PS 端口序数增长、region_epoch 增长）
+  无覆盖。新增 E6：`CHAOS_ROUNDS`（默认 4）轮，每轮随机 victim
+  ∈{EN, holder-PS, manager}（`CHAOS_SEED` 可复现），kill→收敛→respawn
+  →种子校验，最后全 ACK 校验。
+- **验收:** seed=7（en,ps,mgr,en）tcp+ucx 双轮 E1-E6 全 PASS（1592/334
+  ACK 0 丢失；ucx E6.3 manager 重启 66s bind 重试期间无假驱逐）；
+  seed=6（ps,mgr,ps,ps,ps,ps）tcp E1-E6 全 PASS——连续 5 次 ownership
+  failback ping-pong（PS1↔PS2）+ 中途 manager 重启，2019 ACK 0 丢失，
+  每次迁移 ~20s 收敛。F265 的 owner_epoch bump-on-acquire 在重复
+  A→B→A 下成立。未发现新 bug。
+- **passes:** completed (2026-06-11)

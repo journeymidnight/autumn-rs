@@ -1,6 +1,6 @@
 Date: 2026-06-11
 TaskStatus: completed
-Task scope: F265 — /loop chaos 迭代 3：manager 控制面 chaos（E4 manager
+Task scope: F265+F266 — /loop chaos 迭代 3：manager 控制面 chaos（E4 manager
   kill+respawn、E5 PS+manager 驱逐窗口双杀），发现并修复 3 个真实 bug。
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
@@ -39,5 +39,9 @@ Current summary:
 
 Main gaps:
   - 见 Not implemented。
+F266 (迭代 4): transport_chaos.sh 新增 E6 随机化重复 kill 轮
+  (CHAOS_ROUNDS/CHAOS_SEED)。seed=7 tcp+ucx 全 PASS；seed=6 连续 5 次
+  failback ping-pong + manager 重启全 PASS (2019 ACK 0 丢失)。未发现
+  新 bug。
 Next steps:
-  - （后续迭代可选）chaos 随机多轮组合 kill；多 manager HA 场景。
+  - （后续迭代可选）多 manager HA 场景；F227 recovery-stuck 家族。

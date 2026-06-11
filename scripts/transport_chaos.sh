@@ -13,6 +13,11 @@
 #       eviction window) kill -9 the manager too → after the manager
 #       respawns, the interrupted eviction/rebalance must still converge:
 #       all partitions migrate to the survivor PS with zero data loss
+#   E6: CHAOS_ROUNDS (default 4) randomized rounds (seed CHAOS_SEED,
+#       default $$): each kills a random victim (EN / holder PS /
+#       manager), converges, respawns, verifies — stresses CUMULATIVE
+#       state (repeated owner-epoch failback, part_addrs churn, port
+#       ordinal growth) that one-shot events can't reach
 #
 # Invariants checked (exit nonzero on any violation):
 #   - every pre-seeded key (small / 8 KiB VP / 12 MiB put-stream) stays
@@ -302,6 +307,66 @@ setsid nohup "$PSBIN" --psid "$HOLDER_PSID" --port "$HOLDER_PORT" --manager "$MG
     > "$WORK/ps${HOLDER_PSID}_respawn2.log" 2>&1 < /dev/null &
 sleep 8
 verify_seeds "after-E5-ps-respawn"
+
+# ── E6: randomized repeated kill rounds ─────────────────────────────────────
+# Each round kills a random victim (EN / holder PS / manager), waits for
+# convergence, respawns, and verifies. Repeated cycles stress CUMULATIVE
+# state the one-shot events E1-E5 cannot: repeated ownership failback
+# (owner_epoch must keep bumping, F265), part_addrs churn across many
+# reopen waves, PS port-ordinal growth, region_epoch growth.
+ROUNDS="${CHAOS_ROUNDS:-4}"
+SEED="${CHAOS_SEED:-$$}"
+RANDOM=$SEED
+say "E6: $ROUNDS randomized rounds (seed=$SEED)"
+for r in $(seq 1 "$ROUNDS"); do
+    case $((RANDOM % 3)) in
+        0) victim=en ;;
+        1) victim=ps ;;
+        2) victim=mgr ;;
+    esac
+    say "E6.$r: victim=$victim"
+    case $victim in
+        en)
+            EN_PID=$(ps -eo pid,comm | awk '$2=="autumn-extent-n"{print $1}' | head -1)
+            EN_CMD=$(tr '\0' ' ' < "/proc/$EN_PID/cmdline")
+            kill -9 "$EN_PID"
+            sleep 6
+            setsid nohup $EN_CMD > "$WORK/e6_${r}_en.log" 2>&1 < /dev/null &
+            sleep 6
+            ;;
+        ps)
+            # Kill whichever PS currently holds the most partitions; its
+            # partitions must migrate to the other PS (repeated failback).
+            p1=$(parts_on 9301) || p1=0; p2=$(parts_on 9351) || p2=0
+            if [ "${p1:-0}" -ge "${p2:-0}" ]; then vid=1; vport=9301; sport=9351; else vid=2; vport=9351; sport=9301; fi
+            VPID=$(pgrep -f -- "--psid $vid .*--transport $T" | head -1)
+            say "E6.$r: kill PS$vid pid=${VPID:-?} ($p1/$p2 on 9301/9351)"
+            [ -n "$VPID" ] && kill -9 "$VPID"
+            deadline=$((SECONDS + 90))
+            while [ $SECONDS -lt $deadline ]; do
+                left=$(parts_on "$vport")
+                [ "${left:-1}" = "0" ] && break
+                sleep 2
+            done
+            left=$(parts_on "$vport")
+            [ "${left:-1}" = "0" ] || fail "E6.$r: partitions did not migrate off PS$vid"
+            setsid nohup "$PSBIN" --psid "$vid" --port "$vport" --manager "$MGR" \
+                --listen 127.0.0.1 --advertise "127.0.0.1:$vport" --transport "$T" \
+                > "$WORK/e6_${r}_ps${vid}.log" 2>&1 < /dev/null &
+            sleep 6
+            ;;
+        mgr)
+            MPID=$(pgrep -f autumn-manager-server | head -1)
+            MCMD=$(tr '\0' ' ' < "/proc/$MPID/cmdline")
+            kill -9 "$MPID"
+            sleep 4
+            setsid nohup $MCMD > "$WORK/e6_${r}_mgr.log" 2>&1 < /dev/null &
+            wait_mgr_ready "E6.$r"
+            ;;
+    esac
+    verify_seeds "E6.$r-$victim"
+done
+write_liveness "e6"
 
 # ── stop loop + verify every ACKed write ────────────────────────────────────
 touch "$WORK/stop"
