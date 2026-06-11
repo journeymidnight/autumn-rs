@@ -32,7 +32,12 @@ pub const MSG_DELETE: u8 = 0x42;
 pub const MSG_HEAD: u8 = 0x43;
 pub const MSG_RANGE: u8 = 0x44;
 pub const MSG_SPLIT_PART: u8 = 0x45;
-pub const MSG_STREAM_PUT: u8 = 0x46;
+// MSG_STREAM_PUT (0x46) REMOVED 2026-06-11: zero callers since F186 made
+// stripe-writes client-side, and its PS handler bypassed BOTH the inline
+// value cap AND the BUG-LEASE-2 fence check (an unfenced unbounded-write
+// backdoor). 0x46 stays RESERVED (F129-constants pattern) to prevent
+// accidental re-use against in-flight old binaries.
+//   pub const MSG_STREAM_PUT: u8 = 0x46;  // RESERVED, removed
 pub const MSG_MAINTENANCE: u8 = 0x47;
 pub const MSG_GET_DISCARDS: u8 = 0x48;
 
@@ -564,19 +569,8 @@ pub struct PullVpRefsResp {
     pub refs: Vec<(u64, u32)>,
 }
 
-/// StreamPut: entire value in one message (no chunked streaming).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct StreamPutReq {
-    pub part_id: u64,
-    pub key: Vec<u8>,
-    pub value: Vec<u8>,
-    /// F178 follow-up: see `PutReq.must_sync` comment for context.
-    pub expires_at: u64,
-    /// See `PutReq.region_epoch`.
-    pub region_epoch: u64,
-}
-// Response: PutResp
-
+// StreamPutReq REMOVED 2026-06-11 with MSG_STREAM_PUT (see the reserved
+// constant note near the msg_type list).
 // F129 PutBegin / PutChunk / PutCommit / PutAbort req/resp removed in
 // F186. Stripe-write is now pure client-side (Ceph striperados pattern):
 // `ClusterClient::put_stream_begin` returns a `PutStreamHandle` that
@@ -709,9 +703,6 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_SPLIT_PART => rkyv_decode::<SplitPartReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
-        MSG_STREAM_PUT => rkyv_decode::<StreamPutReq>(payload)
-            .map(|r| r.part_id)
-            .unwrap_or(0),
         MSG_MAINTENANCE => rkyv_decode::<MaintenanceReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
@@ -753,7 +744,6 @@ mod msg_type_tests {
             MSG_HEAD,
             MSG_RANGE,
             MSG_SPLIT_PART,
-            MSG_STREAM_PUT,
             MSG_MAINTENANCE,
             MSG_GET_DISCARDS,
             MSG_MERGE_PART,

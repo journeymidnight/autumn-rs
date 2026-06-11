@@ -5587,19 +5587,6 @@ async fn handle_incoming_req(
                 let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                 return;
             }
-            MSG_STREAM_PUT => {
-                let key = match partition_rpc::rkyv_decode::<StreamPutReq>(&req.payload) {
-                    Ok(r) => r.key,
-                    Err(_) => Vec::new(),
-                };
-                let resp = PutResp {
-                    code: CODE_UNAVAILABLE,
-                    message: "partition frozen for merge — refresh routing and retry".to_string(),
-                    key,
-                };
-                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
-                return;
-            }
             partition_rpc::MSG_BATCH_PUT => {
                 // Reject the whole batch with CODE_UNAVAILABLE — client
                 // refreshes routing + retries each per-op (or the whole
@@ -5670,7 +5657,6 @@ async fn handle_incoming_req(
                 Some(&p.rg),
             )
         }
-        MSG_STREAM_PUT => enqueue_stream_put(req, pending, part_region_epoch, part_id_for_err),
         partition_rpc::MSG_BATCH_PUT => {
             let p = part.borrow();
             enqueue_batch_put(
@@ -6239,43 +6225,6 @@ fn enqueue_delete(
                     user_key: del_req.key,
                 },
                 resp: WriteResponder::Delete {
-                    outer: req.resp_tx,
-                    key: key_vec,
-                },
-            });
-        }
-        Err(e) => {
-            let _ = req.resp_tx.send(Err((StatusCode::InvalidArgument, e)));
-        }
-    }
-}
-
-fn enqueue_stream_put(
-    req: PartitionRequest,
-    pending: &mut Vec<WriteRequest>,
-    part_region_epoch: u64,
-    part_id_for_err: u64,
-) {
-    match partition_rpc::rkyv_decode::<StreamPutReq>(&req.payload) {
-        Ok(sp_req) => {
-            if sp_req.region_epoch != 0 && sp_req.region_epoch != part_region_epoch {
-                let _ = req.resp_tx.send(Err((
-                    StatusCode::FailedPrecondition,
-                    format!(
-                        "region epoch stale: part_id={} have={} got={}",
-                        part_id_for_err, part_region_epoch, sp_req.region_epoch
-                    ),
-                )));
-                return;
-            }
-            let key_vec = sp_req.key.clone();
-            pending.push(WriteRequest {
-                op: WriteOp::Put {
-                    user_key: Bytes::from(sp_req.key),
-                    value: Bytes::from(sp_req.value),
-                    expires_at: sp_req.expires_at,
-                },
-                resp: WriteResponder::Put {
                     outer: req.resp_tx,
                     key: key_vec,
                 },
@@ -9172,7 +9121,7 @@ mod f120_knob_tests {
 // ---------------------------------------------------------------------------
 // F099-D — partition_loop direct-response path tests.
 //
-// These tests exercise the enqueue_put / enqueue_delete / enqueue_stream_put
+// These tests exercise the enqueue_put / enqueue_delete
 // helpers and the WriteResponder::send_ok / send_err contract. The full
 // merged loop (SQ/CQ pipeline + start/finish_write_batch) needs a live
 // StreamClient and is covered by the ps_bench / perf_check harness in

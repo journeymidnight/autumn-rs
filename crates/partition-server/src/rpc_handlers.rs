@@ -138,7 +138,7 @@ pub(crate) async fn dispatch_partition_rpc(
         // F129 server-side multipart (MSG_PUT_BEGIN/CHUNK/COMMIT/ABORT)
         // removed in F186. Stripe-write is now pure client-side via
         // ClusterClient::put_stream_begin (Ceph striperados pattern).
-        MSG_PUT | MSG_DELETE | MSG_STREAM_PUT => Err((
+        MSG_PUT | MSG_DELETE => Err((
             StatusCode::Internal,
             format!("write msg_type {msg_type} must be routed via partition_loop"),
         )),

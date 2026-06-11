@@ -2126,33 +2126,6 @@ impl ClusterClient {
         })
     }
 
-    /// Stream put (for large values, single RPC).
-    ///
-    /// F178: see `put` doc — every write is durable, no `must_sync` flag.
-    pub async fn stream_put(
-        &self,
-        key: &[u8],
-        value: &[u8],
-    ) -> std::result::Result<(), AutumnError> {
-        let key = key.to_vec();
-        let value = value.to_vec();
-        let resp_bytes = self
-            .call_ps_for_key(&key, MSG_STREAM_PUT, |part_id, region_epoch| {
-                rkyv_encode(&StreamPutReq {
-                    part_id,
-                    key: key.clone(),
-                    value: value.clone(),
-                    expires_at: 0,
-                    region_epoch,
-                })
-            })
-            .await?;
-        let resp: PutResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
-        if resp.code != partition_rpc::CODE_OK {
-            return Err(code_to_error(resp.code, resp.message));
-        }
-        Ok(())
-    }
 
     // ── F129 multipart upload ──────────────────────────────────────────────
 

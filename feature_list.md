@@ -317,6 +317,12 @@ gaps in the lease protocol's correctness story.
   requeue（旧 lease 永远不可能成功），丢弃 + WARN；close 同步 flush
   同理且不再阻塞 close。
   ⑥ P3 #6 修——e2e 重启等待循环加 60s 超时。
+- **MSG_STREAM_PUT 删除（用户指示，随本 commit）**：`ClusterClient::
+  stream_put` 全仓库零调用方（F186 客户端分条后即死代码；CLI 的
+  put-stream 走 put_stream_begin 与此无关），而 PS 侧 `enqueue_stream_put`
+  ≡ enqueue_put 减去 inline 上限检查与 fence 检查 = 绕过防护的无界写
+  后门。已删除：客户端方法、StreamPutReq、enqueue_stream_put、dispatch/
+  frozen/mis-route 三处 arm；0x46 常量按 F129 惯例保留 RESERVED 注释。
 - **命名收敛（用户指示）**：fencing epoch 在客户端侧统一为
   `lease_epoch`——`FuseLease.version` → `lease_epoch`、
   `OpenedExtents.lease_version` → `lease_epoch`（与

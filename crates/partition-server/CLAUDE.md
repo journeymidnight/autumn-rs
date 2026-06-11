@@ -234,7 +234,7 @@ partition_loop (per partition, F099-D fold-in of the old
           == 0:  await req_rx.next() alone (cold idle)
           >  0:  select(req_rx.next, inflight.next()) — race SQ vs CQ
                  Left  (SQ wins) → handle_incoming_req:
-                                   - PUT/DELETE/STREAM_PUT: decode + pending.push
+                                   - PUT/DELETE: decode + pending.push
                                    - GET/HEAD/RANGE/SPLIT/MAINTENANCE: inline
                                      via dispatch_partition_rpc (reads still
                                      run inline on P-log)
@@ -419,8 +419,10 @@ Client surface: `WriteLease` + `put_fenced`/`put_zc_fenced`/
 `held_leases[ino].version` (`FsState::write_lease_for`), the ioring
 daemon from `OpenedExtents.lease_version` (`write_lease_of`) including
 its deferred dirty-meta flush. DELETE is fenced too (enqueue_delete,
-same range→fence admission order; fuse truncate/unlink stamp it). NOT
-fenced (recorded residual, BUG-LEASE-8 family): StreamPut. Admission
+same range→fence admission order; fuse truncate/unlink stamp it).
+MSG_STREAM_PUT was REMOVED outright (zero callers since F186 + its
+handler bypassed both the inline cap and the fence — 0x46 reserved).
+Admission
 ordering invariant (coco): region_epoch → in_range → value-too-large →
 fence — a rejected request must NEVER raise (or persist) the floor.
 
@@ -1556,7 +1558,7 @@ post-restart.
       - `freeze_drain_ack: RefCell<Option<oneshot::Sender>>` — parked
         freeze response oneshot.
 
-    `handle_incoming_req` short-circuits Put / Delete / StreamPut with
+    `handle_incoming_req` short-circuits Put / Delete with
     `CODE_UNAVAILABLE` while frozen; reads + maintenance flow normally.
 
     `partition_loop` top-of-loop logic:

@@ -35,8 +35,11 @@ Task scope: BUG-LEASE-2 Phase 2 — fence-floor persistence (WAL +
       Naming converged: client-side fencing epoch = `lease_epoch`
       everywhere (FuseLease/OpenedExtents renamed); manager wire keeps
       `version`.
+    - MSG_STREAM_PUT removed outright (user decision): zero callers
+      since F186, and its handler bypassed both the inline cap and the
+      fence check. 0x46 reserved.
   Not implemented (recorded, BUG-LEASE-8 family):
-    - StreamPut not fenced (not on fuse/ioring paths).
+    - multi-key atomic commit boundary (unchanged).
 
 Current summary:
   e2e bug_lease_2_phase2_persistence x2 PASS (subprocess PS kill -9 +
