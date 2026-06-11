@@ -575,3 +575,28 @@ gaps in the lease protocol's correctness story.
   全 PASS（1316 ACK 0 丢失，含 4 次 manager 重启 ~60s rebind、多次
   failback、6 次 split 尝试与多次 merge 尝试交错）。未发现新 bug。
 - **passes:** completed (2026-06-11)
+
+---
+
+### F270 · F227 open-tail write-wedge family：复现已钉死，修复待做（/loop 2026-06-11）
+- **目标:** 修复 chaos 长期已知的 open-tail 写 wedge（原 F227 家族，
+  先前 seed=13/15 记录）。
+- **复现（2026-06-11，HEAD=452b346）:** `AUTUMN_CHAOS_SEED=13
+  AUTUMN_CHAOS_DURATION_SECS=60 cargo test -p autumn-manager --test
+  system_chaos -- --ignored`，单机隔离跑 3 次中 2 次命中：
+  `liveness: PUT TIMED OUT (5s) part_id=9001 write=0/50 — partition
+  wedged for writes`；mismatches=0 not_found=0（非数据丢失）。日志存
+  `docs/f270_seed13_wedge_run{1,3}.log`。第 3 次为另一形态（启动期
+  `no healthy node available to allocate extent`，疑似同家族的
+  alloc 阻塞面）。注意：同 seed 非全确定（nemesis 时序 vs 写时序），
+  当天也有 2 次 PASS；pre-F265 基线 2/2 PASS 属小样本运气，记忆账本
+  早在 F265 前已记录同签名 → 判定为既有 bug 非当日回归。
+- **既有定性（记忆账本）:** OPEN row tail `current_commit` 3/4 永久
+  不齐 → all-replica append 无法完成；seal-and-roll 逃逸未触发
+  （"recovery-stuck blocks alloc_extent"）。nemesis 的 node-1
+  NetworkPartition 窗口是诱因。
+- **修复方向（待证实）:** 为何 writer 的 seal-and-roll（
+  seal_commit_watermark → alloc_new_extent(Some(commit))）在该形态下
+  不触发/被拒；结合 manager CLAUDE.md note 31（sealed-tail alloc 不再
+  被 inflight Recovery 阻塞——OPEN tail 路径是否仍被阻）核对。
+- **passes:** not_completed

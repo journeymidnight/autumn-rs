@@ -1,0 +1,200 @@
+warning: unused imports: `MergeIterator` and `TableIterator`
+  --> crates/partition-server/src/sstable/mod.rs:10:84
+   |
+10 |     AsyncMergeIterator, AsyncTableIterator, FetchMode, IterItem, MemtableIterator, MergeIterator,
+   |                                                                                    ^^^^^^^^^^^^^
+11 |     TableIterator,
+   |     ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `server_owner_key` and `server_revision` are never read
+    --> crates/partition-server/src/lib.rs:1641:5
+     |
+1625 | pub struct PartitionServer {
+     |            --------------- fields in this struct
+...
+1641 |     server_owner_key: String,
+     |     ^^^^^^^^^^^^^^^^
+1642 |     server_revision: Rc<Cell<i64>>,
+     |     ^^^^^^^^^^^^^^^
+     |
+     = note: `PartitionServer` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `decode_records_with_offsets` is never used
+    --> crates/partition-server/src/lib.rs:7080:15
+     |
+7080 | pub(crate) fn decode_records_with_offsets(bytes: &[u8]) -> Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)> {
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `lookup_in_sst` is never used
+    --> crates/partition-server/src/background.rs:2843:15
+     |
+2843 | pub(crate) fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, Bytes, u64)> {
+     |               ^^^^^^^^^^^^^
+
+warning: methods `invalidate_extent` and `stats` are never used
+   --> crates/partition-server/src/sstable/block_cache.rs:113:12
+    |
+ 42 | impl BlockCache {
+    | --------------- methods in this implementation
+...
+113 |     pub fn invalidate_extent(&self, extent_id: u64) {
+    |            ^^^^^^^^^^^^^^^^^
+...
+128 |     pub fn stats(&self) -> (usize, usize, u64, u64) {
+    |            ^^^^^
+
+warning: associated items `new`, `valid`, `item`, `next`, and `rewind` are never used
+   --> crates/partition-server/src/sstable/iterator.rs:128:12
+    |
+127 | impl TableIterator {
+    | ------------------ associated items in this implementation
+128 |     pub fn new(reader: Arc<SstReader>) -> Self {
+    |            ^^^
+...
+137 |     pub fn valid(&self) -> bool {
+    |            ^^^^^
+...
+141 |     pub fn item(&self) -> Option<&IterItem> {
+    |            ^^^^
+...
+145 |     pub fn next(&mut self) {
+    |            ^^^^
+...
+184 |     pub fn rewind(&mut self) {
+    |            ^^^^^^
+
+warning: method `seek` is never used
+   --> crates/partition-server/src/sstable/iterator.rs:437:18
+    |
+389 | impl AsyncMergeIterator {
+    | ----------------------- method in this implementation
+...
+437 |     pub async fn seek(&mut self, target: &[u8]) -> Result<()> {
+    |                  ^^^^
+
+warning: associated items `new`, `valid`, `item`, `next`, and `rewind` are never used
+   --> crates/partition-server/src/sstable/iterator.rs:464:12
+    |
+463 | impl MergeIterator {
+    | ------------------ associated items in this implementation
+464 |     pub fn new(iters: Vec<TableIterator>) -> Self {
+    |            ^^^
+...
+468 |     pub fn valid(&self) -> bool {
+    |            ^^^^^
+...
+473 |     pub fn item(&self) -> Option<&IterItem> {
+    |            ^^^^
+...
+491 |     pub fn next(&mut self) {
+    |            ^^^^
+...
+512 |     pub fn rewind(&mut self) {
+    |            ^^^^^^
+
+warning: methods `is_paged` and `paged_loc` are never used
+   --> crates/partition-server/src/sstable/reader.rs:263:12
+    |
+ 62 | impl SstReader {
+    | -------------- methods in this implementation
+...
+263 |     pub fn is_paged(&self) -> bool {
+    |            ^^^^^^^^
+...
+268 |     pub fn paged_loc(&self) -> Option<(u64, u32, u32)> {
+    |            ^^^^^^^^^
+
+warning: `autumn-partition-server` (lib) generated 9 warnings (run `cargo fix --lib -p autumn-partition-server` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s
+     Running tests/system_chaos.rs (target/debug/deps/system_chaos-83b6d4012c70cf02)
+
+running 1 test
+chaos: duration=60s nemesis_iv=3000ms K=3 M=1 ENs=5 seed=13
+chaos: etcd at http://127.0.0.1:26253
+chaos: toxiproxy admin at 127.0.0.1:16447
+chaos: subprocess logs at /tmp/.tmpIlM8im
+chaos: EN[0] real_port=16321 proxy_port=21057 node_id=1 dir=/tmp/.tmpLuq1AM
+chaos: EN[1] real_port=26497 proxy_port=25021 node_id=3 dir=/tmp/.tmp2mPjbB
+chaos: EN[2] real_port=16241 proxy_port=16491 node_id=5 dir=/tmp/.tmpdRMJg1
+chaos: EN[3] real_port=36579 proxy_port=24621 node_id=7 dir=/tmp/.tmpPKblzY
+chaos: EN[4] real_port=18879 proxy_port=15429 node_id=9 dir=/tmp/.tmpnVqYll
+nemesis: Compact OK — compact × 1
+nemesis: KillThenFence skipped — healthy=5 ≤ min=5
+nemesis: NetworkPartition en-0 (node 1) — disabled
+nemesis: NetworkPartition OK — network partition node 1 (3s)
+writer[w2]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+writer[w1]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+nemesis: Compact OK — compact × 1
+nemesis: NetworkPartition en-0 (node 1) — disabled
+writer[w2]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+writer[w1]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+[2m2026-06-11T18:55:54.418858Z[0m [31mERROR[0m [2mautumn_partition_server::background[0m[2m:[0m write batch error: log_stream append_segments: alloc_new_extent failed after append error: replica 2 rpc error: 127.0.0.1:21057 submit error: connect 127.0.0.1:21057: I/O error: Connection refused (os error 111)
+[2m2026-06-11T18:55:54.419610Z[0m [31mERROR[0m [2mautumn_partition_server::background[0m[2m:[0m write batch error: log_stream append_segments: alloc_new_extent failed after append error: stream tail sealing for failover; retry on fresh tail
+nemesis: NetworkPartition OK — network partition node 1 (3s)
+writer[w2]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+writer[w1]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+nemesis: NetworkPartition en-0 (node 1) — disabled
+[2m2026-06-11T18:55:59.385164Z[0m [31mERROR[0m [2mautumn_partition_server::background[0m[2m:[0m write batch error: log_stream append_segments: alloc_new_extent failed after append error: stream tail sealing for failover; retry on fresh tail
+[2m2026-06-11T18:55:59.441499Z[0m [31mERROR[0m [2mautumn_partition_server::background[0m[2m:[0m write batch error: log_stream append_segments: alloc_new_extent failed after append error: stream tail sealing for failover; retry on fresh tail
+nemesis: NetworkPartition OK — network partition node 1 (3s)
+writer[w2]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+writer[w1]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+[2m2026-06-11T18:56:04.322953Z[0m [31mERROR[0m [2mautumn_partition_server::background[0m[2m:[0m write batch error: log_stream append_segments: alloc_new_extent failed after append error: stream tail sealing for failover; retry on fresh tail
+[2m2026-06-11T18:56:04.370003Z[0m [31mERROR[0m [2mautumn_partition_server::background[0m[2m:[0m write batch error: log_stream append_segments: alloc_new_extent failed after append error: stream tail sealing for failover; retry on fresh tail
+writer[w2]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+writer[w1]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+writer[w2]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+writer[w1]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+writer[w2]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+writer[w1]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+test chaos_real_kill_split_merge_ec_fence_no_data_loss has been running for over 60 seconds
+writer[w2]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+writer[w1]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+writer[w2]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+writer[w1]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+writer[w2]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+writer[w1]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+chaos: stopping workload after 60.000516451s
+reader[r2] stopped
+reader[r1] stopped
+nemesis: EcConvert skipped — EcConvert TIMED OUT (30s) — PS/orchestration wedged?
+nemesis stopped
+writer[w2]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+writer[w2] stopped: seq=3443
+writer[w1]: PUT TIMED OUT (5s) part_id=9001 — uncertain, dropping key from expected
+writer[w1] stopped: seq=3457
+chaos: settle 10 s before verify
+[2m2026-06-11T18:56:39.337991Z[0m [31mERROR[0m [2mautumn_partition_server::background[0m[2m:[0m write batch error: log_stream append_segments: alloc_new_extent failed after append error: stream tail sealing for failover; retry on fresh tail
+[2m2026-06-11T18:56:39.399536Z[0m [31mERROR[0m [2mautumn_partition_server::background[0m[2m:[0m write batch error: log_stream append_segments: alloc_new_extent failed after append error: stream tail sealing for failover; retry on fresh tail
+[2m2026-06-11T18:56:44.599234Z[0m [31mERROR[0m [2mautumn_partition_server::background[0m[2m:[0m write batch error: log_stream append_segments: alloc_new_extent failed after append error: stream tail sealing for failover; retry on fresh tail
+[2m2026-06-11T18:56:44.877539Z[0m [31mERROR[0m [2mautumn_partition_server::background[0m[2m:[0m write batch error: log_stream append_segments: alloc_new_extent failed after append error: stream tail sealing for failover; retry on fresh tail
+[2m2026-06-11T18:56:45.605745Z[0m [31mERROR[0m [2mautumn_partition_server::background[0m[2m:[0m write batch error: log_stream append_segments: alloc_new_extent failed after append error: stream tail sealing for failover; retry on fresh tail
+chaos summary: writes acked=6878 failed=22 | reads ok=26342 miss=0 | nemesis events=7 skipped=2
+chaos: verifying 378 acked keys (per-key)
+chaos: per-key verify: total=378 mismatches=0 not_found=0
+chaos: verifying range() per partition
+chaos: range verify: errors=0
+chaos: verifying write-liveness per partition
+liveness: PUT TIMED OUT (5s) part_id=9001 write=0/50 — partition wedged for writes
+chaos: write-liveness verify: errors=1
+
+thread 'chaos_real_kill_split_merge_ec_fence_no_data_loss' (1741053) panicked at crates/manager/tests/system_chaos.rs:1954:13:
+chaos verify FAILED — mismatches=0 not_found=0 range_errors=0 liveness_errors=1
+mismatches: 
+not_found: 
+range_errors: 
+liveness_errors: part 9001: WRITE WEDGE — PUT timed out (5s) after 0/50 acked post-settle
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test chaos_real_kill_split_merge_ec_fence_no_data_loss ... FAILED
+
+failures:
+
+failures:
+    chaos_real_kill_split_merge_ec_fence_no_data_loss
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 96.04s
+
+error: test failed, to rerun pass `-p autumn-manager --test system_chaos`

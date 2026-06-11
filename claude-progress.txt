@@ -1,6 +1,6 @@
 Date: 2026-06-11
-TaskStatus: completed
-Task scope: F267+F268+F269 — /loop chaos 迭代 5：multi-manager HA chaos
+TaskStatus: not_completed
+Task scope: F267+F268+F269 (completed) + F270 复现完成、修复未做 — /loop chaos 迭代 5：multi-manager HA chaos
   （manager_ha_chaos.sh H1 leader kill / H2 仅新 leader 时 PS kill /
   H3 老 leader 回归 follower），发现并修复 4 个真实 bug。
 
@@ -44,5 +44,10 @@ F268 (迭代 6): transport_chaos.sh 新增 E7a（split 中途 kill 宿主
 F269 (迭代 7): E6 victim 集扩展 split/merge best-effort 操作 +
   CHAOS_ROUNDS=20 双 transport soak（tcp 3931 / ucx 1316 ACK 全 PASS
   0 丢失）；verify_seeds 加收敛窗口单次重试。未发现新 bug。
+F270 (迭代 8, IN PROGRESS): F227 open-tail 写 wedge 复现钉死——
+  seed=13/60s 隔离 3 跑 2 中（part 9001 PUT 全超时 0/50，0 丢失），
+  日志 docs/f270_seed13_wedge_run{1,3}.log；判定既有 bug 非当日回归。
+  修复未开始（commit/seal 高危区，需独立完整 arc）。
 Next steps:
-  - 无（本迭代闭环）。候选: F227 recovery-stuck 家族。
+  - F270 修复: 先读 writer 端 append 失败→seal-and-roll 逃逸路径，对
+    照 wedge 日志找出未触发原因；修复+复跑 seed=13 x10 + 全 gauntlet。
