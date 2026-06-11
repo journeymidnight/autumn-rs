@@ -368,6 +368,61 @@ for r in $(seq 1 "$ROUNDS"); do
 done
 write_liveness "e6"
 
+# ── E7: split/merge orchestration racing kills (F268) ───────────────────────
+# E7a: issue a SPLIT on the partition holding the a-* keys, then kill -9
+#      the hosting PS mid-flight (~0.7s in). Whatever the split's fate
+#      (committed → both children reopen on the survivor; aborted → the
+#      parent reopens), every seed key must stay readable and writable.
+# E7b: issue an F185 orchestrated MERGE (two adjacent empty partitions),
+#      then kill -9 the manager ~0.3s in — inside the freeze → etcd-commit
+#      window. The PS-side FREEZE_TTL (30s) is the designed backstop;
+#      after the manager respawns the cluster must serve again with the
+#      merge either fully committed or fully rolled back.
+mapfile -t E7PARTS < <("${AOC[@]}" info 2>/dev/null | sed -n 's/^  part \([0-9]*\):.*/\1/p' | sort -n | head -4)
+if [ "${#E7PARTS[@]}" -lt 4 ]; then
+    fail "E7: could not enumerate 4 partitions (got ${#E7PARTS[@]})"
+else
+    SPLIT_PART="${E7PARTS[2]}"   # 3rd in key order — holds the a-* keys
+    # Hosting PS: per-partition port < 9351 ⇒ PS1 band, else PS2 band.
+    SP_PORT=$("${AOC[@]}" info 2>/dev/null | sed -n "s/^  part ${SPLIT_PART}: ps=127.0.0.1:\([0-9]*\).*/\1/p" | head -1)
+    if [ -n "$SP_PORT" ] && [ "$SP_PORT" -lt 9351 ]; then SP_PSID=1; SP_BASE=9301; else SP_PSID=2; SP_BASE=9351; fi
+    say "E7a: split part $SPLIT_PART (on PS$SP_PSID) + kill PS mid-flight"
+    ( "${AOC[@]}" split "$SPLIT_PART" >/dev/null 2>&1 ) &
+    sleep 0.7
+    SP_PID=$(pgrep -f -- "--psid $SP_PSID .*--transport $T" | head -1)
+    [ -n "$SP_PID" ] && kill -9 "$SP_PID"
+    deadline=$((SECONDS + 90))
+    while [ $SECONDS -lt $deadline ]; do
+        left=$(parts_on "$SP_BASE")
+        [ "${left:-1}" = "0" ] && break
+        sleep 2
+    done
+    say "E7a: respawn PS$SP_PSID"
+    setsid nohup "$PSBIN" --psid "$SP_PSID" --port "$SP_BASE" --manager "$MGR" \
+        --listen 127.0.0.1 --advertise "127.0.0.1:$SP_BASE" --transport "$T" \
+        > "$WORK/e7a_ps${SP_PSID}.log" 2>&1 < /dev/null &
+    sleep 8
+    verify_seeds "after-E7a-split-kill"
+    write_liveness "e7a"
+
+    MERGE_S="${E7PARTS[0]}"; MERGE_V="${E7PARTS[1]}"
+    say "E7b: merge $MERGE_V into $MERGE_S + kill manager mid-freeze"
+    ( "${AOC[@]}" merge "$MERGE_S" "$MERGE_V" >/dev/null 2>&1 ) &
+    sleep 0.3
+    MPID=$(pgrep -f autumn-manager-server | head -1)
+    MCMD=$(tr '\0' ' ' < "/proc/$MPID/cmdline")
+    kill -9 "$MPID"
+    sleep 4
+    say "E7b: respawn manager"
+    setsid nohup $MCMD > "$WORK/e7b_mgr.log" 2>&1 < /dev/null &
+    wait_mgr_ready "E7b"
+    # FREEZE_TTL is 30s — give the frozen PSes time to self-unfreeze if
+    # the merge never committed, then demand full service.
+    sleep 5
+    verify_seeds "after-E7b-merge-kill"
+    write_liveness "e7b"
+fi
+
 # ── stop loop + verify every ACKed write ────────────────────────────────────
 touch "$WORK/stop"
 wait "$LOOP_PID" 2>/dev/null

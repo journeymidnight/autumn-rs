@@ -182,6 +182,7 @@ AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/transport_chaos.sh ucx   # needs --
 # (ucx note: a node killed -9 leaves its port in TIME_WAIT ~60s; the UCX
 #  listener now retries bind through that window instead of exiting.)
 # E6: CHAOS_ROUNDS=N CHAOS_SEED=S randomized repeated kill rounds (F266).
+# E7: split + mid-flight PS kill; merge + mid-freeze manager kill (F268).
 # Multi-manager HA chaos (F267): leader kill -> standby takeover, PS kill under
 # the new leader, old leader rejoins as follower; zero ACKed-write loss:
 AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/manager_ha_chaos.sh tcp

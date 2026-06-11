@@ -537,3 +537,26 @@ gaps in the lease protocol's correctness story.
   270 ACK；E1-E6 tcp seed=6 连续 5 failback 1978 ACK；E1-E6 ucx
   seed=7 358 ACK。全 workspace --lib 530 单测绿。
 - **passes:** completed (2026-06-11)
+
+---
+
+### F268 · chaos 迭代 6：split/merge 与 kill 竞争（E7，/loop 2026-06-11）
+- **目标:** 编排操作与进程死亡的竞争窗口此前无脚本级覆盖：① split 进
+  行中 kill 持有 PS（CoW 子分区必须在幸存者上可开、零丢失）；② F185
+  orchestrated merge 的 freeze→etcd-commit 窗口内 kill manager
+  （PS 侧 FREEZE_TTL 30s 兜底首次真实验证）。transport_chaos.sh 新增
+  E7a/E7b。
+- **E7a:** 对持有 a-* 键的 partition 发 split，0.7s 后 kill -9 其宿主
+  PS。tcp 轮证据链：split etcd txn 刚提交（CoW 子流 + 新分区 94）即
+  kill；驱逐后父（缩窄的 27）+ 子（94）都在幸存者重开——子分区用
+  fresh per-partition owner key（partition/94, epoch 87, F267 机制
+  在新路径上自然工作）；种子全验 + 双半区写活性 OK，恢复 ~24s。
+- **E7b:** 对两个相邻空 partition 发 merge，0.3s 后 kill -9 manager
+  （落在 freeze 编排窗口）；respawn 后集群 20s 内恢复服务（merge 要
+  么全提交要么全回滚；冻结由 TTL 自解）。
+- **验收:** tcp E1-E7 全 PASS（1926 ACK 0 丢失，E7a 恢复 24s/E7b
+  20s）；ucx E1-E7 全 PASS（545 ACK 0 丢失，E7b 含 manager ~60s
+  TIME_WAIT rebind）。未发现新 bug——F185 freeze-TTL 设计与 F267
+  per-partition 锁在双竞争窗口下按设计工作。纯 harness 增量（bash），
+  双轮实跑即验收，未跑 coco（同 F266 先例）。
+- **passes:** completed (2026-06-11)
