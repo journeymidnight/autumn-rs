@@ -1320,6 +1320,43 @@ impl StreamClient {
         self.current_mgr.set(next);
     }
 
+    /// F267: one manager RPC with rotate-on-transport-failure. Every
+    /// StreamClient manager call MUST route through this (or through
+    /// `retry_manager_call`, which rotates itself) — a raw
+    /// `pool.call_timeout(self.manager_addr(), ..)` pins every
+    /// CALLER-side retry loop (partition open's 5 s commit_length loop,
+    /// GC cooldown retries, read-path cache refreshes) to a dead manager
+    /// forever. Observed (manager-HA chaos H2): with the old leader
+    /// killed and a healthy standby leading, a PS opening a migrated
+    /// partition hammered the dead address every 5 s for 20+ minutes.
+    async fn manager_call(
+        &self,
+        msg_type: u8,
+        req: Bytes,
+        timeout: Duration,
+    ) -> Result<Bytes> {
+        match self
+            .pool
+            .call_timeout(self.manager_addr(), msg_type, req, timeout)
+            .await
+        {
+            Ok(b) => Ok(b),
+            Err(e) => {
+                self.rotate_manager();
+                Err(e)
+            }
+        }
+    }
+
+    /// F267 companion: rotate away from a manager that ANSWERED but is
+    /// no longer the leader (alive-but-deposed after an HA failover) —
+    /// the symmetric wedge to the dead-address case above.
+    fn note_manager_code(&self, code: u8) {
+        if code == CODE_NOT_LEADER {
+            self.rotate_manager();
+        }
+    }
+
     async fn retry_manager_call<F, Fut, T>(&self, label: &str, max_retries: u32, f: F) -> Result<T>
     where
         F: Fn() -> Fut,
@@ -1566,6 +1603,7 @@ impl StreamClient {
             .await?;
         let resp: NodesInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.note_manager_code(resp.code);
         if resp.code != CODE_OK {
             return Err(anyhow!("nodes_info failed: {}", resp.message));
         }
@@ -1705,16 +1743,11 @@ impl StreamClient {
         });
         // 5 s — read-only manager call, in-memory state.
         let resp_data = self
-            .pool
-            .call_timeout(
-                self.manager_addr(),
-                MSG_STREAM_INFO,
-                req,
-                Duration::from_secs(5),
-            )
+            .manager_call(MSG_STREAM_INFO, req, Duration::from_secs(5))
             .await?;
         let resp: StreamInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.note_manager_code(resp.code);
         if resp.code != CODE_OK {
             return Err(anyhow!("stream_info failed: {}", resp.message));
         }
@@ -1770,16 +1803,11 @@ impl StreamClient {
         // replica of the tail extent before responding; each replica
         // call is itself bounded but the aggregate can take a few s.
         let resp_data = self
-            .pool
-            .call_timeout(
-                self.manager_addr(),
-                MSG_CHECK_COMMIT_LENGTH,
-                req,
-                Duration::from_secs(15),
-            )
+            .manager_call(MSG_CHECK_COMMIT_LENGTH, req, Duration::from_secs(15))
             .await?;
         let resp: CheckCommitLengthResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.note_manager_code(resp.code);
         if resp.code != CODE_OK {
             return Err(anyhow!("check_commit_length failed: {}", resp.message));
         }
@@ -2481,16 +2509,11 @@ impl StreamClient {
         // 30 s — manager updates extent refs + may schedule
         // pending_extent_deletes; etcd mirror inside.
         let resp_data = self
-            .pool
-            .call_timeout(
-                self.manager_addr(),
-                MSG_STREAM_PUNCH_HOLES,
-                req,
-                Duration::from_secs(30),
-            )
+            .manager_call(MSG_STREAM_PUNCH_HOLES, req, Duration::from_secs(30))
             .await?;
         let resp: PunchHolesResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.note_manager_code(resp.code);
         if resp.code != CODE_OK {
             return Err(anyhow!("punch_holes failed: {}", resp.message));
         }
@@ -2508,16 +2531,11 @@ impl StreamClient {
         });
         // 30 s — same shape as punch_holes; ref updates + etcd mirror.
         let resp_data = self
-            .pool
-            .call_timeout(
-                self.manager_addr(),
-                MSG_TRUNCATE,
-                req,
-                Duration::from_secs(30),
-            )
+            .manager_call(MSG_TRUNCATE, req, Duration::from_secs(30))
             .await?;
         let resp: TruncateResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.note_manager_code(resp.code);
         if resp.code != CODE_OK {
             return Err(anyhow!("truncate failed: {}", resp.message));
         }
@@ -2532,16 +2550,11 @@ impl StreamClient {
         });
         // 5 s — read-only manager call.
         let resp_data = self
-            .pool
-            .call_timeout(
-                self.manager_addr(),
-                MSG_STREAM_INFO,
-                req,
-                Duration::from_secs(5),
-            )
+            .manager_call(MSG_STREAM_INFO, req, Duration::from_secs(5))
             .await?;
         let resp: StreamInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.note_manager_code(resp.code);
         if resp.code != CODE_OK {
             return Err(anyhow!("stream_info failed: {}", resp.message));
         }
@@ -2565,16 +2578,11 @@ impl StreamClient {
         // 5 s — read-only manager call. Hot in the EC stale-cache
         // refetch path; bounded so that path doesn't wedge.
         let resp_data = self
-            .pool
-            .call_timeout(
-                self.manager_addr(),
-                MSG_EXTENT_INFO,
-                req,
-                Duration::from_secs(5),
-            )
+            .manager_call(MSG_EXTENT_INFO, req, Duration::from_secs(5))
             .await?;
         let resp: ExtentInfoResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.note_manager_code(resp.code);
         if resp.code != CODE_OK {
             return Err(anyhow!("extent_info failed: {}", resp.message));
         }
@@ -3674,15 +3682,10 @@ impl StreamClient {
         // regions + sidecar last_op_at). Generous bound; the PS
         // caller already has its own retry loop on top.
         let resp_data = self
-            .pool
-            .call_timeout(
-                self.manager_addr(),
-                MSG_MULTI_MODIFY_SPLIT,
-                req,
-                Duration::from_secs(30),
-            )
+            .manager_call(MSG_MULTI_MODIFY_SPLIT, req, Duration::from_secs(30))
             .await?;
         let resp: CodeResp = manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.note_manager_code(resp.code);
         if resp.code != CODE_OK {
             return Err(anyhow!("multi_modify_split failed: {}", resp.message));
         }

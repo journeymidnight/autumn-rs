@@ -1628,8 +1628,14 @@ pub struct PartitionServer {
     partitions: Rc<RefCell<HashMap<u64, PartitionHandle>>>,
     /// Manager addresses for round-robin on NotLeader.
     manager_addrs: Vec<String>,
-    /// Current manager index.
-    current_mgr: Cell<usize>,
+    /// Current manager index. MUST be `Rc<Cell>` (F267): `PartitionServer`
+    /// is cloned once per supervised loop (heartbeat / region_sync /
+    /// report_load), and a plain `Cell` clones BY VALUE — pre-F267 only the
+    /// heartbeat task's private copy rotated on manager failure, while
+    /// region_sync (and with it the F265 part_addrs self-heal) hammered the
+    /// dead manager forever: after a leader kill with a healthy standby,
+    /// clients stayed unroutable for 20+ minutes (manager-HA chaos H1).
+    current_mgr: Rc<Cell<usize>>,
     pool: Rc<ConnPool>,
     /// Server-level owner key and owner_epoch for split coordination.
     server_owner_key: String,
@@ -2438,6 +2444,49 @@ impl PartitionServer {
         self.current_mgr.set(next);
     }
 
+    /// F267: acquire (or re-acquire, bumping — F265) an owner lock for a
+    /// per-partition key at `open_partition` time. Walks the manager list
+    /// on transport failure or NotLeader; one attempt per address, twice
+    /// around, before giving up (the caller's open-backoff retries the
+    /// whole open).
+    async fn acquire_partition_owner_epoch(&self, owner_key: &str) -> Result<i64> {
+        let req = manager_rpc::rkyv_encode(&manager_rpc::AcquireOwnerLockReq {
+            owner_key: owner_key.to_string(),
+        });
+        let mut last_err: Option<anyhow::Error> = None;
+        for _ in 0..(self.manager_addrs.len() * 2) {
+            let addr = self.manager_addr().to_string();
+            match self
+                .pool
+                .call_timeout(
+                    &addr,
+                    manager_rpc::MSG_ACQUIRE_OWNER_LOCK,
+                    req.clone(),
+                    Duration::from_secs(10),
+                )
+                .await
+            {
+                Ok(resp_data) => {
+                    let resp: manager_rpc::AcquireOwnerLockResp =
+                        manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+                    if resp.code == manager_rpc::CODE_OK {
+                        return Ok(resp.owner_epoch);
+                    }
+                    last_err = Some(anyhow!(
+                        "acquire_owner_lock({owner_key}) via {addr}: {}",
+                        resp.message
+                    ));
+                    self.rotate_manager();
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    self.rotate_manager();
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("no manager available")))
+    }
+
     /// F099-K: caller supplies the first-partition listen address up front
     /// so `base_port` + `advertise_host` are populated BEFORE
     /// `finish_connect()` runs its implicit `sync_regions_once()`.
@@ -2515,7 +2564,7 @@ impl PartitionServer {
                             advertise_addr,
                             partitions: Rc::new(RefCell::new(HashMap::new())),
                             manager_addrs: mgr_addrs,
-                            current_mgr: Cell::new(connected_idx),
+                            current_mgr: Rc::new(Cell::new(connected_idx)),
                             pool,
                             server_owner_key: owner_key,
                             server_revision: Rc::new(Cell::new(resp.owner_epoch)),
@@ -2668,10 +2717,33 @@ impl PartitionServer {
                 .await
             {
                 Ok(resp_data) => {
-                    consecutive_failures = 0;
                     let code = manager_rpc::rkyv_decode::<manager_rpc::CodeResp>(&resp_data)
                         .map(|r| r.code)
                         .unwrap_or(manager_rpc::CODE_OK);
+                    // F267: a FOLLOWER answered — rotate to find the
+                    // leader, but COUNT IT toward the stale-serving exit
+                    // budget (coco P1): a PS that can reach only
+                    // followers is, for fencing purposes, partitioned
+                    // from the leader — the leader may be evicting and
+                    // reassigning its partitions right now. Only a real
+                    // leader ACK (CODE_OK / CODE_NOT_FOUND below) proves
+                    // liveness and resets the counter. A single-manager
+                    // election window (~5-15 s) burns a few ticks of the
+                    // 90 s budget harmlessly.
+                    if code == manager_rpc::CODE_NOT_LEADER {
+                        self.rotate_manager();
+                        consecutive_failures += 1;
+                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                            tracing::error!(
+                                "PS {} saw only non-leader managers for {}s, exiting to prevent stale serving",
+                                self.ps_id,
+                                consecutive_failures as u64 * HEARTBEAT_INTERVAL_SECS,
+                            );
+                            std::process::exit(1);
+                        }
+                        continue;
+                    }
+                    consecutive_failures = 0;
                     // Manager surfaces CODE_NOT_FOUND when ps_id is not in
                     // ps_nodes (e.g. evicted after a transient hiccup). Re-
                     // register and re-sync so the PS rejoins the cluster
@@ -2829,6 +2901,11 @@ impl PartitionServer {
         let resp: manager_rpc::GetRegionsResp =
             manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
         if resp.code != manager_rpc::CODE_OK {
+            // F267: get_regions is leader-gated; rotate off a follower so
+            // the next 2 s tick reaches the leader.
+            if resp.code == manager_rpc::CODE_NOT_LEADER {
+                self.rotate_manager();
+            }
             return Err(anyhow!("get_regions failed: {}", resp.message));
         }
 
@@ -3077,8 +3154,36 @@ impl PartitionServer {
         meta_stream_id: u64,
     ) -> Result<PartitionHandle> {
         let manager_addr = self.manager_addrs.join(",");
-        let owner_key = self.server_owner_key.clone();
-        let owner_epoch = self.server_revision.get();
+        // F267: acquire a FRESH per-partition owner lock for THIS open.
+        // The key is unique per logical writer (`ps/<id>/partition/<id>`,
+        // the shape stream/CLAUDE.md note 1 always prescribed) and the
+        // F265 bump-on-acquire makes the returned epoch globally newest —
+        // so a partition TAKEOVER always clears the EN fence floors left
+        // by any previous owner. Pre-F267 every partition reused the
+        // PS-lifetime `server_owner_key`/`server_revision` acquired once
+        // at startup: a STANDING PS inheriting partitions from a PS that
+        // acquired LATER sat below the extents' fence floor forever
+        // (manager-HA chaos H2 — `commit-length ... 0/3 committed members
+        // reachable` wedge; the F265 fix only covered respawned-PS
+        // failback). Per-partition keys also scope the fencing correctly:
+        // opening partition X bumps only X's key — sibling partitions on
+        // the same PS keep their epochs; the PREVIOUS owner of X (and
+        // only X) is fenced at both the manager equality check and the
+        // EN floor, and self-evicts via the LockedByOther path.
+        // The key deliberately does NOT embed the ps_id (coco P1): a
+        // per-PS shape (`ps/<id>/partition/<id>`) would leave the OLD
+        // owner's key valid at the manager after a takeover — its
+        // lingering GC (`punch_holes`/`truncate`) would still pass
+        // `ensure_owner_epoch` and could mutate streams now owned
+        // elsewhere. With ONE stable logical key per partition, the
+        // takeover acquire bumps THE SAME key, so the old owner is
+        // fenced at the manager equality check too, not just the EN
+        // floor.
+        let owner_key = format!("partition/{part_id}");
+        let owner_epoch = self
+            .acquire_partition_owner_epoch(&owner_key)
+            .await
+            .with_context(|| format!("acquire owner lock {owner_key}"))?;
         let ps_id = self.ps_id;
         // F184: snapshot the open-time params for sync_regions_once
         // change-detection (post-merge widening, post-split narrowing,

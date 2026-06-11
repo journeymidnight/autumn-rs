@@ -3667,6 +3667,21 @@ impl AutumnManager {
     }
 
     pub(crate) async fn handle_get_regions(&self) -> HandlerResult {
+        // F267: routing comes from the LEADER only. A follower's replayed
+        // regions look plausible but its `part_addrs` (in-memory, healed
+        // by PSes against the LEADER) is empty/stale — serving them
+        // black-holed every client that connected to a freshly-rejoined
+        // follower first (manager-HA chaos H3). NOT_LEADER makes callers
+        // rotate (client `refresh_regions`, PS `sync_regions_once`).
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&GetRegionsResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                regions: Vec::new(),
+                ps_details: Vec::new(),
+                part_addrs: Vec::new(),
+            }));
+        }
         let s = self.store.inner.borrow();
         let regions = s.regions.iter().map(|(&id, r)| (id, r.clone())).collect();
         let ps_details = s
@@ -3703,6 +3718,16 @@ impl AutumnManager {
     }
 
     pub(crate) async fn handle_heartbeat_ps(&self, payload: Bytes) -> HandlerResult {
+        // F267: a follower answering OK pins the PS's shared manager
+        // rotation to itself forever (the PS only rotates on failure) —
+        // while its region/part_addr serving is gated. NOT_LEADER tells
+        // the PS heartbeat loop to rotate WITHOUT counting a failure.
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&CodeResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+            }));
+        }
         let req: HeartbeatPsReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         let known = {

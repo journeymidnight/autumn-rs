@@ -533,11 +533,28 @@ impl ClusterClient {
     }
 
     pub async fn refresh_regions(&self) -> Result<()> {
-        let resp_bytes = self
-            .mgr_call_retry(MSG_GET_REGIONS, Bytes::new(), 3)
-            .await
-            .context("get regions")?;
-        let resp: GetRegionsResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+        // F267: get_regions is leader-gated (a follower's part_addrs view
+        // is empty/stale — manager-HA chaos H3 black-holed every client
+        // that connected to a rejoined follower first). On NOT_LEADER,
+        // rotate and retry until the leader answers.
+        let mut resp: Option<GetRegionsResp> = None;
+        for _ in 0..(self.manager_addrs.len() * 3).max(3) {
+            let resp_bytes = self
+                .mgr_call_retry(MSG_GET_REGIONS, Bytes::new(), 3)
+                .await
+                .context("get regions")?;
+            let r: GetRegionsResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+            if r.code == CODE_NOT_LEADER {
+                self.rotate_manager();
+                *self.mgr_conn.borrow_mut() = None;
+                compio::time::sleep(Duration::from_millis(300)).await;
+                continue;
+            }
+            resp = Some(r);
+            break;
+        }
+        let resp =
+            resp.ok_or_else(|| anyhow!("get regions: no leader among {:?}", self.manager_addrs))?;
         let mut sorted: Vec<(u64, MgrRegionInfo)> = resp.regions.into_iter().collect();
         sorted.sort_by(|a, b| {
             a.1.rg

@@ -1,47 +1,40 @@
 Date: 2026-06-11
 TaskStatus: completed
-Task scope: F265+F266 — /loop chaos 迭代 3：manager 控制面 chaos（E4 manager
-  kill+respawn、E5 PS+manager 驱逐窗口双杀），发现并修复 3 个真实 bug。
+Task scope: F267 — /loop chaos 迭代 5：multi-manager HA chaos
+  （manager_ha_chaos.sh H1 leader kill / H2 仅新 leader 时 PS kill /
+  H3 老 leader 回归 follower），发现并修复 4 个真实 bug。
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
   Already implemented (this commit):
-    - transport_chaos.sh E4/E5 控制面事件 + harness 加固（全 CLI/AO
-      timeout、AOC --transport、双 transport 端口 drain、probe 以输出
-      判成功、E5 holder 选择健壮化、时间戳日志）。
-    - BUG 1 fix: part_addrs 自愈 —— sync_regions_once 每 tick 对比
-      GetRegionsResp.part_addrs，缺失/陈旧即补发
-      MSG_REGISTER_PARTITION_ADDR；handle_register_partition_addr 去
-      leader gate。修 manager 重启后 30 分钟全集群路由黑洞。
-    - BUG 2 fix: owner_epoch bump-on-acquire —— acquire_owner_epoch 无
-      条件 fenced PUT、epoch=本次 txn commit revision（原子，coco P1
-      已折入）；replay 读 mod_revision；内存模式同语义+单测。修
-      failback A→B→A 永久 CODE_LOCKED_BY_OTHER wedge + 同 key 共享
-      epoch 的 split-brain 口子。
-    - BUG 3 fix: manager `serving` 门（listener bind 后 mark_serving
-      重置心跳钟才放行驱逐扫描）+ PS 心跳自杀阈值 10s→90s。修 ucx
-      manager 重启 ~60s TIME_WAIT bind 期间整个 PS 编队 exit(1) 自杀
-      + 假驱逐。
-    - 文档: 三个 crate CLAUDE.md（common invariant 2 改写、manager
-      note 35+addendum、ps note 17/18）、README chaos 节、
-      feature_list F265。
+    - scripts/manager_ha_chaos.sh（tcp|ucx；接管判据=仅经 standby 的端
+      到端写；PS 带全 manager 列表）。
+    - BUG 4 fix: PartitionServer.current_mgr Cell→Rc<Cell>（每 loop 克
+      隆导致只有 heartbeat 的私有副本会轮转 manager）。
+    - BUG 5 fix: StreamClient manager_call（传输失败 rotate）替换 8 个
+      裸调用站点 + note_manager_code（NOT_LEADER rotate）8 个解码点。
+    - BUG 6 fix: owner lock 改 per-partition 稳定逻辑 key
+      （partition/<id>，不含 ps_id——coco P1），open_partition 每次
+      fresh acquire；
+      standing-PS takeover 不再被旧 fence floor 卡死；server 级 key 仅
+      留 split 协调。
+    - BUG 7 fix: get_regions/heartbeat_ps leader-gate + 全链路
+      NOT_LEADER rotate（PS heartbeat Ok 臂/sync_regions_once/SDK
+      refresh_regions）。
+    - 文档: ps CLAUDE.md note 19/20、manager CLAUDE.md F267 addendum、
+      README、feature_list F267。
   Not implemented (recorded):
-    - coco P2「多 manager part_addrs 视图不一致」—— 窄场景 defer（单
-      manager 部署；failover 后 PS 下一 tick 自愈新 leader）。
-    - F227 recovery-stuck/alloc wedge 家族（先前已 OPEN，未动）。
-    - coco P0 durability batch（用户先前决定 defer，未动）。
+    - F227 recovery-stuck 家族（仍 OPEN，未动）。
+    - coco P0 durability batch（用户 defer，未动）。
 
 Current summary:
-  最终二进制双轮全 PASS：tcp E1-E5（1000 ACK 0 丢失，E4 2s 恢复，E5
-  收敛 10s+failback）；ucx E1-E5（326 ACK 0 丢失，59s bind 重试期间无
-  假驱逐/无 PS 自杀）。全 workspace --lib 493 单测绿（含新
-  reacquire-fences 测试）。coco findbugs(GPT-5.5) P1+P2 已折入/defer。
+  coco findbugs(GPT-5.5) 2 P1 全采纳并折入（owner key 去 ps_id +
+  NOT_LEADER 计入自杀预算）。折入后四轮复跑全 PASS 0 丢失：HA tcp
+  502 ACK（H1 接管 2s/H2 迁移 18s/H3 无影响）、HA ucx 270 ACK、
+  E1-E6 tcp seed=6 连续 5 failback 1978 ACK、E1-E6 ucx seed=7
+  358 ACK。全 workspace --lib 530 单测绿。
 
 Main gaps:
   - 见 Not implemented。
-F266 (迭代 4): transport_chaos.sh 新增 E6 随机化重复 kill 轮
-  (CHAOS_ROUNDS/CHAOS_SEED)。seed=7 tcp+ucx 全 PASS；seed=6 连续 5 次
-  failback ping-pong + manager 重启全 PASS (2019 ACK 0 丢失)。未发现
-  新 bug。
 Next steps:
-  - （后续迭代可选）多 manager HA 场景；F227 recovery-stuck 家族。
+  - 无（本迭代闭环）。

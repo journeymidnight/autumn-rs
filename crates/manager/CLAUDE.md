@@ -1756,3 +1756,14 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     +10 s, while no PS could possibly heartbeat into the unbound socket.
     Companion PS-side change: heartbeat-loss exit threshold 10 s → 90 s
     (partition-server CLAUDE.md note 18).
+
+    **F267 addendum — `handle_get_regions` / `handle_heartbeat_ps` are
+    leader-gated (CODE_NOT_LEADER).** Reverses the F265 "ungated
+    get_regions" stance: a rejoined FOLLOWER serves replay-stale regions
+    with an EMPTY in-memory `part_addrs` — clients that connect to it
+    first (manager-list order) black-hole completely, and a follower
+    answering heartbeats OK pins the PS fleet's shared rotation index to
+    itself (manager-HA chaos H3). Followers now answer NOT_LEADER and
+    every caller rotates (PS heartbeat/sync, SDK refresh_regions, F267
+    StreamClient note_manager_code). `handle_register_partition_addr`
+    STAYS ungated (idempotent in-memory hint, continuously re-reported).

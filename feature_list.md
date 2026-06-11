@@ -482,3 +482,58 @@ gaps in the lease protocol's correctness story.
   每次迁移 ~20s 收敛。F265 的 owner_epoch bump-on-acquire 在重复
   A→B→A 下成立。未发现新 bug。
 - **passes:** completed (2026-06-11)
+
+---
+
+### F267 · chaos 迭代 5：multi-manager HA chaos——发现并修复 4 个 bug（/loop 2026-06-11）
+- **目标:** 双 manager（leader@9001 + standby@9002，共享 etcd），写流中
+  H1 kill leader → standby 接管零丢失；H2 仅新 leader 在世时 kill 持有
+  PS → 驱逐迁移收敛；H3 老 leader 重启回归 follower 无 split-brain。
+  新脚本 `scripts/manager_ha_chaos.sh tcp|ucx`（PS 带全 manager 列表，
+  接管判据 = 仅经 9002 的端到端写成功）。
+- **BUG 4（H1 复现，20+ 分钟全集群路由黑洞）:** `PartitionServer` 是
+  `#[derive(Clone)]`，每个 supervised loop 克隆一份；`current_mgr` 是
+  裸 `Cell<usize>` 按值克隆 → 只有 heartbeat 任务的私有副本会
+  rotate，region_sync（连带 F265 part_addrs 自愈）永远打死 manager
+  （781 次 connect refused vs heartbeat 1 次失败后即转）。
+  **修复**: `current_mgr: Rc<Cell<usize>>`（同 struct 其余共享字段的
+  既有约定）。
+- **BUG 5（H2 复现，partition open 永久打死 manager）:** StreamClient
+  10 个 manager RPC 站点只有 alloc_new_extent 走带轮转的
+  `retry_manager_call`；其余 9 个裸 `pool.call_timeout(manager_addr())`
+  —— 调用方自己的重试环（partition open 5s commit_length 环、GC
+  cooldown 重试）被钉死在死 manager 上。**修复**: 新 helper
+  `manager_call`（传输失败即 rotate）替换 8 站点（alloc 内层保留，由
+  retry_manager_call 轮转）；`note_manager_code` 在 8 个解码点对
+  CODE_NOT_LEADER rotate（活着但已退位的 leader 的对称 wedge）。
+- **BUG 6（H2 复现，F265 failback 修复的更深根因）:** owner epoch 是
+  PS 进程级（启动时 acquire 一次，所有 partition 经
+  new_with_owner_epoch 共享）。STANDING PS（未重启）接管 acquire 较晚
+  的 PS 的 extent 时，自己的 epoch 仍低于 EN fence floor → 永久
+  `0/3 committed members reachable` wedge（E5/E6 没暴露是因为接收方
+  总是刚 respawn = 最高 epoch）。**修复**: owner_key 改为每 partition 一个稳定逻辑 key
+  （`partition/<part_id>`，不含 ps_id——coco P1 指出含 ps_id 的形状会让
+  旧 owner 的 key 在 manager 端依然有效，残留 GC punch_holes/truncate
+  可改动已易主的 stream；稳定 key 下 takeover acquire bump 同一 key，
+  旧 owner 在 manager 等值检查处处被 fence），每次 `open_partition`
+  fresh acquire（F265 bump 保证全局最新）→ 任何 takeover 都越过旧
+  floor；兄弟 partition 不受影响；旧 owner LockedByOther 自迁出。
+  server 级 key 保留给 split 协调。
+- **BUG 7（H3 复现，rejoined follower 服务陈旧路由）:**
+  `handle_get_regions` 不设 leader gate——重启回归的 follower 用启动
+  replay 的 regions + 空 part_addrs 应答 CODE_OK；客户端按列表顺序先
+  连 9001（follower）永不轮转 → 全部读写黑洞。PS heartbeat 对
+  follower 也返回 OK → PS 共享轮转指针被钉在 follower。**修复**（共识
+  系统标准形）: `handle_get_regions`/`handle_heartbeat_ps` leader
+  gate 返回 CODE_NOT_LEADER；PS heartbeat Ok 臂对 NOT_LEADER rotate
+  并计入 90s stale-serving 退出预算（coco P1：只连得上 follower 的 PS
+  等价于与 leader 分区，可能正被驱逐——只有真 leader ACK 才清零）；`sync_regions_once` 对 NOT_LEADER
+  rotate；client `refresh_regions` 对 NOT_LEADER rotate+重试。
+  `handle_register_partition_addr` 保持不设 gate（幂等内存 hint）。
+- **coco findbugs (GPT-5.5) 2 个 P1 全采纳**（owner key 去 ps_id；
+  NOT_LEADER 计入自杀预算），折入后四轮复跑。
+- **验收（coco 修复折入后最终二进制四轮全 PASS，0 丢失）:** HA tcp
+  502 ACK（H1 接管 2s/H2 迁移 18s/H3 follower 回归无影响）；HA ucx
+  270 ACK；E1-E6 tcp seed=6 连续 5 failback 1978 ACK；E1-E6 ucx
+  seed=7 358 ACK。全 workspace --lib 530 单测绿。
+- **passes:** completed (2026-06-11)

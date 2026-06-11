@@ -1895,3 +1895,43 @@ post-restart.
     is safe. Companion manager-side guard: the eviction sweep is gated on
     `serving` (listener actually bound) and heartbeat clocks are re-seeded
     at listener-ready (manager CLAUDE.md note 35).
+
+19. **F267 owner locks are PER-PARTITION, acquired fresh at every
+    `open_partition`.** `owner_key = "partition/<part_id>"` — ONE stable logical key per
+    partition, NO ps_id in the key (coco P1: a per-PS key shape would
+    leave the old owner's key valid at the manager after takeover, so
+    its lingering GC punch_holes/truncate could still mutate streams
+    owned elsewhere; with a stable key the takeover acquire bumps THE
+    SAME key and the old owner fails `ensure_owner_epoch` everywhere); `acquire_partition_owner_epoch` walks the manager list.
+    P-log's `part_sc` and P-bulk's `bulk_sc` share the ONE epoch acquired
+    for that open (via `new_with_owner_epoch`). Why: the epoch must be
+    newest-at-TAKEOVER, not newest-at-process-start — a standing PS
+    inheriting partitions from a PS that acquired LATER sat below the EN
+    fence floors forever (manager-HA chaos H2; F265's bump-on-acquire
+    only fixed the respawned-PS case). Per-partition keys scope fencing
+    exactly: an open of partition X bumps only X's key — siblings keep
+    their epochs; X's previous owner alone is fenced (manager equality +
+    EN floor) and self-evicts via LockedByOther. The PS-lifetime
+    `server_owner_key`/`server_revision` ("ps-<id>") remains ONLY for
+    split-coordination RPCs. Cross-ref: manager CLAUDE.md note 35
+    (F265 bump-on-acquire), stream CLAUDE.md note 1.
+
+20. **F267 manager-list rotation invariants (4 bugs from manager-HA
+    chaos — keep all four properties or HA failover silently dies).**
+    (a) `PartitionServer.current_mgr` is `Rc<Cell<usize>>` — the struct
+    is cloned once per supervised loop; a plain Cell gave each loop a
+    PRIVATE rotation index (only heartbeat's rotated; region_sync +
+    the F265 part_addrs self-heal hammered the dead manager forever).
+    (b) Every StreamClient manager RPC routes through `manager_call`
+    (rotate on transport failure) or `retry_manager_call`; decode sites
+    call `note_manager_code` (rotate on CODE_NOT_LEADER). Never add a
+    raw `pool.call_timeout(self.manager_addr(), ..)` site.
+    (c) `MSG_GET_REGIONS` + `MSG_HEARTBEAT_PS` are leader-gated; the PS
+    heartbeat Ok-arm rotates on NOT_LEADER and COUNTS it toward the 90 s
+    stale-serving exit budget (only a real leader ACK resets — coco P1:
+    a follower-only-reachable PS is partitioned from the leader and may
+    be getting evicted),
+    and `sync_regions_once` rotates on NOT_LEADER. A follower answering
+    OK pins the shared rotation to itself while serving empty/stale
+    `part_addrs` (manager-HA chaos H3).
+    (d) Client SDK `refresh_regions` rotates + retries on NOT_LEADER.
