@@ -167,6 +167,19 @@ $AO policy-candidates                    # advisory engine output (split/merge/g
 ./cluster.sh start 3                     # richer driver: 3-replica cluster + auto-EC
 ```
 
+## Chaos
+
+```bash
+# PS-failover chaos (2 PSes, kill one -> partitions must migrate, zero loss):
+cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
+# Transport-layer chaos (real cluster.sh cluster; EN kill+respawn, PS kill ->
+# migrate, PS respawn; every ACKed write verified afterwards):
+AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/transport_chaos.sh tcp
+AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/transport_chaos.sh ucx   # needs --features autumn-server/ucx binaries
+# (ucx note: a node killed -9 leaves its port in TIME_WAIT ~60s; the UCX
+#  listener now retries bind through that window instead of exiting.)
+```
+
 ## Tests
 
 ```bash

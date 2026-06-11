@@ -388,4 +388,19 @@ gaps in the lease protocol's correctness story.
 - **迭代 1 结果:** 2/2 PASS 首跑——110,799 ACK 写 0 丢失，kill 后两
   partition 均迁移（211→212），SDK 重试完整扛过驱逐窗口（10s 驱逐 +
   region_sync + survivor 恢复）。未发现 bug。
-- **passes:** not_completed (迭代进行中——transport ucx/tcp chaos 待做)
+- **迭代 2 (transport chaos):** `scripts/transport_chaos.sh tcp|ucx` ——
+  cluster.sh 真集群（3 EN + 双 PS），后台 ACK 写循环贯穿三个事件：
+  E1 kill -9 一个 EN + 原 cmdline 重生；E2 kill -9 PS1 → 全部 partition
+  60s 内迁移 PS2 + 种子字节校验 + 双半区写活性；E3 原 psid 重启 PS1。
+  结束后逐条校验全部 ACK 写。
+- **发现并修复 BUG（UCX）:** kill -9 后 UCX 节点重启 `ucp_listener_create`
+  报 `Device is busy`（被 accept 的连接以本地端口留在 TIME_WAIT ~60s，
+  UCX 内部 listener socket 无 SO_REUSEADDR）→ 进程直接退出 = EN/manager
+  重启即永久离线；r=3 且 3 节点时连锁成 `alloc_new_extent` 永久重试的
+  写 wedge。**修复**：`UcxListener::bind` 对 busy 类错误 3s×30 次退避
+  重试（盖过 TIME_WAIT），其他错误保持 fail-fast；脚本侧 ucx 启动前
+  drain TIME_WAIT（集群冷启的就绪探测等不了 60s）。TCP 不受影响
+  （TCP listener 自带 REUSEADDR 语义，TCP 轮先证实了同场景可重启）。
+- **结果:** tcp 轮 PASS（10,949 ACK 写 0 丢失）；ucx 轮修复后 PASS
+  （E1/E2/E3 全过，1264 ACK 写 0 丢失，EN 在 TIME_WAIT 窗口内重启成功）。
+- **passes:** completed (2026-06-11)

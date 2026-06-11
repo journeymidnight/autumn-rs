@@ -34,6 +34,44 @@ unsafe impl Sync for ConnReqPtr {}
 
 impl UcxListener {
     pub(crate) async fn bind(addr: SocketAddr) -> io::Result<Self> {
+        // F264 (UCX chaos): a node restarted within the TIME_WAIT window of
+        // its previous incarnation fails `ucp_listener_create` with
+        // UCS_ERR_BUSY ("Device is busy") — the killed process's ACCEPTED
+        // sockets keep the local port in TIME_WAIT (~60 s) and UCX's
+        // internal listener socket does not set SO_REUSEADDR. A one-shot
+        // failure here turned an EN kill+restart into a permanent outage
+        // (the process exits; with r = node-count the cluster then wedges
+        // on alloc_new_extent). Retry with backoff long enough to outlast
+        // TIME_WAIT; every other error stays fail-fast.
+        const BIND_BUSY_RETRIES: u32 = 30;
+        const BIND_BUSY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
+        let mut attempt = 0u32;
+        loop {
+            match Self::bind_once(addr) {
+                Ok(l) => return Ok(l),
+                // Only the BUSY shape retries (a bad address / unsupported
+                // transport must stay fail-fast).
+                Err(e)
+                    if attempt < BIND_BUSY_RETRIES
+                        && e.to_string().to_lowercase().contains("busy") =>
+                {
+                    attempt += 1;
+                    if attempt % 5 == 1 {
+                        tracing::warn!(
+                            %addr,
+                            attempt,
+                            error = %e,
+                            "ucx listener bind busy (TIME_WAIT from a previous                              incarnation?); retrying"
+                        );
+                    }
+                    compio::time::sleep(BIND_BUSY_BACKOFF).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn bind_once(addr: SocketAddr) -> io::Result<Self> {
         // Create the channel and leak the sender into raw pointer form so the
         // C callback can find it via user_data. The pointer is freed in
         // `Drop for UcxListener`.
