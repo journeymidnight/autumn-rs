@@ -49,6 +49,43 @@ pub fn pick_addr() -> SocketAddr {
     addr
 }
 
+/// F270: pick a free FIXED port BELOW the kernel's ephemeral range for
+/// components that get killed + respawned on the SAME port (chaos ENs).
+/// `pick_addr` (`bind :0`) returns an ephemeral-range port; using that as a
+/// long-lived identity loses a race after kill -9 — while the process is
+/// down, any OUTBOUND connection on the host can claim the port as its
+/// local endpoint, and the respawn's bind fails EADDRINUSE (the EN is
+/// fail-stop on bind conflict by design). This host's
+/// `ip_local_port_range` starts at 10000; production guidance for EN
+/// ports is "pick below the ephemeral floor" — the harness now follows
+/// it. Caller may need port+1000 (the EN control listener) free too, so
+/// we check both.
+pub fn pick_stable_port_pair() -> u16 {
+    use std::net::TcpListener;
+    let floor: u16 = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok()))
+        .unwrap_or(32768);
+    let hi = floor.saturating_sub(1001).max(4001); // port+1000 must stay below floor
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos() as u16;
+    for _ in 0..2000 {
+        // xorshift-ish walk over [3000, hi]
+        seed = seed.wrapping_mul(31421).wrapping_add(6927);
+        let port = 3000 + (seed % (hi - 3000));
+        let a = TcpListener::bind(("127.0.0.1", port));
+        let b = TcpListener::bind(("127.0.0.1", port + 1000));
+        if let (Ok(la), Ok(lb)) = (a, b) {
+            drop(la);
+            drop(lb);
+            return port;
+        }
+    }
+    panic!("pick_stable_port_pair: no free below-ephemeral port pair found");
+}
+
 // ── Component startup ─────────────────────────────────────────────────
 
 /// Start a manager (no etcd) on its own thread.

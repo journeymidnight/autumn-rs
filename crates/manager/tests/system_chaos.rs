@@ -1730,7 +1730,13 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         // the proxy to simulate a network partition without killing the EN.
         let mut ens: Vec<EnProcess> = Vec::new();
         for (i, dir) in en_dirs.iter_mut().enumerate() {
-            let port = pick_addr().port();
+            // F270: ENs are killed + respawned on the SAME port mid-run; an
+            // ephemeral-range port loses a race to outbound sockets while the
+            // EN is down (respawn EADDRINUSE → fail-stop → permanently dead
+            // EN → "no healthy node" alloc starvation = ALL of this run's
+            // wedge modes). Fixed identities come from below the ephemeral
+            // floor; +1000 (the control listener) is checked free too.
+            let port = pick_stable_port_pair();
             let proxy_port = pick_addr().port();
             let proxy_name = format!("en-{i}");
             let guard = bootstrap_en(

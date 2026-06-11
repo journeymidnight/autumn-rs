@@ -53,6 +53,9 @@ F270 用户拍板 (a)+(b)；(b) fence 自愈已落地（current_commit 区分
   seed=13 x10 = 1/10：今日 Mode Z 零 LockedByOther → 非 fence 引起，
   (b) 是针对 5/30 已 trace 复合层的定向修复而非本体；Mode Y
   (split child 不开, not_found=200) 5/10 占主导。
+F270 三模式同根已破：harness ephemeral 端口当 EN 固定身份 → kill
+  重生 EADDRINUSE → EN 永久死 → alloc 饥饿。pick_stable_port_pair
+  修复后 seed=13 x10 = 9/10（修前 1/10）。残留 1/10 = 窄版
+  split-child 不可达（无 alloc 饥饿），待 traced 捕获。
 Next steps:
-  - F270 续: RUST_LOG trace 捕 Mode Z 本体（P-bulk append?）；Mode Y
-    split-child 独立查；Mode X 启动 race 查 harness。
+  - F270 残留窄尾: traced 捕获 split-child drop+reopen 路径。

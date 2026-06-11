@@ -611,8 +611,22 @@ gaps in the lease protocol's correctness story.
   5/10 占主导。当日傍晚失败率显著高于历史 ~1/10（环境敏感度未排除）。
   (b) 改动 cold path、530 单测绿、coco P1 已折入——按"已 trace 机制的
   定向修复"保留。
-- **下一步:** ① RUST_LOG trace 捕获今日 Mode Z（确认 P-bulk append
-  卡死 vs current_commit 面）；② Mode Y split-child 不开（connect
-  refused + not_found=200）独立查；③ Mode X 启动期 no-healthy-node
-  （疑 harness race）。
-- **passes:** not_completed
+- **三模式同根已破（2026-06-11 晚）:** traced 捕获 + EN 子进程日志
+  （tempdir）钉死：harness 用 pick_addr（bind :0 = ephemeral 区间，
+  本机 ip_local_port_range 起点 10000）当 EN 固定端口；kill -9 重生
+  窗口内端口被任意出站连接的 local port 抢走 → respawn
+  `bind control listener: Address already in use` → EN fail-stop 永久
+  死（设计如此，文档明确"EN 端口应选 ephemeral 下限以下"）→ 5 节点剩
+  3 < K+M=4 → 所有 alloc 永久 "no healthy node"：Mode Z = 写端
+  seal-and-roll 逃逸每 500ms 重试 alloc 全拒（逃逸本身在工作！trace
+  可见 alloc-seal applied 循环）；Mode Y = split child 重开时 alloc
+  新 tail 卡死 → listener 不再 bind；Mode X = bootstrap create_stream
+  同因。**修复（harness）:** `pick_stable_port_pair()`——EN 固定端口从
+  ephemeral 下限以下取（data+control 双端口检查），与 BUG #3 PS 侧
+  同类、与 production 文档对齐。
+- **验证:** seed=13 x10 = **9/10 PASS**（修前 1/10）；wedge=0、
+  no-healthy=0 全消。残留 1/10 = 窄版 Mode Y（split child 连接拒绝、
+  无 alloc 饥饿、EN 全健康——疑 PS drop+reopen 路径），与历史 ~1/10
+  基线一致，待 traced 捕获。
+- **passes:** not_completed（残留窄尾待查；fence 自愈层 + harness 根
+  因修复已落地）
