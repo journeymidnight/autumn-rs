@@ -1,6 +1,6 @@
 Date: 2026-06-11
 TaskStatus: completed
-Task scope: F267+F268 — /loop chaos 迭代 5：multi-manager HA chaos
+Task scope: F267+F268+F269 — /loop chaos 迭代 5：multi-manager HA chaos
   （manager_ha_chaos.sh H1 leader kill / H2 仅新 leader 时 PS kill /
   H3 老 leader 回归 follower），发现并修复 4 个真实 bug。
 
@@ -41,5 +41,8 @@ F268 (迭代 6): transport_chaos.sh 新增 E7a（split 中途 kill 宿主
   用 fresh per-partition key）+ E7b（merge freeze 窗口 kill manager，
   FREEZE_TTL 兜底首次真实验证）。tcp 1926 / ucx 545 ACK 全 PASS 0 丢
   失，未发现新 bug。
+F269 (迭代 7): E6 victim 集扩展 split/merge best-effort 操作 +
+  CHAOS_ROUNDS=20 双 transport soak（tcp 3931 / ucx 1316 ACK 全 PASS
+  0 丢失）；verify_seeds 加收敛窗口单次重试。未发现新 bug。
 Next steps:
   - 无（本迭代闭环）。候选: F227 recovery-stuck 家族。

@@ -560,3 +560,18 @@ gaps in the lease protocol's correctness story.
   per-partition 锁在双竞争窗口下按设计工作。纯 harness 增量（bash），
   双轮实跑即验收，未跑 coco（同 F266 先例）。
 - **passes:** completed (2026-06-11)
+
+---
+
+### F269 · chaos 迭代 7：20 轮混合 soak（kill × split/merge 交错，/loop 2026-06-11）
+- **目标:** 单发事件覆盖不了的累积态：E6 victim 集扩展 split/merge
+  best-effort 编排操作（拒绝=合法 chaos 噪声），CHAOS_ROUNDS=20 长跑
+  ——深 split 树、重复 CoW 链、几十次 owner-epoch bump、端口序数增长
+  与 kill 轮交错。
+- **harness 修正:** verify_seeds 失败键 5s 后重试一次——观测到 kill 后
+  立即 verify 可与幸存者 partition open 收敛窗口竞争（单键单次瞬时失
+  败，23s 后同键全量通过；真丢失两次都会失败）。
+- **验收:** tcp 20 轮 soak 全 PASS（3931 ACK 0 丢失）；ucx 20 轮 soak
+  全 PASS（1316 ACK 0 丢失，含 4 次 manager 重启 ~60s rebind、多次
+  failback、6 次 split 尝试与多次 merge 尝试交错）。未发现新 bug。
+- **passes:** completed (2026-06-11)

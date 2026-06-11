@@ -118,7 +118,14 @@ verify_seeds() {
     local tag="$1" bad=0
     for k in "${seed_keys[@]}"; do
         if ! "${CLI[@]}" get "$k" 2>/dev/null | cmp -s - "$WORK/seed/$k"; then
-            fail "[$tag] seed key $k mismatch/missing"; bad=1
+            # One retry after 5s: a verify right after a kill can race the
+            # survivor's partition opens (observed: a single seed read
+            # failed mid-convergence; the very next round read all 40
+            # fine). Real loss fails both attempts.
+            sleep 5
+            if ! "${CLI[@]}" get "$k" 2>/dev/null | cmp -s - "$WORK/seed/$k"; then
+                fail "[$tag] seed key $k mismatch/missing (after retry)"; bad=1
+            fi
         fi
     done
     # rm first: a leftover big.out from the previous verify would make a
@@ -319,13 +326,38 @@ SEED="${CHAOS_SEED:-$$}"
 RANDOM=$SEED
 say "E6: $ROUNDS randomized rounds (seed=$SEED)"
 for r in $(seq 1 "$ROUNDS"); do
-    case $((RANDOM % 3)) in
+    # F269: victims 3/4 are best-effort ORCHESTRATION ops (split/merge),
+    # not kills — interleaved with kill rounds they compound state that
+    # one-shot events never reach (deep split trees, repeated CoW chains,
+    # dozens of owner-epoch bumps). Op rejections (has_overlap, non-
+    # adjacent pair, <2 keys) are expected chaos noise, NOT failures.
+    case $((RANDOM % 5)) in
         0) victim=en ;;
         1) victim=ps ;;
         2) victim=mgr ;;
+        3) victim=split ;;
+        4) victim=merge ;;
     esac
     say "E6.$r: victim=$victim"
     case $victim in
+        split)
+            mapfile -t CUR < <("${AOC[@]}" info 2>/dev/null | sed -n 's/^  part \([0-9]*\):.*/\1/p' | sort -n)
+            if [ "${#CUR[@]}" -gt 0 ]; then
+                tgt="${CUR[$((RANDOM % ${#CUR[@]}))]}"
+                say "E6.$r: split part $tgt (best-effort)"
+                "${AOC[@]}" split "$tgt" >/dev/null 2>&1 || say "E6.$r: split rejected (ok)"
+                sleep 4
+            fi
+            ;;
+        merge)
+            mapfile -t CUR < <("${AOC[@]}" info 2>/dev/null | sed -n 's/^  part \([0-9]*\):.*/\1/p' | sort -n)
+            if [ "${#CUR[@]}" -ge 2 ]; then
+                i=$((RANDOM % (${#CUR[@]} - 1)))
+                say "E6.$r: merge ${CUR[$((i+1))]} into ${CUR[$i]} (best-effort)"
+                "${AOC[@]}" merge "${CUR[$i]}" "${CUR[$((i+1))]}" >/dev/null 2>&1 || say "E6.$r: merge rejected (ok)"
+                sleep 4
+            fi
+            ;;
         en)
             EN_PID=$(ps -eo pid,comm | awk '$2=="autumn-extent-n"{print $1}' | head -1)
             EN_CMD=$(tr '\0' ' ' < "/proc/$EN_PID/cmdline")
