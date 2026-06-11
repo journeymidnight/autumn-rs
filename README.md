@@ -144,6 +144,13 @@ $AC perf-check --threads 16 --size 4096 --duration 10 --partitions 8
 #   `$AC get KEY` must byte-match and idle PS RSS stays at the replay-window
 #   bound (GBs), not O(dataset). Recovery must log `open_partition: ready`
 #   for every partition with no `stale_vp_offset_past_sealed_length` retries.
+# F262 — async SST iteration (no whole-SST materialization for range/compact/split)
+# Manual check: on a multi-GB dataset, `$AO compact PART_ID` must log
+#   "compact part N: ... output=..." and `$AC ls --prefix p/` must return
+#   correct entries, while PS RSS stays bounded during both (read side =
+#   8MiB windows, not Σ SST bytes). Striped keys (put-stream) byte-compare
+#   via `$AC get-stream --out F KEY` (plain `get` returns the 29-byte
+#   stripe meta by design).
 
 # Admin / observability
 $AO info                                 # nodes / extents / streams / partitions

@@ -35,7 +35,11 @@ use futures::channel::{mpsc, oneshot};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, SinkExt, StreamExt};
 
-use sstable::{IterItem, MemtableIterator, MergeIterator, SstBuilder, SstReader, TableIterator};
+use sstable::{IterItem, MemtableIterator, SstBuilder, SstReader};
+// Sync TableIterator/MergeIterator remain for Resident-only use (tests,
+// builder round-trips); production iteration is F262's AsyncTableIterator.
+#[cfg(test)]
+use sstable::TableIterator;
 
 // ---------------------------------------------------------------------------
 // Compat helpers

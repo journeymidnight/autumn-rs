@@ -491,10 +491,18 @@ Invariants:
   SNAPSHOT `Arc<SstReader>`s + stream_client under the borrow, DROP it,
   await, re-borrow (note 15). `lookup_in_sst` (sync) serves resident
   readers only and ERRORS on paged ones — never silently misses.
-- Sync iteration (TableIterator/MergeIterator: range, do_compact,
-  unique_user_keys) must `materialized_for_iteration` first (transient
-  resident copy; bounded by per-request / ConcurrencyController /
-  compact_gate). Stage-2 = async iterators to remove this cost.
+- Iteration is ASYNC (F262 = Stage-2): `AsyncTableIterator` /
+  `AsyncMergeIterator` fetch blocks on demand. FetchMode::Cached
+  (range — per-block via the global BlockCache, repeated lists hit warm
+  blocks) vs FetchMode::Window(8MiB) (do_compact / split
+  unique_user_keys — sequential bulk windows BYPASSING the cache,
+  scan-resistant; one RPC per window; peak read memory = inputs × one
+  window). `materialize`/`materialized_for_iteration` are GONE. The
+  async API returns Result — a block-read error ABORTS the compaction
+  (the old sync iterator stashed errors in an unread field, which with
+  network-backed blocks would have silently truncated merge output).
+  Sync TableIterator/MergeIterator remain Resident-only (tests,
+  builder round-trips).
 - Diag seq_opt/fullscan report miss on paged readers (diagnostic-only).
 
 ### F259 — large-VP client direct-read (MSG_GET_REDIRECT)

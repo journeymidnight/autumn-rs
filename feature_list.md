@@ -4726,6 +4726,63 @@ Design (plan doc) completed 2026-05-19, output: `docs/autumn_kvcache_plan.md`.
 
 ---
 
+### F262 · F261 Stage-2 — 异步 SST 迭代器，删除 range/compact/split 整表物化
+- **目标**：F261 Stage-1 的同步迭代路径（handle_range / do_compact / split
+  unique_user_keys）依赖 `materialized_for_iteration` 把 paged SST 整表拉回
+  内存（小 range 也物化整分区；compact 读侧峰值 = Σ 输入 SST 字节）。改为
+  异步迭代器按需取 block，物化路径整体删除。
+- **边界**：迭代器语义不变（newest-first N 路归并、MVCC 序、prefix 压缩
+  block 解码共用 BlockIterator/DecodedBlock）；FetchMode 二分：range =
+  Cached（逐 block 经全局 BlockCache，重复 list 命中热块）、compact/split =
+  Window(8MiB)（顺序窗口批量读、绕 cache = scan-resistant，RocksDB
+  fill_cache=false 同型）；同步 TableIterator/MergeIterator 仅保留给
+  Resident（测试/builder round-trip）。错误传播升级：async API 返回
+  Result——旧同步迭代器把块读错误吞进无人读的 err 字段，paged 时代网络错误
+  会静默截断 compaction 输出，现在 Err 中止 compact。
+- **验收**：compact/range/split e2e 正确（输出/读数与改前一致）；range
+  不再整表物化（内存 = O(打开的 block)）；compact 读侧峰值 = 输入数 ×
+  8MiB 窗口；重启恢复 + 字节对拍通过；perf 不回归。
+- **实现（2026-06-11）**：
+  - reader.rs：`window_span`（纯函数：从 start_idx 起能装进 max_bytes 的
+    整 block 跨度）+ `read_blocks_window`（一次 RPC 取整窗口，coco-P2 同款
+    checked 边界：窗口必须落在 SST 的 extent 切片内）+
+    `decode_block_from_window`。`materialize()` 删除。
+  - iterator.rs：`AsyncTableIterator`（seek/next/rewind async 返回 Result；
+    block-boundary next-block hop 与 note 14 同型）+ `AsyncMergeIterator`
+    （同步版同款 min-key 归并不变式）+ `FetchMode::{Cached, Window}`。
+  - do_compact：直接在 paged 输入上 Window 归并，`merge.next().await?`
+    出错即中止；`materialized_for_iteration` 调用删除。
+  - handle_range：Cached 异步迭代 + Stage-1 的 SST key 范围预过滤保留；
+    四处 merge.next() 全部 await 化，错误 → Internal。
+  - unique_user_keys：改 async（调用方一次 borrow 快照 mem_items/readers/
+    sc 后 drop，note 15）；split 调用点同步更新。
+  - 单测 2 项（window_span 预算/下限/越界 + 窗口解码 vs 直读对拍），共
+    162+72 全绿。
+  - **coco review（2 P1 + 1 P2 + 1 P3 已修）**：
+    ① P1 `window_span` 增加 block offset 单调性校验——CRC 合法但语义损坏的
+    meta 若 offset 回退，原 saturating_sub 会掩盖 underflow、win_len 回绕
+    成巨值发起越界大读；现在回退 = corrupt meta 错误。
+    ② P1 range 补上 get/head 同款 readers-changed 重试：按需读使 compaction
+    截断旧 row extent 的暴露窗口比物化时代更长；扫描出错时若 sst_readers
+    已变（与未过滤 Arc 快照 ptr 对比）→ 整扫描重做一次（limit 有界，整做
+    比中途续扫简单且无簿记），未变或第二次失败才 Internal。扫描体提取为
+    `range_scan_sst_merge`。
+    ③ P2 split 的 memtable 采样移回 SST 扫描之后（`sst_user_key_versions`
+    异步扫 SST → 重新 borrow 取最新 mem_items → `finalize_unique_user_keys`
+    合成，mem 版本胜出）——扫描期间落地的新写参与 <2 检查和 mid 选择
+    （恢复 pre-F262 时序语义）。
+    ④ P3 `.skillopt-sleep/`（本地工具产物）加入 .gitignore。
+- **实测（~60GB 数据集, 8 分区, TCP 3disk）**：major compact part 13
+  （input=2 tables, kept=129,723, output 511MB）窗口路径成功，RSS 平台期
+  +2GB（输出侧 builder/finish 暂态 + 分配器保留，非读侧）；ls/range 正常；
+  merge(55,62)+split(13) 走新 async key 扫描成功（mid=!pc_0_9768）；重启
+  恢复 8/8 + f262small/f262big（put-stream 8M，get-stream 字节对拍）通过。
+  注意：CLI `get` 对 striped key 返回 29 字节 stripe meta 是 F186 设计行为
+  （解析在 client `get_stream`），不是 bug——byte-compare 必须用 get-stream。
+- **passes:** completed (2026-06-11)
+
+---
+
 ## P14 — Inode-level lease + close-to-open coherence (F-ioring-lease series)
 
 Plan: `docs/autumn_fs_lease_plan.md` (2026-06-05). Goal: make

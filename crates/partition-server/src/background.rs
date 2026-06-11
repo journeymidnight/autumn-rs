@@ -12,7 +12,17 @@ use bytes::Bytes;
 use futures::channel::mpsc;
 use futures::StreamExt;
 
-use crate::sstable::{IterItem, MergeIterator, SstBuilder, SstReader, TableIterator};
+use crate::sstable::{
+    AsyncMergeIterator, AsyncTableIterator, FetchMode, IterItem, SstBuilder, SstReader,
+};
+
+/// F262: bulk-read window for sequential SST sweeps (compaction merge
+/// inputs, split key-scan). One `read_bytes_from_extent` per window,
+/// bypassing the BlockCache (scan-resistant). 8 MiB ≈ 128 blocks per RPC —
+/// large enough to amortize the round trip, small enough that N concurrent
+/// merge inputs hold N × 8 MiB instead of Σ SST bytes (the Stage-1
+/// materialization this replaces).
+pub(crate) const SCAN_READ_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
 use crate::*;
 
 // F256: the R4 4.4 MIN_PIPELINE_BATCH launch gate (and its
@@ -1641,11 +1651,10 @@ pub(crate) async fn do_compact(
         });
     }
 
-    // F261: sync MergeIterator needs resident bytes — materialize paged
-    // inputs (transient; peak = input SST bytes, identical to pre-F261
-    // where inputs were always resident; bounded by ConcurrencyController).
-    let readers = materialized_for_iteration(&readers, &part_sc).await?;
-
+    // F262: async window iteration directly over the (paged) inputs — one
+    // 8 MiB bulk read per window, cache-bypassing (scan-resistant). Replaces
+    // Stage-1's materialized_for_iteration whole-SST transient residency;
+    // peak read-side memory = inputs × one window instead of Σ input bytes.
     let mut readers_with_meta: Vec<(Arc<SstReader>, u64)> = readers
         .iter()
         .zip(tbls.iter())
@@ -1653,16 +1662,18 @@ pub(crate) async fn do_compact(
         .collect();
     readers_with_meta.sort_by_key(|r| std::cmp::Reverse(r.1));
 
-    let iters: Vec<TableIterator> = readers_with_meta
+    let iters: Vec<AsyncTableIterator> = readers_with_meta
         .iter()
         .map(|(r, _)| {
-            let mut it = TableIterator::new(r.clone());
-            it.rewind();
-            it
+            AsyncTableIterator::new(
+                r.clone(),
+                part_sc.clone(),
+                FetchMode::Window(SCAN_READ_WINDOW_BYTES),
+            )
         })
         .collect();
-    let mut merge = MergeIterator::new(iters);
-    merge.rewind();
+    let mut merge = AsyncMergeIterator::new(iters);
+    merge.rewind().await?;
 
     let mut discards = get_discards(&readers);
 
@@ -1721,7 +1732,10 @@ pub(crate) async fn do_compact(
                 item.expires_at,
             )
         };
-        merge.next();
+        // F262: a block-read failure aborts the compaction (Err) — the old
+        // sync iterator silently went invalid on error, which would have
+        // TRUNCATED the merge output once reads became network-backed.
+        merge.next().await?;
         let raw_ts = parse_ts(&raw_key);
 
         let user_key = parse_key(&raw_key).to_vec();
@@ -2804,26 +2818,6 @@ pub(crate) async fn lookup_in_sst_via(
     Ok(None)
 }
 
-/// F261: sync iteration (TableIterator/MergeIterator) requires resident
-/// bytes — materialize any PAGED reader into a transient resident copy
-/// (whole-SST read off row_stream). Call sites are bounded: do_compact via
-/// ConcurrencyController, split via compact_gate, range per-request
-/// (documented Stage-1 cost; Stage-2 = async iterators).
-pub(crate) async fn materialized_for_iteration(
-    readers: &[Arc<SstReader>],
-    sc: &Rc<StreamClient>,
-) -> Result<Vec<Arc<SstReader>>> {
-    let mut out = Vec::with_capacity(readers.len());
-    for r in readers {
-        if r.is_paged() {
-            out.push(Arc::new(r.materialize(sc).await?));
-        } else {
-            out.push(r.clone());
-        }
-    }
-    Ok(out)
-}
-
 pub(crate) fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, Bytes, u64)> {
     if !reader.bloom_may_contain(user_key) {
         return None;
@@ -2887,30 +2881,60 @@ pub(crate) fn collect_mem_items(part: &PartitionData) -> Vec<IterItem> {
     items
 }
 
-/// F261: `readers` = pre-materialized resident readers (caller snapshots
-/// `part.sst_readers`, drops the borrow, awaits `materialized_for_iteration`,
-/// re-borrows). The split path holds `compact_gate`, so the set is stable.
-pub(crate) fn unique_user_keys(part: &PartitionData, readers: &[Arc<SstReader>]) -> Vec<Vec<u8>> {
-    let now = now_secs();
+/// F262: async window scan over the (paged) readers — SST side only, no
+/// materialization. Caller snapshots `readers` + `sc` under a brief borrow,
+/// DROPS it, then awaits (note 15). The split path holds `compact_gate`,
+/// so the reader set is stable across the scan. Returns the newest
+/// (first-occurrence, newest-first reader order) version per user key.
+///
+/// coco P2 (F262): the MEMTABLE sample is deliberately NOT taken here —
+/// this scan can run for a while on large SST sets while normal writes
+/// keep landing in active. The caller samples the memtable AFTER this
+/// returns (`finalize_unique_user_keys`), so writes that arrived during
+/// the scan still participate in split's `< 2 keys` check and midpoint
+/// selection (pre-F262 parity: the old sync scan sampled mem after the
+/// materialization await).
+pub(crate) async fn sst_user_key_versions(
+    readers: &[Arc<SstReader>],
+    sc: &Rc<StreamClient>,
+) -> Result<BTreeMap<Vec<u8>, (u8, u64)>> {
     let mut seen: BTreeMap<Vec<u8>, (u8, u64)> = BTreeMap::new();
-
-    let mem_items = collect_mem_items(part);
-    for item in &mem_items {
-        let uk = parse_key(&item.key).to_vec();
-        seen.entry(uk).or_insert((item.op, item.expires_at));
-    }
-
     for reader in readers.iter().rev() {
-        let mut it = TableIterator::new(reader.clone());
-        it.rewind();
+        let mut it = AsyncTableIterator::new(
+            reader.clone(),
+            sc.clone(),
+            FetchMode::Window(SCAN_READ_WINDOW_BYTES),
+        );
+        it.rewind().await?;
         while it.valid() {
             let item = it.item().unwrap();
             let uk = parse_key(&item.key).to_vec();
             seen.entry(uk).or_insert((item.op, item.expires_at));
-            it.next();
+            it.next().await?;
         }
     }
+    Ok(seen)
+}
 
+/// Merge a FRESH memtable sample over the SST scan result (memtable holds
+/// strictly newer versions, so it wins per key), then drop tombstones and
+/// expired entries. Sync — call under/right after a brief borrow.
+pub(crate) fn finalize_unique_user_keys(
+    mem_items: &[IterItem],
+    sst_seen: BTreeMap<Vec<u8>, (u8, u64)>,
+) -> Vec<Vec<u8>> {
+    let now = now_secs();
+    let mut seen: BTreeMap<Vec<u8>, (u8, u64)> = BTreeMap::new();
+    // mem_items are sorted by internal key (newest version of each user
+    // key first) — or_insert keeps the newest, mirroring the old combined
+    // scan's first-occurrence-wins discipline.
+    for item in mem_items {
+        let uk = parse_key(&item.key).to_vec();
+        seen.entry(uk).or_insert((item.op, item.expires_at));
+    }
+    for (uk, v) in sst_seen {
+        seen.entry(uk).or_insert(v);
+    }
     seen.into_iter()
         .filter_map(|(uk, (op, expires_at))| {
             if op == 2 {

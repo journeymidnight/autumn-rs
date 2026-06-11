@@ -1,59 +1,59 @@
 Date: 2026-06-11
 TaskStatus: completed
-Task scope: F261 Stage-1 — SST on-demand paging + bounded global block
-  cache + streamed WAL replay. LAST item of the P15 ledger
-  (F258/F259/F260 all completed earlier).
+Task scope: F262 — F261 Stage-2: async SST iterators; delete the
+  range/compact/split whole-SST materialization path.
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
   Already implemented (this commit):
-    - SstSource::{Resident,Paged}, into_paged, read_block_via (global
-      bounded BlockCache; miss -> row_stream read w/ F258 rotation),
-      open_paged_from_meta (meta-tail-only recovery open), materialize.
-    - BlockCache: sampled-LRU, (extent_id, abs_off) keys,
-      --sst-block-cache-bytes (default 512MB), hit/miss stats. No
-      compaction invalidation NEEDED: extent ids never reused.
-    - Async read paths: get/head/GC-liveness via lookup_in_sst_via
-      (snapshot readers -> drop borrow -> await; F250 hop mirrored).
-    - Sync iterator paths (range/do_compact/unique_user_keys):
-      materialized_for_iteration (transient resident copies).
-    - All 3 producer sites (flush/compact/recovery) emit Paged readers.
-    - WAL replay STREAMED in 64MB chunked-carry (decode_records_chunk)
-      — pre-existing whole-extent read was the real O(dataset) RSS
-      source at restart. Chunks read via NEW
-      StreamClient::read_committed_bytes_from_extent (committed-clamp:
-      sealed_length / min-commit probe) — plain explicit-length reads
-      walk past the seal into replica-local speculative bytes and trip
-      StaleVpOffset, wedging partition open (e2e-hit, fixed, re-verified
-      on the same dataset: 8/8 open, byte-compare pass).
-    - coco fixes (2 rounds; 3 P0 + 2 P2 + 1 P3): lookup_in_sst_via
-      error propagation (read error != miss; GC must not punch live
-      VPs); GC paged-liveness await-window race — post-await snapshot
-      VALIDATION loop (active/imm appearance or sst_readers ptr change
-      -> redo lookup; no await between validation/verdict/seq-alloc).
-      NOTE the first-cut "skip if key in active/imm at seq-alloc" was
-      itself a data-loss P0 (mem branch IS the normal live-VP rewrite
-      path) — replaced. Paged read_block_via bounds checks; get/head
-      retry-once on readers-changed (compaction-truncate TOCTOU);
-      range SST key-range pre-filter before materialize; CLI rejects
-      invalid --sst-block-cache-bytes loudly.
-  Not implemented (recorded for Stage-2):
-    - Async TableIterator/MergeIterator (removes range/compact
-      materialization cost).
-    - Diag seq_opt/fullscan report miss on paged readers.
-    - perf-check read-only mode for cleaner cache-bound measurements.
+    - AsyncTableIterator/AsyncMergeIterator (iterator.rs): seek/next/
+      rewind are async + Result (block-read errors PROPAGATE — the sync
+      iterator swallowed them into an unread field, which would silently
+      truncate compaction output once reads became network-backed).
+    - FetchMode::Cached (range: per-block via global BlockCache) vs
+      FetchMode::Window(8MiB) (compact/split: sequential bulk windows,
+      cache-bypassing = scan-resistant, RocksDB fill_cache=false
+      analogue).
+    - reader.rs: window_span (pure, unit-tested) + read_blocks_window
+      (one RPC per window, coco-P2 bounds discipline) +
+      decode_block_from_window. materialize() deleted.
+    - do_compact: window-merge directly over paged inputs;
+      materialized_for_iteration deleted.
+    - handle_range: Cached async iteration; Stage-1 SST key-range
+      pre-filter kept; merge.next() error -> Internal.
+    - unique_user_keys: async over (mem_items, readers, sc) snapshots
+      taken under ONE brief borrow (note 15); split call site updated.
+  Not implemented (recorded):
+    - Diag seq_opt/fullscan still report miss on paged readers
+      (diagnostic-only surface).
+    - perf-check read-only mode.
+    - Compact read-side double-buffering (prefetch next window during
+      merge) — only if compact wall-clock ever matters.
 
 Current summary:
-  ~14GB dataset, 8 partitions: idle post-recovery RSS 2,380MB
-  (replay-window bound, dataset-size-INDEPENDENT; 18-28GB before).
-  Byte-correct across multiple restarts (small/8M/range), 0 errors;
-  cache delta under read storm +240MB < 512MB cap; perf in-band
-  (4K w 27-64K / r 0.5-1.2M; 8M w 103.6 / r 500.4). After the 8M bench
-  grew the set to ~22GB: post-fix restart 8/8 partitions open, idle RSS
-  3,877MB, 4K w 64.1K (baseline 63.2K). 160+72 lib tests.
+  e2e on ~60GB / 8 partitions / TCP 3disk: major compact over the
+  window path OK (input=2 tables, kept=129,723, output 511MB; RSS
+  plateau +2GB = output builder transient, read side no longer
+  materializes); ls/range OK; merge(55,62) + split(13) exercised the
+  async key scan (mid=!pc_0_9768); restart recovery 8/8, f262small +
+  f262big (put-stream, get-stream byte-compare) exact; recovery RSS
+  1,859MB (dataset-independent); fresh-cluster 4K write 70.4K
+  (baseline 63.2K), reads 1.07M ops/s. 162+72 lib tests green.
+  NOTE: CLI `get` returns the 29-byte stripe meta for put-stream keys
+  BY DESIGN (F186 client-side striping; resolution is in get_stream) —
+  byte-compares must use get-stream.
+
+  coco round (2 P1 + 1 P2 + 1 P3, all fixed): window_span block-offset
+  monotonicity check (corrupt meta could wrap win_len into a huge read);
+  range whole-scan retry-once on readers-changed (compaction-truncate
+  exposure is longer with on-demand reads than with materialization;
+  scan body extracted to range_scan_sst_merge); split memtable sample
+  moved AFTER the SST scan (sst_user_key_versions +
+  finalize_unique_user_keys — writes landing during the scan count for
+  the <2 check and mid selection, pre-F262 timing parity);
+  .skillopt-sleep/ gitignored.
 
 Main gaps:
-  - Stage-2 items above; range over huge paged SST sets pays transient
-    materialization (documented).
+  - Stage-2 leftovers above (diag, read-only perf mode, prefetch).
 Next steps:
-  P15 ledger complete. coco verdict folded before commit.
+  - coco verdict folded before commit; P15 + Stage-2 complete.

@@ -1,7 +1,11 @@
+use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::Result;
+use autumn_stream::StreamClient;
+use bytes::Bytes;
 
+use super::block_cache::BlockCache;
 use super::format::DecodedBlock;
 use super::reader::SstReader;
 
@@ -216,6 +220,225 @@ impl TableIterator {
         }
         let block = self.reader.read_block(idx)?;
         Ok(Some(BlockIterator::new(block)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F262 — AsyncTableIterator: block-on-demand iteration over a (paged) SST
+// ---------------------------------------------------------------------------
+
+/// How an `AsyncTableIterator` fetches blocks it doesn't have.
+#[derive(Clone, Copy, Debug)]
+pub enum FetchMode {
+    /// Per-block through the global `BlockCache` (point-ish scans: RANGE).
+    /// Cache-friendly — repeated list calls over the same prefix hit warm
+    /// blocks; cost is one cache probe (+ one 64 KiB RPC on miss) per block.
+    Cached,
+    /// Sequential bulk windows of up to N bytes, BYPASSING the cache
+    /// (full-SST sweeps: compaction, split key-scan). One RPC per window
+    /// instead of per block, and scan-resistant — the sweep cannot evict
+    /// the hot point-lookup working set (RocksDB `fill_cache=false`
+    /// analogue). Peak memory per iterator = one window.
+    Window(u32),
+}
+
+/// F262: async counterpart of `TableIterator` — works on BOTH Resident and
+/// Paged readers, fetching blocks on demand per `FetchMode`. Replaces the
+/// Stage-1 `materialized_for_iteration` whole-SST transient residency.
+///
+/// API contract differences vs the sync `TableIterator`:
+/// - `seek`/`next`/`rewind` are async and return `Result` — a block-read
+///   failure PROPAGATES instead of silently ending the iteration. (The sync
+///   iterator stashes errors in a field nobody reads; with network-backed
+///   blocks that silence would truncate a compaction's merge output.)
+/// - Holds `Rc<StreamClient>` + `Arc<SstReader>` snapshots only — callers
+///   must NOT hold a `RefCell` borrow across the awaits (note 15).
+pub struct AsyncTableIterator {
+    reader: Arc<SstReader>,
+    sc: Rc<StreamClient>,
+    cache: Arc<BlockCache>,
+    mode: FetchMode,
+    block_idx: usize,
+    block_iter: Option<BlockIterator>,
+    /// Window-mode prefetch buffer: (bytes, first_block, end_block_excl,
+    /// win_start_rel).
+    win: Option<(Bytes, usize, usize, u32)>,
+}
+
+impl AsyncTableIterator {
+    pub fn new(reader: Arc<SstReader>, sc: Rc<StreamClient>, mode: FetchMode) -> Self {
+        AsyncTableIterator {
+            reader,
+            sc,
+            cache: crate::global_block_cache().clone(),
+            mode,
+            block_idx: 0,
+            block_iter: None,
+            win: None,
+        }
+    }
+
+    pub fn valid(&self) -> bool {
+        self.block_iter.as_ref().is_some_and(|bi| bi.valid())
+    }
+
+    pub fn item(&self) -> Option<&IterItem> {
+        self.block_iter.as_ref()?.item()
+    }
+
+    pub async fn rewind(&mut self) -> Result<()> {
+        self.block_idx = 0;
+        self.load_from_block_start().await
+    }
+
+    /// Position at the first entry with key >= `target`.
+    pub async fn seek(&mut self, target: &[u8]) -> Result<()> {
+        self.block_idx = self.reader.find_block_for_key(target);
+        match self.load_block(self.block_idx).await? {
+            Some(mut bi) => {
+                bi.seek(target);
+                if bi.valid() {
+                    self.block_iter = Some(bi);
+                    return Ok(());
+                }
+                // Key is past this block (block-boundary case, note 14
+                // analogue): continue from the next block's first entry.
+                self.block_idx += 1;
+                self.load_from_block_start().await
+            }
+            None => {
+                self.block_iter = None;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn next(&mut self) -> Result<()> {
+        if let Some(bi) = self.block_iter.as_mut() {
+            bi.next();
+            if bi.valid() {
+                return Ok(());
+            }
+        }
+        self.block_idx += 1;
+        self.load_from_block_start().await
+    }
+
+    async fn load_from_block_start(&mut self) -> Result<()> {
+        loop {
+            match self.load_block(self.block_idx).await? {
+                Some(mut bi) => {
+                    bi.rewind();
+                    if bi.valid() {
+                        self.block_iter = Some(bi);
+                        return Ok(());
+                    }
+                    self.block_idx += 1;
+                }
+                None => {
+                    self.block_iter = None;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    async fn load_block(&mut self, idx: usize) -> Result<Option<BlockIterator>> {
+        if idx >= self.reader.block_count() {
+            return Ok(None);
+        }
+        let block = match self.mode {
+            FetchMode::Cached => {
+                self.reader
+                    .read_block_via(idx, &self.sc, &self.cache)
+                    .await?
+            }
+            FetchMode::Window(max_bytes) => {
+                let covered = self
+                    .win
+                    .as_ref()
+                    .is_some_and(|(_, s, e, _)| idx >= *s && idx < *e);
+                if !covered {
+                    let (bytes, end_idx, start_rel) = self
+                        .reader
+                        .read_blocks_window(idx, max_bytes, &self.sc)
+                        .await?;
+                    self.win = Some((bytes, idx, end_idx, start_rel));
+                }
+                let (bytes, _, _, start_rel) = self.win.as_ref().unwrap();
+                self.reader
+                    .decode_block_from_window(bytes, *start_rel, idx)?
+            }
+        };
+        Ok(Some(BlockIterator::new(block)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F262 — AsyncMergeIterator: N-way merge over AsyncTableIterators
+// ---------------------------------------------------------------------------
+//
+// Same key-ordering invariants as the sync MergeIterator below (pass
+// iterators newest-first; minimum internal key across iterators = newest
+// version of the smallest user key). Errors from child iterators propagate.
+
+pub struct AsyncMergeIterator {
+    iters: Vec<AsyncTableIterator>,
+}
+
+impl AsyncMergeIterator {
+    pub fn new(iters: Vec<AsyncTableIterator>) -> Self {
+        AsyncMergeIterator { iters }
+    }
+
+    pub fn valid(&self) -> bool {
+        self.iters.iter().any(|it| it.valid())
+    }
+
+    /// Return the current minimum key across all valid iterators.
+    pub fn item(&self) -> Option<&IterItem> {
+        let mut best: Option<&IterItem> = None;
+        let mut best_iter_idx: Option<usize> = None;
+        for (i, it) in self.iters.iter().enumerate() {
+            if let Some(item) = it.item() {
+                if best.is_none()
+                    || item.key < best.unwrap().key
+                    || (item.key == best.unwrap().key && i < best_iter_idx.unwrap())
+                {
+                    best = Some(item);
+                    best_iter_idx = Some(i);
+                }
+            }
+        }
+        best
+    }
+
+    /// Advance all iterators currently positioned on the minimum key.
+    pub async fn next(&mut self) -> Result<()> {
+        let min_key = match self.item().map(|i| i.key.clone()) {
+            Some(k) => k,
+            None => return Ok(()),
+        };
+        for it in self.iters.iter_mut() {
+            if it.item().is_some_and(|i| i.key == min_key.as_slice()) {
+                it.next().await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn rewind(&mut self) -> Result<()> {
+        for it in self.iters.iter_mut() {
+            it.rewind().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn seek(&mut self, target: &[u8]) -> Result<()> {
+        for it in self.iters.iter_mut() {
+            it.seek(target).await?;
+        }
+        Ok(())
     }
 }
 

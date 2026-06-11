@@ -345,24 +345,147 @@ impl SstReader {
         Ok(block)
     }
 
-    /// F261: fetch the whole SST and return a RESIDENT reader for sync
-    /// iteration (compaction / split key-scan / diag fullscan). Transient —
-    /// caller drops it after the scan; concurrency is bounded by the
-    /// existing compact/GC ConcurrencyController gates at the call sites.
-    pub async fn materialize(&self, sc: &Rc<StreamClient>) -> Result<SstReader> {
-        match self.source {
-            SstSource::Resident(ref d) => SstReader::open_at(d.clone(), self.sst_base),
+    /// F262: bulk-fetch the raw bytes of consecutive blocks starting at
+    /// `start_idx` — as many whole blocks as fit in `max_bytes` (always at
+    /// least one) — in ONE read. For sequential scans (compaction / split
+    /// key-scan): one RPC per window instead of per 64 KiB block, and it
+    /// BYPASSES the global BlockCache (scan-resistant — a full-SST sweep
+    /// must not evict the point-lookup working set; mirrors RocksDB's
+    /// `fill_cache=false` compaction reads).
+    ///
+    /// Returns `(bytes, end_idx_exclusive, win_start_rel)`; decode
+    /// individual blocks out of it with `decode_block_from_window`.
+    /// Pure span computation for `read_blocks_window`: how many whole
+    /// blocks from `start_idx` fit in `max_bytes` (always at least one).
+    /// Returns `(end_idx_exclusive, win_start_rel, win_len)`.
+    fn window_span(&self, start_idx: usize, max_bytes: u32) -> Result<(usize, u32, u32)> {
+        let n = self.block_offsets.len();
+        if start_idx >= n {
+            return Err(anyhow!("window start {start_idx} out of range (total={n})"));
+        }
+        let first = &self.block_offsets[start_idx];
+        let win_start_rel = first.relative_offset;
+        let mut end_rel = first
+            .relative_offset
+            .checked_add(first.block_len)
+            .ok_or_else(|| anyhow!("block {start_idx}: offset overflows u32"))?;
+        let mut end_idx = start_idx + 1;
+        while end_idx < n {
+            let bo = &self.block_offsets[end_idx];
+            // coco P1 (F262): block offsets must be monotonically
+            // non-overlapping. A CRC-valid but semantically corrupt
+            // MetaBlock with a REGRESSING offset would otherwise underflow
+            // the budget check (masked by saturating_sub) and wrap
+            // `win_len` into a huge bogus read.
+            if bo.relative_offset < end_rel {
+                return Err(anyhow!(
+                    "corrupt meta: block {end_idx} offset {} regresses below \
+                     previous block end {end_rel}",
+                    bo.relative_offset
+                ));
+            }
+            let e = bo
+                .relative_offset
+                .checked_add(bo.block_len)
+                .ok_or_else(|| anyhow!("block {end_idx}: offset overflows u32"))?;
+            // e >= relative_offset >= end_rel >= win_start_rel ⇒ no underflow.
+            if e - win_start_rel > max_bytes {
+                break;
+            }
+            end_rel = e;
+            end_idx += 1;
+        }
+        Ok((end_idx, win_start_rel, end_rel - win_start_rel))
+    }
+
+    pub async fn read_blocks_window(
+        &self,
+        start_idx: usize,
+        max_bytes: u32,
+        sc: &Rc<StreamClient>,
+    ) -> Result<(Bytes, usize, u32)> {
+        let (end_idx, win_start_rel, win_len) = self.window_span(start_idx, max_bytes)?;
+        let end_rel = win_start_rel + win_len;
+        match &self.source {
+            SstSource::Resident(d) => {
+                let start = self.sst_base as usize + win_start_rel as usize;
+                let end = start + win_len as usize;
+                if end > d.len() {
+                    return Err(anyhow!(
+                        "window out of bounds: start={start} end={end} data_len={}",
+                        d.len()
+                    ));
+                }
+                Ok((d.slice(start..end), end_idx, win_start_rel))
+            }
             SstSource::Paged {
                 extent_id,
                 base_in_extent,
                 len_in_extent,
             } => {
+                // Same bounds discipline as read_block_via (coco P2): the
+                // window must lie inside this SST's extent slice — a corrupt
+                // MetaBlock must not read a neighbour SST's bytes.
+                let in_bounds = self
+                    .sst_base
+                    .checked_add(end_rel)
+                    .is_some_and(|e| e <= *len_in_extent);
+                if !in_bounds {
+                    return Err(anyhow!(
+                        "paged window out of SST bounds (corrupt meta?): \
+                         sst_base={} win=[{},{}) sst_len={}",
+                        self.sst_base,
+                        win_start_rel,
+                        end_rel,
+                        len_in_extent
+                    ));
+                }
+                let abs = base_in_extent
+                    .checked_add(self.sst_base)
+                    .and_then(|v| v.checked_add(win_start_rel))
+                    .ok_or_else(|| anyhow!("window absolute offset overflows u32"))?;
                 let (raw, _end) = sc
-                    .read_bytes_from_extent(extent_id, base_in_extent, len_in_extent)
+                    .read_bytes_from_extent(*extent_id, abs, win_len)
                     .await?;
-                SstReader::from_bytes(Bytes::from(raw))
+                if raw.len() != win_len as usize {
+                    return Err(anyhow!(
+                        "paged window short read: extent={extent_id} off={abs} \
+                         need={win_len} got={}",
+                        raw.len()
+                    ));
+                }
+                Ok((Bytes::from(raw), end_idx, win_start_rel))
             }
         }
+    }
+
+    /// F262: decode block `idx` out of a window previously returned by
+    /// `read_blocks_window` (whose `win_start_rel` must be passed back).
+    pub fn decode_block_from_window(
+        &self,
+        win: &Bytes,
+        win_start_rel: u32,
+        idx: usize,
+    ) -> Result<Arc<DecodedBlock>> {
+        let bo = self.block_offsets.get(idx).ok_or_else(|| {
+            anyhow!(
+                "block index {idx} out of range (total={})",
+                self.block_offsets.len()
+            )
+        })?;
+        let start = bo
+            .relative_offset
+            .checked_sub(win_start_rel)
+            .ok_or_else(|| anyhow!("block {idx} precedes window start"))?
+            as usize;
+        let end = start + bo.block_len as usize;
+        if end > win.len() {
+            return Err(anyhow!(
+                "block {idx} exceeds window: start={start} end={end} win_len={}",
+                win.len()
+            ));
+        }
+        Ok(Arc::new(DecodedBlock::decode(win.slice(start..end), &bo.key)?))
     }
 
     /// Find the block index whose base key is <= `target_key` using binary search.
@@ -383,5 +506,101 @@ impl SstReader {
             }
         }
         lo
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F262 tests — window-span math + window block decode (Resident fixture;
+// the paged RPC path is covered e2e)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod f262_window_tests {
+    use super::*;
+    use crate::sstable::builder::SstBuilder;
+
+    fn ikey(user: &[u8], seq: u64) -> Vec<u8> {
+        let mut k = user.to_vec();
+        k.push(0);
+        k.extend_from_slice(&(u64::MAX - seq).to_be_bytes());
+        k
+    }
+
+    /// Multi-block SST: >1000 entries forces several blocks (per-block
+    /// entry cap), exercising real block boundaries.
+    fn multi_block_reader() -> SstReader {
+        let mut b = SstBuilder::new(0, 0);
+        for i in 0..3500u32 {
+            let user = format!("key{i:06}");
+            b.add(&ikey(user.as_bytes(), i as u64 + 1), 1, b"v", 0);
+        }
+        SstReader::from_bytes(Bytes::from(b.finish())).expect("reader")
+    }
+
+    #[test]
+    fn window_span_budget_and_floor() {
+        let r = multi_block_reader();
+        let n = r.block_count();
+        assert!(n >= 3, "fixture must be multi-block, got {n}");
+
+        // Huge budget → one window covers every block.
+        let (end, start_rel, len) = r.window_span(0, u32::MAX).unwrap();
+        assert_eq!(end, n);
+        assert_eq!(start_rel, r.block_offsets[0].relative_offset);
+        let last = &r.block_offsets[n - 1];
+        assert_eq!(len, last.relative_offset + last.block_len - start_rel);
+
+        // Budget below one block → still exactly one block (floor).
+        let (end, _, len) = r.window_span(0, 1).unwrap();
+        assert_eq!(end, 1);
+        assert_eq!(len, r.block_offsets[0].block_len);
+
+        // Budget for ~2 blocks starting mid-table.
+        let b1 = &r.block_offsets[1];
+        let b2 = &r.block_offsets[2];
+        let two = b2.relative_offset + b2.block_len - b1.relative_offset;
+        let (end, start_rel, len) = r.window_span(1, two).unwrap();
+        assert_eq!(end, 3);
+        assert_eq!(start_rel, b1.relative_offset);
+        assert_eq!(len, two);
+
+        // Past-the-end start errors.
+        assert!(r.window_span(n, u32::MAX).is_err());
+    }
+
+    #[test]
+    fn decode_block_from_window_matches_direct_read() {
+        let r = multi_block_reader();
+        let n = r.block_count();
+        let data = match &r.source {
+            SstSource::Resident(d) => d.clone(),
+            SstSource::Paged { .. } => unreachable!(),
+        };
+
+        // Manually slice a window over blocks [1, 3) and decode both
+        // blocks out of it; entries must match the direct read_block path.
+        let (end, start_rel, len) = r.window_span(1, {
+            let b1 = &r.block_offsets[1];
+            let b2 = &r.block_offsets[2];
+            b2.relative_offset + b2.block_len - b1.relative_offset
+        })
+        .unwrap();
+        assert_eq!(end, 3.min(n));
+        let win = data.slice(
+            (r.sst_base + start_rel) as usize..(r.sst_base + start_rel + len) as usize,
+        );
+        for idx in 1..end {
+            let from_win = r.decode_block_from_window(&win, start_rel, idx).unwrap();
+            let direct = r.read_block(idx).unwrap();
+            assert_eq!(from_win.num_entries(), direct.num_entries());
+            assert_eq!(
+                from_win.get_entry(0).unwrap().0,
+                direct.get_entry(0).unwrap().0,
+                "block {idx} first key mismatch"
+            );
+        }
+
+        // A block before the window start is rejected.
+        assert!(r.decode_block_from_window(&win, start_rel, 0).is_err());
     }
 }

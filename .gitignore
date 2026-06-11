@@ -41,3 +41,4 @@ perf_baseline*.json
 # Tooling caches / generated lockfiles for nested crates
 .codex
 /python/Cargo.lock
+.skillopt-sleep/

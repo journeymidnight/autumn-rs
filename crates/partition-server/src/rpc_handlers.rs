@@ -16,6 +16,7 @@ use autumn_rpc::{HandlerResult, StatusCode};
 use autumn_stream::{ConnPool, StaleVpOffset, StreamClient};
 use bytes::Bytes;
 
+use crate::sstable::{AsyncMergeIterator, AsyncTableIterator, FetchMode};
 use crate::*;
 
 /// F204: translate VP-resolve errors into wire status codes that
@@ -753,61 +754,126 @@ pub(crate) async fn handle_range(
     };
     let seek_key = key_with_ts(&start_user_key, u64::MAX);
 
-    let mem_items = collect_mem_items(&p);
-    let mut mem_it = MemtableIterator::new(mem_items);
-    mem_it.seek(&seek_key);
+    drop(p);
 
-    // F261: paged readers need resident bytes for the sync TableIterator —
-    // snapshot + drop the borrow + materialize (await), then iterate.
-    // Stage-1 cost: a range over paged SSTs fetches whole SSTs transiently;
-    // Stage-2 (async iterators) removes this.
-    //
-    // coco P2: pre-filter by SST key range BEFORE materializing — a small
-    // prefix/limit scan must not transiently fetch the partition's entire
-    // SST set. Skip SSTs entirely before the scan start (biggest < seek)
-    // and, when a prefix bounds the scan, SSTs entirely after it
-    // (smallest's user part > prefix, and not a prefix-extension).
-    // smallest/biggest are INTERNAL keys (user ++ 0x00 ++ inv-seq);
-    // seek_key sorts before every real entry of start_user_key, so
-    // `biggest < seek_key` is exact, not approximate.
-    let readers_snap: Vec<std::sync::Arc<SstReader>> = p
-        .sst_readers
-        .iter()
-        .filter(|r| {
-            if r.biggest_key() < seek_key.as_slice() {
-                return false;
-            }
-            if !req.prefix.is_empty() {
-                let s_user = parse_key(r.smallest_key());
-                if s_user > req.prefix.as_slice() && !s_user.starts_with(&req.prefix) {
+    // F262 + coco P1: the scan reads blocks on demand, so a background
+    // compaction that completes MID-SCAN can truncate a snapshot reader's
+    // backing row extent (the Arc holds metadata only) — a longer exposure
+    // window than Stage-1's up-front materialization had. Same remedy as
+    // get/head: on a scan error, if the live sst_readers set changed since
+    // the snapshot, redo the WHOLE scan once against the fresh set (range
+    // is limit-bounded; one redo on a rare race is cheaper than mid-scan
+    // resume bookkeeping). Unchanged set or second failure = real error.
+    let mut attempt = 0u32;
+    let out = loop {
+        attempt += 1;
+        let p = part.borrow();
+        let mem_items = collect_mem_items(&p);
+        // Unfiltered Arc snapshot for change detection (the scan set below
+        // is pre-filtered, so it can't be ptr-compared against live state).
+        let full_snap: Vec<std::sync::Arc<SstReader>> = p.sst_readers.to_vec();
+        // F262: async block-on-demand iteration over the (paged) SSTs — no
+        // materialization. Blocks fetch through the global BlockCache
+        // (FetchMode::Cached): repeated list calls over the same prefix hit
+        // warm blocks, and per-request memory is O(open blocks), not O(SST
+        // bytes).
+        //
+        // coco P2 (kept from Stage-1): pre-filter by SST key range — skip
+        // SSTs entirely before the scan start (biggest < seek) and, when a
+        // prefix bounds the scan, SSTs entirely after it. smallest/biggest
+        // are INTERNAL keys (user ++ 0x00 ++ inv-seq); seek_key sorts
+        // before every real entry of start_user_key, so
+        // `biggest < seek_key` is exact.
+        let readers_snap: Vec<std::sync::Arc<SstReader>> = p
+            .sst_readers
+            .iter()
+            .filter(|r| {
+                if r.biggest_key() < seek_key.as_slice() {
                     return false;
                 }
-            }
-            true
-        })
-        .cloned()
-        .collect();
-    let sc_snap = p.stream_client.clone();
-    drop(p);
-    let readers_mat = materialized_for_iteration(&readers_snap, &sc_snap)
-        .await
-        .map_err(|e| (StatusCode::Internal, format!("range materialize: {e}")))?;
-    let p = part.borrow();
-    let sst_iters: Vec<TableIterator> = readers_mat
-        .iter()
-        .rev()
-        .map(|r| {
-            let mut it = TableIterator::new(r.clone());
-            it.seek(&seek_key);
-            it
-        })
-        .collect();
-    let mut merge = MergeIterator::new(sst_iters);
+                if !req.prefix.is_empty() {
+                    let s_user = parse_key(r.smallest_key());
+                    if s_user > req.prefix.as_slice() && !s_user.starts_with(&req.prefix) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        let sc_snap = p.stream_client.clone();
+        let now = now_secs();
+        let check_overlap = p.has_overlap.get() != 0;
+        let part_rg = p.rg.clone();
+        drop(p);
 
-    let now = now_secs();
-    let check_overlap = p.has_overlap.get() != 0;
-    let part_rg = p.rg.clone();
-    drop(p);
+        match range_scan_sst_merge(
+            &req,
+            &seek_key,
+            mem_items,
+            &readers_snap,
+            &sc_snap,
+            now,
+            check_overlap,
+            &part_rg,
+        )
+        .await
+        {
+            Ok(entries) => break entries,
+            Err(e) => {
+                let q = part.borrow();
+                let readers_changed = q.sst_readers.len() != full_snap.len()
+                    || q
+                        .sst_readers
+                        .iter()
+                        .zip(full_snap.iter())
+                        .any(|(a, b)| !std::sync::Arc::ptr_eq(a, b));
+                drop(q);
+                if attempt == 1 && readers_changed {
+                    continue;
+                }
+                return Err((StatusCode::Internal, format!("range sst read: {e}")));
+            }
+        }
+    };
+
+    let has_more = out.len() == req.limit as usize;
+    Ok(partition_rpc::rkyv_encode(&RangeResp {
+        code: CODE_OK,
+        message: String::new(),
+        entries: out,
+        has_more,
+        cur_end_key,
+    }))
+}
+
+
+/// F262 + coco P1: one full SST-merge scan pass for `handle_range` — built
+/// from fresh snapshots each call so the caller can retry the whole pass
+/// when a concurrent compaction invalidates the reader set mid-scan.
+/// Mirrors the pre-F262 mem/SST 2-way merge exactly; block-read errors
+/// propagate (caller decides retry vs Internal).
+#[allow(clippy::too_many_arguments)]
+async fn range_scan_sst_merge(
+    req: &RangeReq,
+    seek_key: &[u8],
+    mem_items: Vec<IterItem>,
+    readers_snap: &[std::sync::Arc<SstReader>],
+    sc_snap: &Rc<StreamClient>,
+    now: u64,
+    check_overlap: bool,
+    part_rg: &autumn_rpc::manager_rpc::MgrRange,
+) -> anyhow::Result<Vec<RangeEntry>> {
+    let mut mem_it = MemtableIterator::new(mem_items);
+    mem_it.seek(seek_key);
+
+    let mut sst_iters: Vec<AsyncTableIterator> = Vec::with_capacity(readers_snap.len());
+    for r in readers_snap.iter().rev() {
+        let mut it = AsyncTableIterator::new(r.clone(), sc_snap.clone(), FetchMode::Cached);
+        it.seek(seek_key).await?;
+        sst_iters.push(it);
+    }
+    let mut merge = AsyncMergeIterator::new(sst_iters);
 
     let mut out: Vec<RangeEntry> = Vec::new();
     let mut last_user_key: Option<Vec<u8>> = None;
@@ -833,7 +899,7 @@ pub(crate) async fn handle_range(
             }
             (None, Some(_)) => {
                 let item = merge.item().unwrap().clone();
-                merge.next();
+                merge.next().await?;
                 item
             }
             (Some(mk), Some(sk)) => {
@@ -844,7 +910,7 @@ pub(crate) async fn handle_range(
                     while merge.valid() {
                         if let Some(si) = merge.item() {
                             if parse_key(&si.key) == uk_owned.as_slice() {
-                                merge.next();
+                                merge.next().await?;
                             } else {
                                 break;
                             }
@@ -856,7 +922,7 @@ pub(crate) async fn handle_range(
                 } else {
                     let item = merge.item().unwrap().clone();
                     let uk_owned = parse_key(sk).to_vec();
-                    merge.next();
+                    merge.next().await?;
                     while mem_it.valid() {
                         if let Some(mi) = mem_it.item() {
                             if parse_key(&mi.key) == uk_owned.as_slice() {
@@ -874,7 +940,7 @@ pub(crate) async fn handle_range(
         };
 
         let uk = parse_key(&item.key);
-        if check_overlap && !in_range(&part_rg, uk) {
+        if check_overlap && !in_range(part_rg, uk) {
             continue;
         }
         if !req.prefix.is_empty() && !uk.starts_with(&req.prefix as &[u8]) {
@@ -901,14 +967,7 @@ pub(crate) async fn handle_range(
         }
     }
 
-    let has_more = out.len() == req.limit as usize;
-    Ok(partition_rpc::rkyv_encode(&RangeResp {
-        code: CODE_OK,
-        message: String::new(),
-        entries: out,
-        has_more,
-        cur_end_key,
-    }))
+    Ok(out)
 }
 
 pub(crate) async fn handle_split_part(
@@ -1019,16 +1078,21 @@ pub(crate) async fn handle_split_part(
             })?
     };
 
-    // F261: materialize paged SSTs for the sync key scan (under
-    // compact_gate; transient resident copies).
+    // F262: async window scan over the (paged) SSTs — snapshot readers +
+    // sc under one brief borrow, drop, await (note 15). Reader set is
+    // stable: this path holds compact_gate.
     let (uuk_readers, uuk_sc) = {
         let p = part.borrow();
         (p.sst_readers.to_vec(), p.stream_client.clone())
     };
-    let uuk_readers = materialized_for_iteration(&uuk_readers, &uuk_sc)
+    let sst_seen = sst_user_key_versions(&uuk_readers, &uuk_sc)
         .await
-        .map_err(|e| (StatusCode::Internal, format!("split materialize: {e}")))?;
-    let user_keys = unique_user_keys(&part.borrow(), &uuk_readers)
+        .map_err(|e| (StatusCode::Internal, format!("split key scan: {e}")))?;
+    // coco P2 (F262): sample the memtable AFTER the (long) SST scan, so
+    // writes that landed during it still count toward the `< 2 keys`
+    // check and the midpoint choice.
+    let uuk_mem_items = collect_mem_items(&part.borrow());
+    let user_keys = finalize_unique_user_keys(&uuk_mem_items, sst_seen)
         .into_iter()
         .filter(|k| in_range(&auth_rg, k))
         .collect::<Vec<_>>();
