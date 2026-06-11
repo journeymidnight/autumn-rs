@@ -3242,7 +3242,6 @@ impl PartitionServer {
             .parse()
             .context("parse per-partition listen addr")?;
         let advertise_host = self.advertise_host.borrow().clone();
-        let advertise_addr = format!("{}:{}", advertise_host, listen_port);
 
         // Shutdown signal: main thread drops `shutdown_tx` to tell the
         // partition's accept loop to exit.
@@ -3255,8 +3254,15 @@ impl PartitionServer {
         let (drain_tx, drain_rx) = mpsc::unbounded::<oneshot::Sender<()>>();
 
         // Report bind + registration success/failure back to the caller,
-        // so we can fail loudly and reclaim the ordinal if needed.
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<()>>();
+        // so we can fail loudly and reclaim the ordinal if needed. F270:
+        // on success the thread reports the ACTUALLY-ADVERTISED address
+        // (the BUG #3 bind fallback may move the port off the computed
+        // base+ord) — `PartitionHandle.part_addr` must carry the actual
+        // one or the F265 part_addr self-heal "heals" the manager's
+        // correct registration back to the dead computed port (the F270
+        // residual: split child reopened on a fallback port, the heal
+        // re-registered the stale port, clients routed to it forever).
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<String>>();
 
         let manager_addr_for_thread = manager_addr.clone();
         let owner_key_for_thread = owner_key.clone();
@@ -3327,8 +3333,8 @@ impl PartitionServer {
         // with the manager. If either step fails, bubble the error up so
         // `sync_regions_once` reports the failure (operator-visible; no
         // silent skip).
-        match ready_rx.await {
-            Ok(Ok(())) => {}
+        let actual_advertise = match ready_rx.await {
+            Ok(Ok(addr)) => addr,
             Ok(Err(e)) => {
                 return Err(e.context(format!(
                     "partition {part_id} failed to bind listener on {listen_addr} or register addr"
@@ -3339,12 +3345,14 @@ impl PartitionServer {
                     "partition {part_id} thread exited before reporting listener readiness"
                 ));
             }
-        }
+        };
 
         Ok(PartitionHandle {
             shutdown_tx: Some(shutdown_tx),
             drain_tx: Some(drain_tx),
-            part_addr: advertise_addr,
+            // F270: the ACTUAL advertised address from the partition
+            // thread (bind fallback may differ from the computed one).
+            part_addr: actual_advertise,
             metrics: metrics_for_handle,
             compact_trigger: compact_tx_main,
             gc_trigger: gc_tx_main,
@@ -4464,7 +4472,7 @@ async fn partition_thread_main(
     ps_id: u64,
     listen_addr: SocketAddr,
     advertise_host: String,
-    ready_tx: oneshot::Sender<Result<()>>,
+    ready_tx: oneshot::Sender<Result<String>>,
     shutdown_rx: oneshot::Receiver<()>,
     drain_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
     cpu_bulk: Option<usize>,
@@ -4982,7 +4990,10 @@ async fn partition_thread_main(
 
     // Signal the main thread that the listener is up AND the address is
     // registered; `open_partition` can now return Ok.
-    let _ = ready_tx.send(Ok(()));
+    // F270: report the ACTUAL advertise address (post-fallback) so
+    // `PartitionHandle.part_addr` — the F265 self-heal's source of truth —
+    // matches what was registered with the manager.
+    let _ = ready_tx.send(Ok(advertise_addr.clone()));
 
     // F099-K accept loop: own the listener on this runtime, spawn
     // `handle_ps_connection` on this runtime for every new fd. The accept

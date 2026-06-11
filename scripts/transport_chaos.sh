@@ -410,11 +410,14 @@ write_liveness "e6"
 #      window. The PS-side FREEZE_TTL (30s) is the designed backstop;
 #      after the manager respawns the cluster must serve again with the
 #      merge either fully committed or fully rolled back.
-mapfile -t E7PARTS < <("${AOC[@]}" info 2>/dev/null | sed -n 's/^  part \([0-9]*\):.*/\1/p' | sort -n | head -4)
-if [ "${#E7PARTS[@]}" -lt 4 ]; then
-    fail "E7: could not enumerate 4 partitions (got ${#E7PARTS[@]})"
+# E6's merge ops (F269) can shrink the partition count below the
+# original 4 — adapt: need >= 2; the a-* keys live in the upper-middle
+# band, approximated by the 2/3 index in id (= key) order.
+mapfile -t E7PARTS < <("${AOC[@]}" info 2>/dev/null | sed -n 's/^  part \([0-9]*\):.*/\1/p' | sort -n)
+if [ "${#E7PARTS[@]}" -lt 2 ]; then
+    fail "E7: could not enumerate >=2 partitions (got ${#E7PARTS[@]})"
 else
-    SPLIT_PART="${E7PARTS[2]}"   # 3rd in key order — holds the a-* keys
+    SPLIT_PART="${E7PARTS[$(( (${#E7PARTS[@]} * 2) / 3 ))]}"
     # Hosting PS: per-partition port < 9351 ⇒ PS1 band, else PS2 band.
     SP_PORT=$("${AOC[@]}" info 2>/dev/null | sed -n "s/^  part ${SPLIT_PART}: ps=127.0.0.1:\([0-9]*\).*/\1/p" | head -1)
     if [ -n "$SP_PORT" ] && [ "$SP_PORT" -lt 9351 ]; then SP_PSID=1; SP_BASE=9301; else SP_PSID=2; SP_BASE=9351; fi

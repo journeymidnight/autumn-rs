@@ -1,6 +1,6 @@
 Date: 2026-06-11
-TaskStatus: not_completed
-Task scope: F267+F268+F269 (completed) + F270 复现完成、修复未做 — /loop chaos 迭代 5：multi-manager HA chaos
+TaskStatus: completed
+Task scope: F267+F268+F269+F270 全部 completed — /loop chaos 迭代 5：multi-manager HA chaos
   （manager_ha_chaos.sh H1 leader kill / H2 仅新 leader 时 PS kill /
   H3 老 leader 回归 follower），发现并修复 4 个真实 bug。
 
@@ -57,5 +57,9 @@ F270 三模式同根已破：harness ephemeral 端口当 EN 固定身份 → kil
   重生 EADDRINUSE → EN 永久死 → alloc 饥饿。pick_stable_port_pair
   修复后 seed=13 x10 = 9/10（修前 1/10）。残留 1/10 = 窄版
   split-child 不可达（无 alloc 饥饿），待 traced 捕获。
+F270 残留窄尾已破并闭合：PartitionHandle.part_addr 存计算地址，
+  BUG#3 端口 fallback 触发时 F265 自愈把正确注册覆写回死端口；ready
+  通道回传实际 advertise 修复。seed=13 x15 = 15/15；全 gauntlet 回归
+  4 轮 PASS 0 丢失。F270 completed。
 Next steps:
-  - F270 残留窄尾: traced 捕获 split-child drop+reopen 路径。
+  - 无（chaos /loop 全部已知项闭环）。

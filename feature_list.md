@@ -628,5 +628,16 @@ gaps in the lease protocol's correctness story.
   no-healthy=0 全消。残留 1/10 = 窄版 Mode Y（split child 连接拒绝、
   无 alloc 饥饿、EN 全健康——疑 PS drop+reopen 路径），与历史 ~1/10
   基线一致，待 traced 捕获。
-- **passes:** not_completed（残留窄尾待查；fence 自愈层 + harness 根
-  因修复已落地）
+- **残留窄尾已破（2026-06-11 深夜，traced 捕获 attempt5）:** 子分区重
+  开时确定性端口被占 → BUG #3 :0-fallback 绑新端口并正确注册——但
+  `PartitionHandle.part_addr` 存的是**计算地址**而非实际绑定地址，
+  F265 part_addr 自愈据此把 manager 上正确的注册覆写回死端口
+  （trace: "partition listener bound ...:16223" 下一行 "F265
+  re-registered part_addr ...:15198"）→ 客户端永久路由到死端口。
+  **修复:** ready 通道改 `Result<String>` 回传实际 advertise 地址，
+  PartitionHandle.part_addr 用实际值；同修 E7 对 E6-merge 后分区数
+  <4 的硬断言（自适应 ≥2 + 2/3 索引）；coco P3（死变量）折入。
+- **最终验证:** seed=13 x15 = **15/15 PASS**（当日早 1/10）；全
+  gauntlet 回归（transport E1-E7 tcp/ucx + HA tcp/ucx）全 PASS，
+  1925/710/469/290 ACK 0 丢失。
+- **passes:** completed (2026-06-11)
