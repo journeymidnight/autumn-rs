@@ -595,8 +595,24 @@ gaps in the lease protocol's correctness story.
   不齐 → all-replica append 无法完成；seal-and-roll 逃逸未触发
   （"recovery-stuck blocks alloc_extent"）。nemesis 的 node-1
   NetworkPartition 窗口是诱因。
-- **修复方向（待证实）:** 为何 writer 的 seal-and-roll（
-  seal_commit_watermark → alloc_new_extent(Some(commit))）在该形态下
-  不触发/被拒；结合 manager CLAUDE.md note 31（sealed-tail alloc 不再
-  被 inflight Recovery 阻塞——OPEN tail 路径是否仍被阻）核对。
+- **用户拍板（2026-06-11）:** 修复方向 (a)+(b) 组合。
+- **已落地（partial，本 commit）:** (a) open-tail current_commit 持久
+  失败的 seal-and-roll 逃逸【已存在】（BUG#1 fix，早于本迭代）。
+  (b) fence 模式自愈：`current_commit` 把 CODE_LOCKED_BY_OTHER 拒绝
+  从"unreachable"中区分出来（错误串含 LockedByOther——is_locked_by_other
+  可分类）；flush path（async-phase + commit 两个 error sink）遇 fence
+  即 `poison_for_fence`：置 locked_by_other + 同时发 imm_drained 与
+  split_wake 两个唤醒（coco P1：idle select 不听 imm_drained）→
+  partition 退出 → region_sync reopen → F267 fresh epoch 自愈。
+  针对 5/30 已 trace 的 fence-bump 复合层。
+- **验证（诚实记录）:** seed=13 x10（fix 后）= 1/10 PASS；wedge 仍现
+  2/10 且日志零 LockedByOther → **今日 Mode Z 不是 fence 引起**（纯
+  all-replica 等待面，Mode B 本体）；not_found=200（split child 不开）
+  5/10 占主导。当日傍晚失败率显著高于历史 ~1/10（环境敏感度未排除）。
+  (b) 改动 cold path、530 单测绿、coco P1 已折入——按"已 trace 机制的
+  定向修复"保留。
+- **下一步:** ① RUST_LOG trace 捕获今日 Mode Z（确认 P-bulk append
+  卡死 vs current_commit 面）；② Mode Y split-child 不开（connect
+  refused + not_found=200）独立查；③ Mode X 启动期 no-healthy-node
+  （疑 harness race）。
 - **passes:** not_completed

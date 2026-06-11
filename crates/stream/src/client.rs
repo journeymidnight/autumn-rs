@@ -2286,6 +2286,7 @@ impl StreamClient {
     async fn current_commit(&self, tail: &StreamTail) -> Result<u32> {
         let mut min_len: Option<u32> = None;
         let mut success: usize = 0;
+        let mut locked: usize = 0;
         let total = tail.replica_addrs.len();
         let owner_epoch = self.owner_epoch;
         for addr in &tail.replica_addrs {
@@ -2313,6 +2314,16 @@ impl StreamClient {
                 continue;
             };
             if resp.code != CODE_OK {
+                // F270: a CODE_LOCKED_BY_OTHER rejection means OUR epoch is
+                // stale (admin fence-bump / new owner), NOT that the replica
+                // is unreachable. Pre-F270 this was folded into the generic
+                // "only N/M responded" error, so the caller could never tell
+                // a fenced probe from a dead replica — and a fence-bumped
+                // writer retried the same stale epoch forever (the seed=13/15
+                // open-tail write wedge's compounding layer).
+                if resp.code == CODE_LOCKED_BY_OTHER {
+                    locked += 1;
+                }
                 continue;
             }
             success += 1;
@@ -2320,6 +2331,20 @@ impl StreamClient {
         }
         // F227: require ALL replicas to respond — no quorum (see fn doc).
         if success < total {
+            if locked > 0 {
+                // The "LockedByOther" substring is load-bearing: the PS's
+                // `is_locked_by_other` classifies on it and poisons the
+                // partition, whose region_sync reopen re-acquires a FRESH
+                // per-partition epoch (F267) — the self-heal for fence bumps.
+                return Err(anyhow!(
+                    "commit_length on extent {}: only {}/{} replicas responded \
+                     ({} rejected LockedByOther — stale owner epoch)",
+                    tail.extent.extent_id,
+                    success,
+                    total,
+                    locked
+                ));
+            }
             return Err(anyhow!(
                 "commit_length on extent {}: only {}/{} replicas responded (need all)",
                 tail.extent.extent_id,

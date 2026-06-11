@@ -4711,10 +4711,18 @@ async fn partition_thread_main(
     // F099-A flame graph analysis (docs/superpowers/specs/2026-04-20-*.md
     // §Section 3/4) for why this collapse matters (~30 % of P-log CPU on
     // 256 × d=1 came from spawn + inner oneshot + Waker cascade).
+    // F270: created BEFORE the flush spawn — the flush loop shares the
+    // poison flag so a fence rejection inside the flush path (P-bulk
+    // append / commit_length barrier hitting CODE_LOCKED_BY_OTHER after
+    // an admin fence-bump or ownership change) tears the partition down
+    // for a region_sync reopen with a FRESH per-partition epoch (F267)
+    // instead of retrying the stale epoch every 2 s forever.
+    let locked_by_other = Rc::new(Cell::new(false));
     {
         let p = part.clone();
+        let poison = locked_by_other.clone();
         spawn_failstop(format!("flush[part {part_id}]"), async move {
-            background_flush_loop(p, flush_rx).await;
+            background_flush_loop(p, flush_rx, poison).await;
         });
     }
     {
@@ -4744,8 +4752,6 @@ async fn partition_thread_main(
             async move { vp_refs_retry_loop(p).await }
         });
     }
-    let locked_by_other = Rc::new(Cell::new(false));
-
     // F099-K: bind this partition's dedicated TcpListener on THIS
     // compio runtime and report readiness (bind + manager-side register)
     // back to the caller via `ready_tx`. If EITHER step fails, we report
@@ -7880,9 +7886,43 @@ where
 /// 2 s is well below the chaos settle window and far above a tight error spin.
 const FLUSH_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// F270: poison the partition after a FENCE rejection (LockedByOther) in the
+/// flush path, and WAKE the (possibly imm-full-parked) `partition_loop` via
+/// the imm-drained channel so it observes the flag and exits — a parked loop
+/// polls only `inflight` + `imm_drained_rx`, so without the wake the poison
+/// would sit unnoticed exactly in the wedged state this exists to break.
+/// The region_sync reopen then re-acquires a FRESH per-partition owner epoch
+/// (F267), which clears both the manager equality check and the EN floors —
+/// the self-heal for admin fence-bumps; a genuine new owner simply keeps the
+/// partition (the manager's region map is the arbiter on reopen).
+fn poison_for_fence(
+    part: &Rc<RefCell<PartitionData>>,
+    locked_by_other: &Rc<Cell<bool>>,
+    site: &str,
+) {
+    tracing::error!("F270: {site} fenced (LockedByOther) — poisoning partition for fresh-epoch reopen");
+    locked_by_other.set(true);
+    // Fire BOTH wake channels (coco P1): the imm-full park listens on
+    // imm_drained_rx, but the fully-idle select listens only on
+    // req_rx / split_wake_rx / drain_rx — without the split-wake an idle
+    // partition would sleep through the poison until the next request.
+    // Every loop iteration re-checks `locked_by_other` at the top, so
+    // either wake suffices once it lands in the right state.
+    let (imm_tx, wake_tx) = {
+        let p = part.borrow();
+        (p.imm_drained_tx.clone(), p.split_wake_tx.clone())
+    };
+    let _ = imm_tx.unbounded_send(());
+    let _ = wake_tx.unbounded_send(());
+}
+
 async fn background_flush_loop(
     part: Rc<RefCell<PartitionData>>,
     mut flush_rx: mpsc::UnboundedReceiver<()>,
+    // F270: shared poison flag (same Rc `partition_loop` checks). A fence
+    // rejection in the flush path must tear the partition down for a
+    // fresh-epoch reopen, not retry the stale epoch forever.
+    locked_by_other: Rc<Cell<bool>>,
 ) {
     use futures::future::{select, Either, FutureExt};
     use futures::stream::FuturesOrdered;
@@ -7978,11 +8018,17 @@ async fn background_flush_loop(
                     }
                     if let Err(e) = commit_flush_outcome(&part, outcome).await {
                         tracing::error!("background flush commit error: {e}");
+                        if crate::background::is_locked_by_other(&e) {
+                            poison_for_fence(&part, &locked_by_other, "flush commit");
+                        }
                         failed = true;
                     }
                 }
                 Some(Err(e)) => {
                     tracing::error!("background flush async-phase error: {e}");
+                    if crate::background::is_locked_by_other(&e) {
+                        poison_for_fence(&part, &locked_by_other, "flush async phase");
+                    }
                     failed = true;
                 }
                 None => break,
