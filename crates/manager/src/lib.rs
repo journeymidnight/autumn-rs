@@ -2011,6 +2011,53 @@ impl AutumnManager {
         self.serving.set(true);
     }
 
+    /// Observability batch 1: Prometheus text snapshot of control-plane
+    /// state. Called by the manager binary's 2 s publisher task ON the
+    /// compio runtime (the store is `Rc<RefCell>`, !Send); the rendered
+    /// string is what crosses to the metrics HTTP thread.
+    pub fn metrics_text(&self) -> String {
+        use autumn_common::metrics_http::{push_metric, push_type};
+        let mut out = String::with_capacity(1024);
+        push_type(&mut out, "autumn_manager_leader", "gauge");
+        push_metric(&mut out, "autumn_manager_leader", &[], self.leader.get() as u32);
+        push_type(&mut out, "autumn_manager_serving", "gauge");
+        push_metric(&mut out, "autumn_manager_serving", &[], self.serving.get() as u32);
+        {
+            let s = self.store.inner.borrow();
+            for (name, v) in [
+                ("autumn_manager_streams", s.streams.len()),
+                ("autumn_manager_extents", s.extents.len()),
+                ("autumn_manager_extent_nodes", s.nodes.len()),
+                ("autumn_manager_partitions", s.partitions.len()),
+                ("autumn_manager_ps_nodes", s.ps_nodes.len()),
+                ("autumn_manager_regions", s.regions.len()),
+                ("autumn_manager_part_addrs", s.part_addrs.len()),
+            ] {
+                push_type(&mut out, name, "gauge");
+                push_metric(&mut out, name, &[], v as u32);
+            }
+            // Per-disk online state as the manager sees it (the df-driven
+            // call-result signal, CLAUDE.md note 7).
+            push_type(&mut out, "autumn_manager_disk_online", "gauge");
+            for (disk_id, d) in &s.disks {
+                push_metric(
+                    &mut out,
+                    "autumn_manager_disk_online",
+                    &[("disk_id", disk_id.to_string())],
+                    d.online as u32,
+                );
+            }
+        }
+        push_type(&mut out, "autumn_manager_extent_inflight_ops", "gauge");
+        push_metric(
+            &mut out,
+            "autumn_manager_extent_inflight_ops",
+            &[],
+            self.inflight.borrow().len() as u32,
+        );
+        out
+    }
+
     // ── Background loops ───────────────────────────────────────────────
 
     // F228 (1C): takes `self` by value (was `&self`) for uniformity with the

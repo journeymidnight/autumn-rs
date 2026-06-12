@@ -80,6 +80,14 @@ struct Args {
     /// Per-thread regpool cap (pinned/registered bytes). `None` = library
     /// default (512 MiB/thread). Clamped to [16 MiB, 64 GiB].
     ucx_regpool_cap_bytes: Option<usize>,
+    /// Observability batch 1: Prometheus `/metrics` HTTP port.
+    /// `None` = endpoint disabled (zero cost). One endpoint per PROCESS
+    /// (shard gauges are aggregated by the renderer).
+    metrics_port: Option<u16>,
+    /// Bind host for /metrics only. `None` = follow `--listen`. The
+    /// endpoint is unauthenticated — operators exposing the RPC plane
+    /// on 0.0.0.0 can pin metrics to 127.0.0.1 with this.
+    metrics_listen: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -96,6 +104,8 @@ fn parse_args() -> Args {
     let mut cpuset: Option<Vec<usize>> = None;
     // F191: optional override; default = port + 1000.
     let mut control_port: Option<u16> = None;
+    let mut metrics_port: Option<u16> = None;
+    let mut metrics_listen: Option<String> = None;
     // F195: F194 + F099-I knobs as Option<usize>; library defaults when None.
     let mut ec_convert_parallelism: Option<usize> = None;
     let mut recovery_parallelism: Option<usize> = None;
@@ -207,6 +217,14 @@ fn parse_args() -> Args {
                         .expect("--ucx-regpool-cap-bytes usize"),
                 );
             }
+            "--metrics-port" => {
+                i += 1;
+                metrics_port = Some(args[i].parse().expect("--metrics-port must be a port"));
+            }
+            "--metrics-listen" => {
+                i += 1;
+                metrics_listen = Some(args[i].clone());
+            }
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
@@ -238,6 +256,8 @@ fn parse_args() -> Args {
         recovery_parallelism,
         inflight_cap,
         ucx_regpool_cap_bytes,
+        metrics_port,
+        metrics_listen,
     }
 }
 
@@ -453,6 +473,24 @@ fn main() -> Result<()> {
         ports = ?shard_ports,
         "autumn-extent-node starting"
     );
+
+    // Observability batch 1: ONE /metrics endpoint per process, spawned
+    // before the shard threads (covers both single- and multi-shard
+    // paths). The renderer reads process-global atomics + the per-shard
+    // gauge slots each ExtentNode registers at construction — no compio
+    // involvement, safe on its own OS thread.
+    if let Some(mport) = args.metrics_port {
+        let mhost = args.metrics_listen.as_deref().unwrap_or(&args.bind_host);
+        match autumn_common::metrics_http::spawn_metrics_http(
+            mhost,
+            mport,
+            std::sync::Arc::new(autumn_stream::render_en_metrics),
+        ) {
+            Ok(()) => tracing::info!(port = mport, host = mhost, "metrics endpoint up at /metrics"),
+            // Auxiliary — a taken metrics port must not kill the data plane.
+            Err(e) => tracing::error!(port = mport, "metrics endpoint bind failed: {e}"),
+        }
+    }
 
     if shards == 1 {
         // Single-shard fast path — preserve exact pre-F196 behaviour.

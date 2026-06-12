@@ -331,10 +331,15 @@ launch_extent_node() {
     # F214-D: --disk-id was removed. Single-disk and multi-disk paths
     # are now uniform — `autumn-op format` writes the disk_id sentinel
     # file per dir, which the EN reads on startup.
+    local -a metrics_args=()
+    if [[ "${AUTUMN_METRICS:-0}" == "1" ]]; then
+        metrics_args=(--metrics-port "$(( 9600 + i ))")
+    fi
     start_proc "node$i" \
         "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
         --listen "$BIND_HOST" --transport "$TRANSPORT" \
         ${stride_args[@]:+"${stride_args[@]}"} \
+        ${metrics_args[@]:+"${metrics_args[@]}"} \
         ${cpu_args[@]:+"${cpu_args[@]}"}
     wait_port "$port" "node$i"
 }
@@ -519,6 +524,9 @@ launch_ps() {
     if [[ -n "${AUTUMN_REGPOOL_LOG_INTERVAL_SECS:-}" ]]; then
         tunable_args+=(--regpool-log-interval-secs "$AUTUMN_REGPOOL_LOG_INTERVAL_SECS")
     fi
+    if [[ "${AUTUMN_METRICS:-0}" == "1" ]]; then
+        tunable_args+=(--metrics-port 9701)
+    fi
     start_proc ps \
         "$PS" \
         --psid 1 --port "$PS_BASE_PORT" \
@@ -606,6 +614,12 @@ do_start() {
     local mgr_extra=""
     if [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]]; then
         mgr_extra="--policy-fast-mode"
+    fi
+    # Observability batch 1: AUTUMN_METRICS=1 wires Prometheus /metrics
+    # endpoints on every role (manager 9591, EN 960<i>, PS 9701 — all
+    # below the 10000 ephemeral floor, see BUG#3).
+    if [[ "${AUTUMN_METRICS:-0}" == "1" ]]; then
+        mgr_extra="$mgr_extra --metrics-port 9591"
     fi
     start_proc manager \
         "$MANAGER" --port 9001 --etcd 127.0.0.1:2379 --listen "$BIND_HOST" \

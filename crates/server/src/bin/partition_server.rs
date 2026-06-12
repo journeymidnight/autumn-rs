@@ -85,6 +85,13 @@ struct Args {
     /// enough to surface every thread's pool activity. Useful for
     /// confirming the registered-buffer hit rate during a perf run.
     regpool_log_interval_secs: Option<u64>,
+    /// Observability batch 1: Prometheus `/metrics` HTTP port.
+    /// `None` = endpoint disabled (zero cost).
+    metrics_port: Option<u16>,
+    /// Bind host for /metrics only. `None` = follow `--listen`. The
+    /// endpoint is unauthenticated — operators exposing the RPC plane
+    /// on 0.0.0.0 can pin metrics to 127.0.0.1 with this.
+    metrics_listen: Option<String>,
     // F195: pprof CLI flags (replaces AUTUMN_PPROF_* env reads).
     #[cfg(feature = "profiling")]
     pprof_secs: Option<u64>,
@@ -134,6 +141,8 @@ fn parse_args() -> Args {
     let mut gc_rate_bytes_per_sec: Option<u64> = None;
     let mut ucx_regpool_cap_bytes: Option<usize> = None;
     let mut regpool_log_interval_secs: Option<u64> = None;
+    let mut metrics_port: Option<u16> = None;
+    let mut metrics_listen: Option<String> = None;
     #[cfg(feature = "profiling")]
     let mut pprof_secs: Option<u64> = None;
     #[cfg(feature = "profiling")]
@@ -352,6 +361,14 @@ fn parse_args() -> Args {
                         .expect("--regpool-log-interval-secs u64"),
                 );
             }
+            "--metrics-port" => {
+                i += 1;
+                metrics_port = Some(args[i].parse().expect("--metrics-port must be a port"));
+            }
+            "--metrics-listen" => {
+                i += 1;
+                metrics_listen = Some(args[i].clone());
+            }
             #[cfg(feature = "profiling")]
             "--pprof-secs" => {
                 i += 1;
@@ -458,6 +475,8 @@ fn parse_args() -> Args {
         gc_rate_bytes_per_sec,
         ucx_regpool_cap_bytes,
         regpool_log_interval_secs,
+        metrics_port,
+        metrics_listen,
         #[cfg(feature = "profiling")]
         pprof_secs,
         #[cfg(feature = "profiling")]
@@ -752,6 +771,41 @@ async fn main() -> Result<()> {
             })
             .detach();
             tracing::info!(period_secs = secs, "regpool periodic log armed");
+        }
+    }
+
+    // Observability batch 1: /metrics endpoint. `partitions` is
+    // Rc/!Send, so a 2 s publisher task on the MAIN compio runtime
+    // renders the snapshot; the HTTP listener (own OS thread) serves the
+    // latest copy.
+    if let Some(mport) = args.metrics_port {
+        let snap = autumn_common::metrics_http::MetricsSnapshot::new();
+        // Initial snapshot BEFORE the listener — a scrape that races
+        // startup gets real data, never an empty 200 (coco P3).
+        snap.publish(ps.metrics_text());
+        let snap_http = snap.clone();
+        let mhost = args.metrics_listen.as_deref().unwrap_or(&args.bind_host);
+        match autumn_common::metrics_http::spawn_metrics_http(
+            mhost,
+            mport,
+            std::sync::Arc::new(move || snap_http.get().as_ref().clone()),
+        ) {
+            Ok(()) => {
+                let ps2 = ps.clone();
+                compio::runtime::spawn(async move {
+                    loop {
+                        compio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        // Render OUTSIDE any lock; publish is an O(1)
+                        // Arc swap — never blocks the main runtime
+                        // behind a scraper (coco P2).
+                        snap.publish(ps2.metrics_text());
+                    }
+                })
+                .detach();
+                tracing::info!(port = mport, host = mhost, "metrics endpoint up at /metrics");
+            }
+            // Auxiliary — a taken metrics port must not kill the data plane.
+            Err(e) => tracing::error!(port = mport, "metrics endpoint bind failed: {e}"),
         }
     }
 

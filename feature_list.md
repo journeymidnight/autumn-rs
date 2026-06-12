@@ -320,3 +320,38 @@ gaps in the lease protocol's correctness story.
   seal/convert/recovery RPC 返回 OK 即断言 sidecar 已持久，而非仅内存
   一致**。
 - **passes:** completed (2026-06-12)
+
+---
+
+### OBS-1 · 生产急修批次 2：observability——Prometheus /metrics 薄层（2026-06-12）
+- **目标:** `/loop 生产视角` 第二项。三个 server binary 此前零可观测端点
+  （QPS/延迟/盘健康/分区分布只能翻日志）。新增 opt-in `--metrics-port`
+  （+`--metrics-listen` 独立绑定）暴露 Prometheus 文本 /metrics：
+  - 公共层 `autumn-common::metrics_http`：手写 HTTP/1.1，**独立 std 线程**
+    （零 compio/io_uring 交互，慢 scraper 永不碰数据面）+ 文本格式 helpers
+    + `MetricsSnapshot`（Mutex<Arc<String>> O(1) 指针交换信箱）。
+  - manager：leader/serving、streams/extents/nodes/partitions/ps/regions/
+    part_addrs 计数、per-disk online、F207 inflight 数（Rc 状态 → 运行时上
+    2s publisher task 渲染快照）。
+  - PS：per-partition requests_total（用 req_count_monotonic，swap-reset 的
+    req_count 会锯齿）+ size/gc-debt/pending-compaction/inflight/sealed-log
+    gauges；metric-major 分组（text format 要求同名样本连续）。
+  - EN：append batches/bytes/ns 全局单调计数（record() 每 BATCH 3 个
+    relaxed fetch_add）+ per-shard gauge 槽位（extents、disk online）。
+- **过程发现（实测抓出）:** 首版 EN gauge 刷新挂在 handle_df ——但 manager
+  的 df 只探注册的 control_address（shard 0），其余 shard 槽位永久陈旧
+  （磁盘 6 extents、metrics 报 3）。改为每 shard 在自己 runtime 上跑 2s
+  刷新循环，多 shard 复验 3+3=6。
+- **coco（GPT-5.5 deep）3P2+3P3，采纳 5 拒 1:** ① RwLock 快照可能让
+  publisher 阻塞 compio runtime → MetricsSnapshot O(1) Arc 交换+毒锁安全；
+  ② EN 槽位/刷新任务无生命周期 → 注册表存 Weak、render 剪枝、刷新任务持
+  Weak（节点 drop 即退出，不钉死 extent 状态）；③ 注册早于可失败 init →
+  Weak 语义自动覆盖；④ 首抓空 200 → listener 前同步发布首个快照；⑤
+  0.0.0.0 暴露 → `--metrics-listen` 独立绑定 + README 无鉴权注记。拒：
+  ⑥ CLI 缺值 panic——与全部既有 flag 的手写解析习惯一致，不单独特判。
+- **验收:** workspace 构建绿；4 crate 395 单测绿（含 metrics_http 2 个新
+  单测）；live 验证 tcp 3EN×2shard 集群三端点全通（manager 9591/PS 9701/
+  EN 9601，404 路径、计数随写入增长、multi-shard 聚合、manager-kill 后
+  gauge 行为）；seed=13 隔离 chaos 回归 ok 零丢失。cluster.sh
+  `AUTUMN_METRICS=1` 一键接线；README 新节 + 3 crate CLAUDE.md 注记。
+- **passes:** completed (2026-06-12)

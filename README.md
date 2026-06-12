@@ -123,6 +123,28 @@ fusermount3 -u /mnt/autumn   # unmount (needs `fuse3` package)
 `autumn-client --help` / `autumn-op --help` lists subcommands. The wire schema for autumn-op
 is stable; the Python policy controller in `python/node_policy.py` shells out to it.
 
+### Prometheus /metrics (observability batch 1)
+
+Every server binary takes an opt-in `--metrics-port <PORT>` flag exposing a
+Prometheus text endpoint at `http://<listen-host>:<PORT>/metrics` (plain
+`std::net` listener on its own OS thread — zero interaction with the
+io_uring data plane; absent flag = no listener). `cluster.sh` wires all
+three with `AUTUMN_METRICS=1` (manager `9591`, EN `960<i>`, PS `9701`).
+
+```bash
+AUTUMN_METRICS=1 AUTUMN_TRANSPORT=tcp ./cluster.sh start 3
+curl -s http://127.0.0.1:9591/metrics   # manager: leader/serving + streams/extents/nodes/partitions/ps/regions counts, per-disk online, inflight ops
+curl -s http://127.0.0.1:9701/metrics   # PS: per-partition requests_total (monotonic), size/gc-debt/pending-compaction bytes, gc/compact inflight, sealed log extents
+curl -s http://127.0.0.1:9601/metrics   # EN: append batches/bytes/ns totals, extents per shard + total, per-disk online
+```
+
+Manual verify: write a few keys with `autumn-client put`, then confirm
+`autumn_ps_partition_requests_total` increments on the owning partition and
+`autumn_en_append_bytes_total` grows. Notes: all snapshots/gauges refresh
+every 2 s (PS/manager publisher task; EN per-shard refresh loop); PS
+`requests_total` resets on PS restart (normal Prometheus counter semantics
+— use `rate()`).
+
 ## CLI cheatsheet
 
 ```bash

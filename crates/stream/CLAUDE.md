@@ -1274,6 +1274,24 @@ sufficient (and cheaper than DashMap).
     seal/convert/recovery RPC asserts the sidecar is durable, not merely that
     memory agrees.**
 
+26. **/metrics (observability batch 1).** The EN's authoritative state is
+    shard-local `Rc` (unreadable from the metrics HTTP thread), so two
+    process-global mirrors feed `render_en_metrics()` (exported, called by
+    the binary's `--metrics-port` listener via
+    `autumn_common::metrics_http`): (a) `EN_APPEND_TOTALS` — monotonic
+    append batch/bytes/ns counters, 3 relaxed fetch_adds per BATCH in
+    `ExtentAppendMetrics::record`; (b) `EN_SHARD_GAUGES` — one
+    `Arc<EnShardGauges>` slot per ExtentNode instance (registered in
+    `new()`, cloned in `impl Clone`), refreshed by a 2 s task spawned in
+    `new()` ON THAT SHARD's runtime (Rc clones stay same-thread). NOT
+    df-driven: the manager's df probe only reaches the registered
+    control_address — one shard — so a `handle_df` refresh left every
+    other shard's slot permanently stale (caught live: 6 extents on disk,
+    metrics said 3). Renderer sums extents across shards (disjoint sets)
+    and reports a disk offline if ANY shard's view says so (each shard
+    owns its own `DiskFS` copy). In-process tests accumulate inert extra
+    slots — harmless, render is binary-only.
+
 ---
 
 ## RPC Wire Protocol (extent_rpc.rs)

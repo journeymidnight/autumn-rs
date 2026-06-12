@@ -1935,3 +1935,17 @@ post-restart.
     OK pins the shared rotation to itself while serving empty/stale
     `part_addrs` (manager-HA chaos H3).
     (d) Client SDK `refresh_regions` rotates + retries on NOT_LEADER.
+
+21. **/metrics (observability batch 1).** `PartitionServer::metrics_text()`
+    renders the Prometheus text snapshot on the MAIN compio thread (the
+    `partitions` map is `Rc<RefCell>`); the binary's `--metrics-port` path
+    spawns a 2 s publisher task that copies the string into an
+    `Arc<RwLock<String>>` served by the `autumn_common::metrics_http`
+    listener thread. Export rules: only `req_count_monotonic` (the
+    never-reset counter — `req_count` is swap-reset every 30 s by
+    `report_load_loop` and would saw-tooth) plus gauges
+    (size/gc-debt/pending-compaction bytes, gc/compact inflight, sealed log
+    extents). Emission is metric-major (all samples of one metric
+    contiguous after its `# TYPE` line — the Prometheus text format
+    requires grouping; the first cut interleaved per-partition and was
+    non-compliant).

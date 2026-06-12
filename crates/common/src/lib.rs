@@ -1,6 +1,7 @@
 pub mod cpu_pin;
 pub mod error;
 pub mod metrics;
+pub mod metrics_http;
 pub mod store;
 
 pub use cpu_pin::{

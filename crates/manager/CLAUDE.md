@@ -1767,3 +1767,14 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     every caller rotates (PS heartbeat/sync, SDK refresh_regions, F267
     StreamClient note_manager_code). `handle_register_partition_addr`
     STAYS ungated (idempotent in-memory hint, continuously re-reported).
+
+36. **/metrics (observability batch 1).** `AutumnManager::metrics_text()`
+    renders leader/serving gauges + store counts (streams / extents /
+    nodes / partitions / ps_nodes / regions / part_addrs), per-disk
+    online (the df call-result signal, note 7) and the F207 inflight-op
+    count. The store is `Rc<RefCell>` (!Send), so the binary's
+    `--metrics-port` path runs a 2 s publisher task ON the compio runtime
+    that copies the rendered string into an `Arc<RwLock<String>>`; the
+    `autumn_common::metrics_http` listener thread serves the latest copy.
+    A follower's counts reflect its replay-stale view — scrape
+    `autumn_manager_leader` to pick the authoritative instance.

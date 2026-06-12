@@ -18,6 +18,23 @@ Standardized helpers for periodic performance reporting across all crates. All l
 
 Used by `StreamAppendMetrics` (stream crate), `WriteLoopMetrics` and `ReadMetrics` (partition-server crate).
 
+### `metrics_http.rs` — Prometheus `/metrics` endpoint (observability batch 1)
+
+`spawn_metrics_http(bind_host, port, render)` — minimal hand-rolled HTTP/1.1
+listener on a dedicated OS thread (`std::net::TcpListener`, blocking, 2 s/5 s
+read/write timeouts). Deliberately ZERO interaction with the compio runtimes:
+the `render: Arc<dyn Fn() -> String + Send + Sync>` closure runs on the
+metrics thread and must only read `Arc`-shared state. Binaries whose state is
+`Rc`/`RefCell` (manager store, PS partitions map) publish a pre-rendered
+snapshot string into an `Arc<RwLock<String>>` from a 2 s task on their own
+runtime; the EN renders directly from process-global atomics. Bind failure
+returns Err — callers log ERROR and keep serving (metrics are auxiliary,
+never kill the data plane). `push_metric` / `push_type` emit the Prometheus
+text format with label escaping; emission must be metric-major (all samples
+of one metric contiguous after its `# TYPE` line — never interleave).
+Endpoint is opt-in per binary via `--metrics-port`; `cluster.sh` wires it
+with `AUTUMN_METRICS=1`.
+
 ### `error.rs` — Domain Error Types
 
 ```rust

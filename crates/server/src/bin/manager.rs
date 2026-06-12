@@ -37,6 +37,13 @@ struct Args {
     /// F195 (was F192 env): MSG_REPORT_DISK_FAILURE distinct-reporter
     /// quorum threshold. `None` = library default (3).
     report_disk_failure_quorum: Option<usize>,
+    /// Observability batch 1: Prometheus `/metrics` HTTP port.
+    /// `None` = endpoint disabled (zero cost).
+    metrics_port: Option<u16>,
+    /// Bind host for /metrics only. `None` = follow `--listen`. The
+    /// endpoint is unauthenticated — operators exposing the RPC plane
+    /// on 0.0.0.0 can pin metrics to 127.0.0.1 with this.
+    metrics_listen: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -47,6 +54,8 @@ fn parse_args() -> Args {
     let mut policy_fast_mode = false;
     let mut report_disk_failure_window_secs: Option<u64> = None;
     let mut report_disk_failure_quorum: Option<usize> = None;
+    let mut metrics_port: Option<u16> = None;
+    let mut metrics_listen: Option<String> = None;
 
     let raw: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -102,6 +111,14 @@ fn parse_args() -> Args {
                         .expect("--report-disk-failure-quorum must be a number"),
                 );
             }
+            "--metrics-port" => {
+                i += 1;
+                metrics_port = Some(raw[i].parse().expect("--metrics-port must be a port"));
+            }
+            "--metrics-listen" => {
+                i += 1;
+                metrics_listen = Some(raw[i].clone());
+            }
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
@@ -115,6 +132,8 @@ fn parse_args() -> Args {
         policy_fast_mode,
         report_disk_failure_window_secs,
         report_disk_failure_quorum,
+        metrics_port,
+        metrics_listen,
     }
 }
 
@@ -179,6 +198,41 @@ async fn main() -> Result<()> {
         tracing::warn!(
             "F187: --policy-fast-mode enabled; thresholds={{gc_debt=1MiB, compact=4MiB, bucket=5s, tick=5s, required=1, cooldown=30s}}. NOT FOR PRODUCTION."
         );
+    }
+
+    // Observability batch 1: /metrics endpoint. The store is Rc/!Send, so
+    // a 2 s publisher task on THIS runtime renders the snapshot string;
+    // the HTTP listener (own OS thread, std::net) serves the latest copy.
+    if let Some(mport) = args.metrics_port {
+        let snap = autumn_common::metrics_http::MetricsSnapshot::new();
+        // Initial snapshot BEFORE the listener — a scrape that races
+        // startup gets real data, never an empty 200 (coco P3).
+        snap.publish(manager.metrics_text());
+        let snap_http = snap.clone();
+        let mhost = args.metrics_listen.as_deref().unwrap_or(&args.bind_host);
+        match autumn_common::metrics_http::spawn_metrics_http(
+            mhost,
+            mport,
+            std::sync::Arc::new(move || snap_http.get().as_ref().clone()),
+        ) {
+            Ok(()) => {
+                let mgr = manager.clone();
+                compio::runtime::spawn(async move {
+                    loop {
+                        compio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        // Render OUTSIDE any lock; publish is an O(1)
+                        // Arc swap — never blocks this runtime behind a
+                        // scraper (coco P2).
+                        snap.publish(mgr.metrics_text());
+                    }
+                })
+                .detach();
+                tracing::info!(port = mport, host = mhost, "metrics endpoint up at /metrics");
+            }
+            // Metrics are auxiliary — a taken port must not kill the
+            // control plane. Loud log, keep serving.
+            Err(e) => tracing::error!(port = mport, "metrics endpoint bind failed: {e}"),
+        }
     }
 
     tracing::info!("autumn-manager-server listening on {addr}");

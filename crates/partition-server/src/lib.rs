@@ -2787,6 +2787,72 @@ impl PartitionServer {
     /// PartitionHandle's Arc<PartitionMetrics> and ship to the manager
     /// via MSG_REPORT_PARTITION_LOAD. Cheap — one RPC per cycle, payload
     /// scales with partition count.
+    /// Observability batch 1: Prometheus text snapshot of this PS's
+    /// per-partition counters/gauges. Runs on the MAIN compio thread (the
+    /// `partitions` map is `Rc<RefCell>`); the binary's 2 s publisher task
+    /// copies the rendered string to the metrics HTTP thread. Only
+    /// monotonic counters (`req_count_monotonic` — `req_count` is
+    /// swap-reset by `report_load_loop` and would saw-tooth) and gauges
+    /// are exported.
+    pub fn metrics_text(&self) -> String {
+        use autumn_common::metrics_http::{push_metric, push_type};
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut out = String::with_capacity(2048);
+        let ps = self.ps_id.to_string();
+        let parts = self.partitions.borrow();
+        push_type(&mut out, "autumn_ps_partitions", "gauge");
+        push_metric(
+            &mut out,
+            "autumn_ps_partitions",
+            &[("ps", ps.clone())],
+            parts.len() as u32,
+        );
+        // Metric-major emission: the Prometheus text format requires all
+        // samples of one metric to form a single contiguous group after
+        // its # TYPE line — never interleave per-partition.
+        let series: Vec<(u64, std::sync::Arc<PartitionMetrics>)> = parts
+            .iter()
+            .map(|(part_id, h)| (*part_id, h.metrics.clone()))
+            .collect();
+        drop(parts);
+        type Extract = fn(&PartitionMetrics) -> f64;
+        let metrics: [(&str, &str, Extract); 7] = [
+            ("autumn_ps_partition_requests_total", "counter", |m| {
+                m.req_count_monotonic.load(Relaxed) as f64
+            }),
+            ("autumn_ps_partition_size_bytes", "gauge", |m| {
+                m.size_bytes.load(Relaxed) as f64
+            }),
+            ("autumn_ps_partition_gc_debt_bytes", "gauge", |m| {
+                m.gc_debt_bytes.load(Relaxed) as f64
+            }),
+            ("autumn_ps_partition_pending_compaction_bytes", "gauge", |m| {
+                m.pending_compaction_bytes.load(Relaxed) as f64
+            }),
+            ("autumn_ps_partition_gc_inflight", "gauge", |m| {
+                m.gc_inflight.load(Relaxed) as f64
+            }),
+            ("autumn_ps_partition_compact_inflight", "gauge", |m| {
+                m.compact_inflight.load(Relaxed) as f64
+            }),
+            ("autumn_ps_partition_sealed_log_extents", "gauge", |m| {
+                m.sealed_log_extent_count.load(Relaxed) as f64
+            }),
+        ];
+        for (name, kind, extract) in metrics {
+            push_type(&mut out, name, kind);
+            for (part_id, m) in &series {
+                push_metric(
+                    &mut out,
+                    name,
+                    &[("ps", ps.clone()), ("part", part_id.to_string())],
+                    extract(m),
+                );
+            }
+        }
+        out
+    }
+
     async fn report_load_loop(&self) {
         // F196: 5 s → 30 s. Manager aggregates into 60 s buckets and
         // the policy window only inspects the last 5 buckets (5 min);

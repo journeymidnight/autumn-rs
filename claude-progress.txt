@@ -1,33 +1,36 @@
 Date: 2026-06-12
 TaskStatus: completed
-Task scope: /loop 生产视角急修 · 批次 1 = P0-D（EN durability：清零被吞的
-  `.meta` persist 失败）。
+Task scope: /loop 生产视角急修 · 批次 2 = OBS-1（Prometheus /metrics 薄层，
+  三 binary opt-in --metrics-port）。批次 1 = P0-D（2334304）已闭。
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
   Already implemented (this commit):
-    - extent_node.rs 最后 3 处 `let _ = save_meta` 全部 fail-closed
-      （mark_disk_offline + 报错）：run_recovery_task 末尾 persist /
-      convert_to_ec prepare 路 seal / convert_to_ec post-convert
-      eversion-seal。grep 确认仓库已无被吞的 save_meta。
-    - coco P1 ×2 折入：F119-D 幂等跳过路径 ensure save_meta（内存原子
-      满足≠sidecar 持久）；recovery persist 失败后 remove partial
-      entry（防复用下线盘 + 防 "already exists" 卡死重派）。
-    - 文档：stream CLAUDE.md note 25（不变量：RPC 返回 OK 即断言
-      sidecar 持久）；feature_list P0-D 条目。
+    - autumn-common::metrics_http（独立 std 线程 HTTP/1.1 + 文本格式
+      helpers + MetricsSnapshot O(1) Arc 交换信箱；2 单测）。
+    - manager/PS/EN 三 binary `--metrics-port` + `--metrics-listen`；
+      manager=控制面计数+leader/serving+盘 online+inflight；PS=per-
+      partition 单调 requests_total + 6 gauges（metric-major 分组）；
+      EN=append 全局计数 + per-shard gauge 槽（Weak 注册表 + 每 shard
+      自己的 2s 刷新循环——df 刷新被实测证伪：manager 只探 shard 0）。
+    - coco deep 3P2+3P3 采纳 5 拒 1（拒=CLI 缺值 panic 特判，与既有
+      手写解析习惯一致）。
+    - cluster.sh AUTUMN_METRICS=1（9591/960i/9701）；README /metrics
+      节；common/stream/ps/manager 四处 CLAUDE.md 注记。
   Not implemented (recorded):
-    - 生产清单后续项（按用户拍板顺序）：observability /metrics 薄层 →
-      ENOSPC 行为定义+测试 → BUG-LEASE-8（fuse 多 key 原子提交边界）。
-      rolling upgrade（rkyv same-commit 约束）= 独立长线 track。
-    - F227 recovery-stuck 家族（仍 OPEN）；note 24 fsync coalescer
-      （结构性不可达，defer 维持）。
+    - PS 端延迟直方图（需在热路径加时间戳，留待需求明确再做）。
+    - 生产清单后续项：ENOSPC 行为定义+测试 → BUG-LEASE-8（fuse 多 key
+      原子提交边界）。rolling upgrade（rkyv same-commit 约束）= 长线。
+    - F227 recovery-stuck 家族（仍 OPEN）。
 
 Current summary:
-  P0-D 验证全绿：autumn-stream --lib 72 单测；seed=13/60s 隔离
-  system_chaos ×2（P1 折入后）全 ok 零丢失；transport_chaos tcp PASS。
+  OBS-1 验证全绿：workspace 构建；4 crate 395 单测；live tcp 3EN×2shard
+  三端点全通（计数随写入增长、multi-shard 聚合 3+3=6 与磁盘一致）；
+  seed=13 隔离 chaos 回归 ok 零丢失。
 
 Main gaps:
   - 见 Not implemented。
 Next steps:
-  - /loop 下一项：observability /metrics 薄层（目前零 metrics 端点，
-    生产无法观测 QPS/延迟/盘健康/分区分布）。
+  - /loop 下一项：ENOSPC 行为——目前磁盘写满时 EN 的行为未定义/未测试
+    （fail-closed 路径会 mark_disk_offline，但 ENOSPC 与 I/O error 的
+    区分、manager 侧腾挪、以及写满后的恢复路径都没有验收）。

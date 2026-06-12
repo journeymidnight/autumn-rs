@@ -76,6 +76,12 @@ impl ExtentAppendMetrics {
         self.req_count += reqs;
         self.bytes += bytes;
         self.total_ns += elapsed_ns;
+        // Observability batch 1: process-global monotonic totals for the
+        // /metrics endpoint. Three relaxed fetch_adds per append BATCH
+        // (record is per-batch, not per-frame) — negligible on the hot path.
+        EN_APPEND_TOTALS.requests.fetch_add(reqs, Ordering::Relaxed);
+        EN_APPEND_TOTALS.bytes.fetch_add(bytes, Ordering::Relaxed);
+        EN_APPEND_TOTALS.ns.fetch_add(elapsed_ns, Ordering::Relaxed);
         self.maybe_report();
     }
     fn maybe_report(&mut self) {
@@ -96,6 +102,114 @@ impl ExtentAppendMetrics {
 thread_local! {
     pub(crate) static EXTENT_APPEND_METRICS: RefCell<ExtentAppendMetrics> =
         RefCell::new(ExtentAppendMetrics::new());
+}
+
+// ─── /metrics globals (observability batch 1) ───────────────────────────────
+//
+// The EN's authoritative state (`extents` DashMap, `disks` map) is
+// shard-local behind `Rc` — unreadable from the metrics HTTP thread. Each
+// shard therefore mirrors cheap gauges into an `Arc<EnShardGauges>` slot
+// (registered at construction, refreshed from `handle_df` — the manager's
+// ~2 s node_health_loop probe — so staleness is bounded by the df cadence)
+// while monotonic append totals accumulate directly into process-global
+// atomics from the per-batch `record` path. `render_en_metrics()` is safe
+// to call from any thread.
+
+pub struct EnAppendTotals {
+    pub requests: std::sync::atomic::AtomicU64,
+    pub bytes: std::sync::atomic::AtomicU64,
+    pub ns: std::sync::atomic::AtomicU64,
+}
+
+pub(crate) static EN_APPEND_TOTALS: EnAppendTotals = EnAppendTotals {
+    requests: std::sync::atomic::AtomicU64::new(0),
+    bytes: std::sync::atomic::AtomicU64::new(0),
+    ns: std::sync::atomic::AtomicU64::new(0),
+};
+
+pub struct EnShardGauges {
+    shard_idx: u32,
+    extents: std::sync::atomic::AtomicU64,
+    /// (disk_id, online as 0/1) — disk set is fixed at construction.
+    disks: Vec<(u64, std::sync::atomic::AtomicU64)>,
+}
+
+/// One slot per LIVE ExtentNode instance. Weak entries (coco P2): a
+/// dropped node (test teardown, failed init after registration) leaves a
+/// dead Weak that the renderer prunes — no slot leak, no stale/duplicate
+/// series, and the per-shard refresh task exits when its upgrades fail.
+static EN_SHARD_GAUGES: std::sync::Mutex<Vec<std::sync::Weak<EnShardGauges>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Render the EN's Prometheus text. Extents are summed across shards
+/// (shards own disjoint extent sets); a disk is reported offline if ANY
+/// shard's view says so (each shard holds its own `DiskFS` instance, and
+/// `mark_disk_offline_for_extent` flips only the observing shard's copy).
+pub fn render_en_metrics() -> String {
+    use autumn_common::metrics_http::{push_metric, push_type};
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut out = String::with_capacity(1024);
+    push_type(&mut out, "autumn_en_append_batches_total", "counter");
+    push_metric(
+        &mut out,
+        "autumn_en_append_batches_total",
+        &[],
+        EN_APPEND_TOTALS.requests.load(Relaxed) as f64,
+    );
+    push_type(&mut out, "autumn_en_append_bytes_total", "counter");
+    push_metric(
+        &mut out,
+        "autumn_en_append_bytes_total",
+        &[],
+        EN_APPEND_TOTALS.bytes.load(Relaxed) as f64,
+    );
+    push_type(&mut out, "autumn_en_append_ns_total", "counter");
+    push_metric(
+        &mut out,
+        "autumn_en_append_ns_total",
+        &[],
+        EN_APPEND_TOTALS.ns.load(Relaxed) as f64,
+    );
+    let slots: Vec<std::sync::Arc<EnShardGauges>> = {
+        let mut guard = EN_SHARD_GAUGES.lock().unwrap();
+        // Prune slots whose ExtentNode has dropped (coco P2).
+        guard.retain(|w| w.strong_count() > 0);
+        guard.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    let mut extents_total: u64 = 0;
+    let mut disk_online: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    push_type(&mut out, "autumn_en_shard_extents", "gauge");
+    for s in slots.iter() {
+        let e = s.extents.load(Relaxed);
+        extents_total += e;
+        push_metric(
+            &mut out,
+            "autumn_en_shard_extents",
+            &[("shard", s.shard_idx.to_string())],
+            e as f64,
+        );
+        for (disk_id, online) in &s.disks {
+            let v = online.load(Relaxed);
+            disk_online
+                .entry(*disk_id)
+                .and_modify(|cur| *cur = (*cur).min(v))
+                .or_insert(v);
+        }
+    }
+    push_type(&mut out, "autumn_en_extents", "gauge");
+    push_metric(&mut out, "autumn_en_extents", &[], extents_total as f64);
+    push_type(&mut out, "autumn_en_disk_online", "gauge");
+    let mut disk_ids: Vec<u64> = disk_online.keys().copied().collect();
+    disk_ids.sort_unstable();
+    for disk_id in disk_ids {
+        push_metric(
+            &mut out,
+            "autumn_en_disk_online",
+            &[("disk_id", disk_id.to_string())],
+            disk_online[&disk_id] as f64,
+        );
+    }
+    out
 }
 
 // ─── DiskFS ──────────────────────────────────────────────────────────────────
@@ -980,6 +1094,10 @@ pub struct ExtentNode {
     extents: Rc<DashMap<u64, Rc<ExtentEntry>>>,
     /// All disks attached to this node, keyed by disk_id.
     disks: Rc<HashMap<u64, Rc<DiskFS>>>,
+    /// Observability batch 1: this shard's /metrics gauge slot (also
+    /// registered in the process-global `EN_SHARD_GAUGES`). Refreshed
+    /// from `handle_df` (manager-driven ~2 s cadence).
+    metrics_gauges: std::sync::Arc<EnShardGauges>,
     manager_endpoint: Option<String>,
     /// ConnPool for manager RPC calls (nodes_info, extent_info, etc.)
     manager_pool: Rc<crate::ConnPool>,
@@ -1055,6 +1173,7 @@ impl Clone for ExtentNode {
         Self {
             extents: self.extents.clone(),
             disks: self.disks.clone(),
+            metrics_gauges: self.metrics_gauges.clone(),
             manager_endpoint: self.manager_endpoint.clone(),
             manager_pool: self.manager_pool.clone(),
             chain_fwd: self.chain_fwd.clone(),
@@ -2306,9 +2425,30 @@ impl ExtentNode {
             disk_map.insert(disk_id, Rc::new(disk));
         }
 
+        // Observability batch 1: register this instance's gauge slot —
+        // the registry holds a Weak, so a dropped/failed-init node is
+        // pruned by the renderer (coco P2/P3). Disk set is fixed for the
+        // node's lifetime; initial state = all online (matches DiskFS
+        // construction).
+        let metrics_gauges = {
+            let mut disk_slots: Vec<(u64, std::sync::atomic::AtomicU64)> = disk_map
+                .keys()
+                .map(|id| (*id, std::sync::atomic::AtomicU64::new(1)))
+                .collect();
+            disk_slots.sort_unstable_by_key(|(id, _)| *id);
+            let g = std::sync::Arc::new(EnShardGauges {
+                shard_idx: config.shard_idx,
+                extents: std::sync::atomic::AtomicU64::new(0),
+                disks: disk_slots,
+            });
+            EN_SHARD_GAUGES.lock().unwrap().push(std::sync::Arc::downgrade(&g));
+            g
+        };
+
         let node = Self {
             extents: Rc::new(DashMap::new()),
             disks: Rc::new(disk_map),
+            metrics_gauges,
             manager_endpoint: config.manager_endpoint,
             manager_pool: Rc::new(crate::ConnPool::new()),
             chain_fwd: Rc::new(RefCell::new(HashMap::new())),
@@ -2346,6 +2486,38 @@ impl ExtentNode {
         // extent's manager refs hit 0 while the node was momentarily
         // unreachable.
         node.spawn_reconcile_orphans_loop();
+
+        // Observability batch 1: per-shard gauge refresh on THIS shard's
+        // runtime. The manager's df probe only reaches the registered
+        // control_address (one shard), so a df-driven refresh left every
+        // other shard's slot permanently stale — each shard must refresh
+        // its own. The task holds only WEAK refs (coco P2): when the
+        // node's last clone drops, the upgrades fail, the loop exits, and
+        // nothing pins the extent/disk state alive.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let extents = Rc::downgrade(&node.extents);
+            let disks = Rc::downgrade(&node.disks);
+            let gauges = std::sync::Arc::downgrade(&node.metrics_gauges);
+            compio::runtime::spawn(async move {
+                loop {
+                    let (Some(extents), Some(disks), Some(gauges)) =
+                        (extents.upgrade(), disks.upgrade(), gauges.upgrade())
+                    else {
+                        return; // node dropped — exit, slot gets pruned
+                    };
+                    gauges.extents.store(extents.len() as u64, Relaxed);
+                    for (disk_id, online) in &gauges.disks {
+                        if let Some(disk) = disks.get(disk_id) {
+                            online.store(disk.online() as u64, Relaxed);
+                        }
+                    }
+                    drop((extents, disks, gauges));
+                    compio::time::sleep(Duration::from_secs(2)).await;
+                }
+            })
+            .detach();
+        }
 
         Ok(node)
     }
