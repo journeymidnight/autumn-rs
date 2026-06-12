@@ -1,6 +1,6 @@
 Date: 2026-06-12
 TaskStatus: completed
-Task scope: F272+F273+F274 completed — /loop chaos 迭代 5：multi-manager HA chaos
+Task scope: F272-F275 completed — /loop chaos 迭代 5：multi-manager HA chaos
   （manager_ha_chaos.sh H1 leader kill / H2 仅新 leader 时 PS kill /
   H3 老 leader 回归 follower），发现并修复 4 个真实 bug。
 
@@ -71,5 +71,8 @@ F273 (迭代 14): fuse_chaos.sh——fuse 挂载在 PS-kill/manager-kill/
   fuse-kill 三类故障下，83 文件 sha256 全完好，首跑全 PASS。
 F274 (迭代 15): 过夜 90 轮 soak（tcp 60 + ucx 30）双 PASS，10034
   ACK 写零丢失。
+F275 (迭代 16): kvcache python 接口 chaos 全 PASS（158 轮零
+  mismatch）；过程中发现 stale maturin wheel = 线协议错位坑（已记
+  README）。三接口（client/fuse/kvcache）failover chaos 全部收齐。
 Next steps:
-  - 无。chaos 战役完整闭环：四层覆盖 + 90 轮 soak 认证。
+  - 无。chaos 战役完整闭环：五层覆盖 + 90 轮 soak。
