@@ -57,6 +57,12 @@ pub const CLUSTER_ID_KEY: &str = "autumn-rs/cluster_id";
 /// per plan §6.4).
 pub const INODE_LEASES_PREFIX: &str = "inode_leases/";
 
+/// ENOSPC-1: default allocation free-space floor — a node whose best
+/// disk has less free than this is soft-avoided by `select_nodes`.
+/// 256 MiB comfortably covers a fresh extent + its metadata while small
+/// enough not to strand mostly-full-but-usable disks.
+pub const DEFAULT_MIN_ALLOC_FREE_BYTES: u64 = 256 * 1024 * 1024;
+
 #[derive(Clone)]
 pub(crate) struct EtcdMirror {
     client: Rc<autumn_etcd::EtcdClient>,
@@ -570,6 +576,17 @@ pub struct AutumnManager {
     /// listener at ~54 s).
     serving: Rc<Cell<bool>>,
     ps_last_heartbeat: Rc<RefCell<HashMap<u64, Instant>>>,
+    /// ENOSPC-1: per-node max per-disk free bytes, refreshed from every
+    /// successful df probe (`node_health_loop`). In-memory only — it is
+    /// a 2 s-fresh routing hint, not state worth persisting. Keyed by
+    /// node_id; absent = "unknown" (treated as spacious: cold leader /
+    /// pre-first-df nodes must stay allocatable).
+    pub(crate) node_max_free: Rc<RefCell<HashMap<u64, u64>>>,
+    /// ENOSPC-1: allocation soft-avoids nodes whose max per-disk free is
+    /// below this (`--min-alloc-free-bytes`, default 256 MiB; 0 =
+    /// disabled). Soft: select_nodes falls back to the full healthy set
+    /// when too few spacious nodes remain.
+    min_alloc_free_bytes: Rc<Cell<u64>>,
     conn_pool: Rc<ConnPool>,
     /// F191: dedicated pool for control-plane RPCs to extent nodes
     /// (`EXT_MSG_DF`, future `MSG_REPORT_DISK_FAILURE`, future heartbeat).
@@ -687,6 +704,8 @@ impl AutumnManager {
             runtime_started: Rc::new(Cell::new(false)),
             serving: Rc::new(Cell::new(false)),
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),
+            node_max_free: Rc::new(RefCell::new(HashMap::new())),
+            min_alloc_free_bytes: Rc::new(Cell::new(DEFAULT_MIN_ALLOC_FREE_BYTES)),
             conn_pool: Rc::new(ConnPool::new()),
             control_pool: Rc::new(ConnPool::new()),
             last_op_at: Rc::new(RefCell::new(HashMap::new())),
@@ -1883,6 +1902,7 @@ impl AutumnManager {
         nodes: &HashMap<u64, MgrNodeInfo>,
         disks: &HashMap<u64, MgrDiskInfo>,
         online_node_ids: &HashSet<u64>,
+        space_low_node_ids: &HashSet<u64>,
         count: usize,
         exclude_node_ids: &[u64],
     ) -> Result<Vec<MgrNodeInfo>, AppError> {
@@ -1922,6 +1942,23 @@ impl AutumnManager {
             .cloned()
             .collect();
         let mut rng = rand::thread_rng();
+        // ENOSPC-1: among healthy nodes, prefer those NOT known to be low
+        // on space (per the df probe's max per-disk free vs
+        // `min_alloc_free_bytes`). Soft preference, never a hard gate:
+        // when too few spacious nodes remain, fall back to the full
+        // healthy set — a capacity-crunched cluster should still attempt
+        // allocation (the EN-side Full gate fails fast and the per-RPC
+        // fallback walk takes over) rather than refuse outright.
+        let spacious: Vec<MgrNodeInfo> = healthy
+            .iter()
+            .filter(|n| !space_low_node_ids.contains(&n.node_id))
+            .cloned()
+            .collect();
+        if spacious.len() >= count {
+            let mut pool = spacious;
+            pool.shuffle(&mut rng);
+            return Ok(pool.into_iter().take(count).collect());
+        }
         if healthy.len() >= count {
             let mut pool = healthy;
             pool.shuffle(&mut rng);
@@ -2003,6 +2040,28 @@ impl AutumnManager {
     /// every PS's liveness clock (heartbeats physically could not arrive
     /// earlier) and unblocks the eviction sweep. See the `serving` field
     /// doc for the ucx TIME_WAIT motivation.
+    /// ENOSPC-1: override the allocation free-space floor (CLI
+    /// `--min-alloc-free-bytes`; 0 disables the filter).
+    pub fn set_min_alloc_free_bytes(&self, v: u64) {
+        self.min_alloc_free_bytes.set(v);
+    }
+
+    /// ENOSPC-1: nodes whose latest df probe showed max per-disk free
+    /// BELOW the floor. Unknown nodes (no df yet) are NOT low — a cold
+    /// leader must keep allocating.
+    pub(crate) fn space_low_node_ids(&self) -> HashSet<u64> {
+        let floor = self.min_alloc_free_bytes.get();
+        if floor == 0 {
+            return HashSet::new();
+        }
+        self.node_max_free
+            .borrow()
+            .iter()
+            .filter(|(_, free)| **free < floor)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     pub fn mark_serving(&self) {
         let now = Instant::now();
         for t in self.ps_last_heartbeat.borrow_mut().values_mut() {
@@ -4977,7 +5036,8 @@ mod tests {
         let mut counts: HashMap<u64, usize> = HashMap::new();
         for _ in 0..ITERS {
             let picked =
-                AutumnManager::select_nodes(&nodes, &disks, &online_node_ids, 3, &[]).unwrap();
+                AutumnManager::select_nodes(&nodes, &disks, &online_node_ids, &HashSet::new(), 3, &[])
+                    .unwrap();
             assert_eq!(picked.len(), 3);
             let mut ids: Vec<u64> = picked.iter().map(|n| n.node_id).collect();
             ids.sort();
@@ -5026,13 +5086,65 @@ mod tests {
         let mut first_node_seen: HashSet<u64> = HashSet::new();
         for _ in 0..200 {
             let picked =
-                AutumnManager::select_nodes(&nodes, &disks, &online_node_ids, 1, &[]).unwrap();
+                AutumnManager::select_nodes(&nodes, &disks, &online_node_ids, &HashSet::new(), 1, &[])
+                    .unwrap();
             first_node_seen.insert(picked[0].node_id);
         }
         assert!(
             first_node_seen.len() >= 3,
             "degraded fallback should pick at least 3 distinct nodes across 200 tries; got {first_node_seen:?}"
         );
+    }
+
+    /// ENOSPC-1: the spacious layer soft-avoids space-low nodes when
+    /// enough remain, and falls back to the full healthy set when the
+    /// avoidance would under-fill the selection.
+    #[test]
+    fn enospc_select_nodes_avoids_space_low_with_fallback() {
+        let mut nodes: HashMap<u64, MgrNodeInfo> = HashMap::new();
+        let mut disks: HashMap<u64, MgrDiskInfo> = HashMap::new();
+        for (idx, &nid) in [1u64, 3, 5, 7].iter().enumerate() {
+            let did = 100 + idx as u64;
+            nodes.insert(
+                nid,
+                MgrNodeInfo {
+                    node_id: nid,
+                    address: format!("127.0.0.1:{}", 9000 + nid),
+                    disks: vec![did],
+                    shard_ports: vec![],
+                    control_address: String::new(),
+                },
+            );
+            disks.insert(
+                did,
+                MgrDiskInfo {
+                    disk_id: did,
+                    online: true,
+                    uuid: format!("uuid-{nid}"),
+                },
+            );
+        }
+        let online: HashSet<u64> = nodes.keys().copied().collect();
+
+        // Node 7 is space-low; 3 spacious nodes remain for count=3 →
+        // node 7 must NEVER be picked.
+        let low: HashSet<u64> = [7u64].into_iter().collect();
+        for _ in 0..200 {
+            let picked =
+                AutumnManager::select_nodes(&nodes, &disks, &online, &low, 3, &[]).unwrap();
+            assert!(
+                picked.iter().all(|n| n.node_id != 7),
+                "space-low node 7 picked despite 3 spacious candidates"
+            );
+        }
+
+        // 2 of 4 are space-low and count=3 → spacious under-fills, the
+        // fallback widens to all healthy nodes (allocation must proceed
+        // on a capacity-crunched cluster, not refuse).
+        let low2: HashSet<u64> = [5u64, 7].into_iter().collect();
+        let picked =
+            AutumnManager::select_nodes(&nodes, &disks, &online, &low2, 3, &[]).unwrap();
+        assert_eq!(picked.len(), 3);
     }
 
     // ── F139: extent-node delete vs in-flight recovery ──────────────────────

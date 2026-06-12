@@ -44,6 +44,10 @@ struct Args {
     /// endpoint is unauthenticated — operators exposing the RPC plane
     /// on 0.0.0.0 can pin metrics to 127.0.0.1 with this.
     metrics_listen: Option<String>,
+    /// ENOSPC-1: allocation free-space floor (bytes). Nodes whose best
+    /// disk has less free are soft-avoided by extent allocation.
+    /// `None` = library default (256 MiB); 0 = disabled.
+    min_alloc_free_bytes: Option<u64>,
 }
 
 fn parse_args() -> Args {
@@ -56,6 +60,7 @@ fn parse_args() -> Args {
     let mut report_disk_failure_quorum: Option<usize> = None;
     let mut metrics_port: Option<u16> = None;
     let mut metrics_listen: Option<String> = None;
+    let mut min_alloc_free_bytes: Option<u64> = None;
 
     let raw: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -119,6 +124,11 @@ fn parse_args() -> Args {
                 i += 1;
                 metrics_listen = Some(raw[i].clone());
             }
+            "--min-alloc-free-bytes" => {
+                i += 1;
+                min_alloc_free_bytes =
+                    Some(raw[i].parse().expect("--min-alloc-free-bytes must be a number"));
+            }
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
@@ -134,6 +144,7 @@ fn parse_args() -> Args {
         report_disk_failure_quorum,
         metrics_port,
         metrics_listen,
+        min_alloc_free_bytes,
     }
 }
 
@@ -179,6 +190,11 @@ async fn main() -> Result<()> {
             quorum,
             "F192 quorum debounce configured"
         );
+    }
+
+    if let Some(v) = args.min_alloc_free_bytes {
+        manager.set_min_alloc_free_bytes(v);
+        tracing::info!(min_alloc_free_bytes = v, "ENOSPC-1 allocation floor configured");
     }
 
     if args.policy_fast_mode {

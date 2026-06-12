@@ -1768,6 +1768,20 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     StreamClient note_manager_code). `handle_register_partition_addr`
     STAYS ungated (idempotent in-memory hint, continuously re-reported).
 
+37. **ENOSPC-1: allocation soft-avoids space-low nodes.**
+    `node_health_loop` stashes each node's MAX per-disk free from every
+    successful df probe into `node_max_free` (in-memory only — a 2 s-
+    fresh routing hint; the df payload's per-disk ids are EN-local and
+    unmapped per note 7, but the max needs no id mapping).
+    `select_nodes` filters `healthy` down to nodes not below
+    `min_alloc_free_bytes` (`--min-alloc-free-bytes`, default 256 MiB,
+    0 = off; `set_min_alloc_free_bytes`); when that under-fills the
+    selection it falls back to the full healthy set — a capacity-
+    crunched cluster still attempts allocation (the EN-side `Full` gate
+    fails fast and the per-RPC fallback walks) rather than refusing.
+    Unknown nodes (no df yet) are spacious — cold leader keeps
+    allocating. EN-side counterpart: stream CLAUDE.md note 25a.
+
 36. **/metrics (observability batch 1).** `AutumnManager::metrics_text()`
     renders leader/serving gauges + store counts (streams / extents /
     nodes / partitions / ps_nodes / regions / part_addrs), per-disk

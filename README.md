@@ -145,6 +145,28 @@ every 2 s (PS/manager publisher task; EN per-shard refresh loop); PS
 `requests_total` resets on PS restart (normal Prometheus counter semantics
 — use `rate()`).
 
+### Disk-full (ENOSPC) behavior
+
+A capacity error (ENOSPC/EDQUOT) on any EN write marks the disk **Full**,
+distinct from **Faulted** (any other I/O error, permanent until restart):
+a Full disk keeps serving reads and existing extents but hosts no NEW
+extents, and **self-heals** back to Online within ~2 s of free space
+returning above 5% of the disk (GC or operator cleanup — no process
+restart needed). Watch `autumn_en_disk_full{disk_id=...}` on the EN
+`/metrics` endpoint. The manager additionally soft-avoids allocating onto
+nodes whose best disk has < `--min-alloc-free-bytes` free (default
+256 MiB; 0 disables; cluster.sh env `AUTUMN_MGR_MIN_ALLOC_FREE_BYTES`).
+
+E2E test (root, loop mounts): `./scripts/enospc_chaos.sh` — EN1 on a
+512 MB loopback ext4 fills under live 1 MB puts; asserts Full-not-Faulted
+classification, write failover to the other ENs, 2 s self-heal after
+space frees, and byte-exact readback of every ACKed key. This harness
+caught a real silent-corruption bug on its first pass: the batched append
+used a raw `pwritev` and treated a SHORT write (the POSIX behavior when
+some bytes fit) as success — a partial value was ACKed and read back
+zero-padded. Fixed with the write-all form; the invariant is documented
+in `crates/stream/CLAUDE.md` note 25a.
+
 ## CLI cheatsheet
 
 ```bash

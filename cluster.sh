@@ -621,6 +621,11 @@ do_start() {
     if [[ "${AUTUMN_METRICS:-0}" == "1" ]]; then
         mgr_extra="$mgr_extra --metrics-port 9591"
     fi
+    if [[ -n "${AUTUMN_MGR_MIN_ALLOC_FREE_BYTES:-}" ]]; then
+        [[ "$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES" =~ ^[0-9]+$ ]] \
+            || die "AUTUMN_MGR_MIN_ALLOC_FREE_BYTES must be a non-negative integer (got '$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES')"
+        mgr_extra="$mgr_extra --min-alloc-free-bytes $AUTUMN_MGR_MIN_ALLOC_FREE_BYTES"
+    fi
     start_proc manager \
         "$MANAGER" --port 9001 --etcd 127.0.0.1:2379 --listen "$BIND_HOST" \
         --transport "$TRANSPORT" $mgr_extra

@@ -355,3 +355,61 @@ gaps in the lease protocol's correctness story.
   gauge 行为）；seed=13 隔离 chaos 回归 ok 零丢失。cluster.sh
   `AUTUMN_METRICS=1` 一键接线；README 新节 + 3 crate CLAUDE.md 注记。
 - **passes:** completed (2026-06-12)
+
+---
+
+### ENOSPC-1 · 生产急修批次 3：写满盘行为定义 + 实测——并揪出 ACK 短写静默损坏（2026-06-12）
+- **目标:** `/loop 生产视角` 第三项。写满盘行为此前未定义未测试：任何写
+  错误（含暂时性 ENOSPC）都把盘永久标 offline 直到进程重启；EC 写路径
+  根本不标；分配从不看剩余空间。
+- **设计:** ① EN `DiskHealth` 三态机（Online/Full/Faulted，按
+  state-machine-not-bool 约定）取代 `DiskFS.online` bool：ENOSPC/EDQUOT
+  （`is_disk_full_error`，按 os-error 后缀匹配——多处只有字符串化错误）
+  归类 **Full**——盘停收新 extent（choose_disk 要求 allocatable）但继续
+  服务读+既有 extent，每 shard 2s sweep 在 free≥总量5% 时自愈回 Online；
+  其余归 **Faulted**（保留历史永久语义，绝不被降级）。全部写/persist
+  错误站点换 `mark_disk_error_for_extent`（append pwrite/fsync、fence
+  persist、save_meta fail-closed、recovery、EC staging/commit——EC 族
+  此前零标记）。② metrics 新增 `autumn_en_disk_full`。③ manager：
+  node_health_loop 存每节点最大单盘 free（内存态），`select_nodes` 软避
+  低于 `--min-alloc-free-bytes`（默认 256MiB，0=关）的节点，不足时回退
+  全 healthy 集（容量紧张集群仍尝试分配，EN 侧 Full 快速失败+逐 RPC
+  fallback 兜底）。
+- **headline BUG（E2E 首跑抓获，真实数据损坏）:** `build_append_future`
+  用裸 `write_vectored_at` 只查 Err——POSIX pwritev 在将满盘上写入能容
+  纳的部分并返回**短计数**，partial append 被 fsync + **ACK**，预留区
+  未写尾部读回全零（实测 1MB 值只有 3.5KB 完好+后续全零，重试 3 次仍
+  错）。修复：`write_vectored_all_at`。不变量：**本地文件写必须用
+  `*_all` 形式或校验写入计数——裸定位写的 Ok(n) 不是成功**
+  （file_pwrite 早已用 write_all_at，批量 vectored 路径是唯一裸调用）。
+- **E2E:** `scripts/enospc_chaos.sh`——EN1 数据目录放 512MB loopback
+  ext4，压舱后 1MB 值持续写至 ENOSPC：E1 Full≠Faulted（metrics 断言）、
+  E2 写可用性 20/20（新 extent 落其他 EN）、E3 释放空间后 ~2s 自愈、
+  E4 全部 ACK key 字节级回读（修复后 145/162 key 两轮零损）。harness
+  自身教训：键须带随机 hex 前缀散到 8 分区（首版 "ek-*" 全落一个分区，
+  其 log tail 恰好不含 EN1）；AUTUMN_DATA_ROOT 必须传给 cluster.sh。
+- **coco（GPT-5.5 deep）2P1+4P2+2P3，采纳 6 拒 2:**
+  - **P1-甲（第二个真 bug，acked 数据被 seal 砍掉）:** apply_completion
+    在 batch 全副本完成时无条件给调用方发 Ok——但同 extent 更低 offset
+    的 lease 已失败（永久 hole，正是 ENOSPC 中段失败的形态）时，writer
+    `commit` 停在 hole 之下（设计如此：roll 的 seal 按 contiguous
+    commit 排除"hole 及其后全部"），于是 seal 砍掉已 ACK 的区间。修复：
+    caller-ack 延迟到 contiguous prefix 覆盖该区间才发（pending_acks 携
+    带 oneshot）；poison 时 `failure_floor` 以上的 pending/迟到完成全部
+    回 Err（副本上的字节成为无害的未 ACK 重复）。不变量：**对调用方可
+    见的 append ack ⟹ 区间在 contiguous 全副本 ACK 前缀内**。单测 ×2
+    （双时序 + hole 之下仍正常 ack）。
+  - **P1-乙:** 多 shard 各持同一物理目录的独立 DiskFS——shard A 标 Full
+    后 shard B 照常分配。修复：health 改为按 canonical base_dir 共享的
+    进程级 Arc<AtomicU8>（shared_disk_health 注册表）+ 跨实例共享单测。
+  - **P2:** alloc_extent 的 save_meta 失败补 mark+remove entry（P0-D 同
+    族）；cluster.sh 环境变量正则校验防参数注入。**P3:** gauge 槽初值
+    1 在新语义下= Full（启动 2s 假阳性）→ 0。
+  - **拒 2:** chaos 脚本全局 kill/rm-rf（全部既有 harness 的固定模式）；
+    CLI 缺值 panic（手写解析器的统一习惯）。
+- **验收:** workspace 0 error；stream 77 + ps 162 + manager 150 单测
+  （新增 DiskHealth ×3、select_nodes spacious ×1、deferred-ack ×2）；
+  enospc_chaos ×3 全 PASS；seed=13 隔离 chaos ok 零丢失；
+  transport_chaos tcp 全 PASS。文档：stream CLAUDE.md note 25a（含两
+  P1）、manager note 37、README "Disk-full (ENOSPC) behavior" 节。
+- **passes:** completed (2026-06-12)

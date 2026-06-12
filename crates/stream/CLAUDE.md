@@ -1245,6 +1245,64 @@ sufficient (and cheaper than DashMap).
     (Issue #14627 ping-pong + LSN watermark) becomes load-bearing** —
     re-validate the race on the new architecture before shipping.
 
+25a. **ENOSPC-1: disk health is a 3-state machine (`DiskHealth`:
+    Online / Full / Faulted), and the batched-append pwritev MUST be the
+    `_all` form.** Two coupled production fixes (2026-06-12):
+    - **Short-write corruption (the headline bug, found by
+      `scripts/enospc_chaos.sh`):** `build_append_future` used raw
+      `write_vectored_at` and only checked `Err` — POSIX pwritev on a
+      nearly-full disk writes what fits and returns the SHORT count, so a
+      partial append (3.5 KB of a 1 MB value) was fsynced + ACKED and the
+      unwritten reserved tail read back as zeros. Fixed with
+      `write_vectored_all_at` (loops until done or real error). Invariant:
+      **every local file write must be a `*_all` form or verify the
+      written count — Ok(n) from a raw positional write is NOT success.**
+      (`file_pwrite` already used `write_all_at`; the vectored batch path
+      was the one raw call.)
+    - **Classification:** `mark_disk_error_for_extent(extent_id, msg)`
+      replaces the bare offline mark at every write/persist error site
+      (append pwrite/fsync, fence persist, save_meta fail-closed paths,
+      recovery, EC staging/commit — the EC family previously marked
+      nothing). ENOSPC/EDQUOT (`is_disk_full_error`, matched on the os-
+      error suffix since several sites only have stringified errors) ⇒
+      `Full`: disk stops hosting NEW extents (`choose_disk` requires
+      `allocatable()`) but keeps serving reads + existing extents, and the
+      per-shard 2 s sweep SELF-HEALS it back to Online once free ≥ 5% of
+      total — a transiently-full disk no longer stays dead until process
+      restart. Anything else ⇒ `Faulted` (historical permanent-until-
+      restart semantics; never downgraded by `set_full`/`try_clear_full`).
+      Exported as `autumn_en_disk_full` / `autumn_en_disk_online`.
+      Manager side: `node_health_loop` stashes each node's max per-disk
+      free (in-memory), `select_nodes` soft-avoids nodes below
+      `--min-alloc-free-bytes` (default 256 MiB, 0 = off) with the F121
+      fallback chain intact. E2E: `scripts/enospc_chaos.sh` (loopback
+      512 MB fs, fill → failover → self-heal → zero-loss verify).
+    - **Health is SHARED per physical dir across shards (coco P1).** F196
+      multi-shard builds one `DiskFS` per shard for the same dir; a
+      shard-local flag let shard B keep allocating onto a disk shard A
+      had marked Full. `DiskFS.health` is an `Arc<AtomicU8>` from the
+      process-global `shared_disk_health(base_dir)` registry (canonical-
+      path keyed) — one state per physical dir, test instances on
+      distinct dirs stay isolated.
+    - **Caller-ack ⊆ contiguous commit (coco P1, the seal-chop hole).**
+      `client.rs::apply_completion` used to fire the caller's oneshot Ok
+      the moment a batch completed on all replicas — even when a LOWER
+      lease on the same extent had already failed (a permanent hole, the
+      exact mid-pipeline profile ENOSPC produces). The writer's `commit`
+      stays below the hole (correct — `apply_reset_tail` doc: seal at
+      contiguous commit, "hole + everything after correctly excluded"),
+      so the roll's SealCommit CHOPPED an already-acked range. Now
+      `StreamAppendState::ack` carries the oneshot: caller acks fire only
+      as the contiguous prefix advances; on poison, `failure_floor` =
+      first failed offset, every pending/late completion at/above it
+      resolves Err ("retry on a fresh extent" — the replica bytes become
+      benign un-acked duplicates). Invariant: **a caller-visible append
+      ack implies the range is inside the contiguous all-replica-acked
+      prefix.** Cost: out-of-order completions wait for contiguity
+      (inversions are rare; same bounded-p99 trade-off as F210-C1).
+      Tests: `caller_ack_deferred_until_contiguous`,
+      `completion_above_failed_lease_is_failed_not_acked`.
+
 25. **No `.meta` persist failure is ever swallowed — P0-D closed the last
     `let _ = save_meta(...)` sites (2026-06-12).** The `.meta` sidecar is the
     only state a restart trusts (note 23); any path that mutates

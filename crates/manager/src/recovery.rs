@@ -767,6 +767,20 @@ impl crate::AutumnManager {
                 // wire status keys on the extent-node's local disk_id,
                 // unrelated to the manager's allocated disk_id).
                 Self::mark_node_disks_online(&self.store, node);
+                // ENOSPC-1: stash the node's max per-disk free for the
+                // allocation free-space soft filter. Uses the df payload's
+                // aggregate only — the per-disk ids in it are EN-local and
+                // unrelated to manager disk_ids (F121, note 7), but the
+                // MAX across disks needs no id mapping.
+                let max_free = df
+                    .disk_status
+                    .iter()
+                    .map(|(_, st)| st.free)
+                    .max()
+                    .unwrap_or(0);
+                self.node_max_free
+                    .borrow_mut()
+                    .insert(node.node_id, max_free);
                 // F192: drop stale push-based failure reports so a residual
                 // burst can't re-flip the node offline on the next tick.
                 self.recent_failure_reports

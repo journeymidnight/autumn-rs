@@ -130,7 +130,8 @@ pub(crate) static EN_APPEND_TOTALS: EnAppendTotals = EnAppendTotals {
 pub struct EnShardGauges {
     shard_idx: u32,
     extents: std::sync::atomic::AtomicU64,
-    /// (disk_id, online as 0/1) — disk set is fixed at construction.
+    /// (disk_id, DiskHealth as u64: 0=Online 1=Full 2=Faulted) — disk
+    /// set is fixed at construction.
     disks: Vec<(u64, std::sync::atomic::AtomicU64)>,
 }
 
@@ -142,9 +143,11 @@ static EN_SHARD_GAUGES: std::sync::Mutex<Vec<std::sync::Weak<EnShardGauges>>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Render the EN's Prometheus text. Extents are summed across shards
-/// (shards own disjoint extent sets); a disk is reported offline if ANY
-/// shard's view says so (each shard holds its own `DiskFS` instance, and
-/// `mark_disk_offline_for_extent` flips only the observing shard's copy).
+/// (shards own disjoint extent sets); per-disk health takes the WORST
+/// across shards (each shard holds its own `DiskFS` instance, and
+/// `mark_disk_error_for_extent` flips only the observing shard's copy):
+/// `autumn_en_disk_online` = 0 iff some shard sees Faulted,
+/// `autumn_en_disk_full` = 1 iff some shard sees Full (and none Faulted).
 pub fn render_en_metrics() -> String {
     use autumn_common::metrics_http::{push_metric, push_type};
     use std::sync::atomic::Ordering::Relaxed;
@@ -177,7 +180,8 @@ pub fn render_en_metrics() -> String {
         guard.iter().filter_map(|w| w.upgrade()).collect()
     };
     let mut extents_total: u64 = 0;
-    let mut disk_online: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    // Worst health per disk across shards (0=Online 1=Full 2=Faulted).
+    let mut disk_health: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
     push_type(&mut out, "autumn_en_shard_extents", "gauge");
     for s in slots.iter() {
         let e = s.extents.load(Relaxed);
@@ -188,25 +192,34 @@ pub fn render_en_metrics() -> String {
             &[("shard", s.shard_idx.to_string())],
             e as f64,
         );
-        for (disk_id, online) in &s.disks {
-            let v = online.load(Relaxed);
-            disk_online
+        for (disk_id, health) in &s.disks {
+            let v = health.load(Relaxed);
+            disk_health
                 .entry(*disk_id)
-                .and_modify(|cur| *cur = (*cur).min(v))
+                .and_modify(|cur| *cur = (*cur).max(v))
                 .or_insert(v);
         }
     }
     push_type(&mut out, "autumn_en_extents", "gauge");
     push_metric(&mut out, "autumn_en_extents", &[], extents_total as f64);
-    push_type(&mut out, "autumn_en_disk_online", "gauge");
-    let mut disk_ids: Vec<u64> = disk_online.keys().copied().collect();
+    let mut disk_ids: Vec<u64> = disk_health.keys().copied().collect();
     disk_ids.sort_unstable();
-    for disk_id in disk_ids {
+    push_type(&mut out, "autumn_en_disk_online", "gauge");
+    for disk_id in &disk_ids {
         push_metric(
             &mut out,
             "autumn_en_disk_online",
             &[("disk_id", disk_id.to_string())],
-            disk_online[&disk_id] as f64,
+            u64::from(disk_health[disk_id] != 2) as f64,
+        );
+    }
+    push_type(&mut out, "autumn_en_disk_full", "gauge");
+    for disk_id in &disk_ids {
+        push_metric(
+            &mut out,
+            "autumn_en_disk_full",
+            &[("disk_id", disk_id.to_string())],
+            u64::from(disk_health[disk_id] == 1) as f64,
         );
     }
     out
@@ -220,10 +233,53 @@ pub fn render_en_metrics() -> String {
 /// `{base_dir}/{crc32c(extent_id_le)&0xFF:02x}/extent-{id}.dat`
 /// This matches the 256 subdirs created by `autumn-op format`.
 /// Hash subdirs are created on-demand when the first extent is written.
+/// ENOSPC-1: per-disk health state machine. `Full` (capacity: ENOSPC /
+/// EDQUOT) is RECOVERABLE — the per-shard 2 s sweep clears it once free
+/// space returns above the hysteresis floor (GC / operator cleanup), so a
+/// transiently-full disk no longer stays dead until process restart.
+/// `Faulted` (any other I/O error = media/fs fault) keeps the historical
+/// permanent-until-restart semantics. Proper enum, not a second bool —
+/// the states are mutually exclusive and Faulted must never be
+/// downgraded by a capacity probe.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub(crate) enum DiskHealth {
+    Online = 0,
+    Full = 1,
+    Faulted = 2,
+}
+
 struct DiskFS {
     base_dir: PathBuf,
     disk_id: u64,
-    online: AtomicBool,
+    /// SHARED across every DiskFS instance for the same physical
+    /// directory in this process (coco P1: F196 multi-shard builds one
+    /// DiskFS per shard for the same dir — a shard-local health flag let
+    /// shard B keep allocating onto a disk shard A had just marked Full).
+    /// Keyed by canonical base_dir via `shared_disk_health`.
+    health: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+/// Process-global registry of per-directory health cells. Canonical path
+/// keying means two shards (or a re-created ExtentNode) observing the
+/// same physical dir share ONE state; distinct dirs (in-process tests,
+/// real multi-disk) stay isolated. Entries are tiny and bounded by the
+/// number of distinct data dirs ever opened in the process.
+fn shared_disk_health(base_dir: &std::path::Path) -> std::sync::Arc<std::sync::atomic::AtomicU8> {
+    static CELLS: std::sync::Mutex<
+        Option<HashMap<PathBuf, std::sync::Arc<std::sync::atomic::AtomicU8>>>,
+    > = std::sync::Mutex::new(None);
+    let key = base_dir
+        .canonicalize()
+        .unwrap_or_else(|_| base_dir.to_path_buf());
+    let mut guard = CELLS.lock().unwrap();
+    guard
+        .get_or_insert_with(HashMap::new)
+        .entry(key)
+        .or_insert_with(|| {
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(DiskHealth::Online as u8))
+        })
+        .clone()
 }
 
 impl DiskFS {
@@ -240,28 +296,74 @@ impl DiskFS {
             .trim()
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid disk_id in {}", base_dir.display()))?;
+        let health = shared_disk_health(&base_dir);
         Ok(Self {
             base_dir,
             disk_id,
-            online: AtomicBool::new(true),
+            health,
         })
     }
 
     /// Create a disk entry with an explicit disk_id (no `disk_id` file required).
     fn with_disk_id(base_dir: PathBuf, disk_id: u64) -> Self {
+        let health = shared_disk_health(&base_dir);
         Self {
             base_dir,
             disk_id,
-            online: AtomicBool::new(true),
+            health,
         }
     }
 
-    fn online(&self) -> bool {
-        self.online.load(Ordering::Relaxed)
+    fn health(&self) -> DiskHealth {
+        match self.health.load(Ordering::Relaxed) {
+            1 => DiskHealth::Full,
+            2 => DiskHealth::Faulted,
+            _ => DiskHealth::Online,
+        }
     }
 
-    fn set_offline(&self) {
-        self.online.store(false, Ordering::Relaxed);
+    /// Historical "online" semantic = NOT faulted. A Full disk still
+    /// serves reads and existing-extent operations; it only stops
+    /// accepting NEW extents (`allocatable`). Reported as-is in df and
+    /// metrics.
+    fn online(&self) -> bool {
+        self.health() != DiskHealth::Faulted
+    }
+
+    /// May this disk host a NEW extent? Online only — Full and Faulted
+    /// are both excluded from `choose_disk`.
+    fn allocatable(&self) -> bool {
+        self.health() == DiskHealth::Online
+    }
+
+    fn set_faulted(&self) {
+        self.health.store(DiskHealth::Faulted as u8, Ordering::Relaxed);
+    }
+
+    /// Capacity-full: only upgrades Online → Full. NEVER downgrades a
+    /// Faulted disk (a media fault that also manifests ENOSPC-ish later
+    /// must stay Faulted).
+    fn set_full(&self) {
+        let _ = self.health.compare_exchange(
+            DiskHealth::Online as u8,
+            DiskHealth::Full as u8,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Self-heal: only Full → Online (the 2 s sweep calls this once free
+    /// space is back above the hysteresis floor). Faulted is permanent
+    /// until restart.
+    fn try_clear_full(&self) -> bool {
+        self.health
+            .compare_exchange(
+                DiskHealth::Full as u8,
+                DiskHealth::Online as u8,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
     }
 
     /// Low byte of crc32c over extent_id little-endian bytes → hash subdir name.
@@ -1963,7 +2065,7 @@ async fn build_append_future(
         .ensure_fence_durable(fence_extent_id, &extent, first_revision)
         .await
     {
-        node.mark_disk_offline_for_extent(fence_extent_id);
+        node.mark_disk_error_for_extent(fence_extent_id, &e.to_string());
         tracing::error!(
             extent_id = fence_extent_id,
             error = %e,
@@ -2136,10 +2238,21 @@ async fn build_append_future(
         // The `RefCell` borrow is released immediately by `.clone()`.
         let file_rc = extent_for_io.file_rc();
         let mut f: &CompioFile = &file_rc;
-        let BufResult(wr, _) = f.write_vectored_at(bufs, file_start).await;
+        // ENOSPC-1 CORRUPTION FIX: `write_vectored_all_at`, NOT the raw
+        // `write_vectored_at`. POSIX pwritev on a nearly-full disk writes
+        // what fits and returns the SHORT count — only a zero-fit write
+        // errors. The raw call's Ok(n < total) was treated as success, so
+        // a partial append was fsynced + ACKED, and the unwritten tail of
+        // the reserved range read back as zeros (sparse hole): silent
+        // corruption of an acked write (caught live by
+        // scripts/enospc_chaos.sh — 1 MB values with 3.5 KB intact then
+        // zeros). The `_all` form loops until every byte is written or a
+        // real error (ENOSPC once nothing fits) surfaces — errors here
+        // reject the batch, never ack.
+        let BufResult(wr, _) = f.write_vectored_all_at(bufs, file_start).await;
         if let Err(e) = wr {
-            node.mark_disk_offline_for_extent(extent_id);
             let msg = e.to_string();
+            node.mark_disk_error_for_extent(extent_id, &msg);
             return req_ids
                 .into_iter()
                 .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
@@ -2162,7 +2275,7 @@ async fn build_append_future(
         match rx.await {
             Ok(Ok(())) => {}
             Ok(Err(msg)) => {
-                node.mark_disk_offline_for_extent(extent_id);
+                node.mark_disk_error_for_extent(extent_id, &msg);
                 return req_ids
                     .into_iter()
                     .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
@@ -2433,7 +2546,10 @@ impl ExtentNode {
         let metrics_gauges = {
             let mut disk_slots: Vec<(u64, std::sync::atomic::AtomicU64)> = disk_map
                 .keys()
-                .map(|id| (*id, std::sync::atomic::AtomicU64::new(1)))
+                // DiskHealth::Online as u64 == 0 (coco P3: the old `1`
+                // meant online under the bool scheme; under the health
+                // scheme it reads as Full until the first sweep).
+                .map(|id| (*id, std::sync::atomic::AtomicU64::new(0)))
                 .collect();
             disk_slots.sort_unstable_by_key(|(id, _)| *id);
             let g = std::sync::Arc::new(EnShardGauges {
@@ -2487,13 +2603,19 @@ impl ExtentNode {
         // unreachable.
         node.spawn_reconcile_orphans_loop();
 
-        // Observability batch 1: per-shard gauge refresh on THIS shard's
-        // runtime. The manager's df probe only reaches the registered
-        // control_address (one shard), so a df-driven refresh left every
-        // other shard's slot permanently stale — each shard must refresh
-        // its own. The task holds only WEAK refs (coco P2): when the
-        // node's last clone drops, the upgrades fail, the loop exits, and
-        // nothing pins the extent/disk state alive.
+        // Per-shard 2 s sweep on THIS shard's runtime, two jobs:
+        // (1) OBS-1 gauge refresh — the manager's df probe only reaches
+        //     the registered control_address (one shard), so a df-driven
+        //     refresh left every other shard's slot permanently stale;
+        //     each shard must refresh its own.
+        // (2) ENOSPC-1 Full self-heal — a disk marked Full (capacity)
+        //     returns Online once free space is back above the
+        //     hysteresis floor (5% of total), so GC / operator cleanup
+        //     restores allocatability WITHOUT a process restart. Faulted
+        //     is never touched here.
+        // The task holds only WEAK refs (coco P2): when the node's last
+        // clone drops, the upgrades fail, the loop exits, and nothing
+        // pins the extent/disk state alive.
         {
             use std::sync::atomic::Ordering::Relaxed;
             let extents = Rc::downgrade(&node.extents);
@@ -2507,9 +2629,20 @@ impl ExtentNode {
                         return; // node dropped — exit, slot gets pruned
                     };
                     gauges.extents.store(extents.len() as u64, Relaxed);
-                    for (disk_id, online) in &gauges.disks {
+                    for (disk_id, health_slot) in &gauges.disks {
                         if let Some(disk) = disks.get(disk_id) {
-                            online.store(disk.online() as u64, Relaxed);
+                            if disk.health() == DiskHealth::Full {
+                                let (total, free) = disk.disk_stats();
+                                if total > 0 && free >= total / 20 && disk.try_clear_full() {
+                                    tracing::info!(
+                                        disk_id,
+                                        free,
+                                        total,
+                                        "disk no longer full — allocation re-enabled"
+                                    );
+                                }
+                            }
+                            health_slot.store(disk.health() as u64, Relaxed);
                         }
                     }
                     drop((extents, disks, gauges));
@@ -2743,9 +2876,12 @@ impl ExtentNode {
             })
     }
 
-    /// Return the first online disk, or None if all are offline.
+    /// Return the first ALLOCATABLE disk (Online — not Full, not
+    /// Faulted), or None. New extents must never land on a full disk;
+    /// existing extents on a full disk keep serving reads + (failing)
+    /// appends until space frees.
     fn choose_disk(&self) -> Option<Rc<DiskFS>> {
-        self.disks.values().find(|d| d.online()).cloned()
+        self.disks.values().find(|d| d.allocatable()).cloned()
     }
 
     /// Resolve DiskFS for an extent by its disk_id. Returns error string if disk is unknown.
@@ -2756,17 +2892,58 @@ impl ExtentNode {
             .ok_or_else(|| format!("unknown disk_id {disk_id}"))
     }
 
-    /// Mark the disk hosting an extent as offline after an I/O error.
-    pub(crate) fn mark_disk_offline_for_extent(&self, extent_id: u64) {
+    /// ENOSPC-1: does this error message describe a CAPACITY condition
+    /// (disk full / quota) rather than a media/fs fault? Matched on the
+    /// std `io::Error` Display forms ("No space left on device (os error
+    /// 28)", "Disk quota exceeded (os error 122)") because several call
+    /// sites only have the stringified error (fsync coalescer waiters,
+    /// anyhow chains) — the os-error suffix survives every wrapping in
+    /// this codebase.
+    pub(crate) fn is_disk_full_error(msg: &str) -> bool {
+        msg.contains("os error 28")
+            || msg.contains("No space left")
+            || msg.contains("os error 122")
+            || msg.contains("Disk quota")
+    }
+
+    /// Mark the disk hosting an extent after a write/persist error,
+    /// CLASSIFIED (ENOSPC-1): capacity errors (ENOSPC/EDQUOT) set `Full`
+    /// — recoverable, the 2 s sweep clears it when space frees — while
+    /// anything else sets `Faulted` (permanent until restart, the
+    /// historical "offline" semantics). Either way the disk stops
+    /// hosting NEW extents immediately and the failing op itself has
+    /// already been rejected by the caller (fail-closed, note 23/25).
+    pub(crate) fn mark_disk_error_for_extent(&self, extent_id: u64, err_msg: &str) {
         if let Some(entry) = self.extents.get(&extent_id) {
             let disk_id = entry.disk_id;
             if let Some(disk) = self.disks.get(&disk_id) {
-                if disk.online() {
-                    tracing::error!(extent_id, disk_id, "marking disk offline due to I/O error");
-                    disk.set_offline();
+                if Self::is_disk_full_error(err_msg) {
+                    if disk.health() == DiskHealth::Online {
+                        tracing::warn!(
+                            extent_id,
+                            disk_id,
+                            "disk FULL (capacity) — new-extent allocation suspended; \
+                             self-heals when free space returns"
+                        );
+                        disk.set_full();
+                    }
+                } else if disk.online() {
+                    tracing::error!(
+                        extent_id,
+                        disk_id,
+                        err_msg,
+                        "marking disk faulted due to I/O error"
+                    );
+                    disk.set_faulted();
                 }
             }
         }
+    }
+
+    /// Legacy unclassified form — kept for call sites with no error text
+    /// (e.g. canceled-channel paths). Faults the disk.
+    pub(crate) fn mark_disk_offline_for_extent(&self, extent_id: u64) {
+        self.mark_disk_error_for_extent(extent_id, "unclassified I/O failure");
     }
 
     /// P0-B: per-extent `.meta`-write critical section. Every `.meta` writer
@@ -3700,7 +3877,7 @@ impl ExtentNode {
                     error = %e,
                     "P0-A: .dat fsync failed before seal meta — disk OFFLINE, NOT persisting sealed meta",
                 );
-                self.mark_disk_offline_for_extent(extent_id);
+                self.mark_disk_error_for_extent(extent_id, &e.to_string());
                 // P0-A (coco): PROPAGATE the failure (was `-> bool`, swallowed)
                 // so callers (handle_re_avali / append meta-refresh / copy)
                 // map it to an error instead of reporting CODE_OK for a replica
@@ -3718,7 +3895,7 @@ impl ExtentNode {
                     error = %e,
                     "P0-A: save_meta of sealed extent failed — disk OFFLINE (seal not durable)",
                 );
-                self.mark_disk_offline_for_extent(extent_id);
+                self.mark_disk_error_for_extent(extent_id, &e);
                 return Err(format!(
                     "save_meta of sealed extent {extent_id} failed: {e}"
                 ));
@@ -4330,7 +4507,7 @@ impl ExtentNode {
             // "extent already exists". The orphaned .dat is reaped by the
             // startup/periodic reconcile (F109/F113), the established path
             // for abandoned recovery artifacts.
-            self.mark_disk_offline_for_extent(task.extent_id);
+            self.mark_disk_error_for_extent(task.extent_id, &e.to_string());
             self.extents.remove(&task.extent_id);
             return Err(format!(
                 "recovery of extent {} completed but .meta persist failed (fail-closed): {e}",
@@ -4501,10 +4678,9 @@ impl ExtentNode {
             .open(&staging_path)
             .await
             .map_err(|e| {
-                (
-                    StatusCode::Internal,
-                    format!("create staging {extent_id}: {e}"),
-                )
+                let msg = format!("create staging {extent_id}: {e}");
+                self.mark_disk_error_for_extent(extent_id, &msg);
+                (StatusCode::Internal, msg)
             })?;
 
         // F171: staging file is local to this function — never aliased
@@ -4512,19 +4688,20 @@ impl ExtentNode {
         // freshly-created `Rc` suffices. We share via clone for the
         // sync_data call below.
         let staging_rc = Rc::new(staging_file);
+        // ENOSPC-1: EC staging writes mark the disk like every other
+        // write path (this was the one family that didn't — a full or
+        // faulted disk kept receiving EC dispatches).
         file_pwrite_chunked(staging_rc.clone(), 0, shard_data)
             .await
             .map_err(|e| {
-                (
-                    StatusCode::Internal,
-                    format!("write staging {extent_id}/{shard_index}: {e}"),
-                )
+                let msg = format!("write staging {extent_id}/{shard_index}: {e}");
+                self.mark_disk_error_for_extent(extent_id, &msg);
+                (StatusCode::Internal, msg)
             })?;
         staging_rc.sync_data().await.map_err(|e| {
-            (
-                StatusCode::Internal,
-                format!("sync staging {extent_id}: {e}"),
-            )
+            let msg = format!("sync staging {extent_id}: {e}");
+            self.mark_disk_error_for_extent(extent_id, &msg);
+            (StatusCode::Internal, msg)
         })?;
 
         tracing::info!(
@@ -4585,10 +4762,9 @@ impl ExtentNode {
         compio::fs::rename(&staging_path, &dat_path)
             .await
             .map_err(|e| {
-                (
-                    StatusCode::Internal,
-                    format!("rename staging {extent_id}: {e}"),
-                )
+                let msg = format!("rename staging {extent_id}: {e}");
+                self.mark_disk_error_for_extent(extent_id, &msg);
+                (StatusCode::Internal, msg)
             })?;
 
         // Reopen the file at the .dat path so entry.file points to the
@@ -4738,7 +4914,7 @@ impl ExtentNode {
             .ensure_fence_durable(req.extent_id, &extent, req.owner_epoch)
             .await
         {
-            self.mark_disk_offline_for_extent(req.extent_id);
+            self.mark_disk_error_for_extent(req.extent_id, &e.to_string());
             tracing::error!(
                 extent_id = req.extent_id,
                 error = %e,
@@ -4852,8 +5028,9 @@ impl ExtentNode {
         let data_payload = req.payload;
 
         if let Err(e) = file_pwrite(extent.file_rc(), start, data_payload.clone()).await {
-            self.mark_disk_offline_for_extent(req.extent_id);
-            return Err((StatusCode::Internal, e.to_string()));
+            let msg = e.to_string();
+            self.mark_disk_error_for_extent(req.extent_id, &msg);
+            return Err((StatusCode::Internal, msg));
         }
         let start_offset = start as u32;
         let end = start + data_payload.len() as u64;
@@ -4865,7 +5042,7 @@ impl ExtentNode {
         match rx.await {
             Ok(Ok(())) => {}
             Ok(Err(msg)) => {
-                self.mark_disk_offline_for_extent(req.extent_id);
+                self.mark_disk_error_for_extent(req.extent_id, &msg);
                 return Err((StatusCode::Internal, msg));
             }
             Err(_canceled) => {
@@ -5263,9 +5440,17 @@ impl ExtentNode {
         );
 
         let entry = self.get_extent(req.extent_id).await?;
-        self.save_meta(req.extent_id, &entry)
-            .await
-            .map_err(|e| (StatusCode::Internal, e))?;
+        // ENOSPC-1 (coco P2): a failed initial `.meta` persist marks the
+        // disk (Full on ENOSPC, Faulted otherwise) AND removes the
+        // just-inserted entry — leaving it would let local lookups see an
+        // extent with no durable sidecar and block a manager re-dispatch
+        // with "extent already exists" (same family as the P0-D recovery
+        // path; the orphan .dat is reaped by F109/F113 reconcile).
+        if let Err(e) = self.save_meta(req.extent_id, &entry).await {
+            self.mark_disk_error_for_extent(req.extent_id, &e);
+            self.extents.remove(&req.extent_id);
+            return Err((StatusCode::Internal, e));
+        }
 
         Ok(rkyv_encode(&AllocExtentResp {
             code: CODE_OK,
@@ -5694,7 +5879,7 @@ impl ExtentNode {
                 error = %e,
                 "P0-A: re_avali post-repair save_meta failed — disk OFFLINE, returning CODE_ERROR",
             );
-            self.mark_disk_offline_for_extent(req.extent_id);
+            self.mark_disk_error_for_extent(req.extent_id, &e);
             return Ok(rkyv_encode(&CodeResp {
                 code: CODE_ERROR,
                 message: format!(
@@ -5932,7 +6117,7 @@ impl ExtentNode {
             // conversion against a stale on-disk sidecar. ENSURE durability:
             // save_meta is idempotent; fail-closed if it still can't persist.
             if let Err(e) = self.save_meta(extent_id, &entry).await {
-                self.mark_disk_offline_for_extent(extent_id);
+                self.mark_disk_error_for_extent(extent_id, &e);
                 return Err((
                     StatusCode::Unavailable,
                     format!(
@@ -6019,7 +6204,7 @@ impl ExtentNode {
                     // lock + F119-D idempotency make the redo safe) and mark
                     // the disk offline (sidecar-persist I/O error).
                     if let Err(e) = self.save_meta(extent_id, &entry).await {
-                        self.mark_disk_offline_for_extent(extent_id);
+                        self.mark_disk_error_for_extent(extent_id, &e);
                         return Err((
                             StatusCode::Unavailable,
                             format!(
@@ -6076,7 +6261,7 @@ impl ExtentNode {
                 // (stale eversion over shard-shaped data = the exact
                 // corruption family F119-C/D guard against).
                 if let Err(e) = self.save_meta(extent_id, &entry).await {
-                    self.mark_disk_offline_for_extent(extent_id);
+                    self.mark_disk_error_for_extent(extent_id, &e);
                     return Err((
                         StatusCode::Unavailable,
                         format!(
@@ -6381,6 +6566,79 @@ impl ExtentNode {
 }
 
 // ─── Unit tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod enospc_disk_health_tests {
+    use super::*;
+
+    /// NB: health cells are shared per-path process-wide (multi-shard
+    /// coupling, coco P1) — each test must use a distinct path.
+    fn disk(path: &str) -> DiskFS {
+        DiskFS::with_disk_id(PathBuf::from(path), 7)
+    }
+
+    /// ENOSPC/EDQUOT classify as capacity in every wrapping this codebase
+    /// produces (typed io::Error Display, fsync-coalescer strings, anyhow
+    /// chains); everything else is a fault.
+    #[test]
+    fn classification_matches_capacity_errors_only() {
+        let enospc = std::io::Error::from_raw_os_error(28).to_string();
+        let edquot = std::io::Error::from_raw_os_error(122).to_string();
+        let eio = std::io::Error::from_raw_os_error(5).to_string();
+        assert!(ExtentNode::is_disk_full_error(&enospc), "{enospc}");
+        assert!(ExtentNode::is_disk_full_error(&edquot), "{edquot}");
+        assert!(ExtentNode::is_disk_full_error(&format!(
+            "write staging 42/1: {enospc}"
+        )));
+        assert!(!ExtentNode::is_disk_full_error(&eio), "{eio}");
+        assert!(!ExtentNode::is_disk_full_error("fsync coalescer canceled"));
+        assert!(!ExtentNode::is_disk_full_error("unclassified I/O failure"));
+    }
+
+    /// Full is recoverable and gates allocation; Faulted is terminal.
+    #[test]
+    fn health_state_machine_transitions() {
+        let d = disk("/tmp/enospc-test-state-machine");
+        assert_eq!(d.health(), DiskHealth::Online);
+        assert!(d.online() && d.allocatable());
+
+        // Online -> Full: still "online" (serves reads) but not allocatable.
+        d.set_full();
+        assert_eq!(d.health(), DiskHealth::Full);
+        assert!(d.online());
+        assert!(!d.allocatable());
+
+        // Full -> Online via the sweep's clear.
+        assert!(d.try_clear_full());
+        assert_eq!(d.health(), DiskHealth::Online);
+        assert!(d.allocatable());
+
+        // Faulted is terminal: set_full must not downgrade it, and
+        // try_clear_full must not resurrect it.
+        d.set_faulted();
+        assert_eq!(d.health(), DiskHealth::Faulted);
+        assert!(!d.online() && !d.allocatable());
+        d.set_full();
+        assert_eq!(d.health(), DiskHealth::Faulted, "set_full downgraded Faulted");
+        assert!(!d.try_clear_full());
+        assert_eq!(d.health(), DiskHealth::Faulted, "clear_full resurrected Faulted");
+    }
+
+    /// coco P1 (multi-shard): two DiskFS instances for the SAME dir share
+    /// one health cell — shard A marking Full must be visible to shard B.
+    #[test]
+    fn health_is_shared_per_directory_across_instances() {
+        let a = disk("/tmp/enospc-test-shared");
+        let b = DiskFS::with_disk_id(PathBuf::from("/tmp/enospc-test-shared"), 7);
+        let other = disk("/tmp/enospc-test-shared-other");
+        a.set_full();
+        assert_eq!(b.health(), DiskHealth::Full, "sibling shard view diverged");
+        assert!(!b.allocatable());
+        assert_eq!(other.health(), DiskHealth::Online, "distinct dir coupled");
+        assert!(b.try_clear_full());
+        assert_eq!(a.health(), DiskHealth::Online);
+    }
+}
 
 #[cfg(test)]
 mod f147b_tests {

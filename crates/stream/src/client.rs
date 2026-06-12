@@ -215,13 +215,26 @@ struct StreamTail {
 /// - `in_flight`: count of leased-but-not-acked batches.
 /// - `poisoned`: set on mid-sequence failure; forces the next caller to
 ///               reset the stream via alloc_new_extent.
+/// A completed-on-all-replicas append waiting for the contiguous prefix
+/// to reach it before the CALLER is acked (ENOSPC-1 P1). `ack` is None in
+/// unit tests that only exercise the cursor arithmetic.
+struct PendingAck {
+    end: u32,
+    ack: Option<(oneshot::Sender<Result<AppendResult>>, AppendResult)>,
+}
+
 struct StreamAppendState {
     tail: Option<StreamTail>,
     commit: u32,
     lease_cursor: u32,
-    pending_acks: std::collections::BTreeMap<u32, u32>,
+    pending_acks: std::collections::BTreeMap<u32, PendingAck>,
     in_flight: u32,
     poisoned: bool,
+    /// ENOSPC-1 P1: offset of the FIRST failed lease (u32::MAX = none).
+    /// Completions at or above this can never join the contiguous prefix
+    /// — the hole below them is permanent for this extent — so they are
+    /// failed to the caller instead of acked. Reset on a genuine roll.
+    failure_floor: u32,
     /// Set true by `SealCommit` after it drains + reports `commit`; while true,
     /// new `Append`s on the about-to-be-sealed tail are REJECTED (soft error →
     /// caller retries onto the fresh tail). Cleared by `ResetTail`
@@ -264,6 +277,7 @@ impl StreamAppendState {
             pending_acks: std::collections::BTreeMap::new(),
             in_flight: 0,
             poisoned: false,
+            failure_floor: u32::MAX,
             sealing: false,
             bad_nodes,
             failure_report_tx,
@@ -295,6 +309,7 @@ impl StreamAppendState {
         self.commit = 0;
         self.lease_cursor = 0;
         self.pending_acks.clear();
+        self.failure_floor = u32::MAX;
         self.in_flight = 0;
         self.poisoned = false;
         // ResetTail moves to a fresh tail → un-freeze: the seal→reset window
@@ -337,13 +352,41 @@ impl StreamAppendState {
         (offset, end)
     }
 
-    fn ack(&mut self, offset: u32, end: u32) {
-        self.pending_acks.insert(offset, end);
+    /// Record an all-replica-completed append and fire CALLER acks only
+    /// for the ranges the contiguous prefix now covers (ENOSPC-1 P1).
+    /// Pre-fix, the caller ack fired unconditionally on completion: with
+    /// a lower lease failed (hole) and this range completed above it, the
+    /// caller saw Ok while `commit` (the seal/SealCommit watermark —
+    /// "hole + everything after correctly excluded", see
+    /// `apply_reset_tail`) stayed below — the eventual seal CHOPPED an
+    /// acked range. Now acked ⊆ contiguous-commit, always.
+    fn ack(
+        &mut self,
+        offset: u32,
+        end: u32,
+        ack: Option<(oneshot::Sender<Result<AppendResult>>, AppendResult)>,
+    ) {
         self.in_flight = self.in_flight.saturating_sub(1);
-        while let Some((&off, &end_of_slot)) = self.pending_acks.iter().next() {
+        if offset >= self.failure_floor {
+            // A lower lease already failed — this range is beyond the
+            // permanent hole and will be excluded by the roll's seal.
+            // Fail the caller (it retries on the fresh tail; the bytes on
+            // the replicas become benign un-acked duplicates).
+            if let Some((tx, _)) = ack {
+                let _ = tx.send(Err(anyhow!(
+                    "append completed but a lower offset failed (hole below);                      not acked — retry on a fresh extent"
+                )));
+            }
+            return;
+        }
+        self.pending_acks.insert(offset, PendingAck { end, ack });
+        while let Some((&off, slot)) = self.pending_acks.iter().next() {
             if off == self.commit {
-                self.commit = end_of_slot;
-                self.pending_acks.remove(&off);
+                self.commit = slot.end;
+                let slot = self.pending_acks.remove(&off).expect("just observed");
+                if let Some((tx, result)) = slot.ack {
+                    let _ = tx.send(Ok(result));
+                }
             } else {
                 break;
             }
@@ -356,6 +399,18 @@ impl StreamAppendState {
             self.lease_cursor = offset;
         } else {
             self.poisoned = true;
+            // ENOSPC-1 P1: everything pending at/above the hole can never
+            // join the contiguous prefix — fail those callers now instead
+            // of acking ranges the roll's seal will discard.
+            self.failure_floor = self.failure_floor.min(offset);
+            let dead = self.pending_acks.split_off(&self.failure_floor);
+            for (_, slot) in dead {
+                if let Some((tx, _)) = slot.ack {
+                    let _ = tx.send(Err(anyhow!(
+                        "append completed but a lower offset failed (hole below);                          not acked — retry on a fresh extent"
+                    )));
+                }
+            }
         }
     }
 }
@@ -1048,12 +1103,20 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
     }
 
     let appended = success_first.expect("success path implies Some");
-    state.ack(offset, end);
-    let _ = ack_tx.send(Ok(AppendResult {
-        extent_id,
-        offset: appended.offset,
-        end: appended.end,
-    }));
+    // ENOSPC-1 P1: the caller ack is DEFERRED until the contiguous prefix
+    // covers this range — `ack` fires it (or fails it past a hole).
+    state.ack(
+        offset,
+        end,
+        Some((
+            ack_tx,
+            AppendResult {
+                extent_id,
+                offset: appended.offset,
+                end: appended.end,
+            },
+        )),
+    );
 }
 
 async fn launch_append(
@@ -3780,19 +3843,122 @@ mod pipeline_tests {
         let (o1, e1) = state.lease(100); // 100..200
         let (o2, e2) = state.lease(100); // 200..300
 
-        state.ack(o1, e1);
+        state.ack(o1, e1, None);
         assert_eq!(state.commit, 0);
         assert_eq!(state.in_flight, 2);
         assert!(state.pending_acks.contains_key(&100));
 
-        state.ack(o2, e2);
+        state.ack(o2, e2, None);
         assert_eq!(state.commit, 0);
         assert_eq!(state.in_flight, 1);
 
-        state.ack(o0, e0);
+        state.ack(o0, e0, None);
         assert_eq!(state.commit, 300);
         assert_eq!(state.in_flight, 0);
         assert!(state.pending_acks.is_empty());
+    }
+
+    fn test_state() -> StreamAppendState {
+        StreamAppendState::new(
+            Rc::new(RefCell::new(HashMap::new())),
+            mpsc::channel::<FailureReport>(1).0,
+            Duration::from_secs(30),
+        )
+    }
+
+    fn ack_payload(
+        offset: u32,
+        end: u32,
+    ) -> (
+        oneshot::Receiver<Result<AppendResult>>,
+        Option<(oneshot::Sender<Result<AppendResult>>, AppendResult)>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        (
+            rx,
+            Some((
+                tx,
+                AppendResult {
+                    extent_id: 1,
+                    offset,
+                    end,
+                },
+            )),
+        )
+    }
+
+    /// ENOSPC-1 P1: caller acks fire only when the contiguous prefix
+    /// covers the range — an out-of-order completion is HELD, not acked.
+    #[test]
+    fn caller_ack_deferred_until_contiguous() {
+        let mut state = test_state();
+        let (o0, e0) = state.lease(100); // 0..100
+        let (o1, e1) = state.lease(100); // 100..200
+
+        let (mut rx1, p1) = ack_payload(o1, e1);
+        state.ack(o1, e1, p1);
+        assert_eq!(state.commit, 0);
+        assert!(
+            rx1.try_recv().expect("sender alive").is_none(),
+            "ack for 100..200 fired before 0..100 completed"
+        );
+
+        let (mut rx0, p0) = ack_payload(o0, e0);
+        state.ack(o0, e0, p0);
+        assert_eq!(state.commit, 200);
+        assert!(rx0.try_recv().unwrap().unwrap().is_ok());
+        assert!(rx1.try_recv().unwrap().unwrap().is_ok());
+    }
+
+    /// ENOSPC-1 P1 (the seal-chop bug): a completion ABOVE a failed lease
+    /// must be FAILED to the caller — pre-fix it acked Ok while `commit`
+    /// (the seal watermark) stayed below it, so the roll's seal discarded
+    /// an acked range. Covers both orders: completion-then-failure
+    /// (pending drained) and failure-then-completion (floor check).
+    #[test]
+    fn completion_above_failed_lease_is_failed_not_acked() {
+        // Order 1: B completes first, then A fails -> B's pending ack
+        // must drain as Err.
+        let mut state = test_state();
+        let (a_off, a_end) = state.lease(100); // 0..100   (A)
+        let (b_off, b_end) = state.lease(100); // 100..200 (B)
+        let _ = state.lease(50); // 200..250 keeps A's rewind path off
+        let (mut rx_b, p_b) = ack_payload(b_off, b_end);
+        state.ack(b_off, b_end, p_b);
+        assert!(rx_b.try_recv().unwrap().is_none(), "B acked early");
+        state.rewind_or_poison(a_off, a_end - a_off); // A fails (hole)
+        assert!(state.poisoned);
+        let b = rx_b.try_recv().unwrap().expect("B must be resolved");
+        assert!(b.is_err(), "B acked Ok above a hole (would be seal-chopped)");
+        assert_eq!(state.commit, 0, "commit must not cover the hole");
+
+        // Order 2: A fails first, then B completes -> floor check fails B.
+        let mut state = test_state();
+        let (a_off, a_end) = state.lease(100);
+        let (b_off, b_end) = state.lease(100);
+        let _ = state.lease(50);
+        state.rewind_or_poison(a_off, a_end - a_off);
+        let (mut rx_b, p_b) = ack_payload(b_off, b_end);
+        state.ack(b_off, b_end, p_b);
+        let b = rx_b.try_recv().unwrap().expect("B must be resolved");
+        assert!(b.is_err(), "late completion above the hole acked Ok");
+
+        // Ranges BELOW the hole still ack normally.
+        let mut state = test_state();
+        let (a_off, a_end) = state.lease(100); // 0..100
+        let (b_off, b_end) = state.lease(100); // 100..200 - will fail
+        let (c_off, c_end) = state.lease(100); // 200..300
+        state.rewind_or_poison(b_off, b_end - b_off); // poison via gap
+        let (mut rx_c, p_c) = ack_payload(c_off, c_end);
+        state.ack(c_off, c_end, p_c);
+        assert!(rx_c.try_recv().unwrap().unwrap().is_err(), "C above hole");
+        let (mut rx_a, p_a) = ack_payload(a_off, a_end);
+        state.ack(a_off, a_end, p_a);
+        assert!(
+            rx_a.try_recv().unwrap().unwrap().is_ok(),
+            "A below the hole must still ack"
+        );
+        assert_eq!(state.commit, 100, "commit advances up to the hole only");
     }
 
     #[test]

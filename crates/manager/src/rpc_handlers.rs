@@ -630,10 +630,18 @@ impl AutumnManager {
         // get picked. Two separate borrows are fine — node_states is an
         // independent RefCell.
         let online_node_ids = self.node_states.borrow().online_node_ids();
+        let space_low_node_ids = self.space_low_node_ids();
         let (stream_id, extent_id, selected) = {
             let mut s = self.store.inner.borrow_mut();
             let selected =
-                match Self::select_nodes(&s.nodes, &s.disks, &online_node_ids, total_replicas, &[])
+                match Self::select_nodes(
+                    &s.nodes,
+                    &s.disks,
+                    &online_node_ids,
+                    &space_low_node_ids,
+                    total_replicas,
+                    &[],
+                )
                 {
                     Ok(v) => v,
                     Err(err) => {
@@ -1164,6 +1172,7 @@ impl AutumnManager {
         // F214-B: capture the verified-online node set before borrowing
         // the store. See `handle_create_stream` for the same pattern.
         let online_node_ids = self.node_states.borrow().online_node_ids();
+        let space_low_node_ids = self.space_low_node_ids();
         let (mut tail, selected, extent_id, data, nodes_map) = {
             let mut s = self.store.inner.borrow_mut();
             if let Err(err) = Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s) {
@@ -1260,6 +1269,7 @@ impl AutumnManager {
                 &s.nodes,
                 &s.disks,
                 &online_node_ids,
+                &space_low_node_ids,
                 data,
                 &req.exclude_node_ids,
             ) {
@@ -2417,6 +2427,7 @@ impl AutumnManager {
         // F214-B: capture verified-online node set BEFORE borrowing the
         // store. Passed into the Phase-1 select_nodes call.
         let online_node_ids = self.node_states.borrow().online_node_ids();
+        let space_low_node_ids = self.space_low_node_ids();
 
         // Phase 1: compute under borrow_mut, NO awaits inside.
         // Returns alloc-IDs reserved + selected nodes for Phase 1.5.
@@ -2538,7 +2549,14 @@ impl AutumnManager {
                     3
                 };
                 let selected =
-                    Self::select_nodes(&s.nodes, &s.disks, &online_node_ids, target_replicas, &[])?;
+                    Self::select_nodes(
+                    &s.nodes,
+                    &s.disks,
+                    &online_node_ids,
+                    &space_low_node_ids,
+                    target_replicas,
+                    &[],
+                )?;
                 let new_tail = MgrExtentInfo {
                     extent_id: new_tail_id,
                     replicates: selected.iter().map(|n| n.node_id).collect(),
