@@ -460,3 +460,43 @@ gaps in the lease protocol's correctness story.
   stream 77 单测绿；seed=13 隔离 chaos ok 零丢失；workspace 0 error。
   文档：fuse CLAUDE.md "Crash-consistency contract" 全节。
 - **passes:** completed (2026-06-12)
+
+---
+
+### ETCD-1 · 生产急修批次 5：etcd 故障 chaos——leaderless 黑洞 + 全队自杀 + 审计日志泄漏（2026-06-12）
+- **目标:** etcd 是控制面唯一外部依赖，此前零 chaos 覆盖（历史 harness
+  杀过 manager/PS/EN，从未杀过 etcd）。生产 etcd 维护（升级/compaction/
+  快照）分钟级常态。新 harness `scripts/etcd_chaos.sh`：D1 杀 etcd 数据
+  面须继续；D2 停 150s（越过 PS 退出预算）全队必须存活；D3 重启 etcd
+  控制面恢复；终局零丢失校验。
+- **pre-fix 复现（reproduce-first）:** D1 FAIL——新客户端进程在断电期
+  无法解析路由（get_regions 严格 leader 门控，而失去 lease 的 ex-leader
+  内存路由其实是全网最新）；D2 FAIL——PS 1→0 全队自杀（NOT_LEADER 与
+  transport 失败共享 90s 预算）；下游连锁出 31 个假"丢失"。
+- **修复 ①（stale-while-leaderless）:** `displaced` 标志（初始 true；当
+  选清零；选举 CAS / F149 fence 诊断观察到**不同** instance 持锁时置
+  位——key 消失=lease 过期非替位）。`ensure_routable()` = leader ||
+  !displaced，只放行两个只读 RPC（get_regions/heartbeat_ps）；全部
+  mutating handler 维持严格 ensure_leader。H3 rejoined-follower 黑洞
+  保持关闭（displaced=true）。
+- **修复 ②（PS 退出预算分离）:** `MAX_CONSECUTIVE_NOT_LEADER=450`
+  （15min）独立于 90s transport 预算——NOT_LEADER 证明 manager 可达
+  （非网络分区），leaderless 控制面无法驱逐任何人；数据安全从不依赖
+  该退出（owner_epoch/region_epoch fencing），它只约束多 manager
+  follower-pinned 的陈旧读窗口。
+- **修复 ③（审计日志泄漏）:** `audit_retention_gc` 自 F211-I 起零调用
+  方——`mgr_audit_log/` 在 etcd 无限增长。新 `audit_gc_loop`（日频、
+  leader-only）+ `--audit-retention-days`（默认 90，0=关；顺手把该
+  helper 的 env 读取改为 CLI flag——F195 规则）。
+- **coco（GPT-5.5）1P1+1P3，采纳 1 拒 1:** P1——非对称分区（仅本
+  manager 失联 etcd，B 接任）下 keepalive 失败不置 displaced，A 无限
+  期供陈旧路由并把 PS 钉离真 leader → stale-while-leaderless 加
+  `ROUTABLE_STALE_TTL`（15min，自 leaderless_since 起；displaced 在本
+  机 etcd 链路恢复时由选举 CAS 检出）；窗口内的钉扎自愈（PS 撞 TTL →
+  NOT_LEADER → 轮转 → NOT_FOUND 重注册）。拒 P3 = CLI 缺值 panic
+  （手写解析器统一习惯，第三次一致拒绝）。
+- **验收:** post-fix etcd_chaos 全 PASS ×2（TTL 折入后复跑：断电全程
+  数据面满速、D2 150s 全队存活、D3 秒级恢复、650 ACK 零丢失）；
+  manager-HA chaos (H1-H3) 回归 PASS 6369 ACK（H3 门控未回退）；
+  manager 150 单测绿。
+- **passes:** completed (2026-06-12)

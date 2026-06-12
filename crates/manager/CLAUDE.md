@@ -1757,6 +1757,48 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     Companion PS-side change: heartbeat-loss exit threshold 10 s → 90 s
     (partition-server CLAUDE.md note 18).
 
+    **etcd-chaos addendum (2026-06-12) — STALE-WHILE-LEADERLESS serving +
+    audit GC wiring.** Three production fixes from the first-ever etcd
+    kill/outage/restart chaos (`scripts/etcd_chaos.sh`, D1/D2/D3):
+    - `displaced: Rc<Cell<bool>>` (default TRUE; cleared on winning the
+      election; set when the election CAS or an F149 fence diagnosis
+      observes a DIFFERENT instance holding the leader key — a missing
+      key is lease-expiry, NOT displacement). `ensure_routable()` =
+      `leader || !displaced` gates the two READ-ONLY routing/liveness
+      RPCs (`get_regions`, `heartbeat_ps`); every mutating handler stays
+      on the strict `ensure_leader`. Rationale: during an etcd outage
+      the ex-leader's in-memory routing is the freshest in existence and
+      NOTHING can supersede it (no election, no mutation) — pre-fix the
+      strict gate black-holed every fresh client for the whole outage
+      (D1) while cached-routing clients sailed through. The F267 H3
+      blackhole stays closed: a rejoined follower is `displaced`.
+      BOUNDED (coco P1): the mode lives at most `ROUTABLE_STALE_TTL`
+      (15 min) from `leaderless_since` — in an ASYMMETRIC partition
+      (only this manager lost etcd; a peer takes over) displacement is
+      only detected once OUR etcd link recovers (the election CAS sees
+      the new holder), so without the TTL this manager would pin the PS
+      fleet to itself indefinitely while the real leader evicts them.
+      Within the window that pinning is self-healing: PSes hit the TTL,
+      get NOT_LEADER, rotate to the real leader, re-register via the
+      heartbeat NOT_FOUND path.
+    - PS-side: `MAX_CONSECUTIVE_NOT_LEADER = 450` (15 min) is a SEPARATE
+      heartbeat exit budget from the 90 s transport budget — NOT_LEADER
+      proves the manager is REACHABLE (not a network partition), and a
+      leaderless control plane cannot evict anyone; sharing the 90 s
+      budget made a routine >90 s etcd maintenance window suicide the
+      whole PS fleet (reproduced pre-fix: D2 PS 1→0, then total outage +
+      false "loss"). With `ensure_routable` heartbeats answer OK through
+      the outage anyway; the 15 min budget covers the multi-manager
+      follower-pinned case (bounds stale READS only — data safety is
+      owner_epoch/region_epoch fencing, never this exit).
+    - `audit_gc_loop` (daily, leader-only): `audit_retention_gc` existed
+      since F211-I but had NO caller — `mgr_audit_log/` grew in etcd
+      unboundedly. `--audit-retention-days` (default 90, 0=off; the
+      helper's env read converted to CLI per the F195 rule).
+    Validated: etcd_chaos D1 writes progressing 14 s into the outage,
+    D2 fleet intact through 150 s, D3 instant recovery, 649 ACKed keys
+    zero loss; manager-HA chaos (H1-H3) regression PASS.
+
     **F267 addendum — `handle_get_regions` / `handle_heartbeat_ps` are
     leader-gated (CODE_NOT_LEADER).** Reverses the F265 "ungated
     get_regions" stance: a rejoined FOLLOWER serves replay-stale regions

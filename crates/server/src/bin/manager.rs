@@ -48,6 +48,8 @@ struct Args {
     /// disk has less free are soft-avoided by extent allocation.
     /// `None` = library default (256 MiB); 0 = disabled.
     min_alloc_free_bytes: Option<u64>,
+    /// F211-I audit-log retention (days). `None` = default 90; 0 = off.
+    audit_retention_days: Option<u64>,
 }
 
 fn parse_args() -> Args {
@@ -61,6 +63,7 @@ fn parse_args() -> Args {
     let mut metrics_port: Option<u16> = None;
     let mut metrics_listen: Option<String> = None;
     let mut min_alloc_free_bytes: Option<u64> = None;
+    let mut audit_retention_days: Option<u64> = None;
 
     let raw: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -129,6 +132,11 @@ fn parse_args() -> Args {
                 min_alloc_free_bytes =
                     Some(raw[i].parse().expect("--min-alloc-free-bytes must be a number"));
             }
+            "--audit-retention-days" => {
+                i += 1;
+                audit_retention_days =
+                    Some(raw[i].parse().expect("--audit-retention-days must be a number"));
+            }
             other => eprintln!("unknown arg: {other}"),
         }
         i += 1;
@@ -145,6 +153,7 @@ fn parse_args() -> Args {
         metrics_port,
         metrics_listen,
         min_alloc_free_bytes,
+        audit_retention_days,
     }
 }
 
@@ -195,6 +204,10 @@ async fn main() -> Result<()> {
     if let Some(v) = args.min_alloc_free_bytes {
         manager.set_min_alloc_free_bytes(v);
         tracing::info!(min_alloc_free_bytes = v, "ENOSPC-1 allocation floor configured");
+    }
+    if let Some(v) = args.audit_retention_days {
+        manager.set_audit_retention_days(v);
+        tracing::info!(audit_retention_days = v, "audit retention configured");
     }
 
     if args.policy_fast_mode {

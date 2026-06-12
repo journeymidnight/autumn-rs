@@ -120,12 +120,15 @@ impl AutumnManager {
     /// Retention GC. Reads the prefix, finds entries older than the
     /// configured retention window, and deletes them in batches.
     /// Best-effort — partial progress is fine, next tick continues.
-    #[allow(dead_code)]
+    /// Driven by `audit_gc_loop` (daily, leader-only) — pre-wiring this
+    /// helper was DEAD CODE and the audit log grew in etcd forever.
     pub(crate) async fn audit_retention_gc(&self) {
-        let days = std::env::var("AUTUMN_MGR_AUDIT_RETENTION_DAYS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(90);
+        // F195 convention: config via CLI flag (--audit-retention-days),
+        // not env (the original env read predates the no-env rule).
+        let days = self.audit_retention_days.get();
+        if days == 0 {
+            return; // 0 = retention disabled
+        }
         let cutoff_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)

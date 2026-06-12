@@ -1,43 +1,36 @@
 Date: 2026-06-12
 TaskStatus: completed
-Task scope: /loop 生产视角急修 · 批次 4 = LEASE8-LITE（fuse truncate 崩溃
-  一致性 + 读路径脏缓冲 bug）。批次 1-3：P0-D（2334304）、OBS-1
-  （25d323d）、ENOSPC-1（4b10922）已闭。
+Task scope: /loop 生产视角急修 · 批次 5 = ETCD-1（etcd 故障 chaos：
+  leaderless 路由黑洞 + PS 全队自杀 + 审计日志 etcd 泄漏）。批次 1-4：
+  P0-D / OBS-1 / ENOSPC-1 / LEASE8-LITE 已闭（2334304 / 25d323d /
+  4b10922 / 75ff306）。
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
   Already implemented (this commit):
-    - fuse truncate-shrink 改 meta-first 提交序（关掉"durable size=旧值
-      但尾部已毁→文件内读零"的伪造数据窗口）。
-    - coco 2P1 折入：clean_beyond_eof 挂全部 grow 冷路径（残留 extent
-      复活旧数据）；提交后清理失败 WARN 不报错（防 same-size 重试
-      no-op）。
-    - 第二个真 bug（T2 钓出，partition-server 读路径）：0 长 clamp 的
-      子区间 GET 走 pooled 快路径返回回收脏缓冲 = 逐次变化的垃圾 →
-      read_len==0 显式短路。
-    - fuse_chaos.sh：T1（truncate+kill+remount 前缀级校验）+ T2
-      （shrink→grow 零值）+ coco 3 项 + 两个 harness 根修（fusermount3
-      缺失致历史 umount 全 no-op → unmount_all；裸目录写入竞态 →
-      fs-type 守卫 + T 阶段前停负载）。
-    - 文档：fuse CLAUDE.md "Crash-consistency contract" 全节。
+    - scripts/etcd_chaos.sh（D1 杀 etcd 数据面续航 / D2 150s 断电全队
+      存活 / D3 重启恢复 + 零丢失校验）——etcd 首次进入 chaos 面。
+    - 修复 ① stale-while-leaderless：displaced 标志 + ensure_routable
+      只放行 get_regions/heartbeat_ps 只读 RPC（mutating 维持严格
+      leader 门）；H3 follower 黑洞保持关闭。
+    - 修复 ② PS NOT_LEADER 退出预算与 transport 预算分离（450×2s=15min
+      vs 45×2s=90s）——pre-fix D2 复现全队自杀。
+    - 修复 ③ audit_retention_gc 零调用方 → audit_gc_loop（日频
+      leader-only）+ --audit-retention-days（env→CLI）。
+    - 文档：manager CLAUDE.md etcd-chaos addendum；feature_list ETCD-1。
   Not implemented (recorded):
-    - BUG-LEASE-8 完整 generation manifest（含 crash-mid-unlink 空间泄
-      漏 GC）——维持 ARCHITECTURAL deferred。
-    - rolling upgrade（rkyv same-commit 约束）= 长线 track，需用户定
-      线协议兼容策略。
-    - F227 recovery-stuck 家族（仍 OPEN）；note 24 fsync coalescer
-      （结构性不可达）。
+    - 同前（rolling upgrade / F227 / generation manifest——均需用户决策）。
+    - etcd 集群多副本部署（cluster.sh 单 etcd）——多 endpoint 客户端代码
+      在，部署面未接。
 
 Current summary:
-  coco 终轮 1P0+2P1+1P2+1P3 全采纳折入（P0=write buffer size 提前抬升
-  抹掉 pre-grow EOF → write() 入口 sweep）。LEASE8-LITE 已 commit+push
-  （75ff306）。生产急修战役四项全闭环：P0-D（2334304）→ OBS-1
-  （25d323d）→ ENOSPC-1（4b10922）→ LEASE8-LITE（75ff306），合计修复
-  6 个真实 acked-data/读损坏级 bug。
+  pre-fix 复现：D1 新客户端路由黑洞 + D2 PS 1→0 自杀 + 连锁假丢失。
+  coco P1 折入（ROUTABLE_STALE_TTL=15min 防非对称分区无限陈旧服务）。
+  post-fix etcd_chaos 全 PASS ×2（断电期数据面满速，650 ACK 零丢失，
+  D3 秒级恢复）；manager-HA (H1-H3) 回归 PASS 6369 ACK；manager 150
+  单测。已 commit+push。
 
 Main gaps:
   - 见 Not implemented。
 Next steps:
-  - 无（loop 结束）。剩余生产项均需用户决策：rolling upgrade 线协议
-    兼容策略 / F227 recovery-stuck（用户持有）/ BUG-LEASE-8 完整
-    generation manifest。
+  - loop 继续扫下一个生产缺口。

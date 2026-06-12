@@ -73,6 +73,12 @@ pub(crate) struct EtcdMirror {
     /// fence compare detects a deposition, so the in-process state agrees with
     /// the etcd ground truth before the next operation runs.
     leader: Rc<Cell<bool>>,
+    /// etcd-chaos D1: shared with `AutumnManager.displaced`. Set `true`
+    /// when the fence diagnosis observes a DIFFERENT instance holding the
+    /// leader key (true displacement — our state can go stale); left
+    /// untouched when the key is merely GONE (lease expiry / etcd blip —
+    /// no one superseded us).
+    displaced: Rc<Cell<bool>>,
 }
 
 impl EtcdMirror {
@@ -80,12 +86,14 @@ impl EtcdMirror {
         endpoints: Vec<String>,
         instance_id: Rc<String>,
         leader: Rc<Cell<bool>>,
+        displaced: Rc<Cell<bool>>,
     ) -> Result<Self> {
         let client = autumn_etcd::EtcdClient::connect_many(&endpoints).await?;
         Ok(Self {
             client: Rc::new(client),
             instance_id,
             leader,
+            displaced,
         })
     }
 
@@ -151,6 +159,12 @@ impl EtcdMirror {
             .unwrap_or(false);
 
         if !still_leader {
+            // etcd-chaos D1: a DIFFERENT holder = true displacement (our
+            // state can be superseded); a missing key = lease expiry with
+            // no successor — leaderless, not displaced.
+            if got.kvs.first().is_some() {
+                self.displaced.set(true);
+            }
             self.leader.set(false);
             return Err(AppError::NotLeader);
         }
@@ -210,6 +224,9 @@ impl EtcdMirror {
             .map(|kv| kv.value.as_slice() == self.instance_id.as_bytes())
             .unwrap_or(false);
         if !still_leader {
+            if got.kvs.first().is_some() {
+                self.displaced.set(true);
+            }
             self.leader.set(false);
             return Err(AppError::NotLeader);
         }
@@ -587,6 +604,35 @@ pub struct AutumnManager {
     /// disabled). Soft: select_nodes falls back to the full healthy set
     /// when too few spacious nodes remain.
     min_alloc_free_bytes: Rc<Cell<u64>>,
+    /// F211-I audit log retention (days; `--audit-retention-days`,
+    /// default 90, 0 = disabled). Enforced by `audit_gc_loop` — the GC
+    /// helper existed since F211-I but had NO caller, so `mgr_audit_log/`
+    /// grew in etcd unboundedly.
+    pub(crate) audit_retention_days: Rc<Cell<u64>>,
+    /// etcd-chaos D1: WHY are we not leader? `true` (the safe default —
+    /// every fresh/rejoined process starts displaced) = another instance
+    /// holds/held leadership or we never won it: our in-memory state may
+    /// be arbitrarily stale → routing reads answer NOT_LEADER (the F267
+    /// H3 fix). `false` while `!leader` = we WERE the leader and lost the
+    /// lease without anyone replacing us (etcd outage / lease blip): our
+    /// in-memory routing is the freshest that exists and NO new leader
+    /// can be elected or mutate anything while etcd is down — serving
+    /// get_regions + heartbeats STALE-WHILE-LEADERLESS keeps the data
+    /// plane fully alive through etcd maintenance (pre-fix, a >90 s etcd
+    /// outage black-holed fresh clients AND suicided the PS fleet).
+    /// Shared with `EtcdMirror` so the F149 fence-diagnosis paths can
+    /// flip it when they observe a DIFFERENT leader id.
+    displaced: Rc<Cell<bool>>,
+    /// etcd-chaos D1 (coco P1): when the stale-while-leaderless window
+    /// opened (keepalive lost without observed displacement). Bounds the
+    /// mode with `ROUTABLE_STALE_TTL`: in an ASYMMETRIC partition (only
+    /// this manager lost etcd; another instance takes over) displacement
+    /// is only detected once OUR etcd link recovers (election CAS sees
+    /// the new holder) — without a TTL this manager would serve stale
+    /// routing/heartbeats indefinitely and pin the PS fleet away from
+    /// the real leader. 15 min covers routine etcd maintenance; past it
+    /// the gate fails closed (pre-fix behavior).
+    leaderless_since: Rc<Cell<Option<Instant>>>,
     conn_pool: Rc<ConnPool>,
     /// F191: dedicated pool for control-plane RPCs to extent nodes
     /// (`EXT_MSG_DF`, future `MSG_REPORT_DISK_FAILURE`, future heartbeat).
@@ -706,6 +752,9 @@ impl AutumnManager {
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),
             node_max_free: Rc::new(RefCell::new(HashMap::new())),
             min_alloc_free_bytes: Rc::new(Cell::new(DEFAULT_MIN_ALLOC_FREE_BYTES)),
+            audit_retention_days: Rc::new(Cell::new(90)),
+            displaced: Rc::new(Cell::new(true)),
+            leaderless_since: Rc::new(Cell::new(None)),
             conn_pool: Rc::new(ConnPool::new()),
             control_pool: Rc::new(ConnPool::new()),
             last_op_at: Rc::new(RefCell::new(HashMap::new())),
@@ -799,8 +848,15 @@ impl AutumnManager {
     pub async fn new_with_etcd(endpoints: Vec<String>) -> Result<Self> {
         let mut s = Self::new();
         s.leader.set(false);
-        s.etcd =
-            Some(EtcdMirror::connect(endpoints, s.instance_id.clone(), s.leader.clone()).await?);
+        s.etcd = Some(
+            EtcdMirror::connect(
+                endpoints,
+                s.instance_id.clone(),
+                s.leader.clone(),
+                s.displaced.clone(),
+            )
+            .await?,
+        );
         s.replay_from_etcd().await?;
         let _ = s.try_become_leader().await;
         s.start_runtime_tasks();
@@ -817,6 +873,34 @@ impl AutumnManager {
         } else {
             Err(AppError::NotLeader)
         }
+    }
+
+    /// etcd-chaos D1: gate for READ-ONLY routing/liveness RPCs
+    /// (`get_regions`, `heartbeat_ps`). Serves when leader OR when
+    /// leaderless WITHOUT displacement (we were the last leader and no
+    /// one can have superseded our state — etcd outage). Mutating
+    /// handlers stay on the strict `ensure_leader` (they need etcd
+    /// anyway). The F267/H3 rejoined-follower blackhole stays closed:
+    /// a process that never won (or observed another holder) has
+    /// `displaced == true`.
+    pub(crate) fn ensure_routable(&self) -> Result<(), AppError> {
+        if self.leader.get() {
+            return Ok(());
+        }
+        // Bounded stale-while-leaderless (coco P1): only while we have
+        // never observed a successor AND the window is fresh. In an
+        // asymmetric partition displacement is detected when OUR etcd
+        // link recovers (election CAS sees the new holder); the TTL caps
+        // the harm until then.
+        const ROUTABLE_STALE_TTL: Duration = Duration::from_secs(900);
+        if !self.displaced.get() {
+            if let Some(t0) = self.leaderless_since.get() {
+                if t0.elapsed() < ROUTABLE_STALE_TTL {
+                    return Ok(());
+                }
+            }
+        }
+        Err(AppError::NotLeader)
     }
 
     /// Start background loops. Called from `new_with_etcd` and `serve`.
@@ -902,6 +986,13 @@ impl AutumnManager {
         // drained the EN's recovery_done and discarded the completions.
         let mgr = self.clone();
         Self::spawn_supervised("node_health", move || mgr.clone().node_health_loop());
+
+        // F211-I completion: audit retention GC was a dead helper —
+        // mgr_audit_log/ grew unboundedly. Daily leader-only sweep.
+        if self.etcd.is_some() {
+            let mgr = self.clone();
+            Self::spawn_supervised("audit_retention_gc", move || mgr.clone().audit_gc_loop());
+        }
 
         let mgr = self.clone();
         Self::spawn_supervised("ec_conversion_dispatch", move || {
@@ -1341,6 +1432,23 @@ impl AutumnManager {
             c.txn(txn).await?
         };
         if !resp.succeeded {
+            // etcd-chaos D1: the CAS failing proves etcd is ALIVE and the
+            // key exists — read the holder. A DIFFERENT instance holding
+            // leadership means our state can go stale under us: mark
+            // displaced (gates the stale-while-leaderless serving). Our
+            // OWN id (stale key from a spurious step-down, lease still
+            // live) is not displacement.
+            let holder = {
+                let c = etcd.client.clone();
+                c.get(LEADER_KEY.as_bytes()).await
+            };
+            if let Ok(got) = holder {
+                if let Some(kv) = got.kvs.first() {
+                    if kv.value.as_slice() != self.instance_id.as_bytes() {
+                        self.displaced.set(true);
+                    }
+                }
+            }
             return Ok(false);
         }
 
@@ -1367,6 +1475,8 @@ impl AutumnManager {
         // — it needs a stop-signal to revoke the lease on replay error.
         self.replay_from_etcd().await?;
         self.set_leader(true);
+        self.displaced.set(false);
+        self.leaderless_since.set(None);
 
         // F214-A: ensure the cluster identity is imprinted in etcd. The
         // CAS uses create_revision==0, so only the first leader ever to
@@ -1463,6 +1573,7 @@ impl AutumnManager {
             let c = match self.etcd.as_ref() {
                 Some(v) => v.client.clone(),
                 None => {
+                    self.leaderless_since.set(Some(Instant::now()));
                     self.set_leader(false);
                     return;
                 }
@@ -1470,6 +1581,7 @@ impl AutumnManager {
             match c.lease_keep_alive(lease_id).await {
                 Ok(k) => k,
                 Err(_) => {
+                    self.leaderless_since.set(Some(Instant::now()));
                     self.set_leader(false);
                     return;
                 }
@@ -1483,6 +1595,10 @@ impl AutumnManager {
                 _ => break,
             }
         }
+        // etcd-chaos D1 (coco P1): open the BOUNDED stale-while-leaderless
+        // window before stepping down — `ensure_routable` serves from it
+        // for at most ROUTABLE_STALE_TTL.
+        self.leaderless_since.set(Some(Instant::now()));
         self.set_leader(false);
     }
 
@@ -2044,6 +2160,25 @@ impl AutumnManager {
     /// `--min-alloc-free-bytes`; 0 disables the filter).
     pub fn set_min_alloc_free_bytes(&self, v: u64) {
         self.min_alloc_free_bytes.set(v);
+    }
+
+    /// Audit-log retention window (CLI `--audit-retention-days`; 0 = off).
+    pub fn set_audit_retention_days(&self, v: u64) {
+        self.audit_retention_days.set(v);
+    }
+
+    /// Daily audit-log retention GC (leader-only; etcd mode only). The
+    /// first pass runs ~10 min after start so leader election + replay
+    /// settle; the daily cadence is far above the helper's cost (one
+    /// prefix read + batched deletes).
+    async fn audit_gc_loop(self) {
+        compio::time::sleep(Duration::from_secs(600)).await;
+        loop {
+            if self.leader.get() {
+                self.audit_retention_gc().await;
+            }
+            compio::time::sleep(Duration::from_secs(86_400)).await;
+        }
     }
 
     /// ENOSPC-1: nodes whose latest df probe showed max per-disk free

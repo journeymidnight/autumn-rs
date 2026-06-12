@@ -2696,7 +2696,20 @@ impl PartitionServer {
         // outlasts the worst observed manager restart while still bounding
         // the partitioned-from-manager-only stale-serving window.
         const MAX_CONSECUTIVE_FAILURES: u32 = 45; // 45 × 2s = 90s
+        // etcd-chaos D2: NOT_LEADER gets its OWN, much longer budget.
+        // A reachable manager answering NOT_LEADER means the control
+        // plane is alive but LEADERLESS (single manager during an etcd
+        // outage) or this PS is follower-pinned (multi-manager). A
+        // leaderless control plane cannot evict/reassign anyone, so
+        // serving on is safe; sharing the 90 s transport budget made a
+        // routine >90 s etcd maintenance window suicide the WHOLE PS
+        // fleet (reproduced by scripts/etcd_chaos.sh D2). 15 min still
+        // bounds the multi-manager follower-pinned stale-READ window —
+        // data safety never depended on this exit (owner_epoch fences
+        // writes at the ENs, region_epoch fences client routing).
+        const MAX_CONSECUTIVE_NOT_LEADER: u32 = 450; // 450 × 2s = 15min
         let mut consecutive_failures: u32 = 0;
+        let mut consecutive_not_leader: u32 = 0;
         let mut ticker = compio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
         ticker.tick().await; // first tick is immediate
         loop {
@@ -2732,18 +2745,23 @@ impl PartitionServer {
                     // 90 s budget harmlessly.
                     if code == manager_rpc::CODE_NOT_LEADER {
                         self.rotate_manager();
-                        consecutive_failures += 1;
-                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        // A response (even NOT_LEADER) proves we are NOT
+                        // network-partitioned — the transport budget resets;
+                        // only the leaderless budget advances.
+                        consecutive_failures = 0;
+                        consecutive_not_leader += 1;
+                        if consecutive_not_leader >= MAX_CONSECUTIVE_NOT_LEADER {
                             tracing::error!(
                                 "PS {} saw only non-leader managers for {}s, exiting to prevent stale serving",
                                 self.ps_id,
-                                consecutive_failures as u64 * HEARTBEAT_INTERVAL_SECS,
+                                consecutive_not_leader as u64 * HEARTBEAT_INTERVAL_SECS,
                             );
                             std::process::exit(1);
                         }
                         continue;
                     }
                     consecutive_failures = 0;
+                    consecutive_not_leader = 0;
                     // Manager surfaces CODE_NOT_FOUND when ps_id is not in
                     // ps_nodes (e.g. evicted after a transient hiccup). Re-
                     // register and re-sync so the PS rejoins the cluster

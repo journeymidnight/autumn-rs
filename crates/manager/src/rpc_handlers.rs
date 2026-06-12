@@ -3691,7 +3691,13 @@ impl AutumnManager {
         // black-holed every client that connected to a freshly-rejoined
         // follower first (manager-HA chaos H3). NOT_LEADER makes callers
         // rotate (client `refresh_regions`, PS `sync_regions_once`).
-        if let Err(err) = self.ensure_leader() {
+        // etcd-chaos D1 refinement: `ensure_routable` (not the strict
+        // leader gate) — an UN-DISPLACED ex-leader during an etcd outage
+        // holds the freshest routing in existence and nothing can
+        // supersede it while etcd is down; gating it black-holed every
+        // fresh client for the whole outage. The H3 case stays gated
+        // (a rejoined follower is `displaced`).
+        if let Err(err) = self.ensure_routable() {
             return Ok(rkyv_encode(&GetRegionsResp {
                 code: Self::err_to_code(&err),
                 message: err.to_string(),
@@ -3739,8 +3745,12 @@ impl AutumnManager {
         // F267: a follower answering OK pins the PS's shared manager
         // rotation to itself forever (the PS only rotates on failure) —
         // while its region/part_addr serving is gated. NOT_LEADER tells
-        // the PS heartbeat loop to rotate WITHOUT counting a failure.
-        if let Err(err) = self.ensure_leader() {
+        // the PS heartbeat loop to rotate (and burn the leaderless exit
+        // budget). etcd-chaos D1: `ensure_routable` — an un-displaced
+        // ex-leader answers OK through an etcd outage so the PS fleet
+        // never approaches its exit budget while reassignment is
+        // impossible anyway.
+        if let Err(err) = self.ensure_routable() {
             return Ok(rkyv_encode(&CodeResp {
                 code: Self::err_to_code(&err),
                 message: err.to_string(),
