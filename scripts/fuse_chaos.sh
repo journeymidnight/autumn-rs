@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# fuse_chaos.sh — data-plane INTERFACE chaos: autumn-fuse under failover (F273).
+#
+# Boots a 2-PS cluster.sh cluster (tcp), mounts autumn-fuse, runs a file
+# workload through the MOUNT (the full fuse -> SDK -> PS -> EN path incl.
+# the inode-lease subsystem), and injects faults:
+#   F1: kill -9 the partition-holding PS → migration; file I/O through the
+#       mount must resume; every previously-synced file stays byte-exact
+#   F2: kill -9 the manager + exact-cmdline respawn → file I/O resumes
+#   F3: kill -9 the fuse daemon itself + remount → all synced files persist
+# Final: full manifest verification (sha256 of every synced file).
+#
+# Usage: AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/fuse_chaos.sh
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+MGR="127.0.0.1:9001"
+MNT="/mnt/autumn-fuse-chaos"
+WORK="$(mktemp -d /tmp/fuse_chaos.XXXXXX)"
+PSBIN="$ROOT/target/release/autumn-ps"
+AO="$ROOT/target/release/autumn-op"
+FAIL=0
+
+say()  { echo "[fuse $(date +%H:%M:%S)] $*"; }
+fail() { echo "[fuse $(date +%H:%M:%S)] FAIL: $*"; FAIL=1; }
+
+export AUTUMN_DATA_ROOT="${AUTUMN_DATA_ROOT:-/data05/autumn-rs}"
+say "cleaning + starting cluster"
+fusermount3 -u "$MNT" 2>/dev/null
+for pid in $(ps -eo pid,comm | awk '$2 ~ /^(autumn-|etcd)/ {print $1}'); do kill -9 "$pid" 2>/dev/null; done
+sleep 2
+say "draining cluster ports"
+for i in $(seq 1 35); do
+    busy=$(ss -tan 2>/dev/null | grep -cE ':(9001|9301|9351|2000[0-9]) ') || true
+    [ "${busy:-0}" = "0" ] && break
+    sleep 2
+done
+rm -rf "$AUTUMN_DATA_ROOT" /tmp/autumn-rs
+env AUTUMN_EXTENT_BASE_PORT=20000 \
+    AUTUMN_BOOTSTRAP_PRESPLIT="4:hexstring" \
+    AUTUMN_TRANSPORT=tcp \
+    bash "$ROOT/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
+grep -q "bootstrap succeeded" "$WORK/cluster.log" || { echo "cluster start failed"; tail -10 "$WORK/cluster.log"; exit 1; }
+setsid nohup "$PSBIN" --psid 2 --port 9351 --manager "$MGR" \
+    --listen 127.0.0.1 --advertise 127.0.0.1:9351 --transport tcp \
+    > "$WORK/ps2.log" 2>&1 < /dev/null &
+sleep 5
+
+AOC=(timeout 20 "$AO" --manager "$MGR" --transport tcp)
+
+mount_fuse() {
+    mkdir -p "$MNT"
+    setsid nohup "$ROOT/target/release/autumn-fuse" \
+        --manager "$MGR" --mountpoint "$MNT" --transport tcp \
+        > "$WORK/fuse_$1.log" 2>&1 < /dev/null &
+    for i in $(seq 1 30); do
+        mountpoint -q "$MNT" && return 0
+        sleep 1
+    done
+    fail "fuse mount did not come up ($1)"
+    return 1
+}
+say "mounting autumn-fuse at $MNT"
+mount_fuse boot || exit 1
+
+# ── workload: numbered files with sha256 manifest ──────────────────────────
+# writer: continuously writes files (4 KiB..256 KiB random), fsyncs (via
+# close), records sha256 in the manifest ONLY after a successful close.
+: > "$WORK/manifest.txt"
+( i=0
+  while [ ! -f "$WORK/stop" ]; do
+      sz=$(( (RANDOM % 63 + 1) * 4096 ))
+      f="$MNT/chaos-$i.bin"
+      if head -c "$sz" /dev/urandom > "$WORK/tmpf" 2>/dev/null \
+         && cp "$WORK/tmpf" "$f" 2>/dev/null \
+         && cmp -s "$WORK/tmpf" "$f" 2>/dev/null; then
+          echo "$(sha256sum < "$WORK/tmpf" | cut -d' ' -f1) chaos-$i.bin" >> "$WORK/manifest.txt"
+      fi
+      i=$((i+1)); sleep 0.2
+  done ) &
+LOOP_PID=$!
+sleep 5
+
+verify_manifest() {
+    local tag="$1" bad=0 total=0
+    while read -r want name; do
+        total=$((total+1))
+        got=$(timeout 30 sha256sum "$MNT/$name" 2>/dev/null | cut -d' ' -f1)
+        if [ "$got" != "$want" ]; then
+            sleep 5
+            got=$(timeout 30 sha256sum "$MNT/$name" 2>/dev/null | cut -d' ' -f1)
+            if [ "$got" != "$want" ]; then
+                fail "[$tag] $name sha mismatch/missing (after retry)"; bad=$((bad+1))
+                [ $bad -ge 5 ] && { fail "(more suppressed)"; break; }
+            fi
+        fi
+    done < "$WORK/manifest.txt"
+    [ $bad -eq 0 ] && say "[$tag] manifest verify OK ($total files)"
+}
+file_liveness() {
+    local tag="$1" ok=0 try
+    for try in $(seq 1 45); do
+        if echo "live-$tag" > "$MNT/live-$tag.txt" 2>/dev/null \
+           && [ "$(cat "$MNT/live-$tag.txt" 2>/dev/null)" = "live-$tag" ]; then ok=1; break; fi
+        sleep 2
+    done
+    [ $ok -eq 1 ] && say "[$tag] file liveness OK" || fail "[$tag] file I/O wedged"
+}
+verify_manifest "baseline"
+
+# ── F1: kill the partition-holding PS → migration under live file I/O ──────
+p1=$("${AOC[@]}" info 2>/dev/null | grep -c "ps=127.0.0.1:9301") || p1=0
+if [ "${p1:-0}" -ge 1 ]; then VID=1; VPORT=9301; else VID=2; VPORT=9351; fi
+VPID=$(pgrep -f -- "--psid $VID .*--transport tcp" | head -1)
+say "F1: kill -9 holder PS$VID pid=${VPID:-?}"
+[ -n "$VPID" ] && kill -9 "$VPID"
+deadline=$((SECONDS + 90))
+while [ $SECONDS -lt $deadline ]; do
+    left=$("${AOC[@]}" info 2>/dev/null | grep -c "ps=127.0.0.1:$VPORT") || true
+    [ "${left:-1}" = "0" ] && break
+    sleep 2
+done
+say "F1: migration converged"
+file_liveness "f1"
+verify_manifest "after-PS-kill"
+say "F1: respawn PS$VID"
+setsid nohup "$PSBIN" --psid "$VID" --port "$VPORT" --manager "$MGR" \
+    --listen 127.0.0.1 --advertise "127.0.0.1:$VPORT" --transport tcp \
+    > "$WORK/ps${VID}_respawn.log" 2>&1 < /dev/null &
+sleep 6
+
+# ── F2: manager kill + respawn under live file I/O ─────────────────────────
+MPID=$(pgrep -f autumn-manager-server | head -1)
+MCMD=$(tr '\0' ' ' < "/proc/$MPID/cmdline")
+say "F2: kill -9 manager pid=$MPID"
+kill -9 "$MPID"
+sleep 6
+setsid nohup $MCMD > "$WORK/mgr_respawn.log" 2>&1 < /dev/null &
+deadline=$((SECONDS + 150))
+while [ $SECONDS -lt $deadline ]; do
+    [ -n "$("${AOC[@]}" info 2>/dev/null)" ] && { say "F2: manager ready"; break; }
+    sleep 2
+done
+file_liveness "f2"
+verify_manifest "after-mgr-kill"
+
+# ── F3: kill the fuse daemon + remount → durability across the interface ───
+FPID=$(pgrep -f "autumn-fuse --manager" | head -1)
+say "F3: kill -9 fuse daemon pid=$FPID + remount"
+[ -n "$FPID" ] && kill -9 "$FPID"
+sleep 2
+fusermount3 -u "$MNT" 2>/dev/null
+mount_fuse remount
+file_liveness "f3"
+verify_manifest "after-fuse-remount"
+
+# ── stop + final verification ───────────────────────────────────────────────
+touch "$WORK/stop"
+wait "$LOOP_PID" 2>/dev/null
+total=$(wc -l < "$WORK/manifest.txt")
+say "workload done: $total synced files; final verify"
+verify_manifest "final"
+
+fusermount3 -u "$MNT" 2>/dev/null
+for pid in $(ps -eo pid,comm | awk '$2 ~ /^(autumn-|etcd)/ {print $1}'); do kill -9 "$pid" 2>/dev/null; done
+if [ $FAIL -eq 0 ]; then say "PASS ($total files, work dir $WORK kept)"; else say "FAILED — logs in $WORK"; fi
+exit $FAIL

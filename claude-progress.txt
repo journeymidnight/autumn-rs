@@ -1,6 +1,6 @@
 Date: 2026-06-12
 TaskStatus: completed
-Task scope: F272 跨主机 chaos completed — /loop chaos 迭代 5：multi-manager HA chaos
+Task scope: F272+F273 completed — /loop chaos 迭代 5：multi-manager HA chaos
   （manager_ha_chaos.sh H1 leader kill / H2 仅新 leader 时 PS kill /
   H3 老 leader 回归 follower），发现并修复 4 个真实 bug。
 
@@ -67,5 +67,8 @@ F272 (迭代 12-13): crosshost_chaos.sh 落地并双轨认证。ucx 首轮异常
   验尸定性=harness 固定 sleep vs manager ucx ~90s TIME_WAIT bind 重
   试（无产品 bug）；加 wait_mgr/wait_nodes 就绪门后 ucx 全 PASS
   （320 ACK 0 丢失）+ tcp 复跑全 PASS（768 ACK 0 丢失）。
+F273 (迭代 14): fuse_chaos.sh——fuse 挂载在 PS-kill/manager-kill/
+  fuse-kill 三类故障下，83 文件 sha256 全完好，首跑全 PASS。
 Next steps:
-  - 无（跨主机双轨闭环）。
+  - 无。chaos 覆盖矩阵四层全绿（in-process 20-seed / 本机脚本 E1-E7+
+    soak+HA / 跨主机 tcp+ucx / fuse 接口层）。

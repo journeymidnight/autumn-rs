@@ -183,6 +183,8 @@ AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/transport_chaos.sh ucx   # needs --
 #  listener now retries bind through that window instead of exiting.)
 # E6: CHAOS_ROUNDS=N CHAOS_SEED=S randomized repeated kill rounds (F266).
 # E7: split + mid-flight PS kill; merge + mid-freeze manager kill (F268).
+# Fuse-interface chaos (F273): file workload through the mount under
+#   PS-kill / manager-kill / fuse-kill+remount:  ./scripts/fuse_chaos.sh
 # Cross-host chaos (F272, real network ::14+::15, remote via ssh):
 #   ./scripts/crosshost_chaos.sh tcp | ucx
 # Multi-manager HA chaos (F267): leader kill -> standby takeover, PS kill under

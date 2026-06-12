@@ -258,3 +258,15 @@ gaps in the lease protocol's correctness story.
   运维注记：EN/PS 启动期对未监听 manager fail-fast 属设计内
   （supervisor 重启吸收），编排側必须设 readiness 门。
 - **passes:** completed (2026-06-12)
+
+---
+
+### F273 · chaos 迭代 14：数据面接口 chaos——autumn-fuse 在 failover 下（2026-06-12）
+- **目标:** 三接口（fuse/kvcache/client）此前无 failover chaos 覆盖。
+  新 harness `scripts/fuse_chaos.sh`：2-PS 集群 + fuse 挂载，文件负载
+  流经 fuse→SDK→PS→EN 全链（含 inode-lease），sha256 清单仅记录
+  成功 close 的文件；F1 杀持有 PS、F2 杀 manager+respawn、F3 杀
+  fuse 守护+重挂；每阶段清单全验。
+- **验收: 首跑全 PASS** —— F1 迁移后文件 I/O 12s 恢复、F2 11s、F3 重
+  挂即恢复；83 个 synced 文件三轮故障后 sha256 全部完好，零损坏。
+- **passes:** completed (2026-06-12)
