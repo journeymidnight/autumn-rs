@@ -165,21 +165,22 @@ pub async fn rename(
     let v = state.kv_get(&old_dk).await.map_err(|_| anyhow!("ENOENT"))?;
     let old_dirent: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
 
-    // Check if target exists — if so, unlink it (for files)
+    // Remember an overwritten file target — its removal runs AFTER the
+    // dirent overwrite below makes it unreachable.
     let new_dk = key::dirent_key(new_parent, new_name_bytes);
+    let mut replaced_file_ino: Option<u64> = None;
     if let Ok(tv) = state.kv_get(&new_dk).await {
         if let Ok(target_dirent) = schema::decode_dirent(&tv) {
+            // POSIX: when old and new resolve to the SAME file (same
+            // path, or two hard links of one inode), rename succeeds and
+            // performs NO other action (coco P1: treating the source's
+            // own inode as a "replaced target" decremented its nlink and
+            // — post-UNLINK-1 — destroyed its data).
+            if target_dirent.child_inode == old_dirent.child_inode {
+                return Ok(());
+            }
             if target_dirent.file_type != DT_DIR {
-                let target_ik = key::inode_key(target_dirent.child_inode);
-                if let Ok(mut target_meta) = get_inode(state, target_dirent.child_inode).await {
-                    target_meta.nlink = target_meta.nlink.saturating_sub(1);
-                    if target_meta.nlink == 0 {
-                        state.kv_delete(&target_ik).await?;
-                        state.inodes.remove(&target_dirent.child_inode);
-                    } else {
-                        put_inode(state, target_dirent.child_inode, &target_meta).await?;
-                    }
-                }
+                replaced_file_ino = Some(target_dirent.child_inode);
             }
         }
     }
@@ -188,6 +189,24 @@ pub async fn rename(
 
     let dv = schema::encode_dirent(&old_dirent);
     state.kv_put(&new_dk, &dv).await?;
+
+    // UNLINK-1: rename-over-existing drops the target's last name. The
+    // pre-fix code deleted the target INODE but never its EXTENTS — the
+    // POSIX atomic-save pattern (`write tmp; mv tmp file`) leaked the
+    // ENTIRE previous file content on every save. Now the target goes
+    // through the same tombstoned removal as unlink, placed AFTER the
+    // dirent overwrite (the unreachability point — a tombstone for a
+    // still-reachable inode would let the sweep destroy a live file).
+    if let Some(t_ino) = replaced_file_ino {
+        if let Ok(mut target_meta) = get_inode(state, t_ino).await {
+            target_meta.nlink = target_meta.nlink.saturating_sub(1);
+            if target_meta.nlink == 0 {
+                crate::extent::remove_unreachable_inode(state, t_ino).await?;
+            } else {
+                put_inode(state, t_ino, &target_meta).await?;
+            }
+        }
+    }
 
     let (s, ns) = now_ts();
     if old_parent == new_parent {

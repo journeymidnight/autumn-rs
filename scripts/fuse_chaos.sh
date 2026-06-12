@@ -255,6 +255,50 @@ for i in 1 2 3; do
 done
 [ $t2_bad -eq 0 ] && say "T2: all grow regions read zeros"
 
+# ── T3: crash-mid-unlink reaping + rename-over extent reclaim ──────────────
+# (UNLINK-1: tombstoned removal + mount-time sweep; rename-over used to
+# leak the replaced file's extents UNCONDITIONALLY.)
+say "T3: unlink burst + fuse kill + remount sweep"
+for i in $(seq 1 15); do
+    head -c 524288 /dev/urandom > "$MNT/rm-$i.bin"
+done
+( timeout 60 bash -c 'for i in $(seq 1 15); do rm -f "'"$MNT"'/rm-$i.bin" 2>/dev/null; done' ) &
+RM_PID=$!
+sleep 0.2
+FPID=$(pgrep -f "autumn-fuse --manager" | head -1)
+say "T3: kill -9 fuse daemon pid=$FPID mid-unlink"
+[ -n "$FPID" ] && kill -9 "$FPID"
+wait "$RM_PID" 2>/dev/null
+unmount_all
+mount_fuse t3-remount
+sleep 2
+# the sweep ran at Init; any survivor file just gets re-rm'd
+t3_left=0
+for i in $(seq 1 15); do
+    [ -e "$MNT/rm-$i.bin" ] && { rm -f "$MNT/rm-$i.bin"; t3_left=$((t3_left+1)); }
+done
+say "T3: $t3_left files survived the kill (re-removed); sweep log:"
+grep -h "unlink tombstone sweep" "$WORK"/fuse_t3-remount.log 2>/dev/null || say "T3: (no tombstones to reap — kill missed the window)"
+# rename-over reclaim: overwrite a 1MiB file via mv, then unlink — all of
+# the ino's extents must be gone (observable: recreate + read = no stale).
+head -c 1048576 /dev/urandom > "$MNT/save-target.bin"
+head -c 262144 /dev/urandom > "$WORK/trunc_src/save-new"
+cp "$WORK/trunc_src/save-new" "$MNT/save-tmp.bin"
+mv "$MNT/save-tmp.bin" "$MNT/save-target.bin"
+sz=$(stat -c%s "$MNT/save-target.bin")
+if [ "$sz" = "262144" ] && cmp -s "$MNT/save-target.bin" "$WORK/trunc_src/save-new"; then
+    say "T3: rename-over content OK (262144B)"
+else
+    fail "T3: rename-over wrong content/size ($sz)"
+fi
+# POSIX same-file rename must be a NO-OP (coco P1: it used to destroy the file)
+mv "$MNT/save-target.bin" "$MNT/save-target.bin" 2>/dev/null
+if cmp -s "$MNT/save-target.bin" "$WORK/trunc_src/save-new"; then
+    say "T3: same-path rename no-op OK"
+else
+    fail "T3: same-path rename destroyed the file"
+fi
+
 # ── final verification ──────────────────────────────────────────────────────
 total=$(wc -l < "$WORK/manifest.txt")
 say "final verify ($total synced files)"

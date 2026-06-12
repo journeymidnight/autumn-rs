@@ -295,6 +295,55 @@ async fn flush_appends(
 /// Delete every data extent of an inode (used by `unlink`). Range-scan + delete;
 /// needs no length info, so it does not touch the runtime cache beyond
 /// invalidating it.
+/// UNLINK-1: remove an UNREACHABLE inode's data under an intent
+/// tombstone — extents, the inode key, then the tombstone itself. Used
+/// by unlink and rename-over-existing once the last dirent is gone, and
+/// replayed by `sweep_unlink_tombstones` after a crash. Idempotent.
+pub async fn remove_unreachable_inode(state: &mut FsState, ino: u64) -> Result<()> {
+    let tk = crate::key::unlink_tombstone_key(ino);
+    state.kv_put(&tk, b"1").await?;
+    delete_all_extents(state, ino).await?;
+    let ik = crate::key::inode_key(ino);
+    let _ = state.kv_delete(&ik).await;
+    let _ = state.kv_delete(&tk).await;
+    state.inodes.remove(&ino);
+    state.dirty_inodes.remove(&ino);
+    Ok(())
+}
+
+/// UNLINK-1: mount-time replay of interrupted unlinks. Returns the
+/// number of tombstones reaped.
+pub async fn sweep_unlink_tombstones(state: &mut FsState) -> Result<usize> {
+    let prefix = crate::key::unlink_tombstone_prefix();
+    let mut start_key = prefix.clone();
+    let mut n = 0;
+    loop {
+        // Paginated like delete_all_extents (coco P2: a single page
+        // capped the per-mount sweep at 4096 tombstones).
+        let keys = state.kv_range_keys(&prefix, &start_key, RANGE_PAGE).await?;
+        let got = keys.len();
+        let mut last_ino = 0u64;
+        for k in &keys {
+            if let Some(ino) = crate::key::parse_unlink_tombstone(k) {
+                last_ino = ino;
+                if let Err(e) = remove_unreachable_inode(state, ino).await {
+                    tracing::warn!(
+                        ino,
+                        "unlink tombstone replay failed (retried next mount): {e}"
+                    );
+                } else {
+                    n += 1;
+                }
+            }
+        }
+        if got < RANGE_PAGE as usize {
+            break;
+        }
+        start_key = crate::key::unlink_tombstone_key(last_ino.saturating_add(1));
+    }
+    Ok(n)
+}
+
 pub async fn delete_all_extents(state: &mut FsState, ino: u64) -> Result<()> {
     let prefix = key::extent_prefix(ino);
     let mut start_key = prefix.clone();

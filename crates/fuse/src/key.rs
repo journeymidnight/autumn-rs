@@ -110,9 +110,46 @@ pub fn next_inode_key() -> Vec<u8> {
     super_key(b"next_inode")
 }
 
+/// UNLINK-1: unlink-intent tombstone `[0x04]rmtomb/[ino BE]`. Written the
+/// moment an inode becomes UNREACHABLE (its last dirent gone) and removed
+/// after its extents + inode key are deleted; the mount-time sweep replays
+/// any survivor so a crash mid-unlink can no longer leak the file's data
+/// KVs forever. INVARIANT: a tombstone is only ever written for an
+/// unreachable inode — the sweep deletes data unconditionally.
+pub fn unlink_tombstone_key(ino: u64) -> Vec<u8> {
+    let mut k = super_key(b"rmtomb/");
+    k.extend_from_slice(&ino.to_be_bytes());
+    k
+}
+
+pub fn unlink_tombstone_prefix() -> Vec<u8> {
+    super_key(b"rmtomb/")
+}
+
+pub fn parse_unlink_tombstone(key: &[u8]) -> Option<u64> {
+    let p = unlink_tombstone_prefix();
+    if key.len() == p.len() + 8 && key.starts_with(&p) {
+        Some(u64::from_be_bytes(key[p.len()..].try_into().unwrap()))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unlink_tombstone_roundtrip() {
+        let k = unlink_tombstone_key(0xDEAD_BEEF);
+        assert!(k.starts_with(&unlink_tombstone_prefix()));
+        assert_eq!(parse_unlink_tombstone(&k), Some(0xDEAD_BEEF));
+        // wrong length / prefix
+        assert_eq!(parse_unlink_tombstone(&unlink_tombstone_prefix()), None);
+        assert_eq!(parse_unlink_tombstone(&next_inode_key()), None);
+        // must not collide with other super keys under prefix scan
+        assert!(!next_inode_key().starts_with(&unlink_tombstone_prefix()));
+    }
 
     #[test]
     fn inode_key_roundtrip() {

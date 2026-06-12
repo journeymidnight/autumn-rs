@@ -444,6 +444,15 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
     match req {
         FsRequest::Init { reply } => {
             let result = init_root(state).await;
+            // UNLINK-1: replay any unlink interrupted by a crash —
+            // tombstoned inodes are unreachable by invariant, so the
+            // sweep can delete their data unconditionally. Best-effort:
+            // a failed sweep retries at the next mount.
+            match crate::extent::sweep_unlink_tombstones(state).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(reaped = n, "unlink tombstone sweep"),
+                Err(e) => tracing::warn!("unlink tombstone sweep failed: {e}"),
+            }
             let _ = reply.send(result);
         }
         FsRequest::Destroy => {
@@ -700,14 +709,13 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
                 let mut meta = get_inode(state, dirent.child_inode).await?;
                 meta.nlink = meta.nlink.saturating_sub(1);
                 if meta.nlink == 0 {
-                    // Delete all data extents (F247 — variable-length, keyed by
-                    // logical offset; range-scan rather than arithmetic).
-                    crate::extent::delete_all_extents(state, dirent.child_inode).await?;
-                    // Delete inode
-                    let ik = key::inode_key(dirent.child_inode);
-                    state.kv_delete(&ik).await?;
-                    state.inodes.remove(&dirent.child_inode);
-                    state.dirty_inodes.remove(&dirent.child_inode);
+                    // UNLINK-1: the inode just became UNREACHABLE — remove
+                    // its data under an intent tombstone so a crash
+                    // mid-removal is replayed at next mount instead of
+                    // leaking the extents forever. (The residual window is
+                    // the single dirent-delete→tombstone-put gap; pre-fix
+                    // it spanned the whole extent scan + N deletes.)
+                    crate::extent::remove_unreachable_inode(state, dirent.child_inode).await?;
                 } else {
                     put_inode(state, dirent.child_inode, &meta).await?;
                 }

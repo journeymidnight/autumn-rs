@@ -577,3 +577,32 @@ gaps in the lease protocol's correctness story.
   1,069,685 ops 无回归；live 直方图分布合理（p50≈1-2ms，GET 17 万次观
   测）；ps 162 单测绿。
 - **passes:** completed (2026-06-12)
+
+---
+
+### UNLINK-1 · 生产急修批次 9：fuse unlink/rename 数据回收——含一个无条件泄漏 bug（2026-06-12）
+- **目标:** BUG-LEASE-8 家族剩余的真实泄漏窗口（crash-mid-unlink 孤儿
+  extent 永久不可达），以窄版意图日志关闭，无需完整 generation
+  manifest。
+- **盘点时发现第二个【无条件】bug:** rename 覆盖已存在文件时只删目标
+  INODE、**从不删其 EXTENTS**——POSIX 原子保存模式（write tmp; mv tmp
+  file）每次保存泄漏前一版全部内容，无需 crash。
+- **实现:** `remove_unreachable_inode`（意图 tombstone
+  `[0x04]rmtomb/[ino]` → 删 extents → 删 inode → 删 tombstone）统一
+  unlink 与 rename-over 路径；`sweep_unlink_tombstones` 每次挂载
+  （Init）重放幸存 tombstone。不变量：**tombstone 只为不可达 inode 写
+  入**（sweep 无条件删数据）——rename-over 中强制把移除放到 dirent 覆盖
+  之后。残余窗口=不可达点→tombstone 的单 RPC 间隙（修前=整个扫描+N 次
+  删除）。
+- **coco（GPT-5.5 fast）1P1+1P2 全采纳:** ① **第三个 bug**——
+  `rename("a","a")`（或同 inode 两个硬链接间 rename）把源自身当
+  "被覆盖目标"清理：递减 nlink + 删 inode（修前既有 POSIX 违反，
+  UNLINK-1 后还会删数据）→ POSIX same-file no-op 早退；② sweep 单页
+  4096 封顶 → 分页推进。
+- **验收:** fuse_chaos 全 PASS（T1/T2 回归 + 新 T3：unlink 突发+kill+
+  remount sweep、rename-over 内容校验、same-path rename no-op）；
+  fuse 44 单测（新增 tombstone round-trip + 前缀不碰撞）。窗口命中说
+  明：loopback 上单 unlink ~1.3ms，难以稳定命中 kill 窗口——sweep 在
+  每次挂载执行（Ok(0) 路径全 harness 实测），机制由不变量+单测+T3 流
+  程覆盖。
+- **passes:** completed (2026-06-12)

@@ -578,11 +578,21 @@ FABRICATES data; it can only lose a recent un-fsynced write:
   would make the caller retry into the `new_size == old_size` early
   return (a no-op that never re-cleans). WARN + invalidate instead;
   leftovers are reaped by the next grow/unlink.
-- **Known deferred gap**: crash mid-unlink (dirent deleted, extent
-  prefix-scan deletion partial) orphans unreachable extent KVs — needs the
-  generation-manifest / tombstone GC from the architectural entry. Rare
-  (requires a crash inside the unlink window) and bounded (space only,
-  never wrong data).
+- **UNLINK-1 (closed the former "deferred gap")**: unlink and
+  rename-over-existing remove the target's data through
+  `extent::remove_unreachable_inode` — an intent TOMBSTONE
+  (`[0x04]rmtomb/[ino]`) written the moment the inode becomes
+  UNREACHABLE, then extents + inode key + tombstone deleted;
+  `sweep_unlink_tombstones` replays survivors at every mount (Init).
+  INVARIANT: a tombstone is only ever written for an unreachable inode
+  (the sweep deletes unconditionally) — in rename-over this forces the
+  removal AFTER the dirent overwrite. The residual leak window is the
+  single unreachability→tombstone RPC gap (pre-fix: the whole scan + N
+  deletes). Bonus unconditional bug fixed en route: rename-over deleted
+  the target's INODE but never its EXTENTS — the POSIX atomic-save
+  pattern (write tmp; mv tmp file) leaked the entire previous content
+  on EVERY save. Covered by fuse_chaos T3 (unlink burst + kill +
+  remount sweep; rename-over content check).
 - **Read-path bug found by the T2 harness check (fixed in
   partition-server)**: a sub-range GET fully past a VP value's end
   clamped to a zero-length read, and `read_value_from_log`'s pooled

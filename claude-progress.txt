@@ -1,6 +1,7 @@
 Date: 2026-06-12
 TaskStatus: completed
-Task scope: /loop 生产视角急修 · 批次 5-8 = ETCD-1/ETCD-2/WIRE-1/LAT-1（etcd 故障 chaos：
+Task scope: /loop 生产视角急修 · 批次 5-9 = ETCD-1/2, WIRE-1, LAT-1,
+  UNLINK-1（etcd 故障 chaos：
   leaderless 路由黑洞 + PS 全队自杀 + 审计日志 etcd 泄漏）。批次 1-4：
   P0-D / OBS-1 / ENOSPC-1 / LEASE8-LITE 已闭（2334304 / 25d323d /
   4b10922 / 75ff306）。
@@ -33,6 +34,7 @@ Current summary:
 Main gaps:
   - 见 Not implemented。
 Next steps:
-  - 无：自治生产面 8 批全部闭环（LAT-1 = 最后一项）。剩余全部需用户
-    决策：rolling upgrade 完整线协议策略（WIRE-1 enforcement point 已
-    就位）/ F227（用户持有）/ generation manifest / 安全鉴权。
+  - 无：自治生产面 9 批全部闭环。UNLINK-1 顺带揪出 2 个无条件 bug
+    （rename-over 泄漏全部 extents；same-file rename 自毁文件）。剩余
+    全部需用户决策：rolling upgrade 完整线协议策略 / F227（用户持有）
+    / generation manifest 全量 / 安全鉴权。
