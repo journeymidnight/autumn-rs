@@ -234,3 +234,21 @@ gaps in the lease protocol's correctness story.
 - **passes:** not_completed (deferred — design recorded)
 
 ---
+
+---
+
+### F272 · chaos 迭代 12：跨主机 chaos（真实网络，::14 + ::15）
+- **目标:** 真 RoCE 网络上的 kill/迁移/failback/manager 重启 chaos。新
+  harness `scripts/crosshost_chaos.sh tcp|ucx`：本地 etcd+manager+
+  EN×2+PS1，远端（ssh）EN×1+PS2，replication=3 跨网；X1 杀远端 EN、
+  X2 跨主机迁移、X3 跨主机 failback、X4 manager 重启。
+- **tcp 轮: 全 PASS** —— X2 跨主机迁移 12s、X3 failback 19s、X4 恢复
+  3s，734 ACK 写 0 丢失。两个 harness 坑已修：ssh 启动远端 daemon 会
+  挂住通道（本地后台化）；首跑 25 min 卡死即此。
+- **ucx 轮: X1-X3 PASS；X4（manager kill+respawn）后全部读失败**。证
+  据（docs/f272/）：原 manager UCX bind 在前次运行的跨网 TIME_WAIT 上
+  重试 ~90s（F264 预算内，最终服务正常）；X4 respawn 后 manager 卡
+  "retrying election" 无下文，probe 显示 etcd store revision=7（接近
+  全空）与 bootstrap 应有数百 revision 矛盾——疑 etcd 状态/连接错位，
+  待带 etcd-revision 探针的复现定位。
+- **passes:** not_completed（ucx X4 待复现+修复）
