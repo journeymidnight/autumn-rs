@@ -4138,7 +4138,33 @@ impl ExtentNode {
             extent.sealed.store(true, Ordering::SeqCst);
         }
 
-        let _ = self.save_meta(task.extent_id, &extent).await;
+        // P0-D (coco durability batch): the `.meta` persist is PART of the
+        // recovered replica — eversion / sealed_length / sealed / avali are
+        // what a restart trusts. Swallowing a persist failure reported the
+        // recovery as DONE while the on-disk sidecar still carried the
+        // pre-recovery state: after a crash the replica re-announces the old
+        // eversion (manager believes the slot recovered at the new one) and a
+        // manager-sealed extent can read back as OPEN. Fail-closed instead:
+        // the recovery task FAILS (the dispatch loop retries it) and the disk
+        // is marked offline, the established response to a sidecar-persist
+        // I/O error (see `ensure_fence_durable`, note 23).
+        if let Err(e) = self.save_meta(task.extent_id, &extent).await {
+            // Mark the disk offline FIRST (the lookup needs the entry), then
+            // REMOVE the partial entry (coco P1): leaving it in `extents`
+            // would (a) make local retries reuse the now-offline disk via
+            // `ensure_extent`'s existing-entry fast path — a later lucky
+            // persist would then report a "recovered" replica on an offline
+            // disk — and (b) block a future manager re-dispatch with
+            // "extent already exists". The orphaned .dat is reaped by the
+            // startup/periodic reconcile (F109/F113), the established path
+            // for abandoned recovery artifacts.
+            self.mark_disk_offline_for_extent(task.extent_id);
+            self.extents.remove(&task.extent_id);
+            return Err(format!(
+                "recovery of extent {} completed but .meta persist failed (fail-closed): {e}",
+                task.extent_id
+            ));
+        }
 
         Ok(RecoveryTaskDone {
             task,
@@ -5726,6 +5752,22 @@ impl ExtentNode {
                 sealed_length,
                 "convert_to_ec idempotent skip: extent already EC-converted"
             );
+            // P0-D (coco P1): the in-memory atomics satisfying this check do
+            // NOT prove the sidecar is durable — a prior attempt may have
+            // published them and then FAILED its `.meta` persist (the
+            // fail-closed paths below error out but cannot roll the atomics
+            // back). Returning OK here would let the manager commit the
+            // conversion against a stale on-disk sidecar. ENSURE durability:
+            // save_meta is idempotent; fail-closed if it still can't persist.
+            if let Err(e) = self.save_meta(extent_id, &entry).await {
+                self.mark_disk_offline_for_extent(extent_id);
+                return Err((
+                    StatusCode::Unavailable,
+                    format!(
+                        "extent {extent_id}: idempotent-skip .meta ensure failed (fail-closed): {e}"
+                    ),
+                ));
+            }
             return Ok(rkyv_encode(&CodeResp {
                 code: CODE_OK,
                 message: String::new(),
@@ -5797,7 +5839,22 @@ impl ExtentNode {
                     entry.sealed.store(true, Ordering::SeqCst);
                     entry.eversion.store(mgr_info.eversion, Ordering::SeqCst);
                     entry.avali.store(mgr_info.avali, Ordering::SeqCst);
-                    let _ = self.save_meta(extent_id, &entry).await;
+                    // P0-D: the seal we just applied gates the EC encode below
+                    // — proceeding with a NON-DURABLE seal lets a crash
+                    // mid-convert restart this extent as OPEN while shards may
+                    // already be distributed. Fail-closed: refuse the convert
+                    // (the manager's dispatch loop retries; F153's per-extent
+                    // lock + F119-D idempotency make the redo safe) and mark
+                    // the disk offline (sidecar-persist I/O error).
+                    if let Err(e) = self.save_meta(extent_id, &entry).await {
+                        self.mark_disk_offline_for_extent(extent_id);
+                        return Err((
+                            StatusCode::Unavailable,
+                            format!(
+                                "extent {extent_id}: seal .meta persist failed before EC convert (fail-closed): {e}"
+                            ),
+                        ));
+                    }
                     sealed_length = mgr_info.sealed_length;
                     tracing::info!(
                         extent_id,
@@ -5841,7 +5898,20 @@ impl ExtentNode {
                 if new_eversion > 0 {
                     entry.eversion.store(new_eversion, Ordering::SeqCst);
                 }
-                let _ = self.save_meta(extent_id, &entry).await;
+                // P0-D: same fail-closed rule as the prepare-path seal above —
+                // an EC-converted extent whose post-convert eversion/seal is
+                // not durable would restart with the PRE-convert sidecar
+                // (stale eversion over shard-shaped data = the exact
+                // corruption family F119-C/D guard against).
+                if let Err(e) = self.save_meta(extent_id, &entry).await {
+                    self.mark_disk_offline_for_extent(extent_id);
+                    return Err((
+                        StatusCode::Unavailable,
+                        format!(
+                            "extent {extent_id}: post-convert .meta persist failed (fail-closed): {e}"
+                        ),
+                    ));
+                }
             } else if local_len < sealed_length {
                 let mgr_info = mgr_info_opt.ok_or_else(|| {
                     (

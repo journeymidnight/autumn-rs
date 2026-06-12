@@ -296,3 +296,27 @@ gaps in the lease protocol's correctness story.
 - **验收: 重建后全 PASS** —— K1 后 12s、K2 后 8s 恢复进度；158 轮全
   部 readback 校验 + 新进程复验 158/158，零 mismatch。
 - **passes:** completed (2026-06-12)
+
+---
+
+### P0-D · 生产急修批次 1：EN durability——清零被吞的 `.meta` persist 失败（2026-06-12）
+- **目标:** `/loop 生产视角` 首项（用户拍板 P0 durability batch 先行）。
+  P0-A/B/C（fsync fail-closed / fence durable-before-ACK / sealed-empty
+  V2）此前已闭；本批清零 extent_node.rs 最后 3 处 `let _ = save_meta`：
+  ① `run_recovery_task` 末尾 persist——失败曾被吞，恢复任务谎报完成而
+  sidecar 仍是恢复前 eversion/seal；② `handle_convert_to_ec` prepare 路
+  seal persist——非持久 seal 门控 EC 编码，crash 中途重启回 OPEN 而
+  shard 已分发；③ 同函数 post-convert eversion/seal persist——stale
+  sidecar 盖 shard 数据（F119-C/D 防的同族损坏）。三处统一 fail-closed
+  （mark_disk_offline + 报错，由调度/manager 重试）。
+- **coco（GPT-5.5）2 P1 全采纳:** ① F119-D 幂等跳过路径内存原子满足≠
+  sidecar 持久——skip 前 ensure save_meta（幂等）并 fail-closed；②
+  recovery persist 失败后残留的 partial entry 会让本地重试复用已下线
+  盘、并以 "extent already exists" 卡死 manager 重派——mark offline 后
+  remove entry（孤儿 .dat 走 F109/F113 reconcile 回收）。
+- **验收:** autumn-stream --lib 72 单测绿；seed=13/60s 隔离 system_chaos
+  ×2（含 P1 折入后）全 "test result: ok" 零丢失；transport_chaos tcp
+  全 PASS。stream CLAUDE.md note 25 固化不变量：**任何
+  seal/convert/recovery RPC 返回 OK 即断言 sidecar 已持久，而非仅内存
+  一致**。
+- **passes:** completed (2026-06-12)

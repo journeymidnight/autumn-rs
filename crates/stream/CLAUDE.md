@@ -1245,6 +1245,35 @@ sufficient (and cheaper than DashMap).
     (Issue #14627 ping-pong + LSN watermark) becomes load-bearing** —
     re-validate the race on the new architecture before shipping.
 
+25. **No `.meta` persist failure is ever swallowed — P0-D closed the last
+    `let _ = save_meta(...)` sites (2026-06-12).** The `.meta` sidecar is the
+    only state a restart trusts (note 23); any path that mutates
+    eversion/sealed/avali/sealed_length and then ignores a failed persist
+    reports a state change the disk does not hold. The remaining three sites,
+    all converted to fail-closed (`mark_disk_offline_for_extent` + error, the
+    note-23 response to a sidecar-persist I/O error):
+    - `run_recovery_task` final persist: a swallowed failure reported a
+      recovered replica whose sidecar still carried the pre-recovery
+      eversion/seal. Now the task FAILS (dispatch loop retries) and the
+      partial `ExtentEntry` is REMOVED from `extents` — leaving it would let
+      local retries reuse the offline disk via `ensure_extent`'s
+      existing-entry fast path and block manager re-dispatch with "extent
+      already exists" (the orphan `.dat` is reaped by F109/F113 reconcile).
+    - `handle_convert_to_ec` prepare-path seal: a non-durable seal gating the
+      EC encode meant a crash mid-convert could restart the extent as OPEN
+      with shards already distributed. F153 per-extent lock + F119-D
+      idempotency make the manager's retry safe.
+    - `handle_convert_to_ec` post-convert eversion/seal persist: a stale
+      pre-convert sidecar over shard-shaped data is the corruption family
+      F119-C/D guard against.
+    Corollary: the F119-D **idempotent-skip must ENSURE durability, not just
+    check atomics** — a prior attempt may have published the in-memory
+    atomics and then failed its persist (the fail-closed paths can't roll
+    atomics back), so the skip path re-runs `save_meta` (idempotent) and
+    fail-closes if it still can't persist. Invariant: **returning OK from any
+    seal/convert/recovery RPC asserts the sidecar is durable, not merely that
+    memory agrees.**
+
 ---
 
 ## RPC Wire Protocol (extent_rpc.rs)

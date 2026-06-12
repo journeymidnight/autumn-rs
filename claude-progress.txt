@@ -1,78 +1,33 @@
 Date: 2026-06-12
 TaskStatus: completed
-Task scope: F272-F275 completed — /loop chaos 迭代 5：multi-manager HA chaos
-  （manager_ha_chaos.sh H1 leader kill / H2 仅新 leader 时 PS kill /
-  H3 老 leader 回归 follower），发现并修复 4 个真实 bug。
+Task scope: /loop 生产视角急修 · 批次 1 = P0-D（EN durability：清零被吞的
+  `.meta` persist 失败）。
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
   Already implemented (this commit):
-    - scripts/manager_ha_chaos.sh（tcp|ucx；接管判据=仅经 standby 的端
-      到端写；PS 带全 manager 列表）。
-    - BUG 4 fix: PartitionServer.current_mgr Cell→Rc<Cell>（每 loop 克
-      隆导致只有 heartbeat 的私有副本会轮转 manager）。
-    - BUG 5 fix: StreamClient manager_call（传输失败 rotate）替换 8 个
-      裸调用站点 + note_manager_code（NOT_LEADER rotate）8 个解码点。
-    - BUG 6 fix: owner lock 改 per-partition 稳定逻辑 key
-      （partition/<id>，不含 ps_id——coco P1），open_partition 每次
-      fresh acquire；
-      standing-PS takeover 不再被旧 fence floor 卡死；server 级 key 仅
-      留 split 协调。
-    - BUG 7 fix: get_regions/heartbeat_ps leader-gate + 全链路
-      NOT_LEADER rotate（PS heartbeat Ok 臂/sync_regions_once/SDK
-      refresh_regions）。
-    - 文档: ps CLAUDE.md note 19/20、manager CLAUDE.md F267 addendum、
-      README、feature_list F267。
+    - extent_node.rs 最后 3 处 `let _ = save_meta` 全部 fail-closed
+      （mark_disk_offline + 报错）：run_recovery_task 末尾 persist /
+      convert_to_ec prepare 路 seal / convert_to_ec post-convert
+      eversion-seal。grep 确认仓库已无被吞的 save_meta。
+    - coco P1 ×2 折入：F119-D 幂等跳过路径 ensure save_meta（内存原子
+      满足≠sidecar 持久）；recovery persist 失败后 remove partial
+      entry（防复用下线盘 + 防 "already exists" 卡死重派）。
+    - 文档：stream CLAUDE.md note 25（不变量：RPC 返回 OK 即断言
+      sidecar 持久）；feature_list P0-D 条目。
   Not implemented (recorded):
-    - F227 recovery-stuck 家族（仍 OPEN，未动）。
-    - coco P0 durability batch（用户 defer，未动）。
+    - 生产清单后续项（按用户拍板顺序）：observability /metrics 薄层 →
+      ENOSPC 行为定义+测试 → BUG-LEASE-8（fuse 多 key 原子提交边界）。
+      rolling upgrade（rkyv same-commit 约束）= 独立长线 track。
+    - F227 recovery-stuck 家族（仍 OPEN）；note 24 fsync coalescer
+      （结构性不可达，defer 维持）。
 
 Current summary:
-  coco findbugs(GPT-5.5) 2 P1 全采纳并折入（owner key 去 ps_id +
-  NOT_LEADER 计入自杀预算）。折入后四轮复跑全 PASS 0 丢失：HA tcp
-  502 ACK（H1 接管 2s/H2 迁移 18s/H3 无影响）、HA ucx 270 ACK、
-  E1-E6 tcp seed=6 连续 5 failback 1978 ACK、E1-E6 ucx seed=7
-  358 ACK。全 workspace --lib 530 单测绿。
+  P0-D 验证全绿：autumn-stream --lib 72 单测；seed=13/60s 隔离
+  system_chaos ×2（P1 折入后）全 ok 零丢失；transport_chaos tcp PASS。
 
 Main gaps:
   - 见 Not implemented。
-F268 (迭代 6): transport_chaos.sh 新增 E7a（split 中途 kill 宿主
-  PS——tcp 轮证据: split txn 刚提交即 kill，父+子分区在幸存者重开，子
-  用 fresh per-partition key）+ E7b（merge freeze 窗口 kill manager，
-  FREEZE_TTL 兜底首次真实验证）。tcp 1926 / ucx 545 ACK 全 PASS 0 丢
-  失，未发现新 bug。
-F269 (迭代 7): E6 victim 集扩展 split/merge best-effort 操作 +
-  CHAOS_ROUNDS=20 双 transport soak（tcp 3931 / ucx 1316 ACK 全 PASS
-  0 丢失）；verify_seeds 加收敛窗口单次重试。未发现新 bug。
-F270 (迭代 8, IN PROGRESS): F227 open-tail 写 wedge 复现钉死——
-  seed=13/60s 隔离 3 跑 2 中（part 9001 PUT 全超时 0/50，0 丢失），
-  日志 docs/f270_seed13_wedge_run{1,3}.log；判定既有 bug 非当日回归。
-  修复未开始（commit/seal 高危区，需独立完整 arc）。
-F270 用户拍板 (a)+(b)；(b) fence 自愈已落地（current_commit 区分
-  LockedByOther + flush poison_for_fence 双唤醒，coco P1 折入），但
-  seed=13 x10 = 1/10：今日 Mode Z 零 LockedByOther → 非 fence 引起，
-  (b) 是针对 5/30 已 trace 复合层的定向修复而非本体；Mode Y
-  (split child 不开, not_found=200) 5/10 占主导。
-F270 三模式同根已破：harness ephemeral 端口当 EN 固定身份 → kill
-  重生 EADDRINUSE → EN 永久死 → alloc 饥饿。pick_stable_port_pair
-  修复后 seed=13 x10 = 9/10（修前 1/10）。残留 1/10 = 窄版
-  split-child 不可达（无 alloc 饥饿），待 traced 捕获。
-F270 残留窄尾已破并闭合：PartitionHandle.part_addr 存计算地址，
-  BUG#3 端口 fallback 触发时 F265 自愈把正确注册覆写回死端口；ready
-  通道回传实际 advertise 修复。seed=13 x15 = 15/15；全 gauntlet 回归
-  4 轮 PASS 0 丢失。F270 completed。
-F271 (迭代 11): 20-seed K4/M2 严酷扫描 20/20 全 PASS（含历史 seed
-  8/13/15）。本机 chaos 面饱和。
-F272 (迭代 12-13): crosshost_chaos.sh 落地并双轨认证。ucx 首轮异常
-  验尸定性=harness 固定 sleep vs manager ucx ~90s TIME_WAIT bind 重
-  试（无产品 bug）；加 wait_mgr/wait_nodes 就绪门后 ucx 全 PASS
-  （320 ACK 0 丢失）+ tcp 复跑全 PASS（768 ACK 0 丢失）。
-F273 (迭代 14): fuse_chaos.sh——fuse 挂载在 PS-kill/manager-kill/
-  fuse-kill 三类故障下，83 文件 sha256 全完好，首跑全 PASS。
-F274 (迭代 15): 过夜 90 轮 soak（tcp 60 + ucx 30）双 PASS，10034
-  ACK 写零丢失。
-F275 (迭代 16): kvcache python 接口 chaos 全 PASS（158 轮零
-  mismatch）；过程中发现 stale maturin wheel = 线协议错位坑（已记
-  README）。三接口（client/fuse/kvcache）failover chaos 全部收齐。
 Next steps:
-  - 无。chaos 战役完整闭环：五层覆盖 + 90 轮 soak。
+  - /loop 下一项：observability /metrics 薄层（目前零 metrics 端点，
+    生产无法观测 QPS/延迟/盘健康/分区分布）。
