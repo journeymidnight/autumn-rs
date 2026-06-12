@@ -1,6 +1,6 @@
 Date: 2026-06-12
 TaskStatus: completed
-Task scope: /loop 生产视角急修 · 批次 5 = ETCD-1（etcd 故障 chaos：
+Task scope: /loop 生产视角急修 · 批次 5+6 = ETCD-1 + ETCD-2（etcd 故障 chaos：
   leaderless 路由黑洞 + PS 全队自杀 + 审计日志 etcd 泄漏）。批次 1-4：
   P0-D / OBS-1 / ENOSPC-1 / LEASE8-LITE 已闭（2334304 / 25d323d /
   4b10922 / 75ff306）。
@@ -33,4 +33,5 @@ Current summary:
 Main gaps:
   - 见 Not implemented。
 Next steps:
-  - loop 继续扫下一个生产缺口。
+  - 认证 soak（tcp 15 轮 + ucx 10 轮 + etcd cluster ×2）收口当日 6 批
+    变更；其后自治面基本扫尽，剩余项待用户决策。
