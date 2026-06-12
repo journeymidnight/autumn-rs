@@ -319,12 +319,14 @@ impl AutumnManager {
                 code: CODE_ERROR,
                 message: "manager not yet bootstrapped".to_string(),
                 cluster_id: String::new(),
+                wire_fingerprint: autumn_rpc::WIRE_FINGERPRINT.to_string(),
             }));
         }
         Ok(rkyv_encode(&GetClusterIdResp {
             code: CODE_OK,
             message: String::new(),
             cluster_id: id,
+            wire_fingerprint: autumn_rpc::WIRE_FINGERPRINT.to_string(),
         }))
     }
 

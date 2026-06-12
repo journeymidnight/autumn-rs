@@ -532,3 +532,30 @@ gaps in the lease protocol's correctness story.
   时 tcp manager 直接 EADDRINUSE 退出（只有 ucx listener 会重试，
   F264）；③（ETCD-2 已含）stop 路径 etcd*.pid 清理。
 - **passes:** completed (2026-06-12)
+
+---
+
+### WIRE-1 · 生产急修批次 7：wire-schema 指纹——混版本部署从静默损坏变响亮拒绝（2026-06-12）
+- **目标:** rolling upgrade 的可自治子集。same-commit 约定下混版本部署
+  **静默**失败（rkyv 解出垃圾——F275 stale wheel: part_id=0 全写失败且
+  无任何指向性报错）。完整 rolling upgrade（线协议兼容策略）仍待用户
+  决策；本批先把"混了"这件事变成启动时的硬拒绝。
+- **实现:** autumn-rpc build.rs 对 wire schema **源文件**取哈希
+  （manager_rpc/partition_rpc/frame/extent_rpc）→ 编译期常量
+  `WIRE_FINGERPRINT`（哈希 schema 源而非 git commit：无关代码改动不扰
+  动 dev 流，改 wire 结构必变）。`GetClusterIdResp.wire_fingerprint`
+  携带；启动校验点：ClusterClient::connect（覆盖 client/op/fuse/
+  ioring/python wheel——F275 形态直接拦截——及 EN 的 cluster_id 校验链）
+  + PS finish_connect + EN verify_manager_cluster_id 显式。语义：成功
+  响应但指纹不同（或解码失败/空指纹=旧端）= 硬拒绝并给出可操作信息；
+  transport 失败 = best-effort 跳过（可用性优先，后续 RPC 自然响亮失
+  败）。
+- **coco（GPT-5.5 fast）1P1+1P2+1P3 全采纳:** ① 成功响应但解码失败曾
+  被静默跳过——这恰是该机制要抓的形态（旧 manager 的 resp 缺字段）→
+  解码失败=硬拒绝；② EN 站点显式校验（不依赖 ClusterClient 耦合）；
+  ③ format! 多行字面量缩进混入错误信息 → 行继续符修正。
+- **验收:** rpc 21 单测（新增指纹 ×2）+ client/ps/manager/stream 全
+  绿；live smoke ×2（折入前后）全栈 put/get 正常（即全部校验点
+  happy-path 实测）；workspace 0 error。文档：rpc CLAUDE.md WIRE-1 节
+  （注明未来 rolling-upgrade 设计的 enforcement point 就在此处放宽）。
+- **passes:** completed (2026-06-12)

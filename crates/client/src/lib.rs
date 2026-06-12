@@ -528,6 +528,27 @@ impl ClusterClient {
             return Err(anyhow!("cannot connect to any manager: {}", manager));
         }
 
+        // WIRE-1: startup wire-schema cross-check. A SUCCESSFUL response
+        // with a different fingerprint is a hard refusal (mixed
+        // same-commit deploy — rkyv would decode garbage; the F275 stale
+        // python wheel failed exactly this way, silently). A transport
+        // failure is skipped: availability wins while the manager is
+        // briefly down, and every RPC after this would fail loudly anyway.
+        if let Ok(resp_bytes) = client
+            .mgr_call(MSG_GET_CLUSTER_ID, rkyv_encode(&GetClusterIdReq {}))
+            .await
+        {
+            // A SUCCESSFUL response that fails to DECODE is itself the
+            // mismatch this check exists for (an older manager's resp
+            // lacks the field) — hard fail, never skip (coco P1).
+            let resp = rkyv_decode::<GetClusterIdResp>(&resp_bytes).map_err(|e| {
+                anyhow!("decode GetClusterIdResp failed ({e}) — possible wire-schema mismatch; rebuild from the cluster's commit")
+            })?;
+            if let Err(msg) = autumn_rpc::wire_fingerprint_check(&resp.wire_fingerprint) {
+                return Err(anyhow!(msg));
+            }
+        }
+
         client.refresh_regions().await?;
         Ok(client)
     }

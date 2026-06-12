@@ -1437,6 +1437,10 @@ pub struct GetClusterIdResp {
     pub message: String,
     /// UUID string. Empty when `code` != `CODE_OK`.
     pub cluster_id: String,
+    /// WIRE-1: the responding manager's `autumn_rpc::WIRE_FINGERPRINT`.
+    /// Callers refuse to join when it differs from their own (mixed
+    /// same-commit deploy violation — rkyv would decode garbage).
+    pub wire_fingerprint: String,
 }
 
 // ── F-ioring-lease-1 wire types ────────────────────────────────────────────

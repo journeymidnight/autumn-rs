@@ -2603,6 +2603,31 @@ impl PartitionServer {
     async fn finish_connect(self) -> Result<Self> {
         let server = self;
 
+        // WIRE-1: startup wire-schema cross-check against the manager. A
+        // successful response with a different fingerprint is a hard
+        // refusal (mixed same-commit deploy — rkyv decodes garbage
+        // silently); a transport failure is best-effort-skipped
+        // (register_ps below retries through manager unavailability).
+        if let Ok(resp_bytes) = server
+            .pool
+            .call_timeout(
+                server.manager_addr(),
+                manager_rpc::MSG_GET_CLUSTER_ID,
+                manager_rpc::rkyv_encode(&manager_rpc::GetClusterIdReq {}),
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            // Successful-but-undecodable IS the mismatch (coco P1).
+            let resp = manager_rpc::rkyv_decode::<manager_rpc::GetClusterIdResp>(&resp_bytes)
+                .map_err(|e| {
+                    anyhow::anyhow!("decode GetClusterIdResp failed ({e}) — possible wire-schema mismatch; rebuild from the cluster's commit")
+                })?;
+            if let Err(msg) = autumn_rpc::wire_fingerprint_check(&resp.wire_fingerprint) {
+                return Err(anyhow::anyhow!(msg));
+            }
+        }
+
         // Retry register_ps — manager may still be electing leader after restart.
         let mut retries = 15;
         loop {

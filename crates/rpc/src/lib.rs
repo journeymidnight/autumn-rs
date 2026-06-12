@@ -31,3 +31,47 @@ pub type HandlerResult = std::result::Result<bytes::Bytes, (StatusCode, String)>
 
 /// Msg type reserved for heartbeat ping/pong.
 pub const MSG_TYPE_PING: u8 = 0xFF;
+
+/// WIRE-1: build-time fingerprint of the wire-schema source files
+/// (manager_rpc / partition_rpc / frame / extent_rpc). Same-commit
+/// deploys share it; ANY wire-struct edit changes it. Exchanged via
+/// `GetClusterIdResp.wire_fingerprint` and checked at every long-lived
+/// process's startup — a mixed-version join refuses LOUDLY instead of
+/// silently decoding garbage (rkyv has no cross-version compat; F275).
+pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
+
+/// WIRE-1: compare a peer-reported fingerprint against ours. Returns the
+/// actionable refusal message on mismatch. Callers treat a TRANSPORT
+/// failure fetching the fingerprint as best-effort-skip (the peer may be
+/// briefly down; availability wins), but a SUCCESSFUL response with a
+/// different fingerprint is a hard startup refusal.
+pub fn wire_fingerprint_check(remote: &str) -> std::result::Result<(), String> {
+    if remote == WIRE_FINGERPRINT {
+        return Ok(());
+    }
+    Err(format!(
+        "wire-schema fingerprint mismatch: local={WIRE_FINGERPRINT} manager={remote} — \
+autumn-rs deploys are SAME-COMMIT (rkyv wire structs have no cross-version \
+compatibility; a mixed deploy decodes garbage silently). Rebuild this binary/wheel \
+from the same tree as the running cluster, or restart the whole cluster from one \
+build (cluster.sh restart)."
+    ))
+}
+
+#[cfg(test)]
+mod wire_fingerprint_tests {
+    #[test]
+    fn fingerprint_is_nonempty_hex() {
+        assert_eq!(super::WIRE_FINGERPRINT.len(), 16);
+        assert!(super::WIRE_FINGERPRINT.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn check_accepts_self_rejects_other() {
+        assert!(super::wire_fingerprint_check(super::WIRE_FINGERPRINT).is_ok());
+        let err = super::wire_fingerprint_check("deadbeefdeadbeef").unwrap_err();
+        assert!(err.contains("SAME-COMMIT"), "{err}");
+        // An empty fingerprint (pre-WIRE-1 peer) must also refuse.
+        assert!(super::wire_fingerprint_check("").is_err());
+    }
+}

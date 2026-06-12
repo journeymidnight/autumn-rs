@@ -302,6 +302,13 @@ async fn verify_manager_cluster_id(manager: &str, stamped: &str) -> Result<()> {
             resp.message
         );
     }
+    // WIRE-1 (coco P2): explicit fingerprint check here too — the
+    // transitive check inside ClusterClient::connect covers today's
+    // path, but this site decodes its own resp and must not depend on
+    // that coupling.
+    if let Err(msg) = autumn_rpc::wire_fingerprint_check(&resp.wire_fingerprint) {
+        anyhow::bail!(msg);
+    }
     if resp.cluster_id != stamped {
         anyhow::bail!(
             "cluster_id mismatch: data dirs stamped for cluster {} but manager {} reports {}. \

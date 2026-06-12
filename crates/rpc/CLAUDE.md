@@ -197,3 +197,29 @@ let resp = client.call(1, payload).await?;
 3. **tokio::sync for locking**: tokio::sync::Mutex/mpsc/oneshot are runtime-agnostic futures. Work correctly on compio without needing tokio Runtime.
 4. **req_id=0 for fire-and-forget**: No response routing, handler runs but response is not written.
 5. **MSG_TYPE_PING=0xFF reserved**: Health check protocol built into the framework.
+
+## WIRE-1 — wire-schema fingerprint (2026-06-12)
+
+`build.rs` hashes the wire-schema SOURCE files (`manager_rpc.rs`,
+`partition_rpc.rs`, `frame.rs`, `../stream/src/extent_rpc.rs`) into
+`autumn_rpc::WIRE_FINGERPRINT` (16-hex compile-time const). Rationale:
+deploys are SAME-COMMIT (rkyv has no cross-version compatibility) and a
+mixed deploy fails SILENTLY with garbage decodes — the F275 stale python
+wheel decoded `PutReq` with `part_id=0` and every write failed with
+nothing pointing at the cause. Hashing the schema source (not the git
+commit) keeps dev flows sane: unrelated code edits don't perturb it; any
+wire-struct edit does.
+
+Exchange: `GetClusterIdResp.wire_fingerprint` (filled by the manager in
+both arms of `handle_get_cluster_id`). Checks at startup of every
+long-lived process via `wire_fingerprint_check`:
+- `ClusterClient::connect` (covers autumn-client/op, fuse, ioring, the
+  python wheel — the F275 shape — and the EN's cluster_id verify which
+  connects through it),
+- PS `finish_connect` (own pool path).
+Semantics: a SUCCESSFUL response with a different (or empty = pre-WIRE-1)
+fingerprint is a HARD startup refusal with an actionable message; a
+TRANSPORT failure fetching it is best-effort-skipped (availability wins
+while the manager is briefly down — every subsequent RPC fails loudly
+anyway). NOTE for a future rolling-upgrade design: this check is the
+enforcement point to relax once a real wire-compat story exists.
