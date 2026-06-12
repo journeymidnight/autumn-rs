@@ -245,10 +245,14 @@ gaps in the lease protocol's correctness story.
 - **tcp 轮: 全 PASS** —— X2 跨主机迁移 12s、X3 failback 19s、X4 恢复
   3s，734 ACK 写 0 丢失。两个 harness 坑已修：ssh 启动远端 daemon 会
   挂住通道（本地后台化）；首跑 25 min 卡死即此。
-- **ucx 轮: X1-X3 PASS；X4（manager kill+respawn）后全部读失败**。证
-  据（docs/f272/）：原 manager UCX bind 在前次运行的跨网 TIME_WAIT 上
-  重试 ~90s（F264 预算内，最终服务正常）；X4 respawn 后 manager 卡
-  "retrying election" 无下文，probe 显示 etcd store revision=7（接近
-  全空）与 bootstrap 应有数百 revision 矛盾——疑 etcd 状态/连接错位，
-  待带 etcd-revision 探针的复现定位。
+- **ucx 轮: 多处异常（更正：非仅 X4）**。① X2 的 `kill PS1 pid=` 为
+  空——pgrep 模式在 ucx 轮没匹配到本地 PS1，PS1 未被杀，"migrated" 判
+  定 1s 内通过疑为假阳性；② x2/x3 写活性均 wedge（45×2s 超时）；③ X4
+  respawn 后 manager 卡 "retrying election" 无下文 + probe 显示 etcd
+  revision=7 与 bootstrap 写入矛盾；④ 原 manager UCX bind 曾在跨网
+  TIME_WAIT 上重试 ~90s（F264 预算内）。seed 校验各阶段反而全 OK——
+  读路径活、写路径死，方向指向 ucx 下 PS/manager 标识与探针的多重
+  harness 失配 + 可能的真 bug 混叠。证据 docs/f272/。
+  下一步：脚本各阶段加 etcd revision/pgrep 命中/instance-id 探针后
+  复现，先把 harness 失配剥离再判断产品 bug。
 - **passes:** not_completed（ucx X4 待复现+修复）
