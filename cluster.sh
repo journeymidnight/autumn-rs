@@ -539,6 +539,52 @@ launch_ps() {
     echo "[cluster] PS launched (F099-K: per-partition listeners bind on partition open; $affinity_msg)"
 }
 
+# Derive the etcd client endpoint list from AUTUMN_ETCD_CLUSTER without
+# starting anything — used by `start-manager` (R0 rolling restart), where
+# etcd is already running and only the manager needs relaunching. Must
+# mirror the port grid in do_start's etcd section (2379 + m*10).
+compute_etcd_endpoints() {
+    local etcd_n="${AUTUMN_ETCD_CLUSTER:-1}"
+    [[ "$etcd_n" =~ ^[0-9]+$ ]] && (( etcd_n >= 1 )) || etcd_n=1
+    if (( etcd_n == 1 )); then
+        ETCD_ENDPOINTS="127.0.0.1:2379"
+    else
+        ETCD_ENDPOINTS=""
+        local m
+        for (( m=0; m<etcd_n; m++ )); do
+            ETCD_ENDPOINTS+="${ETCD_ENDPOINTS:+,}127.0.0.1:$(( 2379 + m * 10 ))"
+        done
+    fi
+}
+
+# Launch the manager. Reads the global ETCD_ENDPOINTS (set by do_start's
+# etcd bring-up, or by compute_etcd_endpoints for a standalone
+# start-manager). F187: AUTUMN_POLICY_FAST_MODE=1 enables fast-mode
+# advisory thresholds (1 MiB GC / 4 MiB compact / 5s tick / 1 bucket /
+# 30s cooldown) so load tests surface advisories within seconds instead
+# of the production 5-min sustained window.
+launch_manager() {
+    local mgr_extra=""
+    if [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]]; then
+        mgr_extra="--policy-fast-mode"
+    fi
+    # Observability batch 1: AUTUMN_METRICS=1 wires Prometheus /metrics
+    # endpoints on every role (manager 9591, EN 960<i>, PS 9701 — all
+    # below the 10000 ephemeral floor, see BUG#3).
+    if [[ "${AUTUMN_METRICS:-0}" == "1" ]]; then
+        mgr_extra="$mgr_extra --metrics-port 9591"
+    fi
+    if [[ -n "${AUTUMN_MGR_MIN_ALLOC_FREE_BYTES:-}" ]]; then
+        [[ "$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES" =~ ^[0-9]+$ ]] \
+            || die "AUTUMN_MGR_MIN_ALLOC_FREE_BYTES must be a non-negative integer (got '$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES')"
+        mgr_extra="$mgr_extra --min-alloc-free-bytes $AUTUMN_MGR_MIN_ALLOC_FREE_BYTES"
+    fi
+    start_proc manager \
+        "$MANAGER" --port 9001 --etcd "$ETCD_ENDPOINTS" --listen "$BIND_HOST" \
+        --transport "$TRANSPORT" $mgr_extra
+    wait_port 9001 manager
+}
+
 # Snapshot the launch parameters so `start-node` / `start-ps` (run later)
 # can reproduce the exact env. Captures REPLICAS + CLUSTER_MODE explicitly,
 # then dumps every AUTUMN_* env var (quoted via %q so values with spaces
@@ -643,29 +689,7 @@ do_start() {
         etcdctl del "" --prefix >/dev/null 2>&1 || true
     fi
 
-    # manager — F187: AUTUMN_POLICY_FAST_MODE=1 enables fast-mode
-    # advisory thresholds (1 MiB GC / 4 MiB compact / 5s tick / 1
-    # bucket / 30s cooldown) so load tests surface advisories within
-    # seconds instead of the production 5-min sustained window.
-    local mgr_extra=""
-    if [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]]; then
-        mgr_extra="--policy-fast-mode"
-    fi
-    # Observability batch 1: AUTUMN_METRICS=1 wires Prometheus /metrics
-    # endpoints on every role (manager 9591, EN 960<i>, PS 9701 — all
-    # below the 10000 ephemeral floor, see BUG#3).
-    if [[ "${AUTUMN_METRICS:-0}" == "1" ]]; then
-        mgr_extra="$mgr_extra --metrics-port 9591"
-    fi
-    if [[ -n "${AUTUMN_MGR_MIN_ALLOC_FREE_BYTES:-}" ]]; then
-        [[ "$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES" =~ ^[0-9]+$ ]] \
-            || die "AUTUMN_MGR_MIN_ALLOC_FREE_BYTES must be a non-negative integer (got '$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES')"
-        mgr_extra="$mgr_extra --min-alloc-free-bytes $AUTUMN_MGR_MIN_ALLOC_FREE_BYTES"
-    fi
-    start_proc manager \
-        "$MANAGER" --port 9001 --etcd "$ETCD_ENDPOINTS" --listen "$BIND_HOST" \
-        --transport "$TRANSPORT" $mgr_extra
-    wait_port 9001 manager
+    launch_manager
 
     # Extent node(s): node1=9101, node2=9102, ...
     # Pre-create all data directories so both single-disk and multi-disk paths can rely on them.
@@ -908,6 +932,25 @@ do_stop_ps() {
     kill_proc ps
 }
 
+# R0 rolling restart: the manager was the one role without per-process
+# subcommands (its launch was inlined in do_start). With etcd it replays
+# all state on start, so stop-manager + start-manager is a safe rolling
+# step — EN/PS retry their manager RPCs through the gap.
+do_start_manager() {
+    load_cluster_config
+    need_bin "$MANAGER"
+    local pf; pf="$(pid_file manager)"
+    if [[ -f "$pf" ]] && proc_alive "$(cat "$pf")"; then
+        die "manager already running (pid $(cat "$pf"))"
+    fi
+    compute_etcd_endpoints
+    launch_manager
+}
+
+do_stop_manager() {
+    kill_proc manager
+}
+
 # ---------------------------------------------------------------------------
 # stop
 # ---------------------------------------------------------------------------
@@ -1055,6 +1098,9 @@ case "$CMD" in
     start-ps)     do_start_ps ;;
     stop-ps)      do_stop_ps ;;
     restart-ps)   do_stop_ps; do_start_ps ;;
+    start-manager)   do_start_manager ;;
+    stop-manager)    do_stop_manager ;;
+    restart-manager) do_stop_manager; do_start_manager ;;
     *)
         echo "Usage: $0 <command> [args]"
         echo ""
@@ -1074,6 +1120,9 @@ case "$CMD" in
         echo "    start-ps           start partition server"
         echo "    stop-ps            stop partition server"
         echo "    restart-ps         stop-ps + start-ps"
+        echo "    start-manager      start manager (etcd must already be up)"
+        echo "    stop-manager       stop manager"
+        echo "    restart-manager    stop-manager + start-manager (etcd replay)"
         echo ""
         echo "  Mode flag (only with start/restart/reset):"
         echo "    --3disk            replicas=3, nodes on /data03,/data05,/data08"

@@ -625,3 +625,36 @@ gaps in the lease protocol's correctness story.
   **seal-lenient 原则（manager note 28）维持为法律**：append 全副本
   ACK 是安全性来源，seal 对可达副本取 min 永不切已 ACK 数据。
 - **passes:** completed (2026-06-12) — 状态由 OPEN → RESOLVED-certified
+
+---
+
+### ROLL-R0 · 滚动重启程序化（rolling upgrade 设计 R0 阶段）（2026-06-12）
+- **目标:** docs/rolling_upgrade_design.md §3-R0 — 把 chaos 已证明的
+  per-role kill+restart 零丢失能力固化为运维程序：逐进程滚动重启 + 每步
+  收敛门 + 失败即停。同 commit 配置变更/换机/内核升级即刻可滚动；亦是
+  R1+ 真正升级编排的骨架。
+- **实现:** `scripts/rolling_restart.sh`（顺序按设计 §6：EN 逐个 → PS →
+  manager）。收敛门：EN = list-nodes Online + 心跳 ≤10s + recovery-stats
+  全静默（0 inflight / 0 backoff）；PS = info 全分区 ps= 路由非 unknown；
+  manager = info 可答（etcd replay + leader 重选）+ 全节点 Online。每步
+  之后逐分区写活性探针（per-partition 区间内派生 key，put+读回比对，
+  非可打印边界跳过并警告）。滚动前 per-partition seed + 12MiB
+  put-stream 大值，滚动后内容校验。cluster.sh 补齐 manager 缺失的
+  per-process 子命令（start-manager/stop-manager/restart-manager，
+  launch_manager 从 do_start 提取 + compute_etcd_endpoints 推导端点）。
+- **coco（GPT-5.5）1P1+3P2 全采纳:** ① P1 探针 key 不保证落在目标分区
+  （空 start 分区的探针字典序路由进末分区——首分区假覆盖）→
+  derive_probe_prefix 按 [start,end) 推导可证明在区间内的前缀（start
+  非 end 前缀 → start 本身；是前缀 → start+低于 end 下一字节的可打印
+  字符），不可推导则响亮 SKIP + 诚实计数，LC_ALL=C 保字节序；②
+  partitions_routed 的 ps= 检查有 base-addr 回退假阳性 → 注释明确
+  liveness 探针才是权威门；③ 固定探针 key 会覆盖业务数据 + 遗留垃圾 →
+  per-run namespace `__autumn-roll-<runid>` + EXIT trap 删除；④ 无并发
+  互斥 → flock $DATA_ROOT/rolling_restart.lock 失败即停。
+- **验收:** 3-EN/4 分区（hexstring presplit）集群、外部持续写负载下全
+  序列通过 ×2（修复前后）：5 进程逐个滚动、全部收敛门 PASS、seed 校验
+  PASS、负载期 191/191 ACKed key 零丢失；修复版 4 分区探针含首分区真
+  覆盖（prefix="0"），探针 key 零遗留，并发第二实例被锁拒绝。
+  derive_probe_prefix 8 边界用例（含 [ab..ab0) SKIP、[..0) SKIP）人工
+  断言通过。README "Rolling restart" 节手动步骤可复执行。
+- **passes:** completed (2026-06-12)

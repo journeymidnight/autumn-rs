@@ -250,6 +250,43 @@ AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/manager_ha_chaos.sh ucx
 #  failback used to wedge forever — owner_epoch now bumps on every acquire.)
 ```
 
+## Rolling restart (R0 of docs/rolling_upgrade_design.md)
+
+Same-binary rolling restart of a live cluster — one process at a time, a
+convergence gate + per-partition write-liveness probe between every step,
+fail-stop on the first gate that doesn't converge. Order: EN one-by-one →
+PS → manager (most-depended-on end first, design §6).
+
+```bash
+# cluster must already be running (any cluster.sh start/reset shape)
+bash scripts/rolling_restart.sh
+# knobs: ROLL_GATE_TIMEOUT (180s), ROLL_HB_FRESH_SECS (10), ROLL_LIVENESS_TRIES (30)
+# pass the same AUTUMN_DATA_ROOT / AUTUMN_TRANSPORT the cluster was started with
+```
+
+Manual verification:
+
+```bash
+bash cluster.sh reset 3                       # or: AUTUMN_BOOTSTRAP_PRESPLIT=4:hexstring bash cluster.sh reset 3
+bash scripts/rolling_restart.sh               # expect: ... ROLLING RESTART COMPLETE ... zero loss
+```
+
+What it asserts per step: EN back `Online` with fresh heartbeat + recovery
+drained (`recovery-stats` 0 inflight / 0 backoff); PS has every partition
+routed (`info` shows no `ps=unknown`; the authoritative per-partition gate is
+the liveness probe — one provably-in-range key per partition); manager answers
+`info` again (leader re-elected from etcd replay) with all nodes Online.
+Before the roll it seeds one 1 KiB key per partition + a 12 MiB striped value;
+after the roll all are content-verified (zero ACKed loss). Probe keys are
+namespaced `<range-prefix>__autumn-roll-<runid>-*` and deleted on exit; a
+flock on `$AUTUMN_DATA_ROOT/rolling_restart.lock` rejects concurrent rolls.
+Verified 2026-06-12 on a 3-EN/4-partition cluster under continuous external
+writes: 191/191 ACKed keys survived.
+
+`cluster.sh` grew the missing manager per-process subcommands for this:
+`start-manager` / `stop-manager` / `restart-manager` (etcd state replay makes
+a manager bounce a safe rolling step).
+
 ## Tests
 
 ```bash

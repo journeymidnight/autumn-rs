@@ -1,39 +1,33 @@
 Date: 2026-06-12
-TaskStatus: completed
-Task scope: /loop 生产视角急修 · 批次 5-9 = ETCD-1/2, WIRE-1, LAT-1,
-  UNLINK-1（etcd 故障 chaos：
-  leaderless 路由黑洞 + PS 全队自杀 + 审计日志 etcd 泄漏）。批次 1-4：
-  P0-D / OBS-1 / ENOSPC-1 / LEASE8-LITE 已闭（2334304 / 25d323d /
-  4b10922 / 75ff306）。
+TaskStatus: not_completed
+Task scope: rolling upgrade 实施（docs/rolling_upgrade_design.md v1.1）。
+  R0 滚动重启程序化已完成并 commit；R1 cluster_version 门进行中；
+  R2（控制面 prost）/R3（数据面协商）待做，R2 范围与切换方式需用户拍板
+  （设计 §9 决策点 1/2）。
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
-  Already implemented (this commit):
-    - scripts/etcd_chaos.sh（D1 杀 etcd 数据面续航 / D2 150s 断电全队
-      存活 / D3 重启恢复 + 零丢失校验）——etcd 首次进入 chaos 面。
-    - 修复 ① stale-while-leaderless：displaced 标志 + ensure_routable
-      只放行 get_regions/heartbeat_ps 只读 RPC（mutating 维持严格
-      leader 门）；H3 follower 黑洞保持关闭。
-    - 修复 ② PS NOT_LEADER 退出预算与 transport 预算分离（450×2s=15min
-      vs 45×2s=90s）——pre-fix D2 复现全队自杀。
-    - 修复 ③ audit_retention_gc 零调用方 → audit_gc_loop（日频
-      leader-only）+ --audit-retention-days（env→CLI）。
-    - 文档：manager CLAUDE.md etcd-chaos addendum；feature_list ETCD-1。
+  Already implemented (this session):
+    - ROLL-R0: scripts/rolling_restart.sh（EN 逐个→PS→manager 滚动 +
+      收敛门 + per-partition 区间内写活性探针 + seed 零丢失校验 +
+      flock 互斥 + per-run 探针命名空间/清理）；cluster.sh 补
+      start-manager/stop-manager/restart-manager（launch_manager 提取
+      + compute_etcd_endpoints）。coco 1P1+3P2 全采纳（P1=空 start 分
+      区探针假覆盖）。实测：3-EN/4 分区持续负载全序列 ×2 PASS，
+      191/191 ACKed 零丢失。
   Not implemented (recorded):
-    - 同前（rolling upgrade / F227 / generation manifest——均需用户决策）。
-    - etcd 集群多副本部署（cluster.sh 单 etcd）——多 endpoint 客户端代码
-      在，部署面未接。
+    - R1: etcd cluster_version（ASCII decimal 持久值）+ manager
+      GET/BUMP RPC（单调+1）+ rpc [WIRE_VERSION_MIN,MAX] 区间 +
+      WIRE-1 检查放宽为区间交集（fingerprint 留诊断 + 防忘 bump 的
+      per-version 指纹注册表单测）+ autumn-op upgrade-version。
+    - R2: manager_rpc + 54 处 etcd 值 prost 化（需拍板范围/切换方式）。
+    - R3: 数据面连接级 hello 协商 + FooReqV2 冻结纪律。
+    - upgrade_chaos.sh 双版本滚动 harness（依赖 R1+）。
 
 Current summary:
-  pre-fix 复现：D1 新客户端路由黑洞 + D2 PS 1→0 自杀 + 连锁假丢失。
-  coco P1 折入（ROUTABLE_STALE_TTL=15min 防非对称分区无限陈旧服务）。
-  post-fix etcd_chaos 全 PASS ×2（断电期数据面满速，650 ACK 零丢失，
-  D3 秒级恢复）；manager-HA (H1-H3) 回归 PASS 6369 ACK；manager 150
-  单测。已 commit+push。
-
+  R0 已 commit。设计文档状态行更新为 "R0 已实现"。
 Main gaps:
-  - 见 Not implemented。
+  - R1 未动工时本文件状态为 not_completed；R1 完成后更新。
 Next steps:
-  - F227 已闭环认证（用户选定方向；23/23 seed 零 wedge → RESOLVED）。
-    剩余需用户决策：rolling upgrade 完整线协议策略 / 安全鉴权（两者
-    均宜设计文档先行）。
+  - R1 实现（见上）；完成后停下来向用户汇报 R2 决策点（§9.1 范围、
+    §9.2 切换方式）再继续。
