@@ -47,6 +47,12 @@ cleanup_all() {
 # ── setup: small fs for EN1 ──────────────────────────────────────────────────
 say "cleaning + mounting 512MB loopback fs at $MNT"
 cleanup_all
+say "draining cluster ports"
+for i in $(seq 1 40); do
+    busy=$(ss -tan 2>/dev/null | grep -cE ':(9001|9301|9351|2000[0-9]) ') || true
+    [ "${busy:-0}" = "0" ] && break
+    sleep 2
+done
 rm -rf "$DATA_ROOT" /tmp/autumn-rs
 mkdir -p "$MNT"
 dd if=/dev/zero of="$IMG" bs=1M count=512 status=none || { echo "dd failed"; exit 1; }

@@ -33,5 +33,7 @@ Current summary:
 Main gaps:
   - 见 Not implemented。
 Next steps:
-  - 认证 soak（tcp 15 轮 + ucx 10 轮 + etcd cluster ×2）收口当日 6 批
-    变更；其后自治面基本扫尽，剩余项待用户决策。
+  - 无（loop 自治面扫尽）。soak 收口完成：tcp 15 轮 + ucx 10 轮 +
+    etcd cluster + enospc 全部零丢失（E7 自供给 + 阶段间端口排水两个
+    harness 根修折入）。剩余生产项均需用户决策：rolling upgrade 线协
+    议策略 / F227（用户持有）/ generation manifest / 安全鉴权。

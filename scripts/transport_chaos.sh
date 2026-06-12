@@ -414,6 +414,18 @@ write_liveness "e6"
 # original 4 — adapt: need >= 2; the a-* keys live in the upper-middle
 # band, approximated by the 2/3 index in id (= key) order.
 mapfile -t E7PARTS < <("${AOC[@]}" info 2>/dev/null | sed -n 's/^  part \([0-9]*\):.*/\1/p' | sort -n)
+# High CHAOS_ROUNDS E6 runs can merge the cluster down to a single
+# partition — SELF-PROVISION by splitting it back instead of failing a
+# precondition (15-round tcp soak hit exactly this).
+if [ "${#E7PARTS[@]}" -eq 1 ]; then
+    say "E7: only 1 partition left after E6 merges — splitting ${E7PARTS[0]} to provision"
+    "${AOC[@]}" split "${E7PARTS[0]}" >/dev/null 2>&1
+    for i in $(seq 1 20); do
+        mapfile -t E7PARTS < <("${AOC[@]}" info 2>/dev/null | sed -n 's/^  part \([0-9]*\):.*/\1/p' | sort -n)
+        [ "${#E7PARTS[@]}" -ge 2 ] && break
+        sleep 2
+    done
+fi
 if [ "${#E7PARTS[@]}" -lt 2 ]; then
     fail "E7: could not enumerate >=2 partitions (got ${#E7PARTS[@]})"
 else

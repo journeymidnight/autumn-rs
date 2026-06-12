@@ -43,6 +43,15 @@ export AUTUMN_DATA_ROOT="${AUTUMN_DATA_ROOT:-/data05/autumn-rs}"
 say "cleaning + starting cluster"
 for pid in $(ps -eo pid,comm | awk '$2 ~ /^(autumn-|etcd)/ {print $1}'); do kill -9 "$pid" 2>/dev/null; done
 sleep 2
+# Port drain: a prior (esp. ucx) cluster leaves 9001/PS ports in
+# TIME_WAIT for ~60s; the tcp manager exits on EADDRINUSE (only the ucx
+# listener retries, F264) — back-to-back harness phases need the wait.
+say "draining cluster ports"
+for i in $(seq 1 40); do
+    busy=$(ss -tan 2>/dev/null | grep -cE ':(9001|9301|9351|2000[0-9]) ') || true
+    [ "${busy:-0}" = "0" ] && break
+    sleep 2
+done
 rm -rf "$AUTUMN_DATA_ROOT" /tmp/autumn-rs
 ETCD_N=1
 [ "$MODE" = "cluster" ] && ETCD_N=3

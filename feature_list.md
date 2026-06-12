@@ -519,3 +519,16 @@ gaps in the lease protocol's correctness story.
   员重启即恢复 quorum）；614 ACK 零丢失。single 模式回归 PASS
   （556 ACK 零丢失）。
 - **passes:** completed (2026-06-12)
+
+---
+
+### SOAK-2 · 当日 6 批变更认证 soak + 3 个 harness 根修（2026-06-12）
+- **soak 结果:** transport tcp 15 轮 + ucx 10 轮（全部故障事件 PASS，唯
+  一失败 = E7 前置条件 artifact）；修后复跑 etcd cluster（614 ACK）+
+  enospc（135 ACK）+ tcp 8 轮全 PASS，零丢失。
+- **harness 根修 ×3:** ① E7 自供给——高 CHAOS_ROUNDS 的 E6 merge 可把
+  集群并到 1 个分区，E7 现在先 split 自建前置而非 fail；② etcd_chaos /
+  enospc_chaos 补端口排水——ucx→tcp 相邻阶段在 9001 TIME_WAIT 内启动
+  时 tcp manager 直接 EADDRINUSE 退出（只有 ucx listener 会重试，
+  F264）；③（ETCD-2 已含）stop 路径 etcd*.pid 清理。
+- **passes:** completed (2026-06-12)
