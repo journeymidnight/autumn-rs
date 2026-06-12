@@ -270,3 +270,12 @@ gaps in the lease protocol's correctness story.
 - **验收: 首跑全 PASS** —— F1 迁移后文件 I/O 12s 恢复、F2 11s、F3 重
   挂即恢复；83 个 synced 文件三轮故障后 sha256 全部完好，零损坏。
 - **passes:** completed (2026-06-12)
+
+---
+
+### F274 · chaos 迭代 15：过夜 90 轮 soak 认证（2026-06-12）
+- **目标:** 四层覆盖全绿后的最终耐久认证。seed=99 混合 soak（kill ×
+  split/merge 交错）：tcp 60 轮 + ucx 30 轮连跑（~2.5h，深夜空闲机）。
+- **验收: 双双全 PASS** —— tcp 8671 ACK + ucx 1363 ACK 全部完好，90
+  轮随机故障零丢失零 wedge。
+- **passes:** completed (2026-06-12)
