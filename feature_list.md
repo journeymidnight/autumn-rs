@@ -606,3 +606,22 @@ gaps in the lease protocol's correctness story.
   每次挂载执行（Ok(0) 路径全 harness 实测），机制由不变量+单测+T3 流
   程覆盖。
 - **passes:** completed (2026-06-12)
+
+---
+
+### F227-CLOSE · F227 open-tail write-wedge 家族闭环认证（2026-06-12）
+- **背景:** 用户选定方向。该家族 = 开放尾部 extent 某副本永久不可达时
+  `current_commit`（全副本探测）永远失败 → 写入/flush 永久卡死（不丢
+  数据但分区写冻结）。历史 seed=15 稳定触发、seed=13 多模式（1/10 通
+  过率时代）。
+- **复现尝试（reproduce-first）:** 当前 HEAD（0e1eb4f）上 seed=15 ×3 +
+  全量 20-seed 严酷扫描（1-20，含历史热点 8/13/15）= **23/23 全 PASS
+  零 wedge**——不再复现。
+- **判定:** 已被既有修复组合关闭——F270 时代的 ① `ensure_tail_
+  initialised` BUG#1 逃生通道（current_commit 持续失败 → `alloc_new_
+  extent(stream_id, None)` 走 manager seal-over-reachable 收口换尾；
+  禁传 Some(0)）+ ② manager note 31（卡死 recovery 标记不再阻塞已
+  seal 尾上的 alloc），再叠加本日战役的 deferred-ack/fence/ENOSPC 修复。
+  **seal-lenient 原则（manager note 28）维持为法律**：append 全副本
+  ACK 是安全性来源，seal 对可达副本取 min 永不切已 ACK 数据。
+- **passes:** completed (2026-06-12) — 状态由 OPEN → RESOLVED-certified

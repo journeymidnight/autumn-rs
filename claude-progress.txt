@@ -34,7 +34,6 @@ Current summary:
 Main gaps:
   - 见 Not implemented。
 Next steps:
-  - 无：自治生产面 9 批全部闭环。UNLINK-1 顺带揪出 2 个无条件 bug
-    （rename-over 泄漏全部 extents；same-file rename 自毁文件）。剩余
-    全部需用户决策：rolling upgrade 完整线协议策略 / F227（用户持有）
-    / generation manifest 全量 / 安全鉴权。
+  - F227 已闭环认证（用户选定方向；23/23 seed 零 wedge → RESOLVED）。
+    剩余需用户决策：rolling upgrade 完整线协议策略 / 安全鉴权（两者
+    均宜设计文档先行）。
