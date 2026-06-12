@@ -29,13 +29,15 @@ Task scope: /loop 生产视角急修 · 批次 4 = LEASE8-LITE（fuse truncate �
       （结构性不可达）。
 
 Current summary:
-  fuse_chaos ×2 全 PASS；fuse/ps/stream 单测绿；最终 coco 轮结果待折入
-  后 commit+push。生产急修清单（用户批准的 P0 durability → observability
-  → ENOSPC → BUG-LEASE-8 顺序）即将全部闭环。
+  coco 终轮 1P0+2P1+1P2+1P3 全采纳折入（P0=write buffer size 提前抬升
+  抹掉 pre-grow EOF → write() 入口 sweep）。LEASE8-LITE 已 commit+push
+  （75ff306）。生产急修战役四项全闭环：P0-D（2334304）→ OBS-1
+  （25d323d）→ ENOSPC-1（4b10922）→ LEASE8-LITE（75ff306），合计修复
+  6 个真实 acked-data/读损坏级 bug。
 
 Main gaps:
   - 见 Not implemented。
 Next steps:
-  - coco 终轮折入 → commit+push。生产清单四项全闭后向用户汇报并征询
-    loop 是否继续（剩余项均需用户决策：rolling upgrade 策略 / F227 /
-    generation manifest）。
+  - 无（loop 结束）。剩余生产项均需用户决策：rolling upgrade 线协议
+    兼容策略 / F227 recovery-stuck（用户持有）/ BUG-LEASE-8 完整
+    generation manifest。
