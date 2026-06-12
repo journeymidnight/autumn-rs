@@ -17,8 +17,16 @@
 #       control-plane ops (autumn-op info / partition ops) resume.
 # Final: every ACKed key reads back byte-exact (zero loss).
 #
-# Usage: AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/etcd_chaos.sh
+# Cluster mode (./scripts/etcd_chaos.sh cluster): 3-member etcd; adds
+#   D0: kill ONE member → the manager's lease keepalive must fail over
+#       (autumn-etcd reconnect_shared round-robin) with NO step-down —
+#       control plane stays fully available, not just the data plane.
+# D1-D3 then kill/restart the REMAINING members (full outage as before).
+#
+# Usage: AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/etcd_chaos.sh [cluster]
 set -u
+
+MODE="${1:-single}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -36,10 +44,13 @@ say "cleaning + starting cluster"
 for pid in $(ps -eo pid,comm | awk '$2 ~ /^(autumn-|etcd)/ {print $1}'); do kill -9 "$pid" 2>/dev/null; done
 sleep 2
 rm -rf "$AUTUMN_DATA_ROOT" /tmp/autumn-rs
+ETCD_N=1
+[ "$MODE" = "cluster" ] && ETCD_N=3
 env AUTUMN_EXTENT_BASE_PORT=20000 \
     AUTUMN_BOOTSTRAP_PRESPLIT="4:hexstring" \
     AUTUMN_TRANSPORT=tcp \
     AUTUMN_METRICS=1 \
+    AUTUMN_ETCD_CLUSTER="$ETCD_N" \
     bash "$ROOT/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
 grep -q "bootstrap succeeded" "$WORK/cluster.log" \
     || { echo "cluster start failed"; tail -10 "$WORK/cluster.log"; exit 1; }
@@ -72,12 +83,32 @@ wait_progress() { # writes must advance by >3 within 60s
 sleep 5
 wait_progress "baseline"
 
-# ── D1: kill etcd → data plane must keep serving ───────────────────────────
-EPID=$(pgrep -x etcd | head -1)
-ECMD=$(tr '\0' ' ' < "/proc/$EPID/cmdline")
-ECWD=$(readlink "/proc/$EPID/cwd")
-say "D1: kill -9 etcd pid=$EPID (cwd=$ECWD)"
-kill -9 "$EPID"
+# ── D0 (cluster mode): kill ONE member → NO manager step-down ───────────────
+mgr_leader() { curl -s --max-time 3 http://127.0.0.1:9591/metrics 2>/dev/null | grep "^autumn_manager_leader" | awk '{print $NF}'; }
+if [ "$MODE" = "cluster" ]; then
+    M0=$(pgrep -af "etcd --name etcd0" | head -1 | awk '{print $1}')
+    say "D0: kill -9 etcd member 0 pid=$M0 (2 of 3 remain — quorum holds)"
+    [ -n "$M0" ] && kill -9 "$M0"
+    sleep 15   # > lease TTL: a failed keepalive failover would step down by now
+    L=$(mgr_leader)
+    if [ "${L:-0}" = "1" ]; then
+        say "D0: manager kept leadership through the member kill"
+    else
+        fail "D0: manager lost leadership (leader=$L) — endpoint failover did not engage"
+    fi
+    wait_progress "after-member-kill"
+    "${AO[@]}" info >/dev/null 2>&1 && say "D0: control plane fully available"         || fail "D0: control plane unavailable with 2/3 etcd members"
+fi
+
+# ── D1: kill (all remaining) etcd → data plane must keep serving ───────────
+declare -a EPIDS=() ECMDS=() ECWDS=()
+for pid in $(pgrep -x etcd); do
+    EPIDS+=("$pid")
+    ECMDS+=("$(tr '\0' ' ' < "/proc/$pid/cmdline")")
+    ECWDS+=("$(readlink "/proc/$pid/cwd")")
+done
+say "D1: kill -9 etcd (${#EPIDS[@]} member(s))"
+for pid in "${EPIDS[@]}"; do kill -9 "$pid"; done
 sleep 12   # past the 10s lease TTL — manager steps down
 wait_progress "during-etcd-outage"
 
@@ -94,8 +125,10 @@ fi
 wait_progress "late-outage"
 
 # ── D3: restart etcd → manager re-elects, control plane resumes ────────────
-say "D3: restarting etcd (same data dir)"
-( cd "$ECWD" && setsid nohup $ECMD > "$WORK/etcd_respawn.log" 2>&1 < /dev/null & )
+say "D3: restarting etcd (same data dir(s), ${#EPIDS[@]} member(s))"
+for i in "${!EPIDS[@]}"; do
+    ( cd "${ECWDS[$i]}" && setsid nohup ${ECMDS[$i]} > "$WORK/etcd_respawn_$i.log" 2>&1 < /dev/null & )
+done
 recovered=0
 deadline=$((SECONDS + 120))
 while [ $SECONDS -lt $deadline ]; do

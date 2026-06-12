@@ -592,13 +592,49 @@ do_start() {
     # Create data dirs for etcd and ps; node dirs are created per-node below.
     mkdir -p "$DATA_ROOT/etcd" "$DATA_ROOT/ps"
 
-    # etcd
-    start_proc etcd \
-        etcd \
-        --data-dir "$ETCD_DIR" \
-        --listen-client-urls http://127.0.0.1:2379 \
-        --advertise-client-urls http://127.0.0.1:2379
-    wait_port 2379 etcd 20 127.0.0.1
+    # etcd — AUTUMN_ETCD_CLUSTER=N (default 1) starts an N-member etcd
+    # cluster on client ports 2379/2389/2399... (peer ports +1). The
+    # manager gets the full endpoint list; autumn-etcd's reconnect_shared
+    # round-robins across members on failure (validated by
+    # scripts/etcd_chaos.sh D0 member-kill).
+    local etcd_n="${AUTUMN_ETCD_CLUSTER:-1}"
+    [[ "$etcd_n" =~ ^[0-9]+$ ]] && (( etcd_n >= 1 )) || die "AUTUMN_ETCD_CLUSTER must be a positive integer"
+    ETCD_ENDPOINTS=""
+    if (( etcd_n == 1 )); then
+        start_proc etcd \
+            etcd \
+            --data-dir "$ETCD_DIR" \
+            --listen-client-urls http://127.0.0.1:2379 \
+            --advertise-client-urls http://127.0.0.1:2379
+        wait_port 2379 etcd 20 127.0.0.1
+        ETCD_ENDPOINTS="127.0.0.1:2379"
+    else
+        local ic="" m cport pport
+        for (( m=0; m<etcd_n; m++ )); do
+            pport=$(( 2380 + m * 10 ))
+            ic+="${ic:+,}etcd$m=http://127.0.0.1:$pport"
+        done
+        for (( m=0; m<etcd_n; m++ )); do
+            cport=$(( 2379 + m * 10 ))
+            pport=$(( 2380 + m * 10 ))
+            mkdir -p "$ETCD_DIR-$m"
+            start_proc "etcd$m" \
+                etcd \
+                --name "etcd$m" \
+                --data-dir "$ETCD_DIR-$m" \
+                --listen-client-urls "http://127.0.0.1:$cport" \
+                --advertise-client-urls "http://127.0.0.1:$cport" \
+                --listen-peer-urls "http://127.0.0.1:$pport" \
+                --initial-advertise-peer-urls "http://127.0.0.1:$pport" \
+                --initial-cluster "$ic" \
+                --initial-cluster-state new
+            ETCD_ENDPOINTS+="${ETCD_ENDPOINTS:+,}127.0.0.1:$cport"
+        done
+        for (( m=0; m<etcd_n; m++ )); do
+            wait_port $(( 2379 + m * 10 )) "etcd$m" 30 127.0.0.1
+        done
+        echo "[cluster] etcd cluster: $etcd_n members ($ETCD_ENDPOINTS)"
+    fi
 
     # Clean etcd data on fresh start (no bootstrap marker = fresh cluster)
     local bootstrap_marker="$DATA_ROOT/bootstrapped"
@@ -627,7 +663,7 @@ do_start() {
         mgr_extra="$mgr_extra --min-alloc-free-bytes $AUTUMN_MGR_MIN_ALLOC_FREE_BYTES"
     fi
     start_proc manager \
-        "$MANAGER" --port 9001 --etcd 127.0.0.1:2379 --listen "$BIND_HOST" \
+        "$MANAGER" --port 9001 --etcd "$ETCD_ENDPOINTS" --listen "$BIND_HOST" \
         --transport "$TRANSPORT" $mgr_extra
     wait_port 9001 manager
 
@@ -886,6 +922,14 @@ do_stop() {
     done
     kill_proc manager
     kill_proc etcd
+    # Multi-member etcd (AUTUMN_ETCD_CLUSTER>1): etcd0.pid, etcd1.pid, ...
+    # (coco P2: the node*.pid loop above doesn't match them, and the
+    # pkill net below only covers autumn-rs data-dir paths).
+    for pf in "$DATA_ROOT"/pids/etcd*.pid; do
+        [[ -f "$pf" ]] || continue
+        local name; name="$(basename "$pf" .pid)"
+        kill_proc "$name"
+    done
     # Safety net: kill by binary name if pid files were missing (e.g. switching
     # between --shm and disk mode changes DATA_ROOT, so the old pids dir is
     # invisible to kill_proc).
@@ -894,7 +938,7 @@ do_stop() {
     pkill -9 -f "$BIN/autumn-ps " 2>/dev/null || true
     # Match stray etcd only when its --data-dir is inside an autumn-rs tree.
     # Avoids killing unrelated etcd instances on the host.
-    pkill -9 -f 'etcd --data-dir [^ ]*autumn-rs' 2>/dev/null || true
+    pkill -9 -f 'etcd .*--data-dir [^ ]*autumn-rs' 2>/dev/null || true
     echo "[cluster] all processes stopped"
 }
 

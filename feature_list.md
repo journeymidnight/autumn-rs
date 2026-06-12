@@ -500,3 +500,22 @@ gaps in the lease protocol's correctness story.
   manager-HA chaos (H1-H3) 回归 PASS 6369 ACK（H3 门控未回退）；
   manager 150 单测绿。
 - **passes:** completed (2026-06-12)
+
+---
+
+### ETCD-2 · 生产急修批次 6：etcd 多副本部署 + 成员级故障验证（2026-06-12）
+- **目标:** autumn-etcd 客户端早有多 endpoint 轮转重连
+  （reconnect_shared round-robin）但部署面只起单 etcd——生产 3 副本
+  etcd 集群从未被接线或验证过 failover 真的生效。
+- **交付:** ① cluster.sh `AUTUMN_ETCD_CLUSTER=N`（默认 1）——N 成员
+  etcd 集群（client 2379/2389/2399…，peer +1），manager 拿全 endpoint
+  列表；stop 路径补 etcd*.pid 清理（coco P2 采纳：node*.pid 循环不匹
+  配多成员，pkill 兜底只覆盖 autumn-rs 路径）。② etcd_chaos.sh
+  `cluster` 模式 + D0 事件：杀 1/3 成员 → manager 须**保持 leader**
+  （lease keepalive 经 reconnect 续期，metrics 断言 leader=1）+ 控制
+  面全可用；D1-D3 随后杀余下成员走全断电退化路径。
+- **验收:** cluster 模式首跑全 PASS——D0 成员杀后 manager 保持
+  leadership、写持续推进、autumn-op 正常；D1-D3 复用退化路径（2/3 成
+  员重启即恢复 quorum）；614 ACK 零丢失。single 模式回归 PASS
+  （556 ACK 零丢失）。
+- **passes:** completed (2026-06-12)
