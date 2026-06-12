@@ -76,7 +76,32 @@ AOC=(timeout 20 "$AO" --manager "$MGR" --transport "$T")
 CLI=(timeout 20 "$AC" --manager "$MGR" --transport "$T")
 CLIS=(timeout 90 "$AC" --manager "$MGR" --transport "$T")
 
+# Readiness gates — NEVER rely on fixed sleeps: under ucx the manager's
+# listener can spend ~90s in the F264 TIME_WAIT bind retry (cross-host
+# TIME_WAIT from a previous round on the same [::14]:9001). The first
+# ucx round was stillborn end-to-end because every stage marched past a
+# not-yet-listening manager (format/bootstrap/seeds all failed, ENs and
+# PS1 fail-fasted on registration).
+wait_mgr() {
+    local tag="$1" deadline=$((SECONDS + 180))
+    while [ $SECONDS -lt $deadline ]; do
+        if [ -n "$("${AOC[@]}" info 2>/dev/null)" ]; then say "[$tag] manager ready"; return 0; fi
+        sleep 2
+    done
+    fail "[$tag] manager not ready within 180s"; return 1
+}
+wait_nodes() { # wait_nodes <count>
+    local want="$1" deadline=$((SECONDS + 120))
+    while [ $SECONDS -lt $deadline ]; do
+        n=$("${AOC[@]}" info 2>/dev/null | grep -c "^  node ") || n=0
+        [ "${n:-0}" -ge "$want" ] && { say "$n nodes registered"; return 0; }
+        sleep 2
+    done
+    fail "only ${n:-0}/$want nodes registered within 120s"; return 1
+}
+
 # ── format + start ENs: 2 local + 1 remote ──────────────────────────────────
+wait_mgr "boot"
 say "formatting + starting ENs (2 local + 1 remote)"
 "${AOC[@]}" format --listen "[$LIP]:21001" --advertise "[$LIP]:21001" "$LDATA/d1" >/dev/null 2>&1 || fail "format local d1"
 "${AOC[@]}" format --listen "[$LIP]:21002" --advertise "[$LIP]:21002" "$LDATA/d2" >/dev/null 2>&1 || fail "format local d2"
@@ -99,6 +124,7 @@ start_remote_en
 sleep 5
 
 # ── bootstrap (replication 3 over 3 ENs) + PSes ─────────────────────────────
+wait_nodes 3
 say "bootstrap + starting PS1 (local) / PS2 (remote)"
 "${AOC[@]}" bootstrap --replication 3+0 --presplit 4:hexstring >/dev/null 2>&1 || fail "bootstrap"
 setsid nohup "$ROOT/target/release/autumn-ps" --psid 1 --port 9301 --manager "$MGR" \
@@ -231,7 +257,7 @@ kill -9 "$MGR_PID"
 sleep 6
 say "X4: respawn manager"
 setsid nohup $MGR_CMD > "$WORK/mgr_respawn.log" 2>&1 < /dev/null &
-wait_mgr_ready "X4"
+wait_mgr "X4"
 verify_seeds "after-mgr-kill-restart"
 write_liveness "x4"
 

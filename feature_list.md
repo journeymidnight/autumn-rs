@@ -245,14 +245,16 @@ gaps in the lease protocol's correctness story.
 - **tcp 轮: 全 PASS** —— X2 跨主机迁移 12s、X3 failback 19s、X4 恢复
   3s，734 ACK 写 0 丢失。两个 harness 坑已修：ssh 启动远端 daemon 会
   挂住通道（本地后台化）；首跑 25 min 卡死即此。
-- **ucx 轮: 多处异常（更正：非仅 X4）**。① X2 的 `kill PS1 pid=` 为
-  空——pgrep 模式在 ucx 轮没匹配到本地 PS1，PS1 未被杀，"migrated" 判
-  定 1s 内通过疑为假阳性；② x2/x3 写活性均 wedge（45×2s 超时）；③ X4
-  respawn 后 manager 卡 "retrying election" 无下文 + probe 显示 etcd
-  revision=7 与 bootstrap 写入矛盾；④ 原 manager UCX bind 曾在跨网
-  TIME_WAIT 上重试 ~90s（F264 预算内）。seed 校验各阶段反而全 OK——
-  读路径活、写路径死，方向指向 ucx 下 PS/manager 标识与探针的多重
-  harness 失配 + 可能的真 bug 混叠。证据 docs/f272/。
-  下一步：脚本各阶段加 etcd revision/pgrep 命中/instance-id 探针后
-  复现，先把 harness 失配剥离再判断产品 bug。
-- **passes:** not_completed（ucx X4 待复现+修复）
+- **ucx 首轮异常已全部定性为 harness 时序（验尸闭环）:** manager 的
+  UCX listener 在跨网 TIME_WAIT（前一 tcp 轮同端口）上按 F264 设计重
+  试 ~90s，而脚本各阶段是固定 sleep——format/bootstrap/全部 seed 打到
+  未监听的 manager 上连环 FAIL，EN/PS1 注册 fail-fast 退出，X2 假阳
+  性、X4 后 manager 当选于"空 etcd"（revision=7 = 只有 cluster_id
+  imprint）全部由此派生。**无产品 bug。**
+- **修复（harness）:** 阶段就绪门取代固定 sleep——`wait_mgr`（180s，
+  盖过 ucx bind 重试预算）+ `wait_nodes 3`（bootstrap 前节点注册门）。
+- **最终认证（带门双轨）:** ucx 全 PASS（X1-X4，跨主机迁移 12s/
+  failback 21s，320 ACK 0 丢失）；tcp 复跑全 PASS（768 ACK 0 丢失）。
+  运维注记：EN/PS 启动期对未监听 manager fail-fast 属设计内
+  （supervisor 重启吸收），编排側必须设 readiness 门。
+- **passes:** completed (2026-06-12)

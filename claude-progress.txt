@@ -1,6 +1,6 @@
 Date: 2026-06-12
-TaskStatus: not_completed
-Task scope: F271 completed + F272 跨主机 chaos in progress — /loop chaos 迭代 5：multi-manager HA chaos
+TaskStatus: completed
+Task scope: F272 跨主机 chaos completed — /loop chaos 迭代 5：multi-manager HA chaos
   （manager_ha_chaos.sh H1 leader kill / H2 仅新 leader 时 PS kill /
   H3 老 leader 回归 follower），发现并修复 4 个真实 bug。
 
@@ -63,10 +63,9 @@ F270 残留窄尾已破并闭合：PartitionHandle.part_addr 存计算地址，
   4 轮 PASS 0 丢失。F270 completed。
 F271 (迭代 11): 20-seed K4/M2 严酷扫描 20/20 全 PASS（含历史 seed
   8/13/15）。本机 chaos 面饱和。
-F272 (迭代 12): crosshost_chaos.sh 落地。tcp 全 PASS（X2 跨主机迁移
-  12s/X3 failback 19s，734 ACK 0 丢失）。ucx X1-X3 PASS、X4 manager
-  重启后全读失败——manager 卡 retrying election + etcd revision=7 矛盾
-  （docs/f272/ 留证）。
+F272 (迭代 12-13): crosshost_chaos.sh 落地并双轨认证。ucx 首轮异常
+  验尸定性=harness 固定 sleep vs manager ucx ~90s TIME_WAIT bind 重
+  试（无产品 bug）；加 wait_mgr/wait_nodes 就绪门后 ucx 全 PASS
+  （320 ACK 0 丢失）+ tcp 复跑全 PASS（768 ACK 0 丢失）。
 Next steps:
-  - F272 ucx X4: 复现 + 在脚本各阶段加 etcd revision/instance-id 探
-    针定位 etcd 状态错位。
+  - 无（跨主机双轨闭环）。
