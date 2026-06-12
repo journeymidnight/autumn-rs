@@ -529,3 +529,69 @@ I/O Ring, copy_file_range, fallocate
 | `crates/client/src/lib.rs` | ClusterClient — 所有 KV 操作入口 |
 | `crates/rpc/src/partition_rpc.rs` | PutReq/GetReq/RangeReq/DeleteReq |
 | `crates/rpc/src/server.rs` | Dispatcher 模式参考（bridge 设计） |
+
+## Crash-consistency contract (BUG-LEASE-8, 2026-06-12)
+
+The fuse layer has NO multi-key atomic commit (the full fix — a per-inode
+generation manifest — stays deferred in feature_list BUG-LEASE-8). What IS
+guaranteed is a strict ordering discipline so that a crash anywhere never
+FABRICATES data; it can only lose a recent un-fsynced write:
+
+- **Grow / write path**: extent KV puts are all-replica ACKed
+  (`write_region(..).await?`) BEFORE the inode-meta size advances and is
+  persisted. Crash between ⇒ durable size is SHORT of the written extents:
+  the file just looks older (POSIX-acceptable for un-fsynced data). The
+  beyond-size extent KVs are benign orphans: invisible to reads (bounded
+  by size), overwritten by a regrowing append (same `[0x03][ino][off]`
+  keys), and reaped by unlink / truncate (both PREFIX-scan, not
+  size-bounded).
+- **Shrink / truncate path (the fixed bug)**: the inode-meta put is the
+  COMMIT POINT — it lands BEFORE extents are deleted/shortened. Pre-fix
+  the order was inverted: a crash between extent destruction and the meta
+  put left durable size = old_size with the tail data already gone, so
+  reads returned ZEROS INSIDE the file — the one crash window in this
+  layer that fabricated data. Invariant: **content[0..size] always equals
+  what was last successfully written there; a crash may only choose WHICH
+  size (old or new) survives.** Covered by `scripts/fuse_chaos.sh` T1
+  (truncate burst + kill -9 mid-burst + remount + prefix-exact verify).
+- **Leftover reaping on GROW (coco P1)**: with meta-first shrink, a crash
+  in the post-commit cleanup window leaves extents beyond the durable
+  size. They are invisible while size stays put, but a later GROW would
+  re-expose them as resurrected old data where POSIX requires zeros.
+  `extent::clean_beyond_eof(ino, eof)` (raw prefix scan; deletes whole
+  keys ≥ eof, shortens the straddler by its ACTUAL KV value length)
+  runs on every grow path: `write::write` ENTRY when `offset > size`
+  (coco P0: the sweep must fire BEFORE the in-memory size bump — the
+  bump erases the pre-grow EOF, so by flush time `write_region` sees
+  the grown size and a stale straddler tail looks like legitimate
+  in-file data whose RMW would merge the write into pre-shrink bytes),
+  `write::truncate` grow branch (before the meta put), and
+  `write_region` entry as defense (leftover keys visible in the prefix
+  scan / sparse grow vs the passed file_size). Contiguous appends
+  self-bound (the new key at old-EOF caps the straddler's inferred
+  length) — the hot path pays one size compare. The sweep is a
+  pre-grow BARRIER: a hard kv error on the straddler read PROPAGATES
+  (aborts the grow) — only a genuinely absent key may be skipped
+  (`kv_get_opt`, coco P1).
+- **Post-commit cleanup errors do NOT fail the truncate** (coco P1): the
+  shrink is committed once the meta lands; surfacing a cleanup error
+  would make the caller retry into the `new_size == old_size` early
+  return (a no-op that never re-cleans). WARN + invalidate instead;
+  leftovers are reaped by the next grow/unlink.
+- **Known deferred gap**: crash mid-unlink (dirent deleted, extent
+  prefix-scan deletion partial) orphans unreachable extent KVs — needs the
+  generation-manifest / tombstone GC from the architectural entry. Rare
+  (requires a crash inside the unlink window) and bounded (space only,
+  never wrong data).
+- **Read-path bug found by the T2 harness check (fixed in
+  partition-server)**: a sub-range GET fully past a VP value's end
+  clamped to a zero-length read, and `read_value_from_log`'s pooled
+  fast path returned the recycled RegPool buffer's STALE contents as
+  the value — fuse reads of a shortened/sparse extent window got
+  varying garbage instead of zeros. Now short-circuits to empty
+  (`crates/partition-server/src/background.rs::read_value_from_log`).
+  Caller-side counterpart (coco P1): the ioring daemon's `read_into`
+  zeroes the unwritten tail of every short/empty extent slice — its
+  dest is a REUSED ring buffer, not a fresh zeroed Vec (the fuse path
+  pre-zeros its whole buffer; ioring zeroed only the gaps BETWEEN
+  extents). `crates/ioring/src/fuse_read.rs`.

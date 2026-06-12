@@ -3025,6 +3025,17 @@ pub(crate) async fn read_value_from_log(
         };
         (vp.offset + off, len)
     };
+    // Sub-range fully past the value end (offset >= vp.len) clamps to a
+    // zero-length read — return empty EXPLICITLY. Pre-fix this fell
+    // through to `read_value_into_pooled(.., 0)`, whose pooled fast path
+    // handed back the recycled RegPool buffer's STALE contents as the
+    // value (`Bytes::from_owner(pb)` with a dirty buffer) — fuse reads of
+    // a shortened/sparse extent window returned VARYING GARBAGE instead
+    // of zeros (caught by fuse_chaos T2: shrink→grow read non-zero,
+    // non-source bytes that changed between reads).
+    if read_len == 0 {
+        return Ok(Bytes::new());
+    }
     // F216-E R3/R4: zero-copy fast path — recv the value straight into a
     // registered RegPool buffer over UCX (MSG_READ_BYTES_ZC) and hand it onward
     // as a Bytes ALIASING that buffer (from_owner; pb returns to the pool when

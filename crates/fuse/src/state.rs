@@ -144,6 +144,14 @@ impl FsState {
         }
     }
 
+    /// Like `kv_get` but distinguishes "key absent" (Ok(None)) from a
+    /// hard RPC/routing/storage error (Err). Barrier-style callers
+    /// (`clean_beyond_eof`) MUST NOT treat a transient failure as
+    /// "already cleaned" (coco P1).
+    pub async fn kv_get_opt(&mut self, k: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.client.get(k).await.map_err(|e| anyhow!("KV get: {e}"))
+    }
+
     /// Get a sub-range of a value from the KV store.
     pub async fn kv_get_range(&mut self, k: &[u8], offset: u32, length: u32) -> Result<Vec<u8>> {
         match self

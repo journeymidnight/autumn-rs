@@ -354,6 +354,25 @@ pub async fn read_into(
             return Err(anyhow!("extent read failed: {e}"));
         }
     }
+    // Short/empty extent reads (a shortened straddler after a truncate, a
+    // sparse over-estimated inferred length, a missing key) leave the tail
+    // of their dest slice UNWRITTEN — and this dest is a reused ring
+    // buffer, not a fresh zeroed Vec (coco P1: the fuse path pre-zeros its
+    // whole buffer; this path zeros only the gaps BETWEEN extents).
+    // Zero-fill whatever the server didn't write so sparse reads are
+    // zeros, never recycled ring contents.
+    for (sl, r) in slices.iter().zip(&results) {
+        let written = match r {
+            Ok(Some(n)) => (*n).min(sl.length as usize),
+            Ok(None) => 0,
+            Err(_) => unreachable!("checked above"),
+        };
+        if written < sl.length as usize {
+            let a = sl.dest_offset + written;
+            let b = sl.dest_offset + sl.length as usize;
+            dest[a..b].fill(0);
+        }
+    }
     Ok(actual)
 }
 

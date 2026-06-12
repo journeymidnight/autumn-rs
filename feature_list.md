@@ -413,3 +413,50 @@ gaps in the lease protocol's correctness story.
   transport_chaos tcp 全 PASS。文档：stream CLAUDE.md note 25a（含两
   P1）、manager note 37、README "Disk-full (ENOSPC) behavior" 节。
 - **passes:** completed (2026-06-12)
+
+---
+
+### LEASE8-LITE · 生产急修批次 4：fuse truncate 崩溃一致性 + 两个连带真 bug（2026-06-12）
+- **目标:** `/loop 生产视角` 第四项 = BUG-LEASE-8 的可自治子集（完整修复=
+  per-inode generation manifest，维持 deferred）。盘点结论：grow 路径
+  本就安全（extent 全 ACK 后才 put meta——Explore agent 的"CRITICAL"判
+  断经查证为误报），孤儿 extent 自愈（prefix-scan 删除 + 同 key 重写）；
+  真正的窗口在 **truncate-shrink**：先毁 extent 后 put meta，中间 crash
+  → durable size=旧值但尾部数据已毁 → 读出**文件内零**（本层唯一"伪造
+  数据"的窗口）。
+- **修复:** shrink 改 meta-first（meta put = 提交点，extent 清理后置）。
+  不变量：**content[0..size] 恒等于最后成功写入的内容；crash 只能选择
+  哪个 size 存活**。coco（GPT-5.5）2P1 全采纳：① meta-first 的残留
+  extent 在后续 GROW（truncate-up/稀疏写）下会以旧数据复活（POSIX 要求
+  零）→ `clean_beyond_eof`（raw prefix 扫描删 ≥eof 整 key + 按**真实**
+  KV value 长度截 straddler）挂全部 grow 冷路径（truncate-grow 前置 +
+  write_region 入口检测 leftover key/稀疏 grow）；连续 append 自界定，
+  热路径零开销。② 提交后清理失败不再报错（调用方重试会落进 same-size
+  早退 no-op 永不补清）→ WARN+invalidate。
+- **T2 钓出第二个真 bug（读路径，partition-server）:** 完全越过 VP value
+  末尾的子区间 GET 被 clamp 成 0 长读，`read_value_from_log` 的 pooled
+  快路径把**回收的 RegPool 脏缓冲**整个当 value 返回——fuse 读
+  截短/稀疏 extent 窗口得到**逐次变化的垃圾**而非零（manual repro:
+  15744/1312/984 非零字节逐次不同；autumnfs 旁证 KV 本身干净）。修复：
+  read_len==0 显式短路返回空。
+- **harness（fuse_chaos.sh）:** T1 truncate 突发+kill -9+remount 前缀级
+  校验（40 文件）+窗口命中证据；T2 shrink→grow 零值校验（含 remount 区
+  分内核缓存）；coco 3 项采纳：burst timeout、kill 后 lazy umount、窗口
+  断言。两个 harness 真相：本机无 fusermount3——历史所有 umount 都是静默
+  no-op（守护进程在坏挂载上叠挂）→ unmount_all 循环 umount -l；
+  工作负载与 unmount 窗口竞态会把文件写进**裸目录**并记入 manifest →
+  fs-type 守卫 + T 阶段前停负载。
+- **coco 终轮（1P0+2P1+1P2+1P3，采纳全部）:** ① P0——write buffer 的
+  in-memory size 提前抬升会抹掉 pre-grow EOF：稀疏写经 buffer 后
+  write_region 只见增长后 size，残留 straddler 被当合法数据 RMW 合并
+  → 修为 `write::write` 入口在 size 抬升前 `offset > size` 即 sweep；
+  ② clean_beyond_eof 是 grow 屏障——straddler 读硬错误必须传播中止
+  grow（新增 kv_get_opt 区分 NotFound）；③ 读侧调用方契约——ioring
+  read_into 的 dest 是复用 ring buffer，空/短读 slice 未写尾部回填零
+  （fuse 路径预清零故安全）；④ T2 先断言 grow 后 size==1M（防 grow
+  失败被"空尾=全零"漏判）+ setup 显式查错；⑤ unmount_all 失败返回非零。
+- **验收:** fuse_chaos ×3 全 PASS（T1 40/40 前缀级精确、T2 全零+size
+  断言、76/77 文件 manifest 零损）；fuse 43 + ioring 68 + ps 162 +
+  stream 77 单测绿；seed=13 隔离 chaos ok 零丢失；workspace 0 error。
+  文档：fuse CLAUDE.md "Crash-consistency contract" 全节。
+- **passes:** completed (2026-06-12)

@@ -25,9 +25,24 @@ FAIL=0
 say()  { echo "[fuse $(date +%H:%M:%S)] $*"; }
 fail() { echo "[fuse $(date +%H:%M:%S)] FAIL: $*"; FAIL=1; }
 
+# fusermount3 is NOT installed on every host (its absence made all the
+# earlier umount calls silent no-ops and the daemon mounted OVER broken
+# layers). umount -l (lazy) as root handles disconnected fuse mounts;
+# loop because layers can stack.
+unmount_all() {
+    local i
+    for i in 1 2 3 4 5 6; do
+        grep -q " $MNT " /proc/mounts || return 0
+        umount -l "$MNT" 2>/dev/null
+        sleep 0.2
+    done
+    grep -q " $MNT " /proc/mounts && { fail "could not unmount $MNT"; return 1; }
+    return 0
+}
+
 export AUTUMN_DATA_ROOT="${AUTUMN_DATA_ROOT:-/data05/autumn-rs}"
 say "cleaning + starting cluster"
-fusermount3 -u "$MNT" 2>/dev/null
+unmount_all
 for pid in $(ps -eo pid,comm | awk '$2 ~ /^(autumn-|etcd)/ {print $1}'); do kill -9 "$pid" 2>/dev/null; done
 sleep 2
 say "draining cluster ports"
@@ -72,9 +87,14 @@ mount_fuse boot || exit 1
   while [ ! -f "$WORK/stop" ]; do
       sz=$(( (RANDOM % 63 + 1) * 4096 ))
       f="$MNT/chaos-$i.bin"
+      # The trailing fs-type check guards the fault windows where the
+      # mount is (re)cycling: a cp racing the unmount lands on the BARE
+      # mountpoint directory, "succeeds", and would be manifested as
+      # durable — then read as missing through the next mount.
       if head -c "$sz" /dev/urandom > "$WORK/tmpf" 2>/dev/null \
          && cp "$WORK/tmpf" "$f" 2>/dev/null \
-         && cmp -s "$WORK/tmpf" "$f" 2>/dev/null; then
+         && cmp -s "$WORK/tmpf" "$f" 2>/dev/null \
+         && [ "$(stat -f -c %T "$f" 2>/dev/null)" = "fuseblk" -o "$(stat -f -c %T "$f" 2>/dev/null)" = "fuse" ]; then
           echo "$(sha256sum < "$WORK/tmpf" | cut -d' ' -f1) chaos-$i.bin" >> "$WORK/manifest.txt"
       fi
       i=$((i+1)); sleep 0.2
@@ -150,19 +170,97 @@ FPID=$(pgrep -f "autumn-fuse --manager" | head -1)
 say "F3: kill -9 fuse daemon pid=$FPID + remount"
 [ -n "$FPID" ] && kill -9 "$FPID"
 sleep 2
-fusermount3 -u "$MNT" 2>/dev/null
+unmount_all
 mount_fuse remount
 file_liveness "f3"
 verify_manifest "after-fuse-remount"
 
-# ── stop + final verification ───────────────────────────────────────────────
+# ── stop the continuous workload BEFORE the T phases ───────────────────────
+# T1/T2 unmount + remount: a cp racing the unmount writes to the BARE
+# mountpoint directory, gets recorded in the manifest, and then reads as
+# missing through the next mount — a harness artifact, not data loss.
 touch "$WORK/stop"
 wait "$LOOP_PID" 2>/dev/null
+say "workload stopped: $(wc -l < "$WORK/manifest.txt") synced files"
+
+# ── T1: truncate-shrink crash consistency (BUG-LEASE-8 ordering) ───────────
+# Shrink is meta-first: the durable size commits BEFORE extents are
+# destroyed. A crash mid-truncate may leave the OLD or the NEW size, but
+# content[0..size] must ALWAYS equal the original prefix — the pre-fix
+# ordering could leave size=old with the tail extents already destroyed,
+# reading back zeros INSIDE the file.
+say "T1: truncate-shrink burst + fuse kill + remount"
+mkdir -p "$WORK/trunc_src"
+NT=40
+for i in $(seq 1 $NT); do
+    head -c 1048576 /dev/urandom > "$WORK/trunc_src/t-$i"
+    cp "$WORK/trunc_src/t-$i" "$MNT/trunc-$i.bin"
+done
+# timeout: a truncate blocked on the killed daemon must not hang the
+# harness (the burst shell may sit in an uninterruptible FUSE wait).
+( timeout 60 bash -c 'for i in $(seq 1 '"$NT"'); do truncate -s $(( (RANDOM % 800 + 8) * 1024 )) "'"$MNT"'/trunc-$i.bin" 2>/dev/null; done' ) &
+TR_PID=$!
+sleep 0.3   # land the kill mid-burst
+FPID=$(pgrep -f "autumn-fuse --manager" | head -1)
+say "T1: kill -9 fuse daemon pid=$FPID mid-truncate"
+[ -n "$FPID" ] && kill -9 "$FPID"
+wait "$TR_PID" 2>/dev/null
+# the daemon was killed — the mountpoint is broken until unmounted.
+unmount_all
+mount_fuse t1-remount
+t1_bad=0 t1_shrunk=0
+for i in $(seq 1 $NT); do
+    f="$MNT/trunc-$i.bin"
+    sz=$(timeout 30 stat -c%s "$f" 2>/dev/null) || { fail "T1: trunc-$i.bin missing"; t1_bad=$((t1_bad+1)); continue; }
+    [ "$sz" -lt 1048576 ] && t1_shrunk=$((t1_shrunk+1))
+    if ! cmp -s -n "$sz" "$f" "$WORK/trunc_src/t-$i"; then
+        fail "T1: trunc-$i.bin content[0..$sz] != original prefix (zeros inside file?)"
+        t1_bad=$((t1_bad+1))
+    fi
+done
+# window-hit evidence: some (not necessarily all) truncates must have
+# landed before the kill, else the phase silently tested nothing.
+[ "$t1_shrunk" -ge 1 ] || fail "T1: no file shrunk — kill landed before any truncate (window missed)"
+[ $t1_bad -eq 0 ] && say "T1: $NT files prefix-exact at their durable size ($t1_shrunk shrunk pre-kill)"
+
+# ── T2: shrink → grow must read ZEROS in the re-extended range ──────────────
+# (BUG-LEASE-8 coco P1: leftover extents from the shrink window must never
+# resurrect old data; clean_beyond_eof sweeps them on every grow path.)
+say "T2: shrink -> grow zeros check"
+t2_bad=0
+for i in 1 2 3; do
+    head -c 1048576 /dev/urandom > "$WORK/trunc_src/g-$i"
+    cp "$WORK/trunc_src/g-$i" "$MNT/grow-$i.bin" || fail "T2: setup cp g-$i"
+    truncate -s 262144 "$MNT/grow-$i.bin" || fail "T2: shrink g-$i"
+    truncate -s 1048576 "$MNT/grow-$i.bin" || fail "T2: grow g-$i"
+done
+# Re-mount before verifying: discriminates daemon/KV state from kernel
+# page-cache staleness (pages cached from the cp can outlive the
+# shrink+grow on the same mount).
+unmount_all
+mount_fuse t2-verify
+for i in 1 2 3; do
+    # size must have actually re-grown — a failed grow would make the
+    # zeros check below pass vacuously (empty tail).
+    gsz=$(stat -c%s "$MNT/grow-$i.bin" 2>/dev/null)
+    [ "$gsz" = "1048576" ] || { fail "T2: grow-$i.bin size=$gsz != 1048576 (grow did not commit)"; t2_bad=$((t2_bad+1)); continue; }
+    # [0,256K) = original prefix; [256K,1M) = zeros
+    if ! cmp -s -n 262144 "$MNT/grow-$i.bin" "$WORK/trunc_src/g-$i"; then
+        fail "T2: grow-$i.bin prefix corrupted"; t2_bad=$((t2_bad+1))
+    fi
+    if tail -c +262145 "$MNT/grow-$i.bin" | tr -d '\0' | grep -q .; then
+        fail "T2: grow-$i.bin re-extended range is NOT zeros (old data resurrected)"
+        t2_bad=$((t2_bad+1))
+    fi
+done
+[ $t2_bad -eq 0 ] && say "T2: all grow regions read zeros"
+
+# ── final verification ──────────────────────────────────────────────────────
 total=$(wc -l < "$WORK/manifest.txt")
-say "workload done: $total synced files; final verify"
+say "final verify ($total synced files)"
 verify_manifest "final"
 
-fusermount3 -u "$MNT" 2>/dev/null
+unmount_all
 for pid in $(ps -eo pid,comm | awk '$2 ~ /^(autumn-|etcd)/ {print $1}'); do kill -9 "$pid" 2>/dev/null; done
 if [ $FAIL -eq 0 ]; then say "PASS ($total files, work dir $WORK kept)"; else say "FAILED — logs in $WORK"; fi
 exit $FAIL

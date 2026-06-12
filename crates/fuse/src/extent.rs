@@ -152,6 +152,16 @@ pub async fn write_region(
         return Ok(());
     }
     let mut ext = extents_snapshot(state, ino, file_size).await?;
+    // BUG-LEASE-8 (coco P1): leftover extents from a crashed shrink must
+    // not merge into / resurface under this write. Cold post-crash path —
+    // whole-key leftovers are visible in the prefix scan for free; a
+    // sparse grow is the one shape where a stale straddler TAIL (value
+    // longer than size implies) becomes readable without any key-level
+    // evidence, so it always sweeps.
+    if offset > file_size || ext.iter().any(|&(s, _)| s >= file_size) {
+        clean_beyond_eof(state, ino, file_size).await?;
+        ext = extents_snapshot(state, ino, file_size).await?;
+    }
     // BUG-LEASE-2 Phase 2: stamp every data-extent put with the held WRITE
     // lease's version so a revoked writer's late RPCs are fenced at the PS.
     let lease = state.write_lease_for(ino);
@@ -341,6 +351,71 @@ pub async fn truncate_extents(
                     val.truncate(keep);
                     state.kv_put_fenced(&ck, &val, lease).await?;
                 }
+            }
+        }
+    }
+    invalidate(state, ino);
+    Ok(())
+}
+
+/// BUG-LEASE-8 (coco P1): reap LEFTOVER extent state beyond `eof` — the
+/// residue of a crash inside a shrink's post-commit cleanup window
+/// (durable size already shrunk, extent destruction interrupted).
+/// Leftovers are invisible while size stays put, but any later GROW
+/// (truncate-up or a sparse write past EOF) would bring them back into
+/// the readable range as RESURRECTED old data where POSIX requires
+/// zeros. Called from the cold grow paths only:
+/// - `write::truncate` grow branch (before the meta put), and
+/// - `write_region` entry when leftovers are visible (a whole extent key
+///   at/after `eof` in the prefix scan) or the write is a sparse grow
+///   (`offset > file_size` — the one case a stale straddler tail can't
+///   be detected from keys alone).
+/// Deletes whole extent keys starting at/after `eof` and shortens the
+/// straddling extent's VALUE (actual KV length, not the inferred one) to
+/// `eof - start`. Idempotent; an error leaves leftovers for the next
+/// grow to retry.
+pub async fn clean_beyond_eof(state: &mut FsState, ino: u64, eof: u64) -> Result<()> {
+    // Raw starts — inference is size-relative and exactly what we must
+    // NOT trust here.
+    let prefix = key::extent_prefix(ino);
+    let mut starts: Vec<u64> = Vec::new();
+    let mut start_key = prefix.clone();
+    loop {
+        let keys = state.kv_range_keys(&prefix, &start_key, RANGE_PAGE).await?;
+        let got = keys.len();
+        for k in &keys {
+            if let Some((_, off)) = key::parse_extent_key(k) {
+                starts.push(off);
+            }
+        }
+        if got < RANGE_PAGE as usize {
+            break;
+        }
+        let last_off = starts.last().copied().unwrap_or(0);
+        start_key = key::extent_key(ino, last_off.saturating_add(1));
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    let lease = state.write_lease_for(ino);
+    for &s in &starts {
+        if s >= eof {
+            state
+                .kv_delete_fenced(&key::extent_key(ino, s), lease)
+                .await?;
+        }
+    }
+    // Straddler: the largest start below eof may carry a stale tail
+    // (value longer than the durable size implies). This function is the
+    // pre-grow BARRIER — a hard kv error here must PROPAGATE (abort the
+    // grow) rather than read as "already clean" (coco P1); only a
+    // genuinely absent key (Ok(None)) may be skipped.
+    if let Some(&s) = starts.iter().rev().find(|&&s| s < eof) {
+        let keep = (eof - s) as usize;
+        let ck = key::extent_key(ino, s);
+        if let Some(mut val) = state.kv_get_opt(&ck).await? {
+            if val.len() > keep {
+                val.truncate(keep);
+                state.kv_put_fenced(&ck, &val, lease).await?;
             }
         }
     }

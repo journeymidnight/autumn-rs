@@ -34,6 +34,20 @@ pub async fn write(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> R
 
     ensure_inode_cached(state, ino).await?;
 
+    // BUG-LEASE-8 (coco P0): a write that GROWS the file past the current
+    // EOF must reap crashed-shrink leftovers BEFORE the in-memory size
+    // bumps below — the bump erases the pre-grow EOF, so by flush time
+    // `write_region` sees the grown size and a stale straddler tail looks
+    // like legitimate in-file data (its RMW would merge the write into
+    // the stale value and expose pre-shrink bytes in the sparse hole).
+    // Cold path: only fires on a beyond-EOF write (offset > size).
+    {
+        let cur_size = state.inodes.get(&ino).map(|is| is.meta.size).unwrap_or(0);
+        if offset as u64 > cur_size {
+            extent::clean_beyond_eof(state, ino, cur_size).await?;
+        }
+    }
+
     // Gap detection: if buffer has data and the write is not contiguous, flush first.
     let needs_flush = {
         let is = state.inodes.get(&ino).unwrap();
@@ -204,24 +218,39 @@ pub async fn truncate(state: &mut FsState, ino: u64, new_size: u64) -> Result<()
         return Ok(());
     }
 
-    if new_size < old_size {
-        // Shrink: delete extents past the new EOF + truncate the straddling one
-        // (F247 — variable-length extents keyed by logical offset).
-        extent::truncate_extents(state, ino, new_size, old_size).await?;
-
-        // Handle inline data
-        if has_inline {
-            let is = state.inodes.get_mut(&ino).unwrap();
-            if let Some(ref mut data) = is.meta.inline_data {
-                data.truncate(new_size as usize);
-                if data.is_empty() {
-                    is.meta.inline_data = None;
-                }
+    // BUG-LEASE-8 (shrink ordering): the inode-meta put is the COMMIT
+    // POINT and must land BEFORE any extent destruction. Pre-fix the
+    // shrink deleted/shortened extent KVs first and persisted the new
+    // size after — a crash in between left durable size = old_size with
+    // the data already destroyed, so reads in [new_size, old_size)
+    // returned zeros INSIDE the file (silent corruption; the one
+    // crash-window in this layer that fabricated data rather than just
+    // losing a recent un-fsynced write). Meta-first inverts the leftover:
+    // a crash after the put leaves extents beyond the new size — they are
+    // invisible to reads (bounded by size) and self-heal via the
+    // prefix-scan deletes (unlink / later truncate) or same-key rewrites
+    // (a regrowing append re-derives the same [ino][off] keys).
+    if new_size < old_size && has_inline {
+        let is = state.inodes.get_mut(&ino).unwrap();
+        if let Some(ref mut data) = is.meta.inline_data {
+            data.truncate(new_size as usize);
+            if data.is_empty() {
+                is.meta.inline_data = None;
             }
         }
     }
 
-    // Update metadata
+    if new_size > old_size {
+        // GROW (coco P1): reap any leftover extents beyond the old EOF
+        // BEFORE the size expands over them — the residue of a crashed
+        // shrink's cleanup window would otherwise re-enter the readable
+        // range as resurrected old data where POSIX requires zeros.
+        // Runs while the leftovers are still invisible (size = old), so
+        // a crash mid-sweep is safe and the next grow retries.
+        extent::clean_beyond_eof(state, ino, old_size).await?;
+    }
+
+    // Update + persist metadata (the commit point).
     let meta = {
         let is = state.inodes.get_mut(&ino).unwrap();
         is.meta.size = new_size;
@@ -233,6 +262,21 @@ pub async fn truncate(state: &mut FsState, ino: u64, new_size: u64) -> Result<()
         is.meta.clone()
     };
     put_inode(state, ino, &meta).await?;
+
+    if new_size < old_size {
+        // Cleanup AFTER the commit: delete extents past the new EOF +
+        // shorten the straddling one (F247 — variable-length extents
+        // keyed by logical offset). The truncate is already COMMITTED
+        // (meta landed), so a cleanup error must NOT surface as failure
+        // (coco P1: the caller would retry, hit the `new_size ==
+        // old_size` early-return no-op, and never re-clean) — leftovers
+        // are benign while size stays put and every grow path sweeps
+        // them via `clean_beyond_eof` before exposure.
+        if let Err(e) = extent::truncate_extents(state, ino, new_size, old_size).await {
+            tracing::warn!(ino, new_size, old_size, "post-commit truncate cleanup failed (leftovers reaped on next grow/unlink): {e}");
+            extent::invalidate(state, ino);
+        }
+    }
 
     Ok(())
 }
