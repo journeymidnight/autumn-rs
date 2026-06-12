@@ -1,6 +1,6 @@
 Date: 2026-06-12
 TaskStatus: completed
-Task scope: /loop 生产视角急修 · 批次 5/6/7 = ETCD-1 + ETCD-2 + WIRE-1（etcd 故障 chaos：
+Task scope: /loop 生产视角急修 · 批次 5-8 = ETCD-1/ETCD-2/WIRE-1/LAT-1（etcd 故障 chaos：
   leaderless 路由黑洞 + PS 全队自杀 + 审计日志 etcd 泄漏）。批次 1-4：
   P0-D / OBS-1 / ENOSPC-1 / LEASE8-LITE 已闭（2334304 / 25d323d /
   4b10922 / 75ff306）。
@@ -33,7 +33,6 @@ Current summary:
 Main gaps:
   - 见 Not implemented。
 Next steps:
-  - WIRE-1 已闭（混版本静默损坏→启动硬拒绝）。剩余生产项需用户决策：
-    rolling upgrade 完整线协议兼容策略（enforcement point 已就位）/
-    F227（用户持有）/ generation manifest / 安全鉴权 / PS 延迟直方图
-    （热路径权衡）。
+  - 无：自治生产面 8 批全部闭环（LAT-1 = 最后一项）。剩余全部需用户
+    决策：rolling upgrade 完整线协议策略（WIRE-1 enforcement point 已
+    就位）/ F227（用户持有）/ generation manifest / 安全鉴权。

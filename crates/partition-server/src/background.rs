@@ -942,7 +942,16 @@ pub(crate) async fn handle_completion(
     c: InflightCompletion,
 ) {
     match finish_write_batch(part, c.data, c.phase2_result).await {
-        Ok(stats) => metrics.record(stats),
+        Ok(stats) => {
+            // LAT-1: every op in a group-committed batch experienced the
+            // batch's end-to-end latency — observe `ops` at that value.
+            // Reuses the already-measured BatchStats (no new timing).
+            part.borrow()
+                .metrics
+                .write_lat
+                .observe_n(stats.end_to_end_ns, stats.ops);
+            metrics.record(stats)
+        }
         Err(e) => {
             if is_locked_by_other(&e) {
                 tracing::error!(part_id, "LockedByOther detected, poisoning partition");

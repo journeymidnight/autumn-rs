@@ -138,6 +138,12 @@ curl -s http://127.0.0.1:9701/metrics   # PS: per-partition requests_total (mono
 curl -s http://127.0.0.1:9601/metrics   # EN: append batches/bytes/ns totals, extents per shard + total, per-disk online
 ```
 
+PS latency histograms (LAT-1): `autumn_ps_write_duration_seconds` (group-commit end-to-end across ALL write ops — Put/Delete —
+observed per batched op from the already-measured WriteLoopMetrics
+— zero added hot-path timing) and `autumn_ps_get_duration_seconds` (inline
+serve incl. VP resolve) — Prometheus histogram exposition per partition,
+buckets 0.5ms..250ms. A/B perf-checked (4K, p8, d8): no write regression.
+
 Manual verify: write a few keys with `autumn-client put`, then confirm
 `autumn_ps_partition_requests_total` increments on the owning partition and
 `autumn_en_append_bytes_total` grows. Notes: all snapshots/gauges refresh

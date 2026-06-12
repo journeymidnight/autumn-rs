@@ -1936,6 +1936,17 @@ post-restart.
     `part_addrs` (manager-HA chaos H3).
     (d) Client SDK `refresh_regions` rotates + retries on NOT_LEADER.
 
+21a. **LAT-1 latency histograms.** `PartitionMetrics.write_lat/get_lat` (write = Put+Delete+FenceBump batch ops, coco P3 rename)
+    (`LatHist`: 9 finite ns buckets 0.5ms..250ms + sum + count,
+    non-cumulative storage, cumulative `le` at render). PUT observes the
+    ALREADY-MEASURED `BatchStats.end_to_end_ns` once per batch with
+    `n = ops` (every op in a group-committed batch experienced the
+    batch's latency — zero new hot-path timing); GET adds one `Instant`
+    pair + RefCell borrow in `serve_get_local` (same cost class as the
+    F183 req_count add). A/B perf-check (4K p8 d8): write 999,864 →
+    1,069,685 ops (no regression). Rendered as Prometheus histograms in
+    `metrics_text`.
+
 21. **/metrics (observability batch 1).** `PartitionServer::metrics_text()`
     renders the Prometheus text snapshot on the MAIN compio thread (the
     `partitions` map is `Rc<RefCell>`); the binary's `--metrics-port` path

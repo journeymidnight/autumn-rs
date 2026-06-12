@@ -559,3 +559,21 @@ gaps in the lease protocol's correctness story.
   happy-path 实测）；workspace 0 error。文档：rpc CLAUDE.md WIRE-1 节
   （注明未来 rolling-upgrade 设计的 enforcement point 就在此处放宽）。
 - **passes:** completed (2026-06-12)
+
+---
+
+### LAT-1 · 生产急修批次 8：PS 延迟直方图（OBS-1 收尾项）（2026-06-12）
+- **目标:** /metrics 缺延迟维度（OBS-1 当时为热路径成本而缓）。
+- **实现:** `LatHist`（9 桶 0.5ms..250ms + sum/count，存储非累积、渲染
+  时累积 le）。**PUT 零新增热路径计时**——复用 WriteLoopMetrics 已测的
+  per-batch `end_to_end_ns`，按 `n=ops` 观测（组提交批内每 op 经历的
+  即批延迟）；GET 在 serve_get_local 加一对 Instant + 一次 borrow（与
+  F183 req_count 同量级）。Prometheus histogram 规范导出
+  （`autumn_ps_write/get_duration_seconds_{bucket,sum,count}`）。
+- **coco（GPT-5.5 fast）零 P0-P2，1 P3 采纳:** 直方图实际覆盖批内全部
+  写操作（Put/Delete/FenceBump）而非仅 PUT → 改名
+  `autumn_ps_write_duration_seconds`（语义对齐看板/SLO）。
+- **验收:** A/B perf-check（4K, p8, d8, 64 线程 12s）：写 999,864 →
+  1,069,685 ops 无回归；live 直方图分布合理（p50≈1-2ms，GET 17 万次观
+  测）；ps 162 单测绿。
+- **passes:** completed (2026-06-12)

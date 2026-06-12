@@ -915,8 +915,66 @@ pub(crate) struct PartitionData {
     pub(crate) fence_floors: RefCell<HashMap<u64, u64>>,
 }
 
+/// LAT-1: fixed-bucket latency histogram (Prometheus-shape). Recording
+/// is one bucket fetch_add + sum/count adds; PUT observations reuse the
+/// ALREADY-MEASURED per-batch end-to-end ns from `WriteLoopMetrics`
+/// (zero new hot-path timing), GET adds one `Instant` pair per request
+/// (same cost class as the F183 `req_count` add).
+pub struct LatHist {
+    pub buckets: [std::sync::atomic::AtomicU64; LAT_BUCKET_BOUNDS_NS.len()],
+    pub sum_ns: std::sync::atomic::AtomicU64,
+    pub count: std::sync::atomic::AtomicU64,
+}
+
+/// Upper bounds (ns) of the finite buckets; an implicit +Inf bucket is
+/// `count - sum(buckets)` at render time... NO — buckets are CUMULATIVE
+/// at render; stored per-bucket counts here are NON-cumulative for
+/// cheap recording. Bounds: 0.5/1/2/5/10/20/50/100/250 ms.
+pub const LAT_BUCKET_BOUNDS_NS: [u64; 9] = [
+    500_000,
+    1_000_000,
+    2_000_000,
+    5_000_000,
+    10_000_000,
+    20_000_000,
+    50_000_000,
+    100_000_000,
+    250_000_000,
+];
+
+impl Default for LatHist {
+    fn default() -> Self {
+        Self {
+            buckets: Default::default(),
+            sum_ns: Default::default(),
+            count: Default::default(),
+        }
+    }
+}
+
+impl LatHist {
+    /// Record `n` observations of `ns` each (a group-committed batch's
+    /// ops all share the batch's end-to-end latency).
+    pub fn observe_n(&self, ns: u64, n: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if n == 0 {
+            return;
+        }
+        let idx = LAT_BUCKET_BOUNDS_NS.partition_point(|&b| ns > b);
+        if idx < self.buckets.len() {
+            self.buckets[idx].fetch_add(n, Relaxed);
+        }
+        // idx == len → +Inf bucket, implicit via count.
+        self.sum_ns.fetch_add(ns.saturating_mul(n), Relaxed);
+        self.count.fetch_add(n, Relaxed);
+    }
+}
+
 #[derive(Default)]
 pub struct PartitionMetrics {
+    /// LAT-1: PUT (group-commit end-to-end) / GET (inline serve) latency.
+    pub write_lat: LatHist,
+    pub get_lat: LatHist,
     pub req_count: std::sync::atomic::AtomicU64,
     /// F189-fix MED-3: monotonic request counter (NEVER swap-reset).
     /// `report_load_loop` swaps `req_count` to 0 every 5 s for its
@@ -2893,6 +2951,56 @@ impl PartitionServer {
                 );
             }
         }
+        // LAT-1: latency histograms (Prometheus histogram exposition —
+        // cumulative `le` buckets + _sum + _count, metric-major).
+        type HistSel = fn(&PartitionMetrics) -> &LatHist;
+        let hists: [(&str, HistSel); 2] = [
+            ("autumn_ps_write_duration_seconds", |m| &m.write_lat),
+            ("autumn_ps_get_duration_seconds", |m| &m.get_lat),
+        ];
+        for (name, sel) in hists {
+            push_type(&mut out, name, "histogram");
+            for (part_id, m) in &series {
+                use std::sync::atomic::Ordering::Relaxed;
+                let h = sel(m);
+                let labels = |le: String| {
+                    [
+                        ("ps", ps.clone()),
+                        ("part", part_id.to_string()),
+                        ("le", le),
+                    ]
+                };
+                let mut cum: u64 = 0;
+                for (i, &bound) in LAT_BUCKET_BOUNDS_NS.iter().enumerate() {
+                    cum += h.buckets[i].load(Relaxed);
+                    push_metric(
+                        &mut out,
+                        &format!("{name}_bucket"),
+                        &labels(format!("{}", bound as f64 / 1e9)),
+                        cum as f64,
+                    );
+                }
+                let count = h.count.load(Relaxed);
+                push_metric(
+                    &mut out,
+                    &format!("{name}_bucket"),
+                    &labels("+Inf".to_string()),
+                    count as f64,
+                );
+                push_metric(
+                    &mut out,
+                    &format!("{name}_sum"),
+                    &[("ps", ps.clone()), ("part", part_id.to_string())],
+                    h.sum_ns.load(Relaxed) as f64 / 1e9,
+                );
+                push_metric(
+                    &mut out,
+                    &format!("{name}_count"),
+                    &[("ps", ps.clone()), ("part", part_id.to_string())],
+                    count as f64,
+                );
+            }
+        }
         out
     }
 
@@ -4031,21 +4139,29 @@ async fn serve_get_local(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
 ) -> (Bytes, Option<Bytes>) {
-    if msg_type == MSG_GET_ZC {
+    let t0 = Instant::now();
+    let out = if msg_type == MSG_GET_ZC {
         // handle_get_zc never errors (status rides in the meta code).
         let (head, value) = crate::rpc_handlers::handle_get_zc(req_id, payload, part).await;
-        return (head, Some(value));
-    }
-    let frame = match crate::rpc_handlers::handle_get(payload, part).await {
-        Ok(p) => Frame::response(req_id, msg_type, p),
-        Err((code, message)) => Frame::error(
-            req_id,
-            msg_type,
-            autumn_rpc::RpcError::encode_status(code, &message),
-        ),
-    }
-    .encode();
-    (frame, None)
+        (head, Some(value))
+    } else {
+        let frame = match crate::rpc_handlers::handle_get(payload, part).await {
+            Ok(p) => Frame::response(req_id, msg_type, p),
+            Err((code, message)) => Frame::error(
+                req_id,
+                msg_type,
+                autumn_rpc::RpcError::encode_status(code, &message),
+            ),
+        }
+        .encode();
+        (frame, None)
+    };
+    // LAT-1: GET latency (inline serve incl. VP resolve).
+    part.borrow()
+        .metrics
+        .get_lat
+        .observe_n(t0.elapsed().as_nanos() as u64, 1);
+    out
 }
 
 /// Mode B fix (read decoupling): serve RANGE / HEAD LOCALLY on the ps-conn task,
