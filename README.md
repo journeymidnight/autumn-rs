@@ -287,6 +287,38 @@ writes: 191/191 ACKed keys survived.
 `start-manager` / `stop-manager` / `restart-manager` (etcd state replay makes
 a manager bounce a safe rolling step).
 
+### cluster_version + wire-version interval (R1)
+
+R1 lays the version-skew foundation: every binary carries a wire-version
+interval `[WIRE_VERSION_MIN, WIRE_VERSION_MAX]` (crates/rpc), the startup
+check accepts interval overlap instead of WIRE-1's fingerprint equality, and
+the manager persists an operator-bumped `cluster_version` in etcd (ASCII
+decimal at `autumn-rs/cluster_version`) that gates when new wire/persisted
+formats may be emitted.
+
+```bash
+autumn-op cluster-version            # current gate + manager/op wire intervals
+autumn-op upgrade-version [--to N]   # bump (default current+1) — run ONLY after
+                                     # EVERY member runs the new binary; not rollbackable
+```
+
+Manual verification (all on a fresh `cluster.sh reset 3`):
+
+```bash
+autumn-op cluster-version            # expect: cluster_version: 1, intervals [1,1]
+autumn-op upgrade-version            # expect REFUSED: 2 exceeds WIRE_VERSION_MAX=1
+bash cluster.sh restart-manager && sleep 10
+autumn-op cluster-version            # expect: still 1 (etcd replay)
+# mixed-version refusal: any pre-R1 binary against this manager fails its
+# startup check loudly ("decode GetClusterIdResp failed ... wire-schema mismatch")
+```
+
+Bump discipline lives in `crates/rpc/src/lib.rs` (`WIRE_VERSION_FINGERPRINTS`
+registry): any wire-schema edit fails `cargo test -p autumn-rpc` until you
+record the new fingerprint and consciously decide MIN/MAX. Rolling back a
+binary past a `cluster_version` bump is refused at manager startup
+(fail-closed in replay).
+
 ## Tests
 
 ```bash

@@ -1,33 +1,40 @@
 Date: 2026-06-12
-TaskStatus: not_completed
-Task scope: rolling upgrade 实施（docs/rolling_upgrade_design.md v1.1）。
-  R0 滚动重启程序化已完成并 commit；R1 cluster_version 门进行中；
-  R2（控制面 prost）/R3（数据面协商）待做，R2 范围与切换方式需用户拍板
-  （设计 §9 决策点 1/2）。
+TaskStatus: completed
+Task scope: rolling upgrade 实施（docs/rolling_upgrade_design.md v1.2）。
+  本次会话交付 R0（滚动重启程序化）+ R1（cluster_version 门 + wire
+  区间握手），均已实测 + coco 评审 + commit。R2（控制面 prost，~1-2 周）
+  / R3（数据面协商）按设计 §9 决策点 1/2 等用户拍板后另起任务。
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
   Already implemented (this session):
-    - ROLL-R0: scripts/rolling_restart.sh（EN 逐个→PS→manager 滚动 +
-      收敛门 + per-partition 区间内写活性探针 + seed 零丢失校验 +
-      flock 互斥 + per-run 探针命名空间/清理）；cluster.sh 补
-      start-manager/stop-manager/restart-manager（launch_manager 提取
-      + compute_etcd_endpoints）。coco 1P1+3P2 全采纳（P1=空 start 分
-      区探针假覆盖）。实测：3-EN/4 分区持续负载全序列 ×2 PASS，
-      191/191 ACKed 零丢失。
+    - ROLL-R0 (020b02b): scripts/rolling_restart.sh（EN 逐个→PS→manager
+      + 收敛门 + per-partition 区间内探针 + seed 零丢失校验 + flock +
+      per-run 命名空间/清理）；cluster.sh start/stop/restart-manager。
+      实测 3-EN/4 分区持续负载 ×2 PASS，191/191 ACKed 零丢失。
+    - ROLL-R1: rpc [WIRE_VERSION_MIN,MAX] + wire_compat_check（区间交
+      集）+ WIRE_VERSION_FINGERPRINTS 注册表（单测强制 bump 决策 +
+      运行时 fraud 交叉校验）；manager etcd cluster_version（ASCII
+      decimal、CAS-imprint、replay、bump=leader-only/+1/≤max/value-CAS、
+      回滚 fail-closed）；GetClusterIdResp 携带区间+gate（结构冻结）；
+      autumn-op cluster-version / upgrade-version。真混版本（旧 op vs
+      新 manager）响亮拒绝实测。
+    - 顺手修复：cluster.sh restart 选主竞态（leadership 等待门）、
+      save_cluster_config pipefail 空匹配中止、rolling_restart.sh
+      IFS=TAB 吞空 start 字段（探针错路由）。
   Not implemented (recorded):
-    - R1: etcd cluster_version（ASCII decimal 持久值）+ manager
-      GET/BUMP RPC（单调+1）+ rpc [WIRE_VERSION_MIN,MAX] 区间 +
-      WIRE-1 检查放宽为区间交集（fingerprint 留诊断 + 防忘 bump 的
-      per-version 指纹注册表单测）+ autumn-op upgrade-version。
-    - R2: manager_rpc + 54 处 etcd 值 prost 化（需拍板范围/切换方式）。
-    - R3: 数据面连接级 hello 协商 + FooReqV2 冻结纪律。
-    - upgrade_chaos.sh 双版本滚动 harness（依赖 R1+）。
+    - R2: manager_rpc 全量 + 54 处 etcd 值 prost 化 —— 需拍板范围
+      （§9.1: 全量 vs 仅 etcd 值）与切换方式（§9.2: reset vs 离线转换
+      工具）。
+    - R3: 数据面连接级 hello + FooReqV2 冻结纪律（按需触发）。
+    - upgrade_chaos.sh 双版本滚动 harness（依赖 R2/R3 才有真实意义；
+      当前版本窗口下混版本=启动拒绝，无可滚动的版本对）。
 
 Current summary:
-  R0 已 commit。设计文档状态行更新为 "R0 已实现"。
+  R0+R1 已 commit+push。设计文档状态 v1.2（R0/R1 标注 ✅ + 实现注记）。
+  单测全绿（rpc 25 / manager 152 / ps 162 / stream 77 / client 27）。
 Main gaps:
-  - R1 未动工时本文件状态为 not_completed；R1 完成后更新。
+  - R2/R3 等用户对 §9 决策点 1/2 拍板。
 Next steps:
-  - R1 实现（见上）；完成后停下来向用户汇报 R2 决策点（§9.1 范围、
-    §9.2 切换方式）再继续。
+  - 用户拍板后：R2 推荐路线 = manager_rpc 全量 + etcd 值 prost 化 +
+    cluster.sh reset 切换（开发期）；之后 R3 + upgrade_chaos.sh。

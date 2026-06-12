@@ -44,6 +44,11 @@ fn usage() -> ! {
     eprintln!(
         "  policy-candidates            advisory split/merge/gc/compact/ec candidates (F213)"
     );
+    eprintln!("  cluster-version              persisted cluster_version + manager wire interval (R1)");
+    eprintln!();
+    eprintln!("rolling upgrade (R1, docs/rolling_upgrade_design.md):");
+    eprintln!("  upgrade-version [--to N]     bump cluster_version (default current+1); run ONLY");
+    eprintln!("                               after every member binary is upgraded; not rollbackable");
     eprintln!();
     eprintln!("node-lifecycle admin commands:");
     eprintln!("  fence-node <id> --reason \"...\" --by alice [--force]");
@@ -76,6 +81,11 @@ struct Args {
 enum Command {
     // F211 read / observability
     ListNodes,
+    // R1 rolling upgrade
+    ClusterVersion,
+    UpgradeVersion {
+        to: Option<u32>,
+    },
     ExtentHealth {
         node_filter: Vec<u64>,
         include_healthy: bool,
@@ -209,6 +219,25 @@ fn parse() -> Args {
     let cmd = match sub {
         // F211 read
         "list-nodes" => Command::ListNodes,
+        // R1 rolling upgrade
+        "cluster-version" => Command::ClusterVersion,
+        "upgrade-version" => {
+            let mut to: Option<u32> = None;
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--to" => {
+                        i += 1;
+                        if i >= raw.len() {
+                            usage();
+                        }
+                        to = Some(raw[i].parse().unwrap_or_else(|_| usage()));
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            Command::UpgradeVersion { to }
+        }
         "extent-health" => {
             let mut node_filter: Vec<u64> = Vec::new();
             let mut include_healthy = false;
@@ -1082,6 +1111,92 @@ async fn run(args: Args) -> Result<()> {
     let client = ClusterClient::connect(&args.manager).await?;
     match args.cmd {
         // ---------------- F211 read ----------------
+        Command::ClusterVersion => {
+            let bytes = client
+                .mgr_call(
+                    MSG_GET_CLUSTER_VERSION,
+                    rkyv_encode(&GetClusterVersionReq {}),
+                )
+                .await?;
+            let resp: GetClusterVersionResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+            if resp.code != CODE_OK {
+                bail!("cluster-version: {}", resp.message);
+            }
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "cluster_version": resp.cluster_version,
+                        "manager_wire_version_min": resp.wire_version_min,
+                        "manager_wire_version_max": resp.wire_version_max,
+                        "op_wire_version_min": autumn_rpc::WIRE_VERSION_MIN,
+                        "op_wire_version_max": autumn_rpc::WIRE_VERSION_MAX,
+                    }))?
+                );
+            } else {
+                println!("cluster_version: {}", resp.cluster_version);
+                println!(
+                    "manager wire interval: [{}, {}]",
+                    resp.wire_version_min, resp.wire_version_max
+                );
+                println!(
+                    "this autumn-op binary:  [{}, {}]",
+                    autumn_rpc::WIRE_VERSION_MIN,
+                    autumn_rpc::WIRE_VERSION_MAX
+                );
+                if resp.cluster_version < resp.wire_version_max {
+                    println!(
+                        "NOTE: manager binaries support up to v{} — `upgrade-version` can bump \
+once EVERY member runs the new binary",
+                        resp.wire_version_max
+                    );
+                }
+            }
+        }
+        Command::UpgradeVersion { to } => {
+            // Resolve the default target (current+1) from a fresh read so
+            // the printed intent matches what the manager will validate.
+            let bytes = client
+                .mgr_call(
+                    MSG_GET_CLUSTER_VERSION,
+                    rkyv_encode(&GetClusterVersionReq {}),
+                )
+                .await?;
+            let cur: GetClusterVersionResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+            if cur.code != CODE_OK {
+                bail!("upgrade-version: read current failed: {}", cur.message);
+            }
+            let target = to.unwrap_or(cur.cluster_version + 1);
+            let bytes = client
+                .mgr_call(
+                    MSG_BUMP_CLUSTER_VERSION,
+                    rkyv_encode(&BumpClusterVersionReq { to: target }),
+                )
+                .await?;
+            let resp: BumpClusterVersionResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+            if resp.code != CODE_OK {
+                bail!(
+                    "upgrade-version to {} REFUSED (cluster_version stays {}): {}",
+                    target,
+                    resp.cluster_version,
+                    resp.message
+                );
+            }
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "cluster_version": resp.cluster_version,
+                    }))?
+                );
+            } else {
+                println!(
+                    "cluster_version bumped: {} -> {} — rollback to older binaries is no \
+longer safe (new formats may now be emitted/persisted)",
+                    cur.cluster_version, resp.cluster_version
+                );
+            }
+        }
         Command::ListNodes => {
             let bytes = client
                 .mgr_call(MSG_LIST_NODE_STATES, rkyv_encode(&ListNodeStatesReq {}))

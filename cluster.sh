@@ -583,6 +583,22 @@ launch_manager() {
         "$MANAGER" --port 9001 --etcd "$ETCD_ENDPOINTS" --listen "$BIND_HOST" \
         --transport "$TRANSPORT" $mgr_extra
     wait_port 9001 manager
+    # Wait for LEADERSHIP, not just the listener: a restart leaves the
+    # previous leader's 10 s etcd lease behind, so the fresh manager can
+    # spend ~10 s answering NOT_LEADER — `autumn-op format` / bootstrap
+    # right after this point would fail and abort do_start under set -e
+    # (flaky `cluster.sh restart` with preserved etcd; reset never hit it
+    # because it wipes the lease). `info` is leader-gated → a clean probe.
+    echo -n "[cluster] waiting for manager leadership..."
+    local _t
+    for _t in $(seq 1 60); do
+        if "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" info >/dev/null 2>&1; then
+            echo " ok"
+            return 0
+        fi
+        sleep 0.5
+    done
+    echo " TIMEOUT (continuing — early RPCs may transiently fail)"
 }
 
 # Snapshot the launch parameters so `start-node` / `start-ps` (run later)
@@ -595,7 +611,11 @@ save_cluster_config() {
     {
         printf 'REPLICAS=%s\n' "$REPLICAS"
         printf 'CLUSTER_MODE=%s\n' "$MODE"
-        env | grep -E '^AUTUMN_' | sort | while IFS='=' read -r k v; do
+        # `|| true`: with zero AUTUMN_* vars in the env, grep exits 1 and
+        # pipefail+set -e would abort do_start right here (config written
+        # truncated, "cluster ready" banner never printed) — only ever
+        # surfaced on a bare `bash cluster.sh restart N` with a clean env.
+        env | { grep -E '^AUTUMN_' || true; } | sort | while IFS='=' read -r k v; do
             printf 'export %s=%q\n' "$k" "$v"
         done
     } > "$CONFIG_FILE"

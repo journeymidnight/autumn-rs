@@ -1834,3 +1834,24 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     `autumn_common::metrics_http` listener thread serves the latest copy.
     A follower's counts reflect its replay-stale view — scrape
     `autumn_manager_leader` to pick the authoritative instance.
+
+38. **R1 cluster_version (rolling upgrade design §3-R1).** Etcd key
+    `autumn-rs/cluster_version`, ASCII decimal (deliberately NOT rkyv — it
+    gates serialization-era transitions so it must outlive them all).
+    CAS-imprinted by the first leader to its own `WIRE_VERSION_MAX`
+    (`imprint_cluster_version`, same shape + best-effort semantics as
+    F214-A's cluster_id — safe because no code gates on it yet and a bump
+    against a missing key CAS-fails). `bump_cluster_version`: leader-only
+    + exactly current+1 + capped at this binary's WIRE_VERSION_MAX +
+    value-CAS against the current ASCII value (racing bumps can't both
+    land; CAS-loser heals its in-memory copy and refuses).
+    **Rollback fail-closed:** `parse_cluster_version` — the ONLY decode
+    point (imprint / CAS-lost re-reads / replay / bump-heal) — refuses a
+    persisted value above this binary's WIRE_VERSION_MAX; through replay
+    that blocks an old binary from becoming leader after a bump (the
+    "bump 后不可滚回" rule, enforced not advisory).
+    `handle_get_cluster_version` does a FRESH etcd read (rare operator
+    RPC; a follower's in-memory copy is replay-stale after a bump).
+    `GetClusterIdResp` carries `{wire_version_min, wire_version_max,
+    cluster_version}` for the startup handshake — that struct is FROZEN
+    from R1 on (see rpc CLAUDE.md R1 section).

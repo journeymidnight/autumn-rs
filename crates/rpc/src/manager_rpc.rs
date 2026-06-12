@@ -139,6 +139,16 @@ pub const MSG_RELEASE_LEASE: u8 = 0x47;
 pub const MSG_HEARTBEAT_LEASE: u8 = 0x48;
 pub const MSG_POLL_INVALIDATIONS: u8 = 0x49;
 
+// ── R1 rolling upgrade: persisted cluster_version (design §3-R1) ──────────
+//
+// etcd key `autumn-rs/cluster_version`, ASCII decimal. GET servable from
+// any replica (replayed state). BUMP is leader-only, monotonic, exactly
+// +1, and capped at the manager's own WIRE_VERSION_MAX. Operators bump
+// via `autumn-op upgrade-version` AFTER every member binary is upgraded;
+// new wire forms / persisted formats gate on the bumped value.
+pub const MSG_GET_CLUSTER_VERSION: u8 = 0x4A;
+pub const MSG_BUMP_CLUSTER_VERSION: u8 = 0x4B;
+
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
 /// Serialize a value to Bytes using rkyv.
@@ -1428,6 +1438,14 @@ pub struct QueryAuditLogResp {
 
 // --- GetClusterId ---
 // F214-A: read-only cluster identity exposed via MSG_GET_CLUSTER_ID.
+//
+// ⚠️ R1 FREEZE (coco P1): GetClusterIdReq/Resp ARE the version-negotiation
+// channel — every long-lived process decodes this resp BEFORE any compat
+// decision can run. If this struct's rkyv layout ever changes again, a
+// newer peer fails the decode against an older manager and the interval
+// handshake becomes unreachable (the refusal is still LOUD, but rolling
+// upgrades regress to same-commit). From R1 on these two structs are
+// FROZEN; additions go in NEW msg_types, never here.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct GetClusterIdReq {}
 
@@ -1438,9 +1456,55 @@ pub struct GetClusterIdResp {
     /// UUID string. Empty when `code` != `CODE_OK`.
     pub cluster_id: String,
     /// WIRE-1: the responding manager's `autumn_rpc::WIRE_FINGERPRINT`.
-    /// Callers refuse to join when it differs from their own (mixed
-    /// same-commit deploy violation — rkyv would decode garbage).
+    /// R1 relaxed the equality check to `wire_compat_check` (interval
+    /// overlap, fingerprint kept as the same-build fast path + for
+    /// diagnostics in the refusal message).
     pub wire_fingerprint: String,
+    /// R1: the responding manager's `[WIRE_VERSION_MIN, WIRE_VERSION_MAX]`.
+    /// Callers refuse to join when their own interval has no overlap.
+    pub wire_version_min: u32,
+    pub wire_version_max: u32,
+    /// R1: the persisted cluster_version (the operator-bumped feature
+    /// gate, NOT this binary's wire version). New wire forms / persisted
+    /// formats versioned N may only be EMITTED once cluster_version >= N.
+    /// 0 when the manager hasn't bootstrapped it yet.
+    pub cluster_version: u32,
+}
+
+// --- ClusterVersion (R1 rolling upgrade) --------------------------------
+// Persisted in etcd as ASCII decimal (format-stable across serialization
+// eras). Read servable from any replica; bump is leader-only, monotonic,
+// and exactly +1 per call (design §3-R1).
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetClusterVersionReq {}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetClusterVersionResp {
+    pub code: u8,
+    pub message: String,
+    pub cluster_version: u32,
+    /// The responding manager binary's own wire interval — surfaced so
+    /// `autumn-op cluster-version` can show operators how much headroom
+    /// a bump has (`cluster_version < wire_version_max` ⇒ bump possible).
+    pub wire_version_min: u32,
+    pub wire_version_max: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BumpClusterVersionReq {
+    /// Target version. Must equal current cluster_version + 1, and must
+    /// not exceed the manager's own WIRE_VERSION_MAX.
+    pub to: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BumpClusterVersionResp {
+    pub code: u8,
+    pub message: String,
+    /// The cluster_version after this call (the new value on success,
+    /// the unchanged current value on refusal).
+    pub cluster_version: u32,
 }
 
 // ── F-ioring-lease-1 wire types ────────────────────────────────────────────

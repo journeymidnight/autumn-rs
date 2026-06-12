@@ -181,18 +181,24 @@ discover_partitions() {
     PART_PREFIXES=()
     local out line start end prefix skipped=0
     out="$("${AO[@]}" info 2>/dev/null)" || die "autumn-op info failed during partition discovery"
-    while IFS=$'\t' read -r start end; do
+    # Delimiter is '|' (excluded from the printable-key charset below),
+    # NOT a tab: tab is whitespace-class IFS, so `read` SWALLOWS a leading
+    # empty field — the empty-start first partition came back as
+    # start="<end>", end="" and its probe silently targeted the wrong
+    # partition (found by the 1-partition regression run).
+    while IFS='|' read -r start end; do
         if [[ ! "$start" =~ ^[0-9a-zA-Z_-]*$ || ! ( "$end" =~ ^[0-9a-zA-Z_-]*$ || "$end" == "∞" ) ]]; then
             say "WARN: partition [$start..$end) has non-printable bounds — probe SKIPPED"
             (( ++skipped )); continue
         fi
         if prefix="$(derive_probe_prefix "$start" "$end")"; then
             PART_PREFIXES+=("$prefix")
+            say "partition [${start}..${end:-∞}) -> probe prefix '$prefix'"
         else
             say "WARN: partition [$start..$end) too narrow for a printable probe key — SKIPPED"
             (( ++skipped ))
         fi
-    done < <(sed -n 's/^  part [0-9]*: ps=[^,]*, range=\[\(.*\)\.\.\(.*\))$/\1\t\2/p' <<<"$out")
+    done < <(sed -n 's/^  part [0-9]*: ps=[^,]*, range=\[\(.*\)\.\.\(.*\))$/\1|\2/p' <<<"$out")
     (( ${#PART_PREFIXES[@]} >= 1 )) || die "no probeable partitions discovered from autumn-op info"
     say "partitions discovered: ${#PART_PREFIXES[@]} probed, $skipped skipped"
 }

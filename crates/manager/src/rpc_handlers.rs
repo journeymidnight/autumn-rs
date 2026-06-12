@@ -286,6 +286,9 @@ impl AutumnManager {
             MSG_RECOVERY_STATS => self.handle_recovery_stats(payload).await,
             MSG_QUERY_AUDIT_LOG => self.handle_query_audit_log(payload).await,
             MSG_GET_CLUSTER_ID => self.handle_get_cluster_id().await,
+            // ── R1 rolling upgrade: cluster_version gate ─────────────────
+            MSG_GET_CLUSTER_VERSION => self.handle_get_cluster_version().await,
+            MSG_BUMP_CLUSTER_VERSION => self.handle_bump_cluster_version(payload).await,
             // ── F-ioring-lease-1: inode-level lease + close-to-open ─────
             MSG_ACQUIRE_LEASE => self.handle_acquire_lease(payload).await,
             MSG_RELEASE_LEASE => self.handle_release_lease(payload).await,
@@ -320,6 +323,9 @@ impl AutumnManager {
                 message: "manager not yet bootstrapped".to_string(),
                 cluster_id: String::new(),
                 wire_fingerprint: autumn_rpc::WIRE_FINGERPRINT.to_string(),
+                wire_version_min: autumn_rpc::WIRE_VERSION_MIN,
+                wire_version_max: autumn_rpc::WIRE_VERSION_MAX,
+                cluster_version: self.cluster_version.get(),
             }));
         }
         Ok(rkyv_encode(&GetClusterIdResp {
@@ -327,7 +333,66 @@ impl AutumnManager {
             message: String::new(),
             cluster_id: id,
             wire_fingerprint: autumn_rpc::WIRE_FINGERPRINT.to_string(),
+            wire_version_min: autumn_rpc::WIRE_VERSION_MIN,
+            wire_version_max: autumn_rpc::WIRE_VERSION_MAX,
+            cluster_version: self.cluster_version.get(),
         }))
+    }
+
+    /// R1: read the persisted cluster_version. Servable from any replica,
+    /// but a follower's in-memory copy only updates on replay (leader
+    /// promotion) — after a bump it would stay stale indefinitely (coco
+    /// P2). This is a rare operator RPC, so do a FRESH etcd read (and
+    /// heal the local cache); fall back to the in-memory value only when
+    /// etcd is unreachable/absent (memory mode).
+    async fn handle_get_cluster_version(&self) -> HandlerResult {
+        if let Some(etcd) = &self.etcd {
+            if let Ok(resp) = etcd.client.get(crate::CLUSTER_VERSION_KEY.as_bytes()).await {
+                if let Some(kv) = resp.kvs.first() {
+                    match AutumnManager::parse_cluster_version(&kv.value) {
+                        Ok(v) => self.cluster_version.set(v),
+                        Err(err) => {
+                            // Out-of-bound (this binary older than the
+                            // committed format level) or garbage: report
+                            // it rather than serving a misleading number.
+                            return Ok(rkyv_encode(&GetClusterVersionResp {
+                                code: CODE_ERROR,
+                                message: err.to_string(),
+                                cluster_version: self.cluster_version.get(),
+                                wire_version_min: autumn_rpc::WIRE_VERSION_MIN,
+                                wire_version_max: autumn_rpc::WIRE_VERSION_MAX,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(rkyv_encode(&GetClusterVersionResp {
+            code: CODE_OK,
+            message: String::new(),
+            cluster_version: self.cluster_version.get(),
+            wire_version_min: autumn_rpc::WIRE_VERSION_MIN,
+            wire_version_max: autumn_rpc::WIRE_VERSION_MAX,
+        }))
+    }
+
+    /// R1: operator bump (leader-only, monotonic +1, value-CAS'd —
+    /// validation in `bump_cluster_version`).
+    async fn handle_bump_cluster_version(&self, payload: Bytes) -> HandlerResult {
+        let req: BumpClusterVersionReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        match self.bump_cluster_version(req.to).await {
+            Ok(v) => Ok(rkyv_encode(&BumpClusterVersionResp {
+                code: CODE_OK,
+                message: String::new(),
+                cluster_version: v,
+            })),
+            Err(err) => Ok(rkyv_encode(&BumpClusterVersionResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                cluster_version: self.cluster_version.get(),
+            })),
+        }
     }
 
     pub(crate) async fn handle_acquire_owner_lock(&self, payload: Bytes) -> HandlerResult {

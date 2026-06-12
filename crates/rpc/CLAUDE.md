@@ -223,3 +223,36 @@ TRANSPORT failure fetching it is best-effort-skipped (availability wins
 while the manager is briefly down — every subsequent RPC fails loudly
 anyway). NOTE for a future rolling-upgrade design: this check is the
 enforcement point to relax once a real wire-compat story exists.
+
+## R1 — wire-version interval + cluster_version (2026-06-12, rolling upgrade design §3-R1)
+
+WIRE-1's single-point fingerprint equality is relaxed to
+`wire_compat_check(remote_fp, remote_min, remote_max)`:
+
+- `WIRE_VERSION_MIN/MAX` (lib.rs consts) declare the interval this binary
+  speaks. Accept iff fingerprints equal (same-build fast path) OR the
+  intervals overlap.
+- **`WIRE_VERSION_FINGERPRINTS` registry + `registry_pins_current_schema_
+  to_max_version` test = the bump-enforcement mechanism.** ANY edit to a
+  wire-schema source file (even a comment) changes `WIRE_FINGERPRINT` and
+  fails the test until the developer records the new fingerprint — and
+  decides compatibility: pre-R3 bump MAX and set MIN=MAX (rkyv = no
+  cross-version decode; same-commit deploys); post-R3 keep MIN=MAX-1
+  (frozen V1 + V2 msg_types; design §5 N↔N-1 window).
+- Runtime cross-check (coco P1): a peer claiming a version that exists in
+  OUR registry with a DIFFERENT fingerprint is refused as "wire-version
+  fraud" — forgot-to-bump caught at runtime, not only in CI.
+- **`GetClusterIdReq/Resp` are FROZEN from R1 on** — they ARE the
+  negotiation channel (decoded before any compat decision can run); a
+  layout change would make the handshake unreachable for mixed versions.
+  Additions go in NEW msg_types.
+- `cluster_version` (manager etcd key `autumn-rs/cluster_version`, ASCII
+  decimal — readable across all future serialization eras): the
+  operator-bumped feature gate. `MSG_GET_CLUSTER_VERSION` (0x4A, fresh
+  etcd read) / `MSG_BUMP_CLUSTER_VERSION` (0x4B, leader-only, exactly +1,
+  capped at the manager's WIRE_VERSION_MAX, value-CAS'd). Bump via
+  `autumn-op upgrade-version` ONLY after every member runs the new
+  binary; new wire forms / persisted formats versioned N gate on
+  cluster_version >= N. Rollback safety: every manager decode of the
+  persisted value refuses (fail-closed, blocks leadership via replay
+  error) when it exceeds the binary's own WIRE_VERSION_MAX.

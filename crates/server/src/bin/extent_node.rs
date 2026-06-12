@@ -302,11 +302,15 @@ async fn verify_manager_cluster_id(manager: &str, stamped: &str) -> Result<()> {
             resp.message
         );
     }
-    // WIRE-1 (coco P2): explicit fingerprint check here too — the
-    // transitive check inside ClusterClient::connect covers today's
-    // path, but this site decodes its own resp and must not depend on
-    // that coupling.
-    if let Err(msg) = autumn_rpc::wire_fingerprint_check(&resp.wire_fingerprint) {
+    // WIRE-1 (coco P2): explicit compat check here too — the transitive
+    // check inside ClusterClient::connect covers today's path, but this
+    // site decodes its own resp and must not depend on that coupling.
+    // R1: relaxed from fingerprint equality to interval overlap.
+    if let Err(msg) = autumn_rpc::wire_compat_check(
+        &resp.wire_fingerprint,
+        resp.wire_version_min,
+        resp.wire_version_max,
+    ) {
         anyhow::bail!(msg);
     }
     if resp.cluster_id != stamped {

@@ -658,3 +658,49 @@ gaps in the lease protocol's correctness story.
   derive_probe_prefix 8 边界用例（含 [ab..ab0) SKIP、[..0) SKIP）人工
   断言通过。README "Rolling restart" 节手动步骤可复执行。
 - **passes:** completed (2026-06-12)
+
+---
+
+### ROLL-R1 · cluster_version 门 + wire 区间握手（rolling upgrade 设计 R1 阶段）（2026-06-12）
+- **目标:** docs/rolling_upgrade_design.md §3-R1 — 滚动升级地基：持久
+  cluster_version（operator 显式 bump 的特性门）+ 二进制自带
+  `[min_wire, max_wire]` 区间、WIRE-1 单点指纹等值检查放宽为区间交集。
+- **实现:**
+  - rpc: `WIRE_VERSION_MIN/MAX` 编译期常量 + `wire_compat_check`（同指
+    纹快路径 ∨ 区间交集）替换 `wire_fingerprint_check`，三处检查点
+    （client connect / PS finish_connect / EN verify）全部切换。
+    **防忘 bump 双保险**：`WIRE_VERSION_FINGERPRINTS` 注册表 + 单测
+    （wire schema 源文件任何改动 → 指纹变 → 测试 fail，强制显式
+    MIN/MAX 决策，pre-R3 规则 = bump MAX 且 MIN=MAX）；运行时 fraud
+    交叉校验（对端声明我方注册表已有的版本但指纹不符 → 拒绝）。
+  - manager: etcd `autumn-rs/cluster_version`（ASCII decimal，跨序列化
+    时代永远可读）+ CAS-imprint（首 leader 种到自身 max）+ replay 安装
+    + `bump_cluster_version`（leader-only、严格 current+1、≤自身 max、
+    value-CAS 防并发双 bump）。`GetClusterIdResp` 携带区间+
+    cluster_version（该结构从 R1 起冻结=协商通道）。
+  - autumn-op: `cluster-version`（GET 走 etcd 新读防 follower 陈旧）+
+    `upgrade-version [--to N]`。
+  - 顺手修复 cluster.sh 两个预存在 bug：① restart 竞态（旧 leader 10s
+    租约残留 + format 需 leader → set -e 中途夭折；launch_manager 增加
+    leadership 等待门）；② save_cluster_config 在零 AUTUMN_* 环境变量
+    时 grep 空匹配 + pipefail 中止 do_start；以及 rolling_restart.sh
+    的 bash IFS=TAB 吞前导空字段 bug（空 start 分区探针仍错路由——
+    1 分区回归跑暴露；改 '|' 分隔 + 打印派生前缀审计行）。
+- **coco（GPT-5.5）3P1+3P2，4 采纳 + 2 文档化:** ① P1 新端 decode 旧
+  GetClusterIdResp 失败先于兼容检查 → 文档化为冻结契约（R1 本身是
+  same-commit 部署，握手从 R1 之后的版本对开始生效，前提=该结构冻结）;
+  ② P1 异指纹同区间放行 → 运行时注册表 fraud 交叉校验（采纳）; ③ P1
+  持久值超 max 未拒 → parse_cluster_version 单点 fail-closed（采纳，
+  回滚安全从约定变机制）; ④ P2 imprint 失败仍当 leader → 维持
+  best-effort 并补安全论证（无 gate 消费者 + bump 对缺失 key 天然 CAS
+  拒绝 + 每轮选举重试）; ⑤ P2 follower 陈旧读 → GET 走 etcd 新读
+  （采纳）; ⑥ P2 --to 缺参 panic → 越界检查（采纳）。
+- **验收:** 单测全绿（rpc 25 含 5 新 wire-version 测试、manager 152 含
+  bump 校验+回滚拒绝 2 新测、ps 162、stream 77、client 27）。live：
+  fresh 集群 cluster_version=1/[1,1]；upgrade-version 正确拒绝（超
+  max，给出"先升二进制"指引）；restart-manager 后 etcd replay 读回；
+  **真混版本实测**：R0 时代旧 autumn-op 连新 manager → 响亮拒绝
+  （decode 失败 + 指引 rebuild）；--to 缺参走 usage 不 panic；4 分区
+  rolling_restart 全序列零丢失回归 PASS（4 个探针前缀含 p0='0' 全部
+  可证明在区间内）。
+- **passes:** completed (2026-06-12)

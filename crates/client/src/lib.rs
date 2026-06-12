@@ -544,7 +544,13 @@ impl ClusterClient {
             let resp = rkyv_decode::<GetClusterIdResp>(&resp_bytes).map_err(|e| {
                 anyhow!("decode GetClusterIdResp failed ({e}) — possible wire-schema mismatch; rebuild from the cluster's commit")
             })?;
-            if let Err(msg) = autumn_rpc::wire_fingerprint_check(&resp.wire_fingerprint) {
+            // R1: interval-overlap compat check (same-fingerprint fast
+            // path inside; refusal message carries both intervals).
+            if let Err(msg) = autumn_rpc::wire_compat_check(
+                &resp.wire_fingerprint,
+                resp.wire_version_min,
+                resp.wire_version_max,
+            ) {
                 return Err(anyhow!(msg));
             }
         }

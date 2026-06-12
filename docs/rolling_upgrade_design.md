@@ -1,9 +1,11 @@
-# Rolling Upgrade 设计（v1.1，2026-06-12）
+# Rolling Upgrade 设计（v1.2，2026-06-12）
 
-> 状态：**R0 已实现并实测通过**（scripts/rolling_restart.sh，3-EN/4 分区
-> 持续写负载下全序列零丢失）；R1+ 待实现。WIRE-1（981c3ef）已把混版本
-> 部署从静默损坏变为启动硬拒绝——本文档定义如何把这个硬拒绝**有计划地
-> 放宽**成真正的滚动升级能力。
+> 状态：**R0 + R1 已实现并实测通过**（R0: scripts/rolling_restart.sh，
+> 3-EN/4 分区持续写负载下全序列零丢失；R1: cluster_version 门 +
+> `[min_wire,max_wire]` 区间握手 + 指纹注册表防忘 bump + 回滚
+> fail-closed）。R2/R3 待用户拍板（§9 决策点 1/2）。WIRE-1（981c3ef）
+> 已把混版本部署从静默损坏变为启动硬拒绝——本文档定义如何把这个硬拒绝
+> **有计划地放宽**成真正的滚动升级能力。
 
 ## 1. 目标与非目标
 
@@ -42,7 +44,14 @@ harness）。把这个能力固化为运维程序：
 - 价值：同 commit 的配置变更/换机/内核升级即刻可滚动；同时它就是 R1+
   之后真正升级编排的骨架。
 
-### R1 — cluster_version 门 + 连接握手（地基，~3 天）
+### R1 — cluster_version 门 + 连接握手（地基，~3 天）✅ 已实现 2026-06-12
+
+> 实现注记：① 区间握手经由 `GetClusterIdResp`（该结构从 R1 起**冻结**——
+> 它是协商通道本身，再改布局会让混版本握手不可达）；② 防忘 bump =
+> `WIRE_VERSION_FINGERPRINTS` 注册表 + 单测（schema 源文件任何改动都使
+> 指纹变化并 fail 测试，强制显式版本决策）+ 运行时 fraud 交叉校验（对端
+> 声明我方已知版本但指纹不符 → 拒绝）；③ 回滚 fail-closed：manager 读到
+> 持久 cluster_version 超出自身 max_wire 时拒绝（经 replay 阻断当选）。
 
 参照 TiKV/CockroachDB 的 cluster version 模型：
 
