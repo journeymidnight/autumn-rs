@@ -294,6 +294,7 @@ dependencies = [
  "crc32c",
  "futures",
  "libc",
+ "prost",
  "rkyv",
  "thiserror 2.0.18",
  "tracing",

@@ -185,12 +185,64 @@ where
     rkyv::from_bytes::<T, RkyvError>(&v).map_err(|e| format!("rkyv decode: {e}"))
 }
 
+// ── prost helpers (R2: control-plane + etcd values, rolling upgrade §R2) ──────
+//
+// prost's tag-based protobuf encoding gives forward/backward field-evolution
+// for free (new optional fields ignored by old readers; missing fields default
+// on new readers) — the property rkyv's memory-layout archive cannot provide,
+// and the hard prerequisite for cross-version etcd replay (design §2).
+// Control-plane is low-frequency so the per-call encode/decode cost is
+// irrelevant; the hot path (partition_rpc / extent_rpc) stays rkyv.
+//
+// IMPORTANT — determinism: prost (Rust) encodes fields in tag order and
+// `repeated` in slice order, so for a struct with NO `map` fields, two encodes
+// of the same value are byte-identical. The etcd value-CAS (manager note 33)
+// depends on this: the CAS baseline `prost_encode(stream_as_read)` must
+// byte-match what is stored in etcd. NEVER use prost `map<>` on a persisted
+// type — use a named-pair `repeated` instead (see `U64U32Pair`).
+
+/// Serialize a `prost::Message` to `Bytes`.
+pub fn prost_encode<T: prost::Message>(val: &T) -> Bytes {
+    let mut buf = Vec::with_capacity(val.encoded_len());
+    // Encoding into a `Vec` is infallible (only fails on a short fixed buffer).
+    val.encode(&mut buf).expect("prost encode into Vec is infallible");
+    Bytes::from(buf)
+}
+
+/// Deserialize a `prost::Message` from bytes.
+pub fn prost_decode<T: prost::Message + Default>(data: &[u8]) -> Result<T, String> {
+    T::decode(data).map_err(|e| format!("prost decode: {e}"))
+}
+
+/// Named pair replacing tuple fields `Vec<(u64, u32)>` on persisted /
+/// control-plane messages (prost can't derive a tuple, and its `map<>`
+/// alternative is non-deterministic — see the determinism note above).
+#[derive(Archive, Serialize, Deserialize, Clone, PartialEq, Eq, prost::Message)]
+pub struct U64U32Pair {
+    #[prost(uint64, tag = "1")]
+    pub key: u64,
+    #[prost(uint32, tag = "2")]
+    pub val: u32,
+}
+
+impl U64U32Pair {
+    pub fn new(key: u64, val: u32) -> Self {
+        Self { key, val }
+    }
+}
+
 // ── Shared domain types ─────────────────────────────────────────────────────
 
 /// Range of keys [start_key, end_key). Empty end_key means unbounded.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+//
+// R2: dual rkyv+prost derive (prost provides Debug+Default — dropped from the
+// derive list; PartialEq/Eq kept). Persisted nested in MgrRegionInfo /
+// MgrPartitionMeta; also on the wire.
+#[derive(Archive, Serialize, Deserialize, Clone, PartialEq, Eq, prost::Message)]
 pub struct MgrRange {
+    #[prost(bytes = "vec", tag = "1")]
     pub start_key: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
     pub end_key: Vec<u8>,
 }
 
@@ -209,23 +261,33 @@ pub struct MgrRange {
 /// trigger a spurious `disk online → offline` flap. Empty = legacy node
 /// that hasn't been re-registered yet; manager falls back to `address` so
 /// upgrades are zero-downtime.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+// R2: dual rkyv+prost. `shard_ports` widened u16→u32 (protobuf has no
+// 16-bit type); ports fit u32 and are only ever used as integers.
+#[derive(Archive, Serialize, Deserialize, Clone, prost::Message)]
 pub struct MgrNodeInfo {
+    #[prost(uint64, tag = "1")]
     pub node_id: u64,
+    #[prost(string, tag = "2")]
     pub address: String,
+    #[prost(uint64, repeated, tag = "3")]
     pub disks: Vec<u64>,
     /// Optional per-shard ports. Empty = legacy single-thread extent-node.
-    pub shard_ports: Vec<u16>,
+    #[prost(uint32, repeated, tag = "4")]
+    pub shard_ports: Vec<u32>,
     /// F191: optional control-plane address. Empty = legacy node;
     /// manager falls back to `address` for DF.
+    #[prost(string, tag = "5")]
     pub control_address: String,
 }
 
 /// Disk metadata.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+#[derive(Archive, Serialize, Deserialize, Clone, prost::Message)]
 pub struct MgrDiskInfo {
+    #[prost(uint64, tag = "1")]
     pub disk_id: u64,
+    #[prost(bool, tag = "2")]
     pub online: bool,
+    #[prost(string, tag = "3")]
     pub uuid: String,
 }
 
@@ -267,17 +329,24 @@ pub struct MgrEcDispatchInflight {
 }
 
 /// Extent metadata — mirrors proto ExtentInfo.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Archive, Serialize, Deserialize, Clone, prost::Message)]
 pub struct MgrExtentInfo {
+    #[prost(uint64, tag = "1")]
     pub extent_id: u64,
+    #[prost(uint64, repeated, tag = "2")]
     pub replicates: Vec<u64>,
+    #[prost(uint64, repeated, tag = "3")]
     pub parity: Vec<u64>,
+    #[prost(uint64, tag = "4")]
     pub eversion: u64,
+    #[prost(uint64, tag = "5")]
     pub refs: u64,
     /// Number of live SSTables across all partitions whose ValuePointers
     /// still reference this extent. Distinct from `refs`, which counts
     /// direct stream membership via `stream.extent_ids`.
+    #[prost(uint64, tag = "6")]
     pub vp_table_refs: u64,
+    #[prost(uint64, tag = "7")]
     pub sealed_length: u64,
     /// True once this extent has been SEALED (immutable; no more appends).
     /// The explicit flag — NOT `sealed_length > 0` — is the authoritative
@@ -287,9 +356,13 @@ pub struct MgrExtentInfo {
     /// the LENGTH (used for "is empty" / EC-min-size / read-bound checks);
     /// `sealed` is the STATE. Invariant: `sealed_length > 0 ⇒ sealed`. A fresh
     /// open extent is `sealed = false`.
+    #[prost(bool, tag = "8")]
     pub sealed: bool,
+    #[prost(uint32, tag = "9")]
     pub avali: u32,
+    #[prost(uint64, repeated, tag = "10")]
     pub replicate_disks: Vec<u64>,
+    #[prost(uint64, repeated, tag = "11")]
     pub parity_disks: Vec<u64>,
     /// True iff `apply_ec_conversion_done` has rewritten this extent's
     /// shards into RS-encoded form. False for (a) freshly allocated
@@ -298,6 +371,7 @@ pub struct MgrExtentInfo {
     /// the manager's `ec_conversion_dispatch_loop` to fire. Read paths
     /// branch on this, NOT on `parity.is_empty()` — see programming
     /// note in `crates/stream/CLAUDE.md`.
+    #[prost(bool, tag = "12")]
     pub ec_converted: bool,
 }
 
@@ -320,32 +394,45 @@ pub struct MgrExtentInfo {
 /// field was introduced deserialise with `replicates = 0`. Callers must
 /// treat `replicates == 0` as "unknown — derive from one of the stream's
 /// open extents' `replicates.len()`".
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Archive, Serialize, Deserialize, Clone, prost::Message)]
 pub struct MgrStreamInfo {
+    #[prost(uint64, tag = "1")]
     pub stream_id: u64,
+    #[prost(uint64, repeated, tag = "2")]
     pub extent_ids: Vec<u64>,
+    #[prost(uint32, tag = "3")]
     pub ec_data_shard: u32,
+    #[prost(uint32, tag = "4")]
     pub ec_parity_shard: u32,
+    #[prost(uint32, tag = "5")]
     pub replicates: u32,
 }
 
 /// Partition metadata.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Archive, Serialize, Deserialize, Clone, prost::Message)]
 pub struct MgrPartitionMeta {
+    #[prost(uint64, tag = "1")]
     pub part_id: u64,
+    #[prost(uint64, tag = "2")]
     pub log_stream: u64,
+    #[prost(uint64, tag = "3")]
     pub row_stream: u64,
+    #[prost(uint64, tag = "4")]
     pub meta_stream: u64,
+    #[prost(message, optional, tag = "5")]
     pub rg: Option<MgrRange>,
 }
 
 /// Partition-scoped snapshot of live SST VP dependencies.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Archive, Serialize, Deserialize, Clone, prost::Message)]
 pub struct MgrPartitionVpRefs {
+    #[prost(uint64, tag = "1")]
     pub part_id: u64,
     /// extent_id -> number of live SSTs in this partition whose VP deps
-    /// include that extent.
-    pub refs: Vec<(u64, u32)>,
+    /// include that extent. R2: tuple `Vec<(u64,u32)>` → named-pair
+    /// `Vec<U64U32Pair>` (prost can't derive tuples; map is non-det).
+    #[prost(message, repeated, tag = "2")]
+    pub refs: Vec<U64U32Pair>,
 }
 
 /// Region (partition→PS assignment).
@@ -357,14 +444,21 @@ pub struct MgrPartitionVpRefs {
 /// reject stale routing without a manager round-trip. Bootstrap value
 /// is 1; `0` is reserved as "unknown / skip check" so legacy callers
 /// and tests that don't populate it stay backward-compatible.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+#[derive(Archive, Serialize, Deserialize, Clone, prost::Message)]
 pub struct MgrRegionInfo {
+    #[prost(message, optional, tag = "1")]
     pub rg: Option<MgrRange>,
+    #[prost(uint64, tag = "2")]
     pub part_id: u64,
+    #[prost(uint64, tag = "3")]
     pub ps_id: u64,
+    #[prost(uint64, tag = "4")]
     pub log_stream: u64,
+    #[prost(uint64, tag = "5")]
     pub row_stream: u64,
+    #[prost(uint64, tag = "6")]
     pub meta_stream: u64,
+    #[prost(uint64, tag = "7")]
     pub region_epoch: u64,
 }
 
@@ -676,10 +770,14 @@ pub struct RegisterPartitionAddrReq {
 // Response: CodeResp
 
 // --- SyncPartitionVpRefs ---
+// R2: `refs` carries the same shape as the persisted MgrPartitionVpRefs.refs,
+// so it uses the same `U64U32Pair` (no tuple↔pair boundary conversion). This
+// RPC struct itself stays rkyv until the R2-B RPC conversion; U64U32Pair
+// derives both codecs so it rides on the rkyv wire fine.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct SyncPartitionVpRefsReq {
     pub part_id: u64,
-    pub refs: Vec<(u64, u32)>,
+    pub refs: Vec<U64U32Pair>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
@@ -1661,4 +1759,108 @@ pub struct MgrInodeLeaseRecord {
     /// Unix seconds. The persisted deadline survives leader failover so
     /// the new leader's TTL revoke loop fires on the correct schedule.
     pub expires_at: i64,
+}
+
+// ── R2 prost round-trip + determinism tests ──────────────────────────────────
+//
+// Guards: (1) each persisted type prost round-trips, (2) encoding is
+// DETERMINISTIC (byte-stable across re-encodes of the same value AND across a
+// decode→re-encode cycle) — the property the manager-note-33 etcd value-CAS
+// relies on, and the reason persisted types must never use prost `map<>`.
+#[cfg(test)]
+mod r2_prost_tests {
+    use super::*;
+
+    // Asserts the two properties the etcd value-CAS depends on, without
+    // requiring `PartialEq` on the type: (1) re-encoding the same value is
+    // byte-identical (determinism), (2) decode→re-encode is byte-identical
+    // (round-trip byte-stability — what the CAS baseline compares against).
+    fn assert_roundtrip_and_det<T>(v: &T)
+    where
+        T: prost::Message + Default,
+    {
+        let a = prost_encode(v);
+        let b = prost_encode(v);
+        assert_eq!(a, b, "prost encode must be deterministic (re-encode)");
+        let decoded: T = prost_decode(&a).expect("decode");
+        let re = prost_encode(&decoded);
+        assert_eq!(a, re, "decode→re-encode must be byte-stable (CAS invariant)");
+    }
+
+    #[test]
+    fn persisted_types_roundtrip_and_deterministic() {
+        assert_roundtrip_and_det(&MgrRange {
+            start_key: vec![1, 2, 0, 255],
+            end_key: vec![],
+        });
+        assert_roundtrip_and_det(&MgrNodeInfo {
+            node_id: 7,
+            address: "h:9101".into(),
+            disks: vec![1, 2, 3],
+            shard_ports: vec![9101, 9111, 9121],
+            control_address: "h:10101".into(),
+        });
+        assert_roundtrip_and_det(&MgrDiskInfo {
+            disk_id: 4,
+            online: true,
+            uuid: "uuid-x".into(),
+        });
+        assert_roundtrip_and_det(&MgrStreamInfo {
+            stream_id: 9,
+            extent_ids: vec![10, 20, 30],
+            ec_data_shard: 4,
+            ec_parity_shard: 1,
+            replicates: 3,
+        });
+        assert_roundtrip_and_det(&MgrExtentInfo {
+            extent_id: 11,
+            replicates: vec![1, 3, 5],
+            parity: vec![7],
+            eversion: 2,
+            refs: 1,
+            vp_table_refs: 4,
+            sealed_length: 8 << 20,
+            sealed: true,
+            avali: 0xF,
+            replicate_disks: vec![2, 4, 6],
+            parity_disks: vec![8],
+            ec_converted: true,
+        });
+        assert_roundtrip_and_det(&MgrPartitionMeta {
+            part_id: 13,
+            log_stream: 7,
+            row_stream: 9,
+            meta_stream: 11,
+            rg: Some(MgrRange {
+                start_key: vec![0x3f],
+                end_key: vec![0x7f],
+            }),
+        });
+        assert_roundtrip_and_det(&MgrPartitionVpRefs {
+            part_id: 13,
+            refs: vec![U64U32Pair::new(10, 2), U64U32Pair::new(20, 5)],
+        });
+        assert_roundtrip_and_det(&MgrRegionInfo {
+            rg: Some(MgrRange {
+                start_key: vec![],
+                end_key: vec![0xbf],
+            }),
+            part_id: 13,
+            ps_id: 1,
+            log_stream: 7,
+            row_stream: 9,
+            meta_stream: 11,
+            region_epoch: 3,
+        });
+    }
+
+    #[test]
+    fn default_value_roundtrips() {
+        // proto3 omits zero/empty fields on the wire; a default value must
+        // still decode back to the same all-zero struct (no field shifts).
+        assert_roundtrip_and_det(&MgrExtentInfo::default());
+        assert_roundtrip_and_det(&MgrStreamInfo::default());
+        assert_roundtrip_and_det(&MgrRegionInfo::default());
+        assert_roundtrip_and_det(&MgrPartitionVpRefs::default());
+    }
 }

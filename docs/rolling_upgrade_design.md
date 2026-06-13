@@ -68,6 +68,13 @@ harness）。把这个能力固化为运维程序：
 
 ### R2 — 控制面 schema 演进：manager_rpc + etcd 值迁移 prost（核心投资，~1-2 周）
 
+> 进度：**R2-A 已实现 2026-06-13** —— etcd 7 个核心元数据前缀（nodes/
+> disks/streams/extents/partitions/partitionVpRefs/regions）rkyv→prost，
+> = 本设计 §2 列的硬前提（etcd 跨版本可重放）。rkyv+prost 双 derive 共存
+> 技术验证；用户拍板全量迁移 + cluster.sh reset 切换；WIRE_VERSION→2。
+> 端到端实测：reset/manager-restart-replay/split/rolling-restart 全过零丢失。
+> 待续 R2-B：manager_rpc 全部 RPC 结构 + 剩余持久前缀。
+
 **这是本设计最大的一次性成本，换取长期免演进负担。**
 
 - 范围：manager_rpc 全部请求/响应结构 + 54 处 etcd mirror 值。

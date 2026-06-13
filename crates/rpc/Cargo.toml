@@ -15,6 +15,7 @@ bytes.workspace = true
 compio = { version = "0.18", features = ["net", "time", "macros"] }
 crc32c.workspace = true
 rkyv = { version = "0.8.15", features = ["alloc"] }
+prost = "0.12"
 thiserror.workspace = true
 futures = "0.3"
 tracing = "0.1"

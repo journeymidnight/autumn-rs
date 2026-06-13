@@ -1855,3 +1855,33 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     `GetClusterIdResp` carries `{wire_version_min, wire_version_max,
     cluster_version}` for the startup handshake — that struct is FROZEN
     from R1 on (see rpc CLAUDE.md R1 section).
+
+39. **R2-A — etcd-persisted core metadata is prost, not rkyv (rolling upgrade
+    §R2 hard prerequisite).** The 7 core metadata prefixes —
+    `nodes/`/`disks/`/`streams/`/`extents/`/`partitions/`/`partitionVpRefs/`/
+    `regions/` — encode/decode with `prost_encode`/`prost_decode`
+    (`manager_rpc`), giving tag-based forward/backward field evolution so a new
+    leader can replay an etcd written by a different version (rkyv's memory-
+    layout archive can't). The persisted types derive BOTH rkyv (still used by
+    the not-yet-converted RPC structs that embed them) AND `prost::Message`
+    (prost provides Debug+Default — dropped from the derive list; PartialEq/Eq
+    kept). Type changes the prost mapping forced: `MgrNodeInfo.shard_ports`
+    u16→u32 (no 16-bit protobuf type; widened at the manager boundary only,
+    hot-path stays u16), `MgrPartitionVpRefs.refs` tuple→`U64U32Pair`
+    (`SyncPartitionVpRefsReq.refs` too, so no boundary conversion).
+    **Determinism is load-bearing (note 33 CAS):** prost is byte-deterministic
+    only WITHOUT `map<>` fields — persisted types use named-pair `repeated`
+    (`U64U32Pair`), never prost `map`, so the `streams/<id>` value-CAS baseline
+    (`prost_encode(stream_as_read)`) byte-matches the stored value. Round-trip +
+    determinism tests in `manager_rpc::r2_prost_tests`.
+    **Switch method = `cluster.sh reset` (etcd wiped); NO in-place rkyv→prost
+    migration.** A v1 (rkyv) etcd is unreadable by a v2 (prost) binary — that is
+    the whole point of the WIRE_VERSION 1→2 bump (MIN=MAX=2, no overlap): a v1
+    binary refuses a v2 cluster and the rollback-fail-closed `parse_cluster_
+    version` blocks a v1 binary from a bumped cluster. Same same-commit-deploy
+    convention as every prior backward-incompat etcd change (region_epoch, F183
+    merge, ...). Still rkyv (R2-B follow-up): all manager_rpc REQUEST/RESPONSE
+    structs + the `node_override/`/`decommissioned/`/`extent_inflight/`/
+    `extentDeleteRetry/`/`inode_leases/` persisted prefixes. (Already format-
+    stable, no codec: `ownerLocks/`=etcd mod_revision, `psNodes/`=raw UTF-8,
+    `partitionLastOp/`=i64 LE, `cluster_id`/`cluster_version`=ASCII.)

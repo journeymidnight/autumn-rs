@@ -1814,7 +1814,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let mut decoded_nodes = HashMap::new();
         for kv in &nodes.kvs {
             let id = Self::parse_id_from_key("nodes/", &kv.key)?;
-            let node: MgrNodeInfo = rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let node: MgrNodeInfo = prost_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             max_id = max_id.max(id);
             decoded_nodes.insert(id, node);
         }
@@ -1822,7 +1822,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let mut decoded_disks = HashMap::new();
         for kv in &disks.kvs {
             let id = Self::parse_id_from_key("disks/", &kv.key)?;
-            let disk: MgrDiskInfo = rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let disk: MgrDiskInfo = prost_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             max_id = max_id.max(id);
             decoded_disks.insert(id, disk);
         }
@@ -1830,7 +1830,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let mut decoded_streams = HashMap::new();
         for kv in &streams.kvs {
             let id = Self::parse_id_from_key("streams/", &kv.key)?;
-            let st: MgrStreamInfo = rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let st: MgrStreamInfo = prost_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             max_id = max_id.max(id);
             decoded_streams.insert(id, st);
         }
@@ -1838,7 +1838,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let mut decoded_extents = HashMap::new();
         for kv in &extents.kvs {
             let id = Self::parse_id_from_key("extents/", &kv.key)?;
-            let ex: MgrExtentInfo = rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let ex: MgrExtentInfo = prost_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             max_id = max_id.max(id);
             decoded_extents.insert(id, ex);
         }
@@ -1864,7 +1864,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         for kv in &partitions.kvs {
             let id = Self::parse_id_from_key("partitions/", &kv.key)?;
             let part: MgrPartitionMeta =
-                rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
+                prost_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             max_id = max_id.max(id);
             decoded_partitions.insert(id, part);
         }
@@ -1873,7 +1873,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         for kv in &partition_vp_refs.kvs {
             let id = Self::parse_id_from_key("partitionVpRefs/", &kv.key)?;
             let refs: MgrPartitionVpRefs =
-                rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
+                prost_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             max_id = max_id.max(id);
             decoded_partition_vp_refs.insert(id, refs);
         }
@@ -1889,7 +1889,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         for kv in &regions.kvs {
             let id = Self::parse_id_from_key("regions/", &kv.key)?;
             let region: MgrRegionInfo =
-                rkyv_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
+                prost_decode(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?;
             decoded_regions.insert(id, region);
         }
 
@@ -2866,7 +2866,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     }
 
     fn vp_refs_to_map(snapshot: &MgrPartitionVpRefs) -> HashMap<u64, u32> {
-        snapshot.refs.iter().copied().collect()
+        // R2: refs is Vec<U64U32Pair> (prost-friendly, was Vec<(u64,u32)>).
+        snapshot.refs.iter().map(|p| (p.key, p.val)).collect()
     }
 
     fn partition_vp_ref_deltas(
@@ -2976,13 +2977,14 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             .get(&victim_id)
             .cloned()
             .unwrap_or_default();
-        let mut sum: HashMap<u64, u32> = survivor.refs.iter().copied().collect();
-        for (eid, n) in victim.refs.iter().copied() {
-            *sum.entry(eid).or_insert(0) += n;
+        let mut sum: HashMap<u64, u32> =
+            survivor.refs.iter().map(|p| (p.key, p.val)).collect();
+        for p in &victim.refs {
+            *sum.entry(p.key).or_insert(0) += p.val;
         }
         MgrPartitionVpRefs {
             part_id: survivor_id,
-            refs: sum.into_iter().collect(),
+            refs: sum.into_iter().map(|(k, v)| U64U32Pair::new(k, v)).collect(),
         }
     }
 
@@ -3084,7 +3086,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// F099-M: look up `shard_ports` for a node by address, so we can
     /// route extent RPCs to the owning shard. Returns empty Vec if the
     /// node isn't found (shouldn't happen in practice but stays safe).
-    fn shard_ports_for_addr(&self, addr: &str) -> Vec<u16> {
+    // R2: returns u32 (MgrNodeInfo.shard_ports is prost u32).
+    fn shard_ports_for_addr(&self, addr: &str) -> Vec<u32> {
         let normalized = Self::normalize_endpoint(addr);
         let s = self.store.inner.borrow();
         for node in s.nodes.values() {
@@ -3097,7 +3100,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
 
     /// F099-M: route an address to the shard listening for `extent_id`.
     /// If `shard_ports` is empty, returns `addr` unchanged (legacy mode).
-    fn shard_addr_for_extent(addr: &str, shard_ports: &[u16], extent_id: u64) -> String {
+    fn shard_addr_for_extent(addr: &str, shard_ports: &[u32], extent_id: u64) -> String {
         if shard_ports.is_empty() {
             return addr.to_string();
         }
@@ -3231,7 +3234,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
 
     async fn persist_extent(&self, extent: &MgrExtentInfo) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
-            let value = rkyv_encode(extent).to_vec();
+            let value = prost_encode(extent).to_vec();
             etcd.put_msgs_txn(vec![(format!("extents/{}", extent.extent_id), value)])
                 .await?;
         }
@@ -3291,12 +3294,12 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             let mut kvs = Vec::with_capacity(1 + disks.len());
             kvs.push((
                 format!("nodes/{}", node.node_id),
-                rkyv_encode(node).to_vec(),
+                prost_encode(node).to_vec(),
             ));
             for disk in disks {
                 kvs.push((
                     format!("disks/{}", disk.disk_id),
-                    rkyv_encode(disk).to_vec(),
+                    prost_encode(disk).to_vec(),
                 ));
             }
             etcd.put_msgs_txn(kvs).await?;
@@ -3308,7 +3311,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         if let Some(etcd) = &self.etcd {
             let kvs = vec![(
                 format!("streams/{}", stream.stream_id),
-                rkyv_encode(stream).to_vec(),
+                prost_encode(stream).to_vec(),
             )];
             etcd.put_msgs_txn(kvs).await?;
         }
@@ -3324,11 +3327,11 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             let kvs = vec![
                 (
                     format!("streams/{}", stream.stream_id),
-                    rkyv_encode(stream).to_vec(),
+                    prost_encode(stream).to_vec(),
                 ),
                 (
                     format!("extents/{}", extent.extent_id),
-                    rkyv_encode(extent).to_vec(),
+                    prost_encode(extent).to_vec(),
                 ),
             ];
             etcd.put_msgs_txn(kvs).await?;
@@ -3357,17 +3360,17 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         if let Some(etcd) = &self.etcd {
             let mut kvs = vec![(
                 format!("streams/{}", stream.stream_id),
-                rkyv_encode(stream).to_vec(),
+                prost_encode(stream).to_vec(),
             )];
             if let Some(sealed_old) = sealed_old {
                 kvs.push((
                     format!("extents/{}", sealed_old.extent_id),
-                    rkyv_encode(sealed_old).to_vec(),
+                    prost_encode(sealed_old).to_vec(),
                 ));
             }
             kvs.push((
                 format!("extents/{}", new_extent.extent_id),
-                rkyv_encode(new_extent).to_vec(),
+                prost_encode(new_extent).to_vec(),
             ));
             let cas: Vec<(String, Vec<u8>)> = stream_cas
                 .map(|v| (format!("streams/{}", stream.stream_id), v))
@@ -3391,12 +3394,12 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             let mut puts = Vec::with_capacity(1 + extent_puts.len());
             puts.push((
                 format!("streams/{}", stream.stream_id),
-                rkyv_encode(stream).to_vec(),
+                prost_encode(stream).to_vec(),
             ));
             for ex in extent_puts {
                 puts.push((
                     format!("extents/{}", ex.extent_id),
-                    rkyv_encode(ex).to_vec(),
+                    prost_encode(ex).to_vec(),
                 ));
             }
             let deletes = extent_deletes
@@ -3423,10 +3426,10 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 kvs.push((format!("psNodes/{ps_id}"), addr.into_bytes()));
             }
             for (part_id, part) in partitions {
-                kvs.push((format!("partitions/{part_id}"), rkyv_encode(&part).to_vec()));
+                kvs.push((format!("partitions/{part_id}"), prost_encode(&part).to_vec()));
             }
             for (part_id, region) in regions {
-                kvs.push((format!("regions/{part_id}"), rkyv_encode(&region).to_vec()));
+                kvs.push((format!("regions/{part_id}"), prost_encode(&region).to_vec()));
             }
             etcd.put_msgs_txn(kvs).await?;
         }
@@ -3442,12 +3445,12 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             let mut kvs = Vec::with_capacity(extent_puts.len() + 1);
             kvs.push((
                 format!("partitionVpRefs/{}", snapshot.part_id),
-                rkyv_encode(snapshot).to_vec(),
+                prost_encode(snapshot).to_vec(),
             ));
             for ex in extent_puts {
                 kvs.push((
                     format!("extents/{}", ex.extent_id),
-                    rkyv_encode(ex).to_vec(),
+                    prost_encode(ex).to_vec(),
                 ));
             }
             etcd.put_msgs_txn(kvs).await?;
@@ -3793,7 +3796,7 @@ mod tests {
             &mut state,
             MgrPartitionVpRefs {
                 part_id: 7,
-                refs: vec![(21, 2), (48, 1)],
+                refs: vec![U64U32Pair::new(21, 2), U64U32Pair::new(48, 1)],
             },
         );
 
@@ -3805,7 +3808,7 @@ mod tests {
             &mut state,
             MgrPartitionVpRefs {
                 part_id: 7,
-                refs: vec![(48, 1)],
+                refs: vec![U64U32Pair::new(48, 1)],
             },
         );
 
@@ -4044,19 +4047,19 @@ mod tests {
             1,
             MgrPartitionVpRefs {
                 part_id: 1,
-                refs: vec![(10, 2), (20, 5)],
+                refs: vec![U64U32Pair::new(10, 2), U64U32Pair::new(20, 5)],
             },
         );
         state.partition_vp_refs.insert(
             2,
             MgrPartitionVpRefs {
                 part_id: 2,
-                refs: vec![(20, 3), (30, 7)],
+                refs: vec![U64U32Pair::new(20, 3), U64U32Pair::new(30, 7)],
             },
         );
         let merged = AutumnManager::merged_partition_vp_refs(&state, 1, 2);
         assert_eq!(merged.part_id, 1);
-        let map: HashMap<u64, u32> = merged.refs.iter().copied().collect();
+        let map: HashMap<u64, u32> = merged.refs.iter().map(|p| (p.key, p.val)).collect();
         assert_eq!(map.get(&10), Some(&2));
         assert_eq!(map.get(&20), Some(&8));
         assert_eq!(map.get(&30), Some(&7));
@@ -4070,13 +4073,13 @@ mod tests {
             10,
             MgrPartitionVpRefs {
                 part_id: 10,
-                refs: vec![(21, 2)],
+                refs: vec![U64U32Pair::new(21, 2)],
             },
         );
 
         let child = AutumnManager::split_partition_vp_snapshot(&state, 10, 11);
         assert_eq!(child.part_id, 11);
-        assert_eq!(child.refs, vec![(21, 2)]);
+        assert_eq!(child.refs, vec![U64U32Pair::new(21, 2)]);
 
         let preview = AutumnManager::preview_partition_vp_refs_apply(&state, &child);
         assert_eq!(preview.len(), 1);
@@ -6327,7 +6330,7 @@ mod tests {
             // Build request: refs delta adds 1 reference on extent_id.
             let req = rkyv_encode(&SyncPartitionVpRefsReq {
                 part_id,
-                refs: vec![(extent_id, 1)],
+                refs: vec![U64U32Pair::new(extent_id, 1)],
             });
 
             let resp = m.handle_sync_partition_vp_refs(req).await.unwrap();
@@ -6376,7 +6379,7 @@ mod tests {
             // Now call with no in-flight tasks: handler must succeed.
             let req_ok = rkyv_encode(&SyncPartitionVpRefsReq {
                 part_id,
-                refs: vec![(extent_id, 1)],
+                refs: vec![U64U32Pair::new(extent_id, 1)],
             });
             let resp_ok = m.handle_sync_partition_vp_refs(req_ok).await.unwrap();
             let r_ok: SyncPartitionVpRefsResp = rkyv_decode(&resp_ok).unwrap();

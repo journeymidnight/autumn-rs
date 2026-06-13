@@ -704,3 +704,36 @@ gaps in the lease protocol's correctness story.
   rolling_restart 全序列零丢失回归 PASS（4 个探针前缀含 p0='0' 全部
   可证明在区间内）。
 - **passes:** completed (2026-06-12)
+
+---
+
+### ROLL-R2-A · 控制面 prost 迁移第一阶段：etcd 核心元数据 → prost（rolling upgrade 设计 R2）（2026-06-13）
+- **目标:** docs/rolling_upgrade_design.md §2/§R2 的硬前提 —— etcd 持久值
+  跨版本可重放（rkyv 内存布局做不到；prost tag 编码天然前后兼容）。用户
+  拍板：全量迁移 + 切换方式 = cluster.sh reset。
+- **技术决策:** rkyv Archive + prost::Message 可共存于同一 struct（实测，
+  prost 提供 Debug+Default 故从 derive 去掉这两个，保留 Archive/Serialize/
+  Deserialize/Clone + PartialEq/Eq）。**持久类型必须用 named-pair
+  `repeated`（U64U32Pair）而非 prost `map<>`** —— map 编码非确定性会破坏
+  manager note 33 的 etcd value-CAS（baseline 字节比对）。u8/u16/[u8;N] 非
+  prost-native → u32/Vec<u8>。
+- **实现（本阶段=7 个核心前缀）:** nodes/disks/streams/extents/partitions/
+  partitionVpRefs/regions 的 7 个 Mgr* 类型双 derive + prost 字段 attr +
+  MgrRange(嵌套)；helper prost_encode/prost_decode；mirror_*/persist_extent/
+  split/merge/recovery 的 etcd 写 + replay 解码 + F33 CAS baseline 全切
+  prost；类型变更 shard_ports u16→u32（仅 manager 边界，热路径留 u16，coco
+  P2 用 try_from 非 as 截断）、VpRefs.refs tuple→U64U32Pair（含
+  SyncPartitionVpRefsReq）。WIRE_VERSION 1→2（MIN=MAX=2，与 v1 无交集；v2=
+  prost 格式，回滚到 v1 被 fail-closed 拦截）。
+- **coco（GPT-5.5）2P1+1P2:** 2 个 P1（旧 rkyv etcd 无法被 prost 读 / CAS
+  baseline 不匹配旧值）= 混合格式迁移顾虑，用户已拍板 cluster.sh reset 切换
+  （etcd 清空，仓库标准 same-commit 惯例 + v2 wire bump 强制旧二进制拒绝），
+  按设计接受并文档化；1 个 P2（as u16 静默截断）采纳 → u16::try_from +
+  越界丢弃告警。
+- **验收:** 单测全绿（rpc 27 含 prost round-trip+determinism+registry、
+  manager 152、ps 162、stream 77、client 27）。**live 端到端**：fresh
+  cluster.sh reset（cluster_version=2）put/get → manager 重启强制 prost
+  replay 全元数据，数据存活 + 4 分区路由正确 + 零 decode error；split（4→5
+  分区，prost split-write 块）+ 再次 manager 重启 replay，split 元数据+数据
+  存活；全序列 rolling_restart 零丢失。
+- **passes:** completed (2026-06-13) — R2-B（RPC 结构 + 剩余持久前缀）待续

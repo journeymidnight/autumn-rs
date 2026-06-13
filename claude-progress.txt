@@ -1,40 +1,38 @@
-Date: 2026-06-12
+Date: 2026-06-13
 TaskStatus: completed
-Task scope: rolling upgrade 实施（docs/rolling_upgrade_design.md v1.2）。
-  本次会话交付 R0（滚动重启程序化）+ R1（cluster_version 门 + wire
-  区间握手），均已实测 + coco 评审 + commit。R2（控制面 prost，~1-2 周）
-  / R3（数据面协商）按设计 §9 决策点 1/2 等用户拍板后另起任务。
+Task scope: rolling upgrade R2（控制面 prost 迁移）。本会话交付 R2-A =
+  etcd 核心元数据 7 前缀 rkyv→prost（设计 §2 硬前提）。R0+R1 已于前序
+  会话完成。R2-B（RPC 结构 + 剩余持久前缀）待续；R3（数据面协商）未开始。
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
-  Already implemented (this session):
-    - ROLL-R0 (020b02b): scripts/rolling_restart.sh（EN 逐个→PS→manager
-      + 收敛门 + per-partition 区间内探针 + seed 零丢失校验 + flock +
-      per-run 命名空间/清理）；cluster.sh start/stop/restart-manager。
-      实测 3-EN/4 分区持续负载 ×2 PASS，191/191 ACKed 零丢失。
-    - ROLL-R1: rpc [WIRE_VERSION_MIN,MAX] + wire_compat_check（区间交
-      集）+ WIRE_VERSION_FINGERPRINTS 注册表（单测强制 bump 决策 +
-      运行时 fraud 交叉校验）；manager etcd cluster_version（ASCII
-      decimal、CAS-imprint、replay、bump=leader-only/+1/≤max/value-CAS、
-      回滚 fail-closed）；GetClusterIdResp 携带区间+gate（结构冻结）；
-      autumn-op cluster-version / upgrade-version。真混版本（旧 op vs
-      新 manager）响亮拒绝实测。
-    - 顺手修复：cluster.sh restart 选主竞态（leadership 等待门）、
-      save_cluster_config pipefail 空匹配中止、rolling_restart.sh
-      IFS=TAB 吞空 start 字段（探针错路由）。
-  Not implemented (recorded):
-    - R2: manager_rpc 全量 + 54 处 etcd 值 prost 化 —— 需拍板范围
-      （§9.1: 全量 vs 仅 etcd 值）与切换方式（§9.2: reset vs 离线转换
-      工具）。
-    - R3: 数据面连接级 hello + FooReqV2 冻结纪律（按需触发）。
-    - upgrade_chaos.sh 双版本滚动 harness（依赖 R2/R3 才有真实意义；
-      当前版本窗口下混版本=启动拒绝，无可滚动的版本对）。
+  Already implemented (this session, R2-A):
+    - prost 基建：autumn-rpc 加 prost dep + prost_encode/prost_decode
+      helper + U64U32Pair（named-pair 替 tuple，确定性编码保 F33 CAS）。
+    - 7 核心持久类型双 derive（rkyv+prost）：MgrNodeInfo/MgrDiskInfo/
+      MgrStreamInfo/MgrExtentInfo/MgrPartitionMeta/MgrPartitionVpRefs/
+      MgrRegionInfo + MgrRange(嵌套)。
+    - etcd 写（mirror_*/persist_extent/split/merge/recovery）+ replay 解码
+      + F33 CAS baseline 全切 prost（这 7 前缀）。
+    - 类型变更：shard_ports u16→u32（仅 manager 边界）、VpRefs.refs
+      tuple→U64U32Pair。
+    - WIRE_VERSION 1→2（MIN=MAX=2；v2=prost 格式，回滚 fail-closed）。
+    - coco 2P1（混格式迁移=用户拍板 reset，文档化接受）+1P2（as u16→
+      try_from）。live 端到端验证（reset/replay/split/rolling 全过）。
+  Not implemented (R2-B + 后续，recorded):
+    - R2-B：manager_rpc 全部 REQUEST/RESPONSE 结构（~100 个，含 CodeResp.code
+      u8→u32 等大面 churn）+ 剩余持久前缀 node_override/decommissioned/
+      extent_inflight/extentDeleteRetry/inode_leases 切 prost；最后移除这些
+      类型的 rkyv derive。
+    - R3：数据面连接级 hello 协商 + FooReqV2 冻结纪律。
+    - upgrade_chaos.sh 双版本滚动 harness（依赖 R2 完成 + R3）。
+  已稳定无需改：ownerLocks=mod_revision/psNodes=UTF-8/partitionLastOp=i64
+    LE/cluster_id+cluster_version=ASCII。
 
 Current summary:
-  R0+R1 已 commit+push。设计文档状态 v1.2（R0/R1 标注 ✅ + 实现注记）。
-  单测全绿（rpc 25 / manager 152 / ps 162 / stream 77 / client 27）。
+  R2-A 已 commit。prost etcd replay 端到端实测通过（fresh/restart/split/
+  rolling 全绿，零 decode error，零数据丢失）。
 Main gaps:
-  - R2/R3 等用户对 §9 决策点 1/2 拍板。
+  - R2-B 是大面 churn（~100 RPC 结构 + u8/u16 churn）；R3 待 R2 完成。
 Next steps:
-  - 用户拍板后：R2 推荐路线 = manager_rpc 全量 + etcd 值 prost 化 +
-    cluster.sh reset 切换（开发期）；之后 R3 + upgrade_chaos.sh。
+  - R2-B：按 RPC 簇逐步切 prost（每簇 green+commit），最后移 rkyv。
