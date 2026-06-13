@@ -54,17 +54,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-// R2 (in development): v2 = control-plane + etcd values move rkyv→prost.
-// The persisted etcd format changes (a v1 binary cannot decode a v2
-// cluster's prost etcd values, and vice versa), so v2 is INCOMPATIBLE with
-// v1 — MIN = MAX = 2, no overlap with v1. While R2 is unreleased (deploys
-// are same-commit; the switch is `cluster.sh reset`), later R2 commits that
-// further change the schema UPDATE the v2 registry fingerprint in place
-// rather than bumping again — the version number tracks releases, not每个
-// dev edit. The first post-R3 release that adds a frozen-V1 + V2 msg_type
-// pair is what bumps MAX with MIN = MAX - 1 (the N↔N-1 rolling window).
-pub const WIRE_VERSION_MIN: u32 = 2;
-pub const WIRE_VERSION_MAX: u32 = 2;
+pub const WIRE_VERSION_MIN: u32 = 1;
+pub const WIRE_VERSION_MAX: u32 = 1;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -75,10 +66,6 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // v1: R1 baseline — GetClusterIdResp grew {wire_version_min,
     // wire_version_max, cluster_version}; MSG_GET/BUMP_CLUSTER_VERSION.
     (1, "321a8b3684f0bbb9"),
-    // v2: R2 prost migration (in development). Control-plane + etcd values
-    // move rkyv→prost; the fingerprint here is updated in place across R2's
-    // dev commits (still v2, unreleased) until the migration ships.
-    (2, "39266921da32dd52"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

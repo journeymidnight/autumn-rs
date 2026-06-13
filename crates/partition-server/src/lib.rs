@@ -7533,19 +7533,14 @@ pub(crate) async fn save_table_locs_raw(
     Ok(())
 }
 
-fn collect_partition_vp_refs(readers: &[Arc<SstReader>]) -> Vec<manager_rpc::U64U32Pair> {
+fn collect_partition_vp_refs(readers: &[Arc<SstReader>]) -> Vec<(u64, u32)> {
     let mut counts = BTreeMap::<u64, u32>::new();
     for reader in readers {
         for &extent_id in &reader.vp_deps {
             *counts.entry(extent_id).or_insert(0) += 1;
         }
     }
-    // R2: SyncPartitionVpRefsReq.refs is Vec<U64U32Pair> (matches the
-    // persisted MgrPartitionVpRefs shape — no tuple↔pair conversion).
-    counts
-        .into_iter()
-        .map(|(k, v)| manager_rpc::U64U32Pair::new(k, v))
-        .collect()
+    counts.into_iter().collect()
 }
 
 /// F210-C4: background retry task. Every 5 s, if `vp_refs_dirty` is

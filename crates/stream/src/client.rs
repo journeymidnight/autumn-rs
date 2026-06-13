@@ -1671,24 +1671,8 @@ impl StreamClient {
             return Err(anyhow!("nodes_info failed: {}", resp.message));
         }
         for (id, node) in resp.nodes {
-            // R2: MgrNodeInfo.shard_ports is prost u32; the hot-path conn
-            // cache + conn_pool::shard_addr_for_extent stay u16 (TCP ports).
-            // try_from, not `as` (coco P2): ports are u16-origin by
-            // construction, so this never drops in practice — but a corrupt /
-            // hand-edited >65535 value is skipped loudly (a silent `as u16`
-            // truncation would route to a plausible-but-wrong port).
-            let ports_u16: Vec<u16> = node
-                .shard_ports
-                .iter()
-                .filter_map(|&p| u16::try_from(p).ok())
-                .collect();
-            if ports_u16.len() != node.shard_ports.len() {
-                tracing::warn!(
-                    node_id = id,
-                    "dropping out-of-range shard_port(s) (>u16::MAX) from node cache"
-                );
-            }
-            self.nodes_cache.insert(id, (node.address, ports_u16));
+            self.nodes_cache
+                .insert(id, (node.address, node.shard_ports));
         }
         Ok(())
     }

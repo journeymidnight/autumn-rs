@@ -1856,32 +1856,16 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     cluster_version}` for the startup handshake — that struct is FROZEN
     from R1 on (see rpc CLAUDE.md R1 section).
 
-39. **R2-A — etcd-persisted core metadata is prost, not rkyv (rolling upgrade
-    §R2 hard prerequisite).** The 7 core metadata prefixes —
-    `nodes/`/`disks/`/`streams/`/`extents/`/`partitions/`/`partitionVpRefs/`/
-    `regions/` — encode/decode with `prost_encode`/`prost_decode`
-    (`manager_rpc`), giving tag-based forward/backward field evolution so a new
-    leader can replay an etcd written by a different version (rkyv's memory-
-    layout archive can't). The persisted types derive BOTH rkyv (still used by
-    the not-yet-converted RPC structs that embed them) AND `prost::Message`
-    (prost provides Debug+Default — dropped from the derive list; PartialEq/Eq
-    kept). Type changes the prost mapping forced: `MgrNodeInfo.shard_ports`
-    u16→u32 (no 16-bit protobuf type; widened at the manager boundary only,
-    hot-path stays u16), `MgrPartitionVpRefs.refs` tuple→`U64U32Pair`
-    (`SyncPartitionVpRefsReq.refs` too, so no boundary conversion).
-    **Determinism is load-bearing (note 33 CAS):** prost is byte-deterministic
-    only WITHOUT `map<>` fields — persisted types use named-pair `repeated`
-    (`U64U32Pair`), never prost `map`, so the `streams/<id>` value-CAS baseline
-    (`prost_encode(stream_as_read)`) byte-matches the stored value. Round-trip +
-    determinism tests in `manager_rpc::r2_prost_tests`.
-    **Switch method = `cluster.sh reset` (etcd wiped); NO in-place rkyv→prost
-    migration.** A v1 (rkyv) etcd is unreadable by a v2 (prost) binary — that is
-    the whole point of the WIRE_VERSION 1→2 bump (MIN=MAX=2, no overlap): a v1
-    binary refuses a v2 cluster and the rollback-fail-closed `parse_cluster_
-    version` blocks a v1 binary from a bumped cluster. Same same-commit-deploy
-    convention as every prior backward-incompat etcd change (region_epoch, F183
-    merge, ...). Still rkyv (R2-B follow-up): all manager_rpc REQUEST/RESPONSE
-    structs + the `node_override/`/`decommissioned/`/`extent_inflight/`/
-    `extentDeleteRetry/`/`inode_leases/` persisted prefixes. (Already format-
-    stable, no codec: `ownerLocks/`=etcd mod_revision, `psNodes/`=raw UTF-8,
-    `partitionLastOp/`=i64 LE, `cluster_id`/`cluster_version`=ASCII.)
+39. **升级安全 = 全停全启 + rkyv fail-loud(2026-06-13;R2-A prost 已回退)。**
+    生产升级 = 全停→换二进制→全起,etcd 永不清(绝不 `cluster.sh reset`)。
+    安全保证来自 **rkyv 校验式 `from_bytes`**:新二进制读旧 etcd,若持久
+    结构布局不符则响亮失败(`replay_from_etcd` 经 `replay_decode_err` 报
+    可操作提示 → manager 当不上 leader),**绝不静默把旧字节解成错值**。
+    R1 的 `cluster_version`(note 38)作格式版本戳:回滚到读不懂当前 etcd
+    的旧二进制被 `parse_cluster_version` 启动拒绝(回滚 fail-closed)。
+    **etcd schema 演进按需补**:第一次真要不 reset 改某持久结构时,那个
+    版本带一次性迁移(读旧→写新,幂等 + 格式戳收尾);在那之前零常驻演进
+    代码。**不变量:任何持久结构(etcd 值 / SST / .meta / WAL)改动都要么
+    保证 rkyv 同布局,要么随版本带迁移 —— 绝不依赖 reset。** 曾用 prost 给
+    "免 reset 自动演进"(R2-A),因纯复杂度 + 对"忘迁移"反而静默风险更高
+    而回退;详见 docs/rolling_upgrade_design.md §R2-final + [[feedback_stopworld_restart_primary]]。

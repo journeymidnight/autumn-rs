@@ -1,38 +1,33 @@
 Date: 2026-06-13
 TaskStatus: completed
-Task scope: rolling upgrade R2（控制面 prost 迁移）。本会话交付 R2-A =
-  etcd 核心元数据 7 前缀 rkyv→prost（设计 §2 硬前提）。R0+R1 已于前序
-  会话完成。R2-B（RPC 结构 + 剩余持久前缀）待续；R3（数据面协商）未开始。
+Task scope: 升级安全方向收敛。用户拍板:不做 rolling upgrade(混版本在线);
+  要"全停全启升级安全"+ 生产绝不 cluster.sh reset。R2-A(etcd→prost)已
+  回退;最终方案 = plain rkyv fail-loud + R1 格式戳 + 按需迁移。
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
-  Already implemented (this session, R2-A):
-    - prost 基建：autumn-rpc 加 prost dep + prost_encode/prost_decode
-      helper + U64U32Pair（named-pair 替 tuple，确定性编码保 F33 CAS）。
-    - 7 核心持久类型双 derive（rkyv+prost）：MgrNodeInfo/MgrDiskInfo/
-      MgrStreamInfo/MgrExtentInfo/MgrPartitionMeta/MgrPartitionVpRefs/
-      MgrRegionInfo + MgrRange(嵌套)。
-    - etcd 写（mirror_*/persist_extent/split/merge/recovery）+ replay 解码
-      + F33 CAS baseline 全切 prost（这 7 前缀）。
-    - 类型变更：shard_ports u16→u32（仅 manager 边界）、VpRefs.refs
-      tuple→U64U32Pair。
-    - WIRE_VERSION 1→2（MIN=MAX=2；v2=prost 格式，回滚 fail-closed）。
-    - coco 2P1（混格式迁移=用户拍板 reset，文档化接受）+1P2（as u16→
-      try_from）。live 端到端验证（reset/replay/split/rolling 全过）。
-  Not implemented (R2-B + 后续，recorded):
-    - R2-B：manager_rpc 全部 REQUEST/RESPONSE 结构（~100 个，含 CodeResp.code
-      u8→u32 等大面 churn）+ 剩余持久前缀 node_override/decommissioned/
-      extent_inflight/extentDeleteRetry/inode_leases 切 prost；最后移除这些
-      类型的 rkyv derive。
-    - R3：数据面连接级 hello 协商 + FooReqV2 冻结纪律。
-    - upgrade_chaos.sh 双版本滚动 harness（依赖 R2 完成 + R3）。
-  已稳定无需改：ownerLocks=mod_revision/psNodes=UTF-8/partitionLastOp=i64
-    LE/cluster_id+cluster_version=ASCII。
+  Already implemented / 当前状态:
+    - R0(020b02b,保留):scripts/rolling_restart.sh + cluster.sh
+      start/stop/restart-manager。同版本零停机滚动重启运维工具。
+    - R1(f78a61e,保留):wire 区间检查(wire_compat_check)+ etcd
+      cluster_version(格式版本戳,回滚 fail-closed)+ autumn-op
+      cluster-version/upgrade-version。MIN=MAX=1。
+    - ROLL-R2-REVERT(本次):git revert ROLL-R2-A(b587471)—— etcd 回
+      rkyv、WIRE_VERSION 退 1、prost 全移除。新增
+      AutumnManager::replay_decode_err(replay 解码失败给可操作提示)。
+      升级安全 = rkyv 校验式 decode 响亮失败(不静默损坏)+ R1 格式戳。
+      live 验证:fresh reset(cluster_version=1)→ manager 重启 rkyv
+      replay 全元数据,数据存活 + 4 分区路由 + 零 decode error。
+  Not implemented(按需,无常驻代码):
+    - etcd schema 演进迁移:第一次真要不 reset 改某持久结构时,那个版本
+      带一次性迁移(读旧→写新,幂等+格式戳收尾)。在那之前不写。
+    - 砍掉(不做):R2 全量 prost、R2-B、R3 数据面协商、upgrade_chaos.sh。
 
 Current summary:
-  R2-A 已 commit。prost etcd replay 端到端实测通过（fresh/restart/split/
-  rolling 全绿，零 decode error，零数据丢失）。
+  R2-A 已回退,升级安全收敛为 rkyv fail-loud + R1 格式戳。build 全绿,
+  rpc 25 单测过(registry 回 R1 指纹),live stop-world replay 验证通过。
 Main gaps:
-  - R2-B 是大面 churn（~100 RPC 结构 + u8/u16 churn）；R3 待 R2 完成。
+  - 无。升级安全已满足("全停全启不静默损坏");schema 演进按需。
 Next steps:
-  - R2-B：按 RPC 簇逐步切 prost（每簇 green+commit），最后移 rkyv。
+  - 守则:任何持久结构(etcd/SST/.meta/WAL)改动要么 rkyv 同布局、要么随
+    版本带迁移,绝不依赖 reset(见 feedback_stopworld_restart_primary)。

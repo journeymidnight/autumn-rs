@@ -60,13 +60,7 @@ impl AutumnManager {
         // checks, verify-BEFORE-mirror (F210-A2), and etcd txn logic.
         let sync_req = SyncPartitionVpRefsReq {
             part_id,
-            // R2: hot-path PullVpRefsResp.refs stays tuple (rkyv); widen to
-            // the U64U32Pair shape the prost-backed sync path expects.
-            refs: resp
-                .refs
-                .into_iter()
-                .map(|(k, v)| autumn_rpc::manager_rpc::U64U32Pair::new(k, v))
-                .collect(),
+            refs: resp.refs,
         };
         let sync_payload = rkyv_encode(&sync_req);
         let sync_resp_bytes = self
@@ -521,16 +515,10 @@ impl AutumnManager {
             // F191: same applies to `control_address` — the manager's DF
             // probe uses it; updating in-memory before mirror could cause
             // the new leader to inherit a stale value on replay.
-            // R2: MgrNodeInfo.shard_ports is u32 (prost has no u16); the
-            // wire RegisterNodeReq stays u16 — widen at this boundary.
-            if existing_node
-                .shard_ports
-                .iter()
-                .copied()
-                .ne(req.shard_ports.iter().map(|&p| p as u32))
+            if existing_node.shard_ports != req.shard_ports
                 || existing_node.control_address != req.control_address
             {
-                existing_node.shard_ports = req.shard_ports.iter().map(|&p| p as u32).collect();
+                existing_node.shard_ports = req.shard_ports;
                 existing_node.control_address = req.control_address;
                 if let Err(err) = self.mirror_register_node(&existing_node, &[]).await {
                     return Ok(rkyv_encode(&RegisterNodeResp {
@@ -590,8 +578,7 @@ impl AutumnManager {
                 node_id,
                 address: req.addr,
                 disks: disk_ids,
-                // R2: widen wire u16 → prost u32.
-                shard_ports: req.shard_ports.iter().map(|&p| p as u32).collect(),
+                shard_ports: req.shard_ports,
                 control_address: req.control_address,
             };
             (node, disk_infos, uuid_map, node_id)
@@ -1652,8 +1639,7 @@ impl AutumnManager {
             // value-CAS's `streams/<id>` against it, so a punch_holes/truncate
             // committing during our RTT makes our write fail → retry, instead of
             // resurrecting the removed extent.
-            // R2: CAS baseline must match the prost-stored streams/<id>.
-            let baseline = prost_encode(st).to_vec();
+            let baseline = rkyv_encode(st).to_vec();
             let mut stream_after = st.clone();
             stream_after.extent_ids.push(extent_id);
             (stream_after, baseline)
@@ -1853,8 +1839,7 @@ impl AutumnManager {
                     .get(&req.stream_id)
                     .ok_or_else(|| AppError::NotFound(format!("stream {}", req.stream_id)))?
                     .clone();
-                // R2: CAS baseline must match prost-stored streams/<id>.
-                let stream_baseline = prost_encode(&stream).to_vec();
+                let stream_baseline = rkyv_encode(&stream).to_vec();
 
                 // F126: only operate on extents that actually belong to this
                 // stream. Without this, a malformed request could decrement
@@ -2037,8 +2022,7 @@ impl AutumnManager {
                     .get(&req.stream_id)
                     .cloned()
                     .ok_or_else(|| AppError::NotFound(format!("stream {}", req.stream_id)))?;
-                // R2: CAS baseline must match prost-stored streams/<id>.
-                let stream_baseline = prost_encode(&stream).to_vec();
+                let stream_baseline = rkyv_encode(&stream).to_vec();
 
                 let pos = stream
                     .extent_ids
@@ -2394,26 +2378,26 @@ impl AutumnManager {
                     for st in &new_streams {
                         kvs.push((
                             format!("streams/{}", st.stream_id),
-                            prost_encode(st).to_vec(),
+                            rkyv_encode(st).to_vec(),
                         ));
                     }
                     for ex in &modified_extents {
                         kvs.push((
                             format!("extents/{}", ex.extent_id),
-                            prost_encode(ex).to_vec(),
+                            rkyv_encode(ex).to_vec(),
                         ));
                     }
                     kvs.push((
                         format!("partitionVpRefs/{}", right_snapshot.part_id),
-                        prost_encode(&right_snapshot).to_vec(),
+                        rkyv_encode(&right_snapshot).to_vec(),
                     ));
                     kvs.push((
                         format!("partitions/{}", left.part_id),
-                        prost_encode(&left).to_vec(),
+                        rkyv_encode(&left).to_vec(),
                     ));
                     kvs.push((
                         format!("partitions/{}", right.part_id),
-                        prost_encode(&right).to_vec(),
+                        rkyv_encode(&right).to_vec(),
                     ));
                     // Pre-compute region entries for left and right partitions
                     // so they are included in the same atomic txn.
@@ -2423,11 +2407,11 @@ impl AutumnManager {
                         let right_region = Self::compute_region_for_partition(&s, &right);
                         kvs.push((
                             format!("regions/{}", left.part_id),
-                            prost_encode(&left_region).to_vec(),
+                            rkyv_encode(&left_region).to_vec(),
                         ));
                         kvs.push((
                             format!("regions/{}", right.part_id),
-                            prost_encode(&right_region).to_vec(),
+                            rkyv_encode(&right_region).to_vec(),
                         ));
                     }
                     // F183: stamp last_op_at on both children so the
@@ -2691,7 +2675,7 @@ impl AutumnManager {
                 .filter_map(|sid| {
                     s.streams
                         .get(&sid)
-                        .map(|st| (format!("streams/{sid}"), prost_encode(st).to_vec()))
+                        .map(|st| (format!("streams/{sid}"), rkyv_encode(st).to_vec()))
                 })
                 .collect();
 
@@ -2829,29 +2813,29 @@ impl AutumnManager {
             for st in &p1.new_streams {
                 kvs.push((
                     format!("streams/{}", st.stream_id),
-                    prost_encode(st).to_vec(),
+                    rkyv_encode(st).to_vec(),
                 ));
             }
             for ex in &modified_extents {
                 kvs.push((
                     format!("extents/{}", ex.extent_id),
-                    prost_encode(ex).to_vec(),
+                    rkyv_encode(ex).to_vec(),
                 ));
             }
             kvs.push((
                 format!("partitionVpRefs/{}", p1.merged_vp.part_id),
-                prost_encode(&p1.merged_vp).to_vec(),
+                rkyv_encode(&p1.merged_vp).to_vec(),
             ));
             kvs.push((
                 format!("partitions/{}", p1.survivor_meta.part_id),
-                prost_encode(&p1.survivor_meta).to_vec(),
+                rkyv_encode(&p1.survivor_meta).to_vec(),
             ));
             {
                 let s = self.store.inner.borrow();
                 let region = Self::compute_region_for_partition(&s, &p1.survivor_meta);
                 kvs.push((
                     format!("regions/{}", p1.survivor_meta.part_id),
-                    prost_encode(&region).to_vec(),
+                    rkyv_encode(&region).to_vec(),
                 ));
             }
             kvs.push((

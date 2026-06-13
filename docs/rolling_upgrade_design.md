@@ -1,11 +1,16 @@
-# Rolling Upgrade 设计（v1.2，2026-06-12）
+# Rolling Upgrade 设计（v2，2026-06-13）
 
-> 状态：**R0 + R1 已实现并实测通过**（R0: scripts/rolling_restart.sh，
-> 3-EN/4 分区持续写负载下全序列零丢失；R1: cluster_version 门 +
-> `[min_wire,max_wire]` 区间握手 + 指纹注册表防忘 bump + 回滚
-> fail-closed）。R2/R3 待用户拍板（§9 决策点 1/2）。WIRE-1（981c3ef）
-> 已把混版本部署从静默损坏变为启动硬拒绝——本文档定义如何把这个硬拒绝
-> **有计划地放宽**成真正的滚动升级能力。
+> **方向调整（2026-06-13，用户拍板）：不做 rolling upgrade（混版本同时
+> 在线服务），目标收敛为"全停全启升级安全 + 生产绝不 cluster.sh reset"。**
+> R0（同版本滚动重启运维工具）+ R1（wire 门 + cluster_version 格式戳）
+> 保留;**R2-A（etcd→prost）已回退（commit revert）**;R3 不做。
+>
+> **关键认知**：全停全启的"安全"(不静默损坏) plain rkyv 本身就给了 ——
+> 校验式 `from_bytes` 在格式不符时**响亮失败**（manager 重放报错 → 当不
+> 上 leader），绝不静默把旧字节解成错值。prost 多给的只是"不 reset 也能
+> 原地改 etcd schema"这个**独立能力**，而该能力可在真正需要时用一次性
+> 迁移补，不必常驻。所以最终方案 = **plain rkyv + R1 格式戳 + 按需迁移**，
+> 见 §3-R2-final。下文 R2/R3 的 prost/协商内容**仅作历史与备选保留**。
 
 ## 1. 目标与非目标
 
@@ -66,14 +71,26 @@ harness）。把这个能力固化为运维程序：
 - 回滚规则：cluster_version 未 bump 前可滚回 N-1 二进制；bump 后不可
   （新格式可能已持久化）。
 
-### R2 — 控制面 schema 演进：manager_rpc + etcd 值迁移 prost（核心投资，~1-2 周）
+### R2-final — 全停全启升级安全（rkyv fail-loud + 按需迁移，已采纳 2026-06-13）
 
-> 进度：**R2-A 已实现 2026-06-13** —— etcd 7 个核心元数据前缀（nodes/
-> disks/streams/extents/partitions/partitionVpRefs/regions）rkyv→prost，
-> = 本设计 §2 列的硬前提（etcd 跨版本可重放）。rkyv+prost 双 derive 共存
-> 技术验证；用户拍板全量迁移 + cluster.sh reset 切换；WIRE_VERSION→2。
-> 端到端实测：reset/manager-restart-replay/split/rolling-restart 全过零丢失。
-> 待续 R2-B：manager_rpc 全部 RPC 结构 + 剩余持久前缀。
+> 取代下面原 R2（prost 迁移已回退）。需求 = 全停→换二进制→全起、etcd 永不清。
+>
+> - **安全（不静默损坏）= plain rkyv 自带**：新二进制读旧 etcd,代码改/
+>   schema 不变的升级直接读通;万一谁改了持久结构,rkyv 校验式 decode
+>   **响亮失败**,manager 起不来（`replay_decode_err` 给可操作提示),
+>   绝不静默损坏。这就是"全停全启安全"的保证来源。
+> - **R1 cluster_version = 格式版本戳**:回滚到读不懂当前 etcd 的旧二进制
+>   → `parse_cluster_version` 启动响亮拒绝（回滚 fail-closed）。
+> - **schema 演进按需补**:第一次真要不 reset 改某 etcd 结构时,那个版本
+>   带一个一次性迁移（读旧结构→写新结构,幂等 + 格式戳收尾)。在那之前
+>   零额外代码、零常驻编解码复杂度。
+> - 砍掉:R2 全量 prost、R2-B、R3 协商、upgrade_chaos.sh。
+> - 代价:不 reset 改 schema 时要写迁移（prost 是免费演进）—— 用户选
+>   "宁可偶尔显式做一次,也不要常驻复杂度"。
+
+---
+
+### ~~R2 — 控制面 schema 演进：manager_rpc + etcd 值迁移 prost（核心投资，~1-2 周）~~（历史/已回退）
 
 **这是本设计最大的一次性成本，换取长期免演进负担。**
 

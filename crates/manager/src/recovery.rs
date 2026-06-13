@@ -358,7 +358,7 @@ impl AutumnManager {
             // F207-D: atomic put + delete txn. Releases the Recovery
             // marker in the same txn that writes the updated extent
             // state. Legacy `recoveryTasks/<id>` delete dropped.
-            let ex_payload = prost_encode(&updated_extent).to_vec(); // R2: extents/ is prost
+            let ex_payload = rkyv_encode(&updated_extent).to_vec();
             etcd.put_and_delete_txn(
                 vec![(format!("extents/{}", updated_extent.extent_id), ex_payload)],
                 vec![Self::extent_inflight_key(updated_extent.extent_id)],
@@ -1269,7 +1269,7 @@ impl crate::AutumnManager {
             // etcd round-trips; F207 made them atomic. F210-A1 makes
             // the in-memory apply happen ONLY after this txn lands.
             let key = format!("extents/{}", extent_id);
-            let val = prost_encode(&updated).to_vec(); // R2: extents/ is prost
+            let val = rkyv_encode(&updated).to_vec();
             etcd.put_and_delete_txn(vec![(key, val)], vec![Self::extent_inflight_key(extent_id)])
                 .await?;
         }
