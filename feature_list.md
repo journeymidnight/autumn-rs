@@ -752,3 +752,26 @@ gaps in the lease protocol's correctness story.
   build 绿;live smoke(3-node reset + put/get + 2MiB put-stream + restart
   node1 + restart-manager)数据存活、正常 .meta 重载无误判 quarantine。
 - **passes:** completed (2026-06-13)
+
+---
+
+### PROD-FIX-2 · WAL-FAILSTOP:log_stream 中间损坏 → fail recovery(生产就绪审计 P0 #2,2026-06-13)
+- **背景:** coco arch P0 #2。recover_partition replay 与 GC 遇完整记录 CRC/
+  长度不符(bit rot/torn write)时 skip 继续 → 静默丢已 ACK 写 + replay 顺序洞。
+- **复现(先):** `wal_mid_record_corruption_fails_recovery_not_silently_skipped`
+  —— [A][CRC 损坏的 B][C],修前 decode_records_chunk 返回 [A,C](B 静默跳过,
+  len==2=复现);修后 .is_err()。
+- **修复:** decode_records_chunk 改返回 Result,Corrupt→Err(recover_partition
+  `?` 传播→open 失败响亮→走副本重建);Incomplete(尾部截断=crash-tail)仍
+  干净 break。process_gc_chunk 同样 Corrupt→Err(abort GC,不越过损坏记录
+  punch holes)。
+- **coco 复审 1 P1 采纳(同轮闭环):** length 字段被 bit-flip 增大时 decode_one
+  在 CRC 校验前因 `len<total` 返回 Incomplete,逃过 Corrupt → 在 recover_partition
+  的"committed-end 非空 carry"处兜住:F261 committed-clamp 下 committed 边界
+  必在记录边界、未提交尾部被 clamp 掉,故 committed-end 残留 carry 只可能是
+  length 损坏/滞后副本截断 → fail(撤销 pre-F261 的"trailing partial=crash-tail"
+  陈旧容忍)。回归断言 inflated-length → B 全留 carry。
+- **验收:** ps 163 单测(含复现+inflated-length 断言);live(40 key + 3MiB
+  put-stream,PS 重启 → 0 丢失、大值 OK、无误触 WAL-FAILSTOP)。test-only 的
+  decode_records_full/with_offsets 保留旧 skip(非生产路径)。
+- **passes:** completed (2026-06-13)

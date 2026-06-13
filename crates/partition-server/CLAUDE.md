@@ -1960,3 +1960,35 @@ post-restart.
     contiguous after its `# TYPE` line — the Prometheus text format
     requires grouping; the first cut interleaved per-partition and was
     non-compliant).
+
+## WAL-FAILSTOP — mid-stream log_stream corruption fails recovery, not silent skip (2026-06-13)
+
+Production-readiness audit P0 (coco). The log_stream replay decoder used to
+`skip + continue` on a `DecodeOne::Corrupt` (a COMPLETE record whose V1 CRC or
+inner-length disagrees = bit rot / torn write). Skipping drops an
+ACKed-but-unflushed write AND holes the replay sequence → silent data loss.
+
+Fix (reproduce-first — `wal_mid_record_corruption_fails_recovery_not_silently_skipped`):
+- `decode_records_chunk` now returns `anyhow::Result`: `Corrupt` → `Err`
+  (`recover_partition` propagates via `?` → partition open fails loud → recover
+  from a healthy log_stream replica). `Incomplete` (truncated TAIL) still
+  `break`s clean (crash-tail).
+- `process_gc_chunk` (GC) likewise `Err`s on `Corrupt` instead of skipping —
+  refusing to punch_holes past records it can't parse (could reclaim still-live
+  VP data).
+- **Committed-end carry check (coco P1 follow-up):** `decode_one` reports a
+  record whose LENGTH field is bit-flipped LARGER as `Incomplete` (the
+  `bytes.len() < total` check precedes the CRC check), so it escapes the
+  `Corrupt` arm. But replay reads are committed-clamped
+  (`read_committed_bytes_from_extent`, F261), and the committed boundary always
+  lands on a record boundary (commit advances by whole all-replica-ACKed
+  records) with uncommitted partial tails clamped OUT — so a **non-empty carry
+  at the committed end** can only be a length-corrupt / lagging-truncated
+  committed record, never a legit crash-tail. `recover_partition` now `Err`s on
+  it instead of discarding (the pre-F261 "trailing partial = crash-tail"
+  tolerance is stale under the committed-clamp).
+
+Trigger is power-loss / bit-rot class (a process kill loses nothing un-fsynced
++ leaves the dirent). Test-only `decode_records_full` / `decode_records_with_offsets`
+keep the old skip (not on any production path). Verified: ps 163 unit tests +
+live (40 keys + 3 MiB value, PS restart → 0 loss, no false WAL-FAILSTOP trip).

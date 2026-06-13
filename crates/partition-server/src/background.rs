@@ -2530,14 +2530,18 @@ async fn process_gc_chunk(
                     break;
                 }
                 crate::wal_record::DecodeOne::Corrupt { skip_bytes, reason } => {
-                    tracing::warn!(
-                        record_start,
-                        skip_bytes,
-                        reason,
-                        "F158: GC encountered corrupted WAL record; skipping"
-                    );
-                    cursor += skip_bytes;
-                    continue;
+                    // WAL-FAILSTOP (coco prod-audit P0 #2): a corrupt record
+                    // means we can't trust which value pointers are live in
+                    // this extent — continuing the GC scan past it could
+                    // punch_holes / reclaim data still referenced by the
+                    // corrupt (unparseable) record. Abort this GC pass loud
+                    // instead of skipping; the classify-cooldown backs it off
+                    // and recovery handles the corrupt replica.
+                    return Err(anyhow::anyhow!(
+                        "WAL-FAILSTOP: GC hit corrupt log_stream record on extent \
+                         {extent_id} at offset {record_start} ({reason}, len={skip_bytes}) — \
+                         aborting GC (refusing to punch holes past unparseable records)"
+                    ));
                 }
             };
         let key = key_owned.as_slice();

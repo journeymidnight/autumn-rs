@@ -1,8 +1,9 @@
 Date: 2026-06-13
 TaskStatus: completed
-Task scope: 生产就绪审计后的两处崩溃一致性 fail-open 修复(coco arch P0)。
-  按"先复现再修"处理。升级方向仍为:全停全启安全(rkyv fail-loud),不做
-  rolling(见 project_rolling_upgrade_paused)。
+Task scope: 生产就绪审计 P0 修复(coco arch)。本会话:PROD-FIX-1(META-
+  FAILCLOSED + EC-PREPARE-DURABLE)+ PROD-FIX-2(WAL-FAILSTOP:log_stream
+  中间损坏 fail recovery)。全部先复现再修。升级方向仍为全停全启安全(rkyv
+  fail-loud),不做 rolling(见 project_rolling_upgrade_paused)。
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 

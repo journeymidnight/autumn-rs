@@ -7161,7 +7161,9 @@ async fn recover_partition(
                 c.extend_from_slice(&data);
                 c
             };
-            let (records, consumed) = decode_records_chunk(&buf);
+            // WAL-FAILSTOP: a corrupt record fails the open loud (propagated)
+            // rather than silently skipping it — see decode_records_chunk.
+            let (records, consumed) = decode_records_chunk(&buf)?;
             for (buf_off, op, key, value, expires_at) in records {
                 let ts = parse_ts(&key);
                 if ts > max_seq {
@@ -7221,15 +7223,29 @@ async fn recover_partition(
             carry = buf[consumed..].to_vec();
             cur_off += got as u32;
             if (got as u32) < REPLAY_CHUNK_BYTES {
-                // Reached the commit end. A trailing partial record is the
-                // expected crash-tail shape (same tolerance as the old
-                // whole-extent decode, which simply stopped at Incomplete).
+                // Reached the COMMITTED end (reads are committed-clamped via
+                // read_committed_bytes_from_extent, F261). WAL-FAILSTOP (coco
+                // prod-audit P0 #2 follow-up): a non-empty `carry` here is NOT
+                // a legit crash-tail. The committed boundary always lands on a
+                // record boundary (commit advances by whole all-replica-ACKed
+                // records), and uncommitted partial tails are clamped OUT of
+                // the read — so leftover bytes mean a record's declared length
+                // runs PAST the commit boundary (a length-field bit-flip that
+                // decode_one reports as Incomplete before it can check the CRC,
+                // or a lagging/truncated replica). Either way, silently
+                // discarding it drops committed data. Fail the open loud; the
+                // record lives on a healthy log_stream replica. (Pre-F261 the
+                // read included speculative bytes so a trailing partial WAS the
+                // uncommitted tail — that tolerance is now stale.)
                 if !carry.is_empty() {
-                    tracing::debug!(
-                        eid,
-                        tail_bytes = carry.len(),
-                        "replay: discarding partial trailing WAL record"
-                    );
+                    return Err(anyhow::anyhow!(
+                        "WAL-FAILSTOP: {} leftover byte(s) at the committed end of \
+                         log_stream extent {eid} — a committed record's length exceeds the \
+                         commit boundary (corruption / length bit-flip / truncated replica). \
+                         Refusing to discard committed data; recover this replica from a \
+                         healthy log_stream copy.",
+                        carry.len()
+                    ));
                 }
                 break;
             }
@@ -7299,7 +7315,7 @@ pub(crate) fn decode_records_full(bytes: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>, u6
 /// into the next chunk (F106 GC streaming pattern).
 pub(crate) fn decode_records_chunk(
     bytes: &[u8],
-) -> (Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)>, usize) {
+) -> anyhow::Result<(Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)>, usize)> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
     while cursor < bytes.len() {
@@ -7315,14 +7331,27 @@ pub(crate) fn decode_records_chunk(
                 ));
                 cursor += r.total;
             }
+            // Incomplete = truncated TAIL record (crash-tail): the caller
+            // carries the partial bytes into the next chunk, or stops. Clean.
             crate::wal_record::DecodeOne::Incomplete => break,
+            // WAL-FAILSTOP (coco prod-audit P0 #2): a CRC/length mismatch on a
+            // COMPLETE record is real corruption (bit rot / torn write).
+            // Skipping it would silently drop an ACKed-but-unflushed write and
+            // leave a hole in the replayed sequence. FAIL recovery instead —
+            // the partition open errors loud; the data lives on the other
+            // log_stream replicas, so the correct response is rebuild/retry
+            // against a healthy replica, never serve a holed memtable.
             crate::wal_record::DecodeOne::Corrupt { skip_bytes, reason } => {
-                tracing::warn!(record_start, skip_bytes, reason, "WAL record corrupted; skipping");
-                cursor += skip_bytes;
+                return Err(anyhow::anyhow!(
+                    "WAL-FAILSTOP: corrupt log_stream record at offset {record_start} \
+                     ({reason}, len={skip_bytes}) — refusing to skip (would silently drop an \
+                     ACKed write + hole the replay). Partition open fails; recover this \
+                     replica from a healthy log_stream copy."
+                ));
             }
         }
     }
-    (out, cursor)
+    Ok((out, cursor))
 }
 
 pub(crate) fn decode_records_with_offsets(bytes: &[u8]) -> Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)> {
@@ -8854,6 +8883,72 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].2.len(), 1024 * 1024);
         assert_eq!(records[0].2[0], 0xAB);
+    }
+
+    /// WAL-FAILSTOP (coco prod-audit P0 #2): a CRC mismatch on a COMPLETE
+    /// middle record (bit rot / torn write) must FAIL recovery, never be
+    /// silently skipped — skipping drops an ACKed-but-unflushed write and
+    /// leaves a hole in the replayed sequence. (A truncated TAIL record =
+    /// crash-tail, which is legitimately stopped-at, not corruption.)
+    #[test]
+    fn wal_mid_record_corruption_fails_recovery_not_silently_skipped() {
+        let a = encode_record(1, b"k1", b"v1", 0);
+        let b = encode_record(1, b"k2", b"v2", 0);
+        let c = encode_record(2, b"k3", b"", 0);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&a);
+        let b_start = buf.len();
+        buf.extend_from_slice(&b);
+        buf.extend_from_slice(&c);
+        // Corrupt a byte inside record B's payload (past the 5-byte envelope
+        // header) → its CRC mismatches while A and C stay valid. The decoder
+        // must NOT return [A, C] with B silently dropped.
+        buf[b_start + 8] ^= 0xFF;
+
+        // Corrupt middle record → recovery FAILS (no silent skip / hole).
+        assert!(
+            decode_records_chunk(&buf).is_err(),
+            "corrupt middle WAL record must fail recovery (got Ok = silent skip / data loss)"
+        );
+
+        // Clean buffer → all three decode.
+        let mut clean = Vec::new();
+        clean.extend_from_slice(&a);
+        clean.extend_from_slice(&b);
+        clean.extend_from_slice(&c);
+        let (recs, _) = decode_records_chunk(&clean).expect("clean WAL must decode");
+        assert_eq!(recs.len(), 3, "clean WAL: all records present");
+
+        // Truncated TAIL (crash-tail) is NOT corruption — decode the valid
+        // prefix (A) and stop cleanly, no error.
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&a);
+        tail.extend_from_slice(&b[..b.len() - 3]); // chop B's last 3 bytes
+        let (recs, _) = decode_records_chunk(&tail).expect("crash-tail must be Ok");
+        assert_eq!(recs.len(), 1, "crash-tail: only the complete prefix (A) replays");
+
+        // coco P1 residual: a V1 record whose LENGTH field is bit-flipped
+        // LARGER (so `total` exceeds the buffer) is reported by decode_one as
+        // Incomplete BEFORE the CRC can be checked — so the chunk decoder does
+        // NOT flag it Corrupt; it leaves B's bytes as un-consumed carry. This
+        // is by-design at the chunk layer; `recover_partition` is the catch
+        // point — a non-empty carry at the COMMITTED end fails the open (it
+        // can't be a legit crash-tail under the F261 committed-clamp). Here we
+        // pin the chunk-layer behaviour: A consumed, B left as carry.
+        let mut inflated = Vec::new();
+        inflated.extend_from_slice(&a);
+        let b_at = inflated.len();
+        inflated.extend_from_slice(&b);
+        // bytes[1..5] = V1 envelope length LE; flip the high byte → huge total.
+        inflated[b_at + 4] ^= 0x40;
+        let (recs, consumed) =
+            decode_records_chunk(&inflated).expect("inflated-length → Incomplete tail, Ok prefix");
+        assert_eq!(recs.len(), 1, "only A decodes; B's inflated length → carry");
+        assert_eq!(
+            consumed,
+            a.len(),
+            "B left entirely as carry → recover_partition's committed-end carry check fails it"
+        );
     }
 
     /// Regression test for GC data loss bug: WAL records for large values
