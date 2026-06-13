@@ -1033,6 +1033,18 @@ pub(crate) struct ExtentEntry {
     pub(crate) disk_id: u64,
     /// F178 Phase 1: per-extent fsync coalescer state.
     pub(crate) coalescer: Coalescer,
+    /// META-FAILCLOSED: set true at load time when the `.meta` sidecar is
+    /// PRESENT but CORRUPT (CRC/magic/extent_id invalid — bit rot / torn
+    /// write / power loss) while the `.dat` still exists. A corrupt `.meta`
+    /// must NOT silently default the extent to `open, owner_epoch=0` (that
+    /// would let a stale/lower-epoch writer bypass the fence and ghost-append
+    /// — see `corrupt_meta_quarantines_extent_and_rejects_stale_append`).
+    /// While set, append / read / commit_length are REFUSED (the extent is
+    /// quarantined); the manager rebuilds authoritative state via
+    /// recovery / re_avali, whose `.meta` write clears this flag. A genuinely
+    /// ABSENT `.meta` (fresh extent, or crash between `.dat` create and first
+    /// `.meta` write) is NOT quarantined — only present-but-corrupt is.
+    pub(crate) corrupt_meta: AtomicBool,
 }
 
 impl ExtentEntry {
@@ -1963,6 +1975,24 @@ async fn build_append_future(
         return Box::pin(async move { Vec::new() });
     }
 
+    // 0. META-FAILCLOSED: a quarantined extent (`.meta` was present-but-corrupt
+    // at load — see load_extents) must refuse ALL appends. Defaulting it to
+    // open/owner_epoch=0 would let a stale lower-epoch writer bypass the fence
+    // and ghost-append. Refuse until manager recovery rebuilds it.
+    if extent.corrupt_meta.load(Ordering::SeqCst) {
+        let resp_payload = AppendResp {
+            code: CODE_PRECONDITION,
+            offset: 0,
+            end: 0,
+        }
+        .encode();
+        let out: Vec<Bytes> = slots
+            .into_iter()
+            .map(|s| Frame::response(s.req_id, MSG_APPEND, resp_payload.clone()).encode())
+            .collect();
+        return Box::pin(async move { out });
+    }
+
     // 1. Eversion refresh: if ANY req.eversion > local, refresh from manager.
     let local_eversion = extent.eversion.load(Ordering::SeqCst);
     let needs_refresh = slots.iter().any(|s| s.req.eversion > local_eversion);
@@ -2356,6 +2386,35 @@ fn build_read_future(
         use compio::io::AsyncReadAtExt;
 
         let mut out: Vec<Bytes> = Vec::with_capacity(slots.len());
+
+        // META-FAILCLOSED (coco P1): the batched read hot path must honour the
+        // quarantine too — `handle_read_bytes` alone misses this (production
+        // reads go through here). A corrupt-`.meta` extent's length/eversion
+        // are untrusted; refuse every slot with CODE_EVERSION_MISMATCH so the
+        // client fails over to a healthy replica.
+        if extent.corrupt_meta.load(Ordering::SeqCst) {
+            for slot in slots {
+                if zc {
+                    out.push(zc_read_head(slot.req_id, CODE_EVERSION_MISMATCH, &[]));
+                } else {
+                    out.push(
+                        Frame::response(
+                            slot.req_id,
+                            MSG_READ_BYTES,
+                            ReadBytesResp {
+                                code: CODE_EVERSION_MISMATCH,
+                                end: 0,
+                                payload: Bytes::new(),
+                            }
+                            .encode(),
+                        )
+                        .encode(),
+                    );
+                }
+            }
+            return out;
+        }
+
         for slot in slots {
             let req = slot.req;
             let ev = extent.eversion.load(Ordering::SeqCst);
@@ -3046,6 +3105,12 @@ impl ExtentNode {
         entry
             .durable_owner_epoch
             .fetch_max(owner_epoch, Ordering::SeqCst);
+        // META-FAILCLOSED: a fresh, valid `.meta` is now on disk — clear any
+        // quarantine. Recovery / re_avali / a manager-driven re-seal that
+        // reaches here has rebuilt authoritative state, so the extent may
+        // serve again. (Steady-state writers never set the flag, so this is
+        // a cheap no-op store on the hot path.)
+        entry.corrupt_meta.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -3199,21 +3264,49 @@ impl ExtentNode {
                 };
                 let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
 
-                let meta = match compio::fs::read(disk.meta_path(extent_id)).await {
-                    Ok(buf) => Self::parse_meta(&buf, extent_id).unwrap_or(LocalExtentMeta {
-                        sealed_length: 0,
-                        eversion: 1,
-                        owner_epoch: 0,
-                        sealed: false,
-                        avali: 0,
-                    }),
-                    Err(_) => LocalExtentMeta {
-                        sealed_length: 0,
-                        eversion: 1,
-                        owner_epoch: 0,
-                        sealed: false,
-                        avali: 0,
+                // META-FAILCLOSED: distinguish ABSENT `.meta` (fresh extent /
+                // pre-first-write crash → default open is fine) from PRESENT
+                // BUT CORRUPT `.meta` (CRC/magic/eid invalid → parse_meta None
+                // → must QUARANTINE, never fail-open to owner_epoch=0).
+                const DEFAULT_META: LocalExtentMeta = LocalExtentMeta {
+                    sealed_length: 0,
+                    eversion: 1,
+                    owner_epoch: 0,
+                    sealed: false,
+                    avali: 0,
+                };
+                let (meta, corrupt_meta) = match compio::fs::read(disk.meta_path(extent_id)).await {
+                    Ok(buf) => match Self::parse_meta(&buf, extent_id) {
+                        Some(m) => (m, false),
+                        None => {
+                            // `.meta` exists but is unparseable: the `.dat` is
+                            // present (we just opened it), so this is real
+                            // corruption, not a fresh extent. Quarantine.
+                            tracing::error!(
+                                extent_id,
+                                "META-FAILCLOSED: `.meta` present but corrupt — \
+                                 quarantining extent (append/read/commit_length refused) \
+                                 until manager recovery rebuilds it"
+                            );
+                            (DEFAULT_META, true)
+                        }
                     },
+                    // Only a genuine NotFound is a safe default-open (fresh
+                    // extent, or crash between `.dat` create and first `.meta`
+                    // write). ANY other read error (EIO / EACCES / etc.) leaves
+                    // the `.meta` state UNKNOWN while the `.dat` exists —
+                    // defaulting to open/owner_epoch=0 would re-open the same
+                    // fail-open fence-bypass window, so quarantine (coco P1).
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (DEFAULT_META, false),
+                    Err(e) => {
+                        tracing::error!(
+                            extent_id,
+                            error = %e,
+                            "META-FAILCLOSED: `.meta` unreadable (non-NotFound IO error) — \
+                             quarantining extent until manager recovery rebuilds it"
+                        );
+                        (DEFAULT_META, true)
+                    }
                 };
                 let sealed_length = meta.sealed_length;
                 let eversion = meta.eversion;
@@ -3238,6 +3331,7 @@ impl ExtentNode {
                         durable_owner_epoch: AtomicI64::new(meta.owner_epoch),
                         disk_id: disk.disk_id,
                         coalescer: Coalescer::new(len),
+                        corrupt_meta: AtomicBool::new(corrupt_meta),
                     }),
                 );
                 tracing::info!(
@@ -3731,6 +3825,7 @@ impl ExtentNode {
                 durable_owner_epoch: AtomicI64::new(0),
                 disk_id,
                 coalescer: Coalescer::new(len),
+                corrupt_meta: AtomicBool::new(false),
             }),
         );
         self.extents
@@ -4658,6 +4753,12 @@ impl ExtentNode {
                     shard_len,
                     "EC prepare: staging file already exists with correct size, skipping"
                 );
+                // EC-PREPARE-DURABLE (coco P2): the prior prepare may have
+                // crashed AFTER sync_data but BEFORE the parent-dir fsync, so
+                // the staging dirent might still be non-durable. Every prepare
+                // path that returns Ok MUST guarantee the same durable-prepare
+                // semantics — re-fsync the parent dir here too (idempotent).
+                self.fsync_staging_dir(extent_id, &staging_path).await?;
                 return Ok(());
             }
         }
@@ -4703,6 +4804,10 @@ impl ExtentNode {
             self.mark_disk_error_for_extent(extent_id, &msg);
             (StatusCode::Internal, msg)
         })?;
+        // EC-PREPARE-DURABLE: `sync_data` only makes the staging file's
+        // CONTENT durable — NOT its directory entry. Make the dirent durable
+        // too (see `fsync_staging_dir`).
+        self.fsync_staging_dir(extent_id, &staging_path).await?;
 
         tracing::info!(
             extent_id,
@@ -4711,6 +4816,39 @@ impl ExtentNode {
             sealed_length,
             "EC prepare: shard written to staging file"
         );
+        Ok(())
+    }
+
+    /// EC-PREPARE-DURABLE: fsync the parent directory of an EC staging file so
+    /// its directory entry is durable. POSIX does not persist a new file's
+    /// NAME on a host crash from a content `sync_data` alone — only an fsync of
+    /// the PARENT directory does. The 2PC commit doc promises `.ec.dat`
+    /// "persists as a durable prepare record" across a crash-before-rename;
+    /// without this a power loss could drop the dirent → commit retry finds the
+    /// staging missing → the participant is stuck. Mirrors the `.meta`
+    /// tmp→rename→parent-dir-fsync pattern in `write_meta_locked` (P0-B). Every
+    /// prepare path that returns Ok calls this so the guarantee is uniform.
+    async fn fsync_staging_dir(
+        &self,
+        extent_id: u64,
+        staging_path: &std::path::Path,
+    ) -> Result<(), (StatusCode, String)> {
+        if let Some(dir) = staging_path.parent() {
+            compio::fs::File::open(dir)
+                .await
+                .map_err(|e| {
+                    let msg = format!("open staging dir {extent_id}: {e}");
+                    self.mark_disk_error_for_extent(extent_id, &msg);
+                    (StatusCode::Internal, msg)
+                })?
+                .sync_all()
+                .await
+                .map_err(|e| {
+                    let msg = format!("fsync staging dir {extent_id}: {e}");
+                    self.mark_disk_error_for_extent(extent_id, &msg);
+                    (StatusCode::Internal, msg)
+                })?;
+        }
         Ok(())
     }
 
@@ -4766,6 +4904,27 @@ impl ExtentNode {
                 self.mark_disk_error_for_extent(extent_id, &msg);
                 (StatusCode::Internal, msg)
             })?;
+        // EC-PREPARE-DURABLE: fsync the parent dir so the rename (the dirent
+        // swap that publishes the shard `.dat`) is itself durable — otherwise a
+        // host crash here could lose the rename and leave the OLD `.dat`, while
+        // the save_meta below (if it landed) records the new eversion → meta /
+        // data mismatch on restart. Same dir-fsync rule as `write_meta_locked`.
+        if let Some(dir) = dat_path.parent() {
+            compio::fs::File::open(dir)
+                .await
+                .map_err(|e| {
+                    let msg = format!("open dat dir {extent_id}: {e}");
+                    self.mark_disk_error_for_extent(extent_id, &msg);
+                    (StatusCode::Internal, msg)
+                })?
+                .sync_all()
+                .await
+                .map_err(|e| {
+                    let msg = format!("fsync dat dir {extent_id}: {e}");
+                    self.mark_disk_error_for_extent(extent_id, &msg);
+                    (StatusCode::Internal, msg)
+                })?;
+        }
 
         // Reopen the file at the .dat path so entry.file points to the
         // new (shard) data instead of the old (unlinked) inode.
@@ -4827,6 +4986,17 @@ impl ExtentNode {
             AppendReq::decode(payload).map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
 
         let extent = self.get_extent(req.extent_id).await?;
+
+        // META-FAILCLOSED: refuse on a quarantined extent (corrupt `.meta` at
+        // load). See build_append_future step 0 + load_extents.
+        if extent.corrupt_meta.load(Ordering::SeqCst) {
+            return Ok(AppendResp {
+                code: CODE_PRECONDITION,
+                offset: 0,
+                end: 0,
+            }
+            .encode());
+        }
 
         // Only fetch from manager when local eversion is behind what the client expects.
         // In the common case (eversions match) we trust local atomics -- no RPC needed.
@@ -5071,6 +5241,19 @@ impl ExtentNode {
 
         let extent = self.get_extent(req.extent_id).await?;
 
+        // META-FAILCLOSED: a quarantined extent (corrupt `.meta` at load) must
+        // NOT serve reads — its length/seal/eversion are untrusted, so bytes
+        // could be stale/garbage. Surface EVERSION_MISMATCH so the client
+        // fails over to a healthy replica; recovery rebuilds this one.
+        if extent.corrupt_meta.load(Ordering::SeqCst) {
+            return Ok(ReadBytesResp {
+                code: CODE_EVERSION_MISMATCH,
+                end: 0,
+                payload: Bytes::new(),
+            }
+            .encode());
+        }
+
         // Use local extent state for eversion checks (no manager RPC needed on reads).
         // Returning a typed CODE_EVERSION_MISMATCH (rather than an Err
         // status) lets the StreamClient distinguish "stale cache —
@@ -5163,6 +5346,19 @@ impl ExtentNode {
                 format!("extent {} not found", req.extent_id),
             )
         })?;
+
+        // META-FAILCLOSED: a quarantined extent (corrupt `.meta` at load) has
+        // an untrusted length/fence — never feed it into the manager's seal
+        // (compute_commit_seal min over reachable members) or let it claim a
+        // commit position. Refuse so the manager excludes this replica and
+        // recovery rebuilds it.
+        if entry.corrupt_meta.load(Ordering::SeqCst) {
+            return Ok(CommitLengthResp {
+                code: CODE_LOCKED_BY_OTHER,
+                length: 0,
+            }
+            .encode());
+        }
 
         // F210-H3 Tier 2 (post-2026-05-17): `req.owner_epoch <= 0` is a
         // protocol error, not a sentinel. The pre-F210-H2 "owner_epoch == 0
@@ -5436,6 +5632,7 @@ impl ExtentNode {
                 durable_owner_epoch: AtomicI64::new(0),
                 disk_id,
                 coalescer: Coalescer::new(len),
+                corrupt_meta: AtomicBool::new(false),
             }),
         );
 
@@ -6791,6 +6988,118 @@ mod f147b_tests {
             assert_eq!(
                 resp.code, CODE_PRECONDITION,
                 "P0-C: sealed-empty must reject a ghost append AFTER restart"
+            );
+        }
+    }
+
+    /// META-FAILCLOSED (coco prod-audit #1): a corrupt `.meta` (CRC mismatch
+    /// from bit rot / torn write / power loss, with the `.dat` still present)
+    /// must NOT silently re-open the extent as a fresh `open, owner_epoch=0`
+    /// state on restart — that would let a stale/lower-epoch writer bypass the
+    /// owner_epoch fence and ghost-append to a fenced extent (split-brain).
+    /// The corrupt extent must be QUARANTINED: appends rejected until the
+    /// manager rebuilds authoritative state via recovery/re_avali.
+    #[compio::test]
+    async fn corrupt_meta_quarantines_extent_and_rejects_stale_append() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+
+        // ---- node #1: open extent 7300, append at owner_epoch=10 (raises +
+        // persists the fence), confirm a stale owner_epoch=5 append is fenced.
+        {
+            let config = ExtentNodeConfig::new(path.clone(), 1);
+            let node = ExtentNode::new(config).await.expect("node1");
+            node.handle_alloc_extent(rkyv_encode(&AllocExtentReq { extent_id: 7300 }))
+                .await
+                .expect("alloc");
+
+            let ok = AppendResp::decode(
+                node.handle_append(
+                    AppendReq {
+                        extent_id: 7300,
+                        eversion: 1,
+                        commit: 0,
+                        owner_epoch: 10,
+                        payload: Bytes::from(vec![1u8; 64]),
+                    }
+                    .encode(),
+                )
+                .await
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(ok.code, CODE_OK, "owner_epoch=10 append should land");
+
+            let stale = AppendResp::decode(
+                node.handle_append(
+                    AppendReq {
+                        extent_id: 7300,
+                        eversion: 1,
+                        commit: 0,
+                        owner_epoch: 5,
+                        payload: Bytes::from(vec![2u8; 8]),
+                    }
+                    .encode(),
+                )
+                .await
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                stale.code, CODE_LOCKED_BY_OTHER,
+                "pre-corruption: owner_epoch=5 < persisted 10 must be fenced"
+            );
+        }
+
+        // ---- corrupt the `.meta` on disk: flip a CRC-covered byte (the
+        // eversion field, 24..32) so magic + extent_id stay valid but the V2
+        // CRC fails — exactly the bit-rot/torn-write shape parse_meta detects.
+        fn find_meta(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+            for e in std::fs::read_dir(root).ok()?.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    if let Some(f) = find_meta(&p, name) {
+                        return Some(f);
+                    }
+                } else if p.file_name().and_then(|s| s.to_str()) == Some(name) {
+                    return Some(p);
+                }
+            }
+            None
+        }
+        let meta_path =
+            find_meta(&path, "extent-7300.meta").expect("extent-7300.meta must exist on disk");
+        let mut bytes = std::fs::read(&meta_path).expect("read meta");
+        assert!(bytes.len() >= 32, "V2 meta should be >= 52 bytes");
+        bytes[24] ^= 0xFF; // corrupt eversion field → CRC mismatch
+        std::fs::write(&meta_path, &bytes).expect("write corrupted meta");
+
+        // ---- node #2: reload the SAME dir. The corrupt `.meta` must NOT
+        // resurrect the extent as open/epoch-0; a stale owner_epoch=5 append
+        // must still be refused.
+        {
+            let config = ExtentNodeConfig::new(path.clone(), 1);
+            let node = ExtentNode::new(config).await.expect("node2 reload");
+
+            let stale = AppendResp::decode(
+                node.handle_append(
+                    AppendReq {
+                        extent_id: 7300,
+                        eversion: 1,
+                        commit: 0,
+                        owner_epoch: 5,
+                        payload: Bytes::from(vec![3u8; 8]),
+                    }
+                    .encode(),
+                )
+                .await
+                .unwrap(),
+            )
+            .unwrap();
+            assert_ne!(
+                stale.code, CODE_OK,
+                "corrupt .meta must QUARANTINE the extent — a stale owner_epoch=5 \
+                 append must be refused, not silently accepted on a fail-open reset"
             );
         }
     }

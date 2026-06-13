@@ -727,3 +727,28 @@ gaps in the lease protocol's correctness story.
   MAX=1);live:fresh reset(cluster_version=1)put/get → manager 重启
   rkyv replay 全元数据,数据存活 + 4 分区路由 + 零 decode error。
 - **passes:** completed (2026-06-13)
+
+---
+
+### PROD-FIX-1 · META-FAILCLOSED + EC-PREPARE-DURABLE(生产就绪审计 P0,2026-06-13)
+- **背景:** coco arch 生产就绪审计找出两处崩溃一致性 fail-open。按用户"先复
+  现再修"(尤其易错区)纪律处理。
+- **META-FAILCLOSED(先复现):** `load_extents` 把损坏 `.meta`(CRC 不符)
+  当缺失 → 默认 open/owner_epoch=0 → fence 绕过 ghost-append。复现测试
+  `corrupt_meta_quarantines_extent_and_rejects_stale_append`(node1 fence 到
+  10 → 损坏 .meta → reload → stale epoch=5 append;修前 CODE_OK=绕过,修后
+  拒绝)。修复:`ExtentEntry.corrupt_meta` flag;load 区分 present-but-corrupt
+  / 非-NotFound 读错(coco P1,都 quarantine)/ 真 NotFound(默认 open);
+  append(handle_append + build_append_future)/read(handle_read_bytes +
+  build_read_future 批量热路径,coco P1)/commit_length 拒绝;成功持久 .meta
+  清 flag。
+- **EC-PREPARE-DURABLE:** EC 2PC prepare 写 `.ec.dat` 只 sync_data 内容,未
+  fsync 父目录 → 断电丢 dirent,"durable prepare record"不成立 → commit 卡
+  死。修复:`fsync_staging_dir` helper,prepare 新写+幂等早退(coco P2)+
+  commit rename 后都 fsync 父目录。套用 `write_meta_locked` P0-B 模式。
+- **coco（GPT-5.5 findbugs）3 条全采纳:** P1 非-NotFound 读错也 quarantine;
+  P1 批量读热路径 build_read_future 也要拒绝;P2 幂等早退也要 dir-fsync。
+- **验收:** stream 78 单测全绿(含复现测试 + EC f119-d/f153);workspace
+  build 绿;live smoke(3-node reset + put/get + 2MiB put-stream + restart
+  node1 + restart-manager)数据存活、正常 .meta 重载无误判 quarantine。
+- **passes:** completed (2026-06-13)

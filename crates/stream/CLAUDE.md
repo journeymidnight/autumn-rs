@@ -1485,3 +1485,37 @@ still hold the full `sealed_length`, so reconciling to a short consensus while
 ANY source is unverified could drop data that exists out of reach. **Invariant:
 never reconcile a sealed extent DOWN while any non-excluded source was
 unreachable or unattempted — that source may hold the only full copy.**
+
+## META-FAILCLOSED + EC-PREPARE-DURABLE (生产就绪审计修复 2026-06-13)
+
+两处崩溃一致性 fail-open,改为 fail-closed(coco arch 审计 P0,先复现再修):
+
+**META-FAILCLOSED — 损坏 `.meta` 隔离(不再 fail-open 到 owner_epoch=0)。**
+`.meta` 写路径一直是 tmp+sync_data+rename+parent-dir-fsync 的 fail-closed
+(P0-B/F159);但 `load_extents` 读路径把 `parse_meta` 失败(CRC/magic/eid
+不符 = bit rot/torn write)和文件缺失**都** `unwrap_or(DEFAULT open,
+owner_epoch=0)` —— 断电后一个本该 sealed/fenced 的 extent(`.dat` 存活、
+`.meta` 损坏)重启即变 open+epoch0,**stale 低-epoch writer 绕过 fence
+ghost-append**(split-brain)。修复:`ExtentEntry.corrupt_meta: AtomicBool`,
+load 时区分(a)`.meta` present-but-corrupt(parse None)→ quarantine;
+(b)非-NotFound 读错误(EIO/EACCES)→ quarantine(coco P1,状态未知不可
+fail-open);(c)真 NotFound → 默认 open(fresh extent)。quarantine 时
+**append(handle_append + build_append_future)/ read(handle_read_bytes +
+build_read_future 批量热路径,coco P1)/ commit_length 全部拒绝**;
+`write_meta_locked` 成功持久后清 flag(recovery/re_avali 重建即 un-quarantine)。
+不变量:`.meta` 损坏/不可读 + `.dat` 在 = 绝不默认 open,必 quarantine 待
+manager 恢复。复现测试 `corrupt_meta_quarantines_extent_and_rejects_stale_append`
+(先红后绿)。**已知残留(liveness,非本次)**:corrupt 自动触发 manager
+recovery 需要额外上报路径;当前靠 read/commit_length 拒绝让副本"看起来不健
+康" + 客户端 failover 到健康副本,recovery 跑到即清。
+
+**EC-PREPARE-DURABLE — EC 2PC staging 缺 parent-dir fsync。**
+`write_shard_local`(prepare)写 `.ec.dat` 后只 `sync_data()`(内容 durable),
+**未 fsync 父目录** —— POSIX 下新文件的目录项不随内容 fsync 持久,断电可整个
+丢 dirent,而 commit 注释承诺"`.ec.dat` persists as durable prepare record",
+不成立 → commit 重试找不到 staging → 2PC participant 卡死。修复:helper
+`fsync_staging_dir`,prepare 的**新写路径 + 幂等早退路径(coco P2:早退也要
+满足同一 durable-prepare 语义)**都调用;commit 的 `rename(.ec.dat→.dat)` 之
+后同样 fsync 父目录(dirent swap durable)。套用 `write_meta_locked` 既有
+P0-B 模式。**触发=断电/内核崩溃**(kill -9 不丢 dirent,chaos 测不到),修复
+为纯 additive fsync,EC 单测(f119-d/f153)全绿。

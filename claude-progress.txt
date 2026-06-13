@@ -1,33 +1,36 @@
 Date: 2026-06-13
 TaskStatus: completed
-Task scope: 升级安全方向收敛。用户拍板:不做 rolling upgrade(混版本在线);
-  要"全停全启升级安全"+ 生产绝不 cluster.sh reset。R2-A(etcd→prost)已
-  回退;最终方案 = plain rkyv fail-loud + R1 格式戳 + 按需迁移。
+Task scope: 生产就绪审计后的两处崩溃一致性 fail-open 修复(coco arch P0)。
+  按"先复现再修"处理。升级方向仍为:全停全启安全(rkyv fail-loud),不做
+  rolling(见 project_rolling_upgrade_paused)。
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
-  Already implemented / 当前状态:
-    - R0(020b02b,保留):scripts/rolling_restart.sh + cluster.sh
-      start/stop/restart-manager。同版本零停机滚动重启运维工具。
-    - R1(f78a61e,保留):wire 区间检查(wire_compat_check)+ etcd
-      cluster_version(格式版本戳,回滚 fail-closed)+ autumn-op
-      cluster-version/upgrade-version。MIN=MAX=1。
-    - ROLL-R2-REVERT(本次):git revert ROLL-R2-A(b587471)—— etcd 回
-      rkyv、WIRE_VERSION 退 1、prost 全移除。新增
-      AutumnManager::replay_decode_err(replay 解码失败给可操作提示)。
-      升级安全 = rkyv 校验式 decode 响亮失败(不静默损坏)+ R1 格式戳。
-      live 验证:fresh reset(cluster_version=1)→ manager 重启 rkyv
-      replay 全元数据,数据存活 + 4 分区路由 + 零 decode error。
-  Not implemented(按需,无常驻代码):
-    - etcd schema 演进迁移:第一次真要不 reset 改某持久结构时,那个版本
-      带一次性迁移(读旧→写新,幂等+格式戳收尾)。在那之前不写。
-    - 砍掉(不做):R2 全量 prost、R2-B、R3 数据面协商、upgrade_chaos.sh。
+  Already implemented (this session):
+    - PROD-FIX-1 META-FAILCLOSED:ExtentEntry.corrupt_meta flag;load_extents
+      区分 present-but-corrupt / 非-NotFound 读错(都 quarantine)/ 真
+      NotFound(默认 open);append(handle_append + build_append_future)/
+      read(handle_read_bytes + build_read_future)/ commit_length 在
+      quarantine 时拒绝;write_meta_locked 成功持久后清 flag。复现测试
+      corrupt_meta_quarantines_extent_and_rejects_stale_append(先红后绿)。
+    - PROD-FIX-1 EC-PREPARE-DURABLE:fsync_staging_dir helper,EC 2PC prepare
+      新写+幂等早退+commit rename 后都 fsync 父目录(durable prepare record
+      真正成立)。
+    - coco findbugs 3 条全采纳(非-NotFound quarantine / build_read_future
+      热路径拒绝 / 幂等早退也 dir-fsync)。stream 78 单测绿,workspace 绿,
+      live smoke 通过。
+  Not implemented (recorded, 生产就绪审计剩余项,见
+    project_production_readiness_audit):
+    - P0 能力:wire 鉴权/TLS + manager 管理授权;备份/DR。
+    - P0 数据损坏(EC/split 崩溃窗,reproduce-first 再修):EC abandon
+      fence-handover 语义漂移;EC commit rename↔meta 窗 participant state
+      machine;split FREEZE_TTL vs 旧 proposal token/epoch。
+    - P1:WAL 中间-corruption skip → fail-stop;recovery set_len(0) 忽略
+      错误;region_epoch=0 旁路审计;V0 WAL CRC + VP offset;flush 发布
+      早于 checkpoint;inflight malformed/auto-release。
+    - META quarantine 的自动 recovery 上报(liveness 残留)。
 
 Current summary:
-  R2-A 已回退,升级安全收敛为 rkyv fail-loud + R1 格式戳。build 全绿,
-  rpc 25 单测过(registry 回 R1 指纹),live stop-world replay 验证通过。
-Main gaps:
-  - 无。升级安全已满足("全停全启不静默损坏");schema 演进按需。
+  两处 fail-open 已改 fail-closed,复现+coco+live 验证。其余审计项已登记。
 Next steps:
-  - 守则:任何持久结构(etcd/SST/.meta/WAL)改动要么 rkyv 同布局、要么随
-    版本带迁移,绝不依赖 reset(见 feedback_stopworld_restart_primary)。
+  - 生产前推进 P0 能力(鉴权/备份)+ EC/split 崩溃窗(各自先复现)。
