@@ -177,6 +177,35 @@ pub(crate) fn rotated_replica_start(extent_id: u64, offset: u32, n: usize) -> us
     x ^= x >> 31;
     (x % n as u64) as usize
 }
+
+/// WAL self-heal A1 (docs/wal_selfheal_design.md I2): replica slot indices
+/// (into `replicates ++ parity`, = the `read_replicated_with_failover` addr
+/// order) eligible to serve a READ.
+///
+/// For a SEALED, REPLICATED extent, slots whose `avali` bit is 0 are EXCLUDED —
+/// a recovering / isolated-corrupt replica must not serve reads (clearing the
+/// avali bit is how the self-heal isolation removes a bit-rotted replica from
+/// the serving set). OPEN extents are NOT filtered: `avali = 0` is the normal
+/// "not sealed yet" state there, and open-extent read consistency is the
+/// commit-min protocol's job, not avali's. (EC extents never reach this helper —
+/// they go through `ec_subrange_read`, where a missing shard is reconstructed,
+/// not skipped; filtering their addr list would break shard↔addr alignment.)
+///
+/// Defensive: if filtering would leave ZERO eligible slots (a sealed extent
+/// with every avali bit clear — shouldn't happen, since seal sets all_bits),
+/// fall back to ALL slots so reads don't regress; the caller logs the fallback.
+pub(crate) fn eligible_replica_slots(ex: &ExtentInfo) -> Vec<usize> {
+    let n = ex.replicates.len() + ex.parity.len();
+    if !ex.sealed {
+        return (0..n).collect();
+    }
+    let elig: Vec<usize> = (0..n).filter(|&i| (ex.avali & (1u32 << i)) != 0).collect();
+    if elig.is_empty() {
+        (0..n).collect()
+    } else {
+        elig
+    }
+}
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, SinkExt, StreamExt};
 
@@ -3009,8 +3038,23 @@ impl StreamClient {
             0
         };
 
+        // A1 (self-heal I2): drop avali-isolated slots from the read set on a
+        // sealed replicated extent. In the common case nothing is isolated
+        // (`eligible.len() == n`) and the hot path is unchanged; only when a
+        // slot is actually isolated do we skip the hedge + the bad slot.
+        let eligible = eligible_replica_slots(ex);
+        let filtered = eligible.len() < n;
+        if filtered {
+            tracing::warn!(
+                extent_id = ex.extent_id,
+                avali = ex.avali,
+                eligible = ?eligible,
+                "read: serving from avali-eligible replicas only (some slot isolated)"
+            );
+        }
+
         let mut from = 0usize;
-        if read_hedge_ms() > 0 && ex.sealed && n > 1 {
+        if !filtered && read_hedge_ms() > 0 && ex.sealed && n > 1 {
             match self.read_hedged_pair(&addrs, start, ex, offset, length).await {
                 Ok(r) => return Ok(r),
                 Err(e) => {
@@ -3025,7 +3069,11 @@ impl StreamClient {
         }
 
         for i in from..n {
-            let addr = &addrs[(start + i) % n];
+            let slot = (start + i) % n;
+            if filtered && !eligible.contains(&slot) {
+                continue; // isolated (avali=0) replica — never serve from it
+            }
+            let addr = &addrs[slot];
             match self
                 .read_shard_from_addr(addr, ex.extent_id, ex.eversion, offset, length)
                 .await
@@ -4118,6 +4166,52 @@ mod f190_bad_nodes_tests {
         let mut snap: Vec<u64> = entries.keys().copied().collect();
         snap.sort();
         assert_eq!(snap, vec![1u64]);
+    }
+}
+
+#[cfg(test)]
+mod selfheal_avali_filter_tests {
+    //! WAL self-heal A1: `eligible_replica_slots` isolates avali=0 slots on a
+    //! SEALED replicated extent (the read-path isolation that makes "clear the
+    //! avali bit" actually remove a bit-rotted replica from the serving set),
+    //! while leaving OPEN extents and the all-clear defensive case unfiltered.
+    use super::eligible_replica_slots;
+    use crate::extent_rpc::ExtentInfo;
+
+    fn ext(sealed: bool, n_repl: usize, avali: u32) -> ExtentInfo {
+        ExtentInfo {
+            extent_id: 7,
+            replicates: (0..n_repl as u64).collect(),
+            parity: Vec::new(),
+            sealed,
+            avali,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sealed_excludes_avali_zero_slot() {
+        // 3 replicas, slot 0's avali bit cleared (isolated corrupt) → only 1,2.
+        let e = ext(true, 3, 0b110);
+        assert_eq!(eligible_replica_slots(&e), vec![1, 2]);
+        // slot 1 cleared → 0,2.
+        assert_eq!(eligible_replica_slots(&ext(true, 3, 0b101)), vec![0, 2]);
+        // all healthy → all.
+        assert_eq!(eligible_replica_slots(&ext(true, 3, 0b111)), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn open_extent_is_never_filtered() {
+        // avali=0 on an OPEN extent is the normal "not sealed" state, not
+        // "all replicas bad" — must read all of them.
+        assert_eq!(eligible_replica_slots(&ext(false, 3, 0)), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn sealed_all_clear_falls_back_to_all() {
+        // Defensive: a sealed extent with EVERY avali bit clear shouldn't
+        // happen (seal sets all_bits); never refuse all reads — fall back.
+        assert_eq!(eligible_replica_slots(&ext(true, 3, 0)), vec![0, 1, 2]);
     }
 }
 

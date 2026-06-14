@@ -775,3 +775,22 @@ gaps in the lease protocol's correctness story.
   put-stream,PS 重启 → 0 丢失、大值 OK、无误触 WAL-FAILSTOP)。test-only 的
   decode_records_full/with_offsets 保留旧 skip(非生产路径)。
 - **passes:** completed (2026-06-13)
+
+---
+
+### SELFHEAL-A1 · 读路径按 avali 隔离副本(WAL replay 自愈环 增量 A 基石)(2026-06-14)
+- **背景:** WAL-FAILSTOP 后 replay 遇坏副本 loud-but-stuck。自愈环(docs/
+  wal_selfheal_design.md,coco arch 两阶段评审)的前提:**读路径必须能把坏
+  副本从 serving set 移除**,否则"读干净副本开服"后用户 VP 读仍命中坏副本
+  返回坏数据(coco P0#2)。
+- **实现:** `eligible_replica_slots(ex)` 纯 helper —— sealed replicated extent
+  跳过 avali 位为 0 的 slot(隔离 recovering/坏副本);**open extent 不过滤**
+  (avali=0 是"未封"常态,一致性靠 commit-min);EC 不过此 helper(走
+  ec_subrange_read,缺 shard 重建不跳过);全 0 防御回退全读。
+  `read_replicated_with_failover` 接入:无隔离时(eligible==n)热路径不变;
+  有 slot 隔离时跳 hedge + 跳坏 slot。
+- **验收:** 3 单测(sealed 排除 avali=0 slot / open 不过滤 / 全清回退);
+  stream 81 单测全绿(热路径未回归);workspace build 绿。
+- **passes:** completed (2026-06-14) — 自愈环增量 A 后续:A2 per-replica 读 /
+  A3 replay 跨副本 decode-check / A4 seal-and-roll+isolate / A5 manager 上报
+  RPC(fencing+etcd-first) / A6 EN quarantine;增量 B forced-repair。
