@@ -1,37 +1,42 @@
-Date: 2026-06-13
+Date: 2026-06-14
 TaskStatus: completed
-Task scope: 生产就绪审计 P0 修复(coco arch)。本会话:PROD-FIX-1(META-
-  FAILCLOSED + EC-PREPARE-DURABLE)+ PROD-FIX-2(WAL-FAILSTOP:log_stream
-  中间损坏 fail recovery)。全部先复现再修。升级方向仍为全停全启安全(rkyv
-  fail-loud),不做 rolling(见 project_rolling_upgrade_paused)。
+Task scope: WAL replay 自愈环 增量 A 主体(A2/A3/A5)。replay 发现 log_stream
+  坏/截断副本时,自动换干净副本继续 + 上报 manager 隔离坏副本(清 avali +
+  bump eversion),不再 loud-but-stuck。先复现(单测)+ coco deep 两轮评审。
+  升级方向仍为全停全启 rkyv fail-loud(不做 rolling)。
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
   Already implemented (this session):
-    - PROD-FIX-1 META-FAILCLOSED:ExtentEntry.corrupt_meta flag;load_extents
-      区分 present-but-corrupt / 非-NotFound 读错(都 quarantine)/ 真
-      NotFound(默认 open);append(handle_append + build_append_future)/
-      read(handle_read_bytes + build_read_future)/ commit_length 在
-      quarantine 时拒绝;write_meta_locked 成功持久后清 flag。复现测试
-      corrupt_meta_quarantines_extent_and_rejects_stale_append(先红后绿)。
-    - PROD-FIX-1 EC-PREPARE-DURABLE:fsync_staging_dir helper,EC 2PC prepare
-      新写+幂等早退+commit rename 后都 fsync 父目录(durable prepare record
-      真正成立)。
-    - coco findbugs 3 条全采纳(非-NotFound quarantine / build_read_future
-      热路径拒绝 / 幂等早退也 dir-fsync)。stream 78 单测绿,workspace 绿,
-      live smoke 通过。
-  Not implemented (recorded, 生产就绪审计剩余项,见
-    project_production_readiness_audit):
-    - P0 能力:wire 鉴权/TLS + manager 管理授权;备份/DR。
-    - P0 数据损坏(EC/split 崩溃窗,reproduce-first 再修):EC abandon
-      fence-handover 语义漂移;EC commit rename↔meta 窗 participant state
-      machine;split FREEZE_TTL vs 旧 proposal token/epoch。
-    - P1:WAL 中间-corruption skip → fail-stop;recovery set_len(0) 忽略
-      错误;region_epoch=0 旁路审计;V0 WAL CRC + VP offset;flush 发布
-      早于 checkpoint;inflight malformed/auto-release。
-    - META quarantine 的自动 recovery 上报(liveness 残留)。
+    - SELFHEAL-A3 (recover_partition): 每 chunk 用 committed_end 算 expected,
+      corrupt 信号 = 短读(serving 截断) ‖ decode Err ‖ committed-end 残留。
+      命中 → self_heal_replay_chunk(只 sealed replicated;跳 avali=0 已隔离
+      slot,I2;逐 eligible 副本重读 committed 窗口 decode-check;选第一个干净
+      继续;坏 node 累积;读错误不记坏 I7;全坏/open/EC → fail loud)。纯选择
+      核 select_clean_replica_chunk 单测。修复后 cursor 按 want_full 前进。
+    - SELFHEAL-A5 (manager MSG_REPORT_CORRUPT_REPLICA=0x4C, wire v2): fencing
+      = owner_epoch CAS + eversion CAS + partition→log_stream→extent 归属链;
+      etcd-first + verify-at-apply(F146);拒 open(A4 待做)/EC/最后副本/全
+      非副本(stale layout);清 avali + bump eversion;slot<32 守卫。PS 上报后
+      invalidate_extent_cache。
+    - wire v2: WIRE_VERSION_MIN=MAX=2 + 注册指纹(pre-R3 全停全启规则)。
+    - coco deep 两轮:R1 8 条(P1x4/P2x3/P3),R2 5 条(P0/P1x2/P2x2)全处置:
+      修了 verify-at-apply / 短读检测 / 归属链 / avali 过滤 clean-source /
+      EC 拒 / slot 守卫 / stale-layout 拒 / 日志计数;拒 #7(MIN=MAX 故意)、
+      #1-R2 etcd-CAS(note 33 deferred)、#4-R2 cluster_version 门控(全停全启)。
+  Not implemented (recorded):
+    - SELFHEAL-A4: open-tail 坏副本 seal-and-roll(当前 open-tail 损坏 fail loud)。
+    - SELFHEAL-A6: EN 本地 corrupt_data quarantine(靠 A1 avali + eversion 淘汰)。
+    - SELFHEAL 增量 B: forced-repair 复活隔离副本(staging+CRC+原子 rename)。
+    - 残留:初始 serving read 无 node_id 归因(超时不可归因=I7);A5 etcd blind-put
+      非 CAS(note 33,reproduce-first 再上)。
+    - 生产就绪审计剩余(见 project_production_readiness_audit):鉴权/TLS、备份/DR、
+      EC/split 崩溃窗。
 
 Current summary:
-  两处 fail-open 已改 fail-closed,复现+coco+live 验证。其余审计项已登记。
+  自愈环增量 A 闭环:replay 坏/截断副本自动 failover + 隔离,zero 静默丢数据。
+  432 lib 单测绿,workspace build 绿,coco 两轮 P0/P1 全处置。
 Next steps:
-  - 生产前推进 P0 能力(鉴权/备份)+ EC/split 崩溃窗(各自先复现)。
+  - A4 open-tail seal-and-roll + A6 EN quarantine + 增量 B forced-repair。
+  - 端到端 reproduce-first(3-node,翻盘 .dat 一字节 → open 自愈 + 隔离 + 零丢失)。
+  - 生产前 P0 能力(鉴权/备份)。

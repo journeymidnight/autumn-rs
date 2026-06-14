@@ -54,8 +54,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 1;
-pub const WIRE_VERSION_MAX: u32 = 1;
+pub const WIRE_VERSION_MIN: u32 = 2;
+pub const WIRE_VERSION_MAX: u32 = 2;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -66,6 +66,11 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // v1: R1 baseline — GetClusterIdResp grew {wire_version_min,
     // wire_version_max, cluster_version}; MSG_GET/BUMP_CLUSTER_VERSION.
     (1, "321a8b3684f0bbb9"),
+    // v2: WAL self-heal A5 — MSG_REPORT_CORRUPT_REPLICA (0x4C) +
+    // ReportCorruptReplicaReq{partition_id, owner_epoch, log_stream_id,
+    // extent_id, eversion, corrupt_node_ids}/Resp. Pre-R3: MIN=MAX=2
+    // (same-commit deploy; rkyv has no cross-version decode).
+    (2, "5d94c026c08e69ca"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

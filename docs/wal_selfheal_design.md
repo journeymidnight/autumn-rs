@@ -41,6 +41,19 @@ WAL-FAILSTOP（5873b71）把 log_stream replay 遇损坏记录从静默丢数据
 - **I9 保障边界**：强完整性只对 V1 WAL（有 CRC）。V0 legacy 无 CRC，bit-flip 若过长度边界
   decode_one 直接 Ok → 自愈报告标 `legacy_unchecked`，不宣称 2^-32。
 
+## 实现状态（2026-06-14）
+- **A1 ✅**（ce19ebd）读路径 avali 过滤 `eligible_replica_slots`。
+- **A2 ✅**（8ab48d9）`read_committed_from_replica` + `replicated_replica_count`。
+- **A3 ✅** `recover_partition` 跨副本 decode-check（短读/CRC/残留三信号），
+  纯选择核 `select_clean_replica_chunk`；只对 sealed replicated，跳 avali=0 slot。
+- **A5 ✅** manager `MSG_REPORT_CORRUPT_REPLICA`（owner+eversion+归属链 fencing,
+  etcd-first + verify-at-apply）。
+- **A4 ⏳ deferred**（open-tail seal-and-roll）：当前 open-tail 损坏 → fail loud。
+- **A6 ⏳ deferred**（EN 本地 quarantine）：靠 A1 avali 过滤 + eversion 淘汰 cache。
+- **增量 B ⏳**（forced-repair 复活隔离副本）。
+- 残留：初始 serving read 不返回 node_id（bit-rot 重读仍坏→可归因；超时不可归因
+  = I7 不隔离不可达）；A5 etcd blind-put（note 33 deferred，reproduce-first 再 CAS）。
+
 ## 增量交付
 ### 增量 A — 同步隔离（先做，拿 80% 价值：不再读坏数据 + 自动 failover）
 - **A1 读路径按 avali 隔离**（I2）：read_replicated_with_failover 跳过 avali=0 slot（sealed

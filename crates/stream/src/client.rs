@@ -2890,6 +2890,45 @@ impl StreamClient {
         Ok(ex.replicates.len() + ex.parity.len())
     }
 
+    /// WAL self-heal A5: report bit-rotted replica(s) of a SEALED log_stream
+    /// extent to the manager so it ISOLATES them (clears each corrupt slot's
+    /// `avali` bit + bumps eversion, etcd-first) — the A1 read-path filter then
+    /// stops serving from those slots, and the eversion bump forces every PS to
+    /// refetch the cleared ExtentInfo on its next read. Fenced: carries the
+    /// partition `owner_epoch` (self) + the extent `eversion` the PS saw; the
+    /// manager CAS-validates both. Returns Err on any non-OK code so the caller
+    /// can keep the partition fail-loud (isolation MUST succeed before serving,
+    /// design invariant I1). After a successful report the caller should
+    /// `invalidate_extent_cache(extent_id)` so its own subsequent reads refetch
+    /// the cleared-avali / bumped-eversion ExtentInfo.
+    pub async fn report_corrupt_replica(
+        &self,
+        partition_id: u64,
+        log_stream_id: u64,
+        extent_id: u64,
+        eversion: u64,
+        corrupt_node_ids: Vec<u64>,
+    ) -> Result<()> {
+        let req = manager_rpc::rkyv_encode(&ReportCorruptReplicaReq {
+            partition_id,
+            owner_epoch: self.owner_epoch,
+            log_stream_id,
+            extent_id,
+            eversion,
+            corrupt_node_ids,
+        });
+        let resp_data = self
+            .manager_call(MSG_REPORT_CORRUPT_REPLICA, req, Duration::from_secs(10))
+            .await?;
+        let resp: ReportCorruptReplicaResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.note_manager_code(resp.code);
+        if resp.code != CODE_OK {
+            return Err(anyhow!("report_corrupt_replica refused: {}", resp.message));
+        }
+        Ok(())
+    }
+
     /// F216-E (UCX) / F219 (TCP) recv-side copy-elimination fast path: recv the
     /// value straight into a read_loop-owned `PooledBuf` (MSG_READ_BYTES_ZC +
     /// call_into_pooled). UCX → registered RDMA recv (zero-copy); TCP → compio

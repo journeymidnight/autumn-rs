@@ -149,6 +149,16 @@ pub const MSG_POLL_INVALIDATIONS: u8 = 0x49;
 pub const MSG_GET_CLUSTER_VERSION: u8 = 0x4A;
 pub const MSG_BUMP_CLUSTER_VERSION: u8 = 0x4B;
 
+// ── WAL self-heal A5: report a corrupt replica (docs/wal_selfheal_design.md) ──
+//
+// A PS that detected a bit-rotted log_stream replica during replay
+// (per-record CRC mismatch, WAL-FAILSTOP) reports it so the manager can
+// ISOLATE that replica from the serving set (clear its `avali` bit + bump
+// eversion, etcd-first) before the partition serves (I1). Fenced: the report
+// carries the partition `owner_epoch` + extent `eversion`; the manager CAS-
+// validates both so a stale PS can't mutate the layout (I4).
+pub const MSG_REPORT_CORRUPT_REPLICA: u8 = 0x4C;
+
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
 /// Serialize a value to Bytes using rkyv.
@@ -1505,6 +1515,35 @@ pub struct BumpClusterVersionResp {
     /// The cluster_version after this call (the new value on success,
     /// the unchanged current value on refusal).
     pub cluster_version: u32,
+}
+
+// --- ReportCorruptReplica (WAL self-heal A5) ---------------------------------
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ReportCorruptReplicaReq {
+    /// Partition whose replay found the corruption — used to CAS-validate the
+    /// reporter is the current owner (`owner_epochs["partition/<id>"]`).
+    pub partition_id: u64,
+    /// The reporting PS's partition owner_epoch (fencing — a stale PS whose
+    /// epoch no longer matches is rejected).
+    pub owner_epoch: i64,
+    /// The partition's log_stream id. The manager verifies `extent_id` is a
+    /// member of this stream (scoping: an owner can only isolate replicas of an
+    /// extent in the stream it is replaying — mirrors punch_holes/truncate
+    /// operating only on their named stream's extents).
+    pub log_stream_id: u64,
+    pub extent_id: u64,
+    /// The extent eversion the PS saw; the manager rejects the report if it
+    /// has since changed (a concurrent recovery / EC bump).
+    pub eversion: u64,
+    /// Node ids whose copy of `extent_id` failed the per-record CRC during
+    /// replay (the PS confirmed at least one OTHER replica decodes clean).
+    pub corrupt_node_ids: Vec<u64>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ReportCorruptReplicaResp {
+    pub code: u8,
+    pub message: String,
 }
 
 // ── F-ioring-lease-1 wire types ────────────────────────────────────────────

@@ -173,6 +173,24 @@ some bytes fit) as success — a partial value was ACKed and read back
 zero-padded. Fixed with the write-all form; the invariant is documented
 in `crates/stream/CLAUDE.md` note 25a.
 
+### WAL replay self-heal (log_stream bit-rot / truncated replica)
+
+Partition open replays `log_stream`. If a sealed extent's serving replica
+returns a **corrupt** record (per-record CRC / length mismatch) or a
+**truncated** committed window (short read on a record boundary), recovery no
+longer fails-and-wedges: it re-reads the SAME committed window from the other
+*eligible* replicas, continues replay from the first that decodes clean, and
+reports the bad replica(s) to the manager — which clears their `avali` bit and
+bumps the extent eversion (so every PS refetches and stops serving from them)
+**before** the partition serves. Fully automatic, no operator action. Watch the
+PS log for `WAL self-heal: ... recovered the window from a clean replica` and
+`isolated corrupt log_stream replica(s) via the manager`. Only **sealed
+replicated** extents self-heal; an OPEN-tail corruption or an all-replicas-bad
+extent still fails the open loud (the data lives on a healthy replica → recover
+/ retry). EC extents route shard repair through recovery, not this path. End-to-
+end fault injection (flip one byte of one EN `.dat`) is a deferred harness; the
+decode-selection core and the manager isolation RPC are unit-tested.
+
 ## CLI cheatsheet
 
 ```bash

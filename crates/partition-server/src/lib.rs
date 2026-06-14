@@ -6661,6 +6661,123 @@ fn enqueue_delete(
 // Recovery
 // ---------------------------------------------------------------------------
 
+/// WAL self-heal A3: a replay chunk `[buf_base, buf_base+want)` of `eid` failed
+/// to decode (corrupt complete record, or a non-empty leftover at the committed
+/// end). Re-read the SAME committed window from EVERY replica of the SEALED
+/// REPLICATED extent and return the first that decodes clean, recording every
+/// replica whose copy is corrupt into `corrupt_acc` (design I7 source
+/// attribution → A5 isolation).
+///
+/// Returns:
+/// - `Ok(Some((records, consumed, healed_buf)))`: a clean replica was found;
+///   `corrupt_acc` now holds the bad node ids. `healed_buf` is that replica's
+///   bytes for the window (the caller uses `healed_buf[consumed..]` as carry).
+/// - `Ok(None)`: NOT self-healable — the extent is OPEN (commit-min has no fixed
+///   length to align a cross-replica re-read; needs F227 seal-and-roll = A4,
+///   deferred), or EC (shard bytes ≠ value), or NO replica decodes clean (every
+///   copy corrupt = unrecoverable). The caller fails the open loud.
+///
+/// I7: a replica that returns a READ error (down / transient) is NOT marked
+/// corrupt — it may hold the only good copy, and reconciling it out on a mere
+/// unreachable signal could drop data.
+async fn self_heal_replay_chunk(
+    part_sc: &StreamClient,
+    eid: u64,
+    buf_base: u32,
+    want: u32,
+    is_final: bool,
+    corrupt_acc: &mut HashSet<u64>,
+) -> Result<Option<(Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)>, usize, Vec<u8>)>> {
+    let ex = match part_sc.get_extent_info(eid).await {
+        Ok(ex) => ex,
+        Err(e) => {
+            tracing::warn!(
+                extent_id = eid,
+                error = %e,
+                "WAL self-heal: could not fetch ExtentInfo; cannot cross-read replicas"
+            );
+            return Ok(None);
+        }
+    };
+    // Only a SEALED replicated extent has a fixed committed window to align the
+    // cross-replica re-read against. Open tail → A4 (deferred); EC → per-replica
+    // read is meaningless (shard ≠ value).
+    if !ex.sealed || ex.ec_converted {
+        return Ok(None);
+    }
+    let n = ex.replicates.len() + ex.parity.len();
+    // I2 (coco P1 #3): only ELIGIBLE slots are clean-source candidates. A slot
+    // whose `avali` bit is already 0 has been isolated (by a prior A5 / an
+    // in-flight recovery) — it must NOT be trusted as a recovery source, even if
+    // it happens to decode clean. Mirror `eligible_replica_slots`: for a sealed
+    // replicated extent, skip avali=0 slots; defensively fall back to ALL slots
+    // if avali is entirely 0 (shouldn't happen for a sealed extent we're healing,
+    // but never strand recovery with zero candidates).
+    let any_avali = ex.avali != 0;
+    // Collect each eligible replica's re-read of the same committed window:
+    // Some(bytes) on a successful read, None/absent on a read error (node down /
+    // transient — NOT corrupt per I7). The pure `select_clean_replica_chunk`
+    // does the decode classification + clean selection (unit-tested).
+    let mut results: Vec<(u64, Option<Vec<u8>>)> = Vec::with_capacity(n);
+    for idx in 0..n {
+        if any_avali && idx < 32 && (ex.avali & (1u32 << idx)) == 0 {
+            // already-isolated slot — not a trustworthy clean source.
+            continue;
+        }
+        match part_sc
+            .read_committed_from_replica(eid, idx, buf_base, want)
+            .await
+        {
+            Ok((bytes, _end, node_id)) => results.push((node_id, Some(bytes))),
+            Err(_e) => { /* read error — recorded as None below via node id gap */ }
+        }
+    }
+    let (clean, corrupt) = select_clean_replica_chunk(results, want as usize, is_final);
+    corrupt_acc.extend(corrupt);
+    Ok(clean)
+}
+
+/// Pure core of A3 cross-replica selection: given each reachable replica's
+/// re-read bytes for a committed window, return the first that decodes clean
+/// plus the set of node ids whose copy is corrupt. A replica that errored on
+/// read is simply absent from `results` (NOT corrupt — I7). `want` = the
+/// expected window length (a short read is corrupt); `is_final` = the window
+/// ends at the committed end, so any leftover after decode is corruption.
+#[allow(clippy::type_complexity)]
+fn select_clean_replica_chunk(
+    results: Vec<(u64, Option<Vec<u8>>)>,
+    want: usize,
+    is_final: bool,
+) -> (
+    Option<(Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)>, usize, Vec<u8>)>,
+    HashSet<u64>,
+) {
+    let mut clean: Option<(Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)>, usize, Vec<u8>)> = None;
+    let mut corrupt: HashSet<u64> = HashSet::new();
+    for (node_id, maybe_bytes) in results {
+        let bytes = match maybe_bytes {
+            Some(b) => b,
+            None => continue, // read error → not corrupt (I7)
+        };
+        if bytes.len() < want {
+            corrupt.insert(node_id);
+            continue;
+        }
+        match decode_records_chunk(&bytes) {
+            Ok((recs, consumed)) if !(is_final && consumed < bytes.len()) => {
+                if clean.is_none() {
+                    clean = Some((recs, consumed, bytes));
+                }
+                // clean replica → NOT corrupt; leave its avali bit set.
+            }
+            _ => {
+                corrupt.insert(node_id);
+            }
+        }
+    }
+    (clean, corrupt)
+}
+
 async fn recover_partition(
     _part_id: u64,
     rg: &Range,
@@ -7039,6 +7156,13 @@ async fn recover_partition(
     };
     let active = Memtable::new();
 
+    // WAL self-heal A3: per-extent set of replica node_ids whose copy of a
+    // log_stream chunk failed to decode during replay. Populated by
+    // `self_heal_replay_chunk` when it works around a corrupt serving replica
+    // by re-reading a clean one; drained after the replay loop into A5
+    // `report_corrupt_replica` (isolation) BEFORE the partition serves (I1).
+    let mut corrupt_per_extent: HashMap<u64, HashSet<u64>> = HashMap::new();
+
     // Position-based replay-extent selection. Pre-this-fix used
     // `eid < recovered_vp_eid → skip`, which is wrong post-merge because
     // the spliced extent_ids list is non-monotonic in extent_id. See
@@ -7124,14 +7248,14 @@ async fn recover_partition(
             let mut cur_off: u32 = start_off;
             let mut carry: Vec<u8> = Vec::new();
             loop {
-            let data = {
+            let (data, committed_end) = {
                 let mut attempt = 0u32;
                 loop {
                     match part_sc
                         .read_committed_bytes_from_extent(eid, cur_off, REPLAY_CHUNK_BYTES)
                         .await
                     {
-                        Ok((d, _)) => break d,
+                        Ok((d, ce)) => break (d, ce),
                         Err(e) => {
                             attempt += 1;
                             if attempt >= 10 {
@@ -7150,20 +7274,107 @@ async fn recover_partition(
                 }
             };
             let got = data.len();
-            if got == 0 && carry.is_empty() {
+            // Bytes still committed from cur_off, and how many THIS chunk should
+            // have yielded. `expected < got` is impossible (the read clamps to
+            // committed_end); `got < expected` = the serving replica TRUNCATED
+            // the committed window (coco P1 #2) — a short read that lands on a
+            // record boundary would otherwise decode clean and be silently
+            // treated as end-of-extent, dropping the committed tail. We route it
+            // to self-heal (a clean replica has the bytes) / fail-loud instead.
+            let rem = committed_end.saturating_sub(cur_off);
+            let expected = REPLAY_CHUNK_BYTES.min(rem) as usize;
+            let is_final = (rem as u64) <= REPLAY_CHUNK_BYTES as u64;
+            let short = got < expected;
+            if rem == 0 && carry.is_empty() {
+                // Reached the committed end cleanly, nothing buffered. Done.
                 break;
             }
             let buf_base = cur_off as usize - carry.len();
-            let buf: Vec<u8> = if carry.is_empty() {
+            // The full committed window this chunk covers (carry prefix + the
+            // bytes that SHOULD be readable here) — used as the self-heal re-read
+            // length so a truncated serving replica's short `got` doesn't shrink it.
+            let want_full = carry.len() + expected;
+            let mut buf: Vec<u8> = if carry.is_empty() {
                 data
             } else {
                 let mut c = std::mem::take(&mut carry);
                 c.extend_from_slice(&data);
                 c
             };
-            // WAL-FAILSTOP: a corrupt record fails the open loud (propagated)
-            // rather than silently skipping it — see decode_records_chunk.
-            let (records, consumed) = decode_records_chunk(&buf)?;
+            // WAL-FAILSTOP + self-heal A3: try to decode the chunk. Corruption =
+            // a short read (truncated serving replica), OR a CRC/length mismatch
+            // on a complete record (`decode_records_chunk` Err), OR a non-empty
+            // leftover at the committed end (final chunk, `consumed < buf.len()`).
+            // On corruption, attempt cross-replica self-heal: re-read this
+            // committed window from every replica of the SEALED extent,
+            // decode-check each, use the first clean one, and record the corrupt
+            // node_ids for A5 isolation. Only if NO clean replica exists (or the
+            // extent is OPEN / EC, not self-healable) do we fail the open loud.
+            let decoded = decode_records_chunk(&buf);
+            let need_heal = short
+                || match &decoded {
+                    Ok((_recs, consumed)) => is_final && *consumed < buf.len(),
+                    Err(_) => true,
+                };
+            let (records, consumed) = if !need_heal {
+                decoded.expect("need_heal=false implies Ok")
+            } else {
+                let corrupt_set = corrupt_per_extent.entry(eid).or_default();
+                // Re-read the FULL committed window (`want_full`), not the
+                // possibly-short `buf.len()` — a truncated serving replica must
+                // not shrink the window we ask clean replicas for.
+                match self_heal_replay_chunk(
+                    part_sc,
+                    eid,
+                    buf_base as u32,
+                    want_full as u32,
+                    is_final,
+                    corrupt_set,
+                )
+                .await?
+                {
+                    Some((recs, c, healed)) => {
+                        tracing::warn!(
+                            part_id = _part_id,
+                            extent_id = eid,
+                            offset = buf_base,
+                            short,
+                            "WAL self-heal: log_stream chunk corrupt/truncated on the \
+                             serving replica(s); recovered the window from a clean \
+                             replica (corrupt replica(s) will be isolated via the manager)"
+                        );
+                        buf = healed;
+                        (recs, c)
+                    }
+                    None => {
+                        // Not self-healable (OPEN tail → A4 seal-and-roll, not yet
+                        // built; EC; or every replica corrupt = unrecoverable).
+                        // Fail the open loud, preserving the decode error if any.
+                        let reason = if short {
+                            format!(
+                                "serving replica truncated the committed window (got {got} of \
+                                 {expected} expected bytes)"
+                            )
+                        } else {
+                            let leftover = match &decoded {
+                                Ok((_r, c)) => buf.len().saturating_sub(*c),
+                                Err(_) => 0,
+                            };
+                            format!("{leftover} leftover byte(s) at the committed end")
+                        };
+                        return Err(decoded
+                            .err()
+                            .unwrap_or_else(|| {
+                                anyhow::anyhow!("WAL-FAILSTOP: {reason} of log_stream extent {eid}")
+                            })
+                            .context(format!(
+                                "log_stream extent {eid} chunk @ offset {buf_base} is \
+                                 corrupt and not self-healable (open tail / EC / all \
+                                 replicas corrupt) — recover from a healthy log_stream copy"
+                            )));
+                    }
+                }
+            };
             for (buf_off, op, key, value, expires_at) in records {
                 let ts = parse_ts(&key);
                 if ts > max_seq {
@@ -7221,22 +7432,22 @@ async fn recover_partition(
                 active.insert(key, mem_entry, size);
             }
             carry = buf[consumed..].to_vec();
-            cur_off += got as u32;
-            if (got as u32) < REPLAY_CHUNK_BYTES {
-                // Reached the COMMITTED end (reads are committed-clamped via
-                // read_committed_bytes_from_extent, F261). WAL-FAILSTOP (coco
-                // prod-audit P0 #2 follow-up): a non-empty `carry` here is NOT
-                // a legit crash-tail. The committed boundary always lands on a
-                // record boundary (commit advances by whole all-replica-ACKed
-                // records), and uncommitted partial tails are clamped OUT of
-                // the read — so leftover bytes mean a record's declared length
-                // runs PAST the commit boundary (a length-field bit-flip that
-                // decode_one reports as Incomplete before it can check the CRC,
-                // or a lagging/truncated replica). Either way, silently
-                // discarding it drops committed data. Fail the open loud; the
-                // record lives on a healthy log_stream replica. (Pre-F261 the
-                // read included speculative bytes so a trailing partial WAS the
-                // uncommitted tail — that tolerance is now stale.)
+            // Advance by the full window `buf` covers (= the committed bytes for
+            // this chunk). When a chunk was self-healed, `buf` was replaced by
+            // the clean replica's `want_full`-length copy, so this advances past
+            // the FULL committed window — not the truncated serving `got`. In the
+            // non-healed case `buf.len() == carry_prev + got`, identical to the
+            // old `cur_off += got`.
+            cur_off = (buf_base + buf.len()) as u32;
+            if is_final {
+                // Reached the committed end (committed_end-clamped reads, F261).
+                // need_heal already routed an is_final leftover through self-heal
+                // / fail-loud above, so `carry` is empty here; the check is
+                // belt-and-braces. WAL-FAILSTOP (coco prod-audit P0 #2 follow-up):
+                // a non-empty carry at the committed end is NOT a legit crash-tail
+                // (the committed boundary lands on a record boundary; uncommitted
+                // partial tails are clamped out), so discarding it would drop
+                // committed data.
                 if !carry.is_empty() {
                     return Err(anyhow::anyhow!(
                         "WAL-FAILSTOP: {} leftover byte(s) at the committed end of \
@@ -7251,6 +7462,44 @@ async fn recover_partition(
             }
             } // chunk loop
         }
+    }
+
+    // WAL self-heal A5: isolate every corrupt replica we worked around during
+    // replay BEFORE this partition serves (design I1 — isolation-before-serving;
+    // an unisolated corrupt replica could still serve rotted bytes for a VP read,
+    // which `resolve_value` does NOT CRC-check). The manager clears each corrupt
+    // slot's `avali` bit + bumps eversion (etcd-first); the eversion bump forces
+    // every PS — including us, after `invalidate_extent_cache` — to refetch the
+    // cleared ExtentInfo so the A1 read filter excludes the bad slot. A refused
+    // report (stale owner/eversion, would-isolate-last, open) returns Err →
+    // partition open fails loud → region_sync retries → re-detect + re-report.
+    for (eid, corrupt) in &corrupt_per_extent {
+        if corrupt.is_empty() {
+            continue;
+        }
+        let node_ids: Vec<u64> = corrupt.iter().copied().collect();
+        // Fresh fetch so the eversion we report matches the manager's current
+        // (minimises a spurious eversion-mismatch refusal).
+        part_sc.invalidate_extent_cache(*eid);
+        let ex = part_sc
+            .get_extent_info(*eid)
+            .await
+            .with_context(|| format!("A5: fetch ExtentInfo for corrupt extent {eid}"))?;
+        part_sc
+            .report_corrupt_replica(_part_id, log_stream_id, *eid, ex.eversion, node_ids.clone())
+            .await
+            .with_context(|| {
+                format!("A5: isolate corrupt log_stream replica(s) {node_ids:?} of extent {eid}")
+            })?;
+        // Force our own serving reads to refetch the cleared-avali / bumped
+        // eversion ExtentInfo.
+        part_sc.invalidate_extent_cache(*eid);
+        tracing::warn!(
+            part_id = _part_id,
+            extent_id = *eid,
+            corrupt = ?node_ids,
+            "WAL self-heal: isolated corrupt log_stream replica(s) via the manager"
+        );
     }
 
     Ok((
@@ -8949,6 +9198,76 @@ mod tests {
             a.len(),
             "B left entirely as carry → recover_partition's committed-end carry check fails it"
         );
+    }
+
+    /// WAL self-heal A3: `select_clean_replica_chunk` picks the first replica
+    /// whose window decodes clean and records every corrupt replica's node id
+    /// (read errors are NOT corrupt — I7). All-corrupt → None (caller fails
+    /// loud).
+    #[test]
+    fn selfheal_a3_selects_clean_replica_and_records_corrupt() {
+        let a = encode_record(1, b"k1", b"v1", 0);
+        let b = encode_record(1, b"k2", b"v2", 0);
+        let mut clean: Vec<u8> = Vec::new();
+        clean.extend_from_slice(&a);
+        let b_start = clean.len();
+        clean.extend_from_slice(&b);
+        let want = clean.len();
+
+        // node 11 = bit-rotted copy (B's CRC mismatches), node 13 = clean,
+        // node 15 = also clean. Mixed order on purpose.
+        let mut rotted = clean.clone();
+        rotted[b_start + 8] ^= 0xFF;
+
+        let results = vec![
+            (11u64, Some(rotted.clone())),
+            (13u64, Some(clean.clone())),
+            (15u64, Some(clean.clone())),
+        ];
+        let (picked, corrupt) = select_clean_replica_chunk(results, want, /*is_final=*/ true);
+        let (recs, consumed, healed) = picked.expect("a clean replica exists → Some");
+        assert_eq!(recs.len(), 2, "clean window decodes both records");
+        assert_eq!(consumed, want, "final chunk fully consumed");
+        assert_eq!(healed, clean, "healed bytes = the clean replica's copy");
+        assert!(corrupt.contains(&11), "rotted node 11 recorded corrupt");
+        assert!(!corrupt.contains(&13) && !corrupt.contains(&15), "clean nodes untouched");
+
+        // A read error (None) is NOT corrupt (I7) — node 11 unreachable, the
+        // remaining clean node is used and 11 is NOT in the corrupt set.
+        let results = vec![(11u64, None), (13u64, Some(clean.clone()))];
+        let (picked, corrupt) = select_clean_replica_chunk(results, want, true);
+        assert!(picked.is_some(), "clean node 13 used");
+        assert!(corrupt.is_empty(), "unreachable node is not marked corrupt (I7)");
+
+        // A short read (< want) over a committed window is corrupt.
+        let results = vec![(11u64, Some(clean[..want - 4].to_vec()))];
+        let (picked, corrupt) = select_clean_replica_chunk(results, want, true);
+        assert!(picked.is_none(), "short read → no clean replica");
+        assert!(corrupt.contains(&11), "short-reading node recorded corrupt");
+
+        // All replicas corrupt → None (caller fails the open loud).
+        let results = vec![
+            (11u64, Some(rotted.clone())),
+            (13u64, Some(rotted.clone())),
+            (15u64, Some(rotted.clone())),
+        ];
+        let (picked, corrupt) = select_clean_replica_chunk(results, want, true);
+        assert!(picked.is_none(), "all corrupt → no clean replica");
+        assert_eq!(corrupt.len(), 3, "all three recorded corrupt");
+
+        // Non-final chunk: a leftover (partial record at the window tail) is the
+        // normal cross-chunk carry, NOT corruption. The clean replica is picked
+        // and `consumed < want` is fine.
+        let mut partial: Vec<u8> = Vec::new();
+        partial.extend_from_slice(&a);
+        partial.extend_from_slice(&b[..b.len() - 3]); // chop B's tail → carry
+        let want_p = partial.len();
+        let results = vec![(13u64, Some(partial.clone()))];
+        let (picked, corrupt) = select_clean_replica_chunk(results, want_p, /*is_final=*/ false);
+        let (recs, consumed, _) = picked.expect("non-final partial tail is clean");
+        assert_eq!(recs.len(), 1, "only A decodes; B's chopped tail is carry");
+        assert!(consumed < want_p, "leftover carried to next chunk");
+        assert!(corrupt.is_empty(), "non-final leftover is not corruption");
     }
 
     /// Regression test for GC data loss bug: WAL records for large values

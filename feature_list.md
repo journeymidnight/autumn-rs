@@ -794,3 +794,36 @@ gaps in the lease protocol's correctness story.
 - **passes:** completed (2026-06-14) — 自愈环增量 A 后续:A2 per-replica 读 /
   A3 replay 跨副本 decode-check / A4 seal-and-roll+isolate / A5 manager 上报
   RPC(fencing+etcd-first) / A6 EN quarantine;增量 B forced-repair。
+
+### SELFHEAL-A2/A3/A5 · WAL replay 跨副本自愈 + manager 隔离 RPC(增量 A 主体)(2026-06-14)
+- **背景:** A1 装好读路径过滤。本次补齐"replay 发现坏副本→换干净副本继续→
+  隔离坏副本"闭环(docs/wal_selfheal_design.md 增量 A)。
+- **A2(stream client):** `read_committed_from_replica(eid, idx, off, len) ->
+  (bytes, committed_end, node_id)` —— 指定副本、不 failover、committed-clamp;
+  `replicated_replica_count`。EC extent → Err。(commit 8ab48d9)
+- **A3(recover_partition):** replay 每 chunk 用 `read_committed_bytes_from_extent`
+  返回的 `committed_end` 算 `expected`;**corrupt 信号 = 短读(serving 副本截断)
+  ‖ decode Err(CRC/长度) ‖ committed-end 残留**。命中→`self_heal_replay_chunk`:
+  只对 **sealed replicated** extent,跳过 avali=0 已隔离 slot(I2,coco P1),
+  逐 ELIGIBLE 副本重读同一 committed 窗口、decode-check,选第一个干净的继续
+  replay,坏 node_id 累积;读错误的副本不记坏(I7);全坏/open/EC → fail loud。
+  纯选择核 `select_clean_replica_chunk` 单测化。修复后 cursor 按 `want_full`
+  前进(不被短读 `got` 缩窄)。
+- **A5(manager `MSG_REPORT_CORRUPT_REPLICA`=0x4C,wire v2):** fencing =
+  partition owner_epoch CAS + extent eversion CAS + **partition→log_stream→extent
+  归属链校验**(coco P1:防跨 partition 隔离);etcd-first persist + **verify-at-
+  apply**(F146 式:await 后 eversion 变了就拒,不覆盖并发);拒 open(A4 待做)/
+  EC/最后一个副本/全非副本(stale layout,coco P2:不假成功);清坏 slot avali 位
+  + bump eversion(逼各 PS refetch,A1 过滤生效);slot<32 shift 守卫。PS 上报后
+  `invalidate_extent_cache`。A4(open-tail seal-and-roll)与 A6(EN 本地 quarantine)
+  仍 deferred。
+- **验收:** A3 选择核单测(干净选择/读错不记坏/短读记坏/全坏 None/非终块残留 OK);
+  A5 manager 单测 10 条(清位+bump / stale owner / stale eversion / EC 拒 / open 拒 /
+  最后副本拒 / 幂等 / 非副本 stale-layout 拒 / 跨 partition 拒 / 越界 extent 拒);
+  4 crate lib 全绿(432);workspace build 绿;coco deep 两轮,P0/P1 全处置。
+- **已知残留(登记,非阻塞):** (1)初始 serving read 不返回 node_id,若坏副本在
+  cross-read 时恰好超时则该次无法归因(bit-rot 实际场景重读仍坏→可归因;I7 不隔离
+  不可达副本);(2)A5 etcd 为 blind-put 非 CAS —— 与 apply_recovery_done 等同类,
+  按 manager note 33 deferred(reproduce-first 再上 CAS);(3)cluster_version 不门控
+  (全停全启 + wire-fingerprint 启动拒绝已防混部)。
+- **passes:** completed (2026-06-14)

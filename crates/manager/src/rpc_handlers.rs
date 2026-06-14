@@ -289,6 +289,8 @@ impl AutumnManager {
             // ── R1 rolling upgrade: cluster_version gate ─────────────────
             MSG_GET_CLUSTER_VERSION => self.handle_get_cluster_version().await,
             MSG_BUMP_CLUSTER_VERSION => self.handle_bump_cluster_version(payload).await,
+            // ── WAL self-heal A5: isolate a corrupt log_stream replica ──
+            MSG_REPORT_CORRUPT_REPLICA => self.handle_report_corrupt_replica(payload).await,
             // ── F-ioring-lease-1: inode-level lease + close-to-open ─────
             MSG_ACQUIRE_LEASE => self.handle_acquire_lease(payload).await,
             MSG_RELEASE_LEASE => self.handle_release_lease(payload).await,
@@ -393,6 +395,242 @@ impl AutumnManager {
                 cluster_version: self.cluster_version.get(),
             })),
         }
+    }
+
+    /// WAL self-heal A5: isolate a bit-rotted log_stream replica reported by a
+    /// PS replay. Fenced (owner_epoch + eversion CAS) + etcd-first. Clears the
+    /// corrupt slots' `avali` bits on a SEALED extent (so the A1 read filter
+    /// stops serving from them) and bumps eversion (invalidates client caches).
+    /// OPEN-extent corruption needs seal-and-roll (A4) — refused here with
+    /// CODE_PRECONDITION so the PS fails the open loud rather than self-heal
+    /// an extent whose length isn't yet frozen.
+    async fn handle_report_corrupt_replica(&self, payload: Bytes) -> HandlerResult {
+        let req: ReportCorruptReplicaReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        if let Err(e) = self.ensure_leader() {
+            return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                code: Self::err_to_code(&e),
+                message: e.to_string(),
+            }));
+        }
+        // Compute the etcd-first update under a read-only borrow (no mutation
+        // until the persist succeeds — coco I5).
+        let updated: Result<MgrExtentInfo, (u8, String)> = {
+            let s = self.store.inner.borrow();
+            // I4 fencing: the reporter must be the current partition owner.
+            let owner_key = format!("partition/{}", req.partition_id);
+            match s.owner_epochs.get(&owner_key) {
+                Some(&cur) if cur == req.owner_epoch => {}
+                other => {
+                    // Fencing CAS failed: the reporter is not the current owner
+                    // (stale PS). Manager-namespace code 5 = NOT_LEADER, so use
+                    // PRECONDITION (the report's precondition — being the owner
+                    // — does not hold). The PS treats any non-OK as "don't trust".
+                    return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                        code: CODE_PRECONDITION,
+                        message: format!(
+                            "stale corrupt-replica report: partition {} owner_epoch {} != current {:?}",
+                            req.partition_id, req.owner_epoch, other
+                        ),
+                    }));
+                }
+            }
+            // I4 scoping (coco P1 #4 + #2): the named log_stream must actually
+            // belong to the partition whose owner_epoch authorized this report,
+            // AND the extent must be a member of that stream. Without the
+            // partition→log_stream binding, a PS owning partition A could name
+            // partition B's log_stream + a B extent and isolate B's replicas.
+            // Mirrors punch_holes/truncate operating only on their named
+            // stream's extents, plus the owner→stream ownership tie.
+            match s.partitions.get(&req.partition_id) {
+                Some(pm) if pm.log_stream == req.log_stream_id => {}
+                _ => {
+                    return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                        code: CODE_PRECONDITION,
+                        message: format!(
+                            "log_stream {} is not partition {}'s log_stream — refusing \
+                             cross-partition corrupt-replica report",
+                            req.log_stream_id, req.partition_id
+                        ),
+                    }));
+                }
+            }
+            match s.streams.get(&req.log_stream_id) {
+                Some(si) if si.extent_ids.contains(&req.extent_id) => {}
+                _ => {
+                    return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                        code: CODE_PRECONDITION,
+                        message: format!(
+                            "extent {} is not a member of log_stream {} — refusing out-of-scope \
+                             corrupt-replica report",
+                            req.extent_id, req.log_stream_id
+                        ),
+                    }));
+                }
+            }
+            match s.extents.get(&req.extent_id) {
+                None => Err((
+                    CODE_NOT_FOUND,
+                    format!("extent {} not found", req.extent_id),
+                )),
+                Some(ex) if ex.eversion != req.eversion => Err((
+                    CODE_PRECONDITION,
+                    format!(
+                        "extent {} eversion {} != reported {} (concurrent op); retry",
+                        req.extent_id, ex.eversion, req.eversion
+                    ),
+                )),
+                // coco P2 #5: an EC-converted extent has shard bytes, not full
+                // replicas — `avali` bits mean shard availability and clearing
+                // one would corrupt the EC read/repair semantics. The replicated
+                // self-heal does not apply; refuse (the detect→EC-convert race or
+                // a stale PS). EC shard repair routes through recovery, not here.
+                Some(ex) if ex.ec_converted => Err((
+                    CODE_PRECONDITION,
+                    format!(
+                        "extent {} is EC-converted; replicated corrupt-replica isolation does \
+                         not apply (EC shard repair routes through recovery)",
+                        req.extent_id
+                    ),
+                )),
+                Some(ex) if !ex.sealed => Err((
+                    CODE_PRECONDITION,
+                    format!(
+                        "extent {} is OPEN; corruption isolation on an unsealed tail needs \
+                         seal-and-roll (A4, not yet implemented) — failing the report so the \
+                         PS open fails loud",
+                        req.extent_id
+                    ),
+                )),
+                Some(ex) => {
+                    let mut new_ex = ex.clone();
+                    let slots: Vec<u64> = new_ex
+                        .replicates
+                        .iter()
+                        .chain(new_ex.parity.iter())
+                        .copied()
+                        .collect();
+                    let mut cleared = 0u32;
+                    let mut found = 0u32; // reported nodes that ARE replicas
+                    for nid in &req.corrupt_node_ids {
+                        if let Some(slot) = slots.iter().position(|s| s == nid) {
+                            found += 1;
+                            // coco P2 #6: `avali` is u32 — guard the shift. K+M
+                            // is capped well below 32 today, but never UB on a
+                            // malformed/future-wide layout.
+                            if slot >= 32 {
+                                continue;
+                            }
+                            let bit = 1u32 << slot;
+                            if new_ex.avali & bit != 0 {
+                                new_ex.avali &= !bit;
+                                cleared += 1;
+                            }
+                        }
+                    }
+                    if found == 0 {
+                        // coco P2 #5: NONE of the reported nodes are replicas of
+                        // this extent — a stale-layout / buggy report. Returning
+                        // OK here would falsely assert "isolated" while the node
+                        // the PS actually saw corruption from is unaddressed
+                        // (isolation-before-serving violated). Refuse so the PS
+                        // refetches ExtentInfo + retries (or fails the open loud).
+                        return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                            code: CODE_PRECONDITION,
+                            message: format!(
+                                "none of the reported corrupt nodes {:?} are replicas of extent \
+                                 {} (slots {:?}) — stale layout; PS should refetch + retry",
+                                req.corrupt_node_ids, req.extent_id, slots
+                            ),
+                        }));
+                    }
+                    if cleared == 0 {
+                        // Reported nodes ARE replicas but their avali bits are
+                        // already clear — genuine idempotent success (a retried
+                        // report after the first isolation landed).
+                        return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                            code: CODE_OK,
+                            message: "no-op (reported replica(s) already isolated)".into(),
+                        }));
+                    }
+                    // Defense: never isolate the LAST healthy replica — that
+                    // would make the extent unreadable. If clearing would leave
+                    // zero avali bits, refuse (all replicas reported corrupt =
+                    // unrecoverable, the PS must fail loud).
+                    if new_ex.avali == 0 {
+                        return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                            code: CODE_PRECONDITION,
+                            message: format!(
+                                "refusing to isolate the last replica(s) of extent {} (all \
+                                 reported corrupt) — unrecoverable, PS must fail loud",
+                                req.extent_id
+                            ),
+                        }));
+                    }
+                    new_ex.eversion += 1;
+                    Ok(new_ex)
+                }
+            }
+        };
+        let updated = match updated {
+            Ok(u) => u,
+            Err((code, message)) => {
+                return Ok(rkyv_encode(&ReportCorruptReplicaResp { code, message }))
+            }
+        };
+        // etcd-first: persist the avali change before touching in-memory.
+        // NOTE (coco P0, deferred per manager CLAUDE.md note 33): this is a
+        // blind put on extents/<id>, not a value-CAS, so a concurrent extent-
+        // state mutator (recovery/EC/seal/split) landing during this await can
+        // be rolled back in etcd by our stale clone. A5 is in the SAME deferred
+        // class as apply_recovery_done / apply_ec_conversion_done / split-seal /
+        // sync_vp_refs — all blind-put + verify-at-apply (the F146 pattern,
+        // below), accepting the etcd-RTT residual that note 33's reproduce-first
+        // investigation found "not reproducible and structurally near-precluded"
+        // (recovery/EC serialize per extent via the F207 ledger; A5 only fires
+        // on actual bit-rot during a partition open). The generalized
+        // put_delete_txn_cas is kept ready to apply here IF an extent-state
+        // clobber is ever actually reproduced — do NOT add it speculatively.
+        if let Err(err) = self.persist_extent(&updated).await {
+            return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+            }));
+        }
+        // Verify-at-apply (coco P1 #1, the F146 pattern): a concurrent mutator
+        // (recovery_done / ec_convert_done / seal / split) could have bumped
+        // this extent's eversion during the persist await. We snapshotted the
+        // pre-bump baseline as `req.eversion`; if the live extent no longer
+        // matches it, another op ran — do NOT stomp it with our stale clone.
+        // Refuse (the orphan etcd revision is benign: failover replay reads the
+        // latest per key, and the PS retry re-detects + re-reports).
+        {
+            let mut s = self.store.inner.borrow_mut();
+            match s.extents.get(&updated.extent_id) {
+                Some(live) if live.eversion != req.eversion => {
+                    return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                        code: CODE_PRECONDITION,
+                        message: format!(
+                            "extent {} eversion changed during isolation ({} != snapshot {}); \
+                             concurrent op — PS should retry",
+                            updated.extent_id, live.eversion, req.eversion
+                        ),
+                    }));
+                }
+                _ => {}
+            }
+            s.extents.insert(updated.extent_id, updated.clone());
+        }
+        tracing::warn!(
+            extent_id = updated.extent_id,
+            avali = updated.avali,
+            corrupt = ?req.corrupt_node_ids,
+            "A5: isolated corrupt log_stream replica(s) (avali cleared, eversion bumped)"
+        );
+        Ok(rkyv_encode(&ReportCorruptReplicaResp {
+            code: CODE_OK,
+            message: String::new(),
+        }))
     }
 
     pub(crate) async fn handle_acquire_owner_lock(&self, payload: Bytes) -> HandlerResult {
@@ -5224,6 +5462,239 @@ mod f227_commit_seal_tests {
         resp.insert(3u64, 20u32);
         assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 3).is_err());
         assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 2).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod selfheal_a5_tests {
+    //! WAL self-heal A5: `handle_report_corrupt_replica` isolates a bit-rotted
+    //! log_stream replica. Borrows then awaits; every borrow is dropped before
+    //! the await (single-threaded test runtime).
+    #![allow(clippy::await_holding_refcell_ref)]
+    use crate::AutumnManager;
+    use autumn_rpc::manager_rpc::*;
+    use bytes::Bytes;
+
+    fn run<F: std::future::Future<Output = T>, T>(f: F) -> T {
+        compio::runtime::Runtime::new().unwrap().block_on(f)
+    }
+
+    const LOG_STREAM_ID: u64 = 700;
+
+    /// A sealed 3-replica extent (slots 0/1/2 → nodes 1/3/5) with all avali
+    /// bits set, owned by partition `part_id` at `owner_epoch`, and a member of
+    /// log_stream `LOG_STREAM_ID`.
+    fn seed(m: &AutumnManager, part_id: u64, owner_epoch: i64, extent_id: u64) {
+        let mut s = m.store.inner.borrow_mut();
+        s.owner_epochs
+            .insert(format!("partition/{part_id}"), owner_epoch);
+        s.partitions.insert(
+            part_id,
+            MgrPartitionMeta {
+                part_id,
+                log_stream: LOG_STREAM_ID,
+                row_stream: 0,
+                meta_stream: 0,
+                rg: None,
+            },
+        );
+        s.streams.insert(
+            LOG_STREAM_ID,
+            MgrStreamInfo {
+                stream_id: LOG_STREAM_ID,
+                extent_ids: vec![extent_id],
+                ec_data_shard: 0,
+                ec_parity_shard: 0,
+                replicates: 3,
+            },
+        );
+        s.extents.insert(
+            extent_id,
+            MgrExtentInfo {
+                extent_id,
+                replicates: vec![1, 3, 5],
+                parity: vec![],
+                eversion: 7,
+                refs: 1,
+                vp_table_refs: 0,
+                sealed_length: 20_000_000,
+                sealed: true,
+                avali: 0b111,
+                replicate_disks: vec![],
+                parity_disks: vec![],
+                ec_converted: false,
+            },
+        );
+    }
+
+    fn fire(
+        m: &AutumnManager,
+        part_id: u64,
+        owner_epoch: i64,
+        extent_id: u64,
+        eversion: u64,
+        corrupt: Vec<u64>,
+    ) -> ReportCorruptReplicaResp {
+        let req = ReportCorruptReplicaReq {
+            partition_id: part_id,
+            owner_epoch,
+            log_stream_id: LOG_STREAM_ID,
+            extent_id,
+            eversion,
+            corrupt_node_ids: corrupt,
+        };
+        let payload: Bytes = rkyv_encode(&req);
+        let resp = run(async { m.handle_report_corrupt_replica(payload).await.unwrap() });
+        rkyv_decode::<ReportCorruptReplicaResp>(&resp).expect("decode resp")
+    }
+
+    #[test]
+    fn valid_report_clears_avali_bit_and_bumps_eversion() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        // node 3 = slot 1 reported corrupt.
+        let r = fire(&m, 100, 42, 9, 7, vec![3]);
+        assert_eq!(r.code, CODE_OK, "{}", r.message);
+        let s = m.store.inner.borrow();
+        let ex = s.extents.get(&9).unwrap();
+        assert_eq!(ex.avali, 0b101, "slot 1 (node 3) bit cleared");
+        assert_eq!(ex.eversion, 8, "eversion bumped to invalidate caches");
+    }
+
+    #[test]
+    fn stale_owner_epoch_is_rejected() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        // reporter claims a stale owner_epoch (41 != current 42).
+        let r = fire(&m, 100, 41, 9, 7, vec![3]);
+        assert_eq!(r.code, CODE_PRECONDITION);
+        let s = m.store.inner.borrow();
+        let ex = s.extents.get(&9).unwrap();
+        assert_eq!(ex.avali, 0b111, "no change on a fenced-out report");
+        assert_eq!(ex.eversion, 7);
+    }
+
+    #[test]
+    fn stale_eversion_is_rejected() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        // reporter saw eversion 6, manager now has 7 (concurrent op) → retry.
+        let r = fire(&m, 100, 42, 9, 6, vec![3]);
+        assert_eq!(r.code, CODE_PRECONDITION);
+        let s = m.store.inner.borrow();
+        assert_eq!(s.extents.get(&9).unwrap().avali, 0b111);
+    }
+
+    #[test]
+    fn refuses_to_isolate_the_last_replicas() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        // all 3 reported corrupt → would clear every avali bit → refuse.
+        let r = fire(&m, 100, 42, 9, 7, vec![1, 3, 5]);
+        assert_eq!(r.code, CODE_PRECONDITION);
+        let s = m.store.inner.borrow();
+        assert_eq!(
+            s.extents.get(&9).unwrap().avali,
+            0b111,
+            "unrecoverable: avali left intact so PS fails loud"
+        );
+    }
+
+    #[test]
+    fn open_extent_is_refused_pending_seal_and_roll() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        {
+            let mut s = m.store.inner.borrow_mut();
+            let ex = s.extents.get_mut(&9).unwrap();
+            ex.sealed = false;
+            ex.sealed_length = 0;
+            ex.avali = 0; // open extents are avali=0 normally
+        }
+        let r = fire(&m, 100, 42, 9, 7, vec![3]);
+        assert_eq!(r.code, CODE_PRECONDITION, "open → A4 seal-and-roll, not A5");
+    }
+
+    #[test]
+    fn ec_converted_extent_is_refused() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        {
+            let mut s = m.store.inner.borrow_mut();
+            s.extents.get_mut(&9).unwrap().ec_converted = true;
+        }
+        let r = fire(&m, 100, 42, 9, 7, vec![3]);
+        assert_eq!(r.code, CODE_PRECONDITION, "EC extent → replicated isolation N/A");
+        let s = m.store.inner.borrow();
+        assert_eq!(s.extents.get(&9).unwrap().avali, 0b111, "unchanged");
+    }
+
+    #[test]
+    fn out_of_scope_extent_is_refused() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        // Report a DIFFERENT extent (8) that is not in the named log_stream.
+        let req = ReportCorruptReplicaReq {
+            partition_id: 100,
+            owner_epoch: 42,
+            log_stream_id: LOG_STREAM_ID,
+            extent_id: 8,
+            eversion: 7,
+            corrupt_node_ids: vec![3],
+        };
+        let payload: Bytes = rkyv_encode(&req);
+        let resp = run(async { m.handle_report_corrupt_replica(payload).await.unwrap() });
+        let r = rkyv_decode::<ReportCorruptReplicaResp>(&resp).unwrap();
+        assert_eq!(r.code, CODE_PRECONDITION, "extent not in log_stream → refused");
+    }
+
+    #[test]
+    fn report_node_not_in_layout_is_refused_not_false_ok() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        // node 99 is not a replica (slots are 1/3/5) — stale/buggy report.
+        // Must refuse (not falsely claim "isolated").
+        let r = fire(&m, 100, 42, 9, 7, vec![99]);
+        assert_eq!(r.code, CODE_PRECONDITION, "{}", r.message);
+        let s = m.store.inner.borrow();
+        assert_eq!(s.extents.get(&9).unwrap().avali, 0b111, "unchanged");
+    }
+
+    #[test]
+    fn cross_partition_log_stream_is_refused() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        // Partition 100 owns LOG_STREAM_ID; claim a DIFFERENT log_stream id the
+        // partition does not own → refused before any avali mutation.
+        let req = ReportCorruptReplicaReq {
+            partition_id: 100,
+            owner_epoch: 42,
+            log_stream_id: LOG_STREAM_ID + 1,
+            extent_id: 9,
+            eversion: 7,
+            corrupt_node_ids: vec![3],
+        };
+        let payload: Bytes = rkyv_encode(&req);
+        let resp = run(async { m.handle_report_corrupt_replica(payload).await.unwrap() });
+        let r = rkyv_decode::<ReportCorruptReplicaResp>(&resp).unwrap();
+        assert_eq!(r.code, CODE_PRECONDITION, "cross-partition stream → refused");
+    }
+
+    #[test]
+    fn idempotent_when_bit_already_cleared() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        // node 3 already isolated (bit 1 clear).
+        {
+            let mut s = m.store.inner.borrow_mut();
+            s.extents.get_mut(&9).unwrap().avali = 0b101;
+        }
+        let r = fire(&m, 100, 42, 9, 7, vec![3]);
+        assert_eq!(r.code, CODE_OK, "{}", r.message);
+        let s = m.store.inner.borrow();
+        let ex = s.extents.get(&9).unwrap();
+        assert_eq!(ex.avali, 0b101, "no-op, no further clear");
+        assert_eq!(ex.eversion, 7, "no eversion bump on a no-op report");
     }
 }
 // end of rpc_handlers.rs
