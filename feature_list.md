@@ -866,3 +866,22 @@ gaps in the lease protocol's correctness story.
   入口 3 个(manager + autumn-op + autumn-client),PS/EN/python/fuse/ioring 不动,
   热路径零开销。详见 `docs/admin_auth_design.md`(含 HBase 两层对照 + 连接面调研)。
 - **passes:** not_completed (design only, 用户 2026-06-14 决定记录留后做)
+
+### SELFHEAL-E2E · 自愈环端到端复现 + 读路径隔离漏洞修复(2026-06-14)
+- **scripts/selfheal_chaos.sh:** 3-EN/1-partition TCP 集群,写 12×1MiB 大值(→
+  log_stream VP),kill -9 PS(不优雅刷盘→未刷 tail 重放),**直接翻 slot[0] 副本
+  .dat 一个字节**(真 bit-rot;open tail 读 replica[0]-first → 确定命中)。
+  S1(正向):重启→A4 seal-and-roll→A3 跨副本→A5 隔离;断言 PS 开成功 + **全部
+  键 byte-exact(含被损值的键)** + extent 封 + slot[0] avali=0、其余=1。
+  S2(负向,毁数据):同 extent 另两副本也翻→无干净副本→open fail loud + 分区不可用。
+  node_id→dir 经 per-dir node_id sentinel 动态映射(已验证 slot[0]=node1/3 随机均通过)。
+- **读路径隔离漏洞(e2e 现场抓到,真数据正确性 BUG):** A1 只把 avali 过滤接进了
+  copy 路径 `read_replicated_with_failover`,但**两条 VP 值读快路径绕过**:
+  (1)`read_value_into_pooled`(PS 代理 ZC 读)、(2)`extent_read_descriptor`
+  (F259 客户端直读描述符)—— 都按 slot 顺序读 addrs[0],隔离后(avali=0)仍把
+  坏副本当首选,而 VP 读不校验 CRC → 自愈后 GET 被损值的键**仍返回坏字节**
+  (正是设计 P0#2/I2)。修复:两处都按 `eligible_replica_slots(ex)` 过滤(健康
+  extent eligible==全部、顺序不变 → 热路径零变化;仅隔离时跳坏 slot)。
+- **验收:** 修复前 e2e 现场复现(sh-key-6 5/5 返回坏 md5)→ 修复后 12/12 byte-exact;
+  stream 81 lib 单测绿;coco deep 评审 Rust 改动 0 issue。
+- **passes:** completed (2026-06-14)

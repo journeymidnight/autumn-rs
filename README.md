@@ -191,9 +191,15 @@ probe, then isolated in the same pass like a sealed extent. Still fails the open
 loud (data lives on a healthy replica → recover / retry) for: an all-replicas-bad
 extent, or an open tail that is **truncated** below the committed prefix (sealing
 there could drop acked data — a separate F227 edge). EC extents route shard repair
-through recovery, not this path. End-to-end fault injection (flip one byte of one
-EN `.dat`) is a deferred harness; the decode-selection core and the manager
-isolation RPC are unit-tested.
+through recovery, not this path. End-to-end fault injection lives in
+`scripts/selfheal_chaos.sh` (3-EN cluster, flip one byte of slot[0]'s extent
+`.dat`, restart → assert self-heal + byte-exact reads incl. the corrupted-value
+key + slot isolated; plus an all-replicas-corrupt fail-loud negative). That
+harness caught a real read-path bug on its first run: the avali isolation filter
+was wired only into the copy read path, so the two VP-value fast paths
+(`read_value_into_pooled` ZC proxy + `extent_read_descriptor` client-direct)
+still served the bit-rotted-but-isolated replica — now both filter
+`eligible_replica_slots`.
 
 ## CLI cheatsheet
 

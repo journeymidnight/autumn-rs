@@ -2989,7 +2989,14 @@ impl StreamClient {
             return Ok(None);
         }
         let addrs = self.replica_addrs_for_extent(&ex).await?;
-        for addr in &addrs {
+        // WAL self-heal A1: skip isolated (avali=0) slots on a sealed replicated
+        // extent — exactly like the copy path's `read_replicated_with_failover`.
+        // Without this, the ZC value fast path reads slot 0 first and a
+        // bit-rotted-but-isolated replica returns CODE_OK with corrupt bytes
+        // (no per-VP CRC on this path), so a GET after self-heal would still
+        // serve the bad bytes (the I2 invariant; e2e-caught 2026-06-14).
+        for &slot in &eligible_replica_slots(&ex) {
+            let addr = &addrs[slot];
             let req = ReadBytesReq {
                 extent_id,
                 eversion: ex.eversion,
@@ -3134,7 +3141,15 @@ impl StreamClient {
             ));
         }
         let addrs = self.replica_addrs_for_extent(&ex).await?;
-        Ok((ex.eversion, addrs))
+        // WAL self-heal A1: hand the client only ELIGIBLE replicas — an
+        // isolated (avali=0) bit-rotted slot must not be a client-direct read
+        // target either (same I2 invariant as the ZC + copy paths; the client
+        // reads these addrs in order with no per-VP CRC).
+        let filtered: Vec<String> = eligible_replica_slots(&ex)
+            .into_iter()
+            .map(|s| addrs[s].clone())
+            .collect();
+        Ok((ex.eversion, filtered))
     }
 
     /// Replicated-mode read with per-replica failover. Used both for the
