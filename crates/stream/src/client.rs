@@ -2815,6 +2815,81 @@ impl StreamClient {
         unreachable!("read_committed_bytes_from_extent: 2-attempt loop must terminate")
     }
 
+    /// WAL self-heal A2 (docs/wal_selfheal_design.md): read the committed
+    /// `[offset, offset+length)` range of a REPLICATED extent from ONE specific
+    /// replica (`replica_idx` into `replicates ++ parity`), with NO failover —
+    /// so the replay self-heal (A3) can read the SAME committed range from each
+    /// replica in turn and CRC-check it, isolating the bit-rotted one.
+    ///
+    /// The committed clamp is identical to `read_committed_bytes_from_extent`
+    /// (the open-time `check commit length` already aligned the committed
+    /// length across replicas, so all replicas agree on the range — only the
+    /// CONTENT can differ). Returns `(bytes, committed_end, node_id)`.
+    ///
+    /// EC-converted extents return `Err` (the replicated self-heal does not
+    /// apply — EC shard corruption is reconstructed via `ec_subrange_read`, a
+    /// separate path). `replica_idx` out of range → `Err`.
+    pub async fn read_committed_from_replica(
+        &self,
+        extent_id: u64,
+        replica_idx: usize,
+        offset: u32,
+        length: u32,
+    ) -> Result<(Vec<u8>, u32, u64)> {
+        let ex = self.fetch_extent_info(extent_id).await?;
+        if ex.ec_converted {
+            return Err(anyhow!(
+                "extent {extent_id} is EC-converted; per-replica read not applicable"
+            ));
+        }
+        let node_ids: Vec<u64> = ex
+            .replicates
+            .iter()
+            .chain(ex.parity.iter())
+            .copied()
+            .collect();
+        if replica_idx >= node_ids.len() {
+            return Err(anyhow!(
+                "replica_idx {replica_idx} out of range (extent {extent_id} has {} replicas)",
+                node_ids.len()
+            ));
+        }
+        let committed_end: u32 = if ex.sealed {
+            if offset as u64 > ex.sealed_length {
+                return Err(anyhow::Error::new(StaleVpOffset {
+                    extent_id,
+                    requested_offset: offset,
+                    requested_length: length,
+                    sealed_length: ex.sealed_length,
+                }));
+            }
+            ex.sealed_length.min(u32::MAX as u64) as u32
+        } else {
+            self.commit_length_for_extent(&ex).await?
+        };
+        let node_id = node_ids[replica_idx];
+        let want = length.min(committed_end.saturating_sub(offset));
+        if want == 0 {
+            return Ok((Vec::new(), committed_end, node_id));
+        }
+        let addrs = self.replica_addrs_for_extent(&ex).await?;
+        let addr = &addrs[replica_idx];
+        let (bytes, _end) = self
+            .read_shard_from_addr(addr, extent_id, ex.eversion, offset, want)
+            .await?;
+        Ok((bytes, committed_end, node_id))
+    }
+
+    /// WAL self-heal A2: replica count of a REPLICATED extent (= the valid
+    /// `replica_idx` range for `read_committed_from_replica`). EC extent → 0.
+    pub async fn replicated_replica_count(&self, extent_id: u64) -> Result<usize> {
+        let ex = self.fetch_extent_info(extent_id).await?;
+        if ex.ec_converted {
+            return Ok(0);
+        }
+        Ok(ex.replicates.len() + ex.parity.len())
+    }
+
     /// F216-E (UCX) / F219 (TCP) recv-side copy-elimination fast path: recv the
     /// value straight into a read_loop-owned `PooledBuf` (MSG_READ_BYTES_ZC +
     /// call_into_pooled). UCX → registered RDMA recv (zero-copy); TCP → compio
