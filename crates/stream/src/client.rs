@@ -1983,6 +1983,31 @@ impl StreamClient {
         .await
     }
 
+    /// WAL self-heal A4: seal-and-roll the current OPEN tail of `stream_id` via
+    /// the F227 manager probe (seal-over-reachable) and alloc a fresh tail.
+    ///
+    /// Used by recovery when replay finds the OPEN tail corrupt: an open extent
+    /// has no `avali` to clear, so it can't be isolated in place. Sealing freezes
+    /// it at the committed length (the acked prefix is on every committed member
+    /// under all-replica-ACK, so `min`-over-reachable ≥ acked — no acked data
+    /// lost; bytes beyond are un-acked speculation, correctly dropped) and turns
+    /// it into a SEALED extent. This method ONLY performs the manager-side
+    /// seal-and-roll; the caller decides what to do next. The recovery caller
+    /// (`self_heal_replay_chunk`) invalidates the extent cache, re-fetches the
+    /// now-sealed ExtentInfo, and runs the sealed cross-read on the same window in
+    /// the same pass — isolating the bad replica via A5 without depending on a
+    /// retried open.
+    ///
+    /// Does NOT touch the per-stream worker (recovery runs before it spawns) —
+    /// it is a pure manager RPC + cache update. Fenced by `self.owner_epoch`
+    /// (the recovering PS holds the partition owner lock). The new fresh tail is
+    /// picked up by `ensure_tail_initialised` when the worker later spawns (the
+    /// old tail now reports sealed → alloc fresh, the standard path).
+    pub async fn seal_and_roll_tail(&self, stream_id: u64) -> Result<()> {
+        self.alloc_new_extent(stream_id, None).await?;
+        Ok(())
+    }
+
     /// SealCommit handshake — ask the per-stream worker for its TRUE
     /// all-replica-acked commit on the current tail, captured at a QUIESCED
     /// point (the worker drains every in-flight append first). This is the

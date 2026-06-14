@@ -184,12 +184,16 @@ reports the bad replica(s) to the manager — which clears their `avali` bit and
 bumps the extent eversion (so every PS refetches and stops serving from them)
 **before** the partition serves. Fully automatic, no operator action. Watch the
 PS log for `WAL self-heal: ... recovered the window from a clean replica` and
-`isolated corrupt log_stream replica(s) via the manager`. Only **sealed
-replicated** extents self-heal; an OPEN-tail corruption or an all-replicas-bad
-extent still fails the open loud (the data lives on a healthy replica → recover
-/ retry). EC extents route shard repair through recovery, not this path. End-to-
-end fault injection (flip one byte of one EN `.dat`) is a deferred harness; the
-decode-selection core and the manager isolation RPC are unit-tested.
+`isolated corrupt log_stream replica(s) via the manager`. An **OPEN-tail**
+content corruption is sealed-and-rolled first (`WAL self-heal A4: sealed-and-rolled
+the corrupt OPEN log_stream tail`) — frozen at the committed length via the F227
+probe, then isolated in the same pass like a sealed extent. Still fails the open
+loud (data lives on a healthy replica → recover / retry) for: an all-replicas-bad
+extent, or an open tail that is **truncated** below the committed prefix (sealing
+there could drop acked data — a separate F227 edge). EC extents route shard repair
+through recovery, not this path. End-to-end fault injection (flip one byte of one
+EN `.dat`) is a deferred harness; the decode-selection core and the manager
+isolation RPC are unit-tested.
 
 ## CLI cheatsheet
 

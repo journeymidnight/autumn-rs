@@ -827,3 +827,27 @@ gaps in the lease protocol's correctness story.
   按 manager note 33 deferred(reproduce-first 再上 CAS);(3)cluster_version 不门控
   (全停全启 + wire-fingerprint 启动拒绝已防混部)。
 - **passes:** completed (2026-06-14)
+
+### SELFHEAL-A4 · open-tail 内容损坏 seal-and-roll(自愈环增量 A 收尾)(2026-06-14)
+- **背景:** A3/A5 只处理 sealed extent;open tail(当前写入 extent)损坏时
+  self_heal 返回 None → fail loud。open extent 没有 avali 可原地隔离,且 commit-min
+  随读集变 → 设计 I3 规定 open-tail = seal-and-roll。
+- **实现:** `StreamClient::seal_and_roll_tail(stream_id)` = `alloc_new_extent(None)`
+  (复用现有 F227 manager probe seal-over-reachable + roll 新 tail,**不改 seal 协议**,
+  纯 manager RPC + cache 更新,recovery 期 owner_epoch fence,worker 未起亦可调)。
+  `self_heal_replay_chunk` 改为循环:open + **内容损坏(!truncated)** → seal-and-roll
+  → invalidate cache → 重取(现 sealed)→ 同一 pass 跑 sealed cross-read 隔离坏副本
+  (corrupt_acc 累积 → 复用 A5 上报循环,不依赖重开);最多封一次(sealed_once 守卫)。
+- **coco 三轮(数据安全关键,F227 相邻区):** R1 2 条(P0 截断副本被纳入 seal min →
+  可封到 acked 以下丢数据 / P1 重开靠 rotated read 撞坏副本不可靠)→ 改为
+  **!truncated 才封**(截断 open tail 仍 fail loud,避免封到 acked 下)+ **一 pass
+  同步隔离**(不依赖重开);R3 P3 文档对齐。
+- **安全论证:** open-tail 实际触发是内容 bit-rot —— 坏副本文件长度完好,probe
+  commit_length 报满 → seal min 不变 = 正确长度,acked 前缀(all-replica-ACK 在每个
+  committed 成员)≤ min,零丢失。截断到 acked 以下属另一条 pre-existing F227 edge,
+  本次不碰(明确 fail loud)。
+- **验收:** 不引入新 wire 结构(复用 StreamAllocExtentReq);stream+ps 245 lib 单测绿;
+  workspace build 绿;coco R2/R3 P0-P2 clean。
+- **已知残留:** open-tail **截断**(非内容损坏)仍 fail loud —— "seal-over-HEALTHY
+  排除坏副本" 需改 seal-probe 排除机制(动 F227 协议,revert-prone),deferred 到真复现。
+- **passes:** completed (2026-06-14)

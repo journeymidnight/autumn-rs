@@ -1,9 +1,9 @@
 Date: 2026-06-14
 TaskStatus: completed
-Task scope: WAL replay 自愈环 增量 A 主体(A2/A3/A5)。replay 发现 log_stream
-  坏/截断副本时,自动换干净副本继续 + 上报 manager 隔离坏副本(清 avali +
-  bump eversion),不再 loud-but-stuck。先复现(单测)+ coco deep 两轮评审。
-  升级方向仍为全停全启 rkyv fail-loud(不做 rolling)。
+Task scope: WAL replay 自愈环 增量 A 全部完成(A2/A3/A5 + A4)。replay 发现
+  log_stream 坏/截断副本时,自动换干净副本继续 + 隔离坏副本;open-tail 内容损坏
+  先 seal-and-roll 再同 pass 隔离。增量 A 收尾(A6/增量 B 用户确认不需要)。
+  coco deep 多轮评审。升级方向仍为全停全启 rkyv fail-loud(不做 rolling)。
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
@@ -24,19 +24,22 @@ Task scope: WAL replay 自愈环 增量 A 主体(A2/A3/A5)。replay 发现 log_s
       修了 verify-at-apply / 短读检测 / 归属链 / avali 过滤 clean-source /
       EC 拒 / slot 守卫 / stale-layout 拒 / 日志计数;拒 #7(MIN=MAX 故意)、
       #1-R2 etcd-CAS(note 33 deferred)、#4-R2 cluster_version 门控(全停全启)。
-  Not implemented (recorded):
-    - SELFHEAL-A4: open-tail 坏副本 seal-and-roll(当前 open-tail 损坏 fail loud)。
-    - SELFHEAL-A6: EN 本地 corrupt_data quarantine(靠 A1 avali + eversion 淘汰)。
-    - SELFHEAL 增量 B: forced-repair 复活隔离副本(staging+CRC+原子 rename)。
+    - SELFHEAL-A4 (本会话补): open-tail 内容损坏 → seal_and_roll_tail(复用 F227
+      probe seal-over-reachable,不改 seal 协议)→ 同 pass 重取 sealed + cross-read
+      隔离。!truncated 才封(截断 open tail 仍 fail loud,避免封到 acked 下,coco
+      R1 P0);一 pass 同步隔离不依赖重开(coco R1 P1)。
+  Not implemented (用户确认不需要 / 登记):
+    - SELFHEAL-A6 / 增量 B: 用户 2026-06-14 确认 A4 之后不需要。
     - 残留:初始 serving read 无 node_id 归因(超时不可归因=I7);A5 etcd blind-put
-      非 CAS(note 33,reproduce-first 再上)。
+      非 CAS(note 33,reproduce-first 再上);open-tail 截断(非内容损坏)仍 fail loud
+      (seal-over-HEALTHY 排除机制动 F227,deferred 到真复现)。
     - 生产就绪审计剩余(见 project_production_readiness_audit):鉴权/TLS、备份/DR、
       EC/split 崩溃窗。
 
 Current summary:
-  自愈环增量 A 闭环:replay 坏/截断副本自动 failover + 隔离,zero 静默丢数据。
-  432 lib 单测绿,workspace build 绿,coco 两轮 P0/P1 全处置。
+  自愈环增量 A 全闭环(含 A4 open-tail):replay 坏/截断副本自动 failover + 隔离,
+  open-tail 内容损坏 seal-and-roll 后同 pass 隔离,zero 静默丢数据。432 lib 单测绿,
+  workspace build 绿,coco deep 多轮 P0/P1 全处置。A6/增量 B 用户确认不做。
 Next steps:
-  - A4 open-tail seal-and-roll + A6 EN quarantine + 增量 B forced-repair。
-  - 端到端 reproduce-first(3-node,翻盘 .dat 一字节 → open 自愈 + 隔离 + 零丢失)。
+  - (可选)端到端 reproduce-first(3-node,翻盘 .dat 一字节 → open 自愈 + 隔离 + 零丢失)。
   - 生产前 P0 能力(鉴权/备份)。

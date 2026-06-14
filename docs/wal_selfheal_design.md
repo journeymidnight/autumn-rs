@@ -48,11 +48,17 @@ WAL-FAILSTOP（5873b71）把 log_stream replay 遇损坏记录从静默丢数据
   纯选择核 `select_clean_replica_chunk`；只对 sealed replicated，跳 avali=0 slot。
 - **A5 ✅** manager `MSG_REPORT_CORRUPT_REPLICA`（owner+eversion+归属链 fencing,
   etcd-first + verify-at-apply）。
-- **A4 ⏳ deferred**（open-tail seal-and-roll）：当前 open-tail 损坏 → fail loud。
+- **A4 ✅** open-tail **内容损坏** → `seal_and_roll_tail`（F227 probe seal-over-
+  reachable 封 + roll 新 tail）→ 同一 pass 重取 sealed ExtentInfo → 跑 sealed
+  cross-read 隔离坏副本（不依赖重开）。**截断（short）的 open tail 不封**（probe
+  min 会含截断副本 → 可能封到 acked 以下 → 丢数据）→ fail loud。"封时排除坏副本
+  的 seal-over-HEALTHY" 需 seal-probe 排除机制 → deferred；实际 open-tail 触发是
+  内容 bit-rot（坏副本长度完好,probe min 安全）。
 - **A6 ⏳ deferred**（EN 本地 quarantine）：靠 A1 avali 过滤 + eversion 淘汰 cache。
 - **增量 B ⏳**（forced-repair 复活隔离副本）。
 - 残留：初始 serving read 不返回 node_id（bit-rot 重读仍坏→可归因；超时不可归因
-  = I7 不隔离不可达）；A5 etcd blind-put（note 33 deferred，reproduce-first 再 CAS）。
+  = I7 不隔离不可达）；A5 etcd blind-put（note 33 deferred，reproduce-first 再 CAS）;
+  open-tail 截断（非内容损坏）仍 fail loud（seal-over-HEALTHY 排除机制 deferred）。
 
 ## 增量交付
 ### 增量 A — 同步隔离（先做，拿 80% 价值：不再读坏数据 + 自动 failover）

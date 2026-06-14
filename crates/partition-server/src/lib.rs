@@ -6672,39 +6672,89 @@ fn enqueue_delete(
 /// - `Ok(Some((records, consumed, healed_buf)))`: a clean replica was found;
 ///   `corrupt_acc` now holds the bad node ids. `healed_buf` is that replica's
 ///   bytes for the window (the caller uses `healed_buf[consumed..]` as carry).
-/// - `Ok(None)`: NOT self-healable — the extent is OPEN (commit-min has no fixed
-///   length to align a cross-replica re-read; needs F227 seal-and-roll = A4,
-///   deferred), or EC (shard bytes ≠ value), or NO replica decodes clean (every
-///   copy corrupt = unrecoverable). The caller fails the open loud.
+/// - `Ok(None)`: NOT self-healable — EC (shard ≠ value), or every replica corrupt
+///   (unrecoverable), or an open tail we must not seal (a truncated tail, see A4).
+///   The caller fails the open loud.
+///
+/// A4 (open tail): an OPEN extent has no `avali` to isolate in place, so on
+/// CONTENT corruption (`truncated == false`) we seal-and-roll it via the F227
+/// probe (seal-over-reachable freezes it at the committed length — the corrupt
+/// replica still reports its full length so the probe `min` is unchanged; the
+/// acked prefix is on every committed member under all-replica-ACK, so `min` ≥
+/// acked), then re-fetch and run the SAME cross-read on the now-SEALED extent in
+/// one pass — isolating the bad replica synchronously (no retry-the-open
+/// dependence). A TRUNCATED open tail (`truncated == true`) is NOT sealed: the
+/// probe `min` would include the truncated replica and could seal BELOW the acked
+/// prefix (data loss); we fail loud instead so a healthy replica / retry recovers
+/// it. ("seal over HEALTHY excluding the corrupt one" would need seal-probe
+/// exclusion machinery — deferred; the realistic open-tail trigger is content
+/// bit-rot, where the corrupt replica's length is intact.)
 ///
 /// I7: a replica that returns a READ error (down / transient) is NOT marked
 /// corrupt — it may hold the only good copy, and reconciling it out on a mere
 /// unreachable signal could drop data.
+#[allow(clippy::too_many_arguments)]
 async fn self_heal_replay_chunk(
     part_sc: &StreamClient,
     eid: u64,
+    log_stream_id: u64,
     buf_base: u32,
     want: u32,
     is_final: bool,
+    truncated: bool,
     corrupt_acc: &mut HashSet<u64>,
 ) -> Result<Option<(Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)>, usize, Vec<u8>)>> {
-    let ex = match part_sc.get_extent_info(eid).await {
-        Ok(ex) => ex,
-        Err(e) => {
-            tracing::warn!(
-                extent_id = eid,
-                error = %e,
-                "WAL self-heal: could not fetch ExtentInfo; cannot cross-read replicas"
-            );
+    let mut sealed_once = false;
+    let ex = loop {
+        let ex = match part_sc.get_extent_info(eid).await {
+            Ok(ex) => ex,
+            Err(e) => {
+                tracing::warn!(
+                    extent_id = eid,
+                    error = %e,
+                    "WAL self-heal: could not fetch ExtentInfo; cannot cross-read replicas"
+                );
+                return Ok(None);
+            }
+        };
+        // EC → per-replica read is meaningless (shard ≠ value): fail loud.
+        if ex.ec_converted {
             return Ok(None);
         }
+        if ex.sealed {
+            break ex;
+        }
+        // OPEN tail. Only seal-and-roll on CONTENT corruption — never on a
+        // truncation (the probe min would include the short replica and could
+        // seal below acked). One seal max (after it, the extent is sealed and we
+        // fall through to the cross-read).
+        if truncated || sealed_once {
+            return Ok(None);
+        }
+        match part_sc.seal_and_roll_tail(log_stream_id).await {
+            Ok(()) => {
+                part_sc.invalidate_extent_cache(eid);
+                sealed_once = true;
+                tracing::warn!(
+                    extent_id = eid,
+                    log_stream_id,
+                    "WAL self-heal A4: sealed-and-rolled the corrupt OPEN log_stream tail; \
+                     re-reading it as sealed to isolate the bad replica"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    extent_id = eid,
+                    log_stream_id,
+                    error = %e,
+                    "WAL self-heal A4: seal-and-roll of the corrupt open tail FAILED; \
+                     failing the open loud"
+                );
+                return Ok(None);
+            }
+        }
     };
-    // Only a SEALED replicated extent has a fixed committed window to align the
-    // cross-replica re-read against. Open tail → A4 (deferred); EC → per-replica
-    // read is meaningless (shard ≠ value).
-    if !ex.sealed || ex.ec_converted {
-        return Ok(None);
-    }
     let n = ex.replicates.len() + ex.parity.len();
     // I2 (coco P1 #3): only ELIGIBLE slots are clean-source candidates. A slot
     // whose `avali` bit is already 0 has been isolated (by a prior A5 / an
@@ -7326,9 +7376,11 @@ async fn recover_partition(
                 match self_heal_replay_chunk(
                     part_sc,
                     eid,
+                    log_stream_id,
                     buf_base as u32,
                     want_full as u32,
                     is_final,
+                    short,
                     corrupt_set,
                 )
                 .await?
@@ -7347,9 +7399,10 @@ async fn recover_partition(
                         (recs, c)
                     }
                     None => {
-                        // Not self-healable (OPEN tail → A4 seal-and-roll, not yet
-                        // built; EC; or every replica corrupt = unrecoverable).
-                        // Fail the open loud, preserving the decode error if any.
+                        // Not self-healable: EC; every replica corrupt; or an open
+                        // tail we must not seal (truncated → would seal below
+                        // acked) / seal-and-roll failed. Fail the open loud,
+                        // preserving the decode error if any.
                         let reason = if short {
                             format!(
                                 "serving replica truncated the committed window (got {got} of \
@@ -7369,8 +7422,9 @@ async fn recover_partition(
                             })
                             .context(format!(
                                 "log_stream extent {eid} chunk @ offset {buf_base} is \
-                                 corrupt and not self-healable (open tail / EC / all \
-                                 replicas corrupt) — recover from a healthy log_stream copy"
+                                 corrupt and not self-healable (EC / all replicas corrupt / \
+                                 open-tail truncated or seal failed) — recover from a healthy \
+                                 log_stream copy"
                             )));
                     }
                 }
