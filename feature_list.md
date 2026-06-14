@@ -851,3 +851,18 @@ gaps in the lease protocol's correctness story.
 - **已知残留:** open-tail **截断**(非内容损坏)仍 fail loud —— "seal-over-HEALTHY
   排除坏副本" 需改 seal-probe 排除机制(动 F227 协议,revert-prone),deferred 到真复现。
 - **passes:** completed (2026-06-14)
+
+### ADMIN-AUTH · 管理操作鉴权(DESIGN ONLY,2026-06-14,未实现)
+- **背景:** 全代码库零鉴权/授权/TLS。可信内网威胁模型 = 挡误连别集群 / 流氓客户端
+  跑破坏性管理命令(非防 MITM/多租户)。
+- **决定 Option A:** 单一共享 admin secret(bearer capability),只 gate manager 的
+  10 个操作员专属变更 op(fence/remove/maintenance/clear-override/bump-version/
+  update-EC/force-EC/create-stream/upsert-partition/register-node —— 已核实 PS/EN
+  内部不发)。split/merge/punch/truncate/alloc 靠 owner_epoch 已挡;数据面 + 只读
+  管理留开。否决 Option B(HBase 式同 gate PS Maintenance split/merge/gc/compact)。
+- **实现路径(留待将来):** `--auth-token-file`(rs 不读 env,cluster.sh 生成分发);
+  `is_admin_msg(msg_type)` 共享判定;admin payload 前缀 32B token + manager
+  constant-time compare(零 wire-struct 改动);opt-in(无 token=放行,零回归)。
+  入口 3 个(manager + autumn-op + autumn-client),PS/EN/python/fuse/ioring 不动,
+  热路径零开销。详见 `docs/admin_auth_design.md`(含 HBase 两层对照 + 连接面调研)。
+- **passes:** not_completed (design only, 用户 2026-06-14 决定记录留后做)
