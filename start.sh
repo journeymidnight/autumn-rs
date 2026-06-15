@@ -52,10 +52,20 @@ log()  { printf '[start] %s\n' "$*" >&2; }
 die()  { printf '[start] error: %s\n' "$*" >&2; exit 1; }
 
 wait_port() {
-    local port="$1" name="$2" tries="${3:-30}"
+    # wait_port <port> <name> [host] [tries]
+    # host defaults to $BIND_HOST; pass an explicit host for services that
+    # bind elsewhere (etcd is hardcoded to 127.0.0.1, NOT $BIND_HOST).
+    local port="$1" name="$2"
+    local host="${3:-$BIND_HOST}"
+    local tries="${4:-30}"
+    # bash /dev/tcp does NOT accept bracketed IPv6 (`[fdbd::14]`) — strip the
+    # brackets so the bare address reaches getaddrinfo. Without this, any
+    # non-loopback BIND_HOST makes every probe falsely time out even though
+    # the service is up.
+    host="${host#[}"; host="${host%]}"
     local i  # CRITICAL: must be local, else clobbers the outer for-loop's $i
     for ((i=0; i<tries; i++)); do
-        if (exec 3<>"/dev/tcp/$BIND_HOST/$port") 2>/dev/null; then
+        if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then
             exec 3>&- 3<&-
             return 0
         fi
@@ -72,6 +82,37 @@ start_proc() {
     nohup setsid "$@" >"$log" 2>&1 &
     sleep 0.1
 }
+
+# ============================================================
+# UCX transport env  (only when TRANSPORT=ucx)
+# ============================================================
+# Exported here so the manager/EN/PS children (started via start_proc →
+# setsid/nohup) inherit it. UCX_* are read by the UCX C library directly,
+# not by autumn rust code — consistent with "config via flags not env in
+# rust": these configure a third-party lib, so the script is the right place.
+if [[ "$TRANSPORT" == "ucx" ]]; then
+    # POSITIVE list only — NEVER prefix an entry with `^` (a leading `^`
+    # negates the WHOLE list; a non-leading `^x` is silently ignored).
+    # Union: rc_mlx5/ud_mlx5 (cross-host RoCE) + posix/cma (same-host shm:
+    # posix = short msgs, cma = large rendezvous bulk) + tcp (fallback) + self.
+    # UCX scores per-connection and auto-picks shm for a same-host pair,
+    # rc_mlx5 for a cross-host pair — so ONE cluster serves both local & remote.
+    # Order is irrelevant (UCX_TLS is an allow-set, not a priority list).
+    # sysv is deliberately excluded (buggy on this stack).
+    export UCX_TLS="${UCX_TLS:-rc_mlx5,ud_mlx5,posix,cma,tcp,self}"
+    # This host has 10 RoCE devices → UCX auto-select HANGS cross-host; pin the
+    # one on your routable subnet (here mlx5_1 carries the ::14/::15 subnet).
+    # Verify per host:  scripts/check_roce.sh --listen-candidates
+    #   (or: ls /sys/class/net/<iface>/device/infiniband/)
+    # Harmless for loopback — shm TLs (posix/cma/self) ignore net devices.
+    export UCX_NET_DEVICES="${UCX_NET_DEVICES:-mlx5_1:1}"
+    # RDMA pins memory via ibv_reg_mr; default 8 MiB memlock faults on >=256K pages.
+    ulimit -l unlimited 2>/dev/null || true
+    log "ucx env: UCX_TLS=$UCX_TLS  UCX_NET_DEVICES=$UCX_NET_DEVICES  memlock=$(ulimit -l)"
+    # NOTE: to actually serve cross-host, launch with a ROUTABLE bind address,
+    # e.g.  BIND_HOST='[fdbd:dc62:3:302::14]' TRANSPORT=ucx ./start.sh
+    # (default BIND_HOST=127.0.0.1 is loopback-only — remote clients can't reach it).
+fi
 
 # ============================================================
 # Preflight
@@ -231,7 +272,10 @@ start_proc etcd etcd \
     --listen-peer-urls "http://127.0.0.1:2380" \
     --initial-advertise-peer-urls "http://127.0.0.1:2380" \
     --initial-cluster "default=http://127.0.0.1:2380"
-wait_port 2379 etcd
+# etcd binds 127.0.0.1 above (local-only; only the same-host manager talks to
+# it), so probe 127.0.0.1 — NOT $BIND_HOST, which may be a RoCE address etcd
+# isn't listening on.
+wait_port 2379 etcd 127.0.0.1
 
 # ============================================================
 # 2. manager
