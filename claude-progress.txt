@@ -52,6 +52,10 @@ Current summary:
   自愈环增量 A 全闭环(含 A4 open-tail):replay 坏/截断副本自动 failover + 隔离,
   open-tail 内容损坏 seal-and-roll 后同 pass 隔离,zero 静默丢数据。432 lib 单测绿,
   workspace build 绿,coco deep 多轮 P0/P1 全处置。A6/增量 B 用户确认不做。
+  SELFHEAL-E2E-CERT(2026-06-15,用户 /loop 选项):自愈环增量 A 端到端 reproduce-first
+  认证完成。无代码改动,纯跑 scripts/selfheal_chaos.sh:3/3 连跑确定性 PASS(S1 翻 slot[0]
+  一字节 → A4 seal-and-roll + A3 跨读 + A5 隔离,12/12 键 byte-exact 零丢失、extent 封、
+  仅坏 slot avali=0;S2 三副本全坏 → open fail-loud 分区不可用)。/data05 TCP 3-EN。
 Next steps:
-  - (可选)端到端 reproduce-first(3-node,翻盘 .dat 一字节 → open 自愈 + 隔离 + 零丢失)。
-  - 生产前 P0 能力(鉴权/备份)。
+  - 生产前 P0 能力:鉴权/TLS(docs/admin_auth_design.md 设计就绪,用户曾定调"以后做")、
+    备份/DR(完全未动,生产就绪审计里唯一全空的 P0)。

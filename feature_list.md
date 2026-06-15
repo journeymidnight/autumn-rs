@@ -886,6 +886,20 @@ gaps in the lease protocol's correctness story.
   stream 81 lib 单测绿;coco deep 评审 Rust 改动 0 issue。
 - **passes:** completed (2026-06-14)
 
+### SELFHEAL-E2E-CERT · 自愈环增量 A 端到端认证(reproduce-first,2026-06-15)
+- **目的:** 用户 /loop 选"自愈环端到端验证"。把增量 A(A1 读路径隔离 / A3 replay
+  跨副本 decode-check / A4 open-tail seal-and-roll / A5 manager 隔离上报)从"单测+单跑"
+  升级为活集群 reproduce-first 认证。**无代码改动**——纯运行 `scripts/selfheal_chaos.sh`。
+- **结果:** 3 次连跑 **3/3 PASS,确定性一致**(每次 sealed=12583431、slot[0]=corrupt-node
+  avali=false、slots1/2=true、12/12 键 byte-exact 含被损值键)。
+  - S1(正向自愈):翻 slot[0] .dat 一字节 → kill -9 PS → 重启 open 命中损坏 OPEN tail →
+    A4 seal-and-roll → A3 跨读干净副本 → A5 隔离坏副本(avali=0 + eversion bump);
+    PS 开成功 + 零丢失 + extent 封 + 仅坏 slot 隔离。
+  - S2(负向 fail-loud):另两副本同 extent 也翻 → 无干净副本 → open **响亮失败**、
+    分区不可用(WAL-FAILSTOP / not-self-healable)。
+- **环境:** /data05(非 /tmp overlayfs)、TCP、3-EN/1-partition、release 二进制。
+- **passes:** completed (2026-06-15)
+
 ### EC-COMMIT-ATOMIC (#5) · EC commit rename↔save_meta 崩溃窗 — intent marker(2026-06-15)
 - **崩溃窗(reproduce-first 确认):** `commit_shard_local` 先 `rename(.ec.dat→.dat)`+dir-fsync
   (durable),再改 eversion/sealed + `save_meta`。两步间崩溃(kill -9 即可,rename 已 fsync)
