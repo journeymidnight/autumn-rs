@@ -445,3 +445,38 @@ env UCX_TLS=tcp,self,rc_mlx5 \
     bash cluster.sh start 3 --3disk
 ```
 The bootstrap + PS-ready states pass; PS↔EN commit_length blocks.
+
+---
+
+## Re-bench at current HEAD (2026-06-15, commit 0439733)
+
+Same shape (`--partitions 8 --pipeline-depth 8 --threads 16`, --3disk r=3),
+cluster on ::14 (bound `[fdbd:dc62:3:302::14]`), client on ::15, RoCE
+`UCX_NET_DEVICES=mlx5_1:1` + `UCX_TLS=rc_mlx5,ud_mlx5,tcp,self`, memlock raised
+(`ulimit -l unlimited` as root). Re-run to validate this session's correctness
+work (self-heal A1-A5, EC-commit marker, #6 guards, lease) did not regress
+cross-host perf.
+
+| size | metric | TCP xhost | UCX xhost | UCX/TCP |
+|---|---|---|---|---|
+| 4K | write ops/s | 22,725 (p99 82 ms) | 16,040 (p99 11 ms) | 0.71× |
+| 4K | read ops/s | 914,549 (p99 0.27 ms) | 849,311 (p99 0.19 ms) | 0.93× |
+| 8M | write MB/s | 277 (p99 6.1 s) | **1199** (p99 1.6 s) | **4.3×** |
+| 8M | read MB/s | 5791 (p99 308 ms) | **9699** (p99 188 ms) | **1.7×** |
+
+**Key change vs the 2026-06-07 matrix (which showed UCX 55-56× at everything):**
+the old TCP cross-host numbers were anomalously low (4K read 15,575; 8M read 193
+MB/s). At current HEAD, cross-host TCP is HEALTHY (4K read 914K = 59× the old,
+8M read 5791 = 30× the old) — the ZC-default ([[project_ucx_zerocopy_default]])
++ fan_out batch foundation lifted the TCP path too, not just UCX. So the picture
+is now nuanced:
+- **UCX still decisively wins the LARGE-payload path** (8M write 4.3×, read 1.7×)
+  — RDMA zero-copy for bulk KV-page movement. This is the real, durable win.
+- **At 4K, fast TCP now edges UCX** (write 0.71×, read 0.93×) — UCX's per-op
+  EP/probe overhead loses to the now-fast kernel TCP path at tiny payloads
+  (consistent with the loopback "UCX-over-TCP floor" section above).
+- **No regression** on either transport at current HEAD.
+
+Takeaway: keep UCX for large-value (≥ ~64K-1M) and bulk transfer; TCP is fine —
+and now competitive — for small ops. Matches the F216-E "ZC iff size≥64K" rule
+([[project_ucx_zerocopy_default]]).

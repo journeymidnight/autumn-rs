@@ -82,9 +82,21 @@ Current summary:
     2.5GB/s ≈ 单块 Intel SSDPF2KX038T1 持续写顶。Python adapter 零开销(495≥native 427)。
     读不受铺盘影响(读单副本不放大)。生产形态(3disk,8part)loopback = 写 1851 / 读 6969 MB/s。
     写路径(group-commit + F178 coalescer + F227 all-replica-ACK)正确,无需改。memory 已记。
+  跨主机 perf 矩阵(2026-06-15,用户 provision ::15,用 remote-autumn skill ssh -p2222):
+    cluster 在 ::14(绑 [::14])--3disk 8part,client 在 ::15。两端都要 --features ucx
+    重建(旧二进制无 ucx feature)+ memlock root 可 raise unlimited + UCX_NET_DEVICES=mlx5_1:1
+    + UCX_TLS=rc_mlx5,ud_mlx5,tcp,self。结果(current HEAD 0439733,无回归):
+      4K: TCP w22.7K/r914K  UCX w16K/r849K   (4K 上 TCP 现在略胜 UCX,UCX per-op EP 开销)
+      8M: TCP w277/r5791 MB/s  UCX w1199/r9699 MB/s  (UCX 8M write 4.3× / read 1.7× = 大块真 win)
+    关键变化:跨主机 TCP 已恢复健康(8M read 5791 vs 2026-05-21 记的 601 collapse,~10×;
+    4K read 914K vs doc 15K)——"UCX 55× 碾 TCP"不再成立。原因未定(fabric PFC 调优 vs 本
+    session fan_out 改了 TCP flow 模式),已 flag 不过度归因。docs/perf_tcp_vs_ucx_xhost.md
+    + memory project_ucx_crosshost_wins 已记。
 Next steps:
   - 用户定调:鉴权/TLS + 备份/DR 均延后,主回性能/功能线。
-  - 性能线现状:read 健康(1.9GB/s)、write 健康(生产形态 1851MB/s,单机低=共享盘 artifact)。
-    单机已无明显可提升点 —— 真正 win 在跨主机(F260 + UCX/RDMA),需 ::15 peer。
-  - 候选:① 用户 provision ::15 → F260 跨主机验收 + 跨主机 perf 矩阵(UCX/RDMA 真正 win);
-    ② intra-host perf-check 全矩阵摸底(查本 session 正确性改动有无回归);③ 其它功能线。
+  - F260 chained-append 跨主机验收 = 待做。需跨主机 EN 拓扑(PS@::14 + 3 EN@::15,让 PS→EN
+    复制跨 NIC,F260 才能把 writer egress 3×→1×)。当前 all-on-::14 集群 PS→EN 是 loopback,
+    测不出 F260 win。要 split-host 部署:::15 建 autumn-extent-node(--features ucx)+ 手搭
+    跨主机集群 + EN 注册到 ::14 manager(RoCE 地址)。set_append_chain_min_bytes 开关在
+    autumn-ps --append-chain-min-bytes(默认 0=off)。
+  - 性能线现状:read/write 健康,无回归;UCX 大块跨主机 win 已证(8M write 4.3×)。
