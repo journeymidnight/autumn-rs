@@ -970,6 +970,24 @@ async fn range_scan_sst_merge(
     Ok(out)
 }
 
+/// #6: per-attempt timeout for `multi_modify_split` in the split path. SHORT
+/// (vs the StreamClient default) so the freeze critical section stays under
+/// FREEZE_TTL — a split that COMMITS after the freeze lapsed seals the
+/// log_stream at a stale commit_length and loses the writes that resumed
+/// post-unfreeze.
+const SPLIT_CALL_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// #6: stop launching split attempts once the freeze has been held this long.
+/// A call launched at the deadline still completes/commits within
+/// `deadline + SPLIT_CALL_TIMEOUT` < FREEZE_TTL (2 s margin), so any in-flight
+/// manager commit lands while the partition is STILL frozen — never after the
+/// freeze could have lapsed. Pure for unit-testing the budget invariant.
+fn split_freeze_deadline(freeze_ttl: Duration, call_timeout: Duration) -> Duration {
+    freeze_ttl
+        .saturating_sub(call_timeout)
+        .saturating_sub(Duration::from_secs(2))
+}
+
 pub(crate) async fn handle_split_part(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
@@ -1321,16 +1339,45 @@ pub(crate) async fn handle_split_part(
         }
     }
 
-    // Call multi_modify_split on manager via StreamClient.
+    // Call multi_modify_split on the manager. #6: the freeze only guarantees a
+    // STABLE commit_length while it is HELD. If `check_freeze_ttls` auto-
+    // unfreezes (this handler exceeded FREEZE_TTL) and a split then commits, it
+    // seals the log_stream at the now-stale `log_end` while writes have resumed
+    // past it → those writes land above sealed_length and are LOST on recovery.
+    // Pre-#6 this looped `for _ in 0..8` with a 30 s per-call timeout (up to ~4
+    // min), trivially blowing past the 30 s TTL. Now: SHORT per-call timeout and
+    // STOP launching once less than one call's budget remains before the TTL, so
+    // any in-flight commit still lands while frozen. Out of budget → ABORT
+    // cleanly (unfreeze + Err); the client retries the whole split when the
+    // cluster is healthier. We NEVER let a split SUCCEED after the freeze could
+    // have lapsed.
+    let freeze_at = match part.borrow().frozen_for_split.get() {
+        Some(t) => t,
+        None => {
+            // check_freeze_ttls already fired (or someone cleared it) before we
+            // reached the commit phase — abort; the captured commit_length is no
+            // longer protected.
+            return Err((
+                StatusCode::FailedPrecondition,
+                "split: freeze lapsed before commit phase; retry".to_string(),
+            ));
+        }
+    };
+    let split_deadline = split_freeze_deadline(crate::FREEZE_TTL, SPLIT_CALL_TIMEOUT);
     let mut split_ok = false;
-    let mut split_err = String::new();
+    let mut split_err =
+        "split: ran out of freeze budget before multi_modify_split succeeded".to_string();
     let mut backoff = Duration::from_millis(100);
-    for _ in 0..8 {
+    loop {
+        if freeze_at.elapsed() >= split_deadline {
+            break; // out of freeze budget → abort below (no stale-seal commit)
+        }
         match part_sc
             .multi_modify_split(
                 mid.clone(),
                 req.part_id,
                 [log_end as u64, row_end as u64, meta_end as u64],
+                SPLIT_CALL_TIMEOUT,
             )
             .await
         {
@@ -1353,6 +1400,37 @@ pub(crate) async fn handle_split_part(
         part.borrow().frozen_for_split.set(None);
         return Err((StatusCode::FailedPrecondition, split_err));
     }
+
+    // #6 belt-and-braces behind the deadline-bound prevention: re-verify the
+    // freeze HELD continuously through the commit. If `check_freeze_ttls`
+    // cleared it anyway, the captured commit_length may be stale + writes
+    // resumed → do NOT apply the split locally; surface loudly. region_sync
+    // reconciles the manager's committed split; the client retries.
+    if part.borrow().frozen_for_split.get().is_none() {
+        return Err((
+            StatusCode::FailedPrecondition,
+            "split: freeze TTL lapsed during multi_modify_split — possible stale seal; \
+             aborting local apply, retry"
+                .to_string(),
+        ));
+    }
+    // KNOWN RESIDUAL (coco P1, accepted — NARROWED not closed): a CLIENT RPC
+    // timeout does not cancel a SERVER-side commit. If a single multi_modify_
+    // split request reaches the manager, the manager hangs > SPLIT_CALL_TIMEOUT
+    // (PS records a timeout + may exhaust the budget + unfreeze), and the
+    // manager's etcd txn THEN lands, the split commits with the freeze-time
+    // (now stale) sealed_lengths after writes have resumed → post-unfreeze
+    // writes above sealed_length are lost. The deadline-bound above shrinks this
+    // from the pre-#6 "minutes of 30s×8 retries" to "one in-flight call's
+    // timeout past the deadline", but cannot eliminate it from the client side
+    // (distributed-commit uncertainty). The real fix is MANAGER-side: either
+    // re-probe commit_length inside handle_multi_modify_split and seal at the
+    // current all-replica value (post-unfreeze writes then either land below the
+    // seal = kept, or above = rejected by the now-sealed tail and re-routed — no
+    // loss; F227 seal-over-reachable already does the probe), OR carry a freeze
+    // token/deadline the manager validates before committing. Deferred until the
+    // narrow manager-tail-latency-mid-split race is actually reproduced
+    // (revert-prone F227/split path).
 
     // The manager sealed all 3 stream tails as part of the split. The
     // P-log stream workers still cache the old (now-sealed) tails and
@@ -1621,6 +1699,39 @@ pub(crate) async fn handle_pull_vp_refs(
 // ---------------------------------------------------------------------------
 // F204 — `map_storage_error` translation tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod split_freeze_budget_tests {
+    use super::{split_freeze_deadline, SPLIT_CALL_TIMEOUT};
+    use std::time::Duration;
+
+    /// #6 invariant: a split attempt launched at the deadline must finish
+    /// (commit on the manager) BEFORE FREEZE_TTL fires, so any in-flight commit
+    /// lands while the partition is still frozen. If this fails, a stale-seal
+    /// write-loss window has reopened (someone shrank FREEZE_TTL or grew the
+    /// per-call timeout past the budget).
+    #[test]
+    fn deadline_leaves_room_for_one_call_before_ttl() {
+        let ttl = crate::FREEZE_TTL;
+        let deadline = split_freeze_deadline(ttl, SPLIT_CALL_TIMEOUT);
+        assert!(
+            deadline + SPLIT_CALL_TIMEOUT < ttl,
+            "a call launched at the deadline ({deadline:?}) + its timeout \
+             ({SPLIT_CALL_TIMEOUT:?}) must complete before FREEZE_TTL ({ttl:?})"
+        );
+        assert!(deadline > Duration::ZERO, "deadline must leave time to attempt at all");
+    }
+
+    /// Degenerate config (call timeout >= TTL) collapses the deadline to zero —
+    /// the loop never attempts (aborts immediately), never commits-after-lapse.
+    #[test]
+    fn over_budget_config_yields_zero_deadline() {
+        assert_eq!(
+            split_freeze_deadline(Duration::from_secs(5), Duration::from_secs(8)),
+            Duration::ZERO
+        );
+    }
+}
 
 #[cfg(test)]
 mod f204_map_storage_error_tests {

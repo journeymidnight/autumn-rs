@@ -923,3 +923,25 @@ gaps in the lease protocol's correctness story.
   force_ec_convert 见 advisory 拒绝 + OP 确认清除 / 专用 fence-bump RPC,**绝不用 commit_length**)。
 - **验收:** manager lib 162 / F211 lifecycle 9+8 / ec3 单测全绿;coco P1 评估后 deferred(理由记档)。
 - **passes:** completed (2026-06-15) — 删除死代码 + 残留诚实化;下一步 #6 split FREEZE_TTL。
+
+### SPLIT-FREEZE-BUDGET (#6) · 把 split 临界区限制在 FREEZE_TTL 内(2026-06-15)
+- **窗口:** split 冻结写后抓 commit_length 再调 multi_modify_split(原 `for 0..8` × 每调 30s
+  超时 → 可达 ~4 分钟 >> FREEZE_TTL=30s)。若临界区超过 TTL,`check_freeze_ttls` 自动解冻
+  → 写恢复越过抓到的 commit_length → split 用 stale length 封 log_stream → 这些写落在
+  sealed_length 之上 → 恢复时丢失。F255 只 bound 了 row-invalidate barrier(15s),
+  multi_modify_split 循环没 bound。
+- **修复(收窄,非完全闭合):** multi_modify_split 加 per-call timeout 参数;split 路径用短
+  超时(SPLIT_CALL_TIMEOUT=8s)+ deadline-bounded 循环(`split_freeze_deadline = FREEZE_TTL
+  - call_timeout - 2s`):freeze 持有超过 deadline 就**干净 abort**(解冻 + Err,客户端重试),
+  绝不让 split 在 freeze 可能已失效后**成功**。成功后再校验 frozen_for_split 仍持有(belt-and-
+  braces)。把窗口从"几分钟重试"缩到"一个在途调用的 8s"。
+- **已知残留(coco P1,登记,deferred):** 客户端 RPC 超时**不能**取消 manager 侧已提交的事务
+  —— 单个 multi_modify_split 到了 manager、manager 卡 >8s(PS 记超时+解冻)、随后 etcd txn
+  才落地,仍会用 stale sealed_length 提交。**这是分布式提交不确定性,客户端侧无法闭合**。真正
+  的修复在 manager 侧:handle_multi_modify_split 内**重新 probe commit_length 按当前 all-replica
+  值封**(解冻后的写要么落在封点下=保留、要么之上=被已封 tail 拒绝重路由=不丢;F227 已有 probe),
+  或带 freeze token/deadline 让 manager 提交前校验。**non-reproduced + revert-prone F227/split 区,
+  按 reproduce-first deferred**。
+- **验收:** budget 不变量单测(deadline+call_timeout < FREEZE_TTL);split/vp-after-split 集成测试绿;
+  workspace build 绿。
+- **passes:** completed (2026-06-15) — 收窄 + 残留登记;manager 侧完全闭合 deferred(待复现)。

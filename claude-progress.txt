@@ -1,6 +1,6 @@
 Date: 2026-06-15
 TaskStatus: completed
-Task scope: 生产就绪审计 EC/split 崩溃窗,顺序 #5→#3→#6。**#5+#3 已完成**:
+Task scope: 生产就绪审计 EC/split 崩溃窗,顺序 #5→#3→#6。**#5+#3+#6 已完成**:
   EC-COMMIT-ATOMIC —— commit_shard_local 的 rename(.ec.dat→.dat)↔save_meta
   崩溃窗,intent marker(rename 前 durable 写,load_extents 三态重放,corrupt-meta
   绝不 replay,marker 为权威)。reproduce-first(单 EN 集成测试)+ coco 4 轮。

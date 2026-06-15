@@ -3957,6 +3957,7 @@ impl StreamClient {
         mid_key: Vec<u8>,
         part_id: u64,
         sealed_lengths: [u64; 3],
+        timeout: Duration,
     ) -> Result<()> {
         let req = manager_rpc::rkyv_encode(&MultiModifySplitReq {
             part_id,
@@ -3967,12 +3968,15 @@ impl StreamClient {
             row_stream_sealed_length: sealed_lengths[1] as u32,
             meta_stream_sealed_length: sealed_lengths[2] as u32,
         });
-        // 30 s — manager runs the split's atomic etcd txn (alloc 4
-        // ids + duplicate 3 streams + create new partition + update
-        // regions + sidecar last_op_at). Generous bound; the PS
-        // caller already has its own retry loop on top.
+        // Per-call timeout is caller-chosen (#6): the PS split path bounds it
+        // SHORT so the whole freeze critical section stays under FREEZE_TTL —
+        // a split that committed AFTER the freeze lapsed would seal the
+        // log_stream at a stale commit_length and lose the writes that resumed
+        // post-unfreeze. The manager runs the split's atomic etcd txn (alloc 4
+        // ids + duplicate 3 streams + create partition + update regions +
+        // last_op_at sidecar).
         let resp_data = self
-            .manager_call(MSG_MULTI_MODIFY_SPLIT, req, Duration::from_secs(30))
+            .manager_call(MSG_MULTI_MODIFY_SPLIT, req, timeout)
             .await?;
         let resp: CodeResp = manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
         self.note_manager_code(resp.code);
