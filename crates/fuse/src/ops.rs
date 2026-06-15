@@ -422,6 +422,12 @@ fn err_to_errno(e: &anyhow::Error) -> i32 {
         // storage outage.
         libc::EBUSY
     } else {
+        // Catch-all EIO. Log the unmapped error at WARN so operators can see
+        // what actually failed — pre-this the app just got a bare EIO with no
+        // cause (a real I/O failure, a fence rejection, an ENOSPC, a UCX/routing
+        // error all looked identical). Only fires on the unexpected fallthrough,
+        // not on the mapped ENOENT/EEXIST/... cases, so it stays low-noise.
+        tracing::warn!("fuse op → EIO (unmapped error): {msg}");
         libc::EIO
     }
 }
