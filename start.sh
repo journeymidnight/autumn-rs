@@ -387,9 +387,10 @@ cat <<EOF
   etcd     : 127.0.0.1:2379  (data: $WORK/etcd)
   logs     : $LOG_DIR
 
-Use:
-  AC="$BIN/autumn-client --manager $MANAGER_ADDR"
-  AO="$BIN/autumn-op --manager $MANAGER_ADDR"
+Use:  (--transport MUST match the cluster; clients default to tcp and a tcp
+       client cannot reach a ucx manager)
+  AC="$BIN/autumn-client --manager $MANAGER_ADDR --transport $TRANSPORT"
+  AO="$BIN/autumn-op --manager $MANAGER_ADDR --transport $TRANSPORT"
   \$AO info
   echo hello | \$AC put mykey /dev/stdin
   \$AC get mykey
