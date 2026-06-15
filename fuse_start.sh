@@ -46,6 +46,16 @@ if [[ ! -x "$BIN/autumn-fuse" ]]; then
     fi
     exit 1
 fi
+# Refuse if a healthy fuse is already mounted here; clear a STALE one (a
+# previously-killed daemon leaves "Transport endpoint is not connected", and
+# the new mount fails on it — `ls` on the dir errors when it's stale).
+if mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
+    echo "fuse_start: $MOUNTPOINT is already mounted — unmount first (umount -l $MOUNTPOINT)" >&2
+    exit 1
+elif ! ls "$MOUNTPOINT" >/dev/null 2>&1 && [[ -e "$MOUNTPOINT" ]]; then
+    echo "fuse_start: clearing stale mount at $MOUNTPOINT"
+    umount -l "$MOUNTPOINT" 2>/dev/null || fusermount3 -u "$MOUNTPOINT" 2>/dev/null || true
+fi
 mkdir -p "$MOUNTPOINT" "$LOG_DIR"
 
 echo "fuse_start: mounting $MOUNTPOINT (manager=$MANAGER transport=$TRANSPORT) → $LOG_DIR/fuse.log"
@@ -54,4 +64,23 @@ nohup setsid "$BIN/autumn-fuse" \
      --mountpoint "$MOUNTPOINT" \
      --transport "$TRANSPORT" \
      > "$LOG_DIR/fuse.log" 2>&1 &
-echo "fuse_start: started (pid $!).  Unmount: fusermount -u $MOUNTPOINT  (or pkill -f autumn-fuse)"
+PID=$!
+
+# Verify the daemon ACTUALLY mounted. A manager-unreachable / transport-mismatch
+# (e.g. tcp client vs ucx cluster) / stale-mountpoint failure makes autumn-fuse
+# exit within ~1 s; without this check the script would falsely report success.
+for _ in $(seq 1 20); do
+    if ! kill -0 "$PID" 2>/dev/null; then
+        echo "fuse_start: ERROR — autumn-fuse exited during mount (check transport / manager addr). Last log:" >&2
+        tail -15 "$LOG_DIR/fuse.log" >&2
+        exit 1
+    fi
+    if mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
+        echo "fuse_start: ✓ mounted (pid $PID).  Unmount: umount -l $MOUNTPOINT  (or pkill -f autumn-fuse)"
+        exit 0
+    fi
+    sleep 0.5
+done
+echo "fuse_start: ERROR — $MOUNTPOINT not mounted within 10 s (daemon pid $PID alive but no mount). Last log:" >&2
+tail -15 "$LOG_DIR/fuse.log" >&2
+exit 1
