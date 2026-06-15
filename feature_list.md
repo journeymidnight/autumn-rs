@@ -945,3 +945,20 @@ gaps in the lease protocol's correctness story.
 - **验收:** budget 不变量单测(deadline+call_timeout < FREEZE_TTL);split/vp-after-split 集成测试绿;
   workspace build 绿。
 - **passes:** completed (2026-06-15) — 收窄 + 残留登记;manager 侧完全闭合 deferred(待复现)。
+
+### SPLIT-CASCADE-GUARD (#6 后续, reproduce-first) · split 重试级联 + 静默丢写复现(2026-06-15)
+- **复现(临时在 handle_multi_modify_split 注入 40s 延迟):** 原以为 #6 是"freeze 解冻后
+  stale-seal 静默丢写"。实际复现出**更清楚的真 bug**:PS 对慢 manager 重试 multi_modify_split
+  时,**每个重试各自提交一个 split → 1→6 分区级联**(TEMP 触发 5 次)。而且我的 #6 fix(更快的
+  8s 重试)**放大**了级联。
+- **修复(manager 侧 split-inflight guard):** `AutumnManager.split_inflight: HashSet<part_id>`
+  (内存,单线程,RAII `SplitInflightGuard` 全出口清理);`handle_multi_modify_split` 入口对同
+  partition 并发 split 拒(CODE_PRECONDITION)。复现验证:级联从 1→6 收敛到 **1→2**,TEMP 触发
+  **1 次**。不持久(级联在单 manager 慢窗内;跨 failover 重复是更窄残留)。
+- **静默丢写没复现:** 级联修掉后,解冻后的写**一致地被响亮拒绝**(owner_epoch/seal fence,
+  NEWOK=0,两轮都是),从不"ack 了再静默丢"。所以 manager 侧 commit_length re-probe(理论上闭合
+  client-timeout-vs-server-commit 残留的完整修复)**复现不支持 → deferred**。freeze-held 复检留作
+  belt-and-braces。
+- **验收:** split-inflight guard 单测(同 part 并发 split 被拒);manager 163 / ps 166 / stream 86
+  lib 全绿;split 集成测试绿;coco deep 0 issue。
+- **passes:** completed (2026-06-15) — 级联(真 bug)已修;静默丢写复现不出来 → re-probe deferred。

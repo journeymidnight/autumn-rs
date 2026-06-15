@@ -1414,23 +1414,19 @@ pub(crate) async fn handle_split_part(
                 .to_string(),
         ));
     }
-    // KNOWN RESIDUAL (coco P1, accepted — NARROWED not closed): a CLIENT RPC
-    // timeout does not cancel a SERVER-side commit. If a single multi_modify_
-    // split request reaches the manager, the manager hangs > SPLIT_CALL_TIMEOUT
-    // (PS records a timeout + may exhaust the budget + unfreeze), and the
-    // manager's etcd txn THEN lands, the split commits with the freeze-time
-    // (now stale) sealed_lengths after writes have resumed → post-unfreeze
-    // writes above sealed_length are lost. The deadline-bound above shrinks this
-    // from the pre-#6 "minutes of 30s×8 retries" to "one in-flight call's
-    // timeout past the deadline", but cannot eliminate it from the client side
-    // (distributed-commit uncertainty). The real fix is MANAGER-side: either
-    // re-probe commit_length inside handle_multi_modify_split and seal at the
-    // current all-replica value (post-unfreeze writes then either land below the
-    // seal = kept, or above = rejected by the now-sealed tail and re-routed — no
-    // loss; F227 seal-over-reachable already does the probe), OR carry a freeze
-    // token/deadline the manager validates before committing. Deferred until the
-    // narrow manager-tail-latency-mid-split race is actually reproduced
-    // (revert-prone F227/split path).
+    // #6 reproduction (scripts split_repro6, 2026-06-15 — a TEMP 40s delay in
+    // handle_multi_modify_split): the deadline-bound above shrinks the freeze-
+    // overrun window, but the thing that ACTUALLY bit was a different, clearer
+    // bug — a PS retry storm against a slow manager committed a SEPARATE split
+    // per retry (a 1→6 partition CASCADE). That is now fixed MANAGER-side by the
+    // per-partition split-inflight guard (concurrent split for the same
+    // partition → CODE_PRECONDITION). With the cascade gone, the original
+    // stale-seal SILENT write-loss did NOT reproduce: post-unfreeze writes were
+    // consistently REJECTED loudly (owner_epoch / seal fencing), never
+    // acked-then-orphaned. So the manager-side commit_length re-probe (the
+    // theoretical full close for the client-timeout-vs-server-commit residual)
+    // is DEFERRED — not justified by reproduction. The freeze-held re-check
+    // above stays as the belt-and-braces detector.
 
     // The manager sealed all 3 stream tails as part of the split. The
     // P-log stream workers still cache the old (now-sealed) tails and

@@ -16,6 +16,18 @@ use std::rc::Rc;
 
 use crate::{AutumnManager, ConnPool, PendingDelete};
 
+/// #6: RAII removal of a partition from `AutumnManager.split_inflight` on every
+/// exit path of `handle_multi_modify_split` (success + all early-return errors).
+struct SplitInflightGuard {
+    set: Rc<std::cell::RefCell<HashSet<u64>>>,
+    part_id: u64,
+}
+impl Drop for SplitInflightGuard {
+    fn drop(&mut self) {
+        self.set.borrow_mut().remove(&self.part_id);
+    }
+}
+
 impl AutumnManager {
     // ── F210-C4: pull-sync vp_refs from PS ──────────────────────────────
     //
@@ -2411,6 +2423,31 @@ impl AutumnManager {
 
         let req: MultiModifySplitReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // #6: serialize splits per partition. A PS that retries
+        // multi_modify_split against a SLOW manager (each call timing out but
+        // the manager still committing later) used to commit a SEPARATE split
+        // per retry — a reproduced 1→6 partition cascade (scripts/split_repro6).
+        // Refuse a concurrent request for the same partition; the RAII guard
+        // clears it on every exit path. Only ONE split per partition can be
+        // in-flight, so retries can't multiply into extra splits.
+        let _split_guard = {
+            let mut inflight = self.split_inflight.borrow_mut();
+            if inflight.contains(&req.part_id) {
+                return Ok(rkyv_encode(&CodeResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "split already in progress for partition {}; retry later",
+                        req.part_id
+                    ),
+                }));
+            }
+            inflight.insert(req.part_id);
+            SplitInflightGuard {
+                set: self.split_inflight.clone(),
+                part_id: req.part_id,
+            }
+        };
 
         // F210-C4: pull-sync vp_refs from the source partition's PS
         // BEFORE the atomic etcd txn below. Pre-F210-C4 the txn used
@@ -5695,6 +5732,52 @@ mod selfheal_a5_tests {
         let ex = s.extents.get(&9).unwrap();
         assert_eq!(ex.avali, 0b101, "no-op, no further clear");
         assert_eq!(ex.eversion, 7, "no eversion bump on a no-op report");
+    }
+}
+
+#[cfg(test)]
+mod split_inflight_guard_tests {
+    //! #6: a concurrent split request for a partition already being split is
+    //! refused — so a PS retry storm against a slow manager can't commit a
+    //! separate split per retry (the reproduced 1→6 cascade).
+    use crate::AutumnManager;
+    use autumn_rpc::manager_rpc::*;
+    use bytes::Bytes;
+
+    fn run<F: std::future::Future<Output = T>, T>(f: F) -> T {
+        compio::runtime::Runtime::new().unwrap().block_on(f)
+    }
+
+    #[test]
+    fn concurrent_split_for_same_partition_is_refused() {
+        let m = AutumnManager::new(); // memory-mode = always leader
+        // Simulate a split already in flight for partition 99 (the RAII guard a
+        // first, slow handler invocation would hold).
+        m.split_inflight.borrow_mut().insert(99);
+
+        let req = MultiModifySplitReq {
+            part_id: 99,
+            owner_key: "partition/99".to_string(),
+            owner_epoch: 1,
+            mid_key: vec![0x80],
+            log_stream_sealed_length: 1,
+            row_stream_sealed_length: 1,
+            meta_stream_sealed_length: 1,
+        };
+        let payload: Bytes = rkyv_encode(&req);
+        let resp = run(async { m.handle_multi_modify_split(payload).await.unwrap() });
+        let r: CodeResp = rkyv_decode(&resp).expect("decode");
+        assert_eq!(
+            r.code, CODE_PRECONDITION,
+            "a concurrent split for the same partition must be refused"
+        );
+        assert!(
+            r.message.contains("already in progress"),
+            "actionable message: {}",
+            r.message
+        );
+        // The guard set is untouched by the refused call (still just our entry).
+        assert!(m.split_inflight.borrow().contains(&99));
     }
 }
 // end of rpc_handlers.rs

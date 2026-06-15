@@ -4,7 +4,7 @@ Task scope: 生产就绪审计 EC/split 崩溃窗,顺序 #5→#3→#6。**#5+#3+
   EC-COMMIT-ATOMIC —— commit_shard_local 的 rename(.ec.dat→.dat)↔save_meta
   崩溃窗,intent marker(rename 前 durable 写,load_extents 三态重放,corrupt-meta
   绝不 replay,marker 为权威)。reproduce-first(单 EN 集成测试)+ coco 4 轮。
-  下一步 #3(EC abandon fence-handover 空操作)、#6(split FREEZE_TTL)。
+  #6 后续:split 级联(reproduce-first 抓到)已修 manager 侧 inflight guard。原 #3(EC abandon fence-handover 空操作)、#6(split FREEZE_TTL)。
   之前会话:WAL 自愈环增量 A 全完成 + selfheal_chaos.sh e2e(抓到读路径隔离漏洞)。
   升级方向仍为全停全启 rkyv fail-loud(不做 rolling)。
 

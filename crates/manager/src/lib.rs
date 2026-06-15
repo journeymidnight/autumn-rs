@@ -566,6 +566,16 @@ pub struct AutumnManager {
     /// and `~/.claude/plans/stream-merge-split-ps-sorted-dijkstra.md` for
     /// the migration plan.
     pub(crate) inflight: Rc<RefCell<HashMap<u64, crate::extent_inflight::MgrExtentInflightRecord>>>,
+    /// #6: per-partition split-in-flight guard (in-memory; single-threaded
+    /// manager). `handle_multi_modify_split` inserts `part_id` before its
+    /// (possibly slow) etcd txn and removes it on completion via a RAII guard.
+    /// A concurrent split request for the SAME partition is refused with
+    /// `CODE_PRECONDITION` — so a PS retry storm against a slow manager can no
+    /// longer commit multiple separate splits (the reproduced 1→6 cascade).
+    /// Not persisted: the cascade is within one manager's slow window; a cross-
+    /// failover duplicate is a far narrower residual (the new leader hasn't
+    /// processed the in-flight request).
+    pub(crate) split_inflight: Rc<RefCell<std::collections::HashSet<u64>>>,
     /// F207-C: in-memory live retry state for Delete ops. The ledger
     /// entry's `PersistedPendingDelete` payload is a snapshot of the
     /// original addrs (captured at enqueue time); the live "which
@@ -759,6 +769,7 @@ impl AutumnManager {
             etcd: None,
             instance_id: Rc::new(uuid::Uuid::new_v4().to_string()),
             inflight: Rc::new(RefCell::new(HashMap::new())),
+            split_inflight: Rc::new(RefCell::new(std::collections::HashSet::new())),
             delete_progress: Rc::new(RefCell::new(HashMap::new())),
             failed_deletes: Rc::new(RefCell::new(HashMap::new())),
             runtime_started: Rc::new(Cell::new(false)),
