@@ -5,6 +5,15 @@ Task scope: 生产就绪审计 EC/split 崩溃窗,顺序 #5→#3→#6。**#5+#3+
   崩溃窗,intent marker(rename 前 durable 写,load_extents 三态重放,corrupt-meta
   绝不 replay,marker 为权威)。reproduce-first(单 EN 集成测试)+ coco 4 轮。
   #6 后续:split 级联(reproduce-first 抓到)已修 manager 侧 inflight guard。原 #3(EC abandon fence-handover 空操作)、#6(split FREEZE_TTL)。
+  #6 /loop 定论(2026-06-15,证伪):stale-seal 静默丢写 = 结构性不可达(非"未复现"):
+  handle_multi_modify_split 在 Phase-1↔etcd-commit 之间只有 bounded await(pull_vp_refs
+  PS-RPC 10s + 内层 sync etcd 10s + 主 put_msgs_txn F228 10s),每个 kill-timeout 把"慢"
+  转成"失败(Err→不提交→不封)"而非"迟到成功";中间 Phase-1 全同步、无 sleep 代码路径。
+  唯一能让成功 commit 落在 PS 解冻(>=20s split_deadline)之后的是注入 sleep(已删,无代码
+  对应)。残留尾(已登记不修):三个 bounded await 各 ~9s 且都成功 → commit ~27s>20s,三连
+  near-timeout-but-healthy,自然不可复现;真正堵口(manager commit 前 re-validate 冻结)在
+  revert-prone 热 split 区,reproduce-first 下 deferred。PS 端 freeze-held re-check 作 belt-
+  and-braces。无代码改动,仅强化 rpc_handlers.rs 注释判词。
   之前会话:WAL 自愈环增量 A 全完成 + selfheal_chaos.sh e2e(抓到读路径隔离漏洞)。
   升级方向仍为全停全启 rkyv fail-loud(不做 rolling)。
 

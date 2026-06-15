@@ -1414,19 +1414,31 @@ pub(crate) async fn handle_split_part(
                 .to_string(),
         ));
     }
-    // #6 reproduction (scripts split_repro6, 2026-06-15 — a TEMP 40s delay in
-    // handle_multi_modify_split): the deadline-bound above shrinks the freeze-
-    // overrun window, but the thing that ACTUALLY bit was a different, clearer
-    // bug — a PS retry storm against a slow manager committed a SEPARATE split
-    // per retry (a 1→6 partition CASCADE). That is now fixed MANAGER-side by the
-    // per-partition split-inflight guard (concurrent split for the same
-    // partition → CODE_PRECONDITION). With the cascade gone, the original
-    // stale-seal SILENT write-loss did NOT reproduce: post-unfreeze writes were
-    // consistently REJECTED loudly (owner_epoch / seal fencing), never
-    // acked-then-orphaned. So the manager-side commit_length re-probe (the
-    // theoretical full close for the client-timeout-vs-server-commit residual)
-    // is DEFERRED — not justified by reproduction. The freeze-held re-check
-    // above stays as the belt-and-braces detector.
+    // #6 VERDICT (2026-06-15, /loop — 证伪): the stale-seal SILENT write-loss is
+    // STRUCTURALLY PRECLUDED, not merely unreproduced. The loss requires the
+    // manager's `multi_modify_split` etcd commit to LAND (succeed) at a wall-
+    // clock time AFTER this PS auto-unfroze (>= split_deadline = 20 s) and acked
+    // writes past the captured commit_length. But between the PS capturing
+    // commit_length (the call's send) and the manager's commit,
+    // `handle_multi_modify_split` has ONLY bounded awaits, each with a kill-
+    // timeout that turns slowness into FAILURE (Err -> no commit -> no stale
+    // seal), never late success: pull_and_apply_vp_refs (PS RPC 10 s + its inner
+    // sync etcd txn, F228 10 s) and the main put_msgs_txn (F228 etcd
+    // request_timeout 10 s); Phase-1 compute between them is fully synchronous.
+    // No code path sleeps there — the only way to land a SUCCESSFUL commit after
+    // the freeze window is the TEMP /tmp/autumn_repro6 sleep (now removed), which
+    // models a stall that no real component can both incur AND survive (a real
+    // stall = timeout = Err = abort). The 2026-06-15 reproduction attempt instead
+    // surfaced a DIFFERENT real bug — a PS retry storm against a slow manager
+    // committing a SEPARATE split per retry (1->6 CASCADE) — now fixed MANAGER-
+    // side by the per-partition split-inflight guard. Residual tail (documented,
+    // NOT fixed): if all three bounded awaits sit at ~9 s and ALL succeed, the
+    // commit could land at ~27 s > 20 s — three consecutive near-timeout-but-
+    // healthy ops, not naturally reproducible; the only true close (manager re-
+    // validate freeze/commit right before the commit) is revert-prone hot-split
+    // mechanism and is deferred per reproduce-first. The freeze-held re-check
+    // above stays as the belt-and-braces detector for the case the PS DOES
+    // receive the Ok.
 
     // The manager sealed all 3 stream tails as part of the split. The
     // P-log stream workers still cache the old (now-sealed) tails and
