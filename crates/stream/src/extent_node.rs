@@ -8504,3 +8504,52 @@ mod ec5_commit_window_tests {
         assert_eq!(entry.avali.load(SeqCst), 0, "quarantined extent is avali=0");
     }
 }
+
+#[cfg(test)]
+mod ec3_fence_handover_tests {
+    //! #3: proves `commit_length` is CHECK-ONLY (never bumps owner_epoch), so
+    //! the manager's `push_fence_handover_to_targets` (which sent a higher
+    //! owner_epoch via commit_length expecting a "handover" bump) was DEAD —
+    //! the bump never happened, the ghost ex-coordinator was never fenced out.
+    //! Guards the three-concepts rule against anyone re-adding handover here.
+    use super::*;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    #[compio::test]
+    async fn commit_length_is_check_only_never_handover() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .unwrap();
+        let eid = 7001u64;
+        let entry = node.ensure_extent(eid).await.unwrap();
+        entry.owner_epoch.store(5, SeqCst);
+        entry.durable_owner_epoch.store(5, SeqCst);
+
+        // commit_length with a HIGHER owner_epoch — exactly the shape the dead
+        // fence-handover push sent. Expectation: no-op (returns length), and
+        // owner_epoch is UNCHANGED (no handover — that's why the push was dead).
+        let resp = node
+            .handle_commit_length(CommitLengthReq { extent_id: eid, owner_epoch: 10 }.encode())
+            .await
+            .unwrap();
+        let decoded = CommitLengthResp::decode(resp).unwrap();
+        assert_eq!(decoded.code, CODE_OK, "higher owner_epoch → no-op OK, not LOCKED");
+        assert_eq!(
+            entry.owner_epoch.load(SeqCst),
+            5,
+            "commit_length MUST NOT bump owner_epoch — write-fence is append-only"
+        );
+
+        // And a LOWER owner_epoch is still rejected (the check half is live).
+        let resp = node
+            .handle_commit_length(CommitLengthReq { extent_id: eid, owner_epoch: 3 }.encode())
+            .await
+            .unwrap();
+        assert_eq!(
+            CommitLengthResp::decode(resp).unwrap().code,
+            CODE_LOCKED_BY_OTHER,
+            "stale (lower) owner_epoch is rejected"
+        );
+    }
+}

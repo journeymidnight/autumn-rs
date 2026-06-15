@@ -905,3 +905,21 @@ gaps in the lease protocol's correctness story.
 - **验收:** 4 单测(无 marker 状态损坏复现 / marker 重放修复+幂等 / corrupt-meta 跳过 /
   corrupt-marker quarantine);stream 85 lib 绿;ec_integration/ec_failover/extent_recovery 全绿。
 - **passes:** completed (2026-06-15)
+
+### EC-ABANDON-DEADCODE (#3) · 删除 fence-handover 死代码 + 诚实化残留(2026-06-15)
+- **死代码确认:** `ec_abandon::push_fence_handover_to_targets` 用 `commit_length_on_node`
+  发更高 owner_epoch,指望 EN `handle_commit_length` 做 handover bump。但 commit_length
+  自 2026-05-29 三概念规则起 **CHECK-ONLY-NEVER-HANDOVER**(更高 owner_epoch 走
+  `>=→no-op` 分支,不 store)→ push **零作用**,ghost ex-coord 从未被隔离;WARN 日志却
+  宣称有保护(假安全)。单测 `ec3_fence_handover_tests::commit_length_is_check_only_never_handover`
+  证明(高 owner_epoch→no-op 不 bump,低→LOCKED)。
+- **处理:删除**(死代码 + 误导注释;删一个 no-op 不改运行时行为,只去掉假安全 + 无用 RPC)。
+  保留 advisory(真 OP 信号)。
+- **残留(登记,非本次改动引入,non-reproduced):** fenced coordinator 进程仍活可继续
+  向 targets 发 EC 2PC;EC 写/提交只 CHECK 不 raise owner_epoch,sealed extent 无 append
+  → fence 不会被顶。但**有界**:ghost-alone = eversion fence 挡成响亮 wedge(非静默损坏);
+  reissue-race = 读路由跟 manager 最终 layout(orphan shard 不被路由,reconcile 回收)。
+  coco P1 要求加码级 gate;判断为**理论窄窗 + 删除不恶化 + reproduce-first**,deferred(若复现:
+  force_ec_convert 见 advisory 拒绝 + OP 确认清除 / 专用 fence-bump RPC,**绝不用 commit_length**)。
+- **验收:** manager lib 162 / F211 lifecycle 9+8 / ec3 单测全绿;coco P1 评估后 deferred(理由记档)。
+- **passes:** completed (2026-06-15) — 删除死代码 + 残留诚实化;下一步 #6 split FREEZE_TTL。

@@ -49,12 +49,10 @@ impl AutumnManager {
     /// Returns the list of extent_ids whose markers were abandoned, so
     /// the caller can audit the chain.
     pub(crate) async fn auto_abandon_for_fenced_node(&self, fenced_node: u64) -> Vec<u64> {
-        // Snapshot under one borrow. We need the extent_ids whose
-        // ledger payload is ConvertToEc AND whose target_nodes[0] is
-        // the freshly-fenced coord. Also capture full target_nodes so
-        // the Tier 2 fence-handover push below can reach each live
-        // remote target.
-        let abandoned: Vec<(u64, Vec<u64>)> = {
+        // Snapshot under one borrow: the extent_ids whose ledger payload is
+        // ConvertToEc AND whose target_nodes[0] (the coordinator) is the
+        // freshly-fenced node.
+        let abandoned: Vec<u64> = {
             let map = self.inflight.borrow();
             map.iter()
                 .filter_map(|(eid, rec)| {
@@ -65,20 +63,16 @@ impl AutumnManager {
                     let crate::extent_inflight::ExtentOpPayload::ConvertToEc(p) = payload else {
                         return None;
                     };
-                    if p.target_nodes.first().copied() == Some(fenced_node) {
-                        Some((*eid, p.target_nodes.clone()))
-                    } else {
-                        None
-                    }
+                    (p.target_nodes.first().copied() == Some(fenced_node)).then_some(*eid)
                 })
                 .collect()
         };
-        let abandoned_ids: Vec<u64> = abandoned.iter().map(|(id, _)| *id).collect();
+        let abandoned_ids: Vec<u64> = abandoned.clone();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        for (extent_id, target_nodes) in &abandoned {
+        for extent_id in &abandoned {
             // Atomic etcd txn: delete the inflight marker + put the
             // advisory entry. The fence path will not be safe until
             // BOTH effects land, so we route via `txn_fenced`.
@@ -116,101 +110,47 @@ impl AutumnManager {
                  whether to force_ec_convert reissue"
             );
 
-            // F211-D Tier 2: push the post-fence owner-lock owner_epoch to
-            // each live (non-fenced) target EN via `commit_length_on_node`.
-            // The EN's `handle_check_commit_length` does fence-handover
-            // when `req.owner_epoch > entry.owner_epoch` — bumps and
-            // persists `.meta`. After this, a ghost ex-coord whose
-            // in-flight 2PC continues with the OLD owner_epoch will be
-            // rejected by `handle_write_shard` / `handle_commit_ec_shard`
-            // (`req.owner_epoch < entry.owner_epoch → CODE_LOCKED_BY_OTHER`),
-            // preventing it from overwriting `.dat` on remotes after the
-            // marker has been abandoned.
+            // #3 (2026-06-15): the former "F211-D Tier 2 fence-handover push"
+            // was DELETED here — it was DEAD CODE. It called
+            // `commit_length_on_node` with the post-fence owner_epoch expecting
+            // the EN's `handle_commit_length` to BUMP `entry.owner_epoch`
+            // (handover) and thereby fence out a ghost ex-coordinator's in-flight
+            // 2PC. But `handle_commit_length` has been CHECK-ONLY-NEVER-HANDOVER
+            // since the 2026-05-29 three-concepts rule (a higher owner_epoch hits
+            // the `>= → no-op, return length` branch and never stores it — proven
+            // by `extent_node::ec3_fence_handover_tests`). So the push raised
+            // nothing; the ghost was never fenced. Worse, the WARN log claimed a
+            // protection it didn't provide. Keeping a dead defense is a false
+            // sense of security, so it's removed.
             //
-            // Best-effort: per-target failure is logged at WARN; the
-            // existing `ec_convert_advisory` breadcrumb is the OP's
-            // signal that manual inspection may be needed.
-            self.push_fence_handover_to_targets(*extent_id, target_nodes, fenced_node)
-                .await;
+            // KNOWN RESIDUAL (accepted, NOT reproduced — deleting the dead push
+            // does NOT worsen it; the push protected nothing). A coordinator
+            // fenced mid-convert can keep its (alive) process sending
+            // WriteShard / CommitEcShard to live targets — EC acts on SEALED
+            // extents (no appends) and the EC write/commit handlers only CHECK
+            // owner_epoch (never raise it), so the targets' fence is never
+            // bumped. Why this is bounded (and why a speculative code gate is NOT
+            // built in this revert-prone area until reproduced):
+            //   • Ghost ALONE is a LOUD WEDGE, not silent corruption: it commits
+            //     the targets at the convert's eversion N (= manager_old + 1),
+            //     but after the abandon the manager stays at eversion_old +
+            //     ec_converted=false. A read uses the manager's stale eversion →
+            //     the target rejects it (`req.eversion < local` → EVERSION_
+            //     MISMATCH) → reads fail LOUDLY; the OP reconciles. The eversion
+            //     fence does its job.
+            //   • Reissue-race harm is ROUTE-BOUNDED: read routing follows the
+            //     manager's FINAL layout (the reissue's apply_ec_conversion_done
+            //     sets replicates/parity); a ghost shard left on a node NOT in
+            //     that layout is never routed to, and orphan reconcile reaps it.
+            //   • The advisory above (`ec_convert_advisory/<id>`) is the OP
+            //     breadcrumb: confirm the fenced EN is quiesced before reissuing
+            //     `force_ec_convert`.
+            // IF reproduced, the fix is a code gate (handle_force_ec_convert
+            // refuses while an advisory is outstanding; OP clears it after
+            // confirming quiesce) and/or a DEDICATED fence-bump RPC — NEVER
+            // commit_length (that re-breaks the three-concepts rule and fences
+            // out the LIVE PS, the exact bug that made it check-only).
         }
         abandoned_ids
-    }
-
-    /// F211-D Tier 2: push the post-fence owner-lock owner_epoch to each
-    /// live (non-fenced) target EN of an abandoned ConvertToEc marker.
-    /// Uses `commit_length_on_node` (which the EN turns into a
-    /// fence-handover bump of `entry.owner_epoch`). Best-effort.
-    async fn push_fence_handover_to_targets(
-        &self,
-        extent_id: u64,
-        target_nodes: &[u64],
-        fenced_node: u64,
-    ) {
-        // Look up: post-fence owner_lock owner_epoch for the partition that
-        // owns this extent, and address for each non-fenced target.
-        // Single borrow.
-        struct Plan {
-            owner_epoch: i64,
-            targets: Vec<(u64, String)>,
-        }
-        let plan: Option<Plan> = {
-            let s = self.store.inner.borrow();
-            let mut owner_epoch: i64 = 0;
-            'outer: for part in s.partitions.values() {
-                let streams = [part.log_stream, part.row_stream, part.meta_stream];
-                for sid in streams {
-                    if s.streams
-                        .get(&sid)
-                        .map(|st| st.extent_ids.contains(&extent_id))
-                        .unwrap_or(false)
-                    {
-                        let key = format!("partition/{}", part.part_id);
-                        if let Some(&rev) = s.owner_epochs.get(&key) {
-                            owner_epoch = rev;
-                        }
-                        break 'outer;
-                    }
-                }
-            }
-            if owner_epoch <= 0 {
-                None
-            } else {
-                let targets: Vec<(u64, String)> = target_nodes
-                    .iter()
-                    .filter(|nid| **nid != fenced_node)
-                    .filter_map(|nid| s.nodes.get(nid).map(|n| (*nid, n.address.clone())))
-                    .collect();
-                Some(Plan { owner_epoch, targets })
-            }
-        };
-        let Some(plan) = plan else {
-            return; // No owner-owner_epoch context (e.g. memory-only / dev).
-        };
-        for (node_id, addr) in &plan.targets {
-            match self
-                .commit_length_on_node(addr, extent_id, plan.owner_epoch)
-                .await
-            {
-                Ok(_) => {
-                    tracing::info!(
-                        extent_id,
-                        node_id,
-                        owner_epoch = plan.owner_epoch,
-                        "F211-D Tier 2: pushed fence-handover to live target"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        extent_id,
-                        node_id,
-                        owner_epoch = plan.owner_epoch,
-                        error = %e,
-                        "F211-D Tier 2: fence-handover push failed; \
-                         ghost ex-coord may still complete 2PC against this target. \
-                         Manual check required (see ec_convert_advisory)"
-                    );
-                }
-            }
-        }
     }
 }
