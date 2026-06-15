@@ -75,9 +75,16 @@ Current summary:
     多-worker BatchClient + ZC-default + fan_out 把单线程 decode 墙拆了。get 健康,不是瓶颈。
     写是弱侧(~300-490 MB/s = 3 副本持久 put 路径,RTT/pipeline-bound 非带宽)。
     memory project_kvcache_first_bench 已加 2026-06-15 update。
+  write 路径分析(2026-06-15,用户选项):结论=写弱侧不是 bug,是单机 3 EN 挤一块 NVMe 的
+    3× 写放大(disk-bound)。证据:写不随 client worker 上升反降(8w495→16w361→32w352)=
+    非 pipeline-bound;native perf-check 256KB:1part-1disk 427 → 8part-1disk 834(8× 分区只
+    2× = 分区层下有共享瓶颈)→ 8part--3disk 1851 MB/s(铺到 /data03+05+08,2.2×);834×3≈
+    2.5GB/s ≈ 单块 Intel SSDPF2KX038T1 持续写顶。Python adapter 零开销(495≥native 427)。
+    读不受铺盘影响(读单副本不放大)。生产形态(3disk,8part)loopback = 写 1851 / 读 6969 MB/s。
+    写路径(group-commit + F178 coalescer + F227 all-replica-ACK)正确,无需改。memory 已记。
 Next steps:
   - 用户定调:鉴权/TLS + 备份/DR 均延后,主回性能/功能线。
-  - 跨主机项(F260 验收 / 跨主机 perf 矩阵)需 ::15 peer 在线部署 —— 本机=::14,::15 是否活
-    需用户确认/provision。
-  - 单机可做:write 路径(kvcache 弱侧)分析、intra-host perf-check 矩阵(TCP;UCX intra-host
-    不赢,且有 loopback livelock 坑)。
+  - 性能线现状:read 健康(1.9GB/s)、write 健康(生产形态 1851MB/s,单机低=共享盘 artifact)。
+    单机已无明显可提升点 —— 真正 win 在跨主机(F260 + UCX/RDMA),需 ::15 peer。
+  - 候选:① 用户 provision ::15 → F260 跨主机验收 + 跨主机 perf 矩阵(UCX/RDMA 真正 win);
+    ② intra-host perf-check 全矩阵摸底(查本 session 正确性改动有无回归);③ 其它功能线。
