@@ -1,29 +1,35 @@
 #!/usr/bin/env bash
 # fuse_start.sh — mount the autumn-fuse filesystem against a running cluster.
 #
-# Env (all overridable):
-#   MANAGER     manager addr (default 127.0.0.1:9001;
-#               cross-host / RoCE: MANAGER='[fdbd:dc62:3:302::14]:9001')
-#   TRANSPORT   tcp | ucx  — MUST match the cluster's transport. The fuse daemon
-#               is a DATA-PLANE client (ClusterClient reads/writes file extents
-#               over this transport), and the transport is process-global, so a
-#               tcp fuse cannot reach a ucx cluster (and vice-versa).
-#   MOUNTPOINT  default /mnt/dongmao-share
-#   LOG_DIR     default /var/lib/autumn-rs/logs   (match the cluster's WORK/logs)
-#   BIN         default ./target/release
-#   UCX_NET_DEVICES  default mlx5_1:1 (only when ucx; verify per host with
+# Accepts the SAME env vars as start.sh, so one set drives both the cluster and
+# the mount:
+#   BIND_HOST  → MANAGER  ($BIND_HOST:9001)   default 127.0.0.1
+#   WORK       → LOG_DIR  ($WORK/logs)        default /var/lib/autumn-rs
+#   TRANSPORT  tcp | ucx — MUST match the cluster's transport. The fuse daemon is
+#              a DATA-PLANE client (ClusterClient reads/writes extents over this
+#              transport), process-global, so a tcp fuse can't reach a ucx cluster.
+# Explicit overrides still win:
+#   MANAGER    full manager addr (overrides BIND_HOST-derived)
+#   LOG_DIR    full log dir       (overrides WORK-derived)
+#   MOUNTPOINT default /mnt/dongmao-share
+#   BIN        default ./target/release
+#   UCX_NET_DEVICES  default mlx5_1:1 (only when ucx; verify with
 #                    scripts/check_roce.sh --listen-candidates)
 #
 # Examples:
 #   ./fuse_start.sh                                            # local tcp cluster
-#   MANAGER='[fdbd:dc62:3:302::14]:9001' TRANSPORT=ucx \
-#     LOG_DIR=/var/lib/autumn-rs-d02/logs ./fuse_start.sh      # cross-host ucx
+#   WORK=/var/lib/autumn-rs-d02 BIND_HOST='[fdbd:dc62:3:302::14]' \
+#     TRANSPORT=ucx ./fuse_start.sh                            # matches the same
+#                                                              # WORK/BIND_HOST/TRANSPORT
+#                                                              # you gave start.sh
 set -euo pipefail
 
-MANAGER="${MANAGER:-127.0.0.1:9001}"
+BIND_HOST="${BIND_HOST:-127.0.0.1}"
+WORK="${WORK:-/var/lib/autumn-rs}"
+MANAGER="${MANAGER:-${BIND_HOST}:9001}"
 TRANSPORT="${TRANSPORT:-tcp}"
 MOUNTPOINT="${MOUNTPOINT:-/mnt/dongmao-share}"
-LOG_DIR="${LOG_DIR:-/var/lib/autumn-rs/logs}"
+LOG_DIR="${LOG_DIR:-${WORK}/logs}"
 BIN="${BIN:-./target/release}"
 
 # UCX env — same rationale as start.sh: positive TLS list (union of cross-host
