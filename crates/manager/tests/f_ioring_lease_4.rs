@@ -24,9 +24,11 @@
 //!    end-to-end here by interleaving releases on two inodes.
 //!
 //! The byte-level "reader actually sees new bytes after write+close"
-//! sits behind an `#[ignore]`'d full-cluster test because it needs
-//! the data plane + extent map seeding from
-//! `system_ioring_fuse.rs`'s shape.
+//! is realized as `f_ioring_lease_phase1_e2e.rs::
+//! phase1_close_to_open_coherence_e2e` — a full-cluster test
+//! (manager + 2 EN + 1 PS, seeds shared.bin via the data plane).
+//! `#[ignore]`'d like every other system_* test (run via
+//! `cargo test -- --ignored`); CERTIFIED GREEN 3/3 on 2026-06-15.
 
 use std::net::SocketAddr;
 use std::time::Duration;

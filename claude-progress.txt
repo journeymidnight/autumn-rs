@@ -56,6 +56,15 @@ Current summary:
   认证完成。无代码改动,纯跑 scripts/selfheal_chaos.sh:3/3 连跑确定性 PASS(S1 翻 slot[0]
   一字节 → A4 seal-and-roll + A3 跨读 + A5 隔离,12/12 键 byte-exact 零丢失、extent 封、
   仅坏 slot avali=0;S2 三副本全坏 → open fail-loud 分区不可用)。/data05 TCP 3-EN。
+  F-ioring-lease-4 收尾(2026-06-15,用户 /loop 选项):inode-lease Phase 1 最后一步。
+  现状=代码早已实现(OpenedExtents.lease_epoch 打标 + InvalidationMap + Read 臂
+  cache_is_stale→reload_extents),且 byte-level full-cluster e2e
+  (f_ioring_lease_phase1_e2e.rs::phase1_close_to_open_coherence_e2e:manager+2EN+1PS,
+  seed v1 → writer 覆盖 v2+release → reader poll→reload→读到 v2 + 跨 extent 校验)
+  之前 #[ignore] 从未确认。收尾=运行认证:--ignored 下 3/3 确定性 GREEN。无新代码,
+  仅清理过时判词(test header + feature_list -2/-3 的 "still pending")。Phase 1 全闭环。
+  Phase 2 (单列,未做):F-fuse-lease-*(autumn-fuse 接入 lease)、F-lease-preempt(force-revoke)。
 Next steps:
-  - 生产前 P0 能力:鉴权/TLS(docs/admin_auth_design.md 设计就绪,用户曾定调"以后做")、
-    备份/DR(完全未动,生产就绪审计里唯一全空的 P0)。
+  - 用户定调:鉴权/TLS + 备份/DR 均延后,主回性能/功能线。
+  - 候选:kvcache get 路径优化(data-movement bound 246 MB/s)、F260 跨主机验收、
+    perf-check 矩阵摸底、lease Phase 2(F-fuse-lease-* / F-lease-preempt)。
