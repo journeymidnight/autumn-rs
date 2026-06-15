@@ -1,11 +1,12 @@
 Date: 2026-06-15
 TaskStatus: completed
-Task scope: WAL replay 自愈环 增量 A 全部完成(A2/A3/A5 + A4)+ 端到端复现
-  (scripts/selfheal_chaos.sh)。e2e 现场抓到并修复读路径隔离漏洞(两条 VP 值读
-  快路径绕过 avali 过滤,自愈后仍读坏副本)。replay 发现 log_stream 坏/截断副本时
-  自动换干净副本 + 隔离;open-tail 内容损坏先 seal-and-roll 再同 pass 隔离。
-  增量 A + e2e 收尾(A6/增量 B 用户确认不需要)。
-  coco deep 多轮评审。升级方向仍为全停全启 rkyv fail-loud(不做 rolling)。
+Task scope: 生产就绪审计 EC/split 崩溃窗,顺序 #5→#3→#6。**#5 已完成**:
+  EC-COMMIT-ATOMIC —— commit_shard_local 的 rename(.ec.dat→.dat)↔save_meta
+  崩溃窗,intent marker(rename 前 durable 写,load_extents 三态重放,corrupt-meta
+  绝不 replay,marker 为权威)。reproduce-first(单 EN 集成测试)+ coco 4 轮。
+  下一步 #3(EC abandon fence-handover 空操作)、#6(split FREEZE_TTL)。
+  之前会话:WAL 自愈环增量 A 全完成 + selfheal_chaos.sh e2e(抓到读路径隔离漏洞)。
+  升级方向仍为全停全启 rkyv fail-loud(不做 rolling)。
 
 === TWO LISTS REQUIRED BY THE LONG-TASK HARNESS ===
 
