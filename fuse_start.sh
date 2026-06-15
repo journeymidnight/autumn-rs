@@ -52,13 +52,17 @@ if [[ ! -x "$BIN/autumn-fuse" ]]; then
     fi
     exit 1
 fi
-# Refuse if a healthy fuse is already mounted here; clear a STALE one (a
-# previously-killed daemon leaves "Transport endpoint is not connected", and
-# the new mount fails on it — `ls` on the dir errors when it's stale).
+# Refuse if a healthy fuse is already mounted here; clear a STALE one (a dead/
+# killed daemon leaves "Transport endpoint is not connected", and the new mount
+# — even the mkdir below — fails on it). Detect stale via /proc/mounts (it's
+# still listed even when dead) OR an ENOTCONN on `ls` (don't use `[[ -e ]]` /
+# `stat`: those THEMSELVES error with ENOTCONN on a stale fuse, so they never
+# trigger the cleanup — the bug that left mkdir failing).
 if mountpoint -q "$MOUNTPOINT" 2>/dev/null; then
     echo "fuse_start: $MOUNTPOINT is already mounted — unmount first (umount -l $MOUNTPOINT)" >&2
     exit 1
-elif ! ls "$MOUNTPOINT" >/dev/null 2>&1 && [[ -e "$MOUNTPOINT" ]]; then
+fi
+if grep -qF " $MOUNTPOINT " /proc/mounts 2>/dev/null || ! ls "$MOUNTPOINT" >/dev/null 2>&1; then
     echo "fuse_start: clearing stale mount at $MOUNTPOINT"
     umount -l "$MOUNTPOINT" 2>/dev/null || fusermount3 -u "$MOUNTPOINT" 2>/dev/null || true
 fi
