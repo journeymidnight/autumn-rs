@@ -249,6 +249,19 @@ pub(crate) enum DiskHealth {
     Faulted = 2,
 }
 
+/// #5 EC-COMMIT-ATOMIC: the three states of the EC commit-intent marker that
+/// recovery must distinguish (mirrors the `.meta` NotFound-vs-corrupt policy).
+enum EcCommitMarker {
+    /// No marker → no interrupted commit.
+    Absent,
+    /// A well-formed marker for an interrupted commit at `(new_eversion,
+    /// sealed_length)` — the durable source of truth for the published `.dat`.
+    Valid { new_eversion: u64, sealed_length: u64 },
+    /// Present but unreadable / wrong size → commit state undeterminable →
+    /// fail-closed (quarantine).
+    Corrupt,
+}
+
 struct DiskFS {
     base_dir: PathBuf,
     disk_id: u64,
@@ -389,6 +402,18 @@ impl DiskFS {
             .join(format!("extent-{extent_id}.ec.dat"))
     }
 
+    /// #5 EC-COMMIT-ATOMIC: the commit-intent marker. Written durably BEFORE
+    /// `commit_shard_local` renames `.ec.dat`→`.dat`, deleted after `save_meta`.
+    /// Its presence on restart means the EC commit was interrupted between the
+    /// rename and the meta write (the `.dat` may be the shard while `.meta` is
+    /// still pre-EC); `load_extents` replays it to write the consistent `.meta`.
+    /// Payload = `[new_eversion: u64 LE][sealed_length: u64 LE]`.
+    fn ec_commit_marker_path(&self, extent_id: u64) -> PathBuf {
+        self.base_dir
+            .join(format!("{:02x}", Self::hash_byte(extent_id)))
+            .join(format!("extent-{extent_id}.ec.commit"))
+    }
+
     /// F109: unlink the `.dat`, `.meta`, and (F210-D2) `.ec.dat` files
     /// for an extent. Idempotent — `NotFound` errors on any of the
     /// three are downgraded to `Ok(())` so retries from the manager
@@ -412,6 +437,7 @@ impl DiskFS {
             self.extent_path(extent_id),
             self.meta_path(extent_id),
             self.ec_staging_path(extent_id),
+            self.ec_commit_marker_path(extent_id),
         ] {
             match compio::fs::remove_file(&path).await {
                 Ok(()) => {}
@@ -3338,6 +3364,74 @@ impl ExtentNode {
                     "loaded extent {extent_id} from disk {}: len={len}, sealed_length={sealed_length}, eversion={eversion}",
                     disk.disk_id
                 );
+
+                // #5 EC-COMMIT-ATOMIC: replay an interrupted EC commit. A
+                // surviving commit-intent marker means a crash landed between
+                // `commit_shard_local`'s rename and its save_meta, so `.dat` may
+                // be the shard while `.meta` is still pre-EC (stale eversion /
+                // short sealed_length). Finish the commit from the marker so the
+                // two agree again (and the manager's 2PC retry can complete
+                // instead of wedging on `staging missing && eversion stale`).
+                //
+                // coco P1 #1: NEVER replay over a QUARANTINED `.meta`. When
+                // `.meta` is corrupt the entry was built from DEFAULT_META
+                // (owner_epoch=0); the marker carries only (eversion,
+                // sealed_length), NOT owner_epoch, so a replay would save_meta
+                // owner_epoch=0 (fence bypass) and clear corrupt_meta
+                // (un-quarantine) — the exact META-FAILCLOSED hole. Keep the
+                // marker + quarantine; recovery/re_avali rebuilds the extent.
+                if !corrupt_meta {
+                    let quarantine = |reason: &str| {
+                        if let Some(entry) = extents.get(&extent_id).map(|e| e.clone()) {
+                            entry.corrupt_meta.store(true, Ordering::SeqCst);
+                            entry.avali.store(0, Ordering::SeqCst);
+                        }
+                        tracing::error!(extent_id, "EC-COMMIT-ATOMIC: {reason} — quarantined");
+                    };
+                    match self.read_ec_commit_marker(&disk, extent_id).await {
+                        EcCommitMarker::Absent => {}
+                        // coco P2 #3: a present-but-unreadable marker = commit
+                        // state undeterminable → fail-closed (mirrors `.meta`).
+                        EcCommitMarker::Corrupt => quarantine("commit marker present but corrupt"),
+                        EcCommitMarker::Valid {
+                            new_eversion: new_ev,
+                            sealed_length: sealed_len,
+                        } => {
+                            if let Some(entry) = extents.get(&extent_id).map(|e| e.clone()) {
+                                // coco P2 #2: a best-effort leftover marker (commit
+                                // succeeded, delete failed) must not roll back a
+                                // later-bumped eversion. If the live eversion is
+                                // already >= the marker's, the commit completed (or
+                                // was superseded) — just clear the stale marker.
+                                if entry.eversion.load(Ordering::SeqCst) >= new_ev {
+                                    self.remove_ec_commit_marker(&disk, extent_id).await;
+                                } else {
+                                    match self
+                                        .finish_ec_commit(extent_id, &entry, sealed_len, new_ev)
+                                        .await
+                                    {
+                                        Ok(()) => {
+                                            self.remove_ec_commit_marker(&disk, extent_id).await;
+                                            tracing::warn!(
+                                                extent_id,
+                                                new_ev,
+                                                sealed_len,
+                                                "EC-COMMIT-ATOMIC: replayed interrupted EC commit on load"
+                                            );
+                                        }
+                                        // coco P1 #2: replay failed → the extent
+                                        // may be a shard with stale meta. FAIL-
+                                        // CLOSED: quarantine; the marker stays for
+                                        // a retry on the next restart.
+                                        Err((_, msg)) => quarantine(&format!(
+                                            "marker replay failed: {msg}"
+                                        )),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -4877,57 +4971,139 @@ impl ExtentNode {
             .disk_for(entry.disk_id)
             .map_err(|e| (StatusCode::Internal, e))?;
         let staging_path = disk.ec_staging_path(extent_id);
-        let dat_path = disk.extent_path(extent_id);
 
         let staging_exists = compio::fs::metadata(&staging_path).await.is_ok();
         if !staging_exists {
-            // Idempotent: staging file already renamed (prior commit
-            // succeeded but response was lost). Check eversion to
-            // confirm this is a replay, not a missing prepare.
-            let local_ev = entry.eversion.load(Ordering::SeqCst);
-            if local_ev >= new_eversion {
-                return Ok(());
+            // Staging already renamed away. #5 EC-COMMIT-ATOMIC: the marker is
+            // the durable source of truth for what `.dat` now holds.
+            match self.read_ec_commit_marker(&disk, extent_id).await {
+                // An interrupted commit (rename done, save_meta / marker-cleanup
+                // pending — including the case where a prior attempt bumped the
+                // in-memory eversion but its save_meta failed). COMPLETE it using
+                // the MARKER's params (NOT the RPC args — a stale/duplicate retry
+                // must not overwrite the published `.dat`'s recorded version),
+                // then clear the marker. finish_ec_commit's eversion store is
+                // monotonic, so a superseded marker can't roll back.
+                EcCommitMarker::Valid {
+                    new_eversion: m_ev,
+                    sealed_length: m_sealed,
+                } => {
+                    // Symmetric to the load_extents replay: a stale leftover
+                    // marker (commit completed, delete failed, extent since
+                    // bumped higher) must NOT re-run finish — just clear it.
+                    if entry.eversion.load(Ordering::SeqCst) >= m_ev {
+                        self.remove_ec_commit_marker(&disk, extent_id).await;
+                        return Ok(());
+                    }
+                    self.finish_ec_commit(extent_id, &entry, m_sealed, m_ev)
+                        .await?;
+                    self.remove_ec_commit_marker(&disk, extent_id).await;
+                    return Ok(());
+                }
+                EcCommitMarker::Corrupt => {
+                    return Err((
+                        StatusCode::Internal,
+                        format!(
+                            "commit_shard extent {extent_id}: commit marker present but \
+                             unreadable — refusing (state undeterminable)"
+                        ),
+                    ));
+                }
+                EcCommitMarker::Absent => {
+                    // No marker → either fully committed (idempotent replay) or
+                    // the prepare never ran.
+                    let local_ev = entry.eversion.load(Ordering::SeqCst);
+                    if local_ev >= new_eversion {
+                        return Ok(());
+                    }
+                    return Err((
+                        StatusCode::FailedPrecondition,
+                        format!(
+                            "commit_shard extent {extent_id}: staging missing, no commit \
+                             marker, and eversion {local_ev} < {new_eversion} — prepare was \
+                             not run"
+                        ),
+                    ));
+                }
             }
-            return Err((
-                StatusCode::FailedPrecondition,
-                format!(
-                    "commit_shard extent {extent_id}: staging file missing and \
-                     eversion {local_ev} < {new_eversion} — prepare was not run"
-                ),
-            ));
         }
 
-        compio::fs::rename(&staging_path, &dat_path)
+        // #5 EC-COMMIT-ATOMIC: write the commit-intent marker DURABLY before the
+        // rename. From here through save_meta a crash is recoverable —
+        // `load_extents` (or the retry branch above) replays the marker to write
+        // the consistent `.meta` even though `.ec.dat` is already gone. Without
+        // this, a crash between the rename and save_meta left `.dat` = the shard
+        // while `.meta` stayed pre-EC (stale eversion / short sealed_length) and
+        // the commit retry wedged (`staging missing && eversion stale → Err`).
+        self.write_ec_commit_marker(&disk, extent_id, new_eversion, sealed_length)
             .await
-            .map_err(|e| {
-                let msg = format!("rename staging {extent_id}: {e}");
-                self.mark_disk_error_for_extent(extent_id, &msg);
-                (StatusCode::Internal, msg)
-            })?;
-        // EC-PREPARE-DURABLE: fsync the parent dir so the rename (the dirent
-        // swap that publishes the shard `.dat`) is itself durable — otherwise a
-        // host crash here could lose the rename and leave the OLD `.dat`, while
-        // the save_meta below (if it landed) records the new eversion → meta /
-        // data mismatch on restart. Same dir-fsync rule as `write_meta_locked`.
-        if let Some(dir) = dat_path.parent() {
-            compio::fs::File::open(dir)
+            .map_err(|e| (StatusCode::Internal, e))?;
+
+        self.finish_ec_commit(extent_id, &entry, sealed_length, new_eversion)
+            .await?;
+
+        self.remove_ec_commit_marker(&disk, extent_id).await;
+
+        tracing::info!(
+            extent_id,
+            sealed_length,
+            new_eversion,
+            "EC commit: staging renamed to .dat, eversion bumped (marker cleared)"
+        );
+        Ok(())
+    }
+
+    /// #5: complete an EC commit on `entry` — rename `.ec.dat`→`.dat` if the
+    /// staging file is still present (else `.dat` is already the shard from a
+    /// pre-crash rename), reopen, set the post-EC atomics, and persist `.meta`.
+    /// Shared by `commit_shard_local` (normal path) and the `load_extents`
+    /// marker replay (crash recovery), so both produce the identical state.
+    async fn finish_ec_commit(
+        &self,
+        extent_id: u64,
+        entry: &ExtentEntry,
+        sealed_length: u64,
+        new_eversion: u64,
+    ) -> Result<(), (StatusCode, String)> {
+        let disk = self
+            .disk_for(entry.disk_id)
+            .map_err(|e| (StatusCode::Internal, e))?;
+        let staging_path = disk.ec_staging_path(extent_id);
+        let dat_path = disk.extent_path(extent_id);
+
+        if compio::fs::metadata(&staging_path).await.is_ok() {
+            compio::fs::rename(&staging_path, &dat_path)
                 .await
                 .map_err(|e| {
-                    let msg = format!("open dat dir {extent_id}: {e}");
-                    self.mark_disk_error_for_extent(extent_id, &msg);
-                    (StatusCode::Internal, msg)
-                })?
-                .sync_all()
-                .await
-                .map_err(|e| {
-                    let msg = format!("fsync dat dir {extent_id}: {e}");
+                    let msg = format!("rename staging {extent_id}: {e}");
                     self.mark_disk_error_for_extent(extent_id, &msg);
                     (StatusCode::Internal, msg)
                 })?;
+            // EC-PREPARE-DURABLE: fsync the parent dir so the rename (the dirent
+            // swap that publishes the shard `.dat`) is itself durable.
+            if let Some(dir) = dat_path.parent() {
+                compio::fs::File::open(dir)
+                    .await
+                    .map_err(|e| {
+                        let msg = format!("open dat dir {extent_id}: {e}");
+                        self.mark_disk_error_for_extent(extent_id, &msg);
+                        (StatusCode::Internal, msg)
+                    })?
+                    .sync_all()
+                    .await
+                    .map_err(|e| {
+                        let msg = format!("fsync dat dir {extent_id}: {e}");
+                        self.mark_disk_error_for_extent(extent_id, &msg);
+                        (StatusCode::Internal, msg)
+                    })?;
+            }
         }
-
-        // Reopen the file at the .dat path so entry.file points to the
-        // new (shard) data instead of the old (unlinked) inode.
+        // ALWAYS reopen the current `.dat` so `entry.file`/`entry.len` reflect
+        // it. coco P1 #1: the same-process retry path may still hold a STALE fd
+        // to the old (unlinked) full-replica file if a prior attempt failed
+        // AFTER the rename — trusting entry.file/len there would serve old data
+        // over a shard `.dat`. F171: safe replace via RefCell + Rc swap
+        // (concurrent readers keep their OLD Rc alive until they drop).
         let new_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -4939,44 +5115,115 @@ impl ExtentNode {
             .await
             .map(|m| m.len())
             .map_err(|e| (StatusCode::Internal, format!("metadata {extent_id}: {e}")))?;
-
-        // F171: safe replace via `RefCell::borrow_mut` + `Rc` swap.
-        // Concurrent readers have already cloned an `Rc<CompioFile>`
-        // off `entry.file_rc()` for their I/O, so they keep the OLD
-        // file alive in their captured `Rc` until they drop. F153's
-        // per-extent `ec_conversion_locks` still serialises concurrent
-        // EC dispatches at the handler level (so two converts don't
-        // race on the staging path), and F119-C's eversion-mismatch
-        // reject covers concurrent reads from stale-cached clients —
-        // but they are no longer load-bearing for memory safety here.
         entry.replace_file(new_file);
-
         entry.len.store(shard_len, Ordering::SeqCst);
-        // F119-E: sealed_length = original payload length (from manager),
-        // not shard size.
+
+        // F119-E: sealed_length = original payload length (from manager), not
+        // shard size.
         entry
             .sealed_length
             .store(sealed_length.max(shard_len), Ordering::SeqCst);
-        // P0-C: EC-converted extents are sealed (sealed_length > 0). Keep the
-        // sealed flag in lock-step with sealed_length so save_meta persists it.
+        // P0-C: EC-converted extents are sealed.
         entry.sealed.store(true, Ordering::SeqCst);
         entry.avali.store(1, Ordering::SeqCst);
+        // coco P2 #2: MONOTONIC — never roll eversion BACK. A best-effort
+        // leftover marker (commit succeeded, delete failed) whose extent was
+        // later bumped to a higher eversion by recovery/re_avali must not be
+        // rolled back by a replay. Callers also gate on `current < new` before
+        // invoking finish, so in the normal path this is exactly `new_eversion`.
         if new_eversion > 0 {
-            entry.eversion.store(new_eversion, Ordering::SeqCst);
+            entry.eversion.fetch_max(new_eversion, Ordering::SeqCst);
         }
-
-        self.save_meta(extent_id, &entry)
+        self.save_meta(extent_id, entry)
             .await
             .map_err(|e| (StatusCode::Internal, e))?;
-
-        tracing::info!(
-            extent_id,
-            shard_len,
-            sealed_length,
-            new_eversion,
-            "EC commit: staging renamed to .dat, eversion bumped"
-        );
         Ok(())
+    }
+
+    /// #5: write the EC commit-intent marker durably (tmp→sync→rename→dir-fsync).
+    /// Payload = `[new_eversion: u64 LE][sealed_length: u64 LE]`.
+    async fn write_ec_commit_marker(
+        &self,
+        disk: &DiskFS,
+        extent_id: u64,
+        new_eversion: u64,
+        sealed_length: u64,
+    ) -> Result<(), String> {
+        let path = disk.ec_commit_marker_path(extent_id);
+        if let Some(parent) = path.parent() {
+            compio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("mkdir ec marker {extent_id}: {e}"))?;
+        }
+        // Append the suffix on the RAW path bytes (not via lossy `display()`),
+        // matching `write_meta_locked` — a non-UTF8 data dir must still get a
+        // real sibling tmp path.
+        let tmp = {
+            let mut s = path.clone().into_os_string();
+            s.push(".tmp");
+            PathBuf::from(s)
+        };
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&new_eversion.to_le_bytes());
+        buf[8..16].copy_from_slice(&sealed_length.to_le_bytes());
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .await
+            .map_err(|e| format!("create ec marker tmp {extent_id}: {e}"))?;
+        let f = Rc::new(f);
+        file_pwrite_chunked(f.clone(), 0, Bytes::copy_from_slice(&buf))
+            .await
+            .map_err(|e| format!("write ec marker {extent_id}: {e}"))?;
+        f.sync_data()
+            .await
+            .map_err(|e| format!("sync ec marker {extent_id}: {e}"))?;
+        compio::fs::rename(&tmp, &path)
+            .await
+            .map_err(|e| format!("rename ec marker {extent_id}: {e}"))?;
+        if let Some(dir) = path.parent() {
+            compio::fs::File::open(dir)
+                .await
+                .map_err(|e| format!("open marker dir {extent_id}: {e}"))?
+                .sync_all()
+                .await
+                .map_err(|e| format!("fsync marker dir {extent_id}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// #5: read the EC commit-intent marker, distinguishing the three states the
+    /// recovery decision needs (coco P2 #3 — mirror the `.meta` NotFound-vs-
+    /// corrupt fail-closed policy; a present-but-unreadable marker must NOT be
+    /// silently treated as "no marker").
+    async fn read_ec_commit_marker(&self, disk: &DiskFS, extent_id: u64) -> EcCommitMarker {
+        match compio::fs::read(disk.ec_commit_marker_path(extent_id)).await {
+            Ok(buf) if buf.len() == 16 => EcCommitMarker::Valid {
+                new_eversion: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+                sealed_length: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            },
+            // Present but wrong size (post-write corruption — the write is
+            // tmp→rename atomic, so a clean write never lands short here) → can't
+            // trust the commit state → fail-closed.
+            Ok(_) => EcCommitMarker::Corrupt,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => EcCommitMarker::Absent,
+            // Present but unreadable (EIO/EACCES) → fail-closed.
+            Err(_) => EcCommitMarker::Corrupt,
+        }
+    }
+
+    /// #5: delete the EC commit-intent marker (best-effort + dir-fsync). A
+    /// leftover marker only causes a redundant, idempotent replay next restart.
+    async fn remove_ec_commit_marker(&self, disk: &DiskFS, extent_id: u64) {
+        let path = disk.ec_commit_marker_path(extent_id);
+        let _ = compio::fs::remove_file(&path).await;
+        if let Some(dir) = path.parent() {
+            if let Ok(f) = compio::fs::File::open(dir).await {
+                let _ = f.sync_all().await;
+            }
+        }
     }
 
     // ─── RPC Handlers ────────────────────────────────────────────────────────
@@ -8088,5 +8335,172 @@ mod p0_fsync_highwater_tests {
             150,
             "in-order completion advances last_synced via a real covering fsync"
         );
+    }
+}
+
+#[cfg(test)]
+mod ec5_commit_window_tests {
+    //! #5: the EC commit `rename(.ec.dat→.dat)` ↔ `save_meta` window. A crash
+    //! after the (fsync'd) rename but before save_meta leaves `.dat` = the EC
+    //! shard while `.meta` still records the PRE-EC eversion/sealed_length —
+    //! and (pre-fix) load_extents trusts the stale `.meta`, so the extent is
+    //! served as a replicated extent whose `.dat` is short → corruption, and a
+    //! commit retry is wedged (staging gone + eversion stale → Err).
+    use super::*;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    fn write_meta_v1(path: &std::path::Path, eid: u64, sealed_length: u64, eversion: u64) {
+        let mut buf = [0u8; ExtentNode::META_SIZE_V1];
+        buf[0..8].copy_from_slice(ExtentNode::META_MAGIC_V1);
+        buf[8..16].copy_from_slice(&eid.to_le_bytes());
+        buf[16..24].copy_from_slice(&sealed_length.to_le_bytes());
+        buf[24..32].copy_from_slice(&eversion.to_le_bytes());
+        buf[32..40].copy_from_slice(&0i64.to_le_bytes());
+        let crc = crc32c::crc32c(&buf[0..ExtentNode::META_SIZE_V0]);
+        buf[40..44].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    // Lay down the exact on-disk state a crash-after-rename leaves: `.dat` is
+    // the SHARD (shard_len bytes), `.meta` is the PRE-EC record. `.ec.dat` is
+    // already gone (renamed). Returns (dat_path, meta_path).
+    fn lay_post_crash_state(disk: &DiskFS, eid: u64, orig_len: usize, shard_len: usize) {
+        let dat = disk.extent_path(eid);
+        std::fs::create_dir_all(dat.parent().unwrap()).unwrap();
+        // shard bytes now occupy `.dat` (the rename happened, durably)
+        std::fs::write(&dat, vec![0xAB_u8; shard_len]).unwrap();
+        // `.meta` still says PRE-EC: eversion=1, sealed_length=orig_len
+        write_meta_v1(&disk.meta_path(eid), eid, orig_len as u64, 1);
+    }
+
+    #[compio::test]
+    async fn crash_after_rename_leaves_stale_meta_and_short_dat() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
+        let eid = 9001u64;
+        let (orig, shard) = (1000usize, 340usize);
+        {
+            let node = ExtentNode::new(config.clone()).await.unwrap();
+            lay_post_crash_state(&node.disk_for(1).unwrap(), eid, orig, shard);
+        }
+        // Restart.
+        let node = ExtentNode::new(config.clone()).await.unwrap();
+        let entry = node.extents.get(&eid).expect("extent loaded");
+        // PRE-FIX corruption: meta says the extent is `orig` long, but the file
+        // is only the `shard` — a replicated read past `shard` short-reads.
+        assert_eq!(entry.sealed_length.load(SeqCst), orig as u64, "stale meta sealed_length");
+        assert_eq!(entry.len.load(SeqCst), shard as u64, ".dat is the shard");
+        assert!(
+            entry.len.load(SeqCst) < entry.sealed_length.load(SeqCst),
+            "the crash-window inconsistency: .dat shorter than meta's sealed_length"
+        );
+    }
+
+    // Write a #5 commit-intent marker `[new_eversion LE][sealed_length LE]`.
+    fn lay_marker(disk: &DiskFS, eid: u64, new_eversion: u64, sealed_length: u64) {
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&new_eversion.to_le_bytes());
+        buf[8..16].copy_from_slice(&sealed_length.to_le_bytes());
+        std::fs::write(disk.ec_commit_marker_path(eid), buf).unwrap();
+    }
+
+    #[compio::test]
+    async fn marker_replay_repairs_meta_and_clears_marker_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
+        let eid = 9002u64;
+        let (orig, shard, new_ev) = (1000usize, 340usize, 2u64);
+        {
+            let node = ExtentNode::new(config.clone()).await.unwrap();
+            let disk = node.disk_for(1).unwrap();
+            // Post-crash state: .dat = shard, .meta = pre-EC (eversion=1,
+            // sealed_length=orig) — PLUS the commit-intent marker the fix writes
+            // before the rename.
+            lay_post_crash_state(&disk, eid, orig, shard);
+            lay_marker(&disk, eid, new_ev, orig as u64);
+        }
+        // Restart → load_extents must replay the marker.
+        let node = ExtentNode::new(config.clone()).await.unwrap();
+        let entry = node.extents.get(&eid).expect("extent loaded").clone();
+        // eversion bumped to the marker's new_ev (was the stale 1).
+        assert_eq!(entry.eversion.load(SeqCst), new_ev, "eversion completed to marker's");
+        // sealed_length kept = original (F119-E), sealed flag set.
+        assert_eq!(entry.sealed_length.load(SeqCst), orig as u64);
+        assert!(entry.sealed.load(SeqCst), "EC-committed extent is sealed");
+        assert_eq!(entry.avali.load(SeqCst), 1);
+        // marker is cleared.
+        assert!(
+            !std::path::Path::new(&node.disk_for(1).unwrap().ec_commit_marker_path(eid)).exists(),
+            "marker must be removed after a successful replay"
+        );
+        // A SECOND restart is a clean no-op (idempotent: no marker, consistent).
+        drop(node);
+        let node2 = ExtentNode::new(config).await.unwrap();
+        let e2 = node2.extents.get(&eid).expect("reload").clone();
+        assert_eq!(e2.eversion.load(SeqCst), new_ev);
+        assert!(e2.sealed.load(SeqCst));
+    }
+
+    /// coco P1 #1: a marker must NEVER replay over a QUARANTINED `.meta` — that
+    /// would save_meta owner_epoch=0 (fence bypass) + clear corrupt_meta.
+    #[compio::test]
+    async fn marker_replay_skipped_when_meta_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
+        let eid = 9003u64;
+        {
+            let node = ExtentNode::new(config.clone()).await.unwrap();
+            let disk = node.disk_for(1).unwrap();
+            let dat = disk.extent_path(eid);
+            std::fs::create_dir_all(dat.parent().unwrap()).unwrap();
+            std::fs::write(&dat, vec![0xAB_u8; 340]).unwrap();
+            // corrupt `.meta`: valid V1 then flip a payload byte (CRC mismatch).
+            let mut buf = [0u8; ExtentNode::META_SIZE_V1];
+            buf[0..8].copy_from_slice(ExtentNode::META_MAGIC_V1);
+            buf[8..16].copy_from_slice(&eid.to_le_bytes());
+            buf[16..24].copy_from_slice(&1000u64.to_le_bytes());
+            buf[24..32].copy_from_slice(&1u64.to_le_bytes());
+            let crc = crc32c::crc32c(&buf[0..ExtentNode::META_SIZE_V0]);
+            buf[40..44].copy_from_slice(&crc.to_le_bytes());
+            buf[16] ^= 0x01; // bit-rot → parse_meta None → quarantine
+            std::fs::write(disk.meta_path(eid), buf).unwrap();
+            lay_marker(&disk, eid, 2, 1000);
+        }
+        let node = ExtentNode::new(config).await.unwrap();
+        let entry = node.extents.get(&eid).expect("loaded").clone();
+        assert!(
+            entry.corrupt_meta.load(SeqCst),
+            "corrupt .meta must STAY quarantined — marker replay must not run"
+        );
+        // owner_epoch must NOT have been rewritten to 0 via a marker save_meta;
+        // and the marker must still be present (replay was correctly skipped).
+        assert!(
+            std::path::Path::new(&node.disk_for(1).unwrap().ec_commit_marker_path(eid)).exists(),
+            "marker must remain — replay over a corrupt .meta is forbidden"
+        );
+    }
+
+    /// coco P2 #3: a present-but-corrupt (wrong-size) marker = undeterminable
+    /// commit state → fail-closed (quarantine), never silently treated as "no
+    /// marker" (which would serve the short shard `.dat` with stale `.meta`).
+    #[compio::test]
+    async fn corrupt_marker_quarantines_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1);
+        let eid = 9004u64;
+        {
+            let node = ExtentNode::new(config.clone()).await.unwrap();
+            let disk = node.disk_for(1).unwrap();
+            lay_post_crash_state(&disk, eid, 1000, 340);
+            // wrong-size marker (8 bytes, not 16) → Corrupt.
+            std::fs::write(disk.ec_commit_marker_path(eid), [0u8; 8]).unwrap();
+        }
+        let node = ExtentNode::new(config).await.unwrap();
+        let entry = node.extents.get(&eid).expect("loaded").clone();
+        assert!(
+            entry.corrupt_meta.load(SeqCst),
+            "a corrupt commit marker must quarantine the extent (fail-closed)"
+        );
+        assert_eq!(entry.avali.load(SeqCst), 0, "quarantined extent is avali=0");
     }
 }

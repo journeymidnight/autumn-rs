@@ -1519,3 +1519,21 @@ recovery 需要额外上报路径;当前靠 read/commit_length 拒绝让副本"�
 后同样 fsync 父目录(dirent swap durable)。套用 `write_meta_locked` 既有
 P0-B 模式。**触发=断电/内核崩溃**(kill -9 不丢 dirent,chaos 测不到),修复
 为纯 additive fsync,EC 单测(f119-d/f153)全绿。
+
+**EC-COMMIT-ATOMIC (#5) — `rename(.ec.dat→.dat)` ↔ `save_meta` 崩溃窗的
+intent marker(2026-06-15,reproduce-first)。** `commit_shard_local` 的 commit
+是两步独立持久化:① `rename(.ec.dat→.dat)`+dir-fsync(`.dat` 变 shard,durable)
+② 改 atomics + `save_meta`(`.meta` 记 post-EC eversion/sealed_length)。两步间崩溃
+(rename 已 fsync,**kill -9 即可复现**)→ `.dat`=shard 但 `.meta`=pre-EC,而旧幂等
+(staging 缺失 + eversion stale → Err)使 commit **永久卡死** + 把 shard 当完整 value
+读(损坏)。修复:`extent-{id}.ec.commit` marker(`[new_eversion][sealed_length]`,
+**rename 前** durable 写,save_meta 后删)。`finish_ec_commit` 共享 helper:
+rename-if-staging + **总是 reopen `.dat`**(同进程 retry 可能持旧 unlink fd)+
+**单调 `fetch_max` eversion**(防旧 marker 回退)+ save_meta。`load_extents` 启动重放
+三态 `EcCommitMarker`:Valid+eversion<marker → 补齐;eversion≥marker → 仅清 marker;
+Corrupt(present 但损坏/截断)→ **quarantine 失败-关闭**;Absent → 跳过。同进程 retry
+分支用 **marker payload(非 RPC 参数,marker 是已发布 `.dat` 的权威)** + 同样 eversion
+门控。**不变量:`corrupt_meta` 的 extent 绝不 marker-replay**(marker 无 owner_epoch,
+replay 会写 owner_epoch=0 → fence 旁路 + 清 quarantine = META-FAILCLOSED 漏洞)。
+4 单测(状态损坏复现 / 重放修复+幂等 / corrupt-meta 跳过 / corrupt-marker quarantine);
+coco 4 轮 P0-P3 全处置。`remove_extent_files` 同时 unlink marker。

@@ -1,4 +1,4 @@
-Date: 2026-06-14
+Date: 2026-06-15
 TaskStatus: completed
 Task scope: WAL replay 自愈环 增量 A 全部完成(A2/A3/A5 + A4)+ 端到端复现
   (scripts/selfheal_chaos.sh)。e2e 现场抓到并修复读路径隔离漏洞(两条 VP 值读

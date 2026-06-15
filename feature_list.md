@@ -885,3 +885,23 @@ gaps in the lease protocol's correctness story.
 - **验收:** 修复前 e2e 现场复现(sh-key-6 5/5 返回坏 md5)→ 修复后 12/12 byte-exact;
   stream 81 lib 单测绿;coco deep 评审 Rust 改动 0 issue。
 - **passes:** completed (2026-06-14)
+
+### EC-COMMIT-ATOMIC (#5) · EC commit rename↔save_meta 崩溃窗 — intent marker(2026-06-15)
+- **崩溃窗(reproduce-first 确认):** `commit_shard_local` 先 `rename(.ec.dat→.dat)`+dir-fsync
+  (durable),再改 eversion/sealed + `save_meta`。两步间崩溃(kill -9 即可,rename 已 fsync)
+  → `.dat`=shard 但 `.meta`=pre-EC(stale eversion / sealed_length=原长),且现有幂等
+  (staging 缺失 + eversion stale)直接 Err → commit **永久卡死** + 读 shard 当完整值(损坏)。
+- **修复 intent marker:** `extent-{id}.ec.commit` = `[new_eversion][sealed_length]`,
+  rename 前 durable 写(tmp→sync→rename→dir-fsync),save_meta 后删。`finish_ec_commit`
+  共享 helper(rename-if-staging + 总是 reopen .dat + 单调 fetch_max eversion + save_meta)。
+  `load_extents` 启动重放:Valid+eversion<marker → finish 补齐;eversion≥marker → 仅清
+  marker(不回退);Corrupt(present 但损坏)→ quarantine 失败-关闭;Absent → 跳过。
+  同进程 retry 分支同样用 **marker payload**(非 RPC 参数)+ eversion 门控。corrupt_meta
+  的 extent 绝不 replay(marker 无 owner_epoch,会 fence 旁路)。
+- **coco 4 轮:** P1×2(corrupt_meta 旁路 quarantine / 重放失败仍服务)→ 修;
+  P1×2(retry 用 stale fd 不 reopen / RPC 参数覆盖 marker)→ always-reopen + marker 为准;
+  P2×3(eversion 回滚 / marker 三态 NotFound-vs-corrupt / commit retry 缺 eversion 门控)→
+  fetch_max + 三态 + 对称门控;P3(display() 非 UTF8)→ OsString。
+- **验收:** 4 单测(无 marker 状态损坏复现 / marker 重放修复+幂等 / corrupt-meta 跳过 /
+  corrupt-marker quarantine);stream 85 lib 绿;ec_integration/ec_failover/extent_recovery 全绿。
+- **passes:** completed (2026-06-15)
