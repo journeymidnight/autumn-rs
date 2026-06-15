@@ -282,10 +282,18 @@ wait_port 2379 etcd 127.0.0.1
 # ============================================================
 
 log "2/5  manager on $MANAGER_ADDR"
+# --transport MUST match the EN/PS/client transport. The manager is pure
+# control-plane (small RPCs, no RDMA benefit), BUT the transport is
+# process-global / single-pick: a `--transport ucx` client uses UCX for ALL
+# connections including the manager link, so a UCX client can only reach a UCX
+# manager. Omitting this (pre-fix bug) left the manager on default TCP while
+# ucx clients failed with "cannot connect to any manager". cluster.sh passes
+# it; start.sh now matches.
 start_proc manager "$MANAGER" \
     --port 9001 \
     --etcd 127.0.0.1:2379 \
-    --listen "$BIND_HOST"
+    --listen "$BIND_HOST" \
+    --transport "$TRANSPORT"
 wait_port 9001 manager
 
 # ============================================================
