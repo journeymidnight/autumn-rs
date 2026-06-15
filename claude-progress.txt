@@ -64,7 +64,20 @@ Current summary:
   之前 #[ignore] 从未确认。收尾=运行认证:--ignored 下 3/3 确定性 GREEN。无新代码,
   仅清理过时判词(test header + feature_list -2/-3 的 "still pending")。Phase 1 全闭环。
   Phase 2 (单列,未做):F-fuse-lease-*(autumn-fuse 接入 lease)、F-lease-preempt(force-revoke)。
+  Phase 2/3 lease(2026-06-15,用户选项):核对发现已全部实现+提交(F-fuse-lease-1/2
+    commits 1bbd990/770765e、F-lease-preempt 72de2b8、BUG-LEASE-3/4/5 后续)。收尾=
+    跑测试认证:inode_lease 35、ioring-lease 3/4/3/3、fuse 44、bug_lease_3/4 1+2、
+    f_lease_preempt 4、f_fuse_lease_1 6/6(--ignored)、f_fuse_lease_2 2/2(--ignored)全绿。
+    #[ignore] 卫生干净。无代码改动。
+  kvcache get 摸底(2026-06-15):重建 pyo3 autumn 模块(May-21 .so 是 pre-WIRE-v2 指纹→
+    握手挂;maturin develop --release)后跑 bench_zc.py(8 worker,3-EN TCP loopback)。
+    读 ~1.5-1.9 GB/s(64K 1902 / 256K 1937 / 8M 1570),是旧 "246 MB/s wall" 的 ~8×——
+    多-worker BatchClient + ZC-default + fan_out 把单线程 decode 墙拆了。get 健康,不是瓶颈。
+    写是弱侧(~300-490 MB/s = 3 副本持久 put 路径,RTT/pipeline-bound 非带宽)。
+    memory project_kvcache_first_bench 已加 2026-06-15 update。
 Next steps:
   - 用户定调:鉴权/TLS + 备份/DR 均延后,主回性能/功能线。
-  - 候选:kvcache get 路径优化(data-movement bound 246 MB/s)、F260 跨主机验收、
-    perf-check 矩阵摸底、lease Phase 2(F-fuse-lease-* / F-lease-preempt)。
+  - 跨主机项(F260 验收 / 跨主机 perf 矩阵)需 ::15 peer 在线部署 —— 本机=::14,::15 是否活
+    需用户确认/provision。
+  - 单机可做:write 路径(kvcache 弱侧)分析、intra-host perf-check 矩阵(TCP;UCX intra-host
+    不赢,且有 loopback livelock 坑)。
