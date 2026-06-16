@@ -89,6 +89,9 @@ fn elapsed_ms(t0: Instant) -> f64 {
 
 const THUMB_PREFIX: &str = ".thumb/";
 const HLS_PREFIX: &str = ".hls/";
+// Reserved prefix for per-file metadata KV (one small KV per field), written on
+// upload and swept on delete.
+const META_PREFIX: &str = ".meta/";
 const THUMB_WIDTH: u32 = 320;
 const THUMB_QUALITY: u8 = 80;
 const LISTEN_PORT: u16 = 5001;
@@ -98,6 +101,168 @@ const RANGE_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
 
 fn thumb_key(name: &str) -> String {
     format!("{THUMB_PREFIX}{THUMB_WIDTH}/{name}")
+}
+
+fn meta_prefix(name: &str) -> String {
+    format!("{META_PREFIX}{name}/")
+}
+
+/// Read image dimensions from the header only (`into_dimensions`, no full
+/// decode). `None` for non-images / undecodable headers.
+fn image_dims(data: &[u8]) -> Option<(u32, u32)> {
+    ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+/// The metadata fields derivable from a file's name + bytes as `(field, value)`
+/// pairs. Shared by the upload path and on-demand backfill, so it excludes
+/// `uploaded_at` (the upload path appends that; backfill can't know it). Each
+/// pair becomes its own small (<4 KiB) KV under `.meta/<name>/<field>`.
+fn file_meta_fields(name: &str, data: &[u8]) -> Vec<(&'static str, String)> {
+    let mut fields = vec![
+        ("name", name.to_string()),
+        ("ext", ext_of(name)),
+        ("size_bytes", data.len().to_string()),
+        (
+            "content_type",
+            mime_guess::from_path(name)
+                .first_or_octet_stream()
+                .to_string(),
+        ),
+    ];
+    if let Some((w, h)) = image_dims(data) {
+        fields.push(("width", w.to_string()));
+        fields.push(("height", h.to_string()));
+    }
+    fields
+}
+
+/// Batch-write metadata fields as individual KV pairs keyed
+/// `.meta/<name>/<field>` (one `MSG_BATCH_PUT` per owning partition via
+/// `put_many`). Best-effort: failures are logged, never fatal. Swept by
+/// `cleanup_derived` on delete.
+async fn write_meta_fields(client: &Client, name: &str, fields: &[(&'static str, String)]) {
+    if fields.is_empty() {
+        return;
+    }
+    let prefix = meta_prefix(name);
+    let keys: Vec<String> = fields.iter().map(|(k, _)| format!("{prefix}{k}")).collect();
+    let items: Vec<(&[u8], bytes::Bytes, u64)> = keys
+        .iter()
+        .zip(fields)
+        .map(|(key, (_, val))| (key.as_bytes(), bytes::Bytes::from(val.clone()), 0))
+        .collect();
+
+    let t0 = Instant::now();
+    let results = client.lock().await.put_many(&items).await;
+    let dt = elapsed_ms(t0);
+    let failed = results.iter().filter(|r| r.is_err()).count();
+    if failed > 0 {
+        tracing::warn!("meta KV: {failed}/{} puts failed for {name}", items.len());
+    }
+    tracing::info!(
+        "meta KV: wrote {} fields for {name} in {dt:.1}ms",
+        items.len() - failed
+    );
+}
+
+/// Upload-time metadata write: derive content fields, stamp `uploaded_at` with
+/// now, persist.
+async fn write_file_meta(client: &Client, name: &str, data: &[u8]) {
+    let mut fields = file_meta_fields(name, data);
+    if let Ok(secs) = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+    {
+        fields.push(("uploaded_at", secs.to_string()));
+    }
+    write_meta_fields(client, name, &fields).await;
+}
+
+/// On-demand backfill for a file that predates the meta feature. `None` if the
+/// file doesn't exist in any form.
+///
+/// Two cases:
+/// - The original `<name>` still exists (image, or a not-yet-transcoded video):
+///   size from `head` (cheap); image dimensions from the bytes (images only).
+/// - The original is gone but `.hls/<name>/index.m3u8` exists (a transcoded
+///   video): describe the HLS — content_type is the playlist type. Segment
+///   bytes aren't summed here (would mean fetching every segment); fresh
+///   transcodes write the richer `size_bytes`/`hls_segments` directly.
+///
+/// No `uploaded_at`/`transcoded_at` — the original times are unknown.
+async fn backfill_file_meta(client: &Client, name: &str) -> Option<Vec<(&'static str, String)>> {
+    let head = client.lock().await.head(name.as_bytes()).await.ok()?;
+    if head.found {
+        let mut fields = vec![
+            ("name", name.to_string()),
+            ("ext", ext_of(name)),
+            ("size_bytes", head.value_length.to_string()),
+            (
+                "content_type",
+                mime_guess::from_path(name)
+                    .first_or_octet_stream()
+                    .to_string(),
+            ),
+        ];
+        if is_image_ext(&ext_of(name)) {
+            if let Ok(Some(data)) = client.lock().await.get(name.as_bytes()).await {
+                if let Some((w, h)) = image_dims(&data) {
+                    fields.push(("width", w.to_string()));
+                    fields.push(("height", h.to_string()));
+                }
+            }
+        }
+        return Some(fields);
+    }
+
+    // Original gone — a transcoded video is identified by its HLS playlist.
+    let playlist = client
+        .lock()
+        .await
+        .head(hls_playlist_key(name).as_bytes())
+        .await
+        .ok()?;
+    if !playlist.found {
+        return None;
+    }
+    let mut fields = vec![
+        ("name", name.to_string()),
+        ("ext", ext_of(name)),
+        ("kind", "video".to_string()),
+        (
+            "content_type",
+            "application/vnd.apple.mpegurl".to_string(),
+        ),
+    ];
+    // Sum the HLS payload so the file shows a size (matches the fresh-transcode
+    // `size_bytes`/`hls_segments` fields). `range` only lists keys, so fetch
+    // each segment's length via `head_many` (cheap — no value transfer).
+    if let Ok(scan) = client
+        .lock()
+        .await
+        .range(hls_dir_prefix(name).as_bytes(), b"", u32::MAX)
+        .await
+    {
+        let keys: Vec<Vec<u8>> = scan.entries.iter().map(|e| e.key.clone()).collect();
+        let segments = keys.iter().filter(|k| k.ends_with(b".ts")).count();
+        let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let hls_bytes: u64 = client
+            .lock()
+            .await
+            .head_many(&refs)
+            .await
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|m| m.value_length)
+            .sum();
+        fields.push(("size_bytes", hls_bytes.to_string()));
+        fields.push(("hls_segments", segments.to_string()));
+    }
+    Some(fields)
 }
 
 fn hls_dir_prefix(name: &str) -> String {
@@ -476,10 +641,17 @@ async fn transcode_video_task(name: String, client: Client, map: TranscodeMap) {
     // the original which we still have until the final delete.
     let t_kv = std::time::Instant::now();
     let mut kv_bytes: u64 = 0;
+    let mut hls_bytes: u64 = 0;
+    let mut hls_segments: usize = 0;
     for (fname, bytes) in outputs {
-        let key = if fname == "thumb.jpg" {
+        let is_thumb = fname == "thumb.jpg";
+        let key = if is_thumb {
             thumb_key(&name)
         } else {
+            hls_bytes += bytes.len() as u64;
+            if fname.ends_with(".ts") {
+                hls_segments += 1;
+            }
             hls_key(&name, &fname)
         };
         kv_bytes += bytes.len() as u64;
@@ -496,6 +668,28 @@ async fn transcode_video_task(name: String, client: Client, map: TranscodeMap) {
         kv_total_mb = kv_bytes / (1024 * 1024),
         "transcode: kv upload done"
     );
+
+    // The final metadata describes the CONVERTED HLS, not the (about-to-be-
+    // deleted) original: size_bytes is the total HLS payload, content_type is
+    // the playlist type. `size_bytes`/`content_type` field names match what the
+    // frontend reads. Best-effort; swept by cleanup_derived on delete.
+    {
+        let mut fields: Vec<(&'static str, String)> = vec![
+            ("name", name.clone()),
+            ("ext", ext_of(&name)),
+            ("kind", "video".to_string()),
+            ("content_type", "application/vnd.apple.mpegurl".to_string()),
+            ("size_bytes", hls_bytes.to_string()),
+            ("hls_segments", hls_segments.to_string()),
+        ];
+        if let Ok(secs) = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+        {
+            fields.push(("transcoded_at", secs.to_string()));
+        }
+        write_meta_fields(&client, &name, &fields).await;
+    }
 
     // Drop the original; non-fatal if it's already gone (concurrent delete).
     match client.lock().await.delete(name.as_bytes()).await {
@@ -544,7 +738,7 @@ async fn recover_pending_transcodes(client: Client, map: TranscodeMap) {
             }
             continue;
         }
-        if key.starts_with(THUMB_PREFIX) {
+        if key.starts_with(THUMB_PREFIX) || key.starts_with(META_PREFIX) {
             continue;
         }
         if is_video_ext(&ext_of(&key)) {
@@ -633,6 +827,8 @@ async fn put_handler_inner(
         let ext = ext_of(&filename);
         if is_video_ext(&ext) {
             // Wipe any prior HLS / thumb so the worker writes fresh artifacts.
+            // NB: no meta write here — the original is deleted after transcode,
+            // so video metadata is written from the HLS output by the worker.
             cleanup_derived(client, &filename).await;
             spawn_transcode(filename.clone(), client.clone(), transcodes.clone());
             return json_response(format!(
@@ -641,7 +837,10 @@ async fn put_handler_inner(
             ));
         }
 
-        // Non-video: invalidate the cached thumbnail so /thumb rebuilds.
+        // Non-video: persist the file's metadata as small (<4 KiB) KV pairs
+        // next to the upload, then invalidate the cached thumbnail so /thumb
+        // rebuilds. Both swept by cleanup_derived on delete.
+        write_file_meta(client, &filename, &data).await;
         let _ = client
             .lock()
             .await
@@ -812,18 +1011,21 @@ async fn get_handler_inner(
 async fn cleanup_derived(client: &Client, name: &str) {
     // Best-effort; NotFound is fine.
     let _ = client.lock().await.delete(thumb_key(name).as_bytes()).await;
-    let prefix = hls_dir_prefix(name);
-    let scan = match client
-        .lock()
-        .await
-        .range(prefix.as_bytes(), b"", u32::MAX)
-        .await
-    {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-    for entry in scan.entries {
-        let _ = client.lock().await.delete(&entry.key).await;
+    // Sweep every prefix-scoped artifact for this file: HLS segments and the
+    // per-file metadata KV written at upload time.
+    for prefix in [hls_dir_prefix(name), meta_prefix(name)] {
+        let scan = match client
+            .lock()
+            .await
+            .range(prefix.as_bytes(), b"", u32::MAX)
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in scan.entries {
+            let _ = client.lock().await.delete(&entry.key).await;
+        }
     }
 }
 
@@ -866,7 +1068,7 @@ async fn list_handler_inner(client: &Client) -> Response<Body> {
                     }
                     continue;
                 }
-                if s.starts_with(THUMB_PREFIX) {
+                if s.starts_with(THUMB_PREFIX) || s.starts_with(META_PREFIX) {
                     continue;
                 }
                 if seen.insert(s.clone()) {
@@ -880,6 +1082,63 @@ async fn list_handler_inner(client: &Client) -> Response<Body> {
         }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("list: {e}")),
     }
+}
+
+/// Return a file's metadata as a flat JSON object `{ "<field>": "<value>", ... }`.
+/// Served from the `.meta/<name>/*` KV when present; otherwise derived on demand
+/// (backfill), persisted, and returned — so files that predate the meta feature
+/// still resolve. 404 only when the file itself doesn't exist.
+async fn meta_handler_inner(client: &Client, name: String) -> Response<Body> {
+    let prefix = meta_prefix(&name);
+    let scan = match client
+        .lock()
+        .await
+        .range(prefix.as_bytes(), b"", u32::MAX)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("meta range: {e}"),
+            )
+        }
+    };
+
+    let pairs: Vec<(String, String)> = if scan.entries.is_empty() {
+        match backfill_file_meta(client, &name).await {
+            Some(fields) => {
+                write_meta_fields(client, &name, &fields).await;
+                fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+            }
+            None => return error_response(StatusCode::NOT_FOUND, "not found".into()),
+        }
+    } else {
+        // `range` is a key-listing scan: `RangeEntry.value` is always empty
+        // (the PS pushes `value: vec![]`). Fetch the values explicitly.
+        let keys: Vec<Vec<u8>> = scan.entries.iter().map(|e| e.key.clone()).collect();
+        let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let vals = client.lock().await.get_many(&refs).await;
+        keys.iter()
+            .zip(vals)
+            .map(|(k, vr)| {
+                let key = String::from_utf8_lossy(k).to_string();
+                let field = key.strip_prefix(prefix.as_str()).unwrap_or(&key).to_string();
+                let val = match vr {
+                    Ok(Some(v)) => String::from_utf8_lossy(&v).to_string(),
+                    _ => String::new(),
+                };
+                (field, val)
+            })
+            .collect()
+    };
+
+    let body = pairs
+        .iter()
+        .map(|(k, v)| format!("{}:{}", json_string(k), json_string(v)))
+        .collect::<Vec<_>>()
+        .join(",");
+    json_response(format!("{{{body}}}"))
 }
 
 async fn hls_handler_inner(
@@ -1146,6 +1405,12 @@ async fn main() -> Result<()> {
         SendWrapper::new(async move { list_handler_inner(&c).await })
     });
 
+    let c = SendWrapper::new(client.clone());
+    let meta_route = get(move |Path(name): Path<String>| {
+        let c = c.clone();
+        SendWrapper::new(async move { meta_handler_inner(&c, name).await })
+    });
+
     let cm = SendWrapper::new((client.clone(), metrics.clone()));
     let thumb_route = get(move |Path(name): Path<String>| {
         let cm = cm.clone();
@@ -1204,6 +1469,7 @@ async fn main() -> Result<()> {
         .route("/transcode-status/{name}", status_route)
         .route("/del/{name}", del_route)
         .route("/list/", list_route)
+        .route("/meta/{name}", meta_route)
         .route("/metrics/", metrics_route)
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)); // 1 GB
 

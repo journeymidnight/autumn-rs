@@ -1926,10 +1926,37 @@ header .tag {
     activeLayer = activeLayer === 'A' ? 'B' : 'A';
   }
 
+  function fmtBytes(n) {
+    n = +n;
+    if (!isFinite(n)) return '';
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
+    return (n / 1024 / 1024).toFixed(1) + ' MB';
+  }
+
+  // Fetch the file's metadata KV (.meta/<name>/*) and append a summary line to
+  // the lightbox caption. Guarded by lbCaption.dataset.name so a slow response
+  // for a previously-open file can't clobber the caption after navigation.
+  function loadMeta(name) {
+    fetch('/meta/' + encodeURIComponent(name), { cache: 'no-store' })
+      .then(r => r.ok ? r.json() : null)
+      .catch(() => null)
+      .then(m => {
+        if (!m || lbCaption.dataset.name !== name) return;
+        const bits = [];
+        if (m.width && m.height) bits.push(m.width + '×' + m.height);
+        if (m.size_bytes) bits.push(fmtBytes(m.size_bytes));
+        if (m.content_type) bits.push(m.content_type);
+        if (bits.length) lbCaption.textContent = name + '  ·  ' + bits.join(' · ');
+      });
+  }
+
   function openLightbox(name) {
     if (!isMedia(name)) return;
     const url = '/get/' + encodeURIComponent(name);
     lbCaption.textContent = name;
+    lbCaption.dataset.name = name;
+    loadMeta(name);
     const wasActive = lightbox.classList.contains('active');
     lightbox.classList.add('active');
     lightbox.setAttribute('aria-hidden', 'false');
