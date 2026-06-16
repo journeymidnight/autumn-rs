@@ -303,6 +303,8 @@ impl AutumnManager {
             MSG_BUMP_CLUSTER_VERSION => self.handle_bump_cluster_version(payload).await,
             // ── WAL self-heal A5: isolate a corrupt log_stream replica ──
             MSG_REPORT_CORRUPT_REPLICA => self.handle_report_corrupt_replica(payload).await,
+            // ── cluster-df: aggregate capacity summary ──────────────────
+            MSG_CLUSTER_DF => self.handle_cluster_df().await,
             // ── F-ioring-lease-1: inode-level lease + close-to-open ─────
             MSG_ACQUIRE_LEASE => self.handle_acquire_lease(payload).await,
             MSG_RELEASE_LEASE => self.handle_release_lease(payload).await,
@@ -1216,6 +1218,54 @@ impl AutumnManager {
             message: String::new(),
             nodes,
             disks_info,
+        }))
+    }
+
+    /// cluster-df (MSG_CLUSTER_DF): leader-only read of the in-memory capacity
+    /// snapshot `node_health_loop` maintains. Raw u64 facts only — the
+    /// consumer (autumn-op df / fuse statfs) computes the amplification factor
+    /// (`physical_used/logical_stored`) and the EC-dependent writable RANGE.
+    /// No scan / no compute here (done off the request path); O(per_node).
+    async fn handle_cluster_df(&self) -> HandlerResult {
+        if !self.leader.get() {
+            // A follower's snapshot is replay-stale + its node_health_loop
+            // doesn't run — answer NOT_LEADER so the caller rotates.
+            return Ok(rkyv_encode(&ClusterDfResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                raw_total: 0,
+                raw_free: 0,
+                physical_used: 0,
+                logical_stored: 0,
+                node_count: 0,
+                last_update_ms: 0,
+                logical_last_update_ms: 0,
+                per_node: Vec::new(),
+            }));
+        }
+        let snap = self.cluster_cap.borrow();
+        let per_node = snap
+            .per_node
+            .iter()
+            .map(|(id, c)| NodeCapWire {
+                node_id: *id,
+                total: c.total,
+                free: c.free,
+                extent_bytes: c.extent_bytes,
+                online: c.online,
+            })
+            .collect();
+        Ok(rkyv_encode(&ClusterDfResp {
+            code: CODE_OK,
+            message: String::new(),
+            raw_total: snap.raw_total,
+            raw_free: snap.raw_free,
+            physical_used: snap.physical_used,
+            logical_stored: snap.logical_stored,
+            node_count: snap.node_count,
+            last_update_ms: snap.last_update_ms,
+            logical_last_update_ms: snap.logical_last_update_ms,
+            per_node,
         }))
     }
 

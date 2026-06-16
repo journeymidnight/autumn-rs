@@ -5920,6 +5920,20 @@ impl ExtentNode {
     async fn handle_df(&self, payload: Bytes) -> HandlerResult {
         let req: DfReq = rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
+        // Cluster-df: per-disk live extent footprint = Σ ExtentEntry.len
+        // (the EN is the data owner; this is the REAL on-disk autumn byte
+        // count — replicas count their full copy, EC shards count shard
+        // size, open tails count live appended bytes — no amplification
+        // formula needed). O(local extents), µs. The manager sums these
+        // across all nodes into `physical_used`.
+        let mut extent_bytes_by_disk: std::collections::HashMap<u64, u64> =
+            std::collections::HashMap::new();
+        for e in self.extents.iter() {
+            let entry = e.value();
+            *extent_bytes_by_disk.entry(entry.disk_id).or_insert(0) +=
+                entry.len.load(std::sync::atomic::Ordering::Relaxed);
+        }
+
         let mut disk_status: Vec<(u64, DiskStatus)> = Vec::new();
         if req.disk_ids.is_empty() {
             // Report all known disks.
@@ -5931,6 +5945,10 @@ impl ExtentNode {
                         total,
                         free,
                         online: disk.online(),
+                        extent_bytes: extent_bytes_by_disk
+                            .get(&disk.disk_id)
+                            .copied()
+                            .unwrap_or(0),
                     },
                 ));
             }
@@ -5944,6 +5962,10 @@ impl ExtentNode {
                             total,
                             free,
                             online: disk.online(),
+                            extent_bytes: extent_bytes_by_disk
+                                .get(disk_id)
+                                .copied()
+                                .unwrap_or(0),
                         },
                     ));
                 }

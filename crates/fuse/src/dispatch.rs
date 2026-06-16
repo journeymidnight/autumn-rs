@@ -1102,15 +1102,49 @@ pub async fn handle_request(state: &mut FsState, req: FsRequest) -> bool {
             let _ = reply.send(result);
         }
         FsRequest::Statfs { reply } => {
-            let _ = reply.send(Ok(StatfsData {
+            // cluster-df: report REAL backend capacity (was hardcoded 1 TiB).
+            // statfs is rare (a `df` invocation), so an inline manager call is
+            // fine — but BOUND it so a slow/down manager can't hang the
+            // syscall; on timeout/error fall back to a benign large default.
+            //
+            // Mapping is CONSERVATIVE (÷3 = assume 3-replica). Usable LOGICAL
+            // capacity is a RANGE under EC (cold data is 1.25-1.33×, hot data
+            // 3×); statfs is a single scalar, so — CephFS-style — we collapse
+            // the range to the WORST factor: never over-report free, so `df`
+            // can't lull a writer into an optimistic ENOSPC. Already-EC'd cold
+            // data means real free is higher; under-reporting is the safe side.
+            const BSIZE: u64 = 4096;
+            let fallback = StatfsData {
                 blocks: 1 << 30,
                 bfree: 1 << 29,
                 bavail: 1 << 29,
                 files: 1 << 20,
                 ffree: 1 << 19,
-                bsize: 4096,
+                bsize: BSIZE as u32,
                 namelen: 255,
-            }));
+            };
+            let data = match compio::time::timeout(
+                std::time::Duration::from_secs(2),
+                state.client.cluster_df(),
+            )
+            .await
+            {
+                Ok(Ok(r)) if r.raw_total > 0 => {
+                    let blocks = (r.raw_total / 3) / BSIZE;
+                    let avail = (r.raw_free / 3) / BSIZE;
+                    StatfsData {
+                        blocks: blocks.max(1),
+                        bfree: avail,
+                        bavail: avail,
+                        files: 1 << 20,
+                        ffree: 1 << 19,
+                        bsize: BSIZE as u32,
+                        namelen: 255,
+                    }
+                }
+                _ => fallback,
+            };
+            let _ = reply.send(Ok(data));
         }
     }
     true // continue processing

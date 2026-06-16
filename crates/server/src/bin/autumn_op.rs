@@ -81,6 +81,8 @@ struct Args {
 enum Command {
     // F211 read / observability
     ListNodes,
+    // cluster-df: aggregate capacity summary (Ceph `ceph df` style)
+    Df,
     // R1 rolling upgrade
     ClusterVersion,
     UpgradeVersion {
@@ -219,6 +221,7 @@ fn parse() -> Args {
     let cmd = match sub {
         // F211 read
         "list-nodes" => Command::ListNodes,
+        "df" => Command::Df,
         // R1 rolling upgrade
         "cluster-version" => Command::ClusterVersion,
         "upgrade-version" => {
@@ -1243,6 +1246,124 @@ longer safe (new formats may now be emitted/persisted)",
                         n.suspected_age_secs,
                         override_str(n.override_kind),
                         n.override_reason,
+                    );
+                }
+            }
+        }
+        Command::Df => {
+            let r = client.cluster_df().await?;
+            let raw_used = r.raw_total.saturating_sub(r.raw_free);
+            // Empirical amplification (physical_used / logical_stored): the
+            // REAL current cold/hot mix, more useful than the theoretical
+            // [1.25, 3] bound. n/a when nothing is stored yet.
+            let amp = if r.logical_stored > 0 {
+                r.physical_used as f64 / r.logical_stored as f64
+            } else {
+                0.0
+            };
+            // Writable logical estimate is a RANGE under EC: best EC shape is
+            // K = min(4, node_count-1) data shards + 1 parity → factor
+            // (K+1)/K; worst is 3-replica. Point estimate uses the empirical
+            // amplification (falls back to the conservative /3).
+            let k = if r.node_count >= 2 {
+                (r.node_count - 1).min(4)
+            } else {
+                0
+            };
+            let best_factor = if k >= 1 {
+                (k as f64 + 1.0) / k as f64
+            } else {
+                3.0
+            };
+            let writable_low = r.raw_free / 3; // conservative: 3-replica
+            let writable_high = (r.raw_free as f64 / best_factor) as u64;
+            let writable_est = if amp > 0.0 {
+                (r.raw_free as f64 / amp) as u64
+            } else {
+                writable_low
+            };
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let snap_age = now_ms.saturating_sub(r.last_update_ms) / 1000;
+            let logical_age = now_ms.saturating_sub(r.logical_last_update_ms) / 1000;
+
+            if args.json {
+                let per_node: Vec<serde_json::Value> = r
+                    .per_node
+                    .iter()
+                    .map(|n| {
+                        serde_json::json!({
+                            "node_id": n.node_id,
+                            "total": n.total,
+                            "free": n.free,
+                            "extent_bytes": n.extent_bytes,
+                            "online": n.online,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "raw_total": r.raw_total,
+                        "raw_used": raw_used,
+                        "raw_free": r.raw_free,
+                        "physical_used": r.physical_used,
+                        "logical_stored_sealed": r.logical_stored,
+                        "amplification": amp,
+                        "writable_est": writable_est,
+                        "writable_low_3x": writable_low,
+                        "writable_high_ec": writable_high,
+                        "best_ec_data_shards": k,
+                        "node_count_online": r.node_count,
+                        "snapshot_age_secs": snap_age,
+                        "logical_scan_age_secs": logical_age,
+                        "per_node": per_node,
+                    }))?
+                );
+            } else {
+                let amp_str = if amp > 0.0 {
+                    format!("{amp:.2}x")
+                } else {
+                    "n/a".to_string()
+                };
+                println!("=== Cluster df ===");
+                println!(
+                    "RAW:     total={:<10} used={:<10} avail={}",
+                    human_size(r.raw_total),
+                    human_size(raw_used),
+                    human_size(r.raw_free),
+                );
+                println!(
+                    "AUTUMN:  phys_used={:<10} stored(sealed)={:<10} amplification={}",
+                    human_size(r.physical_used),
+                    human_size(r.logical_stored),
+                    amp_str,
+                );
+                println!(
+                    "WRITABLE(est): {}   range [{} .. {}]  (3-replica .. EC {}+1)",
+                    human_size(writable_est),
+                    human_size(writable_low),
+                    human_size(writable_high),
+                    k,
+                );
+                println!(
+                    "NODES: {} online   (snapshot {}s ago; logical scan {}s ago)",
+                    r.node_count, snap_age, logical_age,
+                );
+                println!(
+                    "  {:<6} {:<10} {:<10} {:<10} ONLINE",
+                    "ID", "TOTAL", "FREE", "PHYS_USED"
+                );
+                for n in &r.per_node {
+                    println!(
+                        "  {:<6} {:<10} {:<10} {:<10} {}",
+                        n.node_id,
+                        human_size(n.total),
+                        human_size(n.free),
+                        human_size(n.extent_bytes),
+                        if n.online { "yes" } else { "no" },
                     );
                 }
             }

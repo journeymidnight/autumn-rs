@@ -584,9 +584,17 @@ pub struct AllocExtentResp {
 /// Disk space statistics for one disk.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct DiskStatus {
+    /// Raw filesystem capacity (statvfs `f_blocks * f_frsize`).
     pub total: u64,
+    /// Raw filesystem free bytes (statvfs `f_bavail * f_frsize`).
     pub free: u64,
     pub online: bool,
+    /// Cluster-df: sum of THIS disk's live extent file lengths
+    /// (`ExtentEntry.len`) — the REAL autumn physical footprint on this
+    /// disk: replicas count their full copy, EC shards count shard size,
+    /// open tails count live appended bytes. The manager sums these across
+    /// all disks/nodes into `physical_used` with no amplification formula.
+    pub extent_bytes: u64,
 }
 
 /// A recovery task descriptor.

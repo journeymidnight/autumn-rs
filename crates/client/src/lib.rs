@@ -464,6 +464,34 @@ impl ClusterClient {
         }
     }
 
+    /// cluster-df: fetch the aggregate cluster capacity summary
+    /// (`MSG_CLUSTER_DF`). Shared by `autumn-op df` and the FUSE statfs
+    /// background refresh. A follower answers `CODE_NOT_LEADER`; only the
+    /// leader's `node_health_loop` maintains the snapshot, so we round-robin
+    /// to the next manager on that (mgr_call_retry only rotates on transport
+    /// errors — NOT_LEADER comes back as a successful response body).
+    pub async fn cluster_df(&self) -> Result<ClusterDfResp> {
+        let req = rkyv_encode(&ClusterDfReq {});
+        let mut attempt = 0u32;
+        loop {
+            let bytes = self.mgr_call_retry(MSG_CLUSTER_DF, req.clone(), 3).await?;
+            let resp: ClusterDfResp = rkyv_decode(&bytes).map_err(|e| anyhow!("{e}"))?;
+            if resp.code == CODE_NOT_LEADER {
+                attempt += 1;
+                if attempt > 3 {
+                    return Err(anyhow!("cluster_df: no leader available"));
+                }
+                self.rotate_manager();
+                compio::time::sleep(Duration::from_millis(300)).await;
+                continue;
+            }
+            if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+                return Err(anyhow!("cluster_df failed: {}", resp.message));
+            }
+            return Ok(resp);
+        }
+    }
+
     /// Call manager with retry and round-robin on NotLeader/connection error.
     pub async fn mgr_call_retry(
         &self,

@@ -72,6 +72,7 @@ target `/data{03,05,06,07,08}/autumn-rs`.
 ```bash
 ./start.sh                   # bring up the cluster, run bootstrap
 ./target/release/autumn-op --manager 127.0.0.1:9001 info   # 5 nodes online, 1 partition
+./target/release/autumn-op --manager 127.0.0.1:9001 df     # cluster capacity (Ceph `ceph df` style)
 
 # Basic KV
 AC="./target/release/autumn-client --manager 127.0.0.1:9001"
@@ -116,12 +117,36 @@ fusermount3 -u /mnt/autumn   # unmount (needs `fuse3` package)
 | `autumn-extent-node` | 9101+ | Data plane (raw extent files on disk) |
 | `autumn-ps` | 9301 (+ per-partition) | LSM partition server |
 | `autumn-client` | — | Data-plane CLI (put/get/del/head/ls/perf-check) |
-| `autumn-op` | — | Admin CLI (bootstrap/split/merge/compact/gc/info/format) |
+| `autumn-op` | — | Admin CLI (bootstrap/split/merge/compact/gc/info/df/format) |
 | `autumn-stream-cli` | — | Low-level stream debugging |
 | `autumn-fuse` | — | FUSE mount of the KV namespace |
 
 `autumn-client --help` / `autumn-op --help` lists subcommands. The wire schema for autumn-op
 is stable; the Python policy controller in `python/node_policy.py` shells out to it.
+
+### Cluster capacity — `autumn-op df`
+
+Ceph-`ceph df`-style aggregate capacity. RAW + autumn `physical_used` are summed
+from every extent node's `df` report (each EN self-reports the REAL on-disk byte
+count of its extents — replicas, EC shards, open tails — no amplification
+formula); `STORED(sealed)` is the manager's de-amplified Σ distinct
+`sealed_length`. Because EC makes usable LOGICAL capacity a RANGE (cold EC
+1.25–1.33× vs hot 3-replica), `df` shows the empirical `AMPLIFICATION`
+(`physical_used / stored`) plus the writable estimate as a range
+`[raw_free/3 .. raw_free/best_ec]`:
+
+```bash
+autumn-op --manager 127.0.0.1:9001 df          # human-readable
+autumn-op --manager 127.0.0.1:9001 --json df   # for scripts
+
+# Sanity-check against the EN filesystems:
+#   RAW total/free  ≈  Σ `df -h` of each EN data dir
+#   PHYS_USED       ≈  Σ `du -sb` of each EN extent dir
+```
+
+The same snapshot backs FUSE `statfs`: `df -h <mountpoint>` now reflects real
+backend capacity (conservatively, at the 3-replica factor) instead of a fixed
+placeholder.
 
 ### Prometheus /metrics (observability batch 1)
 

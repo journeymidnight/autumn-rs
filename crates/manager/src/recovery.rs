@@ -721,6 +721,15 @@ impl crate::AutumnManager {
                 s.nodes.clone()
             };
 
+            // cluster-df: accumulate this tick's RAW + physical-used snapshot
+            // (the EN self-reports its real per-disk extent_bytes; manager
+            // only sums — no amplification formula, no extent scan here).
+            let mut cdf_raw_total = 0u64;
+            let mut cdf_raw_free = 0u64;
+            let mut cdf_physical_used = 0u64;
+            let mut cdf_node_count = 0u64;
+            let mut cdf_per_node: Vec<(u64, crate::NodeCap)> = Vec::with_capacity(nodes.len());
+
             for node in nodes.values() {
                 // F191: prefer the control_address; fall back to data
                 // plane address for legacy / not-yet-re-registered nodes.
@@ -755,12 +764,30 @@ impl crate::AutumnManager {
                         self.node_states
                             .borrow_mut()
                             .on_heartbeat_fail(node.node_id);
+                        // cluster-df: unreachable this tick (unknown != offline,
+                        // but its capacity can't be summed) — record online=false.
+                        cdf_per_node.push((
+                            node.node_id,
+                            crate::NodeCap {
+                                online: false,
+                                ..Default::default()
+                            },
+                        ));
                         continue;
                     }
                 };
                 let df: ExtDfResp = match rkyv_decode(&resp) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(_) => {
+                        cdf_per_node.push((
+                            node.node_id,
+                            crate::NodeCap {
+                                online: false,
+                                ..Default::default()
+                            },
+                        ));
+                        continue;
+                    }
                 };
                 // F121: a successful df proves the node reachable — promote
                 // on the call-level signal, not per-payload disk_id (the
@@ -781,6 +808,31 @@ impl crate::AutumnManager {
                 self.node_max_free
                     .borrow_mut()
                     .insert(node.node_id, max_free);
+                // cluster-df: sum this node's ONLINE-disk capacity + real
+                // extent footprint (excludes offline disks — unusable space).
+                let mut n_total = 0u64;
+                let mut n_free = 0u64;
+                let mut n_ext = 0u64;
+                for (_, st) in &df.disk_status {
+                    if st.online {
+                        n_total = n_total.saturating_add(st.total);
+                        n_free = n_free.saturating_add(st.free);
+                        n_ext = n_ext.saturating_add(st.extent_bytes);
+                    }
+                }
+                cdf_raw_total = cdf_raw_total.saturating_add(n_total);
+                cdf_raw_free = cdf_raw_free.saturating_add(n_free);
+                cdf_physical_used = cdf_physical_used.saturating_add(n_ext);
+                cdf_node_count += 1;
+                cdf_per_node.push((
+                    node.node_id,
+                    crate::NodeCap {
+                        total: n_total,
+                        free: n_free,
+                        extent_bytes: n_ext,
+                        online: true,
+                    },
+                ));
                 // F192: drop stale push-based failure reports so a residual
                 // burst can't re-flip the node offline on the next tick.
                 self.recent_failure_reports
@@ -793,6 +845,42 @@ impl crate::AutumnManager {
                 for done in df.done_tasks {
                     let _ = self.apply_recovery_done(done).await;
                 }
+            }
+
+            // cluster-df: publish this tick's RAW + physical snapshot, and
+            // (every ~30 s) re-scan the extent store for logical_stored. The
+            // RAW/physical sum above is cheap (one entry per disk); the
+            // logical scan is read-only O(extents) so it runs at a slower
+            // cadence — df calls and statfs read the cached value, never scan.
+            let now_ms = autumn_common::metrics::unix_time_ms();
+            let last_logical = self.cluster_cap.borrow().logical_last_update_ms;
+            let scan_logical = now_ms.saturating_sub(last_logical) >= 30_000;
+            let (logical_stored, logical_ms) = if scan_logical {
+                let s = self.store.inner.borrow();
+                // Σ distinct extent sealed_length (de-amplified user data).
+                // Skip extents pending physical delete (refs==0 &&
+                // vp_table_refs==0) — they no longer count as stored.
+                let logical: u64 = s
+                    .extents
+                    .values()
+                    .filter(|ex| ex.refs != 0 || ex.vp_table_refs != 0)
+                    .map(|ex| ex.sealed_length)
+                    .fold(0u64, |acc, n| acc.saturating_add(n));
+                (logical, now_ms)
+            } else {
+                let snap = self.cluster_cap.borrow();
+                (snap.logical_stored, snap.logical_last_update_ms)
+            };
+            {
+                let mut snap = self.cluster_cap.borrow_mut();
+                snap.raw_total = cdf_raw_total;
+                snap.raw_free = cdf_raw_free;
+                snap.physical_used = cdf_physical_used;
+                snap.node_count = cdf_node_count;
+                snap.last_update_ms = now_ms;
+                snap.logical_stored = logical_stored;
+                snap.logical_last_update_ms = logical_ms;
+                snap.per_node = cdf_per_node;
             }
         }
     }

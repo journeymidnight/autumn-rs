@@ -1,27 +1,25 @@
 Date: 2026-06-16
-TaskStatus: completed
-Task scope: MERGE-EC-REPLAY —— merge survivor 重启永久 WAL-FAILSTOP 根因定位 + 修复 + 端到端救活。
+TaskStatus: not_completed
+Task scope: CLUSTER-DF —— 集群容量汇总(Ceph 模型 df) + extent_rpc 收口 autumn-rpc。
+  对外: autumn-op df(Ceph 风格 RAW + 经验放大系数 + EC 可写区间) + fuse statfs 报真实容量。
 Current summary:
-  真因(debug 埋点实锤,非前两次假设):StreamClient::read_committed_bytes_from_extent 算对了
-  committed_end=sealed_length(3GB),却用 `Ok(r) => return Ok(r)` 把 read_with_layout 的元组整个透传,
-  EC 路径 ec_subrange_read 第二元素是 shard 相对长度(~1GB)→ PS WAL replay 拿它当停止边界,只读 1 个
-  shard,跨 shard 边界记录截断 → WAL-FAILSTOP。merge 只是把 survivor VP-head replay 窗口移到这个 EC log
-  extent(victim 自己从不 replay 它),触发早已存在的透传 bug。数据零丢失。
-  修复:成功分支返回 (bytes, committed_end) 用本函数权威 committed_end。crates/stream/src/client.rs 一处。
-  端到端验证:part 25 重启读满 3GB 打开、绑 9302、autumn-op info 4 分区无 warning、ls 对其范围正常返回。
-  stream lib 86 全绿。
-  走过的弯路(已 revert,登记在 feature_list):
-   - 误判 committed_end 被 clobber 成 1 shard(其实 read_committed 算的是 3GB,被透传丢了)。
-   - 误判 manager `sealed` bool=false(其实 true)。
-   - merge eversion desync(manager=4/EN=3,真实存在但非本 bug 病因,不导致 WAL-FAILSTOP)→ deferred。
+  设计经多轮对齐(用户主导): (1)Ceph 表达模型——集群报 RAW + physical/stored 摊出经验放大系数,
+  usable 只在方案确定粒度回答,statfs 标量取保守值; (2)收口到 EN——physical_used 不用放大公式,
+  EN 自报真实 extent 文件字节(handle_df 按 disk_id 求和 ExtentEntry.len → DiskStatus.extent_bytes),
+  manager node_health_loop 只求和进内存快照 cluster_cap,零热路径手术; logical_stored 走 manager
+  后台 ~30s 只读扫 Σ 去重 sealed_length。MSG_CLUSTER_DF=0x4D leader-only 读快照。区间/系数 display 端算。
+  Phase 0 前置重构: extent_rpc 从 autumn-stream 搬进 autumn-rpc(单一 wire 家),删纯镜像 ExtDiskStatus,
+  ExtDfResp 内嵌 canonical DiskStatus;保留 MgrRecoveryTask 域类型(持久化,非镜像)。WIRE v2→v3→v4。
+  已落地: EN df 字段+求和 / manager 快照+聚合+RPC+handler / ClusterClient::cluster_df /
+  autumn-op df(文本+json) / fuse statfs(bounded 2s,保守 ÷3,fallback)。info open=0 经核无 bug(早期误读)。
+  已验证: cargo build --workspace 绿;wire 6 / stream lib 82 / manager lib 163 / client 27 全绿;
+  新增集成测试 cluster_df_extent_bytes(EN df extent_bytes = Σ 真实 extent 长)绿。
+  Commits: 7b8f010 (Phase 0 unify) 本地;df 本体待 commit。
 Main gaps:
-  - 回归测试已补(2026-06-16):client::merge_ec_replay_tests::ec_committed_end_is_sealed_length_not_shard_length。
-    不起 manager —— StreamClient::construct 跳过 acquire_owner_lock + 预填 nodes_cache/extent_info_cache,
-    起 4 个进程内 EN 持 RS shard(3+1),走真实 read_committed_bytes_from_extent 全量读,断言
-    committed_end==sealed_length(6144,非 shard 长 ~2050)且 bytes 解码回原 payload。验证 revert 修复后红、
-    修复后绿;stream lib 87 全绿(原 86 + 本测试)。
-  - merge eversion desync 修复 deferred(reproduce-first,危害未证 + merge 区 revert-prone)。
+  - live 端到端未跑: 需起真实集群(manager+etcd+≥4 EN+PS),`autumn-op df` 核对 RAW vs 各 EN statvfs、
+    PHYS_USED vs `du`,AMPLIFICATION ∈ [1.25,3];挂载 fuse 跑 `df -h` 核对随写入变化、杀 manager 不卡死。
+  - 故记 not_completed(代码 + 单测/集成全绿,仅缺 live e2e 验证)。
 Next steps:
-  - commit 回归测试 + ledger。
-  - 评估 merge eversion desync 是否值得修(仍 deferred)。
-  - 用户需重启 gallery 进程(本任务多次 restart-ps 期间 gallery 掉了)。
+  - commit df 本体 + ledger/docs(本地)。
+  - 起集群跑 live e2e(start.sh 或 remote-autumn);通过后改 completed。
+  - 可选 follow-up: 删 autumn-rpc 死代码 server.rs/pool.rs/RpcConn(0 外部引用);千万级 extent 时 logical 扫描分片轮转。

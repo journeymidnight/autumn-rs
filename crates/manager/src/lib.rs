@@ -544,6 +544,38 @@ fn parse_addr(addr: &str) -> Result<SocketAddr> {
         .map_err(|e| anyhow::anyhow!("invalid address {:?}: {}", addr, e))
 }
 
+// ── cluster-df capacity snapshot (in-memory; serves MSG_CLUSTER_DF) ──────────
+
+/// Per-node capacity rollup (sum over the node's online disks), refreshed
+/// each `node_health_loop` tick from the EN's df report.
+#[derive(Default, Clone)]
+pub(crate) struct NodeCap {
+    pub total: u64,
+    pub free: u64,
+    /// Σ this node's per-disk `DiskStatus.extent_bytes` — real autumn footprint.
+    pub extent_bytes: u64,
+    /// false = the node's df probe failed this tick (unknown != truly offline).
+    pub online: bool,
+}
+
+/// Cluster capacity snapshot. RAW + physical_used refreshed every tick from
+/// df; logical_stored from a periodic read-only scan. Display layer derives
+/// the amplification factor and the EC-dependent writable RANGE.
+#[derive(Default, Clone)]
+pub(crate) struct ClusterCapSnapshot {
+    pub raw_total: u64,
+    pub raw_free: u64,
+    /// Σ all nodes' extent_bytes (exact physical footprint, no formula).
+    pub physical_used: u64,
+    /// Online EN count (df-reachable this tick) — bounds best EC shape.
+    pub node_count: u64,
+    pub last_update_ms: u64,
+    /// Read-only Σ distinct sealed_length (de-amplified, sealed-only).
+    pub logical_stored: u64,
+    pub logical_last_update_ms: u64,
+    pub per_node: Vec<(u64, NodeCap)>,
+}
+
 // ── AutumnManager ──────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -613,6 +645,13 @@ pub struct AutumnManager {
     /// node_id; absent = "unknown" (treated as spacious: cold leader /
     /// pre-first-df nodes must stay allocatable).
     pub(crate) node_max_free: Rc<RefCell<HashMap<u64, u64>>>,
+    /// cluster-df: in-memory capacity snapshot for `MSG_CLUSTER_DF`. RAW +
+    /// physical_used are summed from every EN's df report each
+    /// `node_health_loop` tick (the EN self-reports its real per-disk extent
+    /// footprint — no amplification formula); `logical_stored` is a periodic
+    /// read-only Σ distinct sealed_length. Not persisted (volatile, rebuilt
+    /// from df + scan); leader-only meaning.
+    pub(crate) cluster_cap: Rc<RefCell<ClusterCapSnapshot>>,
     /// ENOSPC-1: allocation soft-avoids nodes whose max per-disk free is
     /// below this (`--min-alloc-free-bytes`, default 256 MiB; 0 =
     /// disabled). Soft: select_nodes falls back to the full healthy set
@@ -776,6 +815,7 @@ impl AutumnManager {
             serving: Rc::new(Cell::new(false)),
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),
             node_max_free: Rc::new(RefCell::new(HashMap::new())),
+            cluster_cap: Rc::new(RefCell::new(ClusterCapSnapshot::default())),
             min_alloc_free_bytes: Rc::new(Cell::new(DEFAULT_MIN_ALLOC_FREE_BYTES)),
             audit_retention_days: Rc::new(Cell::new(90)),
             displaced: Rc::new(Cell::new(true)),

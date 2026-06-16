@@ -55,8 +55,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (design §5: compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 3;
-pub const WIRE_VERSION_MAX: u32 = 3;
+pub const WIRE_VERSION_MIN: u32 = 4;
+pub const WIRE_VERSION_MAX: u32 = 4;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -78,6 +78,10 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // nests canonical `extent_rpc::DiskStatus`. rkyv layout unchanged, but
     // the hashed schema file set changed → new fingerprint. Pre-R3: MIN=MAX=3.
     (3, "f2a5079b44de98d1"),
+    // v4: cluster-df — DiskStatus grew `extent_bytes` (EN self-reports its
+    // real per-disk extent footprint); MSG_CLUSTER_DF (0x4D) +
+    // ClusterDfReq/ClusterDfResp/NodeCapWire. Pre-R3: MIN=MAX=4.
+    (4, "d96a8af74454f7ef"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point

@@ -605,3 +605,20 @@ FABRICATES data; it can only lose a recent un-fsynced write:
   dest is a REUSED ring buffer, not a fresh zeroed Vec (the fuse path
   pre-zeros its whole buffer; ioring zeroed only the gaps BETWEEN
   extents). `crates/ioring/src/fuse_read.rs`.
+
+## statfs — real backend capacity (CLUSTER-DF, 2026-06-16)
+
+`df -h <mountpoint>` was a hardcoded 1 TiB / 512 GiB placeholder. The `Statfs`
+arm in `dispatch.rs` now calls `state.client.cluster_df()` (the `MSG_CLUSTER_DF`
+aggregate snapshot — RAW + autumn physical_used summed from every EN's df) and
+maps it **conservatively at the 3-replica factor**: `blocks = raw_total/3/4096`,
+`bavail = bfree = raw_free/3/4096`. Usable LOGICAL capacity is a RANGE under EC
+(cold EC 1.25–1.33× vs hot 3×); statfs is a single scalar, so — CephFS-style —
+we collapse the range to the WORST factor so `df` never over-reports free and
+can't lull a writer into an optimistic ENOSPC (already-EC'd cold data means real
+free is higher; under-reporting is the safe side). The call is BOUNDED
+(`compio::time::timeout` 2 s) so a slow/down manager can't hang the syscall —
+on timeout/error it falls back to the benign large default. statfs is rare
+(a `df` invocation) so an inline call is fine; no background cache needed.
+File `size` stays the logical size (replica/EC amplification is transparent to
+the FS layer, matching Ceph/HDFS). inode counts (files/ffree) stay a constant.

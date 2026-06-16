@@ -159,6 +159,18 @@ pub const MSG_BUMP_CLUSTER_VERSION: u8 = 0x4B;
 // validates both so a stale PS can't mutate the layout (I4).
 pub const MSG_REPORT_CORRUPT_REPLICA: u8 = 0x4C;
 
+// ── cluster-df: aggregate capacity summary (Ceph-`ceph df` style) ─────────────
+//
+// Leader-only read of a manager-maintained in-memory snapshot. RAW + autumn
+// physical-used come from summing each EN's `df` report (the EN is the data
+// owner; physical_used = Σ real extent file bytes, no amplification formula);
+// logical_stored is the manager's read-only Σ distinct sealed_length. The wire
+// carries only raw u64 facts — amplification factor / writable range / EC
+// shape are computed by the consumer (autumn-op df, fuse statfs), never sent
+// as floats. See docs / plan: cluster capacity is a RANGE under EC, so the
+// single point-estimate is left to the display layer.
+pub const MSG_CLUSTER_DF: u8 = 0x4D;
+
 // ── rkyv helpers ────────────────────────────────────────────────────────────
 
 /// Serialize a value to Bytes using rkyv.
@@ -1544,6 +1556,51 @@ pub struct ReportCorruptReplicaReq {
 pub struct ReportCorruptReplicaResp {
     pub code: u8,
     pub message: String,
+}
+
+// ── cluster-df wire types (MSG_CLUSTER_DF) ───────────────────────────────────
+
+/// `MSG_CLUSTER_DF` request — empty (the whole cluster summary; no params).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ClusterDfReq {}
+
+/// Per-node capacity rollup (sum over the node's online disks).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct NodeCapWire {
+    pub node_id: u64,
+    pub total: u64,
+    pub free: u64,
+    /// Σ this node's per-disk `DiskStatus.extent_bytes` (real autumn footprint).
+    pub extent_bytes: u64,
+    /// false = the node's df probe failed this cycle (unknown != truly offline).
+    pub online: bool,
+}
+
+/// `MSG_CLUSTER_DF` response — raw u64 facts only; the consumer computes the
+/// amplification factor (`physical_used / logical_stored`) and the writable
+/// RANGE (`[raw_free/3, raw_free/best_ec_factor]`). No floats on the wire.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ClusterDfResp {
+    pub code: u8,
+    pub message: String,
+    /// Σ all online disks' raw capacity / free (statvfs truth).
+    pub raw_total: u64,
+    pub raw_free: u64,
+    /// Σ all nodes' `extent_bytes` — exact autumn physical footprint
+    /// (replicas + EC shards + open tails, no amplification formula).
+    pub physical_used: u64,
+    /// Manager's read-only Σ distinct sealed_length (de-amplified user data;
+    /// sealed-only — excludes un-sealed open-tail bytes, which physical_used
+    /// DOES include, so a hot cluster shows a slightly inflated amplification).
+    pub logical_stored: u64,
+    /// Online EN count — bounds the best achievable EC shape for the writable
+    /// range upper bound (K = min(4, node_count-1)).
+    pub node_count: u64,
+    /// Snapshot freshness (ms since unix epoch) — RAW/physical refreshed by
+    /// node_health_loop; `logical_last_update_ms` by the read-only scan.
+    pub last_update_ms: u64,
+    pub logical_last_update_ms: u64,
+    pub per_node: Vec<NodeCapWire>,
 }
 
 // ── F-ioring-lease-1 wire types ────────────────────────────────────────────

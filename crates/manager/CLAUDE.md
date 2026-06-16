@@ -1869,3 +1869,32 @@ On leader promotion, `replay_from_etcd` reads all prefixes to rebuild in-memory 
     保证 rkyv 同布局,要么随版本带迁移 —— 绝不依赖 reset。** 曾用 prost 给
     "免 reset 自动演进"(R2-A),因纯复杂度 + 对"忘迁移"反而静默风险更高
     而回退;详见 docs/rolling_upgrade_design.md §R2-final + [[feedback_stopworld_restart_primary]]。
+
+40. **CLUSTER-DF capacity snapshot (`cluster_cap`, serves `MSG_CLUSTER_DF`).**
+    Ceph-`ceph df`-style aggregate capacity, in-memory only (volatile, rebuilt
+    from df + scan — never persisted; leader-only meaning). Two sources feed
+    `ClusterCapSnapshot`, both inside the single `node_health_loop` (note 25 —
+    do NOT add a second df caller):
+    - **RAW + physical_used: summed from the EN df reports every tick.** The EN
+      is the data owner — `handle_df` self-reports `DiskStatus.extent_bytes` =
+      Σ its `ExtentEntry.len` (real on-disk bytes: replicas counted ×N, EC
+      shards at shard size, open tails at live length). The manager just sums
+      online-disk `total/free/extent_bytes` per node → `raw_total/raw_free/
+      physical_used`. **No amplification formula, no extent scan, no mutation-
+      site counters** — this is the Ceph/HDFS "owner reports, control plane
+      sums" pattern, chosen because the manager's extent mutations are
+      scattered (no choke point) so an incremental manager counter would mean
+      6 revert-prone hot-path edits.
+    - **logical_stored: a periodic (~30 s) READ-ONLY scan** of `s.extents`,
+      `Σ distinct sealed_length` skipping `refs==0 && vp_table_refs==0`
+      (pending physical delete). Read-only (touches no mutation site); pure
+      in-memory CPU (MetadataState is the etcd mirror). Slower cadence than
+      the df sum because it's O(extents); df/statfs read the cached value.
+    `handle_cluster_df` is leader-gated (follower → CODE_NOT_LEADER; its
+    snapshot is replay-stale + its loop doesn't run) and just copies the
+    snapshot — O(per_node), no compute. Wire carries only raw u64 facts; the
+    amplification factor (`physical_used/logical_stored`) and the EC-dependent
+    writable RANGE `[raw_free/3 .. raw_free/best_ec]` are computed by the
+    consumer (autumn-op df / fuse statfs). `node_max_free`/ENOSPC-1
+    (note 37) is untouched. Cross-ref: note 25 (single df caller), 7 (df
+    call-result vs payload disk_id).

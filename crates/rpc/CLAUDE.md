@@ -43,6 +43,20 @@ handle this one shape — a ZC design constraint, not a legacy version.
 
 ## Modules
 
+### `extent_rpc.rs` (relocated from autumn-stream, CLUSTER-DF Phase 0)
+ExtentService wire codec — hot-path binary (Append/ReadBytes/CommitLength) +
+rkyv control-plane (AllocExtent/Df/RequireRecovery/ConvertToEc/…). Lives HERE
+(not autumn-stream) so it's the single wire-schema home alongside
+`manager_rpc`/`partition_rpc`; autumn-stream re-exports it
+(`pub use autumn_rpc::extent_rpc`) so `autumn_stream::extent_rpc::*` paths are
+unchanged. This deleted the manager's hand-mirrored `ExtDiskStatus` (pure-wire
+duplicate → `ExtDfResp` now nests canonical `extent_rpc::DiskStatus`); the
+`Ext*` types that nest a manager DOMAIN type (`MgrRecoveryTask`, persisted in
+etcd) are kept — that's domain/wire separation, not a mirror. `DiskStatus`
+carries `extent_bytes` (EN self-reported real per-disk extent footprint) for
+cluster-df. `MSG_CLUSTER_DF = 0x4D` + `ClusterDfReq/Resp/NodeCapWire` live in
+`manager_rpc.rs`.
+
 ### `frame.rs`
 - `Frame`: encode/decode a single RPC frame
 - `FrameDecoder`: streaming decoder state machine (feed bytes → try_decode frames)
@@ -201,7 +215,7 @@ let resp = client.call(1, payload).await?;
 ## WIRE-1 — wire-schema fingerprint (2026-06-12)
 
 `build.rs` hashes the wire-schema SOURCE files (`manager_rpc.rs`,
-`partition_rpc.rs`, `frame.rs`, `../stream/src/extent_rpc.rs`) into
+`partition_rpc.rs`, `frame.rs`, `extent_rpc.rs`) into
 `autumn_rpc::WIRE_FINGERPRINT` (16-hex compile-time const). Rationale:
 deploys are SAME-COMMIT (rkyv has no cross-version compatibility) and a
 mixed deploy fails SILENTLY with garbage decodes — the F275 stale python

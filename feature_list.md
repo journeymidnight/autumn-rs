@@ -1006,3 +1006,26 @@ gaps in the lease protocol's correctness story.
      mismatch),危害未证,merge 区 revert-prone → 按 reproduce-first deferred。修法:已 sealed 的 CoW victim extent 只
      refs++、不 bump eversion。
   3. **EC extent manager `sealed` bool:** 本次确认 extent 40 manager 侧 `sealed=true`(我一度误判为 false),不变量正常。
+
+### CLUSTER-DF · 集群容量汇总(Ceph 模型 df)+ extent_rpc 收口 autumn-rpc(2026-06-16)
+- **动机:** 三处「空间」展示不准/缺失:(a)fuse statfs 硬编码 1TiB/512GiB 假值;(b)集群级根本无容量汇总接口;
+  (c)EC 让「可写逻辑空间」本质是区间(冷 EC 1.25–1.33× / 热 3 副本)。
+- **表达模型(用户选 Ceph):** 集群级报 RAW + 经验放大系数(physical_used/logical_stored 摊开自显形),usable 只在
+  方案确定的粒度回答,标量接口(statfs)取保守值。
+- **架构(用户主导「收口到 EN」):** physical_used 不用放大公式 —— EN 自己是数据 owner,`handle_df` 按 disk_id 求和
+  `ExtentEntry.len`(真实文件字节:副本 3× / EC shard / open tail 全含),报进 `DiskStatus.extent_bytes`;manager
+  `node_health_loop` 只把各 EN 的 extent_bytes/total/free 累加进内存快照 `cluster_cap`,**零热路径手术、零散落计数器**。
+  logical_stored(去放大)是 manager 知识 → 后台 ~30s 只读扫 `Σ 去重 sealed_length`(跳过 refs==0&&vp_table_refs==0);
+  只读、不碰任何 mutation 点。`MSG_CLUSTER_DF=0x4D` leader-only 读快照 O(per_node)。区间/系数在 display 端算
+  (autumn-op df / fuse statfs),wire 只载裸 u64。正是 Ceph(OSD per-PG)/HDFS(DataNode block report)的 owner 自报 + 控制面求和。
+- **Phase 0 前置重构:** `extent_rpc` 从 autumn-stream 搬进 autumn-rpc(与 manager_rpc/partition_rpc 看齐,唯一 wire 家),
+  删纯 wire 镜像 `ExtDiskStatus`(无域等价物),`ExtDfResp` 内嵌 canonical `extent_rpc::DiskStatus`;保留 `MgrRecoveryTask`
+  域类型(持久化 etcd recoveryTasks/ + F207 ledger,domain/wire 分离不是镜像)。WIRE bump v2→v3(unify)→v4(extent_bytes+RPC)。
+- **fuse statfs:** 实调 cluster_df(bounded 2s,失败 fallback),保守 ÷3 映射(CephFS 式把 EC 区间塌成最坏 3 副本 → 绝不乐观
+  over-report → 不诱发乐观 ENOSPC)。
+- **info open=0:** 经核 `part.is_some() && !probe_set.contains` 按 De Morgan 全局 info(无 --part)本就探测所有 open extent
+  → 无 bug,不改(早期 Explore 误读)。
+- **验收:** wire 6 / stream lib 82 / manager lib 163 / client 27 全绿;新增集成测试
+  `cluster_df_extent_bytes::df_reports_summed_extent_len_per_disk`(EN df extent_bytes = Σ 真实 extent 长,绿)。
+  端到端(起集群跑 `autumn-op df` 核对 RAW vs 各 EN statvfs、PHYS_USED vs `du`)待真实集群验证。
+- **passes:** not_completed (2026-06-16, 代码 + 单测/集成全绿;仅缺 live 集群 e2e 验证 → 通过后转 completed)。

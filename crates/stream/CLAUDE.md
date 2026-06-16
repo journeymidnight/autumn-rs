@@ -4,7 +4,7 @@
 
 Five components in one crate:
 1. **`ExtentNode`** (`extent_node.rs`) — the server-side storage daemon that holds extents on local disk, implements ExtentService via autumn-rpc (custom binary protocol on compio).
-2. **`extent_rpc`** (`extent_rpc.rs`) — wire codec for all 10 ExtentService RPCs. Hot-path uses binary encoding; control-plane uses rkyv zero-copy serialization.
+2. **`extent_rpc`** — wire codec for all 10 ExtentService RPCs. Hot-path uses binary encoding; control-plane uses rkyv. **CLUSTER-DF: relocated to `autumn-rpc` (`crates/rpc/src/extent_rpc.rs`)** so all three wire schemas share one home; re-exported here (`pub use autumn_rpc::extent_rpc` in `lib.rs`), so `crate::extent_rpc::*` / `autumn_stream::extent_rpc::*` paths are unchanged. `DiskStatus` gained `extent_bytes` (EN self-reported per-disk extent footprint); `handle_df` sums `ExtentEntry.len` by `disk_id` — real on-disk bytes, the source the manager aggregates into cluster `physical_used` (see manager CLAUDE note 40).
 3. **`StreamClient`** (`client.rs`) — the client library used by `PartitionServer` to read/write streams. Manager calls are stubbed (F044 scope).
 4. **`erasure`** (`erasure.rs`) — Reed-Solomon EC codec (`ec_encode`, `ec_decode`, `ec_reconstruct_shard`), wrapping `reed-solomon-erasure` crate.
 5. _(removed in F150 Phase A-: extent-node WAL deleted; SSD-only deployments make sequential WAL fsync no longer beat extent-file fsync)_.
