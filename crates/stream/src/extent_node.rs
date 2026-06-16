@@ -1995,8 +1995,6 @@ async fn build_append_future(
     extent: std::rc::Rc<ExtentEntry>,
     slots: Vec<AppendSlot>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>> {
-    use compio::io::AsyncWriteAt;
-
     if slots.is_empty() {
         return Box::pin(async move { Vec::new() });
     }
@@ -3861,15 +3859,31 @@ impl ExtentNode {
         // the in-memory `len` watermark fence reads against any byte past
         // the acked commit length. So preallocated-but-unwritten blocks are
         // inert.
-        let prealloc = en_prealloc_bytes();
+        // `fallocate(FALLOC_FL_KEEP_SIZE)` is a Linux/ext4-only optimization.
+        // On non-Linux targets (macOS dev builds) it does not exist, so the
+        // prealloc step is a no-op there — the extent still serves writes,
+        // just without the up-front block reservation.
+        let prealloc = if cfg!(target_os = "linux") {
+            en_prealloc_bytes()
+        } else {
+            0
+        };
         if prealloc > 0 {
             use std::os::fd::AsRawFd;
             let fd = file.as_raw_fd();
             let len_arg = prealloc as i64;
             let join = compio::runtime::spawn_blocking(move || -> std::io::Result<()> {
                 // SAFETY: fd is owned by `file`, kept alive by this scope.
+                #[cfg(target_os = "linux")]
                 let rc = unsafe {
                     libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, len_arg)
+                };
+                // Non-Linux: unreachable because `prealloc` is forced to 0
+                // above, but keep the branch compiling.
+                #[cfg(not(target_os = "linux"))]
+                let rc = {
+                    let _ = (fd, len_arg);
+                    0
                 };
                 if rc == 0 {
                     Ok(())
