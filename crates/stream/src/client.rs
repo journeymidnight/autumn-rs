@@ -3943,9 +3943,11 @@ impl StreamClient {
         // F117: RS decode of a full extent (up to 128 MiB) is CPU-bound;
         // run it on the blocking pool so the caller's compio thread (P-log
         // / P-bulk / extent-node read fanout) stays responsive while the
-        // GF(256) math runs.
+        // GF(256) math runs. `sealed_length` is the authoritative payload
+        // length (no in-shard trailer); decode truncates the data shards to it.
+        let original_size = ex.sealed_length as usize;
         let decoded = compio::runtime::spawn_blocking(move || {
-            crate::erasure::ec_decode(shard_data, data_shards, parity_shards)
+            crate::erasure::ec_decode(shard_data, data_shards, parity_shards, original_size)
         })
         .await
         .map_err(|_| anyhow!("ec_decode task panicked"))??;
@@ -4638,9 +4640,9 @@ mod merge_ec_replay_tests {
         const K: usize = 3; // data shards
         const M: usize = 1; // parity shards
         const N: usize = K + M;
-        // Logical payload length. `shard_size` ≈ L/K plus a small length-
-        // trailer pad, so each shard is strictly smaller than the logical
-        // length — that gap is exactly what the bug confused for the end.
+        // Logical payload length. `shard_size` = ceil(L/K), strictly smaller
+        // than the logical length — that gap is exactly what the bug confused
+        // for the end. (6144/3 = 2048 exactly.)
         const L: usize = 6144;
         const EVERSION: u64 = 5; // post-EC target eversion
         let extent_id: u64 = 70_001;

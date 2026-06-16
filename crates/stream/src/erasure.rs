@@ -3,24 +3,24 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 
 /// Per-shard byte size for a given payload length and number of data shards.
 ///
-/// Matches Go rs_codec.go formula:
-///   perShard := (size + dataShards + 4 - 1) / dataShards
-///   if perShard < 4 { perShard = 4 }
-///
-/// The `+ dataShards + 4 - 1` ensures at least 4 bytes of padding remain in the
-/// last data shard to store the original payload length trailer.
+/// `ceil(payload_len / data_shards)` — the last data shard is zero-padded up to
+/// this length. The original payload length is NOT stored in the shards: the
+/// authoritative length is `sealed_length` (manager-tracked), passed into
+/// `ec_decode`. (A 4-byte length trailer in the last data shard used to round
+/// `shard_size` up by 4; it was removed as redundant with `sealed_length`.)
 pub fn shard_size(payload_len: usize, data_shards: usize) -> usize {
-    let per_shard = (payload_len + data_shards + 4 - 1) / data_shards;
-    per_shard.max(4)
+    ((payload_len + data_shards - 1) / data_shards).max(1)
 }
 
 /// Encode a payload into `data_shards + parity_shards` equal-length byte slices.
 ///
-/// Encoding format (matches Go ReedSolomon.Encode):
-///   - Payload bytes are distributed across the first `data_shards` slices.
-///   - The last 4 bytes of `shards[data_shards-1]` store `payload_len` as big-endian u32.
+/// Encoding format:
+///   - Payload bytes are distributed across the first `data_shards` slices
+///     (the last data shard is zero-padded up to `shard_size`).
 ///   - Parity shards are computed by the Reed-Solomon encoder.
 ///
+/// No length trailer is stored — `ec_decode` is given the authoritative
+/// `original_size` (`sealed_length`) by the caller.
 /// All returned shards have length `shard_size(payload.len(), data_shards)`.
 pub fn ec_encode(payload: &[u8], data_shards: usize, parity_shards: usize) -> Result<Vec<Vec<u8>>> {
     if data_shards == 0 {
@@ -35,8 +35,8 @@ pub fn ec_encode(payload: &[u8], data_shards: usize, parity_shards: usize) -> Re
     let total_shards = data_shards + parity_shards;
 
     debug_assert!(
-        per_shard * data_shards >= size + 4,
-        "not enough space for length trailer: per_shard={} data_shards={} size={}",
+        per_shard * data_shards >= size,
+        "shard too small for payload: per_shard={} data_shards={} size={}",
         per_shard,
         data_shards,
         size,
@@ -57,12 +57,6 @@ pub fn ec_encode(payload: &[u8], data_shards: usize, parity_shards: usize) -> Re
         remaining -= n;
     }
 
-    // Write original payload length as big-endian u32 into the last 4 bytes
-    // of the last data shard.
-    let trailer_pos = per_shard - 4;
-    let len_bytes = (size as u32).to_be_bytes();
-    shards[data_shards - 1][trailer_pos..].copy_from_slice(&len_bytes);
-
     // Compute parity shards.
     let rs = ReedSolomon::new(data_shards, parity_shards)
         .map_err(|e| anyhow!("ReedSolomon::new failed: {e}"))?;
@@ -72,16 +66,17 @@ pub fn ec_encode(payload: &[u8], data_shards: usize, parity_shards: usize) -> Re
     Ok(shards)
 }
 
-/// Decode original payload from `data_shards + parity_shards` shards.
+/// Decode the original payload from `data_shards + parity_shards` shards.
 ///
 /// Up to `parity_shards` elements of `shards` may be `None` (missing/unavailable).
-/// Requires at least `data_shards` non-None elements.
-///
-/// Matches Go ReedSolomon.Decode behavior including the length trailer.
+/// Requires at least `data_shards` non-None elements. `original_size` is the
+/// authoritative payload length (`sealed_length`) — the decoded data shards are
+/// concatenated and truncated to it (no length trailer is stored in the shards).
 pub fn ec_decode(
     mut shards: Vec<Option<Vec<u8>>>,
     data_shards: usize,
     parity_shards: usize,
+    original_size: usize,
 ) -> Result<Vec<u8>> {
     if shards.len() != data_shards + parity_shards {
         return Err(anyhow!(
@@ -103,20 +98,7 @@ pub fn ec_decode(
     rs.reconstruct_data(&mut shards)
         .map_err(|e| anyhow!("RS reconstruct_data failed: {e}"))?;
 
-    // Read original size from last 4 bytes of last data shard.
-    let last_data = shards[data_shards - 1]
-        .as_ref()
-        .ok_or_else(|| anyhow!("last data shard still missing after reconstruct"))?;
-    if last_data.len() < 4 {
-        return Err(anyhow!(
-            "last data shard too short to contain length trailer"
-        ));
-    }
-    let trailer_pos = per_shard - 4;
-    let original_size =
-        u32::from_be_bytes(last_data[trailer_pos..trailer_pos + 4].try_into().unwrap()) as usize;
-
-    // Concatenate data shards and truncate to original size.
+    // Concatenate data shards and truncate to the caller-provided original size.
     let mut out = Vec::with_capacity(original_size);
     let mut remaining = original_size;
     for (i, shard_opt) in shards.iter().enumerate().take(data_shards) {
@@ -192,6 +174,7 @@ mod tests {
             shards.into_iter().map(Some).collect(),
             data_shards,
             parity_shards,
+            payload.len(),
         )
         .unwrap();
         assert_eq!(decoded, payload);
@@ -220,7 +203,7 @@ mod tests {
         // Remove shard 1 (a data shard).
         let mut shards_opt: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
         shards_opt[1] = None;
-        let decoded = ec_decode(shards_opt, 3, 2).unwrap();
+        let decoded = ec_decode(shards_opt, 3, 2, payload.len()).unwrap();
         assert_eq!(decoded, payload);
     }
 
@@ -230,7 +213,7 @@ mod tests {
         let shards = ec_encode(&payload, 2, 1).unwrap();
         let mut shards_opt: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
         shards_opt[2] = None; // Remove parity shard.
-        let decoded = ec_decode(shards_opt, 2, 1).unwrap();
+        let decoded = ec_decode(shards_opt, 2, 1, payload.len()).unwrap();
         assert_eq!(decoded, payload);
     }
 
@@ -244,7 +227,7 @@ mod tests {
         shards_opt[1] = None;
         shards_opt[3] = None;
         shards_opt[5] = None;
-        let decoded = ec_decode(shards_opt, 6, 3).unwrap();
+        let decoded = ec_decode(shards_opt, 6, 3, payload.len()).unwrap();
         assert_eq!(decoded, payload);
     }
 
@@ -272,28 +255,13 @@ mod tests {
 
     #[test]
     fn test_shard_size_formula() {
-        // Verify formula matches Go: (size + dataShards + 4 - 1) / dataShards, min 4.
-        // shard_size(0, 2)  = (0+2+4-1)/2 = 5/2 = 2, but min 4 → 4
-        assert_eq!(shard_size(0, 2), 4);
-        // shard_size(1, 2)  = (1+2+4-1)/2 = 6/2 = 3, but min 4 → 4
-        assert_eq!(shard_size(1, 2), 4);
-        // shard_size(8, 2)  = (8+2+4-1)/2 = 13/2 = 6; leftSpace=6*2-8=4 ≥ 4 ✓
-        assert_eq!(shard_size(8, 2), 6);
-        // shard_size(100, 4) = (100+4+4-1)/4 = 107/4 = 26; leftSpace=26*4-100=4 ≥ 4 ✓
-        assert_eq!(shard_size(100, 4), 26);
-        // shard_size(1024, 6) = (1024+6+4-1)/6 = 1033/6 = 172; leftSpace=172*6-1024=8 ≥ 4 ✓
-        assert_eq!(shard_size(1024, 6), 172);
-    }
-
-    #[test]
-    fn test_length_trailer_position() {
-        let payload = b"hello world"; // 11 bytes
-        let shards = ec_encode(payload, 2, 1).unwrap();
-        let per_shard = shards[0].len();
-        // Trailer is last 4 bytes of last data shard (index 1).
-        let trailer = &shards[1][per_shard - 4..];
-        let stored_len = u32::from_be_bytes(trailer.try_into().unwrap());
-        assert_eq!(stored_len as usize, payload.len());
+        // ceil(payload_len / data_shards), min 1 (no +4 trailer rounding).
+        assert_eq!(shard_size(0, 2), 1); // empty → 1 (RS needs non-zero shards)
+        assert_eq!(shard_size(1, 2), 1); // ceil(1/2) = 1
+        assert_eq!(shard_size(8, 2), 4); // ceil(8/2) = 4
+        assert_eq!(shard_size(100, 4), 25); // ceil(100/4) = 25
+        assert_eq!(shard_size(1024, 6), 171); // ceil(1024/6) = 171
+        assert_eq!(shard_size(6144, 3), 2048); // exact division
     }
 
     #[test]
@@ -314,7 +282,7 @@ mod tests {
         let shards = ec_encode(&payload, 2, 1).unwrap();
         let per_shard = shards[0].len();
 
-        // shard[0] should contain payload[0..per_shard] (minus trailer area)
+        // shard[0] should contain payload[0..per_shard] verbatim (no trailer)
         assert_eq!(
             &shards[0][..per_shard.min(payload.len())],
             &payload[..per_shard.min(payload.len())]
@@ -344,8 +312,8 @@ mod tests {
             shards.iter().map(|s| Some(s[100..200].to_vec())).collect();
 
         // This should fail because partial shards have wrong length for RS decode
-        let result = ec_decode(partial, 2, 1);
-        // The decode itself may "succeed" but return garbage (wrong length trailer).
+        let result = ec_decode(partial, 2, 1, payload.len());
+        // The decode itself may "succeed" but return garbage (shards too short).
         // Either way, the output won't match the expected payload sub-range.
         if let Ok(decoded) = result {
             // If it somehow decodes, the result is garbage — not payload[100..200]
@@ -365,7 +333,7 @@ mod tests {
         let shards = ec_encode(&payload, 2, 1).unwrap();
         let mut shards_opt: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
         shards_opt[0] = None; // data shard 0 gone
-        let decoded = ec_decode(shards_opt, 2, 1).unwrap();
+        let decoded = ec_decode(shards_opt, 2, 1, payload.len()).unwrap();
         assert_eq!(decoded, payload, "should recover from 1 data + 1 parity");
     }
 
@@ -376,7 +344,7 @@ mod tests {
         let shards = ec_encode(&payload, 2, 1).unwrap();
         let mut shards_opt: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
         shards_opt[1] = None; // data shard 1 gone
-        let decoded = ec_decode(shards_opt, 2, 1).unwrap();
+        let decoded = ec_decode(shards_opt, 2, 1, payload.len()).unwrap();
         assert_eq!(decoded, payload, "should recover from 1 data + 1 parity");
     }
 

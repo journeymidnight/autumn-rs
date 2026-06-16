@@ -1032,3 +1032,15 @@ gaps in the lease protocol's correctness story.
   3 副本 amp=3.00x → force-ec-convert 转 EC 3+1 后 phys 3.5→1.6MB / amp 3.00x→1.34x(per-node ~400KB=shard_size×4),
   不同配置算出不同正确结果; CoW refs=2 stored 计一次; --json 全字段算术核对; 混合 EC 正确。
 - **passes:** completed (2026-06-16, 代码 + 单测/集成 + live e2e 全绿)。
+
+### EC-TRAILER-REMOVE · 删除 EC shard 的 4 字节长度 trailer(2026-06-16, 无部署前提)
+- **动机:** `shard_size` 旧公式 `ceil((L+4)/K)` 多留 4 字节,`ec_encode` 把 payload 长度写进最后一个 data shard 末 4 字节,
+  `ec_decode` 读它来截断。但这个长度与 manager 权威的 `sealed_length` **完全冗余**(Go reed-solomon 自描述格式的遗留)。
+- **改动:** `shard_size = ceil(L/K).max(1)`(去 +4);`ec_encode` 不再写 trailer;`ec_decode(shards,K,M, original_size)`
+  新增 `original_size` 参数(由调用方传 `sealed_length`)截断。唯一生产调用方 `ec_read_full` 传 `ex.sealed_length`。
+  `ec_subrange_read` / EN crash-detection 等用 `shard_size` 处自动跟新公式(encode 与 read 同源,一致)。
+- **格式影响:** 这是**on-disk EC shard 格式变更**(shard 边界移位 + 无 trailer)。安全前提=**当前无任何部署**(无存量 EC extent
+  需迁移),用户明确「不需要管兼容」。非 wire schema,WIRE_FINGERPRINT 不变。
+- **验收:** erasure 单测 16(含各尺寸 roundtrip + 缺片重建)/ ec_slice 6 / merge_ec_replay 1 / ec_2pc 5 全绿;stream lib 81。
+  **live e2e**:300KB value 写入 → seal → force-ec-convert 3+1 → GET 回读 sha256 **MATCH**(经 ec_subrange_read 新无-trailer 格式)。
+- **passes:** completed (2026-06-16, 代码 + 单测 + live e2e 全绿)。
